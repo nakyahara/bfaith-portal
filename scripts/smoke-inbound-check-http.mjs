@@ -24,7 +24,7 @@ const ok = (c, l) => { if (c) { pass++; console.log(`  ✓ ${l}`); } else { fail
 const child = spawn(process.execPath, ['server.js'], {
   cwd: ROOT,
   env: { ...process.env, DATA_DIR, PORT: String(PORT), PORTAL_PASS: 'smoke', NODE_ENV: 'development', SESSION_SECRET: 'smoke-secret',
-    INBOUND_INFO_SYNC_ENABLED: 'false' },
+    INBOUND_INFO_SYNC_ENABLED: 'false', STAFF_EXPORT_TOKEN: 'smoke-export-token' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let logs = '';
@@ -69,7 +69,7 @@ async function req(j, url, { method = 'GET', body, headers = {}, form, multipart
   if (j) j.absorb(r);
   const text = await r.text();
   let json = null; try { json = JSON.parse(text); } catch {}
-  return { status: r.status, text, json, location: r.headers.get('location'), ctype: r.headers.get('content-type') || '' };
+  return { status: r.status, text, json, location: r.headers.get('location'), ctype: r.headers.get('content-type') || '', cacheControl: r.headers.get('cache-control') || '' };
 }
 
 try {
@@ -98,16 +98,51 @@ try {
   ok(r.status === 200 && r.json.ok && r.json.batch === null && r.json.me.admin === true, 'state (取込なし)');
   r = await req(J, `${APP}/admin`);
   ok(r.status === 200 && r.text.includes('取込履歴') && r.text.includes('この端末を登録'), '管理画面 (admin 節あり)');
+  // 作業者 = スタッフマスタ (apps/staff)。seed 13名が入っている
+  r = await req(J, `${BASE}/apps/staff/api/list`);
+  ok(r.status === 200 && r.json.staff.length === 13 && r.json.candidates[0].staff_no === '0001', 'スタッフマスタ seed 13名');
+  r = await req(J, `${BASE}/apps/staff/`);
+  ok(r.status === 200 && r.text.includes('スタッフマスタ') && r.text.includes('星 立夏'), 'スタッフマスタ管理画面');
   r = await req(J, `${APP}/admin/workers`, { method: 'POST', body: { name: '山田' } });
-  ok(r.status === 200 && r.json.worker?.code === 'w01', '作業者追加');
-  r = await req(J, `${APP}/admin/workers`, { method: 'POST', body: { name: '山田' }, headers: { origin: 'http://evil.example' } });
+  ok(r.status === 404, '入荷側の作業者追加 API は無い (404)');
+  r = await req(J, `${BASE}/apps/staff/api/staff`, { method: 'POST', body: { staff_no: '90001', display_name: 'テスト 一郎' } });
+  ok(r.status === 200 && r.json.staff?.staff_no === '90001', 'スタッフ追加');
+  r = await req(J, `${BASE}/apps/staff/api/staff`, { method: 'POST', body: { staff_no: '90001', display_name: '重複' } });
+  ok(r.status === 400 && /既に/.test(r.json.message || ''), '番号重複は 400');
+  r = await req(J, `${BASE}/apps/staff/api/staff`, { method: 'POST', body: { staff_no: '90002', display_name: 'x' }, headers: { origin: 'http://evil.example' } });
   ok(r.status === 403 && r.json?.error === 'bad_origin', '別 Origin の POST は 403');
-  r = await req(J, `${APP}/admin/workers`, { method: 'POST', body: { name: '鈴木' }, headers: { origin: '' } });
+  r = await req(J, `${BASE}/apps/staff/api/staff`, { method: 'POST', body: { staff_no: '90002', display_name: 'x' }, headers: { origin: '' } });
   ok(r.status === 403, 'Origin も Referer も無い POST は 403');
-  r = await req(J, `${APP}/admin/workers`, { method: 'POST', body: { name: '鈴木' }, headers: { origin: 'null' } });
+  r = await req(J, `${BASE}/apps/staff/api/staff`, { method: 'POST', body: { staff_no: '90002', display_name: 'x' }, headers: { origin: 'null' } });
   ok(r.status === 403, 'Origin: null は 403');
-  r = await req(J, `${APP}/admin/workers`, { method: 'POST', body: { name: '鈴木' }, headers: { origin: '', referer: BASE + '/apps/inbound-check/admin' } });
-  ok(r.status === 200 && r.json.worker?.code === 'w02', 'Origin 無しでも同一ホストの Referer があれば通る');
+  r = await req(J, `${BASE}/apps/staff/api/staff`, { method: 'POST', body: { staff_no: '90002', display_name: 'テスト 二郎' }, headers: { origin: '', referer: BASE + '/apps/staff/' } });
+  ok(r.status === 200 && r.json.staff?.staff_no === '90002', 'Origin 無しでも同一ホストの Referer があれば通る');
+  const s2 = r.json.staff;
+  r = await req(J, `${BASE}/apps/staff/api/staff/${s2.id}/active`, { method: 'POST', body: { active: 'false', expect_version: s2.version } });
+  ok(r.status === 400, "active: 'false' (文字列) は 400");
+  r = await req(J, `${BASE}/apps/staff/api/staff/${s2.id}/active`, { method: 'POST', body: { active: false } });
+  ok(r.status === 400, 'active: expect_version 無しは 400');
+  r = await req(J, `${BASE}/apps/staff/api/staff/${s2.id}/active`, { method: 'POST', body: { active: false, expect_version: s2.version, left_on: 'bad' } });
+  ok(r.status === 400, 'active: 不正な left_on は 400');
+  r = await req(J, `${BASE}/apps/staff/api/staff/${s2.id}/active`, { method: 'POST', body: { active: false, expect_version: s2.version } });
+  ok(r.status === 200 && r.json.staff.active === 0, 'スタッフ無効化 (version 付き)');
+  r = await req(J, `${BASE}/apps/staff/api/staff/${s2.id}`, { method: 'POST', body: { fields: { note: 'x' }, expect_version: s2.version } });
+  ok(r.status === 409 && r.json.error === 'conflict', '無効化後の古い version での編集は 409');
+  r = await req(J, `${BASE}/apps/staff/api/staff/${s2.id}`, { method: 'POST', body: { fields: { note: 'x' } } });
+  ok(r.status === 400, '編集: expect_version 無しは 400');
+  r = await req(J, `${BASE}/apps/staff/api/staff/${s2.id}`);
+  ok(r.status === 200 && r.json.staff.version === s2.version + 1 && r.json.audit.length >= 2, 'スタッフ詳細 (version+1・監査あり)');
+  r = await req(J, `${BASE}/apps/staff/api/staff/${s2.id}`, { method: 'POST', body: { fields: { note: 'y' }, expect_version: r.json.staff.version } });
+  ok(r.status === 200 && r.json.staff.note === 'y', '最新 version での編集は 200');
+  r = await req(J, `${APP}/admin`);
+  ok(r.status === 200 && r.text.includes('テスト 一郎') && !r.text.includes('テスト 二郎'), '入荷側の管理画面に有効スタッフだけ表示');
+  r = await req(null, `${BASE}/apps/staff/export`);
+  ok(r.status === 401, 'export: トークン無しは 401');
+  r = await req(null, `${BASE}/apps/staff/export`, { headers: { authorization: 'Bearer wrong' } });
+  ok(r.status === 401, 'export: 不正トークンは 401');
+  r = await req(null, `${BASE}/apps/staff/export`, { headers: { authorization: 'Bearer smoke-export-token' } });
+  ok(r.status === 200 && r.json.staff.length === 15 && r.json.staff[0].staff_no === '0001', 'export: 正しいトークンで全員 (無効含む)');
+  ok(r.ctype.includes('json') && r.cacheControl === 'no-store', 'export: Cache-Control no-store');
 
   // 取込 (multipart)
   const csvBuf = csvPath && fs.existsSync(csvPath) ? fs.readFileSync(csvPath) : null;
@@ -125,21 +160,23 @@ try {
     ok(r.json.lines.length === 16 && r.json.slips.length === 1 && r.json.totals.checked === 0, 'state 16行/1伝票');
     firstKey = r.json.lines[0].line_key;
     ok(r.json.lines[0].info === null || typeof r.json.lines[0].info === 'object', '補助情報フィールドあり');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 1, worker_code: 'w01' } });
-    ok(r.status === 200 && r.json.state.status === 'checked' && r.json.state.checked_by === '山田', '確認 (セッション + 作業者コード)');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 1, worker_code: 'w01' } });
+    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 1, worker_code: '20250901' } });
+    ok(r.status === 200 && r.json.state.status === 'checked' && r.json.state.checked_by === '星 立夏', '確認 (セッション + スタッフ管理番号)');
+    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 1, worker_code: '20250901' } });
     ok(r.status === 409 && r.json.error === 'conflict' && r.json.current.status === 'checked', '二重確認 → 409 conflict');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId + 99, line_key: firstKey, worker_code: 'w01', expect_version: 1 } });
+    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId + 99, line_key: firstKey, worker_code: '20250901', expect_version: 1 } });
     ok(r.status === 409 && r.json.error === 'stale_batch', '旧/不明 batch_id → 409 stale_batch');
     r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: r.json.line_key || 'AR00110005164|2|1', expect_version: 1 } });
     ok(r.status === 200 && r.json.state.checked_by === '中原 大輔', '作業者コード無し (セッション) = 表示名で記録');
     r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: 'w99', expect_version: 1 } });
-    ok(r.status === 400 && r.json.error === 'worker_required', '不明な作業者コード → 400');
+    ok(r.status === 400 && r.json.error === 'worker_required', '不明なスタッフ管理番号 → 400');
+    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|4|1', worker_code: '90002', expect_version: 1 } });
+    ok(r.status === 400 && r.json.error === 'worker_required', '無効化したスタッフ → 400');
     for (const bad of [undefined, null, 0, -1, 1.5, 'x', '']) {
-      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: 'w01', expect_version: bad } });
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: '20250901', expect_version: bad } });
       ok(r.status === 400 && r.json.error === 'bad_request', `expect_version=${String(bad)} → 400`);
     }
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: 'w01', expect_version: '1' } });
+    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: '20250901', expect_version: '1' } });
     ok(r.status === 200, "expect_version='1' (文字列の整数) は許容");
     r = await req(J, `${APP}/admin/history.csv?batch_id=${batchId}`);
     ok(r.status === 200 && /text\/csv/.test(r.ctype) && r.text.includes('確認'), '履歴 CSV');
@@ -161,12 +198,12 @@ try {
   ok(r.status === 200, '端末Cookieで作業画面');
   r = await req(J, `${APP}/admin/upload`, { method: 'POST', body: {} });
   ok(r.status === 403 && r.json.error === 'session_required', '端末Cookieでは取込不可 (403)');
-  r = await req(J, `${APP}/admin/workers`, { method: 'POST', body: { name: 'x' } });
-  ok(r.status === 403, '端末Cookieでは作業者追加不可');
+  r = await req(J, `${BASE}/apps/staff/api/staff`, { method: 'POST', body: { staff_no: '90003', display_name: 'x' } });
+  ok(r.status === 401, '端末Cookieではスタッフ追加不可 (401)');
   r = await req(J, `${APP}/admin/history.csv?batch_id=1`);
   ok(r.status === 403 || r.status === 302, '端末Cookieでは履歴不可');
   if (batchId) {
-    r = await req(J, `${APP}/api/lines/uncheck`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 2, worker_code: 'w01' } });
+    r = await req(J, `${APP}/api/lines/uncheck`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 2, worker_code: '20250901' } });
     ok(r.status === 200 && r.json.state.status === 'unchecked', '端末Cookie + 作業者コードで取消');
     r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 3 } });
     ok(r.status === 400 && r.json.error === 'worker_required', '端末Cookieで作業者未選択 → 400');
@@ -194,6 +231,10 @@ try {
     ok(r.status === 403, '一般ユーザー: 端末登録は 403');
     r = await req(U, `${APP}/admin/history.csv?batch_id=1`);
     ok(r.status === 403, '一般ユーザー: 履歴CSV は 403');
+    r = await req(U, `${BASE}/apps/staff/api/list`);
+    ok(r.status === 403, '一般ユーザー: スタッフマスタ API は 403');
+    r = await req(U, `${BASE}/apps/staff/`);
+    ok(r.status === 403, '一般ユーザー: スタッフマスタ画面は 403');
     if (csvBuf) {
       const f = new FormData(); f.append('file', new Blob([Buffer.from('broken')]), 'x.csv');
       r = await req(U, `${APP}/admin/upload`, { method: 'POST', multipart: f });

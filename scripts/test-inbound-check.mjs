@@ -10,7 +10,7 @@
  *   2. 取込: active 1件・supersede・同一ハッシュ拒否・古い生成時刻拒否・0件取込
  *   3. 消し込み: 条件付き UPDATE (二重確認=conflict / version 不一致=conflict / stale_batch / 取消の reverted_event_id)
  *   4. 表示結合: f_inbound_info の入数・いろは / mirror_logizard_stock の P3F 優先・集約 (明細が増えない)
- *   5. 端末・作業者・履歴CSV・保持期間の掃除
+ *   5. 端末・作業者 (スタッフマスタ参照)・履歴CSV・保持期間の掃除
  */
 import fs from 'fs';
 import os from 'os';
@@ -27,7 +27,7 @@ const dbMod = await import('../apps/inbound-check/db.js');
 const { parseInboundCsv } = csvMod;
 const {
   getDB, importCsv, getActiveBatch, getState, applyCheck, listEvents, eventsCsv, cleanupOld,
-  createDevice, verifyDevice, revokeDevice, listDevices, addWorker, listWorkers, setWorkerActive, productInfoMap,
+  createDevice, verifyDevice, revokeDevice, listDevices, listWorkers, getWorker, productInfoMap,
 } = dbMod;
 
 let pass = 0, fail = 0;
@@ -54,6 +54,19 @@ const row = (ar, no, pid, qty, extra = {}) => ({
 
 console.log('DATA_DIR =', process.env.DATA_DIR);
 initMirrorDB();
+// 旧作業者表に行がある状態で初期化 → DROP されない (migration guard)
+{
+  const { getMirrorDB } = await import('../apps/warehouse-mirror/db.js');
+  const m = getMirrorDB();
+  m.exec("CREATE TABLE IF NOT EXISTS f_inbound_check_workers (code TEXT PRIMARY KEY, name TEXT NOT NULL, sort INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1)");
+  m.prepare("INSERT INTO f_inbound_check_workers (code, name) VALUES ('w01', '先に登録した人')").run();
+  getDB();
+  ok(!!m.prepare("SELECT 1 FROM sqlite_master WHERE name='f_inbound_check_workers'").get(), '旧作業者表に行があれば DROP しない');
+  m.exec('DELETE FROM f_inbound_check_workers');
+  const { createTables } = await import('../apps/inbound-check/db.js');
+  createTables(m);
+  ok(!m.prepare("SELECT 1 FROM sqlite_master WHERE name='f_inbound_check_workers'").get(), '0 行になれば DROP される');
+}
 const db = getDB();
 
 // ─── 1. CSV パーサ ───
@@ -114,7 +127,7 @@ const csvA = makeCsv([row('AR1', 1, 'abcDEF', 100), row('AR1', 2, 'x2', 12), row
 console.log('\n[3] 消し込み');
 {
   const b = getActiveBatch();
-  const r1 = applyCheck({ batchId: b.id, lineKey: 'AR1|1|1', action: 'check', expectVersion: 1, worker: '山田', deviceId: 1, deviceLabel: 'iPad1' });
+  const r1 = applyCheck({ batchId: b.id, lineKey: 'AR1|1|1', action: 'check', expectVersion: 1, worker: '山田', staffId: 7, deviceId: 1, deviceLabel: 'iPad1' });
   ok(r1.ok && r1.state.status === 'checked' && r1.state.version === 2 && r1.state.checked_by === '山田', '確認 → checked v2');
   const r2 = applyCheck({ batchId: b.id, lineKey: 'AR1|1|1', action: 'check', expectVersion: 1, worker: '佐藤' });
   ok(!r2.ok && r2.error === 'conflict' && r2.current.checked_by === '山田', '同時確認 (古い version) = conflict + 現在状態');
@@ -136,6 +149,7 @@ console.log('\n[3] 消し込み');
   ok(un.ok && un.state.status === 'unchecked' && un.state.version === 3 && un.state.checked_by === null, '取消 → unchecked v3');
   const ev = listEvents(b.id);
   ok(ev.length === 2 && ev[1].action === 'uncheck' && ev[1].reverted_event_id === ev[0].id, '取消イベントが確認イベントを指す');
+  ok(ev[0].staff_id === 7 && ev[1].staff_id === null, 'events.staff_id (確認=7 / 取消は未指定=null)');
   ok(applyCheck({ batchId: b.id, lineKey: 'AR1|1|1', action: 'check', worker: '山田', expectVersion: 3 }).ok, '再確認 (version 3) OK');
   ok(applyCheck({ batchId: b.id, lineKey: 'AR2|1|1', action: 'check', worker: '山田', expectVersion: 1 }).ok, 'AR2 確認');
   ok(getState().totals.checked === 2, '確認数 2');
@@ -206,11 +220,12 @@ console.log('\n[5] 端末・作業者・掃除');
   ok(verifyDevice('bogus') === null, '不正トークン = null');
   ok(revokeDevice(d.id) && verifyDevice(tok) === null, '失効後は検証NG');
   ok(listDevices().length === 1 && listDevices()[0].revoked_at, '端末一覧に失効が見える');
-  const w = addWorker('山田');
-  ok(w.code === 'w01' && listWorkers().length === 1, '作業者追加 w01');
-  throwsWith(() => addWorker('山田'), /既に/, '同名は拒否');
-  throwsWith(() => addWorker(''), /1〜20/, '空は拒否');
-  ok(setWorkerActive('w01', false) && listWorkers().length === 0 && listWorkers(true).length === 1, '無効化は一覧から消えるが includeInactive で残る');
+  const ws = listWorkers();
+  ok(ws.length === 13 && ws[0].code === '0001' && ws[0].name === '中原 大輔', 'listWorkers = スタッフマスタ seed 13名 (code=管理番号)');
+  const gw = getWorker('20250901');
+  ok(gw && gw.name === '星 立夏' && Number.isInteger(gw.staff_id), 'getWorker(管理番号) → 名前 + staff_id');
+  ok(getWorker('w01') === null, '旧コード w01 は存在しない');
+  ok(!db.prepare("SELECT 1 FROM sqlite_master WHERE name='f_inbound_check_workers'").get(), '旧作業者表は DROP 済み');
   // 保持期間: 古い superseded バッチを消す (active は消さない)
   db.prepare("UPDATE f_inbound_check_batches SET imported_at = '2020-01-01T00:00:00.000Z' WHERE status = 'superseded'").run();
   db.prepare("UPDATE f_inbound_check_import_log SET at = '2020-01-01T00:00:00.000Z'").run();

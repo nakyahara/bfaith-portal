@@ -19,7 +19,7 @@ import multer from 'multer';
 import {
   getState, applyCheck, importCsv, getActiveBatch, listBatches, listImportLog, listEvents, eventsCsv,
   createDevice, verifyDevice, revokeDevice, listDevices,
-  listWorkers, getWorker, addWorker, setWorkerActive,
+  listWorkers, getWorker,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -136,11 +136,11 @@ router.get('/api/state', api((req, res) => {
 function resolveWorker(req) {
   const code = String(req.body?.worker_code || '').trim();
   if (code) {
-    const w = getWorker(code);
-    if (!w || !w.active) return { error: '作業者が見つかりません (管理画面で登録してください)' };
-    return { worker: w.name };
+    const w = getWorker(code);   // code = スタッフ管理番号 (apps/staff)
+    if (!w || !w.active) return { error: '作業者が見つかりません (スタッフマスタで有効なスタッフを選んでください)' };
+    return { worker: w.name, staffId: w.staff_id };
   }
-  if (req.icUser) return { worker: req.session.displayName || req.icUser };
+  if (req.icUser) return { worker: req.session.displayName || req.icUser, staffId: null };
   return { error: '作業者を選んでください' };
 }
 
@@ -157,6 +157,7 @@ function handleCheck(action) {
       batchId: batch_id, lineKey: String(line_key || ''), action,
       expectVersion: ev,
       worker: w.worker,
+      staffId: w.staffId,
       deviceId: req.icDevice ? req.icDevice.id : null,
       deviceLabel: req.icDevice ? req.icDevice.label : (req.icUser ? `session:${req.icUser}` : null),
     });
@@ -182,7 +183,7 @@ router.get('/admin', requireSession, (req, res) => {
     batches: listBatches(30),
     importLog: listImportLog(20),
     devices: isAdmin(req) ? listDevices() : [],
-    workers: isAdmin(req) ? listWorkers(true) : [],
+    workers: listWorkers(),   // = スタッフマスタの有効スタッフ (表示のみ。編集は /apps/staff)
   });
 });
 
@@ -235,18 +236,7 @@ router.post('/device/exit', checkOrigin, api((req, res) => {
   res.json({ ok: true, revoked: !!req.icDevice });
 }));
 
-router.post('/admin/workers', checkOrigin, requireAdmin, api((req, res) => {
-  try {
-    res.json({ ok: true, worker: addWorker(req.body?.name) });
-  } catch (e) {
-    res.status(400).json({ ok: false, error: 'bad_worker', message: e.message });
-  }
-}));
-
-router.post('/admin/workers/:code/active', checkOrigin, requireAdmin, api((req, res) => {
-  if (!setWorkerActive(req.params.code, !!req.body?.active)) return res.status(404).json({ ok: false, error: 'not_found', message: '作業者が見つかりません' });
-  res.json({ ok: true });
-}));
+// 作業者の追加・無効化は /apps/staff (スタッフマスタ) で行う。ここには経路を持たない
 
 router.get('/admin/history', requireAdmin, api((req, res) => {
   const id = Number(req.query.batch_id);
