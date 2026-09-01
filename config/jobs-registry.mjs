@@ -448,7 +448,10 @@ export const JOBS_REGISTRY = [
       '翌日 late で赤くなる。「正常終了しているが仕事が無い」を ok にしたせいで 2026-08-07〜27 の20日間、' +
       '監視が緑のまま何も進まなかった — ここを緑に戻してはいけない。' +
       '③ 収集の完全性は `node finder.js --status` で見る (⚠️不完全 = 進捗率は「下限」)。' +
-      '④ 画面 = ポータル /apps/product-scout。供給は `node concepts.js` → `node push.js`。' +
+      '④ 画面 = ポータル /apps/product-scout。供給 (concepts.js → push.js) はランナーが毎回自動で行う。' +
+      '⚠️送信に失敗しても収集は止めない設計なので、画面が古いと思ったら products.log の ' +
+      '「publish start」以降を見ること (2026-08-28〜09-01 は publish 自体が配線されておらず、' +
+      '収集は進んでいるのに画面だけ4日間古いままだった)。手動なら `node concepts.js && node push.js`。' +
       '2度の停止事故の教訓で毎日実行化 (2026-08-01)、空回り検知と自動投入を追加 (2026-08-28)',
   },
   {
