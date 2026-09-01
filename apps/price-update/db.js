@@ -91,6 +91,14 @@ export function createTables(db) {
     PRIMARY KEY (run_id, operation_id)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_pu_ops_ne ON pu_operations(ne_code)');
+  // 復旧 run の行が「元の run のどの行を戻そうとしているか」(M2-4)。
+  // CREATE TABLE IF NOT EXISTS は既存表に列を足さないので、無ければ ALTER で足す
+  {
+    const cols = db.prepare('PRAGMA table_info(pu_operations)').all().map((c) => c.name);
+    if (!cols.includes('source_operation_id')) {
+      db.exec('ALTER TABLE pu_operations ADD COLUMN source_operation_id TEXT');
+    }
+  }
 
   // 状態遷移・手動更新の記録はすべてここに追記する (行の書き換えをしない)
   db.exec(`CREATE TABLE IF NOT EXISTS pu_events (
@@ -160,10 +168,12 @@ export function insertRun(db, { createdBy, kind = 'normal', note = null, neCodes
   const insOp = db.prepare(`INSERT INTO pu_operations
     (run_id, operation_id, seq, mall, ne_code, row_kind, via_code, product_name, listing_code, sku_code,
      confidence, price_source, price_fetched_at, expected_current_price, new_price,
-     cost_excl_tax, tax_rate, shipping_cost, fee_rate, initial_state, guard_json, product_url, created_at)
+     cost_excl_tax, tax_rate, shipping_cost, fee_rate, initial_state, guard_json, product_url, created_at,
+     source_operation_id)
     VALUES (@run_id,@operation_id,@seq,@mall,@ne_code,@row_kind,@via_code,@product_name,@listing_code,@sku_code,
      @confidence,@price_source,@price_fetched_at,@expected_current_price,@new_price,
-     @cost_excl_tax,@tax_rate,@shipping_cost,@fee_rate,@initial_state,@guard_json,@product_url,@created_at)`);
+     @cost_excl_tax,@tax_rate,@shipping_cost,@fee_rate,@initial_state,@guard_json,@product_url,@created_at,
+     @source_operation_id)`);
   const insEvent = db.prepare(`INSERT INTO pu_events (run_id, seq, operation_id, at, actor, event, detail_json)
     VALUES (?,?,?,?,?,?,?)`);
 
@@ -195,6 +205,7 @@ export function insertRun(db, { createdBy, kind = 'normal', note = null, neCodes
         guard_json: op.guard ? JSON.stringify(op.guard) : null,
         product_url: op.productUrl ?? null,
         created_at: now,
+        source_operation_id: op.sourceOperationId ?? null,
       });
     }
     insEvent.run(runId, 0, null, now, createdBy, 'run_created', JSON.stringify({ operations: operations.length }));
@@ -265,8 +276,14 @@ export function getRun(db, runId) {
 
 export function listRuns(db, limit = 50) {
   return db.prepare(`
-    SELECT r.run_id, r.created_at, r.created_by, r.kind, r.note,
+    SELECT r.run_id, r.created_at, r.created_by, r.kind, r.note, r.source_run_id,
            (SELECT COUNT(*) FROM pu_operations o WHERE o.run_id = r.run_id) AS op_count
       FROM pu_runs r ORDER BY r.created_at DESC LIMIT ?
   `).all(limit);
+}
+
+/** この run を元にした復旧 run (新しい順)。二重に作らせないための確認に使う */
+export function recoveryRunsOf(db, sourceRunId) {
+  return db.prepare('SELECT run_id, created_at, created_by FROM pu_runs WHERE source_run_id = ? ORDER BY created_at DESC')
+    .all(sourceRunId);
 }

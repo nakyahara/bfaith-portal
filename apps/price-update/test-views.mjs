@@ -145,10 +145,11 @@ for (const name of ['index.ejs', 'run.ejs']) {
       events: [],
     },
   }, { filename: file });
-  ok(render('https://item.rakuten.co.jp/x/y/').includes('>開く</a>'), '正しい URL はリンクになる');
-  ok(!render('javascript:alert(1)').includes('開く</a>'), '★javascript: の URL はリンクにしない');
+  const LINK = 'target=' + String.fromCharCode(34) + '_blank' + String.fromCharCode(34);
+  ok(render('https://item.rakuten.co.jp/x/y/').includes(LINK), '正しい URL はリンクになる');
+  ok(!render('javascript:alert(1)').includes(LINK), '★javascript: の URL はリンクにしない');
   ok(!render('javascript:alert(1)').includes('javascript:'), 'href に入れない');
-  ok(!render('  JavaScript:alert(1)').includes('開く</a>'), '前後の空白・大文字でもすり抜けない');
+  ok(!render('  JavaScript:alert(1)').includes(LINK), '前後の空白・大文字でもすり抜けない');
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);

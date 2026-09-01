@@ -15,7 +15,8 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { loadDimMall } from '../../lib/dim-mall.js';
-import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim } from './db.js';
+import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim, recoveryRunsOf } from './db.js';
+import { planRecovery, buildRecoveryOperations, RECOVERABLE_STATES } from './recovery.js';
 import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
 import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot } from './live-price.js';
 import { evaluateRow, runLimits } from './pricing.js';
@@ -515,6 +516,92 @@ router.get('/api/runs/:runId/executable', (req, res) => {
     });
   } catch (e) {
     apiError(res, e, 'executable');
+  }
+});
+
+/**
+ * 復旧 run を作る (要件 F6・M2-4)。
+ * ★戻す先の価格は **監査記録から取る**。画面からは run_id しか受け取らない
+ *   (「戻すつもりで別の値を送る」余地を作らない)。
+ * ★作るだけでは何も送らない。送信はいつも通り実行API (確認文字列 + claim + 試運転 + 照合) を通る。
+ */
+router.post('/api/runs/:runId/recovery', async (req, res) => {
+  try {
+    const db = getDB();
+    // 価格を戻すのも価格を変える操作。実行と同じ名簿で守る
+    const gate = executorGate(req);
+    if (!gate.ok) return res.status(403).json({ ok: false, error: 'forbidden', message: gate.message });
+
+    const source = getRun(db, req.params.runId);
+    if (!source) throw validationError('元の履歴が見つかりません');
+
+    // 二重に作らせない。前の復旧 run がまだ実行されていないなら、そちらへ誘導する
+    for (const prev of recoveryRunsOf(db, source.run_id)) {
+      if (!runClaim(db, prev.run_id)) {
+        return res.status(409).json({
+          ok: false, error: 'recovery_exists', runId: prev.run_id,
+          message: `この履歴の復旧 run は既に作ってあります (${prev.run_id})。そちらを実行してください`,
+        });
+      }
+    }
+
+    const { candidates, skipped } = planRecovery(source);
+    if (candidates.length === 0) {
+      throw validationError('戻す対象がありません (価格が変わった行がこの履歴にはありません)');
+    }
+
+    // いま引き当て直してライブ価格を取る (楽観ロックの基準は「いまモールにある価格」)
+    const codes = [...new Set(candidates.map((c) => c.op.ne_code))];
+    const { rows, notices } = await buildPreviewRows(db, codes, new Map());
+    const evaluate = (row) => evaluateRows([row], { isRecovery: true })[0];
+    const { operations, unmatched } = buildRecoveryOperations(candidates, rows, evaluate);
+    if (operations.length === 0) {
+      throw validationError('戻す対象の出品が今は見つかりません。モールの画面で確認してください');
+    }
+
+    const runId = insertRun(db, {
+      createdBy: actorOf(req),
+      kind: 'recovery',
+      sourceRunId: source.run_id,
+      note: `${source.run_id} を元の価格に戻す`,
+      neCodes: codes,
+      limits: runLimits(),
+      operations,
+    });
+    // 元の run 側にも「復旧 run を作った」ことを残す (追記のみ)
+    appendEvent(db, source.run_id, {
+      actor: actorOf(req), event: 'recovery_created',
+      detail: { recoveryRunId: runId, rows: operations.length },
+    });
+    res.json({
+      ok: true, runId, rows: operations.length,
+      skipped: skipped.map((s) => ({ operationId: s.op.operation_id, neCode: s.op.ne_code, reason: s.reason })),
+      unmatched: unmatched.map((u) => ({ operationId: u.op.operation_id, neCode: u.op.ne_code, reason: u.reason })),
+      notices,
+    });
+  } catch (e) {
+    apiError(res, e, 'create-recovery');
+  }
+});
+
+/** 復旧 run を作れるか (画面がボタンを出すかの判断材料) */
+router.get('/api/runs/:runId/recoverable', (req, res) => {
+  try {
+    const db = getDB();
+    const run = getRun(db, req.params.runId);
+    if (!run) return res.status(404).json({ ok: false, error: 'not_found' });
+    const { candidates } = planRecovery(run);
+    const existing = recoveryRunsOf(db, run.run_id).map((r) => ({ ...r, executed: !!runClaim(db, r.run_id) }));
+    res.json({
+      ok: true,
+      rows: candidates.length,
+      states: RECOVERABLE_STATES,
+      canCreate: canExecute(req),
+      canCreateReason: executorGate(req).message,
+      existing,
+    });
+  } catch (e) {
+    apiError(res, e, 'recoverable');
   }
 });
 
