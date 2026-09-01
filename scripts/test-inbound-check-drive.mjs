@@ -92,5 +92,17 @@ console.log('\n[6] cron の有効判定');
   if (prev.render !== undefined) process.env.RENDER = prev.render;
 }
 
+console.log('\n[7] lib/drive-csv の戻り値の形 (取り違えると本番で落ちる)');
+{
+  // 🚨2026-09-01 実障害: downloadDriveCsv の戻り値を Buffer だと思って importCsv に渡し、
+  //   本番で The "data" argument must be of type string or an instance of Buffer... で失敗した。
+  //   実際は { ...info, buffer } なので、その契約を固定して壊れたら気づけるようにする
+  const src = fs.readFileSync(new URL('../lib/drive-csv.js', import.meta.url), 'utf8');
+  ok(/return \{ \.\.\.info, buffer \}/.test(src), 'downloadDriveCsv は { ...info, buffer } を返す');
+  const df = fs.readFileSync(new URL('../apps/inbound-check/drive-fetch.js', import.meta.url), 'utf8');
+  ok(/const buffer = dl\.buffer;/.test(df), 'drive-fetch は dl.buffer を取り出している');
+  ok(/dl\.modified_time/.test(df), '生成時刻は DL 直後の metadata (dl.modified_time) から採る');
+  ok(!/const buffer = await downloadDriveCsv/.test(df), '戻り値をそのまま Buffer として扱っていない');
+}
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;
