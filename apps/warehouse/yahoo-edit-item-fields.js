@@ -74,12 +74,33 @@ export function editItemError(res) {
  */
 export function isDefiniteRejection(err) {
   if (!err) return false;
-  // ★実測した形だけを「弾かれた」と言い切る (Codex R1):
-  //   4xx + <Target> で項目を名指し + <Code> か Status NG が付いている。
-  //   Code だけの見たことがない 400 は言い切らない (書き込まれたかもしれない方に倒す)
-  if (err.status < 400 || err.status >= 500) return false;
-  if (!err.target) return false;
-  return Boolean(err.code || err.ng);
+  // ★実測した形だけを「弾かれた」と言い切る (Codex R1/R5)。
+  //   ここが広いと「部分的に書き換えてから別項目のエラーを返す応答」まで
+  //   「書き込みは起きていない」と誤判定し、戻しを飛ばしてしまう。
+  //   → 実際に見たことのある status + エラーコードの組み合わせだけ。
+  //     知らないコードは言い切らない (戻しに行く方に倒す)
+  if (err.status !== 400 || !err.target) return false;
+  return KNOWN_REJECT_CODES.has(String(err.code || ''));
+}
+
+/**
+ * 「送る前に弾かれた」と実測で確認できているエラーコード。
+ * ★増やしてよいのは **実機で見て、商品が書き換わっていないことを確かめたもの** だけ。
+ * - it-01011 … 必須項目が足りない (2026-09-01 実測: Target=path「パスは必須です」)
+ */
+export const KNOWN_REJECT_CODES = new Set(['it-01011']);
+
+/**
+ * 「この項目が足りない」と教えてくれている応答か。足りない項目名を返す (無ければ null)。
+ * ★これは **必須項目を割り出すループを進めてよいか** の判断。
+ *   「戻しを飛ばしてよいか」(isDefiniteRejection) とは別物にしてある。
+ *   見たことのないコードでも、項目名を名指ししているなら足して再送してよい
+ *   (足して送るのは元の値そのままなので、間違った値で壊すことにはならない)。
+ */
+export function missingFieldTarget(err) {
+  if (!err || err.status < 400 || err.status >= 500) return null;
+  const t = String(err.target || '').trim();
+  return t || null;
 }
 
 /**

@@ -6,7 +6,9 @@
  *
  * 実行: node apps/warehouse/test-yahoo-edit-item-fields.mjs
  */
-import { editItemError, isDefiniteRejection, fieldValueFrom, FIELD_SOURCES } from './yahoo-edit-item-fields.js';
+import {
+  editItemError, isDefiniteRejection, missingFieldTarget, fieldValueFrom, FIELD_SOURCES, KNOWN_REJECT_CODES,
+} from './yahoo-edit-item-fields.js';
 import { flattenXml, itemBaseOf } from './yahoo-edit-item-probe.js';
 
 let failed = 0;
@@ -60,6 +62,17 @@ console.log('\n── 「送る前に弾かれた」と言い切れるか ──
     '★項目を名指ししていない 400 は言い切らない');
   ok(!isDefiniteRejection(editItemError({ status: 400, body: '<Result><Target>path</Target></Result>' })),
     '★Target だけで Code も NG も無い 400 も言い切らない');
+  // ★実測したコードだけを『弾かれた』と言い切る (Codex R5)
+  ok(!isDefiniteRejection(editItemError({ status: 400, body: '<Result><Status>NG</Status><Error><Target>name</Target><Code>it-99999</Code></Error></Result>' })),
+    '★見たことのないコードは言い切らない (戻しに行く)');
+  ok(KNOWN_REJECT_CODES.has('it-01011'), '実測したコードは一覧にある');
+  eq(KNOWN_REJECT_CODES.size, 1, '一覧に入っているのは実測したものだけ');
+
+  // ★ループを進める判断は別。見たことのないコードでも項目名を名指ししていれば進める
+  eq(missingFieldTarget(editItemError({ status: 400, body: '<Result><Error><Target>name</Target><Code>it-99999</Code></Error></Result>' })), 'name',
+    '★見たことのないコードでも、足りない項目は読む');
+  eq(missingFieldTarget(editItemError({ status: 500, body: 'boom' })), null, '5xx は項目を読まない');
+  eq(missingFieldTarget(editItemError({ status: 400, body: '<Result><Code>x</Code></Result>' })), null, 'Target が無ければ null');
 }
 
 console.log('\n── 「前」の応答から値を取る ──');

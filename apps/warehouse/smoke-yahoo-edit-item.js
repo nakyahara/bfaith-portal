@@ -22,7 +22,9 @@
  *   - さらに **商品名に「zz検証用」が入っていること** を実物で確かめてから書き込む
  *   - 送る値はすべて **getItem で取った「前」の値そのまま**。当てずっぽうの値は作らない
  *   - 知らない項目名を要求されたら止める (適当な値で商品を書き換えない)
- *   - 「送る前に弾かれた」と言い切れる失敗 (4xx + 項目名つき) なら書き込みは起きていないので戻さない
+ *   - **実測したエラーコードで弾かれた回だけ** は書き込みが起きていないので、戻しの送信もしない
+ *     (もし送らなかった項目が消える仕様なら、戻しのつもりの書き込み自体が画像などを消しかねない)。
+ *     見たことのない応答は「書き込まれたかもしれない」に倒して戻しに行く
  *   - 送信の応答が返らなかった回は、戻したあとも時間を置いて確かめ直し、
  *     最後は「あとで管理画面でもう一度確かめてください」と人に引き継ぐ (証明できないため)
  *
@@ -37,7 +39,9 @@ import {
   flattenXml, diff, collateralOf, guardTestCode, guardTestItem, itemPriceOf, itemBaseOf,
   TEST_NAME_MARKER,
 } from './yahoo-edit-item-probe.js';
-import { editItemError, isDefiniteRejection, fieldValueFrom, FIELD_SOURCES } from './yahoo-edit-item-fields.js';
+import {
+  editItemError, isDefiniteRejection, missingFieldTarget, fieldValueFrom, FIELD_SOURCES, KNOWN_REJECT_CODES,
+} from './yahoo-edit-item-fields.js';
 
 const TIMEOUT_MS = 30_000;
 /** 送信がタイムアウトした後、遅れて効いてくる変更を捕まえるための待ち時間 */
@@ -133,14 +137,20 @@ async function sendAddingRequiredFields(before, itemBase, price) {
     }
     console.log(`    → HTTP ${err.status} / Target=${err.target ?? '(なし)'} Code=${err.code ?? '(なし)'} ${oneLine(err.message)}`);
 
-    if (!isDefiniteRejection(err)) {
-      // 何が起きたか言い切れない = 書き込まれたかもしれない
-      uncertain = true;
-      return { applied: false, fields, required, uncertain, stopReason: `想定していない応答です (HTTP ${err.status})` };
-    }
-    const target = String(err.target || '').trim();
+    // ★ループを進めてよいか = 「足りない項目」を名指ししているか。
+    //   「戻しを飛ばしてよいか」(isDefiniteRejection) とは別の判断にしてある (Codex R5)
+    const target = missingFieldTarget(err);
     if (!target) {
-      return { applied: false, fields, required, uncertain, stopReason: `どの項目が足りないのか分かりません (${oneLine(err.message)})` };
+      // 何が起きたか言い切れない = 書き込まれたかもしれない
+      uncertain = !isDefiniteRejection(err);
+      return { applied: false, fields, required, uncertain,
+        stopReason: `どの項目が足りないのか分かりません (HTTP ${err.status} / ${oneLine(err.message)})` };
+    }
+    if (!KNOWN_REJECT_CODES.has(String(err.code || ''))) {
+      // 見たことのないコード。項目を足して進むのはよいが、
+      // 「書き込みは起きていない」とは言い切らない (最後に戻しへ行く)
+      console.log(`    ⚠️ 見たことのないエラーコードです (${err.code ?? 'なし'})。念のため、最後に戻しを送ります`);
+      uncertain = true;
     }
     if (Object.prototype.hasOwnProperty.call(fields, target)) {
       // 既に送っているのに同じ項目を指されている = 値の中身が悪い。当てずっぽうで直さない
