@@ -28,17 +28,82 @@ export function guardTestCode(itemCode) {
 }
 
 /**
+ * その道すじが「base の直下の tag」か (連番は問わない)。
+ * ★正規表現を組み立てない。道すじには [ ] が入るので、埋め込むと壊れやすい。
+ */
+export function isDirectChild(path, base, tag) {
+  if (!base) return false;
+  const head = `${base}/${tag}[`;
+  const p = String(path || '');
+  if (!p.startsWith(head)) return false;
+  const rest = p.slice(head.length);
+  return rest.endsWith(']') && /^\d+$/.test(rest.slice(0, -1));
+}
+
+/**
+ * 商品本体の要素の道すじを返す (例: "ResultSet[0]/Result[0]")。決められなければ null。
+ *
+ * ★「ルート直下が商品」と決め打ちしない。
+ *   実測 (2026-09-01): getItem の応答は ResultSet > Result の二段で、商品本体は 2 階層目にある。
+ * ★さらに **ItemCode の値が、こちらが指定したコードと一致する要素** に限る (Codex R1)。
+ *   最初に見つけた ItemCode を使うと、応答に商品が複数あった時に別商品を本体とみなし、
+ *   その別商品の名前に目印があれば門番を通り抜けてしまう。
+ *   一致が 0 件でも 2 件以上でも null にする (決められないなら動かさない)。
+ *
+ * @param {Map<string,string>} flat
+ * @param {string} expectedItemCode 指定した商品コード
+ */
+export function itemBaseOf(flat, expectedItemCode) {
+  const want = String(expectedItemCode || '').trim().toLowerCase();
+  if (!want) return null;
+  // 商品要素ごとに、直下の ItemCode を全部集める
+  const byBase = new Map();
+  for (const [k, v] of flat) {
+    const m = String(k).match(/^(.*)\/ItemCode\[\d+\]$/);
+    // ★商品要素の形も限定する (Codex R6)。ItemCode を持つ要素なら何でも商品本体、にすると、
+    //   入れ子の要素に ItemCode・目印つき Name・Price が揃っていれば門番を通ってしまう。
+    //   実測の形 (ResultSet > Result) 以外は「知らない構造」として動かさない側に倒す
+    if (!m || !ITEM_BASE_SHAPE.test(m[1])) continue;
+    if (!byBase.has(m[1])) byBase.set(m[1], []);
+    byBase.get(m[1]).push(String(v).trim().toLowerCase());
+  }
+  // ★まず「指定コードを名乗る商品要素」を数える。2つ以上あるなら、片方が壊れた形でも決めない。
+  //   ここで「きれいな方を採る」と、もう片方の存在を見なかったことにしてしまう (Codex R8)
+  const mentioning = [...byBase.entries()].filter(([, codes]) => codes.includes(want));
+  if (mentioning.length !== 1) return null;
+  // ★その1つの直下の ItemCode がちょうど1個であること。
+  //   「一致するものが1個あればよい」だと、別コードが並んでいても通ってしまう (Codex R7)
+  const [base, codes] = mentioning[0];
+  return codes.length === 1 ? base : null;
+}
+
+/** 商品本体の道すじの形 (実測 2026-09-01: getItem は ResultSet > Result の二段) */
+export const ITEM_BASE_SHAPE = /^ResultSet\[\d+\]\/Result\[\d+\]$/;
+
+/**
  * 取ってきた商品が「捨ててよい検証用商品」か。問題なければ null、駄目なら理由。
  * ★商品名に目印が入っていることを、書き込む前に実物で確かめる。
  * @param {Map<string,string>} flat flattenXml の戻り
+ * @param {string} itemCode 指定した商品コード (応答の中でこのコードの商品を特定するため)
  */
-export function guardTestItem(flat) {
-  // ★商品本体の名前だけを見る (ルート直下の Name)。入れ子のどこかに目印があれば通る、では門番にならない
+export function guardTestItem(flat, itemCode) {
+  const base = itemBaseOf(flat, itemCode);
+  if (!base) {
+    return `応答の中から商品コード ${itemCode || '(未指定)'} の商品を1つに特定できませんでした。`
+      + '検証用商品か確かめられないので動かしません';
+  }
+  // ★商品本体の名前だけを見る。入れ子のどこかに目印があれば通る、では門番にならない
   const names = [...flat.entries()]
-    .filter(([k]) => /^[^/]+\/Name\[\d+\]$/.test(k))
+    .filter(([k]) => isDirectChild(k, base, 'Name'))
     .map(([, v]) => v);
   if (names.length === 0) return '商品名を読めませんでした。検証用商品か確かめられないので動かしません';
-  if (!names.some((n) => n.includes(TEST_NAME_MARKER))) {
+  // ★商品名が複数あるのは想定外。「どれか1つに目印があれば通す」にすると、
+  //   本番名と目印が並んでいる時に通ってしまう (Codex R2)。1つに定まらなければ動かさない
+  if (names.length > 1) {
+    return `商品名が ${names.length} 個ありました (${names.join(' / ')})。`
+      + 'どれが商品名か決められないので動かしません';
+  }
+  if (!names[0].includes(TEST_NAME_MARKER)) {
     return `商品名に「${TEST_NAME_MARKER}」が入っていません (実際: ${names[0]})。`
       + '捨ててよい検証用商品であることを確かめられないため動かしません';
   }
@@ -119,12 +184,14 @@ export function isPricePath(path) {
 }
 
 /**
- * **商品本体の** 価格の道すじか (ルート直下の Price)。
+ * **商品本体の** 価格の道すじか。
  * ★「変わってよい」のはここだけ。SKU の価格まで見逃すと、
  *   item_code と price を送っただけで SKU の価格が動いても部分更新だと誤って結論する (Codex R5)。
+ * @param {string} path
+ * @param {string|null} itemBase itemBaseOf() の戻り。null なら「商品本体ではない」扱い (fail-closed)
  */
-export function isItemPricePath(path) {
-  return /^[^/]+\/Price\[\d+\]$/.test(String(path || ''));
+export function isItemPricePath(path, itemBase) {
+  return isDirectChild(path, itemBase, 'Price');
 }
 
 /**
@@ -132,24 +199,33 @@ export function isItemPricePath(path) {
  * ★変わった (価格以外) / 消えた / **増えた** の3つとも数える。
  *   増えたものを無視すると、項目が生えた時に部分更新だと誤って結論する (Codex R2)。
  * @param {{changed:Array,removed:Array,added:Array}} d diff() の戻り
+ * @param {string|null} itemBase itemBaseOf() の戻り
  */
-export function collateralOf(d) {
+export function collateralOf(d, itemBase) {
   return [
     // ★除外するのは商品本体の価格だけ。SKU の価格が動いたのは「価格以外の変化」として数える
-    ...(d.changed || []).filter((x) => !isItemPricePath(x.path)),
+    ...(d.changed || []).filter((x) => !isItemPricePath(x.path, itemBase)),
     ...(d.removed || []),
     ...(d.added || []),
   ];
 }
 
-/** 商品本体の価格 (SubCode 配下ではないもの) を1つ返す。読めなければ null */
-export function itemPriceOf(flat) {
-  for (const [k, v] of flat) {
-    if (!isItemPricePath(k)) continue;
-    const n = Number(v);
-    return Number.isInteger(n) ? n : null;
-  }
-  return null;
+/**
+ * 商品本体の価格。読めなければ null
+ * @param {Map<string,string>} flat
+ * @param {string} itemCode 指定した商品コード
+ */
+export function itemPriceOf(flat, itemCode) {
+  const base = itemBaseOf(flat, itemCode);
+  if (!base) return null;
+  const values = [...flat.entries()].filter(([k]) => isItemPricePath(k, base)).map(([, v]) => v);
+  // ★商品直下の Price が複数 = 想定外の構造。どれが売価か決められないので読めない扱いにする。
+  //   最初の1つを採るとその値を基準に値付けしてしまう (Codex R3)
+  if (values.length !== 1) return null;
+  const n = Number(values[0]);
+  // ★安全整数の範囲まで見る。範囲外だと currentPrice + 1 が currentPrice と同じ値になり、
+  //   価格が変わっていないのに「変わった」と読んでしまう (Codex R4)
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 /**

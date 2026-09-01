@@ -30,7 +30,7 @@
  */
 import 'dotenv/config';
 import {
-  flattenXml, diff, collateralOf, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
+  flattenXml, diff, collateralOf, guardTestCode, guardTestItem, itemPriceOf, editItemFailure, itemBaseOf,
   TEST_NAME_MARKER,
 } from './yahoo-edit-item-probe.js';
 
@@ -38,6 +38,8 @@ const TIMEOUT_MS = 30_000;
 /** 送信がタイムアウトした後、遅れて効いてくる変更を捕まえるための待ち時間 */
 const SETTLE_WAIT_MS = 15_000;
 const SETTLE_ROUNDS = 3;
+/** 価格の上限 (楽天側のガードと同じ)。これ以上は検証用としても扱わない */
+const MAX_PRICE = 999999999;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const args = process.argv.slice(2);
@@ -101,13 +103,13 @@ async function main() {
   const before = await flattenXml(beforeXml);
   console.log(`「前」の項目数: ${before.size} (XML ${beforeXml.length} バイト)`);
 
-  const currentPrice = itemPriceOf(before);
+  const currentPrice = itemPriceOf(before, itemCode);
   console.log(`いまの価格: ${currentPrice ?? '(読めません)'}`);
   const sample = [...before.entries()].filter(([, v]) => v && v.length < 60).slice(0, 15);
   console.log('項目の例:');
   for (const [k, v] of sample) console.log(`  ${k} = ${v}`);
 
-  const itemGuard = guardTestItem(before);
+  const itemGuard = guardTestItem(before, itemCode);
   if (itemGuard) {
     console.log(`\n⚠️ ${itemGuard}`);
     if (live) throw new Error(`書き込みできません。商品名に「${TEST_NAME_MARKER}」を入れてください`);
@@ -116,8 +118,10 @@ async function main() {
     console.log('\n--live を付けると、価格だけを送って前後を突き合わせます。');
     return;
   }
-  if (!Number.isInteger(currentPrice) || currentPrice <= 0) {
-    throw new Error('いまの価格を整数で読めないため、書き込みは行いません');
+  // ★+1 した後の値まで妥当か見る。上限ぎりぎりだと足した瞬間に扱えない数になり、
+  //   「変わっていないのに変わった」と読める (Codex R5)
+  if (!Number.isSafeInteger(currentPrice) || currentPrice <= 0 || currentPrice >= MAX_PRICE) {
+    throw new Error(`いまの価格 (${currentPrice}) が 1〜${(MAX_PRICE - 1).toLocaleString()} の整数ではないため、書き込みは行いません`);
   }
 
   const probePrice = currentPrice + 1;
@@ -149,7 +153,7 @@ async function main() {
     report('価格だけ送ったあとの差分', d1);
 
     // ★価格が実際に変わっていなければ、「他が変わっていない」ことに意味は無い
-    const afterPrice = itemPriceOf(after);
+    const afterPrice = itemPriceOf(after, itemCode);
     if (afterPrice !== probePrice) {
       console.error(`\n⚠️ 価格が ${probePrice} になっていません (実際: ${afterPrice})。`
         + '送信が効いていないので、部分更新かどうかは判定できません');
@@ -157,7 +161,7 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    const collateral = collateralOf(d1);
+    const collateral = collateralOf(d1, itemBaseOf(before, itemCode));
     console.log(`\n${collateral.length === 0
       ? '✅ 価格は変わり、価格以外は変わっていません → editItem は「送った項目だけ変える」= 部分更新'
       : `🚨 価格以外が ${collateral.length} 項目 変わった/消えた → editItem は全項目上書き。価格だけ送ってはいけない`}`);
@@ -174,7 +178,7 @@ async function main() {
           process.exitCode = 1;
         } else {
           const restored = await flattenXml(await getRawXml(itemCode));
-          const restoredPrice = itemPriceOf(restored);
+          const restoredPrice = itemPriceOf(restored, itemCode);
           report('元に戻したあと、最初との差分', diff(before, restored));
           if (restoredPrice !== currentPrice) {
             console.error(`🚨 価格が ${currentPrice} に戻っていません (実際: ${restoredPrice})。Yahoo の管理画面で直してください`);
@@ -208,7 +212,7 @@ async function settleAfterUncertainSend(code, wantPrice) {
     await sleep(SETTLE_WAIT_MS);
     let now;
     try {
-      now = itemPriceOf(await flattenXml(await getRawXml(code)));
+      now = itemPriceOf(await flattenXml(await getRawXml(code)), code);
     } catch (e) {
       console.error(`  確かめられませんでした (${e.message})`);
       continue;

@@ -8,6 +8,7 @@
  */
 import {
   flattenXml, diff, isPricePath, isItemPricePath, collateralOf, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
+  itemBaseOf, isDirectChild,
 } from './yahoo-edit-item-probe.js';
 
 let failed = 0;
@@ -83,13 +84,65 @@ console.log('\n── 価格の読み方 ──');
   ok(isPricePath('Result[0]/SubCodes[0]/SubCode[0]/Price[0]'), 'SKU の価格');
   ok(!isPricePath('Result[0]/Name[0]'), '商品名は価格ではない');
 
-  ok(isItemPricePath('Result[0]/Price[0]'), '商品本体の価格');
-  ok(!isItemPricePath('Result[0]/SubCodes[0]/SubCode[0]/Price[0]'), '★SKU の価格は「商品本体の価格」ではない');
+  // ★実測の構造: ResultSet > Result の二段。商品本体はルート直下ではない (2026-09-01)
+  const real = await flattenXml('<ResultSet totalResultsReturned="1"><Result><ItemCode>zz-1</ItemCode>'
+    + '<Name>zz検証用 テスト</Name><Price>1080</Price>'
+    + '<SubCodes><SubCode code="a"><Price>1200</Price></SubCode></SubCodes></Result></ResultSet>');
+  const base = itemBaseOf(real, 'zz-1');
+  eq(base, 'ResultSet[0]/Result[0]', '★商品本体の場所は ItemCode から見つける (ルート直下と決め打ちしない)');
+  ok(isItemPricePath(base + '/Price[0]', base), '商品本体の価格');
+  ok(!isItemPricePath(base + '/SubCodes[0]/SubCode[0]/Price[0]', base), '★SKU の価格は「商品本体の価格」ではない');
+  ok(!isItemPricePath(base + '/Price[0]', null), '商品の場所が分からなければ本体扱いしない (fail-closed)');
+  eq(itemPriceOf(real, 'zz-1'), 1080, '★商品本体の価格を取る (SKU の価格と取り違えない)');
+  eq(itemBaseOf(await flattenXml('<R><Price>100</Price></R>'), 'zz-1'), null, 'ItemCode が無ければ場所を決めない');
+  eq(itemPriceOf(await flattenXml('<R><Price>100</Price></R>'), 'zz-1'), null, '場所が分からなければ価格も読まない');
+  // ★知らない構造は動かさない。入れ子に ItemCode・目印つき Name・Price が揃っていても通さない (Codex R6)
+  const fake = await flattenXml('<ResultSet><Result><ItemCode>real-1</ItemCode><Name>本物</Name><Price>500</Price>'
+    + '<Related><Item><ItemCode>zz-1</ItemCode><Name>zz検証用</Name><Price>1</Price></Item></Related></Result></ResultSet>');
+  eq(itemBaseOf(fake, 'zz-1'), null, '★入れ子の商品らしき要素は商品本体にしない');
+  ok(guardTestItem(fake, 'zz-1'), '★門番も通さない');
+  const odd = await flattenXml('<Other><Thing><ItemCode>zz-1</ItemCode><Name>zz検証用</Name><Price>1</Price></Thing></Other>');
+  eq(itemBaseOf(odd, 'zz-1'), null, '★ResultSet > Result 以外の形は知らない構造として扱う');
+  // ★同じ Result の直下に ItemCode が2つある = どの商品か決まっていない構造 (Codex R7)
+  const twoCodes = await flattenXml('<ResultSet><Result><ItemCode>zz-1</ItemCode><ItemCode>other-1</ItemCode>'
+    + '<Name>zz検証用</Name><Price>100</Price></Result></ResultSet>');
+  eq(itemBaseOf(twoCodes, 'zz-1'), null, '★直下の ItemCode が2つあれば特定できた扱いにしない');
+  ok(guardTestItem(twoCodes, 'zz-1'), '門番も通さない');
+  // ★きれいな Result と、壊れた形の同コード Result が並んでいたら、きれいな方を採らない (Codex R8)
+  const cleanPlusBroken = await flattenXml('<ResultSet>'
+    + '<Result><ItemCode>zz-1</ItemCode><Name>zz検証用</Name><Price>100</Price></Result>'
+    + '<Result><ItemCode>zz-1</ItemCode><ItemCode>other-1</ItemCode><Name>別物</Name><Price>200</Price></Result>'
+    + '</ResultSet>');
+  eq(itemBaseOf(cleanPlusBroken, 'zz-1'), null, '★同じコードを名乗る商品が2つあれば、きれいな方を採らない');
+  ok(guardTestItem(cleanPlusBroken, 'zz-1'), '門番も通さない');
+  eq(itemPriceOf(await flattenXml('<ResultSet><Result><ItemCode>x</ItemCode><Price>お問い合わせ</Price></Result></ResultSet>'), 'x'),
+    null, '整数で読めなければ null');
 
-  const flat = await flattenXml('<R><Price>1080</Price><SubCodes><SubCode code="a"><Price>1200</Price></SubCode></SubCodes></R>');
-  eq(itemPriceOf(flat), 1080, '★商品本体の価格を取る (SKU の価格と取り違えない)');
-  eq(itemPriceOf(await flattenXml('<R><Price>お問い合わせ</Price></R>')), null, '整数で読めなければ null');
-  eq(itemPriceOf(await flattenXml('<R><Name>x</Name></R>')), null, '価格が無ければ null');
+  // ★応答に商品が複数あっても、指定したコードの商品だけを本体とする (Codex R1)
+  const two = await flattenXml('<ResultSet>'
+    + '<Result><ItemCode>other-1</ItemCode><Name>zz検証用 まぎらわしい商品</Name><Price>1</Price></Result>'
+    + '<Result><ItemCode>zz-1</ItemCode><Name>本物</Name><Price>2</Price></Result></ResultSet>');
+  eq(itemBaseOf(two, 'zz-1'), 'ResultSet[0]/Result[1]', '★指定したコードの商品を選ぶ (最初の1つではない)');
+  eq(itemPriceOf(two, 'zz-1'), 2, '価格も指定した商品のもの');
+  eq(itemBaseOf(two, 'ZZ-1'), 'ResultSet[0]/Result[1]', '大小文字は無視して照合');
+  eq(itemBaseOf(two, 'not-there'), null, '一致が無ければ決めない');
+  eq(itemBaseOf(two, ''), null, 'コード未指定なら決めない (fail-closed)');
+  const dup = await flattenXml('<ResultSet>'
+    + '<Result><ItemCode>zz-1</ItemCode><Price>1</Price></Result>'
+    + '<Result><ItemCode>zz-1</ItemCode><Price>2</Price></Result></ResultSet>');
+  eq(itemBaseOf(dup, 'zz-1'), null, '★同じコードが2つあれば決めない (取り違えるくらいなら動かさない)');
+  // ★商品直下の Price が複数 = 想定外の構造。最初の1つを採ると、その値を基準に値付けしてしまう (Codex R3)
+  const twoPrices = await flattenXml('<ResultSet><Result><ItemCode>zz-1</ItemCode><Price>100</Price><Price>200</Price></Result></ResultSet>');
+  eq(itemPriceOf(twoPrices, 'zz-1'), null, '★価格が2つあれば読めない扱い (書き込みに進ませない)');
+  // ★安全整数の外だと +1 しても同じ値になり、変わっていないのに変わったと読める (Codex R4)
+  const huge = await flattenXml('<ResultSet><Result><ItemCode>zz-1</ItemCode><Price>9007199254740993</Price></Result></ResultSet>');
+  eq(itemPriceOf(huge, 'zz-1'), null, '★安全整数の外は読めない扱い');
+
+  // 道すじの直下判定 ([ ] を含む道すじでも壊れない)
+  ok(isDirectChild('A[0]/B[0]/Name[0]', 'A[0]/B[0]', 'Name'), '直下なら true');
+  ok(!isDirectChild('A[0]/B[0]/C[0]/Name[0]', 'A[0]/B[0]', 'Name'), '孫は false');
+  ok(!isDirectChild('A[0]/B[0]/NameX[0]', 'A[0]/B[0]', 'Name'), '別のタグは false');
+  ok(!isDirectChild('A[0]/B[0]/Name[0]', null, 'Name'), 'base が無ければ false');
 }
 
 console.log('\n── 送信が成功したかの判定 (HTTP 200 でも失敗はある) ──');
@@ -106,23 +159,24 @@ console.log('\n── 送信が成功したかの判定 (HTTP 200 でも失敗�
 
 console.log('\n── 「価格以外の変化」の数え方 ──');
 {
-  const before = await flattenXml('<R><Name>名前</Name><Price>100</Price><Caption>説明</Caption></R>');
-  eq(collateralOf(diff(before, await flattenXml('<R><Name>名前</Name><Price>101</Price><Caption>説明</Caption></R>'))).length,
+  const item = (inner) => '<ResultSet><Result><ItemCode>zz-1</ItemCode>' + inner + '</Result></ResultSet>';
+  const B = 'ResultSet[0]/Result[0]';
+  const before = await flattenXml(item('<Name>名前</Name><Price>100</Price><Caption>説明</Caption>'));
+  const bb = itemBaseOf(before, 'zz-1');
+  eq(collateralOf(diff(before, await flattenXml(item('<Name>名前</Name><Price>101</Price><Caption>説明</Caption>'))), bb).length,
     0, '価格だけ変わったなら 0 (= 部分更新)');
-  eq(collateralOf(diff(before, await flattenXml('<R><Name>名前</Name><Price>101</Price></R>'))).map((x) => x.path),
-    ['R[0]/Caption[0]'], '★消えた項目を数える');
-  eq(collateralOf(diff(before, await flattenXml('<R><Name>別の名前</Name><Price>101</Price><Caption>説明</Caption></R>'))).map((x) => x.path),
-    ['R[0]/Name[0]'], '価格以外が変わったら数える');
-  eq(collateralOf(diff(before, await flattenXml('<R><Name>名前</Name><Price>101</Price><Caption>説明</Caption><New>x</New></R>'))).map((x) => x.path),
-    ['R[0]/New[0]'], '★増えた項目も数える (無視すると誤って部分更新と結論する)');
-  eq(collateralOf(diff(before, await flattenXml('<R><Name>名前</Name><Price>101</Price><Caption>説明</Caption><SubCodes><SubCode code="a"><Price>50</Price></SubCode></SubCodes></R>'))).length,
-    2, 'SKU が増えたら SKU の属性と価格が増分として出る (中身の無い SubCodes 自体は値を持たない)');
+  eq(collateralOf(diff(before, await flattenXml(item('<Name>名前</Name><Price>101</Price>'))), bb).map((x) => x.path),
+    [B + '/Caption[0]'], '★消えた項目を数える');
+  eq(collateralOf(diff(before, await flattenXml(item('<Name>別の名前</Name><Price>101</Price><Caption>説明</Caption>'))), bb).map((x) => x.path),
+    [B + '/Name[0]'], '価格以外が変わったら数える');
+  eq(collateralOf(diff(before, await flattenXml(item('<Name>名前</Name><Price>101</Price><Caption>説明</Caption><New>x</New>'))), bb).map((x) => x.path),
+    [B + '/New[0]'], '★増えた項目も数える (無視すると誤って部分更新と結論する)');
 
   // ★SKU の価格が動いたのは「価格以外の変化」。見逃すと部分更新だと誤って結論する
-  const withSku = await flattenXml('<R><Name>名前</Name><Price>100</Price><SubCodes><SubCode code="a"><Price>50</Price></SubCode></SubCodes></R>');
-  const skuMoved = await flattenXml('<R><Name>名前</Name><Price>101</Price><SubCodes><SubCode code="a"><Price>60</Price></SubCode></SubCodes></R>');
-  eq(collateralOf(diff(withSku, skuMoved)).map((x) => x.path),
-    ['R[0]/SubCodes[0]/SubCode[0]/Price[0]'], '★SKU の価格が動いたら数える (商品本体の価格だけを除外する)');
+  const withSku = await flattenXml(item('<Name>名前</Name><Price>100</Price><SubCodes><SubCode code="a"><Price>50</Price></SubCode></SubCodes>'));
+  const skuMoved = await flattenXml(item('<Name>名前</Name><Price>101</Price><SubCodes><SubCode code="a"><Price>60</Price></SubCode></SubCodes>'));
+  eq(collateralOf(diff(withSku, skuMoved), itemBaseOf(withSku, 'zz-1')).map((x) => x.path),
+    [B + '/SubCodes[0]/SubCode[0]/Price[0]'], '★SKU の価格が動いたら数える (商品本体の価格だけを除外する)');
 }
 
 console.log('\n── 本番商品では動かさない ──');
@@ -134,16 +188,30 @@ console.log('\n── 本番商品では動かさない ──');
   eq(guardTestCode('ZZ-Yahoo-Test'), null, '大文字でも通る');
 
   // ★接頭辞だけでは足りない。商品そのものに目印があることを実物で確かめる
-  const marked = await flattenXml('<R><Name>zz検証用 editItem のテスト</Name><Price>100</Price></R>');
-  eq(guardTestItem(marked), null, '目印つきの商品は通る');
-  const real = await flattenXml('<R><Name>合皮補修シート ベージュ</Name><Price>577</Price></R>');
-  ok(guardTestItem(real), '★目印が無い商品は拒否する (コードを取り違えても本番を触らない)');
-  ok(/zz検証用/.test(guardTestItem(real)) && /合皮補修シート/.test(guardTestItem(real)), '理由に目印と実際の商品名を書く');
-  ok(guardTestItem(await flattenXml('<R><Price>100</Price></R>')), '商品名を読めなければ拒否');
+  const wrap = (inner) => '<ResultSet><Result><ItemCode>zz-1</ItemCode>' + inner + '</Result></ResultSet>';
+  const marked = await flattenXml(wrap('<Name>zz検証用 editItem のテスト</Name><Price>100</Price>'));
+  eq(guardTestItem(marked, 'zz-1'), null, '★実測どおりの二段構造 (ResultSet > Result) でも通る');
+  const prod = await flattenXml(wrap('<Name>合皮補修シート ベージュ</Name><Price>577</Price>'));
+  ok(guardTestItem(prod, 'zz-1'), '★目印が無い商品は拒否する (コードを取り違えても本番を触らない)');
+  ok(/zz検証用/.test(guardTestItem(prod, 'zz-1')) && /合皮補修シート/.test(guardTestItem(prod, 'zz-1')),
+    '理由に目印と実際の商品名を書く');
+  ok(guardTestItem(await flattenXml(wrap('<Price>100</Price>')), 'zz-1'), '商品名を読めなければ拒否');
+  ok(/特定できません/.test(guardTestItem(await flattenXml('<R><Name>zz検証用</Name></R>'), 'zz-1')),
+    '★ItemCode が無ければ「特定できない」として拒否 (目印があっても通さない)');
+  // ★応答に別商品が混ざっていて、そちらに目印があっても通さない (Codex R1)
+  const mixed = await flattenXml('<ResultSet>'
+    + '<Result><ItemCode>other-1</ItemCode><Name>zz検証用 まぎらわしい商品</Name><Price>1</Price></Result>'
+    + '<Result><ItemCode>zz-1</ItemCode><Name>合皮補修シート ベージュ</Name><Price>577</Price></Result></ResultSet>');
+  ok(guardTestItem(mixed, 'zz-1'), '★別商品に目印があっても、指定した商品に無ければ拒否する');
+  ok(/合皮補修シート/.test(guardTestItem(mixed, 'zz-1')), '理由は指定した商品の名前');
   // ★入れ子のどこかに目印があっても通さない (商品本体の名前だけを見る)
-  const nested = await flattenXml('<R><Name>合皮補修シート ベージュ</Name><Options><Option><Name>zz検証用</Name></Option></Options></R>');
-  ok(guardTestItem(nested), '★入れ子の Name に目印があっても拒否する');
-  ok(/合皮補修シート/.test(guardTestItem(nested)), '理由には商品本体の名前を出す');
+  const nested = await flattenXml(wrap('<Name>合皮補修シート ベージュ</Name><Options><Option><Name>zz検証用</Name></Option></Options>'));
+  ok(guardTestItem(nested, 'zz-1'), '★入れ子の Name に目印があっても拒否する');
+  ok(/合皮補修シート/.test(guardTestItem(nested, 'zz-1')), '理由には商品本体の名前を出す');
+  // ★商品名が複数あるのは想定外。目印つきが混ざっていても通さない (Codex R2)
+  const twoNames = await flattenXml(wrap('<Name>合皮補修シート ベージュ</Name><Name>zz検証用</Name><Price>577</Price>'));
+  ok(guardTestItem(twoNames, 'zz-1'), '★商品名が2つあれば拒否する (目印つきが混ざっていても通さない)');
+  ok(/2 個/.test(guardTestItem(twoNames, 'zz-1')), '理由に個数を書く: ' + guardTestItem(twoNames, 'zz-1'));
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
