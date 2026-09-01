@@ -285,6 +285,12 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
   const ag = (await fetchRakutenPrices([{ key: 'page-c', aliases: ['page-c-am', 'page-c'], skuAliases: ['page-c-am', 'page-c'], amAliases: ['page-c-am'], manageNumber: 'page-c' }], depsAmGone)).get('page-c');
   eq(ag.found, false, '★対応表には AM があったのに実物に無い → 確定しない');
   ok(/page-c-am/.test(ag.reason) && /作った時は/.test(ag.reason), '理由に対応表の AM を書く: ' + ag.reason);
+  // ★同じ NE コードに AM が 2 つ (同じ商品を 2 SKU で出している)。片方が消えて 1 つだけ残っても確定しない (Codex R8)
+  const depsOneLeft = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'page-d', itemNumber: 'page-d', variants: { '002': { merchantDefinedSkuId: 'am-current', standardPrice: '800' } } }], failed: [] }) };
+  const ol = (await fetchRakutenPrices([{ key: 'page-d', aliases: ['001', 'am-old', '002', 'am-current'], skuAliases: ['001', 'am-old', '002', 'am-current'], amAliases: ['am-old', 'am-current'], manageNumber: 'page-d' }], depsOneLeft)).get('page-d');
+  eq(ol.found, false, '★対応表に AM が 2 つある NE コードは、残った 1 つに当てない');
+  ok(/am-old/.test(ol.reason) && /am-current/.test(ol.reason) && /重複出品/.test(ol.reason), '理由に両方の AM と対処を書く: ' + ol.reason);
   // 対応表の source で分けていることの確認: W 行だけの商品は skuAliases が空
   db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 送料コード, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
     .run('w-only-001', 'W だけの単品', '単品', '取扱中', 500, 200, '確定', 182, '103', '定形外規格内（50g以内）', 0.1, null);

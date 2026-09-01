@@ -155,6 +155,18 @@ export async function fetchRakutenPrices(targets, deps = {}) {
     //   別の variant に当たりうる (Codex R6)。SKU 単位かどうかは値で推定しない (Codex R5)
     const skuAliasKeys = new Set(t.skuAliases.map(normCode));
     const variantCount = Object.keys(variants).length;
+    // ★対応表でこの NE コードに AM (= SKU) が 2 つ以上紐づいている = 同じ商品を 2 つの SKU で出している。
+    //   片方が消えた後に残った方へ当ててしまうと「対応表を作った時と違う状態」を確定させることになる (Codex R8)。
+    //   両方残っていても「別名が複数の SKU に一致」で確定しない。どちらにせよ人が見るべき状態
+    if (t.amAliases.length > 1) {
+      out.set(t.rowKey, {
+        price: null, manageNumber: item.manageNumber || t.manageNumber, skuCode: null, found: false,
+        reason: `対応表でこの NE コードに複数のシステム連携用SKU番号 (${t.amAliases.join(', ')}) が紐づいています。`
+          + 'どの SKU が正しいか決められないため確定しません (楽天側の重複出品を整理してください)',
+        itemTitle: item?.title || null,
+      });
+      continue;
+    }
     const matched = [];
     for (const [vk, v] of Object.entries(variants)) {
       if (skuAliasKeys.has(normCode(vk)) || skuAliasKeys.has(normCode(v?.merchantDefinedSkuId))) matched.push(vk);
