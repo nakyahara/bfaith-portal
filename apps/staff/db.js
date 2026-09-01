@@ -25,6 +25,15 @@ const SEED_FILE = path.join(__dirname, 'seed', 'initial-staff.json');
 export const STAFF_KINDS = ['employee', 'part_time', 'contractor', 'iroha', 'other'];
 export const STAFF_KIND_LABELS = { employee: '社員', part_time: 'パート・アルバイト', contractor: '外注', iroha: 'いろは', other: 'その他' };
 
+/**
+ * 役割 = 「どの現場の名前タップに出すか」。雇用区分 (kind) とは別の軸で、1人が複数持てる。
+ * 倉庫系アプリ (ピッキング・梱包・入荷受付チェック) は warehouse の人だけを名前タップに出す
+ * (事務担当が倉庫の一覧に並ばないように — 中原さん 2026-09-01)。
+ */
+export const STAFF_ROLES = ['warehouse', 'office'];
+export const STAFF_ROLE_LABELS = { warehouse: '倉庫作業 (ピッキング・梱包・入荷)', office: '事務' };
+export const WAREHOUSE_ROLE = 'warehouse';
+
 const utcNow = () => new Date().toISOString();
 let db = null;
 
@@ -76,6 +85,13 @@ function createTables(d) {
       actor       TEXT,
       at          TEXT NOT NULL
     );
+    -- 役割 (どの現場の名前タップに出すか)。1人が複数持てる
+    CREATE TABLE IF NOT EXISTS staff_roles (
+      staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+      role     TEXT NOT NULL CHECK (role IN ('warehouse','office')),
+      PRIMARY KEY (staff_id, role)
+    );
+    CREATE INDEX IF NOT EXISTS idx_staff_roles_role ON staff_roles(role);
     -- 監査表は append-only を DB で強制 (コメント上の規約にしない — Codex R4 Medium)
     CREATE TRIGGER IF NOT EXISTS trg_staff_audit_no_update BEFORE UPDATE ON staff_audit
       BEGIN SELECT RAISE(ABORT, 'staff_audit is append-only'); END;
@@ -125,17 +141,29 @@ export function seedInitialStaff(d = getStaffDB()) {
   const now = utcNow();
   const ins = d.prepare(`INSERT OR IGNORE INTO staff (staff_no, display_name, short_name, joined_on, active, sort, created_at, updated_at)
     VALUES (?, ?, ?, ?, 1, ?, ?, ?)`);
-  let n = 0;
+  const insRole = d.prepare('INSERT OR IGNORE INTO staff_roles (staff_id, role) VALUES (?, ?)');
+  let n = 0, roled = 0;
   d.transaction(() => {
     rows.forEach((r, i) => {
       const no = String(r.staff_no).trim();
       const m = /^(\d{4})(\d{2})(\d{2})$/.exec(no);
       const joined = r.joined_on || (m ? `${m[1]}-${m[2]}-${m[3]}` : null);
       const info = ins.run(no, String(r.display_name).trim(), r.short_name || null, joined, (i + 1) * 10, now, now);
-      if (info.changes) { n++; audit(d, Number(info.lastInsertRowid), 'seed', null, { staff_no: no, display_name: r.display_name }, 'seed'); }
+      let id = info.changes ? Number(info.lastInsertRowid) : null;
+      if (id) { n++; audit(d, id, 'seed', null, { staff_no: no, display_name: r.display_name }, 'seed'); }
+      // 役割は「まだ1つも役割が無い人」にだけ入れる (画面で外した役割を seed が復活させない)
+      const roles = Array.isArray(r.roles) && r.roles.length ? r.roles.filter(x => STAFF_ROLES.includes(x)) : [WAREHOUSE_ROLE];
+      if (!id) {
+        const ex = d.prepare('SELECT id FROM staff WHERE staff_no = ?').get(no);
+        if (!ex) return;
+        id = ex.id;
+        if (d.prepare('SELECT 1 FROM staff_roles WHERE staff_id = ?').get(id)) return;
+      }
+      for (const role of roles) insRole.run(id, role);
+      roled++;
     });
   })();
-  return { seeded: n };
+  return { seeded: n, roled };
 }
 
 // ───────────────────────── 参照 ─────────────────────────
@@ -145,21 +173,63 @@ export function tapName(s) {
   return (s.short_name && s.short_name.trim()) || s.display_name;
 }
 
-export function listStaff({ includeInactive = false } = {}) {
-  return getStaffDB().prepare(`SELECT * FROM staff ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY sort, id`).all();
+/** 役割を各行に配列で載せる (staff_id → ['warehouse', …]) */
+function attachRoles(rows) {
+  if (rows.length === 0) return rows;
+  const map = new Map();
+  for (const r of getStaffDB().prepare('SELECT staff_id, role FROM staff_roles').all()) {
+    if (!map.has(r.staff_id)) map.set(r.staff_id, []);
+    map.get(r.staff_id).push(r.role);
+  }
+  for (const s of rows) s.roles = (map.get(s.id) || []).sort();
+  return rows;
+}
+
+export function listStaff({ includeInactive = false, role = null } = {}) {
+  const rows = attachRoles(getStaffDB().prepare(`SELECT * FROM staff ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY sort, id`).all());
+  return role ? rows.filter(s => s.roles.includes(role)) : rows;
+}
+
+/** 役割の付け外し (指定した集合に置き換える)。空配列も許す (どの現場にも出さない) */
+export function setStaffRoles(id, roles, actor) {
+  const d = getStaffDB();
+  const list = [...new Set((Array.isArray(roles) ? roles : []).map(r => String(r).trim()))];
+  const bad = list.filter(r => !STAFF_ROLES.includes(r));
+  if (bad.length) return { ok: false, error: 'bad_request', message: `役割が不正です: ${bad.join(', ')}` };
+  return d.transaction(() => {
+    const before = getStaff(id);
+    if (!before) return { ok: false, error: 'not_found' };
+    const cur = d.prepare('SELECT role FROM staff_roles WHERE staff_id = ?').all(before.id).map(r => r.role).sort();
+    d.prepare('DELETE FROM staff_roles WHERE staff_id = ?').run(before.id);
+    const ins = d.prepare('INSERT INTO staff_roles (staff_id, role) VALUES (?, ?)');
+    for (const r of list) ins.run(before.id, r);
+    const after = list.slice().sort();
+    if (cur.join(',') !== after.join(',')) {
+      audit(d, before.id, 'update', { ...before, roles: cur }, { ...before, roles: after }, actor);
+    }
+    return { ok: true, staff: { ...getStaff(before.id), roles: after } };
+  }).immediate();
 }
 
 export function getStaff(id) {
-  return getStaffDB().prepare('SELECT * FROM staff WHERE id = ?').get(Number(id)) || null;
+  const row = getStaffDB().prepare('SELECT * FROM staff WHERE id = ?').get(Number(id)) || null;
+  return row ? attachRoles([row])[0] : null;
 }
 
 export function getStaffByNo(staffNo) {
-  return getStaffDB().prepare('SELECT * FROM staff WHERE staff_no = ?').get(String(staffNo || '').trim()) || null;
+  const row = getStaffDB().prepare('SELECT * FROM staff WHERE staff_no = ?').get(String(staffNo || '').trim()) || null;
+  return row ? attachRoles([row])[0] : null;
 }
 
-/** 他アプリ向け: 名前タップの候補 [{staff_id, staff_no, name, display_name, sort}] (有効のみ) */
-export function listTapCandidates() {
-  return listStaff().map(s => ({ staff_id: s.id, staff_no: s.staff_no, name: tapName(s), display_name: s.display_name, sort: s.sort }));
+/**
+ * 他アプリ向け: 名前タップの候補 (有効のみ)。
+ * 既定は**倉庫作業の役割を持つ人だけ** — 事務担当がピッキング・梱包・入荷の一覧に並ばないように
+ * (中原さん 2026-09-01)。役割を指定しなければ全員が欲しい呼び出し側は role:null を渡す
+ */
+export function listTapCandidates({ role = WAREHOUSE_ROLE } = {}) {
+  return listStaff({ role }).map(s => ({
+    staff_id: s.id, staff_no: s.staff_no, name: tapName(s), display_name: s.display_name, sort: s.sort, roles: s.roles,
+  }));
 }
 
 // ───────────────────────── 更新 ─────────────────────────

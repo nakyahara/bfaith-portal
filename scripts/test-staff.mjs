@@ -11,7 +11,7 @@ import path from 'path';
 
 if (!process.env.DATA_DIR) process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'staff-test-'));
 const staff = await import('../apps/staff/db.js');
-const { getStaffDB, listStaff, getStaff, getStaffByNo, createStaff, updateStaff, setStaffActive, listAudit, listTapCandidates, tapName, seedInitialStaff, STAFF_KINDS } = staff;
+const { getStaffDB, listStaff, getStaff, getStaffByNo, createStaff, updateStaff, setStaffActive, setStaffRoles, listAudit, listTapCandidates, tapName, seedInitialStaff, STAFF_KINDS, STAFF_ROLES } = staff;
 
 let pass = 0, fail = 0;
 const ok = (c, l) => { if (c) { pass++; console.log(`  ✓ ${l}`); } else { fail++; console.log(`  ✗ ${l}`); } };
@@ -29,6 +29,12 @@ console.log('\n[1] 初期データ');
   ok(getStaffByNo('0003').joined_on === null, '0001〜0003 は入社日なし');
   ok(seedInitialStaff().seeded === 0 && listStaff({ includeInactive: true }).length === 13, 'seed は冪等 (2回目は0件)');
   ok(listAudit(all[0].id).some(a => a.action === 'seed'), '監査に seed が残る');
+  // 役割 (どの現場の名前タップに出すか)
+  ok(getStaffByNo('0003').roles.join(',') === 'office', '谷川 泰仁 = 事務 (seed)');
+  ok(getStaffByNo('20240901').roles.join(',') === 'office' && getStaffByNo('20241001').roles.join(',') === 'office', '田中 美祐・高島 和美 = 事務');
+  ok(getStaffByNo('20250901').roles.join(',') === 'warehouse', '星 立夏 = 倉庫');
+  ok(getStaffByNo('0001').roles.join(',') === 'office,warehouse', '中原 大輔 = 倉庫+事務');
+  ok(listStaff({ role: 'warehouse' }).length === 10 && listStaff({ role: 'office' }).length === 4, '倉庫10名 / 事務4名');
 }
 
 console.log('\n[2] 追加・検証');
@@ -85,9 +91,30 @@ console.log('\n[3] 更新 (楽観ロック)・無効化');
 console.log('\n[4] 名前タップ候補');
 {
   const c = listTapCandidates();
-  ok(c.length === 14 && c[0].name === '中原 大輔' && c.some(x => x.name === 'テス'), '有効スタッフの候補 (短い表記優先)');
+  ok(c.every(x => x.roles.includes('warehouse')), '名前タップの候補は既定で倉庫作業の人だけ (事務は出ない)');
+  ok(!c.some(x => x.display_name === '谷川 泰仁'), '事務担当は候補に出ない');
+  ok(c[0].name === '中原 大輔', '倉庫の人は出る (短い表記優先)');
+  ok(listTapCandidates({ role: null }).length > c.length, 'role:null で全員を取れる');
   ok(tapName({ short_name: '  ', display_name: 'A' }) === 'A', '短い表記が空白なら正式表記');
   ok(c.every(x => Number.isInteger(x.staff_id) && x.staff_no), 'staff_id / staff_no を持つ');
+  // 役割の付け外し
+  const t2 = getStaffByNo('0003');
+  const rr = setStaffRoles(t2.id, ['warehouse'], 'admin@example.com');
+  ok(rr.ok && getStaffByNo('0003').roles.join(',') === 'warehouse', '事務 → 倉庫 に変更');
+  ok(listTapCandidates().some(x => x.display_name === '谷川 泰仁'), '倉庫にすると候補に出る');
+  ok(setStaffRoles(t2.id, ['office'], 'x').ok && !listTapCandidates().some(x => x.display_name === '谷川 泰仁'), '事務に戻すと候補から消える');
+  ok(setStaffRoles(t2.id, ['boss'], 'x').error === 'bad_request', '不正な役割は拒否');
+  ok(setStaffRoles(t2.id, [], 'x').ok && getStaffByNo('0003').roles.length === 0, '役割ゼロも許す (どの現場にも出さない)');
+  ok(setStaffRoles(99999, ['office'], 'x').error === 'not_found', '存在しない id');
+  ok(listAudit(t2.id).some(a => a.action === 'update'), '役割変更が監査に残る');
+  ok(setStaffRoles(t2.id, ['office'], 'x').ok, '後片付け (事務に戻す)');
+  // seed は画面で外した役割を復活させない
+  const before = getStaffByNo('20250901').roles.join(',');
+  setStaffRoles(getStaffByNo('20250901').id, ['office'], 'x');
+  seedInitialStaff();
+  ok(getStaffByNo('20250901').roles.join(',') === 'office', 'seed 再実行で役割を上書きしない');
+  setStaffRoles(getStaffByNo('20250901').id, ['warehouse'], 'x');
+  ok(getStaffByNo('20250901').roles.join(',') === before, '後片付け');
 }
 
 console.log('\n[5] inbound-check からの参照');
@@ -96,7 +123,9 @@ console.log('\n[5] inbound-check からの参照');
   initMirrorDB();
   const ic = await import('../apps/inbound-check/db.js');
   const ws = ic.listWorkers();
-  ok(ws.length === 14 && ws[0].code === '0001' && ws[0].name === '中原 大輔', 'inbound-check.listWorkers = スタッフマスタ (code=管理番号)');
+  const cand = listTapCandidates();
+  ok(ws.length === cand.length && ws[0].code === '0001' && ws[0].name === '中原 大輔', `inbound-check.listWorkers = スタッフマスタの倉庫作業者 (${ws.length}名)`);
+  ok(!ws.some(w => w.code === '0003'), '事務担当 (谷川 泰仁) は入荷受付チェックの名前タップにも出ない');
   const w = ic.getWorker('20250901');
   ok(w && w.name === '星 立夏' && w.active === 1 && Number.isInteger(w.staff_id), 'getWorker(管理番号)');
   ok(ic.getWorker('nope') === null, '不明な番号は null');

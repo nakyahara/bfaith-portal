@@ -16,7 +16,7 @@ const { applyStaffExport, syncStaff, getStaffSyncState, fetchStaffExport, isStaf
 let pass = 0, fail = 0;
 const ok = (c, l) => { if (c) { pass++; console.log(`  ✓ ${l}`); } else { fail++; console.log(`  ✗ ${l}`); } };
 
-const staff = (id, no, name, extra = {}) => ({ id, staff_no: no, display_name: name, short_name: null, kind: null, portal_email: null, active: 1, sort: id * 10, updated_at: '2026-09-01T00:00:00Z', version: 1, ...extra });
+const staff = (id, no, name, extra = {}) => ({ id, staff_no: no, display_name: name, short_name: null, kind: null, portal_email: null, active: 1, sort: id * 10, updated_at: '2026-09-01T00:00:00Z', version: 1, roles: ['warehouse'], ...extra });
 const payload = (rows, generated = '2026-09-01T01:00:00Z') => ({ ok: true, generated_at: generated, staff: rows });
 const workerByName = n => listWorkers(true).find(w => w.name === n);
 
@@ -99,12 +99,47 @@ console.log('\n[5] 退職者だけの新規は生やさない');
   ok(r.ok && r.added === 0 && listWorkers(true).length === n, '無効なスタッフは pk_workers に追加しない');
 }
 
+console.log('\n[5b] 役割 (事務担当は名前タップに出さない)');
+{
+  const n = listWorkers(true).length;
+  // 事務の人は追加されない
+  const r = applyStaffExport(payload([
+    staff(1, '0001', '中原 大輔'), staff(2, '20250901', '星 立夏', { short_name: '星さん' }),
+    staff(3, '20240901', '田中 美祐'), staff(4, '20260701', '有國 陽'),
+    staff(20, '0003', '谷川 泰仁', { roles: ['office'] }),
+    staff(21, '20241001', '高島 和美', { roles: ['office'] }),
+  ], '2026-09-06T00:00:00Z'));
+  ok(r.ok && r.added === 0 && listWorkers(true).length === n, '事務だけの役割の人は pk_workers に追加しない');
+  ok(!listWorkers().some(w => w.name === '谷川 泰仁'), '事務担当は名前タップに出ない');
+  // 倉庫にいた人が事務に移ったら無効化される
+  const r2 = applyStaffExport(payload([
+    staff(1, '0001', '中原 大輔'), staff(2, '20250901', '星 立夏', { short_name: '星さん', roles: ['office'] }),
+    staff(3, '20240901', '田中 美祐'), staff(4, '20260701', '有國 陽'),
+  ], '2026-09-07T00:00:00Z'));
+  ok(r2.ok && r2.deactivated === 1 && listWorkers(true).find(w => w.staff_id === 2)?.active === 0,
+    '倉庫 → 事務 に変わった人は無効化 (名前タップから消える)');
+  // 戻せば復活
+  const r3 = applyStaffExport(payload([
+    staff(1, '0001', '中原 大輔'), staff(2, '20250901', '星 立夏', { short_name: '星さん' }),
+    staff(3, '20240901', '田中 美祐'), staff(4, '20260701', '有國 陽'),
+  ], '2026-09-08T00:00:00Z'));
+  ok(r3.ok && listWorkers(true).find(w => w.staff_id === 2)?.active === 1, '倉庫に戻せば復活');
+  // roles が無い古い export は全員 倉庫扱い (現場の名前タップが空にならない)
+  const r4 = applyStaffExport({ ok: true, generated_at: '2026-09-09T00:00:00Z', staff: [
+    { id: 1, staff_no: '0001', display_name: '中原 大輔', active: 1, sort: 10 },
+    { id: 2, staff_no: '20250901', display_name: '星 立夏', short_name: '星さん', active: 1, sort: 100 },
+    { id: 3, staff_no: '20240901', display_name: '田中 美祐', active: 1, sort: 30 },
+    { id: 4, staff_no: '20260701', display_name: '有國 陽', active: 1, sort: 40 },
+  ] });
+  ok(r4.ok && r4.deactivated === 0, 'roles が無い export は全員 倉庫とみなす (fail-open)');
+}
+
 console.log('\n[6] fail-closed');
 {
   const n = listWorkers(true).length;
-  const zero = applyStaffExport(payload([], '2026-09-05T01:00:00Z'));
+  const zero = applyStaffExport(payload([], '2026-09-15T01:00:00Z'));
   ok(!zero.ok && zero.skipped && listWorkers(true).length === n, '0件は適用しない');
-  const half = applyStaffExport(payload([staff(1, '0001', '中原 大輔')], '2026-09-05T02:00:00Z'));
+  const half = applyStaffExport(payload([staff(1, '0001', '中原 大輔')], '2026-09-15T02:00:00Z'));
   ok(!half.ok && half.skipped && /半分未満/.test(half.error) && listWorkers(true).length === n, '有効数が前回成功時の半分未満なら適用しない');
   ok(/前回 4 名/.test(half.error), `判定基準は前回成功時の有効スタッフ数 (local を含めない): ${half.error}`);
   ok(listWorkers().length >= 4, '前回の作業者が保たれている');
@@ -126,7 +161,7 @@ console.log('\n[6b] 入力検証 (1件でも壊れていたら全体を拒否)')
     [[...base, staff(5, '90005', '有國 陽')], /同じ表示名が複数/, 'export 側に同名が2人'],
   ];
   for (const [rows, re, label] of cases) {
-    const r = applyStaffExport(payload(rows, '2026-09-10T01:00:00Z'));
+    const r = applyStaffExport(payload(rows, '2026-09-16T01:00:00Z'));
     ok(!r.ok && re.test(r.error) && listWorkers(true).length === n, `${label} → 全体を拒否 (${r.error?.slice(0, 40)})`);
   }
 }
@@ -137,7 +172,7 @@ console.log('\n[6c] identity conflict (staff DB 再作成で id 再採番)');
   const r = applyStaffExport(payload([
     staff(1, '99999', '中原 大輔'),   // id 1 は 0001 のはずが別番号で来た
     staff(2, '20250901', '星 立夏', { short_name: '星さん' }), staff(3, '20240901', '田中 美祐'), staff(4, '20260701', '有國 陽'),
-  ], '2026-09-11T01:00:00Z'));
+  ], '2026-09-17T01:00:00Z'));
   ok(!r.ok && /対応が食い違って/.test(r.error) && listWorkers(true).length === n, `staff_no の食い違いは全体を拒否 (${r.error?.slice(0, 50)})`);
 }
 
@@ -150,7 +185,7 @@ console.log('\n[6d] 同名の取り違え防止');
     staff(1, '0001', '中原 大輔'), staff(2, '20250901', '星 立夏', { short_name: '星さん' }),
     staff(3, '20240901', '田中 美祐'), staff(4, '20260701', '有國 陽'),
     staff(7, '20261001', '二重 名前'),
-  ], '2026-09-12T01:00:00Z'));
+  ], '2026-09-18T01:00:00Z'));
   ok(r.ok, '他の人の同期は進む');
   ok(r.added === 0 && listWorkers(true).length === before, '曖昧な名前の人は紐付けも追加もしない');
   ok(r.warnings.some(w => /紐付けを保留/.test(w)), `保留を警告に出す (${r.warnings.find(w => /保留/.test(w)) || 'なし'})`);

@@ -135,7 +135,7 @@ try {
   r = await req(J, `${BASE}/apps/staff/api/staff/${s2.id}`, { method: 'POST', body: { fields: { note: 'y' }, expect_version: r.json.staff.version } });
   ok(r.status === 200 && r.json.staff.note === 'y', '最新 version での編集は 200');
   r = await req(J, `${APP}/admin`);
-  ok(r.status === 200 && r.text.includes('テスト 一郎') && !r.text.includes('テスト 二郎'), '入荷側の管理画面に有効スタッフだけ表示');
+  ok(r.status === 200 && r.text.includes('星 立夏') && !r.text.includes('谷川 泰仁'), '入荷側の管理画面は倉庫作業のスタッフだけ表示 (事務は出ない)');
   r = await req(null, `${BASE}/apps/staff/export`);
   ok(r.status === 401, 'export: トークン無しは 401');
   r = await req(null, `${BASE}/apps/staff/export`, { headers: { authorization: 'Bearer wrong' } });

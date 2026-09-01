@@ -40,11 +40,12 @@ console.log('E2E: Render(staff) → miniPC(picking)');
 const r = await syncStaff();
 ok(r.ok, `実 HTTP で同期成功 (${r.error || ''})`);
 ok(r.staffCount === 13, `スタッフ13名を取得 (${r.staffCount})`);
+ ok(r.targetStaffCount === 10, `うち倉庫作業は10名 — 事務3名は取り込まない (${r.targetStaffCount})`);
 ok(r.linked === 1, `名前一致で「星 立夏」を紐付け (linked=${r.linked})`);
-ok(r.added === 12, `残り12名を追加 (added=${r.added})`);
+ok(r.added === 9, `倉庫作業の残り9名を追加 (added=${r.added})`);
 ok(r.warnings.some(w => w.includes('派遣 太郎')), `未登録者を警告 (${r.warnings.join(' / ')})`);
 const ws = listWorkers();
-ok(ws.length === 14, `名前タップ候補 14名 (13 + 派遣 太郎) = ${ws.length}`);
+ok(ws.length === 11, `名前タップ候補 11名 (倉庫10 + 派遣 太郎) = ${ws.length}`);
 ok(ws.some(w => w.name === '中原 大輔' && w.staff_no === '0001'), 'staff_no が入る');
 ok(ws.find(w => w.name === '有國 陽')?.source === 'staff', 'source=staff');
 const st = getStaffSyncState();
@@ -57,7 +58,7 @@ ok(r2.ok && r2.added === 0 && r2.linked === 0 && r2.renamed === 0, '2回目は�
 // 不正トークン
 process.env.STAFF_EXPORT_TOKEN = 'wrong';
 const r3 = await syncStaff();
-ok(!r3.ok && /HTTP 401/.test(r3.error) && listWorkers().length === 14, '不正トークンは 401・作業者は消えない');
+ok(!r3.ok && /HTTP 401/.test(r3.error) && listWorkers().length === 11, '不正トークンは 401・作業者は消えない');
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 if (fail) console.log(logs.slice(-1500));

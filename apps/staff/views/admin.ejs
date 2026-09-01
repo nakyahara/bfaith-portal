@@ -22,6 +22,9 @@
     .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; white-space: nowrap; }
     .btn-sm:disabled { opacity: 0.35; cursor: default; }
     td.sort-col { width: 72px; }
+    td.role-col { width: 118px; white-space: nowrap; }
+    td.role-col label { font-size: 0.9em; margin-right: 6px; cursor: pointer; }
+    td.role-col input { width: auto; margin-right: 2px; vertical-align: middle; }
     .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .row input, .row select { padding: 6px; }
     .msg { font-size: 0.9em; } .msg.err { color: #c92a2a; } .msg.ok { color: #2b8a3e; }
@@ -48,7 +51,7 @@
         「人」の正本です。各アプリ (入荷受付チェック・ピッキング・梱包 …) の名前タップはここから引きます。
         <b>スタッフ管理番号</b> は 0001〜 と 入社日 (YYYYMMDD) が混在する運用のまま持ちます。
         <b>短い表記</b> は名前タップに出す名前 (空なら正式表記)。退職は削除でなく「無効」(履歴が参照するため)。
-        将来の勤怠・シフトはこの表の <code>id</code> に紐づけます。
+        <b>役割</b>は「どの現場の名前タップに出すか」です — <b>倉庫</b>のチェックを外すと、ピッキング・梱包・入荷受付チェックの作業者一覧に出なくなります (事務担当など)。役割の変更はチェックした時点で即保存されます。将来の勤怠・シフトはこの表の <code>id</code> に紐づけます。
         <% if (exportEnabled) { %>他マシン向けの読み取り API (<code>/apps/staff/export</code>) は有効です。<% } else { %>他マシン向け読み取り API は <code>STAFF_EXPORT_TOKEN</code> 未設定のため無効です。<% } %>
       </p>
     </div>
@@ -62,6 +65,8 @@
         <select id="n_kind"><option value="">区分</option><% for (const k of kinds) { %><option value="<%= k %>"><%= kindLabels[k] %></option><% } %></select>
         <input type="date" id="n_joined" title="入社日">
         <input type="email" id="n_email" placeholder="ポータルmail (任意)" style="width:200px">
+        <label style="font-size:0.9em"><input type="checkbox" id="n_warehouse" checked>倉庫</label>
+        <label style="font-size:0.9em"><input type="checkbox" id="n_office">事務</label>
         <button id="addBtn" type="button">追加</button>
         <span id="addMsg" class="msg"></span>
       </div>
@@ -71,7 +76,7 @@
       <h2>一覧 (<%= staff.filter(s => s.active).length %> 名 有効 / 全 <%= staff.length %> 名) <span class="msg" id="listMsg"></span></h2>
       <div class="tbox">
       <table class="st">
-        <thead><tr><th>並び</th><th>管理番号</th><th>名前</th><th>短い表記</th><th>よみ</th><th>区分</th><th>ポータルmail</th><th>入社日</th><th>退職日</th><th>メモ</th><th></th></tr></thead>
+        <thead><tr><th>並び</th><th>管理番号</th><th>名前</th><th>短い表記</th><th>役割</th><th>よみ</th><th>区分</th><th>ポータルmail</th><th>入社日</th><th>退職日</th><th>メモ</th><th></th></tr></thead>
         <tbody>
           <% for (const s of staff) { %>
             <tr class="<%= s.active ? '' : 'inactive' %>" data-id="<%= s.id %>" data-version="<%= s.version %>">
@@ -79,6 +84,11 @@
               <td style="width:110px"><input name="staff_no" value="<%= s.staff_no %>" maxlength="20"></td>
               <td style="width:140px"><input name="display_name" value="<%= s.display_name %>" maxlength="40"></td>
               <td style="width:110px"><input name="short_name" value="<%= s.short_name || '' %>" maxlength="40"></td>
+              <td class="role-col">
+                <% for (const r of roles) { %>
+                  <label title="<%= roleLabels[r] %>"><input type="checkbox" class="role-cb" data-role="<%= r %>" <%= (s.roles || []).includes(r) ? 'checked' : '' %>><%= r === 'warehouse' ? '倉庫' : '事務' %></label>
+                <% } %>
+              </td>
               <td style="width:120px"><input name="kana" value="<%= s.kana || '' %>"></td>
               <td style="width:130px"><select name="kind"><option value="">-</option><% for (const k of kinds) { %><option value="<%= k %>" <%= s.kind === k ? 'selected' : '' %>><%= kindLabels[k] %></option><% } %></select></td>
               <td style="width:180px"><input name="portal_email" value="<%= s.portal_email || '' %>"></td>
@@ -106,23 +116,35 @@
     $('#addBtn').addEventListener('click', async () => {
       const body = { staff_no: $('#n_no').value, display_name: $('#n_name').value, short_name: $('#n_short').value, kind: $('#n_kind').value, joined_on: $('#n_joined').value, portal_email: $('#n_email').value };
       const { status, j } = await postJson(BASE + '/api/staff', body);
-      if (j.ok) location.reload(); else msg($('#addMsg'), false, j.message || ('HTTP ' + status));
+      if (!j.ok) return msg($('#addMsg'), false, j.message || ('HTTP ' + status));
+      const roles = [];
+      if ($('#n_warehouse').checked) roles.push('warehouse');
+      if ($('#n_office').checked) roles.push('office');
+      await postJson(BASE + '/api/staff/' + j.staff.id + '/roles', { roles });
+      location.reload();
     });
 
     // 行ごとの編集: 入力があった行だけ保存を有効化 (未編集行の誤保存を防ぐ)
     document.querySelectorAll('table.st tbody tr').forEach(tr => {
       const save = tr.querySelector('.btn-save');
-      tr.querySelectorAll('input, select').forEach(el => {
+      // 役割は行の「保存」とは独立に、チェックした時点で保存する (version を持たない別テーブルのため)
+      tr.querySelectorAll('.role-cb').forEach(cb => cb.addEventListener('change', async () => {
+        const roles = [...tr.querySelectorAll('.role-cb')].filter(x => x.checked).map(x => x.dataset.role);
+        const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id + '/roles', { roles });
+        if (j.ok) msg($('#listMsg'), true, tr.querySelector('input[name=display_name]').value + ' の役割を保存しました');
+        else { msg($('#listMsg'), false, j.message || ('HTTP ' + status)); cb.checked = !cb.checked; }
+      }));
+      tr.querySelectorAll('input:not(.role-cb), select').forEach(el => {
         el.dataset.orig = el.value;
-        el.addEventListener('input', () => { el.classList.toggle('dirty', el.value !== el.dataset.orig); save.disabled = ![...tr.querySelectorAll('input, select')].some(x => x.value !== x.dataset.orig); });
+        el.addEventListener('input', () => { el.classList.toggle('dirty', el.value !== el.dataset.orig); save.disabled = ![...tr.querySelectorAll('input:not(.role-cb), select')].some(x => x.value !== x.dataset.orig); });
       });
       save.addEventListener('click', async () => {
         const fields = {};
-        tr.querySelectorAll('input, select').forEach(el => { if (el.value !== el.dataset.orig) fields[el.name] = el.value; });
+        tr.querySelectorAll('input:not(.role-cb), select').forEach(el => { if (el.value !== el.dataset.orig) fields[el.name] = el.value; });
         const { status, j } = await postJson(BASE + '/api/staff/' + tr.dataset.id, { fields, expect_version: Number(tr.dataset.version) });
         if (j.ok) {
           tr.dataset.version = j.staff.version;
-          tr.querySelectorAll('input, select').forEach(el => { el.dataset.orig = el.value; el.classList.remove('dirty'); });
+          tr.querySelectorAll('input:not(.role-cb), select').forEach(el => { el.dataset.orig = el.value; el.classList.remove('dirty'); });
           save.disabled = true; msg($('#listMsg'), true, j.staff.display_name + ' を保存しました');
         } else if (j.error === 'conflict') { msg($('#listMsg'), false, '他の人が先に変更しました。再読込します'); setTimeout(() => location.reload(), 800); }
         else msg($('#listMsg'), false, j.message || ('HTTP ' + status));

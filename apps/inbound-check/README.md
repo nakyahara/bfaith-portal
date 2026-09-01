@@ -39,7 +39,7 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
 
 ## 作業者 (名前タップ) = スタッフマスタ
 
-自前の作業者表は持たない。名前タップの候補は `apps/staff` (staff.db) の**有効なスタッフ**で、`worker_code` = スタッフ管理番号 (`staff_no`)、表示名 = 短い表記 (無ければ正式表記)。確認イベントには `worker` (表示名) と `staff_id` を記録する。追加・無効化は `/apps/staff/` (管理者)。
+自前の作業者表は持たない。名前タップの候補は `apps/staff` (staff.db) の**有効かつ倉庫作業 (warehouse) の役割を持つスタッフ**で (事務担当は出ない)、`worker_code` = スタッフ管理番号 (`staff_no`)、表示名 = 短い表記 (無ければ正式表記)。確認イベントには `worker` (表示名) と `staff_id` を記録する。追加・無効化は `/apps/staff/` (管理者)。
 
 ## 端末 (iPad) の登録
 
