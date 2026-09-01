@@ -97,6 +97,47 @@ function codesOf(rakutenByNe, sku) {
 }
 
 /**
+ * 商品管理番号として **RMS に直接問い合わせてみる**候補コード (2026-09-01)。
+ *
+ * 🚨 なぜ要るか: 管理番号の存在確認に使っている `mirror_rakuten_item_daily` は
+ *    「楽天でその日に動きがあった商品」の日次データで、**全商品リストではない** (実測: 1日分・2,418件)。
+ *    その日に売れなかった商品は「楽天に無い」と判定され、画像があるのに出ない。
+ *    実測 2026-09-01: 「楽天に商品ページが無い」244件のうち **135件は実在し、全部に画像があった**。
+ *    → mirror で引けなかったものは、候補を RMS に投げて存在を確かめる。
+ *
+ * 候補 = W (商品番号) / AM (連携SKU) / ne_code と、それぞれのハイフン削り。
+ * AL (variants のキー = "394" のような連番) は単独では商品にならないので入れない。
+ */
+const PROBE_MIN_LEN = 4;   // ハイフン削りで "no" のような断片まで投げない (無駄+誤ヒット)
+
+function probeCandidates(rakutenByNe, sku, limit = 5) {
+  const raw = rakutenByNe?.get(sku);
+  const bases = [];
+  if (raw && !Array.isArray(raw) && typeof raw === 'object') {
+    // AL は除く = all から variantIds を差し引く
+    const al = new Set((raw.variantIds || []).map(norm));
+    for (const c of (raw.all || [])) if (!al.has(norm(c))) bases.push(c);
+  } else if (Array.isArray(raw)) {
+    bases.push(...raw);
+  } else if (raw) {
+    bases.push(raw);
+  }
+  bases.push(sku);
+  const out = [];
+  for (const base of bases) {
+    if (!base) continue;
+    const parts = String(base).split('-');
+    for (let i = 0; i <= Math.min(2, parts.length - 1); i++) {
+      const c = parts.slice(0, parts.length - i).join('-');
+      if (c.length < PROBE_MIN_LEN) break;   // これ以上削っても短くなるだけ
+      if (!out.some((x) => norm(x) === norm(c))) out.push(c);
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
+/**
  * ne_code に紐づく「バリエーション照合用」のコード (AL=variantsのキー / AM=merchantDefinedSkuId)。
  * structured=true なら索引が役割を持っている = **W を照合に使ってはいけない**。
  * AL/AM が1つも無い (W だけの) 商品でも structured のままにする —
@@ -298,13 +339,21 @@ async function resolveAndCache(db, need, deps, stats) {
   const { rakutenByNe, itemNumbers } = (deps.loadMaps || loadMirrorMaps)();
   const mnBySku = new Map();
   const codesBySku = new Map();   // バリエーション照合用: このSKUを指し得るコード群
+  const fromCache = new Set();    // 管理番号をキャッシュから採った SKU (外れたら次回 probe へ戻す)
+  const cachedMnStmt = db.prepare('SELECT manage_number FROM pk_product_images WHERE ne_code = ?');
+  const cachedMnOf = (sku) => cachedMnStmt.get(sku)?.manage_number || null;
   for (const sku of need) {
     // 変換テーブルの楽天SKUコード (W/AM/AL の全部) + ne_code 自体
     // (product-hub 出品分は manageNumber = ne_code 小文字)。
     // 🚨 バリエーション画像の照合は AL (variants のキー) と AM (merchantDefinedSkuId) の
     //    両方が要る。1つだけ渡すと「別の色の写真」が出続ける (2026-09-01)
     const codes = [...codesOf(rakutenByNe, sku), sku];
-    mnBySku.set(sku, resolveManageNumber(itemNumbers, codes));
+    // 🚨 一度 RMS で当たった管理番号 (キャッシュ) を**先に**使う。
+    //    mirror の解決はハイフンを削った親商品にも当たるので、確認済みの正しい番号があるのに
+    //    別の親へ差し替わって誤画像を掴むことがある (Codex R1 Medium)
+    const cached = cachedMnOf(sku);
+    mnBySku.set(sku, cached || resolveManageNumber(itemNumbers, codes));
+    if (cached) fromCache.add(sku);
     // 画像の照合は役割ごと (W は使わない)。索引が役割を持っていれば AL/AM がゼロでも
     // 役割つきで渡す (配列に落とすと W が混ざる)。
     // 🚨 any には ne_code も入れない — ne_code が W と同値の商品で W が照合に戻る (Codex R3 High)。
@@ -317,14 +366,30 @@ async function resolveAndCache(db, need, deps, stats) {
       : codes);
   }
 
-  const manageNumbers = [...new Set([...mnBySku.values()].filter(Boolean))];
+  // mirror でもキャッシュでも引けなかった SKU は、候補を**RMS に直接投げて**存在を確かめる。
+  // 当たれば正しい管理番号が分かる (mirror の日次データに載っていないだけの商品を拾う)
+  const probeBySku = new Map();
+  for (const sku of need) {
+    if (mnBySku.get(sku)) continue;
+    const cands = probeCandidates(rakutenByNe, sku);
+    if (cands.length > 0) probeBySku.set(sku, cands);
+  }
+
+  const manageNumbers = [...new Set([
+    ...[...mnBySku.values()].filter(Boolean),
+    ...[...probeBySku.values()].flat(),
+  ])];
   // mn → 対象SKU群 (チャンク失敗を該当SKUだけのerrorに落とすため。1つのmnに複数SKUがあり得る)
   const skusByMn = new Map();
-  for (const [sku, mn] of mnBySku) {
-    if (!mn) continue;
-    if (!skusByMn.has(mn)) skusByMn.set(mn, []);
-    skusByMn.get(mn).push(sku);
-  }
+  const link = (code, sku) => {
+    if (!code) return;
+    if (!skusByMn.has(code)) skusByMn.set(code, []);
+    if (!skusByMn.get(code).includes(sku)) skusByMn.get(code).push(sku);
+  };
+  for (const [sku, mn] of mnBySku) link(mn, sku);
+  // 🚨 probe 候補も紐づける。紐づけないと、候補チャンクが通信エラーになった SKU が
+  //    「管理番号が引けなかった」= not_found に落ち、翌日まで再試行されない (Codex R1 High)
+  for (const [sku, cands] of probeBySku) for (const c of cands) link(c, sku);
   // チャンク単位で取得・リトライする (プロキシのチャンクと同じ50件 = 1呼び出し1リクエスト)。
   // fetchItemDetailsBulkDetailed 全体をリトライすると、途中チャンクの429で成功済み分まで
   // 再送してキュー混雑を自己増幅する (Codex medium)。失敗もチャンク内のSKUに限定して記録する
@@ -332,6 +397,7 @@ async function resolveAndCache(db, need, deps, stats) {
   const items = [];
   const failed = [];
   const chunkFailedSkus = new Set();
+  const failedCodes = new Set();   // 応答が得られなかったコード (probe の判定に使う)
   const fetchDetails = deps.fetchDetails || fetchItemDetailsBulkDetailed;
   const upsertErr = db.prepare(`
     INSERT INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, variant_image_url, status, fetched_at)
@@ -350,9 +416,14 @@ async function resolveAndCache(db, need, deps, stats) {
       // このチャンクのSKUを error として記録し、30分後の再試行に回す (黙殺しない方針)。
       // fetched_at はリトライ待機後の「今」を書く — 処理開始時刻だと待機ぶんTTLが目減りする (Codex medium)
       const stamp = utcNow();
-      for (const mn of chunk) {
-        for (const sku of (skusByMn.get(mn) || [])) {
-          upsertErr.run(sku, mn, stamp);
+      for (const code of chunk) {
+        failedCodes.add(norm(code));
+        for (const sku of (skusByMn.get(code) || [])) {
+          // 🚨 probe 中の SKU (管理番号がまだ未確定) は、ここで候補コードを manage_number に
+          //    書いてはいけない。次回それがキャッシュとして優先され、通信障害1回で
+          //    誤った候補に固定される。別チャンクで当たるかもしれないので最後にまとめて判定する
+          if (mnBySku.get(sku) !== code) continue;
+          upsertErr.run(sku, code, stamp);
           chunkFailedSkus.add(sku);
         }
       }
@@ -365,8 +436,32 @@ async function resolveAndCache(db, need, deps, stats) {
     const mn = it?.manageNumber || it?.itemNumber;
     if (mn) itemByMn.set(norm(mn), it);
   }
+  // 🚨「その商品は存在しない」と断定してよいのは、RMS が**明示的に不存在だと答えた**ときだけ。
+  //    500・認証エラー・レート制限・部分応答を not_found にすると、障害のたびに
+  //    「楽天に商品ページが無い」という嘘のリストができる (Codex R1 High。今回の事故と同じ性質)
+  const NOT_FOUND_RE = /not\s*found|存在しません|該当(する)?(商品|データ)がありません/i;
+  const absent = new Set();    // 明示的に「無い」と答えられたコード
+  for (const f of failed) {
+    const code = f?.manageNumber || f?.itemNumber;
+    if (!code) continue;
+    if (NOT_FOUND_RE.test(String(f?.reason ?? ''))) absent.add(norm(code));
+  }
+  // probe: 候補のうち実在したものを、そのSKUの管理番号として確定する (候補順 = 確度の高い順)
+  let probedOk = 0;
+  for (const [sku, cands] of probeBySku) {
+    for (const c of cands) {
+      const it = itemByMn.get(norm(c));
+      if (!it) continue;
+      mnBySku.set(sku, it.manageNumber || it.itemNumber || c);
+      probedOk++;
+      break;
+    }
+  }
+  if (probeBySku.size > 0) {
+    console.log(`[picking-images] mirrorに無い${probeBySku.size}件を楽天へ直接照会 → ${probedOk}件で商品ページを特定`);
+  }
   if (failed.length > 0) {
-    console.warn(`[picking-images] RMS個別失敗 ${failed.length}件 (翌日再試行): ${failed.slice(0, 3).map((f) => f.manageNumber).join(', ')}…`);
+    console.warn(`[picking-images] RMS個別失敗 ${failed.length}件 (うち明示的な不存在 ${absent.size}件): ${failed.slice(0, 3).map((f) => f.manageNumber).join(', ')}…`);
   }
 
   const upsert = db.prepare(`
@@ -382,12 +477,24 @@ async function resolveAndCache(db, need, deps, stats) {
   for (const sku of need) {
     if (chunkFailedSkus.has(sku)) continue;   // チャンク失敗として記録済み
     const mn = mnBySku.get(sku);
-    if (!mn) { upsert.run(sku, null, null, null, null, 'not_found', stamp); stats.notFound++; continue; }
+    if (!mn) {
+      // 候補を投げたが1つも当たらなかった。**全候補が明示的に「無い」と答えられた**ときだけ
+      // 不存在を確定する。1つでも理由不明 (欠落応答・500・レート制限) が混ざれば error にして再試行する
+      const cands = probeBySku.get(sku) || [];
+      const anyFailed = cands.some((c) => failedCodes.has(norm(c)));
+      const allAbsent = cands.length > 0 && cands.every((c) => absent.has(norm(c)));
+      if (allAbsent && !anyFailed) { upsert.run(sku, null, null, null, null, 'not_found', stamp); stats.notFound++; }
+      else { upsert.run(sku, null, null, null, null, 'error', stamp); stats.errors++; }
+      continue;
+    }
     const item = itemByMn.get(norm(mn));
     if (!item) {
       // items にも failed にも無い欠落応答は「不存在」と断定できないため error 扱い
-      // (30分後再試行。not_found で恒久抑止すると部分応答・プロキシ不具合で永久に画像なしになる)
-      upsert.run(sku, mn, null, null, null, 'error', stamp);
+      // (30分後再試行。not_found で恒久抑止すると部分応答・プロキシ不具合で永久に画像なしになる)。
+      // 🚨 キャッシュの管理番号が明示的に「無い」と答えられたら、楽天側で番号が変わった/消えた。
+      //    manage_number を消しておかないと、次回も同じ旧番号を照会し続けて追従できない (Codex R1 Medium)
+      const stale = fromCache.has(sku) && absent.has(norm(mn));
+      upsert.run(sku, stale ? null : mn, null, null, null, 'error', stamp);
       stats.errors++;
       continue;
     }

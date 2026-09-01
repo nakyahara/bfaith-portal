@@ -113,7 +113,7 @@ t('extractImageUrls: 候補順に走査する (variants の並び順に引きず
     .variantUrl.endsWith('/a.jpg'));
 });
 
-t('W だけ登録された商品でも W を variants 照合に使わない (Codex R2 High)', async () => {
+{
   // 兄弟SKU 2つが同じ商品ページ (W=share-item) を共有し、AL/AM は未登録。
   // W を照合に使うと、先頭 variant (別の色) の画像を掴んでしまう
   const item = {
@@ -137,9 +137,11 @@ t('W だけ登録された商品でも W を variants 照合に使わない (Cod
   assert.equal(row.manage_number, 'share-item', 'W からは商品管理番号を解決してよい');
   assert.equal(row.variant_image_url, null, 'W では variant を確定させない (別の色を掴まない)');
   assert.ok(row.white_bg_url.endsWith('/share_00.jpg'), '商品共通の写真にフォールバック');
-});
+  passed++;
+  console.log('  ok: W だけ登録された商品でも W を variants 照合に使わない (Codex R2 High) (async)');
+}
 
-t('ne_code が W と同値でも variants 照合に使わない (Codex R3 High)', async () => {
+{
   const item = {
     manageNumber: 'share2',
     whiteBgImage: { location: '/share2_00.jpg' },
@@ -160,7 +162,97 @@ t('ne_code が W と同値でも variants 照合に使わない (Codex R3 High)'
   const row = getDB().prepare('SELECT * FROM pk_product_images WHERE ne_code=?').get('share2');
   assert.equal(row.variant_image_url, null, 'ne_code=W では variant を確定させない');
   assert.ok(row.white_bg_url.endsWith('/share2_00.jpg'));
-});
+  passed++;
+  console.log('  ok: ne_code が W と同値でも variants 照合に使わない (Codex R3 High) (async)');
+}
+
+{
+  // mirror_rakuten_item_daily は「その日に動いた商品」だけなので、売れなかった商品は引けない。
+  // 実測: 「楽天に無い」244件のうち135件が実在し、全部に画像があった
+  const calls = [];
+  const stats = await ensureImagesFor(['mamabutter-bs'], {
+    loadMaps: () => ({
+      // AL しか登録がなく、item_daily にも載っていない = 旧実装では not_found だった
+      rakutenByNe: new Map([['mamabutter-bs', { all: ['mamabutter-bs'], variantIds: ['mamabutter-bs'], merchantIds: [] }]]),
+      itemNumbers: new Map([['other-item', 'other-item']]),
+    }),
+    fetchDetails: async (mns) => {
+      calls.push(mns);
+      return {
+        items: mns.some((m) => m === 'mamabutter-bs')
+          ? [{ manageNumber: 'mamabutter-bs', whiteBgImage: { location: '/mamabutter_00.jpg' } }]
+          : [],
+        failed: [],
+      };
+    },
+  });
+  assert.equal(stats.ok, 1, '画像が取れる');
+  assert.ok(calls[0].includes('mamabutter-bs'), '候補を RMS へ投げている');
+  const row = getDB().prepare('SELECT * FROM pk_product_images WHERE ne_code=?').get('mamabutter-bs');
+  assert.equal(row.manage_number, 'mamabutter-bs', '当たった管理番号を保存する (次回はこれを使う)');
+  assert.ok(String(row.white_bg_url).endsWith('/mamabutter_00.jpg'), `white_bg_url=${row.white_bg_url} status=${row.status} mn=${row.manage_number}`);
+  passed++;
+  console.log('  ok: mirror に無い商品でも楽天へ直接照会して見つける (2026-09-01 ママバター事件) (async)');
+}
+
+{
+  const stats = await ensureImagesFor(['nowhere-sku'], {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map() }),
+    // RMS は投げた全コードについて items か failed のどちらかを返す (実測)
+    fetchDetails: async (mns) => ({ items: [], failed: mns.map((m) => ({ manageNumber: m, reason: `Not found for inputs; manageNumber=${m}` })) }),
+  });
+  assert.equal(stats.notFound, 1);
+  const row = getDB().prepare('SELECT * FROM pk_product_images WHERE ne_code=?').get('nowhere-sku');
+  assert.equal(row.status, 'not_found');
+  passed++;
+  console.log('  ok: 楽天に本当に無い商品は not_found のまま (候補を全部試しても当たらない) (async)');
+}
+
+{
+  // 🚨 障害 (500/レート制限/欠落応答) を「楽天に無い」と断定しない — 今回の事故と同じ性質 (Codex R1 High)
+  const stats = await ensureImagesFor(['flaky-sku'], {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map() }),
+    fetchDetails: async (mns) => ({
+      items: [],
+      failed: mns.map((m, i) => ({ manageNumber: m, reason: i === 0 ? 'Not found' : 'HTTP 500 upstream error' })),
+    }),
+  });
+  assert.equal(stats.notFound, 0, '理由不明が混ざれば不存在を確定しない');
+  assert.equal(stats.errors, 1);
+  assert.equal(getDB().prepare('SELECT status FROM pk_product_images WHERE ne_code=?').get('flaky-sku').status, 'error');
+  passed++;
+  console.log('  ok: 障害応答を not_found にしない (30分後に再試行する) (async)');
+}
+
+{
+  // 応答自体が返ってこない (チャンク例外) 場合も、probe 中の SKU を not_found にしない
+  const stats = await ensureImagesFor(['chunkfail-sku'], {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map() }),
+    fetchDetails: async () => { throw new Error('network down'); },
+  });
+  assert.equal(stats.notFound, 0);
+  const cf = getDB().prepare('SELECT status, manage_number FROM pk_product_images WHERE ne_code=?').get('chunkfail-sku');
+  assert.equal(cf.status, 'error', 'probe 候補もチャンクに紐づいている');
+  assert.equal(cf.manage_number, null,
+    '未確認の候補を管理番号として保存しない (次回キャッシュ優先で誤った番号に固定される — Codex R2 High)');
+  passed++;
+  console.log('  ok: チャンク失敗時も probe 中の商品を not_found にしない (async)');
+}
+
+{
+  const calls = [];
+  await ensureImagesFor(['mamabutter-bs'], {
+    force: true,
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map() }),   // mirror から完全に消えた状態
+    fetchDetails: async (mns) => {
+      calls.push(mns);
+      return { items: [{ manageNumber: 'mamabutter-bs', whiteBgImage: { location: '/mamabutter_01.jpg' } }], failed: [] };
+    },
+  });
+  assert.deepEqual(calls[0], ['mamabutter-bs'], 'キャッシュの管理番号だけを問い合わせる (候補を撒き直さない)');
+  passed++;
+  console.log('  ok: 一度当たった管理番号はキャッシュから使う (mirror から消えても再照会しない) (async)');
+}
 
 t('extractImageUrls: 白抜き優先・無ければimages[0]', () => {
   const both = extractImageUrls({
@@ -190,7 +282,15 @@ function fakeDeps({ items = [], failed = [] } = {}) {
         ['whitesage10', 'whitesage10'],      // ne_code直接一致 (product-hub出品分)
       ]),
     }),
-    fetchDetails: async (mns) => { calls.push(mns); return { items, failed }; },
+    // RMS は投げた全コードについて items か failed のどちらかを返す (実測)。
+    // 明示的な failed が無いと「答えが無い」= 障害扱い (error) になるので、テストでも実態に合わせる
+    fetchDetails: async (mns) => {
+      calls.push(mns);
+      const hit = new Set(items.map((it) => String(it.manageNumber || it.itemNumber).toLowerCase()));
+      const auto = mns.filter((m) => !hit.has(String(m).toLowerCase()))
+        .map((m) => ({ manageNumber: m, reason: `Not found for inputs; manageNumber=${m}` }));
+      return { items, failed: failed.length > 0 ? failed : auto };
+    },
   };
 }
 
@@ -208,7 +308,9 @@ function fakeDeps({ items = [], failed = [] } = {}) {
   assert.equal(stats.ok, 2);
   assert.equal(stats.notFound, 1);
   assert.equal(stats.variant, 1);
-  assert.deepEqual(deps.calls, [['rk-item-a', 'whitesage10']]);
+  // mirror で管理番号を引けなかった SKU は、候補を RMS に投げて存在を確かめる (2026-09-01)。
+  // 'no' のような短い断片は投げない (PROBE_MIN_LEN)
+  assert.deepEqual(deps.calls, [['rk-item-a', 'whitesage10', 'no-such-sku', 'no-such']]);
   const map = getImageMap(['csvsku-a', 'whitesage10', 'no-such-sku']);
   assert.ok(map.get('csvsku-a').url.endsWith('/cabinet/a_red_00.jpg'), '変換テーブルの楽天SKUコードで variants を引き、そのSKUの画像 (白抜きより優先)');
   assert.ok(map.get('whitesage10').url.endsWith('/cabinet/ws_top.jpg'), 'フォールバックで1枚目');
