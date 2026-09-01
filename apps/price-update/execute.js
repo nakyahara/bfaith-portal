@@ -274,8 +274,14 @@ export async function executeRun(db, run, { actor, clients, client, env = proces
     const mayHaveChanged = isStopState(state);
     for (const op of ops) {
       summary[bucket]++;
-      record(op, state === 'unexpected' ? 'unknown' : state, reason,
-        { httpStatus: res.status, classified: state, mayHaveChanged });
+      // ★失敗でも「価格は変わった」と分かっているなら、それを記録に残す (Codex R6)。
+      //   Yahoo の「更新は通ったが反映できていない」がこれ。残さないと復旧の対象から漏れる
+      const sentPrice = res.body?.applied?.[op.sku_code];
+      record(op, state === 'unexpected' ? 'unknown' : state, reason, {
+        httpStatus: res.status, classified: state, mayHaveChanged,
+        ...(sentPrice !== undefined ? { applied: sentPrice, mayHaveChanged: true } : {}),
+        ...(res.body?.publish ? { publishRequested: res.body.publish.requested === true, publishOk: res.body.publish.ok === true } : {}),
+      });
     }
 
     if (isStopState(state)) {

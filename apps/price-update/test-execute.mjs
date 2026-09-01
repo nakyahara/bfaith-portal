@@ -287,6 +287,48 @@ console.log('\n── noop も確認できたときだけ確定する ──');
   ok(summary.stopped.includes('確認'), '止めた理由が確認の不一致だと分かる');
 }
 
+console.log('\n── ★「価格は変わったが反映できていない」を記録に残す (Yahoo・Codex R6) ──');
+{
+  const ops = [{
+    operationId: 'pf-1', mall: 'yahoo', neCode: 'ne-pf', rowKind: 'single',
+    listingCode: 'yh-1', skuCode: 'yh-1', confidence: 'confirmed',
+    expectedCurrentPrice: 1000, newPrice: 1001, cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.1,
+    initialState: 'previewed',
+  }];
+  const runId = insertRun(db, { createdBy: 't', neCodes: ['ne-pf'], limits: {}, operations: ops });
+  // 更新は通ったが反映を依頼できなかった (yahoo-apply が返す形)
+  const yh = {
+    calls: [],
+    patchItemPrices: async function (code, body) {
+      this.calls.push({ code, body });
+      return {
+        status: 200,
+        body: {
+          ok: false, error: 'PUBLISH_FAILED',
+          message: '価格は 1001 円に変わりましたが、フロント反映を依頼できていません',
+          applied: { 'yh-1': 1001 },
+          publish: { requested: true, ok: false },
+        },
+      };
+    },
+    fetchItemDetail: async () => ({ item: { manageNumber: 'yh-1', variants: { 'yh-1': { standardPrice: '1001' } } }, status: 'found' }),
+  };
+  const { summary, results } = await executeRun(db, getRun(db, runId), {
+    actor: 't', clients: { yahoo: yh }, env: { PRICE_UPDATE_YAHOO_ENABLED: '1' },
+  });
+  eq(summary.applied, 0, '★反映できていないので「更新済み」に数えない');
+  ok(summary.stopped, '★その場で止める (人が確かめるまで残りを送らない)');
+  eq(results[0].state, 'unknown', '状態は「結果が不明」として残る');
+
+  // ★イベントの詳細に「いくらに変わったか」と「反映の結果」が残っている
+  const ev = getRun(db, runId).events.filter((e) => e.operation_id === 'pf-1').map((e) => JSON.parse(e.detail_json || '{}'));
+  const last = ev[ev.length - 1];
+  eq(last.applied, 1001, '★いくらに変わったかが記録に残る (復旧の対象にできる)');
+  eq(last.mayHaveChanged, true, '★価格が変わった印が付く');
+  eq([last.publishRequested, last.publishOk], [true, false], '★反映を依頼したが通らなかったと分かる');
+  ok(/反映/.test(last.reason || ''), '理由に反映のことが書いてある: ' + last.reason);
+}
+
 console.log('\n── 状態はイベントとして残る (行は書き換えない) ──');
 {
   const run = makeRun(1);
