@@ -89,3 +89,18 @@
 .ps-own { background: #eef6ff; border-left: 3px solid #4a90d9; border-radius: 4px;
   padding: 6px 10px; font-size: 13px; margin: 8px 0 0; }
 .ps-own-withdrawn { background: #fdf3ec; border-left-color: #c07a3a; }
+
+/* 代表商品 → Amazon。押せることが一目で分かるようにする
+   (ASINだけをリンクにしていた頃は、暗号のような文字列なので誰も押さなかった) */
+.ps-examples li { margin-bottom: 9px; }
+.ps-ex-link { display: inline-block; color: #14608f; text-decoration: none; font-size: 13px; line-height: 1.5; }
+.ps-ex-link:hover { text-decoration: underline; }
+.ps-ex-link b { margin-right: 5px; }
+.ps-ext { font-size: 10px; margin-left: 3px; opacity: .6; }
+.ps-ex-meta { font-size: 11px; color: #888; margin-top: 1px; }
+.ps-asin { font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; color: #888;
+  text-decoration: none; border-bottom: 1px dotted #bbb; margin-right: 6px; }
+.ps-asin:hover { color: #14608f; border-bottom-color: #14608f; }
+.ps-search { margin: 10px 0 0; font-size: 13px; }
+.ps-search a { color: #14608f; text-decoration: none; }
+.ps-search a:hover { text-decoration: underline; }

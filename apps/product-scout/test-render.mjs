@@ -107,4 +107,23 @@ assert.ok(withOwn.includes('下限'), '不完全な分母が「下限」と表�
 console.log('  ✓ 自社実績と「下限%」が画面に出る');
 passed++;
 
+// ⭐代表商品からAmazonへ飛べること。ASINだけをリンクにしていた頃は、
+//   暗号のような文字列なので誰も押そうと思わなかった
+const listed = listConcepts({ snapshotId: snap.snapshot_id, gate: 'all', status: 'all', limit: 40 }, db);
+const withEx = listed.find((c) => (c.examples || []).length);
+assert.ok(withEx, '代表商品を持つテーマが1件はあること');
+const linkHtml = ejs.render(template, {
+  username: 'x', displayName: 'x', snapshot: snap, categories, counts, concepts: [withEx],
+  gate: 'all', status: 'all', page: 1, pageSize: 40, total: 1, totalPages: 1,
+  reasonCodes: REASON_CODES, signal: { level: 'green', title: 'x', detail: 'y' },
+}, { filename: path.join(__dirname, 'views/index.ejs') });
+const ex = withEx.examples[0];
+assert.ok(linkHtml.includes(`https://www.amazon.co.jp/dp/${ex.asin}`),
+  '代表商品の Amazon リンクが出ていない');
+assert.ok(linkHtml.includes('ps-ex-link'), '商品名がリンクになっていない');
+assert.ok(linkHtml.includes('https://www.amazon.co.jp/s?k='), '市場を検索するリンクが出ていない');
+assert.ok(linkHtml.includes('rel="noopener"'), 'target=_blank に noopener が付いていない');
+console.log('  ✓ 代表商品からAmazonへ飛べる (商品名がリンク + 市場検索)');
+passed++;
+
 console.log(`\n${passed} 件すべて通りました`);

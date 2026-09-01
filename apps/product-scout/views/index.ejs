@@ -174,14 +174,43 @@
           <details class="ps-examples">
             <summary>代表商品 <%= (c.examples || []).length %>件</summary>
             <ul>
-              <% (c.examples || []).forEach(function (e) { %>
+              <% (c.examples || []).forEach(function (e) {
+                   // Amazonのタイトルは先頭にブランド名が入っていることが多く、
+                   // ブランドを別に出すと同じ語が2回並ぶ (「大一鋼業 大一鋼業 石膏ボード…」)。
+                   // ⚠️ブランドが「福井金属工芸(Fukuikinzokukogei)」でタイトルは
+                   //   「福井金属工芸 Jフック…」のように、括弧の有無で食い違うことがある。
+                   //   括弧より前の名前でも見る
+                   var t = String(e.title || '');
+                   var b = String(e.brand || '');
+                   var heads = [b, b.split(/[(（]/)[0].trim()].filter(function (x) { return x.length >= 2; });
+                   for (var hi = 0; hi < heads.length; hi++) {
+                     if (t.indexOf(heads[hi]) === 0) {
+                       t = t.slice(heads[hi].length).replace(/^[\s　]+/, '');
+                       break;
+                     }
+                   }
+                   var url = 'https://www.amazon.co.jp/dp/' + encodeURIComponent(e.asin); %>
                 <li>
-                  <a href="https://www.amazon.co.jp/dp/<%= e.asin %>" target="_blank" rel="noopener"><%= e.asin %></a>
-                  <b><%= e.brand %></b> <%= e.title %>
-                  <span class="ps-muted">月販<%= (e.monthlySold || 0).toLocaleString() %> / ¥<%= (e.price || 0).toLocaleString() %> / レビュー<%= e.reviewCount || 0 %></span>
+                  <%# ⭐商品名そのものを押せるようにする。ASINだけをリンクにしていた頃は、
+                      暗号のような文字列なので誰も押そうと思わなかった %>
+                  <a class="ps-ex-link" href="<%= url %>" target="_blank" rel="noopener">
+                    <% if (b) { %><b><%= b %></b><% } %><%= t %><span class="ps-ext">↗</span>
+                  </a>
+                  <div class="ps-ex-meta">
+                    <a class="ps-asin" href="<%= url %>" target="_blank" rel="noopener"><%= e.asin %></a>
+                    月販<%= (e.monthlySold || 0).toLocaleString() %>
+                    ／ ¥<%= (e.price || 0).toLocaleString() %>
+                    ／ レビュー<%= (e.reviewCount || 0).toLocaleString() %>
+                  </div>
                 </li>
               <% }); %>
             </ul>
+            <%# この市場を実際のAmazonの検索結果で見る。数字だけでは
+                「どういう売り場か」が掴めないので、判断の前に現物を見に行けるようにする %>
+            <p class="ps-search">
+              <a href="https://www.amazon.co.jp/s?k=<%= encodeURIComponent(c.category_path.split(' > ').slice(-1)[0]) %>"
+                 target="_blank" rel="noopener">🔍 この市場をAmazonで検索する<span class="ps-ext">↗</span></a>
+            </p>
           </details>
 
           <% if (c.decision) { %>
