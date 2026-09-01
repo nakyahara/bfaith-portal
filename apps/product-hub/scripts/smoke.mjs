@@ -5036,6 +5036,16 @@ renders.push(
     board: wfp.boardData(db, { view: 'image', imageKind: 'top' }),
   }],
   ['board.ejs (自分のボール・担当者未紐付け)', 'board.ejs', { ...boardBase, assigneeParam: 'me' }],
+  // 完了列のカードにも画像の状況を出す (2026-09-01)。実データでは完了が 0 件のこともあるので、
+  // 進行中のカードを 1 枚借りて必ず描かせる
+  ['board.ejs (完了列にカード)', 'board.ejs', {
+    ...boardBase,
+    board: {
+      ...boardBase.board,
+      doneCards: boardBase.board.columns.flatMap((c) => c.cards).slice(0, 1),
+      doneTotal: 1,
+    },
+  }],
   ['board.ejs (空)', 'board.ejs', {
     ...boardBase,
     board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false, checkingTotal: 0 },
@@ -5129,13 +5139,34 @@ for (const [name, file, data] of renders) {
 {
   const bh = renderedHtml.get('board.ejs') || '';
   // 2026-09-01 中原さん要望: TOP画像 / 商品詳細画像 が 済 か まだ かをカードで読めること。
-  // TOP は工程を持たない (2026-08-31 廃止) ので、行の中身は画像の登録有無から作る
-  check('ボード: カードに TOP / 詳細 の行が出る',
-    bh.includes('>TOP<') && bh.includes('>詳細<'),
-    (bh.match(/<span class="kb-kname">[^<]*<\/span>/g) || []).slice(0, 4).join(' ') || '(行が無い)');
-  check('ボード: 済 / まだ が状態バッジで出る',
-    /<span class="kb-state (done|todo|off)">(済|まだ|対象外|—)<\/span>/.test(bh),
-    (bh.match(/<span class="kb-state[^>]*>[^<]*<\/span>/g) || []).slice(0, 4).join(' ') || '(バッジが無い)');
+  // TOP は工程を持たない (2026-08-31 廃止) ので、行の中身は画像の登録有無から作る。
+  // 「どこか 1 つでもバッジがあれば OK」では、片方の行だけ描けなくなった退行を拾えない (Codex R1 low)
+  const IMG_ROW_TEXT = { done: ['済'], todo: ['まだ'], off: ['対象外', '—'] };
+  const krowsOf = (html) => html.match(/<div class="kb-krow"[^>]*>[\s\S]*?<\/div>/g) || [];
+  const badgeOf = (row) => {
+    const m = row.match(/<span class="kb-state (done|todo|off)">([^<]+)<\/span>/);
+    return m ? { state: m[1], text: m[2] } : null;
+  };
+  const rowsOk = (rows) => rows.length > 0 && rows.every((r) => {
+    const b = badgeOf(r);
+    return b && IMG_ROW_TEXT[b.state].includes(b.text);
+  });
+  const rows = krowsOf(bh);
+  check('ボード: カードの TOP 行に 済/まだ のバッジが付く',
+    rowsOk(rows.filter((r) => r.includes('>TOP<'))),
+    rows.filter((r) => r.includes('>TOP<')).slice(0, 2).join(' | ') || '(TOP の行が無い)');
+  check('ボード: カードの 詳細 行に 済/まだ/対象外 のバッジが付く',
+    rowsOk(rows.filter((r) => r.includes('>詳細<'))),
+    rows.filter((r) => r.includes('>詳細<')).slice(0, 2).join(' | ') || '(詳細の行が無い)');
+  {
+    // 完了列にも同じ 2 行が出る (本流を D&D で完了にすると TOP画像が未登録のまま完了列に入りうる)
+    const bhDone = renderedHtml.get('board.ejs (完了列にカード)') || '';
+    const doneCol = bhDone.split('data-col="done"')[1] || '';
+    const doneRows = krowsOf(doneCol);
+    check('ボード: 完了列のカードにも TOP / 詳細 の状況が出る',
+      rowsOk(doneRows.filter((r) => r.includes('>TOP<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細<'))),
+      doneRows.slice(0, 2).join(' | ') || '(完了列に画像の行が無い)');
+  }
   check('ボード: 確認中のカードに理由ラベルが出る',
     bh.includes('kb-checking') && bh.includes('🔍 確認中: パッケージ裏面の確認待ち'),
     bh.includes('kb-checking') ? 'ラベル文言が出ていない' : 'バッジ自体が無い');
