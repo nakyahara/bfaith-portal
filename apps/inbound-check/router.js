@@ -24,7 +24,7 @@ import {
   checkEnrollRate, recordEnrollAttempt,
   listWorkers, getWorker,
 } from './db.js';
-import { fetchAndImportFromDrive, statusForView, driveConfig } from './drive-fetch.js';
+import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProductMaster } from './drive-fetch.js';
 // 入庫情報の書き込みは inbound-info の関数を通す (いろは=有り の連動ルール・楽観ロック・
 // updated_by の記録がそこに1つだけある。ここで直に UPDATE すると規則が二重管理になる)
 import { updateInbound, getInbound, addManual } from '../inbound-info/db.js';
@@ -415,6 +415,16 @@ router.post('/api/info/register', checkOrigin, api((req, res) => {
     return res.status(r.error === 'duplicate' ? 409 : 400).json({ ok: false, error: r.error, message });
   }
   res.json({ ok: true, row: getInbound(code) });
+}));
+
+// ─── ロジザード商品マスタを今すぐ取り込む (期限管理あり/なしの正本) ───
+// アプリ利用者なら誰でも。読み取り専用の取込で、失敗しても既存の設定は変わらない
+router.post('/admin/fetch-product-master', requireSession, checkOrigin, api(async (req, res) => {
+  try {
+    res.json(await fetchAndImportProductMaster({ actor: req.session.email, force: true }));
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.code || 'drive_error', message: e.message });
+  }
 }));
 
 // ─── 期限管理あり/なし の切り替え (詳細パネルから) ───

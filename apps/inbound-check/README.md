@@ -18,6 +18,7 @@
 | `/apps/inbound-check/api/info/register` (POST) | 同上 | 入庫情報が無い商品を登録する |
 | `/apps/inbound-check/api/product-flags` (POST) | 同上 | 期限管理 あり/なし を切り替える |
 | `/apps/inbound-check/admin/destinations(.csv)` | ポータルセッション | 行き先の台帳 (いろはへ送る商品の一覧) |
+| `/apps/inbound-check/admin/fetch-product-master` (POST) | ポータルセッション | ロジザード商品マスタを今すぐ取り込む |
 | `/apps/inbound-check/admin` | ポータルセッション (アプリ権限) | 管理画面。CSV 取込はアプリ利用者全員 |
 | `/apps/inbound-check/admin/devices` `/workers` `/history(.csv)` | admin のみ | 端末登録・作業者・履歴 |
 | `/apps/inbound-check/device/exit` (POST) | 端末 | 端末Cookie を外す |
@@ -73,14 +74,31 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
 期限管理商品は入荷のたびに有効期限が変わるので、**確認のたびに** 年/月/日 のプルダウンで入れてもらう
 (日が書かれていない商品は「—」のままにすると年月だけで記録する)。入力値は台帳の `expiry_date` に残る。
 
-🚨**「期限管理あり/なし」の正しい出どころはロジザードの商品マスタだが、入荷受付CSV には出てこない**
-(58列を実測。`有効期限` 列はあるが検品時に入る値で、受付時点では空)。当面は次の順で決める:
+**「期限管理あり/なし」の正本はロジザードの商品マスタ**。入荷受付CSV には出てこない
+(58列を実測。`有効期限` 列はあるが検品時に入る値で、受付時点では空) ので、別に取ってくる。
 
-1. `f_inbound_check_product_flags` に人が設定した値 (詳細パネルの「期限管理 あり/なし」)
-2. `mirror_logizard_stock` の `有効期限` が入っていれば「あり」と推定
+```
+miniPC auto-shohin-csv.js (Logizard-NyukaCSV の2ステップ目・1日1回)
+  ロジザード エクスポート[FM08_01] → 種類=商品 / パターン=デフォルト
+  → 有効期限区分つきCSV → rclone → 共有ドライブ shohin_master.csv
+  → Render が30分おきの巡回のついでに取り込む (中身が変わっていなければ何もしない)
+  → f_inbound_check_product_flags (source='logizard')
+```
 
-在庫ゼロの商品は在庫ミラーに行が無いため推定できない → 現場が詳細パネルで直す。
-ロジザードの商品マスタを取り込めるようになったら、同じ表を `source='logizard'` で埋めれば置き換わる。
+判定の優先順:
+
+1. **ロジザード商品マスタ** (`source='logizard'`) — 正本
+2. 人が設定した値 (`source='manual'`。iPad の詳細パネル) — 商品マスタを取り込めるまでの応急処置
+3. `mirror_logizard_stock` の `有効期限` が入っていれば「あり」と推定 — **在庫ゼロの商品は推定できない**
+
+⭐**ロジザードの取込は手動設定も上書きする** (CLAUDE.md「正本優先」)。ただし黙って消さず、
+「手動設定を何件上書きしたか」を取込結果に出す。
+
+🚨**有効期限区分の値の意味は環境依存**なので決め打ちしない。`0 / なし / 無し / 無 / しない /
+管理しない / 対象外 / - / －` と空欄だけを「管理しない」とし、それ以外は「管理する」に倒す
+(判定に迷う値を「管理しない」にすると、期限を聞かずに通してしまうため)。
+**見つかった区分の内訳は miniPC のログと管理画面に必ず出す** — ロジザード側の表記が変わったら
+そこで気付ける。
 
 ## 作業者 (名前タップ) = スタッフマスタ
 
@@ -96,12 +114,12 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
 node scripts/test-inbound-check.mjs [CA04001_*.csv]        # DB 層 + CSV パーサ (77 項目)
 node scripts/test-inbound-check-enroll.mjs                 # 端末の登録コード (35 項目)
 node scripts/test-inbound-check-drive.mjs                  # Drive 自動取込 (17 項目)
+node scripts/test-inbound-check-product-master.mjs         # 商品マスタ取込 = 期限管理 (40 項目)
 node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路 (131 項目)
 ```
 
 ## 次
 
-- ロジザード商品マスタから「期限管理」フラグを取り込む (いまは在庫データからの推定 + 手動)
 - 実機で決まった表示の手直し、Stream Deck の紙印刷を障害時のみに降格
 - ピックロケ補完は**取りやめ** (フリーロケ運用のため「空きロケへ」で問題ないと決着・2026-09-01)
 - **受け入れ条件**: 受付済がある日に実データが流れることを確認する (0件の日の動作は確認済み)。
