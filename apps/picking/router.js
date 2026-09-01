@@ -544,7 +544,10 @@ router.get('/manifest.json', (req, res) => {
     orientation: 'any',   // 前腕ホルダーは横装着が実運用 (2026-08-12 実機確認)
     background_color: '#111418',
     theme_color: '#111418',
-    icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
+    icons: [
+      { src: '/app-icons/picking-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/app-icons/picking-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+    ],
   });
 });
 
