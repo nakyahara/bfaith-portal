@@ -81,7 +81,13 @@ export function guardTestItem(flat, itemCode) {
     .filter(([k]) => isDirectChild(k, base, 'Name'))
     .map(([, v]) => v);
   if (names.length === 0) return '商品名を読めませんでした。検証用商品か確かめられないので動かしません';
-  if (!names.some((n) => n.includes(TEST_NAME_MARKER))) {
+  // ★商品名が複数あるのは想定外。「どれか1つに目印があれば通す」にすると、
+  //   本番名と目印が並んでいる時に通ってしまう (Codex R2)。1つに定まらなければ動かさない
+  if (names.length > 1) {
+    return `商品名が ${names.length} 個ありました (${names.join(' / ')})。`
+      + 'どれが商品名か決められないので動かしません';
+  }
+  if (!names[0].includes(TEST_NAME_MARKER)) {
     return `商品名に「${TEST_NAME_MARKER}」が入っていません (実際: ${names[0]})。`
       + '捨ててよい検証用商品であることを確かめられないため動かしません';
   }

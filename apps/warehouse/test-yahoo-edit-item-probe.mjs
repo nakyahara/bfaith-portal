@@ -183,6 +183,10 @@ console.log('\n── 本番商品では動かさない ──');
   const nested = await flattenXml(wrap('<Name>合皮補修シート ベージュ</Name><Options><Option><Name>zz検証用</Name></Option></Options>'));
   ok(guardTestItem(nested, 'zz-1'), '★入れ子の Name に目印があっても拒否する');
   ok(/合皮補修シート/.test(guardTestItem(nested, 'zz-1')), '理由には商品本体の名前を出す');
+  // ★商品名が複数あるのは想定外。目印つきが混ざっていても通さない (Codex R2)
+  const twoNames = await flattenXml(wrap('<Name>合皮補修シート ベージュ</Name><Name>zz検証用</Name><Price>577</Price>'));
+  ok(guardTestItem(twoNames, 'zz-1'), '★商品名が2つあれば拒否する (目印つきが混ざっていても通さない)');
+  ok(/2 個/.test(guardTestItem(twoNames, 'zz-1')), '理由に個数を書く: ' + guardTestItem(twoNames, 'zz-1'));
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
