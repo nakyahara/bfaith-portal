@@ -131,6 +131,12 @@ try {
   r = await req(J, `${APP}/admin`);
   ok(r.status === 200 && r.text.includes('取込履歴') && r.text.includes('この端末を登録'), '管理画面 (admin 節あり)');
   ok(r.text.includes('いろはへ送る商品') && r.text.includes('destinations.csv'), '管理画面に いろはへ送る商品 の一覧が出る');
+  ok(r.text.includes('期限管理 (ロジザード商品マスタ)') && r.text.includes('fetchMasterBtn'), '管理画面に 期限管理 (商品マスタ) の節が出る');
+  // Drive にファイルが無い環境でも 400 で返る (500 にしない = 原因が画面で分かる)
+  r = await req(J, `${APP}/admin/fetch-product-master`, { method: 'POST', body: {} });
+  ok(r.status === 400 && !!r.json?.message, `商品マスタの取込は取れないとき 400 で理由を返す (${r.json?.message?.slice(0, 60)})`);
+  r = await req(null, `${APP}/admin/fetch-product-master`, { method: 'POST', body: {} });
+  ok(r.status === 302 || r.status === 401, '未認証は商品マスタを取り込めない');
   // 作業者 = スタッフマスタ (apps/staff)。seed 13名が入っている
   r = await req(J, `${BASE}/apps/staff/api/list`);
   ok(r.status === 200 && r.json.staff.length === 13 && r.json.candidates[0].staff_no === '0001', 'スタッフマスタ seed 13名');

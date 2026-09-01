@@ -330,6 +330,31 @@ export const JOBS_REGISTRY = [
       + '画面採取の正本 = AI_reference『ロジザード作業自動化\入荷状況照会CSV_画面採取_20260901.md』',
   },
   {
+    id: 'logizard-shohin-csv',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: 'ロジザード エクスポート[FM08_01] の「商品 / デフォルト」を出力し、rclone で共有ドライブへ置く。'
+      + '目的は1つだけ = **入荷受付チェック (iPad) の「期限管理あり/なし」の正本を取ること**。'
+      + '入荷受付CSV [FA04_01] には期限管理の設定が出てこないため (58列を実測)、これが無いと'
+      + '在庫データからの推定 (在庫ゼロの商品は推定できない) と手動設定に頼ることになる。'
+      + '⭐止まっても現場は止まらない (推定と手動で動き続ける) ので P3',
+    where: 'miniPC TaskScheduler [Logizard-NyukaCSV] の2ステップ目 → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat',
+    schedule: '毎日 08:40 (入荷受付CSV の直後。--once-per-day で1日1回だけ実行し、11:45 の回は何もしない)',
+    anchor_hour_jst: 8,
+    anchor_minute_jst: 45,
+    grace_hours: 12,
+    lifecycle: 'permanent',
+    runbook: 'C:\\tools\\logizard-automation\\logs\\scheduled.log の [shohin-csv] を確認 '
+      + '(手で試すなら node auto-shohin-csv.js --dry / 強制的に取り直すなら --once-per-day を外して実行)。'
+      + '取込側の状態は /apps/inbound-check/admin の「期限管理 (ロジザード商品マスタ)」節 '
+      + '(件数・最終取込・「今すぐ取り込む」ボタン)。'
+      + 'env = LOGIZARD_SHOHIN_CSV_OUT / LOGIZARD_SHOHIN_CSV_RCLONE_DEST (miniPC の .env)。'
+      + '⚠ロックは他のロジザード自動化と共有 (logizard-session.lock)。入荷受付CSV と同じ bat の中で'
+      + '順番に走るので、この2つが競合することはない。'
+      + '⭐「有効期限区分」の値の内訳を毎回ログに出す。ロジザード側の表記が変わったら気付けるようにしてある',
+  },
+  {
     id: 'logizard-nefuda-csv',
     type: 'scheduled_job',
     importance: 'P2',
