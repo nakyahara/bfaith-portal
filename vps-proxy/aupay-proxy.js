@@ -1801,8 +1801,9 @@ function assertPriceOnlyItems(items, { clearSalePrice = false } = {}) {
       // 書式: サブコード:価格 をパイプ区切り (例 aaaa:1000|bbbb:1200)
       const parts = String(item.subcode_price ?? '').split('|');
       for (const part of parts) {
-        const [sub, val] = part.split(':');
-        if (!sub || !/^[A-Za-z0-9._-]{1,99}$/.test(sub.trim()) || !isSaneYahooPrice(val)) {
+        // ★「サブコード:価格」ちょうど2つ。x:100:ゴミ を通さない (Codex R16)
+        const seg = part.split(':');
+        if (seg.length !== 2 || !/^[A-Za-z0-9._-]{1,99}$/.test(seg[0].trim()) || !isSaneYahooPrice(seg[1])) {
           throw new Error(`update-items: ${i + 1}件目の subcode_price の書式が正しくありません (${part})`);
         }
       }
@@ -2052,6 +2053,10 @@ function runSelfTest() {
   check('update-items: セール価格の値も見る', tryAssert([{ item_code: 'a', price: '100', sale_price: '0' }]).includes('sale_price が 1〜'), true);
   check('update-items: SKU別価格の書式を見る', tryAssert([{ item_code: 'a', subcode_price: 'x:0' }]).includes('subcode_price の書式'), true);
   check('update-items: SKU別価格の正しい書式は通る', tryAssert([{ item_code: 'a', subcode_price: 'x:1000|y:1200' }]), 'ok');
+  check('update-items: ★コロンが多い SKU別価格は通さない',
+    tryAssert([{ item_code: 'a', subcode_price: 'x:100:ゴミ' }]).includes('subcode_price の書式'), true);
+  check('update-items: コロンが無い SKU別価格も通さない',
+    tryAssert([{ item_code: 'a', subcode_price: 'x100' }]).includes('subcode_price の書式'), true);
   check('yahoo応答: Status OK は成功', yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status></ResultSet>' }), true);
   check('yahoo応答: ★HTTP 200 でも Error があれば失敗', yahooXmlOk({ status: 200, body: '<ResultSet><Result><Error><Code>x</Code></Error></Result></ResultSet>' }), false);
   check('yahoo応答: Status NG は失敗', yahooXmlOk({ status: 200, body: '<ResultSet><Status>NG</Status></ResultSet>' }), false);
