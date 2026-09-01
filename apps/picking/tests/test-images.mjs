@@ -61,6 +61,107 @@ t('resolveManageNumber: 直接一致とハイフン削りfallback (最大3段)',
   assert.equal(resolveManageNumber(nums, 'a-b-c-d-e'), null);                 // 3段削っても無ければnull
 });
 
+t('resolveManageNumber: 候補配列を順に試す (楽天 W/AM/AL の別名 — 2026-09-01)', () => {
+  const nums = new Map([['waterbowl-m', 'waterbowl-m'], ['kofunneil', 'kofunneil']]);
+  // AL (連番) を先に渡しても、後続の AM から解決できる
+  assert.equal(resolveManageNumber(nums, ['394', 'waterbowl-m-wh']), 'waterbowl-m');
+  assert.equal(resolveManageNumber(nums, ['0776', 'kofunneil-0776']), 'kofunneil');
+  // 1つも当たらなければ null
+  assert.equal(resolveManageNumber(nums, ['394', '0776']), null);
+  // 文字列渡し (従来の呼び出し) も引き続き動く
+  assert.equal(resolveManageNumber(nums, 'waterbowl-m-wh'), 'waterbowl-m');
+  assert.equal(resolveManageNumber(nums, []), null);
+  assert.equal(resolveManageNumber(nums, [null, undefined, '']), null);
+});
+
+t('extractImageUrls: 役割ごとに照合する (W で兄弟SKUの画像を掴まない — Codex 2026-09-01 High)', () => {
+  // 合皮補修シート型: 商品番号 W=0726-001802 を全12色が共有。variants のキーは AL の連番
+  const item = {
+    manageNumber: '0726-001802',
+    whiteBgImage: { location: '/sheet_00.jpg' },
+    variants: {
+      // 先頭 variant の merchantDefinedSkuId が W と同値 = 旧実装ならこれが先に当たった
+      '360': { merchantDefinedSkuId: '0726-001802', images: [{ location: '/sheet_black.jpg' }] },
+      '361': { merchantDefinedSkuId: '0726-001802-ow', images: [{ location: '/sheet_white.jpg' }] },
+    },
+  };
+  // 対象は白 (AL=361 / AM=0726-001802-ow)。W は渡さない
+  const white = extractImageUrls(item, { variantIds: ['361'], merchantIds: ['0726-001802-ow'], any: ['0726-001802-ow'] });
+  assert.ok(white.variantUrl.endsWith('/sheet_white.jpg'), '自分の色の写真を取る');
+  // AL だけ分かっている場合も同じ
+  assert.ok(extractImageUrls(item, { variantIds: ['361'], merchantIds: [], any: [] }).variantUrl.endsWith('/sheet_white.jpg'));
+  // AM だけでも取れる
+  assert.ok(extractImageUrls(item, { variantIds: [], merchantIds: ['0726-001802-ow'], any: [] }).variantUrl.endsWith('/sheet_white.jpg'));
+  // 一致しなければ null (白抜きへフォールバック)
+  const none = extractImageUrls(item, { variantIds: ['999'], merchantIds: [], any: [] });
+  assert.equal(none.variantUrl, null);
+  assert.ok(none.whiteBgUrl.endsWith('/sheet_00.jpg'));
+  // 配列渡し (従来の呼び出し) は役割不明として両方に当てる
+  assert.ok(extractImageUrls(item, ['361']).variantUrl.endsWith('/sheet_white.jpg'));
+  assert.ok(extractImageUrls(item, ['0726-001802-ow']).variantUrl.endsWith('/sheet_white.jpg'));
+});
+
+t('extractImageUrls: 候補順に走査する (variants の並び順に引きずられない)', () => {
+  const item = {
+    variants: {
+      'zz-first': { merchantDefinedSkuId: 'sku-b', images: [{ location: '/b.jpg' }] },
+      'sku-a': { merchantDefinedSkuId: 'zz-other', images: [{ location: '/a.jpg' }] },
+    },
+  };
+  // AL='sku-a' を優先 (列挙順では zz-first が先)
+  assert.ok(extractImageUrls(item, { variantIds: ['sku-a'], merchantIds: ['sku-b'], any: [] })
+    .variantUrl.endsWith('/a.jpg'));
+});
+
+t('W だけ登録された商品でも W を variants 照合に使わない (Codex R2 High)', async () => {
+  // 兄弟SKU 2つが同じ商品ページ (W=share-item) を共有し、AL/AM は未登録。
+  // W を照合に使うと、先頭 variant (別の色) の画像を掴んでしまう
+  const item = {
+    manageNumber: 'share-item',
+    whiteBgImage: { location: '/share_00.jpg' },
+    variants: {
+      'v-red': { merchantDefinedSkuId: 'share-item', images: [{ location: '/red.jpg' }] },
+      'v-blue': { merchantDefinedSkuId: 'share-item', images: [{ location: '/blue.jpg' }] },
+    },
+  };
+  const stats = await ensureImagesFor(['share-blue'], {
+    loadMaps: () => ({
+      // 新形式の索引で W だけ (AL/AM なし)
+      rakutenByNe: new Map([['share-blue', { all: ['share-item'], variantIds: [], merchantIds: [] }]]),
+      itemNumbers: new Map([['share-item', 'share-item']]),
+    }),
+    fetchDetails: async () => ({ items: [item], failed: [] }),
+  });
+  assert.equal(stats.ok, 1);
+  const row = getDB().prepare('SELECT * FROM pk_product_images WHERE ne_code=?').get('share-blue');
+  assert.equal(row.manage_number, 'share-item', 'W からは商品管理番号を解決してよい');
+  assert.equal(row.variant_image_url, null, 'W では variant を確定させない (別の色を掴まない)');
+  assert.ok(row.white_bg_url.endsWith('/share_00.jpg'), '商品共通の写真にフォールバック');
+});
+
+t('ne_code が W と同値でも variants 照合に使わない (Codex R3 High)', async () => {
+  const item = {
+    manageNumber: 'share2',
+    whiteBgImage: { location: '/share2_00.jpg' },
+    variants: {
+      'v1': { merchantDefinedSkuId: 'share2', images: [{ location: '/first.jpg' }] },
+      'v2': { merchantDefinedSkuId: 'share2-b', images: [{ location: '/second.jpg' }] },
+    },
+  };
+  // ne_code 自体が W と同値 ('share2')。any に入れると先頭 variant を掴んでしまう
+  const stats = await ensureImagesFor(['share2'], {
+    loadMaps: () => ({
+      rakutenByNe: new Map([['share2', { all: ['share2'], variantIds: [], merchantIds: [] }]]),
+      itemNumbers: new Map([['share2', 'share2']]),
+    }),
+    fetchDetails: async () => ({ items: [item], failed: [] }),
+  });
+  assert.equal(stats.ok, 1);
+  const row = getDB().prepare('SELECT * FROM pk_product_images WHERE ne_code=?').get('share2');
+  assert.equal(row.variant_image_url, null, 'ne_code=W では variant を確定させない');
+  assert.ok(row.white_bg_url.endsWith('/share2_00.jpg'));
+});
+
 t('extractImageUrls: 白抜き優先・無ければimages[0]', () => {
   const both = extractImageUrls({
     whiteBgImage: { location: '/white_00.jpg' },

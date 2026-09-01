@@ -266,6 +266,33 @@ t('商品名は作業日の新しい方を採る (過去日を後から取り込
   assert.equal(row.lines, 2, '件数は期間内の全明細');
 });
 
+// ─── 楽天 W/AM/AL の別名 (2026-09-01 実測: 画像なし407件中124件が AL を掴んで誤判定) ───
+{
+  const bAl = mkBatch(today);
+  addLine(bAl, 'waterbowl-m-wh', 1, 'ヘルスウォーター ボウル M 白');
+  cacheImg('waterbowl-m-wh', { status: 'not_found' });   // キャッシュ時は管理番号を引けなかった
+  // 同じ ne_code に3行 (W=商品番号 / AM=連携SKU / AL=連番)。AL だけでは商品管理番号に届かない
+  const insMap = mdb.prepare("INSERT INTO mirror_rakuten_sku_map (rakuten_code, ne_code, source, updated_at) VALUES (?, ?, ?, ?)");
+  insMap.run('waterbowl-m-wh', 'waterbowl-m-wh', 'am', now);
+  insMap.run('394', 'waterbowl-m-wh', 'al', now);        // 後から入る = 旧実装ではこれが勝っていた
+  insItem.run(today, 'waterbowl-m', 'h-wb', now);
+  clearMirrorMapsCache();
+  const r3 = listMissingImages({ until: today, days: 30 });
+  const row = r3.missing.find((x) => x.sku === 'waterbowl-m-wh');
+
+  t('AL (連番) が最後に入っていても、AM/W から商品管理番号を解決する', () => {
+    assert.equal(row.manageNumber, 'waterbowl-m', '旧実装は 394 を掴んで null になっていた');
+    assert.equal(row.itemUrl, 'https://item.rakuten.co.jp/b-faith/waterbowl-m/');
+    assert.equal(row.retryable, true, 'キャッシュ時に引けず今は引ける → 再取得で直る可能性');
+  });
+
+  t('楽天SKUコード欄には分かっているコードを全部並べる (連番だけ見せない)', () => {
+    assert.ok(row.rakutenCode.includes('waterbowl-m-wh'), 'AM');
+    assert.ok(row.rakutenCode.includes('394'), 'AL');
+    assert.match(row.rakutenCode, / \/ /, '区切りは " / "');
+  });
+}
+
 // ─── 画面テンプレート (EJS) の描画 + インラインJSの構文 ───
 // (2026-08-25 事故: EJS内のJS文字列に実改行が混入し、画面のボタンが全部無反応になった)
 {

@@ -58,19 +58,56 @@ export function normalizeImageUrl(loc) {
 /**
  * SKUコード → 実在する楽天商品管理番号。ハイフン末尾を最大3段削りながら探す
  * (SKU粒度のコードでは商品ページ・商品APIが404になるため。site-products で実測済み)。
+ *
+ * 🚨 1つの ne_code に**複数の楽天コード**が紐づく (W=商品番号 / AM=連携SKU番号 / AL=SKU管理番号。
+ *    同じ1SKUの別名 — [[reference_rakuten_sku_code_aliases]])。AL は "394" のような連番なので
+ *    単独では商品管理番号に解決できない。1つだけ選んで試すと、たまたま AL を掴んだ商品が
+ *    「楽天に無い」と誤判定される (2026-09-01 実測: 画像なし407件中124件がこれ)。
+ *    → 候補は**順に全部試す**。
  * @param itemNumbers Map<norm(manage_number), manage_number>
+ * @param rakutenCode 文字列 または 候補の配列 (先頭から試す)
  */
 export function resolveManageNumber(itemNumbers, rakutenCode) {
   if (!itemNumbers || !rakutenCode) return null;
-  const parts = String(rakutenCode).split('-');
-  const maxStrip = Math.min(3, parts.length - 1);
-  for (let i = 0; i <= maxStrip; i++) {
-    const candidate = parts.slice(0, parts.length - i).join('-');
-    if (!candidate) break;
-    const hit = itemNumbers.get(norm(candidate));
-    if (hit) return hit;
+  const candidates = Array.isArray(rakutenCode) ? rakutenCode : [rakutenCode];
+  for (const code of candidates) {
+    if (!code) continue;
+    const parts = String(code).split('-');
+    const maxStrip = Math.min(3, parts.length - 1);
+    for (let i = 0; i <= maxStrip; i++) {
+      const candidate = parts.slice(0, parts.length - i).join('-');
+      if (!candidate) break;
+      const hit = itemNumbers.get(norm(candidate));
+      if (hit) return hit;
+    }
   }
   return null;
+}
+
+/**
+ * ne_code に紐づく楽天コードの候補を取り出す。
+ * 🚨 文字列が入っていても**1文字ずつに分解しない** (旧形式の索引・テストの差し替え互換)。
+ */
+function codesOf(rakutenByNe, sku) {
+  const raw = rakutenByNe?.get(sku);
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.filter(Boolean);
+  if (typeof raw === 'object') return (raw.all || []).filter(Boolean);
+  return [raw];
+}
+
+/**
+ * ne_code に紐づく「バリエーション照合用」のコード (AL=variantsのキー / AM=merchantDefinedSkuId)。
+ * structured=true なら索引が役割を持っている = **W を照合に使ってはいけない**。
+ * AL/AM が1つも無い (W だけの) 商品でも structured のままにする —
+ * ここで配列へフォールバックすると W が照合対象に戻り、兄弟SKUの画像を掴む (Codex R2 High)。
+ */
+function variantCodesOf(rakutenByNe, sku) {
+  const raw = rakutenByNe?.get(sku);
+  if (raw && !Array.isArray(raw) && typeof raw === 'object') {
+    return { variantIds: raw.variantIds || [], merchantIds: raw.merchantIds || [], structured: true };
+  }
+  return { variantIds: [], merchantIds: [], structured: false };   // 旧形式・テスト差し替え
 }
 
 /**
@@ -84,12 +121,33 @@ export function extractImageUrls(item, codes = []) {
   let variant = null;
   const variants = item?.variants;
   if (variants && typeof variants === 'object') {
-    const wanted = new Set((Array.isArray(codes) ? codes : [codes]).map(norm).filter(Boolean));
-    for (const [vid, v] of Object.entries(variants)) {
-      if (!wanted.has(norm(vid)) && !wanted.has(norm(v?.merchantDefinedSkuId))) continue;
-      variant = normalizeImageUrl(Array.isArray(v?.images) ? v.images[0]?.location : null);
-      if (variant) break;
-    }
+    // 🚨 照合は**役割ごと**に分ける (Codex 2026-09-01 High)。
+    //    AL = variants のキーそのもの / AM = merchantDefinedSkuId / W = 商品番号 (商品単位)。
+    //    W は兄弟SKUで共有され得るので variants の照合に使ってはいけない —
+    //    使うと「別の色の写真」を掴む。ne_code だけは両方の fallback (product-hub 出品分)。
+    // 走査は**候補順**。variants の列挙順に任せると、先に並んだ別 variant が先に当たる
+    const asObj = !Array.isArray(codes) && codes && typeof codes === 'object';
+    const list = (v) => [...new Set((Array.isArray(v) ? v : [v]).map(norm).filter(Boolean))];
+    const variantIds = asObj ? list(codes.variantIds ?? []) : [];
+    const merchantIds = asObj ? list(codes.merchantIds ?? []) : [];
+    // 配列渡し (従来の呼び出し・テスト) は役割不明なので両方に当てる
+    const any = asObj ? list(codes.any ?? []) : list(codes ?? []);
+    const entries = Object.entries(variants);
+    const pick = (wanted, field) => {
+      for (const w of wanted) {
+        for (const [vid, v] of entries) {
+          const got = field === 'vid' ? vid : v?.merchantDefinedSkuId;
+          if (norm(got) !== w) continue;
+          const url = normalizeImageUrl(Array.isArray(v?.images) ? v.images[0]?.location : null);
+          if (url) return url;
+        }
+      }
+      return null;
+    };
+    variant = pick(variantIds, 'vid')
+      ?? pick(merchantIds, 'mds')
+      ?? pick(any, 'vid')
+      ?? pick(any, 'mds');
   }
   return { variantUrl: variant, whiteBgUrl: white, topUrl: top };
 }
@@ -144,11 +202,34 @@ export function clearMirrorMapsCache() { _mapsCache = null; }
 function loadMirrorMaps() {
   if (_mapsCache && Date.now() - _mapsCache.at < MIRROR_MAPS_TTL_MS) return _mapsCache.value;
   const mdb = getMirrorDB();
-  const rakutenByNe = new Map();
+  // 1 ne_code に最大3行 (W=商品番号 / AM=連携SKU番号 / AL=SKU管理番号)。**全部**持つ:
+  //   - 商品管理番号の解決は W が最も近い (多くの商品で manageNumber と同値) → 先に試す
+  //   - バリエーション画像の照合には AL (variants のキーそのもの) と AM (merchantDefinedSkuId) が要る
+  // 並びは W → AM → AL。同 source 内は updated_at 昇順 (後から入った方を後ろに)
+  const SOURCE_RANK = { w: 0, am: 1, al: 2 };
+  const byNe = new Map();
   for (const r of mdb.prepare(
-    'SELECT ne_code, rakuten_code FROM mirror_rakuten_sku_map ORDER BY updated_at ASC'
+    'SELECT ne_code, rakuten_code, source FROM mirror_rakuten_sku_map ORDER BY updated_at ASC'
   ).all()) {
-    if (r.ne_code) rakutenByNe.set(norm(r.ne_code), r.rakuten_code);
+    if (!r.ne_code || !r.rakuten_code) continue;
+    const k = norm(r.ne_code);
+    if (!byNe.has(k)) byNe.set(k, []);
+    byNe.get(k).push({ code: r.rakuten_code, rank: SOURCE_RANK[norm(r.source)] ?? 9 });
+  }
+  const rakutenByNe = new Map();
+  for (const [k, rows] of byNe) {
+    const sorted = rows.slice().sort((a, b) => a.rank - b.rank);
+    const codes = [];
+    for (const x of sorted) {
+      if (!codes.some((c) => norm(c) === norm(x.code))) codes.push(x.code);
+    }
+    // all = 商品管理番号の解決用 (W→AM→AL の順に試す)
+    // variantIds (AL) / merchantIds (AM) = バリエーション画像の照合用。W は**入れない**
+    rakutenByNe.set(k, {
+      all: codes,
+      variantIds: sorted.filter((x) => x.rank === 2).map((x) => x.code),
+      merchantIds: sorted.filter((x) => x.rank === 1).map((x) => x.code),
+    });
   }
   const itemNumbers = new Map();
   for (const r of mdb.prepare(
@@ -218,11 +299,22 @@ async function resolveAndCache(db, need, deps, stats) {
   const mnBySku = new Map();
   const codesBySku = new Map();   // バリエーション照合用: このSKUを指し得るコード群
   for (const sku of need) {
-    // 変換テーブルの楽天SKUコードを優先、無ければ ne_code 自体を候補にする
-    // (product-hub 出品分は manageNumber = ne_code 小文字)
-    const rakutenCode = rakutenByNe.get(sku) || sku;
-    mnBySku.set(sku, resolveManageNumber(itemNumbers, rakutenCode));
-    codesBySku.set(sku, [rakutenCode, sku]);
+    // 変換テーブルの楽天SKUコード (W/AM/AL の全部) + ne_code 自体
+    // (product-hub 出品分は manageNumber = ne_code 小文字)。
+    // 🚨 バリエーション画像の照合は AL (variants のキー) と AM (merchantDefinedSkuId) の
+    //    両方が要る。1つだけ渡すと「別の色の写真」が出続ける (2026-09-01)
+    const codes = [...codesOf(rakutenByNe, sku), sku];
+    mnBySku.set(sku, resolveManageNumber(itemNumbers, codes));
+    // 画像の照合は役割ごと (W は使わない)。索引が役割を持っていれば AL/AM がゼロでも
+    // 役割つきで渡す (配列に落とすと W が混ざる)。
+    // 🚨 any には ne_code も入れない — ne_code が W と同値の商品で W が照合に戻る (Codex R3 High)。
+    //    変換テーブルに行がある = AL/AM/W が分かっているので、ne_code を当てる必要はない。
+    //    行が無い商品 (product-hub 出品分・manageNumber = ne_code) は structured=false 側で
+    //    従来どおり配列 [sku] を渡すので、そちらは影響を受けない
+    const roles = variantCodesOf(rakutenByNe, sku);
+    codesBySku.set(sku, roles.structured
+      ? { variantIds: roles.variantIds, merchantIds: roles.merchantIds, any: [] }
+      : codes);
   }
 
   const manageNumbers = [...new Set([...mnBySku.values()].filter(Boolean))];
@@ -456,8 +548,11 @@ export function listMissingImages({ until = jstToday(), days = 30 } = {}) {
   for (const sku of skus) {
     const a = agg.get(sku);
     const c = cache.get(sku) || null;
-    const rakutenCode = maps ? (maps.rakutenByNe.get(sku) || null) : null;
-    const resolved = maps ? resolveManageNumber(maps.itemNumbers, rakutenCode || sku) : null;
+    // 画面・CSV に出す「楽天SKUコード」は人が楽天の管理画面で検索する手がかり。
+    // 連番の AL だけ見せても引けないので、分かっているコード (W/AM/AL) を全部並べる
+    const codes = maps ? codesOf(maps.rakutenByNe, sku) : [];
+    const rakutenCode = codes.length > 0 ? codes.join(' / ') : null;
+    const resolved = maps ? resolveManageNumber(maps.itemNumbers, [...codes, sku]) : null;
     rows.push({ ...a, cache: c, rakutenCode, manageNumber: c?.manage_number || resolved || null, resolved });
   }
 
