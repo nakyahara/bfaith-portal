@@ -331,6 +331,8 @@ function tableExists(db, name) {
  * 商品ごとの補助情報。
  *  info: f_inbound_info (入数 / BCシール / 直接ピックロケ保管 / BF保管荷姿 / いろは在庫化作業有無 / memo)
  *  locs: mirror_logizard_stock を商品×ロケで集約。P3F (ピックロケ) を在庫数の多い順に最大3件、
+ *        引けない商品は loc_source='none' = 「ピックロケの登録なし」。フリーロケ運用なので
+ *        空いている保管ロケに入れてよい状態であり、異常ではない (中原さん 2026-09-01)。
  *        P3F が無ければ他ブロックの先頭1件を「保管」として返す。JOIN で明細を増やさず商品単位で集約
  */
 export function productInfoMap(codeKeys) {

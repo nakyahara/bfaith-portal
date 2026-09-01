@@ -57,7 +57,7 @@
     .tag { border-radius: 6px; padding: 3px 8px; background: #f1f3f5; color: #343a40; white-space: nowrap; }
     .tag.loc { background: #e7f5ff; color: #1864ab; font-weight: 700; }
     .tag.loc-store { background: #f3f0ff; color: #5f3dc4; }
-    .tag.loc-none { background: #fff4e6; color: #d9480f; }
+    .tag.loc-none { background: #f1f3f5; color: #495057; }
     .tag.iroha { background: #fff3bf; color: #7a5c00; font-weight: 700; }
     .tag.direct { background: #d3f9d8; color: #2b8a3e; }
     .tag.seal { background: #ffe8cc; color: #d9480f; }
@@ -99,7 +99,7 @@
     </div>
   </div>
   <div class="banner" id="banner"></div>
-  <div class="legend">凡例: 📍=ピックロケ (現在庫のロケ・配置指示ではありません) / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り</div>
+  <div class="legend">凡例: 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り</div>
   <div class="wrap" id="list"></div>
   <div class="foot"><a href="/apps/inbound-check/admin">管理画面 (取込・端末)</a> ・ <a href="/">ポータル</a></div>
 
@@ -202,8 +202,8 @@
     function tagsHtml(l) {
       const t = [];
       if (l.loc_source === 'pick') t.push('<span class="tag loc">📍 ' + esc(l.pick_locs.map(x => x.loc).join(' / ')) + '</span>');
-      else if (l.loc_source === 'storage') t.push('<span class="tag loc-store">保管 ' + esc(l.other_locs[0].loc) + ' (ピックロケなし)</span>');
-      else t.push('<span class="tag loc-none">ロケ未取得</span>');
+      else if (l.loc_source === 'storage') t.push('<span class="tag loc-store">保管 ' + esc(l.other_locs[0].loc) + '</span>');
+      else t.push('<span class="tag loc-none">空きロケへ</span>');
       const i = l.info;
       if (!i) t.push('<span class="tag warn">入庫情報 未登録</span>');
       else {
