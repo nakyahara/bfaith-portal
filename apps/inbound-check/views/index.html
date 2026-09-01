@@ -12,7 +12,7 @@
   <link rel="apple-touch-icon" sizes="180x180" href="/app-icons/inbound-check-180.png">
   <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-    html, body { margin: 0; background: #f1f3f5; color: #212529; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+    html, body { margin: 0; background: #eceef1; color: #212529; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
     body { padding-bottom: 40px; }
     .top { position: sticky; top: 0; z-index: 20; background: #fff; border-bottom: 1px solid #dee2e6; padding: 8px 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
     .top-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -31,11 +31,11 @@
     .banner { display: none; margin: 8px 12px 0; padding: 10px 12px; border-radius: 8px; font-size: 0.92em; }
     .banner.warn { display: block; background: #fff3bf; color: #7a5c00; }
     .banner.err { display: block; background: #ffe3e3; color: #a61e1e; }
-    .banner button { margin-left: 10px; }
+    .banner.ok { display: block; background: #d3f9d8; color: #2b8a3e; }
     .wrap { padding: 10px 12px; }
     .empty { text-align: center; color: #868e96; padding: 60px 10px; font-size: 1.05em; line-height: 1.8; }
     .slip { background: #fff; border-radius: 12px; margin-bottom: 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); overflow: hidden; }
-    .slip-h { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; }
+    .slip-h { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; background: #f8f9fa; }
     .slip-h .ar { font-weight: 700; font-size: 1.05em; }
     .slip-h .dates { color: #495057; font-size: 0.85em; }
     .slip-h .cnt { margin-left: auto; font-weight: 700; color: #1864ab; white-space: nowrap; }
@@ -44,27 +44,63 @@
     .bar > i { display: block; height: 100%; background: #40c057; width: 0; transition: width .2s; }
     .slip.collapsed .lines { display: none; }
     .slip-h .chev { color: #adb5bd; font-size: 0.9em; }
-    .line { display: flex; gap: 12px; padding: 10px 14px; border-top: 1px solid #f1f3f5; align-items: flex-start; cursor: pointer; user-select: none; }
-    .line.checked { background: #ebfbee; }
-    .line .box { flex: 0 0 44px; height: 44px; border: 2px solid #adb5bd; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1.5em; color: #fff; background: #fff; margin-top: 2px; }
-    .line.checked .box { background: #40c057; border-color: #40c057; }
-    .line .body { flex: 1; min-width: 0; }
-    .line .name { font-size: 1.0em; line-height: 1.35; word-break: break-all; }
-    .line .code { font-size: 0.82em; color: #868e96; margin-right: 8px; }
-    .line .qty { font-size: 1.25em; font-weight: 700; color: #1864ab; margin-top: 4px; }
-    .line .qty small { font-size: 0.7em; font-weight: 400; color: #495057; margin-left: 6px; }
+
+    /* ── 明細行 ── 1行おきに背景色を変えて、どこまで読んだか見失わないようにする */
+    .row { border-top: 1px solid #e9ecef; }
+    .row:nth-child(even) > .line { background: #f6f8fa; }
+    .line { display: flex; gap: 12px; padding: 12px 14px; align-items: center; }
+    .row.checked > .line { background: #e6fcf0; }
+    .row.checked:nth-child(even) > .line { background: #dcf7e7; }
+    .line .thumb { flex: 0 0 60px; width: 60px; height: 60px; border-radius: 8px; background: #f1f3f5; border: 1px solid #e9ecef; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+    .line .thumb img { width: 100%; height: 100%; object-fit: contain; }
+    .line .thumb .ph { color: #ced4da; font-size: 1.5em; }
+    .line .body { flex: 1; min-width: 0; cursor: pointer; }
+    .line .name { font-size: 1.05em; line-height: 1.35; word-break: break-all; font-weight: 600; }
+    .line .sub { font-size: 0.85em; color: #868e96; margin-top: 3px; }
+    .line .sub b { color: #1864ab; font-size: 1.15em; }
     .line .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; font-size: 0.82em; }
-    .tag { border-radius: 6px; padding: 3px 8px; background: #f1f3f5; color: #343a40; white-space: nowrap; }
+    .tag { border-radius: 6px; padding: 3px 8px; background: #eceef1; color: #343a40; white-space: nowrap; }
     .tag.loc { background: #e7f5ff; color: #1864ab; font-weight: 700; }
     .tag.loc-store { background: #f3f0ff; color: #5f3dc4; }
-    .tag.loc-none { background: #f1f3f5; color: #495057; }
+    .tag.loc-none { background: #eceef1; color: #495057; }
     .tag.iroha { background: #fff3bf; color: #7a5c00; font-weight: 700; }
     .tag.direct { background: #d3f9d8; color: #2b8a3e; }
     .tag.seal { background: #ffe8cc; color: #d9480f; }
     .tag.warn { background: #ffe3e3; color: #a61e1e; }
-    .line .who { font-size: 0.8em; color: #2b8a3e; margin-top: 4px; }
+    .line .who { font-size: 0.82em; color: #2b8a3e; margin-top: 4px; font-weight: 600; }
     .line .prev { font-size: 0.78em; color: #adb5bd; margin-top: 3px; }
-    .line.pending { opacity: 0.6; }
+    .line .act { flex: 0 0 auto; display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
+    /* 消し込みは必ずこのボタンから。行のどこを触っても消えてしまう作りは誤操作のもと (2026-09-01 現場) */
+    .btn-check { min-width: 104px; min-height: 56px; border: 0; border-radius: 10px; background: #37b24d; color: #fff; font-size: 1.05em; font-weight: 700; cursor: pointer; padding: 0 16px; }
+    .btn-check:active { background: #2f9e44; }
+    .btn-undo { min-width: 104px; min-height: 44px; border: 1px solid #ced4da; border-radius: 10px; background: #fff; color: #495057; font-size: 0.95em; cursor: pointer; padding: 0 12px; }
+    .btn-more { min-width: 104px; min-height: 34px; border: 1px solid #dee2e6; border-radius: 8px; background: #fff; color: #868e96; font-size: 0.85em; cursor: pointer; }
+    .row.pending > .line { opacity: 0.55; }
+
+    /* ── 詳細 (アコーディオン) ── */
+    .detail { display: none; padding: 4px 14px 16px; background: #fbfcfd; border-top: 1px dashed #dee2e6; }
+    .row.open > .detail { display: block; }
+    .detail .dgrid { display: flex; gap: 16px; flex-wrap: wrap; }
+    .detail .big { flex: 0 0 180px; }
+    .detail .big img { width: 180px; height: 180px; object-fit: contain; background: #fff; border: 1px solid #e9ecef; border-radius: 10px; }
+    .detail .big .ph { width: 180px; height: 180px; display: flex; align-items: center; justify-content: center; background: #fff; border: 1px dashed #dee2e6; border-radius: 10px; color: #ced4da; font-size: 0.85em; text-align: center; line-height: 1.6; }
+    .detail .fields { flex: 1; min-width: 260px; }
+    .fld { margin-bottom: 12px; }
+    .fld label { display: block; font-size: 0.85em; color: #495057; margin-bottom: 4px; font-weight: 600; }
+    .fld input, .fld select, .fld textarea { width: 100%; padding: 10px 12px; font-size: 1.05em; border: 1px solid #ced4da; border-radius: 8px; background: #fff; font-family: inherit; }
+    .fld input[type=number] { max-width: 160px; }
+    .fld textarea { min-height: 60px; resize: vertical; }
+    .fld input:disabled, .fld select:disabled { background: #f1f3f5; color: #adb5bd; }
+    .fld .note { font-size: 0.8em; color: #868e96; margin-top: 4px; }
+    .detail .dact { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+    .detail .dact button { min-height: 48px; padding: 0 22px; border-radius: 10px; font-size: 1.0em; cursor: pointer; border: 1px solid #ced4da; background: #fff; }
+    .detail .dact button.primary { background: #1c7ed6; border-color: #1c7ed6; color: #fff; font-weight: 700; }
+    .detail .dact button:disabled { opacity: 0.5; cursor: default; }
+    .detail .dmsg { font-size: 0.9em; }
+    .detail .dmsg.err { color: #c92a2a; }
+    .detail .dmsg.ok { color: #2b8a3e; }
+    .detail .unreg { background: #fff3bf; color: #7a5c00; padding: 12px 14px; border-radius: 8px; font-size: 0.92em; line-height: 1.6; }
+
     .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 50; align-items: center; justify-content: center; }
     .overlay.on { display: flex; }
     .modal { background: #fff; border-radius: 14px; padding: 18px; width: min(92vw, 480px); }
@@ -73,12 +109,18 @@
     .modal .opts button { font-size: 1.1em; padding: 14px 20px; border-radius: 10px; border: 1px solid #ced4da; background: #fff; cursor: pointer; }
     .modal .hint { color: #868e96; font-size: 0.85em; margin-top: 10px; }
     .modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
-    .modal .actions button { padding: 10px 18px; border-radius: 8px; border: 1px solid #ced4da; background: #fff; font-size: 1em; cursor: pointer; }
+    .modal .actions button { padding: 12px 20px; border-radius: 8px; border: 1px solid #ced4da; background: #fff; font-size: 1em; cursor: pointer; }
     .modal .actions button.danger { background: #e03131; border-color: #e03131; color: #fff; }
     .legend { font-size: 0.78em; color: #868e96; padding: 6px 12px 0; line-height: 1.6; }
     .foot { text-align: center; font-size: 0.8em; color: #adb5bd; padding: 20px; }
     .foot a { color: #868e96; }
-    @media (max-width: 600px) { .line .box { flex-basis: 40px; height: 40px; } .meta { display: none; } }
+    @media (max-width: 600px) {
+      .meta { display: none; }
+      .line { gap: 10px; padding: 10px; }
+      .line .thumb { flex-basis: 48px; width: 48px; height: 48px; }
+      .btn-check, .btn-undo, .btn-more { min-width: 84px; }
+      .detail .big, .detail .big img, .detail .big .ph { flex-basis: 120px; width: 120px; height: 120px; }
+    }
   </style>
 </head>
 <body>
@@ -99,9 +141,14 @@
     </div>
   </div>
   <div class="banner" id="banner"></div>
-  <div class="legend">凡例: 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り</div>
+  <div class="legend">凡例: 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り<br>商品名をタップすると詳細が開き、入数やいろはの設定をその場で直せます</div>
   <div class="wrap" id="list"></div>
   <div class="foot"><a href="/apps/inbound-check/admin">管理画面 (取込・端末)</a> ・ <a href="/">ポータル</a></div>
+
+  <datalist id="dl-bc"><option value="BCシール貼付必要"><option value="不要"></datalist>
+  <datalist id="dl-pick"><option value="直接ピックロケ"></datalist>
+  <datalist id="dl-form"><option value="そのまま"><option value="バラ"><option value="内箱で保管"><option value="20L折りコン入替"><option value="120サイズ入替"></datalist>
+  <datalist id="dl-iroha"><option value="有り"><option value="無し"><option value="状況による"></datalist>
 
   <div class="overlay" id="workerPick">
     <div class="modal">
@@ -116,6 +163,7 @@
     <div class="modal">
       <h2>確認を取り消しますか?</h2>
       <div id="uncheckTarget" style="font-size:0.95em; line-height:1.5"></div>
+      <div class="hint">押し間違えたときはここで戻せます。取り消すと「未確認」に戻ります</div>
       <div class="actions">
         <button type="button" id="uncheckCancel">やめる</button>
         <button type="button" class="danger" id="uncheckOk">取り消す</button>
@@ -132,10 +180,17 @@
     let lastJson = '';
     const collapsed = new Set();
     const pending = new Set();
+    const openLines = new Set();   // 詳細を開いている明細 (再描画をまたいで保つ)
     let pollTimer = null;
+    // 入力中は再描画しない。5秒ポーリングの再描画で打ちかけの入数が消えるのを防ぐ
+    let editDirty = false;
+    let renderQueued = false;
 
     const $ = s => document.querySelector(s);
     const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const IROHA_YES = '有り';
+    const IROHA_NA = '－';
+    const irohaLocked = v => String(v == null ? '' : v).trim() === IROHA_YES;
 
     function workerCode() { try { return localStorage.getItem(LS_CODE) || ''; } catch { return ''; } }
     function workerName() { try { return localStorage.getItem(LS_NAME) || ''; } catch { return ''; } }
@@ -156,8 +211,7 @@
       if (!iso) return '';
       const d = new Date(iso);
       if (Number.isNaN(d.getTime())) return iso;
-      const p = new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(d);
-      return p;
+      return new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(d);
     }
     function fmtDate(s) { return s ? s.slice(5).replace('-', '/') : '-'; }
 
@@ -187,16 +241,11 @@
       }
     }
 
-    function qtyHtml(l) {
+    // ケース換算は出さない (現場では使わない — 2026-09-01 中原さん)。入数はそのまま数字で見せる
+    function qtySub(l) {
       const irisu = l.info && Number.isInteger(l.info.irisu) && l.info.irisu > 0 ? l.info.irisu : null;
-      let s = '予定 ' + l.planned_qty + ' 個';
-      if (irisu) {
-        const q = Math.floor(l.planned_qty / irisu), rem = l.planned_qty % irisu;
-        s += '<small>入数 ' + irisu + ' 個 → ' + q + ' ケース' + (rem ? ' + ' + rem + ' 個' : '') + '</small>';
-      } else {
-        s += '<small>入数 未登録</small>';
-      }
-      return s;
+      return esc(l.product_id) + ' ・ 予定 <b>' + l.planned_qty + '</b> 個'
+        + (irisu ? ' ・ 入数 ' + irisu : ' ・ <span style="color:#e8590c">入数 未登録</span>');
     }
 
     function tagsHtml(l) {
@@ -208,10 +257,10 @@
       if (!i) t.push('<span class="tag warn">入庫情報 未登録</span>');
       else {
         if (i.iroha && /有/.test(i.iroha)) t.push('<span class="tag iroha">🏠 いろは: ' + esc(i.iroha) + '</span>');
-        else if (i.iroha && i.iroha !== '－' && i.iroha !== '-') t.push('<span class="tag">いろは: ' + esc(i.iroha) + '</span>');
+        else if (i.iroha && i.iroha !== IROHA_NA && i.iroha !== '-') t.push('<span class="tag">いろは: ' + esc(i.iroha) + '</span>');
         if (i.direct_pick && /有/.test(i.direct_pick)) t.push('<span class="tag direct">直ピック</span>');
         if (i.bc_seal && /(要|有|必要|あり)/.test(i.bc_seal)) t.push('<span class="tag seal">シール: ' + esc(i.bc_seal) + '</span>');
-        if (i.storage_form && i.storage_form !== '－' && i.storage_form !== '-') t.push('<span class="tag">荷姿: ' + esc(i.storage_form) + '</span>');
+        if (i.storage_form && i.storage_form !== IROHA_NA && i.storage_form !== '-') t.push('<span class="tag">荷姿: ' + esc(i.storage_form) + '</span>');
         if (i.memo) t.push('<span class="tag">📝 ' + esc(i.memo) + '</span>');
       }
       return t.join('');
@@ -224,7 +273,55 @@
       return (l.product_name || '').toLowerCase().includes(q) || (l.product_id || '').toLowerCase().includes(q) || (l.barcode || '').includes(q);
     }
 
-    function render() {
+    // 詳細パネルの打ちかけの値を控える / 描き直したあとに戻す。
+    // 5秒ポーリングや他の行の消し込みで再描画が走っても、入力中の入数が消えないようにする
+    function captureDraft() {
+      const row = document.querySelector('.row.open');
+      if (!row || !editDirty) return null;
+      const values = {};
+      for (const el of row.querySelectorAll('[data-f]')) values[el.getAttribute('data-f')] = el.value;
+      const a = document.activeElement;
+      const focus = a && row.contains(a) && a.getAttribute ? a.getAttribute('data-f') : null;
+      return { key: row.getAttribute('data-key'), values, focus };
+    }
+    function restoreDraft(d) {
+      if (!d) return;
+      const row = [...document.querySelectorAll('.row')].find(r => r.getAttribute('data-key') === d.key);
+      if (!row) return;
+      for (const el of row.querySelectorAll('[data-f]')) {
+        const v = d.values[el.getAttribute('data-f')];
+        if (v !== undefined) el.value = v;
+      }
+      applyIrohaLock(row);
+      if (d.focus) {
+        const el = row.querySelector('[data-f="' + d.focus + '"]');
+        if (el) { try { el.focus(); } catch { /* iOS で失敗しても値は戻っている */ } }
+      }
+    }
+    // いろは=有り の行は、いろは側で在庫化するので下の3項目を触らせない (実際に「－」を書くのはサーバー)
+    function applyIrohaLock(row) {
+      const src = row.querySelector('[data-f="いろは在庫化作業有無"]');
+      if (!src) return;
+      const lock = irohaLocked(src.value);
+      for (const name of ['入庫時BCシール貼りフラグ', '直接ピックロケ保管', 'BF保管荷姿']) {
+        const el = row.querySelector('[data-f="' + name + '"]');
+        if (el) { el.disabled = lock; if (lock) el.value = IROHA_NA; }
+      }
+    }
+
+    // force = 自分の操作による描き直し。編集中でも描くが、打ちかけの入力は持ち越す。
+    // force なし = ポーリング由来。編集中は見送って、編集が終わってから描く (画面が飛ばない)
+    function render(force) {
+      if (editDirty && !force) {
+        // 入力中に他の端末の更新で画面が飛ぶのを避けて見送る。ただし「止まっている」ことは伝える
+        // (何も出さないと、消し込みが反映されない画面をじっと見ることになる)
+        renderQueued = true;
+        banner('warn', '入力中のため一覧の更新を止めています (保存するか「元に戻す」を押すと再開します)');
+        return;
+      }
+      if (renderQueued) banner(null);
+      const draft = force ? captureDraft() : null;
+      renderQueued = false;
       renderWorker();
       const b = state.batch;
       const t = state.totals;
@@ -263,18 +360,73 @@
         parts.push('<div class="empty">' + (query ? '検索に一致する明細はありません' : '🎉 未確認の明細はありません (全部確認済み)') + '</div>');
       }
       $('#list').innerHTML = parts.join('');
+      restoreDraft(draft);
+    }
+
+    function thumbHtml(l, big) {
+      if (l.image_url) {
+        // 画像が消えていても行が崩れないよう、読めなければ枠ごと隠す
+        return '<img src="' + esc(l.image_url) + '" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display=&#39;none&#39;">';
+      }
+      return big ? '<div class="ph">画像なし<br><small>(楽天に商品ページが<br>あれば翌朝入ります)</small></div>' : '<span class="ph">📦</span>';
     }
 
     function lineHtml(l) {
       const checked = l.check_status === 'checked';
-      return '<div class="line' + (checked ? ' checked' : '') + (pending.has(l.line_key) ? ' pending' : '') + '" data-key="' + esc(l.line_key) + '" data-version="' + l.version + '">'
-        + '<div class="box">' + (checked ? '✓' : '') + '</div>'
-        + '<div class="body">'
-        + '<div class="name"><span class="code">' + esc(l.product_id) + '</span>' + esc(l.product_name) + '</div>'
-        + '<div class="qty">' + qtyHtml(l) + '</div>'
+      const open = openLines.has(l.line_key);
+      const act = checked
+        ? '<button type="button" class="btn-undo" data-act="undo">↩︎ 取り消す</button>'
+        : '<button type="button" class="btn-check" data-act="check">確認</button>';
+      return '<div class="row' + (checked ? ' checked' : '') + (open ? ' open' : '') + (pending.has(l.line_key) ? ' pending' : '') + '" data-key="' + esc(l.line_key) + '" data-version="' + l.version + '">'
+        + '<div class="line">'
+        + '<div class="thumb">' + thumbHtml(l, false) + '</div>'
+        + '<div class="body" data-act="detail">'
+        + '<div class="name">' + esc(l.product_name) + '</div>'
+        + '<div class="sub">' + qtySub(l) + '</div>'
         + '<div class="tags">' + tagsHtml(l) + '</div>'
         + (checked ? '<div class="who">✅ ' + esc(l.checked_by || '') + ' ' + esc(fmtJst(l.checked_at)) + '</div>' : '')
         + (!checked && l.prev_checked ? '<div class="prev">前回 ' + esc(fmtJst(l.prev_checked.at)) + ' に ' + esc(l.prev_checked.by || '') + ' が確認済み (今日は未確認)</div>' : '')
+        + '</div>'
+        + '<div class="act">' + act
+        + '<button type="button" class="btn-more" data-act="detail">' + (open ? '▲ 閉じる' : '▼ 詳細・修正') + '</button>'
+        + '</div></div>'
+        + '<div class="detail">' + (open ? detailHtml(l) : '') + '</div>'
+        + '</div>';
+    }
+
+    // 詳細パネル: 入庫情報 (入数・いろは・BCシール・直ピック・荷姿・memo) をその場で直す。
+    // 書き込み先は /apps/inbound-info と同じ f_inbound_info なので、値札印刷にもそのまま効く
+    function detailHtml(l) {
+      const i = l.info;
+      const img = '<div class="big">' + thumbHtml(l, true) + '</div>';
+      if (!i) {
+        return '<div class="dgrid">' + img + '<div class="fields">'
+          + '<div class="unreg">この商品は入庫情報に登録されていません。<br>登録すると、入数やいろはの設定をここで入力できます。</div>'
+          + '<div class="dact" style="margin-top:12px"><button type="button" class="primary" data-act="register">入庫情報に登録する</button>'
+          + '<span class="dmsg" data-msg></span></div>'
+          + '</div></div>';
+      }
+      const locked = irohaLocked(i.iroha);
+      const dis = locked ? ' disabled' : '';
+      const v = s => esc(s == null ? '' : s);
+      return '<div class="dgrid">' + img + '<div class="fields">'
+        + '<div class="fld"><label>入数 (1箱あたりの個数)</label>'
+        + '<input type="number" inputmode="numeric" min="1" step="1" data-f="入数" value="' + (Number.isInteger(i.irisu) ? i.irisu : '') + '" placeholder="未登録">'
+        + '<div class="note">予定 ' + l.planned_qty + ' 個。空欄にすると「未登録」に戻ります</div></div>'
+        + '<div class="fld"><label>いろは在庫化作業有無</label>'
+        + '<input type="text" list="dl-iroha" data-f="いろは在庫化作業有無" value="' + v(i.iroha) + '" placeholder="無し">'
+        + '<div class="note">「有り」にすると、いろはで在庫化するため下の3項目は自動で「' + IROHA_NA + '」になります</div></div>'
+        + '<div class="fld"><label>入庫時BCシール貼りフラグ</label>'
+        + '<input type="text" list="dl-bc" data-f="入庫時BCシール貼りフラグ" value="' + v(i.bc_seal) + '"' + dis + '></div>'
+        + '<div class="fld"><label>直接ピックロケ保管</label>'
+        + '<input type="text" list="dl-pick" data-f="直接ピックロケ保管" value="' + v(i.direct_pick) + '"' + dis + '></div>'
+        + '<div class="fld"><label>BF保管荷姿</label>'
+        + '<input type="text" list="dl-form" data-f="BF保管荷姿" value="' + v(i.storage_form) + '"' + dis + '></div>'
+        + '<div class="fld"><label>メモ</label>'
+        + '<textarea data-f="memo" placeholder="現場への申し送りなど">' + v(i.memo) + '</textarea></div>'
+        + '<div class="dact"><button type="button" class="primary" data-act="save">保存</button>'
+        + '<button type="button" data-act="reset">元に戻す</button>'
+        + '<span class="dmsg" data-msg></span></div>'
         + '</div></div>';
     }
 
@@ -295,7 +447,7 @@
       const rollback = () => Object.assign(line, snapshot);
       line.check_status = action === 'check' ? 'checked' : 'unchecked';
       if (action === 'check') { line.checked_by = workerName() || (state.me.session || ''); line.checked_at = new Date().toISOString(); }
-      recount(); render();
+      recount(); render(true);
       let needReload = false;
       try {
         const r = await fetch(API + '/lines/' + action, {
@@ -316,11 +468,11 @@
         }
       } catch (e) {
         rollback();
-        banner('err', '送信できませんでした (' + esc(e.message) + ')。通信が戻ったらもう一度タップしてください');
+        banner('err', '送信できませんでした (' + esc(e.message) + ')。通信が戻ったらもう一度押してください');
         needReload = true;
       } finally {
         pending.delete(line.line_key);
-        recount(); render();
+        recount(); render(true);
         if (needReload) { lastJson = ''; await load(); }
       }
     }
@@ -333,26 +485,136 @@
       state.totals = { lines: state.lines.length, checked };
     }
 
+    // ─── 入庫情報の保存 ───
+    // 同じ商品は複数の伝票に出るので、保存したら同じ code_key の行を全部差し替える
+    function applyInfoRow(codeKey, row) {
+      const info = row ? {
+        code: row.商品コード, irisu: row.入数, bc_seal: row.入庫時BCシール貼りフラグ,
+        direct_pick: row.直接ピックロケ保管, storage_form: row.BF保管荷姿,
+        iroha: row.いろは在庫化作業有無, memo: row.memo, version: row.version,
+      } : null;
+      for (const l of state.lines) if (l.code_key === codeKey) l.info = info;
+      lastJson = '';   // 次のポーリングで必ず描き直す
+    }
+
+    function detailMsg(rowEl, kind, text) {
+      const m = rowEl.querySelector('[data-msg]');
+      if (!m) return;
+      m.className = 'dmsg' + (kind ? ' ' + kind : '');
+      m.textContent = text || '';
+    }
+
+    async function saveInfo(rowEl, line) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      const i = line.info;
+      if (!i) return;
+      const fields = {};
+      for (const el of rowEl.querySelectorAll('[data-f]')) {
+        const name = el.getAttribute('data-f');
+        if (el.disabled) continue;   // いろは=有り で固定される項目はサーバー側が決める
+        fields[name] = el.value;
+      }
+      const btn = rowEl.querySelector('[data-act="save"]');
+      if (btn) btn.disabled = true;
+      detailMsg(rowEl, '', '保存中…');
+      try {
+        const r = await fetch(API + '/info', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code_key: line.code_key, fields, expect_version: i.version, worker_code: workerCode() || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.status === 401) { location.href = '/login'; return; }
+        if (!j.ok) {
+          detailMsg(rowEl, 'err', j.message || j.error || '保存できませんでした');
+          if (j.error === 'worker_required') openWorkerPick();
+          if (j.error === 'conflict') { editDirty = false; lastJson = ''; await load(); }
+          return;
+        }
+        applyInfoRow(line.code_key, j.row);
+        editDirty = false;
+        render();
+        banner('ok', '「' + esc(line.product_name) + '」の入庫情報を保存しました');
+        setTimeout(() => { if ($('#banner').classList.contains('ok')) banner(null); }, 4000);
+      } catch (e) {
+        detailMsg(rowEl, 'err', '送信できませんでした (' + e.message + ')');
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    async function registerInfo(rowEl, line) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      const btn = rowEl.querySelector('[data-act="register"]');
+      if (btn) btn.disabled = true;
+      detailMsg(rowEl, '', '登録中…');
+      try {
+        const r = await fetch(API + '/info/register', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: line.product_id, worker_code: workerCode() || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.status === 401) { location.href = '/login'; return; }
+        if (!j.ok) { detailMsg(rowEl, 'err', j.message || '登録できませんでした'); if (j.error === 'worker_required') openWorkerPick(); return; }
+        applyInfoRow(line.code_key, j.row);
+        editDirty = false;
+        render();
+      } catch (e) {
+        detailMsg(rowEl, 'err', '送信できませんでした (' + e.message + ')');
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    // ─── 操作 ───
     let uncheckLine = null;
+    function findLine(el) {
+      const row = el.closest('.row');
+      if (!row) return null;
+      const line = state.lines.find(l => l.line_key === row.getAttribute('data-key'));
+      return line ? { row, line } : null;
+    }
+
     $('#list').addEventListener('click', (ev) => {
       const h = ev.target.closest('[data-toggle]');
       if (h) {
         const ar = h.getAttribute('data-toggle');
         if (collapsed.has(ar)) collapsed.delete(ar); else collapsed.add(ar);
-        render(); return;
+        render(true); return;
       }
-      const el = ev.target.closest('.line');
-      if (!el) return;
-      const line = state.lines.find(l => l.line_key === el.getAttribute('data-key'));
-      if (!line) return;
-      if (line.check_status === 'checked') {
+      const a = ev.target.closest('[data-act]');
+      if (!a) return;
+      const found = findLine(a);
+      if (!found) return;
+      const { row, line } = found;
+      const act = a.getAttribute('data-act');
+      if (act === 'check') { send('check', line); return; }
+      if (act === 'undo') {
+        // 押し間違いを戻す導線。うっかり二度押しを防ぐため確認を1枚はさむ
         uncheckLine = line;
         $('#uncheckTarget').innerHTML = '<b>' + esc(line.product_name) + '</b><br>' + esc(line.checked_by || '') + ' が ' + esc(fmtJst(line.checked_at)) + ' に確認';
         $('#confirmUncheck').classList.add('on');
-      } else {
-        send('check', line);
+        return;
       }
+      if (act === 'detail') {
+        if (openLines.has(line.line_key)) { openLines.delete(line.line_key); editDirty = false; }
+        else openLines.add(line.line_key);
+        render(true);
+        return;
+      }
+      if (act === 'save') { saveInfo(row, line); return; }
+      if (act === 'register') { registerInfo(row, line); return; }
+      if (act === 'reset') { editDirty = false; render(); return; }
     });
+
+    // 入力が始まったら再描画を止める (ポーリングで打ちかけの値が消えないように)
+    $('#list').addEventListener('input', (ev) => {
+      const f = ev.target.closest('[data-f]');
+      if (!f) return;
+      editDirty = true;
+      // 「有り」にした瞬間に3項目を閉じる (保存を待たずに見た目を合わせる。書くのはサーバー)
+      if (f.getAttribute('data-f') === 'いろは在庫化作業有無') applyIrohaLock(f.closest('.row'));
+    });
+
     $('#uncheckCancel').addEventListener('click', () => { $('#confirmUncheck').classList.remove('on'); uncheckLine = null; });
     $('#uncheckOk').addEventListener('click', () => { const l = uncheckLine; $('#confirmUncheck').classList.remove('on'); uncheckLine = null; if (l) send('uncheck', l); });
 
@@ -377,9 +639,10 @@
     document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
       filter = b.getAttribute('data-filter');
       document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('on', x === b));
+      editDirty = false;
       render();
     }));
-    $('#q').addEventListener('input', () => { query = $('#q').value.trim(); render(); });
+    $('#q').addEventListener('input', () => { query = $('#q').value.trim(); editDirty = false; render(); });
 
     function startPolling() {
       if (pollTimer) clearInterval(pollTimer);

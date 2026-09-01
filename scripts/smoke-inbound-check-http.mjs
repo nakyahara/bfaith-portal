@@ -21,6 +21,23 @@ const csvPath = process.argv[2];
 let pass = 0, fail = 0;
 const ok = (c, l) => { if (c) { pass++; console.log(`  ✓ ${l}`); } else { fail++; console.log(`  ✗ ${l}`); } };
 
+// ─── 起動前の種まき ───
+// /api/info の編集を実経路で確かめるには、CSV の商品が入庫情報に載っている必要がある。
+// サーバーを起動する前に入れて接続を閉じる (起動後に別プロセスから書くと SQLITE_BUSY を招く)
+if (csvPath && fs.existsSync(csvPath)) {
+  process.env.DATA_DIR = DATA_DIR;
+  const { initMirrorDB, getMirrorDB } = await import('../apps/warehouse-mirror/db.js');
+  initMirrorDB();
+  const m = getMirrorDB();
+  const now = new Date().toISOString();
+  m.prepare(`INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ, 直接ピックロケ保管, BF保管荷姿, いろは在庫化作業有無, source, created_at, updated_at)
+    VALUES ('asahilabo15g', 'asahilabo15g', 'アサヒ商品', 10, '不要', '', 'そのまま', '無し', 'manual', ?, ?)`).run(now, now);
+  // 2行目の商品は入庫情報に無い状態にしておく (未登録 → 登録の導線を確かめるため)
+  m.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, updated_at)
+    VALUES (900001, 'ohanautsuwa', 'お花の器', '単品', '取扱中', 'unknown', ?)`).run(now);
+  m.close();
+}
+
 const child = spawn(process.execPath, ['server.js'], {
   cwd: ROOT,
   env: { ...process.env, DATA_DIR, PORT: String(PORT), PORTAL_PASS: 'smoke', NODE_ENV: 'development', SESSION_SECRET: 'smoke-secret',
@@ -178,6 +195,50 @@ try {
     }
     r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: '20250901', expect_version: '1' } });
     ok(r.status === 200, "expect_version='1' (文字列の整数) は許容");
+    console.log('\n[B1b] 入庫情報を iPad からその場で直す');
+    {
+      // 入数やいろはは f_inbound_info (= /apps/inbound-info と同じ正本) に書く。値札印刷にもそのまま効く
+      r = await req(J, `${APP}/api/state`);
+      const seeded = r.json.lines.find(l => l.product_id === 'asahilabo15g');
+      ok(seeded && seeded.info && seeded.info.irisu === 10 && seeded.info.version >= 1, `入数と version が state に載る (入数=${seeded?.info?.irisu} version=${seeded?.info?.version})`);
+      const key = seeded.code_key, ver = seeded.info.version;
+      // 作業者なしでは書かせない (誰が直したか残らない更新を作らない)
+      r = await req(J, `${APP}/api/info`, { method: 'POST', body: { code_key: key, fields: { 入数: 24 }, expect_version: ver, worker_code: 'w99' } });
+      ok(r.status === 400 && r.json.error === 'worker_required', '不明な作業者では保存できない');
+      // version 必須 (楽観ロック)
+      r = await req(J, `${APP}/api/info`, { method: 'POST', body: { code_key: key, fields: { 入数: 24 }, worker_code: '20250901' } });
+      ok(r.status === 400 && r.json.error === 'bad_request', 'expect_version 無しは 400');
+      // 編集を許していない列は通さない
+      r = await req(J, `${APP}/api/info`, { method: 'POST', body: { code_key: key, fields: { 商品名: '書き換え' }, expect_version: ver, worker_code: '20250901' } });
+      ok(r.status === 400 && r.json.error === 'bad_request', '商品名など許可外の列だけなら 400 (iPad から書き換えられない)');
+      // 保存
+      r = await req(J, `${APP}/api/info`, { method: 'POST', body: { code_key: key, fields: { 入数: 24, memo: '内箱つぶれ注意' }, expect_version: ver, worker_code: '20250901' } });
+      ok(r.status === 200 && r.json.row.入数 === 24 && r.json.row.memo === '内箱つぶれ注意', '入数とメモを保存');
+      ok(/星 立夏/.test(r.json.row.updated_by || ''), `誰が直したか残る (${r.json.row.updated_by})`);
+      const ver2 = r.json.row.version;
+      ok(ver2 === ver + 1, '保存すると version が上がる');
+      // 古い version では上書きできない
+      r = await req(J, `${APP}/api/info`, { method: 'POST', body: { code_key: key, fields: { 入数: 99 }, expect_version: ver, worker_code: '20250901' } });
+      ok(r.status === 409 && r.json.error === 'conflict', '古い version は 409 (他の人の変更を消さない)');
+      // いろは=有り にすると、いろは側で在庫化する3項目はサーバーが「－」に倒す
+      r = await req(J, `${APP}/api/info`, { method: 'POST', body: { code_key: key, fields: { いろは在庫化作業有無: '有り' }, expect_version: ver2, worker_code: '20250901' } });
+      ok(r.status === 200 && r.json.row.BF保管荷姿 === '－' && r.json.row.入庫時BCシール貼りフラグ === '－', 'いろは=有り で BCシール・荷姿が「－」になる');
+      // 画面に反映される
+      r = await req(J, `${APP}/api/state`);
+      const after = r.json.lines.find(l => l.product_id === 'asahilabo15g');
+      ok(after.info.irisu === 24 && /有り/.test(after.info.iroha), '一覧にも反映される');
+
+      // 入庫情報が無い商品 → 登録の導線
+      const unreg = r.json.lines.find(l => l.info === null);
+      ok(!!unreg, `入庫情報が未登録の明細がある (${unreg?.product_id})`);
+      r = await req(J, `${APP}/api/info/register`, { method: 'POST', body: { code: 'ohanautsuwa', worker_code: '20250901' } });
+      ok(r.status === 200 && r.json.row && r.json.row.code_key === 'ohanautsuwa', '商品マスタにあるコードは登録できる');
+      r = await req(J, `${APP}/api/info/register`, { method: 'POST', body: { code: 'ohanautsuwa', worker_code: '20250901' } });
+      ok(r.status === 409 && r.json.error === 'duplicate', '二重登録は 409');
+      r = await req(J, `${APP}/api/info/register`, { method: 'POST', body: { code: 'nosuchcode-xyz', worker_code: '20250901' } });
+      ok(r.status === 400 && r.json.error === 'not_in_master', '商品マスタに無いコードは登録できない');
+    }
+
     r = await req(J, `${APP}/admin/history.csv?batch_id=${batchId}`);
     ok(r.status === 200 && /text\/csv/.test(r.ctype) && r.text.includes('確認'), '履歴 CSV');
     r = await req(J, `${APP}/admin/history?batch_id=${batchId}`);
@@ -232,6 +293,21 @@ try {
   ok(r.status === 200, '端末Cookieで作業画面');
   r = await req(J, `${APP}/admin/upload`, { method: 'POST', body: {} });
   ok(r.status === 403 && r.json.error === 'session_required', '端末Cookieでは取込不可 (403)');
+  // ⭐iPad の実経路: 端末Cookie だけで入庫情報を直せること (ログインは求めない)。
+  //   作業者は名前タップ = worker_code で渡すので、誰が直したかは端末名と組で残る
+  if (batchId) {
+    r = await req(J, `${APP}/api/state`);
+    const target = r.json.lines.find(l => l.info && l.info.version >= 1);
+    if (target) {
+      r = await req(J, `${APP}/api/info`, { method: 'POST', body: { code_key: target.code_key, fields: { memo: '端末から記入' }, expect_version: target.info.version, worker_code: '20250901' } });
+      ok(r.status === 200 && r.json.row.memo === '端末から記入', '端末Cookieだけで入庫情報を直せる (ログイン不要)');
+      ok(/星 立夏 \(入荷iPad1\)/.test(r.json.row.updated_by || ''), `作業者と端末名が残る (${r.json.row.updated_by})`);
+      r = await req(J, `${APP}/api/info`, { method: 'POST', body: { code_key: target.code_key, fields: { memo: 'x' }, expect_version: r.json.row.version } });
+      ok(r.status === 400 && r.json.error === 'worker_required', '端末でも作業者の指定は必須');
+    } else {
+      ok(false, '入庫情報のある明細が見つからない (テストの前提が崩れている)');
+    }
+  }
   r = await req(J, `${BASE}/apps/staff/api/staff`, { method: 'POST', body: { staff_no: '90003', display_name: 'x' } });
   ok(r.status === 401, '端末Cookieではスタッフ追加不可 (401)');
   r = await req(J, `${APP}/admin/history.csv?batch_id=1`);

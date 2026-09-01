@@ -13,6 +13,7 @@
  */
 import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { getImageMap, queueEnsureImages } from '../picking/images.js';
 import { listTapCandidates, getStaffByNo, tapName } from '../staff/db.js';
 import { parseInboundCsv } from './csv.js';
 
@@ -370,10 +371,17 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     }
     logImport(db, { actor, source, fileName, ok: true, batchId, message: `${parsed.rows.length}行 / ${slipsMap.size}伝票` });
     cleanupOld(db);
-    return { ok: true, batch: getBatch(batchId), rowCount: parsed.rows.length, slipCount: slipsMap.size };
+    return { ok: true, batch: getBatch(batchId), rowCount: parsed.rows.length, slipCount: slipsMap.size, imageSkus: parsed.rows.map(r => r.product_id) };
   });
   try {
-    return tx.immediate();
+    const r = tx.immediate();
+    // 取込直後に、キャッシュに無い商品の画像だけ埋めにいく (ピッキングと同じキュー・fire-and-forget)。
+    // 失敗しても一覧は出る。⚠ここに置くのは手動アップロードと Drive 自動取込の両方が通る唯一の場所だから
+    if (r.ok && r.imageSkus && r.imageSkus.length) {
+      try { queueEnsureImages(r.imageSkus, `入荷受付 ${fileName || source}`); } catch (e2) { console.warn('[inbound-check] 画像解決を飛ばしました:', e2.message); }
+    }
+    if (r.imageSkus) delete r.imageSkus;
+    return r;
   } catch (e) {
     // immediate tx 同士は直列化されるので通常ここには来ないが、UNIQUE(file_hash) 違反は 409 相当に正規化する
     if (/UNIQUE constraint failed: f_inbound_check_batches\.file_hash/.test(e.message)) {
@@ -418,12 +426,13 @@ export function productInfoMap(codeKeys) {
     const part = keys.slice(i, i + chunk);
     const ph = part.map(() => '?').join(',');
     if (tableExists(db, 'f_inbound_info')) {
-      const rows = db.prepare(`SELECT code_key, 入数, 入庫時BCシール貼りフラグ AS bc_seal, 直接ピックロケ保管 AS direct_pick,
-          BF保管荷姿 AS storage_form, いろは在庫化作業有無 AS iroha, memo
+      const rows = db.prepare(`SELECT code_key, 商品コード AS code, 入数, 入庫時BCシール貼りフラグ AS bc_seal, 直接ピックロケ保管 AS direct_pick,
+          BF保管荷姿 AS storage_form, いろは在庫化作業有無 AS iroha, memo, version
         FROM f_inbound_info WHERE code_key IN (${ph})`).all(...part);
       for (const r of rows) {
         const m = map.get(r.code_key);
-        if (m) m.info = { irisu: r.入数, bc_seal: r.bc_seal, direct_pick: r.direct_pick, storage_form: r.storage_form, iroha: r.iroha, memo: r.memo };
+        // version は iPad の編集で expect_version として送り返す (楽観ロック)。これが無いと編集できない
+        if (m) m.info = { code: r.code, irisu: r.入数, bc_seal: r.bc_seal, direct_pick: r.direct_pick, storage_form: r.storage_form, iroha: r.iroha, memo: r.memo, version: r.version };
       }
     }
     if (tableExists(db, 'mirror_logizard_stock')) {
@@ -464,6 +473,27 @@ function previousCheckedMap(db, activeId) {
 }
 
 /**
+ * 商品画像。ピッキング画面が使っている pk_product_images (楽天の白抜き/バリエーション画像の
+ * キャッシュ) をそのまま流用する。**同じ DATA_DIR の picking.db なので Render 内で完結する**。
+ *   - 解決済みでなければ null → 画面はプレースホルダ。取込時に queueEnsureImages で埋めにいく
+ *   - picking 側が未初期化・テーブル無しでも一覧は出す (画像は「あれば嬉しい」もの)
+ */
+export function productImageMap(productIds) {
+  const keys = [...new Set(productIds.map(k => String(k || '').trim()).filter(Boolean))];
+  const map = new Map();
+  if (keys.length === 0) return map;
+  try {
+    for (const [sku, img] of getImageMap(keys)) {
+      const url = img && img.url ? img.url : null;
+      if (url) map.set(String(sku).trim().toLowerCase(), url);
+    }
+  } catch (e) {
+    console.warn('[inbound-check] 画像の取得を飛ばしました:', e.message);
+  }
+  return map;
+}
+
+/**
  * iPad 一覧の状態。active バッチが無ければ { batch:null, slips:[], lines:[] }
  * 各行 = 明細 + 状態 + 補助情報 + 前回確認 (参考)
  */
@@ -476,6 +506,7 @@ export function getState() {
     FROM f_inbound_check_lines l JOIN f_inbound_check_line_state s ON s.batch_id = l.batch_id AND s.line_key = l.line_key
     WHERE l.batch_id = ? ORDER BY l.seq`).all(batch.id);
   const info = productInfoMap(lines.map(l => l.code_key));
+  const images = productImageMap(lines.map(l => l.product_id));
   const prev = previousCheckedMap(db, batch.id);
   const checkedBySlip = new Map();
   for (const l of lines) {
@@ -484,6 +515,7 @@ export function getState() {
     l.pick_locs = x.pick_locs;
     l.other_locs = x.other_locs;
     l.loc_source = x.loc_source;
+    l.image_url = images.get(String(l.product_id || '').trim().toLowerCase()) || null;
     l.prev_checked = prev.get(l.line_key) || null;
     if (l.check_status === 'checked') checkedBySlip.set(l.ar_no, (checkedBySlip.get(l.ar_no) || 0) + 1);
   }
