@@ -75,17 +75,18 @@
   .kb-tabs { display: inline-flex; border: 1px solid #cbd5e1; border-radius: 8px; overflow: hidden; }
   .kb-tab { padding: 5px 14px; font-size: 12px; text-decoration: none; color: #475569; background: #fff; }
   .kb-tab.on { background: #1d4ed8; color: #fff; font-weight: 700; }
-  /* 画像トラックのミニステッパー (依頼→制作→登録→承認)。カードに常時出す = 2重管理をなくす */
-  .kb-imgtracks { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; font-size: 10px; }
-  .kb-krow { display: flex; align-items: center; gap: 4px; color: #64748b; }
-  .kb-krow .kb-kname { flex: 0 0 26px; font-weight: 700; }
-  .kb-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #e2e8f0; }
-  .kb-dot.done { background: #16a34a; }
-  .kb-dot.doing { background: #f59e0b; }
+  /* 画像の作成状況 (2026-09-01 中原さん要望): TOP画像 / 商品詳細画像 が 済 か まだ か。
+     カードに常時出す = ボードを見るだけで「画像がまだの商品」が拾える。
+     TOP は工程を廃止した (2026-08-31) ので、出品ゲートと同じ「枠1 (_top) が登録されているか」で見る */
+  .kb-imgtracks { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+  .kb-krow { display: flex; align-items: center; gap: 5px; color: #64748b; }
+  .kb-krow .kb-kname { flex: 0 0 30px; font-weight: 700; color: #475569; }
+  .kb-state { flex: 0 0 auto; font-weight: 700; border-radius: 4px; padding: 1px 7px; border: 1px solid; }
+  .kb-state.done { background: #dcfce7; color: #166534; border-color: #86efac; }
+  .kb-state.todo { background: #fff7ed; color: #b45309; border-color: #fdba74; }
+  .kb-state.off { background: #f1f5f9; color: #94a3b8; border-color: #e2e8f0; }
   .kb-klabel { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-  .kb-klabel.done { color: #166534; font-weight: 600; }
-  .kb-klabel.excluded { color: #94a3b8; }
-  .kb-kstall { color: #b91c1c; font-weight: 700; }
+  .kb-kstall { flex: 0 0 auto; color: #b91c1c; font-weight: 700; }
 </style>
 
 <%
@@ -169,12 +170,25 @@
   <% } %>
 
   <%
-    // 画像トラック (TOP/詳細) のミニステッパー。どちらのビューでも同じものをカードに出す
-    // 2026-08-31: TOP の工程は廃止したので、カードに出すのは商品詳細 (LP) の 1 行だけ。
-    // 'top' を残すと工程が無いカードに「TOP —」が出続ける (Codex R4 low)
-    const imgTrackRows = (c) => {
-      const t = c.image && c.image.detail;
-      return t ? [{ kind: 'detail', t }] : [];
+    // カードに出す画像の作成状況 (2026-09-01 中原さん要望)。どちらのビューでも同じものを出す。
+    // TOP は工程を廃止した (2026-08-31) ので **枠1 (<商品コード>_top) が登録されているか** で見る。
+    // 出品ゲート imageTrackBlockReason とわざと同じ判定にしている — ボードで「済」なのに
+    // 出品が止まる (逆も) と、現場はどちらを信じればいいか分からなくなる
+    const imgStateRows = (c) => {
+      const t = (c.image && c.image.detail) || null;
+      const detail = !t ? { state: 'off', text: '—' }
+        : t.excluded ? { state: 'off', text: '対象外' }
+          : t.done ? { state: 'done', text: '済' }
+            : { state: 'todo', text: 'まだ', note: t.current ? t.current.label : '', stalledDays: t.stalledDays };
+      const topDone = !!(c.image && c.image.top && c.image.top.registered);
+      return [
+        {
+          name: 'TOP',
+          title: topDone ? 'TOP画像 (枠1) が登録されています' : 'TOP画像 (枠1 = 商品コード_top) がまだ登録されていません',
+          ...(topDone ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' }),
+        },
+        { name: '詳細', title: '商品詳細画像 (LP) の工程', ...detail },
+      ];
     };
   %>
 
@@ -255,26 +269,14 @@
                   <% if (c.stalledDays) { %><span class="kb-stall">⚠️<%= c.stalledDays %>日</span><% } %>
                 <% } %>
               </div>
-              <!-- 画像トラック (TOP/詳細) の進み具合。ボードを行き来しなくてもここで読める -->
+              <!-- TOP画像 / 商品詳細画像 が 済 か まだ か。ボードを行き来しなくてもここで読める -->
               <div class="kb-imgtracks">
-                <% for (const { kind, t } of imgTrackRows(c)) { %>
-                  <div class="kb-krow">
-                    <span class="kb-kname">画像</span>
-                    <% if (t.excluded) { %>
-                      <span class="kb-klabel excluded">対象外</span>
-                    <% } else { %>
-                      <% for (const s of t.steps) { %>
-                        <span class="kb-dot <%= s.state === 'done' || s.state === 'skip' ? 'done' : (s.state === 'doing' ? 'doing' : '') %>"></span>
-                      <% } %>
-                      <% if (t.done) { %>
-                        <span class="kb-klabel done">済</span>
-                      <% } else if (t.current) { %>
-                        <span class="kb-klabel"><%= t.current.label %></span>
-                        <% if (t.stalledDays) { %><span class="kb-kstall">⚠<%= t.stalledDays %>日</span><% } %>
-                      <% } else { %>
-                        <span class="kb-klabel">—</span>
-                      <% } %>
-                    <% } %>
+                <% for (const r of imgStateRows(c)) { %>
+                  <div class="kb-krow" title="<%= r.title %>">
+                    <span class="kb-kname"><%= r.name %></span>
+                    <span class="kb-state <%= r.state %>"><%= r.text %></span>
+                    <% if (r.note) { %><span class="kb-klabel"><%= r.note %></span><% } %>
+                    <% if (r.stalledDays) { %><span class="kb-kstall">⚠<%= r.stalledDays %>日</span><% } %>
                   </div>
                 <% } %>
               </div>
@@ -345,6 +347,17 @@
                 <div class="kb-name"><%= c.name %></div>
                 <div class="kb-code"><%= c.ne_code %></div>
               </div>
+            </div>
+            <%# 完了列にも画像の状況を出す (2026-09-01): 本流を D&D で完了にすると
+                TOP画像が未登録のまま完了列に入りうる。ここで「まだ」が見えれば拾える %>
+            <div class="kb-imgtracks">
+              <% for (const r of imgStateRows(c)) { %>
+                <div class="kb-krow" title="<%= r.title %>">
+                  <span class="kb-kname"><%= r.name %></span>
+                  <span class="kb-state <%= r.state %>"><%= r.text %></span>
+                  <% if (r.note) { %><span class="kb-klabel"><%= r.note %></span><% } %>
+                </div>
+              <% } %>
             </div>
           </a>
           <% if (boardView === 'image') { %>

@@ -453,6 +453,9 @@ export function initProductHubDB() {
       UNIQUE(draft_id, drive_file_id)
     );
     CREATE INDEX IF NOT EXISTS idx_draft_images_draft ON draft_images(draft_id);
+    ${/* ボードは 1 回の表示で最大 800 商品ぶんの相関サブクエリを撃つ (先頭画像 id / 更新日時 /
+         枠1 の有無)。draft_id 単独では ORDER BY sort, id LIMIT 1 を索引だけで解けない (Codex R1 low) */''}
+    CREATE INDEX IF NOT EXISTS idx_draft_images_draft_sort_id ON draft_images(draft_id, sort, id);
 
     CREATE TABLE IF NOT EXISTS draft_specs (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,

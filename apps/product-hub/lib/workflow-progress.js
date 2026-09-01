@@ -1174,7 +1174,11 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       (SELECT canva_url FROM draft_image_production ip WHERE ip.draft_id = d.id) AS canva_url,
       (SELECT CASE WHEN TRIM(COALESCE(product_info_text, '')) = '' THEN 0 ELSE 1 END FROM draft_image_production ip WHERE ip.draft_id = d.id) AS has_product_info,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
-      (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime
+      (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime,
+      ${/* TOP画像が作られたか (2026-09-01 カード表示用)。枠1 = sort=0 = <商品コード>_top が
+            楽天のサムネイルになるので、出品ゲート imageTrackBlockReason と同じ判定にする。
+            画像が 1 行あるだけの判定にすると、_01 だけ取り込まれた商品が「済」に見える */''}
+      (SELECT 1 FROM draft_images i WHERE i.draft_id = d.id AND i.sort = 0 LIMIT 1) AS has_top_image
     FROM product_drafts d
     WHERE d.status NOT IN ('on_hold', 'excluded')
     ${candidateSql}
@@ -1220,10 +1224,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
 
   // カードに常時出す画像側のサマリー (どちらのビューでも同じものを見せる = 2 重管理をなくす)
   const imageSummaryOf = (p, d) => ({
-    top: {
-      steps: p.imageTop.rows.map((r) => ({ state: r.state, label: r.label })),
-      current: p.imageTop.current, done: p.imageTop.done, stalledDays: p.imageTop.stalledDays,
-    },
+    // TOP画像は工程を廃止した (2026-08-31) ので **枠1 が登録されているか** が作成済みの判定。
+    // 工程ベースの p.imageTop は active=0 で常に空 = 常に「未完了」に見えるため使わない
+    top: { registered: d.has_top_image === 1 },
     detail: d.detail_images_excluded === 1
       ? { excluded: true, steps: [], current: null, done: false, stalledDays: null }
       : {
