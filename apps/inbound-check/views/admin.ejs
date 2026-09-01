@@ -125,7 +125,37 @@
 
     <% if (isAdmin) { %>
     <div class="ic-box">
-      <h2>📱 この端末 (iPad) を登録</h2>
+      <h2>📱 iPad を登録する (登録コードを発行)</h2>
+      <p class="hint">
+        <b>パソコンでコードを発行 → iPad で入力</b> するだけで登録できます。
+        <b>iPad にログインさせる必要はありません</b> (共用端末に管理者パスワードを打たせないため)。<br>
+        ① 下のボタンで6桁のコードを出す (<b>10分間</b>有効・1台につき1回) →
+        ② iPad で <code><%= base %>/</code> を開く (未登録なら登録画面が出ます) →
+        ③ コードを入力 → 登録完了。次からはログイン不要で使えます。<br>
+        ⚠ <b>ホーム画面に追加したアイコンから開いて登録してください</b>。Safari で登録しても、
+        ホーム画面のアプリとは保存領域が別なので効きません。
+      </p>
+      <div class="row">
+        <input type="text" id="enrollLabel" placeholder="端末名 (例: 入荷iPad1)" maxlength="40">
+        <button id="enrollBtn" type="button">📱 iPad の登録コードを発行</button>
+        <span id="enrollMsg" class="msg"></span>
+      </div>
+      <div id="enrollCode" style="display:none; margin-top:14px; padding:16px; background:#e7f5ff; border-radius:8px; text-align:center">
+        <div style="font-size:0.85em; color:#495057">iPad にこの6桁を入力してください</div>
+        <div id="enrollCodeValue" style="font-size:2.6em; font-weight:700; letter-spacing:0.25em; font-family:ui-monospace,Menlo,monospace; color:#1864ab; margin:6px 0"></div>
+        <div id="enrollCodeMeta" style="font-size:0.85em; color:#868e96"></div>
+      </div>
+      <% if (enrollCodes && enrollCodes.length) { %>
+        <p class="hint" style="margin-top:12px">発行済みで、まだ使われていないコード:
+          <% for (const c of enrollCodes) { %>
+            <%= c.label %> (<span data-jst="<%= c.expires_at %>"></span> まで)<%= c.attempts ? ` ・入力ミス${c.attempts}回` : '' %>
+          <% } %>
+        </p>
+      <% } %>
+    </div>
+
+    <div class="ic-box">
+      <h2>📱 いま使っているこの端末を登録する (PC/iPad 共通)</h2>
       <p class="hint">
         倉庫で使う iPad で管理者としてログインし、ここで登録すると、その端末は以後<b>ログイン不要</b>で作業画面を使えます (管理画面は引き続きログイン必須)。
         登録と同時にこの端末の管理者ログインは解除されます。⚠ ホーム画面に追加したアプリから開いて登録してください (Safari本体と保存領域が別のため)。
@@ -219,6 +249,26 @@
       const j = await r.json().catch(() => ({}));
       if (j.ok) { msg($('#uploadMsg'), true, '取り込みました: ' + j.slipCount + ' 伝票 / ' + j.rowCount + ' 行 (バッチ #' + j.batch.id + ')'); setTimeout(() => location.reload(), 800); }
       else msg($('#uploadMsg'), false, j.message || j.error || ('HTTP ' + r.status));
+    });
+
+    const enrollBtn = $('#enrollBtn');
+    if (enrollBtn) enrollBtn.addEventListener('click', async () => {
+      const label = $('#enrollLabel').value.trim();
+      if (!label) return msg($('#enrollMsg'), false, '端末名を入力してください');
+      enrollBtn.disabled = true;
+      msg($('#enrollMsg'), true, '発行中…');
+      try {
+        const { status, j } = await postJson(BASE + '/admin/enroll-codes', { label });
+        if (j.ok) {
+          $('#enrollCodeValue').textContent = j.code;
+          $('#enrollCodeMeta').textContent = '「' + j.label + '」用 ・ ' + j.ttlMinutes + '分間有効 (' + fmtJst(j.expiresAt) + ' まで)';
+          $('#enrollCode').style.display = 'block';
+          msg($('#enrollMsg'), true, 'iPad で入力してください');
+        } else {
+          msg($('#enrollMsg'), false, j.message || ('HTTP ' + status));
+        }
+      } catch (e) { msg($('#enrollMsg'), false, '通信できませんでした: ' + e.message); }
+      finally { enrollBtn.disabled = false; }
     });
 
     const reg = $('#registerBtn');

@@ -121,6 +121,20 @@ export function createTables(db = getMirrorDB()) {
       message    TEXT
     );
 
+    -- iPad をログインなしで登録するための使い捨てコード (管理者が PC で発行 → iPad で入力)。
+    -- ⚠ホーム画面の PWA と Safari は Cookie 保存領域が別なので、PWA 側で登録を完結させる必要がある
+    CREATE TABLE IF NOT EXISTS f_inbound_check_enroll_codes (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      code_hash  TEXT NOT NULL UNIQUE,
+      label      TEXT NOT NULL,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at    TEXT,
+      used_device_id INTEGER,
+      attempts   INTEGER NOT NULL DEFAULT 0
+    );
+
     CREATE TABLE IF NOT EXISTS f_inbound_check_devices (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
       token_hash   TEXT NOT NULL UNIQUE,
@@ -168,6 +182,64 @@ export function verifyDevice(token) {
     db.prepare('UPDATE f_inbound_check_devices SET last_seen_at = ? WHERE id = ?').run(now, row.id);
   }
   return row;
+}
+
+// ── 登録コード (iPad をログインなしで登録する) ──
+export const ENROLL_TTL_MS = 10 * 60 * 1000;   // 10分で失効
+export const ENROLL_MAX_ATTEMPTS = 5;          // 打ち間違い5回で無効 (総当たり対策)
+
+/** 6桁の登録コードを発行する。返すのはこの1回だけ (保存はハッシュのみ) */
+export function createEnrollCode(label, actor) {
+  const l = String(label || '').trim();
+  if (!l || l.length > 40) throw new Error('端末名は1〜40文字');
+  const db = getDB();
+  // 紛らわしい 0/O・1/I を避けるため数字のみ 6 桁。crypto で偏りなく引く
+  let code;
+  for (let i = 0; ; i++) {
+    code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    const dup = db.prepare('SELECT 1 FROM f_inbound_check_enroll_codes WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?').get(hashToken(code), utcNow());
+    if (!dup) break;
+    if (i > 20) throw new Error('登録コードを発行できませんでした (再試行してください)');
+  }
+  const now = new Date();
+  db.prepare(`INSERT INTO f_inbound_check_enroll_codes (code_hash, label, created_by, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?)`)
+    .run(hashToken(code), l, actor, now.toISOString(), new Date(now.getTime() + ENROLL_TTL_MS).toISOString());
+  return { code, label: l, expiresAt: new Date(now.getTime() + ENROLL_TTL_MS).toISOString() };
+}
+
+/**
+ * 登録コードを引き換えて端末を作る。成功したらコードは使用済みになる。
+ * @returns {ok:true, token, label} | {ok:false, error:'bad_code'|'expired'|'used'|'too_many'}
+ */
+export function redeemEnrollCode(code) {
+  const c = String(code || '').trim();
+  if (!/^\d{6}$/.test(c)) return { ok: false, error: 'bad_code', message: '6桁の数字を入力してください' };
+  const db = getDB();
+  return db.transaction(() => {
+    const row = db.prepare('SELECT * FROM f_inbound_check_enroll_codes WHERE code_hash = ?').get(hashToken(c));
+    if (!row) return { ok: false, error: 'bad_code', message: '登録コードが違います' };
+    if (row.attempts >= ENROLL_MAX_ATTEMPTS) return { ok: false, error: 'too_many', message: 'このコードは無効です (発行し直してください)' };
+    if (row.used_at) return { ok: false, error: 'used', message: 'この登録コードは使用済みです (発行し直してください)' };
+    if (Date.parse(row.expires_at) < Date.now()) return { ok: false, error: 'expired', message: '登録コードの有効期限が切れています (発行し直してください)' };
+    const { token, id } = createDevice(row.label, `enroll:${row.created_by}`);
+    db.prepare('UPDATE f_inbound_check_enroll_codes SET used_at = ?, used_device_id = ? WHERE id = ?').run(utcNow(), id, row.id);
+    return { ok: true, token, label: row.label };
+  }).immediate();
+}
+
+/** 打ち間違いを数える (総当たり対策)。コードが存在しないときは何もしない */
+export function countEnrollAttempt(code) {
+  const c = String(code || '').trim();
+  if (!/^\d{6}$/.test(c)) return;
+  getDB().prepare('UPDATE f_inbound_check_enroll_codes SET attempts = attempts + 1 WHERE code_hash = ?').run(hashToken(c));
+}
+
+/** 発行済みで、まだ使えるコードの一覧 (画面表示用。コード自体は出さない) */
+export function listActiveEnrollCodes() {
+  return getDB().prepare(`SELECT id, label, created_by, created_at, expires_at, attempts
+    FROM f_inbound_check_enroll_codes WHERE used_at IS NULL AND expires_at > ? AND attempts < ?
+    ORDER BY id DESC`).all(utcNow(), ENROLL_MAX_ATTEMPTS);
 }
 
 export function revokeDevice(id) {

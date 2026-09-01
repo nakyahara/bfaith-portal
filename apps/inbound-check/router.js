@@ -19,6 +19,7 @@ import multer from 'multer';
 import {
   getState, applyCheck, importCsv, getActiveBatch, listBatches, listImportLog, listEvents, eventsCsv,
   createDevice, verifyDevice, revokeDevice, listDevices,
+  createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   listWorkers, getWorker,
 } from './db.js';
 import { fetchAndImportFromDrive, statusForView, driveConfig } from './drive-fetch.js';
@@ -75,12 +76,16 @@ function checkOrigin(req, res, next) {
 /** 全ルート共通の入口: セッション or 登録端末 */
 function access(req, res, next) {
   if (req.path === '/manifest.json') return next();
+  // 端末登録の画面と API はログイン不要 (登録コード自体が認証。共用 iPad に管理者パスワードを打たせない)
+  if (req.path === '/enroll' || req.path === '/enroll/redeem') return next();
   if (hasSessionAccess(req)) { req.icUser = req.session.email; return next(); }
   const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
   if (device) { req.icDevice = device; return next(); }
   if (req.path.startsWith('/api/')) return res.status(401).json({ ok: false, error: 'unauthorized', message: 'ログインまたは端末登録が必要です' });
+  // ⭐iPad (未登録) は /login ではなく端末登録画面へ送る。
+  //   ホーム画面の PWA と Safari は Cookie 保存領域が別なので、PWA 側で登録を完結させる必要がある
   if (req.session) req.session.returnTo = req.originalUrl;
-  return res.redirect('/login');
+  return res.redirect(`${BASE}/enroll`);
 }
 
 /** セッション必須 (端末Cookieでは不可)。取込・管理画面用 */
@@ -117,6 +122,42 @@ router.get('/manifest.json', (req, res) => {
     ],
   });
 });
+
+// ─── 端末登録 (ログイン不要。登録コードで認証する) ───
+// 管理者が PC で発行した6桁コードを iPad で入力すると、その端末に Cookie が入る。
+// ⭐これがあるおかげで、共用 iPad に管理者アカウントでログインさせずに済む
+router.get('/enroll', (req, res) => {
+  // 既に登録済みなら作業画面へ戻す (誤って開いたとき用)
+  if (verifyDevice(readCookie(req, DEVICE_COOKIE))) return res.redirect(`${BASE}/`);
+  res.sendFile(path.join(__dirname, 'views', 'enroll.html'));
+});
+
+router.post('/enroll/redeem', checkOrigin, api((req, res) => {
+  const code = String(req.body?.code || '').trim();
+  const r = redeemEnrollCode(code);
+  if (!r.ok) {
+    countEnrollAttempt(code);   // 打ち間違いを数える (総当たり対策)
+    return res.status(400).json(r);
+  }
+  res.cookie(DEVICE_COOKIE, r.token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV !== 'development',
+    sameSite: 'lax',
+    maxAge: 400 * 24 * 3600 * 1000,
+    path: BASE,
+  });
+  res.json({ ok: true, label: r.label });
+}));
+
+// 発行 (管理者・PC から)
+router.post('/admin/enroll-codes', checkOrigin, requireAdmin, api((req, res) => {
+  try {
+    const r = createEnrollCode(req.body?.label, req.session.email);
+    res.json({ ok: true, ...r, ttlMinutes: Math.round(ENROLL_TTL_MS / 60000) });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: 'bad_request', message: e.message });
+  }
+}));
 
 // ─── 作業画面 ───
 router.get('/', (req, res) => {
@@ -189,6 +230,7 @@ router.get('/admin', requireSession, api(async (req, res) => {
     batches: listBatches(30),
     importLog: listImportLog(20),
     devices: isAdmin(req) ? listDevices() : [],
+    enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     workers: listWorkers(),   // = スタッフマスタの有効スタッフ (表示のみ。編集は /apps/staff)
     drive,
   });

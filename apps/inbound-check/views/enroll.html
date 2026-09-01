@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="入荷チェック">
+  <title>端末登録 | 入荷受付チェック</title>
+  <link rel="manifest" href="/apps/inbound-check/manifest.json">
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/app-icons/inbound-check-180.png">
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; height: 100%; background: #1c7ed6; color: #fff;
+      font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+    .wrap { min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .card { background: #fff; color: #212529; border-radius: 18px; padding: 28px 24px; width: min(94vw, 460px);
+      box-shadow: 0 8px 30px rgba(0,0,0,0.18); text-align: center; }
+    h1 { font-size: 1.25em; margin: 0 0 6px; }
+    .lead { color: #495057; font-size: 0.95em; line-height: 1.7; margin: 0 0 20px; }
+    .code-in { width: 100%; font-size: 2.4em; font-weight: 700; letter-spacing: 0.32em;
+      text-align: center; padding: 14px 10px 14px 20px; border: 2px solid #ced4da; border-radius: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .code-in:focus { outline: none; border-color: #1c7ed6; }
+    button.go { width: 100%; margin-top: 16px; padding: 16px; font-size: 1.15em; font-weight: 700;
+      border: 0; border-radius: 12px; background: #1c7ed6; color: #fff; cursor: pointer; }
+    button.go:disabled { background: #adb5bd; }
+    .msg { margin-top: 14px; font-size: 0.95em; min-height: 1.5em; }
+    .msg.err { color: #c92a2a; }
+    .msg.ok { color: #2b8a3e; font-weight: 700; }
+    .how { margin-top: 22px; padding-top: 18px; border-top: 1px solid #e9ecef;
+      font-size: 0.85em; color: #868e96; line-height: 1.8; text-align: left; }
+    .how b { color: #495057; }
+    .alt { margin-top: 14px; font-size: 0.85em; }
+    .alt a { color: #868e96; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>📦 この iPad を登録します</h1>
+      <p class="lead">管理者から聞いた<b>6桁の登録コード</b>を入れてください。<br>
+        一度登録すれば、次からはログインなしで使えます。</p>
+
+      <input class="code-in" id="code" type="tel" inputmode="numeric" pattern="[0-9]*"
+             maxlength="6" placeholder="------" autocomplete="one-time-code" autofocus>
+      <button class="go" id="go" type="button" disabled>登録する</button>
+      <div class="msg" id="msg"></div>
+
+      <div class="how">
+        <b>登録コードの出し方 (管理者の方へ)</b><br>
+        パソコンで <b>入荷受付チェックの管理画面</b> を開き、「📱 iPad の登録コードを発行」を押すと
+        6桁の数字が出ます。<b>10分間だけ</b>有効で、1台につき1回使えます。
+      </div>
+      <div class="alt"><a href="/login">管理者としてログインする</a></div>
+    </div>
+  </div>
+
+  <script>
+    const BASE = '/apps/inbound-check';
+    const $ = s => document.querySelector(s);
+    const codeEl = $('#code'), goEl = $('#go'), msgEl = $('#msg');
+
+    function setMsg(kind, text) { msgEl.className = 'msg' + (kind ? ' ' + kind : ''); msgEl.textContent = text; }
+
+    codeEl.addEventListener('input', () => {
+      // 数字だけに整える (コピペで空白や記号が入っても弾かない)
+      const v = codeEl.value.replace(/\D/g, '').slice(0, 6);
+      if (v !== codeEl.value) codeEl.value = v;
+      goEl.disabled = v.length !== 6;
+      setMsg(null, '');
+      if (v.length === 6) submit();   // 6桁入ったら自動で送る (現場のタップを1回減らす)
+    });
+    codeEl.addEventListener('keydown', e => { if (e.key === 'Enter' && codeEl.value.length === 6) submit(); });
+    goEl.addEventListener('click', submit);
+
+    let sending = false;
+    async function submit() {
+      if (sending || codeEl.value.length !== 6) return;
+      sending = true; goEl.disabled = true;
+      setMsg(null, '登録しています…');
+      try {
+        const r = await fetch(BASE + '/enroll/redeem', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: codeEl.value }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (j.ok) {
+          setMsg('ok', '✅ 「' + j.label + '」として登録しました。開いています…');
+          setTimeout(() => { location.href = BASE + '/'; }, 900);
+          return;
+        }
+        setMsg('err', j.message || '登録できませんでした');
+        codeEl.value = ''; codeEl.focus();
+      } catch (e) {
+        setMsg('err', '通信できませんでした (' + e.message + ')');
+      } finally {
+        sending = false; goEl.disabled = codeEl.value.length !== 6;
+      }
+    }
+  </script>
+</body>
+</html>
