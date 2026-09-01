@@ -95,7 +95,9 @@ async function unpublishedKeys({ maxPages = 50, perPage = 100 } = {}) {
   const keys = new Set();
   let pages = 0;
   let complete = false;
-  for (let start = 1; pages < maxPages; start += perPage) {
+  // ★次の start は「実際に読めた件数」で進める (Codex R10)。
+  //   要求より少ない件数が返った時に perPage で進めると、その間の行を読み飛ばす
+  for (let start = 1, step = 0; pages < maxPages; start += step) {
     const res = await fetch(`${BASE}/yahoo/publish-history?publish_id=0&start=${start}&results=${perPage}`, {
       method: 'GET', headers: headers(false), signal: AbortSignal.timeout(TIMEOUT_MS),
     });
@@ -125,23 +127,29 @@ async function unpublishedKeys({ maxPages = 50, perPage = 100 } = {}) {
       if (m) resultIdx.add(m[1]);
     }
     const rows = resultIdx.size;
-    let found = 0;
+    // ★行ごとに TargetKey を持っているか見る (Codex R10)。
+    //   「TargetKey の総数 vs 行数」だと、1行に2つあって別の行に0個のときに相殺されて見逃す
+    const withKey = new Set();
     for (const [k, v] of flat) {
-      if (/(^|\/)TargetKey\[\d+\]$/.test(k) && String(v).trim()) {
+      const m = k.match(/^ResultSet\[\d+\]\/Result\[(\d+)\].*?(^|\/)TargetKey\[\d+\]$/);
+      if (m && String(v).trim()) {
         keys.add(String(v).trim().toLowerCase());
-        found++;
+        withKey.add(m[1]);
       }
     }
     // ★TargetKey が無い行があると、その行が対象商品かどうか分からない = 反映済みと言い切れない
-    if (found < rows) {
-      throw new Error(`publish-history に対象キーの無い行が ${rows - found} 件あります。反映できたか判定できません`);
+    const missing = [...resultIdx].filter((i) => !withKey.has(i));
+    if (missing.length > 0) {
+      throw new Error(`publish-history に対象キーの無い行が ${missing.length} 件あります。反映できたか判定できません`);
     }
     // 総件数が分かるならそれで終わりを判断する。分からなければ「1ページに満たなければ終わり」
     const totalRaw = String(flat.get('ResultSet[0]@totalResultsAvailable') ?? '').trim();
     const total = /^\d+$/.test(totalRaw) ? Number(totalRaw) : null;   // 空文字を 0 と読まない
+    if (rows === 0) { complete = true; break; }          // これ以上は無い
     if (total !== null) {
       if (start + rows - 1 >= total) { complete = true; break; }
     } else if (rows < perPage) { complete = true; break; }
+    step = rows;                                          // 読めた件数だけ進める
     await sleep(API_GAP_MS);
   }
   // ★上限で打ち切ったら「載っていない」と言い切れない (Codex R3)。
