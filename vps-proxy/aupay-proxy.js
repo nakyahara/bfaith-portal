@@ -534,6 +534,11 @@ function parseGetItemDetailXml(xml) {
     // Price は「商品単位の設定価格」。バリエーション商品は SubCodes[] に sub_code 別価格が入る
     // (現行の出品運用ではサブコード別価格は使わず item 価格を継承する方針 — variation-resolver.js 参照)
     Price: null, SubCodes: [],
+    // ★SalePrice (M3 2026-09-01 追加)。updateItems で price を送る時は sale_price も必須で、
+    //   空文字を送ると既存のセール価格が消える。**入っている商品は更新しない**ための判断材料。
+    //   「入っていない」ことを確かめられないと止められないので、読めない時は null ではなく
+    //   SalePriceReadable=false で「読めなかった」と分けて返す
+    SalePrice: null, SalePriceReadable: false,
     // 発送まわり (価格一括改定ツール 2026-08-31 追加)。同じ商品でもモールで配送方法が違い、
     // それが売価差の理由になるため、画面で並べて見えるようにする
     Delivery: null, PostageSet: null, ShipWeight: null,
@@ -616,6 +621,25 @@ function parseGetItemDetailXml(xml) {
     return toIntPrice(decodeXmlEntities(unwrapCdata(m[1])).trim());
   };
   out.Price = priceIn(withoutVariationBlocks);
+
+  // ★セール価格。「空 = 使っていない」と「読めなかった」を分ける (M3 のガードに使う)。
+  //   商品単位のスコープに <SalePrice> がちょうど1つあり、中身が空 or 整数のときだけ読めた扱い
+  {
+    const all = withoutVariationBlocks.match(/<SalePrice\b[^>]*>([\s\S]*?)<\/SalePrice>/gi) || [];
+    const selfClosed = withoutVariationBlocks.match(/<SalePrice\b[^>]*\/>/gi) || [];
+    if (all.length === 1) {
+      const inner = decodeXmlEntities(unwrapCdata(all[0].match(/<SalePrice\b[^>]*>([\s\S]*?)<\/SalePrice>/i)[1])).trim();
+      if (inner === '') { out.SalePrice = null; out.SalePriceReadable = true; }        // 使っていない
+      else {
+        const n = toIntPrice(inner);
+        out.SalePrice = n;
+        out.SalePriceReadable = n !== null;    // 読めない値なら「読めなかった」扱い
+      }
+    } else if (all.length === 0 && selfClosed.length === 1) {
+      out.SalePrice = null; out.SalePriceReadable = true;                              // <SalePrice/> も「使っていない」
+    }
+    // それ以外 (複数ある / 見当たらない) は SalePriceReadable=false のまま = 判断できない
+  }
 
   // 発送まわり (商品単位)。SubCodes 内にも同名タグがあるので、除外済みの範囲から取る
   const textIn = (scope, name) => {
@@ -1483,6 +1507,10 @@ const server = http.createServer(async (req, res) => {
         // 価格一括改定ツール向け (2026-08-24 追加)
         Price: parsed.Price,
         SubCodes: parsed.SubCodes,
+        // ★M3: セール価格が入っている商品は価格更新しない (空文字を送ると消えるため)。
+        //   「入っていない」と「読めなかった」を分けて返す
+        SalePrice: parsed.SalePrice,
+        SalePriceReadable: parsed.SalePriceReadable,
         // 発送まわり (2026-08-31 追加)。モールごとの配送方法を画面で見比べるため
         Delivery: parsed.Delivery,
         PostageSet: parsed.PostageSet,
@@ -1977,6 +2005,17 @@ function runSelfTest() {
   check('先頭ゼロ', parseGetItemDetailXml('<Result><Price>0080</Price></Result>').Price, null);
   check('全角', parseGetItemDetailXml('<Result><Price>１０８０</Price></Result>').Price, null);
   // 同一スコープに Price が複数 = 想定外の構造。取り違えるより読めない扱いにする
+  // 8) セール価格 (M3 のガード。「使っていない」と「読めなかった」を分ける)
+  const sp = (xml) => { const r = parseGetItemDetailXml(xml); return [r.SalePrice, r.SalePriceReadable]; };
+  check('セール価格: 空タグは「使っていない」', sp('<Result><SalePrice></SalePrice></Result>'), [null, true]);
+  check('セール価格: 自己終了タグも「使っていない」', sp('<Result><SalePrice/></Result>'), [null, true]);
+  check('セール価格: 値が入っていれば読む', sp('<Result><SalePrice>900</SalePrice></Result>'), [900, true]);
+  check('セール価格: ★読めない値は「読めなかった」', sp('<Result><SalePrice>お問い合わせ</SalePrice></Result>'), [null, false]);
+  check('セール価格: ★見当たらなければ「読めなかった」', sp('<Result><Price>100</Price></Result>'), [null, false]);
+  check('セール価格: ★複数あれば「読めなかった」', sp('<Result><SalePrice>900</SalePrice><SalePrice>800</SalePrice></Result>'), [null, false]);
+  check('セール価格: SubCodes 内は見ない',
+    sp('<Result><SalePrice></SalePrice><SubCodes><SubCode code="a"><SalePrice>500</SalePrice></SubCode></SubCodes></Result>'), [null, true]);
+
   check('Price重複', parseGetItemDetailXml('<Result><Price>100</Price><Price>200</Price></Result>').Price, null);
 
   // 7) editItem の seller_id は VPS の値が正 (呼び出し側の値は捨てる)

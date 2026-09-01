@@ -31,7 +31,7 @@ export const BREAKER_CONSECUTIVE_FAILURES = 2;
  *   ここで止めないと「Yahoo の出品コードを楽天の管理番号として送る」ことになる (Codex R1 High)。
  *   Yahoo は M3 で送信経路と一緒に開ける。
  */
-export const EXECUTABLE_MALLS = ['rakuten'];
+export const EXECUTABLE_MALLS = ['rakuten', 'yahoo'];
 
 const TRUE_VALUES = new Set(['1', 'true', 'on', 'yes']);
 
@@ -43,7 +43,7 @@ export function mallWriteEnabled(mall, env = process.env) {
   if (!EXECUTABLE_MALLS.includes(mall)) {
     return { enabled: false, reason: `${mall} はこのバージョンからは更新できません (送信経路がありません)` };
   }
-  const key = { rakuten: 'PRICE_UPDATE_RAKUTEN_ENABLED' }[mall];
+  const key = { rakuten: 'PRICE_UPDATE_RAKUTEN_ENABLED', yahoo: 'PRICE_UPDATE_YAHOO_ENABLED' }[mall];
   const on = TRUE_VALUES.has(String(env[key] ?? '').trim().toLowerCase());
   return on ? { enabled: true, reason: null } : { enabled: false, reason: `${key} が有効でないため送信しません (fail-closed)` };
 }
@@ -121,12 +121,17 @@ function isStopState(state) {
  * @param {object} run getRun() の戻り
  * @param {object} opts
  * @param {string} opts.actor
- * @param {object} opts.client { patchItemPrices, fetchItemDetail } (テストでは差し替える)
+ * @param {object} opts.clients モール別のクライアント { rakuten: {...}, yahoo: {...} }。
+ *   どのモールも { patchItemPrices, fetchItemDetail } の同じ形にそろえてある
+ *   (モールごとに判定を作らず、classify() / 試運転 / ブレーカー を共通に効かせるため)。
+ *   テストでは差し替える
  * @param {object} [opts.env]
  * @param {boolean} [opts.skipClaim] テスト用: claim を取らない
  * @returns {Promise<{summary:object, results:Array}>}
  */
-export async function executeRun(db, run, { actor, client, env = process.env, skipClaim = false }) {
+export async function executeRun(db, run, { actor, clients, client, env = process.env, skipClaim = false }) {
+  // client 単体で渡されたら楽天のものとして扱う (既存の呼び出し・テストとの互換)
+  const clientOf = (mall) => (clients ? clients[mall] : (mall === 'rakuten' ? client : null));
   const results = [];
   const summary = { sent: 0, applied: 0, noop: 0, conflict: 0, failed: 0, unknown: 0, skipped: 0, stopped: null };
 
@@ -167,6 +172,13 @@ export async function executeRun(db, run, { actor, client, env = process.env, sk
       continue;
     }
 
+    const mallClient = clientOf(mall);
+    if (!mallClient) {
+      const reason = `${mall} への送信口がありません`;
+      stoppedMalls.set(mall, reason);
+      for (const op of ops) { summary.skipped++; record(op, 'skipped', reason); }
+      continue;
+    }
     const gate = mallWriteEnabled(mall, env);
     if (!gate.enabled) {
       stoppedMalls.set(mall, gate.reason);
@@ -204,7 +216,7 @@ export async function executeRun(db, run, { actor, client, env = process.env, sk
 
     let res;
     try {
-      res = await client.patchItemPrices(listingCode, { operationId, runId: run.run_id, expected, prices });
+      res = await mallClient.patchItemPrices(listingCode, { operationId, runId: run.run_id, expected, prices });
     } catch (e) {
       // 応答が返ってこなかった = 送られたか不明。★再送しない
       const reason = `送信結果が不明です (${e.message})。受領台帳を operation_id=${operationId} で照会してください`;
@@ -221,11 +233,20 @@ export async function executeRun(db, run, { actor, client, env = process.env, sk
       failStreak.set(mall, 0);
       // ★API再取得で本当にその価格になっているか確かめる (要件 F5 一次確認)。
       //   noop も確認する — 確かめずに「既に同価格だった」と確定させない (Codex R1 Medium)
-      const verified = await verifyPrices(client, listingCode, prices);
+      const verified = await verifyPrices(mallClient, listingCode, prices);
       if (verified.ok) {
         for (const op of ops) {
           if (state === 'noop') { summary.noop++; record(op, 'noop', null, { live: verified.live?.[op.sku_code] ?? null }); }
-          else { summary.applied++; record(op, 'confirmed', null, { sent: prices[op.sku_code], verified: verified.live?.[op.sku_code] ?? null }); }
+          else {
+            summary.applied++;
+            // ★Yahoo は「管理側が変わった」だけでは客に見えない。反映を依頼できたかも残す
+            //   (反映そのものは非同期。ここでは終わらないので、後から確かめる)
+            const publish = res.body?.publish;
+            record(op, 'confirmed', null, {
+              sent: prices[op.sku_code], verified: verified.live?.[op.sku_code] ?? null,
+              ...(publish ? { publishRequested: publish.requested === true, publishOk: publish.ok === true } : {}),
+            });
+          }
         }
         // ★試運転が済んだ = 「実際に書き換えて、その通りになったことを確かめられた」1件があること。
         //   noop は楽天へ書き込んでいないので、書き込みが通る証拠にならない (Codex R2 Medium)
