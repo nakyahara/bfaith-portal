@@ -169,9 +169,11 @@ async function sendAddingRequiredFields(before, itemBase, price) {
 }
 
 /**
- * 「前」の応答から復元できる項目をすべて集める。
+ * 「前」の応答から **この道具が復元できる** 項目を集める。
  * ★戻しは必須項目だけでは足りない (Codex R1)。もし editItem が「送らなかった項目を消す」なら、
  *   必須項目だけで戻すと、消えた商品名・説明などが消えたまま固定されてしまう。
+ * ⚠️これは「全項目」ではない。FIELD_SOURCES に載っている項目だけ。
+ *   画像のように別の API でしか戻せないものは含まれない (だから最後に「前」との差分を必ず見る)。
  */
 function fullRestoreFields(before, itemBase, price) {
   const fields = { item_code: itemCode, price: String(price) };
@@ -221,15 +223,15 @@ async function main() {
   const sent = await sendAddingRequiredFields(before, itemBase, probePrice);
   console.log(`\n必須だった項目: ${sent.required.length > 0 ? sent.required.join(' → ') : '(なし)'}`);
 
-  // ★書き込みが起きていないと言い切れるなら、戻しに行かない (戻しも同じ理由で弾かれるだけ)
-  if (!sent.applied && !sent.uncertain) {
+  // ★「書き込みが起きていないから戻さない」という判断はしない (Codex R2)。
+  //   その判断を誤ると壊れたまま残る。戻しは同じ値を書くだけなので、常に通しても害が無い。
+  //   代わりに「弾かれただけ」なのか「本当に戻せていない」のかを、報告の側で区別する。
+  const definiteReject = !sent.applied && !sent.uncertain;
+  if (definiteReject) {
     console.error(`\n⚠️ 送信は通りませんでした: ${sent.stopReason}`);
-    console.error('   Yahoo が受け付けずに返しているので、商品は書き換わっていません (戻す必要はありません)。');
-    if (sent.required.length > 0) {
-      console.error(`   ここまでで分かった必須項目: ${sent.required.join(' → ')}`);
-    }
+    console.error('   Yahoo が受け付けずに返しているので、商品は書き換わっていないはずです。');
+    if (sent.required.length > 0) console.error(`   ここまでで分かった必須項目: ${sent.required.join(' → ')}`);
     process.exitCode = 1;
-    return;
   }
 
   try {
@@ -256,37 +258,35 @@ async function main() {
       : `🚨 価格以外が ${collateral.length} 項目 変わった/消えた → **送らなかった項目は消える**。`
         + '価格更新でも全項目を送り直す設計が要る'}`);
   } finally {
-    console.log(`\n価格を元に戻します (${probePrice} → ${currentPrice})`);
+    console.log(`\n元の状態に戻します (価格 ${currentPrice} + 「前」から復元できる項目)`);
     try {
-      // ★「前」から復元できる項目を全部送る。必須項目だけだと、消えた項目が消えたまま固定される
       const restoreFields = fullRestoreFields(before, itemBase, currentPrice);
       console.log(`  戻しに送る項目: ${Object.keys(restoreFields).join(', ')}`);
       let r2 = await callEditItem(restoreFields);
       let restoreErr = editItemError(r2);
       if (restoreErr) {
         // 全部送って弾かれたら、通った時と同じ項目一式でもう一度 (せめて価格だけでも戻す)
-        console.error(`  全項目での戻しが弾かれました (${oneLine(restoreErr.message || r2.body)})。必須項目だけで戻します`);
+        console.error(`  復元できる項目一式が弾かれました (${oneLine(restoreErr.message || r2.body)})。必須項目だけで戻します`);
         r2 = await callEditItem({ ...sent.fields, price: String(currentPrice) });
         restoreErr = editItemError(r2);
       }
       console.log(`editItem: HTTP ${r2.status} / ${oneLine(r2.body)}`);
-      if (restoreErr) {
-        console.error(`🚨 戻せていません。Yahoo の管理画面で価格を ${currentPrice} に直してください`);
-        process.exitCode = 1;
+      // ★最後は「送れたか」ではなく **いまの状態が「前」と同じか** で判断する
+      const restored = await flattenXml(await getRawXml(itemCode));
+      const back = diff(before, restored);
+      report('いまの状態と、最初との差分', back);
+      const stillOff = back.changed.length + back.removed.length + back.added.length;
+      if (stillOff === 0) {
+        console.log(`\n✅ 商品は最初の状態に戻っています${definiteReject ? ' (そもそも書き換わっていません)' : ''}`);
       } else {
-        const restored = await flattenXml(await getRawXml(itemCode));
-        const restoredPrice = itemPriceOf(restored, itemCode);
-        report('元に戻したあと、最初との差分', diff(before, restored));
-        if (restoredPrice !== currentPrice) {
-          console.error(`🚨 価格が ${currentPrice} に戻っていません (実際: ${restoredPrice})。Yahoo の管理画面で直してください`);
-          process.exitCode = 1;
-        } else if (sent.uncertain) {
-          await settleAfterUncertainSend(itemCode, currentPrice, sent.fields);
-        }
+        console.error(`\n🚨 最初の状態と ${stillOff} 項目 違います。Yahoo の管理画面で直してください`);
+        if (restoreErr) console.error(`   (戻しの送信も通っていません: ${oneLine(restoreErr.message || r2.body)})`);
+        process.exitCode = 1;
       }
+      if (sent.uncertain) await settleAfterUncertainSend(itemCode, before, itemBase, currentPrice);
     } catch (e) {
       console.error(`🚨 戻す処理でエラー: ${e.message}`);
-      console.error(`   Yahoo の管理画面で ${itemCode} の価格を ${currentPrice} に直してください`);
+      console.error(`   Yahoo の管理画面で ${itemCode} を確かめてください (価格は ${currentPrice} 円)`);
       process.exitCode = 1;
     }
   }
@@ -300,21 +300,25 @@ async function main() {
  *   「この後もう効かない」ことは、どれだけ待っても証明できないため (Codex R4)。
  *   最後は必ず「あとで管理画面で確かめてください」と人に引き継いで終了コード 1 にする。
  */
-async function settleAfterUncertainSend(code, wantPrice, fields) {
+async function settleAfterUncertainSend(code, before, itemBase, wantPrice) {
   for (let i = 1; i <= SETTLE_ROUNDS; i++) {
     console.log(`\n送信の結果が不明だったので ${SETTLE_WAIT_MS / 1000} 秒待って確かめ直します (${i}/${SETTLE_ROUNDS})`);
     await sleep(SETTLE_WAIT_MS);
     let now;
     try {
-      now = itemPriceOf(await flattenXml(await getRawXml(code)), code);
+      now = await flattenXml(await getRawXml(code));
     } catch (e) {
       console.error(`  確かめられませんでした (${e.message})`);
       continue;
     }
-    if (now === wantPrice) { console.log(`  価格は ${wantPrice} のままです`); continue; }
-    console.error(`  🚨 価格が ${now} に変わっていました (遅れて効いた送信)。もう一度 ${wantPrice} に戻します`);
+    // ★価格だけでなく全項目を見る。遅れて効いた送信で項目が消えることもある (Codex R2)
+    const d = diff(before, now);
+    const off = d.changed.length + d.removed.length + d.added.length;
+    if (off === 0) { console.log('  最初の状態のままです'); continue; }
+    console.error(`  🚨 ${off} 項目が最初と違います (遅れて効いた送信)。もう一度戻します`);
+    report('  いまの差分', d);
     try {
-      const r = await callEditItem({ ...fields, price: String(wantPrice) });
+      const r = await callEditItem(fullRestoreFields(before, itemBase, wantPrice));
       const f = editItemError(r);
       if (f) throw new Error(oneLine(r.body));
     } catch (e) {
@@ -326,8 +330,8 @@ async function settleAfterUncertainSend(code, wantPrice, fields) {
   // ★ここで「もう大丈夫」とは言えない。応答が返らなかった送信は、待ち時間を何倍にしても
   //   「この後もう効かない」ことを証明できない (Codex R4)。確かめるのを人に引き継ぐ。
   console.error('\n⚠️ この回は送信の結果が分かりませんでした。');
-  console.error('   いまの価格は確認しましたが、この後さらに遅れて効く可能性が残ります。');
-  console.error(`   あとで Yahoo の管理画面で ${code} の価格が ${wantPrice} 円か、もう一度確かめてください。`);
+  console.error('   いまの状態は確認しましたが、この後さらに遅れて効く可能性が残ります。');
+  console.error(`   あとで Yahoo の管理画面で ${code} を確かめてください (価格 ${wantPrice} 円・商品名や説明が消えていないか)。`);
   process.exitCode = 1;
 }
 
