@@ -233,6 +233,13 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
     items: [{ manageNumber: '0726-001588', variants: { '0726-001588': { standardPrice: '1280' } } }], failed: [] }) };
   const single = (await fetchRakutenPrices([{ key: '0726-001588', aliases: ['0726-001588'], manageNumber: '0726-001588' }], depsNoAm)).get('0726-001588');
   eq([single.found, single.price], [true, 1280], 'AM が無い単品は通る');
+  // ★複数SKUの商品で、当たった variant に AM が無い = 同じ SKU か確かめる手段が無い → 確定しない (Codex R3)
+  const noAmMulti = { ...variants, 366: { standardPrice: '577' } };   // 366 の AM が空 (差し替え後の可能性)
+  const depsNoAmMulti = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: '0726-001802', itemNumber: '0726-001802', title: 'T', variants: noAmMulti }], failed: [] }) };
+  const nam = (await fetchRakutenPrices([target], depsNoAmMulti)).get('0726-001802');
+  eq(nam.found, false, '★複数SKU商品で AM が空の variant は確定しない');
+  ok(/システム連携用SKU番号がありません/.test(nam.reason) && /複数SKU [(]9[)] の商品/.test(nam.reason), '理由に SKU 数 (この商品は 9) と対処を書く: ' + nam.reason);
 
   // ★同じプレビューに BK と BE を並べても、片方がもう片方を上書きしない (行キーは NE コード単位)
   const both = await fetchRakutenPrices([

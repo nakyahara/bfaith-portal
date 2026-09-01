@@ -168,16 +168,26 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       });
       continue;
     }
-    // ★取り違えの最終防衛 (Codex R2): 当たった variant のシステム連携用SKU番号 (AM) が対応表の別名に無ければ確定しない。
-    //   対応表を作った後に SKU が別商品へ移り、空いた SKU管理番号に別商品の SKU が入った、という隙を塞ぐ。
-    //   AM は店舗内で一意なので、これが違えば別の SKU。AM が空の variant (単品など) はこの検査の対象外
+    // ★取り違えの最終防衛 (Codex R2/R3): 当たった variant のシステム連携用SKU番号 (AM) を対応表の別名と照合する。
+    //   対応表を作った後に SKU が別商品へ移り、空いた SKU管理番号に別の SKU が入った、という隙を塞ぐ。
+    //   AM は店舗内で一意なので、これが違えば別の SKU。
+    //   - AM があって別名に無い → 差し替わった疑い。確定しない
+    //   - AM が空 → 複数SKUの商品では同一性を確かめる手段が無いので確定しない。
+    //     単一SKUの商品だけ通す (取り違える相手がいない。実データ: 複数SKU商品で AM 空は 0 件・単一SKUでは 1,652 件)
     const liveAm = String(variants[matchedKey]?.merchantDefinedSkuId || '').trim();
+    const variantCount = Object.keys(variants).length;
+    let identityProblem = null;
     if (liveAm && !aliasKeys.has(normCode(liveAm))) {
+      identityProblem = `SKU ${matchedKey} のシステム連携用SKU番号 (${liveAm}) が対応表の別名 (${t.aliases.join(', ')}) にありません。`
+        + '対応表を作った後に SKU が差し替わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
+    } else if (!liveAm && variantCount > 1) {
+      identityProblem = `SKU ${matchedKey} にシステム連携用SKU番号がありません。複数SKU (${variantCount}) の商品では同じ SKU か確かめられないため確定しません`
+        + ' (RMS でこの SKU にシステム連携用SKU番号を設定してください)';
+    }
+    if (identityProblem) {
       out.set(t.rowKey, {
         price: null, manageNumber: item.manageNumber || t.manageNumber, skuCode: null, found: false,
-        reason: `SKU ${matchedKey} のシステム連携用SKU番号 (${liveAm}) が対応表の別名 (${t.aliases.join(', ')}) にありません。`
-          + '対応表を作った後に SKU が差し替わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)',
-        itemTitle: item?.title || null,
+        reason: identityProblem, itemTitle: item?.title || null,
       });
       continue;
     }
