@@ -1397,6 +1397,8 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         ok: updateOk && (!wantSubmit || submits.every((s) => s.ok)),
         updateStatus: r.status,
+        // ★「更新は通ったが反映が失敗」を呼び出し側が見分けられるようにする (Codex R5)
+        updateOk,
         updateBody: String(r.body).slice(0, 2000),
         submitted: wantSubmit,
         submits,
@@ -1840,7 +1842,8 @@ function isWellFormedResultSet(xml) {
  * ★このサーバの中だけの話。Yahoo の管理画面から直に変えられた場合は閉じようがない。
  */
 async function withYahooItemLock(codes, fn) {
-  const keys = [...new Set((codes || []).map((c) => String(c)))].sort();
+  // ★キーは正規化する (Codex R5)。zz-1 と ZZ-1 は同じ商品なので、別のロックにしてはいけない
+  const keys = [...new Set((codes || []).map((c) => String(c).trim().toLowerCase()))].sort();
   const prev = keys.map((k) => yahooItemLocks.get(k)).filter(Boolean);
   let release;
   const mine = new Promise((r) => { release = r; });

@@ -96,7 +96,7 @@ console.log('\n── クライアント: 楽天と同じ形の応答にそろ�
     getDetail: async () => detail(),
     postUpdate: async (code, price) => {
       calls.push({ code, price });
-      return { status: 200, json: { ok: true, submitted: true, submits: [{ item_code: code, ok: true }] } };
+      return { status: 200, json: { ok: true, updateOk: true, submitted: true, submits: [{ item_code: code, ok: true }] } };
     },
   });
 
@@ -116,9 +116,10 @@ console.log('\n── クライアント: 楽天と同じ形の応答にそろ�
   eq([n.status, n.body.state], [200, 'noop'], '★同じ価格なら Yahoo を叩かない');
 
   // 反映が通らなかった時も成功扱いにしない印を残す
+  // ★VPS は反映が失敗すると ok:false を返す (updateOk:true で「更新は通った」と分かる)
   const noPub = makeYahooClient({
     getDetail: async () => detail(),
-    postUpdate: async () => ({ status: 200, json: { ok: true, submitted: true, submits: [{ item_code: 'zz-1', ok: false }] } }),
+    postUpdate: async () => ({ status: 200, json: { ok: false, updateOk: true, submitted: true, submits: [{ item_code: 'zz-1', ok: false }] } }),
   });
   const np = await noPub.patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
   eq(np.body.publish, { requested: true, ok: false }, '★反映が通らなかったことが記録に残る');
@@ -133,23 +134,34 @@ console.log('\n── ★反映を依頼できなければ「終わった」と�
   const mk = (json) => makeYahooClient({ getDetail: async () => detail(), postUpdate: async () => ({ status: 200, json }) });
 
   // 反映の依頼そのものをしていない
-  const notSubmitted = await mk({ ok: true, submitted: false, submits: [] })
+  const notSubmitted = await mk({ ok: false, updateOk: true, submitted: false, submits: [] })
     .patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
   ok(notSubmitted.body.state !== 'applied', '★反映を依頼していなければ applied にしない');
   eq(notSubmitted.body.error, 'PUBLISH_FAILED', '理由が分かる');
   eq(notSubmitted.body.applied, { 'zz-1': 1001 }, '★価格が変わったことは記録に残す (戻せるように)');
   ok(/管理画面/.test(notSubmitted.body.message), '人に何をすればよいか書く');
 
-  // 依頼はしたが失敗した
-  const failed = await mk({ ok: true, submitted: true, submits: [{ item_code: 'zz-1', ok: false }] })
+  // 依頼はしたが失敗した (★VPS が実際に返す形: ok:false + updateOk:true)
+  const failed = await mk({ ok: false, updateOk: true, submitted: true, submits: [{ item_code: 'zz-1', ok: false }] })
     .patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
   ok(failed.body.state !== 'applied', '★反映の依頼が失敗しても applied にしない');
   eq(failed.body.publish, { requested: true, ok: false }, '依頼はしたが通らなかったと分かる');
 
   // submits が空 (何も反映していない) も成功にしない
-  const empty = await mk({ ok: true, submitted: true, submits: [] })
+  const empty = await mk({ ok: false, updateOk: true, submitted: true, submits: [] })
     .patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
   ok(empty.body.state !== 'applied', '★反映の結果が空でも applied にしない');
+
+  // ★更新そのものが通らなかった回は「価格が変わった」と言わない (戻す対象にしない)
+  const updateNg = await mk({ ok: false, updateOk: false, updateBody: '<ResultSet><Status>NG</Status></ResultSet>', submits: [] })
+    .patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
+  ok(updateNg.body.state !== 'applied', '更新が通らなければ applied にしない');
+  eq(updateNg.body.applied, undefined, '★更新が通っていないのに applied を残さない');
+
+  // 成功した回 (VPS は ok:true + updateOk:true を返す)
+  const good = await mk({ ok: true, updateOk: true, submitted: true, submits: [{ item_code: 'zz-1', ok: true }] })
+    .patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
+  eq([good.body.state, good.body.publish.ok], ['applied', true], '更新も反映も通れば applied');
 }
 
 console.log('\n── ★VPS へ「今いくらのはず」を渡す (送る直前にあちらでも照合してもらう) ──');
@@ -159,7 +171,7 @@ console.log('\n── ★VPS へ「今いくらのはず」を渡す (送る直�
     getDetail: async () => detail(),
     postUpdate: async (code, price, expectedPrice) => {
       sent.push({ code, price, expectedPrice });
-      return { status: 200, json: { ok: true, submitted: true, submits: [{ item_code: code, ok: true }] } };
+      return { status: 200, json: { ok: true, updateOk: true, submitted: true, submits: [{ item_code: code, ok: true }] } };
     },
   });
   await client.patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });

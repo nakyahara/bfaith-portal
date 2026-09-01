@@ -150,8 +150,13 @@ export function makeYahooClient(deps = {}) {
         return { status: 200, body: { ok: true, state: 'noop', applied: {} } };
       }
       const res = await postUpdate(itemCode, plan.price, plan.currentPrice);
-      // ★VPS が「更新 + 反映依頼」をまとめて行い、JSON で結果を返す
-      if (res.status >= 200 && res.status < 300 && res.json && res.json.ok === true) {
+      // ★VPS が「更新 + 反映依頼」をまとめて行い、JSON で結果を返す。
+      //   反映だけ失敗した回は VPS の ok が false になるので、**更新が通ったか (updateOk) で見る** (Codex R5)。
+      //   ok だけ見ていると「価格は変わったのに反映できていない」回が
+      //   ただの失敗に落ちて、価格が変わった事実 (applied) が記録から消える
+      const updateSucceeded = res.status >= 200 && res.status < 300 && res.json
+        && (res.json.updateOk === true || (res.json.updateOk === undefined && res.json.ok === true));
+      if (updateSucceeded) {
         const submits = Array.isArray(res.json.submits) ? res.json.submits : [];
         const publish = {
           requested: res.json.submitted === true,
