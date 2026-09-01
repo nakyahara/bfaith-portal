@@ -111,7 +111,9 @@ function setAttempt(db, draftId, { outcome, error = null, start = false, keepErr
  *   - 前回の結果が unknown → 400 (forceUnknown = 管理者が RMS で未登録を確認済み、のときだけ通す)
  *   - running のまま実行中でない = 途中で落ちた。PUT が通った直後・registered_at を書く前に落ちた
  *     可能性があるので unknown と同じ扱い (「15 分経ったからやり直せる」にしない)
- * 実行中 (ロック中) は呼び出し側のロック取得で 409 になる
+ * 実行中 (ロック中) は呼び出し側のロック取得で 409 になる。
+ * 🚨**ロックを取る前に呼ぶこと** (Codex R3): 取った後だと inFlight が自分自身になり、途中で止まった
+ * running を「いま動いている」と誤認して通してしまう
  * @throws 400
  */
 export function assertRakutenListable(db, draft, { forceUnknown = false } = {}) {

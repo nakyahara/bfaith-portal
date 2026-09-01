@@ -1463,14 +1463,18 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
   }
   // ボードからの出品と**同じロック**を通す (Codex R1 critical): ボードで実行中に別タブの
   // 詳細画面から押すと、両方が「未登録」を見て同じ PUT を二度打てた
+  // 登録済み / 前回の結果が不明 / 途中で止まった商品は詳細画面からも通さない (ボードと同じ判定 —
+  // Codex R2 critical: ここが素通りだと「結果不明は管理者だけが再実行」を詳細画面から迂回できる)。
+  // 🚨**ロックを取る前に**判定する (Codex R3): 取った後だと「実行中 (inFlight)」が自分自身になり、
+  // 途中で止まった running を「いま動いている」と誤認して通してしまう
+  try { assertRakutenListable(getDB(), draft); } catch (e) {
+    return res.status(Number(e?.status) || 400).json({ ok: false, error: e.message });
+  }
   let release;
   try { release = acquireRakutenListingLock(draft.id); } catch (e) {
     return res.status(409).json({ ok: false, error: e.message });
   }
   try {
-    // 登録済み / 前回の結果が不明 / 途中で止まった商品は詳細画面からも通さない (ボードと同じ判定 —
-    // Codex R2 critical: ここが素通りだと「結果不明は管理者だけが再実行」を詳細画面から迂回できる)
-    assertRakutenListable(getDB(), draft);
     const r = await registerItem(draft.id, { actor: actorOf(req) });
     if (!r.ok) return res.status(400).json({ ok: false, error: r.error || (r.reasons || []).join(' / '), reasons: r.reasons });
     // 楽天モール=完了 + 画像工程⑧=完了 (人に二度同じことを押させない)。

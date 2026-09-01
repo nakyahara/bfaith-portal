@@ -5953,6 +5953,14 @@ for (const [name, file, data] of renders) {
       r.status === 400 && /RMS/.test(r.json.error || ''), JSON.stringify(r.json));
     r = await call(`/api/drafts/${id}/rakuten/register`, { confirm: true });
     check('HTTP 詳細画面の「公開で登録」: 登録済みの商品は 400', r.status === 400 && /登録済み/.test(r.json.error || ''), JSON.stringify(r.json));
+    // 途中で止まった (running・実行中でない) も詳細画面から通さない (Codex R3: ロックを取ってから判定すると
+    // inFlight が自分自身になって「いま動いている」と誤認し、素通りしていた)
+    const idS = mkDraft('LST-HTTP-STUCK');
+    db.prepare("INSERT INTO draft_rakuten (draft_id, listing_outcome, listing_attempt_at) VALUES (?, 'running', '2026-08-01T00:00:00Z')").run(idS);
+    r = await call(`/api/drafts/${idS}/rakuten/register`, { confirm: true });
+    check('HTTP 詳細画面の「公開で登録」: 途中で止まった商品は 400 (ロックを取る前に判定)',
+      r.status === 400 && /途中で止まって/.test(r.json.error || '') && !bl.isRakutenListingInFlight(idS), JSON.stringify(r.json));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idS);
     server.close();
     db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?)').run(id, idU, idL);
   }
