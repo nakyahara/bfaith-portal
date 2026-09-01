@@ -58,6 +58,22 @@
   .hdr-help[open] > summary::before { content: '▾ '; }   /* 開閉が見た目で分かるようにする */
   .hdr-help > summary:hover { color: #1d4ed8; text-decoration: underline; }
   .hdr-help p { margin: 6px 0 0; font-size: 12px; color: #64748b; }
+  /* 利益額・利益率 (2026-09-01 中原さん要望: 小さくて読み飛ばす)。売価を決めるときに
+     一番見る数字なので、原価・内訳の文字とは別格の大きさで出す */
+  .profit-figs { display: flex; gap: 20px; align-items: baseline; flex-wrap: wrap;
+                 margin-top: 6px; padding: 7px 12px; border: 1px solid #e2e8f0;
+                 border-radius: 8px; background: #f8fafc; }
+  .profit-figs.neg { background: #fef2f2; border-color: #fca5a5; }   /* 赤字は枠ごと赤 */
+  .profit-fig { display: flex; align-items: baseline; gap: 7px; }
+  .profit-fig .lbl { font-size: 11px; font-weight: 700; color: #64748b; }
+  .profit-fig .val { font-size: 24px; font-weight: 800; color: #0f172a; line-height: 1.15;
+                     font-variant-numeric: tabular-nums; }
+  .profit-fig .val.neg { color: #dc2626; }
+  /* SKU別売価の表の利益セル。色は class で切り替える (inline style を JS で消すと
+     ここの指定ごと消えてしまうため) */
+  .sku-profit { font-size: 14px; font-weight: 700; color: #0f172a; white-space: nowrap; }
+  .sku-profit.neg { color: #dc2626; }
+  .sku-profit.none { font-size: 12px; font-weight: 400; color: #94a3b8; }
 </style>
 <div class="wrap wide">
 
@@ -630,8 +646,13 @@
               <span class="muted"> — 送料 (配送方法からの自動算出値) が無いため利益計算できません</span>
             <% } else { %>
               <span class="ftag ftag-auto" style="margin-left:0">自動</span>
-              <span style="font-size:12px;">原価 <%= neCost.costExTax.toLocaleString() %>円<span class="muted"> (税抜・NE<%= neCost.source === 'members' ? '・全SKU共通' : '' %>)</span> — </span>
-              <span id="profit-sim-body" class="muted"></span>
+              <span style="font-size:12px;">原価 <%= neCost.costExTax.toLocaleString() %>円<span class="muted"> (税抜・NE<%= neCost.source === 'members' ? '・全SKU共通' : '' %>)</span></span>
+              <%# 利益額・利益率は大きく (2026-09-01 中原さん要望)。内訳は下に小さく添える %>
+              <div class="profit-figs" id="profit-sim-figs" hidden>
+                <div class="profit-fig"><span class="lbl">利益額</span><span class="val" id="profit-sim-amount">—</span></div>
+                <div class="profit-fig"><span class="lbl">利益率</span><span class="val" id="profit-sim-margin">—</span></div>
+              </div>
+              <div id="profit-sim-body" class="muted" style="font-size:11px; margin-top:4px;"></div>
             <% } %>
           </div>
         </div>
@@ -835,7 +856,8 @@
                              value="<%= skuPrices[mKey] != null ? skuPrices[mKey] : '' %>"
                              placeholder="<%= draft.price != null ? draft.price : '' %>">
                     </td>
-                    <td class="muted" style="font-size:12px;" id="sku-profit-<%= mi %>">—</td>
+                    <%# 利益は読み飛ばされないよう表の中でも一段大きく (2026-09-01 中原さん要望) %>
+                    <td class="sku-profit" id="sku-profit-<%= mi %>">—</td>
                   <% } %>
                   <td>
                     <% if (!isSelf) { %>
@@ -3078,18 +3100,32 @@
     const tax = Number(box.dataset.tax);
     const take = Number(box.dataset.take);
     const priceInput = document.getElementById('f-price');
+    // 利益額・利益率は大きい数字で別枠に出す (2026-09-01)。内訳と未入力メッセージは body 側
+    const figs = document.getElementById('profit-sim-figs');
+    const amountEl = document.getElementById('profit-sim-amount');
+    const marginEl = document.getElementById('profit-sim-margin');
     function render() {
       const price = Number(priceInput.value);
-      if (!Number.isFinite(price) || price <= 0) { body.textContent = '売価を入れると利益額・利益率が出ます'; return; }
+      if (!Number.isFinite(price) || price <= 0) {
+        if (figs) figs.hidden = true;
+        body.textContent = '売価を入れると利益額・利益率が出ます';
+        return;
+      }
       const costIncTax = cost * (1 + tax / 100);
       const profit = price * take - costIncTax - ship;
       const margin = (profit / price) * 100;
-      body.textContent = '利益額 ' + Math.round(profit).toLocaleString() + '円 / 利益率 ' + margin.toFixed(1) + '%'
-        + ' — 内訳: 手取り' + Math.round(price * take).toLocaleString()
+      const neg = profit < 0;
+      if (figs) {
+        figs.hidden = false;
+        figs.classList.toggle('neg', neg);
+        amountEl.textContent = Math.round(profit).toLocaleString() + '円';
+        marginEl.textContent = margin.toFixed(1) + '%';
+        amountEl.classList.toggle('neg', neg);
+        marginEl.classList.toggle('neg', neg);
+      }
+      body.textContent = '内訳: 手取り' + Math.round(price * take).toLocaleString()
         + ' − 税込原価' + Math.round(costIncTax).toLocaleString()
         + ' − 配送費' + Math.round(ship).toLocaleString();
-      body.style.color = profit < 0 ? '#dc2626' : '';
-      body.style.fontWeight = profit < 0 ? '600' : '';
     }
     priceInput.addEventListener('input', render);
     render();
@@ -3113,7 +3149,8 @@
         if (!Number.isFinite(price) || price <= 0 || cost == null || ship == null) {
           cell.textContent = '—';
           cell.title = cost == null ? 'NEに原価がありません' : (ship == null ? 'NEに送料がありません' : '売価を入れると利益が出ます');
-          cell.style.color = '';
+          cell.classList.remove('neg');
+          cell.classList.add('none');
           return;
         }
         const profit = price * take - cost * (1 + tax / 100) - ship;
@@ -3122,8 +3159,8 @@
         cell.title = '手取り' + Math.round(price * take).toLocaleString()
           + ' − 税込原価' + Math.round(cost * (1 + tax / 100)).toLocaleString()
           + ' − 配送費' + Math.round(ship).toLocaleString();
-        cell.style.color = profit < 0 ? '#dc2626' : '';
-        cell.style.fontWeight = profit < 0 ? '600' : '';
+        cell.classList.remove('none');
+        cell.classList.toggle('neg', profit < 0);
       }
       let last = input.value;
       // 保存はSKU単位の単一チェーンで直列化する (Codex R1 high: 素早く2回変更したとき

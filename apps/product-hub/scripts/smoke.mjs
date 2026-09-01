@@ -2678,11 +2678,22 @@ let wfSetParentId = null;
   {
     // 本流カードに画像 (TOP/詳細) の進捗が常時付く = ボードを行き来せずに読める (2重管理の解消)
     const card = b.columns.flatMap((c) => c.cards).find((x) => x.id === wfDraftId);
-    // 2026-08-31: TOP の工程は廃止したので、カードに出るのは詳細 (LP) の 10 点だけ
-    check('ボード: カードに詳細のステッパーが付く (v2 の 10 点・TOP は工程を持たない)',
-      card.image?.top?.steps?.length === 0 && card.image?.detail?.steps?.length === 10,
+    // 2026-08-31: TOP の工程は廃止。2026-09-01: TOP は「枠1 が登録されているか」でカードに出す
+    check('ボード: カードに詳細のステッパー (v2 の 10 点) と TOP の登録状況が付く',
+      card.image?.top?.registered === false && card.image?.detail?.steps?.length === 10,
       JSON.stringify(card.image || null).slice(0, 120));
 
+    // TOP は枠1 (sort=0) だけを見る = 出品ゲート imageTrackBlockReason と同じ判定。
+    // _01 だけ取り込まれた商品 (sort=1〜) を「済」にしてはいけない
+    db.prepare("INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'smoke-img-01', 1)").run(wfDraftId);
+    const cardOnly01 = wfp.boardData(db, {}).columns.flatMap((c) => c.cards).find((x) => x.id === wfDraftId);
+    check('ボード: 枠1 以外の画像だけでは TOP は「済」にしない',
+      cardOnly01.image?.top?.registered === false, JSON.stringify(cardOnly01.image?.top || null));
+    db.prepare("INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'smoke-img-top', 0)").run(wfDraftId);
+    const cardWithTop = wfp.boardData(db, {}).columns.flatMap((c) => c.cards).find((x) => x.id === wfDraftId);
+    check('ボード: 枠1 (_top) が登録されると TOP が「済」になる',
+      cardWithTop.image?.top?.registered === true, JSON.stringify(cardWithTop.image?.top || null));
+    db.prepare("DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id IN ('smoke-img-01','smoke-img-top')").run(wfDraftId);
   }
 
   // 画像ビュー: 列は商品詳細 (LP) の 10 段階。カードは 1 商品 1 枚 (2026-08-31 TOP工程の廃止)
@@ -5117,10 +5128,14 @@ for (const [name, file, data] of renders) {
 // ─── 確認中が画面に出ていること (2026-08-31 スタッフ要望の本体は「カードに表示」) ───
 {
   const bh = renderedHtml.get('board.ejs') || '';
-  // 廃止した TOP の行をカードに出さない (Codex R4 low)
-  check('ボード: カードに廃止した TOP の行を出さない',
-    !bh.includes('>TOP<'),
+  // 2026-09-01 中原さん要望: TOP画像 / 商品詳細画像 が 済 か まだ かをカードで読めること。
+  // TOP は工程を持たない (2026-08-31 廃止) ので、行の中身は画像の登録有無から作る
+  check('ボード: カードに TOP / 詳細 の行が出る',
+    bh.includes('>TOP<') && bh.includes('>詳細<'),
     (bh.match(/<span class="kb-kname">[^<]*<\/span>/g) || []).slice(0, 4).join(' ') || '(行が無い)');
+  check('ボード: 済 / まだ が状態バッジで出る',
+    /<span class="kb-state (done|todo|off)">(済|まだ|対象外|—)<\/span>/.test(bh),
+    (bh.match(/<span class="kb-state[^>]*>[^<]*<\/span>/g) || []).slice(0, 4).join(' ') || '(バッジが無い)');
   check('ボード: 確認中のカードに理由ラベルが出る',
     bh.includes('kb-checking') && bh.includes('🔍 確認中: パッケージ裏面の確認待ち'),
     bh.includes('kb-checking') ? 'ラベル文言が出ていない' : 'バッジ自体が無い');
