@@ -83,10 +83,14 @@ console.log('\n── 応答の解釈 ──');
   eq(classify({ status: 200, body: { state: 'noop' } }), 'noop', '200 noop');
   eq(classify({ status: 409, body: { state: 'conflict' } }), 'conflict', '409 conflict');
   eq(classify({ status: 409, body: { error: 'OPERATION_RESULT_UNKNOWN' } }), 'unknown', '結果不明');
-  eq(classify({ status: 409, body: { error: 'OPERATION_ID_REUSED' } }), 'failed', 'ID使い回しは失敗');
-  eq(classify({ status: 400, body: {} }), 'failed', '400 は失敗');
+  eq(classify({ status: 409, body: { error: 'OPERATION_ID_REUSED' } }), 'unexpected', '★ID使い回しは想定外 (採番が壊れている合図なので止める)');
+  eq(classify({ status: 400, body: { error: 'INVALID_PRICE' } }), 'failed', '意味の分かる 400 は失敗 (続行してよい)');
+  eq(classify({ status: 400, body: {} }), 'unexpected', '★理由の分からない 400 は想定外');
   eq(classify({ status: 502, body: {} }), 'unknown', '★502 は「不明」に倒す (成功にしない)');
-  eq(classify({ status: 200, body: { state: 'なにか' } }), 'failed', '★想定外の応答は成功にしない');
+  eq(classify({ status: 200, body: { state: 'なにか' } }), 'unexpected', '★未知の200は成功にしない (止める)');
+  eq(classify({ status: 500, body: {} }), 'unexpected', '500 は想定外');
+  eq(classify({ status: 401, body: {} }), 'unexpected', '401 も想定外');
+  eq(classify({ status: 404, body: { error: 'ITEM_NOT_FOUND' } }), 'failed', '商品が無いのは意味の分かる失敗');
 }
 
 console.log('\n── 試運転: 1件目が失敗したら残りを送らない ──');
@@ -173,6 +177,65 @@ console.log('\n── 同じ商品の SKU はまとめて1回で送る ──');
   eq(client.calls.length, 1, '★1リクエストにまとめる');
   eq(client.calls[0].body.prices, { s1: 620, s2: 630 }, '両SKUを1回で送る');
   eq(summary.applied, 2, '2行とも成功として数える');
+}
+
+console.log('\n── 同じ run は一度しか実行できない (二重クリック・複数インスタンス) ──');
+{
+  const run = makeRun(2);
+  const c1 = makeClient([]);
+  const first = await executeRun(db, run, { actor: 'a@example.com', client: c1, env: ENV_ON });
+  eq(first.summary.applied, 2, '1回目は実行できる');
+
+  const c2 = makeClient([]);
+  let err = null;
+  try { await executeRun(db, getRun(db, run.run_id), { actor: 'b@example.com', client: c2, env: ENV_ON }); }
+  catch (e) { err = e; }
+  ok(err?.code === 'ALREADY_EXECUTED', '★2回目は claim が取れず実行されない');
+  ok(String(err?.message).includes('a@example.com'), '誰が実行したか分かる');
+  eq(c2.calls.length, 0, '★楽天を1度も叩いていない (二重更新にならない)');
+}
+
+console.log('\n── 想定外の応答は試運転後でも即停止 ──');
+{
+  const run = makeRun(4);
+  const client = makeClient([
+    { status: 200, body: { state: 'applied' } },   // 試運転OK
+    { status: 500, body: { message: 'なにか' } },  // 想定外 → 即停止 (ブレーカーの2件を待たない)
+  ]);
+  const { summary } = await executeRun(db, run, { actor: 't', client, env: ENV_ON });
+  eq(client.calls.length, 2, '★想定外が返った時点で送信をやめる');
+  eq([summary.applied, summary.unknown, summary.skipped], [1, 1, 2], '1成功 / 1不明 / 2未送信');
+  ok(summary.stopped.includes('想定していない応答'), '止めた理由が想定外だと分かる');
+}
+
+console.log('\n── Yahoo は送らない (送信経路が楽天しか無いため) ──');
+{
+  const ops = [{
+    operationId: 'y1', mall: 'yahoo', neCode: 'ne-y', rowKind: 'single', listingCode: 'yahoo-item', skuCode: 'ys1',
+    confidence: 'confirmed', expectedCurrentPrice: 577, newPrice: 620, cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.1,
+    initialState: 'previewed',
+  }];
+  const runId = insertRun(db, { createdBy: 't', neCodes: ['ne-y'], limits: {}, operations: ops });
+  const client = makeClient([]);
+  const { summary, results } = await executeRun(db, getRun(db, runId), {
+    actor: 't', client, env: { PRICE_UPDATE_RAKUTEN_ENABLED: '1', PRICE_UPDATE_YAHOO_ENABLED: '1' },
+  });
+  eq(client.calls.length, 0, '★Yahoo の出品コードを楽天の管理番号として送らない');
+  eq(summary.skipped, 1, 'skipped として記録');
+  ok(results[0].reason.includes('送信経路がありません'), '理由が分かる');
+  eq(mallWriteEnabled('yahoo', { PRICE_UPDATE_YAHOO_ENABLED: '1' }).enabled, false, 'env を立てても Yahoo は無効');
+}
+
+console.log('\n── noop も確認できたときだけ確定する ──');
+{
+  const run = makeRun(2);
+  const plan = [{ status: 200, body: { state: 'noop', reason: '同価格' } }];
+  plan.verifyAs = 999;   // 取り直したら違う価格だった
+  const client = makeClient(plan);
+  const { summary } = await executeRun(db, run, { actor: 't', client, env: ENV_ON });
+  eq(summary.noop, 0, '★確認が通らなければ noop で確定させない');
+  eq(summary.failed, 1, '一致しないので failed');
+  ok(summary.stopped.includes('確認'), '止めた理由が確認の不一致だと分かる');
 }
 
 console.log('\n── 状態はイベントとして残る (行は書き換えない) ──');

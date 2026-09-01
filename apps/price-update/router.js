@@ -15,7 +15,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { loadDimMall } from '../../lib/dim-mall.js';
-import { getDB, insertRun, appendEvent, getRun, listRuns, newId } from './db.js';
+import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim } from './db.js';
 import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
 import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot } from './live-price.js';
 import { evaluateRow, runLimits } from './pricing.js';
@@ -60,6 +60,20 @@ function actorOf(req) {
 function isAdmin(req) {
   return req.session?.role === 'admin';
 }
+/**
+ * 実行できる人か (要件⑨: 実行は中原さん + 奥様の2名)。
+ * ★画面でボタンを隠すだけでは防御にならない。API を直接叩かれてもここで止める。
+ * env PRICE_UPDATE_EXECUTORS にメールを並べて指定する (カンマ区切り)。
+ * 未設定なら admin だけ (fail-closed。「誰でも実行できる」状態を作らない)。
+ */
+function canExecute(req) {
+  const list = String(process.env.PRICE_UPDATE_EXECUTORS || '')
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  const email = String(req.session?.email || '').toLowerCase();
+  if (list.length === 0) return req.session?.role === 'admin';
+  return list.includes(email) || req.session?.role === 'admin';
+}
+
 function apiError(res, e, where) {
   if (e?.code === 'VALIDATION') return res.status(400).json({ ok: false, error: e.message });
   console.error(`[price-update] ${where}:`, e);
@@ -433,6 +447,12 @@ router.post('/api/runs', (req, res) => {
 router.post('/api/runs/:runId/execute', async (req, res) => {
   try {
     const db = getDB();
+    if (!canExecute(req)) {
+      return res.status(403).json({
+        ok: false, error: 'forbidden',
+        message: '価格を実際に更新できるのは、実行権限のある人だけです (PRICE_UPDATE_EXECUTORS)',
+      });
+    }
     const run = getRun(db, req.params.runId);
     if (!run) throw validationError('履歴が見つかりません');
     if (String(req.body?.confirm || '') !== '実行する') {
@@ -456,6 +476,7 @@ router.post('/api/runs/:runId/execute', async (req, res) => {
     });
     res.json({ ok: true, ...out });
   } catch (e) {
+    if (e?.code === 'ALREADY_EXECUTED') return res.status(409).json({ ok: false, error: 'already_executed', message: e.message });
     apiError(res, e, 'execute-run');
   }
 });
@@ -470,6 +491,8 @@ router.get('/api/runs/:runId/executable', (req, res) => {
     res.json({
       ok: true,
       targets: targets.length,
+      canExecute: canExecute(req),
+      claim: runClaim(getDB(), run.run_id),   // 既に実行済みならここに誰がいつ実行したかが入る
       gates: Object.fromEntries(malls.map((m) => [m, mallWriteEnabled(m)])),
     });
   } catch (e) {

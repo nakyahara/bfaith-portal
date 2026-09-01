@@ -105,6 +105,17 @@ export function createTables(db) {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_pu_events_op ON pu_events(run_id, operation_id, seq)');
 
+  // ★実行の claim (M2)。1つの run は一度しか実行できない。
+  // 二重クリック・ブラウザの再送・複数インスタンスからの同時要求で同じ行を2回送らないよう、
+  // 送信の前に**DB で**取る (プロセス内のロックでは複数インスタンスに効かない)。
+  // 一度取った claim は返さない: 途中で止まった run の残りを送りたい時は、
+  // 新しい run を作り直す (「送られたか不明」な行をもう一度送らないため)
+  db.exec(`CREATE TABLE IF NOT EXISTS pu_run_claims (
+    run_id     TEXT PRIMARY KEY,
+    claimed_by TEXT NOT NULL,
+    claimed_at TEXT NOT NULL
+  )`);
+
   // ★append-only を DB 側で強制する (Codex R1 Critical)。
   // 「UPDATE/DELETE を書かない」という規約だけでは、保守スクリプトや SQL コンソールから
   // 監査根拠を書き換えられてしまい、「構造で保証する」と言えない。
@@ -217,6 +228,24 @@ export function currentStates(db, runId) {
     if (STATES.includes(e.event)) state.set(e.operation_id, e.event);
   }
   return state;
+}
+
+/**
+ * 実行の claim を取る (原子的)。取れなければ誰が先に取ったかを返す。
+ * @returns {{acquired:true} | {acquired:false, claimedBy:string, claimedAt:string}}
+ */
+export function claimRun(db, runId, actor) {
+  const info = db.prepare(`INSERT INTO pu_run_claims (run_id, claimed_by, claimed_at)
+      VALUES (?,?,?) ON CONFLICT(run_id) DO NOTHING`)
+    .run(runId, actor, new Date().toISOString());
+  if (info.changes === 1) return { acquired: true };
+  const row = db.prepare('SELECT claimed_by, claimed_at FROM pu_run_claims WHERE run_id = ?').get(runId);
+  return { acquired: false, claimedBy: row?.claimed_by || '不明', claimedAt: row?.claimed_at || '不明' };
+}
+
+/** claim の状態 (画面が実行ボタンを出すかの判断に使う) */
+export function runClaim(db, runId) {
+  return db.prepare('SELECT claimed_by, claimed_at FROM pu_run_claims WHERE run_id = ?').get(runId) || null;
 }
 
 export function getRun(db, runId) {
