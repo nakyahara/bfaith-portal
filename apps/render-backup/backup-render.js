@@ -93,6 +93,7 @@ const TARGETS = [
   { key: 'mercari-settings', file: 'mercari-settings.db', mode: 'vacuum', required: false, sentinels: [] },
   { key: 'easy-ship', file: 'easy-ship.db', mode: 'vacuum', required: false, sentinels: ['es_package_size_master'] },
   { key: 'shohyo-links', file: 'shohyo-links.db', mode: 'vacuum', required: false, sentinels: ['vendor_links'] },
+  { key: 'staff', file: 'staff.db', mode: 'vacuum', required: false, sentinels: ['staff'] },
   { key: 'users', file: 'users.json', mode: 'file', required: true, sentinels: [] },
 ];
 

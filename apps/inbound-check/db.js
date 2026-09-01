@@ -13,6 +13,7 @@
  */
 import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { listTapCandidates, getStaffByNo, tapName } from '../staff/db.js';
 import { parseInboundCsv } from './csv.js';
 
 const utcNow = () => new Date().toISOString();
@@ -130,13 +131,19 @@ export function createTables(db = getMirrorDB()) {
       revoked_at   TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS f_inbound_check_workers (
-      code   TEXT PRIMARY KEY,
-      name   TEXT NOT NULL,
-      sort   INTEGER NOT NULL DEFAULT 0,
-      active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1))
-    );
   `);
+  // 作業者表は PR1 (#1055) で作ったが、スタッフマスタ (apps/staff) に一本化したので廃止。
+  // 無条件 DROP はしない (Codex R4 High): 行が 0 のときだけ落とす。誰かが先に登録していたら表を残して警告
+  // (その名前はスタッフマスタに手で登録してから、この表を手動で落とす)
+  const legacy = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_inbound_check_workers'").get();
+  if (legacy) {
+    const n = db.prepare('SELECT COUNT(*) c FROM f_inbound_check_workers').get().c;
+    if (n === 0) db.exec('DROP TABLE f_inbound_check_workers');
+    else console.warn(`[inbound-check] 旧 f_inbound_check_workers に ${n} 行あるため DROP しません (スタッフマスタへ移してから手動で削除)`);
+  }
+  // 確認イベントに staff_id (スタッフマスタの id) を後付け。worker (表示名) は従来どおり残す
+  const cols = db.prepare('PRAGMA table_info(f_inbound_check_events)').all().map(c => c.name);
+  if (!cols.includes('staff_id')) db.exec('ALTER TABLE f_inbound_check_events ADD COLUMN staff_id INTEGER');
 }
 
 // ───────────────────────── 端末 (iPad) ─────────────────────────
@@ -171,33 +178,19 @@ export function listDevices() {
   return getDB().prepare('SELECT id, label, created_by, created_at, last_seen_at, revoked_at FROM f_inbound_check_devices ORDER BY id').all();
 }
 
-// ───────────────────────── 作業者 (名前タップ) ─────────────────────────
+// ───────────────────────── 作業者 (名前タップ) = スタッフマスタ (apps/staff) を参照 ─────────────────────────
+// 自前の作業者表は持たない (2026-09-01 中原さん方針: 「人」の正本は staff.db に1つ)。
+// 名前タップの候補 = 有効なスタッフ。code = staff_no (スタッフ管理番号)、name = 短い表記 (無ければ正式表記)
 
-export function listWorkers(includeInactive = false) {
-  return getDB().prepare(`SELECT code, name, sort, active FROM f_inbound_check_workers ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY sort, code`).all();
+export function listWorkers() {
+  return listTapCandidates().map(c => ({ code: c.staff_no, name: c.name, staff_id: c.staff_id, sort: c.sort }));
 }
 
+/** staff_no → {code, name, staff_id, active}。無ければ null */
 export function getWorker(code) {
-  return getDB().prepare('SELECT code, name, sort, active FROM f_inbound_check_workers WHERE code = ?').get(String(code || ''));
-}
-
-export function addWorker(name) {
-  const n = String(name || '').trim();
-  if (!n || n.length > 20) throw new Error('作業者名は1〜20文字');
-  const db = getDB();
-  // 採番と INSERT を immediate tx で直列化 (同時追加で同じコードになるのを防ぐ — Codex R3 Low)
-  return db.transaction(() => {
-    const dup = db.prepare('SELECT code FROM f_inbound_check_workers WHERE name = ?').get(n);
-    if (dup) throw new Error('同じ名前の作業者が既にいます');
-    const max = db.prepare('SELECT MAX(sort) m FROM f_inbound_check_workers').get().m || 0;
-    const code = 'w' + String(max + 1).padStart(2, '0');
-    db.prepare('INSERT INTO f_inbound_check_workers (code, name, sort, active) VALUES (?, ?, ?, 1)').run(code, n, max + 1);
-    return { code, name: n };
-  }).immediate();
-}
-
-export function setWorkerActive(code, active) {
-  return getDB().prepare('UPDATE f_inbound_check_workers SET active = ? WHERE code = ?').run(active ? 1 : 0, String(code)).changes > 0;
+  const s = getStaffByNo(code);
+  if (!s) return null;
+  return { code: s.staff_no, name: tapName(s), staff_id: s.id, active: s.active };
 }
 
 // ───────────────────────── 取込 ─────────────────────────
@@ -435,7 +428,7 @@ function currentState(db, batchId, lineKey) {
  * 1タップ確認 / 取消。
  * @returns {ok:true, state} | {ok:false, error:'stale_batch'|'not_found'|'conflict'|'bad_request', current?}
  */
-export function applyCheck({ batchId, lineKey, action, expectVersion, worker, deviceId = null, deviceLabel = null }) {
+export function applyCheck({ batchId, lineKey, action, expectVersion, worker, staffId = null, deviceId = null, deviceLabel = null }) {
   if (!['check', 'uncheck'].includes(action)) return { ok: false, error: 'bad_request', message: 'action が不正です' };
   const bid = Number(batchId);
   if (!Number.isInteger(bid) || !lineKey) return { ok: false, error: 'bad_request', message: 'batch_id / line_key が不正です' };
@@ -470,8 +463,8 @@ export function applyCheck({ batchId, lineKey, action, expectVersion, worker, de
       const last = db.prepare(`SELECT id FROM f_inbound_check_events WHERE batch_id = ? AND line_key = ? AND action = 'check' ORDER BY id DESC LIMIT 1`).get(bid, lineKey);
       reverted = last ? last.id : null;
     }
-    db.prepare(`INSERT INTO f_inbound_check_events (batch_id, line_key, ar_no, action, worker, device_id, device_label, created_at, reverted_event_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(bid, lineKey, line.ar_no, action, w, deviceId, deviceLabel, now, reverted);
+    db.prepare(`INSERT INTO f_inbound_check_events (batch_id, line_key, ar_no, action, worker, staff_id, device_id, device_label, created_at, reverted_event_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(bid, lineKey, line.ar_no, action, w, staffId, deviceId, deviceLabel, now, reverted);
     return { ok: true, state: currentState(db, bid, lineKey) };
   });
   return tx.immediate();

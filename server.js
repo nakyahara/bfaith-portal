@@ -54,6 +54,7 @@ import giftsetAssemblyRouter from './apps/giftset-assembly/router.js';
 import inboundInfoRouter from './apps/inbound-info/router.js';
 import { startInboundInfoCron } from './apps/inbound-info/sync-job.js';
 import inboundCheckRouter from './apps/inbound-check/router.js';
+import staffRouter from './apps/staff/router.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
 import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorkerRouter } from './apps/packing-dispatch/router.js';
 import packingDispatchRuleChangeApiRouter from './apps/packing-dispatch/rule-change-api.js';
@@ -730,6 +731,15 @@ const apps = [
     category: 'shipping',
   },
   {
+    id: 'staff',
+    name: 'スタッフマスタ',
+    description: '「人」の正本 (スタッフ管理番号・名前・区分・入社/退職)。各アプリの名前タップはここから引く。将来の勤怠・シフトの親 (管理者のみ)',
+    icon: '👥',
+    path: '/apps/staff/',
+    status: 'active',
+    category: 'data',
+  },
+  {
     id: 'giftset-assembly',
     name: 'ギフトセット組み依頼',
     description: '構成品のピッキング表(ロジザード貼り付け)と子会社Notionの作業カードを発行',
@@ -1341,6 +1351,8 @@ app.use('/apps/inbound-info', requireAppAccess('inbound-info'), express.json({ l
 // 入荷受付チェック (iPad): picking と同じく requireAppAccess を掛けない (登録端末Cookie を通すため)。
 // 認可は router 内 (セッション or 端末Cookie。管理系はセッション必須・端末登録等は admin)
 app.use('/apps/inbound-check', express.json({ limit: '256kb' }), inboundCheckRouter);
+// スタッフマスタ (staff.db): 管理画面/API は router 内で管理者限定。/export だけトークン認証 (miniPC 同期用)
+app.use('/apps/staff', express.json({ limit: '256kb' }), staffRouter);
 // MF仕訳用 証憑リンク集 (apps/shohyo-links): 専用DB shohyo-links.db (DATA_DIR)。Notion「支払い関係リンク先」の移行先
 // limit 8mb = MF照合画面の証憑添付 (MFの上限5MBファイル → base64で約6.7MB) を受けるため
 app.use('/apps/shohyo-links', requireAppAccess('shohyo-links'), express.json({ limit: '8mb' }), shohyoLinksRouter);

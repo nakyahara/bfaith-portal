@@ -135,25 +135,21 @@
       </table>
     </div>
 
+    <% } %>
+
     <div class="ic-box">
-      <h2>👤 作業者 (作業画面で名前タップで選ぶリスト)</h2>
-      <div class="row" style="margin-bottom:10px">
-        <input type="text" id="workerName" placeholder="作業者名 (例: 山田)" maxlength="20">
-        <button id="addWorkerBtn" type="button">追加</button>
-        <span id="workerMsg" class="msg"></span>
-      </div>
+      <h2>👤 作業者 (作業画面で名前タップで選ぶリスト) = スタッフマスタ</h2>
+      <p class="hint">名前の追加・無効化は <a href="/apps/staff/">👥 スタッフマスタ</a> (管理者) で行います。ここでは有効なスタッフを表示するだけです。</p>
       <table class="ic-list">
-        <thead><tr><th>コード</th><th>名前</th><th></th></tr></thead>
+        <thead><tr><th>管理番号</th><th>名前 (タップ表記)</th></tr></thead>
         <tbody>
           <% for (const w of workers) { %>
-            <tr class="<%= w.active ? '' : 'inactive' %>"><td><%= w.code %></td><td><%= w.name %></td>
-              <td><button class="btn-sm btn-worker" data-code="<%= w.code %>" data-active="<%= w.active ? 0 : 1 %>"><%= w.active ? '無効にする' : '有効にする' %></button></td></tr>
+            <tr><td><%= w.code %></td><td><%= w.name %></td></tr>
           <% } %>
-          <% if (workers.length === 0) { %><tr><td colspan="3" style="color:#868e96">まだ登録がありません</td></tr><% } %>
+          <% if (workers.length === 0) { %><tr><td colspan="2" style="color:#868e96">有効なスタッフがいません (スタッフマスタで登録してください)</td></tr><% } %>
         </tbody>
       </table>
     </div>
-    <% } %>
   </div>
 
   <script>
