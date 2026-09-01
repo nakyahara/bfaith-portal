@@ -431,6 +431,9 @@ try {
     const IPAD = jar();
     let r2 = await req(IPAD, `${APP}/`);
     ok(r2.status === 302 && /\/apps\/inbound-check\/enroll/.test(r2.location || ''), '未登録の端末は登録画面へ (ログイン画面ではない)');
+  // 手順書は登録前の iPad からこそ読まれるページ。認証なしで 200 を返すこと
+  r = await req(null, `${APP}/guide`);
+  ok(r.status === 200 && r.text.includes('入荷受付チェックの使い方') && r.text.includes('数量を数える'), '手順書 /guide は未認証でも読める');
     r2 = await req(IPAD, `${APP}/enroll`);
     ok(r2.status === 200 && r2.text.includes('6桁の登録コード'), '登録画面はログイン不要で開ける');
     // 管理者が PC でコードを発行

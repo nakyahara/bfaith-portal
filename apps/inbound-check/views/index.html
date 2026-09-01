@@ -152,6 +152,19 @@
     .qpanel .acts button.short { border-color: #e8590c; color: #e8590c; font-weight: 700; }
     .qpanel .qmsg { font-size: 0.9em; margin-top: 8px; }
     .qpanel .qmsg.err { color: #c92a2a; }
+    .qpanel .quick { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+    .qpanel .quick .btn-plus { min-height: 58px; min-width: 150px; font-size: 1.05em; }
+    .qpanel .qhint { font-size: 0.8em; color: #868e96; }
+    .qgroup { border: 1px dashed #ced4da; border-radius: 10px; padding: 12px; margin-bottom: 6px; }
+    .qgroup-t { font-size: 0.8em; font-weight: 700; color: #868e96; margin-bottom: 8px; }
+    .qpanel .unit label { font-size: 0.85em; color: #495057; font-weight: 600; }
+    .qpanel .qeq { font-size: 0.95em; }
+    .qpanel .qeq b, .qsum b { color: #1864ab; font-size: 1.2em; }
+    .qsum { background: #e7f5ff; border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 1em; }
+    .qsum small { color: #868e96; }
+    .qpanel .acts button.add { background: #1c7ed6; border-color: #1c7ed6; color: #fff; font-weight: 700; min-width: 150px; }
+    .qpanel .acts button.add:disabled { opacity: 0.45; }
+    .qpanel .note { font-size: 0.85em; color: #868e96; margin-top: 8px; line-height: 1.6; }
 
     .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 50; align-items: center; justify-content: center; }
     .overlay.on { display: flex; }
@@ -216,9 +229,9 @@
     </div>
   </div>
   <div class="banner" id="banner"></div>
-  <div class="legend">凡例: 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り<br><b>[＋1箱]</b> = 箱を1つ開けるたびに1タップ ／ <b>[全部あり]</b> = 予定数が全部そろった ／ 行をタップすると<b>数量パネル</b>が開き、箱数をまとめて入れたり、入数を直したり、不足のまま確定できます</div>
+  <div class="legend">凡例: 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り<br><b>[数量を数える]</b> = 箱数やバラを入れる (＋1箱もここ) ／ <b>[全部あり]</b> = 予定数が全部そろった ／ 商品名をタップすると入数やいろはの設定を直せます ／ <a href="/apps/inbound-check/guide">📖 くわしい使い方</a></div>
   <div class="wrap" id="list"></div>
-  <div class="foot"><a href="/apps/inbound-check/admin">管理画面 (取込・端末)</a> ・ <a href="/">ポータル</a></div>
+  <div class="foot"><a href="/apps/inbound-check/guide">📖 使い方</a> ・ <a href="/apps/inbound-check/admin">管理画面 (取込・端末)</a> ・ <a href="/">ポータル</a></div>
 
   <datalist id="dl-bc"><option value="BCシール貼付必要"><option value="不要"></datalist>
   <datalist id="dl-pick"><option value="直接ピックロケ"></datalist>
@@ -264,7 +277,9 @@
     let query = '';
     let lastJson = '';
     const collapsed = new Set();
-    const openLines = new Set();   // 詳細を開いている明細 (再描画をまたいで保つ)
+    // 開いているパネル (再描画をまたいで保つ)。'info' = 入庫情報 / 'qty' = 数量を数える
+    //   (2026-09-02 中原さん: 行タップは入数などの情報だけ、数量は [数量を数える] で別に開く)
+    const openMode = new Map();
     let pollTimer = null;
     // 入力中は再描画しない。5秒ポーリングの再描画で打ちかけの入数が消えるのを防ぐ
     let editDirty = false;
@@ -354,11 +369,11 @@
       return '<button type="button" class="btn-main" data-act="exact">確認</button>';
     }
 
-    // ⭐箱を1つ開けるたびに1タップ。入数が未登録なら「なぜ押せないか」ではなく**次の行動**を出す
+    // ⭐[数量を数える] で数量パネルを開く。＋1箱 はパネルの中に移した
+    //   (2026-09-02 中原さん: 「+1箱っていうやつより、数量を数えるっていうものにして」)
     function plusBtnHtml(l) {
       if (l.check_status === 'checked') return '';
-      if (!l.pack_qty) return '<button type="button" class="btn-plus setup" data-act="setpack">入数を設定</button>';
-      return '<button type="button" class="btn-plus" data-act="plus">＋1箱 (' + l.pack_qty + '個)</button>';
+      return '<button type="button" class="btn-plus" data-act="count">🔢 数量を数える</button>';
     }
 
     function sendingHtml(l) {
@@ -399,7 +414,7 @@
 
     // 詳細パネルの打ちかけの値を控える / 描き直したあとに戻す。
     // 5秒ポーリングや他の行の消し込みで再描画が走っても、入力中の入数が消えないようにする
-    // ⚠詳細は複数行を同時に開ける (openLines) ので、開いている行を全部控える。
+    // ⚠詳細は複数行を同時に開ける (openMode) ので、開いている行を全部控える。
     //   最初の1行しか見ないと、2行目以降の打ちかけが再描画で消える
     function captureDraft() {
       if (!editDirty) return null;
@@ -512,7 +527,7 @@
     function lineHtml(l) {
       const checked = l.check_status === 'checked';
       const partial = !checked && l.found_qty > 0;   // 「一部」は status ではなく found_qty から導出する
-      const open = openLines.has(l.line_key);
+      const open = openMode.has(l.line_key);
       const busy = sending.get(l.line_key);
       return '<div class="row' + (checked ? ' checked' : '') + (partial ? ' partial' : '') + (open ? ' open' : '')
         + (busy && busy.kind === 'sending' ? ' pending' : '') + '" data-key="' + esc(l.line_key) + '" data-version="' + l.version + '">'
@@ -531,52 +546,88 @@
         + '</div>';
     }
 
-    // 詳細 = 数量パネル (上) + 入庫情報の編集 (下)
-    function detailHtml(l) { return qpanelHtml(l) + detailInfoHtml(l); }
+    // 行タップ = 入庫情報 / [数量を数える] = 数量パネル。別々に開く (混ぜると縦に長くなって数が見えない)
+    function detailHtml(l) { return openMode.get(l.line_key) === 'qty' ? qpanelHtml(l) : detailInfoHtml(l); }
 
-    // ─────────── 数量パネル (行の中にインライン展開する) ───────────
-    // ⚠モーダルにしない。商品と一覧上の位置を見失うと、別の商品の行に入力する事故が増える
+    // ─────────── 数量パネル ───────────
+    // ⚠モーダルにしない。商品と一覧上の位置を見失うと、別の商品の行に入力する事故が増える。
+    // ⭐行タップ = 入庫情報 (入数・いろは等) / [数量を数える] = 数量、と**別々に開く**。
+    //   1つのアコーディオンに両方入れると、数を入れたいだけなのに設定項目まで出てきて長くなる
     function qdraft(l) {
       let d = qdrafts.get(l.line_key);
-      if (!d) { d = { pack: l.pack_qty || '', boxes: 1, loose: '' }; qdrafts.set(l.line_key, d); }
-      if (!d.pack && l.pack_qty) d.pack = l.pack_qty;
+      if (!d) { d = { pack: '', boxes: '', loose: '' }; qdrafts.set(l.line_key, d); }
+      // 入数は**自動で入れる** (この検品で使っている値 → 無ければ入庫情報のマスタ値)
+      if (d.pack === '' && l.pack_qty) d.pack = String(l.pack_qty);
       return d;
+    }
+
+    /** 打ちかけの入力から「今回足す数」を出す。箱とバラの両方を1回でまとめて足せる */
+    function qcalc(l) {
+      const d = qdraft(l);
+      const pack = Number(d.pack), boxes = Number(d.boxes), loose = Number(d.loose);
+      const boxQty = (Number.isInteger(pack) && pack > 0 && Number.isInteger(boxes) && boxes > 0) ? pack * boxes : 0;
+      const looseQty = (Number.isInteger(loose) && loose > 0) ? loose : 0;
+      return { pack, boxes, loose, boxQty, looseQty, total: boxQty + looseQty };
+    }
+
+    /** 「今回 +N個 → 保存後 M / 予定」。打つたびに書き換える (再描画するとフォーカスが飛ぶため) */
+    function qsumText(l) {
+      const c = qcalc(l);
+      const after = l.found_qty + c.total;
+      const rel = after < l.planned_qty ? 'あと ' + (l.planned_qty - after) + '個'
+        : after > l.planned_qty ? (after - l.planned_qty) + '個 多い' : '揃います';
+      return { add: c.total, html: '今回 <b>+' + c.total + '</b> 個 → 保存後 <b>' + after + '</b> / ' + l.planned_qty + ' 個 <small>' + rel + '</small>' };
     }
 
     function qpanelHtml(l) {
       if (l.check_status === 'checked') {
-        return '<div class="qpanel"><h4>数量</h4><div class="now"><b>' + l.found_qty + '</b> / ' + l.planned_qty + ' 個 で確認済み'
-          + '</div><div class="fld"><div class="note">数を直すには、右の「確認済み」を押して<b>やり直す</b>と編集できるようになります</div></div></div>';
+        return '<div class="qpanel"><h4>数量</h4><div class="now"><b>' + l.found_qty + '</b> / ' + l.planned_qty + ' 個 で確認済み</div>'
+          + '<div class="note">数を直すには、右の「確認済み」を押して<b>やり直す</b>と編集できるようになります</div></div>';
       }
       const d = qdraft(l);
       const hist = qhist.get(l.line_key);
       const rest = l.planned_qty - l.found_qty;
+      const sum = qsumText(l);
       const p = [];
-      p.push('<div class="qpanel"><h4>数量を記録</h4>');
+      p.push('<div class="qpanel"><h4>数量を数える</h4>');
       p.push('<div class="now">いま <b>' + l.found_qty + '</b> / ' + l.planned_qty + ' 個'
         + (rest > 0 ? ' ・ あと ' + rest + '個' : rest < 0 ? ' ・ ' + (-rest) + '個 多い' : ' ・ 揃いました') + '</div>');
-      // 今から数える箱の入数。**すでに数えた箱の入数は変わらない** (訂正は履歴側から行う)
-      p.push('<div class="unit"><label>今から数える箱の入数</label>'
+
+      // 箱を1つ開けるたびの1タップ (入数が分かっているときだけ)
+      if (l.pack_qty) {
+        p.push('<div class="quick"><button type="button" class="btn-plus" data-act="plus">＋1箱 (' + l.pack_qty + '個)</button>'
+          + '<span class="qhint">箱を1つ開けるたびに1タップ</span></div>');
+      }
+
+      // まとめて入れる。**箱とバラを1回で足せる**ようにし、足す前に合計を見せる
+      p.push('<div class="qgroup"><div class="qgroup-t">まとめて入れる</div>');
+      p.push('<div class="unit"><label>入数</label>'
         + '<input type="number" inputmode="numeric" min="1" step="1" data-q="pack" value="' + esc(d.pack) + '" placeholder="例 10">'
-        + '<span style="font-size:0.85em;color:#868e96">個入り ・ すでに数えた箱の入数は変わりません</span></div>');
-      p.push('<div class="stepper"><button type="button" data-q="dec">−</button>'
-        + '<input type="number" inputmode="numeric" min="1" step="1" data-q="boxes" value="' + esc(d.boxes) + '">'
-        + '<button type="button" data-q="inc">＋</button>'
-        + '<span style="font-size:0.95em">箱 = <b>' + (Number(d.pack) > 0 && Number(d.boxes) > 0 ? Number(d.pack) * Number(d.boxes) : 0) + '</b> 個</span>'
-        + '<button type="button" class="btn-plus" data-act="addboxes" style="min-height:64px">この箱数を足す</button></div>');
-      p.push('<div class="unit" style="margin-top:12px"><label>バラ</label>'
-        + '<input type="number" inputmode="numeric" min="1" step="1" data-q="loose" value="' + esc(d.loose) + '" placeholder="個数">'
-        + '<button type="button" class="btn-plus" data-act="addloose">バラを足す</button></div>');
+        + '<span>個入り ×</span>'
+        + '<label>箱数</label>'
+        + '<div class="stepper"><button type="button" data-q="dec">−</button>'
+        + '<input type="number" inputmode="numeric" min="0" step="1" data-q="boxes" value="' + esc(d.boxes) + '" placeholder="0">'
+        + '<button type="button" data-q="inc">＋</button></div>'
+        + '<span class="qeq">= <b data-qbox>' + qcalc(l).boxQty + '</b> 個</span></div>');
+      p.push('<div class="unit"><label>バラ</label>'
+        + '<input type="number" inputmode="numeric" min="0" step="1" data-q="loose" value="' + esc(d.loose) + '" placeholder="0">'
+        + '<span>個</span></div>');
+      p.push('<div class="qsum" data-qsum>' + sum.html + '</div>');
+      p.push('<div class="acts"><button type="button" class="add" data-act="addall"' + (sum.add > 0 ? '' : ' disabled') + ' data-qadd>この分を足す</button>'
+        + '<button type="button" data-act="qclear">入力を消す</button></div>');
+      if (!l.pack_qty) p.push('<div class="note">この商品は<b>1箱の入り数がまだ登録されていません</b>。実物を見て入数を入れてください (今回の検品にだけ使い、商品マスタには書きません)</div>');
+      p.push('</div>');
 
       // 数えた記録 (訂正・打ち消しはここから)
       p.push('<div class="hist"><h4>数えた記録</h4>');
-      if (!hist) p.push('<div style="color:#868e96;font-size:0.9em">読み込み中…</div>');
-      else if (hist.length === 0) p.push('<div style="color:#868e96;font-size:0.9em">まだありません</div>');
+      if (!hist) p.push('<div class="note">読み込み中…</div>');
+      else if (hist.length === 0) p.push('<div class="note">まだありません</div>');
       else {
         for (const e of hist) {
           if (e.action === 'reversal') continue;
           const label = e.unit_size ? e.unit_size + '個入り × ' + Math.round(e.quantity / e.unit_size) + '箱 = ' + e.quantity + '個'
-            : e.quantity + '個' + (e.input_kind === 'fill_remaining' ? ' (残りをまとめて)' : e.input_kind === 'backfill' ? ' (以前の確認から)' : '');
+            : (e.input_kind === 'loose' ? 'バラ ' + e.quantity + '個'
+              : e.quantity + '個' + (e.input_kind === 'fill_remaining' ? ' (残りをまとめて)' : e.input_kind === 'backfill' ? ' (以前の確認から)' : ''));
           p.push('<div class="h' + (e.reversed ? ' rev' : '') + '">' + esc(label)
             + ' <span class="who">' + esc(e.worker || '') + '</span>'
             + (e.reversed ? '' : '<button type="button" data-act="undoev" data-seq="' + e.event_seq + '">取り消す</button>'
@@ -591,6 +642,17 @@
       }
       p.push('<div class="qmsg" data-qmsg></div></div>');
       return p.join('');
+    }
+
+    /** 打つたびに「= N個」と「今回 +N個 → 保存後 …」だけを書き換える (再描画しない = フォーカスが飛ばない) */
+    function refreshQsum(row, l) {
+      const c = qcalc(l), sum = qsumText(l);
+      const box = row.querySelector('[data-qbox]');
+      if (box) box.textContent = String(c.boxQty);
+      const s = row.querySelector('[data-qsum]');
+      if (s) s.innerHTML = sum.html;
+      const btn = row.querySelector('[data-qadd]');
+      if (btn) btn.disabled = sum.add <= 0;
     }
 
     // 詳細パネル: 入庫情報 (入数・いろは・BCシール・直ピック・荷姿・memo) をその場で直す。
@@ -742,7 +804,7 @@
         if (res.json.ok) {
           applyQtyState(line, res.json.state);
           qhist.delete(key);            // 履歴は開き直したときに取り直す
-          if (openLines.has(key)) loadHist(key);
+          if (openMode.get(key) === 'qty') loadHist(key);
           banner(null);
           lastJson = '';
         } else {
@@ -1150,7 +1212,7 @@
         const f = findLine(q);
         if (!f) return;
         const d = qdraft(f.line);
-        d.boxes = Math.max(1, (Number(d.boxes) || 0) + (kind === 'inc' ? 1 : -1));
+        d.boxes = String(Math.max(0, (Number(d.boxes) || 0) + (kind === 'inc' ? 1 : -1)));
         render(true);
         return;
       }
@@ -1167,25 +1229,28 @@
         sendQuantity(line, [boxEvent(line.pack_qty, line.pack_qty)]);
         return;
       }
-      if (act === 'setpack') {
-        openLines.add(line.line_key); loadHist(line.line_key); render(true);
+      if (act === 'count') {
+        if (openMode.get(line.line_key) === 'qty') openMode.delete(line.line_key);
+        else { openMode.set(line.line_key, 'qty'); loadHist(line.line_key); }
+        render(true);
         return;
       }
-      if (act === 'addboxes') {
-        const d = qdraft(line);
-        const pack = Number(d.pack), boxes = Number(d.boxes);
-        if (!Number.isInteger(pack) || pack <= 0) return qmsg(row, '入数を1以上の整数で入れてください');
-        if (!Number.isInteger(boxes) || boxes <= 0) return qmsg(row, '箱数を1以上の整数で入れてください');
-        d.boxes = 1;
-        sendQuantity(line, [boxEvent(pack * boxes, pack)], pack);
+      if (act === 'addall') {
+        // 箱とバラを**1回でまとめて足す**。足す前に「今回 +N → 保存後 M」を見せているので、
+        // 押した結果と画面の数字が必ず一致する (2026-09-02 中原さん指摘: バラの合計が見えなかった)
+        const c = qcalc(line);
+        if (Number(qdraft(line).boxes) > 0 && !(Number.isInteger(c.pack) && c.pack > 0)) return qmsg(row, '入数を1以上の整数で入れてください');
+        if (c.total <= 0) return qmsg(row, '箱数かバラを入れてください');
+        const events = [];
+        if (c.boxQty > 0) events.push(boxEvent(c.boxQty, c.pack));
+        if (c.looseQty > 0) events.push({ client_event_id: newId(), action: 'add', quantity: c.looseQty, input_kind: 'loose', client_occurred_at: nowIso() });
+        qdrafts.set(line.line_key, { pack: c.pack > 0 ? String(c.pack) : '', boxes: '', loose: '' });
+        sendQuantity(line, events, c.boxQty > 0 ? c.pack : null);
         return;
       }
-      if (act === 'addloose') {
-        const d = qdraft(line);
-        const n = Number(d.loose);
-        if (!Number.isInteger(n) || n <= 0) return qmsg(row, 'バラの個数を1以上の整数で入れてください');
-        d.loose = '';
-        sendQuantity(line, [{ client_event_id: newId(), action: 'add', quantity: n, input_kind: 'loose', client_occurred_at: nowIso() }]);
+      if (act === 'qclear') {
+        qdrafts.delete(line.line_key);
+        render(true);
         return;
       }
       if (act === 'undoev') {
@@ -1258,8 +1323,10 @@
 
       // ── 詳細・入庫情報 ──
       if (act === 'detail') {
-        if (openLines.has(line.line_key)) { openLines.delete(line.line_key); editDirty = false; }
-        else { openLines.add(line.line_key); loadHist(line.line_key); }
+        // 行タップ = 入庫情報だけ。数量は [数量を数える] から
+        if (openMode.get(line.line_key) === 'info') openMode.delete(line.line_key);
+        else openMode.set(line.line_key, 'info');
+        editDirty = false;
         render(true);
         return;
       }
@@ -1282,6 +1349,9 @@
         if (!f) return;
         const d = qdraft(f.line);
         d[q.getAttribute('data-q')] = q.value;
+        // ⭐打つたびに「= N個」「今回 +N → 保存後 M / 予定」を書き換える。
+        //   再描画はしない (フォーカスが飛んで打てなくなる)。バラだけでも合計が見える
+        refreshQsum(f.row, f.line);
         return;
       }
       const f = ev.target.closest('[data-f]');
