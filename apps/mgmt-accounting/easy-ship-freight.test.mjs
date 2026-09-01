@@ -181,11 +181,16 @@ test('確定済み月の再同期: Easy Ship運賃 が shared 運賃として PL
 });
 
 test('自動同期スケジューラ: スキップは例外にならず件数と月×carrier を集約して返す (凍結月はスキップ)', () => {
-  // 2026-06 には手入力の Easy Ship運賃 が残っている (上のテスト) → 1件スキップ。2026-02 (凍結) は同期されない
+  // このテスト内で前提を作る (他テストの状態に依存しない): 2026-04 に手入力の Easy Ship運賃 + Easy Ship 列付き summary → 1件スキップ。
+  // 2026-02 (凍結) は summary があっても同期されない
+  insertFreight('2026-04', 'Easy Ship運賃', 555, 'tester');
+  putAmazonSummary('2026-04', { '1': seg({ 商品売上: 1000 }), other: seg({ [EASY]: -1100 }) });
   putAmazonSummary('2026-02', { other: seg({ [EASY]: -1100 }) });
   const r = runMgmtAutoSync(db);
-  assert.ok(r.months >= 4);
-  assert.equal(r.freight_skipped, 1);
-  assert.deepEqual(r.freight_skipped_detail, ['2026-06 Easy Ship運賃']);
+  assert.ok(r.months >= 2);
+  assert.ok(r.freight_skipped_detail.includes('2026-04 Easy Ship運賃'), JSON.stringify(r.freight_skipped_detail));
+  assert.equal(r.freight_skipped, r.freight_skipped_detail.length);
+  assert.ok(!r.freight_skipped_detail.some(s => s.startsWith('2026-02 ')));
+  assert.deepEqual(freightRows('2026-04').map(x => [x.carrier, x.amount, x.entered_by]), [['Easy Ship運賃', 555, 'tester']]); // 手入力のまま
   assert.deepEqual(freightRows('2026-02'), []); // 凍結月には自動運賃を作らない
 });
