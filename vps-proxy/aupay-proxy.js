@@ -1235,8 +1235,15 @@ const server = http.createServer(async (req, res) => {
       const formBody = await readBody(req);
       // ★seller_id は VPS の env を正とする (呼び出し側が付けた値は捨てる)。
       //   別の店に書き込む経路を作らない。同じ店なので既存の呼び出し側の挙動は変わらない
-      const { body: editBody, fields: editFields } = withSellerId(formBody, YAHOO_SELLER_ID);
-      console.log(`[${ts()}] Yahoo editItem: item_code=${editParams.get('item_code') || '(なし)'} fields=${editFields.join(',')} body=${editBody.length}b`);
+      // ★seller_id は VPS の env を正とする。空なら送らない (空の店に書き込む事故を作らない)
+      if (!YAHOO_SELLER_ID) throw new Error('editItem: YAHOO_SELLER_ID が未設定のため送信しません');
+      const { body: editBody, fields: editFields, itemCode: editItemCode, mismatch } =
+        withSellerId(formBody, YAHOO_SELLER_ID);
+      // 呼び出し側が別の店を指定していた = どこかの設定が食い違っている。黙って書き換えず止める
+      if (mismatch) {
+        throw new Error(`editItem: 呼び出し側の seller_id (${mismatch}) が VPS の設定と違います`);
+      }
+      console.log(`[${ts()}] Yahoo editItem: item_code=${editItemCode || '(なし)'} fields=${editFields.join(',')} body=${editBody.length}b`);
       const r = await callYahooAPIRaw('editItem', {
         method: 'POST',
         contentType,
@@ -1332,6 +1339,13 @@ const server = http.createServer(async (req, res) => {
       //   「送らなかった項目を消す」のかは、前後の全項目を突き合わせないと分からない (M0 検証用)。
       //   read-only・secret 必須・商品カタログなので個人情報は含まない
       if (body.raw === true) {
+        // ★生XMLを返すのは **検証用の商品コード (zz-) だけ**。
+        //   本番カタログの応答をそのまま外に出す経路を作らない (Codex R1)
+        if (!/^zz-/i.test(itemCode)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'raw は検証用商品 (zz- で始まる商品コード) でのみ使えます' }));
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true, itemCode, xml: String(r.body), length: String(r.body).length }));
         return;
@@ -1578,14 +1592,19 @@ const server = http.createServer(async (req, res) => {
 /**
  * editItem の form body の seller_id を、VPS が持っている値に差し替える。
  * ★呼び出し側が付けた seller_id は捨てる (別の店に書き込む経路を作らない)。
- * @returns {{body:string, fields:string[]}} fields は seller_id を除いた項目名 (ログ用)
+ *   ただし呼び出し側が **別の店** を指定していたら mismatch として返す。
+ *   黙って書き換えると、設定の食い違いに気づけないまま別の店の商品を触りうる。
+ * @returns {{body:string, fields:string[], itemCode:string|null, mismatch:string|null}}
  */
 function withSellerId(formBody, sellerId) {
   const params = new URLSearchParams(String(formBody || ''));
+  const given = params.getAll('seller_id').map((v) => String(v).trim()).filter(Boolean);
+  const mismatch = given.find((v) => v !== String(sellerId || '').trim()) || null;
   params.delete('seller_id');
   const fields = [...new Set([...params.keys()])];
+  const itemCode = params.get('item_code');
   params.append('seller_id', String(sellerId || ''));
-  return { body: params.toString(), fields };
+  return { body: params.toString(), fields, itemCode, mismatch };
 }
 
 // ─── self-test ───
@@ -1692,6 +1711,14 @@ function runSelfTest() {
   check('seller_id: 日本語の値が壊れない',
     new URLSearchParams(withSellerId('item_code=zz-1&name=' + encodeURIComponent('テスト商品'), 'mystore').body).get('name'),
     'テスト商品');
+  check('seller_id: 同じ店なら mismatch にしない',
+    withSellerId('seller_id=mystore&item_code=zz-1', 'mystore').mismatch, null);
+  check('seller_id: 別の店を指定されたら mismatch',
+    withSellerId('seller_id=otherstore&item_code=zz-1', 'mystore').mismatch, 'otherstore');
+  check('seller_id: 未指定なら mismatch にしない',
+    withSellerId('item_code=zz-1', 'mystore').mismatch, null);
+  check('editItem: item_code をログ用に取り出す',
+    withSellerId('item_code=zz-yahoo-m0-0901&price=100', 'mystore').itemCode, 'zz-yahoo-m0-0901');
 
   // 6) 既存の挙動が壊れていないこと (Path は PathList 内の origFlag=1 優先)
   const paths = `<Result><PathList><Path>その他</Path><Path origFlag="1">本命</Path></PathList></Result>`;

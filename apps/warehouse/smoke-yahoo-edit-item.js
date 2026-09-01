@@ -8,13 +8,15 @@
  * やること:
  *   1. getItem で「前」の全項目を取る (応答XMLをそのまま)
  *   2. editItem に **item_code と price だけ** を送る
- *   3. getItem で「後」の全項目を取る
+ *   3. 送信が成功したか・価格が実際に変わったかを確かめる (変わっていなければ何も結論しない)
  *   4. 全項目を突き合わせて、価格以外が変わっていない / 消えていないかを見る
- *   5. 価格を元に戻して、最初の状態と突き合わせる
+ *   5. 価格を元に戻して、最初の状態と突き合わせる (途中で失敗しても必ず戻しに行く)
  *
  * 安全装置:
  *   - 書き込みは --live のときだけ (既定は「前」の中身を見るだけ)
- *   - 商品コードは **zz- で始まるものだけ**。本番商品では動かない
+ *   - 商品コードは **zz- で始まるものだけ**
+ *   - さらに **商品名に「zz検証用」が入っていること** を実物で確かめてから書き込む
+ *     (コードの取り違えで本番商品を触らないため)
  *   - 送る項目は item_code / price のみ。他の項目は一切送らない (それが検証の目的)
  *   - 価格が整数で読めなければ書き込まない
  *
@@ -25,7 +27,10 @@
  * 必要な env: YAHOO_PROXY_URL (または YAHOO_PROXY_BASE_URL) / YAHOO_PROXY_SECRET
  */
 import 'dotenv/config';
-import { flattenXml, diff, isPricePath, guardTestCode } from './yahoo-edit-item-probe.js';
+import {
+  flattenXml, diff, isPricePath, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
+  TEST_NAME_MARKER,
+} from './yahoo-edit-item-probe.js';
 
 const TIMEOUT_MS = 30_000;
 
@@ -87,16 +92,20 @@ async function main() {
 
   console.log(`商品コード: ${itemCode} / ${live ? '★実際に書き込みます (--live)' : '見るだけ (--live なし)'}`);
   const beforeXml = await getRawXml(itemCode);
-  const before = flattenXml(beforeXml);
+  const before = await flattenXml(beforeXml);
   console.log(`「前」の項目数: ${before.size} (XML ${beforeXml.length} バイト)`);
 
-  const priceKey = [...before.keys()].find((k) => /(^|\/)Price\[0\]$/.test(k));
-  const currentPrice = priceKey ? Number(before.get(priceKey)) : null;
+  const currentPrice = itemPriceOf(before);
   console.log(`いまの価格: ${currentPrice ?? '(読めません)'}`);
   const sample = [...before.entries()].filter(([, v]) => v && v.length < 60).slice(0, 15);
   console.log('項目の例:');
   for (const [k, v] of sample) console.log(`  ${k} = ${v}`);
 
+  const itemGuard = guardTestItem(before);
+  if (itemGuard) {
+    console.log(`\n⚠️ ${itemGuard}`);
+    if (live) throw new Error(`書き込みできません。商品名に「${TEST_NAME_MARKER}」を入れてください`);
+  }
   if (!live) {
     console.log('\n--live を付けると、価格だけを送って前後を突き合わせます。');
     return;
@@ -109,21 +118,51 @@ async function main() {
   console.log(`\n★ item_code と price だけを送ります (${currentPrice} → ${probePrice})。他の項目は一切送りません。`);
   const r1 = await editPrice(itemCode, probePrice);
   console.log(`editItem: HTTP ${r1.status} / ${r1.body.slice(0, 200).replace(/\s+/g, ' ')}`);
+  const sendFailure = editItemFailure(r1);
+  if (sendFailure) throw new Error(`送信できていません (${sendFailure})。書き換わっていないので、この回では何も判定しません`);
 
-  const after = flattenXml(await getRawXml(itemCode));
-  console.log(`「後」の項目数: ${after.size}`);
-  const d1 = diff(before, after);
-  report('価格だけ送ったあとの差分', d1);
+  // ★ここから先は「価格を上げた状態」。何があっても戻しに行く
+  try {
+    const after = await flattenXml(await getRawXml(itemCode));
+    console.log(`「後」の項目数: ${after.size}`);
+    const d1 = diff(before, after);
+    report('価格だけ送ったあとの差分', d1);
 
-  const collateral = [...d1.changed.filter((x) => !isPricePath(x.path)), ...d1.removed];
-  console.log(`\n${collateral.length === 0
-    ? '✅ 価格以外は変わっていません → editItem は「送った項目だけ変える」= 部分更新'
-    : `🚨 価格以外が ${collateral.length} 項目 変わった/消えた → editItem は全項目上書き。価格だけ送ってはいけない`}`);
-
-  console.log(`\n価格を元に戻します (${probePrice} → ${currentPrice})`);
-  const r2 = await editPrice(itemCode, currentPrice);
-  console.log(`editItem: HTTP ${r2.status} / ${r2.body.slice(0, 200).replace(/\s+/g, ' ')}`);
-  report('元に戻したあと、最初との差分', diff(before, flattenXml(await getRawXml(itemCode))));
+    // ★価格が実際に変わっていなければ、「他が変わっていない」ことに意味は無い
+    const afterPrice = itemPriceOf(after);
+    if (afterPrice !== probePrice) {
+      console.log(`\n⚠️ 価格が ${probePrice} になっていません (実際: ${afterPrice})。`
+        + '送信が効いていないので、部分更新かどうかは判定できません');
+      return;
+    }
+    const collateral = [...d1.changed.filter((x) => !isPricePath(x.path)), ...d1.removed];
+    console.log(`\n${collateral.length === 0
+      ? '✅ 価格は変わり、価格以外は変わっていません → editItem は「送った項目だけ変える」= 部分更新'
+      : `🚨 価格以外が ${collateral.length} 項目 変わった/消えた → editItem は全項目上書き。価格だけ送ってはいけない`}`);
+  } finally {
+    console.log(`\n価格を元に戻します (${probePrice} → ${currentPrice})`);
+    try {
+      const r2 = await editPrice(itemCode, currentPrice);
+      console.log(`editItem: HTTP ${r2.status} / ${r2.body.slice(0, 200).replace(/\s+/g, ' ')}`);
+      const restoreFailure = editItemFailure(r2);
+      if (restoreFailure) {
+        console.error(`🚨 戻せていません (${restoreFailure})。Yahoo の管理画面で価格を ${currentPrice} に直してください`);
+        process.exitCode = 1;
+        return;
+      }
+      const restored = await flattenXml(await getRawXml(itemCode));
+      const restoredPrice = itemPriceOf(restored);
+      report('元に戻したあと、最初との差分', diff(before, restored));
+      if (restoredPrice !== currentPrice) {
+        console.error(`🚨 価格が ${currentPrice} に戻っていません (実際: ${restoredPrice})。Yahoo の管理画面で直してください`);
+        process.exitCode = 1;
+      }
+    } catch (e) {
+      console.error(`🚨 戻す処理でエラー: ${e.message}`);
+      console.error(`   Yahoo の管理画面で ${itemCode} の価格を ${currentPrice} に直してください`);
+      process.exitCode = 1;
+    }
+  }
 }
 
 main().catch((e) => {
