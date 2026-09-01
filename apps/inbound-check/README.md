@@ -20,11 +20,14 @@
 
 server.js では `requireAppAccess` を掛けずに mount する (端末Cookie を通すため)。認可は router 内で全ルートに掛ける (manifest.json だけ素通し)。
 
-## データの流れ (PR1 = 手動取込)
+## データの流れ
 
 ```
-ロジザード 入荷状況照会 [FA04_01] (当日〜7日前・受付済) → CSV エクスポート (CA04001_*.csv, Shift-JIS, 58列)
-  → 管理画面「取り込む」 (file_modified = ブラウザ File.lastModified を CSV 生成時刻として送る)
+【自動 (通常)】miniPC Logizard-NyukaCSV (毎日 08:30 / 12:00)
+  ロジザード 入荷状況照会[FA04_01] (受付済・当日から7日前) → CSV → rclone → 共有ドライブ nyuka_uketsuke.csv
+  → Render が30分おきに取得 (JST 6〜20時台。同じ内容なら取り込まない)
+【手動 (自動が止まったとき)】管理画面から CA04001_*.csv をアップロード
+  ↓ どちらも同じ取込ロジックへ
   → f_inbound_check_batches (active は常に1件) / slips / lines / line_state (全行 unchecked から)
   → iPad: GET /api/state で f_inbound_info (入数等) と mirror_logizard_stock (ピックロケ) を商品単位で結合して表示
 ```
@@ -52,8 +55,9 @@ node scripts/test-inbound-check.mjs [CA04001_*.csv]        # DB 層 + CSV パー
 node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路 (38 項目)
 ```
 
-## 次 (PR2 / PR3)
+## 次 (PR3)
 
-- PR2: miniPC の Playwright で FA04_01 → CSV を 8:30 / 12:00 に自動エクスポート → rclone → Drive → Render 取込 (`source='auto'`)。jobs-registry 登録 + dead-man ping + 失敗 GChat
 - PR3: 在庫ゼロ商品のピックロケ補完 (商品マスタ)、実機で決まった表示の手直し、Stream Deck の紙印刷を障害時のみに降格
-- **PR1 の受け入れ条件**: 2日分の実 CSV で「検品済みの伝票が受付済の検索から消える」ことを確認する (要件定義 §3.1)
+- **受け入れ条件**: 受付済がある日に実データが流れることを確認する (0件の日の動作は確認済み)。
+  ⭐ステータスは 未入荷01→受付済02→検品中03→入荷確定04 と進むので、「受付済」で絞れば検品済みは自然に落ちる
+  (要件定義 §3.1 の「翌日には消える」はこの仕組みで担保される)

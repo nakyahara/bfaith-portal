@@ -55,6 +55,7 @@ import inboundInfoRouter from './apps/inbound-info/router.js';
 import { startInboundInfoCron } from './apps/inbound-info/sync-job.js';
 import inboundCheckRouter from './apps/inbound-check/router.js';
 import staffRouter from './apps/staff/router.js';
+import { startInboundCheckCron } from './apps/inbound-check/sync-job.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
 import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorkerRouter } from './apps/packing-dispatch/router.js';
 import packingDispatchRuleChangeApiRouter from './apps/packing-dispatch/rule-change-api.js';
@@ -1620,6 +1621,7 @@ app.listen(PORT, () => {
   // 入庫情報管理: NE商品マスタ(ミラー)から新商品を自動追加 + 入荷予定 nefuda.csv 取得。
   // 既定で有効 (JST 09:00 = ミラー同期完了後)。止める場合のみ INBOUND_INFO_SYNC_ENABLED=false
   startInboundInfoCron();
+  startInboundCheckCron();
   startProductHubIntakeCron();
   // 商品リンク台帳: 夜間照合 (09:45 JST) + 台帳が空なら起動時バックフィル。既定 ON (PRODUCT_LINKS_RECONCILE_ENABLED=false で停止)
   startProductLinksCron();
