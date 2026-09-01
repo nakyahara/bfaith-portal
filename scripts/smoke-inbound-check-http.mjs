@@ -78,13 +78,13 @@ try {
 
   console.log('\n[A] 未認証');
   let r = await req(null, `${APP}/`);
-  ok(r.status === 302 && /\/login/.test(r.location || ''), '作業画面 → /login へ');
+  ok(r.status === 302 && /\/apps\/inbound-check\/enroll/.test(r.location || ''), '作業画面 → 端末登録画面へ (iPad にログインを求めない)');
   r = await req(null, `${APP}/api/state`);
   ok(r.status === 401 && r.json?.error === 'unauthorized', 'API → 401');
   r = await req(null, `${APP}/manifest.json`);
   ok(r.status === 200 && r.json?.name === '入荷受付チェック', 'manifest.json は認証不要');
   r = await req(null, `${APP}/admin/upload`, { method: 'POST', body: {} });
-  ok(r.status === 302 && /\/login/.test(r.location || ''), '未認証の取込 POST → /login へ (API パス外)');
+  ok(r.status === 302 && /\/(login|apps\/inbound-check\/enroll)/.test(r.location || ''), '未認証の取込 POST はリダイレクトされ、取り込めない');
 
   console.log('\n[B] セッション (管理者)');
   const J = jar();
@@ -186,6 +186,40 @@ try {
     console.log('  (CSV パス未指定: 取込系はスキップ)');
   }
 
+  console.log('\n[B2] 登録コードで iPad を登録する (ログイン不要の経路)');
+  {
+    // 未登録の端末が作業画面を開くと、/login ではなく登録画面へ送られる
+    const IPAD = jar();
+    let r2 = await req(IPAD, `${APP}/`);
+    ok(r2.status === 302 && /\/apps\/inbound-check\/enroll/.test(r2.location || ''), '未登録の端末は登録画面へ (ログイン画面ではない)');
+    r2 = await req(IPAD, `${APP}/enroll`);
+    ok(r2.status === 200 && r2.text.includes('6桁の登録コード'), '登録画面はログイン不要で開ける');
+    // 管理者が PC でコードを発行
+    r2 = await req(J, `${APP}/admin/enroll-codes`, { method: 'POST', body: { label: '入荷iPad-smoke' } });
+    ok(r2.status === 200 && /^\d{6}$/.test(r2.json.code || ''), `管理者がコードを発行 (${r2.json.code})`);
+    const code = r2.json.code;
+    // 一般ユーザー・端末では発行できない
+    const r3 = await req(null, `${APP}/admin/enroll-codes`, { method: 'POST', body: { label: 'x' } });
+    ok(r3.status === 401 || r3.status === 403 || r3.status === 302, `未認証はコードを発行できない (${r3.status})`);
+    // iPad が引き換え
+    r2 = await req(IPAD, `${APP}/enroll/redeem`, { method: 'POST', body: { code: '000000' === code ? '111111' : '000000' } });
+    ok(r2.status === 400, '違うコードは 400');
+    r2 = await req(IPAD, `${APP}/enroll/redeem`, { method: 'POST', body: { code } });
+    ok(r2.status === 200 && r2.json.ok && IPAD.has('ic_device'), '正しいコードで端末Cookieが入る');
+    r2 = await req(IPAD, `${APP}/`);
+    ok(r2.status === 200, '以後はログインなしで作業画面が開く');
+    r2 = await req(IPAD, `${APP}/api/state`);
+    ok(r2.status === 200 && r2.json.me.device?.label === '入荷iPad-smoke', '端末として認識される');
+    // 端末は管理系を触れない (権限境界)
+    r2 = await req(IPAD, `${APP}/admin/enroll-codes`, { method: 'POST', body: { label: 'x' } });
+    ok(r2.status === 403, '端末はコードを発行できない');
+    r2 = await req(IPAD, `${APP}/enroll`);
+    ok(r2.status === 302 && /\/apps\/inbound-check\/$/.test(r2.location || ''), '登録済みなら登録画面は作業画面へ戻す');
+    // 同じコードは二度使えない
+    const IPAD2 = jar();
+    r2 = await req(IPAD2, `${APP}/enroll/redeem`, { method: 'POST', body: { code } });
+    ok(r2.status === 400 && r2.json.error === 'used', '使用済みのコードは別端末でも使えない');
+  }
   console.log('\n[C] 端末登録 → 端末Cookie');
   r = await req(J, `${APP}/admin/devices`, { method: 'POST', body: { label: '入荷iPad1' } });
   ok(r.status === 200 && r.json.ok && r.json.loggedOut === true && J.has('ic_device'), '端末登録: ic_device Cookie 発行');
