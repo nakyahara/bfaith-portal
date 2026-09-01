@@ -101,13 +101,13 @@ async function main() {
   const before = await flattenXml(beforeXml);
   console.log(`「前」の項目数: ${before.size} (XML ${beforeXml.length} バイト)`);
 
-  const currentPrice = itemPriceOf(before);
+  const currentPrice = itemPriceOf(before, itemCode);
   console.log(`いまの価格: ${currentPrice ?? '(読めません)'}`);
   const sample = [...before.entries()].filter(([, v]) => v && v.length < 60).slice(0, 15);
   console.log('項目の例:');
   for (const [k, v] of sample) console.log(`  ${k} = ${v}`);
 
-  const itemGuard = guardTestItem(before);
+  const itemGuard = guardTestItem(before, itemCode);
   if (itemGuard) {
     console.log(`\n⚠️ ${itemGuard}`);
     if (live) throw new Error(`書き込みできません。商品名に「${TEST_NAME_MARKER}」を入れてください`);
@@ -149,7 +149,7 @@ async function main() {
     report('価格だけ送ったあとの差分', d1);
 
     // ★価格が実際に変わっていなければ、「他が変わっていない」ことに意味は無い
-    const afterPrice = itemPriceOf(after);
+    const afterPrice = itemPriceOf(after, itemCode);
     if (afterPrice !== probePrice) {
       console.error(`\n⚠️ 価格が ${probePrice} になっていません (実際: ${afterPrice})。`
         + '送信が効いていないので、部分更新かどうかは判定できません');
@@ -157,7 +157,7 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    const collateral = collateralOf(d1, itemBaseOf(before));
+    const collateral = collateralOf(d1, itemBaseOf(before, itemCode));
     console.log(`\n${collateral.length === 0
       ? '✅ 価格は変わり、価格以外は変わっていません → editItem は「送った項目だけ変える」= 部分更新'
       : `🚨 価格以外が ${collateral.length} 項目 変わった/消えた → editItem は全項目上書き。価格だけ送ってはいけない`}`);
@@ -174,7 +174,7 @@ async function main() {
           process.exitCode = 1;
         } else {
           const restored = await flattenXml(await getRawXml(itemCode));
-          const restoredPrice = itemPriceOf(restored);
+          const restoredPrice = itemPriceOf(restored, itemCode);
           report('元に戻したあと、最初との差分', diff(before, restored));
           if (restoredPrice !== currentPrice) {
             console.error(`🚨 価格が ${currentPrice} に戻っていません (実際: ${restoredPrice})。Yahoo の管理画面で直してください`);
@@ -208,7 +208,7 @@ async function settleAfterUncertainSend(code, wantPrice) {
     await sleep(SETTLE_WAIT_MS);
     let now;
     try {
-      now = itemPriceOf(await flattenXml(await getRawXml(code)));
+      now = itemPriceOf(await flattenXml(await getRawXml(code)), code);
     } catch (e) {
       console.error(`  確かめられませんでした (${e.message})`);
       continue;

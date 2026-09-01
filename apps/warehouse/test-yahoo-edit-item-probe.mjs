@@ -88,16 +88,30 @@ console.log('\n── 価格の読み方 ──');
   const real = await flattenXml('<ResultSet totalResultsReturned="1"><Result><ItemCode>zz-1</ItemCode>'
     + '<Name>zz検証用 テスト</Name><Price>1080</Price>'
     + '<SubCodes><SubCode code="a"><Price>1200</Price></SubCode></SubCodes></Result></ResultSet>');
-  const base = itemBaseOf(real);
+  const base = itemBaseOf(real, 'zz-1');
   eq(base, 'ResultSet[0]/Result[0]', '★商品本体の場所は ItemCode から見つける (ルート直下と決め打ちしない)');
   ok(isItemPricePath(base + '/Price[0]', base), '商品本体の価格');
   ok(!isItemPricePath(base + '/SubCodes[0]/SubCode[0]/Price[0]', base), '★SKU の価格は「商品本体の価格」ではない');
   ok(!isItemPricePath(base + '/Price[0]', null), '商品の場所が分からなければ本体扱いしない (fail-closed)');
-  eq(itemPriceOf(real), 1080, '★商品本体の価格を取る (SKU の価格と取り違えない)');
-  eq(itemBaseOf(await flattenXml('<R><Price>100</Price></R>')), null, 'ItemCode が無ければ場所を決めない');
-  eq(itemPriceOf(await flattenXml('<R><Price>100</Price></R>')), null, '場所が分からなければ価格も読まない');
-  eq(itemPriceOf(await flattenXml('<ResultSet><Result><ItemCode>x</ItemCode><Price>お問い合わせ</Price></Result></ResultSet>')),
+  eq(itemPriceOf(real, 'zz-1'), 1080, '★商品本体の価格を取る (SKU の価格と取り違えない)');
+  eq(itemBaseOf(await flattenXml('<R><Price>100</Price></R>'), 'zz-1'), null, 'ItemCode が無ければ場所を決めない');
+  eq(itemPriceOf(await flattenXml('<R><Price>100</Price></R>'), 'zz-1'), null, '場所が分からなければ価格も読まない');
+  eq(itemPriceOf(await flattenXml('<ResultSet><Result><ItemCode>x</ItemCode><Price>お問い合わせ</Price></Result></ResultSet>'), 'x'),
     null, '整数で読めなければ null');
+
+  // ★応答に商品が複数あっても、指定したコードの商品だけを本体とする (Codex R1)
+  const two = await flattenXml('<ResultSet>'
+    + '<Result><ItemCode>other-1</ItemCode><Name>zz検証用 まぎらわしい商品</Name><Price>1</Price></Result>'
+    + '<Result><ItemCode>zz-1</ItemCode><Name>本物</Name><Price>2</Price></Result></ResultSet>');
+  eq(itemBaseOf(two, 'zz-1'), 'ResultSet[0]/Result[1]', '★指定したコードの商品を選ぶ (最初の1つではない)');
+  eq(itemPriceOf(two, 'zz-1'), 2, '価格も指定した商品のもの');
+  eq(itemBaseOf(two, 'ZZ-1'), 'ResultSet[0]/Result[1]', '大小文字は無視して照合');
+  eq(itemBaseOf(two, 'not-there'), null, '一致が無ければ決めない');
+  eq(itemBaseOf(two, ''), null, 'コード未指定なら決めない (fail-closed)');
+  const dup = await flattenXml('<ResultSet>'
+    + '<Result><ItemCode>zz-1</ItemCode><Price>1</Price></Result>'
+    + '<Result><ItemCode>zz-1</ItemCode><Price>2</Price></Result></ResultSet>');
+  eq(itemBaseOf(dup, 'zz-1'), null, '★同じコードが2つあれば決めない (取り違えるくらいなら動かさない)');
 
   // 道すじの直下判定 ([ ] を含む道すじでも壊れない)
   ok(isDirectChild('A[0]/B[0]/Name[0]', 'A[0]/B[0]', 'Name'), '直下なら true');
@@ -123,7 +137,7 @@ console.log('\n── 「価格以外の変化」の数え方 ──');
   const item = (inner) => '<ResultSet><Result><ItemCode>zz-1</ItemCode>' + inner + '</Result></ResultSet>';
   const B = 'ResultSet[0]/Result[0]';
   const before = await flattenXml(item('<Name>名前</Name><Price>100</Price><Caption>説明</Caption>'));
-  const bb = itemBaseOf(before);
+  const bb = itemBaseOf(before, 'zz-1');
   eq(collateralOf(diff(before, await flattenXml(item('<Name>名前</Name><Price>101</Price><Caption>説明</Caption>'))), bb).length,
     0, '価格だけ変わったなら 0 (= 部分更新)');
   eq(collateralOf(diff(before, await flattenXml(item('<Name>名前</Name><Price>101</Price>'))), bb).map((x) => x.path),
@@ -136,7 +150,7 @@ console.log('\n── 「価格以外の変化」の数え方 ──');
   // ★SKU の価格が動いたのは「価格以外の変化」。見逃すと部分更新だと誤って結論する
   const withSku = await flattenXml(item('<Name>名前</Name><Price>100</Price><SubCodes><SubCode code="a"><Price>50</Price></SubCode></SubCodes>'));
   const skuMoved = await flattenXml(item('<Name>名前</Name><Price>101</Price><SubCodes><SubCode code="a"><Price>60</Price></SubCode></SubCodes>'));
-  eq(collateralOf(diff(withSku, skuMoved), itemBaseOf(withSku)).map((x) => x.path),
+  eq(collateralOf(diff(withSku, skuMoved), itemBaseOf(withSku, 'zz-1')).map((x) => x.path),
     [B + '/SubCodes[0]/SubCode[0]/Price[0]'], '★SKU の価格が動いたら数える (商品本体の価格だけを除外する)');
 }
 
@@ -151,17 +165,24 @@ console.log('\n── 本番商品では動かさない ──');
   // ★接頭辞だけでは足りない。商品そのものに目印があることを実物で確かめる
   const wrap = (inner) => '<ResultSet><Result><ItemCode>zz-1</ItemCode>' + inner + '</Result></ResultSet>';
   const marked = await flattenXml(wrap('<Name>zz検証用 editItem のテスト</Name><Price>100</Price>'));
-  eq(guardTestItem(marked), null, '★実測どおりの二段構造 (ResultSet > Result) でも通る');
+  eq(guardTestItem(marked, 'zz-1'), null, '★実測どおりの二段構造 (ResultSet > Result) でも通る');
   const prod = await flattenXml(wrap('<Name>合皮補修シート ベージュ</Name><Price>577</Price>'));
-  ok(guardTestItem(prod), '★目印が無い商品は拒否する (コードを取り違えても本番を触らない)');
-  ok(/zz検証用/.test(guardTestItem(prod)) && /合皮補修シート/.test(guardTestItem(prod)), '理由に目印と実際の商品名を書く');
-  ok(guardTestItem(await flattenXml(wrap('<Price>100</Price>'))), '商品名を読めなければ拒否');
-  ok(/ItemCode/.test(guardTestItem(await flattenXml('<R><Name>zz検証用</Name></R>'))),
-    '★ItemCode が無ければ「場所が分からない」として拒否 (目印があっても通さない)');
+  ok(guardTestItem(prod, 'zz-1'), '★目印が無い商品は拒否する (コードを取り違えても本番を触らない)');
+  ok(/zz検証用/.test(guardTestItem(prod, 'zz-1')) && /合皮補修シート/.test(guardTestItem(prod, 'zz-1')),
+    '理由に目印と実際の商品名を書く');
+  ok(guardTestItem(await flattenXml(wrap('<Price>100</Price>')), 'zz-1'), '商品名を読めなければ拒否');
+  ok(/特定できません/.test(guardTestItem(await flattenXml('<R><Name>zz検証用</Name></R>'), 'zz-1')),
+    '★ItemCode が無ければ「特定できない」として拒否 (目印があっても通さない)');
+  // ★応答に別商品が混ざっていて、そちらに目印があっても通さない (Codex R1)
+  const mixed = await flattenXml('<ResultSet>'
+    + '<Result><ItemCode>other-1</ItemCode><Name>zz検証用 まぎらわしい商品</Name><Price>1</Price></Result>'
+    + '<Result><ItemCode>zz-1</ItemCode><Name>合皮補修シート ベージュ</Name><Price>577</Price></Result></ResultSet>');
+  ok(guardTestItem(mixed, 'zz-1'), '★別商品に目印があっても、指定した商品に無ければ拒否する');
+  ok(/合皮補修シート/.test(guardTestItem(mixed, 'zz-1')), '理由は指定した商品の名前');
   // ★入れ子のどこかに目印があっても通さない (商品本体の名前だけを見る)
   const nested = await flattenXml(wrap('<Name>合皮補修シート ベージュ</Name><Options><Option><Name>zz検証用</Name></Option></Options>'));
-  ok(guardTestItem(nested), '★入れ子の Name に目印があっても拒否する');
-  ok(/合皮補修シート/.test(guardTestItem(nested)), '理由には商品本体の名前を出す');
+  ok(guardTestItem(nested, 'zz-1'), '★入れ子の Name に目印があっても拒否する');
+  ok(/合皮補修シート/.test(guardTestItem(nested, 'zz-1')), '理由には商品本体の名前を出す');
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);

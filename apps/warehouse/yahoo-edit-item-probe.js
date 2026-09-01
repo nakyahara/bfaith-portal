@@ -41,29 +41,41 @@ export function isDirectChild(path, base, tag) {
 }
 
 /**
- * 商品本体の要素の道すじを返す (例: "ResultSet[0]/Result[0]")。見つからなければ null。
+ * 商品本体の要素の道すじを返す (例: "ResultSet[0]/Result[0]")。決められなければ null。
  *
  * ★「ルート直下が商品」と決め打ちしない。
  *   実測 (2026-09-01): getItem の応答は ResultSet > Result の二段で、商品本体は 2 階層目にある。
- *   ItemCode を持つ要素を商品本体とみなす。無ければ null = 判断できないので動かさない側に倒す。
+ * ★さらに **ItemCode の値が、こちらが指定したコードと一致する要素** に限る (Codex R1)。
+ *   最初に見つけた ItemCode を使うと、応答に商品が複数あった時に別商品を本体とみなし、
+ *   その別商品の名前に目印があれば門番を通り抜けてしまう。
+ *   一致が 0 件でも 2 件以上でも null にする (決められないなら動かさない)。
+ *
  * @param {Map<string,string>} flat
+ * @param {string} expectedItemCode 指定した商品コード
  */
-export function itemBaseOf(flat) {
-  for (const k of flat.keys()) {
+export function itemBaseOf(flat, expectedItemCode) {
+  const want = String(expectedItemCode || '').trim().toLowerCase();
+  if (!want) return null;
+  const hits = [];
+  for (const [k, v] of flat) {
     const m = String(k).match(/^(.*)\/ItemCode\[\d+\]$/);
-    if (m) return m[1];
+    if (m && String(v).trim().toLowerCase() === want) hits.push(m[1]);
   }
-  return null;
+  return hits.length === 1 ? hits[0] : null;
 }
 
 /**
  * 取ってきた商品が「捨ててよい検証用商品」か。問題なければ null、駄目なら理由。
  * ★商品名に目印が入っていることを、書き込む前に実物で確かめる。
  * @param {Map<string,string>} flat flattenXml の戻り
+ * @param {string} itemCode 指定した商品コード (応答の中でこのコードの商品を特定するため)
  */
-export function guardTestItem(flat) {
-  const base = itemBaseOf(flat);
-  if (!base) return '商品の場所 (ItemCode) を見つけられませんでした。検証用商品か確かめられないので動かしません';
+export function guardTestItem(flat, itemCode) {
+  const base = itemBaseOf(flat, itemCode);
+  if (!base) {
+    return `応答の中から商品コード ${itemCode || '(未指定)'} の商品を1つに特定できませんでした。`
+      + '検証用商品か確かめられないので動かしません';
+  }
   // ★商品本体の名前だけを見る。入れ子のどこかに目印があれば通る、では門番にならない
   const names = [...flat.entries()]
     .filter(([k]) => isDirectChild(k, base, 'Name'))
@@ -176,9 +188,13 @@ export function collateralOf(d, itemBase) {
   ];
 }
 
-/** 商品本体の価格。読めなければ null */
-export function itemPriceOf(flat) {
-  const base = itemBaseOf(flat);
+/**
+ * 商品本体の価格。読めなければ null
+ * @param {Map<string,string>} flat
+ * @param {string} itemCode 指定した商品コード
+ */
+export function itemPriceOf(flat, itemCode) {
+  const base = itemBaseOf(flat, itemCode);
   if (!base) return null;
   for (const [k, v] of flat) {
     if (!isItemPricePath(k, base)) continue;
