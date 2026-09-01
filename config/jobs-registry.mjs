@@ -165,6 +165,8 @@ export const JOBS_REGISTRY = [
     runbook: 'scripts/ph-nightly/README.md。C:\\tools\\ph-nightly\\logs\\runner.log の末尾を見る: '
       + '"not logged in" → bfaith で cd C:\\tools\\ph-nightly\\work; claude → /login / "no progress" → 同 logs の *.err.log '
       + '(permission denied は allow を安易に増やさず ./phq で代替できないか先に確認 / codex 未ログイン / Amazon の HTML 構造変更) / '
+      + '"no progress" + claude が数秒で終了 = *.out.log に "Failed to refresh OAuth token" → ~\\.claude\\.oauth_refresh.lock の残骸 '
+      + '(9/2 の実例。ランナーが実行前に削除+1回再実行する。それでも駄目なら bfaith で lock を消して claude auth status) / '
       + 'timeout は件数超過とは限らない (ハング・認証・Codex 停止も。*.out.log を見る) / partial は翌晩に続く。止めるなら Disable-ScheduledTask PhGenerateNightly',
   },
   {
