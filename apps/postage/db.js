@@ -73,8 +73,10 @@ function createTables() {
     band_code         TEXT NOT NULL,
     display_name      TEXT NOT NULL,               -- シールに印字する文言
     max_weight_g      INTEGER NOT NULL CHECK (max_weight_g > 0),
-    amount_yen        INTEGER NOT NULL CHECK (amount_yen >= 0),
-    UNIQUE (tariff_version_id, band_code)
+    amount_yen        INTEGER NOT NULL CHECK (amount_yen > 0),
+    UNIQUE (tariff_version_id, band_code),
+    -- 同じ区分・同じ重量帯が2つあると、どちらの金額が出るか不定になる
+    UNIQUE (tariff_version_id, mail_type, max_weight_g)
   )`);
   db.exec(`CREATE INDEX IF NOT EXISTS ix_pm_tariff_bands_lookup
     ON pm_tariff_bands(tariff_version_id, mail_type, max_weight_g)`);
@@ -86,8 +88,10 @@ function createTables() {
   db.exec(`CREATE TABLE IF NOT EXISTS pm_skus (
     sku_code              TEXT PRIMARY KEY,
     display_name          TEXT,
-    unit_weight_g         REAL CHECK (unit_weight_g IS NULL OR unit_weight_g >= 0),
-    thickness_mm          REAL CHECK (thickness_mm IS NULL OR thickness_mm >= 0),
+    -- 欠測は NULL。0 は許さない (0g・0mm の実物は無く、入力ミスが「境界から遠い軽量品」として
+    -- 確定してしまうため。Codex R1 P1)
+    unit_weight_g         REAL CHECK (unit_weight_g IS NULL OR unit_weight_g > 0),
+    thickness_mm          REAL CHECK (thickness_mm IS NULL OR thickness_mm > 0),
     default_material_code TEXT REFERENCES pm_materials(material_code),
     material_source       TEXT CHECK (material_source IS NULL OR material_source IN ('explicit','name_suffix')),
     weight_source         TEXT CHECK (weight_source IS NULL OR weight_source IN ('measured','estimated','supplier')),
@@ -102,7 +106,7 @@ function createTables() {
   db.exec(`CREATE TABLE IF NOT EXISTS pm_materials (
     material_code     TEXT PRIMARY KEY,
     display_name      TEXT NOT NULL,
-    tare_weight_g     REAL CHECK (tare_weight_g IS NULL OR tare_weight_g >= 0),
+    tare_weight_g     REAL CHECK (tare_weight_g IS NULL OR tare_weight_g > 0),
     outer_length_mm   REAL CHECK (outer_length_mm IS NULL OR outer_length_mm > 0),
     outer_width_mm    REAL CHECK (outer_width_mm IS NULL OR outer_width_mm > 0),
     dims_verified     INTEGER NOT NULL DEFAULT 0 CHECK (dims_verified IN (0,1)),
@@ -268,14 +272,22 @@ export function getSetting(key, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-/** 指定日に有効な料金表。日付を省略したら今日 (JST)。 */
+/**
+ * 指定日に有効な料金表。日付を省略したら今日 (JST)。
+ *
+ * 有効期間が重なる版が2つ以上あったら **null を返して判定を止める** (Codex R1 P2)。
+ * 「新しいほうを黙って採用」すると、料金改定の入れ方を間違えたときに
+ * 間違った金額が静かに紙へ出る。止めれば「不明」として人に返る。
+ */
 export function getTariffVersionFor(dateStr) {
   const d = dateStr || jstToday();
-  return getDB().prepare(`
+  const rows = getDB().prepare(`
     SELECT * FROM pm_tariff_versions
      WHERE valid_from <= ? AND (valid_to IS NULL OR valid_to > ?)
-     ORDER BY valid_from DESC LIMIT 1
-  `).get(d, d) || null;
+     ORDER BY valid_from DESC
+  `).all(d, d);
+  if (rows.length !== 1) return null;
+  return rows[0];
 }
 
 export function getBands(tariffVersionId) {

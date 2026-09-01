@@ -25,8 +25,18 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const router = express.Router();
 const view = (name) => path.join(__dirname, 'views', name);
-// 重量表は 1MB もあれば足りる (実データは 44KB)。無制限にしない
-const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 2 * 1024 * 1024 } });
+// 重量表は 1MB もあれば足りる (実データは 44KB)。無制限にしない。
+// 拡張子も絞る (ExcelJS に何でも渡さない)
+const upload = multer({
+  dest: UPLOAD_DIR,
+  limits: { fileSize: 2 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    if (!/\.(xlsx|csv)$/i.test(file.originalname || '')) {
+      return cb(new Error('取り込めるのは .xlsx か .csv です'));
+    }
+    cb(null, true);
+  },
+});
 
 initPostageDB();
 
@@ -39,8 +49,19 @@ router.use('/api/', (req, res, next) => {
     try { host = new URL(origin).host; } catch { /* 不正 Origin は不一致として拒否 */ }
     if (!host || host !== req.headers.host) return res.status(403).json({ ok: false, error: 'origin_mismatch' });
   }
-  // multipart (取込) だけは Content-Type が multipart/form-data になる
-  if (req.path === '/import') return next();
+  // multipart (取込) は Content-Type で守れないぶん、Origin か Referer を必須にする。
+  // マスタ反映は料金判定そのものを変える操作なので、ここだけ緩くしない
+  if (req.path === '/import') {
+    if (!origin && !req.headers.referer) {
+      return res.status(403).json({ ok: false, error: 'origin_required' });
+    }
+    if (!origin && req.headers.referer) {
+      let rhost = null;
+      try { rhost = new URL(req.headers.referer).host; } catch { /* 不正 Referer は不一致として拒否 */ }
+      if (!rhost || rhost !== req.headers.host) return res.status(403).json({ ok: false, error: 'origin_mismatch' });
+    }
+    return next();
+  }
   if (!/^application\/json\b/i.test(String(req.headers['content-type'] || ''))) {
     return res.status(415).json({ ok: false, error: 'Content-Type は application/json にしてください' });
   }
@@ -127,12 +148,13 @@ router.post('/api/materials/:code', (req, res) => {
   const cur = db.prepare('SELECT * FROM pm_materials WHERE material_code=?').get(code);
   if (!cur) return res.status(404).json({ ok: false, error: '資材が見つかりません' });
 
+  // 0 は許さない。欠測は空欄 (NULL)。0 を実測値として持つと最安区分に倒れる
   const pick = (k) => {
     if (!(k in req.body)) return cur[k];
     const v = req.body[k];
     if (v === '' || v === null) return null;
     const n = Number(v);
-    if (!Number.isFinite(n) || n < 0) throw new Error(`${k} は 0 以上の数値で入れてください`);
+    if (!Number.isFinite(n) || n <= 0) throw new Error(`${k} は 0 より大きい数値で入れてください (未計測なら空欄)`);
     return n;
   };
   try {
@@ -156,10 +178,11 @@ router.post('/api/skus/:sku', (req, res) => {
   const sku = String(req.params.sku || '').normalize('NFKC').trim().toLowerCase();
   if (!sku) return res.status(400).json({ ok: false, error: '商品コードが空です' });
   const db = getDB();
+  // 0 は許さない (欠測は空欄)。0g・0mm の実物は無く、入力ミスが最安区分として確定してしまう
   const num = (v) => {
     if (v === '' || v === null || v === undefined) return null;
     const n = Number(v);
-    if (!Number.isFinite(n) || n < 0) throw new Error('0 以上の数値で入れてください');
+    if (!Number.isFinite(n) || n <= 0) throw new Error('0 より大きい数値で入れてください (未計測なら空欄)');
     return n;
   };
   try {

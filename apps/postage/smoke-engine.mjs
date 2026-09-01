@@ -27,14 +27,16 @@ const BANDS = [
 ];
 
 const MATERIALS = new Map([
-  // 長形3号 = 定形サイズそのもの
-  ['chabuto',    { display_name: '茶封筒', tare_weight_g: 5,  outer_length_mm: 235, outer_width_mm: 120 }],
+  // 長形3号 = 定形サイズそのもの。実測済み
+  ['chabuto',    { display_name: '茶封筒', tare_weight_g: 5,  outer_length_mm: 235, outer_width_mm: 120, dims_verified: 1 }],
   // 外寸未測定 (実運用の初期状態)
-  ['shiropuchi', { display_name: '白プチ', tare_weight_g: 10, outer_length_mm: null, outer_width_mm: null }],
+  ['shiropuchi', { display_name: '白プチ', tare_weight_g: 10, outer_length_mm: null, outer_width_mm: null, dims_verified: 0 }],
   // 規格内に収まる大きさ
-  ['shirobi',    { display_name: '白ビ袋', tare_weight_g: 11, outer_length_mm: 320, outer_width_mm: 240 }],
+  ['shirobi',    { display_name: '白ビ袋', tare_weight_g: 11, outer_length_mm: 320, outer_width_mm: 240, dims_verified: 1 }],
   // 規格外になる大きさ
-  ['ookibako',   { display_name: '大箱',   tare_weight_g: 50, outer_length_mm: 450, outer_width_mm: 300 }],
+  ['ookibako',   { display_name: '大箱',   tare_weight_g: 50, outer_length_mm: 450, outer_width_mm: 300, dims_verified: 1 }],
+  // 外寸は入っているが「推定値」— 判定に使ってはいけない
+  ['suitei',     { display_name: '推定封筒', tare_weight_g: 5, outer_length_mm: 235, outer_width_mm: 120, dims_verified: 0 }],
 ]);
 
 function ctx(over = {}) {
@@ -141,6 +143,30 @@ t('資材の外寸が未測定 → missing_dims (重量は出せていても確�
   eq(r.weightG, 40.5, '重量そのものは計算できている');
 });
 
+t('外寸が入っていても未実測 (dims_verified=0) なら確定しない', () => {
+  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 15, thickness_mm: 1, default_material_code: 'suitei' } }) }));
+  eq(r.status, 'unknown'); eq(r.reason, 'missing_dims', '推定値で定形110円を出さない');
+});
+
+t('重さ 0 は実測値でなく欠測として扱う', () => {
+  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 0, thickness_mm: 1, default_material_code: 'chabuto' } }) }));
+  eq(r.status, 'unknown'); eq(r.reason, 'missing_weight');
+});
+
+t('厚み 0 も欠測として扱う', () => {
+  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 15, thickness_mm: 0, default_material_code: 'chabuto' } }) }));
+  eq(r.status, 'unknown'); eq(r.reason, 'missing_thickness');
+});
+
+t('資材の自重 0 は未登録として扱う', () => {
+  const mats = new Map(MATERIALS);
+  mats.set('zeromat', { display_name: 'ゼロ', tare_weight_g: 0, outer_length_mm: 235, outer_width_mm: 120, dims_verified: 1 });
+  const r = judge(ship(['a', 1]), ctx({
+    skus: sku({ a: { unit_weight_g: 15, thickness_mm: 1, default_material_code: 'zeromat' } }), materials: mats,
+  }));
+  eq(r.status, 'unknown'); eq(r.reason, 'missing_material');
+});
+
 t('資材が決まらない → missing_material', () => {
   const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 15, thickness_mm: 1 } }) }));
   eq(r.status, 'unknown'); eq(r.reason, 'missing_material');
@@ -165,7 +191,7 @@ t('4kg超 → over_maximum (最大料金に丸めない)', () => {
 
 t('3辺合計が90cm超 → over_maximum', () => {
   const mats = new Map(MATERIALS);
-  mats.set('nagai', { display_name: '長物', tare_weight_g: 100, outer_length_mm: 590, outer_width_mm: 300 });
+  mats.set('nagai', { display_name: '長物', tare_weight_g: 100, outer_length_mm: 590, outer_width_mm: 300, dims_verified: 1 });
   const r = judge(ship(['a', 1]), ctx({
     skus: sku({ a: { unit_weight_g: 100, thickness_mm: 100, default_material_code: 'nagai' } }), materials: mats,
   }));
@@ -176,9 +202,21 @@ console.log('\n■ 入力の頑健さ');
 
 t('明細ゼロ → no_lines', () => { eq(judge({ lines: [] }, ctx({ skus: sku({}) })).reason, 'no_lines'); });
 t('数量0 → no_lines', () => { eq(judge(ship(['a', 0]), ctx({ skus: sku({ a: { unit_weight_g: 1 } }) })).reason, 'no_lines'); });
+t('小数の数量は切り捨てず拒否する (1.9 を 1 として通さない)', () => {
+  const r = judge(ship(['a', 1.9]), ctx({ skus: sku({ a: { unit_weight_g: 30, thickness_mm: 1, default_material_code: 'chabuto' } }) }));
+  eq(r.status, 'unknown'); eq(r.reason, 'no_lines', '切り捨てると重量も厚みも過少になる');
+});
+t('数値として整数なら文字列でも通す (切り捨ては起きないので過少にならない)', () => {
+  const r = judge(ship(['a', '2']), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 1, default_material_code: 'chabuto' } }) }));
+  eq(r.status, 'confirmed'); eq(r.weightG, 25.5, '10*2 + 5 + 0.5');
+});
+t('小数の文字列は拒否', () => {
+  const r = judge(ship(['a', '1.5']), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 1, default_material_code: 'chabuto' } }) }));
+  eq(r.status, 'unknown'); eq(r.reason, 'no_lines');
+});
 t('外寸の長短を逆に入れても同じ結果', () => {
   const mats = new Map(MATERIALS);
-  mats.set('rev', { display_name: '逆', tare_weight_g: 5, outer_length_mm: 120, outer_width_mm: 235 });
+  mats.set('rev', { display_name: '逆', tare_weight_g: 5, outer_length_mm: 120, outer_width_mm: 235, dims_verified: 1 });
   const r = judge(ship(['a', 1]), ctx({
     skus: sku({ a: { unit_weight_g: 15, thickness_mm: 1, default_material_code: 'rev' } }), materials: mats,
   }));

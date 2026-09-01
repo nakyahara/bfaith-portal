@@ -59,12 +59,14 @@ export function judge(shipment, ctx) {
   const missingWeight = [];
   const missingSku = [];
   for (const l of lines) {
-    const qty = Math.trunc(Number(l.qty));
+    // 切り捨ててから整数か見ると 1.9 が 1 として通り、重量も厚みも過少になる (= 黙って安い区分)。
+    // 元の値が整数かを見る
+    const qty = Number(l.qty);
     if (!Number.isInteger(qty) || qty < 1) return unknown('no_lines', `数量が不正: ${l.sku_code}=${l.qty}`);
     totalQty += qty;
     const s = ctx.skus.get(l.sku_code);
     if (!s) { missingSku.push(l.sku_code); continue; }
-    if (!Number.isFinite(s.unit_weight_g)) { missingWeight.push(l.sku_code); continue; }
+    if (!Number.isFinite(s.unit_weight_g) || s.unit_weight_g <= 0) { missingWeight.push(l.sku_code); continue; }
     itemWeightG += s.unit_weight_g * qty;
   }
   if (missingSku.length) return unknown('missing_sku', missingSku.join(', '));
@@ -83,7 +85,7 @@ export function judge(shipment, ctx) {
   const materialCode = [...matCodes][0];
   const material = ctx.materials.get(materialCode);
   if (!material) return unknown('missing_material', materialCode);
-  if (!Number.isFinite(material.tare_weight_g)) {
+  if (!Number.isFinite(material.tare_weight_g) || material.tare_weight_g <= 0) {
     return unknown('missing_material', `${material.display_name || materialCode} の自重が未登録`);
   }
 
@@ -96,8 +98,8 @@ export function judge(shipment, ctx) {
   let thicknessMm = 0;
   for (const l of lines) {
     const s = ctx.skus.get(l.sku_code);
-    if (!Number.isFinite(s.thickness_mm)) { missingThickness.push(l.sku_code); continue; }
-    thicknessMm += s.thickness_mm * Math.trunc(Number(l.qty));
+    if (!Number.isFinite(s.thickness_mm) || s.thickness_mm <= 0) { missingThickness.push(l.sku_code); continue; }
+    thicknessMm += s.thickness_mm * Number(l.qty);
   }
   if (missingThickness.length) return unknown('missing_thickness', missingThickness.join(', '));
   thicknessMm = round1(thicknessMm);
@@ -105,10 +107,13 @@ export function judge(shipment, ctx) {
   const effThicknessMargin = totalQty > 1 ? marginMm * 2 : marginMm;
 
   // ── 4. サイズ区分 ──────────────────────────────────────
+  // 外寸は「入っている」だけでは使わない。**人が実測したもの (dims_verified=1) だけ** 判定に使う。
+  // 推定値で確定させると、画面に「未測定」と出ているのに最安の定形110円が出てしまう
   const L = material.outer_length_mm;
   const W = material.outer_width_mm;
-  if (!Number.isFinite(L) || !Number.isFinite(W)) {
-    return unknown('missing_dims', `${material.display_name || materialCode} の外寸`, { weightG, thicknessMm, materialCode });
+  if (!Number.isFinite(L) || !Number.isFinite(W) || Number(material.dims_verified) !== 1) {
+    const why = (Number.isFinite(L) && Number.isFinite(W)) ? 'の外寸が未実測 (推定値では確定しません)' : 'の外寸';
+    return unknown('missing_dims', `${material.display_name || materialCode} ${why}`, { weightG, thicknessMm, materialCode });
   }
   // 長辺・短辺は入力順に依存させない
   const longMm = Math.max(L, W);
