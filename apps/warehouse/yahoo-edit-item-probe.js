@@ -28,14 +28,45 @@ export function guardTestCode(itemCode) {
 }
 
 /**
+ * その道すじが「base の直下の tag」か (連番は問わない)。
+ * ★正規表現を組み立てない。道すじには [ ] が入るので、埋め込むと壊れやすい。
+ */
+export function isDirectChild(path, base, tag) {
+  if (!base) return false;
+  const head = `${base}/${tag}[`;
+  const p = String(path || '');
+  if (!p.startsWith(head)) return false;
+  const rest = p.slice(head.length);
+  return rest.endsWith(']') && /^\d+$/.test(rest.slice(0, -1));
+}
+
+/**
+ * 商品本体の要素の道すじを返す (例: "ResultSet[0]/Result[0]")。見つからなければ null。
+ *
+ * ★「ルート直下が商品」と決め打ちしない。
+ *   実測 (2026-09-01): getItem の応答は ResultSet > Result の二段で、商品本体は 2 階層目にある。
+ *   ItemCode を持つ要素を商品本体とみなす。無ければ null = 判断できないので動かさない側に倒す。
+ * @param {Map<string,string>} flat
+ */
+export function itemBaseOf(flat) {
+  for (const k of flat.keys()) {
+    const m = String(k).match(/^(.*)\/ItemCode\[\d+\]$/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/**
  * 取ってきた商品が「捨ててよい検証用商品」か。問題なければ null、駄目なら理由。
  * ★商品名に目印が入っていることを、書き込む前に実物で確かめる。
  * @param {Map<string,string>} flat flattenXml の戻り
  */
 export function guardTestItem(flat) {
-  // ★商品本体の名前だけを見る (ルート直下の Name)。入れ子のどこかに目印があれば通る、では門番にならない
+  const base = itemBaseOf(flat);
+  if (!base) return '商品の場所 (ItemCode) を見つけられませんでした。検証用商品か確かめられないので動かしません';
+  // ★商品本体の名前だけを見る。入れ子のどこかに目印があれば通る、では門番にならない
   const names = [...flat.entries()]
-    .filter(([k]) => /^[^/]+\/Name\[\d+\]$/.test(k))
+    .filter(([k]) => isDirectChild(k, base, 'Name'))
     .map(([, v]) => v);
   if (names.length === 0) return '商品名を読めませんでした。検証用商品か確かめられないので動かしません';
   if (!names.some((n) => n.includes(TEST_NAME_MARKER))) {
@@ -119,12 +150,14 @@ export function isPricePath(path) {
 }
 
 /**
- * **商品本体の** 価格の道すじか (ルート直下の Price)。
+ * **商品本体の** 価格の道すじか。
  * ★「変わってよい」のはここだけ。SKU の価格まで見逃すと、
  *   item_code と price を送っただけで SKU の価格が動いても部分更新だと誤って結論する (Codex R5)。
+ * @param {string} path
+ * @param {string|null} itemBase itemBaseOf() の戻り。null なら「商品本体ではない」扱い (fail-closed)
  */
-export function isItemPricePath(path) {
-  return /^[^/]+\/Price\[\d+\]$/.test(String(path || ''));
+export function isItemPricePath(path, itemBase) {
+  return isDirectChild(path, itemBase, 'Price');
 }
 
 /**
@@ -132,20 +165,23 @@ export function isItemPricePath(path) {
  * ★変わった (価格以外) / 消えた / **増えた** の3つとも数える。
  *   増えたものを無視すると、項目が生えた時に部分更新だと誤って結論する (Codex R2)。
  * @param {{changed:Array,removed:Array,added:Array}} d diff() の戻り
+ * @param {string|null} itemBase itemBaseOf() の戻り
  */
-export function collateralOf(d) {
+export function collateralOf(d, itemBase) {
   return [
     // ★除外するのは商品本体の価格だけ。SKU の価格が動いたのは「価格以外の変化」として数える
-    ...(d.changed || []).filter((x) => !isItemPricePath(x.path)),
+    ...(d.changed || []).filter((x) => !isItemPricePath(x.path, itemBase)),
     ...(d.removed || []),
     ...(d.added || []),
   ];
 }
 
-/** 商品本体の価格 (SubCode 配下ではないもの) を1つ返す。読めなければ null */
+/** 商品本体の価格。読めなければ null */
 export function itemPriceOf(flat) {
+  const base = itemBaseOf(flat);
+  if (!base) return null;
   for (const [k, v] of flat) {
-    if (!isItemPricePath(k)) continue;
+    if (!isItemPricePath(k, base)) continue;
     const n = Number(v);
     return Number.isInteger(n) ? n : null;
   }

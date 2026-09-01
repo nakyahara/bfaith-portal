@@ -30,7 +30,7 @@
  */
 import 'dotenv/config';
 import {
-  flattenXml, diff, collateralOf, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
+  flattenXml, diff, collateralOf, guardTestCode, guardTestItem, itemPriceOf, editItemFailure, itemBaseOf,
   TEST_NAME_MARKER,
 } from './yahoo-edit-item-probe.js';
 
@@ -157,7 +157,7 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    const collateral = collateralOf(d1);
+    const collateral = collateralOf(d1, itemBaseOf(before));
     console.log(`\n${collateral.length === 0
       ? '✅ 価格は変わり、価格以外は変わっていません → editItem は「送った項目だけ変える」= 部分更新'
       : `🚨 価格以外が ${collateral.length} 項目 変わった/消えた → editItem は全項目上書き。価格だけ送ってはいけない`}`);
