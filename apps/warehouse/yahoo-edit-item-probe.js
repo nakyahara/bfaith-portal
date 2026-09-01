@@ -202,12 +202,12 @@ export function collateralOf(d, itemBase) {
 export function itemPriceOf(flat, itemCode) {
   const base = itemBaseOf(flat, itemCode);
   if (!base) return null;
-  for (const [k, v] of flat) {
-    if (!isItemPricePath(k, base)) continue;
-    const n = Number(v);
-    return Number.isInteger(n) ? n : null;
-  }
-  return null;
+  const values = [...flat.entries()].filter(([k]) => isItemPricePath(k, base)).map(([, v]) => v);
+  // ★商品直下の Price が複数 = 想定外の構造。どれが売価か決められないので読めない扱いにする。
+  //   最初の1つを採るとその値を基準に値付けしてしまう (Codex R3)
+  if (values.length !== 1) return null;
+  const n = Number(values[0]);
+  return Number.isInteger(n) ? n : null;
 }
 
 /**

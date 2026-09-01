@@ -112,6 +112,9 @@ console.log('\n── 価格の読み方 ──');
     + '<Result><ItemCode>zz-1</ItemCode><Price>1</Price></Result>'
     + '<Result><ItemCode>zz-1</ItemCode><Price>2</Price></Result></ResultSet>');
   eq(itemBaseOf(dup, 'zz-1'), null, '★同じコードが2つあれば決めない (取り違えるくらいなら動かさない)');
+  // ★商品直下の Price が複数 = 想定外の構造。最初の1つを採ると、その値を基準に値付けしてしまう (Codex R3)
+  const twoPrices = await flattenXml('<ResultSet><Result><ItemCode>zz-1</ItemCode><Price>100</Price><Price>200</Price></Result></ResultSet>');
+  eq(itemPriceOf(twoPrices, 'zz-1'), null, '★価格が2つあれば読めない扱い (書き込みに進ませない)');
 
   // 道すじの直下判定 ([ ] を含む道すじでも壊れない)
   ok(isDirectChild('A[0]/B[0]/Name[0]', 'A[0]/B[0]', 'Name'), '直下なら true');
