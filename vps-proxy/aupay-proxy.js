@@ -1254,6 +1254,75 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // POST /yahoo/update-items — 商品一括更新API (価格だけ変えられる)
+    //   request body: { items: [{ item_code, price, sale_price, ... }], itemNum?: boolean }
+    //   ★editItem と違い「指定された項目だけを更新し、省略された項目は更新しません」(公式)。
+    //     価格改定で商品名・説明・画像を巻き添えにしないために、こちらを使う。
+    //   ★フロント反映はしない。反映は /yahoo/submit-item を別に呼ぶ。
+    if (pathname === '/yahoo/update-items' && req.method === 'POST') {
+      if (!YAHOO_SELLER_ID) throw new Error('update-items: YAHOO_SELLER_ID が未設定のため送信しません');
+      const raw = await readBody(req);
+      let body;
+      try { body = JSON.parse(raw); } catch (_) { throw new Error('update-items: invalid JSON body'); }
+      const built = buildUpdateItemsBody(body.items, YAHOO_SELLER_ID, { includeItemNum: body.itemNum === true });
+      console.log(`[${ts()}] Yahoo updateItems: ${built.count}件 (${built.codes.join(',')}) body=${built.body.length}b`);
+      const r = await callYahooAPIRaw('updateItems', {
+        method: 'POST',
+        contentType: 'application/x-www-form-urlencoded',
+        body: built.body,
+      });
+      res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+      res.end(r.body);
+      return;
+    }
+
+    // POST /yahoo/submit-item — 商品個別反映API (updateItems の後にこれを呼ばないと客に見えない)
+    //   request body: { itemCode: string }
+    //   ★1件ずつしか指定できない。OK が返っても処理途中でエラーになることがある (公式) ので、
+    //     /yahoo/publish-history で未反映項目を確かめる
+    if (pathname === '/yahoo/submit-item' && req.method === 'POST') {
+      if (!YAHOO_SELLER_ID) throw new Error('submit-item: YAHOO_SELLER_ID が未設定のため送信しません');
+      const raw = await readBody(req);
+      let body;
+      try { body = JSON.parse(raw); } catch (_) { throw new Error('submit-item: invalid JSON body'); }
+      const code = String(body.itemCode || '').trim();
+      if (!code) throw new Error('submit-item: itemCode is required');
+      const params = new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: code });
+      console.log(`[${ts()}] Yahoo submitItem: item_code=${code}`);
+      const r = await callYahooAPIRaw('submitItem', {
+        method: 'POST',
+        contentType: 'application/x-www-form-urlencoded',
+        body: params.toString(),
+      });
+      res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+      res.end(r.body);
+      return;
+    }
+
+    // GET /yahoo/publish-history — 反映履歴 / 未反映項目詳細API
+    //   query: publish_id (既定 0 = 未反映項目), start, results
+    //   ★publish_id=0 で「まだ反映されていない項目」が取れる。反映できたかの確認に使う
+    if (pathname === '/yahoo/publish-history' && req.method === 'GET') {
+      if (!YAHOO_SELLER_ID) throw new Error('publish-history: YAHOO_SELLER_ID が未設定のため取得しません');
+      const q = new URLSearchParams({
+        seller_id: YAHOO_SELLER_ID,
+        publish_id: String(url.searchParams.get('publish_id') ?? '0'),
+      });
+      for (const key of ['start', 'results']) {
+        const v = url.searchParams.get(key);
+        if (v) q.append(key, v);
+      }
+      console.log(`[${ts()}] Yahoo publishHistoryDetail: ${q.toString()}`);
+      const r = await callYahooAPIRaw('publishHistoryDetail', {
+        method: 'GET',
+        body: null,
+        queryString: q.toString(),
+      });
+      res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+      res.end(r.body);
+      return;
+    }
+
     // POST /yahoo/my-item-list
     //   request body: { query: string, offset?: number, results?: number }
     //   Yahoo myItemList API (GET + query string、 start は 1-based) へ token + 署名付きで forward。
@@ -1590,6 +1659,44 @@ const server = http.createServer(async (req, res) => {
 });
 
 /**
+ * 商品一括更新API (updateItems) の form body を組み立てる。
+ *
+ * ★item1 の値は「1つの商品情報をまとめてエンコードしたもの」= **二重エンコード**。
+ *   公式の例: item1 の値は `item_code%3Dabc1%26name%3D%25E8%25BB%258A`
+ *   (中身は item_code=abc1&name=車 を1回エンコードしたもの。それを外側でもう1回エンコードする)
+ *   URLSearchParams を入れ子にすると自然にこの形になる。
+ *
+ * @param {Array<object>} items [{ item_code, price, sale_price, ... }] 最大100件
+ * @param {string} sellerId VPS が持っているストアアカウント (呼び出し側の値は使わない)
+ * @param {{includeItemNum?: boolean}} opts item_num を付けるか (公式のサンプルには無い)
+ * @returns {{body:string, count:number, codes:string[]}}
+ */
+function buildUpdateItemsBody(items, sellerId, opts = {}) {
+  if (!Array.isArray(items) || items.length === 0) throw new Error('updateItems: items が空です');
+  if (items.length > 100) throw new Error(`updateItems: 1回に送れるのは100件までです (${items.length}件)`);
+  const outer = new URLSearchParams();
+  outer.append('seller_id', String(sellerId));
+  if (opts.includeItemNum) outer.append('item_num', String(items.length));
+  const codes = [];
+  items.forEach((item, i) => {
+    const code = String(item?.item_code ?? '').trim();
+    if (!code) throw new Error(`updateItems: ${i + 1}件目に item_code がありません`);
+    codes.push(code);
+    const inner = new URLSearchParams();
+    inner.append('item_code', code);
+    for (const [k, v] of Object.entries(item)) {
+      if (k === 'item_code') continue;
+      // ★null / undefined は送らない。空文字は「空にする」という意味なので送る
+      //   (sale_price は「利用しない場合は空文字を指定」が公式の指示)
+      if (v === null || v === undefined) continue;
+      inner.append(k, String(v));
+    }
+    outer.append(`item${i + 1}`, inner.toString());   // ← 外側で自動的にもう1回エンコードされる
+  });
+  return { body: outer.toString(), count: items.length, codes };
+}
+
+/**
  * editItem の form body の seller_id を、VPS が持っている値に差し替える。
  * ★呼び出し側が付けた seller_id は捨てる (別の店に書き込む経路を作らない)。
  *   ただし呼び出し側が **別の店** を指定していたら mismatch として返す。
@@ -1719,6 +1826,45 @@ function runSelfTest() {
     withSellerId('item_code=zz-1', 'mystore').mismatch, null);
   check('editItem: item_code をログ用に取り出す',
     withSellerId('item_code=zz-yahoo-m0-0901&price=100', 'mystore').itemCode, 'zz-yahoo-m0-0901');
+
+  // 8) updateItems の body 組み立て。★公式ドキュメントの例をそのまま突き合わせる
+  //    例: seller_id=teststore&item1=item_code%3Dabc1%26name%3D%25E8%25BB%258A&item2=item_code%3Dabc2%26name%3D%25E6%2599%2582%25E8%25A8%2588
+  check('updateItems: 公式の例と同じ形になる',
+    buildUpdateItemsBody([{ item_code: 'abc1', name: '車' }, { item_code: 'abc2', name: '時計' }], 'teststore').body,
+    'seller_id=teststore&item1=item_code%3Dabc1%26name%3D%25E8%25BB%258A&item2=item_code%3Dabc2%26name%3D%25E6%2599%2582%25E8%25A8%2588');
+  check('updateItems: 件数とコードを返す',
+    (() => { const b = buildUpdateItemsBody([{ item_code: 'a' }, { item_code: 'b' }], 's'); return [b.count, b.codes]; })(),
+    [2, ['a', 'b']]);
+  // ★sale_price は「利用しない場合は空文字を指定」= 空文字は送る / null は送らない
+  check('updateItems: 空文字は送る (セール価格を使わない指定)',
+    buildUpdateItemsBody([{ item_code: 'a', price: 1000, sale_price: '' }], 's').body,
+    'seller_id=s&item1=item_code%3Da%26price%3D1000%26sale_price%3D');
+  check('updateItems: null は送らない',
+    buildUpdateItemsBody([{ item_code: 'a', price: 1000, member_price: null }], 's').body,
+    'seller_id=s&item1=item_code%3Da%26price%3D1000');
+  check('updateItems: item_code は必ず先頭',
+    buildUpdateItemsBody([{ price: 1000, item_code: 'a' }], 's').body,
+    'seller_id=s&item1=item_code%3Da%26price%3D1000');
+  check('updateItems: item_num を付けられる',
+    buildUpdateItemsBody([{ item_code: 'a' }], 's', { includeItemNum: true }).body,
+    'seller_id=s&item_num=1&item1=item_code%3Da');
+  check('updateItems: 空なら投げる',
+    (() => { try { buildUpdateItemsBody([], 's'); return 'なぜか通った'; } catch (e) { return e.message; } })(),
+    'updateItems: items が空です');
+  check('updateItems: 101件は投げる',
+    (() => {
+      try { buildUpdateItemsBody(Array.from({ length: 101 }, (_, i) => ({ item_code: 'c' + i })), 's'); return 'なぜか通った'; }
+      catch (e) { return e.message; }
+    })(),
+    'updateItems: 1回に送れるのは100件までです (101件)');
+  check('updateItems: item_code が無い行は投げる',
+    (() => { try { buildUpdateItemsBody([{ item_code: 'a' }, { price: 1 }], 's'); return 'なぜか通った'; } catch (e) { return e.message; } })(),
+    'updateItems: 2件目に item_code がありません');
+  // SKU別価格の書式 (サブコード:価格 をパイプ区切り) がそのまま通ること
+  check('updateItems: subcode_price の書式が壊れない',
+    decodeURIComponent(decodeURIComponent(
+      buildUpdateItemsBody([{ item_code: 'a', subcode_price: 'aaaa:1000|bbbb:1200' }], 's').body.split('item1=')[1])),
+    'item_code=a&subcode_price=aaaa:1000|bbbb:1200');
 
   // 6) 既存の挙動が壊れていないこと (Path は PathList 内の origFlag=1 優先)
   const paths = `<Result><PathList><Path>その他</Path><Path origFlag="1">本命</Path></PathList></Result>`;

@@ -178,6 +178,36 @@ export function diff(beforeMap, afterMap) {
   return { changed, removed, added };
 }
 
+/**
+ * 書き込めば必ず変わる項目 (実測 2026-09-01)。差分の判定から外す。
+ * ★外さないと「戻したのに2項目違う」と毎回 🚨 が出て、本当の異常が埋もれる。
+ * - UpdateTime   … 更新日時。書けば必ず変わる
+ * - EditingFlag  … 編集中フラグ。updateItems / editItem はフロント反映しないので 1 が立つ
+ */
+export const VOLATILE_TAGS = ['UpdateTime', 'EditingFlag'];
+
+/** 書き込めば必ず変わる項目の道すじか */
+export function isVolatilePath(path) {
+  const p = String(path || '');
+  return VOLATILE_TAGS.some((tag) => new RegExp(`(^|/)${tag}\\[\\d+\\](@[\\w.:-]+)?$`).test(p));
+}
+
+/** 差分から「書き込めば必ず変わる項目」を取り除く */
+export function withoutVolatile(d) {
+  const keep = (x) => !isVolatilePath(x.path);
+  return {
+    changed: (d.changed || []).filter(keep),
+    removed: (d.removed || []).filter(keep),
+    added: (d.added || []).filter(keep),
+  };
+}
+
+/** 差分の件数 (書き込めば必ず変わる項目は数えない) */
+export function diffCount(d) {
+  const x = withoutVolatile(d);
+  return x.changed.length + x.removed.length + x.added.length;
+}
+
 /** 価格の道すじか (商品本体でも SKU でも) */
 export function isPricePath(path) {
   return /(^|\/)Price\[\d+\]$/.test(String(path || ''));
@@ -202,11 +232,12 @@ export function isItemPricePath(path, itemBase) {
  * @param {string|null} itemBase itemBaseOf() の戻り
  */
 export function collateralOf(d, itemBase) {
+  const v = withoutVolatile(d);   // 書き込めば必ず変わる項目は「巻き添え」ではない
   return [
     // ★除外するのは商品本体の価格だけ。SKU の価格が動いたのは「価格以外の変化」として数える
-    ...(d.changed || []).filter((x) => !isItemPricePath(x.path, itemBase)),
-    ...(d.removed || []),
-    ...(d.added || []),
+    ...v.changed.filter((x) => !isItemPricePath(x.path, itemBase)),
+    ...v.removed,
+    ...v.added,
   ];
 }
 
