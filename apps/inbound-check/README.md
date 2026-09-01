@@ -33,13 +33,21 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
   → Render が30分おきに取得 (JST 6〜20時台。同じ内容なら取り込まない)
 【手動 (自動が止まったとき)】管理画面から CA04001_*.csv をアップロード
   ↓ どちらも同じ取込ロジックへ
-  → f_inbound_check_batches (active は常に1件) / slips / lines / line_state (全行 unchecked から)
+  → f_inbound_check_batches (active は常に1件) / slips / lines / line_state (同日は確認を引き継ぎ・翌日は未確認から)
   → iPad: GET /api/state で f_inbound_info (入数等) と mirror_logizard_stock (ピックロケ) を商品単位で結合して表示
 ```
 
 - 明細キー = `AR番号|入荷管理行番号|入荷管理詳細行番号`。商品IDはキーにしない
 - **取込は fail-closed**: 必須列欠落 / 列数不一致 / 数値でない予定数 / AR空 / 明細キー重複 / 同一ハッシュ / 生成時刻が active より古い → 拒否して active を据え置く。**0件は正常** (行数の前回比ガードは置かない)
-- **確認状態はバッチ単位** (毎朝リセット)。前バッチで確認済みだった行は「前回 … が確認済み」を薄字で出す (状態は引き継がない)
+- **確認状態は業務日 (JST) 単位**。同日中の再取込は確認を引き継ぎ、翌日は未確認から始まる
+  - ⭐miniPC は **08:40 と 11:45 の1日2回**取り込む。引き継ぎが無いと、**午前中に新しい受付が1件でも
+    登録された日は 11:45 の取込で午前の ✅ が全部消える** (同内容の CSV は file_hash 重複で弾かれるので
+    新しい受付があった日だけ起きる)。バッチに `work_date` (JST) を持たせて防ぐ
+  - 引き継ぐ条件 = **明細キー (AR|行|詳細行) と商品 (code_key) と予定数 が全部同じ**。
+    予定数が変わった / 商品が差し替わった明細は、数えたものが違うので必ず未確認に戻す
+  - 翌日は従来どおり全行 unchecked から始める (要件定義 §2 確定事項⑤)。
+    前バッチで確認済みだった行は「前回 … が確認済み」を薄字で出す (状態は引き継がない)
+  - `work_date` は **CSV 内の日付でもクライアント時刻でもなく、サーバーが取り込んだ時刻の JST 日付**
 - **同時操作**: `UPDATE line_state … WHERE status='unchecked' AND (expect_version IS NULL OR version=?)` の原子的条件付き UPDATE。負けたら 409 `conflict` + 現在状態。旧 batch_id の操作は 409 `stale_batch`。画面は 409 を受けたら最新状態に置き換える
 - events は append-only。取消は `reverted_event_id` で打ち消した確認を指す
 - ピックロケ = `mirror_logizard_stock` を商品×(ブロック略称-ロケ) で集約し、`P3F*` を在庫数順に最大3件。P3F が無ければ他ブロック先頭1件を「保管」

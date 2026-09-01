@@ -18,6 +18,14 @@ import { listTapCandidates, getStaffByNo, tapName } from '../staff/db.js';
 import { parseInboundCsv } from './csv.js';
 
 const utcNow = () => new Date().toISOString();
+
+/**
+ * 業務日 (JST の日付)。**サーバーが受け取った時刻**で決める。
+ * クライアント時刻や CSV 内の日付は使わない (端末の時計ずれで前日の一覧に混ざるため)。
+ */
+export function workDateJst(d = new Date()) {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+}
 const hashToken = t => crypto.createHash('sha256').update(String(t)).digest('hex');
 
 /**
@@ -216,6 +224,16 @@ export function createTables(db = getMirrorDB()) {
   // 確認イベントに staff_id (スタッフマスタの id) を後付け。worker (表示名) は従来どおり残す
   const cols = db.prepare('PRAGMA table_info(f_inbound_check_events)').all().map(c => c.name);
   if (!cols.includes('staff_id')) db.exec('ALTER TABLE f_inbound_check_events ADD COLUMN staff_id INTEGER');
+
+  // 取込バッチの業務日 (JST)。同日中の再取込で確認状態を引き継ぐ判定に使う。
+  // ⚠これが無いと 11:45 の取込で午前中の確認が全部消える (miniPC は 08:40 と 11:45 の2回取得する)
+  const bcols = db.prepare('PRAGMA table_info(f_inbound_check_batches)').all().map(c => c.name);
+  if (!bcols.includes('work_date')) {
+    db.exec('ALTER TABLE f_inbound_check_batches ADD COLUMN work_date TEXT');
+    // 既存バッチは取込時刻から埋める (UTC 保存なので +9 時間して JST の日付にする)
+    db.prepare("UPDATE f_inbound_check_batches SET work_date = date(imported_at, '+9 hours') WHERE work_date IS NULL").run();
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ic_batches_work_date ON f_inbound_check_batches(work_date, id)');
 }
 
 // ───────────────────────── 端末 (iPad) ─────────────────────────
@@ -437,6 +455,8 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
         return { ok: false, error: 'older_file', message, batch: active };
       }
     }
+    // ⭐同日中の再取込は確認状態を引き継ぐ。旧 active を superseded にする前に掴んでおく
+    const prevActive = active;
     // 旧 active を先に superseded にする (active の部分ユニーク索引があるため)
     db.prepare("UPDATE f_inbound_check_batches SET status = 'superseded' WHERE status = 'active'").run();
     const slipsMap = new Map();
@@ -445,24 +465,45 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       slipsMap.get(r.ar_no).line_count++;
     }
     const now = utcNow();
+    const workDate = workDateJst(new Date(now));
     const info = db.prepare(`INSERT INTO f_inbound_check_batches
-      (source, file_name, file_hash, csv_generated_at, data_max_at, row_count, slip_count, imported_at, imported_by, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')`)
-      .run(source, fileName, fileHash, genAt, dataMaxAt, parsed.rows.length, slipsMap.size, now, actor);
+      (source, file_name, file_hash, csv_generated_at, data_max_at, row_count, slip_count, imported_at, imported_by, status, work_date)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)`)
+      .run(source, fileName, fileHash, genAt, dataMaxAt, parsed.rows.length, slipsMap.size, now, actor, workDate);
     const batchId = Number(info.lastInsertRowid);
     const insSlip = db.prepare('INSERT INTO f_inbound_check_slips (batch_id, ar_no, planned_date, received_date, status, line_count, seq) VALUES (?, ?, ?, ?, ?, ?, ?)');
     for (const s of slipsMap.values()) insSlip.run(batchId, s.ar_no, s.planned_date, s.received_date, s.status, s.line_count, s.seq);
     const insLine = db.prepare(`INSERT INTO f_inbound_check_lines
       (batch_id, line_key, ar_no, line_no, detail_no, product_id, code_key, product_name, barcode, planned_qty, received_qty, seq)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-    const insState = db.prepare("INSERT INTO f_inbound_check_line_state (batch_id, line_key, status, version) VALUES (?, ?, 'unchecked', 1)");
+    const insState = db.prepare(`INSERT INTO f_inbound_check_line_state
+      (batch_id, line_key, status, version, checked_by, checked_device, checked_at) VALUES (?, ?, ?, 1, ?, ?, ?)`);
+    // ⭐同日中の再取込だけ確認状態を引き継ぐ (要件定義 v1.3 §11.6)。
+    //   引き継ぐ条件 = 明細キー (AR|行|詳細行) と商品 (code_key) と予定数 が全部同じ。
+    //   予定数が変わった / 商品が差し替わった明細は、数えたものが違うので必ず未確認に戻す。
+    //   翌日は従来どおり全部未確認から始める (§2 確定事項⑤「毎朝リセット」を守る)。
+    const carry = new Map();
+    if (prevActive && prevActive.work_date === workDate) {
+      for (const p of db.prepare(`SELECT s.line_key, s.status, s.checked_by, s.checked_device, s.checked_at, l.code_key, l.planned_qty
+          FROM f_inbound_check_line_state s
+          JOIN f_inbound_check_lines l ON l.batch_id = s.batch_id AND l.line_key = s.line_key
+          WHERE s.batch_id = ? AND s.status = 'checked'`).all(prevActive.id)) {
+        carry.set(p.line_key, p);
+      }
+    }
+    let carried = 0;
     for (const r of parsed.rows) {
       insLine.run(batchId, r.line_key, r.ar_no, r.line_no, r.detail_no, r.product_id, r.code_key, r.product_name, r.barcode, r.planned_qty, r.received_qty, r.seq);
-      insState.run(batchId, r.line_key);
+      const p = carry.get(r.line_key);
+      const same = p && p.code_key === r.code_key && p.planned_qty === r.planned_qty;
+      if (same) carried++;
+      insState.run(batchId, r.line_key, same ? 'checked' : 'unchecked',
+        same ? p.checked_by : null, same ? p.checked_device : null, same ? p.checked_at : null);
     }
-    logImport(db, { actor, source, fileName, ok: true, batchId, message: `${parsed.rows.length}行 / ${slipsMap.size}伝票` });
+    logImport(db, { actor, source, fileName, ok: true, batchId,
+      message: `${parsed.rows.length}行 / ${slipsMap.size}伝票` + (carried ? ` (同日の確認 ${carried}行を引き継ぎ)` : '') });
     cleanupOld(db);
-    return { ok: true, batch: getBatch(batchId), rowCount: parsed.rows.length, slipCount: slipsMap.size, imageSkus: parsed.rows.map(r => r.product_id) };
+    return { ok: true, batch: getBatch(batchId), rowCount: parsed.rows.length, slipCount: slipsMap.size, carriedOver: carried, imageSkus: parsed.rows.map(r => r.product_id) };
   });
   try {
     const r = tx.immediate();

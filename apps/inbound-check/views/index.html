@@ -319,27 +319,34 @@
 
     // 詳細パネルの打ちかけの値を控える / 描き直したあとに戻す。
     // 5秒ポーリングや他の行の消し込みで再描画が走っても、入力中の入数が消えないようにする
+    // ⚠詳細は複数行を同時に開ける (openLines) ので、開いている行を全部控える。
+    //   最初の1行しか見ないと、2行目以降の打ちかけが再描画で消える
     function captureDraft() {
-      const row = document.querySelector('.row.open');
-      if (!row || !editDirty) return null;
-      const values = {};
-      for (const el of row.querySelectorAll('[data-f]')) values[el.getAttribute('data-f')] = el.value;
+      if (!editDirty) return null;
+      const rows = [...document.querySelectorAll('.row.open')];
+      if (rows.length === 0) return null;
       const a = document.activeElement;
-      const focus = a && row.contains(a) && a.getAttribute ? a.getAttribute('data-f') : null;
-      return { key: row.getAttribute('data-key'), values, focus };
+      return rows.map(row => {
+        const values = {};
+        for (const el of row.querySelectorAll('[data-f]')) values[el.getAttribute('data-f')] = el.value;
+        const focus = a && row.contains(a) && a.getAttribute ? a.getAttribute('data-f') : null;
+        return { key: row.getAttribute('data-key'), values, focus };
+      });
     }
-    function restoreDraft(d) {
-      if (!d) return;
-      const row = [...document.querySelectorAll('.row')].find(r => r.getAttribute('data-key') === d.key);
-      if (!row) return;
-      for (const el of row.querySelectorAll('[data-f]')) {
-        const v = d.values[el.getAttribute('data-f')];
-        if (v !== undefined) el.value = v;
-      }
-      applyIrohaLock(row);
-      if (d.focus) {
-        const el = row.querySelector('[data-f="' + d.focus + '"]');
-        if (el) { try { el.focus(); } catch { /* iOS で失敗しても値は戻っている */ } }
+    function restoreDraft(drafts) {
+      if (!drafts) return;
+      for (const d of drafts) {
+        const row = [...document.querySelectorAll('.row')].find(r => r.getAttribute('data-key') === d.key);
+        if (!row) continue;
+        for (const el of row.querySelectorAll('[data-f]')) {
+          const v = d.values[el.getAttribute('data-f')];
+          if (v !== undefined) el.value = v;
+        }
+        applyIrohaLock(row);
+        if (d.focus) {
+          const el = row.querySelector('[data-f="' + d.focus + '"]');
+          if (el) { try { el.focus(); } catch { /* iOS で失敗しても値は戻っている */ } }
+        }
       }
     }
     // いろは=有り の行は、いろは側で在庫化するので下の3項目を触らせない (実際に「－」を書くのはサーバー)
@@ -551,12 +558,19 @@
       }
     }
 
+    // ⚠サーバー (getState) と同じ数え方をすること。undecided / toIroha を落とすと、
+    //   消し込みのたびに上部の「行き先未設定 N」「🏠いろは N」が消えて、次のポーリングで戻る
     function recount() {
       const c = new Map();
-      let checked = 0;
-      for (const l of state.lines) if (l.check_status === 'checked') { checked++; c.set(l.ar_no, (c.get(l.ar_no) || 0) + 1); }
+      let checked = 0, undecided = 0, toIroha = 0;
+      for (const l of state.lines) {
+        const done = l.check_status === 'checked';
+        if (done) { checked++; c.set(l.ar_no, (c.get(l.ar_no) || 0) + 1); }
+        if (!done && l.dest && l.dest.missing && l.dest.missing.includes('iroha')) undecided++;
+        if (done && l.dest && l.dest.destination === 'iroha') toIroha++;
+      }
       for (const s of state.slips) s.checked_count = c.get(s.ar_no) || 0;
-      state.totals = { lines: state.lines.length, checked };
+      state.totals = { lines: state.lines.length, checked, undecided, toIroha };
     }
 
     // ─── 入庫情報の保存 ───

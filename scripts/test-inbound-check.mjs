@@ -27,7 +27,7 @@ const dbMod = await import('../apps/inbound-check/db.js');
 const { parseInboundCsv } = csvMod;
 const {
   getDB, importCsv, getActiveBatch, getState, applyCheck, listEvents, eventsCsv, cleanupOld,
-  createDevice, verifyDevice, revokeDevice, listDevices, listWorkers, getWorker, productInfoMap,
+  createDevice, verifyDevice, revokeDevice, listDevices, listWorkers, getWorker, productInfoMap, workDateJst,
 } = dbMod;
 
 let pass = 0, fail = 0;
@@ -159,20 +159,33 @@ console.log('\n[3] 消し込み');
   ok(eventsCsv(b.id).includes("'=HYPERLINK"), '履歴CSV: 先頭 = の値はアポストロフィで無害化');
 }
 
-// ─── 新バッチ: 状態はリセット・旧 batch は stale ───
-console.log('\n[2b] 新バッチ');
+// ─── 新バッチ: 同日は引き継ぎ / 翌日はリセット・旧 batch は stale ───
+// ⚠miniPC は 08:40 と 11:45 の1日2回取り込む。同日の2回目で午前中の確認が消えると現場が二度手間になる
+console.log('\n[2b] 新バッチ (同日引き継ぎ / 翌日リセット)');
 {
   const old = getActiveBatch();
-  const csvB = makeCsv([row('AR1', 1, 'abcDEF', 100), row('AR3', 1, 'new', 3)]);
+  // AR1|2|1 は予定数を 12 → 20 に変える (数えたものが違うので引き継がない)
+  const csvB = makeCsv([row('AR1', 1, 'abcDEF', 100), row('AR1', 2, 'x2', 20), row('AR3', 1, 'new', 3)]);
   const r = importCsv(csvB, { fileName: 'b.csv', source: 'manual_upload', generatedAt: '2026-09-02T00:00:00Z' });
   ok(r.ok && getActiveBatch().id === r.batch.id, '取込 B が active');
   ok(db.prepare("SELECT COUNT(*) c FROM f_inbound_check_batches WHERE status='active'").get().c === 1, 'active は常に1件');
+  ok(getActiveBatch().work_date === workDateJst(), '新バッチに work_date (JST) が入る');
   const st = getState();
-  ok(st.lines.every(l => l.check_status === 'unchecked'), '新バッチは全行 unchecked (毎朝リセット)');
   const l1 = st.lines.find(l => l.line_key === 'AR1|1|1');
-  ok(l1.prev_checked && l1.prev_checked.by === '山田', '前回確認済みの参考表示');
+  ok(l1.check_status === 'checked' && l1.checked_by === '山田', '同日の再取込: 明細キー・商品・予定数が同じ行は確認を引き継ぐ');
+  ok(r.carriedOver === 1, '取込結果に引き継ぎ件数 (carriedOver)');
+  const l2 = st.lines.find(l => l.line_key === 'AR1|2|1');
+  ok(l2.check_status === 'unchecked' && !!l2.prev_checked, '予定数が変わった明細は引き継がず未確認 (前回確認は参考表示)');
+  ok(st.lines.find(l => l.line_key === 'AR3|1|1').check_status === 'unchecked', '新しい明細は未確認');
   const stale = applyCheck({ batchId: old.id, lineKey: 'AR1|1|1', action: 'check', worker: '山田', expectVersion: 1 });
   ok(!stale.ok && stale.error === 'stale_batch' && stale.activeBatchId === r.batch.id, '旧 batch_id の操作 = stale_batch');
+  // 翌日の取込 (active の work_date を1日戻して再現) は引き継がない = 要件 §2 確定事項⑤ 毎朝リセット
+  db.prepare("UPDATE f_inbound_check_batches SET work_date = date(work_date, '-1 day') WHERE id = ?").run(r.batch.id);
+  const rc = importCsv(makeCsv([row('AR1', 1, 'abcDEF', 100), row('AR3', 1, 'new', 3)]), { fileName: 'c.csv', generatedAt: '2026-09-02T06:00:00Z' });
+  ok(rc.ok && rc.carriedOver === 0, '翌日の取込は引き継がない');
+  const st2 = getState();
+  ok(st2.lines.every(l => l.check_status === 'unchecked'), '翌日は全行 unchecked (毎朝リセット)');
+  ok(st2.lines.find(l => l.line_key === 'AR1|1|1').prev_checked.by === '山田', '前回確認済みの参考表示');
   ok(getActiveBatch().data_max_at === '2026-08-31T22:03:11+09:00', 'data_max_at = 明細の更新日時の最大');
   const olderData = importCsv(makeCsv([row('AR7', 1, 'q', 1, { 更新日時: '20260830090000', 作成日時: '20260830090000' })]), { fileName: 'old-data.csv', generatedAt: '2026-09-09T00:00:00Z' });
   ok(!olderData.ok && olderData.error === 'older_file' && /明細/.test(olderData.message), '生成時刻が新しくても明細時刻が古いCSVは拒否 (File.lastModified を信用しない)');
