@@ -50,6 +50,11 @@ console.log('\n── 「送る前に弾かれた」と言い切れるか ──
   ok(!isDefiniteRejection(null), '成功に対しては false');
   ok(!isDefiniteRejection(editItemError({ status: 400, body: 'ただの文字列' })),
     '4xx でも中身が読めなければ言い切らない');
+  // ★Code だけの見たことがない 400 は言い切らない (Codex R1)
+  ok(!isDefiniteRejection(editItemError({ status: 400, body: '<Result><Code>xx-99</Code></Result>' })),
+    '★項目を名指ししていない 400 は言い切らない');
+  ok(!isDefiniteRejection(editItemError({ status: 400, body: '<Result><Target>path</Target></Result>' })),
+    '★Target だけで Code も NG も無い 400 も言い切らない');
 }
 
 console.log('\n── 「前」の応答から値を取る ──');

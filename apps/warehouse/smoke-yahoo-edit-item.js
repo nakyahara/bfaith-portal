@@ -45,8 +45,10 @@ const SETTLE_WAIT_MS = 15_000;
 const SETTLE_ROUNDS = 3;
 /** 価格の上限 (楽天側のガードと同じ)。これ以上は検証用としても扱わない */
 const MAX_PRICE = 999999999;
-/** 必須項目を足していく回数の上限 (堂々巡りを避ける) */
-const MAX_FIELD_ROUNDS = 15;
+/** 足せる必須項目の数の上限 (堂々巡りを避ける) */
+const MAX_FIELDS_TO_ADD = 15;
+/** 送信回数の上限。最後に足した項目でもう一度送るぶん +1 (Codex R1) */
+const MAX_SENDS = MAX_FIELDS_TO_ADD + 1;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const args = process.argv.slice(2);
@@ -113,7 +115,7 @@ async function sendAddingRequiredFields(before, itemBase, price) {
   const required = [];
   let uncertain = false;
 
-  for (let round = 1; round <= MAX_FIELD_ROUNDS; round++) {
+  for (let round = 1; round <= MAX_SENDS; round++) {
     const sending = Object.keys(fields).join(', ');
     console.log(`\n[${round}] 送る項目: ${sending}`);
     let res;
@@ -145,6 +147,10 @@ async function sendAddingRequiredFields(before, itemBase, price) {
       return { applied: false, fields, required, uncertain,
         stopReason: `${target} は既に送っていますが、まだ受け付けられません (${oneLine(err.message)})` };
     }
+    if (required.length >= MAX_FIELDS_TO_ADD) {
+      return { applied: false, fields, required, uncertain,
+        stopReason: `必須項目を ${MAX_FIELDS_TO_ADD} 個足しても通りませんでした (次に求められたのは「${target}」)` };
+    }
     if (!FIELD_SOURCES[target]) {
       return { applied: false, fields, required, uncertain,
         stopReason: `知らない項目「${target}」を求められました。値を作れないのでここで止めます (${oneLine(err.message)})` };
@@ -159,7 +165,22 @@ async function sendAddingRequiredFields(before, itemBase, price) {
     required.push(target);
   }
   return { applied: false, fields, required, uncertain,
-    stopReason: `必須項目を ${MAX_FIELD_ROUNDS} 回足しても通りませんでした` };
+    stopReason: `${MAX_SENDS} 回送っても通りませんでした` };
+}
+
+/**
+ * 「前」の応答から復元できる項目をすべて集める。
+ * ★戻しは必須項目だけでは足りない (Codex R1)。もし editItem が「送らなかった項目を消す」なら、
+ *   必須項目だけで戻すと、消えた商品名・説明などが消えたまま固定されてしまう。
+ */
+function fullRestoreFields(before, itemBase, price) {
+  const fields = { item_code: itemCode, price: String(price) };
+  for (const name of Object.keys(FIELD_SOURCES)) {
+    if (name === 'item_code' || name === 'price') continue;
+    const v = fieldValueFrom(before, itemBase, name);
+    if (v !== null) fields[name] = v;
+  }
+  return fields;
 }
 
 async function main() {
@@ -237,9 +258,17 @@ async function main() {
   } finally {
     console.log(`\n価格を元に戻します (${probePrice} → ${currentPrice})`);
     try {
-      // 戻しも「通った時と同じ項目一式」で送る (必須項目を欠くとまた弾かれる)
-      const r2 = await callEditItem({ ...sent.fields, price: String(currentPrice) });
-      const restoreErr = editItemError(r2);
+      // ★「前」から復元できる項目を全部送る。必須項目だけだと、消えた項目が消えたまま固定される
+      const restoreFields = fullRestoreFields(before, itemBase, currentPrice);
+      console.log(`  戻しに送る項目: ${Object.keys(restoreFields).join(', ')}`);
+      let r2 = await callEditItem(restoreFields);
+      let restoreErr = editItemError(r2);
+      if (restoreErr) {
+        // 全部送って弾かれたら、通った時と同じ項目一式でもう一度 (せめて価格だけでも戻す)
+        console.error(`  全項目での戻しが弾かれました (${oneLine(restoreErr.message || r2.body)})。必須項目だけで戻します`);
+        r2 = await callEditItem({ ...sent.fields, price: String(currentPrice) });
+        restoreErr = editItemError(r2);
+      }
       console.log(`editItem: HTTP ${r2.status} / ${oneLine(r2.body)}`);
       if (restoreErr) {
         console.error(`🚨 戻せていません。Yahoo の管理画面で価格を ${currentPrice} に直してください`);

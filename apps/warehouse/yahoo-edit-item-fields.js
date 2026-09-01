@@ -54,6 +54,7 @@ export function editItemError(res) {
   if (status2xx && !ng && !/<Error[\s>]/i.test(text)) return null;
   return {
     status,
+    ng,
     target: pick('Target'),
     code: pick('Code'),
     message: pick('Message'),
@@ -67,9 +68,12 @@ export function editItemError(res) {
  */
 export function isDefiniteRejection(err) {
   if (!err) return false;
-  // 4xx で、どの項目が悪いか・何のエラーかを名指しできている = Yahoo が受け付けずに返した
-  if (err.status >= 400 && err.status < 500 && (err.target || err.code)) return true;
-  return false;
+  // ★実測した形だけを「弾かれた」と言い切る (Codex R1):
+  //   4xx + <Target> で項目を名指し + <Code> か Status NG が付いている。
+  //   Code だけの見たことがない 400 は言い切らない (書き込まれたかもしれない方に倒す)
+  if (err.status < 400 || err.status >= 500) return false;
+  if (!err.target) return false;
+  return Boolean(err.code || err.ng);
 }
 
 /**
