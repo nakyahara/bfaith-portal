@@ -223,9 +223,10 @@ async function main() {
   const sent = await sendAddingRequiredFields(before, itemBase, probePrice);
   console.log(`\n必須だった項目: ${sent.required.length > 0 ? sent.required.join(' → ') : '(なし)'}`);
 
-  // ★「書き込みが起きていないから戻さない」という判断はしない (Codex R2)。
-  //   その判断を誤ると壊れたまま残る。戻しは同じ値を書くだけなので、常に通しても害が無い。
-  //   代わりに「弾かれただけ」なのか「本当に戻せていない」のかを、報告の側で区別する。
+  // ★受け付けられずに返ってきた回は、**戻しの送信もしない** (Codex R4)。
+  //   いま確かめようとしているのは「送らなかった項目が消えるか」。もし消えるなら、
+  //   戻しのつもりの書き込み自体が、復元できない項目 (画像など) を消しかねない。
+  //   書き込みが起きていない以上、読み直して「前」と同じであることを確かめれば足りる。
   const definiteReject = !sent.applied && !sent.uncertain;
   if (definiteReject) {
     console.error(`\n⚠️ 送信は通りませんでした: ${sent.stopReason}`);
@@ -258,19 +259,25 @@ async function main() {
       : `🚨 価格以外が ${collateral.length} 項目 変わった/消えた → **送らなかった項目は消える**。`
         + '価格更新でも全項目を送り直す設計が要る'}`);
   } finally {
-    console.log(`\n元の状態に戻します (価格 ${currentPrice} + 「前」から復元できる項目)`);
     try {
-      const restoreFields = fullRestoreFields(before, itemBase, currentPrice);
-      console.log(`  戻しに送る項目: ${Object.keys(restoreFields).join(', ')}`);
-      let r2 = await callEditItem(restoreFields);
-      let restoreErr = editItemError(r2);
-      if (restoreErr) {
-        // 全部送って弾かれたら、通った時と同じ項目一式でもう一度 (せめて価格だけでも戻す)
-        console.error(`  復元できる項目一式が弾かれました (${oneLine(restoreErr.message || r2.body)})。必須項目だけで戻します`);
-        r2 = await callEditItem({ ...sent.fields, price: String(currentPrice) });
+      let restoreErr = null;
+      let r2 = null;
+      if (definiteReject) {
+        console.log('\n受け付けられずに返ってきたので、戻しの送信はしません。いまの状態だけ確かめます。');
+      } else {
+        console.log(`\n元の状態に戻します (価格 ${currentPrice} + 「前」から復元できる項目)`);
+        const restoreFields = fullRestoreFields(before, itemBase, currentPrice);
+        console.log(`  戻しに送る項目: ${Object.keys(restoreFields).join(', ')}`);
+        r2 = await callEditItem(restoreFields);
         restoreErr = editItemError(r2);
+        if (restoreErr) {
+          // 復元できる項目一式が弾かれたら、通った時と同じ項目一式でもう一度 (せめて価格だけでも戻す)
+          console.error(`  復元できる項目一式が弾かれました (${oneLine(restoreErr.message || r2.body)})。必須項目だけで戻します`);
+          r2 = await callEditItem({ ...sent.fields, price: String(currentPrice) });
+          restoreErr = editItemError(r2);
+        }
+        console.log(`editItem: HTTP ${r2.status} / ${oneLine(r2.body)}`);
       }
-      console.log(`editItem: HTTP ${r2.status} / ${oneLine(r2.body)}`);
       // ★最後は「送れたか」ではなく **いまの状態が「前」と同じか** で判断する
       const restored = await flattenXml(await getRawXml(itemCode));
       const back = diff(before, restored);
