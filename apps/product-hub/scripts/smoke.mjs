@@ -2694,6 +2694,39 @@ let wfSetParentId = null;
     check('ボード: 枠1 (_top) が登録されると TOP が「済」になる',
       cardWithTop.image?.top?.registered === true, JSON.stringify(cardWithTop.image?.top || null));
     db.prepare("DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id IN ('smoke-img-01','smoke-img-top')").run(wfDraftId);
+
+    // 詳細画像は「作り終わったか」で 済/まだ を出す (2026-09-01 中原さん要望)。
+    // ⑧楽天登録・⑨A+登録 は作った画像をモールに載せる後工程なので、そこに来ていれば made=true。
+    // ⑦Amazon登録依頼 は最終デザイン確認を兼ねるので、まだ made ではない。
+    // 他のボードテストの前提 (どの商品がどの列にいるか) を崩さないよう、専用の商品で試して消す
+    {
+      const madeId = Number(db.prepare(
+        "INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-MADE', '画像 済 判定テスト', 'draft', 'smoke')"
+      ).run().lastInsertRowid);
+      wfp.ensureProgress(db, madeId);
+      const madeOf = () => wfp.boardData(db, {}).columns.flatMap((c) => c.cards)
+        .find((x) => x.id === madeId)?.image?.detail;
+      check('ボード: 制作の途中は「まだ」 (made=false)',
+        madeOf()?.made === false, JSON.stringify(madeOf()?.current?.step_code || null));
+      for (const code of ['imgd_request', 'imgd_compose', 'imgd_material', 'imgd_ai', 'imgd_design', 'imgd_review_1', 'imgd_review_2']) {
+        wfp.setStepState(madeId, code, { state: 'done' }, 'smoke', ADMIN);
+      }
+      check('ボード: ⑦Amazon登録依頼 で止まっている間は「まだ」',
+        madeOf()?.made === false && madeOf()?.current?.step_code === 'imgd_amazon',
+        JSON.stringify(madeOf()?.current?.step_code || null));
+      wfp.setStepState(madeId, 'imgd_amazon', { state: 'done' }, 'smoke', ADMIN);
+      check('ボード: ⑧楽天登録に移ったら「済」 (画像は作り終わっている・工程はまだ残る)',
+        madeOf()?.made === true && madeOf()?.done === false
+        && madeOf()?.current?.step_code === 'imgd_rakuten',
+        JSON.stringify(madeOf()?.current?.step_code || null));
+      check('ボード: 詳細画像が対象外の商品は made にしない (対象外のまま)', (() => {
+        wfp.setDetailImagesExcluded(madeId, true, 'smoke', ADMIN);
+        const t = madeOf();
+        wfp.setDetailImagesExcluded(madeId, false, 'smoke', ADMIN);
+        return t?.excluded === true && t?.made === false;
+      })());
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(madeId);
+    }
   }
 
   // 画像ビュー: 列は商品詳細 (LP) の 10 段階。カードは 1 商品 1 枚 (2026-08-31 TOP工程の廃止)
@@ -5152,19 +5185,19 @@ for (const [name, file, data] of renders) {
     return b && IMG_ROW_TEXT[b.state].includes(b.text);
   });
   const rows = krowsOf(bh);
-  check('ボード: カードの TOP 行に 済/まだ のバッジが付く',
-    rowsOk(rows.filter((r) => r.includes('>TOP<'))),
-    rows.filter((r) => r.includes('>TOP<')).slice(0, 2).join(' | ') || '(TOP の行が無い)');
-  check('ボード: カードの 詳細 行に 済/まだ/対象外 のバッジが付く',
-    rowsOk(rows.filter((r) => r.includes('>詳細<'))),
-    rows.filter((r) => r.includes('>詳細<')).slice(0, 2).join(' | ') || '(詳細の行が無い)');
+  check('ボード: カードの トップ画像 行に 済/まだ のバッジが付く',
+    rowsOk(rows.filter((r) => r.includes('>トップ画像<'))),
+    rows.filter((r) => r.includes('>トップ画像<')).slice(0, 2).join(' | ') || '(TOP の行が無い)');
+  check('ボード: カードの 詳細画像 行に 済/まだ/対象外 のバッジが付く',
+    rowsOk(rows.filter((r) => r.includes('>詳細画像<'))),
+    rows.filter((r) => r.includes('>詳細画像<')).slice(0, 2).join(' | ') || '(詳細の行が無い)');
   {
     // 完了列にも同じ 2 行が出る (本流を D&D で完了にすると TOP画像が未登録のまま完了列に入りうる)
     const bhDone = renderedHtml.get('board.ejs (完了列にカード)') || '';
     const doneCol = bhDone.split('data-col="done"')[1] || '';
     const doneRows = krowsOf(doneCol);
-    check('ボード: 完了列のカードにも TOP / 詳細 の状況が出る',
-      rowsOk(doneRows.filter((r) => r.includes('>TOP<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細<'))),
+    check('ボード: 完了列のカードにも トップ画像 / 詳細画像 の状況が出る',
+      rowsOk(doneRows.filter((r) => r.includes('>トップ画像<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細画像<'))),
       doneRows.slice(0, 2).join(' | ') || '(完了列に画像の行が無い)');
   }
   check('ボード: 確認中のカードに理由ラベルが出る',

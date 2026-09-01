@@ -80,7 +80,7 @@
      TOP は工程を廃止した (2026-08-31) ので、出品ゲートと同じ「枠1 (_top) が登録されているか」で見る */
   .kb-imgtracks { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
   .kb-krow { display: flex; align-items: center; gap: 5px; color: #64748b; }
-  .kb-krow .kb-kname { flex: 0 0 30px; font-weight: 700; color: #475569; }
+  .kb-krow .kb-kname { flex: 0 0 62px; font-weight: 700; color: #475569; }   /* 「トップ画像」が折り返さない幅 */
   .kb-state { flex: 0 0 auto; font-weight: 700; border-radius: 4px; padding: 1px 7px; border: 1px solid; }
   .kb-state.done { background: #dcfce7; color: #166534; border-color: #86efac; }
   .kb-state.todo { background: #fff7ed; color: #b45309; border-color: #fdba74; }
@@ -176,18 +176,21 @@
     // 出品が止まる (逆も) と、現場はどちらを信じればいいか分からなくなる
     const imgStateRows = (c) => {
       const t = (c.image && c.image.detail) || null;
+      // 詳細画像は「作り終わったか」で 済/まだ を出す (2026-09-01 中原さん)。
+      // ⑧楽天登録・⑨A+登録 は作った画像を載せる後工程なので、そこに来ていれば「済」。
+      // 済でも いまの工程名は残す (「済 楽天登録」= 作り終わって登録の番、が 1 行で読める)
       const detail = !t ? { state: 'off', text: '—' }
         : t.excluded ? { state: 'off', text: '対象外' }
-          : t.done ? { state: 'done', text: '済' }
+          : (t.done || t.made) ? { state: 'done', text: '済', note: t.current ? t.current.label : '' }
             : { state: 'todo', text: 'まだ', note: t.current ? t.current.label : '', stalledDays: t.stalledDays };
       const topDone = !!(c.image && c.image.top && c.image.top.registered);
       return [
         {
-          name: 'TOP',
+          name: 'トップ画像',
           title: topDone ? 'TOP画像 (枠1) が登録されています' : 'TOP画像 (枠1 = 商品コード_top) がまだ登録されていません',
           ...(topDone ? { state: 'done', text: '済' } : { state: 'todo', text: 'まだ' }),
         },
-        { name: '詳細', title: '商品詳細画像 (LP) の工程', ...detail },
+        { name: '詳細画像', title: '商品詳細画像 (LP)。楽天登録・A+登録まで来たら「済」', ...detail },
       ];
     };
   %>

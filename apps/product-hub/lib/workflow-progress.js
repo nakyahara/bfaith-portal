@@ -483,6 +483,23 @@ function splitImageRows(imageRows) {
   };
 }
 
+/**
+ * 「画像はもう作り終わっている」とみなす段階 (2026-09-01 中原さん:「画像で並べるステータスが
+ * 楽天登録に移動したらカードは済にしてほしい」)。⑧楽天登録・⑨A+登録 は**作った画像をモールに
+ * 載せる後工程**なので、ここまで来ていれば制作としては終わっている。
+ * ⑦Amazon登録依頼 は最終デザイン確認を兼ねるので含めない (中原さんの線引き)。
+ * 工程コードでなく image_stage で見るのは、管理画面での改名・並べ替えで壊れないため
+ * (image_stage は「TOP/詳細の同じ段階を 1 列にまとめる安定キー」として置いてある)。
+ */
+export const IMAGE_MADE_STAGES = ['rakuten', 'aplus'];
+
+/** 商品詳細画像が作り終わっているか (決着済み、または登録の後工程まで来ている) */
+export function imageMadeOf(summary) {
+  if (!summary || summary.excluded) return false;
+  if (summary.done) return true;
+  return IMAGE_MADE_STAGES.includes(summary.current?.image_stage || '');
+}
+
 /** 1 種別分のサマリー (current / done / 滞留)。excluded の種別は current を出さない */
 function kindSummaryOf(rows, createdAt, excluded = false) {
   const current = excluded ? null : currentOf(rows);
@@ -1228,10 +1245,16 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     // 工程ベースの p.imageTop は active=0 で常に空 = 常に「未完了」に見えるため使わない
     top: { registered: d.has_top_image === 1 },
     detail: d.detail_images_excluded === 1
-      ? { excluded: true, steps: [], current: null, done: false, stalledDays: null }
+      ? { excluded: true, steps: [], current: null, done: false, made: false, stalledDays: null }
       : {
         steps: p.imageDetail.rows.map((r) => ({ state: r.state, label: r.label })),
-        current: p.imageDetail.current, done: p.imageDetail.done, stalledDays: p.imageDetail.stalledDays,
+        current: p.imageDetail.current, done: p.imageDetail.done,
+        // made = 「画像はもう作り終わっている」(2026-09-01 中原さん:「画像で並べるステータスが
+        // 楽天登録に移動したらカードは済にしてほしい」)。⑧楽天登録・⑨A+登録 は作った画像を
+        // モールに載せる後工程なので、ここまで来たカードは制作としては終わっている。
+        // ⑦Amazon登録依頼 は最終デザイン確認を兼ねるので「まだ」のまま (中原さんの線引き)
+        made: imageMadeOf(p.imageDetail),
+        stalledDays: p.imageDetail.stalledDays,
       },
   });
 
