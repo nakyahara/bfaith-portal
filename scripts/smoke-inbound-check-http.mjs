@@ -32,6 +32,21 @@ if (csvPath && fs.existsSync(csvPath)) {
   const now = new Date().toISOString();
   m.prepare(`INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ, 直接ピックロケ保管, BF保管荷姿, いろは在庫化作業有無, source, created_at, updated_at)
     VALUES ('asahilabo15g', 'asahilabo15g', 'アサヒ商品', 10, '不要', '', 'そのまま', '無し', 'manual', ?, ?)`).run(now, now);
+  // 他の商品も「行き先が決まっている」状態にしておく。
+  // ⭐こうしないと確認のたびに行き先ゲートが開き、作業者記録や version の検証ができない
+  const { parseInboundCsv } = await import('../apps/inbound-check/csv.js');
+  const seedIns = m.prepare(`INSERT OR IGNORE INTO f_inbound_info
+    (code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ, いろは在庫化作業有無, source, created_at, updated_at)
+    VALUES (?, ?, ?, 1, '不要', '無し', 'manual', ?, ?)`);
+  for (const row of parseInboundCsv(fs.readFileSync(csvPath)).rows) {
+    if (row.product_id === 'b07bl10ml') continue;    // ← 行き先ゲート / 未登録の導線に使うので残す
+    if (row.product_id === 'b17ls10ml') continue;  // ← 商品マスタにも無い商品の逃げ道に使う
+    seedIns.run(row.code_key, row.product_id, row.product_name, now, now);
+  }
+  // b07bl10ml は商品マスタにだけ載せる = その場で選んだ行き先を入庫情報へ自動登録できる状態。
+  // b17ls10ml はどちらにも載せない = 登録できないケース (現場は止めず台帳だけ残す) の確認用
+  m.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, updated_at)
+    VALUES (900002, 'b07bl10ml', 'ブレンドオイル', '単品', '取扱中', 'unknown', ?)`).run(now);
   // 2行目の商品は入庫情報に無い状態にしておく (未登録 → 登録の導線を確かめるため)
   m.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, updated_at)
     VALUES (900001, 'ohanautsuwa', 'お花の器', '単品', '取扱中', 'unknown', ?)`).run(now);
@@ -115,6 +130,7 @@ try {
   ok(r.status === 200 && r.json.ok && r.json.batch === null && r.json.me.admin === true, 'state (取込なし)');
   r = await req(J, `${APP}/admin`);
   ok(r.status === 200 && r.text.includes('取込履歴') && r.text.includes('この端末を登録'), '管理画面 (admin 節あり)');
+  ok(r.text.includes('いろはへ送る商品') && r.text.includes('destinations.csv'), '管理画面に いろはへ送る商品 の一覧が出る');
   // 作業者 = スタッフマスタ (apps/staff)。seed 13名が入っている
   r = await req(J, `${BASE}/apps/staff/api/list`);
   ok(r.status === 200 && r.json.staff.length === 13 && r.json.candidates[0].staff_no === '0001', 'スタッフマスタ seed 13名');
@@ -243,6 +259,95 @@ try {
     ok(r.status === 200 && /text\/csv/.test(r.ctype) && r.text.includes('確認'), '履歴 CSV');
     r = await req(J, `${APP}/admin/history?batch_id=${batchId}`);
     ok(r.status === 200 && r.json.events.length === 3, '履歴 JSON 3件 (確認2 + 文字列version確認1)');
+
+    console.log('\n[B1a] 確認するときに行き先 (いろは / B-Faith) を確定させる');
+    {
+      r = await req(J, `${APP}/api/state`);
+      const undecided = r.json.lines.find(l => l.product_id === 'b07bl10ml');
+      ok(undecided && undecided.dest.missing.includes('iroha'), '入庫情報が無い商品は「行き先 未設定」として出る');
+      ok(r.json.totals.undecided >= 1, `画面上部のアラート件数が出る (${r.json.totals.undecided}件)`);
+      const key = undecided.line_key, ver = undecided.version;
+      const body = extra => ({ batch_id: batchId, line_key: key, expect_version: ver, worker_code: '20250901', ...extra });
+
+      // 行き先を決めずには確認できない
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body() });
+      ok(r.status === 400 && r.json.error === 'destination_required' && r.json.missing.includes('iroha'), '行き先が未設定なら確認できない (400 destination_required)');
+
+      // B-Faith を選んだらラベルと入数が要る
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { destination: 'bfaith' } }) });
+      ok(r.status === 400 && r.json.missing.includes('bc_seal'), 'B-Faith 入庫はラベル (BCシール) が無いと進めない');
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { destination: 'bfaith', bc_seal: '不要' } }) });
+      ok(r.status === 400 && r.json.missing.includes('irisu'), 'B-Faith 入庫は入数が無いと進めない');
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { destination: 'bfaith', bc_seal: '不要', irisu: 0 } }) });
+      ok(r.status === 400, '入数 0 は拒否');
+
+      // いろはを選ぶ → 確認が通り、選んだ内容が入庫情報に登録される
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { destination: 'iroha' } }) });
+      ok(r.status === 200 && r.json.state.status === 'checked', 'いろはを選べば確認できる');
+      r = await req(J, `${APP}/api/state`);
+      const after = r.json.lines.find(l => l.product_id === 'b07bl10ml');
+      ok(after.info && after.info.iroha === '有り', '選んだ行き先が入庫情報に自動登録される');
+      ok(after.dest.destination === 'iroha' && after.dest.missing.length === 0, '次からは聞かれない (データに沿って判定)');
+      ok(r.json.totals.toIroha >= 1, `いろは行きの件数が出る (${r.json.totals.toIroha}件)`);
+
+      // 台帳に残る
+      r = await req(J, `${APP}/admin/destinations`);
+      const led = r.json.rows.find(x => x.product_id === 'b07bl10ml');
+      ok(led && led.destination === 'iroha' && led.decided_from === 'chosen' && !led.cancelled_at, 'いろはへ送る実績が台帳に残る');
+      ok(led.planned_qty === after.planned_qty && led.ar_no === after.ar_no, '数量と入荷管理番号も台帳に残る');
+
+      // 取り消すと台帳も取り消される (行は消さない)
+      r = await req(J, `${APP}/api/lines/uncheck`, { method: 'POST', body: { batch_id: batchId, line_key: key, expect_version: ver + 1, worker_code: '20250901' } });
+      ok(r.status === 200, '確認を取り消せる');
+      r = await req(J, `${APP}/admin/destinations?include_cancelled=1`);
+      const led2 = r.json.rows.find(x => x.product_id === 'b07bl10ml');
+      ok(led2 && led2.cancelled_at, '取り消すと台帳は消さずに取消日時が入る');
+      r = await req(J, `${APP}/admin/destinations`);
+      ok(!r.json.rows.some(x => x.product_id === 'b07bl10ml'), '既定の一覧からは取り消し分が外れる');
+      r = await req(J, `${APP}/admin/destinations.csv`);
+      ok(r.status === 200 && /text\/csv/.test(r.ctype) && r.text.includes('有効期限'), '台帳を CSV で出せる');
+    }
+
+    console.log('\n[B1c] 期限管理商品は確認のたびに有効期限を聞く');
+    {
+      r = await req(J, `${APP}/api/state`);
+      const line = r.json.lines.find(l => l.check_status !== 'checked' && !l.dest.missing.length);
+      ok(!!line, '行き先が決まっている未確認の明細を用意');
+      // 期限管理ありに設定
+      r = await req(J, `${APP}/api/product-flags`, { method: 'POST', body: { code_key: line.code_key, expiry_managed: true, worker_code: '20250901' } });
+      ok(r.status === 200 && r.json.expiry_managed === true, '期限管理あり に設定できる');
+      r = await req(J, `${APP}/api/state`);
+      const l2 = r.json.lines.find(x => x.line_key === line.line_key);
+      ok(l2.expiry_managed === true && l2.expiry_source === 'manual', '一覧に期限管理あり として出る');
+      ok(l2.dest.missing.includes('expiry'), '期限管理商品は毎回 有効期限 を聞かれる');
+      const body = extra => ({ batch_id: batchId, line_key: line.line_key, expect_version: l2.version, worker_code: '20250901', ...extra });
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body() });
+      ok(r.status === 400 && r.json.missing.includes('expiry'), '有効期限なしでは確認できない');
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { expiry_date: '2026-02-31' } }) });
+      ok(r.status === 400, '実在しない日付は拒否 (2026-02-31)');
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { expiry_date: '2027-06' } }) });
+      ok(r.status === 200, '年月だけ (日は指定なし) でも確認できる');
+      r = await req(J, `${APP}/admin/destinations?destination=all`);
+      const led = r.json.rows.find(x => x.line_key === line.line_key);
+      ok(led && led.expiry_date === '2027-06', '有効期限が台帳に残る');
+      ok(led.decided_from === 'master', '行き先そのものは入庫情報どおりと記録される (期限だけ聞いた場合)');
+      // 期限管理を戻しておく (後続のテストが巻き添えにならないように)
+      await req(J, `${APP}/api/product-flags`, { method: 'POST', body: { code_key: line.code_key, expiry_managed: false, worker_code: '20250901' } });
+    }
+
+    console.log('\n[B1d] 商品マスタに無い商品でも現場を止めない');
+    {
+      // 入庫情報を作れないケース。**確認は通し、行き先は台帳に残す**。
+      // ここで止めると、荷受けの現場が「登録できないから消し込めない」で詰まる
+      r = await req(J, `${APP}/api/state`);
+      const orphan = r.json.lines.find(l => l.product_id === 'b17ls10ml');
+      ok(orphan && orphan.info === null, '入庫情報も商品マスタも無い明細を用意');
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: orphan.line_key, expect_version: orphan.version, worker_code: '20250901', choice: { destination: 'iroha' } } });
+      ok(r.status === 200 && r.json.state.status === 'checked', '商品マスタに無くても確認できる');
+      ok(/商品マスタ/.test(r.json.warning || ''), `登録できなかったことは画面に伝える (${r.json.warning})`);
+      r = await req(J, `${APP}/admin/destinations`);
+      ok(r.json.rows.some(x => x.product_id === 'b17ls10ml'), '入庫情報が作れなくても行き先の記録は残る');
+    }
   } else {
     console.log('  (CSV パス未指定: 取込系はスキップ)');
   }

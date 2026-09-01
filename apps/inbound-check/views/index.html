@@ -54,7 +54,9 @@
     .line .thumb { flex: 0 0 60px; width: 60px; height: 60px; border-radius: 8px; background: #f1f3f5; border: 1px solid #e9ecef; display: flex; align-items: center; justify-content: center; overflow: hidden; }
     .line .thumb img { width: 100%; height: 100%; object-fit: contain; }
     .line .thumb .ph { color: #ced4da; font-size: 1.5em; }
-    .line .body { flex: 1; min-width: 0; cursor: pointer; }
+    .line { cursor: pointer; }
+    .line .body { flex: 1; min-width: 0; }
+    .line .act .chev-line { text-align: center; color: #adb5bd; font-size: 0.8em; }
     .line .name { font-size: 1.05em; line-height: 1.35; word-break: break-all; font-weight: 600; }
     .line .sub { font-size: 0.85em; color: #868e96; margin-top: 3px; }
     .line .sub b { color: #1864ab; font-size: 1.15em; }
@@ -67,6 +69,9 @@
     .tag.direct { background: #d3f9d8; color: #2b8a3e; }
     .tag.seal { background: #ffe8cc; color: #d9480f; }
     .tag.warn { background: #ffe3e3; color: #a61e1e; }
+    /* 行き先が決まっていない = 確認を押した時に必ず聞かれる。先に目立たせておく */
+    .tag.todo { background: #e03131; color: #fff; font-weight: 700; }
+    .tag.exp { background: #e5dbff; color: #5f3dc4; font-weight: 700; }
     .line .who { font-size: 0.82em; color: #2b8a3e; margin-top: 4px; font-weight: 600; }
     .line .prev { font-size: 0.78em; color: #adb5bd; margin-top: 3px; }
     .line .act { flex: 0 0 auto; display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
@@ -92,6 +97,9 @@
     .fld textarea { min-height: 60px; resize: vertical; }
     .fld input:disabled, .fld select:disabled { background: #f1f3f5; color: #adb5bd; }
     .fld .note { font-size: 0.8em; color: #868e96; margin-top: 4px; }
+    .fld .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+    .fld .chips button { min-height: 46px; padding: 0 18px; border: 1px solid #ced4da; border-radius: 10px; background: #fff; font-size: 1em; cursor: pointer; }
+    .fld .chips button.on { border-color: #1c7ed6; background: #1c7ed6; color: #fff; font-weight: 700; }
     .detail .dact { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
     .detail .dact button { min-height: 48px; padding: 0 22px; border-radius: 10px; font-size: 1.0em; cursor: pointer; border: 1px solid #ced4da; background: #fff; }
     .detail .dact button.primary { background: #1c7ed6; border-color: #1c7ed6; color: #fff; font-weight: 700; }
@@ -111,6 +119,28 @@
     .modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
     .modal .actions button { padding: 12px 20px; border-radius: 8px; border: 1px solid #ced4da; background: #fff; font-size: 1em; cursor: pointer; }
     .modal .actions button.danger { background: #e03131; border-color: #e03131; color: #fff; }
+    /* 確認するときに行き先などを聞く画面 */
+    .gate { width: min(94vw, 560px); max-height: 90vh; overflow-y: auto; }
+    .gate .who-item { display: flex; gap: 12px; align-items: center; background: #f8f9fa; border-radius: 10px; padding: 10px; margin-bottom: 14px; }
+    .gate .who-item img { width: 56px; height: 56px; object-fit: contain; background: #fff; border-radius: 8px; }
+    .gate .who-item .nm { font-weight: 700; line-height: 1.3; }
+    .gate .who-item .sb { font-size: 0.85em; color: #868e96; margin-top: 2px; }
+    .gate h3 { font-size: 0.9em; margin: 0 0 8px; color: #495057; }
+    .gate section { margin-bottom: 18px; }
+    .pick2 { display: flex; gap: 12px; }
+    .pick2 button { flex: 1; min-height: 88px; border: 2px solid #dee2e6; border-radius: 12px; background: #fff; font-size: 1.05em; line-height: 1.5; cursor: pointer; padding: 8px; }
+    .pick2 button.on { border-color: #1c7ed6; background: #e7f5ff; font-weight: 700; }
+    .pick2 button b { display: block; font-size: 1.15em; }
+    .pick2 button small { color: #868e96; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .chips button { min-height: 52px; min-width: 60px; padding: 0 16px; border: 1px solid #ced4da; border-radius: 10px; background: #fff; font-size: 1.05em; cursor: pointer; }
+    .chips button.on { border-color: #1c7ed6; background: #1c7ed6; color: #fff; font-weight: 700; }
+    .gate input[type=number] { width: 130px; padding: 10px 12px; font-size: 1.1em; border: 1px solid #ced4da; border-radius: 8px; }
+    .ymd { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .ymd select { padding: 12px 8px; font-size: 1.15em; border: 1px solid #ced4da; border-radius: 8px; background: #fff; }
+    .gate .err { color: #c92a2a; font-size: 0.92em; margin-bottom: 10px; }
+    .gate .lock { font-size: 0.82em; color: #868e96; margin-top: 6px; }
+
     .legend { font-size: 0.78em; color: #868e96; padding: 6px 12px 0; line-height: 1.6; }
     .foot { text-align: center; font-size: 0.8em; color: #adb5bd; padding: 20px; }
     .foot a { color: #868e96; }
@@ -156,6 +186,17 @@
       <div class="opts" id="workerOpts"></div>
       <div class="hint">名前は確認の記録に残ります (自己申告。端末名と組で記録)</div>
       <div class="actions"><button type="button" id="workerCancel">閉じる</button></div>
+    </div>
+  </div>
+
+  <div class="overlay" id="gate">
+    <div class="modal gate">
+      <h2 id="gateTitle">この商品はどこへ?</h2>
+      <div id="gateBody"></div>
+      <div class="actions">
+        <button type="button" id="gateCancel">やめる</button>
+        <button type="button" class="primary" id="gateOk" style="background:#37b24d;border-color:#37b24d;color:#fff;font-weight:700">確認して登録</button>
+      </div>
     </div>
   </div>
 
@@ -250,6 +291,9 @@
 
     function tagsHtml(l) {
       const t = [];
+      // 行き先が決まっていない = 確認を押すと必ず聞かれる。押す前に分かるよう先頭に出す
+      if (l.dest && l.dest.missing.includes('iroha')) t.push('<span class="tag todo">⚠ 行き先 未設定</span>');
+      if (l.expiry_managed) t.push('<span class="tag exp">📅 期限管理</span>');
       if (l.loc_source === 'pick') t.push('<span class="tag loc">📍 ' + esc(l.pick_locs.map(x => x.loc).join(' / ')) + '</span>');
       else if (l.loc_source === 'storage') t.push('<span class="tag loc-store">保管 ' + esc(l.other_locs[0].loc) + '</span>');
       else t.push('<span class="tag loc-none">空きロケへ</span>');
@@ -331,7 +375,9 @@
         $('#list').innerHTML = '<div class="empty">まだ入荷受付のCSVが取り込まれていません。<br>管理画面から取り込んでください。</div>';
         return;
       }
-      $('#stat').innerHTML = '伝票 ' + state.slips.length + ' 件 <small>／</small> 確認 ' + t.checked + ' / ' + t.lines + ' 行';
+      $('#stat').innerHTML = '伝票 ' + state.slips.length + ' 件 <small>／</small> 確認 ' + t.checked + ' / ' + t.lines + ' 行'
+        + (t.undecided ? ' <small style="color:#c92a2a;font-weight:700">・行き先未設定 ' + t.undecided + '</small>' : '')
+        + (t.toIroha ? ' <small style="color:#7a5c00;font-weight:700">・🏠いろは ' + t.toIroha + '</small>' : '');
       $('#meta').textContent = 'CSV ' + fmtJst(b.csv_generated_at) + ' 生成 ・ ' + fmtJst(b.imported_at) + ' 取込';
       if (state.lines.length === 0) {
         $('#list').innerHTML = '<div class="empty">受付済の入荷伝票はありません<br><small>(CSV ' + esc(fmtJst(b.csv_generated_at)) + ' 生成)</small></div>';
@@ -378,30 +424,43 @@
         ? '<button type="button" class="btn-undo" data-act="undo">↩︎ 取り消す</button>'
         : '<button type="button" class="btn-check" data-act="check">確認</button>';
       return '<div class="row' + (checked ? ' checked' : '') + (open ? ' open' : '') + (pending.has(l.line_key) ? ' pending' : '') + '" data-key="' + esc(l.line_key) + '" data-version="' + l.version + '">'
-        + '<div class="line">'
+        + '<div class="line" data-act="detail">'
         + '<div class="thumb">' + thumbHtml(l, false) + '</div>'
-        + '<div class="body" data-act="detail">'
+        + '<div class="body">'
         + '<div class="name">' + esc(l.product_name) + '</div>'
         + '<div class="sub">' + qtySub(l) + '</div>'
         + '<div class="tags">' + tagsHtml(l) + '</div>'
         + (checked ? '<div class="who">✅ ' + esc(l.checked_by || '') + ' ' + esc(fmtJst(l.checked_at)) + '</div>' : '')
         + (!checked && l.prev_checked ? '<div class="prev">前回 ' + esc(fmtJst(l.prev_checked.at)) + ' に ' + esc(l.prev_checked.by || '') + ' が確認済み (今日は未確認)</div>' : '')
         + '</div>'
-        + '<div class="act">' + act
-        + '<button type="button" class="btn-more" data-act="detail">' + (open ? '▲ 閉じる' : '▼ 詳細・修正') + '</button>'
-        + '</div></div>'
+        + '<div class="act">' + act + '<span class="chev-line">' + (open ? '▲' : '▼') + '</span></div></div>'
         + '<div class="detail">' + (open ? detailHtml(l) : '') + '</div>'
         + '</div>';
     }
 
     // 詳細パネル: 入庫情報 (入数・いろは・BCシール・直ピック・荷姿・memo) をその場で直す。
     // 書き込み先は /apps/inbound-info と同じ f_inbound_info なので、値札印刷にもそのまま効く
+    // 期限管理は入庫情報 (f_inbound_info) ではなく inbound-check 側で持つ。
+    // ロジザードの商品マスタにある設定だが入荷受付CSVには出てこないため、
+    // 在庫データの有効期限から推定し、違っていればここで直す
+    function expiryHtml(l) {
+      const src = l.expiry_source === 'manual' ? '手動で設定'
+        : l.expiry_source === 'logizard' ? 'ロジザードの商品マスタ'
+        : l.expiry_source === 'stock' ? '在庫データに有効期限があるため推定'
+        : '在庫データに有効期限が無いため推定';
+      return '<div class="fld"><label>期限管理</label><div class="chips">'
+        + '<button type="button" data-act="expiry" data-v="1" class="' + (l.expiry_managed ? 'on' : '') + '">📅 あり</button>'
+        + '<button type="button" data-act="expiry" data-v="0" class="' + (l.expiry_managed ? '' : 'on') + '">なし</button>'
+        + '</div><div class="note">' + esc(src) + '。「あり」の商品は、確認するときに有効期限を選んでもらいます</div></div>';
+    }
+
     function detailHtml(l) {
       const i = l.info;
       const img = '<div class="big">' + thumbHtml(l, true) + '</div>';
       if (!i) {
         return '<div class="dgrid">' + img + '<div class="fields">'
-          + '<div class="unreg">この商品は入庫情報に登録されていません。<br>登録すると、入数やいろはの設定をここで入力できます。</div>'
+          + expiryHtml(l)
+          + '<div class="unreg">この商品は入庫情報に登録されていません。<br>登録すると、入数やいろはの設定をここで入力できます。<br><small>(確認ボタンを押すと、その場で行き先を選んで登録もできます)</small></div>'
           + '<div class="dact" style="margin-top:12px"><button type="button" class="primary" data-act="register">入庫情報に登録する</button>'
           + '<span class="dmsg" data-msg></span></div>'
           + '</div></div>';
@@ -410,6 +469,7 @@
       const dis = locked ? ' disabled' : '';
       const v = s => esc(s == null ? '' : s);
       return '<div class="dgrid">' + img + '<div class="fields">'
+        + expiryHtml(l)
         + '<div class="fld"><label>入数 (1箱あたりの個数)</label>'
         + '<input type="number" inputmode="numeric" min="1" step="1" data-f="入数" value="' + (Number.isInteger(i.irisu) ? i.irisu : '') + '" placeholder="未登録">'
         + '<div class="note">予定 ' + l.planned_qty + ' 個。空欄にすると「未登録」に戻ります</div></div>'
@@ -437,10 +497,16 @@
       Object.assign(line, { check_status: s.status, version: s.version, checked_by: s.checked_by, checked_at: s.checked_at });
     }
 
-    async function send(action, line) {
+    async function send(action, line, choice) {
       if (stale) { banner('warn', '一覧が更新されています。最新の一覧を読み込むまで操作できません'); load(); return; }
       if (!hasWorker()) { openWorkerPick(); return; }
       if (pending.has(line.line_key)) return;
+      // 行き先・ラベル・入数・有効期限が決まっていなければ、先に聞いてから送る
+      // (サーバーも同じ判定をするので、聞かずに送っても 400 destination_required で戻ってくる)
+      if (action === 'check' && !choice && line.dest && line.dest.missing.length > 0) {
+        openGate(line, line.dest.missing, line.info);
+        return;
+      }
       pending.add(line.line_key);
       // 楽観表示 (送信前の状態を控えておき、結果が確定しない時は必ず戻す — Codex R3 High)
       const snapshot = { check_status: line.check_status, version: line.version, checked_by: line.checked_by, checked_at: line.checked_at };
@@ -452,7 +518,7 @@
       try {
         const r = await fetch(API + '/lines/' + action, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ batch_id: state.batch.id, line_key: line.line_key, expect_version: snapshot.version, worker_code: workerCode() || undefined }),
+          body: JSON.stringify({ batch_id: state.batch.id, line_key: line.line_key, expect_version: snapshot.version, worker_code: workerCode() || undefined, choice }),
         });
         const j = await r.json().catch(() => ({}));
         if (r.status === 401) { location.href = '/login'; return; }
@@ -461,10 +527,18 @@
           if (j.error === 'stale_batch') { stale = true; banner('warn', '一覧が更新されました。最新の一覧を読み込んでいます…'); needReload = true; }
           else if (j.error === 'conflict') { if (j.current) applyServerState(line, j.current); banner('warn', '他の端末で先に更新されました。最新の状態を表示します'); needReload = true; }
           else if (j.error === 'worker_required') { banner('warn', esc(j.message)); openWorkerPick(); }
+          else if (j.error === 'destination_required') {
+            // サーバー側の判定が画面より新しい (他の人が入庫情報を変えた等)。足りないものを聞き直す
+            openGate(line, j.missing, j.info);
+            if (j.message) renderGate(j.message);
+          }
           else { banner('err', esc(j.message || j.error || 'エラー')); needReload = true; }
         } else {
           applyServerState(line, j.state);
-          banner(null);
+          if (j.warning) banner('warn', esc(j.warning));
+          else banner(null);
+          // 入庫情報を書き込んだかもしれないので、次のポーリングで取り直す
+          if (choice) lastJson = '';
         }
       } catch (e) {
         rollback();
@@ -542,6 +616,36 @@
       }
     }
 
+    async function setExpiry(rowEl, line, managed) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      if (line.expiry_managed === managed) return;
+      const before = line.expiry_managed, beforeSrc = line.expiry_source;
+      // 同じ商品は複数の伝票に出るので、まとめて表示を切り替える
+      for (const l of state.lines) if (l.code_key === line.code_key) { l.expiry_managed = managed; l.expiry_source = 'manual'; }
+      render(true);
+      try {
+        const r = await fetch(API + '/product-flags', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code_key: line.code_key, expiry_managed: managed, worker_code: workerCode() || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.status === 401) { location.href = '/login'; return; }
+        if (!j.ok) {
+          for (const l of state.lines) if (l.code_key === line.code_key) { l.expiry_managed = before; l.expiry_source = beforeSrc; }
+          render(true);
+          banner('err', esc(j.message || '期限管理の設定を変更できませんでした'));
+          if (j.error === 'worker_required') openWorkerPick();
+          return;
+        }
+        lastJson = '';
+        banner(null);
+      } catch (e) {
+        for (const l of state.lines) if (l.code_key === line.code_key) { l.expiry_managed = before; l.expiry_source = beforeSrc; }
+        render(true);
+        banner('err', '送信できませんでした (' + esc(e.message) + ')');
+      }
+    }
+
     async function registerInfo(rowEl, line) {
       if (!hasWorker()) { openWorkerPick(); return; }
       const btn = rowEl.querySelector('[data-act="register"]');
@@ -564,6 +668,137 @@
         if (btn) btn.disabled = false;
       }
     }
+
+    // ─────────── 確認するときに行き先などを聞く ───────────
+    // 中原さん 2026-09-01: 「確認をした時にいろはに在庫化作業を依頼するのか、ビーフェイスに
+    // 入庫するのかを判定してほしい。すでにデータがあるものはそのデータに沿って。無ければ選択して登録」
+    let gateLine = null, gateChoice = null, gateMissing = [], gateInfo = null;
+
+    const SEAL_OPTIONS = ['BCシール貼付必要', '不要'];
+    const IRISU_CHIPS = [1, 6, 10, 12, 20, 24, 30, 48];
+
+    function openGate(line, missing, info) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      gateLine = line;
+      gateMissing = missing && missing.length ? missing : ['iroha'];
+      gateInfo = info !== undefined ? info : line.info;
+      gateChoice = {
+        destination: gateMissing.includes('iroha') ? null : (line.dest ? line.dest.destination : null),
+        bc_seal: null, irisu: null, y: null, m: null, d: null,
+      };
+      $('#gateTitle').textContent = gateMissing.length === 1 && gateMissing[0] === 'expiry' ? '有効期限を入れてください' : 'この商品はどこへ?';
+      renderGate();
+      $('#gate').classList.add('on');
+    }
+
+    function renderGate(errMsg) {
+      const l = gateLine;
+      if (!l) return;
+      const c = gateChoice;
+      const p = [];
+      if (errMsg) p.push('<div class="err">' + esc(errMsg) + '</div>');
+      p.push('<div class="who-item">'
+        + (l.image_url ? '<img src="' + esc(l.image_url) + '" alt="" referrerpolicy="no-referrer" onerror="this.style.display=&#39;none&#39;">' : '')
+        + '<div><div class="nm">' + esc(l.product_name) + '</div>'
+        + '<div class="sb">' + esc(l.product_id) + ' ・ 予定 ' + l.planned_qty + ' 個</div></div></div>');
+
+      if (gateMissing.includes('iroha')) {
+        p.push('<section><h3>行き先</h3><div class="pick2">'
+          + '<button type="button" data-g="dest" data-v="iroha" class="' + (c.destination === 'iroha' ? 'on' : '') + '">'
+          + '<b>🏠 いろはへ</b><small>いろはで在庫化作業</small></button>'
+          + '<button type="button" data-g="dest" data-v="bfaith" class="' + (c.destination === 'bfaith' ? 'on' : '') + '">'
+          + '<b>🏢 B-Faith</b><small>自社で入庫する</small></button>'
+          + '</div>'
+          + (gateInfo && gateInfo.iroha ? '<div class="lock">入庫情報の現在値: 「' + esc(gateInfo.iroha) + '」 (この値は書き換えません)</div>' : '')
+          + '</section>');
+      }
+
+      // B-Faith で入庫するなら、ラベルと入数が無いと入庫作業ができない
+      const needBf = c.destination === 'bfaith';
+      if (needBf) {
+        const seal = c.bc_seal != null ? c.bc_seal : (gateInfo && !isBlank(gateInfo.bc_seal) ? gateInfo.bc_seal : null);
+        p.push('<section><h3>ラベル (入庫時BCシール貼り)</h3><div class="chips">'
+          + SEAL_OPTIONS.map(s => '<button type="button" data-g="seal" data-v="' + esc(s) + '" class="' + (seal === s ? 'on' : '') + '">' + esc(s) + '</button>').join('')
+          + '</div></section>');
+        const irisu = c.irisu != null ? c.irisu : (gateInfo && Number.isInteger(gateInfo.irisu) && gateInfo.irisu > 0 ? gateInfo.irisu : null);
+        p.push('<section><h3>入数 (1箱あたりの個数)</h3><div class="chips">'
+          + IRISU_CHIPS.map(n => '<button type="button" data-g="irisu" data-v="' + n + '" class="' + (irisu === n ? 'on' : '') + '">' + n + '</button>').join('')
+          + '<input type="number" inputmode="numeric" min="1" step="1" data-g="irisu-input" placeholder="他" value="' + (irisu != null && !IRISU_CHIPS.includes(irisu) ? irisu : '') + '">'
+          + '</div></section>');
+      }
+
+      // 期限管理商品は入荷のたびに期限が変わるので毎回聞く。打ち込まずに選べるようにする
+      if (gateMissing.includes('expiry')) {
+        const now = new Date();
+        const y0 = Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo', year: 'numeric' }).format(now));
+        const years = [];
+        for (let y = y0 - 1; y <= y0 + 7; y++) years.push(y);
+        const days = [];
+        for (let d = 1; d <= daysInMonth(c.y, c.m); d++) days.push(d);
+        p.push('<section><h3>有効期限 (商品に書かれている日付)</h3><div class="ymd">'
+          + sel('y', years, c.y, '年') + '<span>年</span>'
+          + sel('m', [1,2,3,4,5,6,7,8,9,10,11,12], c.m, '月') + '<span>月</span>'
+          + sel('d', days, c.d, '—') + '<span>日</span>'
+          + '</div><div class="lock">日付が書かれていない (年月だけ) の商品は、日を「—」のままにしてください</div></section>');
+      }
+      $('#gateBody').innerHTML = p.join('');
+    }
+
+    function sel(name, values, cur, blankLabel) {
+      return '<select data-g="ymd" data-k="' + name + '">'
+        + '<option value="">' + esc(blankLabel) + '</option>'
+        + values.map(v => '<option value="' + v + '"' + (String(cur) === String(v) ? ' selected' : '') + '>' + v + '</option>').join('')
+        + '</select>';
+    }
+    function daysInMonth(y, m) { return (y && m) ? new Date(Date.UTC(Number(y), Number(m), 0)).getUTCDate() : 31; }
+    const isBlank = v => ['', '－', '-', 'ー', '―'].includes(String(v == null ? '' : v).trim());
+
+    $('#gateBody').addEventListener('click', (ev) => {
+      const b = ev.target.closest('button[data-g]');
+      if (!b) return;
+      const g = b.getAttribute('data-g'), v = b.getAttribute('data-v');
+      if (g === 'dest') { gateChoice.destination = v; gateChoice.bc_seal = null; gateChoice.irisu = null; }
+      else if (g === 'seal') gateChoice.bc_seal = v;
+      else if (g === 'irisu') gateChoice.irisu = Number(v);
+      renderGate();
+    });
+    $('#gateBody').addEventListener('input', (ev) => {
+      const el = ev.target;
+      if (el.getAttribute('data-g') === 'irisu-input') { const n = Number(el.value); gateChoice.irisu = Number.isSafeInteger(n) && n > 0 ? n : null; }
+    });
+    $('#gateBody').addEventListener('change', (ev) => {
+      const el = ev.target;
+      if (el.getAttribute('data-g') !== 'ymd') return;
+      gateChoice[el.getAttribute('data-k')] = el.value || null;
+      if (el.getAttribute('data-k') !== 'd') renderGate();   // 月を変えたら日の選択肢を作り直す
+    });
+    $('#gateCancel').addEventListener('click', closeGate);
+    function closeGate() { $('#gate').classList.remove('on'); gateLine = null; gateChoice = null; }
+
+    $('#gateOk').addEventListener('click', () => {
+      const c = gateChoice, l = gateLine;
+      if (!c || !l) return;
+      if (gateMissing.includes('iroha') && !c.destination) return renderGate('行き先を選んでください');
+      const choice = { destination: c.destination || undefined };
+      if (c.destination === 'bfaith') {
+        const seal = c.bc_seal != null ? c.bc_seal : (gateInfo && !isBlank(gateInfo.bc_seal) ? gateInfo.bc_seal : null);
+        const irisu = c.irisu != null ? c.irisu : (gateInfo && Number.isInteger(gateInfo.irisu) && gateInfo.irisu > 0 ? gateInfo.irisu : null);
+        if (!seal) return renderGate('ラベル (BCシール) を選んでください');
+        if (!irisu) return renderGate('入数を選んでください');
+        choice.bc_seal = seal;
+        choice.irisu = irisu;
+      }
+      if (gateMissing.includes('expiry')) {
+        if (!c.y || !c.m) return renderGate('有効期限の年と月を選んでください');
+        const mm = String(c.m).padStart(2, '0');
+        choice.expiry_date = c.d ? c.y + '-' + mm + '-' + String(c.d).padStart(2, '0') : c.y + '-' + mm;
+      }
+      // モーダルを開いている間にポーリングで state が入れ替わっていることがあるので、
+      // 送る直前に line_key で引き直す (古いオブジェクトの version を送ると空振りの 409 になる)
+      const line = state.lines.find(x => x.line_key === l.line_key) || l;
+      closeGate();
+      send('check', line, choice);
+    });
 
     // ─── 操作 ───
     let uncheckLine = null;
@@ -601,6 +836,7 @@
         render(true);
         return;
       }
+      if (act === 'expiry') { setExpiry(row, line, a.getAttribute('data-v') === '1'); return; }
       if (act === 'save') { saveInfo(row, line); return; }
       if (act === 'register') { registerInfo(row, line); return; }
       if (act === 'reset') { editDirty = false; render(); return; }

@@ -87,6 +87,27 @@
     </div>
 
     <div class="ic-box">
+      <h2>🏠 いろはへ送る商品 (確認したときに決まった行き先)</h2>
+      <p class="ic-note">確認のときに「いろはで在庫化」と決まった明細です。取り消した分は既定では出ません。
+        バッチが保持期間で消えたあとも、この記録は残ります。</p>
+      <div class="ic-row" style="gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px">
+        <select id="destWhich">
+          <option value="iroha">🏠 いろはで在庫化</option>
+          <option value="bfaith">🏢 B-Faith で入庫</option>
+          <option value="all">両方</option>
+        </select>
+        <label>期間 <input type="date" id="destFrom"> 〜 <input type="date" id="destTo"></label>
+        <label><input type="checkbox" id="destCancelled"> 取り消した分も出す</label>
+        <button type="button" id="destReload">表示</button>
+        <a id="destCsv" href="<%= base %>/admin/destinations.csv?destination=iroha">CSV を出す</a>
+      </div>
+      <table class="ic-list">
+        <thead><tr><th>決定日時</th><th>行き先</th><th>入荷管理番号</th><th>商品ID</th><th>商品名</th><th>予定数</th><th>有効期限</th><th>判断</th><th>作業者</th></tr></thead>
+        <tbody id="destRows"><tr><td colspan="9">読み込み中…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="ic-box">
       <h2>取込履歴 (バッチ)</h2>
       <table class="ic-list">
         <thead><tr><th>#</th><th>状態</th><th>CSV生成</th><th>取込</th><th>経路 / 実行者</th><th>伝票</th><th>行</th><th>ファイル</th><th></th></tr></thead>
@@ -302,6 +323,40 @@
       const rows = j.events.map(e => '<tr><td>' + e.id + '</td><td>' + esc(e.ar_no) + '</td><td>' + esc(e.product_id) + ' ' + esc(e.product_name) + '</td><td>' + (e.action === 'check' ? '確認' : '<span class="ng">取消</span>' + (e.reverted_event_id ? ' (#' + e.reverted_event_id + ' を打ち消し)' : '')) + '</td><td>' + esc(e.worker) + '</td><td>' + esc(e.device_label || '') + '</td><td>' + esc(fmtJst(e.created_at)) + '</td></tr>').join('');
       $('#histBox').innerHTML = '<h3 style="font-size:0.95em">バッチ #' + b.dataset.id + ' の確認履歴 (' + j.events.length + ' 件)</h3><table class="ic-list"><thead><tr><th>ID</th><th>AR</th><th>商品</th><th>操作</th><th>作業者</th><th>端末</th><th>日時</th></tr></thead><tbody>' + (rows || '<tr><td colspan="7" style="color:#868e96">記録なし</td></tr>') + '</tbody></table>';
     }));
+  
+    // ── いろはへ送る商品の一覧 ──
+    // 期間・行き先で絞って表示する。同じ条件で CSV も出せる (いろはへの持ち出しリスト)
+    (function () {
+      const q = () => new URLSearchParams({
+        destination: document.getElementById('destWhich').value,
+        ...(document.getElementById('destFrom').value ? { from: document.getElementById('destFrom').value } : {}),
+        ...(document.getElementById('destTo').value ? { to: document.getElementById('destTo').value + 'T23:59:59.999Z' } : {}),
+        ...(document.getElementById('destCancelled').checked ? { include_cancelled: '1' } : {}),
+      }).toString();
+      // esc / fmtJst は、この画面の共通スクリプトで定義したものをそのまま使う
+      async function reload() {
+        const tb = document.getElementById('destRows');
+        document.getElementById('destCsv').href = '<%= base %>/admin/destinations.csv?' + q();
+        try {
+          const r = await fetch('<%= base %>/admin/destinations?' + q(), { cache: 'no-store' });
+          const j = await r.json();
+          if (!j.ok) throw new Error(j.message || j.error || 'エラー');
+          if (j.rows.length === 0) { tb.innerHTML = '<tr><td colspan="9">この条件に当てはまる記録はありません</td></tr>'; return; }
+          tb.innerHTML = j.rows.map(x => '<tr' + (x.cancelled_at ? ' style="opacity:.5;text-decoration:line-through"' : '') + '>'
+            + '<td>' + esc(fmtJst(x.decided_at)) + '</td>'
+            + '<td>' + (x.destination === 'iroha' ? '🏠 いろは' : '🏢 B-Faith') + '</td>'
+            + '<td>' + esc(x.ar_no) + '</td><td>' + esc(x.product_id) + '</td><td>' + esc(x.product_name) + '</td>'
+            + '<td>' + (x.planned_qty == null ? '' : x.planned_qty) + '</td>'
+            + '<td>' + esc(x.expiry_date || '') + '</td>'
+            + '<td>' + (x.decided_from === 'chosen' ? 'その場で選択' : '入庫情報どおり') + '</td>'
+            + '<td>' + esc(x.worker || '') + '</td></tr>').join('');
+        } catch (e) {
+          tb.innerHTML = '<tr><td colspan="9" class="ng">読み込めませんでした (' + esc(e.message) + ')</td></tr>';
+        }
+      }
+      document.getElementById('destReload').addEventListener('click', reload);
+      reload();
+    })();
   </script>
 </body>
 </html>

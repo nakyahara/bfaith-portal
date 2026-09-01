@@ -13,7 +13,11 @@
 |---|---|---|
 | `/apps/inbound-check/` | 登録端末 (iPad) or ポータルセッション | 作業画面 (PWA) |
 | `/apps/inbound-check/api/state` | 同上 | 一覧の状態 (5秒ポーリング) |
-| `/apps/inbound-check/api/lines/check` `/uncheck` | 同上 | 1タップ確認 / 取消 |
+| `/apps/inbound-check/api/lines/check` `/uncheck` | 同上 | 確認 / 取消。確認時に行き先を確定させる (下記) |
+| `/apps/inbound-check/api/info` (POST) | 同上 | 入庫情報 (入数・いろは・BCシール・直ピック・荷姿・memo) をその場で直す |
+| `/apps/inbound-check/api/info/register` (POST) | 同上 | 入庫情報が無い商品を登録する |
+| `/apps/inbound-check/api/product-flags` (POST) | 同上 | 期限管理 あり/なし を切り替える |
+| `/apps/inbound-check/admin/destinations(.csv)` | ポータルセッション | 行き先の台帳 (いろはへ送る商品の一覧) |
 | `/apps/inbound-check/admin` | ポータルセッション (アプリ権限) | 管理画面。CSV 取込はアプリ利用者全員 |
 | `/apps/inbound-check/admin/devices` `/workers` `/history(.csv)` | admin のみ | 端末登録・作業者・履歴 |
 | `/apps/inbound-check/device/exit` (POST) | 端末 | 端末Cookie を外す |
@@ -43,6 +47,41 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
     実測では 16行中5行がこれに当たる (在庫ミラーには在庫0の商品の行が無いため)
 - 保持期間: superseded バッチとその子 = 365日、取込ログ = 90日 (取込時に掃除)
 
+## 確認するときの行き先ゲート (いろは / B-Faith)
+
+中原さん 2026-09-01:「確認をした時にいろはに在庫化作業を依頼するのか、ビーフェイスに入庫するのかを
+判定してほしい。すでにデータがあるものはそのデータに沿って。もしデータがなければその時に選択して、
+その選択したデータがデータベースに登録される」
+
+```
+いろは在庫化作業有無 = 有り  → いろは行き。B-Faith での入庫作業が無いので他は要らない
+いろは在庫化作業有無 = 無し  → B-Faith 入庫。★ラベル (BCシール) と入数が揃うまで確認できない
+それ以外 (未記入・「状況による」) → その場で選ぶ
+```
+
+- 選んだ値は `f_inbound_info` (= `/apps/inbound-info` と同じ正本) に自動登録する。値札印刷にもそのまま効く
+- ⭐**未記入だったときだけ書き戻す**。「状況による」のように人が意図して入れた値は上書きせず、
+  今回の判断は台帳にだけ残す
+- 商品マスタに無い商品は入庫情報を作れない。**現場を止めないため確認は通し**、行き先は台帳に残して
+  画面に警告を出す (荷受けが「登録できないから消し込めない」で詰まるのを避ける)
+- 決まった行き先は `f_inbound_check_destinations` に append する。**batch_id は FK にしない**ので、
+  バッチが保持期間で消えたあとも「いつ・何を・何個いろはへ送ることにしたか」は残る。
+  取り消したときは行を消さず `cancelled_at` を立てる
+
+## 期限管理
+
+期限管理商品は入荷のたびに有効期限が変わるので、**確認のたびに** 年/月/日 のプルダウンで入れてもらう
+(日が書かれていない商品は「—」のままにすると年月だけで記録する)。入力値は台帳の `expiry_date` に残る。
+
+🚨**「期限管理あり/なし」の正しい出どころはロジザードの商品マスタだが、入荷受付CSV には出てこない**
+(58列を実測。`有効期限` 列はあるが検品時に入る値で、受付時点では空)。当面は次の順で決める:
+
+1. `f_inbound_check_product_flags` に人が設定した値 (詳細パネルの「期限管理 あり/なし」)
+2. `mirror_logizard_stock` の `有効期限` が入っていれば「あり」と推定
+
+在庫ゼロの商品は在庫ミラーに行が無いため推定できない → 現場が詳細パネルで直す。
+ロジザードの商品マスタを取り込めるようになったら、同じ表を `source='logizard'` で埋めれば置き換わる。
+
 ## 作業者 (名前タップ) = スタッフマスタ
 
 自前の作業者表は持たない。名前タップの候補は `apps/staff` (staff.db) の**有効かつ倉庫作業 (warehouse) の役割を持つスタッフ**で (事務担当は出ない)、`worker_code` = スタッフ管理番号 (`staff_no`)、表示名 = 短い表記 (無ければ正式表記)。確認イベントには `worker` (表示名) と `staff_id` を記録する。追加・無効化は `/apps/staff/` (管理者)。
@@ -54,13 +93,17 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
 ## テスト
 
 ```
-node scripts/test-inbound-check.mjs [CA04001_*.csv]        # DB 層 + CSV パーサ (60 項目)
-node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路 (38 項目)
+node scripts/test-inbound-check.mjs [CA04001_*.csv]        # DB 層 + CSV パーサ (77 項目)
+node scripts/test-inbound-check-enroll.mjs                 # 端末の登録コード (35 項目)
+node scripts/test-inbound-check-drive.mjs                  # Drive 自動取込 (17 項目)
+node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路 (131 項目)
 ```
 
-## 次 (PR3)
+## 次
 
-- PR3: 在庫ゼロ商品のピックロケ補完 (商品マスタ)、実機で決まった表示の手直し、Stream Deck の紙印刷を障害時のみに降格
+- ロジザード商品マスタから「期限管理」フラグを取り込む (いまは在庫データからの推定 + 手動)
+- 実機で決まった表示の手直し、Stream Deck の紙印刷を障害時のみに降格
+- ピックロケ補完は**取りやめ** (フリーロケ運用のため「空きロケへ」で問題ないと決着・2026-09-01)
 - **受け入れ条件**: 受付済がある日に実データが流れることを確認する (0件の日の動作は確認済み)。
   ⭐ステータスは 未入荷01→受付済02→検品中03→入荷確定04 と進むので、「受付済」で絞れば検品済みは自然に落ちる
   (要件定義 §3.1 の「翌日には消える」はこの仕組みで担保される)
