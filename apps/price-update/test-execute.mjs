@@ -11,7 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { createTables, insertRun, getRun } from './db.js';
-import { executeRun, mallWriteEnabled, classify, groupOperations, BREAKER_CONSECUTIVE_FAILURES } from './execute.js';
+import { executeRun, mallWriteEnabled, classify, groupOperations, findSendConflicts, sendKeyOf,
+  BREAKER_CONSECUTIVE_FAILURES } from './execute.js';
 import { executorGate } from './router.js';
 
 let failed = 0;
@@ -339,6 +340,159 @@ console.log('\n── 状態はイベントとして残る (行は書き換え�
   const events = after.events.filter((e) => e.operation_id === run.operations[0].operation_id).map((e) => e.event);
   eq(events, ['executing', 'confirmed'], '★executing → confirmed の順で追記されている');
   ok(after.events.some((e) => e.event === 'run_executed'), 'run 全体のイベントも残る');
+}
+
+console.log('\n── 同じ送り先に違う新売価が来たら送らない (Yahoo のカラバリ) ──');
+{
+  // Yahoo は商品に1つの価格しか持たないので、色が違っても送り先は同じ商品コードになる。
+  // ここで色ごとに違う新売価が入っていると、後から入れたほうが黙って勝ってしまう。
+  // どちらを送るか決められない、として送らない
+  const mk = (neCode, newPrice) => ({
+    operationId: `puo-dup-${neCode}-${Math.random().toString(36).slice(2, 8)}`,
+    mall: 'yahoo', neCode, rowKind: 'single',
+    listingCode: 'kara-1', skuCode: 'kara-1',   // ★色が違っても送り先は同じ
+    confidence: 'confirmed', expectedCurrentPrice: 577, newPrice,
+    cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.12,
+    initialState: 'previewed',
+  });
+  let sent = 0;
+  const client = {
+    patchItemPrices: async () => { sent++; return { status: 200, body: { state: "applied" } }; },
+    fetchItemDetail: async () => ({ item: { variants: { "kara-1": { standardPrice: "600" } } } }),
+  };
+
+  const dupId = insertRun(db, { createdBy: 't', neCodes: ['ne-k1', 'ne-k2'], limits: {},
+    operations: [mk('ne-k1', 600), mk('ne-k2', 650)] });
+  const dup = await executeRun(db, getRun(db, dupId), { actor: 't', clients: { yahoo: client },
+    env: { PRICE_UPDATE_YAHOO_ENABLED: '1' }, skipClaim: true });
+  eq(sent, 0, "★1件も送らない (どちらの値を送るか決められない)");
+  eq(dup.summary.sent, 0, "送信数 0");
+  eq(dup.results.every((r) => r.state === "blocked"), true, "全行が blocked");
+  ok(/違う新売価/.test(dup.results[0].reason || ""), "理由に「違う新売価」と書く");
+
+  // 同じ値なら送ってよい (色をまとめて同じ価格にする、はふつうの操作)
+  const sameId = insertRun(db, { createdBy: 't', neCodes: ['ne-k3', 'ne-k4'], limits: {},
+    operations: [mk('ne-k3', 600), mk('ne-k4', 600)] });
+  const same = await executeRun(db, getRun(db, sameId), { actor: 't', clients: { yahoo: client },
+    env: { PRICE_UPDATE_YAHOO_ENABLED: '1' }, skipClaim: true });
+  eq(sent, 1, "★同じ値なら 1回だけ送る (商品1つに1リクエスト)");
+  eq(same.summary.applied, 2, "2行とも成功として記録される");
+}
+
+console.log('\n── 送り先キーと事前検証 (グループ分けとは別) ──');
+{
+  const y = (listing, sku) => ({ mall: "yahoo", listing_code: listing, sku_code: sku });
+  const r = (listing, sku) => ({ mall: "rakuten", listing_code: listing, sku_code: sku });
+
+  eq(sendKeyOf(y("kara-1", "kara-1")), sendKeyOf(y("KARA-1", "kara-1")),
+    "★Yahoo: 出品コードの表記ゆれは同じ送り先");
+  eq(sendKeyOf(y("kara-1", "a")) === sendKeyOf(y("kara-1", "b")), true,
+    "★Yahoo: SKU が違っても送り先は同じ (商品に1つの価格)");
+  eq(sendKeyOf(r("mn-1", "sku-a")) === sendKeyOf(r("mn-1", "sku-b")), false,
+    "★楽天: SKU ごとに別の送り先 (variant ごとに価格を持つ)");
+
+  // 表記ゆれで別グループに割れても、同じ商品への矛盾は見つかる
+  const split = findSendConflicts([
+    { ...y("kara-1", "kara-1"), new_price: 600, expected_current_price: 577 },
+    { ...y("KARA-1", "KARA-1"), new_price: 650, expected_current_price: 577 },
+  ]);
+  eq(split.size, 1, "★大文字小文字で割れても同じ商品として見つける");
+
+  // 新売価が同じでも、記録した時の価格が違えば送らない (楽観ロックの基準を選べない)
+  const exp = findSendConflicts([
+    { ...y("kara-1", "kara-1"), new_price: 600, expected_current_price: 577 },
+    { ...y("kara-1", "kara-1"), new_price: 600, expected_current_price: 580 },
+  ]);
+  eq(exp.size, 1, "★新売価が同じでも、記録時の価格が違えば送らない");
+  ok(/記録した時の価格/.test([...exp.values()][0]), "理由に記録時の価格の食い違いと書く");
+
+  // ★3行以上あっても「重い食い違い」が優先される。
+  //   見つけた順で決めると、先に拾った表記ゆれの陰に「違う新売価」が隠れる (Codex R3)
+  const order1 = findSendConflicts([
+    { ...y("kara-1", "kara-1"), new_price: 600, expected_current_price: 577 },
+    { ...y("KARA-1", "KARA-1"), new_price: 600, expected_current_price: 577 },   // 表記ゆれ
+    { ...y("kara-1", "kara-1"), new_price: 650, expected_current_price: 577 },   // 違う新売価
+  ]);
+  ok(/違う新売価/.test([...order1.values()][0]),
+    "★表記ゆれを先に見ても、違う新売価のほうを理由にする");
+
+  const order2 = findSendConflicts([
+    { ...y("kara-1", "kara-1"), new_price: 600, expected_current_price: 577 },
+    { ...y("kara-1", "kara-1"), new_price: 600, expected_current_price: 580 },   // 記録時の価格が違う
+    { ...y("kara-1", "kara-1"), new_price: 650, expected_current_price: 577 },   // 違う新売価
+  ]);
+  ok(/違う新売価/.test([...order2.values()][0]),
+    "★記録時の価格の食い違いを先に見ても、違う新売価のほうを理由にする");
+
+  const order3 = findSendConflicts([
+    { ...y("kara-1", "kara-1"), new_price: 600, expected_current_price: 577 },
+    { ...y("KARA-1", "KARA-1"), new_price: 600, expected_current_price: 580 },
+  ]);
+  ok(/記録した時の価格/.test([...order3.values()][0]),
+    "★表記ゆれより、記録時の価格の食い違いを先に出す");
+
+  eq(findSendConflicts([
+    { ...y("kara-1", "kara-1"), new_price: 600, expected_current_price: 577 },
+    { ...y("kara-1", "kara-1"), new_price: 600, expected_current_price: 577 },
+  ]).size, 0, "同じ指示が2行あるだけなら問題にしない");
+}
+
+console.log('\n── 表記ゆれ・kill switch との優先順位 ──');
+{
+  const mk = (id, listing, sku, newPrice, expected) => ({
+    operationId: `puo-${id}-${Math.random().toString(36).slice(2, 8)}`,
+    mall: "yahoo", neCode: `ne-${id}`, rowKind: "single",
+    listingCode: listing, skuCode: sku,
+    confidence: "confirmed", expectedCurrentPrice: expected, newPrice,
+    cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.12,
+    initialState: "previewed",
+  });
+  const mkClient = () => {
+    const sentTo = [];
+    return {
+      sentTo,
+      patchItemPrices: async (code) => { sentTo.push(code); return { status: 200, body: { state: "applied" } }; },
+      fetchItemDetail: async () => ({ item: { variants: { "kara-1": { standardPrice: "600" }, "KARA-1": { standardPrice: "600" } } } }),
+    };
+  };
+
+  // ★表記ゆれ + 同じ指示 → 同じ商品へ2回送らない
+  const c1 = mkClient();
+  const id1 = insertRun(db, { createdBy: "t", neCodes: ["ne-a", "ne-b"], limits: {},
+    operations: [mk("a", "kara-1", "kara-1", 600, 577), mk("b", "KARA-1", "KARA-1", 600, 577)] });
+  const o1 = await executeRun(db, getRun(db, id1), { actor: "t", clients: { yahoo: c1.patchItemPrices ? c1 : c1 },
+    env: { PRICE_UPDATE_YAHOO_ENABLED: "1" }, skipClaim: true });
+  eq(c1.sentTo.length, 0, "★書き方が揃っていないので送らない (2回送信になる手前で止める)");
+  ok(/書き方が揃っていません/.test(o1.results[0].reason || ""), "理由に書き方の不揃いと書く");
+
+  // グループ分けも正規化されている (万一すり抜けても1リクエストにまとまる)
+  eq(groupOperations([
+    { mall: "yahoo", listing_code: "kara-1", sku_code: "kara-1" },
+    { mall: "yahoo", listing_code: "KARA-1", sku_code: "KARA-1" },
+  ]).length, 1, "★大文字小文字違いは1グループ (同じ商品へ2回送らない)");
+
+  // ★kill switch が無効でも、run の中身が決められない行は blocked として残す
+  const c2 = mkClient();
+  const id2 = insertRun(db, { createdBy: "t", neCodes: ["ne-c", "ne-d", "ne-e"], limits: {},
+    operations: [mk("c", "kara-2", "kara-2", 600, 577), mk("d", "kara-2", "kara-2", 650, 577),
+      mk("e", "other-1", "other-1", 600, 577)] });
+  const o2 = await executeRun(db, getRun(db, id2), { actor: "t", clients: { yahoo: c2 },
+    env: {}, skipClaim: true });   // ← kill switch は入れていない
+  eq(c2.sentTo.length, 0, "kill switch が無ければ1件も送らない");
+  const st = Object.fromEntries(o2.results.map((r) => [r.operationId.split("-")[1], r.state]));
+  eq([st.c, st.d], ["blocked", "blocked"], "★衝突行は blocked (kill switch を入れれば送れる、と読ませない)");
+  eq(st.e, "skipped", "衝突していない行は kill switch の理由で skipped");
+
+  // ★クライアントが無い時も同じ (送り口が無いことと、run の中身が壊れていることは別の事実)
+  const id3 = insertRun(db, { createdBy: "t", neCodes: ["ne-f", "ne-g"], limits: {},
+    operations: [mk("f", "kara-3", "kara-3", 600, 577), mk("g", "kara-3", "kara-3", 650, 577)] });
+  const o3 = await executeRun(db, getRun(db, id3), { actor: "t", clients: {},
+    env: { PRICE_UPDATE_YAHOO_ENABLED: "1" }, skipClaim: true });
+  eq(o3.results.every((r) => r.state === "blocked"), true, "★送り口が無くても、衝突は衝突として残す");
+
+  // ★全行が衝突して送るものが無くなった時
+  eq(o3.summary.sent, 0, "送信数 0");
+  eq(o3.summary.skipped, 2, "全行が対象外として数えられる");
 }
 
 db.close();

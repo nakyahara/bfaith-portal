@@ -174,3 +174,20 @@ export function runLimits(env = process.env) {
     maxRowsPerNeCode: 50,
   };
 }
+
+/**
+ * 行のガード評価に、その行だけの注意書きを足して保存用の guard にする。
+ * ★通常 run と復旧 run で同じものを使う。片方だけに足すと、復旧画面から
+ *   「1色のつもりが全色に効く」が消える (Codex R1 高)。
+ *
+ * @param {object|null} evaluation evaluateRow() の戻り
+ * @param {...(string|null|undefined)} notes 足したい注意書き
+ * @returns {{blocks:string[], warns:string[], canUpdate:boolean}|null}
+ */
+export function mergeGuardWarns(evaluation, ...notes) {
+  if (!evaluation) return null;
+  const extra = notes.filter((n) => typeof n === "string" && n.trim() !== "");
+  const warns = [...(evaluation.warns || [])];
+  for (const n of extra) if (!warns.includes(n)) warns.push(n);
+  return { blocks: evaluation.blocks, warns, canUpdate: evaluation.canUpdate };
+}

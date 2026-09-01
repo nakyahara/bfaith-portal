@@ -23,6 +23,8 @@
  *   previewed … まだ実行していない run (戻すものが無い)
  */
 
+import { mergeGuardWarns } from './pricing.js';
+
 /** 変わったことが確認できている状態 */
 export const CHANGED_STATES = ['confirmed'];
 /** 変わったかもしれない状態 (mayHaveChanged の印があるものだけ対象にする) */
@@ -95,12 +97,33 @@ export function buildRecoveryOperations(candidates, previewRows, evaluate) {
     mall, String(neCode ?? '').toLowerCase().trim(), rowKind,
     String(listingCode ?? '').toLowerCase().trim(), String(skuCode ?? '').toLowerCase().trim(),
   ].join('|');
+  /**
+   * ★旧形式 (色の個別商品コードを sku_code にしていた頃) の突き合わせキー。
+   *   Yahoo は商品に1つの価格しか持たないので、同じ商品の色は全部この行が受け持つ。
+   *   いま引き当て直した行にぶら下がっている色だけを対象にする
+   *   (その色が今も同じ商品にあることを確かめてから読み替える)。
+   */
+  const legacyYahooKeys = (r) => {
+    if (r.mall !== 'yahoo') return [];
+    const olds = [...(r.sharedSubCodes || []), ...(r.matchedSubCode ? [r.matchedSubCode] : [])];
+    return [...new Set(olds.map((c) => String(c ?? '').toLowerCase().trim()).filter(Boolean))]
+      .filter((c) => c !== String(r.skuCode ?? '').toLowerCase().trim())
+      .map((c) => key(r.mall, r.neCode, r.rowKind, r.listingCode, c));
+  };
   const byKey = new Map();
   const dup = new Set();
   for (const r of previewRows) {
     const k = key(r.mall, r.neCode, r.rowKind, r.listingCode, r.skuCode);
     if (byKey.has(k)) dup.add(k);      // 同じキーが 2 行 = どちらか決められない
     byKey.set(k, r);
+    // ★2026-09-01 より前の Yahoo の記録は sku_code に **色の個別商品コード** が入っている。
+    //   いまは商品コードに変えたので、そのままだと突き合わせが外れて「戻せない」になる。
+    //   同じ商品を指しているのが確かめられる時 (その色がいまも同じ商品にぶら下がっている) だけ、
+    //   旧いキーからも同じ行を引けるようにする。曖昧なら足さない (取り違えない)
+    for (const old of legacyYahooKeys(r)) {
+      if (byKey.has(old) && byKey.get(old) !== r) dup.add(old);
+      else if (!byKey.has(old)) byKey.set(old, r);
+    }
   }
 
   for (const { op, restoreTo } of candidates) {
@@ -139,9 +162,9 @@ export function buildRecoveryOperations(candidates, previewRows, evaluate) {
       taxRate: row.taxRate,
       shipping: row.shipping,
       feeRate: row.feeRate,
-      guard: evaluated.evaluation
-        ? { blocks: evaluated.evaluation.blocks, warns: evaluated.evaluation.warns, canUpdate: evaluated.evaluation.canUpdate }
-        : null,
+      // ★注意書き (例: Yahoo は色ごとの価格を持たないので全色が変わる) は復旧でも同じ。
+      //   価格を書き換える操作である以上、通常 run と同じものを見せる
+      guard: mergeGuardWarns(evaluated.evaluation, row.sharedNote),
       productUrl: row.url,
       initialState: evaluated.evaluation?.canUpdate ? 'previewed' : 'blocked_preview',
       // 監査用: どの行を戻そうとしているか

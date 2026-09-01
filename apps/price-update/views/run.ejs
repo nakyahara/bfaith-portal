@@ -4,6 +4,8 @@
   .pu-title { font-weight: 700; font-size: 15px; }
   .wrap { max-width: 1400px; }
   .pu-note { font-size: 12px; color: #64748b; }
+  /* 「操作の効き方が見た目と違う」注意書き (例: Yahoo のカラバリは全色つられて変わる) */
+  .pu-warn { font-size: 11px; color: #9a3412; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 4px; padding: 3px 6px; margin-top: 3px; line-height: 1.4; }
   table.pu { width: 100%; border-collapse: collapse; font-size: 13px; }
   table.pu th { text-align: left; color: #64748b; font-size: 11px; font-weight: 600; border-bottom: 2px solid #e2e8f0; padding: 6px 8px; white-space: nowrap; }
   table.pu td { border-bottom: 1px solid #f1f5f9; padding: 6px 8px; vertical-align: middle; }
@@ -113,6 +115,7 @@
           1件目は試運転です。送ったあとに価格を取り直して、その通りになっているか確かめます。
           確かめられなかった時・想定していない応答が返った時は、そこで止めて残りは送りません。
         </div>
+        <div id="exec-warn"></div>
         <input class="exec-confirm" id="exec-confirm" placeholder="実行する" autocomplete="off">
         <button class="btn btn-danger" id="exec-btn" type="button" disabled>送る</button>
         <span class="pu-note" id="exec-count"></span>
@@ -163,9 +166,10 @@
               <td class="num"><%= o.expected_current_price == null ? '—' : o.expected_current_price.toLocaleString() %></td>
               <td class="num"><%= o.new_price == null ? '—' : o.new_price.toLocaleString() %></td>
               <td class="pu-note">
-                <% if (guard && guard.blocks && guard.blocks.length) { %><%= guard.blocks.join(' / ') %>
-                <% } else if (guard && guard.warns && guard.warns.length) { %><%= guard.warns.join(' / ') %>
-                <% } else { %>—<% } %>
+                <% if (guard && guard.blocks && guard.blocks.length) { %><%= guard.blocks.join(' / ') %><% } %>
+                <%# ★注意書きはブロック理由があっても消さない。「1色のつもりが全色」は隠すと危ない %>
+                <% if (guard && guard.warns && guard.warns.length) { %><div class="pu-warn"><%= guard.warns.join(' / ') %></div><% } %>
+                <% if (!(guard && (((guard.blocks || []).length) || ((guard.warns || []).length)))) { %>—<% } %>
               </td>
               <td>
                 <% if (o.initial_state === 'manual_required') { %>
@@ -275,6 +279,16 @@
     $('exec-count').textContent = '(' + n(info.targets) + ' 行)';
     // ★ボタンの文言はこの履歴で実際に送るモールから作る。
     //   「楽天へ送る」と決め打ちにしていたので、Yahoo の履歴でも楽天と書いてあった (中原さん 9/1)
+    // ★送る前に「効き方が見た目と違う行」を必ず見せる。
+    //   例: Yahoo のカラバリは1色ぶんのつもりでも、その商品の色が全部同じ価格になる
+    const warns = info.warnings || [];
+    $('exec-warn').innerHTML = warns.length === 0 ? '' :
+      '<div class="pu-warn" style="margin:8px 0;"><b>送る前に確認してください (' + n(warns.length) + ' 行)</b>'
+      + '<ul style="margin:4px 0 0 18px; padding:0;">'
+      + warns.map((w) => '<li>' + esc(w.neCode || '')
+        + (w.listingCode ? ' (' + esc(w.listingCode) + ')' : '') + ' — ' + esc(w.warn) + '</li>').join('')
+      + '</ul></div>';
+
     const sendMalls = gates.filter(([, g]) => g.enabled).map(([m]) => MALL_LABEL[m] || m);
     $('exec-btn').textContent = (sendMalls.length > 0 ? sendMalls.join('・') + 'へ送る' : '送る');
     $('exec-form').style.display = '';
@@ -394,6 +408,19 @@
           if (json.runId) {
             $('rec-result').innerHTML = esc(json.message) + ' → <a href="/apps/price-update/runs/'
               + encodeURIComponent(json.runId) + '">開く</a>';
+            return;
+          }
+          // ★1行も戻せなかった時も、どの行がなぜ戻せないのかを必ず見せる。
+          //   「見つかりません」だけだと、モールの画面で何を確認すればよいか分からない
+          if (json.error === 'recovery_no_target' && (json.notRestored || []).length > 0) {
+            $('rec-result').innerHTML = '<span style="color:#991b1b;">' + esc(json.message) + '</span>'
+              + '<ul style="margin:6px 0 0 18px;">'
+              + json.notRestored.map((m) => '<li>' + esc(m.neCode || '')
+                + (m.listingCode ? ' (' + esc(m.listingCode)
+                  + (m.skuCode ? ' / ' + esc(m.skuCode) : '') + ')' : '')
+                + ' — ' + esc(m.reason) + '</li>').join('')
+              + '</ul>';
+            $('rec-btn').disabled = false;
             return;
           }
           throw new Error(json.message || json.error || ('HTTP ' + res.status));

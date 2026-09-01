@@ -74,11 +74,83 @@ function rowOf(op, isRecovery = false) {
 export function groupOperations(ops) {
   const groups = new Map();
   for (const op of ops) {
-    const key = JSON.stringify([op.mall, op.listing_code]);
+    // ★大文字小文字を無視してまとめる。生の値のままだと、同じ商品が 'kara-1' と 'KARA-1' の
+    //   2グループに割れて、同じ商品へ2回送ってしまう
+    //   (1回目で価格が変わり、2回目は楽観ロックで conflict → 同じ指示なのに片方だけ失敗として残る)
+    const key = JSON.stringify([op.mall, String(op.listing_code ?? '').trim().toLowerCase()]);
+    // 送る時に使う出品コードは先頭行の生の値 (モールが返してきた表記)
     if (!groups.has(key)) groups.set(key, { mall: op.mall, listingCode: op.listing_code, ops: [] });
     groups.get(key).ops.push(op);
   }
   return [...groups.values()];
+}
+
+/**
+ * **実際にモールへ書き込む単位** を表すキー。グループ分け (mall + listing_code) とは別物。
+ *
+ * ★Yahoo は商品に1つの価格しか持たない。色 (個別商品コード) は商品価格を継承するので、
+ *   色が違っても書き込む先は同じ商品になる。
+ *   出品コードの表記ゆれ (大文字小文字) で別グループに割れても、同じ商品なら同じ送り先として見る
+ *   — でないと「同じ商品へ違う価格を続けて送る」を素通りさせる (Codex R1 高)。
+ * ★楽天は SKU (variant) ごとに価格を持つので、SKU まで含めて1つの送り先。
+ */
+export function sendKeyOf(op) {
+  const n = (v) => String(v ?? '').trim().toLowerCase();
+  return op.mall === 'yahoo'
+    ? [op.mall, n(op.listing_code)].join('|')
+    : [op.mall, n(op.listing_code), n(op.sku_code)].join('|');
+}
+
+/**
+ * 送信前の一括検証: **同じ送り先に、決められない指示が来ていないか**。
+ *
+ * ・新売価が違う → どちらを送るか決められない
+ * ・記録した時の価格が違う → 引き当てかキャッシュが食い違っている。楽観ロックの基準を選べない
+ *
+ * どちらも「後から処理した行が黙って勝つ」形になるので、送る前に止める。
+ * @param {Array<object>} ops 実行対象の operation
+ * @returns {Map<string,string>} 送り先キー → 止める理由
+ */
+export function findSendConflicts(ops) {
+  // ★送り先ごとに **全行を集めてから** 判定する。見つけた順に決めると、
+  //   先に軽い食い違い (表記ゆれ) を拾った時点で以降を見なくなり、
+  //   後ろにある「違う新売価」が隠れる (Codex R3)
+  const byKey = new Map();
+  for (const op of ops) {
+    const k = sendKeyOf(op);
+    if (!byKey.has(k)) byKey.set(k, []);
+    byKey.get(k).push(op);
+  }
+
+  const conflicts = new Map();
+  for (const [k, rows] of byKey) {
+    if (rows.length < 2) continue;
+    const uniq = (vals) => [...new Set(vals)];
+
+    // 1. 送る値が決まらない — いちばん重い
+    const newPrices = uniq(rows.map((o) => o.new_price));
+    if (newPrices.length > 1) {
+      conflicts.set(k, `同じ送り先に違う新売価が指定されています (${newPrices.map((v) => `${v} 円`).join(" と ")})。`
+        + "どちらを送るか決められないため送りません");
+      continue;
+    }
+    // 2. 楽観ロックの基準が決まらない
+    const expects = uniq(rows.map((o) => o.expected_current_price));
+    if (expects.length > 1) {
+      conflicts.set(k, `同じ送り先なのに、記録した時の価格が行ごとに違います `
+        + `(${expects.map((v) => `${v} 円`).join(" と ")})。引き当てが食い違っているため送りません`);
+      continue;
+    }
+    // 3. 出品コードの書き方が揃っていない。
+    //    引き当てはモールが返した表記をそのまま使うので、ここが揺れるのは記録が壊れている合図。
+    //    まとめ送りのキーが2つに割れて「1商品に2つの価格」として弾かれるため、分かる理由で先に止める
+    const codes = uniq(rows.map((o) => `${o.listing_code} / ${o.sku_code}`));
+    if (codes.length > 1) {
+      conflicts.set(k, `同じ商品を指す行で、出品コードの書き方が揃っていません (${codes.join(" と ")})。`
+        + "取り違えを避けるため送りません");
+    }
+  }
+  return conflicts;
 }
 
 /**
@@ -133,6 +205,7 @@ export async function executeRun(db, run, { actor, clients, client, env = proces
   // client 単体で渡されたら楽天のものとして扱う (既存の呼び出し・テストとの互換)
   const clientOf = (mall) => (clients ? clients[mall] : (mall === 'rakuten' ? client : null));
   const results = [];
+  const conflictBlocked = [];   // 送り先が重なって決められなかった行 (記録は record 定義後)
   const summary = { sent: 0, applied: 0, noop: 0, conflict: 0, failed: 0, unknown: 0, skipped: 0, stopped: null };
 
   // ★同じ run を2つの要求が同時に実行しないよう、DB で claim を取る。
@@ -154,7 +227,21 @@ export async function executeRun(db, run, { actor, clients, client, env = proces
     return { summary, results };
   }
 
-  const groups = groupOperations(targets);
+  // ★送る前に run 全体を見て、同じ送り先へ決められない指示が来ていないか調べる。
+  //   グループ (mall + listing_code) ごとに見ると、表記ゆれで別グループに割れた
+  //   同じ商品を取りこぼす。
+  // ★これは kill switch やクライアント不在より **先** に記録する。
+  //   「この run の中身が決められない」は送信可否とは別の事実で、
+  //   kill switch を入れ直せば送れる、と読まれてはいけないため (Codex R2)
+  const sendConflicts = findSendConflicts(targets);
+  const sendable = [];
+  for (const op of targets) {
+    const reason = sendConflicts.get(sendKeyOf(op));
+    if (reason) { summary.skipped++; conflictBlocked.push({ op, reason }); }
+    else sendable.push(op);
+  }
+
+  const groups = groupOperations(sendable);
   const failStreak = new Map();     // mall → 連続失敗数
   const stoppedMalls = new Map();   // mall → 止めた理由
   const trialDone = new Set();      // 試運転が済んだモール
@@ -163,6 +250,8 @@ export async function executeRun(db, run, { actor, clients, client, env = proces
     results.push({ operationId: op.operation_id, state, reason: reason ?? null });
     appendEvent(db, run.run_id, { operationId: op.operation_id, actor, event: state, detail: { reason: reason ?? null, ...detail } });
   };
+
+  for (const { op, reason } of conflictBlocked) record(op, 'blocked', reason, { blocks: [reason] });
 
   for (const group of groups) {
     const { mall, listingCode, ops } = group;

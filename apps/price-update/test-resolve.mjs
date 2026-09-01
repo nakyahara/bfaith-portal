@@ -342,13 +342,18 @@ console.log('\n── ★Yahoo の普通の商品も SKU のキーを持つ (M3�
   });
   eq(upper.get('plain-002').skuCode, 'PLAIN-002', '応答の商品コードをそのまま使う');
 
-  // 個別商品コードで当たった時は今まで通りそちらが SKU のキー
+  // ★個別商品コード (色) で当たっても、送り先は **商品コード**。
+  //   Yahoo は商品に1つの価格しか持たず、色はそれを継承する。
+  //   子コードをキーにすると「商品の全色を書き換えたのに照合は子コードで探す」ことになり、
+  //   価格は変わったのに失敗として記録される (2026-09-01 実データで判明)
   const sub = await fetchYahooPricesRaw([{ key: 'sub-a', candidates: ['sub-a', 'parent-1'] }], {
     fetchYahooItemDetail: async (c) => (c === 'parent-1'
-      ? { ok: true, ItemCode: 'parent-1', Price: 500, SubCodes: [{ SubCode: 'sub-a', Price: null }] }
+      ? { ok: true, ItemCode: 'parent-1', Price: 500, SubCodes: [{ SubCode: 'sub-a', Price: null }, { SubCode: 'sub-b', Price: null }] }
       : (() => { throw new Error('HTTP 400'); })()),
   });
-  eq(sub.get('sub-a').skuCode, 'sub-a', '個別商品コードで当たればそれが SKU のキー');
+  eq(sub.get('sub-a').skuCode, 'parent-1', '★色で当たっても送り先は商品コード (Yahoo は商品に1つの価格)');
+  eq(sub.get('sub-a').matchedSubCode, 'sub-a', '当たった色は別に持っておく (画面に出す)');
+  eq(sub.get('sub-a').sharedSubCodes, ['sub-a', 'sub-b'], '★価格を共有する色をすべて返す (変えると全部変わる)');
 }
 
 console.log('\n── Yahoo カラバリ: 親の商品コード + 個別商品コード (2026-08-30 中原さん確認) ──');
@@ -376,8 +381,11 @@ console.log('\n── Yahoo カラバリ: 親の商品コード + 個別商品�
   const r = await fetchYahooPricesRaw(
     [{ key: '0726-001802-bk', candidates: ['0726-001802-bk', '0726-001802'] }], yahooDeps);
   const got = r.get('0726-001802-bk');
-  eq([got.found, got.price, got.skuCode, got.itemCode], [true, 577, '0726-001802-BK', '0726-001802'],
-    '★親コードで当てて、個別商品コードの価格 (継承なら商品価格) を採る');
+  eq([got.found, got.price, got.skuCode, got.itemCode], [true, 577, '0726-001802', '0726-001802'],
+    '★親コードで当てて商品価格を採る。送り先は商品コード (色ごとの価格は Yahoo に無い)');
+  eq(got.matchedSubCode, '0726-001802-BK', '当たった色 (画面に出す)');
+  eq(got.sharedSubCodes, ['0726-001802-BK', '0726-001802-CL'],
+    '★この価格を共有する色。実行するとこの2色が同じ価格になる');
   eq(calls, ['0726-001802-bk', '0726-001802'], 'NEコード → 親コードの順に試す');
 
   // 親ページに自分の個別商品コードが無ければ確定させない (別商品を掴まない)
@@ -570,24 +578,38 @@ console.log('\n── Yahoo: 応答の取り違えと SKU別価格 (fail-closed)
   eq(parentOfVariants.get('item-v').found, false, '★SKU別価格がある商品の親コードは未確定 (親価格で値付けさせない)');
   ok(parentOfVariants.get('item-v').reason.includes('SKU別価格'), '理由に SKU別価格と書く');
 
-  // 要求コードがサブコードと一致 → そのサブコードの価格を使う
+  // ★その色に専用の価格が入っている → 商品の価格を変えてもその色には効かない。
+  //   ここを「2200 が現在価格」として確定させると、送っても値段が変わらないのに
+  //   成功したように見える。触らない (2026-09-01)
   const sub = await fetchYahooPrices(['item-v-b'], {
     fetchYahooItemDetail: async (c) => ({
       ok: true, ItemCode: c, Name: 'バリ商品', Price: 2000,
       SubCodes: [{ SubCode: 'item-v-a', Price: 2100 }, { SubCode: 'item-v-b', Price: 2200 }],
     }),
   });
-  eq([sub.get('item-v-b').price, sub.get('item-v-b').skuCode], [2200, 'item-v-b'], 'サブコード一致ならその価格');
+  eq(sub.get('item-v-b').found, false, '★色に専用価格がある商品は確定させない');
+  ok(sub.get('item-v-b').reason.includes('専用の価格'), '理由に専用価格と書く');
 
-  // サブコードで問い合わせて応答の ItemCode が親商品になる仕様でも引き当てられる
+  // 応答の ItemCode が親商品になる仕様でも同じ (色に専用価格があれば触らない)
   const subViaParent = await fetchYahooPrices(['item-v-a'], {
     fetchYahooItemDetail: async () => ({
       ok: true, ItemCode: 'item-v', Name: 'バリ商品', Price: 2000,
       SubCodes: [{ SubCode: 'item-v-a', Price: 2100 }, { SubCode: 'item-v-b', Price: 2200 }],
     }),
   });
-  eq([subViaParent.get('item-v-a').price, subViaParent.get('item-v-a').skuCode], [2100, 'item-v-a'],
-    '★応答が親 ItemCode でも、サブコード一致なら引き当てる');
+  eq(subViaParent.get('item-v-a').found, false,
+    '★応答が親 ItemCode でも、色に専用価格があれば確定させない');
+
+  // 色に専用価格が無い (商品価格を継承) なら、送り先は商品コード
+  const inheritItem = await fetchYahooPrices(['item-w-a'], {
+    fetchYahooItemDetail: async () => ({
+      ok: true, ItemCode: 'item-w', Name: '継承の商品', Price: 2000,
+      SubCodes: [{ SubCode: 'item-w-a', Price: null }, { SubCode: 'item-w-b', Price: null }],
+    }),
+  });
+  eq([inheritItem.get('item-w-a').price, inheritItem.get('item-w-a').skuCode], [2000, 'item-w'],
+    '★継承なら商品価格・送り先は商品コード');
+  eq(inheritItem.get('item-w-a').sharedSubCodes, ['item-w-a', 'item-w-b'], '共有する色を返す');
 
   // 応答に要求コードがどこにも無い (ItemCode も SubCodes も違う) → 取り違えとして拒否
   const wrongItem = await fetchYahooPrices(['item-x'], {

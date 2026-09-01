@@ -86,6 +86,15 @@ export function planYahooUpdate(detail, itemCode, expected, prices) {
       `Yahoo は商品ごとに1つの価格しか送りません (受け取った数: ${wantKeys.length})`);
   }
   const key = wantKeys[0];
+  // ★送るキーは **商品コード** でなければならない。Yahoo に送るのは商品の価格 1つで、
+  //   個別商品コード (色) は自分の価格を持たずそれを継承する。
+  //   ここに子コードが来ると「商品の全色を書き換えたのに、照合は子コードで探す」ことになり、
+  //   価格は変わったのに失敗として記録される。呼び出し側の取り違えをここで止める (最後の安全弁)
+  if (String(key).trim().toLowerCase() !== String(detail.ItemCode).trim().toLowerCase()) {
+    return bad(400, 'SKU_KEY_MISMATCH',
+      `Yahoo は商品に1つの価格しか持ちません。送る先は商品コード (${detail.ItemCode}) `
+      + `でなければなりませんが、${key} が渡されました`);
+  }
   const next = toIntPrice(prices[key]);
   if (next === null || next < 1) {
     return bad(400, 'INVALID_PRICE', `送ろうとした価格が整数円ではありません (${prices[key]})`);
