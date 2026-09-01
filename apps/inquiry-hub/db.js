@@ -18,8 +18,10 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
-const DB_FILE = path.join(DATA_DIR, 'inquiry-hub.db');
+// ⚠️モジュール読み込み時に固定しない — 固定すると、初期化のたびに DATA_DIR を差し替える
+//   テスト (既存DBへの列追加の検証など) が、実際には元のDBを開いてしまい素通りする
+const dataDir = () => process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const dbFile = () => path.join(dataDir(), 'inquiry-hub.db');
 
 let db = null;
 
@@ -38,9 +40,10 @@ export function toUtcIso(input) {
 }
 
 export function initInquiryHubDB() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  const dir = dataDir();
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   if (db) { try { db.close(); } catch { /* close済み等は無視 */ } db = null; }
-  db = new Database(DB_FILE);
+  db = new Database(dbFile());
   // PRAGMAは接続単位。foreign_keys は SQLite デフォルトOFFなので毎接続で明示 (設計書§6)
   db.pragma('foreign_keys = ON');
   db.pragma('journal_mode = WAL');
@@ -637,6 +640,175 @@ function createTables() {
       ['amazon-cons-deal@amazon.com', 'Amazonの販促通知 (中原さん指定 2026-08-28)'],
     ]) ins.run(p, p.toLowerCase(), note, 'seed');
   }
+
+  createReturnCaseTables();
+}
+
+/**
+ * 返品・交換案件 (2026-09-01)。
+ * 正本 = AI_reference『システム設計\返品交換案件管理_要件定義_20260901.md』
+ *
+ * ⭐なぜ inquiries にフラグを足さないのか:
+ *   ①「顧客への返信は終わったが返金と回収は続く」が普通に起きる → 完了の意味が2つある
+ *   ② 同じ問い合わせで商品Aは返金・商品Bはメーカー代品、と割れることがある
+ *   ③ 別スレッドで「先日の返品の件ですが」と来る → 1案件に複数問い合わせがぶら下がる
+ *   ①〜③は inquiries の1行では表せない。
+ *
+ * ⭐状態は3軸に分ける。1つのステータスに混ぜない:
+ *   stage       = 工程 (どこまで進んだか)
+ *   waiting_on  = いま誰の返事・行動待ちか (カンバンの列)
+ *   assigned_user_id = 社内で最後まで面倒を見る人 (**外部待ちでも消さない**)
+ */
+function createReturnCaseTables() {
+  // 案件本体
+  db.exec(`CREATE TABLE IF NOT EXISTS return_cases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_no TEXT NOT NULL UNIQUE,              -- 'RC-2026-0087'
+    case_type TEXT NOT NULL CHECK(case_type IN ('RETURN_REFUND','EXCHANGE','MANUFACTURER','OTHER')),
+    -- 工程。⭐**厳密な順序ではなく「現在の代表工程」**。返送不要・メーカー直送で枝分かれするので
+    --   一本道の状態機械にしない (スキップ・逆戻りを許す)
+    stage TEXT NOT NULL DEFAULT 'RECEIVED' CHECK(stage IN
+      ('RECEIVED','COLLECTING_INFO','ASSESSING','RETURN_IN_TRANSIT','ARRANGING','FOLLOWING_UP','COMPLETED','CANCELED')),
+    -- ⭐カンバンの列。**いま案件全体を止めている主ブロッカーを1つだけ**持つ
+    --   (複数主体をJSON配列で持つと、カードをどの列に置くか決まらなくなる)
+    waiting_on TEXT NOT NULL DEFAULT 'SELF' CHECK(waiting_on IN
+      ('SELF','CUSTOMER','SUPPLIER','CARRIER','MARKETPLACE','SCHEDULED_EVENT','NONE')),
+    -- ⭐'waiting' は持たない。「待っている」は waiting_on が表す (二重管理にしない)
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','completed','cancelled')),
+    assigned_user_id TEXT NOT NULL,            -- ⭐空にできない。外部待ちでも催促責任は社内に残る
+    next_action_at TEXT,                       -- 次回確認日 (外部待ちのときは必須。アプリ層で担保)
+    next_action_note TEXT,                     -- 期限が来たら何をするか
+    -- ⭐滞留の起点。**updated_at で代用しない** (メモ修正や担当変更でリセットされてしまう)
+    waiting_since TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    -- 問い合わせから引き継ぐ表示用 (正はモール/ネクストエンジン。ここは案件カードに出すための写し)
+    customer_name TEXT,
+    order_channel TEXT,
+    order_no TEXT,
+    product_name TEXT,
+    supplier_name TEXT,
+    -- 返金。⭐実行はモール管理画面。ここは「いくら返す約束で、いくら返したか」の記録
+    refund_expected_amount INTEGER,
+    refund_completed_amount INTEGER,
+    refund_external_ref TEXT,
+    summary TEXT,
+    closed_at TEXT,
+    closed_by TEXT,
+    close_reason_code TEXT,                    -- 例外完了の理由コード (RETURN_CLOSE_REASONS)
+    close_note TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_return_cases_board ON return_cases(status, waiting_on, next_action_at)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_return_cases_order ON return_cases(order_no)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_return_cases_assignee ON return_cases(assigned_user_id, status)');
+
+  // 対応工程。⭐Boolean列の羅列 (returned_ok / refunded_ok …) にしない —
+  //   担当・期限・完了者・外部参照番号を持てず、「要否未確定」も表せないため
+  db.exec(`CREATE TABLE IF NOT EXISTS case_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL REFERENCES return_cases(id),
+    step_type TEXT NOT NULL,                   -- return-cases.js STEP_TEMPLATES のコード値
+    -- ⭐**「必要かどうか」と「進み具合」は別物**。
+    --   「返送は必要、でもまだ未着手」と「返送が必要かまだ分からない」を1列では書けない
+    necessity_status TEXT NOT NULL DEFAULT 'required'
+      CHECK(necessity_status IN ('undecided','required','not_required')),
+    -- テンプレート作成時の必要性 (最後の拠り所)
+    template_necessity TEXT NOT NULL DEFAULT 'required'
+      CHECK(template_necessity IN ('undecided','required')),
+    -- ⭐「対応不要」にする直前の必要性。戻すときはここへ戻す。
+    --   テンプレート値へ戻すと「要否未確定 → 必要にした → 外した → 戻す」で
+    --   要否未確定まで巻き戻ってしまう (人が下した「必要」という判断が消える)
+    necessity_before_skip TEXT,
+    progress_status TEXT NOT NULL DEFAULT 'not_started'
+      CHECK(progress_status IN ('not_started','in_progress','waiting','completed','exception')),
+    assignee_id TEXT,                          -- 確認担当 (社内)
+    waiting_party TEXT,                        -- 待ち先の表示 (顧客 / メーカー / 配送業者 / 倉庫)。⭐外部を assignee にしない
+    due_at TEXT,
+    completed_at TEXT,
+    completed_by TEXT,
+    external_ref TEXT,                         -- 送り状番号・依頼番号・モール返金ID
+    note TEXT,                                 -- 直近の状況 (1行)
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_case_steps_case ON case_steps(case_id, sort_order)');
+  // ⭐既に case_steps があるDB (先の版で作られたもの) にも列を足す。
+  //   CREATE TABLE IF NOT EXISTS の定義を変えるだけでは既存DBに列は増えず、
+  //   案件作成が "no column named ..." で落ちる (Codex R2 High)
+  addColumnIfMissing('case_steps', 'template_necessity',
+    "TEXT NOT NULL DEFAULT 'required' CHECK(template_necessity IN ('undecided','required'))");
+  addColumnIfMissing('case_steps', 'necessity_before_skip', 'TEXT');
+  // 既存行の backfill: いま要否未確定のものは、テンプレートでも要否未確定だったとみなす
+  db.exec("UPDATE case_steps SET template_necessity = 'undecided' WHERE necessity_status = 'undecided'");
+
+  // 案件 ⇔ 問い合わせ (多対多)。⭐1問い合わせに複数案件 / 1案件に複数問い合わせ の両方が起きる
+  db.exec(`CREATE TABLE IF NOT EXISTS case_inquiries (
+    case_id INTEGER NOT NULL REFERENCES return_cases(id),
+    inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
+    link_role TEXT NOT NULL DEFAULT 'related' CHECK(link_role IN ('origin','related')),
+    linked_by TEXT,
+    linked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    PRIMARY KEY (case_id, inquiry_id)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_case_inquiries_inquiry ON case_inquiries(inquiry_id)');
+
+  // 外部への依頼 (メーカー・配送業者・モール)。⭐case_steps とは役割が違う:
+  //   case_steps = やるべき工程と完了確認 / external_requests = いつ何を依頼して何を待っているか。
+  //   1案件で「メーカーに照会 + 配送業者に破損申請 + 顧客に写真依頼」が同時に走るので、
+  //   親に supplier_status を足す案は2件目で破綻する
+  db.exec(`CREATE TABLE IF NOT EXISTS external_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL REFERENCES return_cases(id),
+    party_type TEXT NOT NULL CHECK(party_type IN ('SUPPLIER','CARRIER','MARKETPLACE','OTHER')),
+    party_name TEXT,
+    request_type TEXT,
+    status TEXT NOT NULL DEFAULT 'WAITING'
+      CHECK(status IN ('DRAFT','SENT','WAITING','REPLIED','COMPLETED','CANCELED')),
+    is_blocking INTEGER NOT NULL DEFAULT 1 CHECK(is_blocking IN (0,1)),
+    requested_at TEXT,
+    response_due_at TEXT,
+    last_followup_at TEXT,
+    followup_count INTEGER NOT NULL DEFAULT 0,
+    completed_at TEXT,
+    subject TEXT,
+    note TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_external_requests_case ON external_requests(case_id, status)');
+
+  // 案件の履歴。⭐監査のためだけではなく「なぜメーカー待ちになったのか」
+  //   「自動反転が誤作動したか」を後から調べるために要る
+  db.exec(`CREATE TABLE IF NOT EXISTS case_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL REFERENCES return_cases(id),
+    event_type TEXT NOT NULL,
+    from_json TEXT,
+    to_json TEXT,
+    actor_type TEXT NOT NULL DEFAULT 'user' CHECK(actor_type IN ('user','system')),
+    actor_id TEXT,
+    source_type TEXT,                          -- UI / MESSAGE / OUTBOX / SCHEDULER
+    source_id TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_case_events_case ON case_events(case_id, id DESC)');
+  // 同じ受信メッセージ・同じ送信ジョブで自動反転を二重に適用しないための鍵 (PR2で使う)
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_case_events_source
+    ON case_events(source_type, source_id, event_type) WHERE source_id IS NOT NULL`);
+
+  // 問い合わせ側に残す「案件にするかの判断」。
+  // ⭐締め前確認は検知結果を保存しないが、ここは**人が押した判断だけ**を残す
+  //   (「今回は案件にしない」を押したのに毎回また聞かれる、を防ぐため)
+  db.exec(`CREATE TABLE IF NOT EXISTS case_triage_results (
+    inquiry_id INTEGER PRIMARY KEY REFERENCES inquiries(id),
+    result TEXT NOT NULL CHECK(result IN ('case_created','no_case_needed')),
+    decided_by TEXT,
+    decided_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
 }
 
 /**

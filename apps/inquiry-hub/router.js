@@ -57,6 +57,12 @@ import { collectInsights, estimateCost, WMS_CUTOFFS } from './insights.js';
 import { listCutoffItems, countCutoffItems, summarize, ackCutoffItem, unackCutoffItem,
   listCutoffExcludes, addCutoffExclude, removeCutoffExclude,
   nextCutoff, CUTOFF_KINDS, CUTOFF_TIMES, LOOKBACK_DAYS } from './cutoff.js';
+import { CASE_TYPES, STAGES, WAITING_ON, NECESSITY, PROGRESS, CLOSE_REASONS,
+  createCase, getCase, listSteps, listCaseInquiries, listCasesForInquiry, listEvents,
+  listBoardCases, boardColumns, nextStepOf, blockersOf, stepLabel, updateStep, setWaiting,
+  setAssignee, setRefund, closeCase, reopenCase, linkInquiry, countOpenCases,
+  detectCaseKeywords, getTriage, setTriage, clearTriage, overdueDays, businessDaysFromNow, canDoException,
+  STEP_TEMPLATES, jstDate as rcJstDate } from './return-cases.js';
 import { toPreviewLine } from './text-utils.js';
 
 // 返信エディタの Dark Launch フラグ (送信ワーカー稼働前にスタッフが誤って「送信したつもり」に
@@ -801,6 +807,54 @@ router.get('/inquiries/:id', (req, res) => {
   const quickDoneBtn = inq.internal_status === 'done'
     ? '<button class="ghost quick-done" disabled>✅ 完了済み</button>'
     : '<button class="pri quick-done" id="quickDoneBtn" title="1クリックで「完了」にして、次の問い合わせへ移動します">✅ 対応完了</button>';
+  // ─── 📦返品・交換案件パネル (2026-09-01)。
+  //   ⭐自動では案件にしない。キーワードで**候補を出すだけ**で、押すかどうかは人が決める
+  //     (「返品できますか？」という質問まで案件になると、ボードが死ぬ)
+  const linkedCases = (() => { try { return listCasesForInquiry(id); } catch { return []; } })();
+  const caseTriage = (() => { try { return getTriage(id); } catch { return null; } })();
+  const lastCustomerMsg = [...messages].reverse().find(m => m.is_incoming);
+  const caseHits = linkedCases.length ? []
+    : (() => { try { return detectCaseKeywords(inq.subject, lastCustomerMsg?.message_body_text || ''); } catch { return []; } })();
+  const caseDefaultDate = (() => { try { return businessDaysFromNow(3); } catch { return ''; } })();
+  const casePanel = linkedCases.length
+    ? `<div class="panel">
+        <h3>📦 返品・交換案件</h3>
+        ${linkedCases.map(c => `<div style="padding:6px 0;border-bottom:1px solid #f1f5f9">
+          <a href="/apps/inquiry-hub/cases/${c.id}"><b>${he(c.case_no)}</b></a>
+          ${badge({ badge: CASE_TYPES[c.case_type]?.badge }, CASE_TYPES[c.case_type]?.label || c.case_type)}
+          ${c.status === 'active'
+            ? badge({ badge: WAITING_ON[c.waiting_on]?.badge }, WAITING_ON[c.waiting_on]?.label || c.waiting_on)
+            : badge({ badge: 'background:#dcfce7;color:#166534' }, '完了')}
+          <div class="sub">担当 ${he(c.assigned_user_id)}${c.next_action_at ? ' ・ 次回確認 ' + he(rcJstDate(c.next_action_at)) : ''}
+            ${overdueDays(c.next_action_at) > 0 ? `<b style="color:#b91c1c"> ${overdueDays(c.next_action_at)}日超過</b>` : ''}</div>
+        </div>`).join('')}
+        <div class="sub" style="margin-top:8px">この問い合わせを「完了」にしても案件は残ります。
+          返信が終わったことと、返金・代品が終わったことは別物です。</div>
+      </div>`
+    : caseHits.length && caseTriage?.result !== 'no_case_needed'
+      ? `<div class="panel" style="border-left:3px solid #f59e0b">
+          <h3>📦 返品・交換の対応が残りそうです</h3>
+          <div class="sub">本文から「${he(caseHits.slice(0, 4).join('、'))}」を検出しました。
+            案件にすると、返金や代品の手配が終わるまで追いかけます。</div>
+          <label>案件種別
+            <select id="caseType">
+              <option value="">選んでください</option>
+              ${Object.entries(CASE_TYPES).map(([k, v]) => `<option value="${k}">${he(v.label)}</option>`).join('')}
+            </select></label>
+          <label>次回確認日
+            <input type="date" id="caseDate" value="${he(caseDefaultDate)}"></label>
+          <div class="sub" id="casePreview">担当と工程は自動で入ります (入力はこの2つだけ)</div>
+          <div class="row" style="margin-top:8px">
+            <button class="pri" id="makeCase">返品・交換案件として管理</button>
+            <button class="ghost" id="noCase">今回は案件にしない</button>
+          </div>
+        </div>`
+      : caseTriage?.result === 'no_case_needed'
+        ? `<div class="panel"><h3>📦 返品・交換案件</h3>
+            <div class="sub">${he(caseTriage.decided_by || '担当者')} が「案件にしない」と判断しました
+              (${he(fmtJst(caseTriage.decided_at))})。<a href="#" id="undoNoCase">やっぱり案件にする</a></div></div>`
+        : '';
+
   const body = `
   <div class="detail-head">
     <div class="detail-nav">
@@ -819,6 +873,7 @@ router.get('/inquiries/:id', (req, res) => {
       ${replyPanel}
     </div>
     <div class="side">
+      ${casePanel}
       <div class="panel">
         <h3>顧客情報</h3>
         <dl>
@@ -1356,7 +1411,64 @@ router.get('/inquiries/:id', (req, res) => {
   if (replyBtn && replyCompleteBtn) {
     replyBtn.addEventListener('click', function() { submitReply(false); });
     replyCompleteBtn.addEventListener('click', function() { submitReply(true); });
-  }`;
+  }
+
+  // ─── 📦返品・交換案件 (2026-09-01) ───
+  var CASE_STEP_NAMES = ${JSON.stringify(Object.fromEntries(
+    Object.entries(STEP_TEMPLATES).map(([k, v]) => [k, v.map(s => s.name)])))};
+  var caseTypeSel = document.getElementById('caseType');
+  if (caseTypeSel) {
+    caseTypeSel.addEventListener('change', function() {
+      var names = CASE_STEP_NAMES[caseTypeSel.value];
+      var el = document.getElementById('casePreview');
+      el.textContent = names
+        ? names.length + '件の工程が作られます: ' + names.join(' / ')
+        : '担当と工程は自動で入ります (入力はこの2つだけ)';
+    });
+  }
+  var makeCaseBtn = document.getElementById('makeCase');
+  if (makeCaseBtn) makeCaseBtn.addEventListener('click', function() {
+    var type = caseTypeSel.value, date = document.getElementById('caseDate').value;
+    if (!type) { toast('案件種別を選んでください'); return; }
+    if (!date) { toast('次回確認日を入れてください'); return; }
+    makeCaseBtn.disabled = true;
+    createCaseReq(type, date, false);
+  });
+  function createCaseReq(type, date, allowDuplicate) {
+    fetch('/apps/inquiry-hub/api/cases', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inquiryId: ${id}, caseType: type, nextActionDate: date,
+        allowDuplicate: !!allowDuplicate }) })
+      .then(function(r) { return r.json().then(function(j) { return { status: r.status, ok: r.ok, j: j }; }); })
+      .then(function(x) {
+        // 同じ問い合わせに進行中の案件がある = 二度押しの可能性。作るなら人が確認してから
+        if (x.status === 409 && x.j.duplicate) {
+          if (confirm('この問い合わせには進行中の案件 ' + x.j.caseNo + ' があります。\\n'
+            + '別の案件として新しく作りますか?\\n'
+            + '(同じ件なら「キャンセル」を押して、既存の案件を開いてください)')) {
+            createCaseReq(type, date, true);
+          } else { makeCaseBtn.disabled = false; }
+          return;
+        }
+        if (!x.ok) { toast(x.j.error || '作成できませんでした'); makeCaseBtn.disabled = false; return; }
+        toast(x.j.case_no + ' を作成しました');
+        setTimeout(function() { location.href = '/apps/inquiry-hub/cases/' + x.j.id; }, 700);
+      })
+      .catch(function(e) { toast('作成失敗: ' + e.message); makeCaseBtn.disabled = false; });
+  }
+  var noCaseBtn = document.getElementById('noCase');
+  if (noCaseBtn) noCaseBtn.addEventListener('click', function() {
+    fetch('/apps/inquiry-hub/api/inquiries/${id}/no-case', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .then(function() { toast('この問い合わせは案件にしません'); setTimeout(function(){ location.reload(); }, 700); });
+  });
+  var undoNoCase = document.getElementById('undoNoCase');
+  if (undoNoCase) undoNoCase.addEventListener('click', function(e) {
+    e.preventDefault();
+    fetch('/apps/inquiry-hub/api/inquiries/${id}/triage-reset', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .then(function() { location.reload(); });
+  });`;
 
   res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`,
     backFolder ? `folder:${backFolder.id}` : backView, body, script, { group: backGroup }));
@@ -3622,6 +3734,512 @@ router.post('/api/cutoff/exclude/:id(\\d+)/delete', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// 📦 返品・交換案件 (2026-09-01 中原さん要望「いま誰がボールを持っているか一発で分かるように」)
+//    正本 = AI_reference『システム設計\返品交換案件管理_要件定義_20260901.md』
+//    ⭐問い合わせの完了と案件の完了は別物。返信が終わっても、返金と回収が残っていれば案件は残る
+// ═══════════════════════════════════════════════════════════════
+
+const CASE_PAGE_CSS = `<style>
+.board-wrap { overflow-x: auto; padding-bottom: 8px; }
+.board { display: grid; grid-auto-flow: column; gap: 10px; align-items: start; min-width: min-content; }
+.bcol { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 9px; width: 240px; }
+.bcol.empty { width: 120px; background: transparent; border-style: dashed; }
+.bcol-head { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; margin-bottom: 8px; }
+.bcol-head b { font-size: 13px; }
+.bcol.empty .bcol-head b { color: #94a3b8; font-weight: 500; font-size: 12px; }
+.bcol-head .n { font-size: 12px; color: #94a3b8; }
+.bcard { display: block; background: #fff; border: 1px solid #e2e8f0; border-left: 3px solid #cbd5e1;
+  border-radius: 8px; padding: 9px 10px; margin-bottom: 8px; text-decoration: none; color: inherit; }
+.bcard:hover { border-color: #94a3b8; }
+.bcard.late { border-left-color: #dc2626; }
+.bcard.soon { border-left-color: #f59e0b; }
+.bcard.done { opacity: .55; }
+.bcard .no { font-size: 11px; color: #94a3b8; }
+.bcard .who { font-size: 13px; font-weight: 700; margin-top: 1px; }
+.bcard .item { font-size: 12px; color: #64748b; }
+.bcard .next { font-size: 12px; margin-top: 7px; padding-top: 7px; border-top: 1px dashed #e2e8f0; }
+.bcard .next .k { display: block; font-size: 11px; color: #94a3b8; }
+.bcard .foot { display: flex; justify-content: space-between; gap: 6px; margin-top: 7px; font-size: 12px; color: #64748b; }
+.bcard .over { color: #b91c1c; font-weight: 700; }
+.bcol-empty { text-align: center; color: #94a3b8; font-size: 12px; padding: 8px 0; }
+.case-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr)); gap: 1px;
+  background: #e2e8f0; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; margin: 12px 0; }
+.case-facts .f { background: #fff; padding: 9px 12px; }
+.case-facts .k { font-size: 11px; color: #94a3b8; }
+.case-facts .v { font-size: 14px; font-weight: 600; margin-top: 2px; }
+.next-box { border: 1px solid #e2e8f0; border-left: 3px solid #2563eb; background: #eff6ff;
+  border-radius: 8px; padding: 13px 15px; margin: 12px 0; }
+.next-box.late { border-left-color: #dc2626; background: #fef2f2; }
+.next-box.done { border-left-color: #16a34a; background: #f0fdf4; }
+.next-box .lbl { font-size: 12px; color: #64748b; }
+.next-box .what { font-size: 17px; font-weight: 700; margin-top: 2px; }
+.next-box .who { font-size: 13px; color: #64748b; margin-top: 4px; }
+.steps { border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden; }
+.step-row { display: grid; grid-template-columns: 120px minmax(0,1fr) 130px 120px auto; gap: 12px;
+  padding: 11px 13px; border-bottom: 1px solid #f1f5f9; align-items: start; }
+.step-row:last-child { border-bottom: 0; }
+.step-row.settled { background: #f8fafc; }
+.step-row.now { background: #eff6ff; }
+.step-row .nm { font-weight: 700; font-size: 14px; }
+.step-row .nt { font-size: 12px; color: #64748b; margin-top: 2px; }
+.step-row .cd { font-size: 11px; color: #cbd5e1; margin-top: 2px; }
+.step-row .wp { font-size: 12px; color: #92400e; }
+.step-row .as { font-size: 12px; color: #94a3b8; }
+.step-row .due { font-size: 12px; color: #64748b; }
+.step-row .due .over { color: #b91c1c; font-weight: 700; display: block; }
+.step-row .ops { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 900px) { .step-row { grid-template-columns: 1fr; gap: 6px; } .step-row .ops { justify-content: flex-start; } }
+.case-hist { font-size: 13px; }
+.case-hist .r { display: flex; gap: 10px; padding: 7px 0; border-top: 1px solid #f1f5f9; }
+.case-hist .w { color: #94a3b8; font-size: 12px; white-space: nowrap; }
+.case-panel { border: 1px solid #e2e8f0; border-left: 3px solid #2563eb; background: #f8fafc;
+  border-radius: 8px; padding: 12px 14px; margin: 12px 0; }
+.case-panel.suggest { border-left-color: #f59e0b; background: #fffbeb; }
+.case-panel h4 { margin: 0 0 6px; font-size: 14px; }
+.case-panel .row { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; }
+.case-panel .ops { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+</style>`;
+
+/** ボードのカード1枚 */
+function caseCard(c) {
+  const late = c.over > 0, soon = !late && c.next_action_at
+    && Date.parse(c.next_action_at) - Date.now() < 24 * 3600 * 1000;
+  const cls = c.status !== 'active' ? 'done' : late ? 'late' : soon ? 'soon' : '';
+  const due = c.next_action_at ? rcJstDate(c.next_action_at).slice(5).replace('-', '/') : '期限なし';
+  return `<a class="bcard ${cls}" href="/apps/inquiry-hub/cases/${c.id}">
+    <div class="no">${he(c.case_no)} ・ ${he(CASE_TYPES[c.case_type]?.label || c.case_type)}</div>
+    <div class="who">${he(c.customer_name || '(顧客名なし)')}</div>
+    <div class="item">${he(c.product_name || c.order_no || '')}</div>
+    ${c.status === 'active' && c.next_step_label
+      ? `<div class="next"><span class="k">次にやること</span>${he(c.next_step_label)}</div>` : ''}
+    <div class="foot"><span>${he(c.assigned_user_id || '担当なし')}</span>
+      <span class="${late ? 'over' : ''}">${he(due)}${late ? ' ・ ' + c.over + '日超過' : ` ・ ${c.steps_done}/${c.steps_total}工程`}</span></div>
+  </a>`;
+}
+
+/** 📦 返品・交換案件ボード。⭐列は「誰待ち」が既定。工程は枝分かれするので既定にしない */
+router.get('/cases', (req, res) => {
+  const view = ['wait', 'stage', 'list'].includes(req.query.view) ? req.query.view : 'wait';
+  const showDone = req.query.done === '1';
+  const rows = listBoardCases({ includeCompleted: showDone });
+  const active = rows.filter(r => r.status === 'active');
+  const overdue = active.filter(r => r.over > 0).length;
+
+  const viewLink = (v, label, title) =>
+    `<a class="${view === v ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cases?view=${v}${showDone ? '&done=1' : ''}" title="${he(title)}">${he(label)}</a>`;
+
+  let main = '';
+  if (view === 'list') {
+    // 件数が増えたとき用の表 (返品SaaSの主画面はこの形。Loop Returns / ReturnGO)
+    main = `<div class="board-wrap"><table class="list-table" style="width:100%;font-size:13px">
+      <thead><tr><th>案件番号</th><th>顧客・商品</th><th>種別</th><th>待ち先</th><th>工程</th><th>担当</th><th>次にやること</th><th>次回確認日</th></tr></thead>
+      <tbody>${rows.map(c => `<tr>
+        <td><a href="/apps/inquiry-hub/cases/${c.id}">${he(c.case_no)}</a></td>
+        <td>${he(c.customer_name || '(顧客名なし)')}<br><span class="sub">${he(c.product_name || '')}</span></td>
+        <td>${he(CASE_TYPES[c.case_type]?.label || c.case_type)}</td>
+        <td>${badge({ badge: WAITING_ON[c.waiting_on]?.badge }, WAITING_ON[c.waiting_on]?.label || c.waiting_on)}</td>
+        <td>${he(STAGES[c.stage]?.label || c.stage)}<br><span class="sub">${c.steps_done}/${c.steps_total}工程</span></td>
+        <td>${he(c.assigned_user_id || '')}</td>
+        <td>${c.status === 'active' ? he(c.next_step_label || '') : '<span class="sub">—</span>'}</td>
+        <td>${c.next_action_at ? he(rcJstDate(c.next_action_at)) : '<span class="sub">なし</span>'}
+          ${c.over > 0 ? `<br><b style="color:#b91c1c">${c.over}日超過</b>` : ''}</td>
+      </tr>`).join('') || '<tr><td colspan="8" class="empty">案件はまだありません</td></tr>'}</tbody></table></div>`;
+  } else {
+    const key = view === 'stage' ? 'stage' : 'waiting_on';
+    const cols = boardColumns(view === 'stage' ? 'stage' : 'wait');
+    main = `<div class="board-wrap"><div class="board">${cols.map(col => {
+      const items = rows.filter(c => (view === 'stage'
+        ? (c.status === 'active' ? c.stage : 'COMPLETED')
+        : (c.status === 'active' ? c.waiting_on : 'NONE')) === col.key);
+      const empty = items.length === 0;
+      return `<div class="bcol${empty ? ' empty' : ''}">
+        <div class="bcol-head"><b>${he(col.label)}</b><span class="n">${items.length}</span></div>
+        ${empty ? '<div class="bcol-empty">なし</div>' : items.map(caseCard).join('')}
+      </div>`;
+    }).join('')}</div></div>`;
+  }
+
+  const body = `${CASE_PAGE_CSS}
+  <div class="view-hint">📦 <b>返品・交換案件</b> — 問い合わせのうち
+    <b>商品が動く・お金が動くもの</b>だけを案件にして、終わるまで追いかけます。
+    <span class="sub">問い合わせを完了にしても案件は残ります (返信が終わったことと、返金・代品が終わったことは別)。
+    列は「対応状況」＝いま誰の返事・行動待ちか。工程は枝分かれするので、こちらを既定にしています</span></div>
+
+  <div class="cut-hero">
+    <div>未完了 <span class="big">${active.length}</span>件</div>
+    <div class="sub">${overdue > 0 ? `<b style="color:#b91c1c">期限超過 ${overdue}件</b>` : '期限超過なし'}</div>
+    <span style="flex:1"></span>
+    <div class="sub">${he(rcJstDate(new Date().toISOString()))} 時点</div>
+  </div>
+
+  <div class="filters">
+    ${viewLink('wait', '対応状況', '列＝いま誰の返事・行動を待っているか。日々の対応と放置防止はこの見方')}
+    ${viewLink('stage', '処理工程', '列＝処理のどこまで進んだか。全体の進み具合を見るときの見方')}
+    ${viewLink('list', '一覧', '件数が増えたとき用。表で見る')}
+    <span style="flex:1"></span>
+    <a class="${showDone ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cases?view=${view}${showDone ? '' : '&done=1'}">完了した案件も表示</a>
+  </div>
+
+  ${main}
+
+  <div class="sub" style="margin-top:12px">
+    カードのドラッグ移動は入れていません — 待ち先は工程の状態から決まるので、
+    ボード上で直接動かせると「実際は終わっていないのに動いた」という嘘が入ります。
+  </div>`;
+  res.send(pageShell('問い合わせ管理 — 返品・交換案件', 'cases', body, ''));
+});
+
+/** 📦 案件詳細。⭐上から「次にやること」→「対応工程」→「履歴」 */
+router.get('/cases/:id(\\d+)', (req, res) => {
+  const c = getCase(Number(req.params.id));
+  if (!c) return res.status(404).send(pageShell('案件が見つかりません', 'cases',
+    '<div class="empty">案件が見つかりません</div>', ''));
+  const steps = listSteps(c.id);
+  const next = nextStepOf(steps);
+  const inqs = listCaseInquiries(c.id);
+  const events = listEvents(c.id, 20);
+  const blockers = blockersOf(c.id);
+  const over = overdueDays(c.next_action_at);
+  // 例外操作 (必要な工程を外す / 未処理を残して完了) の権限。
+  // ⭐担当者マスタが未整備のうちは通すが、その旨を画面に出す
+  // ⚠️判定できなかったときは「できない」と出す。ここで allowed:true にすると、
+  //   画面は押せそうに見えるのに API は 403 を返す、という食い違いになる
+  const excPerm = (() => { try { return canDoException(actorOf(req)); }
+    catch { return { allowed: false, unmanaged: false, error: true }; } })();
+  const settled = s => ['completed', 'exception'].includes(s.progress_status) || s.necessity_status === 'not_required';
+
+  const stepRow = s => {
+    const isSettled = settled(s);
+    const stateMeta = s.necessity_status === 'undecided' ? NECESSITY.undecided
+      : s.necessity_status === 'not_required' ? NECESSITY.not_required
+      : PROGRESS[s.progress_status];
+    const sOver = !isSettled && s.due_at ? overdueDays(s.due_at) : 0;
+    // ⭐「対応不要」は要否がまだ決まっていない工程だけ。
+    //   必要と決まっている工程を外すのは例外操作 (理由 + 権限)。ボタンの見た目も分ける
+    const ops = s.necessity_status === 'undecided'
+      ? `<button class="stp" data-id="${s.id}" data-act="need">必要にする</button>
+         <button class="stp ghost" data-id="${s.id}" data-act="skip">対応不要にする</button>`
+      : isSettled
+        ? `<button class="stp ghost" data-id="${s.id}" data-act="undo">戻す</button>`
+        : `<button class="stp pri" data-id="${s.id}" data-act="complete">完了にする</button>
+           <button class="stp" data-id="${s.id}" data-act="wait">回答・到着待ちにする</button>
+           <button class="stp ghost stp-exc" data-id="${s.id}" data-act="skip_required"
+             title="必要と決まっている工程を外します。理由が要ります">この工程を外す</button>`;
+    return `<div class="step-row${isSettled ? ' settled' : ''}${next && next.id === s.id ? ' now' : ''}">
+      <div>${badge({ badge: stateMeta?.badge }, stateMeta?.label || s.progress_status)}</div>
+      <div><div class="nm">${he(stepLabel(c.case_type, s.step_type))}</div>
+        ${s.note ? `<div class="nt">${he(s.note)}</div>` : ''}
+        ${s.external_ref ? `<div class="nt">外部参照 ${he(s.external_ref)}</div>` : ''}
+        <div class="cd">${he(s.step_type)}</div></div>
+      <div>${s.waiting_party && !isSettled ? `<div class="wp">${he(s.waiting_party)}</div>` : ''}
+        <div class="as">${isSettled && s.completed_by ? he(s.completed_by) : s.assignee_id ? '確認：' + he(s.assignee_id) : ''}</div></div>
+      <div class="due">${isSettled
+        ? (s.completed_at ? `<span class="sub">${he(rcJstDate(s.completed_at))}</span>` : '')
+        : s.due_at ? `${he(rcJstDate(s.due_at).slice(5).replace('-', '/'))}${sOver > 0 ? `<span class="over">${sOver}日超過</span>` : ''}` : ''}</div>
+      <div class="ops">${ops}</div>
+    </div>`;
+  };
+
+  const openSteps = steps.filter(s => !settled(s));
+  const doneSteps = steps.filter(settled);
+
+  const body = `${CASE_PAGE_CSS}
+  <div class="filters"><a class="ghost btn-link" href="/apps/inquiry-hub/cases">← 案件ボードに戻る</a></div>
+
+  <div class="card" style="padding:16px">
+    <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:flex-start">
+      <div>
+        <div class="sub">${he(c.case_no)}</div>
+        <h2 style="margin:2px 0 0;font-size:19px">${he(c.product_name || c.customer_name || c.case_no)}</h2>
+        <div class="sub">${he(c.customer_name || '')}${c.order_no ? ' ・ ' + he(c.order_no) : ''}${c.order_channel ? ' ・ ' + he(c.order_channel) : ''}</div>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${badge({ badge: CASE_TYPES[c.case_type]?.badge }, CASE_TYPES[c.case_type]?.label || c.case_type)}
+        ${badge({ badge: WAITING_ON[c.waiting_on]?.badge }, WAITING_ON[c.waiting_on]?.label || c.waiting_on)}
+        ${c.status !== 'active' ? badge({ badge: 'background:#dcfce7;color:#166534' }, '完了') : ''}
+      </div>
+    </div>
+
+    <div class="case-facts">
+      <div class="f"><div class="k">確認担当</div><div class="v">${he(c.assigned_user_id)}</div></div>
+      <div class="f"><div class="k">現在の待ち先</div><div class="v">${he(WAITING_ON[c.waiting_on]?.short || c.waiting_on)}</div></div>
+      <div class="f"><div class="k">工程</div><div class="v">${he(STAGES[c.stage]?.label || c.stage)}</div></div>
+      <div class="f"><div class="k">次回確認日</div><div class="v">${c.next_action_at ? he(rcJstDate(c.next_action_at)) : '<span class="sub">なし</span>'}
+        ${over > 0 ? `<span style="color:#b91c1c"> ${over}日超過</span>` : ''}</div></div>
+    </div>
+
+    ${c.status === 'active' ? `
+    <div class="next-box ${over > 0 ? 'late' : next ? '' : 'done'}">
+      <div class="lbl">次にやること</div>
+      <div class="what">${next ? he(stepLabel(c.case_type, next.step_type)) : 'すべての工程が片付きました'}</div>
+      <div class="who">${next
+        ? `${next.waiting_party ? '待ち先：' + he(next.waiting_party) + ' ／ ' : ''}確認担当：${he(next.assignee_id || c.assigned_user_id)}${next.due_at ? ' ／ 期限 ' + he(rcJstDate(next.due_at)) : ''}`
+        : '案件を完了できます'}</div>
+    </div>` : `
+    <div class="next-box done"><div class="lbl">完了</div>
+      <div class="what">${he(rcJstDate(c.closed_at || ''))} に ${he(c.closed_by || '')} が完了にしました</div>
+      ${c.close_reason_code ? `<div class="who">例外として完了：${he(CLOSE_REASONS[c.close_reason_code] || c.close_reason_code)}${c.close_note ? ' — ' + he(c.close_note) : ''}</div>` : ''}
+    </div>`}
+
+    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:6px">
+      <b style="font-size:15px">対応工程</b>
+      <span class="sub">未完了 ${openSteps.length}件 / 全${steps.length}件</span>
+      <span style="flex:1"></span>
+      <button class="ghost" id="toggleDone">完了済みの工程 ${doneSteps.length}件 を表示</button>
+    </div>
+    <div class="steps">${openSteps.map(stepRow).join('') || '<div class="step-row"><div></div><div class="nm">残っている工程はありません</div><div></div><div></div><div></div></div>'}</div>
+    <div class="steps" id="doneSteps" style="display:none;margin-top:8px">${doneSteps.map(stepRow).join('')}</div>
+
+    <div style="margin-top:18px;display:flex;flex-wrap:wrap;gap:16px">
+      <div style="flex:1 1 260px">
+        <b style="font-size:14px">💴 返金の記録</b>
+        <div class="sub" style="margin-bottom:6px">※返金の正データは各モールです。この画面は実施確認用です</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          <input id="refExp" type="text" inputmode="numeric" placeholder="予定額" value="${c.refund_expected_amount ?? ''}" style="width:100px">
+          <input id="refDone" type="text" inputmode="numeric" placeholder="実績額" value="${c.refund_completed_amount ?? ''}" style="width:100px">
+          <input id="refRef" type="text" placeholder="モールの処理番号" value="${he(c.refund_external_ref || '')}" style="width:150px">
+          <button class="pri" id="saveRefund">記録する</button>
+        </div>
+      </div>
+      <div style="flex:1 1 240px">
+        <b style="font-size:14px">⏰ 待ち先と次回確認日</b>
+        <div class="sub" style="margin-bottom:6px">外部待ちにするときは次回確認日が必ず入ります</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          <select id="waitOn">${Object.entries(WAITING_ON).filter(([k]) => k !== 'NONE')
+            .map(([k, v]) => `<option value="${k}"${k === c.waiting_on ? ' selected' : ''}>${he(v.label)}</option>`).join('')}</select>
+          <input id="waitDate" type="date" value="${c.next_action_at ? he(rcJstDate(c.next_action_at)) : ''}">
+          <button class="pri" id="saveWaiting">変更する</button>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:18px">
+      <b style="font-size:14px">🔗 関連する問い合わせ</b>
+      <div class="sub">${inqs.length}件。問い合わせを完了にしても、この案件は残ります</div>
+      ${inqs.map(i => `<div style="padding:6px 0;border-top:1px solid #f1f5f9;font-size:13px">
+        ${i.link_role === 'origin' ? badge({ badge: 'background:#dbeafe;color:#1d4ed8' }, '元') : ''}
+        <a href="/apps/inquiry-hub/inquiries/${i.inquiry_id}">${he(i.subject || '(件名なし)')}</a>
+        <span class="sub">${he(STATUSES[i.internal_status]?.label || i.internal_status)}</span>
+      </div>`).join('') || '<div class="sub">なし</div>'}
+    </div>
+
+    <div style="margin-top:18px" class="case-hist">
+      <b style="font-size:14px">対応履歴</b>
+      ${events.map(e => `<div class="r"><span class="w">${he(fmtJst(e.created_at))}</span>
+        <span>${he(e.actor_id || 'システム')} — ${he(caseEventLabel(e))}</span></div>`).join('')
+        || '<div class="sub">履歴はまだありません</div>'}
+    </div>
+
+    <div style="margin-top:18px;padding-top:14px;border-top:1px solid #e2e8f0;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
+      <span class="sub">${blockers.total > 0
+        ? `未処理の工程が ${blockers.total}件 残っています`
+        : '必要な工程はすべて片付いています'}${excPerm.unmanaged
+        ? ' ／ ⚠️担当者と権限が未登録のため、いまは誰でも例外操作ができます (<a href="/apps/inquiry-hub/staff">担当者と権限</a>で登録してください)'
+        : excPerm.error ? ' ／ ⚠️権限を確認できませんでした (例外操作はできません)'
+        : excPerm.allowed ? '' : ' ／ 例外として完了する権限はありません'}</span>
+      <span style="flex:1"></span>
+      ${c.status === 'active'
+        ? '<button class="pri" id="closeCase">案件を完了</button>'
+        : '<button class="ghost" id="reopenCase">案件を開け直す</button>'}
+    </div>
+  </div>`;
+
+  const script = `
+  async function api(path, data) {
+    const r = await fetch('/apps/inquiry-hub/api/cases/${c.id}' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data || {}) });
+    const j = await r.json().catch(function() { return {}; });
+    if (!r.ok) { toast(j.error || '失敗しました'); return null; }
+    return j;
+  }
+  document.getElementById('toggleDone').addEventListener('click', function() {
+    var el = document.getElementById('doneSteps');
+    var open = el.style.display === 'none';
+    el.style.display = open ? '' : 'none';
+    this.textContent = '完了済みの工程 ${doneSteps.length}件 を' + (open ? '隠す' : '表示');
+  });
+  document.querySelectorAll('.stp').forEach(function(b) {
+    b.addEventListener('click', async function() {
+      var payload = { action: b.dataset.act };
+      // 必要と決まっている工程を外すときは理由を必ず書かせる (履歴に残る)
+      if (b.dataset.act === 'skip_required') {
+        var why = prompt('この工程は「必要」と決まっています。外す理由を書いてください (履歴に残ります)\\n'
+          + '例: 顧客が返送を希望しないため / 別案件で処理済みのため');
+        if (!why || !why.trim()) return;
+        payload.reason = why;
+      }
+      b.disabled = true;
+      var r = await api('/steps/' + b.dataset.id, payload);
+      if (r) location.reload(); else b.disabled = false;
+    });
+  });
+  document.getElementById('saveRefund').addEventListener('click', async function() {
+    var r = await api('/refund', { expected: document.getElementById('refExp').value,
+      completed: document.getElementById('refDone').value, ref: document.getElementById('refRef').value });
+    if (r) { toast('返金の記録を保存しました'); }
+  });
+  document.getElementById('saveWaiting').addEventListener('click', async function() {
+    var r = await api('/waiting', { waitingOn: document.getElementById('waitOn').value,
+      nextActionDate: document.getElementById('waitDate').value });
+    if (r) location.reload();
+  });
+  var closeBtn = document.getElementById('closeCase');
+  if (closeBtn) closeBtn.addEventListener('click', async function() {
+    var r = await api('/close', {});
+    if (!r) return;
+    if (r.ok) { location.reload(); return; }
+    var names = (r.blockers && r.blockers.steps || []).map(function(s) { return '・' + s.label; }).join('\\n');
+    var reason = prompt('この案件はまだ完了できません。未処理の工程が ' + r.blockers.total + '件 残っています。\\n'
+      + names + '\\n\\n例外として完了する場合は理由を選んでください:\\n'
+      + '1=顧客と連絡が取れない 2=顧客が対応継続を希望しない 3=メーカー回答を得られない\\n'
+      + '4=システム外で対応済み 5=誤って作成した案件 6=その他\\n(やめる場合は空欄でOK)');
+    if (!reason) return;
+    var codes = { '1': 'customer_unreachable', '2': 'customer_declined', '3': 'no_maker_response',
+      '4': 'handled_elsewhere', '5': 'created_by_mistake', '6': 'other' };
+    var code = codes[reason.trim()];
+    if (!code) { toast('番号で選んでください'); return; }
+    var note = prompt('未完了の工程を残したまま完了します。理由の詳細を書いてください (履歴に残ります)');
+    if (!note || !note.trim()) { toast('詳細メモが必要です'); return; }
+    var r2 = await api('/close', { force: true, reasonCode: code, note: note });
+    if (r2) location.reload();
+  });
+  var reopenBtn = document.getElementById('reopenCase');
+  if (reopenBtn) reopenBtn.addEventListener('click', async function() {
+    var r = await api('/reopen', {});
+    if (r) location.reload();
+  });`;
+  res.send(pageShell(`問い合わせ管理 — ${c.case_no}`, 'cases', body, script));
+});
+
+/** 履歴の1行を日本語にする */
+function caseEventLabel(e) {
+  const to = (() => { try { return JSON.parse(e.to_json || '{}'); } catch { return {}; } })();
+  switch (e.event_type) {
+    case 'case_created': return `案件を作成した (${CASE_TYPES[to.caseType]?.label || ''})`;
+    case 'step_changed': {
+      const act = { complete: '完了にした', skip: '対応不要にした', need: '必要にした',
+        start: '対応を開始した', wait: '回答・到着待ちにした', undo: '戻した' }[to.action] || to.action;
+      return `「${e.note || to.step_type}」を ${act}`;
+    }
+    case 'waiting_changed': return `待ち先を ${WAITING_ON[to.waiting_on]?.label || to.waiting_on} にした`;
+    case 'assignee_changed': return `担当を ${to.assignee} にした`;
+    case 'refund_recorded': return `返金を記録した (予定 ${to.expected ?? '—'} / 実績 ${to.completed ?? '—'})`;
+    case 'case_closed': return '案件を完了した';
+    case 'case_closed_exception': return `例外として完了した (${CLOSE_REASONS[to.reasonCode] || ''}${e.note ? ' — ' + e.note : ''})`;
+    case 'case_reopened': return '案件を開け直した';
+    case 'inquiry_linked': return '問い合わせを関連付けた';
+    case 'inquiry_unlinked': return '問い合わせの関連付けを外した';
+    default: return e.event_type;
+  }
+}
+
+// ── 案件の API ──────────────────────────────────────────
+
+router.post('/api/cases', (req, res) => {
+  try {
+    const b = req.body || {};
+    const r = createCase({ inquiryId: b.inquiryId ? Number(b.inquiryId) : null, caseType: b.caseType,
+      nextActionDate: b.nextActionDate, summary: b.summary, allowDuplicate: !!b.allowDuplicate,
+      actor: actorOf(req) });
+    console.log(`[inquiry-hub] 返品案件 ${r.case_no} を作成 (${b.caseType}) by ${actorOf(req)}`);
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    // ⭐二度押し・再送と「本当に別案件を作りたい」を区別する (409 を返して画面が確認する)
+    if (e?.code === 'DUPLICATE_CASE') {
+      return res.status(409).json({ error: String(e.message), duplicate: true, caseNo: e.caseNo });
+    }
+    res.status(400).json({ error: String(e?.message || e).slice(0, 200) });
+  }
+});
+
+router.post('/api/cases/:id(\\d+)/steps/:stepId(\\d+)', (req, res) => {
+  try {
+    const b = req.body || {};
+    updateStep(Number(req.params.id), Number(req.params.stepId), b.action,
+      { note: b.note, externalRef: b.externalRef, reason: b.reason, actor: actorOf(req) });
+    res.json({ ok: true });
+  } catch (e) {
+    const msg = String(e?.message || e).slice(0, 200);
+    res.status(msg.includes('権限がありません') ? 403 : 400).json({ error: msg });
+  }
+});
+
+router.post('/api/cases/:id(\\d+)/waiting', (req, res) => {
+  try {
+    const b = req.body || {};
+    res.json({ ok: true, case: setWaiting(Number(req.params.id), { waitingOn: b.waitingOn,
+      nextActionDate: b.nextActionDate, nextActionNote: b.nextActionNote, actor: actorOf(req) }) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/cases/:id(\\d+)/assignee', (req, res) => {
+  try {
+    res.json({ ok: true, case: setAssignee(Number(req.params.id), (req.body || {}).assignee, actorOf(req)) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/cases/:id(\\d+)/refund', (req, res) => {
+  try {
+    const b = req.body || {};
+    res.json({ ok: true, case: setRefund(Number(req.params.id),
+      { expected: b.expected, completed: b.completed, ref: b.ref, actor: actorOf(req) }) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+/** 案件を完了する。⭐必要な工程が残っていれば ok:false + 残りを返す (止める) */
+router.post('/api/cases/:id(\\d+)/close', (req, res) => {
+  try {
+    const b = req.body || {};
+    const caseId = Number(req.params.id);
+    const r = closeCase(caseId, { force: !!b.force, reasonCode: b.reasonCode, note: b.note, actor: actorOf(req) });
+    if (!r.ok) {
+      const c = getCase(caseId);
+      return res.json({ ok: false, blockers: {
+        total: r.blockers.total,
+        steps: r.blockers.steps.map(s => ({ label: stepLabel(c.case_type, s.step_type),
+          state: s.necessity_status === 'undecided' ? '要否を判断' : PROGRESS[s.progress_status]?.label })),
+        requests: r.blockers.requests.map(x => ({ label: x.subject || x.request_type, status: x.status })),
+      } });
+    }
+    if (!r.already) console.log(`[inquiry-hub] 返品案件 ${r.case.case_no} を完了${b.force ? ' (例外)' : ''} by ${actorOf(req)}`);
+    res.json({ ok: true, case: r.case });
+  } catch (e) {
+    const msg = String(e?.message || e).slice(0, 200);
+    res.status(msg.includes('権限がありません') ? 403 : 400).json({ error: msg });
+  }
+});
+
+router.post('/api/cases/:id(\\d+)/reopen', (req, res) => {
+  try {
+    res.json({ ok: true, case: reopenCase(Number(req.params.id), actorOf(req)) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/cases/:id(\\d+)/link', (req, res) => {
+  try {
+    linkInquiry(Number(req.params.id), Number((req.body || {}).inquiryId), actorOf(req));
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+/** 案件化の判断をやり直す (「やっぱり案件にする」) */
+router.post('/api/inquiries/:id(\\d+)/triage-reset', (req, res) => {
+  try {
+    clearTriage(Number(req.params.id));
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+/** 「今回は案件にしない」= 人の判断だけを保存する (同じ確認を繰り返さないため) */
+router.post('/api/inquiries/:id(\\d+)/no-case', (req, res) => {
+  try {
+    setTriage(Number(req.params.id), 'no_case_needed', actorOf(req));
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // 👥 担当者と権限マップ (2026-08-28 中原さん要望「権限マップをアプリに入れて自分で登録したい」)
 //    ⭐AIに人を選ばせない設計の土台。AIが出すのは「必要な権限」までで、
 //      誰に渡すかはこの表を見る決定的なルールが決める (staff.js の冒頭に理由)
@@ -4802,6 +5420,9 @@ function pageShell(title, active, body, script, opts = {}) {
   // ⏰締め前確認の未対応件数。重い集計なので失敗しても画面は出す (fail-soft)
   let cutoffCount = 0;
   try { cutoffCount = countCutoffItems().inquiries; } catch { /* 初期化前などは0 */ }
+  // 📦返品・交換案件の未完了件数 (fail-soft)
+  let openCaseCount = 0;
+  try { openCaseCount = countOpenCases(); } catch { /* 初期化前などは0 */ }
   const folderItems = folderNav.map(f =>
     navItem(`/apps/inquiry-hub?view=all&folder=${f.id}${groupQs}`, '📁', he(f.name), `folder:${f.id}`, f.open_count)).join('');
 
@@ -4818,6 +5439,7 @@ function pageShell(title, active, body, script, opts = {}) {
     <div class="nav-sep"></div>
     <div class="nav-group">
       ${navItem('/apps/inquiry-hub/cutoff', '⏰', '締め前確認', 'cutoff', cutoffCount)}
+      ${navItem('/apps/inquiry-hub/cases', '📦', '返品・交換案件', 'cases', openCaseCount)}
     </div>
     <div class="nav-sep"></div>
     <div class="nav-group">

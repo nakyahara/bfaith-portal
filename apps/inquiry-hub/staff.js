@@ -101,6 +101,32 @@ export function getStaff(id) {
   return getDB().prepare('SELECT * FROM staff_members WHERE id = ?').get(id) || null;
 }
 
+/** 照合用の正規化。⭐「中原大輔」と「中原 大輔」を別人にしない (2026-09-01 スタッフ同期の事故) */
+const matchKey = v => String(v ?? '').normalize('NFKC').replace(/\s+/g, '').toLowerCase();
+
+/**
+ * この人がこの権限を持っているか。
+ *
+ * 戻り値: true / false / **null = 担当者が一度も登録されていない (未導入)**
+ *
+ * ⭐null を返す理由: 導入直後は担当者が1人もいない。そこで false を返すと誰も操作できず
+ *   業務が止まる。「未導入なら通す + 画面に注意を出す」を呼び元が選べるようにする。
+ * ⚠️**「全員を無効化した」は未導入ではない**。無効の行が残っていれば導入済みとみなし、
+ *   誰も通さない (設定事故で全員に例外権限が開くのを防ぐ。Codex R2 指摘)
+ * ⚠️照合は user_key (一意) を優先する。表示名は**一致が1人のときだけ**認める —
+ *   同姓の担当者がいると、権限を持つ別人に化けてしまうため
+ */
+export function hasPermission(actor, code) {
+  if (!listStaff({ includeInactive: true }).length) return null;   // 一度も登録がない = 未導入
+  const key = matchKey(actor);
+  if (!key) return false;
+  const active = listStaff({ withPermissions: true });              // 有効な担当者だけ
+  const byKey = active.filter(s => matchKey(s.user_key) === key);
+  if (byKey.length) return byKey.length === 1 && byKey[0].permissions.includes(code);
+  const byName = active.filter(s => matchKey(s.display_name) === key);
+  return byName.length === 1 && byName[0].permissions.includes(code);
+}
+
 /** 作成。有効な担当者の user_key は重複させない */
 export function createStaff({ userKey, displayName, refundLimitYen, note } = {}, createdBy = null) {
   const db = getDB();
