@@ -107,17 +107,27 @@ export function setCostOf(db, setCode, costOverrides = new Map()) {
  */
 function resolveRakuten(db, code) {
   const rows = db.prepare(`
-    SELECT rakuten_code AS listingCode, source
+    SELECT rakuten_code AS listingCode, source, manage_number AS manageNumber
       FROM mirror_rakuten_sku_map WHERE LOWER(TRIM(ne_code)) = ? ORDER BY source, rakuten_code
   `).all(normCode(code));
   if (rows.length === 0) return [];
   const aliases = rows.map((r) => r.listingCode);
-  // 表示は W (商品番号 = manageNumber) を優先。無ければ最初の別名 (ライブ取得後に実際の管理番号へ差し替わる)
+  // ★商品管理番号は対応表の manage_number 列から取る (2026-09-01)。
+  //   W (商品番号) の行は 1 商品に 1 行しか作れないので、カラバリ 12 色のうち 11 色は W 行を持たない。
+  //   W 行だけを頼ると、その 11 色は商品ページにたどり着けず価格が取れなかった (楽天出品の 3 割)。
+  //   AM/AL の行にも manage_number が入っているので、どの行からでも商品ページへ届く。
+  const manageNumbers = [...new Set(rows.map((r) => String(r.manageNumber || '').trim()).filter(Boolean))];
+  // 同じ NE コードが複数の楽天商品に紐づいている時は、どちらの商品か決めない (取り違え防止)。
+  //   live-price 側で「特定できない」として未確定にする
+  const manageNumber = manageNumbers.length === 1 ? manageNumbers[0] : null;
   const w = rows.find((r) => r.source === 'w');
   return [{
     mall: 'rakuten',
-    listingCode: w ? w.listingCode : aliases[0],
+    // 表示は 商品管理番号 → W (商品番号) → 最初の別名 の順 (ライブ取得後に実際の管理番号へ差し替わる)
+    listingCode: manageNumber || (w ? w.listingCode : aliases[0]),
     aliases,
+    manageNumber,
+    manageNumbers,
     skuCode: null,
     confidence: 'rule',
     source: `mirror_rakuten_sku_map(${rows.map((r) => r.source).join('/')})`,

@@ -76,36 +76,57 @@ export function shippingOfRakutenVariant(v) {
 }
 
 /**
- * 楽天のライブ価格。listingCode は AM/AL/W いずれか (mirror_rakuten_sku_map 由来)。
+ * 楽天のライブ価格。
  *
- * @param {string[]} listingCodes
+ * @param {Array<{key:string, aliases?:string[], manageNumber?:string|null, manageNumbers?:string[], rowKey?:string}>} targets
+ *   key      = 表示中の出品コード (別名の1つとしても使う)
+ *   aliases  = AM/AL/W の別名 (mirror_rakuten_sku_map 由来)。variant の特定に使う
+ *   manageNumber  = 対応表が持っている商品管理番号 (あればこれを最優先で使う)
+ *   manageNumbers = 対応表に複数の商品管理番号があった時の一覧 (2つ以上なら取り違え防止で確定しない)
+ *   rowKey   = 結果を引くためのキー。★色違いは同じ商品管理番号を共有するので、
+ *              出品コードだけをキーにすると同じプレビュー内の別の行と衝突する。省略時は key の正規化
  * @returns {Promise<Map<string, {price:number|null, manageNumber:string|null, skuCode:string|null,
  *                                found:boolean, reason:string|null, itemTitle:string|null}>>}
- *   キーは listingCode の正規化キー
  */
 export async function fetchRakutenPrices(targets, deps = {}) {
   const out = new Map();
-  // targets = [{ key, aliases: [AM/AL/W の別名] }]。key は行を引くためのキー (= 表示中の出品コード)
   const list = (targets || [])
     .map((t) => ({
       key: normCode(t.key),
+      rowKey: t.rowKey ? String(t.rowKey) : normCode(t.key),
       aliases: [...new Set([t.key, ...(t.aliases || [])].map((a) => String(a || '').trim()).filter(Boolean))],
+      manageNumber: String(t.manageNumber || '').trim() || null,
+      manageNumbers: [...new Set((t.manageNumbers || []).map((m) => String(m || '').trim()).filter(Boolean))],
     }))
     .filter((t) => t.key);
   if (list.length === 0) return out;
 
-  const codeMap = await itemNumberToManageNumber(deps);
-  // 別名のどれかが itemNumber として対応表にあれば、それが manageNumber。
-  // 無ければ「別名自体が管理番号」の可能性を順に試す (単品はコード = 管理番号のことが多い)
+  // ★商品管理番号の決め方 (優先順):
+  //   1. 対応表の manage_number (RMS の全SKU一覧から取った値。AM/AL の行にも入っている — 2026-09-01)
+  //   2. 別名のどれかが itemNumber として all-codes にあれば、その manageNumber
+  //   3. 別名そのもの (単品はコード = 管理番号のことが多い)
+  //   1 で全部決まるなら all-codes は取りに行かない
+  const needCodeMap = list.some((t) => !t.manageNumber && t.manageNumbers.length <= 1);
+  const codeMap = needCodeMap ? await itemNumberToManageNumber(deps) : new Map();
   const wanted = new Map();   // manageNumber → [target...]
   for (const t of list) {
-    let mn = null;
-    for (const a of t.aliases) { const hit = codeMap.get(normCode(a)); if (hit) { mn = hit; break; } }
+    if (t.manageNumbers.length > 1) {
+      // 同じ NE コードが複数の楽天商品に紐づいている。どちらか決めずに未確定 (取り違え防止)
+      out.set(t.rowKey, {
+        price: null, manageNumber: null, skuCode: null, found: false,
+        reason: `このNEコードは複数の楽天商品に紐づいています (${t.manageNumbers.join(', ')})。どちらか特定できないため確定しません`,
+        itemTitle: null,
+      });
+      continue;
+    }
+    let mn = t.manageNumber;
+    if (!mn) for (const a of t.aliases) { const hit = codeMap.get(normCode(a)); if (hit) { mn = hit; break; } }
     if (!mn) mn = t.aliases[0];
     t.manageNumber = mn;
     if (!wanted.has(mn)) wanted.set(mn, []);
     wanted.get(mn).push(t);
   }
+  if (wanted.size === 0) return out;
 
   const fetchBulk = deps.fetchItemDetailsBulkDetailed || fetchItemDetailsBulkDetailed;
   const { items, failed } = await fetchBulk([...wanted.keys()]);
@@ -113,9 +134,10 @@ export async function fetchRakutenPrices(targets, deps = {}) {
   const itemByMn = new Map((items || []).map((it) => [normCode(it?.manageNumber), it]));
 
   for (const t of list) {
+    if (out.has(t.rowKey)) continue;   // 上で確定しないと決めた行
     const item = itemByMn.get(normCode(t.manageNumber));
     if (!item) {
-      out.set(t.key, {
+      out.set(t.rowKey, {
         price: null, manageNumber: t.manageNumber, skuCode: null, found: false,
         reason: failedByCode.get(normCode(t.manageNumber)) || '楽天に見つかりません',
         itemTitle: null,
@@ -135,7 +157,7 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       matchedKey = Object.keys(variants)[0];
     }
     if (!matchedKey) {
-      out.set(t.key, {
+      out.set(t.rowKey, {
         price: null, manageNumber: item.manageNumber || t.manageNumber, skuCode: null, found: false,
         reason: matched.length > 1
           ? `別名が複数のSKUに一致しました (${matched.join(', ')})。取り違えを避けるため確定しません`
@@ -147,7 +169,7 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       continue;
     }
     const price = toIntPrice(variants[matchedKey]?.standardPrice);
-    out.set(t.key, {
+    out.set(t.rowKey, {
       price,
       manageNumber: item.manageNumber || t.manageNumber,
       skuCode: matchedKey,

@@ -135,12 +135,21 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   // モールごとに問い合わせ対象をまとめる (1商品1回。行ごとに叩かない)
   // 楽天は AM/AL/W の別名をまとめて渡す (同じ SKU の別名なので、どれか1つで manageNumber と
   // variant を特定できる — 別名ごとに問い合わせると全部「見つかりません」になる)
+  // ★楽天の結果は「NEコード × モール」で引く。色違いは同じ商品管理番号を共有するので、
+  //   出品コード (= 管理番号) をキーにすると、同じプレビューに BK と BE を並べた時に片方の価格を
+  //   もう片方が上書きする
+  const rakutenRowKey = (t, l) => `${normCode(t.neCode)}|${t.rowKind}|${normCode(l.listingCode)}`;
   const rakutenTargets = [];
   const yahooTargets = [];
   const amazonSkus = [];
   for (const t of targets) {
     for (const l of t.listings) {
-      if (l.mall === 'rakuten') rakutenTargets.push({ key: l.listingCode, aliases: l.aliases || [l.listingCode] });
+      if (l.mall === 'rakuten') {
+        rakutenTargets.push({
+          key: l.listingCode, rowKey: rakutenRowKey(t, l), aliases: l.aliases || [l.listingCode],
+          manageNumber: l.manageNumber || null, manageNumbers: l.manageNumbers || [],
+        });
+      }
       else if (l.mall === 'yahoo') yahooTargets.push({ key: l.listingCode, candidates: l.candidates || [l.listingCode] });
       else if (l.mall === 'amazon') amazonSkus.push(l.listingCode);
     }
@@ -184,7 +193,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         // 引き当てできなかったモール。「出品が無い」とは書かない (否定を証明できていないため)
         note = 'このモールの出品コードが見つかりませんでした';
       } else if (l.mall === 'rakuten') {
-        const p = rakutenPrices.get(key);
+        const p = rakutenPrices.get(rakutenRowKey(t, l));
         if (p?.found) {
           price = p.price; priceSource = '楽天RMS (ライブ)'; priceIsLive = true;
           confidence = 'confirmed'; skuCode = p.skuCode;

@@ -387,6 +387,9 @@ function createTables() {
     updated_at        TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_mirr_rskm_ne ON mirror_rakuten_sku_map(ne_code)');
+  // 商品管理番号 (manageNumber)。AM/AL の行にも持たせ、W 行を持てない色違い SKU からも商品ページへ届くようにする
+  // (価格一括改定 2026-09-01: W 行だけを頼ると楽天出品の 3 割が価格を取れなかった)
+  addColumnIfMissing('mirror_rakuten_sku_map', 'manage_number', 'TEXT');
 
   // mirror_sync_status — 同期状態
   db.exec(`CREATE TABLE IF NOT EXISTS mirror_sync_status (
