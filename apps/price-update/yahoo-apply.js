@@ -186,6 +186,19 @@ export function makeYahooClient(deps = {}) {
           },
         };
       }
+      // ★VPS が「今の価格が想定と違う」と言ってきた時は、楽天と同じ conflict として返す (Codex R4)。
+      //   ひとまとめに失敗へ潰すと、誰かの変更とぶつかったのか別の理由なのかが記録から分からなくなる
+      if (res.status === 409 && res.json?.error === 'CONFLICT') {
+        const c = res.json.conflict || {};
+        return {
+          status: 409,
+          body: {
+            ok: false, state: 'conflict', error: 'CONFLICT',
+            message: c.reason || '現在価格が想定と違います',
+            detail: { conflicts: [{ sku: plan.sku, expected: c.expected ?? plan.currentPrice, live: c.live ?? null, reason: c.reason || '現在価格が想定と違います' }] },
+          },
+        };
+      }
       // 更新そのものが通らなかった。中身が読めるなら「意味の分かる失敗」、読めなければ想定外へ倒す
       const message = String(res.json?.updateBody || res.body || '').slice(0, 300).replace(/\s+/g, ' ');
       if (res.status >= 400 && res.status < 500) {

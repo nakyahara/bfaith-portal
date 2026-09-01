@@ -76,6 +76,10 @@ function assertExpectedForAll(items, expected) {
   if (!expected || typeof expected !== 'object' || Array.isArray(expected)) {
     throw new Error('update-items: expected (今いくらのはず) が必要です。照合せずに送ることはできません');
   }
+  // ★空の items も止める (この関数だけを見ても穴が無いように)
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new Error('update-items: items が空です');
+  }
   for (const [i, it] of (items || []).entries()) {
     const code = String(it?.item_code ?? '').trim();
     const want = expected[code];

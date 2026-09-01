@@ -167,6 +167,33 @@ console.log('\n── ★VPS へ「今いくらのはず」を渡す (送る直�
     '★「今 1000 円のはず」を渡す (VPS が送る直前に読み直して照合できるように)');
 }
 
+console.log('\n── ★VPS が「今の価格が違う」と言ってきたら conflict として扱う (Codex R4) ──');
+{
+  const client = makeYahooClient({
+    getDetail: async () => detail(),
+    postUpdate: async () => ({
+      status: 409,
+      json: { ok: false, error: 'CONFLICT', conflict: { item_code: 'zz-1', reason: '現在価格が想定と違います', expected: 1000, live: 1200 } },
+    }),
+  });
+  const r = await client.patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
+  eq([r.status, r.body.state, r.body.error], [409, 'conflict', 'CONFLICT'],
+    '★楽天と同じ conflict の形にそろえる (ひとまとめに失敗へ潰さない)');
+  eq(r.body.detail.conflicts[0].live, 1200, '実際の価格も残す');
+
+  // セール価格が送信直前に足された場合も、VPS が 409 で止めてくれる
+  const sale = makeYahooClient({
+    getDetail: async () => detail(),
+    postUpdate: async () => ({
+      status: 409,
+      json: { ok: false, error: 'CONFLICT', conflict: { item_code: 'zz-1', reason: 'セール価格 (900 円) が入っています', salePrice: 900 } },
+    }),
+  });
+  const sr = await sale.patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
+  eq(sr.body.state, 'conflict', '★送信直前にセール価格が足された時も止まる');
+  ok(/セール価格/.test(sr.body.message), '理由が分かる: ' + sr.body.message);
+}
+
 console.log('\n── クライアント: 送信が通らなかった時 ──');
 {
   const reject = makeYahooClient({
