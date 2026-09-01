@@ -8,7 +8,7 @@
  */
 import {
   flattenXml, diff, isPricePath, isItemPricePath, collateralOf, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
-  itemBaseOf, isDirectChild,
+  itemBaseOf, isDirectChild, isVolatilePath, withoutVolatile, diffCount,
 } from './yahoo-edit-item-probe.js';
 
 let failed = 0;
@@ -177,6 +177,24 @@ console.log('\n── 「価格以外の変化」の数え方 ──');
   const skuMoved = await flattenXml(item('<Name>名前</Name><Price>101</Price><SubCodes><SubCode code="a"><Price>60</Price></SubCode></SubCodes>'));
   eq(collateralOf(diff(withSku, skuMoved), itemBaseOf(withSku, 'zz-1')).map((x) => x.path),
     [B + '/SubCodes[0]/SubCode[0]/Price[0]'], '★SKU の価格が動いたら数える (商品本体の価格だけを除外する)');
+}
+
+console.log('\n── 書き込めば必ず変わる項目は差分から外す ──');
+{
+  ok(isVolatilePath('ResultSet[0]/Result[0]/UpdateTime[0]'), '更新日時');
+  ok(isVolatilePath('ResultSet[0]/Result[0]/EditingFlag[0]'), '編集中フラグ');
+  ok(!isVolatilePath('ResultSet[0]/Result[0]/Price[0]'), '価格は外さない');
+  ok(!isVolatilePath('ResultSet[0]/Result[0]/Caption[0]'), '説明文は外さない');
+
+  const w = (inner) => '<ResultSet><Result><ItemCode>zz-1</ItemCode>' + inner + '</Result></ResultSet>';
+  const b1 = await flattenXml(w('<Price>100</Price><Caption>説明</Caption><UpdateTime>2026-09-01T14:10:38+09:00</UpdateTime><EditingFlag>0</EditingFlag>'));
+  const a1 = await flattenXml(w('<Price>100</Price><Caption>説明</Caption><UpdateTime>2026-09-01T14:52:57+09:00</UpdateTime><EditingFlag>1</EditingFlag>'));
+  eq(diffCount(diff(b1, a1)), 0, '★書き込みで必ず変わる項目だけなら「差分なし」と数える');
+  eq(withoutVolatile(diff(b1, a1)).changed.length, 0, '取り除かれている');
+  const a2 = await flattenXml(w('<Price>101</Price><UpdateTime>2026-09-01T14:52:57+09:00</UpdateTime><EditingFlag>1</EditingFlag>'));
+  eq(diffCount(diff(b1, a2)), 2, '本当の変化 (価格が変わり説明が消えた) は数える');
+  eq(collateralOf(diff(b1, a2), itemBaseOf(b1, 'zz-1')).map((x) => x.path),
+    ['ResultSet[0]/Result[0]/Caption[0]'], '★巻き添えは説明文だけ (価格と揮発項目は外す)');
 }
 
 console.log('\n── 本番商品では動かさない ──');

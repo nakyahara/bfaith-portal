@@ -59,6 +59,17 @@ const YAHOO_REDIRECT_URI = process.env.YAHOO_REDIRECT_URI || 'https://b-faith.bi
 // (.env に YAHOO_TOKEN_FILE=/home/rocky/yahoo-tokens.json を設定推奨)
 const TOKEN_FILE = process.env.YAHOO_TOKEN_FILE || path.join(__dirname, 'yahoo-tokens.json');
 
+/** 続けて Yahoo を叩く時に空ける間隔 (公式の利用制限 1クエリー/秒) */
+const YAHOO_API_GAP_MS = 1200;
+/**
+ * updateItems で送ってよい項目。★この経路は **価格専用**。
+ * 商品名や説明を通せるようにすると、価格改定のつもりで商品ページを書き換えられる経路になる。
+ * ★self-test より前に置く (const は巻き上がらないので、後ろに書くと self-test から見えない)。
+ */
+const PRICE_ONLY_KEYS = new Set(['item_code', 'price', 'sale_price', 'subcode_price']);
+/** Yahoo に送ってよい価格の上限 (楽天側のガードと同じ) */
+const MAX_YAHOO_PRICE = 999999999;
+
 // --self-test は起動前に処理する。secret も外部通信も要らない純粋なパーサ検証なので、
 // PROXY_SECRET の必須チェックより前に置く (手元でも VPS 上でも同じコードを確かめられるように)
 if (process.argv.includes('--self-test')) { runSelfTest(); }
@@ -1254,6 +1265,100 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // POST /yahoo/update-items — 商品一括更新API (価格だけ変えられる)
+    //   request body: { items: [{ item_code, price, sale_price, ... }], itemNum?: boolean }
+    //   ★editItem と違い「指定された項目だけを更新し、省略された項目は更新しません」(公式)。
+    //     価格改定で商品名・説明・画像を巻き添えにしないために、こちらを使う。
+    //   ★フロント反映はしない。反映は /yahoo/submit-item を別に呼ぶ。
+    if (pathname === '/yahoo/update-items' && req.method === 'POST') {
+      if (!YAHOO_SELLER_ID) throw new Error('update-items: YAHOO_SELLER_ID が未設定のため送信しません');
+      const raw = await readBody(req);
+      let body;
+      try { body = JSON.parse(raw); } catch (_) { throw new Error('update-items: invalid JSON body'); }
+      assertPriceOnlyItems(body.items, { clearSalePrice: body.clearSalePrice === true });
+      const built = buildUpdateItemsBody(body.items, YAHOO_SELLER_ID, { includeItemNum: body.itemNum === true });
+      console.log(`[${ts()}] Yahoo updateItems: ${built.count}件 (${built.codes.join(',')}) body=${built.body.length}b`);
+      const r = await callYahooAPIRaw('updateItems', {
+        method: 'POST',
+        contentType: 'application/x-www-form-urlencoded',
+        body: built.body,
+      });
+      // ★更新しただけでは客に見えない。「変えたつもり」を作らないよう、
+      //   この経路の中で反映まで済ませる (明示的に submit:false と言われた時だけ飛ばす)
+      const wantSubmit = body.submit !== false;
+      const updateOk = yahooXmlOk(r);
+      const submits = [];
+      if (wantSubmit && updateOk) {
+        for (const code of built.codes) {
+          await new Promise((r2) => setTimeout(r2, YAHOO_API_GAP_MS));   // 1クエリー/秒
+          const sr = await callYahooAPIRaw('submitItem', {
+            method: 'POST',
+            contentType: 'application/x-www-form-urlencoded',
+            body: new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: code }).toString(),
+          });
+          const sok = yahooXmlOk(sr);
+          console.log(`[${ts()}] Yahoo submitItem: item_code=${code} status=${sr.status} ok=${sok}`);
+          submits.push({ item_code: code, status: sr.status, ok: sok, body: String(sr.body).slice(0, 500) });
+        }
+      }
+      res.writeHead(r.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: updateOk && (!wantSubmit || submits.every((s) => s.ok)),
+        updateStatus: r.status,
+        updateBody: String(r.body).slice(0, 2000),
+        submitted: wantSubmit,
+        submits,
+      }));
+      return;
+    }
+
+    // POST /yahoo/submit-item — 商品個別反映API (updateItems の後にこれを呼ばないと客に見えない)
+    //   request body: { itemCode: string }
+    //   ★1件ずつしか指定できない。OK が返っても処理途中でエラーになることがある (公式) ので、
+    //     /yahoo/publish-history で未反映項目を確かめる
+    if (pathname === '/yahoo/submit-item' && req.method === 'POST') {
+      if (!YAHOO_SELLER_ID) throw new Error('submit-item: YAHOO_SELLER_ID が未設定のため送信しません');
+      const raw = await readBody(req);
+      let body;
+      try { body = JSON.parse(raw); } catch (_) { throw new Error('submit-item: invalid JSON body'); }
+      const code = String(body.itemCode || '').trim();
+      if (!code) throw new Error('submit-item: itemCode is required');
+      const params = new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: code });
+      console.log(`[${ts()}] Yahoo submitItem: item_code=${code}`);
+      const r = await callYahooAPIRaw('submitItem', {
+        method: 'POST',
+        contentType: 'application/x-www-form-urlencoded',
+        body: params.toString(),
+      });
+      res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+      res.end(r.body);
+      return;
+    }
+
+    // GET /yahoo/publish-history — 反映履歴 / 未反映項目詳細API
+    //   query: publish_id (既定 0 = 未反映項目), start, results
+    //   ★publish_id=0 で「まだ反映されていない項目」が取れる。反映できたかの確認に使う
+    if (pathname === '/yahoo/publish-history' && req.method === 'GET') {
+      if (!YAHOO_SELLER_ID) throw new Error('publish-history: YAHOO_SELLER_ID が未設定のため取得しません');
+      const q = new URLSearchParams({
+        seller_id: YAHOO_SELLER_ID,
+        publish_id: String(url.searchParams.get('publish_id') ?? '0'),
+      });
+      for (const key of ['start', 'results']) {
+        const v = url.searchParams.get(key);
+        if (v) q.append(key, v);
+      }
+      console.log(`[${ts()}] Yahoo publishHistoryDetail: ${q.toString()}`);
+      const r = await callYahooAPIRaw('publishHistoryDetail', {
+        method: 'GET',
+        body: null,
+        queryString: q.toString(),
+      });
+      res.writeHead(r.status, { 'Content-Type': 'application/xml' });
+      res.end(r.body);
+      return;
+    }
+
     // POST /yahoo/my-item-list
     //   request body: { query: string, offset?: number, results?: number }
     //   Yahoo myItemList API (GET + query string、 start は 1-based) へ token + 署名付きで forward。
@@ -1590,6 +1695,181 @@ const server = http.createServer(async (req, res) => {
 });
 
 /**
+ * 応答が「ルートが ResultSet の、タグの閉じた XML」か。
+ * ★VPS プロキシは依存ゼロで運用しているので XML パーサは入れない。
+ *   完全な XML 検証はしないが、**タグの入れ子が閉じているか** は見る。
+ *   これを見ないと <ResultSet><Result></ResultSet> のような壊れた応答が通る (Codex R13)。
+ */
+function isWellFormedResultSet(xml) {
+  // 宣言・コメント・CDATA は中身を見ない (中に < > が入るため)
+  const text = String(xml || '')
+    .replace(/<\?[\s\S]*?\?>/g, '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '');
+  const stack = [];
+  const re = /<(\/?)([A-Za-z][\w.:-]*)(?:\s[^>]*?)?(\/?)>/g;
+  let m;
+  let cursor = 0;
+  let rootClosed = false;
+  let sawRoot = false;
+  while ((m = re.exec(text)) !== null) {
+    // ★タグとタグの間に「<」があるのに読めていない = 切れたタグ。無視せず落とす (Codex R14)
+    if (text.slice(cursor, m.index).includes('<')) return false;
+    cursor = m.index + m[0].length;
+    const [, closing, name, selfClose] = m;
+    // ★ルートを閉じた後に要素が続くのは複数ルート。1つの応答として読めない
+    if (rootClosed) return false;
+    if (selfClose) {
+      if (stack.length === 0) return false;        // ルートの外に要素がある
+      continue;
+    }
+    if (closing) {
+      if (stack.pop() !== name) return false;      // 閉じ方が合わない
+      if (stack.length === 0) rootClosed = true;
+    } else {
+      if (stack.length === 0) {
+        if (sawRoot || name !== 'ResultSet') return false;   // ルートが違う / ルートが2つ
+        sawRoot = true;
+      }
+      stack.push(name);
+    }
+  }
+  // 最後のタグより後ろに「<」が残っていないか (切れたタグ)
+  if (text.slice(cursor).includes('<')) return false;
+  return sawRoot && rootClosed && stack.length === 0;
+}
+
+/**
+ * Yahoo の応答が成功か。
+ * ★HTTP 200 でも本文に Status NG や Error が入っていることがある。
+ *   NG だけを見ると「HTTP 200 + <Error>」を成功扱いしてしまう (Codex R5)。
+ */
+function yahooXmlOk(res) {
+  const text = String(res?.body || '');
+  if (!(res?.status >= 200 && res.status < 300)) return false;
+  // ★成功と言い切るには Status OK が要る (Codex R7)。
+  //   これが無いと、空本文・HTML のメンテ画面・壊れた XML まで成功扱いになる
+  if (!/<Status>\s*OK\s*<\/Status>/i.test(text)) return false;
+  // ★応答が途中で切れていないことも見る (Codex R11)。
+  //   VPS には XML パーサを入れていないので厳密な検証はしないが、
+  //   ルート要素が開いて閉じていることだけは確かめる (切断された応答を成功にしない)
+  //   ★ルート要素は ResultSet で、タグの入れ子が閉じていること (Codex R12/R13)。
+  //     限定しないと <html>...<Status>OK</Status>...</html> が通り、
+  //     入れ子を見ないと <ResultSet><Result></ResultSet> のような壊れた XML も通る
+  if (!isWellFormedResultSet(text)) return false;
+  if (/<Status>\s*NG\s*<\/Status>/i.test(text)) return false;
+  // ★中身のある <Error> だけを失敗とする。
+  //   Yahoo は空の自己終了タグを「無し」の意味で使う (実測した submitItem の成功応答に
+  //   <Warning/> が入っていた)。<Error/> まで失敗にすると、正常な応答を弾いてしまう。
+  for (const m of text.matchAll(/<Error(?:\s[^>]*)?>([\s\S]*?)<\/Error>/gi)) {
+    if (m[1].trim()) return false;
+  }
+  return true;
+}
+
+/**
+ * updateItems に渡された items が「価格だけ」か検査する。問題があれば投げる。
+ * ★sale_price に空文字を送ると **既存のセール価格が消える**。
+ *   うっかりで消さないよう、消す意図があるときだけ clearSalePrice:true を要求する。
+ */
+function assertPriceOnlyItems(items, { clearSalePrice = false } = {}) {
+  if (!Array.isArray(items) || items.length === 0) throw new Error('update-items: items が空です');
+  items.forEach((item, i) => {
+    if (!item || typeof item !== 'object') throw new Error(`update-items: ${i + 1}件目が商品の形をしていません`);
+    for (const key of Object.keys(item)) {
+      if (!PRICE_ONLY_KEYS.has(key)) {
+        throw new Error(`update-items: 「${key}」は送れません (この経路は価格専用: ${[...PRICE_ONLY_KEYS].join(', ')})`);
+      }
+    }
+    // ★公式: 「priceを更新する場合は必ずpriceとsale_priceの両方を更新する必要があります」(Codex R17)。
+    //   片方だけ送ると Yahoo 側でどう扱われるか分からないので、送る前に止める
+    if (('price' in item) !== ('sale_price' in item)) {
+      throw new Error(`update-items: ${i + 1}件目は price と sale_price の両方が必要です `
+        + '(公式: price を更新する場合は必ず両方を更新する)');
+    }
+    // ★null / undefined は組み立ての時に省かれてしまい、price だけが送られる (Codex R18)。
+    //   「消す」つもりなら空文字で書くこと
+    if ('sale_price' in item && (item.sale_price === null || item.sale_price === undefined)) {
+      throw new Error(`update-items: ${i + 1}件目の sale_price が null です。`
+        + '消すつもりなら空文字 "" を指定してください (null だと送られずに price だけが届きます)');
+    }
+    if ('sale_price' in item && String(item.sale_price) === '' && !clearSalePrice) {
+      throw new Error(`update-items: ${i + 1}件目の sale_price が空です。`
+        + '空文字は「セール価格を消す」意味になります。消してよいなら clearSalePrice:true を付けてください');
+    }
+    // ★値そのものも検査する (Codex R15)。キーだけ見ていると 0円・空・負数・文字列が通り、
+    //   このエンドポイントを直接叩かれた時に価格を壊せる
+    const code = String(item.item_code ?? '').trim();
+    if (!/^[A-Za-z0-9._-]{1,99}$/.test(code)) {
+      throw new Error(`update-items: ${i + 1}件目の item_code が商品コードの形をしていません (${code})`);
+    }
+    if ('price' in item && !isSaneYahooPrice(item.price)) {
+      throw new Error(`update-items: ${i + 1}件目の price が 1〜${MAX_YAHOO_PRICE} の整数ではありません (${item.price})`);
+    }
+    if ('sale_price' in item && String(item.sale_price ?? '') !== '' && !isSaneYahooPrice(item.sale_price)) {
+      throw new Error(`update-items: ${i + 1}件目の sale_price が 1〜${MAX_YAHOO_PRICE} の整数ではありません (${item.sale_price})`);
+    }
+    if ('subcode_price' in item) {
+      // 書式: サブコード:価格 をパイプ区切り (例 aaaa:1000|bbbb:1200)
+      const parts = String(item.subcode_price ?? '').split('|');
+      for (const part of parts) {
+        // ★「サブコード:価格」ちょうど2つ。x:100:ゴミ を通さない (Codex R16)
+        const seg = part.split(':');
+        if (seg.length !== 2 || !/^[A-Za-z0-9._-]{1,99}$/.test(seg[0].trim()) || !isSaneYahooPrice(seg[1])) {
+          throw new Error(`update-items: ${i + 1}件目の subcode_price の書式が正しくありません (${part})`);
+        }
+      }
+    }
+  });
+}
+
+/** Yahoo に送ってよい価格か (正の整数円)。★0円・空・負数・小数・文字列は通さない */
+function isSaneYahooPrice(v) {
+  const s = String(v ?? '').trim();
+  if (!/^\d+$/.test(s)) return false;
+  const n = Number(s);
+  return Number.isSafeInteger(n) && n >= 1 && n <= MAX_YAHOO_PRICE;
+}
+
+/**
+ * 商品一括更新API (updateItems) の form body を組み立てる。
+ *
+ * ★item1 の値は「1つの商品情報をまとめてエンコードしたもの」= **二重エンコード**。
+ *   公式の例: item1 の値は `item_code%3Dabc1%26name%3D%25E8%25BB%258A`
+ *   (中身は item_code=abc1&name=車 を1回エンコードしたもの。それを外側でもう1回エンコードする)
+ *   URLSearchParams を入れ子にすると自然にこの形になる。
+ *
+ * @param {Array<object>} items [{ item_code, price, sale_price, ... }] 最大100件
+ * @param {string} sellerId VPS が持っているストアアカウント (呼び出し側の値は使わない)
+ * @param {{includeItemNum?: boolean}} opts item_num を付けるか (公式のサンプルには無い)
+ * @returns {{body:string, count:number, codes:string[]}}
+ */
+function buildUpdateItemsBody(items, sellerId, opts = {}) {
+  if (!Array.isArray(items) || items.length === 0) throw new Error('updateItems: items が空です');
+  if (items.length > 100) throw new Error(`updateItems: 1回に送れるのは100件までです (${items.length}件)`);
+  const outer = new URLSearchParams();
+  outer.append('seller_id', String(sellerId));
+  if (opts.includeItemNum) outer.append('item_num', String(items.length));
+  const codes = [];
+  items.forEach((item, i) => {
+    const code = String(item?.item_code ?? '').trim();
+    if (!code) throw new Error(`updateItems: ${i + 1}件目に item_code がありません`);
+    codes.push(code);
+    const inner = new URLSearchParams();
+    inner.append('item_code', code);
+    for (const [k, v] of Object.entries(item)) {
+      if (k === 'item_code') continue;
+      // ★null / undefined は送らない。空文字は「空にする」という意味なので送る
+      //   (sale_price は「利用しない場合は空文字を指定」が公式の指示)
+      if (v === null || v === undefined) continue;
+      inner.append(k, String(v));
+    }
+    outer.append(`item${i + 1}`, inner.toString());   // ← 外側で自動的にもう1回エンコードされる
+  });
+  return { body: outer.toString(), count: items.length, codes };
+}
+
+/**
  * editItem の form body の seller_id を、VPS が持っている値に差し替える。
  * ★呼び出し側が付けた seller_id は捨てる (別の店に書き込む経路を作らない)。
  *   ただし呼び出し側が **別の店** を指定していたら mismatch として返す。
@@ -1719,6 +1999,134 @@ function runSelfTest() {
     withSellerId('item_code=zz-1', 'mystore').mismatch, null);
   check('editItem: item_code をログ用に取り出す',
     withSellerId('item_code=zz-yahoo-m0-0901&price=100', 'mystore').itemCode, 'zz-yahoo-m0-0901');
+
+  // 8) updateItems の body 組み立て。★公式ドキュメントの例をそのまま突き合わせる
+  //    例: seller_id=teststore&item1=item_code%3Dabc1%26name%3D%25E8%25BB%258A&item2=item_code%3Dabc2%26name%3D%25E6%2599%2582%25E8%25A8%2588
+  check('updateItems: 公式の例と同じ形になる',
+    buildUpdateItemsBody([{ item_code: 'abc1', name: '車' }, { item_code: 'abc2', name: '時計' }], 'teststore').body,
+    'seller_id=teststore&item1=item_code%3Dabc1%26name%3D%25E8%25BB%258A&item2=item_code%3Dabc2%26name%3D%25E6%2599%2582%25E8%25A8%2588');
+  check('updateItems: 件数とコードを返す',
+    (() => { const b = buildUpdateItemsBody([{ item_code: 'a' }, { item_code: 'b' }], 's'); return [b.count, b.codes]; })(),
+    [2, ['a', 'b']]);
+  // ★sale_price は「利用しない場合は空文字を指定」= 空文字は送る / null は送らない
+  check('updateItems: 空文字は送る (セール価格を使わない指定)',
+    buildUpdateItemsBody([{ item_code: 'a', price: 1000, sale_price: '' }], 's').body,
+    'seller_id=s&item1=item_code%3Da%26price%3D1000%26sale_price%3D');
+  check('updateItems: null は送らない',
+    buildUpdateItemsBody([{ item_code: 'a', price: 1000, member_price: null }], 's').body,
+    'seller_id=s&item1=item_code%3Da%26price%3D1000');
+  check('updateItems: item_code は必ず先頭',
+    buildUpdateItemsBody([{ price: 1000, item_code: 'a' }], 's').body,
+    'seller_id=s&item1=item_code%3Da%26price%3D1000');
+  check('updateItems: item_num を付けられる',
+    buildUpdateItemsBody([{ item_code: 'a' }], 's', { includeItemNum: true }).body,
+    'seller_id=s&item_num=1&item1=item_code%3Da');
+  check('updateItems: 空なら投げる',
+    (() => { try { buildUpdateItemsBody([], 's'); return 'なぜか通った'; } catch (e) { return e.message; } })(),
+    'updateItems: items が空です');
+  check('updateItems: 101件は投げる',
+    (() => {
+      try { buildUpdateItemsBody(Array.from({ length: 101 }, (_, i) => ({ item_code: 'c' + i })), 's'); return 'なぜか通った'; }
+      catch (e) { return e.message; }
+    })(),
+    'updateItems: 1回に送れるのは100件までです (101件)');
+  check('updateItems: item_code が無い行は投げる',
+    (() => { try { buildUpdateItemsBody([{ item_code: 'a' }, { price: 1 }], 's'); return 'なぜか通った'; } catch (e) { return e.message; } })(),
+    'updateItems: 2件目に item_code がありません');
+  // SKU別価格の書式 (サブコード:価格 をパイプ区切り) がそのまま通ること
+  // 9) この経路は価格専用。商品名や説明を通さない / セール価格を黙って消さない
+  const tryAssert = (items, opts) => {
+    try { assertPriceOnlyItems(items, opts); return 'ok'; } catch (e) { return e.message; }
+  };
+  check('update-items: 価格だけなら通る',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: '900' }]), 'ok');
+  check('update-items: ★商品名は送れない',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: '900', name: '別の名前' }]),
+    'update-items: 「name」は送れません (この経路は価格専用: item_code, price, sale_price, subcode_price)');
+  check('update-items: ★説明も送れない',
+    tryAssert([{ item_code: 'a', caption: 'x' }]).startsWith('update-items: 「caption」は送れません'), true);
+  check('update-items: SKU別価格は通る', tryAssert([{ item_code: 'a', subcode_price: 'x:100' }]), 'ok');
+  check('update-items: ★空の sale_price は既定で拒否 (セール価格を黙って消さない)',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: '' }]),
+    'update-items: 1件目の sale_price が空です。空文字は「セール価格を消す」意味になります。消してよいなら clearSalePrice:true を付けてください');
+  check('update-items: 消してよいと言われたら通る',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: '' }], { clearSalePrice: true }), 'ok');
+  check('update-items: 空の items は拒否', tryAssert([]), 'update-items: items が空です');
+  // ★値そのものの検査 (このエンドポイントを直接叩かれても価格を壊せないように)
+  check('update-items: ★0円は通さない', tryAssert([{ item_code: 'a', price: '0', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: ★空の価格は通さない', tryAssert([{ item_code: 'a', price: '', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: ★負数は通さない', tryAssert([{ item_code: 'a', price: '-100', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: ★小数は通さない', tryAssert([{ item_code: 'a', price: '100.5', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: ★文字列は通さない', tryAssert([{ item_code: 'a', price: 'お問い合わせ', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: 上限超えは通さない', tryAssert([{ item_code: 'a', price: '1000000000', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: 上限ちょうどは通る', tryAssert([{ item_code: 'a', price: '999999999', sale_price: '900' }]), 'ok');
+  check('update-items: ★商品コードの形も見る', tryAssert([{ item_code: 'a b/c', price: '100', sale_price: '900' }]).includes('item_code が商品コードの形'), true);
+  check('update-items: 実際の商品コードは通る', tryAssert([{ item_code: '0726-001802-bk', price: '577', sale_price: '500' }]), 'ok');
+  check('update-items: セール価格の値も見る', tryAssert([{ item_code: 'a', price: '100', sale_price: '0' }]).includes('sale_price が 1〜'), true);
+  check('update-items: SKU別価格の書式を見る', tryAssert([{ item_code: 'a', subcode_price: 'x:0' }]).includes('subcode_price の書式'), true);
+  check('update-items: SKU別価格の正しい書式は通る', tryAssert([{ item_code: 'a', subcode_price: 'x:1000|y:1200' }]), 'ok');
+  check('update-items: ★price だけでは通さない (公式: 両方必須)',
+    tryAssert([{ item_code: 'a', price: '1000' }]).includes('price と sale_price の両方が必要'), true);
+  check('update-items: ★sale_price だけでも通さない',
+    tryAssert([{ item_code: 'a', sale_price: '900' }]).includes('price と sale_price の両方が必要'), true);
+  check('update-items: 両方あれば通る', tryAssert([{ item_code: 'a', price: '1000', sale_price: '900' }]), 'ok');
+  check('update-items: ★sale_price が null は通さない (組み立てで省かれ price だけ届く)',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: null }], { clearSalePrice: true }).includes('null'), true);
+  check('update-items: ★sale_price が undefined も通さない',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: undefined }], { clearSalePrice: true }).includes('null'), true);
+  check('update-items: 空文字 + 許可なら通る',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: '' }], { clearSalePrice: true }), 'ok');
+  check('update-items: ★コロンが多い SKU別価格は通さない',
+    tryAssert([{ item_code: 'a', subcode_price: 'x:100:ゴミ' }]).includes('subcode_price の書式'), true);
+  check('update-items: コロンが無い SKU別価格も通さない',
+    tryAssert([{ item_code: 'a', subcode_price: 'x100' }]).includes('subcode_price の書式'), true);
+  check('yahoo応答: Status OK は成功', yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status></ResultSet>' }), true);
+  check('yahoo応答: ★HTTP 200 でも Error があれば失敗', yahooXmlOk({ status: 200, body: '<ResultSet><Result><Error><Code>x</Code></Error></Result></ResultSet>' }), false);
+  check('yahoo応答: Status NG は失敗', yahooXmlOk({ status: 200, body: '<ResultSet><Status>NG</Status></ResultSet>' }), false);
+  check('yahoo応答: HTTP エラーは失敗', yahooXmlOk({ status: 500, body: 'boom' }), false);
+  // ★実測した submitItem の成功応答 (空の自己終了タグ Warning が入る)
+  check('yahoo応答: 実測の成功応答をそのまま通す',
+    yahooXmlOk({ status: 200, body: '<?xml version="1.0" encoding="UTF-8"?><ResultSet><Result><Status>OK</Status><Warning/></Result></ResultSet>' }), true);
+  check('yahoo応答: 空の Error は「無し」の意味なので成功のまま',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status><Error/></Result></ResultSet>' }), true);
+  check('yahoo応答: 中身のない Error も成功のまま',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status><Error>  </Error></Result></ResultSet>' }), true);
+  check('yahoo応答: ★中身のある Error は失敗',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Result><Error><Code>it-01011</Code></Error></Result></ResultSet>' }), false);
+  check('yahoo応答: ★本文が空の 200 は成功にしない', yahooXmlOk({ status: 200, body: '' }), false);
+  check('yahoo応答: ★HTML のメンテ画面も成功にしない', yahooXmlOk({ status: 200, body: '<html>maintenance</html>' }), false);
+  check('yahoo応答: ★壊れた XML も成功にしない', yahooXmlOk({ status: 200, body: '<ResultSet><Result>' }), false);
+  check('yahoo応答: ★途中で切れた応答も成功にしない (Status OK があっても)',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status>' }), false);
+  check('yahoo応答: 末尾に改行があっても成功のまま',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status></Result></ResultSet>' + String.fromCharCode(10) }), true);
+  check('yahoo応答: ★ルートが2つある応答は成功にしない',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status></ResultSet><ResultSet></ResultSet>' }), false);
+  check('yahoo応答: ★末尾に切れたタグが残る応答も成功にしない',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status></ResultSet><broken' }), false);
+  check('yahoo応答: ★途中に読めない < があっても成功にしない',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status><broken <Name>x</Name></ResultSet>' }), false);
+  check('yahoo応答: ★入れ子が閉じていない XML は成功にしない',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status><Result></ResultSet>' }), false);
+  check('yahoo応答: 閉じ方が食い違う XML も成功にしない',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status><A><B></A></B></ResultSet>' }), false);
+  check('yahoo応答: CDATA に < > が入っていても成功のまま',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status><Name><![CDATA[<b>太字</b>]]></Name></ResultSet>' }), true);
+  check('yahoo応答: 自己終了タグがあっても成功のまま',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status><Warning/></Result></ResultSet>' }), true);
+  check('yahoo応答: ★HTML の中に Status OK があっても成功にしない',
+    yahooXmlOk({ status: 200, body: '<html><body><Status>OK</Status></body></html>' }), false);
+  check('yahoo応答: ★ルートが ResultSet 以外なら成功にしない',
+    yahooXmlOk({ status: 200, body: '<Other><Status>OK</Status></Other>' }), false);
+  check('yahoo応答: XML宣言つきでも成功のまま',
+    yahooXmlOk({ status: 200, body: '<?xml version="1.0"?><ResultSet><Status>OK</Status></ResultSet>' }), true);
+  check('yahoo応答: 属性つきの Error も失敗',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Error type="x">だめ</Error></ResultSet>' }), false);
+
+  check('updateItems: subcode_price の書式が壊れない',
+    decodeURIComponent(decodeURIComponent(
+      buildUpdateItemsBody([{ item_code: 'a', subcode_price: 'aaaa:1000|bbbb:1200' }], 's').body.split('item1=')[1])),
+    'item_code=a&subcode_price=aaaa:1000|bbbb:1200');
 
   // 6) 既存の挙動が壊れていないこと (Path は PathList 内の origFlag=1 優先)
   const paths = `<Result><PathList><Path>その他</Path><Path origFlag="1">本命</Path></PathList></Result>`;
