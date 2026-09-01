@@ -196,6 +196,7 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
   eq(rak[0].manageNumber, '0726-001802', '★W 行が無くても商品管理番号が分かる');
   eq(rak[0].listingCode, '0726-001802', '表示も商品管理番号');
   eq(rak[0].aliases.sort(), ['0726-001802-be', '366'], '別名は AM / AL');
+  eq(rak[0].skuAliases.sort(), ['0726-001802-be', '366'], 'SKU 単位の別名 (source が w 以外)');
 
   const variants = {};
   ['BK', 'CL', 'WH', 'CM', 'DB', 'OW', 'BE', 'BG', 'GR'].forEach((c, i) => {
@@ -214,7 +215,7 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
       };
     },
   };
-  const target = { key: rak[0].listingCode, aliases: rak[0].aliases, manageNumber: rak[0].manageNumber, manageNumbers: rak[0].manageNumbers };
+  const target = { key: rak[0].listingCode, aliases: rak[0].aliases, skuAliases: rak[0].skuAliases, manageNumber: rak[0].manageNumber, manageNumbers: rak[0].manageNumbers };
   const prices = await fetchRakutenPrices([target], deps);
   const p = prices.get('0726-001802');
   eq(asked, ['0726-001802'], '★問い合わせるのは商品管理番号 (366 を管理番号として投げない)');
@@ -244,7 +245,7 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
   //   記録していた SKU (AM old-ne / AL 001) が消え、別の SKU (AL 999・AM 空) だけになった商品ページ
   const depsReplaced = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
     items: [{ manageNumber: 'page-a', itemNumber: 'page-a', title: 'T', variants: { 999: { standardPrice: '9800' } } }], failed: [] }) };
-  const rp = (await fetchRakutenPrices([{ key: 'page-a', aliases: ['old-ne', '001'], manageNumber: 'page-a' }], depsReplaced)).get('page-a');
+  const rp = (await fetchRakutenPrices([{ key: 'page-a', aliases: ['old-ne', '001'], skuAliases: ['old-ne', '001'], manageNumber: 'page-a' }], depsReplaced)).get('page-a');
   eq(rp.found, false, '★記録した SKU が消えた単一SKU商品は、残った SKU を採用しない');
   ok(/old-ne/.test(rp.reason) && /001/.test(rp.reason) && /差し替わった/.test(rp.reason), '理由に消えた SKU の別名を書く: ' + rp.reason);
   // 商品番号しか別名が無い単品 (SKU管理番号 normal-inventory・AM 空) は今まで通り救済する
@@ -252,6 +253,15 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
     items: [{ manageNumber: 'w-only-001', itemNumber: 'w-only-001', variants: { 'normal-inventory': { standardPrice: '500' } } }], failed: [] }) };
   const wo = (await fetchRakutenPrices([{ key: 'w-only-001', aliases: ['w-only-001'], manageNumber: 'w-only-001' }], depsWOnly)).get('w-only-001');
   eq([wo.found, wo.price, wo.skuCode], [true, 500, 'normal-inventory'], '商品番号だけの単品 (normal-inventory) は通る');
+  // ★AM に商品番号と同じ値を付けた単品 (source=am, 値は page-a)。値で見ればページ単位に見えるが SKU 単位 (Codex R5)
+  const rp2 = (await fetchRakutenPrices([{ key: 'page-a', aliases: ['page-a'], skuAliases: ['page-a'], manageNumber: 'page-a' }], depsReplaced)).get('page-a');
+  eq(rp2.found, false, '★AM が商品番号と同じ値でも、SKU 単位の別名が当たらなければ救済しない');
+  // 対応表の source で分けていることの確認: W 行だけの商品は skuAliases が空
+  db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 送料コード, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run('w-only-001', 'W だけの単品', '単品', '取扱中', 500, 200, '確定', 182, '103', '定形外規格内（50g以内）', 0.1, null);
+  ins.run('w-only-001', 'w-only-001', 'w', 'now', 'w-only-001');
+  const wl = buildTargets(db, ['w-only-001']).targets[0].listings.find((l) => l.mall === 'rakuten');
+  eq([wl.aliases, wl.skuAliases], [['w-only-001'], []], 'W 行だけなら skuAliases は空 (救済してよい)');
   ok(/システム連携用SKU番号がありません/.test(nam.reason) && /複数SKU [(]9[)] の商品/.test(nam.reason), '理由に SKU 数 (この商品は 9) と対処を書く: ' + nam.reason);
 
   // ★同じプレビューに BK と BE を並べても、片方がもう片方を上書きしない (行キーは NE コード単位)

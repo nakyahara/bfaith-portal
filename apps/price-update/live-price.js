@@ -81,6 +81,8 @@ export function shippingOfRakutenVariant(v) {
  * @param {Array<{key:string, aliases?:string[], manageNumber?:string|null, manageNumbers?:string[], rowKey?:string}>} targets
  *   key      = 表示中の出品コード (別名の1つとしても使う)
  *   aliases  = AM/AL/W の別名 (mirror_rakuten_sku_map 由来)。variant の特定に使う
+ *   skuAliases = そのうち SKU 単位のもの (AM/AL。対応表の source で分けたもの)。
+ *              単一SKUの救済を使ってよいか (= 対応表が商品ページ単位の別名しか持たないか) の判断に使う
  *   manageNumber  = 対応表が持っている商品管理番号 (あればこれを最優先で使う)
  *   manageNumbers = 対応表に複数の商品管理番号があった時の一覧 (2つ以上なら取り違え防止で確定しない)
  *   rowKey   = 結果を引くためのキー。★色違いは同じ商品管理番号を共有するので、
@@ -95,6 +97,7 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       key: normCode(t.key),
       rowKey: t.rowKey ? String(t.rowKey) : normCode(t.key),
       aliases: [...new Set([t.key, ...(t.aliases || [])].map((a) => String(a || '').trim()).filter(Boolean))],
+      skuAliases: [...new Set((t.skuAliases || []).map((a) => String(a || '').trim()).filter(Boolean))],
       manageNumber: String(t.manageNumber || '').trim() || null,
       manageNumbers: [...new Set((t.manageNumbers || []).map((m) => String(m || '').trim()).filter(Boolean))],
     }))
@@ -155,12 +158,12 @@ export async function fetchRakutenPrices(targets, deps = {}) {
     // 別名で特定できなくても、variant が 1 つだけの商品なら取り違える相手がいない。
     // ★ただし、対応表が SKU 単位の別名 (AM/AL) を持っているのに 1 つも当たらない = 記録していた SKU が
     //   この商品から消えている (差し替わった疑い)。その時はこの救済を使わない (Codex R4)。
-    //   救済してよいのは、対応表が商品ページ単位の別名 (商品番号 / 管理番号) しか持たない時だけ
-    //   (例: SKU管理番号が normal-inventory の単品。W 行しか作れないので別名は商品番号だけ)
+    //   救済してよいのは、対応表が商品ページ単位の別名 (W = 商品番号) しか持たない時だけ
+    //   (例: SKU管理番号が normal-inventory の単品。W 行しか作れないので別名は商品番号だけ)。
+    //   ★SKU 単位かどうかは値で推定せず、対応表の source (skuAliases) で判断する (Codex R5)
     let missingSkuAliases = [];
     if (!matchedKey && matched.length === 0 && Object.keys(variants).length === 1) {
-      const pageLevel = new Set([normCode(item?.itemNumber), normCode(item?.manageNumber)].filter(Boolean));
-      missingSkuAliases = [...aliasKeys].filter((a) => !pageLevel.has(a));
+      missingSkuAliases = t.skuAliases;
       if (missingSkuAliases.length === 0) matchedKey = Object.keys(variants)[0];
     }
     if (!matchedKey) {
