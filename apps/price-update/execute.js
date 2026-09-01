@@ -49,7 +49,7 @@ export function mallWriteEnabled(mall, env = process.env) {
 }
 
 /** run の operation 行 → ガード評価にかける形 */
-function rowOf(op) {
+function rowOf(op, isRecovery = false) {
   return {
     mall: op.mall,
     confidence: op.confidence,
@@ -59,7 +59,9 @@ function rowOf(op) {
     taxRate: op.tax_rate,
     shipping: op.shipping_cost,
     feeRate: op.fee_rate,
-    isRecovery: false,
+    // ★復旧 run は変更率ガードを免除する。ここで渡し忘れると、作成時は通った復旧行が
+    //   送信直前に「値下げ幅が大きすぎます」で全部止まる (値上げを戻すと必ず大きな値下げになる)
+    isRecovery,
   };
 }
 
@@ -173,9 +175,10 @@ export async function executeRun(db, run, { actor, client, env = process.env, sk
     }
 
     // ★送る直前にもう一度ガードを評価する。記録時に通っていても、ここで通らなければ送らない
+    const isRecovery = run.kind === 'recovery';
     const blocked = [];
     for (const op of ops) {
-      const ev = evaluateRow(rowOf(op));
+      const ev = evaluateRow(rowOf(op, isRecovery));
       if (!ev.canUpdate) blocked.push({ op, blocks: ev.blocks });
     }
     if (blocked.length > 0) {
@@ -205,7 +208,8 @@ export async function executeRun(db, run, { actor, client, env = process.env, sk
     } catch (e) {
       // 応答が返ってこなかった = 送られたか不明。★再送しない
       const reason = `送信結果が不明です (${e.message})。受領台帳を operation_id=${operationId} で照会してください`;
-      for (const op of ops) { summary.unknown++; record(op, 'unknown', reason, { operationId }); }
+      // ★送信が届いたかどうか分からない = モールの価格が変わっているかもしれない。復旧の対象にする印
+      for (const op of ops) { summary.unknown++; record(op, 'unknown', reason, { operationId, mayHaveChanged: true }); }
       stoppedMalls.set(mall, '送信結果が不明な行が出たため、残りを止めました');
       summary.stopped = stoppedMalls.get(mall);
       continue;
@@ -232,7 +236,9 @@ export async function executeRun(db, run, { actor, client, env = process.env, sk
       const outState = verified.reachable ? 'failed' : 'unknown';
       for (const op of ops) {
         summary[outState]++;
-        record(op, outState, verified.reason, { sent: prices[op.sku_code], verified: verified.live?.[op.sku_code] ?? null });
+        // ★miniPC は「送った」と言っている。照合が通らなかっただけなので、価格は変わっているかもしれない
+        record(op, outState, verified.reason,
+          { sent: prices[op.sku_code], verified: verified.live?.[op.sku_code] ?? null, mayHaveChanged: true });
       }
       stoppedMalls.set(mall, `送った後の確認が通りませんでした (${verified.reason})`);
       summary.stopped = stoppedMalls.get(mall);
@@ -242,9 +248,13 @@ export async function executeRun(db, run, { actor, client, env = process.env, sk
     // 失敗 (conflict / ガード / 想定外 / 結果不明)
     const reason = res.body?.message || res.body?.error || `HTTP ${res.status}`;
     const bucket = state === 'conflict' ? 'conflict' : (isStopState(state) ? 'unknown' : 'failed');
+    // ★意味の分かる失敗 (理由つき400 / 商品が無い / 価格の食い違い) は送信前に弾かれている = 価格は変わっていない。
+    //   想定外・結果不明は、届いて適用された可能性が残る
+    const mayHaveChanged = isStopState(state);
     for (const op of ops) {
       summary[bucket]++;
-      record(op, state === 'unexpected' ? 'unknown' : state, reason, { httpStatus: res.status, classified: state });
+      record(op, state === 'unexpected' ? 'unknown' : state, reason,
+        { httpStatus: res.status, classified: state, mayHaveChanged });
     }
 
     if (isStopState(state)) {

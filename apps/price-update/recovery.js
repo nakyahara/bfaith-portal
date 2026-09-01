@@ -12,16 +12,35 @@
  *
  * 対象にする行 = **モールの価格が変わった可能性がある行**:
  *   confirmed … 変わったことを確認済み
- *   unknown   … 送ったが結果が分からない (変わっているかもしれない)
- *   failed    … 送った後の照合が通らなかった (変わっているかもしれない)
+ *   unknown / failed … ただし **状態だけでは決められない**。
+ *     failed には「送った後の照合が通らなかった」(変わったかもしれない) と
+ *     「miniPC が送る前に弾いた 400 / 商品が無い」(変わっていない) が混ざっている。
+ *     → 実行側が記録した `mayHaveChanged` の印で判断する (execute.js が付ける)。
+ *       印が無い古い記録は、状態だけで判断せず **対象外** にする (勝手に戻さない方に倒す)
  * 対象にしない行:
  *   noop      … 既に同じ価格だった (戻す先も同じ値。送るだけ無駄)
  *   conflict / blocked / skipped … 送っていないので変わっていない
  *   previewed … まだ実行していない run (戻すものが無い)
  */
 
-/** モールの価格が変わった可能性がある状態 */
-export const RECOVERABLE_STATES = ['confirmed', 'unknown', 'failed'];
+/** 変わったことが確認できている状態 */
+export const CHANGED_STATES = ['confirmed'];
+/** 変わったかもしれない状態 (mayHaveChanged の印があるものだけ対象にする) */
+export const MAYBE_CHANGED_STATES = ['unknown', 'failed'];
+/** 復旧の候補になりうる状態 (画面表示用) */
+export const RECOVERABLE_STATES = [...CHANGED_STATES, ...MAYBE_CHANGED_STATES];
+
+/** その行の最後のイベントに mayHaveChanged の印があるか */
+function mayHaveChanged(sourceRun, operationId) {
+  let hit = null;
+  for (const e of sourceRun.events || []) {
+    if (e.operation_id !== operationId) continue;
+    let detail = null;
+    try { detail = e.detail_json ? JSON.parse(e.detail_json) : null; } catch { detail = null; }
+    if (detail && Object.prototype.hasOwnProperty.call(detail, 'mayHaveChanged')) hit = detail.mayHaveChanged === true;
+  }
+  return hit === true;
+}
 
 /**
  * 元の run から「戻す対象」を洗い出す。DB も fetch も触らない。
@@ -35,6 +54,11 @@ export function planRecovery(sourceRun) {
   for (const op of sourceRun.operations || []) {
     if (!RECOVERABLE_STATES.includes(op.state)) {
       skipped.push({ op, reason: `この行は送っていない、または価格が変わっていません (${op.state})` });
+      continue;
+    }
+    // ★「失敗」には送る前に弾かれたものも混ざる。印が無ければ戻さない (変わっていない行を上書きしない)
+    if (MAYBE_CHANGED_STATES.includes(op.state) && !mayHaveChanged(sourceRun, op.operation_id)) {
+      skipped.push({ op, reason: 'モールに送る前に止まった行です (価格は変わっていないので戻す必要がありません)' });
       continue;
     }
     const restoreTo = op.expected_current_price;
@@ -63,15 +87,34 @@ export function planRecovery(sourceRun) {
 export function buildRecoveryOperations(candidates, previewRows, evaluate) {
   const operations = [];
   const unmatched = [];
-  const key = (mall, neCode, rowKind) => `${mall}|${String(neCode).toLowerCase().trim()}|${rowKind}`;
+  // ★突き合わせは **出品コードと SKU まで** 見る。モール × NEコード × 単品/セット だけだと、
+  //   同じ NE コードに出品が 2 つあるモールで別の出品に値付けしうる (Codex R1 重大)
+  const key = (mall, neCode, rowKind, listingCode, skuCode) => [
+    mall, String(neCode ?? '').toLowerCase().trim(), rowKind,
+    String(listingCode ?? '').toLowerCase().trim(), String(skuCode ?? '').toLowerCase().trim(),
+  ].join('|');
   const byKey = new Map();
-  for (const r of previewRows) byKey.set(key(r.mall, r.neCode, r.rowKind), r);
+  const dup = new Set();
+  for (const r of previewRows) {
+    const k = key(r.mall, r.neCode, r.rowKind, r.listingCode, r.skuCode);
+    if (byKey.has(k)) dup.add(k);      // 同じキーが 2 行 = どちらか決められない
+    byKey.set(k, r);
+  }
 
   for (const { op, restoreTo } of candidates) {
-    const row = byKey.get(key(op.mall, op.ne_code, op.row_kind));
+    const k = key(op.mall, op.ne_code, op.row_kind, op.listing_code, op.sku_code);
+    if (dup.has(k)) {
+      unmatched.push({ op, reason: '同じ出品コード・SKU の行が複数あります。取り違えを避けるため戻しません' });
+      continue;
+    }
+    const row = byKey.get(k);
     if (!row) {
-      // 元の run にあった出品が、いま引き当て直すと出てこない (出品が消えた等)。人が見る
-      unmatched.push({ op, reason: 'いま引き当て直すとこの出品が見つかりません。モールの画面で確認してください' });
+      // 元の run にあった出品が、いま引き当て直すと出てこない (出品が消えた・別の出品コードになった等)。人が見る
+      unmatched.push({
+        op,
+        reason: `いま引き当て直すと同じ出品 (${op.listing_code || '出品コード不明'}`
+          + `${op.sku_code ? ' / SKU ' + op.sku_code : ''}) が見つかりません。モールの画面で確認してください`,
+      });
       continue;
     }
     // ★戻す先はプレビューからではなく監査記録から取る (画面や再引き当ての値を信じない)

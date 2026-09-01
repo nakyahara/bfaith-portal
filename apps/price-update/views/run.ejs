@@ -318,17 +318,26 @@
     }
     const done = (info.existing || []).filter((r) => r.executed);
     $('rec-status').innerHTML = 'この履歴で<b>価格が変わった行が ' + n(info.rows) + ' 行</b>あります。'
-      + '送る前の価格に戻せます。'
-      + (done.length > 0 ? '<br><span style="color:#991b1b;">※ この履歴は既に一度戻しています ('
-        + done.map((r) => esc(r.run_id)).join(', ') + ')。もう一度作ると、いまの価格を当時の価格に戻します。</span>' : '');
+      + '送る前の価格に戻せます。';
+    if (done.length > 0) {
+      // 一度戻した履歴をもう一度戻す = いまの価格を当時の価格で上書きする。明示のチェックを求める
+      $('rec-status').innerHTML += '<div style="color:#991b1b; margin-top:6px;">※ この履歴は既に一度戻しています ('
+        + done.map((r) => esc(r.run_id)).join(', ') + ')。'
+        + 'もう一度戻すと、<b>いまの価格を当時の価格で上書きします</b>。'
+        + 'その後に別の理由で値付けし直していた場合、それも消えます。</div>'
+        + '<label style="display:block; margin-top:6px;"><input type="checkbox" id="rec-repeat"> '
+        + 'それでも、もう一度戻す</label>';
+    }
     $('rec-form').style.display = '';
 
     $('rec-btn').addEventListener('click', async function () {
       $('rec-btn').disabled = true;
       $('rec-result').textContent = '作成中…';
       try {
+        const repeat = $('rec-repeat');
         const res = await fetch(API + '/recovery', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}),
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmRepeat: !!(repeat && repeat.checked) }),
         });
         const json = await res.json();
         if (!res.ok || json.ok === false) {

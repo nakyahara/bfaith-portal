@@ -15,7 +15,7 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { loadDimMall } from '../../lib/dim-mall.js';
-import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim, recoveryRunsOf } from './db.js';
+import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim, recoveryRunsOf, createRecoveryRun } from './db.js';
 import { planRecovery, buildRecoveryOperations, RECOVERABLE_STATES } from './recovery.js';
 import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
 import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot } from './live-price.js';
@@ -535,16 +535,6 @@ router.post('/api/runs/:runId/recovery', async (req, res) => {
     const source = getRun(db, req.params.runId);
     if (!source) throw validationError('元の履歴が見つかりません');
 
-    // 二重に作らせない。前の復旧 run がまだ実行されていないなら、そちらへ誘導する
-    for (const prev of recoveryRunsOf(db, source.run_id)) {
-      if (!runClaim(db, prev.run_id)) {
-        return res.status(409).json({
-          ok: false, error: 'recovery_exists', runId: prev.run_id,
-          message: `この履歴の復旧 run は既に作ってあります (${prev.run_id})。そちらを実行してください`,
-        });
-      }
-    }
-
     const { candidates, skipped } = planRecovery(source);
     if (candidates.length === 0) {
       throw validationError('戻す対象がありません (価格が変わった行がこの履歴にはありません)');
@@ -559,15 +549,25 @@ router.post('/api/runs/:runId/recovery', async (req, res) => {
       throw validationError('戻す対象の出品が今は見つかりません。モールの画面で確認してください');
     }
 
-    const runId = insertRun(db, {
-      createdBy: actorOf(req),
-      kind: 'recovery',
+    // ★「既にあるか調べる → 作る」は1つの取引の中で (同時に2回押されても2本作らない)
+    const created = createRecoveryRun(db, {
       sourceRunId: source.run_id,
-      note: `${source.run_id} を元の価格に戻す`,
-      neCodes: codes,
-      limits: runLimits(),
-      operations,
+      allowRepeat: req.body?.confirmRepeat === true,
+      runSpec: {
+        createdBy: actorOf(req),
+        note: `${source.run_id} を元の価格に戻す`,
+        neCodes: codes,
+        limits: runLimits(),
+        operations,
+      },
     });
+    if (!created.ok) {
+      const message = created.code === 'RECOVERY_EXISTS'
+        ? `この履歴の復旧 run は既に作ってあります (${created.runId})。そちらを実行してください`
+        : `この履歴は既に一度戻しています (${created.runId})。もう一度戻すと、いまの価格を当時の価格に上書きします。それでよければ画面の確認にチェックを入れてください`;
+      return res.status(409).json({ ok: false, error: created.code.toLowerCase(), runId: created.runId, message });
+    }
+    const runId = created.runId;
     // 元の run 側にも「復旧 run を作った」ことを残す (追記のみ)
     appendEvent(db, source.run_id, {
       actor: actorOf(req), event: 'recovery_created',

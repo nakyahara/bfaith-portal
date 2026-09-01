@@ -287,3 +287,27 @@ export function recoveryRunsOf(db, sourceRunId) {
   return db.prepare('SELECT run_id, created_at, created_by FROM pu_runs WHERE source_run_id = ? ORDER BY created_at DESC')
     .all(sourceRunId);
 }
+
+/**
+ * 復旧 run を作る (要件 F6)。★「既にあるか調べる → 作る」を1つの取引の中でやる。
+ * 別々にやると、同時に2回押された時に両方とも「まだ無い」と判断して2本できる (Codex R1 High)。
+ *
+ * @param {object} db
+ * @param {string} sourceRunId 元の run
+ * @param {object} runSpec insertRun に渡す内容
+ * @param {boolean} allowRepeat 既に戻したことがある run を、もう一度戻してよいか (画面の明示確認つき)
+ * @returns {{ok:true, runId:string} | {ok:false, code:'RECOVERY_EXISTS'|'ALREADY_RECOVERED', runId:string}}
+ */
+export function createRecoveryRun(db, { sourceRunId, runSpec, allowRepeat = false }) {
+  const tx = db.transaction(() => {
+    const prevs = recoveryRunsOf(db, sourceRunId);
+    for (const prev of prevs) {
+      // まだ実行していない復旧 run があるなら、それを使ってもらう (同じ内容を2本作らない)
+      if (!runClaim(db, prev.run_id)) return { ok: false, code: 'RECOVERY_EXISTS', runId: prev.run_id };
+    }
+    // 実行済みの復旧 run がある = 一度戻している。もう一度戻すのは明示確認が要る
+    if (prevs.length > 0 && !allowRepeat) return { ok: false, code: 'ALREADY_RECOVERED', runId: prevs[0].run_id };
+    return { ok: true, runId: insertRun(db, { ...runSpec, kind: 'recovery', sourceRunId }) };
+  });
+  return tx.immediate();
+}

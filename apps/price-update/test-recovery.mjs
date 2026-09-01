@@ -6,17 +6,27 @@
  *
  * 実行: node apps/price-update/test-recovery.mjs
  */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import Database from 'better-sqlite3';
 import { planRecovery, buildRecoveryOperations, RECOVERABLE_STATES } from './recovery.js';
 import { evaluateRow } from './pricing.js';
+import { createTables, insertRun, getRun, claimRun, createRecoveryRun, recoveryRunsOf } from './db.js';
+import { executeRun } from './execute.js';
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
 const eq = (a, b, label) => ok(JSON.stringify(a) === JSON.stringify(b), `${label} (期待 ${JSON.stringify(b)} / 実際 ${JSON.stringify(a)})`);
 
-const op = (id, state, { expected = 577, next = 578, mall = 'rakuten', neCode = 'abc-001', rowKind = 'single' } = {}) => ({
+const op = (id, state, { expected = 577, next = 578, mall = 'rakuten', neCode = 'abc-001', rowKind = 'single',
+  listingCode = 'mn-1', skuCode = 'sku-a' } = {}) => ({
   operation_id: id, state, mall, ne_code: neCode, row_kind: rowKind,
+  listing_code: listingCode, sku_code: skuCode,
   expected_current_price: expected, new_price: next,
 });
+/** 実行側が付ける「価格が変わったかもしれない」印 */
+const mark = (id, may) => ({ operation_id: id, detail_json: JSON.stringify({ mayHaveChanged: may }) });
 
 console.log('\n── 戻す対象になる行 ──');
 {
@@ -24,19 +34,27 @@ console.log('\n── 戻す対象になる行 ──');
     op('a', 'confirmed'),
     op('b', 'unknown'),
     op('c', 'failed'),
+    op('c2', 'failed'),     // 送る前に弾かれた失敗 (印が false)
+    op('c3', 'failed'),     // 印そのものが無い古い記録
     op('d', 'noop'),
     op('e', 'conflict'),
     op('f', 'skipped'),
     op('g', 'blocked'),
     op('h', 'previewed'),
-  ] };
+  ], events: [mark('b', true), mark('c', true), mark('c2', false)] };
   const { candidates, skipped } = planRecovery(run);
   eq(candidates.map((c) => c.op.operation_id), ['a', 'b', 'c'],
-    '★価格が変わった可能性のある行だけ (確認ずみ / 結果不明 / 送った後の照合が通らなかった)');
-  eq(RECOVERABLE_STATES, ['confirmed', 'unknown', 'failed'], '対象の状態は3つ');
-  eq(skipped.length, 5, '残りは理由つきで対象外');
+    '★価格が変わった可能性のある行だけ (確認ずみ / 印つきの 結果不明・失敗)');
+  eq(RECOVERABLE_STATES, ['confirmed', 'unknown', 'failed'], '候補になりうる状態は3つ');
+  eq(skipped.length, 7, '残りは理由つきで対象外');
   ok(skipped.every((s) => s.reason), 'なぜ対象外かを必ず残す');
   eq(candidates[0].restoreTo, 577, '★戻す先は「元の run が記録した送信前の価格」');
+
+  // ★「失敗」には送る前に弾かれたもの (400 / 商品が無い) が混ざる。印が無ければ戻さない
+  const c2 = skipped.find((s) => s.op.operation_id === 'c2');
+  const c3 = skipped.find((s) => s.op.operation_id === 'c3');
+  ok(/送る前に止まった/.test(c2.reason), '★送信前に弾かれた失敗は戻さない: ' + c2.reason);
+  ok(/送る前に止まった/.test(c3.reason), '★印が無い古い記録も戻さない (勝手に戻さない方に倒す)');
 }
 
 console.log('\n── 戻す先が無い / 戻す必要が無い行 ──');
@@ -85,21 +103,38 @@ console.log('\n── 引き当て直すと出てこない行は、黙って飛�
 
 console.log('\n── 別の商品の行に取り違えない ──');
 {
+  const base = { confidence: 'confirmed', cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.12 };
   const rows = [
-    { mall: 'rakuten', neCode: 'abc-001', rowKind: 'single', price: 578, confidence: 'confirmed', cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.12 },
-    { mall: 'rakuten', neCode: 'abc-002', rowKind: 'single', price: 900, confidence: 'confirmed', cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.12 },
-    { mall: 'yahoo', neCode: 'abc-001', rowKind: 'single', price: 700, confidence: 'confirmed', cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.12 },
-    { mall: 'rakuten', neCode: 'abc-001', rowKind: 'set', price: 1500, confidence: 'confirmed', cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.12 },
+    { ...base, mall: 'rakuten', neCode: 'abc-001', rowKind: 'single', listingCode: 'mn-1', skuCode: 'sku-a', price: 578 },
+    { ...base, mall: 'rakuten', neCode: 'abc-002', rowKind: 'single', listingCode: 'mn-2', skuCode: 'sku-a', price: 900 },
+    { ...base, mall: 'yahoo', neCode: 'abc-001', rowKind: 'single', listingCode: 'mn-1', skuCode: 'sku-a', price: 700 },
+    { ...base, mall: 'rakuten', neCode: 'abc-001', rowKind: 'set', listingCode: 'mn-1', skuCode: 'sku-a', price: 1500 },
+    // ★同じ NE コード・同じモール・同じ単品だが **別の出品** (楽天に2出品ある商品)
+    { ...base, mall: 'rakuten', neCode: 'abc-001', rowKind: 'single', listingCode: 'mn-OTHER', skuCode: 'sku-z', price: 3000 },
   ];
   const evaluate = (row) => ({ evaluation: evaluateRow({ ...row, currentPrice: row.price, isRecovery: true }) });
   const { candidates } = planRecovery({ operations: [op('a', 'confirmed')] });
   const { operations } = buildRecoveryOperations(candidates, rows, evaluate);
-  eq([operations.length, operations[0].mall, operations[0].neCode, operations[0].rowKind, operations[0].expectedCurrentPrice],
-    [1, 'rakuten', 'abc-001', 'single', 578], '★モール × NEコード × 単品/セット が全部一致した行だけ');
-  // NEコードの大小文字・前後空白が違っても同じ行として扱う
+  eq([operations.length, operations[0].listingCode, operations[0].skuCode, operations[0].expectedCurrentPrice],
+    [1, 'mn-1', 'sku-a', 578], '★モール × NEコード × 単品/セット × 出品コード × SKU が全部一致した行だけ');
+
+  // NEコード・出品コード・SKU の大小文字・前後空白が違っても同じ行として扱う
   const { operations: o2 } = buildRecoveryOperations(
-    planRecovery({ operations: [op('a', 'confirmed', { neCode: ' ABC-001 ' })] }).candidates, rows, evaluate);
+    planRecovery({ operations: [op('a', 'confirmed', { neCode: ' ABC-001 ', listingCode: 'MN-1', skuCode: ' SKU-A ' })] }).candidates,
+    rows, evaluate);
   eq(o2.length, 1, '大小文字・前後空白は無視して一致させる');
+
+  // ★元の run で更新したのとは違う出品しか今は無い → 戻さない (別出品に値付けしない)
+  const { operations: o3, unmatched: u3 } = buildRecoveryOperations(
+    planRecovery({ operations: [op('a', 'confirmed', { listingCode: 'mn-GONE' })] }).candidates, rows, evaluate);
+  eq([o3.length, u3.length], [0, 1], '★出品コードが変わっていたら戻さない');
+  ok(/mn-GONE/.test(u3[0].reason), '理由に元の出品コードを書く: ' + u3[0].reason);
+
+  // ★同じキーの行が2つ返ってきたらどちらか決めない
+  const { operations: o4, unmatched: u4 } = buildRecoveryOperations(
+    planRecovery({ operations: [op('a', 'confirmed')] }).candidates, [rows[0], { ...rows[0], price: 999 }], evaluate);
+  eq([o4.length, u4.length], [0, 1], '★同じ出品コード・SKU の行が複数なら戻さない');
+  ok(/複数あります/.test(u4[0].reason), '理由: ' + u4[0].reason);
 }
 
 console.log('\n── ガード: 復旧では変更率だけ免除される ──');
@@ -120,6 +155,7 @@ console.log('\n── ガードに掛かった行は実行候補にしない ─
 {
   const previewRow = {
     mall: 'rakuten', neCode: 'abc-001', rowKind: 'single', confidence: 'confirmed',
+    listingCode: 'mn-1', skuCode: 'sku-a',
     price: 578, cost: 100000, taxRate: 0.1, shipping: 182, feeRate: 0.12,   // 原価が高すぎて戻すと原価割れ
   };
   const evaluate = (row) => ({ evaluation: evaluateRow({ ...row, currentPrice: row.price, isRecovery: true }) });
@@ -127,6 +163,77 @@ console.log('\n── ガードに掛かった行は実行候補にしない ─
   const { operations } = buildRecoveryOperations(candidates, [previewRow], evaluate);
   eq(operations[0].initialState, 'blocked_preview', '★ガードに掛かったら blocked_preview (実行候補に混ぜない)');
   ok(operations[0].guard.blocks.length > 0, '止めた理由を記録に残す');
+}
+
+console.log('\n── 実行の直前でも復旧として評価する (作成時だけ免除しても意味がない) ──');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pu-rec-'));
+  const db = createTables(new Database(path.join(dir, 'm.db')));
+  // 900 円 → 400 円に戻す (−55.6%)。通常の run なら送信直前のガードで止まる値
+  const mkRun = (kind) => {
+    const runId = insertRun(db, {
+      createdBy: 't@example.com', kind, neCodes: ['abc-001'], limits: {},
+      operations: [{
+        operationId: 'puo-' + kind, mall: 'rakuten', neCode: 'abc-001', rowKind: 'single',
+        listingCode: 'mn-1', skuCode: 'sku-a', confidence: 'confirmed',
+        expectedCurrentPrice: 900, newPrice: 400,
+        cost: 210, taxRate: 0.1, shipping: 100, feeRate: 0.12, initialState: 'previewed',
+      }],
+    });
+    return getRun(db, runId);
+  };
+  const client = () => ({
+    calls: [],
+    patchItemPrices: async function (mn, body) { this.calls.push({ mn, body }); return { status: 200, body: { ok: true, state: 'applied' } }; },
+    fetchItemDetail: async () => ({ item: { manageNumber: 'mn-1', variants: { 'sku-a': { standardPrice: '400' } } }, status: 'found' }),
+  });
+  const ENV_ON = { PRICE_UPDATE_RAKUTEN_ENABLED: '1' };
+
+  const c1 = client();
+  const normal = await executeRun(db, mkRun('normal'), { actor: 't', client: c1, env: ENV_ON });
+  eq([c1.calls.length, normal.summary.skipped], [0, 1], '通常の run は大きな値下げを送信直前で止める');
+
+  const c2 = client();
+  const rec = await executeRun(db, mkRun('recovery'), { actor: 't', client: c2, env: ENV_ON });
+  eq([c2.calls.length, rec.summary.applied], [1, 1], '★復旧 run は送信直前のガードでも変更率を免除される');
+
+  db.close();
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* Windows のロック残り */ }
+}
+
+console.log('\n── 復旧 run を二重に作らせない ──');
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pu-rec2-'));
+  const db = createTables(new Database(path.join(dir, 'm.db')));
+  const srcId = insertRun(db, {
+    createdBy: 't@example.com', neCodes: ['abc-001'], limits: {},
+    operations: [{
+      operationId: 'puo-src', mall: 'rakuten', neCode: 'abc-001', rowKind: 'single',
+      confidence: 'confirmed', expectedCurrentPrice: 577, newPrice: 578, initialState: 'previewed',
+    }],
+  });
+  const spec = { createdBy: 't@example.com', neCodes: ['abc-001'], limits: {}, operations: [{
+    operationId: 'puo-r1', mall: 'rakuten', neCode: 'abc-001', rowKind: 'single',
+    confidence: 'confirmed', expectedCurrentPrice: 578, newPrice: 577, initialState: 'previewed',
+  }] };
+
+  const first = createRecoveryRun(db, { sourceRunId: srcId, runSpec: spec });
+  eq(first.ok, true, '1本目は作れる');
+  const second = createRecoveryRun(db, { sourceRunId: srcId, runSpec: spec });
+  eq([second.ok, second.code, second.runId], [false, 'RECOVERY_EXISTS', first.runId],
+    '★未実行の復旧 run があるうちは2本目を作らせない (そちらへ誘導)');
+  eq(recoveryRunsOf(db, srcId).length, 1, '復旧 run は1本のまま');
+
+  // 実行済みになったら、明示確認つきでだけもう一度作れる
+  claimRun(db, first.runId, 't@example.com');
+  const third = createRecoveryRun(db, { sourceRunId: srcId, runSpec: spec });
+  eq([third.ok, third.code], [false, 'ALREADY_RECOVERED'], '★一度戻した履歴は、確認なしでは戻せない');
+  const fourth = createRecoveryRun(db, { sourceRunId: srcId, runSpec: spec, allowRepeat: true });
+  eq(fourth.ok, true, '明示確認があれば作れる');
+  eq(recoveryRunsOf(db, srcId).length, 2, '2本目ができた');
+
+  db.close();
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* Windows のロック残り */ }
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
