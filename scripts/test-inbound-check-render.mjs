@@ -86,7 +86,7 @@ function makeContext(stateJson) {
 
 const m = /<script>([\s\S]*?)<\/script>/.exec(HTML);
 if (!m) { console.log('  ✗ インラインJSが見つかりません'); process.exit(1); }
-const SCRIPT = m[1] + String.fromCharCode(10) + "globalThis.__t = { openLines, render, state, qhist, setFilter: v => { filter = v; } };";
+const SCRIPT = m[1] + String.fromCharCode(10) + "globalThis.__t = { openMode, render, state, qhist, setFilter: v => { filter = v; } };";
 
 const LINE = (over = {}) => ({
   line_key: 'AR1|1|1', ar_no: 'AR1', product_id: 'asahilabo15g', code_key: 'asahilabo15g',
@@ -118,7 +118,7 @@ const STATE = lines => ({
 });
 
 /** 画面を描いて #list の HTML を返す */
-async function renderWith(lines, { open = null, worker = true, filter = null } = {}) {
+async function renderWith(lines, { open = null, mode = 'qty', worker = true, filter = null } = {}) {
   const { ctx, q } = makeContext(STATE(lines));
   vm.createContext(ctx);
   vm.runInContext(SCRIPT, ctx, { timeout: 5000 });
@@ -126,7 +126,7 @@ async function renderWith(lines, { open = null, worker = true, filter = null } =
   // load() は script 末尾で走っている。マイクロタスクを回して描画完了を待つ
   for (let i = 0; i < 10; i++) await new Promise(r => setTimeout(r, 0));
   if (filter) ctx.__t.setFilter(filter);
-  if (open) { ctx.__t.qhist.set(open, []); ctx.__t.openLines.add(open); }
+  if (open) { ctx.__t.qhist.set(open, []); ctx.__t.openMode.set(open, mode); }
   if (filter || open) ctx.__t.render(true);
   return { html: q('#list').innerHTML, stat: q('#stat').innerHTML, ctx, q };
 }
@@ -135,7 +135,7 @@ console.log('[1] 行の状態と主ボタン');
 {
   let r = await renderWith([LINE()]);
   ok(/data-act="all"[^>]*>全部あり</.test(r.html), '未着手 → 主ボタンは [全部あり]');
-  ok(/data-act="plus"[^>]*>＋1箱 \(10個\)</.test(r.html), '未着手 → ＋1箱 (10個) が出る');
+  ok(/data-act="count"[^>]*>🔢 数量を数える</.test(r.html), '未着手 → [数量を数える] が出る (＋1箱はパネルの中)');
   ok(!/class="row[^"]*partial/.test(r.html), '未着手の行に partial は付かない');
   ok(/予定 <b>106<\/b> 個 ・ 1箱 10個/.test(r.html), '予定と1箱の入数が出る');
 
@@ -143,7 +143,7 @@ console.log('[1] 行の状態と主ボタン');
   ok(/class="row[^"]* partial/.test(r.html), '一部 → 行に partial (黄色)');
   ok(/82 \/ 106 個 <small>あと 24個<\/small>/.test(r.html), '一部 → 「82 / 106 個 あと 24個」');
   ok(/data-act="all"[^>]*>残りも<br>全部あり</.test(r.html), '一部 → 主ボタンは [残りも全部あり]');
-  ok(/data-act="plus"/.test(r.html), '一部 → ＋1箱 も出る');
+  ok(/data-act="count"/.test(r.html), '一部 → [数量を数える] も出る');
 
   r = await renderWith([LINE({ found_qty: 106, remaining_qty: 0, quantity_relation: 'exact' })]);
   ok(/data-act="exact"[^>]*>確認</.test(r.html), '数量一致 → 主ボタンは [確認]');
@@ -155,14 +155,15 @@ console.log('[1] 行の状態と主ボタン');
 
   r = await renderWith([LINE({ check_status: 'checked', found_qty: 106, remaining_qty: 0, quantity_relation: 'exact', finalized_result: 'exact', version: 2, checked_by: '山田', checked_at: '2026-09-02T05:30:00.000Z' })], { filter: 'all' });
   ok(/data-act="reopen"[^>]*>✅ 確認済み</.test(r.html), '確定済み → [確認済み] (押すとやり直す)');
-  ok(!/data-act="plus"/.test(r.html), '確定済み → ＋1箱 は出さない');
+  ok(!/data-act="count"/.test(r.html), '確定済み → [数量を数える] は出さない');
 
   r = await renderWith([LINE({ check_status: 'checked', found_qty: 82, remaining_qty: 24, quantity_relation: 'shortage', finalized_result: 'shortage', version: 2, checked_by: '山田', checked_at: '2026-09-02T05:30:00.000Z' })], { filter: 'all' });
   ok(/✅ 不足で<br>確認済み/.test(r.html), '不足で確定済み → 「不足で確認済み」と出る');
 
-  r = await renderWith([LINE({ pack_qty: null, info: { ...LINE().info, irisu: null } })]);
-  ok(/data-act="setpack"[^>]*>入数を設定</.test(r.html), '入数未登録 → ＋1箱ではなく [入数を設定] (無効ボタンにしない)');
+  r = await renderWith([LINE({ pack_qty: null, info: { ...LINE().info, irisu: null } })], { open: 'AR1|1|1', mode: 'qty' });
   ok(/入数 未登録/.test(r.html), '入数未登録 と表示される');
+  ok(/1箱の入り数がまだ登録されていません/.test(r.html), '入数未登録 → パネルに案内が出て、入数を打てば数えられる');
+  ok(!/data-act="plus"/.test(r.html), '入数未登録 → ＋1箱 は出ない (1箱が何個か分からないため)');
 }
 
 console.log('\n[2] 上部の集計');
@@ -176,24 +177,32 @@ console.log('\n[2] 上部の集計');
   ok(/途中 1/.test(r.html), '伝票カードにも途中件数が出る');
 }
 
-console.log('\n[3] 数量パネル (行を開く)');
+console.log('\n[3] 数量パネル ([数量を数える] で開く)');
 {
-  const r = await renderWith([LINE({ found_qty: 82, remaining_qty: 24 })], { open: 'AR1|1|1' });
-  ok(/今から数える箱の入数/.test(r.html), 'パネル: 「今から数える箱の入数」');
-  ok(/すでに数えた箱の入数は変わりません/.test(r.html), 'パネル: 過去の箱は変わらないと明記 (訂正は履歴側)');
+  const r = await renderWith([LINE({ found_qty: 82, remaining_qty: 24 })], { open: 'AR1|1|1', mode: 'qty' });
+  ok(/data-act="plus"[^>]*>＋1箱 \(10個\)</.test(r.html), 'パネル: ＋1箱 (箱を1つ開けるたびの1タップ) はパネルの中');
+  ok(/data-q="pack"[^>]*value="10"/.test(r.html), 'パネル: 入数がマスタから自動で入る');
   ok(/data-q="dec"[^>]*>−</.test(r.html) && /data-q="inc"[^>]*>＋</.test(r.html), 'パネル: 箱数の ＋/− ステッパー');
-  ok(/data-act="addboxes"[^>]*>この箱数を足す</.test(r.html), 'パネル: [この箱数を足す]');
-  ok(/data-act="addloose"[^>]*>バラを足す</.test(r.html), 'パネル: バラの入力');
+  ok(/data-q="loose"/.test(r.html), 'パネル: バラの入力欄');
+  ok(/data-qsum>今回 <b>\+0<\/b> 個 → 保存後 <b>82<\/b> \/ 106 個/.test(r.html),
+    'パネル: 「今回 +N → 保存後 M / 予定」の合計プレビュー (バラも箱もここに足される)');
+  ok(/data-act="addall"[^>]*disabled[^>]*>この分を足す</.test(r.html) || /data-act="addall" disabled[^>]*>この分を足す</.test(r.html),
+    'パネル: [この分を足す] は入力が空なら押せない');
   ok(/data-act="shortage"[^>]*>これ以上来ない — 不足 24個 で確認済みにする</.test(r.html),
     'パネル: 不足で確定は**主ボタンではなくパネル内**に置き、結果を文言に書く');
   ok(/数えた記録/.test(r.html), 'パネル: 数えた記録 (訂正・取り消しの入口)');
+  ok(!/いろは在庫化作業有無/.test(r.html), 'パネル: 入庫情報は混ぜない (行タップで別に開く)');
 
-  const r2 = await renderWith([LINE()], { open: 'AR1|1|1' });
+  const rInfo = await renderWith([LINE({ found_qty: 82, remaining_qty: 24 })], { open: 'AR1|1|1', mode: 'info' });
+  ok(/いろは在庫化作業有無/.test(rInfo.html) && /入数 \(1箱あたりの個数\)/.test(rInfo.html), '行タップ → 入庫情報 (入数・いろは等) だけが開く');
+  ok(!/数えた記録/.test(rInfo.html), '行タップ → 数量パネルは混ざらない');
+
+  const r2 = await renderWith([LINE()], { open: 'AR1|1|1', mode: 'qty' });
   ok(!/data-act="shortage"/.test(r2.html), '0個のときは不足確定を出さない (押し間違いの余地を作らない)');
 
-  const r3 = await renderWith([LINE({ check_status: 'checked', found_qty: 106, quantity_relation: 'exact', finalized_result: 'exact', version: 2 })], { open: 'AR1|1|1', filter: 'all' });
+  const r3 = await renderWith([LINE({ check_status: 'checked', found_qty: 106, quantity_relation: 'exact', finalized_result: 'exact', version: 2 })], { open: 'AR1|1|1', mode: 'qty', filter: 'all' });
   ok(/やり直す<\/b>と編集できる/.test(r3.html), '確定済みのパネルは編集させず「やり直す」に誘導する');
-  ok(!/data-act="addboxes"/.test(r3.html), '確定済みでは数量を足せない');
+  ok(!/data-act="addall"/.test(r3.html), '確定済みでは数量を足せない');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

@@ -84,7 +84,8 @@ function checkOrigin(req, res, next) {
 function access(req, res, next) {
   if (req.path === '/manifest.json') return next();
   // 端末登録の画面と API はログイン不要 (登録コード自体が認証。共用 iPad に管理者パスワードを打たせない)
-  if (req.path === '/enroll' || req.path === '/enroll/redeem') return next();
+  // 手順書も認証なし: 登録がまだ済んでいない iPad からこそ読まれるページのため (中身は手順だけ)
+  if (req.path === '/enroll' || req.path === '/enroll/redeem' || req.path === '/guide') return next();
   if (hasSessionAccess(req)) { req.icUser = req.session.email; return next(); }
   const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
   if (device) { req.icDevice = device; return next(); }
@@ -174,6 +175,12 @@ router.post('/admin/enroll-codes', checkOrigin, requireAdmin, api((req, res) => 
     res.status(400).json({ ok: false, error: 'bad_request', message: e.message });
   }
 }));
+
+// ─── 使い方 (手順書) ───
+// 毎日の使い方 + 初回セットアップ。iPad の作業画面フッターと登録画面から飛べる
+router.get('/guide', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'guide.html'));
+});
 
 // ─── 作業画面 ───
 router.get('/', (req, res) => {
