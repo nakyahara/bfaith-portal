@@ -111,7 +111,10 @@ router.get('/manifest.json', (req, res) => {
   res.json({
     name: '入荷受付チェック', short_name: '入荷チェック', start_url: `${BASE}/`, scope: `${BASE}/`,
     display: 'standalone', orientation: 'any', background_color: '#f8f9fa', theme_color: '#1c7ed6',
-    icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
+    icons: [
+      { src: '/app-icons/inbound-check-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/app-icons/inbound-check-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+    ],
   });
 });
 

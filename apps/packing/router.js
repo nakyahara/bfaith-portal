@@ -1356,7 +1356,10 @@ router.get('/manifest.json', (req, res) => {
     orientation: 'any',   // 梱包台は横向き据置が基本 (要件§6) だが縦でも使えるように
     background_color: '#e9ecef',
     theme_color: '#212529',
-    icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
+    icons: [
+      { src: '/app-icons/packing-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/app-icons/packing-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+    ],
   });
 });
 
