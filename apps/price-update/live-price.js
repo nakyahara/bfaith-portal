@@ -18,6 +18,7 @@
  */
 import { fetchItemDetailsBulkDetailed, fetchAllItemCodes } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
 import { fetchYahooItemDetail } from '../rakuten-yahoo-sync/lib/yahoo-detail-proxy.js';
+import { fetchAupayItemDetail } from './aupay-apply.js';
 import { normCode } from './resolve.js';
 
 /** itemNumber → manageNumber の対応表はそう変わらないので短時間だけ使い回す */
@@ -365,6 +366,98 @@ export async function fetchYahooPrices(targets, deps = {}) {
       price: null, subCodes: [], skuCode: null, itemCode: null, found: false,
       reason: reasons.length ? reasons.join(' / ') : 'Yahooから取得できません',
       itemName: null,
+    });
+  }
+  return out;
+}
+
+/**
+ * au PAY: searchItemInfo で商品ごとの設定価格を取る。
+ *
+ * ★au PAY は Yahoo と同じで「商品」に1つの価格しか持たない。カラバリは
+ *   registerStock 側にあり在庫だけで、価格の項目が無い (2026-09-01 実測)。
+ *   つまり **色ごとの値付けはできず、変えるとその商品の全ての色が同じ価格になる**。
+ *   送り先のキーは商品コード。ここを取り違えると、送った後の照合が必ず食い違う
+ *   ([[feedback_mall_price_granularity_differs]] と同じ罠)。
+ *
+ * @param {Array<{key:string, candidates:string[]}>} targets
+ * @param {object} [deps] テスト用の差し替え ({ fetchAupayItemDetail })
+ * @returns {Promise<Map<string, object>>} key → { price, skuCode, itemCode, found, reason, ... }
+ */
+export async function fetchAupayPrices(targets, deps = {}) {
+  const out = new Map();
+  const list = (targets || [])
+    .map((t) => ({
+      key: normCode(t.key),
+      candidates: [...new Set([t.key, ...(t.candidates || [])].map((c) => String(c || "").trim()).filter(Boolean))],
+    }))
+    .filter((t) => t.key);
+  if (list.length === 0) return out;
+
+  const fetchOne = deps.fetchAupayItemDetail || fetchAupayItemDetail;
+  const gapMs = Number.isInteger(deps.gapMs) ? deps.gapMs : 900;   // 既存の au PAY 取得と同じ間隔
+  const cache = new Map();
+
+  async function detailOf(code) {
+    const k = normCode(code);
+    if (!cache.has(k)) {
+      try { cache.set(k, { ok: true, d: await fetchOne(code) }); }
+      catch (e) { cache.set(k, { ok: false, e }); }
+      if (gapMs > 0) await new Promise((r) => setTimeout(r, gapMs));
+    }
+    return cache.get(k);
+  }
+
+  for (const t of list) {
+    const reasons = [];
+    let resolved = null;
+    for (const cand of t.candidates) {
+      const got = await detailOf(cand);
+      if (!got.ok) { reasons.push(`${cand}: ${got.e?.message || "取得できません"}`); continue; }
+      const d = got.d;
+      if (!d || d.ok === false) {
+        reasons.push(`${cand}: ${d?.message || "au PAY が ok を返しませんでした"}`);
+        continue;
+      }
+      // ★取り違え防止: 応答の商品コードが **問い合わせた候補** と一致すること。
+      //   探しているキー (t.key) と比べると、候補がキーと違う書き方の時に
+      //   正しい商品を「別の商品」として捨ててしまう (Codex R1 中)。
+      //   候補がそのキーの出品であることは、候補を組み立てた側 (resolve) が保証する
+      if (normCode(d.itemCode) !== normCode(cand)) {
+        reasons.push(`${cand}: 別の商品が返りました (応答 ${d.itemCode ?? 'なし'})`);
+        continue;
+      }
+      let price = null;
+      let reason = null;
+      if (d.itemPrice == null) {
+        reason = d.itemPriceReadable
+          ? "設定価格を整数円として読めません"
+          : "価格が返ってきません";
+      } else {
+        price = d.itemPrice;
+      }
+      resolved = {
+        price,
+        // ★送り先は商品コード。au PAY は商品に1つの価格しか持たない
+        skuCode: d.itemCode,
+        itemCode: d.itemCode,
+        found: price != null,
+        reason,
+        itemName: d.itemName || null,
+        // 変えると影響を受ける色の数 (0 = カラバリ無し)
+        choiceCount: d.choiceCount || 0,
+        saleStatus: d.saleStatus || null,
+        lotNumber: d.lotNumber || null,
+        shipping: (d.postageSegment != null || d.deliveryMethodName != null)
+          ? { postageSegment: d.postageSegment, postage: d.postage, methodName: d.deliveryMethodName }
+          : null,
+      };
+      break;
+    }
+    out.set(t.key, resolved || {
+      price: null, skuCode: null, itemCode: null, found: false,
+      reason: reasons.length ? reasons.join(" / ") : "au PAY から取得できません",
+      itemName: null, choiceCount: 0,
     });
   }
   return out;

@@ -55,6 +55,16 @@ export function labelOf(map, id) {
   return name ? `${id} (${name})` : String(id);
 }
 
+/**
+ * au PAY の送料設定区分 (postageSegment)。
+ * ★番号の意味はまだ確かめていない。実物では 2 が返ってくるのを見ただけで、
+ *   どの番号が何を指すかは au PAY の仕様書で確認していない。
+ *   **推測で名前を当てると、送料の読み違いがそのまま粗利の嘘になる**ので、
+ *   分かるまでは番号のまま出す (楽天・Yahoo の表と同じ扱いにはしない)。
+ */
+const AUPAY_POSTAGE_SEGMENTS = {};
+export function aupayPostageLabel(id) { return labelOf(AUPAY_POSTAGE_SEGMENTS, id); }
+
 export function rakutenShippingLabel(id) { return labelOf(RAKUTEN_SHIPPING_METHODS, id); }
 export function yahooPostageLabel(id) { return labelOf(YAHOO_POSTAGE_SETS, id); }
 
