@@ -109,11 +109,23 @@ async function unpublishedKeys({ maxPages = 50, perPage = 100 } = {}) {
     }
     pages++;
     const flat = await flattenXml(text);
+    // ★応答が一覧として読めることを確かめる (Codex R8)。
+    //   空本文・HTML のメンテ画面・壊れた XML は「0件」に見えてしまい、
+    //   「未反映一覧に載っていない = 反映済み」と誤読する。
+    //   この API が <Status>OK</Status> を返すかは未実測なので、
+    //   「ResultSet として読めたか」を条件にする (それなら実測なしで確かめられる)
+    if (![...flat.keys()].some((k) => k.startsWith('ResultSet['))) {
+      throw new Error(`publish-history の応答を一覧として読めません: ${oneLine(text)}`);
+    }
     let found = 0;
     for (const [k, v] of flat) {
       if (/(^|\/)TargetKey\[\d+\]$/.test(k)) { keys.add(String(v).trim().toLowerCase()); found++; }
     }
-    if (found < perPage) { complete = true; break; }   // 最後のページまで読めた
+    // 総件数が分かるならそれで終わりを判断する。分からなければ「1ページに満たなければ終わり」
+    const total = Number(flat.get('ResultSet[0]@totalResultsAvailable'));
+    if (Number.isFinite(total) && total >= 0) {
+      if (start + found - 1 >= total) { complete = true; break; }
+    } else if (found < perPage) { complete = true; break; }
     await sleep(API_GAP_MS);
   }
   // ★上限で打ち切ったら「載っていない」と言い切れない (Codex R3)。
