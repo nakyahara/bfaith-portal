@@ -54,7 +54,7 @@ function saveState(s) {
     unmatched: s.warnings ? JSON.stringify(s.warnings) : null, generated_at: s.generatedAt ?? null,
     error: s.error ?? null,
     // 成功時だけ「次回の判定基準」を進める (失敗で基準が緩むと激減を見逃す)
-    active_staff_count: s.ok ? (s.activeStaffCount ?? null) : (prev?.active_staff_count ?? null),
+    active_staff_count: s.ok ? (s.targetStaffCount ?? null) : (prev?.active_staff_count ?? null),
     last_generated_at: s.ok ? (s.generatedAt ?? prev?.last_generated_at ?? null) : (prev?.last_generated_at ?? null),
   });
 }
@@ -84,7 +84,17 @@ export async function fetchStaffExport(fetchFn = fetch) {
 
 const norm = s => String(s == null ? '' : s).trim();
 const tapName = s => norm(s.short_name) || norm(s.display_name);
-const isActive = s => s.active === 1 || s.active === true;
+
+/**
+ * ここ (ピッキング・梱包) の名前タップに出す人 = **倉庫作業の役割を持つ有効なスタッフ**。
+ * 事務担当 (谷川さん・田中美祐さん・高島さん等) を現場の一覧に並べない (中原さん 2026-09-01)。
+ * ⚠ roles を持たない古い export (役割導入前) は「全員 倉庫」とみなす — 役割が届かないだけで
+ *    現場の名前タップが空になる事故を作らない (fail-open はここだけ。人が減る方向は下の激減ガードが見る)
+ */
+const WAREHOUSE_ROLE = 'warehouse';
+const hasWarehouseRole = s => !Array.isArray(s.roles) || s.roles.includes(WAREHOUSE_ROLE);
+/** この現場 (ピッキング・梱包) の名前タップに出すべき人か = 有効 かつ 倉庫作業の役割あり */
+const isTarget = s => (s.active === 1 || s.active === true) && hasWarehouseRole(s);
 
 /**
  * 名前の照合キー。**空白 (半角/全角) を無視**して比べる。
@@ -118,7 +128,7 @@ function validateStaff(rows) {
     ids.add(id); nos.add(no);
     const s = { ...r, id, staff_no: no, display_name: name };
     // 名前一致の紐付けに使う表示名。有効な人だけ衝突を見る (退職者の同名は紐付け対象にならない)
-    if (isActive(s)) tapNames.set(tapName(s), (tapNames.get(tapName(s)) || 0) + 1);
+    if (isTarget(s)) tapNames.set(tapName(s), (tapNames.get(tapName(s)) || 0) + 1);
     staff.push(s);
   });
   const dupNames = [...tapNames.entries()].filter(([, c]) => c > 1).map(([n]) => n);
@@ -128,7 +138,7 @@ function validateStaff(rows) {
 
 /**
  * 取得済みデータを pk_workers に反映 (単一トランザクション)。
- * @returns {ok:true, staffCount, activeStaffCount, linked, added, renamed, deactivated, warnings[]}
+ * @returns {ok:true, staffCount, targetStaffCount, linked, added, renamed, deactivated, warnings[]}
  *        | {ok:false, error, skipped:true}
  */
 export function applyStaffExport(payload, { fetchedAt = null } = {}) {
@@ -150,10 +160,10 @@ export function applyStaffExport(payload, { fetchedAt = null } = {}) {
   const { staff, errs } = validateStaff(payload.staff);
   if (errs.length) return fail(`スタッフマスタの内容が不正なため適用しません: ${errs.slice(0, 3).join(' / ')}${errs.length > 3 ? ` ほか${errs.length - 3}件` : ''}`);
   if (staff.length === 0) return fail('スタッフが0件のため適用しません (前回の作業者を保持)');
-  const activeStaff = staff.filter(isActive);
+  const targetStaff = staff.filter(isTarget);
   // ③ 激減ガード: 前回**成功時の有効スタッフ数**と比べる (local 一時要員を含む現在値と比べない)
-  if (prev?.active_staff_count > 0 && activeStaff.length * 2 < prev.active_staff_count) {
-    return fail(`有効スタッフ ${activeStaff.length} 名が前回 ${prev.active_staff_count} 名の半分未満のため適用しません (前回を保持)`);
+  if (prev?.active_staff_count > 0 && targetStaff.length * 2 < prev.active_staff_count) {
+    return fail(`有効スタッフ ${targetStaff.length} 名が前回 ${prev.active_staff_count} 名の半分未満のため適用しません (前回を保持)`);
   }
 
   const workers = db.prepare('SELECT code, name, sort, active, staff_id, staff_no, source FROM pk_workers').all();
@@ -200,7 +210,7 @@ export function applyStaffExport(payload, { fetchedAt = null } = {}) {
 
     for (const s of staff) {
       const name = tapName(s);
-      const active = isActive(s) ? 1 : 0;
+      const active = isTarget(s) ? 1 : 0;
       let w = byStaffId.get(s.id);
       if (!w) {
         // 曖昧な名前 (pk_workers に同名が複数) は触らない — 別人に紐づく事故を防ぐ
@@ -248,7 +258,7 @@ export function applyStaffExport(payload, { fetchedAt = null } = {}) {
       ...(unlinkedLocal.length ? [`スタッフマスタ未登録: ${unlinkedLocal.join('、')}`] : []),
     ];
     return {
-      ok: true, staffCount: staff.length, activeStaffCount: activeStaff.length,
+      ok: true, staffCount: staff.length, targetStaffCount: targetStaff.length,
       linked, added, renamed, deactivated, warnings, generatedAt,
       // 互換 (既存の呼び出し・表示が unmatched を見ている場合)
       unmatched: warnings,

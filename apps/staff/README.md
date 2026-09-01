@@ -21,6 +21,16 @@
 | `joined_on` / `left_on` / `active` | 入社日・退職日・有効 (無効化で `left_on` を自動セット、再有効化でクリア) |
 | `sort` / `note` / `version` | 並び・メモ・楽観ロック |
 
+`staff_roles` = **役割** (どの現場の名前タップに出すか。1人が複数持てる):
+
+| role | ラベル | 効果 |
+|---|---|---|
+| `warehouse` | 倉庫作業 | ピッキング・梱包・入荷受付チェックの名前タップに**出る** |
+| `office` | 事務 | 倉庫系アプリには出ない (事務担当を現場の一覧に並べない — 中原さん 2026-09-01) |
+
+`listTapCandidates()` は既定で `warehouse` だけを返す。全員が欲しい呼び出し側は `{ role: null }` を渡す。
+役割は管理画面のチェックボックスで即保存 (行の「保存」とは独立)。
+
 `staff_audit` = 変更履歴 (append-only: create / update / deactivate / reactivate / seed、before/after JSON、actor)。
 
 ## 使っているアプリ

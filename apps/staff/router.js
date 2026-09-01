@@ -13,8 +13,8 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
-  listStaff, getStaff, createStaff, updateStaff, setStaffActive, listAudit, listTapCandidates,
-  STAFF_KINDS, STAFF_KIND_LABELS,
+  listStaff, getStaff, createStaff, updateStaff, setStaffActive, setStaffRoles, listAudit, listTapCandidates,
+  STAFF_KINDS, STAFF_KIND_LABELS, STAFF_ROLES, STAFF_ROLE_LABELS,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -65,6 +65,7 @@ router.get('/export', (req, res) => {
   res.json({ ok: true, generated_at: new Date().toISOString(), staff: listStaff({ includeInactive: true }).map(s => ({
     id: s.id, staff_no: s.staff_no, display_name: s.display_name, short_name: s.short_name, kind: s.kind,
     portal_email: s.portal_email, active: s.active, sort: s.sort, updated_at: s.updated_at, version: s.version,
+    roles: s.roles,   // 取込側 (miniPC の picking/packing) は warehouse の人だけを名前タップに出す
   })) });
 });
 
@@ -82,6 +83,8 @@ router.get('/', (req, res) => {
     staff: listStaff({ includeInactive: true }),
     kinds: STAFF_KINDS,
     kindLabels: STAFF_KIND_LABELS,
+    roles: STAFF_ROLES,
+    roleLabels: STAFF_ROLE_LABELS,
     exportEnabled: !!process.env.STAFF_EXPORT_TOKEN,
   });
 });
@@ -89,6 +92,7 @@ router.get('/', (req, res) => {
 router.get('/api/list', api((req, res) => {
   res.json({ ok: true, staff: listStaff({ includeInactive: req.query.all === '1' }), candidates: listTapCandidates() });
 }));
+
 
 router.get('/api/staff/:id(\\d+)', api((req, res) => {
   const s = getStaff(req.params.id);
@@ -101,6 +105,16 @@ router.post('/api/staff', checkOrigin, api((req, res) => {
 }));
 
 const statusOf = r => (r.error === 'not_found' ? 404 : r.error === 'conflict' ? 409 : 400);
+
+// 役割の付け外し (倉庫作業 / 事務)。倉庫系アプリの名前タップに出すかを決める
+router.post('/api/staff/:id(\\d+)/roles', checkOrigin, api((req, res) => {
+  const { roles } = req.body || {};
+  if (!Array.isArray(roles)) return res.status(400).json({ ok: false, error: 'bad_request', message: 'roles は配列で指定してください' });
+  const r = setStaffRoles(req.params.id, roles, req.session.email);
+  if (!r.ok) return res.status(statusOf(r)).json(r);
+  res.json(r);
+}));
+
 
 // expect_version は必須の正整数 (省略で楽観ロックを迂回させない — Codex R4 High)
 router.post('/api/staff/:id(\\d+)', checkOrigin, api((req, res) => {
