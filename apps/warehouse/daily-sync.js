@@ -1208,16 +1208,24 @@ async function main() {
             signal: AbortSignal.timeout(60000),
           });
           const data = await resp.json().catch(() => ({}));
+          // 原価が取れず 0円計上の商品があれば、読み手がそのまま直しに行ける形で出す
+          // (「partial: fba_warehouse」だけでは何をすればいいか分からない)。skip の日も残っていれば出す
+          const costNoteOf = (d) => {
+            if (!(d.unresolved_cost_count > 0)) return '';
+            const historyUrl = d.history_path ? url.replace(/\/apps\/inventory-monthly\/api\/save-month-end$/, '') + d.history_path : '';
+            return `\n   🚨 原価未登録で0円計上の商品 ${d.unresolved_cost_count}件 (数量${d.unresolved_cost_qty}個) → 履歴詳細ページで原価を入力: ${historyUrl}`;
+          };
           if (resp.ok && data.ok && data.skipped) {
             // 既存 snapshot あり (手動入力 pending 等を保護するため上書きしない)
             console.log(`[月末確定値] スキップ: ${data.reason}`);
-            results.push({ name: '月末確定値', success: true, skipped: true, summary: `⏸️ ${data.snapshot_date} 既存あり (id=${data.snapshot_id})` });
+            results.push({ name: '月末確定値', success: true, skipped: true, summary: `⏸️ ${data.snapshot_date} 既存あり (id=${data.snapshot_id})${costNoteOf(data)}` });
           } else if (resp.ok && data.ok) {
             const { snapshot_date, source_business_date, totals, partial_categories } = data;
             const partialNote = (partial_categories && partial_categories.length > 0) ? ` (partial: ${partial_categories.join(',')})` : '';
             const sourceNote = source_business_date ? ` (source=${source_business_date}朝)` : '';
-            console.log(`[月末確定値] 保存成功: ${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${sourceNote}${partialNote}`);
-            results.push({ name: '月末確定値', success: true, summary: `${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${sourceNote}${partialNote}` });
+            const costNote = costNoteOf(data);
+            console.log(`[月末確定値] 保存成功: ${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${sourceNote}${partialNote}${costNote}`);
+            results.push({ name: '月末確定値', success: true, summary: `${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${sourceNote}${partialNote}${costNote}` });
           } else {
             const err = data.error || `HTTP ${resp.status}`;
             console.error(`[月末確定値] 保存失敗:`, err);
