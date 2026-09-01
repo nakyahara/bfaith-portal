@@ -1693,6 +1693,34 @@ const server = http.createServer(async (req, res) => {
 });
 
 /**
+ * 応答が「ルートが ResultSet の、タグの閉じた XML」か。
+ * ★VPS プロキシは依存ゼロで運用しているので XML パーサは入れない。
+ *   完全な XML 検証はしないが、**タグの入れ子が閉じているか** は見る。
+ *   これを見ないと <ResultSet><Result></ResultSet> のような壊れた応答が通る (Codex R13)。
+ */
+function isWellFormedResultSet(xml) {
+  // 宣言・コメント・CDATA は中身を見ない (中に < > が入るため)
+  const text = String(xml || '')
+    .replace(/<\?[\s\S]*?\?>/g, '')
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '');
+  const stack = [];
+  const re = /<(\/?)([A-Za-z][\w.:-]*)(?:\s[^>]*?)?(\/?)>/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const [, closing, name, selfClose] = m;
+    if (selfClose) continue;
+    if (closing) {
+      if (stack.pop() !== name) return false;      // 閉じ方が合わない
+    } else {
+      if (stack.length === 0 && name !== 'ResultSet') return false;   // ルートが違う
+      stack.push(name);
+    }
+  }
+  return stack.length === 0 && /<ResultSet[\s>]/.test(text);
+}
+
+/**
  * Yahoo の応答が成功か。
  * ★HTTP 200 でも本文に Status NG や Error が入っていることがある。
  *   NG だけを見ると「HTTP 200 + <Error>」を成功扱いしてしまう (Codex R5)。
@@ -1706,11 +1734,10 @@ function yahooXmlOk(res) {
   // ★応答が途中で切れていないことも見る (Codex R11)。
   //   VPS には XML パーサを入れていないので厳密な検証はしないが、
   //   ルート要素が開いて閉じていることだけは確かめる (切断された応答を成功にしない)
-  //   ★ルート要素は ResultSet であること。限定しないと <html>...<Status>OK</Status>...</html> のような
-  //     ページが通ってしまう (Codex R12)
-  const root = text.replace(/^\s*<\?xml[^>]*\?>\s*/i, '').match(/^\s*<([A-Za-z][\w.:-]*)(?:\s[^>]*)?>/);
-  if (!root || root[1] !== 'ResultSet') return false;
-  if (!/<\/ResultSet\s*>\s*$/i.test(text.trim())) return false;
+  //   ★ルート要素は ResultSet で、タグの入れ子が閉じていること (Codex R12/R13)。
+  //     限定しないと <html>...<Status>OK</Status>...</html> が通り、
+  //     入れ子を見ないと <ResultSet><Result></ResultSet> のような壊れた XML も通る
+  if (!isWellFormedResultSet(text)) return false;
   if (/<Status>\s*NG\s*<\/Status>/i.test(text)) return false;
   // ★中身のある <Error> だけを失敗とする。
   //   Yahoo は空の自己終了タグを「無し」の意味で使う (実測した submitItem の成功応答に
@@ -1983,6 +2010,14 @@ function runSelfTest() {
     yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status>' }), false);
   check('yahoo応答: 末尾に改行があっても成功のまま',
     yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status></Result></ResultSet>' + String.fromCharCode(10) }), true);
+  check('yahoo応答: ★入れ子が閉じていない XML は成功にしない',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status><Result></ResultSet>' }), false);
+  check('yahoo応答: 閉じ方が食い違う XML も成功にしない',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status><A><B></A></B></ResultSet>' }), false);
+  check('yahoo応答: CDATA に < > が入っていても成功のまま',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status><Name><![CDATA[<b>太字</b>]]></Name></ResultSet>' }), true);
+  check('yahoo応答: 自己終了タグがあっても成功のまま',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status><Warning/></Result></ResultSet>' }), true);
   check('yahoo応答: ★HTML の中に Status OK があっても成功にしない',
     yahooXmlOk({ status: 200, body: '<html><body><Status>OK</Status></body></html>' }), false);
   check('yahoo応答: ★ルートが ResultSet 以外なら成功にしない',
