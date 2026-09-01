@@ -45,13 +45,17 @@ export const JOBS_REGISTRY = [
     type: 'heartbeat',
     importance: 'P2',
     owner: '中原さん',
-    purpose: 'Drive出荷_noのピッキングリストCSVを2分間隔で自動取込 (RPAのPOST欠落・手動配置の自己回復)。PickingServer内の常駐ループで、独立したスケジュールタスクではない',
+    purpose: 'Drive出荷_noのピッキングリストCSVを2分間隔で自動取込 (RPAのPOST欠落・手動配置の自己回復)。'
+      + 'スタッフマスタ同期 (Render apps/staff → pk_workers。名前タップを人の正本と揃える。1時間に1回・'
+      + 'env STAFF_EXPORT_TOKEN 未設定なら何もしない・fail-closedで前回の作業者を保つ) もこのループの1ステップ (2026-09-01)。'
+      + 'PickingServer内の常駐ループで、独立したスケジュールタスクではない',
     where: 'miniPC PickingServer (apps/picking/drive-sync.js startDrivePoller)',
     schedule: '常駐 (120秒間隔・env PICKING_POLL_INTERVAL_SEC。生存 ping は1時間に1回へ間引き)',
     // ping間引き1時間の3倍。ポーリング失敗が続いた場合も ping が止まりここに出る
     max_age_hours: 3,
     lifecycle: 'permanent',
-    runbook: 'C:\\tools\\picking-service\\PickingServer.out.log の [picking-drive-poller] を確認。失敗台帳は picking.db pk_drive_imports。'
+    runbook: 'C:\\tools\\picking-service\\PickingServer.out.log の [picking-drive-poller] / [picking-staff-sync] を確認。失敗台帳は picking.db pk_drive_imports。'
+      + 'スタッフ同期の状態は /apps/picking/admin/devices の「作業者マスタ」に最終同期として出る (手動同期ボタンあり)。'
       + 'ping には miniPC の C:\\tools\\bfaith-picking\\.env に JOBS_MONITOR_TOKEN が必要。復旧は Restart-Service PickingServer',
   },
   {

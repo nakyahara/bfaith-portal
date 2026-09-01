@@ -31,6 +31,7 @@ import { allPatternNames } from './patterns.js';
 import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
 import { enqueueBatchSync, fetchNotionWorkerNames, STATUS_PICKING, STATUS_PICKED } from './notion.js';
 import { getFloorData } from './floor.js';
+import { syncStaff, isStaffSyncConfigured, getStaffSyncState } from './staff-sync.js';
 // ロケーション動線マスタ (NEXTサイン)。起動時にマスタが空なら同梱CSVで初期化する
 import {
   listFaces, importFaces, parseFacesCsv, validateFaces, knownLocationsFromLines,
@@ -767,8 +768,20 @@ router.get('/admin/devices', requireAdmin, (req, res) => {
     isAdmin: true,
     devices: listDevices(),
     workers: listWorkers(true),
+    staffSync: { configured: isStaffSyncConfigured(), state: getStaffSyncState() },
   });
 });
+
+/**
+ * スタッフマスタ (Render apps/staff) から今すぐ同期する。
+ * 通常は drive-poller が1時間に1回自動で行う (この画面の「最終同期」に出る)。
+ */
+router.post('/admin/workers/sync-staff', checkOrigin, requireAdmin, api(async (req, res) => {
+  if (!isStaffSyncConfigured()) {
+    throw new PkError(400, 'staff_sync_disabled', 'STAFF_EXPORT_TOKEN が未設定です (miniPC の .env に設定してください)');
+  }
+  res.json({ ok: true, result: await syncStaff() });
+}));
 
 /**
  * この端末を登録する。発行したトークンは httpOnly Cookie としてこの端末にだけ渡す

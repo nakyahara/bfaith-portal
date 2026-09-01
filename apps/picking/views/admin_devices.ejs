@@ -83,8 +83,29 @@
 
     <div class="pk-form">
       <h2>作業者マスタ (作業画面で名前タップで選ぶリスト)</h2>
+      <p class="hint" style="font-size:0.85em; color:#495057; margin:0 0 10px; line-height:1.6;">
+        名前の正本は<b>ポータルの「👥 スタッフマスタ」</b>です (勤怠・シフトの親)。1時間に1回自動で取り込み、
+        <b>追加・改名・退職 (無効化) が反映</b>されます。ここでの追加は、スタッフマスタに載せない一時要員のときだけ使ってください。<br>
+        <% if (staffSync && staffSync.configured) { %>
+          最終同期:
+          <% if (staffSync.state) { %>
+            <span data-jst="<%= staffSync.state.synced_at %>"></span>
+            <% if (staffSync.state.ok) { %>
+              ✅ スタッフ <%= staffSync.state.staff_count %> 名 (追加 <%= staffSync.state.added %> / 紐付け <%= staffSync.state.linked %> / 改名 <%= staffSync.state.renamed %> / 無効化 <%= staffSync.state.deactivated %>)
+              <% if (staffSync.state.unmatchedNames && staffSync.state.unmatchedNames.length) { %>
+                <br><span style="color:#d9480f">⚠ スタッフマスタに無い作業者: <%= staffSync.state.unmatchedNames.join(', ') %> (ポータルのスタッフマスタに登録してください。ここでは自動で無効化しません)</span>
+              <% } %>
+            <% } else { %>
+              <span style="color:#c92a2a">❌ <%= staffSync.state.error %></span>
+            <% } %>
+          <% } else { %>まだ一度も同期していません<% } %>
+        <% } else { %>
+          <span style="color:#d9480f">⚠ STAFF_EXPORT_TOKEN が未設定のため自動同期は動きません (miniPC の .env と Render の env に設定してください)</span>
+        <% } %>
+      </p>
       <div class="pk-row-inline" style="margin-bottom:10px">
-        <input type="text" id="workerName" placeholder="作業者名 (例: 星)" maxlength="20">
+        <button id="syncStaffBtn" type="button">👥 スタッフマスタから今すぐ同期</button>
+        <input type="text" id="workerName" placeholder="一時要員の名前" maxlength="20">
         <button id="addWorkerBtn" type="button">追加</button>
         <button id="importNotionBtn" type="button">Notionから取込</button>
         <span id="workerMsg" class="pk-msg"></span>
@@ -93,16 +114,17 @@
         「Notionから取込」= スタッフ用デイリー業務の「ピッキング担当者」の選択肢を追加します
         (表記をNotionと揃えると、カードの担当者が自動でセットされます)</p>
       <table class="pk-list">
-        <thead><tr><th>コード</th><th>名前</th><th></th></tr></thead>
+        <thead><tr><th>コード</th><th>名前</th><th>出所</th><th></th></tr></thead>
         <tbody>
           <% for (const w of workers) { %>
             <tr class="<%= w.active ? '' : 'inactive' %>">
               <td><%= w.code %></td>
               <td><%= w.name %></td>
+              <td><%= w.source === 'staff' ? '👥 ' + (w.staff_no || 'スタッフ') : 'この画面' %></td>
               <td><button class="btn-sm btn-toggle" data-code="<%= w.code %>"><%= w.active ? '無効化' : '有効化' %></button></td>
             </tr>
           <% } %>
-          <% if (workers.length === 0) { %><tr><td colspan="3" style="color:#868e96">まだ登録がありません</td></tr><% } %>
+          <% if (workers.length === 0) { %><tr><td colspan="4" style="color:#868e96">まだ登録がありません</td></tr><% } %>
         </tbody>
       </table>
     </div>
@@ -135,6 +157,30 @@
       const { ok } = await post(`/apps/picking/admin/devices/${btn.dataset.id}/revoke`);
       if (ok) location.reload();
     }));
+
+    // 日時を JST で表示 (サーバーは UTC ISO で渡す)
+    document.querySelectorAll('[data-jst]').forEach((el) => {
+      const v = el.getAttribute('data-jst');
+      const d = v ? new Date(v) : null;
+      el.textContent = d && !Number.isNaN(d.getTime())
+        ? new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(d)
+        : (v || '-');
+    });
+
+    const syncStaffBtn = $('syncStaffBtn');
+    if (syncStaffBtn) syncStaffBtn.addEventListener('click', async () => {
+      $('workerMsg').textContent = 'スタッフマスタから同期中…'; $('workerMsg').className = 'pk-msg';
+      const { ok, body } = await post('/apps/picking/admin/workers/sync-staff');
+      if (!ok || body.result?.ok === false) {
+        $('workerMsg').textContent = body.error || body.result?.error || '失敗しました';
+        $('workerMsg').className = 'pk-msg err';
+        return;
+      }
+      const r = body.result;
+      alert(`スタッフ ${r.staffCount} 名を反映しました\n追加 ${r.added} / 紐付け ${r.linked} / 改名 ${r.renamed} / 無効化 ${r.deactivated}`
+        + (r.unmatched?.length ? `\n\n⚠ スタッフマスタに無い作業者: ${r.unmatched.join('、')}` : ''));
+      location.reload();
+    });
 
     $('importNotionBtn').addEventListener('click', async () => {
       $('workerMsg').textContent = '取込中…'; $('workerMsg').className = 'pk-msg';
