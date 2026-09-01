@@ -23,7 +23,7 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
 ## データの流れ
 
 ```
-【自動 (通常)】miniPC Logizard-NyukaCSV (毎日 08:30 / 12:00)
+【自動 (通常)】miniPC Logizard-NyukaCSV (毎日 08:40 / 11:45)
   ロジザード 入荷状況照会[FA04_01] (受付済・当日から7日前) → CSV → rclone → 共有ドライブ nyuka_uketsuke.csv
   → Render が30分おきに取得 (JST 6〜20時台。同じ内容なら取り込まない)
 【手動 (自動が止まったとき)】管理画面から CA04001_*.csv をアップロード
