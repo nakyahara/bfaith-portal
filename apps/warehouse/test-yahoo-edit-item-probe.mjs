@@ -96,6 +96,13 @@ console.log('\n── 価格の読み方 ──');
   eq(itemPriceOf(real, 'zz-1'), 1080, '★商品本体の価格を取る (SKU の価格と取り違えない)');
   eq(itemBaseOf(await flattenXml('<R><Price>100</Price></R>'), 'zz-1'), null, 'ItemCode が無ければ場所を決めない');
   eq(itemPriceOf(await flattenXml('<R><Price>100</Price></R>'), 'zz-1'), null, '場所が分からなければ価格も読まない');
+  // ★知らない構造は動かさない。入れ子に ItemCode・目印つき Name・Price が揃っていても通さない (Codex R6)
+  const fake = await flattenXml('<ResultSet><Result><ItemCode>real-1</ItemCode><Name>本物</Name><Price>500</Price>'
+    + '<Related><Item><ItemCode>zz-1</ItemCode><Name>zz検証用</Name><Price>1</Price></Item></Related></Result></ResultSet>');
+  eq(itemBaseOf(fake, 'zz-1'), null, '★入れ子の商品らしき要素は商品本体にしない');
+  ok(guardTestItem(fake, 'zz-1'), '★門番も通さない');
+  const odd = await flattenXml('<Other><Thing><ItemCode>zz-1</ItemCode><Name>zz検証用</Name><Price>1</Price></Thing></Other>');
+  eq(itemBaseOf(odd, 'zz-1'), null, '★ResultSet > Result 以外の形は知らない構造として扱う');
   eq(itemPriceOf(await flattenXml('<ResultSet><Result><ItemCode>x</ItemCode><Price>お問い合わせ</Price></Result></ResultSet>'), 'x'),
     null, '整数で読めなければ null');
 

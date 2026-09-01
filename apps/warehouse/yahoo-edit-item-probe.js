@@ -59,10 +59,16 @@ export function itemBaseOf(flat, expectedItemCode) {
   const hits = [];
   for (const [k, v] of flat) {
     const m = String(k).match(/^(.*)\/ItemCode\[\d+\]$/);
-    if (m && String(v).trim().toLowerCase() === want) hits.push(m[1]);
+    // ★商品要素の形も限定する (Codex R6)。ItemCode を持つ要素なら何でも商品本体、にすると、
+    //   入れ子の要素に ItemCode・目印つき Name・Price が揃っていれば門番を通ってしまう。
+    //   実測の形 (ResultSet > Result) 以外は「知らない構造」として動かさない側に倒す
+    if (m && ITEM_BASE_SHAPE.test(m[1]) && String(v).trim().toLowerCase() === want) hits.push(m[1]);
   }
   return hits.length === 1 ? hits[0] : null;
 }
+
+/** 商品本体の道すじの形 (実測 2026-09-01: getItem は ResultSet > Result の二段) */
+export const ITEM_BASE_SHAPE = /^ResultSet\[\d+\]\/Result\[\d+\]$/;
 
 /**
  * 取ってきた商品が「捨ててよい検証用商品」か。問題なければ null、駄目なら理由。
