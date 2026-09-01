@@ -108,6 +108,13 @@ console.log('\n── 価格の読み方 ──');
     + '<Name>zz検証用</Name><Price>100</Price></Result></ResultSet>');
   eq(itemBaseOf(twoCodes, 'zz-1'), null, '★直下の ItemCode が2つあれば特定できた扱いにしない');
   ok(guardTestItem(twoCodes, 'zz-1'), '門番も通さない');
+  // ★きれいな Result と、壊れた形の同コード Result が並んでいたら、きれいな方を採らない (Codex R8)
+  const cleanPlusBroken = await flattenXml('<ResultSet>'
+    + '<Result><ItemCode>zz-1</ItemCode><Name>zz検証用</Name><Price>100</Price></Result>'
+    + '<Result><ItemCode>zz-1</ItemCode><ItemCode>other-1</ItemCode><Name>別物</Name><Price>200</Price></Result>'
+    + '</ResultSet>');
+  eq(itemBaseOf(cleanPlusBroken, 'zz-1'), null, '★同じコードを名乗る商品が2つあれば、きれいな方を採らない');
+  ok(guardTestItem(cleanPlusBroken, 'zz-1'), '門番も通さない');
   eq(itemPriceOf(await flattenXml('<ResultSet><Result><ItemCode>x</ItemCode><Price>お問い合わせ</Price></Result></ResultSet>'), 'x'),
     null, '整数で読めなければ null');
 

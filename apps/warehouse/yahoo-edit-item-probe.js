@@ -67,13 +67,14 @@ export function itemBaseOf(flat, expectedItemCode) {
     if (!byBase.has(m[1])) byBase.set(m[1], []);
     byBase.get(m[1]).push(String(v).trim().toLowerCase());
   }
-  const hits = [];
-  for (const [base, codes] of byBase) {
-    // ★直下の ItemCode がちょうど1個で、その値が一致する時だけ。
-    //   「一致するものが1個あればよい」にすると、別コードが並んでいても通ってしまう (Codex R7)
-    if (codes.length === 1 && codes[0] === want) hits.push(base);
-  }
-  return hits.length === 1 ? hits[0] : null;
+  // ★まず「指定コードを名乗る商品要素」を数える。2つ以上あるなら、片方が壊れた形でも決めない。
+  //   ここで「きれいな方を採る」と、もう片方の存在を見なかったことにしてしまう (Codex R8)
+  const mentioning = [...byBase.entries()].filter(([, codes]) => codes.includes(want));
+  if (mentioning.length !== 1) return null;
+  // ★その1つの直下の ItemCode がちょうど1個であること。
+  //   「一致するものが1個あればよい」だと、別コードが並んでいても通ってしまう (Codex R7)
+  const [base, codes] = mentioning[0];
+  return codes.length === 1 ? base : null;
 }
 
 /** 商品本体の道すじの形 (実測 2026-09-01: getItem は ResultSet > Result の二段) */
