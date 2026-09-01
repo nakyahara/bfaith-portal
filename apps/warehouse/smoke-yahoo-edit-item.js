@@ -38,6 +38,8 @@ const TIMEOUT_MS = 30_000;
 /** 送信がタイムアウトした後、遅れて効いてくる変更を捕まえるための待ち時間 */
 const SETTLE_WAIT_MS = 15_000;
 const SETTLE_ROUNDS = 3;
+/** 価格の上限 (楽天側のガードと同じ)。これ以上は検証用としても扱わない */
+const MAX_PRICE = 999999999;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const args = process.argv.slice(2);
@@ -116,8 +118,10 @@ async function main() {
     console.log('\n--live を付けると、価格だけを送って前後を突き合わせます。');
     return;
   }
-  if (!Number.isInteger(currentPrice) || currentPrice <= 0) {
-    throw new Error('いまの価格を整数で読めないため、書き込みは行いません');
+  // ★+1 した後の値まで妥当か見る。上限ぎりぎりだと足した瞬間に扱えない数になり、
+  //   「変わっていないのに変わった」と読める (Codex R5)
+  if (!Number.isSafeInteger(currentPrice) || currentPrice <= 0 || currentPrice >= MAX_PRICE) {
+    throw new Error(`いまの価格 (${currentPrice}) が 1〜${(MAX_PRICE - 1).toLocaleString()} の整数ではないため、書き込みは行いません`);
   }
 
   const probePrice = currentPrice + 1;
