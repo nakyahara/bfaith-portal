@@ -128,5 +128,28 @@ for (const name of ['index.ejs', 'run.ejs']) {
   ok(!html.includes('alert(1)' + CLOSE_TAG), 'script を抜け出せていない');
 }
 
+// 出品ページのリンクは http(s) だけ
+{
+  const file = path.join(HERE, 'views', 'run.ejs');
+  const render = (url) => ejs.render(fs.readFileSync(file, 'utf8'), {
+    title: '履歴', displayName: 'テスト', isAdmin: false,
+    run: {
+      run_id: 'pur-url', created_at: '2026-09-01T01:02:03.000Z', created_by: 't@example.com',
+      kind: 'normal', note: null, neCodes: ['abc-001'], limits: {},
+      operations: [{
+        operation_id: 'puo-1', mall: 'rakuten', ne_code: 'abc-001', row_kind: 'single',
+        product_name: '商品', listing_code: 'abc-001', sku_code: 'sku-a', confidence: 'confirmed',
+        price_source: '楽天RMS (ライブ)', expected_current_price: 1000, new_price: 1200,
+        initial_state: 'previewed', state: 'previewed', guard_json: null, product_url: url,
+      }],
+      events: [],
+    },
+  }, { filename: file });
+  ok(render('https://item.rakuten.co.jp/x/y/').includes('>開く</a>'), '正しい URL はリンクになる');
+  ok(!render('javascript:alert(1)').includes('開く</a>'), '★javascript: の URL はリンクにしない');
+  ok(!render('javascript:alert(1)').includes('javascript:'), 'href に入れない');
+  ok(!render('  JavaScript:alert(1)').includes('開く</a>'), '前後の空白・大文字でもすり抜けない');
+}
+
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
 process.exitCode = failed === 0 ? 0 : 1;

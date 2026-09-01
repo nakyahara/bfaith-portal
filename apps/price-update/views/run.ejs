@@ -44,6 +44,12 @@
     blocked: 'ガードで停止', skipped: '送っていない',
   };
   var CONF_LABEL = { confirmed: '確定', rule: '規則推定', sales: '実績のみ', unresolved: '未解決' };
+  // ★href に入れてよいのは http(s) だけ (javascript: を踏ませない)
+  var safeUrl = function (u) {
+    var v = String(u == null ? '' : u).trim();
+    var lower = v.toLowerCase();
+    return (lower.indexOf('https://') === 0 || lower.indexOf('http://') === 0) ? v : null;
+  };
 %>
 <div class="topbar" style="margin-top:-1px">
   <span class="pu-title">💴 価格一括改定 — 履歴</span>
@@ -118,7 +124,7 @@
                     <%= o.state === 'manual_done' ? '取り消す' : '手動更新した' %>
                   </button>
                 <% } %>
-                <% if (o.product_url) { %><a href="<%= o.product_url %>" target="_blank" rel="noopener">開く</a><% } %>
+                <% var href = safeUrl(o.product_url); if (href) { %><a href="<%= href %>" target="_blank" rel="noopener">開く</a><% } %>
               </td>
             </tr>
           <% }); %>
