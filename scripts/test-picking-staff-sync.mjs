@@ -35,18 +35,20 @@ console.log('\n[1] migration v12');
 
 console.log('\n[2] 初回同期 (名前一致で紐付け + 新規追加)');
 {
-  // 既に picking で使われている作業者 (Notion 由来の表記)
-  addWorker('星 立夏');
-  addWorker('田中 美祐');
+  // 既に picking で使われている作業者。⭐実データは**空白なし**の表記で、スタッフマスタは空白あり
+  // (2026-09-01 の実障害: 完全一致の照合で紐付かず二重登録された)
+  addWorker('星立夏');
+  addWorker('田中美祐');
   addWorker('派遣 太郎');            // スタッフマスタに無い人 (触ってはいけない)
   const r = applyStaffExport(payload([
     staff(1, '0001', '中原 大輔'),
-    staff(2, '20250901', '星 立夏', { short_name: '星' }),
+    staff(2, '20250901', '星 立夏'),
     staff(3, '20240901', '田中 美祐'),
   ]));
-  ok(r.ok && r.linked === 2 && r.added === 1, `紐付け2・追加1 (linked=${r.linked} added=${r.added})`);
-  ok(r.renamed === 1, '短い表記「星」へ改名 1件');
-  ok(workerByName('星').staff_id === 2 && workerByName('星').staff_no === '20250901', '星 立夏 → 「星」に改名して staff_id 紐付け');
+  ok(r.ok && r.linked === 2 && r.added === 1, `空白の有無を無視して紐付け2・追加1 (linked=${r.linked} added=${r.added})`);
+  ok(r.renamed === 0, '空白の有無だけの違いでは改名しない (現場の表記=過去実績と繋がったまま)');
+  ok(workerByName('星立夏').staff_id === 2 && workerByName('星立夏').staff_no === '20250901', '「星立夏」に staff_id を紐付け (現場の表記は据え置き)');
+  ok(listWorkers(true).length === 4, '二重登録しない (4名: 星立夏・田中美祐・派遣 太郎・中原 大輔)');
   ok(workerByName('中原 大輔').source === 'staff' && workerByName('中原 大輔').active === 1, '新規スタッフを追加');
   ok(workerByName('派遣 太郎').staff_id === null && workerByName('派遣 太郎').source === 'local', 'スタッフマスタに無い人は触らない (local のまま)');
   ok(r.warnings.some(w => w.includes('派遣 太郎')), `未登録者が警告に出る (${r.warnings.join(' / ')})`);
@@ -64,10 +66,11 @@ console.log('\n[3] 2回目 (staff_id で再照合・改名・無効化)');
     staff(4, '20260701', '有國 陽'),                                 // 新規
   ], '2026-09-02T01:00:00Z'));
   ok(r.ok && r.linked === 0, '2回目は名前一致に頼らない (linked=0)');
-  ok(r.renamed === 1 && workerByName('星さん').staff_id === 2, 'staff_id で照合して改名に追従');
+  ok(r.renamed === 1 && workerByName('星さん')?.staff_id === 2, `実質的な改名 (短い表記) には追従する (renamed=${r.renamed})`);
+  ok(listWorkers(true).find(w => w.staff_id === 3)?.name === '田中美祐', '空白違いのままの人は改名されない');
   ok(r.deactivated === 1 && listWorkers(true).find(w => w.staff_id === 3).active === 0, '退職者を無効化');
   ok(r.added === 1 && workerByName('有國 陽'), '新規スタッフを追加');
-  ok(listWorkers().every(w => w.name !== '田中 美祐'), '無効化された人は名前タップに出ない');
+  ok(listWorkers().every(w => w.name !== '田中美祐' && w.name !== '田中 美祐'), '無効化された人は名前タップに出ない');
   ok(workerByName('派遣 太郎').active === 1, 'スタッフマスタに無い人は有効のまま (勝手に消さない)');
   ok(listWorkers(true).length === 5, '行は消えない (5名)');
 }

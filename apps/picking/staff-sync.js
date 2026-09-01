@@ -86,6 +86,14 @@ const norm = s => String(s == null ? '' : s).trim();
 const tapName = s => norm(s.short_name) || norm(s.display_name);
 const isActive = s => s.active === 1 || s.active === true;
 
+/**
+ * 名前の照合キー。**空白 (半角/全角) を無視**して比べる。
+ * 🚨 2026-09-01 実障害: picking の既存作業者は「中原大輔」、スタッフマスタは「中原 大輔」で、
+ * 完全一致の照合では紐付かず10名が二重登録された (現場の名前タップが23名になった)。
+ * 姓名の間の空白は同じ人の表記ゆれなので、照合では落とす。NFKC で全角英数の揺れも吸収する。
+ */
+const nameKey = s => norm(s).normalize('NFKC').replace(/[\s　]+/g, '');
+
 /** id は正整数 (数字文字列も受ける)。それ以外は null */
 function staffId(v) {
   const n = typeof v === 'number' ? v : (/^\d+$/.test(norm(v)) ? Number(norm(v)) : NaN);
@@ -160,17 +168,18 @@ export function applyStaffExport(payload, { fetchedAt = null } = {}) {
   }
 
   const result = db.transaction(() => {
-    // 名前一致の候補 (未紐付けのみ)。同名が2行以上ある名前は「曖昧」として紐付けに使わない
+    // 名前一致の候補 (未紐付けのみ)。照合キーは空白を無視する (表記ゆれ対策)。
+    // 同じキーの行が2つ以上ある名前は「曖昧」として紐付けに使わない
     const nameCount = new Map();
     for (const w of workers) {
       if (w.staff_id != null) continue;
-      const k = norm(w.name);
+      const k = nameKey(w.name);
       if (k) nameCount.set(k, (nameCount.get(k) || 0) + 1);
     }
     const byName = new Map();
     for (const w of workers) {
       if (w.staff_id != null) continue;
-      const k = norm(w.name);
+      const k = nameKey(w.name);
       if (k && nameCount.get(k) === 1) byName.set(k, w);
     }
     const ambiguous = new Set([...nameCount.entries()].filter(([, c]) => c > 1).map(([n]) => n));
@@ -195,14 +204,14 @@ export function applyStaffExport(payload, { fetchedAt = null } = {}) {
       let w = byStaffId.get(s.id);
       if (!w) {
         // 曖昧な名前 (pk_workers に同名が複数) は触らない — 別人に紐づく事故を防ぐ
-        if (ambiguous.has(name) || ambiguous.has(s.display_name)) {
+        if (ambiguous.has(nameKey(name)) || ambiguous.has(nameKey(s.display_name))) {
           conflicts.push(`⚠ ${s.staff_no} ${s.display_name}: 同じ名前の作業者が複数いるため紐付けを保留しました (どちらかの名前を直してください)`);
           continue;
         }
-        w = byName.get(name) || byName.get(s.display_name);
+        w = byName.get(nameKey(name)) || byName.get(nameKey(s.display_name));
         if (w) {
           link.run(s.id, s.staff_no, w.code);
-          byName.delete(norm(w.name));
+          byName.delete(nameKey(w.name));
           w = { ...w, staff_id: s.id, staff_no: s.staff_no };
           byStaffId.set(s.id, w);
           linked++;
@@ -218,7 +227,11 @@ export function applyStaffExport(payload, { fetchedAt = null } = {}) {
         continue;
       }
       touched.add(w.code);
-      if (norm(w.name) !== name) { rename.run(name, w.code); renamed++; }
+      // ⭐**空白の有無だけの違いでは改名しない**: 現場の表記 (「中原大輔」) で過去の作業実績が
+      //   記録されているため、「中原 大輔」に変えると実績の集計が新旧で分断される。
+      //   スタッフマスタで実質的に名前が変わったとき (「中原」「星さん」等) だけ追従する。
+      //   表記を完全に揃えたいときはスタッフマスタ側の「短い表記」に現場の表記を入れる
+      if (nameKey(w.name) !== nameKey(name)) { rename.run(name, w.code); renamed++; }
       if (w.active !== active) { setActive.run(active, w.code); if (!active) deactivated++; }
       if (norm(w.staff_no) !== s.staff_no) setNo.run(s.staff_no, w.code);
     }
