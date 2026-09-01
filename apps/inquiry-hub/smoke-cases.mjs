@@ -260,6 +260,10 @@ console.log('6b. 完了ゲートをすり抜ける経路を塞げているか');
     rc.listSteps(c.id).find(s => s.id === refundStep.id).necessity_status === 'not_required');
   check('⭐外した記録は履歴に別イベントで残る',
     rc.listEvents(c.id).some(e => e.event_type === 'step_skipped_exception'));
+  // ⭐担当者が未登録のまま通した例外操作は履歴にも印を残す (ログはいずれ消えるため)
+  check('担当者未登録のまま外したことが履歴に残る',
+    rc.listEvents(c.id).some(e => e.event_type === 'step_skipped_exception'
+      && JSON.parse(e.to_json || '{}').bootstrap === true));
   check('理由が工程のメモに残る',
     rc.listSteps(c.id).find(s => s.id === refundStep.id).note === '顧客が返金を辞退したため');
 
@@ -294,6 +298,21 @@ console.log('6b-2. 外した工程を戻すと「外す直前」に戻る (Codex
   check('要否未確定の工程は skip_required では外せない (通常の「対応不要」を使う)',
     errOf(() => rc.updateStep(c.id, rc.listSteps(c.id).find(x => x.necessity_status === 'undecided').id,
       'skip_required', { reason: 'テスト', actor: '中村' })).includes('要否がまだ決まっていない'));
+
+  // ⭐先の版で作られた行 (退避値が無く、移行の既定で template_necessity='required' の行) の復元
+  //   テンプレートから引き直すので、要否未確定だった工程が required に化けない (Codex R3)
+  const s2 = rc.listSteps(c.id).find(x => x.step_type === 'wait_return_arrival');
+  db.prepare(`UPDATE case_steps SET necessity_status='not_required', necessity_before_skip=NULL,
+    template_necessity='required' WHERE id = ?`).run(s2.id);
+  rc.updateStep(c.id, s2.id, 'undo', { actor: '中村' });
+  check('⭐退避値のない古い行でもテンプレートの要否に戻る',
+    rc.listSteps(c.id).find(x => x.id === s2.id).necessity_status === 'undecided',
+    rc.listSteps(c.id).find(x => x.id === s2.id).necessity_status);
+  check('テンプレートの必要性を引ける',
+    rc.templateNecessityOf('RETURN_REFUND', 'execute_refund') === 'required' &&
+    rc.templateNecessityOf('MANUFACTURER', 'wait_replacement_delivery') === 'undecided' &&
+    rc.templateNecessityOf('EXCHANGE', 'wait_replacement_delivery') === 'required');
+  check('テンプレートに無い工程は null', rc.templateNecessityOf('OTHER', 'nope') === null);
 }
 
 console.log('6c. 権限 (例外操作)');

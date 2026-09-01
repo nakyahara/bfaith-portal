@@ -488,6 +488,16 @@ export function blockersOf(caseId) {
   return { steps: out, requests: reqs, total: out.length + reqs.length };
 }
 
+/**
+ * テンプレート上、その工程は「必要」だったか「要否未確定」だったか。
+ * ⭐**列に頼らずテンプレートから引き直せる** — 先の版で作られた行 (退避値が無く、
+ *   移行の既定値で 'required' になっている行) でも、正しい要否に戻せる
+ */
+export function templateNecessityOf(caseType, stepType) {
+  const hit = (STEP_TEMPLATES[caseType] || []).find(s => s.code === stepType);
+  return hit ? hit.necessity : null;
+}
+
 /** 工程の表示名 (テンプレートに無いコードでも落ちないようにする) */
 export function stepLabel(caseType, code) {
   for (const list of [STEP_TEMPLATES[caseType] || [], ...Object.values(STEP_TEMPLATES)]) {
@@ -645,6 +655,8 @@ export function updateStep(caseId, stepId, action, { note, externalRef, reason, 
 
     const before = { necessity: step.necessity_status, progress: step.progress_status };
     const patch = {};
+    // 担当者が未登録のまま通した例外操作の印。⭐ログはいずれ消えるので履歴にも残す
+    let stepBootstrap = false;
     switch (action) {
       case 'complete':
         patch.necessity_status = 'required';
@@ -675,6 +687,7 @@ export function updateStep(caseId, stepId, action, { note, externalRef, reason, 
         const perm = canDoException(actor);
         if (!perm.allowed) throw new Error('必要な工程を外す権限がありません (担当者と権限の画面で D3 が要ります)');
         if (perm.unmanaged) console.warn('[inquiry-hub] 担当者未登録のまま必要な工程を外しました case=' + caseId + ' step=' + stepId + ' by ' + (actor || '不明'));
+        stepBootstrap = perm.unmanaged;
         patch.necessity_status = 'not_required';
         patch.necessity_before_skip = 'required';
         patch.progress_status = 'not_started';
@@ -700,7 +713,12 @@ export function updateStep(caseId, stepId, action, { note, externalRef, reason, 
         //   戻し先は**外す直前の値** (人が「必要」と決めていたなら必要へ戻す。
         //   テンプレート値へ戻すと、その判断が消えてしまう)
         if (step.necessity_status === 'not_required') {
-          patch.necessity_status = step.necessity_before_skip || step.template_necessity || 'required';
+          // ①外す直前の値 → ②テンプレートから引き直した値 → ③列に残っている値 の順に戻す。
+          // ⭐②があるので、退避値を持たない古い行 (移行で既定の 'required' になっている行) でも
+          //   「テンプレートでは要否未確定だった工程」を required に化けさせない
+          patch.necessity_status = step.necessity_before_skip
+            || templateNecessityOf(c.case_type, step.step_type)
+            || step.template_necessity || 'required';
           patch.necessity_before_skip = null;
         }
         patch.progress_status = 'not_started';
@@ -748,8 +766,9 @@ export function updateStep(caseId, stepId, action, { note, externalRef, reason, 
     else touchCase(db, caseId, {});
 
     logCaseEvent(caseId, { eventType: action === 'skip_required' ? 'step_skipped_exception' : 'step_changed',
-      from: before, to: { step_type: step.step_type, action, ...patch }, actorId: actor,
-      note: stepLabel(c.case_type, step.step_type) });
+      from: before,
+      to: { step_type: step.step_type, action, ...patch, bootstrap: stepBootstrap || undefined },
+      actorId: actor, note: stepLabel(c.case_type, step.step_type) });
     return { case: getCase(caseId), steps: listSteps(caseId) };
   }).immediate();
 }
