@@ -612,7 +612,11 @@ router.get('/api/runs/:runId/recoverable', (req, res) => {
     res.json({
       ok: true,
       rows: candidates.length,
-      notRestorable: skipped.filter((s) => s.blocking).length,   // 変わったのに戻せない行
+      // ★変わったのに戻せない行。件数だけでなく中身も返す (戻せる行が 0 でも画面に出すため)
+      notRestorable: skipped.filter((s) => s.blocking).map((s) => ({
+        operationId: s.op.operation_id, neCode: s.op.ne_code, mall: s.op.mall,
+        listingCode: s.op.listing_code, skuCode: s.op.sku_code, reason: s.reason,
+      })),
       states: RECOVERABLE_STATES,
       canCreate: canExecute(req),
       canCreateReason: executorGate(req).message,
