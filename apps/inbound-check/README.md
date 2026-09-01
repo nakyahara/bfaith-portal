@@ -13,7 +13,9 @@
 |---|---|---|
 | `/apps/inbound-check/` | 登録端末 (iPad) or ポータルセッション | 作業画面 (PWA) |
 | `/apps/inbound-check/api/state` | 同上 | 一覧の状態 (5秒ポーリング) |
-| `/apps/inbound-check/api/lines/check` `/uncheck` | 同上 | 確認 / 取消。確認時に行き先を確定させる (下記) |
+| `/apps/inbound-check/api/lines/quantity-events` (POST) | 同上 | 数を足す / 打ち消す / 入数を訂正する (加算イベント・冪等) |
+| `/apps/inbound-check/api/lines/events` | 同上 | その行の数量イベント (訂正パネル用) |
+| `/apps/inbound-check/api/lines/check` `/uncheck` | 同上 | 確定 (exact/shortage/excess) / やり直し。確認時に行き先を確定させる (下記) |
 | `/apps/inbound-check/api/info` (POST) | 同上 | 入庫情報 (入数・いろは・BCシール・直ピック・荷姿・memo) をその場で直す |
 | `/apps/inbound-check/api/info/register` (POST) | 同上 | 入庫情報が無い商品を登録する |
 | `/apps/inbound-check/api/product-flags` (POST) | 同上 | 期限管理 あり/なし を切り替える |
@@ -55,6 +57,86 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
     保管ロケの空いているところに入れてよい (中原さん 2026-09-01)。取得失敗ではなく正常な状態なので警告色にしない。
     実測では 16行中5行がこれに当たる (在庫ミラーには在庫0の商品の行が無いため)
 - 保持期間: superseded バッチとその子 = 365日、取込ログ = 90日 (取込時に掃除)
+
+## 数量 (部分確認) — 要件定義 v1.3 §11
+
+大量入荷では段ボールがばらばらになり、**同じ商品の箱があちこちから1つずつ見つかる**。
+「何個中何個まで見つけたか」を保存できないと、途中で中断したときに数え直しになる。
+
+```
+☐ 未着手    予定 106 個 ・ 1箱 10個                 [ 全部あり ] [ ＋1箱 (10個) ]
+◐ 一部      82 / 106 個  あと 24個                  [ 残りも全部あり ] [ ＋1箱 ]
+◐ 一致      106 / 106 個 揃いました                  [ 確認 ] [ ＋1箱 ]
+◐ 超過      110 / 106 個 4個 多い                    [ 超過で確定 ]
+✅ 完了     106 / 106 個                             [ 確認済み ] (押すとやり直す)
+```
+
+- **右端の色つき主ボタンは常に1つ**。`[確認]` `[一部]` の2ボタンにしない (毎行「どっちを押すか」を読ませない)
+- **`[＋1箱]` は箱を1つ開けるたびに1タップ**。入数が未登録の商品は `[入数を設定]` を出す
+  (無効ボタンは「なぜ押せないか」を読ませるだけ。⚠**入数1を初期値にしない** — 30箱を30個として保存する事故になる)
+- 行をタップすると**数量パネルがインライン展開**する (モーダルにしない = 商品と一覧上の位置を見失わない)。
+  箱数をまとめて入力・バラ・数えた記録の取り消し/入数訂正・不足のまま確定
+- `[全部あり]` / `[残りも全部あり]` は**残りを1イベント足して exact 確定**を同一トランザクションで行う。
+  「0個からなら信じるが8箱数えた後は信じない」差を設ける合理性はない
+- **不足のまま確定は主ボタンにしない**。パネル内に置き、結果を文言に書く
+  (`これ以上来ない — 不足 24個 で確認済みにする`) + 確認ダイアログを1枚はさむ
+- **不足の理由は取らない** (初回フェーズ)。用途が決まっていない分類は反射的に選ばれるだけで、集計できても使えない
+- `[やり直す]` は確認解除のみ。**数量は残す** (誤タップで11箱分の記録が消えない)
+
+### 状態は found_qty から導出する
+
+DB の `status` は `unchecked` / `checked` の**2値のまま**。CHECK 制約の作り替え (テーブル再作成) を避けるため。
+
+| DB | 画面 |
+|---|---|
+| `unchecked` / `found_qty = 0` | 未着手 |
+| `unchecked` / `0 < found < planned` | **一部** (黄色・「残りあり」フィルタに残す) |
+| `unchecked` / `found = planned` | 数量一致 |
+| `unchecked` / `found > planned` | 超過 |
+| `checked` | 完了 (`finalized_result` = exact / shortage / excess) |
+
+**不足数・超過数は保存しない**。`planned - found` から導出する (二重管理で食い違わせない)。
+
+### 数量は加算イベント (絶対値の上書きは禁止)
+
+`f_inbound_check_quantity_events` (append-only・**1タップ1行**) が正本で、`line_state.found_qty` はその投影。
+
+- 合計を上書きする作りだと、**A の 11箱と B の 3箱 が競合して片方が消える**
+- 打ち消しは `reversal` イベント。行を消さない・UPDATE しない
+- 入数の訂正は **`reversal` + 新 `add` (`replaces_event_seq` で元を指す)** の2行。
+  ⭐「今から数える箱の入数」と「すでに数えた記録の訂正」は**完全に別操作**にする
+  (同じプルダウンに2つの意味を載せると数量が静かに間違う)
+- 論理キーは `batch_id` ではなく **`(work_date, line_key, code_key)`**。
+  同日中は何度取り込んでも数が残り、翌日は自然に 0 から始まる
+- 入数はこの検品だけに使い、**商品マスタには書かない** (混載の「今回だけ24入り」を標準入数にしない)
+
+### 送信は「応答待ち + 冪等ID」。オフラインキューは持たない
+
+```
+[＋1箱] タップ → スピナー (その行の操作を無効化) → 200 が返ってから数字が動く
+失敗 → 数字は動かない + [同じ操作を再送]
+```
+
+- **「数字が増えた = サーバーに記録済み」が常に真**になる。楽観更新しないので嘘の表示が出ない
+- 逆 (増えなかった = 未記録) は**コミット直後に応答だけ失われる**と保証できない
+  → 1タップごとの `client_event_id` / 確定ごとの `client_operation_id` で埋める。**再送は同じID**
+- 自動再送は 1試行4秒・最大3回 (250ms → 750ms)。通信エラー / タイムアウト / 502・503・504 のみ。
+  **4xx・409・500 は再送しない**
+- ⚠**IndexedDB の永続キューは作らない**。このアプリは一覧をサーバーから取るだけでローカルに
+  キャッシュを持たず、通信が切れたら**どの明細に足すかも画面に出ない**。
+  ＋1箱だけオフライン対応しても業務は続かないため (Codex と3巡議論して撤回した案)
+
+### 主なエラー (すべて画面を最新にして出し直せば回復する)
+
+| error | 意味 |
+|---|---|
+| `stale_batch` | active バッチが入れ替わった |
+| `stale_work_date` | 日付が変わり、当日の取込がまだ来ていない |
+| `conflict` | line version / quantity_version の不一致 |
+| `finalized` | 確定済みの行への数量変更 (先に「やり直す」) |
+| `result_mismatch` | 人が選んだ意味 (exact/shortage/excess) と実数が食い違う |
+| `already_reversed` | 同じ記録の二重打ち消し |
+| `idempotency_conflict` | 同じ冪等IDで違う内容 |
 
 ## 確認するときの行き先ゲート (いろは / B-Faith)
 
@@ -147,7 +229,8 @@ node scripts/test-inbound-check.mjs [CA04001_*.csv]        # DB 層 + CSV パー
 node scripts/test-inbound-check-enroll.mjs                 # 端末の登録コード (35 項目)
 node scripts/test-inbound-check-drive.mjs                  # Drive 自動取込 (17 項目)
 node scripts/test-inbound-check-product-master.mjs         # 商品マスタ取込 = 期限管理 (40 項目)
-node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路 (131 項目)
+node scripts/test-inbound-check-render.mjs                 # iPad 画面のレンダリング (状態ごとの主ボタン・数量パネル)
+node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路
 ```
 
 ## 次
