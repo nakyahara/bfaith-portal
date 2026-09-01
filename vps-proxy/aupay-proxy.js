@@ -1707,17 +1707,34 @@ function isWellFormedResultSet(xml) {
   const stack = [];
   const re = /<(\/?)([A-Za-z][\w.:-]*)(?:\s[^>]*?)?(\/?)>/g;
   let m;
+  let cursor = 0;
+  let rootClosed = false;
+  let sawRoot = false;
   while ((m = re.exec(text)) !== null) {
+    // ★タグとタグの間に「<」があるのに読めていない = 切れたタグ。無視せず落とす (Codex R14)
+    if (text.slice(cursor, m.index).includes('<')) return false;
+    cursor = m.index + m[0].length;
     const [, closing, name, selfClose] = m;
-    if (selfClose) continue;
+    // ★ルートを閉じた後に要素が続くのは複数ルート。1つの応答として読めない
+    if (rootClosed) return false;
+    if (selfClose) {
+      if (stack.length === 0) return false;        // ルートの外に要素がある
+      continue;
+    }
     if (closing) {
       if (stack.pop() !== name) return false;      // 閉じ方が合わない
+      if (stack.length === 0) rootClosed = true;
     } else {
-      if (stack.length === 0 && name !== 'ResultSet') return false;   // ルートが違う
+      if (stack.length === 0) {
+        if (sawRoot || name !== 'ResultSet') return false;   // ルートが違う / ルートが2つ
+        sawRoot = true;
+      }
       stack.push(name);
     }
   }
-  return stack.length === 0 && /<ResultSet[\s>]/.test(text);
+  // 最後のタグより後ろに「<」が残っていないか (切れたタグ)
+  if (text.slice(cursor).includes('<')) return false;
+  return sawRoot && rootClosed && stack.length === 0;
 }
 
 /**
@@ -2010,6 +2027,12 @@ function runSelfTest() {
     yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status>' }), false);
   check('yahoo応答: 末尾に改行があっても成功のまま',
     yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status></Result></ResultSet>' + String.fromCharCode(10) }), true);
+  check('yahoo応答: ★ルートが2つある応答は成功にしない',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status></ResultSet><ResultSet></ResultSet>' }), false);
+  check('yahoo応答: ★末尾に切れたタグが残る応答も成功にしない',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status></ResultSet><broken' }), false);
+  check('yahoo応答: ★途中に読めない < があっても成功にしない',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status><broken <Name>x</Name></ResultSet>' }), false);
   check('yahoo応答: ★入れ子が閉じていない XML は成功にしない',
     yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status><Result></ResultSet>' }), false);
   check('yahoo応答: 閉じ方が食い違う XML も成功にしない',
