@@ -151,8 +151,10 @@ async function main() {
     // ★価格が実際に変わっていなければ、「他が変わっていない」ことに意味は無い
     const afterPrice = itemPriceOf(after);
     if (afterPrice !== probePrice) {
-      console.log(`\n⚠️ 価格が ${probePrice} になっていません (実際: ${afterPrice})。`
+      console.error(`\n⚠️ 価格が ${probePrice} になっていません (実際: ${afterPrice})。`
         + '送信が効いていないので、部分更新かどうかは判定できません');
+      // ★何も判定できなかった回を成功として終わらせない (Codex R5)
+      process.exitCode = 1;
       return;
     }
     const collateral = collateralOf(d1);

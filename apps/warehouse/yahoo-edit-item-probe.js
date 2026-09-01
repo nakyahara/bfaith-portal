@@ -113,9 +113,18 @@ export function diff(beforeMap, afterMap) {
   return { changed, removed, added };
 }
 
-/** 価格の道すじか (価格だけが変わるのが期待値。それ以外が動いたら全項目上書き) */
+/** 価格の道すじか (商品本体でも SKU でも) */
 export function isPricePath(path) {
   return /(^|\/)Price\[\d+\]$/.test(String(path || ''));
+}
+
+/**
+ * **商品本体の** 価格の道すじか (ルート直下の Price)。
+ * ★「変わってよい」のはここだけ。SKU の価格まで見逃すと、
+ *   item_code と price を送っただけで SKU の価格が動いても部分更新だと誤って結論する (Codex R5)。
+ */
+export function isItemPricePath(path) {
+  return /^[^/]+\/Price\[\d+\]$/.test(String(path || ''));
 }
 
 /**
@@ -126,7 +135,8 @@ export function isPricePath(path) {
  */
 export function collateralOf(d) {
   return [
-    ...(d.changed || []).filter((x) => !isPricePath(x.path)),
+    // ★除外するのは商品本体の価格だけ。SKU の価格が動いたのは「価格以外の変化」として数える
+    ...(d.changed || []).filter((x) => !isItemPricePath(x.path)),
     ...(d.removed || []),
     ...(d.added || []),
   ];
@@ -135,7 +145,7 @@ export function collateralOf(d) {
 /** 商品本体の価格 (SubCode 配下ではないもの) を1つ返す。読めなければ null */
 export function itemPriceOf(flat) {
   for (const [k, v] of flat) {
-    if (!/(^|\/)Price\[0\]$/.test(k) || /SubCode/.test(k)) continue;
+    if (!isItemPricePath(k)) continue;
     const n = Number(v);
     return Number.isInteger(n) ? n : null;
   }

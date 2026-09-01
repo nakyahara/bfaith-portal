@@ -7,7 +7,7 @@
  * 実行: node apps/warehouse/test-yahoo-edit-item-probe.mjs
  */
 import {
-  flattenXml, diff, isPricePath, collateralOf, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
+  flattenXml, diff, isPricePath, isItemPricePath, collateralOf, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
 } from './yahoo-edit-item-probe.js';
 
 let failed = 0;
@@ -83,6 +83,9 @@ console.log('\n── 価格の読み方 ──');
   ok(isPricePath('Result[0]/SubCodes[0]/SubCode[0]/Price[0]'), 'SKU の価格');
   ok(!isPricePath('Result[0]/Name[0]'), '商品名は価格ではない');
 
+  ok(isItemPricePath('Result[0]/Price[0]'), '商品本体の価格');
+  ok(!isItemPricePath('Result[0]/SubCodes[0]/SubCode[0]/Price[0]'), '★SKU の価格は「商品本体の価格」ではない');
+
   const flat = await flattenXml('<R><Price>1080</Price><SubCodes><SubCode code="a"><Price>1200</Price></SubCode></SubCodes></R>');
   eq(itemPriceOf(flat), 1080, '★商品本体の価格を取る (SKU の価格と取り違えない)');
   eq(itemPriceOf(await flattenXml('<R><Price>お問い合わせ</Price></R>')), null, '整数で読めなければ null');
@@ -113,7 +116,13 @@ console.log('\n── 「価格以外の変化」の数え方 ──');
   eq(collateralOf(diff(before, await flattenXml('<R><Name>名前</Name><Price>101</Price><Caption>説明</Caption><New>x</New></R>'))).map((x) => x.path),
     ['R[0]/New[0]'], '★増えた項目も数える (無視すると誤って部分更新と結論する)');
   eq(collateralOf(diff(before, await flattenXml('<R><Name>名前</Name><Price>101</Price><Caption>説明</Caption><SubCodes><SubCode code="a"><Price>50</Price></SubCode></SubCodes></R>'))).length,
-    2, 'SKU が増えたら SubCodes と SubCode の属性が増分として出る');
+    2, 'SKU が増えたら SKU の属性と価格が増分として出る (中身の無い SubCodes 自体は値を持たない)');
+
+  // ★SKU の価格が動いたのは「価格以外の変化」。見逃すと部分更新だと誤って結論する
+  const withSku = await flattenXml('<R><Name>名前</Name><Price>100</Price><SubCodes><SubCode code="a"><Price>50</Price></SubCode></SubCodes></R>');
+  const skuMoved = await flattenXml('<R><Name>名前</Name><Price>101</Price><SubCodes><SubCode code="a"><Price>60</Price></SubCode></SubCodes></R>');
+  eq(collateralOf(diff(withSku, skuMoved)).map((x) => x.path),
+    ['R[0]/SubCodes[0]/SubCode[0]/Price[0]'], '★SKU の価格が動いたら数える (商品本体の価格だけを除外する)');
 }
 
 console.log('\n── 本番商品では動かさない ──');
