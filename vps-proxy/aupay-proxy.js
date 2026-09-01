@@ -1284,7 +1284,7 @@ const server = http.createServer(async (req, res) => {
       // ★更新しただけでは客に見えない。「変えたつもり」を作らないよう、
       //   この経路の中で反映まで済ませる (明示的に submit:false と言われた時だけ飛ばす)
       const wantSubmit = body.submit !== false;
-      const updateOk = r.status >= 200 && r.status < 300 && !/<Status>\s*NG\s*<\/Status>/i.test(String(r.body));
+      const updateOk = yahooXmlOk(r);
       const submits = [];
       if (wantSubmit && updateOk) {
         for (const code of built.codes) {
@@ -1294,7 +1294,7 @@ const server = http.createServer(async (req, res) => {
             contentType: 'application/x-www-form-urlencoded',
             body: new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: code }).toString(),
           });
-          const sok = sr.status >= 200 && sr.status < 300 && !/<Status>\s*NG\s*<\/Status>/i.test(String(sr.body));
+          const sok = yahooXmlOk(sr);
           console.log(`[${ts()}] Yahoo submitItem: item_code=${code} status=${sr.status} ok=${sok}`);
           submits.push({ item_code: code, status: sr.status, ok: sok, body: String(sr.body).slice(0, 500) });
         }
@@ -1693,6 +1693,19 @@ const server = http.createServer(async (req, res) => {
 });
 
 /**
+ * Yahoo の応答が成功か。
+ * ★HTTP 200 でも本文に Status NG や Error が入っていることがある。
+ *   NG だけを見ると「HTTP 200 + <Error>」を成功扱いしてしまう (Codex R5)。
+ */
+function yahooXmlOk(res) {
+  const text = String(res?.body || '');
+  if (!(res?.status >= 200 && res.status < 300)) return false;
+  if (/<Status>\s*NG\s*<\/Status>/i.test(text)) return false;
+  if (/<Error[\s>]/i.test(text)) return false;
+  return true;
+}
+
+/**
  * updateItems に渡された items が「価格だけ」か検査する。問題があれば投げる。
  * ★sale_price に空文字を送ると **既存のセール価格が消える**。
  *   うっかりで消さないよう、消す意図があるときだけ clearSalePrice:true を要求する。
@@ -1934,6 +1947,10 @@ function runSelfTest() {
   check('update-items: 消してよいと言われたら通る',
     tryAssert([{ item_code: 'a', price: '1000', sale_price: '' }], { clearSalePrice: true }), 'ok');
   check('update-items: 空の items は拒否', tryAssert([]), 'update-items: items が空です');
+  check('yahoo応答: Status OK は成功', yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status></ResultSet>' }), true);
+  check('yahoo応答: ★HTTP 200 でも Error があれば失敗', yahooXmlOk({ status: 200, body: '<ResultSet><Result><Error><Code>x</Code></Error></Result></ResultSet>' }), false);
+  check('yahoo応答: Status NG は失敗', yahooXmlOk({ status: 200, body: '<ResultSet><Status>NG</Status></ResultSet>' }), false);
+  check('yahoo応答: HTTP エラーは失敗', yahooXmlOk({ status: 500, body: 'boom' }), false);
 
   check('updateItems: subcode_price の書式が壊れない',
     decodeURIComponent(decodeURIComponent(
