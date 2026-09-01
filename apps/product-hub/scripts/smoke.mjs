@@ -2764,6 +2764,30 @@ let wfSetParentId = null;
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
       }
       {
+        // 境界工程 ⑦ そのものを ⑥ より前へ動かした状態 (Codex R3 medium)。
+        // 「境界より前の行だけ見る」判定だと、後ろへ回った ⑥ が todo でも「済」になってしまう
+        const id = mk2('WF-MADE-BOUNDARY-FIRST');
+        wfp.setStepState(id, 'imgd_review_2', { state: 'todo' }, 'smoke', ADMIN);
+        wfp.setStepState(id, 'imgd_amazon', { state: 'done' }, 'smoke', ADMIN);
+        const origSort = db.prepare("SELECT sort FROM ph_steps WHERE code = 'imgd_amazon'").get().sort;
+        db.prepare("UPDATE ph_steps SET sort = 5 WHERE code = 'imgd_amazon'").run();
+        const t = detailOf(id);
+        db.prepare('UPDATE ph_steps SET sort = ? WHERE code = ?').run(origSort, 'imgd_amazon');
+        check('ボード: ⑦を先頭へ動かしても、後ろに残った ⑥ が未完了なら「まだ」',
+          t?.made === false, JSON.stringify({ made: t?.made, cur: t?.current?.step_code }));
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+      }
+      {
+        // 境界工程 ⑦ を無効化した状態 (工程を消した)。決着の確認ができないので「済」と偽らない
+        const id = mk2('WF-MADE-NO-BOUNDARY');
+        db.prepare("UPDATE ph_steps SET active = 0 WHERE code = 'imgd_amazon'").run();
+        const t = detailOf(id);
+        db.prepare("UPDATE ph_steps SET active = 1 WHERE code = 'imgd_amazon'").run();
+        check('ボード: 境界工程 (⑦) が無いときは「済」にしない',
+          t?.made === false && t?.done === false, JSON.stringify({ made: t?.made, done: t?.done }));
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+      }
+      {
         // ⑦と⑧の間に管理画面から工程を足した状態 (image_stage は NULL)。
         // 制作の境界は ⑦ なので、その工程が残っていても「済」でよい
         const id = mk2('WF-MADE-CUSTOM');
