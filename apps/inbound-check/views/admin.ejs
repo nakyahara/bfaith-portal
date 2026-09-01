@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .ic-wrap { max-width: 900px; margin: 0 auto; padding: 12px 16px; }
+    .ic-box { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 18px; }
+    .ic-box h2 { font-size: 1.0em; margin: 0 0 10px; }
+    .ic-box p.hint { font-size: 0.85em; color: #495057; margin: 0 0 10px; line-height: 1.6; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .row input[type=text] { padding: 7px; width: 220px; }
+    .row button { padding: 7px 18px; cursor: pointer; }
+    .msg { font-size: 0.9em; } .msg.err { color: #c92a2a; } .msg.ok { color: #2b8a3e; }
+    table.ic-list { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.ic-list th, table.ic-list td { border-bottom: 1px solid #dee2e6; padding: 6px 8px; text-align: left; vertical-align: top; }
+    table.ic-list th { background: #f1f3f5; white-space: nowrap; }
+    tr.revoked td, tr.inactive td { color: #adb5bd; text-decoration: line-through; }
+    tr.active-batch td { background: #ebfbee; }
+    .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; }
+    .ok-banner { background: #d3f9d8; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 0.95em; }
+    .ng { color: #c92a2a; }
+    code { background: #e9ecef; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📦 入荷受付チェック 管理</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="<%= base %>/" class="btn-logout">📱 作業画面</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="ic-wrap">
+    <div class="ic-box">
+      <h2>📥 入荷受付 CSV を取り込む (手動)</h2>
+      <p class="hint">
+        ロジザード <b>入荷状況照会 [FA04_01]</b> で「検索範囲: 当日から7日前まで / 対象データ: 受付済」で検索 → CSV エクスポートしたファイル
+        (<code>CA04001_….csv</code>、Shift-JIS) を選んでください。取り込むと iPad の一覧が<b>丸ごと入れ替わり、確認状態は未確認から始まります</b>。<br>
+        同じ内容のファイル、いまの一覧より古い時刻のファイルは取り込みません。0件のCSVも正常に取り込みます (受付済が無い日)。
+      </p>
+      <div class="row">
+        <input type="file" id="csvFile" accept=".csv,text/csv">
+        <button id="uploadBtn" type="button">取り込む</button>
+        <span id="uploadMsg" class="msg"></span>
+      </div>
+    </div>
+
+    <div class="ic-box">
+      <h2>現在の一覧 (active バッチ)</h2>
+      <% if (active) { %>
+        <p>バッチ #<%= active.id %> ・ CSV生成 <span data-jst="<%= active.csv_generated_at %>"></span> ・ 取込 <span data-jst="<%= active.imported_at %>"></span>
+          (<%= active.source === 'manual_upload' ? '手動' : active.source %><%= active.imported_by ? ' / ' + active.imported_by : '' %>) ・
+          <%= active.slip_count %> 伝票 / <%= active.row_count %> 行 ・ ファイル <%= active.file_name || '-' %></p>
+      <% } else { %>
+        <p class="ng">まだ取り込まれていません</p>
+      <% } %>
+    </div>
+
+    <div class="ic-box">
+      <h2>取込履歴 (バッチ)</h2>
+      <table class="ic-list">
+        <thead><tr><th>#</th><th>状態</th><th>CSV生成</th><th>取込</th><th>経路 / 実行者</th><th>伝票</th><th>行</th><th>ファイル</th><th></th></tr></thead>
+        <tbody>
+          <% for (const b of batches) { %>
+            <tr class="<%= b.status === 'active' ? 'active-batch' : '' %>">
+              <td><%= b.id %></td>
+              <td><%= b.status === 'active' ? '表示中' : '過去' %></td>
+              <td><span data-jst="<%= b.csv_generated_at %>"></span></td>
+              <td><span data-jst="<%= b.imported_at %>"></span></td>
+              <td><%= b.source === 'manual_upload' ? '手動' : b.source %><%= b.imported_by ? ' / ' + b.imported_by : '' %></td>
+              <td><%= b.slip_count %></td>
+              <td><%= b.row_count %></td>
+              <td><%= b.file_name || '-' %></td>
+              <td><% if (isAdmin) { %><button class="btn-sm btn-hist" data-id="<%= b.id %>">履歴</button> <a class="btn-sm" href="<%= base %>/admin/history.csv?batch_id=<%= b.id %>">CSV</a><% } %></td>
+            </tr>
+          <% } %>
+          <% if (batches.length === 0) { %><tr><td colspan="9" style="color:#868e96">まだ取込がありません</td></tr><% } %>
+        </tbody>
+      </table>
+      <div id="histBox" style="margin-top:10px"></div>
+    </div>
+
+    <div class="ic-box">
+      <h2>取込ログ (失敗理由を含む)</h2>
+      <table class="ic-list">
+        <thead><tr><th>日時</th><th>結果</th><th>経路 / 実行者</th><th>ファイル</th><th>内容</th></tr></thead>
+        <tbody>
+          <% for (const l of importLog) { %>
+            <tr><td><span data-jst="<%= l.at %>"></span></td><td><%= l.ok ? '✅' : '❌' %></td><td><%= l.source === 'manual_upload' ? '手動' : l.source %><%= l.actor ? ' / ' + l.actor : '' %></td><td><%= l.file_name || '-' %></td><td class="<%= l.ok ? '' : 'ng' %>"><%= l.message || '' %></td></tr>
+          <% } %>
+          <% if (importLog.length === 0) { %><tr><td colspan="5" style="color:#868e96">まだ記録がありません</td></tr><% } %>
+        </tbody>
+      </table>
+    </div>
+
+    <% if (isAdmin) { %>
+    <div class="ic-box">
+      <h2>📱 この端末 (iPad) を登録</h2>
+      <p class="hint">
+        倉庫で使う iPad で管理者としてログインし、ここで登録すると、その端末は以後<b>ログイン不要</b>で作業画面を使えます (管理画面は引き続きログイン必須)。
+        登録と同時にこの端末の管理者ログインは解除されます。⚠ ホーム画面に追加したアプリから開いて登録してください (Safari本体と保存領域が別のため)。
+        端末側で外すときは作業画面のフッターの「管理画面」→ ではなく <code><%= base %>/device/exit</code> に POST (作業画面から将来ボタン化)。
+      </p>
+      <div class="row">
+        <input type="text" id="deviceLabel" placeholder="端末名 (例: 入荷iPad1)" maxlength="40">
+        <button id="registerBtn" type="button">この端末を登録</button>
+        <span id="deviceMsg" class="msg"></span>
+      </div>
+    </div>
+
+    <div class="ic-box">
+      <h2>登録済み端末</h2>
+      <table class="ic-list">
+        <thead><tr><th>ID</th><th>端末名</th><th>登録者</th><th>登録日</th><th>最終利用</th><th></th></tr></thead>
+        <tbody>
+          <% for (const d of devices) { %>
+            <tr class="<%= d.revoked_at ? 'revoked' : '' %>">
+              <td><%= d.id %></td><td><%= d.label %></td><td><%= d.created_by %></td>
+              <td><%= (d.created_at || '').slice(0, 10) %></td><td><%= (d.last_seen_at || '-').slice(0, 10) %></td>
+              <td><% if (!d.revoked_at) { %><button class="btn-sm btn-revoke" data-id="<%= d.id %>">失効</button><% } else { %>失効済み<% } %></td>
+            </tr>
+          <% } %>
+          <% if (devices.length === 0) { %><tr><td colspan="6" style="color:#868e96">まだ登録がありません</td></tr><% } %>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="ic-box">
+      <h2>👤 作業者 (作業画面で名前タップで選ぶリスト)</h2>
+      <div class="row" style="margin-bottom:10px">
+        <input type="text" id="workerName" placeholder="作業者名 (例: 山田)" maxlength="20">
+        <button id="addWorkerBtn" type="button">追加</button>
+        <span id="workerMsg" class="msg"></span>
+      </div>
+      <table class="ic-list">
+        <thead><tr><th>コード</th><th>名前</th><th></th></tr></thead>
+        <tbody>
+          <% for (const w of workers) { %>
+            <tr class="<%= w.active ? '' : 'inactive' %>"><td><%= w.code %></td><td><%= w.name %></td>
+              <td><button class="btn-sm btn-worker" data-code="<%= w.code %>" data-active="<%= w.active ? 0 : 1 %>"><%= w.active ? '無効にする' : '有効にする' %></button></td></tr>
+          <% } %>
+          <% if (workers.length === 0) { %><tr><td colspan="3" style="color:#868e96">まだ登録がありません</td></tr><% } %>
+        </tbody>
+      </table>
+    </div>
+    <% } %>
+  </div>
+
+  <script>
+    const BASE = <%- JSON.stringify(base) %>;
+    const $ = s => document.querySelector(s);
+    const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const fmtJst = iso => {
+      if (!iso) return '-';
+      const d = new Date(iso); if (Number.isNaN(d.getTime())) return iso;
+      return new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(d);
+    };
+    document.querySelectorAll('[data-jst]').forEach(el => { el.textContent = fmtJst(el.getAttribute('data-jst')); });
+    const postJson = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }).then(async r => ({ status: r.status, j: await r.json().catch(() => ({})) }));
+    const msg = (el, ok, text) => { el.className = 'msg ' + (ok ? 'ok' : 'err'); el.textContent = text; };
+
+    $('#uploadBtn').addEventListener('click', async () => {
+      const f = $('#csvFile').files[0];
+      if (!f) return msg($('#uploadMsg'), false, 'ファイルを選んでください');
+      const fd = new FormData();
+      fd.append('file', f);
+      fd.append('file_modified', String(f.lastModified || ''));
+      msg($('#uploadMsg'), true, '取込中…');
+      const r = await fetch(BASE + '/admin/upload', { method: 'POST', body: fd });
+      const j = await r.json().catch(() => ({}));
+      if (j.ok) { msg($('#uploadMsg'), true, '取り込みました: ' + j.slipCount + ' 伝票 / ' + j.rowCount + ' 行 (バッチ #' + j.batch.id + ')'); setTimeout(() => location.reload(), 800); }
+      else msg($('#uploadMsg'), false, j.message || j.error || ('HTTP ' + r.status));
+    });
+
+    const reg = $('#registerBtn');
+    if (reg) reg.addEventListener('click', async () => {
+      const label = $('#deviceLabel').value.trim();
+      if (!label) return msg($('#deviceMsg'), false, '端末名を入力してください');
+      if (!confirm('この端末を「' + label + '」として登録し、管理者ログインを解除します。よろしいですか?')) return;
+      const { status, j } = await postJson(BASE + '/admin/devices', { label });
+      if (j.ok) { msg($('#deviceMsg'), true, '登録しました。作業画面へ移動します'); setTimeout(() => location.href = BASE + '/', 800); }
+      else msg($('#deviceMsg'), false, j.message || ('HTTP ' + status));
+    });
+    document.querySelectorAll('.btn-revoke').forEach(b => b.addEventListener('click', async () => {
+      if (!confirm('端末 #' + b.dataset.id + ' を失効させますか? (その iPad は再登録が必要になります)')) return;
+      const { j } = await postJson(BASE + '/admin/devices/' + b.dataset.id + '/revoke');
+      if (j.ok) location.reload(); else alert(j.message || 'エラー');
+    }));
+    const addW = $('#addWorkerBtn');
+    if (addW) addW.addEventListener('click', async () => {
+      const name = $('#workerName').value.trim();
+      const { status, j } = await postJson(BASE + '/admin/workers', { name });
+      if (j.ok) location.reload(); else msg($('#workerMsg'), false, j.message || ('HTTP ' + status));
+    });
+    document.querySelectorAll('.btn-worker').forEach(b => b.addEventListener('click', async () => {
+      const { j } = await postJson(BASE + '/admin/workers/' + encodeURIComponent(b.dataset.code) + '/active', { active: b.dataset.active === '1' });
+      if (j.ok) location.reload(); else alert(j.message || 'エラー');
+    }));
+    document.querySelectorAll('.btn-hist').forEach(b => b.addEventListener('click', async () => {
+      const r = await fetch(BASE + '/admin/history?batch_id=' + b.dataset.id);
+      const j = await r.json().catch(() => ({}));
+      if (!j.ok) return alert(j.message || 'エラー');
+      const rows = j.events.map(e => '<tr><td>' + e.id + '</td><td>' + esc(e.ar_no) + '</td><td>' + esc(e.product_id) + ' ' + esc(e.product_name) + '</td><td>' + (e.action === 'check' ? '確認' : '<span class="ng">取消</span>' + (e.reverted_event_id ? ' (#' + e.reverted_event_id + ' を打ち消し)' : '')) + '</td><td>' + esc(e.worker) + '</td><td>' + esc(e.device_label || '') + '</td><td>' + esc(fmtJst(e.created_at)) + '</td></tr>').join('');
+      $('#histBox').innerHTML = '<h3 style="font-size:0.95em">バッチ #' + b.dataset.id + ' の確認履歴 (' + j.events.length + ' 件)</h3><table class="ic-list"><thead><tr><th>ID</th><th>AR</th><th>商品</th><th>操作</th><th>作業者</th><th>端末</th><th>日時</th></tr></thead><tbody>' + (rows || '<tr><td colspan="7" style="color:#868e96">記録なし</td></tr>') + '</tbody></table>';
+    }));
+  </script>
+</body>
+</html>
