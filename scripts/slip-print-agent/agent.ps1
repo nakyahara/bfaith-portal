@@ -311,8 +311,15 @@ function Test-PrinterExists {
 function Invoke-Print {
   param([string] $PrinterName, [string] $FilePath)
   if (-not (Test-Path $Sumatra)) { throw "SumatraPDF not found: $Sumatra" }
-  # -print-settings noscale is mandatory: a few percent of shrink makes the barcode
-  # unreadable on a thermal label.
+  # MEASURED 2026-09-01: "shrink", not "noscale".
+  #   The AES slips come out of the sorter as A4 pages (210x297mm, one full-page image per
+  #   slip) while the label printer holds 100x150mm stock. With "noscale" the page is placed
+  #   at 100% and the label comes out oversized with the edges cut off (confirmed on paper).
+  #   "shrink" only scales DOWN when the page is larger than the paper, so a slip that is
+  #   already label-sized still prints at exactly 100% - which is what the 2026-08-27 ruler
+  #   test (a 100x150mm PDF) verified. "fit" would blow small pages UP and is not used.
+  # -exit-when-done: without it SumatraPDF stays alive after spooling, the spool job lingers
+  #   and Watch-SpoolJob times out, so a slip that actually printed is reported as "unknown".
   #
   # MEASURED 2026-08-28: Start-Process -ArgumentList SPLITS a printer name that contains a
   # space, even when the arguments are passed as an array:
@@ -321,7 +328,8 @@ function Invoke-Print {
   # That would print to a printer that does not exist, or to the wrong one. The call
   # operator with a splatted array keeps each element as exactly one argument, which is
   # what we need for "Munbyn ITPP941(300DPI)" and for the Japanese names.
-  $argv = @('-print-to', $PrinterName, '-print-settings', 'noscale', '-silent', $FilePath)
+  $scale = if ($cfg.printScaling) { [string]$cfg.printScaling } else { 'shrink' }
+  $argv = @('-print-to', $PrinterName, '-print-settings', $scale, '-silent', '-exit-when-done', $FilePath)
   & $Sumatra @argv 2>&1 | Out-Null
   return $LASTEXITCODE
 }
