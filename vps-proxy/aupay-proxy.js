@@ -1706,9 +1706,11 @@ function yahooXmlOk(res) {
   // ★応答が途中で切れていないことも見る (Codex R11)。
   //   VPS には XML パーサを入れていないので厳密な検証はしないが、
   //   ルート要素が開いて閉じていることだけは確かめる (切断された応答を成功にしない)
-  const root = text.match(/<([A-Za-z][\w.:-]*)(?:\s[^>]*)?>/);
-  if (!root) return false;
-  if (!new RegExp(`</${root[1]}\\s*>\\s*$`, 'i').test(text.trim())) return false;
+  //   ★ルート要素は ResultSet であること。限定しないと <html>...<Status>OK</Status>...</html> のような
+  //     ページが通ってしまう (Codex R12)
+  const root = text.replace(/^\s*<\?xml[^>]*\?>\s*/i, '').match(/^\s*<([A-Za-z][\w.:-]*)(?:\s[^>]*)?>/);
+  if (!root || root[1] !== 'ResultSet') return false;
+  if (!/<\/ResultSet\s*>\s*$/i.test(text.trim())) return false;
   if (/<Status>\s*NG\s*<\/Status>/i.test(text)) return false;
   // ★中身のある <Error> だけを失敗とする。
   //   Yahoo は空の自己終了タグを「無し」の意味で使う (実測した submitItem の成功応答に
@@ -1981,6 +1983,10 @@ function runSelfTest() {
     yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status>' }), false);
   check('yahoo応答: 末尾に改行があっても成功のまま',
     yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status></Result></ResultSet>' + String.fromCharCode(10) }), true);
+  check('yahoo応答: ★HTML の中に Status OK があっても成功にしない',
+    yahooXmlOk({ status: 200, body: '<html><body><Status>OK</Status></body></html>' }), false);
+  check('yahoo応答: ★ルートが ResultSet 以外なら成功にしない',
+    yahooXmlOk({ status: 200, body: '<Other><Status>OK</Status></Other>' }), false);
   check('yahoo応答: XML宣言つきでも成功のまま',
     yahooXmlOk({ status: 200, body: '<?xml version="1.0"?><ResultSet><Status>OK</Status></ResultSet>' }), true);
   check('yahoo応答: 属性つきの Error も失敗',
