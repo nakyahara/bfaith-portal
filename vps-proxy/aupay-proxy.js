@@ -42,6 +42,20 @@ class TokenLocalError    extends Error { constructor(m) { super(m); this.name = 
 // ─── au PAY設定 ───
 const AUPAY_API_KEY = process.env.AUPAY_API_KEY || '';
 const AUPAY_BASE = 'https://api.manager.wowma.jp';
+const AUPAY_SHOP_ID = process.env.AUPAY_SHOP_ID || '54318092';
+/**
+ * 書き込みに使う店舗ID。
+ * ★読み取りは既定値に頼ってよいが、**書き込みは env が無ければ止める**。
+ *   設定漏れのまま既定の店舗へ書いてしまう (fail-open) のを防ぐ (Codex R1)。
+ */
+function requireAupayShopIdForWrite() {
+  const v = String(process.env.AUPAY_SHOP_ID || '').trim();
+  if (!/^\d{1,20}$/.test(v)) {
+    throw new Error('aupay/update-item: AUPAY_SHOP_ID (数字) が未設定です。'
+      + 'どの店に書くのかが決まらないため送信しません');
+  }
+  return v;
+}
 
 // ─── Yahoo設定 ───
 const YAHOO_CLIENT_ID = process.env.YAHOO_CLIENT_ID || '';
@@ -90,6 +104,137 @@ function assertExpectedForAll(items, expected) {
       throw new Error(`update-items: ${i + 1}件目 (${code}) の expected が整数ではありません (${want})`);
     }
   }
+}
+
+/** au PAY に送ってよい価格か (正の整数円)。★0円・空・負数・小数・文字列は通さない */
+const MAX_AUPAY_PRICE = 999999999;
+/** 書き込み経路の待ち時間。長く待つほど商品のロックを握り続けることになる */
+const AUPAY_WRITE_TIMEOUT_MS = 20000;
+function isSaneAupayPrice(v) {
+  const s = String(v ?? '').trim();
+  if (!/^\d+$/.test(s)) return false;
+  const n = Number(s);
+  return Number.isInteger(n) && n >= 1 && n <= MAX_AUPAY_PRICE;
+}
+
+/** au PAY の商品ごとのロック (読む→照合→送る を割り込ませない) */
+const aupayItemLocks = new Map();
+async function withAupayItemLock(codes, fn) {
+  // ★キーは正規化する。abc-1 と ABC-1 は同じ商品なので別のロックにしてはいけない
+  const keys = [...new Set((codes || []).map((c) => String(c).trim().toLowerCase()))].sort();
+  const prev = keys.map((k) => aupayItemLocks.get(k)).filter(Boolean);
+  let release;
+  const mine = new Promise((r) => { release = r; });
+  for (const k of keys) aupayItemLocks.set(k, mine);
+  try {
+    await Promise.all(prev);
+    return await fn();
+  } finally {
+    release();
+    for (const k of keys) if (aupayItemLocks.get(k) === mine) aupayItemLocks.delete(k);
+  }
+}
+
+/**
+ * この経路で送ってよいのは「商品コードと価格」だけ。
+ * ★au PAY の updateItemInfo が部分更新か全項目上書きかは **まだ確かめていない**
+ *   (Yahoo の editItem は省略した項目を消した)。どちらであっても、
+ *   ここを通れるのが価格だけなら「商品名を書き換える」経路は生まれない。
+ */
+const AUPAY_PRICE_ONLY_KEYS = new Set(['itemCode', 'itemPrice']);
+function assertAupayPriceOnly(item) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) {
+    throw new Error('aupay/update-item: item が商品の形をしていません');
+  }
+  for (const key of Object.keys(item)) {
+    if (!AUPAY_PRICE_ONLY_KEYS.has(key)) {
+      throw new Error(`aupay/update-item: 「${key}」は送れません `
+        + `(この経路は価格専用: ${[...AUPAY_PRICE_ONLY_KEYS].join(', ')})`);
+    }
+  }
+  const code = String(item.itemCode ?? '').trim();
+  if (!/^[A-Za-z0-9._-]{1,99}$/.test(code)) {
+    throw new Error(`aupay/update-item: itemCode が商品コードの形をしていません (${code})`);
+  }
+  if (!isSaneAupayPrice(item.itemPrice)) {
+    throw new Error(`aupay/update-item: itemPrice が 1〜${MAX_AUPAY_PRICE} の整数ではありません (${item.itemPrice})`);
+  }
+}
+
+/**
+ * au PAY の応答が成功か。
+ * ★au PAY は失敗も HTTP 200 + <status>1</status> で返す。HTTP だけ見てはいけない。
+ *   ルートが <response> であることも確かめる (別のものを掴んで成功にしない)。
+ */
+function aupayXmlOk(res) {
+  const text = String(res?.body || '');
+  if (!(res?.status >= 200 && res.status < 300)) return false;
+  // 宣言・BOM・先頭のコメントを外してからルート要素を見る
+  const withoutDecl = text.replace(/^\uFEFF/, '')
+    .replace(/^\s*<\?xml[^>]*\?>\s*/, '')
+    .replace(/^(?:\s*<!--[\s\S]*?-->\s*)+/, '');
+  if (!/^\s*<response[\s>]/.test(withoutDecl)) return false;
+  // ★status が複数あったら判断しない。1つでも 0 でないものがあれば失敗
+  const all = [...withoutDecl.matchAll(/<status>\s*([^<]*)\s*<\/status>/g)].map((m) => m[1].trim());
+  if (all.length === 0) return false;
+  return all.every((v) => v === '0');
+}
+
+/**
+ * updateItemInfo に送る本文を組み立てる。
+ *
+ * ★形式 (form-urlencoded / XML) が仕様書で確かめられていない。'form' と 'xml' の
+ *   どちらも組み立てられるようにして、実測でどちらが通るかを決める。
+ *   どちらの形でも **送るのは shopId と itemCode と itemPrice だけ**。
+ *
+ * @param {{itemCode:string, itemPrice:number|string}} item
+ * @param {string} shopId
+ * @param {'form'|'xml'} format
+ * @returns {{contentType:string, body:string}}
+ */
+function buildAupayUpdateBody(item, shopId, format = 'form') {
+  assertAupayPriceOnly(item);
+  const code = String(item.itemCode).trim();
+  const price = String(item.itemPrice).trim();
+  if (format === 'xml') {
+    // au PAY の応答と同じ入れ子をなぞる。中身は数字と商品コードだけなのでエスケープ不要だが、
+    // 念のため & < > は実体参照にする
+    const esc = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return {
+      contentType: 'application/xml; charset=utf-8',
+      body: '<?xml version="1.0" encoding="UTF-8"?>'
+        + `<request><shopId>${esc(shopId)}</shopId>`
+        + `<item><itemCode>${esc(code)}</itemCode><itemPrice>${esc(price)}</itemPrice></item></request>`,
+    };
+  }
+  return {
+    contentType: 'application/x-www-form-urlencoded',
+    body: new URLSearchParams({ shopId: String(shopId), itemCode: code, itemPrice: price }).toString(),
+  };
+}
+
+/** 照合のために「今の価格」を読む (au PAY) */
+async function readAupayItemForCheck(itemCode) {
+  const qs = new URLSearchParams({ shopId: AUPAY_SHOP_ID, itemCode: String(itemCode) }).toString();
+  const r = await fetch(`${AUPAY_BASE}/wmshopapi/searchItemInfo?${qs}`, {
+    headers: { Authorization: `Bearer ${AUPAY_API_KEY}` },
+    signal: AbortSignal.timeout(AUPAY_WRITE_TIMEOUT_MS),
+  });
+  const body = await r.text();
+  if (!aupayXmlOk({ status: r.status, body })) {
+    return { error: `いまの価格を読めません (HTTP ${r.status})` };
+  }
+  const infoM = body.match(/<itemInfo>([\s\S]*?)<\/itemInfo>/);
+  if (!infoM) return { error: 'この商品コードの商品が見つかりません' };
+  const gotCode = (infoM[1].match(/<itemCode>([^<]*)<\/itemCode>/) || [])[1];
+  if (String(gotCode || '').trim().toLowerCase() !== String(itemCode).trim().toLowerCase()) {
+    return { error: `読み取った商品コードが違います (${gotCode ?? 'なし'})` };
+  }
+  const rawPrice = (infoM[1].match(/<itemPrice>([^<]*)<\/itemPrice>/) || [])[1];
+  if (!/^\d+$/.test(String(rawPrice ?? '').trim())) {
+    return { error: 'いまの価格を整数円として読めません' };
+  }
+  return { price: Number(String(rawPrice).trim()) };
 }
 
 /** 商品ごとのロック。★self-test より前に置く (const は巻き上がらない) */
@@ -523,6 +668,29 @@ function readBody(req) {
   });
 }
 
+/**
+ * 上限つきで本文を読む。
+ * ★書き込みの口で無制限に読むと、大きな本文を投げ込まれるだけでメモリを食う。
+ *   価格を1件送るのに数KBも要らない (Codex R1)。
+ */
+function readBodyLimited(req, maxBytes = 8 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) {
+        req.destroy();
+        reject(new Error(`本文が大きすぎます (上限 ${maxBytes} バイト)`));
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    req.on('error', reject);
+  });
+}
+
 // ─── Yahoo myItemList XML parser (Phase E-7-a) ───
 //   Yahoo myItemList API のレスポンス XML を JSON 風 object に変換する。
 //   RYS client は { items: [{ItemCode, Name?, HasSubCode?}], totalResultsAvailable, totalResultsReturned, firstResultPosition }
@@ -887,6 +1055,89 @@ const server = http.createServer(async (req, res) => {
     // ═══════════════════════════════════════
     // au PAY Market ルート（/wmshopapi/...）
     // ═══════════════════════════════════════
+    // POST /aupay/update-item — au PAY の **価格だけ** を変える
+    //   body: { itemCode, itemPrice, expected, format? }
+    //   ★この口が保証するのは「**価格しか送らない**」ことであって、
+    //     「価格しか変わらない」ことではない。updateItemInfo が省略した項目を消す仕様なら、
+    //     価格だけ送っても商品名や説明が消える。**実測で確かめるまで本番の商品に使わない** (Codex R1)。
+    //   ★/wmshopapi/ の素通し中継は GET だけ。書き込みは「価格しか通れない」この口に限る。
+    //     素通しで POST を許すと、鍵を持つ誰でも商品を消せる (deleteItemInfos がある)。
+    //   ★expected (今いくらのはず) は必須。照合せずには送らない。
+    //   ★読む→照合→送る を商品ごとのロックで囲む (途中で割り込まれて誰かの変更を踏み潰さない)。
+    if (pathname === '/aupay/update-item' && req.method === 'POST') {
+      if (!AUPAY_API_KEY) throw new Error('aupay/update-item: AUPAY_API_KEY が未設定のため送信しません');
+      const shopIdForWrite = requireAupayShopIdForWrite();
+      const ct = String(req.headers['content-type'] || '');
+      if (!/^application\/json\b/.test(ct)) {
+        throw new Error(`aupay/update-item: Content-Type は application/json にしてください (${ct || 'なし'})`);
+      }
+      const raw = await readBodyLimited(req);
+      let body;
+      try { body = JSON.parse(raw); } catch (_) { throw new Error('aupay/update-item: invalid JSON body'); }
+
+      const item = { itemCode: body.itemCode, itemPrice: body.itemPrice };
+      assertAupayPriceOnly(item);
+      const want = String(body.expected ?? '').trim();
+      if (!/^\d+$/.test(want)) {
+        throw new Error('aupay/update-item: expected (今いくらのはず) が整数で必要です。照合せずに送ることはできません');
+      }
+      // ★知らない形式は黙って form に倒さない。タイプミスが別の送り方になるのを防ぐ (Codex R1)
+      const format = body.format === undefined ? 'form' : String(body.format);
+      if (format !== 'form' && format !== 'xml') {
+        throw new Error(`aupay/update-item: format は form か xml です (${format})`);
+      }
+
+      const outcome = await withAupayItemLock([item.itemCode], async () => {
+        const cur = await readAupayItemForCheck(item.itemCode);
+        if (cur.error) return { conflict: { itemCode: item.itemCode, reason: cur.error } };
+        if (cur.price !== Number(want)) {
+          return {
+            conflict: {
+              itemCode: item.itemCode,
+              reason: '現在価格が想定と違います',
+              expected: Number(want), live: cur.price,
+            },
+          };
+        }
+        const built = buildAupayUpdateBody(item, shopIdForWrite, format);
+        console.log(`[${ts()}] auPay updateItemInfo: ${item.itemCode} ${cur.price}円 -> ${item.itemPrice}円 (${format})`);
+        const r = await fetch(`${AUPAY_BASE}/wmshopapi/updateItemInfo`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${AUPAY_API_KEY}`,
+            'Content-Type': built.contentType,
+          },
+          body: built.body,
+          // ★止まったままだと商品のロックを握り続ける (Codex R1)
+          signal: AbortSignal.timeout(AUPAY_WRITE_TIMEOUT_MS),
+        });
+        const text = await r.text();
+        const updateOk = aupayXmlOk({ status: r.status, body: text });
+        console.log(`[${ts()}] auPay updateItemInfo: status=${r.status} ok=${updateOk}`);
+        return { status: r.status, text, updateOk, before: cur.price };
+      });
+
+      if (outcome.conflict) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'CONFLICT', conflict: outcome.conflict }));
+        return;
+      }
+      // ★au PAY は失敗も HTTP 200 で返す。そのまま 200 で返すと、
+      //   HTTP しか見ない呼び出し側が成功と読む (Codex R1)。読めない応答も同じ
+      const outStatus = outcome.updateOk ? outcome.status : (outcome.status >= 400 ? outcome.status : 502);
+      res.writeHead(outStatus, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: outcome.updateOk,
+        updateStatus: outcome.status,
+        before: outcome.before,
+        applied: outcome.updateOk ? Number(item.itemPrice) : null,
+        format,
+        // 形式が合っているかを外から見られるように、応答の頭を返す (長い本文は切る)
+        updateBody: String(outcome.text).slice(0, 800),
+      }));
+      return;
+    }
+
     if (pathname.startsWith('/wmshopapi/')) {
       if (!AUPAY_API_KEY) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -2306,12 +2557,101 @@ function runSelfTest() {
       buildUpdateItemsBody([{ item_code: 'a', subcode_price: 'aaaa:1000|bbbb:1200' }], 's').body.split('item1=')[1])),
     'item_code=a&subcode_price=aaaa:1000|bbbb:1200');
 
+  // ── au PAY: 価格だけを通す口 ──
+  const throws = (fn, label) => { try { fn(); check(label, 'とおった', '止まる'); } catch (_) { check(label, '止まる', '止まる'); } };
+
+  throws(() => assertAupayPriceOnly({ itemCode: 'a', itemPrice: 100, itemName: 'x' }),
+    'auPay: ★商品名は送れない (この経路は価格専用)');
+  throws(() => assertAupayPriceOnly({ itemCode: 'a', itemPrice: 100, description: 'x' }),
+    'auPay: ★説明文は送れない');
+  throws(() => assertAupayPriceOnly({ itemCode: 'a', itemPrice: 0 }), 'auPay: ★0円は通さない');
+  throws(() => assertAupayPriceOnly({ itemCode: 'a', itemPrice: -1 }), 'auPay: ★負の値は通さない');
+  throws(() => assertAupayPriceOnly({ itemCode: 'a', itemPrice: '1000円' }), 'auPay: ★数字以外は通さない');
+  throws(() => assertAupayPriceOnly({ itemCode: 'a', itemPrice: 1.5 }), 'auPay: ★小数は通さない');
+  throws(() => assertAupayPriceOnly({ itemCode: '', itemPrice: 100 }), 'auPay: ★商品コードが空なら通さない');
+  throws(() => assertAupayPriceOnly({ itemCode: 'a b/../x', itemPrice: 100 }),
+    'auPay: ★商品コードに変な文字があれば通さない');
+  throws(() => assertAupayPriceOnly({ itemCode: 'a', itemPrice: 1000000000 }),
+    'auPay: ★上限を超える価格は通さない');
+
+  check('auPay: まっとうな価格は通る', (() => {
+    try { assertAupayPriceOnly({ itemCode: 'zz-1', itemPrice: 980 }); return 'とおった'; }
+    catch (e) { return e.message; }
+  })(), 'とおった');
+
+  check('auPay: form 形式の本文',
+    buildAupayUpdateBody({ itemCode: 'zz-1', itemPrice: 981 }, '54318092', 'form').body,
+    'shopId=54318092&itemCode=zz-1&itemPrice=981');
+  check('auPay: form の Content-Type',
+    buildAupayUpdateBody({ itemCode: 'zz-1', itemPrice: 981 }, '5', 'form').contentType,
+    'application/x-www-form-urlencoded');
+  check('auPay: xml 形式にも商品コードと価格しか入らない',
+    buildAupayUpdateBody({ itemCode: 'zz-1', itemPrice: 981 }, '5', 'xml').body.includes('<itemPrice>981</itemPrice>')
+      && buildAupayUpdateBody({ itemCode: 'zz-1', itemPrice: 981 }, '5', 'xml').body.includes('<itemCode>zz-1</itemCode>'),
+    true);
+
+  check('auPay応答: status 0 は成功',
+    aupayXmlOk({ status: 200, body: '<response><result><status>0</status></result></response>' }), true);
+  check('auPay応答: ★HTTP 200 でも status 1 は失敗',
+    aupayXmlOk({ status: 200, body: '<response><result><status>1</status><error><code>CME0021</code></error></result></response>' }), false);
+  check('auPay応答: ★ルートが response 以外なら成功にしない',
+    aupayXmlOk({ status: 200, body: '<other><status>0</status></other>' }), false);
+  check('auPay応答: XML宣言つきでも読める',
+    aupayXmlOk({ status: 200, body: '<?xml version="1.0" encoding="UTF-8"?><response><result><status>0</status></result></response>' }), true);
+  check('auPay応答: ★5xx は成功にしない',
+    aupayXmlOk({ status: 500, body: '<response><result><status>0</status></result></response>' }), false);
+  check('auPay応答: ★status が 0 と 1 の両方あれば成功にしない',
+    aupayXmlOk({ status: 200, body: '<response><result><status>0</status></result><x><status>1</status></x></response>' }), false);
+  check('auPay応答: BOM がついていても読める',
+    aupayXmlOk({ status: 200, body: '\uFEFF<response><result><status>0</status></result></response>' }), true);
+  check('auPay応答: 先頭のコメントを飛ばして読める',
+    aupayXmlOk({ status: 200, body: '<!-- generated --><response><result><status>0</status></result></response>' }), true);
+  check('auPay応答: ★閉じていない XML は成功にしない',
+    aupayXmlOk({ status: 200, body: '<response><result><status>0' }), false);
+  check('auPay応答: ★空の本文は成功にしない', aupayXmlOk({ status: 200, body: '' }), false);
+  check('auPay応答: ★HTML に status 0 が入っていても成功にしない',
+    aupayXmlOk({ status: 200, body: '<html><status>0</status></html>' }), false);
+  check('auPay応答: 属性つきの response でも読める',
+    aupayXmlOk({ status: 200, body: '<response xmlns="x"><result><status>0</status></result></response>' }), true);
+
+  // 店舗ID: 書き込みでは env が無ければ止める (既定値に頼らない)
+  {
+    const save = process.env.AUPAY_SHOP_ID;
+    delete process.env.AUPAY_SHOP_ID;
+    check('auPay: ★店舗IDが無ければ書き込みを止める',
+      (() => { try { requireAupayShopIdForWrite(); return 'とおった'; } catch (_) { return '止まる'; } })(), '止まる');
+    process.env.AUPAY_SHOP_ID = 'abc';
+    check('auPay: ★店舗IDが数字でなければ止める',
+      (() => { try { requireAupayShopIdForWrite(); return 'とおった'; } catch (_) { return '止まる'; } })(), '止まる');
+    process.env.AUPAY_SHOP_ID = '54318092';
+    check('auPay: 数字の店舗IDは通る', requireAupayShopIdForWrite(), '54318092');
+    if (save === undefined) delete process.env.AUPAY_SHOP_ID; else process.env.AUPAY_SHOP_ID = save;
+  }
+
+  // 同じ商品への同時要求は待たされる / 別商品は待たされない (au PAY 側のロック)
+  const aupayLockCheck = (async () => {
+    const order = [];
+    const slow = withAupayItemLock(['zz-1'], async () => {
+      order.push('A入'); await new Promise((r) => setTimeout(r, 30)); order.push('A出'); });
+    await new Promise((r) => setTimeout(r, 5));
+    // ★大小文字が違っても同じ商品として待たせる
+    const fast = withAupayItemLock(['ZZ-1'], async () => { order.push('B入'); });
+    const other = withAupayItemLock(['zz-2'], async () => { order.push('C入'); });
+    await Promise.all([slow, fast, other]);
+    check('auPay ロック: ★大小文字違いでも同じ商品として待たせる',
+      order.indexOf('A出') < order.indexOf('B入'), true);
+    check('auPay ロック: 別商品は待たされない', order.indexOf('C入') < order.indexOf('A出'), true);
+  })();
+
+  check('auPay応答: ★status が無ければ成功にしない',
+    aupayXmlOk({ status: 200, body: '<response><result></result></response>' }), false);
+
   // 6) 既存の挙動が壊れていないこと (Path は PathList 内の origFlag=1 優先)
   const paths = `<Result><PathList><Path>その他</Path><Path origFlag="1">本命</Path></PathList></Result>`;
   check('Path: origFlag優先', parseGetItemDetailXml(paths).Path, '本命');
 
   // ★非同期の検証が終わってから結果を出す (待たないと「pass」と言って落ちる)
-  lockCheck.then(() => {
+  Promise.all([lockCheck, aupayLockCheck]).then(() => {
     console.log(failed === 0 ? '\n✅ self-test 全件 pass' : `\n❌ ${failed} 件 FAIL`);
     process.exit(failed === 0 ? 0 : 1);
   });
