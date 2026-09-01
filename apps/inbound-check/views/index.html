@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="入荷チェック">
+  <title>入荷受付チェック | B-Faith Portal</title>
+  <link rel="manifest" href="/apps/inbound-check/manifest.json">
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="apple-touch-icon" href="/favicon.png">
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; background: #f1f3f5; color: #212529; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+    body { padding-bottom: 40px; }
+    .top { position: sticky; top: 0; z-index: 20; background: #fff; border-bottom: 1px solid #dee2e6; padding: 8px 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    .top-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .top h1 { font-size: 1.05em; margin: 0; white-space: nowrap; }
+    .stat { font-size: 1.0em; font-weight: 700; color: #1864ab; white-space: nowrap; }
+    .stat small { font-weight: 400; color: #495057; }
+    .meta { font-size: 0.78em; color: #868e96; white-space: nowrap; }
+    .spacer { flex: 1; }
+    .worker { border: 1px solid #ced4da; border-radius: 20px; padding: 6px 14px; background: #fff; font-size: 0.95em; cursor: pointer; white-space: nowrap; }
+    .worker.none { border-color: #e03131; color: #c92a2a; background: #fff5f5; }
+    .ctl { display: flex; gap: 8px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
+    .seg { display: inline-flex; border: 1px solid #ced4da; border-radius: 8px; overflow: hidden; }
+    .seg button { border: 0; background: #fff; padding: 8px 14px; font-size: 0.95em; cursor: pointer; }
+    .seg button.on { background: #1c7ed6; color: #fff; }
+    .search { flex: 1; min-width: 160px; padding: 8px 10px; font-size: 1em; border: 1px solid #ced4da; border-radius: 8px; }
+    .banner { display: none; margin: 8px 12px 0; padding: 10px 12px; border-radius: 8px; font-size: 0.92em; }
+    .banner.warn { display: block; background: #fff3bf; color: #7a5c00; }
+    .banner.err { display: block; background: #ffe3e3; color: #a61e1e; }
+    .banner button { margin-left: 10px; }
+    .wrap { padding: 10px 12px; }
+    .empty { text-align: center; color: #868e96; padding: 60px 10px; font-size: 1.05em; line-height: 1.8; }
+    .slip { background: #fff; border-radius: 12px; margin-bottom: 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); overflow: hidden; }
+    .slip-h { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; }
+    .slip-h .ar { font-weight: 700; font-size: 1.05em; }
+    .slip-h .dates { color: #495057; font-size: 0.85em; }
+    .slip-h .cnt { margin-left: auto; font-weight: 700; color: #1864ab; white-space: nowrap; }
+    .slip-h .cnt.done { color: #2b8a3e; }
+    .bar { height: 6px; background: #e9ecef; }
+    .bar > i { display: block; height: 100%; background: #40c057; width: 0; transition: width .2s; }
+    .slip.collapsed .lines { display: none; }
+    .slip-h .chev { color: #adb5bd; font-size: 0.9em; }
+    .line { display: flex; gap: 12px; padding: 10px 14px; border-top: 1px solid #f1f3f5; align-items: flex-start; cursor: pointer; user-select: none; }
+    .line.checked { background: #ebfbee; }
+    .line .box { flex: 0 0 44px; height: 44px; border: 2px solid #adb5bd; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 1.5em; color: #fff; background: #fff; margin-top: 2px; }
+    .line.checked .box { background: #40c057; border-color: #40c057; }
+    .line .body { flex: 1; min-width: 0; }
+    .line .name { font-size: 1.0em; line-height: 1.35; word-break: break-all; }
+    .line .code { font-size: 0.82em; color: #868e96; margin-right: 8px; }
+    .line .qty { font-size: 1.25em; font-weight: 700; color: #1864ab; margin-top: 4px; }
+    .line .qty small { font-size: 0.7em; font-weight: 400; color: #495057; margin-left: 6px; }
+    .line .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; font-size: 0.82em; }
+    .tag { border-radius: 6px; padding: 3px 8px; background: #f1f3f5; color: #343a40; white-space: nowrap; }
+    .tag.loc { background: #e7f5ff; color: #1864ab; font-weight: 700; }
+    .tag.loc-store { background: #f3f0ff; color: #5f3dc4; }
+    .tag.loc-none { background: #fff4e6; color: #d9480f; }
+    .tag.iroha { background: #fff3bf; color: #7a5c00; font-weight: 700; }
+    .tag.direct { background: #d3f9d8; color: #2b8a3e; }
+    .tag.seal { background: #ffe8cc; color: #d9480f; }
+    .tag.warn { background: #ffe3e3; color: #a61e1e; }
+    .line .who { font-size: 0.8em; color: #2b8a3e; margin-top: 4px; }
+    .line .prev { font-size: 0.78em; color: #adb5bd; margin-top: 3px; }
+    .line.pending { opacity: 0.6; }
+    .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 50; align-items: center; justify-content: center; }
+    .overlay.on { display: flex; }
+    .modal { background: #fff; border-radius: 14px; padding: 18px; width: min(92vw, 480px); }
+    .modal h2 { margin: 0 0 12px; font-size: 1.05em; }
+    .modal .opts { display: flex; flex-wrap: wrap; gap: 10px; }
+    .modal .opts button { font-size: 1.1em; padding: 14px 20px; border-radius: 10px; border: 1px solid #ced4da; background: #fff; cursor: pointer; }
+    .modal .hint { color: #868e96; font-size: 0.85em; margin-top: 10px; }
+    .modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+    .modal .actions button { padding: 10px 18px; border-radius: 8px; border: 1px solid #ced4da; background: #fff; font-size: 1em; cursor: pointer; }
+    .modal .actions button.danger { background: #e03131; border-color: #e03131; color: #fff; }
+    .legend { font-size: 0.78em; color: #868e96; padding: 6px 12px 0; line-height: 1.6; }
+    .foot { text-align: center; font-size: 0.8em; color: #adb5bd; padding: 20px; }
+    .foot a { color: #868e96; }
+    @media (max-width: 600px) { .line .box { flex-basis: 40px; height: 40px; } .meta { display: none; } }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div class="top-row">
+      <h1>📦 入荷受付チェック</h1>
+      <span class="stat" id="stat">—</span>
+      <span class="meta" id="meta"></span>
+      <span class="spacer"></span>
+      <button class="worker none" id="workerBtn" type="button">👤 作業者を選ぶ</button>
+    </div>
+    <div class="ctl">
+      <div class="seg">
+        <button type="button" data-filter="todo" class="on">未確認のみ</button>
+        <button type="button" data-filter="all">全部</button>
+      </div>
+      <input class="search" id="q" type="search" placeholder="商品名・商品ID・JAN で検索" autocomplete="off">
+    </div>
+  </div>
+  <div class="banner" id="banner"></div>
+  <div class="legend">凡例: 📍=ピックロケ (現在庫のロケ・配置指示ではありません) / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り</div>
+  <div class="wrap" id="list"></div>
+  <div class="foot"><a href="/apps/inbound-check/admin">管理画面 (取込・端末)</a> ・ <a href="/">ポータル</a></div>
+
+  <div class="overlay" id="workerPick">
+    <div class="modal">
+      <h2>作業者を選んでください</h2>
+      <div class="opts" id="workerOpts"></div>
+      <div class="hint">名前は確認の記録に残ります (自己申告。端末名と組で記録)</div>
+      <div class="actions"><button type="button" id="workerCancel">閉じる</button></div>
+    </div>
+  </div>
+
+  <div class="overlay" id="confirmUncheck">
+    <div class="modal">
+      <h2>確認を取り消しますか?</h2>
+      <div id="uncheckTarget" style="font-size:0.95em; line-height:1.5"></div>
+      <div class="actions">
+        <button type="button" id="uncheckCancel">やめる</button>
+        <button type="button" class="danger" id="uncheckOk">取り消す</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API = '/apps/inbound-check/api';
+    const LS_CODE = 'ic_worker_code', LS_NAME = 'ic_worker_name';
+    let state = { batch: null, slips: [], lines: [], totals: { lines: 0, checked: 0 }, workers: [], me: {} };
+    let filter = 'todo';
+    let query = '';
+    let lastJson = '';
+    const collapsed = new Set();
+    const pending = new Set();
+    let pollTimer = null;
+
+    const $ = s => document.querySelector(s);
+    const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    function workerCode() { try { return localStorage.getItem(LS_CODE) || ''; } catch { return ''; } }
+    function workerName() { try { return localStorage.getItem(LS_NAME) || ''; } catch { return ''; } }
+    function setWorker(code, name) { try { localStorage.setItem(LS_CODE, code); localStorage.setItem(LS_NAME, name); } catch {} renderWorker(); }
+    function renderWorker() {
+      const b = $('#workerBtn');
+      const n = workerName();
+      const valid = n && state.workers.some(w => w.code === workerCode());
+      if (valid) { b.textContent = '👤 ' + n; b.classList.remove('none'); }
+      else if (state.me && state.me.session && !n) { b.textContent = '👤 ' + state.me.session; b.classList.remove('none'); }
+      else { b.textContent = '👤 作業者を選ぶ'; b.classList.add('none'); }
+    }
+    function hasWorker() {
+      return (workerName() && state.workers.some(w => w.code === workerCode())) || (state.me && state.me.session);
+    }
+
+    function fmtJst(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return iso;
+      const p = new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(d);
+      return p;
+    }
+    function fmtDate(s) { return s ? s.slice(5).replace('-', '/') : '-'; }
+
+    function banner(kind, html) {
+      const b = $('#banner');
+      if (!kind) { b.className = 'banner'; b.innerHTML = ''; return; }
+      b.className = 'banner ' + kind; b.innerHTML = html;
+    }
+
+    async function load() {
+      try {
+        const r = await fetch(API + '/state', { cache: 'no-store' });
+        if (r.status === 401) { location.href = '/login'; return; }
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.message || j.error);
+        const s = JSON.stringify(j);
+        if (s !== lastJson) {
+          lastJson = s;
+          state = j;
+          render();
+        }
+        // 最新の一覧を取得できた = 旧バッチ警告と通信エラーは解除
+        if (stale) { stale = false; banner(null); }
+        if ($('#banner').classList.contains('err')) banner(null);
+      } catch (e) {
+        banner('err', '通信できません (' + esc(e.message) + ')。表示は最後に取得した内容です');
+      }
+    }
+
+    function qtyHtml(l) {
+      const irisu = l.info && Number.isInteger(l.info.irisu) && l.info.irisu > 0 ? l.info.irisu : null;
+      let s = '予定 ' + l.planned_qty + ' 個';
+      if (irisu) {
+        const q = Math.floor(l.planned_qty / irisu), rem = l.planned_qty % irisu;
+        s += '<small>入数 ' + irisu + ' 個 → ' + q + ' ケース' + (rem ? ' + ' + rem + ' 個' : '') + '</small>';
+      } else {
+        s += '<small>入数 未登録</small>';
+      }
+      return s;
+    }
+
+    function tagsHtml(l) {
+      const t = [];
+      if (l.loc_source === 'pick') t.push('<span class="tag loc">📍 ' + esc(l.pick_locs.map(x => x.loc).join(' / ')) + '</span>');
+      else if (l.loc_source === 'storage') t.push('<span class="tag loc-store">保管 ' + esc(l.other_locs[0].loc) + ' (ピックロケなし)</span>');
+      else t.push('<span class="tag loc-none">ロケ未取得</span>');
+      const i = l.info;
+      if (!i) t.push('<span class="tag warn">入庫情報 未登録</span>');
+      else {
+        if (i.iroha && /有/.test(i.iroha)) t.push('<span class="tag iroha">🏠 いろは: ' + esc(i.iroha) + '</span>');
+        else if (i.iroha && i.iroha !== '－' && i.iroha !== '-') t.push('<span class="tag">いろは: ' + esc(i.iroha) + '</span>');
+        if (i.direct_pick && /有/.test(i.direct_pick)) t.push('<span class="tag direct">直ピック</span>');
+        if (i.bc_seal && /(要|有|必要|あり)/.test(i.bc_seal)) t.push('<span class="tag seal">シール: ' + esc(i.bc_seal) + '</span>');
+        if (i.storage_form && i.storage_form !== '－' && i.storage_form !== '-') t.push('<span class="tag">荷姿: ' + esc(i.storage_form) + '</span>');
+        if (i.memo) t.push('<span class="tag">📝 ' + esc(i.memo) + '</span>');
+      }
+      return t.join('');
+    }
+
+    function matches(l) {
+      if (filter === 'todo' && l.check_status === 'checked') return false;
+      if (!query) return true;
+      const q = query.toLowerCase();
+      return (l.product_name || '').toLowerCase().includes(q) || (l.product_id || '').toLowerCase().includes(q) || (l.barcode || '').includes(q);
+    }
+
+    function render() {
+      renderWorker();
+      const b = state.batch;
+      const t = state.totals;
+      if (!b) {
+        $('#stat').textContent = '取込なし';
+        $('#meta').textContent = '';
+        $('#list').innerHTML = '<div class="empty">まだ入荷受付のCSVが取り込まれていません。<br>管理画面から取り込んでください。</div>';
+        return;
+      }
+      $('#stat').innerHTML = '伝票 ' + state.slips.length + ' 件 <small>／</small> 確認 ' + t.checked + ' / ' + t.lines + ' 行';
+      $('#meta').textContent = 'CSV ' + fmtJst(b.csv_generated_at) + ' 生成 ・ ' + fmtJst(b.imported_at) + ' 取込';
+      if (state.lines.length === 0) {
+        $('#list').innerHTML = '<div class="empty">受付済の入荷伝票はありません<br><small>(CSV ' + esc(fmtJst(b.csv_generated_at)) + ' 生成)</small></div>';
+        return;
+      }
+      const bySlip = new Map();
+      for (const l of state.lines) { if (!bySlip.has(l.ar_no)) bySlip.set(l.ar_no, []); bySlip.get(l.ar_no).push(l); }
+      const parts = [];
+      let shown = 0;
+      for (const s of state.slips) {
+        const lines = (bySlip.get(s.ar_no) || []).filter(matches);
+        if (lines.length === 0 && (filter === 'todo' || query)) continue;
+        shown++;
+        const done = s.checked_count >= s.line_count;
+        const pct = s.line_count ? Math.round(s.checked_count * 100 / s.line_count) : 0;
+        const isCollapsed = collapsed.has(s.ar_no);
+        parts.push('<div class="slip' + (isCollapsed ? ' collapsed' : '') + '" data-ar="' + esc(s.ar_no) + '">'
+          + '<div class="slip-h" data-toggle="' + esc(s.ar_no) + '"><span class="ar">' + esc(s.ar_no) + '</span>'
+          + '<span class="dates">予定 ' + esc(fmtDate(s.planned_date)) + ' ・ 受付 ' + esc(fmtDate(s.received_date)) + '</span>'
+          + '<span class="cnt' + (done ? ' done' : '') + '">' + (done ? '✅ ' : '') + '確認 ' + s.checked_count + ' / ' + s.line_count + '</span>'
+          + '<span class="chev">' + (isCollapsed ? '▶' : '▼') + '</span></div>'
+          + '<div class="bar"><i style="width:' + pct + '%"></i></div>'
+          + '<div class="lines">' + lines.map(lineHtml).join('') + '</div></div>');
+      }
+      if (shown === 0) {
+        parts.push('<div class="empty">' + (query ? '検索に一致する明細はありません' : '🎉 未確認の明細はありません (全部確認済み)') + '</div>');
+      }
+      $('#list').innerHTML = parts.join('');
+    }
+
+    function lineHtml(l) {
+      const checked = l.check_status === 'checked';
+      return '<div class="line' + (checked ? ' checked' : '') + (pending.has(l.line_key) ? ' pending' : '') + '" data-key="' + esc(l.line_key) + '" data-version="' + l.version + '">'
+        + '<div class="box">' + (checked ? '✓' : '') + '</div>'
+        + '<div class="body">'
+        + '<div class="name"><span class="code">' + esc(l.product_id) + '</span>' + esc(l.product_name) + '</div>'
+        + '<div class="qty">' + qtyHtml(l) + '</div>'
+        + '<div class="tags">' + tagsHtml(l) + '</div>'
+        + (checked ? '<div class="who">✅ ' + esc(l.checked_by || '') + ' ' + esc(fmtJst(l.checked_at)) + '</div>' : '')
+        + (!checked && l.prev_checked ? '<div class="prev">前回 ' + esc(fmtJst(l.prev_checked.at)) + ' に ' + esc(l.prev_checked.by || '') + ' が確認済み (今日は未確認)</div>' : '')
+        + '</div></div>';
+    }
+
+    // stale: 旧バッチを表示している間は操作を止め、最新の一覧を取得できるまで警告を出し続ける
+    let stale = false;
+
+    function applyServerState(line, s) {
+      Object.assign(line, { check_status: s.status, version: s.version, checked_by: s.checked_by, checked_at: s.checked_at });
+    }
+
+    async function send(action, line) {
+      if (stale) { banner('warn', '一覧が更新されています。最新の一覧を読み込むまで操作できません'); load(); return; }
+      if (!hasWorker()) { openWorkerPick(); return; }
+      if (pending.has(line.line_key)) return;
+      pending.add(line.line_key);
+      // 楽観表示 (送信前の状態を控えておき、結果が確定しない時は必ず戻す — Codex R3 High)
+      const snapshot = { check_status: line.check_status, version: line.version, checked_by: line.checked_by, checked_at: line.checked_at };
+      const rollback = () => Object.assign(line, snapshot);
+      line.check_status = action === 'check' ? 'checked' : 'unchecked';
+      if (action === 'check') { line.checked_by = workerName() || (state.me.session || ''); line.checked_at = new Date().toISOString(); }
+      recount(); render();
+      let needReload = false;
+      try {
+        const r = await fetch(API + '/lines/' + action, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ batch_id: state.batch.id, line_key: line.line_key, expect_version: snapshot.version, worker_code: workerCode() || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.status === 401) { location.href = '/login'; return; }
+        if (!j.ok) {
+          rollback();
+          if (j.error === 'stale_batch') { stale = true; banner('warn', '一覧が更新されました。最新の一覧を読み込んでいます…'); needReload = true; }
+          else if (j.error === 'conflict') { if (j.current) applyServerState(line, j.current); banner('warn', '他の端末で先に更新されました。最新の状態を表示します'); needReload = true; }
+          else if (j.error === 'worker_required') { banner('warn', esc(j.message)); openWorkerPick(); }
+          else { banner('err', esc(j.message || j.error || 'エラー')); needReload = true; }
+        } else {
+          applyServerState(line, j.state);
+          banner(null);
+        }
+      } catch (e) {
+        rollback();
+        banner('err', '送信できませんでした (' + esc(e.message) + ')。通信が戻ったらもう一度タップしてください');
+        needReload = true;
+      } finally {
+        pending.delete(line.line_key);
+        recount(); render();
+        if (needReload) { lastJson = ''; await load(); }
+      }
+    }
+
+    function recount() {
+      const c = new Map();
+      let checked = 0;
+      for (const l of state.lines) if (l.check_status === 'checked') { checked++; c.set(l.ar_no, (c.get(l.ar_no) || 0) + 1); }
+      for (const s of state.slips) s.checked_count = c.get(s.ar_no) || 0;
+      state.totals = { lines: state.lines.length, checked };
+    }
+
+    let uncheckLine = null;
+    $('#list').addEventListener('click', (ev) => {
+      const h = ev.target.closest('[data-toggle]');
+      if (h) {
+        const ar = h.getAttribute('data-toggle');
+        if (collapsed.has(ar)) collapsed.delete(ar); else collapsed.add(ar);
+        render(); return;
+      }
+      const el = ev.target.closest('.line');
+      if (!el) return;
+      const line = state.lines.find(l => l.line_key === el.getAttribute('data-key'));
+      if (!line) return;
+      if (line.check_status === 'checked') {
+        uncheckLine = line;
+        $('#uncheckTarget').innerHTML = '<b>' + esc(line.product_name) + '</b><br>' + esc(line.checked_by || '') + ' が ' + esc(fmtJst(line.checked_at)) + ' に確認';
+        $('#confirmUncheck').classList.add('on');
+      } else {
+        send('check', line);
+      }
+    });
+    $('#uncheckCancel').addEventListener('click', () => { $('#confirmUncheck').classList.remove('on'); uncheckLine = null; });
+    $('#uncheckOk').addEventListener('click', () => { const l = uncheckLine; $('#confirmUncheck').classList.remove('on'); uncheckLine = null; if (l) send('uncheck', l); });
+
+    function openWorkerPick() {
+      const box = $('#workerOpts');
+      if (state.workers.length === 0) {
+        box.innerHTML = '<span style="color:#c92a2a">作業者が登録されていません。管理画面で登録してください</span>';
+      } else {
+        box.innerHTML = state.workers.map(w => '<button type="button" data-code="' + esc(w.code) + '" data-name="' + esc(w.name) + '">' + esc(w.name) + '</button>').join('');
+      }
+      $('#workerPick').classList.add('on');
+    }
+    $('#workerBtn').addEventListener('click', openWorkerPick);
+    $('#workerCancel').addEventListener('click', () => $('#workerPick').classList.remove('on'));
+    $('#workerOpts').addEventListener('click', (ev) => {
+      const b = ev.target.closest('button[data-code]');
+      if (!b) return;
+      setWorker(b.getAttribute('data-code'), b.getAttribute('data-name'));
+      $('#workerPick').classList.remove('on');
+    });
+
+    document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
+      filter = b.getAttribute('data-filter');
+      document.querySelectorAll('.seg button').forEach(x => x.classList.toggle('on', x === b));
+      render();
+    }));
+    $('#q').addEventListener('input', () => { query = $('#q').value.trim(); render(); });
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(() => { if (document.visibilityState === 'visible') load(); }, 5000);
+    }
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') load(); });
+    load().then(startPolling);
+  </script>
+</body>
+</html>

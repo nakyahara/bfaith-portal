@@ -53,6 +53,7 @@ import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
 import giftsetAssemblyRouter from './apps/giftset-assembly/router.js';
 import inboundInfoRouter from './apps/inbound-info/router.js';
 import { startInboundInfoCron } from './apps/inbound-info/sync-job.js';
+import inboundCheckRouter from './apps/inbound-check/router.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
 import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorkerRouter } from './apps/packing-dispatch/router.js';
 import packingDispatchRuleChangeApiRouter from './apps/packing-dispatch/rule-change-api.js';
@@ -720,6 +721,15 @@ const apps = [
     category: 'shipping',
   },
   {
+    id: 'inbound-check',
+    name: '入荷受付チェック (iPad)',
+    description: 'ロジザードの入荷受付伝票 (紙) を iPad に置き換え。届いた行を1タップで消し込み、入数・ピックロケ・行き先を表示',
+    icon: '📦',
+    path: '/apps/inbound-check/',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
     id: 'giftset-assembly',
     name: 'ギフトセット組み依頼',
     description: '構成品のピッキング表(ロジザード貼り付け)と子会社Notionの作業カードを発行',
@@ -1328,6 +1338,9 @@ app.use('/apps/ai-insights', requireAppAccess('ai-insights'), express.json({ lim
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);
 app.use('/apps/inbound-info', requireAppAccess('inbound-info'), express.json({ limit: '256kb' }), inboundInfoRouter);
+// 入荷受付チェック (iPad): picking と同じく requireAppAccess を掛けない (登録端末Cookie を通すため)。
+// 認可は router 内 (セッション or 端末Cookie。管理系はセッション必須・端末登録等は admin)
+app.use('/apps/inbound-check', express.json({ limit: '256kb' }), inboundCheckRouter);
 // MF仕訳用 証憑リンク集 (apps/shohyo-links): 専用DB shohyo-links.db (DATA_DIR)。Notion「支払い関係リンク先」の移行先
 // limit 8mb = MF照合画面の証憑添付 (MFの上限5MBファイル → base64で約6.7MB) を受けるため
 app.use('/apps/shohyo-links', requireAppAccess('shohyo-links'), express.json({ limit: '8mb' }), shohyoLinksRouter);
