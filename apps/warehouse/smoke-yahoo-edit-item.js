@@ -19,6 +19,8 @@
  *     (コードの取り違えで本番商品を触らないため)
  *   - 送る項目は item_code / price のみ。他の項目は一切送らない (それが検証の目的)
  *   - 価格が整数で読めなければ書き込まない
+ *   - 送信の応答が返らなかった回は、戻したあとも時間を置いて確かめ直し、
+ *     最後は「あとで管理画面でもう一度確かめてください」と人に引き継ぐ (証明できないため)
  *
  * 実行 (miniPC):
  *   node apps/warehouse/smoke-yahoo-edit-item.js zz-yahoo-m0-0901            … 見るだけ
@@ -192,7 +194,11 @@ async function main() {
 
 /**
  * 応答が返らなかった送信が遅れて効いてくる場合に備え、時間を置いて確かめ直す。
- * 違っていたらもう一度戻す。決着が付かなければ人に知らせる。
+ * 違っていたらもう一度戻す。
+ *
+ * ★この関数は「大丈夫でした」とは言わない。応答が返らなかった送信について
+ *   「この後もう効かない」ことは、どれだけ待っても証明できないため (Codex R4)。
+ *   最後は必ず「あとで管理画面で確かめてください」と人に引き継いで終了コード 1 にする。
  */
 async function settleAfterUncertainSend(code, wantPrice) {
   for (let i = 1; i <= SETTLE_ROUNDS; i++) {
@@ -205,7 +211,7 @@ async function settleAfterUncertainSend(code, wantPrice) {
       console.error(`  確かめられませんでした (${e.message})`);
       continue;
     }
-    if (now === wantPrice) { console.log(`  価格は ${wantPrice} のままです`); if (i === SETTLE_ROUNDS) return; continue; }
+    if (now === wantPrice) { console.log(`  価格は ${wantPrice} のままです`); continue; }
     console.error(`  🚨 価格が ${now} に変わっていました (遅れて効いた送信)。もう一度 ${wantPrice} に戻します`);
     try {
       const r = await editPrice(code, wantPrice);
@@ -217,7 +223,11 @@ async function settleAfterUncertainSend(code, wantPrice) {
       return;
     }
   }
-  console.error(`🚨 決着が付きませんでした。Yahoo の管理画面で ${code} の価格が ${wantPrice} か確かめてください`);
+  // ★ここで「もう大丈夫」とは言えない。応答が返らなかった送信は、待ち時間を何倍にしても
+  //   「この後もう効かない」ことを証明できない (Codex R4)。確かめるのを人に引き継ぐ。
+  console.error(`\n⚠️ この回は送信の結果が分かりませんでした。`);
+  console.error(`   いまの価格は確認しましたが、この後さらに遅れて効く可能性が残ります。`);
+  console.error(`   あとで Yahoo の管理画面で ${code} の価格が ${wantPrice} 円か、もう一度確かめてください。`);
   process.exitCode = 1;
 }
 
