@@ -483,6 +483,35 @@ function splitImageRows(imageRows) {
   };
 }
 
+/**
+ * 「画像の制作はここまでで終わり」の境界 = ⑦Amazon登録依頼 (最終デザイン確認を兼ねる)。
+ * これより後の ⑧楽天登録・⑨A+登録 は**作った画像をモールに載せる後工程**なので、
+ * そこに来ていればカードは「済」にする (2026-09-01 中原さん:「画像で並べるステータスが
+ * 楽天登録に移動したらカードは済にしてほしい」)。
+ * 工程コードでなく image_stage で見るのは、管理画面での改名で壊れないため
+ * (image_stage は「TOP/詳細の同じ段階を 1 列にまとめる安定キー」として置いてある)。
+ */
+export const IMAGE_MADE_BOUNDARY_STAGE = 'amazon';
+
+/**
+ * 商品詳細画像が作り終わっているか。
+ * 🚨**並び順 (sort) に依存させない** (Codex R2/R3 medium): 管理画面で工程を並べ替え・追加できるので、
+ * 「いま楽天登録にいる」「境界より前の行だけ見る」はどちらも崩れる (楽天を前に動かせば ⑥未完了でも
+ * current が楽天になり、⑦自体を前に動かせば後ろに残った ⑥ を見落とす)。
+ * 見るのは属性だけ:
+ *   ① 楽天出品ゲートに数える工程 (listing_gate=1 = ①〜⑥) がすべて決着している (gateDone)
+ *   ② 境界工程 ⑦Amazon登録依頼 (image_stage='amazon') が決着している
+ * 境界の行が 1 つも無い (工程を消した) ときは「済」と偽らずに false へ倒す。
+ * ただし全工程が決着していれば当然「作り終わっている」ので、そこは先に true。
+ */
+export function imageMadeOf(summary) {
+  if (!summary || summary.excluded) return false;
+  if (summary.done) return true;
+  if (!summary.gateDone) return false;
+  const boundary = (summary.rows || []).filter((r) => r.image_stage === IMAGE_MADE_BOUNDARY_STAGE);
+  return boundary.length > 0 && boundary.every((r) => r.state === 'done' || r.state === 'skip');
+}
+
 /** 1 種別分のサマリー (current / done / 滞留)。excluded の種別は current を出さない */
 function kindSummaryOf(rows, createdAt, excluded = false) {
   const current = excluded ? null : currentOf(rows);
@@ -1228,10 +1257,16 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     // 工程ベースの p.imageTop は active=0 で常に空 = 常に「未完了」に見えるため使わない
     top: { registered: d.has_top_image === 1 },
     detail: d.detail_images_excluded === 1
-      ? { excluded: true, steps: [], current: null, done: false, stalledDays: null }
+      ? { excluded: true, steps: [], current: null, done: false, made: false, stalledDays: null }
       : {
         steps: p.imageDetail.rows.map((r) => ({ state: r.state, label: r.label })),
-        current: p.imageDetail.current, done: p.imageDetail.done, stalledDays: p.imageDetail.stalledDays,
+        current: p.imageDetail.current, done: p.imageDetail.done,
+        // made = 「画像はもう作り終わっている」(2026-09-01 中原さん:「画像で並べるステータスが
+        // 楽天登録に移動したらカードは済にしてほしい」)。⑧楽天登録・⑨A+登録 は作った画像を
+        // モールに載せる後工程なので、ここまで来たカードは制作としては終わっている。
+        // ⑦Amazon登録依頼 は最終デザイン確認を兼ねるので「まだ」のまま (中原さんの線引き)
+        made: imageMadeOf(p.imageDetail),
+        stalledDays: p.imageDetail.stalledDays,
       },
   });
 
@@ -1424,7 +1459,9 @@ export function progressSummaryFor(db, draftIds) {
   const placeholders = ids.map(() => '?').join(',');
   const rows = db.prepare(`
     SELECT p.draft_id, p.step_code, p.state, p.assignee_id, p.done_at, p.started_at,
-           s.label, s.track, s.image_kind, s.image_stage, s.sort, s.stall_days, s.role_code,
+           ${/* listing_gate を落とすと kindSummaryOf の gateRows が「全工程」になり、gateDone が
+                常に done と同じ意味になってしまう (ボードの「済」判定がこれを見る — 2026-09-01) */''}
+           s.label, s.track, s.image_kind, s.image_stage, s.sort, s.stall_days, s.role_code, s.listing_gate,
            st.name AS assignee_name, st.color AS assignee_color,
            -- 先頭工程が止まっている場合は前工程の完了日時が無いので、ドラフト作成日時を起点にする
            d.created_at AS draft_created_at, d.detail_images_excluded
