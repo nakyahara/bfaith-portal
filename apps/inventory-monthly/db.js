@@ -69,6 +69,28 @@ export function initInventoryMonthly() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_inv_pending_snap ON inv_snapshot_pending(snapshot_id)');
 
+  // 原価の手入力履歴 (2026-09 追加)。
+  // 月末保存時に原価が取れず 0 円計上になった明細へ、履歴詳細ページから原価を手入力した記録。
+  //   - 監査証跡 (誰がいつ何円を入れたか = 合計が変わった理由)
+  //   - 翌月も同じ商品がマスタ未登録のままなら「前回入力値」として提示する
+  // item_key = 'code:<商品コード小文字>' or 'sku:<seller_sku小文字>' (商品コード未解決の Amazon SKU)
+  db.exec(`CREATE TABLE IF NOT EXISTS inv_snapshot_cost_fix (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL,
+    item_key        TEXT NOT NULL,
+    商品コード      TEXT,
+    seller_sku      TEXT,
+    商品名          TEXT,
+    原価            REAL NOT NULL,
+    rows_updated    INTEGER NOT NULL,
+    delta_value     REAL NOT NULL,
+    created_by      TEXT,
+    created_at      TEXT NOT NULL,
+    FOREIGN KEY(snapshot_id) REFERENCES inv_snapshot(id) ON DELETE CASCADE
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inv_cost_fix_snap ON inv_snapshot_cost_fix(snapshot_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inv_cost_fix_key ON inv_snapshot_cost_fix(item_key, id)');
+
   fixMislabeledSnapshotDates20260801(db);
 
   initialized = true;

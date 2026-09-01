@@ -1213,11 +1213,17 @@ async function main() {
             console.log(`[月末確定値] スキップ: ${data.reason}`);
             results.push({ name: '月末確定値', success: true, skipped: true, summary: `⏸️ ${data.snapshot_date} 既存あり (id=${data.snapshot_id})` });
           } else if (resp.ok && data.ok) {
-            const { snapshot_date, source_business_date, totals, partial_categories } = data;
+            const { snapshot_date, source_business_date, totals, partial_categories, unresolved_cost_count, unresolved_cost_qty, history_path } = data;
             const partialNote = (partial_categories && partial_categories.length > 0) ? ` (partial: ${partial_categories.join(',')})` : '';
             const sourceNote = source_business_date ? ` (source=${source_business_date}朝)` : '';
-            console.log(`[月末確定値] 保存成功: ${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${sourceNote}${partialNote}`);
-            results.push({ name: '月末確定値', success: true, summary: `${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${sourceNote}${partialNote}` });
+            // 原価が取れず 0円計上の商品があれば、読み手がそのまま直しに行ける形で出す
+            // (「partial: fba_warehouse」だけでは何をすればいいか分からない)
+            const historyUrl = history_path ? url.replace(/\/apps\/inventory-monthly\/api\/save-month-end$/, '') + history_path : '';
+            const costNote = (unresolved_cost_count > 0)
+              ? `\n   🚨 原価未登録で0円計上の商品 ${unresolved_cost_count}件 (数量${unresolved_cost_qty}個) → 履歴詳細ページで原価を入力: ${historyUrl}`
+              : '';
+            console.log(`[月末確定値] 保存成功: ${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${sourceNote}${partialNote}${costNote}`);
+            results.push({ name: '月末確定値', success: true, summary: `${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${sourceNote}${partialNote}${costNote}` });
           } else {
             const err = data.error || `HTTP ${resp.status}`;
             console.error(`[月末確定値] 保存失敗:`, err);

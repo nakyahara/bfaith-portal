@@ -17,7 +17,10 @@ import multer from 'multer';
 import fs from 'fs';
 import { initInventoryMonthly, getDB } from './db.js';
 import { parseRestockReport, parseOwnWarehouse } from './csv-parser.js';
-import { aggregateInventory, aggregateFromMirror, saveSnapshot, listSnapshots, getSnapshot, isValidIsoDate } from './aggregator.js';
+import {
+  aggregateInventory, aggregateFromMirror, saveSnapshot, listSnapshots, getSnapshot, isValidIsoDate,
+  listUnresolvedCostItems, applyCostFixes, countUnresolvedCostBySnapshot, COST_STATUS_LABEL, MANUAL_FIX_STATUS,
+} from './aggregator.js';
 import { exportSnapshotToXlsx } from './excel-export.js';
 import { buildSnapshotCsv } from './csv-export.js';
 
@@ -91,6 +94,15 @@ function renderLayout(title, body) {
   .pending-row input[type=text] { flex: 2; }
   .pending-row input[type=number] { flex: 1; }
   small.hint { color: #666; font-weight: normal; }
+  .alert-danger { background: #f8d7da; border: 2px solid #dc3545; color: #58151c; padding: 12px 16px; border-radius: 6px; margin: 12px 0; font-size: 15px; }
+  .alert-ok { background: #d1e7dd; border: 1px solid #a3cfbb; color: #0f5132; padding: 10px 16px; border-radius: 6px; margin: 12px 0; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 3px; font-size: 11px; color: #fff; white-space: nowrap; }
+  .badge-red { background: #dc3545; }
+  .badge-orange { background: #f39c12; }
+  .badge-gray { background: #6c757d; }
+  .badge-green { background: #198754; }
+  table.costfix input[type=number] { width: 110px; text-align: right; }
+  table.costfix td.changed { background: #fff3cd; }
 </style>
 </head>
 <body>
@@ -514,9 +526,17 @@ router.post('/aggregate', upload.fields([
 router.get('/history', (req, res) => {
   if (!ensureDbOrFailHtml(res)) return;
   const list = listSnapshots(); // snapshot_date DESC
+  const unresolvedMap = countUnresolvedCostBySnapshot();
+  const unresolvedCell = (s) => {
+    const c = unresolvedMap.get(s.id) || { unresolved_count: 0, fixed_count: 0 };
+    if (c.unresolved_count > 0) return `<a href="history/${s.id}#costfix" style="text-decoration:none"><span class="badge badge-red">🚨 原価未登録 ${c.unresolved_count}</span></a>`;
+    if (c.fixed_count > 0) return `<span class="badge badge-green">手入力済 ${c.fixed_count}</span>`;
+    return '';
+  };
   const rows = list.map(s => `
     <tr>
       <td><a href="history/${s.id}">${esc(s.snapshot_date)}</a></td>
+      <td>${unresolvedCell(s)}</td>
       <td class="num">${yen(s.fba_warehouse)}</td>
       <td class="num">${yen(s.fba_inbound)}</td>
       <td class="num">${yen(s.own_warehouse)}</td>
@@ -551,7 +571,7 @@ ${list.length === 0 ? '<p>まだ履歴がありません。</p>' : `
 
 <h2>履歴一覧</h2>
 <table>
-  <thead><tr><th>基準日</th><th>FBA倉庫</th><th>FBA輸送中</th><th>自社倉庫</th><th>米国FBA</th><th>米国FBA輸送中</th><th>発注後未着</th><th>手動調整</th><th>合計</th><th>作成日時</th></tr></thead>
+  <thead><tr><th>基準日</th><th>要確認</th><th>FBA倉庫</th><th>FBA輸送中</th><th>自社倉庫</th><th>米国FBA</th><th>米国FBA輸送中</th><th>発注後未着</th><th>手動調整</th><th>合計</th><th>作成日時</th></tr></thead>
   <tbody>${rows}</tbody>
 </table>
 
@@ -1192,8 +1212,68 @@ router.get('/history/:id', (req, res) => {
   // </script> によるタグ切りを防ぐため < をエスケープして埋め込む
   const jsonEmbed = obj => JSON.stringify(obj).replace(/</g, '\\u003c');
   const totalRow = (label, val) => `<tr><td>${label}</td><td class="num">${yen(val)}</td></tr>`;
+
+  // 原価未登録 (0円計上) の商品。ページ先頭にアラート + 本文に入力表を出す
+  const costInfo = listUnresolvedCostItems(id);
+  const CAT_LABEL = { fba_warehouse: 'FBA倉庫', fba_inbound: 'FBA輸送中', own_warehouse: '自社倉庫', fba_us: '米国FBA' };
+  let costAlertHtml = '';
+  if (costInfo.unresolved_count > 0) {
+    costAlertHtml = `<div class="alert-danger">🚨 <b>原価が取れず 0円で計上されている商品が ${costInfo.unresolved_count}件 (数量 ${costInfo.unresolved_qty.toLocaleString('ja-JP')}個) あります。</b>
+      合計 ${yen(s.total)} はその分だけ過小です。<a href="#costfix" style="color:#58151c;font-weight:bold">↓ 下の表で原価を入力</a>すると合計に反映されます。</div>`;
+  } else if (costInfo.fixed_count > 0) {
+    costAlertHtml = `<div class="alert-ok">✅ 原価未登録なし (手入力で補った商品 ${costInfo.fixed_count}件を含む → <a href="#costfix">一覧</a>)</div>`;
+  } else {
+    costAlertHtml = `<div class="alert-ok">✅ 原価未登録なし (全明細の原価がマスタから取れています)</div>`;
+  }
+  const statusBadge = (st) => {
+    if (st === MANUAL_FIX_STATUS) return `<span class="badge badge-green">手入力済</span>`;
+    if (st === 'UNMAPPED_SKU' || st === 'NOT_IN_MASTER') return `<span class="badge badge-red">${esc(st)}</span>`;
+    return `<span class="badge badge-orange">${esc(st)}</span>`;
+  };
+  const costRows = costInfo.items.map((it, i) => {
+    const cats = it.rows.map(r => `${CAT_LABEL[r.category] || r.category} ${r.数量.toLocaleString('ja-JP')}`).join(' / ');
+    const prevHint = (it.prev_cost != null) ? `<br><small class="hint">前回 ${esc(it.prev_snapshot_date)} に ¥${Number(it.prev_cost).toLocaleString('ja-JP')} を手入力</small>` : '';
+    const currentCost = (it.原価 != null) ? String(it.原価) : '';
+    const placeholder = (it.prev_cost != null) ? String(it.prev_cost) : '税抜原価';
+    return `<tr data-key="${esc(it.key)}" data-qty="${it.total_qty}" data-orig="${esc(currentCost)}">
+      <td>${statusBadge(it.原価状態)}${it.原価状態 === MANUAL_FIX_STATUS ? '' : `<br><small class="hint">${esc(COST_STATUS_LABEL[it.原価状態] || '')}</small>`}</td>
+      <td>${it.seller_sku ? esc(it.seller_sku) : '<span style="color:#999">-</span>'}</td>
+      <td>${it.商品コード ? esc(it.商品コード) : '<span style="color:#999">未解決</span>'}</td>
+      <td>${esc(it.商品名 || '')}${prevHint}</td>
+      <td class="num" title="${esc(cats)}">${it.total_qty.toLocaleString('ja-JP')}<br><small class="hint">${esc(cats)}</small></td>
+      <td><input type="number" min="0" step="any" inputmode="decimal" placeholder="${esc(placeholder)}" value="${esc(currentCost)}" oninput="costChanged(this)"></td>
+      <td class="num cost-value">${it.原価 != null ? yen(it.total_qty * it.原価) : '<span style="color:#dc3545">¥0</span>'}</td>
+    </tr>`;
+  }).join('');
+  const costFixHtml = costInfo.items.length === 0 ? '' : `
+<h2 id="costfix">${costInfo.unresolved_count > 0 ? '🚨 ' : ''}原価未登録 (0円計上) の商品 — ここで原価を入れると合計に反映</h2>
+<div class="card" style="${costInfo.unresolved_count > 0 ? 'border-color:#dc3545;border-width:2px' : ''}">
+  <p style="margin:0 0 8px">
+    未解決 <b>${costInfo.unresolved_count}</b>件 / 手入力済 ${costInfo.fixed_count}件
+    ${costInfo.zero_registered > 0 ? `<small class="hint">（ほかにマスタで原価=0円として登録済みの明細が ${costInfo.zero_registered}行。意図した0円とみなして表示していません）</small>` : ''}
+  </p>
+  <div style="overflow-x:auto">
+  <table class="costfix">
+    <thead><tr><th>状態</th><th>Amazon SKU</th><th>商品コード</th><th>商品名</th><th>数量 (内訳)</th><th>原価 (税抜)</th><th>反映金額</th></tr></thead>
+    <tbody>${costRows}</tbody>
+    <tfoot><tr class="total-row"><td colspan="6">入力による増減</td><td class="num" id="costDelta">¥0</td></tr></tfoot>
+  </table>
+  </div>
+  <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+    <button type="button" onclick="saveCostFixes()">💾 原価を保存（合計も再計算）</button>
+    <button type="button" class="secondary" onclick="dlCostFixCsv()">📥 マスタ登録用CSV (商品コード,原価,商品名)</button>
+    <button type="button" class="secondary" onclick="dlUnresolvedCsv()">📥 未解決一覧CSV</button>
+  </div>
+  <small class="hint">原価は税抜・1個あたり。同じ商品コードの明細 (FBA倉庫/輸送中/自社倉庫) にまとめて反映します。
+  ここでの入力はこの月の棚卸しにだけ効きます。<b>来月も0円にならないよう、商品マスタ (miniPC 発注管理 → 原価登録) にも登録してください</b>
+  — 「マスタ登録用CSV」は入力した原価をそのまま原価CSV一括登録の形式で落とします。
+  Amazon SKU が「未解決」の行は SKUマスタ (商品コード変換テーブル) への登録が根本対応です。</small>
+  <div id="costMsg"></div>
+</div>`;
+
   res.send(renderLayout('月末棚卸し ' + s.snapshot_date, `
 <h2>${esc(s.snapshot_date)}</h2>
+${costAlertHtml}
 <table>
   <tbody>
     ${totalRow('FBA倉庫内在庫', s.fba_warehouse)}
@@ -1216,6 +1296,7 @@ router.get('/history/:id', (req, res) => {
     &nbsp;/&nbsp; 明細件数: ${snap.details.length}
   </span>
 </p>
+${costFixHtml}
 <h2>発注後未着商品（あとから編集できます）</h2>
 <div class="card">
   <div id="pendingRows"></div>
@@ -1305,6 +1386,116 @@ if (CURRENT_PENDING.length) {
 } else {
   addPendingRow('', '');
 }
+
+// ───── 原価未登録 (0円計上) の手入力 ─────
+const COST_ITEMS = ${jsonEmbed(costInfo.items.map(it => ({ key: it.key, 商品コード: it.商品コード, seller_sku: it.seller_sku, 商品名: it.商品名, 原価状態: it.原価状態, total_qty: it.total_qty, 原価: it.原価, prev_cost: it.prev_cost })))};
+const yenFmt = (n) => '¥' + Math.round(Number(n) || 0).toLocaleString('ja-JP');
+
+function costChanged(input) {
+  const tr = input.closest('tr');
+  const qty = Number(tr.dataset.qty) || 0;
+  const orig = tr.dataset.orig === '' ? null : Number(tr.dataset.orig);
+  const v = input.value === '' ? null : Number(input.value);
+  const cell = tr.querySelector('.cost-value');
+  if (v == null || !Number.isFinite(v) || v < 0) {
+    cell.innerHTML = orig != null ? yenFmt(qty * orig) : '<span style="color:#dc3545">¥0</span>';
+    cell.classList.remove('changed');
+  } else {
+    cell.textContent = yenFmt(qty * v);
+    cell.classList.toggle('changed', v !== orig);
+  }
+  // 入力による増減 (未保存分) を合計行に出す
+  let delta = 0;
+  for (const row of document.querySelectorAll('table.costfix tbody tr')) {
+    const q = Number(row.dataset.qty) || 0;
+    const o = row.dataset.orig === '' ? 0 : Number(row.dataset.orig);
+    const inp = row.querySelector('input');
+    const nv = inp.value === '' ? null : Number(inp.value);
+    if (nv == null || !Number.isFinite(nv) || nv < 0) continue;
+    delta += q * (nv - o);
+  }
+  const deltaEl = document.getElementById('costDelta');
+  deltaEl.textContent = (delta >= 0 ? '+' : '') + yenFmt(delta);
+}
+
+function collectCostFixes() {
+  const fixes = [];
+  for (const row of document.querySelectorAll('table.costfix tbody tr')) {
+    const inp = row.querySelector('input');
+    if (inp.value === '') continue;
+    const cost = Number(inp.value);
+    if (!Number.isFinite(cost) || cost < 0) continue;
+    const orig = row.dataset.orig === '' ? null : Number(row.dataset.orig);
+    if (orig != null && cost === orig) continue; // 変更なし
+    fixes.push({ key: row.dataset.key, cost });
+  }
+  return fixes;
+}
+
+async function saveCostFixes() {
+  const fixes = collectCostFixes();
+  const msg = document.getElementById('costMsg');
+  const showErr = (text) => {
+    const div = document.createElement('div');
+    div.className = 'err';
+    div.textContent = text;
+    msg.replaceChildren(div);
+  };
+  if (fixes.length === 0) { showErr('原価が入力されていません (変更のある行だけ保存します)'); return; }
+  if (!confirm(fixes.length + '商品の原価を保存して合計を再計算します。よろしいですか?')) return;
+  msg.textContent = '保存中...';
+  try {
+    const res = await fetch('history/${id}/cost-fix', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ fixes }),
+    });
+    if (res.status === 401 || res.status === 403) {
+      msg.innerHTML = '<div class="err">認証が切れました。<a href="/login">再ログイン</a>してから再実行してください。</div>';
+      return;
+    }
+    const data = await res.json();
+    if (!res.ok) { showErr(data.error || 'エラー'); return; }
+    location.reload();
+  } catch (e) {
+    showErr(e.message);
+  }
+}
+
+// 入力した原価を miniPC の原価CSV一括登録 (商品コード,原価,商品名) の形式で落とす
+function dlCostFixCsv() {
+  const rows = [['商品コード', '原価', '商品名']];
+  for (const row of document.querySelectorAll('table.costfix tbody tr')) {
+    const item = COST_ITEMS.find(i => i.key === row.dataset.key);
+    if (!item || !item.商品コード) continue; // 商品コード未解決 (Amazon SKU のみ) は原価CSVでは登録できない
+    const inp = row.querySelector('input');
+    const cost = inp.value === '' ? item.原価 : Number(inp.value);
+    if (cost == null || !Number.isFinite(cost) || cost < 0) continue;
+    rows.push([item.商品コード, String(cost), item.商品名 || '']);
+  }
+  if (rows.length === 1) { alert('原価が入力された商品コードがありません'); return; }
+  downloadCsvText('genka_' + ${jsonEmbed(s.snapshot_date)} + '.csv', rows);
+}
+
+function dlUnresolvedCsv() {
+  const rows = [['状態', 'Amazon SKU', '商品コード', '商品名', '数量', '現在の原価', '前回手入力']];
+  for (const it of COST_ITEMS) {
+    rows.push([it.原価状態, it.seller_sku || '', it.商品コード || '', it.商品名 || '', String(it.total_qty), it.原価 == null ? '' : String(it.原価), it.prev_cost == null ? '' : String(it.prev_cost)]);
+  }
+  downloadCsvText('unresolved_cost_' + ${jsonEmbed(s.snapshot_date)} + '.csv', rows);
+}
+
+function downloadCsvText(filename, rows) {
+  const cell = (v) => { const s = String(v == null ? '' : v); return /[",\\r\\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  const text = rows.map(r => r.map(cell).join(',')).join('\\r\\n') + '\\r\\n';
+  const blob = new Blob(['\\ufeff' + text], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
 </script>
 `));
 });
@@ -1351,6 +1542,43 @@ router.post('/history/:id/pending', json({ limit: '64kb' }), (req, res) => {
     const result = txn();
     if (!result) return res.status(404).json({ error: 'snapshot が見つかりません' });
     res.json({ ok: true, ...result, rows: pendingRows.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 原価未登録 (0円計上) 明細への原価手入力: 明細・カテゴリ列・合計を再計算する。
+// body: { fixes: [{ key: 'code:xxx' | 'sku:xxx', cost: 数値 }] }
+router.post('/history/:id/cost-fix', json({ limit: '256kb' }), (req, res) => {
+  if (!ensureDbOrFail(res)) return;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'id が不正です' });
+  const raw = Array.isArray(req.body?.fixes) ? req.body.fixes : null;
+  if (!raw) return res.status(400).json({ error: 'fixes (配列) が必要です' });
+  if (raw.length === 0) return res.status(400).json({ error: '原価が入力されていません' });
+  if (raw.length > 2000) return res.status(400).json({ error: '件数が多すぎます (最大2000)' });
+
+  const COST_CAP = 1e8; // 1個1億円超は入力ミス
+  const fixes = [];
+  const seen = new Set();
+  for (const f of raw) {
+    const key = String(f?.key || '').trim().toLowerCase();
+    if (!/^(code|sku):.+/.test(key) || key.length > 300) return res.status(400).json({ error: `key が不正です: ${key.slice(0, 50)}` });
+    const cost = Number(f?.cost);
+    if (!Number.isFinite(cost) || cost < 0 || cost > COST_CAP) return res.status(400).json({ error: `原価が不正です (${key}): 0〜${COST_CAP} の数値で入力してください` });
+    if (seen.has(key)) continue;
+    seen.add(key);
+    fixes.push({ key, cost: Math.round(cost * 100) / 100 });
+  }
+
+  try {
+    const created_by = req.session?.email || null;
+    const result = applyCostFixes(id, fixes, { created_by });
+    if (!result) return res.status(404).json({ error: 'snapshot が見つかりません' });
+    if (result.updated_items === 0) {
+      return res.status(409).json({ error: '対象の明細がありません (既にマスタで解決済みか、ページが古い可能性があります。再読み込みしてください)' });
+    }
+    res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1448,6 +1676,9 @@ apiRouter.post('/save-month-end', (req, res) => {
       note: `auto: cron save-month-end (source=${result.source_business_date}朝)`,
     });
 
+    // 0円計上の商品数 (履歴詳細ページのアラートと同じ数え方)。daily-sync の GChat 通知で
+    // 「原価未登録 N商品 → URL」と出すために返す
+    const costInfo = listUnresolvedCostItems(snapshot_id);
     res.json({
       ok: true,
       snapshot_date,
@@ -1460,6 +1691,9 @@ apiRouter.post('/save-month-end', (req, res) => {
         partialCategories: (result.warnings.partialCategories || []).length,
       },
       partial_categories: result.warnings.partialCategories || [],
+      unresolved_cost_count: costInfo.unresolved_count,
+      unresolved_cost_qty: costInfo.unresolved_qty,
+      history_path: `/apps/inventory-monthly/history/${snapshot_id}`,
     });
   } catch (e) {
     // aggregateFromMirror は「source 未着 = 再試行で解消し得る」を 409 で区別する
