@@ -67,12 +67,44 @@ const YAHOO_API_GAP_MS = 1200;
  * ★self-test より前に置く (const は巻き上がらないので、後ろに書くと self-test から見えない)。
  */
 const PRICE_ONLY_KEYS = new Set(['item_code', 'price', 'sale_price', 'subcode_price']);
+/**
+ * expected (「今いくらのはず」) が全商品ぶん揃っているか。欠けていれば投げる。
+ * ★1件でも欠けると、その商品は照合もセール価格の確認も飛ばして送られてしまう。
+ *   「照合しないで送る」経路を作らないために、入口で止める。
+ */
+function assertExpectedForAll(items, expected) {
+  if (!expected || typeof expected !== 'object' || Array.isArray(expected)) {
+    throw new Error('update-items: expected (今いくらのはず) が必要です。照合せずに送ることはできません');
+  }
+  // ★空の items も止める (この関数だけを見ても穴が無いように)
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new Error('update-items: items が空です');
+  }
+  for (const [i, it] of (items || []).entries()) {
+    const code = String(it?.item_code ?? '').trim();
+    const want = expected[code];
+    if (want === undefined || want === null || String(want).trim() === '') {
+      throw new Error(`update-items: ${i + 1}件目 (${code}) の expected がありません。照合せずに送ることはできません`);
+    }
+    if (!/^\d+$/.test(String(want).trim())) {
+      throw new Error(`update-items: ${i + 1}件目 (${code}) の expected が整数ではありません (${want})`);
+    }
+  }
+}
+
+/** 商品ごとのロック。★self-test より前に置く (const は巻き上がらない) */
+const yahooItemLocks = new Map();
 /** Yahoo に送ってよい価格の上限 (楽天側のガードと同じ) */
 const MAX_YAHOO_PRICE = 999999999;
 
 // --self-test は起動前に処理する。secret も外部通信も要らない純粋なパーサ検証なので、
 // PROXY_SECRET の必須チェックより前に置く (手元でも VPS 上でも同じコードを確かめられるように)
-if (process.argv.includes('--self-test')) { runSelfTest(); }
+if (process.argv.includes('--self-test')) {
+  // ★self-test には非同期の検証 (商品ロック) が含まれるので、runSelfTest() は同期では終わらない。
+  //   ここで抜けないとサーバ起動側に流れて 'PROXY_SECRET is required' で落ちる (CommonJS の top-level return)
+  runSelfTest();
+  return;
+}
 
 if (!PROXY_SECRET) { console.error('PROXY_SECRET is required'); process.exit(1); }
 
@@ -534,6 +566,11 @@ function parseGetItemDetailXml(xml) {
     // Price は「商品単位の設定価格」。バリエーション商品は SubCodes[] に sub_code 別価格が入る
     // (現行の出品運用ではサブコード別価格は使わず item 価格を継承する方針 — variation-resolver.js 参照)
     Price: null, SubCodes: [],
+    // ★SalePrice (M3 2026-09-01 追加)。updateItems で price を送る時は sale_price も必須で、
+    //   空文字を送ると既存のセール価格が消える。**入っている商品は更新しない**ための判断材料。
+    //   「入っていない」ことを確かめられないと止められないので、読めない時は null ではなく
+    //   SalePriceReadable=false で「読めなかった」と分けて返す
+    SalePrice: null, SalePriceReadable: false,
     // 発送まわり (価格一括改定ツール 2026-08-31 追加)。同じ商品でもモールで配送方法が違い、
     // それが売価差の理由になるため、画面で並べて見えるようにする
     Delivery: null, PostageSet: null, ShipWeight: null,
@@ -616,6 +653,25 @@ function parseGetItemDetailXml(xml) {
     return toIntPrice(decodeXmlEntities(unwrapCdata(m[1])).trim());
   };
   out.Price = priceIn(withoutVariationBlocks);
+
+  // ★セール価格。「空 = 使っていない」と「読めなかった」を分ける (M3 のガードに使う)。
+  //   商品単位のスコープに <SalePrice> がちょうど1つあり、中身が空 or 整数のときだけ読めた扱い
+  {
+    const all = withoutVariationBlocks.match(/<SalePrice\b[^>]*>([\s\S]*?)<\/SalePrice>/gi) || [];
+    const selfClosed = withoutVariationBlocks.match(/<SalePrice\b[^>]*\/>/gi) || [];
+    if (all.length === 1) {
+      const inner = decodeXmlEntities(unwrapCdata(all[0].match(/<SalePrice\b[^>]*>([\s\S]*?)<\/SalePrice>/i)[1])).trim();
+      if (inner === '') { out.SalePrice = null; out.SalePriceReadable = true; }        // 使っていない
+      else {
+        const n = toIntPrice(inner);
+        out.SalePrice = n;
+        out.SalePriceReadable = n !== null;    // 読めない値なら「読めなかった」扱い
+      }
+    } else if (all.length === 0 && selfClosed.length === 1) {
+      out.SalePrice = null; out.SalePriceReadable = true;                              // <SalePrice/> も「使っていない」
+    }
+    // それ以外 (複数ある / 見当たらない) は SalePriceReadable=false のまま = 判断できない
+  }
 
   // 発送まわり (商品単位)。SubCodes 内にも同名タグがあるので、除外済みの範囲から取る
   const textIn = (scope, name) => {
@@ -1276,35 +1332,73 @@ const server = http.createServer(async (req, res) => {
       let body;
       try { body = JSON.parse(raw); } catch (_) { throw new Error('update-items: invalid JSON body'); }
       assertPriceOnlyItems(body.items, { clearSalePrice: body.clearSalePrice === true });
+      // ★expected は全商品ぶん必須 (Codex R3)。1件でも欠けていると、その商品だけ照合も
+      //   セール価格の確認も飛ばして送ってしまう。「照合しないで送る」経路を作らない
+      assertExpectedForAll(body.items, body.expected);
       const built = buildUpdateItemsBody(body.items, YAHOO_SELLER_ID, { includeItemNum: body.itemNum === true });
-      console.log(`[${ts()}] Yahoo updateItems: ${built.count}件 (${built.codes.join(',')}) body=${built.body.length}b`);
-      const r = await callYahooAPIRaw('updateItems', {
-        method: 'POST',
-        contentType: 'application/x-www-form-urlencoded',
-        body: built.body,
-      });
-      // ★更新しただけでは客に見えない。「変えたつもり」を作らないよう、
-      //   この経路の中で反映まで済ませる (明示的に submit:false と言われた時だけ飛ばす)
       const wantSubmit = body.submit !== false;
-      const updateOk = yahooXmlOk(r);
-      const submits = [];
-      if (wantSubmit && updateOk) {
-        for (const code of built.codes) {
-          await new Promise((r2) => setTimeout(r2, YAHOO_API_GAP_MS));   // 1クエリー/秒
-          const sr = await callYahooAPIRaw('submitItem', {
-            method: 'POST',
-            contentType: 'application/x-www-form-urlencoded',
-            body: new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: code }).toString(),
-          });
-          const sok = yahooXmlOk(sr);
-          console.log(`[${ts()}] Yahoo submitItem: item_code=${code} status=${sr.status} ok=${sok}`);
-          submits.push({ item_code: code, status: sr.status, ok: sok, body: String(sr.body).slice(0, 500) });
+
+      // ★「読む → 照合する → 送る → 反映する」を **まとめて** 商品ごとのロックの中で行う
+      //   (Codex R1/R2 High)。照合だけをロックして送信を外に出すと、照合の後・送信の前に
+      //   割り込まれて、その変更を踏み潰す / 追加されたセール価格を空文字で消す。
+      //   ⚠️Yahoo の管理画面から直に変えられた場合は API では閉じようがない (残る危険として明示)
+      const outcome = await withYahooItemLock(built.codes, async () => {
+        {
+          for (const it of body.items) {
+            const want = body.expected[it.item_code];
+            const cur = await readItemForCheck(it.item_code);
+            if (cur.error) return { conflict: { item_code: it.item_code, reason: cur.error } };
+            if (cur.price !== Number(want)) {
+              return { conflict: { item_code: it.item_code, reason: '現在価格が想定と違います', expected: Number(want), live: cur.price } };
+            }
+            // ★セール価格も直前に見る。空文字を送ると消えるので、入っていたら送らない
+            if (String(it.sale_price ?? '') === '' && cur.salePrice !== null) {
+              return { conflict: { item_code: it.item_code, reason: `セール価格 (${cur.salePrice} 円) が入っています`, salePrice: cur.salePrice } };
+            }
+            if (String(it.sale_price ?? '') === '' && !cur.salePriceReadable) {
+              return { conflict: { item_code: it.item_code, reason: 'セール価格が入っているか確かめられません' } };
+            }
+            await new Promise((r2) => setTimeout(r2, YAHOO_API_GAP_MS));   // 1クエリー/秒
+          }
         }
+        console.log(`[${ts()}] Yahoo updateItems: ${built.count}件 (${built.codes.join(',')}) body=${built.body.length}b`);
+        const r = await callYahooAPIRaw('updateItems', {
+          method: 'POST',
+          contentType: 'application/x-www-form-urlencoded',
+          body: built.body,
+        });
+        // ★更新しただけでは客に見えない。「変えたつもり」を作らないよう、
+        //   この経路の中で反映まで済ませる (明示的に submit:false と言われた時だけ飛ばす)
+        const updateOk = yahooXmlOk(r);
+        const submits = [];
+        if (wantSubmit && updateOk) {
+          for (const code of built.codes) {
+            await new Promise((r2) => setTimeout(r2, YAHOO_API_GAP_MS));   // 1クエリー/秒
+            const sr = await callYahooAPIRaw('submitItem', {
+              method: 'POST',
+              contentType: 'application/x-www-form-urlencoded',
+              body: new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: code }).toString(),
+            });
+            const sok = yahooXmlOk(sr);
+            console.log(`[${ts()}] Yahoo submitItem: item_code=${code} status=${sr.status} ok=${sok}`);
+            submits.push({ item_code: code, status: sr.status, ok: sok, body: String(sr.body).slice(0, 500) });
+          }
+        }
+        return { r, updateOk, submits };
+      });
+
+      if (outcome.conflict) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'CONFLICT', conflict: outcome.conflict }));
+        return;
       }
+      const { r, updateOk, submits } = outcome;
       res.writeHead(r.status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: updateOk && (!wantSubmit || submits.every((s) => s.ok)),
         updateStatus: r.status,
+        // ★「更新は通ったが反映が失敗」を呼び出し側が見分けられるようにする (Codex R5)
+        updateOk,
         updateBody: String(r.body).slice(0, 2000),
         submitted: wantSubmit,
         submits,
@@ -1483,6 +1577,10 @@ const server = http.createServer(async (req, res) => {
         // 価格一括改定ツール向け (2026-08-24 追加)
         Price: parsed.Price,
         SubCodes: parsed.SubCodes,
+        // ★M3: セール価格が入っている商品は価格更新しない (空文字を送ると消えるため)。
+        //   「入っていない」と「読めなかった」を分けて返す
+        SalePrice: parsed.SalePrice,
+        SalePriceReadable: parsed.SalePriceReadable,
         // 発送まわり (2026-08-31 追加)。モールごとの配送方法を画面で見比べるため
         Delivery: parsed.Delivery,
         PostageSet: parsed.PostageSet,
@@ -1740,6 +1838,39 @@ function isWellFormedResultSet(xml) {
 }
 
 /**
+ * 商品ごとの直列化。同じ商品に対する「読む → 照合 → 送る」が重ならないようにする。
+ * ★このサーバの中だけの話。Yahoo の管理画面から直に変えられた場合は閉じようがない。
+ */
+async function withYahooItemLock(codes, fn) {
+  // ★キーは正規化する (Codex R5)。zz-1 と ZZ-1 は同じ商品なので、別のロックにしてはいけない
+  const keys = [...new Set((codes || []).map((c) => String(c).trim().toLowerCase()))].sort();
+  const prev = keys.map((k) => yahooItemLocks.get(k)).filter(Boolean);
+  let release;
+  const mine = new Promise((r) => { release = r; });
+  for (const k of keys) yahooItemLocks.set(k, mine);
+  try {
+    await Promise.all(prev);
+    return await fn();
+  } finally {
+    release();
+    for (const k of keys) if (yahooItemLocks.get(k) === mine) yahooItemLocks.delete(k);
+  }
+}
+
+/** 照合のために「今の価格とセール価格」を読む */
+async function readItemForCheck(itemCode) {
+  const qs = new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: String(itemCode) }).toString();
+  const r = await callYahooAPIRaw('getItem', { method: 'GET', body: null, queryString: qs });
+  if (r.status !== 200) return { error: `いまの価格を読めません (HTTP ${r.status})` };
+  const parsed = parseGetItemDetailXml(r.body);
+  if (String(parsed.ItemCode || '').trim().toLowerCase() !== String(itemCode).trim().toLowerCase()) {
+    return { error: `読み取った商品コードが違います (${parsed.ItemCode ?? 'なし'})` };
+  }
+  if (parsed.Price === null) return { error: 'いまの価格を整数円として読めません' };
+  return { price: parsed.Price, salePrice: parsed.SalePrice, salePriceReadable: parsed.SalePriceReadable };
+}
+
+/**
  * Yahoo の応答が成功か。
  * ★HTTP 200 でも本文に Status NG や Error が入っていることがある。
  *   NG だけを見ると「HTTP 200 + <Error>」を成功扱いしてしまう (Codex R5)。
@@ -1893,6 +2024,7 @@ function withSellerId(formBody, sellerId) {
 // 呼び出しはファイル冒頭 (PROXY_SECRET チェックの前)。function 宣言なのでホイスティングで届く。
 function runSelfTest() {
   let failed = 0;
+  let lockCheck = Promise.resolve();   // 非同期の検証 (商品ロック) はここに積んで最後に待つ
   const check = (label, actual, expected) => {
     const a = JSON.stringify(actual), e = JSON.stringify(expected);
     if (a === e) { console.log(`  ok   ${label}`); return; }
@@ -1977,6 +2109,52 @@ function runSelfTest() {
   check('先頭ゼロ', parseGetItemDetailXml('<Result><Price>0080</Price></Result>').Price, null);
   check('全角', parseGetItemDetailXml('<Result><Price>１０８０</Price></Result>').Price, null);
   // 同一スコープに Price が複数 = 想定外の構造。取り違えるより読めない扱いにする
+  // 9b) expected は全商品ぶん必須
+  const tryExpected = (items, exp) => {
+    try { assertExpectedForAll(items, exp); return 'ok'; } catch (e) { return e.message; }
+  };
+  check('expected: 全商品ぶんあれば通る',
+    tryExpected([{ item_code: 'a' }, { item_code: 'b' }], { a: 100, b: 200 }), 'ok');
+  check('expected: ★1件でも欠けたら止める',
+    tryExpected([{ item_code: 'a' }, { item_code: 'b' }], { a: 100 }).includes('2件目 (b) の expected がありません'), true);
+  check('expected: ★丸ごと無ければ止める',
+    tryExpected([{ item_code: 'a' }], undefined).includes('照合せずに送ることはできません'), true);
+  check('expected: 整数でなければ止める',
+    tryExpected([{ item_code: 'a' }], { a: 'お問い合わせ' }).includes('整数ではありません'), true);
+  check('expected: 空文字も止める', tryExpected([{ item_code: 'a' }], { a: '' }).includes('expected がありません'), true);
+
+  // 9) 商品ごとのロック (「読む → 照合 → 送る」が同じ商品で重ならないこと)
+  {
+    const order = [];
+    const slow = (tag, ms) => withYahooItemLock(['zz-1'], async () => {
+      order.push(tag + ':start');
+      await new Promise((r) => setTimeout(r, ms));
+      order.push(tag + ':end');
+    });
+    const other = () => withYahooItemLock(['zz-2'], async () => { order.push('other'); });
+    // 同じ商品は直列 (A が終わってから B)。別商品は待たされない
+    const done = Promise.all([slow('A', 20), slow('B', 1), other()]);
+    lockCheck = done.then(() => {
+      // ★同じ商品の処理が入れ子にならない (A の最中に B が始まらない)。別商品は混ざってよい
+      check('ロック: 同じ商品は重ならない',
+        order.filter((x) => x.startsWith('A') || x.startsWith('B')),
+        ['A:start', 'A:end', 'B:start', 'B:end']);
+      check('ロック: 後から来た方が待つ', order.indexOf('B:start') > order.indexOf('A:end'), true);
+      check('ロック: 別商品は待たされない', order.indexOf('other') < order.indexOf('A:end'), true);
+    });
+  }
+
+  // 8) セール価格 (M3 のガード。「使っていない」と「読めなかった」を分ける)
+  const sp = (xml) => { const r = parseGetItemDetailXml(xml); return [r.SalePrice, r.SalePriceReadable]; };
+  check('セール価格: 空タグは「使っていない」', sp('<Result><SalePrice></SalePrice></Result>'), [null, true]);
+  check('セール価格: 自己終了タグも「使っていない」', sp('<Result><SalePrice/></Result>'), [null, true]);
+  check('セール価格: 値が入っていれば読む', sp('<Result><SalePrice>900</SalePrice></Result>'), [900, true]);
+  check('セール価格: ★読めない値は「読めなかった」', sp('<Result><SalePrice>お問い合わせ</SalePrice></Result>'), [null, false]);
+  check('セール価格: ★見当たらなければ「読めなかった」', sp('<Result><Price>100</Price></Result>'), [null, false]);
+  check('セール価格: ★複数あれば「読めなかった」', sp('<Result><SalePrice>900</SalePrice><SalePrice>800</SalePrice></Result>'), [null, false]);
+  check('セール価格: SubCodes 内は見ない',
+    sp('<Result><SalePrice></SalePrice><SubCodes><SubCode code="a"><SalePrice>500</SalePrice></SubCode></SubCodes></Result>'), [null, true]);
+
   check('Price重複', parseGetItemDetailXml('<Result><Price>100</Price><Price>200</Price></Result>').Price, null);
 
   // 7) editItem の seller_id は VPS の値が正 (呼び出し側の値は捨てる)
@@ -2132,8 +2310,11 @@ function runSelfTest() {
   const paths = `<Result><PathList><Path>その他</Path><Path origFlag="1">本命</Path></PathList></Result>`;
   check('Path: origFlag優先', parseGetItemDetailXml(paths).Path, '本命');
 
-  console.log(failed === 0 ? '\n✅ self-test 全件 pass' : `\n❌ ${failed} 件 FAIL`);
-  process.exit(failed === 0 ? 0 : 1);
+  // ★非同期の検証が終わってから結果を出す (待たないと「pass」と言って落ちる)
+  lockCheck.then(() => {
+    console.log(failed === 0 ? '\n✅ self-test 全件 pass' : `\n❌ ${failed} 件 FAIL`);
+    process.exit(failed === 0 ? 0 : 1);
+  });
 }
 
 server.listen(PORT, '0.0.0.0', () => {

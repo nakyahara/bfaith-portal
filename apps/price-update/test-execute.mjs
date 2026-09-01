@@ -240,22 +240,39 @@ console.log('\n── 想定外の応答は試運転後でも即停止 ──');
   ok(summary.stopped.includes('想定していない応答'), '止めた理由が想定外だと分かる');
 }
 
-console.log('\n── Yahoo は送らない (送信経路が楽天しか無いため) ──');
+console.log('\n── モール別の送信口 (Yahoo の出品コードを楽天へ送らない) ──');
 {
-  const ops = [{
-    operationId: 'y1', mall: 'yahoo', neCode: 'ne-y', rowKind: 'single', listingCode: 'yahoo-item', skuCode: 'ys1',
+  const yahooOps = () => ([{
+    operationId: 'y' + Math.random().toString(36).slice(2, 8), mall: 'yahoo', neCode: 'ne-y', rowKind: 'single',
+    listingCode: 'yahoo-item', skuCode: 'yahoo-item',
     confidence: 'confirmed', expectedCurrentPrice: 577, newPrice: 620, cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.1,
     initialState: 'previewed',
-  }];
-  const runId = insertRun(db, { createdBy: 't', neCodes: ['ne-y'], limits: {}, operations: ops });
-  const client = makeClient([]);
-  const { summary, results } = await executeRun(db, getRun(db, runId), {
-    actor: 't', client, env: { PRICE_UPDATE_RAKUTEN_ENABLED: '1', PRICE_UPDATE_YAHOO_ENABLED: '1' },
+  }]);
+  const ENV_BOTH = { PRICE_UPDATE_RAKUTEN_ENABLED: '1', PRICE_UPDATE_YAHOO_ENABLED: '1' };
+
+  // ★Yahoo の行は Yahoo の送信口へ。楽天のクライアントは一度も呼ばれない
+  const rk = makeClient([]);
+  const yh = makeClient([]);
+  const runA = insertRun(db, { createdBy: 't', neCodes: ['ne-y'], limits: {}, operations: yahooOps() });
+  const a = await executeRun(db, getRun(db, runA), {
+    actor: 't', clients: { rakuten: rk, yahoo: yh }, env: ENV_BOTH,
   });
-  eq(client.calls.length, 0, '★Yahoo の出品コードを楽天の管理番号として送らない');
-  eq(summary.skipped, 1, 'skipped として記録');
-  ok(results[0].reason.includes('送信経路がありません'), '理由が分かる');
-  eq(mallWriteEnabled('yahoo', { PRICE_UPDATE_YAHOO_ENABLED: '1' }).enabled, false, 'env を立てても Yahoo は無効');
+  eq(rk.calls.length, 0, '★Yahoo の出品コードを楽天の管理番号として送らない');
+  eq([yh.calls.length, a.summary.applied], [1, 1], 'Yahoo の送信口に届いて更新できた');
+
+  // ★Yahoo の送信口が無い版では送らずに skipped (勝手に楽天へ流さない)
+  const rk2 = makeClient([]);
+  const runB = insertRun(db, { createdBy: 't', neCodes: ['ne-y'], limits: {}, operations: yahooOps() });
+  const b = await executeRun(db, getRun(db, runB), { actor: 't', clients: { rakuten: rk2 }, env: ENV_BOTH });
+  eq([rk2.calls.length, b.summary.skipped], [0, 1], '★送信口が無ければ1件も送らない');
+  ok(b.results[0].reason.includes('送信口がありません'), '理由が分かる: ' + b.results[0].reason);
+
+  // kill switch はモールごと
+  eq(mallWriteEnabled('yahoo', { PRICE_UPDATE_YAHOO_ENABLED: '1' }).enabled, true, 'env を立てれば Yahoo も送れる');
+  eq(mallWriteEnabled('yahoo', {}).enabled, false, '★env 未設定なら Yahoo は送らない (fail-closed)');
+  eq(mallWriteEnabled('yahoo', { PRICE_UPDATE_RAKUTEN_ENABLED: '1' }).enabled, false,
+    '★楽天の env では Yahoo は開かない');
+  eq(mallWriteEnabled('aupay', ENV_BOTH).enabled, false, 'au PAY はまだ送れない');
 }
 
 console.log('\n── noop も確認できたときだけ確定する ──');
@@ -268,6 +285,48 @@ console.log('\n── noop も確認できたときだけ確定する ──');
   eq(summary.noop, 0, '★確認が通らなければ noop で確定させない');
   eq(summary.failed, 1, '一致しないので failed');
   ok(summary.stopped.includes('確認'), '止めた理由が確認の不一致だと分かる');
+}
+
+console.log('\n── ★「価格は変わったが反映できていない」を記録に残す (Yahoo・Codex R6) ──');
+{
+  const ops = [{
+    operationId: 'pf-1', mall: 'yahoo', neCode: 'ne-pf', rowKind: 'single',
+    listingCode: 'yh-1', skuCode: 'yh-1', confidence: 'confirmed',
+    expectedCurrentPrice: 1000, newPrice: 1001, cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.1,
+    initialState: 'previewed',
+  }];
+  const runId = insertRun(db, { createdBy: 't', neCodes: ['ne-pf'], limits: {}, operations: ops });
+  // 更新は通ったが反映を依頼できなかった (yahoo-apply が返す形)
+  const yh = {
+    calls: [],
+    patchItemPrices: async function (code, body) {
+      this.calls.push({ code, body });
+      return {
+        status: 200,
+        body: {
+          ok: false, error: 'PUBLISH_FAILED',
+          message: '価格は 1001 円に変わりましたが、フロント反映を依頼できていません',
+          applied: { 'yh-1': 1001 },
+          publish: { requested: true, ok: false },
+        },
+      };
+    },
+    fetchItemDetail: async () => ({ item: { manageNumber: 'yh-1', variants: { 'yh-1': { standardPrice: '1001' } } }, status: 'found' }),
+  };
+  const { summary, results } = await executeRun(db, getRun(db, runId), {
+    actor: 't', clients: { yahoo: yh }, env: { PRICE_UPDATE_YAHOO_ENABLED: '1' },
+  });
+  eq(summary.applied, 0, '★反映できていないので「更新済み」に数えない');
+  ok(summary.stopped, '★その場で止める (人が確かめるまで残りを送らない)');
+  eq(results[0].state, 'unknown', '状態は「結果が不明」として残る');
+
+  // ★イベントの詳細に「いくらに変わったか」と「反映の結果」が残っている
+  const ev = getRun(db, runId).events.filter((e) => e.operation_id === 'pf-1').map((e) => JSON.parse(e.detail_json || '{}'));
+  const last = ev[ev.length - 1];
+  eq(last.applied, 1001, '★いくらに変わったかが記録に残る (復旧の対象にできる)');
+  eq(last.mayHaveChanged, true, '★価格が変わった印が付く');
+  eq([last.publishRequested, last.publishOk], [true, false], '★反映を依頼したが通らなかったと分かる');
+  ok(/反映/.test(last.reason || ''), '理由に反映のことが書いてある: ' + last.reason);
 }
 
 console.log('\n── 状態はイベントとして残る (行は書き換えない) ──');

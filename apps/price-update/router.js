@@ -23,6 +23,7 @@ import { evaluateRow, runLimits } from './pricing.js';
 import { rakutenShippingLabel, yahooPostageLabel, rakutenShippingName, yahooPostageName } from './shipping-labels.js';
 import { executeRun, mallWriteEnabled } from './execute.js';
 import { patchItemPrices, fetchItemDetail } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
+import { makeYahooClient } from './yahoo-apply.js';
 import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -490,7 +491,11 @@ router.post('/api/runs/:runId/execute', async (req, res) => {
 
     const out = await executeRun(db, run, {
       actor: actorOf(req),
-      client: { patchItemPrices, fetchItemDetail },
+      // モール別の送信口。どれも同じ形 ({ patchItemPrices, fetchItemDetail }) にそろえてある
+      clients: {
+        rakuten: { patchItemPrices, fetchItemDetail },
+        yahoo: makeYahooClient(),
+      },
     });
     res.json({ ok: true, ...out });
   } catch (e) {
