@@ -346,7 +346,11 @@
     }
     const done = (info.existing || []).filter((r) => r.executed);
     $('rec-status').innerHTML = 'この履歴で<b>価格が変わった行が ' + n(info.rows) + ' 行</b>あります。'
-      + '送る前の価格に戻せます。';
+      + '送る前の価格に戻せます。'
+      + (n(info.notRestorable) > 0
+        ? '<div style="color:#991b1b; margin-top:6px;">※ ほかに <b>' + n(info.notRestorable)
+          + ' 行</b>、価格が変わったのに戻す先が分からない行があります。モールの画面で確認してください。</div>'
+        : '');
     if (done.length > 0) {
       // 一度戻した履歴をもう一度戻す = いまの価格を当時の価格で上書きする。明示のチェックを求める
       $('rec-status').innerHTML += '<div style="color:#991b1b; margin-top:6px;">※ この履歴は既に一度戻しています ('
@@ -376,7 +380,7 @@
           }
           throw new Error(json.message || json.error || ('HTTP ' + res.status));
         }
-        const missed = json.unmatched || [];
+        const missed = json.notRestored || [];
         const link = '/apps/price-update/runs/' + encodeURIComponent(json.runId);
         if (missed.length > 0) {
           // ★戻せなかった行があるまま黙って移動しない。何が戻らないのかをここで見せる

@@ -568,10 +568,15 @@ router.post('/api/runs/:runId/recovery', async (req, res) => {
       return res.status(409).json({ ok: false, error: created.code.toLowerCase(), runId: created.runId, message });
     }
     const runId = created.runId;
-    // ★戻せなかった行は必ず記録に残す。残さないと「全部戻した」と読めてしまう (Codex R2)
+    // ★戻せなかった行は必ず記録に残す。残さないと「全部戻した」と読めてしまう (Codex R2/R3)。
+    //   対象 = 引き当て直せなかった行 + 「価格は変わったのに戻す先が分からない」行 (skipped の blocking)
+    const asLeftover = (o, reason, kind) => ({
+      operationId: o.operation_id, neCode: o.ne_code, mall: o.mall,
+      listingCode: o.listing_code, skuCode: o.sku_code, reason, kind,
+    });
     const leftovers = [
-      ...unmatched.map((u) => ({ operationId: u.op.operation_id, neCode: u.op.ne_code, mall: u.op.mall,
-        listingCode: u.op.listing_code, skuCode: u.op.sku_code, reason: u.reason, kind: 'unmatched' })),
+      ...unmatched.map((u) => asLeftover(u.op, u.reason, 'unmatched')),
+      ...skipped.filter((s) => s.blocking).map((s) => asLeftover(s.op, s.reason, 'no_original_price')),
     ];
     if (leftovers.length > 0) {
       appendEvent(db, runId, {
@@ -586,8 +591,9 @@ router.post('/api/runs/:runId/recovery', async (req, res) => {
     });
     res.json({
       ok: true, runId, rows: operations.length,
-      skipped: skipped.map((s) => ({ operationId: s.op.operation_id, neCode: s.op.ne_code, reason: s.reason })),
-      unmatched: unmatched.map((u) => ({ operationId: u.op.operation_id, neCode: u.op.ne_code, reason: u.reason })),
+      // 画面はこれを見て「黙って移動しない」判断をする
+      notRestored: leftovers,
+      skipped: skipped.map((s) => ({ operationId: s.op.operation_id, neCode: s.op.ne_code, reason: s.reason, blocking: !!s.blocking })),
       notices,
     });
   } catch (e) {
@@ -601,11 +607,12 @@ router.get('/api/runs/:runId/recoverable', (req, res) => {
     const db = getDB();
     const run = getRun(db, req.params.runId);
     if (!run) return res.status(404).json({ ok: false, error: 'not_found' });
-    const { candidates } = planRecovery(run);
+    const { candidates, skipped } = planRecovery(run);
     const existing = recoveryRunsOf(db, run.run_id).map((r) => ({ ...r, executed: !!runClaim(db, r.run_id) }));
     res.json({
       ok: true,
       rows: candidates.length,
+      notRestorable: skipped.filter((s) => s.blocking).length,   // 変わったのに戻せない行
       states: RECOVERABLE_STATES,
       canCreate: canExecute(req),
       canCreateReason: executorGate(req).message,

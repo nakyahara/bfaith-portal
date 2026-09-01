@@ -55,6 +55,7 @@ console.log('\n── 戻す対象になる行 ──');
   const c3 = skipped.find((s) => s.op.operation_id === 'c3');
   ok(/送る前に止まった/.test(c2.reason), '★送信前に弾かれた失敗は戻さない: ' + c2.reason);
   ok(/送る前に止まった/.test(c3.reason), '★印が無い古い記録も戻さない (勝手に戻さない方に倒す)');
+  ok(skipped.every((x) => x.blocking === false), '送っていない行は blocking にしない (騒がない)');
 }
 
 console.log('\n── 戻す先が無い / 戻す必要が無い行 ──');
@@ -66,6 +67,8 @@ console.log('\n── 戻す先が無い / 戻す必要が無い行 ──');
   const { candidates, skipped } = planRecovery(run);
   eq(candidates.length, 0, '両方とも対象外');
   ok(/元の価格が記録に残っていない/.test(skipped[0].reason), '記録が壊れている行は黙って飛ばさない: ' + skipped[0].reason);
+  eq([skipped[0].blocking, skipped[1].blocking], [true, false],
+    '★「変わったのに戻せない」行だけ blocking (人に知らせる) / 「戻す必要が無い」行は false');
   ok(/戻す必要がありません/.test(skipped[1].reason), '送った値と元の値が同じなら戻す必要が無い');
 }
 

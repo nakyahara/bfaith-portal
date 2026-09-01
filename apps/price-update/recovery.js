@@ -45,30 +45,32 @@ function mayHaveChanged(sourceRun, operationId) {
 /**
  * 元の run から「戻す対象」を洗い出す。DB も fetch も触らない。
  * @param {object} sourceRun getRun() の戻り (operations に state が付いているもの)
- * @returns {{candidates: Array<object>, skipped: Array<{op:object, reason:string}>}}
+ * @returns {{candidates: Array<object>, skipped: Array<{op:object, reason:string, blocking:boolean}>}}
  *   candidates の各要素 = { op, restoreTo }
+ *   skipped の blocking = true は **価格が変わったのに戻せない** 行 (人に知らせないといけない)。
+ *   false は「そもそも戻す必要が無い」行 (送っていない・既に同じ価格)。
  */
 export function planRecovery(sourceRun) {
   const candidates = [];
   const skipped = [];
   for (const op of sourceRun.operations || []) {
     if (!RECOVERABLE_STATES.includes(op.state)) {
-      skipped.push({ op, reason: `この行は送っていない、または価格が変わっていません (${op.state})` });
+      skipped.push({ op, blocking: false, reason: `この行は送っていない、または価格が変わっていません (${op.state})` });
       continue;
     }
     // ★「失敗」には送る前に弾かれたものも混ざる。印が無ければ戻さない (変わっていない行を上書きしない)
     if (MAYBE_CHANGED_STATES.includes(op.state) && !mayHaveChanged(sourceRun, op.operation_id)) {
-      skipped.push({ op, reason: 'モールに送る前に止まった行です (価格は変わっていないので戻す必要がありません)' });
+      skipped.push({ op, blocking: false, reason: 'モールに送る前に止まった行です (価格は変わっていないので戻す必要がありません)' });
       continue;
     }
     const restoreTo = op.expected_current_price;
     if (restoreTo == null) {
-      // 実行できた行には必ず入っている値。無い = 記録が壊れているので、黙って飛ばさず理由を残す
-      skipped.push({ op, reason: '元の価格が記録に残っていないため戻せません' });
+      // ★価格は変わったのに戻す先が分からない。いちばん人に知らせないといけない行 (blocking)
+      skipped.push({ op, blocking: true, reason: '元の価格が記録に残っていないため戻せません。モールの画面で実際の価格を確認してください' });
       continue;
     }
     if (op.new_price != null && op.new_price === restoreTo) {
-      skipped.push({ op, reason: '送った価格と元の価格が同じです (戻す必要がありません)' });
+      skipped.push({ op, blocking: false, reason: '送った価格と元の価格が同じです (戻す必要がありません)' });
       continue;
     }
     candidates.push({ op, restoreTo });
