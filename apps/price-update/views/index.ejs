@@ -6,6 +6,8 @@
   .pu-input { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
   .pu-input textarea { min-height: 76px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
   .pu-note { font-size: 12px; color: #64748b; }
+  /* 色が全部つられて変わる、のような「操作の効き方が見た目と違う」注意書き */
+  .pu-warn { font-size: 11px; color: #9a3412; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 4px; padding: 2px 4px; margin-top: 3px; line-height: 1.35; }
   table.pu { width: 100%; border-collapse: collapse; font-size: 13px; }
   table.pu th { text-align: left; color: #64748b; font-size: 11px; font-weight: 600; border-bottom: 2px solid #e2e8f0; padding: 6px 8px; white-space: nowrap; }
   table.pu td { border-bottom: 1px solid #f1f5f9; padding: 6px 8px; vertical-align: middle; }
@@ -262,7 +264,12 @@
         + '<td><span class="mall m-' + r.mall + '">' + esc(MALL_LABEL[r.mall] || r.mall) + '</span></td>'
         + '<td><div class="code">' + esc(r.neCode) + (r.rowKind === 'set' ? ' <span class="chip c-rule">セット</span>' : '') + '</div>'
         + '<div class="pu-note">' + esc(r.productName || '') + (r.viaCode ? ' ← ' + esc(r.viaCode) : '') + '</div></td>'
-        + '<td class="code">' + esc(r.listingCode || '') + (r.skuCode ? '<div class="pu-note">SKU ' + esc(r.skuCode) + '</div>' : '') + '</td>'
+        + '<td class="code">' + esc(r.listingCode || '')
+        // Yahoo のカラバリは「当たった色」と「送り先の商品コード」が別。両方見せる
+        + (r.matchedSubCode ? '<div class="pu-note">' + esc(r.matchedSubCode) + '</div>'
+          : (r.skuCode ? '<div class="pu-note">SKU ' + esc(r.skuCode) + '</div>' : ''))
+        + (r.sharedNote ? '<div class="pu-warn">' + esc(r.sharedNote) + '</div>' : '')
+        + '</td>'
         + '<td><span class="chip c-' + r.confidence + '">' + esc(CONF_LABEL[r.confidence]) + '</span>'
         + '<div class="pu-note">' + esc(r.resolveSource || '') + '</div></td>'
         + '<td class="num">' + yen(r.price) + '<div class="pu-note">' + esc(r.priceSource || r.note || '取得できず') + '</div></td>'

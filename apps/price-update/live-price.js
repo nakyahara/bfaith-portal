@@ -304,11 +304,35 @@ export async function fetchYahooPrices(targets, deps = {}) {
       let price = null;
       let skuCode = null;
       let reason = null;
+      // カラバリで当たった個別商品コード (画面に出す。更新のキーには使わない)
+      let matchedSubCode = null;
+      // 商品価格を共有する個別商品コード = 専用価格を持たないもの。**変えると全部が変わる**
+      let sharedSubCodes = [];
       if (matchedSub) {
-        // 個別商品コードの価格。null なら商品価格を継承する運用
-        price = matchedSub.price != null ? matchedSub.price : itemPrice;
-        skuCode = matchedSub.subCode;
-        if (price == null) reason = '設定価格を整数円として読めません';
+        matchedSubCode = matchedSub.subCode;
+        if (matchedSub.price != null) {
+          // この色だけ専用の価格が入っている。商品価格を送っても直らないので触らない (fail-closed)
+          reason = `この個別商品には専用の価格 (${matchedSub.price} 円) が入っています。`
+            + '商品の価格を変えてもこの色には効かないため、いまの版では更新できません';
+        } else if (pricedSubs.length > 0) {
+          // ★自分は継承でも、同じ商品に専用価格の色が混ざっている。
+          //   商品価格を変えると継承している色だけが動き、専用価格の色は取り残される。
+          //   送信側 (yahoo-apply) はこの商品を丸ごと拒否するので、
+          //   ここで確定させると「画面では更新できるのに、送ると必ず失敗する」になる (Codex R1 中)
+          reason = `この商品には専用の価格が入っている色があります `
+            + `(${pricedSubs.map((x) => x.subCode).join(', ')})。`
+            + '商品の価格を変えてもその色には効かないため、いまの版では更新できません';
+        } else if (itemPrice == null) {
+          reason = '設定価格を整数円として読めません';
+        } else {
+          price = itemPrice;
+          // ★Yahoo は「商品」に1つの価格しか持たない。個別商品コード (色) は商品価格を継承する。
+          //   だから更新のキーは **商品コード** にする。子コードをキーにすると
+          //   「送るのは商品価格なのに、送った後の照合は子コードで探す」ことになり必ず食い違う
+          //   (実測: 全色の価格が変わったうえで failed として記録される)
+          skuCode = d?.ItemCode || cand;
+          sharedSubCodes = subCodes.filter((s) => s.price == null).map((s) => s.subCode);
+        }
       } else if (pricedSubs.length > 0) {
         // 商品コードでは一致したが、SKU別価格を持つ商品 → どのSKUの価格か決められない (fail-closed)
         reason = `SKU別価格のある商品です (${pricedSubs.map((s) => s.subCode).join(', ')})。どのSKUかを特定できないため更新対象にできません`;
@@ -322,9 +346,10 @@ export async function fetchYahooPrices(targets, deps = {}) {
         //   ここを null のままにすると、実行時に "null" という文字列が価格のキーになり、
         //   送った後の照合が必ず食い違う (更新は通っているのに失敗として記録される)
         skuCode = d?.ItemCode || cand;
+        sharedSubCodes = subCodes.filter((s) => s.price == null).map((s) => s.subCode);
       }
       resolved = {
-        price, subCodes, skuCode,
+        price, subCodes, skuCode, matchedSubCode, sharedSubCodes,
         itemCode: d?.ItemCode || cand,
         found: price != null,
         reason,

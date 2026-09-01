@@ -239,5 +239,46 @@ console.log('\n── 復旧 run を二重に作らせない ──');
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* Windows のロック残り */ }
 }
 
+console.log('\n── Yahoo カラバリ: 旧形式の記録を戻せる / 注意書きが消えない ──');
+{
+  // 2026-09-01 より前の Yahoo の記録は sku_code に **色の個別商品コード** が入っていた。
+  // いまは商品コードに変えたので、そのままだと突き合わせが外れて「戻せない」になる。
+  // その色が今も同じ商品にぶら下がっていることを確かめたうえで読み替える
+  const yahooRow = {
+    mall: 'yahoo', neCode: '0726-001802-bk', rowKind: 'single', viaCode: null,
+    productName: '合皮補修シート', listingCode: '0726-001802',
+    skuCode: '0726-001802',                         // ★いまは商品コードが送り先
+    matchedSubCode: '0726-001802-BK',
+    sharedSubCodes: ['0726-001802-BK', '0726-001802-CL'],
+    sharedNote: 'Yahoo は色ごとの価格を持ちません。変えるとこの商品の 2 色すべてが同じ価格になります',
+    confidence: 'confirmed', priceSource: 'Yahoo itemInfo (ライブ)', priceFetchedAt: null,
+    price: 720,
+    cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.12, url: 'https://example.com',
+  };
+  const evaluate = (row) => ({ evaluation: evaluateRow({ ...row, currentPrice: row.price, isRecovery: true }) });
+
+  // 旧形式で記録された行 (sku_code = 色の個別商品コード)
+  const legacy = op('y1', 'confirmed', { mall: 'yahoo', neCode: '0726-001802-bk',
+    listingCode: '0726-001802', skuCode: '0726-001802-BK', expected: 698, next: 720 });
+  const r1 = buildRecoveryOperations(planRecovery({ operations: [legacy] }).candidates, [yahooRow], evaluate);
+  eq(r1.unmatched.length, 0, '★旧形式 (色のコード) の記録でも戻す先を見つけられる');
+  eq(r1.operations[0].skuCode, '0726-001802', '★送り先は商品コードに読み替わる');
+  eq(r1.operations[0].newPrice, 698, '戻す先は監査記録の値');
+  ok((r1.operations[0].guard.warns || []).some((w) => /色すべてが同じ価格/.test(w)),
+    '★復旧 run でも「全色が変わる」注意書きが残る');
+
+  // 新形式 (sku_code = 商品コード) はそのまま当たる
+  const modern = op('y2', 'confirmed', { mall: 'yahoo', neCode: '0726-001802-bk',
+    listingCode: '0726-001802', skuCode: '0726-001802', expected: 698, next: 720 });
+  const r2 = buildRecoveryOperations(planRecovery({ operations: [modern] }).candidates, [yahooRow], evaluate);
+  eq(r2.unmatched.length, 0, '新形式もそのまま戻せる');
+
+  // その商品にぶら下がっていない色は読み替えない (別商品を掴まない)
+  const alien = op('y3', 'confirmed', { mall: 'yahoo', neCode: '0726-001802-bk',
+    listingCode: '0726-001802', skuCode: '0726-001802-ZZ', expected: 698, next: 720 });
+  const r3 = buildRecoveryOperations(planRecovery({ operations: [alien] }).candidates, [yahooRow], evaluate);
+  eq(r3.unmatched.length, 1, '★いま存在しない色は読み替えない (取り違えない)');
+}
+
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
 process.exitCode = failed === 0 ? 0 : 1;

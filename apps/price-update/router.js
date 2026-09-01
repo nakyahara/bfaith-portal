@@ -19,7 +19,7 @@ import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim, recov
 import { planRecovery, buildRecoveryOperations, RECOVERABLE_STATES } from './recovery.js';
 import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
 import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot } from './live-price.js';
-import { evaluateRow, runLimits } from './pricing.js';
+import { evaluateRow, runLimits, mergeGuardWarns } from './pricing.js';
 import { rakutenShippingLabel, yahooPostageLabel, rakutenShippingName, yahooPostageName } from './shipping-labels.js';
 import { executeRun, mallWriteEnabled } from './execute.js';
 import { patchItemPrices, fetchItemDetail } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
@@ -188,6 +188,9 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       let confidence = l.confidence;
       let note = null;
       let skuCode = l.skuCode;
+      let matchedSubCode = null;
+      let sharedSubCodes = [];
+      let sharedNote = null;
       let listingCode = l.listingCode;
       let mallShipping = null;   // モール側の発送設定 (モールで配送方法が違うと売価差の理由になる)
       let url = listingUrl(l.mall, l.listingCode);
@@ -219,6 +222,16 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
           // 当たった実際の商品コードに差し替える (Yahoo の画面で探せるように)
           if (p.itemCode) { listingCode = p.itemCode; url = listingUrl('yahoo', p.itemCode); }
           if (p.skuCode) skuCode = p.skuCode;
+          // ★Yahoo は商品に1つの価格しか持たない。色 (個別商品コード) はそれを継承する。
+          //   つまり1色ぶんのつもりで変えると、その商品の色が全部同じ価格になる。
+          //   楽天は色ごとに変えられるので、同じ画面で同じ操作をしてもモールで効き方が違う。
+          //   黙って全色を変えないよう、必ず画面に出す
+          matchedSubCode = p.matchedSubCode || null;
+          sharedSubCodes = Array.isArray(p.sharedSubCodes) ? p.sharedSubCodes : [];
+          if (sharedSubCodes.length > 1) {
+            sharedNote = `Yahoo は色ごとの価格を持ちません。変えるとこの商品の ${sharedSubCodes.length} 色すべてが同じ価格になります`;
+            note = note ? `${note} / ${sharedNote}` : sharedNote;
+          }
         } else {
           note = p?.reason || '設定価格を取得できませんでした';
         }
@@ -250,6 +263,10 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         mall: l.mall,
         listingCode,
         skuCode,
+        // カラバリ (Yahoo): 当たった色の個別商品コードと、価格を共有する色の一覧
+        matchedSubCode,
+        sharedSubCodes,
+        sharedNote,
         confidence,
         resolveSource: l.source,
         price,
@@ -436,7 +453,11 @@ router.post('/api/runs', (req, res) => {
       taxRate: r.taxRate,
       shipping: r.shipping,
       feeRate: r.feeRate,
-      guard: r.evaluation ? { blocks: r.evaluation.blocks, warns: r.evaluation.warns, canUpdate: r.evaluation.canUpdate } : null,
+      // ★「この1色のつもりが全色に効く」は run を作った後も残さないといけない。
+      //   実行画面で見えないと、履歴だけ見た人が影響範囲を読み違える
+      // ★注意書き (例: Yahoo は色ごとの価格を持たないので全色が変わる) は run を作った後も残す。
+      //   実行画面で見えないと、履歴だけ見た人が影響範囲を読み違える
+      guard: mergeGuardWarns(r.evaluation, r.sharedNote),
       productUrl: r.url,
       // ★ガードに引っかかった行は previewed にしない (Codex R1 High)。
       // M2 の実行候補は previewed だけを見る。ブロック理由つきの行が同じ状態で混ざると、
@@ -511,9 +532,20 @@ router.get('/api/runs/:runId/executable', (req, res) => {
     if (!run) return res.status(404).json({ ok: false, error: 'not_found' });
     const targets = run.operations.filter((o) => o.state === 'previewed');
     const malls = [...new Set(targets.map((o) => o.mall))];
+    // ★送るボタンの手前で「1色のつもりが全色に効く」行を数えて見せる。
+    //   記録時に付けた注意書き (guard.warns) をそのまま使う — 実行時に作り直すと食い違う
+    const warnings = [];
+    for (const o of targets) {
+      let g = null;
+      try { g = o.guard_json ? JSON.parse(o.guard_json) : null; } catch { g = null; }
+      for (const w of (g?.warns || [])) {
+        warnings.push({ neCode: o.ne_code, listingCode: o.listing_code, mall: o.mall, warn: w });
+      }
+    }
     res.json({
       ok: true,
       targets: targets.length,
+      warnings,
       canExecute: canExecute(req),
       canExecuteReason: executorGate(req).message,   // 実行できない理由を画面に出すため
       claim: runClaim(getDB(), run.run_id),   // 既に実行済みならここに誰がいつ実行したかが入る
@@ -550,8 +582,32 @@ router.post('/api/runs/:runId/recovery', async (req, res) => {
     const { rows, notices } = await buildPreviewRows(db, codes, new Map());
     const evaluate = (row) => evaluateRows([row], { isRecovery: true })[0];
     const { operations, unmatched } = buildRecoveryOperations(candidates, rows, evaluate);
+
+    // ★戻せなかった行は必ず記録に残す。残さないと「全部戻した」と読めてしまう (Codex R2/R3)。
+    //   対象 = 引き当て直せなかった行 + 「価格は変わったのに戻す先が分からない」行 (skipped の blocking)
+    const asLeftover = (o, reason, kind) => ({
+      operationId: o.operation_id, neCode: o.ne_code, mall: o.mall,
+      listingCode: o.listing_code, skuCode: o.sku_code, reason, kind,
+    });
+    const leftovers = [
+      ...unmatched.map((u) => asLeftover(u.op, u.reason, 'unmatched')),
+      ...skipped.filter((x) => x.blocking).map((x) => asLeftover(x.op, x.reason, 'no_original_price')),
+    ];
+
     if (operations.length === 0) {
-      throw validationError('戻す対象の出品が今は見つかりません。モールの画面で確認してください');
+      // ★1件も戻せない時こそ記録が要る。ここで黙って投げると
+      //   「どの行がなぜ戻せなかったか」がどこにも残らず、画面にも汎用の文言しか出ない (Codex R1 高)
+      appendEvent(db, source.run_id, {
+        actor: actorOf(req), event: 'recovery_incomplete',
+        detail: { recoveryRunId: null, notRestored: leftovers },
+      });
+      return res.status(400).json({
+        ok: false, error: 'recovery_no_target',
+        message: '戻す対象の出品が今は見つかりません。下の一覧をモールの画面で確認してください',
+        notRestored: leftovers,
+        skipped: skipped.map((x) => ({ operationId: x.op.operation_id, neCode: x.op.ne_code, reason: x.reason, blocking: !!x.blocking })),
+        notices,
+      });
     }
 
     // ★「既にあるか調べる → 作る」は1つの取引の中で (同時に2回押されても2本作らない)
@@ -573,16 +629,6 @@ router.post('/api/runs/:runId/recovery', async (req, res) => {
       return res.status(409).json({ ok: false, error: created.code.toLowerCase(), runId: created.runId, message });
     }
     const runId = created.runId;
-    // ★戻せなかった行は必ず記録に残す。残さないと「全部戻した」と読めてしまう (Codex R2/R3)。
-    //   対象 = 引き当て直せなかった行 + 「価格は変わったのに戻す先が分からない」行 (skipped の blocking)
-    const asLeftover = (o, reason, kind) => ({
-      operationId: o.operation_id, neCode: o.ne_code, mall: o.mall,
-      listingCode: o.listing_code, skuCode: o.sku_code, reason, kind,
-    });
-    const leftovers = [
-      ...unmatched.map((u) => asLeftover(u.op, u.reason, 'unmatched')),
-      ...skipped.filter((s) => s.blocking).map((s) => asLeftover(s.op, s.reason, 'no_original_price')),
-    ];
     if (leftovers.length > 0) {
       appendEvent(db, runId, {
         actor: actorOf(req), event: 'recovery_incomplete',

@@ -197,5 +197,23 @@ for (const name of ['index.ejs', 'run.ejs']) {
   ok(/sendMalls/.test(src) && /g\.enabled/.test(src), '★実際に送るモール (kill switch が有効なもの) だけを名前に出す');
 }
 
+console.log('\n── 「1色のつもりが全色に効く」を画面から消さない ──');
+{
+  const idx = fs.readFileSync(path.join(HERE, 'views', 'index.ejs'), 'utf8');
+  const run = fs.readFileSync(path.join(HERE, 'views', 'run.ejs'), 'utf8');
+
+  ok(/sharedNote/.test(idx), '引き当て画面が sharedNote を出す');
+  ok(/pu-warn/.test(idx), '注意書き用のスタイルがある (ふつうの注記と見分けがつく)');
+  ok(/matchedSubCode/.test(idx), '★当たった色の個別商品コードを見せる (送り先とは別物)');
+
+  ok(/exec-warn/.test(run), '送るボタンの手前に注意書きの枠がある');
+  ok(/info.warnings/.test(run), '実行前チェックの warnings を使っている');
+  ok(/pu-warn/.test(run), '履歴の一覧にも注意書きのスタイルがある');
+  // ★注意書きは「ブロック理由が無いとき」だけ出す、という書き方をしていないこと。
+  //   ブロックされた行こそ、なぜ止まったか以外の事実も見えていないといけない
+  ok(!run.includes(String.fromCharCode(125) + " else if (guard && guard.warns"),
+    '★ブロック理由があっても注意書きを消さない (else if にしない)');
+}
+
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
 process.exitCode = failed === 0 ? 0 : 1;

@@ -232,5 +232,27 @@ console.log('\n── クライアント: 送信が通らなかった時 ──'
   ok(no.body.state !== 'applied', '★ok:false を成功にしない');
 }
 
+console.log('\n── 送り先は商品コードでなければならない (カラバリの取り違え防止) ──');
+{
+  // Yahoo は商品に1つの価格しか持たない。色 (個別商品コード) はそれを継承する。
+  // 呼び出し側が色のコードをキーにして渡してきたら、送る前に止める。
+  // ここを通すと「商品の全色が書き換わったのに、照合は色のコードで探して失敗になる」
+  const item = {
+    ok: true, ItemCode: 'kara-1', Price: 577, SalePrice: null, SalePriceReadable: true,
+    SubCodes: [{ SubCode: 'kara-1-BK', Price: null }, { SubCode: 'kara-1-CL', Price: null }],
+  };
+  const wrongKey = planYahooUpdate(item, 'kara-1', { 'kara-1-BK': 577 }, { 'kara-1-BK': 600 });
+  eq(wrongKey.ok, false, '★色のコードをキーに渡されたら送らない');
+  eq(wrongKey.body.error, 'SKU_KEY_MISMATCH', 'SKU_KEY_MISMATCH で止まる');
+  ok(/kara-1/.test(wrongKey.body.message), '正しい送り先 (商品コード) を理由に書く');
+
+  const rightKey = planYahooUpdate(item, 'kara-1', { 'kara-1': 577 }, { 'kara-1': 600 });
+  eq([rightKey.ok, rightKey.price], [true, 600], '商品コードなら通る (この商品の全色が 600 円になる)');
+
+  // 大文字小文字の違いは同じものとして扱う (どこかで正規化がずれても止まらないように)
+  const caseDiff = planYahooUpdate({ ...item, ItemCode: 'KARA-1' }, 'KARA-1', { 'kara-1': 577 }, { 'kara-1': 600 });
+  eq(caseDiff.ok, true, '大文字小文字の違いは同じ商品として扱う');
+}
+
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
 process.exitCode = failed === 0 ? 0 : 1;
