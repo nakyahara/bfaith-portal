@@ -59,6 +59,15 @@ const YAHOO_REDIRECT_URI = process.env.YAHOO_REDIRECT_URI || 'https://b-faith.bi
 // (.env に YAHOO_TOKEN_FILE=/home/rocky/yahoo-tokens.json を設定推奨)
 const TOKEN_FILE = process.env.YAHOO_TOKEN_FILE || path.join(__dirname, 'yahoo-tokens.json');
 
+/** 続けて Yahoo を叩く時に空ける間隔 (公式の利用制限 1クエリー/秒) */
+const YAHOO_API_GAP_MS = 1200;
+/**
+ * updateItems で送ってよい項目。★この経路は **価格専用**。
+ * 商品名や説明を通せるようにすると、価格改定のつもりで商品ページを書き換えられる経路になる。
+ * ★self-test より前に置く (const は巻き上がらないので、後ろに書くと self-test から見えない)。
+ */
+const PRICE_ONLY_KEYS = new Set(['item_code', 'price', 'sale_price', 'subcode_price']);
+
 // --self-test は起動前に処理する。secret も外部通信も要らない純粋なパーサ検証なので、
 // PROXY_SECRET の必須チェックより前に置く (手元でも VPS 上でも同じコードを確かめられるように)
 if (process.argv.includes('--self-test')) { runSelfTest(); }
@@ -1264,6 +1273,7 @@ const server = http.createServer(async (req, res) => {
       const raw = await readBody(req);
       let body;
       try { body = JSON.parse(raw); } catch (_) { throw new Error('update-items: invalid JSON body'); }
+      assertPriceOnlyItems(body.items, { clearSalePrice: body.clearSalePrice === true });
       const built = buildUpdateItemsBody(body.items, YAHOO_SELLER_ID, { includeItemNum: body.itemNum === true });
       console.log(`[${ts()}] Yahoo updateItems: ${built.count}件 (${built.codes.join(',')}) body=${built.body.length}b`);
       const r = await callYahooAPIRaw('updateItems', {
@@ -1271,8 +1281,32 @@ const server = http.createServer(async (req, res) => {
         contentType: 'application/x-www-form-urlencoded',
         body: built.body,
       });
-      res.writeHead(r.status, { 'Content-Type': 'application/xml' });
-      res.end(r.body);
+      // ★更新しただけでは客に見えない。「変えたつもり」を作らないよう、
+      //   この経路の中で反映まで済ませる (明示的に submit:false と言われた時だけ飛ばす)
+      const wantSubmit = body.submit !== false;
+      const updateOk = r.status >= 200 && r.status < 300 && !/<Status>\s*NG\s*<\/Status>/i.test(String(r.body));
+      const submits = [];
+      if (wantSubmit && updateOk) {
+        for (const code of built.codes) {
+          await new Promise((r2) => setTimeout(r2, YAHOO_API_GAP_MS));   // 1クエリー/秒
+          const sr = await callYahooAPIRaw('submitItem', {
+            method: 'POST',
+            contentType: 'application/x-www-form-urlencoded',
+            body: new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: code }).toString(),
+          });
+          const sok = sr.status >= 200 && sr.status < 300 && !/<Status>\s*NG\s*<\/Status>/i.test(String(sr.body));
+          console.log(`[${ts()}] Yahoo submitItem: item_code=${code} status=${sr.status} ok=${sok}`);
+          submits.push({ item_code: code, status: sr.status, ok: sok, body: String(sr.body).slice(0, 500) });
+        }
+      }
+      res.writeHead(r.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: updateOk && (!wantSubmit || submits.every((s) => s.ok)),
+        updateStatus: r.status,
+        updateBody: String(r.body).slice(0, 2000),
+        submitted: wantSubmit,
+        submits,
+      }));
       return;
     }
 
@@ -1659,6 +1693,27 @@ const server = http.createServer(async (req, res) => {
 });
 
 /**
+ * updateItems に渡された items が「価格だけ」か検査する。問題があれば投げる。
+ * ★sale_price に空文字を送ると **既存のセール価格が消える**。
+ *   うっかりで消さないよう、消す意図があるときだけ clearSalePrice:true を要求する。
+ */
+function assertPriceOnlyItems(items, { clearSalePrice = false } = {}) {
+  if (!Array.isArray(items) || items.length === 0) throw new Error('update-items: items が空です');
+  items.forEach((item, i) => {
+    if (!item || typeof item !== 'object') throw new Error(`update-items: ${i + 1}件目が商品の形をしていません`);
+    for (const key of Object.keys(item)) {
+      if (!PRICE_ONLY_KEYS.has(key)) {
+        throw new Error(`update-items: 「${key}」は送れません (この経路は価格専用: ${[...PRICE_ONLY_KEYS].join(', ')})`);
+      }
+    }
+    if ('sale_price' in item && String(item.sale_price ?? '') === '' && !clearSalePrice) {
+      throw new Error(`update-items: ${i + 1}件目の sale_price が空です。`
+        + '空文字は「セール価格を消す」意味になります。消してよいなら clearSalePrice:true を付けてください');
+    }
+  });
+}
+
+/**
  * 商品一括更新API (updateItems) の form body を組み立てる。
  *
  * ★item1 の値は「1つの商品情報をまとめてエンコードしたもの」= **二重エンコード**。
@@ -1861,6 +1916,25 @@ function runSelfTest() {
     (() => { try { buildUpdateItemsBody([{ item_code: 'a' }, { price: 1 }], 's'); return 'なぜか通った'; } catch (e) { return e.message; } })(),
     'updateItems: 2件目に item_code がありません');
   // SKU別価格の書式 (サブコード:価格 をパイプ区切り) がそのまま通ること
+  // 9) この経路は価格専用。商品名や説明を通さない / セール価格を黙って消さない
+  const tryAssert = (items, opts) => {
+    try { assertPriceOnlyItems(items, opts); return 'ok'; } catch (e) { return e.message; }
+  };
+  check('update-items: 価格だけなら通る',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: '900' }]), 'ok');
+  check('update-items: ★商品名は送れない',
+    tryAssert([{ item_code: 'a', price: '1000', name: '別の名前' }]),
+    'update-items: 「name」は送れません (この経路は価格専用: item_code, price, sale_price, subcode_price)');
+  check('update-items: ★説明も送れない',
+    tryAssert([{ item_code: 'a', caption: 'x' }]).startsWith('update-items: 「caption」は送れません'), true);
+  check('update-items: SKU別価格は通る', tryAssert([{ item_code: 'a', subcode_price: 'x:100' }]), 'ok');
+  check('update-items: ★空の sale_price は既定で拒否 (セール価格を黙って消さない)',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: '' }]),
+    'update-items: 1件目の sale_price が空です。空文字は「セール価格を消す」意味になります。消してよいなら clearSalePrice:true を付けてください');
+  check('update-items: 消してよいと言われたら通る',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: '' }], { clearSalePrice: true }), 'ok');
+  check('update-items: 空の items は拒否', tryAssert([]), 'update-items: items が空です');
+
   check('updateItems: subcode_price の書式が壊れない',
     decodeURIComponent(decodeURIComponent(
       buildUpdateItemsBody([{ item_code: 'a', subcode_price: 'aaaa:1000|bbbb:1200' }], 's').body.split('item1=')[1])),

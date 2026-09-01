@@ -29,7 +29,6 @@ import {
   flattenXml, diff, diffCount, withoutVolatile, collateralOf,
   guardTestCode, guardTestItem, itemPriceOf, itemBaseOf, isDirectChild, TEST_NAME_MARKER,
 } from './yahoo-edit-item-probe.js';
-import { editItemError } from './yahoo-edit-item-fields.js';
 
 const TIMEOUT_MS = 30_000;
 const MAX_PRICE = 999999999;
@@ -67,24 +66,24 @@ async function getRawXml(code) {
   return json.xml;
 }
 
-async function updatePrice(code, price, salePrice) {
+/**
+ * 価格を更新して、そのままフロント反映まで行う (プロキシ側が1操作にまとめている)。
+ * ★sale_price に空文字を送る = セール価格を消す。消してよいと明示する
+ *   (この smoke はセール価格が入っている商品では動かないようにしてある)
+ */
+async function updatePrice(code, price) {
   const res = await fetch(`${BASE}/yahoo/update-items`, {
     method: 'POST', headers: headers(),
-    // ★公式: price を更新する時は price と sale_price の両方を必ず送る。
-    //   使わない場合は sale_price に空文字
-    body: JSON.stringify({ items: [{ item_code: code, price: String(price), sale_price: salePrice }] }),
+    body: JSON.stringify({
+      items: [{ item_code: code, price: String(price), sale_price: '' }],
+      clearSalePrice: true,
+    }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
-  return { status: res.status, body: await res.text() };
-}
-
-async function submitItem(code) {
-  const res = await fetch(`${BASE}/yahoo/submit-item`, {
-    method: 'POST', headers: headers(),
-    body: JSON.stringify({ itemCode: code }),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  return { status: res.status, body: await res.text() };
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* エラー時は XML やテキストが返る */ }
+  return { status: res.status, body: text, json };
 }
 
 async function unpublished() {
@@ -155,10 +154,12 @@ async function main() {
   let attempted = false;
   try {
     attempted = true;
-    const r1 = await updatePrice(itemCode, probePrice, '');
-    console.log(`updateItems: HTTP ${r1.status} / ${oneLine(r1.body)}`);
-    const err1 = editItemError(r1);
-    if (err1) throw new Error(`送信できていません (${oneLine(err1.message || r1.body)})`);
+    const r1 = await updatePrice(itemCode, probePrice);
+    console.log(`updateItems + 反映: HTTP ${r1.status} / ${oneLine(r1.body)}`);
+    if (!r1.json?.ok) {
+      throw new Error(`送信できていません (${oneLine(r1.json?.updateBody || r1.body)})`);
+    }
+    console.log(`  反映 (submitItem): ${(r1.json.submits || []).map((s) => `${s.item_code}=${s.ok ? 'OK' : 'NG'}`).join(', ') || '(していない)'}`);
 
     await sleep(API_GAP_MS);
     const after = await flattenXml(await getRawXml(itemCode));
@@ -177,14 +178,6 @@ async function main() {
         + '\n   商品名・説明・画像を触らずに価格改定できます (M3 はこの API を使う)'
       : `🚨 価格以外が ${collateral.length} 項目 変わった/消えた → この API でも巻き添えが出ます`}`);
 
-    // ── フロント反映 (updateItems は反映しない) ──
-    await sleep(API_GAP_MS);
-    console.log('\n★ フロント反映 (submitItem) を試します');
-    const r2 = await submitItem(itemCode);
-    console.log(`submitItem: HTTP ${r2.status} / ${oneLine(r2.body)}`);
-    const err2 = editItemError(r2);
-    if (err2) console.error(`  ⚠️ 反映を受け付けてもらえませんでした (${oneLine(err2.message || r2.body)})`);
-
     await sleep(API_GAP_MS);
     const h = await unpublished();
     console.log(`\n未反映項目 (publish_id=0): HTTP ${h.status}`);
@@ -196,8 +189,18 @@ async function main() {
       await sleep(API_GAP_MS);
       console.log(`\n価格を元に戻します (${probePrice} → ${currentPrice})`);
       try {
-        const r3 = await updatePrice(itemCode, currentPrice, '');
-        console.log(`updateItems: HTTP ${r3.status} / ${oneLine(r3.body)}`);
+        const r3 = await updatePrice(itemCode, currentPrice);
+        console.log(`updateItems + 反映: HTTP ${r3.status} / ${oneLine(r3.body)}`);
+        // ★戻しの「反映」まで通っていることを確かめる。
+        //   ここを見ないと、管理側は戻っているのにフロントには検証中の価格が出たまま終わる
+        const submits = r3.json?.submits || [];
+        const submitOk = submits.length > 0 && submits.every((s) => s.ok);
+        console.log(`  反映 (submitItem): ${submits.map((s) => `${s.item_code}=${s.ok ? 'OK' : 'NG'}`).join(', ') || '(していない)'}`);
+        if (!r3.json?.ok || !submitOk) {
+          console.error(`🚨 戻しが完了していません (更新 ${r3.json?.updateStatus ?? r3.status} / 反映 ${submitOk ? 'OK' : 'NG'})`);
+          console.error(`   Yahoo の管理画面で ${itemCode} の価格を ${currentPrice} に直し、反映してください`);
+          process.exitCode = 1;
+        }
         await sleep(API_GAP_MS);
         const restored = await flattenXml(await getRawXml(itemCode));
         const back = diff(before, restored);
@@ -208,9 +211,6 @@ async function main() {
           console.error(`\n🚨 最初の状態と ${diffCount(back)} 項目 違います。Yahoo の管理画面で確かめてください`);
           process.exitCode = 1;
         }
-        await sleep(API_GAP_MS);
-        const r4 = await submitItem(itemCode);
-        console.log(`戻したあとの反映 submitItem: HTTP ${r4.status} / ${oneLine(r4.body)}`);
       } catch (e) {
         console.error(`🚨 戻す処理でエラー: ${e.message}`);
         console.error(`   Yahoo の管理画面で ${itemCode} の価格を ${currentPrice} に直してください`);
