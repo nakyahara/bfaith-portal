@@ -65,7 +65,7 @@ import {
   isValidGtin, MODEL_ATTR_NAME,
 } from './services/rakuten-listing.js';
 // ボードから楽天に出品 (2026-09-01): 画像転送 → 登録 → 後処理 を 1 本に
-import { listToRakutenFromBoard, afterRakutenRegistered } from './services/board-listing.js';
+import { listToRakutenFromBoard, afterRakutenRegistered, acquireRakutenListingLock } from './services/board-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
@@ -1459,17 +1459,25 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
   if (req.body?.confirm !== true) {
     return res.status(400).json({ ok: false, error: 'confirm が必要です' });
   }
+  // ボードからの出品と**同じロック**を通す (Codex R1 critical): ボードで実行中に別タブの
+  // 詳細画面から押すと、両方が「未登録」を見て同じ PUT を二度打てた
+  let release;
+  try { release = acquireRakutenListingLock(draft.id); } catch (e) {
+    return res.status(409).json({ ok: false, error: e.message });
+  }
   try {
     const r = await registerItem(draft.id, { actor: actorOf(req) });
     if (!r.ok) return res.status(400).json({ ok: false, error: r.error || (r.reasons || []).join(' / '), reasons: r.reasons });
     // 楽天モール=完了 + 画像工程⑧=完了 (人に二度同じことを押させない)。
-    // fail-soft: ここで失敗しても出品は成功しているので、出品結果は返す。
+    // fail-soft: ここで失敗しても出品は成功しているので、出品結果は返す (postProcess で失敗を伝える)。
     // ボードからの出品 (board-listing.js) と同じ後処理を共有する
-    afterRakutenRegistered(getDB(), draft, actorOf(req));
-    res.json(r);
+    const postProcess = afterRakutenRegistered(getDB(), draft, actorOf(req));
+    res.json({ ...r, postProcess });
   } catch (e) {
     console.error('[product-hub] rakuten register failed:', e);
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  } finally {
+    release();
   }
 });
 
@@ -1483,7 +1491,12 @@ router.post('/api/drafts/:id/rakuten/list-from-board', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'confirm が必要です' });
   }
   try {
-    const r = await listToRakutenFromBoard(draft.id, { actor: actorOf(req) });
+    // 前回「結果不明」の商品を再実行できるのは管理者だけ (人が RMS で未登録を確認した前提)
+    const forceUnknown = req.body?.force_unknown === true;
+    if (forceUnknown && req.session?.role !== 'admin') {
+      return res.status(403).json({ ok: false, error: '結果不明の商品の再実行は管理者だけができます' });
+    }
+    const r = await listToRakutenFromBoard(draft.id, { actor: actorOf(req), forceUnknown });
     // 失敗も 200 で返す (理由は r.error / r.stage。画面はこれを読んで見せる)。
     // 4xx に倒すのは「実行できない」(登録済み・実行中・confirm なし) だけ
     res.json(r);
@@ -2102,6 +2115,8 @@ router.get('/board', (req, res) => {
     // 楽天の商品ページ URL は商品コードから決まる (draft_mall_status には保存しない設計)。
     // 出品・展開の列のカードで「商品ページ ↗」を組み立てるために渡す (2026-09-01)
     rakutenItemPageUrl,
+    // 結果不明 (outcome=unknown) の商品を再実行する「確認済みで再実行」は管理者だけに出す
+    isAdmin: req.session?.role === 'admin',
   });
 });
 

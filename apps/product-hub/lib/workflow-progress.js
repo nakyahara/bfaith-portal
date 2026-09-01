@@ -1211,7 +1211,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       ${/* ボードから楽天に出品した結果 (2026-09-01)。出品・展開の列のカードだけが読む。
             registered_at があれば「登録済み」、無くて last_error があれば「失敗 (理由)」 */''}
       (SELECT registered_at FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_registered_at,
-      (SELECT last_error FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_last_error
+      (SELECT last_error FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_last_error,
+      (SELECT listing_outcome FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_listing_outcome,
+      (SELECT listing_attempt_at FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_listing_attempt_at
     FROM product_drafts d
     WHERE d.status NOT IN ('on_hold', 'excluded')
     ${candidateSql}
@@ -1299,6 +1301,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       // ボードから楽天に出品した結果 (2026-09-01)。出品・展開の列でだけ使う
       rakutenRegisteredAt: d.rakuten_registered_at || null,
       rakutenLastError: d.rakuten_last_error || null,
+      // 直近の試行: running=実行中 / failed=失敗 (やり直せる) / unknown=結果不明 (やり直し禁止) / null
+      rakutenListingOutcome: d.rakuten_listing_outcome || null,
+      rakutenListingAttemptAt: d.rakuten_listing_attempt_at || null,
       // 夜間自動化 (2026-08-28): AI が「人の確認待ち」にした理由。列は変えず (工程は AI情報入力待ちのまま)
       // カードに ⚠ で出す — on_hold にするとボードから消えて誰も気づかない
       genBlockCode: d.generation_block_code || null,

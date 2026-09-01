@@ -7,97 +7,165 @@
  *   ② 公開状態で登録 (registerItem。前提チェックで止まれば reasons が返る)
  *   ③ 成功したら 楽天モール=完了 + 画像工程⑧「楽天登録」=完了 (詳細画面の登録ボタンと同じ後処理)
  *
- * 失敗はどの段階でも draft_rakuten.last_error に残す — ボードのカードはこれを読んで
- * 「❌ 出品できませんでした」を出す (詳細画面を開かなくても理由が分かる)。
- * registerItem は RMS のエラーしか last_error に書かないので、前提チェックの理由 (ジャンル未入力等)
- * と転送の失敗はここで書く。
+ * 楽天への PUT は取り消せない。そのための守り (Codex R1 critical ×2 / high ×2):
+ *   - 二重実行のロックは**詳細画面の「公開で登録」と共有** (acquireRakutenListingLock)。
+ *     ボードで実行中に別タブの詳細画面から押しても 409
+ *   - registerItem が「PUT の結果が確認できない」(RMS_OUTCOME_UNKNOWN) を投げたら、失敗ではなく
+ *     **outcome=unknown** で止める。実は登録が通っている可能性があるので、カードに「やり直す」を出さず、
+ *     人が RMS で確認したうえで管理者だけが再実行 (forceUnknown) できる
+ *   - サーバー側でも「本流の工程が出品・展開まで来ている / 保留・除外でない / 登録済みでない」を見る。
+ *     confirm:true は誤操作防止の印であって、認可ではない
+ *   - 後処理 (モール=完了・工程⑧=完了) の失敗は成功に紛れさせず、戻り値と履歴に残す
  *
- * 楽天への PUT は取り消せないので、二重実行は 2 段で防ぐ: 登録済み (registered_at) なら拒否 /
- * 同じ商品の実行中は 409。
+ * 試行の状態は draft_rakuten.listing_outcome / listing_attempt_at / last_error に残す。
+ * ボードのカードはこれを読んで 実行中 / 失敗 (理由) / 結果不明 を出す。
+ * registerItem は RMS のエラーしか last_error に書かないので、前提チェックの理由と転送の失敗はここで書く。
  */
 import { getDB, logEvent } from '../db.js';
 import { transferImagesToCabinet, registerItem, rakutenItemPageUrl } from './rakuten-listing.js';
 import { markRakutenListed } from '../lib/mall-status.js';
 import { setStepState } from '../lib/workflow-progress.js';
 
-/** 実行中の draft_id (プロセス内)。Render は 1 プロセスなのでこれで足りる */
-const inFlight = new Set();
+/** 楽天への登録を実行中の draft_id → 開始時刻 (プロセス内。Render は 1 プロセスなのでこれで足りる) */
+const inFlight = new Map();
 
-function badRequest(message, extra = {}) {
+function httpError(status, message) {
   const e = new Error(message);
-  e.status = 400;
-  Object.assign(e, extra);
+  e.status = status;
   return e;
 }
 
 /**
+ * 楽天への登録 (PUT) を 1 商品 1 本に直列化するロック。ボードからの出品と詳細画面の
+ * 「公開で登録」の**両方**がこれを通る (片方だけだと、もう片方から同じ PUT が走る)。
+ * @returns {() => void} 解放関数 (finally で必ず呼ぶ。二度呼んでも安全)
+ * @throws 409 実行中
+ */
+export function acquireRakutenListingLock(draftId) {
+  const id = Number(draftId);
+  if (inFlight.has(id)) throw httpError(409, 'この商品は楽天に出品中です。終わるまで待ってください');
+  inFlight.set(id, Date.now());
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    inFlight.delete(id);
+  };
+}
+
+export function isRakutenListingInFlight(draftId) {
+  return inFlight.has(Number(draftId));
+}
+
+/**
  * 楽天登録が成功したあとの共通後処理 (詳細画面の「公開で登録」とボードからの出品で同じ)。
- * どちらも fail-soft: 出品は成功しているので、ここで失敗しても結果は成功として返す
+ * fail-soft: 出品は成功しているので、ここで失敗しても throw しない。ただし**黙らない** —
+ * 戻り値で返し、履歴にも残す (Codex R1 high: モール状況が未更新だと登録済みなのにカードに
+ * 「出品」ボタンが出続ける。カード側は registered_at を主判定にして、ここでの失敗は警告として出す)
+ * @returns {{mallOk: boolean, stepOk: boolean}}
  */
 export function afterRakutenRegistered(db, draft, actor) {
-  markRakutenListed(db, draft.id, { itemUrl: rakutenItemPageUrl(draft.ne_code), actor });
-  // 画像工程 v2 ⑧「楽天登録」も自動で完了
+  const mallOk = markRakutenListed(db, draft.id, { itemUrl: rakutenItemPageUrl(draft.ne_code), actor }) === true;
+  // 画像工程 v2 ⑧「楽天登録」も自動で完了 (対象外 skip はそのまま)
+  let stepOk = true;
   try {
     const st = db.prepare("SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(draft.id);
     if (st && st.state !== 'done' && st.state !== 'skip') {
       setStepState(draft.id, 'imgd_rakuten', { state: 'done' }, actor, { isAdmin: true, systemActor: true });
     }
   } catch (e) {
+    stepOk = false;
     console.warn('[product-hub] imgd_rakuten auto-done failed:', e?.message || e);
   }
+  if (!mallOk || !stepOk) {
+    logEvent(db, draft.id, 'rakuten_postprocess_failed',
+      `楽天登録は成功。後処理: モール状況=${mallOk ? 'ok' : '失敗'} / 画像工程⑧=${stepOk ? 'ok' : '失敗'}`, actor);
+  }
+  return { mallOk, stepOk };
 }
 
-/** ボードのカードに出す失敗理由を残す (registerItem の成功時に NULL へ戻る) */
-function rememberFailure(db, draftId, message, actor) {
+/**
+ * 試行の状態を残す。outcome=running で始め、失敗なら failed/unknown、成功なら NULL に戻す。
+ * last_error は「今回の試行」のものだけを見せたいので、開始時に消す (keepError=true は
+ * registerItem が RMS の原文を書いた直後に呼ぶとき — 上書きして原文を失わない)
+ */
+function setAttempt(db, draftId, { outcome, error = null, start = false, keepError = false }) {
   db.prepare(`
-    INSERT INTO draft_rakuten (draft_id, last_error) VALUES (?, ?)
+    INSERT INTO draft_rakuten (draft_id, listing_outcome, listing_attempt_at, last_error)
+    VALUES (@id, @outcome, @at, @error)
     ON CONFLICT(draft_id) DO UPDATE SET
-      last_error = excluded.last_error,
+      listing_outcome = excluded.listing_outcome,
+      listing_attempt_at = CASE WHEN @start = 1 THEN excluded.listing_attempt_at ELSE draft_rakuten.listing_attempt_at END,
+      last_error = CASE WHEN @keep = 1 THEN draft_rakuten.last_error ELSE excluded.last_error END,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-  `).run(draftId, String(message).slice(0, 1500));
-  logEvent(db, draftId, 'rakuten_board_listing_failed', String(message).slice(0, 500), actor);
+  `).run({
+    id: Number(draftId), outcome, at: start ? new Date().toISOString() : null,
+    error: error == null ? null : String(error).slice(0, 1500), start: start ? 1 : 0, keep: keepError ? 1 : 0,
+  });
+}
+
+/** 本流の「いま進める番」の工程 (全部決着なら null) */
+function mainCurrentStep(db, draftId) {
+  return db.prepare(`
+    SELECT p.step_code, s.label FROM draft_step_progress p
+    JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+    WHERE p.draft_id = ? AND s.track = 'main' AND p.state NOT IN ('done', 'skip')
+    ORDER BY s.sort, s.code LIMIT 1
+  `).get(Number(draftId)) || null;
 }
 
 /**
  * @param {number} draftId
- * @param {{actor?: string|null, deps?: {transfer?: Function, register?: Function}}} opts
- *   deps はテスト用の差し替え口 (本番は既定のまま)
- * @returns {Promise<{ok: boolean, stage: 'transfer'|'register'|'done', transfer: object|null, register: object|null, error?: string}>}
+ * @param {{actor?: string|null, forceUnknown?: boolean, deps?: {transfer?: Function, register?: Function}}} opts
+ *   forceUnknown = 前回 outcome=unknown の商品を、人が RMS で「登録されていない」と確認したうえで再実行する
+ *   (router が管理者だけに許す)。deps はテスト用の差し替え口 (本番は既定のまま)
+ * @returns {Promise<{ok: boolean, stage: 'transfer'|'register'|'done', outcome: 'failed'|'unknown'|null,
+ *   retryable: boolean, transfer: object|null, register: object|null, postProcess?: object, error?: string}>}
+ * @throws 400 実行できない状態 / 409 実行中
  */
-export async function listToRakutenFromBoard(draftId, { actor = null, deps = {} } = {}) {
+export async function listToRakutenFromBoard(draftId, { actor = null, forceUnknown = false, deps = {} } = {}) {
   const db = getDB();
   const id = Number(draftId);
-  const draft = db.prepare('SELECT id, ne_code, name FROM product_drafts WHERE id = ?').get(id);
-  if (!draft) throw badRequest('商品が見つかりません');
-  const rk = db.prepare('SELECT registered_at FROM draft_rakuten WHERE draft_id = ?').get(id);
+  const draft = db.prepare('SELECT id, ne_code, name, status FROM product_drafts WHERE id = ?').get(id);
+  if (!draft) throw httpError(400, '商品が見つかりません');
+  if (draft.status === 'on_hold' || draft.status === 'excluded') {
+    throw httpError(400, '保留・除外中の商品は出品できません (詳細画面で再開してから)');
+  }
+  const rk = db.prepare('SELECT registered_at, listing_outcome FROM draft_rakuten WHERE draft_id = ?').get(id);
   if (rk?.registered_at) {
-    throw badRequest('この商品は楽天に登録済みです (公開/非公開の切り替えは詳細画面から)');
+    throw httpError(400, 'この商品は楽天に登録済みです (公開/非公開の切り替えは詳細画面から)');
   }
-  if (inFlight.has(id)) {
-    const e = new Error('この商品は楽天に出品中です。終わるまで待ってください');
-    e.status = 409;
-    throw e;
+  if (rk?.listing_outcome === 'unknown' && !forceUnknown) {
+    throw httpError(400, `前回の登録結果が確認できていません。RMS で商品管理番号「${String(draft.ne_code).toLowerCase()}」の有無を確認してください。`
+      + '登録されていれば詳細画面の「モール別の展開状況」で楽天を完了に、無ければ管理者が「確認済みで再実行」できます');
   }
+  // ボードの意味を守る: 本流が「出品・展開」まで来ている商品だけ (URL 直叩きで工程を飛ばさせない)
+  const cur = mainCurrentStep(db, id);
+  if (cur && cur.step_code !== 'listing') {
+    throw httpError(400, `工程がまだ「出品・展開」まで進んでいません (いま: ${cur.label})。先に工程を進めてください`);
+  }
+
+  const release = acquireRakutenListingLock(id);
   const transfer = deps.transfer || transferImagesToCabinet;
   const register = deps.register || registerItem;
-
-  inFlight.add(id);
+  const fail = (stage, message, { transfer: tr = null, register: reg = null, keepError = false } = {}) => {
+    setAttempt(db, id, { outcome: 'failed', error: message, keepError });
+    logEvent(db, id, 'rakuten_board_listing_failed', `${stage}: ${String(message).slice(0, 480)}`, actor);
+    return { ok: false, stage, outcome: 'failed', retryable: true, transfer: tr, register: reg, error: message };
+  };
   try {
-    logEvent(db, id, 'rakuten_board_listing_started', null, actor);
+    setAttempt(db, id, { outcome: 'running', start: true });
+    logEvent(db, id, 'rakuten_board_listing_started', forceUnknown ? '結果不明を人が確認したうえで再実行' : null, actor);
 
     // ① 画像転送。転送済みは 'already' で飛ぶので、何度実行しても余計なアップロードは起きない
     let tr;
     try {
       tr = await transfer(id, { actor });
     } catch (e) {
-      const msg = `画像の転送でエラー: ${String(e?.message || e).slice(0, 300)}`;
-      rememberFailure(db, id, msg, actor);
-      return { ok: false, stage: 'transfer', transfer: null, register: null, error: msg };
+      return fail('transfer', `画像の転送でエラー: ${String(e?.message || e).slice(0, 300)}`);
     }
     if (tr.error === 'no_images') {
-      const msg = '商品画像がありません (画像タブでフォルダを取り込んでから出品してください)';
-      rememberFailure(db, id, msg, actor);
-      return { ok: false, stage: 'transfer', transfer: tr, register: null, error: msg };
+      return fail('transfer', '商品画像がありません (画像タブでフォルダを取り込んでから出品してください)', { transfer: tr });
     }
     const transferSummary = {
       uploaded: tr.uploaded || 0,
@@ -107,40 +175,42 @@ export async function listToRakutenFromBoard(draftId, { actor = null, deps = {} 
     };
     if (transferSummary.failed > 0) {
       // 未転送のまま登録しても registerItem の前提チェックで止まる。理由を転送側の言葉で残す
-      const msg = `画像 ${transferSummary.failed} 枚を R-Cabinet に転送できませんでした`
+      return fail('transfer', `画像 ${transferSummary.failed} 枚を R-Cabinet に転送できませんでした`
         + (transferSummary.errors[0] ? ` (${transferSummary.errors[0].slice(0, 200)})` : '')
-        + '。Drive の画像フォルダがサービスアカウントに共有されているか確認してください';
-      rememberFailure(db, id, msg, actor);
-      return { ok: false, stage: 'transfer', transfer: transferSummary, register: null, error: msg };
+        + '。Drive の画像フォルダがサービスアカウントに共有されているか確認してください', { transfer: transferSummary });
     }
 
-    // ② 登録 (前提チェック → RMS PUT)。RMS のエラーは registerItem が last_error に書く
+    // ② 登録 (前提チェック → RMS PUT)
     let reg;
     try {
       reg = await register(id, { actor });
     } catch (e) {
-      const msg = `楽天への登録でエラー: ${String(e?.message || e).slice(0, 300)}`;
-      rememberFailure(db, id, msg, actor);
-      return { ok: false, stage: 'register', transfer: transferSummary, register: null, error: msg };
+      if (e?.code === 'RMS_OUTCOME_UNKNOWN') {
+        // 🚨 PUT が通ったかどうか分からない。失敗にすると「やり直す」で二重登録になるので、
+        // unknown で止めて人の確認を待つ (registerItem の原文をそのまま残す)
+        const msg = String(e.message || e).slice(0, 1200);
+        setAttempt(db, id, { outcome: 'unknown', error: msg });
+        logEvent(db, id, 'rakuten_board_listing_unknown', msg.slice(0, 480), actor);
+        return { ok: false, stage: 'register', outcome: 'unknown', retryable: false, transfer: transferSummary, register: null, error: msg };
+      }
+      return fail('register', `楽天への登録でエラー: ${String(e?.message || e).slice(0, 300)}`, { transfer: transferSummary });
     }
     if (!reg.ok) {
-      const msg = reg.error || (reg.reasons || []).join(' / ') || '楽天への登録に失敗しました';
-      // 前提チェック (reasons) は registerItem が記録しないのでここで残す。RMS エラーは記録済み
-      if (reg.reasons) rememberFailure(db, id, `出品の前提が揃っていません: ${msg}`, actor);
-      else logEvent(db, id, 'rakuten_board_listing_failed', String(msg).slice(0, 500), actor);
-      return { ok: false, stage: 'register', transfer: transferSummary, register: reg, error: msg };
+      if (reg.reasons) {
+        // 前提チェック (registerItem は reasons を last_error に書かない → ここで残す)
+        return fail('register', `出品の前提が揃っていません: ${reg.reasons.join(' / ')}`, { transfer: transferSummary, register: reg });
+      }
+      // RMS エラー: 原文は registerItem が last_error に書いた。上書きせず outcome だけ付ける
+      return fail('register', reg.error || '楽天への登録に失敗しました', { transfer: transferSummary, register: reg, keepError: true });
     }
 
-    // ③ 後処理 (モール=完了・画像工程⑧=完了)
-    afterRakutenRegistered(db, draft, actor);
-    logEvent(db, id, 'rakuten_board_listing_done', reg.manageNumber || null, actor);
-    return { ok: true, stage: 'done', transfer: transferSummary, register: reg };
+    // ③ 後処理 (モール=完了・画像工程⑧=完了)。失敗は戻り値で返す (成功に紛れさせない)
+    const postProcess = afterRakutenRegistered(db, draft, actor);
+    setAttempt(db, id, { outcome: null, keepError: true }); // last_error は registerItem が NULL にしている
+    logEvent(db, id, 'rakuten_board_listing_done',
+      `${reg.manageNumber || ''}${postProcess.mallOk && postProcess.stepOk ? '' : ' (後処理に失敗あり)'}`, actor);
+    return { ok: true, stage: 'done', outcome: null, retryable: false, transfer: transferSummary, register: reg, postProcess };
   } finally {
-    inFlight.delete(id);
+    release();
   }
-}
-
-/** テスト用: 実行中フラグを覗く */
-export function _isListingInFlight(draftId) {
-  return inFlight.has(Number(draftId));
 }

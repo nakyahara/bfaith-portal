@@ -5135,6 +5135,7 @@ const boardBase = {
   boardView: 'main', imageKindLabels: wfp.IMAGE_KIND_LABELS,
   // 出品・展開の列で楽天の商品ページを組み立てる (2026-09-01)
   rakutenItemPageUrl: (mn) => `https://item.rakuten.co.jp/b-faith/${String(mn).toLowerCase()}/`,
+  isAdmin: true,
 };
 renders.push(
   ['board.ejs', 'board.ejs', boardBase],
@@ -5179,6 +5180,11 @@ renders.push(
             mk(90001, { malls: malls('todo'), rakutenRegisteredAt: null, rakutenLastError: null }),
             mk(90002, { malls: malls('todo'), rakutenRegisteredAt: null, rakutenLastError: 'ジャンルIDが未入力か数字ではありません' }),
             mk(90003, { malls: malls('done', 'https://item.rakuten.co.jp/x/lst-90003/'), rakutenRegisteredAt: '2026-09-01T00:00:00Z', rakutenLastError: null }),
+            // 結果不明 (やり直し禁止・管理者だけ再実行) / 実行中 / 途中で止まった / 登録済みだが後処理が失敗
+            mk(90004, { malls: malls('todo'), rakutenRegisteredAt: null, rakutenLastError: '楽天への登録結果が確認できませんでした (fetch failed)', rakutenListingOutcome: 'unknown' }),
+            mk(90005, { malls: malls('todo'), rakutenRegisteredAt: null, rakutenLastError: null, rakutenListingOutcome: 'running', rakutenListingAttemptAt: new Date().toISOString() }),
+            mk(90006, { malls: malls('todo'), rakutenRegisteredAt: null, rakutenLastError: null, rakutenListingOutcome: 'running', rakutenListingAttemptAt: '2026-08-01T00:00:00Z' }),
+            mk(90007, { malls: malls('todo'), rakutenRegisteredAt: '2026-09-01T00:00:00Z', rakutenLastError: null }),
           ],
         }),
       },
@@ -5334,6 +5340,17 @@ for (const [name, file, data] of renders) {
     check('ボード(出品): カードに data-rk (楽天の状態) と data-name が付く',
       /data-rk="todo"[\s\S]{0,80}data-name="出品テスト 90001"/.test(bhL) && bhL.includes('data-rk="done"'),
       (bhL.match(/data-rk="[^"]*"/g) || []).slice(0, 4).join(' '));
+    const c4 = cardOf(90004), c5 = cardOf(90005), c6 = cardOf(90006), c7 = cardOf(90007);
+    check('ボード(出品): 結果不明のカードは「やり直す」を出さず、RMS で確認の案内 + 管理者だけの再実行ボタン',
+      c4.includes('確認できませんでした') && c4.includes('lst-90004') && !c4.includes('やり直す')
+      && /class="kb-rk-btn"[^>]*data-force="1"/.test(c4),
+      c4.slice(0, 260));
+    check('ボード(出品): 実行中のカードは「出品しています…」でボタン無し',
+      c5.includes('kb-rk-busy') && !c5.includes('kb-rk-btn'), c5.slice(0, 200));
+    check('ボード(出品): 実行中のまま 15 分以上経ったカードは「途中で止まりました」+ やり直しボタン',
+      c6.includes('途中で止まりました') && c6.includes('やり直す') && /class="kb-rk-btn"/.test(c6), c6.slice(0, 260));
+    check('ボード(出品): 登録済みだがモール状況が未更新のカードは「出品済み」+ 警告 (ボタンは出さない)',
+      c7.includes('kb-rk-done') && c7.includes('未更新') && !c7.includes('kb-rk-btn'), c7.slice(0, 260));
   }
   check('ボード: 確認中のカードに理由ラベルが出る',
     bh.includes('kb-checking') && bh.includes('🔍 確認中: パッケージ裏面の確認待ち'),
@@ -5765,11 +5782,17 @@ for (const [name, file, data] of renders) {
 {
   const bl = await import('../services/board-listing.js');
   const wfp = wfpEarly;
-  const mkDraft = (code) => {
+  // 本流を「出品・展開」まで進めた商品 (ボードでそこへ落とした状態)。工程のゲート (基本情報の材料等) は
+  // ここでは見たいものではないので、fixture として直接 done にする
+  const mkDraft = (code, { atListing = true, status = 'draft' } = {}) => {
     const id = Number(db.prepare(
-      `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES (?, ?, 'draft', 'smoke')`,
-    ).run(code, `楽天出品テスト ${code}`).lastInsertRowid);
+      `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES (?, ?, ?, 'smoke')`,
+    ).run(code, `楽天出品テスト ${code}`, status).lastInsertRowid);
     wfp.ensureProgress(db, id);
+    if (atListing) {
+      db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ?
+                  AND step_code IN (SELECT code FROM ph_steps WHERE track = 'main' AND code <> 'listing')`).run(id);
+    }
     return id;
   };
   const rkOf = (id) => db.prepare('SELECT registered_at, last_error FROM draft_rakuten WHERE draft_id = ?').get(id) || {};
@@ -5881,10 +5904,10 @@ for (const [name, file, data] of renders) {
     await new Promise((resolve) => setTimeout(resolve, 10));
     let second = null;
     try { await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { second = e; }
-    check('ボード出品: 実行中に同じ商品をもう一度は 409', second?.status === 409 && bl._isListingInFlight(id), second?.message);
+    check('ボード出品: 実行中に同じ商品をもう一度は 409', second?.status === 409 && bl.isRakutenListingInFlight(id), second?.message);
     release();
     const r1 = await first;
-    check('ボード出品: 先の実行は最後まで通り、フラグが消える', r1.ok === true && !bl._isListingInFlight(id), JSON.stringify(r1).slice(0, 120));
+    check('ボード出品: 先の実行は最後まで通り、フラグが消える', r1.ok === true && !bl.isRakutenListingInFlight(id), JSON.stringify(r1).slice(0, 120));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
   }
   {
@@ -5908,7 +5931,82 @@ for (const [name, file, data] of renders) {
     check('HTTP ボード出品: 登録済みは 400 で理由を返す', r.status === 400 && /登録済み/.test(r.json.error || ''), JSON.stringify(r.json));
     r = await call('/api/drafts/999999999/rakuten/list-from-board', { confirm: true });
     check('HTTP ボード出品: 存在しない商品は 404', r.status === 404, String(r.status));
+    // 結果不明の再実行 (force_unknown) は管理者だけ。一般ユーザーは 403 で何も起きない
+    const idU = mkDraft('LST-HTTP-FORCE');
+    db.prepare("INSERT INTO draft_rakuten (draft_id, listing_outcome, last_error) VALUES (?, 'unknown', 'x')").run(idU);
+    r = await call(`/api/drafts/${idU}/rakuten/list-from-board`, { confirm: true, force_unknown: true });
+    check('HTTP ボード出品: 結果不明の再実行を一般ユーザーが頼むと 403', r.status === 403, JSON.stringify(r.json));
+    r = await call(`/api/drafts/${idU}/rakuten/list-from-board`, { confirm: true });
+    check('HTTP ボード出品: 結果不明の商品は force なしだと 400 (RMS で確認、の案内)',
+      r.status === 400 && /RMS/.test(r.json.error || '') && /lst-http-force/.test(r.json.error || ''), JSON.stringify(r.json));
+    // 詳細画面の「公開で登録」もロックを通る (Codex R1 critical): ボードで実行中は 409
+    const idL = mkDraft('LST-HTTP-LOCK');
+    const releaseL = bl.acquireRakutenListingLock(idL);
+    r = await call(`/api/drafts/${idL}/rakuten/register`, { confirm: true });
+    check('HTTP 詳細画面の「公開で登録」: ボードで出品中の商品は 409 (同じロック)', r.status === 409, JSON.stringify(r.json));
+    releaseL();
     server.close();
+    db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?)').run(id, idU, idL);
+  }
+  {
+    // 🚨 PUT の結果が確認できなかった (RMS_OUTCOME_UNKNOWN) は「失敗」ではなく「結果不明」で止める。
+    // 実は登録が通っている可能性があるので、やり直し可 (retryable) にしてはいけない (Codex R1 critical)
+    const id = mkDraft('LST-UNKNOWN');
+    const unknownErr = Object.assign(new Error('楽天への登録結果が確認できませんでした (fetch failed)。RMS で商品管理番号 lst-unknown の有無を確認してから再実行してください'), { code: 'RMS_OUTCOME_UNKNOWN' });
+    const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: { transfer: okTransfer, register: async () => { throw unknownErr; } } });
+    const rk = db.prepare('SELECT listing_outcome, last_error FROM draft_rakuten WHERE draft_id = ?').get(id);
+    check('ボード出品: 結果不明は outcome=unknown・retryable=false で返る',
+      r.ok === false && r.outcome === 'unknown' && r.retryable === false && /確認できませんでした/.test(r.error), JSON.stringify(r).slice(0, 200));
+    check('ボード出品: 結果不明は DB に unknown と原文が残る',
+      rk.listing_outcome === 'unknown' && /lst-unknown/.test(rk.last_error || ''), JSON.stringify(rk));
+    check('ボード出品: 結果不明の商品は force 無しでは実行できない (400)', await (async () => {
+      try { await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); return false; }
+      catch (e) { return e.status === 400 && /RMS/.test(e.message); }
+    })());
+    // 人が RMS で未登録を確認 → 管理者が force で再実行 → 通る
+    const r2 = await bl.listToRakutenFromBoard(id, { actor: 'admin', forceUnknown: true, deps: { transfer: okTransfer, register: okRegister } });
+    const rk2 = db.prepare('SELECT listing_outcome, registered_at FROM draft_rakuten WHERE draft_id = ?').get(id);
+    check('ボード出品: force で再実行すると通り、outcome は消える', r2.ok === true && rk2.listing_outcome == null && !!rk2.registered_at, JSON.stringify({ r2: r2.ok, rk2 }));
+    check('ボード出品: 開始時に前回の last_error を消してから走る (古い理由が残らない)',
+      db.prepare('SELECT last_error FROM draft_rakuten WHERE draft_id = ?').get(id).last_error == null);
+    check('ボード出品: 結果不明のイベントが残る', eventsOf(id).includes('rakuten_board_listing_unknown'), eventsOf(id).join(','));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // サーバー側の状態チェック (confirm は誤操作防止であって認可ではない — Codex R1 high)
+    const idStep = mkDraft('LST-NOTYET', { atListing: false });
+    let e1 = null;
+    try { await bl.listToRakutenFromBoard(idStep, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { e1 = e; }
+    check('ボード出品: 本流が「出品・展開」まで来ていない商品は 400 (いまの工程名つき)',
+      e1?.status === 400 && /出品・展開/.test(e1.message) && /基本情報入力/.test(e1.message), e1?.message);
+    const idHold = mkDraft('LST-HOLD', { status: 'on_hold' });
+    let e2 = null;
+    try { await bl.listToRakutenFromBoard(idHold, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { e2 = e; }
+    check('ボード出品: 保留中の商品は 400', e2?.status === 400 && /保留/.test(e2.message), e2?.message);
+    check('ボード出品: 弾かれた商品には試行の痕跡を残さない (running のまま残らない)',
+      !db.prepare('SELECT 1 FROM draft_rakuten WHERE draft_id IN (?, ?) AND listing_outcome IS NOT NULL').get(idStep, idHold));
+    db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idStep, idHold);
+  }
+  {
+    // 後処理 (afterRakutenRegistered): 成功の形と、対象外 (skip) の工程⑧を上書きしないこと
+    const id = mkDraft('LST-POST');
+    wfp.setStepState(id, 'imgd_rakuten', { state: 'skip' }, 'smoke', ADMIN);
+    const post = bl.afterRakutenRegistered(db, { id, ne_code: 'LST-POST', name: 'x' }, 'smoke');
+    check('後処理: モール=完了・工程⑧はそのまま (対象外を上書きしない)',
+      post.mallOk === true && post.stepOk === true && stepOf(id) === 'skip' && mallOf(id).state === 'done', JSON.stringify({ post, step: stepOf(id) }));
+    check('後処理: 成功時は失敗イベントを残さない', !eventsOf(id).includes('rakuten_postprocess_failed'));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // ロックは解放関数を二度呼んでも安全 / 例外でも解放される
+    const id = mkDraft('LST-LOCK');
+    const rel = bl.acquireRakutenListingLock(id);
+    let dup = null;
+    try { bl.acquireRakutenListingLock(id); } catch (e) { dup = e; }
+    rel(); rel();
+    check('ロック: 二重取得は 409・解放は冪等', dup?.status === 409 && !bl.isRakutenListingInFlight(id));
+    const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: { transfer: async () => { throw new Error('boom'); }, register: okRegister } });
+    check('ロック: 転送が例外を投げても失敗で返り、ロックは解放される', r.ok === false && r.stage === 'transfer' && !bl.isRakutenListingInFlight(id), JSON.stringify(r).slice(0, 120));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
   }
 }
