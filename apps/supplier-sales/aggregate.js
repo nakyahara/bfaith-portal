@@ -163,8 +163,23 @@ function loadAmazonMap(db, supplier) {
   return m;
 }
 
+// 対象仕入先の「表示すべき商品」= 取扱中の商品コード一覧（売上ゼロでも一覧に出すためのシード）。
+//   - 取扱区分='取扱中' のみ（廃止品まで並べると仕入先に不要な行が増える。廃止品でも売れていれば
+//     売上側の和集合で従来通り出る）。
+//   - mirror_set_components に登録済みのセット商品コードは除外（販売は構成品へ展開して計上するため
+//     セット行自身には永遠に数字が付かず、恒久ゼロ行になってしまう）。
+function loadSupplierProductCodes(db, supplier) {
+  return db.prepare(`
+    SELECT LOWER(TRIM(商品コード)) c FROM mirror_products
+    WHERE 仕入先コード = @s AND 取扱区分 = '取扱中'
+      AND LOWER(TRIM(商品コード)) NOT IN (SELECT LOWER(TRIM(セット商品コード)) FROM mirror_set_components)
+  `).all({ s: supplier }).map(r => r.c);
+}
+
 /**
  * 指定仕入先の期間レポート。
+ *   商品行 = 取扱中商品(売上ゼロ含む) ∪ 期間内に確定売上のある商品 ∪ 速報に数字のある商品。
+ *   （2026-09-01 中原さん要望: 売上ゼロの商品も一覧に出す。「売れていない」も仕入先への情報）
  * @returns { period, products:[{ne_code,name,pieces,sales,prevPieces,prevSales,lastSold,
  *            listings:[{mall,listingId,listingName,asin,is_fba,sold,pieces,sales}]}], totals }
  */
@@ -286,8 +301,8 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
   const emptyFinance = { pieces: 0, sales: 0, prevPieces: 0, prevSales: 0, avgPerDay: 0, lastSold: null, listings: [] };
   const emptySokuho = { name: '', s7: 0, s30: 0, byMall: new Map() };
 
-  // 確定(finance)と速報(モール別マート)の商品コード和集合
-  const allNe = new Set([...out.keys(), ...sokuho.byNe.keys()]);
+  // 取扱中商品(売上ゼロ含む) ∪ 確定(finance) ∪ 速報(モール別マート) の商品コード和集合
+  const allNe = new Set([...loadSupplierProductCodes(db, supplierCode), ...out.keys(), ...sokuho.byNe.keys()]);
   const products = [...allNe]
     .map(ne => {
       const f = out.get(ne);
@@ -299,7 +314,7 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
         .sort((a, b) => b.q30 - a.q30 || b.q7 - a.q7);
       return {
         ne_code: ne,
-        product_name: (f && f.name) || sk.name || '',
+        product_name: (f && f.name) || sk.name || (prod.get(ne)?.name) || '',
         ...fin,
         // 速報（注文ベース）。sokuhoMalls にモール別内訳（楽天/Yahoo/Amazon FBA/FBM…、卸は除外）
         sokuho7: sk.s7 || 0,
@@ -307,12 +322,15 @@ export function getSupplierReport(db, supplierCode, opts = {}) {
         sokuhoMalls,
       };
     })
-    .filter(p => p.pieces !== 0 || p.sales !== 0 || p.sokuho30 !== 0 || p.sokuho7 !== 0)
-    // 速報30日(今売れてるか)を主、確定売上を従にソート
-    .sort((a, b) => b.sokuho30 - a.sokuho30 || b.sales - a.sales || b.pieces - a.pieces);
+    // 売上ゼロの商品も落とさない（取扱中商品は全件並べる）。
+    // 速報30日(今売れてるか)を主、確定売上を従にソート。全部ゼロの商品は商品コード順で末尾に固まる。
+    .sort((a, b) => b.sokuho30 - a.sokuho30 || b.sales - a.sales || b.pieces - a.pieces
+      || (a.ne_code < b.ne_code ? -1 : a.ne_code > b.ne_code ? 1 : 0));
 
   const totals = {
     productCount: products.length,
+    // 販売のあった商品数（速報 or 確定に数字がある）。一覧は売上ゼロも含むので別に持つ
+    soldProductCount: products.filter(p => p.pieces || p.sales || p.sokuho7 || p.sokuho30).length,
     pieces: round1(products.reduce((a, p) => a + p.pieces, 0)),
     sales: products.reduce((a, p) => a + p.sales, 0),
     prevPieces: round1(products.reduce((a, p) => a + p.prevPieces, 0)),
