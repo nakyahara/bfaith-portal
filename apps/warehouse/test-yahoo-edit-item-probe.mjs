@@ -103,6 +103,11 @@ console.log('\n── 価格の読み方 ──');
   ok(guardTestItem(fake, 'zz-1'), '★門番も通さない');
   const odd = await flattenXml('<Other><Thing><ItemCode>zz-1</ItemCode><Name>zz検証用</Name><Price>1</Price></Thing></Other>');
   eq(itemBaseOf(odd, 'zz-1'), null, '★ResultSet > Result 以外の形は知らない構造として扱う');
+  // ★同じ Result の直下に ItemCode が2つある = どの商品か決まっていない構造 (Codex R7)
+  const twoCodes = await flattenXml('<ResultSet><Result><ItemCode>zz-1</ItemCode><ItemCode>other-1</ItemCode>'
+    + '<Name>zz検証用</Name><Price>100</Price></Result></ResultSet>');
+  eq(itemBaseOf(twoCodes, 'zz-1'), null, '★直下の ItemCode が2つあれば特定できた扱いにしない');
+  ok(guardTestItem(twoCodes, 'zz-1'), '門番も通さない');
   eq(itemPriceOf(await flattenXml('<ResultSet><Result><ItemCode>x</ItemCode><Price>お問い合わせ</Price></Result></ResultSet>'), 'x'),
     null, '整数で読めなければ null');
 

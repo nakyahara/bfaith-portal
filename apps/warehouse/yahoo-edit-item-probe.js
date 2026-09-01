@@ -56,13 +56,22 @@ export function isDirectChild(path, base, tag) {
 export function itemBaseOf(flat, expectedItemCode) {
   const want = String(expectedItemCode || '').trim().toLowerCase();
   if (!want) return null;
-  const hits = [];
+  // 商品要素ごとに、直下の ItemCode を全部集める
+  const byBase = new Map();
   for (const [k, v] of flat) {
     const m = String(k).match(/^(.*)\/ItemCode\[\d+\]$/);
     // ★商品要素の形も限定する (Codex R6)。ItemCode を持つ要素なら何でも商品本体、にすると、
     //   入れ子の要素に ItemCode・目印つき Name・Price が揃っていれば門番を通ってしまう。
     //   実測の形 (ResultSet > Result) 以外は「知らない構造」として動かさない側に倒す
-    if (m && ITEM_BASE_SHAPE.test(m[1]) && String(v).trim().toLowerCase() === want) hits.push(m[1]);
+    if (!m || !ITEM_BASE_SHAPE.test(m[1])) continue;
+    if (!byBase.has(m[1])) byBase.set(m[1], []);
+    byBase.get(m[1]).push(String(v).trim().toLowerCase());
+  }
+  const hits = [];
+  for (const [base, codes] of byBase) {
+    // ★直下の ItemCode がちょうど1個で、その値が一致する時だけ。
+    //   「一致するものが1個あればよい」にすると、別コードが並んでいても通ってしまう (Codex R7)
+    if (codes.length === 1 && codes[0] === want) hits.push(base);
   }
   return hits.length === 1 ? hits[0] : null;
 }
