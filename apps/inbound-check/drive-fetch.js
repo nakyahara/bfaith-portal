@@ -14,7 +14,7 @@
  *  - 取込の fail-closed 判定は db.js 側が持つ (必須列・列数・暦日・0件正常・明細時刻の巻き戻り)。
  *    ここは「取ってきて渡す」だけに徹する
  */
-import { getDriveCsvInfo, downloadDriveCsv, findDriveFile, vErr } from '../../lib/drive-csv.js';
+import { getDriveCsvInfo, downloadDriveCsv, vErr } from '../../lib/drive-csv.js';
 import { importCsv, getActiveBatch } from './db.js';
 
 const CFG = {
@@ -44,12 +44,13 @@ export async function fetchAndImportFromDrive({ actor = null, source = 'auto' } 
   if (!info || !info.file_id) {
     throw vErr(`${CFG.filename} が Drive に見つかりません。${CFG.notFoundHint}`);
   }
-  const buffer = await downloadDriveCsv(CFG);
-  // ダウンロード後に metadata を取り直して照合する (60秒キャッシュ越しの info と
-  // 実際に落とした本文の世代がずれるのを防ぐ — Codex R6 High-4)。
-  // downloadDriveCsv 自身も DL 中の差し替えを1回リトライするが、ここは「表示・判定に使う時刻」を本文と揃えるため
-  const after = await findDriveFile(CFG);
-  const modified = after?.modified_time || after?.modifiedTime || null;
+  // downloadDriveCsv は { buffer, info } を返す (info は DL 直後に取り直した metadata)。
+  // 本文と世代を必ず揃えるため、生成時刻はこの info から採る (Codex R6 High-4)
+  // downloadDriveCsv は { ...info, buffer } を返す (info は DL 直後に「差し替わっていない」ことを
+  // 確認済みの metadata)。本文と世代が必ず揃うので、生成時刻はここから採る (Codex R6 High-4)
+  const dl = await downloadDriveCsv(CFG);
+  const buffer = dl.buffer;
+  const modified = dl.modified_time || dl.modifiedTime || null;
   if (!modified) throw vErr(`${CFG.filename} の更新日時を取得できませんでした (取込を中止しました)`);
   // 未来時刻は受け付けない (時計ずれや誤操作で以後の取込が全部拒否されるのを防ぐ)
   const skewMs = Date.parse(modified) - Date.now();
@@ -57,12 +58,12 @@ export async function fetchAndImportFromDrive({ actor = null, source = 'auto' } 
     throw vErr(`${CFG.filename} の更新日時が未来です (${modified})。時計を確認してください`);
   }
   const r = importCsv(buffer, {
-    fileName: after?.name || info.name || CFG.filename,
+    fileName: dl.name || info.name || CFG.filename,
     source,
     actor,
     generatedAt: modified,
   });
-  return { ...r, driveModifiedTime: modified, fileName: after?.name || CFG.filename };
+  return { ...r, driveModifiedTime: modified, fileName: dl.name || CFG.filename };
 }
 
 // プロセス内の実行中フラグ。cron の周期より処理が長引いても重ねない (Codex R6 High-3/Med-6)。
