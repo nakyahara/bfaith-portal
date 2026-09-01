@@ -165,7 +165,8 @@ console.log('\n── 楽天カラバリ: AM/AL/W は同じSKUの別名 → 1行
       failed: [],
     }),
   };
-  const prices = await fetchRakutenPrices([{ key: rak[0].listingCode, aliases: rak[0].aliases }], deps);
+  eq(rak[0].skuAliases.sort(), ['0726-001802-bk', '360'], 'SKU 単位の別名 = AM / AL (W は含めない)');
+  const prices = await fetchRakutenPrices([{ key: rak[0].listingCode, aliases: rak[0].aliases, skuAliases: rak[0].skuAliases }], deps);
   const p = prices.get('0726-001802');
   eq([p.found, p.price, p.skuCode, p.manageNumber], [true, 577, '360', '0726-001802'],
     '★12SKU の中から別名で variant 360 を特定できる');
@@ -256,6 +257,20 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
   // ★AM に商品番号と同じ値を付けた単品 (source=am, 値は page-a)。値で見ればページ単位に見えるが SKU 単位 (Codex R5)
   const rp2 = (await fetchRakutenPrices([{ key: 'page-a', aliases: ['page-a'], skuAliases: ['page-a'], manageNumber: 'page-a' }], depsReplaced)).get('page-a');
   eq(rp2.found, false, '★AM が商品番号と同じ値でも、SKU 単位の別名が当たらなければ救済しない');
+  // ★ページ単位の値 (page-a) を SKU管理番号や AM に持つ別の variant があっても、それに当てない (Codex R6)
+  const depsCoincide = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'page-a', itemNumber: 'page-a', variants: {
+      'page-a': { merchantDefinedSkuId: 'page-a', standardPrice: '9800' },
+      999: { merchantDefinedSkuId: 'other', standardPrice: '500' },
+    } }], failed: [] }) };
+  const co = (await fetchRakutenPrices([{ key: 'page-a', aliases: ['old-ne', '001', 'page-a'], skuAliases: ['old-ne', '001'], manageNumber: 'page-a' }], depsCoincide)).get('page-a');
+  eq(co.found, false, '★商品番号と同じ値を持つ variant に当てない (記録した SKU が消えている)');
+  ok(/old-ne/.test(co.reason) && /見当たりません/.test(co.reason), '理由は「記録した SKU が見当たらない」: ' + co.reason);
+  // W 行だけの単品に、対応表を作った後で AM が付いた → 作った時には無かったもの。確定しない
+  const depsLateAm = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'w-only-001', itemNumber: 'w-only-001', variants: { 'normal-inventory': { merchantDefinedSkuId: 'w-only-001', standardPrice: '500' } } }], failed: [] }) };
+  const la = (await fetchRakutenPrices([{ key: 'w-only-001', aliases: ['w-only-001'], skuAliases: [], manageNumber: 'w-only-001' }], depsLateAm)).get('w-only-001');
+  eq(la.found, false, '★W 行だけの商品に AM が付いていたら (作った時には無かった) 確定しない');
   // 対応表の source で分けていることの確認: W 行だけの商品は skuAliases が空
   db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 送料コード, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
     .run('w-only-001', 'W だけの単品', '単品', '取扱中', 500, 200, '確定', 182, '103', '定形外規格内（50g以内）', 0.1, null);
@@ -266,8 +281,8 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
 
   // ★同じプレビューに BK と BE を並べても、片方がもう片方を上書きしない (行キーは NE コード単位)
   const both = await fetchRakutenPrices([
-    { key: '0726-001802', rowKey: 'bk|rakuten', aliases: ['0726-001802-bk', '360', '0726-001802'], manageNumber: '0726-001802' },
-    { key: '0726-001802', rowKey: 'be|rakuten', aliases: ['0726-001802-be', '366'], manageNumber: '0726-001802' },
+    { key: '0726-001802', rowKey: 'bk|rakuten', aliases: ['0726-001802-bk', '360', '0726-001802'], skuAliases: ['0726-001802-bk', '360'], manageNumber: '0726-001802' },
+    { key: '0726-001802', rowKey: 'be|rakuten', aliases: ['0726-001802-be', '366'], skuAliases: ['0726-001802-be', '366'], manageNumber: '0726-001802' },
   ], deps);
   eq([both.get('bk|rakuten')?.skuCode, both.get('be|rakuten')?.skuCode], ['360', '366'], '★BK=360 / BE=366 をそれぞれ返す (衝突しない)');
   eq(asked, ['0726-001802'], '同じ商品は 1 回だけ問い合わせる');
@@ -465,7 +480,7 @@ console.log('\n── ライブ価格の取得 (モールAPIは差し替え) ─
     }),
   };
   const prices = await fetchRakutenPrices(
-    [{ key: 'abc-001', aliases: ['abc-001'] }, { key: 'ghost-001', aliases: ['ghost-001'] }], deps);
+    [{ key: 'abc-001', aliases: ['abc-001'], skuAliases: ['abc-001'] }, { key: 'ghost-001', aliases: ['ghost-001'] }], deps);
   eq(prices.get('abc-001').price, 1000, '楽天のライブ価格が整数で取れる');
   eq(prices.get('abc-001').skuCode, 'sku-a', 'どの SKU かも分かる');
   eq(prices.get('ghost-001').found, false, '見つからない出品は found=false');

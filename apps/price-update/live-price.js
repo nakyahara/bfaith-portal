@@ -148,32 +148,33 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       continue;
     }
     const variants = item?.variants && typeof item.variants === 'object' ? item.variants : {};
-    const aliasKeys = new Set(t.aliases.map(normCode));
-    // variant の特定: SKU管理番号 (variants のキー) か システム連携SKU番号 が、別名のどれかと一致
+    // variant の特定: SKU管理番号 (variants のキー) か システム連携用SKU番号 (AM) が、
+    // ★SKU 単位の別名 (AM/AL。対応表の source で分けたもの) のどれかと一致すること。
+    //   ページ単位の値 (商品番号 = 管理番号) は照合に使わない — 偶然それを SKU管理番号や AM に持つ
+    //   別の variant に当たりうる (Codex R6)。SKU 単位かどうかは値で推定しない (Codex R5)
+    const skuAliasKeys = new Set(t.skuAliases.map(normCode));
+    const variantCount = Object.keys(variants).length;
     const matched = [];
     for (const [vk, v] of Object.entries(variants)) {
-      if (aliasKeys.has(normCode(vk)) || aliasKeys.has(normCode(v?.merchantDefinedSkuId))) matched.push(vk);
+      if (skuAliasKeys.has(normCode(vk)) || skuAliasKeys.has(normCode(v?.merchantDefinedSkuId))) matched.push(vk);
     }
     let matchedKey = matched.length === 1 ? matched[0] : null;
-    // 別名で特定できなくても、variant が 1 つだけの商品なら取り違える相手がいない。
-    // ★ただし、対応表が SKU 単位の別名 (AM/AL) を持っているのに 1 つも当たらない = 記録していた SKU が
-    //   この商品から消えている (差し替わった疑い)。その時はこの救済を使わない (Codex R4)。
-    //   救済してよいのは、対応表が商品ページ単位の別名 (W = 商品番号) しか持たない時だけ
-    //   (例: SKU管理番号が normal-inventory の単品。W 行しか作れないので別名は商品番号だけ)。
-    //   ★SKU 単位かどうかは値で推定せず、対応表の source (skuAliases) で判断する (Codex R5)
+    // SKU 単位の別名が 1 つも当たらない:
+    //   - 対応表が SKU 単位の別名を持っている → 記録していた SKU がこの商品から消えている (差し替わった疑い)。確定しない (Codex R4)
+    //   - 持っていない (W 行だけ。例: SKU管理番号 normal-inventory の単品) → variant が 1 つだけなら取り違える相手がいないので採用
     let missingSkuAliases = [];
-    if (!matchedKey && matched.length === 0 && Object.keys(variants).length === 1) {
+    if (matched.length === 0) {
       missingSkuAliases = t.skuAliases;
-      if (missingSkuAliases.length === 0) matchedKey = Object.keys(variants)[0];
+      if (missingSkuAliases.length === 0 && variantCount === 1) matchedKey = Object.keys(variants)[0];
     }
     if (!matchedKey) {
       let reason;
       if (matched.length > 1) reason = `別名が複数のSKUに一致しました (${matched.join(', ')})。取り違えを避けるため確定しません`;
-      else if (Object.keys(variants).length === 0) reason = 'SKU情報が取得できません';
+      else if (variantCount === 0) reason = 'SKU情報が取得できません';
       else if (missingSkuAliases.length > 0) {
         reason = `対応表に記録された SKU (${missingSkuAliases.join(', ')}) がこの商品に見当たりません。`
           + '対応表を作った後に SKU が差し替わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
-      } else reason = `どのSKUか特定できません (この商品には ${Object.keys(variants).length} SKU あります)`;
+      } else reason = `どのSKUか特定できません (この商品には ${variantCount} SKU あります)`;
       out.set(t.rowKey, {
         price: null, manageNumber: item.manageNumber || t.manageNumber, skuCode: null, found: false,
         reason, itemTitle: item?.title || null,
@@ -186,11 +187,15 @@ export async function fetchRakutenPrices(targets, deps = {}) {
     //   - AM があって別名に無い → 差し替わった疑い。確定しない
     //   - AM が空 → 複数SKUの商品では同一性を確かめる手段が無いので確定しない。
     //     単一SKUの商品だけ通す (取り違える相手がいない。実データ: 複数SKU商品で AM 空は 0 件・単一SKUでは 1,652 件)
+    //   - AM があるのに対応表が SKU 単位の別名を持たない → 対応表を作った時には AM が無かった SKU
+    //     (AM があれば必ず AM の行が作られる)。作った後に変わった疑い。確定しない (Codex R6)
     const liveAm = String(variants[matchedKey]?.merchantDefinedSkuId || '').trim();
-    const variantCount = Object.keys(variants).length;
     let identityProblem = null;
-    if (liveAm && !aliasKeys.has(normCode(liveAm))) {
-      identityProblem = `SKU ${matchedKey} のシステム連携用SKU番号 (${liveAm}) が対応表の別名 (${t.aliases.join(', ')}) にありません。`
+    if (liveAm && skuAliasKeys.size === 0) {
+      identityProblem = `SKU ${matchedKey} にシステム連携用SKU番号 (${liveAm}) がありますが、対応表を作った時には無かったものです。`
+        + '対応表を作った後に変わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
+    } else if (liveAm && !skuAliasKeys.has(normCode(liveAm))) {
+      identityProblem = `SKU ${matchedKey} のシステム連携用SKU番号 (${liveAm}) が対応表の別名 (${t.skuAliases.join(', ')}) にありません。`
         + '対応表を作った後に SKU が差し替わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
     } else if (!liveAm && variantCount > 1) {
       identityProblem = `SKU ${matchedKey} にシステム連携用SKU番号がありません。複数SKU (${variantCount}) の商品では同じ SKU か確かめられないため確定しません`
