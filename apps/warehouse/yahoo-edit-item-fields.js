@@ -1,0 +1,134 @@
+/**
+ * yahoo-edit-item-fields.js — editItem の「必須項目」を割り出すための部品 (純関数)
+ *
+ * 実測 (2026-09-01): editItem に item_code と price だけを送ると
+ *   HTTP 400 / <Target>path</Target> <Code>it-01011</Code> 「パスは必須です」
+ * が返る。つまり editItem は「変えたい項目だけ送る」形では呼べず、出品登録と同じで
+ * 必須項目を毎回要求する。
+ *
+ * 応答の <Target> が **足りない項目の名前** を教えてくれるので、
+ * getItem で取った「前」の値からその項目を1つずつ足して再送し、必須項目の最小集合を割り出す。
+ *
+ * ★知らない項目名が返ってきたら止める。当てずっぽうで値を作って送らない
+ *   (間違った値で商品が書き換わる方が、分からないまま止まるより悪い)。
+ */
+
+/**
+ * editItem の項目名 → getItem の応答のどこから値を取るか。
+ * 値は「商品本体の道すじ」からの相対で書く。
+ * ★ここに無い項目名が要求されたら、その回は止めて人に報告する。
+ */
+export const FIELD_SOURCES = {
+  item_code: { tag: 'ItemCode' },
+  name: { tag: 'Name' },
+  // カテゴリのパス。PathList の中に複数入ることがあり、origFlag="1" が本命 (VPS のパーサと同じ扱い)
+  path: { tag: 'Path', within: 'PathList', preferAttr: 'origFlag' },
+  product_category: { tag: 'ProductCategory' },
+  headline: { tag: 'Headline' },
+  caption: { tag: 'Caption' },
+  abstract: { tag: 'Abstract' },
+  explanation: { tag: 'Explanation' },
+  taxable: { tag: 'Taxable' },
+  quantity: { tag: 'Quantity' },
+  display: { tag: 'Display' },
+  postage_set: { tag: 'PostageSet' },
+  delivery: { tag: 'Delivery' },
+  template_id: { tag: 'TemplateId' },
+};
+
+/**
+ * editItem の応答から「どの項目が足りないか」を読む。
+ * @param {{status:number, body:string}} res
+ * @returns {{status:number, target:string|null, code:string|null, message:string|null}|null}
+ *   問題なければ null
+ */
+export function editItemError(res) {
+  const status = res?.status;
+  const text = String(res?.body || '');
+  const pick = (tag) => {
+    const m = text.match(new RegExp(`<${tag}>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</${tag}>`, 'i'));
+    return m ? m[1].trim() : null;
+  };
+  const status2xx = status >= 200 && status < 300;
+  const ng = /<Status>\s*NG\s*<\/Status>/i.test(text);
+  const okMarker = /<Status>\s*OK\s*<\/Status>/i.test(text);
+  // ★成功は「2xx かつ Status OK かつ Error 無し」だけ。
+  //   2xx で本文が空・壊れている・見たことのない形は成功にしない (Codex R3)。
+  //   成功にすると、あとで効いてくるかもしれない送信を「終わった」ことにしてしまう
+  if (status2xx && okMarker && !ng && !/<Error[\s>]/i.test(text)) return null;
+  const unrecognized = status2xx && !ng && !/<Error[\s>]/i.test(text);
+  return {
+    status,
+    ng,
+    unrecognized,
+    target: pick('Target'),
+    code: pick('Code'),
+    message: unrecognized ? `応答の形が想定と違います: ${text.slice(0, 200)}` : pick('Message'),
+  };
+}
+
+/**
+ * その失敗は「送る前に弾かれた」= 商品は書き換わっていない、と言い切れるか。
+ * ★言い切れる時だけ true。迷ったら false (戻しに行く方に倒す)。
+ *   楽天側と同じ考え方: 意味の分かる失敗は書き込まれていない / 分からない失敗は不明として扱う。
+ */
+export function isDefiniteRejection(err) {
+  if (!err) return false;
+  // ★実測した形だけを「弾かれた」と言い切る (Codex R1/R5)。
+  //   ここが広いと「部分的に書き換えてから別項目のエラーを返す応答」まで
+  //   「書き込みは起きていない」と誤判定し、戻しを飛ばしてしまう。
+  //   → 実際に見たことのある status + エラーコードの組み合わせだけ。
+  //     知らないコードは言い切らない (戻しに行く方に倒す)
+  if (err.status !== 400 || !err.target) return false;
+  return KNOWN_REJECT_CODES.has(String(err.code || ''));
+}
+
+/**
+ * 「送る前に弾かれた」と実測で確認できているエラーコード。
+ * ★増やしてよいのは **実機で見て、商品が書き換わっていないことを確かめたもの** だけ。
+ * - it-01011 … 必須項目が足りない (2026-09-01 実測: Target=path「パスは必須です」)
+ */
+export const KNOWN_REJECT_CODES = new Set(['it-01011']);
+
+/**
+ * 「この項目が足りない」と教えてくれている応答か。足りない項目名を返す (無ければ null)。
+ * ★これは **必須項目を割り出すループを進めてよいか** の判断。
+ *   「戻しを飛ばしてよいか」(isDefiniteRejection) とは別物にしてある。
+ *   見たことのないコードでも、項目名を名指ししているなら足して再送してよい
+ *   (足して送るのは元の値そのままなので、間違った値で壊すことにはならない)。
+ */
+export function missingFieldTarget(err) {
+  if (!err || err.status < 400 || err.status >= 500) return null;
+  const t = String(err.target || '').trim();
+  return t || null;
+}
+
+/**
+ * 「前」の応答から、指定した editItem 項目の値を取る。取れなければ null。
+ * @param {Map<string,string>} flat flattenXml の戻り
+ * @param {string} itemBase 商品本体の道すじ
+ * @param {string} field editItem の項目名
+ */
+export function fieldValueFrom(flat, itemBase, field) {
+  const spec = FIELD_SOURCES[field];
+  if (!spec || !itemBase) return null;
+  const base = spec.within ? `${itemBase}/${spec.within}[0]` : itemBase;
+  const head = `${base}/${spec.tag}[`;
+  const hits = [];
+  for (const [k, v] of flat) {
+    if (!k.startsWith(head)) continue;
+    const rest = k.slice(head.length);
+    if (!rest.endsWith(']') || !/^\d+$/.test(rest.slice(0, -1))) continue;
+    hits.push({ path: k, value: v });
+  }
+  const nonEmpty = hits.filter((h) => String(h.value).trim() !== '');
+  if (nonEmpty.length === 0) return null;     // 中身が空の項目は送らない
+  if (nonEmpty.length === 1) return nonEmpty[0].value;
+  // 複数あるときは、印のついたもの (origFlag="1") を本命とする
+  if (spec.preferAttr) {
+    const marked = nonEmpty.filter((h) => flat.get(`${h.path}@${spec.preferAttr}`) === '1');
+    if (marked.length === 1) return marked[0].value;
+  }
+  // ★どれか決められないなら null。当てずっぽうで送らない
+  return null;
+}
