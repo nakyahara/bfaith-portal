@@ -34,8 +34,18 @@
   .btn-danger:disabled { opacity: .5; }
   .exec-result { margin-top: 10px; font-size: 13px; }
   .exec-result b { font-variant-numeric: tabular-nums; }
+  .rec-box { border: 1px solid #cbd5e1; background: #f8fafc; border-radius: 8px; padding: 12px 14px; }
+  .rec-box h3 { margin: 0 0 6px; font-size: 14px; color: #334155; }
+  .btn-rec { background: #fff; color: #b91c1c; border: 1px solid #fca5a5; }
+  .kind-recovery { background: #ede9fe; color: #5b21b6; }
 </style>
 <%
+  // 復旧 run で戻せなかった行 (作成時に引き当て直せなかった行)。追記イベントから読む
+  var notRestored = [];
+  (run.events || []).forEach(function (e) {
+    if (e.event !== 'recovery_incomplete' || !e.detail_json) return;
+    try { notRestored = notRestored.concat(JSON.parse(e.detail_json).notRestored || []); } catch (err) { /* 壊れた記録は無視 */ }
+  });
   var STATE_LABEL = {
     previewed: '記録のみ', blocked_preview: 'ガードで停止',
     manual_required: '手動更新まち', manual_done: '手動更新済み',
@@ -62,11 +72,35 @@
     <h2><%= run.run_id %></h2>
     <div class="pu-note">
       <%= run.created_at.replace('T', ' ').slice(0, 19) %> / 実行者 <%= run.created_by %> /
-      <%= run.kind === 'recovery' ? '復旧 run' : '通常 run' %> /
+      <% if (run.kind === 'recovery') { %><span class="chip kind-recovery">復旧 run</span>
+        <% if (run.source_run_id) { %>(元: <a href="/apps/price-update/runs/<%= run.source_run_id %>"><%= run.source_run_id %></a>)<% } %>
+      <% } else { %>通常 run<% } %> /
       対象コード <%= run.neCodes.join(', ') %>
     </div>
     <% if (run.note) { %><div style="margin-top:6px;"><%= run.note %></div><% } %>
   </div>
+
+  <% if (notRestored.length > 0) { %>
+    <div class="card">
+      <div class="exec-box">
+        <h3>⚠️ 戻せなかった行が <%= notRestored.length %> 行あります</h3>
+        <div class="pu-note">この復旧では下の行を戻せていません。モールの画面で実際の価格を確認してください。</div>
+        <table class="pu" style="margin-top:6px;">
+          <thead><tr><th>モール</th><th>NEコード</th><th>出品コード / SKU</th><th>理由</th></tr></thead>
+          <tbody>
+            <% notRestored.forEach(function (x) { %>
+              <tr>
+                <td><span class="mall m-<%= x.mall %>"><%= x.mall %></span></td>
+                <td class="code"><%= x.neCode %></td>
+                <td class="code"><%= x.listingCode || '' %><% if (x.skuCode) { %> / <%= x.skuCode %><% } %></td>
+                <td class="pu-note"><%= x.reason %></td>
+              </tr>
+            <% }); %>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  <% } %>
 
   <div class="card">
     <div class="exec-box" id="exec-box">
@@ -84,6 +118,21 @@
         <span class="pu-note" id="exec-count"></span>
       </div>
       <div class="exec-result" id="exec-result"></div>
+    </div>
+  </div>
+
+  <div class="card" id="rec-card" style="display:none;">
+    <div class="rec-box">
+      <h3>↩︎ 元の価格に戻す</h3>
+      <div class="pu-note" id="rec-status"></div>
+      <div id="rec-form" style="display:none; margin-top:8px;">
+        <div class="pu-note" style="margin-bottom:6px;">
+          戻す先の価格は<b>この履歴の記録から取ります</b> — 打ち間違えようがありません。<br>
+          押すと「戻すための履歴」ができるだけで、まだ何も送りません。中身を確かめてから実行してください。
+        </div>
+        <button class="btn btn-rec" id="rec-btn" type="button">戻すための履歴を作る</button>
+      </div>
+      <div class="pu-note" id="rec-result" style="margin-top:8px;"></div>
     </div>
   </div>
 
@@ -271,4 +320,98 @@
   }
 
   loadExecutable();
+
+  // ── 元の価格に戻す ─────────────────────────────────
+  async function loadRecoverable() {
+    let info;
+    try {
+      const res = await fetch(API + '/recoverable', { headers: { Accept: 'application/json' } });
+      info = await res.json();
+      if (!res.ok || info.ok === false) return;
+    } catch { return; }
+
+    const unexecuted = (info.existing || []).filter((r) => !r.executed);
+    const notRestorable = info.notRestorable || [];
+    // ★戻せる行が 0 でも「変わったのに戻せない行」があれば必ず出す。
+    //   ここで隠すと、その行の存在自体が画面から消える (Codex R4)
+    if (!n(info.rows) && notRestorable.length === 0 && unexecuted.length === 0) return;
+    $('rec-card').style.display = '';
+
+    const notRestorableHtml = notRestorable.length === 0 ? '' :
+      '<div style="color:#991b1b; margin-top:6px;">※ <b>' + notRestorable.length
+      + ' 行</b>は価格が変わったのに戻す先が分かりません。モールの画面で実際の価格を確認してください。<ul style="margin:4px 0 0 18px;">'
+      + notRestorable.map((x) => '<li>' + esc(x.neCode)
+        + (x.listingCode ? ' (' + esc(x.listingCode) + (x.skuCode ? ' / ' + esc(x.skuCode) : '') + ')' : '')
+        + ' — ' + esc(x.reason) + '</li>').join('')
+      + '</ul></div>';
+
+    if (unexecuted.length > 0) {
+      $('rec-status').innerHTML = '戻すための履歴は<b>もう作ってあります</b>: '
+        + unexecuted.map((r) => '<a href="/apps/price-update/runs/' + encodeURIComponent(r.run_id) + '">' + esc(r.run_id) + '</a>').join(' / ')
+        + '。そちらを開いて実行してください。'
+        + notRestorableHtml;   // ★どの分岐でも「戻せない行」は消さない (Codex R5)
+      return;
+    }
+    if (!n(info.rows)) {
+      // 戻せる行は無いが、戻せない行はある (上の early return を抜けてきた)
+      $('rec-status').innerHTML = '<b>送る前の価格に戻せる行はありません。</b>' + notRestorableHtml;
+      return;
+    }
+    if (!info.canCreate) {
+      // 権限が無くても「戻せない行」は見せる (知らせるべき事実であって、操作ではない)
+      $('rec-status').innerHTML = esc(info.canCreateReason || '権限がありません。') + notRestorableHtml;
+      return;
+    }
+    const done = (info.existing || []).filter((r) => r.executed);
+    $('rec-status').innerHTML = 'この履歴で<b>価格が変わった行が ' + n(info.rows) + ' 行</b>あります。'
+      + '送る前の価格に戻せます。' + notRestorableHtml;
+    if (done.length > 0) {
+      // 一度戻した履歴をもう一度戻す = いまの価格を当時の価格で上書きする。明示のチェックを求める
+      $('rec-status').innerHTML += '<div style="color:#991b1b; margin-top:6px;">※ この履歴は既に一度戻しています ('
+        + done.map((r) => esc(r.run_id)).join(', ') + ')。'
+        + 'もう一度戻すと、<b>いまの価格を当時の価格で上書きします</b>。'
+        + 'その後に別の理由で値付けし直していた場合、それも消えます。</div>'
+        + '<label style="display:block; margin-top:6px;"><input type="checkbox" id="rec-repeat"> '
+        + 'それでも、もう一度戻す</label>';
+    }
+    $('rec-form').style.display = '';
+
+    $('rec-btn').addEventListener('click', async function () {
+      $('rec-btn').disabled = true;
+      $('rec-result').textContent = '作成中…';
+      try {
+        const repeat = $('rec-repeat');
+        const res = await fetch(API + '/recovery', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirmRepeat: !!(repeat && repeat.checked) }),
+        });
+        const json = await res.json();
+        if (!res.ok || json.ok === false) {
+          if (json.runId) {
+            $('rec-result').innerHTML = esc(json.message) + ' → <a href="/apps/price-update/runs/'
+              + encodeURIComponent(json.runId) + '">開く</a>';
+            return;
+          }
+          throw new Error(json.message || json.error || ('HTTP ' + res.status));
+        }
+        const missed = json.notRestored || [];
+        const link = '/apps/price-update/runs/' + encodeURIComponent(json.runId);
+        if (missed.length > 0) {
+          // ★戻せなかった行があるまま黙って移動しない。何が戻らないのかをここで見せる
+          $('rec-result').innerHTML = '作りました (' + n(json.rows) + ' 行)。'
+            + '<span style="color:#991b1b;">ただし ' + missed.length + ' 行は戻せません:</span><ul style="margin:6px 0 0 18px;">'
+            + missed.map((m) => '<li>' + esc(m.neCode) + ' — ' + esc(m.reason) + '</li>').join('')
+            + '</ul><a href="' + link + '">作った履歴を開く</a>';
+          return;
+        }
+        $('rec-result').innerHTML = '作りました (' + n(json.rows) + ' 行)。移動します…';
+        location.href = link;
+      } catch (e) {
+        $('rec-result').innerHTML = '<span style="color:#991b1b;">エラー: ' + esc(e.message) + '</span>';
+        $('rec-btn').disabled = false;
+      }
+    });
+  }
+
+  loadRecoverable();
 </script>

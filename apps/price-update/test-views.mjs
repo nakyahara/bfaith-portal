@@ -145,10 +145,46 @@ for (const name of ['index.ejs', 'run.ejs']) {
       events: [],
     },
   }, { filename: file });
-  ok(render('https://item.rakuten.co.jp/x/y/').includes('>開く</a>'), '正しい URL はリンクになる');
-  ok(!render('javascript:alert(1)').includes('開く</a>'), '★javascript: の URL はリンクにしない');
+  const LINK = 'target=' + String.fromCharCode(34) + '_blank' + String.fromCharCode(34);
+  ok(render('https://item.rakuten.co.jp/x/y/').includes(LINK), '正しい URL はリンクになる');
+  ok(!render('javascript:alert(1)').includes(LINK), '★javascript: の URL はリンクにしない');
   ok(!render('javascript:alert(1)').includes('javascript:'), 'href に入れない');
-  ok(!render('  JavaScript:alert(1)').includes('開く</a>'), '前後の空白・大文字でもすり抜けない');
+  ok(!render('  JavaScript:alert(1)').includes(LINK), '前後の空白・大文字でもすり抜けない');
+}
+
+// 復旧 run: 戻せなかった行を画面に出す (黙って消さない)
+{
+  const file = path.join(HERE, 'views', 'run.ejs');
+  const render = (events) => ejs.render(fs.readFileSync(file, 'utf8'), {
+    title: '履歴', displayName: 'テスト', isAdmin: false,
+    run: {
+      run_id: 'pur-rec', created_at: '2026-09-01T01:02:03.000Z', created_by: 't@example.com',
+      kind: 'recovery', source_run_id: 'pur-src', note: null, neCodes: ['abc-001'], limits: {},
+      operations: [{
+        operation_id: 'puo-1', mall: 'rakuten', ne_code: 'abc-001', row_kind: 'single',
+        product_name: '商品', listing_code: 'mn-1', sku_code: 'sku-a', confidence: 'confirmed',
+        price_source: '楽天RMS (ライブ)', expected_current_price: 578, new_price: 577,
+        initial_state: 'previewed', state: 'previewed', guard_json: null, product_url: null,
+      }],
+      events,
+    },
+  }, { filename: file });
+
+  const withMiss = render([{ at: '2026-09-01T01:02:03.000Z', actor: 't@example.com', event: 'recovery_incomplete',
+    operation_id: null, detail_json: JSON.stringify({ notRestored: [
+      { operationId: 'puo-x', neCode: 'abc-002', mall: 'rakuten', listingCode: 'mn-GONE', skuCode: 'sku-z',
+        reason: 'いま引き当て直すと同じ出品が見つかりません' }] }) }]);
+  ok(withMiss.includes('戻せなかった行が 1 行'), '★戻せなかった行を画面の先頭で知らせる');
+  ok(withMiss.includes('mn-GONE') && withMiss.includes('abc-002'), 'どの出品が戻っていないか出す');
+  ok(withMiss.includes('復旧 run') && withMiss.includes('pur-src'), '復旧 run だと分かり、元の履歴へ行ける');
+
+  const clean = render([]);
+  const HEAD = '戻せなかった行が ';
+  ok(!clean.includes(HEAD), '戻せなかった行が無ければ出さない');
+  // 壊れた記録でもレンダリングが落ちない
+  const broken = render([{ at: '2026-09-01T01:02:03.000Z', actor: 't', event: 'recovery_incomplete', operation_id: null, detail_json: '{壊れ' }]);
+  ok(!broken.includes(HEAD), '壊れた記録は無視して画面を出す');
+  checkTagBalance(withMiss, 'run.ejs (復旧)');
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
