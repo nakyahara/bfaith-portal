@@ -19,6 +19,7 @@ import multer from 'multer';
 import {
   getState, applyCheck, importCsv, getActiveBatch, listBatches, listImportLog, listEvents, eventsCsv,
   createDevice, verifyDevice, revokeDevice, listDevices,
+  resolveDestination, infoForLine, getLineForCheck, setExpiryManaged, listDestinations, destinationsCsv, IROHA_YES, IROHA_NO,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
   listWorkers, getWorker,
@@ -203,6 +204,119 @@ function resolveWorker(req) {
   return { error: '作業者を選んでください' };
 }
 
+// ─── 確認するときに「いろはで在庫化 / B-Faith で入庫」を確定させる ───
+// 中原さん 2026-09-01: 「確認をした時にいろはに在庫化作業を依頼するのか、ビーフェイスに
+// 入庫するのかを判定してほしい。すでにデータがあるものはそのデータに沿って。もしデータが
+// なければその時に選択して、その選択したデータがデータベースに登録される」
+//
+// B-Faith 入庫を選んだときは**ラベル (BCシール) と入数が揃うまで進ませない**。
+// 揃っていなければ 400 destination_required を返し、画面が聞いてから送り直す。
+const MISSING_LABEL = { iroha: '行き先', bc_seal: 'ラベル (BCシール)', irisu: '入数', expiry: '有効期限' };
+// 「－」等は未記入と同じ扱い (db.js の blank と揃える)
+const NA_VALUES = new Set(['', '－', '-', 'ー', '―']);
+const isBlankValue = v => NA_VALUES.has(String(v == null ? '' : v).trim());
+
+/**
+ * 有効期限の受け取り。画面は 年/月/日 のプルダウンで選ぶので YYYY-MM-DD か YYYY-MM で届く。
+ * 実在する暦日だけ通す (2026-02-31 のような日付を台帳に残さない)
+ */
+function parseExpiry(v) {
+  const s = String(v == null ? '' : v).trim();
+  const m = /^(\d{4})-(\d{2})(?:-(\d{2}))?$/.exec(s);
+  if (!m) return null;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), m[3] ? Number(m[3]) : null];
+  if (y < 2000 || y > 2100 || mo < 1 || mo > 12) return null;
+  if (d == null) return `${m[1]}-${m[2]}`;
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() + 1 !== mo || dt.getUTCDate() !== d) return null;
+  return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+function decideDestination(req, line, worker) {
+  const { info, expiryManaged } = infoForLine(line.code_key);
+  let dest = resolveDestination(info, { expiryManaged });
+  if (dest.missing.length === 0) return { ok: true, destination: dest.destination, decidedFrom: 'master' };
+
+  const choice = req.body?.choice;
+  if (!choice || typeof choice !== 'object') {
+    return { ok: false, status: 400, body: { ok: false, error: 'destination_required', missing: dest.missing, info, expiry_managed: expiryManaged,
+      line: { product_id: line.product_id, product_name: line.product_name, planned_qty: line.planned_qty },
+      message: dest.missing.map(m => MISSING_LABEL[m] || m).join(' と ') + ' を決めてください' } };
+  }
+
+  // 期限管理商品は入荷のたびに有効期限が変わるので、毎回入れてもらう (商品マスタに持てない)
+  let expiryDate = null;
+  if (expiryManaged) {
+    expiryDate = parseExpiry(choice.expiry_date);
+    if (!expiryDate) {
+      return { ok: false, status: 400, body: { ok: false, error: 'destination_required', missing: ['expiry'], info, expiry_managed: true,
+        message: '有効期限を選んでください (実在する日付で)' } };
+    }
+  }
+  const want = String(choice.destination || '').trim();
+  if (dest.missing.includes('iroha') && want !== 'iroha' && want !== 'bfaith') {
+    return { ok: false, status: 400, body: { ok: false, error: 'bad_request', message: '行き先 (いろは / B-Faith) を選んでください' } };
+  }
+  const destination = dest.missing.includes('iroha') ? want : dest.destination;
+  const usedChoice = dest.missing.some(m => m !== 'expiry');
+
+  // 書き戻す値を組み立てる。⭐未記入だったときだけ「いろは在庫化作業有無」を書く
+  //   (「状況による」のように人が意図して入れた値は上書きしない — 今回の判断は台帳にだけ残す)
+  const fields = {};
+  if (dest.missing.includes('iroha') && dest.writeBack) fields.いろは在庫化作業有無 = destination === 'iroha' ? IROHA_YES : IROHA_NO;
+  if (destination === 'bfaith') {
+    // いろはに送らず自社で入庫するなら、ラベルと入数が無いと入庫作業ができない。
+    // ⚠dest.missing ではなく info の値そのものを見る: 行き先が未記入だった場合、
+    //   resolveDestination は iroha の分岐で先に返るので bc_seal/irisu は missing に入らない
+    const needSeal = isBlankValue(info && info.bc_seal);
+    const needIrisu = !info || !Number.isInteger(info.irisu) || info.irisu <= 0;
+    if (needSeal) {
+      const seal = String(choice.bc_seal == null ? '' : choice.bc_seal).trim();
+      if (!seal) return { ok: false, status: 400, body: { ok: false, error: 'destination_required', missing: ['bc_seal'], info, message: 'ラベル (BCシール) を選んでください' } };
+      fields.入庫時BCシール貼りフラグ = seal;
+    }
+    if (needIrisu) {
+      const n = Number(choice.irisu);
+      if (!Number.isSafeInteger(n) || n <= 0) return { ok: false, status: 400, body: { ok: false, error: 'destination_required', missing: ['irisu'], info, message: '入数を1以上の整数で入力してください' } };
+      fields.入数 = n;
+    }
+  }
+
+  // 選んだ値を入庫情報へ登録する (中原さん「選択したものは自動登録される」)
+  let warning = null;
+  if (Object.keys(fields).length > 0) {
+    let cur = info;
+    if (!cur) {
+      const add = addManual(line.product_id, worker);
+      if (add.ok || add.error === 'duplicate') cur = getInbound(line.product_id);
+      // 商品マスタに無い商品は入庫情報を作れない。**現場を止めないため確認は通し**、
+      // 行き先は台帳に残す (登録できなかったことは画面に出す)
+      if (!cur) warning = 'この商品は商品マスタに無いため、入庫情報には登録できませんでした (行き先の記録は残ります)';
+    }
+    if (cur) {
+      const up = updateInbound(line.code_key, fields, worker, cur.version);
+      if (!up.ok) {
+        if (up.error === 'conflict') return { ok: false, status: 409, body: { ok: false, error: 'conflict', message: '他の人が同じ商品の入庫情報を変更しました。もう一度押してください' } };
+        return { ok: false, status: 400, body: { ok: false, error: up.error, message: '入庫情報を登録できませんでした' } };
+      }
+      // 書いたあとで、B-Faith 入庫の必須2項目が本当に揃ったか見直す。
+      // ⚠ここで行き先 (iroha) は見ない: 「状況による」の行は master を書き換えないので、
+      //   毎回 missing に残るのが正しく、それを不足として扱うと永久に確認できなくなる
+      if (destination === 'bfaith') {
+        const short = [];
+        if (isBlankValue(up.row.入庫時BCシール貼りフラグ)) short.push('bc_seal');
+        if (!Number.isInteger(up.row.入数) || up.row.入数 <= 0) short.push('irisu');
+        if (short.length > 0) {
+          return { ok: false, status: 400, body: { ok: false, error: 'destination_required', missing: short, info: up.row,
+            message: short.map(m => MISSING_LABEL[m] || m).join(' と ') + ' が足りません' } };
+        }
+      }
+    }
+  }
+  // 有効期限だけを聞いた場合、行き先そのものは入庫情報どおり (master) と記録する
+  return { ok: true, destination, decidedFrom: usedChoice ? 'chosen' : 'master', expiryDate, warning };
+}
+
 function handleCheck(action) {
   return api((req, res) => {
     const { batch_id, line_key, expect_version } = req.body || {};
@@ -212,8 +326,23 @@ function handleCheck(action) {
     if (!Number.isSafeInteger(ev) || ev < 1) return res.status(400).json({ ok: false, error: 'bad_request', message: 'expect_version (正の整数) が必要です' });
     const w = resolveWorker(req);
     if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+
+    // 確認するときだけ行き先を確定させる (取り消しは台帳側で cancelled を立てるだけ)
+    let decided = { destination: null, decidedFrom: null, warning: null };
+    if (action === 'check') {
+      // 明細が引けないときはゲートを通さず applyCheck に任せる。
+      // そちらが stale_batch (一覧が入れ替わった) と not_found を正しく出し分けるため
+      const line = getLineForCheck(batch_id, String(line_key || ''));
+      if (line) {
+        const d = decideDestination(req, line, editorName(req, w.worker));
+        if (!d.ok) return res.status(d.status).json(d.body);
+        decided = d;
+      }
+    }
+
     const r = applyCheck({
       batchId: batch_id, lineKey: String(line_key || ''), action,
+      destination: decided.destination, decidedFrom: decided.decidedFrom, expiryDate: decided.expiryDate || null,
       expectVersion: ev,
       worker: w.worker,
       staffId: w.staffId,
@@ -224,7 +353,7 @@ function handleCheck(action) {
       const status = r.error === 'stale_batch' || r.error === 'conflict' ? 409 : r.error === 'not_found' ? 404 : 400;
       return res.status(status).json(r);
     }
-    res.json(r);
+    res.json(decided.warning ? { ...r, warning: decided.warning } : r);
   });
 }
 router.post('/api/lines/check', checkOrigin, handleCheck('check'));
@@ -287,6 +416,44 @@ router.post('/api/info/register', checkOrigin, api((req, res) => {
   }
   res.json({ ok: true, row: getInbound(code) });
 }));
+
+// ─── 期限管理あり/なし の切り替え (詳細パネルから) ───
+// ロジザードの商品マスタに設定がある項目だが入荷受付CSVには出てこないため、
+// 在庫の有効期限から推定した値を、違っていれば現場が直せるようにする
+router.post('/api/product-flags', checkOrigin, api((req, res) => {
+  const codeKey = String(req.body?.code_key || '').trim();
+  if (!codeKey) return res.status(400).json({ ok: false, error: 'bad_request', message: '商品が指定されていません' });
+  if (typeof req.body?.expiry_managed !== 'boolean') {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: 'expiry_managed (true/false) が必要です' });
+  }
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  res.json({ ok: true, ...setExpiryManaged(codeKey, req.body.expiry_managed, editorName(req, w.worker)) });
+}));
+
+// ─── 行き先の台帳 (いろはへ送る商品の一覧) ───
+// アプリ利用者なら誰でも見られる (いろはへの持ち出しリストは事務担当も使うため)
+router.get('/admin/destinations', requireSession, api((req, res) => {
+  res.json({ ok: true, rows: listDestinations(destQuery(req)) });
+}));
+
+router.get('/admin/destinations.csv', requireSession, api((req, res) => {
+  const q = destQuery(req);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Disposition', `attachment; filename="inbound-destinations-${q.destination}.csv"`);
+  res.send(destinationsCsv(q));
+}));
+
+function destQuery(req) {
+  const d = String(req.query?.destination || 'iroha');
+  return {
+    destination: ['iroha', 'bfaith', 'all'].includes(d) ? d : 'iroha',
+    from: req.query?.from ? String(req.query.from) : null,
+    to: req.query?.to ? String(req.query.to) : null,
+    includeCancelled: String(req.query?.include_cancelled || '') === '1',
+  };
+}
 
 // ─── 管理画面 ───
 router.get('/admin', requireSession, api(async (req, res) => {

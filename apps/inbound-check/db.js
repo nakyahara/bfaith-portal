@@ -121,6 +121,43 @@ export function createTables(db = getMirrorDB()) {
     );
     CREATE INDEX IF NOT EXISTS idx_ic_events_batch ON f_inbound_check_events(batch_id, line_key, id);
 
+    -- 入荷ごとの行き先 (いろはで在庫化 / B-Faith で入庫) の実績。
+    -- ⚠batch_id は値として持つだけで FK にしない: バッチは保持期間で消えるが、
+    --   「いつ・何を・何個いろはへ送ることにしたか」は後から見返せないと困るため残す。
+    -- append-only: 消し込みを取り消したときも行は消さず cancelled_at を立てる
+    CREATE TABLE IF NOT EXISTS f_inbound_check_destinations (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id      INTEGER NOT NULL,
+      line_key      TEXT NOT NULL,
+      ar_no         TEXT NOT NULL,
+      product_id    TEXT NOT NULL,
+      product_name  TEXT,
+      planned_qty   INTEGER,
+      destination   TEXT NOT NULL CHECK (destination IN ('iroha','bfaith')),
+      decided_from  TEXT NOT NULL CHECK (decided_from IN ('master','chosen')),
+      worker        TEXT,
+      staff_id      INTEGER,
+      device_label  TEXT,
+      decided_at    TEXT NOT NULL,
+      cancelled_at  TEXT,
+      cancelled_by  TEXT,
+      expiry_date   TEXT              -- 期限管理商品のときに入力した有効期限 (YYYY-MM-DD / YYYY-MM)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ic_dest_at ON f_inbound_check_destinations(decided_at);
+    CREATE INDEX IF NOT EXISTS idx_ic_dest_line ON f_inbound_check_destinations(batch_id, line_key, id);
+
+    -- 商品ごとの「期限管理あり/なし」。
+    -- ⚠ロジザードの商品マスタに設定がある項目だが、入荷受付CSV には出てこない。
+    --   当面は在庫データ (mirror_logizard_stock の有効期限) から推定し、違っていれば
+    --   この表で人が上書きする。将来ロジザード商品マスタを取り込めたら source='logizard' で埋める
+    CREATE TABLE IF NOT EXISTS f_inbound_check_product_flags (
+      code_key       TEXT PRIMARY KEY,
+      expiry_managed INTEGER NOT NULL CHECK (expiry_managed IN (0,1)),
+      source         TEXT NOT NULL CHECK (source IN ('manual','logizard')),
+      updated_at     TEXT NOT NULL,
+      updated_by     TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS f_inbound_check_import_log (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       at         TEXT NOT NULL,
@@ -473,7 +510,7 @@ export function productInfoMap(codeKeys) {
   const db = getDB();
   const keys = [...new Set(codeKeys.map(k => String(k || '').trim().toLowerCase()).filter(Boolean))];
   const map = new Map();
-  for (const k of keys) map.set(k, { info: null, pick_locs: [], other_locs: [], loc_source: 'none' });
+  for (const k of keys) map.set(k, { info: null, pick_locs: [], other_locs: [], loc_source: 'none', expiry_from_stock: false, expiry_flag: null });
   if (keys.length === 0) return map;
   const chunk = 400;
   for (let i = 0; i < keys.length; i += chunk) {
@@ -491,7 +528,7 @@ export function productInfoMap(codeKeys) {
     }
     if (tableExists(db, 'mirror_logizard_stock')) {
       const rows = db.prepare(`SELECT lower(trim(商品ID)) AS k, COALESCE(ブロック略称,'') AS block, COALESCE(ロケ,'') AS loc,
-          SUM(在庫数) AS qty
+          SUM(在庫数) AS qty, MAX(CASE WHEN COALESCE(trim(有効期限),'') <> '' THEN 1 ELSE 0 END) AS has_exp
         FROM mirror_logizard_stock
         WHERE lower(trim(商品ID)) IN (${ph}) AND 在庫数 > 0
         GROUP BY k, block, loc`).all(...part);
@@ -501,11 +538,21 @@ export function productInfoMap(codeKeys) {
         const label = r.block && r.loc ? `${r.block}-${r.loc}` : (r.block || r.loc || '');
         if (!label) continue;
         const entry = { loc: label, qty: r.qty };
+        if (r.has_exp) m.expiry_from_stock = true;   // 在庫に有効期限が入っている = 期限管理商品とみなす
         if (/^P3F/i.test(r.block)) m.pick_locs.push(entry); else m.other_locs.push(entry);
+      }
+    }
+    // 人が設定した「期限管理あり/なし」は在庫からの推定より優先する
+    if (tableExists(db, 'f_inbound_check_product_flags')) {
+      for (const r of db.prepare(`SELECT code_key, expiry_managed, source FROM f_inbound_check_product_flags WHERE code_key IN (${ph})`).all(...part)) {
+        const m = map.get(r.code_key);
+        if (m) m.expiry_flag = { managed: !!r.expiry_managed, source: r.source };
       }
     }
   }
   for (const m of map.values()) {
+    m.expiry_managed = m.expiry_flag ? m.expiry_flag.managed : m.expiry_from_stock;
+    m.expiry_source = m.expiry_flag ? m.expiry_flag.source : (m.expiry_from_stock ? 'stock' : 'none');
     m.pick_locs.sort((a, b) => b.qty - a.qty || a.loc.localeCompare(b.loc));
     m.other_locs.sort((a, b) => b.qty - a.qty || a.loc.localeCompare(b.loc));
     m.pick_locs = m.pick_locs.slice(0, 3);
@@ -564,18 +611,94 @@ export function getState() {
   const prev = previousCheckedMap(db, batch.id);
   const checkedBySlip = new Map();
   for (const l of lines) {
-    const x = info.get(l.code_key) || { info: null, pick_locs: [], other_locs: [], loc_source: 'none' };
+    const x = info.get(l.code_key) || { info: null, pick_locs: [], other_locs: [], loc_source: 'none', expiry_managed: false, expiry_source: 'none' };
     l.info = x.info;
     l.pick_locs = x.pick_locs;
     l.other_locs = x.other_locs;
     l.loc_source = x.loc_source;
     l.image_url = images.get(String(l.product_id || '').trim().toLowerCase()) || null;
+    l.expiry_managed = !!x.expiry_managed;      // 期限管理商品か (在庫の有効期限から推定 or 手動設定)
+    l.expiry_source = x.expiry_source || 'none';
+    l.dest = resolveDestination(l.info, { expiryManaged: l.expiry_managed });   // 行き先と、確認の前に決める項目
     l.prev_checked = prev.get(l.line_key) || null;
     if (l.check_status === 'checked') checkedBySlip.set(l.ar_no, (checkedBySlip.get(l.ar_no) || 0) + 1);
   }
   for (const s of slips) s.checked_count = checkedBySlip.get(s.ar_no) || 0;
   const checked = lines.filter(l => l.check_status === 'checked').length;
-  return { batch, slips, lines, totals: { lines: lines.length, checked } };
+  // 未確認のうち「行き先が決まっていない」件数 = 画面上部のアラート
+  // アラート = 行き先 (いろは在庫化) が未設定のもの。期限入力は毎回聞くので件数には入れない
+  const undecided = lines.filter(l => l.check_status !== 'checked' && l.dest.missing.includes('iroha')).length;
+  const toIroha = lines.filter(l => l.check_status === 'checked' && l.dest.destination === 'iroha').length;
+  return { batch, slips, lines, totals: { lines: lines.length, checked, undecided, toIroha } };
+}
+
+/** 確認の前に行き先を決めるために要る明細1件 (active バッチかどうかは applyCheck が見る) */
+export function getLineForCheck(batchId, lineKey) {
+  return getDB().prepare('SELECT ar_no, line_key, product_id, product_name, code_key, planned_qty FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?')
+    .get(Number(batchId), String(lineKey || "")) || null;
+}
+
+// ─────────────────── 行き先 (いろは / B-Faith) の判定 ───────────────────
+
+export const IROHA_YES = '有り';
+export const IROHA_NO = '無し';
+const NA_VALUES = new Set(['', '－', '-', 'ー', '―']);   // 「未記入」と同じ扱いにする表記
+const blank = v => NA_VALUES.has(String(v == null ? "" : v).trim());
+
+/**
+ * この明細を「いろはで在庫化」に回すのか「B-Faith で入庫」するのかを、入庫情報から決める。
+ *
+ * 中原さん 2026-09-01: 「すでにデータがあるものはそのデータに沿ってやる。もしデータが
+ * なければその時に選択して、その選択したデータがデータベースに登録される」
+ *
+ *   いろは在庫化作業有無 = 有り → いろは行き。B-Faith での入庫作業が無いので他は要らない
+ *   いろは在庫化作業有無 = 無し → B-Faith 入庫。**ラベル (BCシール) と入数が要る**
+ *                                  (中原さん: 「選択しないと進めない形にしてほしい」)
+ *   それ以外 (未記入・「状況による」等) → その場で選んでもらう
+ *
+ * ⭐未記入のときだけ、選んだ値を入庫情報に書き戻す。「状況による」のように**人が意図して
+ *   入れた値は上書きしない** (今回の判断は台帳にだけ残す)
+ *
+ * 期限管理商品は、**入荷のたびに有効期限が変わる**ので毎回 missing に 'expiry' が入る
+ * (商品マスタに持てる値ではない)。
+ *
+ * @returns {{destination: string|null, missing: string[], writeBack: boolean}}
+ *   missing = 確認の前に決めないといけない項目 (iroha / bc_seal / irisu / expiry)
+ */
+export function resolveDestination(info, { expiryManaged = false } = {}) {
+  const withExpiry = r => (expiryManaged ? { ...r, missing: [...r.missing, 'expiry'] } : r);
+  if (!info) return withExpiry({ destination: null, missing: ['iroha'], writeBack: true });
+  const iroha = String(info.iroha == null ? "" : info.iroha).trim();
+  if (iroha === IROHA_YES) return withExpiry({ destination: 'iroha', missing: [], writeBack: false });
+  if (iroha !== IROHA_NO) {
+    // 未記入 = 書き戻す / 「状況による」等 = 今回だけの判断 (master は触らない)
+    return withExpiry({ destination: null, missing: ['iroha'], writeBack: blank(iroha) });
+  }
+  const missing = [];
+  if (blank(info.bc_seal)) missing.push('bc_seal');
+  if (!Number.isInteger(info.irisu) || info.irisu <= 0) missing.push('irisu');
+  return withExpiry({ destination: 'bfaith', missing, writeBack: true });
+}
+
+/** 明細1件分の補助情報 (入庫情報 + 期限管理)。行き先の判定に使う */
+export function infoForLine(codeKey) {
+  const m = productInfoMap([codeKey]).get(String(codeKey || "").trim().toLowerCase());
+  return { info: m?.info || null, expiryManaged: !!m?.expiry_managed };
+}
+
+/**
+ * 「期限管理あり/なし」を人が設定する。在庫からの推定を上書きする。
+ * ロジザード商品マスタを取り込めるようになったら source='logizard' で同じ表を埋める
+ */
+export function setExpiryManaged(codeKey, managed, actor) {
+  const k = String(codeKey || '').trim().toLowerCase();
+  if (!k) throw new Error('商品が指定されていません');
+  getDB().prepare(`INSERT INTO f_inbound_check_product_flags (code_key, expiry_managed, source, updated_at, updated_by)
+    VALUES (?, ?, 'manual', ?, ?)
+    ON CONFLICT(code_key) DO UPDATE SET expiry_managed = excluded.expiry_managed,
+      source = 'manual', updated_at = excluded.updated_at, updated_by = excluded.updated_by`)
+    .run(k, managed ? 1 : 0, utcNow(), String(actor || '').trim() || null);
+  return { ok: true, code_key: k, expiry_managed: !!managed };
 }
 
 // ───────────────────────── 消し込み ─────────────────────────
@@ -588,7 +711,7 @@ function currentState(db, batchId, lineKey) {
  * 1タップ確認 / 取消。
  * @returns {ok:true, state} | {ok:false, error:'stale_batch'|'not_found'|'conflict'|'bad_request', current?}
  */
-export function applyCheck({ batchId, lineKey, action, expectVersion, worker, staffId = null, deviceId = null, deviceLabel = null }) {
+export function applyCheck({ batchId, lineKey, action, expectVersion, worker, staffId = null, deviceId = null, deviceLabel = null, destination = null, decidedFrom = null, expiryDate = null }) {
   if (!['check', 'uncheck'].includes(action)) return { ok: false, error: 'bad_request', message: 'action が不正です' };
   const bid = Number(batchId);
   if (!Number.isInteger(bid) || !lineKey) return { ok: false, error: 'bad_request', message: 'batch_id / line_key が不正です' };
@@ -600,7 +723,7 @@ export function applyCheck({ batchId, lineKey, action, expectVersion, worker, st
   const tx = db.transaction(() => {
     const active = getActiveBatch();
     if (!active || active.id !== bid) return { ok: false, error: 'stale_batch', message: '一覧が更新されました。最新の一覧を読み込み直してください', activeBatchId: active ? active.id : null };
-    const line = db.prepare('SELECT ar_no FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(bid, lineKey);
+    const line = db.prepare('SELECT ar_no, product_id, product_name, planned_qty FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(bid, lineKey);
     if (!line) return { ok: false, error: 'not_found', message: '明細が見つかりません' };
     const now = utcNow();
     let res;
@@ -625,9 +748,53 @@ export function applyCheck({ batchId, lineKey, action, expectVersion, worker, st
     }
     db.prepare(`INSERT INTO f_inbound_check_events (batch_id, line_key, ar_no, action, worker, staff_id, device_id, device_label, created_at, reverted_event_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(bid, lineKey, line.ar_no, action, w, staffId, deviceId, deviceLabel, now, reverted);
+    // 行き先の台帳。確認したら1行足し、取り消したら消さずに cancelled を立てる (append-only)
+    if (action === 'check' && destination) {
+      db.prepare(`INSERT INTO f_inbound_check_destinations
+        (batch_id, line_key, ar_no, product_id, product_name, planned_qty, destination, decided_from, worker, staff_id, device_label, decided_at, expiry_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(bid, lineKey, line.ar_no, line.product_id, line.product_name, line.planned_qty, destination, decidedFrom || 'master', w, staffId, deviceLabel, now, expiryDate);
+    } else if (action === 'uncheck') {
+      db.prepare('UPDATE f_inbound_check_destinations SET cancelled_at = ?, cancelled_by = ? WHERE batch_id = ? AND line_key = ? AND cancelled_at IS NULL')
+        .run(now, w, bid, lineKey);
+    }
     return { ok: true, state: currentState(db, bid, lineKey) };
   });
   return tx.immediate();
+}
+
+// ─────────────────── 行き先の台帳 (いろはへ送った実績) ───────────────────
+
+/**
+ * 行き先の実績。既定は「いろは行き・取り消されていないもの」を新しい順。
+ * バッチが保持期間で消えたあとも残る (テーブルを CASCADE にしていないため)
+ */
+export function listDestinations({ destination = 'iroha', from = null, to = null, includeCancelled = false, limit = 2000 } = {}) {
+  const where = [];
+  const params = [];
+  if (destination && destination !== 'all') { where.push('destination = ?'); params.push(destination); }
+  if (!includeCancelled) where.push('cancelled_at IS NULL');
+  if (from) { where.push('decided_at >= ?'); params.push(String(from)); }
+  if (to) { where.push('decided_at <= ?'); params.push(String(to)); }
+  return getDB().prepare(`SELECT * FROM f_inbound_check_destinations
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY id DESC LIMIT ?`).all(...params, Math.max(1, Math.min(20000, Number(limit) || 2000)));
+}
+
+/** 行き先の CSV (UTF-8 BOM)。いろはへの持ち出しリストとして使う */
+export function destinationsCsv(opts = {}) {
+  const rows = listDestinations({ ...opts, limit: 20000 });
+  const esc = v => {
+    let s = v == null ? '' : String(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;   // 表計算ソフトが数式として解釈しないように
+    return `"${s.replace(/"/g, '""')}"`;
+  };
+  const head = ['決定日時', '行き先', '入荷管理番号', '商品ID', '商品名', '予定数', '有効期限', '判断', '作業者', '端末', '取消日時'];
+  const body = rows.map(r => [
+    r.decided_at, r.destination === 'iroha' ? 'いろは在庫化' : 'B-Faith入庫', r.ar_no, r.product_id, r.product_name,
+    r.planned_qty, r.expiry_date, r.decided_from === 'chosen' ? 'その場で選択' : '入庫情報どおり', r.worker, r.device_label, r.cancelled_at,
+  ].map(esc).join(','));
+  return '\ufeff' + [head.map(esc).join(','), ...body].join('\r\n') + '\r\n';
 }
 
 // ───────────────────────── 履歴 ─────────────────────────
