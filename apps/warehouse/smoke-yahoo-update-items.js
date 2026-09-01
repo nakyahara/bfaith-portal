@@ -71,12 +71,14 @@ async function getRawXml(code) {
  * ★sale_price に空文字を送る = セール価格を消す。消してよいと明示する
  *   (この smoke はセール価格が入っている商品では動かないようにしてある)
  */
-async function updatePrice(code, price) {
+async function updatePrice(code, price, expectedPrice) {
   const res = await fetch(`${BASE}/yahoo/update-items`, {
     method: 'POST', headers: headers(),
     body: JSON.stringify({
       items: [{ item_code: code, price: String(price), sale_price: '' }],
       clearSalePrice: true,
+      // ★VPS 側でも送る直前に読み直して照合してもらう (expected は必須)
+      expected: { [code]: String(expectedPrice) },
     }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
@@ -240,7 +242,7 @@ async function main() {
   let attempted = false;
   try {
     attempted = true;
-    const r1 = await updatePrice(itemCode, probePrice);
+    const r1 = await updatePrice(itemCode, probePrice, currentPrice);
     console.log(`updateItems + 反映: HTTP ${r1.status} / ${oneLine(r1.body)}`);
     if (!r1.json?.ok) {
       throw new Error(`送信できていません (${oneLine(r1.json?.updateBody || r1.body)})`);
@@ -272,7 +274,7 @@ async function main() {
       await sleep(API_GAP_MS);
       console.log(`\n価格を元に戻します (${probePrice} → ${currentPrice})`);
       try {
-        const r3 = await updatePrice(itemCode, currentPrice);
+        const r3 = await updatePrice(itemCode, currentPrice, probePrice);
         console.log(`updateItems + 反映: HTTP ${r3.status} / ${oneLine(r3.body)}`);
         // ★戻しの「反映」まで通っていることを確かめる。
         //   ここを見ないと、管理側は戻っているのにフロントには検証中の価格が出たまま終わる
