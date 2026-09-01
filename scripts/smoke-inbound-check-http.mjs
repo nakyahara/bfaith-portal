@@ -199,24 +199,84 @@ try {
     ok(r.json.lines.length === 16 && r.json.slips.length === 1 && r.json.totals.checked === 0, 'state 16行/1伝票');
     firstKey = r.json.lines[0].line_key;
     ok(r.json.lines[0].info === null || typeof r.json.lines[0].info === 'object', '補助情報フィールドあり');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 1, worker_code: '20250901' } });
-    ok(r.status === 200 && r.json.state.status === 'checked' && r.json.state.checked_by === '星 立夏', '確認 (セッション + スタッフ管理番号)');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 1, worker_code: '20250901' } });
-    ok(r.status === 409 && r.json.error === 'conflict' && r.json.current.status === 'checked', '二重確認 → 409 conflict');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId + 99, line_key: firstKey, worker_code: '20250901', expect_version: 1 } });
+    const K = n => `AR00110005164|${n}|1`;
+    const fin = (body) => req(J, `${APP}/api/lines/check`, { method: 'POST', body });
+    const allPresent = (n, extra = {}) => fin({ batch_id: batchId, line_key: K(n), expect_version: 1, expect_quantity_version: 1,
+      result: 'exact', mode: 'fill_remaining', fill_event: { client_event_id: `sm-fill-${n}` }, worker_code: '20250901', ...extra });
+    r = await allPresent(6);
+    ok(r.status === 200 && r.json.state.status === 'checked' && r.json.state.checked_by === '星 立夏' && r.json.state.finalized_result === 'exact',
+      '全部あり (セッション + スタッフ管理番号)');
+    r = await allPresent(6);
+    ok(r.status === 409 && r.json.error === 'finalized' && r.json.current.status === 'checked', '確定済みへの再確定 → 409 finalized');
+    r = await fin({ batch_id: batchId + 99, line_key: K(6), worker_code: '20250901', expect_version: 1, expect_quantity_version: 1, result: 'exact' });
     ok(r.status === 409 && r.json.error === 'stale_batch', '旧/不明 batch_id → 409 stale_batch');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: r.json.line_key || 'AR00110005164|2|1', expect_version: 1 } });
+    r = await fin({ batch_id: batchId, line_key: K(7), expect_version: 1, expect_quantity_version: 1, result: 'exact',
+      mode: 'fill_remaining', fill_event: { client_event_id: 'sm-fill-7' } });
     ok(r.status === 200 && r.json.state.checked_by === '中原 大輔', '作業者コード無し (セッション) = 表示名で記録');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: 'w99', expect_version: 1 } });
+    r = await fin({ batch_id: batchId, line_key: K(8), worker_code: 'w99', expect_version: 1, expect_quantity_version: 1, result: 'exact' });
     ok(r.status === 400 && r.json.error === 'worker_required', '不明なスタッフ管理番号 → 400');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|4|1', worker_code: '90002', expect_version: 1 } });
+    r = await fin({ batch_id: batchId, line_key: K(9), worker_code: '90002', expect_version: 1, expect_quantity_version: 1, result: 'exact' });
     ok(r.status === 400 && r.json.error === 'worker_required', '無効化したスタッフ → 400');
     for (const bad of [undefined, null, 0, -1, 1.5, 'x', '']) {
-      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: '20250901', expect_version: bad } });
+      r = await fin({ batch_id: batchId, line_key: K(10), worker_code: '20250901', expect_version: bad, expect_quantity_version: 1, result: 'exact' });
       ok(r.status === 400 && r.json.error === 'bad_request', `expect_version=${String(bad)} → 400`);
     }
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: '20250901', expect_version: '1' } });
+    r = await fin({ batch_id: batchId, line_key: K(10), worker_code: '20250901', expect_version: '1', expect_quantity_version: '1',
+      result: 'exact', mode: 'fill_remaining', fill_event: { client_event_id: 'sm-fill-10' } });
     ok(r.status === 200, "expect_version='1' (文字列の整数) は許容");
+
+    console.log('\n[B1a] 数量 (部分確認) の HTTP 経路');
+    {
+      // ⚠ここは「箱を数えている最中に通信が切れた」「2台で同時に数えた」を通す道。正常系より事故系を先に見る
+      const QE = `${APP}/api/lines/quantity-events`;
+      const line = (await req(J, `${APP}/api/state`)).json.lines.find(l => l.line_key === K(1));
+      const planned = line.planned_qty;
+      const box = (id, q) => ({ client_event_id: id, action: 'add', quantity: q, input_kind: 'box', unit_size: q });
+      const post = body => req(J, QE, { method: 'POST', body: { batch_id: batchId, line_key: K(1), worker_code: '20250901', ...body } });
+
+      r = await post({ expect_quantity_version: 1, events: [box('sm-q-0001', 10)], pack_qty: 10 });
+      ok(r.status === 200 && r.json.state.found_qty === 10 && r.json.state.quantity_version === 2, '＋1箱 → 200 が返ってから数が増える');
+      r = await post({ expect_quantity_version: 2, events: [box('sm-q-0001', 10)] });
+      ok(r.status === 200 && r.json.replayed && r.json.state.found_qty === 10, '同じ client_event_id の再送は二重加算しない (応答だけ失われた時の押し直し)');
+      r = await post({ expect_quantity_version: 2, events: [box('sm-q-0001', 20)] });
+      ok(r.status === 409 && r.json.error === 'idempotency_conflict', '同じ操作IDで違う内容 → 409');
+      r = await post({ expect_quantity_version: 1, events: [box('sm-q-0002', 10)] });
+      ok(r.status === 409 && r.json.error === 'conflict' && r.json.current.found_qty === 10, '古い quantity_version → 409 conflict + 現在値');
+      r = await post({ expect_quantity_version: 2, events: [box('sm-q-0002', 10)] });
+      ok(r.status === 200 && r.json.state.found_qty === 20, '別の端末の加算は足し算 (絶対値の上書きではない)');
+      r = await post({ expect_quantity_version: 3, events: [{ client_event_id: 'sm-q-bad1', action: 'add', quantity: 0, input_kind: 'box' }] });
+      ok(r.status === 400 && r.json.error === 'bad_request', '数量0は 400');
+      r = await post({ expect_quantity_version: 3, events: [{ client_event_id: 'x', action: 'add', quantity: 1, input_kind: 'box' }] });
+      ok(r.status === 400 && r.json.error === 'bad_request', '短すぎる client_event_id は 400');
+      r = await req(J, `${APP}/api/lines/events?batch_id=${batchId}&line_key=${encodeURIComponent(K(1))}`);
+      ok(r.status === 200 && r.json.events.length === 2, '数量イベント履歴が引ける (訂正パネル用)');
+      const target = r.json.events[0];
+      r = await post({ expect_quantity_version: 3, events: [
+        { client_event_id: 'sm-q-0003', action: 'reversal', quantity: 10, input_kind: 'correction', reverses_event_seq: target.event_seq },
+        { client_event_id: 'sm-q-0004', action: 'add', quantity: 12, input_kind: 'correction', unit_size: 12, replaces_event_seq: target.event_seq } ] });
+      ok(r.status === 200 && r.json.state.found_qty === 22, '入数の訂正 (10入り→12入り) → 22');
+      r = await post({ expect_quantity_version: 4, events: [
+        { client_event_id: 'sm-q-0005', action: 'reversal', quantity: 10, input_kind: 'correction', reverses_event_seq: target.event_seq } ] });
+      ok(r.status === 409 && r.json.error === 'already_reversed', '二重打ち消し → 409 already_reversed');
+
+      // 人が選んだ意味と実数が食い違ったまま確定させない
+      r = await fin({ batch_id: batchId, line_key: K(1), expect_version: 1, expect_quantity_version: 4, result: 'exact', worker_code: '20250901' });
+      ok(r.status === 409 && r.json.error === 'result_mismatch', `22/${planned} で exact → 409 result_mismatch`);
+      r = await fin({ batch_id: batchId, line_key: K(1), expect_version: 1, expect_quantity_version: 4, result: 'shortage', worker_code: '20250901', client_operation_id: 'sm-op-0001',
+        choice: { destination: 'bfaith', bc_seal: '不要', irisu: 10 } });
+      ok(r.status === 200 && r.json.state.finalized_result === 'shortage' && r.json.state.found_qty === 22, '不足のまま確定 → 22個で checked');
+      r = await fin({ batch_id: batchId, line_key: K(1), expect_version: 1, expect_quantity_version: 4, result: 'shortage', worker_code: '20250901', client_operation_id: 'sm-op-0001',
+        choice: { destination: 'bfaith', bc_seal: '不要', irisu: 10 } });
+      ok(r.status === 200 && r.json.replayed, '確定の再送は replayed (台帳を増やさない)');
+      r = await post({ expect_quantity_version: 5, events: [box('sm-q-0006', 10)] });
+      ok(r.status === 409 && r.json.error === 'finalized', '確定済みの行には数を足せない → 409 finalized');
+      r = await req(J, `${APP}/api/lines/uncheck`, { method: 'POST', body: { batch_id: batchId, line_key: K(1), expect_version: 2, worker_code: '20250901' } });
+      ok(r.status === 200 && r.json.state.status === 'unchecked' && r.json.state.found_qty === 22, 'やり直す → 未確認に戻るが数量22は残る');
+      r = await req(J, `${APP}/api/state`);
+      const l5 = r.json.lines.find(l => l.line_key === K(1));
+      ok(l5.quantity_relation === 'shortage' && l5.remaining_qty === planned - 22 && r.json.totals.partial >= 1,
+        'state に found_qty / remaining_qty / quantity_relation / totals.partial が載る');
+    }
     console.log('\n[B1b] 入庫情報を iPad からその場で直す');
     {
       // 入数やいろはは f_inbound_info (= /apps/inbound-info と同じ正本) に書く。値札印刷にもそのまま効く
@@ -264,7 +324,10 @@ try {
     r = await req(J, `${APP}/admin/history.csv?batch_id=${batchId}`);
     ok(r.status === 200 && /text\/csv/.test(r.ctype) && r.text.includes('確認'), '履歴 CSV');
     r = await req(J, `${APP}/admin/history?batch_id=${batchId}`);
-    ok(r.status === 200 && r.json.events.length === 3, '履歴 JSON 3件 (確認2 + 文字列version確認1)');
+    ok(r.status === 200 && r.json.events.length >= 3 && r.json.events.every(e => e.result || e.action === 'uncheck'),
+      '履歴 JSON に確認/やり直しが残り、確認には result (exact/shortage/excess) が入る');
+    ok(r.json.events.some(e => e.result === 'shortage' && e.found_qty === 22 && e.planned_qty_snapshot === 100),
+      '履歴に確定時点の実数と予定数のスナップショットが残る (後で数量を訂正しても当時の値が読める)');
 
     console.log('\n[B1a] 確認するときに行き先 (いろは / B-Faith) を確定させる');
     {
@@ -273,7 +336,9 @@ try {
       ok(undecided && undecided.dest.missing.includes('iroha'), '入庫情報が無い商品は「行き先 未設定」として出る');
       ok(r.json.totals.undecided >= 1, `画面上部のアラート件数が出る (${r.json.totals.undecided}件)`);
       const key = undecided.line_key, ver = undecided.version;
-      const body = extra => ({ batch_id: batchId, line_key: key, expect_version: ver, worker_code: '20250901', ...extra });
+      // 確定は「全部あり」= 残りを足して exact 確定する形で通す (失敗した回はロールバックされるので fill の id は使い回してよい)
+      const body = extra => ({ batch_id: batchId, line_key: key, expect_version: ver, expect_quantity_version: undecided.quantity_version,
+        result: 'exact', mode: 'fill_remaining', fill_event: { client_event_id: 'sm-gate-fill-1' }, worker_code: '20250901', ...extra });
 
       // 行き先を決めずには確認できない
       r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body() });
@@ -326,7 +391,8 @@ try {
       const l2 = r.json.lines.find(x => x.line_key === line.line_key);
       ok(l2.expiry_managed === true && l2.expiry_source === 'manual', '一覧に期限管理あり として出る');
       ok(l2.dest.missing.includes('expiry'), '期限管理商品は毎回 有効期限 を聞かれる');
-      const body = extra => ({ batch_id: batchId, line_key: line.line_key, expect_version: l2.version, worker_code: '20250901', ...extra });
+      const body = extra => ({ batch_id: batchId, line_key: line.line_key, expect_version: l2.version, expect_quantity_version: l2.quantity_version,
+        result: 'exact', mode: 'fill_remaining', fill_event: { client_event_id: 'sm-exp-fill-1' }, worker_code: '20250901', ...extra });
       r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body() });
       ok(r.status === 400 && r.json.missing.includes('expiry'), '有効期限なしでは確認できない');
       r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { expiry_date: '2026-02-31' } }) });
@@ -348,7 +414,8 @@ try {
       r = await req(J, `${APP}/api/state`);
       const orphan = r.json.lines.find(l => l.product_id === 'b17ls10ml');
       ok(orphan && orphan.info === null, '入庫情報も商品マスタも無い明細を用意');
-      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: orphan.line_key, expect_version: orphan.version, worker_code: '20250901', choice: { destination: 'iroha' } } });
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: orphan.line_key, expect_version: orphan.version, expect_quantity_version: orphan.quantity_version,
+      result: 'exact', mode: 'fill_remaining', fill_event: { client_event_id: 'sm-orphan-fill-1' }, worker_code: '20250901', choice: { destination: 'iroha' } } });
       ok(r.status === 200 && r.json.state.status === 'checked', '商品マスタに無くても確認できる');
       ok(/商品マスタ/.test(r.json.warning || ''), `登録できなかったことは画面に伝える (${r.json.warning})`);
       r = await req(J, `${APP}/admin/destinations`);
@@ -441,8 +508,10 @@ try {
   r = await req(J, `${APP}/admin/history.csv?batch_id=1`);
   ok(r.status === 403 || r.status === 302, '端末Cookieでは履歴不可');
   if (batchId) {
-    r = await req(J, `${APP}/api/lines/uncheck`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 2, worker_code: '20250901' } });
-    ok(r.status === 200 && r.json.state.status === 'unchecked', '端末Cookie + 作業者コードで取消');
+    const cur = (await req(J, `${APP}/api/state`)).json.lines.find(l => l.check_status === 'checked');
+    r = await req(J, `${APP}/api/lines/uncheck`, { method: 'POST', body: { batch_id: batchId, line_key: cur.line_key, expect_version: cur.version, worker_code: '20250901' } });
+    ok(r.status === 200 && r.json.state.status === 'unchecked' && r.json.state.found_qty === cur.found_qty,
+      '端末Cookie + 作業者コードでやり直し (数量は残る)');
     r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 3 } });
     ok(r.status === 400 && r.json.error === 'worker_required', '端末Cookieで作業者未選択 → 400');
   }

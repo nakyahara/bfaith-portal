@@ -201,6 +201,42 @@ export function createTables(db = getMirrorDB()) {
     );
     CREATE INDEX IF NOT EXISTS idx_ic_enroll_attempts ON f_inbound_check_enroll_attempts(at);
 
+    -- 数えた数の正本。**append-only・1タップ1行**。
+    -- ⚠合計を上書きする作りにすると、A が 11箱・B が 3箱 を同時に保存したとき片方が消える。
+    --   足し算 (add) と打ち消し (reversal) だけで表現し、UPDATE / DELETE はしない。
+    -- ⚠論理キーは batch_id ではなく (work_date, line_key, code_key)。
+    --   同日中に何度取り込んでも数えた数が引き継がれ、翌日は自然に 0 から始まる。
+    -- client_event_id = 1タップごとにクライアントが振る UUID。**再送は同じIDを使う**ので
+    --   「コミットされたが応答だけ失われた」ケースで二重加算しない。
+    CREATE TABLE IF NOT EXISTS f_inbound_check_quantity_events (
+      event_seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_event_id    TEXT NOT NULL UNIQUE,
+      work_date          TEXT NOT NULL,
+      batch_id           INTEGER NOT NULL,
+      line_key           TEXT NOT NULL,
+      code_key           TEXT NOT NULL,
+      ar_no              TEXT NOT NULL,
+      product_id         TEXT NOT NULL,
+      action             TEXT NOT NULL CHECK (action IN ('add','reversal')),
+      quantity           INTEGER NOT NULL CHECK (quantity > 0),
+      input_kind         TEXT NOT NULL CHECK (input_kind IN ('box','loose','fill_remaining','correction','backfill')),
+      unit_size          INTEGER CHECK (unit_size IS NULL OR unit_size > 0),
+      reverses_event_seq INTEGER REFERENCES f_inbound_check_quantity_events(event_seq),
+      replaces_event_seq INTEGER REFERENCES f_inbound_check_quantity_events(event_seq),
+      worker             TEXT NOT NULL,
+      staff_id           INTEGER,
+      device_id          INTEGER,
+      device_label       TEXT,
+      client_occurred_at TEXT,
+      received_at        TEXT NOT NULL,
+      CHECK ((action = 'add' AND reverses_event_seq IS NULL)
+          OR (action = 'reversal' AND reverses_event_seq IS NOT NULL AND replaces_event_seq IS NULL))
+    );
+    -- 同じ加算を二度打ち消せない
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_ic_qty_reversal ON f_inbound_check_quantity_events(reverses_event_seq)
+      WHERE reverses_event_seq IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_ic_qty_logical ON f_inbound_check_quantity_events(work_date, line_key, code_key, event_seq);
+
     CREATE TABLE IF NOT EXISTS f_inbound_check_devices (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
       token_hash   TEXT NOT NULL UNIQUE,
@@ -234,6 +270,104 @@ export function createTables(db = getMirrorDB()) {
     db.prepare("UPDATE f_inbound_check_batches SET work_date = date(imported_at, '+9 hours') WHERE work_date IS NULL").run();
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_ic_batches_work_date ON f_inbound_check_batches(work_date, id)');
+
+  migrateQuantity(db);
+}
+
+/** 列がなければ足す (SQLite の ALTER TABLE ADD COLUMN は冪等でないので自前で見る) */
+function addCol(db, table, col, ddl) {
+  const cols = db.prepare('PRAGMA table_info(' + table + ')').all().map(c => c.name);
+  if (cols.includes(col)) return false;
+  db.exec('ALTER TABLE ' + table + ' ADD COLUMN ' + col + ' ' + ddl);
+  return true;
+}
+
+/**
+ * 数量 (部分確認) のための列追加と、既存データのバックフィル。
+ *
+ * ⭐**バックフィルまでが1セット**。既に確認済みの行を found_qty=0 のまま残すと、
+ *   画面に「0 / 106個」と出て現場が数え直す羽目になる。さらに同日の再取込で
+ *   数量イベントの集計が 0 になり、午後の取込で数量が消える。
+ *   合成の add イベント (client_event_id='backfill:...') まで作って初めて整合する。
+ */
+function migrateQuantity(db) {
+  const added = addCol(db, 'f_inbound_check_line_state', 'found_qty', 'INTEGER NOT NULL DEFAULT 0');
+  addCol(db, 'f_inbound_check_line_state', 'quantity_version', 'INTEGER NOT NULL DEFAULT 1');
+  addCol(db, 'f_inbound_check_line_state', 'quantity_work_date', 'TEXT');
+  // exact = 予定どおり / shortage = 不足のまま確定 / excess = 予定より多い
+  addCol(db, 'f_inbound_check_line_state', 'finalized_result', 'TEXT');
+  // 確定時に作った行き先台帳の行。やり直したときに「その行だけ」取り消すために持つ
+  addCol(db, 'f_inbound_check_line_state', 'destination_id', 'INTEGER');
+  // 今から数える箱の入数 (今回の検品だけに使う。商品マスタには書かない)
+  addCol(db, 'f_inbound_check_line_state', 'current_pack_qty', 'INTEGER');
+
+  addCol(db, 'f_inbound_check_events', 'client_operation_id', 'TEXT');
+  addCol(db, 'f_inbound_check_events', 'result', 'TEXT');
+  addCol(db, 'f_inbound_check_events', 'found_qty', 'INTEGER');
+  addCol(db, 'f_inbound_check_events', 'planned_qty_snapshot', 'INTEGER');
+  addCol(db, 'f_inbound_check_events', 'quantity_version', 'INTEGER');
+  addCol(db, 'f_inbound_check_events', 'destination_id', 'INTEGER');
+  addCol(db, 'f_inbound_check_events', 'client_occurred_at', 'TEXT');
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_ic_check_operation ON f_inbound_check_events(client_operation_id)
+    WHERE client_operation_id IS NOT NULL`);
+
+  addCol(db, 'f_inbound_check_destinations', 'work_date', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'code_key', 'TEXT');
+  // 実際に見つけた数。いろはへ送る数は予定数ではなくこちらが正しい
+  addCol(db, 'f_inbound_check_destinations', 'actual_qty', 'INTEGER');
+  addCol(db, 'f_inbound_check_destinations', 'cancel_reason', 'TEXT');
+
+  if (!added) return;   // ここから先は列を足した初回だけ
+
+  db.transaction(() => {
+    db.prepare("UPDATE f_inbound_check_batches SET work_date = date(imported_at, '+9 hours') WHERE work_date IS NULL").run();
+    db.prepare("UPDATE f_inbound_check_destinations SET work_date = date(decided_at, '+9 hours') WHERE work_date IS NULL").run();
+    db.prepare(`UPDATE f_inbound_check_destinations SET code_key = (
+        SELECT l.code_key FROM f_inbound_check_lines l
+        WHERE l.batch_id = f_inbound_check_destinations.batch_id AND l.line_key = f_inbound_check_destinations.line_key LIMIT 1)
+      WHERE code_key IS NULL`).run();
+    db.prepare('UPDATE f_inbound_check_destinations SET actual_qty = COALESCE(planned_qty, 0) WHERE actual_qty IS NULL').run();
+
+    db.prepare(`UPDATE f_inbound_check_line_state SET quantity_work_date =
+        (SELECT b.work_date FROM f_inbound_check_batches b WHERE b.id = f_inbound_check_line_state.batch_id)
+      WHERE quantity_work_date IS NULL`).run();
+
+    // 旧「確認済み」= 予定数が全部あった、とみなす
+    db.prepare(`UPDATE f_inbound_check_line_state
+      SET found_qty = COALESCE((SELECT MAX(l.planned_qty, 0) FROM f_inbound_check_lines l
+            WHERE l.batch_id = f_inbound_check_line_state.batch_id AND l.line_key = f_inbound_check_line_state.line_key), 0),
+          finalized_result = 'exact'
+      WHERE status = 'checked'`).run();
+
+    // active バッチだけ、同日引き継ぎに使える合成 add を作る (集計の正本はイベント表なので必須)
+    db.prepare(`INSERT INTO f_inbound_check_quantity_events
+      (client_event_id, work_date, batch_id, line_key, code_key, ar_no, product_id,
+       action, quantity, input_kind, worker, device_label, client_occurred_at, received_at)
+      SELECT 'backfill:' || s.batch_id || ':' || s.line_key, b.work_date, s.batch_id, s.line_key,
+             l.code_key, l.ar_no, l.product_id, 'add', l.planned_qty, 'backfill',
+             COALESCE(s.checked_by, 'migration'), s.checked_device,
+             COALESCE(s.checked_at, b.imported_at), COALESCE(s.checked_at, b.imported_at)
+      FROM f_inbound_check_line_state s
+      JOIN f_inbound_check_batches b ON b.id = s.batch_id
+      JOIN f_inbound_check_lines l ON l.batch_id = s.batch_id AND l.line_key = s.line_key
+      WHERE b.status = 'active' AND s.status = 'checked' AND l.planned_qty > 0
+        AND NOT EXISTS (SELECT 1 FROM f_inbound_check_quantity_events q
+                        WHERE q.client_event_id = 'backfill:' || s.batch_id || ':' || s.line_key)`).run();
+
+    // 確認済み行を、今ある行き先台帳の最新行につなぐ (やり直し時にその行だけ取り消せるように)
+    db.prepare(`UPDATE f_inbound_check_line_state SET destination_id = (
+        SELECT d.id FROM f_inbound_check_destinations d
+        WHERE d.batch_id = f_inbound_check_line_state.batch_id AND d.line_key = f_inbound_check_line_state.line_key
+          AND d.cancelled_at IS NULL ORDER BY d.id DESC LIMIT 1)
+      WHERE status = 'checked'`).run();
+
+    db.prepare(`UPDATE f_inbound_check_events SET result = 'exact',
+        found_qty = (SELECT l.planned_qty FROM f_inbound_check_lines l
+          WHERE l.batch_id = f_inbound_check_events.batch_id AND l.line_key = f_inbound_check_events.line_key),
+        planned_qty_snapshot = (SELECT l.planned_qty FROM f_inbound_check_lines l
+          WHERE l.batch_id = f_inbound_check_events.batch_id AND l.line_key = f_inbound_check_events.line_key)
+      WHERE action = 'check' AND result IS NULL`).run();
+  }).immediate();
 }
 
 // ───────────────────────── 端末 (iPad) ─────────────────────────
@@ -477,28 +611,48 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       (batch_id, line_key, ar_no, line_no, detail_no, product_id, code_key, product_name, barcode, planned_qty, received_qty, seq)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const insState = db.prepare(`INSERT INTO f_inbound_check_line_state
-      (batch_id, line_key, status, version, checked_by, checked_device, checked_at) VALUES (?, ?, ?, 1, ?, ?, ?)`);
+      (batch_id, line_key, status, version, checked_by, checked_device, checked_at,
+       found_qty, quantity_version, quantity_work_date, finalized_result, destination_id, current_pack_qty)
+      VALUES (?, ?, ?, 1, ?, ?, ?, ?, 1, ?, ?, ?, ?)`);
     // ⭐同日中の再取込だけ確認状態を引き継ぐ (要件定義 v1.3 §11.6)。
     //   引き継ぐ条件 = 明細キー (AR|行|詳細行) と商品 (code_key) と予定数 が全部同じ。
     //   予定数が変わった / 商品が差し替わった明細は、数えたものが違うので必ず未確認に戻す。
     //   翌日は従来どおり全部未確認から始める (§2 確定事項⑤「毎朝リセット」を守る)。
+    //
+    //   ⚠**見つけた数は引き継がない代わりに数え直しもしない**。数量イベントの論理キーが
+    //     (work_date, line_key, code_key) なので、同日なら集計がそのまま残り、翌日は 0 になる。
+    //     コピーしないぶん、同じ数が二重に入る事故が起きない。
     const carry = new Map();
-    if (prevActive && prevActive.work_date === workDate) {
-      for (const p of db.prepare(`SELECT s.line_key, s.status, s.checked_by, s.checked_device, s.checked_at, l.code_key, l.planned_qty
+    const sameDay = !!(prevActive && prevActive.work_date === workDate);
+    if (sameDay) {
+      for (const p of db.prepare(`SELECT s.line_key, s.status, s.checked_by, s.checked_device, s.checked_at,
+            s.finalized_result, s.destination_id, s.current_pack_qty, l.code_key, l.planned_qty
           FROM f_inbound_check_line_state s
           JOIN f_inbound_check_lines l ON l.batch_id = s.batch_id AND l.line_key = s.line_key
-          WHERE s.batch_id = ? AND s.status = 'checked'`).all(prevActive.id)) {
+          WHERE s.batch_id = ?`).all(prevActive.id)) {
         carry.set(p.line_key, p);
       }
     }
+    const cancelDest = db.prepare(`UPDATE f_inbound_check_destinations
+      SET cancelled_at = ?, cancelled_by = 'import', cancel_reason = ? WHERE id = ? AND cancelled_at IS NULL`);
     let carried = 0;
     for (const r of parsed.rows) {
       insLine.run(batchId, r.line_key, r.ar_no, r.line_no, r.detail_no, r.product_id, r.code_key, r.product_name, r.barcode, r.planned_qty, r.received_qty, r.seq);
       const p = carry.get(r.line_key);
-      const same = p && p.code_key === r.code_key && p.planned_qty === r.planned_qty;
-      if (same) carried++;
-      insState.run(batchId, r.line_key, same ? 'checked' : 'unchecked',
-        same ? p.checked_by : null, same ? p.checked_device : null, same ? p.checked_at : null);
+      const sameProduct = !!(p && p.code_key === r.code_key);
+      const same = sameProduct && p.planned_qty === r.planned_qty;
+      // 見つけた数は同日の集計から復元する (同じ商品を数えていた場合だけ数が残る)
+      const found = sameDay ? quantitySum(db, workDate, r.line_key, r.code_key) : 0;
+      const keepChecked = same && p.status === 'checked';
+      if (keepChecked) carried++;
+      // 確認を引き継げない行の行き先実績は取り消す (いろはへ送る数が二重計上されないように)
+      if (p && p.status === 'checked' && p.destination_id && !keepChecked) {
+        cancelDest.run(now, sameProduct ? 'planned_changed' : 'product_changed', p.destination_id);
+      }
+      insState.run(batchId, r.line_key, keepChecked ? 'checked' : 'unchecked',
+        keepChecked ? p.checked_by : null, keepChecked ? p.checked_device : null, keepChecked ? p.checked_at : null,
+        found, workDate, keepChecked ? p.finalized_result : null,
+        keepChecked ? p.destination_id : null, sameProduct ? p.current_pack_qty : null);
     }
     logImport(db, { actor, source, fileName, ok: true, batchId,
       message: `${parsed.rows.length}行 / ${slipsMap.size}伝票` + (carried ? ` (同日の確認 ${carried}行を引き継ぎ)` : '') });
@@ -642,15 +796,18 @@ export function productImageMap(productIds) {
 export function getState() {
   const db = getDB();
   const batch = getActiveBatch();
-  if (!batch) return { batch: null, slips: [], lines: [], totals: { lines: 0, checked: 0 } };
+  if (!batch) return { batch: null, slips: [], lines: [], totals: { lines: 0, checked: 0, partial: 0, undecided: 0, toIroha: 0, toIrohaQty: 0 } };
   const slips = db.prepare('SELECT * FROM f_inbound_check_slips WHERE batch_id = ? ORDER BY seq').all(batch.id);
-  const lines = db.prepare(`SELECT l.*, s.status AS check_status, s.version, s.checked_by, s.checked_device, s.checked_at
+  const lines = db.prepare(`SELECT l.*, s.status AS check_status, s.version, s.checked_by, s.checked_device, s.checked_at,
+      s.found_qty, s.quantity_version, s.finalized_result, s.current_pack_qty, s.destination_id
     FROM f_inbound_check_lines l JOIN f_inbound_check_line_state s ON s.batch_id = l.batch_id AND s.line_key = l.line_key
     WHERE l.batch_id = ? ORDER BY l.seq`).all(batch.id);
   const info = productInfoMap(lines.map(l => l.code_key));
   const images = productImageMap(lines.map(l => l.product_id));
   const prev = previousCheckedMap(db, batch.id);
   const checkedBySlip = new Map();
+  const partialBySlip = new Map();
+  let partial = 0;
   for (const l of lines) {
     const x = info.get(l.code_key) || { info: null, pick_locs: [], other_locs: [], loc_source: 'none', expiry_managed: false, expiry_source: 'none' };
     l.info = x.info;
@@ -662,21 +819,36 @@ export function getState() {
     l.expiry_source = x.expiry_source || 'none';
     l.dest = resolveDestination(l.info, { expiryManaged: l.expiry_managed });   // 行き先と、確認の前に決める項目
     l.prev_checked = prev.get(l.line_key) || null;
+    // 数量 (部分確認)。「一部」は status ではなく found_qty から導出する (要件定義 v1.3 §11.3)
+    l.found_qty = Number(l.found_qty) || 0;
+    l.remaining_qty = l.planned_qty - l.found_qty;
+    l.quantity_relation = quantityRelation(l.found_qty, l.planned_qty);
+    // 1箱の入数: この検品で使っている値 → 無ければ入庫情報のマスタ値
+    l.pack_qty = Number.isInteger(l.current_pack_qty) && l.current_pack_qty > 0 ? l.current_pack_qty
+      : (l.info && Number.isInteger(l.info.irisu) && l.info.irisu > 0 ? l.info.irisu : null);
     if (l.check_status === 'checked') checkedBySlip.set(l.ar_no, (checkedBySlip.get(l.ar_no) || 0) + 1);
+    else if (l.found_qty > 0) { partial++; partialBySlip.set(l.ar_no, (partialBySlip.get(l.ar_no) || 0) + 1); }
   }
-  for (const s of slips) s.checked_count = checkedBySlip.get(s.ar_no) || 0;
+  for (const s of slips) {
+    s.checked_count = checkedBySlip.get(s.ar_no) || 0;
+    s.partial_count = partialBySlip.get(s.ar_no) || 0;
+  }
   const checked = lines.filter(l => l.check_status === 'checked').length;
   // 未確認のうち「行き先が決まっていない」件数 = 画面上部のアラート
   // アラート = 行き先 (いろは在庫化) が未設定のもの。期限入力は毎回聞くので件数には入れない
   const undecided = lines.filter(l => l.check_status !== 'checked' && l.dest.missing.includes('iroha')).length;
-  const toIroha = lines.filter(l => l.check_status === 'checked' && l.dest.destination === 'iroha').length;
-  return { batch, slips, lines, totals: { lines: lines.length, checked, undecided, toIroha } };
-}
-
-/** 確認の前に行き先を決めるために要る明細1件 (active バッチかどうかは applyCheck が見る) */
-export function getLineForCheck(batchId, lineKey) {
-  return getDB().prepare('SELECT ar_no, line_key, product_id, product_name, code_key, planned_qty FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?')
-    .get(Number(batchId), String(lineKey || "")) || null;
+  // ⭐いろは行きは**商品マスタの判定ではなく行き先台帳から**数える。
+  //   「状況による」でその場選択した行はマスタが書き変わらないので、マスタから数えると 0 件になる
+  const ir = db.prepare(`SELECT COUNT(*) AS c, COALESCE(SUM(d.actual_qty), 0) AS q
+    FROM f_inbound_check_destinations d
+    JOIN f_inbound_check_line_state s ON s.destination_id = d.id AND s.batch_id = ?
+    WHERE d.destination = 'iroha' AND d.cancelled_at IS NULL`).get(batch.id);
+  // 業務日が変わったのに当日の取込がまだ来ていない = 前日の一覧。数量操作は受け付けない
+  const dayStale = !!(batch.work_date && batch.work_date !== workDateJst());
+  return {
+    batch, slips, lines, day_stale: dayStale,
+    totals: { lines: lines.length, checked, partial, undecided, toIroha: ir ? ir.c : 0, toIrohaQty: ir ? Number(ir.q) : 0 },
+  };
 }
 
 // ─────────────────── 行き先 (いろは / B-Faith) の判定 ───────────────────
@@ -744,66 +916,6 @@ export function setExpiryManaged(codeKey, managed, actor) {
 
 // ───────────────────────── 消し込み ─────────────────────────
 
-function currentState(db, batchId, lineKey) {
-  return db.prepare('SELECT * FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = ?').get(batchId, lineKey) || null;
-}
-
-/**
- * 1タップ確認 / 取消。
- * @returns {ok:true, state} | {ok:false, error:'stale_batch'|'not_found'|'conflict'|'bad_request', current?}
- */
-export function applyCheck({ batchId, lineKey, action, expectVersion, worker, staffId = null, deviceId = null, deviceLabel = null, destination = null, decidedFrom = null, expiryDate = null }) {
-  if (!['check', 'uncheck'].includes(action)) return { ok: false, error: 'bad_request', message: 'action が不正です' };
-  const bid = Number(batchId);
-  if (!Number.isInteger(bid) || !lineKey) return { ok: false, error: 'bad_request', message: 'batch_id / line_key が不正です' };
-  // version は必須 (省略を許すと条件が無効化され「画面が見ていた状態」の検証にならない — Codex R3 High)
-  if (!Number.isSafeInteger(expectVersion) || expectVersion < 1) return { ok: false, error: 'bad_request', message: 'expect_version (正の整数) が必要です' };
-  const w = String(worker || '').trim();
-  if (!w) return { ok: false, error: 'bad_request', message: '作業者を選んでください' };
-  const db = getDB();
-  const tx = db.transaction(() => {
-    const active = getActiveBatch();
-    if (!active || active.id !== bid) return { ok: false, error: 'stale_batch', message: '一覧が更新されました。最新の一覧を読み込み直してください', activeBatchId: active ? active.id : null };
-    const line = db.prepare('SELECT ar_no, product_id, product_name, planned_qty FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(bid, lineKey);
-    if (!line) return { ok: false, error: 'not_found', message: '明細が見つかりません' };
-    const now = utcNow();
-    let res;
-    if (action === 'check') {
-      res = db.prepare(`UPDATE f_inbound_check_line_state
-        SET status = 'checked', version = version + 1, checked_by = ?, checked_device = ?, checked_at = ?
-        WHERE batch_id = ? AND line_key = ? AND status = 'unchecked' AND version = ?`)
-        .run(w, deviceLabel, now, bid, lineKey, expectVersion);
-    } else {
-      res = db.prepare(`UPDATE f_inbound_check_line_state
-        SET status = 'unchecked', version = version + 1, checked_by = NULL, checked_device = NULL, checked_at = NULL
-        WHERE batch_id = ? AND line_key = ? AND status = 'checked' AND version = ?`)
-        .run(bid, lineKey, expectVersion);
-    }
-    if (res.changes === 0) {
-      return { ok: false, error: 'conflict', message: '他の端末で先に更新されました', current: currentState(db, bid, lineKey) };
-    }
-    let reverted = null;
-    if (action === 'uncheck') {
-      const last = db.prepare(`SELECT id FROM f_inbound_check_events WHERE batch_id = ? AND line_key = ? AND action = 'check' ORDER BY id DESC LIMIT 1`).get(bid, lineKey);
-      reverted = last ? last.id : null;
-    }
-    db.prepare(`INSERT INTO f_inbound_check_events (batch_id, line_key, ar_no, action, worker, staff_id, device_id, device_label, created_at, reverted_event_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(bid, lineKey, line.ar_no, action, w, staffId, deviceId, deviceLabel, now, reverted);
-    // 行き先の台帳。確認したら1行足し、取り消したら消さずに cancelled を立てる (append-only)
-    if (action === 'check' && destination) {
-      db.prepare(`INSERT INTO f_inbound_check_destinations
-        (batch_id, line_key, ar_no, product_id, product_name, planned_qty, destination, decided_from, worker, staff_id, device_label, decided_at, expiry_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(bid, lineKey, line.ar_no, line.product_id, line.product_name, line.planned_qty, destination, decidedFrom || 'master', w, staffId, deviceLabel, now, expiryDate);
-    } else if (action === 'uncheck') {
-      db.prepare('UPDATE f_inbound_check_destinations SET cancelled_at = ?, cancelled_by = ? WHERE batch_id = ? AND line_key = ? AND cancelled_at IS NULL')
-        .run(now, w, bid, lineKey);
-    }
-    return { ok: true, state: currentState(db, bid, lineKey) };
-  });
-  return tx.immediate();
-}
-
 // ─────────────────── 行き先の台帳 (いろはへ送った実績) ───────────────────
 
 /**
@@ -836,6 +948,374 @@ export function destinationsCsv(opts = {}) {
     r.planned_qty, r.expiry_date, r.decided_from === 'chosen' ? 'その場で選択' : '入庫情報どおり', r.worker, r.device_label, r.cancelled_at,
   ].map(esc).join(','));
   return '\ufeff' + [head.map(esc).join(','), ...body].join('\r\n') + '\r\n';
+}
+
+// ───────────────────────── 数量 (部分確認) ─────────────────────────
+//
+// 要件定義 v1.3 §11。設計の要点:
+//  - **partial は DB の状態にしない**。status は unchecked / checked の2値のまま持ち、
+//    「一部」は status='unchecked' かつ found_qty>0 から導出する (CHECK 制約の作り替えを避ける)
+//  - **数量は加算イベントの合計**。絶対値の上書きは禁止 (A の 11箱と B の 3箱 が競合して片方消える)
+//  - **論理キーは (work_date, line_key, code_key)**。同日中は何度取り込んでも数が残り、翌日は 0 から
+//  - 打ち消し・訂正は行を消さず reversal を積む。訂正 = reversal + 新 add (replaces_event_seq で元を指す)
+
+/** 見つけた数 = 加算 − 打ち消し。行が1件も無ければ 0 */
+export function quantitySum(db, workDate, lineKey, codeKey) {
+  const r = db.prepare(`SELECT COALESCE(SUM(CASE action WHEN 'add' THEN quantity ELSE -quantity END), 0) AS q
+    FROM f_inbound_check_quantity_events WHERE work_date = ? AND line_key = ? AND code_key = ?`)
+    .get(workDate, lineKey, codeKey);
+  return r ? Number(r.q) : 0;
+}
+
+/** 予定数との関係。画面のボタンと文言はこれで決まる */
+export function quantityRelation(found, planned) {
+  if (found < planned) return 'shortage';
+  if (found > planned) return 'excess';
+  return 'exact';
+}
+
+export const QTY_INPUT_KINDS = ['box', 'loose', 'fill_remaining', 'correction'];
+const MAX_EVENTS_PER_REQUEST = 10;   // 通常1件。訂正 (reversal + add) で2件。それ以上は誤用
+
+/** 呼び出し側に 4xx/409 を返させるための中断 (トランザクションを確実に巻き戻す) */
+class Abort extends Error {
+  constructor(result) { super(result.error || 'abort'); this.result = result; }
+}
+
+const isId = v => typeof v === 'string' && v.length >= 8 && v.length <= 64 && /^[A-Za-z0-9:_.-]+$/.test(v);
+const posInt = v => Number.isSafeInteger(v) && v > 0;
+
+/** 数量操作の共通ガード。active バッチ・業務日・行の存在・確定済みかどうかを見る */
+function loadForQuantity(db, batchId, lineKey) {
+  const active = getActiveBatch();
+  if (!active || active.id !== Number(batchId)) {
+    return { error: { ok: false, error: 'stale_batch', message: '一覧が更新されました。最新の一覧を読み込み直してください', activeBatchId: active ? active.id : null } };
+  }
+  // ⚠日付が変わったら昨日の一覧には数を足させない (今日の荷物が昨日の行に混ざる)
+  const today = workDateJst();
+  if (active.work_date && active.work_date !== today) {
+    return { error: { ok: false, error: 'stale_work_date', message: '本日の入荷一覧を待っています (前日の一覧には記録できません)', workDate: active.work_date } };
+  }
+  const line = db.prepare('SELECT * FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(active.id, lineKey);
+  if (!line) return { error: { ok: false, error: 'not_found', message: '明細が見つかりません' } };
+  const state = db.prepare('SELECT * FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = ?').get(active.id, lineKey);
+  if (!state) return { error: { ok: false, error: 'not_found', message: '明細の状態が見つかりません' } };
+  return { active, line, state, workDate: active.work_date || today };
+}
+
+function quantityState(db, batchId, lineKey) {
+  const s = db.prepare(`SELECT status, version, found_qty, quantity_version, finalized_result, current_pack_qty, checked_by, checked_at
+    FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = ?`).get(batchId, lineKey);
+  return s || null;
+}
+
+/**
+ * 数を足す / 打ち消す / 訂正する。**1タップ1イベント**で記録する。
+ *
+ * @param {object} o
+ *   events[] = { client_event_id, action:'add'|'reversal', quantity, input_kind, unit_size?,
+ *                reverses_event_seq?, replaces_event_seq?, client_occurred_at? }
+ * @returns {ok:true, state, accepted, replayed} | {ok:false, error, ...}
+ *   error: stale_batch | stale_work_date | not_found | finalized | conflict |
+ *          bad_request | already_reversed | idempotency_conflict | negative_total
+ */
+export function applyQuantityEvents({ batchId, lineKey, expectQuantityVersion, events, packQty = null,
+  worker, staffId = null, deviceId = null, deviceLabel = null }) {
+  const w = String(worker || '').trim();
+  if (!w) return { ok: false, error: 'bad_request', message: '作業者を選んでください' };
+  if (!Array.isArray(events) || events.length === 0 || events.length > MAX_EVENTS_PER_REQUEST) {
+    return { ok: false, error: 'bad_request', message: '数量の指定がありません' };
+  }
+  if (!Number.isSafeInteger(expectQuantityVersion) || expectQuantityVersion < 1) {
+    return { ok: false, error: 'bad_request', message: 'expect_quantity_version (正の整数) が必要です' };
+  }
+  for (const e of events) {
+    if (!e || typeof e !== 'object') return { ok: false, error: 'bad_request', message: 'イベントの形式が不正です' };
+    if (!isId(e.client_event_id)) return { ok: false, error: 'bad_request', message: 'client_event_id が不正です' };
+    if (e.action !== 'add' && e.action !== 'reversal') return { ok: false, error: 'bad_request', message: 'action が不正です' };
+    if (!posInt(e.quantity) || e.quantity > 1_000_000) return { ok: false, error: 'bad_request', message: '数量は1以上の整数で指定してください' };
+    if (!QTY_INPUT_KINDS.includes(e.input_kind)) return { ok: false, error: 'bad_request', message: 'input_kind が不正です' };
+    if (e.unit_size != null && !posInt(e.unit_size)) return { ok: false, error: 'bad_request', message: '入数は1以上の整数で指定してください' };
+    if (e.action === 'reversal' && !posInt(e.reverses_event_seq)) return { ok: false, error: 'bad_request', message: '打ち消す対象がありません' };
+  }
+  const db = getDB();
+  const tx = db.transaction(() => {
+    const g = loadForQuantity(db, batchId, lineKey);
+    if (g.error) throw new Abort(g.error);
+    const { active, line, state, workDate } = g;
+    // 確定済みの行は数量を動かせない。直すなら先に「やり直す」
+    if (state.status === 'checked') {
+      throw new Abort({ ok: false, error: 'finalized', message: '確認済みです。数を直すには先に「やり直す」を押してください', current: quantityState(db, active.id, lineKey) });
+    }
+
+    // ── 冪等: 同じ client_event_id は1回だけ計上する ──
+    //    (コミット直後に応答だけ失われたときの押し直しで二重加算しないため)
+    const seen = db.prepare('SELECT * FROM f_inbound_check_quantity_events WHERE client_event_id = ?');
+    const fresh = [];
+    for (const e of events) {
+      const prev = seen.get(e.client_event_id);
+      if (!prev) { fresh.push(e); continue; }
+      const same = prev.line_key === line.line_key && prev.code_key === line.code_key
+        && prev.action === e.action && prev.quantity === e.quantity && prev.input_kind === e.input_kind;
+      if (!same) {
+        throw new Abort({ ok: false, error: 'idempotency_conflict', message: '同じ操作IDで違う内容が送られました (画面を読み込み直してください)' });
+      }
+    }
+    if (fresh.length === 0) {
+      // 全部再生だった = 前回の送信は成功していた。version は上げない
+      return { ok: true, replayed: true, accepted: [], state: quantityState(db, active.id, lineKey) };
+    }
+    // 再生が混ざったまま version 照合すると、成功済みの分だけ version が進んでいて必ず conflict になる。
+    // 「新しいイベントがある」ときだけ version を見る
+    if (state.quantity_version !== expectQuantityVersion) {
+      throw new Abort({ ok: false, error: 'conflict', message: '他の端末で先に数が入りました。最新の数を表示します', current: quantityState(db, active.id, lineKey) });
+    }
+
+    const ins = db.prepare(`INSERT INTO f_inbound_check_quantity_events
+      (client_event_id, work_date, batch_id, line_key, code_key, ar_no, product_id, action, quantity, input_kind,
+       unit_size, reverses_event_seq, replaces_event_seq, worker, staff_id, device_id, device_label, client_occurred_at, received_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const now = utcNow();
+    const accepted = [];
+    for (const e of fresh) {
+      let reverses = null, replaces = null;
+      if (e.action === 'reversal') {
+        const target = db.prepare('SELECT * FROM f_inbound_check_quantity_events WHERE event_seq = ?').get(e.reverses_event_seq);
+        if (!target || target.work_date !== workDate || target.line_key !== line.line_key || target.code_key !== line.code_key) {
+          throw new Abort({ ok: false, error: 'not_found', message: '打ち消す対象の記録が見つかりません' });
+        }
+        if (target.action !== 'add') throw new Abort({ ok: false, error: 'bad_request', message: '打ち消せるのは加算だけです' });
+        if (target.quantity !== e.quantity) throw new Abort({ ok: false, error: 'bad_request', message: '打ち消す数が元の記録と一致しません' });
+        const already = db.prepare('SELECT 1 FROM f_inbound_check_quantity_events WHERE reverses_event_seq = ?').get(e.reverses_event_seq);
+        if (already) throw new Abort({ ok: false, error: 'already_reversed', message: 'その記録は既に打ち消されています' });
+        reverses = e.reverses_event_seq;
+      } else if (e.replaces_event_seq != null) {
+        // 訂正の後半 (新しい入数での add)。同じリクエスト内の reversal が指す先と一致すること
+        if (!posInt(e.replaces_event_seq)) throw new Abort({ ok: false, error: 'bad_request', message: 'replaces_event_seq が不正です' });
+        const ok = events.some(x => x.action === 'reversal' && x.reverses_event_seq === e.replaces_event_seq);
+        if (!ok) throw new Abort({ ok: false, error: 'bad_request', message: '訂正は打ち消しと同時に送ってください' });
+        replaces = e.replaces_event_seq;
+      }
+      const info = ins.run(e.client_event_id, workDate, active.id, line.line_key, line.code_key, line.ar_no, line.product_id,
+        e.action, e.quantity, e.input_kind, e.unit_size ?? null, reverses, replaces,
+        w, staffId, deviceId, deviceLabel, e.client_occurred_at ? String(e.client_occurred_at).slice(0, 40) : null, now);
+      accepted.push({ client_event_id: e.client_event_id, event_seq: Number(info.lastInsertRowid) });
+    }
+
+    const found = quantitySum(db, workDate, line.line_key, line.code_key);
+    if (found < 0) throw new Abort({ ok: false, error: 'negative_total', message: '打ち消しが多すぎます (合計が0未満になります)' });
+    db.prepare(`UPDATE f_inbound_check_line_state
+      SET found_qty = ?, quantity_version = quantity_version + 1, quantity_work_date = ?,
+          current_pack_qty = COALESCE(?, current_pack_qty)
+      WHERE batch_id = ? AND line_key = ?`)
+      .run(found, workDate, posInt(packQty) ? packQty : null, active.id, line.line_key);
+    return { ok: true, replayed: false, accepted, state: quantityState(db, active.id, lineKey) };
+  });
+  try {
+    return tx.immediate();
+  } catch (e) {
+    if (e instanceof Abort) return e.result;
+    // 打ち消しの一意制約 (同時に同じ加算を打ち消した) は 409 に正規化する
+    if (/UNIQUE constraint failed: f_inbound_check_quantity_events\.reverses_event_seq/.test(e.message)) {
+      return { ok: false, error: 'already_reversed', message: 'その記録は既に打ち消されています' };
+    }
+    if (/UNIQUE constraint failed: f_inbound_check_quantity_events\.client_event_id/.test(e.message)) {
+      return { ok: false, error: 'idempotency_conflict', message: '同じ操作IDが同時に送られました (画面を読み込み直してください)' };
+    }
+    throw e;
+  }
+}
+
+/** その行の数量イベント (訂正パネル用)。打ち消し済みの加算には reversed=1 を立てる */
+export function listQuantityEvents(batchId, lineKey) {
+  const db = getDB();
+  const line = db.prepare('SELECT line_key, code_key FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(Number(batchId), String(lineKey || ''));
+  if (!line) return [];
+  const batch = getBatch(batchId);
+  if (!batch) return [];
+  const workDate = batch.work_date || workDateJst();
+  return db.prepare(`SELECT e.event_seq, e.action, e.quantity, e.input_kind, e.unit_size, e.worker,
+      e.replaces_event_seq, e.reverses_event_seq, e.received_at,
+      EXISTS (SELECT 1 FROM f_inbound_check_quantity_events r WHERE r.reverses_event_seq = e.event_seq) AS reversed
+    FROM f_inbound_check_quantity_events e
+    WHERE e.work_date = ? AND e.line_key = ? AND e.code_key = ? ORDER BY e.event_seq`)
+    .all(workDate, line.line_key, line.code_key);
+}
+
+/**
+ * 確定 (finalize)。「全部あり」「残りも全部あり」「不足で確定」「超過で確定」の全部がここを通る。
+ *
+ * ⭐**入庫情報の書き戻しも同じトランザクションに入れる**。現行実装は router 側で先に
+ *   マスタを書いてから確認を実行していたので、**確認が 409 で失敗したのにマスタだけ変わる**
+ *   ことがあった (Codex 指摘)。decide は「検証 + 書き戻し」を行うコールバックで、
+ *   ここで失敗したらイベントも状態もマスタも丸ごと巻き戻る。
+ *
+ * @param {object} o
+ *   result   'exact' | 'shortage' | 'excess'  … 確定後の found と予定数の関係。人が選んだ意味
+ *   mode     'current'        … 今の found_qty で確定
+ *            'fill_remaining' … 残り (planned - found) を1イベント足してから exact 確定
+ *   fillEvent { client_event_id, client_occurred_at? }  … mode='fill_remaining' のとき必須
+ *   decide(line, foundQty) → {ok:true, destination, decidedFrom, expiryDate, warning} | {ok:false, ...}
+ */
+export function finalizeLine({ batchId, lineKey, expectVersion, expectQuantityVersion, result, mode = 'current',
+  fillEvent = null, clientOperationId = null, worker, staffId = null, deviceId = null, deviceLabel = null, decide = null }) {
+  const w = String(worker || '').trim();
+  if (!w) return { ok: false, error: 'bad_request', message: '作業者を選んでください' };
+  if (!['exact', 'shortage', 'excess'].includes(result)) return { ok: false, error: 'bad_request', message: 'result が不正です' };
+  if (!['current', 'fill_remaining'].includes(mode)) return { ok: false, error: 'bad_request', message: 'mode が不正です' };
+  if (!Number.isSafeInteger(expectVersion) || expectVersion < 1) return { ok: false, error: 'bad_request', message: 'expect_version (正の整数) が必要です' };
+  if (!Number.isSafeInteger(expectQuantityVersion) || expectQuantityVersion < 1) return { ok: false, error: 'bad_request', message: 'expect_quantity_version (正の整数) が必要です' };
+  if (mode === 'fill_remaining' && (!fillEvent || !isId(fillEvent.client_event_id))) {
+    return { ok: false, error: 'bad_request', message: '不足分を足すための client_event_id が必要です' };
+  }
+  if (clientOperationId != null && !isId(clientOperationId)) return { ok: false, error: 'bad_request', message: 'client_operation_id が不正です' };
+
+  const db = getDB();
+  const tx = db.transaction(() => {
+    // 再送 (応答だけ失われた) は、同じ操作IDなら何もせず現在状態を返す
+    if (clientOperationId) {
+      const done = db.prepare('SELECT batch_id, line_key FROM f_inbound_check_events WHERE client_operation_id = ?').get(clientOperationId);
+      if (done) return { ok: true, replayed: true, state: quantityState(db, done.batch_id, done.line_key) };
+    }
+    const g = loadForQuantity(db, batchId, lineKey);
+    if (g.error) throw new Abort(g.error);
+    const { active, line, state, workDate } = g;
+    if (state.status === 'checked') {
+      throw new Abort({ ok: false, error: 'finalized', message: '既に確認済みです', current: quantityState(db, active.id, lineKey) });
+    }
+    if (state.version !== expectVersion || state.quantity_version !== expectQuantityVersion) {
+      throw new Abort({ ok: false, error: 'conflict', message: '他の端末で先に更新されました。最新の状態を表示します', current: quantityState(db, active.id, lineKey) });
+    }
+
+    let found = quantitySum(db, workDate, line.line_key, line.code_key);
+    if (mode === 'fill_remaining') {
+      const rest = line.planned_qty - found;
+      if (rest <= 0) throw new Abort({ ok: false, error: 'result_mismatch', message: '不足はありません (すでに予定数に達しています)', current: quantityState(db, active.id, lineKey) });
+      db.prepare(`INSERT INTO f_inbound_check_quantity_events
+        (client_event_id, work_date, batch_id, line_key, code_key, ar_no, product_id, action, quantity, input_kind,
+         worker, staff_id, device_id, device_label, client_occurred_at, received_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'add', ?, 'fill_remaining', ?, ?, ?, ?, ?, ?)`)
+        .run(fillEvent.client_event_id, workDate, active.id, line.line_key, line.code_key, line.ar_no, line.product_id,
+          rest, w, staffId, deviceId, deviceLabel,
+          fillEvent.client_occurred_at ? String(fillEvent.client_occurred_at).slice(0, 40) : null, utcNow());
+      found = quantitySum(db, workDate, line.line_key, line.code_key);
+    }
+    // 人が選んだ意味と、実際の数が食い違ったまま確定させない
+    if (quantityRelation(found, line.planned_qty) !== result) {
+      throw new Abort({ ok: false, error: 'result_mismatch',
+        message: `数が変わっています (${found} / 予定 ${line.planned_qty})。もう一度確認してください`,
+        current: { ...quantityState(db, active.id, lineKey), found_qty: found } });
+    }
+
+    // 行き先・BCシール・入数・有効期限。**ここで失敗したらマスタへの書き戻しごと巻き戻る**
+    let decided = { destination: null, decidedFrom: null, expiryDate: null, warning: null };
+    if (decide) {
+      const d = decide(line, found);
+      if (!d || !d.ok) throw new Abort(d && d.abort ? d.abort : { ok: false, error: 'destination_required', message: '行き先を決めてください' });
+      decided = d;
+    }
+
+    const now = utcNow();
+    // 残りを足して確定した場合は数量も動いたので quantity_version も進める
+    const upd = db.prepare(`UPDATE f_inbound_check_line_state
+      SET status = 'checked', version = version + 1, quantity_version = quantity_version + ?, found_qty = ?, finalized_result = ?,
+          checked_by = ?, checked_device = ?, checked_at = ?
+      WHERE batch_id = ? AND line_key = ? AND status = 'unchecked' AND version = ?`)
+      .run(mode === 'fill_remaining' ? 1 : 0, found, result, w, deviceLabel, now, active.id, line.line_key, expectVersion);
+    if (upd.changes === 0) {
+      throw new Abort({ ok: false, error: 'conflict', message: '他の端末で先に更新されました', current: quantityState(db, active.id, lineKey) });
+    }
+    let destinationId = null;
+    if (decided.destination) {
+      const di = db.prepare(`INSERT INTO f_inbound_check_destinations
+        (batch_id, line_key, ar_no, product_id, product_name, planned_qty, destination, decided_from, worker, staff_id,
+         device_label, decided_at, expiry_date, work_date, code_key, actual_qty)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(active.id, line.line_key, line.ar_no, line.product_id, line.product_name, line.planned_qty,
+          decided.destination, decided.decidedFrom || 'master', w, staffId, deviceLabel, now,
+          decided.expiryDate || null, workDate, line.code_key, found);
+      destinationId = Number(di.lastInsertRowid);
+      db.prepare('UPDATE f_inbound_check_line_state SET destination_id = ? WHERE batch_id = ? AND line_key = ?')
+        .run(destinationId, active.id, line.line_key);
+    }
+    db.prepare(`INSERT INTO f_inbound_check_events
+      (batch_id, line_key, ar_no, action, worker, staff_id, device_id, device_label, created_at,
+       client_operation_id, result, found_qty, planned_qty_snapshot, quantity_version, destination_id, client_occurred_at)
+      VALUES (?, ?, ?, 'check', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(active.id, line.line_key, line.ar_no, w, staffId, deviceId, deviceLabel, now,
+        clientOperationId, result, found, line.planned_qty, state.quantity_version, destinationId, null);
+    return { ok: true, replayed: false, state: quantityState(db, active.id, lineKey), warning: decided.warning || null };
+  });
+  try {
+    return tx.immediate();
+  } catch (e) {
+    if (e instanceof Abort) return e.result;
+    if (/UNIQUE constraint failed: f_inbound_check_events\.client_operation_id/.test(e.message)) {
+      return { ok: false, error: 'idempotency_conflict', message: '同じ操作が同時に送られました (画面を読み込み直してください)' };
+    }
+    throw e;
+  }
+}
+
+/**
+ * やり直す (reopen)。確認を解除するだけで **数えた数は残す**。
+ * 数量記録まで消したいときは打ち消しイベントを積む (別導線)。
+ */
+export function reopenLine({ batchId, lineKey, expectVersion, expectQuantityVersion, clientOperationId = null,
+  worker, staffId = null, deviceId = null, deviceLabel = null }) {
+  const w = String(worker || '').trim();
+  if (!w) return { ok: false, error: 'bad_request', message: '作業者を選んでください' };
+  if (!Number.isSafeInteger(expectVersion) || expectVersion < 1) return { ok: false, error: 'bad_request', message: 'expect_version (正の整数) が必要です' };
+  if (clientOperationId != null && !isId(clientOperationId)) return { ok: false, error: 'bad_request', message: 'client_operation_id が不正です' };
+  const db = getDB();
+  const tx = db.transaction(() => {
+    if (clientOperationId) {
+      const done = db.prepare('SELECT batch_id, line_key FROM f_inbound_check_events WHERE client_operation_id = ?').get(clientOperationId);
+      if (done) return { ok: true, replayed: true, state: quantityState(db, done.batch_id, done.line_key) };
+    }
+    const g = loadForQuantity(db, batchId, lineKey);
+    if (g.error) throw new Abort(g.error);
+    const { active, line, state } = g;
+    if (state.status !== 'checked') {
+      throw new Abort({ ok: false, error: 'conflict', message: 'この行は確認済みではありません', current: quantityState(db, active.id, lineKey) });
+    }
+    if (expectQuantityVersion != null && state.quantity_version !== expectQuantityVersion) {
+      throw new Abort({ ok: false, error: 'conflict', message: '他の端末で先に更新されました', current: quantityState(db, active.id, lineKey) });
+    }
+    const now = utcNow();
+    const upd = db.prepare(`UPDATE f_inbound_check_line_state
+      SET status = 'unchecked', version = version + 1, finalized_result = NULL, destination_id = NULL,
+          checked_by = NULL, checked_device = NULL, checked_at = NULL
+      WHERE batch_id = ? AND line_key = ? AND status = 'checked' AND version = ?`)
+      .run(active.id, line.line_key, expectVersion);
+    if (upd.changes === 0) {
+      throw new Abort({ ok: false, error: 'conflict', message: '他の端末で先に更新されました', current: quantityState(db, active.id, lineKey) });
+    }
+    // ⭐取り消すのは「この確認で作った1行」だけ。line_key 全体を消すと、同日に引き継いだ
+    //   前の確認の実績まで巻き添えで消える
+    if (state.destination_id) {
+      db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = ?, cancelled_by = ?, cancel_reason = 'reopen' WHERE id = ? AND cancelled_at IS NULL")
+        .run(now, w, state.destination_id);
+    }
+    const last = db.prepare("SELECT id FROM f_inbound_check_events WHERE batch_id = ? AND line_key = ? AND action = 'check' ORDER BY id DESC LIMIT 1")
+      .get(active.id, line.line_key);
+    db.prepare(`INSERT INTO f_inbound_check_events
+      (batch_id, line_key, ar_no, action, worker, staff_id, device_id, device_label, created_at, reverted_event_id,
+       client_operation_id, found_qty, planned_qty_snapshot, quantity_version, destination_id)
+      VALUES (?, ?, ?, 'uncheck', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(active.id, line.line_key, line.ar_no, w, staffId, deviceId, deviceLabel, now, last ? last.id : null,
+        clientOperationId, state.found_qty, line.planned_qty, state.quantity_version, state.destination_id || null);
+    return { ok: true, replayed: false, state: quantityState(db, active.id, lineKey) };
+  });
+  try {
+    return tx.immediate();
+  } catch (e) {
+    if (e instanceof Abort) return e.result;
+    if (/UNIQUE constraint failed: f_inbound_check_events\.client_operation_id/.test(e.message)) {
+      return { ok: false, error: 'idempotency_conflict', message: '同じ操作が同時に送られました' };
+    }
+    throw e;
+  }
 }
 
 // ───────────────────────── 履歴 ─────────────────────────
