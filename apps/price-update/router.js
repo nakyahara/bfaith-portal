@@ -568,10 +568,21 @@ router.post('/api/runs/:runId/recovery', async (req, res) => {
       return res.status(409).json({ ok: false, error: created.code.toLowerCase(), runId: created.runId, message });
     }
     const runId = created.runId;
+    // ★戻せなかった行は必ず記録に残す。残さないと「全部戻した」と読めてしまう (Codex R2)
+    const leftovers = [
+      ...unmatched.map((u) => ({ operationId: u.op.operation_id, neCode: u.op.ne_code, mall: u.op.mall,
+        listingCode: u.op.listing_code, skuCode: u.op.sku_code, reason: u.reason, kind: 'unmatched' })),
+    ];
+    if (leftovers.length > 0) {
+      appendEvent(db, runId, {
+        actor: actorOf(req), event: 'recovery_incomplete',
+        detail: { sourceRunId: source.run_id, notRestored: leftovers },
+      });
+    }
     // 元の run 側にも「復旧 run を作った」ことを残す (追記のみ)
     appendEvent(db, source.run_id, {
       actor: actorOf(req), event: 'recovery_created',
-      detail: { recoveryRunId: runId, rows: operations.length },
+      detail: { recoveryRunId: runId, rows: operations.length, notRestored: leftovers.length },
     });
     res.json({
       ok: true, runId, rows: operations.length,

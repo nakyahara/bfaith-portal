@@ -40,6 +40,12 @@
   .kind-recovery { background: #ede9fe; color: #5b21b6; }
 </style>
 <%
+  // 復旧 run で戻せなかった行 (作成時に引き当て直せなかった行)。追記イベントから読む
+  var notRestored = [];
+  (run.events || []).forEach(function (e) {
+    if (e.event !== 'recovery_incomplete' || !e.detail_json) return;
+    try { notRestored = notRestored.concat(JSON.parse(e.detail_json).notRestored || []); } catch (err) { /* 壊れた記録は無視 */ }
+  });
   var STATE_LABEL = {
     previewed: '記録のみ', blocked_preview: 'ガードで停止',
     manual_required: '手動更新まち', manual_done: '手動更新済み',
@@ -73,6 +79,28 @@
     </div>
     <% if (run.note) { %><div style="margin-top:6px;"><%= run.note %></div><% } %>
   </div>
+
+  <% if (notRestored.length > 0) { %>
+    <div class="card">
+      <div class="exec-box">
+        <h3>⚠️ 戻せなかった行が <%= notRestored.length %> 行あります</h3>
+        <div class="pu-note">この復旧では下の行を戻せていません。モールの画面で実際の価格を確認してください。</div>
+        <table class="pu" style="margin-top:6px;">
+          <thead><tr><th>モール</th><th>NEコード</th><th>出品コード / SKU</th><th>理由</th></tr></thead>
+          <tbody>
+            <% notRestored.forEach(function (x) { %>
+              <tr>
+                <td><span class="mall m-<%= x.mall %>"><%= x.mall %></span></td>
+                <td class="code"><%= x.neCode %></td>
+                <td class="code"><%= x.listingCode || '' %><% if (x.skuCode) { %> / <%= x.skuCode %><% } %></td>
+                <td class="pu-note"><%= x.reason %></td>
+              </tr>
+            <% }); %>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  <% } %>
 
   <div class="card">
     <div class="exec-box" id="exec-box">
@@ -348,8 +376,18 @@
           }
           throw new Error(json.message || json.error || ('HTTP ' + res.status));
         }
+        const missed = json.unmatched || [];
+        const link = '/apps/price-update/runs/' + encodeURIComponent(json.runId);
+        if (missed.length > 0) {
+          // ★戻せなかった行があるまま黙って移動しない。何が戻らないのかをここで見せる
+          $('rec-result').innerHTML = '作りました (' + n(json.rows) + ' 行)。'
+            + '<span style="color:#991b1b;">ただし ' + missed.length + ' 行は戻せません:</span><ul style="margin:6px 0 0 18px;">'
+            + missed.map((m) => '<li>' + esc(m.neCode) + ' — ' + esc(m.reason) + '</li>').join('')
+            + '</ul><a href="' + link + '">作った履歴を開く</a>';
+          return;
+        }
         $('rec-result').innerHTML = '作りました (' + n(json.rows) + ' 行)。移動します…';
-        location.href = '/apps/price-update/runs/' + encodeURIComponent(json.runId);
+        location.href = link;
       } catch (e) {
         $('rec-result').innerHTML = '<span style="color:#991b1b;">エラー: ' + esc(e.message) + '</span>';
         $('rec-btn').disabled = false;
