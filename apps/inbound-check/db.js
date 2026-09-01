@@ -19,6 +19,16 @@ import { parseInboundCsv } from './csv.js';
 const utcNow = () => new Date().toISOString();
 const hashToken = t => crypto.createHash('sha256').update(String(t)).digest('hex');
 
+/**
+ * 登録コード専用のハッシュ。6桁 = 100万通りしかないので、単純な sha256 だと
+ * DB が漏れた時点で総当たりで逆算できてしまう。サーバー秘密鍵で HMAC して、
+ * DB だけでは復元できないようにする (秘密鍵が変われば既存コードは無効 = 10分で失効するので実害なし)。
+ */
+function enrollHash(code) {
+  const secret = process.env.SESSION_SECRET || process.env.STAFF_EXPORT_TOKEN || 'inbound-check-enroll';
+  return crypto.createHmac('sha256', secret).update(String(code)).digest('hex');
+}
+
 export const BATCH_SOURCES = ['auto', 'drive_retry', 'manual_upload'];
 export const RETENTION_DAYS = 365;      // events / batches / line_state
 export const LOG_RETENTION_DAYS = 90;   // 取込ログ (失敗理由)
@@ -135,6 +145,16 @@ export function createTables(db = getMirrorDB()) {
       attempts   INTEGER NOT NULL DEFAULT 0
     );
 
+    -- 登録コードの引き換え試行 (総当たり対策のレート制限に使う)。
+    -- ⚠ここに記録するのは「試したこと」だけで、入力されたコードは保存しない
+    CREATE TABLE IF NOT EXISTS f_inbound_check_enroll_attempts (
+      id   INTEGER PRIMARY KEY AUTOINCREMENT,
+      ip   TEXT,
+      at   TEXT NOT NULL,
+      ok   INTEGER NOT NULL CHECK (ok IN (0,1))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ic_enroll_attempts ON f_inbound_check_enroll_attempts(at);
+
     CREATE TABLE IF NOT EXISTS f_inbound_check_devices (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
       token_hash   TEXT NOT NULL UNIQUE,
@@ -194,17 +214,19 @@ export function createEnrollCode(label, actor) {
   if (!l || l.length > 40) throw new Error('端末名は1〜40文字');
   const db = getDB();
   // 紛らわしい 0/O・1/I を避けるため数字のみ 6 桁。crypto で偏りなく引く
-  let code;
-  for (let i = 0; ; i++) {
-    code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-    const dup = db.prepare('SELECT 1 FROM f_inbound_check_enroll_codes WHERE code_hash = ? AND used_at IS NULL AND expires_at > ?').get(hashToken(code), utcNow());
-    if (!dup) break;
-    if (i > 20) throw new Error('登録コードを発行できませんでした (再試行してください)');
-  }
   const now = new Date();
-  db.prepare(`INSERT INTO f_inbound_check_enroll_codes (code_hash, label, created_by, created_at, expires_at)
-    VALUES (?, ?, ?, ?, ?)`)
-    .run(hashToken(code), l, actor, now.toISOString(), new Date(now.getTime() + ENROLL_TTL_MS).toISOString());
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  db.transaction(() => {
+    // ⭐有効なコードは常に1つだけにする (総当たりの当たり確率を 100万分の1 に抑える)。
+    //   2台続けて登録するときは、1台目が終わってから次を発行する運用
+    // 期限は「1秒前」にする。同じミリ秒だと expires_at < now が成り立たず期限切れと見なされない
+    const revokedAt = new Date(now.getTime() - 1000).toISOString();
+    db.prepare("UPDATE f_inbound_check_enroll_codes SET expires_at = ? WHERE used_at IS NULL AND expires_at > ?")
+      .run(revokedAt, now.toISOString());
+    db.prepare(`INSERT INTO f_inbound_check_enroll_codes (code_hash, label, created_by, created_at, expires_at)
+      VALUES (?, ?, ?, ?, ?)`)
+      .run(enrollHash(code), l, actor, now.toISOString(), new Date(now.getTime() + ENROLL_TTL_MS).toISOString());
+  }).immediate();
   return { code, label: l, expiresAt: new Date(now.getTime() + ENROLL_TTL_MS).toISOString() };
 }
 
@@ -217,7 +239,7 @@ export function redeemEnrollCode(code) {
   if (!/^\d{6}$/.test(c)) return { ok: false, error: 'bad_code', message: '6桁の数字を入力してください' };
   const db = getDB();
   return db.transaction(() => {
-    const row = db.prepare('SELECT * FROM f_inbound_check_enroll_codes WHERE code_hash = ?').get(hashToken(c));
+    const row = db.prepare('SELECT * FROM f_inbound_check_enroll_codes WHERE code_hash = ?').get(enrollHash(c));
     if (!row) return { ok: false, error: 'bad_code', message: '登録コードが違います' };
     if (row.attempts >= ENROLL_MAX_ATTEMPTS) return { ok: false, error: 'too_many', message: 'このコードは無効です (発行し直してください)' };
     if (row.used_at) return { ok: false, error: 'used', message: 'この登録コードは使用済みです (発行し直してください)' };
@@ -228,11 +250,43 @@ export function redeemEnrollCode(code) {
   }).immediate();
 }
 
-/** 打ち間違いを数える (総当たり対策)。コードが存在しないときは何もしない */
+// レート制限 (総当たり対策)。6桁 = 100万通りなので、**存在しないコードの試行も数える**必要がある
+// (旧実装は実在する行しか数えず、総当たりに対して無力だった — セキュリティレビュー指摘)
+export const ENROLL_RATE_WINDOW_MS = 10 * 60 * 1000;  // 直近10分を見る
+export const ENROLL_RATE_PER_IP = 8;                  // 同じ相手からの失敗 8 回で打ち止め
+export const ENROLL_RATE_GLOBAL = 40;                 // 分散して来られた場合の全体上限
+
+/** 引き換えの試行を記録する (成功・失敗とも)。入力されたコード自体は保存しない */
+export function recordEnrollAttempt({ ip = null, ok = false } = {}) {
+  const db = getDB();
+  db.prepare('INSERT INTO f_inbound_check_enroll_attempts (ip, at, ok) VALUES (?, ?, ?)').run(ip ? String(ip).slice(0, 64) : null, utcNow(), ok ? 1 : 0);
+  // 古い記録は溜めない (レート制限に使うのは直近だけ)
+  db.prepare('DELETE FROM f_inbound_check_enroll_attempts WHERE at < ?').run(new Date(Date.now() - 24 * 3600 * 1000).toISOString());
+}
+
+/**
+ * 引き換えを受け付けてよいか。直近10分の**失敗**回数で判断する。
+ * @returns {allowed:true} | {allowed:false, error:'rate_limited', message}
+ */
+export function checkEnrollRate({ ip = null } = {}) {
+  const db = getDB();
+  const since = new Date(Date.now() - ENROLL_RATE_WINDOW_MS).toISOString();
+  const mine = ip ? db.prepare('SELECT COUNT(*) c FROM f_inbound_check_enroll_attempts WHERE ip = ? AND ok = 0 AND at > ?').get(String(ip).slice(0, 64), since).c : 0;
+  if (mine >= ENROLL_RATE_PER_IP) {
+    return { allowed: false, error: 'rate_limited', message: '試行が多すぎます。しばらく待ってから、管理者にコードを発行し直してもらってください' };
+  }
+  const all = db.prepare('SELECT COUNT(*) c FROM f_inbound_check_enroll_attempts WHERE ok = 0 AND at > ?').get(since).c;
+  if (all >= ENROLL_RATE_GLOBAL) {
+    return { allowed: false, error: 'rate_limited', message: '登録の受付を一時的に停止しています。しばらく待ってから、管理者にコードを発行し直してもらってください' };
+  }
+  return { allowed: true };
+}
+
+/** 打ち間違いを数える (そのコードが実在するときだけ。上限に達したらそのコードを無効化する) */
 export function countEnrollAttempt(code) {
   const c = String(code || '').trim();
   if (!/^\d{6}$/.test(c)) return;
-  getDB().prepare('UPDATE f_inbound_check_enroll_codes SET attempts = attempts + 1 WHERE code_hash = ?').run(hashToken(c));
+  getDB().prepare('UPDATE f_inbound_check_enroll_codes SET attempts = attempts + 1 WHERE code_hash = ?').run(enrollHash(c));
 }
 
 /** 発行済みで、まだ使えるコードの一覧 (画面表示用。コード自体は出さない) */

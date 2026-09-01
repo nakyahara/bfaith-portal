@@ -220,6 +220,23 @@ try {
     r2 = await req(IPAD2, `${APP}/enroll/redeem`, { method: 'POST', body: { code } });
     ok(r2.status === 400 && r2.json.error === 'used', '使用済みのコードは別端末でも使えない');
   }
+  console.log('\n[B3] 登録コードの総当たりは途中で止まる');
+  {
+    // ⚠6桁 = 100万通り。存在しないコードを順に試されても止まらないと、有効期限の10分でも十分に危ない
+    const ATTACK = jar();
+    let last = null, blockedAt = -1;
+    for (let i = 0; i < 12; i++) {
+      last = await req(ATTACK, `${APP}/enroll/redeem`, { method: 'POST', body: { code: String(900000 + i) } });
+      if (last.status === 429) { blockedAt = i; break; }
+    }
+    ok(blockedAt >= 0, `存在しないコードの連打は ${blockedAt + 1} 回目で 429 になる`);
+    ok(!!last.json?.message, '止めた理由が画面に出せる (メッセージつき)');
+    // 打ち止め中は、管理者が発行した正しいコードでも通らない
+    const issued = await req(J, `${APP}/admin/enroll-codes`, { method: 'POST', body: { label: '入荷iPad-rate' } });
+    const r = await req(ATTACK, `${APP}/enroll/redeem`, { method: 'POST', body: { code: issued.json.code } });
+    ok(r.status === 429 && !ATTACK.has('ic_device'), '打ち止め中は当たりのコードでも登録されない');
+  }
+
   console.log('\n[C] 端末登録 → 端末Cookie');
   r = await req(J, `${APP}/admin/devices`, { method: 'POST', body: { label: '入荷iPad1' } });
   ok(r.status === 200 && r.json.ok && r.json.loggedOut === true && J.has('ic_device'), '端末登録: ic_device Cookie 発行');

@@ -3,7 +3,7 @@
  *
  * 実行: node scripts/test-inbound-check-enroll.mjs
  * 検証: 発行→引き換え→端末Cookieが有効 / 期限切れ / 使用済み / 打ち間違い回数 / 形式不正 /
- *       引き換えても管理系は触れない (端末の権限境界)
+ *       引き換えても管理系は触れない (端末の権限境界) / 総当たりのレート制限
  */
 import fs from 'fs';
 import os from 'os';
@@ -16,6 +16,7 @@ const db = await import('../apps/inbound-check/db.js');
 const {
   getDB, createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes,
   verifyDevice, listDevices, revokeDevice, ENROLL_MAX_ATTEMPTS,
+  checkEnrollRate, recordEnrollAttempt, ENROLL_RATE_PER_IP, ENROLL_RATE_GLOBAL,
 } = db;
 
 let pass = 0, fail = 0;
@@ -74,7 +75,52 @@ console.log('\n[4] 打ち間違い・形式不正');
   ok(listActiveEnrollCodes().length === 0, '無効化されたコードは一覧に出ない');
 }
 
-console.log('\n[5] 端末の失効');
+console.log('\n[5] 総当たり (存在しないコードを順に試す)');
+{
+  const c = createEnrollCode('総当たりテスト', 'admin@example.com');
+  const IP = '203.0.113.9';
+  // ⚠旧実装はここが素通りだった: countEnrollAttempt は「実在する行」しか数えないので、
+  //   当たり以外を叩き続ける限りカウントが増えず、100万通りを試し放題だった
+  let blocked = 0;
+  for (let i = 0; i < ENROLL_RATE_PER_IP + 3; i++) {
+    const guess = String(i).padStart(6, '0');
+    const gate = checkEnrollRate({ ip: IP });
+    if (!gate.allowed) { blocked++; recordEnrollAttempt({ ip: IP, ok: false }); continue; }
+    recordEnrollAttempt({ ip: IP, ok: redeemEnrollCode(guess).ok });
+  }
+  ok(blocked >= 3, `存在しないコードの連打でも止まる (${blocked}回ブロック)`);
+  ok(!checkEnrollRate({ ip: IP }).allowed, '打ち止め後は当たりのコードでも受け付けない');
+  ok(checkEnrollRate({ ip: '198.51.100.1' }).allowed, '別の相手はまだ試せる (巻き添えにしない)');
+  // 分散して来られても全体上限で止まる
+  for (let i = 0; i < ENROLL_RATE_GLOBAL; i++) recordEnrollAttempt({ ip: `198.51.100.${i % 200}`, ok: false });
+  ok(!checkEnrollRate({ ip: '198.51.100.77' }).allowed, 'IP を変えて分散しても全体上限で止まる');
+  // 後片付け (時間が経って記録が消えた状態を作る)
+  getDB().prepare('DELETE FROM f_inbound_check_enroll_attempts').run();
+  ok(checkEnrollRate({ ip: IP }).allowed, '時間が経てば (記録が消えれば) また試せる');
+  ok(redeemEnrollCode(c.code).ok, '正しいコードは引き換えられる');
+}
+
+console.log('\n[5b] コードの保存形');
+{
+  const crypto = await import('node:crypto');
+  const c = createEnrollCode('保存形テスト', 'admin@example.com');
+  const rows = getDB().prepare('SELECT code_hash FROM f_inbound_check_enroll_codes WHERE used_at IS NULL').all();
+  const plainSha = crypto.createHash('sha256').update(c.code).digest('hex');
+  ok(!rows.some(r => r.code_hash === c.code), 'コードそのものは保存しない');
+  // 6桁 = 100万通りなので、ソルト無しの sha256 だと DB が漏れた時点で逆算できる
+  ok(!rows.some(r => r.code_hash === plainSha), 'ソルト無し sha256 では保存しない (総当たりで逆算できてしまう)');
+}
+
+console.log('\n[5c] 有効なコードは同時に1つだけ');
+{
+  const a = createEnrollCode('iPad-A', 'admin@example.com');
+  const b = createEnrollCode('iPad-B', 'admin@example.com');
+  ok(listActiveEnrollCodes().length === 1, '新しく発行すると古い未使用コードは無効になる');
+  ok(!redeemEnrollCode(a.code).ok, '古いコードはもう使えない');
+  ok(redeemEnrollCode(b.code).ok, '新しいコードは使える');
+}
+
+console.log('\n[6] 端末の失効');
 {
   const c = createEnrollCode('失効テスト', 'admin@example.com');
   const r = redeemEnrollCode(c.code);
@@ -83,7 +129,7 @@ console.log('\n[5] 端末の失効');
   ok(revokeDevice(d.id) && verifyDevice(r.token) === null, '失効させると使えなくなる');
 }
 
-console.log('\n[6] 入力検証');
+console.log('\n[7] 入力検証');
 {
   throwsWith(() => createEnrollCode('', 'admin'), /1〜40/, '端末名なしは拒否');
   throwsWith(() => createEnrollCode('あ'.repeat(41), 'admin'), /1〜40/, '長すぎる端末名は拒否');

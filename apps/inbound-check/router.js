@@ -20,6 +20,7 @@ import {
   getState, applyCheck, importCsv, getActiveBatch, listBatches, listImportLog, listEvents, eventsCsv,
   createDevice, verifyDevice, revokeDevice, listDevices,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
+  checkEnrollRate, recordEnrollAttempt,
   listWorkers, getWorker,
 } from './db.js';
 import { fetchAndImportFromDrive, statusForView, driveConfig } from './drive-fetch.js';
@@ -134,9 +135,18 @@ router.get('/enroll', (req, res) => {
 
 router.post('/enroll/redeem', checkOrigin, api((req, res) => {
   const code = String(req.body?.code || '').trim();
+  // ⭐総当たり対策は「試行そのもの」を数える。コードが実在するかで数え方を変えると、
+  //   000000〜999999 を順に叩かれたとき一度もカウントされない (6桁 = 100万通り)
+  const ip = req.ip || null;
+  const gate = checkEnrollRate({ ip });
+  if (!gate.allowed) {
+    recordEnrollAttempt({ ip, ok: false });
+    return res.status(429).json({ ok: false, error: gate.error, message: gate.message });
+  }
   const r = redeemEnrollCode(code);
+  recordEnrollAttempt({ ip, ok: r.ok });
   if (!r.ok) {
-    countEnrollAttempt(code);   // 打ち間違いを数える (総当たり対策)
+    countEnrollAttempt(code);   // そのコード自体の打ち間違いも数える (正規利用者の打ち間違い上限)
     return res.status(400).json(r);
   }
   res.cookie(DEVICE_COOKIE, r.token, {
