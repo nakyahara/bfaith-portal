@@ -115,6 +115,9 @@ console.log('\n── 価格の読み方 ──');
   // ★商品直下の Price が複数 = 想定外の構造。最初の1つを採ると、その値を基準に値付けしてしまう (Codex R3)
   const twoPrices = await flattenXml('<ResultSet><Result><ItemCode>zz-1</ItemCode><Price>100</Price><Price>200</Price></Result></ResultSet>');
   eq(itemPriceOf(twoPrices, 'zz-1'), null, '★価格が2つあれば読めない扱い (書き込みに進ませない)');
+  // ★安全整数の外だと +1 しても同じ値になり、変わっていないのに変わったと読める (Codex R4)
+  const huge = await flattenXml('<ResultSet><Result><ItemCode>zz-1</ItemCode><Price>9007199254740993</Price></Result></ResultSet>');
+  eq(itemPriceOf(huge, 'zz-1'), null, '★安全整数の外は読めない扱い');
 
   // 道すじの直下判定 ([ ] を含む道すじでも壊れない)
   ok(isDirectChild('A[0]/B[0]/Name[0]', 'A[0]/B[0]', 'Name'), '直下なら true');

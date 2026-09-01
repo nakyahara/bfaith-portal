@@ -207,7 +207,9 @@ export function itemPriceOf(flat, itemCode) {
   //   最初の1つを採るとその値を基準に値付けしてしまう (Codex R3)
   if (values.length !== 1) return null;
   const n = Number(values[0]);
-  return Number.isInteger(n) ? n : null;
+  // ★安全整数の範囲まで見る。範囲外だと currentPrice + 1 が currentPrice と同じ値になり、
+  //   価格が変わっていないのに「変わった」と読んでしまう (Codex R4)
+  return Number.isSafeInteger(n) ? n : null;
 }
 
 /**
