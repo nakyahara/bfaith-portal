@@ -2726,6 +2726,59 @@ let wfSetParentId = null;
         return t?.excluded === true && t?.made === false;
       })());
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(madeId);
+
+      // 順序が飛ぶケース (Codex R2 medium)。「いまの工程が楽天登録か」で見ると、
+      // ⑦を対象外にした / 工程を並べ替えた だけで判定が崩れる
+      const mk2 = (code) => {
+        const id = Number(db.prepare(
+          `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('${code}', '画像 済 判定 ${code}', 'draft', 'smoke')`
+        ).run().lastInsertRowid);
+        wfp.ensureProgress(db, id);
+        for (const c of ['imgd_request', 'imgd_compose', 'imgd_material', 'imgd_ai', 'imgd_design', 'imgd_review_1', 'imgd_review_2']) {
+          wfp.setStepState(id, c, { state: 'done' }, 'smoke', ADMIN);
+        }
+        return id;
+      };
+      const detailOf = (id) => wfp.boardData(db, {}).columns.flatMap((c) => c.cards)
+        .find((x) => x.id === id)?.image?.detail;
+      {
+        // ⑦Amazon登録依頼 を「対象外」= Amazon に出さない商品。決着なので「済」
+        const id = mk2('WF-MADE-SKIP7');
+        wfp.setStepState(id, 'imgd_amazon', { state: 'skip' }, 'smoke', ADMIN);
+        check('ボード: ⑦を対象外にしても「済」 (skip も決着)',
+          detailOf(id)?.made === true, JSON.stringify(detailOf(id)?.current?.step_code || null));
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+      }
+      {
+        // 管理画面で ⑧楽天登録 を ⑥より前へ動かした状態。「いま楽天登録にいる」だけを見ると
+        // ⑥⑦が終わっていないのに「済」になってしまう
+        const id = mk2('WF-MADE-REORDER');
+        wfp.setStepState(id, 'imgd_review_2', { state: 'todo' }, 'smoke', ADMIN);
+        const origSort = db.prepare("SELECT sort FROM ph_steps WHERE code = 'imgd_rakuten'").get().sort;
+        db.prepare("UPDATE ph_steps SET sort = 55 WHERE code = 'imgd_rakuten'").run();
+        const t = detailOf(id);
+        db.prepare('UPDATE ph_steps SET sort = ? WHERE code = ?').run(origSort, 'imgd_rakuten');
+        check('ボード: 工程を並べ替えて楽天登録が先に来ても、前の工程が残っていれば「まだ」',
+          t?.made === false && t?.current?.step_code === 'imgd_rakuten',
+          JSON.stringify({ made: t?.made, cur: t?.current?.step_code }));
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+      }
+      {
+        // ⑦と⑧の間に管理画面から工程を足した状態 (image_stage は NULL)。
+        // 制作の境界は ⑦ なので、その工程が残っていても「済」でよい
+        const id = mk2('WF-MADE-CUSTOM');
+        db.prepare(`INSERT INTO ph_steps (code, label, track, image_kind, image_stage, role_code, sort, builtin, skippable, listing_gate, active)
+                    VALUES ('step_smoke_mid', '追加工程 (smoke)', 'image', 'detail', NULL, NULL, 75, 0, 1, 0, 1)`).run();
+        wfp.ensureProgress(db, id);
+        wfp.setStepState(id, 'imgd_amazon', { state: 'done' }, 'smoke', ADMIN);
+        const t = detailOf(id);
+        db.prepare("DELETE FROM draft_step_progress WHERE step_code = 'step_smoke_mid'").run();
+        db.prepare("DELETE FROM ph_steps WHERE code = 'step_smoke_mid'").run();
+        check('ボード: ⑦の後にカスタム工程が挟まっても「済」 (境界は ⑦)',
+          t?.made === true && t?.current?.step_code === 'step_smoke_mid',
+          JSON.stringify({ made: t?.made, cur: t?.current?.step_code }));
+        db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+      }
     }
   }
 

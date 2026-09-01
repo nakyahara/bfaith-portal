@@ -484,20 +484,29 @@ function splitImageRows(imageRows) {
 }
 
 /**
- * 「画像はもう作り終わっている」とみなす段階 (2026-09-01 中原さん:「画像で並べるステータスが
- * 楽天登録に移動したらカードは済にしてほしい」)。⑧楽天登録・⑨A+登録 は**作った画像をモールに
- * 載せる後工程**なので、ここまで来ていれば制作としては終わっている。
- * ⑦Amazon登録依頼 は最終デザイン確認を兼ねるので含めない (中原さんの線引き)。
- * 工程コードでなく image_stage で見るのは、管理画面での改名・並べ替えで壊れないため
+ * 「画像の制作はここまでで終わり」の境界 = ⑦Amazon登録依頼 (最終デザイン確認を兼ねる)。
+ * これより後の ⑧楽天登録・⑨A+登録 は**作った画像をモールに載せる後工程**なので、
+ * そこに来ていればカードは「済」にする (2026-09-01 中原さん:「画像で並べるステータスが
+ * 楽天登録に移動したらカードは済にしてほしい」)。
+ * 工程コードでなく image_stage で見るのは、管理画面での改名で壊れないため
  * (image_stage は「TOP/詳細の同じ段階を 1 列にまとめる安定キー」として置いてある)。
  */
-export const IMAGE_MADE_STAGES = ['rakuten', 'aplus'];
+export const IMAGE_MADE_BOUNDARY_STAGE = 'amazon';
 
-/** 商品詳細画像が作り終わっているか (決着済み、または登録の後工程まで来ている) */
+/**
+ * 商品詳細画像が作り終わっているか。
+ * 🚨**current の段階だけを見ない** (Codex R2 medium): 管理画面で工程を並べ替え・追加できるので、
+ * 「いま楽天登録にいる」= 前の工程が終わっている とは限らない (楽天を前に動かせば ⑥未完了でも
+ * current が楽天になる)。境界工程 (⑦) と**それ以前に並ぶ行がすべて決着**していることを見る。
+ * 境界の行が無い (工程を消した) ときは「済」と偽らずに false へ倒す。
+ */
 export function imageMadeOf(summary) {
   if (!summary || summary.excluded) return false;
   if (summary.done) return true;
-  return IMAGE_MADE_STAGES.includes(summary.current?.image_stage || '');
+  const rows = summary.rows || [];
+  const boundary = rows.findIndex((r) => r.image_stage === IMAGE_MADE_BOUNDARY_STAGE);
+  if (boundary < 0) return false;
+  return rows.slice(0, boundary + 1).every((r) => r.state === 'done' || r.state === 'skip');
 }
 
 /** 1 種別分のサマリー (current / done / 滞留)。excluded の種別は current を出さない */
