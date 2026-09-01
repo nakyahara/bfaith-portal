@@ -20,6 +20,8 @@ import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.j
 import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot } from './live-price.js';
 import { evaluateRow, runLimits } from './pricing.js';
 import { rakutenShippingLabel, yahooPostageLabel, rakutenShippingName, yahooPostageName } from './shipping-labels.js';
+import { executeRun, mallWriteEnabled } from './execute.js';
+import { patchItemPrices, fetchItemDetail } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
 import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -419,6 +421,59 @@ router.post('/api/runs', (req, res) => {
     res.json({ ok: true, runId });
   } catch (e) {
     apiError(res, e, 'create-run');
+  }
+});
+
+/**
+ * run を実行する (M2)。
+ * ★画面から価格を受け取らない。保存済みの run の内容だけを送る
+ *   (画面を書き換えて別の値を送る、という抜け道を作らないため)。
+ * ★確認文字列を要求する (押し間違いで走らないように)。
+ */
+router.post('/api/runs/:runId/execute', async (req, res) => {
+  try {
+    const db = getDB();
+    const run = getRun(db, req.params.runId);
+    if (!run) throw validationError('履歴が見つかりません');
+    if (String(req.body?.confirm || '') !== '実行する') {
+      throw validationError('実行するには確認欄に「実行する」と入力してください');
+    }
+    const targets = run.operations.filter((o) => o.state === 'previewed');
+    if (targets.length === 0) throw validationError('実行できる行がありません (すでに実行済み、またはガードで止まっています)');
+
+    const limits = runLimits();
+    const neCodes = new Set(targets.map((o) => o.ne_code));
+    if (neCodes.size > limits.maxNeCodes) {
+      throw validationError(`一度に実行できるのは ${limits.maxNeCodes} コードまでです (対象 ${neCodes.size} コード)`);
+    }
+    if (targets.length > limits.maxSkuRows) {
+      throw validationError(`対象行が多すぎます (${targets.length} 行 / 上限 ${limits.maxSkuRows} 行)`);
+    }
+
+    const out = await executeRun(db, run, {
+      actor: actorOf(req),
+      client: { patchItemPrices, fetchItemDetail },
+    });
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    apiError(res, e, 'execute-run');
+  }
+});
+
+/** 実行できる状態か (画面がボタンを出すかどうかの判断に使う) */
+router.get('/api/runs/:runId/executable', (req, res) => {
+  try {
+    const run = getRun(getDB(), req.params.runId);
+    if (!run) return res.status(404).json({ ok: false, error: 'not_found' });
+    const targets = run.operations.filter((o) => o.state === 'previewed');
+    const malls = [...new Set(targets.map((o) => o.mall))];
+    res.json({
+      ok: true,
+      targets: targets.length,
+      gates: Object.fromEntries(malls.map((m) => [m, mallWriteEnabled(m)])),
+    });
+  } catch (e) {
+    apiError(res, e, 'executable');
   }
 });
 

@@ -27,8 +27,20 @@ let initialized = false;
  *   blocked_preview … ガードに引っかかったまま記録した (★M2 の実行候補にしてはいけない)
  *   manual_required … Amazon / auPAY / Qoo10 の手動更新対象
  *   manual_done     … 手動更新を済ませたと本人が記録した
+ *   (M2) executing / confirmed / noop / conflict / failed / unknown / blocked / skipped
  */
-export const STATES = ['previewed', 'blocked_preview', 'manual_required', 'manual_done'];
+export const STATES = [
+  'previewed', 'blocked_preview', 'manual_required', 'manual_done',
+  // M2 (実行) で増える状態
+  'executing',   // 送信中
+  'confirmed',   // 送信 → API再取得で価格が変わったことを確認できた
+  'noop',        // 既に同じ価格だった
+  'conflict',    // 更新前価格が想定と違った (送っていない)
+  'failed',      // 送ったが失敗 / ガードで送らなかった
+  'unknown',     // 送信結果が不明 (★再送しない。受領台帳で確かめる)
+  'blocked',     // 実行直前のガードで止めた
+  'skipped',     // 前の行で止まった等で送らなかった
+];
 
 export function initPriceUpdate() {
   const db = getMirrorDB();

@@ -130,3 +130,37 @@ export async function fetchItemDetail(manageNumber) {
   }
   return { item: null, status: 'not_found' };
 }
+
+/**
+ * 価格更新 (価格一括改定 M2)。miniPC の書き込みエンドポイントを叩く。
+ * ★リトライしない。応答が返らなかった時に「送られたか不明」のまま再送すると二重更新になる。
+ *   その場合は fetchPriceOperation() で受領台帳を照会して状態を確かめる。
+ *
+ * @returns {Promise<{status:number, body:object|null}>} HTTP status をそのまま返す
+ *   (200 applied/noop / 409 conflict・ID使い回し・結果不明 / 400 入力やガード / 502 楽天側)
+ */
+export async function patchItemPrices(manageNumber, { operationId, runId, expected, prices }) {
+  const url = `${getWarehouseUrl()}/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(manageNumber)}/prices`;
+  const res = await fetch(url, {
+    method: 'PATCH',
+    headers: getServiceHeaders(),
+    body: JSON.stringify({ operation_id: operationId, run_id: runId ?? null, expected, prices }),
+    signal: AbortSignal.timeout(120_000),
+  });
+  let body = null;
+  try { body = await res.json(); } catch { /* JSON でない応答 */ }
+  return { status: res.status, body };
+}
+
+/** 受領台帳の照会 (結果不明の operation を人が判断するため)。read-only */
+export async function fetchPriceOperation(operationId) {
+  const url = `${getWarehouseUrl()}/service-api/rakuten-rms/price-ops/${encodeURIComponent(operationId)}`;
+  const res = await fetch(url, { headers: getServiceHeaders(), signal: AbortSignal.timeout(30_000) });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const err = new Error(`[rakuten-rms-proxy:price-ops] HTTP ${res.status}`);
+    err.statusCode = res.status;
+    throw err;
+  }
+  return res.json();
+}
