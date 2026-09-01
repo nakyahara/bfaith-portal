@@ -64,6 +64,8 @@ import {
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
   isValidGtin, MODEL_ATTR_NAME,
 } from './services/rakuten-listing.js';
+// ボードから楽天に出品 (2026-09-01): 画像転送 → 登録 → 後処理 を 1 本に
+import { listToRakutenFromBoard, afterRakutenRegistered } from './services/board-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
@@ -1460,24 +1462,36 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
   try {
     const r = await registerItem(draft.id, { actor: actorOf(req) });
     if (!r.ok) return res.status(400).json({ ok: false, error: r.error || (r.reasons || []).join(' / '), reasons: r.reasons });
-    // 楽天モールを完了にする (人に二度同じことを押させない)。
-    // fail-soft: ここで失敗しても出品は成功しているので、出品結果は返す
-    markRakutenListed(getDB(), draft.id, {
-      itemUrl: rakutenItemPageUrl(draft.ne_code),
-      actor: actorOf(req),
-    });
-    // 画像工程 v2 ⑧「楽天登録」も自動で完了 (fail-soft: 出品は成功している)
-    try {
-      const st = getDB().prepare("SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(draft.id);
-      if (st && st.state !== 'done' && st.state !== 'skip') {
-        setStepState(draft.id, 'imgd_rakuten', { state: 'done' }, actorOf(req), { isAdmin: true, systemActor: true });
-      }
-    } catch (e) {
-      console.warn('[product-hub] imgd_rakuten auto-done failed:', e?.message || e);
-    }
+    // 楽天モール=完了 + 画像工程⑧=完了 (人に二度同じことを押させない)。
+    // fail-soft: ここで失敗しても出品は成功しているので、出品結果は返す。
+    // ボードからの出品 (board-listing.js) と同じ後処理を共有する
+    afterRakutenRegistered(getDB(), draft, actorOf(req));
     res.json(r);
   } catch (e) {
     console.error('[product-hub] rakuten register failed:', e);
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  }
+});
+
+// 工程ボードから楽天に出品 (2026-09-01 中原さん要望)。画像転送 → 公開で登録 → 後処理 を 1 本で。
+// 落とした指の滑りで本番公開されないよう、画面側で確認ダイアログを出したうえで confirm:true を送らせる。
+// 二重実行 (連打・別タブ) は service 側が 登録済み=400 / 実行中=409 で止める
+router.post('/api/drafts/:id/rakuten/list-from-board', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ ok: false, error: 'confirm が必要です' });
+  }
+  try {
+    const r = await listToRakutenFromBoard(draft.id, { actor: actorOf(req) });
+    // 失敗も 200 で返す (理由は r.error / r.stage。画面はこれを読んで見せる)。
+    // 4xx に倒すのは「実行できない」(登録済み・実行中・confirm なし) だけ
+    res.json(r);
+  } catch (e) {
+    if (Number(e?.status) >= 400 && Number(e?.status) < 500) {
+      return res.status(Number(e.status)).json({ ok: false, error: e.message });
+    }
+    console.error('[product-hub] rakuten list-from-board failed:', e);
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
   }
 });
@@ -2085,6 +2099,9 @@ router.get('/board', (req, res) => {
     stepStateLabels: STEP_STATE_LABELS,
     imageKindLabels: IMAGE_KIND_LABELS,
     imagePriorities: IMAGE_PRIORITIES,
+    // 楽天の商品ページ URL は商品コードから決まる (draft_mall_status には保存しない設計)。
+    // 出品・展開の列のカードで「商品ページ ↗」を組み立てるために渡す (2026-09-01)
+    rakutenItemPageUrl,
   });
 });
 

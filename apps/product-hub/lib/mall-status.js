@@ -315,17 +315,19 @@ export function mallSummaryFor(db, draftIds) {
   if (ids.length === 0) return out;
   const placeholders = ids.map(() => '?').join(',');
   const rows = db.prepare(`
-    SELECT draft_id, mall, state FROM draft_mall_status WHERE draft_id IN (${placeholders})
+    SELECT draft_id, mall, state, item_url FROM draft_mall_status WHERE draft_id IN (${placeholders})
   `).all(...ids);
   const byDraft = new Map();
   for (const r of rows) {
     if (!byDraft.has(r.draft_id)) byDraft.set(r.draft_id, new Map());
-    byDraft.get(r.draft_id).set(r.mall, r.state);
+    byDraft.get(r.draft_id).set(r.mall, r);
   }
   for (const id of ids) {
     const m = byDraft.get(id) || new Map();
     out.set(id, MALLS.map((mall) => ({
-      code: mall.code, label: mall.label, state: m.get(mall.code) || 'todo',
+      code: mall.code, label: mall.label, state: m.get(mall.code)?.state || 'todo',
+      // 掲載ページ (ボードのカードから「楽天の商品ページを開く」— 2026-09-01)
+      itemUrl: m.get(mall.code)?.item_url || null,
     })));
   }
   return out;
