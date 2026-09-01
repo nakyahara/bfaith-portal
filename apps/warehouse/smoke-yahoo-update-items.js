@@ -102,7 +102,9 @@ async function unpublishedKeys({ maxPages = 50, perPage = 100 } = {}) {
     const text = await res.text();
     if (!res.ok) throw new Error(`publish-history HTTP ${res.status}: ${text.slice(0, 200)}`);
     // ★HTTP 200 でも本文が NG のことがある。0件と区別しないと「未反映は無い」と誤読する (Codex R4)
-    if (/<Status>\s*NG\s*<\/Status>/i.test(text) || /<Error[\s>]/i.test(text)) {
+    //   ただし空の <Error/> は「無し」の意味 (実測: 成功応答に <Warning/> が入る)。中身があるときだけ失敗
+    const hasError = [...text.matchAll(/<Error(?:\s[^>]*)?>([\s\S]*?)<\/Error>/gi)].some((m) => m[1].trim());
+    if (/<Status>\s*NG\s*<\/Status>/i.test(text) || hasError) {
       throw new Error(`publish-history がエラーを返しました: ${oneLine(text)}`);
     }
     pages++;

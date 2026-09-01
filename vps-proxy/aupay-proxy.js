@@ -1701,7 +1701,12 @@ function yahooXmlOk(res) {
   const text = String(res?.body || '');
   if (!(res?.status >= 200 && res.status < 300)) return false;
   if (/<Status>\s*NG\s*<\/Status>/i.test(text)) return false;
-  if (/<Error[\s>]/i.test(text)) return false;
+  // ★中身のある <Error> だけを失敗とする。
+  //   Yahoo は空の自己終了タグを「無し」の意味で使う (実測した submitItem の成功応答に
+  //   <Warning/> が入っていた)。<Error/> まで失敗にすると、正常な応答を弾いてしまう。
+  for (const m of text.matchAll(/<Error(?:\s[^>]*)?>([\s\S]*?)<\/Error>/gi)) {
+    if (m[1].trim()) return false;
+  }
   return true;
 }
 
@@ -1951,6 +1956,17 @@ function runSelfTest() {
   check('yahoo応答: ★HTTP 200 でも Error があれば失敗', yahooXmlOk({ status: 200, body: '<ResultSet><Result><Error><Code>x</Code></Error></Result></ResultSet>' }), false);
   check('yahoo応答: Status NG は失敗', yahooXmlOk({ status: 200, body: '<ResultSet><Status>NG</Status></ResultSet>' }), false);
   check('yahoo応答: HTTP エラーは失敗', yahooXmlOk({ status: 500, body: 'boom' }), false);
+  // ★実測した submitItem の成功応答 (空の自己終了タグ Warning が入る)
+  check('yahoo応答: 実測の成功応答をそのまま通す',
+    yahooXmlOk({ status: 200, body: '<?xml version="1.0" encoding="UTF-8"?><ResultSet><Result><Status>OK</Status><Warning/></Result></ResultSet>' }), true);
+  check('yahoo応答: 空の Error は「無し」の意味なので成功のまま',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status><Error/></Result></ResultSet>' }), true);
+  check('yahoo応答: 中身のない Error も成功のまま',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status><Error>  </Error></Result></ResultSet>' }), true);
+  check('yahoo応答: ★中身のある Error は失敗',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Result><Error><Code>it-01011</Code></Error></Result></ResultSet>' }), false);
+  check('yahoo応答: 属性つきの Error も失敗',
+    yahooXmlOk({ status: 200, body: '<ResultSet><Error type="x">だめ</Error></ResultSet>' }), false);
 
   check('updateItems: subcode_price の書式が壊れない',
     decodeURIComponent(decodeURIComponent(
