@@ -101,6 +101,10 @@ async function unpublishedKeys({ maxPages = 50, perPage = 100 } = {}) {
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`publish-history HTTP ${res.status}: ${text.slice(0, 200)}`);
+    // ★HTTP 200 でも本文が NG のことがある。0件と区別しないと「未反映は無い」と誤読する (Codex R4)
+    if (/<Status>\s*NG\s*<\/Status>/i.test(text) || /<Error[\s>]/i.test(text)) {
+      throw new Error(`publish-history がエラーを返しました: ${oneLine(text)}`);
+    }
     pages++;
     const flat = await flattenXml(text);
     let found = 0;
