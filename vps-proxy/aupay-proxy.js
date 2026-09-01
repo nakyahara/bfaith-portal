@@ -1307,61 +1307,65 @@ const server = http.createServer(async (req, res) => {
       let body;
       try { body = JSON.parse(raw); } catch (_) { throw new Error('update-items: invalid JSON body'); }
       assertPriceOnlyItems(body.items, { clearSalePrice: body.clearSalePrice === true });
-      // ★「今いくらか読む → 照合する → 送る」を **1つの商品につき1つずつ** 行う (Codex R1 High)。
-      //   Render 側で読んでから送るまでの間に誰かが変えると、その変更を踏み潰す / 追加された
-      //   セール価格を消す。ここでロックして直前に読み直せば、その窓をこのサーバの中では閉じられる。
+      const built = buildUpdateItemsBody(body.items, YAHOO_SELLER_ID, { includeItemNum: body.itemNum === true });
+      const wantSubmit = body.submit !== false;
+
+      // ★「読む → 照合する → 送る → 反映する」を **まとめて** 商品ごとのロックの中で行う
+      //   (Codex R1/R2 High)。照合だけをロックして送信を外に出すと、照合の後・送信の前に
+      //   割り込まれて、その変更を踏み潰す / 追加されたセール価格を空文字で消す。
       //   ⚠️Yahoo の管理画面から直に変えられた場合は API では閉じようがない (残る危険として明示)
-      if (body.expected && typeof body.expected === 'object') {
-        const conflict = await withYahooItemLock(body.items.map((it) => it.item_code), async () => {
+      const outcome = await withYahooItemLock(built.codes, async () => {
+        if (body.expected && typeof body.expected === 'object') {
           for (const it of body.items) {
             const want = body.expected[it.item_code];
             if (want === undefined) continue;
             const cur = await readItemForCheck(it.item_code);
-            if (cur.error) return { item_code: it.item_code, reason: cur.error };
+            if (cur.error) return { conflict: { item_code: it.item_code, reason: cur.error } };
             if (cur.price !== Number(want)) {
-              return { item_code: it.item_code, reason: '現在価格が想定と違います', expected: Number(want), live: cur.price };
+              return { conflict: { item_code: it.item_code, reason: '現在価格が想定と違います', expected: Number(want), live: cur.price } };
             }
             // ★セール価格も直前に見る。空文字を送ると消えるので、入っていたら送らない
             if (String(it.sale_price ?? '') === '' && cur.salePrice !== null) {
-              return { item_code: it.item_code, reason: `セール価格 (${cur.salePrice} 円) が入っています`, salePrice: cur.salePrice };
+              return { conflict: { item_code: it.item_code, reason: `セール価格 (${cur.salePrice} 円) が入っています`, salePrice: cur.salePrice } };
             }
             if (String(it.sale_price ?? '') === '' && !cur.salePriceReadable) {
-              return { item_code: it.item_code, reason: 'セール価格が入っているか確かめられません' };
+              return { conflict: { item_code: it.item_code, reason: 'セール価格が入っているか確かめられません' } };
             }
+            await new Promise((r2) => setTimeout(r2, YAHOO_API_GAP_MS));   // 1クエリー/秒
           }
-          return null;
+        }
+        console.log(`[${ts()}] Yahoo updateItems: ${built.count}件 (${built.codes.join(',')}) body=${built.body.length}b`);
+        const r = await callYahooAPIRaw('updateItems', {
+          method: 'POST',
+          contentType: 'application/x-www-form-urlencoded',
+          body: built.body,
         });
-        if (conflict) {
-          res.writeHead(409, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'CONFLICT', conflict }));
-          return;
+        // ★更新しただけでは客に見えない。「変えたつもり」を作らないよう、
+        //   この経路の中で反映まで済ませる (明示的に submit:false と言われた時だけ飛ばす)
+        const updateOk = yahooXmlOk(r);
+        const submits = [];
+        if (wantSubmit && updateOk) {
+          for (const code of built.codes) {
+            await new Promise((r2) => setTimeout(r2, YAHOO_API_GAP_MS));   // 1クエリー/秒
+            const sr = await callYahooAPIRaw('submitItem', {
+              method: 'POST',
+              contentType: 'application/x-www-form-urlencoded',
+              body: new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: code }).toString(),
+            });
+            const sok = yahooXmlOk(sr);
+            console.log(`[${ts()}] Yahoo submitItem: item_code=${code} status=${sr.status} ok=${sok}`);
+            submits.push({ item_code: code, status: sr.status, ok: sok, body: String(sr.body).slice(0, 500) });
+          }
         }
-      }
-      const built = buildUpdateItemsBody(body.items, YAHOO_SELLER_ID, { includeItemNum: body.itemNum === true });
-      console.log(`[${ts()}] Yahoo updateItems: ${built.count}件 (${built.codes.join(',')}) body=${built.body.length}b`);
-      const r = await callYahooAPIRaw('updateItems', {
-        method: 'POST',
-        contentType: 'application/x-www-form-urlencoded',
-        body: built.body,
+        return { r, updateOk, submits };
       });
-      // ★更新しただけでは客に見えない。「変えたつもり」を作らないよう、
-      //   この経路の中で反映まで済ませる (明示的に submit:false と言われた時だけ飛ばす)
-      const wantSubmit = body.submit !== false;
-      const updateOk = yahooXmlOk(r);
-      const submits = [];
-      if (wantSubmit && updateOk) {
-        for (const code of built.codes) {
-          await new Promise((r2) => setTimeout(r2, YAHOO_API_GAP_MS));   // 1クエリー/秒
-          const sr = await callYahooAPIRaw('submitItem', {
-            method: 'POST',
-            contentType: 'application/x-www-form-urlencoded',
-            body: new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: code }).toString(),
-          });
-          const sok = yahooXmlOk(sr);
-          console.log(`[${ts()}] Yahoo submitItem: item_code=${code} status=${sr.status} ok=${sok}`);
-          submits.push({ item_code: code, status: sr.status, ok: sok, body: String(sr.body).slice(0, 500) });
-        }
+
+      if (outcome.conflict) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'CONFLICT', conflict: outcome.conflict }));
+        return;
       }
+      const { r, updateOk, submits } = outcome;
       res.writeHead(r.status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: updateOk && (!wantSubmit || submits.every((s) => s.ok)),
