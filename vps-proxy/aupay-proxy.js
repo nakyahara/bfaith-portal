@@ -1700,6 +1700,9 @@ const server = http.createServer(async (req, res) => {
 function yahooXmlOk(res) {
   const text = String(res?.body || '');
   if (!(res?.status >= 200 && res.status < 300)) return false;
+  // ★成功と言い切るには Status OK が要る (Codex R7)。
+  //   これが無いと、空本文・HTML のメンテ画面・壊れた XML まで成功扱いになる
+  if (!/<Status>\s*OK\s*<\/Status>/i.test(text)) return false;
   if (/<Status>\s*NG\s*<\/Status>/i.test(text)) return false;
   // ★中身のある <Error> だけを失敗とする。
   //   Yahoo は空の自己終了タグを「無し」の意味で使う (実測した submitItem の成功応答に
@@ -1965,6 +1968,9 @@ function runSelfTest() {
     yahooXmlOk({ status: 200, body: '<ResultSet><Result><Status>OK</Status><Error>  </Error></Result></ResultSet>' }), true);
   check('yahoo応答: ★中身のある Error は失敗',
     yahooXmlOk({ status: 200, body: '<ResultSet><Result><Error><Code>it-01011</Code></Error></Result></ResultSet>' }), false);
+  check('yahoo応答: ★本文が空の 200 は成功にしない', yahooXmlOk({ status: 200, body: '' }), false);
+  check('yahoo応答: ★HTML のメンテ画面も成功にしない', yahooXmlOk({ status: 200, body: '<html>maintenance</html>' }), false);
+  check('yahoo応答: ★壊れた XML も成功にしない', yahooXmlOk({ status: 200, body: '<ResultSet><Result>' }), false);
   check('yahoo応答: 属性つきの Error も失敗',
     yahooXmlOk({ status: 200, body: '<ResultSet><Error type="x">だめ</Error></ResultSet>' }), false);
 
