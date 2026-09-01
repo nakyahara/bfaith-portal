@@ -114,7 +114,7 @@
           確かめられなかった時・想定していない応答が返った時は、そこで止めて残りは送りません。
         </div>
         <input class="exec-confirm" id="exec-confirm" placeholder="実行する" autocomplete="off">
-        <button class="btn btn-danger" id="exec-btn" type="button" disabled>楽天へ送る</button>
+        <button class="btn btn-danger" id="exec-btn" type="button" disabled>送る</button>
         <span class="pu-note" id="exec-count"></span>
       </div>
       <div class="exec-result" id="exec-result"></div>
@@ -273,6 +273,10 @@
     $('exec-status').innerHTML = '送る対象は <b>' + n(info.targets) + ' 行</b> です。'
       + '<b>送った価格は自動では戻せません</b> — 新売価が正しいか、上の表でもう一度確かめてください。';
     $('exec-count').textContent = '(' + n(info.targets) + ' 行)';
+    // ★ボタンの文言はこの履歴で実際に送るモールから作る。
+    //   「楽天へ送る」と決め打ちにしていたので、Yahoo の履歴でも楽天と書いてあった (中原さん 9/1)
+    const sendMalls = gates.filter(([, g]) => g.enabled).map(([m]) => MALL_LABEL[m] || m);
+    $('exec-btn').textContent = (sendMalls.length > 0 ? sendMalls.join('・') + 'へ送る' : '送る');
     $('exec-form').style.display = '';
 
     const confirm = $('exec-confirm');

@@ -187,5 +187,15 @@ for (const name of ['index.ejs', 'run.ejs']) {
   checkTagBalance(withMiss, 'run.ejs (復旧)');
 }
 
+// ★実行ボタンの文言をモール名で決め打ちしない (Yahoo の履歴で「楽天へ送る」と出ていた)
+{
+  const src = fs.readFileSync(path.join(HERE, 'views', 'run.ejs'), 'utf8');
+  // 画面に直接書かれた固定文言 (テンプレート側) にモール名が無いこと
+  const template = src.split(OPEN_TAG)[0];
+  ok(!/楽天へ送る|Yahooへ送る/.test(template), '★ボタンの文言にモール名を直書きしない');
+  ok(/exec-btn'\)\.textContent/.test(src), '送るモールから文言を作っている');
+  ok(/sendMalls/.test(src) && /g\.enabled/.test(src), '★実際に送るモール (kill switch が有効なもの) だけを名前に出す');
+}
+
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
 process.exitCode = failed === 0 ? 0 : 1;
