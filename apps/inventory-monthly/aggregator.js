@@ -583,9 +583,12 @@ export function costItemKey(row) {
  * 商品単位 (costItemKey) にまとめて返す。
  *
  * 戻り値:
- *   items: [{ key, 商品コード, seller_sku, 商品名, 原価状態, 原価 (手入力済なら現在値),
+ *   items: [{ key, 商品コード, seller_sku, 商品名, 原価状態,
+ *             原価 (手入力済なら現在値。未解決は null),
+ *             current_value (現在計上されている金額。未解決でも PARTIAL_SET 等は 0 でないことがある),
  *             rows: [{ id, category, 数量 }], total_qty, prev_cost, prev_snapshot_date }]
  *          原価状態は未解決系を優先 (同一商品で未解決行と手入力行が混在したら未解決扱い)。
+ *          数量 0 以下の行は対象外 (金額に影響しない)。
  *   unresolved_count: 未解決の商品数 (= アラート件数)
  *   unresolved_qty:   未解決の合計数量
  *   fixed_count:      手入力済の商品数
@@ -593,9 +596,10 @@ export function costItemKey(row) {
  */
 export function listUnresolvedCostItems(snapshotId) {
   const db = getDB();
+  const snap = db.prepare('SELECT snapshot_date FROM inv_snapshot WHERE id = ?').get(snapshotId);
   const rows = db.prepare(
-    `SELECT id, category, seller_sku, 商品コード, 商品名, 数量, 原価, 原価状態
-     FROM inv_snapshot_detail WHERE snapshot_id = ? ORDER BY category, 商品コード, seller_sku`
+    `SELECT id, category, seller_sku, 商品コード, 商品名, 数量, 原価, 金額, 原価状態
+     FROM inv_snapshot_detail WHERE snapshot_id = ? AND 数量 > 0 ORDER BY category, 商品コード, seller_sku`
   ).all(snapshotId);
 
   const byKey = new Map();
@@ -605,7 +609,7 @@ export function listUnresolvedCostItems(snapshotId) {
     const unresolved = UNRESOLVED_COST_STATUSES.has(status);
     const fixed = status === MANUAL_FIX_STATUS;
     if (!unresolved && !fixed) {
-      if (Number(r.原価 || 0) === 0 && Number(r.数量 || 0) > 0) zero_registered++;
+      if (Number(r.原価 || 0) === 0) zero_registered++;
       continue;
     }
     const key = costItemKey(r);
@@ -618,6 +622,7 @@ export function listUnresolvedCostItems(snapshotId) {
         商品名: r.商品名 || '',
         原価状態: status,
         原価: fixed ? Number(r.原価 || 0) : null,
+        current_value: 0,
         rows: [],
         total_qty: 0,
         prev_cost: null,
@@ -631,17 +636,20 @@ export function listUnresolvedCostItems(snapshotId) {
     if (unresolved && item.原価状態 === MANUAL_FIX_STATUS) { item.原価状態 = status; item.原価 = null; }
     item.rows.push({ id: r.id, category: r.category, 数量: Number(r.数量 || 0) });
     item.total_qty += Number(r.数量 || 0);
+    item.current_value += Number(r.金額 || 0);
   }
 
-  // 過去 snapshot での手入力値 (同じ商品がマスタ未登録のまま翌月も出たときの提示用)
+  // 過去の手入力値 (同じ商品がマスタ未登録のまま翌月も出たときの提示用)。
+  // この snapshot より前の基準日、または同じ基準日の旧世代 (CSV 再保存で作り直した場合) から引く。
+  // 後の月の値を「前回」として出さない (Codex R1 #10)。
   const prevStmt = db.prepare(`
-    SELECT f.原価, s.snapshot_date
-    FROM inv_snapshot_cost_fix f JOIN inv_snapshot s ON s.id = f.snapshot_id
-    WHERE f.item_key = ? AND f.snapshot_id != ?
-    ORDER BY s.snapshot_date DESC, f.id DESC LIMIT 1
+    SELECT 原価, snapshot_date
+    FROM inv_snapshot_cost_fix
+    WHERE item_key = ? AND snapshot_date <= ? AND snapshot_id != ?
+    ORDER BY snapshot_date DESC, id DESC LIMIT 1
   `);
   for (const item of byKey.values()) {
-    const prev = prevStmt.get(item.key, snapshotId);
+    const prev = snap ? prevStmt.get(item.key, snap.snapshot_date, snapshotId) : null;
     if (prev) { item.prev_cost = Number(prev.原価); item.prev_snapshot_date = prev.snapshot_date; }
   }
 
@@ -673,9 +681,13 @@ const CATEGORY_COLUMN = {
 /**
  * 手入力した原価を明細へ反映し、カテゴリ列・合計を再計算する。
  *
- * fixes: [{ key: 'code:xxx' | 'sku:xxx', cost: 数値 (0以上) }]
+ * fixes: [{ key: 'code:xxx' | 'sku:xxx', cost: 数値 (0以上), expected_qty?: 画面表示時の合計数量 }]
  * 更新対象 = 同じ key の明細のうち 原価状態 が未解決系 or 手入力済 の行だけ
  * (マスタから原価が取れている行は触らない)。
+ *   - expected_qty を渡すと DB 上の対象数量と照合し、違えば statusCode=409 で失敗する
+ *     (古い画面から保存して想定外の行に適用するのを防ぐ。Codex R1 #5)
+ *   - 対象行が全て手入力済で同じ原価なら no-op (再送で監査記録が増えない。Codex R1 #3)
+ *   - 金額列の無い category の行が対象に含まれたら全体を失敗させる (明細だけ変わって合計に乗らない事故防止)
  *
  * カテゴリ列は「保存済みの列 + 差分 (数量×新原価 − 旧金額)」で更新する。
  * 明細 SUM から作り直すと mirror 経路の summary 値 (±1円許容) と食い違い得るため差分方式。
@@ -698,14 +710,14 @@ export function applyCostFixes(snapshotId, fixes, { created_by = null } = {}) {
     if (!snap) return null;
 
     const selectRows = db.prepare(
-      `SELECT id, category, seller_sku, 商品コード, 商品名, 数量, 金額, 原価状態
+      `SELECT id, category, seller_sku, 商品コード, 商品名, 数量, 原価, 金額, 原価状態
        FROM inv_snapshot_detail
-       WHERE snapshot_id = ? AND (原価状態 IN (${placeholders}) OR 原価状態 IS NULL)`
+       WHERE snapshot_id = ? AND 数量 > 0 AND (原価状態 IN (${placeholders}) OR 原価状態 IS NULL)`
     );
     const updRow = db.prepare('UPDATE inv_snapshot_detail SET 原価 = ?, 金額 = ?, 原価状態 = ? WHERE id = ?');
     const insFix = db.prepare(
-      `INSERT INTO inv_snapshot_cost_fix (snapshot_id, item_key, 商品コード, seller_sku, 商品名, 原価, rows_updated, delta_value, created_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO inv_snapshot_cost_fix (snapshot_id, snapshot_date, item_key, 商品コード, seller_sku, 商品名, 原価, rows_updated, delta_value, created_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
 
     // 対象行を key ごとに束ねる (1回の SELECT で済ませる)
@@ -724,18 +736,32 @@ export function applyCostFixes(snapshotId, fixes, { created_by = null } = {}) {
     for (const f of fixes) {
       const rows = byKey.get(f.key);
       if (!rows || rows.length === 0) continue; // 既にマスタで解決済み等 → 無視 (エラーにしない)
+      const dbQty = rows.reduce((s, r) => s + Number(r.数量 || 0), 0);
+      if (f.expected_qty != null && Number(f.expected_qty) !== dbQty) {
+        const err = new Error(`${f.key} の対象数量が画面表示時 (${f.expected_qty}) と DB (${dbQty}) で異なります。ページを再読み込みしてから入力し直してください。`);
+        err.statusCode = 409;
+        throw err;
+      }
+      const unknownCat = rows.find(r => !CATEGORY_COLUMN[r.category]);
+      if (unknownCat) {
+        const err = new Error(`${f.key} に金額列へ反映できない区分 (${unknownCat.category}) の明細があります。`);
+        err.statusCode = 500;
+        throw err;
+      }
+      // 全行が既に同じ原価で手入力済なら no-op
+      if (rows.every(r => r.原価状態 === MANUAL_FIX_STATUS && Number(r.原価) === f.cost)) continue;
       let delta = 0;
       for (const r of rows) {
         const newValue = Number(r.数量 || 0) * f.cost;
         const d = newValue - Number(r.金額 || 0);
         updRow.run(f.cost, newValue, MANUAL_FIX_STATUS, r.id);
         const col = CATEGORY_COLUMN[r.category];
-        if (col) deltaByCol[col] = (deltaByCol[col] || 0) + d;
+        deltaByCol[col] = (deltaByCol[col] || 0) + d;
         delta += d;
         updated_rows++;
       }
       const head = rows[0];
-      insFix.run(snapshotId, f.key, head.商品コード || null, head.seller_sku || null, head.商品名 || '', f.cost, rows.length, delta, created_by, now);
+      insFix.run(snapshotId, snap.snapshot_date, f.key, head.商品コード || null, head.seller_sku || null, head.商品名 || '', f.cost, rows.length, delta, created_by, now);
       updated_items++;
     }
     if (updated_items === 0) return { updated_items: 0, updated_rows: 0, totals: null, snapshot_date: snap.snapshot_date };
@@ -748,8 +774,13 @@ export function applyCostFixes(snapshotId, fixes, { created_by = null } = {}) {
     };
     const total = cols.fba_warehouse + cols.fba_inbound + cols.own_warehouse + cols.fba_us
       + (snap.fba_us_inbound || 0) + (snap.pending_orders || 0) + (snap.manual_adjustment || 0);
-    const noteTag = `[原価手入力 ${now.slice(0, 10)}: ${updated_items}商品]`;
-    const note = snap.note ? `${snap.note} ${noteTag}` : noteTag;
+    // note には「手入力あり」の目印を 1 つだけ残す (再編集のたびに増やさない。詳細は inv_snapshot_cost_fix)
+    const fixedItems = db.prepare(
+      `SELECT COUNT(DISTINCT item_key) AS n FROM inv_snapshot_cost_fix WHERE snapshot_id = ?`
+    ).get(snapshotId).n;
+    const noteTag = `[原価手入力 ${now.slice(0, 10)}: ${fixedItems}商品]`;
+    const baseNote = (snap.note || '').replace(/\s*\[原価手入力 [^\]]*\]/g, '').trim();
+    const note = baseNote ? `${baseNote} ${noteTag}` : noteTag;
     db.prepare(
       'UPDATE inv_snapshot SET fba_warehouse = ?, fba_inbound = ?, own_warehouse = ?, fba_us = ?, total = ?, note = ? WHERE id = ?'
     ).run(cols.fba_warehouse, cols.fba_inbound, cols.own_warehouse, cols.fba_us, total, note, snapshotId);
@@ -781,6 +812,7 @@ export function countUnresolvedCostBySnapshot() {
            COUNT(DISTINCT CASE WHEN 原価状態 IN (${ph}) OR 原価状態 IS NULL THEN ${keyExpr} END) AS unresolved_count,
            COUNT(DISTINCT CASE WHEN 原価状態 = ? THEN ${keyExpr} END) AS fixed_count
     FROM inv_snapshot_detail
+    WHERE 数量 > 0
     GROUP BY snapshot_id
   `).all(...unresolvedList, MANUAL_FIX_STATUS);
   return new Map(rows.map(r => [r.snapshot_id, { unresolved_count: r.unresolved_count, fixed_count: r.fixed_count }]));

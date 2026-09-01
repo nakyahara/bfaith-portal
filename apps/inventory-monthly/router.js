@@ -1218,7 +1218,8 @@ router.get('/history/:id', (req, res) => {
   const CAT_LABEL = { fba_warehouse: 'FBA倉庫', fba_inbound: 'FBA輸送中', own_warehouse: '自社倉庫', fba_us: '米国FBA' };
   let costAlertHtml = '';
   if (costInfo.unresolved_count > 0) {
-    costAlertHtml = `<div class="alert-danger">🚨 <b>原価が取れず 0円で計上されている商品が ${costInfo.unresolved_count}件 (数量 ${costInfo.unresolved_qty.toLocaleString('ja-JP')}個) あります。</b>
+    const hasPartial = costInfo.items.some(it => it.原価状態 !== MANUAL_FIX_STATUS && it.current_value > 0);
+    costAlertHtml = `<div class="alert-danger">🚨 <b>原価が取れず 0円${hasPartial ? ' (一部は部分原価)' : ''}で計上されている商品が ${costInfo.unresolved_count}件 (数量 ${costInfo.unresolved_qty.toLocaleString('ja-JP')}個) あります。</b>
       合計 ${yen(s.total)} はその分だけ過小です。<a href="#costfix" style="color:#58151c;font-weight:bold">↓ 下の表で原価を入力</a>すると合計に反映されます。</div>`;
   } else if (costInfo.fixed_count > 0) {
     costAlertHtml = `<div class="alert-ok">✅ 原価未登録なし (手入力で補った商品 ${costInfo.fixed_count}件を含む → <a href="#costfix">一覧</a>)</div>`;
@@ -1235,14 +1236,18 @@ router.get('/history/:id', (req, res) => {
     const prevHint = (it.prev_cost != null) ? `<br><small class="hint">前回 ${esc(it.prev_snapshot_date)} に ¥${Number(it.prev_cost).toLocaleString('ja-JP')} を手入力</small>` : '';
     const currentCost = (it.原価 != null) ? String(it.原価) : '';
     const placeholder = (it.prev_cost != null) ? String(it.prev_cost) : '税抜原価';
-    return `<tr data-key="${esc(it.key)}" data-qty="${it.total_qty}" data-orig="${esc(currentCost)}">
+    // 未解決でも PARTIAL_SET (構成品の一部だけ原価あり) は 0 円でないことがある → 現在計上額をそのまま見せる
+    const currentValueHtml = (it.原価 != null)
+      ? yen(it.total_qty * it.原価)
+      : (it.current_value > 0 ? `<span style="color:#dc3545">${yen(it.current_value)}<br><small class="hint">部分原価</small></span>` : '<span style="color:#dc3545">¥0</span>');
+    return `<tr data-key="${esc(it.key)}" data-qty="${it.total_qty}" data-orig="${esc(currentCost)}" data-current-value="${Math.round(it.current_value)}">
       <td>${statusBadge(it.原価状態)}${it.原価状態 === MANUAL_FIX_STATUS ? '' : `<br><small class="hint">${esc(COST_STATUS_LABEL[it.原価状態] || '')}</small>`}</td>
       <td>${it.seller_sku ? esc(it.seller_sku) : '<span style="color:#999">-</span>'}</td>
       <td>${it.商品コード ? esc(it.商品コード) : '<span style="color:#999">未解決</span>'}</td>
       <td>${esc(it.商品名 || '')}${prevHint}</td>
       <td class="num" title="${esc(cats)}">${it.total_qty.toLocaleString('ja-JP')}<br><small class="hint">${esc(cats)}</small></td>
       <td><input type="number" min="0" step="any" inputmode="decimal" placeholder="${esc(placeholder)}" value="${esc(currentCost)}" oninput="costChanged(this)"></td>
-      <td class="num cost-value">${it.原価 != null ? yen(it.total_qty * it.原価) : '<span style="color:#dc3545">¥0</span>'}</td>
+      <td class="num cost-value">${currentValueHtml}</td>
     </tr>`;
   }).join('');
   const costFixHtml = costInfo.items.length === 0 ? '' : `
@@ -1395,24 +1400,27 @@ function costChanged(input) {
   const tr = input.closest('tr');
   const qty = Number(tr.dataset.qty) || 0;
   const orig = tr.dataset.orig === '' ? null : Number(tr.dataset.orig);
+  const currentValue = Number(tr.dataset.currentValue) || 0;
   const v = input.value === '' ? null : Number(input.value);
   const cell = tr.querySelector('.cost-value');
   if (v == null || !Number.isFinite(v) || v < 0) {
-    cell.innerHTML = orig != null ? yenFmt(qty * orig) : '<span style="color:#dc3545">¥0</span>';
+    cell.innerHTML = orig != null ? yenFmt(qty * orig) : '<span style="color:#dc3545">' + yenFmt(currentValue) + '</span>';
     cell.classList.remove('changed');
   } else {
     cell.textContent = yenFmt(qty * v);
     cell.classList.toggle('changed', v !== orig);
   }
-  // 入力による増減 (未保存分) を合計行に出す
+  // 入力による増減 (未保存分) を合計行に出す = 数量×新原価 − 現在計上額
   let delta = 0;
   for (const row of document.querySelectorAll('table.costfix tbody tr')) {
     const q = Number(row.dataset.qty) || 0;
-    const o = row.dataset.orig === '' ? 0 : Number(row.dataset.orig);
+    const cur = Number(row.dataset.currentValue) || 0;
     const inp = row.querySelector('input');
     const nv = inp.value === '' ? null : Number(inp.value);
     if (nv == null || !Number.isFinite(nv) || nv < 0) continue;
-    delta += q * (nv - o);
+    const o = row.dataset.orig === '' ? null : Number(row.dataset.orig);
+    if (o != null && nv === o) continue;
+    delta += q * nv - cur;
   }
   const deltaEl = document.getElementById('costDelta');
   deltaEl.textContent = (delta >= 0 ? '+' : '') + yenFmt(delta);
@@ -1427,7 +1435,8 @@ function collectCostFixes() {
     if (!Number.isFinite(cost) || cost < 0) continue;
     const orig = row.dataset.orig === '' ? null : Number(row.dataset.orig);
     if (orig != null && cost === orig) continue; // 変更なし
-    fixes.push({ key: row.dataset.key, cost });
+    // expected_qty = 画面表示時の数量。保存時に DB と違えばサーバが 409 で止める (古い画面からの誤反映防止)
+    fixes.push({ key: row.dataset.key, cost, expected_qty: Number(row.dataset.qty) });
   }
   return fixes;
 }
@@ -1478,9 +1487,12 @@ function dlCostFixCsv() {
 }
 
 function dlUnresolvedCsv() {
+  // 閲覧用CSV: Excel の数式として評価される先頭文字 (= + - @) はクォートして無害化
+  // (マスタ登録用CSVは取込先で商品コードが変わるためこの処理をしない)
+  const safe = (v) => { const s = String(v == null ? '' : v); return /^[=+\\-@\\t\\r]/.test(s) ? "'" + s : s; };
   const rows = [['状態', 'Amazon SKU', '商品コード', '商品名', '数量', '現在の原価', '前回手入力']];
   for (const it of COST_ITEMS) {
-    rows.push([it.原価状態, it.seller_sku || '', it.商品コード || '', it.商品名 || '', String(it.total_qty), it.原価 == null ? '' : String(it.原価), it.prev_cost == null ? '' : String(it.prev_cost)]);
+    rows.push([it.原価状態, safe(it.seller_sku), safe(it.商品コード), safe(it.商品名), String(it.total_qty), it.原価 == null ? '' : String(it.原価), it.prev_cost == null ? '' : String(it.prev_cost)]);
   }
   downloadCsvText('unresolved_cost_' + ${jsonEmbed(s.snapshot_date)} + '.csv', rows);
 }
@@ -1568,7 +1580,13 @@ router.post('/history/:id/cost-fix', json({ limit: '256kb' }), (req, res) => {
     if (!Number.isFinite(cost) || cost < 0 || cost > COST_CAP) return res.status(400).json({ error: `原価が不正です (${key}): 0〜${COST_CAP} の数値で入力してください` });
     if (seen.has(key)) continue;
     seen.add(key);
-    fixes.push({ key, cost: Math.round(cost * 100) / 100 });
+    // expected_qty: 画面表示時の対象数量 (省略可)。DB と食い違えば 409 で止める
+    let expected_qty = null;
+    if (f?.expected_qty != null && f.expected_qty !== '') {
+      expected_qty = Number(f.expected_qty);
+      if (!Number.isFinite(expected_qty)) return res.status(400).json({ error: `expected_qty が不正です (${key})` });
+    }
+    fixes.push({ key, cost: Math.round(cost * 100) / 100, expected_qty });
   }
 
   try {
@@ -1576,11 +1594,11 @@ router.post('/history/:id/cost-fix', json({ limit: '256kb' }), (req, res) => {
     const result = applyCostFixes(id, fixes, { created_by });
     if (!result) return res.status(404).json({ error: 'snapshot が見つかりません' });
     if (result.updated_items === 0) {
-      return res.status(409).json({ error: '対象の明細がありません (既にマスタで解決済みか、ページが古い可能性があります。再読み込みしてください)' });
+      return res.status(409).json({ error: '変更のある明細がありません (既に同じ原価で保存済み・マスタで解決済み・ページが古い のいずれか。再読み込みしてください)' });
     }
     res.json({ ok: true, ...result });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(e.statusCode || 500).json({ error: e.message });
   }
 });
 
@@ -1654,6 +1672,8 @@ apiRouter.post('/save-month-end', (req, res) => {
       'SELECT id, total, created_at, note FROM inv_snapshot WHERE snapshot_date = ?'
     ).get(snapshot_date);
     if (existing && !force) {
+      // skip でも原価未登録が残っていれば件数を返す (翌日以降の通知にも出す。Codex R1 #9)
+      const existingCost = listUnresolvedCostItems(existing.id);
       return res.json({
         ok: true,
         snapshot_date,
@@ -1661,6 +1681,9 @@ apiRouter.post('/save-month-end', (req, res) => {
         skipped: true,
         reason: `既存 snapshot あり (id=${existing.id}, created_at=${existing.created_at}, note=${existing.note || 'なし'})。上書きしないため cron では skip。force=1 で強制上書き可能`,
         existing_total: existing.total,
+        unresolved_cost_count: existingCost.unresolved_count,
+        unresolved_cost_qty: existingCost.unresolved_qty,
+        history_path: `/apps/inventory-monthly/history/${existing.id}`,
       });
     }
 
