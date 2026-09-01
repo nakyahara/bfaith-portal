@@ -42,7 +42,27 @@
 
   <div class="ic-wrap">
     <div class="ic-box">
-      <h2>📥 入荷受付 CSV を取り込む (手動)</h2>
+      <h2>☁️ 自動取込 (通常はこちら)</h2>
+      <p class="hint">
+        miniPC が毎朝ロジザードから CSV を出して共有ドライブへ置き、それをこの画面が <b>30分おきに自動で取り込みます</b>
+        (JST 6〜20時台)。同じ内容なら取り込まないので、何度巡回しても増えません。
+      </p>
+      <% if (drive && drive.drive) { %>
+        <p>Drive のファイル: <code><%= drive.drive.name %></code> ・ 更新 <span data-jst="<%= drive.drive.modified_time || drive.drive.modifiedTime %>"></span>
+          <% if (drive.drive.size != null) { %>・ <%= Math.round(drive.drive.size / 1024) %> KB<% } %></p>
+      <% } else if (drive && drive.driveError) { %>
+        <p class="ng">⚠ Drive を見に行けません: <%= drive.driveError %></p>
+      <% } else { %>
+        <p class="ng">Drive の情報を取得できていません</p>
+      <% } %>
+      <div class="row">
+        <button id="fetchDriveBtn" type="button">☁️ Drive から今すぐ取り込む</button>
+        <span id="fetchMsg" class="msg"></span>
+      </div>
+    </div>
+
+    <div class="ic-box">
+      <h2>📥 入荷受付 CSV を取り込む (手動アップロード・自動が止まったとき用)</h2>
       <p class="hint">
         ロジザード <b>入荷状況照会 [FA04_01]</b> で「検索範囲: 当日から7日前まで / 対象データ: 受付済」で検索 → CSV エクスポートしたファイル
         (<code>CA04001_….csv</code>、Shift-JIS) を選んでください。取り込むと iPad の一覧が<b>丸ごと入れ替わり、確認状態は未確認から始まります</b>。<br>
@@ -164,6 +184,29 @@
     document.querySelectorAll('[data-jst]').forEach(el => { el.textContent = fmtJst(el.getAttribute('data-jst')); });
     const postJson = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }).then(async r => ({ status: r.status, j: await r.json().catch(() => ({})) }));
     const msg = (el, ok, text) => { el.className = 'msg ' + (ok ? 'ok' : 'err'); el.textContent = text; };
+
+    const fetchBtn = $('#fetchDriveBtn');
+    if (fetchBtn) fetchBtn.addEventListener('click', async () => {
+      fetchBtn.disabled = true;
+      msg($('#fetchMsg'), true, 'Drive から取得中…');
+      try {
+        const r = await fetch(BASE + '/admin/fetch-drive', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        const j = await r.json().catch(() => ({}));
+        if (j.ok) {
+          msg($('#fetchMsg'), true, '取り込みました: ' + j.slipCount + ' 伝票 / ' + j.rowCount + ' 行');
+          setTimeout(() => location.reload(), 800);
+          return;   // reload するのでボタンは戻さない
+        } else if (j.error === 'duplicate_file') {
+          msg($('#fetchMsg'), true, '最新の CSV は取込済みです (変更なし)');
+        } else {
+          msg($('#fetchMsg'), false, j.message || j.error || ('HTTP ' + r.status));
+        }
+      } catch (e) {
+        msg($('#fetchMsg'), false, '通信できませんでした: ' + e.message);
+      } finally {
+        fetchBtn.disabled = false;
+      }
+    });
 
     $('#uploadBtn').addEventListener('click', async () => {
       const f = $('#csvFile').files[0];

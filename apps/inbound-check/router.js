@@ -21,6 +21,7 @@ import {
   createDevice, verifyDevice, revokeDevice, listDevices,
   listWorkers, getWorker,
 } from './db.js';
+import { fetchAndImportFromDrive, statusForView, driveConfig } from './drive-fetch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -172,7 +173,9 @@ router.post('/api/lines/check', checkOrigin, handleCheck('check'));
 router.post('/api/lines/uncheck', checkOrigin, handleCheck('uncheck'));
 
 // ─── 管理画面 ───
-router.get('/admin', requireSession, (req, res) => {
+router.get('/admin', requireSession, api(async (req, res) => {
+  let drive = null;
+  try { drive = await statusForView(); } catch (e) { drive = { driveError: e.message, config: driveConfig() }; }
   res.render(path.join(__dirname, 'views/admin'), {
     title: '入荷受付チェック 管理',
     username: req.session.email,
@@ -184,8 +187,9 @@ router.get('/admin', requireSession, (req, res) => {
     importLog: listImportLog(20),
     devices: isAdmin(req) ? listDevices() : [],
     workers: listWorkers(),   // = スタッフマスタの有効スタッフ (表示のみ。編集は /apps/staff)
+    drive,
   });
-});
+}));
 
 // CSV 取込 (アプリ利用者なら誰でも = 取込復旧は中原さん + 事務担当)。
 // file_modified = ブラウザ File.lastModified (ms)。CSV 生成時刻として順序逆転の判定に使う
@@ -193,11 +197,28 @@ router.post('/admin/upload', requireSession, checkOrigin, upload.single('file'),
   if (!req.file) return res.status(400).json({ ok: false, error: 'no_file', message: 'ファイルがありません' });
   let buf;
   try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch { /* 一時ファイルの掃除失敗は無視 */ } }
+  // ブラウザの File.lastModified は利用者が任意に設定できる。未来時刻を許すと以後の自動取込が
+  // 「古いファイル」として全部拒否されるので、未来なら受信時刻に丸める (Codex R6 Med-5)
   const lm = Number(req.body?.file_modified);
-  const generatedAt = Number.isFinite(lm) && lm > 0 ? new Date(lm).toISOString() : null;
+  const now = Date.now();
+  const generatedAt = Number.isFinite(lm) && lm > 0 ? new Date(Math.min(lm, now)).toISOString() : null;
   const r = importCsv(buf, { fileName: req.file.originalname, source: 'manual_upload', actor: req.session.email, generatedAt });
   if (!r.ok) return res.status(r.error === 'bad_csv' ? 400 : 409).json(r);
   res.json(r);
+}));
+
+/**
+ * Drive から今すぐ取り込む (miniPC が置いた最新CSV)。通常は cron が 30 分おきに自動で行う。
+ * 手動アップロードと同じ取込ロジックを通るので、fail-closed の判定もそのまま効く。
+ */
+router.post('/admin/fetch-drive', requireSession, checkOrigin, api(async (req, res) => {
+  try {
+    const r2 = await fetchAndImportFromDrive({ actor: req.session.email, source: 'drive_retry' });
+    if (!r2.ok) return res.status(r2.error === 'bad_csv' ? 400 : 409).json(r2);
+    res.json(r2);
+  } catch (e) {
+    res.status(502).json({ ok: false, error: 'drive_error', message: e.message });
+  }
 }));
 
 // 端末登録: 発行したトークンは httpOnly Cookie としてこの端末にだけ渡す。登録と同時に管理者セッションを破棄
