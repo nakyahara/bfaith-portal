@@ -315,16 +315,17 @@ export const JOBS_REGISTRY = [
       + ' (管理画面から手動アップロードで凌げるので P2)。'
       + '⭐0件の日は正常 (受付済なし = 全部検品済み)。ヘッダだけの CSV を Drive まで送り、一覧を空にする',
     where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\tools\logizard-automation\run-nyuka-csv-scheduled.bat',
-    schedule: '毎日 08:30 / 12:00',
+    schedule: '毎日 08:40 / 11:45',
     anchor_hour_jst: 8,
-    anchor_minute_jst: 30,
+    anchor_minute_jst: 40,
     grace_hours: 6,
     lifecycle: 'permanent',
     runbook: 'C:\tools\logizard-automation\logs\scheduled.log の [nyuka-csv] を確認 (手で試すなら node auto-nyuka-csv.js --dry)。'
       + '取込側の状態は /apps/inbound-check/admin (Drive の更新日時・取込履歴・失敗理由。「Drive から今すぐ取り込む」ボタンあり)。'
       + 'env = LOGIZARD_NYUKA_CSV_OUT / LOGIZARD_NYUKA_CSV_RCLONE_DEST (miniPC の .env)。'
-      + '⚠ロックは在庫CSV・値札CSV (08:30) と共有 (logizard-session.lock)。同じ 08:30 に走るので、'
-      + 'bat が最大10分ロックの解放を待ってから node を起動する (実測: 値札CSVの終了後に正常実行)。'
+      + '⚠ロックは他のロジザード自動化と共有 (logizard-session.lock)。**時刻はどれとも重ならないように選んである**: '
+      + '値札CSV 08:30 / 緊急補充 08:50 / 在庫CSV 毎時00分 → この処理は 08:40 と 11:45。'
+      + '保険として bat が最大10分ロックの解放を待ってから node を起動する (node の acquireLock は失敗時に即終了するため)。'
       + '異常終了で残ったロックは PID の死亡を確認して削除。'
       + '画面採取の正本 = AI_reference『ロジザード作業自動化\入荷状況照会CSV_画面採取_20260901.md』',
   },
