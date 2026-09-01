@@ -2788,19 +2788,22 @@ let wfSetParentId = null;
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
       }
       {
-        // ⑦と⑧の間に管理画面から工程を足した状態 (image_stage は NULL)。
-        // 制作の境界は ⑦ なので、その工程が残っていても「済」でよい
+        // 管理画面から画像工程を足した状態。**実際の作成経路 (createStep) を通す** (Codex R4 medium):
+        // 直接 INSERT で listing_gate=0 を指定すると、既定値 1 で作られる本番と違う前提を固定してしまう。
+        // 既定 1 = 「制作に必要な工程」扱い → 終わるまで「まだ」(fail-closed。楽天出品ゲートも同じ扱い)
         const id = mk2('WF-MADE-CUSTOM');
-        db.prepare(`INSERT INTO ph_steps (code, label, track, image_kind, image_stage, role_code, sort, builtin, skippable, listing_gate, active)
-                    VALUES ('step_smoke_mid', '追加工程 (smoke)', 'image', 'detail', NULL, NULL, 75, 0, 1, 0, 1)`).run();
+        const customCode = wf.createStep({ label: '追加工程 (smoke)', track: 'image', image_kind: 'detail' });
         wfp.ensureProgress(db, id);
         wfp.setStepState(id, 'imgd_amazon', { state: 'done' }, 'smoke', ADMIN);
-        const t = detailOf(id);
-        db.prepare("DELETE FROM draft_step_progress WHERE step_code = 'step_smoke_mid'").run();
-        db.prepare("DELETE FROM ph_steps WHERE code = 'step_smoke_mid'").run();
-        check('ボード: ⑦の後にカスタム工程が挟まっても「済」 (境界は ⑦)',
-          t?.made === true && t?.current?.step_code === 'step_smoke_mid',
-          JSON.stringify({ made: t?.made, cur: t?.current?.step_code }));
+        const tBefore = detailOf(id);
+        wfp.setStepState(id, customCode, { state: 'done' }, 'smoke', ADMIN);
+        const tAfter = detailOf(id);
+        db.prepare('DELETE FROM draft_step_progress WHERE step_code = ?').run(customCode);
+        db.prepare('DELETE FROM ph_steps WHERE code = ?').run(customCode);
+        check('ボード: 管理画面で足した画像工程が未完了なら「まだ」 (既定で制作に数える)',
+          tBefore?.made === false, JSON.stringify({ made: tBefore?.made, cur: tBefore?.current?.step_code }));
+        check('ボード: その工程が終われば「済」',
+          tAfter?.made === true, JSON.stringify({ made: tAfter?.made, cur: tAfter?.current?.step_code }));
         db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
       }
     }
