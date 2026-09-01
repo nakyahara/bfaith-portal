@@ -67,6 +67,8 @@ const YAHOO_API_GAP_MS = 1200;
  * ★self-test より前に置く (const は巻き上がらないので、後ろに書くと self-test から見えない)。
  */
 const PRICE_ONLY_KEYS = new Set(['item_code', 'price', 'sale_price', 'subcode_price']);
+/** Yahoo に送ってよい価格の上限 (楽天側のガードと同じ) */
+const MAX_YAHOO_PRICE = 999999999;
 
 // --self-test は起動前に処理する。secret も外部通信も要らない純粋なパーサ検証なので、
 // PROXY_SECRET の必須チェックより前に置く (手元でも VPS 上でも同じコードを確かめられるように)
@@ -1783,7 +1785,37 @@ function assertPriceOnlyItems(items, { clearSalePrice = false } = {}) {
       throw new Error(`update-items: ${i + 1}件目の sale_price が空です。`
         + '空文字は「セール価格を消す」意味になります。消してよいなら clearSalePrice:true を付けてください');
     }
+    // ★値そのものも検査する (Codex R15)。キーだけ見ていると 0円・空・負数・文字列が通り、
+    //   このエンドポイントを直接叩かれた時に価格を壊せる
+    const code = String(item.item_code ?? '').trim();
+    if (!/^[A-Za-z0-9._-]{1,99}$/.test(code)) {
+      throw new Error(`update-items: ${i + 1}件目の item_code が商品コードの形をしていません (${code})`);
+    }
+    if ('price' in item && !isSaneYahooPrice(item.price)) {
+      throw new Error(`update-items: ${i + 1}件目の price が 1〜${MAX_YAHOO_PRICE} の整数ではありません (${item.price})`);
+    }
+    if ('sale_price' in item && String(item.sale_price ?? '') !== '' && !isSaneYahooPrice(item.sale_price)) {
+      throw new Error(`update-items: ${i + 1}件目の sale_price が 1〜${MAX_YAHOO_PRICE} の整数ではありません (${item.sale_price})`);
+    }
+    if ('subcode_price' in item) {
+      // 書式: サブコード:価格 をパイプ区切り (例 aaaa:1000|bbbb:1200)
+      const parts = String(item.subcode_price ?? '').split('|');
+      for (const part of parts) {
+        const [sub, val] = part.split(':');
+        if (!sub || !/^[A-Za-z0-9._-]{1,99}$/.test(sub.trim()) || !isSaneYahooPrice(val)) {
+          throw new Error(`update-items: ${i + 1}件目の subcode_price の書式が正しくありません (${part})`);
+        }
+      }
+    }
   });
+}
+
+/** Yahoo に送ってよい価格か (正の整数円)。★0円・空・負数・小数・文字列は通さない */
+function isSaneYahooPrice(v) {
+  const s = String(v ?? '').trim();
+  if (!/^\d+$/.test(s)) return false;
+  const n = Number(s);
+  return Number.isSafeInteger(n) && n >= 1 && n <= MAX_YAHOO_PRICE;
 }
 
 /**
@@ -2007,6 +2039,19 @@ function runSelfTest() {
   check('update-items: 消してよいと言われたら通る',
     tryAssert([{ item_code: 'a', price: '1000', sale_price: '' }], { clearSalePrice: true }), 'ok');
   check('update-items: 空の items は拒否', tryAssert([]), 'update-items: items が空です');
+  // ★値そのものの検査 (このエンドポイントを直接叩かれても価格を壊せないように)
+  check('update-items: ★0円は通さない', tryAssert([{ item_code: 'a', price: '0' }]).includes('price が 1〜'), true);
+  check('update-items: ★空の価格は通さない', tryAssert([{ item_code: 'a', price: '' }]).includes('price が 1〜'), true);
+  check('update-items: ★負数は通さない', tryAssert([{ item_code: 'a', price: '-100' }]).includes('price が 1〜'), true);
+  check('update-items: ★小数は通さない', tryAssert([{ item_code: 'a', price: '100.5' }]).includes('price が 1〜'), true);
+  check('update-items: ★文字列は通さない', tryAssert([{ item_code: 'a', price: 'お問い合わせ' }]).includes('price が 1〜'), true);
+  check('update-items: 上限超えは通さない', tryAssert([{ item_code: 'a', price: '1000000000' }]).includes('price が 1〜'), true);
+  check('update-items: 上限ちょうどは通る', tryAssert([{ item_code: 'a', price: '999999999' }]), 'ok');
+  check('update-items: ★商品コードの形も見る', tryAssert([{ item_code: 'a b/c', price: '100' }]).includes('item_code が商品コードの形'), true);
+  check('update-items: 実際の商品コードは通る', tryAssert([{ item_code: '0726-001802-bk', price: '577' }]), 'ok');
+  check('update-items: セール価格の値も見る', tryAssert([{ item_code: 'a', price: '100', sale_price: '0' }]).includes('sale_price が 1〜'), true);
+  check('update-items: SKU別価格の書式を見る', tryAssert([{ item_code: 'a', subcode_price: 'x:0' }]).includes('subcode_price の書式'), true);
+  check('update-items: SKU別価格の正しい書式は通る', tryAssert([{ item_code: 'a', subcode_price: 'x:1000|y:1200' }]), 'ok');
   check('yahoo応答: Status OK は成功', yahooXmlOk({ status: 200, body: '<ResultSet><Status>OK</Status></ResultSet>' }), true);
   check('yahoo応答: ★HTTP 200 でも Error があれば失敗', yahooXmlOk({ status: 200, body: '<ResultSet><Result><Error><Code>x</Code></Error></Result></ResultSet>' }), false);
   check('yahoo応答: Status NG は失敗', yahooXmlOk({ status: 200, body: '<ResultSet><Status>NG</Status></ResultSet>' }), false);
