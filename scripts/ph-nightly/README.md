@@ -34,7 +34,12 @@
   install.ps1 が deny を外して更新し、途中で失敗しても `finally` で掛け直す
 - タスクは **RunLevel Limited**: bfaith は Administrators 所属なので、Highest だと昇格トークンで ACL を外せてしまう (R3 high 1)
 - `./phreview ID` は Codex 検品の固定ラッパー (プロンプト固定・`_ph_review_<ID>.md` 固定で実体ファイルか lstat 検査・
-  `--sandbox read-only` 固定・timeout 600 秒)。`codex exec *` を直接許可すると任意プロンプト・任意オプションを渡せる (R2/R3 critical)
+  `--sandbox read-only` 固定・timeout 600 秒)。`codex exec *` を直接許可すると任意プロンプト・任意オプションを渡せる (R2/R3 critical)。
+  🚨 **ファイルの中身はラッパーが読んで stdin で渡す** (2026-09-01)。codex 0.150.1 の read-only sandbox は Windows で
+  `powershell.exe` も `cmd.exe` も "blocked by policy" で spawn 拒否するため、「Codex に読ませる」形は必ず失敗する。
+  stdin ならサンドボックスの exec 方針に依存せず、他のファイルを読ませない担保も強くなる
+- 一時ファイルの削除も phq に閉じる (`./phq clean <ID>`)。`rm` は allow から外した — `rm -f a b c` のような形は
+  パターンを外れて拒否され、逆に緩いパターンを足すと work の外まで消せてしまう
 外部ページ由来の prompt injection があっても「秘密情報を読んで外へ送る」「コードや手順を書き換えて実行する」経路が無い。
 残るリスク (承知の上): phq の lstat と open の間の TOCTOU (Claude は `ln`/`mklink` を実行できないので実用上は無視できる)。
 
@@ -82,7 +87,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
 - **人待ち (⚠ AIが止めました)**: ボードのカードに理由。基本情報を直して詳細画面の「解除する」→ 次の夜に再挑戦
 - **朝のチェック**: jobs-monitor の要対応に `ph-generate-nightly` が出たら `C:\tools\ph-nightly\logs\runner.log` の末尾
   - `not logged in` → bfaith で `cd C:\tools\ph-nightly\work ; claude` → `/login`
-  - `no progress` → 同じ logs の `*.err.log` (permission denied / codex 未ログイン / Amazon の HTML 構造変更)
+  - `no progress` → 同じ logs の `*.err.log` (permission denied / codex 未ログイン / Amazon の HTML 構造変更)。
+    `*.out.log` の `permission_denials` と Claude の最後の報告も見る。**検品ゲートが環境要因で全滅すると
+    「lint は通るのに 1 件も submit できない」形で止まる** (9/1 の実例 = codex の sandbox が powershell を拒否)
   - `timeout` → 件数が多かっただけとは限らない (ハング・認証・Codex 停止も)。`*.out.log` で最後に何をしていたか見る
   - `partial` → 翌晩に続く。連日続くなら件数か時間の見直し
 - **スキルを直したい**: PR で `.claude/skills/ph-generate/SKILL.md` を変更 → miniPC で `git pull` → `install.ps1` (コピーなので再 install が要る)

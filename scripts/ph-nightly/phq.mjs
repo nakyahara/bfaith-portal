@@ -24,6 +24,7 @@
  *   ./phq find    page-ID.html needle [needle...]            JAN/ASIN 等がページ内にあるか (同一性確認)
  *   ./phq lint    copy-ID.json                               copy_lint.py を固定パスで実行
  *   ./phq search-amazon JAN --out page-s-ID.html             JAN で Amazon 検索して候補 ASIN を出す
+ *   ./phq clean   ID                                         その draft の一時ファイルを work/ 直下から消す
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -202,6 +203,27 @@ function cmdCheckReview(pos) {
   if (!st || !st.isFile()) die(`${name} is missing or not a regular file`);
   out({ ok: true, file: name, bytes: st.size });
 }
+
+/**
+ * clean ID — その draft の一時ファイルを作業ディレクトリ直下から消す。
+ * rm を Claude に許可すると `rm -f a b c` のようにパターンを外れた形が拒否され (9/1 夜間の実例)、
+ * かといって `rm -f *` を allow に足すと work 外まで消せてしまう → 削除も phq に閉じる。
+ * 名前は ID から組み立てるので任意パスは渡らない。無いファイルは黙って飛ばす (何度呼んでも同じ)。
+ */
+function cmdClean(pos) {
+  const id = pos[0]; if (!/^\d{1,9}$/.test(id || '')) die('usage: clean ID');
+  const cwd = fs.realpathSync(process.cwd());
+  const names = [`page-${id}.html`, `page-s-${id}.html`, `facts-${id}.md`, `copy-${id}.json`, `reason-${id}.txt`, `_ph_review_${id}.md`];
+  const removed = []; const skipped = [];
+  for (const name of names) {
+    const abs = path.join(cwd, name);
+    let st = null; try { st = fs.lstatSync(abs); } catch { continue; }   // 無い = 何もしない
+    if (!st.isFile()) { skipped.push({ name, why: 'not a regular file' }); continue; }   // symlink/ディレクトリは触らない
+    try { fs.unlinkSync(abs); removed.push(name); } catch (e) { skipped.push({ name, why: String(e.code || e.message) }); }
+  }
+  out({ ok: skipped.length === 0, removed, skipped });
+  if (skipped.length) fail(1);
+}
 async function cmdFetch(pos, opt) {
   if (!pos[0] || !opt.out) die('usage: fetch URL --out page-ID.html');
   const r = await fetchToFile(pos[0], String(opt.out));
@@ -319,6 +341,6 @@ function cmdLint(pos) {
 
 const { pos, opt } = parseArgs(process.argv.slice(2));
 const cmd = pos.shift();
-const table = { queue: cmdQueue, claim: cmdClaim, block: cmdBlock, release: cmdRelease, submit: cmdSubmit, fetch: cmdFetch, extract: cmdExtract, find: cmdFind, lint: cmdLint, 'search-amazon': cmdSearchAmazon, checkreview: cmdCheckReview };
+const table = { queue: cmdQueue, claim: cmdClaim, block: cmdBlock, release: cmdRelease, submit: cmdSubmit, fetch: cmdFetch, extract: cmdExtract, find: cmdFind, lint: cmdLint, 'search-amazon': cmdSearchAmazon, checkreview: cmdCheckReview, clean: cmdClean };
 if (!cmd || !table[cmd]) die(`usage: phq <${Object.keys(table).join('|')}> ...`);
 Promise.resolve(table[cmd](pos, opt)).catch((e) => { process.stderr.write(`phq: ${String(e.message || e)}\n`); fail(1); });

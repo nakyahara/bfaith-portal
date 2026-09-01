@@ -15,7 +15,8 @@ description: product-hub の生成待ち商品の説明文6項目を AI 生成�
 **HTTP・トークン・URL 制限・ファイル名制限はすべて phq の中**。ファイル引数は作業ディレクトリ直下の
 `page-<ID>.html` / `copy-<ID>.json` / `reason-<ID>.txt` という名前しか受け付けない (パス付き・別名は拒否される)。
 🚨 トークンファイル (`~/.claude/secrets/...`) を **読まない・表示しない**。`curl` / `node` / `python` / `codex` を直接使わない (無人実行では deny)。
-手動実行で `./phq` が無ければ `node <repo>/scripts/ph-nightly/phq.mjs` を `./phq` の代わりに、`codex exec` を `./phreview` の代わりに使う。
+手動実行で `./phq` が無ければ `node <repo>/scripts/ph-nightly/phq.mjs` を `./phq` の代わりに使う。`./phreview` の代わりは
+`codex exec --skip-git-repo-check --sandbox read-only - < _ph_review_ID.md` (ファイル名を読ませるのでなく **中身を stdin で** 流す)。
 
 ```
 ./phq queue                                              一覧 + queue {claimable, leased, blocked}
@@ -25,10 +26,11 @@ description: product-hub の生成待ち商品の説明文6項目を AI 生成�
 ./phq find    page-ID.html 4550433056625 B0DSL5D2CP      同一性確認 (JAN/ASIN/型番がページにあるか)
 ./phq search-amazon JAN --out page-s-ID.html             参照先が薄いとき JAN で ASIN 候補を出す
 ./phq lint    copy-ID.json                               copy_lint.py (文字数・NG語)
-./phreview    ID                                         Codex 検品 (_ph_review_ID.md を読ませる。プロンプト固定)
+./phreview    ID                                         Codex 検品 (_ph_review_ID.md を渡す。プロンプト固定)
 ./phq submit  ID --run RUN_ID --file copy-ID.json --advance --note "claude+codex YYYY-MM-DD"
 ./phq block   ID --run RUN_ID --code CODE --reason-file reason-ID.txt
 ./phq release ID --run RUN_ID --reason "一時障害の内容"
+./phq clean   ID                                         その draft の一時ファイルを消す (rm は使えない)
 ```
 
 ## 不変条件 (終了時に必ず成り立つこと)
@@ -38,7 +40,8 @@ description: product-hub の生成待ち商品の説明文6項目を AI 生成�
 - **1 件ずつ** claim する (lease は 30 分)
 - 夜間の上限 = 15 件 (`attempted = done + blocked + released + 409`)。手動実行で件数指定があればそれに従う
 - 一時ファイル (`page-*.html` / `facts-*.md` / `copy-*.json` / `reason-*.txt` / `_ph_review_*.md`) は
-  **done / blocked / released / 409 のどの結末でも、その draft を離れる前に削除**する
+  **done / blocked / released / 409 のどの結末でも、その draft を離れる前に `./phq clean ID` で削除**する
+  (`rm` は使えない。9/1 の夜間は `rm -f a b c` が allowlist を外れて拒否され、1.8MB の page-*.html が残った)
 
 ## 手順 (draft 1 件ごと)
 
@@ -119,6 +122,8 @@ reference_urls / specs / 画像数 / **sp_keywords** (中原さんが SP 広告�
 🚨 検品内容をシェル引数に埋め込まない (裏取りは外部ページ由来)。Write ツールで `_ph_review_ID.md` に
 「検品観点 / 裏取り事実 (facts-ID.md) / 生成物 6 項目」を書き、`./phreview ID` を実行する (プロンプトは固定・
 文字数を判定しない指示も入っている。Codex は全角 2 換算で誤判定する — 8/28 に 3 回)。
+ファイルの中身は phreview が読んで stdin で Codex に渡す (Codex 側はコマンドを実行できない環境なので、
+「Codex に読ませる」形にすると必ず失敗する — 9/1 に 12 件全滅した真因)。
 検品観点 = ①事実整合 (裏取りに無い仕様・効果・用途) ②景表法・薬機法・モール規約 ③誤字・不自然な日本語 ④訴求力。
 
 ```bash
@@ -138,7 +143,7 @@ reference_urls / specs / 画像数 / **sp_keywords** (中原さんが SP 広告�
 - 409 = 人がレビュー中 / 別実行が claim / lease 切れ / block 済み → **上書きせず**その draft は終わり (報告に `409` として残す)
 - 5xx は phq が 8 秒間隔で 4 回まで再送する (同じ内容の再送は安全)
 - `skipped_human_edited` は人の編集が優先された印 (正常)
-- **結末がどれでも** (done / blocked / released / 409) その draft の一時ファイルを `rm` してから次の claim へ
+- **結末がどれでも** (done / blocked / released / 409) その draft の一時ファイルを `./phq clean ID` で消してから次の claim へ
 
 ### 7. 報告
 

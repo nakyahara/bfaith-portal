@@ -11,11 +11,6 @@
       "Bash(./phreview *)",
       "Bash(ls)",
       "Bash(ls *)",
-      "Bash(rm _ph_review_*)",
-      "Bash(rm facts-*)",
-      "Bash(rm copy-*)",
-      "Bash(rm page-*)",
-      "Bash(rm reason-*)",
       "Read",
       "Write",
       "Edit"
@@ -48,7 +43,7 @@
       "Bash(ssh *)",
       "Bash(scp *)",
       "Bash(rclone *)",
-      "Bash(rm -r*)",
+      "Bash(rm *)",
       "Bash(mv *)",
       "Bash(cp *)",
       "Bash(ln *)",
@@ -70,8 +65,9 @@
   },
 
   "_notes": {
-    "allow ./phq": "queue/claim(常に1件)/block/release/submit/fetch/extract/find/lint/search-amazon。ファイル引数は work/ 直下の page-*.html / copy-*.json / reason-*.txt だけ",
-    "allow ./phreview": "Codex 検品。引数は draft ID だけ。プロンプト固定・_ph_review_<ID>.md 固定 (lstat で実体検査)・--sandbox read-only 固定・timeout 600 秒",
+    "allow ./phq": "queue/claim(常に1件)/block/release/submit/fetch/extract/find/lint/search-amazon/clean。ファイル引数は work/ 直下の page-*.html / copy-*.json / reason-*.txt だけ",
+    "allow ./phreview": "Codex 検品。引数は draft ID だけ。プロンプト固定・_ph_review_<ID>.md の中身はラッパーが読んで stdin で渡す (Codex は何も実行しない)・--sandbox read-only 固定・timeout 600 秒",
+    "deny rm": "一時ファイルの削除は ./phq clean ID に閉じた (2026-09-01)。rm を allow に置くと `rm -f a b c` のようにパターンを外れた形が拒否され、逆に緩いパターンを足すと work 外まで消せる",
     "deny 一式": "deny は allow より強い。./phq と ./phreview 以外の実行経路を残さない。ACL が本命で、パス deny は二重化 (Windows パス記法の効き方は初回実行で確認)",
     "Write/Edit": "生成物 (facts/copy/reason/_ph_review/page) を work/ 直下に書くために必要。bin/ と work/.claude (settings + スキルのコピー) は ACL + deny で書けない。タスクは RunLevel Limited なので昇格して ACL を外す経路も無い"
   },
