@@ -15,11 +15,13 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { loadDimMall } from '../../lib/dim-mall.js';
-import { getDB, insertRun, appendEvent, getRun, listRuns, newId } from './db.js';
+import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim } from './db.js';
 import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
 import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot } from './live-price.js';
 import { evaluateRow, runLimits } from './pricing.js';
 import { rakutenShippingLabel, yahooPostageLabel, rakutenShippingName, yahooPostageName } from './shipping-labels.js';
+import { executeRun, mallWriteEnabled } from './execute.js';
+import { patchItemPrices, fetchItemDetail } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
 import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -58,6 +60,29 @@ function actorOf(req) {
 function isAdmin(req) {
   return req.session?.role === 'admin';
 }
+/**
+ * 実行できる人か (要件⑨: 実行は中原さん + 奥様の2名)。
+ * ★画面でボタンを隠すだけでは防御にならない。API を直接叩かれてもここで止める。
+ * env PRICE_UPDATE_EXECUTORS にメールを並べて指定する (カンマ区切り)。名簿がすべて。
+ * ★admin でも名簿に無ければ実行できない。未設定なら誰も実行できない (Codex R2 High)。
+ *   「admin なら実行できる」にすると、権限を持つ人が増えた時に黙って実行者も増える。
+ */
+function executorGate(req) {
+  const list = String(process.env.PRICE_UPDATE_EXECUTORS || '')
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (list.length === 0) {
+    return { ok: false, message: '実行できる人がまだ設定されていません (環境変数 PRICE_UPDATE_EXECUTORS にメールを設定してください)。設定されるまで誰も実行できません' };
+  }
+  const email = String(req.session?.email || '').trim().toLowerCase();
+  if (!list.includes(email)) {
+    return { ok: false, message: '価格を実際に更新できるのは、実行権限のある人だけです (管理者でも名簿に無ければ実行できません)' };
+  }
+  return { ok: true, message: null };
+}
+function canExecute(req) {
+  return executorGate(req).ok;
+}
+
 function apiError(res, e, where) {
   if (e?.code === 'VALIDATION') return res.status(400).json({ ok: false, error: e.message });
   console.error(`[price-update] ${where}:`, e);
@@ -422,6 +447,67 @@ router.post('/api/runs', (req, res) => {
   }
 });
 
+/**
+ * run を実行する (M2)。
+ * ★画面から価格を受け取らない。保存済みの run の内容だけを送る
+ *   (画面を書き換えて別の値を送る、という抜け道を作らないため)。
+ * ★確認文字列を要求する (押し間違いで走らないように)。
+ */
+router.post('/api/runs/:runId/execute', async (req, res) => {
+  try {
+    const db = getDB();
+    const gate = executorGate(req);
+    if (!gate.ok) {
+      return res.status(403).json({ ok: false, error: 'forbidden', message: gate.message });
+    }
+    const run = getRun(db, req.params.runId);
+    if (!run) throw validationError('履歴が見つかりません');
+    if (String(req.body?.confirm || '') !== '実行する') {
+      throw validationError('実行するには確認欄に「実行する」と入力してください');
+    }
+    const targets = run.operations.filter((o) => o.state === 'previewed');
+    if (targets.length === 0) throw validationError('実行できる行がありません (すでに実行済み、またはガードで止まっています)');
+
+    const limits = runLimits();
+    const neCodes = new Set(targets.map((o) => o.ne_code));
+    if (neCodes.size > limits.maxNeCodes) {
+      throw validationError(`一度に実行できるのは ${limits.maxNeCodes} コードまでです (対象 ${neCodes.size} コード)`);
+    }
+    if (targets.length > limits.maxSkuRows) {
+      throw validationError(`対象行が多すぎます (${targets.length} 行 / 上限 ${limits.maxSkuRows} 行)`);
+    }
+
+    const out = await executeRun(db, run, {
+      actor: actorOf(req),
+      client: { patchItemPrices, fetchItemDetail },
+    });
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    if (e?.code === 'ALREADY_EXECUTED') return res.status(409).json({ ok: false, error: 'already_executed', message: e.message });
+    apiError(res, e, 'execute-run');
+  }
+});
+
+/** 実行できる状態か (画面がボタンを出すかどうかの判断に使う) */
+router.get('/api/runs/:runId/executable', (req, res) => {
+  try {
+    const run = getRun(getDB(), req.params.runId);
+    if (!run) return res.status(404).json({ ok: false, error: 'not_found' });
+    const targets = run.operations.filter((o) => o.state === 'previewed');
+    const malls = [...new Set(targets.map((o) => o.mall))];
+    res.json({
+      ok: true,
+      targets: targets.length,
+      canExecute: canExecute(req),
+      canExecuteReason: executorGate(req).message,   // 実行できない理由を画面に出すため
+      claim: runClaim(getDB(), run.run_id),   // 既に実行済みならここに誰がいつ実行したかが入る
+      gates: Object.fromEntries(malls.map((m) => [m, mallWriteEnabled(m)])),
+    });
+  } catch (e) {
+    apiError(res, e, 'executable');
+  }
+});
+
 /** 手動更新チェック (Amazon / auPAY / Qoo10)。状態はイベント追記で表す */
 router.post('/api/runs/:runId/manual', (req, res) => {
   try {
@@ -464,4 +550,4 @@ router.get('/api/runs/:runId', (req, res) => {
 });
 
 export default router;
-export { buildPreviewRows, evaluateRows };
+export { buildPreviewRows, evaluateRows, executorGate };

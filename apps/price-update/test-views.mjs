@@ -81,5 +81,75 @@ for (const name of ['index.ejs', 'run.ejs']) {
   ok(inScript.every((s) => !s.includes(CLOSE_TAG)), `${name}: inline script の中に終了タグ文字列が無い`);
 }
 
+// 実行 (M2) の画面: 状態が日本語で出ること・実行カードがあること
+{
+  const file = path.join(HERE, 'views', 'run.ejs');
+  const html = ejs.render(fs.readFileSync(file, 'utf8'), {
+    title: '履歴', displayName: 'テスト', isAdmin: false,
+    run: {
+      run_id: 'pur-m2', created_at: '2026-09-01T01:02:03.000Z', created_by: 't@example.com',
+      kind: 'normal', note: null, neCodes: ['abc-001'], limits: {},
+      operations: ['confirmed', 'noop', 'conflict', 'unknown', 'skipped', 'blocked'].map((st, i) => ({
+        operation_id: 'puo-' + i, mall: 'rakuten', ne_code: 'abc-001', row_kind: 'single',
+        product_name: 'テスト商品', listing_code: 'abc-001', sku_code: 'sku-' + i, confidence: 'confirmed',
+        price_source: '楽天RMS (ライブ)', expected_current_price: 1000, new_price: 1200,
+        initial_state: 'previewed', state: st, guard_json: null, product_url: null,
+      })),
+      events: [{ at: '2026-09-01T01:02:03.000Z', actor: 't@example.com', event: 'confirmed', operation_id: 'puo-0', detail_json: '{}' }],
+    },
+  }, { filename: file });
+  ok(html.includes('更新済み (確認ずみ)') && html.includes('結果が不明'), '★M2 の状態が日本語で出る (confirmed / unknown)');
+  ok(!/>confirmed</.test(html) && !/>unknown</.test(html), '生の状態名がそのまま出ていない');
+  ok(html.includes('実行する') && html.includes('exec-btn'), '実行カード (確認欄+ボタン) がある');
+  ok(html.includes('自動では戻せません') || html.includes('価格を実際に書き換えます'), '取り消せないことを画面で伝えている');
+  checkTagBalance(html, 'run.ejs (M2)');
+}
+
+// 値に細工があっても画面から抜け出せないこと (run_id は script に直書きしない)
+{
+  const file = path.join(HERE, 'views', 'run.ejs');
+  const evil = 'pur-x' + CLOSE_TAG + OPEN_TAG + '>alert(1)' + CLOSE_TAG + '"><img src=x onerror=alert(1)>';
+  const html = ejs.render(fs.readFileSync(file, 'utf8'), {
+    title: '履歴', displayName: evil, isAdmin: false,
+    run: {
+      run_id: evil, created_at: '2026-09-01T01:02:03.000Z', created_by: evil,
+      kind: 'normal', note: evil, neCodes: [evil], limits: {},
+      operations: [{
+        operation_id: evil, mall: 'rakuten', ne_code: evil, row_kind: 'single',
+        product_name: evil, listing_code: evil, sku_code: evil, confidence: 'confirmed',
+        price_source: evil, expected_current_price: 1000, new_price: 1200,
+        initial_state: 'previewed', state: 'previewed', guard_json: null, product_url: null,
+      }],
+      events: [{ at: '2026-09-01T01:02:03.000Z', actor: evil, event: 'run_created', operation_id: evil, detail_json: evil }],
+    },
+  }, { filename: file });
+  checkTagBalance(html, 'run.ejs (細工つき)');
+  ok(!html.includes('<img src=x'), '★細工した文字列がそのまま HTML として出ていない');
+  ok(!html.includes('alert(1)' + CLOSE_TAG), 'script を抜け出せていない');
+}
+
+// 出品ページのリンクは http(s) だけ
+{
+  const file = path.join(HERE, 'views', 'run.ejs');
+  const render = (url) => ejs.render(fs.readFileSync(file, 'utf8'), {
+    title: '履歴', displayName: 'テスト', isAdmin: false,
+    run: {
+      run_id: 'pur-url', created_at: '2026-09-01T01:02:03.000Z', created_by: 't@example.com',
+      kind: 'normal', note: null, neCodes: ['abc-001'], limits: {},
+      operations: [{
+        operation_id: 'puo-1', mall: 'rakuten', ne_code: 'abc-001', row_kind: 'single',
+        product_name: '商品', listing_code: 'abc-001', sku_code: 'sku-a', confidence: 'confirmed',
+        price_source: '楽天RMS (ライブ)', expected_current_price: 1000, new_price: 1200,
+        initial_state: 'previewed', state: 'previewed', guard_json: null, product_url: url,
+      }],
+      events: [],
+    },
+  }, { filename: file });
+  ok(render('https://item.rakuten.co.jp/x/y/').includes('>開く</a>'), '正しい URL はリンクになる');
+  ok(!render('javascript:alert(1)').includes('開く</a>'), '★javascript: の URL はリンクにしない');
+  ok(!render('javascript:alert(1)').includes('javascript:'), 'href に入れない');
+  ok(!render('  JavaScript:alert(1)').includes('開く</a>'), '前後の空白・大文字でもすり抜けない');
+}
+
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
 process.exitCode = failed === 0 ? 0 : 1;

@@ -11,19 +11,53 @@
   .num { text-align: right; font-variant-numeric: tabular-nums; }
   .chip { font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
   .s-previewed { background: #e0f2fe; color: #0369a1; }
+  .s-blocked_preview, .s-blocked { background: #fee2e2; color: #991b1b; }
   .s-manual_required { background: #fef3c7; color: #92400e; }
   .s-manual_done { background: #dcfce7; color: #166534; }
+  .s-executing { background: #ede9fe; color: #5b21b6; }
+  .s-confirmed { background: #dcfce7; color: #166534; }
+  .s-noop { background: #f1f5f9; color: #475569; }
+  .s-conflict { background: #fef3c7; color: #92400e; }
+  .s-failed { background: #fee2e2; color: #991b1b; }
+  .s-unknown { background: #fde68a; color: #7c2d12; }
+  .s-skipped { background: #f1f5f9; color: #64748b; }
   .mall { font-weight: 600; font-size: 12px; }
   .m-rakuten { color: #bf0000; } .m-yahoo { color: #ff0033; } .m-amazon { color: #ff9900; }
   .m-aupay { color: #eb5505; } .m-qoo10 { color: #e4002b; }
+  .exec-box { border: 2px solid #fecaca; background: #fff7f7; border-radius: 8px; padding: 12px 14px; }
+  .exec-box h3 { margin: 0 0 6px; font-size: 14px; color: #991b1b; }
+  .exec-gate { font-size: 12px; margin: 2px 0; }
+  .exec-gate.ng { color: #991b1b; }
+  .exec-gate.ok { color: #166534; }
+  .exec-confirm { font-family: inherit; font-size: 13px; padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 6px; width: 160px; }
+  .btn-danger { background: #b91c1c; color: #fff; border-color: #b91c1c; }
+  .btn-danger:disabled { opacity: .5; }
+  .exec-result { margin-top: 10px; font-size: 13px; }
+  .exec-result b { font-variant-numeric: tabular-nums; }
 </style>
+<%
+  var STATE_LABEL = {
+    previewed: '記録のみ', blocked_preview: 'ガードで停止',
+    manual_required: '手動更新まち', manual_done: '手動更新済み',
+    executing: '送信中', confirmed: '更新済み (確認ずみ)', noop: '同じ価格だった',
+    conflict: '価格が違うので送らず', failed: '失敗', unknown: '結果が不明',
+    blocked: 'ガードで停止', skipped: '送っていない',
+  };
+  var CONF_LABEL = { confirmed: '確定', rule: '規則推定', sales: '実績のみ', unresolved: '未解決' };
+  // ★href に入れてよいのは http(s) だけ (javascript: を踏ませない)
+  var safeUrl = function (u) {
+    var v = String(u == null ? '' : u).trim();
+    var lower = v.toLowerCase();
+    return (lower.indexOf('https://') === 0 || lower.indexOf('http://') === 0) ? v : null;
+  };
+%>
 <div class="topbar" style="margin-top:-1px">
   <span class="pu-title">💴 価格一括改定 — 履歴</span>
   <a href="/apps/price-update">戻る</a>
   <span class="spacer"></span>
   <span class="user"><%= displayName %></span>
 </div>
-<div class="wrap">
+<div class="wrap" data-run-id="<%= run.run_id %>">
   <div class="card">
     <h2><%= run.run_id %></h2>
     <div class="pu-note">
@@ -35,12 +69,31 @@
   </div>
 
   <div class="card">
+    <div class="exec-box" id="exec-box">
+      <h3>⚠️ モールの価格を実際に書き換えます</h3>
+      <div id="exec-status" class="pu-note">確認中…</div>
+      <div id="exec-gates"></div>
+      <div id="exec-form" style="display:none; margin-top:10px;">
+        <div class="pu-note" style="margin-bottom:6px;">
+          押し間違いで走らないよう、確認欄に <b>実行する</b> と入力してからボタンを押してください。<br>
+          1件目は試運転です。送ったあとに価格を取り直して、その通りになっているか確かめます。
+          確かめられなかった時・想定していない応答が返った時は、そこで止めて残りは送りません。
+        </div>
+        <input class="exec-confirm" id="exec-confirm" placeholder="実行する" autocomplete="off">
+        <button class="btn btn-danger" id="exec-btn" type="button" disabled>楽天へ送る</button>
+        <span class="pu-note" id="exec-count"></span>
+      </div>
+      <div class="exec-result" id="exec-result"></div>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>行 (<%= run.operations.length %>)</h2>
     <div style="overflow-x:auto;">
       <table class="pu">
         <thead>
           <tr>
-            <th>状態</th><th>モール</th><th>商品</th><th>出品コード / SKU</th><th>引き当て</th>
+            <th>状態</th><th>モール</th><th>商品</th><th>出品コード / SKU</th><th>出品の確認</th>
             <th class="num">記録時の価格</th><th class="num">新売価</th><th>判定</th><th></th>
           </tr>
         </thead>
@@ -49,7 +102,7 @@
             <% var guard = o.guard_json ? JSON.parse(o.guard_json) : null; %>
             <tr data-op="<%= o.operation_id %>">
               <td>
-                <span class="chip s-<%= o.state %>" data-state-cell><%= o.state === 'manual_done' ? '手動更新済み' : (o.state === 'manual_required' ? '手動更新まち' : '記録のみ') %></span>
+                <span class="chip s-<%= o.state %>" data-state-cell><%= STATE_LABEL[o.state] || o.state %></span>
               </td>
               <td><span class="mall m-<%= o.mall %>"><%= o.mall %></span></td>
               <td>
@@ -57,7 +110,7 @@
                 <div class="pu-note"><%= o.product_name || '' %></div>
               </td>
               <td class="code"><%= o.listing_code || '' %><% if (o.sku_code) { %><div class="pu-note">SKU <%= o.sku_code %></div><% } %></td>
-              <td><%= o.confidence %><div class="pu-note"><%= o.price_source || '' %></div></td>
+              <td><%= CONF_LABEL[o.confidence] || o.confidence %><div class="pu-note"><%= o.price_source || '' %></div></td>
               <td class="num"><%= o.expected_current_price == null ? '—' : o.expected_current_price.toLocaleString() %></td>
               <td class="num"><%= o.new_price == null ? '—' : o.new_price.toLocaleString() %></td>
               <td class="pu-note">
@@ -71,7 +124,7 @@
                     <%= o.state === 'manual_done' ? '取り消す' : '手動更新した' %>
                   </button>
                 <% } %>
-                <% if (o.product_url) { %><a href="<%= o.product_url %>" target="_blank" rel="noopener">開く</a><% } %>
+                <% var href = safeUrl(o.product_url); if (href) { %><a href="<%= href %>" target="_blank" rel="noopener">開く</a><% } %>
               </td>
             </tr>
           <% }); %>
@@ -90,7 +143,7 @@
           <tr>
             <td class="code"><%= e.at.replace('T', ' ').slice(0, 19) %></td>
             <td><%= e.actor %></td>
-            <td><%= e.event %></td>
+            <td><%= STATE_LABEL[e.event] || e.event %></td>
             <td class="code"><%= e.operation_id || '(run)' %></td>
             <td class="pu-note"><%= e.detail_json || '' %></td>
           </tr>
@@ -101,12 +154,20 @@
 </div>
 
 <script>
+  // ★run_id を script の中に直書きしない (終了タグ相当の文字列で JS を抜けられるため)。
+  //   属性から読む — テンプレート側の出力タグが HTML として必ずエスケープしてくれる
+  const RUN_ID = document.querySelector('[data-run-id]').dataset.runId;
+  const API = location.pathname.replace(/\/runs\/.*$/, '/api/runs/') + encodeURIComponent(RUN_ID);
+  const $ = (id) => document.getElementById(id);
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);   // API の値を数として扱う (文字列を HTML に流さない)
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
   document.querySelectorAll('.manual-btn').forEach(function (btn) {
     btn.addEventListener('click', async function () {
       const done = btn.dataset.done === '1';
       btn.disabled = true;
       try {
-        const res = await fetch(location.pathname.replace(/\/runs\/.*$/, '/api/runs/') + encodeURIComponent('<%= run.run_id %>') + '/manual', {
+        const res = await fetch(API + '/manual', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ operationId: btn.dataset.op, done: done }),
@@ -115,9 +176,99 @@
         if (!res.ok || json.ok === false) throw new Error(json.error || ('HTTP ' + res.status));
         location.reload();
       } catch (e) {
-        document.getElementById('manual-msg').textContent = 'エラー: ' + e.message;
+        $('manual-msg').textContent = 'エラー: ' + e.message;
         btn.disabled = false;
       }
     });
   });
+
+  // ── 実行 ─────────────────────────────────────────────
+  const MALL_LABEL = { rakuten: '楽天', yahoo: 'Yahoo', amazon: 'Amazon', aupay: 'au PAY', qoo10: 'Qoo10' };
+
+  async function loadExecutable() {
+    let info;
+    try {
+      const res = await fetch(API + '/executable', { headers: { Accept: 'application/json' } });
+      info = await res.json();
+      if (!res.ok || info.ok === false) throw new Error(info.error || ('HTTP ' + res.status));
+    } catch (e) {
+      $('exec-status').textContent = '実行できるか確認できませんでした: ' + e.message;
+      return;
+    }
+
+    const gates = Object.entries(info.gates || {});
+    $('exec-gates').innerHTML = gates.map(([mall, g]) =>
+      '<div class="exec-gate ' + (g.enabled ? 'ok' : 'ng') + '">'
+      + (g.enabled ? '● ' : '○ ') + esc(MALL_LABEL[mall] || mall) + ': '
+      + esc(g.enabled ? '送信できます' : g.reason) + '</div>').join('');
+
+    if (info.claim) {
+      // ★claim は「実行を始めた」印であって「終わった」印ではない。
+      //   途中で止まった run もここに入るので、完了だと言い切らない
+      $('exec-status').innerHTML = 'この履歴は <b>' + esc(info.claim.claimed_at.replace('T', ' ').slice(0, 19))
+        + '</b> に <b>' + esc(info.claim.claimed_by) + '</b> が実行を開始しています。'
+        + '同じ内容をもう一度送ることはしません。'
+        + '<b>まだ途中の場合もあります</b> — 下の行とイベントで1行ずつ状態を確認してください'
+        + ' (「送信中」のまま残っている行は、モールの画面で実際の価格を確かめてください)。';
+      return;
+    }
+    if (!info.targets) {
+      $('exec-status').textContent = '送る行がありません (記録時のガードを通った行だけが対象です)。';
+      return;
+    }
+    if (!info.canExecute) {
+      $('exec-status').textContent = info.canExecuteReason || '実行の権限がありません。';
+      return;
+    }
+
+    $('exec-status').innerHTML = '送る対象は <b>' + n(info.targets) + ' 行</b> です。'
+      + '<b>送った価格は自動では戻せません</b> — 新売価が正しいか、上の表でもう一度確かめてください。';
+    $('exec-count').textContent = '(' + n(info.targets) + ' 行)';
+    $('exec-form').style.display = '';
+
+    const confirm = $('exec-confirm');
+    const btn = $('exec-btn');
+    const sync = () => { btn.disabled = confirm.value.trim() !== '実行する'; };
+    confirm.addEventListener('input', sync);
+    sync();
+
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      confirm.disabled = true;
+      $('exec-result').innerHTML = '<span class="pu-note">送信中… 画面を閉じても送信は止まりません。終わるまでお待ちください。</span>';
+      try {
+        const res = await fetch(API + '/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirm: confirm.value.trim() }),
+        });
+        const json = await res.json();
+        if (!res.ok || json.ok === false) throw new Error(json.message || json.error || ('HTTP ' + res.status));
+        showSummary(json.summary);
+        setTimeout(() => location.reload(), 2500);
+      } catch (e) {
+        $('exec-result').innerHTML = '<span style="color:#991b1b;">エラー: ' + esc(e.message) + '</span>'
+          + '<div class="pu-note">送ったかどうかが分からない場合は、この画面を再読み込みして行の状態を確認してください。'
+          + '同じ履歴を二重に実行することはできません。</div>';
+        confirm.disabled = false;
+        confirm.value = '';
+        btn.disabled = true;
+      }
+    });
+  }
+
+  function showSummary(s) {
+    if (!s) { $('exec-result').textContent = '終わりました。'; return; }
+    const parts = [
+      ['更新済み', s.applied], ['同じ価格', s.noop], ['価格が違う', s.conflict],
+      ['失敗', s.failed], ['結果が不明', s.unknown], ['送っていない', s.skipped],
+    ].map(([k, v]) => esc(k) + ' <b>' + n(v) + '</b>').join(' / ');
+    $('exec-result').innerHTML = parts
+      + (s.stopped ? '<div style="color:#991b1b; margin-top:4px;">途中で止めました: ' + esc(s.stopped) + '</div>' : '')
+      + (n(s.unknown) > 0 ? '<div style="color:#991b1b; margin-top:4px;">★結果が不明な行は自動では送り直しません。'
+        + 'モールの画面で実際の価格を確認してください。</div>' : '')
+      + '<div class="pu-note">画面を更新します…</div>';
+  }
+
+  loadExecutable();
 </script>

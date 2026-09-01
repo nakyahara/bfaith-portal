@@ -43,7 +43,7 @@
 </div>
 <div class="wrap">
   <div class="banner-warn">
-    <span>📖 <strong>いまは読み取り専用版 (M1)</strong> です。モールへの書き込みは行いません。出品の検索・現在価格・利益の確認と、手動更新チェックリストの記録までができます。楽天への自動更新は次の段階 (M2) で開放します。</span>
+    <span>📖 この画面では<strong>書き込みは起きません</strong>。出品の検索・現在価格・利益の確認をして、更新候補として<strong>記録する</strong>までです。実際にモールの価格を書き換えるのは、記録した履歴を開いてからになります (いまは<strong>楽天だけ</strong>。Yahoo・au PAY・Qoo10・Amazon は手動更新のチェックリストとして記録します)。</span>
   </div>
 
   <div class="card">
@@ -126,6 +126,12 @@
 <script>
   const MALL_LABEL = { rakuten: '楽天', yahoo: 'Yahoo', amazon: 'Amazon', aupay: 'au PAY', qoo10: 'Qoo10' };
   const CONF_LABEL = { confirmed: '確定', rule: '規則推定', sales: '実績のみ', unresolved: '未解決' };
+  // ★href に入れてよいのは http(s) だけ (javascript: を踏ませない)
+  const safeUrl = (u) => {
+    const v = String(u == null ? '' : u).trim();
+    const lower = v.toLowerCase();
+    return (lower.indexOf('https://') === 0 || lower.indexOf('http://') === 0) ? v : null;
+  };
   let previewId = null;
   let rows = [];
   let inputCodes = [];
@@ -266,7 +272,7 @@
         + '<td class="num">' + ratio + '</td>'
         + '<td class="num">' + gross + '</td>'
         + '<td>' + evalCell(ev) + '</td>'
-        + '<td>' + (r.url ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener">開く</a>' : '') + '</td>'
+        + '<td>' + (safeUrl(r.url) ? '<a href="' + esc(safeUrl(r.url)) + '" target="_blank" rel="noopener">開く</a>' : '') + '</td>'
         + '</tr>';
     }).join('');
 
@@ -277,7 +283,7 @@
       + '<td class="code">' + esc(r.listingCode || '') + '</td>'
       + '<td class="num">' + yen(r.price) + '<div class="pu-note">' + esc(r.priceSource || '') + '</div></td>'
       + '<td class="pu-note">' + esc(r.note || '') + '</td>'
-      + '<td>' + (r.url ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener">開く</a>' : '') + '</td>'
+      + '<td>' + (safeUrl(r.url) ? '<a href="' + esc(safeUrl(r.url)) + '" target="_blank" rel="noopener">開く</a>' : '') + '</td>'
       + '</tr>'
     )).join('');
 
