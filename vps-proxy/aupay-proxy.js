@@ -1781,6 +1781,12 @@ function assertPriceOnlyItems(items, { clearSalePrice = false } = {}) {
         throw new Error(`update-items: 「${key}」は送れません (この経路は価格専用: ${[...PRICE_ONLY_KEYS].join(', ')})`);
       }
     }
+    // ★公式: 「priceを更新する場合は必ずpriceとsale_priceの両方を更新する必要があります」(Codex R17)。
+    //   片方だけ送ると Yahoo 側でどう扱われるか分からないので、送る前に止める
+    if (('price' in item) !== ('sale_price' in item)) {
+      throw new Error(`update-items: ${i + 1}件目は price と sale_price の両方が必要です `
+        + '(公式: price を更新する場合は必ず両方を更新する)');
+    }
     if ('sale_price' in item && String(item.sale_price ?? '') === '' && !clearSalePrice) {
       throw new Error(`update-items: ${i + 1}件目の sale_price が空です。`
         + '空文字は「セール価格を消す」意味になります。消してよいなら clearSalePrice:true を付けてください');
@@ -2029,7 +2035,7 @@ function runSelfTest() {
   check('update-items: 価格だけなら通る',
     tryAssert([{ item_code: 'a', price: '1000', sale_price: '900' }]), 'ok');
   check('update-items: ★商品名は送れない',
-    tryAssert([{ item_code: 'a', price: '1000', name: '別の名前' }]),
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: '900', name: '別の名前' }]),
     'update-items: 「name」は送れません (この経路は価格専用: item_code, price, sale_price, subcode_price)');
   check('update-items: ★説明も送れない',
     tryAssert([{ item_code: 'a', caption: 'x' }]).startsWith('update-items: 「caption」は送れません'), true);
@@ -2041,18 +2047,23 @@ function runSelfTest() {
     tryAssert([{ item_code: 'a', price: '1000', sale_price: '' }], { clearSalePrice: true }), 'ok');
   check('update-items: 空の items は拒否', tryAssert([]), 'update-items: items が空です');
   // ★値そのものの検査 (このエンドポイントを直接叩かれても価格を壊せないように)
-  check('update-items: ★0円は通さない', tryAssert([{ item_code: 'a', price: '0' }]).includes('price が 1〜'), true);
-  check('update-items: ★空の価格は通さない', tryAssert([{ item_code: 'a', price: '' }]).includes('price が 1〜'), true);
-  check('update-items: ★負数は通さない', tryAssert([{ item_code: 'a', price: '-100' }]).includes('price が 1〜'), true);
-  check('update-items: ★小数は通さない', tryAssert([{ item_code: 'a', price: '100.5' }]).includes('price が 1〜'), true);
-  check('update-items: ★文字列は通さない', tryAssert([{ item_code: 'a', price: 'お問い合わせ' }]).includes('price が 1〜'), true);
-  check('update-items: 上限超えは通さない', tryAssert([{ item_code: 'a', price: '1000000000' }]).includes('price が 1〜'), true);
-  check('update-items: 上限ちょうどは通る', tryAssert([{ item_code: 'a', price: '999999999' }]), 'ok');
-  check('update-items: ★商品コードの形も見る', tryAssert([{ item_code: 'a b/c', price: '100' }]).includes('item_code が商品コードの形'), true);
-  check('update-items: 実際の商品コードは通る', tryAssert([{ item_code: '0726-001802-bk', price: '577' }]), 'ok');
+  check('update-items: ★0円は通さない', tryAssert([{ item_code: 'a', price: '0', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: ★空の価格は通さない', tryAssert([{ item_code: 'a', price: '', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: ★負数は通さない', tryAssert([{ item_code: 'a', price: '-100', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: ★小数は通さない', tryAssert([{ item_code: 'a', price: '100.5', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: ★文字列は通さない', tryAssert([{ item_code: 'a', price: 'お問い合わせ', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: 上限超えは通さない', tryAssert([{ item_code: 'a', price: '1000000000', sale_price: '900' }]).includes('price が 1〜'), true);
+  check('update-items: 上限ちょうどは通る', tryAssert([{ item_code: 'a', price: '999999999', sale_price: '900' }]), 'ok');
+  check('update-items: ★商品コードの形も見る', tryAssert([{ item_code: 'a b/c', price: '100', sale_price: '900' }]).includes('item_code が商品コードの形'), true);
+  check('update-items: 実際の商品コードは通る', tryAssert([{ item_code: '0726-001802-bk', price: '577', sale_price: '500' }]), 'ok');
   check('update-items: セール価格の値も見る', tryAssert([{ item_code: 'a', price: '100', sale_price: '0' }]).includes('sale_price が 1〜'), true);
   check('update-items: SKU別価格の書式を見る', tryAssert([{ item_code: 'a', subcode_price: 'x:0' }]).includes('subcode_price の書式'), true);
   check('update-items: SKU別価格の正しい書式は通る', tryAssert([{ item_code: 'a', subcode_price: 'x:1000|y:1200' }]), 'ok');
+  check('update-items: ★price だけでは通さない (公式: 両方必須)',
+    tryAssert([{ item_code: 'a', price: '1000' }]).includes('price と sale_price の両方が必要'), true);
+  check('update-items: ★sale_price だけでも通さない',
+    tryAssert([{ item_code: 'a', sale_price: '900' }]).includes('price と sale_price の両方が必要'), true);
+  check('update-items: 両方あれば通る', tryAssert([{ item_code: 'a', price: '1000', sale_price: '900' }]), 'ok');
   check('update-items: ★コロンが多い SKU別価格は通さない',
     tryAssert([{ item_code: 'a', subcode_price: 'x:100:ゴミ' }]).includes('subcode_price の書式'), true);
   check('update-items: コロンが無い SKU別価格も通さない',
