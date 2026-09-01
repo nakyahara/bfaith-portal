@@ -76,9 +76,6 @@
     .line .prev { font-size: 0.78em; color: #adb5bd; margin-top: 3px; }
     .line .act { flex: 0 0 auto; display: flex; flex-direction: column; align-items: stretch; gap: 6px; }
     /* 消し込みは必ずこのボタンから。行のどこを触っても消えてしまう作りは誤操作のもと (2026-09-01 現場) */
-    .btn-check { min-width: 104px; min-height: 56px; border: 0; border-radius: 10px; background: #37b24d; color: #fff; font-size: 1.05em; font-weight: 700; cursor: pointer; padding: 0 16px; }
-    .btn-check:active { background: #2f9e44; }
-    .btn-undo { min-width: 104px; min-height: 44px; border: 1px solid #ced4da; border-radius: 10px; background: #fff; color: #495057; font-size: 0.95em; cursor: pointer; padding: 0 12px; }
     .btn-more { min-width: 104px; min-height: 34px; border: 1px solid #dee2e6; border-radius: 8px; background: #fff; color: #868e96; font-size: 0.85em; cursor: pointer; }
     .row.pending > .line { opacity: 0.55; }
 
@@ -109,6 +106,53 @@
     .detail .dmsg.ok { color: #2b8a3e; }
     .detail .unreg { background: #fff3bf; color: #7a5c00; padding: 12px 14px; border-radius: 8px; font-size: 0.92em; line-height: 1.6; }
 
+    /* ── 数量 (部分確認) ── */
+    /* 一部だけ見つかった行は黄色。緑 (完了) と見た目ではっきり分ける */
+    .row.partial > .line { background: #fff9db; }
+    .row.partial:nth-child(even) > .line { background: #fff3bf; }
+    .line .qty { font-size: 1.05em; font-weight: 700; color: #1864ab; margin-top: 4px; }
+    .line .qty.short { color: #e8590c; }
+    .line .qty.over { color: #c92a2a; }
+    .line .qty small { font-weight: 400; color: #868e96; }
+    .qbar { display: block; height: 6px; background: #e9ecef; border-radius: 3px; margin-top: 5px; max-width: 240px; overflow: hidden; }
+    .qbar > i { display: block; height: 100%; background: #fab005; }
+    .qbar.full > i { background: #40c057; }
+    .qbar.over > i { background: #fa5252; }
+    /* 主ボタンは常に1つ。＋1箱はその下の補助 */
+    .btn-main { min-width: 116px; min-height: 56px; border: 0; border-radius: 10px; background: #37b24d; color: #fff; font-size: 1.0em; font-weight: 700; cursor: pointer; padding: 0 12px; line-height: 1.3; }
+    .btn-main:active { filter: brightness(0.92); }
+    .btn-main.warn { background: #f76707; }
+    .btn-main.over { background: #e8590c; }
+    .btn-main.done { background: #e9ecef; color: #495057; font-weight: 600; }
+    .btn-main:disabled { opacity: 0.5; }
+    .btn-plus { min-width: 116px; min-height: 46px; border: 1px solid #1c7ed6; border-radius: 10px; background: #e7f5ff; color: #1864ab; font-size: 0.95em; font-weight: 700; cursor: pointer; padding: 0 8px; }
+    .btn-plus:disabled { opacity: 0.45; }
+    .btn-plus.setup { border-color: #f08c00; background: #fff9db; color: #e8590c; }
+    .sending { font-size: 0.78em; color: #868e96; text-align: center; }
+    .sending.err { color: #c92a2a; font-weight: 700; }
+
+    /* 数量パネル (行の中にインラインで開く。モーダルにしない = 目の前の箱と行の対応を見失わない) */
+    .qpanel { background: #fff; border: 1px solid #dee2e6; border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+    .qpanel h4 { margin: 0 0 10px; font-size: 0.95em; color: #495057; }
+    .qpanel .now { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+    .qpanel .now b { font-size: 1.3em; color: #1864ab; }
+    .stepper { display: flex; align-items: center; gap: 8px; }
+    .stepper button { width: 64px; height: 64px; border: 1px solid #ced4da; border-radius: 12px; background: #fff; font-size: 1.6em; cursor: pointer; }
+    .stepper button:active { background: #e7f5ff; }
+    .stepper input { width: 92px; height: 64px; text-align: center; font-size: 1.4em; border: 1px solid #ced4da; border-radius: 12px; }
+    .qpanel .unit { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+    .qpanel .unit input { width: 92px; padding: 10px; font-size: 1.1em; border: 1px solid #ced4da; border-radius: 8px; text-align: center; }
+    .qpanel .hist { border-top: 1px dashed #dee2e6; margin-top: 12px; padding-top: 10px; }
+    .qpanel .hist .h { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 0.92em; flex-wrap: wrap; }
+    .qpanel .hist .h.rev { color: #adb5bd; text-decoration: line-through; }
+    .qpanel .hist .h .who { color: #868e96; font-size: 0.85em; }
+    .qpanel .hist .h button { margin-left: auto; min-height: 40px; padding: 0 12px; border: 1px solid #ced4da; border-radius: 8px; background: #fff; font-size: 0.85em; cursor: pointer; }
+    .qpanel .acts { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+    .qpanel .acts button { min-height: 50px; padding: 0 18px; border-radius: 10px; border: 1px solid #ced4da; background: #fff; font-size: 1em; cursor: pointer; }
+    .qpanel .acts button.short { border-color: #e8590c; color: #e8590c; font-weight: 700; }
+    .qpanel .qmsg { font-size: 0.9em; margin-top: 8px; }
+    .qpanel .qmsg.err { color: #c92a2a; }
+
     .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 50; align-items: center; justify-content: center; }
     .overlay.on { display: flex; }
     .modal { background: #fff; border-radius: 14px; padding: 18px; width: min(92vw, 480px); }
@@ -119,6 +163,7 @@
     .modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
     .modal .actions button { padding: 12px 20px; border-radius: 8px; border: 1px solid #ced4da; background: #fff; font-size: 1em; cursor: pointer; }
     .modal .actions button.danger { background: #e03131; border-color: #e03131; color: #fff; }
+    .modal .actions button.primary { background: #1c7ed6; border-color: #1c7ed6; color: #fff; font-weight: 700; }
     /* 確認するときに行き先などを聞く画面 */
     .gate { width: min(94vw, 560px); max-height: 90vh; overflow-y: auto; }
     .gate .who-item { display: flex; gap: 12px; align-items: center; background: #f8f9fa; border-radius: 10px; padding: 10px; margin-bottom: 14px; }
@@ -148,7 +193,7 @@
       .meta { display: none; }
       .line { gap: 10px; padding: 10px; }
       .line .thumb { flex-basis: 48px; width: 48px; height: 48px; }
-      .btn-check, .btn-undo, .btn-more { min-width: 84px; }
+      .btn-main, .btn-plus, .btn-more { min-width: 96px; }
       .detail .big, .detail .big img, .detail .big .ph { flex-basis: 120px; width: 120px; height: 120px; }
     }
   </style>
@@ -164,14 +209,14 @@
     </div>
     <div class="ctl">
       <div class="seg">
-        <button type="button" data-filter="todo" class="on">未確認のみ</button>
-        <button type="button" data-filter="all">全部</button>
+        <button type="button" data-filter="todo" class="on">残りあり</button>
+        <button type="button" data-filter="all">すべて</button>
       </div>
       <input class="search" id="q" type="search" placeholder="商品名・商品ID・JAN で検索" autocomplete="off">
     </div>
   </div>
   <div class="banner" id="banner"></div>
-  <div class="legend">凡例: 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り<br>商品名をタップすると詳細が開き、入数やいろはの設定をその場で直せます</div>
+  <div class="legend">凡例: 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り<br><b>[＋1箱]</b> = 箱を1つ開けるたびに1タップ ／ <b>[全部あり]</b> = 予定数が全部そろった ／ 行をタップすると<b>数量パネル</b>が開き、箱数をまとめて入れたり、入数を直したり、不足のまま確定できます</div>
   <div class="wrap" id="list"></div>
   <div class="foot"><a href="/apps/inbound-check/admin">管理画面 (取込・端末)</a> ・ <a href="/">ポータル</a></div>
 
@@ -200,14 +245,13 @@
     </div>
   </div>
 
-  <div class="overlay" id="confirmUncheck">
+  <div class="overlay" id="confirmBox">
     <div class="modal">
-      <h2>確認を取り消しますか?</h2>
-      <div id="uncheckTarget" style="font-size:0.95em; line-height:1.5"></div>
-      <div class="hint">押し間違えたときはここで戻せます。取り消すと「未確認」に戻ります</div>
+      <h2 id="confirmTitle">確認</h2>
+      <div id="confirmBody" style="font-size:0.95em; line-height:1.6"></div>
       <div class="actions">
-        <button type="button" id="uncheckCancel">やめる</button>
-        <button type="button" class="danger" id="uncheckOk">取り消す</button>
+        <button type="button" id="confirmCancel">やめる</button>
+        <button type="button" id="confirmOk" class="danger">はい</button>
       </div>
     </div>
   </div>
@@ -220,7 +264,6 @@
     let query = '';
     let lastJson = '';
     const collapsed = new Set();
-    const pending = new Set();
     const openLines = new Set();   // 詳細を開いている明細 (再描画をまたいで保つ)
     let pollTimer = null;
     // 入力中は再描画しない。5秒ポーリングの再描画で打ちかけの入数が消えるのを防ぐ
@@ -282,11 +325,48 @@
       }
     }
 
-    // ケース換算は出さない (現場では使わない — 2026-09-01 中原さん)。入数はそのまま数字で見せる
+    // 数量の見え方。予定と実数の関係で色と文言を変える。
+    // ⭐ケース換算は「入数 × 箱数」を人が入れる形にしたので、ここでは実数だけを大きく出す
     function qtySub(l) {
-      const irisu = l.info && Number.isInteger(l.info.irisu) && l.info.irisu > 0 ? l.info.irisu : null;
-      return esc(l.product_id) + ' ・ 予定 <b>' + l.planned_qty + '</b> 個'
-        + (irisu ? ' ・ 入数 ' + irisu : ' ・ <span style="color:#e8590c">入数 未登録</span>');
+      const pack = l.pack_qty ? ' ・ 1箱 ' + l.pack_qty + '個' : ' ・ <span style="color:#e8590c">入数 未登録</span>';
+      const head = '<div class="sub">' + esc(l.product_id) + ' ・ 予定 <b>' + l.planned_qty + '</b> 個' + pack + '</div>';
+      if (l.check_status !== 'checked' && !l.found_qty) return head;
+      const rel = l.quantity_relation || 'exact';
+      const cls = rel === 'exact' ? '' : (rel === 'shortage' ? ' short' : ' over');
+      const tail = rel === 'shortage' ? 'あと ' + (l.planned_qty - l.found_qty) + '個'
+        : rel === 'excess' ? (l.found_qty - l.planned_qty) + '個 多い' : '揃いました';
+      const pct = l.planned_qty > 0 ? Math.min(100, Math.round(l.found_qty * 100 / l.planned_qty)) : 100;
+      const bar = rel === 'exact' ? ' full' : (rel === 'excess' ? ' over' : '');
+      return head + '<div class="qty' + cls + '">' + l.found_qty + ' / ' + l.planned_qty + ' 個 <small>' + tail + '</small>'
+        + '<span class="qbar' + bar + '"><i style="width:' + pct + '%"></i></span></div>';
+    }
+
+    // 右端の**色つき主ボタンは常に1つ**。「確認と一部、どっちを押すの?」を毎行考えさせない
+    function mainBtnHtml(l) {
+      if (l.check_status === 'checked') {
+        const r = l.finalized_result;
+        const label = r === 'shortage' ? '✅ 不足で<br>確認済み' : r === 'excess' ? '✅ 超過で<br>確認済み' : '✅ 確認済み';
+        return '<button type="button" class="btn-main done" data-act="reopen">' + label + '</button>';
+      }
+      if (!l.found_qty) return '<button type="button" class="btn-main" data-act="all">全部あり</button>';
+      if (l.quantity_relation === 'shortage') return '<button type="button" class="btn-main warn" data-act="all">残りも<br>全部あり</button>';
+      if (l.quantity_relation === 'excess') return '<button type="button" class="btn-main over" data-act="excess">超過で確定</button>';
+      return '<button type="button" class="btn-main" data-act="exact">確認</button>';
+    }
+
+    // ⭐箱を1つ開けるたびに1タップ。入数が未登録なら「なぜ押せないか」ではなく**次の行動**を出す
+    function plusBtnHtml(l) {
+      if (l.check_status === 'checked') return '';
+      if (!l.pack_qty) return '<button type="button" class="btn-plus setup" data-act="setpack">入数を設定</button>';
+      return '<button type="button" class="btn-plus" data-act="plus">＋1箱 (' + l.pack_qty + '個)</button>';
+    }
+
+    function sendingHtml(l) {
+      const s = sending.get(l.line_key);
+      if (!s) return '';
+      if (s.kind === 'sending') return '<div class="sending">送信しています…</div>';
+      return '<div class="sending err">' + esc(s.msg) + '</div>'
+        + '<button type="button" class="btn-plus" data-act="retry" style="border-color:#e03131;background:#fff5f5;color:#c92a2a">同じ操作を再送</button>';
     }
 
     function tagsHtml(l) {
@@ -382,10 +462,14 @@
         $('#list').innerHTML = '<div class="empty">まだ入荷受付のCSVが取り込まれていません。<br>管理画面から取り込んでください。</div>';
         return;
       }
-      $('#stat').innerHTML = '伝票 ' + state.slips.length + ' 件 <small>／</small> 確認 ' + t.checked + ' / ' + t.lines + ' 行'
+      $('#stat').innerHTML = '伝票 ' + state.slips.length + ' 件 <small>／</small> 完了 ' + t.checked
+        + (t.partial ? ' <small style="color:#e8590c;font-weight:700">・途中 ' + t.partial + '</small>' : '')
+        + ' <small>・未着手 ' + Math.max(0, t.lines - t.checked - (t.partial || 0)) + ' / 全 ' + t.lines + ' 行</small>'
         + (t.undecided ? ' <small style="color:#c92a2a;font-weight:700">・行き先未設定 ' + t.undecided + '</small>' : '')
         + (t.toIroha ? ' <small style="color:#7a5c00;font-weight:700">・🏠いろは ' + t.toIroha + '</small>' : '');
       $('#meta').textContent = 'CSV ' + fmtJst(b.csv_generated_at) + ' 生成 ・ ' + fmtJst(b.imported_at) + ' 取込';
+      // 日付が変わったのに当日の取込が来ていない = 前日の一覧。数量は入れさせない (今日の荷物が昨日の行に混ざる)
+      if (state.day_stale) banner('warn', '本日の入荷一覧を待っています (表示中は ' + esc(b.work_date || '') + ' に取り込んだ一覧です)。取込が来るまで数量・確認は記録できません');
       if (state.lines.length === 0) {
         $('#list').innerHTML = '<div class="empty">受付済の入荷伝票はありません<br><small>(CSV ' + esc(fmtJst(b.csv_generated_at)) + ' 生成)</small></div>';
         return;
@@ -404,7 +488,8 @@
         parts.push('<div class="slip' + (isCollapsed ? ' collapsed' : '') + '" data-ar="' + esc(s.ar_no) + '">'
           + '<div class="slip-h" data-toggle="' + esc(s.ar_no) + '"><span class="ar">' + esc(s.ar_no) + '</span>'
           + '<span class="dates">予定 ' + esc(fmtDate(s.planned_date)) + ' ・ 受付 ' + esc(fmtDate(s.received_date)) + '</span>'
-          + '<span class="cnt' + (done ? ' done' : '') + '">' + (done ? '✅ ' : '') + '確認 ' + s.checked_count + ' / ' + s.line_count + '</span>'
+          + '<span class="cnt' + (done ? ' done' : '') + '">' + (done ? '✅ ' : '') + '確認 ' + s.checked_count + ' / ' + s.line_count
+            + (s.partial_count ? ' <small style="color:#e8590c">・途中 ' + s.partial_count + '</small>' : '') + '</span>'
           + '<span class="chev">' + (isCollapsed ? '▶' : '▼') + '</span></div>'
           + '<div class="bar"><i style="width:' + pct + '%"></i></div>'
           + '<div class="lines">' + lines.map(lineHtml).join('') + '</div></div>');
@@ -426,23 +511,86 @@
 
     function lineHtml(l) {
       const checked = l.check_status === 'checked';
+      const partial = !checked && l.found_qty > 0;   // 「一部」は status ではなく found_qty から導出する
       const open = openLines.has(l.line_key);
-      const act = checked
-        ? '<button type="button" class="btn-undo" data-act="undo">↩︎ 取り消す</button>'
-        : '<button type="button" class="btn-check" data-act="check">確認</button>';
-      return '<div class="row' + (checked ? ' checked' : '') + (open ? ' open' : '') + (pending.has(l.line_key) ? ' pending' : '') + '" data-key="' + esc(l.line_key) + '" data-version="' + l.version + '">'
+      const busy = sending.get(l.line_key);
+      return '<div class="row' + (checked ? ' checked' : '') + (partial ? ' partial' : '') + (open ? ' open' : '')
+        + (busy && busy.kind === 'sending' ? ' pending' : '') + '" data-key="' + esc(l.line_key) + '" data-version="' + l.version + '">'
         + '<div class="line" data-act="detail">'
         + '<div class="thumb">' + thumbHtml(l, false) + '</div>'
         + '<div class="body">'
         + '<div class="name">' + esc(l.product_name) + '</div>'
-        + '<div class="sub">' + qtySub(l) + '</div>'
+        + qtySub(l)
         + '<div class="tags">' + tagsHtml(l) + '</div>'
         + (checked ? '<div class="who">✅ ' + esc(l.checked_by || '') + ' ' + esc(fmtJst(l.checked_at)) + '</div>' : '')
         + (!checked && l.prev_checked ? '<div class="prev">前回 ' + esc(fmtJst(l.prev_checked.at)) + ' に ' + esc(l.prev_checked.by || '') + ' が確認済み (今日は未確認)</div>' : '')
         + '</div>'
-        + '<div class="act">' + act + '<span class="chev-line">' + (open ? '▲' : '▼') + '</span></div></div>'
+        + '<div class="act">' + mainBtnHtml(l) + plusBtnHtml(l) + sendingHtml(l)
+        + '<span class="chev-line">' + (open ? '▲' : '▼') + '</span></div></div>'
         + '<div class="detail">' + (open ? detailHtml(l) : '') + '</div>'
         + '</div>';
+    }
+
+    // 詳細 = 数量パネル (上) + 入庫情報の編集 (下)
+    function detailHtml(l) { return qpanelHtml(l) + detailInfoHtml(l); }
+
+    // ─────────── 数量パネル (行の中にインライン展開する) ───────────
+    // ⚠モーダルにしない。商品と一覧上の位置を見失うと、別の商品の行に入力する事故が増える
+    function qdraft(l) {
+      let d = qdrafts.get(l.line_key);
+      if (!d) { d = { pack: l.pack_qty || '', boxes: 1, loose: '' }; qdrafts.set(l.line_key, d); }
+      if (!d.pack && l.pack_qty) d.pack = l.pack_qty;
+      return d;
+    }
+
+    function qpanelHtml(l) {
+      if (l.check_status === 'checked') {
+        return '<div class="qpanel"><h4>数量</h4><div class="now"><b>' + l.found_qty + '</b> / ' + l.planned_qty + ' 個 で確認済み'
+          + '</div><div class="fld"><div class="note">数を直すには、右の「確認済み」を押して<b>やり直す</b>と編集できるようになります</div></div></div>';
+      }
+      const d = qdraft(l);
+      const hist = qhist.get(l.line_key);
+      const rest = l.planned_qty - l.found_qty;
+      const p = [];
+      p.push('<div class="qpanel"><h4>数量を記録</h4>');
+      p.push('<div class="now">いま <b>' + l.found_qty + '</b> / ' + l.planned_qty + ' 個'
+        + (rest > 0 ? ' ・ あと ' + rest + '個' : rest < 0 ? ' ・ ' + (-rest) + '個 多い' : ' ・ 揃いました') + '</div>');
+      // 今から数える箱の入数。**すでに数えた箱の入数は変わらない** (訂正は履歴側から行う)
+      p.push('<div class="unit"><label>今から数える箱の入数</label>'
+        + '<input type="number" inputmode="numeric" min="1" step="1" data-q="pack" value="' + esc(d.pack) + '" placeholder="例 10">'
+        + '<span style="font-size:0.85em;color:#868e96">個入り ・ すでに数えた箱の入数は変わりません</span></div>');
+      p.push('<div class="stepper"><button type="button" data-q="dec">−</button>'
+        + '<input type="number" inputmode="numeric" min="1" step="1" data-q="boxes" value="' + esc(d.boxes) + '">'
+        + '<button type="button" data-q="inc">＋</button>'
+        + '<span style="font-size:0.95em">箱 = <b>' + (Number(d.pack) > 0 && Number(d.boxes) > 0 ? Number(d.pack) * Number(d.boxes) : 0) + '</b> 個</span>'
+        + '<button type="button" class="btn-plus" data-act="addboxes" style="min-height:64px">この箱数を足す</button></div>');
+      p.push('<div class="unit" style="margin-top:12px"><label>バラ</label>'
+        + '<input type="number" inputmode="numeric" min="1" step="1" data-q="loose" value="' + esc(d.loose) + '" placeholder="個数">'
+        + '<button type="button" class="btn-plus" data-act="addloose">バラを足す</button></div>');
+
+      // 数えた記録 (訂正・打ち消しはここから)
+      p.push('<div class="hist"><h4>数えた記録</h4>');
+      if (!hist) p.push('<div style="color:#868e96;font-size:0.9em">読み込み中…</div>');
+      else if (hist.length === 0) p.push('<div style="color:#868e96;font-size:0.9em">まだありません</div>');
+      else {
+        for (const e of hist) {
+          if (e.action === 'reversal') continue;
+          const label = e.unit_size ? e.unit_size + '個入り × ' + Math.round(e.quantity / e.unit_size) + '箱 = ' + e.quantity + '個'
+            : e.quantity + '個' + (e.input_kind === 'fill_remaining' ? ' (残りをまとめて)' : e.input_kind === 'backfill' ? ' (以前の確認から)' : '');
+          p.push('<div class="h' + (e.reversed ? ' rev' : '') + '">' + esc(label)
+            + ' <span class="who">' + esc(e.worker || '') + '</span>'
+            + (e.reversed ? '' : '<button type="button" data-act="undoev" data-seq="' + e.event_seq + '">取り消す</button>'
+              + (e.unit_size ? '<button type="button" data-act="fixev" data-seq="' + e.event_seq + '">入数を訂正</button>' : ''))
+            + '</div>');
+        }
+      }
+      p.push('</div>');
+      // 不足のまま確定は**主ボタンにしない**。押し間違えると「届いていないのに確認済み」になる
+      if (l.found_qty > 0 && rest > 0) {
+        p.push('<div class="acts"><button type="button" class="short" data-act="shortage">これ以上来ない — 不足 ' + rest + '個 で確認済みにする</button></div>');
+      }
+      p.push('<div class="qmsg" data-qmsg></div></div>');
+      return p.join('');
     }
 
     // 詳細パネル: 入庫情報 (入数・いろは・BCシール・直ピック・荷姿・memo) をその場で直す。
@@ -461,7 +609,7 @@
         + '</div><div class="note">' + esc(src) + '。「あり」の商品は、確認するときに有効期限を選んでもらいます</div></div>';
     }
 
-    function detailHtml(l) {
+    function detailInfoHtml(l) {
       const i = l.info;
       const img = '<div class="big">' + thumbHtml(l, true) + '</div>';
       if (!i) {
@@ -500,77 +648,199 @@
     // stale: 旧バッチを表示している間は操作を止め、最新の一覧を取得できるまで警告を出し続ける
     let stale = false;
 
-    function applyServerState(line, s) {
-      Object.assign(line, { check_status: s.status, version: s.version, checked_by: s.checked_by, checked_at: s.checked_at });
+    // ─────────── 送信 ───────────
+    // ⭐**楽観更新をしない**。200 が返ってから数字を動かすので「数字が増えた = サーバーに入った」が常に真。
+    //   逆 (増えなかった = 未記録) はコミット直後に応答だけ失われると保証できないので、
+    //   1タップごとの冪等ID (client_event_id) で埋める。再送は必ず同じIDを使う。
+    //   ⚠オフライン用の永続キューは持たない。このアプリは一覧をサーバーから取るだけで
+    //     ローカルにキャッシュを持たず、通信が切れたらどの明細に足すかも画面に出ないため
+    function newId() {
+      const r = (window.crypto && crypto.randomUUID) ? crypto.randomUUID()
+        : String(Date.now()) + '-' + Math.random().toString(36).slice(2);
+      return 'ic-' + r;
+    }
+    const sending = new Map();    // line_key → {kind:'sending'|'error', msg, retry}
+    const qhist = new Map();      // line_key → 数量イベント (訂正パネル用)
+    const qdrafts = new Map();    // line_key → 打ちかけの入数・箱数・バラ
+
+    const RETRY_WAITS = [250, 750];
+    async function postJson(url, body) {
+      // 通信エラー・タイムアウト・502/503/504 だけ、同じ冪等IDで最大3回まで送り直す。
+      // 4xx / 409 / 500 は何度送っても同じなので再送しない
+      for (let i = 0; ; i++) {
+        try {
+          const ac = new AbortController();
+          const t = setTimeout(() => ac.abort(), 4000);
+          const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ac.signal });
+          clearTimeout(t);
+          const j = await r.json().catch(() => ({}));
+          if ((r.status === 502 || r.status === 503 || r.status === 504) && i < 2) {
+            await new Promise(z => setTimeout(z, RETRY_WAITS[i]));
+            continue;
+          }
+          return { status: r.status, json: j };
+        } catch (e) {
+          if (i >= 2) throw e;
+          await new Promise(z => setTimeout(z, RETRY_WAITS[i]));
+        }
+      }
     }
 
-    async function send(action, line, choice) {
-      if (stale) { banner('warn', '一覧が更新されています。最新の一覧を読み込むまで操作できません'); load(); return; }
-      if (!hasWorker()) { openWorkerPick(); return; }
-      if (pending.has(line.line_key)) return;
-      // 行き先・ラベル・入数・有効期限が決まっていなければ、先に聞いてから送る
-      // (サーバーも同じ判定をするので、聞かずに送っても 400 destination_required で戻ってくる)
-      if (action === 'check' && !choice && line.dest && line.dest.missing.length > 0) {
-        openGate(line, line.dest.missing, line.info);
-        return;
-      }
-      pending.add(line.line_key);
-      // 楽観表示 (送信前の状態を控えておき、結果が確定しない時は必ず戻す — Codex R3 High)
-      const snapshot = { check_status: line.check_status, version: line.version, checked_by: line.checked_by, checked_at: line.checked_at };
-      const rollback = () => Object.assign(line, snapshot);
-      line.check_status = action === 'check' ? 'checked' : 'unchecked';
-      if (action === 'check') { line.checked_by = workerName() || (state.me.session || ''); line.checked_at = new Date().toISOString(); }
-      recount(); render(true);
-      let needReload = false;
+    function applyQtyState(line, s) {
+      if (!s) return;
+      if (s.found_qty != null) line.found_qty = s.found_qty;
+      if (s.quantity_version != null) line.quantity_version = s.quantity_version;
+      if (s.status) line.check_status = s.status;
+      if (s.version != null) line.version = s.version;
+      line.finalized_result = s.finalized_result || null;
+      line.checked_by = s.checked_by || null;
+      line.checked_at = s.checked_at || null;
+      if (s.current_pack_qty) line.pack_qty = s.current_pack_qty;
+      line.remaining_qty = line.planned_qty - line.found_qty;
+      line.quantity_relation = line.found_qty < line.planned_qty ? 'shortage'
+        : (line.found_qty > line.planned_qty ? 'excess' : 'exact');
+    }
+
+    /** サーバーが返したエラーを画面に反映する。@returns 再読込が要るか */
+    function handleApiError(j, line, retryCtx) {
+      if (j.error === 'stale_batch') { stale = true; banner('warn', '一覧が更新されました。最新の一覧を読み込んでいます…'); return true; }
+      if (j.error === 'stale_work_date') { banner('warn', esc(j.message)); return true; }
+      if (j.error === 'worker_required') { banner('warn', esc(j.message)); openWorkerPick(); return false; }
+      if (j.error === 'destination_required') { openGate(line, j.missing, j.info, retryCtx); if (j.message) renderGate(j.message); return false; }
+      if (j.current) applyQtyState(line, j.current);
+      if (j.error === 'conflict') { banner('warn', '他の端末で先に更新されました。最新の状態を表示します'); return true; }
+      if (j.error === 'finalized') { banner('warn', 'この行は確認済みです。数を直すには「やり直す」を押してください'); return true; }
+      if (j.error === 'result_mismatch') { banner('warn', esc(j.message)); return true; }
+      if (j.error === 'already_reversed') { banner('warn', 'その記録は既に取り消されています'); return true; }
+      if (j.error === 'idempotency_conflict') { banner('warn', esc(j.message)); return true; }
+      banner('err', esc(j.message || j.error || 'エラー'));
+      return true;
+    }
+
+    function guardLine(line) {
+      if (stale) { banner('warn', '一覧が更新されています。最新の一覧を読み込むまで操作できません'); load(); return false; }
+      if (state.day_stale) { banner('warn', '本日の入荷一覧を待っています (前日の一覧には記録できません)'); return false; }
+      if (!hasWorker()) { openWorkerPick(); return false; }
+      if (sending.has(line.line_key)) return false;
+      return true;
+    }
+
+    /** 数を足す / 打ち消す / 訂正する */
+    async function sendQuantity(line, events, packQty) {
+      if (!guardLine(line)) return;
+      const key = line.line_key;
+      sending.set(key, { kind: 'sending' });
+      render(true);
+      let reload = false;
       try {
-        const r = await fetch(API + '/lines/' + action, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ batch_id: state.batch.id, line_key: line.line_key, expect_version: snapshot.version, worker_code: workerCode() || undefined, choice }),
+        const res = await postJson(API + '/lines/quantity-events', {
+          batch_id: state.batch.id, line_key: key, expect_quantity_version: line.quantity_version,
+          worker_code: workerCode() || undefined, events, pack_qty: packQty || undefined,
         });
-        const j = await r.json().catch(() => ({}));
-        if (r.status === 401) { location.href = '/login'; return; }
-        if (!j.ok) {
-          rollback();
-          if (j.error === 'stale_batch') { stale = true; banner('warn', '一覧が更新されました。最新の一覧を読み込んでいます…'); needReload = true; }
-          else if (j.error === 'conflict') { if (j.current) applyServerState(line, j.current); banner('warn', '他の端末で先に更新されました。最新の状態を表示します'); needReload = true; }
-          else if (j.error === 'worker_required') { banner('warn', esc(j.message)); openWorkerPick(); }
-          else if (j.error === 'destination_required') {
-            // サーバー側の判定が画面より新しい (他の人が入庫情報を変えた等)。足りないものを聞き直す
-            openGate(line, j.missing, j.info);
-            if (j.message) renderGate(j.message);
-          }
-          else { banner('err', esc(j.message || j.error || 'エラー')); needReload = true; }
+        if (res.status === 401) { location.href = '/login'; return; }
+        sending.delete(key);
+        if (res.json.ok) {
+          applyQtyState(line, res.json.state);
+          qhist.delete(key);            // 履歴は開き直したときに取り直す
+          if (openLines.has(key)) loadHist(key);
+          banner(null);
+          lastJson = '';
         } else {
-          applyServerState(line, j.state);
-          if (j.warning) banner('warn', esc(j.warning));
-          else banner(null);
-          // 入庫情報を書き込んだかもしれないので、次のポーリングで取り直す
-          if (choice) lastJson = '';
+          reload = handleApiError(res.json, line, null);
         }
       } catch (e) {
-        rollback();
-        banner('err', '送信できませんでした (' + esc(e.message) + ')。通信が戻ったらもう一度押してください');
-        needReload = true;
+        // 3回とも届かなかった。**数字は動かさない** = 画面が嘘をつかない。同じIDで押し直せる
+        sending.set(key, { kind: 'error', msg: '送れませんでした。この操作はまだ記録されていません', retry: { kind: 'qty', events, packQty } });
       } finally {
-        pending.delete(line.line_key);
-        recount(); render(true);
-        if (needReload) { lastJson = ''; await load(); }
+        if (!sending.has(key) || sending.get(key).kind !== 'sending') { recount(); render(true); }
+        if (reload) { lastJson = ''; await load(); }
       }
     }
 
-    // ⚠サーバー (getState) と同じ数え方をすること。undecided / toIroha を落とすと、
-    //   消し込みのたびに上部の「行き先未設定 N」「🏠いろは N」が消えて、次のポーリングで戻る
+    /** 確定 (全部あり / 残りも全部あり / 確認 / 不足で確定 / 超過で確定) */
+    async function doFinalize(line, opts, choice, ids) {
+      if (!guardLine(line)) return;
+      // 行き先・ラベル・入数・有効期限が決まっていなければ先に聞く (サーバーも同じ判定をする)
+      if (!choice && line.dest && line.dest.missing.length > 0) { openGate(line, line.dest.missing, line.info, opts); return; }
+      const key = line.line_key;
+      const id = ids || { op: newId(), fill: newId() };
+      sending.set(key, { kind: 'sending' });
+      render(true);
+      let reload = false;
+      try {
+        const body = {
+          batch_id: state.batch.id, line_key: key, expect_version: line.version,
+          expect_quantity_version: line.quantity_version, worker_code: workerCode() || undefined,
+          client_operation_id: id.op, result: opts.result, mode: opts.mode || 'current', choice,
+        };
+        if (body.mode === 'fill_remaining') body.fill_event = { client_event_id: id.fill };
+        const res = await postJson(API + '/lines/check', body);
+        if (res.status === 401) { location.href = '/login'; return; }
+        sending.delete(key);
+        if (res.json.ok) {
+          applyQtyState(line, res.json.state);
+          qhist.delete(key);
+          if (res.json.warning) banner('warn', esc(res.json.warning)); else banner(null);
+          lastJson = '';
+        } else {
+          reload = handleApiError(res.json, line, opts);
+        }
+      } catch (e) {
+        sending.set(key, { kind: 'error', msg: '送れませんでした。まだ確認済みになっていません', retry: { kind: 'fin', opts, choice, ids: id } });
+      } finally {
+        if (!sending.has(key) || sending.get(key).kind !== 'sending') { recount(); render(true); }
+        if (reload) { lastJson = ''; await load(); }
+      }
+    }
+
+    /** やり直す (確認だけ外す。数量は残る) */
+    async function doReopen(line, ids) {
+      if (!guardLine(line)) return;
+      const key = line.line_key;
+      const id = ids || { op: newId() };
+      sending.set(key, { kind: 'sending' });
+      render(true);
+      let reload = false;
+      try {
+        const res = await postJson(API + '/lines/uncheck', {
+          batch_id: state.batch.id, line_key: key, expect_version: line.version,
+          expect_quantity_version: line.quantity_version, worker_code: workerCode() || undefined,
+          client_operation_id: id.op,
+        });
+        if (res.status === 401) { location.href = '/login'; return; }
+        sending.delete(key);
+        if (res.json.ok) { applyQtyState(line, res.json.state); qhist.delete(key); banner(null); lastJson = ''; }
+        else reload = handleApiError(res.json, line, null);
+      } catch (e) {
+        sending.set(key, { kind: 'error', msg: '送れませんでした', retry: { kind: 'reopen', ids: id } });
+      } finally {
+        if (!sending.has(key) || sending.get(key).kind !== 'sending') { recount(); render(true); }
+        if (reload) { lastJson = ''; await load(); }
+      }
+    }
+
+    async function loadHist(key) {
+      if (qhist.has(key) || !state.batch) return;
+      try {
+        const r = await fetch(API + '/lines/events?batch_id=' + state.batch.id + '&line_key=' + encodeURIComponent(key), { cache: 'no-store' });
+        const j = await r.json();
+        if (j.ok) { qhist.set(key, j.events); render(true); }
+      } catch { /* 履歴が出せなくても数を足す操作はできる */ }
+    }
+
     function recount() {
       const c = new Map();
-      let checked = 0, undecided = 0, toIroha = 0;
+      const pc = new Map();
+      let checked = 0, partial = 0, undecided = 0, toIroha = 0;
       for (const l of state.lines) {
         const done = l.check_status === 'checked';
         if (done) { checked++; c.set(l.ar_no, (c.get(l.ar_no) || 0) + 1); }
+        else if (l.found_qty > 0) { partial++; pc.set(l.ar_no, (pc.get(l.ar_no) || 0) + 1); }
         if (!done && l.dest && l.dest.missing && l.dest.missing.includes('iroha')) undecided++;
         if (done && l.dest && l.dest.destination === 'iroha') toIroha++;
       }
-      for (const s of state.slips) s.checked_count = c.get(s.ar_no) || 0;
-      state.totals = { lines: state.lines.length, checked, undecided, toIroha };
+      for (const s of state.slips) { s.checked_count = c.get(s.ar_no) || 0; s.partial_count = pc.get(s.ar_no) || 0; }
+      state.totals = { ...state.totals, lines: state.lines.length, checked, partial, undecided, toIroha };
     }
 
     // ─── 入庫情報の保存 ───
@@ -686,14 +956,17 @@
     // ─────────── 確認するときに行き先などを聞く ───────────
     // 中原さん 2026-09-01: 「確認をした時にいろはに在庫化作業を依頼するのか、ビーフェイスに
     // 入庫するのかを判定してほしい。すでにデータがあるものはそのデータに沿って。無ければ選択して登録」
-    let gateLine = null, gateChoice = null, gateMissing = [], gateInfo = null;
+    let gateLine = null, gateChoice = null, gateMissing = [], gateInfo = null, gateOpts = null;
 
     const SEAL_OPTIONS = ['BCシール貼付必要', '不要'];
     const IRISU_CHIPS = [1, 6, 10, 12, 20, 24, 30, 48];
 
-    function openGate(line, missing, info) {
+    function openGate(line, missing, info, opts) {
       if (!hasWorker()) { openWorkerPick(); return; }
       gateLine = line;
+      // 何を確定しようとしていたか (全部あり / 不足 / 超過) を覚えておく
+      if (opts && opts.result) gateOpts = opts;
+      else if (!gateOpts) gateOpts = { result: 'exact', mode: 'fill_remaining' };
       gateMissing = missing && missing.length ? missing : ['iroha'];
       gateInfo = info !== undefined ? info : line.info;
       gateChoice = {
@@ -787,7 +1060,7 @@
       if (el.getAttribute('data-k') !== 'd') renderGate();   // 月を変えたら日の選択肢を作り直す
     });
     $('#gateCancel').addEventListener('click', closeGate);
-    function closeGate() { $('#gate').classList.remove('on'); gateLine = null; gateChoice = null; }
+    function closeGate() { $('#gate').classList.remove('on'); gateLine = null; gateChoice = null; gateOpts = null; }
 
     $('#gateOk').addEventListener('click', () => {
       const c = gateChoice, l = gateLine;
@@ -810,17 +1083,56 @@
       // モーダルを開いている間にポーリングで state が入れ替わっていることがあるので、
       // 送る直前に line_key で引き直す (古いオブジェクトの version を送ると空振りの 409 になる)
       const line = state.lines.find(x => x.line_key === l.line_key) || l;
+      const opts = gateOpts || { result: 'exact', mode: 'fill_remaining' };
+      // 残りが無ければ fill しない (fill_remaining は残り0だと result_mismatch になる)
+      if (opts.mode === 'fill_remaining' && line.planned_qty - line.found_qty <= 0) opts.mode = 'current';
       closeGate();
-      send('check', line, choice);
+      doFinalize(line, opts, choice);
     });
 
     // ─── 操作 ───
-    let uncheckLine = null;
     function findLine(el) {
       const row = el.closest('.row');
       if (!row) return null;
       const line = state.lines.find(l => l.line_key === row.getAttribute('data-key'));
       return line ? { row, line } : null;
+    }
+
+    // 取り返しのつきにくい操作 (不足で確定・超過で確定・やり直す・記録の取り消し) は必ず1枚はさむ。
+    // ⚠押し間違えると「届いていないのに確認済み」になる
+    let confirmFn = null;
+    function askConfirm({ title, html, okLabel, danger, numberLabel, numberValue, onOk }) {
+      $('#confirmTitle').textContent = title;
+      $('#confirmBody').innerHTML = html
+        + (numberLabel ? '<div class="fld" style="margin-top:12px"><label>' + esc(numberLabel) + '</label>'
+          + '<input type="number" inputmode="numeric" min="1" step="1" id="confirmNum" value="' + esc(numberValue == null ? '' : numberValue) + '"></div>' : '');
+      const ok = $('#confirmOk');
+      ok.textContent = okLabel;
+      ok.className = danger ? 'danger' : 'primary';
+      confirmFn = onOk;
+      $('#confirmBox').classList.add('on');
+    }
+    $('#confirmCancel').addEventListener('click', () => { $('#confirmBox').classList.remove('on'); confirmFn = null; });
+    $('#confirmOk').addEventListener('click', () => {
+      const fn = confirmFn;
+      const num = $('#confirmNum') ? Number($('#confirmNum').value) : null;
+      $('#confirmBox').classList.remove('on');
+      confirmFn = null;
+      if (fn) fn(num);
+    });
+
+    const nowIso = () => new Date().toISOString();
+    const boxEvent = (qty, unit) => ({ client_event_id: newId(), action: 'add', quantity: qty, input_kind: 'box', unit_size: unit, client_occurred_at: nowIso() });
+
+    function retrySend(line) {
+      const s = sending.get(line.line_key);
+      if (!s || s.kind !== 'error' || !s.retry) return;
+      const r = s.retry;
+      sending.delete(line.line_key);
+      // ⭐同じ冪等IDで送り直す。サーバーに既に入っていれば replayed で返り、二重加算にならない
+      if (r.kind === 'qty') sendQuantity(line, r.events, r.packQty);
+      else if (r.kind === 'fin') doFinalize(line, r.opts, r.choice, r.ids);
+      else if (r.kind === 'reopen') doReopen(line, r.ids);
     }
 
     $('#list').addEventListener('click', (ev) => {
@@ -830,23 +1142,124 @@
         if (collapsed.has(ar)) collapsed.delete(ar); else collapsed.add(ar);
         render(true); return;
       }
+      // 数量パネルの ＋/− は先に拾う (data-act を持たないため)
+      const q = ev.target.closest('button[data-q]');
+      if (q) {
+        const kind = q.getAttribute('data-q');
+        if (kind !== 'inc' && kind !== 'dec') return;
+        const f = findLine(q);
+        if (!f) return;
+        const d = qdraft(f.line);
+        d.boxes = Math.max(1, (Number(d.boxes) || 0) + (kind === 'inc' ? 1 : -1));
+        render(true);
+        return;
+      }
       const a = ev.target.closest('[data-act]');
       if (!a) return;
       const found = findLine(a);
       if (!found) return;
       const { row, line } = found;
       const act = a.getAttribute('data-act');
-      if (act === 'check') { send('check', line); return; }
-      if (act === 'undo') {
-        // 押し間違いを戻す導線。うっかり二度押しを防ぐため確認を1枚はさむ
-        uncheckLine = line;
-        $('#uncheckTarget').innerHTML = '<b>' + esc(line.product_name) + '</b><br>' + esc(line.checked_by || '') + ' が ' + esc(fmtJst(line.checked_at)) + ' に確認';
-        $('#confirmUncheck').classList.add('on');
+
+      // ── 数量・確定 ──
+      if (act === 'plus') {
+        if (!line.pack_qty) return;
+        sendQuantity(line, [boxEvent(line.pack_qty, line.pack_qty)]);
         return;
       }
+      if (act === 'setpack') {
+        openLines.add(line.line_key); loadHist(line.line_key); render(true);
+        return;
+      }
+      if (act === 'addboxes') {
+        const d = qdraft(line);
+        const pack = Number(d.pack), boxes = Number(d.boxes);
+        if (!Number.isInteger(pack) || pack <= 0) return qmsg(row, '入数を1以上の整数で入れてください');
+        if (!Number.isInteger(boxes) || boxes <= 0) return qmsg(row, '箱数を1以上の整数で入れてください');
+        d.boxes = 1;
+        sendQuantity(line, [boxEvent(pack * boxes, pack)], pack);
+        return;
+      }
+      if (act === 'addloose') {
+        const d = qdraft(line);
+        const n = Number(d.loose);
+        if (!Number.isInteger(n) || n <= 0) return qmsg(row, 'バラの個数を1以上の整数で入れてください');
+        d.loose = '';
+        sendQuantity(line, [{ client_event_id: newId(), action: 'add', quantity: n, input_kind: 'loose', client_occurred_at: nowIso() }]);
+        return;
+      }
+      if (act === 'undoev') {
+        const seq = Number(a.getAttribute('data-seq'));
+        const e = (qhist.get(line.line_key) || []).find(x => x.event_seq === seq);
+        if (!e) return;
+        askConfirm({
+          title: 'この記録を取り消しますか?', okLabel: '取り消す', danger: true,
+          html: '<b>' + esc(line.product_name) + '</b><br>' + e.quantity + '個 の記録を取り消します (合計 ' + line.found_qty + ' → ' + (line.found_qty - e.quantity) + '個)',
+          onOk: () => sendQuantity(line, [{ client_event_id: newId(), action: 'reversal', quantity: e.quantity, input_kind: 'correction', reverses_event_seq: seq, client_occurred_at: nowIso() }]),
+        });
+        return;
+      }
+      if (act === 'fixev') {
+        // ⭐「今から数える箱の入数」とは別物。**すでに数えた箱**の入数を直す
+        const seq = Number(a.getAttribute('data-seq'));
+        const e = (qhist.get(line.line_key) || []).find(x => x.event_seq === seq);
+        if (!e || !e.unit_size) return;
+        const boxes = Math.round(e.quantity / e.unit_size);
+        askConfirm({
+          title: 'この記録の入数を直す', okLabel: '訂正する', numberLabel: '本当の入数 (1箱の個数)', numberValue: e.unit_size,
+          html: '<b>' + esc(line.product_name) + '</b><br>' + e.unit_size + '個入り × ' + boxes + '箱 = ' + e.quantity + '個 として記録されています',
+          onOk: (n) => {
+            if (!Number.isInteger(n) || n <= 0) return banner('warn', '入数は1以上の整数で入れてください');
+            if (n === e.unit_size) return;
+            sendQuantity(line, [
+              { client_event_id: newId(), action: 'reversal', quantity: e.quantity, input_kind: 'correction', reverses_event_seq: seq, client_occurred_at: nowIso() },
+              { client_event_id: newId(), action: 'add', quantity: n * boxes, input_kind: 'correction', unit_size: n, replaces_event_seq: seq, client_occurred_at: nowIso() },
+            ]);
+          },
+        });
+        return;
+      }
+      if (act === 'all') {
+        // 「全部あり」= 残りを1イベント足して exact 確定。0個からでも途中からでも同じ宣言
+        const rest = line.planned_qty - line.found_qty;
+        doFinalize(line, rest > 0 ? { result: 'exact', mode: 'fill_remaining' } : { result: 'exact', mode: 'current' });
+        return;
+      }
+      if (act === 'exact') { doFinalize(line, { result: 'exact', mode: 'current' }); return; }
+      if (act === 'excess') {
+        askConfirm({
+          title: '予定より多いまま確定しますか?', okLabel: (line.found_qty - line.planned_qty) + '個 多い状態で確認済みにする',
+          html: '<b>' + esc(line.product_name) + '</b><br>予定 ' + line.planned_qty + '個 ／ 見つけた ' + line.found_qty + '個 (<b>' + (line.found_qty - line.planned_qty) + '個 多い</b>)',
+          onOk: () => doFinalize(line, { result: 'excess', mode: 'current' }),
+        });
+        return;
+      }
+      if (act === 'shortage') {
+        const rest = line.planned_qty - line.found_qty;
+        askConfirm({
+          title: 'これ以上来ないとして作業を終了しますか?', danger: true, okLabel: '不足 ' + rest + '個 で確認済みにする',
+          html: '<b>' + esc(line.product_name) + '</b><br>' + esc(line.ar_no) + '<br><br>'
+            + '予定 <b>' + line.planned_qty + '</b>個 ／ 見つけた <b>' + line.found_qty + '</b>個 ／ <b style="color:#c92a2a">不足 ' + rest + '</b>個<br>'
+            + '<small>確定するとこの行は「残りあり」の一覧から消えます</small>',
+          onOk: () => doFinalize(line, { result: 'shortage', mode: 'current' }),
+        });
+        return;
+      }
+      if (act === 'reopen') {
+        askConfirm({
+          title: '確認をやり直しますか?', danger: true, okLabel: 'やり直す',
+          html: '<b>' + esc(line.product_name) + '</b><br>' + esc(line.checked_by || '') + ' が ' + esc(fmtJst(line.checked_at)) + ' に確認<br>'
+            + '<small>未確認に戻します。<b>数えた ' + line.found_qty + '個 の記録は残ります</b></small>',
+          onOk: () => doReopen(line),
+        });
+        return;
+      }
+      if (act === 'retry') { retrySend(line); return; }
+
+      // ── 詳細・入庫情報 ──
       if (act === 'detail') {
         if (openLines.has(line.line_key)) { openLines.delete(line.line_key); editDirty = false; }
-        else openLines.add(line.line_key);
+        else { openLines.add(line.line_key); loadHist(line.line_key); }
         render(true);
         return;
       }
@@ -856,17 +1269,27 @@
       if (act === 'reset') { editDirty = false; render(); return; }
     });
 
-    // 入力が始まったら再描画を止める (ポーリングで打ちかけの値が消えないように)
+    function qmsg(rowEl, text) {
+      const m = rowEl.querySelector('[data-qmsg]');
+      if (m) { m.className = 'qmsg err'; m.textContent = text; }
+    }
+
+    // 数量パネルの入力は打ちかけを控える (ポーリングの再描画で消えないように)
     $('#list').addEventListener('input', (ev) => {
+      const q = ev.target.closest('[data-q]');
+      if (q) {
+        const f = findLine(q);
+        if (!f) return;
+        const d = qdraft(f.line);
+        d[q.getAttribute('data-q')] = q.value;
+        return;
+      }
       const f = ev.target.closest('[data-f]');
       if (!f) return;
       editDirty = true;
       // 「有り」にした瞬間に3項目を閉じる (保存を待たずに見た目を合わせる。書くのはサーバー)
       if (f.getAttribute('data-f') === 'いろは在庫化作業有無') applyIrohaLock(f.closest('.row'));
     });
-
-    $('#uncheckCancel').addEventListener('click', () => { $('#confirmUncheck').classList.remove('on'); uncheckLine = null; });
-    $('#uncheckOk').addEventListener('click', () => { const l = uncheckLine; $('#confirmUncheck').classList.remove('on'); uncheckLine = null; if (l) send('uncheck', l); });
 
     function openWorkerPick() {
       const box = $('#workerOpts');
