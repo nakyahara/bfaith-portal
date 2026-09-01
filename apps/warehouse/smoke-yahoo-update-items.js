@@ -91,24 +91,28 @@ async function updatePrice(code, price) {
  * ★1ページだけ見て includes で探すと、ページ漏れと部分一致で見落とす (Codex R2)。
  *   ページを送りながら TargetKey を集め、値として完全一致で判定する。
  */
-async function unpublishedKeys({ maxPages = 5, perPage = 100 } = {}) {
+async function unpublishedKeys({ maxPages = 50, perPage = 100 } = {}) {
   const keys = new Set();
   let pages = 0;
-  for (let start = 1; pages < maxPages; start += perPage, pages++) {
+  let complete = false;
+  for (let start = 1; pages < maxPages; start += perPage) {
     const res = await fetch(`${BASE}/yahoo/publish-history?publish_id=0&start=${start}&results=${perPage}`, {
       method: 'GET', headers: headers(false), signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     const text = await res.text();
     if (!res.ok) throw new Error(`publish-history HTTP ${res.status}: ${text.slice(0, 200)}`);
+    pages++;
     const flat = await flattenXml(text);
     let found = 0;
     for (const [k, v] of flat) {
       if (/(^|\/)TargetKey\[\d+\]$/.test(k)) { keys.add(String(v).trim().toLowerCase()); found++; }
     }
-    if (found < perPage) break;      // 最後のページ
+    if (found < perPage) { complete = true; break; }   // 最後のページまで読めた
     await sleep(API_GAP_MS);
   }
-  return { keys, pages: pages + 1 };
+  // ★上限で打ち切ったら「載っていない」と言い切れない (Codex R3)。
+  //   全ページ読めた時だけ complete。読み切れていなければ判定に使わない
+  return { keys, pages, complete };
 }
 
 /**
@@ -118,10 +122,16 @@ async function unpublishedKeys({ maxPages = 5, perPage = 100 } = {}) {
 async function waitUntilPublished(code, { rounds = 4, waitMs = 15_000 } = {}) {
   const want = String(code).trim().toLowerCase();
   for (let i = 1; i <= rounds; i++) {
-    const { keys, pages } = await unpublishedKeys();
+    const { keys, pages, complete } = await unpublishedKeys();
     const still = keys.has(want);
-    console.log(`  未反映の確認 (${i}/${rounds}): 未反映 ${keys.size} 件 / ${pages}ページ / この商品は ${still ? '★まだ載っている' : '載っていない'}`);
-    if (!still) return true;
+    console.log(`  未反映の確認 (${i}/${rounds}): 未反映 ${keys.size} 件 / ${pages}ページ`
+      + `${complete ? '' : ' (★読み切れていません)'} / この商品は ${still ? '★まだ載っている' : '載っていない'}`);
+    // ★読み切れていないのに「載っていない」= 見落としかもしれない。反映済みとは言わない
+    if (!still && complete) return true;
+    if (!complete) {
+      console.error('  未反映一覧を最後まで読めませんでした。反映できたかを判定できません');
+      return false;
+    }
     if (i < rounds) await sleep(waitMs);
   }
   return false;
