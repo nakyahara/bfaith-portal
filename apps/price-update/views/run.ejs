@@ -51,7 +51,7 @@
   <span class="spacer"></span>
   <span class="user"><%= displayName %></span>
 </div>
-<div class="wrap">
+<div class="wrap" data-run-id="<%= run.run_id %>">
   <div class="card">
     <h2><%= run.run_id %></h2>
     <div class="pu-note">
@@ -148,9 +148,12 @@
 </div>
 
 <script>
-  const RUN_ID = <%- JSON.stringify(run.run_id) %>;
+  // ★run_id を script の中に直書きしない (終了タグ相当の文字列で JS を抜けられるため)。
+  //   属性から読む — テンプレート側の出力タグが HTML として必ずエスケープしてくれる
+  const RUN_ID = document.querySelector('[data-run-id]').dataset.runId;
   const API = location.pathname.replace(/\/runs\/.*$/, '/api/runs/') + encodeURIComponent(RUN_ID);
   const $ = (id) => document.getElementById(id);
+  const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);   // API の値を数として扱う (文字列を HTML に流さない)
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
   document.querySelectorAll('.manual-btn').forEach(function (btn) {
@@ -194,9 +197,13 @@
       + esc(g.enabled ? '送信できます' : g.reason) + '</div>').join('');
 
     if (info.claim) {
+      // ★claim は「実行を始めた」印であって「終わった」印ではない。
+      //   途中で止まった run もここに入るので、完了だと言い切らない
       $('exec-status').innerHTML = 'この履歴は <b>' + esc(info.claim.claimed_at.replace('T', ' ').slice(0, 19))
-        + '</b> に <b>' + esc(info.claim.claimed_by) + '</b> が実行済みです。'
-        + '同じ内容をもう一度送ることはしません。結果は下の行とイベントで確認してください。';
+        + '</b> に <b>' + esc(info.claim.claimed_by) + '</b> が実行を開始しています。'
+        + '同じ内容をもう一度送ることはしません。'
+        + '<b>まだ途中の場合もあります</b> — 下の行とイベントで1行ずつ状態を確認してください'
+        + ' (「送信中」のまま残っている行は、モールの画面で実際の価格を確かめてください)。';
       return;
     }
     if (!info.targets) {
@@ -208,9 +215,9 @@
       return;
     }
 
-    $('exec-status').innerHTML = '送る対象は <b>' + info.targets + ' 行</b> です。'
+    $('exec-status').innerHTML = '送る対象は <b>' + n(info.targets) + ' 行</b> です。'
       + '<b>送った価格は自動では戻せません</b> — 新売価が正しいか、上の表でもう一度確かめてください。';
-    $('exec-count').textContent = '(' + info.targets + ' 行)';
+    $('exec-count').textContent = '(' + n(info.targets) + ' 行)';
     $('exec-form').style.display = '';
 
     const confirm = $('exec-confirm');
@@ -249,10 +256,10 @@
     const parts = [
       ['更新済み', s.applied], ['同じ価格', s.noop], ['価格が違う', s.conflict],
       ['失敗', s.failed], ['結果が不明', s.unknown], ['送っていない', s.skipped],
-    ].map(([k, v]) => esc(k) + ' <b>' + (v || 0) + '</b>').join(' / ');
+    ].map(([k, v]) => esc(k) + ' <b>' + n(v) + '</b>').join(' / ');
     $('exec-result').innerHTML = parts
       + (s.stopped ? '<div style="color:#991b1b; margin-top:4px;">途中で止めました: ' + esc(s.stopped) + '</div>' : '')
-      + ((s.unknown || 0) > 0 ? '<div style="color:#991b1b; margin-top:4px;">★結果が不明な行は自動では送り直しません。'
+      + (n(s.unknown) > 0 ? '<div style="color:#991b1b; margin-top:4px;">★結果が不明な行は自動では送り直しません。'
         + 'モールの画面で実際の価格を確認してください。</div>' : '')
       + '<div class="pu-note">画面を更新します…</div>';
   }

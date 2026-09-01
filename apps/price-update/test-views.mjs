@@ -105,5 +105,28 @@ for (const name of ['index.ejs', 'run.ejs']) {
   checkTagBalance(html, 'run.ejs (M2)');
 }
 
+// 値に細工があっても画面から抜け出せないこと (run_id は script に直書きしない)
+{
+  const file = path.join(HERE, 'views', 'run.ejs');
+  const evil = 'pur-x' + CLOSE_TAG + OPEN_TAG + '>alert(1)' + CLOSE_TAG + '"><img src=x onerror=alert(1)>';
+  const html = ejs.render(fs.readFileSync(file, 'utf8'), {
+    title: '履歴', displayName: evil, isAdmin: false,
+    run: {
+      run_id: evil, created_at: '2026-09-01T01:02:03.000Z', created_by: evil,
+      kind: 'normal', note: evil, neCodes: [evil], limits: {},
+      operations: [{
+        operation_id: evil, mall: 'rakuten', ne_code: evil, row_kind: 'single',
+        product_name: evil, listing_code: evil, sku_code: evil, confidence: 'confirmed',
+        price_source: evil, expected_current_price: 1000, new_price: 1200,
+        initial_state: 'previewed', state: 'previewed', guard_json: null, product_url: null,
+      }],
+      events: [{ at: '2026-09-01T01:02:03.000Z', actor: evil, event: 'run_created', operation_id: evil, detail_json: evil }],
+    },
+  }, { filename: file });
+  checkTagBalance(html, 'run.ejs (細工つき)');
+  ok(!html.includes('<img src=x'), '★細工した文字列がそのまま HTML として出ていない');
+  ok(!html.includes('alert(1)' + CLOSE_TAG), 'script を抜け出せていない');
+}
+
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
 process.exitCode = failed === 0 ? 0 : 1;
