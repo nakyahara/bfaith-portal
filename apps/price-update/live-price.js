@@ -168,6 +168,19 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       });
       continue;
     }
+    // ★取り違えの最終防衛 (Codex R2): 当たった variant のシステム連携用SKU番号 (AM) が対応表の別名に無ければ確定しない。
+    //   対応表を作った後に SKU が別商品へ移り、空いた SKU管理番号に別商品の SKU が入った、という隙を塞ぐ。
+    //   AM は店舗内で一意なので、これが違えば別の SKU。AM が空の variant (単品など) はこの検査の対象外
+    const liveAm = String(variants[matchedKey]?.merchantDefinedSkuId || '').trim();
+    if (liveAm && !aliasKeys.has(normCode(liveAm))) {
+      out.set(t.rowKey, {
+        price: null, manageNumber: item.manageNumber || t.manageNumber, skuCode: null, found: false,
+        reason: `SKU ${matchedKey} のシステム連携用SKU番号 (${liveAm}) が対応表の別名 (${t.aliases.join(', ')}) にありません。`
+          + '対応表を作った後に SKU が差し替わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)',
+        itemTitle: item?.title || null,
+      });
+      continue;
+    }
     const price = toIntPrice(variants[matchedKey]?.standardPrice);
     out.set(t.rowKey, {
       price,

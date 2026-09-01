@@ -221,6 +221,19 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
   eq([p.found, p.price, p.skuCode, p.manageNumber], [true, 577, '366', '0726-001802'], '★BE の variant 366 = 577円 が取れる');
   eq(allCodesCalled, 0, '対応表で管理番号が決まる時は all-codes を取りに行かない');
 
+  // ★対応表を作った後に SKU が差し替わった疑い: AL 366 は当たるが、その variant の AM が対応表に無い (Codex R2)
+  const swapped = { ...variants, 366: { merchantDefinedSkuId: 'other-product-xx', standardPrice: '980' } };
+  const depsSwapped = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: '0726-001802', itemNumber: '0726-001802', title: 'T', variants: swapped }], failed: [] }) };
+  const sw = (await fetchRakutenPrices([target], depsSwapped)).get('0726-001802');
+  eq(sw.found, false, '★AL は当たるが AM が別物 → 別商品の SKU の疑いで確定しない');
+  ok(/other-product-xx/.test(sw.reason) && /差し替わった/.test(sw.reason), '理由に実際の AM と疑いを書く: ' + sw.reason);
+  // AM が空の variant (単品。0726-001588 の実物と同じ形) は検査の対象外
+  const depsNoAm = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: '0726-001588', variants: { '0726-001588': { standardPrice: '1280' } } }], failed: [] }) };
+  const single = (await fetchRakutenPrices([{ key: '0726-001588', aliases: ['0726-001588'], manageNumber: '0726-001588' }], depsNoAm)).get('0726-001588');
+  eq([single.found, single.price], [true, 1280], 'AM が無い単品は通る');
+
   // ★同じプレビューに BK と BE を並べても、片方がもう片方を上書きしない (行キーは NE コード単位)
   const both = await fetchRakutenPrices([
     { key: '0726-001802', rowKey: 'bk|rakuten', aliases: ['0726-001802-bk', '360', '0726-001802'], manageNumber: '0726-001802' },
