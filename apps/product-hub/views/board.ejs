@@ -352,10 +352,13 @@
                 <div class="kb-rk kb-rk-skip">🛒 楽天: 対象外</div>
               <% } else if (rkOutcome === 'running' && !rkStale) { %>
                 <div class="kb-rk kb-rk-busy">⏳ 楽天に出品しています… (画像転送 → 登録)</div>
-              <% } else if (rkOutcome === 'unknown') { %>
-                <%# 🚨 PUT の結果が確認できなかった = 実は登録が通っているかもしれない。「やり直す」は出さない %>
+              <% } else if (rkOutcome === 'unknown' || rkStale) { %>
+                <%# 🚨 PUT の結果が確認できなかった / 途中で止まった = 実は登録が通っているかもしれない。
+                    「やり直す」は出さない。人が RMS で確認したうえで管理者だけが再実行 (Codex R2 critical:
+                    途中で止まったものを「15 分経ったからやり直せる」にすると、PUT 成功直後に落ちた商品が二重登録になる) %>
                 <div class="kb-rk kb-rk-fail" title="<%= c.rakutenLastError || '' %>">
-                  ⚠ 楽天への登録結果が確認できませんでした。RMS で商品管理番号「<%= String(c.ne_code || '').toLowerCase() %>」の有無を確認してください。
+                  ⚠ <%= rkStale ? `出品処理が途中で止まりました (${(c.rakutenListingAttemptAt || '').replace('T', ' ').slice(0, 16)})` : '楽天への登録結果が確認できませんでした' %>。
+                  RMS で商品管理番号「<%= String(c.ne_code || '').toLowerCase() %>」の有無を確認してください。
                   登録されていれば詳細画面の「モール別の展開状況」で楽天を完了に。
                 </div>
                 <% if (isAdmin) { %>
@@ -366,14 +369,11 @@
                   <div class="kb-rk-note">RMS に無ければ管理者に再実行を依頼してください</div>
                 <% } %>
               <% } else { %>
-                <% if (rkStale) { %>
-                  <div class="kb-rk kb-rk-fail">⚠ 出品処理が途中で止まりました (<%= c.rakutenListingAttemptAt ? c.rakutenListingAttemptAt.replace('T', ' ').slice(0, 16) : '' %>)。
-                    RMS に登録されていなければやり直せます</div>
-                <% } else if (c.rakutenLastError) { %>
+                <% if (c.rakutenLastError) { %>
                   <div class="kb-rk kb-rk-fail" title="<%= c.rakutenLastError %>">❌ 楽天に出品できませんでした: <%= c.rakutenLastError %></div>
                 <% } %>
                 <button type="button" class="kb-rk-btn" data-draft="<%= c.id %>" data-name="<%= c.name %>">
-                  ⚡ 楽天に出品<%= (c.rakutenLastError || rkStale) ? ' (やり直す)' : '' %>
+                  ⚡ 楽天に出品<%= c.rakutenLastError ? ' (やり直す)' : '' %>
                 </button>
               <% } %>
             <% } %>

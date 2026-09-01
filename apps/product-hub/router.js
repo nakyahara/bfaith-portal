@@ -65,7 +65,9 @@ import {
   isValidGtin, MODEL_ATTR_NAME,
 } from './services/rakuten-listing.js';
 // ボードから楽天に出品 (2026-09-01): 画像転送 → 登録 → 後処理 を 1 本に
-import { listToRakutenFromBoard, afterRakutenRegistered, acquireRakutenListingLock } from './services/board-listing.js';
+import {
+  listToRakutenFromBoard, afterRakutenRegistered, acquireRakutenListingLock, assertRakutenListable, rememberUnknownOutcome,
+} from './services/board-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
@@ -1466,6 +1468,9 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
     return res.status(409).json({ ok: false, error: e.message });
   }
   try {
+    // 登録済み / 前回の結果が不明 / 途中で止まった商品は詳細画面からも通さない (ボードと同じ判定 —
+    // Codex R2 critical: ここが素通りだと「結果不明は管理者だけが再実行」を詳細画面から迂回できる)
+    assertRakutenListable(getDB(), draft);
     const r = await registerItem(draft.id, { actor: actorOf(req) });
     if (!r.ok) return res.status(400).json({ ok: false, error: r.error || (r.reasons || []).join(' / '), reasons: r.reasons });
     // 楽天モール=完了 + 画像工程⑧=完了 (人に二度同じことを押させない)。
@@ -1474,6 +1479,9 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
     const postProcess = afterRakutenRegistered(getDB(), draft, actorOf(req));
     res.json({ ...r, postProcess });
   } catch (e) {
+    if (Number(e?.status) === 400) return res.status(400).json({ ok: false, error: e.message });
+    // PUT の結果が確認できなかった → 記録して、人が RMS で確認するまで両経路とも止める
+    if (e?.code === 'RMS_OUTCOME_UNKNOWN') rememberUnknownOutcome(getDB(), draft.id, e.message, actorOf(req));
     console.error('[product-hub] rakuten register failed:', e);
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
   } finally {

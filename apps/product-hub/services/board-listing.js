@@ -104,6 +104,40 @@ function setAttempt(db, draftId, { outcome, error = null, start = false, keepErr
   });
 }
 
+/**
+ * 楽天に登録してよい状態か — **ボードと詳細画面の両経路で同じ判定** (Codex R2 critical:
+ * 片方だけだと、もう片方から「結果不明」の商品を誰でも出し直せてしまう)。
+ *   - 登録済み → 400
+ *   - 前回の結果が unknown → 400 (forceUnknown = 管理者が RMS で未登録を確認済み、のときだけ通す)
+ *   - running のまま実行中でない = 途中で落ちた。PUT が通った直後・registered_at を書く前に落ちた
+ *     可能性があるので unknown と同じ扱い (「15 分経ったからやり直せる」にしない)
+ * 実行中 (ロック中) は呼び出し側のロック取得で 409 になる
+ * @throws 400
+ */
+export function assertRakutenListable(db, draft, { forceUnknown = false } = {}) {
+  const id = Number(draft.id);
+  const rk = db.prepare('SELECT registered_at, listing_outcome FROM draft_rakuten WHERE draft_id = ?').get(id);
+  if (rk?.registered_at) {
+    throw httpError(400, 'この商品は楽天に登録済みです (公開/非公開の切り替えは詳細画面から)');
+  }
+  const stuck = rk?.listing_outcome === 'unknown' || (rk?.listing_outcome === 'running' && !inFlight.has(id));
+  if (stuck && !forceUnknown) {
+    const head = rk.listing_outcome === 'running' ? '前回の出品処理が途中で止まっています' : '前回の登録結果が確認できていません';
+    throw httpError(400, `${head}。RMS で商品管理番号「${String(draft.ne_code || '').toLowerCase()}」の有無を確認してください。`
+      + '登録されていれば詳細画面の「モール別の展開状況」で楽天を完了に、無ければ管理者がボードの「確認済み → 再実行」で出し直せます');
+  }
+}
+
+/**
+ * registerItem が「PUT の結果が確認できない」(RMS_OUTCOME_UNKNOWN) を投げたときの記録 (両経路共通)。
+ * 以後 assertRakutenListable が止めるので、人が RMS で確認するまで誰も再実行できない
+ */
+export function rememberUnknownOutcome(db, draftId, message, actor) {
+  const msg = String(message || '').slice(0, 1200);
+  setAttempt(db, draftId, { outcome: 'unknown', error: msg });
+  logEvent(db, draftId, 'rakuten_listing_outcome_unknown', msg.slice(0, 480), actor);
+}
+
 /** 本流の「いま進める番」の工程 (全部決着なら null) */
 function mainCurrentStep(db, draftId) {
   return db.prepare(`
@@ -131,17 +165,14 @@ export async function listToRakutenFromBoard(draftId, { actor = null, forceUnkno
   if (draft.status === 'on_hold' || draft.status === 'excluded') {
     throw httpError(400, '保留・除外中の商品は出品できません (詳細画面で再開してから)');
   }
-  const rk = db.prepare('SELECT registered_at, listing_outcome FROM draft_rakuten WHERE draft_id = ?').get(id);
-  if (rk?.registered_at) {
-    throw httpError(400, 'この商品は楽天に登録済みです (公開/非公開の切り替えは詳細画面から)');
-  }
-  if (rk?.listing_outcome === 'unknown' && !forceUnknown) {
-    throw httpError(400, `前回の登録結果が確認できていません。RMS で商品管理番号「${String(draft.ne_code).toLowerCase()}」の有無を確認してください。`
-      + '登録されていれば詳細画面の「モール別の展開状況」で楽天を完了に、無ければ管理者が「確認済みで再実行」できます');
-  }
-  // ボードの意味を守る: 本流が「出品・展開」まで来ている商品だけ (URL 直叩きで工程を飛ばさせない)
+  assertRakutenListable(db, draft, { forceUnknown });
+  // ボードの意味を守る: 本流が「出品・展開」の番の商品だけ (URL 直叩きで工程を飛ばさせない)。
+  // 全工程が決着している (= 楽天は完了か対象外で決着済み) 商品も通さない (Codex R2 high)
   const cur = mainCurrentStep(db, id);
-  if (cur && cur.step_code !== 'listing') {
+  if (!cur) {
+    throw httpError(400, '本流の工程「出品・展開」は完了しています。楽天を出し直すなら詳細画面の「モール別の展開状況」で楽天を未着手に戻してから');
+  }
+  if (cur.step_code !== 'listing') {
     throw httpError(400, `工程がまだ「出品・展開」まで進んでいません (いま: ${cur.label})。先に工程を進めてください`);
   }
 
@@ -189,8 +220,7 @@ export async function listToRakutenFromBoard(draftId, { actor = null, forceUnkno
         // 🚨 PUT が通ったかどうか分からない。失敗にすると「やり直す」で二重登録になるので、
         // unknown で止めて人の確認を待つ (registerItem の原文をそのまま残す)
         const msg = String(e.message || e).slice(0, 1200);
-        setAttempt(db, id, { outcome: 'unknown', error: msg });
-        logEvent(db, id, 'rakuten_board_listing_unknown', msg.slice(0, 480), actor);
+        rememberUnknownOutcome(db, id, msg, actor);
         return { ok: false, stage: 'register', outcome: 'unknown', retryable: false, transfer: transferSummary, register: null, error: msg };
       }
       return fail('register', `楽天への登録でエラー: ${String(e?.message || e).slice(0, 300)}`, { transfer: transferSummary });

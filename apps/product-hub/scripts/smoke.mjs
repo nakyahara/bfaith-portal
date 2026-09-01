@@ -5347,8 +5347,9 @@ for (const [name, file, data] of renders) {
       c4.slice(0, 260));
     check('ボード(出品): 実行中のカードは「出品しています…」でボタン無し',
       c5.includes('kb-rk-busy') && !c5.includes('kb-rk-btn'), c5.slice(0, 200));
-    check('ボード(出品): 実行中のまま 15 分以上経ったカードは「途中で止まりました」+ やり直しボタン',
-      c6.includes('途中で止まりました') && c6.includes('やり直す') && /class="kb-rk-btn"/.test(c6), c6.slice(0, 260));
+    check('ボード(出品): 実行中のまま 15 分以上経ったカードは「途中で止まりました」= 結果不明と同じ扱い (やり直す無し・管理者の再実行のみ)',
+      c6.includes('途中で止まりました') && c6.includes('RMS') && !c6.includes('やり直す')
+      && /class="kb-rk-btn"[^>]*data-force="1"/.test(c6), c6.slice(0, 300));
     check('ボード(出品): 登録済みだがモール状況が未更新のカードは「出品済み」+ 警告 (ボタンは出さない)',
       c7.includes('kb-rk-done') && c7.includes('未更新') && !c7.includes('kb-rk-btn'), c7.slice(0, 260));
   }
@@ -5945,6 +5946,13 @@ for (const [name, file, data] of renders) {
     r = await call(`/api/drafts/${idL}/rakuten/register`, { confirm: true });
     check('HTTP 詳細画面の「公開で登録」: ボードで出品中の商品は 409 (同じロック)', r.status === 409, JSON.stringify(r.json));
     releaseL();
+    // 詳細画面の「公開で登録」も 結果不明 / 登録済み を通さない (Codex R2 critical: ここが素通りだと
+    // 「結果不明は管理者だけが再実行」を詳細画面から迂回できる)
+    r = await call(`/api/drafts/${idU}/rakuten/register`, { confirm: true });
+    check('HTTP 詳細画面の「公開で登録」: 結果不明の商品は 400 (RMS で確認、の案内)',
+      r.status === 400 && /RMS/.test(r.json.error || ''), JSON.stringify(r.json));
+    r = await call(`/api/drafts/${id}/rakuten/register`, { confirm: true });
+    check('HTTP 詳細画面の「公開で登録」: 登録済みの商品は 400', r.status === 400 && /登録済み/.test(r.json.error || ''), JSON.stringify(r.json));
     server.close();
     db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?)').run(id, idU, idL);
   }
@@ -5969,7 +5977,7 @@ for (const [name, file, data] of renders) {
     check('ボード出品: force で再実行すると通り、outcome は消える', r2.ok === true && rk2.listing_outcome == null && !!rk2.registered_at, JSON.stringify({ r2: r2.ok, rk2 }));
     check('ボード出品: 開始時に前回の last_error を消してから走る (古い理由が残らない)',
       db.prepare('SELECT last_error FROM draft_rakuten WHERE draft_id = ?').get(id).last_error == null);
-    check('ボード出品: 結果不明のイベントが残る', eventsOf(id).includes('rakuten_board_listing_unknown'), eventsOf(id).join(','));
+    check('ボード出品: 結果不明のイベントが残る', eventsOf(id).includes('rakuten_listing_outcome_unknown'), eventsOf(id).join(','));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
   }
   {
@@ -5986,6 +5994,25 @@ for (const [name, file, data] of renders) {
     check('ボード出品: 弾かれた商品には試行の痕跡を残さない (running のまま残らない)',
       !db.prepare('SELECT 1 FROM draft_rakuten WHERE draft_id IN (?, ?) AND listing_outcome IS NOT NULL').get(idStep, idHold));
     db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idStep, idHold);
+    // 全工程が決着している商品 (楽天は完了か対象外で決着済み) も通さない (Codex R2 high)
+    const idDone = mkDraft('LST-ALLDONE');
+    db.prepare("UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = 'listing'").run(idDone);
+    let e3 = null;
+    try { await bl.listToRakutenFromBoard(idDone, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { e3 = e; }
+    check('ボード出品: 本流が全部完了している商品は 400 (出し直しはモール別状況を戻してから)',
+      e3?.status === 400 && /完了しています/.test(e3.message), e3?.message);
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDone);
+    // 🚨 running のまま実行中でない = 途中で落ちた。PUT 成功直後に落ちた可能性があるので unknown と同じ扱い
+    // (Codex R2 critical: 「15 分経ったからやり直せる」にすると二重登録になり得る)
+    const idStuck = mkDraft('LST-STUCK');
+    db.prepare("INSERT INTO draft_rakuten (draft_id, listing_outcome, listing_attempt_at) VALUES (?, 'running', '2026-08-01T00:00:00Z')").run(idStuck);
+    let e4 = null;
+    try { await bl.listToRakutenFromBoard(idStuck, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { e4 = e; }
+    check('ボード出品: 途中で止まった (running・実行中でない) 商品は 400 = 結果不明と同じ扱い',
+      e4?.status === 400 && /途中で止まって/.test(e4.message) && /RMS/.test(e4.message), e4?.message);
+    const r4 = await bl.listToRakutenFromBoard(idStuck, { actor: 'admin', forceUnknown: true, deps: { transfer: okTransfer, register: okRegister } });
+    check('ボード出品: 途中で止まった商品も管理者の force なら再実行できる', r4.ok === true, JSON.stringify(r4).slice(0, 120));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idStuck);
   }
   {
     // 後処理 (afterRakutenRegistered): 成功の形と、対象外 (skip) の工程⑧を上書きしないこと
