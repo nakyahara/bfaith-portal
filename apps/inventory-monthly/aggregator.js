@@ -681,7 +681,8 @@ const CATEGORY_COLUMN = {
 /**
  * 手入力した原価を明細へ反映し、カテゴリ列・合計を再計算する。
  *
- * fixes: [{ key: 'code:xxx' | 'sku:xxx', cost: 数値 (0以上), expected_qty?: 画面表示時の合計数量 }]
+ * fixes: [{ key: 'code:xxx' | 'sku:xxx', cost: 数値 (0以上),
+ *           expected_qty?: 画面表示時の合計数量, expected_value?: 画面表示時の計上額 (円) }]
  * 更新対象 = 同じ key の明細のうち 原価状態 が未解決系 or 手入力済 の行だけ
  * (マスタから原価が取れている行は触らない)。
  *   - expected_qty を渡すと DB 上の対象数量と照合し、違えば statusCode=409 で失敗する
@@ -733,12 +734,22 @@ export function applyCostFixes(snapshotId, fixes, { created_by = null } = {}) {
     const deltaByCol = {};
     let updated_items = 0;
     let updated_rows = 0;
+    let unchanged_items = 0; // 既に同じ原価で手入力済 (再送) → 成功扱いで区別する (Codex R2 Low)
+    let missing_items = 0;   // 対象行なし (マスタで解決済み・ページが古い)
     for (const f of fixes) {
       const rows = byKey.get(f.key);
-      if (!rows || rows.length === 0) continue; // 既にマスタで解決済み等 → 無視 (エラーにしない)
+      if (!rows || rows.length === 0) { missing_items++; continue; } // エラーにしない
       const dbQty = rows.reduce((s, r) => s + Number(r.数量 || 0), 0);
       if (f.expected_qty != null && Number(f.expected_qty) !== dbQty) {
         const err = new Error(`${f.key} の対象数量が画面表示時 (${f.expected_qty}) と DB (${dbQty}) で異なります。ページを再読み込みしてから入力し直してください。`);
+        err.statusCode = 409;
+        throw err;
+      }
+      // expected_value = 画面表示時の計上額 (円丸め)。数量が同じでも別の人が先に原価を保存していれば
+      // 計上額が変わっているので、それを上書きしない (Codex R2 Medium)
+      const dbValue = Math.round(rows.reduce((s, r) => s + Number(r.金額 || 0), 0));
+      if (f.expected_value != null && Math.round(Number(f.expected_value)) !== dbValue) {
+        const err = new Error(`${f.key} の計上額が画面表示時 (¥${Math.round(Number(f.expected_value)).toLocaleString('ja-JP')}) と DB (¥${dbValue.toLocaleString('ja-JP')}) で異なります (別の人が先に保存した可能性)。ページを再読み込みして確認してください。`);
         err.statusCode = 409;
         throw err;
       }
@@ -749,7 +760,7 @@ export function applyCostFixes(snapshotId, fixes, { created_by = null } = {}) {
         throw err;
       }
       // 全行が既に同じ原価で手入力済なら no-op
-      if (rows.every(r => r.原価状態 === MANUAL_FIX_STATUS && Number(r.原価) === f.cost)) continue;
+      if (rows.every(r => r.原価状態 === MANUAL_FIX_STATUS && Number(r.原価) === f.cost)) { unchanged_items++; continue; }
       let delta = 0;
       for (const r of rows) {
         const newValue = Number(r.数量 || 0) * f.cost;
@@ -764,7 +775,7 @@ export function applyCostFixes(snapshotId, fixes, { created_by = null } = {}) {
       insFix.run(snapshotId, snap.snapshot_date, f.key, head.商品コード || null, head.seller_sku || null, head.商品名 || '', f.cost, rows.length, delta, created_by, now);
       updated_items++;
     }
-    if (updated_items === 0) return { updated_items: 0, updated_rows: 0, totals: null, snapshot_date: snap.snapshot_date };
+    if (updated_items === 0) return { updated_items: 0, updated_rows: 0, unchanged_items, missing_items, totals: null, snapshot_date: snap.snapshot_date };
 
     const cols = {
       fba_warehouse: Math.round((snap.fba_warehouse || 0) + (deltaByCol.fba_warehouse || 0)),
@@ -785,7 +796,7 @@ export function applyCostFixes(snapshotId, fixes, { created_by = null } = {}) {
       'UPDATE inv_snapshot SET fba_warehouse = ?, fba_inbound = ?, own_warehouse = ?, fba_us = ?, total = ?, note = ? WHERE id = ?'
     ).run(cols.fba_warehouse, cols.fba_inbound, cols.own_warehouse, cols.fba_us, total, note, snapshotId);
     return {
-      updated_items, updated_rows,
+      updated_items, updated_rows, unchanged_items, missing_items,
       totals: { ...cols, fba_us_inbound: snap.fba_us_inbound || 0, pending_orders: snap.pending_orders || 0, manual_adjustment: snap.manual_adjustment || 0, total },
       snapshot_date: snap.snapshot_date,
     };

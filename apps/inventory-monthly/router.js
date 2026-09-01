@@ -1436,7 +1436,8 @@ function collectCostFixes() {
     const orig = row.dataset.orig === '' ? null : Number(row.dataset.orig);
     if (orig != null && cost === orig) continue; // 変更なし
     // expected_qty = 画面表示時の数量。保存時に DB と違えばサーバが 409 で止める (古い画面からの誤反映防止)
-    fixes.push({ key: row.dataset.key, cost, expected_qty: Number(row.dataset.qty) });
+    // expected_value = 画面表示時の計上額。数量が同じでも別の人が先に保存していれば 409 になる
+    fixes.push({ key: row.dataset.key, cost, expected_qty: Number(row.dataset.qty), expected_value: Number(row.dataset.currentValue) });
   }
   return fixes;
 }
@@ -1586,7 +1587,12 @@ router.post('/history/:id/cost-fix', json({ limit: '256kb' }), (req, res) => {
       expected_qty = Number(f.expected_qty);
       if (!Number.isFinite(expected_qty)) return res.status(400).json({ error: `expected_qty が不正です (${key})` });
     }
-    fixes.push({ key, cost: Math.round(cost * 100) / 100, expected_qty });
+    let expected_value = null;
+    if (f?.expected_value != null && f.expected_value !== '') {
+      expected_value = Number(f.expected_value);
+      if (!Number.isFinite(expected_value)) return res.status(400).json({ error: `expected_value が不正です (${key})` });
+    }
+    fixes.push({ key, cost: Math.round(cost * 100) / 100, expected_qty, expected_value });
   }
 
   try {
@@ -1594,7 +1600,11 @@ router.post('/history/:id/cost-fix', json({ limit: '256kb' }), (req, res) => {
     const result = applyCostFixes(id, fixes, { created_by });
     if (!result) return res.status(404).json({ error: 'snapshot が見つかりません' });
     if (result.updated_items === 0) {
-      return res.status(409).json({ error: '変更のある明細がありません (既に同じ原価で保存済み・マスタで解決済み・ページが古い のいずれか。再読み込みしてください)' });
+      // 全件「既に同じ原価で保存済み」= 再送 → 保存は完了しているので成功で返す (Codex R2 Low)
+      if (result.unchanged_items > 0 && result.missing_items === 0) {
+        return res.json({ ok: true, unchanged: true, ...result });
+      }
+      return res.status(409).json({ error: '対象の明細がありません (マスタで解決済み・ページが古い のいずれか。再読み込みしてください)' });
     }
     res.json({ ok: true, ...result });
   } catch (e) {
