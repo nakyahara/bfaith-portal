@@ -23,6 +23,7 @@ import {
   listDriveSubfolders, listDriveFilesAcross, downloadDriveFileById,
 } from '../../lib/drive-csv.js';
 import { getDB, utcNow } from './db.js';
+import { syncStaff, isStaffSyncConfigured } from './staff-sync.js';
 import { parseCs03002, importBatch, PkError } from './service.js';
 import { queueEnsureImages } from './images.js';
 
@@ -209,12 +210,47 @@ export function getPollerStatus() {
   return { ..._status, intervalSec: POLL_INTERVAL_MS / 1000 };
 }
 
+// ─── スタッフマスタ同期 (Render apps/staff → pk_workers)。このループに相乗りする ───
+// 入口 (スケジュールタスク) を増やさないための相乗り。人の増減は日単位なので1時間に1回で足りる。
+// 失敗してもポーリング本体は止めない (fail-closed = 前回の作業者を保つのは staff-sync 側の責任)
+const STAFF_SYNC_INTERVAL_MS = Number(process.env.PICKING_STAFF_SYNC_INTERVAL_MIN || 60) * 60 * 1000;
+const STAFF_SYNC_RETRY_MS = 5 * 60 * 1000;   // 失敗時は短く再試行 (一時的な通信断で1時間空けない)
+let _nextStaffSyncAt = 0;
+let _staffSyncing = false;
+
+/** スタッフ同期を「時が来ていれば」実行する。**待たない** (Drive ポーリングと heartbeat を遅らせないため) */
+function kickStaffSync() {
+  if (!isStaffSyncConfigured() || _staffSyncing) return;
+  const now = Date.now();
+  if (now < _nextStaffSyncAt) return;
+  _staffSyncing = true;
+  // await しない = 最大20秒の HTTP が 2分周期の tick を直列に押さえない (Codex R5 Medium)
+  syncStaff().then((r) => {
+    // 成否で次回時刻を分ける (失敗を1時間放置しない)
+    _nextStaffSyncAt = Date.now() + (r.ok ? STAFF_SYNC_INTERVAL_MS : STAFF_SYNC_RETRY_MS);
+    if (r.ok) {
+      if (r.added || r.linked || r.renamed || r.deactivated) {
+        console.log(`[picking-staff-sync] 反映 追加${r.added} 紐付け${r.linked} 改名${r.renamed} 無効化${r.deactivated}`);
+      }
+      for (const w of r.warnings || []) console.warn(`[picking-staff-sync] ${w}`);
+    } else if (!r.skipped || r.error !== 'STAFF_EXPORT_TOKEN 未設定') {
+      console.warn(`[picking-staff-sync] ${r.error}`);
+    }
+  }).catch((e) => {
+    _nextStaffSyncAt = Date.now() + STAFF_SYNC_RETRY_MS;
+    console.warn(`[picking-staff-sync] 例外: ${e.message}`);
+  }).finally(() => { _staffSyncing = false; });
+}
+
 export function startDrivePoller() {
   if (_status.running) return;
   _status.running = true;
   const tick = async () => {
     if (_polling) return;   // 前回が長引いていたら重ねない
     _polling = true;
+    // スタッフ同期は Drive の成否と独立に走らせる (Drive 障害中も人の増減は反映する — Codex R5 High)。
+    // 中で待たないので、この行が tick を遅らせることはない
+    kickStaffSync();
     try {
       _status.lastStats = await pollOnce();
       _status.lastAt = utcNow();

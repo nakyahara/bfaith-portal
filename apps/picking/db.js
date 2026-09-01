@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -270,6 +270,45 @@ const MIGRATIONS = {
     )`);
     db.exec("CREATE INDEX IF NOT EXISTS idx_pk_later_requests_status ON pk_later_requests(status)");
   },
+  // v12: スタッフマスタ (Render apps/staff) との紐付け (2026-09-01 中原さん方針「人の正本は1つ」)。
+  //   pk_workers はそのまま残し (code は作業実績が参照する不変キー)、どの staff と同じ人かを持つ。
+  //   名前 (pk_workers.name) は同期で staff の表記に寄せるが、過去の実績 (pk_batches.worker 等) は
+  //   打刻時点の表示名を保存しているため遡って変わらない = 意図した挙動 (履歴を書き換えない)。
+  //   source: 'local' = この picking で作られた行 (staff 未登録) / 'staff' = スタッフマスタ由来
+  12: () => {
+    const cols = db.prepare('PRAGMA table_info(pk_workers)').all().map((c) => c.name);
+    if (!cols.includes('staff_id')) db.exec('ALTER TABLE pk_workers ADD COLUMN staff_id INTEGER');
+    if (!cols.includes('staff_no')) db.exec('ALTER TABLE pk_workers ADD COLUMN staff_no TEXT');
+    if (!cols.includes('source')) db.exec("ALTER TABLE pk_workers ADD COLUMN source TEXT NOT NULL DEFAULT 'local'");
+    // 同じ staff を2行に紐づけない (紐付けの取り違えを DB で防ぐ)。
+    // 部分適用済みDB (列だけ足された状態で手を入れた等) に重複があると索引作成が謎のエラーで落ちるため、
+    // 先に検出して「どの行が重複か」を出す (Codex R5 Low)
+    const dupStaff = db.prepare(`SELECT staff_id, group_concat(code) codes FROM pk_workers
+      WHERE staff_id IS NOT NULL GROUP BY staff_id HAVING COUNT(*) > 1`).all();
+    if (dupStaff.length) {
+      throw new Error('picking migration v12: 同じ staff_id を持つ作業者が複数います → '
+        + dupStaff.map(d => `staff_id=${d.staff_id} (${d.codes})`).join(', ')
+        + '。どちらか一方の staff_id を NULL にしてから再起動してください');
+    }
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS uq_pk_workers_staff ON pk_workers(staff_id) WHERE staff_id IS NOT NULL');
+    // 同期の状態 (1行固定)。最終同期時刻・結果を管理画面に出し、黙って止まるのを防ぐ
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_staff_sync_state (
+      id            INTEGER PRIMARY KEY CHECK(id = 1),
+      synced_at     TEXT NOT NULL,
+      ok            INTEGER NOT NULL CHECK(ok IN (0,1)),
+      staff_count   INTEGER,
+      linked        INTEGER,
+      added         INTEGER,
+      renamed       INTEGER,
+      deactivated   INTEGER,
+      unmatched     TEXT,                 -- 警告 (JSON 配列): 紐付け保留・消えた紐付け済み・スタッフマスタ未登録
+      generated_at  TEXT,                 -- 今回取得した export の generated_at (失敗時も記録)
+      error         TEXT,
+      -- 次回の判定基準。成功時だけ進める (失敗で基準が緩むと激減・巻き戻りを見逃す)
+      active_staff_count INTEGER,         -- 前回成功時の有効スタッフ数 (激減ガードの基準)
+      last_generated_at  TEXT             -- 前回成功時の generated_at (後着した古い応答を弾く)
+    )`);
+  },
 };
 
 function createCoreTables() {
@@ -462,7 +501,7 @@ export function listDevices() {
 
 export function listWorkers(includeInactive = false) {
   return getDB().prepare(
-    `SELECT code, name, sort, active FROM pk_workers ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY sort, code`
+    `SELECT code, name, sort, active, staff_id, staff_no, source FROM pk_workers ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY sort, code`
   ).all();
 }
 

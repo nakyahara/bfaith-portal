@@ -28,7 +28,7 @@
 | アプリ | 状態 |
 |---|---|
 | 入荷受付チェック (`apps/inbound-check`) | ✅ 直接参照 (worker_code = staff_no、events.staff_id) |
-| ピッキング・梱包 (miniPC `pk_workers`) | ⬜ 次の PR: `pk_workers.staff_id` + daily-sync に `/export` 取得ステップ |
+| ピッキング・梱包 (miniPC `pk_workers`) | ✅ 同期あり: `apps/picking/staff-sync.js` が `/export` を取得して `pk_workers` へ反映 (picking-drive-poller に相乗り・1時間ごと)。詳細は `apps/picking/README-staff-sync.md` |
 | 問い合わせ管理 / 商品登録 | ⬜ `staff_id` 列の追加は後回し (事務スタッフは倉庫と集合が違う) |
 
 ## テスト
