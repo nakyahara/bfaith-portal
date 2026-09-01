@@ -52,8 +52,26 @@ function isFrozenMonth(ym) { return typeof ym === 'string' && ym <= FROZEN_THROU
 const HISTORICAL_SEED_PATH = path.join(__dirname, 'seed', 'historical-pl-seed.json');
 
 // 運送会社・仕入先のプリセット（Excel「運賃集計」「輸出運賃」「梱包資材費」シートのヘッダーに合わせる）
-const CARRIERS = ['FBA運賃', 'RSL費用', 'ヤマト', 'ヤマト2', '佐川', '西濃', '福山通運', '郵便局（UPSIDER1）', '郵便局（UPSIDER2）', 'クリックポスト'];
+const CARRIERS = ['FBA運賃', 'Easy Ship運賃', 'RSL費用', 'ヤマト', 'ヤマト2', '佐川', '西濃', '福山通運', '郵便局（UPSIDER1）', '郵便局（UPSIDER2）', 'クリックポスト'];
 const EXPORT_CARRIERS = ['TNK運賃(輸出)', 'FBA運賃(輸出)'];
+
+// Amazon ペイメント由来の自動運賃（売上同期で mart_amazon_monthly_summary.by_segment から投入。画面では読み取り専用・保存対象外）
+//   FBA運賃       = |Σ FBA手数料|             … Excel 旧運用踏襲（2026-04-20・§12）
+//   Easy Ship運賃 = |Σ Amazon Easy Ship料金|  … 代表指示 2026-09-01。amazon-accounting PR #1043 で by_segment に追加された説明別内訳。
+//                   Easy Ship は SKUなし行 = other セグメントの 手数料/トランザクション他 列にしか入らず、PF手数料（seg1〜3 のみ）には
+//                   数えられていないため運賃に立てても二重計上にならない。列が無い月（PR #1043 より前に確定した月）は 0 = 行を作らない
+// いずれも税込負数 → |x|/1.1 で税抜化し cost_scope='shared'（全モール売上で按分）
+const AUTO_FREIGHT = [
+  { carrier: 'FBA運賃',       segKey: 'FBA手数料',            label: 'Amazon FBA手数料から自動計算（売上同期で更新）' },
+  { carrier: 'Easy Ship運賃', segKey: 'Amazon Easy Ship料金', label: 'Amazon Easy Ship料金から自動計算（売上同期で更新）' },
+];
+const autoFreightNote = segKey => 'auto from mart_amazon_monthly_summary.by_segment.' + segKey;
+// 「自動運賃が所有する行」の判定 (stale 削除と UPSERT の WHERE で必ず同じ条件を使う — Codex 指摘: 条件がずれると
+// historical-import 由来 (note 無し) の行がネットゼロ/列なしの月に消えず、古い運賃で PL が再確定される)。
+//   自動行 (note='auto from…') / system-sync / historical-import (Excel 取込・値は自動計算と同じ) が対象。
+//   人が画面・API で入れた行 (entered_by=メールアドレス等) は対象外 = 上書きも削除もしない
+const AUTO_FREIGHT_OWNED_SQL = "(mgmt_freight_costs.note LIKE 'auto from%' OR mgmt_freight_costs.entered_by IN ('system-sync', 'historical-import'))";
+const isAutoFreightCarrier = carrier => AUTO_FREIGHT.some(a => a.carrier === carrier);
 const SUPPLIERS = ['ヤマト', 'ダイワハイテックス', 'アップサイダーカード', 'ダンボールワン', 'アスクル', 'シモジマ', 'ラクスル', '郵便局（レタパ）', 'イージーパック', 'スズヤエビス堂', 'アップサイダーカード2', '五洋パッケージ'];
 
 const MALL_NAMES = {
@@ -359,9 +377,17 @@ router.post('/api/freight', (req, res) => {
   }
   const user = req.session?.email || 'unknown';
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  if (!Array.isArray(items)) return res.status(400).json({ error: 'invalid_items', message: 'items 配列が必要です' });
+  // 自動運賃 (FBA運賃 / Easy Ship運賃) は売上同期が所有するため API からの手入力は受け付けない
+  // (画面は data-auto で送らない。受け付けると次回同期で無警告上書き or 所有者不明の行が残る — Codex 指摘)
+  const autoItems = items.filter(i => isAutoFreightCarrier(i && i.carrier)).map(i => i.carrier);
+  if (autoItems.length > 0) {
+    return res.status(400).json({ error: 'auto_carrier', message: autoItems.join(' / ') + ' は Amazon売上集計から売上同期で自動計算されるため手入力できません', carriers: autoItems });
+  }
+  // 手入力の UPSERT。競合更新では entered_by も更新し、所有者を「人」に移す (自動同期の上書き対象から外れる)
   const stmt = db.prepare(`INSERT INTO mgmt_freight_costs (year_month, carrier, amount, cost_scope, target_segment, target_mall_id, note, entered_by, entered_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(year_month, carrier) DO UPDATE SET amount=excluded.amount, cost_scope=excluded.cost_scope, target_segment=excluded.target_segment, target_mall_id=excluded.target_mall_id, note=excluded.note, updated_at=excluded.updated_at`);
+    ON CONFLICT(year_month, carrier) DO UPDATE SET amount=excluded.amount, cost_scope=excluded.cost_scope, target_segment=excluded.target_segment, target_mall_id=excluded.target_mall_id, note=excluded.note, entered_by=excluded.entered_by, updated_at=excluded.updated_at`);
   const tx = db.transaction(() => {
     for (const item of items) {
       stmt.run(year_month, item.carrier, Math.round(item.amount || 0), item.cost_scope || 'shared', item.target_segment || null, item.target_mall_id || null, item.note || null, user, now, now);
@@ -518,17 +544,25 @@ function segmentCost(segData) {
 // 各モールアプリは「確定」時のみ summary 行を作るため、行の存在 = そのモールの当月確定済み。
 function syncSegmentSalesForMonth(db, year_month, now) {
   let totalInserted = 0;
-  let fbaFreightInserted = null;
+  let fbaFreightInserted = null;      // 後方互換 (レスポンスの fba_freight_tax_excluded)
+  const autoFreightInserted = {};     // carrier → 税抜額 (FBA運賃 / Easy Ship運賃)
+  const autoFreightSkipped = {};      // carrier → { auto_amount, existing_amount, entered_by } (手入力行があり上書きしなかった)
   const mallsPresent = new Set();
 
   const insertStmt = db.prepare(`INSERT OR REPLACE INTO mart_monthly_segment_sales
     (year_month, mall_id, segment, sales, cost, pf_fee, ad_cost, confirmed_at, source_file, logic_version)
     VALUES (?,?,?,?,?,?,?,?,?,?)`);
 
+  // 自動運賃の UPSERT。UNIQUE(year_month, carrier) で衝突した既存行が「自動行 (note='auto from…')」または
+  // 「historical-import 由来 (Excel 取込・値は自動計算と同じ)」の場合だけ更新し、人が入れた行 (entered_by=ユーザー) は上書きしない
+  // (Codex 指摘: 手入力行が黙って自動値に置換され entered_by だけ残る監査矛盾を防ぐ)。スキップは auto_freight_skipped で返す
   const freightStmt = db.prepare(`INSERT INTO mgmt_freight_costs
     (year_month, carrier, amount, cost_scope, target_segment, target_mall_id, note, entered_by, entered_at, updated_at)
     VALUES (?,?,?,?,?,?,?,?,?,?)
-    ON CONFLICT(year_month, carrier) DO UPDATE SET amount=excluded.amount, cost_scope=excluded.cost_scope, note=excluded.note, updated_at=excluded.updated_at`);
+    ON CONFLICT(year_month, carrier) DO UPDATE SET amount=excluded.amount, cost_scope=excluded.cost_scope, note=excluded.note,
+      target_segment=excluded.target_segment, target_mall_id=excluded.target_mall_id, entered_by=excluded.entered_by, updated_at=excluded.updated_at
+    WHERE ${AUTO_FREIGHT_OWNED_SQL}`);
+  const existingFreightStmt = db.prepare('SELECT amount, entered_by, note FROM mgmt_freight_costs WHERE year_month = ? AND carrier = ?');
 
   const tx = db.transaction(() => {
     // source-owned（各 summary 由来）の当月行を先に全消去。summary が削除/空化された
@@ -537,9 +571,11 @@ function syncSegmentSalesForMonth(db, year_month, now) {
     for (const mt of MALL_TABLES) {
       db.prepare('DELETE FROM mart_monthly_segment_sales WHERE year_month = ? AND source_file = ?').run(year_month, mt.table);
     }
-    // 自動登録の FBA運賃 も冒頭で消去（Amazon summary が消えた月の stale 運賃を残さない）。
-    // 手入力分は note で除外して保護。FBA手数料がある場合のみ下で再投入する。
-    db.prepare("DELETE FROM mgmt_freight_costs WHERE year_month = ? AND carrier = 'FBA運賃' AND note LIKE 'auto from%'").run(year_month);
+    // 自動登録の運賃 (FBA運賃 / Easy Ship運賃) も冒頭で消去（Amazon summary が消えた月・列が無くなった月の stale 運賃を残さない）。
+    // 削除対象は UPSERT の更新対象と同じ所有権条件 (AUTO_FREIGHT_OWNED_SQL)。手入力分は対象外で保護。金額がある場合のみ下で再投入する。
+    for (const af of AUTO_FREIGHT) {
+      db.prepare('DELETE FROM mgmt_freight_costs WHERE year_month = ? AND carrier = ? AND ' + AUTO_FREIGHT_OWNED_SQL).run(year_month, af.carrier);
+    }
     for (const mt of MALL_TABLES) {
       let row;
       try {
@@ -571,20 +607,28 @@ function syncSegmentSalesForMonth(db, year_month, now) {
         pfFeeTotal = Math.max(0, pfFeeTotal - fulfillmentInBilling(row));
       }
 
-      // Amazon JP: FBA手数料は販売手数料ではなく運賃として扱う（Excel運用踏襲）
-      // by_segment の FBA手数料（全セグメント合計、税込負数）を |x|/1.1 で税抜化し
-      // mgmt_freight_costs に carrier='FBA運賃', cost_scope='shared' で自動登録
+      // Amazon JP: FBA手数料・Easy Ship料金は販売手数料ではなく運賃として扱う（FBA は Excel運用踏襲、Easy Ship は 2026-09-01 代表指示）
+      // by_segment の該当列（全セグメント合計、税込負数）を |x|/1.1 で税抜化し
+      // mgmt_freight_costs に carrier=AUTO_FREIGHT[].carrier, cost_scope='shared' で自動登録
       if (mt.mall_id === 'amazon_jp') {
-        // 符号付き合計を取ってから絶対値化（返金 segment が含まれる場合もネットで計算するため）
-        const fbaFeeSigned = Object.values(allSegs).reduce((s, v) => s + (v['FBA手数料'] || 0), 0);
-        const fbaFeeTaxInc = Math.abs(fbaFeeSigned);
-        if (fbaFeeTaxInc > 0) {
-          const fbaFeeTaxEx = toTaxExcludedJpy(fbaFeeTaxInc);
-          freightStmt.run(year_month, 'FBA運賃', fbaFeeTaxEx, 'shared', null, null,
-            'auto from mart_amazon_monthly_summary.by_segment.FBA手数料', 'system-sync', now, now);
-          fbaFreightInserted = fbaFeeTaxEx;
+        for (const af of AUTO_FREIGHT) {
+          // 符号付き合計を取ってから絶対値化（返金 segment・取り消し/訂正行が含まれる場合もネットで計算するため）
+          const signed = Object.values(allSegs).reduce((s, v) => s + (Number(v[af.segKey]) || 0), 0);
+          const taxInc = Math.abs(signed);
+          if (taxInc > 0) {
+            const taxEx = toTaxExcludedJpy(taxInc);
+            const r = freightStmt.run(year_month, af.carrier, taxEx, 'shared', null, null, autoFreightNote(af.segKey), 'system-sync', now, now);
+            if (r.changes > 0) {
+              autoFreightInserted[af.carrier] = taxEx;
+              if (af.carrier === 'FBA運賃') fbaFreightInserted = taxEx;
+            } else {
+              // 同名 carrier の手入力行が残っている → 上書きせずスキップ (画面のトーストとログで知らせる)
+              const ex = existingFreightStmt.get(year_month, af.carrier) || {};
+              autoFreightSkipped[af.carrier] = { auto_amount: taxEx, existing_amount: ex.amount ?? null, entered_by: ex.entered_by ?? null };
+            }
+          }
+          // fee=0 / summary 無し / by_segment に列が無い月は冒頭で削除済みなので何もしない
         }
-        // fee=0 / summary 無しの場合は冒頭で削除済みなので何もしない
       }
 
       // セグメント行を組み立てる
@@ -673,7 +717,7 @@ function syncSegmentSalesForMonth(db, year_month, now) {
     }
   });
   tx();
-  return { inserted: totalInserted, fba_freight_tax_excluded: fbaFreightInserted, malls: [...mallsPresent] };
+  return { inserted: totalInserted, fba_freight_tax_excluded: fbaFreightInserted, auto_freight_tax_excluded: autoFreightInserted, auto_freight_skipped: autoFreightSkipped, malls: [...mallsPresent] };
 }
 
 // 指定月のPLを「現在の segment_sales + 既存の運賃・資材費」で再計算して保存し confirmed にする。
@@ -771,7 +815,9 @@ router.post('/api/sync-segment-sales', (req, res) => {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   // 同期 + 確定実績のある月は自動再計算（confirmed 維持）
   const r = syncAndRefreshMonth(db, year_month, now);
-  res.json({ ok: true, inserted: r.inserted, fba_freight_tax_excluded: r.fba_freight_tax_excluded, refreshed: r.refreshed });
+  const skippedCarriers = Object.keys(r.auto_freight_skipped || {});
+  if (skippedCarriers.length > 0) console.warn('[mgmt-sync] ' + year_month + ': 手入力行があるため自動運賃を上書きしませんでした: ' + skippedCarriers.join(', '));
+  res.json({ ok: true, inserted: r.inserted, fba_freight_tax_excluded: r.fba_freight_tax_excluded, auto_freight_tax_excluded: r.auto_freight_tax_excluded || {}, auto_freight_skipped: r.auto_freight_skipped || {}, refreshed: r.refreshed });
 });
 
 // ─── 売上自動同期の本体（in-process）───
@@ -791,11 +837,16 @@ function runMgmtAutoSync(db) {
   const months = [...monthsSet].sort();
 
   let refreshed = 0;
+  const freightSkipped = []; // 'YYYY-MM carrier' — 手入力行があって自動運賃を上書きしなかった月×carrier (毎回同じ警告が並ばないよう最後に1行で出す)
   for (const ym of months) {
     const r = syncAndRefreshMonth(db, ym, now); // 月単位の同一tx（同期→確定実績があれば再計算）
     if (r.refreshed) refreshed++;
+    for (const carrier of Object.keys(r.auto_freight_skipped || {})) freightSkipped.push(ym + ' ' + carrier);
   }
-  return { months: months.length, synced: months.length, refreshed };
+  if (freightSkipped.length > 0) {
+    console.warn('[mgmt-auto-sync] 手入力行があるため自動運賃を上書きしなかった月×carrier ' + freightSkipped.length + '件: ' + freightSkipped.join(', ') + ' (手入力行を消すか金額を合わせてください)');
+  }
+  return { months: months.length, synced: months.length, refreshed, freight_skipped: freightSkipped.length, freight_skipped_detail: freightSkipped };
 }
 
 // 売上自動同期エンドポイント（手動/デバッグ用。MIRROR_SYNC_KEY 認証）。
@@ -818,7 +869,7 @@ function runMgmtAutoSyncSafely(label) {
     const r = runMgmtAutoSync(getMirrorDB());
     console.log(`[mgmt-auto-sync] ${label}: ${r.synced}ヶ月同期 / ${r.refreshed}ヶ月再計算`);
     // dead-man 監視 (jobs-registry: mgmt-auto-sync)
-    pingJob('mgmt-auto-sync', 'ok', `${label}: ${r.synced}ヶ月同期/${r.refreshed}ヶ月再計算`);
+    pingJob('mgmt-auto-sync', 'ok', `${label}: ${r.synced}ヶ月同期/${r.refreshed}ヶ月再計算${r.freight_skipped ? ' / 自動運賃スキップ' + r.freight_skipped + '件' : ''}`);
   } catch (e) {
     console.error(`[mgmt-auto-sync] ${label} 失敗:`, e.message);
     pingJob('mgmt-auto-sync', 'fail', e.message);
@@ -826,6 +877,9 @@ function runMgmtAutoSyncSafely(label) {
     _mgmtAutoSyncRunning = false;
   }
 }
+// テスト用 (easy-ship-freight.test.mjs): 売上同期の純粋ロジックと自動運賃の定義
+export { syncSegmentSalesForMonth, syncAndRefreshMonth, runMgmtAutoSync, AUTO_FREIGHT, CARRIERS };
+
 export function startMgmtAutoSyncScheduler() {
   if (_mgmtAutoSyncTimer) return;
   const intervalMin = Math.max(10, parseInt(process.env.MGMT_AUTOSYNC_INTERVAL_MIN) || 120);
@@ -1216,6 +1270,7 @@ tr:hover { background: #f0f4ff; }
 const MALL_NAMES = ${JSON.stringify(MALL_NAMES)};
 const SEGMENT_NAMES = ${JSON.stringify(SEGMENT_NAMES)};
 const CARRIERS = ${JSON.stringify(CARRIERS)};
+const AUTO_FREIGHT = ${JSON.stringify(AUTO_FREIGHT)}; // 自動運賃 (FBA運賃 / Easy Ship運賃): 読み取り専用・保存対象外
 const EXPORT_CARRIERS = ${JSON.stringify(EXPORT_CARRIERS)};
 const SUPPLIERS = ${JSON.stringify(SUPPLIERS)};
 
@@ -1273,11 +1328,12 @@ function buildCostRows(containerId, names, data, keyField) {
     const amountInc = existing ? toTaxIn(existing.amount) : 0; // 税抜→税込表示
     const note = existing ? (existing.note || '') : '';
     const tr = document.createElement('tr');
-    // FBA運賃 は Amazon FBA手数料から自動計算。手入力で上書きさせない（読み取り専用・保存対象外）
-    if (name === 'FBA運賃') {
+    // FBA運賃 / Easy Ship運賃 は Amazon ペイメント (by_segment) から自動計算。手入力で上書きさせない（読み取り専用・保存対象外）
+    const auto = AUTO_FREIGHT.find(a => a.carrier === name);
+    if (auto) {
       tr.innerHTML = '<td>' + name + ' <span style="font-size:11px;color:#888">（自動）</span></td>'
         + '<td><input type="number" class="input-amount" data-name="' + name + '" data-auto="1" value="' + amountInc + '" readonly style="background:#f1f3f4;color:#666;cursor:not-allowed"></td>'
-        + '<td style="font-size:12px;color:#888">Amazon FBA手数料から自動計算（売上同期で更新）</td>';
+        + '<td style="font-size:12px;color:#888">' + auto.label + '</td>';
     } else {
       tr.innerHTML = '<td>' + name + '</td>'
         + '<td><input type="number" class="input-amount" data-name="' + name + '" value="' + amountInc + '" onchange="updateTotals()"></td>'
@@ -1322,7 +1378,7 @@ async function saveCosts() {
   // 運賃（国内）入力は税込→税抜で保存
   const freightItems = [];
   document.querySelectorAll('#freightBody .input-amount').forEach(i => {
-    if (i.dataset.auto) return; // FBA運賃は自動管理なので保存対象外（手入力で上書きしない）
+    if (i.dataset.auto) return; // FBA運賃 / Easy Ship運賃 は自動管理なので保存対象外（手入力で上書きしない）
     freightItems.push({ carrier: i.dataset.name, amount: toTaxEx(Number(i.value) || 0), cost_scope: 'shared' });
   });
   // 運賃（輸出）
@@ -1354,8 +1410,15 @@ async function syncSegmentSales() {
   const data = await res.json();
   if (data.error) { toast('エラー: ' + data.error); return; }
   let msg = '売上同期完了（' + data.inserted + '行）';
-  if (data.fba_freight_tax_excluded) {
-    msg += ' / FBA運賃 自動登録: ¥' + Math.round(data.fba_freight_tax_excluded * 1.1).toLocaleString() + '（税込）';
+  const autoMap = data.auto_freight_tax_excluded || (data.fba_freight_tax_excluded ? { 'FBA運賃': data.fba_freight_tax_excluded } : {});
+  for (const af of AUTO_FREIGHT) {
+    if (autoMap[af.carrier]) msg += ' / ' + af.carrier + ' 自動登録: ¥' + Math.round(autoMap[af.carrier] * 1.1).toLocaleString() + '（税込）';
+  }
+  // 同名 carrier の手入力行があって自動値を入れなかった場合は警告 (手入力行を消すか金額を合わせる必要がある)
+  const skipped = data.auto_freight_skipped || {};
+  for (const [carrier, s] of Object.entries(skipped)) {
+    msg += ' / ⚠ ' + carrier + ': 手入力行 (¥' + Math.round((s.existing_amount || 0) * 1.1).toLocaleString() + '・' + (s.entered_by || '?') + ') があるため自動値 ¥'
+      + Math.round((s.auto_amount || 0) * 1.1).toLocaleString() + ' で上書きしていません';
   }
   toast(msg);
   await loadCosts();
