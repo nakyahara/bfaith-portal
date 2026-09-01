@@ -86,11 +86,45 @@ async function updatePrice(code, price) {
   return { status: res.status, body: text, json };
 }
 
-async function unpublished() {
-  const res = await fetch(`${BASE}/yahoo/publish-history?publish_id=0&results=50`, {
-    method: 'GET', headers: headers(false), signal: AbortSignal.timeout(TIMEOUT_MS),
-  });
-  return { status: res.status, body: await res.text() };
+/**
+ * 未反映項目に載っている対象キーを集める (publish_id=0)。
+ * ★1ページだけ見て includes で探すと、ページ漏れと部分一致で見落とす (Codex R2)。
+ *   ページを送りながら TargetKey を集め、値として完全一致で判定する。
+ */
+async function unpublishedKeys({ maxPages = 5, perPage = 100 } = {}) {
+  const keys = new Set();
+  let pages = 0;
+  for (let start = 1; pages < maxPages; start += perPage, pages++) {
+    const res = await fetch(`${BASE}/yahoo/publish-history?publish_id=0&start=${start}&results=${perPage}`, {
+      method: 'GET', headers: headers(false), signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`publish-history HTTP ${res.status}: ${text.slice(0, 200)}`);
+    const flat = await flattenXml(text);
+    let found = 0;
+    for (const [k, v] of flat) {
+      if (/(^|\/)TargetKey\[\d+\]$/.test(k)) { keys.add(String(v).trim().toLowerCase()); found++; }
+    }
+    if (found < perPage) break;      // 最後のページ
+    await sleep(API_GAP_MS);
+  }
+  return { keys, pages: pages + 1 };
+}
+
+/**
+ * 反映が済んで、未反映一覧からその商品が消えるまで待つ。
+ * ★Yahoo の反映は非同期。消えなければ「まだ未反映」と正直に報告して終わる。
+ */
+async function waitUntilPublished(code, { rounds = 4, waitMs = 15_000 } = {}) {
+  const want = String(code).trim().toLowerCase();
+  for (let i = 1; i <= rounds; i++) {
+    const { keys, pages } = await unpublishedKeys();
+    const still = keys.has(want);
+    console.log(`  未反映の確認 (${i}/${rounds}): 未反映 ${keys.size} 件 / ${pages}ページ / この商品は ${still ? '★まだ載っている' : '載っていない'}`);
+    if (!still) return true;
+    if (i < rounds) await sleep(waitMs);
+  }
+  return false;
 }
 
 function report(label, d) {
@@ -179,11 +213,8 @@ async function main() {
       : `🚨 価格以外が ${collateral.length} 項目 変わった/消えた → この API でも巻き添えが出ます`}`);
 
     await sleep(API_GAP_MS);
-    const h = await unpublished();
-    console.log(`\n未反映項目 (publish_id=0): HTTP ${h.status}`);
-    console.log(`  ${oneLine(h.body)}`);
-    const mine = h.body.includes(itemCode);
-    console.log(`  この商品が未反映に載っているか: ${mine ? 'はい (まだ反映されていない)' : 'いいえ'}`);
+    console.log('\n★ 反映されたか (未反映一覧から消えたか) を確かめます');
+    await waitUntilPublished(itemCode, { rounds: 2, waitMs: 10_000 });
   } finally {
     if (attempted) {
       await sleep(API_GAP_MS);
@@ -205,11 +236,21 @@ async function main() {
         const restored = await flattenXml(await getRawXml(itemCode));
         const back = diff(before, restored);
         report('いまの状態と、最初との差分', back);
-        if (diffCount(back) === 0) {
-          console.log('\n✅ 商品は最初の状態に戻っています');
-        } else {
+        if (diffCount(back) !== 0) {
           console.error(`\n🚨 最初の状態と ${diffCount(back)} 項目 違います。Yahoo の管理画面で確かめてください`);
           process.exitCode = 1;
+        }
+        // ★管理側が戻っただけでは終わりにしない。フロントに反映されるまで見届ける (Codex R2)。
+        //   EditingFlag は差分から外しているので、ここを見ないと「戻った」と誤って言い切る
+        console.log('\n★ 戻しが反映されたか (未反映一覧から消えたか) を確かめます');
+        const published = await waitUntilPublished(itemCode);
+        if (!published) {
+          console.error(`\n🚨 ${itemCode} が未反映のまま残っています。`);
+          console.error('   管理側の価格は戻っていますが、フロントにはまだ出ていない可能性があります。');
+          console.error('   Yahoo の管理画面で反映状況を確かめてください。');
+          process.exitCode = 1;
+        } else if (diffCount(back) === 0) {
+          console.log('\n✅ 商品は最初の状態に戻り、フロントにも反映されています');
         }
       } catch (e) {
         console.error(`🚨 戻す処理でエラー: ${e.message}`);
