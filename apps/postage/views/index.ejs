@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>郵便料金判定 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    body { background: #f5f7fa; }
+    .container { max-width: 1180px; margin: 0 auto; padding: 16px 20px 60px; }
+    .header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; flex-wrap: wrap; gap: 12px; }
+    .header-row h2 { margin: 0; }
+    .back-link { font-size: 13px; color: #2563eb; text-decoration: none; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    .card h3 { margin: 0 0 4px; font-size: 15px; color: #111; }
+    .hint { font-size: 12px; color: #6b7280; margin: 4px 0 10px; line-height: 1.7; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: right; }
+    th { background: #f9fafb; color: #374151; font-weight: 600; text-align: center; white-space: nowrap; }
+    td.l, th.l { text-align: left; }
+    .scroll { overflow-x: auto; }
+    input[type=text], input[type=date], input[type=number], select { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
+    input.n { width: 84px; text-align: right; }
+    button.primary { background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
+    button.ghost { background: #fff; color: #374151; border: 1px solid #d1d5db; border-radius: 6px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
+    .kpi-row { display: flex; gap: 14px; flex-wrap: wrap; }
+    .kpi { flex: 1 1 150px; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 16px; }
+    .kpi .n { font-size: 27px; font-weight: 700; color: #111; line-height: 1.2; font-variant-numeric: tabular-nums; }
+    .kpi .n.good { color: #047857; } .kpi .n.warn { color: #b45309; }
+    .kpi .l { font-size: 12px; color: #6b7280; margin-top: 2px; }
+    .bar { background: #eef2f7; border-radius: 4px; height: 10px; overflow: hidden; min-width: 90px; }
+    .bar i { display: block; height: 100%; background: #2563eb; }
+    .pill { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px; border: 1px solid; }
+    .pill.err { color: #b91c1c; border-color: #fca5a5; background: #fef2f2; }
+    .pill.warn { color: #b45309; border-color: #fcd34d; background: #fffbeb; }
+    .pill.ok { color: #047857; border-color: #6ee7b7; background: #ecfdf5; }
+    .banner { border-left: 4px solid #dc2626; background: #fef2f2; padding: 12px 16px; border-radius: 0 6px 6px 0; margin-bottom: 16px; }
+    .banner.tip { border-left-color: #2563eb; background: #eff6ff; }
+    .banner h3 { margin: 0 0 4px; font-size: 14px; }
+    .banner p { margin: 0; font-size: 13px; color: #374151; line-height: 1.75; }
+    .msg { font-size: 12px; color: #6b7280; margin-left: 8px; }
+    .mono { font-family: ui-monospace, Consolas, monospace; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header-row">
+    <h2>📮 郵便料金判定</h2>
+    <a class="back-link" href="/">← ポータルへ戻る</a>
+  </div>
+
+  <% if (!warehouseOk) { %>
+    <div class="banner">
+      <h3>出荷実績が読めません</h3>
+      <p>カバー率は miniPC の <span class="mono">warehouse.db</span> (NE受注) を見て出します。この画面が動くのは miniPC のポータルだけです。マスタの編集と取込はここでもできます。</p>
+    </div>
+  <% } %>
+
+  <!-- ── 期間 ── -->
+  <form class="card" method="get" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <label>期間 <input type="date" name="since" value="<%= since %>"></label>
+    <label>〜 <input type="date" name="until" value="<%= until %>"></label>
+    <button class="primary" type="submit">集計</button>
+    <span class="msg">既定は直近90日。短すぎると季節の偏りで判断を誤ります</span>
+  </form>
+
+  <% if (report.available) { %>
+    <!-- ── カバー率 ── -->
+    <div class="kpi-row" style="margin-bottom:16px">
+      <div class="kpi"><div class="n"><%= report.total.toLocaleString() %></div><div class="l">対象の定形外 (通)</div></div>
+      <div class="kpi"><div class="n good"><%= (report.confirmedRate*100).toFixed(1) %>%</div><div class="l">自動で確定できる割合</div></div>
+      <div class="kpi"><div class="n"><%= report.confirmed.toLocaleString() %></div><div class="l">確定 (通)</div></div>
+      <div class="kpi"><div class="n warn"><%= report.unknown.toLocaleString() %></div><div class="l">不明 — 人が測る (通)</div></div>
+      <div class="kpi"><div class="n">¥<%= report.totalAmount.toLocaleString() %></div><div class="l">確定分の郵便料金 合計</div></div>
+    </div>
+
+    <!-- ── いま一番効くこと ── -->
+    <% if (report.blockedMaterials && report.blockedMaterials.length) { %>
+      <div class="banner tip">
+        <h3>いま一番効くこと — 資材の外寸を測る</h3>
+        <p>
+          資材の外寸が入っていないと、定形か規格内かが決められず「不明」になります。下の資材マスタで縦横を入れてください。
+          <% report.blockedMaterials.forEach((m) => { %>
+            <br><strong><%= m.display_name %></strong> を測ると <strong><%= m.count.toLocaleString() %> 通</strong>が動きます。
+          <% }) %>
+        </p>
+      </div>
+    <% } %>
+
+    <div class="card">
+      <h3>料金区分別 — これがそのまま差出表になります</h3>
+      <p class="hint">確定できた <%= report.confirmed.toLocaleString() %> 通の内訳。金額は出荷日に有効な料金表から引いています。</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th class="l">区分</th><th>通数</th><th>金額</th></tr></thead>
+          <tbody>
+            <% report.bands.forEach((b) => { %>
+              <tr><td class="l"><%= b.display_name %></td><td><%= b.count.toLocaleString() %></td><td>¥<%= b.amount.toLocaleString() %></td></tr>
+            <% }) %>
+            <% if (!report.bands.length) { %><tr><td class="l" colspan="3">確定できたものがまだありません</td></tr><% } %>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>「不明」の理由</h3>
+      <p class="hint">上から潰すのが最短です。マスタ不足は埋めれば直り、境界は実物を測るしかありません。</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th class="l">理由</th><th>通数</th><th class="l" style="width:200px">割合</th></tr></thead>
+          <tbody>
+            <% report.reasons.forEach((r) => { %>
+              <tr>
+                <td class="l"><%= r.label %></td>
+                <td><%= r.count.toLocaleString() %></td>
+                <td class="l"><div class="bar"><i style="width:<%= report.unknown ? (r.count/report.unknown*100).toFixed(1) : 0 %>%"></i></div></td>
+              </tr>
+            <% }) %>
+            <% if (!report.reasons.length) { %><tr><td class="l" colspan="3">不明はありません</td></tr><% } %>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>次に測る商品 (出現の多い順 上位30)</h3>
+      <p class="hint">
+        全部を埋める必要はありません。よく出るものから埋めれば、少ない手数でカバー率が伸びます。
+        <a href="/apps/postage/missing.csv?since=<%= since %>">全件をCSVで落とす</a>
+      </p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>#</th><th>出現</th><th class="l">商品コード</th><th class="l">商品名</th><th>足りない</th><th class="l">その場で入れる</th></tr></thead>
+          <tbody>
+            <% report.missingSkus.slice(0,30).forEach((m, i) => { %>
+              <tr data-sku="<%= m.sku_code %>">
+                <td><%= i+1 %></td>
+                <td><%= m.count %></td>
+                <td class="l mono"><%= m.sku_code %></td>
+                <td class="l" style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><%= m.name || '' %></td>
+                <td><%= m.needs %></td>
+                <td class="l">
+                  <input class="n sku-w" type="number" step="0.1" min="0" placeholder="重さg">
+                  <input class="n sku-t" type="number" step="0.1" min="0" placeholder="厚みmm">
+                  <button class="ghost" data-act="save-sku">保存</button>
+                </td>
+              </tr>
+            <% }) %>
+            <% if (!report.missingSkus.length) { %><tr><td class="l" colspan="6">不足はありません</td></tr><% } %>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  <% } %>
+
+  <!-- ── 資材マスタ ── -->
+  <div class="card">
+    <h3>資材マスタ</h3>
+    <p class="hint">
+      外寸は「定形 / 規格内 / 規格外」を決めるために使います。<strong>縦横の両方が入って初めて判定に使えます</strong>。
+      片方だけでは「不明」のままです。厚みは商品側で持つので、ここには入れません。
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th class="l">資材</th><th>自重 (g)</th><th>長辺 (mm)</th><th>短辺 (mm)</th><th>外寸</th><th class="l">メモ</th><th></th></tr></thead>
+        <tbody>
+          <% materials.forEach((m) => { %>
+            <tr data-code="<%= m.material_code %>">
+              <td class="l"><%= m.display_name %> <span class="msg mono"><%= m.material_code %></span></td>
+              <td><input class="n mat-tare" type="number" step="0.1" min="0" value="<%= m.tare_weight_g ?? '' %>"></td>
+              <td><input class="n mat-l" type="number" step="1" min="0" value="<%= m.outer_length_mm ?? '' %>"></td>
+              <td><input class="n mat-w" type="number" step="1" min="0" value="<%= m.outer_width_mm ?? '' %>"></td>
+              <td><% if (m.dims_verified) { %><span class="pill ok">実測</span><% } else { %><span class="pill err">未測定</span><% } %></td>
+              <td class="l msg"><%= m.note || '' %></td>
+              <td><button class="ghost" data-act="save-mat">保存</button></td>
+            </tr>
+          <% }) %>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── 取込 ── -->
+  <div class="card">
+    <h3>重量表の取込</h3>
+    <p class="hint">
+      『定形外の重さ.xlsx』を選んでください。<strong>まず「検証だけ」で中身を確かめてから取り込みます</strong>。
+      列はヘッダ名で読むので、列を足したり並べ替えても壊れません。値が空の列は既存データを消しません。
+    </p>
+    <form id="imp" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <input type="file" name="file" accept=".xlsx,.csv" required>
+      <button class="ghost" type="button" data-act="import" data-apply="0">検証だけ</button>
+      <button class="primary" type="button" data-act="import" data-apply="1">取り込む</button>
+      <span class="msg" id="imp-msg"></span>
+    </form>
+    <div id="imp-result" style="margin-top:12px"></div>
+  </div>
+
+  <!-- ── 直近の取込で見つかった問題 ── -->
+  <% if (lastRun) { %>
+    <div class="card">
+      <h3>直近の取込で見つかった問題</h3>
+      <p class="hint">
+        <span class="mono"><%= lastRun.source_name %></span> ／ <%= lastRun.row_count %>行を読み、<%= lastRun.applied_count %>件を反映
+        <% if (lastRun.dry_run) { %><span class="pill warn">検証のみ (反映していません)</span><% } %>
+      </p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>行</th><th class="l">商品コード</th><th>種別</th><th class="l">列</th><th class="l">値</th><th class="l">内容</th></tr></thead>
+          <tbody>
+            <% issues.slice(0,60).forEach((i) => { %>
+              <tr>
+                <td><%= i.row_no ?? '' %></td>
+                <td class="l mono"><%= i.sku_code || '' %></td>
+                <td><span class="pill <%= i.severity === 'error' ? 'err' : 'warn' %>"><%= i.severity === 'error' ? '要修正' : '注意' %></span></td>
+                <td class="l"><%= i.column_name || '' %></td>
+                <td class="l mono"><%= i.raw_value || '' %></td>
+                <td class="l"><%= i.message %></td>
+              </tr>
+            <% }) %>
+            <% if (!issues.length) { %><tr><td class="l" colspan="6">問題はありませんでした</td></tr><% } %>
+          </tbody>
+        </table>
+      </div>
+      <% if (issues.length > 60) { %><p class="hint">ほか <%= issues.length - 60 %> 件</p><% } %>
+    </div>
+  <% } %>
+
+  <!-- ── マスタの埋まり具合 + 設定 ── -->
+  <div class="card">
+    <h3>マスタの埋まり具合</h3>
+    <p class="hint">
+      登録 <%= skuStats.total %> 件 ／ 重さ <%= skuStats.with_weight %> ／ 厚み <%= skuStats.with_thickness %> ／ 資材 <%= skuStats.with_material %>。
+      料金表 = <%= tariff ? tariff.name : '未設定' %> (<%= tariff ? tariff.valid_from : '' %>〜)。
+      送り状シールなどの固定加算 = <%= overheads.map(o => o.name + ' ' + o.weight_g + 'g').join(' / ') || 'なし' %>
+    </p>
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+      <label>重量の安全幅 <input class="n" id="mg" type="number" step="0.5" min="0" max="100" value="<%= settings.boundary_margin_g || 5 %>"> g</label>
+      <label>厚みの安全幅 <input class="n" id="mt" type="number" step="0.5" min="0" max="20" value="<%= settings.thickness_margin_mm || 1 %>"> mm</label>
+      <button class="ghost" data-act="save-settings">保存</button>
+      <span class="msg">境界までこの幅より近いものは確定させず「不明」にします。率ではなく実寸で持ちます</span>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const post = async (url, body) => {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({ ok: false, error: 'サーバの応答を読めません' }));
+    if (!j.ok) throw new Error(j.error || '保存に失敗しました');
+    return j;
+  };
+  const flash = (el, text, bad) => {
+    const s = document.createElement('span');
+    s.className = 'msg'; s.textContent = ' ' + text; s.style.color = bad ? '#b91c1c' : '#047857';
+    el.after(s); setTimeout(() => s.remove(), 3200);
+  };
+
+  document.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('button[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+
+    if (act === 'save-mat') {
+      const tr = btn.closest('tr');
+      const val = (sel) => tr.querySelector(sel).value.trim();
+      btn.disabled = true;
+      try {
+        await post('/apps/postage/api/materials/' + encodeURIComponent(tr.dataset.code), {
+          tare_weight_g: val('.mat-tare'), outer_length_mm: val('.mat-l'), outer_width_mm: val('.mat-w'),
+        });
+        flash(btn, '保存しました。集計し直すと反映されます');
+      } catch (e) { flash(btn, e.message, true); } finally { btn.disabled = false; }
+    }
+
+    if (act === 'save-sku') {
+      const tr = btn.closest('tr');
+      const w = tr.querySelector('.sku-w').value.trim();
+      const t = tr.querySelector('.sku-t').value.trim();
+      if (!w && !t) return flash(btn, '重さか厚みを入れてください', true);
+      btn.disabled = true;
+      try {
+        await post('/apps/postage/api/skus/' + encodeURIComponent(tr.dataset.sku), { unit_weight_g: w, thickness_mm: t });
+        flash(btn, '保存しました');
+      } catch (e) { flash(btn, e.message, true); } finally { btn.disabled = false; }
+    }
+
+    if (act === 'save-settings') {
+      btn.disabled = true;
+      try {
+        await post('/apps/postage/api/settings', {
+          boundary_margin_g: document.getElementById('mg').value,
+          thickness_margin_mm: document.getElementById('mt').value,
+        });
+        flash(btn, '保存しました');
+      } catch (e) { flash(btn, e.message, true); } finally { btn.disabled = false; }
+    }
+
+    if (act === 'import') {
+      const form = document.getElementById('imp');
+      const file = form.querySelector('input[type=file]').files[0];
+      const msg = document.getElementById('imp-msg');
+      if (!file) { msg.textContent = 'ファイルを選んでください'; return; }
+      const apply = btn.dataset.apply === '1';
+      if (apply && !confirm('マスタに反映します。先に「検証だけ」で中身を確かめましたか?')) return;
+      const fd = new FormData();
+      fd.append('file', file);
+      if (apply) fd.append('apply', '1');
+      msg.textContent = apply ? '取り込んでいます…' : '検証しています…';
+      try {
+        const r = await fetch('/apps/postage/api/import', { method: 'POST', body: fd });
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.error || '取込に失敗しました');
+        const s = j.summary;
+        msg.textContent = apply ? '取り込みました' : '検証しました (反映していません)';
+        document.getElementById('imp-result').innerHTML =
+          '<table><thead><tr><th>行数</th><th>読めた</th><th>重さ</th><th>厚み</th><th>資材</th>'
+          + '<th>うち商品名から</th><th>要修正</th><th>注意</th></tr></thead><tbody><tr>'
+          + [s.rows, s.readable, s.withWeight, s.withThickness, s.withMaterial, s.materialFromSuffix, s.errors, s.warns]
+              .map((v) => '<td>' + v + '</td>').join('')
+          + '</tr></tbody></table>'
+          + (apply ? '<p class="hint">画面を再読み込みするとカバー率に反映されます</p>'
+                   : '<p class="hint">問題の中身は「直近の取込で見つかった問題」に出ます (再読み込み)</p>');
+      } catch (e) { msg.textContent = e.message; }
+    }
+  });
+})();
+</script>
+</body>
+</html>

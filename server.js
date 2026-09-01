@@ -69,6 +69,7 @@ import supplierSalesRouter from './apps/supplier-sales/router.js';
 import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from './apps/product-hub/router.js';
 import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
 import productLinksRouter from './apps/product-links/router.js';
+import postageRouter from './apps/postage/router.js';
 import { startProductLinksCron } from './apps/product-links/cron.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import priceUpdateRouter from './apps/price-update/router.js';
@@ -911,6 +912,16 @@ const apps = [
     status: 'active',
     category: 'analysis',
   },
+
+  {
+    id: 'postage',
+    name: '郵便料金判定',
+    description: '定形外郵便の料金区分 (定形110円 / 規格内 / 規格外) を商品の重さ・厚み・資材から自動判定。重量マスタの取込と、いま何割が自動で確定できるかの確認',
+    icon: '📮',
+    path: '/apps/postage',
+    status: 'active',
+    category: 'shipping',
+  },
 ];
 
 // ─── PORTAL_VARIANT (どの環境で動かしているか) ───
@@ -1381,6 +1392,10 @@ app.use('/apps/site-products/api', siteProductsRouter);
 app.use('/apps/site-contact/api', express.json({ limit: '64kb' }), siteContactRouter);
 // 仕入れ先向け 売れ筋共有 (社内管理): 仕入先名登録・共有URL発行・プレビュー
 app.use('/apps/supplier-sales', requireAppAccess('supplier-sales'), express.json({ limit: '256kb' }), supplierSalesRouter);
+// 郵便料金判定 (postage): 専用DB postage.db (DATA_DIR)。
+// カバー率は miniPC の warehouse.db (NE受注) を読み取り専用で参照する — Render では available:false になる。
+// express.json はルータ側で持つ (取込だけ multipart のため)
+app.use('/apps/postage', requireAppAccess('postage'), postageRouter);
 app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トークン認証 (PH_SERVICE_TOKEN, fail-closed)
 app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
 // 商品リンク台帳: warehouse-mirror.db 同居 (product-hub の保存と同一トランザクションで写す)。編集は product-hub 権限。
