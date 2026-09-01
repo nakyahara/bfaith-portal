@@ -31,13 +31,19 @@
 #>
 [CmdletBinding()]
 param(
-  [string] $ConfigPath = (Join-Path $PSScriptRoot 'config.json'),
+  [string] $ConfigPath = '',   # default resolved below (see $ScriptDir)
   # Run a single poll and exit. Used by the smoke test and by install.ps1 verification.
   [switch] $Once
 )
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
+
+# Windows PowerShell 5.1 leaves $PSScriptRoot EMPTY while param() defaults are evaluated when the
+# script is started with "powershell -File" (which is how setup.ps1 and the scheduled task run
+# it), so the config default is resolved here. $MyInvocation is the fallback for the same reason.
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'config.json' }
 
 # ---------------------------------------------------------------- configuration
 
@@ -52,8 +58,8 @@ $BaseUrl      = $cfg.baseUrl.TrimEnd('/')
 $Token        = $cfg.token
 $PollSec      = if ($cfg.pollSec)   { [int]$cfg.pollSec }   else { 4 }
 $HeartbeatSec = if ($cfg.heartbeatSec) { [int]$cfg.heartbeatSec } else { 45 }
-$Sumatra      = if ($cfg.sumatraPath) { $cfg.sumatraPath } else { Join-Path $PSScriptRoot 'SumatraPDF.exe' }
-$WorkDir      = if ($cfg.workDir)   { $cfg.workDir }   else { Join-Path $PSScriptRoot 'work' }
+$Sumatra      = if ($cfg.sumatraPath) { $cfg.sumatraPath } else { Join-Path $ScriptDir 'SumatraPDF.exe' }
+$WorkDir      = if ($cfg.workDir)   { $cfg.workDir }   else { Join-Path $ScriptDir 'work' }
 $LedgerDir    = Join-Path $WorkDir 'ledger'
 $PdfDir       = Join-Path $WorkDir 'pdf'
 $LogPath      = Join-Path $WorkDir 'agent.log'
@@ -82,9 +88,22 @@ function Write-Log {
 # Only one agent per machine. Two of them would hand jobs to the same printer at the same
 # time and confuse the "which spool job was mine" bookkeeping. The scheduled task itself is
 # set to IgnoreNew, but that does not stop someone running this by hand while it is resident.
-$script:Mutex = New-Object System.Threading.Mutex($false, 'Global\BFaith-SlipPrintAgent')
-if (-not $script:Mutex.WaitOne(0)) {
-  Write-Log 'INFO' 'another slip print agent is already running on this PC - exiting'
+$script:Mutex = $null
+$haveMutex = $false
+try {
+  $script:Mutex = New-Object System.Threading.Mutex($false, 'Global\BFaith-SlipPrintAgent')
+  $haveMutex = $script:Mutex.WaitOne(0)
+} catch {
+  # "Access denied" here means the mutex exists but belongs to another account - typically the
+  # SYSTEM scheduled task while somebody runs this by hand. That still means "already running".
+  $haveMutex = $false
+}
+if (-not $haveMutex) {
+  Write-Log 'INFO' 'another slip print agent is already running on this PC (scheduled task BFaith-SlipPrintAgent?) - exiting'
+  if ($Once) {
+    Write-Log 'ERROR' 'stop it first (as Administrator): Stop-ScheduledTask -TaskName BFaith-SlipPrintAgent'
+    exit 1
+  }
   exit 0
 }
 
@@ -111,7 +130,9 @@ function Invoke-Api {
     $params.Body        = ($Body | ConvertTo-Json -Compress)
     $params.ContentType = 'application/json; charset=utf-8'
   }
-  if ($OutFile) { $params.OutFile = $OutFile }
+  # PS 5.1: with -OutFile alone Invoke-WebRequest returns NOTHING (StatusCode would read as 0),
+  # -PassThru makes it write the file AND hand back the response.
+  if ($OutFile) { $params.OutFile = $OutFile; $params.PassThru = $true }
   # PS 5.1 throws on any non-2xx, so 204/401/409 all land in catch. The caller needs the
   # status code to tell "nothing to print" from "something is wrong".
   try {
@@ -556,6 +577,7 @@ try { Resolve-UnfinishedLedger } catch { Write-Log 'ERROR' "start-up ledger chec
 $lastHeartbeat = [DateTime]::MinValue
 $lastCleanup   = [DateTime]::MinValue
 $backoff       = 0
+$onceFailed    = $false   # -Once: report a failed poll through the exit code (setup.ps1 relies on it)
 
 while ($true) {
   try {
@@ -587,6 +609,7 @@ while ($true) {
     } elseif ($res.Status -eq 409) {
       # No printer registered for this device on the server side. Nothing we can fix here.
       Write-Log 'WARN' "server refused to hand out work: $($res.Content)"
+      $onceFailed = $true
       $sleepSec = 30
     } else {
       Write-Log 'WARN' "unexpected response from /print/next: HTTP $($res.Status)"
@@ -594,6 +617,7 @@ while ($true) {
   } catch {
     $backoff = [Math]::Min($MaxBackoffSec, [Math]::Max(2, $backoff * 2))
     Write-Log 'ERROR' "$($_.Exception.Message) (retrying in ${backoff}s)"
+    $onceFailed = $true
     $sleepSec = $backoff
   }
   if ($Once) { break }
@@ -601,3 +625,4 @@ while ($true) {
 }
 
 Write-Log 'INFO' 'agent stopped'
+if ($Once -and $onceFailed) { exit 1 }

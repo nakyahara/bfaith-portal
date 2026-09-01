@@ -133,6 +133,9 @@ Get-Content C:\tools\slip-print-agent\work\agent.log -Tail 30
 | `did not print cleanly` | スプーラー側で止まった（用紙切れ・オフライン等） | 実物を確認。プリンターの状態を直してから再印刷 |
 | `another slip print agent is already running` | 二重起動を弾いた | 正常。常駐中に手で起動したときに出る |
 | `does not match the expected checksum` | PDFが途中で壊れた | 自動で失敗報告されるので、フォルダから手動印刷 |
+| `pdf download failed: HTTP 0` | **PassThru 修正前の agent.ps1** (PS5.1 の `Invoke-WebRequest -OutFile` は `-PassThru` が無いと何も返さず、実際は保存できているのに失敗扱いになる) | 最新版の agent.ps1 に差し替える |
+| `Cannot bind argument to parameter 'Path' because it is an empty string` | **`$PSScriptRoot` 修正前の agent.ps1** (PS5.1 は `powershell -File` 起動時、param() の既定値評価中に `$PSScriptRoot` が空) | 最新版の agent.ps1 に差し替える |
+| `Access to the path 'Global\BFaith-SlipPrintAgent' is denied` | 常駐 (SYSTEM) が動いている最中に手で `-Once` を実行した | 正常。最新版は「既に動いています」と案内して終わる。テストしたいときは先に `Stop-ScheduledTask -TaskName BFaith-SlipPrintAgent` |
 
 タスクの状態:
 
