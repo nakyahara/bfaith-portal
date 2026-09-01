@@ -26,7 +26,8 @@ const csvMod = await import('../apps/inbound-check/csv.js');
 const dbMod = await import('../apps/inbound-check/db.js');
 const { parseInboundCsv } = csvMod;
 const {
-  getDB, importCsv, getActiveBatch, getState, applyCheck, listEvents, eventsCsv, cleanupOld,
+  getDB, importCsv, getActiveBatch, getState, listEvents, eventsCsv, cleanupOld,
+  applyQuantityEvents, listQuantityEvents, finalizeLine, reopenLine, listDestinations, createTables, quantitySum,
   createDevice, verifyDevice, revokeDevice, listDevices, listWorkers, getWorker, productInfoMap, workDateJst,
 } = dbMod;
 
@@ -123,39 +124,122 @@ const csvA = makeCsv([row('AR1', 1, 'abcDEF', 100), row('AR1', 2, 'x2', 12), row
   ok(logs.length === 4 && logs[0].ok === 1 && logs.slice(1).every(l => l.ok === 0), '取込ログに成功1・失敗3');
 }
 
-// ─── 3. 消し込み ───
-console.log('\n[3] 消し込み');
+// ─── 3. 確定 (finalize) と やり直し (reopen) ───
+console.log('\n[3] 確定・やり直し');
+const FILL = id => ({ client_event_id: id });
 {
   const b = getActiveBatch();
-  const r1 = applyCheck({ batchId: b.id, lineKey: 'AR1|1|1', action: 'check', expectVersion: 1, worker: '山田', staffId: 7, deviceId: 1, deviceLabel: 'iPad1' });
-  ok(r1.ok && r1.state.status === 'checked' && r1.state.version === 2 && r1.state.checked_by === '山田', '確認 → checked v2');
-  const r2 = applyCheck({ batchId: b.id, lineKey: 'AR1|1|1', action: 'check', expectVersion: 1, worker: '佐藤' });
-  ok(!r2.ok && r2.error === 'conflict' && r2.current.checked_by === '山田', '同時確認 (古い version) = conflict + 現在状態');
+  // 「全部あり」= 残り (予定 − 見つけた) を1イベント足してから exact 確定する
+  const r1 = finalizeLine({ batchId: b.id, lineKey: 'AR1|1|1', expectVersion: 1, expectQuantityVersion: 1,
+    result: 'exact', mode: 'fill_remaining', fillEvent: FILL('ev-fill-ar1-1'),
+    worker: '山田', staffId: 7, deviceId: 1, deviceLabel: 'iPad1' });
+  ok(r1.ok && r1.state.status === 'checked' && r1.state.version === 2 && r1.state.found_qty === 100 && r1.state.finalized_result === 'exact',
+    '全部あり → checked v2 / 100個 / exact');
+  const r2 = finalizeLine({ batchId: b.id, lineKey: 'AR1|1|1', expectVersion: 1, expectQuantityVersion: 1, result: 'exact', mode: 'current', worker: '佐藤' });
+  ok(!r2.ok && r2.error === 'finalized' && r2.current.checked_by === '山田', '確定済みへの確定 = finalized + 現在状態');
   for (const bad of [undefined, null, 0, -1, 1.5, NaN, '2']) {
-    const rb = applyCheck({ batchId: b.id, lineKey: 'AR1|1|1', action: 'check', expectVersion: bad, worker: '佐藤' });
+    const rb = finalizeLine({ batchId: b.id, lineKey: 'AR1|2|1', expectVersion: bad, expectQuantityVersion: 1, result: 'exact', worker: '佐藤' });
     ok(!rb.ok && rb.error === 'bad_request', `expectVersion=${String(bad)} は bad_request`);
   }
-  const r3 = applyCheck({ batchId: b.id, lineKey: 'AR1|2|1', action: 'check', worker: '佐藤', expectVersion: 99 });
+  const r3 = finalizeLine({ batchId: b.id, lineKey: 'AR1|2|1', expectVersion: 99, expectQuantityVersion: 1, result: 'exact', mode: 'current', worker: '佐藤' });
   ok(!r3.ok && r3.error === 'conflict', 'version 不一致 = conflict');
-  const r4 = applyCheck({ batchId: b.id, lineKey: 'AR1|2|1', action: 'uncheck', worker: '佐藤', expectVersion: 1 });
-  ok(!r4.ok && r4.error === 'conflict', '未確認行の取消 = conflict');
-  const r5 = applyCheck({ batchId: b.id, lineKey: 'NOPE', action: 'check', worker: 'x', expectVersion: 1 });
+  const r4 = reopenLine({ batchId: b.id, lineKey: 'AR1|2|1', expectVersion: 1, worker: '佐藤' });
+  ok(!r4.ok && r4.error === 'conflict', '未確認行のやり直し = conflict');
+  const r5 = finalizeLine({ batchId: b.id, lineKey: 'NOPE', expectVersion: 1, expectQuantityVersion: 1, result: 'exact', worker: 'x' });
   ok(!r5.ok && r5.error === 'not_found', '存在しない明細 = not_found');
-  const r6 = applyCheck({ batchId: b.id, lineKey: 'AR1|1|1', action: 'check', worker: '', expectVersion: 2 });
+  const r6 = finalizeLine({ batchId: b.id, lineKey: 'AR2|1|1', expectVersion: 1, expectQuantityVersion: 1, result: 'exact', worker: '' });
   ok(!r6.ok && r6.error === 'bad_request', '作業者なし = bad_request');
+  const r7 = finalizeLine({ batchId: b.id, lineKey: 'AR2|1|1', expectVersion: 1, expectQuantityVersion: 1, result: 'exact', mode: 'current', worker: '山田' });
+  ok(!r7.ok && r7.error === 'result_mismatch', '0個なのに exact = result_mismatch (人が選んだ意味と実数が食い違ったまま確定させない)');
   const st = getState();
   ok(st.totals.checked === 1 && st.slips.find(s => s.ar_no === 'AR1').checked_count === 1, 'state に確認数が反映');
-  const un = applyCheck({ batchId: b.id, lineKey: 'AR1|1|1', action: 'uncheck', worker: '山田', expectVersion: 2 });
-  ok(un.ok && un.state.status === 'unchecked' && un.state.version === 3 && un.state.checked_by === null, '取消 → unchecked v3');
+
+  // やり直し = 確認だけ外し、数えた数は残す
+  const un = reopenLine({ batchId: b.id, lineKey: 'AR1|1|1', expectVersion: 2, worker: '山田' });
+  ok(un.ok && un.state.status === 'unchecked' && un.state.version === 3 && un.state.checked_by === null, 'やり直す → unchecked v3');
+  ok(un.state.found_qty === 100 && un.state.finalized_result === null, 'やり直しても数量100は残る (誤タップで記録が消えない)');
   const ev = listEvents(b.id);
-  ok(ev.length === 2 && ev[1].action === 'uncheck' && ev[1].reverted_event_id === ev[0].id, '取消イベントが確認イベントを指す');
-  ok(ev[0].staff_id === 7 && ev[1].staff_id === null, 'events.staff_id (確認=7 / 取消は未指定=null)');
-  ok(applyCheck({ batchId: b.id, lineKey: 'AR1|1|1', action: 'check', worker: '山田', expectVersion: 3 }).ok, '再確認 (version 3) OK');
-  ok(applyCheck({ batchId: b.id, lineKey: 'AR2|1|1', action: 'check', worker: '山田', expectVersion: 1 }).ok, 'AR2 確認');
+  ok(ev.length === 2 && ev[1].action === 'uncheck' && ev[1].reverted_event_id === ev[0].id, 'やり直しイベントが確認イベントを指す');
+  ok(ev[0].staff_id === 7 && ev[0].result === 'exact' && ev[0].found_qty === 100 && ev[0].planned_qty_snapshot === 100,
+    'events に staff_id / result / 確定時点の数量スナップショットが残る');
+  // 数量が残っているので、再確定は fill 不要 (mode='current')
+  ok(finalizeLine({ batchId: b.id, lineKey: 'AR1|1|1', expectVersion: 3, expectQuantityVersion: 2, result: 'exact', mode: 'current', worker: '山田' }).ok,
+    '再確定 (version 3 / 数量そのまま) OK');
+  ok(finalizeLine({ batchId: b.id, lineKey: 'AR2|1|1', expectVersion: 1, expectQuantityVersion: 1, result: 'exact', mode: 'fill_remaining', fillEvent: FILL('ev-fill-ar2-1'), worker: '山田' }).ok, 'AR2 確認');
   ok(getState().totals.checked === 2, '確認数 2');
   const csv = eventsCsv(b.id);
   ok(csv.charCodeAt(0) === 0xFEFF && csv.split('\r\n').length >= 5 && csv.includes('打ち消した確認ID'), '履歴CSV (BOM + 4イベント)');
-  applyCheck({ batchId: b.id, lineKey: 'AR1|2|1', action: 'check', worker: '=HYPERLINK("x")', expectVersion: 1 });
+}
+
+// ─── 3b. 数量 (部分確認) ───
+// 要件定義 v1.3 §11。加算イベント / 冪等ID / 訂正 / 不足確定 / 台帳の実数
+console.log('\n[3b] 数量 (部分確認)');
+{
+  const b = getActiveBatch();
+  const K = 'AR1|2|1';                     // 予定 12
+  const add = (id, q, kind = 'box', u = 4) => ({ client_event_id: id, action: 'add', quantity: q, input_kind: kind, unit_size: u });
+
+  let x = applyQuantityEvents({ batchId: b.id, lineKey: K, expectQuantityVersion: 1, events: [add('ev-q-0001', 4)], worker: '山田', packQty: 4 });
+  ok(x.ok && x.state.found_qty === 4 && x.state.quantity_version === 2, '＋1箱 (4入り) → 4個 / quantity_version=2');
+  ok(getState().lines.find(l => l.line_key === K).quantity_relation === 'shortage', '4/12 は shortage (= 画面では「一部」)');
+  ok(getState().totals.partial === 1, 'totals.partial = 1 (partial は status ではなく found_qty から導出)');
+
+  x = applyQuantityEvents({ batchId: b.id, lineKey: K, expectQuantityVersion: 2, events: [add('ev-q-0001', 4)], worker: '山田' });
+  ok(x.ok && x.replayed && x.state.found_qty === 4, '同じ client_event_id の再送は二重加算しない (応答だけ失われた時の押し直し)');
+  x = applyQuantityEvents({ batchId: b.id, lineKey: K, expectQuantityVersion: 2, events: [add('ev-q-0001', 8)], worker: '山田' });
+  ok(!x.ok && x.error === 'idempotency_conflict', '同じ操作IDで違う内容 = idempotency_conflict');
+  x = applyQuantityEvents({ batchId: b.id, lineKey: K, expectQuantityVersion: 1, events: [add('ev-q-0002', 4)], worker: '佐藤' });
+  ok(!x.ok && x.error === 'conflict' && x.current.found_qty === 4, '古い quantity_version = conflict + 現在値');
+  x = applyQuantityEvents({ batchId: b.id, lineKey: K, expectQuantityVersion: 2, events: [add('ev-q-0002', 4)], worker: '佐藤' });
+  ok(x.ok && x.state.found_qty === 8, '別の人の加算は足し算になる (絶対値の上書きではない)');
+
+  const evs = listQuantityEvents(b.id, K);
+  ok(evs.length === 2 && evs[0].quantity === 4 && evs[0].reversed === 0, '数量イベント履歴 2件・未打消');
+  // 訂正 = 打ち消し + 新しい入数での加算 (元イベントを replaces_event_seq で指す)
+  x = applyQuantityEvents({ batchId: b.id, lineKey: K, expectQuantityVersion: 3, worker: '山田', events: [
+    { client_event_id: 'ev-q-0003', action: 'reversal', quantity: 4, input_kind: 'correction', reverses_event_seq: evs[0].event_seq },
+    { client_event_id: 'ev-q-0004', action: 'add', quantity: 6, input_kind: 'correction', unit_size: 6, replaces_event_seq: evs[0].event_seq },
+  ] });
+  ok(x.ok && x.state.found_qty === 10, '入数の訂正 (4入り→6入り) → 10個');
+  x = applyQuantityEvents({ batchId: b.id, lineKey: K, expectQuantityVersion: 4, worker: '山田',
+    events: [{ client_event_id: 'ev-q-0005', action: 'reversal', quantity: 4, input_kind: 'correction', reverses_event_seq: evs[0].event_seq }] });
+  ok(!x.ok && x.error === 'already_reversed', '同じ加算の二重打ち消し = already_reversed');
+  x = applyQuantityEvents({ batchId: b.id, lineKey: K, expectQuantityVersion: 4, worker: '山田',
+    events: [{ client_event_id: 'ev-q-0006', action: 'add', quantity: 6, input_kind: 'correction', replaces_event_seq: evs[0].event_seq }] });
+  ok(!x.ok && x.error === 'bad_request', '訂正の add だけを単独で送るのは拒否 (打ち消しと同時に送る)');
+
+  // 不足のまま確定 → 台帳には「実数」が残る
+  let f = finalizeLine({ batchId: b.id, lineKey: K, expectVersion: 1, expectQuantityVersion: 4, result: 'exact', mode: 'current', worker: '山田' });
+  ok(!f.ok && f.error === 'result_mismatch', '10/12 で exact は result_mismatch');
+  f = finalizeLine({ batchId: b.id, lineKey: K, expectVersion: 1, expectQuantityVersion: 4, result: 'shortage', mode: 'current',
+    worker: '山田', clientOperationId: 'op-short-0001', decide: () => ({ ok: true, destination: 'iroha', decidedFrom: 'chosen' }) });
+  ok(f.ok && f.state.finalized_result === 'shortage' && f.state.found_qty === 10, '不足のまま確定 → checked / shortage / 10個');
+  const dests = listDestinations({ destination: 'iroha' }).filter(d => !d.cancelled_at);
+  ok(dests.length === 1 && dests[0].actual_qty === 10 && dests[0].planned_qty === 12,
+    '行き先台帳に実数10 (予定12ではなく、実際にいろはへ送る数が残る)');
+  ok(getState().totals.toIroha === 1 && getState().totals.toIrohaQty === 10, 'totals のいろは件数・個数は台帳から数える');
+  const again = finalizeLine({ batchId: b.id, lineKey: K, expectVersion: 1, expectQuantityVersion: 4, result: 'shortage', worker: '山田', clientOperationId: 'op-short-0001' });
+  ok(again.ok && again.replayed && listDestinations({ destination: 'iroha' }).filter(d => !d.cancelled_at).length === 1,
+    '確定の再送は台帳を増やさない (client_operation_id で冪等)');
+  x = applyQuantityEvents({ batchId: b.id, lineKey: K, expectQuantityVersion: 4, events: [add('ev-q-0007', 2)], worker: '山田' });
+  ok(!x.ok && x.error === 'finalized', '確定済みの行には数を足せない (先にやり直す)');
+
+  // 打ち消しで合計が負にならない
+  const ro = reopenLine({ batchId: b.id, lineKey: K, expectVersion: 2, worker: '山田' });
+  ok(ro.ok && ro.state.found_qty === 10, 'やり直しても数量は残る');
+  ok(listDestinations({ destination: 'iroha' }).filter(d => !d.cancelled_at).length === 0, 'やり直しで行き先台帳が取り消される (二重計上を防ぐ)');
+  const all = listQuantityEvents(b.id, K);
+  const live = all.filter(e => e.action === 'add' && !e.reversed);
+  let qv = ro.state.quantity_version, seq = 0;
+  for (const e of live) {
+    const rr = applyQuantityEvents({ batchId: b.id, lineKey: K, expectQuantityVersion: qv, worker: '山田',
+      events: [{ client_event_id: `ev-q-undo-${++seq}`, action: 'reversal', quantity: e.quantity, input_kind: 'correction', reverses_event_seq: e.event_seq }] });
+    qv = rr.state.quantity_version;
+  }
+  ok(getState().lines.find(l => l.line_key === K).found_qty === 0, '全部打ち消すと 0 に戻る (行は消さず reversal を積む)');
+  // 最後に確定しておく ([2b] が「前回確認済み」を見るため)
+  ok(finalizeLine({ batchId: b.id, lineKey: K, expectVersion: 3, expectQuantityVersion: qv, result: 'exact', mode: 'fill_remaining',
+    fillEvent: FILL('ev-fill-ar12-1'), worker: '=HYPERLINK("x")' }).ok, '残りも全部あり → exact 確定');
   ok(eventsCsv(b.id).includes("'=HYPERLINK"), '履歴CSV: 先頭 = の値はアポストロフィで無害化');
 }
 
@@ -177,7 +261,7 @@ console.log('\n[2b] 新バッチ (同日引き継ぎ / 翌日リセット)');
   const l2 = st.lines.find(l => l.line_key === 'AR1|2|1');
   ok(l2.check_status === 'unchecked' && !!l2.prev_checked, '予定数が変わった明細は引き継がず未確認 (前回確認は参考表示)');
   ok(st.lines.find(l => l.line_key === 'AR3|1|1').check_status === 'unchecked', '新しい明細は未確認');
-  const stale = applyCheck({ batchId: old.id, lineKey: 'AR1|1|1', action: 'check', worker: '山田', expectVersion: 1 });
+  const stale = finalizeLine({ batchId: old.id, lineKey: 'AR1|1|1', expectVersion: 1, expectQuantityVersion: 1, result: 'exact', worker: '山田' });
   ok(!stale.ok && stale.error === 'stale_batch' && stale.activeBatchId === r.batch.id, '旧 batch_id の操作 = stale_batch');
   // 翌日の取込 (active の work_date を1日戻して再現) は引き継がない = 要件 §2 確定事項⑤ 毎朝リセット
   db.prepare("UPDATE f_inbound_check_batches SET work_date = date(work_date, '-1 day') WHERE id = ?").run(r.batch.id);
@@ -247,6 +331,51 @@ console.log('\n[5] 端末・作業者・掃除');
   ok(c.batches >= 1 && db.prepare('SELECT COUNT(*) c FROM f_inbound_check_batches').get().c === 1, `古いバッチを削除 (${c.batches}) / active は残る`);
   ok(db.prepare('SELECT COUNT(*) c FROM f_inbound_check_events').get().c === 0 && db.prepare('SELECT COUNT(*) c FROM f_inbound_check_lines WHERE batch_id NOT IN (SELECT id FROM f_inbound_check_batches)').get().c === 0, '子行も CASCADE で消える');
   ok(c.logs >= 1, `取込ログの掃除 (${c.logs})`);
+}
+
+// ─── 9. 移行 (既存の確認済みを数量つきに引き上げる) ───
+// ⭐**バックフィルまでが1セット**。ここが抜けると、本番の当日分が全部「0 / 106個」に見えて
+//   現場が数え直す羽目になり、さらに同日の再取込で数量が消える (要件定義 v1.3 §11.8)
+// ─── 9. 移行 (既存の確認済みを数量つきに引き上げる) ───
+// ⭐**バックフィルまでが1セット**。ここが抜けると、本番の当日分が全部「0 / 106個」に見えて
+//   現場が数え直す羽目になり、さらに同日の再取込で数量が消える (要件定義 v1.3 §11.8)
+console.log('\n[9] 移行 (バックフィル)');
+{
+  // 数量を入れた行がある状態で「数量の列が無かった頃の DB」を作り直す
+  const rm = importCsv(makeCsv([row('AR9', 1, 'mig1', 50), row('AR9', 2, 'mig2', 8)]), { fileName: 'mig.csv', generatedAt: '2026-09-20T00:00:00Z' });
+  const bm = rm.batch;
+  finalizeLine({ batchId: bm.id, lineKey: 'AR9|1|1', expectVersion: 1, expectQuantityVersion: 1, result: 'exact',
+    mode: 'fill_remaining', fillEvent: { client_event_id: 'ev-mig-0001' }, worker: '山田' });
+  ok(getState().lines.find(l => l.line_key === 'AR9|1|1').found_qty === 50, '移行前の準備: 50個で確定');
+
+  // 旧スキーマを再現する (列を落とし、数量イベントを消す)
+  db.exec('DELETE FROM f_inbound_check_quantity_events');
+  for (const c of ['found_qty', 'quantity_version', 'quantity_work_date', 'finalized_result', 'destination_id', 'current_pack_qty']) {
+    db.exec(`ALTER TABLE f_inbound_check_line_state DROP COLUMN ${c}`);
+  }
+  ok(!db.prepare('PRAGMA table_info(f_inbound_check_line_state)').all().map(c => c.name).includes('found_qty'), '旧スキーマ (found_qty 無し) を再現');
+
+  createTables(db);   // ← ここで移行が走る
+
+  const cols1 = db.prepare('PRAGMA table_info(f_inbound_check_line_state)').all().map(c => c.name);
+  ok(cols1.includes('found_qty') && cols1.includes('quantity_version') && cols1.includes('finalized_result'), '列が足される');
+  const s1 = db.prepare("SELECT * FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = 'AR9|1|1'").get(bm.id);
+  ok(s1.found_qty === 50 && s1.finalized_result === 'exact', '既存の確認済みは found_qty = 予定数 / exact で埋まる (0個にならない)');
+  const s2 = db.prepare("SELECT * FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = 'AR9|2|1'").get(bm.id);
+  ok(s2.found_qty === 0 && s2.finalized_result === null, '未確認の行は 0 のまま');
+  const synth = db.prepare('SELECT * FROM f_inbound_check_quantity_events WHERE client_event_id = ?').get(`backfill:${bm.id}:AR9|1|1`);
+  ok(synth && synth.quantity === 50 && synth.input_kind === 'backfill' && synth.worker === '山田',
+    '合成の加算イベントも作られる (これが無いと同日の再取込で数量が消える)');
+  ok(quantitySum(db, bm.work_date, 'AR9|1|1', 'mig1') === 50, 'イベント集計も 50 になる');
+
+  createTables(db);   // 2回流しても増えない (冪等)
+  ok(db.prepare('SELECT COUNT(*) c FROM f_inbound_check_quantity_events WHERE client_event_id = ?').get(`backfill:${bm.id}:AR9|1|1`).c === 1,
+    '移行を再実行しても合成イベントは増えない (冪等)');
+
+  // 同日の再取込で、移行した数量がそのまま引き継がれる
+  const rm2 = importCsv(makeCsv([row('AR9', 1, 'mig1', 50), row('AR9', 2, 'mig2', 8), row('AR9', 3, 'mig3', 5)]), { fileName: 'mig2.csv', generatedAt: '2026-09-20T02:00:00Z' });
+  const lm = getState().lines.find(x => x.line_key === 'AR9|1|1');
+  ok(rm2.ok && lm.check_status === 'checked' && lm.found_qty === 50, '移行後の同日再取込でも確認と数量が残る');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

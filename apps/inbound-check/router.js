@@ -17,9 +17,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
-  getState, applyCheck, importCsv, getActiveBatch, listBatches, listImportLog, listEvents, eventsCsv,
+  getState, importCsv, getActiveBatch, listBatches, listImportLog, listEvents, eventsCsv,
+  applyQuantityEvents, listQuantityEvents, finalizeLine, reopenLine,
   createDevice, verifyDevice, revokeDevice, listDevices,
-  resolveDestination, infoForLine, getLineForCheck, setExpiryManaged, listDestinations, destinationsCsv, IROHA_YES, IROHA_NO,
+  resolveDestination, infoForLine, setExpiryManaged, listDestinations, destinationsCsv, IROHA_YES, IROHA_NO,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
   listWorkers, getWorker,
@@ -232,7 +233,7 @@ function parseExpiry(v) {
   return `${m[1]}-${m[2]}-${m[3]}`;
 }
 
-function decideDestination(req, line, worker) {
+function decideDestination(req, line, worker, foundQty = null) {
   const { info, expiryManaged } = infoForLine(line.code_key);
   let dest = resolveDestination(info, { expiryManaged });
   if (dest.missing.length === 0) return { ok: true, destination: dest.destination, decidedFrom: 'master' };
@@ -240,7 +241,7 @@ function decideDestination(req, line, worker) {
   const choice = req.body?.choice;
   if (!choice || typeof choice !== 'object') {
     return { ok: false, status: 400, body: { ok: false, error: 'destination_required', missing: dest.missing, info, expiry_managed: expiryManaged,
-      line: { product_id: line.product_id, product_name: line.product_name, planned_qty: line.planned_qty },
+      line: { product_id: line.product_id, product_name: line.product_name, planned_qty: line.planned_qty, found_qty: foundQty },
       message: dest.missing.map(m => MISSING_LABEL[m] || m).join(' と ') + ' を決めてください' } };
   }
 
@@ -317,47 +318,92 @@ function decideDestination(req, line, worker) {
   return { ok: true, destination, decidedFrom: usedChoice ? 'chosen' : 'master', expiryDate, warning };
 }
 
+// 数量・確定系のエラーはどれも「画面を最新にして出し直す」で回復する。HTTP の対応表
+const STATUS_BY_ERROR = {
+  stale_batch: 409, stale_work_date: 409, conflict: 409, finalized: 409, result_mismatch: 409,
+  already_reversed: 409, idempotency_conflict: 409, negative_total: 409,
+  not_found: 404, worker_required: 400, destination_required: 400, bad_request: 400,
+};
+const statusFor = r => (r && r._status) || STATUS_BY_ERROR[r && r.error] || 400;
+
+function sendResult(res, r) {
+  if (r.ok) return res.json(r);
+  const status = statusFor(r);
+  const body = { ...r };
+  delete body._status;
+  return res.status(status).json(body);
+}
+
+/** 端末・作業者・共通の前処理。エラーならレスポンス済みを示す null を返す */
+function actorOf(req, res) {
+  const w = resolveWorker(req);
+  if (w.error) { res.status(400).json({ ok: false, error: 'worker_required', message: w.error }); return null; }
+  return {
+    worker: w.worker, staffId: w.staffId,
+    deviceId: req.icDevice ? req.icDevice.id : null,
+    deviceLabel: req.icDevice ? req.icDevice.label : (req.icUser ? `session:${req.icUser}` : null),
+  };
+}
+
+const intOrNull = v => (typeof v === 'number' ? v : (typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : NaN));
+
+// ─── 数を足す / 打ち消す / 訂正する ───
+// ⭐1タップ1イベント。**再送は同じ client_event_id** を使うので、コミット直後に応答だけ
+//   失われて押し直しても二重加算しない (要件定義 v1.3 §11.5)
+router.post('/api/lines/quantity-events', checkOrigin, api((req, res) => {
+  const a = actorOf(req, res);
+  if (!a) return;
+  const { batch_id, line_key, expect_quantity_version, events, pack_qty } = req.body || {};
+  sendResult(res, applyQuantityEvents({
+    batchId: intOrNull(batch_id), lineKey: String(line_key || ''),
+    expectQuantityVersion: intOrNull(expect_quantity_version),
+    events, packQty: pack_qty == null ? null : intOrNull(pack_qty), ...a,
+  }));
+}));
+
+// その行の数量イベント (訂正パネル用)
+router.get('/api/lines/events', api((req, res) => {
+  const id = Number(req.query.batch_id);
+  if (!Number.isInteger(id)) return res.status(400).json({ ok: false, error: 'bad_request', message: 'batch_id が必要です' });
+  res.json({ ok: true, events: listQuantityEvents(id, String(req.query.line_key || '')) });
+}));
+
 function handleCheck(action) {
   return api((req, res) => {
-    const { batch_id, line_key, expect_version } = req.body || {};
-    // expect_version は必須の正整数 (不在・NaN・小数・0以下 → 400)。文字列の "2" は許容 (JSON の型揺れ)
-    const ev = typeof expect_version === 'number' ? expect_version
-      : (typeof expect_version === 'string' && /^\d+$/.test(expect_version) ? Number(expect_version) : NaN);
+    const a = actorOf(req, res);
+    if (!a) return;
+    const { batch_id, line_key, expect_version, expect_quantity_version, client_operation_id } = req.body || {};
+    const ev = intOrNull(expect_version);
+    const qv = intOrNull(expect_quantity_version);
     if (!Number.isSafeInteger(ev) || ev < 1) return res.status(400).json({ ok: false, error: 'bad_request', message: 'expect_version (正の整数) が必要です' });
-    const w = resolveWorker(req);
-    if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
 
-    // 確認するときだけ行き先を確定させる (取り消しは台帳側で cancelled を立てるだけ)
-    let decided = { destination: null, decidedFrom: null, warning: null };
-    if (action === 'check') {
-      // 明細が引けないときはゲートを通さず applyCheck に任せる。
-      // そちらが stale_batch (一覧が入れ替わった) と not_found を正しく出し分けるため
-      const line = getLineForCheck(batch_id, String(line_key || ''));
-      if (line) {
-        const d = decideDestination(req, line, editorName(req, w.worker));
-        if (!d.ok) return res.status(d.status).json(d.body);
-        decided = d;
-      }
+    if (action === 'uncheck') {
+      return sendResult(res, reopenLine({
+        batchId: intOrNull(batch_id), lineKey: String(line_key || ''), expectVersion: ev,
+        expectQuantityVersion: Number.isSafeInteger(qv) ? qv : null,
+        clientOperationId: client_operation_id || null, ...a,
+      }));
     }
 
-    const r = applyCheck({
-      batchId: batch_id, lineKey: String(line_key || ''), action,
-      destination: decided.destination, decidedFrom: decided.decidedFrom, expiryDate: decided.expiryDate || null,
-      expectVersion: ev,
-      worker: w.worker,
-      staffId: w.staffId,
-      deviceId: req.icDevice ? req.icDevice.id : null,
-      deviceLabel: req.icDevice ? req.icDevice.label : (req.icUser ? `session:${req.icUser}` : null),
-    });
-    if (!r.ok) {
-      const status = r.error === 'stale_batch' || r.error === 'conflict' ? 409 : r.error === 'not_found' ? 404 : 400;
-      return res.status(status).json(r);
-    }
-    res.json(decided.warning ? { ...r, warning: decided.warning } : r);
+    if (!Number.isSafeInteger(qv) || qv < 1) return res.status(400).json({ ok: false, error: 'bad_request', message: 'expect_quantity_version (正の整数) が必要です' });
+    // ⭐行き先の判定と入庫情報への書き戻しは finalizeLine の**トランザクション内**で行う。
+    //   先に書いてから確認すると、確認が 409 で失敗したのにマスタだけ変わる (Codex 指摘の既存バグ)
+    const decide = (line, foundQty) => {
+      const d = decideDestination(req, line, editorName(req, a.worker), foundQty);
+      if (!d.ok) return { ok: false, abort: { ...d.body, _status: d.status } };
+      return d;
+    };
+    sendResult(res, finalizeLine({
+      batchId: intOrNull(batch_id), lineKey: String(line_key || ''), expectVersion: ev, expectQuantityVersion: qv,
+      result: String(req.body?.result || ''), mode: String(req.body?.mode || 'current'),
+      fillEvent: req.body?.fill_event || null, clientOperationId: client_operation_id || null,
+      decide, ...a,
+    }));
   });
 }
 router.post('/api/lines/check', checkOrigin, handleCheck('check'));
 router.post('/api/lines/uncheck', checkOrigin, handleCheck('uncheck'));
+
 
 // ─── 入庫情報の編集 (iPad の詳細パネルから) ───
 // 入数・いろは在庫化作業有無・BCシール・直ピック・荷姿・memo をその場で直せる。
