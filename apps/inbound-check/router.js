@@ -24,6 +24,10 @@ import {
   listWorkers, getWorker,
 } from './db.js';
 import { fetchAndImportFromDrive, statusForView, driveConfig } from './drive-fetch.js';
+// 入庫情報の書き込みは inbound-info の関数を通す (いろは=有り の連動ルール・楽観ロック・
+// updated_by の記録がそこに1つだけある。ここで直に UPDATE すると規則が二重管理になる)
+import { updateInbound, getInbound, addManual } from '../inbound-info/db.js';
+import { queueEnsureImages } from '../picking/images.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -225,6 +229,64 @@ function handleCheck(action) {
 }
 router.post('/api/lines/check', checkOrigin, handleCheck('check'));
 router.post('/api/lines/uncheck', checkOrigin, handleCheck('uncheck'));
+
+// ─── 入庫情報の編集 (iPad の詳細パネルから) ───
+// 入数・いろは在庫化作業有無・BCシール・直ピック・荷姿・memo をその場で直せる。
+// 書き込み先は f_inbound_info (= /apps/inbound-info と同じ正本) なので、値札印刷にもそのまま効く。
+// ⚠誰が直したかを残すため、消し込みと同じく作業者の指定を必須にする
+const EDITABLE_FIELDS = ['入数', '入庫時BCシール貼りフラグ', '直接ピックロケ保管', 'BF保管荷姿', 'いろは在庫化作業有無', 'memo'];
+
+function editorName(req, worker) {
+  const dev = req.icDevice ? req.icDevice.label : (req.icUser ? 'ポータル' : '');
+  return dev ? `${worker} (${dev})` : worker;
+}
+
+router.post('/api/info', checkOrigin, api((req, res) => {
+  const { code_key, fields, expect_version } = req.body || {};
+  const key = String(code_key || '').trim();
+  if (!key) return res.status(400).json({ ok: false, error: 'bad_request', message: '商品が指定されていません' });
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '変更内容がありません' });
+  }
+  // 送られてきたキーのうち、編集を許した項目だけを通す (商品名など他の列は iPad から触らせない)
+  const picked = {};
+  for (const k of EDITABLE_FIELDS) if (k in fields) picked[k] = fields[k];
+  if (Object.keys(picked).length === 0) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '変更できる項目がありません' });
+  }
+  const ev = typeof expect_version === 'number' ? expect_version
+    : (typeof expect_version === 'string' && /^\d+$/.test(expect_version) ? Number(expect_version) : NaN);
+  if (!Number.isSafeInteger(ev) || ev < 1) return res.status(400).json({ ok: false, error: 'bad_request', message: 'expect_version (正の整数) が必要です' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+
+  const r = updateInbound(key, picked, editorName(req, w.worker), ev);
+  if (!r.ok) {
+    const status = r.error === 'not_found' ? 404 : r.error === 'conflict' ? 409 : 400;
+    const message = r.error === 'conflict' ? '他の人が先に変更しました。最新の内容を表示します'
+      : r.error === 'not_found' ? 'この商品は入庫情報に登録されていません'
+      : r.error === 'invalid_irisu' ? '入数は1以上の整数で入力してください'
+      : '保存できませんでした';
+    return res.status(status).json({ ok: false, error: r.error, message });
+  }
+  res.json({ ok: true, row: r.row });
+}));
+
+// 入庫情報がまだ無い商品を登録する (登録しないと入数もいろはも書けないため)
+router.post('/api/info/register', checkOrigin, api((req, res) => {
+  const code = String(req.body?.code || '').trim();
+  if (!code) return res.status(400).json({ ok: false, error: 'bad_request', message: '商品IDがありません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const r = addManual(code, editorName(req, w.worker));
+  if (!r.ok) {
+    const message = r.error === 'duplicate' ? '既に登録されています (画面を更新してください)'
+      : r.error === 'not_in_master' ? 'この商品IDは商品マスタにありません (ネクストエンジン側を確認してください)'
+      : '登録できませんでした';
+    return res.status(r.error === 'duplicate' ? 409 : 400).json({ ok: false, error: r.error, message });
+  }
+  res.json({ ok: true, row: getInbound(code) });
+}));
 
 // ─── 管理画面 ───
 router.get('/admin', requireSession, api(async (req, res) => {
