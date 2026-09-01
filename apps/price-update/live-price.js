@@ -81,8 +81,8 @@ export function shippingOfRakutenVariant(v) {
  * @param {Array<{key:string, aliases?:string[], manageNumber?:string|null, manageNumbers?:string[], rowKey?:string}>} targets
  *   key      = 表示中の出品コード (別名の1つとしても使う)
  *   aliases  = AM/AL/W の別名 (mirror_rakuten_sku_map 由来)。variant の特定に使う
- *   skuAliases = そのうち SKU 単位のもの (AM/AL。対応表の source で分けたもの)。
- *              単一SKUの救済を使ってよいか (= 対応表が商品ページ単位の別名しか持たないか) の判断に使う
+ *   skuAliases = そのうち SKU 単位のもの (AM/AL。対応表の source で分けたもの)。variant の照合に使う
+ *   amAliases  = そのうち AM (システム連携用SKU番号) 由来のもの。当たった variant の AM はこれとだけ照合する
  *   manageNumber  = 対応表が持っている商品管理番号 (あればこれを最優先で使う)
  *   manageNumbers = 対応表に複数の商品管理番号があった時の一覧 (2つ以上なら取り違え防止で確定しない)
  *   rowKey   = 結果を引くためのキー。★色違いは同じ商品管理番号を共有するので、
@@ -98,6 +98,7 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       rowKey: t.rowKey ? String(t.rowKey) : normCode(t.key),
       aliases: [...new Set([t.key, ...(t.aliases || [])].map((a) => String(a || '').trim()).filter(Boolean))],
       skuAliases: [...new Set((t.skuAliases || []).map((a) => String(a || '').trim()).filter(Boolean))],
+      amAliases: [...new Set((t.amAliases || []).map((a) => String(a || '').trim()).filter(Boolean))],
       manageNumber: String(t.manageNumber || '').trim() || null,
       manageNumbers: [...new Set((t.manageNumbers || []).map((m) => String(m || '').trim()).filter(Boolean))],
     }))
@@ -181,22 +182,28 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       });
       continue;
     }
-    // ★取り違えの最終防衛 (Codex R2/R3): 当たった variant のシステム連携用SKU番号 (AM) を対応表の別名と照合する。
+    // ★取り違えの最終防衛 (Codex R2〜R7): 当たった variant のシステム連携用SKU番号 (AM) を、
+    //   対応表の **AM 由来の別名とだけ** 照合する (AL と混ぜない — AL と同じ値の AM が後から付いた場合を区別するため)。
     //   対応表を作った後に SKU が別商品へ移り、空いた SKU管理番号に別の SKU が入った、という隙を塞ぐ。
-    //   AM は店舗内で一意なので、これが違えば別の SKU。
-    //   - AM があって別名に無い → 差し替わった疑い。確定しない
-    //   - AM が空 → 複数SKUの商品では同一性を確かめる手段が無いので確定しない。
+    //   AM は店舗内で一意なので、これが違えば別の SKU。対応表を作った時と AM の有無・値が違えば、
+    //   同じ SKU と言い切れないので確定しない (翌朝の再構築で対応表が追いつけば通る)。
+    //   - AM があるのに対応表に AM が無い → 作った時には無かった AM。確定しない
+    //   - AM が対応表の AM と違う → 差し替わった疑い。確定しない
+    //   - AM が無いのに対応表には AM があった → 消えた or 別の SKU。確定しない
+    //   - どちらも無い → 複数SKUの商品では同一性を確かめる手段が無いので確定しない。
     //     単一SKUの商品だけ通す (取り違える相手がいない。実データ: 複数SKU商品で AM 空は 0 件・単一SKUでは 1,652 件)
-    //   - AM があるのに対応表が SKU 単位の別名を持たない → 対応表を作った時には AM が無かった SKU
-    //     (AM があれば必ず AM の行が作られる)。作った後に変わった疑い。確定しない (Codex R6)
     const liveAm = String(variants[matchedKey]?.merchantDefinedSkuId || '').trim();
+    const amAliasKeys = new Set(t.amAliases.map(normCode));
     let identityProblem = null;
-    if (liveAm && skuAliasKeys.size === 0) {
+    if (liveAm && amAliasKeys.size === 0) {
       identityProblem = `SKU ${matchedKey} にシステム連携用SKU番号 (${liveAm}) がありますが、対応表を作った時には無かったものです。`
         + '対応表を作った後に変わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
-    } else if (liveAm && !skuAliasKeys.has(normCode(liveAm))) {
-      identityProblem = `SKU ${matchedKey} のシステム連携用SKU番号 (${liveAm}) が対応表の別名 (${t.skuAliases.join(', ')}) にありません。`
+    } else if (liveAm && !amAliasKeys.has(normCode(liveAm))) {
+      identityProblem = `SKU ${matchedKey} のシステム連携用SKU番号 (${liveAm}) が対応表のもの (${t.amAliases.join(', ')}) と違います。`
         + '対応表を作った後に SKU が差し替わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
+    } else if (!liveAm && amAliasKeys.size > 0) {
+      identityProblem = `SKU ${matchedKey} にシステム連携用SKU番号がありません (対応表を作った時は ${t.amAliases.join(', ')} でした)。`
+        + '対応表を作った後に変わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
     } else if (!liveAm && variantCount > 1) {
       identityProblem = `SKU ${matchedKey} にシステム連携用SKU番号がありません。複数SKU (${variantCount}) の商品では同じ SKU か確かめられないため確定しません`
         + ' (RMS でこの SKU にシステム連携用SKU番号を設定してください)';

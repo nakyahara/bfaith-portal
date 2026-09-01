@@ -115,6 +115,9 @@ function resolveRakuten(db, code) {
   // SKU 単位の別名 (AM = システム連携用SKU番号 / AL = SKU管理番号)。W (商品番号) は商品ページ単位。
   // ★値で推定しない (AM に商品番号と同じ値を付けた単品があり得る — Codex R5)。対応表の source で分ける
   const skuAliases = rows.filter((r) => r.source !== 'w').map((r) => r.listingCode);
+  // AM (システム連携用SKU番号) 由来の別名だけを別に持つ。AM の照合は AM 由来とだけ行う
+  // (AL と同じ値の AM が後から付いた場合を区別するため — Codex R7)
+  const amAliases = rows.filter((r) => r.source === 'am').map((r) => r.listingCode);
   // ★商品管理番号は対応表の manage_number 列から取る (2026-09-01)。
   //   W (商品番号) の行は 1 商品に 1 行しか作れないので、カラバリ 12 色のうち 11 色は W 行を持たない。
   //   W 行だけを頼ると、その 11 色は商品ページにたどり着けず価格が取れなかった (楽天出品の 3 割)。
@@ -130,6 +133,7 @@ function resolveRakuten(db, code) {
     listingCode: manageNumber || (w ? w.listingCode : aliases[0]),
     aliases,
     skuAliases,
+    amAliases,
     manageNumber,
     manageNumbers,
     skuCode: null,

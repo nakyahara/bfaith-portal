@@ -147,7 +147,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       if (l.mall === 'rakuten') {
         rakutenTargets.push({
           key: l.listingCode, rowKey: rakutenRowKey(t, l), aliases: l.aliases || [l.listingCode],
-          skuAliases: l.skuAliases || [],
+          skuAliases: l.skuAliases || [], amAliases: l.amAliases || [],
           manageNumber: l.manageNumber || null, manageNumbers: l.manageNumbers || [],
         });
       }
