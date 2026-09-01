@@ -33,6 +33,10 @@ import {
 } from './yahoo-edit-item-probe.js';
 
 const TIMEOUT_MS = 30_000;
+/** 送信がタイムアウトした後、遅れて効いてくる変更を捕まえるための待ち時間 */
+const SETTLE_WAIT_MS = 15_000;
+const SETTLE_ROUNDS = 3;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const args = process.argv.slice(2);
 const itemCode = (args.find((a) => !a.startsWith('--')) || '').trim();
@@ -121,9 +125,18 @@ async function main() {
   //   応答が返る前に切れた場合でも Yahoo 側では変わっているかもしれないので、
   //   editPrice の呼び出しごと try の中に入れる (Codex R2)
   let attempted = false;
+  let sendUncertain = false;   // 送信の結果が分からない = 遅れて効いてくるかもしれない
   try {
     attempted = true;
-    const r1 = await editPrice(itemCode, probePrice);
+    let r1;
+    try {
+      r1 = await editPrice(itemCode, probePrice);
+    } catch (e) {
+      // ★応答が返ってこなかった。Yahoo 側では通っているかもしれないので、
+      //   戻した後に時間を置いて確かめ直す (Codex R3)
+      sendUncertain = true;
+      throw new Error(`送信の応答が返りませんでした (${e.message})。遅れて効く可能性があるので、戻した後に確かめ直します`);
+    }
     console.log(`editItem: HTTP ${r1.status} / ${r1.body.slice(0, 200).replace(/\s+/g, ' ')}`);
     const sendFailure = editItemFailure(r1);
     if (sendFailure) throw new Error(`送信できていません (${sendFailure})。書き換わっていないので、この回では何も判定しません`);
@@ -162,6 +175,10 @@ async function main() {
           if (restoredPrice !== currentPrice) {
             console.error(`🚨 価格が ${currentPrice} に戻っていません (実際: ${restoredPrice})。Yahoo の管理画面で直してください`);
             process.exitCode = 1;
+          } else if (sendUncertain) {
+            // ★応答が返らなかった送信が、戻した後に効いてくることがある。
+            //   時間を置いて確かめ、違っていたらもう一度戻す
+            await settleAfterUncertainSend(itemCode, currentPrice);
           }
         }
       } catch (e) {
@@ -171,6 +188,37 @@ async function main() {
       }
     }
   }
+}
+
+/**
+ * 応答が返らなかった送信が遅れて効いてくる場合に備え、時間を置いて確かめ直す。
+ * 違っていたらもう一度戻す。決着が付かなければ人に知らせる。
+ */
+async function settleAfterUncertainSend(code, wantPrice) {
+  for (let i = 1; i <= SETTLE_ROUNDS; i++) {
+    console.log(`\n送信の結果が不明だったので ${SETTLE_WAIT_MS / 1000} 秒待って確かめ直します (${i}/${SETTLE_ROUNDS})`);
+    await sleep(SETTLE_WAIT_MS);
+    let now;
+    try {
+      now = itemPriceOf(await flattenXml(await getRawXml(code)));
+    } catch (e) {
+      console.error(`  確かめられませんでした (${e.message})`);
+      continue;
+    }
+    if (now === wantPrice) { console.log(`  価格は ${wantPrice} のままです`); if (i === SETTLE_ROUNDS) return; continue; }
+    console.error(`  🚨 価格が ${now} に変わっていました (遅れて効いた送信)。もう一度 ${wantPrice} に戻します`);
+    try {
+      const r = await editPrice(code, wantPrice);
+      const f = editItemFailure(r);
+      if (f) throw new Error(f);
+    } catch (e) {
+      console.error(`  🚨 戻せませんでした (${e.message})`);
+      process.exitCode = 1;
+      return;
+    }
+  }
+  console.error(`🚨 決着が付きませんでした。Yahoo の管理画面で ${code} の価格が ${wantPrice} か確かめてください`);
+  process.exitCode = 1;
 }
 
 main().catch((e) => {
