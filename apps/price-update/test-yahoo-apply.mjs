@@ -128,6 +128,45 @@ console.log('\n── クライアント: 楽天と同じ形の応答にそろ�
   eq((await gone.fetchItemDetail('zz-1')).item, null, '取得できなければ item は null');
 }
 
+console.log('\n── ★反映を依頼できなければ「終わった」と言わない ──');
+{
+  const mk = (json) => makeYahooClient({ getDetail: async () => detail(), postUpdate: async () => ({ status: 200, json }) });
+
+  // 反映の依頼そのものをしていない
+  const notSubmitted = await mk({ ok: true, submitted: false, submits: [] })
+    .patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
+  ok(notSubmitted.body.state !== 'applied', '★反映を依頼していなければ applied にしない');
+  eq(notSubmitted.body.error, 'PUBLISH_FAILED', '理由が分かる');
+  eq(notSubmitted.body.applied, { 'zz-1': 1001 }, '★価格が変わったことは記録に残す (戻せるように)');
+  ok(/管理画面/.test(notSubmitted.body.message), '人に何をすればよいか書く');
+
+  // 依頼はしたが失敗した
+  const failed = await mk({ ok: true, submitted: true, submits: [{ item_code: 'zz-1', ok: false }] })
+    .patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
+  ok(failed.body.state !== 'applied', '★反映の依頼が失敗しても applied にしない');
+  eq(failed.body.publish, { requested: true, ok: false }, '依頼はしたが通らなかったと分かる');
+
+  // submits が空 (何も反映していない) も成功にしない
+  const empty = await mk({ ok: true, submitted: true, submits: [] })
+    .patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
+  ok(empty.body.state !== 'applied', '★反映の結果が空でも applied にしない');
+}
+
+console.log('\n── ★VPS へ「今いくらのはず」を渡す (送る直前にあちらでも照合してもらう) ──');
+{
+  const sent = [];
+  const client = makeYahooClient({
+    getDetail: async () => detail(),
+    postUpdate: async (code, price, expectedPrice) => {
+      sent.push({ code, price, expectedPrice });
+      return { status: 200, json: { ok: true, submitted: true, submits: [{ item_code: code, ok: true }] } };
+    },
+  });
+  await client.patchItemPrices('zz-1', { expected: { 'zz-1': 1000 }, prices: { 'zz-1': 1001 } });
+  eq(sent, [{ code: 'zz-1', price: 1001, expectedPrice: 1000 }],
+    '★「今 1000 円のはず」を渡す (VPS が送る直前に読み直して照合できるように)');
+}
+
 console.log('\n── クライアント: 送信が通らなかった時 ──');
 {
   const reject = makeYahooClient({

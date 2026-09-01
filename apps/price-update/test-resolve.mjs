@@ -324,6 +324,33 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
   ok(/page-a.*page-b|page-b.*page-a/.test(dp.reason), '理由に両方の商品管理番号を書く: ' + dp.reason);
 }
 
+console.log('\n── ★Yahoo の普通の商品も SKU のキーを持つ (M3・Codex R1) ──');
+{
+  // SKU別価格が無い普通の商品。ここで skuCode が null のままだと、実行時に "null" という
+  // 文字列が価格のキーになり、送った後の照合が必ず食い違う (更新は通っているのに失敗になる)
+  const deps = {
+    fetchYahooItemDetail: async (c) => ({ ok: true, ItemCode: c, Name: 'ハッカ油', Price: 1480, SubCodes: [] }),
+  };
+  const r = await fetchYahooPricesRaw([{ key: 'plain-001', candidates: ['plain-001'] }], deps);
+  const got = r.get('plain-001');
+  eq([got.found, got.price, got.skuCode], [true, 1480, 'plain-001'],
+    '★SKU別価格が無い商品は、商品コードそのものが SKU のキーになる');
+
+  // 応答の商品コードの書き方が違っても、返ってきた方を使う (実際に送るのはこの値)
+  const upper = await fetchYahooPricesRaw([{ key: 'plain-002', candidates: ['plain-002'] }], {
+    fetchYahooItemDetail: async () => ({ ok: true, ItemCode: 'PLAIN-002', Price: 100, SubCodes: [] }),
+  });
+  eq(upper.get('plain-002').skuCode, 'PLAIN-002', '応答の商品コードをそのまま使う');
+
+  // 個別商品コードで当たった時は今まで通りそちらが SKU のキー
+  const sub = await fetchYahooPricesRaw([{ key: 'sub-a', candidates: ['sub-a', 'parent-1'] }], {
+    fetchYahooItemDetail: async (c) => (c === 'parent-1'
+      ? { ok: true, ItemCode: 'parent-1', Price: 500, SubCodes: [{ SubCode: 'sub-a', Price: null }] }
+      : (() => { throw new Error('HTTP 400'); })()),
+  });
+  eq(sub.get('sub-a').skuCode, 'sub-a', '個別商品コードで当たればそれが SKU のキー');
+}
+
 console.log('\n── Yahoo カラバリ: 親の商品コード + 個別商品コード (2026-08-30 中原さん確認) ──');
 {
   // 実際の登録: item_code=0726-001802 のページに sub_code=0726-001802-BK がある。

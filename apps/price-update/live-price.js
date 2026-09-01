@@ -318,6 +318,10 @@ export async function fetchYahooPrices(targets, deps = {}) {
           : '設定価格を整数円として読めません';
       } else {
         price = itemPrice;
+        // ★SKU別価格が無い普通の商品は、商品コードそのものを SKU のキーにする (Codex R1 High)。
+        //   ここを null のままにすると、実行時に "null" という文字列が価格のキーになり、
+        //   送った後の照合が必ず食い違う (更新は通っているのに失敗として記録される)
+        skuCode = d?.ItemCode || cand;
       }
       resolved = {
         price, subCodes, skuCode,

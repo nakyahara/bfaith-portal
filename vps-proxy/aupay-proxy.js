@@ -67,12 +67,19 @@ const YAHOO_API_GAP_MS = 1200;
  * ★self-test より前に置く (const は巻き上がらないので、後ろに書くと self-test から見えない)。
  */
 const PRICE_ONLY_KEYS = new Set(['item_code', 'price', 'sale_price', 'subcode_price']);
+/** 商品ごとのロック。★self-test より前に置く (const は巻き上がらない) */
+const yahooItemLocks = new Map();
 /** Yahoo に送ってよい価格の上限 (楽天側のガードと同じ) */
 const MAX_YAHOO_PRICE = 999999999;
 
 // --self-test は起動前に処理する。secret も外部通信も要らない純粋なパーサ検証なので、
 // PROXY_SECRET の必須チェックより前に置く (手元でも VPS 上でも同じコードを確かめられるように)
-if (process.argv.includes('--self-test')) { runSelfTest(); }
+if (process.argv.includes('--self-test')) {
+  // ★self-test には非同期の検証 (商品ロック) が含まれるので、runSelfTest() は同期では終わらない。
+  //   ここで抜けないとサーバ起動側に流れて 'PROXY_SECRET is required' で落ちる (CommonJS の top-level return)
+  runSelfTest();
+  return;
+}
 
 if (!PROXY_SECRET) { console.error('PROXY_SECRET is required'); process.exit(1); }
 
@@ -1300,6 +1307,36 @@ const server = http.createServer(async (req, res) => {
       let body;
       try { body = JSON.parse(raw); } catch (_) { throw new Error('update-items: invalid JSON body'); }
       assertPriceOnlyItems(body.items, { clearSalePrice: body.clearSalePrice === true });
+      // ★「今いくらか読む → 照合する → 送る」を **1つの商品につき1つずつ** 行う (Codex R1 High)。
+      //   Render 側で読んでから送るまでの間に誰かが変えると、その変更を踏み潰す / 追加された
+      //   セール価格を消す。ここでロックして直前に読み直せば、その窓をこのサーバの中では閉じられる。
+      //   ⚠️Yahoo の管理画面から直に変えられた場合は API では閉じようがない (残る危険として明示)
+      if (body.expected && typeof body.expected === 'object') {
+        const conflict = await withYahooItemLock(body.items.map((it) => it.item_code), async () => {
+          for (const it of body.items) {
+            const want = body.expected[it.item_code];
+            if (want === undefined) continue;
+            const cur = await readItemForCheck(it.item_code);
+            if (cur.error) return { item_code: it.item_code, reason: cur.error };
+            if (cur.price !== Number(want)) {
+              return { item_code: it.item_code, reason: '現在価格が想定と違います', expected: Number(want), live: cur.price };
+            }
+            // ★セール価格も直前に見る。空文字を送ると消えるので、入っていたら送らない
+            if (String(it.sale_price ?? '') === '' && cur.salePrice !== null) {
+              return { item_code: it.item_code, reason: `セール価格 (${cur.salePrice} 円) が入っています`, salePrice: cur.salePrice };
+            }
+            if (String(it.sale_price ?? '') === '' && !cur.salePriceReadable) {
+              return { item_code: it.item_code, reason: 'セール価格が入っているか確かめられません' };
+            }
+          }
+          return null;
+        });
+        if (conflict) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'CONFLICT', conflict }));
+          return;
+        }
+      }
       const built = buildUpdateItemsBody(body.items, YAHOO_SELLER_ID, { includeItemNum: body.itemNum === true });
       console.log(`[${ts()}] Yahoo updateItems: ${built.count}件 (${built.codes.join(',')}) body=${built.body.length}b`);
       const r = await callYahooAPIRaw('updateItems', {
@@ -1768,6 +1805,38 @@ function isWellFormedResultSet(xml) {
 }
 
 /**
+ * 商品ごとの直列化。同じ商品に対する「読む → 照合 → 送る」が重ならないようにする。
+ * ★このサーバの中だけの話。Yahoo の管理画面から直に変えられた場合は閉じようがない。
+ */
+async function withYahooItemLock(codes, fn) {
+  const keys = [...new Set((codes || []).map((c) => String(c)))].sort();
+  const prev = keys.map((k) => yahooItemLocks.get(k)).filter(Boolean);
+  let release;
+  const mine = new Promise((r) => { release = r; });
+  for (const k of keys) yahooItemLocks.set(k, mine);
+  try {
+    await Promise.all(prev);
+    return await fn();
+  } finally {
+    release();
+    for (const k of keys) if (yahooItemLocks.get(k) === mine) yahooItemLocks.delete(k);
+  }
+}
+
+/** 照合のために「今の価格とセール価格」を読む */
+async function readItemForCheck(itemCode) {
+  const qs = new URLSearchParams({ seller_id: YAHOO_SELLER_ID, item_code: String(itemCode) }).toString();
+  const r = await callYahooAPIRaw('getItem', { method: 'GET', body: null, queryString: qs });
+  if (r.status !== 200) return { error: `いまの価格を読めません (HTTP ${r.status})` };
+  const parsed = parseGetItemDetailXml(r.body);
+  if (String(parsed.ItemCode || '').trim().toLowerCase() !== String(itemCode).trim().toLowerCase()) {
+    return { error: `読み取った商品コードが違います (${parsed.ItemCode ?? 'なし'})` };
+  }
+  if (parsed.Price === null) return { error: 'いまの価格を整数円として読めません' };
+  return { price: parsed.Price, salePrice: parsed.SalePrice, salePriceReadable: parsed.SalePriceReadable };
+}
+
+/**
  * Yahoo の応答が成功か。
  * ★HTTP 200 でも本文に Status NG や Error が入っていることがある。
  *   NG だけを見ると「HTTP 200 + <Error>」を成功扱いしてしまう (Codex R5)。
@@ -1921,6 +1990,7 @@ function withSellerId(formBody, sellerId) {
 // 呼び出しはファイル冒頭 (PROXY_SECRET チェックの前)。function 宣言なのでホイスティングで届く。
 function runSelfTest() {
   let failed = 0;
+  let lockCheck = Promise.resolve();   // 非同期の検証 (商品ロック) はここに積んで最後に待つ
   const check = (label, actual, expected) => {
     const a = JSON.stringify(actual), e = JSON.stringify(expected);
     if (a === e) { console.log(`  ok   ${label}`); return; }
@@ -2005,6 +2075,27 @@ function runSelfTest() {
   check('先頭ゼロ', parseGetItemDetailXml('<Result><Price>0080</Price></Result>').Price, null);
   check('全角', parseGetItemDetailXml('<Result><Price>１０８０</Price></Result>').Price, null);
   // 同一スコープに Price が複数 = 想定外の構造。取り違えるより読めない扱いにする
+  // 9) 商品ごとのロック (「読む → 照合 → 送る」が同じ商品で重ならないこと)
+  {
+    const order = [];
+    const slow = (tag, ms) => withYahooItemLock(['zz-1'], async () => {
+      order.push(tag + ':start');
+      await new Promise((r) => setTimeout(r, ms));
+      order.push(tag + ':end');
+    });
+    const other = () => withYahooItemLock(['zz-2'], async () => { order.push('other'); });
+    // 同じ商品は直列 (A が終わってから B)。別商品は待たされない
+    const done = Promise.all([slow('A', 20), slow('B', 1), other()]);
+    lockCheck = done.then(() => {
+      // ★同じ商品の処理が入れ子にならない (A の最中に B が始まらない)。別商品は混ざってよい
+      check('ロック: 同じ商品は重ならない',
+        order.filter((x) => x.startsWith('A') || x.startsWith('B')),
+        ['A:start', 'A:end', 'B:start', 'B:end']);
+      check('ロック: 後から来た方が待つ', order.indexOf('B:start') > order.indexOf('A:end'), true);
+      check('ロック: 別商品は待たされない', order.indexOf('other') < order.indexOf('A:end'), true);
+    });
+  }
+
   // 8) セール価格 (M3 のガード。「使っていない」と「読めなかった」を分ける)
   const sp = (xml) => { const r = parseGetItemDetailXml(xml); return [r.SalePrice, r.SalePriceReadable]; };
   check('セール価格: 空タグは「使っていない」', sp('<Result><SalePrice></SalePrice></Result>'), [null, true]);
@@ -2171,8 +2262,11 @@ function runSelfTest() {
   const paths = `<Result><PathList><Path>その他</Path><Path origFlag="1">本命</Path></PathList></Result>`;
   check('Path: origFlag優先', parseGetItemDetailXml(paths).Path, '本命');
 
-  console.log(failed === 0 ? '\n✅ self-test 全件 pass' : `\n❌ ${failed} 件 FAIL`);
-  process.exit(failed === 0 ? 0 : 1);
+  // ★非同期の検証が終わってから結果を出す (待たないと「pass」と言って落ちる)
+  lockCheck.then(() => {
+    console.log(failed === 0 ? '\n✅ self-test 全件 pass' : `\n❌ ${failed} 件 FAIL`);
+    process.exit(failed === 0 ? 0 : 1);
+  });
 }
 
 server.listen(PORT, '0.0.0.0', () => {

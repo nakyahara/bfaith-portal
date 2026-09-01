@@ -149,17 +149,40 @@ export function makeYahooClient(deps = {}) {
       if (plan.noop) {
         return { status: 200, body: { ok: true, state: 'noop', applied: {} } };
       }
-      const res = await postUpdate(itemCode, plan.price);
+      const res = await postUpdate(itemCode, plan.price, plan.currentPrice);
       // ★VPS が「更新 + 反映依頼」をまとめて行い、JSON で結果を返す
       if (res.status >= 200 && res.status < 300 && res.json && res.json.ok === true) {
         const submits = Array.isArray(res.json.submits) ? res.json.submits : [];
+        const publish = {
+          requested: res.json.submitted === true,
+          ok: submits.length > 0 && submits.every((s) => s.ok),
+        };
+        // ★反映を依頼できていなければ「終わった」と言わない (Codex R1 High)。
+        //   価格は変わっているのに客には見えない状態なので、成功にすると誰も気づかない。
+        //   state を付けずに返すと execute 側が「想定外」として **その場で止める** ので、
+        //   人が確かめるまで残りを送らない。価格が変わったことは applied に残す
+        if (!publish.requested || !publish.ok) {
+          return {
+            status: 200,
+            body: {
+              ok: false,
+              error: 'PUBLISH_FAILED',
+              message: `価格は ${plan.price} 円に変わりましたが、フロント反映を依頼できていません`
+                + `${publish.requested ? ' (反映の依頼が失敗)' : ' (反映を依頼していない)'}。`
+                + 'Yahoo の管理画面で反映状況を確かめてください',
+              applied: { [plan.sku]: plan.price },
+              publish,
+            },
+          };
+        }
         return {
           status: 200,
           body: {
             ok: true, state: 'applied',
             applied: { [plan.sku]: plan.price },
-            // ★反映は非同期。ここで分かるのは「依頼できたか」まで
-            publish: { requested: res.json.submitted === true, ok: submits.every((s) => s.ok) && submits.length > 0 },
+            // ★反映は非同期。ここで分かるのは「依頼できたか」まで。
+            //   フロントに出たかは後から未反映一覧で確かめる
+            publish,
           },
         };
       }
@@ -174,7 +197,7 @@ export function makeYahooClient(deps = {}) {
 }
 
 /** VPS の /yahoo/update-items を叩く (更新 + 反映依頼がまとまっている) */
-async function defaultPostUpdate(itemCode, price) {
+async function defaultPostUpdate(itemCode, price, expectedPrice) {
   const res = await fetch(`${proxyBase()}/yahoo/update-items`, {
     method: 'POST',
     headers: { 'X-Proxy-Secret': proxySecret(), 'Content-Type': 'application/json' },
@@ -183,6 +206,9 @@ async function defaultPostUpdate(itemCode, price) {
       //   「消してよい」と明示する (入っている商品は planYahooUpdate が手前で止めている)
       items: [{ item_code: itemCode, price: String(price), sale_price: '' }],
       clearSalePrice: true,
+      // ★VPS 側でも「送る直前に読み直して照合」してもらう (Codex R1 High)。
+      //   Render で読んでから送るまでの窓を、あちらのロックの中で閉じる
+      expected: { [itemCode]: expectedPrice },
     }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
