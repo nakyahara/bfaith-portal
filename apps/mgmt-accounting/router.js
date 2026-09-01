@@ -1559,13 +1559,20 @@ async function loadMonthlyPL() {
     variable_cost: a.variable_cost + r.variable_cost, gross_profit: a.gross_profit + r.gross_profit,
   }), { sales:0, cost:0, pf_fee:0, ad_cost:0, freight:0, material:0, variable_cost:0, gross_profit:0 });
 
-  // PF の出現順を維持してグループ化 (Map で proto 汚染回避)。
+  // PF ごとにグループ化 (Map で proto 汚染回避)。
   const pfOrder = [];
   const pfGroups = new Map();
   for (const r of visibleRows) {
     if (!pfGroups.has(r.mall_id)) { pfGroups.set(r.mall_id, []); pfOrder.push(r.mall_id); }
     pfGroups.get(r.mall_id).push(r);
   }
+  // 並びは売上高の大きい順。APIは mall_id 順 (= ABC順) で返すため、2位の楽天・3位のYahoo! が
+  // 小さいモールの下に埋もれて読みにくかった (2026-09-01 代表指摘)。
+  // 同額なら元の順のまま (Array#sort は安定ソート)。
+  // セグメントはランキングではなく定義された区分なので、PF配下の並びは触らない。
+  const pfSales = new Map();
+  for (const [id, rows] of pfGroups) pfSales.set(id, sumRows(rows).sales);
+  pfOrder.sort((a, b) => pfSales.get(b) - pfSales.get(a));
 
   let html = '';
   // DOM キーは mall_id ではなく行番号(index)を使う → onclick/class/selector への文字列注入面を排除。
