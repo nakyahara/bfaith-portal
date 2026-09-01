@@ -239,6 +239,19 @@ console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manag
     items: [{ manageNumber: '0726-001802', itemNumber: '0726-001802', title: 'T', variants: noAmMulti }], failed: [] }) };
   const nam = (await fetchRakutenPrices([target], depsNoAmMulti)).get('0726-001802');
   eq(nam.found, false, '★複数SKU商品で AM が空の variant は確定しない');
+
+  // ★単一SKUの救済は「対応表が商品ページ単位の別名しか持たない」時だけ (Codex R4)。
+  //   記録していた SKU (AM old-ne / AL 001) が消え、別の SKU (AL 999・AM 空) だけになった商品ページ
+  const depsReplaced = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'page-a', itemNumber: 'page-a', title: 'T', variants: { 999: { standardPrice: '9800' } } }], failed: [] }) };
+  const rp = (await fetchRakutenPrices([{ key: 'page-a', aliases: ['old-ne', '001'], manageNumber: 'page-a' }], depsReplaced)).get('page-a');
+  eq(rp.found, false, '★記録した SKU が消えた単一SKU商品は、残った SKU を採用しない');
+  ok(/old-ne/.test(rp.reason) && /001/.test(rp.reason) && /差し替わった/.test(rp.reason), '理由に消えた SKU の別名を書く: ' + rp.reason);
+  // 商品番号しか別名が無い単品 (SKU管理番号 normal-inventory・AM 空) は今まで通り救済する
+  const depsWOnly = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'w-only-001', itemNumber: 'w-only-001', variants: { 'normal-inventory': { standardPrice: '500' } } }], failed: [] }) };
+  const wo = (await fetchRakutenPrices([{ key: 'w-only-001', aliases: ['w-only-001'], manageNumber: 'w-only-001' }], depsWOnly)).get('w-only-001');
+  eq([wo.found, wo.price, wo.skuCode], [true, 500, 'normal-inventory'], '商品番号だけの単品 (normal-inventory) は通る');
   ok(/システム連携用SKU番号がありません/.test(nam.reason) && /複数SKU [(]9[)] の商品/.test(nam.reason), '理由に SKU 数 (この商品は 9) と対処を書く: ' + nam.reason);
 
   // ★同じプレビューに BK と BE を並べても、片方がもう片方を上書きしない (行キーは NE コード単位)

@@ -152,19 +152,28 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       if (aliasKeys.has(normCode(vk)) || aliasKeys.has(normCode(v?.merchantDefinedSkuId))) matched.push(vk);
     }
     let matchedKey = matched.length === 1 ? matched[0] : null;
-    // 別名で特定できなくても、variant が 1 つだけの商品なら取り違えようがない
+    // 別名で特定できなくても、variant が 1 つだけの商品なら取り違える相手がいない。
+    // ★ただし、対応表が SKU 単位の別名 (AM/AL) を持っているのに 1 つも当たらない = 記録していた SKU が
+    //   この商品から消えている (差し替わった疑い)。その時はこの救済を使わない (Codex R4)。
+    //   救済してよいのは、対応表が商品ページ単位の別名 (商品番号 / 管理番号) しか持たない時だけ
+    //   (例: SKU管理番号が normal-inventory の単品。W 行しか作れないので別名は商品番号だけ)
+    let missingSkuAliases = [];
     if (!matchedKey && matched.length === 0 && Object.keys(variants).length === 1) {
-      matchedKey = Object.keys(variants)[0];
+      const pageLevel = new Set([normCode(item?.itemNumber), normCode(item?.manageNumber)].filter(Boolean));
+      missingSkuAliases = [...aliasKeys].filter((a) => !pageLevel.has(a));
+      if (missingSkuAliases.length === 0) matchedKey = Object.keys(variants)[0];
     }
     if (!matchedKey) {
+      let reason;
+      if (matched.length > 1) reason = `別名が複数のSKUに一致しました (${matched.join(', ')})。取り違えを避けるため確定しません`;
+      else if (Object.keys(variants).length === 0) reason = 'SKU情報が取得できません';
+      else if (missingSkuAliases.length > 0) {
+        reason = `対応表に記録された SKU (${missingSkuAliases.join(', ')}) がこの商品に見当たりません。`
+          + '対応表を作った後に SKU が差し替わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
+      } else reason = `どのSKUか特定できません (この商品には ${Object.keys(variants).length} SKU あります)`;
       out.set(t.rowKey, {
         price: null, manageNumber: item.manageNumber || t.manageNumber, skuCode: null, found: false,
-        reason: matched.length > 1
-          ? `別名が複数のSKUに一致しました (${matched.join(', ')})。取り違えを避けるため確定しません`
-          : (Object.keys(variants).length === 0
-            ? 'SKU情報が取得できません'
-            : `どのSKUか特定できません (この商品には ${Object.keys(variants).length} SKU あります)`),
-        itemTitle: item?.title || null,
+        reason, itemTitle: item?.title || null,
       });
       continue;
     }
