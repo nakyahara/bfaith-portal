@@ -247,22 +247,58 @@ function prettyNote(s) {
   return String(s).replace(/AI\([^)]*\)/g, 'AI').replace(/マスタ#\d+ に結びつけ/g, '支払先マスタに結びつけ');
 }
 
-// MFには「仕訳1件を直接開くURL」が無いため、仕訳帳を開いて 仕訳No. で探してもらう
-// (明細ビューの「金額をコピー → MFの金額欄に貼る」と同じ流儀)
-const MF_JOURNALS_URL = 'https://accounting.moneyforward.com/journals';
+// MFには「仕訳1件を直接開くURL」が無いため、仕訳帳 (会計帳簿) を日付で絞って開き、そこから目で探してもらう。
+// ⚠ `/journals` は「手動で仕訳 > 仕訳帳入力」= 入力画面で、検索する場所が無い (2026-09-01 代表指摘)。
+//    探せるのは `/books` = 「会計帳簿 > 仕訳帳」。
+// ⚠ `cti` は事業者ごとの識別子で APIからは作れない (カードの絞り込みURLと同じ事情)。
+//    代表がブラウザで開いたURLをそのまま採用している。事業者が変わったらこの1行を差し替える。
+const MF_BOOKS_URL = 'https://accounting.moneyforward.com/books?cti=QeftIj8IL5kYaeP7SaUq3w&recognized_at_from=2026%2F07%2F01&recognized_at_to=2027%2F06%2F30&page=1&per_page=50';
+// 期の全部 (1年分・50件/ページ) を出すと目的の仕訳を探せないので、この日数だけ前後に絞る
+const BOOKS_WINDOW_DAYS = 7;
+
+const isYmd_ = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || ''));
+const slashYmd_ = (ymd) => String(ymd).replace(/-/g, '/');
+function shiftYmd_(ymd, days) {
+  const d = new Date(ymd + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+/** 仕訳帳を、その仕訳の日付の前後 BOOKS_WINDOW_DAYS 日だけに絞って開くURL */
+function mfBooksUrl(dateYmd) {
+  if (!isYmd_(dateYmd)) return MF_BOOKS_URL;
+  try {
+    const u = new URL(MF_BOOKS_URL);
+    u.searchParams.set('recognized_at_from', slashYmd_(shiftYmd_(dateYmd, -BOOKS_WINDOW_DAYS)));
+    u.searchParams.set('recognized_at_to', slashYmd_(shiftYmd_(dateYmd, BOOKS_WINDOW_DAYS)));
+    return u.toString();
+  } catch { return MF_BOOKS_URL; }
+}
+
+/** その行が指している仕訳の日付 (突合できた明細の取引日 → 無ければ証憑の日付) */
+function journalDate_(r) {
+  const c = (r.candidates || [])[0];
+  return isYmd_(c && c.date) ? c.date : (isYmd_(r.doc_date) ? r.doc_date : '');
+}
 
 /** 相手の仕訳に既に証憑が付いているか (貼ると二重添付になる行) */
 function hasDup(r) {
   return Number(r.match_journal_vouchers || 0) > 0 && !['attached', 'attaching', 'excluded'].includes(r.status);
 }
 
-/** MFの仕訳帳へのリンク + 仕訳No.のコピー (No. が無ければ何も出さない) */
+/** MFの仕訳帳 (日付で絞る) へのリンク + 仕訳No.のコピー。日付もNo.も無ければ何も出さない */
 function mfJournalCell(r, label) {
   const no = r.match_journal_number;
-  if (!no) return '';
-  return `<div class="jlink"><a class="mflink" href="${MF_JOURNALS_URL}" target="_blank" rel="noopener"
-    title="MFの仕訳帳を新しいタブで開きます。仕訳No.で検索してください">${label}</a>
-    <button class="btn mini" data-copyno="${esc(String(no))}" title="仕訳No.をコピー（MFの仕訳帳の検索欄に貼る）">No.${esc(String(no))} をコピー</button></div>`;
+  const date = journalDate_(r);
+  if (!no && !date) return '';
+  const hint = date
+    ? `MFの仕訳帳を ${slashYmd_(shiftYmd_(date, -BOOKS_WINDOW_DAYS))}〜${slashYmd_(shiftYmd_(date, BOOKS_WINDOW_DAYS))} に絞って開きます`
+    : 'MFの仕訳帳を開きます';
+  const copy = no
+    ? ` <button class="btn mini" data-copyno="${esc(String(no))}" title="仕訳No.をコピー（開いた一覧をページ内検索 Ctrl+F で探せます）">No.${esc(String(no))} をコピー</button>`
+    : '';
+  return `<div class="jlink"><a class="mflink" href="${esc(mfBooksUrl(date))}" target="_blank" rel="noopener"
+    title="${esc(hint)}">${label}</a>${copy}</div>`;
 }
 
 /** 二重添付になる行の説明 (何が起きるか・どうすればよいか) */
@@ -308,7 +344,7 @@ document.addEventListener('click', async (ev) => {
     if (t.dataset.tab) { tab = t.dataset.tab; renderTabs(); render(); return; }
     if (t.dataset.copyno) {
       navigator.clipboard?.writeText(String(t.dataset.copyno));
-      toast(`仕訳No.${t.dataset.copyno} をコピーしました。MFの仕訳帳の検索欄に貼ってください`);
+      toast(`仕訳No.${t.dataset.copyno} をコピーしました。開いた仕訳帳でページ内検索 (Ctrl+F) して探してください`);
       return;
     }
     if (t.dataset.attach) { t.disabled = true; await attachWithConfirm(t.dataset.attach, {}); toast('MFの仕訳に貼りました'); return load(t.dataset.attach); }

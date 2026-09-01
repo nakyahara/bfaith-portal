@@ -61,8 +61,12 @@ check('未接続は401', r.status === 401 && (await r.json()).error === 'mf_not_
 const inboxHtml = await (await fetch(base + '/apps/shohyo-links/mf/inbox')).text();
 check('受け箱: 証憑ありの行は「それでも貼る」に変わる', inboxHtml.includes('それでも貼る') && inboxHtml.includes('hasDup(r)'));
 check('受け箱: 「⚠ 仕訳に証憑あり」バッジがある', inboxHtml.includes('⚠ 仕訳に証憑あり'));
-check('受け箱: MFの仕訳帳へのリンクと No.コピーがある',
-  inboxHtml.includes('https://accounting.moneyforward.com/journals') && inboxHtml.includes('data-copyno'));
+// リンク先は /books (会計帳簿・検索できる)。/journals は「仕訳帳入力」= 入力画面で探せない (2026-09-01 代表指摘)
+check('受け箱: 仕訳帳リンクは /books で No.コピーもある',
+  inboxHtml.includes('accounting.moneyforward.com/books') && inboxHtml.includes('data-copyno'));
+check('受け箱: 入力画面 /journals へは飛ばさない', !/moneyforward\.com\/journals/.test(inboxHtml));
+check('受け箱: 仕訳の日付の前後に絞って開く',
+  inboxHtml.includes('recognized_at_from') && inboxHtml.includes('BOOKS_WINDOW_DAYS'));
 check('受け箱: 二重添付の確認文に件数と選択肢が出る',
   inboxHtml.includes('二重添付になるかもしれません') && inboxHtml.includes('別の書類だと確かめた'));
 
