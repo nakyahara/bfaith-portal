@@ -242,7 +242,8 @@
       const ml = d.mallLabels || {};
       const sokuhoAsOf = d.sokuho && d.sokuho.asOf ? d.sokuho.asOf : '—';
       const kakuteiMeta = d.period ? `確定(精算ベース): ${d.period.start}〜${d.period.end}（${d.period.label}）売上 ${yen(d.totals.sales)}` : '確定(精算ベース): 集計対象データなし';
-      meta.innerHTML = `🟢 速報(注文ベース): <b>${esc(sokuhoAsOf)}</b>朝時点　7日 ${num(d.totals.sokuho7)} / 30日 ${num(d.totals.sokuho30)}　｜　${kakuteiMeta}`;
+      const cnt = `商品 ${d.products.length}点（販売あり ${d.totals.soldProductCount ?? '—'}点・売上ゼロも表示）`;
+      meta.innerHTML = `${esc(cnt)}　｜　🟢 速報(注文ベース): <b>${esc(sokuhoAsOf)}</b>朝時点　7日 ${num(d.totals.sokuho7)} / 30日 ${num(d.totals.sokuho30)}　｜　${kakuteiMeta}`;
       tb.innerHTML = d.products.map((p, i) => {
         const sub = p.listings.map(L => `<tr>
             <td class="l">${esc(ml[L.mall]||L.mall)}${L.mall==='amazon' ? (L.is_fba?' <span class="pill pill-on">FBA</span>':' <span class="pill pill-off">FBM</span>') : ''}</td>

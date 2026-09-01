@@ -51,6 +51,10 @@
     table.matrix td.tot { font-weight:700; }
     .note { color:var(--muted); font-size:11px; margin-top:18px; line-height:1.8; background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px 14px; }
     .empty { background:#fff; border:1px solid var(--line); border-radius:10px; padding:40px; text-align:center; color:var(--muted); }
+    /* 販売なし（売上ゼロ）の商品行は薄く表示。一覧からは落とさない */
+    tr.nosale td, tr.nosale td.l, table.matrix tr.nosale td.l { color:#9ca3af; background:#fafafa; }
+    tr.nosale .name { font-weight:400; }
+    .scard.nosale { opacity:.6; }
     .scroll { overflow:auto; max-height:74vh; }
     /* 見出し行を追随（縦スクロールで列名が消えない）。border-collapse でも下線が残るよう box-shadow。 */
     .scroll table thead th { position:sticky; top:0; z-index:2; box-shadow: inset 0 -1px 0 var(--line), inset 0 1px 0 var(--line); }
@@ -104,8 +108,13 @@
          return { cls:'trend-fl', mark:'→' };
        };
        const hasSokuho = !!(sokuho && sokuho.asOf);
-       const sokuhoProducts = products.filter(p => p.sokuho7 || p.sokuho30);
-       const kakuteiProducts = [...products].filter(p => p.pieces || p.sales).sort((a,b)=> b.sales-a.sales || b.pieces-a.pieces);
+       // 売上ゼロの商品も一覧に出す（2026-09-01 中原さん要望）。「売れていない」も仕入先への情報。
+       //   販売なし行は .nosale で薄く表示。ゼロ行は末尾（コード順）に固まるようソート。
+       const byCode = (a,b) => (a.ne_code < b.ne_code ? -1 : a.ne_code > b.ne_code ? 1 : 0);
+       const sokuhoProducts = [...products].sort((a,b)=> b.sokuho30-a.sokuho30 || b.sokuho7-a.sokuho7 || byCode(a,b));
+       const kakuteiProducts = [...products].sort((a,b)=> b.sales-a.sales || b.pieces-a.pieces || byCode(a,b));
+       const sokuhoSold = sokuhoProducts.filter(p => p.sokuho7 || p.sokuho30).length;
+       const kakuteiSold = kakuteiProducts.filter(p => p.pieces || p.sales).length;
   %>
     <div class="tabs">
       <button type="button" class="tabbtn" data-tab="sokuho">🟢 速報（注文ベース・直近）</button>
@@ -116,7 +125,7 @@
     <section class="tabpanel" data-panel="sokuho">
       <div class="period">速報（注文ベース）: <%= hasSokuho ? sokuho.asOf + ' 朝時点' : '準備中' %>　／　全モール（Amazon FBA/FBM・楽天・Yahoo! ほか）</div>
       <div class="cards">
-        <div class="card"><div class="k">対象商品数</div><div class="v"><%= sokuhoProducts.length.toLocaleString('ja-JP') %><small> 点</small></div></div>
+        <div class="card"><div class="k">対象商品数</div><div class="v"><%= sokuhoProducts.length.toLocaleString('ja-JP') %><small> 点（販売あり <%= sokuhoSold.toLocaleString('ja-JP') %> 点）</small></div></div>
         <div class="card"><div class="k">直近7日 販売数</div><div class="v"><%= num(totals.sokuho7) %><small> 個</small></div></div>
         <div class="card"><div class="k">直近30日 販売数</div><div class="v"><%= num(totals.sokuho30) %><small> 個</small></div></div>
       </div>
@@ -141,14 +150,15 @@
         <tbody>
           <% sokuhoProducts.forEach(p => {
                const byKey = {}; (p.sokuhoMalls || []).forEach(m => { byKey[m.key] = m; });
+               const ns = (p.sokuho7 || p.sokuho30) ? '' : ' nosale';
           %>
-            <tr class="prod-top">
+            <tr class="prod-top<%= ns %>">
               <td class="l" rowspan="2"><div class="name"><%= p.product_name || '(商品名なし)' %></div><div class="code"><%= p.ne_code %></div></td>
               <td class="per">7日</td>
               <td class="tot"><%= num(p.sokuho7) %></td>
               <% mallCols.forEach(c => { const m = byKey[c.key]; %><td><%= (m && m.q7) ? num(m.q7) : '' %></td><% }) %>
             </tr>
-            <tr class="prod-bot">
+            <tr class="prod-bot<%= ns %>">
               <td class="per">30日</td>
               <td class="tot"><%= num(p.sokuho30) %></td>
               <% mallCols.forEach(c => { const m = byKey[c.key]; %><td><%= (m && m.q30) ? num(m.q30) : '' %></td><% }) %>
@@ -160,7 +170,7 @@
       <!-- スマホ: 商品ごとのカード -->
       <div class="sokuho-cards only-mobile">
         <% sokuhoProducts.forEach(p => { const ms = [...(p.sokuhoMalls || [])].sort((a,b)=>a.order-b.order); %>
-          <div class="scard">
+          <div class="scard<%= (p.sokuho7 || p.sokuho30) ? '' : ' nosale' %>">
             <div class="scard-name"><%= p.product_name || '(商品名なし)' %> <span class="code"><%= p.ne_code %></span></div>
             <div class="scard-tot">直近7日 <b><%= num(p.sokuho7) %></b>　/　直近30日 <b><%= num(p.sokuho30) %></b></div>
             <% if (ms.length) { %>
@@ -177,7 +187,7 @@
       <% } %>
       <div class="note">
         <b>速報（注文ベース）</b>とは … 注文が入った日でカウントした直近の販売数です（ほぼ前日まで反映・Amazon FBA含む・返品/キャンセル後の精算は未反映の暫定値）。<br>
-        各モール列（楽天・Yahoo!・au PAY・Qoo10・メルカリ・LINEギフト・Amazon FBA・Amazon FBM ほか）に、上段＝直近7日／下段＝直近30日 の販売数を表示します。空欄はその期間に販売なし。<br>
+        各モール列（楽天・Yahoo!・au PAY・Qoo10・メルカリ・LINEギフト・Amazon FBA・Amazon FBM ほか）に、上段＝直近7日／下段＝直近30日 の販売数を表示します。空欄はその期間に販売なし。販売のなかった商品（取扱中）も薄字で一覧に載せています。<br>
         速報と確定（精算ベース）は集計基準が違うため数字は一致しません。
       </div>
     </section>
@@ -201,12 +211,12 @@
       </div>
       <div class="period"><% if (period) { %>確定（精算ベース）: <%= period.start %> 〜 <%= period.end %>（<%= period.label %>・<%= period.cutoff %>まで確定分）<% } else { %>確定（精算ベース）: 集計対象データがまだありません<% } %></div>
       <div class="cards">
-        <div class="card"><div class="k">対象商品数</div><div class="v"><%= kakuteiProducts.length.toLocaleString('ja-JP') %><small> 点</small></div></div>
+        <div class="card"><div class="k">対象商品数</div><div class="v"><%= kakuteiProducts.length.toLocaleString('ja-JP') %><small> 点（販売あり <%= kakuteiSold.toLocaleString('ja-JP') %> 点）</small></div></div>
         <div class="card"><div class="k">販売ピース数</div><div class="v"><%= num(totals.pieces) %><small> 個</small></div></div>
         <div class="card"><div class="k">売上(税込)</div><div class="v"><%= yen(totals.sales) %></div></div>
         <div class="card"><div class="k">前同期間比(個数)</div><div class="v"><% const tt=trend(totals.pieces, totals.prevPieces); %><span class="<%= tt.cls %>"><%= tt.mark %></span></div></div>
       </div>
-      <% if (!kakuteiProducts.length) { %>
+      <% if (!period || !kakuteiProducts.length) { %>
         <div class="empty">この期間に確定済みの販売実績がありません（速報タブをご覧ください）。</div>
       <% } else { %>
       <div class="scroll">
@@ -214,7 +224,7 @@
         <thead><tr><th class="l">商品</th><th>ピース数</th><th>傾向</th><th>日平均</th><th>売上(税込)</th><th>最終販売日</th><th class="l">出品内訳</th></tr></thead>
         <tbody>
           <% kakuteiProducts.forEach((p, idx) => { const t = trend(p.pieces, p.prevPieces); %>
-            <tr>
+            <tr class="<%= (p.pieces || p.sales) ? '' : 'nosale' %>">
               <td class="l"><div class="name"><%= p.product_name || '(商品名なし)' %></div><div class="code"><%= p.ne_code %></div></td>
               <td><%= num(p.pieces) %></td>
               <td class="<%= t.cls %>"><%= t.mark %></td>
