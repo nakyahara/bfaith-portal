@@ -1787,7 +1787,13 @@ function assertPriceOnlyItems(items, { clearSalePrice = false } = {}) {
       throw new Error(`update-items: ${i + 1}件目は price と sale_price の両方が必要です `
         + '(公式: price を更新する場合は必ず両方を更新する)');
     }
-    if ('sale_price' in item && String(item.sale_price ?? '') === '' && !clearSalePrice) {
+    // ★null / undefined は組み立ての時に省かれてしまい、price だけが送られる (Codex R18)。
+    //   「消す」つもりなら空文字で書くこと
+    if ('sale_price' in item && (item.sale_price === null || item.sale_price === undefined)) {
+      throw new Error(`update-items: ${i + 1}件目の sale_price が null です。`
+        + '消すつもりなら空文字 "" を指定してください (null だと送られずに price だけが届きます)');
+    }
+    if ('sale_price' in item && String(item.sale_price) === '' && !clearSalePrice) {
       throw new Error(`update-items: ${i + 1}件目の sale_price が空です。`
         + '空文字は「セール価格を消す」意味になります。消してよいなら clearSalePrice:true を付けてください');
     }
@@ -2064,6 +2070,12 @@ function runSelfTest() {
   check('update-items: ★sale_price だけでも通さない',
     tryAssert([{ item_code: 'a', sale_price: '900' }]).includes('price と sale_price の両方が必要'), true);
   check('update-items: 両方あれば通る', tryAssert([{ item_code: 'a', price: '1000', sale_price: '900' }]), 'ok');
+  check('update-items: ★sale_price が null は通さない (組み立てで省かれ price だけ届く)',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: null }], { clearSalePrice: true }).includes('null'), true);
+  check('update-items: ★sale_price が undefined も通さない',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: undefined }], { clearSalePrice: true }).includes('null'), true);
+  check('update-items: 空文字 + 許可なら通る',
+    tryAssert([{ item_code: 'a', price: '1000', sale_price: '' }], { clearSalePrice: true }), 'ok');
   check('update-items: ★コロンが多い SKU別価格は通さない',
     tryAssert([{ item_code: 'a', subcode_price: 'x:100:ゴミ' }]).includes('subcode_price の書式'), true);
   check('update-items: コロンが無い SKU別価格も通さない',
