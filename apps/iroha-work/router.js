@@ -319,14 +319,27 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   const db = getDB();
   const row = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
 
+  // シード・権限判定に使うカード値 (商品コードが一致するカードだけ)
+  const card = getCachePage(String(req.body?.page_id || ''));
+  let cardProps = {};
+  if (card && codeKeyOf(card.product_code) === k) {
+    try { cardProps = JSON.parse(card.payload || '{}'); } catch { /* 壊れていればカード値なし */ }
+  }
+
+  // DBが実際に変わるか (書き込み要否・unchanged判定) は**生値**で見る
   const { fills, overwrites } = classifyMasterEdit(row, fields);
   if (fills.length === 0 && overwrites.length === 0) {
     return res.json({ ok: true, unchanged: true, row });
   }
-  if (overwrites.length > 0 && !hasSessionAccess(req)) {
+  // 権限は**画面に見えていた実効値** (マスタ+カードのフォールバック合成) で見る (Codex PR4-R3:
+  // マスタが空欄でもカード値 D-8 が表示されている項目を、一般作業者が D-9 へ変えられてはいけない。
+  // 表示どおりの値を確定保存するだけなら誰でもよい)
+  const effRow = masterOf(row || null, cardProps);
+  const perm = classifyMasterEdit(effRow, fields);
+  if (perm.overwrites.length > 0 && !hasSessionAccess(req)) {
     if (w.worker.worker_type !== 'staff') {
       return res.status(403).json({ ok: false, error: 'staff_required',
-        message: '入っている値の変更は職員のみです (空欄への登録は誰でもできます)' });
+        message: '表示されている値の変更は職員のみです (空欄への登録は誰でもできます)' });
     }
     const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
     if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
@@ -357,17 +370,12 @@ router.post('/api/master', checkOrigin, api((req, res) => {
         cur = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
         expect = cur.version;
         // カード表示中の値をシード (今回指定されなかった項目だけ)。空欄埋め扱いなので権限は不要。
-        // ⚠シード元カードの商品コードが今回の商品と一致するときだけ (別商品のカード値を混ぜない)
-        const card = getCachePage(String(req.body?.page_id || ''));
-        if (card && codeKeyOf(card.product_code) === k) {
-          let props = {};
-          try { props = JSON.parse(card.payload || '{}'); } catch { /* 壊れていればシードなし */ }
-          const seed = {
-            material_code: props['資材セットID'], storage_container: props['収納容器'],
-            units_per_container: props['入数'], process_count: props['工程数'], note: props['備考'],
-          };
-          applyFields = { ...Object.fromEntries(Object.entries(seed).filter(([f, v]) => v != null && v !== '' && !(f in fields))), ...fields };
-        }
+        // cardProps は上で商品コード一致を確認済み (別商品のカード値を混ぜない)
+        const seed = {
+          material_code: cardProps['資材セットID'], storage_container: cardProps['収納容器'],
+          units_per_container: cardProps['入数'], process_count: cardProps['工程数'], note: cardProps['備考'],
+        };
+        applyFields = { ...Object.fromEntries(Object.entries(seed).filter(([f, v]) => v != null && v !== '' && !(f in fields))), ...fields };
       } else {
         expect = Number(req.body.expect_version);
       }

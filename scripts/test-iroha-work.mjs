@@ -655,6 +655,17 @@ console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動�
   const c5 = classifyMasterEdit(null, { material_code: 'D-1' });
   ok(c5.fills.includes('material_code'), '行が無い商品への登録も fills');
 
+  // 権限迂回の防止 (PR4-R3): 権限判定はカードフォールバック込みの**実効値**で行う。
+  // マスタ空欄+カード表示 D-8 の項目: D-8 の確定保存=誰でも / D-9 への変更=職員 (router はこの2判定を併用)
+  const { masterOf: masterOfSvc } = await import('../apps/iroha-work/service.js');
+  const eff = masterOfSvc({ version: 1, material_code: null, storage_container: null, units_per_container: null, process_count: null, note: null, video_url: null },
+    { '資材セットID': 'D-8' });
+  ok(eff.material_code === 'D-8', '実効値はカード値で埋まる');
+  const permSame = classifyMasterEdit(eff, { material_code: 'D-8' });
+  ok(permSame.overwrites.length === 0, '表示どおりの値の確定保存は上書き扱いにならない (誰でも可)');
+  const permDiff = classifyMasterEdit(eff, { material_code: 'D-9' });
+  ok(permDiff.overwrites.includes('material_code'), '表示と違う値への変更は上書き (職員PIN必要)');
+
   // 動画リンクの検証と版管理
   const bad = updateWorkMasterRow('prod-a', { video_url: 'javascript:alert(1)' }, 'test', row.version);
   ok(bad.ok === false && bad.error === 'bad_url', 'http(s) 以外の動画リンクは拒否');
