@@ -33,7 +33,7 @@ const { getDB } = await import('../apps/inbound-check/db.js');
 const {
   parseWorkMasterXlsx, compareIrohaFlags, applyWorkMaster, seedIrohaFlags,
   workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow, logWorkMasterImport,
-  importIssueCount,
+  importIssueCount, computeDeletions,
 } = await import('../apps/inbound-check/work-master.js');
 const { buildCardProperties, calcExternal } = await import('../apps/inbound-check/notion-sync.js');
 const { addManual } = await import('../apps/inbound-info/db.js');
@@ -176,6 +176,9 @@ console.log('\n[6] Notion カードへの反映 (buildCardProperties + wm)');
 console.log('\n[7] [PR2-R2 High] 取込は全置換 — xlsx に無い既存行は削除される');
 {
   const subset = parsed.rows.filter(r => r.code !== 'PROD-8');
+  const preview = computeDeletions(subset);
+  ok(preview.count === 1 && preview.codes.length === preview.count && preview.codes[0] === 'PROD-8',
+    'dry-run の削除予定は全件のコード一覧を返す');
   const c = applyWorkMaster(subset, { user: 'test' });
   ok(c.deleted === 1 && !db.prepare("SELECT 1 FROM f_iroha_work_master WHERE code_key = 'prod-8'").get(),
     'xlsx から消えた PROD-8 の行が削除される (廃止した作業仕様を残さない)');

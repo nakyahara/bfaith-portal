@@ -541,9 +541,14 @@
         + (issue.emptyCode ? ' ・ コード空 ' + issue.emptyCode : '') + (issueLine ? ' ・ ⚠ ' + issueLine : '') + '</p>';
       if (j.applied) html += '<p>マスタ書込: 新規 ' + j.applied.inserted + ' / 更新 ' + j.applied.updated + ' / 変化なし ' + j.applied.unchanged + ' / <b>削除 ' + j.applied.deleted + '</b></p>';
       if (j.wouldDelete && j.wouldDelete.count > 0 && j.dryRun) {
+        const delAll = j.wouldDelete.codes || [];
+        const delHead = delAll.slice(0, 50);
         html += '<p class="hint"><b class="ng">⚠ 取込すると削除される既存行: ' + j.wouldDelete.count + ' 件</b>'
-          + ' (xlsx に無い行。画面で追加した行も対象): ' + esc(j.wouldDelete.codes.join(' / '))
-          + (j.wouldDelete.count > j.wouldDelete.codes.length ? ' …ほか' : '') + '</p>';
+          + ' (xlsx に無い行。画面で追加した行も対象): ' + esc(delHead.join(' / ')) + '</p>';
+        if (delAll.length > delHead.length) {
+          html += '<details><summary class="hint">削除予定の全 ' + delAll.length + ' 件を表示</summary>'
+            + '<p class="hint">' + esc(delAll.join(' / ')) + '</p></details>';
+        }
       }
       if (j.seeded) {
         html += '<p>いろは有無の書込: <b>' + j.seeded.seeded + '</b> 件 (入庫情報に行を新規作成 ' + j.seeded.added

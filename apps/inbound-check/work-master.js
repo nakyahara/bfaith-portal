@@ -200,7 +200,9 @@ export function computeDeletions(rows) {
   const incoming = new Set(rows.map((r) => r.codeKey));
   const gone = db.prepare('SELECT code_key, 商品コード AS code FROM f_iroha_work_master').all()
     .filter((r) => !incoming.has(r.code_key));
-  return { count: gone.length, codes: gone.map((g) => g.code).slice(0, 50), keys: gone.map((g) => g.code_key) };
+  // codes は**全件**返す (削除予定を全部確認できないと「予告」にならない — Codex PR2-R3)。
+  // 画面側が先頭50件+折りたたみで表示する
+  return { count: gone.length, codes: gone.map((g) => g.code), keys: gone.map((g) => g.code_key) };
 }
 
 export function applyWorkMaster(rows, { user = null } = {}) {
