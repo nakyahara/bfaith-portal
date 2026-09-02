@@ -542,7 +542,12 @@ export function initProductHubDB() {
       draft_id       INTEGER PRIMARY KEY REFERENCES product_drafts(id) ON DELETE CASCADE,
       genre_id       TEXT,
       attributes_json TEXT,                 -- [{name, values:[string]}]
-      article_number TEXT,                  -- メーカー型番 (空 = exemptionReason で送る)
+      -- メーカー型番。RMS 画面では「商品仕様」の中の 1 項目 = API の attributes[メーカー型番]。
+      -- 🚨 API の articleNumber (= RMS 画面の「カタログID」) ではない。2026-09-02 まで
+      -- ここを articleNumber に送っていて IE0228 で登録が落ちていた (shaganshi)
+      article_number TEXT,
+      -- カタログID が無いときの理由 (1..6)。カタログID 本体は product_drafts.jan_code
+      catalog_id_exemption_reason INTEGER CHECK (catalog_id_exemption_reason BETWEEN 1 AND 6),
       registered_at  TEXT,                  -- 楽天への登録に成功した日時 (2026-08-05〜 公開直行。それ以前は非公開登録)
       last_error     TEXT,                  -- 直近の RMS エラー (人が直す材料)
       -- 2026-07-27 仕様確定: 「アプリが正、RMS手直しは最終手段」— 公開に必要な情報をアプリで持つ
@@ -999,6 +1004,9 @@ export function initProductHubDB() {
     // last_error だけだと「いつの・どの段階の失敗か」「再実行していいか」が分からない (Codex R1)
     ['listing_outcome', "TEXT CHECK (listing_outcome IN ('running', 'failed', 'unknown'))"],
     ['listing_attempt_at', 'TEXT'],
+    // カタログID (= RMS 画面の「カタログID」/ API の articleNumber) が無いときの理由 (2026-09-02)。
+    // JAN があれば JAN を送るので使わない。NULL = 未設定 → 送信時は 5 (該当製品コードなし) 扱い
+    ['catalog_id_exemption_reason', 'INTEGER CHECK (catalog_id_exemption_reason BETWEEN 1 AND 6)'],
   ]) {
     if (!rkCols.has(col)) db.exec(`ALTER TABLE draft_rakuten ADD COLUMN ${col} ${ddl}`);
   }
