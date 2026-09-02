@@ -617,6 +617,26 @@ router.post('/api/supplier/:code/draft', (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
+// 下書きの解除 (破棄)。空カート保存 (POST items:[]) と同じ削除だが、
+// 発注数を1つずつ消さなくても1クリックで解除できる明示API。
+// 誤操作の追跡用に、消した中身 (明細・メモ) を監査ログに残す。
+router.delete('/api/supplier/:code/draft', (req, res) => {
+  try {
+    const code = normSupplierCode(req.params.code);
+    const db = getDB();
+    const row = db.prepare("SELECT id, note FROM po_orders WHERE supplier_code=? AND status='draft'").get(code);
+    // 下書きが無いときは deleted=false (画面側の入力クリアを誤発火させない、POST items:[] と同じ約束)
+    if (!row) return res.json({ ok: true, deleted: false, skuCount: 0 });
+    const items = db.prepare('SELECT product_code AS code, qty FROM po_order_items WHERE order_id=?').all(row.id);
+    db.prepare("DELETE FROM po_orders WHERE id=? AND status='draft'").run(row.id);
+    audit(db, {
+      actorType: 'user', actor: actorOf(req), action: 'draft_discard', resource: `supplier:${code}`,
+      detail: { orderId: row.id, note: row.note || '', items },
+    });
+    res.json({ ok: true, deleted: true, skuCount: items.length });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 router.post('/api/supplier/:code/issue', (req, res) => {
   try {
     const code = normSupplierCode(req.params.code);
@@ -3338,6 +3358,9 @@ const CSS = `
   .card { position: relative; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 16px 14px; display: block; text-decoration: none; color: inherit; box-shadow: var(--shadow); transition: transform .08s, box-shadow .12s, border-color .12s; }
   .card .cdis { position: absolute; top: 8px; right: 8px; border: none; background: none; color: #9aa7b5; padding: 2px 7px; font-size: 13px; cursor: pointer; border-radius: 7px; }
   .card .cdis:hover { background: var(--danger-soft); color: var(--danger); }
+  .dwrap { white-space: nowrap; }
+  .cdrop { border: 1px solid var(--line); background: var(--card); color: var(--sub); border-radius: 999px; padding: 1px 8px; font-size: 11px; font-weight: 600; cursor: pointer; vertical-align: middle; }
+  .cdrop:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
   a.card:hover { border-color: #b9d0ff; box-shadow: var(--shadow-h); transform: translateY(-2px); }
   .card .nm { font-weight: 700; font-size: 15px; margin-bottom: 6px; line-height: 1.4; }
   .card .memo { font-size: 11.5px; color: var(--warnc); background: var(--warn-soft); border-radius: 6px; padding: 2px 7px; display: inline-block; margin-bottom: 6px; }
@@ -3605,7 +3628,11 @@ router.get('/', (req, res) => {
   try {
     const { pub, overlay, bySupplier, products, ruleStats } = computeAll();
     const db = getDB();
-    const draftCodes = new Set(db.prepare("SELECT supplier_code FROM po_orders WHERE status='draft'").all().map(r => r.supplier_code));
+    // 下書きは件数も出す (カードから解除できるので、中身が分からないまま消させない)
+    const draftMeta = new Map(db.prepare(`
+      SELECT o.supplier_code AS code, COUNT(i.id) AS sku_count, COALESCE(SUM(i.qty),0) AS total_qty
+      FROM po_orders o LEFT JOIN po_order_items i ON i.order_id = o.id
+      WHERE o.status='draft' GROUP BY o.id`).all().map(r => [r.code, r]));
     const cycleIssued = new Map(cycleIssuedSuppliers(cycleStartIso(pub)).map(r => [r.code, r]));
     const cards = [];
     const others = [];
@@ -3614,7 +3641,8 @@ router.get('/', (req, res) => {
       const ci = cycleIssued.get(g.code);
       const c = {
         code: g.code, name: g.name || ('仕入先 ' + g.code), memo: g.memo,
-        targetCount: g.targets.length, estAmount: g.estAmount, hasDraft: draftCodes.has(g.code),
+        targetCount: g.targets.length, estAmount: g.estAmount, hasDraft: draftMeta.has(g.code),
+        draftSkus: draftMeta.has(g.code) ? draftMeta.get(g.code).sku_count : 0,
         issuedCount: ci ? ci.orders : 0, unsentCount: ci ? ci.unsent : 0,
         productCount: g.targets.length + g.candidates.length + g.horikoshi.length,
       };
@@ -3653,9 +3681,9 @@ router.get('/', (req, res) => {
   const stale = pub && pub.as_of_date ? (Date.now() - Date.parse(pub.as_of_date + 'T00:00:00+09:00')) > 3 * 86400000 : true;
   const freshNote = pub ? freshnessText(pub, overlay) : 'PML未同期';
   const cardHtml = c => `
-    <a class="card" data-sup="${he(c.code)}" data-supname="${he(c.name)}" href="/apps/purchase-orders/supplier/${encodeURIComponent(c.code)}">
+    <a class="card" data-sup="${he(c.code)}" data-supname="${he(c.name)}" data-tc="${c.targetCount}" data-ic="${c.issuedCount}" href="/apps/purchase-orders/supplier/${encodeURIComponent(c.code)}">
       <button class="cdis" data-cdis="${he(c.code)}" title="この仕入先を非表示 (下の「非表示の仕入先」から戻せます)">✕</button>
-      <div class="nm">${he(c.name)} ${c.hasDraft ? '<span class="badge b-draft">下書きあり</span>' : ''}${c.issuedCount ? ` <span class="badge b-issued" title="今サイクルで発注確定済み。FBA在庫更新やNE CSV取込 (データ更新) でこの表示はリセットされます">✅ 発注確定済み${c.issuedCount > 1 ? ' ×' + c.issuedCount : ''}</span>` : ''}${c.unsentCount ? ' <span class="badge b-warn" title="発注確定済みですが発注書メール (本送信) が未送信です">📧 メール未送信</span>' : ''}</div>
+      <div class="nm">${he(c.name)} ${c.hasDraft ? `<span class="dwrap"><span class="badge b-draft">下書きあり${c.draftSkus ? ` ${c.draftSkus}SKU` : ''}</span> <button class="cdrop" data-cdraft="${he(c.code)}" data-cdraftname="${he(c.name)}" data-cdraftskus="${c.draftSkus}" title="この仕入先の下書き (入力中の発注数・メモ) を破棄します。発注確定済みの発注には影響しません">🗑 下書きを解除</button></span>` : ''}${c.issuedCount ? ` <span class="badge b-issued" title="今サイクルで発注確定済み。FBA在庫更新やNE CSV取込 (データ更新) でこの表示はリセットされます">✅ 発注確定済み${c.issuedCount > 1 ? ' ×' + c.issuedCount : ''}</span>` : ''}${c.unsentCount ? ' <span class="badge b-warn" title="発注確定済みですが発注書メール (本送信) が未送信です">📧 メール未送信</span>' : ''}</div>
       ${c.memo ? `<div class="memo">📌 ${he(c.memo)}</div>` : ''}
       <div class="stats">
         <span><span class="n${c.targetCount ? ' acc' : ''}">${c.targetCount}</span>要発注 SKU</span>
@@ -3750,6 +3778,31 @@ document.addEventListener('click', function(ev) {
       HID[cd] = 1;
       toast('非表示にしました (「非表示の仕入先」から戻せます。次のデータ更新まで保持)');
     });
+    return;
+  }
+  // 下書きの解除: カードから1クリックで破棄 (取り消せないので中身の件数を出して確認)
+  var cdr = ev.target.getAttribute && ev.target.getAttribute('data-cdraft');
+  if (cdr) {
+    ev.preventDefault(); ev.stopPropagation(); // カード(リンク)への遷移を止める
+    var btn = ev.target;
+    var nm = btn.getAttribute('data-cdraftname') || cdr;
+    var sk = btn.getAttribute('data-cdraftskus') || '';
+    if (!confirm(nm + ' の下書きを解除します。\\n入力中の発注数' + (sk && sk !== '0' ? ' (' + sk + 'SKU)' : '') + ' とメモが消えます。元に戻せません。\\n\\n※発注確定済みの発注には影響しません。')) return;
+    btn.disabled = true;
+    fetch('/apps/purchase-orders/api/supplier/' + encodeURIComponent(cdr) + '/draft', { method: 'DELETE' })
+      .then(function(r){ return r.json(); })
+      .then(function(j) {
+        btn.disabled = false;
+        if (!j.ok) { toast('エラー: ' + j.error); return; }
+        var card = btn.closest('a.card');
+        var wrap = btn.closest('.dwrap');
+        if (wrap) wrap.remove();
+        // 下書きだけで一覧に出ていたカード (要発注0・発注確定0) は解除で対象外になるので消す
+        if (card && card.getAttribute('data-tc') === '0' && card.getAttribute('data-ic') === '0') card.remove();
+        applyHid(); // 件数の再計算
+        toast(j.deleted ? '下書きを解除しました (' + nm + ')' : '下書きはありませんでした');
+      })
+      .catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
     return;
   }
   var ud = ev.target.getAttribute && ev.target.getAttribute('data-cundis');
@@ -3968,6 +4021,7 @@ router.get('/supplier/:code', (req, res) => {
     <div class="toolbar" style="margin-top:6px">
       <button data-act="save">💾 下書き保存</button>
       <button class="pri" data-act="issue">✅ 発注確定</button>
+      <button class="dropdraft" data-act="dropdraft" style="display:none" title="入力中の発注数・メモ (下書き) をまとめて破棄します。発注確定済みの発注には影響しません">🗑 下書きを解除</button>
       <span class="fsavedInd muted"></span>
     </div>
     <div class="sec"><h2 data-sec="targets">🔴 要発注 (<span id="cntTargets"></span>) — 発注金額の大きいグループ順。<span class="muted" style="font-weight:400">商品名クリックで詳細・◯ヶ月分計算・同グループ商品</span></h2><div class="bd" id="secTargets"></div></div>
@@ -3984,6 +4038,7 @@ router.get('/supplier/:code', (req, res) => {
         <input type="text" id="orderNote" placeholder="メモ (任意)">
         <button data-act="save" id="btnSave">💾 下書き保存</button>
         <button class="pri" data-act="issue" id="btnIssue">✅ 発注確定</button>
+        <button class="fghost dropdraft" data-act="dropdraft" id="btnDropDraft" style="display:none" title="入力中の発注数・メモ (下書き) をまとめて破棄します。発注確定済みの発注には影響しません">🗑 下書きを解除</button>
         <span class="fsavedInd muted" id="fSaved"></span>
       </div>
     </div>`;
@@ -4854,6 +4909,7 @@ document.addEventListener('click', function(ev) {
   var act = ev.target.getAttribute && ev.target.getAttribute('data-act');
   if (act === 'save') save(false);
   if (act === 'issue') save(true);
+  if (act === 'dropdraft') dropDraft();
 });
 
 // 発注確定の冪等キー: ノンス (成功時に更新) + 内容ハッシュ。
@@ -4881,6 +4937,34 @@ function cartSummary(items) {
   var totA = 0;
   items.forEach(function(i){ var p = byCode[i.code]; totA += i.qty * ((p && p.cost) || 0); });
   return items.length + ' SKU / 発注金額合計 ' + yen(totA);
+}
+// 下書き解除ボタンは下書きがあるときだけ出す (押せるのに何も起きないボタンを置かない)
+function updateDraftBtn() {
+  document.querySelectorAll('.dropdraft').forEach(function(b){ b.style.display = hasDraft ? '' : 'none'; });
+}
+// 下書きの解除: 発注数を1つずつ0に戻さなくても、まとめて破棄できる
+function dropDraft() {
+  if (!hasDraft) { toast('下書きはありません'); return; }
+  if (!confirm('この仕入先の下書きを解除します。\\n入力中の発注数とメモが消えます。元に戻せません。\\n\\n※発注確定済みの発注には影響しません。')) return;
+  var actBtns = document.querySelectorAll('button[data-act]');
+  actBtns.forEach(function(b){ b.disabled = true; });
+  var unlock = function(){ actBtns.forEach(function(b){ b.disabled = false; }); };
+  fetch('/apps/purchase-orders/api/supplier/' + encodeURIComponent(D.supplier.code) + '/draft', { method: 'DELETE' })
+    .then(function(r){ return r.json().catch(function(){ return { ok: false, error: 'HTTP ' + r.status }; }); })
+    .then(function(j) {
+      unlock();
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      CART = {}; DATES = {};
+      document.querySelectorAll('input[data-code]').forEach(function(inp){ inp.value = ''; });
+      document.querySelectorAll('input[data-date]').forEach(function(inp){ inp.value = ''; });
+      document.getElementById('orderNote').value = '';
+      hasDraft = false;
+      savedState = null; savedInfo = '';
+      updateSavedInd(); updateDraftBtn();
+      renderAll();
+      toast(j.deleted ? '下書きを解除しました' : '下書きはありませんでした (入力をクリアしました)');
+    })
+    .catch(function(e){ unlock(); toast('通信エラー: ' + e.message); });
 }
 function updateSavedInd() {
   var h = '';
@@ -4949,6 +5033,7 @@ function save(issue) {
       document.querySelectorAll('input[data-date]').forEach(function(inp){ inp.value = ''; });
       document.getElementById('orderNote').value = '';
       hasDraft = false; // draft は確定で消費済み
+      updateDraftBtn();
       // 確定サマリをバーに常時表示。クリア後の空状態を基準に、以後の編集は「未保存の変更あり」(Codex R2 Medium)
       savedState = JSON.stringify(payloadNow());
       savedInfo = '✅ ' + new Date().toTimeString().slice(0, 5) + ' 発注確定 ' + esc(j.poNumber || ('#' + j.id)) + ' — ' + summary;
@@ -4959,11 +5044,12 @@ function save(issue) {
       // draft削除APIは items 空のとき note を保存しない。画面の残留入力をDBと揃えてクリア (Codex R1 Medium)
       document.getElementById('orderNote').value = '';
       hasDraft = false;
-      savedState = null; updateSavedInd();
+      savedState = null; updateSavedInd(); updateDraftBtn();
       toast(j.deleted ? '下書きを削除しました' : '下書きはありません (入力をクリアしました)');
     }
     else {
       hasDraft = true;
+      updateDraftBtn();
       savedState = JSON.stringify(payload);
       savedInfo = '💾 ' + new Date().toTimeString().slice(0, 5) + ' 保存済み — ' + summary;
       updateSavedInd();
@@ -5025,6 +5111,7 @@ if (D.draft) {
   savedState = JSON.stringify(p0);
   savedInfo = '💾 下書き保存済み — ' + cartSummary(p0.items);
 }
+updateDraftBtn();
 renderLists();
 renderAll();`;
   res.send(pageShell(`発注 — ${data.supplier.name}`, '', body, script));

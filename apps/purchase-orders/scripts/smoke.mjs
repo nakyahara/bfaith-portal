@@ -1164,6 +1164,48 @@ console.log('── P13b: 発注残ページ+消込API ──');
   ok(r.body.ok && r.body.deleted === true, '空カート保存: 既存draftあり → deleted=true');
   r = await emptyPost();
   ok(r.body.ok && r.body.deleted === false, '空カート保存: draftなし → deleted=false');
+  // ── 下書きの解除 (DELETE): 発注数を1つずつ0に戻さなくても1クリックで破棄できる ──
+  const putDraft = (qty, note) => j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'noflyersticker', qty }], note: note || '解除テスト' }) });
+  await putDraft(5);
+  r = await j('/api/supplier/1/draft', { method: 'DELETE' });
+  ok(r.status === 200 && r.body.ok && r.body.deleted === true && r.body.skuCount === 1, '下書き解除: deleted=true + SKU件数', r.body);
+  r = await j('/api/supplier/1');
+  ok(r.body.draft === null, '下書き解除後は draft なし');
+  r = await j('/api/supplier/1/draft', { method: 'DELETE' });
+  ok(r.status === 200 && r.body.ok && r.body.deleted === false, '下書き解除: 下書きなし → deleted=false (画面の入力を誤クリアしない)', r.body);
+  {
+    // 取り消せない操作なので、消えた中身を監査ログから追える
+    const a = db.prepare("SELECT action, resource, detail_json FROM po_audit_log WHERE action='draft_discard' ORDER BY id DESC").get();
+    const d = a && JSON.parse(a.detail_json);
+    ok(a && a.resource === 'supplier:1' && d.items.length === 1 && d.items[0].qty === 5 && d.note === '解除テスト',
+      '下書き解除は監査ログに明細とメモを残す', a);
+    const cnt = db.prepare("SELECT COUNT(*) c FROM po_audit_log WHERE action='draft_discard'").get().c;
+    ok(cnt === 1, '下書きが無いときの解除は監査ログを増やさない', cnt);
+  }
+  {
+    // 発注確定済み (issued) は解除の対象外
+    const issuedBefore = db.prepare("SELECT COUNT(*) c FROM po_orders WHERE status='issued'").get().c;
+    await putDraft(7);
+    await j('/api/supplier/1/draft', { method: 'DELETE' });
+    const issuedAfter = db.prepare("SELECT COUNT(*) c FROM po_orders WHERE status='issued'").get().c;
+    ok(issuedBefore > 0 && issuedBefore === issuedAfter, '下書き解除は発注確定済みの発注に影響しない', { issuedBefore, issuedAfter });
+    const left = db.prepare("SELECT COUNT(*) c FROM po_order_items i JOIN po_orders o ON o.id=i.order_id WHERE o.status='draft'").get().c;
+    ok(left === 0, '下書き解除で明細も残らない (CASCADE)', left);
+  }
+  {
+    // 画面: 下書きがあるときだけ解除ボタンが出る
+    await putDraft(5);
+    const dash = await (await fetch(base + '/')).text();
+    ok(dash.includes('data-cdraft="1"') && dash.includes('下書きを解除'), 'ダッシュボード: 下書きありカードに解除ボタン');
+    ok(dash.includes('下書きあり 1SKU'), 'ダッシュボード: 下書きの SKU 件数を表示');
+    const sup = await (await fetch(base + '/supplier/1')).text();
+    ok(sup.includes('data-act="dropdraft"') && sup.includes('function dropDraft'), '仕入先ページ: 下書き解除ボタン + 処理');
+    ok(sup.includes('updateDraftBtn'), '仕入先ページ: 解除ボタンの表示制御 (下書きが無いときは隠す)');
+    await j('/api/supplier/1/draft', { method: 'DELETE' });
+    const dash2 = await (await fetch(base + '/')).text();
+    ok(!dash2.includes('data-cdraft="1"'), 'ダッシュボード: 下書きが無ければ解除ボタンは出ない');
+  }
   // 状態を元に戻す
   await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }], note: 'd', requestedDate: '2026-08-15' }) });
