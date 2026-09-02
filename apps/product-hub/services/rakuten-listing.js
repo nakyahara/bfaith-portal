@@ -1010,27 +1010,43 @@ export function cabinetImageUrl(location) {
  * SKU ごとに上書きする。画面 (detail) と出品 payload の両方がこの関数を使う = 見えている値がそのまま送られる。
  * @returns {{ names: string[], bySku: Map<string, Map<string, string>> }} bySku のキーは LOWER(TRIM(商品コード))
  */
+export function splitAttributeValues(raw) {
+  // RMS の商品仕様と同じく「|」区切りで複数値 (Codex R1 medium: 共通の多値属性を 1 文字列に潰さない)
+  return String(raw == null ? '' : raw).split('|').map((v) => v.trim()).filter(Boolean);
+}
+
 export function skuAttributeGrid(db, draftId, rk, members) {
-  const base = new Map();
+  const base = new Map();           // name → string[] (ページ共通の既定値)
+  const legacyModels = [];          // 旧データで属性側に残っているメーカー型番
   for (const a of (parseAttributes(rk?.attributes_json) || [])) {
-    if (a.name !== MODEL_ATTR_NAME) base.set(a.name, a.values.join(' | '));
+    if (a.name === MODEL_ATTR_NAME) { for (const v of a.values) if (!legacyModels.includes(v)) legacyModels.push(v); continue; }
+    base.set(a.name, a.values.slice());
   }
+  // メーカー型番の既定値: 欄 (article_number) > 属性側に 1 つだけ残っている旧値。食い違い (複数・欄と別) は
+  // 既定値にせず空の行にして、SKU ごとの入力を促す (buildItemPayload が SKU 名つきで止める。Codex R1 high)
   const article = String(rk?.article_number || '').trim();
-  if (article) base.set(MODEL_ATTR_NAME, article);
+  const legacyModelConflict = legacyModels.length > 1 || (legacyModels.length === 1 && !!article && legacyModels[0] !== article);
+  if (article) base.set(MODEL_ATTR_NAME, [article]);
+  else if (legacyModels.length === 1) base.set(MODEL_ATTR_NAME, [legacyModels[0]]);
+  else if (legacyModels.length > 1) base.set(MODEL_ATTR_NAME, []);
   const names = [...base.keys()];
   const bySku = new Map();
+  const explicit = new Map();       // skuKey → Set(name): SKU 行で明示的に上書きされた項目
   for (const m of members || []) {
-    bySku.set(String(m.商品コード || '').trim().toLowerCase(), new Map(base));
+    const key = String(m.商品コード || '').trim().toLowerCase();
+    bySku.set(key, new Map([...base.entries()].map(([n, vals]) => [n, vals.slice()])));
+    explicit.set(key, new Set());
   }
   const rows = db.prepare('SELECT sku_code, name, value FROM draft_sku_attributes WHERE draft_id = ? ORDER BY rowid').all(draftId);
   for (const r of rows) {
     const cell = bySku.get(String(r.sku_code));
     if (!cell) continue; // 外した SKU の残骸は読まない
-    const value = String(r.value == null ? '' : r.value);
-    if (!names.includes(r.name) && value.trim()) names.push(r.name);
-    cell.set(r.name, value);
+    const values = splitAttributeValues(r.value);
+    if (!names.includes(r.name) && values.length > 0) names.push(r.name);
+    cell.set(r.name, values);
+    explicit.get(String(r.sku_code)).add(r.name);
   }
-  return { names, bySku };
+  return { names, bySku, explicit, legacyModels, legacyModelConflict };
 }
 
 /**
@@ -1160,13 +1176,14 @@ export function buildItemPayload(db, draftId) {
       const selectorValue = String(selRows.get(key) || '').trim();
       const skuJan = String(janRows.get(key) || '').trim();
       const cell = grid.bySku.get(key) || new Map();
-      if (String(cell.get('カタログID') || '').trim()) {
+      if ((cell.get('カタログID') || []).length > 0) {
         reasons.push(`SKU「${skuCode}」の商品仕様に「カタログID」の行があります — カタログID (JAN) は表の「カタログID」の行で入力してください`);
       }
       const skuAttrs = [...cell.entries()]
-        .filter(([n, v]) => String(v).trim() && n !== MODEL_ATTR_NAME && n !== 'カタログID')
-        .map(([n, v]) => ({ name: n, values: [String(v).trim()] }));
-      const skuModel = String(cell.get(MODEL_ATTR_NAME) || '').trim();
+        .filter(([n, vals]) => vals.length > 0 && n !== MODEL_ATTR_NAME && n !== 'カタログID')
+        .map(([n, vals]) => ({ name: n, values: vals.slice() }));
+      const skuModel = String((cell.get(MODEL_ATTR_NAME) || [])[0] || '').trim();
+      const modelExplicit = (grid.explicit.get(key) || new Set()).has(MODEL_ATTR_NAME);
       const rawSkuReason = exemptionRows.get(key);
       const skuReason = Number.isInteger(rawSkuReason) && rawSkuReason >= 1 && rawSkuReason <= 6 ? rawSkuReason : catalogExemptionReason;
       if (!selectorValue) reasons.push(`SKU「${skuCode}」の選択肢 (${selectorName || 'バリエーション'}) が未入力です — 基本情報タブのSKU表で入れてください`);
@@ -1181,7 +1198,13 @@ export function buildItemPayload(db, draftId) {
       if (!Number.isInteger(price) || price < 1) {
         reasons.push(`SKU「${skuCode}」の売価がありません (NEの標準売価も代表の売価も未設定)`);
       }
-      variantRows.push({ skuCode, selectorValue, jan: skuJan, price, attrs: skuAttrs, model: skuModel, reason: skuReason });
+      variantRows.push({ skuCode, selectorValue, jan: skuJan, price, attrs: skuAttrs, model: skuModel, modelExplicit, reason: skuReason });
+    }
+    // 旧データでメーカー型番が食い違っている (属性側に複数 / 欄と別) バリエーション: 既定値にできないので、
+    // SKU 表の「メーカー型番」の行が全 SKU で明示的に入るまで止める (黙って捨てない・隠さない。Codex R1 high)
+    if (grid.legacyModelConflict && variantRows.some((v) => !v.modelExplicit)) {
+      const vals = [...new Set([...grid.legacyModels, String(rk.article_number || '').trim()].filter(Boolean))];
+      reasons.push(`旧データの${MODEL_ATTR_NAME}が食い違っています (${vals.join(' / ')}) — カテゴリ・属性タブの表「${MODEL_ATTR_NAME}」の行に SKU ごとの値を入れてください (全 SKU に入れば旧データは使いません)`);
     }
     // 同じ値が 2 SKU に付くと組み合わせが重複して RMS に弾かれる (DB の UNIQUE でも防ぐが、
     // 取込など別経路で入った分に備えてここでも見る)
@@ -1212,7 +1235,10 @@ export function buildItemPayload(db, draftId) {
   const articleNo = String(rk.article_number || '').trim();
   const modelAttrs = Array.isArray(attributes) ? attributes.filter((a) => a.name === MODEL_ATTR_NAME) : [];
   let manualModel = null;
-  if (modelAttrs.length > 1) {
+  // バリエーションは SKU 表の「メーカー型番」の行が入口 (旧データの食い違いは上で SKU 表への入力を促している)
+  if (isVariation) {
+    manualModel = modelAttrs[0] || null;
+  } else if (modelAttrs.length > 1) {
     reasons.push(`商品属性「${MODEL_ATTR_NAME}」が複数あります (1件にまとめてください)`);
   } else if (modelAttrs.length === 1) {
     manualModel = modelAttrs[0];

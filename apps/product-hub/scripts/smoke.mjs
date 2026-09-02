@@ -1669,9 +1669,27 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   const grid = listing.skuAttributeGrid(db, gsaId, db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gsaId), members);
   check('skuAttributeGrid: ページ共通が既定値・SKU 行が上書き (名前の並び = 共通 → SKU)',
     grid.names.join(',') === 'ブランド名,' + listing.MODEL_ATTR_NAME + ',代表カラー'
-    && grid.bySku.get('gsa-a').get('ブランド名') === '共通ブランド' && grid.bySku.get('gsa-a').get('代表カラー') === '黒'
-    && grid.bySku.get('gsa-a').get(listing.MODEL_ATTR_NAME) === 'M-COMMON' && grid.bySku.get('gsa-b').get(listing.MODEL_ATTR_NAME) === 'M-B',
+    && grid.bySku.get('gsa-a').get('ブランド名').join() === '共通ブランド' && grid.bySku.get('gsa-a').get('代表カラー').join() === '黒'
+    && grid.bySku.get('gsa-a').get(listing.MODEL_ATTR_NAME).join() === 'M-COMMON' && grid.bySku.get('gsa-b').get(listing.MODEL_ATTR_NAME).join() === 'M-B'
+    && grid.explicit.get('gsa-b').has(listing.MODEL_ATTR_NAME) && !grid.explicit.get('gsa-a').has(listing.MODEL_ATTR_NAME),
     JSON.stringify({ names: grid.names, a: [...grid.bySku.get('gsa-a').entries()], b: [...grid.bySku.get('gsa-b').entries()] }));
+  // 共通の多値属性は配列のまま (Codex R1 medium)。SKU 行は「|」区切りで複数値 (RMS と同じ)
+  {
+    const rk2 = { attributes_json: '[{"name":"ブランド名","values":["A","B"]}]', article_number: null };
+    insAttr.run(gsaId, 'gsa-b', 'ブランド名', 'X | Y | Z');
+    const g2 = listing.skuAttributeGrid(db, gsaId, rk2, members);
+    check('skuAttributeGrid: 共通の多値は配列のまま・SKU 行は | 区切りで配列に',
+      g2.bySku.get('gsa-a').get('ブランド名').join(',') === 'A,B' && g2.bySku.get('gsa-b').get('ブランド名').join(',') === 'X,Y,Z',
+      JSON.stringify([...g2.bySku.get('gsa-b').entries()]));
+    db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND sku_code = 'gsa-b' AND name = 'ブランド名'`).run(gsaId);
+    // 旧データ: メーカー型番が属性側だけにある → 既定値に引き上げる / 欄と食い違い → 既定値にせず conflict
+    const g3 = listing.skuAttributeGrid(db, gsaId, { attributes_json: '[{"name":"メーカー型番","values":["OLD"]}]', article_number: null }, members);
+    const g4 = listing.skuAttributeGrid(db, gsaId, { attributes_json: '[{"name":"メーカー型番","values":["OLD"]}]', article_number: 'NEW' }, members);
+    check('skuAttributeGrid: 属性側だけの旧メーカー型番は既定値に / 欄と食い違えば conflict (欄の値を既定値)',
+      g3.bySku.get('gsa-a').get(listing.MODEL_ATTR_NAME).join() === 'OLD' && g3.legacyModelConflict === false
+      && g4.legacyModelConflict === true && g4.bySku.get('gsa-a').get(listing.MODEL_ATTR_NAME).join() === 'NEW',
+      JSON.stringify({ g3: g3.legacyModels, g4: g4.legacyModels }));
+  }
   let gs = listing.buildItemPayload(db, gsaId);
   const attrsOfSku = (sku) => ((gs.ok && gs.payload.variants[sku].attributes) || []).map((a) => a.name + '=' + a.values.join('|')).sort().join(',');
   check('payload×SKU仕様: SKU ごとに違う代表カラー + 共通ブランド名 + SKU 別カタログID (辞書に無いメーカー型番は送らない)',
@@ -1718,6 +1736,30 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   db.prepare(`UPDATE draft_sku_catalog_exemptions SET reason = 1 WHERE draft_id = ? AND sku_code = 'gsa-b'`).run(gsaId);
   gs = listing.buildItemPayload(db, gsaId);
   check('payload×SKU仕様: SKU の理由 1 (セット商品) は未対応で止める', gs.ok === false && gs.reasons.some((r) => r.includes('セット商品')), JSON.stringify(gs.reasons));
+  db.prepare(`UPDATE draft_sku_catalog_exemptions SET reason = 3 WHERE draft_id = ? AND sku_code = 'gsa-b'`).run(gsaId);
+  // 共通の多値属性はそのまま複数値で送る (Codex R1 medium)。辞書 900001 の ブランド名 は multiValueLimit 3
+  insJanA.run(gsaId, 'gsa-a', '4901234567894'); insJanA.run(gsaId, 'gsa-b', '4999999999999');
+  db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = '[{"name":"ブランド名","values":["A","B"]}]' WHERE draft_id = ?`).run(gsaId);
+  gs = listing.buildItemPayload(db, gsaId);
+  check('payload×SKU仕様: 共通の多値属性は values 配列のまま送る',
+    gs.ok === true && (gs.payload.variants['gsa-a'].attributes.find((a) => a.name === 'ブランド名') || {}).values.join(',') === 'A,B',
+    JSON.stringify(gs.ok ? gs.payload.variants['gsa-a'].attributes : gs.reasons));
+  insAttr.run(gsaId, 'gsa-a', 'ブランド名', 'P | Q | R | S');
+  gs = listing.buildItemPayload(db, gsaId);
+  check('payload×SKU仕様: SKU 行の | 区切りも複数値として上限 (3 個) を検査する',
+    gs.ok === false && gs.reasons.some((r) => r.includes('gsa-a') && r.includes('最大 3 個')), JSON.stringify(gs.reasons));
+  db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND name = 'ブランド名'`).run(gsaId);
+  // 旧データでメーカー型番が食い違っているバリエーション: SKU 表の行が全 SKU に入るまで止める (Codex R1 high)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["A"]},{"name":"メーカー型番","values":["OLD"]}]', article_number = 'NEW' WHERE draft_id = ?`).run(gsaId);
+  gs = listing.buildItemPayload(db, gsaId);
+  check('payload×SKU仕様: 旧メーカー型番の食い違いは SKU 表への入力を促して止める (黙って捨てない)',
+    gs.ok === false && gs.reasons.some((r) => r.includes('食い違って') && r.includes('OLD') && r.includes('NEW')), JSON.stringify(gs.reasons));
+  insAttr.run(gsaId, 'gsa-a', listing.MODEL_ATTR_NAME, 'M-A');
+  gs = listing.buildItemPayload(db, gsaId);
+  check('payload×SKU仕様: 全 SKU に SKU 表の値が入れば旧データは使わず通る',
+    gs.ok === true, JSON.stringify(gs.ok ? gs.payload.variants : gs.reasons));
+  db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND name = ?`).run(gsaId, listing.MODEL_ATTR_NAME);
+  insAttr.run(gsaId, 'gsa-b', listing.MODEL_ATTR_NAME, 'M-B');
   db.prepare('DELETE FROM draft_sku_catalog_exemptions WHERE draft_id = ?').run(gsaId);
   db.prepare('DELETE FROM draft_sku_attributes WHERE draft_id = ?').run(gsaId);
   db.prepare('DELETE FROM draft_sku_selector_values WHERE draft_id = ?').run(gsaId);
@@ -3702,6 +3744,19 @@ let wfSetParentId = null;
   check('SKU仕様: バリエーションでないドラフトは 400', r.status === 400);
   r = await call('POST', `/api/drafts/${idP}/sku-attributes`, { ne_code: 'vc-b', value: 'x' });
   check('SKU仕様: 項目名が無ければ 400', r.status === 400);
+  r = await call('POST', `/api/drafts/${idP}/sku-attributes`, { ne_code: 'vc-b', name: 'ブランド名', value: 'x'.repeat(301) });
+  check('SKU仕様: 301 文字の値は 400 (黙って切り詰めない)', r.status === 400 && attrOf('vc-b', 'ブランド名')?.value === 'B-Faith', JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idP}/sku-attributes`, { ne_code: 'vc-b', name: 'n'.repeat(101), value: 'x' });
+  check('SKU仕様: 101 文字の項目名は 400', r.status === 400);
+  // /rakuten で article_number を送らない保存 (バリエーションの画面) は既存の型番を維持する (Codex R1 high)
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, article_number) VALUES (?, '1', 'M-KEEP')
+    ON CONFLICT(draft_id) DO UPDATE SET article_number = 'M-KEEP'`).run(idP);
+  r = await call('POST', `/api/drafts/${idP}/rakuten`, { genre_id: '1' });
+  check('メーカー型番: /rakuten で article_number を送らなければ既存を維持する', r.status === 200
+    && db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(idP)?.article_number === 'M-KEEP', JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idP}/rakuten`, { genre_id: '1', article_number: '' });
+  check('メーカー型番: 空文字は明示的な解除', r.status === 200
+    && db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(idP)?.article_number == null);
   const exOf = (code) => db.prepare(
     'SELECT reason FROM draft_sku_catalog_exemptions WHERE draft_id = ? AND sku_code = ?').get(idP, code)?.reason;
   r = await call('POST', `/api/drafts/${idP}/sku-catalog-exemptions`, { ne_code: 'vc-b', reason: '3' });
@@ -6421,7 +6476,7 @@ for (const [name, file, data] of renders) {
         setTimeout, console,
       };
       vm.createContext(ctx);
-      const api = new vm.Script(`const skuSavers = [];\n${iife}\n({ flush: async () => (await Promise.all(skuSavers.map((s) => s.flush()))).every(Boolean) })`, { filename: 'initSkuJans' }).runInContext(ctx);
+      const api = new vm.Script(`const skuSavers = [];\nlet skuSaveGeneration = 0;\n${iife}\n({ flush: () => flushSkuSavers() })`, { filename: 'initSkuJans' }).runInContext(ctx);
       return { a, b, pending, alerts, posts, flush: api.flush };
     }
     // 1) A の保存が通信中に flush → その間に B を変更 → A 成功 → B も保存されてから flush が true で戻る

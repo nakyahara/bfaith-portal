@@ -1663,7 +1663,7 @@
                   </div>
                 </th>
                 <% for (const m of variation.members) { const k = skuKeyOf(m); const v = (gridData.bySku[k] || {})[name] || ''; %>
-                  <td><input type="text" class="sku-attr-input" data-code="<%= m.商品コード %>" data-name="<%= name %>" value="<%= v %>" style="font-size:12px; padding:4px 6px;"></td>
+                  <td><input type="text" class="sku-attr-input" maxlength="300" data-code="<%= m.商品コード %>" data-name="<%= name %>" value="<%= v %>" style="font-size:12px; padding:4px 6px;" title="複数の値は | (縦棒) で区切る"></td>
                 <% } %>
               </tr>
             <% } %>
@@ -3005,7 +3005,8 @@
   // SKU ごとの即保存ワーカー一覧 (JAN / 商品仕様 / IDなしの理由。createSkuSaver が登録する)。
   // 未保存の変更を確定して全部待ち、1 件でも失敗したら false
   const skuSavers = [];
-  const flushSkuJanSaves = async () => (await Promise.all(skuSavers.map((s) => s.flush()))).every(Boolean);
+  let skuSaveGeneration = 0;   // change が来るたびに +1 (全ワーカーを通した安定確認に使う)
+  const flushSkuJanSaves = () => flushSkuSavers();
   async function saveRakutenFields() {
     // JAN (単品欄 / SKU表) の保存を先に確定させる。失敗したらプレビュー・登録に進まない (Codex R2 high)
     if (!(await saveJanIfChanged())) return false;
@@ -3483,7 +3484,7 @@
     function register(input) {
       list.push(input);
       lastOf.set(input, input.value.trim());
-      input.addEventListener('change', () => { drain(); });
+      input.addEventListener('change', () => { skuSaveGeneration += 1; drain(); });
     }
     // 戻り値: 'ok' = 保存した / 'rejected' = サーバーが拒否 (DB は旧値のまま) / 'unknown' = DB の値が不明 (drain を止める)
     async function saveOne(input) {
@@ -3539,6 +3540,7 @@
     }
     const saver = {
       register,
+      isDirty: () => dirtyInputs().length > 0,
       // 一括入力など別経路で保存済みにした値を「DB の値」として覚える
       markSaved(input, value) { uncertain.delete(input); lastOf.set(input, value); },
       // プレビュー・登録・出品情報保存の前に呼ばれる。(合流した) drain の開始以降に 1 件でも失敗していたら /
@@ -3551,6 +3553,17 @@
     (inputs || []).forEach(register);
     skuSavers.push(saver);
     return saver;
+  }
+  // 全ワーカーを通した安定状態まで待つ (Codex R1 high: Promise.all 一発だと、先に終わったワーカーへ
+  // 待機中に入った変更を待たずに登録へ進める)。変更の無い一巡が取れたら true
+  async function flushSkuSavers() {
+    for (let i = 0; i < 10; i++) {
+      const gen = skuSaveGeneration;
+      const ok = (await Promise.all(skuSavers.map((s) => s.flush()))).every(Boolean);
+      if (!ok) return false;
+      if (gen === skuSaveGeneration && skuSavers.every((s) => !s.isDirty())) return true;
+    }
+    return false;
   }
 
   // ─── SKU別JAN (2026-08-28 中原さん要望)。入力欄を離れたら即保存 ───
@@ -3633,6 +3646,8 @@
         input.className = 'sku-attr-input';
         input.dataset.code = code;
         input.dataset.name = name;
+        input.maxLength = 300;
+        input.title = '複数の値は | (縦棒) で区切る';
         input.style.cssText = 'font-size:12px; padding:4px 6px;';
         td.appendChild(input);
         tr.appendChild(td);

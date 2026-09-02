@@ -261,9 +261,10 @@ router.get('/detail/:id', (req, res) => {
   const rakutenRowForGrid = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
   const gridRaw = (variation.kind === 'variation' && variation.memberCount > 1)
     ? skuAttributeGrid(db, draft.id, rakutenRowForGrid, variation.members) : { names: [], bySku: new Map() };
+  // セルの表示は複数値を「 | 」で結ぶ (RMS の商品仕様と同じ区切り。保存時は | で分けて配列に戻す)
   const skuAttrGrid = {
     names: gridRaw.names,
-    bySku: Object.fromEntries([...gridRaw.bySku.entries()].map(([k, m]) => [k, Object.fromEntries(m.entries())])),
+    bySku: Object.fromEntries([...gridRaw.bySku.entries()].map(([k, m]) => [k, Object.fromEntries([...m.entries()].map(([n, vals]) => [n, vals.join(' | ')]))])),
   };
   const skuExemptions = {};
   for (const r of db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?').all(draft.id)) {
@@ -1042,10 +1043,14 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   if (genreId && !/^\d+$/.test(genreId)) {
     return res.status(400).json({ ok: false, error: 'ジャンルIDは数字で入力してください' });
   }
-  // メーカー型番は attributes の検証でも使うので、ここで先に読む
-  let articleNumber = cleanText(req.body?.article_number, 100);
   // 既存の属性は複数の判定で使うので先に読む
-  const prevRkRow = db.prepare('SELECT attributes_json, catalog_id_exemption_reason, variant_selector_name FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  const prevRkRow = db.prepare('SELECT attributes_json, article_number, catalog_id_exemption_reason, variant_selector_name FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  // メーカー型番は attributes の検証でも使うので、ここで先に読む。
+  // **送ってこない呼び出しでは既存を維持する** (Codex R1 high: バリエーションの画面には欄が無く送らないので、
+  // null で上書きすると SKU 表の既定値 = ページ共通の型番が消える)。'' = 型番なし (明示的な解除)
+  let articleNumber = req.body?.article_number !== undefined
+    ? cleanText(req.body.article_number, 100)
+    : (prevRkRow?.article_number ?? null);
   // 項目選択肢の見出し (カラバリ。「種類」「カラー」など)。送ってこなければ既存を維持する
   let variantSelectorName = prevRkRow?.variant_selector_name ?? null;
   if (req.body?.variant_selector_name !== undefined) {
@@ -1959,12 +1964,16 @@ router.post('/api/drafts/:id/sku-jans', (req, res) => {
 router.post('/api/drafts/:id/sku-attributes', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  const name = cleanText(req.body?.name, 100);
+  // 上限超過は黙って切り詰めず 400 (Codex R1 medium: 切り詰めると画面の値と DB が食い違ったまま保存済み扱いになる)
+  const rawName = String(req.body?.name ?? '').trim();
+  if (rawName.length > 100) return res.status(400).json({ ok: false, error: '項目名は100文字以内で入力してください' });
+  const name = cleanText(rawName, 100);
   if (!name) return res.status(400).json({ ok: false, error: '項目名が必要です' });
   if (name === 'カタログID') {
     return res.status(400).json({ ok: false, error: 'カタログID (JAN) は商品仕様ではなく表の「カタログID」の行で入力してください' });
   }
-  const value = cleanText(req.body?.value, 300) || ''; // '' = 明示的に空 (cleanText は空を null にするので戻す。NOT NULL 列)
+  const value = String(req.body?.value ?? '').trim(); // '' = 明示的に空 (NOT NULL 列)
+  if (value.length > 300) return res.status(400).json({ ok: false, error: '値は300文字以内で入力してください' });
   const all = req.body?.all === true;
   const code = all ? '' : cleanText(req.body?.ne_code, 100);
   if (!all && !code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
