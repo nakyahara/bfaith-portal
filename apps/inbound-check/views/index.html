@@ -66,11 +66,13 @@
     .line .thumb .ph { color: #ced4da; font-size: 1.5em; }
     .line { cursor: pointer; }
     .line .body { flex: 1; min-width: 0; }
-    /* 詳細を開く印。行の縦中央・押せる大きさ (ボタンの下に置くと親指が届かない) */
-    .line .chev-line { flex: 0 0 auto; align-self: center; color: #868e96; font-size: 0.85em;
-      border: 1px solid #dee2e6; border-radius: 8px; padding: 10px 8px; background: #fff;
-      white-space: nowrap; writing-mode: vertical-rl; text-orientation: upright; letter-spacing: 1px; }
-    .row.open > .line .chev-line { border-color: #1c7ed6; color: #1c7ed6; background: #e7f5ff; }
+    /* 詳細を開く印。タグ行の右端に置く (行の中・横書き。縦書きの別枠は場所が遠かった) */
+    .line .tagrow { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+    .line .tagrow .tags { margin-top: 0; flex: 1 1 auto; min-width: 0; }
+    .line .chev-line { flex: 0 0 auto; color: #868e96; font-size: 0.85em; font-family: inherit;
+      border: 1px solid #dee2e6; border-radius: 8px; padding: 8px 12px; background: #fff;
+      white-space: nowrap; cursor: pointer; }
+    .row.open .chev-line { border-color: #1c7ed6; color: #1c7ed6; background: #e7f5ff; }
     .line .name { font-size: 1.05em; line-height: 1.35; word-break: break-all; font-weight: 600; }
     .line .sub { font-size: 0.85em; color: #868e96; margin-top: 3px; }
     .line .sub b { color: #1864ab; font-size: 1.15em; }
@@ -565,13 +567,14 @@
         + '<div class="body">'
         + '<div class="name">' + esc(l.product_name) + '</div>'
         + qtySub(l)
-        + '<div class="tags">' + tagsHtml(l) + '</div>'
+        // 詳細を開く印は**タグ行の右端**に置く (2026-09-02 中原さん: 行の中のここ、と指定)。
+        // タグが折り返しても縦位置がぶれないよう、タグ群と横並びにして右寄せする
+        + '<div class="tagrow"><div class="tags">' + tagsHtml(l) + '</div>'
+        + '<button type="button" class="chev-line" data-act="detail">' + (open ? '詳細▲' : '詳細▼') + '</button></div>'
         + (checked ? '<div class="who">✅ ' + esc(l.checked_by || '') + ' ' + esc(fmtJst(l.checked_at)) + '</div>' : '')
         + (!checked && l.prev_checked ? '<div class="prev">前回 ' + esc(fmtJst(l.prev_checked.at)) + ' に ' + esc(l.prev_checked.by || '') + ' が確認済み (今日は未確認)</div>' : '')
         + '</div>'
-        + '<div class="act">' + mainBtnHtml(l) + plusBtnHtml(l) + sendingHtml(l) + '</div>'
-        // 詳細を開く印は行の縦中央に置く (ボタンの下だと押しにくい — 中原さん 2026-09-02)
-        + '<div class="chev-line">' + (open ? '詳細▲' : '詳細▼') + '</div></div>'
+        + '<div class="act">' + mainBtnHtml(l) + plusBtnHtml(l) + sendingHtml(l) + '</div></div>'
         + '<div class="detail">' + (open ? detailHtml(l) : '') + '</div>'
         + '</div>';
     }
