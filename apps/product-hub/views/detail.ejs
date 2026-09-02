@@ -2035,8 +2035,9 @@
       name: document.getElementById('f-name').value,
       official_url: document.getElementById('f-official-url').value,
       price: document.getElementById('f-price').value,
-      // JAN欄は単品だけ (バリエーションは SKU表 → /sku-jans)。欄が無ければ送らない = サーバーは既存値を保持
-      ...(document.getElementById('f-jan') ? { jan_code: document.getElementById('f-jan').value } : {}),
+      // JAN (単品欄) は直前の saveRakutenFields → saveJanIfChanged で保存済みなので、ここでは送らない
+      // (送ると同じ値を二重に保存し、更新ログと Notion 同期が 2 回走る — Codex R2 low)。
+      // バリエーションは SKU表 → /sku-jans。どちらも未送信 = サーバーは既存値を保持
       asin: document.getElementById('f-asin').value,
       amazon_url: document.getElementById('f-amazon-url').value,
       own_brand: document.getElementById('f-own-brand').checked,
@@ -2849,18 +2850,35 @@
   // プレビュー・登録・出品情報の保存はすべて saveRakutenFields を通るので、ここで JAN の変更を先に
   // 基本情報 API へ送る (Codex R1 high: 画面の確認表示は新値なのに payload が旧 jan_code で組まれていた)
   let lastSavedJan = document.getElementById('f-jan') ? document.getElementById('f-jan').value.trim() : null;
-  async function saveJanIfChanged() {
-    const el = document.getElementById('f-jan');
-    if (!el) return true; // バリエーションは SKU表 → /sku-jans で入力時に保存済み
-    const value = el.value.trim();
-    if (value === lastSavedJan) return true;
-    const json = await post(BASE, { jan_code: value });
-    if (!json.ok) { alert(json.error || 'JANコードの保存に失敗しました'); return false; }
-    lastSavedJan = value;
-    return true;
+  // 保存は 1 本のチェーンで直列化し、保存中に打ち直された分も取り切ってから戻る
+  // (Codex R2 high: A を保存している間に B へ変えると、画面は B なのに payload が A で登録される)
+  let janSaveChain = Promise.resolve(true);
+  function saveJanIfChanged() {
+    janSaveChain = janSaveChain.then(async () => {
+      const el = document.getElementById('f-jan');
+      if (!el) return true; // バリエーションは SKU表 → /sku-jans (flushSkuJanSaves で待つ)
+      for (let i = 0; i < 5; i++) {
+        const value = el.value.trim();
+        if (value === lastSavedJan) return true;
+        let json;
+        try {
+          json = await post(BASE, { jan_code: value });
+        } catch (e) {
+          json = { ok: false, error: '通信エラーでJANコードを保存できませんでした' }; // Codex R2 medium
+        }
+        if (!json.ok) { alert(json.error || 'JANコードの保存に失敗しました'); return false; }
+        lastSavedJan = value;
+      }
+      return el.value.trim() === lastSavedJan;
+    });
+    return janSaveChain;
   }
+  // SKU別JAN の保存キュー (initSkuJans が差し替える)。未保存の変更を確定して全部待ち、1 件でも失敗したら false
+  let flushSkuJanSaves = async () => true;
   async function saveRakutenFields() {
+    // JAN (単品欄 / SKU表) の保存を先に確定させる。失敗したらプレビュー・登録に進まない (Codex R2 high)
     if (!(await saveJanIfChanged())) return false;
+    if (!(await flushSkuJanSaves())) return false;
     const json = await post(BASE + '/rakuten', collectRakutenFields());
     if (!json.ok) { alert(json.error || '保存に失敗しました'); return false; }
     return true;
@@ -3324,34 +3342,43 @@
     if (inputs.length === 0) return;
     const result = document.getElementById('rk-result');
     let saveChain = Promise.resolve(); // POST は1本ずつ (並行保存の後勝ち上書き防止)
-    inputs.forEach((input) => {
-      let last = input.value.trim();
-      async function save(value) {
-        if (value === last) return;
-        let json;
-        try {
-          json = await post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value });
-        } catch (e) {
-          json = { ok: false, error: '通信エラーでJANコードを保存できませんでした' };
-        }
-        if (!json.ok) {
-          alert(json.error || 'JANコードの保存に失敗しました');
-          // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ巻き戻す。
-          // 巻き戻したら確認表示 (カテゴリ・属性タブのカタログID) と必須バッジも DB の値に合わせる (Codex R1 low)
-          if (input.value.trim() === value) {
-            input.value = last;
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-          return;
-        }
-        last = value;
-        if (result) result.textContent = 'JANコードを保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
+    const lastOf = new Map(inputs.map((i) => [i, i.value.trim()])); // 保存済みの値 (= DB の値)
+    let failedSinceFlush = false;
+    async function save(input, value) {
+      if (value === lastOf.get(input)) return;
+      let json;
+      try {
+        json = await post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value });
+      } catch (e) {
+        json = { ok: false, error: '通信エラーでJANコードを保存できませんでした' };
       }
-      input.addEventListener('change', () => {
-        const value = input.value.trim();
-        saveChain = saveChain.then(() => save(value));
-      });
-    });
+      if (!json.ok) {
+        failedSinceFlush = true;
+        alert(json.error || 'JANコードの保存に失敗しました');
+        // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ巻き戻す。
+        // 巻き戻したら確認表示 (カテゴリ・属性タブのカタログID) と必須バッジも DB の値に合わせる (Codex R1 low)
+        if (input.value.trim() === value) {
+          input.value = lastOf.get(input);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        return;
+      }
+      lastOf.set(input, value);
+      if (result) result.textContent = 'JANコードを保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
+    }
+    function enqueue(input) {
+      const value = input.value.trim();
+      saveChain = saveChain.then(() => save(input, value));
+    }
+    inputs.forEach((input) => input.addEventListener('change', () => enqueue(input)));
+    // プレビュー・登録・出品情報保存の前に呼ばれる (saveRakutenFields)。未保存の変更を確定してキューを
+    // 待ち切り、1 件でも失敗していたら false (Codex R2 high: change 保存と登録が並行して旧 JAN で進んでいた)
+    flushSkuJanSaves = async () => {
+      failedSinceFlush = false;
+      inputs.forEach((input) => { if (input.value.trim() !== lastOf.get(input)) enqueue(input); });
+      await saveChain;
+      return !failedSinceFlush;
+    };
   })();
 
   // カタログID (カテゴリ・属性タブ) は確認表示だけ。入力は基本情報タブ (単品=JAN欄 / バリエーション=SKU表)
