@@ -57,7 +57,7 @@ const PRIORITY_RANK = { urgent: 0, new: 1, normal: 2, unknown: 3, calm: 4 };
  * スナップショット (Notion プロパティ) で代用し、source で区別する。
  * missing = 現場が作業を始めるのに足りない項目 (⚠未登録バッジの根拠)
  */
-function masterOf(wm, props) {
+export function masterOf(wm, props) {
   // ⭐項目単位でカード値へフォールバックする (Codex PR4 #1: マスタ行が「動画だけ」でも、
   //   カードに載っている資材・入数の表示を消さない)。version はマスタ行の有無で決まる
   const card = {

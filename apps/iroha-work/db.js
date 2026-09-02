@@ -199,6 +199,11 @@ export function createTables(db = getMirrorDB()) {
   // 作業開始時点の作業仕様スナップショット (§1.7 ④: 後で仕様が変わっても
   // 「当時何を見て作業したか」を残す。JSON)
   addCol('f_iroha_work_sessions', 'master_snapshot', 'TEXT');
+  // video_url は inbound-check 側でも足すが、いろは単独経路の起動でも保証する
+  // (このアプリが先に f_iroha_work_master を SELECT すると no such column になるため)
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get()) {
+    addCol('f_iroha_work_master', 'video_url', 'TEXT');
+  }
 
   // 「1作業者につき活動中セッション1件」は**DBの制約**で保証する (Codex PR2 #1:
   // アプリ側のトランザクション検査だけだと、将来の別経路・移行コードから重複を作れる)。
@@ -397,7 +402,7 @@ export const SESSION_WARN_HOURS = 6;
  * 作業開始。⭐1作業者につき活動中セッションは1件 (要件定義 §1.7 ⑤)。
  * 別カードで作業中なら busy (どのカードかを返す — 画面が誘導する)
  */
-export function startSession({ pageId, productCode = null, title = null, worker, deviceLabel = null }) {
+export function startSession({ pageId, productCode = null, title = null, worker, deviceLabel = null, masterSnapshot = undefined }) {
   const db = getDB();
   const now = utcNow();
   return db.transaction(() => {
@@ -410,13 +415,19 @@ export function startSession({ pageId, productCode = null, title = null, worker,
       return { ok: false, error: 'busy', open,
         message: `「${open.title_snapshot || '別のカード'}」の作業がまだ終わっていません。先にそちらを終了・中断してください` };
     }
-    // 開始時点の作業仕様を残す (§1.7 ④)。マスタ未登録なら null (それも事実)
+    // 開始時点の作業仕様を残す (§1.7 ④)。呼び元 (router) が「画面に見えていた実効値」
+    // (マスタ+カードのフォールバック合成 = service.masterOf) を渡す — Codex PR4-R2 #1。
+    // 渡されなければマスタ行の生値で代用 (テスト・移行経路用)
     let snapshot = null;
-    const hasWm = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get();
-    if (productCode && hasWm) {
-      const wm = db.prepare('SELECT material_code, storage_container, units_per_container, process_count, note, video_url, version FROM f_iroha_work_master WHERE code_key = ?')
-        .get(String(productCode).trim().toLowerCase());
-      if (wm) snapshot = JSON.stringify(wm);
+    if (masterSnapshot !== undefined) {
+      snapshot = masterSnapshot == null ? null : JSON.stringify(masterSnapshot);
+    } else {
+      const hasWm = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get();
+      if (productCode && hasWm) {
+        const wm = db.prepare('SELECT material_code, storage_container, units_per_container, process_count, note, video_url, version FROM f_iroha_work_master WHERE code_key = ?')
+          .get(String(productCode).trim().toLowerCase());
+        if (wm) snapshot = JSON.stringify(wm);
+      }
     }
     const info = db.prepare(`INSERT INTO f_iroha_work_sessions
       (page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, master_snapshot)

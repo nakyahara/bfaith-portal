@@ -694,6 +694,14 @@ console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動�
   ok(snap.material_code === 'D-8' && snap.video_url === 'https://youtu.be/abc',
     '開始時点の作業仕様がセッションに残る (§1.7 ④)');
   stopSession({ pageId: 'snap-p1', workerId: wS.id, sessionId: sS.sessionId, reason: 'done' });
+
+  // routerが渡す「実効値」スナップショット (フォールバック合成) がそのまま保存される
+  const sS2 = startSession({ pageId: 'snap-p2', productCode: 'PROD-NEW', title: '新商品',
+    worker: getIrohaWorker(wS.id), masterSnapshot: { source: 'master', material_code: 'D-8', units_per_container: 180 } });
+  const snap2 = JSON.parse(db3.prepare('SELECT master_snapshot FROM f_iroha_work_sessions WHERE id = ?').get(sS2.sessionId).master_snapshot);
+  ok(snap2.material_code === 'D-8' && snap2.units_per_container === 180,
+    '呼び元が渡した実効値 (カードフォールバック込み) を保存 (PR4-R2 #1)');
+  stopSession({ pageId: 'snap-p2', workerId: wS.id, sessionId: sS2.sessionId, reason: 'done' });
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

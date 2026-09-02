@@ -27,7 +27,7 @@ import {
   getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
-import { buildList, classifyMasterEdit, clearEnrichCache } from './service.js';
+import { buildList, classifyMasterEdit, clearEnrichCache, masterOf } from './service.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import {
   addMedia, softDeleteMedia, countActivePhotos, resetMedia, listMediaForAdmin, schedule as scheduleMedia,
@@ -356,9 +356,10 @@ router.post('/api/master', checkOrigin, api((req, res) => {
         }
         cur = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
         expect = cur.version;
-        // カード表示中の値をシード (今回指定されなかった項目だけ)。空欄埋め扱いなので権限は不要
+        // カード表示中の値をシード (今回指定されなかった項目だけ)。空欄埋め扱いなので権限は不要。
+        // ⚠シード元カードの商品コードが今回の商品と一致するときだけ (別商品のカード値を混ぜない)
         const card = getCachePage(String(req.body?.page_id || ''));
-        if (card) {
+        if (card && codeKeyOf(card.product_code) === k) {
           let props = {};
           try { props = JSON.parse(card.payload || '{}'); } catch { /* 壊れていればシードなし */ }
           const seed = {
@@ -376,21 +377,23 @@ router.post('/api/master', checkOrigin, api((req, res) => {
         const msg = r.error === 'conflict' ? '他の人が先に更新しました。最新の内容を読み込みます' : r.message;
         const e = new Error(msg); e[rollback] = { status: st, body: { ok: false, error: r.error, message: msg, currentVersion: r.currentVersion } }; throw e;
       }
-      return r;
+      return { ...r, applyFields };
     }).immediate();
   } catch (e) {
     if (e[rollback]) return res.status(e[rollback].status).json(e[rollback].body);
     throw e;
   }
 
-  // 履歴は旧値→新値をJSONで残す (項目名だけだと復元できない — Codex PR4 #6)
+  // 履歴は旧値→新値をJSONで残す (項目名だけだと復元できない — Codex PR4 #6)。
+  // シードで書いた項目も含め、実際に適用した applyFields を対象に。切り詰めない
+  // (入力は各フィールド上限500字までなのでJSON全体でも高々数KB — 途中切断で壊れたJSONを残さない)
   const oldVals = {}; const newVals = {};
-  for (const f of [...fills, ...overwrites]) { oldVals[f] = row ? row[f] : null; newVals[f] = result.row[f]; }
+  for (const f of Object.keys(result.applyFields)) { oldVals[f] = row ? row[f] : null; newVals[f] = result.row[f]; }
   safeLog({
     action: 'master_edit', pageId: String(req.body?.page_id || '') || null,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
-    from: JSON.stringify({ code, ...oldVals }).slice(0, 500),
-    to: JSON.stringify({ v: result.row.version, ...newVals }).slice(0, 500),
+    from: JSON.stringify({ code, ...oldVals }),
+    to: JSON.stringify({ v: result.row.version, ...newVals }),
     ok: true,
   });
   clearEnrichCache();   // 次の /api/state から新しい作業仕様で出す
@@ -491,9 +494,18 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   if (card.status === '棚入完了') return res.status(409).json({ ok: false, error: 'done_card', message: 'このカードは棚入完了です (作業をはじめるなら職員がステータスを戻してください)' });
   if (card.status === '取消') return res.status(409).json({ ok: false, error: 'cancelled_card', message: 'このカードは取消済みです' });
 
+  // スナップショット (§1.7 ④) は「画面に見えていた実効値」= マスタ+カードのフォールバック合成
+  let snapshot = null;
+  if (card.product_code) {
+    let props = {};
+    try { props = JSON.parse(card.payload || '{}'); } catch { /* 壊れていれば props なしで合成 */ }
+    const wm = getDB().prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?')
+      .get(String(card.product_code).trim().toLowerCase());
+    snapshot = masterOf(wm || null, props);
+  }
   const r = startSession({
     pageId, productCode: card.product_code, title: card.title,
-    worker: w.worker, deviceLabel: deviceLabelOf(req),
+    worker: w.worker, deviceLabel: deviceLabelOf(req), masterSnapshot: snapshot,
   });
   if (!r.already) {
     safeLog({ action: 'session_start', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
