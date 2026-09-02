@@ -864,7 +864,7 @@ export function getState() {
   // 業務日が変わったのに当日の取込がまだ来ていない = 前日の一覧。数量操作は受け付けない
   const dayStale = !!(batch.work_date && batch.work_date !== workDateJst());
   return {
-    batch, slips, lines, day_stale: dayStale,
+    batch, slips, lines, day_stale: dayStale, field_options: fieldOptions(),
     totals: { lines: lines.length, checked, partial, undecided, toIroha: ir ? ir.c : 0, toIrohaQty: ir ? Number(ir.q) : 0 },
   };
 }
@@ -1334,6 +1334,53 @@ export function reopenLine({ batchId, lineKey, expectVersion, expectQuantityVers
     }
     throw e;
   }
+}
+
+// ─────────────────── 入庫情報の選択肢 ───────────────────
+
+// 現場が実際に使っている表記。**専用の表は作らない** — 選択肢は f_inbound_info の
+// 実データから作り、新しい値を保存したら次から選択肢に並ぶ (自分で育つ)。
+// この定数は「まだ1件も入っていない列でも空にしない」ための土台
+const FIELD_SEEDS = {
+  いろは在庫化作業有無: ['有り', '無し', '状況による'],
+  入庫時BCシール貼りフラグ: ['BCシール貼付必要', '不要'],
+  直接ピックロケ保管: ['直接ピックロケ', '無'],
+  BF保管荷姿: ['そのまま', 'バラ', '内箱で保管', '20L折りコン入替', '120サイズ入替'],
+};
+export const OPTION_FIELDS = Object.keys(FIELD_SEEDS);
+// いろは=有り のとき他項目に入る「未記入」の印。選択肢には出さない
+const NA_MARK = String.fromCharCode(0xFF0D);
+
+/**
+ * 詳細パネルのプルダウンに出す選択肢。
+ *
+ * 中原さん 2026-09-02:「自由に入れられる形をやめてセレクトにしてほしい (文字を消さないと
+ * 入れられないので)。自由に入れる場合は『新規で登録』を選ぶと入れられて、それが登録されると
+ * 選択肢が増えるようにしたい」
+ *
+ * ⭐**よく使われている順**に並べる (件数の多い表記が上)。現場が普段使う値が上に来る。
+ *   種類が増えすぎないよう1列あたり上位30件まで。土台の値は必ず含める
+ */
+export function fieldOptions() {
+  const db = getDB();
+  const out = {};
+  const has = tableExists(db, 'f_inbound_info');
+  for (const [field, seeds] of Object.entries(FIELD_SEEDS)) {
+    const seen = new Map();   // 表記ゆれを潰さない (現場の表記をそのまま出す) が、完全一致の重複だけまとめる
+    if (has) {
+      // 列名は固定の4つだけ (FIELD_SEEDS のキー) なので SQL への埋め込みは安全
+      const rows = db.prepare(`SELECT ${field} AS v, COUNT(*) AS n FROM f_inbound_info
+        WHERE ${field} IS NOT NULL AND trim(${field}) <> '' AND trim(${field}) <> ?
+        GROUP BY v ORDER BY n DESC, v LIMIT 30`).all(NA_MARK);
+      for (const r of rows) {
+        const v = String(r.v || '').trim();
+        if (v) seen.set(v, r.n);
+      }
+    }
+    for (const s of seeds) if (!seen.has(s)) seen.set(s, 0);
+    out[field] = [...seen.keys()];
+  }
+  return out;
 }
 
 // ─────────────────── 完了した伝票の一覧 (棚入れ・確認用) ───────────────────

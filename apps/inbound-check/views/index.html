@@ -27,6 +27,10 @@
     .seg { display: inline-flex; border: 1px solid #ced4da; border-radius: 8px; overflow: hidden; }
     .seg button { border: 0; background: #fff; padding: 8px 14px; font-size: 0.95em; cursor: pointer; }
     .seg button.on { background: #1c7ed6; color: #fff; }
+    /* 手で読み直す。5秒ポーリングはあるが、他の人の操作を「いま」反映したいことがある */
+    .btn-reload { border: 1px solid #ced4da; border-radius: 8px; background: #fff; padding: 8px 14px;
+      font-size: 0.95em; cursor: pointer; white-space: nowrap; }
+    .btn-reload:disabled { opacity: 0.5; }
     .search { flex: 1; min-width: 160px; padding: 8px 10px; font-size: 1em; border: 1px solid #ced4da; border-radius: 8px; }
     .banner { display: none; margin: 8px 12px 0; padding: 10px 12px; border-radius: 8px; font-size: 0.92em; }
     .banner.warn { display: block; background: #fff3bf; color: #7a5c00; }
@@ -232,6 +236,7 @@
       <button class="worker none" id="workerBtn" type="button">👤 作業者を選ぶ</button>
     </div>
     <div class="ctl">
+      <button type="button" class="btn-reload" id="reloadBtn">🔄 更新</button>
       <div class="seg">
         <button type="button" data-filter="todo" class="on">残りあり</button>
         <button type="button" data-filter="all">すべて</button>
@@ -696,6 +701,29 @@
         + '</div><div class="note">' + esc(src) + '。「あり」の商品は、確認するときに有効期限を選んでもらいます</div></div>';
     }
 
+    // ⭐入力欄ではなく**プルダウン**で選ばせる。
+    //   中原さん 2026-09-02:「自由に入れられる形をやめてセレクトにしてほしい (文字を消さないと
+    //   入れられないので)。自由に入れる場合は『新規で登録』を選ぶと入れられて、それが登録されると
+    //   選択肢が増えるようにしたい」
+    //   → 選択肢は state.field_options (= 入庫情報の実データ + 土台の値)。新しい値を保存すると
+     //     次の取得から選択肢に並ぶので、覚えておく仕組みは要らない
+    const NEW_OPT = '__new__';
+
+    function selectHtml(field, current, { disabled = false, blankLabel = "(未設定)" } = {}) {
+      const opts = (state.field_options && state.field_options[field]) || [];
+      const cur = String(current == null ? "" : current).trim();
+      // 現在値が選択肢に無いこともある (他所で入った表記)。消さないよう先頭に足す
+      const list = cur && !opts.includes(cur) ? [cur, ...opts] : opts;
+      const dis = disabled ? " disabled" : "";
+      return '<select data-f="' + esc(field) + '" data-sel="1"' + dis + '>'
+        + '<option value=""' + (cur === "" ? " selected" : "") + '>' + esc(blankLabel) + '</option>'
+        + list.map(o => '<option value="' + esc(o) + '"' + (o === cur ? " selected" : "") + '>' + esc(o) + '</option>').join("")
+        + '<option value="' + NEW_OPT + '">➕ 新規で登録…</option>'
+        + '</select>'
+        // 「新規で登録」を選んだときだけ出る入力欄。選択肢に無い表記はここから増やす
+        + '<input type="text" class="new-val" data-newfor="' + esc(field) + '" placeholder="新しい表記を入力" style="display:none;margin-top:6px">';
+    }
+
     function detailInfoHtml(l) {
       const i = l.info;
       const img = '<div class="big">' + thumbHtml(l, true) + '</div>';
@@ -708,7 +736,6 @@
           + '</div></div>';
       }
       const locked = irohaLocked(i.iroha);
-      const dis = locked ? ' disabled' : '';
       const v = s => esc(s == null ? '' : s);
       return '<div class="dgrid">' + img + '<div class="fields">'
         + expiryHtml(l)
@@ -716,14 +743,14 @@
         + '<input type="number" inputmode="numeric" min="1" step="1" data-f="入数" value="' + (Number.isInteger(i.irisu) ? i.irisu : '') + '" placeholder="未登録">'
         + '<div class="note">予定 ' + l.planned_qty + ' 個。空欄にすると「未登録」に戻ります</div></div>'
         + '<div class="fld"><label>いろは在庫化作業有無</label>'
-        + '<input type="text" list="dl-iroha" data-f="いろは在庫化作業有無" value="' + v(i.iroha) + '" placeholder="無し">'
+        + selectHtml('いろは在庫化作業有無', i.iroha, { blankLabel: '(未設定)' })
         + '<div class="note">「有り」にすると、いろはで在庫化するため下の3項目は自動で「' + IROHA_NA + '」になります</div></div>'
         + '<div class="fld"><label>入庫時BCシール貼りフラグ</label>'
-        + '<input type="text" list="dl-bc" data-f="入庫時BCシール貼りフラグ" value="' + v(i.bc_seal) + '"' + dis + '></div>'
+        + selectHtml('入庫時BCシール貼りフラグ', i.bc_seal, { disabled: locked }) + '</div>'
         + '<div class="fld"><label>直接ピックロケ保管</label>'
-        + '<input type="text" list="dl-pick" data-f="直接ピックロケ保管" value="' + v(i.direct_pick) + '"' + dis + '></div>'
+        + selectHtml('直接ピックロケ保管', i.direct_pick, { disabled: locked }) + '</div>'
         + '<div class="fld"><label>BF保管荷姿</label>'
-        + '<input type="text" list="dl-form" data-f="BF保管荷姿" value="' + v(i.storage_form) + '"' + dis + '></div>'
+        + selectHtml('BF保管荷姿', i.storage_form, { disabled: locked }) + '</div>'
         + '<div class="fld"><label>メモ</label>'
         + '<textarea data-f="memo" placeholder="現場への申し送りなど">' + v(i.memo) + '</textarea></div>'
         + '<div class="dact"><button type="button" class="primary" data-act="save">保存</button>'
@@ -957,6 +984,14 @@
       for (const el of rowEl.querySelectorAll('[data-f]')) {
         const name = el.getAttribute('data-f');
         if (el.disabled) continue;   // いろは=有り で固定される項目はサーバー側が決める
+        if (el.getAttribute('data-sel') === '1' && el.value === NEW_OPT) {
+          // 「新規で登録」を選んだのに何も入れていない = 保存しない (空で上書きしない)
+          const box = rowEl.querySelector('[data-newfor="' + name + '"]');
+          const v = box ? String(box.value || '').trim() : '';
+          if (!v) { detailMsg(rowEl, 'err', '「' + name + '」の新しい表記を入力してください'); return; }
+          fields[name] = v;
+          continue;
+        }
         fields[name] = el.value;
       }
       const btn = rowEl.querySelector('[data-act="save"]');
@@ -977,7 +1012,10 @@
         }
         applyInfoRow(line.code_key, j.row);
         editDirty = false;
-        render();
+        // 保存したら閉じる (中原さん 2026-09-02)。開いたままだと一覧に戻るのに毎回もう一度押すことになる
+        openMode.delete(line.line_key);
+        lastJson = '';   // 新しい表記を選択肢に反映するため、次の取得で state を作り直す
+        render(true);
         banner('ok', '「' + esc(line.product_name) + '」の入庫情報を保存しました');
         setTimeout(() => { if ($('#banner').classList.contains('ok')) banner(null); }, 4000);
       } catch (e) {
@@ -1369,6 +1407,26 @@
     }
 
     // 数量パネルの入力は打ちかけを控える (ポーリングの再描画で消えないように)
+    $('#list').addEventListener('change', (ev) => {
+      const f = ev.target.closest('[data-sel="1"]');
+      if (!f) return;
+      editDirty = true;
+      toggleNewInput(f);
+      if (f.getAttribute('data-f') === 'いろは在庫化作業有無') applyIrohaLock(f.closest('.row'));
+    });
+
+    // 「➕ 新規で登録…」のときだけ入力欄を見せて、そこに入った文字を保存値として使う
+    function toggleNewInput(sel) {
+      const row = sel.closest('.row');
+      const field = sel.getAttribute('data-f');
+      const box = row && row.querySelector('[data-newfor="' + field + '"]');
+      if (!box) return;
+      const on = sel.value === NEW_OPT;
+      box.style.display = on ? '' : 'none';
+      if (on) { try { box.focus(); } catch { /* iOS で失敗しても入力はできる */ } }
+      else box.value = '';
+    }
+
     $('#list').addEventListener('input', (ev) => {
       const q = ev.target.closest('[data-q]');
       if (q) {
@@ -1384,6 +1442,8 @@
       const f = ev.target.closest('[data-f]');
       if (!f) return;
       editDirty = true;
+      // 「➕ 新規で登録…」を選んだときだけ入力欄を出す (ふだんは選ぶだけで済ませる)
+      if (f.getAttribute('data-sel') === '1') toggleNewInput(f);
       // 「有り」にした瞬間に3項目を閉じる (保存を待たずに見た目を合わせる。書くのはサーバー)
       if (f.getAttribute('data-f') === 'いろは在庫化作業有無') applyIrohaLock(f.closest('.row'));
     });
@@ -1412,6 +1472,16 @@
       editDirty = false;
       render();
     }));
+    $('#reloadBtn').addEventListener('click', async () => {
+      const b = $('#reloadBtn');
+      b.disabled = true;
+      b.textContent = '読み込み中…';
+      // 入力中でも押した以上は読み直す。開いていた詳細は閉じる (中身が変わっている可能性があるため)
+      editDirty = false;
+      lastJson = '';
+      try { await load(); } finally { b.disabled = false; b.textContent = '🔄 更新'; }
+    });
+
     $('#q').addEventListener('input', () => { query = $('#q').value.trim(); editDirty = false; render(); });
 
     function startPolling() {

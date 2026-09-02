@@ -76,6 +76,7 @@
       </select>
       <label style="font-size:0.9em;color:#495057"><input type="checkbox" id="all"> 途中の伝票も出す</label>
       <span class="spacer"></span>
+      <button class="btn" type="button" id="reload">🔄 更新</button>
       <a class="btn" id="csv" href="#">⬇️ CSV</a>
       <button class="btn" type="button" onclick="window.print()">🖨 印刷</button>
       <a class="btn" href="/apps/inbound-check/">← 作業画面</a>
@@ -171,6 +172,11 @@
       $('#days').style.display = 'none';
       document.querySelector('h1').textContent = '📋 ' + arNo + ' 完了一覧';
     }
+    $('#reload').addEventListener('click', async () => {
+      const b = $('#reload');
+      b.disabled = true; b.textContent = '読み込み中…';
+      try { await load(); } finally { b.disabled = false; b.textContent = '🔄 更新'; }
+    });
     $('#days').addEventListener('change', load);
     $('#all').addEventListener('change', load);
     load();
