@@ -284,6 +284,20 @@ function acquireLease(db, holder, now = Date.now()) {
   return tx.immediate();
 }
 
+/**
+ * 起動時に lease を掃除する (Render はディスク付き=単一インスタンスなので、起動した時点で
+ * 他に生きている実行は存在しない)。デプロイ再起動が sweep を直撃すると lease が残り、
+ * 最大10分「別の実行が進行中」で弾かれてしまうため (2026-09-02 実機で発生)
+ */
+export function clearLeaseOnBoot() {
+  try {
+    const n = getDB().prepare('DELETE FROM f_inbound_check_notion_lease').run().changes;
+    if (n > 0) console.log('[inbound-check notion] 起動時に残っていた lease を掃除しました');
+  } catch (e) {
+    console.warn('[inbound-check notion] lease 掃除に失敗 (10分で自然回収されます):', e.message);
+  }
+}
+
 function releaseLease(db, holder) {
   try { db.prepare('DELETE FROM f_inbound_check_notion_lease WHERE id = 1 AND holder = ?').run(holder); }
   catch (e) { console.warn('[inbound-check notion] lease 解放失敗 (期限で自然回収されます):', e.message); }

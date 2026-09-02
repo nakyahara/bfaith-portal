@@ -350,11 +350,17 @@
     // 有効期限は YYYY-MM-DD か YYYY-MM (日が書かれていない商品は年月だけ)
     const fmtExpiry = s => !s ? '' : (s.length === 7 ? s.replace('-', '/') : s.slice(2).replace(/-/g, '/'));
 
-    function banner(kind, html) {
+    // sticky = ポーリング成功でも自動で消さない (Notion送信の結果など「読ませたい」通知用)。
+    // タップで閉じられる。⚠通常のerrは従来どおり回復したら自動で消す
+    let bannerSticky = false;
+    function banner(kind, html, { sticky = false } = {}) {
       const b = $('#banner');
+      bannerSticky = !!kind && sticky;
       if (!kind) { b.className = 'banner'; b.innerHTML = ''; return; }
-      b.className = 'banner ' + kind; b.innerHTML = html;
+      b.className = 'banner ' + kind + (sticky ? ' sticky' : '');
+      b.innerHTML = html + (sticky ? ' <small style="opacity:.7">(タップで閉じる)</small>' : '');
     }
+    $('#banner').addEventListener('click', () => { if (bannerSticky) banner(null); });
 
     async function load() {
       try {
@@ -370,7 +376,7 @@
         }
         // 最新の一覧を取得できた = 旧バッチ警告と通信エラーは解除
         if (stale) { stale = false; banner(null); }
-        if ($('#banner').classList.contains('err')) banner(null);
+        if ($('#banner').classList.contains('err') && !bannerSticky) banner(null);
       } catch (e) {
         banner('err', '通信できません (' + esc(e.message) + ')。表示は最後に取得した内容です');
       }
@@ -1678,8 +1684,8 @@
         if (r.status === 401) { location.href = '/login'; return; }
         if (j.ok) banner('ok', '🗂 Notionへ送りました: ' + esc(j.note || '完了'));
         else if (j.error === 'worker_required') { openWorkerPick(); banner('warn', '作業者を選んでからもう一度押してください'); }
-        else if (j.error === 'rate_limited' || j.error === 'already_running') banner('warn', '⏱ ' + esc(j.message || '実行中です。少し待ってください'));
-        else banner('err', '🗂 送信できませんでした: ' + esc(j.note || j.message || j.error || ('HTTP ' + r.status)));
+        else if (j.error === 'rate_limited' || j.error === 'already_running') banner('warn', '⏱ ' + esc(j.message || '実行中です。少し待ってください'), { sticky: true });
+        else banner('err', '🗂 送信できませんでした: ' + esc(j.note || j.message || j.error || ('HTTP ' + r.status)), { sticky: true });
         setTimeout(() => { if ($('#banner').classList.contains('ok')) banner(null); }, 6000);
       } catch (e) {
         banner('err', '🗂 通信できませんでした (' + esc(e.message) + ')');
