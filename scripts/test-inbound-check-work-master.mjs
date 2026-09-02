@@ -3,11 +3,9 @@
  *
  * 実行: node scripts/test-inbound-check-work-master.mjs
  *
- * 検証項目:
- *   1. xlsx 読み取り: IMPORTRANGE 数式セルの result 解決 / 重複コード先勝ち / FLG・数値の検証
- *   2. FLG × f_inbound_info の突合 (8区分・食い違い一覧・書き込み候補)
- *   3. 本取込 (upsert): 新規 / 変化なし / 更新で version が上がる
- *   4. seedIrohaFlags: 未設定の SKU だけに書く (行が無ければ addManual 経由・値がある行は触らない)
+ * 検証項目 (⭐在庫化必要FLG は廃止 — 中原さん 2026-09-02。列があっても完全に読み飛ばす):
+ *   1. xlsx 読み取り: IMPORTRANGE 数式セルの result 解決 / 重複コード先勝ち / 数値の検証
+ *   3. 本取込 (全置換): 新規 / 変化なし / 更新で version が上がる / xlsx に無い行は削除
  *   5. 管理画面編集: 楽観ロック / 数値検証 / 追加は mirror_products に居る商品のみ
  *   6. Notion カードへの反映: wm があれば 資材セットID・収納容器・入数・工程数・備考 が載る
  */
@@ -31,12 +29,11 @@ const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 initMirrorDB();
 const { getDB } = await import('../apps/inbound-check/db.js');
 const {
-  parseWorkMasterXlsx, compareIrohaFlags, applyWorkMaster, seedIrohaFlags,
+  parseWorkMasterXlsx, applyWorkMaster,
   workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow, logWorkMasterImport,
   importIssueCount, computeDeletions,
 } = await import('../apps/inbound-check/work-master.js');
 const { buildCardProperties, calcExternal } = await import('../apps/inbound-check/notion-sync.js');
-const { addManual } = await import('../apps/inbound-info/db.js');
 
 console.log('DATA_DIR =', process.env.DATA_DIR);
 const db = getDB();
@@ -45,13 +42,6 @@ const db = getDB();
 const insProd = db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, updated_at)
   VALUES (?, ?, ?, '単品', '取扱中', '確定', '2026-09-02T00:00:00Z')`);
 for (let i = 1; i <= 7; i++) insProd.run(i, `PROD-${i}`, `商品${i}`);
-
-// f_inbound_info: PROD-2 = 行あり未設定 / PROD-6・7 = 有り
-for (const c of ['PROD-2', 'PROD-6', 'PROD-7']) {
-  const a = addManual(c, 'test');
-  ok(a.ok, `f_inbound_info 準備 ${c}`);
-}
-db.prepare("UPDATE f_inbound_info SET いろは在庫化作業有無 = '有り' WHERE code_key IN ('prod-6', 'prod-7')").run();
 
 // ─── xlsx を組み立てる (実ファイルと同じ列構成 + IMPORTRANGE 数式ヘッダー/セル) ───
 async function buildXlsx() {
@@ -66,7 +56,7 @@ async function buildXlsx() {
   ws.getCell(`A${ws.rowCount}`).value = { formula: 'X', result: 'PROD-1' };   // データ行の数式セル
   put(['PROD-2', '商品2', '', '', '0', '', '', '', '', '', '', '', '', '', '']);
   put(['prod-1', '重複', '', '', '1', '', '', '', '', '', '', '', '', '', '']);      // 大文字小文字違いの重複
-  put(['PROD-3', '商品3', '', '', 'x', '', '', '', '', '', '', '', '', '', '']);     // FLG 不正
+  put(['PROD-3', '商品3', '', '', 'x', '', '', '', '', '', '', '', '', '', '']);     // FLG列の値は無視される (廃止)
   put(['PROD-4', '商品4', '', '', '1', '', '', 'abc', '', '', '', '', '', '', '']);  // 入数 不正
   put(['PROD-5', '商品5', '', '', '1', 'T7-18', '9Lコンテナ', 80, 1, '', '', '', '', '', '']);
   put(['PROD-6', '商品6', '', '', '1', '', '', '', '', '', '', '', '', '', '']);
@@ -87,12 +77,11 @@ const parsed = await parseWorkMasterXlsx(buf);
   ok(p1.material === 'D-8' && p1.container === '20Lコンテナ' && p1.units === 180 && p1.processCount === 3 && p1.note === '割れ注意',
     '資材・収納容器・入数・工程数・備考を読める');
   ok(parsed.issues.duplicates.length === 1, '重複コード (大文字小文字違い) は先勝ちで記録');
-  ok(parsed.issues.badFlg.length === 1 && parsed.rows.find(r => r.code === 'PROD-3').flg === null, 'FLG 不正は未記入扱い + 記録');
   ok(parsed.issues.badUnits.length === 1 && parsed.rows.find(r => r.code === 'PROD-4').units === null, '入数不正は null + 記録');
   ok(parsed.issues.numericCode.length === 1 && !parsed.rows.some(r => r.code === '1234'),
     '数値セルの商品コードは検証エラーにして行を除外 (先頭ゼロ喪失の防止)');
-  ok(importIssueCount(parsed.issues) === 4, `検証エラー合計 4 → 本取込は拒否される (実際 ${importIssueCount(parsed.issues)})`);
-  ok(parsed.hasFlgColumn === true, 'FLG列があれば hasFlgColumn=true');
+  ok(importIssueCount(parsed.issues) === 3, `検証エラー合計 3 → 本取込は拒否される (実際 ${importIssueCount(parsed.issues)})`);
+  ok(!('flg' in parsed.rows[0]), 'FLG は行データに存在しない (廃止 — 列があっても読み飛ばす)');
 }
 
 console.log('\n[1b] 在庫化必要FLG 列なしでも取り込める (FLGは廃止 — 中原さん 2026-09-02)');
@@ -102,25 +91,11 @@ console.log('\n[1b] 在庫化必要FLG 列なしでも取り込める (FLGは廃
   ws2.addRow(['商品コード', '商品名', '資材', '収納容器', '入数', '工程数', '備考']);
   ws2.addRow(['PROD-1', '商品1', 'D-9', '9Lコンテナ', 60, 2, '']);
   const p2 = await parseWorkMasterXlsx(Buffer.from(await wb2.xlsx.writeBuffer()));
-  ok(p2.hasFlgColumn === false && p2.rows.length === 1 && p2.rows[0].flg === null,
-    'FLG列なし: hasFlgColumn=false・行は読める・flg=null');
+  ok(p2.rows.length === 1 && p2.rows[0].material === 'D-9', 'FLG列なし: そのまま読める');
   ok(importIssueCount(p2.issues) === 0, 'FLG列が無いこと自体はエラーにしない');
 }
 
-console.log('\n[2] FLG × f_inbound_info の突合');
-const compare = compareIrohaFlags(parsed.rows);
-{
-  const b = compare.buckets;
-  ok(b.old1_yes === 1, '旧1/現行有り = PROD-6');
-  ok(b.old0_yes === 1, '旧0/現行有り (食い違い) = PROD-7');
-  ok(b.cur_unset === 5, `現行未設定 (書き込み候補) = 5 (実際 ${b.cur_unset})`);
-  ok(b.flg_blank === 1, 'FLG未記入 = PROD-3');
-  ok(b.not_in_mirror === 1, '商品マスタに無い = PROD-8');
-  ok(compare.mismatches.length === 1 && compare.mismatches[0].code === 'PROD-7', '食い違い一覧 = PROD-7 だけ');
-  ok(compare.seedable.length === 5, '書き込み候補 = PROD-1,2,4,5,8');
-}
-
-console.log('\n[3] 本取込 (upsert)');
+console.log('\n[3] 本取込 (全置換)');
 {
   const c1 = applyWorkMaster(parsed.rows, { user: 'test' });
   ok(c1.inserted === 8 && c1.updated === 0, `初回は全部 insert (${c1.inserted})`);
@@ -132,23 +107,6 @@ console.log('\n[3] 本取込 (upsert)');
   ok(c3.updated === 1 && row.note === '割れ注意 (更新)' && row.version === 2, '変更行だけ更新され version が上がる');
   logWorkMasterImport({ actor: 'test', fileName: 't.xlsx', ok: true, message: 'test' });
   ok(!!db.prepare("SELECT 1 FROM f_inbound_check_import_log WHERE source = 'work_master_xlsx'").get(), '取込ログが残る');
-}
-
-console.log('\n[4] seedIrohaFlags (未設定の SKU だけに書く)');
-{
-  const s = seedIrohaFlags(compare.seedable, { user: 'test' });
-  ok(s.seeded === 4, `書き込み 4 件 (実際 ${s.seeded})`);      // PROD-1,2,4,5 (PROD-8 は mirror に無い)
-  ok(s.added === 3, `行の新規作成 3 件 (PROD-1,4,5。実際 ${s.added})`);
-  ok(s.notInMaster === 1, 'PROD-8 は商品マスタに無く見送り');
-  ok(Array.isArray(s.errorDetails) && s.errors === 0, '失敗の内訳 (errorDetails) を返す (今回は0件)');
-  const v = (k) => db.prepare('SELECT いろは在庫化作業有無 AS i, 入庫時BCシール貼りフラグ AS bc FROM f_inbound_info WHERE code_key = ?').get(k);
-  ok(v('prod-1')?.i === '有り', 'PROD-1 (FLG=1) → 有り');
-  ok(v('prod-1')?.bc === '－', '有り の連動ルール (BCシール等=－) が効いている (updateInbound 経由の証拠)');
-  ok(v('prod-2')?.i === '無し', 'PROD-2 (FLG=0・行あり未設定) → 無し');
-  ok(v('prod-7')?.i === '有り', 'PROD-7 (食い違い) は触らない');
-  // もう一度呼んでも上書きしない (値が入ったので skipped になる)
-  const s2 = seedIrohaFlags(compare.seedable, { user: 'test' });
-  ok(s2.seeded === 0 && s2.skipped >= 4, '2回目は書かない (冪等)');
 }
 
 console.log('\n[5] 管理画面編集');

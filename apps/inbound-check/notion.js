@@ -139,7 +139,7 @@ export async function ensureCardSchema({ force = false } = {}) {
   const EXPECTED_TYPES = {
     '名前': 'title', 'ステータス': 'select', '商品コード': 'rich_text', '数量': 'number',
     '入庫日': 'date', '入荷管理番号': 'rich_text', 'バーコード': 'rich_text', '取引先': 'select',
-    '仕入先': 'number', '取扱区分': 'select', '在庫化必要FLG': 'checkbox', '作業拠点': 'select',
+    '仕入先': 'number', '取扱区分': 'select', '作業拠点': 'select',
     '過去30日販売数': 'rich_text', '外部出し目安': 'rich_text',
     '資材セットID': 'select', '収納容器': 'select', '入数': 'number', '工程数': 'number', '備考': 'rich_text',
     '有効期限': 'rich_text', 'destination_id': 'number', [DEDUPE_PROP]: 'rich_text',

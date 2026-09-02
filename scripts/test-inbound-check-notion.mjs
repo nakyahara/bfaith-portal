@@ -200,7 +200,7 @@ console.log('\n[3] カード作成とプロパティ');
   ok(p['取引先'].select.name === 'AMC', '取引先 = 仕入先マスタ (po_suppliers) の名称');
   ok(p['仕入先'].number === 1, '仕入先 = 仕入先コード (数値)');
   ok(p['取扱区分'].select.name === '取扱中', '取扱区分 = mirror_products');
-  ok(p['在庫化必要FLG'].checkbox === true, '在庫化必要FLG = true (いろは行き=在庫化する)');
+  ok(!('在庫化必要FLG' in p), '在庫化必要FLG は送らない (FLGは廃止 — 2026-09-02)');
   ok(p['作業拠点'].select.name === 'いろは', '作業拠点 = いろは');
   ok(p['有効期限'].rich_text[0].text.content === '2026-12', '有効期限 = YYYY-MM も送れる (rich_text)');
   ok(p['過去30日販売数'].rich_text[0].text.content === '30個', '30日販売数 = by_product のみ合計');

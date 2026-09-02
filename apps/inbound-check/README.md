@@ -270,16 +270,15 @@ miniPC auto-shohin-csv.js (Logizard-NyukaCSV の2ステップ目・1日1回)
 - 台帳 = `config/jobs-registry.mjs` `inbound-check-notion-cards` (dead-man ping)
 - **いろは作業仕様マスタ (`f_iroha_work_master`)** = 旧スプレッドシート「作業内容管理マスター」の置き換え (work-master.js)。
   カードの 資材セットID・収納容器・入数・工程数・備考 はここから載る (未整備の商品は送らない — それが正常)。
-  取込は管理画面から xlsx をアップロード: 既定 **dry-run** (検証 + 「在庫化必要FLG × いろは有無」の突合レポート。
-  not_in_mirror は他区分と重複する補助集計) → 内容を見てから本取込。
+  取込は管理画面から xlsx をアップロード: 既定 **dry-run** (検証レポート) → 内容を見てから本取込。
   **検証エラー (数値でない入数・重複コード・数値セルの商品コード等) が1件でもあると本取込は拒否** —
   不正値を null で取り込むと既存値を黙って消すため (Codex PR2 High-1)。
   **本取込はマスタ全体を xlsx で置き換える** — xlsx に無い既存行は**削除**される
   (廃止した作業仕様を残さない。画面の個別編集・追加より一括取込が正。削除予定は dry-run で予告)。
   カードは**作成時スナップショット** — 後からのマスタ変更は既存カードに反映しない (直すなら Notion 側で。
   自動同期を移植しないのは Codex設計相談R1 質問2-5 の決定)。
-  **在庫化必要FLG はこの表に持ち込まない** — 正本は `f_inbound_info.いろは在庫化作業有無`。
-  本取込時に「未設定の SKU にだけ」FLG を初期値として書き込める (食い違いはレポートのみ・自動では触らない)。
+  **在庫化必要FLG は廃止** (中原さん 2026-09-02「もうつかわない」) — xlsx に列があっても完全に読み飛ばし、
+  カードにも送らない。在庫化要否の正本は `f_inbound_info.いろは在庫化作業有無` (荷受け時のその場選択で育つ) のみ。
   ⚠カードの「入数」= `units_per_container` (いろはで1容器に詰める数)。f_inbound_info の入数 (仕入箱) とは別概念で統合しない
 
 ## テスト
@@ -291,7 +290,7 @@ node scripts/test-inbound-check-drive.mjs                  # Drive 自動取込 
 node scripts/test-inbound-check-product-master.mjs         # 商品マスタ取込 = 期限管理 (40 項目)
 node scripts/test-inbound-check-render.mjs                 # iPad 画面のレンダリング (状態ごとの主ボタン・数量パネル)
 node scripts/test-inbound-check-notion.mjs                 # Notion 作業カード sweep (API はモック)
-node scripts/test-inbound-check-work-master.mjs            # いろは作業仕様マスタ (xlsx取込・FLG突合・seed)
+node scripts/test-inbound-check-work-master.mjs            # いろは作業仕様マスタ (xlsx取込・全置換・編集)
 node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路
 ```
 

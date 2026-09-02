@@ -29,7 +29,7 @@ import {
 import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProductMaster } from './drive-fetch.js';
 import { runNotionSweep, notionStatusForAdmin, resetNotionRow } from './notion-sync.js';
 import {
-  parseWorkMasterXlsx, compareIrohaFlags, applyWorkMaster, seedIrohaFlags, logWorkMasterImport,
+  parseWorkMasterXlsx, applyWorkMaster, logWorkMasterImport,
   workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow, importIssueCount, computeDeletions,
 } from './work-master.js';
 // 入庫情報の書き込みは inbound-info の関数を通す (いろは=有り の連動ルール・楽観ロック・
@@ -639,22 +639,15 @@ router.post('/admin/work-master-import', requireAdmin, checkOrigin, upload.singl
     logWorkMasterImport({ actor: req.session.email, fileName: req.file.originalname, ok: false, message: e.message });
     return res.status(400).json({ ok: false, error: 'bad_xlsx', message: e.message });
   }
-  // FLG 列が無い xlsx (在庫化必要FLG は廃止・2026-09-02) では突合も seed も行わない
-  const compare = parsed.hasFlgColumn
-    ? compareIrohaFlags(parsed.rows)
-    : { buckets: null, mismatches: [], seedable: [], infoOnlyCount: 0 };
+  // 在庫化必要FLG は廃止 (中原さん 2026-09-02) — 突合レポートも seed も行わない。
+  // 在庫化要否の正本は f_inbound_info.いろは在庫化作業有無 (荷受け時のその場選択で育つ)
   const apply = String(req.body?.apply || '') === '1';
-  const seed = apply && String(req.body?.seed || '') === '1' && parsed.hasFlgColumn;
   const issueTotal = importIssueCount(parsed.issues);
   const del = computeDeletions(parsed.rows);   // 取込 = 全置換。xlsx に無い既存行は削除される (予告して見せる)
   const out = {
     ok: true, dryRun: !apply, dataRows: parsed.dataRows, rowCount: parsed.rows.length,
     issues: parsed.issues, issueTotal,
-    flgColumn: parsed.hasFlgColumn,
     wouldDelete: { count: del.count, codes: del.codes },
-    buckets: compare.buckets,
-    seedableCount: compare.seedable.length, infoOnlyCount: compare.infoOnlyCount,
-    mismatchCount: compare.mismatches.length, mismatches: compare.mismatches.slice(0, 300),
   };
   // ⭐検証エラーが1件でもあれば本取込は拒否 (Codex PR2 High-1)。
   //   「入数 abc」等を null で取り込むと既存値 (180 等) を黙って消すため、xlsx 側を直してもらう
@@ -670,11 +663,9 @@ router.post('/admin/work-master-import', requireAdmin, checkOrigin, upload.singl
   }
   if (apply) {
     out.applied = applyWorkMaster(parsed.rows, { user: req.session.email });
-    if (seed) out.seeded = seedIrohaFlags(compare.seedable, { user: req.session.email });
     logWorkMasterImport({
       actor: req.session.email, fileName: req.file.originalname, ok: true,
-      message: `${parsed.rows.length}行 (新規${out.applied.inserted}/更新${out.applied.updated}/変化なし${out.applied.unchanged}/削除${out.applied.deleted})`
-        + (out.seeded ? ` / いろは有無を${out.seeded.seeded}件書込 (新規行${out.seeded.added})` : ''),
+      message: `${parsed.rows.length}行 (新規${out.applied.inserted}/更新${out.applied.updated}/変化なし${out.applied.unchanged}/削除${out.applied.deleted})`,
     });
   }
   res.json(out);
