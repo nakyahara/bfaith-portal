@@ -1328,7 +1328,11 @@ export async function registerItem(draftId, { actor = null } = {}) {
       if (r === null) throw transportError;
     } else {
       const cause = transportError ? String(transportError.message || transportError) : `HTTP ${r?.status}`;
-      throw new Error(`楽天への登録結果が確認できませんでした (${String(cause).slice(0, 120)})。RMS で商品管理番号 ${mn} の有無を確認してから再実行してください`);
+      const err = new Error(`楽天への登録結果が確認できませんでした (${String(cause).slice(0, 120)})。RMS で商品管理番号 ${mn} の有無を確認してから再実行してください`);
+      // 呼び出し元 (ボードからの出品) が「失敗 = やり直せる」と区別するための印 (Codex R1 critical):
+      // 実は PUT が通っている可能性があるので、これは自動でも人の一押しでも再実行させてはいけない
+      err.code = 'RMS_OUTCOME_UNKNOWN';
+      throw err;
     }
   }
   // 公開登録なので published_at も登録時刻で埋める (公開/非公開ボタンの表示状態と整合させる)

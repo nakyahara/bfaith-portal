@@ -9,9 +9,10 @@
  *   INBOUND_CHECK_SYNC_ENABLED   … false/0/off/no で停止 (既定=有効)。非 Render では既定 OFF
  *   INBOUND_CHECK_SYNC_CRON      … cron 式を上書き (既定 '*\/30 6-20 * * *' JST)
  *   INBOUND_CHECK_DRIVE_FOLDER_ID / INBOUND_CHECK_DRIVE_FILE … 取得先 (既定は値札CSVと同じ共有ドライブ)
+ *   INBOUND_CHECK_MASTER_FILE    … 商品マスタのファイル名 (既定 shohin_master.csv)
  */
 import cron from 'node-cron';
-import { runScheduledFetch } from './drive-fetch.js';
+import { runScheduledFetch, runScheduledMasterFetch } from './drive-fetch.js';
 import { isRender } from '../../lib/is-render.js';
 
 const OFF = new Set(['false', '0', 'off', 'no']);
@@ -46,6 +47,10 @@ export function startInboundCheckCron() {
   task = cron.schedule(use, async () => {
     try { await runScheduledFetch({ actor: 'cron' }); }
     catch (e) { console.warn(`[inbound-check] cron: ${e.message}`); }
+    // 商品マスタ (期限管理あり/なし) も同じ巡回で見る。中身が変わっていなければ何もしない。
+    // ⭐入口を増やさないため専用の cron は作らない (CLAUDE.md の定期実行ルール)
+    try { await runScheduledMasterFetch({ actor: 'cron' }); }
+    catch (e) { console.warn(`[inbound-check] cron(商品マスタ): ${e.message}`); }
   }, { timezone: 'Asia/Tokyo' });
   console.log(`[inbound-check] cron 起動 (${use} JST)`);
   return task;

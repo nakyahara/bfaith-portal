@@ -32,6 +32,21 @@ if (csvPath && fs.existsSync(csvPath)) {
   const now = new Date().toISOString();
   m.prepare(`INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ, 直接ピックロケ保管, BF保管荷姿, いろは在庫化作業有無, source, created_at, updated_at)
     VALUES ('asahilabo15g', 'asahilabo15g', 'アサヒ商品', 10, '不要', '', 'そのまま', '無し', 'manual', ?, ?)`).run(now, now);
+  // 他の商品も「行き先が決まっている」状態にしておく。
+  // ⭐こうしないと確認のたびに行き先ゲートが開き、作業者記録や version の検証ができない
+  const { parseInboundCsv } = await import('../apps/inbound-check/csv.js');
+  const seedIns = m.prepare(`INSERT OR IGNORE INTO f_inbound_info
+    (code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ, いろは在庫化作業有無, source, created_at, updated_at)
+    VALUES (?, ?, ?, 1, '不要', '無し', 'manual', ?, ?)`);
+  for (const row of parseInboundCsv(fs.readFileSync(csvPath)).rows) {
+    if (row.product_id === 'b07bl10ml') continue;    // ← 行き先ゲート / 未登録の導線に使うので残す
+    if (row.product_id === 'b17ls10ml') continue;  // ← 商品マスタにも無い商品の逃げ道に使う
+    seedIns.run(row.code_key, row.product_id, row.product_name, now, now);
+  }
+  // b07bl10ml は商品マスタにだけ載せる = その場で選んだ行き先を入庫情報へ自動登録できる状態。
+  // b17ls10ml はどちらにも載せない = 登録できないケース (現場は止めず台帳だけ残す) の確認用
+  m.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, updated_at)
+    VALUES (900002, 'b07bl10ml', 'ブレンドオイル', '単品', '取扱中', 'unknown', ?)`).run(now);
   // 2行目の商品は入庫情報に無い状態にしておく (未登録 → 登録の導線を確かめるため)
   m.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, updated_at)
     VALUES (900001, 'ohanautsuwa', 'お花の器', '単品', '取扱中', 'unknown', ?)`).run(now);
@@ -115,6 +130,13 @@ try {
   ok(r.status === 200 && r.json.ok && r.json.batch === null && r.json.me.admin === true, 'state (取込なし)');
   r = await req(J, `${APP}/admin`);
   ok(r.status === 200 && r.text.includes('取込履歴') && r.text.includes('この端末を登録'), '管理画面 (admin 節あり)');
+  ok(r.text.includes('いろはへ送る商品') && r.text.includes('destinations.csv'), '管理画面に いろはへ送る商品 の一覧が出る');
+  ok(r.text.includes('期限管理 (ロジザード商品マスタ)') && r.text.includes('fetchMasterBtn'), '管理画面に 期限管理 (商品マスタ) の節が出る');
+  // Drive にファイルが無い環境でも 400 で返る (500 にしない = 原因が画面で分かる)
+  r = await req(J, `${APP}/admin/fetch-product-master`, { method: 'POST', body: {} });
+  ok(r.status === 400 && !!r.json?.message, `商品マスタの取込は取れないとき 400 で理由を返す (${r.json?.message?.slice(0, 60)})`);
+  r = await req(null, `${APP}/admin/fetch-product-master`, { method: 'POST', body: {} });
+  ok(r.status === 302 || r.status === 401, '未認証は商品マスタを取り込めない');
   // 作業者 = スタッフマスタ (apps/staff)。seed 13名が入っている
   r = await req(J, `${BASE}/apps/staff/api/list`);
   ok(r.status === 200 && r.json.staff.length === 13 && r.json.candidates[0].staff_no === '0001', 'スタッフマスタ seed 13名');
@@ -177,24 +199,84 @@ try {
     ok(r.json.lines.length === 16 && r.json.slips.length === 1 && r.json.totals.checked === 0, 'state 16行/1伝票');
     firstKey = r.json.lines[0].line_key;
     ok(r.json.lines[0].info === null || typeof r.json.lines[0].info === 'object', '補助情報フィールドあり');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 1, worker_code: '20250901' } });
-    ok(r.status === 200 && r.json.state.status === 'checked' && r.json.state.checked_by === '星 立夏', '確認 (セッション + スタッフ管理番号)');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 1, worker_code: '20250901' } });
-    ok(r.status === 409 && r.json.error === 'conflict' && r.json.current.status === 'checked', '二重確認 → 409 conflict');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId + 99, line_key: firstKey, worker_code: '20250901', expect_version: 1 } });
+    const K = n => `AR00110005164|${n}|1`;
+    const fin = (body) => req(J, `${APP}/api/lines/check`, { method: 'POST', body });
+    const allPresent = (n, extra = {}) => fin({ batch_id: batchId, line_key: K(n), expect_version: 1, expect_quantity_version: 1,
+      result: 'exact', mode: 'fill_remaining', fill_event: { client_event_id: `sm-fill-${n}` }, worker_code: '20250901', ...extra });
+    r = await allPresent(6);
+    ok(r.status === 200 && r.json.state.status === 'checked' && r.json.state.checked_by === '星 立夏' && r.json.state.finalized_result === 'exact',
+      '全部あり (セッション + スタッフ管理番号)');
+    r = await allPresent(6);
+    ok(r.status === 409 && r.json.error === 'finalized' && r.json.current.status === 'checked', '確定済みへの再確定 → 409 finalized');
+    r = await fin({ batch_id: batchId + 99, line_key: K(6), worker_code: '20250901', expect_version: 1, expect_quantity_version: 1, result: 'exact' });
     ok(r.status === 409 && r.json.error === 'stale_batch', '旧/不明 batch_id → 409 stale_batch');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: r.json.line_key || 'AR00110005164|2|1', expect_version: 1 } });
+    r = await fin({ batch_id: batchId, line_key: K(7), expect_version: 1, expect_quantity_version: 1, result: 'exact',
+      mode: 'fill_remaining', fill_event: { client_event_id: 'sm-fill-7' } });
     ok(r.status === 200 && r.json.state.checked_by === '中原 大輔', '作業者コード無し (セッション) = 表示名で記録');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: 'w99', expect_version: 1 } });
+    r = await fin({ batch_id: batchId, line_key: K(8), worker_code: 'w99', expect_version: 1, expect_quantity_version: 1, result: 'exact' });
     ok(r.status === 400 && r.json.error === 'worker_required', '不明なスタッフ管理番号 → 400');
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|4|1', worker_code: '90002', expect_version: 1 } });
+    r = await fin({ batch_id: batchId, line_key: K(9), worker_code: '90002', expect_version: 1, expect_quantity_version: 1, result: 'exact' });
     ok(r.status === 400 && r.json.error === 'worker_required', '無効化したスタッフ → 400');
     for (const bad of [undefined, null, 0, -1, 1.5, 'x', '']) {
-      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: '20250901', expect_version: bad } });
+      r = await fin({ batch_id: batchId, line_key: K(10), worker_code: '20250901', expect_version: bad, expect_quantity_version: 1, result: 'exact' });
       ok(r.status === 400 && r.json.error === 'bad_request', `expect_version=${String(bad)} → 400`);
     }
-    r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: 'AR00110005164|3|1', worker_code: '20250901', expect_version: '1' } });
+    r = await fin({ batch_id: batchId, line_key: K(10), worker_code: '20250901', expect_version: '1', expect_quantity_version: '1',
+      result: 'exact', mode: 'fill_remaining', fill_event: { client_event_id: 'sm-fill-10' } });
     ok(r.status === 200, "expect_version='1' (文字列の整数) は許容");
+
+    console.log('\n[B1a] 数量 (部分確認) の HTTP 経路');
+    {
+      // ⚠ここは「箱を数えている最中に通信が切れた」「2台で同時に数えた」を通す道。正常系より事故系を先に見る
+      const QE = `${APP}/api/lines/quantity-events`;
+      const line = (await req(J, `${APP}/api/state`)).json.lines.find(l => l.line_key === K(1));
+      const planned = line.planned_qty;
+      const box = (id, q) => ({ client_event_id: id, action: 'add', quantity: q, input_kind: 'box', unit_size: q });
+      const post = body => req(J, QE, { method: 'POST', body: { batch_id: batchId, line_key: K(1), worker_code: '20250901', ...body } });
+
+      r = await post({ expect_quantity_version: 1, events: [box('sm-q-0001', 10)], pack_qty: 10 });
+      ok(r.status === 200 && r.json.state.found_qty === 10 && r.json.state.quantity_version === 2, '＋1箱 → 200 が返ってから数が増える');
+      r = await post({ expect_quantity_version: 2, events: [box('sm-q-0001', 10)] });
+      ok(r.status === 200 && r.json.replayed && r.json.state.found_qty === 10, '同じ client_event_id の再送は二重加算しない (応答だけ失われた時の押し直し)');
+      r = await post({ expect_quantity_version: 2, events: [box('sm-q-0001', 20)] });
+      ok(r.status === 409 && r.json.error === 'idempotency_conflict', '同じ操作IDで違う内容 → 409');
+      r = await post({ expect_quantity_version: 1, events: [box('sm-q-0002', 10)] });
+      ok(r.status === 409 && r.json.error === 'conflict' && r.json.current.found_qty === 10, '古い quantity_version → 409 conflict + 現在値');
+      r = await post({ expect_quantity_version: 2, events: [box('sm-q-0002', 10)] });
+      ok(r.status === 200 && r.json.state.found_qty === 20, '別の端末の加算は足し算 (絶対値の上書きではない)');
+      r = await post({ expect_quantity_version: 3, events: [{ client_event_id: 'sm-q-bad1', action: 'add', quantity: 0, input_kind: 'box' }] });
+      ok(r.status === 400 && r.json.error === 'bad_request', '数量0は 400');
+      r = await post({ expect_quantity_version: 3, events: [{ client_event_id: 'x', action: 'add', quantity: 1, input_kind: 'box' }] });
+      ok(r.status === 400 && r.json.error === 'bad_request', '短すぎる client_event_id は 400');
+      r = await req(J, `${APP}/api/lines/events?batch_id=${batchId}&line_key=${encodeURIComponent(K(1))}`);
+      ok(r.status === 200 && r.json.events.length === 2, '数量イベント履歴が引ける (訂正パネル用)');
+      const target = r.json.events[0];
+      r = await post({ expect_quantity_version: 3, events: [
+        { client_event_id: 'sm-q-0003', action: 'reversal', quantity: 10, input_kind: 'correction', reverses_event_seq: target.event_seq },
+        { client_event_id: 'sm-q-0004', action: 'add', quantity: 12, input_kind: 'correction', unit_size: 12, replaces_event_seq: target.event_seq } ] });
+      ok(r.status === 200 && r.json.state.found_qty === 22, '入数の訂正 (10入り→12入り) → 22');
+      r = await post({ expect_quantity_version: 4, events: [
+        { client_event_id: 'sm-q-0005', action: 'reversal', quantity: 10, input_kind: 'correction', reverses_event_seq: target.event_seq } ] });
+      ok(r.status === 409 && r.json.error === 'already_reversed', '二重打ち消し → 409 already_reversed');
+
+      // 人が選んだ意味と実数が食い違ったまま確定させない
+      r = await fin({ batch_id: batchId, line_key: K(1), expect_version: 1, expect_quantity_version: 4, result: 'exact', worker_code: '20250901' });
+      ok(r.status === 409 && r.json.error === 'result_mismatch', `22/${planned} で exact → 409 result_mismatch`);
+      r = await fin({ batch_id: batchId, line_key: K(1), expect_version: 1, expect_quantity_version: 4, result: 'shortage', worker_code: '20250901', client_operation_id: 'sm-op-0001',
+        choice: { destination: 'bfaith', bc_seal: '不要', irisu: 10 } });
+      ok(r.status === 200 && r.json.state.finalized_result === 'shortage' && r.json.state.found_qty === 22, '不足のまま確定 → 22個で checked');
+      r = await fin({ batch_id: batchId, line_key: K(1), expect_version: 1, expect_quantity_version: 4, result: 'shortage', worker_code: '20250901', client_operation_id: 'sm-op-0001',
+        choice: { destination: 'bfaith', bc_seal: '不要', irisu: 10 } });
+      ok(r.status === 200 && r.json.replayed, '確定の再送は replayed (台帳を増やさない)');
+      r = await post({ expect_quantity_version: 5, events: [box('sm-q-0006', 10)] });
+      ok(r.status === 409 && r.json.error === 'finalized', '確定済みの行には数を足せない → 409 finalized');
+      r = await req(J, `${APP}/api/lines/uncheck`, { method: 'POST', body: { batch_id: batchId, line_key: K(1), expect_version: 2, worker_code: '20250901' } });
+      ok(r.status === 200 && r.json.state.status === 'unchecked' && r.json.state.found_qty === 22, 'やり直す → 未確認に戻るが数量22は残る');
+      r = await req(J, `${APP}/api/state`);
+      const l5 = r.json.lines.find(l => l.line_key === K(1));
+      ok(l5.quantity_relation === 'shortage' && l5.remaining_qty === planned - 22 && r.json.totals.partial >= 1,
+        'state に found_qty / remaining_qty / quantity_relation / totals.partial が載る');
+    }
     console.log('\n[B1b] 入庫情報を iPad からその場で直す');
     {
       // 入数やいろはは f_inbound_info (= /apps/inbound-info と同じ正本) に書く。値札印刷にもそのまま効く
@@ -242,7 +324,140 @@ try {
     r = await req(J, `${APP}/admin/history.csv?batch_id=${batchId}`);
     ok(r.status === 200 && /text\/csv/.test(r.ctype) && r.text.includes('確認'), '履歴 CSV');
     r = await req(J, `${APP}/admin/history?batch_id=${batchId}`);
-    ok(r.status === 200 && r.json.events.length === 3, '履歴 JSON 3件 (確認2 + 文字列version確認1)');
+    ok(r.status === 200 && r.json.events.length >= 3 && r.json.events.every(e => e.result || e.action === 'uncheck'),
+      '履歴 JSON に確認/やり直しが残り、確認には result (exact/shortage/excess) が入る');
+    ok(r.json.events.some(e => e.result === 'shortage' && e.found_qty === 22 && e.planned_qty_snapshot === 100),
+      '履歴に確定時点の実数と予定数のスナップショットが残る (後で数量を訂正しても当時の値が読める)');
+
+    console.log('\n[B1a] 確認するときに行き先 (いろは / B-Faith) を確定させる');
+    {
+      r = await req(J, `${APP}/api/state`);
+      const undecided = r.json.lines.find(l => l.product_id === 'b07bl10ml');
+      ok(undecided && undecided.dest.missing.includes('iroha'), '入庫情報が無い商品は「行き先 未設定」として出る');
+      ok(r.json.totals.undecided >= 1, `画面上部のアラート件数が出る (${r.json.totals.undecided}件)`);
+      const key = undecided.line_key, ver = undecided.version;
+      // 確定は「全部あり」= 残りを足して exact 確定する形で通す (失敗した回はロールバックされるので fill の id は使い回してよい)
+      const body = extra => ({ batch_id: batchId, line_key: key, expect_version: ver, expect_quantity_version: undecided.quantity_version,
+        result: 'exact', mode: 'fill_remaining', fill_event: { client_event_id: 'sm-gate-fill-1' }, worker_code: '20250901', ...extra });
+
+      // 行き先を決めずには確認できない
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body() });
+      ok(r.status === 400 && r.json.error === 'destination_required' && r.json.missing.includes('iroha'), '行き先が未設定なら確認できない (400 destination_required)');
+
+      // B-Faith を選んだらラベルと入数が要る
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { destination: 'bfaith' } }) });
+      ok(r.status === 400 && r.json.missing.includes('bc_seal'), 'B-Faith 入庫はラベル (BCシール) が無いと進めない');
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { destination: 'bfaith', bc_seal: '不要' } }) });
+      ok(r.status === 400 && r.json.missing.includes('irisu'), 'B-Faith 入庫は入数が無いと進めない');
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { destination: 'bfaith', bc_seal: '不要', irisu: 0 } }) });
+      ok(r.status === 400, '入数 0 は拒否');
+
+      // いろはを選ぶ → 確認が通り、選んだ内容が入庫情報に登録される
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { destination: 'iroha' } }) });
+      ok(r.status === 200 && r.json.state.status === 'checked', 'いろはを選べば確認できる');
+      r = await req(J, `${APP}/api/state`);
+      const after = r.json.lines.find(l => l.product_id === 'b07bl10ml');
+      ok(after.info && after.info.iroha === '有り', '選んだ行き先が入庫情報に自動登録される');
+      ok(after.dest.destination === 'iroha' && after.dest.missing.length === 0, '次からは聞かれない (データに沿って判定)');
+      ok(r.json.totals.toIroha >= 1, `いろは行きの件数が出る (${r.json.totals.toIroha}件)`);
+
+      // 台帳に残る
+      r = await req(J, `${APP}/admin/destinations`);
+      const led = r.json.rows.find(x => x.product_id === 'b07bl10ml');
+      ok(led && led.destination === 'iroha' && led.decided_from === 'chosen' && !led.cancelled_at, 'いろはへ送る実績が台帳に残る');
+      ok(led.planned_qty === after.planned_qty && led.ar_no === after.ar_no, '数量と入荷管理番号も台帳に残る');
+
+      // 取り消すと台帳も取り消される (行は消さない)
+      r = await req(J, `${APP}/api/lines/uncheck`, { method: 'POST', body: { batch_id: batchId, line_key: key, expect_version: ver + 1, worker_code: '20250901' } });
+      ok(r.status === 200, '確認を取り消せる');
+      r = await req(J, `${APP}/admin/destinations?include_cancelled=1`);
+      const led2 = r.json.rows.find(x => x.product_id === 'b07bl10ml');
+      ok(led2 && led2.cancelled_at, '取り消すと台帳は消さずに取消日時が入る');
+      r = await req(J, `${APP}/admin/destinations`);
+      ok(!r.json.rows.some(x => x.product_id === 'b07bl10ml'), '既定の一覧からは取り消し分が外れる');
+      r = await req(J, `${APP}/admin/destinations.csv`);
+      ok(r.status === 200 && /text\/csv/.test(r.ctype) && r.text.includes('有効期限'), '台帳を CSV で出せる');
+    }
+
+    console.log('\n[B1c] 期限管理商品は確認のたびに有効期限を聞く');
+    {
+      r = await req(J, `${APP}/api/state`);
+      const line = r.json.lines.find(l => l.check_status !== 'checked' && !l.dest.missing.length);
+      ok(!!line, '行き先が決まっている未確認の明細を用意');
+      // 期限管理ありに設定
+      r = await req(J, `${APP}/api/product-flags`, { method: 'POST', body: { code_key: line.code_key, expiry_managed: true, worker_code: '20250901' } });
+      ok(r.status === 200 && r.json.expiry_managed === true, '期限管理あり に設定できる');
+      r = await req(J, `${APP}/api/state`);
+      const l2 = r.json.lines.find(x => x.line_key === line.line_key);
+      ok(l2.expiry_managed === true && l2.expiry_source === 'manual', '一覧に期限管理あり として出る');
+      ok(l2.dest.missing.includes('expiry'), '期限管理商品は毎回 有効期限 を聞かれる');
+      const body = extra => ({ batch_id: batchId, line_key: line.line_key, expect_version: l2.version, expect_quantity_version: l2.quantity_version,
+        result: 'exact', mode: 'fill_remaining', fill_event: { client_event_id: 'sm-exp-fill-1' }, worker_code: '20250901', ...extra });
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body() });
+      ok(r.status === 400 && r.json.missing.includes('expiry'), '有効期限なしでは確認できない');
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { expiry_date: '2026-02-31' } }) });
+      ok(r.status === 400, '実在しない日付は拒否 (2026-02-31)');
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: body({ choice: { expiry_date: '2027-06' } }) });
+      ok(r.status === 200, '年月だけ (日は指定なし) でも確認できる');
+      r = await req(J, `${APP}/admin/destinations?destination=all`);
+      const led = r.json.rows.find(x => x.line_key === line.line_key);
+      ok(led && led.expiry_date === '2027-06', '有効期限が台帳に残る');
+      ok(led.decided_from === 'master', '行き先そのものは入庫情報どおりと記録される (期限だけ聞いた場合)');
+      // 期限管理を戻しておく (後続のテストが巻き添えにならないように)
+      await req(J, `${APP}/api/product-flags`, { method: 'POST', body: { code_key: line.code_key, expiry_managed: false, worker_code: '20250901' } });
+    }
+
+    console.log('\n[B1e] 完了一覧 (棚入れ・確認用)');
+    {
+      // 中原さん 2026-09-02:「全部チェックされたら一覧を表示。期限があるものは期限と数量。
+      //   画像は要らない。PC からも見れるように」
+      r = await req(J, `${APP}/done`);
+      ok(r.status === 200 && r.text.includes('入荷 完了一覧'), '完了一覧のページが開く');
+      ok(!/<img /.test(r.text), '完了一覧に画像は出さない (棚入れで見たいのは 商品・数量・期限 だけ)');
+      ok(/@media print/.test(r.text), 'PC で印刷できる (印刷用のCSSがある)');
+      r = await req(J, `${APP}/done/`);
+      ok(r.status === 308 && /\/apps\/inbound-check\/done$/.test(r.location || ''), '末尾スラッシュは正規化する');
+
+      r = await req(J, `${APP}/api/done?days=2`);
+      ok(r.status === 200 && r.json.ok && Array.isArray(r.json.slips), '完了一覧の API が返る');
+      ok(r.json.slips.every(s => s.done), '既定では完了した伝票だけ出す');
+      const doneOnly = r.json.slips.length;
+
+      r = await req(J, `${APP}/api/done?days=2&all=1`);
+      ok(r.status === 200 && r.json.slips.length >= doneOnly, 'all=1 で途中の伝票も出せる');
+      const lines = r.json.slips.flatMap(s => s.lines);
+      ok(lines.length >= 1, `確認した明細が一覧に出る (${lines.length}行)`);
+      const withExp = lines.filter(l => l.expiry_date);
+      ok(withExp.length >= 1, `有効期限つきの行が出る (${withExp.length}件)`);
+      ok(lines.every(l => l.product_id && l.planned_qty != null), '商品IDと予定数が入っている');
+      const s0 = r.json.slips.find(s => s.expiry_count > 0);
+      ok(!s0 || !!s0.lines[0].expiry_date, '期限のある行を先頭に寄せる (棚入れで先に片付ける)');
+
+      r = await req(J, `${APP}/done.csv?days=2&all=1`);
+      ok(r.status === 200 && /text\/csv/.test(r.ctype) && r.text.includes('有効期限'), '完了一覧を CSV で出せる (PC で印刷・保管)');
+      ok(r.cacheControl === 'no-store', '完了一覧の CSV はキャッシュさせない');
+
+      // 未認証は見られない (作業画面と同じ扱い)
+      r = await req(null, `${APP}/api/done`);
+      ok(r.status === 401, '未認証は完了一覧の API を見られない');
+      r = await req(null, `${APP}/done`);
+      ok(r.status === 302 && /\/apps\/inbound-check\/enroll/.test(r.location || ''), '未登録端末は登録画面へ');
+    }
+
+    console.log('\n[B1d] 商品マスタに無い商品でも現場を止めない');
+    {
+      // 入庫情報を作れないケース。**確認は通し、行き先は台帳に残す**。
+      // ここで止めると、荷受けの現場が「登録できないから消し込めない」で詰まる
+      r = await req(J, `${APP}/api/state`);
+      const orphan = r.json.lines.find(l => l.product_id === 'b17ls10ml');
+      ok(orphan && orphan.info === null, '入庫情報も商品マスタも無い明細を用意');
+      r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: orphan.line_key, expect_version: orphan.version, expect_quantity_version: orphan.quantity_version,
+      result: 'exact', mode: 'fill_remaining', fill_event: { client_event_id: 'sm-orphan-fill-1' }, worker_code: '20250901', choice: { destination: 'iroha' } } });
+      ok(r.status === 200 && r.json.state.status === 'checked', '商品マスタに無くても確認できる');
+      ok(/商品マスタ/.test(r.json.warning || ''), `登録できなかったことは画面に伝える (${r.json.warning})`);
+      r = await req(J, `${APP}/admin/destinations`);
+      ok(r.json.rows.some(x => x.product_id === 'b17ls10ml'), '入庫情報が作れなくても行き先の記録は残る');
+    }
   } else {
     console.log('  (CSV パス未指定: 取込系はスキップ)');
   }
@@ -253,6 +468,9 @@ try {
     const IPAD = jar();
     let r2 = await req(IPAD, `${APP}/`);
     ok(r2.status === 302 && /\/apps\/inbound-check\/enroll/.test(r2.location || ''), '未登録の端末は登録画面へ (ログイン画面ではない)');
+  // 手順書は登録前の iPad からこそ読まれるページ。認証なしで 200 を返すこと
+  r = await req(null, `${APP}/guide`);
+  ok(r.status === 200 && r.text.includes('入荷受付チェックの使い方') && r.text.includes('数量を数える'), '手順書 /guide は未認証でも読める');
     r2 = await req(IPAD, `${APP}/enroll`);
     ok(r2.status === 200 && r2.text.includes('6桁の登録コード'), '登録画面はログイン不要で開ける');
     // 管理者が PC でコードを発行
@@ -330,8 +548,10 @@ try {
   r = await req(J, `${APP}/admin/history.csv?batch_id=1`);
   ok(r.status === 403 || r.status === 302, '端末Cookieでは履歴不可');
   if (batchId) {
-    r = await req(J, `${APP}/api/lines/uncheck`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 2, worker_code: '20250901' } });
-    ok(r.status === 200 && r.json.state.status === 'unchecked', '端末Cookie + 作業者コードで取消');
+    const cur = (await req(J, `${APP}/api/state`)).json.lines.find(l => l.check_status === 'checked');
+    r = await req(J, `${APP}/api/lines/uncheck`, { method: 'POST', body: { batch_id: batchId, line_key: cur.line_key, expect_version: cur.version, worker_code: '20250901' } });
+    ok(r.status === 200 && r.json.state.status === 'unchecked' && r.json.state.found_qty === cur.found_qty,
+      '端末Cookie + 作業者コードでやり直し (数量は残る)');
     r = await req(J, `${APP}/api/lines/check`, { method: 'POST', body: { batch_id: batchId, line_key: firstKey, expect_version: 3 } });
     ok(r.status === 400 && r.json.error === 'worker_required', '端末Cookieで作業者未選択 → 400');
   }

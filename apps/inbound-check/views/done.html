@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="入荷完了一覧">
+  <title>入荷 完了一覧 | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/app-icons/inbound-check-180.png">
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; background: #eceef1; color: #212529; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+    body { padding-bottom: 40px; }
+    .top { position: sticky; top: 0; z-index: 20; background: #fff; border-bottom: 1px solid #dee2e6; padding: 10px 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    .top-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .top h1 { font-size: 1.05em; margin: 0; white-space: nowrap; }
+    .spacer { flex: 1; }
+    .top a, .top button, .top select { font-size: 0.95em; }
+    .top .btn { display: inline-block; padding: 8px 14px; border: 1px solid #ced4da; border-radius: 8px; background: #fff; color: #343a40; text-decoration: none; cursor: pointer; }
+    .top select { padding: 8px 10px; border: 1px solid #ced4da; border-radius: 8px; background: #fff; }
+    .wrap { padding: 12px 14px; max-width: 1100px; margin: 0 auto; }
+    .empty { text-align: center; color: #868e96; padding: 60px 10px; font-size: 1.05em; line-height: 1.8; }
+    .banner { display: none; margin: 10px 14px 0; padding: 10px 12px; border-radius: 8px; font-size: 0.92em; }
+    .banner.err { display: block; background: #ffe3e3; color: #a61e1e; }
+
+    .slip { background: #fff; border-radius: 12px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); overflow: hidden; }
+    .slip-h { display: flex; align-items: baseline; gap: 12px; padding: 12px 14px; background: #f1f3f5; flex-wrap: wrap; }
+    .slip-h .ar { font-weight: 700; font-size: 1.1em; }
+    .slip-h .day { color: #495057; font-size: 0.9em; }
+    .slip-h .who { color: #868e96; font-size: 0.85em; }
+    .slip-h .cnt { margin-left: auto; font-weight: 700; color: #2b8a3e; white-space: nowrap; }
+    .slip-h .cnt.part { color: #e8590c; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.95em; }
+    th, td { padding: 9px 12px; text-align: left; border-top: 1px solid #f1f3f5; vertical-align: top; }
+    th { background: #fafbfc; color: #495057; font-size: 0.85em; font-weight: 600; white-space: nowrap; }
+    tbody tr:nth-child(even) { background: #fafbfc; }
+    tbody tr.has-exp { background: #fff9db; }
+    tbody tr.has-exp:nth-child(even) { background: #fff5c9; }
+    td.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    td.code { color: #868e96; font-size: 0.88em; white-space: nowrap; }
+    td.exp { white-space: nowrap; font-weight: 700; color: #5f3dc4; }
+    .qty-ng { color: #c92a2a; font-weight: 700; }
+    .qty-over { color: #d9480f; font-weight: 700; }
+    .pill { display: inline-block; border-radius: 6px; padding: 2px 8px; font-size: 0.82em; white-space: nowrap; }
+    .pill.iroha { background: #fff3bf; color: #7a5c00; font-weight: 700; }
+    .pill.bf { background: #e7f5ff; color: #1864ab; }
+    .foot { text-align: center; font-size: 0.8em; color: #adb5bd; padding: 20px; }
+    .foot a { color: #868e96; }
+
+    @media (max-width: 640px) {
+      .wrap { padding: 10px; }
+      th, td { padding: 8px 8px; }
+      td.code { display: none; }
+      th.code { display: none; }
+    }
+    /* 紙に出すとき: 操作系を消して、表だけを詰めて出す */
+    @media print {
+      body { background: #fff; }
+      .top, .foot, .banner { display: none !important; }
+      .slip { box-shadow: none; border: 1px solid #adb5bd; page-break-inside: avoid; margin-bottom: 10px; }
+      tbody tr.has-exp { background: #f1f3f5 !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div class="top-row">
+      <h1>📋 入荷 完了一覧</h1>
+      <select id="days">
+        <option value="1">今日</option>
+        <option value="3">3日</option>
+        <option value="7">1週間</option>
+        <option value="14" selected>2週間</option>
+        <option value="31">1ヶ月</option>
+      </select>
+      <label style="font-size:0.9em;color:#495057"><input type="checkbox" id="all"> 途中の伝票も出す</label>
+      <span class="spacer"></span>
+      <button class="btn" type="button" id="reload">🔄 更新</button>
+      <a class="btn" id="csv" href="#">⬇️ CSV</a>
+      <button class="btn" type="button" onclick="window.print()">🖨 印刷</button>
+      <a class="btn" href="/apps/inbound-check/">← 作業画面</a>
+    </div>
+  </div>
+  <div class="banner" id="banner"></div>
+  <div class="wrap" id="list"><div class="empty">読み込んでいます…</div></div>
+  <div class="foot"><a href="/apps/inbound-check/">作業画面</a> ・ <a href="/apps/inbound-check/guide">手順書</a> ・ <a href="/">ポータル</a></div>
+
+  <script>
+    const API = '/apps/inbound-check/api';
+    const $ = s => document.querySelector(s);
+    const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const params = new URLSearchParams(location.search);
+    const arNo = params.get('ar');
+
+    function query() {
+      const q = new URLSearchParams();
+      if (arNo) q.set('ar', arNo);
+      else q.set('days', $('#days').value);
+      if ($('#all').checked) q.set('all', '1');
+      return q.toString();
+    }
+
+    function fmtJst(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return iso;
+      return new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(d);
+    }
+    // 有効期限は YYYY-MM-DD か YYYY-MM。日が無い商品は年月だけで記録している
+    const fmtExp = s => !s ? '' : (s.length === 7 ? s.replace('-', '/') + ' (年月)' : s.replace(/-/g, '/'));
+
+    function banner(kind, text) {
+      const b = $('#banner');
+      if (!kind) { b.className = 'banner'; b.textContent = ''; return; }
+      b.className = 'banner ' + kind; b.textContent = text;
+    }
+
+    function rowHtml(l) {
+      const planned = l.planned_qty == null ? '' : l.planned_qty;
+      const actual = l.actual_qty == null ? l.planned_qty : l.actual_qty;
+      let qty = String(actual == null ? '' : actual);
+      if (actual != null && planned !== '' && actual !== planned) {
+        // 予定と違う数で確定した行は目立たせる (棚入れ時に「あれ?」となるのを防ぐ)
+        qty = '<span class="' + (actual < planned ? 'qty-ng' : 'qty-over') + '">' + actual + '</span>'
+          + '<small style="color:#868e96"> / ' + planned + '</small>';
+      }
+      return '<tr class="' + (l.expiry_date ? 'has-exp' : '') + '">'
+        + '<td class="code">' + esc(l.product_id) + '</td>'
+        + '<td>' + esc(l.product_name || '') + '</td>'
+        + '<td class="num">' + qty + '</td>'
+        + '<td class="exp">' + (l.expiry_date ? '📅 ' + esc(fmtExp(l.expiry_date)) : '') + '</td>'
+        + '<td>' + (l.destination === 'iroha' ? '<span class="pill iroha">🏠 いろは</span>' : '<span class="pill bf">🏢 B-Faith</span>') + '</td>'
+        + '</tr>';
+    }
+
+    function slipHtml(s) {
+      return '<div class="slip">'
+        + '<div class="slip-h"><span class="ar">' + esc(s.ar_no) + '</span>'
+        + '<span class="day">' + esc(s.work_date || '') + '</span>'
+        + '<span class="who">' + esc((s.workers || []).join('・')) + ' ' + esc(fmtJst(s.last_at)) + '</span>'
+        + '<span class="cnt' + (s.done ? '' : ' part') + '">' + (s.done ? '✅ 完了 ' : '途中 ') + s.checked_count + ' / ' + s.line_count + ' 行'
+        + (s.expiry_count ? ' <small>・📅 期限 ' + s.expiry_count + '</small>' : '')
+        + (s.iroha_count ? ' <small>・🏠 ' + s.iroha_count + '</small>' : '') + '</span></div>'
+        + '<table><thead><tr><th class="code">商品ID</th><th>商品名</th><th class="num">数量</th><th>有効期限</th><th>行き先</th></tr></thead>'
+        + '<tbody>' + s.lines.map(rowHtml).join('') + '</tbody></table></div>';
+    }
+
+    async function load() {
+      const q = query();
+      $('#csv').href = '/apps/inbound-check/done.csv?' + q;
+      try {
+        const r = await fetch(API + '/done?' + q, { cache: 'no-store' });
+        if (r.status === 401) { location.href = '/login'; return; }
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.message || j.error);
+        banner(null);
+        if (!j.slips.length) {
+          $('#list').innerHTML = '<div class="empty">'
+            + (arNo ? esc(arNo) + ' の完了記録はまだありません' : 'この期間に確認し終えた伝票はありません')
+            + '<br><small>(伝票の明細を全部確認すると、ここに出ます)</small></div>';
+          return;
+        }
+        $('#list').innerHTML = j.slips.map(slipHtml).join('');
+      } catch (e) {
+        banner('err', '読み込めませんでした (' + e.message + ')');
+      }
+    }
+
+    if (arNo) {
+      // 1伝票だけを見るときは期間の選択を隠す (作業画面の「📋 一覧」から来たとき)
+      $('#days').style.display = 'none';
+      document.querySelector('h1').textContent = '📋 ' + arNo + ' 完了一覧';
+    }
+    $('#reload').addEventListener('click', async () => {
+      const b = $('#reload');
+      b.disabled = true; b.textContent = '読み込み中…';
+      try { await load(); } finally { b.disabled = false; b.textContent = '🔄 更新'; }
+    });
+    $('#days').addEventListener('change', load);
+    $('#all').addEventListener('change', load);
+    load();
+    // 端末を置きっぱなしにするので、開いたまま次の伝票が終わっても追いつくようにする
+    setInterval(() => { if (document.visibilityState === 'visible') load(); }, 30000);
+  </script>
+</body>
+</html>

@@ -5133,6 +5133,9 @@ const boardBase = {
   me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false, checkingOnly: false, imageKind: null,
   stepStateLabels: wfp.STEP_STATE_LABELS,
   boardView: 'main', imageKindLabels: wfp.IMAGE_KIND_LABELS,
+  // 出品・展開の列で楽天の商品ページを組み立てる (2026-09-01)
+  rakutenItemPageUrl: (mn) => `https://item.rakuten.co.jp/b-faith/${String(mn).toLowerCase()}/`,
+  isAdmin: true,
 };
 renders.push(
   ['board.ejs', 'board.ejs', boardBase],
@@ -5159,6 +5162,34 @@ renders.push(
       doneTotal: 1,
     },
   }],
+  // 出品・展開の列 (2026-09-01 楽天出品ボタン/結果)。未出品・失敗・出品済み の 3 枚を並べる
+  ['board.ejs (出品・展開にカード)', 'board.ejs', (() => {
+    const base = boardBase.board.columns.flatMap((c) => c.cards)[0];
+    const malls = (st, itemUrl = null) => wf.listSteps ? [
+      { code: 'rakuten', label: '楽天', state: st, itemUrl },
+      { code: 'yahoo', label: 'Yahoo', state: 'todo', itemUrl: null },
+    ] : [];
+    const mk = (id, over) => ({ ...base, id, ne_code: `LST-${id}`, name: `出品テスト ${id}`, ...over });
+    return {
+      ...boardBase,
+      board: {
+        ...boardBase.board,
+        columns: boardBase.board.columns.map((c) => c.code !== 'listing' ? c : {
+          ...c,
+          cards: [
+            mk(90001, { malls: malls('todo'), rakutenRegisteredAt: null, rakutenLastError: null }),
+            mk(90002, { malls: malls('todo'), rakutenRegisteredAt: null, rakutenLastError: 'ジャンルIDが未入力か数字ではありません' }),
+            mk(90003, { malls: malls('done', 'https://item.rakuten.co.jp/x/lst-90003/'), rakutenRegisteredAt: '2026-09-01T00:00:00Z', rakutenLastError: null }),
+            // 結果不明 (やり直し禁止・管理者だけ再実行) / 実行中 / 途中で止まった / 登録済みだが後処理が失敗
+            mk(90004, { malls: malls('todo'), rakutenRegisteredAt: null, rakutenLastError: '楽天への登録結果が確認できませんでした (fetch failed)', rakutenListingOutcome: 'unknown' }),
+            mk(90005, { malls: malls('todo'), rakutenRegisteredAt: null, rakutenLastError: null, rakutenListingOutcome: 'running', rakutenListingAttemptAt: new Date().toISOString() }),
+            mk(90006, { malls: malls('todo'), rakutenRegisteredAt: null, rakutenLastError: null, rakutenListingOutcome: 'running', rakutenListingAttemptAt: '2026-08-01T00:00:00Z' }),
+            mk(90007, { malls: malls('todo'), rakutenRegisteredAt: '2026-09-01T00:00:00Z', rakutenLastError: null }),
+          ],
+        }),
+      },
+    };
+  })()],
   ['board.ejs (空)', 'board.ejs', {
     ...boardBase,
     board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false, checkingTotal: 0 },
@@ -5279,6 +5310,48 @@ for (const [name, file, data] of renders) {
     check('ボード: 完了列のカードにも トップ画像 / 詳細画像 の状況が出る',
       rowsOk(doneRows.filter((r) => r.includes('>トップ画像<'))) && rowsOk(doneRows.filter((r) => r.includes('>詳細画像<'))),
       doneRows.slice(0, 2).join(' | ') || '(完了列に画像の行が無い)');
+  }
+  {
+    // 出品・展開の列のカード (2026-09-01): 未出品=ボタン / 失敗=理由+やり直しボタン / 出品済み=商品ページ
+    const bhL = renderedHtml.get('board.ejs (出品・展開にカード)') || '';
+    // カード 1 枚分 = <div class="kb-card …> から次のカードまで (ボタンにも data-draft が付くので、それでは切れない)
+    const cardOf = (id) => {
+      const seg = bhL.split('<div class="kb-card ').find((s) => s.includes(`data-draft="${id}"`)) || '';
+      // 次のカード (完了列は class="kb-card" と空白無しで始まる) と <script> の手前で切る —
+      // 最後のカードは末尾まで伸びて、スクリプト内の '.kb-rk-btn' を拾ってしまう
+      // (kb-card-top / kb-card-link は同じカードの中身なので切らない = 直後が '"' か空白のときだけ)
+      return seg.split(/<div class="kb-card[" ]/)[0].split('<script>')[0];
+    };
+    const c1 = cardOf(90001), c2 = cardOf(90002), c3 = cardOf(90003);
+    check('ボード(出品): 未出品のカードに「⚡ 楽天に出品」ボタンが出る',
+      /class="kb-rk-btn"[^>]*data-draft="90001"/.test(c1) && c1.includes('楽天に出品') && !c1.includes('やり直す'),
+      c1.slice(0, 200));
+    check('ボード(出品): 失敗したカードに理由と「やり直す」ボタンが出る',
+      c2.includes('kb-rk-fail') && c2.includes('ジャンルIDが未入力') && c2.includes('やり直す'),
+      c2.slice(0, 200));
+    check('ボード(出品): 出品済みのカードは商品ページへのリンク (ボタンは出さない)',
+      c3.includes('kb-rk-done') && c3.includes('https://item.rakuten.co.jp/x/lst-90003/') && !c3.includes('kb-rk-btn'),
+      c3.slice(0, 200));
+    check('ボード(出品): ボタン・結果はカードのリンク (<a>) の外にある (入れ子リンクにしない)', (() => {
+      // <a class="kb-card-link"> … </a> の内側に kb-rk が無いこと
+      const inLinks = [...bhL.matchAll(/<a class="kb-card-link"[\s\S]*?<\/a>/g)].map((m) => m[0]);
+      return inLinks.length > 0 && inLinks.every((a) => !a.includes('kb-rk'));
+    })());
+    check('ボード(出品): カードに data-rk (楽天の状態) と data-name が付く',
+      /data-rk="todo"[\s\S]{0,80}data-name="出品テスト 90001"/.test(bhL) && bhL.includes('data-rk="done"'),
+      (bhL.match(/data-rk="[^"]*"/g) || []).slice(0, 4).join(' '));
+    const c4 = cardOf(90004), c5 = cardOf(90005), c6 = cardOf(90006), c7 = cardOf(90007);
+    check('ボード(出品): 結果不明のカードは「やり直す」を出さず、RMS で確認の案内 + 管理者だけの再実行ボタン',
+      c4.includes('確認できませんでした') && c4.includes('lst-90004') && !c4.includes('やり直す')
+      && /class="kb-rk-btn"[^>]*data-force="1"/.test(c4),
+      c4.slice(0, 260));
+    check('ボード(出品): 実行中のカードは「出品しています…」でボタン無し',
+      c5.includes('kb-rk-busy') && !c5.includes('kb-rk-btn'), c5.slice(0, 200));
+    check('ボード(出品): 実行中のまま 15 分以上経ったカードは「途中で止まりました」= 結果不明と同じ扱い (やり直す無し・管理者の再実行のみ)',
+      c6.includes('途中で止まりました') && c6.includes('RMS') && !c6.includes('やり直す')
+      && /class="kb-rk-btn"[^>]*data-force="1"/.test(c6), c6.slice(0, 300));
+    check('ボード(出品): 登録済みだがモール状況が未更新のカードは「出品済み」+ 警告 (ボタンは出さない)',
+      c7.includes('kb-rk-done') && c7.includes('未更新') && !c7.includes('kb-rk-btn'), c7.slice(0, 260));
   }
   check('ボード: 確認中のカードに理由ラベルが出る',
     bh.includes('kb-checking') && bh.includes('🔍 確認中: パッケージ裏面の確認待ち'),
@@ -5703,6 +5776,274 @@ for (const [name, file, data] of renders) {
     holdCard && holdCard.imageOnHold === true && holdCard.imageHoldNote === 'テスト保留' && holdCard.kindStalledDays == null,
     JSON.stringify(holdCard && { imageOnHold: holdCard.imageOnHold, note: holdCard.imageHoldNote, stalled: holdCard.kindStalledDays }));
   dbmod.setImageWorkflowState(db, roomsRow.id, 'active', { actor: 'smoke' });
+}
+
+// ─── ボードから楽天に出品 (2026-09-01 中原さん要望): 画像転送 → 登録 → 後処理 を 1 本で ───
+// 外部 (Drive / R-Cabinet / RMS) は deps で差し替える。見るのは「順番・止まり方・記録」
+{
+  const bl = await import('../services/board-listing.js');
+  const wfp = wfpEarly;
+  // 本流を「出品・展開」まで進めた商品 (ボードでそこへ落とした状態)。工程のゲート (基本情報の材料等) は
+  // ここでは見たいものではないので、fixture として直接 done にする
+  const mkDraft = (code, { atListing = true, status = 'draft' } = {}) => {
+    const id = Number(db.prepare(
+      `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES (?, ?, ?, 'smoke')`,
+    ).run(code, `楽天出品テスト ${code}`, status).lastInsertRowid);
+    wfp.ensureProgress(db, id);
+    if (atListing) {
+      db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ?
+                  AND step_code IN (SELECT code FROM ph_steps WHERE track = 'main' AND code <> 'listing')`).run(id);
+    }
+    return id;
+  };
+  const rkOf = (id) => db.prepare('SELECT registered_at, last_error FROM draft_rakuten WHERE draft_id = ?').get(id) || {};
+  const mallOf = (id) => db.prepare("SELECT state, item_url FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'").get(id) || {};
+  const stepOf = (id) => db.prepare("SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(id)?.state;
+  const eventsOf = (id) => db.prepare('SELECT event FROM draft_events WHERE draft_id = ? ORDER BY id').all(id).map((r) => r.event);
+  const okTransfer = async () => ({ ok: true, uploaded: 2, failed: 0, results: [{ outcome: 'uploaded' }, { outcome: 'uploaded' }, { outcome: 'already' }] });
+  // 本物の registerItem は成功時に registered_at / published_at を書き、last_error を消す。偽物も同じ痕跡を残す
+  const okRegister = async (id) => {
+    db.prepare(`INSERT INTO draft_rakuten (draft_id, registered_at, published_at, last_error) VALUES (?, '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z', NULL)
+                ON CONFLICT(draft_id) DO UPDATE SET registered_at = excluded.registered_at, published_at = excluded.published_at, last_error = NULL`).run(id);
+    return { ok: true, manageNumber: 'lst-ok', status: 201, shopCategories: { ok: true, count: 1 } };
+  };
+
+  {
+    // 成功: 転送 → 登録 → 楽天モール=完了 + 画像工程⑧=完了 + 失敗理由なし
+    const id = mkDraft('LST-OK');
+    let order = [];
+    const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: {
+      transfer: async (...a) => { order.push('transfer'); return okTransfer(...a); },
+      register: async (...a) => { order.push('register'); return okRegister(...a); },
+    } });
+    check('ボード出品: 成功 = 転送 → 登録 の順で呼ぶ', order.join('>') === 'transfer>register', order.join('>'));
+    check('ボード出品: 成功の戻り (stage=done・転送の内訳)',
+      r.ok === true && r.stage === 'done' && r.transfer.uploaded === 2 && r.transfer.already === 1 && r.register.manageNumber === 'lst-ok',
+      JSON.stringify(r).slice(0, 200));
+    // 商品ページ URL は draft_mall_status に保存しない設計 (ensureMallStatus: 商品コードから決まる) なので見ない
+    check('ボード出品: 成功で 楽天モール=完了', mallOf(id).state === 'done', JSON.stringify(mallOf(id)));
+    check('ボード出品: 成功で 画像工程⑧「楽天登録」=完了', stepOf(id) === 'done', String(stepOf(id)));
+    check('ボード出品: 成功で last_error は空', rkOf(id).last_error == null, String(rkOf(id).last_error));
+    check('ボード出品: 開始・完了のイベントが残る',
+      eventsOf(id).includes('rakuten_board_listing_started') && eventsOf(id).includes('rakuten_board_listing_done'), eventsOf(id).join(','));
+    // 登録済みは二度出さない (RMS への PUT は取り消せない)
+    let dup = null;
+    try { await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { dup = e; }
+    check('ボード出品: 登録済みの商品は 400 で拒否', dup?.status === 400 && /登録済み/.test(dup.message), dup?.message);
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // 転送で 1 枚失敗 → 登録は呼ばない。理由を last_error に残す (カードに出る)
+    const id = mkDraft('LST-TRF');
+    let registerCalled = false;
+    const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: {
+      transfer: async () => ({ ok: false, uploaded: 1, failed: 1, results: [{ outcome: 'uploaded' }, { outcome: 'failed', error: 'Drive 403: not shared' }] }),
+      register: async () => { registerCalled = true; return okRegister(id); },
+    } });
+    check('ボード出品: 転送に失敗したら登録を呼ばない', r.ok === false && r.stage === 'transfer' && !registerCalled, JSON.stringify(r).slice(0, 160));
+    check('ボード出品: 転送失敗の理由が last_error に残る (Drive の共有を疑う文言)',
+      /転送できませんでした/.test(rkOf(id).last_error || '') && /not shared/.test(rkOf(id).last_error || '') && /共有/.test(rkOf(id).last_error || ''),
+      String(rkOf(id).last_error));
+    check('ボード出品: 転送失敗では楽天モールは動かない', (mallOf(id).state || 'todo') !== 'done', JSON.stringify(mallOf(id)));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // 画像が 1 枚も無い
+    const id = mkDraft('LST-NOIMG');
+    const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: {
+      transfer: async () => ({ ok: false, error: 'no_images' }), register: okRegister,
+    } });
+    check('ボード出品: 画像が無ければ転送段階で止まり、理由が残る',
+      r.ok === false && r.stage === 'transfer' && /商品画像がありません/.test(rkOf(id).last_error || ''), String(rkOf(id).last_error));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // 登録の前提チェックで止まる (registerItem は reasons を last_error に書かない → ここで残す)
+    const id = mkDraft('LST-REASON');
+    const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: {
+      transfer: okTransfer,
+      register: async () => ({ ok: false, reasons: ['ジャンルIDが未入力か数字ではありません', '売価が未入力か範囲外です (1〜1億円)'] }),
+    } });
+    check('ボード出品: 前提チェックの理由が戻り値と last_error の両方に残る',
+      r.ok === false && r.stage === 'register' && /ジャンルID/.test(r.error) && /出品の前提が揃っていません/.test(rkOf(id).last_error || '') && /売価/.test(rkOf(id).last_error || ''),
+      JSON.stringify({ err: r.error, last: rkOf(id).last_error }).slice(0, 220));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // RMS がエラーを返した (registerItem 自身が last_error を書く → 上書きしない)
+    const id = mkDraft('LST-RMS');
+    const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: {
+      transfer: okTransfer,
+      register: async () => {
+        db.prepare("INSERT INTO draft_rakuten (draft_id, last_error) VALUES (?, 'IE1002: 属性が不正') ON CONFLICT(draft_id) DO UPDATE SET last_error = excluded.last_error").run(id);
+        return { ok: false, status: 400, error: 'IE1002: 属性が不正' };
+      },
+    } });
+    check('ボード出品: RMS エラーは registerItem の記録をそのまま残す (二重に書かない)',
+      r.ok === false && r.stage === 'register' && rkOf(id).last_error === 'IE1002: 属性が不正', String(rkOf(id).last_error));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // 登録が例外 (warehouse 不通など) → 理由を残して失敗で返す (throw しない = 画面が固まらない)
+    const id = mkDraft('LST-THROW');
+    const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: {
+      transfer: okTransfer, register: async () => { throw new Error('WAREHOUSE_URL not configured on Render (fail-closed)'); },
+    } });
+    check('ボード出品: 登録の例外は失敗として返り、理由が残る',
+      r.ok === false && r.stage === 'register' && /楽天への登録でエラー/.test(rkOf(id).last_error || '') && /WAREHOUSE_URL/.test(rkOf(id).last_error || ''),
+      String(rkOf(id).last_error));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // 実行中の二重起動は 409 (連打・別タブ)。終わればフラグは消える
+    const id = mkDraft('LST-INFLIGHT');
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const first = bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: {
+      transfer: async () => { await gate; return okTransfer(); }, register: okRegister,
+    } });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    let second = null;
+    try { await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { second = e; }
+    check('ボード出品: 実行中に同じ商品をもう一度は 409', second?.status === 409 && bl.isRakutenListingInFlight(id), second?.message);
+    release();
+    const r1 = await first;
+    check('ボード出品: 先の実行は最後まで通り、フラグが消える', r1.ok === true && !bl.isRakutenListingInFlight(id), JSON.stringify(r1).slice(0, 120));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // HTTP: confirm 必須 / 登録済みは 400 / 存在しない商品は 404 (外部には出ない経路だけ叩く)
+    const express = (await import('express')).default;
+    const routerMod = await import('../router.js');
+    const app = express();
+    app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'staff' }; next(); });
+    app.use('/ph', routerMod.default);
+    const server = app.listen(0);
+    const base = `http://127.0.0.1:${server.address().port}/ph`;
+    const call = async (p, body) => {
+      const res = await fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      return { status: res.status, json: await res.json() };
+    };
+    const id = mkDraft('LST-HTTP');
+    let r = await call(`/api/drafts/${id}/rakuten/list-from-board`, {});
+    check('HTTP ボード出品: confirm が無ければ 400 (何もしない)', r.status === 400 && /confirm/.test(r.json.error || ''), JSON.stringify(r.json));
+    db.prepare("INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-09-01T00:00:00Z')").run(id);
+    r = await call(`/api/drafts/${id}/rakuten/list-from-board`, { confirm: true });
+    check('HTTP ボード出品: 登録済みは 400 で理由を返す', r.status === 400 && /登録済み/.test(r.json.error || ''), JSON.stringify(r.json));
+    r = await call('/api/drafts/999999999/rakuten/list-from-board', { confirm: true });
+    check('HTTP ボード出品: 存在しない商品は 404', r.status === 404, String(r.status));
+    // 結果不明の再実行 (force_unknown) は管理者だけ。一般ユーザーは 403 で何も起きない
+    const idU = mkDraft('LST-HTTP-FORCE');
+    db.prepare("INSERT INTO draft_rakuten (draft_id, listing_outcome, last_error) VALUES (?, 'unknown', 'x')").run(idU);
+    r = await call(`/api/drafts/${idU}/rakuten/list-from-board`, { confirm: true, force_unknown: true });
+    check('HTTP ボード出品: 結果不明の再実行を一般ユーザーが頼むと 403', r.status === 403, JSON.stringify(r.json));
+    r = await call(`/api/drafts/${idU}/rakuten/list-from-board`, { confirm: true });
+    check('HTTP ボード出品: 結果不明の商品は force なしだと 400 (RMS で確認、の案内)',
+      r.status === 400 && /RMS/.test(r.json.error || '') && /lst-http-force/.test(r.json.error || ''), JSON.stringify(r.json));
+    // 詳細画面の「公開で登録」もロックを通る (Codex R1 critical): ボードで実行中は 409
+    const idL = mkDraft('LST-HTTP-LOCK');
+    const releaseL = bl.acquireRakutenListingLock(idL);
+    r = await call(`/api/drafts/${idL}/rakuten/register`, { confirm: true });
+    check('HTTP 詳細画面の「公開で登録」: ボードで出品中の商品は 409 (同じロック)', r.status === 409, JSON.stringify(r.json));
+    releaseL();
+    // 詳細画面の「公開で登録」も 結果不明 / 登録済み を通さない (Codex R2 critical: ここが素通りだと
+    // 「結果不明は管理者だけが再実行」を詳細画面から迂回できる)
+    r = await call(`/api/drafts/${idU}/rakuten/register`, { confirm: true });
+    check('HTTP 詳細画面の「公開で登録」: 結果不明の商品は 400 (RMS で確認、の案内)',
+      r.status === 400 && /RMS/.test(r.json.error || ''), JSON.stringify(r.json));
+    r = await call(`/api/drafts/${id}/rakuten/register`, { confirm: true });
+    check('HTTP 詳細画面の「公開で登録」: 登録済みの商品は 400', r.status === 400 && /登録済み/.test(r.json.error || ''), JSON.stringify(r.json));
+    // 途中で止まった (running・実行中でない) も詳細画面から通さない (Codex R3: ロックを取ってから判定すると
+    // inFlight が自分自身になって「いま動いている」と誤認し、素通りしていた)
+    const idS = mkDraft('LST-HTTP-STUCK');
+    db.prepare("INSERT INTO draft_rakuten (draft_id, listing_outcome, listing_attempt_at) VALUES (?, 'running', '2026-08-01T00:00:00Z')").run(idS);
+    r = await call(`/api/drafts/${idS}/rakuten/register`, { confirm: true });
+    check('HTTP 詳細画面の「公開で登録」: 途中で止まった商品は 400 (ロックを取る前に判定)',
+      r.status === 400 && /途中で止まって/.test(r.json.error || '') && !bl.isRakutenListingInFlight(idS), JSON.stringify(r.json));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idS);
+    server.close();
+    db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?)').run(id, idU, idL);
+  }
+  {
+    // 🚨 PUT の結果が確認できなかった (RMS_OUTCOME_UNKNOWN) は「失敗」ではなく「結果不明」で止める。
+    // 実は登録が通っている可能性があるので、やり直し可 (retryable) にしてはいけない (Codex R1 critical)
+    const id = mkDraft('LST-UNKNOWN');
+    const unknownErr = Object.assign(new Error('楽天への登録結果が確認できませんでした (fetch failed)。RMS で商品管理番号 lst-unknown の有無を確認してから再実行してください'), { code: 'RMS_OUTCOME_UNKNOWN' });
+    const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: { transfer: okTransfer, register: async () => { throw unknownErr; } } });
+    const rk = db.prepare('SELECT listing_outcome, last_error FROM draft_rakuten WHERE draft_id = ?').get(id);
+    check('ボード出品: 結果不明は outcome=unknown・retryable=false で返る',
+      r.ok === false && r.outcome === 'unknown' && r.retryable === false && /確認できませんでした/.test(r.error), JSON.stringify(r).slice(0, 200));
+    check('ボード出品: 結果不明は DB に unknown と原文が残る',
+      rk.listing_outcome === 'unknown' && /lst-unknown/.test(rk.last_error || ''), JSON.stringify(rk));
+    check('ボード出品: 結果不明の商品は force 無しでは実行できない (400)', await (async () => {
+      try { await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); return false; }
+      catch (e) { return e.status === 400 && /RMS/.test(e.message); }
+    })());
+    // 人が RMS で未登録を確認 → 管理者が force で再実行 → 通る
+    const r2 = await bl.listToRakutenFromBoard(id, { actor: 'admin', forceUnknown: true, deps: { transfer: okTransfer, register: okRegister } });
+    const rk2 = db.prepare('SELECT listing_outcome, registered_at FROM draft_rakuten WHERE draft_id = ?').get(id);
+    check('ボード出品: force で再実行すると通り、outcome は消える', r2.ok === true && rk2.listing_outcome == null && !!rk2.registered_at, JSON.stringify({ r2: r2.ok, rk2 }));
+    check('ボード出品: 開始時に前回の last_error を消してから走る (古い理由が残らない)',
+      db.prepare('SELECT last_error FROM draft_rakuten WHERE draft_id = ?').get(id).last_error == null);
+    check('ボード出品: 結果不明のイベントが残る', eventsOf(id).includes('rakuten_listing_outcome_unknown'), eventsOf(id).join(','));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // サーバー側の状態チェック (confirm は誤操作防止であって認可ではない — Codex R1 high)
+    const idStep = mkDraft('LST-NOTYET', { atListing: false });
+    let e1 = null;
+    try { await bl.listToRakutenFromBoard(idStep, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { e1 = e; }
+    check('ボード出品: 本流が「出品・展開」まで来ていない商品は 400 (いまの工程名つき)',
+      e1?.status === 400 && /出品・展開/.test(e1.message) && /基本情報入力/.test(e1.message), e1?.message);
+    const idHold = mkDraft('LST-HOLD', { status: 'on_hold' });
+    let e2 = null;
+    try { await bl.listToRakutenFromBoard(idHold, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { e2 = e; }
+    check('ボード出品: 保留中の商品は 400', e2?.status === 400 && /保留/.test(e2.message), e2?.message);
+    check('ボード出品: 弾かれた商品には試行の痕跡を残さない (running のまま残らない)',
+      !db.prepare('SELECT 1 FROM draft_rakuten WHERE draft_id IN (?, ?) AND listing_outcome IS NOT NULL').get(idStep, idHold));
+    db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idStep, idHold);
+    // 全工程が決着している商品 (楽天は完了か対象外で決着済み) も通さない (Codex R2 high)
+    const idDone = mkDraft('LST-ALLDONE');
+    db.prepare("UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = 'listing'").run(idDone);
+    let e3 = null;
+    try { await bl.listToRakutenFromBoard(idDone, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { e3 = e; }
+    check('ボード出品: 本流が全部完了している商品は 400 (出し直しはモール別状況を戻してから)',
+      e3?.status === 400 && /完了しています/.test(e3.message), e3?.message);
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDone);
+    // 🚨 running のまま実行中でない = 途中で落ちた。PUT 成功直後に落ちた可能性があるので unknown と同じ扱い
+    // (Codex R2 critical: 「15 分経ったからやり直せる」にすると二重登録になり得る)
+    const idStuck = mkDraft('LST-STUCK');
+    db.prepare("INSERT INTO draft_rakuten (draft_id, listing_outcome, listing_attempt_at) VALUES (?, 'running', '2026-08-01T00:00:00Z')").run(idStuck);
+    let e4 = null;
+    try { await bl.listToRakutenFromBoard(idStuck, { actor: 'smoke', deps: { transfer: okTransfer, register: okRegister } }); } catch (e) { e4 = e; }
+    check('ボード出品: 途中で止まった (running・実行中でない) 商品は 400 = 結果不明と同じ扱い',
+      e4?.status === 400 && /途中で止まって/.test(e4.message) && /RMS/.test(e4.message), e4?.message);
+    const r4 = await bl.listToRakutenFromBoard(idStuck, { actor: 'admin', forceUnknown: true, deps: { transfer: okTransfer, register: okRegister } });
+    check('ボード出品: 途中で止まった商品も管理者の force なら再実行できる', r4.ok === true, JSON.stringify(r4).slice(0, 120));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idStuck);
+  }
+  {
+    // 後処理 (afterRakutenRegistered): 成功の形と、対象外 (skip) の工程⑧を上書きしないこと
+    const id = mkDraft('LST-POST');
+    wfp.setStepState(id, 'imgd_rakuten', { state: 'skip' }, 'smoke', ADMIN);
+    const post = bl.afterRakutenRegistered(db, { id, ne_code: 'LST-POST', name: 'x' }, 'smoke');
+    check('後処理: モール=完了・工程⑧はそのまま (対象外を上書きしない)',
+      post.mallOk === true && post.stepOk === true && stepOf(id) === 'skip' && mallOf(id).state === 'done', JSON.stringify({ post, step: stepOf(id) }));
+    check('後処理: 成功時は失敗イベントを残さない', !eventsOf(id).includes('rakuten_postprocess_failed'));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
+  {
+    // ロックは解放関数を二度呼んでも安全 / 例外でも解放される
+    const id = mkDraft('LST-LOCK');
+    const rel = bl.acquireRakutenListingLock(id);
+    let dup = null;
+    try { bl.acquireRakutenListingLock(id); } catch (e) { dup = e; }
+    rel(); rel();
+    check('ロック: 二重取得は 409・解放は冪等', dup?.status === 409 && !bl.isRakutenListingInFlight(id));
+    const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: { transfer: async () => { throw new Error('boom'); }, register: okRegister } });
+    check('ロック: 転送が例外を投げても失敗で返り、ロックは解放される', r.ok === false && r.stage === 'transfer' && !bl.isRakutenListingInFlight(id), JSON.stringify(r).slice(0, 120));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
 }
 
 {
