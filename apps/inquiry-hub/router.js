@@ -677,6 +677,8 @@ router.get('/inquiries/:id', (req, res) => {
         ${activeJob
           ? `<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px">この問い合わせには未決着の送信ジョブ (#${activeJob.id}) があります。<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消してから新しい返信を作成してください</div>`
           : `<div class="row tpl-row" id="tplRow">
+          <input type="search" id="tplSearch" placeholder="🔍 キーワードで絞り込み"
+            title="テンプレート名・グループ・件名・本文・キーワードで絞り込みます (空白区切りで複数指定)">
           <select id="tplSel" title="テンプレートを選ぶ (カテゴリごとにまとまっています)"><option value="">📄 テンプレートを選ぶ…</option></select>
           <button class="ghost" id="tplApplyBtn" type="button">本文に反映</button>
         </div>
@@ -1192,29 +1194,36 @@ router.get('/inquiries/:id', (req, res) => {
   var tplRow = document.getElementById('tplRow');
   if (tplRow) (function() {
     var tplSel = document.getElementById('tplSel');
-    var TPLS = null, tplLoading = null;
+    var tplSearch = document.getElementById('tplSearch');
+    var TPLS = null, CATS = [], tplLoading = null;
     function loadTpls() {
       if (tplLoading) return tplLoading;
       tplLoading = fetch('/apps/inquiry-hub/api/templates')
         .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-        .then(function(j) { TPLS = j.templates || []; fillTplSel(j.categories || []); })
+        .then(function(j) { TPLS = j.templates || []; CATS = j.categories || []; fillTplSel(); })
         .catch(function(e) { tplLoading = null; toast('テンプレート取得失敗: ' + e.message); });
       return tplLoading;
     }
     // カテゴリ = <optgroup> (太字の見出し) にまとめ、その下にテンプレートを並べる
     // (2026-08-26 スタッフ要望「テンプレートが増えて探しにくい。カテゴリ見出しの下にまとめて」= メールディーラーと同じ見え方)
-    function fillTplSel(categories) {
+    // 🔍絞り込み中はヒットしたものだけ並べる (2026-09-02 スタッフ要望)
+    function fillTplSel() {
       if (!TPLS) return;
+      var q = tplSearch.value;
+      var shown = tplFilter(TPLS, q);
       var cur = tplSel.value;
       tplSel.textContent = '';
       var head = document.createElement('option');
-      head.value = ''; head.textContent = '📄 テンプレートを選ぶ… (' + TPLS.length + '件)';
+      head.value = '';
+      head.textContent = q.trim()
+        ? (shown.length ? '🔍 ' + shown.length + '件ヒット — 選んでください' : '🔍 該当なし (キーワードを変えてください)')
+        : '📄 テンプレートを選ぶ… (' + TPLS.length + '件)';
       tplSel.appendChild(head);
-      var order = categories.slice();
-      TPLS.forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
+      var order = CATS.slice();
+      shown.forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
       order.push('');   // 未分類は最後に「その他」
       order.forEach(function(cat) {
-        var items = TPLS.filter(function(t) { return (t.category || '') === cat; });
+        var items = shown.filter(function(t) { return (t.category || '') === cat; });
         if (!items.length) return;
         var g = document.createElement('optgroup');
         g.label = cat || 'その他';
@@ -1232,6 +1241,8 @@ router.get('/inquiries/:id', (req, res) => {
     // マウスが返信パネルに乗った時点で先読みして、セレクトを開いた時には並んでいる状態にする
     tplRow.addEventListener('pointerover', loadTpls, { once: true });
     tplSel.addEventListener('focus', loadTpls);
+    tplSearch.addEventListener('focus', loadTpls);
+    tplSearch.addEventListener('input', function() { if (TPLS) fillTplSel(); else loadTpls(); });
     function applyTpl() {
       var t = (TPLS || []).find(function(x) { return String(x.id) === tplSel.value; });
       if (!t) { toast('テンプレートを選んでください'); return; }
@@ -1537,6 +1548,7 @@ router.get('/api/templates', (req, res) => {
       name: t.template_name,
       category: t.category || '',
       subject: t.subject || '',
+      keywords: t.keywords || '',   // メールディーラーの「キーワード」列。画面の絞り込み検索の対象
       body: t.template_body || '',
       bodyBottom: t.body_bottom || '',
     })),
@@ -2019,7 +2031,11 @@ router.get('/compose', (req, res) => {
     <div class="cform">
       <label class="k" for="tplSel">テンプレート</label>
       <div>
-        <select id="tplSel"><option value="">-------- (使わない)</option></select>
+        <div class="row tpl-row" style="margin-bottom:6px">
+          <input type="search" id="tplSearch" placeholder="🔍 キーワードで絞り込み"
+            title="テンプレート名・グループ・件名・本文・キーワードで絞り込みます (空白区切りで複数指定)">
+          <select id="tplSel"><option value="">-------- (使わない)</option></select>
+        </div>
         <div class="sub" style="margin-top:4px">選ぶと件名と本文が入った状態で次の画面が開きます (そのあと自由に編集できます)</div>
         <div class="cpreview" id="tplPrev" hidden></div>
       </div>
@@ -2049,37 +2065,53 @@ router.get('/compose', (req, res) => {
 
   const script = `
   var SIGS = ${JSON.stringify(signatures.map(s => ({ id: s.id, body: s.body }))).replace(/</g, '\\u003c')};
-  var TPLS = null;
+  var TPLS = null, CATS = [];
   var tplSel = document.getElementById('tplSel');
+  var tplSearch = document.getElementById('tplSearch');
   var sigSel = document.getElementById('sigSel');
+  // カテゴリ = optgroup (太字の見出し)。未分類は最後に「その他」(返信画面と同じ並べ方)。
+  // 🔍絞り込み中はヒットしたものだけ並べる (2026-09-02 スタッフ要望)
+  function fillTplSel() {
+    if (!TPLS) return;
+    var q = tplSearch.value;
+    var shown = tplFilter(TPLS, q);
+    var cur = tplSel.value;
+    tplSel.textContent = '';
+    var head = document.createElement('option');
+    head.value = '';
+    head.textContent = q.trim()
+      ? (shown.length ? '🔍 ' + shown.length + '件ヒット — 選んでください' : '🔍 該当なし (キーワードを変えてください)')
+      : '-------- (テンプレートを使わない)';
+    tplSel.appendChild(head);
+    var order = CATS.slice();
+    shown.forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
+    order.push('');
+    order.forEach(function(cat) {
+      var items = shown.filter(function(t) { return (t.category || '') === cat; });
+      if (!items.length) return;
+      var g = document.createElement('optgroup');
+      g.label = cat || 'その他';
+      items.forEach(function(t) {
+        var o = document.createElement('option');
+        o.value = String(t.id); o.textContent = t.name;
+        g.appendChild(o);
+      });
+      tplSel.appendChild(g);
+    });
+    tplSel.value = cur;
+    if (tplSel.selectedIndex < 0) tplSel.value = '';
+    // 絞り込みで選択中のテンプレが外れたら、プレビューも同期する (古いプレビューが
+    // 残ると「選んだつもり」で次へ進んでしまう)
+    if (tplSel.value !== cur) syncTplPrev();
+  }
+  tplSearch.addEventListener('input', fillTplSel);
   // テンプレートは件数が多いので本文ごと埋め込まず、返信画面と同じ /api/templates から取る
   fetch('/apps/inquiry-hub/api/templates')
     .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
     .then(function(j) {
       TPLS = j.templates || [];
-      var cur = tplSel.value;
-      tplSel.textContent = '';
-      var head = document.createElement('option');
-      head.value = ''; head.textContent = '-------- (テンプレートを使わない)';
-      tplSel.appendChild(head);
-      // カテゴリ = optgroup (太字の見出し)。未分類は最後に「その他」(返信画面と同じ並べ方)
-      var order = (j.categories || []).slice();
-      TPLS.forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
-      order.push('');
-      order.forEach(function(cat) {
-        var items = TPLS.filter(function(t) { return (t.category || '') === cat; });
-        if (!items.length) return;
-        var g = document.createElement('optgroup');
-        g.label = cat || 'その他';
-        items.forEach(function(t) {
-          var o = document.createElement('option');
-          o.value = String(t.id); o.textContent = t.name;
-          g.appendChild(o);
-        });
-        tplSel.appendChild(g);
-      });
-      tplSel.value = cur;
-      if (tplSel.selectedIndex < 0) tplSel.value = '';
+      CATS = j.categories || [];
+      fillTplSel();
     })
     .catch(function(e) { toast('テンプレート取得失敗: ' + e.message); });
 
@@ -2087,11 +2119,12 @@ router.get('/compose', (req, res) => {
     el.textContent = text || '';
     el.hidden = !text;
   }
-  tplSel.addEventListener('change', function() {
+  function syncTplPrev() {
     var t = (TPLS || []).find(function(x) { return String(x.id) === tplSel.value; });
     showPreview(document.getElementById('tplPrev'),
       t ? ((t.subject ? '件名: ' + t.subject + '\\n\\n' : '') + t.body + (t.bodyBottom ? '\\n\\n' + t.bodyBottom : '')) : '');
-  });
+  }
+  tplSel.addEventListener('change', syncTplPrev);
   function syncSigPrev() {
     var s = SIGS.find(function(x) { return String(x.id) === sigSel.value; });
     showPreview(document.getElementById('sigPrev'), s ? s.body : '');
@@ -2160,6 +2193,8 @@ router.get('/compose/new', (req, res) => {
       <label class="k" for="cBody">本文 <span style="color:#b91c1c">*</span></label>
       <div>
         <div class="row tpl-row" id="tplRow" style="margin-bottom:6px">
+          <input type="search" id="tplSearch" placeholder="🔍 キーワードで絞り込み"
+            title="テンプレート名・グループ・件名・本文・キーワードで絞り込みます (空白区切りで複数指定)">
           <select id="tplSel" title="テンプレートを選ぶ (カテゴリごとにまとまっています)"><option value="">📄 テンプレートを本文に入れる…</option></select>
         </div>
         <textarea id="cBody" maxlength="${BODY_MAX}" placeholder="本文">${he(initialBody)}</textarea>
@@ -2202,41 +2237,51 @@ router.get('/compose/new', (req, res) => {
   // ─── テンプレートを後から本文に入れる (1段目で選ばなかった場合の入口) ───
   (function() {
     var tplSel = document.getElementById('tplSel');
-    var TPLS = null, loading = null;
+    var tplSearch = document.getElementById('tplSearch');
+    var TPLS = null, CATS = [], loading = null;
+    // 🔍絞り込み中はヒットしたものだけ並べる (2026-09-02 スタッフ要望)
+    function fillTplSel() {
+      if (!TPLS) return;
+      var q = tplSearch.value;
+      var shown = tplFilter(TPLS, q);
+      var cur = tplSel.value;
+      tplSel.textContent = '';
+      var head = document.createElement('option');
+      head.value = '';
+      head.textContent = q.trim()
+        ? (shown.length ? '🔍 ' + shown.length + '件ヒット — 選んでください' : '🔍 該当なし (キーワードを変えてください)')
+        : '📄 テンプレートを本文に入れる… (' + TPLS.length + '件)';
+      tplSel.appendChild(head);
+      var order = CATS.slice();
+      shown.forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
+      order.push('');
+      order.forEach(function(cat) {
+        var items = shown.filter(function(t) { return (t.category || '') === cat; });
+        if (!items.length) return;
+        var g = document.createElement('optgroup');
+        g.label = cat || 'その他';
+        items.forEach(function(t) {
+          var o = document.createElement('option');
+          o.value = String(t.id); o.textContent = t.name;
+          g.appendChild(o);
+        });
+        tplSel.appendChild(g);
+      });
+      tplSel.value = cur;
+      if (tplSel.selectedIndex < 0) tplSel.value = '';
+    }
     function load() {
       if (loading) return loading;
       loading = fetch('/apps/inquiry-hub/api/templates')
         .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-        .then(function(j) {
-          TPLS = j.templates || [];
-          var cur = tplSel.value;
-          tplSel.textContent = '';
-          var head = document.createElement('option');
-          head.value = ''; head.textContent = '📄 テンプレートを本文に入れる… (' + TPLS.length + '件)';
-          tplSel.appendChild(head);
-          var order = (j.categories || []).slice();
-          TPLS.forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
-          order.push('');
-          order.forEach(function(cat) {
-            var items = TPLS.filter(function(t) { return (t.category || '') === cat; });
-            if (!items.length) return;
-            var g = document.createElement('optgroup');
-            g.label = cat || 'その他';
-            items.forEach(function(t) {
-              var o = document.createElement('option');
-              o.value = String(t.id); o.textContent = t.name;
-              g.appendChild(o);
-            });
-            tplSel.appendChild(g);
-          });
-          tplSel.value = cur;
-          if (tplSel.selectedIndex < 0) tplSel.value = '';
-        })
+        .then(function(j) { TPLS = j.templates || []; CATS = j.categories || []; fillTplSel(); })
         .catch(function(e) { loading = null; toast('テンプレート取得失敗: ' + e.message); });
       return loading;
     }
     document.getElementById('tplRow').addEventListener('pointerover', load, { once: true });
     tplSel.addEventListener('focus', load);
+    tplSearch.addEventListener('focus', load);
+    tplSearch.addEventListener('input', function() { if (TPLS) fillTplSel(); else load(); });
     tplSel.addEventListener('change', function() {
       var t = (TPLS || []).find(function(x) { return String(x.id) === tplSel.value; });
       if (!t) return;
@@ -5188,6 +5233,8 @@ figure.att-img.att-err .att-fail { display: block; }
 /* 返信パネルのテンプレート選択行 */
 .tpl-row { margin-bottom: 8px; flex-wrap: wrap; }
 .tpl-row #tplSel { flex: 1; min-width: 160px; }
+/* 🔍キーワード絞り込み (2026-09-02 スタッフ要望)。セレクトより控えめな幅で横に並べる */
+.tpl-row #tplSearch { flex: 0 1 200px; min-width: 140px; }
 /* カテゴリ見出し (optgroup) は太字・テンプレートは1段下げて、一目で区別がつくように */
 .tpl-row #tplSel optgroup { font-weight: 700; font-style: normal; color: #0f172a; }
 .tpl-row #tplSel option { font-weight: 400; padding-left: 1.2em; }
@@ -5478,6 +5525,21 @@ function toast(msg) {
   var t = document.getElementById('toast');
   t.textContent = msg; t.style.display = 'block';
   clearTimeout(t._h); t._h = setTimeout(function(){ t.style.display = 'none'; }, 2800);
+}
+// テンプレートのキーワード絞り込み (2026-09-02 スタッフ要望「キーワード入力で探せたら便利」)。
+// 全角/半角・大文字/小文字・ひらがな/カタカナの違いを吸収する。空白区切りは AND 条件
+function tplNorm(s) {
+  s = String(s || '');
+  try { s = s.normalize('NFKC'); } catch (e) { /* 古い環境では正規化なしで続行 */ }
+  return s.toLowerCase().replace(/[\\u3041-\\u3096]/g, function(c) { return String.fromCharCode(c.charCodeAt(0) + 0x60); });
+}
+function tplFilter(tpls, q) {
+  var words = tplNorm(q).split(/\\s+/).filter(Boolean);
+  if (!words.length) return tpls;
+  return tpls.filter(function(t) {
+    var hay = tplNorm([t.name, t.category, t.subject, t.keywords, t.body, t.bodyBottom].join('\\n'));
+    return words.every(function(w) { return hay.indexOf(w) >= 0; });
+  });
 }
 // サイドバー開閉 (スマホ)。PCでは常時表示なのでボタン自体をCSSで隠している
 (function() {

@@ -613,6 +613,34 @@ console.log('HTTP: 全件一括');
     try { new vm.Script(scriptOf(dMail)); } catch (e) { jsErr = e; }
     check('詳細画面のクライアントJSが構文OK (メール)', jsErr === null, String(jsErr));
 
+    // 🔍 テンプレのキーワード絞り込み (2026-09-02 スタッフ要望「キーワード入力で探せたら便利」)
+    check('返信欄: テンプレのキーワード絞り込み入力欄がある',
+      dMail.includes('id="tplSearch"') && dMail.includes('tplFilter('));
+    {
+      // 共有スクリプトから tplNorm/tplFilter を取り出して実挙動を検証
+      // (関数は列0の "}" で終わる前提。取り出せなければ下の実行が throw して落ちる)
+      const shared = scriptOf(dMail);
+      const fnSrc = ['tplNorm', 'tplFilter'].map(n => {
+        const m = shared.match(new RegExp('function ' + n + '\\([\\s\\S]*?\\n}'));
+        return m ? m[0] : `throw new Error('${n} が共有スクリプトに見つかりません');`;
+      }).join('\n');
+      const ctx = {};
+      vm.createContext(ctx);
+      vm.runInNewContext(fnSrc, ctx);
+      const tpls = [
+        { id: 1, name: '返品のご案内', category: '返品・交換', subject: '', keywords: 'へんぴん 返送', body: '返品の手順をご案内します', bodyBottom: '' },
+        { id: 2, name: 'ノベルティ欠品', category: 'その他', subject: '', keywords: '', body: 'noveltyの在庫が切れています', bodyBottom: '' },
+      ];
+      check('絞り込み: ひらがな/カタカナを同一視', ctx.tplFilter(tpls, 'ヘンピン').length === 1
+        && ctx.tplFilter(tpls, 'へんぴん')[0].id === 1);
+      check('絞り込み: 全角英字・大文字でも当たる (NFKC+小文字化)', ctx.tplFilter(tpls, 'ＮＯＶＥＬＴＹ').length === 1
+        && ctx.tplFilter(tpls, 'Novelty')[0].id === 2);
+      check('絞り込み: 空白区切りはAND条件', ctx.tplFilter(tpls, '返品 手順').length === 1
+        && ctx.tplFilter(tpls, '返品 在庫').length === 0);
+      check('絞り込み: 空・空白のみは全件', ctx.tplFilter(tpls, '').length === 2 && ctx.tplFilter(tpls, '　 ').length === 2);
+      check('絞り込み: メールディーラーのキーワード列も対象', ctx.tplFilter(tpls, '返送').length === 1);
+    }
+
     const shopYh = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('yahoo','Yahoo店','yh-ui')").run().lastInsertRowid;
     const iYh = db.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject, received_at, is_unread)
       VALUES ('yahoo', ?, 'yh-ui-1', 'Yahoo問い合わせ', ?, 1)`).run(shopYh, T('2026-08-26T10:00:00+09:00')).lastInsertRowid;

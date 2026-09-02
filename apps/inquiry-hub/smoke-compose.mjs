@@ -437,6 +437,8 @@ console.log('8. 画面');
   check('1段目: To/From設定に送信元アドレスが出る', step1.includes('info@b-faith.biz'));
   check('1段目: 登録済みの署名が並ぶ', step1.includes('雑貨イズム署名'));
   check('1段目: 「次へ」で2段目へ進む', step1.includes('id="nextBtn"') && step1.includes('/apps/inquiry-hub/compose/new'));
+  check('1段目: テンプレのキーワード絞り込み入力欄がある (2026-09-02 スタッフ要望)',
+    step1.includes('id="tplSearch"') && step1.includes('tplFilter('));
   let e1 = null; try { new vm.Script(scriptOf(step1)); } catch (e) { e1 = e; }
   check('1段目のクライアントJSが構文OK', e1 === null, String(e1));
 
@@ -452,6 +454,8 @@ console.log('8. 画面');
   check('2段目: 選んだ署名が本文末尾に展開される', step2.includes('雑貨イズム（B-Faith株式会社）'));
   check('2段目: 添付ボタンがある', step2.includes('id="attBtn"') && step2.includes('📎 ファイルを添付'));
   check('2段目: 「送信」と「送信して完了」の2ボタン', step2.includes('id="sendBtn"') && step2.includes('id="sendDoneBtn"'));
+  check('2段目: テンプレのキーワード絞り込み入力欄がある (2026-09-02 スタッフ要望)',
+    step2.includes('id="tplSearch"') && step2.includes('tplFilter('));
   let e2 = null; try { new vm.Script(scriptOf(step2)); } catch (e) { e2 = e; }
   check('2段目のクライアントJSが構文OK', e2 === null, String(e2));
 
