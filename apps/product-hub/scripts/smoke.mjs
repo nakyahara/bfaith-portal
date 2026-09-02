@@ -3757,6 +3757,15 @@ let wfSetParentId = null;
   r = await call('POST', `/api/drafts/${idP}/rakuten`, { genre_id: '1', article_number: '' });
   check('メーカー型番: 空文字は明示的な解除', r.status === 200
     && db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(idP)?.article_number == null);
+  // バリエーションは単品用の競合チェックを走らせず、旧データ (属性側の型番) も捨てない (Codex R2 high)
+  db.prepare(`UPDATE draft_rakuten SET article_number = 'NEW', attributes_json = '[{"name":"メーカー型番","values":["OLD"]}]' WHERE draft_id = ?`).run(idP);
+  r = await call('POST', `/api/drafts/${idP}/rakuten`, { genre_id: '1' });
+  {
+    const row = db.prepare('SELECT article_number, attributes_json FROM draft_rakuten WHERE draft_id = ?').get(idP);
+    check('メーカー型番: バリエーションの /rakuten は旧型番の食い違いで 400 にせず、旧値も捨てない',
+      r.status === 200 && row?.article_number === 'NEW' && String(row?.attributes_json).includes('OLD'), `${r.status} ${JSON.stringify(row)}`);
+  }
+  db.prepare(`UPDATE draft_rakuten SET article_number = NULL, attributes_json = NULL WHERE draft_id = ?`).run(idP);
   const exOf = (code) => db.prepare(
     'SELECT reason FROM draft_sku_catalog_exemptions WHERE draft_id = ? AND sku_code = ?').get(idP, code)?.reason;
   r = await call('POST', `/api/drafts/${idP}/sku-catalog-exemptions`, { ne_code: 'vc-b', reason: '3' });
@@ -6476,8 +6485,22 @@ for (const [name, file, data] of renders) {
         setTimeout, console,
       };
       vm.createContext(ctx);
-      const api = new vm.Script(`const skuSavers = [];\nlet skuSaveGeneration = 0;\n${iife}\n({ flush: () => flushSkuSavers() })`, { filename: 'initSkuJans' }).runInContext(ctx);
-      return { a, b, pending, alerts, posts, flush: api.flush };
+      const api = new vm.Script(`const skuSavers = [];\nlet skuSaveGeneration = 0;\nconst skuPendingOps = new Set();\n${iife}\n({ flush: () => flushSkuSavers(), track: (p) => trackSkuOp(p) })`, { filename: 'initSkuJans' }).runInContext(ctx);
+      return { a, b, pending, alerts, posts, flush: api.flush, track: api.track };
+    }
+    // 0) ワーカー外の保存 (一括入力) が実行中なら flush はその完了を待つ (Codex R2 high)
+    {
+      const h = harness();
+      let done = null;
+      const op = new Promise((resolve) => { done = resolve; });
+      h.track(op);
+      let flushed = null;
+      const fl = h.flush().then((v) => { flushed = v; return v; });
+      await tick();
+      check('sku-jan worker: 一括操作が実行中なら flush は戻らない', flushed === null);
+      done({ ok: true });
+      const ok = await fl;
+      check('sku-jan worker: 一括操作が終わってから flush=true', ok === true && flushed === true);
     }
     // 1) A の保存が通信中に flush → その間に B を変更 → A 成功 → B も保存されてから flush が true で戻る
     {

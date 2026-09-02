@@ -1182,7 +1182,13 @@ export function buildItemPayload(db, draftId) {
       const skuAttrs = [...cell.entries()]
         .filter(([n, vals]) => vals.length > 0 && n !== MODEL_ATTR_NAME && n !== 'カタログID')
         .map(([n, vals]) => ({ name: n, values: vals.slice() }));
-      const skuModel = String((cell.get(MODEL_ATTR_NAME) || [])[0] || '').trim();
+      // メーカー型番は 1 値 (RMS の articleNumber 相当ではなく属性として送るが、値は 1 つ)。
+      // 「A | B」のように複数入っていたら先頭だけ黙って送らず止める (Codex R2 high)
+      const modelVals = cell.get(MODEL_ATTR_NAME) || [];
+      if (modelVals.length > 1) {
+        reasons.push(`SKU「${skuCode}」の${MODEL_ATTR_NAME}が複数あります (${modelVals.join(' / ')}) — 1 つだけにしてください`);
+      }
+      const skuModel = String(modelVals[0] || '').trim();
       const modelExplicit = (grid.explicit.get(key) || new Set()).has(MODEL_ATTR_NAME);
       const rawSkuReason = exemptionRows.get(key);
       const skuReason = Number.isInteger(rawSkuReason) && rawSkuReason >= 1 && rawSkuReason <= 6 ? rawSkuReason : catalogExemptionReason;
@@ -1289,8 +1295,11 @@ export function buildItemPayload(db, draftId) {
         if (da.name === MODEL_ATTR_NAME && skuModel) continue; // メーカー型番の欄/セルから自動付与する
         reasons.push(`${tag}必須属性「${da.name}」が未入力です (ジャンル ${genreLabel} の必須)`);
       }
-      // ③ 値の数・長さの軽い検証 (RMS と同じ基準で早めに教える)
-      for (const a of skuAttrs) {
+      // ③ 値の数・長さの軽い検証 (RMS と同じ基準で早めに教える)。メーカー型番も辞書にあれば同じ基準で見る
+      const checkList = skuModel && dictByName.has(MODEL_ATTR_NAME)
+        ? [...skuAttrs, { name: MODEL_ATTR_NAME, values: [skuModel] }]
+        : skuAttrs;
+      for (const a of checkList) {
         const da = dictByName.get(a.name);
         if (!da) continue;
         if (da.multiValueLimit && a.values.length > da.multiValueLimit) {

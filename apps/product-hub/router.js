@@ -1115,6 +1115,11 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
     .flatMap((a) => (Array.isArray(a.values) ? a.values : (a.value !== undefined ? [a.value] : [])))
     .map((v) => String(v == null ? '' : v).trim())
     .filter(Boolean);
+  // バリエーション (SKU 表が入口、2026-09-03) は単品用の競合チェック・旧値の整理を走らせない
+  // (Codex R2 high: 全 SKU に型番を明示しても /rakuten が 400 で止まり、画面に解消ボタンも無い)。
+  // 旧データは skuAttributeGrid が既定値/食い違いとして扱い、buildItemPayload が SKU 表への入力を促す
+  const variationForRk = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id, withMembers: false });
+  const isVariationDraft = variationForRk.kind === 'variation' && variationForRk.memberCount > 1;
   const prevModels = modelOf(prevAttrs);
   const postModels = rows ? rows.filter((a) => a.name === MODEL_ATTR_NAME).map((a) => String(a.value || '').trim()).filter(Boolean) : [];
   const modelValues = [...new Set([...postModels, ...prevModels])];
@@ -1136,7 +1141,7 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
         error: `この商品の${MODEL_ATTR_NAME}が別の画面から変わりました (いまの値: ${prevSet.join(' / ') || 'なし'})。画面を再読み込みしてから選び直してください` });
     }
   }
-  if (!resolveModel) {
+  if (!resolveModel && !isVariationDraft) {
     if (modelValues.length > 1) {
       return res.status(400).json({ ok: false, conflict: MODEL_ATTR_NAME, values: modelValues,
         error: `${MODEL_ATTR_NAME}が複数あります (${modelValues.join(' / ')})。画面の警告からどれを残すか選んでください` });
@@ -1158,8 +1163,9 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
     if (parseAttributes(attributesJson) === null) {
       return res.status(400).json({ ok: false, error: '属性の形式が不正です' });
     }
-  } else if (prevModels.length > 0) {
-    // 部分更新でも、メーカー型番の行は残さない (次の保存でまた競合として出てくる)
+  } else if (prevModels.length > 0 && !isVariationDraft) {
+    // 部分更新でも、メーカー型番の行は残さない (次の保存でまた競合として出てくる)。
+    // バリエーションは旧値を捨てない (SKU 表の既定値・食い違いの材料として残す)
     attributesJson = JSON.stringify(prevAttrs.filter((a) => !(a && a.name === MODEL_ATTR_NAME)));
   }
 

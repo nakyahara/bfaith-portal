@@ -3005,7 +3005,8 @@
   // SKU ごとの即保存ワーカー一覧 (JAN / 商品仕様 / IDなしの理由。createSkuSaver が登録する)。
   // 未保存の変更を確定して全部待ち、1 件でも失敗したら false
   const skuSavers = [];
-  let skuSaveGeneration = 0;   // change が来るたびに +1 (全ワーカーを通した安定確認に使う)
+  let skuSaveGeneration = 0;   // change / 一括操作の開始・終了ごとに +1 (全ワーカーを通した安定確認に使う)
+  const skuPendingOps = new Set(); // ワーカー外の保存 (一括入力・行削除) の実行中 Promise (Codex R2 high: flush が待つ)
   const flushSkuJanSaves = () => flushSkuSavers();
   async function saveRakutenFields() {
     // JAN (単品欄 / SKU表) の保存を先に確定させる。失敗したらプレビュー・登録に進まない (Codex R2 high)
@@ -3543,6 +3544,8 @@
       isDirty: () => dirtyInputs().length > 0,
       // 一括入力など別経路で保存済みにした値を「DB の値」として覚える
       markSaved(input, value) { uncertain.delete(input); lastOf.set(input, value); },
+      // 別経路の保存が結果不明 (通信エラー) になった入力: 次の change / flush で現在値を再送する
+      markUncertain(input) { uncertain.add(input); },
       // プレビュー・登録・出品情報保存の前に呼ばれる。(合流した) drain の開始以降に 1 件でも失敗していたら /
       // まだ DB と違う入力が残っていたら false
       async flush() {
@@ -3559,11 +3562,20 @@
   async function flushSkuSavers() {
     for (let i = 0; i < 10; i++) {
       const gen = skuSaveGeneration;
+      // ワーカー外の保存 (一括入力・行削除) が走っていれば先に終わるのを待つ
+      if (skuPendingOps.size > 0) await Promise.allSettled([...skuPendingOps]);
       const ok = (await Promise.all(skuSavers.map((s) => s.flush()))).every(Boolean);
       if (!ok) return false;
-      if (gen === skuSaveGeneration && skuSavers.every((s) => !s.isDirty())) return true;
+      if (gen === skuSaveGeneration && skuPendingOps.size === 0 && skuSavers.every((s) => !s.isDirty())) return true;
     }
     return false;
+  }
+  // ワーカー外の保存 (一括入力・行削除) を flush の待ち対象にする。開始・終了で世代を進める
+  function trackSkuOp(promise) {
+    skuPendingOps.add(promise);
+    skuSaveGeneration += 1;
+    promise.finally(() => { skuPendingOps.delete(promise); skuSaveGeneration += 1; }).catch(() => {});
+    return promise;
   }
 
   // ─── SKU別JAN (2026-08-28 中原さん要望)。入力欄を離れたら即保存 ───
@@ -3675,9 +3687,15 @@
       }
       let json;
       try {
-        json = await post(BASE + '/sku-attributes', { name, value, all: true });
+        // flush (プレビュー・登録・保存) が完了を待てるよう追跡する (Codex R2 high)
+        json = await trackSkuOp(post(BASE + '/sku-attributes', { name, value, all: true }));
       } catch (e) {
-        json = { ok: false, error: '通信エラーで保存できませんでした。もう一度お試しください' };
+        // 結果不明: サーバーが適用済みかもしれない。セルを意図した値にして「結果不明」にし、
+        // 次の change / flush で SKU ごとに同じ値を再送して収束させる (黙って旧値のままにしない)
+        cells.forEach((c) => { c.value = value; attrSaver.markUncertain(c); });
+        alert('通信エラーで一括入力の結果が分かりません。保存・登録の前に自動で再送します (画面の値をそのまま使います)');
+        updateTabBadges();
+        return;
       }
       if (!json.ok) { alert(json.error || '保存に失敗しました'); return; }
       cells.forEach((c) => { c.value = value; attrSaver.markSaved(c, value); });
