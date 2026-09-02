@@ -993,6 +993,12 @@ export function initProductHubDB() {
     ['shop_categories_synced_at', 'TEXT'],
     ['shop_categories_synced_key', 'TEXT'],
     ['shop_categories_error', 'TEXT'],
+    // ボードからの出品 (2026-09-01) の直近の試行。outcome: running=実行中 / failed=失敗 (やり直せる) /
+    // unknown=RMS への PUT の結果が確認できなかった (**やり直し禁止** — 実は登録が通っている可能性がある。
+    // 人が RMS で確認してから管理者だけが再実行できる) / NULL=成功 or 未実行。
+    // last_error だけだと「いつの・どの段階の失敗か」「再実行していいか」が分からない (Codex R1)
+    ['listing_outcome', "TEXT CHECK (listing_outcome IN ('running', 'failed', 'unknown'))"],
+    ['listing_attempt_at', 'TEXT'],
   ]) {
     if (!rkCols.has(col)) db.exec(`ALTER TABLE draft_rakuten ADD COLUMN ${col} ${ddl}`);
   }
