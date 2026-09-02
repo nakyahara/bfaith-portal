@@ -4,8 +4,8 @@
  * 設計 = Codex設計相談R1 (Downloads『在庫化カード置き換え_Codex設計相談R1_20260902.md』質問2):
  *  - 持つのは「いろは作業に固有の属性」だけ: 資材 / 収納容器 / 容器あたり数量 / 工程数 / 備考
  *  - 商品名・仕入先・取扱区分は mirror_products を JOIN で引く (旧シートの IMPORTRANGE 列は保存しない)
- *  - **在庫化必要FLG はこの表に持ち込まない**。在庫化要否の正本は f_inbound_info.いろは在庫化作業有無。
- *    取込時は比較レポート (8区分) を出し、「f_inbound_info が未設定の SKU にだけ」初期値として書ける
+ *  - **在庫化必要FLG は廃止** (中原さん 2026-09-02)。在庫化要否の正本は f_inbound_info.いろは在庫化作業有無
+ *    (荷受け時のその場選択で育つ)。xlsx に FLG 列があっても完全に読み飛ばす
  *  - 旧「入数」は units_per_container と命名して意味を固定 (f_inbound_info.入数 = 仕入箱入数 とは別概念。
  *    統合しない — 値が一致していても同一概念とは判断しない)
  *  - 全て空だった5列 (作業動画URL・作業拠点初期値・外部委託対象・作業工程・単価) は持ち込まない
@@ -14,7 +14,6 @@
  */
 import ExcelJS from 'exceljs';
 import { getDB } from './db.js';
-import { updateInbound, addManual, codeKey as infoCodeKey } from '../inbound-info/db.js';
 
 const utcNow = () => new Date().toISOString();
 export const SHEET_NAME = '作業内容管理マスター';
@@ -52,7 +51,7 @@ function parseIntOrNull(s) {
 
 /**
  * 「作業内容管理マスター」シートを読み、正規化した行と検証問題を返す。
- * 必須ヘッダー: 商品コード・在庫化必要FLG。任意: 資材・収納容器・入数・工程数・備考。
+ * 必須ヘッダー: 商品コード。任意: 資材・収納容器・入数・工程数・備考 (それ以外の列は読み飛ばす)。
  * 重複コードは先勝ち (後の行は duplicates に記録)。
  */
 export async function parseWorkMasterXlsx(buffer) {
@@ -80,14 +79,14 @@ export async function parseWorkMasterXlsx(buffer) {
   }
   const col = (name) => header.get(name) || null;
   const cols = {
-    code: col('商品コード'), flg: col('在庫化必要FLG'), material: col('資材'),
+    code: col('商品コード'), material: col('資材'),
     container: col('収納容器'), units: col('入数'), process: col('工程数') || col('工数数'),
     note: col('備考'),
   };
 
   const rows = [];
   const seen = new Map();   // codeKey → 行番号 (先勝ち)
-  const issues = { duplicates: [], badFlg: [], badUnits: [], badProcess: [], numericCode: [], emptyCode: 0 };
+  const issues = { duplicates: [], badUnits: [], badProcess: [], numericCode: [], emptyCode: 0 };
   let dataRows = 0;
   ws.eachRow((row, rn) => {
     if (rn === 1) return;
@@ -102,22 +101,17 @@ export async function parseWorkMasterXlsx(buffer) {
       return;
     }
     const code = get(cols.code);
-    const flgRaw = get(cols.flg);
     const material = get(cols.material);
     const container = get(cols.container);
     const unitsRaw = get(cols.units);
     const processRaw = get(cols.process);
     const note = get(cols.note);
-    if (!code && !flgRaw && !material && !container && !unitsRaw && !processRaw && !note) return; // 全空行
+    if (!code && !material && !container && !unitsRaw && !processRaw && !note) return; // 対象列が全空の行
     dataRows++;
     if (!code) { issues.emptyCode++; return; }
     const k = codeKeyOf(code);
     if (seen.has(k)) { issues.duplicates.push({ code, row: rn, first: seen.get(k) }); return; }
     seen.set(k, rn);
-
-    let flg = null;   // '1' | '0' | null(未記入)
-    if (flgRaw === '1' || flgRaw === '0') flg = flgRaw;
-    else if (flgRaw !== '') issues.badFlg.push({ code, row: rn, value: flgRaw });
 
     const units = parseIntOrNull(unitsRaw);
     if (!units.ok) issues.badUnits.push({ code, row: rn, value: unitsRaw });
@@ -125,13 +119,13 @@ export async function parseWorkMasterXlsx(buffer) {
     if (!proc.ok) issues.badProcess.push({ code, row: rn, value: processRaw });
 
     rows.push({
-      code, codeKey: k, flg,
+      code, codeKey: k,
       material: material || null, container: container || null,
       units: units.ok ? units.value : null, processCount: proc.ok ? proc.value : null,
       note: note || null,
     });
   });
-  return { rows, issues, dataRows, hasFlgColumn: cols.flg != null };
+  return { rows, issues, dataRows };
 }
 
 /**
@@ -140,62 +134,12 @@ export async function parseWorkMasterXlsx(buffer) {
  * dry-run のレポートで場所が分かるので、xlsx 側を直してから取り込み直してもらう
  */
 export function importIssueCount(issues) {
-  return (issues.duplicates?.length || 0) + (issues.badFlg?.length || 0)
+  return (issues.duplicates?.length || 0)
     + (issues.badUnits?.length || 0) + (issues.badProcess?.length || 0)
     + (issues.numericCode?.length || 0) + (issues.emptyCode || 0);
 }
 
-// ─── 在庫化必要FLG × f_inbound_info の突合レポート ───
-
-/**
- * 旧FLG と 現行 (f_inbound_info.いろは在庫化作業有無) の8区分 (Codex設計相談R1)。
- * mismatches = 本当に食い違っている (旧1/現行無し・旧0/現行有り) SKU の一覧。
- */
-export function compareIrohaFlags(rows) {
-  const db = getDB();
-  const info = new Map();
-  if (tableExists(db, 'f_inbound_info')) {
-    for (const r of db.prepare('SELECT code_key, いろは在庫化作業有無 AS iroha FROM f_inbound_info').all()) {
-      info.set(r.code_key, r.iroha == null ? '' : String(r.iroha).trim());
-    }
-  }
-  const inMirror = new Set();
-  const names = new Map();
-  if (tableExists(db, 'mirror_products')) {
-    for (const r of db.prepare('SELECT LOWER(TRIM(商品コード)) AS k, 商品名 AS n FROM mirror_products').all()) {
-      inMirror.add(r.k); names.set(r.k, r.n);
-    }
-  }
-  const buckets = {
-    old1_yes: 0, old1_no: 0, old1_dep: 0, old0_yes: 0, old0_no: 0, old0_dep: 0,
-    cur_unset: 0,          // 旧に値があるが f_inbound_info 未設定 (行なし or 未記入) → seed 候補
-    flg_blank: 0,          // 旧FLGが未記入
-    not_in_mirror: 0,      // mirror_products に無い (廃番等)
-  };
-  const mismatches = [];
-  const seedable = [];
-  for (const r of rows) {
-    if (!inMirror.has(r.codeKey)) buckets.not_in_mirror++;
-    if (r.flg == null) { buckets.flg_blank++; continue; }
-    const cur = info.has(r.codeKey) ? info.get(r.codeKey) : null;   // null=行なし
-    const curNorm = cur == null || cur === '' ? '' : cur;
-    if (curNorm === '') {
-      buckets.cur_unset++;
-      seedable.push(r);
-      continue;
-    }
-    const key = `old${r.flg}_` + (curNorm === '有り' ? 'yes' : curNorm === '無し' ? 'no' : 'dep');
-    buckets[key] = (buckets[key] || 0) + 1;
-    const conflict = (r.flg === '1' && curNorm === '無し') || (r.flg === '0' && curNorm === '有り');
-    if (conflict) {
-      mismatches.push({ code: r.code, name: names.get(r.codeKey) || '', flg: r.flg, current: curNorm });
-    }
-  }
-  const infoOnly = [...info.keys()].filter((k) => !rows.some((r) => r.codeKey === k)).length;
-  return { buckets, mismatches, seedable, infoOnlyCount: infoOnly };
-}
-
-// ─── 本取込 (upsert) ───
+// ─── 本取込 (全置換 upsert+delete) ───
 
 /** xlsx に無い既存行 (=取込で削除される行)。dry-run の予告と本取込の両方で使う */
 export function computeDeletions(rows) {
@@ -247,44 +191,6 @@ export function applyWorkMaster(rows, { user = null } = {}) {
     }
   });
   tx.immediate();
-  return counts;
-}
-
-/**
- * 在庫化要否の初期値を f_inbound_info へ書く。**未設定の SKU だけ** (Codex設計相談R1):
- *   - f_inbound_info に行が無い → addManual (mirror_products に居る商品のみ) → 更新
- *   - 行はあるが「いろは在庫化作業有無」未記入 → 更新
- *   - 既に値がある SKU は一切触らない (食い違いはレポートで人が判断)
- * 書き込みは inbound-info の updateInbound を通す (いろは=有り の連動・楽観ロックを迂回しない)。
- */
-export function seedIrohaFlags(seedable, { user = null } = {}) {
-  const db = getDB();
-  const counts = { seeded: 0, added: 0, notInMaster: 0, skipped: 0, errors: 0, errorDetails: [] };
-  const fail = (code, reason) => {
-    counts.errors++;
-    if (counts.errorDetails.length < 20) counts.errorDetails.push({ code, reason });
-  };
-  for (const r of seedable) {
-    if (r.flg !== '1' && r.flg !== '0') { counts.skipped++; continue; }
-    const target = r.flg === '1' ? '有り' : '無し';
-    const k = infoCodeKey(r.code);
-    let cur = db.prepare('SELECT code_key, いろは在庫化作業有無 AS iroha, version FROM f_inbound_info WHERE code_key = ?').get(k);
-    if (!cur) {
-      const a = addManual(r.code, user);
-      if (!a.ok) {
-        if (a.error === 'not_in_master') { counts.notInMaster++; continue; }
-        if (a.error !== 'duplicate') { fail(r.code, a.error); continue; }
-      } else {
-        counts.added++;
-      }
-      cur = db.prepare('SELECT code_key, いろは在庫化作業有無 AS iroha, version FROM f_inbound_info WHERE code_key = ?').get(k);
-      if (!cur) { fail(r.code, 'row_missing_after_add'); continue; }
-    }
-    const curVal = cur.iroha == null ? '' : String(cur.iroha).trim();
-    if (curVal !== '') { counts.skipped++; continue; }   // レポート後に人が入れた等 — 触らない
-    const u = updateInbound(k, { いろは在庫化作業有無: target }, user || 'work-master取込', cur.version);
-    if (u.ok) counts.seeded++; else fail(r.code, u.error || 'update_failed');
-  }
   return counts;
 }
 

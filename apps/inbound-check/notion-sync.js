@@ -187,8 +187,8 @@ export function buildCardProperties(row, { barcode, product, supplierName, ext, 
   const supNum = product ? parseInt(product.supplierCode, 10) : NaN;
   if (!Number.isNaN(supNum)) put('仕入先', { number: supNum });
   if (product?.handling) put('取扱区分', { select: { name: product.handling } });
-  // このカードは「いろはで在庫化する」と人が判断した行だけから作られる
-  put('在庫化必要FLG', { checkbox: true });
+  // 「在庫化必要FLG」は送らない — FLG は廃止 (中原さん 2026-09-02)。
+  // このカードは「いろはで在庫化する」と人が判断した行だけから作られるので、フラグ自体が不要
   put('作業拠点', { select: { name: 'いろは' } });
   if (row.expiry_date) put('有効期限', { rich_text: text(row.expiry_date) });
   put('destination_id', { number: row.id });
