@@ -1394,9 +1394,52 @@ const rkvId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, pric
 db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id) VALUES (?, '1')`).run(rkvId);
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'g2')`).run(rkvId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'g2', '/x/y.jpg')`).run(rkvId);
-const bv = listing.buildItemPayload(db, rkvId);
-check('payload: バリエーションページは未対応と明示',
-  bv.ok === false && bv.reasons.some((r) => r.includes('バリエーション')), JSON.stringify(bv.reasons));
+// 出品できる状態にする (TOP画像 sort=0 + 詳細画像は対象外) → 残る不足は項目選択肢だけ
+db.prepare('UPDATE draft_images SET sort = 0 WHERE draft_id = ?').run(rkvId);
+db.prepare('UPDATE product_drafts SET detail_images_excluded = 1, jan_code = NULL WHERE id = ?').run(rkvId);
+let bv = listing.buildItemPayload(db, rkvId);
+check('カラバリ: 項目選択肢の見出しと値が無ければ止める',
+  bv.ok === false
+  && bv.reasons.some((r) => r.includes('見出し'))
+  && bv.reasons.some((r) => r.includes('rkv-a'))
+  && bv.reasons.some((r) => r.includes('rkv-b')), JSON.stringify(bv.reasons));
+
+// 見出しと値を入れると payload が組める
+db.prepare("UPDATE draft_rakuten SET variant_selector_name = 'カラー' WHERE draft_id = ?").run(rkvId);
+const insSel = db.prepare('INSERT INTO draft_sku_selector_values (draft_id, sku_code, value) VALUES (?, ?, ?)');
+insSel.run(rkvId, 'rkv-a', 'ブラック');
+insSel.run(rkvId, 'rkv-b', 'ホワイト');
+db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(rkvId, 'rkv-a', '4901234567894');
+// SKU別売価 (画面入力) が最優先。NE の標準売価より強い
+db.prepare('INSERT INTO draft_sku_prices (draft_id, sku_code, price) VALUES (?, ?, ?)').run(rkvId, 'rkv-a', 2480);
+bv = listing.buildItemPayload(db, rkvId);
+check('カラバリ: SKU別売価 (画面入力) が NE の標準売価より優先される',
+  bv.ok === true && bv.payload.variants['rkv-a'].standardPrice === 2480,
+  JSON.stringify(bv.ok ? bv.payload.variants['rkv-a'] : bv.reasons));
+check('カラバリ: variantSelectors は key/displayName/values[].displayValue の形',
+  bv.ok === true && Array.isArray(bv.payload.variantSelectors)
+  && bv.payload.variantSelectors.length === 1
+  && bv.payload.variantSelectors[0].key === 'カラー'
+  && bv.payload.variantSelectors[0].displayName === 'カラー'
+  && bv.payload.variantSelectors[0].values.map((v) => v.displayValue).join(',') === 'ブラック,ホワイト',
+  JSON.stringify(bv.ok ? bv.payload.variantSelectors : bv.reasons));
+check('カラバリ: variants は SKU ごと + selectorValues + SKU別カタログID',
+  bv.ok === true && Object.keys(bv.payload.variants).sort().join(',') === 'rkv-a,rkv-b'
+  && bv.payload.variants['rkv-a'].selectorValues['カラー'] === 'ブラック'
+  && bv.payload.variants['rkv-a'].merchantDefinedSkuId === 'rkv-a'
+  && bv.payload.variants['rkv-a'].articleNumber.value === '4901234567894'
+  && bv.payload.variants['rkv-b'].articleNumber.exemptionReason === 5,
+  JSON.stringify(bv.ok ? bv.payload.variants : bv.reasons));
+
+// 同じ値は DB の UNIQUE が拒否する (buildItemPayload 側の重複チェックは取込など別経路のバックストップ)
+let selDupErr = null;
+try {
+  db.prepare("UPDATE draft_sku_selector_values SET value = 'ブラック' WHERE draft_id = ? AND sku_code = 'rkv-b'").run(rkvId);
+} catch (e) { selDupErr = e; }
+check('カラバリ: 同じ項目選択肢を2つのSKUに付けられない (DBのUNIQUE)',
+  selDupErr !== null && /UNIQUE/i.test(String(selDupErr.message)), String(selDupErr && selDupErr.message));
+db.prepare('DELETE FROM draft_sku_selector_values WHERE draft_id = ?').run(rkvId);
+db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ?').run(rkvId);
 db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'rkv'`).run();
 db.prepare(`DELETE FROM mirror_products WHERE product_id IN (9301, 9302)`).run();
 
@@ -5093,6 +5136,7 @@ renders.push(
       skuPrices: { 'rooms-l-bk': 1480 },
       // SKU別JAN (2026-08-28): 保存済み / 未入力 の両方を描かせる
       skuJans: { 'rooms-l-bk': '4901234567894' },
+      skuSelectorValues: { 'rooms-l-bk': 'ブラック' },
     }]);
     // バリエーションあり (原価は全SKU共通) — SKU別JANの列だけが出る分岐
     renders.push(['detail.ejs (バリエーション: SKU別JANのみ)', 'detail.ejs', {
@@ -5100,6 +5144,7 @@ renders.push(
       draft: { ...d0[2].draft, ne_code: 'rooms', price: 1980, jan_code: '4901234567894' },
       variation: variationFixtures.rep,
       skuJans: { 'rooms-l-wh': '4912345678904' },
+      skuSelectorValues: { 'rooms-l-wh': 'ホワイト' },
     }]);
     // 商品情報: ブランド名・容量が入っている分岐
     renders.push(['detail.ejs (商品情報: ブランド名・容量あり)', 'detail.ejs', {
@@ -5228,7 +5273,7 @@ for (const [name, file, data] of renders) {
         backLink: { url: '/apps/product-hub/list', label: '← 一覧に戻る' },
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
         skuImages: [],
-        skuJans: {},
+        skuJans: {}, skuSelectorValues: {},
         imagePriorities: dbmod.IMAGE_PRIORITIES,
         materialStatuses: dbmod.MATERIAL_STATUSES,
         // 確認中 (2026-08-31)。detail は理由リスト、board は絞り込みの状態を使う

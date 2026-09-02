@@ -631,6 +631,22 @@ export function initProductHubDB() {
       UNIQUE (draft_id, jan_code)
     );
 
+    -- SKU別の項目選択肢の値 (2026-09-02、カラバリ出品 P3.5)。
+    -- 楽天のバリエーションページは variants[sku].selectorValues = {軸キー: 値} が必須で、
+    -- 軸名 (「種類」「カラー」) は draft_rakuten.variant_selector_name に 1 つだけ持つ。
+    -- 🚨 draft_sku_jans と分けている理由: あちらは jan_code NOT NULL なので、
+    --    JAN の無い SKU (カタログIDなしの理由で出す商品) の選択肢値を持てない。
+    -- NE 側にバリエーション軸の情報が無いため、値は画面で手入力する (2026-09-02 中原さん決定)
+    CREATE TABLE IF NOT EXISTS draft_sku_selector_values (
+      draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      sku_code   TEXT NOT NULL,          -- LOWER(TRIM()) した SKU 商品コード (draft_sku_jans と同じ規則)
+      value      TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, sku_code),
+      -- 1 軸なので、同じ値を 2 つの SKU に付けると組み合わせが重複して RMS に弾かれる
+      UNIQUE (draft_id, value)
+    );
+
     CREATE TABLE IF NOT EXISTS draft_shop_categories (
       draft_id         INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
       shop_category_id INTEGER NOT NULL REFERENCES ph_shop_categories(id),
@@ -1007,6 +1023,8 @@ export function initProductHubDB() {
     // カタログID (= RMS 画面の「カタログID」/ API の articleNumber) が無いときの理由 (2026-09-02)。
     // JAN があれば JAN を送るので使わない。NULL = 未設定 → 送信時は 5 (該当製品コードなし) 扱い
     ['catalog_id_exemption_reason', 'INTEGER CHECK (catalog_id_exemption_reason BETWEEN 1 AND 6)'],
+    // カラバリ出品 (2026-09-02)。項目選択肢の軸名 (「種類」「カラー」等)。1 ページ 1 軸まで
+    ['variant_selector_name', 'TEXT'],
   ]) {
     if (!rkCols.has(col)) db.exec(`ALTER TABLE draft_rakuten ADD COLUMN ${col} ${ddl}`);
   }
