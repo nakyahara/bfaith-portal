@@ -244,6 +244,26 @@ miniPC auto-shohin-csv.js (Logizard-NyukaCSV の2ステップ目・1日1回)
 
 倉庫の iPad で管理者としてログイン → 管理画面「この端末を登録」 → トークンは httpOnly Cookie `ic_device` (path=/apps/inbound-check、400日) としてその端末だけに渡り、**同時に管理者セッションを破棄**する (共用端末に管理者ログインを残さない)。⚠ ホーム画面に追加した PWA から開いて登録する (Safari 本体と Cookie 保存領域が別)。
 
+## Notion 作業カード (いろはの在庫化作業管理)
+
+「いろはで在庫化」と確定した明細 (`f_inbound_check_destinations`) を、Notion「在庫化作業管理」DB のカードにする
+(旧 GAS 在庫化カード生成の置き換え。設計 = Downloads『在庫化カード置き換え_Codex設計相談R1_20260902.md』)。
+
+- **1日1回 17:30 JST に一括送信** (`sync-job.js startInboundCheckNotionCron` → `notion-sync.js runNotionSweep`)。
+  都度送信にしないのは、当日中のやり直し (確認→取消→再確認) を送信前に収束させるため (中原さん 2026-09-02)。
+  管理画面の「今すぐ Notion へ送る」で夕方を待たずに送れる
+- **outbox + reconcile**: 送信状態は台帳の行に持つ (`notion_page_id` / `notion_synced_at` / …)。
+  カードに `destination_id` を必ず入れ、作成前に同 ID を検索して回収する (二重カード防止)。
+  送信後に取り消された行はカードをステータス**「取消」**に倒し、取消時のカードが未着手以外なら
+  管理画面の要確認一覧に出す (取消済みの作業指示を有効に見せない)
+- 4xx (スキーマ不整合等) は自動再試行しない — 管理画面に出て「再送」で解除
+- env: `NOTION_TOKEN` (既存インテグレーション共用) / `INBOUND_CHECK_NOTION_DB_ID` /
+  `INBOUND_CHECK_NOTION_CRON` (既定 `30 17 * * *`) / `INBOUND_CHECK_NOTION_ENABLED` (false で停止・非Renderは既定OFF)。
+  Notion 側で対象 DB のコネクトにインテグレーションを追加しておくこと
+- 台帳 = `config/jobs-registry.mjs` `inbound-check-notion-cards` (dead-man ping)
+- ⚠「入数」はカードに送らない: 旧マスターの入数 (いろは容器あたり) と f_inbound_info の入数 (仕入箱) は
+  意味が違うため。いろは作業仕様マスタ (`f_iroha_work_master`, PR2) 整備後に載せる
+
 ## テスト
 
 ```
@@ -252,6 +272,7 @@ node scripts/test-inbound-check-enroll.mjs                 # 端末の登録コ�
 node scripts/test-inbound-check-drive.mjs                  # Drive 自動取込 (17 項目)
 node scripts/test-inbound-check-product-master.mjs         # 商品マスタ取込 = 期限管理 (40 項目)
 node scripts/test-inbound-check-render.mjs                 # iPad 画面のレンダリング (状態ごとの主ボタン・数量パネル)
+node scripts/test-inbound-check-notion.mjs                 # Notion 作業カード sweep (API はモック)
 node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路
 ```
 

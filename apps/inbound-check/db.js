@@ -316,6 +316,18 @@ function migrateQuantity(db) {
   // 実際に見つけた数。いろはへ送る数は予定数ではなくこちらが正しい
   addCol(db, 'f_inbound_check_destinations', 'actual_qty', 'INTEGER');
   addCol(db, 'f_inbound_check_destinations', 'cancel_reason', 'TEXT');
+  // Notion 作業カード (いろは行き) の outbox 状態 (notion-sync.js が使う)。
+  // 作成の成功 (synced_at) と取消反映の成功 (cancelled_at) は別の列に持つ — synced_at を
+  // 取消時に上書きすると「いつカードを作ったか」が消える (Codex設計相談R1 2026-09-02)
+  addCol(db, 'f_inbound_check_destinations', 'notion_page_id', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_synced_at', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_payload', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_error', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_attempt_count', 'INTEGER');
+  addCol(db, 'f_inbound_check_destinations', 'notion_next_retry_at', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_cancelled_at', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_cancel_error', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_cancelled_prev_status', 'TEXT');
 
   if (!added) return;   // ここから先は列を足した初回だけ
 

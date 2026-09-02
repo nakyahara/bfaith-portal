@@ -27,6 +27,7 @@ import {
   listWorkers, getWorker,
 } from './db.js';
 import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProductMaster } from './drive-fetch.js';
+import { runNotionSweep, notionStatusForAdmin, resetNotionRow } from './notion-sync.js';
 // 入庫情報の書き込みは inbound-info の関数を通す (いろは=有り の連動ルール・楽観ロック・
 // updated_by の記録がそこに1つだけある。ここで直に UPDATE すると規則が二重管理になる)
 import { updateInbound, getInbound, addManual } from '../inbound-info/db.js';
@@ -554,6 +555,8 @@ function destQuery(req) {
 router.get('/admin', requireSession, api(async (req, res) => {
   let drive = null;
   try { drive = await statusForView(); } catch (e) { drive = { driveError: e.message, config: driveConfig() }; }
+  let notion = null;
+  try { notion = notionStatusForAdmin(); } catch (e) { notion = { error: e.message }; }
   res.render(path.join(__dirname, 'views/admin'), {
     title: '入荷受付チェック 管理',
     username: req.session.email,
@@ -567,6 +570,7 @@ router.get('/admin', requireSession, api(async (req, res) => {
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     workers: listWorkers(),   // = スタッフマスタの有効スタッフ (表示のみ。編集は /apps/staff)
     drive,
+    notion,
   });
 }));
 
@@ -598,6 +602,17 @@ router.post('/admin/fetch-drive', requireSession, checkOrigin, api(async (req, r
   } catch (e) {
     res.status(502).json({ ok: false, error: 'drive_error', message: e.message });
   }
+}));
+
+// ─── Notion 作業カード (いろは行き) を今すぐ送る ───
+// 1日1回 (17:30 JST) の cron と同じ reconcile。夕方を待たずに送りたいとき・エラー後の再送用。
+// 取込と同じく「アプリ利用者なら誰でも」(事務担当が押せるように)。
+// retry_id を渡すと、その行のエラーブロック (4xx で止めた分) を解除してから実行する
+router.post('/admin/notion-sync', requireSession, checkOrigin, api(async (req, res) => {
+  const retryId = Number(req.body?.retry_id);
+  if (Number.isInteger(retryId) && retryId > 0) resetNotionRow(retryId);
+  const r = await runNotionSweep({ actor: req.session.email });
+  res.status(r.ok ? 200 : (r.error === 'already_running' ? 409 : 502)).json(r);
 }));
 
 // 端末登録: 発行したトークンは httpOnly Cookie としてこの端末にだけ渡す。登録と同時に管理者セッションを破棄

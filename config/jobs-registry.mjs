@@ -562,6 +562,26 @@ export const JOBS_REGISTRY = [
     runbook: 'Render Logs で「product-links」を検索。手動実行 = /apps/product-links (admin) の「商品登録ハブから照合」。'
       + '正本 = AI_reference『システム設計/商品リンク台帳_要件定義_20260827.md』',
   },
+  {
+    id: 'inbound-check-notion-cards',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: '入荷受付チェックで「いろはで在庫化」と確定した明細を Notion「在庫化作業管理」DB のカードにする'
+      + ' (旧 GAS 在庫化カード生成の置き換え・2026-09-02)。1日1回の一括送信 — 当日中のやり直し (確認→取消→再確認) を'
+      + '送信前に収束させるため都度送信にしない。送信後に取り消された行はカードをステータス「取消」に倒し、'
+      + '着手後の取消は管理画面の要確認一覧に出す。止まると いろはに作業カードが届かない',
+    where: 'Render bfaith-portal 内 node-cron (apps/inbound-check/sync-job.js startInboundCheckNotionCron。'
+      + 'INBOUND_CHECK_NOTION_ENABLED=false で停止)',
+    schedule: '毎日 17:30 JST (env INBOUND_CHECK_NOTION_CRON)。手動 = 管理画面「今すぐ Notion へ送る」',
+    anchor_hour_jst: 17,
+    anchor_minute_jst: 30,
+    grace_hours: 3,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「inbound-check notion」を検索。手動実行 = /apps/inbound-check/admin の「🗂 Notion 作業カード」節。'
+      + 'env NOTION_TOKEN / INBOUND_CHECK_NOTION_DB_ID 必須 + Notion 側で対象DBのコネクトに既存インテグレーションを追加。'
+      + '4xx で止まった行は同節の「再送」で解除してから送る。設計 = Downloads『在庫化カード置き換え_Codex設計相談R1_20260902.md』',
+  },
   // ⭐2026-08-05 追加分 — 2026-08-01 の棚卸しは miniPC Task Scheduler だけが対象で、
   //   Render 内の node-cron / 常駐ワーカーはカテゴリごと台帳から漏れていた。
   //   同時に、これらが miniPC でも二重起動していたため Render 専用ガードを入れている

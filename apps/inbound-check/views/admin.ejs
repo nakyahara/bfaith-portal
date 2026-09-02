@@ -140,6 +140,58 @@
     </div>
 
     <div class="ic-box">
+      <h2>🗂 Notion 作業カード (いろはの在庫化作業管理)</h2>
+      <p class="hint">
+        「いろはで在庫化」と確定した明細を、<b>1日1回 夕方 17:30</b> に Notion「在庫化作業管理」DB のカードにします
+        (当日中のやり直しを送信前に収束させるため、都度は送りません)。夕方を待たずに送りたいときはボタンで。
+        送信後に取り消された明細は、カードのステータスを<b>「取消」</b>に変えます。
+      </p>
+      <% if (!notion || notion.error) { %>
+        <p class="ng">⚠ 状態を取得できません<%= notion && notion.error ? ': ' + notion.error : '' %></p>
+      <% } else if (!notion.configured) { %>
+        <p class="ng">⚠ 未設定です。Render の env に <code>INBOUND_CHECK_NOTION_DB_ID</code> を追加し、
+          Notion 側で「在庫化作業管理」DB のコネクトに既存インテグレーションを追加してください (NOTION_TOKEN は共用)。</p>
+      <% } else { %>
+        <p>送信待ち <b><%= notion.unsent %></b> 件 ・ 取消の反映待ち <b><%= notion.cancelPending %></b> 件 ・
+          直近24時間の送信 <b><%= notion.sentRecent %></b> 件<% if (notion.lastSyncedAt) { %> ・ 最終送信 <span data-jst="<%= notion.lastSyncedAt %>"></span><% } %>
+          (DB …<%= notion.dbIdTail %>)</p>
+        <div class="row">
+          <button id="notionSyncBtn" type="button">🗂 今すぐ Notion へ送る</button>
+          <span id="notionMsg" class="msg"></span>
+        </div>
+        <% if (notion.blocked && notion.blocked.length) { %>
+          <p class="hint" style="margin-top:10px"><b class="ng">エラーで止まっている明細</b> (原因を直したら「再送」):</p>
+          <table class="ic-list">
+            <thead><tr><th>#</th><th>商品</th><th>エラー</th><th></th></tr></thead>
+            <tbody>
+              <% for (const b of notion.blocked) { %>
+                <tr><td><%= b.id %></td><td><%= b.product_id %> <%= b.product_name || '' %></td>
+                  <td class="ng"><%= b.notion_error || b.notion_cancel_error || '' %></td>
+                  <td><button class="btn-sm btn-notion-retry" data-id="<%= b.id %>">再送</button></td></tr>
+              <% } %>
+            </tbody>
+          </table>
+        <% } %>
+        <% if (notion.attention && notion.attention.length) { %>
+          <p class="hint" style="margin-top:10px"><b class="ng">⚠ 要確認: 着手後に取消になったカード</b>
+            — いろはで作業が始まっていた可能性があります。現物の状態を確認してください:</p>
+          <table class="ic-list">
+            <thead><tr><th>取消反映</th><th>商品</th><th>数量</th><th>取消の理由</th><th>取消時のカード状態</th></tr></thead>
+            <tbody>
+              <% for (const a of notion.attention) { %>
+                <tr><td><span data-jst="<%= a.notion_cancelled_at %>"></span></td>
+                  <td><%= a.product_id %> <%= a.product_name || '' %></td>
+                  <td><%= a.actual_qty == null ? '' : a.actual_qty %></td>
+                  <td><%= a.cancel_reason === 'reopen' ? 'やり直し' : (a.cancel_reason || '') %></td>
+                  <td><%= a.notion_cancelled_prev_status %></td></tr>
+              <% } %>
+            </tbody>
+          </table>
+        <% } %>
+      <% } %>
+    </div>
+
+    <div class="ic-box">
       <h2>取込履歴 (バッチ)</h2>
       <table class="ic-list">
         <thead><tr><th>#</th><th>状態</th><th>CSV生成</th><th>取込</th><th>経路 / 実行者</th><th>伝票</th><th>行</th><th>ファイル</th><th></th></tr></thead>
@@ -415,6 +467,27 @@
         masterBtn.disabled = false;
       }
     });
+
+    // ── Notion 作業カード: 今すぐ送る / エラー行の再送 ──
+    const notionBtn = $('#notionSyncBtn');
+    const runNotionSync = async (retryId) => {
+      if (notionBtn) notionBtn.disabled = true;
+      msg($('#notionMsg'), true, '送信しています…');
+      try {
+        const { status, j } = await postJson(BASE + '/admin/notion-sync', retryId ? { retry_id: retryId } : {});
+        if (j.ok) {
+          msg($('#notionMsg'), true, '✅ ' + (j.note || '完了'));
+          setTimeout(() => location.reload(), 1500);
+          return;   // reload するのでボタンは戻さない
+        }
+        msg($('#notionMsg'), false, '❌ ' + (j.note || j.message || j.error || ('HTTP ' + status)));
+      } catch (e) {
+        msg($('#notionMsg'), false, '❌ 通信できませんでした: ' + e.message);
+      }
+      if (notionBtn) notionBtn.disabled = false;
+    };
+    if (notionBtn) notionBtn.addEventListener('click', () => runNotionSync());
+    document.querySelectorAll('.btn-notion-retry').forEach(b => b.addEventListener('click', () => runNotionSync(Number(b.dataset.id))));
   </script>
 </body>
 </html>
