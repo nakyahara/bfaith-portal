@@ -166,6 +166,13 @@ export function createTables(db = getMirrorDB()) {
       updated_by     TEXT
     );
 
+    -- Notion sweep の多重実行防止 lease (notion-sync.js。期限切れは自動回収 = 永久ロックにならない)
+    CREATE TABLE IF NOT EXISTS f_inbound_check_notion_lease (
+      id         INTEGER PRIMARY KEY CHECK (id = 1),
+      holder     TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS f_inbound_check_import_log (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       at         TEXT NOT NULL,
@@ -316,6 +323,26 @@ function migrateQuantity(db) {
   // 実際に見つけた数。いろはへ送る数は予定数ではなくこちらが正しい
   addCol(db, 'f_inbound_check_destinations', 'actual_qty', 'INTEGER');
   addCol(db, 'f_inbound_check_destinations', 'cancel_reason', 'TEXT');
+  // Notion 作業カード (いろは行き) の outbox 状態 (notion-sync.js が使う)。
+  // 作成の成功 (synced_at) と取消反映の成功 (cancelled_at) は別の列に持つ — synced_at を
+  // 取消時に上書きすると「いつカードを作ったか」が消える (Codex設計相談R1 2026-09-02)
+  addCol(db, 'f_inbound_check_destinations', 'notion_page_id', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_synced_at', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_payload', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_error', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_attempt_count', 'INTEGER');
+  addCol(db, 'f_inbound_check_destinations', 'notion_next_retry_at', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_cancelled_at', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_cancel_error', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_cancelled_prev_status', 'TEXT');
+  // 回収用の永続ランダムキー (カードの「台帳キー」プロパティと対)。行IDは DB 作り直しで
+  // 振り直されるため回収キーにしない (Codex R1 #8)。カード作成の**前に**保存される
+  addCol(db, 'f_inbound_check_destinations', 'notion_dedupe_key', 'TEXT');
+  // 取消反映の再試行は送信側 (notion_next_retry_at) と**別の列**で制御する。
+  // 共用すると、送信エラーで永久ブロックした行の「取消」まで巻き込まれ、
+  // 取消済みの作業指示が Notion に有効なまま残る (Codex R3 High)
+  addCol(db, 'f_inbound_check_destinations', 'notion_cancel_next_retry_at', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_cancel_attempt_count', 'INTEGER');
 
   if (!added) return;   // ここから先は列を足した初回だけ
 
