@@ -143,7 +143,8 @@ export function createTables(db = getMirrorDB()) {
       synced_at     TEXT,
       deleted_at    TEXT,
       deleted_by    TEXT,
-      delete_token_hash TEXT
+      delete_token_hash TEXT,
+      uploader_device_id INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_iroha_media_page ON f_iroha_card_media(page_id, id);
 

@@ -84,7 +84,7 @@ function readHead(filePath, n = 16) {
  * 同じ operation_id の再送は既存行を返す (冪等)。
  * @returns {ok:true, media, already?} | {ok:false, error, message}
  */
-export function addMedia({ pageId, productCode = null, kind, mime, filePath, worker, deviceLabel = null, operationId }) {
+export function addMedia({ pageId, productCode = null, kind, mime, filePath, worker, deviceLabel = null, deviceId = null, operationId }) {
   const opId = String(operationId || '').trim();
   if (!/^[A-Za-z0-9_-]{8,64}$/.test(opId)) return { ok: false, error: 'bad_request', message: 'operation_id が不正です' };
   const size = fs.statSync(filePath).size;
@@ -98,7 +98,17 @@ export function addMedia({ pageId, productCode = null, kind, mime, filePath, wor
   }
   const db = getDB();
   const dup = db.prepare('SELECT * FROM f_iroha_card_media WHERE operation_id = ?').get(opId);
-  if (dup) return { ok: true, already: true, media: publicMedia(dup) };
+  if (dup) {
+    // 応答消失→再送 (Codex PR3-R3): 削除トークンを持てていないので、**同じ端末からの再送に
+    // 限って**発行し直す (古いトークンは無効になる)。別端末からの同 operation_id には返さない
+    if (deviceId != null && dup.uploader_device_id === Number(deviceId) && !dup.deleted_at) {
+      const token = crypto.randomBytes(16).toString('base64url');
+      db.prepare('UPDATE f_iroha_card_media SET delete_token_hash = ? WHERE id = ?')
+        .run(crypto.createHash('sha256').update(token).digest('hex'), dup.id);
+      return { ok: true, already: true, media: publicMedia(dup), deleteToken: token };
+    }
+    return { ok: true, already: true, media: publicMedia(dup) };
+  }
   const max = kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
   if (countActiveMedia(pageId, kind) >= max) {
     return { ok: false, error: 'cap_reached',
@@ -112,10 +122,10 @@ export function addMedia({ pageId, productCode = null, kind, mime, filePath, wor
   // 「撮った本人」の証明に使わない — Codex PR3 #2)。サーバーはハッシュのみ保存
   const deleteToken = crypto.randomBytes(16).toString('base64url');
   const info = db.prepare(`INSERT INTO f_iroha_card_media
-    (operation_id, page_id, product_code, kind, mime, size, local_path, status, worker_id, worker_name, device_label, created_at, delete_token_hash)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?, ?, ?)`)
+    (operation_id, page_id, product_code, kind, mime, size, local_path, status, worker_id, worker_name, device_label, uploader_device_id, created_at, delete_token_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?, ?, ?, ?)`)
     .run(opId, pageId, productCode, kind, mime || null, size, localPath,
-      worker.id, worker.display_name, deviceLabel, utcNow(),
+      worker.id, worker.display_name, deviceLabel, deviceId == null ? null : Number(deviceId), utcNow(),
       crypto.createHash('sha256').update(deleteToken).digest('hex'));
   const row = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(info.lastInsertRowid));
   return { ok: true, media: publicMedia(row), deleteToken };

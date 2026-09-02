@@ -312,6 +312,7 @@ router.post('/api/media', checkOrigin, mediaUpload.single('file'), api((req, res
     const r = addMedia({
       pageId, productCode: card.product_code, kind, mime: req.file.mimetype,
       filePath: req.file.path, worker: w.worker, deviceLabel: deviceLabelOf(req),
+      deviceId: req.iwDevice ? req.iwDevice.id : null,
       operationId: req.body?.operation_id,
     });
     if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' ? 409 : 400).json(r); }

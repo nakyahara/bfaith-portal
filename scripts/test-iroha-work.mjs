@@ -535,16 +535,20 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
 
   const tmp = (name, buf) => { const p = path.join(process.env.DATA_DIR, name); fs.writeFileSync(p, buf); return p; };
   const a1 = addMedia({ pageId: pMedia.id, productCode: 'PROD-M', kind: 'photo', mime: 'image/jpeg',
-    filePath: tmp('a1.jpg', jpeg), worker: worker1, operationId: 'op-photo-0001' });
+    filePath: tmp('a1.jpg', jpeg), worker: worker1, deviceId: 11, operationId: 'op-photo-0001' });
   ok(a1.ok === true && a1.media.status === 'stored', '受信 → stored (即応答できる形)');
   ok(fs.existsSync(path.join(MEDIA_DIR, 'op-photo-0001.jpg')), '実体は MEDIA_DIR へ移動');
-  const a1b = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a1b.jpg', jpeg), worker: worker1, operationId: 'op-photo-0001' });
+  const a1b = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a1b.jpg', jpeg), worker: worker1, deviceId: 11, operationId: 'op-photo-0001' });
   ok(a1b.ok === true && a1b.already === true, '同じ operation_id の再送は既存を返す (二重登録しない)');
+  ok(!!a1b.deleteToken && a1b.deleteToken !== a1.deleteToken,
+    '同じ端末からの再送には削除トークンを発行し直す (応答消失でも削除できる — PR3-R3)');
+  const a1c = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a1c.jpg', jpeg), worker: worker1, deviceId: 22, operationId: 'op-photo-0001' });
+  ok(a1c.already === true && !a1c.deleteToken, '別端末からの同 operation_id にはトークンを返さない');
   ok(addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('bad.jpg', mp4), worker: worker1, operationId: 'op-bad-000001' }).error === 'bad_file',
     '中身が写真でなければ拒否 (Content-Type を信じない)');
   addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a2.jpg', jpeg), worker: worker1, operationId: 'op-photo-0002' });
-  const a3 = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a3.jpg', jpeg), worker: worker2, operationId: 'op-photo-0003' });
-  ok(a1.deleteToken && a3.deleteToken && a1.deleteToken !== a3.deleteToken, '削除トークンは行ごとに一度だけ返る');
+  const a3 = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a3.jpg', jpeg), worker: worker2, deviceId: 11, operationId: 'op-photo-0003' });
+  ok(a1.deleteToken && a3.deleteToken && a1.deleteToken !== a3.deleteToken, '削除トークンは行ごとに別');
   ok(addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a4.jpg', jpeg), worker: worker1, operationId: 'op-photo-0004' }).error === 'cap_reached',
     '写真は3枚まで');
   const v1 = addMedia({ pageId: pMedia.id, kind: 'video', mime: 'video/mp4', filePath: tmp('v1.mp4', mp4), worker: worker1, operationId: 'op-video-0001' });
