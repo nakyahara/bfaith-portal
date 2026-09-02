@@ -2853,23 +2853,29 @@
   // 保存は 1 本のチェーンで直列化し、保存中に打ち直された分も取り切ってから戻る
   // (Codex R2 high: A を保存している間に B へ変えると、画面は B なのに payload が A で登録される)
   let janSaveChain = Promise.resolve(true);
+  // 通信エラーで結果が分からなくなった印 (Codex R5 high: 応答待ち中に元の値へ戻すと lastSavedJan と一致して
+  // 保存を省略し、DB だけ新値で登録が進む)。立っている間は現在値が同じでも必ず再送し、成功したときだけ下ろす
+  let janSaveUnknown = false;
   function saveJanIfChanged() {
     janSaveChain = janSaveChain.then(async () => {
       const el = document.getElementById('f-jan');
       if (!el) return true; // バリエーションは SKU表 → /sku-jans (flushSkuJanSaves で待つ)
       for (let i = 0; i < 5; i++) {
         const value = el.value.trim();
-        if (value === lastSavedJan) return true;
+        if (value === lastSavedJan && !janSaveUnknown) return true;
         let json;
         try {
           json = await post(BASE, { jan_code: value });
         } catch (e) {
-          json = { ok: false, error: '通信エラーでJANコードを保存できませんでした' }; // Codex R2 medium
+          janSaveUnknown = true; // Codex R2 medium / R5 high
+          alert('通信エラーでJANコードを保存できませんでした。もう一度お試しください');
+          return false;
         }
         if (!json.ok) { alert(json.error || 'JANコードの保存に失敗しました'); return false; }
+        janSaveUnknown = false;
         lastSavedJan = value;
       }
-      return el.value.trim() === lastSavedJan;
+      return el.value.trim() === lastSavedJan && !janSaveUnknown;
     });
     return janSaveChain;
   }
@@ -3345,22 +3351,31 @@
     // 1 件ずつ POST し、全部一致するまで回す。捕捉値のキューにしない (Codex R3 high:
     // 待機中に追加された保存を待てない / 失敗して巻き戻した後に古い捕捉値を再送できた)
     const lastOf = new Map(inputs.map((i) => [i, i.value.trim()]));
+    // 通信エラーで結果が分からなくなった入力 (Codex R5 high: 応答待ち中に元の値へ戻すと lastOf と一致して
+    // dirty から消え、DB だけ新値のまま flush が true になる)。再送が成功するまで dirty 扱いを外さない
+    const uncertain = new Set();
     let draining = null;   // 実行中の drain (Promise<boolean> = その実行の開始以降に失敗が無かったか)
     let rerun = false;     // drain 中に change が来た印 (終わる直前の取りこぼし防止)
-    // 戻り値: 'ok' = 保存した / 'rejected' = サーバーが拒否 (DB は旧値のまま) / 'unknown' = 通信エラー (DB は不明)
+    // 戻り値: 'ok' = 保存した / 'rejected' = サーバーが拒否 (DB は旧値のまま) / 'unknown' = DB の値が不明 (drain を止める)
     async function saveOne(input) {
       const value = input.value.trim();
-      if (value === lastOf.get(input)) return 'ok';
+      if (value === lastOf.get(input) && !uncertain.has(input)) return 'ok';
       let json;
       try {
         json = await post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value });
       } catch (e) {
         // 通信エラーはサーバーがコミット済みの可能性がある (Codex R4 high)。DB の値が分からないので
-        // 画面は巻き戻さず dirty のまま残し、drain を止める (次の change / flush で冪等に再送される)
+        // 画面は巻き戻さず uncertain に入れて drain を止める (次の change / flush で現在値を冪等に再送する)
+        uncertain.add(input);
         alert('通信エラーでJANコードを保存できませんでした (' + input.dataset.code + ')。もう一度お試しください');
         return 'unknown';
       }
       if (!json.ok) {
+        if (uncertain.has(input)) {
+          // DB の値が分からないまま拒否された = 巻き戻す先が無い。uncertain のまま止めて再読込を促す
+          alert((json.error || 'JANコードの保存に失敗しました') + ' — 直前の保存結果が不明なため、ページを再読み込みして値を確認してください');
+          return 'unknown';
+        }
         alert(json.error || 'JANコードの保存に失敗しました');
         // サーバーが拒否 = DB は旧値。後続の変更値を潰さない: 表示が失敗した値のままのときだけ DB の値へ巻き戻す。
         // 巻き戻したら確認表示 (カテゴリ・属性タブのカタログID) と必須バッジも合わせる (Codex R1 low)
@@ -3370,11 +3385,12 @@
         }
         return 'rejected';
       }
+      uncertain.delete(input);
       lastOf.set(input, value);
       if (result) result.textContent = 'JANコードを保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
       return 'ok';
     }
-    const dirtyInputs = () => inputs.filter((i) => i.value.trim() !== lastOf.get(i));
+    const dirtyInputs = () => inputs.filter((i) => uncertain.has(i) || i.value.trim() !== lastOf.get(i));
     // 失敗は共有フラグではなく drain 実行の結果として持つ (Codex R4 high: 実行中の drain に合流する flush が
     // 共有フラグをリセットすると、その drain で既に起きた失敗が消えていた)
     function drain() {

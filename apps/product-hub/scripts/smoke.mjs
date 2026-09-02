@@ -6322,6 +6322,87 @@ for (const [name, file, data] of renders) {
       const ok2 = await h.flush();
       check('sku-jan worker: その後の flush は (dirty なし・失敗なし) true', ok2 === true && h.posts.length === 2);
     }
+    // 5) 通信中に元の値へ戻す + 応答消失 (Codex R5 high): 画面と lastOf は一致するが DB は不明 →
+    //    uncertain のまま flush=false。次の flush で現在値 (空 = 解除) を再送し、成功して初めて true
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      h.a.change(''); // 応答待ち中に元の値へ戻す (rerun が立つ)
+      await tick();
+      h.pending.shift().reject(new Error('network')); // サーバーは A をコミットしたかもしれない
+      await tick();
+      const fl1 = h.flush();
+      await tick();
+      check('sku-jan worker: 不明な入力は画面が旧値と同じでも現在値 (空 = 解除) を再送する',
+        h.pending.length === 1 && h.pending[0].body.jan_code === '' && h.pending[0].body.ne_code === 'sku-a', JSON.stringify(h.posts));
+      h.pending.shift().reject(new Error('network'));
+      const ok = await fl1;
+      check('sku-jan worker: 再送も失敗なら flush=false のまま (DB 不明)', ok === false && h.posts.length === 2, JSON.stringify({ ok, posts: h.posts }));
+      const fl2 = h.flush();
+      await tick();
+      h.pending.shift().resolve({ ok: true });
+      const ok2 = await fl2;
+      check('sku-jan worker: 再送が通れば uncertain が消えて flush=true', ok2 === true && h.posts.length === 3, JSON.stringify({ ok2, posts: h.posts }));
+      const ok3 = await h.flush();
+      check('sku-jan worker: 確定後の flush は再送しない', ok3 === true && h.posts.length === 3);
+    }
+  }
+
+  // ─── 単品 JAN の保存 (detail.ejs saveJanIfChanged) の時系列テスト (Codex R5 high) ───
+  {
+    const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+    const start = src.indexOf('let lastSavedJan =');
+    const end = src.indexOf('  // SKU別JAN の保存キュー', start);
+    const chunk = start >= 0 && end > start ? src.slice(start, end) : '';
+    check('jan save: detail.ejs から saveJanIfChanged を切り出せる', chunk.includes('function saveJanIfChanged') && chunk.length > 200, String(chunk.length));
+    const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0)); };
+    function harness(initial) {
+      const el = { value: initial };
+      const pending = []; const alerts = []; const posts = [];
+      const ctx = {
+        document: { getElementById: (id) => (id === 'f-jan' ? el : null) },
+        alert: (m) => alerts.push(String(m)), BASE: '/x',
+        post: (url, body) => new Promise((resolve, reject) => { posts.push(body); pending.push({ body, resolve, reject }); }),
+        setTimeout, console,
+      };
+      vm.createContext(ctx);
+      const api = new vm.Script(`${chunk}\n({ save: () => saveJanIfChanged() })`, { filename: 'saveJanIfChanged' }).runInContext(ctx);
+      return { el, pending, alerts, posts, save: api.save };
+    }
+    // X → A に変更して保存開始 → 通信中に X へ戻す → 応答消失。次の保存は値が同じでも必ず再送する
+    {
+      const h = harness('4901234567894');
+      h.el.value = '4912345678904';
+      const s1 = h.save();
+      await tick();
+      h.el.value = '4901234567894'; // 元の値へ戻す
+      h.pending.shift().reject(new Error('network'));
+      const ok1 = await s1;
+      check('jan save: 通信エラーは false + 不明状態', ok1 === false && h.alerts.length === 1, JSON.stringify({ ok1, alerts: h.alerts }));
+      const s2 = h.save();
+      await tick();
+      check('jan save: 不明状態なら現在値が lastSavedJan と同じでも再送する', h.pending.length === 1 && h.pending[0].body.jan_code === '4901234567894', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok2 = await s2;
+      check('jan save: 再送が通れば true', ok2 === true && h.posts.length === 2);
+      const ok3 = await h.save();
+      check('jan save: 確定後は値が同じなら再送しない', ok3 === true && h.posts.length === 2);
+    }
+    // 保存中の打ち直しは最新値まで保存してから戻る (Codex R2 high)
+    {
+      const h = harness('');
+      h.el.value = '4901234567894';
+      const s1 = h.save();
+      await tick();
+      h.el.value = '4912345678904'; // 応答待ち中に打ち直し
+      h.pending.shift().resolve({ ok: true });
+      await tick();
+      check('jan save: 打ち直された値も続けて保存する', h.pending.length === 1 && h.pending[0].body.jan_code === '4912345678904', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok = await s1;
+      check('jan save: 最新値まで保存できたら true', ok === true && h.posts.length === 2);
+    }
   }
 }
 
