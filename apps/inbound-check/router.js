@@ -21,6 +21,7 @@ import {
   applyQuantityEvents, listQuantityEvents, finalizeLine, reopenLine,
   createDevice, verifyDevice, revokeDevice, listDevices,
   resolveDestination, infoForLine, setExpiryManaged, listDestinations, destinationsCsv, IROHA_YES, IROHA_NO,
+  listCompletedSlips, completedSlipsCsv,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
   listWorkers, getWorker,
@@ -181,6 +182,37 @@ router.post('/admin/enroll-codes', checkOrigin, requireAdmin, api((req, res) => 
 router.get('/guide', (req, res) => {
   res.sendFile(path.join(__dirname, 'views', 'guide.html'));
 });
+
+// ─── 完了一覧 (棚入れ・確認用) ───
+// 端末Cookie でもポータルセッションでも見られる。中原さん 2026-09-02:「PC からも見れるように」
+// ⭐画像は出さない (棚入れのときに見たいのは 商品・数量・期限 だけ)
+router.get('/done', (req, res) => {
+  const qIdx = req.originalUrl.indexOf('?');
+  const pathname = qIdx === -1 ? req.originalUrl : req.originalUrl.slice(0, qIdx);
+  if (pathname.endsWith('/')) return res.redirect(308, pathname.slice(0, -1) + (qIdx === -1 ? '' : req.originalUrl.slice(qIdx)));
+  res.sendFile(path.join(__dirname, 'views', 'done.html'));
+});
+
+function doneQuery(req) {
+  return {
+    days: req.query?.days ? Number(req.query.days) : 14,
+    arNo: req.query?.ar ? String(req.query.ar) : null,
+    workDate: req.query?.date ? String(req.query.date) : null,
+    includeIncomplete: String(req.query?.all || '') === '1',
+  };
+}
+
+router.get('/api/done', api((req, res) => {
+  res.json({ ok: true, slips: listCompletedSlips(doneQuery(req)) });
+}));
+
+// CSV は PC で開いて印刷・保管する用。端末からも落とせてよい (中身は画面と同じ)
+router.get('/done.csv', api((req, res) => {
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Content-Disposition', 'attachment; filename="inbound-done.csv"');
+  res.send(completedSlipsCsv(doneQuery(req)));
+}));
 
 // ─── 作業画面 ───
 router.get('/', (req, res) => {

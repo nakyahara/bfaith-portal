@@ -757,6 +757,20 @@ export function productInfoMap(codeKeys) {
   return map;
 }
 
+/**
+ * このバッチで確認済みの行に紐づく「決まったこと」= 行き先 / 有効期限 / 実数。
+ * 取り消していない最新の1件を採る (やり直すと新しい行が積まれるため)
+ */
+function decidedMap(db, batchId) {
+  const m = new Map();
+  for (const r of db.prepare(`SELECT line_key, destination, expiry_date, actual_qty
+    FROM f_inbound_check_destinations
+    WHERE batch_id = ? AND cancelled_at IS NULL ORDER BY id`).all(batchId)) {
+    m.set(r.line_key, r);   // 後勝ち = 最新
+  }
+  return m;
+}
+
 /** 前回 (直前の superseded バッチ) で確認済みだった行 → 参考表示用 {line_key → {by, at}} */
 function previousCheckedMap(db, activeId) {
   const prev = db.prepare("SELECT id FROM f_inbound_check_batches WHERE status = 'superseded' AND id < ? ORDER BY id DESC LIMIT 1").get(activeId);
@@ -803,6 +817,7 @@ export function getState() {
     FROM f_inbound_check_lines l JOIN f_inbound_check_line_state s ON s.batch_id = l.batch_id AND s.line_key = l.line_key
     WHERE l.batch_id = ? ORDER BY l.seq`).all(batch.id);
   const info = productInfoMap(lines.map(l => l.code_key));
+  const decided = decidedMap(db, batch.id);   // 確認時に決まった 行き先 / 有効期限 / 実数
   const images = productImageMap(lines.map(l => l.product_id));
   const prev = previousCheckedMap(db, batch.id);
   const checkedBySlip = new Map();
@@ -815,6 +830,9 @@ export function getState() {
     l.other_locs = x.other_locs;
     l.loc_source = x.loc_source;
     l.image_url = images.get(String(l.product_id || '').trim().toLowerCase()) || null;
+    const d = decided.get(l.line_key) || null;
+    l.expiry_date = d ? d.expiry_date : null;   // 確認したときに入力した有効期限 (未確認なら null)
+    l.destination = d ? d.destination : null;
     l.expiry_managed = !!x.expiry_managed;      // 期限管理商品か (在庫の有効期限から推定 or 手動設定)
     l.expiry_source = x.expiry_source || 'none';
     l.dest = resolveDestination(l.info, { expiryManaged: l.expiry_managed });   // 行き先と、確認の前に決める項目
@@ -1316,6 +1334,103 @@ export function reopenLine({ batchId, lineKey, expectVersion, expectQuantityVers
     }
     throw e;
   }
+}
+
+// ─────────────────── 完了した伝票の一覧 (棚入れ・確認用) ───────────────────
+
+/**
+ * 入荷番号 (AR) 単位で「確認し終えた明細」をまとめて返す。
+ *
+ * 中原さん 2026-09-02:「入荷番号のリストが全部チェックされたら一覧を表示させてほしい。
+ * そのときに期限があるものは期限と数量を一覧にしてほしい。画像とかは要らない。
+ * その一覧は PC からも見れるように」
+ *
+ * ⭐出所は **f_inbound_check_destinations だけ**。この表は batch_id を FK にしていないので、
+ *   取込バッチが保持期間で消えたあとも一覧が残る (棚入れ後に見返せないと意味がない)。
+ * ⚠「完了」= その AR の**確認済み行数が、その日にその AR で見た明細数と一致**すること。
+ *   明細数は台帳だけでは分からないので、active バッチにある AR は f_inbound_check_lines で
+ *   照合し、消えたバッチの AR は「台帳にある行数 = 完了行数」として扱う (全部確認したから残っている)
+ *
+ * @param {object} o { days, arNo, workDate, includeIncomplete }
+ * @returns {Array<{ar_no, work_date, done, line_count, checked_count, expiry_count, lines: [...]}>}
+ */
+export function listCompletedSlips({ days = 14, arNo = null, workDate = null, includeIncomplete = false } = {}) {
+  const db = getDB();
+  const where = ['d.cancelled_at IS NULL'];
+  const params = [];
+  if (arNo) { where.push('d.ar_no = ?'); params.push(String(arNo)); }
+  if (workDate) { where.push('d.work_date = ?'); params.push(String(workDate)); }
+  else {
+    const n = Math.max(1, Math.min(400, Number(days) || 14));
+    where.push("d.work_date >= date('now', '+9 hours', ?)");
+    params.push(`-${n - 1} days`);
+  }
+  const rows = db.prepare(`SELECT d.ar_no, d.work_date, d.line_key, d.product_id, d.product_name,
+      d.planned_qty, d.actual_qty, d.expiry_date, d.destination, d.worker, d.decided_at, d.code_key
+    FROM f_inbound_check_destinations d
+    WHERE ${where.join(' AND ')}
+    ORDER BY d.work_date DESC, d.ar_no, d.id`).all(...params);
+
+  // その AR に本来何行あるか。active バッチにある分だけ分かる (消えたバッチは台帳の行数で代用)
+  const planned = new Map();
+  for (const r of db.prepare(`SELECT b.work_date, l.ar_no, COUNT(*) AS n
+    FROM f_inbound_check_lines l JOIN f_inbound_check_batches b ON b.id = l.batch_id
+    WHERE b.status = 'active' GROUP BY b.work_date, l.ar_no`).all()) {
+    planned.set(`${r.work_date}|${r.ar_no}`, r.n);
+  }
+
+  const bySlip = new Map();
+  for (const r of rows) {
+    const key = `${r.work_date}|${r.ar_no}`;
+    if (!bySlip.has(key)) {
+      bySlip.set(key, { ar_no: r.ar_no, work_date: r.work_date, lines: [], workers: new Set(), last_at: r.decided_at });
+    }
+    const s = bySlip.get(key);
+    // 同じ明細が2度出たら最新を採る (取り消して確認し直した場合)
+    const idx = s.lines.findIndex(x => x.line_key === r.line_key);
+    if (idx >= 0) s.lines[idx] = r; else s.lines.push(r);
+    if (r.worker) s.workers.add(r.worker);
+    if (r.decided_at > s.last_at) s.last_at = r.decided_at;
+  }
+
+  const out = [];
+  for (const s of bySlip.values()) {
+    const total = planned.get(`${s.work_date}|${s.ar_no}`) ?? s.lines.length;
+    const done = s.lines.length >= total;
+    if (!done && !includeIncomplete) continue;
+    out.push({
+      ar_no: s.ar_no, work_date: s.work_date, done,
+      line_count: total, checked_count: s.lines.length,
+      expiry_count: s.lines.filter(l => l.expiry_date).length,
+      iroha_count: s.lines.filter(l => l.destination === 'iroha').length,
+      workers: [...s.workers], last_at: s.last_at,
+      // 期限があるものを先に。棚入れのとき「期限を書く商品」から片付けたい
+      lines: s.lines.slice().sort((a, b) => (b.expiry_date ? 1 : 0) - (a.expiry_date ? 1 : 0)
+        || String(a.product_id).localeCompare(String(b.product_id))),
+    });
+  }
+  out.sort((a, b) => (b.work_date || "").localeCompare(a.work_date || "") || (b.last_at || "").localeCompare(a.last_at || ""));
+  return out;
+}
+
+/** 完了一覧の CSV (UTF-8 BOM)。PC で開いて印刷・保管する用 */
+export function completedSlipsCsv(opts = {}) {
+  const slips = listCompletedSlips({ ...opts });
+  const esc = v => {
+    let s = v == null ? '' : String(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;   // 表計算ソフトが数式として解釈しないように
+    return `"${s.replace(/"/g, '""')}"`;
+  };
+  const head = ['作業日', '入荷管理番号', '商品ID', '商品名', '予定数', '実数', '有効期限', '行き先', '作業者', '確認日時'];
+  const body = [];
+  for (const s of slips) {
+    for (const l of s.lines) {
+      body.push([s.work_date, s.ar_no, l.product_id, l.product_name, l.planned_qty,
+        l.actual_qty == null ? l.planned_qty : l.actual_qty, l.expiry_date,
+        l.destination === 'iroha' ? 'いろは在庫化' : 'B-Faith入庫', l.worker, l.decided_at].map(esc).join(','));
+    }
+  }
+  return '\ufeff' + [head.map(esc).join(','), ...body].join('\r\n') + '\r\n';
 }
 
 // ───────────────────────── 履歴 ─────────────────────────

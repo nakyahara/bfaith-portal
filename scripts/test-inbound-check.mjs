@@ -378,5 +378,50 @@ console.log('\n[9] 移行 (バックフィル)');
   ok(rm2.ok && lm.check_status === 'checked' && lm.found_qty === 50, '移行後の同日再取込でも確認と数量が残る');
 }
 
+console.log('\n[13] 完了一覧 (棚入れ・確認用)');
+{
+  const { listCompletedSlips, completedSlipsCsv } = await import('../apps/inbound-check/db.js');
+  // 台帳に直接入れて検証する (確認の経路そのものは [8]〜[12] で検証済み)
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo' }).format(new Date());
+  const ins = db.prepare(`INSERT INTO f_inbound_check_destinations
+    (batch_id, line_key, ar_no, product_id, product_name, planned_qty, actual_qty, destination, decided_from,
+     worker, decided_at, work_date, code_key, expiry_date)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const at = new Date().toISOString();
+  db.prepare('DELETE FROM f_inbound_check_destinations').run();
+  ins.run(9001, 'ARX|1|1', 'ARX', 'p1', '商品1', 10, 10, 'bfaith', 'master', '山田', at, today, 'p1', null);
+  ins.run(9001, 'ARX|2|1', 'ARX', 'p2', '商品2', 20, 18, 'bfaith', 'master', '山田', at, today, 'p2', '2027-06-30');
+  ins.run(9001, 'ARY|1|1', 'ARY', 'p3', '商品3', 5, 5, 'iroha', 'chosen', '星', at, today, 'p3', '2027-06');
+
+  const slips = listCompletedSlips({ days: 2 });
+  ok(slips.length === 2, `完了した伝票が2件 (${slips.length})`);
+  const x = slips.find(s => s.ar_no === 'ARX');
+  ok(x && x.lines.length === 2 && x.done === true, 'ARX は2行で完了');
+  ok(x.expiry_count === 1, '期限のある行数を数える');
+  ok(x.lines[0].expiry_date === '2027-06-30', '期限のある行を先に出す (棚入れで先に片付ける)');
+  ok(x.lines[0].actual_qty === 18 && x.lines[0].planned_qty === 20, '予定と実数の両方を持つ');
+  const y = slips.find(s => s.ar_no === 'ARY');
+  ok(y.iroha_count === 1 && y.lines[0].destination === 'iroha', 'いろは行きの件数と行き先');
+
+  // 取り消した行は出さない
+  db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = ? WHERE line_key = 'ARY|1|1'").run(at);
+  ok(!listCompletedSlips({ days: 2 }).some(s => s.ar_no === 'ARY'), '取り消した行は完了一覧に出ない');
+
+  // AR で絞れる (作業画面の「📋 一覧」から来たとき)
+  const only = listCompletedSlips({ arNo: 'ARX' });
+  ok(only.length === 1 && only[0].ar_no === 'ARX', 'AR で絞り込める');
+
+  // 同じ明細を確認し直したら最新だけを出す
+  ins.run(9001, 'ARX|2|1', 'ARX', 'p2', '商品2', 20, 20, 'bfaith', 'master', '星', at, today, 'p2', '2028-01-31');
+  const again = listCompletedSlips({ arNo: 'ARX' })[0];
+  ok(again.lines.length === 2, 'やり直しても行が増えない');
+  ok(again.lines.find(l => l.product_id === 'p2').expiry_date === '2028-01-31', 'やり直したら最新の期限を出す');
+
+  const csv = completedSlipsCsv({ days: 2 });
+  ok(csv.charCodeAt(0) === 0xFEFF, 'CSV は BOM つき');
+  ok(/有効期限/.test(csv) && /2028-01-31/.test(csv), 'CSV に有効期限が入る');
+  ok(/商品1/.test(csv) && /商品2/.test(csv), 'CSV に明細が入る');
+}
+
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;
