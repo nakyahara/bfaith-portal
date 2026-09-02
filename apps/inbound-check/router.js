@@ -30,7 +30,7 @@ import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProd
 import { runNotionSweep, notionStatusForAdmin, resetNotionRow } from './notion-sync.js';
 import {
   parseWorkMasterXlsx, compareIrohaFlags, applyWorkMaster, seedIrohaFlags, logWorkMasterImport,
-  workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow, importIssueCount,
+  workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow, importIssueCount, computeDeletions,
 } from './work-master.js';
 // 入庫情報の書き込みは inbound-info の関数を通す (いろは=有り の連動ルール・楽観ロック・
 // updated_by の記録がそこに1つだけある。ここで直に UPDATE すると規則が二重管理になる)
@@ -643,9 +643,12 @@ router.post('/admin/work-master-import', requireAdmin, checkOrigin, upload.singl
   const apply = String(req.body?.apply || '') === '1';
   const seed = apply && String(req.body?.seed || '') === '1';
   const issueTotal = importIssueCount(parsed.issues);
+  const del = computeDeletions(parsed.rows);   // 取込 = 全置換。xlsx に無い既存行は削除される (予告して見せる)
   const out = {
     ok: true, dryRun: !apply, dataRows: parsed.dataRows, rowCount: parsed.rows.length,
-    issues: parsed.issues, issueTotal, buckets: compare.buckets,
+    issues: parsed.issues, issueTotal,
+    wouldDelete: { count: del.count, codes: del.codes },
+    buckets: compare.buckets,
     seedableCount: compare.seedable.length, infoOnlyCount: compare.infoOnlyCount,
     mismatchCount: compare.mismatches.length, mismatches: compare.mismatches.slice(0, 300),
   };
@@ -666,7 +669,7 @@ router.post('/admin/work-master-import', requireAdmin, checkOrigin, upload.singl
     if (seed) out.seeded = seedIrohaFlags(compare.seedable, { user: req.session.email });
     logWorkMasterImport({
       actor: req.session.email, fileName: req.file.originalname, ok: true,
-      message: `${parsed.rows.length}行 (新規${out.applied.inserted}/更新${out.applied.updated}/変化なし${out.applied.unchanged})`
+      message: `${parsed.rows.length}行 (新規${out.applied.inserted}/更新${out.applied.updated}/変化なし${out.applied.unchanged}/削除${out.applied.deleted})`
         + (out.seeded ? ` / いろは有無を${out.seeded.seeded}件書込 (新規行${out.seeded.added})` : ''),
     });
   }

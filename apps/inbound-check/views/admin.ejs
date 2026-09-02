@@ -200,7 +200,8 @@
         (作成時スナップショット — 後からマスタを変えても既存カードは変わりません。直すなら Notion 側で)。<br>
         取込は xlsx をそのままアップロード → まず<b>「検証する」</b> (何も書き込みません)。内容と
         「在庫化必要FLG × 入庫情報 (いろは有無)」の突合を確認してから「本取込」を押してください。<br>
-        ⚠ 本取込は<b>マスタ全体を xlsx の内容で置き換えます</b> (この画面での個別編集より取込が正)。
+        ⚠ 本取込は<b>マスタ全体を xlsx の内容で置き換えます</b> — xlsx に無い既存行は<b>削除</b>されます
+        (この画面での個別編集・追加より取込が正。削除予定は検証時に一覧で出ます)。
         検証エラー (数値でない入数・重複コード・数値セルの商品コード等) が1件でもあると本取込はできません。
       </p>
       <p>登録 <b><%= workMaster && workMaster.total != null ? workMaster.total : '-' %></b> 件
@@ -538,7 +539,12 @@
       let html = '<p>' + (j.dryRun ? '🔍 検証結果 (まだ何も書き込んでいません)' : '💾 取込結果')
         + ': データ ' + j.dataRows + ' 行 → 有効 ' + j.rowCount + ' 行'
         + (issue.emptyCode ? ' ・ コード空 ' + issue.emptyCode : '') + (issueLine ? ' ・ ⚠ ' + issueLine : '') + '</p>';
-      if (j.applied) html += '<p>マスタ書込: 新規 ' + j.applied.inserted + ' / 更新 ' + j.applied.updated + ' / 変化なし ' + j.applied.unchanged + '</p>';
+      if (j.applied) html += '<p>マスタ書込: 新規 ' + j.applied.inserted + ' / 更新 ' + j.applied.updated + ' / 変化なし ' + j.applied.unchanged + ' / <b>削除 ' + j.applied.deleted + '</b></p>';
+      if (j.wouldDelete && j.wouldDelete.count > 0 && j.dryRun) {
+        html += '<p class="hint"><b class="ng">⚠ 取込すると削除される既存行: ' + j.wouldDelete.count + ' 件</b>'
+          + ' (xlsx に無い行。画面で追加した行も対象): ' + esc(j.wouldDelete.codes.join(' / '))
+          + (j.wouldDelete.count > j.wouldDelete.codes.length ? ' …ほか' : '') + '</p>';
+      }
       if (j.seeded) {
         html += '<p>いろは有無の書込: <b>' + j.seeded.seeded + '</b> 件 (入庫情報に行を新規作成 ' + j.seeded.added
           + ' / 商品マスタに無く見送り ' + j.seeded.notInMaster + ' / 既に値があり触らず ' + j.seeded.skipped + ' / 失敗 ' + j.seeded.errors + ')</p>';

@@ -173,5 +173,15 @@ console.log('\n[6] Notion カードへの反映 (buildCardProperties + wm)');
   ok(!('入数' in noWm) && !('資材セットID' in noWm), 'マスタ未整備の商品はこれらの項目を送らない');
 }
 
+console.log('\n[7] [PR2-R2 High] 取込は全置換 — xlsx に無い既存行は削除される');
+{
+  const subset = parsed.rows.filter(r => r.code !== 'PROD-8');
+  const c = applyWorkMaster(subset, { user: 'test' });
+  ok(c.deleted === 1 && !db.prepare("SELECT 1 FROM f_iroha_work_master WHERE code_key = 'prod-8'").get(),
+    'xlsx から消えた PROD-8 の行が削除される (廃止した作業仕様を残さない)');
+  const c2 = applyWorkMaster(parsed.rows, { user: 'test' });
+  ok(c2.inserted === 1 && c2.deleted === 0, '戻せば再作成される');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail === 0 ? 0 : 1;

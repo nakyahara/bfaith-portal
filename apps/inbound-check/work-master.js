@@ -194,6 +194,15 @@ export function compareIrohaFlags(rows) {
 
 // ─── 本取込 (upsert) ───
 
+/** xlsx に無い既存行 (=取込で削除される行)。dry-run の予告と本取込の両方で使う */
+export function computeDeletions(rows) {
+  const db = getDB();
+  const incoming = new Set(rows.map((r) => r.codeKey));
+  const gone = db.prepare('SELECT code_key, 商品コード AS code FROM f_iroha_work_master').all()
+    .filter((r) => !incoming.has(r.code_key));
+  return { count: gone.length, codes: gone.map((g) => g.code).slice(0, 50), keys: gone.map((g) => g.code_key) };
+}
+
 export function applyWorkMaster(rows, { user = null } = {}) {
   const db = getDB();
   const now = utcNow();
@@ -204,7 +213,7 @@ export function applyWorkMaster(rows, { user = null } = {}) {
   const upd = db.prepare(`UPDATE f_iroha_work_master
     SET 商品コード = ?, material_code = ?, storage_container = ?, units_per_container = ?, process_count = ?, note = ?,
         version = version + 1, updated_at = ?, updated_by = ? WHERE code_key = ?`);
-  const counts = { inserted: 0, updated: 0, unchanged: 0 };
+  const counts = { inserted: 0, updated: 0, unchanged: 0, deleted: 0 };
   const tx = db.transaction(() => {
     for (const r of rows) {
       const cur = sel.get(r.codeKey);
@@ -221,6 +230,15 @@ export function applyWorkMaster(rows, { user = null } = {}) {
       } else {
         counts.unchanged++;
       }
+    }
+    // ⭐取込 = マスタ全体の置き換え。xlsx に無い既存行は削除する — upsert だけだと廃止した
+    //   作業仕様が残り、以後のカードに誤って載り続ける (Codex PR2-R2 High)。
+    //   削除予定は dry-run のレポート (wouldDelete) で先に見せる
+    const gone = computeDeletions(rows);
+    if (gone.keys.length > 0) {
+      const del = db.prepare('DELETE FROM f_iroha_work_master WHERE code_key = ?');
+      for (const k of gone.keys) del.run(k);
+      counts.deleted = gone.keys.length;
     }
   });
   tx.immediate();
