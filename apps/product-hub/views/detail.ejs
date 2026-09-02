@@ -3341,10 +3341,15 @@
     const inputs = [...document.querySelectorAll('.sku-jan-input')];
     if (inputs.length === 0) return;
     const result = document.getElementById('rk-result');
-    let saveChain = Promise.resolve(); // POST は1本ずつ (並行保存の後勝ち上書き防止)
-    const lastOf = new Map(inputs.map((i) => [i, i.value.trim()])); // 保存済みの値 (= DB の値)
+    // 保存は単一の drain ワーカー: 「保存済みの値 (lastOf = DB の値) と違う入力」を実行時点の現在値で
+    // 1 件ずつ POST し、全部一致するまで回す。捕捉値のキューにしない (Codex R3 high:
+    // 待機中に追加された保存を待てない / 失敗して巻き戻した後に古い捕捉値を再送できた)
+    const lastOf = new Map(inputs.map((i) => [i, i.value.trim()]));
     let failedSinceFlush = false;
-    async function save(input, value) {
+    let draining = null;   // 実行中の drain (Promise)
+    let rerun = false;     // drain 中に change が来た印 (終わる直前の取りこぼし防止)
+    async function saveOne(input) {
+      const value = input.value.trim();
       if (value === lastOf.get(input)) return;
       let json;
       try {
@@ -3355,8 +3360,8 @@
       if (!json.ok) {
         failedSinceFlush = true;
         alert(json.error || 'JANコードの保存に失敗しました');
-        // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ巻き戻す。
-        // 巻き戻したら確認表示 (カテゴリ・属性タブのカタログID) と必須バッジも DB の値に合わせる (Codex R1 low)
+        // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ DB の値へ巻き戻す。
+        // 巻き戻したら確認表示 (カテゴリ・属性タブのカタログID) と必須バッジも合わせる (Codex R1 low)
         if (input.value.trim() === value) {
           input.value = lastOf.get(input);
           input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -3366,18 +3371,29 @@
       lastOf.set(input, value);
       if (result) result.textContent = 'JANコードを保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
     }
-    function enqueue(input) {
-      const value = input.value.trim();
-      saveChain = saveChain.then(() => save(input, value));
+    const dirtyInputs = () => inputs.filter((i) => i.value.trim() !== lastOf.get(i));
+    function drain() {
+      if (draining) { rerun = true; return draining; }
+      draining = (async () => {
+        do {
+          rerun = false;
+          // 失敗は巻き戻すので通常 1〜2 周で収束する。上限は保存が失敗し続けるときの安全弁
+          for (let round = 0; round < 10; round++) {
+            const dirty = dirtyInputs();
+            if (dirty.length === 0) break;
+            for (const input of dirty) await saveOne(input);
+          }
+        } while (rerun);
+      })().finally(() => { draining = null; });
+      return draining;
     }
-    inputs.forEach((input) => input.addEventListener('change', () => enqueue(input)));
-    // プレビュー・登録・出品情報保存の前に呼ばれる (saveRakutenFields)。未保存の変更を確定してキューを
-    // 待ち切り、1 件でも失敗していたら false (Codex R2 high: change 保存と登録が並行して旧 JAN で進んでいた)
+    inputs.forEach((input) => input.addEventListener('change', () => { drain(); }));
+    // プレビュー・登録・出品情報保存の前に呼ばれる (saveRakutenFields)。未保存の変更を全部確定してから、
+    // 1 件でも失敗していたら / まだ DB と違う入力が残っていたら false (Codex R2 high)
     flushSkuJanSaves = async () => {
       failedSinceFlush = false;
-      inputs.forEach((input) => { if (input.value.trim() !== lastOf.get(input)) enqueue(input); });
-      await saveChain;
-      return !failedSinceFlush;
+      await drain();
+      return !failedSinceFlush && dirtyInputs().length === 0;
     };
   })();
 
