@@ -372,9 +372,10 @@ function supplierWorkspaceData(code) {
       ? { status: l.status, value: l.barcodeValue || '', note: l.note || '', version: l.version }
       : { status: 'unregistered', value: '', note: '', version: null };
   };
-  const draftRow = db.prepare("SELECT id, note, requested_date FROM po_orders WHERE supplier_code=? AND status='draft'").get(code);
+  const draftRow = db.prepare("SELECT id, note, requested_date, updated_at FROM po_orders WHERE supplier_code=? AND status='draft'").get(code);
   const draft = draftRow ? {
     id: draftRow.id, note: draftRow.note || '', requestedDate: draftRow.requested_date || '',
+    updatedAt: draftRow.updated_at || '', // 解除 (DELETE) の楽観ロックキー
     // 旧形式draft (ヘッダに希望納期・明細はNULL) の互換: 明細値が無ければヘッダ値を実効値として返す (Codex 明細納期R1 High)
     items: db.prepare('SELECT product_code AS code, product_key AS key, product_name AS name, qty, unit_cost AS cost, requested_date AS requestedDate FROM po_order_items WHERE order_id=? ORDER BY id')
       .all(draftRow.id).map(it => ({ ...it, requestedDate: it.requestedDate || draftRow.requested_date || null })),
@@ -613,27 +614,43 @@ router.post('/api/supplier/:code/draft', (req, res) => {
       return res.json({ ok: true, deleted: info.changes > 0 });
     }
     const id = upsertDraft(code, resolveSupplierName(code), items, trimS(note), requestedDate);
-    res.json({ ok: true, id });
+    // updatedAt = 解除 (DELETE) の楽観ロックキー。保存のたびに画面側の手持ちを更新させる
+    const saved = getDB().prepare('SELECT updated_at FROM po_orders WHERE id=?').get(id);
+    res.json({ ok: true, id, updatedAt: (saved && saved.updated_at) || '' });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
 // 下書きの解除 (破棄)。空カート保存 (POST items:[]) と同じ削除だが、
 // 発注数を1つずつ消さなくても1クリックで解除できる明示API。
 // 誤操作の追跡用に、消した中身 (明細・メモ) を監査ログに残す。
+// ?updatedAt= に画面が表示した時点の下書きの更新時刻を渡す。ズレていれば 409 で止める
+// (別PC/別タブで更新された下書きを、確認画面に出ていない内容ごと消さない ─ Codex R1 High)。
 router.delete('/api/supplier/:code/draft', (req, res) => {
   try {
     const code = normSupplierCode(req.params.code);
+    const expectAt = trimS(req.query.updatedAt);
     const db = getDB();
-    const row = db.prepare("SELECT id, note FROM po_orders WHERE supplier_code=? AND status='draft'").get(code);
-    // 下書きが無いときは deleted=false (画面側の入力クリアを誤発火させない、POST items:[] と同じ約束)
-    if (!row) return res.json({ ok: true, deleted: false, skuCount: 0 });
-    const items = db.prepare('SELECT product_code AS code, qty FROM po_order_items WHERE order_id=?').all(row.id);
-    db.prepare("DELETE FROM po_orders WHERE id=? AND status='draft'").run(row.id);
-    audit(db, {
-      actorType: 'user', actor: actorOf(req), action: 'draft_discard', resource: `supplier:${code}`,
-      detail: { orderId: row.id, note: row.note || '', items },
-    });
-    res.json({ ok: true, deleted: true, skuCount: items.length });
+    // 読み取り→削除→監査を1トランザクションに (監査だけ落ちて「消えたのに記録がない」状態を作らない ─ Codex R1 High)
+    const out = db.transaction(() => {
+      const row = db.prepare("SELECT id, note, updated_at FROM po_orders WHERE supplier_code=? AND status='draft'").get(code);
+      // 下書きが無いときは deleted=false (画面側の入力クリアを誤発火させない、POST items:[] と同じ約束)
+      if (!row) return { deleted: false, skuCount: 0 };
+      const items = db.prepare('SELECT product_code AS code, qty FROM po_order_items WHERE order_id=?').all(row.id);
+      if (expectAt && row.updated_at !== expectAt) return { conflict: true, skuCount: items.length, updatedAt: row.updated_at };
+      db.prepare("DELETE FROM po_orders WHERE id=? AND status='draft'").run(row.id);
+      audit(db, {
+        actorType: 'user', actor: actorOf(req), action: 'draft_discard', resource: `supplier:${code}`,
+        detail: { orderId: row.id, note: row.note || '', items },
+      });
+      return { deleted: true, skuCount: items.length };
+    }).immediate();
+    if (out.conflict) {
+      return res.status(409).json({
+        ok: false, conflict: true, skuCount: out.skuCount, updatedAt: out.updatedAt,
+        error: `この下書きは別の画面で更新されています (現在 ${out.skuCount}SKU)。最新を読み込んでから解除してください`,
+      });
+    }
+    res.json({ ok: true, ...out });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -3630,7 +3647,7 @@ router.get('/', (req, res) => {
     const db = getDB();
     // 下書きは件数も出す (カードから解除できるので、中身が分からないまま消させない)
     const draftMeta = new Map(db.prepare(`
-      SELECT o.supplier_code AS code, COUNT(i.id) AS sku_count, COALESCE(SUM(i.qty),0) AS total_qty
+      SELECT o.supplier_code AS code, o.updated_at, COUNT(i.id) AS sku_count, COALESCE(SUM(i.qty),0) AS total_qty
       FROM po_orders o LEFT JOIN po_order_items i ON i.order_id = o.id
       WHERE o.status='draft' GROUP BY o.id`).all().map(r => [r.code, r]));
     const cycleIssued = new Map(cycleIssuedSuppliers(cycleStartIso(pub)).map(r => [r.code, r]));
@@ -3643,6 +3660,7 @@ router.get('/', (req, res) => {
         code: g.code, name: g.name || ('仕入先 ' + g.code), memo: g.memo,
         targetCount: g.targets.length, estAmount: g.estAmount, hasDraft: draftMeta.has(g.code),
         draftSkus: draftMeta.has(g.code) ? draftMeta.get(g.code).sku_count : 0,
+        draftAt: draftMeta.has(g.code) ? (draftMeta.get(g.code).updated_at || '') : '',
         issuedCount: ci ? ci.orders : 0, unsentCount: ci ? ci.unsent : 0,
         productCount: g.targets.length + g.candidates.length + g.horikoshi.length,
       };
@@ -3683,7 +3701,7 @@ router.get('/', (req, res) => {
   const cardHtml = c => `
     <a class="card" data-sup="${he(c.code)}" data-supname="${he(c.name)}" data-tc="${c.targetCount}" data-ic="${c.issuedCount}" href="/apps/purchase-orders/supplier/${encodeURIComponent(c.code)}">
       <button class="cdis" data-cdis="${he(c.code)}" title="この仕入先を非表示 (下の「非表示の仕入先」から戻せます)">✕</button>
-      <div class="nm">${he(c.name)} ${c.hasDraft ? `<span class="dwrap"><span class="badge b-draft">下書きあり${c.draftSkus ? ` ${c.draftSkus}SKU` : ''}</span> <button class="cdrop" data-cdraft="${he(c.code)}" data-cdraftname="${he(c.name)}" data-cdraftskus="${c.draftSkus}" title="この仕入先の下書き (入力中の発注数・メモ) を破棄します。発注確定済みの発注には影響しません">🗑 下書きを解除</button></span>` : ''}${c.issuedCount ? ` <span class="badge b-issued" title="今サイクルで発注確定済み。FBA在庫更新やNE CSV取込 (データ更新) でこの表示はリセットされます">✅ 発注確定済み${c.issuedCount > 1 ? ' ×' + c.issuedCount : ''}</span>` : ''}${c.unsentCount ? ' <span class="badge b-warn" title="発注確定済みですが発注書メール (本送信) が未送信です">📧 メール未送信</span>' : ''}</div>
+      <div class="nm">${he(c.name)} ${c.hasDraft ? `<span class="dwrap"><span class="badge b-draft">下書きあり${c.draftSkus ? ` ${c.draftSkus}SKU` : ''}</span> <button class="cdrop" data-cdraft="${he(c.code)}" data-cdraftname="${he(c.name)}" data-cdraftskus="${c.draftSkus}" data-cdraftat="${he(c.draftAt)}" title="この仕入先の下書き (入力中の発注数・メモ) を破棄します。発注確定済みの発注には影響しません">🗑 下書きを解除</button></span>` : ''}${c.issuedCount ? ` <span class="badge b-issued" title="今サイクルで発注確定済み。FBA在庫更新やNE CSV取込 (データ更新) でこの表示はリセットされます">✅ 発注確定済み${c.issuedCount > 1 ? ' ×' + c.issuedCount : ''}</span>` : ''}${c.unsentCount ? ' <span class="badge b-warn" title="発注確定済みですが発注書メール (本送信) が未送信です">📧 メール未送信</span>' : ''}</div>
       ${c.memo ? `<div class="memo">📌 ${he(c.memo)}</div>` : ''}
       <div class="stats">
         <span><span class="n${c.targetCount ? ' acc' : ''}">${c.targetCount}</span>要発注 SKU</span>
@@ -3789,10 +3807,17 @@ document.addEventListener('click', function(ev) {
     var sk = btn.getAttribute('data-cdraftskus') || '';
     if (!confirm(nm + ' の下書きを解除します。\\n入力中の発注数' + (sk && sk !== '0' ? ' (' + sk + 'SKU)' : '') + ' とメモが消えます。元に戻せません。\\n\\n※発注確定済みの発注には影響しません。')) return;
     btn.disabled = true;
-    fetch('/apps/purchase-orders/api/supplier/' + encodeURIComponent(cdr) + '/draft', { method: 'DELETE' })
-      .then(function(r){ return r.json(); })
+    // 表示時点の更新時刻を添える。別PC/別タブで更新されていたら 409 で止まる
+    var at = btn.getAttribute('data-cdraftat') || '';
+    fetch('/apps/purchase-orders/api/supplier/' + encodeURIComponent(cdr) + '/draft' + (at ? '?updatedAt=' + encodeURIComponent(at) : ''), { method: 'DELETE' })
+      .then(function(r){ return r.json().catch(function(){ return { ok: false, error: 'HTTP ' + r.status }; }); })
       .then(function(j) {
         btn.disabled = false;
+        if (j.conflict) {
+          alert(j.error);
+          location.reload(); // 最新の下書き内容を見てから、もう一度判断してもらう
+          return;
+        }
         if (!j.ok) { toast('エラー: ' + j.error); return; }
         var card = btn.closest('a.card');
         var wrap = btn.closest('.dwrap');
@@ -4949,20 +4974,33 @@ function dropDraft() {
   var actBtns = document.querySelectorAll('button[data-act]');
   actBtns.forEach(function(b){ b.disabled = true; });
   var unlock = function(){ actBtns.forEach(function(b){ b.disabled = false; }); };
-  fetch('/apps/purchase-orders/api/supplier/' + encodeURIComponent(D.supplier.code) + '/draft', { method: 'DELETE' })
+  var at = (D.draft && D.draft.updatedAt) || '';
+  fetch('/apps/purchase-orders/api/supplier/' + encodeURIComponent(D.supplier.code) + '/draft' + (at ? '?updatedAt=' + encodeURIComponent(at) : ''), { method: 'DELETE' })
     .then(function(r){ return r.json().catch(function(){ return { ok: false, error: 'HTTP ' + r.status }; }); })
     .then(function(j) {
       unlock();
+      if (j.conflict) {
+        // この画面の内容自体が古い。読み込み直して最新を見てもらう (入力中の内容は失われるので確認する)
+        if (confirm(j.error + '\\n\\nこの画面を読み込み直しますか? (入力中の内容は失われます)')) location.reload();
+        return;
+      }
       if (!j.ok) { toast('エラー: ' + j.error); return; }
+      if (!j.deleted) {
+        // 既に他の画面で消えていた。入力中の内容までは消さない (Codex R1 Medium)
+        hasDraft = false; updateDraftBtn(); updateSavedInd();
+        toast('下書きはすでにありません (入力中の内容はそのままです)');
+        return;
+      }
       CART = {}; DATES = {};
       document.querySelectorAll('input[data-code]').forEach(function(inp){ inp.value = ''; });
       document.querySelectorAll('input[data-date]').forEach(function(inp){ inp.value = ''; });
       document.getElementById('orderNote').value = '';
       hasDraft = false;
+      D.draft = null; // 以後の解除・保存は「下書きなし」から始まる
       savedState = null; savedInfo = '';
       updateSavedInd(); updateDraftBtn();
       renderAll();
-      toast(j.deleted ? '下書きを解除しました' : '下書きはありませんでした (入力をクリアしました)');
+      toast('下書きを解除しました');
     })
     .catch(function(e){ unlock(); toast('通信エラー: ' + e.message); });
 }
@@ -5033,6 +5071,7 @@ function save(issue) {
       document.querySelectorAll('input[data-date]').forEach(function(inp){ inp.value = ''; });
       document.getElementById('orderNote').value = '';
       hasDraft = false; // draft は確定で消費済み
+      D.draft = null;
       updateDraftBtn();
       // 確定サマリをバーに常時表示。クリア後の空状態を基準に、以後の編集は「未保存の変更あり」(Codex R2 Medium)
       savedState = JSON.stringify(payloadNow());
@@ -5044,11 +5083,14 @@ function save(issue) {
       // draft削除APIは items 空のとき note を保存しない。画面の残留入力をDBと揃えてクリア (Codex R1 Medium)
       document.getElementById('orderNote').value = '';
       hasDraft = false;
+      D.draft = null;
       savedState = null; updateSavedInd(); updateDraftBtn();
       toast(j.deleted ? '下書きを削除しました' : '下書きはありません (入力をクリアしました)');
     }
     else {
       hasDraft = true;
+      // 保存で updated_at が進む。手持ちを更新しないと、この後の「下書きを解除」が自分の保存と衝突する
+      D.draft = { updatedAt: j.updatedAt || '', note: payload.note, items: payload.items };
       updateDraftBtn();
       savedState = JSON.stringify(payload);
       savedInfo = '💾 ' + new Date().toTimeString().slice(0, 5) + ' 保存済み — ' + summary;
