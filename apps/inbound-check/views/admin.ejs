@@ -559,9 +559,13 @@
               '<tr><td>' + esc(d.code) + '</td><td>' + esc(d.reason) + '</td></tr>').join('') + '</tbody></table>';
         }
       }
-      html += '<p><b>在庫化必要FLG × 入庫情報 (いろは有無) の突合</b> — 書き込み候補 ' + j.seedableCount + ' 件 / ⚠食い違い ' + j.mismatchCount + ' 件</p>';
-      html += '<table class="ic-list"><tbody>' + Object.entries(j.buckets || {})
-        .map(([k, v]) => '<tr><td>' + esc(WM_BUCKETS[k] || k) + '</td><td style="text-align:right">' + v + '</td></tr>').join('') + '</tbody></table>';
+      if (j.flgColumn === false) {
+        html += '<p class="hint">在庫化必要FLG 列なし — 突合・「いろは有無」の書込は行いません (FLGは廃止。正本は入庫情報)</p>';
+      } else {
+        html += '<p><b>在庫化必要FLG × 入庫情報 (いろは有無) の突合</b> (参考情報 — FLGは廃止済み) — 書き込み候補 ' + j.seedableCount + ' 件 / ⚠食い違い ' + j.mismatchCount + ' 件</p>';
+        html += '<table class="ic-list"><tbody>' + Object.entries(j.buckets || {})
+          .map(([k, v]) => '<tr><td>' + esc(WM_BUCKETS[k] || k) + '</td><td style="text-align:right">' + v + '</td></tr>').join('') + '</tbody></table>';
+      }
       if ((j.mismatches || []).length) {
         html += '<p class="hint" style="margin-top:8px"><b class="ng">⚠ 食い違い一覧</b> (自動では書き換えません。直すなら入庫情報側で):</p>'
           + '<table class="ic-list"><thead><tr><th>商品コード</th><th>商品名</th><th>旧FLG</th><th>現行</th></tr></thead><tbody>'

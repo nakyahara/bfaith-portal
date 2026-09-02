@@ -72,7 +72,10 @@ export async function parseWorkMasterXlsx(buffer) {
     const name = resolveCell(c.value).trim();
     if (name && !header.has(name)) header.set(name, col);
   });
-  for (const required of ['商品コード', '在庫化必要FLG']) {
+  // ⭐在庫化必要FLG は廃止 (中原さん 2026-09-02:「在庫化必要FLGはもうつかわない」)。
+  //   正本は f_inbound_info.いろは在庫化作業有無 (荷受け時のその場選択で育つ)。
+  //   列があれば突合レポート/seed に使えるが、無い xlsx も取り込める (必須は商品コードのみ)
+  for (const required of ['商品コード']) {
     if (!header.has(required)) throw new Error(`ヘッダーに「${required}」がありません`);
   }
   const col = (name) => header.get(name) || null;
@@ -128,7 +131,7 @@ export async function parseWorkMasterXlsx(buffer) {
       note: note || null,
     });
   });
-  return { rows, issues, dataRows };
+  return { rows, issues, dataRows, hasFlgColumn: cols.flg != null };
 }
 
 /**
