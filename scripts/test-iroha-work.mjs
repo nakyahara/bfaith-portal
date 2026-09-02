@@ -126,6 +126,8 @@ global.fetch = async (url, opts = {}) => {
     const p = mock.pages.find(x => x.id === id);
     if (!p) return respond(404, { object: 'error', message: 'not found' });
     mock.patched.push({ id, body });
+    // 応答前に1回だけ呼ぶフック (PATCH 中に別リクエストが割り込むレースの再現)
+    if (mock.onPagePatch) { const h = mock.onPagePatch; mock.onPagePatch = null; await h(); }
     const name = body.properties?.['ステータス']?.select?.name;
     if (name) p.properties['ステータス'] = sel(mock.patchStatusOverride || name);
     p.last_edited_time = '2026-09-02T01:00:00.000Z';
@@ -608,6 +610,25 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   ok(countActivePhotos(pDead.id) === 1, '送信待ち (stored) は数える');
   getDB().prepare("UPDATE f_iroha_card_media SET next_retry_at = '9999-12-31T00:00:00.000Z', error = 'x' WHERE operation_id = 'op-dead-00001'").run();
   ok(countActivePhotos(pDead.id) === 0, '停止した失敗写真は数えない (保存されない写真だけで完了できない)');
+
+  // Notion PATCH 中に削除が割り込んでも、削除の同期要求が消えない (revision 方式 — PR3-R2)
+  const pRace2 = mkPage({ status: '作業中', title: '同期レース', code: 'PROD-R2' });
+  addMedia({ pageId: pRace2.id, kind: 'photo', filePath: tmp('r1.jpg', jpeg), worker: worker1, operationId: 'op-race-00001' });
+  const rm2 = addMedia({ pageId: pRace2.id, kind: 'photo', filePath: tmp('r2.jpg', jpeg), worker: worker1, operationId: 'op-race-00002' });
+  mock.onPagePatch = async () => {
+    const id2 = getDB().prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-race-00002'").get().id;
+    const d = softDeleteMedia(id2, { deleteToken: rm2.deleteToken });
+    if (!d.ok) throw new Error('レース用の削除が失敗: ' + d.error);
+  };
+  await processMediaQueue();   // upload×2 → 同期PATCH (この最中に2枚目が削除される)
+  ok(getDB().prepare('SELECT COUNT(*) c FROM f_iroha_media_page_sync WHERE page_id = ?').get(pRace2.id).c === 1,
+    'PATCH 中の削除要求は完了扱いで消されず、キューに残る');
+  await new Promise(r => setTimeout(r, 30));
+  await processMediaQueue();
+  const raceLast = mock.patched.filter(p => p.id === pRace2.id && p.body.properties?.['完成写真']).pop();
+  ok(raceLast.body.properties['完成写真'].files.length === 1, '次の巡回で削除後の1枚に貼り直される');
+  ok(getDB().prepare('SELECT COUNT(*) c FROM f_iroha_media_page_sync WHERE page_id = ?').get(pRace2.id).c === 0,
+    '最新内容で同期できたらキューから消える');
   _setDriveUpload(null);
 }
 

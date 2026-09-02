@@ -162,11 +162,14 @@ export function softDeleteMedia(id, { deleteToken = null, actor = null, isSessio
   return { ok: true };
 }
 
-/** Notion 貼り直しをページ単位で予約する (即時対象になる) */
+/** Notion 貼り直しをページ単位で予約する (即時対象になる)。revision を進めて「処理中の古い
+ *  取得内容で完了扱いされない」ようにする (Codex PR3-R2: PATCH中の削除要求が消える競合) */
 export function requestPageSync(pageId) {
-  getDB().prepare(`INSERT INTO f_iroha_media_page_sync (page_id, requested_at, attempt_count, next_retry_at, error)
-    VALUES (?, ?, 0, NULL, NULL)
-    ON CONFLICT(page_id) DO UPDATE SET requested_at = excluded.requested_at, attempt_count = 0, next_retry_at = NULL`)
+  getDB().prepare(`INSERT INTO f_iroha_media_page_sync (page_id, revision, requested_at, attempt_count, next_retry_at, error)
+    VALUES (?, 1, ?, 0, NULL, NULL)
+    ON CONFLICT(page_id) DO UPDATE SET
+      revision = f_iroha_media_page_sync.revision + 1,
+      requested_at = excluded.requested_at, attempt_count = 0, next_retry_at = NULL`)
     .run(pageId, utcNow());
 }
 
@@ -331,14 +334,19 @@ export async function processMediaQueue() {
         try {
           if (!(await ensureMediaProp())) break;   // プロパティ型が合わない間は全ページ保留
           await syncPageToNotion(db, s.page_id);
-          db.prepare('DELETE FROM f_iroha_media_page_sync WHERE page_id = ?').run(s.page_id);
-          stats.synced++;
+          // ⚠PATCH を待っている間に新しい要求 (削除など) が来ていたら revision が進んでいる。
+          //   そのときは完了扱いにせず残す — 次の巡回が最新の内容で貼り直す (Codex PR3-R2)
+          const done = db.prepare('DELETE FROM f_iroha_media_page_sync WHERE page_id = ? AND revision = ?')
+            .run(s.page_id, s.revision).changes;
+          if (done > 0) stats.synced++;
         } catch (e) {
           const attempts = (s.attempt_count || 0) + 1;
           const retryAt = attempts >= MAX_ATTEMPTS ? BLOCKED_UNTIL
             : new Date(Date.now() + RETRY_BASE_MS * attempts).toISOString();
-          db.prepare('UPDATE f_iroha_media_page_sync SET attempt_count = ?, next_retry_at = ?, error = ? WHERE page_id = ?')
-            .run(attempts, retryAt, String(e.message).slice(0, 300), s.page_id);
+          // 失敗の記録も revision 一致時のみ (新しい要求はカウンタ0から再試行される)
+          db.prepare(`UPDATE f_iroha_media_page_sync SET attempt_count = ?, next_retry_at = ?, error = ?
+            WHERE page_id = ? AND revision = ?`)
+            .run(attempts, retryAt, String(e.message).slice(0, 300), s.page_id, s.revision);
           stats.failed++;
         }
       }
