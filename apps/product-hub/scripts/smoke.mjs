@@ -5212,6 +5212,14 @@ renders.push(
       skuJans: { 'rooms-l-wh': '4912345678904' },
       skuSelectorValues: { 'rooms-l-wh': 'ホワイト' },
     }]);
+    // 除外で実効 1 SKU になったバリエーション (2026-09-02 Codex R1 medium): サーバーは単品扱い
+    // (memberCount > 1 でない) なので、画面も JAN 欄を出し SKU 表には JAN 入力欄を出さない
+    renders.push(['detail.ejs (バリエーション: 実効1SKU)', 'detail.ejs', {
+      ...d0[2],
+      draft: { ...d0[2].draft, ne_code: 'rooms', price: 1980, jan_code: '4901234567894' },
+      variation: { ...variationFixtures.rep, members: variationFixtures.rep.members.slice(0, 1), memberCount: 1 },
+      skuJans: {}, skuSelectorValues: {},
+    }]);
     // 商品情報: ブランド名・容量が入っている分岐
     renders.push(['detail.ejs (商品情報: ブランド名・容量あり)', 'detail.ejs', {
       ...d0[2],
@@ -5373,6 +5381,21 @@ for (const [name, file, data] of renders) {
   } catch (e) {
     check(`render ${name}`, false, e.message);
   }
+}
+
+// ─── カタログID (JAN) の入口は基本情報タブだけ (2026-09-02 中原さん: 2 箇所に入れさせない) ───
+{
+  // 単品の描画 = variationFixtures.single を使う fixture (「detail.ejs (full/own_brand)」は子SKUの描画)
+  const single = renderedHtml.get('detail.ejs (rakuten registered + shop categories)') || '';
+  const multi = renderedHtml.get('detail.ejs (バリエーション: SKU別JANのみ)') || '';
+  const one = renderedHtml.get('detail.ejs (バリエーション: 実効1SKU)') || '';
+  check('カタログID画面: 単品は JAN 欄が基本情報タブに 1 つ、カテゴリ・属性タブは確認表示のみ',
+    single.includes('id="f-jan"') && !single.includes('rk-catalog-jan') && !single.includes('rk-catalog-mode')
+    && single.includes('id="rk-catalog-status"') && !single.includes('class="sku-jan-input"'));
+  check('カタログID画面: バリエーションは SKU 表の JAN 入力欄だけ (ページ代表の JAN 欄は出ない)',
+    !multi.includes('id="f-jan"') && multi.includes('class="sku-jan-input"') && multi.includes('id="rk-catalog-status"'));
+  check('カタログID画面: 実効 1 SKU は単品と同じ (JAN 欄あり・SKU 表に JAN 入力欄なし) = サーバーの判定と一致',
+    one.includes('id="f-jan"') && !one.includes('class="sku-jan-input"') && one.includes('単品扱い'));
 }
 
 // ─── 画面から消した UI が戻ってこないこと (2026-08-28 中原さん指摘) ───

@@ -853,10 +853,16 @@
                            value="<%= skuSelectorValues[mKey] || '' %>" placeholder="例: ブラウン">
                   </td>
                   <td>
-                    <input type="text" class="sku-jan-input" inputmode="numeric" maxlength="13"
-                           style="width:130px; font-size:12px; padding:4px 6px;"
-                           data-code="<%= m.商品コード %>"
-                           value="<%= skuJans[mKey] || '' %>" placeholder="8/12/13桁">
+                    <%# SKU が実効 1 件 (除外で減った) のときはサーバーが単品扱い = 上の JANコード欄を送る。
+                        ここに入力欄を出すと画面の確認表示・バッジと送る値が食い違うので出さない (Codex R1 medium) %>
+                    <% if (variation.members.length > 1) { %>
+                      <input type="text" class="sku-jan-input" inputmode="numeric" maxlength="13"
+                             style="width:130px; font-size:12px; padding:4px 6px;"
+                             data-code="<%= m.商品コード %>"
+                             value="<%= skuJans[mKey] || '' %>" placeholder="8/12/13桁">
+                    <% } else { %>
+                      <span class="muted" style="font-size:11px;">単品扱い — 上のJANコード欄の値を送ります</span>
+                    <% } %>
                   </td>
                   <% if (showSkuPrices) { %>
                     <td>
@@ -2839,7 +2845,22 @@
     });
   }
 
+  // 単品の JAN 欄 (基本情報タブ) は /rakuten では保存されない (入口一本化で catalog_jan を廃止したため)。
+  // プレビュー・登録・出品情報の保存はすべて saveRakutenFields を通るので、ここで JAN の変更を先に
+  // 基本情報 API へ送る (Codex R1 high: 画面の確認表示は新値なのに payload が旧 jan_code で組まれていた)
+  let lastSavedJan = document.getElementById('f-jan') ? document.getElementById('f-jan').value.trim() : null;
+  async function saveJanIfChanged() {
+    const el = document.getElementById('f-jan');
+    if (!el) return true; // バリエーションは SKU表 → /sku-jans で入力時に保存済み
+    const value = el.value.trim();
+    if (value === lastSavedJan) return true;
+    const json = await post(BASE, { jan_code: value });
+    if (!json.ok) { alert(json.error || 'JANコードの保存に失敗しました'); return false; }
+    lastSavedJan = value;
+    return true;
+  }
   async function saveRakutenFields() {
+    if (!(await saveJanIfChanged())) return false;
     const json = await post(BASE + '/rakuten', collectRakutenFields());
     if (!json.ok) { alert(json.error || '保存に失敗しました'); return false; }
     return true;
@@ -3315,8 +3336,12 @@
         }
         if (!json.ok) {
           alert(json.error || 'JANコードの保存に失敗しました');
-          // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ巻き戻す
-          if (input.value.trim() === value) input.value = last;
+          // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ巻き戻す。
+          // 巻き戻したら確認表示 (カテゴリ・属性タブのカタログID) と必須バッジも DB の値に合わせる (Codex R1 low)
+          if (input.value.trim() === value) {
+            input.value = last;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+          }
           return;
         }
         last = value;
