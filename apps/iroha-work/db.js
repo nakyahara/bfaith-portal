@@ -70,6 +70,8 @@ export function createTables(db = getMirrorDB()) {
       sort_order   INTEGER NOT NULL DEFAULT 0,
       pin_hash     TEXT,
       pin_salt     TEXT,
+      pin_fails    INTEGER NOT NULL DEFAULT 0,
+      pin_lock_until TEXT,
       created_at   TEXT NOT NULL,
       created_by   TEXT
     );
@@ -153,6 +155,24 @@ export function updateCacheStatus(pageId, status, lastEditedTime) {
     .run(status, lastEditedTime || null, pageId).changes;
 }
 
+/**
+ * 1ページ分を upsert する (parsePage の結果)。
+ * 全置換の取得に含まれなかった直近変更ページの復元用 — 例: 全体取得の最中に
+ * 棚入完了→作業中 へ変えると、未完了クエリ (変更前) にも完了クエリ (変更後) にも
+ * 入らず、UPDATE では0件になり行ごと消えてしまう (Codex PR1-R2 #1)
+ */
+export function upsertCachePage(p, fetchedAt = utcNow()) {
+  getDB().prepare(`INSERT INTO f_iroha_app_notion_cache
+    (page_id, status, title, product_code, dedupe_key, url, last_edited_time, payload, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(page_id) DO UPDATE SET
+      status = excluded.status, title = excluded.title, product_code = excluded.product_code,
+      dedupe_key = excluded.dedupe_key, url = excluded.url, last_edited_time = excluded.last_edited_time,
+      payload = excluded.payload, fetched_at = excluded.fetched_at`)
+    .run(p.pageId, p.status, p.title, p.productCode, p.dedupeKey, p.url, p.lastEditedTime,
+      JSON.stringify(p.props), fetchedAt);
+}
+
 export function removeCachePage(pageId) {
   return getDB().prepare('DELETE FROM f_iroha_app_notion_cache WHERE page_id = ?').run(pageId).changes;
 }
@@ -206,8 +226,12 @@ export function setIrohaWorkerActive(id, active) {
 }
 
 // ── 職員PIN (職員限定操作の本人確認。worker_id の自己申告を信用しない — Codex PR1 #1) ──
+// ハッシュは scrypt (短い数字PINは sha256 だと漏えい時に総当たりが容易 — セキュリティレビュー指摘)。
+// 失敗ロックは DB に持つ (プロセス内 Map だと再起動で消える — Codex PR1-R2 #4)
 
-const pinHash = (salt, pin) => crypto.createHash('sha256').update(`${salt}:${pin}`).digest('hex');
+const PIN_MAX_FAILS = 5;
+const PIN_LOCK_MS = 10 * 60 * 1000;
+const pinHash = (salt, pin) => crypto.scryptSync(String(pin), `iroha-pin:${salt}`, 32).toString('hex');
 
 export function setWorkerPin(id, pin, actor) {
   const p = String(pin || '').trim();
@@ -215,39 +239,46 @@ export function setWorkerPin(id, pin, actor) {
   const w = getIrohaWorker(id);
   if (!w) return { ok: false, error: 'not_found', message: '作業者が見つかりません' };
   if (w.worker_type !== 'staff') return { ok: false, error: 'not_staff', message: 'PINを設定できるのは職員だけです' };
-  const salt = crypto.randomBytes(8).toString('hex');
-  getDB().prepare('UPDATE f_iroha_workers SET pin_hash = ?, pin_salt = ? WHERE id = ?')
+  const salt = crypto.randomBytes(16).toString('hex');
+  getDB().prepare('UPDATE f_iroha_workers SET pin_hash = ?, pin_salt = ?, pin_fails = 0, pin_lock_until = NULL WHERE id = ?')
     .run(pinHash(salt, p), salt, Number(id));
-  logEvent({ action: 'pin_set', workerId: w.id, workerName: w.display_name, deviceLabel: actor || null, ok: true });
+  // 監査ログの失敗で設定済みの結果を失敗に見せない (Codex PR1-R2 #5)
+  try {
+    logEvent({ action: 'pin_set', workerId: w.id, workerName: w.display_name, deviceLabel: actor || null, ok: true });
+  } catch (e) { console.error('[iroha-work] PIN設定の履歴記録に失敗 (設定自体は完了)', e); }
   return { ok: true };
 }
 
 /**
- * PIN 照合 (連続失敗はプロセス内で 10分/5回 に制限 — 総当たり対策)。
+ * PIN 照合。連続失敗 5 回で 10 分ロック (DB 永続 — 再起動で回避できない)。
  * @returns {ok:true} | {ok:false, error:'pin_required'|'pin_invalid'|'pin_locked'}
  */
-const pinFails = new Map();   // workerId → [failedAtMs...]
 export function verifyWorkerPin(id, pin) {
-  const row = getDB().prepare('SELECT id, pin_hash, pin_salt FROM f_iroha_workers WHERE id = ?').get(Number(id));
-  if (!row || !row.pin_hash) return { ok: false, error: 'pin_required', message: 'この職員にはPINが未設定です (管理画面で設定してください)' };
-  const now = Date.now();
-  const fails = (pinFails.get(row.id) || []).filter(t => now - t < 10 * 60 * 1000);
-  if (fails.length >= 5) {
-    pinFails.set(row.id, fails);
-    return { ok: false, error: 'pin_locked', message: 'PINの間違いが続いたため一時的にロックしました。10分ほど待ってください' };
-  }
-  const p = String(pin || '').trim();
-  if (!p || pinHash(row.pin_salt, p) !== row.pin_hash) {
-    fails.push(now);
-    pinFails.set(row.id, fails);
-    return { ok: false, error: p ? 'pin_invalid' : 'pin_required', message: p ? 'PINが違います' : '職員のPINを入れてください' };
-  }
-  pinFails.delete(row.id);
-  return { ok: true };
+  const db = getDB();
+  return db.transaction(() => {
+    const row = db.prepare('SELECT id, pin_hash, pin_salt, pin_fails, pin_lock_until FROM f_iroha_workers WHERE id = ?').get(Number(id));
+    if (!row || !row.pin_hash) return { ok: false, error: 'pin_required', message: 'この職員にはPINが未設定です (管理画面で設定してください)' };
+    if (row.pin_lock_until && Date.parse(row.pin_lock_until) > Date.now()) {
+      return { ok: false, error: 'pin_locked', message: 'PINの間違いが続いたため一時的にロックしました。10分ほど待ってください' };
+    }
+    const p = String(pin || '').trim();
+    if (!p || pinHash(row.pin_salt, p) !== row.pin_hash) {
+      const fails = (row.pin_fails || 0) + 1;
+      const lockUntil = fails >= PIN_MAX_FAILS ? new Date(Date.now() + PIN_LOCK_MS).toISOString() : null;
+      db.prepare('UPDATE f_iroha_workers SET pin_fails = ?, pin_lock_until = COALESCE(?, pin_lock_until) WHERE id = ?')
+        .run(lockUntil ? 0 : fails, lockUntil, row.id);
+      if (lockUntil) return { ok: false, error: 'pin_locked', message: 'PINの間違いが続いたため一時的にロックしました。10分ほど待ってください' };
+      return { ok: false, error: p ? 'pin_invalid' : 'pin_required', message: p ? 'PINが違います' : '職員のPINを入れてください' };
+    }
+    db.prepare('UPDATE f_iroha_workers SET pin_fails = 0, pin_lock_until = NULL WHERE id = ?').run(row.id);
+    return { ok: true };
+  }).immediate();
 }
 
-/** テスト用: PIN 失敗カウンタを消す */
-export function _clearPinFails() { pinFails.clear(); }
+/** テスト用: PIN ロックと失敗カウンタを消す */
+export function _clearPinFails() {
+  getDB().prepare('UPDATE f_iroha_workers SET pin_fails = 0, pin_lock_until = NULL').run();
+}
 
 // ───────────────────────── 操作履歴 ─────────────────────────
 

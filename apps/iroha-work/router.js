@@ -185,7 +185,12 @@ router.post('/api/refresh', checkOrigin, api(async (req, res) => {
   }
   refreshLastAt = now;
   const refresh = await ensureFresh({ force: true });
-  res.status(refresh.error ? 502 : 200).json({ ok: !refresh.error, refresh });
+  // truncated (件数上限で取得を諦めた) も「最新にできていない」ので成功にしない (Codex PR1-R2 #3)
+  const okRes = !refresh.error && !refresh.truncated;
+  res.status(refresh.error ? 502 : 200).json({
+    ok: okRes, refresh,
+    ...(okRes ? {} : { message: refresh.error || 'カードが件数上限を超えているため更新できませんでした (前回取得分を表示しています)' }),
+  });
 }));
 
 /** 作業者の解決 (いろは名簿)。変更操作は誰がやったかを必須にする */

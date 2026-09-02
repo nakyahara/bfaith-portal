@@ -61,6 +61,7 @@ function mkPage({ status = '未着手', title = '商品', code = 'PROD-A', qty =
   const id = `page-${++seq}`;
   const page = {
     id, url: `https://www.notion.so/${id}`, archived: false,
+    parent: { database_id: 'testdb' },
     last_edited_time: '2026-09-02T00:00:00.000Z',
     properties: {
       '名前': { type: 'title', title: title == null ? [] : [{ plain_text: title }] },
@@ -312,6 +313,13 @@ console.log('\n[9] changeStatus');
   pTyped.properties['ステータス'] = { type: 'status', status: { name: '未着手' } };
   const rT = await changeStatus({ pageId: pTyped.id, to: '作業中', expect: '未着手', isStaff: false });
   ok(rT.ok === false && rT.error === 'schema_mismatch', 'select 型でなければ schema_mismatch');
+
+  // 別 DB のページ ID を渡されても書き換えない (同じインテグレーションが触れる他DBの防御)
+  const pForeign = mkPage({ status: '未着手', title: 'よそのDB', code: 'PROD-F' });
+  pForeign.parent = { database_id: 'other-db' };
+  const rF = await changeStatus({ pageId: pForeign.id, to: '作業中', expect: '未着手', isStaff: true });
+  ok(rF.ok === false && rF.error === 'wrong_database', '対象DB外のページは拒否');
+  ok(!mock.patched.some(p => p.id === pForeign.id), 'PATCH 自体を送らない');
 }
 
 console.log('\n[9b] 同時変更はページ単位で直列化 (後勝ち消失を防ぐ)');
@@ -339,6 +347,24 @@ console.log('\n[9c] 取得中のステータス変更を全置換で巻き戻さ
   await refreshFromNotion();
   const row = listCache().find(x => x.page_id === pR.id);
   ok(row && row.status === '作業中', '古い取得結果がキャッシュ全置換で変更を巻き戻さない');
+}
+
+console.log('\n[9d] 取得中の 棚入完了→未完了 で行が消えない (R2 #1)');
+{
+  // 棚入完了のカードをキャッシュに入れておく
+  const pD = mkPage({ status: '棚入完了', title: '完了から戻す', code: 'PROD-D2' });
+  await refreshFromNotion();
+  ok(listCache().some(x => x.page_id === pD.id), '前提: 完了カードがキャッシュにある');
+  // 未完了クエリのスナップショット後 (=このカードは含まれない) に 棚入完了→作業中 へ変更。
+  // 完了クエリ時点ではもう作業中なので、どちらのクエリ結果にも入らない
+  mock.onQuery = async () => {
+    const r = await changeStatus({ pageId: pD.id, to: '作業中', expect: '棚入完了', isStaff: true });
+    if (!r.ok) throw new Error('レース用の変更が失敗: ' + r.error);
+  };
+  await refreshFromNotion();
+  const row = listCache().find(x => x.page_id === pD.id);
+  ok(!!row, '行ごと消えない (upsert で戻し入れる)');
+  ok(row && row.status === '作業中', '変更後のステータスで残る');
 }
 
 console.log('\n[10] 作業者名簿');

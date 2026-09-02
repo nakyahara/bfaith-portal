@@ -21,7 +21,7 @@
  * INBOUND_CHECK_NOTION_DB_ID がこの DB の ID)。
  */
 import { notionRequest, isNotionConfigured, ensureCardSchema } from '../inbound-check/notion.js';
-import { getDB, replaceCache, listCache, updateCacheStatus, removeCachePage, getMeta, setMetaValue } from './db.js';
+import { getDB, replaceCache, listCache, updateCacheStatus, upsertCachePage, removeCachePage, getMeta, setMetaValue } from './db.js';
 
 export { isNotionConfigured };
 
@@ -98,8 +98,10 @@ async function queryPages(filter, maxPages) {
   return { results, truncated: true };
 }
 
-// 取得中にアプリ経由で変えたステータス (pageId → { status, at })。
-// 全置換が古い取得結果で変更を巻き戻さないための覚え書き (Codex PR1 #3)
+// 取得中にアプリ経由で変えたページ (pageId → { row: parsePage結果, at })。
+// 全置換が古い取得結果で変更を巻き戻さない・行ごと消さないための覚え書き (Codex PR1 #3 / R2 #1)。
+// ⭐UPDATE でなく行まるごと upsert する: 取得の最中に 棚入完了→作業中 と変えると、
+//   未完了クエリ (変更前に実行) にも完了クエリ (変更後に実行) にも入らず、行が消えるため
 const recentChanges = new Map();
 
 /**
@@ -141,10 +143,10 @@ export async function refreshFromNotion() {
     pages.push(parsePage(page));
   }
   replaceCache(pages);
-  // 取得開始より後にアプリで変えたステータスは、置換結果 (古い) より新しい → 上書きし直す。
+  // 取得開始より後にアプリで変えたページは、置換結果 (古い) より新しい → 行ごと戻し入れる。
   // 取得開始より前の変更は Notion 側の取得結果に含まれているので覚え書きを消す
   for (const [pageId, ch] of recentChanges) {
-    if (ch.at >= startedAt) updateCacheStatus(pageId, ch.status, null);
+    if (ch.at >= startedAt) upsertCachePage(ch.row);
     else recentChanges.delete(pageId);
   }
   setMetaValue('truncated', null);
@@ -241,6 +243,12 @@ async function changeStatusLocked({ pageId, to, expect, isStaff }) {
     removeCachePage(pageId);
     return { ok: false, error: 'card_gone', message: 'このカードは Notion 側でアーカイブされています。一覧を更新します' };
   }
+  // 対象 DB のページであることを確認 (Codex PR1-R2 #2: pageId は端末から自由に送れるので、
+  // 同じインテグレーションが触れる**別DB**のページを書き換えられないようにする)
+  const parentId = String(page.parent?.database_id || '').replace(/-/g, '').toLowerCase();
+  if (parentId !== String(dbId() || '').replace(/-/g, '').toLowerCase()) {
+    return { ok: false, error: 'wrong_database', message: 'このページは在庫化作業管理のカードではありません' };
+  }
   const stProp = page.properties?.[STATUS_PROP];
   if (stProp && stProp.type !== 'select') {
     return { ok: false, error: 'schema_mismatch',
@@ -275,8 +283,10 @@ async function changeStatusLocked({ pageId, to, expect, isStaff }) {
     return { ok: false, error: 'verify_failed',
       message: '変更を送りましたが、Notion 側の値が確認できませんでした。一覧を更新して確かめてください' };
   }
-  updateCacheStatus(pageId, to, updated.last_edited_time);
-  recentChanges.set(pageId, { status: to, at: Date.now() });
+  // PATCH 応答はページ全体なので、行まるごとキャッシュへ反映する
+  const parsed = parsePage(updated);
+  upsertCachePage(parsed);
+  recentChanges.set(pageId, { row: parsed, at: Date.now() });
   return { ok: true, status: to };
 }
 

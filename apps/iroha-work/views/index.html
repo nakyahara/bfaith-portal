@@ -296,7 +296,7 @@ function renderSync() {
   let txt = 'Notionと同期: ' + fmtTime(rf.lastRefreshAt) + ' ・ 🗂 カード' + state.cards.length + '枚 ・ ステータスの札をタップすると変えられます';
   $('#syncTxt').textContent = txt;
   if (rf.error) showErr('Notionから最新を取得できませんでした (前回取得分を表示しています)', rf.error);
-  if (rf.truncated) showWarn('カードが多すぎて一部だけ表示しています (職員の方は管理画面を確認してください)');
+  if (rf.truncated) showWarn('カードが件数上限を超えているため最新化できていません (前回取得分を表示中。職員の方は管理画面を確認してください)');
 }
 
 // ─── タブ・一覧 ───
