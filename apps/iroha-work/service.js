@@ -58,13 +58,19 @@ const PRIORITY_RANK = { urgent: 0, new: 1, normal: 2, unknown: 3, calm: 4 };
  * missing = 現場が作業を始めるのに足りない項目 (⚠未登録バッジの根拠)
  */
 function masterOf(wm, props) {
+  // ⭐項目単位でカード値へフォールバックする (Codex PR4 #1: マスタ行が「動画だけ」でも、
+  //   カードに載っている資材・入数の表示を消さない)。version はマスタ行の有無で決まる
+  const card = {
+    material_code: props['資材セットID'] || null, storage_container: props['収納容器'] || null,
+    units_per_container: props['入数'] ?? null, process_count: props['工程数'] ?? null, note: props['備考'] || null,
+  };
   const m = wm
-    ? { source: 'master', version: wm.version, material_code: wm.material_code || null, storage_container: wm.storage_container || null,
-        units_per_container: wm.units_per_container ?? null, process_count: wm.process_count ?? null, note: wm.note || null,
+    ? { source: 'master', version: wm.version,
+        material_code: wm.material_code || card.material_code, storage_container: wm.storage_container || card.storage_container,
+        units_per_container: wm.units_per_container ?? card.units_per_container,
+        process_count: wm.process_count ?? card.process_count, note: wm.note || card.note,
         video_url: wm.video_url || null }
-    : { source: 'card', version: null, material_code: props['資材セットID'] || null, storage_container: props['収納容器'] || null,
-        units_per_container: props['入数'] ?? null, process_count: props['工程数'] ?? null, note: props['備考'] || null,
-        video_url: null };
+    : { source: 'card', version: null, ...card, video_url: null };
   const missing = [];
   if (!m.material_code) missing.push('資材');
   if (!m.storage_container) missing.push('容器');

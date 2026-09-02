@@ -700,6 +700,9 @@ function rerenderDetail() {
 
 // ── 作業のやり方の登録・修正 (FB③⑥。空欄埋め=誰でも / 上書き=職員PIN。版は楽観ロック) ──
 let mvSaving = false;
+// ⭐開いた時点の値と version を固定する (Codex PR4 #3: 60秒ポーリングが version を進めると、
+//   古い入力を新しい version で送れてしまい他人の変更を上書きする)
+let mvCtx = null;   // { pageId, code, version, values }
 const MV_MAP = { material_code: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
   process_count: 'mvProcess', note: 'mvNote', video_url: 'mvVideo' };
 
@@ -732,6 +735,7 @@ function openMaster(focus) {
   if (!c) return;
   if (!c.product_code) { showErr('商品コードのないカードは登録できません (Notion側で商品コードを入れてください)'); return; }
   const cur = mvValues(c.master);
+  mvCtx = { pageId: c.page_id, code: c.product_code, version: c.master.version, values: cur };
   for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur[f];
   $('#mvName').textContent = c.title + ' (' + c.product_code + ')';
   $('#mvMsg').textContent = '';
@@ -744,14 +748,11 @@ function closeMaster() { if (mvSaving) return; $('#mvOv').classList.remove('on')
 $('#mvOv').addEventListener('click', e => { if (e.target === $('#mvOv')) closeMaster(); });
 
 async function saveMaster() {
-  if (mvSaving || !worker) return;
-  const c = state.cards.find(x => x.page_id === curDetail);
-  if (!c) { closeMaster(); return; }
-  const cur = mvValues(c.master);
+  if (mvSaving || !worker || !mvCtx) return;
   const fields = {};
   for (const [f, id] of Object.entries(MV_MAP)) {
     const v = document.getElementById(id).value.trim();
-    if (v !== cur[f]) fields[f] = v;
+    if (v !== mvCtx.values[f]) fields[f] = v;   // 開いた時点との差分だけ送る
   }
   if (Object.keys(fields).length === 0) { closeMaster(); toast('変更はありませんでした'); return; }
   mvSaving = true;
@@ -762,8 +763,8 @@ async function saveMaster() {
     const r = await fetch(BASE + '/api/master', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        code: c.product_code, page_id: c.page_id, fields,
-        expect_version: c.master.version, worker_id: worker.id,
+        code: mvCtx.code, page_id: mvCtx.pageId, fields,
+        expect_version: mvCtx.version, worker_id: worker.id,
         pin: $('#mvPin').value.trim() || undefined,
       }),
     });
@@ -775,9 +776,10 @@ async function saveMaster() {
   if (j.ok) {
     // 同じ商品の他のカードにも効かせる
     if (j.row) for (const card of state.cards) {
-      if (card.product_code === c.product_code) card.master = masterFromRow(j.row);
+      if (card.product_code === mvCtx.code) card.master = masterFromRow(j.row);
     }
     $('#mvOv').classList.remove('on');
+    mvCtx = null;
     renderList(); rerenderDetail();
     toast(j.unchanged ? '変更はありませんでした' : '登録しました (この商品の次のカードにも反映されます)');
     return;
@@ -789,9 +791,17 @@ async function saveMaster() {
     $('#mvPin').focus();
     return;
   }
-  if (j.error === 'conflict') {
-    $('#mvMsg').textContent = '❌ ' + (j.message || '他の人が先に更新しました');
-    loadState();
+  if (j.error === 'conflict' || j.error === 'version_required') {
+    // 最新を読み込み、フォームも最新値で組み直す (古い入力のままの再保存で上書きさせない — Codex PR4 #4)
+    $('#mvMsg').textContent = '⏳ ' + (j.message || '他の人が先に更新しました') + ' — 最新を読み込んでいます…';
+    await loadState();
+    const c2 = state.cards.find(x => x.page_id === mvCtx.pageId);
+    if (c2) {
+      const cur2 = mvValues(c2.master);
+      mvCtx = { pageId: c2.page_id, code: c2.product_code, version: c2.master.version, values: cur2 };
+      for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur2[f];
+    }
+    $('#mvMsg').textContent = '❌ 他の人が先に更新したため、最新の内容に読み込み直しました。もう一度入力してください';
     return;
   }
   $('#mvMsg').textContent = '❌ ' + (j.message || '保存できませんでした');

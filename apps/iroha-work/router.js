@@ -317,7 +317,7 @@ router.post('/api/master', checkOrigin, api((req, res) => {
 
   const k = codeKeyOf(code);
   const db = getDB();
-  let row = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
+  const row = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
 
   const { fills, overwrites } = classifyMasterEdit(row, fields);
   if (fills.length === 0 && overwrites.length === 0) {
@@ -331,30 +331,70 @@ router.post('/api/master', checkOrigin, api((req, res) => {
     const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
     if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
   }
-
-  if (!row) {
-    const add = addWorkMasterRow(code, `${w.worker.display_name} (いろはアプリ)`);
-    if (!add.ok) {
-      const msg = add.error === 'not_in_master' ? 'この商品は商品マスタに無いため登録できません (商品コードを確認してください)' : add.message;
-      return res.status(400).json({ ok: false, error: add.error, message: msg });
-    }
-    row = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
+  // 既存行の更新は expect_version 必須 (省略でロックを素通りさせない — Codex PR4 #5)
+  if (row && req.body?.expect_version == null) {
+    return res.status(400).json({ ok: false, error: 'version_required', message: '画面を更新してからやり直してください (version が必要です)' });
   }
-  const expect = req.body?.expect_version == null ? row.version : Number(req.body.expect_version);
-  const r = updateWorkMasterRow(k, fields, `${w.worker.display_name} (いろはアプリ)`, expect);
+
+  // ⭐行の新規作成〜更新は1トランザクション (Codex PR4 #2: 検証や競合で失敗したのに
+  //   空行だけ残ると、カード由来の表示仕様を隠してしまう)。
+  //   新規作成時は、カード作成時のスナップショット値で行を初期化してから今回の変更を
+  //   重ねる (Codex PR4 #1: 動画だけ登録した瞬間に資材・入数の表示が消えないように)
+  const editor = `${w.worker.display_name} (いろはアプリ)`;
+  const rollback = Symbol('rollback');
+  let result;
+  try {
+    result = db.transaction(() => {
+      let cur = row;
+      let applyFields = fields;
+      let expect;
+      if (!cur) {
+        const add = addWorkMasterRow(code, editor);
+        if (!add.ok) {
+          const msg = add.error === 'not_in_master' ? 'この商品は商品マスタに無いため登録できません (商品コードを確認してください)' : add.message;
+          const e = new Error(msg); e[rollback] = { status: 400, body: { ok: false, error: add.error, message: msg } }; throw e;
+        }
+        cur = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
+        expect = cur.version;
+        // カード表示中の値をシード (今回指定されなかった項目だけ)。空欄埋め扱いなので権限は不要
+        const card = getCachePage(String(req.body?.page_id || ''));
+        if (card) {
+          let props = {};
+          try { props = JSON.parse(card.payload || '{}'); } catch { /* 壊れていればシードなし */ }
+          const seed = {
+            material_code: props['資材セットID'], storage_container: props['収納容器'],
+            units_per_container: props['入数'], process_count: props['工程数'], note: props['備考'],
+          };
+          applyFields = { ...Object.fromEntries(Object.entries(seed).filter(([f, v]) => v != null && v !== '' && !(f in fields))), ...fields };
+        }
+      } else {
+        expect = Number(req.body.expect_version);
+      }
+      const r = updateWorkMasterRow(k, applyFields, editor, expect);
+      if (!r.ok) {
+        const st = r.error === 'conflict' ? 409 : r.error === 'not_found' ? 404 : 400;
+        const msg = r.error === 'conflict' ? '他の人が先に更新しました。最新の内容を読み込みます' : r.message;
+        const e = new Error(msg); e[rollback] = { status: st, body: { ok: false, error: r.error, message: msg, currentVersion: r.currentVersion } }; throw e;
+      }
+      return r;
+    }).immediate();
+  } catch (e) {
+    if (e[rollback]) return res.status(e[rollback].status).json(e[rollback].body);
+    throw e;
+  }
+
+  // 履歴は旧値→新値をJSONで残す (項目名だけだと復元できない — Codex PR4 #6)
+  const oldVals = {}; const newVals = {};
+  for (const f of [...fills, ...overwrites]) { oldVals[f] = row ? row[f] : null; newVals[f] = result.row[f]; }
   safeLog({
     action: 'master_edit', pageId: String(req.body?.page_id || '') || null,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
-    from: code, to: [...fills.map(f => `+${f}`), ...overwrites.map(f => `!${f}`)].join(','),
-    ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}`,
+    from: JSON.stringify({ code, ...oldVals }).slice(0, 500),
+    to: JSON.stringify({ v: result.row.version, ...newVals }).slice(0, 500),
+    ok: true,
   });
-  if (!r.ok) {
-    const st = r.error === 'conflict' ? 409 : r.error === 'not_found' ? 404 : 400;
-    const msg = r.error === 'conflict' ? '他の人が先に更新しました。最新の内容を読み込みます' : r.message;
-    return res.status(st).json({ ok: false, error: r.error, message: msg, currentVersion: r.currentVersion });
-  }
   clearEnrichCache();   // 次の /api/state から新しい作業仕様で出す
-  res.json({ ok: true, row: r.row });
+  res.json({ ok: true, row: result.row });
 }));
 
 // ─── 完成写真・動画 ───

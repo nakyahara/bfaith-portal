@@ -671,6 +671,21 @@ console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動�
   ok(a.master.video_url === 'https://youtu.be/abc' && a.master.version === row.version + 1,
     '画面データに video_url と version (楽観ロック用) が載る');
 
+  // #1 マスタ行が一部だけでも、カード値へ項目単位でフォールバック (表示が消えない)
+  db3.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 仕入先コード, updated_at)
+    VALUES (2, 'PROD-NEW', '新商品', '単品', '取扱中', '確定', '0002', '2026-09-02T00:00:00Z')`).run();
+  ok(addWorkMasterRow('PROD-NEW', 'test').ok === true, '新商品の行を作成');
+  const newRow = db3.prepare("SELECT * FROM f_iroha_work_master WHERE code_key = 'prod-new'").get();
+  ok(updateWorkMasterRow('prod-new', { video_url: 'https://youtu.be/new' }, 'test', newRow.version).ok === true, '動画だけ登録');
+  clearEnrichCache();
+  const cards2 = buildList().cards;
+  const nw = cards2.find(c => c.product_code === 'PROD-NEW');
+  ok(nw.master.source === 'master' && nw.master.video_url === 'https://youtu.be/new', 'マスタ行が使われる');
+  ok(nw.master.material_code === 'D-8' && nw.master.units_per_container === 180,
+    '動画だけの行でも資材・入数はカード値で表示され続ける (項目単位フォールバック)');
+  ok(nw.master.missing.includes('工程') && !nw.master.missing.includes('資材'),
+    '未登録バッジもフォールバック込みで判定');
+
   // ④開始時スナップショット
   const wS = addIrohaWorker({ displayName: 'すなぷ', workerType: 'member', actor: 'test' });
   const sS = startSession({ pageId: 'snap-p1', productCode: 'PROD-A', title: '商品A', worker: getIrohaWorker(wS.id) });
