@@ -110,6 +110,12 @@ function assertExpectedForAll(items, expected) {
 const MAX_AUPAY_PRICE = 999999999;
 /** 書き込み経路の待ち時間。長く待つほど商品のロックを握り続けることになる */
 const AUPAY_WRITE_TIMEOUT_MS = 20000;
+/**
+ * au PAY が受け付ける Content-Type。
+ * ★GET にも要る (2026-09-02 実測)。無いと CME8039「サポートされていないContentTypeです」。
+ *   素通し中継 (/wmshopapi/) が最初から付けていたのはこのため
+ */
+const AUPAY_CONTENT_TYPE = 'application/x-www-form-urlencoded';
 function isSaneAupayPrice(v) {
   const s = String(v ?? '').trim();
   if (!/^\d+$/.test(s)) return false;
@@ -217,12 +223,25 @@ function buildAupayUpdateBody(item, shopId, format = 'form') {
 async function readAupayItemForCheck(itemCode) {
   const qs = new URLSearchParams({ shopId: AUPAY_SHOP_ID, itemCode: String(itemCode) }).toString();
   const r = await fetch(`${AUPAY_BASE}/wmshopapi/searchItemInfo?${qs}`, {
-    headers: { Authorization: `Bearer ${AUPAY_API_KEY}` },
+    headers: {
+      Authorization: `Bearer ${AUPAY_API_KEY}`,
+      // ★au PAY は **GET にも Content-Type を要求する** (2026-09-02 実測)。
+      //   付けないと HTTP 200 + <status>1</status> + CME8039
+      //   「サポートされていないContentTypeです」が返る。
+      //   素通し中継 (/wmshopapi/) が動いていたのはこれを付けていたから
+      'Content-Type': AUPAY_CONTENT_TYPE,
+    },
     signal: AbortSignal.timeout(AUPAY_WRITE_TIMEOUT_MS),
   });
   const body = await r.text();
   if (!aupayXmlOk({ status: r.status, body })) {
-    return { error: `いまの価格を読めません (HTTP ${r.status})` };
+    // ★理由を残す。HTTP だけだと「200 なのに読めない」で原因が追えない
+    const code = (String(body).match(/<code>([^<]*)<\/code>/) || [])[1];
+    const msg = (String(body).match(/<message>([^<]*)<\/message>/) || [])[1];
+    return {
+      error: `いまの価格を読めません (HTTP ${r.status}`
+        + `${code ? ` / ${code}` : ''}${msg ? `: ${msg}` : ''})`,
+    };
   }
   const infoM = body.match(/<itemInfo>([\s\S]*?)<\/itemInfo>/);
   if (!infoM) return { error: 'この商品コードの商品が見つかりません' };
