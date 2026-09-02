@@ -979,6 +979,10 @@ export function setPendingExpiry({ batchId, lineKey, expiryDate }) {
   const db = getDB();
   const active = getActiveBatch();
   if (!active || active.id !== Number(batchId)) return { ok: false, error: 'stale_batch', message: '一覧が更新されました' };
+  // 前日の一覧に今日の期限を入れさせない (数量APIと同じ day_stale ガード — Codex #1116 R1 Med-4)
+  if (active.work_date && active.work_date !== workDateJst()) {
+    return { ok: false, error: 'stale_work_date', message: '本日の入荷一覧を待っています (前日の一覧には記録できません)' };
+  }
   const r = db.prepare(`UPDATE f_inbound_check_line_state SET pending_expiry = ?
     WHERE batch_id = ? AND line_key = ? AND status = 'unchecked'`).run(expiryDate || null, active.id, lineKey);
   if (r.changes === 0) {
@@ -1376,8 +1380,13 @@ export function reopenLine({ batchId, lineKey, expectVersion, expectQuantityVers
       throw new Abort({ ok: false, error: 'conflict', message: '他の端末で先に更新されました', current: quantityState(db, active.id, lineKey) });
     }
     const now = utcNow();
+    // ⭐やり直すとき、確定に使った有効期限を「先入力」に戻す (Codex #1116 Med-3 の選択肢b)。
+    //   一覧タグに 📅入力済 として**見える**ので黙って再利用にはならない。期限を直したい
+    //   やり直しは、詳細パネルで選び直せばそのまま上書きされる。
+    //   SET の右辺は更新前の行の値を見る (SQLite仕様) ので destination_id=NULL と同時でも参照できる
     const upd = db.prepare(`UPDATE f_inbound_check_line_state
       SET status = 'unchecked', version = version + 1, finalized_result = NULL, destination_id = NULL,
+          pending_expiry = COALESCE((SELECT expiry_date FROM f_inbound_check_destinations WHERE id = f_inbound_check_line_state.destination_id), pending_expiry),
           checked_by = NULL, checked_device = NULL, checked_at = NULL
       WHERE batch_id = ? AND line_key = ? AND status = 'checked' AND version = ?`)
       .run(active.id, line.line_key, expectVersion);

@@ -17,7 +17,7 @@ const ok = (c, l) => { if (c) { pass++; console.log(`  ✓ ${l}`); } else { fail
 
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 initMirrorDB();
-const { getDB, setPendingExpiry, pendingExpiryFor, getState } = await import('../apps/inbound-check/db.js');
+const { getDB, setPendingExpiry, pendingExpiryFor, getState, reopenLine, workDateJst } = await import('../apps/inbound-check/db.js');
 
 const db = getDB();
 db.prepare(`INSERT INTO f_inbound_check_batches (id, source, file_name, file_hash, csv_generated_at, row_count, slip_count, imported_at, status)
@@ -59,6 +59,29 @@ console.log('[3] getState に pending_expiry が載る');
   const s = getState();
   const l1 = s.lines.find(l => l.line_key === 'L1');
   ok(l1 && l1.pending_expiry === '2026-12', '一覧の行に pending_expiry が出る (タグ表示・確認スキップ判定に使う)');
+}
+
+console.log('[4] やり直すと確定に使った期限が先入力に戻る (Codex #1116 Med-3)');
+{
+  const di = db.prepare(`INSERT INTO f_inbound_check_destinations
+    (batch_id, line_key, ar_no, product_id, product_name, planned_qty, destination, decided_from, worker, decided_at, expiry_date, work_date, code_key, actual_qty)
+    VALUES (1, 'L2', 'AR001', 'PROD-B', '商品B', 10, 'iroha', 'master', 'テスト', ?, '2026-11', ?, 'prod-b', 10)`)
+    .run(new Date().toISOString(), workDateJst());
+  db.prepare('UPDATE f_inbound_check_line_state SET destination_id = ? WHERE batch_id = 1 AND line_key = ?')
+    .run(Number(di.lastInsertRowid), 'L2');
+  const r = reopenLine({ batchId: 1, lineKey: 'L2', expectVersion: 1, worker: 'テスト' });
+  ok(r.ok === true, 'やり直しできる');
+  ok(pendingExpiryFor(1, 'L2') === '2026-11', '確定時の期限が pending に戻る (タグ📅入力済として見える)');
+}
+
+console.log('[5] 前日の一覧には先入力できない (day_stale ガード — Codex #1116 Med-4)');
+{
+  db.prepare("UPDATE f_inbound_check_batches SET work_date = '2000-01-01' WHERE id = 1").run();
+  const r = setPendingExpiry({ batchId: 1, lineKey: 'L1', expiryDate: '2026-12' });
+  ok(r.ok === false && r.error === 'stale_work_date', '前日バッチは stale_work_date');
+  db.prepare('UPDATE f_inbound_check_batches SET work_date = ? WHERE id = 1').run(workDateJst());
+  const r2 = setPendingExpiry({ batchId: 1, lineKey: 'L1', expiryDate: '2026-12' });
+  ok(r2.ok === true, '当日の一覧なら書ける');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
