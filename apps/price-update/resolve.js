@@ -273,7 +273,8 @@ export function listingUrl(mall, listingCode, extra = {}) {
     case 'amazon': return extra.asin ? `https://www.amazon.co.jp/dp/${encodeURIComponent(extra.asin)}` : null;
     // auPAY / Qoo10 は商品ページを組み立てず管理画面へ送る (出品コードから公開URLを機械的に作れない)
     case 'aupay': return 'https://manager.wowma.jp/';
-    case 'qoo10': return 'https://qsm.qoo10.jp/';
+    // Qoo10 は商品番号があれば客が見る商品ページへ (無ければ QSM)
+    case 'qoo10': return `https://www.qoo10.jp/g/${encodeURIComponent(c)}`;
     default: return null;
   }
 }

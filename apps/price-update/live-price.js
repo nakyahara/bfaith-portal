@@ -8,7 +8,7 @@
  *   Yahoo : VPS /yahoo/get-item-detail → Price (+ SubCodes[].Price)
  *   Amazon: mirror_amazon_price_snapshot_daily (日次・表示のみ。更新しないのでライブ取得は不要)
  *   auPAY : VPS /wmshopapi/searchItemInfo → itemPrice (2026-09-02〜)
- *   Qoo10 : 価格を出さない (書き込み経路がまだ無い)
+ *   Qoo10 : miniPC /service-api/qoo10/items/:itemNo → sellPrice (2026-09-02〜)
  *
  * 🚨M0実測: 楽天 GET の standardPrice は**文字列**で返る ("1000")。
  *    ここで整数化しておかないと、M2 の楽観ロック照合が全件 conflict になる。
@@ -20,6 +20,7 @@
 import { fetchItemDetailsBulkDetailed, fetchAllItemCodes } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
 import { fetchYahooItemDetail } from '../rakuten-yahoo-sync/lib/yahoo-detail-proxy.js';
 import { fetchAupayItemDetail } from './aupay-apply.js';
+import { fetchQoo10ItemDetail } from './qoo10-apply.js';
 import { normCode } from './resolve.js';
 
 /** itemNumber → manageNumber の対応表はそう変わらないので短時間だけ使い回す */
@@ -460,6 +461,71 @@ export async function fetchAupayPrices(targets, deps = {}) {
       price: null, skuCode: null, itemCode: null, found: false,
       reason: reasons.length ? reasons.join(" / ") : "au PAY から取得できません",
       itemName: null, choiceCount: 0,
+    });
+  }
+  return out;
+}
+
+/**
+ * Qoo10: miniPC 経由で商品ごとの設定価格を取る。
+ *
+ * ★Qoo10 も「商品」に1つの価格 (SellPrice)。オプションは差額で別系。
+ *   送り先のキーは Qoo10 商品番号 (ItemNo)。
+ * ★販売中 (S2) 以外の商品は確定させない — 停止中の商品に値付けしても客に見えず、
+ *   「変えたつもり」だけが残る。
+ *
+ * @param {Array<{key:string, itemNo:string}>} targets key = 行キー / itemNo = Qoo10商品番号
+ * @param {object} [deps] テスト用の差し替え ({ fetchQoo10ItemDetail })
+ */
+export async function fetchQoo10Prices(targets, deps = {}) {
+  const out = new Map();
+  const list = (targets || [])
+    .map((t) => ({ key: String(t.key || ''), itemNo: String(t.itemNo || '').trim() }))
+    .filter((t) => t.key && t.itemNo);
+  if (list.length === 0) return out;
+  const fetchOne = deps.fetchQoo10ItemDetail || fetchQoo10ItemDetail;
+  const gapMs = Number.isInteger(deps.gapMs) ? deps.gapMs : 700;
+  const cache = new Map();
+
+  for (const t of list) {
+    if (!cache.has(t.itemNo)) {
+      try { cache.set(t.itemNo, await fetchOne(t.itemNo)); }
+      catch (e) { cache.set(t.itemNo, { ok: false, message: e.message }); }
+      if (gapMs > 0) await new Promise((r) => setTimeout(r, gapMs));
+    }
+    const got = cache.get(t.itemNo);
+    const d = got?.item;
+    if (!got?.ok || !d) {
+      out.set(t.key, { price: null, skuCode: null, itemCode: t.itemNo, found: false,
+        reason: got?.message || 'Qoo10 から取得できません', itemName: null });
+      continue;
+    }
+    // ★取り違え防止: 応答の商品番号が問い合わせた番号と一致すること
+    if (String(d.itemNo) !== t.itemNo) {
+      out.set(t.key, { price: null, skuCode: null, itemCode: t.itemNo, found: false,
+        reason: `別の商品が返りました (応答 ${d.itemNo ?? "なし"})`, itemName: null });
+      continue;
+    }
+    let price = null;
+    let reason = null;
+    if (d.itemStatus !== 'S2') {
+      reason = `販売中の商品ではありません (状態 ${d.itemStatus ?? "不明"})。値付けしても客に見えないため対象外です`;
+    } else if (!Number.isInteger(d.sellPrice) || d.sellPrice < 1) {
+      // ★miniPC 側の整形を信頼しきらない。古い版から "2574.0000" のような文字列が
+      //   来ても、ここで止まる (Codex M5 R1 Low)
+      reason = '設定価格を整数円として読めません';
+    } else {
+      price = d.sellPrice;
+    }
+    out.set(t.key, {
+      price,
+      // ★送り先は商品番号 (Qoo10 は商品に1つの価格)
+      skuCode: d.itemNo,
+      itemCode: d.itemNo,
+      sellerCode: d.sellerCode ?? null,
+      found: price != null,
+      reason,
+      itemName: d.itemTitle || null,
     });
   }
   return out;

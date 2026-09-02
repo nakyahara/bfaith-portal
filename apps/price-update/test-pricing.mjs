@@ -73,7 +73,9 @@ console.log('\n── 更新対象外のモール ──');
   //   ここが「手動」に戻っていたら、画面で選べても送信の手前で必ず弾かれる
   ok(!evaluateRow({ ...base, mall: 'aupay' }).blocks.some((b) => /手動更新/.test(b)),
     'au PAY は更新できる (手動扱いに戻っていない)');
-  has(evaluateRow({ ...base, mall: 'qoo10' }).blocks, '手動更新', 'Qoo10 はまだ手動');
+  // ★Qoo10 も 2026-09-02 から更新できる (ItemsOrder.SetGoodsPriceQty)
+  ok(!evaluateRow({ ...base, mall: 'qoo10' }).blocks.some((b) => /手動更新/.test(b)),
+    'Qoo10 は更新できる (手動扱いに戻っていない)');
 }
 
 console.log('\n── 引き当て・現在価格が確定していない行 ──');

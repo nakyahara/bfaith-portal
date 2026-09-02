@@ -57,6 +57,7 @@ router.get('/rate-limit-status', (req, res) => {
 import fbaServiceRouter from './fba-service.js';
 import researchServiceRouter from './research-service.js';
 import rakutenRmsServiceRouter from './rakuten-rms-service.js';
+import qoo10PriceServiceRouter from './qoo10-price-service.js';
 import rankcheckServiceRouter from './rankcheck-service.js';
 import crossSellServiceRouter from './cross-sell-service.js';
 import selectSetServiceRouter from './select-set-service.js';
@@ -65,6 +66,7 @@ import neProductsServiceRouter from './ne-products-service.js';
 router.use('/fba', fbaServiceRouter);
 router.use('/research', researchServiceRouter);
 router.use('/rakuten-rms', rakutenRmsServiceRouter);
+router.use('/qoo10', qoo10PriceServiceRouter);
 router.use('/rankcheck', rankcheckServiceRouter);
 router.use('/cross-sell', crossSellServiceRouter);
 router.use('/select-set', selectSetServiceRouter);
