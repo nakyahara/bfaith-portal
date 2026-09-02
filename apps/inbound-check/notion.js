@@ -159,14 +159,28 @@ export function _clearSchemaCache() { schemaCache = null; }
 
 // ─── ページ操作 ───
 
-/** 台帳キーでカードを検索 (回収用)。複数返る = 二重カードの検出も兼ねる (最大3件) */
+/**
+ * 台帳キーでカードを検索 (回収用)。複数返る = 二重カードの検出も兼ねる。
+ * ⚠has_more/next_cursor で**全件**取り切る (件数固定だと4枚目以降の二重カードが
+ *   取消されず有効なまま残る — Codex R4 High)。通常は 0〜1 件で1ページで終わる。
+ *   10ページ (200件) で打ち切るのは暴走ガード — そこまで増える事故は別問題として表面化させる
+ */
 export async function findCardsByDedupeKey(dedupeKey) {
   const { dbId } = getConfig();
-  const r = await notionRequest(`/databases/${dbId}/query`, 'POST', {
-    filter: { property: DEDUPE_PROP, rich_text: { equals: String(dedupeKey) } },
-    page_size: 3,
-  });
-  return r.results || [];
+  const results = [];
+  let cursor = null;
+  for (let page = 0; page < 10; page++) {
+    const body = {
+      filter: { property: DEDUPE_PROP, rich_text: { equals: String(dedupeKey) } },
+      page_size: 20,
+    };
+    if (cursor) body.start_cursor = cursor;
+    const r = await notionRequest(`/databases/${dbId}/query`, 'POST', body);
+    results.push(...(r.results || []));
+    if (!r.has_more || !r.next_cursor) break;
+    cursor = r.next_cursor;
+  }
+  return results;
 }
 
 /**

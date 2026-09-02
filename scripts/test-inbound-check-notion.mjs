@@ -72,7 +72,11 @@ global.fetch = async (url, opts = {}) => {
     const value = f.rich_text?.equals ?? f.number?.equals;
     const hit = mock.queryResults.get(`${f.property}:${value}`);
     const hits = hit ? (Array.isArray(hit) ? hit : [hit]) : [];
-    return respond(200, { object: 'list', results: hits });
+    // わざと2件ずつ返してページネーションを踏ませる (has_more を辿らない実装だと4枚目以降を見落とす)
+    const start = Number(body.start_cursor || 0);
+    const pageItems = hits.slice(start, start + 2);
+    const hasMore = start + 2 < hits.length;
+    return respond(200, { object: 'list', results: pageItems, has_more: hasMore, next_cursor: hasMore ? String(start + 2) : null });
   }
   if (u.endsWith('/pages') && method === 'POST') {
     if (mock.onCreate) { const h = mock.onCreate; mock.onCreate = null; h(); }
@@ -422,6 +426,19 @@ console.log('\n[18] [R3 High] 孤立回収: 余分カードの取消に失敗し
   row = destRow(dD);
   ok(r2.ok && !!row.notion_cancelled_at, '次の sweep で続きからやり直して終端');
   ok(mock.pageStates.get('pgC').status === '取消' && mock.pageStates.get('pgD').status === '取消', '2枚とも「取消」になる');
+}
+
+console.log('\n[18b] [R4 High] 二重カードが4枚以上でもページネーションで全部「取消」に倒す');
+{
+  const dF = seedDest({ name: '商品A四重孤立' });
+  db.prepare("UPDATE f_inbound_check_destinations SET notion_dedupe_key = 'd999-four' WHERE id = ?").run(dF);
+  for (const p of ['pgE', 'pgF', 'pgG', 'pgH']) mock.pageStates.set(p, { archived: false, status: '未着手' });
+  mock.queryResults.set('台帳キー:d999-four', [{ id: 'pgE' }, { id: 'pgF' }, { id: 'pgG' }, { id: 'pgH' }]);
+  cancelDest(dF, 'reopen');
+  const r = await runNotionSweep({ actor: 'test' });
+  ok(r.ok && r.cancelled >= 1 && !!destRow(dF).notion_cancelled_at, '4枚見つけて終端');
+  ok(['pgE', 'pgF', 'pgG', 'pgH'].every(p => mock.pageStates.get(p).status === '取消'),
+    '4枚全部が「取消」になる (page_size 固定だと3枚で止まる)');
 }
 
 console.log('\n[19] 取消対象のカードが削除済み (404) なら「カード消失」で収束');
