@@ -340,6 +340,10 @@ function migrateQuantity(db) {
   // 実際に見つけた数。いろはへ送る数は予定数ではなくこちらが正しい
   addCol(db, 'f_inbound_check_destinations', 'actual_qty', 'INTEGER');
   addCol(db, 'f_inbound_check_destinations', 'cancel_reason', 'TEXT');
+  // 確認前に詳細パネルから先に入れておける有効期限 (中原さん 2026-09-02:
+  // 「詳細の期限管理のところで期限を入れられるように。入れてあれば確認時に聞かなくていい」)。
+  // 期限は入荷ごとに変わるので line_state (バッチ限り) に持つ — 翌日には自然に消える
+  addCol(db, 'f_inbound_check_line_state', 'pending_expiry', 'TEXT');
   // Notion 作業カード (いろは行き) の outbox 状態 (notion-sync.js が使う)。
   // 作成の成功 (synced_at) と取消反映の成功 (cancelled_at) は別の列に持つ — synced_at を
   // 取消時に上書きすると「いつカードを作ったか」が消える (Codex設計相談R1 2026-09-02)
@@ -857,7 +861,7 @@ export function getState() {
   if (!batch) return { batch: null, slips: [], lines: [], totals: { lines: 0, checked: 0, partial: 0, undecided: 0, toIroha: 0, toIrohaQty: 0 } };
   const slips = db.prepare('SELECT * FROM f_inbound_check_slips WHERE batch_id = ? ORDER BY seq').all(batch.id);
   const lines = db.prepare(`SELECT l.*, s.status AS check_status, s.version, s.checked_by, s.checked_device, s.checked_at,
-      s.found_qty, s.quantity_version, s.finalized_result, s.current_pack_qty, s.destination_id
+      s.found_qty, s.quantity_version, s.finalized_result, s.current_pack_qty, s.destination_id, s.pending_expiry
     FROM f_inbound_check_lines l JOIN f_inbound_check_line_state s ON s.batch_id = l.batch_id AND s.line_key = l.line_key
     WHERE l.batch_id = ? ORDER BY l.seq`).all(batch.id);
   const info = productInfoMap(lines.map(l => l.code_key));
@@ -876,6 +880,7 @@ export function getState() {
     l.image_url = images.get(String(l.product_id || '').trim().toLowerCase()) || null;
     const d = decided.get(l.line_key) || null;
     l.expiry_date = d ? d.expiry_date : null;   // 確認したときに入力した有効期限 (未確認なら null)
+    l.pending_expiry = l.pending_expiry || null; // 確認前に詳細パネルで先入力した有効期限
     l.destination = d ? d.destination : null;
     l.expiry_managed = !!x.expiry_managed;      // 期限管理商品か (在庫の有効期限から推定 or 手動設定)
     l.expiry_source = x.expiry_source || 'none';
@@ -965,6 +970,32 @@ export function infoForLine(codeKey) {
  * 「期限管理あり/なし」を人が設定する。在庫からの推定を上書きする。
  * ロジザード商品マスタを取り込めるようになったら source='logizard' で同じ表を埋める
  */
+/**
+ * 確認前の有効期限の先入力 (詳細パネルから)。expiryDate = 'YYYY-MM-DD' / 'YYYY-MM' / null(消す)。
+ * 形式検証は router (parseExpiry) が済ませてから渡す。確認済みの行は変更不可 (やり直してから)。
+ * 楽観ロックは持たない — 同じ行の期限を2台で同時に打つ状況は実務上なく、後勝ちで困らない
+ */
+export function setPendingExpiry({ batchId, lineKey, expiryDate }) {
+  const db = getDB();
+  const active = getActiveBatch();
+  if (!active || active.id !== Number(batchId)) return { ok: false, error: 'stale_batch', message: '一覧が更新されました' };
+  const r = db.prepare(`UPDATE f_inbound_check_line_state SET pending_expiry = ?
+    WHERE batch_id = ? AND line_key = ? AND status = 'unchecked'`).run(expiryDate || null, active.id, lineKey);
+  if (r.changes === 0) {
+    const cur = db.prepare('SELECT status FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = ?').get(active.id, lineKey);
+    if (!cur) return { ok: false, error: 'not_found', message: 'その明細が見つかりません' };
+    return { ok: false, error: 'finalized', message: '確認済みの行です。期限を直すには先に「やり直す」を押してください' };
+  }
+  return { ok: true, pending_expiry: expiryDate || null };
+}
+
+/** 確認時に使う: 先入力された有効期限 (無ければ null) */
+export function pendingExpiryFor(batchId, lineKey) {
+  const r = getDB().prepare('SELECT pending_expiry FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = ?')
+    .get(batchId, lineKey);
+  return r ? r.pending_expiry || null : null;
+}
+
 export function setExpiryManaged(codeKey, managed, actor) {
   const k = String(codeKey || '').trim().toLowerCase();
   if (!k) throw new Error('商品が指定されていません');

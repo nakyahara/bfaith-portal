@@ -20,7 +20,8 @@ import {
   getState, importCsv, getActiveBatch, listBatches, listImportLog, listEvents, eventsCsv,
   applyQuantityEvents, listQuantityEvents, finalizeLine, reopenLine,
   createDevice, verifyDevice, revokeDevice, listDevices,
-  resolveDestination, infoForLine, setExpiryManaged, listDestinations, destinationsCsv, IROHA_YES, IROHA_NO,
+  resolveDestination, infoForLine, setExpiryManaged, setPendingExpiry, pendingExpiryFor,
+  listDestinations, destinationsCsv, IROHA_YES, IROHA_NO,
   listCompletedSlips, completedSlipsCsv,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
@@ -280,19 +281,25 @@ function parseExpiry(v) {
 function decideDestination(req, line, worker, foundQty = null) {
   const { info, expiryManaged } = infoForLine(line.code_key);
   let dest = resolveDestination(info, { expiryManaged });
-  if (dest.missing.length === 0) return { ok: true, destination: dest.destination, decidedFrom: 'master' };
+  // ⭐詳細パネルで先に入れた有効期限 (pending) があれば、確認時にはもう聞かない
+  //   (中原さん 2026-09-02:「そこで入れてたら確認ボタンで出てこなくていい」)
+  const pendingExp = expiryManaged ? parseExpiry(pendingExpiryFor(line.batch_id, line.line_key)) : null;
+  const askMissing = pendingExp ? dest.missing.filter(m => m !== 'expiry') : dest.missing;
+  if (askMissing.length === 0) {
+    return { ok: true, destination: dest.destination, decidedFrom: 'master', expiryDate: pendingExp };
+  }
 
   const choice = req.body?.choice;
   if (!choice || typeof choice !== 'object') {
-    return { ok: false, status: 400, body: { ok: false, error: 'destination_required', missing: dest.missing, info, expiry_managed: expiryManaged,
+    return { ok: false, status: 400, body: { ok: false, error: 'destination_required', missing: askMissing, info, expiry_managed: expiryManaged,
       line: { product_id: line.product_id, product_name: line.product_name, planned_qty: line.planned_qty, found_qty: foundQty },
-      message: dest.missing.map(m => MISSING_LABEL[m] || m).join(' と ') + ' を決めてください' } };
+      message: askMissing.map(m => MISSING_LABEL[m] || m).join(' と ') + ' を決めてください' } };
   }
 
-  // 期限管理商品は入荷のたびに有効期限が変わるので、毎回入れてもらう (商品マスタに持てない)
+  // 期限管理商品は入荷のたびに有効期限が変わるので毎回入れてもらう (先入力があればそれを使う)
   let expiryDate = null;
   if (expiryManaged) {
-    expiryDate = parseExpiry(choice.expiry_date);
+    expiryDate = parseExpiry(choice.expiry_date) || pendingExp;
     if (!expiryDate) {
       return { ok: false, status: 400, body: { ok: false, error: 'destination_required', missing: ['expiry'], info, expiry_managed: true,
         message: '有効期限を選んでください (実在する日付で)' } };
@@ -529,6 +536,34 @@ router.post('/api/product-flags', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   res.json({ ok: true, ...setExpiryManaged(codeKey, req.body.expiry_managed, editorName(req, w.worker)) });
+}));
+
+// ─── 有効期限の先入力 (詳細パネルから。入れてあれば確認時にはもう聞かない) ───
+router.post('/api/lines/pending-expiry', checkOrigin, api((req, res) => {
+  const lineKey = String(req.body?.line_key || '').trim();
+  const batchId = Number(req.body?.batch_id);
+  if (!lineKey || !Number.isInteger(batchId)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: 'batch_id と line_key が必要です' });
+  }
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const raw = req.body?.expiry_date;
+  let expiryDate = null;
+  if (raw != null && String(raw).trim() !== '') {
+    expiryDate = parseExpiry(raw);
+    if (!expiryDate) return res.status(400).json({ ok: false, error: 'bad_request', message: '有効期限は実在する日付で入れてください' });
+  }
+  const r = setPendingExpiry({ batchId, lineKey, expiryDate });
+  res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 409)).json(r);
+}));
+
+// ─── Notion へ今すぐ送る (iPad からも押せる) ───
+// 中原さん 2026-09-02:「iPadにボタンがあれば便利」。sweep は冪等 (何回押しても二重カードにならない) で
+// lease が多重実行も防ぐので、端末Cookie利用者にも開放する
+router.post('/api/notion-sync', checkOrigin, api(async (req, res) => {
+  const actor = req.icDevice ? `device:${req.icDevice.label}` : (req.session?.email || 'ipad');
+  const r = await runNotionSweep({ actor, mode: 'full' });
+  res.status(r.ok ? 200 : (r.error === 'already_running' ? 409 : 502)).json(r);
 }));
 
 // ─── 行き先の台帳 (いろはへ送る商品の一覧) ───

@@ -121,6 +121,21 @@
     .detail .dmsg { font-size: 0.9em; }
     .detail .dmsg.err { color: #c92a2a; }
     .detail .dmsg.ok { color: #2b8a3e; }
+    /* ⭐ダブルタップでの画面拡大を止める (＋1箱を素早く2回押すとiOSがズームしてしまう — 2026-09-02 中原さん) */
+    html, body, button, input, select, textarea, .row { touch-action: manipulation; }
+    /* 入庫予定数は気持ち大きく (2026-09-02 中原さん) */
+    .sub b.pl { font-size: 1.4em; }
+    /* ロジザード登録のバーコード表示 */
+    .bcode { font-family: ui-monospace, Menlo, monospace; font-size: 1.15em; letter-spacing: 0.06em; background: #f1f3f5; padding: 5px 10px; border-radius: 6px; display: inline-block; }
+    /* 数量パネル: 入数違いの箱の追加行 */
+    .qx-row { margin-top: 6px; }
+    .unit button.qx-del { min-height: 40px; padding: 0 12px; border-radius: 8px; border: 1px solid #ced4da; background: #fff; color: #c92a2a; cursor: pointer; }
+    /* 詳細パネル内の有効期限 (年/月/日) */
+    .exp-ymd { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+    .exp-ymd select { min-height: 44px; font-size: 1em; padding: 4px 6px; }
+    .exp-ymd .pemsg { font-size: 0.88em; }
+    .exp-ymd .pemsg.ok { color: #2b8a3e; }
+    .exp-ymd .pemsg.err { color: #c92a2a; }
     .detail .unreg { background: #fff3bf; color: #7a5c00; padding: 12px 14px; border-radius: 8px; font-size: 0.92em; line-height: 1.6; }
 
     /* ── 数量 (部分確認) ── */
@@ -239,6 +254,7 @@
     </div>
     <div class="ctl">
       <button type="button" class="btn-reload" id="reloadBtn">🔄 更新</button>
+      <button type="button" class="btn-reload" id="notionBtn">🗂 Notionへ送る</button>
       <div class="seg">
         <button type="button" data-filter="todo" class="on">残りあり</button>
         <button type="button" data-filter="all">すべて</button>
@@ -364,7 +380,7 @@
     // ⭐ケース換算は「入数 × 箱数」を人が入れる形にしたので、ここでは実数だけを大きく出す
     function qtySub(l) {
       const pack = l.pack_qty ? ' ・ 1箱 ' + l.pack_qty + '個' : ' ・ <span style="color:#e8590c">入数 未登録</span>';
-      const head = '<div class="sub">' + esc(l.product_id) + ' ・ 予定 <b>' + l.planned_qty + '</b> 個' + pack + '</div>';
+      const head = '<div class="sub">' + esc(l.product_id) + ' ・ 予定 <b class="pl">' + l.planned_qty + '</b> 個' + pack + '</div>';
       if (l.check_status !== 'checked' && !l.found_qty) return head;
       const rel = l.quantity_relation || 'exact';
       const cls = rel === 'exact' ? '' : (rel === 'shortage' ? ' short' : ' over');
@@ -411,6 +427,7 @@
       // 期限を入れたら**その日付**を出す。入れる前は「期限管理」の予告だけ
       // (中原さん 2026-09-02:「期限を入力したら一覧に期限を表示してほしい」)
       if (l.expiry_date) t.push('<span class="tag exp-set">📅 ' + esc(fmtExpiry(l.expiry_date)) + '</span>');
+      else if (l.pending_expiry) t.push('<span class="tag exp-set">📅 ' + esc(fmtExpiry(l.pending_expiry)) + ' 入力済</span>');
       else if (l.expiry_managed) t.push('<span class="tag exp">📅 期限管理</span>');
       if (l.loc_source === 'pick') t.push('<span class="tag loc">📍 ' + esc(l.pick_locs.map(x => x.loc).join(' / ')) + '</span>');
       else if (l.loc_source === 'storage') t.push('<span class="tag loc-store">保管 ' + esc(l.other_locs[0].loc) + '</span>');
@@ -588,19 +605,31 @@
     //   1つのアコーディオンに両方入れると、数を入れたいだけなのに設定項目まで出てきて長くなる
     function qdraft(l) {
       let d = qdrafts.get(l.line_key);
-      if (!d) { d = { pack: '', boxes: '', loose: '' }; qdrafts.set(l.line_key, d); }
+      if (!d) { d = { pack: '', boxes: '', loose: '', extra: [] }; qdrafts.set(l.line_key, d); }
+      if (!d.extra) d.extra = [];
       // 入数は**自動で入れる** (この検品で使っている値 → 無ければ入庫情報のマスタ値)
       if (d.pack === '' && l.pack_qty) d.pack = String(l.pack_qty);
       return d;
     }
 
-    /** 打ちかけの入力から「今回足す数」を出す。箱とバラの両方を1回でまとめて足せる */
+    const rowQty = (r) => {
+      const pack = Number(r.pack), boxes = Number(r.boxes);
+      return (Number.isInteger(pack) && pack > 0 && Number.isInteger(boxes) && boxes > 0) ? pack * boxes : 0;
+    };
+
+    /** 打ちかけの入力から「今回足す数」を出す。⭐入数違いの箱は「行を追加」で複数行を1回でまとめて足せる
+     *  (2026-09-02 中原さん:「入数じゃない個数が複数あったりするから、箱数の列を追加する機能」) */
     function qcalc(l) {
       const d = qdraft(l);
-      const pack = Number(d.pack), boxes = Number(d.boxes), loose = Number(d.loose);
-      const boxQty = (Number.isInteger(pack) && pack > 0 && Number.isInteger(boxes) && boxes > 0) ? pack * boxes : 0;
+      const units = [];
+      for (const r of [{ pack: d.pack, boxes: d.boxes }, ...d.extra]) {
+        const q = rowQty(r);
+        if (q > 0) units.push({ pack: Number(r.pack), boxes: Number(r.boxes), qty: q });
+      }
+      const boxQty = units.reduce((a, u) => a + u.qty, 0);
+      const loose = Number(d.loose);
       const looseQty = (Number.isInteger(loose) && loose > 0) ? loose : 0;
-      return { pack, boxes, loose, boxQty, looseQty, total: boxQty + looseQty };
+      return { pack: Number(d.pack), boxes: Number(d.boxes), loose, units, boxQty, looseQty, total: boxQty + looseQty };
     }
 
     /** 「今回 +N個 → 保存後 M / 予定」。打つたびに書き換える (再描画するとフォーカスが飛ぶため) */
@@ -641,7 +670,18 @@
         + '<div class="stepper"><button type="button" data-q="dec">−</button>'
         + '<input type="number" inputmode="numeric" min="0" step="1" data-q="boxes" value="' + esc(d.boxes) + '" placeholder="0">'
         + '<button type="button" data-q="inc">＋</button></div>'
-        + '<span class="qeq">= <b data-qbox>' + qcalc(l).boxQty + '</b> 個</span></div>');
+        + '<span class="qeq">= <b data-qbox>' + rowQty(d) + '</b> 個</span></div>');
+      // ⭐入数違いの箱が混ざるとき用の追加行 (例: 24個入り×3箱 と 30個入り×2箱)
+      for (let i = 0; i < d.extra.length; i++) {
+        const x = d.extra[i];
+        p.push('<div class="unit"><label>入数</label>'
+          + '<input type="number" inputmode="numeric" min="1" step="1" data-qx="pack" data-qi="' + i + '" value="' + esc(x.pack) + '" placeholder="例 24">'
+          + '<span>個入り ×</span><label>箱数</label>'
+          + '<input type="number" inputmode="numeric" min="0" step="1" data-qx="boxes" data-qi="' + i + '" value="' + esc(x.boxes) + '" placeholder="0">'
+          + '<span class="qeq">= <b data-qboxi="' + i + '">' + rowQty(x) + '</b> 個</span>'
+          + '<button type="button" class="qx-del" data-act="qrowdel" data-qi="' + i + '">✕</button></div>');
+      }
+      p.push('<div class="qx-row"><button type="button" class="btn-plus" data-act="qrowadd">＋ 行を追加 (入数違いの箱があるとき)</button></div>');
       p.push('<div class="unit"><label>バラ</label>'
         + '<input type="number" inputmode="numeric" min="0" step="1" data-q="loose" value="' + esc(d.loose) + '" placeholder="0">'
         + '<span>個</span></div>');
@@ -679,9 +719,13 @@
 
     /** 打つたびに「= N個」と「今回 +N個 → 保存後 …」だけを書き換える (再描画しない = フォーカスが飛ばない) */
     function refreshQsum(row, l) {
-      const c = qcalc(l), sum = qsumText(l);
+      const d = qdraft(l), sum = qsumText(l);
       const box = row.querySelector('[data-qbox]');
-      if (box) box.textContent = String(c.boxQty);
+      if (box) box.textContent = String(rowQty(d));
+      for (let i = 0; i < d.extra.length; i++) {
+        const el = row.querySelector('[data-qboxi="' + i + '"]');
+        if (el) el.textContent = String(rowQty(d.extra[i]));
+      }
       const s = row.querySelector('[data-qsum]');
       if (s) s.innerHTML = sum.html;
       const btn = row.querySelector('[data-qadd]');
@@ -698,10 +742,73 @@
         : l.expiry_source === 'logizard' ? 'ロジザードの商品マスタ'
         : l.expiry_source === 'stock' ? '在庫データに有効期限があるため推定'
         : '在庫データに有効期限が無いため推定';
-      return '<div class="fld"><label>期限管理</label><div class="chips">'
+      const parts = ['<div class="fld"><label>期限管理</label><div class="chips">'
         + '<button type="button" data-act="expiry" data-v="1" class="' + (l.expiry_managed ? 'on' : '') + '">📅 あり</button>'
         + '<button type="button" data-act="expiry" data-v="0" class="' + (l.expiry_managed ? '' : 'on') + '">なし</button>'
-        + '</div><div class="note">' + esc(src) + '。「あり」の商品は、確認するときに有効期限を選んでもらいます</div></div>';
+        + '</div>'];
+      if (l.expiry_managed && l.check_status === 'checked') {
+        parts.push('<div class="note">この入荷の有効期限: <b>' + esc(fmtExpiry(l.expiry_date) || '未入力') + '</b> (確認済み。直すには「やり直す」を押してから)</div>');
+      } else if (l.expiry_managed) {
+        // ⭐ここで先に入れておけば、確認ボタンのときにはもう聞かれない (中原さん 2026-09-02:
+        //   「期限管理ありを押したらそこで期限を入れられるように。入れてたら確認で出てこなくていい」)
+        const cur = parseYmd(l.pending_expiry);
+        const now = new Date();
+        const y0 = Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo', year: 'numeric' }).format(now));
+        const years = []; for (let y = y0 - 1; y <= y0 + 7; y++) years.push(y);
+        const days = []; for (let d = 1; d <= daysInMonth(cur.y, cur.m); d++) days.push(d);
+        parts.push('<div class="exp-ymd">'
+          + selPe('y', years, cur.y, '年') + '<span>年</span>'
+          + selPe('m', [1,2,3,4,5,6,7,8,9,10,11,12], cur.m, '月') + '<span>月</span>'
+          + selPe('d', days, cur.d, '—') + '<span>日</span>'
+          + '<span class="pemsg" data-pemsg>' + (l.pending_expiry ? '✅ 入力済み (確認時には聞きません)' : '') + '</span></div>');
+        parts.push('<div class="note">' + esc(src) + '。商品に書かれている日付を選んでください (日が無い商品は「—」のまま)。年と月を選ぶと自動で保存されます</div>');
+      } else {
+        parts.push('<div class="note">' + esc(src) + '</div>');
+      }
+      parts.push('</div>');
+      return parts.join('');
+    }
+    function parseYmd(s) {
+      const m = /^(\d{4})-(\d{2})(?:-(\d{2}))?$/.exec(String(s || ''));
+      return m ? { y: Number(m[1]), m: Number(m[2]), d: m[3] ? Number(m[3]) : null } : { y: null, m: null, d: null };
+    }
+    function selPe(k, values, cur, blankLabel) {
+      return '<select data-pe="' + k + '">'
+        + '<option value="">' + esc(blankLabel) + '</option>'
+        + values.map(v => '<option value="' + v + '"' + (String(cur) === String(v) ? ' selected' : '') + '>' + v + '</option>').join('')
+        + '</select>';
+    }
+
+    /** 詳細パネルの年/月/日から有効期限を保存する (年+月が揃ったら自動保存。消すのも可) */
+    async function savePendingExpiry(row, line) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      const g = k => { const el = row.querySelector('[data-pe="' + k + '"]'); return el && el.value ? el.value : null; };
+      const y = g('y'), m = g('m'), d = g('d');
+      const msgEl = row.querySelector('[data-pemsg]');
+      const setMsg = (cls, t) => { if (msgEl) { msgEl.className = 'pemsg ' + (cls || ''); msgEl.textContent = t; } };
+      let expiry = null;
+      if (y && m) expiry = y + '-' + String(m).padStart(2, '0') + (d ? '-' + String(d).padStart(2, '0') : '');
+      else if (y || m || d) { setMsg('', '年と月を選ぶと保存されます'); return; }
+      setMsg('', '保存中…');
+      try {
+        const r = await fetch(API + '/lines/pending-expiry', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ batch_id: state.batch.id, line_key: line.line_key, expiry_date: expiry, worker_code: workerCode() || undefined }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (r.status === 401) { location.href = '/login'; return; }
+        if (!j.ok) {
+          setMsg('err', j.message || j.error || '保存できませんでした');
+          if (j.error === 'worker_required') openWorkerPick();
+          if (j.error === 'stale_batch') { lastJson = ''; load(); }
+          return;
+        }
+        line.pending_expiry = j.pending_expiry;
+        lastJson = '';
+        render(true);   // タグ (📅 入力済) と「日」の選択肢を更新する。パネルは開いたまま
+      } catch (e) {
+        setMsg('err', '送信できませんでした (' + e.message + ')');
+      }
     }
 
     // ⭐入力欄ではなく**プルダウン**で選ばせる。
@@ -730,8 +837,11 @@
     function detailInfoHtml(l) {
       const i = l.info;
       const img = '<div class="big">' + thumbHtml(l, true) + '</div>';
+      // ロジザードに登録されているバーコード (入荷受付CSV由来。2026-09-02 中原さん要望)
+      const bc = l.barcode ? '<div class="fld"><label>バーコード (ロジザード登録)</label><div class="bcode">' + esc(l.barcode) + '</div></div>' : '';
       if (!i) {
         return '<div class="dgrid">' + img + '<div class="fields">'
+          + bc
           + expiryHtml(l)
           + '<div class="unreg">この商品は入庫情報に登録されていません。<br>登録すると、入数やいろはの設定をここで入力できます。<br><small>(確認ボタンを押すと、その場で行き先を選んで登録もできます)</small></div>'
           + '<div class="dact" style="margin-top:12px"><button type="button" class="primary" data-act="register">入庫情報に登録する</button>'
@@ -741,6 +851,7 @@
       const locked = irohaLocked(i.iroha);
       const v = s => esc(s == null ? '' : s);
       return '<div class="dgrid">' + img + '<div class="fields">'
+        + bc
         + expiryHtml(l)
         + '<div class="fld"><label>入数 (1箱あたりの個数)</label>'
         + '<input type="number" inputmode="numeric" min="1" step="1" data-f="入数" value="' + (Number.isInteger(i.irisu) ? i.irisu : '') + '" placeholder="未登録">'
@@ -877,8 +988,10 @@
     /** 確定 (全部あり / 残りも全部あり / 確認 / 不足で確定 / 超過で確定) */
     async function doFinalize(line, opts, choice, ids) {
       if (!guardLine(line)) return;
-      // 行き先・ラベル・入数・有効期限が決まっていなければ先に聞く (サーバーも同じ判定をする)
-      if (!choice && line.dest && line.dest.missing.length > 0) { openGate(line, line.dest.missing, line.info, opts); return; }
+      // 行き先・ラベル・入数・有効期限が決まっていなければ先に聞く (サーバーも同じ判定をする)。
+      // ⭐有効期限は詳細パネルで先入力 (pending) してあれば聞かない
+      const needAsk = (line.dest ? line.dest.missing : []).filter(m => !(m === 'expiry' && line.pending_expiry));
+      if (!choice && needAsk.length > 0) { openGate(line, needAsk, line.info, opts); return; }
       const key = line.line_key;
       const id = ids || { op: newId(), fill: newId() };
       sending.set(key, { kind: 'sending' });
@@ -1015,8 +1128,8 @@
         }
         applyInfoRow(line.code_key, j.row);
         editDirty = false;
-        // 保存したら閉じる (中原さん 2026-09-02)。開いたままだと一覧に戻るのに毎回もう一度押すことになる
-        openMode.delete(line.line_key);
+        // ⭐保存しても**閉じない** (中原さん 2026-09-02 変更: 閉じると行がずれて確認ボタンの位置が
+        //   一瞬動く。保存後も全項目を開いたまま、保存された値で表示し続ける)
         lastJson = '';   // 新しい表記を選択肢に反映するため、次の取得で state を作り直す
         render(true);
         banner('ok', '「' + esc(line.product_name) + '」の入庫情報を保存しました');
@@ -1304,18 +1417,27 @@
         return;
       }
       if (act === 'addall') {
-        // 箱とバラを**1回でまとめて足す**。足す前に「今回 +N → 保存後 M」を見せているので、
-        // 押した結果と画面の数字が必ず一致する (2026-09-02 中原さん指摘: バラの合計が見えなかった)
+        // 箱とバラを**1回でまとめて足す**。入数違いの箱は行ごとに別イベントで記録される
+        // (数えた記録に「24個入り×3箱」「30個入り×2箱」と分かれて残り、訂正も行単位でできる)
         const c = qcalc(line);
-        if (Number(qdraft(line).boxes) > 0 && !(Number.isInteger(c.pack) && c.pack > 0)) return qmsg(row, '入数を1以上の整数で入れてください');
+        const d0 = qdraft(line);
+        for (const r0 of [{ pack: d0.pack, boxes: d0.boxes }, ...d0.extra]) {
+          if (Number(r0.boxes) > 0 && !(Number.isInteger(Number(r0.pack)) && Number(r0.pack) > 0)) {
+            return qmsg(row, '入数を1以上の整数で入れてください');
+          }
+        }
         if (c.total <= 0) return qmsg(row, '箱数かバラを入れてください');
-        const events = [];
-        if (c.boxQty > 0) events.push(boxEvent(c.boxQty, c.pack));
+        const events = c.units.map(u => boxEvent(u.qty, u.pack));
         if (c.looseQty > 0) events.push({ client_event_id: newId(), action: 'add', quantity: c.looseQty, input_kind: 'loose', client_occurred_at: nowIso() });
-        qdrafts.set(line.line_key, { pack: c.pack > 0 ? String(c.pack) : '', boxes: '', loose: '' });
-        sendQuantity(line, events, c.boxQty > 0 ? c.pack : null);
+        qdrafts.set(line.line_key, {
+          pack: c.units[0] ? String(c.units[0].pack) : (Number(d0.pack) > 0 ? String(d0.pack) : ''),
+          boxes: '', loose: '', extra: [],
+        });
+        sendQuantity(line, events, c.units[0] ? c.units[0].pack : null);
         return;
       }
+      if (act === 'qrowadd') { qdraft(line).extra.push({ pack: '', boxes: '' }); render(true); return; }
+      if (act === 'qrowdel') { qdraft(line).extra.splice(Number(a.getAttribute('data-qi')), 1); render(true); return; }
       if (act === 'qclear') {
         qdrafts.delete(line.line_key);
         render(true);
@@ -1411,6 +1533,9 @@
 
     // 数量パネルの入力は打ちかけを控える (ポーリングの再描画で消えないように)
     $('#list').addEventListener('change', (ev) => {
+      // 有効期限 (年/月/日) は選んだそばから自動保存する
+      const pe = ev.target.closest('[data-pe]');
+      if (pe) { const f2 = findLine(pe); if (f2) savePendingExpiry(f2.row, f2.line); return; }
       const f = ev.target.closest('[data-sel="1"]');
       if (!f) return;
       editDirty = true;
@@ -1431,6 +1556,17 @@
     }
 
     $('#list').addEventListener('input', (ev) => {
+      // 追加行 (入数違いの箱) の入力
+      const qx = ev.target.closest('[data-qx]');
+      if (qx) {
+        const f = findLine(qx);
+        if (!f) return;
+        const d = qdraft(f.line);
+        const i = Number(qx.getAttribute('data-qi'));
+        if (d.extra[i]) d.extra[i][qx.getAttribute('data-qx')] = qx.value;
+        refreshQsum(f.row, f.line);
+        return;
+      }
       const q = ev.target.closest('[data-q]');
       if (q) {
         const f = findLine(q);
@@ -1486,6 +1622,26 @@
     });
 
     $('#q').addEventListener('input', () => { query = $('#q').value.trim(); editDirty = false; render(); });
+
+    // 🗂 Notionへ送る (iPadからも押せる。冪等 = 何回押しても二重カードにならない — 2026-09-02 中原さん)
+    $('#notionBtn').addEventListener('click', async () => {
+      const b = $('#notionBtn');
+      b.disabled = true;
+      b.textContent = '送信中…';
+      try {
+        const r = await fetch(API + '/notion-sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        const j = await r.json().catch(() => ({}));
+        if (r.status === 401) { location.href = '/login'; return; }
+        if (j.ok) banner('ok', '🗂 Notionへ送りました: ' + esc(j.note || '完了'));
+        else banner('err', '🗂 送信できませんでした: ' + esc(j.note || j.message || j.error || ('HTTP ' + r.status)));
+        setTimeout(() => { if ($('#banner').classList.contains('ok')) banner(null); }, 6000);
+      } catch (e) {
+        banner('err', '🗂 通信できませんでした (' + esc(e.message) + ')');
+      } finally {
+        b.disabled = false;
+        b.textContent = '🗂 Notionへ送る';
+      }
+    });
 
     function startPolling() {
       if (pollTimer) clearInterval(pollTimer);
