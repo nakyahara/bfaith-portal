@@ -1502,7 +1502,9 @@
         btn.addEventListener('click', () => {
           if (STATE.twoLabelsOption && btn.dataset.m === STATE.twoLabelsOption) {
             // 二枚出しは理由を聞かずその場で事務へ通知するだけ (中原さん指示 2026-09-02)。
-            // ⑥恒久ルールの確認も出さない (配送方法は変わらないためルール化の対象外)
+            // ⑥恒久ルールの確認も出さない (配送方法は変わらないためルール化の対象外)。
+            // 理由ステップが無いぶん誤タップで即通知になるので confirm だけ挟む (Codexレビュー)
+            if (!confirm('ネコポス二枚出し (送り状2枚・2個口) を事務へ依頼します。よろしいですか?')) return;
             $('shipOverlay').style.display = 'none';
             enqueue('ship_change', viewSeq, { proposed_method: btn.dataset.m });
             showToast('事務へネコポス二枚出しを依頼しました。商品と納品書は変更待ちの棚へ置き、「次へ」で完了してください');
