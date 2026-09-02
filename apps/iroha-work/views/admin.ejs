@@ -138,6 +138,28 @@
     <% } %>
 
     <div class="iw-box">
+      <h2>⏱ 作業時間セッション (直近50件)</h2>
+      <p class="hint">開始/終了はサーバー時刻で記録します。<b>終了忘れは自動で確定しません</b> —
+        6時間を超えて「作業中」のものは ⚠ が付くので、確認のうえ「取り消し」してください (行は消えず、集計から外れるだけ)。</p>
+      <table class="iw-list">
+        <tr><th>開始</th><th>カード</th><th>作業者</th><th>時間</th><th>終了</th><% if (isAdmin) { %><th></th><% } %></tr>
+        <% for (const s of sessions) { %>
+          <tr class="<%= s.voided_at ? 'revoked' : '' %>">
+            <td style="white-space:nowrap"><%= new Date(s.started_at).toLocaleString('ja-JP') %></td>
+            <td><%= s.title_snapshot || s.page_id %></td>
+            <td><%= s.worker_name %></td>
+            <td class="<%= s.warn_long ? 'ng' : '' %>"><%= s.warn_long ? '⚠ ' : '' %><%= Math.floor(s.elapsed_seconds / 60) %>分<%= s.ended_at ? '' : ' (作業中)' %></td>
+            <td><%= s.voided_at ? '取り消し済み' : (s.end_reason === 'done' ? 'できあがり' : s.end_reason === 'pause' ? '中断' : s.end_reason === 'admin' ? '管理者' : '-') %></td>
+            <% if (isAdmin) { %>
+              <td><% if (!s.voided_at) { %><button class="btn-sm" onclick="voidSession(<%= s.id %>)">取り消し</button><% } %></td>
+            <% } %>
+          </tr>
+        <% } %>
+        <% if (sessions.length === 0) { %><tr><td colspan="6">まだ記録はありません</td></tr><% } %>
+      </table>
+    </div>
+
+    <div class="iw-box">
       <h2>📋 操作履歴 (直近50件)</h2>
       <p class="hint">iPad からのステータス変更などを、成功・失敗とも記録しています (だれが・どの端末で・何を)。</p>
       <table class="iw-list">
@@ -195,6 +217,13 @@
       document.getElementById('ecOut').style.display = 'block';
       document.getElementById('ecCode').textContent = json.code;
       document.getElementById('ecNote').textContent = '「' + json.label + '」用 ・ ' + json.ttlMinutes + '分間有効 ・ 1回だけ使えます';
+    }
+    async function voidSession(id) {
+      const reason = prompt('取り消しの理由 (例: 終了ボタンの押し忘れ)');
+      if (reason == null) return;
+      const { json } = await post('/admin/sessions/' + id + '/void', { reason });
+      if (json.ok) location.reload();
+      else alert(json.message || '取り消しできませんでした');
     }
     async function revokeDevice(id) {
       if (!confirm('この端末の登録を解除しますか? (その iPad は使えなくなります)')) return;

@@ -13,7 +13,7 @@
 import { buildEnrichContext } from '../inbound-check/notion-sync.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
-import { getDB, listCache } from './db.js';
+import { getDB, listCache, activeSessionsByPage, estimateByProduct } from './db.js';
 import { STATUSES } from './notion-read.js';
 
 // 「急ぎ」の線引き: 在庫切れ、または残り在庫日数がこれ以下
@@ -80,6 +80,8 @@ export function buildList() {
   const rows = listCache();
   const ctx = enrichContext();
   const images = productImageMap(rows.map(r => r.product_code));
+  const activeMap = activeSessionsByPage();
+  const estimates = estimateByProduct();
 
   const cards = rows.map((r) => {
     let props = {};
@@ -107,6 +109,9 @@ export function buildList() {
       master: masterOf(k ? ctx.workMaster.get(k) : null, props),
       live: { sales30, free_stock: freeStock },
       priority: priorityOf(sales30, freeStock),
+      // 作業時間: いま作業中の人 + 過去の実測 (カード単位合計の平均。1回だけなら「前回」表示)
+      active: activeMap.get(r.page_id) || [],
+      estimate: (k && estimates.get(k)) || null,
     };
   });
 

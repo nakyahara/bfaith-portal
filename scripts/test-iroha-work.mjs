@@ -143,7 +143,8 @@ const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 initMirrorDB();
 const { getDB, replaceCache, listCache, addIrohaWorker, setIrohaWorkerActive, getIrohaWorker, listIrohaWorkers,
   setWorkerPin, verifyWorkerPin, _clearPinFails,
-  createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents } = await import('../apps/iroha-work/db.js');
+  createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents,
+  startSession, stopSession, activeSessionsByPage, estimateByProduct, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
 const { ensureFresh, refreshFromNotion, changeStatus, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
 const { buildList, priorityOf, clearEnrichCache } = await import('../apps/iroha-work/service.js');
 
@@ -414,6 +415,51 @@ console.log('\n[12] 操作履歴');
   logEvent({ action: 'status_change', pageId: pA.id, workerId: 1, workerName: 'たにがわ', deviceLabel: 'test', from: '未着手', to: '作業中', ok: true });
   const ev = listEvents(5);
   ok(ev.length > 0 && ev[0].action === 'status_change' && ev[0].ok === 1, '履歴が残る');
+}
+
+console.log('\n[13] 作業時間セッション');
+{
+  const w1 = addIrohaWorker({ displayName: 'やまだ', workerType: 'member', actor: 'test' });
+  const w2 = addIrohaWorker({ displayName: 'すずき', workerType: 'member', actor: 'test' });
+  const worker1 = getIrohaWorker(w1.id), worker2 = getIrohaWorker(w2.id);
+
+  const s1 = startSession({ pageId: 'sess-p1', productCode: 'PROD-A', title: '商品A', worker: worker1, deviceLabel: 'test' });
+  ok(s1.ok === true && s1.startedAt, '開始できる');
+  ok(startSession({ pageId: 'sess-p1', worker: worker1 }).error === 'already_started', '同じカードの二重開始は拒否');
+  const busy = startSession({ pageId: 'sess-p2', worker: worker1 });
+  ok(busy.error === 'busy' && busy.open.page_id === 'sess-p1', '別カードは busy (どのカードか返す) — 1人1件の原則');
+
+  const s2 = startSession({ pageId: 'sess-p1', productCode: 'PROD-A', title: '商品A', worker: worker2 });
+  ok(s2.ok === true, '別の人は同じカードに参加できる (複数人=複数行)');
+  ok((activeSessionsByPage().get('sess-p1') || []).length === 2, '活動中2名が一覧に出る');
+
+  const st1 = stopSession({ pageId: 'sess-p1', workerId: worker1.id, reason: 'done' });
+  ok(st1.ok === true && st1.session.raw_seconds >= 0 && st1.remainingActive === 1, '終了 (raw_seconds はサーバー計算・残り1名)');
+  ok(stopSession({ pageId: 'sess-p1', workerId: worker1.id, reason: 'done' }).error === 'not_started', '開始していない人の終了は拒否');
+  ok(stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'bogus' }).error === 'bad_request', '不正な理由は拒否');
+  const st2 = stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'pause' });
+  ok(st2.ok === true && st2.remainingActive === 0, '中断で全員離脱 (remainingActive=0 → 画面が「中断にする?」を出す)');
+
+  // 実測の集計: カード単位の合計を商品ごとに平均。voided は外す
+  const db2 = getDB();
+  const insSess = db2.prepare(`INSERT INTO f_iroha_work_sessions
+    (page_id, product_code, worker_id, worker_name, started_at, ended_at, end_reason, raw_seconds)
+    VALUES (?, 'PROD-EST', 1, 'x', ?, ?, 'done', ?)`);
+  insSess.run('est-p1', '2026-09-01T00:00:00Z', '2026-09-01T01:00:00Z', 300);
+  insSess.run('est-p1', '2026-09-01T00:00:00Z', '2026-09-01T01:00:00Z', 300);   // 同カード2人 → 合計600
+  insSess.run('est-p2', '2026-09-02T00:00:00Z', '2026-09-02T01:00:00Z', 1200);
+  const est = estimateByProduct().get('prod-est');
+  ok(est && est.cards === 2 && est.avgSeconds === 900, `カード合計の平均 (600+1200)/2=900 (実際 ${est && est.avgSeconds})`);
+  ok(est.lastSeconds === 1200, '直近カードの実績も持つ (1回だけなら「前回」表示に使う)');
+
+  // 取り消し (論理削除) → 集計から外れる
+  const openS = startSession({ pageId: 'est-p3', productCode: 'PROD-EST', title: 'x', worker: worker1 });
+  const v = voidSession(getDB().prepare('SELECT id FROM f_iroha_work_sessions WHERE page_id = ?').get('est-p3').id, 'admin@test', '押し忘れ');
+  ok(openS.ok && v.ok === true, '活動中セッションも取り消せる (閉じて void)');
+  ok(voidSession(getDB().prepare('SELECT id FROM f_iroha_work_sessions WHERE page_id = ?').get('est-p3').id, 'admin@test').error === 'already_voided', '二重取り消しは拒否');
+  ok((activeSessionsByPage().get('est-p3') || []).length === 0, '取り消したら活動中から消える');
+  const rows = listSessionsForAdmin(10);
+  ok(rows.length > 0 && typeof rows[0].elapsed_seconds === 'number', '管理画面用一覧 (経過秒つき)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
