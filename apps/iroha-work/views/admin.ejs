@@ -189,6 +189,14 @@
         <% } %>
         <% if (media.length === 0) { %><tr><td colspan="6">まだありません</td></tr><% } %>
       </table>
+      <% if (pageSync.length > 0) { %>
+        <p class="hint" style="margin-top:10px"><b>Notion貼り直し待ち:</b>
+          <% for (const s of pageSync) { %>
+            <span><%= s.page_id.slice(0, 8) %>… (<%= s.attempt_count %>回<%= s.error ? ` / ${s.error}` : '' %>)
+              <% if (isAdmin && s.error) { %><button class="btn-sm" onclick="retrySync('<%= s.page_id %>')">再実行</button><% } %></span>
+          <% } %>
+        </p>
+      <% } %>
     </div>
 
     <div class="iw-box">
@@ -252,6 +260,11 @@
     }
     async function retryMedia(id) {
       const { json } = await post('/admin/media/' + id + '/retry');
+      if (json.ok) location.reload();
+      else alert(json.message || '再実行できませんでした');
+    }
+    async function retrySync(pageId) {
+      const { json } = await post('/admin/media-sync/retry', { page_id: pageId });
       if (json.ok) location.reload();
       else alert(json.message || '再実行できませんでした');
     }

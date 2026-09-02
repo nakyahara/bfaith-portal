@@ -29,7 +29,8 @@ import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES 
 import { buildList } from './service.js';
 import {
   addMedia, softDeleteMedia, countActivePhotos, resetMedia, listMediaForAdmin, schedule as scheduleMedia,
-  isDriveConfigured, MEDIA_DIR, MAX_VIDEO_BYTES, MAX_PHOTOS, MAX_VIDEOS,
+  listPageSyncForAdmin, resetPageSync,
+  isDriveConfigured, MEDIA_DIR, MAX_VIDEO_BYTES,
 } from './media.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -252,16 +253,22 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
   }
 
   // 棚入完了には できあがり写真1枚以上 (要件 §6)。職員判断でスキップ可 (skip_photo。履歴に残す)
+  let skipPhotoUsed = false;
   if (to === '棚入完了' && countActivePhotos(pageId) === 0) {
     if (!req.body?.skip_photo) {
       return res.status(409).json({ ok: false, error: 'photo_required',
         message: 'できあがりの写真がまだありません。写真を1枚以上とってから棚入完了にしてください' });
     }
-    safeLog({ action: 'status_skip_photo', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
-      deviceLabel: deviceLabelOf(req), to, ok: true });
+    skipPhotoUsed = true;
   }
 
   const r = await changeStatus({ pageId, to, expect, isStaff });
+  // スキップの履歴は**結果が出てから**残す (変更が失敗したのに「写真なしで完了した」と
+  // 記録しない — Codex PR3 #5)
+  if (skipPhotoUsed) {
+    safeLog({ action: 'status_skip_photo', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
+      deviceLabel: deviceLabelOf(req), to, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+  }
   // 監査ログの失敗で Notion 更新済みの結果を「失敗」に見せない (Codex PR1 #6)
   try {
     logEvent({
@@ -318,22 +325,26 @@ router.post('/api/media', checkOrigin, mediaUpload.single('file'), api((req, res
   }
 }));
 
-// 撮り直し用の削除 (論理削除。消せるのは撮った本人。職員はPCから)
+// 撮り直し用の削除 (論理削除)。本人確認 = アップロード時に返した削除トークン
+// (worker_id は自己申告なので使わない — Codex PR3 #2)。職員はPCの管理画面 (セッション) から
 router.post('/api/media/:id(\\d+)/delete', checkOrigin, api((req, res) => {
-  const isSession = hasSessionAccess(req);
-  let workerId = null;
-  if (!isSession) {
-    const w = resolveWorker(req);
-    if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-    workerId = w.worker.id;
-  }
-  const r = softDeleteMedia(Number(req.params.id), { workerId, actor: req.iwUser || null, isSession });
+  const r = softDeleteMedia(Number(req.params.id), {
+    deleteToken: req.body?.delete_token || null,
+    actor: req.iwUser || null,
+    isSession: hasSessionAccess(req),
+  });
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 403)).json(r);
 }));
 
 // 失敗した送信の再実行 (管理画面)
 router.post('/admin/media/:id(\\d+)/retry', checkOrigin, requireAdmin, api((req, res) => {
   if (!resetMedia(Number(req.params.id))) return res.status(404).json({ ok: false, error: 'not_found', message: '対象が見つかりません' });
+  res.json({ ok: true });
+}));
+
+// Notion 貼り直しの再実行 (管理画面)
+router.post('/admin/media-sync/retry', checkOrigin, requireAdmin, api((req, res) => {
+  if (!resetPageSync(String(req.body?.page_id || ''))) return res.status(404).json({ ok: false, error: 'not_found', message: '対象が見つかりません' });
   res.json({ ok: true });
 }));
 
@@ -427,6 +438,7 @@ router.get('/admin', requireSession, api((req, res) => {
     events: listEvents(50),
     sessions: listSessionsForAdmin(50),
     media: listMediaForAdmin(50),
+    pageSync: listPageSyncForAdmin(),
     driveConfigured: isDriveConfigured(),
   });
 }));

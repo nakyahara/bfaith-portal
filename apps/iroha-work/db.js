@@ -142,9 +142,20 @@ export function createTables(db = getMirrorDB()) {
       uploaded_at   TEXT,
       synced_at     TEXT,
       deleted_at    TEXT,
-      deleted_by    TEXT
+      deleted_by    TEXT,
+      delete_token_hash TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_iroha_media_page ON f_iroha_card_media(page_id, id);
+
+    -- Notion「完成写真」貼り直しのページ単位キュー (Codex PR3 #1: 最後の1件を削除したときも
+    -- 「空にする」PATCH が必要 — メディア行の状態だけでは表現できない)
+    CREATE TABLE IF NOT EXISTS f_iroha_media_page_sync (
+      page_id       TEXT PRIMARY KEY,
+      requested_at  TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_retry_at TEXT,
+      error         TEXT
+    );
 
     -- 端末 (iPad)。inbound-check と同じ方式 (トークンはハッシュのみ保存)
     CREATE TABLE IF NOT EXISTS f_iroha_app_devices (

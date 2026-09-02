@@ -510,9 +510,13 @@ function renderDetail(c) {
 
 // ── できあがりの写真・動画 (作業のやり方のすぐ下 — 中原さんFB①「写真は上のほうに」) ──
 const KIND_ICON = { photo: '📷', video: '🎥' };
+// 削除トークン = アップロードした端末だけが持つ (この端末で撮った分だけ×が出る)
+function mediaTokens() { try { return JSON.parse(localStorage.getItem('iw_media_tok') || '{}'); } catch (e) { return {}; } }
+function saveMediaToken(id, tok) { try { const t = mediaTokens(); t[id] = tok; localStorage.setItem('iw_media_tok', JSON.stringify(t)); } catch (e) { /* 消せなくなるだけ */ } }
+function dropMediaToken(id) { try { const t = mediaTokens(); delete t[id]; localStorage.setItem('iw_media_tok', JSON.stringify(t)); } catch (e) { /* 無視 */ } }
 function mediaTile(m) {
   const st = m.error ? '❌失敗' : m.status === 'stored' ? '送信中…' : '☁保存済み';
-  const own = worker && m.worker_id === worker.id;
+  const own = !!mediaTokens()[m.id];
   return '<div class="ph' + (m.error ? ' err' : '') + '" onclick="openMedia(event,' + m.id + ')">' +
     (own ? '<button class="del" onclick="delMedia(event,' + m.id + ')">×</button>' : '') +
     '<div><span class="ic">' + KIND_ICON[m.kind] + '</span>' + esc(m.worker_name || '') +
@@ -621,6 +625,7 @@ async function uploadMedia(opId) {
     return;
   }
   pendingTiles.delete(opId);
+  if (j.deleteToken && j.media) saveMediaToken(j.media.id, j.deleteToken);
   const c = state.cards.find(x => x.page_id === p.pageId);
   if (c && !c.media.some(m => m.id === j.media.id)) c.media.push(j.media);
   rerenderDetail();
@@ -631,17 +636,17 @@ function retryUpload(ev, opId) { ev.stopPropagation(); uploadMedia(opId); }
 
 async function delMedia(ev, id) {
   ev.stopPropagation();
-  if (!worker) { openGate(); return; }
   if (!confirm('この写真・動画を削除しますか? (撮り直し用)')) return;
   let j;
   try {
     const r = await fetch(BASE + '/api/media/' + id + '/delete', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ worker_id: worker.id }),
+      body: JSON.stringify({ delete_token: mediaTokens()[id] || null }),
     });
     j = await r.json().catch(() => ({}));
   } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
   if (!j.ok) { showErr(j.message || '削除できませんでした'); return; }
+  dropMediaToken(id);
   for (const c of state.cards) c.media = c.media.filter(m => m.id !== id);
   rerenderDetail();
   toast('削除しました');
