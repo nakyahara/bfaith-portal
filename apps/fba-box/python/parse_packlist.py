@@ -220,14 +220,16 @@ def main():
     except Exception as e:
         fail('bad_xlsx', f'Excelとして開けません: {e}')
 
+    # Metadata シートは必須 (無い・読めない = 未知形式として拒否。Codex PR1 #2)
+    if 'Metadata' not in wb.sheetnames:
+        fail('no_metadata', 'Metadataシートがありません (STAのパックリストではない可能性)')
     meta = {}
-    if 'Metadata' in wb.sheetnames:
-        ws = wb['Metadata']
-        for r in range(1, min(ws.max_row, 50) + 1):
-            k = cell_text(ws.cell(row=r, column=1).value)
-            v = ws.cell(row=r, column=2).value
-            if k:
-                meta[k] = v if isinstance(v, (int, float)) else cell_text(v)
+    ws = wb['Metadata']
+    for r in range(1, min(ws.max_row, 50) + 1):
+        k = cell_text(ws.cell(row=r, column=1).value)
+        v = ws.cell(row=r, column=2).value
+        if k:
+            meta[k] = v if isinstance(v, (int, float)) else cell_text(v)
 
     sheets = []
     errors = []
@@ -243,14 +245,21 @@ def main():
         else:
             sheets.append(info)
 
+    # 1シートでも解析できなければ全体を拒否する (Codex PR1 #2: 梱包グループの欠落した
+    # 納品回を作らせない。部分成功は「成功」ではない)
+    if errors:
+        fail('sheet_parse_errors',
+             '解析できないシートがあります: ' + ', '.join(f"{e['sheet']} ({e['error']})" for e in errors),
+             metadata=meta, sheetErrors=errors,
+             detected=[s['sheetName'] for s in sheets])
     if not sheets:
         fail('no_packing_sheets', '梱包情報シートを検出できませんでした (未知の形式)', metadata=meta, sheetErrors=errors)
 
-    # Metadata の枚数と実検出数の突合 (欠けたシートを見逃さない)
+    # Metadata の枚数と実検出数の突合 (欠け・型不正も未知形式として拒否)
     declared = meta.get('Number of packing sheets')
-    if isinstance(declared, (int, float)) and int(declared) != len(sheets):
+    if not isinstance(declared, (int, float)) or int(declared) != len(sheets):
         fail('sheet_count_mismatch',
-             f'Metadataの梱包シート数 ({int(declared)}) と検出数 ({len(sheets)}) が一致しません',
+             f'Metadataの梱包シート数 ({declared!r}) と検出数 ({len(sheets)}) が一致しません',
              metadata=meta, sheetErrors=errors,
              detected=[s['sheetName'] for s in sheets])
 

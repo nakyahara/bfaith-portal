@@ -113,10 +113,14 @@ function resolveWorker(req) {
 
 /**
  * 職員限定操作の本人確認 (iroha-work と同じ考え方):
- *   ①ポータルセッション = 職員扱い ②端末Cookie = 職員 worker + PIN 一致のときのみ
+ *   ①ポータルセッション = 職員扱い (ポータル利用者は B-Faith 側スタッフのみ。
+ *     監査上の操作主体は各イベントの device_label = `session:メール` で追える —
+ *     worker_name は現場の作業帰属で、権限行使者とは別の欄という整理。Codex PR1 #9 は
+ *     この記録で足りると業務判断)
+ *   ②端末Cookie = 職員 worker + PIN 一致のときのみ
  */
 function requireStaff(req, worker) {
-  if (hasSessionAccess(req)) return { ok: true };
+  if (hasSessionAccess(req)) return { ok: true, via: 'session' };
   if (worker.worker_type !== 'staff') {
     return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: 'この操作は職員のみです (職員の名前を選んでください)' } };
   }
@@ -125,7 +129,7 @@ function requireStaff(req, worker) {
     const st = pinCheck.error === 'pin_locked' ? 429 : 403;
     return { ok: false, status: st, body: { ok: false, ...pinCheck } };
   }
-  return { ok: true };
+  return { ok: true, via: 'pin' };
 }
 
 router.use(access);
@@ -246,12 +250,18 @@ router.post('/api/placements/:id(\\d+)/revoke', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
-/** 配置 (下/中/上) の後付け・付け替え */
+/** 配置 (下/中/上) の後付け・付け替え。閉じた箱は職員 (as_staff+PIN) のみ */
 router.post('/api/placements/:id(\\d+)/layer', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  const r = setPlacementLayer({ placementId: Number(req.params.id), layer: req.body?.layer, worker: w.worker, deviceLabel: deviceLabelOf(req) });
-  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 400).json(r);
+  let byStaff = false;
+  if (req.body?.as_staff) {
+    const gate = requireStaff(req, w.worker);
+    if (!gate.ok) return res.status(gate.status).json(gate.body);
+    byStaff = true;
+  }
+  const r = setPlacementLayer({ placementId: Number(req.params.id), layer: req.body?.layer, byStaff, worker: w.worker, deviceLabel: deviceLabelOf(req) });
+  if (!r.ok) return res.status({ not_found: 404, staff_required: 403 }[r.error] || 400).json(r);
   res.json(r);
 }));
 

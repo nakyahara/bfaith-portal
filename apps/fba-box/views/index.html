@@ -257,6 +257,7 @@
   async function refresh(force) {
     if (!curRunId) return;
     if (dialogOpen && !force) return;   // 入力中に画面を差し替えない
+    await flushPendingPlacement();      // 未確定の割当があれば先に確定させる (同じ request_id)
     try {
       const j = await apiGet('/api/state?run=' + curRunId);
       setOnline(!!j.ok || j._status === 404);
@@ -455,23 +456,45 @@
     return d ? `${y}-${m}-${d}` : `${y}-${m}`;
   }
 
-  /** 割当送信 (request_id で冪等。失敗リトライは同じ id で) */
+  /**
+   * 割当送信。request_id で冪等 (サーバーは内容hashも突合)。
+   * 応答が返るまで payload ごと localStorage に残し、応答喪失後の再送でも**同じ id** を
+   * 使い続ける (Codex PR1 #6: 手動リトライで新しい id を発行すると二重登録になる)
+   */
+  let flushing = false;
+  async function flushPendingPlacement() {
+    const pend = LS.get('pending_place', null);
+    if (!pend || flushing) return;
+    flushing = true;
+    try {
+      await apiPost('/api/placements', pend.body);   // 応答 (成功/業務エラー問わず) が返れば確定
+      LS.set('pending_place', null);
+      setOnline(true);
+    } catch { /* まだ通信不能 — pending は残す */ } finally { flushing = false; }
+  }
   async function sendPlacement({ rowId, boxId, qty, layer, expiry }) {
+    await flushPendingPlacement();   // 前回の未確定分を先に片付ける
+    if (LS.get('pending_place', null)) {
+      return { ok: false, message: '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください' };
+    }
     const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+    const body = {
+      run_id: curRunId, row_id: rowId, box_id: boxId, qty, layer: layer || null,
+      expiry: expiry || null, worker_id: worker.id, request_id: requestId,
+    };
+    LS.set('pending_place', { requestId, body });
     showSaving(true);
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const j = await apiPost('/api/placements', {
-            run_id: curRunId, row_id: rowId, box_id: boxId, qty, layer: layer || null,
-            expiry: expiry || null, worker_id: worker.id, request_id: requestId,
-          });
+          const j = await apiPost('/api/placements', body);
+          LS.set('pending_place', null);
           setOnline(true);
           return j;
         } catch (e) {
           if (attempt === 0) { await new Promise(r => setTimeout(r, 1200)); continue; }
           setOnline(false);
-          return { ok: false, message: '通信できませんでした。電波の良い場所でもう一度押してください' };
+          return { ok: false, message: '通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)' };
         }
       }
     } finally {
@@ -670,6 +693,7 @@
         if (confirm(`不足${row.shortage_qty} の記録を消しますか? (現物が見つかったとき)`)) {
           const j = await apiPost(`/api/rows/${row.id}/shortage`, { worker_id: staffWorker.id, pin, clear: true });
           if (!j.ok) alert(j.message);
+          await refresh(true);   // 解除結果をすぐ画面に反映 (Codex PR1 #10)
         }
         return;
       }

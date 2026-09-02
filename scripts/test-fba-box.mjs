@@ -73,6 +73,12 @@ t('Excel内の識別キー重複 = ブロック (ok:false)', () => {
   assert.equal(m.ok, false);
   assert.ok(m.blocking.some(i => i.kind === 'duplicate_identity'));
 });
+t('同一FNSKUで別SKUの2行も重複ブロック (突合キーと同じ規則)', () => {
+  const dupSheet = { ...sheetInfo, skuRows: [...sheetInfo.skuRows, { ...sheetInfo.skuRows[0], row: 9, sku: 'sku-a2', asin: 'B999999999' }] };
+  const m = svc.matchSheet(dupSheet, svc.buildPickingIndex(planSheets));
+  assert.equal(m.ok, false);
+  assert.ok(m.blocking.some(i => i.kind === 'duplicate_identity' && i.identity === 'fnsku:X0001AAA01'));
+});
 t('同一FNSKU複数候補で数量も曖昧 = plan_noなし+ambiguous警告', () => {
   const amb = { ...sheetInfo, skuRows: [{ row: 6, sku: 'sku-a', asin: 'B1', fnsku: 'X0001AAA01', plannedQty: 7, productName: 'x' }] };
   const m = svc.matchSheet(amb, svc.buildPickingIndex(planSheets));
@@ -146,11 +152,16 @@ t('addPlacement 成功 (box_seq=1)', () => {
   assert.equal(p1.boxSeq, 1);
   assert.equal(p1.placed, 20);
 });
-t('冪等性: 同じ device_key+request_id は already で同結果', () => {
+t('冪等性: 同じ device_key+request_id+同内容 は already で同結果', () => {
   const again = db.addPlacement({ runId, rowId: rowA.id, boxId: box1.boxId, qty: 20, worker: member, deviceKey: 'dev:1', deviceLabel: 'iPad1', requestId: 'r1' });
   assert.equal(again.ok, true);
   assert.equal(again.already, true);
   assert.equal(db.getRunState(runId).rows.find(r => r.id === rowA.id).placed, 20);
+});
+t('冪等性: 同じキーで内容が違えば idempotency_conflict', () => {
+  const bad = db.addPlacement({ runId, rowId: rowA.id, boxId: box1.boxId, qty: 3, worker: member, deviceKey: 'dev:1', requestId: 'r1' });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.error, 'idempotency_conflict');
 });
 t('残数超過は over_qty で拒否', () => {
   const r = db.addPlacement({ runId, rowId: rowA.id, boxId: box1.boxId, qty: 26, worker: member, deviceKey: 'dev:1', requestId: 'r2' });
@@ -260,10 +271,59 @@ t('setRowShortage: 残数超は拒否・正常は記録・clearで消える', ()
   assert.equal(db.getRunState(runId).rows.find(x => x.id === rowA.id).shortage_qty, null);
 });
 
+t('不足確定後は placed+shortage を超える割当が over_qty', () => {
+  db.setRowShortage({ rowId: rowA.id, shortageQty: 2, reason: 'missing', worker: staff });
+  const r0 = db.getRunState(runId).rows.find(x => x.id === rowA.id);
+  const rem = r0.planned_qty - r0.placed - r0.shortage_qty;
+  const over = db.addPlacement({ runId, rowId: rowA.id, boxId: box1.boxId, qty: rem + 1, worker: member, deviceKey: 'dev:1', requestId: 'sh1' });
+  assert.equal(over.error, 'over_qty');
+  db.clearRowShortage({ rowId: rowA.id, worker: staff });
+});
+
 // run 完了ガード
 t('setRunStatus done: 開いた箱があれば拒否', () => {
   const r = db.setRunStatus(runId, 'done', 't');
   assert.equal(r.error, 'open_boxes');
+});
+t('setRunStatus done: 全行の投入+不足=予定 でなければ rows_incomplete、揃えば完了できる', () => {
+  // 別 run で完了までの正常系を検証
+  const m = svc.matchWorkbook({ sheets: [sheetInfo] }, planSheets);
+  const c2 = db.createRun({
+    sourceRunId: 62, deliveryDate: '2026-09-06', title: '9/6 納品分',
+    matchSummary: svc.summarizeMatch(m),
+    excelFile: { originalName: 'p.xlsx', storedPath: '/tmp/y.xlsx', sha256: 'b'.repeat(64), fingerprint: 'd337e046bbf029c1', metadata: {} },
+    groups: m.groups, createdBy: 't',
+  });
+  assert.equal(c2.ok, true);
+  db.activateRun(c2.runId, 't');
+  const st2 = db.getRunState(c2.runId);
+  const g2 = st2.groups[0].id;
+  const bx = db.createBox({ packGroupId: g2, materialCode: 'box140', worker: member });
+  // 1行だけ入れて他は未処理 → rows_incomplete
+  const rA = st2.rows[0];
+  db.addPlacement({ runId: c2.runId, rowId: rA.id, boxId: bx.boxId, qty: rA.planned_qty, worker: member, deviceKey: 'dev:9', requestId: 'd1' });
+  db.closeBox({ boxId: bx.boxId, measuredKg: 8, worker: staff });
+  assert.equal(db.setRunStatus(c2.runId, 'done', 't').error, 'rows_incomplete');
+  // 残り2行を「全量不足」で確定 → 完了できる
+  for (const row of st2.rows.slice(1)) {
+    db.setRowShortage({ rowId: row.id, shortageQty: row.planned_qty, reason: 'hq_order', worker: staff });
+  }
+  assert.equal(db.setRunStatus(c2.runId, 'done', 't').ok, true);
+});
+t('閉じた箱の layer 変更は職員のみ', () => {
+  const st = db.getRunState(runId);
+  const closedBoxIds = new Set(st.boxes.filter(b => b.status === 'closed').map(b => b.id));
+  const p = st.placements.find(x => closedBoxIds.has(x.box_id));
+  if (!p) { // box1 は再オープン済みのため、ここで一度閉じ直して検証
+    db.closeBox({ boxId: box1.boxId, measuredKg: 9, worker: staff });
+  }
+  const st2 = db.getRunState(runId);
+  const closed2 = new Set(st2.boxes.filter(b => b.status === 'closed').map(b => b.id));
+  const p2 = st2.placements.find(x => closed2.has(x.box_id));
+  assert.ok(p2, '閉じた箱に割当があるはず');
+  assert.equal(db.setPlacementLayer({ placementId: p2.id, layer: 'top', worker: member }).error, 'staff_required');
+  assert.equal(db.setPlacementLayer({ placementId: p2.id, layer: 'top', byStaff: true, worker: staff }).ok, true);
+  db.reopenBox({ boxId: p2.box_id, reason: 'テスト後始末', worker: staff });
 });
 
 // PIN

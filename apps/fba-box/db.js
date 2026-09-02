@@ -182,6 +182,7 @@ export function createTables(d = getDB()) {
       worker_name   TEXT,
       device_key    TEXT NOT NULL,
       request_id    TEXT NOT NULL,
+      request_hash  TEXT,
       created_at    TEXT NOT NULL,
       revoked_at    TEXT,
       revoked_by    TEXT,
@@ -362,6 +363,13 @@ export function setRunStatus(runId, status, actor) {
       const openBoxes = d.prepare(`SELECT COUNT(*) c FROM fbx_boxes b JOIN fbx_pack_groups g ON g.id = b.pack_group_id
         WHERE g.run_id = ? AND b.status = 'open'`).get(run.id).c;
       if (openBoxes > 0) return { ok: false, error: 'open_boxes', message: `開いたままの箱が ${openBoxes} 箱あります。先に全ての箱を閉じてください` };
+      // 全行が「投入 + 確定不足 = 予定」でなければ完了できない (Codex PR1 #7)
+      const bad = d.prepare(`SELECT COUNT(*) c FROM fbx_rows w
+        LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
+        WHERE w.run_id = ?
+          AND COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0)
+              + COALESCE(rw.shortage_qty, 0) != w.planned_qty`).get(run.id).c;
+      if (bad > 0) return { ok: false, error: 'rows_incomplete', message: `投入数と不足の合計が予定数と合わない商品が ${bad} 行あります。iPad で入力を終えるか、不足を確定してから完了にしてください` };
     }
     d.prepare('UPDATE fbx_runs SET status = ?, done_at = ?, data_version = data_version + 1 WHERE id = ?')
       .run(status, status === 'done' ? utcNow() : null, run.id);
@@ -513,11 +521,20 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
     if (!Number.isFinite(t)) return { ok: false, error: 'bad_expiry', message: '実在する日付を入力してください' };
     if (t < Date.now()) return { ok: false, error: 'past_expiry', message: '過去の期限は入力できません (現物を確認してください)' };
   }
+  // 冪等キーはリクエスト内容に結び付ける (Codex PR1 #5): 同キーで内容が違えば 409。
+  // hash はクライアントが送った生の値で計算する (期限の引き継ぎ等のサーバー側補完より前 —
+  // 再送は同じ生値で来るので一致する)
+  const requestHash = crypto.createHash('sha256')
+    .update(JSON.stringify([Number(runId), Number(rowId), Number(boxId), q, expiry ?? null, lay]))
+    .digest('hex');
   const d = getDB();
   return d.transaction(() => {
     // 冪等性: 同じ端末×request_id は前回結果を返す (再送で二重登録しない)
     const prev = d.prepare('SELECT * FROM fbx_placements WHERE device_key = ? AND request_id = ?').get(String(deviceKey), String(requestId));
     if (prev) {
+      if (prev.request_hash !== requestHash) {
+        return { ok: false, error: 'idempotency_conflict', message: '同じ操作IDで内容の違う記録が既にあります (画面を更新してやり直してください)' };
+      }
       return { ok: true, already: true, placementId: prev.id, boxSeq: prev.box_seq,
         placed: placedOf(d, prev.row_id) };
     }
@@ -532,10 +549,13 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
       return { ok: false, error: 'wrong_group', message: 'この箱は別の梱包グループの箱です。同じシートの箱を選んでください' };
     }
     if (box.status !== 'open') return { ok: false, error: 'box_closed', message: 'この箱は閉じられています (職員が再オープンすれば入れられます)' };
+    // 残数 = 予定 − 投入済み − 確定不足 (Codex PR1 #4: 不足確定後にその分を超えて入れられない)
     const placed = placedOf(d, row.id);
-    if (placed + q > row.planned_qty) {
-      return { ok: false, error: 'over_qty', placed, plannedQty: row.planned_qty,
-        message: `予定数を超えます (予定 ${row.planned_qty} / 入力済み ${placed})。残りは ${row.planned_qty - placed} 個です` };
+    const shortage = d.prepare('SELECT COALESCE(shortage_qty, 0) s FROM fbx_row_work WHERE row_id = ?').get(row.id)?.s || 0;
+    if (placed + shortage + q > row.planned_qty) {
+      const rem = Math.max(0, row.planned_qty - placed - shortage);
+      return { ok: false, error: 'over_qty', placed, plannedQty: row.planned_qty, shortage,
+        message: `予定数を超えます (予定 ${row.planned_qty} / 入力済み ${placed}${shortage ? ` / 不足確定 ${shortage}` : ''})。残りは ${rem} 個です` };
     }
     // 期限制約 (要件 §5-3): 同一納品回×同一商品行は1期限。既存と異なる期限はブロック
     if (exp != null) {
@@ -553,10 +573,10 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
     // box_seq: 取消済みも含めた最大+1 (欠番は再利用しない — 監査・分析の正本)
     const seq = d.prepare('SELECT COALESCE(MAX(box_seq), 0) + 1 AS n FROM fbx_placements WHERE box_id = ?').get(box.id).n;
     const info = d.prepare(`INSERT INTO fbx_placements
-      (run_id, row_id, box_id, qty, expiry, box_seq, placement_layer, layer_source, worker_id, worker_name, device_key, request_id, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      (run_id, row_id, box_id, qty, expiry, box_seq, placement_layer, layer_source, worker_id, worker_name, device_key, request_id, request_hash, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(row.run_id, row.id, box.id, q, exp, seq, lay, lay ? 'manual' : null,
-        worker?.id ?? null, worker?.display_name ?? null, String(deviceKey), String(requestId), utcNow());
+        worker?.id ?? null, worker?.display_name ?? null, String(deviceKey), String(requestId), requestHash, utcNow());
     const placementId = Number(info.lastInsertRowid);
     logEvent({ runId: row.run_id, action: 'placement_add', targetType: 'placement', targetId: placementId,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
@@ -604,17 +624,24 @@ export function revokePlacement({ placementId, byStaff = false, reason, worker, 
   }).immediate();
 }
 
-/** 割当の配置 (下/中/上) を後から付け替え (箱クローズ読み合わせ画面から。manual のみ) */
-export function setPlacementLayer({ placementId, layer, worker, deviceLabel }) {
+/**
+ * 割当の配置 (下/中/上) を後から付け替え (読み合わせ画面から。manual のみ)。
+ * 閉じた箱の記録の変更は職員のみ (Codex PR1 #8: 読み合わせ後の監査対象データを勝手に変えない)
+ */
+export function setPlacementLayer({ placementId, layer, byStaff = false, worker, deviceLabel }) {
   const lay = layer == null || layer === '' ? null : String(layer);
   if (lay && !['bottom', 'middle', 'top'].includes(lay)) return { ok: false, error: 'bad_layer', message: '配置の値が不正です' };
   const d = getDB();
   return d.transaction(() => {
-    const p = d.prepare('SELECT p.*, r.status AS run_status FROM fbx_placements p JOIN fbx_runs r ON r.id = p.run_id WHERE p.id = ?')
+    const p = d.prepare(`SELECT p.*, b.status AS box_status, r.status AS run_status FROM fbx_placements p
+      JOIN fbx_boxes b ON b.id = p.box_id JOIN fbx_runs r ON r.id = p.run_id WHERE p.id = ?`)
       .get(Number(placementId));
     if (!p) return { ok: false, error: 'not_found', message: '割当が見つかりません' };
     if (p.revoked_at) return { ok: false, error: 'revoked', message: '取消済みの割当です' };
     if (p.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    if (p.box_status === 'closed' && !byStaff) {
+      return { ok: false, error: 'staff_required', message: '閉じた箱の記録の変更は職員のみです' };
+    }
     d.prepare('UPDATE fbx_placements SET placement_layer = ?, layer_source = ? WHERE id = ?')
       .run(lay, lay ? 'manual' : null, p.id);
     logEvent({ runId: p.run_id, action: 'placement_layer', targetType: 'placement', targetId: p.id,

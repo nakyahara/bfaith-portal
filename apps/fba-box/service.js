@@ -44,7 +44,10 @@ export function buildPickingIndex(planSheets) {
 export function matchSheet(sheetInfo, pickingIndex) {
   const rows = [];
   const issues = [];
-  const seenIdentity = new Map();
+  // 重複検出は突合と同じ識別規則で行う (Codex PR1 #3): FNSKU があれば FNSKU 単独、
+  // 無ければ SKU 単独。「同じFNSKUで別SKU」の2行が両方同じ picking 行に対応する事故を防ぐ
+  const seenFnsku = new Map();
+  const seenSku = new Map();
 
   for (const r of sheetInfo.skuRows) {
     const fnsku = norm(r.fnsku);
@@ -53,12 +56,19 @@ export function matchSheet(sheetInfo, pickingIndex) {
       issues.push({ kind: 'missing_identity', excelRow: r.row });
       continue;
     }
-    const identity = `${sku}|${fnsku}|${norm(r.asin)}`;
-    if (seenIdentity.has(identity)) {
-      issues.push({ kind: 'duplicate_identity', excelRow: r.row, firstRow: seenIdentity.get(identity), identity });
-      continue;
+    if (fnsku) {
+      if (seenFnsku.has(fnsku)) {
+        issues.push({ kind: 'duplicate_identity', excelRow: r.row, firstRow: seenFnsku.get(fnsku), identity: `fnsku:${fnsku}` });
+        continue;
+      }
+      seenFnsku.set(fnsku, r.row);
+    } else {
+      if (seenSku.has(sku)) {
+        issues.push({ kind: 'duplicate_identity', excelRow: r.row, firstRow: seenSku.get(sku), identity: `sku:${sku}` });
+        continue;
+      }
+      seenSku.set(sku, r.row);
     }
-    seenIdentity.set(identity, r.row);
 
     let matchState = 'excel_only';
     let planNo = null, sourceSlotId = null, pickingRowNo = null, pickingQty = null;

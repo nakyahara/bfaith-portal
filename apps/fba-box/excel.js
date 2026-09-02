@@ -88,8 +88,13 @@ export async function ingestPacklist(buffer, originalName) {
     try { fs.unlinkSync(storedPath); } catch { /* noop */ }
     return { ok: false, error: 'locked_cells', message: `書き込み対象のセルが保護されています (${lockedCount}箇所)。テンプレの形式が変わった可能性があります — 手動転記に切り替えて中原さんに連絡してください` };
   }
-  return {
-    ok: true, storedPath, sha256, parsed,
-    fingerprintKnown: KNOWN_FINGERPRINTS.has(parsed.fingerprint),
-  };
+  // 未知の fingerprint は受理しない (Codex PR1 #1: 列構造の意味が変わった新テンプレで
+  // 作業→誤ったExcel出力まで進む事故を、警告ではなく拒否で止める)。
+  // 新形式が来たら実物を確認して KNOWN_FINGERPRINTS に追加する
+  if (!KNOWN_FINGERPRINTS.has(parsed.fingerprint)) {
+    try { fs.unlinkSync(storedPath); } catch { /* noop */ }
+    return { ok: false, error: 'unknown_template', fingerprint: parsed.fingerprint,
+      message: `テンプレの形式が既知のものと違います (fingerprint=${parsed.fingerprint})。今回は手動転記で進め、このコードを中原さんに伝えてください (実物確認のうえ対応形式に追加します)` };
+  }
+  return { ok: true, storedPath, sha256, parsed, fingerprintKnown: true };
 }
