@@ -123,6 +123,7 @@ const { getDB } = await import('../apps/inbound-check/db.js');
 const notionMod = await import('../apps/inbound-check/notion.js');
 const {
   runNotionSweep, collectUnsent, collectCancelPending, calcExternal, resetNotionRow, notionStatusForAdmin,
+  buildCardProperties,
 } = await import('../apps/inbound-check/notion-sync.js');
 
 console.log('DATA_DIR =', process.env.DATA_DIR);
@@ -466,9 +467,16 @@ console.log('\n[20] 冪等: もう一度回しても何もしない');
   ok(mock.created.length === before.created && mock.patchedPages.length === before.patched, 'API も叩かない');
 }
 
-console.log('\n[calcExternal 単体]');
+console.log('\n[calcExternal 単体 + 新商品ラベル]');
 {
   ok(calcExternal(null, null).externalOk === null, '販売も在庫も無ければ計算しない');
+  // 販売も在庫実績も無い = 新商品 → 外部出し目安に「新商品」(中原さん 2026-09-02)
+  const names = new Set(['名前', '外部出し目安', '過去30日販売数', '台帳キー', 'destination_id']);
+  const row0 = { id: 99, product_id: 'NEW-1', product_name: '新商品テスト', actual_qty: 5, planned_qty: 5, ar_no: 'AR9', work_date: '2026-09-02', code_key: 'new-1' };
+  const pNew = buildCardProperties(row0, { barcode: null, product: null, supplierName: null, ext: calcExternal(null, null), dedupeKey: 'd99-x', wm: null }, names);
+  ok(pNew['外部出し目安'].rich_text[0].text.content === '新商品', '実績ゼロの初入荷は「新商品」');
+  const pStock = buildCardProperties(row0, { barcode: null, product: null, supplierName: null, ext: calcExternal(null, 50), dedupeKey: 'd99-x', wm: null }, names);
+  ok(pStock['外部出し目安'].rich_text[0].text.content === '外部施設に50個まで預けてOK', '在庫実績がある既存品は従来どおり数字');
   ok(calcExternal(null, 50).externalOk === 50, '販売0扱いならフリー在庫がそのまま外部出しOK');
   ok(calcExternal(30, 10).externalOk === 0, 'キープ数を割ると 0 (外部施設NG)');
 }

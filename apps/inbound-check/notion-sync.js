@@ -196,12 +196,14 @@ export function buildCardProperties(row, { barcode, product, supplierName, ext, 
   put('destination_id', { number: row.id });
   put(DEDUPE_PROP, { rich_text: text(dedupeKey) });
 
-  // 過去30日販売数 / 外部出し目安 (GAS と同じ文言)
+  // 過去30日販売数 / 外部出し目安 (GAS と同じ文言)。
+  // ⭐販売も在庫の実績も無い = 初めて入ってきた商品 → 「新商品」と出す (中原さん 2026-09-02。
+  //   例: バンブーティー)。在庫ゼロなだけの既存品は在庫ミラーに行が残るのでここには落ちない
   put('過去30日販売数', { rich_text: text(ext.sales30 != null ? `${ext.sales30}個` : '販売実績なし') });
   if (ext.externalOk != null) {
     put('外部出し目安', { rich_text: text(ext.externalOk === 0 ? '外部施設NG' : `外部施設に${ext.externalOk}個まで預けてOK`) });
-  } else if (ext.sales30 == null) {
-    put('外部出し目安', { rich_text: text('販売実績なし') });
+  } else if (ext.sales30 == null && ext.freeStock == null) {
+    put('外部出し目安', { rich_text: text('新商品') });
   }
   // いろは作業仕様マスタ (f_iroha_work_master) 由来。未整備の商品は各項目を送らない (それが正常な状態)。
   // ⚠「入数」に載せるのは units_per_container (いろはで1容器に詰める数) だけ。f_inbound_info の
