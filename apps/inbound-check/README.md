@@ -20,6 +20,8 @@
 | `/apps/inbound-check/api/info` (POST) | 同上 | 入庫情報 (入数・いろは・BCシール・直ピック・荷姿・memo) をその場で直す |
 | `/apps/inbound-check/api/info/register` (POST) | 同上 | 入庫情報が無い商品を登録する |
 | `/apps/inbound-check/api/product-flags` (POST) | 同上 | 期限管理 あり/なし を切り替える |
+| `/apps/inbound-check/done` | 登録端末 or セッション | **完了一覧** (確認し終えた伝票の 商品・数量・期限。画像なし・印刷可) |
+| `/apps/inbound-check/api/done` `/done.csv` | 同上 | 完了一覧の JSON / CSV |
 | `/apps/inbound-check/admin/destinations(.csv)` | ポータルセッション | 行き先の台帳 (いろはへ送る商品の一覧) |
 | `/apps/inbound-check/admin/fetch-product-master` (POST) | ポータルセッション | ロジザード商品マスタを今すぐ取り込む |
 | `/apps/inbound-check/admin` | ポータルセッション (アプリ権限) | 管理画面。CSV 取込はアプリ利用者全員 |
@@ -215,6 +217,24 @@ miniPC auto-shohin-csv.js (Logizard-NyukaCSV の2ステップ目・1日1回)
 
 **見つかった区分の内訳は miniPC のログと管理画面に必ず出す** — ロジザード側の表記が変わったら
 そこで気付ける。
+
+## 完了一覧 (`/done`)
+
+中原さん 2026-09-02:「入荷番号のリストが全部チェックされたら一覧を表示させてほしい。
+そのときに期限があるものは期限と数量を一覧にしてほしい。画像とかは要らない。PC からも見れるように」
+
+- **出所は `f_inbound_check_destinations` だけ**。この表は batch_id を FK にしていないので、
+  取込バッチが保持期間で消えたあとも一覧が残る (棚入れ後に見返せないと意味がない)
+- 「完了」= その AR の確認済み行数が、その日にその AR で見た明細数と一致すること。
+  明細数は active バッチの `f_inbound_check_lines` で照合し、消えたバッチの AR は
+  「台帳にある行数 = 完了行数」として扱う (全部確認したから残っている)
+- **期限のある行を先頭に寄せる** (棚入れで先に片付けたいのはそこ)
+- 予定と実数が違う行は色を変える (棚入れ時に「あれ?」となるのを防ぐ)
+- 端末Cookie でもポータルセッションでも見られる。`?ar=AR...` で1伝票だけ、`?all=1` で途中の伝票も
+- 印刷用 CSS つき。CSV は `/done.csv` (同じ絞り込みが効く)
+
+作業画面からの導線は3つ: ①完了した伝票のヘッダの「📋 一覧」 ②全伝票が終わったときの上部バナー
+③フッターの「📋 完了一覧」。
 
 ## 作業者 (名前タップ) = スタッフマスタ
 

@@ -205,5 +205,31 @@ console.log('\n[3] 数量パネル ([数量を数える] で開く)');
   ok(!/data-act="addall"/.test(r3.html), '確定済みでは数量を足せない');
 }
 
+console.log('\n[7] 期限の表示・詳細ボタン・完了一覧への導線 (2026-09-02 中原さん)');
+{
+  // 期限を入れる前は「期限管理」の予告だけ。入れたら**その日付**を出す
+  let r = await renderWith([LINE({ expiry_managed: true })]);
+  ok(/tag exp">📅 期限管理</.test(r.html), '期限管理商品は入力前「📅 期限管理」');
+  ok(!/tag exp-set/.test(r.html), '入力前は日付タグを出さない');
+  r = await renderWith([LINE({ expiry_managed: true, expiry_date: '2027-06-30', check_status: 'checked', found_qty: 106, quantity_relation: 'exact', finalized_result: 'exact' })], { filter: 'all' });
+  ok(/tag exp-set">📅 27\/06\/30</.test(r.html), '入力した有効期限を一覧に出す (YYYY-MM-DD)');
+  r = await renderWith([LINE({ expiry_managed: true, expiry_date: '2027-06', check_status: 'checked', found_qty: 106, quantity_relation: 'exact', finalized_result: 'exact' })], { filter: 'all' });
+  ok(/tag exp-set">📅 2027\/06</.test(r.html), '日が無い商品は年月だけで出す');
+
+  // 詳細を開く印は .act の外 (行の縦中央)。ボタンの下だと親指が届かない
+  r = await renderWith([LINE()]);
+  ok(/<div class="chev-line">詳細▼<\/div>/.test(r.html), '詳細▼ が行に出る');
+  ok(/<\/button><\/div><div class="chev-line">/.test(r.html), '詳細▼ はボタン群 (.act) を閉じた外側に置く');
+  r = await renderWith([LINE()], { open: 'AR1|1|1', mode: 'info' });
+  ok(/<div class="chev-line">詳細▲<\/div>/.test(r.html), '開いているときは 詳細▲');
+
+  // 伝票が終わったら一覧への導線を出す
+  r = await renderWith([LINE({ check_status: 'checked', found_qty: 106, quantity_relation: 'exact', finalized_result: 'exact' })], { filter: 'all' });
+  ok(/slip-done"[^>]*href="\/apps\/inbound-check\/done\?ar=AR1"/.test(r.html), '完了した伝票のヘッダに 📋 一覧 リンクが出る');
+  ok(/all-done[^]*完了一覧を開く/.test(r.html), '全部終わったら上に「完了一覧を開く」を出す');
+  r = await renderWith([LINE()]);
+  ok(!/slip-done/.test(r.html) && !/all-done/.test(r.html), '途中の伝票には一覧リンクを出さない');
+}
+
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;

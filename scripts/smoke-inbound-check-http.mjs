@@ -407,6 +407,43 @@ try {
       await req(J, `${APP}/api/product-flags`, { method: 'POST', body: { code_key: line.code_key, expiry_managed: false, worker_code: '20250901' } });
     }
 
+    console.log('\n[B1e] 完了一覧 (棚入れ・確認用)');
+    {
+      // 中原さん 2026-09-02:「全部チェックされたら一覧を表示。期限があるものは期限と数量。
+      //   画像は要らない。PC からも見れるように」
+      r = await req(J, `${APP}/done`);
+      ok(r.status === 200 && r.text.includes('入荷 完了一覧'), '完了一覧のページが開く');
+      ok(!/<img /.test(r.text), '完了一覧に画像は出さない (棚入れで見たいのは 商品・数量・期限 だけ)');
+      ok(/@media print/.test(r.text), 'PC で印刷できる (印刷用のCSSがある)');
+      r = await req(J, `${APP}/done/`);
+      ok(r.status === 308 && /\/apps\/inbound-check\/done$/.test(r.location || ''), '末尾スラッシュは正規化する');
+
+      r = await req(J, `${APP}/api/done?days=2`);
+      ok(r.status === 200 && r.json.ok && Array.isArray(r.json.slips), '完了一覧の API が返る');
+      ok(r.json.slips.every(s => s.done), '既定では完了した伝票だけ出す');
+      const doneOnly = r.json.slips.length;
+
+      r = await req(J, `${APP}/api/done?days=2&all=1`);
+      ok(r.status === 200 && r.json.slips.length >= doneOnly, 'all=1 で途中の伝票も出せる');
+      const lines = r.json.slips.flatMap(s => s.lines);
+      ok(lines.length >= 1, `確認した明細が一覧に出る (${lines.length}行)`);
+      const withExp = lines.filter(l => l.expiry_date);
+      ok(withExp.length >= 1, `有効期限つきの行が出る (${withExp.length}件)`);
+      ok(lines.every(l => l.product_id && l.planned_qty != null), '商品IDと予定数が入っている');
+      const s0 = r.json.slips.find(s => s.expiry_count > 0);
+      ok(!s0 || !!s0.lines[0].expiry_date, '期限のある行を先頭に寄せる (棚入れで先に片付ける)');
+
+      r = await req(J, `${APP}/done.csv?days=2&all=1`);
+      ok(r.status === 200 && /text\/csv/.test(r.ctype) && r.text.includes('有効期限'), '完了一覧を CSV で出せる (PC で印刷・保管)');
+      ok(r.cacheControl === 'no-store', '完了一覧の CSV はキャッシュさせない');
+
+      // 未認証は見られない (作業画面と同じ扱い)
+      r = await req(null, `${APP}/api/done`);
+      ok(r.status === 401, '未認証は完了一覧の API を見られない');
+      r = await req(null, `${APP}/done`);
+      ok(r.status === 302 && /\/apps\/inbound-check\/enroll/.test(r.location || ''), '未登録端末は登録画面へ');
+    }
+
     console.log('\n[B1d] 商品マスタに無い商品でも現場を止めない');
     {
       // 入庫情報を作れないケース。**確認は通し、行き先は台帳に残す**。
