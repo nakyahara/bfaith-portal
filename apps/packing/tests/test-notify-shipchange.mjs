@@ -72,6 +72,21 @@ console.log('\n── 番号が無くても落ちない ──');
   ok(!/お客様管理番号/.test(received[0]), '番号行だけが消える');
 }
 
+console.log('\n── 📦 ネコポス二枚出し (2026-09-02): 事務のやることが1行目で分かる ──');
+{
+  received.length = 0;
+  await notifyShipChange({
+    ...base, currentMethod: 'ヤマト(ネコポス)', proposedMethod: 'ネコポス二枚出し',
+    slipNo: 'SP00110364189',
+  });
+  const t = received.at(-1);
+  console.log(t.split('\n').map((l) => '   ' + l).join('\n'));
+  ok(/ネコポス二枚出しの依頼/.test(t), '1行目が「二枚出し」の依頼だと分かる');
+  ok(!/配送方法の変更依頼/.test(t), '「配送方法の変更」とは言わない (方法は変わらない)');
+  ok(/2個口/.test(t), '2個口 (送り状2枚) だと書いてある');
+  ok(t.includes('00110364189'), 'お客様管理番号は二枚出しでも載る');
+}
+
 await new Promise((r) => server.close(r));
 console.log(`\n${failed === 0 ? '✅ 全テスト PASS' : `❌ ${failed} 件失敗`}`);
 process.exitCode = failed === 0 ? 0 : 1;

@@ -370,6 +370,7 @@
       repickReadySeqs: Object.entries(state.repickBySlip || {}).filter(([, st]) => st === 'fulfilled').map(([q]) => Number(q)),
       incidents: (state.incidents || []).map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku, actualName: i.actual_name || null, qty: i.qty, slipSeq: i.slip_seq })),
       methodOptions: typeof methodOptions === 'undefined' ? [] : methodOptions,
+      twoLabelsOption: typeof twoLabelsOption === 'undefined' ? null : twoLabelsOption,
       materials: typeof materials === 'undefined' ? null : materials,
       materialOpts: typeof materialOpts === 'undefined' ? null : materialOpts,
       materialUndoSec: typeof materialUndoSec === 'undefined' ? 15 : materialUndoSec,
@@ -1486,16 +1487,28 @@
       if (heldSet.has(viewSeq)) { showToast('この伝票は再ピック保留中です'); return; }
       shipProposed = null;
       const cur = bySeq.get(viewSeq);
-      $('shipMethods').innerHTML = (STATE.methodOptions || [])
+      $('shipMethods').innerHTML = ((STATE.methodOptions || [])
         .filter((m) => m !== cur.deliveryMethod)
         .map((m) => `<button class="reason-opt ship-method" data-m="${esc(m)}">${esc(m)}</button>`).join('')
-        || '<div style="grid-column:1/-1; color:#868e96">候補がありません</div>';
+        || '<div style="grid-column:1/-1; color:#868e96">候補がありません</div>')
+        // 📦 ネコポス二枚出し (中原さん指示 2026-09-02): 配送方法は変えず送り状を2枚に。
+        // 現在ネコポスの伝票が主用途なので deliveryMethod フィルタの外で常に出す
+        + (STATE.twoLabelsOption ? `<button class="reason-opt ship-method" data-m="${esc(STATE.twoLabelsOption)}" style="grid-column:1/-1; background:#fff4e6; border-color:#e8590c">📦📦 ${esc(STATE.twoLabelsOption)} (送り状2枚)</button>` : '');
       $('shipStep1').style.display = 'block';
       $('shipStep2').style.display = 'none';
       $('shipOverlay').style.display = 'flex';
       autoPauseStart();
       document.querySelectorAll('.ship-method').forEach((btn) => {
         btn.addEventListener('click', () => {
+          if (STATE.twoLabelsOption && btn.dataset.m === STATE.twoLabelsOption) {
+            // 二枚出しは理由を聞かずその場で事務へ通知するだけ (中原さん指示 2026-09-02)。
+            // ⑥恒久ルールの確認も出さない (配送方法は変わらないためルール化の対象外)
+            $('shipOverlay').style.display = 'none';
+            enqueue('ship_change', viewSeq, { proposed_method: btn.dataset.m });
+            showToast('事務へネコポス二枚出しを依頼しました。商品と納品書は変更待ちの棚へ置き、「次へ」で完了してください');
+            autoPauseEnd();
+            return;
+          }
           shipProposed = btn.dataset.m;
           $('shipStep1').style.display = 'none';
           $('shipStep2').style.display = 'block';

@@ -27,12 +27,20 @@ export async function notifyShipChange({
   //   ⚠ 接頭辞を機械的に剥がすと、採番が変わったときに「別の番号」を検索キーとして
   //     出してしまう。いま実データで確認できている SP+数字 の形だけを通す
   const kanri = /^SP(\d+)$/i.exec(String(slipNo ?? '').trim())?.[1] ?? null;
+  // ネコポス二枚出し (中原さん指示 2026-09-02): 配送方法は変えず送り状を2枚 (2個口) にする依頼。
+  // 事務のやることが違うので1行目を分ける (値 = service.js SHIP_CHANGE_TWO_LABELS。
+  // import すると単体テストが service の依存を引き込むため文字列で持つ)
+  const twoLabels = proposedMethod === 'ネコポス二枚出し';
   const text = [
-    `🚚 *配送方法の変更依頼* — NE・ロジザードの変更と送り状の再発行をお願いします (現物は変更待ち棚)`,
+    twoLabels
+      ? `📦📦 *ネコポス二枚出しの依頼* — ネコポスの送り状を2枚 (2個口) 発行してください (現物は変更待ち棚)`
+      : `🚚 *配送方法の変更依頼* — NE・ロジザードの変更と送り状の再発行をお願いします (現物は変更待ち棚)`,
     `伝票: *${neSlipNo}* (${folderName || '-'})`,
     ...(kanri ? [`🔎 元の送り状を消すとき: お客様管理番号 *${kanri}* (出荷伝票NO ${slipNo})`] : []),
     ...lines.map((l) => `・${l.name || l.sku} × ${l.qty}個`),
-    `現行: ${currentMethod || '-'} → 提案: *${proposedMethod}*`,
+    twoLabels
+      ? `現行: ${currentMethod || '-'} → *ネコポス 2枚出し (2個口)*`
+      : `現行: ${currentMethod || '-'} → 提案: *${proposedMethod}*`,
     `理由: ${reason} / 依頼: ${worker}`,
   ].join('\n');
   const res = await fetch(url, {
