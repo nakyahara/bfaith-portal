@@ -67,11 +67,15 @@ export function collectUnsent(db, { now = utcNow(), limit = SWEEP_LIMIT, retryOn
     ORDER BY id LIMIT ?`).all(now, limit);
 }
 
-/** カードは作ったが、その後取り消された行 (Notion 側へ「取消」を反映する対象) */
+/**
+ * カードは作ったが、その後取り消された行 (Notion 側へ「取消」を反映する対象)。
+ * ⚠ゲートは取消専用の notion_cancel_next_retry_at。送信側の notion_next_retry_at は見ない —
+ *   送信エラーで永久ブロックした行 (二重カード疑い等) でも「取消」は必ず反映する (Codex R3 High)
+ */
 export function collectCancelPending(db, now = utcNow(), limit = SWEEP_LIMIT) {
   return db.prepare(`SELECT * FROM f_inbound_check_destinations
     WHERE notion_page_id IS NOT NULL AND cancelled_at IS NOT NULL AND notion_cancelled_at IS NULL
-      AND (notion_next_retry_at IS NULL OR notion_next_retry_at <= ?)
+      AND (notion_cancel_next_retry_at IS NULL OR notion_cancel_next_retry_at <= ?)
     ORDER BY id LIMIT ?`).all(now, limit);
 }
 
@@ -84,7 +88,7 @@ export function collectCancelPending(db, now = utcNow(), limit = SWEEP_LIMIT) {
 export function collectOrphanCancelled(db, now = utcNow(), limit = SWEEP_LIMIT) {
   return db.prepare(`SELECT * FROM f_inbound_check_destinations
     WHERE cancelled_at IS NOT NULL AND notion_page_id IS NULL AND notion_cancelled_at IS NULL
-      AND (notion_next_retry_at IS NULL OR notion_next_retry_at <= ?)
+      AND (notion_cancel_next_retry_at IS NULL OR notion_cancel_next_retry_at <= ?)
     ORDER BY id LIMIT ?`).all(now, limit);
 }
 
@@ -228,22 +232,25 @@ function markSendError(db, id, message, permanent) {
 
 function markCancelled(db, id, prevStatus) {
   db.prepare(`UPDATE f_inbound_check_destinations
-    SET notion_cancelled_at = ?, notion_cancelled_prev_status = ?, notion_cancel_error = NULL, notion_next_retry_at = NULL
+    SET notion_cancelled_at = ?, notion_cancelled_prev_status = ?,
+        notion_cancel_error = NULL, notion_cancel_next_retry_at = NULL
     WHERE id = ?`).run(utcNow(), prevStatus || null, id);
 }
 
+// 取消側の失敗は取消専用列に書く (送信側の notion_next_retry_at と混ぜない — Codex R3 High)
 function markCancelError(db, id, message, permanent) {
   const retryAt = permanent ? BLOCKED_UNTIL : new Date(Date.now() + RETRY_DELAY_MS).toISOString();
   db.prepare(`UPDATE f_inbound_check_destinations
-    SET notion_cancel_error = ?, notion_next_retry_at = ?
+    SET notion_cancel_error = ?, notion_cancel_next_retry_at = ?
     WHERE id = ?`).run(String(message).slice(0, 300), retryAt, id);
   return permanent;
 }
 
-/** 管理画面の「再送」: ブロック・再試行待ちを解除する (次の sweep / ボタンで拾われる) */
+/** 管理画面の「再送」: 送信・取消どちらのブロック/再試行待ちも解除する (次の sweep / ボタンで拾われる) */
 export function resetNotionRow(id) {
   return getDB().prepare(`UPDATE f_inbound_check_destinations
-    SET notion_next_retry_at = NULL, notion_error = NULL, notion_cancel_error = NULL
+    SET notion_next_retry_at = NULL, notion_error = NULL,
+        notion_cancel_error = NULL, notion_cancel_next_retry_at = NULL
     WHERE id = ?`).run(Number(id)).changes;
 }
 
@@ -303,7 +310,14 @@ async function createCardSafe(props, dedupeKey) {
 
 /** page_id のあるカードを「取消」へ倒す (取消フェーズ・孤立回収の共通処理) */
 async function convergeCancelledCard(db, rowId, pageId) {
-  const state = await getCardState(pageId);
+  let state;
+  try {
+    state = await getCardState(pageId);
+  } catch (e) {
+    // 404 = ページが完全に削除されている → 有効な作業指示としてはもう見えないので収束
+    if (e.status === 404) { markCancelled(db, rowId, '(カード消失)'); return; }
+    throw e;
+  }
   if (state.archived) {
     // 誰かが Notion 側でアーカイブ済み — もう有効な作業指示として見えないので収束とみなす
     markCancelled(db, rowId, state.status ? `${state.status} (アーカイブ済み)` : '(アーカイブ済み)');
@@ -363,14 +377,32 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
       try {
         if (!row.notion_dedupe_key) { markCancelled(db, row.id, '(カード未作成)'); continue; }
         const found = await findCardsByDedupeKey(row.notion_dedupe_key);
-        if (found.length === 0) { markCancelled(db, row.id, '(カード未作成)'); continue; }
+        if (found.length === 0) {
+          // 検索反映の遅延かもしれない — 3回 (約90分) は空振りを許してから「カード未作成」で終端 (R3 Medium)
+          const attempts = (row.notion_cancel_attempt_count || 0) + 1;
+          if (attempts >= 3) {
+            markCancelled(db, row.id, '(カード未作成)');
+          } else {
+            db.prepare(`UPDATE f_inbound_check_destinations
+              SET notion_cancel_attempt_count = ?, notion_cancel_next_retry_at = ? WHERE id = ?`)
+              .run(attempts, new Date(Date.now() + RETRY_DELAY_MS).toISOString(), row.id);
+          }
+          continue;
+        }
+        // ⭐余分カード (2枚目以降) を**先に**「取消」へ倒す。1枚でも失敗したら throw して
+        //   markCancelError → 行は孤立のまま残り、次の sweep が全カードをやり直す (R3 High)。
+        //   ⚠attachPage を先にすると、失敗時に行が cancelPending 経路 (1枚目だけ見る) へ移って
+        //     余分カードが永久に放置される — テスト[18]で実際に踏んだ順序バグ
+        for (const extra of found.slice(1)) {
+          try {
+            const st = await getCardState(extra.id);
+            if (!st.archived && st.status !== CANCELLED_STATUS) await setCardStatus(extra.id, CANCELLED_STATUS);
+          } catch (e2) {
+            if (e2.status !== 404) throw e2;   // 404 = 消えている → それで良い
+          }
+        }
         attachPage(db, row.id, found[0].id, null);
         await convergeCancelledCard(db, row.id, found[0].id);
-        // 万一 複数枚あれば全部「取消」に倒す (取消済みの指示を1枚も有効に見せない)
-        for (const extra of found.slice(1)) {
-          try { await setCardStatus(extra.id, CANCELLED_STATUS); }
-          catch (e2) { console.warn(`[inbound-check notion] 余分カードの取消失敗 ${extra.id}: ${e2.message}`); }
-        }
         summary.cancelled++;
       } catch (e) {
         summary.errors++;
@@ -503,10 +535,11 @@ export function notionStatusForAdmin() {
       AND (notion_next_retry_at IS NULL OR notion_next_retry_at <= ?)`, now);
   // 「再試行待ち (一時エラー・自動で再試行される)」と「要対応 (4xx・再送ボタンが必要)」は別物 (Codex R1 #10)
   const waitingRetry = one(`SELECT COUNT(*) n FROM f_inbound_check_destinations
-    WHERE notion_next_retry_at IS NOT NULL AND notion_next_retry_at > ? AND notion_next_retry_at < '9999'`, now);
+    WHERE (notion_next_retry_at IS NOT NULL AND notion_next_retry_at > ? AND notion_next_retry_at < '9999')
+       OR (notion_cancel_next_retry_at IS NOT NULL AND notion_cancel_next_retry_at > ? AND notion_cancel_next_retry_at < '9999')`, now, now);
   const blocked = db.prepare(`SELECT id, product_id, product_name, notion_error, notion_cancel_error
     FROM f_inbound_check_destinations
-    WHERE notion_next_retry_at >= '9999'
+    WHERE notion_next_retry_at >= '9999' OR notion_cancel_next_retry_at >= '9999'
     ORDER BY id DESC LIMIT 10`).all();
   const cancelPending = one(`SELECT COUNT(*) n FROM f_inbound_check_destinations
     WHERE cancelled_at IS NOT NULL AND notion_cancelled_at IS NULL

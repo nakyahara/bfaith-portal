@@ -338,6 +338,11 @@ function migrateQuantity(db) {
   // 回収用の永続ランダムキー (カードの「台帳キー」プロパティと対)。行IDは DB 作り直しで
   // 振り直されるため回収キーにしない (Codex R1 #8)。カード作成の**前に**保存される
   addCol(db, 'f_inbound_check_destinations', 'notion_dedupe_key', 'TEXT');
+  // 取消反映の再試行は送信側 (notion_next_retry_at) と**別の列**で制御する。
+  // 共用すると、送信エラーで永久ブロックした行の「取消」まで巻き込まれ、
+  // 取消済みの作業指示が Notion に有効なまま残る (Codex R3 High)
+  addCol(db, 'f_inbound_check_destinations', 'notion_cancel_next_retry_at', 'TEXT');
+  addCol(db, 'f_inbound_check_destinations', 'notion_cancel_attempt_count', 'INTEGER');
 
   if (!added) return;   // ここから先は列を足した初回だけ
 

@@ -45,8 +45,10 @@ const mock = {
   },
   queryResults: new Map(),   // `${property}:${value}` → page
   pageStates: new Map(),     // pageId → { archived, status }
-  failCreate: null,          // { status } 次の POST /pages を1回失敗させる
+  failCreate: null,          // { status, times } POST /pages を times 回失敗させる
   onCreate: null,            // POST /pages の直前に呼ぶフック (レース再現用)
+  failPatch: null,           // { id, status, times } 特定ページの PATCH を失敗させる
+  missingPages: new Set(),   // GET /pages/:id を 404 にする (削除済みページの再現)
   created: [],
   patchedPages: [],
   patchedDb: [],
@@ -88,10 +90,17 @@ global.fetch = async (url, opts = {}) => {
   }
   const mPage = u.match(/\/pages\/([^/?]+)$/);
   if (mPage && method === 'GET') {
+    if (mock.missingPages.has(mPage[1])) return respond(404, { object: 'error', message: 'Could not find page', code: 'object_not_found' });
     const st = mock.pageStates.get(mPage[1]) || { archived: false, status: null };
     return respond(200, { object: 'page', id: mPage[1], archived: st.archived, properties: { 'ステータス': { select: st.status ? { name: st.status } : null } } });
   }
   if (mPage && method === 'PATCH') {
+    if (mock.failPatch && mock.failPatch.id === mPage[1]) {
+      const f = mock.failPatch;
+      f.times = (f.times ?? 1) - 1;
+      if (f.times <= 0) mock.failPatch = null;
+      return respond(f.status, { object: 'error', message: 'mock patch fail ' + f.status, code: 'mock' });
+    }
     mock.patchedPages.push({ id: mPage[1], body });
     const st = mock.pageStates.get(mPage[1]) || { archived: false, status: null };
     if (body.properties?.['ステータス']?.select?.name) st.status = body.properties['ステータス'].select.name;
@@ -364,6 +373,11 @@ console.log('\n[15] [R2 High1] 同じ台帳キーのカードが複数 → 要�
   ok(String(row.notion_error).includes('2 枚'), 'エラーに枚数が出る');
   ok(String(row.notion_next_retry_at).startsWith('9999-'), '人が整理するまで自動では触らない');
   ok(notionStatusForAdmin().blocked.some(b => b.id === dB), '管理画面のエラー一覧に出る');
+  // 送信側の永久ブロック (9999) 中でも「取消」は通る (R3 High: 送信と取消の制御列を分離)
+  cancelDest(dB, 'reopen');
+  const r2 = await runNotionSweep({ actor: 'test' });
+  ok(r2.cancelled >= 1 && !!destRow(dB).notion_cancelled_at, '送信ブロック中でも取消は反映される');
+  ok(mock.pageStates.get('pgA').status === '取消', 'カード (pgA) は取消になる');
 }
 
 console.log('\n[16] [R2 High2] 他プロセスが lease を持っていたら実行しない');
@@ -376,7 +390,52 @@ console.log('\n[16] [R2 High2] 他プロセスが lease を持っていたら実
   db.prepare('DELETE FROM f_inbound_check_notion_lease').run();
 }
 
-console.log('\n[17] 冪等: もう一度回しても何もしない');
+console.log('\n[17] [R3 Medium] 孤立検索の空振りは3回まで再試行してから終端');
+{
+  const dC = seedDest({ name: '商品A検索遅延' });
+  db.prepare("UPDATE f_inbound_check_destinations SET notion_dedupe_key = 'd888-lag' WHERE id = ?").run(dC);
+  cancelDest(dC, 'reopen');
+  const clearGate = () => db.prepare('UPDATE f_inbound_check_destinations SET notion_cancel_next_retry_at = NULL WHERE id = ?').run(dC);
+  await runNotionSweep({ actor: 'test' });
+  let row = destRow(dC);
+  ok(!row.notion_cancelled_at && row.notion_cancel_attempt_count === 1, '1回目の空振りでは終端しない (検索遅延に備える)');
+  clearGate(); await runNotionSweep({ actor: 'test' });
+  clearGate(); await runNotionSweep({ actor: 'test' });
+  row = destRow(dC);
+  ok(!!row.notion_cancelled_at && row.notion_cancelled_prev_status === '(カード未作成)', '3回空振りで「カード未作成」終端');
+}
+
+console.log('\n[18] [R3 High] 孤立回収: 余分カードの取消に失敗したら終端しない');
+{
+  const dD = seedDest({ name: '商品A多重孤立' });
+  db.prepare("UPDATE f_inbound_check_destinations SET notion_dedupe_key = 'd444-multi' WHERE id = ?").run(dD);
+  mock.pageStates.set('pgC', { archived: false, status: '未着手' });
+  mock.pageStates.set('pgD', { archived: false, status: '未着手' });
+  mock.queryResults.set('台帳キー:d444-multi', [{ id: 'pgC' }, { id: 'pgD' }]);
+  mock.failPatch = { id: 'pgD', status: 500, times: 3 };
+  cancelDest(dD, 'reopen');
+  const r = await runNotionSweep({ actor: 'test' });
+  let row = destRow(dD);
+  ok(r.errors >= 1 && !row.notion_cancelled_at && !!row.notion_cancel_error, '失敗を握り潰さず未終端のまま残す');
+  resetNotionRow(dD);
+  const r2 = await runNotionSweep({ actor: 'test' });
+  row = destRow(dD);
+  ok(r2.ok && !!row.notion_cancelled_at, '次の sweep で続きからやり直して終端');
+  ok(mock.pageStates.get('pgC').status === '取消' && mock.pageStates.get('pgD').status === '取消', '2枚とも「取消」になる');
+}
+
+console.log('\n[19] 取消対象のカードが削除済み (404) なら「カード消失」で収束');
+{
+  const dE = seedDest({ name: '商品A消失' });
+  const rSend = await runNotionSweep({ actor: 'test' });
+  ok(rSend.ok && !!destRow(dE).notion_page_id, '先に普通に送る');
+  mock.missingPages.add(destRow(dE).notion_page_id);
+  cancelDest(dE, 'reopen');
+  const r = await runNotionSweep({ actor: 'test' });
+  ok(r.ok && destRow(dE).notion_cancelled_prev_status === '(カード消失)', '404 は「カード消失」で終端 (エラーにしない)');
+}
+
+console.log('\n[20] 冪等: もう一度回しても何もしない');
 {
   const before = { created: mock.created.length, patched: mock.patchedPages.length };
   const r = await runNotionSweep({ actor: 'test' });
