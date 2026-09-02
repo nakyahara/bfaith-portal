@@ -59,13 +59,17 @@ export function createTables(db = getMirrorDB()) {
       value TEXT
     );
 
-    -- いろは名簿 (利用者/職員)。⭐staff.db とは別 (冒頭コメント参照)
+    -- いろは名簿 (利用者/職員)。⭐staff.db とは別 (冒頭コメント参照)。
+    -- pin_hash/pin_salt = 職員PIN (棚入完了の変更などの職員限定操作の本人確認。Codex PR1 #1:
+    -- worker_id は画面で自由に選べる自己申告なので、それだけで職員権限にしない)
     CREATE TABLE IF NOT EXISTS f_iroha_workers (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
       display_name TEXT NOT NULL,
       worker_type  TEXT NOT NULL CHECK (worker_type IN ('member','staff')),
       active       INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
       sort_order   INTEGER NOT NULL DEFAULT 0,
+      pin_hash     TEXT,
+      pin_salt     TEXT,
       created_at   TEXT NOT NULL,
       created_by   TEXT
     );
@@ -169,7 +173,9 @@ export function setMetaValue(key, value) { setMeta(getDB(), key, value); }
 // ───────────────────────── 作業者 (いろは名簿) ─────────────────────────
 
 export function listIrohaWorkers(includeInactive = false) {
-  return getDB().prepare(`SELECT id, display_name, worker_type, active, sort_order
+  // pin_set は「設定済みかどうか」のフラグだけ (ハッシュは出さない)
+  return getDB().prepare(`SELECT id, display_name, worker_type, active, sort_order,
+      (pin_hash IS NOT NULL) AS pin_set
     FROM f_iroha_workers ${includeInactive ? '' : 'WHERE active = 1'}
     ORDER BY sort_order, id`).all();
 }
@@ -198,6 +204,50 @@ export function setIrohaWorkerActive(id, active) {
   return getDB().prepare('UPDATE f_iroha_workers SET active = ? WHERE id = ?')
     .run(active ? 1 : 0, Number(id)).changes > 0;
 }
+
+// ── 職員PIN (職員限定操作の本人確認。worker_id の自己申告を信用しない — Codex PR1 #1) ──
+
+const pinHash = (salt, pin) => crypto.createHash('sha256').update(`${salt}:${pin}`).digest('hex');
+
+export function setWorkerPin(id, pin, actor) {
+  const p = String(pin || '').trim();
+  if (!/^\d{4,8}$/.test(p)) return { ok: false, error: 'bad_pin', message: 'PINは4〜8桁の数字で設定してください' };
+  const w = getIrohaWorker(id);
+  if (!w) return { ok: false, error: 'not_found', message: '作業者が見つかりません' };
+  if (w.worker_type !== 'staff') return { ok: false, error: 'not_staff', message: 'PINを設定できるのは職員だけです' };
+  const salt = crypto.randomBytes(8).toString('hex');
+  getDB().prepare('UPDATE f_iroha_workers SET pin_hash = ?, pin_salt = ? WHERE id = ?')
+    .run(pinHash(salt, p), salt, Number(id));
+  logEvent({ action: 'pin_set', workerId: w.id, workerName: w.display_name, deviceLabel: actor || null, ok: true });
+  return { ok: true };
+}
+
+/**
+ * PIN 照合 (連続失敗はプロセス内で 10分/5回 に制限 — 総当たり対策)。
+ * @returns {ok:true} | {ok:false, error:'pin_required'|'pin_invalid'|'pin_locked'}
+ */
+const pinFails = new Map();   // workerId → [failedAtMs...]
+export function verifyWorkerPin(id, pin) {
+  const row = getDB().prepare('SELECT id, pin_hash, pin_salt FROM f_iroha_workers WHERE id = ?').get(Number(id));
+  if (!row || !row.pin_hash) return { ok: false, error: 'pin_required', message: 'この職員にはPINが未設定です (管理画面で設定してください)' };
+  const now = Date.now();
+  const fails = (pinFails.get(row.id) || []).filter(t => now - t < 10 * 60 * 1000);
+  if (fails.length >= 5) {
+    pinFails.set(row.id, fails);
+    return { ok: false, error: 'pin_locked', message: 'PINの間違いが続いたため一時的にロックしました。10分ほど待ってください' };
+  }
+  const p = String(pin || '').trim();
+  if (!p || pinHash(row.pin_salt, p) !== row.pin_hash) {
+    fails.push(now);
+    pinFails.set(row.id, fails);
+    return { ok: false, error: p ? 'pin_invalid' : 'pin_required', message: p ? 'PINが違います' : '職員のPINを入れてください' };
+  }
+  pinFails.delete(row.id);
+  return { ok: true };
+}
+
+/** テスト用: PIN 失敗カウンタを消す */
+export function _clearPinFails() { pinFails.clear(); }
 
 // ───────────────────────── 操作履歴 ─────────────────────────
 

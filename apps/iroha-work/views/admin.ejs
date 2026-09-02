@@ -79,20 +79,27 @@
       </div>
       <% } %>
       <table class="iw-list">
-        <tr><th>表示名</th><th>区分</th><th>状態</th><% if (isAdmin) { %><th></th><% } %></tr>
+        <tr><th>表示名</th><th>区分</th><th>PIN</th><th>状態</th><% if (isAdmin) { %><th></th><% } %></tr>
         <% for (const w of workers) { %>
           <tr class="<%= w.active ? '' : 'inactive' %>">
             <td><%= w.display_name %></td>
             <td><%= w.worker_type === 'staff' ? '職員' : '利用者' %></td>
+            <td><% if (w.worker_type === 'staff') { %><%= w.pin_set ? '設定済み' : '未設定' %><% } else { %>-<% } %></td>
             <td><%= w.active ? '有効' : '無効' %></td>
             <% if (isAdmin) { %>
-              <td><button class="btn-sm" onclick="toggleWorker(<%= w.id %>, <%= w.active ? 'false' : 'true' %>)">
+              <td>
+                <% if (w.worker_type === 'staff') { %>
+                  <button class="btn-sm" onclick="setPin(<%= w.id %>)"><%= w.pin_set ? 'PIN再設定' : 'PIN設定' %></button>
+                <% } %>
+                <button class="btn-sm" onclick="toggleWorker(<%= w.id %>, <%= w.active ? 'false' : 'true' %>)">
                 <%= w.active ? '無効にする' : '戻す' %></button></td>
             <% } %>
           </tr>
         <% } %>
-        <% if (workers.length === 0) { %><tr><td colspan="4">まだ登録されていません</td></tr><% } %>
+        <% if (workers.length === 0) { %><tr><td colspan="5">まだ登録されていません</td></tr><% } %>
       </table>
+      <p class="hint" style="margin-top:8px">職員には <b>PIN (4〜8桁の数字)</b> を設定してください。iPad で「棚入完了」に変えるときの本人確認に使います
+        (名前は誰でも選べるため、PINが無いと職員限定の操作ができません)。</p>
     </div>
 
     <% if (isAdmin) { %>
@@ -171,6 +178,13 @@
       const { json } = await post('/admin/workers/' + id + '/active', { active });
       if (json.ok) location.reload();
       else alert(json.message || '変更できませんでした');
+    }
+    async function setPin(id) {
+      const pin = prompt('この職員のPIN (4〜8桁の数字) を入力してください');
+      if (pin == null) return;
+      const { json } = await post('/admin/workers/' + id + '/pin', { pin: pin.trim() });
+      if (json.ok) { alert('PINを設定しました'); location.reload(); }
+      else alert(json.message || '設定できませんでした');
     }
     async function issueCode() {
       const label = document.getElementById('ecLabel').value.trim();

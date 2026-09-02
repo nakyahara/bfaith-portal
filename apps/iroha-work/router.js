@@ -19,6 +19,7 @@ import {
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
   listIrohaWorkers, getIrohaWorker, addIrohaWorker, setIrohaWorkerActive,
+  setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
 } from './db.js';
 import { ensureFresh, changeStatus, cacheStatsForAdmin, STATUSES } from './notion-read.js';
@@ -195,11 +196,22 @@ function resolveWorker(req) {
   return { worker: w };
 }
 
-const STATUS_HTTP = { conflict: 409, card_gone: 404, staff_required: 403, bad_status: 400, notion_error: 502, verify_failed: 502 };
+const STATUS_HTTP = {
+  conflict: 409, card_gone: 404, staff_required: 403, bad_status: 400, bad_request: 400,
+  notion_error: 502, verify_failed: 502, schema_mismatch: 502,
+  pin_required: 403, pin_invalid: 403, pin_locked: 429,
+};
 
 /**
  * ステータス変更 (一覧のステータス札 → ダイアログから)。
  * 変更直前の再取得・競合検出・反映確認は notion-read.changeStatus が行う。
+ *
+ * 職員限定の変更 (棚入完了への変更・取り消し) の本人確認 (Codex PR1 #1):
+ *   worker_id は画面で自由に選べる自己申告なので、それだけで職員扱いしない。
+ *   ①ポータルセッション = ログイン済みの B-Faith 側 → そのまま職員扱い
+ *   ②端末Cookie = 職員の worker_id + その職員の PIN が合ったときだけ職員扱い
+ *   リクエスト時点で職員操作と分からなくても (expect が古い等)、changeStatus が実状態で
+ *   ゲートを判定する — PIN 未確認なら isStaff=false のままなので素通りしない。
  * 成否とも操作履歴 (f_iroha_app_events) に残す (Codex R2「操作履歴」)
  */
 router.post('/api/status', checkOrigin, api(async (req, res) => {
@@ -210,14 +222,34 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
   const expect = req.body?.expect == null ? null : String(req.body.expect);
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
 
-  const r = await changeStatus({ pageId, to, expect, isStaff: w.worker.worker_type === 'staff' });
-  logEvent({
-    action: 'status_change', pageId,
-    workerId: w.worker.id, workerName: w.worker.display_name,
-    deviceLabel: req.iwDevice ? req.iwDevice.label : (req.iwUser ? `session:${req.iwUser}` : null),
-    from: expect, to,
-    ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}`,
-  });
+  // 職員としての本人確認。PIN はリクエストが職員限定操作 (棚入完了が絡む) のときだけ要求する
+  let isStaff = false;
+  if (hasSessionAccess(req)) {
+    isStaff = true;
+  } else if (w.worker.worker_type === 'staff') {
+    const gatedReq = to === '棚入完了' || expect === '棚入完了';
+    if (gatedReq) {
+      const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
+      if (!pinCheck.ok) {
+        return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
+      }
+      isStaff = true;
+    }
+  }
+
+  const r = await changeStatus({ pageId, to, expect, isStaff });
+  // 監査ログの失敗で Notion 更新済みの結果を「失敗」に見せない (Codex PR1 #6)
+  try {
+    logEvent({
+      action: 'status_change', pageId,
+      workerId: w.worker.id, workerName: w.worker.display_name,
+      deviceLabel: req.iwDevice ? req.iwDevice.label : (req.iwUser ? `session:${req.iwUser}` : null),
+      from: expect, to,
+      ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}`,
+    });
+  } catch (e) {
+    console.error('[iroha-work] 操作履歴の記録に失敗 (結果はそのまま返す)', e);
+  }
   if (!r.ok) return res.status(STATUS_HTTP[r.error] || 400).json(r);
   res.json(r);
 }));
@@ -285,6 +317,12 @@ router.post('/admin/workers/:id(\\d+)/active', checkOrigin, requireAdmin, api((r
   if (typeof req.body?.active !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_request', message: 'active (true/false) が必要です' });
   if (!setIrohaWorkerActive(Number(req.params.id), req.body.active)) return res.status(404).json({ ok: false, error: 'not_found', message: '作業者が見つかりません' });
   res.json({ ok: true });
+}));
+
+// 職員PIN の設定・再設定 (管理者のみ。PIN は保存せずハッシュのみ)
+router.post('/admin/workers/:id(\\d+)/pin', checkOrigin, requireAdmin, api((req, res) => {
+  const r = setWorkerPin(Number(req.params.id), req.body?.pin, req.session.email);
+  res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 400)).json(r);
 }));
 
 export default router;

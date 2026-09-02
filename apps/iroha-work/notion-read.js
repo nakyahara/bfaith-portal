@@ -6,10 +6,21 @@
  *   - ステータス変更 = 変更直前に再取得して競合を見てから PATCH → 応答で反映を確認
  *     (Notion に原子的な比較更新は無い。Codex設計相談R2 §2「Notionステータス変更」)
  *
+ * 整合性まわり (Codex PR1 レビューで固めた点):
+ *   - 変更はページ単位の in-process mutex で直列化 (Render 単一インスタンス前提)。
+ *     同じ expect からの同時変更は、後の方が競合として正しく弾かれる (#3)。
+ *     ⚠Notion を直接編集する人との競合までは防げない — それは expect 比較が検出する
+ *   - 全体取得中にアプリ経由で変えたステータスは recentChanges で覚えておき、
+ *     取得開始より後の変更はキャッシュ全置換後に上書きし直す (古い取得結果で巻き戻さない #3)
+ *   - ページング上限で取り切れなかったときはキャッシュを**置き換えない** (部分データで
+ *     見えていたカードを消さない #4)。truncated を出して古い完全キャッシュを維持する
+ *   - スキーマは inbound-check の ensureCardSchema で検証 (ステータス=select 型など。
+ *     人が status 型に作り替えたら黙って 400 を撒かず 1回で止まる #5)
+ *
  * HTTP 層は inbound-check の notionRequest を共用 (同じインテグレーション・同じ DB。
  * INBOUND_CHECK_NOTION_DB_ID がこの DB の ID)。
  */
-import { notionRequest, isNotionConfigured } from '../inbound-check/notion.js';
+import { notionRequest, isNotionConfigured, ensureCardSchema } from '../inbound-check/notion.js';
 import { getDB, replaceCache, listCache, updateCacheStatus, removeCachePage, getMeta, setMetaValue } from './db.js';
 
 export { isNotionConfigured };
@@ -23,7 +34,7 @@ const STATUS_PROP = 'ステータス';
 export const DONE_WINDOW_DAYS = 14;
 // キャッシュの鮮度。これより古ければ /api/state が自動で取り直す
 export const CACHE_FRESH_MS = 3 * 60 * 1000;
-// ページング上限 (暴走ガード。超えたら打ち切りを meta に残して画面へ出す — 黙って欠けさせない)
+// ページング上限 (暴走ガード。超えたら取得を諦めて古い完全キャッシュを守る — 黙って欠けさせない)
 const MAX_PAGES_ACTIVE = 10;   // 未完了カード 最大1000枚
 const MAX_PAGES_DONE = 5;      // 直近の棚入完了 最大500枚
 
@@ -35,7 +46,7 @@ function dbId() {
 
 const plain = (arr) => (Array.isArray(arr) ? arr.map(t => t?.plain_text ?? t?.text?.content ?? '').join('') : '');
 
-/** プロパティ1つを型に応じて素の値へ (未知の型は null)。ステータスは select / status 両対応 */
+/** プロパティ1つを型に応じて素の値へ (未知の型は null)。読み取りは select / status 両対応 */
 function propValue(p) {
   if (!p || typeof p !== 'object') return null;
   switch (p.type) {
@@ -87,20 +98,28 @@ async function queryPages(filter, maxPages) {
   return { results, truncated: true };
 }
 
+// 取得中にアプリ経由で変えたステータス (pageId → { status, at })。
+// 全置換が古い取得結果で変更を巻き戻さないための覚え書き (Codex PR1 #3)
+const recentChanges = new Map();
+
 /**
  * カード一覧を Notion から取得してキャッシュを全置換する。
  *   ①未完了 (棚入完了・取消以外) は**全件** — 何ヶ月放置の未着手も消さない
  *   ②棚入完了は直近 DONE_WINDOW_DAYS 日に編集されたものだけ
  * アーカイブ済みページは query に元々返らない。
+ * 取り切れなかった (truncated) ときは置き換えず、古い完全キャッシュを守る。
  */
 export async function refreshFromNotion() {
+  // スキーマ検証 (10分キャッシュ)。ステータスが select 型でなくなった等は 1回のエラーで止める
+  await ensureCardSchema();
+  const startedAt = Date.now();
   const activeFilter = {
     and: [
       { property: STATUS_PROP, select: { does_not_equal: STATUS_DONE } },
       { property: STATUS_PROP, select: { does_not_equal: STATUS_CANCELLED } },
     ],
   };
-  const doneSince = new Date(Date.now() - DONE_WINDOW_DAYS * 24 * 3600 * 1000).toISOString();
+  const doneSince = new Date(startedAt - DONE_WINDOW_DAYS * 24 * 3600 * 1000).toISOString();
   const doneFilter = {
     and: [
       { property: STATUS_PROP, select: { equals: STATUS_DONE } },
@@ -109,6 +128,11 @@ export async function refreshFromNotion() {
   };
   const a = await queryPages(activeFilter, MAX_PAGES_ACTIVE);
   const b = await queryPages(doneFilter, MAX_PAGES_DONE);
+  if (a.truncated || b.truncated) {
+    setMetaValue('truncated', '1');
+    console.warn(`[iroha-work] Notion 取得がページ上限で打ち切り → キャッシュは置き換えない (未完了${a.results.length}件/完了${b.results.length}件)`);
+    return { count: null, truncated: true };
+  }
   const seen = new Set();
   const pages = [];
   for (const page of [...a.results, ...b.results]) {
@@ -117,10 +141,14 @@ export async function refreshFromNotion() {
     pages.push(parsePage(page));
   }
   replaceCache(pages);
-  const truncated = a.truncated || b.truncated;
-  setMetaValue('truncated', truncated ? '1' : null);
-  if (truncated) console.warn(`[iroha-work] Notion 取得がページ上限で打ち切り (未完了${a.results.length}件/完了${b.results.length}件)`);
-  return { count: pages.length, truncated };
+  // 取得開始より後にアプリで変えたステータスは、置換結果 (古い) より新しい → 上書きし直す。
+  // 取得開始より前の変更は Notion 側の取得結果に含まれているので覚え書きを消す
+  for (const [pageId, ch] of recentChanges) {
+    if (ch.at >= startedAt) updateCacheStatus(pageId, ch.status, null);
+    else recentChanges.delete(pageId);
+  }
+  setMetaValue('truncated', null);
+  return { count: pages.length, truncated: false };
 }
 
 // 同時に何度も取りに行かない (画面を2枚開いた・連打などで API を連打しない)
@@ -128,7 +156,9 @@ let inflight = null;
 
 /**
  * 必要ならキャッシュを更新して結果を返す。
- * 失敗してもキャッシュは残す (古い一覧 + エラー表示で現場を止めない — Codex R2 ①)
+ * 失敗してもキャッシュは残す (古い一覧 + エラー表示で現場を止めない — Codex R2 ①)。
+ * 鮮度の判定は「最後に試みた時刻」(last_attempt_at) — 失敗やカード超過のたびに
+ * 全アクセスが Notion を叩き直さないようにする。表示用の last_refresh_at とは別
  * @returns {{ fresh: boolean, error: string|null, lastRefreshAt: string|null, truncated: boolean }}
  */
 export async function ensureFresh({ force = false } = {}) {
@@ -140,36 +170,62 @@ export async function ensureFresh({ force = false } = {}) {
   if (!isNotionConfigured()) {
     return { fresh: false, ...status(), error: 'Notion 連携が未設定です (NOTION_TOKEN / INBOUND_CHECK_NOTION_DB_ID)' };
   }
-  const last = getMeta('last_refresh_at');
-  if (!force && last && Date.now() - Date.parse(last) < CACHE_FRESH_MS) {
-    return { fresh: true, ...status() };
+  const attempted = getMeta('last_attempt_at');
+  if (!force && attempted && Date.now() - Date.parse(attempted) < CACHE_FRESH_MS) {
+    return { fresh: !status().error, ...status() };
   }
   if (!inflight) {
     inflight = refreshFromNotion()
-      .then(() => ({ ok: true }))
+      .then((r) => {
+        setMetaValue('last_refresh_error', null);
+        return { ok: !r.truncated };
+      })
       .catch((e) => {
         setMetaValue('last_refresh_error', e.message);
         return { ok: false, message: e.message };
       })
-      .finally(() => { inflight = null; });
+      .finally(() => {
+        setMetaValue('last_attempt_at', new Date().toISOString());
+        inflight = null;
+      });
   }
   const r = await inflight;
-  return { fresh: r.ok, ...status(), ...(r.ok ? { error: null } : { error: r.message }) };
+  return { fresh: r.ok, ...status(), ...(r.ok ? { error: null } : {}) };
 }
 
 // ─── ステータス変更 (一覧・詳細から) ───
+
+// ページ単位の直列化 (Codex PR1 #3)。チェーンが終わったらエントリを掃除する
+const pageLocks = new Map();
+function withPageLock(pageId, fn) {
+  const prev = pageLocks.get(pageId) || Promise.resolve();
+  const run = prev.then(() => fn());
+  const tail = run.then(() => {}, () => {});
+  pageLocks.set(pageId, tail);
+  tail.then(() => { if (pageLocks.get(pageId) === tail) pageLocks.delete(pageId); });
+  return run;
+}
 
 /**
  * ステータスを変える。手順 (Codex R2 §2):
  *   ①直前にページを再取得 → 消えていれば card_gone / 今の値が expect と違えば conflict
  *   ②PATCH (select は存在しない選択肢名でも Notion が自動作成する)
  *   ③応答のステータスが to になっているか確認 (HTTP 成功だけを成功と見なさない)
- * 棚入完了への変更・棚入完了からの変更は職員のみ (要件定義 §1.7 ⑤)。
+ * expect は必須 (省略で競合検出を素通りさせない — Codex PR1 #2)。
+ * 棚入完了への変更・棚入完了からの変更は職員のみ (要件定義 §1.7 ⑤)。isStaff の真偽は
+ * 呼び元 (router) が本人確認 (ポータルセッション or 職員PIN) 済みの場合だけ true にする。
  *
  * @returns {ok:true, status} | {ok:false, error, message, current?}
  */
-export async function changeStatus({ pageId, to, expect, isStaff = false }) {
+export function changeStatus({ pageId, to, expect, isStaff = false }) {
+  return withPageLock(pageId, () => changeStatusLocked({ pageId, to, expect, isStaff }));
+}
+
+async function changeStatusLocked({ pageId, to, expect, isStaff }) {
   if (!STATUSES.includes(to)) return { ok: false, error: 'bad_status', message: '変更先のステータスが不正です' };
+  if (!expect || typeof expect !== 'string') {
+    return { ok: false, error: 'bad_request', message: '変更前のステータス (expect) が必要です。画面を更新してからやり直してください' };
+  }
 
   let page;
   try {
@@ -185,20 +241,25 @@ export async function changeStatus({ pageId, to, expect, isStaff = false }) {
     removeCachePage(pageId);
     return { ok: false, error: 'card_gone', message: 'このカードは Notion 側でアーカイブされています。一覧を更新します' };
   }
-  const current = propValue(page.properties?.[STATUS_PROP]) || STATUSES[0];
+  const stProp = page.properties?.[STATUS_PROP];
+  if (stProp && stProp.type !== 'select') {
+    return { ok: false, error: 'schema_mismatch',
+      message: `Notion の「${STATUS_PROP}」プロパティが select 型ではありません (${stProp.type})。管理者に連絡してください` };
+  }
+  const current = propValue(stProp) || STATUSES[0];
   if (current === to) {
     // もう目的の状態 (他の端末で同じ変更が済んでいた)。エラーにしない
     updateCacheStatus(pageId, current, page.last_edited_time);
     return { ok: true, status: current, already: true };
   }
-  if (expect != null && current !== expect) {
+  if (current !== expect) {
     updateCacheStatus(pageId, current, page.last_edited_time);
     return { ok: false, error: 'conflict', current,
       message: `Notion 側で「${current}」に変更されています。最新の状態を表示します` };
   }
   if ((to === STATUS_DONE || current === STATUS_DONE) && !isStaff) {
     return { ok: false, error: 'staff_required',
-      message: `「${STATUS_DONE}」への変更・取り消しは職員の方が行ってください (作業者の選択を職員に切り替えてから)` };
+      message: `「${STATUS_DONE}」への変更・取り消しは職員のみです (職員の名前を選び、PINを入れてください)` };
   }
 
   let updated;
@@ -215,6 +276,7 @@ export async function changeStatus({ pageId, to, expect, isStaff = false }) {
       message: '変更を送りましたが、Notion 側の値が確認できませんでした。一覧を更新して確かめてください' };
   }
   updateCacheStatus(pageId, to, updated.last_edited_time);
+  recentChanges.set(pageId, { status: to, at: Date.now() });
   return { ok: true, status: to };
 }
 

@@ -41,6 +41,16 @@ const mock = {
   patchStatusOverride: null,   // PATCH 応答のステータスを差し替え (verify_failed 再現)
   missingPages: new Set(),
   failQuery: null,      // { status } query を失敗させる
+  onQuery: null,        // query 応答の直前に1回呼ぶフック (取得中の変更レース再現用)
+  // ensureCardSchema 用の DB スキーマ (実DBと同じ型。inbound-check テストと同じ)
+  dbProps: {
+    '名前': { type: 'title' }, 'ステータス': { type: 'select' }, '商品コード': { type: 'rich_text' },
+    '数量': { type: 'number' }, '入庫日': { type: 'date' }, '入荷管理番号': { type: 'rich_text' },
+    'バーコード': { type: 'rich_text' }, '取引先': { type: 'select' }, '仕入先': { type: 'number' },
+    '取扱区分': { type: 'select' }, '作業拠点': { type: 'select' },
+    '過去30日販売数': { type: 'rich_text' }, '外部出し目安': { type: 'rich_text' }, '入数': { type: 'number' },
+    '資材セットID': { type: 'select' }, '収納容器': { type: 'select' }, '備考': { type: 'rich_text' },
+  },
 };
 
 function sel(name) { return name == null ? { type: 'select', select: null } : { type: 'select', select: { name } }; }
@@ -73,16 +83,28 @@ global.fetch = async (url, opts = {}) => {
   const u = String(url);
   const respond = (status, obj) => ({ ok: status < 300, status, headers: { get: () => null }, json: async () => obj });
 
+  if (u.endsWith('/databases/testdb') && method === 'GET') {
+    return respond(200, { object: 'database', properties: JSON.parse(JSON.stringify(mock.dbProps)) });
+  }
+  if (u.endsWith('/databases/testdb') && method === 'PATCH') {
+    for (const [k, cfg] of Object.entries(body.properties || {})) mock.dbProps[k] = { type: Object.keys(cfg)[0] };
+    return respond(200, { object: 'database' });
+  }
   if (u.endsWith('/databases/testdb/query') && method === 'POST') {
     mock.queryCalls++;
     mock.lastFilters.push(body?.filter || null);
     if (mock.failQuery) return respond(mock.failQuery.status, { object: 'error', message: 'query failed' });
+    // レース再現: 応答内容を先にスナップショットしてからフックを走らせる
+    // (「取得はもう始まっていたのに、その間にアプリでステータスが変わった」を作る)
+    const snapshot = JSON.parse(JSON.stringify(mock.pages));
+    if (mock.onQuery) { const h = mock.onQuery; mock.onQuery = null; await h(); }
     const f = body?.filter || {};
     const conds = f.and || [f];
-    let hits = mock.pages.filter(p => !p.archived);
+    const stOfSnap = (p) => p.properties['ステータス']?.select?.name || null;
+    let hits = snapshot.filter(p => !p.archived);
     for (const c of conds) {
-      if (c.property === 'ステータス' && c.select?.does_not_equal) hits = hits.filter(p => statusOf(p) !== c.select.does_not_equal);
-      if (c.property === 'ステータス' && c.select?.equals) hits = hits.filter(p => statusOf(p) === c.select.equals);
+      if (c.property === 'ステータス' && c.select?.does_not_equal) hits = hits.filter(p => stOfSnap(p) !== c.select.does_not_equal);
+      if (c.property === 'ステータス' && c.select?.equals) hits = hits.filter(p => stOfSnap(p) === c.select.equals);
       // timestamp フィルタはモックでは素通し (期間の値は lastFilters で検証する)
     }
     const start = Number(body.start_cursor || 0);
@@ -119,6 +141,7 @@ delete process.env.INBOUND_CHECK_NOTION_DB_ID;
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 initMirrorDB();
 const { getDB, replaceCache, listCache, addIrohaWorker, setIrohaWorkerActive, getIrohaWorker, listIrohaWorkers,
+  setWorkerPin, verifyWorkerPin, _clearPinFails,
   createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents } = await import('../apps/iroha-work/db.js');
 const { ensureFresh, refreshFromNotion, changeStatus, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
 const { buildList, priorityOf, clearEnrichCache } = await import('../apps/iroha-work/service.js');
@@ -163,6 +186,7 @@ console.log('\n[3] パース');
 
 console.log('\n[4] キャッシュ鮮度');
 {
+  await ensureFresh({ force: true });   // last_attempt_at を打つ (鮮度は「最後に試みた時刻」で判定)
   const calls = mock.queryCalls;
   const r = await ensureFresh();
   ok(r.fresh === true && mock.queryCalls === calls, '期間内は再取得しない');
@@ -180,17 +204,20 @@ console.log('\n[5] 取得失敗はキャッシュ温存 + エラー記録');
   ok(cacheStatsForAdmin().lastRefreshError, '管理画面用にも残る');
 }
 
-console.log('\n[6] ページング打ち切り → truncated');
+console.log('\n[6] ページング打ち切り → truncated + 古い完全キャッシュを守る');
 {
   const before = mock.pages.length;
+  const beforeRows = listCache().length;
   for (let i = 0; i < 25; i++) mkPage({ title: `量産${i}`, code: `BULK-${i}` });
   const r = await refreshFromNotion();
-  ok(r.truncated === true, `上限超えで truncated (${r.count}件)`);
+  ok(r.truncated === true, '上限超えで truncated');
   ok(cacheStatsForAdmin().truncated === true, 'meta にも残る');
+  ok(listCache().length === beforeRows, '部分データでキャッシュを置き換えない (見えていたカードを消さない)');
   mock.pages.length = before;   // 量産分を戻す
   seq = before;
   const r2 = await refreshFromNotion();
   ok(r2.truncated === false && cacheStatsForAdmin().truncated === false, '収まれば解除される');
+  ok(listCache().length === beforeRows, '収まったら通常の全置換に戻る');
 }
 
 console.log('\n[7] buildList: 作業仕様・優先度・並び');
@@ -274,8 +301,44 @@ console.log('\n[9] changeStatus');
   mock.patchStatusOverride = null;
   ok(r9.ok === false && r9.error === 'verify_failed', 'PATCH 応答の値が違えば verify_failed (HTTP成功を信じない)');
 
-  const bad = await changeStatus({ pageId: pA.id, to: '完成', expect: null, isStaff: true });
+  const bad = await changeStatus({ pageId: pA.id, to: '完成', expect: '作業中', isStaff: true });
   ok(bad.ok === false && bad.error === 'bad_status', '未知のステータスへの変更は拒否');
+
+  const noExpect = await changeStatus({ pageId: pA.id, to: '中断', expect: null, isStaff: true });
+  ok(noExpect.ok === false && noExpect.error === 'bad_request', 'expect 省略は拒否 (競合検出を素通りさせない)');
+
+  // ステータスが select 型でない (人が status 型に作り替えた等) → 明確に止める
+  const pTyped = mkPage({ status: '未着手', title: '型違い', code: 'PROD-T' });
+  pTyped.properties['ステータス'] = { type: 'status', status: { name: '未着手' } };
+  const rT = await changeStatus({ pageId: pTyped.id, to: '作業中', expect: '未着手', isStaff: false });
+  ok(rT.ok === false && rT.error === 'schema_mismatch', 'select 型でなければ schema_mismatch');
+}
+
+console.log('\n[9b] 同時変更はページ単位で直列化 (後勝ち消失を防ぐ)');
+{
+  const pC = mkPage({ status: '未着手', title: '同時', code: 'PROD-C' });
+  const [r1, r2] = await Promise.all([
+    changeStatus({ pageId: pC.id, to: '作業中', expect: '未着手', isStaff: false }),
+    changeStatus({ pageId: pC.id, to: '中断', expect: '未着手', isStaff: false }),
+  ]);
+  const oks = [r1, r2].filter(x => x.ok);
+  const conflicts = [r1, r2].filter(x => x.error === 'conflict');
+  ok(oks.length === 1 && conflicts.length === 1, `片方だけ成功し、もう片方は競合 (${r1.error || 'ok'}/${r2.error || 'ok'})`);
+  ok(statusOf(pC) === oks[0].status, '成功した方の値が Notion に残る (黙って上書きされない)');
+}
+
+console.log('\n[9c] 取得中のステータス変更を全置換で巻き戻さない');
+{
+  const pR = mkPage({ status: '未着手', title: 'レース', code: 'PROD-R' });
+  await refreshFromNotion();   // まずキャッシュに入れる
+  // 全体取得の query 応答スナップショット後 (=取得開始後) にアプリ経由で変更が走るレース
+  mock.onQuery = async () => {
+    const r = await changeStatus({ pageId: pR.id, to: '作業中', expect: '未着手', isStaff: false });
+    if (!r.ok) throw new Error('レース用の変更が失敗: ' + r.error);
+  };
+  await refreshFromNotion();
+  const row = listCache().find(x => x.page_id === pR.id);
+  ok(row && row.status === '作業中', '古い取得結果がキャッシュ全置換で変更を巻き戻さない');
 }
 
 console.log('\n[10] 作業者名簿');
@@ -290,6 +353,23 @@ console.log('\n[10] 作業者名簿');
   setIrohaWorkerActive(m.id, false);
   ok(listIrohaWorkers().length === 1 && listIrohaWorkers(true).length === 2, '無効化は一覧から外れる (履歴は残る)');
   ok(getIrohaWorker(m.id).active === 0, 'getIrohaWorker は無効でも引ける (routerで弾く)');
+}
+
+console.log('\n[10b] 職員PIN (worker_id の自己申告を職員権限にしない)');
+{
+  const staff = listIrohaWorkers(true).find(w => w.worker_type === 'staff');
+  const member = listIrohaWorkers(true).find(w => w.worker_type === 'member');
+  ok(verifyWorkerPin(staff.id, '1234').error === 'pin_required', 'PIN未設定は職員操作できない (設定を促す)');
+  ok(setWorkerPin(member.id, '1234', 'test').error === 'not_staff', '利用者にはPINを設定できない');
+  ok(setWorkerPin(staff.id, '12', 'test').error === 'bad_pin', '桁数チェック');
+  ok(setWorkerPin(staff.id, '4649', 'test').ok === true, '職員にPIN設定');
+  ok(listIrohaWorkers(true).find(w => w.id === staff.id).pin_set === 1, 'pin_set フラグが立つ (ハッシュは出さない)');
+  ok(verifyWorkerPin(staff.id, '4649').ok === true, '正しいPINは通る');
+  ok(verifyWorkerPin(staff.id, '0000').error === 'pin_invalid', '間違いは弾く');
+  for (let i = 0; i < 5; i++) verifyWorkerPin(staff.id, '9999');
+  ok(verifyWorkerPin(staff.id, '4649').error === 'pin_locked', '5回失敗でロック (正しいPINでも通さない)');
+  _clearPinFails();
+  ok(verifyWorkerPin(staff.id, '4649').ok === true, 'ロック解除後は通る');
 }
 
 console.log('\n[11] 端末登録');

@@ -183,9 +183,15 @@
       <div class="mname" id="stName">—</div>
       <div class="msaving" id="stMsg"></div>
       <div class="stbtns" id="stBtns"></div>
+      <div id="pinRow" style="display:none;margin-bottom:12px">
+        <label style="font-size:.8rem;color:var(--sub);font-weight:700">職員PIN (棚入完了の変更に必要です)</label>
+        <input id="pinIn" type="tel" inputmode="numeric" maxlength="8" placeholder="****" autocomplete="off"
+          style="width:100%;border:1.5px solid var(--line);border-radius:10px;padding:10px 12px;font-size:1.3rem;
+                 letter-spacing:.3em;background:var(--surface);color:var(--ink)">
+      </div>
       <div class="mbtns"><button class="btn" id="stCancel" onclick="closeSt()">やめる</button></div>
       <p class="hint">ここで変えると、Notionのカードのステータスもそのまま変わります。<br>
-        「棚入完了」への変更・取り消しは職員の方だけができます。</p>
+        「棚入完了」への変更・取り消しは職員の方だけができます (職員PINが必要)。</p>
     </div>
   </div>
 
@@ -461,6 +467,8 @@ function openSt(ev, pageId) {
   stTarget = pageId;
   $('#stName').textContent = c.title + ' (いま: ' + c.status + ')';
   $('#stMsg').textContent = '';
+  $('#pinRow').style.display = 'none';
+  $('#pinIn').value = '';
   $('#stBtns').innerHTML = state.statuses.map(s =>
     '<button class="btn' + (s === c.status ? ' cur' : '') + '" onclick="doSetSt(\'' + esc(s) + '\')">' + esc(s) + '</button>').join('');
   $('#stOv').classList.add('on');
@@ -473,6 +481,22 @@ async function doSetSt(to) {
   const c = state.cards.find(x => x.page_id === stTarget);
   if (!c) { closeSt(); return; }
   if (to === c.status) { closeSt(); return; }
+
+  // 棚入完了が絡む変更は職員のみ (PIN で本人確認)。端末Cookie利用時だけ PIN を求める
+  const gated = to === '棚入完了' || c.status === '棚入完了';
+  if (gated && !state.me.session) {
+    if (worker.worker_type !== 'staff') {
+      $('#stMsg').textContent = '❌ 「棚入完了」の変更は職員のみです。右上の名前を職員に切り替えてください';
+      return;
+    }
+    if (!$('#pinIn').value.trim()) {
+      $('#pinRow').style.display = 'block';
+      $('#stMsg').textContent = '職員PINを入れてから「' + to + '」を押してください';
+      $('#pinIn').focus();
+      return;
+    }
+  }
+
   stSaving = true;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = true;
   $('#stMsg').textContent = '保存中… (Notionに反映しています)';
@@ -480,7 +504,8 @@ async function doSetSt(to) {
   try {
     const r = await fetch(BASE + '/api/status', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ page_id: stTarget, to, expect: c.status, worker_id: worker.id }),
+      body: JSON.stringify({ page_id: stTarget, to, expect: c.status, worker_id: worker.id,
+        pin: $('#pinIn').value.trim() || undefined }),
     });
     j = await r.json().catch(() => ({}));
   } catch (e) {
@@ -509,6 +534,14 @@ async function doSetSt(to) {
     showErr(j.message || 'カードが見つかりません');
     closeDetail();
     loadState();
+    return;
+  }
+  // PIN 関連はダイアログ内で入力し直せるようにする
+  if (j.error === 'pin_required' || j.error === 'pin_invalid') {
+    $('#pinRow').style.display = 'block';
+    $('#pinIn').value = '';
+    $('#stMsg').textContent = '❌ ' + (j.message || 'PINを確認してください');
+    $('#pinIn').focus();
     return;
   }
   // staff_required / notion_error / verify_failed など: ダイアログを開いたまま理由を出す (やり直せる)
