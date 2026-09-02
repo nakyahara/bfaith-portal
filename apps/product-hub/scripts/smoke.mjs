@@ -1758,6 +1758,14 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   gs = listing.buildItemPayload(db, gsaId);
   check('payload×SKU仕様: 全 SKU に SKU 表の値が入れば旧データは使わず通る',
     gs.ok === true, JSON.stringify(gs.ok ? gs.payload.variants : gs.reasons));
+  // 旧データの「カタログID」属性が残るバリエーションは、警告ボタンでの削除を促して止める (SKU 表には展開しない)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["A"]},{"name":"カタログID","values":["4901234567894"]}]', article_number = 'NEW' WHERE draft_id = ?`).run(gsaId);
+  gs = listing.buildItemPayload(db, gsaId);
+  check('payload×SKU仕様: 旧データの「カタログID」属性は削除を促して止める (SKU ごとの行にはしない)',
+    gs.ok === false && gs.reasons.some((r) => r.includes('旧データ') && r.includes('カタログID') && r.includes('削除'))
+    && !gs.reasons.some((r) => r.includes('SKU「gsa-a」の商品仕様に「カタログID」')),
+    JSON.stringify(gs.reasons));
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["A"]}]' WHERE draft_id = ?`).run(gsaId);
   db.prepare(`DELETE FROM draft_sku_attributes WHERE draft_id = ? AND name = ?`).run(gsaId, listing.MODEL_ATTR_NAME);
   insAttr.run(gsaId, 'gsa-b', listing.MODEL_ATTR_NAME, 'M-B');
   db.prepare('DELETE FROM draft_sku_catalog_exemptions WHERE draft_id = ?').run(gsaId);
@@ -3764,6 +3772,27 @@ let wfSetParentId = null;
     const row = db.prepare('SELECT article_number, attributes_json FROM draft_rakuten WHERE draft_id = ?').get(idP);
     check('メーカー型番: バリエーションの /rakuten は旧型番の食い違いで 400 にせず、旧値も捨てない',
       r.status === 200 && row?.article_number === 'NEW' && String(row?.attributes_json).includes('OLD'), `${r.status} ${JSON.stringify(row)}`);
+  }
+  // 古い画面・旧クライアントが attributes を送ってきても、バリエーションでは旧メーカー型番の行を落とさない (Codex R3 high)
+  r = await call('POST', `/api/drafts/${idP}/rakuten`, { genre_id: '1', attributes: [{ name: 'ブランド名', value: 'X' }] });
+  {
+    const row = db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(idP);
+    check('メーカー型番: バリエーションの /rakuten は attributes を送られても旧型番の行を残す',
+      r.status === 200 && String(row?.attributes_json).includes('OLD') && String(row?.attributes_json).includes('ブランド名'), `${r.status} ${JSON.stringify(row)}`);
+  }
+  // 旧データの「カタログID」属性は SKU 表に展開せず、警告ボタン (drop_legacy_catalog_attr) で削除する (Codex R3 high)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567894"]},{"name":"ブランド名","values":["X"]}]' WHERE draft_id = ?`).run(idP);
+  {
+    const membersP = vari.resolveVariationGroup(db, 'vc', { draftId: idP, withMembers: true }).members;
+    const gP = listing.skuAttributeGrid(db, idP, db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(idP), membersP);
+    check('旧カタログID属性: SKU 表には展開せず legacyCatalogIds に出す',
+      !gP.names.includes('カタログID') && gP.legacyCatalogIds.join() === '4901234567894' && gP.names.includes('ブランド名'), JSON.stringify(gP.names));
+  }
+  r = await call('POST', `/api/drafts/${idP}/rakuten`, { genre_id: '1', drop_legacy_catalog_attr: true });
+  {
+    const row = db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(idP);
+    check('旧カタログID属性: drop_legacy_catalog_attr で「カタログID」の行だけ消える',
+      r.status === 200 && !String(row?.attributes_json).includes('カタログID') && String(row?.attributes_json).includes('ブランド名'), `${r.status} ${JSON.stringify(row)}`);
   }
   db.prepare(`UPDATE draft_rakuten SET article_number = NULL, attributes_json = NULL WHERE draft_id = ?`).run(idP);
   const exOf = (code) => db.prepare(
@@ -6485,8 +6514,20 @@ for (const [name, file, data] of renders) {
         setTimeout, console,
       };
       vm.createContext(ctx);
-      const api = new vm.Script(`const skuSavers = [];\nlet skuSaveGeneration = 0;\nconst skuPendingOps = new Set();\n${iife}\n({ flush: () => flushSkuSavers(), track: (p) => trackSkuOp(p) })`, { filename: 'initSkuJans' }).runInContext(ctx);
+      const api = new vm.Script(`const skuSavers = [];\nlet skuSaveGeneration = 0;\nconst skuPendingOps = new Set();\nlet skuOpFailed = false;\n${iife}\n({ flush: () => flushSkuSavers(), track: (p) => trackSkuOp(p) })`, { filename: 'initSkuJans' }).runInContext(ctx);
       return { a, b, pending, alerts, posts, flush: api.flush, track: api.track };
+    }
+    // 0') 追跡した一括操作が拒否 (ok:false) で終わったら、その flush は 1 回だけ false (Codex R3 medium)
+    {
+      const h = harness();
+      let done = null;
+      h.track(new Promise((resolve) => { done = resolve; })).catch(() => {});
+      const fl = h.flush();
+      await tick();
+      done({ ok: false, error: 'rejected' });
+      const ok = await fl;
+      const ok2 = await h.flush();
+      check('sku-jan worker: 拒否された一括操作を待った flush は false、次の flush は true (1 回限り)', ok === false && ok2 === true, JSON.stringify({ ok, ok2 }));
     }
     // 0) ワーカー外の保存 (一括入力) が実行中なら flush はその完了を待つ (Codex R2 high)
     {

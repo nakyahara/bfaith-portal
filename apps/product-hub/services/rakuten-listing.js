@@ -1018,8 +1018,10 @@ export function splitAttributeValues(raw) {
 export function skuAttributeGrid(db, draftId, rk, members) {
   const base = new Map();           // name → string[] (ページ共通の既定値)
   const legacyModels = [];          // 旧データで属性側に残っているメーカー型番
+  const legacyCatalogIds = [];      // 旧データで属性側に残っているカタログID (SKU 表では JAN の専用行が入口なので展開しない)
   for (const a of (parseAttributes(rk?.attributes_json) || [])) {
     if (a.name === MODEL_ATTR_NAME) { for (const v of a.values) if (!legacyModels.includes(v)) legacyModels.push(v); continue; }
+    if (a.name === 'カタログID') { for (const v of a.values) if (!legacyCatalogIds.includes(v)) legacyCatalogIds.push(v); continue; }
     base.set(a.name, a.values.slice());
   }
   // メーカー型番の既定値: 欄 (article_number) > 属性側に 1 つだけ残っている旧値。食い違い (複数・欄と別) は
@@ -1046,7 +1048,7 @@ export function skuAttributeGrid(db, draftId, rk, members) {
     cell.set(r.name, values);
     explicit.get(String(r.sku_code)).add(r.name);
   }
-  return { names, bySku, explicit, legacyModels, legacyModelConflict };
+  return { names, bySku, explicit, legacyModels, legacyModelConflict, legacyCatalogIds };
 }
 
 /**
@@ -1136,8 +1138,9 @@ export function buildItemPayload(db, draftId) {
   // 商品属性の行に「カタログID」を手入力する経路は廃止した。SKU ごとに値が違うので 1 行では表せず、
   // ページ代表の値を全 SKU に付けると SKU の articleNumber と食い違う
   // (根本対策: 「カタログID」属性は下で SKU ごとに自分の JAN から自動付与する)
-  if (Array.isArray(attributes) && attributes.some((a) => a.name === 'カタログID')) {
-    reasons.push('商品属性の行に「カタログID」があります — カタログID (JAN) は基本情報タブ (単品はJANコード欄・バリエーションはSKU表) で入力すると自動で送ります。属性の行からは削除してください');
+  // (バリエーションは skuAttributeGrid の legacyCatalogIds で別に案内する)
+  if (!isVariation && Array.isArray(attributes) && attributes.some((a) => a.name === 'カタログID')) {
+    reasons.push('商品属性の行に「カタログID」があります — カタログID (JAN) はカテゴリ・属性タブの表の「カタログID」の行で入力すると自動で送ります。属性の行からは削除してください');
   }
   const jan = isVariation ? '' : String(draft.jan_code || '').trim();
   if (jan && !isValidGtin(jan)) {
@@ -1169,6 +1172,11 @@ export function buildItemPayload(db, draftId) {
     const exemptionRows = new Map(db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?')
       .all(draftId).map((r) => [String(r.sku_code), Number(r.reason)]));
     const grid = skuAttributeGrid(db, draftId, rk, vari.members);
+    // 旧データ (2026-09-02 までの単品の属性行) の「カタログID」は SKU 表に展開しない。JAN は専用行に入れる方式なので、
+    // 表の警告ボタンで削除してもらう (Codex R3 high: 展開すると全 SKU で止まり、画面から消せなかった)
+    if (grid.legacyCatalogIds.length > 0) {
+      reasons.push(`旧データの商品仕様に「カタログID」(${grid.legacyCatalogIds.join(' / ')}) が残っています — カテゴリ・属性タブの表の上の警告「旧データの「カタログID」属性を削除する」で消してください (JAN は表の「カタログID」の行に SKU ごとに入れます)`);
+    }
     variantRows = [];
     for (const m of vari.members) {
       const skuCode = String(m.商品コード || '').trim();

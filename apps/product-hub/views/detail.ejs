@@ -1617,6 +1617,15 @@
       <p class="muted" style="margin:0 0 6px; font-size:12px;">
         入力欄を離れると<strong>即保存</strong>。「一括入力」で全SKUに同じ値を入れられます。JANが無いSKUは「IDなし」を選んで理由を選択。
       </p>
+      <% if ((gridData.legacyCatalogIds || []).length > 0) { %>
+        <%# 旧データ (2026-09-02 までの単品の属性行) の「カタログID」。SKU 表では JAN の専用行が入口なので展開せず、
+            人が確認して削除する (Codex R3 high: 展開すると全 SKU で出品が止まり、画面から消せなかった) %>
+        <div class="banner-warn" id="rk-legacy-catalog" style="font-size:12px; margin-bottom:6px;">
+          ⚠️ 旧データの商品仕様に「カタログID」(<%= gridData.legacyCatalogIds.join(' / ') %>) が残っています。
+          JAN は下の表の「カタログID」の行に SKU ごとに入れる方式になりました。各 SKU の JAN を確認してから削除してください (削除するまで出品は止まります)。
+          <div style="margin-top:6px;"><button type="button" class="btn btn-sm" id="rk-legacy-catalog-drop">旧データの「カタログID」属性を削除する</button></div>
+        </div>
+      <% } %>
       <div style="overflow-x:auto; border:1px solid #e2e8f0; border-radius:8px; margin-bottom:8px; background:#fff;">
         <table class="list sku-grid" id="rk-sku-grid" style="margin:0; width:max-content; min-width:100%;">
           <thead><tr>
@@ -3007,6 +3016,7 @@
   const skuSavers = [];
   let skuSaveGeneration = 0;   // change / 一括操作の開始・終了ごとに +1 (全ワーカーを通した安定確認に使う)
   const skuPendingOps = new Set(); // ワーカー外の保存 (一括入力・行削除) の実行中 Promise (Codex R2 high: flush が待つ)
+  let skuOpFailed = false;         // 追跡した保存が拒否/例外で終わった印 (次の flush を 1 回だけ false にする。Codex R3 medium)
   const flushSkuJanSaves = () => flushSkuSavers();
   async function saveRakutenFields() {
     // JAN (単品欄 / SKU表) の保存を先に確定させる。失敗したらプレビュー・登録に進まない (Codex R2 high)
@@ -3564,18 +3574,24 @@
       const gen = skuSaveGeneration;
       // ワーカー外の保存 (一括入力・行削除) が走っていれば先に終わるのを待つ
       if (skuPendingOps.size > 0) await Promise.allSettled([...skuPendingOps]);
+      // 待った保存が拒否/例外で終わっていたら、この flush は失敗 (1 回限り。次の明示的な flush で再試行できる)
+      if (skuOpFailed) { skuOpFailed = false; return false; }
       const ok = (await Promise.all(skuSavers.map((s) => s.flush()))).every(Boolean);
       if (!ok) return false;
       if (gen === skuSaveGeneration && skuPendingOps.size === 0 && skuSavers.every((s) => !s.isDirty())) return true;
     }
     return false;
   }
-  // ワーカー外の保存 (一括入力・行削除) を flush の待ち対象にする。開始・終了で世代を進める
+  // ワーカー外の保存 (一括入力・行削除) を flush の待ち対象にする。開始・終了で世代を進め、
+  // 拒否 (ok:false) や例外は skuOpFailed に残す (Codex R3 medium: 完了だけ待つと拒否された一括操作でも成功扱いになる)
   function trackSkuOp(promise) {
-    skuPendingOps.add(promise);
+    const tracked = promise.then(
+      (json) => { if (!json || json.ok === false) skuOpFailed = true; return json; },
+      (err) => { skuOpFailed = true; throw err; });
+    skuPendingOps.add(tracked);
     skuSaveGeneration += 1;
-    promise.finally(() => { skuPendingOps.delete(promise); skuSaveGeneration += 1; }).catch(() => {});
-    return promise;
+    tracked.finally(() => { skuPendingOps.delete(tracked); skuSaveGeneration += 1; }).catch(() => {});
+    return tracked;
   }
 
   // ─── SKU別JAN (2026-08-28 中原さん要望)。入力欄を離れたら即保存 ───
@@ -3707,6 +3723,24 @@
         rkResultCat.textContent = '「' + name + '」を全SKUに入れました (' + (value || '空') + ')';
       }
       updateTabBadges();
+    });
+  })();
+
+  // 旧データの「カタログID」属性を削除する (バリエーションの SKU 表の警告)。JAN は専用行に入っている前提で人が押す
+  (function initLegacyCatalogDrop() {
+    const btn = document.getElementById('rk-legacy-catalog-drop');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (!confirm('旧データの「カタログID」属性を削除します。各 SKU の JAN は下の表の「カタログID」の行に入っていますか？')) return;
+      btn.disabled = true;
+      let json;
+      try {
+        json = await post(BASE + '/rakuten', { ...collectRakutenFields(), drop_legacy_catalog_attr: true });
+      } catch (e) {
+        json = { ok: false, error: '通信エラーで削除できませんでした。もう一度お試しください' };
+      }
+      if (!json.ok) { alert(json.error || '削除に失敗しました'); btn.disabled = false; return; }
+      location.reload();
     });
   })();
 

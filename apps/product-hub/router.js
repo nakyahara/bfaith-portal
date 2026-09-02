@@ -264,6 +264,7 @@ router.get('/detail/:id', (req, res) => {
   // セルの表示は複数値を「 | 」で結ぶ (RMS の商品仕様と同じ区切り。保存時は | で分けて配列に戻す)
   const skuAttrGrid = {
     names: gridRaw.names,
+    legacyCatalogIds: gridRaw.legacyCatalogIds || [],
     bySku: Object.fromEntries([...gridRaw.bySku.entries()].map(([k, m]) => [k, Object.fromEntries([...m.entries()].map(([n, vals]) => [n, vals.join(' | ')]))])),
   };
   const skuExemptions = {};
@@ -1158,11 +1159,19 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   // どちらの場合も メーカー型番 の行だけは落とす (入口を 1 つに保つ)
   let attributesJson = prevRkRow?.attributes_json ?? null;
   if (rows) {
-    attributesJson = JSON.stringify(
-      rows.filter((a) => a.name !== MODEL_ATTR_NAME).map((a) => ({ name: a.name, values: [a.value] })));
+    const kept = rows.filter((a) => a.name !== MODEL_ATTR_NAME).map((a) => ({ name: a.name, values: [a.value] }));
+    // バリエーションは旧メーカー型番の行を落とさない (Codex R3 high: 古い画面・旧クライアントの attributes で
+    // 黙って失う)。SKU 表の既定値/食い違いの材料として残す
+    if (isVariationDraft) kept.push(...prevAttrs.filter((a) => a && a.name === MODEL_ATTR_NAME));
+    attributesJson = JSON.stringify(kept);
     if (parseAttributes(attributesJson) === null) {
       return res.status(400).json({ ok: false, error: '属性の形式が不正です' });
     }
+  } else if (req.body?.drop_legacy_catalog_attr === true) {
+    // 旧データの「カタログID」属性を人の操作で削除する (SKU 表の警告ボタン。JAN は専用行に入っている前提)。
+    // 2026-09-02 までの単品は属性行で持てたが、SKU 表では JAN の専用行が入口なので出品が必ず止まる (Codex R3 high)
+    attributesJson = JSON.stringify(prevAttrs.filter((a) => !(a && a.name === 'カタログID')));
+    logEvent(db, draft.id, 'legacy_catalog_attr_dropped', '旧データの「カタログID」属性を削除', actorOf(req));
   } else if (prevModels.length > 0 && !isVariationDraft) {
     // 部分更新でも、メーカー型番の行は残さない (次の保存でまた競合として出てくる)。
     // バリエーションは旧値を捨てない (SKU 表の既定値・食い違いの材料として残す)
