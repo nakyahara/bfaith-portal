@@ -55,6 +55,7 @@ import inboundInfoRouter from './apps/inbound-info/router.js';
 import { startInboundInfoCron } from './apps/inbound-info/sync-job.js';
 import inboundCheckRouter from './apps/inbound-check/router.js';
 import irohaWorkRouter from './apps/iroha-work/router.js';
+import fbaBoxRouter from './apps/fba-box/router.js';
 import { startMediaWorker as startIrohaMediaWorker } from './apps/iroha-work/media.js';
 import staffRouter from './apps/staff/router.js';
 import { startInboundCheckCron, startInboundCheckNotionCron } from './apps/inbound-check/sync-job.js';
@@ -744,6 +745,15 @@ const apps = [
     category: 'shipping',
   },
   {
+    id: 'fba-box',
+    name: 'FBA箱詰め記録 (iPad)',
+    description: 'FBA納品の箱詰めをいろはのiPadで記録 (紙の納品箱No手書きを置き換え)。STAパックリストExcelと突合し、どの輸送箱に何を何個入れたかを残す',
+    icon: '📦',
+    path: '/apps/fba-box/admin',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
     id: 'staff',
     name: 'スタッフマスタ',
     description: '「人」の正本 (スタッフ管理番号・名前・区分・入社/退職)。各アプリの名前タップはここから引く。将来の勤怠・シフトの親 (管理者のみ)',
@@ -1377,6 +1387,9 @@ app.use('/apps/inbound-check', express.json({ limit: '256kb' }), inboundCheckRou
 // いろは在庫化 作業アプリ (iPad): inbound-check と同じく requireAppAccess を掛けない (登録端末Cookie を通すため)。
 // 認可は router 内 (セッション or 端末Cookie。管理系はセッション必須・端末登録/作業者は admin)
 app.use('/apps/iroha-work', express.json({ limit: '256kb' }), irohaWorkRouter);
+// FBA箱詰め記録 (iPad): 同じく requireAppAccess を掛けない (登録端末Cookie を通すため)。
+// 認可は router 内 (セッション or 端末Cookie。納品回管理はセッション・端末登録/作業者は admin)
+app.use('/apps/fba-box', express.json({ limit: '256kb' }), fbaBoxRouter);
 // スタッフマスタ (staff.db): 管理画面/API は router 内で管理者限定。/export だけトークン認証 (miniPC 同期用)
 app.use('/apps/staff', express.json({ limit: '256kb' }), staffRouter);
 // MF仕訳用 証憑リンク集 (apps/shohyo-links): 専用DB shohyo-links.db (DATA_DIR)。Notion「支払い関係リンク先」の移行先
