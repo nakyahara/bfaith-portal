@@ -92,6 +92,19 @@ const parsed = await parseWorkMasterXlsx(buf);
   ok(parsed.issues.numericCode.length === 1 && !parsed.rows.some(r => r.code === '1234'),
     '数値セルの商品コードは検証エラーにして行を除外 (先頭ゼロ喪失の防止)');
   ok(importIssueCount(parsed.issues) === 4, `検証エラー合計 4 → 本取込は拒否される (実際 ${importIssueCount(parsed.issues)})`);
+  ok(parsed.hasFlgColumn === true, 'FLG列があれば hasFlgColumn=true');
+}
+
+console.log('\n[1b] 在庫化必要FLG 列なしでも取り込める (FLGは廃止 — 中原さん 2026-09-02)');
+{
+  const wb2 = new ExcelJS.Workbook();
+  const ws2 = wb2.addWorksheet('作業内容管理マスター');
+  ws2.addRow(['商品コード', '商品名', '資材', '収納容器', '入数', '工程数', '備考']);
+  ws2.addRow(['PROD-1', '商品1', 'D-9', '9Lコンテナ', 60, 2, '']);
+  const p2 = await parseWorkMasterXlsx(Buffer.from(await wb2.xlsx.writeBuffer()));
+  ok(p2.hasFlgColumn === false && p2.rows.length === 1 && p2.rows[0].flg === null,
+    'FLG列なし: hasFlgColumn=false・行は読める・flg=null');
+  ok(importIssueCount(p2.issues) === 0, 'FLG列が無いこと自体はエラーにしない');
 }
 
 console.log('\n[2] FLG × f_inbound_info の突合');

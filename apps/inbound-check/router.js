@@ -639,14 +639,18 @@ router.post('/admin/work-master-import', requireAdmin, checkOrigin, upload.singl
     logWorkMasterImport({ actor: req.session.email, fileName: req.file.originalname, ok: false, message: e.message });
     return res.status(400).json({ ok: false, error: 'bad_xlsx', message: e.message });
   }
-  const compare = compareIrohaFlags(parsed.rows);
+  // FLG 列が無い xlsx (在庫化必要FLG は廃止・2026-09-02) では突合も seed も行わない
+  const compare = parsed.hasFlgColumn
+    ? compareIrohaFlags(parsed.rows)
+    : { buckets: null, mismatches: [], seedable: [], infoOnlyCount: 0 };
   const apply = String(req.body?.apply || '') === '1';
-  const seed = apply && String(req.body?.seed || '') === '1';
+  const seed = apply && String(req.body?.seed || '') === '1' && parsed.hasFlgColumn;
   const issueTotal = importIssueCount(parsed.issues);
   const del = computeDeletions(parsed.rows);   // 取込 = 全置換。xlsx に無い既存行は削除される (予告して見せる)
   const out = {
     ok: true, dryRun: !apply, dataRows: parsed.dataRows, rowCount: parsed.rows.length,
     issues: parsed.issues, issueTotal,
+    flgColumn: parsed.hasFlgColumn,
     wouldDelete: { count: del.count, codes: del.codes },
     buckets: compare.buckets,
     seedableCount: compare.seedable.length, infoOnlyCount: compare.infoOnlyCount,
