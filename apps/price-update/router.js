@@ -18,9 +18,9 @@ import { loadDimMall } from '../../lib/dim-mall.js';
 import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim, recoveryRunsOf, createRecoveryRun } from './db.js';
 import { planRecovery, buildRecoveryOperations, RECOVERABLE_STATES } from './recovery.js';
 import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
-import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot } from './live-price.js';
+import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot, fetchAupayPrices } from './live-price.js';
 import { evaluateRow, runLimits, mergeGuardWarns } from './pricing.js';
-import { rakutenShippingLabel, yahooPostageLabel, rakutenShippingName, yahooPostageName } from './shipping-labels.js';
+import { rakutenShippingLabel, yahooPostageLabel, rakutenShippingName, yahooPostageName, aupayPostageLabel } from './shipping-labels.js';
 import { executeRun, mallWriteEnabled } from './execute.js';
 import { patchItemPrices, fetchItemDetail } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
 import { makeYahooClient } from './yahoo-apply.js';
@@ -143,6 +143,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   const rakutenRowKey = (t, l) => `${normCode(t.neCode)}|${t.rowKind}|${normCode(l.listingCode)}`;
   const rakutenTargets = [];
   const yahooTargets = [];
+  const aupayTargets = [];
   const amazonSkus = [];
   for (const t of targets) {
     for (const l of t.listings) {
@@ -154,6 +155,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         });
       }
       else if (l.mall === 'yahoo') yahooTargets.push({ key: l.listingCode, candidates: l.candidates || [l.listingCode] });
+      else if (l.mall === 'aupay') aupayTargets.push({ key: l.listingCode, candidates: [l.listingCode] });
       else if (l.mall === 'amazon') amazonSkus.push(l.listingCode);
     }
   }
@@ -161,6 +163,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   const notices = [];
   let rakutenPrices = new Map();
   let yahooPrices = new Map();
+  let aupayPrices = new Map();
   if (rakutenTargets.length > 0) {
     try {
       rakutenPrices = await fetchRakutenPrices(rakutenTargets, deps);
@@ -173,6 +176,13 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       yahooPrices = await fetchYahooPrices(yahooTargets, deps);
     } catch (e) {
       notices.push(`Yahoo の設定価格を取得できませんでした: ${e.message}`);
+    }
+  }
+  if (aupayTargets.length > 0) {
+    try {
+      aupayPrices = await fetchAupayPrices(aupayTargets, deps);
+    } catch (e) {
+      notices.push(`au PAY の設定価格を取得できませんでした: ${e.message}`);
     }
   }
   const amazonSnap = loadAmazonSnapshot(db, amazonSkus);
@@ -230,6 +240,25 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
           sharedSubCodes = Array.isArray(p.sharedSubCodes) ? p.sharedSubCodes : [];
           if (sharedSubCodes.length > 1) {
             sharedNote = `Yahoo は色ごとの価格を持ちません。変えるとこの商品の ${sharedSubCodes.length} 色すべてが同じ価格になります`;
+            note = note ? `${note} / ${sharedNote}` : sharedNote;
+          }
+        } else {
+          note = p?.reason || '設定価格を取得できませんでした';
+        }
+      } else if (l.mall === 'aupay') {
+        const p = aupayPrices.get(key);
+        if (p?.found) {
+          price = p.price; priceSource = 'au PAY searchItemInfo (ライブ)'; priceIsLive = true;
+          confidence = 'confirmed';
+          if (p.itemCode) { listingCode = p.itemCode; url = listingUrl('aupay', p.itemCode); }
+          if (p.skuCode) skuCode = p.skuCode;
+          mallShipping = p.shipping
+            ? { ...p.shipping, postageLabel: aupayPostageLabel(p.shipping.postageSegment) }
+            : null;
+          // ★au PAY も商品に1つの価格。カラバリ (色) は在庫だけで価格を持たない。
+          //   1色ぶんのつもりで変えると、その商品の色が全部同じ価格になる
+          if (p.choiceCount > 1) {
+            sharedNote = `au PAY は色ごとの価格を持ちません。変えるとこの商品の ${p.choiceCount} 通りすべてが同じ価格になります`;
             note = note ? `${note} / ${sharedNote}` : sharedNote;
           }
         } else {
