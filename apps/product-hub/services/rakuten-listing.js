@@ -1106,6 +1106,15 @@ export function buildItemPayload(db, draftId) {
       reasons.push(`商品属性のカタログID (${manualCatalog.values[0]}) と JAN欄 (${jan}) が一致しません — どちらかに揃えてください`);
     }
   }
+  // カタログID (= API の articleNumber) が無いときの理由。JAN があれば JAN を送るので使わない。
+  // 未設定は 5 (該当製品コードなし) = 2026-09-02 以前の固定値なので、既存ドラフトの送信内容は変わらない
+  const rawReason = Number(rk.catalog_id_exemption_reason);
+  const catalogExemptionReason = Number.isInteger(rawReason) && rawReason >= 1 && rawReason <= 6 ? rawReason : 5;
+  // 1 (セット商品) は articleNumberForSet (構成品の JAN 一覧) が別に必須になる。まだ送れないので止める
+  if (!jan && catalogExemptionReason === 1) {
+    reasons.push('カタログIDなしの理由「1: セット商品」は未対応です (構成品のJAN一覧を送る仕組みがまだありません)。JANを入力するか別の理由を選んでください');
+  }
+
   // メーカー型番はカタログIDと同じ扱い (2026-08-31 中原さん: RMS でも入力項目は 1 つなのに
   // 画面で 2 箇所に入れさせていた)。**入口は「メーカー型番」欄 (article_number) だけ**にして、
   // ジャンル属性に「メーカー型番」があるときは下でその値を自動付与する。
@@ -1249,13 +1258,17 @@ export function buildItemPayload(db, draftId) {
         // システム連携用SKU番号 = 商品コード (2026-08-05 中原さん指示。NE との SKU 突合キー)
         merchantDefinedSkuId: productCode,
         standardPrice: draft.price,
-        // カタログID免除理由 (2026-08-05 平串の IE0429 で実測確定):
-        //   1=セット商品 (articleNumberForSet が必須になる) / 2=サービス商品 / 3=当店オリジナル商品
-        //   4=項目選択肢別在庫商品 / 5=該当商品コードなし / 6=頒布会商品
-        // JAN の無い単品仕入れ商品は 5 が正 (旧値 1 は IE0429 で登録拒否)
-        articleNumber: rk.article_number && String(rk.article_number).trim() !== ''
-          ? { value: String(rk.article_number).trim() }
-          : { exemptionReason: 5 },
+        // 🚨 articleNumber = RMS 画面の「カタログID」= **JAN 等の製品コード**。
+        //    メーカー型番ではない (メーカー型番は下の attrs に「メーカー型番」属性として積む)。
+        //    2026-09-02 まで rk.article_number (メーカー型番) を value に入れており、
+        //    型番を欄に入れた商品が IE0228 Invalid articleNumber で必ず落ちていた (shaganshi)。
+        //    〜2026-08-31 は欄が空で exemptionReason=5 に落ちていたため表面化しなかった。
+        // 免除理由 (2026-08-05 平串の IE0429 で実測確定):
+        //   1=セット商品 (articleNumberForSet が必須になる) / 2=サービス商品 / 3=店舗オリジナル商品
+        //   4=項目選択肢別在庫商品 / 5=該当製品コードなし / 6=頒布会商品
+        articleNumber: jan
+          ? { value: jan }
+          : { exemptionReason: catalogExemptionReason },
         ...(attrs.length > 0 ? { attributes: attrs } : {}),
         ...(Object.keys(shipping).length > 0 ? { shipping } : {}),
         ...(deliveryDateId ? { normalDeliveryDateId: Number(deliveryDateId) } : {}),
@@ -1265,13 +1278,54 @@ export function buildItemPayload(db, draftId) {
   return { ok: true, payload, draft };
 }
 
+/**
+ * RMS のエラーコードを「人が次に何をすればいいか」に翻訳する (2026-09-02)。
+ * 生の英語 + JSON のままだと、画面に出ても直しようがない (shaganshi の IE0228 / IE0418 で実証)。
+ * 翻訳できないコードは null を返し、呼び出し側が原文をそのまま見せる (握りつぶさない)。
+ */
+export function translateRmsError(code, message, metadata) {
+  const md = metadata && typeof metadata === 'object' ? metadata : {};
+  const path = String(md.propertyPath || '');
+  const details = Array.isArray(md.details) ? md.details : [];
+  // 属性名は details[].properties.attributeName に入る (実測 2026-09-02)
+  const attrName = details.map((d) => d && d.properties && d.properties.attributeName).find((n) => n);
+  const attrLabel = attrName ? `「${attrName}」` : '';
+
+  if (code === 'IE0228' && /articleNumber/i.test(path)) {
+    return 'カタログID (JANコード) の値を楽天が受け付けませんでした。基本情報タブのJANコードを確認してください'
+      + ' — ここはメーカー型番を入れる欄ではありません (RMS の「カタログID」に相当します)';
+  }
+  if (code === 'IE0229' && /articleNumber/i.test(path)) {
+    return 'カタログIDが空です。JANコードを入れるか、「カタログIDなしの理由」を選んでください';
+  }
+  if (code === 'IE0418' && details.some((d) => d && d.code === 'invalidSelectiveValue')) {
+    return `商品属性${attrLabel}の値が、楽天がこのジャンルで用意している選択肢にありません。`
+      + '選択式の属性なので自由入力はできません — RMS の商品編集画面で選べる値を確かめ、同じ表記で入れ直してください';
+  }
+  if (code === 'IE0418') {
+    return `商品属性${attrLabel}かジャンルIDが不正です${path ? ` (${path})` : ''}`;
+  }
+  if (code === 'IE1002') {
+    return `このジャンルに存在しない商品属性が含まれています${attrLabel}。「ジャンル情報を取得」で候補を出し直してください`;
+  }
+  if (code === 'IE0429') {
+    return 'カタログIDなしの理由がこの商品に使えません (例: セット商品を選ぶと構成品のJAN一覧が必要)。理由を選び直してください';
+  }
+  return null;
+}
+
 /** RMS のエラー本文から人が読める文を取り出す */
 export function extractRmsErrors(data) {
   if (data == null) return '';
   if (typeof data === 'string') return data.slice(0, 800);
   const list = Array.isArray(data?.errors) ? data.errors : null;
   if (list) {
-    return list.map((e) => `${e.code || ''}: ${e.message || ''}${e.metadata ? ' ' + JSON.stringify(e.metadata) : ''}`).join('\n').slice(0, 1500);
+    return list.map((e) => {
+      const raw = `${e.code || ''}: ${e.message || ''}${e.metadata ? ' ' + JSON.stringify(e.metadata) : ''}`;
+      const jp = translateRmsError(e.code, e.message, e.metadata);
+      // 日本語を先に出す。原文は括弧で残す (楽天サポートに投げるときに要る)
+      return jp ? `${jp}\n  └ ${raw}` : raw;
+    }).join('\n').slice(0, 2500);
   }
   return JSON.stringify(data).slice(0, 800);
 }

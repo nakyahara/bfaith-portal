@@ -1026,7 +1026,20 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   // メーカー型番は attributes の検証でも使うので、ここで先に読む
   let articleNumber = cleanText(req.body?.article_number, 100);
   // 既存の属性は複数の判定で使うので先に読む
-  const prevRkRow = db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  const prevRkRow = db.prepare('SELECT attributes_json, catalog_id_exemption_reason FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  // カタログIDなしの理由 (RMS 画面の「カタログIDなしの理由」)。JAN があれば送信時に使われない。
+  // **送ってこない呼び出しでは既存を維持する** (attributes と同じ方針。部分更新で黙って消さない)
+  let catalogExemptionReason = prevRkRow?.catalog_id_exemption_reason ?? null;
+  if (req.body?.catalog_id_exemption_reason !== undefined) {
+    const rawReason = String(req.body.catalog_id_exemption_reason ?? '').trim();
+    if (rawReason === '') {
+      catalogExemptionReason = null;
+    } else if (/^[1-6]$/.test(rawReason)) {
+      catalogExemptionReason = Number(rawReason);
+    } else {
+      return res.status(400).json({ ok: false, error: 'カタログIDなしの理由は1〜6から選んでください' });
+    }
+  }
   // 既存 JSON が壊れていたら何を消したか分からなくなるので、上書きせず止める (Codex R2 medium)
   let prevAttrs = [];
   if (prevRkRow && String(prevRkRow.attributes_json || '').trim()) {
@@ -1164,20 +1177,22 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   db.transaction(() => {
     db.prepare(`
       INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number,
+        catalog_id_exemption_reason,
         shipping_method_group, postage_included, normal_delivery_date_id,
         white_bg_drive_file_id, white_bg_drive_url)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(draft_id) DO UPDATE SET
         genre_id = excluded.genre_id,
         attributes_json = excluded.attributes_json,
         article_number = excluded.article_number,
+        catalog_id_exemption_reason = excluded.catalog_id_exemption_reason,
         shipping_method_group = excluded.shipping_method_group,
         postage_included = excluded.postage_included,
         normal_delivery_date_id = excluded.normal_delivery_date_id,
         white_bg_drive_file_id = excluded.white_bg_drive_file_id,
         white_bg_drive_url = excluded.white_bg_drive_url,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    `).run(draft.id, genreId, attributesJson, articleNumber,
+    `).run(draft.id, genreId, attributesJson, articleNumber, catalogExemptionReason,
       shippingGroup, postageIncluded, deliveryDateId, whiteBgFileId, whiteBgRaw);
     if (shopCategoryIds !== null) {
       setDraftShopCategories(db, draft.id, shopCategoryIds);

@@ -1116,10 +1116,30 @@ check('payload: variants は ne_code キー + 属性 + 型番なし例外',
   && pl.variants['rk-smoke-1'].attributes[0].name === 'ブランド名',
   JSON.stringify(pl.variants));
 
-// メーカー型番があれば value で送る
+// 🚨 articleNumber = RMS 画面の「カタログID」= JAN。メーカー型番を入れると IE0228 で登録が落ちる
+// (2026-09-02 shaganshi で実証)。型番を入れても articleNumber は免除理由のまま、が正しい
 db.prepare(`UPDATE draft_rakuten SET article_number = 'ABC-100' WHERE draft_id = ?`).run(rkId);
-check('payload: 型番があれば value で送る',
-  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.value === 'ABC-100');
+check('payload: メーカー型番は articleNumber に入れない (IE0228 の再発防止)',
+  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.exemptionReason === 5
+  && listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.value === undefined,
+  JSON.stringify(listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber));
+
+// カタログIDなしの理由は選んだ値で送る (未選択なら 5)
+db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = 3 WHERE draft_id = ?`).run(rkId);
+check('payload: カタログIDなしの理由は選んだ値で送る',
+  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.exemptionReason === 3);
+// 1 (セット商品) は articleNumberForSet が要るのでまだ送れない → 止める
+db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = 1 WHERE draft_id = ?`).run(rkId);
+check('payload: 理由1 (セット商品) は未対応として止める',
+  listing.buildItemPayload(db, rkId).ok === false);
+db.prepare(`UPDATE draft_rakuten SET catalog_id_exemption_reason = NULL WHERE draft_id = ?`).run(rkId);
+
+// JAN があればそれをカタログIDとして送る (免除理由より優先)
+db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
+check('payload: JANがあればカタログIDとして value で送る',
+  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.value === '4901234567894',
+  JSON.stringify(listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber));
+db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(rkId);
 
 // ─── 2026-07-27 出品仕様: 税率 / JAN / 配送 / 納期 / 白抜き / 画像20枚 ───
 check('taxRateToPayment: 8% → payment.taxRate 0.08', listing.taxRateToPayment('8%')?.taxRate === 0.08);
@@ -1560,9 +1580,11 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   check('メーカー型番: 欄に入れれば属性行が無くても通り、属性として自動で積まれる',
     bm.ok === true && attrsOf(bm).some((a2) => a2.name === MODEL && a2.values[0] === 'toys3pen'),
     JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
-  check('メーカー型番: articleNumber にも入る (楽天の型番フィールド)',
+  // この draft は JAN 付き → articleNumber は JAN になる。型番 (toys3pen) が混ざらないことが要点
+  check('メーカー型番: articleNumber (= カタログID) には入れない (2026-09-02 IE0228 の再発防止)',
     bm.ok === true && bm.payload.variants['gd-smoke-1'].articleNumber
-    && bm.payload.variants['gd-smoke-1'].articleNumber.value === 'toys3pen',
+    && bm.payload.variants['gd-smoke-1'].articleNumber.value !== 'toys3pen'
+    && bm.payload.variants['gd-smoke-1'].articleNumber.exemptionReason === undefined,
     JSON.stringify(bm.ok ? bm.payload.variants['gd-smoke-1'].articleNumber : bm.reasons));
 
   // ② 欄が空なら、辞書必須の メーカー型番 は今までどおり欠落エラー (黙って通さない)

@@ -1572,7 +1572,7 @@
           // 出ていない、という直せない状態になる)
           const modelAutoResolve = !modelConflict && legacyModels.length === 1 && !rakuten?.article_number;
         %>
-        <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信。商品属性にも自動で入ります)</span><span class="ftag ftag-m">手入力</span></label>
+        <label>メーカー型番 <span class="muted">(商品属性の「メーカー型番」に入ります。カタログIDではありません)</span><span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="rk-article" value="<%= rakuten?.article_number || legacyModel || '' %>">
         <% if (modelConflict) { %>
           <%# 止めるだけだと画面から直せない (Codex R2 high)。どれを残すかを押して決められるようにする。
@@ -1598,6 +1598,42 @@
           <div class="muted" style="font-size:11px;">ℹ️ 商品属性に入っていた値をここへ移しました。保存すると 1 箇所にまとまります</div>
         <% } %>
       </div>
+    </div>
+
+    <%# カタログID (2026-09-02 新設)。RMS 画面の「カタログID」= API の articleNumber。
+        入口は基本情報タブの JAN 欄ひとつに保つ (#1029 の「入口は1つ」と同じ方針) ので、
+        ここでは JAN が無いときの理由だけを選ばせる。
+        🚨 2026-09-02 まで、この欄にメーカー型番を送っていて IE0228 で登録が落ちていた %>
+    <div class="field">
+      <label>カタログID <span class="muted">(RMSの「カタログID」。JANコードの入口は基本情報タブ)</span></label>
+      <% if (draft.jan_code) { %>
+        <p class="muted" style="margin:4px 0;">
+          ✅ 基本情報タブのJANコード <strong><%= draft.jan_code %></strong> をカタログIDとして送ります。
+        </p>
+      <% } else { %>
+        <p class="muted" style="margin:4px 0;">
+          JANコードが未入力です。<strong>カタログIDなしの理由</strong>を選んでください
+          (基本情報タブにJANを入れると、そちらが優先されます)。
+        </p>
+        <%
+          const exReason = rakuten && rakuten.catalog_id_exemption_reason != null
+            ? Number(rakuten.catalog_id_exemption_reason) : null;
+          // RMS 画面と同じ並び。6 (頒布会商品) は RMS の選択肢に出ないので載せない
+          const exOptions = [
+            [1, '1: セット商品 (未対応 — 構成品のJAN一覧が要ります)'],
+            [2, '2: サービス商品'],
+            [3, '3: 店舗オリジナル商品'],
+            [4, '4: 項目選択肢在庫商品'],
+            [5, '5: 該当製品コードなし'],
+          ];
+        %>
+        <select id="rk-catalog-exemption" style="max-width:360px;">
+          <option value="" <%= exReason == null ? 'selected' : '' %>>未選択 (5: 該当製品コードなし で送ります)</option>
+          <% for (const [v, label] of exOptions) { %>
+            <option value="<%= v %>" <%= exReason === v ? 'selected' : '' %>><%= label %></option>
+          <% } %>
+        </select>
+      <% } %>
     </div>
 
     <div class="field">
@@ -1637,9 +1673,27 @@
           if (rkAttrs.length === 0) rkAttrs = [{ name: '', values: [''] }];
         %>
         <% for (const a of rkAttrs) { %>
+          <%# 保存済みの行にも辞書の性質を出す (2026-09-02)。ここに「選択式」が出ていなかったため、
+              代表カラーに自由入力した値がそのまま送られて IE0418 で登録が落ちた %>
+          <%
+            const da = genreDict && a.name ? genreDict.attributes.find((d) => d.name === a.name) : null;
+            const daHint = da
+              ? [da.mandatory ? '必須' : null, da.inputMethod === 'SELECTIVE' ? '選択式' : null,
+                 da.unit ? '単位:' + da.unit : null, da.maxLength ? '〜' + da.maxLength + '文字' : null]
+                .filter(Boolean).join(' / ')
+              : '';
+          %>
           <tr>
-            <td><input type="text" class="rk-attr-name" value="<%= a.name || '' %>"></td>
-            <td><input type="text" class="rk-attr-value" value="<%= (a.values && a.values[0]) || '' %>"></td>
+            <td><input type="text" class="rk-attr-name" value="<%= a.name || '' %>">
+              <% if (daHint) { %><div class="muted" style="font-size:11px;"><%= daHint %></div><% } %>
+            </td>
+            <td><input type="text" class="rk-attr-value" value="<%= (a.values && a.values[0]) || '' %>">
+              <% if (da && da.inputMethod === 'SELECTIVE') { %>
+                <div class="muted" style="font-size:11px; color:#b45309;">
+                  ⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)
+                </div>
+              <% } %>
+            </td>
             <td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>
           </tr>
         <% } %>
@@ -2471,13 +2525,20 @@
          meta.unit ? '単位:' + meta.unit : null, meta.maxLength ? '〜' + meta.maxLength + '文字' : null]
           .filter(Boolean).join(' / ')
       : '';
+    const selective = !!(meta && meta.inputMethod === 'SELECTIVE');
     tr.innerHTML = '<td><input type="text" class="rk-attr-name">'
       + (hint ? '<div class="muted" style="font-size:11px;"></div>' : '') + '</td>'
-      + '<td><input type="text" class="rk-attr-value"></td>'
+      + '<td><input type="text" class="rk-attr-value">'
+      + (selective ? '<div class="muted rk-attr-selective" style="font-size:11px; color:#b45309;"></div>' : '') + '</td>'
       + '<td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>';
     tr.querySelector('.rk-attr-name').value = name || '';
     tr.querySelector('.rk-attr-value').value = value || '';
     if (hint) tr.querySelector('td div').textContent = hint;
+    // 選択式は自由入力できない (2026-09-02 代表カラーの IE0418)。値欄の直下に出す
+    if (selective) {
+      tr.querySelector('.rk-attr-selective').textContent =
+        '⚠️ 選択式 — 楽天が用意した値と同じ表記でないと登録に失敗します (自由入力できません)';
+    }
     if (meta && meta.mandatory) tr.querySelector('.rk-attr-name').style.borderColor = '#fca5a5';
     document.querySelector('#rk-attrs tbody').appendChild(tr);
     return tr;
@@ -2657,6 +2718,11 @@
     return {
       genre_id: document.getElementById('rk-genre').value,
       article_number: document.getElementById('rk-article').value,
+      // カタログIDなしの理由。JAN が入っていると欄自体を出さないので、その場合は送らない
+      // (undefined = 未送信 → サーバは既存値を維持する。null を送ると消えてしまう)
+      ...(document.getElementById('rk-catalog-exemption')
+        ? { catalog_id_exemption_reason: document.getElementById('rk-catalog-exemption').value }
+        : {}),
       attributes: attrs,
       // メーカー型番の競合を人が解消したときだけ true (サーバはこのとき旧値を捨てる)
       resolve_model_conflict: modelConflictResolved,
