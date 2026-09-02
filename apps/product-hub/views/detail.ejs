@@ -657,7 +657,7 @@
           </div>
         </div>
         <div style="flex:1">
-          <label>JANコード<span class="ftag ftag-m">手入力</span></label>
+          <label>JANコード <span class="muted">(楽天の「カタログID」— カテゴリ・属性タブと同じ値)</span><span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
           <% if (variation.kind === 'variation' && variation.members.length > 1) { %>
             <%# 2026-08-28 中原さん要望: バリエーションありのときは SKU ごとに JAN を控える %>
@@ -815,18 +815,18 @@
           <% } %>
           <%# SKU別JAN (2026-08-28 中原さん要望) %>
           <p class="muted" style="margin:8px 0 0; font-size:12px;">
-            🏷 <strong>JANコードはSKUごと</strong>に入力してください (入力すると即保存。空欄にすると解除)。
-            基本情報タブのJAN欄はこのページ代表の1つ (楽天のカタログID用) です。
+            🏷 <strong>カタログID (JAN) と選択肢はSKUごと</strong>に入力してください (入力すると即保存。空欄にすると解除)。
+            JANが空のSKUは、カテゴリ・属性タブの「カタログIDなしの理由」で送られます。
           </p>
           <table class="list" style="margin-top:8px;">
             <thead><tr>
               <th style="width:170px">商品コード</th><th>商品名</th><th style="width:80px">取扱区分</th><th style="width:50px">在庫</th>
               <th style="width:80px">原価<span class="muted" style="font-weight:400">(税抜)</span></th>
               <%# SKU別JAN (2026-08-28 中原さん要望)。バリエーションありのときはページ代表のJAN1つでは足りない %>
-              <%# 項目選択肢 (2026-09-02 カラバリ出品)。楽天は variants[sku].selectorValues が必須で、
-                  NE 側に軸の情報が無いのでここで手入力する %>
-              <th style="width:130px">項目選択肢<br><span class="muted" style="font-weight:400; font-size:11px;">見出しは楽天タブ</span></th>
-              <th style="width:140px">JANコード</th>
+              <%# 選択肢 (2026-09-02 カラバリ出品)。楽天は variants[sku].selectorValues が必須で、
+                  NE 側に軸の情報が無いのでここで手入力する。列名は RMS の「バリエーション」の用語に合わせる %>
+              <th style="width:130px">選択肢<br><span class="muted" style="font-weight:400; font-size:11px;">項目: <%= rakuten?.variant_selector_name || '未設定 (カテゴリ・属性タブ)' %></span></th>
+              <th style="width:140px">カタログID (JAN)</th>
               <% if (showSkuPrices) { %><th style="width:100px">売価<span class="muted" style="font-weight:400">(税込)</span></th><th style="width:110px">利益</th><% } %>
               <th style="width:70px"></th>
             </tr></thead>
@@ -1533,10 +1533,9 @@
   <!-- ═══ タブ5: カテゴリ・属性 ═══ -->
   <div class="tab-panel" id="tab-category">
   <div class="card">
-    <h2>🗂 カテゴリ・属性 <span class="muted" style="font-weight:400">(楽天のジャンル・店舗内カテゴリ・商品属性)</span></h2>
+    <h2>🗂 カテゴリ・属性 <span class="muted" style="font-weight:400">(楽天RMSの商品編集画面と同じ項目名・同じ並びにしています)</span></h2>
 
-    <div class="field" style="display:flex; gap:12px;">
-      <div style="flex:1">
+    <div class="field">
         <label class="req">ジャンルID (楽天)<span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
         <div style="display:flex; gap:6px;">
           <input type="text" id="rk-genre" inputmode="numeric" value="<%= rakuten?.genre_id || '' %>" placeholder="AIが自動で提案します" style="flex:1;">
@@ -1552,106 +1551,57 @@
             <span class="muted">辞書未取得 — 取得すると必須属性の行が自動で並び、登録前にチェックされます</span>
           <% } %>
         </div>
-      </div>
-      <div style="flex:1">
-        <%# メーカー型番の入口は**この欄だけ** (2026-08-31 中原さん: RMS でも入力項目は 1 つなのに、
-            商品属性にも同じ欄があって二重入力になっていた)。ジャンル属性に「メーカー型番」がある
-            ジャンルでは、送信時にこの値が属性へ自動で積まれる (カタログID と同じ方式)。
-            旧データで属性側に入っている分はここへ引き上げて表示する — 保存すれば統合される %>
-        <%
-          let rkAttrsRaw = [];
-          try { rkAttrsRaw = JSON.parse(rakuten?.attributes_json || '[]'); } catch (e) { rkAttrsRaw = []; }
-          // 旧データに残っている メーカー型番 の値をすべて集める (1 行 1 値とは限らない)
-          // 旧形式 {name, value} も拾う (Codex R3 high): これを取りこぼすと、
-          // サーバは 400 にするのに画面には値が出ず、直せないまま止まる
-          const legacyModels = [...new Set(rkAttrsRaw
-            .filter((a) => a && a.name === modelAttrName)
-            .flatMap((a) => (Array.isArray(a.values) ? a.values : (a.value !== undefined ? [a.value] : [])))
-            .map((v) => String(v == null ? '' : v).trim())
-            .filter(Boolean))];
-          const legacyModel = legacyModels.length === 1 ? legacyModels[0] : '';
-          // 「欄と違う値が属性に残っている」「属性に複数ある」= 人が決めないと消えてしまう。
-          // 隠さずに見せて、サーバ側 (保存 API) も 400 で止める (Codex R1 high/medium)
-          const modelConflict = legacyModels.length > 1
-            || (legacyModels.length === 1 && rakuten?.article_number && rakuten.article_number !== legacyModels[0]);
-          // 旧値を欄へ引き上げて表示しているケース (欄が空で属性側に 1 つだけ) は、
-          // **人がその値を画面で見ている**状態。そのまま保存しても書き換えて保存しても
-          // 「見えている値が正」なので、解消フラグを最初から立てておく (Codex R4 high:
-          // 立てないと、書き換えて保存 → DB の旧値と食い違って 400、なのに解消ボタンが
-          // 出ていない、という直せない状態になる)
-          const modelAutoResolve = !modelConflict && legacyModels.length === 1 && !rakuten?.article_number;
-        %>
-        <label>メーカー型番 <span class="muted">(商品属性の「メーカー型番」に入ります。カタログIDではありません)</span><span class="ftag ftag-m">手入力</span></label>
-        <input type="text" id="rk-article" value="<%= rakuten?.article_number || legacyModel || '' %>">
-        <% if (modelConflict) { %>
-          <%# 止めるだけだと画面から直せない (Codex R2 high)。どれを残すかを押して決められるようにする。
-              押した値だけが残り、他は捨てられる — 捨てる操作を人に選ばせるのが要点 %>
-          <div class="banner-warn" style="margin:6px 0 0; font-size:12px;" id="rk-model-conflict">
-            ⚠️ <%= modelAttrName %>が 2 つ以上あります。<strong>どれを残すか選んでください</strong>
-            (選んだ値だけが残ります)。このままでは保存できません。
-            <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;">
-              <% for (const m of legacyModels) { %>
-                <button type="button" class="btn btn-sm rk-model-pick" data-value="<%= m %>">
-                  商品属性の「<%= m %>」を残す
-                </button>
-              <% } %>
-              <% if (rakuten?.article_number && !legacyModels.includes(rakuten.article_number)) { %>
-                <button type="button" class="btn btn-sm rk-model-pick" data-value="<%= rakuten.article_number %>">
-                  この欄の「<%= rakuten.article_number %>」を残す
-                </button>
-              <% } %>
-              <button type="button" class="btn btn-sm rk-model-pick" data-value="">型番なしにする</button>
-            </div>
-          </div>
-        <% } else if (!rakuten?.article_number && legacyModel) { %>
-          <div class="muted" style="font-size:11px;">ℹ️ 商品属性に入っていた値をここへ移しました。保存すると 1 箇所にまとまります</div>
-        <% } %>
-      </div>
     </div>
 
-    <%# カタログID (2026-09-02 新設)。RMS 画面の「カタログID」= API の articleNumber。
-        入口は基本情報タブの JAN 欄ひとつに保つ (#1029 の「入口は1つ」と同じ方針) ので、
-        ここでは JAN が無いときの理由だけを選ばせる。
-        🚨 2026-09-02 まで、この欄にメーカー型番を送っていて IE0228 で登録が落ちていた %>
+    <%# カタログID — RMS の「カタログID」と**同じ構成** (2026-09-02 中原さん: 楽天のUIと揃えないと
+        どこがどこに対応するか直感で分からない): ◉IDあり=JAN / ○IDなし=理由プルダウン。
+        JANコードの実体は product_drafts.jan_code = 基本情報タブの JAN 欄と同じ値 (どちらで直しても揃う)。
+        🚨 2026-09-02 まで、この欄 (API の articleNumber) にメーカー型番を送っていて IE0228 で登録が落ちていた %>
+    <%
+      const exReason = rakuten && rakuten.catalog_id_exemption_reason != null
+        ? Number(rakuten.catalog_id_exemption_reason) : null;
+      // RMS 画面と同じ並び。6 (頒布会商品) は RMS の選択肢に出ないので載せない
+      const exOptions = [
+        [1, '1: セット商品 (未対応 — 構成品のJAN一覧が要ります)'],
+        [2, '2: サービス商品'],
+        [3, '3: 店舗オリジナル商品'],
+        [4, '4: 項目選択肢在庫商品'],
+        [5, '5: 該当製品コードなし'],
+      ];
+      const catalogHasId = !!draft.jan_code;
+    %>
     <div class="field">
-      <label>カタログID <span class="muted">(RMSの「カタログID」。JANコードの入口は基本情報タブ)</span></label>
-      <% if (draft.jan_code) { %>
-        <p class="muted" style="margin:4px 0;">
-          ✅ 基本情報タブのJANコード <strong><%= draft.jan_code %></strong> をカタログIDとして送ります。
-        </p>
-      <% } else { %>
-        <p class="muted" style="margin:4px 0;">
-          JANコードが未入力です。<strong>カタログIDなしの理由</strong>を選んでください
-          (基本情報タブにJANを入れると、そちらが優先されます)。
-        </p>
-        <%
-          const exReason = rakuten && rakuten.catalog_id_exemption_reason != null
-            ? Number(rakuten.catalog_id_exemption_reason) : null;
-          // RMS 画面と同じ並び。6 (頒布会商品) は RMS の選択肢に出ないので載せない
-          const exOptions = [
-            [1, '1: セット商品 (未対応 — 構成品のJAN一覧が要ります)'],
-            [2, '2: サービス商品'],
-            [3, '3: 店舗オリジナル商品'],
-            [4, '4: 項目選択肢在庫商品'],
-            [5, '5: 該当製品コードなし'],
-          ];
-        %>
-        <select id="rk-catalog-exemption" style="max-width:360px;">
-          <option value="" <%= exReason == null ? 'selected' : '' %>>未選択 (5: 該当製品コードなし で送ります)</option>
+      <label class="req">カタログID <span class="muted">(RMSの「カタログID」と同じ。JAN = 基本情報タブのJANコードと同じ値)</span><span class="ftag ftag-m">手入力</span></label>
+      <div style="display:flex; gap:18px; align-items:center; margin:2px 0 4px;">
+        <label style="display:flex; align-items:center; gap:4px; font-size:13px; cursor:pointer; font-weight:400;">
+          <input type="radio" name="rk-catalog-mode" value="with" <%= catalogHasId ? 'checked' : '' %>> IDあり
+        </label>
+        <label style="display:flex; align-items:center; gap:4px; font-size:13px; cursor:pointer; font-weight:400;">
+          <input type="radio" name="rk-catalog-mode" value="without" <%= catalogHasId ? '' : 'checked' %>> IDなし
+        </label>
+      </div>
+      <div id="rk-catalog-with" style="<%= catalogHasId ? '' : 'display:none;' %>">
+        <input type="text" id="rk-catalog-jan" inputmode="numeric" maxlength="13" style="max-width:220px;"
+               value="<%= draft.jan_code || '' %>" placeholder="JANコード (8/12/13桁)">
+        <div class="muted" style="font-size:11px;">基本情報タブのJANコード欄と同じ値です (どちらで直しても揃います)</div>
+      </div>
+      <div id="rk-catalog-without" style="<%= catalogHasId ? 'display:none;' : '' %>">
+        <select id="rk-catalog-exemption" style="max-width:380px;">
+          <option value="" <%= exReason == null ? 'selected' : '' %>>カタログIDなしの理由 (未選択は 5: 該当製品コードなし で送ります)</option>
           <% for (const [v, label] of exOptions) { %>
             <option value="<%= v %>" <%= exReason === v ? 'selected' : '' %>><%= label %></option>
           <% } %>
         </select>
-      <% } %>
+      </div>
     </div>
 
-    <%# 項目選択肢の見出し (2026-09-02 カラバリ出品)。SKUごとの値は基本情報タブのSKU表で入力する。
-        楽天は variantSelectors[].displayName にこの見出しが入る %>
+    <%# バリエーション — RMS の「バリエーション」(項目と選択肢) に対応 (2026-09-02 カラバリ出品)。
+        項目名 = variantSelectors[].displayName。選択肢は SKU ごとに基本情報タブの SKU 表で入力する %>
     <% if (variation && variation.kind === 'variation' && variation.memberCount > 1) { %>
       <div class="field">
-        <label>項目選択肢の見出し <span class="muted">(「種類」「カラー」など。SKUごとの値は基本情報タブのSKU表で入力します)</span><span class="ftag ftag-m">手入力</span></label>
+        <label>バリエーション <span class="muted">(RMSの「バリエーション」。項目名をここに、選択肢は基本情報タブのSKU表で)</span><span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="rk-variant-selector" maxlength="50" style="max-width:280px;"
-               value="<%= rakuten?.variant_selector_name || '' %>" placeholder="例: カラー">
+               value="<%= rakuten?.variant_selector_name || '' %>" placeholder="項目名 (例: カラー・種類)">
         <p class="muted" style="margin:4px 0 0; font-size:11px;">
           このページは <%= variation.memberCount %> SKU のバリエーションページとして登録されます。
         </p>
@@ -1659,7 +1609,7 @@
     <% } %>
 
     <div class="field">
-      <label>店舗内カテゴリ <span class="muted">(RMSの「表示先カテゴリ」と同じ5枠。枠1がメインページ。RMSへは登録後に自動反映)</span><span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
+      <label>表示先カテゴリ <span class="muted">(RMSの「表示先カテゴリ」と同じ5枠。店舗内カテゴリのこと。枠1がメインページ。RMSへは登録後に自動反映)</span><span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
       <% if (shopCategories.length === 0) { %>
         <p class="muted" style="margin:4px 0;">
           カテゴリ一覧が未取り込みです。<a href="/apps/product-hub/list">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
@@ -1683,14 +1633,65 @@
       <% } %>
     </div>
 
-    <label>商品属性 <span class="muted">(「ジャンル情報を取得」で必須属性の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
+    <label>商品仕様 <span class="muted">(RMSの「商品仕様」。「ジャンル情報を取得」で必須の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
     <table class="list" id="rk-attrs" style="margin-bottom:8px;">
-      <thead><tr><th style="width:40%">属性名 (例: ブランド名)</th><th>値</th><th style="width:50px"></th></tr></thead>
+      <thead><tr><th style="width:40%">項目 (例: ブランド名)</th><th>値</th><th style="width:50px"></th></tr></thead>
       <tbody>
+        <%# メーカー型番は RMS でも「商品仕様」の中の 1 項目なので、固定行としてここに置く (2026-09-02
+            中原さん: 独立欄が上部にあると、RMS のどこに対応するか分からずカタログIDと誤認する —
+            実際 shaganshi で型番がカタログIDとして送られ IE0228 で落ちた)。
+            値の実体は draft_rakuten.article_number のまま (#1029 の「入口は1つ」を維持。
+            送信時に属性「メーカー型番」へ自動で積まれる配線も不変)。
+            旧データで属性側に残っている値は引き上げて表示し、食い違いはバナーで人に選ばせる %>
+        <%
+          let rkAttrsRaw = [];
+          try { rkAttrsRaw = JSON.parse(rakuten?.attributes_json || '[]'); } catch (e) { rkAttrsRaw = []; }
+          // 旧形式 {name, value} も拾う (Codex R3 high): 取りこぼすとサーバは 400 なのに画面に値が出ない
+          const legacyModels = [...new Set(rkAttrsRaw
+            .filter((a) => a && a.name === modelAttrName)
+            .flatMap((a) => (Array.isArray(a.values) ? a.values : (a.value !== undefined ? [a.value] : [])))
+            .map((v) => String(v == null ? '' : v).trim())
+            .filter(Boolean))];
+          const legacyModel = legacyModels.length === 1 ? legacyModels[0] : '';
+          const modelConflict = legacyModels.length > 1
+            || (legacyModels.length === 1 && rakuten?.article_number && rakuten.article_number !== legacyModels[0]);
+          // 欄が空で属性側に 1 つだけ = 引き上げ表示。人がその値を見ているので解消フラグを立てておく
+          // (Codex R4 high: 立てないと、書き換えて保存 → 400 なのに解消ボタンが出ていない、で詰む)
+          const modelAutoResolve = !modelConflict && legacyModels.length === 1 && !rakuten?.article_number;
+          const modelDict = genreDict ? genreDict.attributes.find((d) => d.name === modelAttrName) : null;
+        %>
+        <tr style="background:#f8fafc;">
+          <td>
+            <div style="padding:4px 2px; font-weight:600;"><%= modelAttrName %></div>
+            <div class="muted" style="font-size:11px;"><%= modelDict && modelDict.mandatory ? '必須 / ' : '' %>固定の項目 — 空なら「型番なし」で送信</div>
+          </td>
+          <td>
+            <input type="text" id="rk-article" value="<%= rakuten?.article_number || legacyModel || '' %>">
+            <% if (modelConflict) { %>
+              <%# 止めるだけだと画面から直せない (Codex R2 high)。どれを残すかを押して決めさせる %>
+              <div class="banner-warn" style="margin:6px 0 0; font-size:12px;" id="rk-model-conflict">
+                ⚠️ <%= modelAttrName %>が 2 つ以上あります。<strong>どれを残すか選んでください</strong>
+                (選んだ値だけが残ります)。このままでは保存できません。
+                <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;">
+                  <% for (const m of legacyModels) { %>
+                    <button type="button" class="btn btn-sm rk-model-pick" data-value="<%= m %>">「<%= m %>」を残す</button>
+                  <% } %>
+                  <% if (rakuten?.article_number && !legacyModels.includes(rakuten.article_number)) { %>
+                    <button type="button" class="btn btn-sm rk-model-pick" data-value="<%= rakuten.article_number %>">「<%= rakuten.article_number %>」を残す</button>
+                  <% } %>
+                  <button type="button" class="btn btn-sm rk-model-pick" data-value="">型番なしにする</button>
+                </div>
+              </div>
+            <% } else if (!rakuten?.article_number && legacyModel) { %>
+              <div class="muted" style="font-size:11px;">ℹ️ 旧データの値をここへ移しました。保存すると 1 箇所にまとまります</div>
+            <% } %>
+          </td>
+          <td></td>
+        </tr>
         <%
           let rkAttrs = [];
           try { rkAttrs = JSON.parse(rakuten?.attributes_json || '[]'); } catch (e) { rkAttrs = []; }
-          // メーカー型番は上の欄が入口なので行として出さない (カタログID と同じ考え方)
+          // メーカー型番は上の固定行が入口なので、自由入力の行としては出さない
           rkAttrs = rkAttrs.filter((a) => a.name !== modelAttrName);
           if (rkAttrs.length === 0) rkAttrs = [{ name: '', values: [''] }];
         %>
@@ -1883,7 +1884,9 @@
     if (need.length > 0) {
       const vals = {};
       document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
-        const n = tr.querySelector('.rk-attr-name').value.trim();
+        const nameEl = tr.querySelector('.rk-attr-name');
+        if (!nameEl) return;   // メーカー型番の固定行 (rk-article) は属性行ではない
+        const n = nameEl.value.trim();
         if (n) vals[n] = tr.querySelector('.rk-attr-value').value.trim();
       });
       for (const n of need) {
@@ -2525,8 +2528,10 @@
                  .filter(Boolean).join(' / ');
       b.addEventListener('click', () => {
         // 名前も値も空の行が余っていれば、そこを使う (押すたびに空行が増えない)
-        const blank = [...document.querySelectorAll('#rk-attrs tbody tr')].find((tr) =>
-          !tr.querySelector('.rk-attr-name').value.trim() && !tr.querySelector('.rk-attr-value').value.trim());
+        const blank = [...document.querySelectorAll('#rk-attrs tbody tr')].find((tr) => {
+          const nameEl = tr.querySelector('.rk-attr-name');   // 固定行 (メーカー型番) は対象外
+          return nameEl && !nameEl.value.trim() && !tr.querySelector('.rk-attr-value').value.trim();
+        });
         if (blank) blank.remove();
         const tr = addAttrRow(a.name, '', a);
         renderAttrSuggest();
@@ -2610,7 +2615,9 @@
       // 既存行の属性名を集め、無い必須属性だけ行を足す (人の入力は消さない)
       const present = new Set();
       document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
-        const n = tr.querySelector('.rk-attr-name').value.trim();
+        const nameEl = tr.querySelector('.rk-attr-name');
+        if (!nameEl) return;   // メーカー型番の固定行は消さない
+        const n = nameEl.value.trim();
         if (n) present.add(n);
         // 空行 (name も value も空) は整理して詰める
         if (!n && !tr.querySelector('.rk-attr-value').value.trim()) tr.remove();
@@ -2732,20 +2739,23 @@
   function collectRakutenFields() {
     const attrs = [];
     document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
+      const nameEl = tr.querySelector('.rk-attr-name');
+      if (!nameEl) return;   // メーカー型番の固定行は article_number として別送 (属性に混ぜない)
       attrs.push({
-        name: tr.querySelector('.rk-attr-name').value,
+        name: nameEl.value,
         value: tr.querySelector('.rk-attr-value').value,
       });
     });
     return {
       genre_id: document.getElementById('rk-genre').value,
       article_number: document.getElementById('rk-article').value,
-      // カタログIDなしの理由。JAN が入っていると欄自体を出さないので、その場合は送らない
-      // (undefined = 未送信 → サーバは既存値を維持する。null を送ると消えてしまう)
-      ...(document.getElementById('rk-catalog-exemption')
-        ? { catalog_id_exemption_reason: document.getElementById('rk-catalog-exemption').value }
-        : {}),
-      // 項目選択肢の見出し (カラバリのときだけ欄がある。無ければ送らない = 既存維持)
+      // カタログID (RMS と同じ ◉IDあり/○IDなし)。IDあり = JAN欄の値を jan_code へ保存、
+      // IDなし = '' で jan_code をクリア (IDなしを明示的に選んだ人の意思)
+      catalog_jan: (document.querySelector('input[name="rk-catalog-mode"]:checked') || {}).value === 'with'
+        ? document.getElementById('rk-catalog-jan').value
+        : '',
+      catalog_id_exemption_reason: document.getElementById('rk-catalog-exemption').value,
+      // バリエーションの項目名 (カラバリのときだけ欄がある。無ければ送らない = 既存維持)
       ...(document.getElementById('rk-variant-selector')
         ? { variant_selector_name: document.getElementById('rk-variant-selector').value }
         : {}),
@@ -3320,7 +3330,28 @@
     });
   })();
 
-  // SKU別の項目選択肢 (2026-09-02 カラバリ出品)。JAN欄と同じ作法: 入力即保存・POSTは1本ずつ
+  // カタログID: RMS と同じ「IDあり / IDなし」の切替 + 基本情報タブの JAN 欄との同期 (2026-09-02)
+  (function () {
+    const withBox = document.getElementById('rk-catalog-with');
+    const withoutBox = document.getElementById('rk-catalog-without');
+    if (!withBox || !withoutBox) return;
+    document.querySelectorAll('input[name="rk-catalog-mode"]').forEach((r) => {
+      r.addEventListener('change', () => {
+        const withMode = document.querySelector('input[name="rk-catalog-mode"]:checked')?.value === 'with';
+        withBox.style.display = withMode ? '' : 'none';
+        withoutBox.style.display = withMode ? 'none' : '';
+      });
+    });
+    // 同じ jan_code の 2 つのビュー (基本情報タブの JAN 欄とここ)。画面内で食い違わないよう相互コピー
+    const janHere = document.getElementById('rk-catalog-jan');
+    const janBasic = document.getElementById('f-jan');
+    if (janHere && janBasic) {
+      janHere.addEventListener('input', () => { if (janBasic.value !== janHere.value) janBasic.value = janHere.value; });
+      janBasic.addEventListener('input', () => { if (janHere.value !== janBasic.value) janHere.value = janBasic.value; });
+    }
+  })();
+
+  // SKU別の選択肢 (2026-09-02 カラバリ出品)。JAN欄と同じ作法: 入力即保存・POSTは1本ずつ
   (function () {
     const inputs = [...document.querySelectorAll('.sku-selector-input')];
     if (inputs.length === 0) return;
