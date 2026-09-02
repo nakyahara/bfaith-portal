@@ -118,8 +118,10 @@ export function buildEnrichContext(db) {
     }
   }
   if (tableExists(db, 'po_suppliers')) {
-    for (const r of db.prepare('SELECT supplier_code, supplier_name FROM po_suppliers').all()) {
-      ctx.suppliers.set(String(r.supplier_code), r.supplier_name);
+    // ⚠列名は name (supplier_name ではない — 2026-09-02 本番で no such column。
+    //   正=apps/purchase-orders/db.js initPurchaseOrders。テストも本物の init でテーブルを作る)
+    for (const r of db.prepare('SELECT supplier_code, name FROM po_suppliers').all()) {
+      ctx.suppliers.set(String(r.supplier_code), r.name);
     }
   }
   if (tableExists(db, 'mirror_sales_daily')) {
