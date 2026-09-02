@@ -280,5 +280,36 @@ console.log('\n── Yahoo カラバリ: 旧形式の記録を戻せる / 注�
   eq(r3.unmatched.length, 1, '★いま存在しない色は読み替えない (取り違えない)');
 }
 
+console.log('\n── au PAY の復旧 (商品に1つの価格) ──');
+{
+  // ★au PAY は引き当ての時点で skuCode = 商品コード に正規化されるので、
+  //   Yahoo のような旧形式の読み替えは要らない。ただし復旧が成り立つことは確かめる
+  const aupayRow = {
+    mall: 'aupay', neCode: 'au-001', rowKind: 'single', viaCode: null,
+    productName: 'ハッカ油スプレー', listingCode: 'au-001', skuCode: 'au-001',
+    sharedNote: 'au PAY は色ごとの価格を持ちません。変えるとこの商品の 6 通りすべてが同じ価格になります',
+    confidence: 'confirmed', priceSource: 'au PAY searchItemInfo (ライブ)', priceFetchedAt: null,
+    price: 999,   // ★いまモールにある価格 (さっき上げた値)
+    cost: 350, taxRate: 0.1, shipping: 182, feeRate: 0.12, url: 'https://example.com',
+  };
+  const evaluate = (row) => ({ evaluation: evaluateRow({ ...row, currentPrice: row.price, isRecovery: true }) });
+
+  const op1 = op('a1', 'confirmed', { mall: 'aupay', neCode: 'au-001',
+    listingCode: 'au-001', skuCode: 'au-001', expected: 980, next: 999 });
+  const r = buildRecoveryOperations(planRecovery({ operations: [op1] }).candidates, [aupayRow], evaluate);
+  eq(r.unmatched.length, 0, 'au PAY も戻す先を見つけられる');
+  eq(r.operations[0].newPrice, 980, '★戻す先は監査記録の値 (送信前の価格)');
+  eq(r.operations[0].expectedCurrentPrice, 999, '★楽観ロックの基準はいまモールにある価格');
+  eq(r.operations[0].skuCode, 'au-001', '送り先は商品コードのまま');
+  eq(r.operations[0].initialState, 'previewed', 'ガードを通る (復旧は値下げ幅を免除)');
+  ok((r.operations[0].guard.warns || []).some((w) => /通りすべてが同じ価格/.test(w)),
+    '★復旧 run でも「全部が変わる」注意書きが残る');
+
+  // 大文字小文字が違っても同じ商品として戻せる
+  const upRow = { ...aupayRow, listingCode: 'AU-001', skuCode: 'AU-001' };
+  const r2 = buildRecoveryOperations(planRecovery({ operations: [op1] }).candidates, [upRow], evaluate);
+  eq(r2.unmatched.length, 0, '★出品コードの大小が違っても戻せる');
+}
+
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);
 process.exitCode = failed === 0 ? 0 : 1;

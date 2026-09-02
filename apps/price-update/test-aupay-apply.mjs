@@ -6,7 +6,8 @@
  *
  * 実行: node apps/price-update/test-aupay-apply.mjs
  */
-import { parseSearchItemInfoXml, toIntPrice, fetchAupayItemDetail } from './aupay-apply.js';
+import { parseSearchItemInfoXml, toIntPrice, fetchAupayItemDetail,
+  planAupayUpdate, makeAupayClient } from './aupay-apply.js';
 import { fetchAupayPrices } from './live-price.js';
 
 let failed = 0;
@@ -184,6 +185,71 @@ console.log('\n── env が無ければ送らない (fail-closed) ──');
   ok(caught !== null && /未設定/.test(caught.message),
     '★プロキシの設定が無ければ取りにいかない: ' + (caught?.message || 'エラーが出なかった'));
   Object.assign(process.env, save);
+}
+
+console.log('\n── 送る前の判定 ──');
+{
+  const d = parseSearchItemInfoXml(xmlOf({ itemCode: 'zz-1', itemPrice: '980', choices: 0 }));
+
+  const okPlan = planAupayUpdate(d, 'zz-1', { 'zz-1': 980 }, { 'zz-1': 981 });
+  eq([okPlan.ok, okPlan.price, okPlan.currentPrice], [true, 981, 980], 'まっとうな更新は通る');
+
+  const same = planAupayUpdate(d, 'zz-1', { 'zz-1': 980 }, { 'zz-1': 980 });
+  eq([same.ok, same.noop], [true, true], '同じ値なら noop');
+
+  // ★色のコードを送り先にしたら止める (au PAY は商品に1つの価格)
+  const wrongKey = planAupayUpdate(d, 'zz-1', { 'zz-1-BK': 980 }, { 'zz-1-BK': 981 });
+  eq([wrongKey.ok, wrongKey.body.error], [false, 'SKU_KEY_MISMATCH'],
+    '★色のコードをキーに渡されたら送らない');
+
+  // 楽観ロック
+  const conflict = planAupayUpdate(d, 'zz-1', { 'zz-1': 900 }, { 'zz-1': 981 });
+  eq([conflict.ok, conflict.status, conflict.body.state], [false, 409, 'conflict'],
+    '★記録時と今の価格が違えば送らない');
+
+  eq(planAupayUpdate(d, 'zz-1', {}, { 'zz-1': 981 }).body.error, 'EXPECTED_REQUIRED',
+    '★記録時の価格が無ければ送らない');
+  eq(planAupayUpdate(d, 'zz-1', { 'zz-1': 980 }, { a: 1, b: 2 }).body.error, 'MULTIPLE_PRICES',
+    '★1商品に2つの価格は受けない');
+  eq(planAupayUpdate(d, 'zz-1', { 'zz-1': 980 }, { 'zz-1': 0 }).body.error, 'INVALID_PRICE',
+    '★0円は送らない');
+  eq(planAupayUpdate(d, 'other', { other: 980 }, { other: 981 }).body.error, 'ITEM_NOT_FOUND',
+    '★別の商品が返ってきたら送らない');
+  eq(planAupayUpdate({ ok: false, message: 'だめ' }, 'zz-1', {}, {}).body.error, 'ITEM_NOT_FOUND',
+    '取得できていなければ送らない');
+  // 大文字小文字の違いは同じ商品
+  const up = parseSearchItemInfoXml(xmlOf({ itemCode: 'ZZ-1', itemPrice: '980', choices: 0 }));
+  eq(planAupayUpdate(up, 'ZZ-1', { 'zz-1': 980 }, { 'zz-1': 981 }).ok, true,
+    '大文字小文字の違いは同じ商品として扱う');
+}
+
+console.log('\n── 送信クライアント ──');
+{
+  const detail = parseSearchItemInfoXml(xmlOf({ itemCode: 'zz-1', itemPrice: '980', choices: 0 }));
+  const mk = (postUpdate) => makeAupayClient({ getDetail: async () => detail, postUpdate });
+
+  const okc = mk(async () => ({ status: 200, json: { ok: true, applied: 981 } }));
+  const r1 = await okc.patchItemPrices('zz-1', { expected: { 'zz-1': 980 }, prices: { 'zz-1': 981 } });
+  eq([r1.status, r1.body.state, r1.body.applied['zz-1']], [200, 'applied', 981], '成功は applied');
+
+  // ★VPS が ok:false を返したら成功にしない
+  const ng = mk(async () => ({ status: 200, json: { ok: false, updateBody: '<status>1</status>' } }));
+  const r2 = await ng.patchItemPrices('zz-1', { expected: { 'zz-1': 980 }, prices: { 'zz-1': 981 } });
+  ok(r2.body.state !== 'applied', '★ok:false を成功にしない');
+
+  // 409 は conflict のまま返す
+  const cf = mk(async () => ({ status: 409, json: { ok: false, error: 'CONFLICT', conflict: { reason: '違う', live: 999 } } }));
+  const r3 = await cf.patchItemPrices('zz-1', { expected: { 'zz-1': 980 }, prices: { 'zz-1': 981 } });
+  eq([r3.status, r3.body.state], [409, 'conflict'], '★VPS の 409 は conflict のまま返す');
+
+  // 5xx はそのまま (execute 側が「結果不明」に倒す)
+  const boom = mk(async () => ({ status: 502, body: 'bad gateway', json: null }));
+  const r4 = await boom.patchItemPrices('zz-1', { expected: { 'zz-1': 980 }, prices: { 'zz-1': 981 } });
+  eq(r4.status, 502, '★5xx はそのまま返す');
+
+  // 照合のための再取得は楽天と同じ形
+  const got = await okc.fetchItemDetail('zz-1');
+  eq(got.item.variants['zz-1'].standardPrice, '980', '★照合の形は楽天とそろえる');
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);

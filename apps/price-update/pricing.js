@@ -16,6 +16,8 @@
  *   ・消費税率は m_products.消費税率 = 0.10 / 0.08 の小数。未登録は 10% 扱い (他アプリと同じ)
  */
 
+import { blockReasonOf } from './mall-capabilities.js';
+
 /** 消費税率が未登録なら 10% (amazon-accounting と同じ扱い) */
 export const DEFAULT_TAX_RATE = 0.10;
 /** 楽天APIの許容上限。これを超える値は送る前に落とす */
@@ -105,9 +107,11 @@ export function evaluateRow(row) {
   const current = num(row.currentPrice);
   const next = num(row.newPrice);
 
-  // Amazon はデータの側でも更新対象から外す (決定事項⑥。画面で選べないだけでは直叩きで突破される)
-  if (mall === 'amazon') blocks.push('Amazon は本ツールの更新対象外です (既存の価格管理の仕組みを使ってください)');
-  if (mall === 'aupay' || mall === 'qoo10') blocks.push('このモールは手動更新です (API更新は Phase 2)');
+  // ★更新できないモールはデータの側でも止める (画面で選べないだけでは直叩きで突破される)。
+  //   どのモールが更新できるかは mall-capabilities.js が正。
+  //   ここに直接書くと、モールを増やした時に片方だけ直し忘れる (2026-09-02 実際に起きた)
+  const blockReason = blockReasonOf(mall);
+  if (blockReason) blocks.push(blockReason);
 
   if (row.confidence !== 'confirmed') blocks.push('出品が確認できていない行は更新できません');
   if (current == null) {

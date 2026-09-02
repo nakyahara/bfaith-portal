@@ -69,8 +69,11 @@ console.log('\n── 原価割れ (手数料に依存しない保守式) ──
 console.log('\n── 更新対象外のモール ──');
 {
   has(evaluateRow({ ...base, mall: 'amazon' }).blocks, 'Amazon', 'Amazon は行データの側でも拒否 (決定事項⑥)');
-  has(evaluateRow({ ...base, mall: 'aupay' }).blocks, '手動更新', 'au PAY は手動');
-  has(evaluateRow({ ...base, mall: 'qoo10' }).blocks, '手動更新', 'Qoo10 は手動');
+  // ★au PAY は 2026-09-02 から更新できる (updateItemInfo が部分更新だと実測)。
+  //   ここが「手動」に戻っていたら、画面で選べても送信の手前で必ず弾かれる
+  ok(!evaluateRow({ ...base, mall: 'aupay' }).blocks.some((b) => /手動更新/.test(b)),
+    'au PAY は更新できる (手動扱いに戻っていない)');
+  has(evaluateRow({ ...base, mall: 'qoo10' }).blocks, '手動更新', 'Qoo10 はまだ手動');
 }
 
 console.log('\n── 引き当て・現在価格が確定していない行 ──');
