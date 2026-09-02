@@ -636,6 +636,9 @@ router.delete('/api/supplier/:code/draft', (req, res) => {
       // 下書きが無いときは deleted=false (画面側の入力クリアを誤発火させない、POST items:[] と同じ約束)
       if (!row) return { deleted: false, skuCount: 0 };
       const items = db.prepare('SELECT product_code AS code, qty FROM po_order_items WHERE order_id=?').all(row.id);
+      // キー未指定での削除は許さない (古い画面・パラメータ欠落で競合チェックを素通りさせない ─ Codex R2 High)。
+      // updated_at を持たない旧データだけは突合できないので例外的に通す
+      if (row.updated_at && !expectAt) return { conflict: true, missingKey: true, skuCount: items.length, updatedAt: row.updated_at };
       if (expectAt && row.updated_at !== expectAt) return { conflict: true, skuCount: items.length, updatedAt: row.updated_at };
       db.prepare("DELETE FROM po_orders WHERE id=? AND status='draft'").run(row.id);
       audit(db, {
@@ -647,7 +650,9 @@ router.delete('/api/supplier/:code/draft', (req, res) => {
     if (out.conflict) {
       return res.status(409).json({
         ok: false, conflict: true, skuCount: out.skuCount, updatedAt: out.updatedAt,
-        error: `この下書きは別の画面で更新されています (現在 ${out.skuCount}SKU)。最新を読み込んでから解除してください`,
+        error: out.missingKey
+          ? `下書きの解除に必要な確認キーがありません (現在 ${out.skuCount}SKU)。ページを再読み込みしてから解除してください`
+          : `この下書きは別の画面で更新されています (現在 ${out.skuCount}SKU)。最新を読み込んでから解除してください`,
       });
     }
     res.json({ ok: true, ...out });

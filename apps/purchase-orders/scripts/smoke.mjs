@@ -1167,8 +1167,13 @@ console.log('── P13b: 発注残ページ+消込API ──');
   // ── 下書きの解除 (DELETE): 発注数を1つずつ0に戻さなくても1クリックで破棄できる ──
   const putDraft = (qty, note) => j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ items: [{ code: 'noflyersticker', qty }], note: note || '解除テスト' }) });
+  // 画面と同じく、いま保存されている下書きの updatedAt を添えて解除する
+  const dropDraft = () => {
+    const cur = db.prepare("SELECT updated_at FROM po_orders WHERE supplier_code='1' AND status='draft'").get();
+    return j('/api/supplier/1/draft' + (cur ? '?updatedAt=' + encodeURIComponent(cur.updated_at) : ''), { method: 'DELETE' });
+  };
   await putDraft(5);
-  r = await j('/api/supplier/1/draft', { method: 'DELETE' });
+  r = await dropDraft();
   ok(r.status === 200 && r.body.ok && r.body.deleted === true && r.body.skuCount === 1, '下書き解除: deleted=true + SKU件数', r.body);
   r = await j('/api/supplier/1');
   ok(r.body.draft === null, '下書き解除後は draft なし');
@@ -1187,7 +1192,7 @@ console.log('── P13b: 発注残ページ+消込API ──');
     // 発注確定済み (issued) は解除の対象外
     const issuedBefore = db.prepare("SELECT COUNT(*) c FROM po_orders WHERE status='issued'").get().c;
     await putDraft(7);
-    await j('/api/supplier/1/draft', { method: 'DELETE' });
+    await dropDraft();
     const issuedAfter = db.prepare("SELECT COUNT(*) c FROM po_orders WHERE status='issued'").get().c;
     ok(issuedBefore > 0 && issuedBefore === issuedAfter, '下書き解除は発注確定済みの発注に影響しない', { issuedBefore, issuedAfter });
     const left = db.prepare("SELECT COUNT(*) c FROM po_order_items i JOIN po_orders o ON o.id=i.order_id WHERE o.status='draft'").get().c;
@@ -1207,6 +1212,13 @@ console.log('── P13b: 発注残ページ+消込API ──');
     ok(r.body.draft.updatedAt && r.body.draft.updatedAt !== at0, '仕入先APIは最新の updatedAt を返す', r.body.draft.updatedAt);
     r = await j('/api/supplier/1/draft?updatedAt=' + encodeURIComponent(r.body.draft.updatedAt), { method: 'DELETE' });
     ok(r.status === 200 && r.body.deleted === true, '最新の updatedAt なら解除できる', r.body);
+    // キー無しの解除は通さない (古い画面・パラメータ欠落で突合を素通りさせない ─ Codex R2 High)
+    await putDraft(3, 'キーなし試験');
+    r = await j('/api/supplier/1/draft', { method: 'DELETE' });
+    ok(r.status === 409 && r.body.conflict === true && r.body.error.includes('確認キー'), 'updatedAt 未指定の解除は 409', r.body);
+    r = await j('/api/supplier/1');
+    ok(r.body.draft && r.body.draft.note === 'キーなし試験', 'キー無し 409 のとき下書きは消えていない', r.body.draft);
+    await dropDraft();
   }
   {
     // 画面: 下書きがあるときだけ解除ボタンが出る
@@ -1219,7 +1231,7 @@ console.log('── P13b: 発注残ページ+消込API ──');
     ok(dash.includes('data-cdraftat="'), 'ダッシュボード: 解除ボタンに updatedAt を持たせる (楽観ロック)');
     ok(sup.includes('入力中の内容はそのままです'), '仕入先ページ: 既に消えていた場合は入力を保持する');
     ok(sup.includes('updateDraftBtn'), '仕入先ページ: 解除ボタンの表示制御 (下書きが無いときは隠す)');
-    await j('/api/supplier/1/draft', { method: 'DELETE' });
+    await dropDraft();
     const dash2 = await (await fetch(base + '/')).text();
     ok(!dash2.includes('data-cdraft="1"'), 'ダッシュボード: 下書きが無ければ解除ボタンは出ない');
   }
