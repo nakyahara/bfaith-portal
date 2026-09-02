@@ -6347,6 +6347,27 @@ for (const [name, file, data] of renders) {
       const ok3 = await h.flush();
       check('sku-jan worker: 確定後の flush は再送しない', ok3 === true && h.posts.length === 3);
     }
+    // 6) 結果不明のまま再送がサーバーに拒否された (Codex R6 low): 巻き戻す先が無いので巻き戻さず、
+    //    flush=false・再読込案内。次の flush でも再送され、成功して初めて確定
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      h.pending.shift().reject(new Error('network'));
+      await tick();
+      const fl1 = h.flush();
+      await tick();
+      h.pending.shift().resolve({ ok: false, error: 'dup' });
+      const ok = await fl1;
+      check('sku-jan worker: 不明中の拒否は巻き戻さず flush=false + 再読込案内',
+        ok === false && h.a.value === '4901234567894' && h.alerts.some((m) => m.includes('再読み込み')), JSON.stringify({ ok, a: h.a.value, alerts: h.alerts }));
+      const fl2 = h.flush();
+      await tick();
+      check('sku-jan worker: 不明中の拒否の後も次の flush で再送する', h.pending.length === 1 && h.pending[0].body.jan_code === '4901234567894', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok2 = await fl2;
+      check('sku-jan worker: 再送が通れば確定して flush=true', ok2 === true && h.posts.length === 3);
+    }
   }
 
   // ─── 単品 JAN の保存 (detail.ejs saveJanIfChanged) の時系列テスト (Codex R5 high) ───
@@ -6402,6 +6423,27 @@ for (const [name, file, data] of renders) {
       h.pending.shift().resolve({ ok: true });
       const ok = await s1;
       check('jan save: 最新値まで保存できたら true', ok === true && h.posts.length === 2);
+    }
+    // 結果不明 → 再送が拒否 → それでも未確定のまま (同値を再送し続け、成功時だけ解除) (Codex R6 low)
+    {
+      const h = harness('4901234567894');
+      h.el.value = '4912345678904';
+      const s1 = h.save();
+      await tick();
+      h.pending.shift().reject(new Error('network'));
+      const ok1 = await s1;
+      const s2 = h.save();
+      await tick();
+      h.pending.shift().resolve({ ok: false, error: 'bad' });
+      const ok2 = await s2;
+      check('jan save: 不明中の拒否は false のまま', ok1 === false && ok2 === false && h.posts.length === 2, JSON.stringify({ ok1, ok2, posts: h.posts }));
+      const s3 = h.save();
+      await tick();
+      check('jan save: 拒否の後も未確定なので同値を再送する', h.pending.length === 1 && h.pending[0].body.jan_code === '4912345678904', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok3 = await s3;
+      const ok4 = await h.save();
+      check('jan save: 成功で確定 → 以後は再送しない', ok3 === true && ok4 === true && h.posts.length === 3);
     }
   }
 }
