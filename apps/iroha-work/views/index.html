@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="いろは在庫化">
+<title>いろは在庫化 作業画面</title>
+<link rel="manifest" href="/apps/iroha-work/manifest.json">
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/app-icons/iroha-work-180.png">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@500;700;900&family=Noto+Sans+JP:wght@400;500;700&display=swap">
+<style>
+  :root{
+    --ink:#26312B; --sub:#5C6B62; --faint:#8A968D;
+    --ground:#F4F6F1; --surface:#FFFFFF; --line:#DFE5DC; --well:#EDF1EA;
+    --accent:#3E8E5A; --accent-ink:#FFFFFF; --accent-soft:#E3F0E7;
+    --amber:#C77D2B; --amber-soft:#F7ECDD;
+    --danger:#C2453A; --danger-soft:#F8E6E3;
+    --shadow:0 2px 10px rgba(38,49,43,.08);
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html{touch-action:manipulation}
+  body{margin:0;background:var(--ground);color:var(--ink);
+    font-family:"Noto Sans JP","Hiragino Sans",system-ui,sans-serif;font-size:16px;line-height:1.55}
+  h1,h2,h3,button,.chip,.st{font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
+  .num{font-variant-numeric:tabular-nums}
+  .app{max-width:900px;margin:0 auto;padding:12px 14px 40px}
+
+  header.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+  header.top h1{font-size:1.25rem;font-weight:900;margin:0}
+  .who{margin-left:auto;font-weight:700;background:var(--surface);border:1.5px solid var(--line);
+    border-radius:999px;padding:8px 16px;cursor:pointer;font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif;font-size:1rem}
+
+  /* ── バナー (エラーは押すまで消えない) ── */
+  .banner{display:none;width:100%;border-radius:12px;padding:12px 16px;font-weight:700;margin-bottom:10px;cursor:pointer}
+  .banner.on{display:block}
+  .banner.err{background:var(--danger-soft);color:var(--danger);border:1.5px solid var(--danger)}
+  .banner.warn{background:var(--amber-soft);color:var(--amber);border:1.5px solid var(--amber)}
+  .banner small{display:block;font-weight:400;font-size:.78rem;margin-top:2px}
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:var(--ink);color:var(--ground);
+    border-radius:12px;padding:12px 22px;font-weight:700;opacity:0;pointer-events:none;transition:opacity .25s;z-index:40;
+    max-width:90vw;text-align:center}
+  .toast.on{opacity:.96}
+
+  .filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
+  .flabel{font-size:.78rem;color:var(--sub);font-weight:700}
+  .chip{border:1.5px solid var(--line);background:var(--surface);color:var(--sub);border-radius:999px;
+    padding:9px 18px;font-weight:700;font-size:.95rem;cursor:pointer}
+  .chip.on{background:var(--ink);border-color:var(--ink);color:var(--ground)}
+  .search{flex:1;min-width:180px;border:1.5px solid var(--line);border-radius:12px;padding:10px 14px;
+    font-size:1rem;background:var(--surface);color:var(--ink)}
+  .sync{font-size:.75rem;color:var(--faint);width:100%;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .sync button{border:1.5px solid var(--line);background:var(--surface);color:var(--sub);border-radius:8px;
+    padding:4px 12px;font-size:.78rem;font-weight:700;cursor:pointer}
+
+  /* ── リスト ── */
+  .list{display:flex;flex-direction:column;gap:10px}
+  .row{display:flex;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--line);
+    border-radius:16px;padding:10px 14px;box-shadow:var(--shadow);cursor:pointer}
+  .row .thumb{width:64px;height:64px;border-radius:12px;background:#fff;border:1px solid var(--line);
+    display:grid;place-items:center;font-size:1.6rem;flex:none;overflow:hidden}
+  .row .thumb img{width:100%;height:100%;object-fit:contain}
+  .row .bd{flex:1;min-width:0}
+  .row h2{margin:0;font-size:1rem;font-weight:700;line-height:1.35}
+  .row .meta{font-size:.82rem;color:var(--sub)}
+  .row .meta b{color:var(--ink);font-size:1.1em}
+  .row .meta2{font-size:.78rem;color:var(--faint);margin-top:2px}
+  .tag{display:inline-block;font-size:.74rem;font-weight:700;border-radius:7px;padding:2px 9px;
+    margin-right:6px;vertical-align:1px}
+  .tag.urgent{background:var(--danger-soft);color:var(--danger)}
+  .tag.new{background:var(--accent-soft);color:var(--accent)}
+  .tag.miss{background:var(--amber-soft);color:var(--amber)}
+  .st{flex:none;font-size:.82rem;font-weight:700;border-radius:9px;padding:6px 12px;cursor:pointer;border:none;
+    font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
+  .st.todo{background:var(--well);color:var(--sub)}
+  .st.doing{background:var(--amber-soft);color:var(--amber)}
+  .st.done{background:var(--accent-soft);color:var(--accent)}
+  .st.pause{background:var(--danger-soft);color:var(--danger)}
+  .st.other{background:var(--well);color:var(--faint)}
+  .row .chev{color:var(--faint);font-size:1.2rem;flex:none}
+  .empty{padding:40px 10px;text-align:center;color:var(--faint)}
+
+  /* ── 詳細 ── */
+  .detail{display:none}
+  body.detail-open .listpage{display:none}
+  body.detail-open .detail{display:block}
+  .backbar{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+  .back{border:1.5px solid var(--line);background:var(--surface);color:var(--ink);border-radius:12px;
+    padding:10px 18px;font-size:1rem;font-weight:700;cursor:pointer}
+  .backbar .st{margin-left:auto;font-size:.95rem;padding:8px 16px}
+  .dcard{background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);
+    padding:18px;margin-bottom:14px}
+  .dhead{display:flex;gap:16px}
+  .dhead .thumb{width:132px;height:132px;border-radius:14px;background:#fff;border:1px solid var(--line);
+    display:grid;place-items:center;font-size:3rem;flex:none;overflow:hidden}
+  .dhead .thumb img{width:100%;height:100%;object-fit:contain}
+  .dhead h2{margin:0 0 6px;font-size:1.3rem;font-weight:900;line-height:1.35}
+  .dhead .meta{font-size:.88rem;color:var(--sub);word-break:break-all}
+  .qty{font-size:1.05rem;margin-top:6px}
+  .qty b{font-size:1.6em;font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
+  .bcode{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--well);border-radius:8px;
+    padding:2px 8px;font-size:.95em}
+
+  .kvs{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}
+  .kv{background:var(--well);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
+  .kv label{display:block;font-size:.7rem;color:var(--sub);letter-spacing:.08em;margin-bottom:3px}
+  .kv .v{font-weight:700}
+  .kv.miss{border:1.5px dashed var(--amber);background:var(--amber-soft)}
+  .kv.miss .v{color:var(--amber)}
+  h3.sec{font-size:.95rem;margin:0 0 10px;color:var(--sub);letter-spacing:.05em}
+  .nlink{font-size:.82rem;color:var(--sub);margin:10px 0 0}
+  .nlink a{color:var(--accent);font-weight:700}
+
+  /* ── ダイアログ ── */
+  .overlay{position:fixed;inset:0;background:rgba(20,26,22,.5);display:none;place-items:center;padding:16px;z-index:20}
+  .overlay.on{display:grid}
+  .modal{background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);
+    padding:20px;width:min(480px,100%)}
+  .modal h3{margin:0 0 4px;font-size:1.1rem}
+  .modal .mname{font-size:.88rem;color:var(--sub);margin-bottom:14px}
+  .stbtns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+  .btn{min-height:58px;border-radius:14px;border:1.5px solid var(--line);
+    background:var(--surface);color:var(--ink);font-size:1.02rem;font-weight:700;cursor:pointer;
+    font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  .btn.cur{outline:3px solid var(--accent);outline-offset:1px}
+  .btn:disabled{opacity:.55}
+  .mbtns{display:flex;gap:10px}
+  .mbtns .btn{flex:1;min-height:52px}
+  .msaving{font-size:.85rem;color:var(--sub);font-weight:700;min-height:1.4em;margin-bottom:8px}
+  .hint{font-size:.78rem;color:var(--faint);margin-top:8px}
+
+  /* ── 作業者選択 (だれがつかう?) ── */
+  .gate{position:fixed;inset:0;background:var(--ground);z-index:30;display:none;overflow:auto;padding:24px 16px}
+  .gate.on{display:block}
+  .gate .gwrap{max-width:640px;margin:0 auto}
+  .gate h2{font-size:1.2rem;font-weight:900}
+  .gate .gsec{font-size:.85rem;color:var(--sub);font-weight:700;margin:18px 0 8px}
+  .gate .names{display:flex;gap:10px;flex-wrap:wrap}
+  .gate .name{border:1.5px solid var(--line);background:var(--surface);border-radius:14px;padding:16px 22px;
+    font-size:1.1rem;font-weight:700;cursor:pointer;font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif;color:var(--ink)}
+  .gate .gnote{font-size:.8rem;color:var(--faint);margin-top:20px}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ══ 画面1: リスト ══ -->
+  <div class="listpage">
+    <header class="top">
+      <h1>🎋 いろは在庫化</h1>
+      <button class="who" id="whoBtn" onclick="openGate()">👤 —</button>
+    </header>
+    <div class="banner err" id="errBanner" onclick="this.classList.remove('on')"></div>
+    <div class="banner warn" id="warnBanner" onclick="this.classList.remove('on')"></div>
+
+    <div class="filters">
+      <span class="flabel">Notionのステータス:</span>
+      <span id="tabs"></span>
+      <input class="search" id="q" placeholder="商品名・商品コードで検索">
+      <span class="sync">
+        <span id="syncTxt">読み込み中…</span>
+        <button id="refreshBtn" onclick="forceRefresh()">🔄 いま更新</button>
+      </span>
+    </div>
+
+    <div class="list" id="list"><div class="empty">読み込み中…</div></div>
+  </div>
+
+  <!-- ══ 画面2: 詳細 ══ -->
+  <div class="detail">
+    <div class="backbar">
+      <button class="back" onclick="closeDetail()">‹ 一覧にもどる</button>
+      <button class="st todo" id="dstate" onclick="openStFromDetail()">—</button>
+    </div>
+    <div id="dbody"></div>
+  </div>
+
+  <!-- ══ ステータス変更ダイアログ ══ -->
+  <div class="overlay" id="stOv">
+    <div class="modal">
+      <h3>ステータスを変える</h3>
+      <div class="mname" id="stName">—</div>
+      <div class="msaving" id="stMsg"></div>
+      <div class="stbtns" id="stBtns"></div>
+      <div id="pinRow" style="display:none;margin-bottom:12px">
+        <label style="font-size:.8rem;color:var(--sub);font-weight:700">職員PIN (棚入完了の変更に必要です)</label>
+        <input id="pinIn" type="tel" inputmode="numeric" maxlength="8" placeholder="****" autocomplete="off"
+          style="width:100%;border:1.5px solid var(--line);border-radius:10px;padding:10px 12px;font-size:1.3rem;
+                 letter-spacing:.3em;background:var(--surface);color:var(--ink)">
+      </div>
+      <div class="mbtns"><button class="btn" id="stCancel" onclick="closeSt()">やめる</button></div>
+      <p class="hint">ここで変えると、Notionのカードのステータスもそのまま変わります。<br>
+        「棚入完了」への変更・取り消しは職員の方だけができます (職員PINが必要)。</p>
+    </div>
+  </div>
+
+  <!-- ══ 作業者選択 ══ -->
+  <div class="gate" id="gate">
+    <div class="gwrap">
+      <h2>👤 だれがつかいますか?</h2>
+      <p style="color:var(--sub);font-size:.9rem">じぶんの名前をおしてください。ステータスを変えるときの記録に使います。</p>
+      <div id="gateNames"></div>
+      <p class="gnote">名前がないときは、職員の方が管理画面 (パソコン) から追加できます。</p>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+</div>
+
+<script>
+'use strict';
+const BASE = '/apps/iroha-work';
+const $ = s => document.querySelector(s);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// ステータス → 見た目クラス (未知のステータスは other で「すべて」にだけ出る)
+const ST_CLASS = { '未着手':'todo', '作業中':'doing', '中断':'pause', '棚入完了':'done' };
+const stClass = s => ST_CLASS[s] || 'other';
+
+let state = { cards: [], statuses: [], workers: [], refresh: {}, me: {} };
+let curTab = 'all';
+let curDetail = null;      // 開いている詳細の page_id
+let worker = null;         // { id, display_name, worker_type }
+
+// ─── 通知まわり (Codex R2 ①: エラーは押すまで消えない・成功はトースト) ───
+function showErr(msg, sub) {
+  const b = $('#errBanner');
+  b.innerHTML = esc(msg) + (sub ? '<small>' + esc(sub) + '</small>' : '');
+  b.classList.add('on');
+}
+function showWarn(msg) { const b = $('#warnBanner'); b.textContent = msg; b.classList.add('on'); }
+let toastTimer = null;
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('on');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('on'), 2600);
+}
+
+// ─── 作業者選択 ───
+function openGate() {
+  const g = $('#gateNames');
+  const members = state.workers.filter(w => w.worker_type === 'member');
+  const staff = state.workers.filter(w => w.worker_type === 'staff');
+  const chunk = (label, ws) => ws.length === 0 ? '' :
+    '<div class="gsec">' + label + '</div><div class="names">' +
+    ws.map(w => '<button class="name" onclick="pickWorker(' + w.id + ')">' + esc(w.display_name) + '</button>').join('') + '</div>';
+  g.innerHTML = (chunk('作業する人', members) + chunk('職員', staff)) ||
+    '<p style="color:var(--faint)">作業者がまだ登録されていません。職員の方が管理画面から追加してください。</p>';
+  $('#gate').classList.add('on');
+}
+function pickWorker(id) {
+  const w = state.workers.find(x => x.id === id);
+  if (!w) return;
+  worker = w;
+  try { localStorage.setItem('iw_worker_id', String(id)); } catch (e) { /* プライベートモード等 */ }
+  $('#whoBtn').textContent = '👤 ' + w.display_name + (w.worker_type === 'staff' ? ' (職員)' : '') + ' ▾';
+  $('#gate').classList.remove('on');
+}
+function restoreWorker() {
+  let id = null;
+  try { id = Number(localStorage.getItem('iw_worker_id')); } catch (e) { /* 読めなければ選び直し */ }
+  const w = state.workers.find(x => x.id === id);
+  if (w) { worker = w; $('#whoBtn').textContent = '👤 ' + w.display_name + (w.worker_type === 'staff' ? ' (職員)' : '') + ' ▾'; }
+  else if (!worker) openGate();
+}
+
+// ─── データ取得 ───
+async function loadState() {
+  let r, j;
+  try {
+    r = await fetch(BASE + '/api/state');
+    j = await r.json();
+  } catch (e) {
+    showErr('サーバーに接続できませんでした', e.message);
+    return;
+  }
+  if (!j.ok) { showErr(j.message || '読み込みに失敗しました'); return; }
+  state = j;
+  renderSync();
+  renderTabs();
+  renderList();
+  restoreWorker();
+  if (curDetail) {
+    const c = state.cards.find(x => x.page_id === curDetail);
+    if (c) renderDetail(c);
+  }
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  try { return new Date(iso).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return '—'; }
+}
+
+function renderSync() {
+  const rf = state.refresh || {};
+  let txt = 'Notionと同期: ' + fmtTime(rf.lastRefreshAt) + ' ・ 🗂 カード' + state.cards.length + '枚 ・ ステータスの札をタップすると変えられます';
+  $('#syncTxt').textContent = txt;
+  if (rf.error) showErr('Notionから最新を取得できませんでした (前回取得分を表示しています)', rf.error);
+  if (rf.truncated) showWarn('カードが件数上限を超えているため最新化できていません (前回取得分を表示中。職員の方は管理画面を確認してください)');
+}
+
+// ─── タブ・一覧 ───
+function counts() {
+  const c = { all: state.cards.length };
+  for (const s of state.statuses) c[s] = 0;
+  for (const card of state.cards) if (c[card.status] != null) c[card.status]++;
+  return c;
+}
+
+function renderTabs() {
+  const c = counts();
+  const tabs = [['all', 'すべて'], ...state.statuses.map(s => [s, s])];
+  $('#tabs').innerHTML = tabs.map(([key, label]) =>
+    '<button class="chip' + (curTab === key ? ' on' : '') + '" onclick="pickTab(\'' + esc(key) + '\')">' +
+    esc(label) + ' <span class="num">' + (c[key] ?? 0) + '</span></button>').join('');
+}
+function pickTab(key) { curTab = key; renderTabs(); renderList(); }
+
+function masterSummary(c) {
+  const m = c.master;
+  const parts = [];
+  if (m.material_code) parts.push('資材 ' + m.material_code);
+  if (m.storage_container) parts.push(m.storage_container + (m.units_per_container != null ? 'に' + m.units_per_container + '個ずつ' : ''));
+  else if (m.units_per_container != null) parts.push('入数 ' + m.units_per_container);
+  return parts.join(' ・ ');
+}
+
+function rowTags(c) {
+  let h = '';
+  if (c.priority.kind === 'urgent') h += '<span class="tag urgent">🔥 急ぎ・' + esc(c.priority.label) + '</span>';
+  if (c.priority.kind === 'new') h += '<span class="tag new">🌱 新商品</span>';
+  if (c.master.missing.length > 0) h += '<span class="tag miss">⚠ ' + esc(c.master.missing.join('・')) + ' 未登録</span>';
+  return h;
+}
+
+function visibleCards() {
+  const q = $('#q').value.trim().toLowerCase();
+  return state.cards.filter(c => {
+    if (curTab !== 'all' && c.status !== curTab) return false;
+    if (!q) return true;
+    return String(c.title).toLowerCase().includes(q) || String(c.product_code || '').toLowerCase().includes(q);
+  });
+}
+
+function thumbHtml(c) {
+  if (c.image_url) return '<img src="' + esc(c.image_url) + '" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">';
+  return '📦';
+}
+
+function renderList() {
+  const cards = visibleCards();
+  if (cards.length === 0) {
+    $('#list').innerHTML = '<div class="empty">' + ($('#q').value ? '見つかりませんでした' : 'このステータスのカードはありません') + '</div>';
+    return;
+  }
+  $('#list').innerHTML = cards.map(c => {
+    const meta = [
+      c.qty != null ? '<b>' + esc(c.qty) + '</b> 個' : null,
+      c.arrival ? '入庫 ' + esc(c.arrival) : null,
+      masterSummary(c) || null,
+    ].filter(Boolean).join(' ・ ');
+    const meta2 = [
+      c.priority.kind !== 'urgent' && c.priority.kind !== 'new' ? esc(c.priority.label) : null,
+      c.external_text ? esc(c.external_text) : null,
+      c.expiry ? '📅 期限 ' + esc(c.expiry) : null,
+    ].filter(Boolean).join(' ・ ');
+    return '<div class="row" onclick="openDetail(\'' + esc(c.page_id) + '\')">' +
+      '<div class="thumb">' + thumbHtml(c) + '</div>' +
+      '<div class="bd"><h2>' + rowTags(c) + esc(c.title) + '</h2>' +
+      '<div class="meta num">' + meta + '</div>' +
+      (meta2 ? '<div class="meta2 num">' + meta2 + '</div>' : '') + '</div>' +
+      '<button class="st ' + stClass(c.status) + '" onclick="openSt(event,\'' + esc(c.page_id) + '\')">' + esc(c.status) + ' ▾</button>' +
+      '<span class="chev">›</span></div>';
+  }).join('');
+}
+
+$('#q').addEventListener('input', renderList);
+
+// ─── 手動更新 ───
+async function forceRefresh() {
+  const btn = $('#refreshBtn');
+  btn.disabled = true; btn.textContent = '更新中…';
+  try {
+    const r = await fetch(BASE + '/api/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    const j = await r.json().catch(() => ({}));
+    if (!j.ok && j.error === 'rate_limited') { toast(j.message); return; }
+    if (!j.ok) showErr('更新できませんでした', (j.refresh && j.refresh.error) || j.message || '');
+    await loadState();
+    if (j.ok) toast('最新にしました');
+  } catch (e) {
+    showErr('更新できませんでした', e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '🔄 いま更新';
+  }
+}
+
+// ─── 詳細 ───
+function openDetail(pageId) {
+  const c = state.cards.find(x => x.page_id === pageId);
+  if (!c) return;
+  curDetail = pageId;
+  renderDetail(c);
+  document.body.classList.add('detail-open');
+  window.scrollTo(0, 0);
+}
+function closeDetail() { curDetail = null; document.body.classList.remove('detail-open'); }
+
+function kv(label, value, opts) {
+  const miss = opts && opts.miss;
+  return '<div class="kv' + (miss ? ' miss' : '') + '"><label>' + esc(label) + '</label><div class="v num">' +
+    (value == null || value === '' ? (miss ? '未登録' : '—') : esc(value)) + '</div></div>';
+}
+
+function renderDetail(c) {
+  const st = $('#dstate');
+  st.textContent = c.status + ' ▾';
+  st.className = 'st ' + stClass(c.status);
+
+  const m = c.master;
+  const missSet = new Set(m.missing);
+  const live = [];
+  if (c.sales_text) live.push(c.sales_text);
+  if (c.live.free_stock != null) live.push('フリー在庫 ' + c.live.free_stock + '個');
+  const prio = (c.priority.kind === 'urgent' ? '🔥 ' : '') + c.priority.label;
+
+  $('#dbody').innerHTML =
+    '<div class="dcard"><div class="dhead">' +
+      '<div class="thumb">' + thumbHtml(c) + '</div>' +
+      '<div><h2>' + rowTags(c) + esc(c.title) + '</h2>' +
+      '<div class="meta num">' + esc(c.product_code || '—') +
+        (c.barcode ? ' ・ JAN <span class="bcode">' + esc(c.barcode) + '</span>' : '') +
+        (c.arrival ? ' ・ 入庫 ' + esc(c.arrival) : '') +
+        (c.ar_no ? ' ・ ' + esc(c.ar_no) : '') + '</div>' +
+      '<div class="qty num">つくる数: <b>' + esc(c.qty != null ? c.qty : '—') + '</b> 個</div>' +
+      '</div></div></div>' +
+
+    '<div class="dcard"><h3 class="sec">作業のやり方</h3><div class="kvs">' +
+      kv('資材', m.material_code, { miss: missSet.has('資材') }) +
+      kv('入れもの', m.storage_container && m.units_per_container != null
+          ? m.storage_container + 'に ' + m.units_per_container + '個ずつ'
+          : m.storage_container, { miss: missSet.has('容器') || missSet.has('入数') }) +
+      kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程') }) +
+      kv('気をつけること', m.note) +
+      kv('期限', c.expiry ? c.expiry : '期限シールなし') +
+      kv('参考', [prio, ...live].join(' ・ ')) +
+      (c.external_text ? kv('外部出し目安', c.external_text) : '') +
+      (c.supplier ? kv('取引先', c.supplier) : '') +
+    '</div>' +
+      (m.missing.length > 0
+        ? '<p class="nlink">⚠ 未登録の項目があります。登録機能はこのあとの更新で入ります (それまでは職員の方が入荷受付チェックの管理画面から)。</p>' : '') +
+      (m.source === 'card'
+        ? '<p class="nlink">※作業仕様マスタに未登録のため、カード作成時の値を表示しています。</p>' : '') +
+      '<p class="nlink">くわしくは 🗂 ' + (c.url ? '<a href="' + esc(c.url) + '" target="_blank" rel="noopener">Notionのカードを開く</a>' : 'Notionのカード (リンクなし)') + '</p>' +
+    '</div>';
+}
+function openStFromDetail() { if (curDetail) openSt(null, curDetail); }
+
+// ─── ステータス変更 (Codex R2 ①: 保存中表示・処理中は全ボタン無効・失敗は大きく) ───
+let stTarget = null;   // page_id
+let stSaving = false;
+
+function openSt(ev, pageId) {
+  if (ev) ev.stopPropagation();
+  if (!worker) { openGate(); return; }
+  const c = state.cards.find(x => x.page_id === pageId);
+  if (!c) return;
+  stTarget = pageId;
+  $('#stName').textContent = c.title + ' (いま: ' + c.status + ')';
+  $('#stMsg').textContent = '';
+  $('#pinRow').style.display = 'none';
+  $('#pinIn').value = '';
+  $('#stBtns').innerHTML = state.statuses.map(s =>
+    '<button class="btn' + (s === c.status ? ' cur' : '') + '" onclick="doSetSt(\'' + esc(s) + '\')">' + esc(s) + '</button>').join('');
+  $('#stOv').classList.add('on');
+}
+function closeSt() { if (stSaving) return; $('#stOv').classList.remove('on'); stTarget = null; }
+$('#stOv').addEventListener('click', e => { if (e.target === $('#stOv')) closeSt(); });
+
+async function doSetSt(to) {
+  if (stSaving || !stTarget || !worker) return;
+  const c = state.cards.find(x => x.page_id === stTarget);
+  if (!c) { closeSt(); return; }
+  if (to === c.status) { closeSt(); return; }
+
+  // 棚入完了が絡む変更は職員のみ (PIN で本人確認)。端末Cookie利用時だけ PIN を求める
+  const gated = to === '棚入完了' || c.status === '棚入完了';
+  if (gated && !state.me.session) {
+    if (worker.worker_type !== 'staff') {
+      $('#stMsg').textContent = '❌ 「棚入完了」の変更は職員のみです。右上の名前を職員に切り替えてください';
+      return;
+    }
+    if (!$('#pinIn').value.trim()) {
+      $('#pinRow').style.display = 'block';
+      $('#stMsg').textContent = '職員PINを入れてから「' + to + '」を押してください';
+      $('#pinIn').focus();
+      return;
+    }
+  }
+
+  stSaving = true;
+  for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = true;
+  $('#stMsg').textContent = '保存中… (Notionに反映しています)';
+  let j = null;
+  try {
+    const r = await fetch(BASE + '/api/status', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ page_id: stTarget, to, expect: c.status, worker_id: worker.id,
+        pin: $('#pinIn').value.trim() || undefined }),
+    });
+    j = await r.json().catch(() => ({}));
+  } catch (e) {
+    j = { ok: false, error: 'network', message: '通信できませんでした (' + e.message + ')。もう一度お試しください' };
+  }
+  stSaving = false;
+  for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
+
+  if (j.ok) {
+    c.status = j.status;
+    renderTabs(); renderList();
+    if (curDetail === c.page_id) renderDetail(c);
+    $('#stOv').classList.remove('on'); stTarget = null;
+    toast('「' + j.status + '」に変えました (Notionにも反映済み)');
+    return;
+  }
+  if (j.error === 'conflict') {
+    $('#stOv').classList.remove('on'); stTarget = null;
+    showErr(j.message || 'Notion側で変更されています');
+    if (j.current) { c.status = j.current; renderTabs(); renderList(); if (curDetail === c.page_id) renderDetail(c); }
+    loadState();
+    return;
+  }
+  if (j.error === 'card_gone') {
+    $('#stOv').classList.remove('on'); stTarget = null;
+    showErr(j.message || 'カードが見つかりません');
+    closeDetail();
+    loadState();
+    return;
+  }
+  // PIN 関連はダイアログ内で入力し直せるようにする
+  if (j.error === 'pin_required' || j.error === 'pin_invalid') {
+    $('#pinRow').style.display = 'block';
+    $('#pinIn').value = '';
+    $('#stMsg').textContent = '❌ ' + (j.message || 'PINを確認してください');
+    $('#pinIn').focus();
+    return;
+  }
+  // staff_required / notion_error / verify_failed など: ダイアログを開いたまま理由を出す (やり直せる)
+  $('#stMsg').textContent = '❌ ' + (j.message || '変更できませんでした');
+}
+
+// ─── 起動・巡回 ───
+loadState();
+setInterval(() => { if (!stSaving) loadState(); }, 60_000);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeSt(); closeDetail(); } });
+</script>
+</body>
+</html>

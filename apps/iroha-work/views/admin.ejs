@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .iw-wrap { max-width: 900px; margin: 0 auto; padding: 12px 16px; }
+    .iw-box { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 18px; }
+    .iw-box h2 { font-size: 1.0em; margin: 0 0 10px; }
+    .iw-box p.hint { font-size: 0.85em; color: #495057; margin: 0 0 10px; line-height: 1.6; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .row input[type=text] { padding: 7px; width: 220px; }
+    .row select { padding: 7px; }
+    .row button { padding: 7px 18px; cursor: pointer; }
+    .msg { font-size: 0.9em; } .msg.err { color: #c92a2a; } .msg.ok { color: #2b8a3e; }
+    table.iw-list { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.iw-list th, table.iw-list td { border-bottom: 1px solid #dee2e6; padding: 6px 8px; text-align: left; vertical-align: top; }
+    table.iw-list th { background: #f1f3f5; white-space: nowrap; }
+    tr.revoked td, tr.inactive td { color: #adb5bd; text-decoration: line-through; }
+    .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; }
+    .ng { color: #c92a2a; }
+    .code-big { font-size: 2em; font-weight: 700; letter-spacing: 0.2em; font-family: ui-monospace, Menlo, monospace; }
+    code { background: #e9ecef; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">🎋 いろは在庫化 作業アプリ 管理</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="<%= base %>/" class="btn-logout">📱 作業画面</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="iw-wrap">
+
+    <div class="iw-box">
+      <h2>🗂 Notion 連携 (カードの取得)</h2>
+      <p class="hint">
+        カードの一覧は Notion「在庫化作業管理」から取得したキャッシュを表示します (進捗の正本は当面 Notion)。
+        作業画面を開くと3分おきに自動で最新化され、iPad の「🔄 いま更新」でも取り直せます。
+      </p>
+      <% if (!cache.configured) { %>
+        <p class="msg err">⚠ Notion 連携が未設定です (NOTION_TOKEN / INBOUND_CHECK_NOTION_DB_ID)</p>
+      <% } %>
+      <table class="iw-list">
+        <tr><th>キャッシュ枚数</th><td><%= cache.total %> 枚
+          (<%= cache.byStatus.map(s => `${s.status}: ${s.c}`).join(' / ') || 'なし' %>)</td></tr>
+        <tr><th>最終取得</th><td><%= cache.lastRefreshAt ? new Date(cache.lastRefreshAt).toLocaleString('ja-JP') : 'まだ取得していません' %></td></tr>
+        <% if (cache.lastRefreshError) { %>
+          <tr><th class="ng">直近のエラー</th><td class="ng"><%= cache.lastRefreshError %></td></tr>
+        <% } %>
+        <% if (cache.truncated) { %>
+          <tr><th class="ng">⚠ 取得打ち切り</th><td class="ng">カードが多すぎて一部だけ取得しています (未完了1000枚/完了500枚が上限)</td></tr>
+        <% } %>
+      </table>
+    </div>
+
+    <div class="iw-box">
+      <h2>👤 作業者 (いろは名簿)</h2>
+      <p class="hint">
+        iPad の名前タップに出る名簿です。<b>スタッフマスタ (B-Faith) とは別</b>で、いろはの利用者・職員をここで管理します。
+        「棚入完了」への変更は<b>職員</b>だけができます。名前はフルネームでなく現場の呼び名 (表示名) で登録してください。
+      </p>
+      <% if (isAdmin) { %>
+      <div class="row" style="margin-bottom:10px">
+        <input type="text" id="wName" placeholder="表示名 (例: たにがわ)" maxlength="30">
+        <select id="wType"><option value="member">利用者</option><option value="staff">職員</option></select>
+        <button onclick="addWorker()">追加</button>
+        <span class="msg" id="wMsg"></span>
+      </div>
+      <% } %>
+      <table class="iw-list">
+        <tr><th>表示名</th><th>区分</th><th>PIN</th><th>状態</th><% if (isAdmin) { %><th></th><% } %></tr>
+        <% for (const w of workers) { %>
+          <tr class="<%= w.active ? '' : 'inactive' %>">
+            <td><%= w.display_name %></td>
+            <td><%= w.worker_type === 'staff' ? '職員' : '利用者' %></td>
+            <td><% if (w.worker_type === 'staff') { %><%= w.pin_set ? '設定済み' : '未設定' %><% } else { %>-<% } %></td>
+            <td><%= w.active ? '有効' : '無効' %></td>
+            <% if (isAdmin) { %>
+              <td>
+                <% if (w.worker_type === 'staff') { %>
+                  <button class="btn-sm" onclick="setPin(<%= w.id %>)"><%= w.pin_set ? 'PIN再設定' : 'PIN設定' %></button>
+                <% } %>
+                <button class="btn-sm" onclick="toggleWorker(<%= w.id %>, <%= w.active ? 'false' : 'true' %>)">
+                <%= w.active ? '無効にする' : '戻す' %></button></td>
+            <% } %>
+          </tr>
+        <% } %>
+        <% if (workers.length === 0) { %><tr><td colspan="5">まだ登録されていません</td></tr><% } %>
+      </table>
+      <p class="hint" style="margin-top:8px">職員には <b>PIN (4〜8桁の数字)</b> を設定してください。iPad で「棚入完了」に変えるときの本人確認に使います
+        (名前は誰でも選べるため、PINが無いと職員限定の操作ができません)。</p>
+    </div>
+
+    <% if (isAdmin) { %>
+    <div class="iw-box">
+      <h2>📱 iPad の登録</h2>
+      <p class="hint">
+        いろはの iPad で <code><%= base %>/enroll</code> を開き、ここで発行した6桁コードを入れると登録されます
+        (10分間・1台1回。入荷受付チェックと同じ方式)。
+      </p>
+      <div class="row">
+        <input type="text" id="ecLabel" placeholder="端末名 (例: いろはiPad 1号機)" maxlength="40">
+        <button onclick="issueCode()">📱 iPad の登録コードを発行</button>
+        <span class="msg" id="ecMsg"></span>
+      </div>
+      <div id="ecOut" style="display:none;margin-top:10px">
+        <span class="code-big" id="ecCode"></span>
+        <span class="msg" id="ecNote"></span>
+      </div>
+      <% if (enrollCodes.length > 0) { %>
+        <p class="hint" style="margin-top:10px">発行済みで未使用のコード:
+          <%= enrollCodes.map(c => `${c.label} (期限 ${new Date(c.expires_at).toLocaleTimeString('ja-JP')})`).join(' / ') %></p>
+      <% } %>
+      <table class="iw-list" style="margin-top:10px">
+        <tr><th>端末</th><th>登録</th><th>最終利用</th><th></th></tr>
+        <% for (const d of devices) { %>
+          <tr class="<%= d.revoked_at ? 'revoked' : '' %>">
+            <td><%= d.label %></td>
+            <td><%= new Date(d.created_at).toLocaleDateString('ja-JP') %> (<%= d.created_by || '-' %>)</td>
+            <td><%= d.last_seen_at ? new Date(d.last_seen_at).toLocaleString('ja-JP') : '-' %></td>
+            <td><% if (!d.revoked_at) { %><button class="btn-sm" onclick="revokeDevice(<%= d.id %>)">解除</button><% } %></td>
+          </tr>
+        <% } %>
+        <% if (devices.length === 0) { %><tr><td colspan="4">登録された端末はありません</td></tr><% } %>
+      </table>
+    </div>
+    <% } %>
+
+    <div class="iw-box">
+      <h2>📋 操作履歴 (直近50件)</h2>
+      <p class="hint">iPad からのステータス変更などを、成功・失敗とも記録しています (だれが・どの端末で・何を)。</p>
+      <table class="iw-list">
+        <tr><th>日時</th><th>操作</th><th>内容</th><th>作業者</th><th>端末</th><th>結果</th></tr>
+        <% for (const e of events) { %>
+          <tr>
+            <td style="white-space:nowrap"><%= new Date(e.at).toLocaleString('ja-JP') %></td>
+            <td><%= e.action === 'status_change' ? 'ステータス変更' : e.action %></td>
+            <td><%= (e.from_value || '?') %> → <%= (e.to_value || '?') %></td>
+            <td><%= e.worker_name || '-' %></td>
+            <td><%= e.device_label || '-' %></td>
+            <td><%= e.ok ? '✅' : '' %><span class="ng"><%= e.ok ? '' : ('❌ ' + (e.error || '')) %></span></td>
+          </tr>
+        <% } %>
+        <% if (events.length === 0) { %><tr><td colspan="6">まだ操作はありません</td></tr><% } %>
+      </table>
+    </div>
+
+  </div>
+
+  <script>
+    const BASE = '<%= base %>';
+    async function post(path, body) {
+      const r = await fetch(BASE + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+      return { status: r.status, json: await r.json().catch(() => ({})) };
+    }
+    function setMsg(id, kind, text) { const el = document.getElementById(id); el.className = 'msg ' + kind; el.textContent = text; }
+
+    async function addWorker() {
+      const name = document.getElementById('wName').value.trim();
+      const type = document.getElementById('wType').value;
+      if (!name) { setMsg('wMsg', 'err', '表示名を入れてください'); return; }
+      const { json } = await post('/admin/workers', { display_name: name, worker_type: type });
+      if (json.ok) location.reload();
+      else setMsg('wMsg', 'err', json.message || '追加できませんでした');
+    }
+    async function toggleWorker(id, active) {
+      const { json } = await post('/admin/workers/' + id + '/active', { active });
+      if (json.ok) location.reload();
+      else alert(json.message || '変更できませんでした');
+    }
+    async function setPin(id) {
+      const pin = prompt('この職員のPIN (4〜8桁の数字) を入力してください');
+      if (pin == null) return;
+      const { json } = await post('/admin/workers/' + id + '/pin', { pin: pin.trim() });
+      if (json.ok) { alert('PINを設定しました'); location.reload(); }
+      else alert(json.message || '設定できませんでした');
+    }
+    async function issueCode() {
+      const label = document.getElementById('ecLabel').value.trim();
+      if (!label) { setMsg('ecMsg', 'err', '端末名を入れてください'); return; }
+      const { json } = await post('/admin/enroll-codes', { label });
+      if (!json.ok) { setMsg('ecMsg', 'err', json.message || '発行できませんでした'); return; }
+      setMsg('ecMsg', 'ok', '');
+      document.getElementById('ecOut').style.display = 'block';
+      document.getElementById('ecCode').textContent = json.code;
+      document.getElementById('ecNote').textContent = '「' + json.label + '」用 ・ ' + json.ttlMinutes + '分間有効 ・ 1回だけ使えます';
+    }
+    async function revokeDevice(id) {
+      if (!confirm('この端末の登録を解除しますか? (その iPad は使えなくなります)')) return;
+      const { json } = await post('/admin/devices/' + id + '/revoke');
+      if (json.ok) location.reload();
+      else alert(json.message || '解除できませんでした');
+    }
+  </script>
+</body>
+</html>

@@ -54,6 +54,7 @@ import giftsetAssemblyRouter from './apps/giftset-assembly/router.js';
 import inboundInfoRouter from './apps/inbound-info/router.js';
 import { startInboundInfoCron } from './apps/inbound-info/sync-job.js';
 import inboundCheckRouter from './apps/inbound-check/router.js';
+import irohaWorkRouter from './apps/iroha-work/router.js';
 import staffRouter from './apps/staff/router.js';
 import { startInboundCheckCron, startInboundCheckNotionCron } from './apps/inbound-check/sync-job.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
@@ -733,6 +734,15 @@ const apps = [
     category: 'shipping',
   },
   {
+    id: 'iroha-work',
+    name: 'いろは在庫化 作業アプリ (iPad)',
+    description: 'いろはの在庫化作業をNotionカンバンからiPadへ。カード一覧・詳細・優先度 (残り在庫日数)・ステータス変更 (Notionが正本のまま連動)',
+    icon: '🎋',
+    path: '/apps/iroha-work/',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
     id: 'staff',
     name: 'スタッフマスタ',
     description: '「人」の正本 (スタッフ管理番号・名前・区分・入社/退職)。各アプリの名前タップはここから引く。将来の勤怠・シフトの親 (管理者のみ)',
@@ -1363,6 +1373,9 @@ app.use('/apps/inbound-info', requireAppAccess('inbound-info'), express.json({ l
 // 入荷受付チェック (iPad): picking と同じく requireAppAccess を掛けない (登録端末Cookie を通すため)。
 // 認可は router 内 (セッション or 端末Cookie。管理系はセッション必須・端末登録等は admin)
 app.use('/apps/inbound-check', express.json({ limit: '256kb' }), inboundCheckRouter);
+// いろは在庫化 作業アプリ (iPad): inbound-check と同じく requireAppAccess を掛けない (登録端末Cookie を通すため)。
+// 認可は router 内 (セッション or 端末Cookie。管理系はセッション必須・端末登録/作業者は admin)
+app.use('/apps/iroha-work', express.json({ limit: '256kb' }), irohaWorkRouter);
 // スタッフマスタ (staff.db): 管理画面/API は router 内で管理者限定。/export だけトークン認証 (miniPC 同期用)
 app.use('/apps/staff', express.json({ limit: '256kb' }), staffRouter);
 // MF仕訳用 証憑リンク集 (apps/shohyo-links): 専用DB shohyo-links.db (DATA_DIR)。Notion「支払い関係リンク先」の移行先
