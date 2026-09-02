@@ -145,7 +145,7 @@ const { getDB, replaceCache, listCache, addIrohaWorker, setIrohaWorkerActive, ge
   setWorkerPin, verifyWorkerPin, _clearPinFails,
   createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents,
   startSession, stopSession, activeSessionsByPage, estimateByProduct, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
-const { ensureFresh, refreshFromNotion, changeStatus, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
+const { ensureFresh, refreshFromNotion, changeStatus, fetchCardLive, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
 const { buildList, priorityOf, clearEnrichCache } = await import('../apps/iroha-work/service.js');
 
 const db = getDB();
@@ -415,6 +415,25 @@ console.log('\n[12] 操作履歴');
   logEvent({ action: 'status_change', pageId: pA.id, workerId: 1, workerName: 'たにがわ', deviceLabel: 'test', from: '未着手', to: '作業中', ok: true });
   const ev = listEvents(5);
   ok(ev.length > 0 && ev[0].action === 'status_change' && ev[0].ok === 1, '履歴が残る');
+}
+
+console.log('\n[12b] fetchCardLive (作業開始前の実ページ判定)');
+{
+  const pLive = mkPage({ status: '未着手', title: '開始判定', code: 'PROD-L' });
+  const r = await fetchCardLive(pLive.id);
+  ok(r.ok === true && r.status === '未着手', '実ページから今の状態を取る');
+  ok(listCache().some(x => x.page_id === pLive.id), '取った内容はキャッシュへ upsert される');
+  pLive.properties['ステータス'] = { type: 'select', select: { name: '棚入完了' } };
+  const r2 = await fetchCardLive(pLive.id);
+  ok(r2.ok === true && r2.status === '棚入完了', 'キャッシュが新しくても実ページの変更を見る (開始ゲートの根拠)');
+  mock.missingPages.add(pLive.id);
+  const r3 = await fetchCardLive(pLive.id);
+  ok(r3.ok === false && r3.error === 'card_gone', '削除済みは card_gone (開始拒否)');
+  mock.missingPages.delete(pLive.id);
+  pLive.parent = { database_id: 'other-db' };
+  const r4 = await fetchCardLive(pLive.id);
+  ok(r4.ok === false && r4.error === 'wrong_database', '別DBのページは拒否');
+  pLive.parent = { database_id: 'testdb' };
 }
 
 console.log('\n[13] 作業時間セッション');

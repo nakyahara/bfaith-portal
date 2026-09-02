@@ -280,21 +280,15 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const pageId = String(req.body?.page_id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
-  // 開始可否の判定に使うキャッシュの鮮度を保証してから見る (3分以内。Codex PR2 #6)。
-  // 鮮度を保証できなかったとき (取得失敗・件数上限) は、キャッシュを信じずに
-  // **対象ページを直接再取得**して判定する (Codex PR2-R2 P1)。それも失敗なら開始を拒否 —
+  // 開始可否は**必ず**実ページを直接再取得して判定する (Codex PR2-R3: キャッシュが3分以内でも、
+  // その間に棚入完了・取消・アーカイブ・別DB移動があり得る)。取得失敗なら開始を拒否 —
   // どのみち Notion に書けない状況なので、素性の分からないカードで時間だけ記録しない
-  const refresh = await ensureFresh();
-  let card = getCachePage(pageId);
-  if (!refresh.fresh) {
-    const live = await fetchCardLive(pageId);
-    if (!live.ok) {
-      const st = live.error === 'card_gone' ? 404 : live.error === 'wrong_database' ? 404 : 502;
-      return res.status(st).json({ ok: false, error: live.error, message: live.message });
-    }
-    card = getCachePage(pageId);   // fetchCardLive が upsert 済み
+  const live = await fetchCardLive(pageId);
+  if (!live.ok) {
+    const st = (live.error === 'card_gone' || live.error === 'wrong_database') ? 404 : 502;
+    return res.status(st).json({ ok: false, error: live.error, message: live.message });
   }
-  if (!card) return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' });
+  const card = getCachePage(pageId);   // fetchCardLive が最新状態を upsert 済み
   if (card.status === '棚入完了') return res.status(409).json({ ok: false, error: 'done_card', message: 'このカードは棚入完了です (作業をはじめるなら職員がステータスを戻してください)' });
   if (card.status === '取消') return res.status(409).json({ ok: false, error: 'cancelled_card', message: 'このカードは取消済みです' });
 
