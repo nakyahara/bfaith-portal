@@ -6221,6 +6221,108 @@ for (const [name, file, data] of renders) {
       check(`client-js syntax ${f}`, false, e.message);
     }
   }
+
+  // ─── SKU別JAN の保存ワーカー (detail.ejs initSkuJans) の時系列テスト (2026-09-02 Codex R3/R4 high) ───
+  // 画面の IIFE をそのまま切り出し、最小の DOM もどきと手動で応答を返す post で走らせる
+  {
+    const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+    const start = src.indexOf('(function initSkuJans() {');
+    const end = src.indexOf('\n  })();', start);
+    const iife = start >= 0 && end > start ? src.slice(start, end + '\n  })();'.length) : '';
+    check('sku-jan worker: detail.ejs から initSkuJans を切り出せる', iife.length > 200, String(iife.length));
+    class FakeEvent { constructor(type) { this.type = type; } }
+    const mkInput = (code, value) => {
+      const ls = {};
+      return {
+        value, dataset: { code },
+        addEventListener(t, fn) { (ls[t] = ls[t] || []).push(fn); },
+        dispatchEvent(ev) { (ls[ev.type] || []).forEach((fn) => fn(ev)); },
+        change(v) { this.value = v; this.dispatchEvent(new FakeEvent('change')); },
+      };
+    };
+    const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0)); };
+    function harness() {
+      const a = mkInput('sku-a', ''), b = mkInput('sku-b', '');
+      const pending = []; const alerts = []; const posts = [];
+      const ctx = {
+        document: {
+          querySelectorAll: (sel) => (sel === '.sku-jan-input' ? [a, b] : []),
+          getElementById: () => null,
+        },
+        Event: FakeEvent, alert: (m) => alerts.push(String(m)), BASE: '/x',
+        post: (url, body) => new Promise((resolve, reject) => { posts.push(body); pending.push({ body, resolve, reject }); }),
+        setTimeout, console,
+      };
+      vm.createContext(ctx);
+      const api = new vm.Script(`let flushSkuJanSaves = async () => true;\n${iife}\n({ flush: () => flushSkuJanSaves() })`, { filename: 'initSkuJans' }).runInContext(ctx);
+      return { a, b, pending, alerts, posts, flush: api.flush };
+    }
+    // 1) A の保存が通信中に flush → その間に B を変更 → A 成功 → B も保存されてから flush が true で戻る
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      const fl = h.flush();
+      await tick();
+      h.b.change('4912345678904');
+      await tick();
+      h.pending.shift().resolve({ ok: true });
+      await tick();
+      check('sku-jan worker: 待機中の変更も保存してから flush が戻る', h.pending.length === 1 && h.pending[0].body.jan_code === '4912345678904', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok = await fl;
+      check('sku-jan worker: 全部保存できたら flush=true', ok === true && h.posts.length === 2 && h.alerts.length === 0, JSON.stringify({ ok, posts: h.posts, alerts: h.alerts }));
+    }
+    // 2) サーバー拒否 → 画面は DB の値へ巻き戻り、flush=false (合流した drain の失敗が伝わる)
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      const fl = h.flush();
+      await tick();
+      h.pending.shift().resolve({ ok: false, error: 'dup' });
+      const ok = await fl;
+      check('sku-jan worker: 拒否は巻き戻し + flush=false', ok === false && h.a.value === '' && h.alerts.length === 1 && h.posts.length === 1, JSON.stringify({ ok, a: h.a.value, alerts: h.alerts }));
+      // 拒否後は dirty が無いので、次の flush は POST なしで true
+      const ok2 = await h.flush();
+      check('sku-jan worker: 拒否で巻き戻した後の flush は再送せず true', ok2 === true && h.posts.length === 1);
+    }
+    // 3) 通信エラー → 巻き戻さず dirty のまま止まる (DB がコミット済みかもしれない)。flush=false。次の flush で冪等に再送
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      const fl = h.flush();
+      await tick();
+      h.pending.shift().reject(new Error('network'));
+      const ok = await fl;
+      check('sku-jan worker: 通信エラーは巻き戻さず flush=false', ok === false && h.a.value === '4901234567894' && h.posts.length === 1, JSON.stringify({ ok, a: h.a.value, posts: h.posts }));
+      const fl2 = h.flush();
+      await tick();
+      check('sku-jan worker: 次の flush で同じ値を再送する', h.pending.length === 1 && h.pending[0].body.jan_code === '4901234567894', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok2 = await fl2;
+      check('sku-jan worker: 再送が通れば flush=true', ok2 === true && h.posts.length === 2);
+    }
+    // 4) drain の途中で 1 件目が拒否済み・2 件目が通信中に flush → 2 件目が成功しても false (失敗は drain の結果として残る)
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      h.b.change('4912345678904');
+      await tick();
+      h.pending.shift().resolve({ ok: false, error: 'dup' }); // A 拒否 → 巻き戻し
+      await tick();
+      check('sku-jan worker: 2 件目 (B) の保存が進んでいる', h.pending.length === 1 && h.pending[0].body.ne_code === 'sku-b', JSON.stringify(h.posts));
+      const fl = h.flush(); // 実行中の drain に合流
+      await tick();
+      h.pending.shift().resolve({ ok: true });
+      const ok = await fl;
+      check('sku-jan worker: 合流前に起きた拒否も flush=false に反映される', ok === false && h.a.value === '' && h.b.value === '4912345678904', JSON.stringify({ ok, a: h.a.value, b: h.b.value }));
+      const ok2 = await h.flush();
+      check('sku-jan worker: その後の flush は (dirty なし・失敗なし) true', ok2 === true && h.posts.length === 2);
+    }
+  }
 }
 
 console.log(failed === 0 ? '\nSMOKE: ALL PASS' : `\nSMOKE: ${failed} FAILED`);

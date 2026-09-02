@@ -3345,55 +3345,65 @@
     // 1 件ずつ POST し、全部一致するまで回す。捕捉値のキューにしない (Codex R3 high:
     // 待機中に追加された保存を待てない / 失敗して巻き戻した後に古い捕捉値を再送できた)
     const lastOf = new Map(inputs.map((i) => [i, i.value.trim()]));
-    let failedSinceFlush = false;
-    let draining = null;   // 実行中の drain (Promise)
+    let draining = null;   // 実行中の drain (Promise<boolean> = その実行の開始以降に失敗が無かったか)
     let rerun = false;     // drain 中に change が来た印 (終わる直前の取りこぼし防止)
+    // 戻り値: 'ok' = 保存した / 'rejected' = サーバーが拒否 (DB は旧値のまま) / 'unknown' = 通信エラー (DB は不明)
     async function saveOne(input) {
       const value = input.value.trim();
-      if (value === lastOf.get(input)) return;
+      if (value === lastOf.get(input)) return 'ok';
       let json;
       try {
         json = await post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value });
       } catch (e) {
-        json = { ok: false, error: '通信エラーでJANコードを保存できませんでした' };
+        // 通信エラーはサーバーがコミット済みの可能性がある (Codex R4 high)。DB の値が分からないので
+        // 画面は巻き戻さず dirty のまま残し、drain を止める (次の change / flush で冪等に再送される)
+        alert('通信エラーでJANコードを保存できませんでした (' + input.dataset.code + ')。もう一度お試しください');
+        return 'unknown';
       }
       if (!json.ok) {
-        failedSinceFlush = true;
         alert(json.error || 'JANコードの保存に失敗しました');
-        // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ DB の値へ巻き戻す。
+        // サーバーが拒否 = DB は旧値。後続の変更値を潰さない: 表示が失敗した値のままのときだけ DB の値へ巻き戻す。
         // 巻き戻したら確認表示 (カテゴリ・属性タブのカタログID) と必須バッジも合わせる (Codex R1 low)
         if (input.value.trim() === value) {
           input.value = lastOf.get(input);
           input.dispatchEvent(new Event('input', { bubbles: true }));
         }
-        return;
+        return 'rejected';
       }
       lastOf.set(input, value);
       if (result) result.textContent = 'JANコードを保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
+      return 'ok';
     }
     const dirtyInputs = () => inputs.filter((i) => i.value.trim() !== lastOf.get(i));
+    // 失敗は共有フラグではなく drain 実行の結果として持つ (Codex R4 high: 実行中の drain に合流する flush が
+    // 共有フラグをリセットすると、その drain で既に起きた失敗が消えていた)
     function drain() {
       if (draining) { rerun = true; return draining; }
       draining = (async () => {
+        let ok = true;
         do {
           rerun = false;
-          // 失敗は巻き戻すので通常 1〜2 周で収束する。上限は保存が失敗し続けるときの安全弁
+          // 拒否は巻き戻すので通常 1〜2 周で収束する。上限は保存が拒否され続けるときの安全弁
           for (let round = 0; round < 10; round++) {
             const dirty = dirtyInputs();
             if (dirty.length === 0) break;
-            for (const input of dirty) await saveOne(input);
+            for (const input of dirty) {
+              const r = await saveOne(input);
+              if (r === 'unknown') return false; // 結果不明: dirty を残したまま止める (連打再送しない)
+              if (r === 'rejected') ok = false;
+            }
           }
         } while (rerun);
+        return ok;
       })().finally(() => { draining = null; });
       return draining;
     }
     inputs.forEach((input) => input.addEventListener('change', () => { drain(); }));
     // プレビュー・登録・出品情報保存の前に呼ばれる (saveRakutenFields)。未保存の変更を全部確定してから、
-    // 1 件でも失敗していたら / まだ DB と違う入力が残っていたら false (Codex R2 high)
+    // (合流した) drain の開始以降に 1 件でも失敗していたら / まだ DB と違う入力が残っていたら false (Codex R2 high)
     flushSkuJanSaves = async () => {
-      failedSinceFlush = false;
-      await drain();
-      return !failedSinceFlush && dirtyInputs().length === 0;
+      const ok = await drain();
+      return ok && dirtyInputs().length === 0;
     };
   })();
 
