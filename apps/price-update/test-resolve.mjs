@@ -655,7 +655,7 @@ let previewRows = null;
   // ★au PAY は 2026-09-02 から更新できるようになった (updateItemInfo が部分更新だと実測)。
   //   Qoo10 はまだ書き込み経路が無いので手動のまま
   ok(rows.filter((r) => r.mall === 'aupay').every((r) => !r.manual), 'au PAY は更新できる行');
-  ok(rows.filter((r) => r.mall === 'qoo10').every((r) => r.manual), 'Qoo10 はまだ手動行');
+  ok(rows.filter((r) => r.mall === 'qoo10').every((r) => !r.manual), 'Qoo10 も更新できる行 (2026-09-02〜)');
   eq(rak.feeRate, 0.12, '手数料率は dim_mall から');
 
   const evaluated = evaluateRows(rows.map((r) => (r.mall === 'rakuten' ? { ...r, newPrice: 1200, selected: true } : r)));

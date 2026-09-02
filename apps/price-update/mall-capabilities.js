@@ -48,9 +48,12 @@ export const MALL_CAPABILITIES = {
   },
   qoo10: {
     label: 'Qoo10',
-    updatable: false,
-    executable: false,
-    blockReason: 'このモールは手動更新です (API更新の経路がまだありません)',
+    // 2026-09-02〜: ItemsOrder.SetGoodsPriceQty (価格専用 API) で更新できる。
+    // 実測で「価格以外は1バイトも変わらない」ことを確認済み (M5実測結果_Qoo10)
+    updatable: true,
+    executable: true,
+    priceScope: 'item',
+    killSwitch: 'PRICE_UPDATE_QOO10_ENABLED',
   },
 };
 

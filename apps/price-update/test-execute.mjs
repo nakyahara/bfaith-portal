@@ -588,8 +588,8 @@ console.log('\n── モールの設定が食い違っていないか (増や�
     eq(mallWriteEnabled(mall, { PRICE_UPDATE_RAKUTEN_ENABLED: "1" }).enabled, false,
       `${mall}: 更新できないモールは何をしても開かない`);
   }
-  eq([...ITEM_PRICE_MALLS].sort(), ['aupay', 'yahoo'],
-    "★商品に1つの価格のモール = Yahoo と au PAY (楽天は SKU ごと)");
+  eq([...ITEM_PRICE_MALLS].sort(), ['aupay', 'qoo10', 'yahoo'],
+    "★商品に1つの価格のモール = Yahoo / au PAY / Qoo10 (楽天だけ SKU ごと)");
 }
 
 db.close();

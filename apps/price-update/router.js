@@ -18,13 +18,14 @@ import { loadDimMall } from '../../lib/dim-mall.js';
 import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim, recoveryRunsOf, createRecoveryRun } from './db.js';
 import { planRecovery, buildRecoveryOperations, RECOVERABLE_STATES } from './recovery.js';
 import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
-import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot, fetchAupayPrices } from './live-price.js';
+import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot, fetchAupayPrices, fetchQoo10Prices } from './live-price.js';
 import { evaluateRow, runLimits, mergeGuardWarns } from './pricing.js';
 import { rakutenShippingLabel, yahooPostageLabel, rakutenShippingName, yahooPostageName, aupayPostageLabel } from './shipping-labels.js';
 import { executeRun, mallWriteEnabled } from './execute.js';
 import { patchItemPrices, fetchItemDetail } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
 import { makeYahooClient } from './yahoo-apply.js';
 import { makeAupayClient } from './aupay-apply.js';
+import { makeQoo10Client } from './qoo10-apply.js';
 import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -145,6 +146,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   const rakutenTargets = [];
   const yahooTargets = [];
   const aupayTargets = [];
+  const qoo10Targets = [];
   const amazonSkus = [];
   for (const t of targets) {
     for (const l of t.listings) {
@@ -157,6 +159,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       }
       else if (l.mall === 'yahoo') yahooTargets.push({ key: l.listingCode, candidates: l.candidates || [l.listingCode] });
       else if (l.mall === 'aupay') aupayTargets.push({ key: l.listingCode, candidates: [l.listingCode] });
+      else if (l.mall === 'qoo10') qoo10Targets.push({ key: rakutenRowKey(t, l), itemNo: l.listingCode });
       else if (l.mall === 'amazon') amazonSkus.push(l.listingCode);
     }
   }
@@ -165,6 +168,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   let rakutenPrices = new Map();
   let yahooPrices = new Map();
   let aupayPrices = new Map();
+  let qoo10Prices = new Map();
   if (rakutenTargets.length > 0) {
     try {
       rakutenPrices = await fetchRakutenPrices(rakutenTargets, deps);
@@ -184,6 +188,13 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       aupayPrices = await fetchAupayPrices(aupayTargets, deps);
     } catch (e) {
       notices.push(`au PAY の設定価格を取得できませんでした: ${e.message}`);
+    }
+  }
+  if (qoo10Targets.length > 0) {
+    try {
+      qoo10Prices = await fetchQoo10Prices(qoo10Targets, deps);
+    } catch (e) {
+      notices.push(`Qoo10 の設定価格を取得できませんでした: ${e.message}`);
     }
   }
   const amazonSnap = loadAmazonSnapshot(db, amazonSkus);
@@ -267,6 +278,20 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
             sharedNote = `au PAY は色ごとの価格を持ちません。変えるとこの商品の ${p.choiceCount} 通りすべてが同じ価格になります`;
             note = note ? `${note} / ${sharedNote}` : sharedNote;
           }
+        } else {
+          note = p?.reason || '設定価格を取得できませんでした';
+        }
+      } else if (l.mall === 'qoo10') {
+        // ★Qoo10 は同じ NE コードに複数の出品がありうるので、行キー (NEコード×出品) で引く
+        const p = qoo10Prices.get(rakutenRowKey(t, l));
+        if (p?.found) {
+          price = p.price; priceSource = 'Qoo10 GetItemDetailInfo (ライブ)'; priceIsLive = true;
+          confidence = 'confirmed';
+          if (p.itemCode) { listingCode = p.itemCode; url = listingUrl('qoo10', p.itemCode); }
+          if (p.skuCode) skuCode = p.skuCode;
+          // ★Qoo10 のオプション (色など) は商品価格への差額。商品価格を変えると全部が底上げされる
+          sharedNote = 'Qoo10 のオプション価格は商品価格への差額です。変えると全オプションの実売価がいっしょに動きます';
+          note = note ? `${note} / ${sharedNote}` : sharedNote;
         } else {
           note = p?.reason || '設定価格を取得できませんでした';
         }
@@ -552,6 +577,7 @@ router.post('/api/runs/:runId/execute', async (req, res) => {
         rakuten: { patchItemPrices, fetchItemDetail },
         yahoo: makeYahooClient(),
         aupay: makeAupayClient(),
+        qoo10: makeQoo10Client(),
       },
     });
     res.json({ ok: true, ...out });
