@@ -162,8 +162,12 @@ const cancelDest = (id, reason = 'reopen') => db.prepare(
 // 参照データ (取引先・販売・在庫)
 db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 仕入先コード, updated_at)
   VALUES (1, 'PROD-A', '商品A', '単品', '取扱中', '確定', '0001', '2026-09-02T00:00:00Z')`).run();
-db.exec('CREATE TABLE IF NOT EXISTS po_suppliers (supplier_code TEXT PRIMARY KEY, supplier_name TEXT NOT NULL)');
-db.prepare("INSERT INTO po_suppliers (supplier_code, supplier_name) VALUES ('1', 'AMC')").run();
+// ⚠自前の CREATE で列名を想像しない — 本物の init でテーブルを作る (supplier_name と誤モックして
+//   本番の no such column を素通りさせた 2026-09-02 の教訓)
+const { initPurchaseOrders } = await import('../apps/purchase-orders/db.js');
+initPurchaseOrders();
+db.prepare("INSERT INTO po_suppliers (supplier_code, name, created_at, updated_at) VALUES ('1', 'AMC', ?, ?)")
+  .run(new Date().toISOString(), new Date().toISOString());
 const today = new Date().toISOString().slice(0, 10);
 const insSales = db.prepare(`INSERT INTO mirror_sales_daily (日付, 商品コード, モール, 数量, データ種別, チャネル, updated_at)
   VALUES (?, 'PROD-A', ?, ?, ?, '', ?)`);
