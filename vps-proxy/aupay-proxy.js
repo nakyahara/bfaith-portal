@@ -116,6 +116,11 @@ const AUPAY_WRITE_TIMEOUT_MS = 20000;
  *   素通し中継 (/wmshopapi/) が最初から付けていたのはこのため
  */
 const AUPAY_CONTENT_TYPE = 'application/x-www-form-urlencoded';
+/**
+ * updateItemInfo に送る本文の形。仕様書が手元に無いので実測で決める。
+ * ★どの形でも中身は「商品コード・価格・店舗ID」だけ。形が増えても送れるものは増えない
+ */
+const AUPAY_FORMATS = new Set(['form', 'xml', 'xml2', 'xml3', 'xml4', 'xml5']);
 function isSaneAupayPrice(v) {
   const s = String(v ?? '').trim();
   if (!/^\d+$/.test(s)) return false;
@@ -202,21 +207,35 @@ function buildAupayUpdateBody(item, shopId, format = 'form') {
   assertAupayPriceOnly(item);
   const code = String(item.itemCode).trim();
   const price = String(item.itemPrice).trim();
-  if (format === 'xml') {
-    // au PAY の応答と同じ入れ子をなぞる。中身は数字と商品コードだけなのでエスケープ不要だが、
-    // 念のため & < > は実体参照にする
-    const esc = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    return {
-      contentType: 'application/xml; charset=utf-8',
-      body: '<?xml version="1.0" encoding="UTF-8"?>'
-        + `<request><shopId>${esc(shopId)}</shopId>`
-        + `<item><itemCode>${esc(code)}</itemCode><itemPrice>${esc(price)}</itemPrice></item></request>`,
-    };
+  // 中身は数字と商品コードだけなのでエスケープは要らないはずだが、念のため & < > は実体参照にする
+  const esc = (v) => String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const decl = '<?xml version="1.0" encoding="UTF-8"?>';
+  const fields = `<itemCode>${esc(code)}</itemCode><itemPrice>${esc(price)}</itemPrice>`;
+  const xml = (body) => ({ contentType: 'application/xml; charset=utf-8', body: decl + body });
+
+  switch (format) {
+    case 'form':
+      return {
+        contentType: 'application/x-www-form-urlencoded',
+        body: new URLSearchParams({ shopId: String(shopId), itemCode: code, itemPrice: price }).toString(),
+      };
+    // ★実測 (2026-09-02): form は CME8039 (Content-Type 違い)。xml は受け付けられ、
+    //   CME9002「[updateItem] 必須入力項目です」= updateItem という要素が要る、まで分かった。
+    //   仕様書が手元に無いので、当たりをつけた形をいくつか用意して実測で決める。
+    //   **どの形でも送るのは商品コードと価格 (と店舗ID) だけ**
+    case 'xml':
+      return xml(`<request><shopId>${esc(shopId)}</shopId><item>${fields}</item></request>`);
+    case 'xml2':
+      return xml(`<request><updateItem>${fields}</updateItem></request>`);
+    case 'xml3':
+      return xml(`<request><shopId>${esc(shopId)}</shopId><updateItem>${fields}</updateItem></request>`);
+    case 'xml4':
+      return xml(`<updateItem><shopId>${esc(shopId)}</shopId>${fields}</updateItem>`);
+    case 'xml5':
+      return xml(`<request><updateItem><shopId>${esc(shopId)}</shopId>${fields}</updateItem></request>`);
+    default:
+      throw new Error(`aupay/update-item: 知らない format です (${format})`);
   }
-  return {
-    contentType: 'application/x-www-form-urlencoded',
-    body: new URLSearchParams({ shopId: String(shopId), itemCode: code, itemPrice: price }).toString(),
-  };
 }
 
 /** 照合のために「今の価格」を読む (au PAY) */
@@ -1102,8 +1121,8 @@ const server = http.createServer(async (req, res) => {
       }
       // ★知らない形式は黙って form に倒さない。タイプミスが別の送り方になるのを防ぐ (Codex R1)
       const format = body.format === undefined ? 'form' : String(body.format);
-      if (format !== 'form' && format !== 'xml') {
-        throw new Error(`aupay/update-item: format は form か xml です (${format})`);
+      if (!AUPAY_FORMATS.has(format)) {
+        throw new Error(`aupay/update-item: format は ${[...AUPAY_FORMATS].join(' / ')} のどれかです (${format})`);
       }
 
       const outcome = await withAupayItemLock([item.itemCode], async () => {
@@ -1120,7 +1139,11 @@ const server = http.createServer(async (req, res) => {
         }
         const built = buildAupayUpdateBody(item, shopIdForWrite, format);
         console.log(`[${ts()}] auPay updateItemInfo: ${item.itemCode} ${cur.price}円 -> ${item.itemPrice}円 (${format})`);
-        const r = await fetch(`${AUPAY_BASE}/wmshopapi/updateItemInfo`, {
+        // ★shopId はクエリにも付ける。searchItemInfo がこの流儀で、
+        //   本文側で要らなければ無視されるだけ
+        const upUrl = `${AUPAY_BASE}/wmshopapi/updateItemInfo?`
+          + new URLSearchParams({ shopId: shopIdForWrite }).toString();
+        const r = await fetch(upUrl, {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${AUPAY_API_KEY}`,
@@ -2604,6 +2627,18 @@ function runSelfTest() {
   check('auPay: form の Content-Type',
     buildAupayUpdateBody({ itemCode: 'zz-1', itemPrice: 981 }, '5', 'form').contentType,
     'application/x-www-form-urlencoded');
+  // ★どの形でも、送れるのは商品コードと価格 (と店舗ID) だけ。形が増えても送れるものは増えない
+  for (const f of ['xml', 'xml2', 'xml3', 'xml4', 'xml5']) {
+    const b = buildAupayUpdateBody({ itemCode: 'zz-1', itemPrice: 981 }, '54318092', f).body;
+    check('auPay: ' + f + ' は商品コードと価格を含む',
+      b.includes('<itemCode>zz-1</itemCode>') && b.includes('<itemPrice>981</itemPrice>'), true);
+    check('auPay: ★' + f + ' に商品名や説明は入らない',
+      /itemName|description|image/i.test(b), false);
+  }
+  check('auPay: ★知らない format は組み立てない',
+    (() => { try { buildAupayUpdateBody({ itemCode: 'a', itemPrice: 1 }, '5', 'xmll'); return 'とおった'; }
+      catch (_) { return '止まる'; } })(), '止まる');
+
   check('auPay: xml 形式にも商品コードと価格しか入らない',
     buildAupayUpdateBody({ itemCode: 'zz-1', itemPrice: 981 }, '5', 'xml').body.includes('<itemPrice>981</itemPrice>')
       && buildAupayUpdateBody({ itemCode: 'zz-1', itemPrice: 981 }, '5', 'xml').body.includes('<itemCode>zz-1</itemCode>'),
