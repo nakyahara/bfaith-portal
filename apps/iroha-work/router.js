@@ -23,7 +23,7 @@ import {
   logEvent, listEvents,
   getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
 } from './db.js';
-import { ensureFresh, changeStatus, cacheStatsForAdmin, STATUSES } from './notion-read.js';
+import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
 import { buildList } from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -281,12 +281,22 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   const pageId = String(req.body?.page_id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
   // 開始可否の判定に使うキャッシュの鮮度を保証してから見る (3分以内。Codex PR2 #6)。
-  // それでも「直後にNotion側で完了へ変えられた」レースは残る — 正本がNotionのv1では許容し、
-  // 巡回で表示が追いつく
-  await ensureFresh();
-  const card = getCachePage(pageId);
+  // 鮮度を保証できなかったとき (取得失敗・件数上限) は、キャッシュを信じずに
+  // **対象ページを直接再取得**して判定する (Codex PR2-R2 P1)。それも失敗なら開始を拒否 —
+  // どのみち Notion に書けない状況なので、素性の分からないカードで時間だけ記録しない
+  const refresh = await ensureFresh();
+  let card = getCachePage(pageId);
+  if (!refresh.fresh) {
+    const live = await fetchCardLive(pageId);
+    if (!live.ok) {
+      const st = live.error === 'card_gone' ? 404 : live.error === 'wrong_database' ? 404 : 502;
+      return res.status(st).json({ ok: false, error: live.error, message: live.message });
+    }
+    card = getCachePage(pageId);   // fetchCardLive が upsert 済み
+  }
   if (!card) return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' });
   if (card.status === '棚入完了') return res.status(409).json({ ok: false, error: 'done_card', message: 'このカードは棚入完了です (作業をはじめるなら職員がステータスを戻してください)' });
+  if (card.status === '取消') return res.status(409).json({ ok: false, error: 'cancelled_card', message: 'このカードは取消済みです' });
 
   const r = startSession({
     pageId, productCode: card.product_code, title: card.title,
@@ -319,7 +329,7 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
   const pageId = String(req.body?.page_id || '').trim();
   const reason = String(req.body?.reason || '');
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
-  const r = stopSession({ pageId, workerId: w.worker.id, reason });
+  const r = stopSession({ pageId, workerId: w.worker.id, sessionId: req.body?.session_id, reason });
   safeLog({ action: 'session_stop', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
     deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
   if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);

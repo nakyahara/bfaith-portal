@@ -561,7 +561,7 @@ async function startWork() {
   if (c) {
     if (j.status) c.status = j.status;
     if (!c.active.some(a => a.worker_id === worker.id)) {
-      c.active.push({ worker_id: worker.id, worker_name: worker.display_name, started_at: j.startedAt });
+      c.active.push({ id: j.sessionId, worker_id: worker.id, worker_name: worker.display_name, started_at: j.startedAt });
     }
     renderTabs(); renderList(); renderDetail(c);
   }
@@ -571,12 +571,15 @@ async function startWork() {
 
 async function stopWork(reason) {
   if (!worker || !curDetail) return;
+  const cNow = state.cards.find(x => x.page_id === curDetail);
+  const mine = cNow ? myActiveOf(cNow) : null;
+  if (!mine || !mine.id) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
   for (const id of ['pauseBtn', 'doneBtn']) { const b = document.getElementById(id); if (b) b.disabled = true; }
   let j;
   try {
     const r = await fetch(BASE + '/api/sessions/stop', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ page_id: curDetail, worker_id: worker.id, reason }),
+      body: JSON.stringify({ page_id: curDetail, worker_id: worker.id, session_id: mine.id, reason }),
     });
     j = await r.json().catch(() => ({}));
   } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }

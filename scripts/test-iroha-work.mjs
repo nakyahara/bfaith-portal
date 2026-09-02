@@ -443,18 +443,25 @@ console.log('\n[13] 作業時間セッション');
   ok(s2.ok === true, '別の人は同じカードに参加できる (複数人=複数行)');
   ok((activeSessionsByPage().get('sess-p1') || []).length === 2, '活動中2名が一覧に出る');
 
-  const st1 = stopSession({ pageId: 'sess-p1', workerId: worker1.id, reason: 'done' });
+  const st1 = stopSession({ pageId: 'sess-p1', workerId: worker1.id, sessionId: s1.sessionId, reason: 'done' });
   ok(st1.ok === true && st1.session.raw_seconds >= 0 && st1.remainingActive === 1, '終了 (raw_seconds はサーバー計算・残り1名)');
   const w3 = addIrohaWorker({ displayName: 'いとう', workerType: 'member', actor: 'test' });
-  ok(stopSession({ pageId: 'sess-p1', workerId: w3.id, reason: 'done' }).error === 'not_started', '開始していない人の終了は拒否');
-  ok(stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'bogus' }).error === 'bad_request', '不正な理由は拒否');
-  const st2 = stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'pause' });
+  ok(stopSession({ pageId: 'sess-p1', workerId: w3.id, sessionId: s2.sessionId, reason: 'done' }).error === 'not_started',
+    '他人のセッションIDでは終了できない');
+  ok(stopSession({ pageId: 'sess-p1', workerId: worker2.id, sessionId: s2.sessionId, reason: 'bogus' }).error === 'bad_request', '不正な理由は拒否');
+  ok(stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'done' }).error === 'bad_request', 'session_id なしは拒否');
+  const st2 = stopSession({ pageId: 'sess-p1', workerId: worker2.id, sessionId: s2.sessionId, reason: 'pause' });
   ok(st2.ok === true && st2.remainingActive === 0, '中断で全員離脱 (remainingActive=0 → 画面が「中断にする?」を出す)');
-  const st2again = stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'pause' });
+  const st2again = stopSession({ pageId: 'sess-p1', workerId: worker2.id, sessionId: s2.sessionId, reason: 'pause' });
   ok(st2again.ok === true && st2again.already === true && st2again.session.id === st2.session.id,
-    '終了の再送 (同じ理由・2分以内) は成功扱い — 冪等');
-  ok(stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'done' }).error === 'not_started',
-    '理由が違う再送は冪等扱いしない');
+    '同じセッションIDの再送は成功扱い — 冪等');
+
+  // 遅延再送が「後から始めた新しいセッション」を誤終了しない (Codex PR2-R2 P2)
+  const sB = startSession({ pageId: 'sess-p1', productCode: 'PROD-A', title: '商品A', worker: worker2 });
+  const stale = stopSession({ pageId: 'sess-p1', workerId: worker2.id, sessionId: s2.sessionId, reason: 'pause' });
+  ok(stale.ok === true && stale.already === true, '古いIDの再送は already で返る');
+  ok((activeSessionsByPage().get('sess-p1') || []).some(a => a.id === sB.sessionId), '新しいセッションは終了されず動き続ける');
+  stopSession({ pageId: 'sess-p1', workerId: worker2.id, sessionId: sB.sessionId, reason: 'done' });
 
   // 実測の集計: カード単位の合計を商品ごとに平均。voided は外す
   const db2 = getDB();
@@ -486,7 +493,7 @@ console.log('\n[13] 作業時間セッション');
   const rows2 = listSessionsForAdmin(10);
   ok(oldOpen.ok && rows2.some(r => r.page_id === 'old-open' && !r.ended_at),
     '終了済みが増えても活動中セッションは管理一覧に必ず出る');
-  stopSession({ pageId: 'old-open', workerId: worker2.id, reason: 'done' });
+  stopSession({ pageId: 'old-open', workerId: worker2.id, sessionId: oldOpen.sessionId, reason: 'done' });
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

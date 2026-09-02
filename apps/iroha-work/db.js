@@ -365,43 +365,42 @@ export function startSession({ pageId, productCode = null, title = null, worker,
 }
 
 /**
- * 作業終了・中断。raw_seconds はサーバー時刻の差分で確定する (上書きしない)。
+ * 作業終了・中断。**開始時に発行した sessionId を必ず指定する** (Codex PR2-R2 P2:
+ * 「その作業者の活動中の行」を閉じる方式だと、遅延再送が後から始めた別セッションを誤終了する)。
+ * 同じ sessionId が既に終了済みなら成功扱いで返す (冪等)。
+ * raw_seconds はサーバー時刻の差分で確定する (上書きしない)。
  * @returns {ok, session, remainingActive} remainingActive = このカードでまだ作業中の人数
  */
-export function stopSession({ pageId, workerId, reason }) {
+export function stopSession({ pageId, workerId, sessionId, reason }) {
   if (reason !== 'done' && reason !== 'pause') return { ok: false, error: 'bad_request', message: '終了の種類が不正です' };
+  const sid = Number(sessionId);
+  if (!Number.isInteger(sid) || sid <= 0) return { ok: false, error: 'bad_request', message: 'session_id が必要です (画面を更新してください)' };
   const db = getDB();
   const now = utcNow();
   return db.transaction(() => {
-    const open = db.prepare(`SELECT * FROM f_iroha_work_sessions
-      WHERE page_id = ? AND worker_id = ? AND ended_at IS NULL`).get(pageId, Number(workerId));
-    if (!open) {
-      // 応答が消えた再送への冪等対応: 直近2分以内に同じ理由で終了済みなら成功扱いで返す
-      const recent = db.prepare(`SELECT * FROM f_iroha_work_sessions
-        WHERE page_id = ? AND worker_id = ? AND ended_at IS NOT NULL AND voided_at IS NULL
-        ORDER BY id DESC LIMIT 1`).get(pageId, Number(workerId));
-      if (recent && recent.end_reason === reason && Date.parse(now) - Date.parse(recent.ended_at) < 2 * 60 * 1000) {
-        const remaining0 = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE page_id = ? AND ended_at IS NULL')
-          .get(pageId).c;
-        return { ok: true, already: true,
-          session: { id: recent.id, raw_seconds: recent.raw_seconds, started_at: recent.started_at, ended_at: recent.ended_at },
-          remainingActive: remaining0 };
-      }
+    const remainingOn = () => db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE page_id = ? AND ended_at IS NULL')
+      .get(pageId).c;
+    const row = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(sid);
+    if (!row || row.page_id !== pageId || row.worker_id !== Number(workerId)) {
       return { ok: false, error: 'not_started', message: 'このカードで作業をはじめた記録がありません (画面を更新してください)' };
     }
-    const raw = Math.max(0, Math.floor((Date.parse(now) - Date.parse(open.started_at)) / 1000));
+    if (row.ended_at) {
+      // 再送 (応答消失) — 対象セッションはもう閉じている。後続の新しいセッションには触らない
+      return { ok: true, already: true,
+        session: { id: row.id, raw_seconds: row.raw_seconds, started_at: row.started_at, ended_at: row.ended_at },
+        remainingActive: remainingOn() };
+    }
+    const raw = Math.max(0, Math.floor((Date.parse(now) - Date.parse(row.started_at)) / 1000));
     db.prepare('UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = ?, raw_seconds = ? WHERE id = ?')
-      .run(now, reason, raw, open.id);
-    const remaining = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE page_id = ? AND ended_at IS NULL')
-      .get(pageId).c;
-    return { ok: true, session: { id: open.id, raw_seconds: raw, started_at: open.started_at, ended_at: now }, remainingActive: remaining };
+      .run(now, reason, raw, row.id);
+    return { ok: true, session: { id: row.id, raw_seconds: raw, started_at: row.started_at, ended_at: now }, remainingActive: remainingOn() };
   }).immediate();
 }
 
-/** 活動中セッションを page_id → [{worker_id, worker_name, started_at}] で返す (一覧表示用) */
+/** 活動中セッションを page_id → [{id, worker_id, worker_name, started_at}] で返す (一覧表示・終了ボタン用) */
 export function activeSessionsByPage() {
   const map = new Map();
-  for (const r of getDB().prepare(`SELECT page_id, worker_id, worker_name, started_at
+  for (const r of getDB().prepare(`SELECT id, page_id, worker_id, worker_name, started_at
     FROM f_iroha_work_sessions WHERE ended_at IS NULL ORDER BY started_at`).all()) {
     if (!map.has(r.page_id)) map.set(r.page_id, []);
     map.get(r.page_id).push(r);

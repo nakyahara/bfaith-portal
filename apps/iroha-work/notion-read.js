@@ -290,6 +290,35 @@ async function changeStatusLocked({ pageId, to, expect, isStaff }) {
   return { ok: true, status: to };
 }
 
+/**
+ * 1ページの現在状態を Notion から直接取る (キャッシュが古いときの開始可否判定用 — Codex PR2-R2 P1)。
+ * changeStatus と同じ検査 (404/アーカイブ/別DB) を通す。
+ * @returns {ok:true, status, row} | {ok:false, error, message}
+ */
+export async function fetchCardLive(pageId) {
+  let page;
+  try {
+    page = await notionRequest(`/pages/${pageId}`, 'GET');
+  } catch (e) {
+    if (e.status === 404) {
+      removeCachePage(pageId);
+      return { ok: false, error: 'card_gone', message: 'このカードは Notion 側で削除されています。一覧を更新します' };
+    }
+    return { ok: false, error: 'notion_error', message: `Notion に接続できませんでした (${e.message})` };
+  }
+  if (page.archived) {
+    removeCachePage(pageId);
+    return { ok: false, error: 'card_gone', message: 'このカードは Notion 側でアーカイブされています。一覧を更新します' };
+  }
+  const parentId = String(page.parent?.database_id || '').replace(/-/g, '').toLowerCase();
+  if (parentId !== String(dbId() || '').replace(/-/g, '').toLowerCase()) {
+    return { ok: false, error: 'wrong_database', message: 'このページは在庫化作業管理のカードではありません' };
+  }
+  const parsed = parsePage(page);
+  upsertCachePage(parsed);
+  return { ok: true, status: parsed.status, row: parsed };
+}
+
 /** 管理画面用のキャッシュ統計 */
 export function cacheStatsForAdmin() {
   const db = getDB();
