@@ -9,13 +9,16 @@
  *   INBOUND_CHECK_NOTION_DB_ID   … 「在庫化作業管理」DB の ID
  * どちらか未設定なら NOTION_NOT_CONFIGURED (fail-closed)。
  *
- * ⭐カードには必ず destination_id (number) を入れる。
+ * ⭐カードには必ず「台帳キー」(rich_text, 例 d123-a1b2c3) を入れる。
  *   「ページ作成は成功したが応答を受け取る前に落ちて page_id を保存できなかった」とき、
- *   このプロパティで既存カードを探して回収する (二重カードの防止。Codex設計相談R1 #3)。
+ *   このキーで既存カードを探して回収する (二重カードの防止)。
+ *   行IDそのもの (destination_id, number) は人が見るための表示用 — DB を作り直すと
+ *   AUTOINCREMENT が 1 から振り直され過去カードと衝突するため、回収キーには使わない (Codex R1 #8)。
  */
 
 const API_BASE = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
+export const DEDUPE_PROP = '台帳キー';
 
 export function isNotionConfigured() {
   return !!(process.env.NOTION_TOKEN && process.env.INBOUND_CHECK_NOTION_DB_ID);
@@ -74,7 +77,8 @@ export async function notionRequest(path, method, body) {
     }
     if ((res.status === 429 || res.status >= 500) && attempt < MAX) {
       const ra = Number(res.headers.get('retry-after'));
-      await sleep(ra > 0 ? ra * 1000 : backoff(attempt));
+      // Retry-After は上限 30 秒で丸める (異常値で sweep 全体が長時間止まらないように — Codex R1 #11)
+      await sleep(ra > 0 ? Math.min(ra * 1000, 30_000) : backoff(attempt));
       continue;
     }
     const data = await res.json().catch(() => ({}));
@@ -87,32 +91,53 @@ export async function notionRequest(path, method, body) {
 
 // ─── DB スキーマ (プロパティ) ───
 
-// プロセス内キャッシュ。プロパティ名の集合はほぼ変わらないので毎 sweep 取り直さない
-let schemaCache = null; // { at: ms, props: Set<string> }
+// プロセス内キャッシュ。プロパティ構成はほぼ変わらないので毎 sweep 取り直さない
+let schemaCache = null; // { at: ms, schema: { names: Set, types: Map } }
 const SCHEMA_TTL_MS = 10 * 60 * 1000;
 
 /**
- * カード DB のプロパティ名一覧を返す。無ければ足すもの:
- *   destination_id (number)  … 二重カード防止の回収キー
+ * カード DB のプロパティを確認し、無ければ足す:
+ *   台帳キー (rich_text)     … 回収用の一意キー (必須)
+ *   destination_id (number)  … 台帳の行ID (人が見る表示用)
  *   有効期限 (rich_text)     … YYYY-MM-DD / YYYY-MM の両方が入るので date 型にしない
  * 既存プロパティ (名前・ステータス・商品コード…) は一切触らない。
- * 戻り値の Set は「実在するプロパティ名」— カード作成側はこれに無い項目を送らない
- * (プロパティが改名されていても validation エラーで全滅しないため)。
+ *
+ * ⭐この経路が依存するプロパティの「型」も検証する (Codex R1 #9)。
+ *   型が合わないと全行が個別に 400 でブロックされるので、スキーマ全体の問題として
+ *   1回だけ NOTION_SCHEMA_MISMATCH で失敗させる (行にはエラーを書かない)。
+ *
+ * @returns {{ names: Set<string>, types: Map<string,string> }}
  */
 export async function ensureCardSchema({ force = false } = {}) {
   const { dbId } = getConfig();
-  if (!force && schemaCache && Date.now() - schemaCache.at < SCHEMA_TTL_MS) return schemaCache.props;
+  if (!force && schemaCache && Date.now() - schemaCache.at < SCHEMA_TTL_MS) return schemaCache.schema;
   const db = await notionRequest(`/databases/${dbId}`, 'GET');
-  const props = new Set(Object.keys(db.properties || {}));
+  const names = new Set(Object.keys(db.properties || {}));
+  const types = new Map(Object.entries(db.properties || {}).map(([k, v]) => [k, v?.type]));
+
   const add = {};
-  if (!props.has('destination_id')) add['destination_id'] = { number: {} };
-  if (!props.has('有効期限')) add['有効期限'] = { rich_text: {} };
+  if (!names.has(DEDUPE_PROP)) add[DEDUPE_PROP] = { rich_text: {} };
+  if (!names.has('destination_id')) add['destination_id'] = { number: {} };
+  if (!names.has('有効期限')) add['有効期限'] = { rich_text: {} };
   if (Object.keys(add).length > 0) {
     await notionRequest(`/databases/${dbId}`, 'PATCH', { properties: add });
-    for (const k of Object.keys(add)) props.add(k);
+    for (const [k, v] of Object.entries(add)) { names.add(k); types.set(k, Object.keys(v)[0]); }
   }
-  schemaCache = { at: Date.now(), props };
-  return props;
+
+  // 型の検証 (存在するのに型が違う = 人が作り替えた等)。合わないなら1回で止める
+  const expect = [
+    [DEDUPE_PROP, 'rich_text'], ['destination_id', 'number'], ['有効期限', 'rich_text'], ['ステータス', 'select'],
+  ];
+  const bad = expect.filter(([k, t]) => names.has(k) && types.get(k) !== undefined && types.get(k) !== t);
+  if (bad.length > 0) {
+    const e = new Error('Notion DB のプロパティ型が想定と違います: '
+      + bad.map(([k, t]) => `「${k}」は ${t} 型が必要 (現在 ${types.get(k)})`).join(' / '));
+    e.code = 'NOTION_SCHEMA_MISMATCH';
+    throw e;
+  }
+  const schema = { names, types };
+  schemaCache = { at: Date.now(), schema };
+  return schema;
 }
 
 /** テストからキャッシュを消すため */
@@ -120,11 +145,11 @@ export function _clearSchemaCache() { schemaCache = null; }
 
 // ─── ページ操作 ───
 
-/** destination_id でカードを検索 (回収用)。見つからなければ null */
-export async function findCardByDestinationId(destinationId) {
+/** 台帳キーでカードを検索 (回収用)。見つからなければ null */
+export async function findCardByDedupeKey(dedupeKey) {
   const { dbId } = getConfig();
   const r = await notionRequest(`/databases/${dbId}/query`, 'POST', {
-    filter: { property: 'destination_id', number: { equals: Number(destinationId) } },
+    filter: { property: DEDUPE_PROP, rich_text: { equals: String(dedupeKey) } },
     page_size: 1,
   });
   return r.results?.[0] || null;

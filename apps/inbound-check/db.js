@@ -166,6 +166,13 @@ export function createTables(db = getMirrorDB()) {
       updated_by     TEXT
     );
 
+    -- Notion sweep の多重実行防止 lease (notion-sync.js。期限切れは自動回収 = 永久ロックにならない)
+    CREATE TABLE IF NOT EXISTS f_inbound_check_notion_lease (
+      id         INTEGER PRIMARY KEY CHECK (id = 1),
+      holder     TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS f_inbound_check_import_log (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       at         TEXT NOT NULL,
@@ -328,6 +335,9 @@ function migrateQuantity(db) {
   addCol(db, 'f_inbound_check_destinations', 'notion_cancelled_at', 'TEXT');
   addCol(db, 'f_inbound_check_destinations', 'notion_cancel_error', 'TEXT');
   addCol(db, 'f_inbound_check_destinations', 'notion_cancelled_prev_status', 'TEXT');
+  // 回収用の永続ランダムキー (カードの「台帳キー」プロパティと対)。行IDは DB 作り直しで
+  // 振り直されるため回収キーにしない (Codex R1 #8)。カード作成の**前に**保存される
+  addCol(db, 'f_inbound_check_destinations', 'notion_dedupe_key', 'TEXT');
 
   if (!added) return;   // ここから先は列を足した初回だけ
 

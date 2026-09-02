@@ -6,24 +6,31 @@
  *   cancelled       → カードなし (未送信のまま取消) または既存カードがステータス「取消」
  *
  * 実行タイミング (中原さん 2026-09-02 決定):
- *   1日1回 夕方 (既定 17:30 JST) の一括送信 + 管理画面「今すぐ送る」ボタン。
- *   都度送信にしないのは、当日中のやり直し (取消→再確認) を送信前に収束させるため。
- *   それでも「確認済み行が翌日に引き継がれた後のやり直し」等で送信後の取消は起こり得るので、
- *   取消の反映 (ステータス→取消) は同じ sweep が保険として行う (Codex設計相談R1)。
+ *   - 新規カードの送信 = 1日1回 夕方 (既定 17:30 JST) の一括 + 管理画面「今すぐ送る」。
+ *     都度送信にしないのは、当日中のやり直し (確認→取消→再確認) を送信前に収束させるため
+ *   - 取消の反映・エラー行の再試行だけは 30 分巡回 (既存 Drive cron に相乗り・mode='retry')。
+ *     「取消済みの作業指示が有効に見え続ける」時間を短くする (Codex R1 #5 #6)
  *
- * 設計の要点 (Codex設計相談R1 = Downloads『在庫化カード置き換え_Codex設計相談R1_20260902.md』):
- *   - outbox 方式: 送信状態は台帳の行そのものに持つ (notion_page_id / notion_synced_at / …)。
- *     Render のデプロイ再起動で今日の分を送り損ねても、次の sweep が拾う
- *   - 二重カード防止: カードに destination_id を必ず入れ、作成前に同 ID のカードを検索して回収
- *   - 作成成功と取消反映は別の状態列 (notion_synced_at を取消時に上書きしない)
- *   - 4xx (スキーマ不整合等) は無限リトライしない — ブロックして管理画面に出す。再送は人がボタンで
+ * 設計の要点 (Codex設計相談R1 + コードレビューR1 = Downloads『在庫化カード置き換え_*_20260902.md』):
+ *   - outbox: 送信状態は台帳の行に持つ。Render 再起動で送り損ねても次の sweep が拾う
+ *   - 二重カード防止: 送信前に notion_dedupe_key (行ごとの永続ランダムキー) を**先に DB へ保存**し、
+ *     カードにも「台帳キー」として入れる。作成前に同キーで検索して回収する。
+ *     行ID (AUTOINCREMENT) はDB作り直しで振り直されるので回収キーにしない (R1 #8)
+ *   - markSent は「未取消・未送信」の条件付き UPDATE。0件なら競合として扱い、
+ *     作った/回収したカードを取り漏らさない (R1 #3 #4)
+ *   - 「作成成功→記録前に停止→取消」で孤立したカードも、取消済み行の台帳キー検索で回収して
+ *     「取消」へ収束させる (R1 #1)
+ *   - 多重実行は プロセス内フラグ + SQLite lease の二段 (R1 #2。Render はディスク付き=単一インスタンス
+ *     だが、デプロイ切替や手動実行の重なりに備える)
+ *   - 4xx (429/409 以外) は自動再試行しない — ブロックして管理画面の「再送」で解除 (R1 #7)。
+ *     一時エラーは 30 分後から再試行対象 (30分巡回が拾う)
  *   - 取消反映時に元ステータスを記録し、未着手以外だった行は管理画面の要確認一覧に出す
- *     (「人が動かしていたら触らない」はしない — 取消済みの作業指示が有効に見える方が危険)
  */
-import { getDB, workDateJst } from './db.js';
+import crypto from 'crypto';
+import { getDB } from './db.js';
 import {
-  isNotionConfigured, ensureCardSchema, findCardByDestinationId,
-  createCard, getCardState, setCardStatus,
+  isNotionConfigured, ensureCardSchema, findCardByDedupeKey,
+  createCard, getCardState, setCardStatus, DEDUPE_PROP,
 } from './notion.js';
 import { recordPing } from '../jobs-monitor/store.js';
 import { normSupplierCode } from '../purchase-orders/db.js';
@@ -32,24 +39,29 @@ export const JOB_ID = 'inbound-check-notion-cards';
 const CANCELLED_STATUS = '取消';
 // 4xx で止めた行の目印。人が「再送」するまで自動では触らない
 const BLOCKED_UNTIL = '9999-12-31T00:00:00.000Z';
-const RETRY_DELAY_MS = 30 * 60 * 1000;   // 一時エラーの再試行間隔 (次の sweep か手動ボタンで拾う)
+const RETRY_DELAY_MS = 30 * 60 * 1000;   // 一時エラーの再試行間隔 (30分巡回 mode='retry' が拾う)
 const CREATE_INTERVAL_MS = 350;          // Notion レートリミット (3req/s) 対策。GAS と同じ
 const SWEEP_LIMIT = 300;                 // 1回の sweep で扱う行数の上限 (通常は1日数十行)
+const LEASE_MS = 10 * 60 * 1000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const utcNow = () => new Date().toISOString();
+
+// 再試行しても直らない 4xx (429=rate limit と 409=conflict は一時扱い) — Codex R1 #7
+const isPermanentStatus = (s) => Number.isInteger(s) && s >= 400 && s < 500 && s !== 429 && s !== 409;
 
 function tableExists(db, name) {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
 }
 
-// ─── 送信対象の抽出 ───
+// ─── 対象行の抽出 ───
 
-/** まだカードになっていない いろは行き (取消済み・ブロック中・再試行待ちは除く) */
-export function collectUnsent(db, now = utcNow(), limit = SWEEP_LIMIT) {
+/** まだカードになっていない いろは行き。retryOnly=true なら一度失敗した行だけ (30分巡回用) */
+export function collectUnsent(db, { now = utcNow(), limit = SWEEP_LIMIT, retryOnly = false } = {}) {
   return db.prepare(`SELECT * FROM f_inbound_check_destinations
     WHERE destination = 'iroha' AND cancelled_at IS NULL AND notion_page_id IS NULL
       AND (notion_next_retry_at IS NULL OR notion_next_retry_at <= ?)
+      ${retryOnly ? 'AND COALESCE(notion_attempt_count, 0) > 0' : ''}
     ORDER BY id LIMIT ?`).all(now, limit);
 }
 
@@ -59,6 +71,29 @@ export function collectCancelPending(db, now = utcNow(), limit = SWEEP_LIMIT) {
     WHERE notion_page_id IS NOT NULL AND cancelled_at IS NOT NULL AND notion_cancelled_at IS NULL
       AND (notion_next_retry_at IS NULL OR notion_next_retry_at <= ?)
     ORDER BY id LIMIT ?`).all(now, limit);
+}
+
+/**
+ * 取消済みなのに page_id が無い行 (Codex R1 #1)。
+ * 「作成は成功したが記録前に落ち、その後取り消された」カードが Notion に孤立している可能性がある。
+ * 台帳キーで1回だけ検索し、見つかれば「取消」へ収束、無ければ「カード未作成」で終端にする。
+ * 台帳キーが無い行はカードを作りようがなかった行なので、API を叩かず終端。
+ */
+export function collectOrphanCancelled(db, now = utcNow(), limit = SWEEP_LIMIT) {
+  return db.prepare(`SELECT * FROM f_inbound_check_destinations
+    WHERE cancelled_at IS NOT NULL AND notion_page_id IS NULL AND notion_cancelled_at IS NULL
+      AND (notion_next_retry_at IS NULL OR notion_next_retry_at <= ?)
+    ORDER BY id LIMIT ?`).all(now, limit);
+}
+
+/** 行の永続ランダムキー。**カード作成の前に** DB へ保存する (作成後のクラッシュでも回収できる) */
+export function ensureDedupeKey(db, row) {
+  if (row.notion_dedupe_key) return row.notion_dedupe_key;
+  const key = `d${row.id}-${crypto.randomBytes(6).toString('hex')}`;
+  db.prepare('UPDATE f_inbound_check_destinations SET notion_dedupe_key = ? WHERE id = ? AND notion_dedupe_key IS NULL')
+    .run(key, row.id);
+  // 同時実行で別プロセスが先に付けた場合はそちらが正
+  return db.prepare('SELECT notion_dedupe_key FROM f_inbound_check_destinations WHERE id = ?').get(row.id)?.notion_dedupe_key || key;
 }
 
 // ─── カード内容の組み立て ───
@@ -120,12 +155,12 @@ function barcodeFor(db, row) {
 }
 
 /**
- * Notion プロパティを組み立てる。schemaProps (実在するプロパティ名の集合) に無い項目は送らない
+ * Notion プロパティを組み立てる。names (実在するプロパティ名の集合) に無い項目は送らない
  * (プロパティが改名・削除されていても、その項目だけ落ちて送信自体は成功する)。
  */
-export function buildCardProperties(row, { barcode, product, supplierName, ext }, schemaProps) {
+export function buildCardProperties(row, { barcode, product, supplierName, ext, dedupeKey }, names) {
   const props = {};
-  const put = (name, value) => { if (schemaProps.has(name)) props[name] = value; };
+  const put = (name, value) => { if (names.has(name)) props[name] = value; };
   const text = (s) => [{ text: { content: String(s).slice(0, 1900) } }];
 
   props['名前'] = { title: [{ text: { content: row.product_name || row.product_id || '名称不明' } }] };
@@ -145,6 +180,7 @@ export function buildCardProperties(row, { barcode, product, supplierName, ext }
   put('作業拠点', { select: { name: 'いろは' } });
   if (row.expiry_date) put('有効期限', { rich_text: text(row.expiry_date) });
   put('destination_id', { number: row.id });
+  put(DEDUPE_PROP, { rich_text: text(dedupeKey) });
 
   // 過去30日販売数 / 外部出し目安 (GAS と同じ文言)
   put('過去30日販売数', { rich_text: text(ext.sales30 != null ? `${ext.sales30}個` : '販売実績なし') });
@@ -161,20 +197,30 @@ export function buildCardProperties(row, { barcode, product, supplierName, ext }
 
 // ─── 状態の記録 ───
 
+/**
+ * 送信成功の記録。**未取消・未送信のときだけ** 書く (Codex R1 #3)。
+ * 戻り値 changes=0 は「待っている間に取り消された/別実行が先に記録した」— 呼び元が収束させる。
+ */
 function markSent(db, id, pageId, payload) {
-  // notion_page_id IS NULL ガード: sweep 中に別経路で埋まっていたら上書きしない
   return db.prepare(`UPDATE f_inbound_check_destinations
     SET notion_page_id = ?, notion_synced_at = ?, notion_payload = ?,
         notion_error = NULL, notion_next_retry_at = NULL, notion_attempt_count = COALESCE(notion_attempt_count, 0) + 1
-    WHERE id = ? AND notion_page_id IS NULL`).run(pageId, utcNow(), payload, id).changes;
+    WHERE id = ? AND destination = 'iroha' AND cancelled_at IS NULL AND notion_page_id IS NULL`)
+    .run(pageId, utcNow(), payload, id).changes;
 }
 
-function markSendError(db, id, e) {
-  const permanent = [400, 401, 403, 404].includes(e.status);
+/** 取消済み行などへ page_id だけ紐付ける (取消フェーズが「取消」へ倒すための足がかり) */
+function attachPage(db, id, pageId, payload) {
+  return db.prepare(`UPDATE f_inbound_check_destinations
+    SET notion_page_id = ?, notion_synced_at = COALESCE(notion_synced_at, ?), notion_payload = COALESCE(notion_payload, ?)
+    WHERE id = ? AND notion_page_id IS NULL`).run(pageId, utcNow(), payload || null, id).changes;
+}
+
+function markSendError(db, id, message, permanent) {
   const retryAt = permanent ? BLOCKED_UNTIL : new Date(Date.now() + RETRY_DELAY_MS).toISOString();
   db.prepare(`UPDATE f_inbound_check_destinations
     SET notion_error = ?, notion_next_retry_at = ?, notion_attempt_count = COALESCE(notion_attempt_count, 0) + 1
-    WHERE id = ?`).run(String(e.message || e).slice(0, 300), retryAt, id);
+    WHERE id = ?`).run(String(message).slice(0, 300), retryAt, id);
   return permanent;
 }
 
@@ -184,12 +230,11 @@ function markCancelled(db, id, prevStatus) {
     WHERE id = ?`).run(utcNow(), prevStatus || null, id);
 }
 
-function markCancelError(db, id, e) {
-  const permanent = [400, 401, 403, 404].includes(e.status);
+function markCancelError(db, id, message, permanent) {
   const retryAt = permanent ? BLOCKED_UNTIL : new Date(Date.now() + RETRY_DELAY_MS).toISOString();
   db.prepare(`UPDATE f_inbound_check_destinations
     SET notion_cancel_error = ?, notion_next_retry_at = ?
-    WHERE id = ?`).run(String(e.message || e).slice(0, 300), retryAt, id);
+    WHERE id = ?`).run(String(message).slice(0, 300), retryAt, id);
   return permanent;
 }
 
@@ -200,91 +245,182 @@ export function resetNotionRow(id) {
     WHERE id = ?`).run(Number(id)).changes;
 }
 
-// ─── sweep 本体 ───
+// ─── 多重実行の防止 (プロセス内フラグ + SQLite lease。Codex R1 #2) ───
 
 let running = false;
 
+function acquireLease(db, holder, now = Date.now()) {
+  const tx = db.transaction(() => {
+    const cur = db.prepare('SELECT holder, expires_at FROM f_inbound_check_notion_lease WHERE id = 1').get();
+    if (cur && cur.holder !== holder && Date.parse(cur.expires_at) > now) return false;
+    db.prepare(`INSERT INTO f_inbound_check_notion_lease (id, holder, expires_at) VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET holder = excluded.holder, expires_at = excluded.expires_at`)
+      .run(holder, new Date(now + LEASE_MS).toISOString());
+    return true;
+  });
+  return tx.immediate();
+}
+
+function releaseLease(db, holder) {
+  try { db.prepare('DELETE FROM f_inbound_check_notion_lease WHERE id = 1 AND holder = ?').run(holder); }
+  catch (e) { console.warn('[inbound-check notion] lease 解放失敗 (期限で自然回収されます):', e.message); }
+}
+
+// ─── sweep 本体 ───
+
+/** page_id のあるカードを「取消」へ倒す (取消フェーズ・孤立回収の共通処理) */
+async function convergeCancelledCard(db, rowId, pageId) {
+  const state = await getCardState(pageId);
+  if (state.archived) {
+    // 誰かが Notion 側でアーカイブ済み — もう有効な作業指示として見えないので収束とみなす
+    markCancelled(db, rowId, state.status ? `${state.status} (アーカイブ済み)` : '(アーカイブ済み)');
+  } else if (state.status === CANCELLED_STATUS) {
+    markCancelled(db, rowId, CANCELLED_STATUS);
+  } else {
+    await setCardStatus(pageId, CANCELLED_STATUS);
+    markCancelled(db, rowId, state.status || '(不明)');
+    await sleep(CREATE_INTERVAL_MS);
+  }
+}
+
 /**
- * reconcile を1回実行する。cron (毎日夕方) と管理画面ボタンの両方から呼ばれる。
- * @returns {{ok:boolean, sent?:number, recovered?:number, cancelled?:number, errors?:number, error?:string}}
+ * reconcile を1回実行する。
+ * @param {object} opts
+ * @param {string} opts.actor  'cron' | 'cron-retry' | 利用者メール
+ * @param {string} opts.mode   'full' = 新規送信も行う (17:30・手動ボタン) /
+ *                             'retry' = 取消反映・失敗行の再試行だけ (30分巡回。新規は送らない)
  */
-export async function runNotionSweep({ actor = 'manual' } = {}) {
+export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
   if (!isNotionConfigured()) {
-    const r = { ok: false, error: 'not_configured', message: 'Notion 連携が未設定です (NOTION_TOKEN / INBOUND_CHECK_NOTION_DB_ID)' };
-    // cron から呼ばれたのに未設定 = 「動いているべきものが動いていない」なので fail を残す
+    // cron から呼ばれたのに未設定 = 「動いているべきものが動いていない」なので fail を残す。
+    // 30分巡回 (retry) では静かに帰る (毎回鳴らすと通知疲れになる)
     if (actor === 'cron') ping('fail', 'env未設定 (INBOUND_CHECK_NOTION_DB_ID)');
-    return r;
+    return { ok: false, error: 'not_configured', message: 'Notion 連携が未設定です (NOTION_TOKEN / INBOUND_CHECK_NOTION_DB_ID)' };
   }
   if (running) return { ok: false, error: 'already_running', message: '送信処理が既に動いています' };
   running = true;
+  const db = getDB();
+  const holder = `${process.pid}:${crypto.randomBytes(3).toString('hex')}`;
   try {
-    const db = getDB();
-    const summary = { sent: 0, recovered: 0, cancelled: 0, errors: 0, skipped: 0, blocked: 0 };
-    const schemaProps = await ensureCardSchema();
-    const ctx = buildEnrichContext(db);
+    if (!acquireLease(db, holder)) {
+      return { ok: false, error: 'already_running', message: '別の実行が進行中です (数分後にやり直してください)' };
+    }
+    const summary = { sent: 0, recovered: 0, raced: 0, cancelled: 0, errors: 0, skipped: 0, blocked: 0 };
+    let schema;
+    try {
+      schema = await ensureCardSchema();
+    } catch (e) {
+      // スキーマ全体の問題は行に書かず、sweep 1回の失敗として報告する (Codex R1 #9)
+      console.error('[inbound-check notion] スキーマ確認失敗:', e.message);
+      if (mode === 'full') ping('fail', String(e.message).slice(0, 180));
+      return { ok: false, error: e.code === 'NOTION_SCHEMA_MISMATCH' ? 'schema_mismatch' : 'schema_error', message: e.message };
+    }
 
-    // ① 未送信の いろは行き → カード作成
-    for (const row of collectUnsent(db)) {
+    // ① 孤立カードの回収 (取消済み・page_id なし。Codex R1 #1) — 取消を最優先で片付ける
+    for (const row of collectOrphanCancelled(db)) {
+      try {
+        if (!row.notion_dedupe_key) { markCancelled(db, row.id, '(カード未作成)'); continue; }
+        const existing = await findCardByDedupeKey(row.notion_dedupe_key);
+        if (!existing) { markCancelled(db, row.id, '(カード未作成)'); continue; }
+        attachPage(db, row.id, existing.id, null);
+        await convergeCancelledCard(db, row.id, existing.id);
+        summary.cancelled++;
+      } catch (e) {
+        summary.errors++;
+        if (markCancelError(db, row.id, e.message, isPermanentStatus(e.status))) summary.blocked++;
+        console.warn(`[inbound-check notion] 孤立回収失敗 dest#${row.id}: ${e.message}`);
+      }
+    }
+
+    // ② 送信後に取り消された行 → カードを「取消」へ (新規作成より先に。Codex R1 #6)
+    const cancelPhase = async () => {
+      for (const row of collectCancelPending(db)) {
+        try {
+          await convergeCancelledCard(db, row.id, row.notion_page_id);
+          summary.cancelled++;
+        } catch (e) {
+          summary.errors++;
+          if (markCancelError(db, row.id, e.message, isPermanentStatus(e.status))) summary.blocked++;
+          console.warn(`[inbound-check notion] 取消反映失敗 dest#${row.id}: ${e.message}`);
+        }
+      }
+    };
+    await cancelPhase();
+
+    // ③ 未送信の いろは行き → カード作成 (retry モードでは「一度失敗した行」だけ)
+    const unsent = collectUnsent(db, { retryOnly: mode !== 'full' });
+    const ctx = unsent.length > 0 ? buildEnrichContext(db) : null;
+    for (const row of unsent) {
       // API を待っている間に取り消されているかもしれない — 直前にもう一度見る
       const fresh = db.prepare('SELECT cancelled_at, notion_page_id FROM f_inbound_check_destinations WHERE id = ?').get(row.id);
       if (!fresh || fresh.cancelled_at || fresh.notion_page_id) { summary.skipped++; continue; }
       try {
-        // 回収: 前回「作成成功したのに page_id を保存できなかった」カードが残っていないか
-        const existing = await findCardByDestinationId(row.id);
-        const key = String(row.code_key || row.product_id || '').trim().toLowerCase();
-        const product = ctx.products.get(key) || null;
-        const supplierName = product ? (ctx.suppliers.get(normSupplierCode(product.supplierCode)) || null) : null;
-        const ext = calcExternal(ctx.sales30.get(key) ?? null, ctx.freeStock.get(key) ?? null);
-        const props = buildCardProperties(row, { barcode: barcodeFor(db, row), product, supplierName, ext }, schemaProps);
+        // ⭐キーを DB に保存してから Notion を触る (作成成功→記録前に落ちても次回回収できる)
+        const dedupeKey = ensureDedupeKey(db, row);
+        const existing = await findCardByDedupeKey(dedupeKey);
+        let pageId;
+        let payload;
         if (existing) {
-          markSent(db, row.id, existing.id, JSON.stringify({ recovered: true }));
-          summary.recovered++;
+          pageId = existing.id;
+          payload = JSON.stringify({ recovered: true });
         } else {
-          const { id: pageId } = await createCard(props);
-          markSent(db, row.id, pageId, JSON.stringify(props));
-          summary.sent++;
+          const key = String(row.code_key || row.product_id || '').trim().toLowerCase();
+          const product = ctx.products.get(key) || null;
+          const supplierName = product ? (ctx.suppliers.get(normSupplierCode(product.supplierCode)) || null) : null;
+          const ext = calcExternal(ctx.sales30.get(key) ?? null, ctx.freeStock.get(key) ?? null);
+          const props = buildCardProperties(row, { barcode: barcodeFor(db, row), product, supplierName, ext, dedupeKey }, schema.names);
+          const created = await createCard(props);
+          pageId = created.id;
+          payload = JSON.stringify(props);
           await sleep(CREATE_INTERVAL_MS);
+        }
+        const ch = markSent(db, row.id, pageId, payload);
+        if (ch === 1) {
+          if (existing) summary.recovered++; else summary.sent++;
+        } else {
+          // 記録できなかった = 待っている間に状態が変わった (Codex R1 #3 #4)。取り漏らさず収束させる
+          const cur = db.prepare('SELECT cancelled_at, notion_page_id FROM f_inbound_check_destinations WHERE id = ?').get(row.id);
+          if (cur && cur.notion_page_id === pageId) {
+            if (existing) summary.recovered++; else summary.sent++;   // 別実行が同じカードを記録済み
+          } else if (cur && !cur.notion_page_id) {
+            attachPage(db, row.id, pageId, payload);   // 取消済みでも紐付ける → ②の次回実行が「取消」へ倒す
+            summary.raced++;
+          } else {
+            // 台帳には別のカードが記録されている — 今作った方が孤立した疑い。人に見せる
+            summary.errors++;
+            summary.blocked++;
+            markSendError(db, row.id,
+              `二重カードの疑い: 台帳=${cur?.notion_page_id || '?'} / 今回=${pageId}。Notion 側を確認して片方を整理してください`, true);
+            console.error(`[inbound-check notion] 二重カード疑い dest#${row.id}: db=${cur?.notion_page_id} new=${pageId}`);
+          }
         }
       } catch (e) {
         summary.errors++;
-        if (markSendError(db, row.id, e)) summary.blocked++;
+        if (markSendError(db, row.id, e.message, isPermanentStatus(e.status))) summary.blocked++;
         console.warn(`[inbound-check notion] 送信失敗 dest#${row.id} ${row.product_id}: ${e.message}`);
       }
     }
 
-    // ② 送信後に取り消された行 → カードを「取消」へ (①の最中に取り消された分も同じ sweep で拾う)
-    for (const row of collectCancelPending(db)) {
-      try {
-        const state = await getCardState(row.notion_page_id);
-        if (state.archived) {
-          // 誰かが Notion 側でアーカイブ済み — もう有効な作業指示として見えないので収束とみなす
-          markCancelled(db, row.id, state.status ? `${state.status} (アーカイブ済み)` : '(アーカイブ済み)');
-        } else if (state.status === CANCELLED_STATUS) {
-          markCancelled(db, row.id, CANCELLED_STATUS);
-        } else {
-          await setCardStatus(row.notion_page_id, CANCELLED_STATUS);
-          markCancelled(db, row.id, state.status || '(不明)');
-          await sleep(CREATE_INTERVAL_MS);
-        }
-        summary.cancelled++;
-      } catch (e) {
-        summary.errors++;
-        if (markCancelError(db, row.id, e)) summary.blocked++;
-        console.warn(`[inbound-check notion] 取消反映失敗 dest#${row.id}: ${e.message}`);
-      }
-    }
+    // ④ 送信中に取り消された分を同じ sweep で拾う (②の再実行。通常 0 件)
+    if (summary.sent + summary.raced > 0) await cancelPhase();
 
-    const note = `作成${summary.sent} 回収${summary.recovered} 取消反映${summary.cancelled} 失敗${summary.errors}` +
-      (summary.blocked ? ` (うち要対応${summary.blocked})` : '');
-    console.log(`[inbound-check notion] sweep (${actor}): ${note}`);
-    // 失敗が1件でもあれば fail (「正常終了したが仕事が残っている」を ok にしない)
-    ping(summary.errors > 0 ? 'fail' : 'ok', note);
+    const note = `作成${summary.sent} 回収${summary.recovered} 取消反映${summary.cancelled} 失敗${summary.errors}`
+      + (summary.raced ? ` 競合${summary.raced}` : '')
+      + (summary.blocked ? ` (うち要対応${summary.blocked})` : '');
+    if (mode === 'full' || summary.sent + summary.recovered + summary.cancelled + summary.errors + summary.raced > 0) {
+      console.log(`[inbound-check notion] sweep (${actor}/${mode}): ${note}`);
+    }
+    // 失敗が1件でもあれば fail (「正常終了したが仕事が残っている」を ok にしない)。
+    // dead-man ping は 17:30 の一括 (full) だけ — 30分巡回で毎回 ok を打つと
+    // 「一括送信が止まっているのに監視は緑」になる
+    if (mode === 'full') ping(summary.errors > 0 ? 'fail' : 'ok', note);
     return { ok: summary.errors === 0, ...summary, note };
   } catch (e) {
     console.error('[inbound-check notion] sweep 失敗:', e);
-    ping('fail', String(e.message).slice(0, 180));
+    if (mode === 'full') ping('fail', String(e.message).slice(0, 180));
     return { ok: false, error: 'sweep_failed', message: e.message };
   } finally {
+    releaseLease(db, holder);
     running = false;
   }
 }
@@ -299,17 +435,20 @@ function ping(status, note) {
 export function notionStatusForAdmin() {
   const db = getDB();
   const now = utcNow();
-  const todayStart = `${workDateJst()}T00:00:00`; // JST の今日 (synced_at は UTC なので比較は目安表示用)
   const one = (sql, ...p) => db.prepare(sql).get(...p)?.n ?? 0;
   const unsent = one(`SELECT COUNT(*) n FROM f_inbound_check_destinations
     WHERE destination = 'iroha' AND cancelled_at IS NULL AND notion_page_id IS NULL
       AND (notion_next_retry_at IS NULL OR notion_next_retry_at <= ?)`, now);
-  const blocked = db.prepare(`SELECT id, product_id, product_name, notion_error, notion_cancel_error, notion_next_retry_at
+  // 「再試行待ち (一時エラー・自動で再試行される)」と「要対応 (4xx・再送ボタンが必要)」は別物 (Codex R1 #10)
+  const waitingRetry = one(`SELECT COUNT(*) n FROM f_inbound_check_destinations
+    WHERE notion_next_retry_at IS NOT NULL AND notion_next_retry_at > ? AND notion_next_retry_at < '9999'`, now);
+  const blocked = db.prepare(`SELECT id, product_id, product_name, notion_error, notion_cancel_error
     FROM f_inbound_check_destinations
-    WHERE notion_next_retry_at IS NOT NULL AND notion_next_retry_at > ?
-    ORDER BY id DESC LIMIT 10`).all(now);
+    WHERE notion_next_retry_at >= '9999'
+    ORDER BY id DESC LIMIT 10`).all();
   const cancelPending = one(`SELECT COUNT(*) n FROM f_inbound_check_destinations
-    WHERE notion_page_id IS NOT NULL AND cancelled_at IS NOT NULL AND notion_cancelled_at IS NULL`);
+    WHERE cancelled_at IS NOT NULL AND notion_cancelled_at IS NULL
+      AND (notion_page_id IS NOT NULL OR notion_dedupe_key IS NOT NULL)`);
   const sentRecent = one(`SELECT COUNT(*) n FROM f_inbound_check_destinations
     WHERE notion_synced_at IS NOT NULL AND notion_synced_at >= datetime('now', '-1 day')`);
   const lastSyncedAt = db.prepare('SELECT MAX(notion_synced_at) m FROM f_inbound_check_destinations').get()?.m || null;
@@ -317,12 +456,13 @@ export function notionStatusForAdmin() {
   const attention = db.prepare(`SELECT id, product_id, product_name, actual_qty, work_date,
       cancel_reason, cancelled_at, notion_cancelled_at, notion_cancelled_prev_status
     FROM f_inbound_check_destinations
-    WHERE notion_cancelled_prev_status IS NOT NULL AND notion_cancelled_prev_status <> '未着手'
+    WHERE notion_cancelled_prev_status IS NOT NULL
+      AND notion_cancelled_prev_status NOT IN ('未着手', '(カード未作成)')
       AND notion_cancelled_at >= datetime('now', '-30 day')
     ORDER BY notion_cancelled_at DESC LIMIT 20`).all();
   return {
     configured: isNotionConfigured(),
     dbIdTail: (process.env.INBOUND_CHECK_NOTION_DB_ID || '').slice(-6),
-    unsent, cancelPending, sentRecent, lastSyncedAt, blocked, attention, todayStart,
+    unsent, waitingRetry, cancelPending, sentRecent, lastSyncedAt, blocked, attention,
   };
 }

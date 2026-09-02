@@ -152,7 +152,8 @@
         <p class="ng">⚠ 未設定です。Render の env に <code>INBOUND_CHECK_NOTION_DB_ID</code> を追加し、
           Notion 側で「在庫化作業管理」DB のコネクトに既存インテグレーションを追加してください (NOTION_TOKEN は共用)。</p>
       <% } else { %>
-        <p>送信待ち <b><%= notion.unsent %></b> 件 ・ 取消の反映待ち <b><%= notion.cancelPending %></b> 件 ・
+        <p>送信待ち <b><%= notion.unsent %></b> 件 ・ 取消の反映待ち <b><%= notion.cancelPending %></b> 件
+          <% if (notion.waitingRetry) { %> ・ 一時エラーの再試行待ち <b><%= notion.waitingRetry %></b> 件 (30分おきに自動で再試行)<% } %> ・
           直近24時間の送信 <b><%= notion.sentRecent %></b> 件<% if (notion.lastSyncedAt) { %> ・ 最終送信 <span data-jst="<%= notion.lastSyncedAt %>"></span><% } %>
           (DB …<%= notion.dbIdTail %>)</p>
         <div class="row">

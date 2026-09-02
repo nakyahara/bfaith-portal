@@ -52,6 +52,10 @@ export function startInboundCheckCron() {
     // ⭐入口を増やさないため専用の cron は作らない (CLAUDE.md の定期実行ルール)
     try { await runScheduledMasterFetch({ actor: 'cron' }); }
     catch (e) { console.warn(`[inbound-check] cron(商品マスタ): ${e.message}`); }
+    // Notion カードの「取消反映」と「一時エラーの再試行」だけ同じ巡回に相乗り (mode='retry')。
+    // 新規カードの送信は 17:30 の一括のみ (取消済みの作業指示を30分以内に消すため — Codex R1 #5 #6)
+    try { await runNotionSweep({ actor: 'cron-retry', mode: 'retry' }); }
+    catch (e) { console.warn(`[inbound-check] cron(notion-retry): ${e.message}`); }
   }, { timezone: 'Asia/Tokyo' });
   console.log(`[inbound-check] cron 起動 (${use} JST)`);
   return task;
