@@ -20,6 +20,8 @@
 | `/apps/inbound-check/api/info` (POST) | 同上 | 入庫情報 (入数・いろは・BCシール・直ピック・荷姿・memo) をその場で直す |
 | `/apps/inbound-check/api/info/register` (POST) | 同上 | 入庫情報が無い商品を登録する |
 | `/apps/inbound-check/api/product-flags` (POST) | 同上 | 期限管理 あり/なし を切り替える |
+| `/apps/inbound-check/api/lines/pending-expiry` (POST) | 同上 | 有効期限の先入力 (詳細パネル。入れてあれば確認時に聞かない) |
+| `/apps/inbound-check/api/notion-sync` (POST) | 同上 | Notion 作業カードを今すぐ送る (iPadのヘッダーボタン。冪等) |
 | `/apps/inbound-check/done` | 登録端末 or セッション | **完了一覧** (確認し終えた伝票の 商品・数量・期限。画像なし・印刷可) |
 | `/apps/inbound-check/api/done` `/done.csv` | 同上 | 完了一覧の JSON / CSV |
 | `/apps/inbound-check/admin/destinations(.csv)` | ポータルセッション | 行き先の台帳 (いろはへ送る商品の一覧) |

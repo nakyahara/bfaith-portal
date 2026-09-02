@@ -144,7 +144,7 @@ console.log('[1] 行の状態と主ボタン');
   ok(/data-act="all"[^>]*>全部あり</.test(r.html), '未着手 → 主ボタンは [全部あり]');
   ok(/data-act="count"[^>]*>🔢 数量を数える</.test(r.html), '未着手 → [数量を数える] が出る (＋1箱はパネルの中)');
   ok(!/class="row[^"]*partial/.test(r.html), '未着手の行に partial は付かない');
-  ok(/予定 <b>106<\/b> 個 ・ 1箱 10個/.test(r.html), '予定と1箱の入数が出る');
+  ok(/予定 <b class="pl">106<\/b> 個 ・ 1箱 10個/.test(r.html), '予定と1箱の入数が出る (予定数は大きめ表示 — 2026-09-02)');
 
   r = await renderWith([LINE({ found_qty: 82, remaining_qty: 24, quantity_relation: 'shortage' })]);
   ok(/class="row[^"]* partial/.test(r.html), '一部 → 行に partial (黄色)');
