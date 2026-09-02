@@ -258,7 +258,7 @@
     <details class="hdr-help" style="margin:0 0 6px;">
       <summary>送られる値・項目の場所</summary>
       <p>
-        税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と JANコード (<%= draft.jan_code || '未入力' %>) は基本情報タブの値を自動で送ります。
+        税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と カタログID (JAN<%= (variation && variation.kind === 'variation' && variation.memberCount > 1) ? ' — SKU表の値をSKUごとに' : ': ' + (draft.jan_code || '未入力') %>) は基本情報タブの値を自動で送ります。
         在庫は常に 0 で登録します。<br>
         配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
         </p>
@@ -657,14 +657,17 @@
           </div>
         </div>
         <div style="flex:1">
-          <label>JANコード <span class="muted">(楽天の「カタログID」— カテゴリ・属性タブと同じ値)</span><span class="ftag ftag-m">手入力</span></label>
-          <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
+          <%# JAN (楽天のカタログID) の入力はここだけ (2026-09-02 中原さん: カテゴリ・属性タブと 2 箇所に
+              入れさせない)。バリエーションは SKU ごとに JAN が違うので、ページ代表の欄は出さず
+              右の SKU 表の「カタログID (JAN)」列が入口になる %>
           <% if (variation.kind === 'variation' && variation.members.length > 1) { %>
-            <%# 2026-08-28 中原さん要望: バリエーションありのときは SKU ごとに JAN を控える %>
-            <div class="muted" style="font-size:11px;">
-              バリエーションありです — SKUごとのJANは右の「このページに載るSKU」表で入力してください
-              (この欄はページ代表の1つ = 楽天のカタログID用)
+            <label>JANコード <span class="muted">(楽天の「カタログID」)</span><span class="ftag ftag-m">手入力</span></label>
+            <div class="muted" style="font-size:12px; padding:6px 0;">
+              バリエーションありです — SKUごとに右の「このページに載るSKU」表の「カタログID (JAN)」列で入力してください
             </div>
+          <% } else { %>
+            <label>JANコード <span class="muted">(楽天の「カタログID」として送ります。入力はここだけ)</span><span class="ftag ftag-m">手入力</span></label>
+            <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
           <% } %>
         </div>
         <div style="flex:1">
@@ -1553,9 +1556,11 @@
         </div>
     </div>
 
-    <%# カタログID — RMS の「カタログID」と**同じ構成** (2026-09-02 中原さん: 楽天のUIと揃えないと
-        どこがどこに対応するか直感で分からない): ◉IDあり=JAN / ○IDなし=理由プルダウン。
-        JANコードの実体は product_drafts.jan_code = 基本情報タブの JAN 欄と同じ値 (どちらで直しても揃う)。
+    <%# カタログID — RMS の「カタログID」に対応する**確認表示** (2026-09-02 中原さん: 基本情報タブと
+        カテゴリ・属性タブの 2 箇所に JAN を入れさせない)。入力は基本情報タブだけ:
+          単品 = JANコード欄 (product_drafts.jan_code) / バリエーション = SKU表 (draft_sku_jans)。
+        ここは「何が送られるか」の表示と、JAN が無いときの理由 (RMS の「カタログIDなしの理由」) の選択だけ。
+        表示は initCatalogStatus (下の script) が基本情報タブの入力欄から組み立てる。
         🚨 2026-09-02 まで、この欄 (API の articleNumber) にメーカー型番を送っていて IE0228 で登録が落ちていた %>
     <%
       const exReason = rakuten && rakuten.catalog_id_exemption_reason != null
@@ -1568,26 +1573,14 @@
         [4, '4: 項目選択肢在庫商品'],
         [5, '5: 該当製品コードなし'],
       ];
-      const catalogHasId = !!draft.jan_code;
+      const isVariationPage = variation && variation.kind === 'variation' && variation.memberCount > 1;
     %>
     <div class="field">
-      <label class="req">カタログID <span class="muted">(RMSの「カタログID」と同じ。JAN = 基本情報タブのJANコードと同じ値)</span><span class="ftag ftag-m">手入力</span></label>
-      <div style="display:flex; gap:18px; align-items:center; margin:2px 0 4px;">
-        <label style="display:flex; align-items:center; gap:4px; font-size:13px; cursor:pointer; font-weight:400;">
-          <input type="radio" name="rk-catalog-mode" value="with" <%= catalogHasId ? 'checked' : '' %>> IDあり
-        </label>
-        <label style="display:flex; align-items:center; gap:4px; font-size:13px; cursor:pointer; font-weight:400;">
-          <input type="radio" name="rk-catalog-mode" value="without" <%= catalogHasId ? '' : 'checked' %>> IDなし
-        </label>
-      </div>
-      <div id="rk-catalog-with" style="<%= catalogHasId ? '' : 'display:none;' %>">
-        <input type="text" id="rk-catalog-jan" inputmode="numeric" maxlength="13" style="max-width:220px;"
-               value="<%= draft.jan_code || '' %>" placeholder="JANコード (8/12/13桁)">
-        <div class="muted" style="font-size:11px;">基本情報タブのJANコード欄と同じ値です (どちらで直しても揃います)</div>
-      </div>
-      <div id="rk-catalog-without" style="<%= catalogHasId ? 'display:none;' : '' %>">
-        <select id="rk-catalog-exemption" style="max-width:380px;">
-          <option value="" <%= exReason == null ? 'selected' : '' %>>カタログIDなしの理由 (未選択は 5: 該当製品コードなし で送ります)</option>
+      <label class="req">カタログID <span class="muted">(RMSの「カタログID」。入力は基本情報タブ — 単品はJANコード欄、バリエーションはSKU表。ここは送る内容の確認)</span><span class="ftag ftag-auto">自動</span></label>
+      <div id="rk-catalog-status" style="font-size:13px; margin:2px 0 4px;"></div>
+      <div id="rk-catalog-without">
+        <select id="rk-catalog-exemption" style="max-width:420px;">
+          <option value="" <%= exReason == null ? 'selected' : '' %>>カタログIDなしの理由 (JANが無い<%= isVariationPage ? 'SKU' : 'とき' %>に使います。未選択は 5: 該当製品コードなし)</option>
           <% for (const [v, label] of exOptions) { %>
             <option value="<%= v %>" <%= exReason === v ? 'selected' : '' %>><%= label %></option>
           <% } %>
@@ -1877,10 +1870,19 @@
     else if (transferred < imgs) m['tab-images'].push('R-Cabinet未転送 ' + (imgs - transferred) + '枚');
     m['tab-info'].push(...pageInfoMissing());
     if (!tv('rk-genre')) m['tab-category'].push('ジャンルID');
-    // カタログIDは JAN欄に値があればサーバーが自動送信する。JAN も手入力属性も無ければ必須扱い
+    // カタログIDは JAN からサーバーが自動送信する (入力は基本情報タブ: 単品=JAN欄 / バリエーション=SKU表)。
+    // 辞書で必須のジャンルは JAN の無い SKU があると登録が止まるので、基本情報タブの未入力として数える
     // (Codex R1 High-1: 無条件に除外すると「未入力0件」のまま登録が失敗する)
-    const janFilled = !!tv('f-jan');
-    const need = mandatoryAttrNames.filter((n) => n !== 'カタログID' || !janFilled);
+    const skuJanInputs = Array.from(document.querySelectorAll('.sku-jan-input'));
+    const janMissing = skuJanInputs.length > 0
+      ? skuJanInputs.filter((i) => !i.value.trim()).length
+      : (tv('f-jan') ? 0 : 1);
+    if (mandatoryAttrNames.includes('カタログID') && janMissing > 0) {
+      m['tab-basic'].push(skuJanInputs.length > 0
+        ? 'SKU表のカタログID (JAN) ' + janMissing + '件 (このジャンルの必須属性)'
+        : 'JANコード (楽天のカタログID・このジャンルの必須属性)');
+    }
+    const need = mandatoryAttrNames.filter((n) => n !== 'カタログID');
     if (need.length > 0) {
       const vals = {};
       document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
@@ -1891,7 +1893,7 @@
       });
       for (const n of need) {
         if (vals[n]) continue;
-        m['tab-category'].push(n === 'カタログID' ? '必須属性「カタログID」(基本情報タブのJAN欄入力でも可)' : '必須属性「' + n + '」');
+        m['tab-category'].push('必須属性「' + n + '」');
       }
     }
     return m;
@@ -2027,7 +2029,8 @@
       name: document.getElementById('f-name').value,
       official_url: document.getElementById('f-official-url').value,
       price: document.getElementById('f-price').value,
-      jan_code: document.getElementById('f-jan').value,
+      // JAN欄は単品だけ (バリエーションは SKU表 → /sku-jans)。欄が無ければ送らない = サーバーは既存値を保持
+      ...(document.getElementById('f-jan') ? { jan_code: document.getElementById('f-jan').value } : {}),
       asin: document.getElementById('f-asin').value,
       amazon_url: document.getElementById('f-amazon-url').value,
       own_brand: document.getElementById('f-own-brand').checked,
@@ -2640,7 +2643,7 @@
         const note = document.createElement('div');
         note.className = 'muted';
         note.style.fontSize = '11px';
-        note.textContent = 'ℹ️ このジャンルはカタログIDが属性にあります。JAN欄の値が自動で送られます。';
+        note.textContent = 'ℹ️ このジャンルはカタログIDが属性にあります。基本情報タブの JAN (バリエーションは SKU表の JAN) が SKU ごとに自動で送られます。';
         info.appendChild(note);
       }
       if ((g.attributes || []).some((a) => a.name === modelAttrName)) {
@@ -2749,11 +2752,7 @@
     return {
       genre_id: document.getElementById('rk-genre').value,
       article_number: document.getElementById('rk-article').value,
-      // カタログID (RMS と同じ ◉IDあり/○IDなし)。IDあり = JAN欄の値を jan_code へ保存、
-      // IDなし = '' で jan_code をクリア (IDなしを明示的に選んだ人の意思)
-      catalog_jan: (document.querySelector('input[name="rk-catalog-mode"]:checked') || {}).value === 'with'
-        ? document.getElementById('rk-catalog-jan').value
-        : '',
+      // カタログID (JAN) 本体はここから送らない (入力は基本情報タブだけ)。ここは「IDなしの理由」だけ
       catalog_id_exemption_reason: document.getElementById('rk-catalog-exemption').value,
       // バリエーションの項目名 (カラバリのときだけ欄がある。無ければ送らない = 既存維持)
       ...(document.getElementById('rk-variant-selector')
@@ -3330,25 +3329,54 @@
     });
   })();
 
-  // カタログID: RMS と同じ「IDあり / IDなし」の切替 + 基本情報タブの JAN 欄との同期 (2026-09-02)
-  (function () {
-    const withBox = document.getElementById('rk-catalog-with');
+  // カタログID (カテゴリ・属性タブ) は確認表示だけ。入力は基本情報タブ (単品=JAN欄 / バリエーション=SKU表)
+  // に一本化した (2026-09-02 中原さん)。表示は入力欄から組み立て、入力に追従して更新する。
+  // 「IDなしの理由」は JAN の無い SKU があるときだけ見せる
+  (function initCatalogStatus() {
+    const box = document.getElementById('rk-catalog-status');
     const withoutBox = document.getElementById('rk-catalog-without');
-    if (!withBox || !withoutBox) return;
-    document.querySelectorAll('input[name="rk-catalog-mode"]').forEach((r) => {
-      r.addEventListener('change', () => {
-        const withMode = document.querySelector('input[name="rk-catalog-mode"]:checked')?.value === 'with';
-        withBox.style.display = withMode ? '' : 'none';
-        withoutBox.style.display = withMode ? 'none' : '';
-      });
-    });
-    // 同じ jan_code の 2 つのビュー (基本情報タブの JAN 欄とここ)。画面内で食い違わないよう相互コピー
-    const janHere = document.getElementById('rk-catalog-jan');
+    if (!box) return;
+    const skuInputs = Array.from(document.querySelectorAll('.sku-jan-input'));
     const janBasic = document.getElementById('f-jan');
-    if (janHere && janBasic) {
-      janHere.addEventListener('input', () => { if (janBasic.value !== janHere.value) janBasic.value = janHere.value; });
-      janBasic.addEventListener('input', () => { if (janHere.value !== janBasic.value) janHere.value = janBasic.value; });
+    function jumpToBasic(e) {
+      e.preventDefault();
+      const b = document.querySelector('#tabbar .tab-btn[data-tab="tab-basic"]');
+      if (b) b.click();
     }
+    function render() {
+      box.innerHTML = '';
+      let missing = 0;
+      const head = document.createElement('div');
+      if (skuInputs.length > 0) {
+        const ul = document.createElement('ul');
+        ul.style.cssText = 'margin:4px 0; padding-left:18px; font-size:12px;';
+        for (const i of skuInputs) {
+          const v = i.value.trim();
+          if (!v) missing += 1;
+          const li = document.createElement('li');
+          li.textContent = i.dataset.code + ' — ' + (v ? 'IDあり ' + v : 'IDなし (下の理由で送ります)');
+          ul.appendChild(li);
+        }
+        head.textContent = 'SKUごとに送ります (' + (skuInputs.length - missing) + '/' + skuInputs.length + ' 件入力済み)';
+        box.appendChild(head);
+        box.appendChild(ul);
+      } else {
+        const v = janBasic ? janBasic.value.trim() : '';
+        if (!v) missing = 1;
+        head.textContent = v ? 'IDあり — JAN ' + v : 'IDなし — 下の理由で送ります';
+        box.appendChild(head);
+      }
+      const link = document.createElement('a');
+      link.href = '#tab-basic';
+      link.style.fontSize = '12px';
+      link.textContent = skuInputs.length > 0 ? '基本情報タブのSKU表で入力する' : '基本情報タブのJANコード欄で入力する';
+      link.addEventListener('click', jumpToBasic);
+      box.appendChild(link);
+      if (withoutBox) withoutBox.style.display = missing > 0 ? '' : 'none';
+    }
+    skuInputs.forEach((i) => { i.addEventListener('input', render); i.addEventListener('change', render); });
+    if (janBasic) janBasic.addEventListener('input', render);
+    render();
   })();
 
   // SKU別の選択肢 (2026-09-02 カラバリ出品)。JAN欄と同じ作法: 入力即保存・POSTは1本ずつ

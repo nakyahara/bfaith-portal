@@ -1084,37 +1084,24 @@ export function buildItemPayload(db, draftId) {
   if (taxText && !/^(8|10)\s*%?$/.test(taxText)) {
     reasons.push(`税率「${taxText}」が不正です (8% / 10% / 空欄のみ)`);
   }
-  // JAN はチェックデジットまで検証し、手入力のカタログID属性と食い違ったら止める (Codex R1 Medium-4)。
-  // カタログID属性は最大1件・値1個に限定し、その値自体も GTIN 検証する
-  // (R2 Medium: 複数記述で不一致検査を迂回できた / JAN欄が空だと手入力値が未検証だった)
-  const jan = String(draft.jan_code || '').trim();
-  const catalogAttrs = Array.isArray(attributes) ? attributes.filter((a) => a.name === 'カタログID') : [];
-  let manualCatalog = null;
-  if (catalogAttrs.length > 1) {
-    reasons.push('商品属性「カタログID」が複数あります (1件にまとめてください)');
-  } else if (catalogAttrs.length === 1) {
-    manualCatalog = catalogAttrs[0];
-    if (manualCatalog.values.length !== 1) {
-      reasons.push('商品属性「カタログID」の値は1個だけにしてください');
-    } else if (!isValidGtin(manualCatalog.values[0])) {
-      reasons.push(`商品属性のカタログID「${manualCatalog.values[0]}」の形式が不正です (8/12/13桁 + チェックデジット)`);
-    }
+  // ─── カタログID (JAN) の入口は基本情報タブだけ (2026-09-02 中原さん: 基本情報タブと
+  //     カテゴリ・属性タブの 2 箇所に JAN を入れさせない) ───
+  //   単品         : product_drafts.jan_code (基本情報タブの JANコード欄)
+  //   バリエーション: draft_sku_jans (基本情報タブの SKU 表)。ページ代表の jan_code は楽天には使わない
+  // 商品属性の行に「カタログID」を手入力する経路は廃止した。SKU ごとに値が違うので 1 行では表せず、
+  // ページ代表の値を全 SKU に付けると SKU の articleNumber と食い違う
+  // (根本対策: 「カタログID」属性は下で SKU ごとに自分の JAN から自動付与する)
+  if (Array.isArray(attributes) && attributes.some((a) => a.name === 'カタログID')) {
+    reasons.push('商品属性の行に「カタログID」があります — カタログID (JAN) は基本情報タブ (単品はJANコード欄・バリエーションはSKU表) で入力すると自動で送ります。属性の行からは削除してください');
   }
-  if (jan) {
-    if (!isValidGtin(jan)) {
-      reasons.push(`JANコード「${jan}」の形式が不正です (8/12/13桁 + チェックデジット)`);
-    } else if (manualCatalog && manualCatalog.values.length === 1 && manualCatalog.values[0] !== jan) {
-      reasons.push(`商品属性のカタログID (${manualCatalog.values[0]}) と JAN欄 (${jan}) が一致しません — どちらかに揃えてください`);
-    }
+  const jan = isVariation ? '' : String(draft.jan_code || '').trim();
+  if (jan && !isValidGtin(jan)) {
+    reasons.push(`JANコード「${jan}」の形式が不正です (8/12/13桁 + チェックデジット)`);
   }
-  // カタログID (= API の articleNumber) が無いときの理由。JAN があれば JAN を送るので使わない。
+  // カタログID (= API の articleNumber) が無いときの理由。JAN がある SKU には使わない。
   // 未設定は 5 (該当製品コードなし) = 2026-09-02 以前の固定値なので、既存ドラフトの送信内容は変わらない
   const rawReason = Number(rk.catalog_id_exemption_reason);
   const catalogExemptionReason = Number.isInteger(rawReason) && rawReason >= 1 && rawReason <= 6 ? rawReason : 5;
-  // 1 (セット商品) は articleNumberForSet (構成品の JAN 一覧) が別に必須になる。まだ送れないので止める
-  if (!jan && catalogExemptionReason === 1) {
-    reasons.push('カタログIDなしの理由「1: セット商品」は未対応です (構成品のJAN一覧を送る仕組みがまだありません)。JANを入力するか別の理由を選んでください');
-  }
 
   // ─── カラバリ (バリエーションページ) の材料 (2026-09-02) ───
   // 楽天の形: item.variantSelectors [{key, displayName, values:[{displayValue}]}]
@@ -1164,6 +1151,15 @@ export function buildItemPayload(db, draftId) {
     }
     if (variantRows.length > 40) reasons.push(`SKUが多すぎます (${variantRows.length}件 / 楽天の上限40件)`);
   }
+  // 送る SKU の一覧 (単品 = 商品コード 1 行)。カタログIDの必須判定と「カタログID」属性の自動付与は
+  // この単位で行う (単品とバリエーションで判定を分けない)
+  const skuRows = isVariation && variantRows
+    ? variantRows
+    : [{ skuCode: String(draft.ne_code).trim(), selectorValue: null, jan, price: draft.price }];
+  // 1 (セット商品) は articleNumberForSet (構成品の JAN 一覧) が別に必須になる。まだ送れないので止める
+  if (catalogExemptionReason === 1 && skuRows.some((s) => !s.jan)) {
+    reasons.push('カタログIDなしの理由「1: セット商品」は未対応です (構成品のJAN一覧を送る仕組みがまだありません)。JANを入力するか別の理由を選んでください');
+  }
 
   // メーカー型番はカタログIDと同じ扱い (2026-08-31 中原さん: RMS でも入力項目は 1 つなのに
   // 画面で 2 箇所に入れさせていた)。**入口は「メーカー型番」欄 (article_number) だけ**にして、
@@ -1202,11 +1198,20 @@ export function buildItemPayload(db, draftId) {
         reasons.push(`属性「${a.name}」はジャンル「${genreDict.genreName || rk.genre_id}」の属性辞書にありません (登録エラー IE1002 になります)`);
       }
     }
-    // ② 必須属性の欠落 (カタログIDは JAN欄からの自動付与があるので別扱い)
+    // ② 必須属性の欠落 (カタログIDは JAN からの自動付与があるので、SKU ごとに JAN の有無で判定する)
     const presentNames = new Set(attributes.map((a) => a.name));
     for (const da of genreDict.attributes) {
       if (!da.mandatory || presentNames.has(da.name)) continue;
-      if (da.name === 'カタログID' && jan) continue; // 下で自動付与する
+      if (da.name === 'カタログID') {
+        const genreLabel = genreDict.genreName || rk.genre_id;
+        for (const s of skuRows) {
+          if (s.jan) continue; // 下で SKU ごとに自動付与する
+          reasons.push(isVariation
+            ? `SKU「${s.skuCode}」のカタログID (JAN) が未入力です (ジャンル ${genreLabel} の必須属性) — 基本情報タブのSKU表で入れてください`
+            : `カタログID (JAN) が未入力です (ジャンル ${genreLabel} の必須属性) — 基本情報タブのJANコード欄で入れてください`);
+        }
+        continue;
+      }
       // メーカー型番は「メーカー型番」欄から自動付与する (属性行では入力させない)
       if (da.name === MODEL_ATTR_NAME && articleNo) continue;
       reasons.push(`必須属性「${da.name}」が未入力です (ジャンル ${genreDict.genreName || rk.genre_id} の必須)`);
@@ -1255,17 +1260,16 @@ export function buildItemPayload(db, draftId) {
 
   // JAN → カタログID属性の自動付与は**ジャンル属性辞書にあるときだけ** (2026-07-28 確定)。
   // 実測: 「カタログID」が辞書に無いジャンル (111145等) へ付与すると IE1002 で登録自体が失敗する。
-  // 辞書未取得のジャンルでは付与しない (安全側。必要なら「ジャンル情報を取得」してから登録する)
+  // 辞書未取得のジャンルでは付与しない (安全側。必要なら「ジャンル情報を取得」してから登録する)。
+  // 値は **SKU ごとに自分の JAN** (2026-09-02: ページ代表の JAN を全 SKU に付けていた穴を塞ぐ)
   const attrs = attributes.slice();
-  if (dictHasCatalogId && jan && !manualCatalog) {
-    attrs.push({ name: 'カタログID', values: [jan] });
-  }
   // メーカー型番を属性としても送る (2026-08-31)。入口は「メーカー型番」欄だけなので、
   // ジャンル属性に メーカー型番 があるジャンルではここで補う。
   // 旧データで属性側に同じ値が残っている場合は二重に足さない (上で不一致は弾いてある)
   if (dictHasModel && articleNo && !manualModel) {
     attrs.push({ name: MODEL_ATTR_NAME, values: [articleNo] });
   }
+  const attrsForSku = (s) => (dictHasCatalogId && s.jan ? [...attrs, { name: 'カタログID', values: [s.jan] }] : attrs);
 
   // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる
   const shippingGroup = String(rk.shipping_method_group ?? '').trim();
@@ -1317,7 +1321,7 @@ export function buildItemPayload(db, draftId) {
       standardPrice: v.price,
       articleNumber: v.jan ? { value: v.jan } : { exemptionReason: catalogExemptionReason },
       selectorValues: { [selectorName]: v.selectorValue },
-      ...(attrs.length > 0 ? { attributes: attrs } : {}),
+      ...(attrsForSku(v).length > 0 ? { attributes: attrsForSku(v) } : {}),
       ...(Object.keys(shipping).length > 0 ? { shipping } : {}),
       ...(deliveryDateId ? { normalDeliveryDateId: Number(deliveryDateId) } : {}),
     }])) : {
@@ -1336,7 +1340,7 @@ export function buildItemPayload(db, draftId) {
         articleNumber: jan
           ? { value: jan }
           : { exemptionReason: catalogExemptionReason },
-        ...(attrs.length > 0 ? { attributes: attrs } : {}),
+        ...(attrsForSku(skuRows[0]).length > 0 ? { attributes: attrsForSku(skuRows[0]) } : {}),
         ...(Object.keys(shipping).length > 0 ? { shipping } : {}),
         ...(deliveryDateId ? { normalDeliveryDateId: Number(deliveryDateId) } : {}),
       },

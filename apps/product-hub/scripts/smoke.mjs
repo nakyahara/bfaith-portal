@@ -1308,22 +1308,19 @@ b27 = listing.buildItemPayload(db, rkId);
 check('payload: 税率の不正値を弾く (8/10/空欄のみ)', b27.ok === false && b27.reasons.some((r) => r.includes('税率')), JSON.stringify(b27.reasons));
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
 
-// 手入力のカタログID属性と JAN欄の不一致は止める (Codex R1 Medium-4)
-db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4999999999999"]}]' WHERE draft_id = ?`).run(rkId);
+// 商品属性の行に「カタログID」を手入力する経路は廃止 (2026-09-02: 入口は基本情報タブだけ)。
+// JAN欄と一致していても弾く (旧データの掃除を促す)
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567894"]}]' WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
-check('payload: カタログID属性とJAN欄の不一致を弾く', b27.ok === false && b27.reasons.some((r) => r.includes('一致しません')), JSON.stringify(b27.reasons));
+check('payload: 属性行のカタログIDは弾く (入口は基本情報タブだけ)',
+  b27.ok === false && b27.reasons.some((r) => r.includes('属性の行に「カタログID」')), JSON.stringify(b27.reasons));
 
-// R2: 複数のカタログID属性で不一致検査を迂回できない
-db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567894"]},{"name":"カタログID","values":["4999999999999"]}]' WHERE draft_id = ?`).run(rkId);
+// JAN欄の不正値 (チェックデジット違い) は止める
+db.prepare(`UPDATE product_drafts SET jan_code = '4901234567890' WHERE id = ?`).run(rkId);
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["ノーブランド品"]}]' WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
-check('payload: カタログID属性の複数記述を弾く', b27.ok === false && b27.reasons.some((r) => r.includes('複数')), JSON.stringify(b27.reasons));
-
-// R2: JAN欄が空でも手入力カタログID自体を GTIN 検証する
-db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(rkId);
-db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567890"]}]' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
-check('payload: 手入力カタログIDの不正値を弾く (JAN欄が空でも)',
-  b27.ok === false && b27.reasons.some((r) => r.includes('カタログID') && r.includes('不正')), JSON.stringify(b27.reasons));
+check('payload: JAN欄の不正値を弾く',
+  b27.ok === false && b27.reasons.some((r) => r.includes('JANコード') && r.includes('不正')), JSON.stringify(b27.reasons));
 db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["ノーブランド品"]}]' WHERE draft_id = ?`).run(rkId);
 
@@ -1601,7 +1598,52 @@ db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = '[{"
 db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(gdId);
 gb = listing.buildItemPayload(db, gdId);
 check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラーになる',
-  gb.ok === false && gb.reasons.some((r) => r.includes('カタログID')), JSON.stringify(gb.reasons));
+  gb.ok === false && gb.reasons.some((r) => r.includes('カタログID') && r.includes('JANコード欄')), JSON.stringify(gb.reasons));
+
+// ─── バリエーション + 辞書にカタログIDあり: 属性は SKU ごとに自分の JAN (2026-09-02 根本対策) ───
+// それまではページ代表の jan_code を全 SKU の「カタログID」属性に付けていて、SKU の articleNumber と食い違っていた。
+// ページ代表の jan_code (ここでは 4999999999999) は楽天には使わない
+{
+  insProd.run(9311, 'gdv-a', 'バリA', 'gdv');
+  insProd.run(9312, 'gdv-b', 'バリB', 'gdv');
+  const gdvId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price, jan_code) VALUES ('gdv', '辞書バリエ', 1500, '4999999999999')`).run().lastInsertRowid);
+  db.prepare(`UPDATE product_drafts SET detail_images_excluded = 1 WHERE id = ?`).run(gdvId);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, variant_selector_name)
+    VALUES (?, '900001', '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]}]', 'カラー')`).run(gdvId);
+  db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'gdv1', 0)`).run(gdvId);
+  db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gdv1', '/x/gdv1.jpg')`).run(gdvId);
+  const insSelV = db.prepare('INSERT INTO draft_sku_selector_values (draft_id, sku_code, value) VALUES (?, ?, ?)');
+  insSelV.run(gdvId, 'gdv-a', '黒');
+  insSelV.run(gdvId, 'gdv-b', '白');
+  db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(gdvId, 'gdv-a', '4901234567894');
+  let gv = listing.buildItemPayload(db, gdvId);
+  check('genre×バリエーション: JAN の無い SKU があると SKU 名つきで止まる (ページ代表の jan_code は見ない)',
+    gv.ok === false
+    && gv.reasons.some((r) => r.includes('gdv-b') && r.includes('カタログID') && r.includes('SKU表'))
+    && !gv.reasons.some((r) => r.includes('gdv-a') && r.includes('カタログID')),
+    JSON.stringify(gv.reasons));
+  db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(gdvId, 'gdv-b', '4999999999999');
+  gv = listing.buildItemPayload(db, gdvId);
+  const catOf = (sku) => ((gv.ok && gv.payload.variants[sku].attributes) || []).filter((a) => a.name === 'カタログID').map((a) => a.values[0]);
+  check('genre×バリエーション: カタログID属性は SKU ごとに自分の JAN (articleNumber と一致)',
+    gv.ok === true
+    && catOf('gdv-a').join() === '4901234567894' && gv.payload.variants['gdv-a'].articleNumber.value === '4901234567894'
+    && catOf('gdv-b').join() === '4999999999999' && gv.payload.variants['gdv-b'].articleNumber.value === '4999999999999',
+    JSON.stringify(gv.ok ? gv.payload.variants : gv.reasons));
+  // 辞書に無いジャンルでは SKU にもカタログID属性を付けない (IE1002 対策はバリエーションでも同じ)
+  db.prepare(`UPDATE draft_rakuten SET genre_id = '999999', attributes_json = '[]' WHERE draft_id = ?`).run(gdvId);
+  gv = listing.buildItemPayload(db, gdvId);
+  check('genre×バリエーション: 辞書未取得ジャンルでは SKU にカタログID属性を付けない',
+    gv.ok === true && catOf('gdv-a').length === 0 && gv.payload.variants['gdv-a'].articleNumber.value === '4901234567894',
+    JSON.stringify(gv.ok ? gv.payload.variants : gv.reasons));
+  db.prepare('DELETE FROM draft_sku_selector_values WHERE draft_id = ?').run(gdvId);
+  db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ?').run(gdvId);
+  db.prepare('DELETE FROM draft_cabinet_images WHERE draft_id = ?').run(gdvId);
+  db.prepare('DELETE FROM draft_images WHERE draft_id = ?').run(gdvId);
+  db.prepare('DELETE FROM draft_rakuten WHERE draft_id = ?').run(gdvId);
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(gdvId);
+  db.prepare('DELETE FROM mirror_products WHERE product_id IN (9311, 9312)').run();
+}
 
 // ─── メーカー型番は「メーカー型番」欄が唯一の入口 (2026-08-31 中原さん指摘) ───
 // RMS でも入力項目は 1 つなのに、画面が「メーカー型番」欄と商品属性の 2 箇所に入れさせていた。
@@ -4720,23 +4762,29 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       r.status === 200 && !saved.article_number && !String(saved.attributes_json).includes('OLD'),
       `${r.status} ${JSON.stringify(saved)}`);
   }
-  // カタログID (JAN) の保存 (2026-09-02: 画面の「カタログID」ブロック → product_drafts.jan_code)
-  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '4901234567894' });
-  check('カタログID: catalog_jan で jan_code が保存される',
+  // カタログID (JAN) 本体は /rakuten では受けない (2026-09-02: 入力は基本情報タブだけ)。
+  // 旧クライアントが catalog_jan を送ってきても jan_code は触らない
+  db.prepare('UPDATE product_drafts SET jan_code = ? WHERE id = ?').run('4901234567894', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '4999999999999', attributes: [] });
+  check('カタログID: /rakuten の catalog_jan は無視され jan_code は変わらない (入口は基本情報タブだけ)',
+    r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code === '4901234567894',
+    `${r.status} ${JSON.stringify(r.json)}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '', attributes: [] });
+  check('カタログID: catalog_jan の空文字でも jan_code は消えない',
     r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code === '4901234567894',
     `${r.status}`);
-  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '1234' });
-  check('カタログID: 不正な JAN は 400', r.status === 400, `${r.status} ${JSON.stringify(r.json)}`);
-  check('カタログID: 400 のとき既存の JAN は変わらない',
-    db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code === '4901234567894');
-  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '' });
-  check('カタログID: 空文字でクリアできる (IDなしを選んだ)',
-    r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code == null,
+  // 「IDなしの理由」は /rakuten で保存する (JAN の無い SKU に使う)
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_id_exemption_reason: '3', attributes: [] });
+  check('カタログID: IDなしの理由が保存される',
+    r.status === 200 && db.prepare('SELECT catalog_id_exemption_reason FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id).catalog_id_exemption_reason === 3,
     `${r.status}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_id_exemption_reason: '9', attributes: [] });
+  check('カタログID: 範囲外の理由は 400', r.status === 400, `${r.status} ${JSON.stringify(r.json)}`);
   r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [] });
-  check('カタログID: catalog_jan を送らない保存では jan_code を触らない',
-    r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code == null,
+  check('カタログID: 理由を送らない保存では既存の理由を維持する',
+    r.status === 200 && db.prepare('SELECT catalog_id_exemption_reason FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id).catalog_id_exemption_reason === 3,
     `${r.status}`);
+  db.prepare('UPDATE product_drafts SET jan_code = NULL WHERE id = ?').run(gdraft3.id);
 
   // 旧形式 {name, value} で残っている値も拾う (Codex R2 medium: values 配列だけ見ると消える)
   db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
