@@ -706,20 +706,6 @@ let mvCtx = null;   // { pageId, code, version, values }
 const MV_MAP = { material_code: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
   process_count: 'mvProcess', note: 'mvNote', video_url: 'mvVideo' };
 
-function masterFromRow(row) {
-  const m = { source: 'master', version: row.version,
-    material_code: row.material_code || null, storage_container: row.storage_container || null,
-    units_per_container: row.units_per_container ?? null, process_count: row.process_count ?? null,
-    note: row.note || null, video_url: row.video_url || null };
-  const missing = [];
-  if (!m.material_code) missing.push('資材');
-  if (!m.storage_container) missing.push('容器');
-  if (m.units_per_container == null) missing.push('入数');
-  if (m.process_count == null) missing.push('工程');
-  m.missing = missing;
-  return m;
-}
-
 function mvValues(m) {
   return {
     material_code: m.material_code || '', storage_container: m.storage_container || '',
@@ -774,13 +760,11 @@ async function saveMaster() {
   for (const id of ['mvSave', 'mvCancel']) document.getElementById(id).disabled = false;
 
   if (j.ok) {
-    // 同じ商品の他のカードにも効かせる
-    if (j.row) for (const card of state.cards) {
-      if (card.product_code === mvCtx.code) card.master = masterFromRow(j.row);
-    }
     $('#mvOv').classList.remove('on');
     mvCtx = null;
-    renderList(); rerenderDetail();
+    // ⭐ローカルで j.row (生値) を貼らず、サーバーの合成結果 (カードフォールバック込み) を
+    //   取り直す — 部分マスタ行で保存直後だけ資材・入数が「未登録」に見える回帰を防ぐ (PR4-R4)
+    await loadState();
     toast(j.unchanged ? '変更はありませんでした' : '登録しました (この商品の次のカードにも反映されます)');
     return;
   }
