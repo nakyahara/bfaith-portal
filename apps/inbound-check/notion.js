@@ -122,8 +122,10 @@ export async function ensureCardSchema({ force = false } = {}) {
   // いろは作業仕様マスタ (f_iroha_work_master) 由来の項目も、無ければ作る (Codex PR2 #5:
   // names に無いと黙って送られず、新しい環境で一部欠落したまま正常終了してしまう)
   if (!names.has('工程数')) add['工程数'] = { number: {} };
-  if (!names.has('資材セットID')) add['資材セットID'] = { rich_text: {} };
-  if (!names.has('収納容器')) add['収納容器'] = { rich_text: {} };
+  // 資材セットID・収納容器は実DBが select 型 (2026-09-02 実機で判明。GAS はこの2項目を
+  // 実際には送っていなかったため型の思い込みが露見しなかった)
+  if (!names.has('資材セットID')) add['資材セットID'] = { select: {} };
+  if (!names.has('収納容器')) add['収納容器'] = { select: {} };
   if (!names.has('入数')) add['入数'] = { number: {} };
   if (!names.has('備考')) add['備考'] = { rich_text: {} };
   if (Object.keys(add).length > 0) {
@@ -139,7 +141,7 @@ export async function ensureCardSchema({ force = false } = {}) {
     '入庫日': 'date', '入荷管理番号': 'rich_text', 'バーコード': 'rich_text', '取引先': 'select',
     '仕入先': 'number', '取扱区分': 'select', '在庫化必要FLG': 'checkbox', '作業拠点': 'select',
     '過去30日販売数': 'rich_text', '外部出し目安': 'rich_text',
-    '資材セットID': 'rich_text', '収納容器': 'rich_text', '入数': 'number', '工程数': 'number', '備考': 'rich_text',
+    '資材セットID': 'select', '収納容器': 'select', '入数': 'number', '工程数': 'number', '備考': 'rich_text',
     '有効期限': 'rich_text', 'destination_id': 'number', [DEDUPE_PROP]: 'rich_text',
   };
   const problems = [];

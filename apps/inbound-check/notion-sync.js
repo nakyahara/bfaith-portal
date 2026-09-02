@@ -172,6 +172,8 @@ export function buildCardProperties(row, { barcode, product, supplierName, ext, 
   const props = {};
   const put = (name, value) => { if (names.has(name)) props[name] = value; };
   const text = (s) => [{ text: { content: String(s).slice(0, 1900) } }];
+  // select の選択肢名: Notion はカンマを含む名前を拒否する (400)。全角に逃がして行を落とさない
+  const selName = (s) => String(s).replace(/,/g, '，').slice(0, 100);
 
   props['名前'] = { title: [{ text: { content: row.product_name || row.product_id || '名称不明' } }] };
   put('ステータス', { select: { name: '未着手' } });
@@ -181,7 +183,7 @@ export function buildCardProperties(row, { barcode, product, supplierName, ext, 
   put('入荷管理番号', { rich_text: text(row.ar_no || '') });
   if (barcode) put('バーコード', { rich_text: text(barcode) });
   // 取引先: 入荷受付CSVの取引先は常に 0002/BF で使えない → 商品マスタの仕入先から引く
-  if (supplierName) put('取引先', { select: { name: supplierName } });
+  if (supplierName) put('取引先', { select: { name: selName(supplierName) } });
   const supNum = product ? parseInt(product.supplierCode, 10) : NaN;
   if (!Number.isNaN(supNum)) put('仕入先', { number: supNum });
   if (product?.handling) put('取扱区分', { select: { name: product.handling } });
@@ -203,8 +205,9 @@ export function buildCardProperties(row, { barcode, product, supplierName, ext, 
   // ⚠「入数」に載せるのは units_per_container (いろはで1容器に詰める数) だけ。f_inbound_info の
   //   入数 (仕入箱入数) は意味が違うので送らない (Codex設計相談R1 質問2-3)
   if (wm) {
-    if (wm.material_code) put('資材セットID', { rich_text: text(wm.material_code) });
-    if (wm.storage_container) put('収納容器', { rich_text: text(wm.storage_container) });
+    // 資材セットID・収納容器は実DBが select 型 (選択肢は無ければ Notion が自動作成する)
+    if (wm.material_code) put('資材セットID', { select: { name: selName(wm.material_code) } });
+    if (wm.storage_container) put('収納容器', { select: { name: selName(wm.storage_container) } });
     if (wm.units_per_container != null) put('入数', { number: wm.units_per_container });
     if (wm.process_count != null) put('工程数', { number: wm.process_count });
     if (wm.note) put('備考', { rich_text: text(wm.note) });

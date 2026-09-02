@@ -41,6 +41,8 @@ const mock = {
     'バーコード': { type: 'rich_text' }, '取引先': { type: 'select' }, '仕入先': { type: 'number' },
     '取扱区分': { type: 'select' }, '在庫化必要FLG': { type: 'checkbox' }, '作業拠点': { type: 'select' },
     '過去30日販売数': { type: 'rich_text' }, '外部出し目安': { type: 'rich_text' }, '入数': { type: 'number' },
+    // 実DBと同じ型 (2026-09-02 実機で判明: この2つは select。rich_text 想定だと schema_mismatch で全停止した)
+    '資材セットID': { type: 'select' }, '収納容器': { type: 'select' }, '備考': { type: 'rich_text' },
     // 台帳キー / destination_id / 有効期限 は最初は無い → ensure が足す
   },
   queryResults: new Map(),   // `${property}:${value}` → page
