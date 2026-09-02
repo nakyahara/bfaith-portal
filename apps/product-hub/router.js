@@ -62,7 +62,7 @@ import {
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
-  isValidGtin, MODEL_ATTR_NAME,
+  isValidGtin, MODEL_ATTR_NAME, skuAttributeGrid,
 } from './services/rakuten-listing.js';
 // ボードから楽天に出品 (2026-09-01): 画像転送 → 登録 → 後処理 を 1 本に
 import {
@@ -256,6 +256,19 @@ router.get('/detail/:id', (req, res) => {
   for (const r of db.prepare('SELECT sku_code, value FROM draft_sku_selector_values WHERE draft_id = ?').all(draft.id)) {
     skuSelectorValues[r.sku_code] = r.value;
   }
+  // SKU別の商品仕様 (2026-09-03、RMS と同じ SKU 列 × 項目行の表) と「カタログIDなしの理由」。
+  // 出品 payload と同じ関数で読む (画面に見えている値がそのまま送られる)
+  const rakutenRowForGrid = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
+  const gridRaw = (variation.kind === 'variation' && variation.memberCount > 1)
+    ? skuAttributeGrid(db, draft.id, rakutenRowForGrid, variation.members) : { names: [], bySku: new Map() };
+  const skuAttrGrid = {
+    names: gridRaw.names,
+    bySku: Object.fromEntries([...gridRaw.bySku.entries()].map(([k, m]) => [k, Object.fromEntries(m.entries())])),
+  };
+  const skuExemptions = {};
+  for (const r of db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?').all(draft.id)) {
+    skuExemptions[r.sku_code] = r.reason;
+  }
   const simTaxPercent = (() => {
     const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
     if (t) return Number(t[1]);
@@ -305,6 +318,7 @@ router.get('/detail/:id', (req, res) => {
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
     thumbnailUrl, fileViewUrl,
     neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices, skuJans, skuSelectorValues,
+    skuAttrGrid, skuExemptions,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
     categoryLabelsByType: CATEGORY_LABELS_BY_TYPE,
@@ -1786,6 +1800,11 @@ router.post('/api/drafts/:id/variation/exclude', (req, res) => {
     // SKU別JAN も同じ理由で掃除する (2026-08-28)。残すと入力欄が消えて解除できない
     db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?')
       .run(draft.id, code.trim().toLowerCase());
+    // SKU別の商品仕様・カタログIDなしの理由も同じ理由で掃除する (2026-09-03)
+    db.prepare('DELETE FROM draft_sku_attributes WHERE draft_id = ? AND sku_code = ?')
+      .run(draft.id, code.trim().toLowerCase());
+    db.prepare('DELETE FROM draft_sku_catalog_exemptions WHERE draft_id = ? AND sku_code = ?')
+      .run(draft.id, code.trim().toLowerCase());
     try {
       db.prepare('INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, ?, ?)')
         .run(draft.id, code, actorOf(req));
@@ -1928,6 +1947,82 @@ router.post('/api/drafts/:id/sku-jans', (req, res) => {
       throw e;
     }
     logEvent(db, draft.id, 'sku_jan_saved', `${code} = ${jan}`, actorOf(req));
+    return { code: 200 };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true });
+});
+
+// SKU別の商品仕様 (2026-09-03 中原さん: RMS と同じ「SKU 列 × 項目行」の表で入力)。
+// value '' = 明示的に空 (ページ共通の既定値を打ち消す)。all=true で全 SKU に同じ値 (一括入力)。
+// 入力欄を離れたら即保存 (sku-jans と同じ作法)。所属確認まで 1 トランザクション
+router.post('/api/drafts/:id/sku-attributes', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const name = cleanText(req.body?.name, 100);
+  if (!name) return res.status(400).json({ ok: false, error: '項目名が必要です' });
+  if (name === 'カタログID') {
+    return res.status(400).json({ ok: false, error: 'カタログID (JAN) は商品仕様ではなく表の「カタログID」の行で入力してください' });
+  }
+  const value = cleanText(req.body?.value, 300) || ''; // '' = 明示的に空 (cleanText は空を null にするので戻す。NOT NULL 列)
+  const all = req.body?.all === true;
+  const code = all ? '' : cleanText(req.body?.ne_code, 100);
+  if (!all && !code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const db = getDB();
+  const r = db.transaction(() => {
+    const v = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id, withMembers: true });
+    if (v.kind !== 'variation' || v.memberCount < 2) {
+      return { code: 400, error: 'このドラフトはバリエーションではありません (単品は商品仕様の表で入力してください)' };
+    }
+    const memberKeys = v.members.map((m) => String(m.商品コード || '').trim().toLowerCase());
+    const keys = all ? memberKeys : [code.trim().toLowerCase()];
+    if (!all && !memberKeys.includes(keys[0])) {
+      return { code: 409, error: `${code} はこのページのバリエーションに含まれていません。画面を再読み込みしてください` };
+    }
+    const up = db.prepare(`
+      INSERT INTO draft_sku_attributes (draft_id, sku_code, name, value) VALUES (?, ?, ?, ?)
+      ON CONFLICT(draft_id, sku_code, name) DO UPDATE SET
+        value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `);
+    for (const k of keys) up.run(draft.id, k, name, value);
+    logEvent(db, draft.id, 'sku_attribute_saved', `${name} = ${value || '(空)'} (${all ? '全SKU一括' : code})`, actorOf(req));
+    return { code: 200, count: keys.length };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true, count: r.count });
+});
+
+// SKU別の「カタログIDなしの理由」(2026-09-03)。JAN の無い SKU に使う。空欄で送れば解除 (= ページ共通の理由)
+router.post('/api/drafts/:id/sku-catalog-exemptions', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const code = cleanText(req.body?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const raw = String(req.body?.reason ?? '').trim();
+  if (raw !== '' && !/^[1-6]$/.test(raw)) {
+    return res.status(400).json({ ok: false, error: 'カタログIDなしの理由は1〜6から選んでください' });
+  }
+  const db = getDB();
+  const r = db.transaction(() => {
+    const key = code.trim().toLowerCase();
+    if (raw === '') {
+      const info = db.prepare('DELETE FROM draft_sku_catalog_exemptions WHERE draft_id = ? AND sku_code = ?').run(draft.id, key);
+      if (info.changes > 0) logEvent(db, draft.id, 'sku_catalog_exemption_saved', `${code} = (解除)`, actorOf(req));
+      return { code: 200 };
+    }
+    const v = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id, withMembers: true });
+    if (v.kind !== 'variation' || v.memberCount < 2) {
+      return { code: 400, error: 'このドラフトはバリエーションではありません' };
+    }
+    if (!v.members.some((m) => String(m.商品コード || '').trim().toLowerCase() === key)) {
+      return { code: 409, error: `${code} はこのページのバリエーションに含まれていません。画面を再読み込みしてください` };
+    }
+    db.prepare(`
+      INSERT INTO draft_sku_catalog_exemptions (draft_id, sku_code, reason) VALUES (?, ?, ?)
+      ON CONFLICT(draft_id, sku_code) DO UPDATE SET
+        reason = excluded.reason, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `).run(draft.id, key, Number(raw));
+    logEvent(db, draft.id, 'sku_catalog_exemption_saved', `${code} = ${raw}`, actorOf(req));
     return { code: 200 };
   })();
   if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });

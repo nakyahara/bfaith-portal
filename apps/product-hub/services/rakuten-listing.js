@@ -1005,6 +1005,35 @@ export function cabinetImageUrl(location) {
 }
 
 /**
+ * SKU ごとの商品仕様 (2026-09-03 中原さん: RMS と同じ「SKU 列 × 項目行」の表で入力)。
+ * ページ共通の attributes_json / article_number を既定値に、draft_sku_attributes (value '' = 明示的に空) で
+ * SKU ごとに上書きする。画面 (detail) と出品 payload の両方がこの関数を使う = 見えている値がそのまま送られる。
+ * @returns {{ names: string[], bySku: Map<string, Map<string, string>> }} bySku のキーは LOWER(TRIM(商品コード))
+ */
+export function skuAttributeGrid(db, draftId, rk, members) {
+  const base = new Map();
+  for (const a of (parseAttributes(rk?.attributes_json) || [])) {
+    if (a.name !== MODEL_ATTR_NAME) base.set(a.name, a.values.join(' | '));
+  }
+  const article = String(rk?.article_number || '').trim();
+  if (article) base.set(MODEL_ATTR_NAME, article);
+  const names = [...base.keys()];
+  const bySku = new Map();
+  for (const m of members || []) {
+    bySku.set(String(m.商品コード || '').trim().toLowerCase(), new Map(base));
+  }
+  const rows = db.prepare('SELECT sku_code, name, value FROM draft_sku_attributes WHERE draft_id = ? ORDER BY rowid').all(draftId);
+  for (const r of rows) {
+    const cell = bySku.get(String(r.sku_code));
+    if (!cell) continue; // 外した SKU の残骸は読まない
+    const value = String(r.value == null ? '' : r.value);
+    if (!names.includes(r.name) && value.trim()) names.push(r.name);
+    cell.set(r.name, value);
+  }
+  return { names, bySku };
+}
+
+/**
  * 出品 payload を組み立てる。送れない状態なら reasons を返す (dry_run と live で共通)。
  */
 export function buildItemPayload(db, draftId) {
@@ -1120,12 +1149,26 @@ export function buildItemPayload(db, draftId) {
     // 画面で入れた SKU別売価 (draft_sku_prices)。入っていればこれが最優先
     const priceRows = new Map(db.prepare('SELECT sku_code, price FROM draft_sku_prices WHERE draft_id = ?')
       .all(draftId).map((r) => [String(r.sku_code), Number(r.price)]));
+    // SKU ごとの「カタログIDなしの理由」(無ければページ共通の理由) と商品仕様 (2026-09-03 SKU 表)
+    const exemptionRows = new Map(db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?')
+      .all(draftId).map((r) => [String(r.sku_code), Number(r.reason)]));
+    const grid = skuAttributeGrid(db, draftId, rk, vari.members);
     variantRows = [];
     for (const m of vari.members) {
       const skuCode = String(m.商品コード || '').trim();
       const key = skuCode.toLowerCase();
       const selectorValue = String(selRows.get(key) || '').trim();
       const skuJan = String(janRows.get(key) || '').trim();
+      const cell = grid.bySku.get(key) || new Map();
+      if (String(cell.get('カタログID') || '').trim()) {
+        reasons.push(`SKU「${skuCode}」の商品仕様に「カタログID」の行があります — カタログID (JAN) は表の「カタログID」の行で入力してください`);
+      }
+      const skuAttrs = [...cell.entries()]
+        .filter(([n, v]) => String(v).trim() && n !== MODEL_ATTR_NAME && n !== 'カタログID')
+        .map(([n, v]) => ({ name: n, values: [String(v).trim()] }));
+      const skuModel = String(cell.get(MODEL_ATTR_NAME) || '').trim();
+      const rawSkuReason = exemptionRows.get(key);
+      const skuReason = Number.isInteger(rawSkuReason) && rawSkuReason >= 1 && rawSkuReason <= 6 ? rawSkuReason : catalogExemptionReason;
       if (!selectorValue) reasons.push(`SKU「${skuCode}」の選択肢 (${selectorName || 'バリエーション'}) が未入力です — 基本情報タブのSKU表で入れてください`);
       if (skuJan && !isValidGtin(skuJan)) {
         reasons.push(`SKU「${skuCode}」のJANコード「${skuJan}」の形式が不正です (8/12/13桁 + チェックデジット)`);
@@ -1138,7 +1181,7 @@ export function buildItemPayload(db, draftId) {
       if (!Number.isInteger(price) || price < 1) {
         reasons.push(`SKU「${skuCode}」の売価がありません (NEの標準売価も代表の売価も未設定)`);
       }
-      variantRows.push({ skuCode, selectorValue, jan: skuJan, price });
+      variantRows.push({ skuCode, selectorValue, jan: skuJan, price, attrs: skuAttrs, model: skuModel, reason: skuReason });
     }
     // 同じ値が 2 SKU に付くと組み合わせが重複して RMS に弾かれる (DB の UNIQUE でも防ぐが、
     // 取込など別経路で入った分に備えてここでも見る)
@@ -1153,11 +1196,12 @@ export function buildItemPayload(db, draftId) {
   }
   // 送る SKU の一覧 (単品 = 商品コード 1 行)。カタログIDの必須判定と「カタログID」属性の自動付与は
   // この単位で行う (単品とバリエーションで判定を分けない)
+  // 単品の attrs/model は下で確定する (ページ共通の属性 + メーカー型番欄)
   const skuRows = isVariation && variantRows
     ? variantRows
-    : [{ skuCode: String(draft.ne_code).trim(), selectorValue: null, jan, price: draft.price }];
+    : [{ skuCode: String(draft.ne_code).trim(), selectorValue: null, jan, price: draft.price, attrs: null, model: null, reason: catalogExemptionReason }];
   // 1 (セット商品) は articleNumberForSet (構成品の JAN 一覧) が別に必須になる。まだ送れないので止める
-  if (catalogExemptionReason === 1 && skuRows.some((s) => !s.jan)) {
+  if (skuRows.some((s) => !s.jan && s.reason === 1)) {
     reasons.push('カタログIDなしの理由「1: セット商品」は未対応です (構成品のJAN一覧を送る仕組みがまだありません)。JANを入力するか別の理由を選んでください');
   }
 
@@ -1192,40 +1236,44 @@ export function buildItemPayload(db, draftId) {
     const dictByName = new Map(genreDict.attributes.map((a) => [a.name, a]));
     dictHasCatalogId = dictByName.has('カタログID');
     dictHasModel = dictByName.has(MODEL_ATTR_NAME);
-    // ① 辞書に無い属性名は IE1002 で登録が失敗する → 送る前に止める
-    for (const a of attributes) {
-      if (!dictByName.has(a.name)) {
-        reasons.push(`属性「${a.name}」はジャンル「${genreDict.genreName || rk.genre_id}」の属性辞書にありません (登録エラー IE1002 になります)`);
-      }
-    }
-    // ② 必須属性の欠落 (カタログIDは JAN からの自動付与があるので、SKU ごとに JAN の有無で判定する)
-    const presentNames = new Set(attributes.map((a) => a.name));
-    for (const da of genreDict.attributes) {
-      if (!da.mandatory || presentNames.has(da.name)) continue;
-      if (da.name === 'カタログID') {
-        const genreLabel = genreDict.genreName || rk.genre_id;
-        for (const s of skuRows) {
-          if (s.jan) continue; // 下で SKU ごとに自動付与する
-          reasons.push(isVariation
-            ? `SKU「${s.skuCode}」のカタログID (JAN) が未入力です (ジャンル ${genreLabel} の必須属性) — 基本情報タブのSKU表で入れてください`
-            : `カタログID (JAN) が未入力です (ジャンル ${genreLabel} の必須属性) — 基本情報タブのJANコード欄で入れてください`);
+    const genreLabel = genreDict.genreName || rk.genre_id;
+    // 検証の単位は SKU (単品 = 1 行)。バリエーションは SKU 表の値、単品はページ共通の属性 + メーカー型番欄
+    for (const s of skuRows) {
+      const skuAttrs = isVariation ? s.attrs : attributes;
+      const skuModel = isVariation ? s.model : articleNo;
+      const tag = isVariation ? `SKU「${s.skuCode}」の` : '';
+      // ① 辞書に無い属性名は IE1002 で登録が失敗する → 送る前に止める
+      for (const a of skuAttrs) {
+        if (!dictByName.has(a.name)) {
+          reasons.push(`${tag}属性「${a.name}」はジャンル「${genreLabel}」の属性辞書にありません (登録エラー IE1002 になります)`);
         }
-        continue;
       }
-      // メーカー型番は「メーカー型番」欄から自動付与する (属性行では入力させない)
-      if (da.name === MODEL_ATTR_NAME && articleNo) continue;
-      reasons.push(`必須属性「${da.name}」が未入力です (ジャンル ${genreDict.genreName || rk.genre_id} の必須)`);
-    }
-    // ③ 値の数・長さの軽い検証 (RMS と同じ基準で早めに教える)
-    for (const a of attributes) {
-      const da = dictByName.get(a.name);
-      if (!da) continue;
-      if (da.multiValueLimit && a.values.length > da.multiValueLimit) {
-        reasons.push(`属性「${a.name}」の値は最大 ${da.multiValueLimit} 個です`);
+      // ② 必須属性の欠落 (カタログIDは JAN、メーカー型番は欄/セルの値で判定する)
+      const presentNames = new Set(skuAttrs.map((a) => a.name));
+      for (const da of genreDict.attributes) {
+        if (!da.mandatory || presentNames.has(da.name)) continue;
+        if (da.name === 'カタログID') {
+          if (!s.jan) {
+            reasons.push(isVariation
+              ? `SKU「${s.skuCode}」のカタログID (JAN) が未入力です (ジャンル ${genreLabel} の必須属性) — カテゴリ・属性タブのSKU表「カタログID」の行で入れてください`
+              : `カタログID (JAN) が未入力です (ジャンル ${genreLabel} の必須属性) — カテゴリ・属性タブの「カタログID」の行で入れてください`);
+          }
+          continue; // JAN があれば下で SKU ごとに自動付与する
+        }
+        if (da.name === MODEL_ATTR_NAME && skuModel) continue; // メーカー型番の欄/セルから自動付与する
+        reasons.push(`${tag}必須属性「${da.name}」が未入力です (ジャンル ${genreLabel} の必須)`);
       }
-      if (da.maxLength) {
-        for (const v of a.values) {
-          if (String(v).length > da.maxLength) reasons.push(`属性「${a.name}」の値が長すぎます (上限 ${da.maxLength} 文字)`);
+      // ③ 値の数・長さの軽い検証 (RMS と同じ基準で早めに教える)
+      for (const a of skuAttrs) {
+        const da = dictByName.get(a.name);
+        if (!da) continue;
+        if (da.multiValueLimit && a.values.length > da.multiValueLimit) {
+          reasons.push(`${tag}属性「${a.name}」の値は最大 ${da.multiValueLimit} 個です`);
+        }
+        if (da.maxLength) {
+          for (const v of a.values) {
+            if (String(v).length > da.maxLength) reasons.push(`${tag}属性「${a.name}」の値が長すぎます (上限 ${da.maxLength} 文字)`);
+          }
         }
       }
     }
@@ -1262,14 +1310,16 @@ export function buildItemPayload(db, draftId) {
   // 実測: 「カタログID」が辞書に無いジャンル (111145等) へ付与すると IE1002 で登録自体が失敗する。
   // 辞書未取得のジャンルでは付与しない (安全側。必要なら「ジャンル情報を取得」してから登録する)。
   // 値は **SKU ごとに自分の JAN** (2026-09-02: ページ代表の JAN を全 SKU に付けていた穴を塞ぐ)
-  const attrs = attributes.slice();
-  // メーカー型番を属性としても送る (2026-08-31)。入口は「メーカー型番」欄だけなので、
-  // ジャンル属性に メーカー型番 があるジャンルではここで補う。
-  // 旧データで属性側に同じ値が残っている場合は二重に足さない (上で不一致は弾いてある)
-  if (dictHasModel && articleNo && !manualModel) {
-    attrs.push({ name: MODEL_ATTR_NAME, values: [articleNo] });
-  }
-  const attrsForSku = (s) => (dictHasCatalogId && s.jan ? [...attrs, { name: 'カタログID', values: [s.jan] }] : attrs);
+  // SKU ごとに送る属性 (2026-09-03): バリエーションは SKU 表の値、単品はページ共通の属性。
+  // メーカー型番は辞書にあるジャンルだけ補う (2026-08-31。単品は欄の値、旧データで属性側に同じ値が
+  // 残っている場合は二重に足さない — 上で不一致は弾いてある)
+  const attrsForSku = (s) => {
+    const list = isVariation ? s.attrs.slice() : attributes.slice();
+    const model = isVariation ? s.model : (manualModel ? '' : articleNo);
+    if (dictHasModel && model) list.push({ name: MODEL_ATTR_NAME, values: [model] });
+    if (dictHasCatalogId && s.jan) list.push({ name: 'カタログID', values: [s.jan] });
+    return list;
+  };
 
   // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる
   const shippingGroup = String(rk.shipping_method_group ?? '').trim();
@@ -1319,7 +1369,8 @@ export function buildItemPayload(db, draftId) {
     variants: isVariation && variantRows ? Object.fromEntries(variantRows.map((v) => [v.skuCode, {
       merchantDefinedSkuId: v.skuCode,
       standardPrice: v.price,
-      articleNumber: v.jan ? { value: v.jan } : { exemptionReason: catalogExemptionReason },
+      // カタログIDなしの理由は SKU ごと (無ければページ共通の理由)
+      articleNumber: v.jan ? { value: v.jan } : { exemptionReason: v.reason },
       selectorValues: { [selectorName]: v.selectorValue },
       ...(attrsForSku(v).length > 0 ? { attributes: attrsForSku(v) } : {}),
       ...(Object.keys(shipping).length > 0 ? { shipping } : {}),
