@@ -1400,7 +1400,7 @@ db.prepare('UPDATE product_drafts SET detail_images_excluded = 1, jan_code = NUL
 let bv = listing.buildItemPayload(db, rkvId);
 check('カラバリ: 項目選択肢の見出しと値が無ければ止める',
   bv.ok === false
-  && bv.reasons.some((r) => r.includes('見出し'))
+  && bv.reasons.some((r) => r.includes('項目名'))
   && bv.reasons.some((r) => r.includes('rkv-a'))
   && bv.reasons.some((r) => r.includes('rkv-b')), JSON.stringify(bv.reasons));
 
@@ -4720,6 +4720,24 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       r.status === 200 && !saved.article_number && !String(saved.attributes_json).includes('OLD'),
       `${r.status} ${JSON.stringify(saved)}`);
   }
+  // カタログID (JAN) の保存 (2026-09-02: 画面の「カタログID」ブロック → product_drafts.jan_code)
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '4901234567894' });
+  check('カタログID: catalog_jan で jan_code が保存される',
+    r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code === '4901234567894',
+    `${r.status}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '1234' });
+  check('カタログID: 不正な JAN は 400', r.status === 400, `${r.status} ${JSON.stringify(r.json)}`);
+  check('カタログID: 400 のとき既存の JAN は変わらない',
+    db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code === '4901234567894');
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '' });
+  check('カタログID: 空文字でクリアできる (IDなしを選んだ)',
+    r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code == null,
+    `${r.status}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [] });
+  check('カタログID: catalog_jan を送らない保存では jan_code を触らない',
+    r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code == null,
+    `${r.status}`);
+
   // 旧形式 {name, value} で残っている値も拾う (Codex R2 medium: values 配列だけ見ると消える)
   db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
     .run('[{"name":"メーカー型番","value":"OLDFORM"}]', gdraft3.id);
@@ -5497,11 +5515,14 @@ for (const [name, file, data] of renders) {
 {
   const dl = renderedHtml.get('detail.ejs (メーカー型番が属性側にある旧データ)') || '';
   const attrTable = (dl.match(/<table class="list" id="rk-attrs"[\s\S]*?<\/table>/) || [''])[0];
-  check('メーカー型番: 商品属性のテーブルに行を出さない (入口は上の欄だけ)',
-    attrTable.length > 0 && !attrTable.includes('メーカー型番') && attrTable.includes('テストブランド'),
-    attrTable.includes('メーカー型番') ? '属性テーブルに残っている' : '属性テーブルが取れない');
-  check('メーカー型番: 旧データの値は「メーカー型番」欄へ引き上げて表示する',
-    /id="rk-article" value="toys3pen"/.test(dl) && dl.includes('商品属性に入っていた値をここへ移しました'),
+  // 2026-09-02: RMS と同じく、メーカー型番は「商品仕様」テーブルの中の固定行 (rk-article)。
+  // 自由入力の属性行 (rk-attr-name) としては出ないこと = 入口が 1 つのまま
+  check('メーカー型番: 商品仕様テーブルに固定行として出る (rk-article がテーブル内・自由入力行は出ない)',
+    attrTable.length > 0 && attrTable.includes('id="rk-article"') && attrTable.includes('テストブランド')
+    && !/class="rk-attr-name"[^>]*value="メーカー型番"/.test(attrTable),
+    attrTable.includes('id="rk-article"') ? '自由入力行にメーカー型番が残っている' : 'rk-article がテーブル内に無い');
+  check('メーカー型番: 旧データの値は固定行の欄へ引き上げて表示する',
+    /id="rk-article" value="toys3pen"/.test(dl) && dl.includes('旧データの値をここへ移しました'),
     (dl.match(/id="rk-article" value="[^"]*"/) || ['(見つからない)'])[0]);
   // 旧値を欄へ引き上げて表示している状態は、そのまま/書き換えて保存できる必要がある
   // (Codex R4 high: フラグが false だと保存が 400 になるのに解消ボタンが出ていない)

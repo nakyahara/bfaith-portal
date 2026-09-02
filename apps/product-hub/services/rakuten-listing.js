@@ -1124,7 +1124,7 @@ export function buildItemPayload(db, draftId) {
   let variantRows = null;   // [{ skuCode, selectorValue, jan, price }]
   if (isVariation) {
     if (!selectorName) {
-      reasons.push('項目選択肢の見出し (「種類」「カラー」など) が未入力です — カテゴリ・属性タブで入れてください');
+      reasons.push('バリエーションの項目名 (「種類」「カラー」など) が未入力です — カテゴリ・属性タブの「バリエーション」で入れてください');
     }
     const selRows = new Map(db.prepare('SELECT sku_code, value FROM draft_sku_selector_values WHERE draft_id = ?')
       .all(draftId).map((r) => [String(r.sku_code), String(r.value)]));
@@ -1139,7 +1139,7 @@ export function buildItemPayload(db, draftId) {
       const key = skuCode.toLowerCase();
       const selectorValue = String(selRows.get(key) || '').trim();
       const skuJan = String(janRows.get(key) || '').trim();
-      if (!selectorValue) reasons.push(`SKU「${skuCode}」の${selectorName || '項目選択肢'}が未入力です`);
+      if (!selectorValue) reasons.push(`SKU「${skuCode}」の選択肢 (${selectorName || 'バリエーション'}) が未入力です — 基本情報タブのSKU表で入れてください`);
       if (skuJan && !isValidGtin(skuJan)) {
         reasons.push(`SKU「${skuCode}」のJANコード「${skuJan}」の形式が不正です (8/12/13桁 + チェックデジット)`);
       }
@@ -1359,11 +1359,11 @@ export function translateRmsError(code, message, metadata) {
   const attrLabel = attrName ? `「${attrName}」` : '';
 
   if (code === 'IE0228' && /articleNumber/i.test(path)) {
-    return 'カタログID (JANコード) の値を楽天が受け付けませんでした。基本情報タブのJANコードを確認してください'
-      + ' — ここはメーカー型番を入れる欄ではありません (RMS の「カタログID」に相当します)';
+    return 'カタログID (JANコード) の値を楽天が受け付けませんでした。カテゴリ・属性タブの「カタログID」を確認してください'
+      + ' — メーカー型番を入れる欄ではありません (型番は「商品仕様」のメーカー型番へ)';
   }
   if (code === 'IE0229' && /articleNumber/i.test(path)) {
-    return 'カタログIDが空です。JANコードを入れるか、「カタログIDなしの理由」を選んでください';
+    return 'カタログIDが空です。カテゴリ・属性タブの「カタログID」でJANを入れるか、IDなしの理由を選んでください';
   }
   if (code === 'IE0418' && details.some((d) => d && d.code === 'invalidSelectiveValue')) {
     return `商品属性${attrLabel}の値が、楽天がこのジャンルで用意している選択肢にありません。`

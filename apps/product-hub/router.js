@@ -1051,6 +1051,16 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
       return res.status(400).json({ ok: false, error: 'カタログIDなしの理由は1〜6から選んでください' });
     }
   }
+  // カタログID (JAN)。画面の「カタログID」ブロック (RMS と同じ ◉IDあり/○IDなし) からの値で、
+  // 実体は product_drafts.jan_code (基本情報タブの JAN 欄と同じ)。
+  // undefined = 触らない (旧クライアント・部分更新)。'' = クリア (IDなしを明示的に選んだ)
+  let catalogJan; // undefined のまま = 変更なし
+  if (req.body?.catalog_jan !== undefined) {
+    catalogJan = String(req.body.catalog_jan ?? '').trim();
+    if (catalogJan !== '' && !isValidGtin(catalogJan)) {
+      return res.status(400).json({ ok: false, error: 'カタログID (JANコード) の形式が不正です (8/12/13桁 + チェックデジット)' });
+    }
+  }
   // 既存 JSON が壊れていたら何を消したか分からなくなるので、上書きせず止める (Codex R2 medium)
   let prevAttrs = [];
   if (prevRkRow && String(prevRkRow.attributes_json || '').trim()) {
@@ -1206,6 +1216,13 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(draft.id, genreId, attributesJson, articleNumber, catalogExemptionReason, variantSelectorName,
       shippingGroup, postageIncluded, deliveryDateId, whiteBgFileId, whiteBgRaw);
+    // カタログID (JAN) = product_drafts.jan_code の更新 (同一トランザクション)。
+    // 基本情報タブの JAN 欄と同じ列なので、どちらの画面で直しても同じ場所に入る
+    if (catalogJan !== undefined && catalogJan !== String(draft.jan_code || '').trim()) {
+      db.prepare('UPDATE product_drafts SET jan_code = ? WHERE id = ?')
+        .run(catalogJan === '' ? null : catalogJan, draft.id);
+      logEvent(db, draft.id, 'jan_code_saved', `カタログID: ${draft.jan_code || '(空)'} → ${catalogJan || '(空)'}`, actorOf(req));
+    }
     if (shopCategoryIds !== null) {
       setDraftShopCategories(db, draft.id, shopCategoryIds);
       // 店舗内カテゴリが確定した記録 (AI 初期設定の「一度だけ」判定に使う。0件保存も「人が外した」意思表示)。
