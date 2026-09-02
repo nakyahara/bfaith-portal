@@ -223,7 +223,7 @@ router.post('/api/placements', checkOrigin, api((req, res) => {
     requestId: String(req.body?.request_id || ''),
   });
   if (!r.ok) {
-    const st = { over_qty: 409, expiry_conflict: 409, box_closed: 409, wrong_group: 409, run_not_active: 409, not_found: 404 }[r.error] || 400;
+    const st = { over_qty: 409, expiry_conflict: 409, box_closed: 409, wrong_group: 409, run_not_active: 409, idempotency_conflict: 409, not_found: 404 }[r.error] || 400;
     return res.status(st).json(r);
   }
   res.json(r);

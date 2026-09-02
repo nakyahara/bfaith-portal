@@ -461,16 +461,34 @@
    * 応答が返るまで payload ごと localStorage に残し、応答喪失後の再送でも**同じ id** を
    * 使い続ける (Codex PR1 #6: 手動リトライで新しい id を発行すると二重登録になる)
    */
+  /**
+   * 割当POSTの「確定した応答」判定: アプリが返した構造化JSON (ok フィールドあり) かつ 5xx でない
+   * ときだけ確定とみなす。プロキシの502や解釈不能な応答は「サーバーが処理したか不明」なので
+   * pending を保持し、同じ request_id で再送する (Codex PR1-R2 #2)
+   */
+  async function postPlacementDefinitive(body) {
+    const r = await fetch(BASE + '/api/placements', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    let j = null;
+    try { j = await r.json(); } catch { /* JSONでない = アプリ応答でない */ }
+    if (r.status >= 500 || !j || typeof j.ok !== 'boolean') {
+      throw new Error('indeterminate');   // 確定していない — 呼び出し側は pending を残す
+    }
+    j._status = r.status;
+    return j;
+  }
   let flushing = false;
   async function flushPendingPlacement() {
     const pend = LS.get('pending_place', null);
     if (!pend || flushing) return;
     flushing = true;
     try {
-      await apiPost('/api/placements', pend.body);   // 応答 (成功/業務エラー問わず) が返れば確定
+      await postPlacementDefinitive(pend.body);   // 確定応答 (成功/業務エラー) が返ったときだけ消す
       LS.set('pending_place', null);
       setOnline(true);
-    } catch { /* まだ通信不能 — pending は残す */ } finally { flushing = false; }
+    } catch { /* 未確定 — pending は残す */ } finally { flushing = false; }
   }
   async function sendPlacement({ rowId, boxId, qty, layer, expiry }) {
     await flushPendingPlacement();   // 前回の未確定分を先に片付ける
@@ -487,7 +505,7 @@
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
-          const j = await apiPost('/api/placements', body);
+          const j = await postPlacementDefinitive(body);
           LS.set('pending_place', null);
           setOnline(true);
           return j;

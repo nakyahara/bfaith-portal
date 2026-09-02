@@ -260,6 +260,13 @@ export function createTables(d = getDB()) {
     );
   `);
 
+  // 列追加のマイグレーション (CREATE IF NOT EXISTS は既存表を変えない —
+  // [[feedback_schema_change_needs_migration_and_real_test]])。冪等
+  const placementCols = new Set(d.prepare('PRAGMA table_info(fbx_placements)').all().map((c) => c.name));
+  if (!placementCols.has('request_hash')) {
+    d.exec('ALTER TABLE fbx_placements ADD COLUMN request_hash TEXT');
+  }
+
   // 資材の初期値 (管理画面で編集可能にするのは後続PR。tare_g は現行の実測目安)
   const seeded = d.prepare('SELECT COUNT(*) c FROM fbx_box_materials').get().c;
   if (seeded === 0) {
