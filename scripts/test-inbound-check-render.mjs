@@ -223,12 +223,13 @@ console.log('\n[7] 期限の表示・詳細ボタン・完了一覧への導線 
   r = await renderWith([LINE({ expiry_managed: true, expiry_date: '2027-06', check_status: 'checked', found_qty: 106, quantity_relation: 'exact', finalized_result: 'exact' })], { filter: 'all' });
   ok(/tag exp-set">📅 2027\/06</.test(r.html), '日が無い商品は年月だけで出す');
 
-  // 詳細を開く印は .act の外 (行の縦中央)。ボタンの下だと親指が届かない
+  // 詳細を開く印はタグ行の右端 (行の中)。別枠の縦書きだと場所が遠かった
   r = await renderWith([LINE()]);
-  ok(/<div class="chev-line">詳細▼<\/div>/.test(r.html), '詳細▼ が行に出る');
-  ok(/<\/button><\/div><div class="chev-line">/.test(r.html), '詳細▼ はボタン群 (.act) を閉じた外側に置く');
+  ok(/<button type="button" class="chev-line" data-act="detail">詳細▼<\/button>/.test(r.html), '詳細▼ が行に出る (押せるボタン)');
+  ok(/<div class="tagrow"><div class="tags">[^]*?<\/div><button type="button" class="chev-line"/.test(r.html), '詳細▼ はタグ行の右端 (行の中)');
+  ok(r.html.indexOf('chev-line') < r.html.indexOf('class="act"'), '詳細▼ はボタン群 (.act) より前 = 行の中にある');
   r = await renderWith([LINE()], { open: 'AR1|1|1', mode: 'info' });
-  ok(/<div class="chev-line">詳細▲<\/div>/.test(r.html), '開いているときは 詳細▲');
+  ok(/class="chev-line" data-act="detail">詳細▲</.test(r.html), '開いているときは 詳細▲');
 
   // 伝票が終わったら一覧への導線を出す
   r = await renderWith([LINE({ check_status: 'checked', found_qty: 106, quantity_relation: 'exact', finalized_result: 'exact' })], { filter: 'all' });
