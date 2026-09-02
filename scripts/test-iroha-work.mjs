@@ -425,9 +425,19 @@ console.log('\n[13] 作業時間セッション');
 
   const s1 = startSession({ pageId: 'sess-p1', productCode: 'PROD-A', title: '商品A', worker: worker1, deviceLabel: 'test' });
   ok(s1.ok === true && s1.startedAt, '開始できる');
-  ok(startSession({ pageId: 'sess-p1', worker: worker1 }).error === 'already_started', '同じカードの二重開始は拒否');
+  const again = startSession({ pageId: 'sess-p1', worker: worker1 });
+  ok(again.ok === true && again.already === true && again.sessionId === s1.sessionId,
+    '同じカードの再送は成功扱いで既存セッションを返す (応答消失からの復旧)');
   const busy = startSession({ pageId: 'sess-p2', worker: worker1 });
   ok(busy.error === 'busy' && busy.open.page_id === 'sess-p1', '別カードは busy (どのカードか返す) — 1人1件の原則');
+
+  // 「活動中1件」は DB 制約でも守られている (アプリを迂回した INSERT が弾かれる)
+  let uniqErr = null;
+  try {
+    getDB().prepare(`INSERT INTO f_iroha_work_sessions (page_id, worker_id, worker_name, started_at)
+      VALUES ('sess-px', ?, 'x', ?)`).run(worker1.id, new Date().toISOString());
+  } catch (e) { uniqErr = e; }
+  ok(uniqErr && /UNIQUE/i.test(uniqErr.message), '部分ユニーク索引が二重の活動中セッションを拒否');
 
   const s2 = startSession({ pageId: 'sess-p1', productCode: 'PROD-A', title: '商品A', worker: worker2 });
   ok(s2.ok === true, '別の人は同じカードに参加できる (複数人=複数行)');
@@ -435,10 +445,16 @@ console.log('\n[13] 作業時間セッション');
 
   const st1 = stopSession({ pageId: 'sess-p1', workerId: worker1.id, reason: 'done' });
   ok(st1.ok === true && st1.session.raw_seconds >= 0 && st1.remainingActive === 1, '終了 (raw_seconds はサーバー計算・残り1名)');
-  ok(stopSession({ pageId: 'sess-p1', workerId: worker1.id, reason: 'done' }).error === 'not_started', '開始していない人の終了は拒否');
+  const w3 = addIrohaWorker({ displayName: 'いとう', workerType: 'member', actor: 'test' });
+  ok(stopSession({ pageId: 'sess-p1', workerId: w3.id, reason: 'done' }).error === 'not_started', '開始していない人の終了は拒否');
   ok(stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'bogus' }).error === 'bad_request', '不正な理由は拒否');
   const st2 = stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'pause' });
   ok(st2.ok === true && st2.remainingActive === 0, '中断で全員離脱 (remainingActive=0 → 画面が「中断にする?」を出す)');
+  const st2again = stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'pause' });
+  ok(st2again.ok === true && st2again.already === true && st2again.session.id === st2.session.id,
+    '終了の再送 (同じ理由・2分以内) は成功扱い — 冪等');
+  ok(stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'done' }).error === 'not_started',
+    '理由が違う再送は冪等扱いしない');
 
   // 実測の集計: カード単位の合計を商品ごとに平均。voided は外す
   const db2 = getDB();
@@ -460,6 +476,17 @@ console.log('\n[13] 作業時間セッション');
   ok((activeSessionsByPage().get('est-p3') || []).length === 0, '取り消したら活動中から消える');
   const rows = listSessionsForAdmin(10);
   ok(rows.length > 0 && typeof rows[0].elapsed_seconds === 'number', '管理画面用一覧 (経過秒つき)');
+
+  // 活動中は件数制限に埋もれない (終了忘れの導線を失わない)
+  const oldOpen = startSession({ pageId: 'old-open', productCode: 'X', title: '古い作業中', worker: worker2 });
+  const insClosed = getDB().prepare(`INSERT INTO f_iroha_work_sessions
+    (page_id, product_code, worker_id, worker_name, started_at, ended_at, end_reason, raw_seconds)
+    VALUES (?, 'X', 99, 'x', ?, ?, 'done', 60)`);
+  for (let i = 0; i < 15; i++) insClosed.run('bulk-' + i, new Date().toISOString(), new Date().toISOString());
+  const rows2 = listSessionsForAdmin(10);
+  ok(oldOpen.ok && rows2.some(r => r.page_id === 'old-open' && !r.ended_at),
+    '終了済みが増えても活動中セッションは管理一覧に必ず出る');
+  stopSession({ pageId: 'old-open', workerId: worker2.id, reason: 'done' });
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

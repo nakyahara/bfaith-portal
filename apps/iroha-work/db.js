@@ -114,7 +114,6 @@ export function createTables(db = getMirrorDB()) {
       void_reason    TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_iroha_sessions_page ON f_iroha_work_sessions(page_id, id);
-    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_open ON f_iroha_work_sessions(worker_id) WHERE ended_at IS NULL;
 
     -- 端末 (iPad)。inbound-check と同じ方式 (トークンはハッシュのみ保存)
     CREATE TABLE IF NOT EXISTS f_iroha_app_devices (
@@ -146,6 +145,19 @@ export function createTables(db = getMirrorDB()) {
       ok INTEGER NOT NULL CHECK (ok IN (0,1))
     );
   `);
+
+  // 「1作業者につき活動中セッション1件」は**DBの制約**で保証する (Codex PR2 #1:
+  // アプリ側のトランザクション検査だけだと、将来の別経路・移行コードから重複を作れる)。
+  // 部分ユニークを張る前に、万一の既存重複 (最新以外) を admin 終了で閉じておく
+  db.exec('DROP INDEX IF EXISTS idx_iroha_sessions_open');
+  db.prepare(`UPDATE f_iroha_work_sessions
+    SET ended_at = ?, end_reason = 'admin',
+        raw_seconds = MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER))
+    WHERE ended_at IS NULL AND id NOT IN (
+      SELECT MAX(id) FROM f_iroha_work_sessions WHERE ended_at IS NULL GROUP BY worker_id)`)
+    .run(utcNow(), utcNow());
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_sessions_open_uniq
+    ON f_iroha_work_sessions(worker_id) WHERE ended_at IS NULL`);
 }
 
 // ───────────────────────── Notion キャッシュ ─────────────────────────
@@ -335,10 +347,12 @@ export function startSession({ pageId, productCode = null, title = null, worker,
   const db = getDB();
   const now = utcNow();
   return db.transaction(() => {
-    const open = db.prepare(`SELECT id, page_id, title_snapshot FROM f_iroha_work_sessions
+    const open = db.prepare(`SELECT id, page_id, title_snapshot, started_at FROM f_iroha_work_sessions
       WHERE worker_id = ? AND ended_at IS NULL`).get(worker.id);
     if (open) {
-      if (open.page_id === pageId) return { ok: false, error: 'already_started', message: 'もうこのカードで作業をはじめています' };
+      // 同じカードなら成功扱いで既存セッションを返す (応答が消えた再送で
+      // 「実際は動いているのに開始できない」状態にしない — Codex PR2 #2)
+      if (open.page_id === pageId) return { ok: true, already: true, sessionId: open.id, startedAt: open.started_at };
       return { ok: false, error: 'busy', open,
         message: `「${open.title_snapshot || '別のカード'}」の作業がまだ終わっていません。先にそちらを終了・中断してください` };
     }
@@ -361,7 +375,20 @@ export function stopSession({ pageId, workerId, reason }) {
   return db.transaction(() => {
     const open = db.prepare(`SELECT * FROM f_iroha_work_sessions
       WHERE page_id = ? AND worker_id = ? AND ended_at IS NULL`).get(pageId, Number(workerId));
-    if (!open) return { ok: false, error: 'not_started', message: 'このカードで作業をはじめた記録がありません (画面を更新してください)' };
+    if (!open) {
+      // 応答が消えた再送への冪等対応: 直近2分以内に同じ理由で終了済みなら成功扱いで返す
+      const recent = db.prepare(`SELECT * FROM f_iroha_work_sessions
+        WHERE page_id = ? AND worker_id = ? AND ended_at IS NOT NULL AND voided_at IS NULL
+        ORDER BY id DESC LIMIT 1`).get(pageId, Number(workerId));
+      if (recent && recent.end_reason === reason && Date.parse(now) - Date.parse(recent.ended_at) < 2 * 60 * 1000) {
+        const remaining0 = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE page_id = ? AND ended_at IS NULL')
+          .get(pageId).c;
+        return { ok: true, already: true,
+          session: { id: recent.id, raw_seconds: recent.raw_seconds, started_at: recent.started_at, ended_at: recent.ended_at },
+          remainingActive: remaining0 };
+      }
+      return { ok: false, error: 'not_started', message: 'このカードで作業をはじめた記録がありません (画面を更新してください)' };
+    }
     const raw = Math.max(0, Math.floor((Date.parse(now) - Date.parse(open.started_at)) / 1000));
     db.prepare('UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = ?, raw_seconds = ? WHERE id = ?')
       .run(now, reason, raw, open.id);
@@ -409,9 +436,17 @@ export function estimateByProduct() {
   return out;
 }
 
-/** 管理画面用: 最近のセッション + 終了忘れ疑い (SESSION_WARN_HOURS 超の活動中) */
+/**
+ * 管理画面用: **活動中は全件** + 終了済みは直近 limit 件。
+ * ⚠活動中を件数制限に含めない — 6時間超の終了忘れが新しい記録に押し流されて
+ *   「取り消す唯一の導線」ごと見えなくなる (Codex PR2 #3)
+ */
 export function listSessionsForAdmin(limit = 50) {
-  const rows = getDB().prepare(`SELECT * FROM f_iroha_work_sessions ORDER BY id DESC LIMIT ?`).all(Number(limit) || 50);
+  const db = getDB();
+  const open = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE ended_at IS NULL ORDER BY started_at').all();
+  const closed = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE ended_at IS NOT NULL ORDER BY id DESC LIMIT ?')
+    .all(Number(limit) || 50);
+  const rows = [...open, ...closed];
   const now = Date.now();
   for (const r of rows) {
     r.elapsed_seconds = r.ended_at ? r.raw_seconds : Math.max(0, Math.floor((now - Date.parse(r.started_at)) / 1000));

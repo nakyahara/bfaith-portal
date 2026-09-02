@@ -233,6 +233,9 @@ let state = { cards: [], statuses: [], workers: [], refresh: {}, me: {} };
 let curTab = 'all';
 let curDetail = null;      // 開いている詳細の page_id
 let worker = null;         // { id, display_name, worker_type }
+// タイマーはサーバー時刻基準 (iPadの時計を信じない)。/api/state の serverNow とのオフセットで補正
+let clockOffset = 0;
+const nowMs = () => Date.now() + clockOffset;
 
 // ─── 通知まわり (Codex R2 ①: エラーは押すまで消えない・成功はトースト) ───
 function showErr(msg, sub) {
@@ -287,6 +290,7 @@ async function loadState() {
   }
   if (!j.ok) { showErr(j.message || '読み込みに失敗しました'); return; }
   state = j;
+  if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
   renderSync();
   renderTabs();
   renderList();
@@ -498,7 +502,7 @@ function myActiveOf(c) {
 }
 function workCardHtml(c) {
   const chips = c.active.map(a => {
-    const el = (Date.now() - Date.parse(a.started_at)) / 1000;
+    const el = (nowMs() - Date.parse(a.started_at)) / 1000;
     return '<span class="wchip">' + esc(a.worker_name) + ' さん (' + fmtDur(el) + ')</span>';
   }).join('');
   const mine = myActiveOf(c);
@@ -529,7 +533,7 @@ function startTimerTick(c) {
   const el = document.getElementById('wt');
   if (!el) return;
   const start = Date.parse(el.dataset.start);
-  const p = () => { el.textContent = fmtClock((Date.now() - start) / 1000); };
+  const p = () => { el.textContent = fmtClock((nowMs() - start) / 1000); };
   p();
   tickId = setInterval(p, 1000);
 }
@@ -552,13 +556,17 @@ async function startWork() {
     showErr(j.message || '作業をはじめられませんでした');
     return;
   }
+  if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
   const c = state.cards.find(x => x.page_id === curDetail);
   if (c) {
     if (j.status) c.status = j.status;
-    c.active.push({ worker_id: worker.id, worker_name: worker.display_name, started_at: j.startedAt });
+    if (!c.active.some(a => a.worker_id === worker.id)) {
+      c.active.push({ worker_id: worker.id, worker_name: worker.display_name, started_at: j.startedAt });
+    }
     renderTabs(); renderList(); renderDetail(c);
   }
-  toast('作業をはじめました' + (j.status === '作業中' ? ' (Notionも「作業中」にしました)' : ''));
+  toast(j.already ? '作業中にもどりました (開始済みでした)'
+    : '作業をはじめました' + (j.status === '作業中' ? ' (Notionも「作業中」にしました)' : ''));
 }
 
 async function stopWork(reason) {
@@ -583,9 +591,14 @@ async function stopWork(reason) {
     c.active = c.active.filter(a => a.worker_id !== worker.id);
     renderList(); renderDetail(c);
   }
+  // ⑤ステータスとの連動は自動にしない: 人が選んで変える。促すのは**全員が離れたとき**だけ
+  //   (だれかが作業中のまま棚入完了を促すと、早まって完了にしてしまう — Codex PR2 #4)
+  if (j.remainingActive > 0) {
+    toast('作業時間 ' + fmtDur(j.session.raw_seconds) + ' を記録しました (' + j.remainingActive + '名がまだ作業中)');
+    return;
+  }
   toast('おつかれさまでした! 作業時間 ' + fmtDur(j.session.raw_seconds) + ' を記録しました');
-  // ⑤ステータスとの連動は自動にしない: 全員が離れた中断・できあがりは人が選んで変える
-  if (reason === 'pause' && j.remainingActive === 0) {
+  if (reason === 'pause') {
     openSt(null, pid);
     const m = document.getElementById('stMsg');
     if (m) m.textContent = 'みんな作業から離れました。つづきが後になるなら「中断」を選んでください';

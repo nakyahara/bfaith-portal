@@ -172,6 +172,8 @@ router.get('/api/state', api(async (req, res) => {
     ...list,
     workers: listIrohaWorkers(),
     refresh,
+    // タイマー表示の基準 (iPad の時計を信じない — 画面はこの値とのオフセットで経過を出す)
+    serverNow: new Date().toISOString(),
     me: { session: req.iwUser || null, device: req.iwDevice ? { id: req.iwDevice.id, label: req.iwDevice.label } : null, admin: isAdmin(req) },
   });
 }));
@@ -278,6 +280,10 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const pageId = String(req.body?.page_id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
+  // 開始可否の判定に使うキャッシュの鮮度を保証してから見る (3分以内。Codex PR2 #6)。
+  // それでも「直後にNotion側で完了へ変えられた」レースは残る — 正本がNotionのv1では許容し、
+  // 巡回で表示が追いつく
+  await ensureFresh();
   const card = getCachePage(pageId);
   if (!card) return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' });
   if (card.status === '棚入完了') return res.status(409).json({ ok: false, error: 'done_card', message: 'このカードは棚入完了です (作業をはじめるなら職員がステータスを戻してください)' });
@@ -286,18 +292,24 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
     pageId, productCode: card.product_code, title: card.title,
     worker: w.worker, deviceLabel: deviceLabelOf(req),
   });
-  safeLog({ action: 'session_start', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
-    deviceLabel: deviceLabelOf(req), to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+  if (!r.already) {
+    safeLog({ action: 'session_start', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
+      deviceLabel: deviceLabelOf(req), to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+  }
   if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
 
+  // ⑤最初の開始で 未着手→作業中 (best-effort)。Notion が遅いときに現場の応答を道連れに
+  // しないよう 8 秒で見切る — 変更処理自体は裏で続き、キャッシュへは完了時に反映される
   let statusNow = card.status;
   if (card.status === '未着手') {
-    const cs = await changeStatus({ pageId, to: '作業中', expect: '未着手', isStaff: false });
-    if (cs.ok) statusNow = cs.status;
-    else if (cs.error === 'conflict' && cs.current) statusNow = cs.current;
-    // それ以外の失敗 (接続断など) は開始を成立させたまま、次の巡回・手動更新に任せる
+    const change = changeStatus({ pageId, to: '作業中', expect: '未着手', isStaff: false })
+      .catch((e) => ({ ok: false, error: 'notion_error', message: e.message }));
+    const cs = await Promise.race([change, new Promise((resolve) => setTimeout(() => resolve(null), 8000))]);
+    if (cs?.ok) statusNow = cs.status;
+    else if (cs?.error === 'conflict' && cs.current) statusNow = cs.current;
+    // タイムアウト/失敗は開始を成立させたまま、次の巡回・手動更新に任せる
   }
-  res.json({ ok: true, sessionId: r.sessionId, startedAt: r.startedAt, status: statusNow });
+  res.json({ ok: true, already: !!r.already, sessionId: r.sessionId, startedAt: r.startedAt, status: statusNow, serverNow: new Date().toISOString() });
 }));
 
 /** 作業終了 (done) / 中断 (pause)。時間はサーバー時刻の差分で確定 */
