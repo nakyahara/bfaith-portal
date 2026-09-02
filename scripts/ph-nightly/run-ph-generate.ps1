@@ -59,6 +59,18 @@ function Get-Queue {
   return $r.queue
 }
 
+# A leftover ~\.claude\.oauth_refresh.lock kills claude -p at startup ("another Claude Code process is
+# refreshing it or exited mid-refresh") before any work is done. Seen 2026-09-02: a lock created at 02:30:06
+# was never cleaned up and the run died in 6 seconds with done=0 remaining=12. The nightly task is the only
+# claude user on this machine, so any lock that exists when this script runs is stale by definition.
+$OauthLock = Join-Path $env:USERPROFILE '.claude\.oauth_refresh.lock'
+function Clear-StaleOauthLock {
+  if (Test-Path $OauthLock) {
+    try { Remove-Item $OauthLock -Recurse -Force; Log 'removed stale .oauth_refresh.lock' }
+    catch { Log ('could not remove oauth lock: ' + $_.Exception.Message) }
+  }
+}
+
 # --- preflight ------------------------------------------------------------------
 if (-not (Test-Path $Claude)) { Send-Ping 'fail' 'claude.cmd not found (npm install -g @anthropic-ai/claude-code)'; Finish 1 }
 if (-not (Test-Path $TokenFile)) { Send-Ping 'fail' 'ph-service-token.txt missing'; Finish 1 }
@@ -66,6 +78,7 @@ if (-not (Test-Path (Join-Path $Root 'bin\phq.mjs')) -or -not (Test-Path (Join-P
 
 # Auth check every night, even when there is nothing to generate: subscription OAuth can expire silently
 # and a quiet week would otherwise hide it until a busy night.
+Clear-StaleOauthLock
 $authJson = ''
 try { $authJson = (& $Claude auth status 2>$null | Out-String) } catch { $authJson = '' }
 if ($authJson -notmatch '"loggedIn"\s*:\s*true') {
@@ -85,25 +98,39 @@ if ([int]$before.claimable -eq 0 -and [int]$before.leased -eq 0) {
 # Permissions come from work\.claude\settings.json (defaultMode dontAsk; only ./phq and ./phreview).
 # ASCII, no quotes, no cmd metacharacters (& | < > ^ %). One draft at a time: lease is 30 min.
 $prompt = 'Process the product-hub generation queue. Follow the ph-generate skill in this workspace exactly: claim ONE draft at a time with ./phq, verify identity, generate, lint, review with ./phreview, then submit or block. Every claimed draft must end as done, blocked, or released. Stop when ./phq claim returns no drafts or after ' + $MaxDrafts + ' drafts. Never read the service token and never touch files outside this workspace. Finish with one line: done=N blocked=N released=N'
+# One retry, only for the transient OAuth-refresh failure: claude then dies within seconds having done
+# zero work, and its own error text says "retry in a minute". Nothing else is retried - a second full run
+# after a real (partial) failure could burn claims twice.
 $timedOut = $false
 $claudeExit = -1
-try {
-  $p = Start-Process -FilePath $Claude -WorkingDirectory $WorkDir -NoNewWindow -PassThru `
-         -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
-         -ArgumentList @('-p', ('"' + $prompt + '"'), '--output-format', 'json')
-  if (-not $p.WaitForExit($TimeoutMin * 60 * 1000)) {
-    $timedOut = $true
-    try { $p.Kill() } catch { }
-    try { $p.WaitForExit(30000) | Out-Null } catch { }
-    Log ("timeout after " + $TimeoutMin + " min - killed")
+for ($attempt = 1; $attempt -le 2; $attempt++) {
+  Clear-StaleOauthLock
+  try {
+    $p = Start-Process -FilePath $Claude -WorkingDirectory $WorkDir -NoNewWindow -PassThru `
+           -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog `
+           -ArgumentList @('-p', ('"' + $prompt + '"'), '--output-format', 'json')
+    if (-not $p.WaitForExit($TimeoutMin * 60 * 1000)) {
+      $timedOut = $true
+      try { $p.Kill() } catch { }
+      try { $p.WaitForExit(30000) | Out-Null } catch { }
+      Log ("timeout after " + $TimeoutMin + " min - killed")
+    }
+    try { $claudeExit = $p.ExitCode } catch { $claudeExit = -1 }
+  } catch {
+    Log ('failed to start claude: ' + $_.Exception.Message)
+    Send-Ping 'fail' ('failed to start claude: ' + $_.Exception.Message)
+    Finish 1
   }
-  try { $claudeExit = $p.ExitCode } catch { $claudeExit = -1 }
-} catch {
-  Log ('failed to start claude: ' + $_.Exception.Message)
-  Send-Ping 'fail' ('failed to start claude: ' + $_.Exception.Message)
-  Finish 1
+  Log ("claude exit=" + $claudeExit + " timedOut=" + $timedOut + " attempt=" + $attempt)
+  if ($timedOut -or $attempt -ge 2) { break }
+  $outText = ''
+  try { $outText = [System.IO.File]::ReadAllText($OutLog) } catch { $outText = '' }
+  if ($outText -notmatch 'Failed to refresh OAuth token') { break }
+  Log 'transient OAuth refresh failure - keeping attempt-1 logs and retrying once in 60s'
+  try { Copy-Item $OutLog ($OutLog + '.attempt1') -Force } catch { }
+  try { Copy-Item $ErrLog ($ErrLog + '.attempt1') -Force } catch { }
+  Start-Sleep -Seconds 60
 }
-Log ("claude exit=" + $claudeExit + " timedOut=" + $timedOut)
 
 # --- verify against the server ---------------------------------------------------
 Start-Sleep -Seconds 5

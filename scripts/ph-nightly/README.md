@@ -90,6 +90,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
   - `no progress` → 同じ logs の `*.err.log` (permission denied / codex 未ログイン / Amazon の HTML 構造変更)。
     `*.out.log` の `permission_denials` と Claude の最後の報告も見る。**検品ゲートが環境要因で全滅すると
     「lint は通るのに 1 件も submit できない」形で止まる** (9/1 の実例 = codex の sandbox が powershell を拒否)
+  - `no progress` + claude が数秒で終了 (`*.out.log` に `Failed to refresh OAuth token`) →
+    `~\.claude\.oauth_refresh.lock` の残骸 (9/2 の実例)。ランナーが実行前に削除 + 60 秒後に 1 回だけ再実行する。
+    それでも駄目なら bfaith で lock を消して `claude auth status` → 小さな `claude -p` で疎通を見る
   - `timeout` → 件数が多かっただけとは限らない (ハング・認証・Codex 停止も)。`*.out.log` で最後に何をしていたか見る
   - `partial` → 翌晩に続く。連日続くなら件数か時間の見直し
 - **スキルを直したい**: PR で `.claude/skills/ph-generate/SKILL.md` を変更 → miniPC で `git pull` → `install.ps1` (コピーなので再 install が要る)
