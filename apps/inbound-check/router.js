@@ -559,9 +559,23 @@ router.post('/api/lines/pending-expiry', checkOrigin, api((req, res) => {
 
 // ─── Notion へ今すぐ送る (iPad からも押せる) ───
 // 中原さん 2026-09-02:「iPadにボタンがあれば便利」。sweep は冪等 (何回押しても二重カードにならない) で
-// lease が多重実行も防ぐので、端末Cookie利用者にも開放する
+// lease が多重実行も防ぐ。端末Cookie経由は**作業者必須** (誰が押したかを actor に残す) +
+// 30秒のレート制限 (連打・端末Cookie漏えい時の外部API負荷を抑える — Codex #1116 Med-5)
+let notionSyncLastAt = 0;
 router.post('/api/notion-sync', checkOrigin, api(async (req, res) => {
-  const actor = req.icDevice ? `device:${req.icDevice.label}` : (req.session?.email || 'ipad');
+  let actor;
+  if (req.icDevice) {
+    const w = resolveWorker(req);
+    if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+    actor = `device:${req.icDevice.label}/${w.worker}`;
+  } else {
+    actor = req.session?.email || 'portal';
+  }
+  const now = Date.now();
+  if (now - notionSyncLastAt < 30_000) {
+    return res.status(429).json({ ok: false, error: 'rate_limited', message: '少し待ってからもう一度押してください (30秒に1回まで)' });
+  }
+  notionSyncLastAt = now;
   const r = await runNotionSweep({ actor, mode: 'full' });
   res.status(r.ok ? 200 : (r.error === 'already_running' ? 409 : 502)).json(r);
 }));

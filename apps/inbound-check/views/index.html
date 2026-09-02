@@ -779,16 +779,40 @@
         + '</select>';
     }
 
+    // ⭐保存は**行ごとに直列化**する (Codex #1116 High-1)。年→月→日と素早く選ぶと保存POSTが
+    //   並行し、順序が入れ替わると「日」が消えることがある。前の保存を待ってから次を送る
+    const peQueue = new Map();   // line_key → Promise (直列化)
+    const peState = new Map();   // line_key → 'saving' | 'error' (確認ボタンのガードに使う)
+
+    function savePendingExpiry(row, line) {
+      const key = line.line_key;
+      const prev = peQueue.get(key) || Promise.resolve();
+      const next = prev.then(() => savePendingExpiryNow(line)).catch(() => {});
+      peQueue.set(key, next);
+      return next;
+    }
+
     /** 詳細パネルの年/月/日から有効期限を保存する (年+月が揃ったら自動保存。消すのも可) */
-    async function savePendingExpiry(row, line) {
+    async function savePendingExpiryNow(line) {
       if (!hasWorker()) { openWorkerPick(); return; }
+      // 再描画されていることがあるので、行要素は毎回引き直す
+      const row = [...document.querySelectorAll('.row')].find(r => r.getAttribute('data-key') === line.line_key);
+      if (!row) return;
       const g = k => { const el = row.querySelector('[data-pe="' + k + '"]'); return el && el.value ? el.value : null; };
-      const y = g('y'), m = g('m'), d = g('d');
+      const y = g('y'), m = g('m');
+      let d = g('d');
+      // 月を変えて存在しない日が残っていたら (1/31→2月など) 日を未選択に戻してから保存 (Codex Low-6)
+      if (d && y && m && Number(d) > daysInMonth(Number(y), Number(m))) {
+        d = null;
+        const ds = row.querySelector('[data-pe="d"]');
+        if (ds) ds.value = '';
+      }
       const msgEl = row.querySelector('[data-pemsg]');
       const setMsg = (cls, t) => { if (msgEl) { msgEl.className = 'pemsg ' + (cls || ''); msgEl.textContent = t; } };
       let expiry = null;
       if (y && m) expiry = y + '-' + String(m).padStart(2, '0') + (d ? '-' + String(d).padStart(2, '0') : '');
       else if (y || m || d) { setMsg('', '年と月を選ぶと保存されます'); return; }
+      peState.set(line.line_key, 'saving');
       setMsg('', '保存中…');
       try {
         const r = await fetch(API + '/lines/pending-expiry', {
@@ -798,15 +822,18 @@
         const j = await r.json().catch(() => ({}));
         if (r.status === 401) { location.href = '/login'; return; }
         if (!j.ok) {
+          peState.set(line.line_key, 'error');
           setMsg('err', j.message || j.error || '保存できませんでした');
           if (j.error === 'worker_required') openWorkerPick();
-          if (j.error === 'stale_batch') { lastJson = ''; load(); }
+          if (j.error === 'stale_batch' || j.error === 'stale_work_date') { lastJson = ''; load(); }
           return;
         }
+        peState.delete(line.line_key);
         line.pending_expiry = j.pending_expiry;
         lastJson = '';
         render(true);   // タグ (📅 入力済) と「日」の選択肢を更新する。パネルは開いたまま
       } catch (e) {
+        peState.set(line.line_key, 'error');
         setMsg('err', '送信できませんでした (' + e.message + ')');
       }
     }
@@ -953,8 +980,8 @@
       return true;
     }
 
-    /** 数を足す / 打ち消す / 訂正する */
-    async function sendQuantity(line, events, packQty) {
+    /** 数を足す / 打ち消す / 訂正する。onOk = 保存成功時だけ行う後処理 (ドラフトのクリア等) */
+    async function sendQuantity(line, events, packQty, onOk) {
       if (!guardLine(line)) return;
       const key = line.line_key;
       sending.set(key, { kind: 'sending' });
@@ -969,6 +996,7 @@
         sending.delete(key);
         if (res.json.ok) {
           applyQtyState(line, res.json.state);
+          if (onOk) onOk();             // 成功したときだけドラフトを消す (失敗時は打ち直させない)
           qhist.delete(key);            // 履歴は開き直したときに取り直す
           if (openMode.get(key) === 'qty') loadHist(key);
           banner(null);
@@ -978,7 +1006,7 @@
         }
       } catch (e) {
         // 3回とも届かなかった。**数字は動かさない** = 画面が嘘をつかない。同じIDで押し直せる
-        sending.set(key, { kind: 'error', msg: '送れませんでした。この操作はまだ記録されていません', retry: { kind: 'qty', events, packQty } });
+        sending.set(key, { kind: 'error', msg: '送れませんでした。この操作はまだ記録されていません', retry: { kind: 'qty', events, packQty, onOk } });
       } finally {
         if (!sending.has(key) || sending.get(key).kind !== 'sending') { recount(); render(true); }
         if (reload) { lastJson = ''; await load(); }
@@ -988,6 +1016,10 @@
     /** 確定 (全部あり / 残りも全部あり / 確認 / 不足で確定 / 超過で確定) */
     async function doFinalize(line, opts, choice, ids) {
       if (!guardLine(line)) return;
+      // ⭐期限の保存が終わる前に確認すると、古い期限で確定してしまう (Codex #1116 High-1)。
+      //   保存中は少し待ってもらい、失敗したままなら入れ直してもらう
+      if (peState.get(line.line_key) === 'saving') { banner('warn', '有効期限を保存しています。1〜2秒待ってからもう一度押してください'); return; }
+      if (peState.get(line.line_key) === 'error') { banner('warn', '有効期限の保存に失敗しています。詳細パネルで入れ直してから確認してください'); return; }
       // 行き先・ラベル・入数・有効期限が決まっていなければ先に聞く (サーバーも同じ判定をする)。
       // ⭐有効期限は詳細パネルで先入力 (pending) してあれば聞かない
       const needAsk = (line.dest ? line.dest.missing : []).filter(m => !(m === 'expiry' && line.pending_expiry));
@@ -1371,7 +1403,7 @@
       const r = s.retry;
       sending.delete(line.line_key);
       // ⭐同じ冪等IDで送り直す。サーバーに既に入っていれば replayed で返り、二重加算にならない
-      if (r.kind === 'qty') sendQuantity(line, r.events, r.packQty);
+      if (r.kind === 'qty') sendQuantity(line, r.events, r.packQty, r.onOk);
       else if (r.kind === 'fin') doFinalize(line, r.opts, r.choice, r.ids);
       else if (r.kind === 'reopen') doReopen(line, r.ids);
     }
@@ -1429,14 +1461,23 @@
         if (c.total <= 0) return qmsg(row, '箱数かバラを入れてください');
         const events = c.units.map(u => boxEvent(u.qty, u.pack));
         if (c.looseQty > 0) events.push({ client_event_id: newId(), action: 'add', quantity: c.looseQty, input_kind: 'loose', client_occurred_at: nowIso() });
-        qdrafts.set(line.line_key, {
-          pack: c.units[0] ? String(c.units[0].pack) : (Number(d0.pack) > 0 ? String(d0.pack) : ''),
+        // ⭐入力は**保存に成功してから**消す (Codex Med-2: 失敗したのに複数行の打ち直しになるのを防ぐ)。
+        //   次回の既定入数は「最後に入力した行」の入数 (Codex Low-7 の意味を固定)
+        const lastPack = c.units.length ? c.units[c.units.length - 1].pack : null;
+        const clearDraft = () => qdrafts.set(line.line_key, {
+          pack: lastPack ? String(lastPack) : (Number(d0.pack) > 0 ? String(d0.pack) : ''),
           boxes: '', loose: '', extra: [],
         });
-        sendQuantity(line, events, c.units[0] ? c.units[0].pack : null);
+        sendQuantity(line, events, lastPack, clearDraft);
         return;
       }
-      if (act === 'qrowadd') { qdraft(line).extra.push({ pack: '', boxes: '' }); render(true); return; }
+      if (act === 'qrowadd') {
+        // サーバーは1回の送信で最大10イベント (箱の行 + バラ)。超えないよう箱は9行まで (Codex Med-2)
+        if (1 + qdraft(line).extra.length >= 9) return qmsg(row, '一度に入れられる箱の行は9行までです。いったん「この分を足す」で保存してから続けてください');
+        qdraft(line).extra.push({ pack: '', boxes: '' });
+        render(true);
+        return;
+      }
       if (act === 'qrowdel') { qdraft(line).extra.splice(Number(a.getAttribute('data-qi')), 1); render(true); return; }
       if (act === 'qclear') {
         qdrafts.delete(line.line_key);
@@ -1629,10 +1670,14 @@
       b.disabled = true;
       b.textContent = '送信中…';
       try {
-        const r = await fetch(API + '/notion-sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        const r = await fetch(API + '/notion-sync', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ worker_code: workerCode() || undefined }),
+        });
         const j = await r.json().catch(() => ({}));
         if (r.status === 401) { location.href = '/login'; return; }
         if (j.ok) banner('ok', '🗂 Notionへ送りました: ' + esc(j.note || '完了'));
+        else if (j.error === 'worker_required') { openWorkerPick(); banner('warn', '作業者を選んでからもう一度押してください'); }
         else banner('err', '🗂 送信できませんでした: ' + esc(j.note || j.message || j.error || ('HTTP ' + r.status)));
         setTimeout(() => { if ($('#banner').classList.contains('ok')) banner(null); }, 6000);
       } catch (e) {
