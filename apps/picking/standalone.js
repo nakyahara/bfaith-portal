@@ -37,7 +37,7 @@ import { fileURLToPath } from 'url';
 import pickingRouter from './router.js';
 import pickingIngestRouter from './ingest-router.js';
 import { getDB as getPickingDB } from './db.js';
-import { handleLineWebhook } from './notify.js';
+import { handleLineWebhook, shortageLineEnabled } from './notify.js';
 import { processLineEvents } from './line-search.js';
 // 画像解決 (images.js) が読む warehouse-mirror.db は明示 init が必要
 // (portal では server.js が init している。忘れると getMirrorDB() が throw し、
@@ -240,6 +240,9 @@ app.get('/', (req, res) => res.redirect('/apps/picking/'));
 const HOST = process.env.PICKING_HOST || '127.0.0.1';
 const server = app.listen(PORT, HOST, () => {
   bootLog(`picking standalone listening on http://${HOST}:${PORT} (DATA_DIR=${DATA_DIR})`);
+  // 欠品通知の経路を起動時に明示する。LINE は従量課金なので「いま送っているか」を
+  // ログから即断できるようにしておく (2026-09-02: 止めたつもりが送り続けていた再発防止)
+  bootLog(`[picking-notify] 欠品通知の送信先: GChat=${process.env.PICKING_ALERT_WEBHOOK ? 'ON' : 'OFF (PICKING_ALERT_WEBHOOK 未設定)'} / LINE=${shortageLineEnabled() ? 'ON ⚠️従量課金' : 'OFF (既定)'}`);
   startDrivePoller();
   if (startPackingPoller) startPackingPoller();   // 納品書CSVの自動取込 (packing 有効時のみ)
 });
