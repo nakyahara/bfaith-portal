@@ -13,7 +13,7 @@
  */
 import cron from 'node-cron';
 import { runScheduledFetch, runScheduledMasterFetch } from './drive-fetch.js';
-import { runNotionSweep } from './notion-sync.js';
+import { runNotionSweep, clearLeaseOnBoot } from './notion-sync.js';
 import { isRender } from '../../lib/is-render.js';
 
 const OFF = new Set(['false', '0', 'off', 'no']);
@@ -94,6 +94,8 @@ export function startInboundCheckNotionCron() {
     console.log('[inbound-check] notion cron skipped (非Render環境。動かすなら INBOUND_CHECK_NOTION_ENABLED=true)');
     return null;
   }
+  // デプロイ再起動が sweep を直撃して残った lease を掃除 (単一インスタンス前提)
+  clearLeaseOnBoot();
   const expr = (process.env.INBOUND_CHECK_NOTION_CRON || NOTION_DEFAULT_CRON).trim();
   if (!cron.validate(expr)) {
     console.error(`[inbound-check] notion cron 式が不正です: ${expr} (既定 ${NOTION_DEFAULT_CRON} を使います)`);
