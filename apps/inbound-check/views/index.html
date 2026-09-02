@@ -1678,6 +1678,7 @@
         if (r.status === 401) { location.href = '/login'; return; }
         if (j.ok) banner('ok', '🗂 Notionへ送りました: ' + esc(j.note || '完了'));
         else if (j.error === 'worker_required') { openWorkerPick(); banner('warn', '作業者を選んでからもう一度押してください'); }
+        else if (j.error === 'rate_limited' || j.error === 'already_running') banner('warn', '⏱ ' + esc(j.message || '実行中です。少し待ってください'));
         else banner('err', '🗂 送信できませんでした: ' + esc(j.note || j.message || j.error || ('HTTP ' + r.status)));
         setTimeout(() => { if ($('#banner').classList.contains('ok')) banner(null); }, 6000);
       } catch (e) {
