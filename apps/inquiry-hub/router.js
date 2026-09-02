@@ -2100,6 +2100,9 @@ router.get('/compose', (req, res) => {
     });
     tplSel.value = cur;
     if (tplSel.selectedIndex < 0) tplSel.value = '';
+    // 絞り込みで選択中のテンプレが外れたら、プレビューも同期する (古いプレビューが
+    // 残ると「選んだつもり」で次へ進んでしまう)
+    if (tplSel.value !== cur) syncTplPrev();
   }
   tplSearch.addEventListener('input', fillTplSel);
   // テンプレートは件数が多いので本文ごと埋め込まず、返信画面と同じ /api/templates から取る
@@ -2116,11 +2119,12 @@ router.get('/compose', (req, res) => {
     el.textContent = text || '';
     el.hidden = !text;
   }
-  tplSel.addEventListener('change', function() {
+  function syncTplPrev() {
     var t = (TPLS || []).find(function(x) { return String(x.id) === tplSel.value; });
     showPreview(document.getElementById('tplPrev'),
       t ? ((t.subject ? '件名: ' + t.subject + '\\n\\n' : '') + t.body + (t.bodyBottom ? '\\n\\n' + t.bodyBottom : '')) : '');
-  });
+  }
+  tplSel.addEventListener('change', syncTplPrev);
   function syncSigPrev() {
     var s = SIGS.find(function(x) { return String(x.id) === sigSel.value; });
     showPreview(document.getElementById('sigPrev'), s ? s.body : '');
