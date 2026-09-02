@@ -33,6 +33,7 @@ const { getDB } = await import('../apps/inbound-check/db.js');
 const {
   parseWorkMasterXlsx, compareIrohaFlags, applyWorkMaster, seedIrohaFlags,
   workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow, logWorkMasterImport,
+  importIssueCount,
 } = await import('../apps/inbound-check/work-master.js');
 const { buildCardProperties, calcExternal } = await import('../apps/inbound-check/notion-sync.js');
 const { addManual } = await import('../apps/inbound-info/db.js');
@@ -71,6 +72,7 @@ async function buildXlsx() {
   put(['PROD-6', '商品6', '', '', '1', '', '', '', '', '', '', '', '', '', '']);
   put(['PROD-7', '商品7', '', '', '0', '', '', '', '', '', '', '', '', '', '']);
   put(['PROD-8', '商品8(廃番)', '', '', '1', '', '', '', '', '', '', '', '', '', '']);
+  put([1234, '数値セル商品', '', '', '1', '', '', '', '', '', '', '', '', '', '']);   // 商品コードが数値セル → 検証エラー
   put(['', '', '', '', '', '', '', '', '', '', '', '', '', '', '']);                 // 全空行 → 無視
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
@@ -87,6 +89,9 @@ const parsed = await parseWorkMasterXlsx(buf);
   ok(parsed.issues.duplicates.length === 1, '重複コード (大文字小文字違い) は先勝ちで記録');
   ok(parsed.issues.badFlg.length === 1 && parsed.rows.find(r => r.code === 'PROD-3').flg === null, 'FLG 不正は未記入扱い + 記録');
   ok(parsed.issues.badUnits.length === 1 && parsed.rows.find(r => r.code === 'PROD-4').units === null, '入数不正は null + 記録');
+  ok(parsed.issues.numericCode.length === 1 && !parsed.rows.some(r => r.code === '1234'),
+    '数値セルの商品コードは検証エラーにして行を除外 (先頭ゼロ喪失の防止)');
+  ok(importIssueCount(parsed.issues) === 4, `検証エラー合計 4 → 本取込は拒否される (実際 ${importIssueCount(parsed.issues)})`);
 }
 
 console.log('\n[2] FLG × f_inbound_info の突合');
@@ -122,6 +127,7 @@ console.log('\n[4] seedIrohaFlags (未設定の SKU だけに書く)');
   ok(s.seeded === 4, `書き込み 4 件 (実際 ${s.seeded})`);      // PROD-1,2,4,5 (PROD-8 は mirror に無い)
   ok(s.added === 3, `行の新規作成 3 件 (PROD-1,4,5。実際 ${s.added})`);
   ok(s.notInMaster === 1, 'PROD-8 は商品マスタに無く見送り');
+  ok(Array.isArray(s.errorDetails) && s.errors === 0, '失敗の内訳 (errorDetails) を返す (今回は0件)');
   const v = (k) => db.prepare('SELECT いろは在庫化作業有無 AS i, 入庫時BCシール貼りフラグ AS bc FROM f_inbound_info WHERE code_key = ?').get(k);
   ok(v('prod-1')?.i === '有り', 'PROD-1 (FLG=1) → 有り');
   ok(v('prod-1')?.bc === '－', '有り の連動ルール (BCシール等=－) が効いている (updateInbound 経由の証拠)');

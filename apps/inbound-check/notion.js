@@ -119,7 +119,13 @@ export async function ensureCardSchema({ force = false } = {}) {
   if (!names.has(DEDUPE_PROP)) add[DEDUPE_PROP] = { rich_text: {} };
   if (!names.has('destination_id')) add['destination_id'] = { number: {} };
   if (!names.has('有効期限')) add['有効期限'] = { rich_text: {} };
-  if (!names.has('工程数')) add['工程数'] = { number: {} };   // いろは作業仕様マスタ (f_iroha_work_master) 由来
+  // いろは作業仕様マスタ (f_iroha_work_master) 由来の項目も、無ければ作る (Codex PR2 #5:
+  // names に無いと黙って送られず、新しい環境で一部欠落したまま正常終了してしまう)
+  if (!names.has('工程数')) add['工程数'] = { number: {} };
+  if (!names.has('資材セットID')) add['資材セットID'] = { rich_text: {} };
+  if (!names.has('収納容器')) add['収納容器'] = { rich_text: {} };
+  if (!names.has('入数')) add['入数'] = { number: {} };
+  if (!names.has('備考')) add['備考'] = { rich_text: {} };
   if (Object.keys(add).length > 0) {
     await notionRequest(`/databases/${dbId}`, 'PATCH', { properties: add });
     for (const [k, v] of Object.entries(add)) { names.add(k); types.set(k, Object.keys(v)[0]); }

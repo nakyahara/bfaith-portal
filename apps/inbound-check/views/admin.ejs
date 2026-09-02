@@ -196,9 +196,12 @@
       <h2>🧰 いろは作業仕様マスタ (資材・収納容器・入数・工程数)</h2>
       <p class="hint">
         旧スプレッドシート「作業内容管理マスター」の置き換えです。Notion 作業カードの
-        資材セットID・収納容器・入数 (いろはで1容器に詰める数)・工程数・備考 はここから載ります。<br>
+        資材セットID・収納容器・入数 (いろはで1容器に詰める数)・工程数・備考 は<b>カード作成時に</b>ここから載ります
+        (作成時スナップショット — 後からマスタを変えても既存カードは変わりません。直すなら Notion 側で)。<br>
         取込は xlsx をそのままアップロード → まず<b>「検証する」</b> (何も書き込みません)。内容と
-        「在庫化必要FLG × 入庫情報 (いろは有無)」の突合を確認してから「本取込」を押してください。
+        「在庫化必要FLG × 入庫情報 (いろは有無)」の突合を確認してから「本取込」を押してください。<br>
+        ⚠ 本取込は<b>マスタ全体を xlsx の内容で置き換えます</b> (この画面での個別編集より取込が正)。
+        検証エラー (数値でない入数・重複コード・数値セルの商品コード等) が1件でもあると本取込はできません。
       </p>
       <p>登録 <b><%= workMaster && workMaster.total != null ? workMaster.total : '-' %></b> 件
         (作業仕様の入力あり <%= workMaster ? workMaster.filled : '-' %> 件)
@@ -525,18 +528,26 @@
     const WM_BUCKETS = {
       old1_yes: '旧FLG=1 / 現行=有り (一致)', old1_no: '旧FLG=1 / 現行=無し (⚠食い違い)', old1_dep: '旧FLG=1 / 現行=状況による',
       old0_yes: '旧FLG=0 / 現行=有り (⚠食い違い)', old0_no: '旧FLG=0 / 現行=無し (一致)', old0_dep: '旧FLG=0 / 現行=状況による',
-      cur_unset: '現行が未設定 (→書き込み候補)', flg_blank: '旧FLGが未記入', not_in_mirror: '商品マスタに無い (廃番等)',
+      cur_unset: '現行が未設定 (→書き込み候補)', flg_blank: '旧FLGが未記入',
+      not_in_mirror: '商品マスタに無い (廃番等) ※補助集計 — 他の区分と重複して数えます',
     };
     function wmRenderReport(j) {
       const issue = j.issues || {};
-      const issueLine = [['duplicates','重複コード'],['badFlg','FLG不正'],['badUnits','入数不正'],['badProcess','工程数不正']]
+      const issueLine = [['duplicates','重複コード'],['badFlg','FLG不正'],['badUnits','入数不正'],['badProcess','工程数不正'],['numericCode','商品コードが数値セル (先頭ゼロが消えるため文字列形式に直す)']]
         .map(([k, l]) => (issue[k] || []).length ? l + ' ' + issue[k].length : null).filter(Boolean).join(' / ');
       let html = '<p>' + (j.dryRun ? '🔍 検証結果 (まだ何も書き込んでいません)' : '💾 取込結果')
         + ': データ ' + j.dataRows + ' 行 → 有効 ' + j.rowCount + ' 行'
         + (issue.emptyCode ? ' ・ コード空 ' + issue.emptyCode : '') + (issueLine ? ' ・ ⚠ ' + issueLine : '') + '</p>';
       if (j.applied) html += '<p>マスタ書込: 新規 ' + j.applied.inserted + ' / 更新 ' + j.applied.updated + ' / 変化なし ' + j.applied.unchanged + '</p>';
-      if (j.seeded) html += '<p>いろは有無の書込: <b>' + j.seeded.seeded + '</b> 件 (入庫情報に行を新規作成 ' + j.seeded.added
-        + ' / 商品マスタに無く見送り ' + j.seeded.notInMaster + ' / 既に値があり触らず ' + j.seeded.skipped + ' / 失敗 ' + j.seeded.errors + ')</p>';
+      if (j.seeded) {
+        html += '<p>いろは有無の書込: <b>' + j.seeded.seeded + '</b> 件 (入庫情報に行を新規作成 ' + j.seeded.added
+          + ' / 商品マスタに無く見送り ' + j.seeded.notInMaster + ' / 既に値があり触らず ' + j.seeded.skipped + ' / 失敗 ' + j.seeded.errors + ')</p>';
+        if ((j.seeded.errorDetails || []).length) {
+          html += '<p class="hint"><b class="ng">⚠ 書込に失敗した SKU</b> (もう一度取り込むか個別に確認):</p>'
+            + '<table class="ic-list"><tbody>' + j.seeded.errorDetails.map(d =>
+              '<tr><td>' + esc(d.code) + '</td><td>' + esc(d.reason) + '</td></tr>').join('') + '</tbody></table>';
+        }
+      }
       html += '<p><b>在庫化必要FLG × 入庫情報 (いろは有無) の突合</b> — 書き込み候補 ' + j.seedableCount + ' 件 / ⚠食い違い ' + j.mismatchCount + ' 件</p>';
       html += '<table class="ic-list"><tbody>' + Object.entries(j.buckets || {})
         .map(([k, v]) => '<tr><td>' + esc(WM_BUCKETS[k] || k) + '</td><td style="text-align:right">' + v + '</td></tr>').join('') + '</tbody></table>';
@@ -562,10 +573,22 @@
         if (apply) { fd.append('apply', '1'); if ($('#wmSeed').checked) fd.append('seed', '1'); }
         const r = await fetch(BASE + '/admin/work-master-import', { method: 'POST', body: fd });
         const j = await r.json().catch(() => ({}));
-        if (!j.ok) { msg($('#wmMsg'), false, '❌ ' + (j.message || j.error || ('HTTP ' + r.status))); return; }
+        if (!j.ok) {
+          if (j.buckets) wmRenderReport(j);   // 本取込拒否 (検証エラー) でもレポートは見せる
+          msg($('#wmMsg'), false, '❌ ' + (j.message || j.error || ('HTTP ' + r.status)));
+          return;
+        }
         wmRenderReport(j);
-        if (j.dryRun) { msg($('#wmMsg'), true, '✅ 検証しました。内容が良ければ「本取込」'); wmApply.disabled = false; }
-        else { msg($('#wmMsg'), true, '✅ 取り込みました'); setTimeout(() => location.reload(), 2500); }
+        if (j.dryRun) {
+          if (j.issueTotal > 0) msg($('#wmMsg'), false, '⚠ 検証エラー ' + j.issueTotal + ' 件 — 直すまで本取込はできません');
+          else { msg($('#wmMsg'), true, '✅ 検証しました。内容が良ければ「本取込」'); wmApply.disabled = false; }
+        } else if (j.seeded && j.seeded.errors > 0) {
+          msg($('#wmMsg'), false, '⚠ マスタは取込済み・いろは有無の書込に失敗 ' + j.seeded.errors + ' 件 (レポート参照)');
+          setTimeout(() => location.reload(), 6000);
+        } else {
+          msg($('#wmMsg'), true, '✅ 取り込みました');
+          setTimeout(() => location.reload(), 2500);
+        }
       } catch (e) {
         msg($('#wmMsg'), false, '❌ 通信できませんでした: ' + e.message);
       } finally {

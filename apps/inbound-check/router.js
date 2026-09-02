@@ -30,7 +30,7 @@ import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProd
 import { runNotionSweep, notionStatusForAdmin, resetNotionRow } from './notion-sync.js';
 import {
   parseWorkMasterXlsx, compareIrohaFlags, applyWorkMaster, seedIrohaFlags, logWorkMasterImport,
-  workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow,
+  workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow, importIssueCount,
 } from './work-master.js';
 // 入庫情報の書き込みは inbound-info の関数を通す (いろは=有り の連動ルール・楽観ロック・
 // updated_by の記録がそこに1つだけある。ここで直に UPDATE すると規則が二重管理になる)
@@ -642,12 +642,25 @@ router.post('/admin/work-master-import', requireAdmin, checkOrigin, upload.singl
   const compare = compareIrohaFlags(parsed.rows);
   const apply = String(req.body?.apply || '') === '1';
   const seed = apply && String(req.body?.seed || '') === '1';
+  const issueTotal = importIssueCount(parsed.issues);
   const out = {
     ok: true, dryRun: !apply, dataRows: parsed.dataRows, rowCount: parsed.rows.length,
-    issues: parsed.issues, buckets: compare.buckets,
+    issues: parsed.issues, issueTotal, buckets: compare.buckets,
     seedableCount: compare.seedable.length, infoOnlyCount: compare.infoOnlyCount,
     mismatchCount: compare.mismatches.length, mismatches: compare.mismatches.slice(0, 300),
   };
+  // ⭐検証エラーが1件でもあれば本取込は拒否 (Codex PR2 High-1)。
+  //   「入数 abc」等を null で取り込むと既存値 (180 等) を黙って消すため、xlsx 側を直してもらう
+  if (apply && issueTotal > 0) {
+    logWorkMasterImport({
+      actor: req.session.email, fileName: req.file.originalname, ok: false,
+      message: `検証エラー ${issueTotal} 件のため本取込を拒否`,
+    });
+    return res.status(400).json({
+      ...out, ok: false, dryRun: true, error: 'validation_failed',
+      message: `検証エラーが ${issueTotal} 件あります。xlsx を直して取り込み直してください (下のレポート参照)`,
+    });
+  }
   if (apply) {
     out.applied = applyWorkMaster(parsed.rows, { user: req.session.email });
     if (seed) out.seeded = seedIrohaFlags(compare.seedable, { user: req.session.email });

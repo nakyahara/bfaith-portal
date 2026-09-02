@@ -63,6 +63,10 @@ export async function parseWorkMasterXlsx(buffer) {
     const names = wb.worksheets.map((w) => w.name).join(' / ');
     throw new Error(`シート「${SHEET_NAME}」がありません (あるシート: ${names})`);
   }
+  // 細工された xlsx (高圧縮で展開後が巨大) の暴走ガード。実ファイルは ~5,100行×15列
+  if (ws.rowCount > 50_000 || ws.columnCount > 100) {
+    throw new Error(`シートが大きすぎます (${ws.rowCount}行×${ws.columnCount}列。上限 50,000行×100列)`);
+  }
   const header = new Map();   // 列名 → 列番号
   ws.getRow(1).eachCell({ includeEmpty: false }, (c, col) => {
     const name = resolveCell(c.value).trim();
@@ -80,11 +84,20 @@ export async function parseWorkMasterXlsx(buffer) {
 
   const rows = [];
   const seen = new Map();   // codeKey → 行番号 (先勝ち)
-  const issues = { duplicates: [], badFlg: [], badUnits: [], badProcess: [], emptyCode: 0 };
+  const issues = { duplicates: [], badFlg: [], badUnits: [], badProcess: [], numericCode: [], emptyCode: 0 };
   let dataRows = 0;
   ws.eachRow((row, rn) => {
     if (rn === 1) return;
     const get = (c) => (c ? resolveCell(row.getCell(c).value).trim() : '');
+    // 商品コードが数値セルだと Excel の表示形式 (先頭ゼロ等) が失われて別SKU化する (Codex PR2 #3)。
+    // 黙って String() せず検証エラーにする — 列を文字列形式に直してから取り込み直してもらう
+    const rawCode = cols.code ? row.getCell(cols.code).value : null;
+    const rawCodeResolved = rawCode && typeof rawCode === 'object' ? rawCode.result : rawCode;
+    if (typeof rawCodeResolved === 'number') {
+      dataRows++;
+      issues.numericCode.push({ row: rn, value: String(rawCodeResolved) });
+      return;
+    }
     const code = get(cols.code);
     const flgRaw = get(cols.flg);
     const material = get(cols.material);
@@ -116,6 +129,17 @@ export async function parseWorkMasterXlsx(buffer) {
     });
   });
   return { rows, issues, dataRows };
+}
+
+/**
+ * 検証エラーの総数。1件でもあれば**本取込は拒否**する (Codex PR2 High-1)。
+ * 「入数 abc」のような不正値を null として取り込むと、既存の 180 を黙って消してしまう。
+ * dry-run のレポートで場所が分かるので、xlsx 側を直してから取り込み直してもらう
+ */
+export function importIssueCount(issues) {
+  return (issues.duplicates?.length || 0) + (issues.badFlg?.length || 0)
+    + (issues.badUnits?.length || 0) + (issues.badProcess?.length || 0)
+    + (issues.numericCode?.length || 0) + (issues.emptyCode || 0);
 }
 
 // ─── 在庫化必要FLG × f_inbound_info の突合レポート ───
@@ -212,7 +236,11 @@ export function applyWorkMaster(rows, { user = null } = {}) {
  */
 export function seedIrohaFlags(seedable, { user = null } = {}) {
   const db = getDB();
-  const counts = { seeded: 0, added: 0, notInMaster: 0, skipped: 0, errors: 0 };
+  const counts = { seeded: 0, added: 0, notInMaster: 0, skipped: 0, errors: 0, errorDetails: [] };
+  const fail = (code, reason) => {
+    counts.errors++;
+    if (counts.errorDetails.length < 20) counts.errorDetails.push({ code, reason });
+  };
   for (const r of seedable) {
     if (r.flg !== '1' && r.flg !== '0') { counts.skipped++; continue; }
     const target = r.flg === '1' ? '有り' : '無し';
@@ -222,17 +250,17 @@ export function seedIrohaFlags(seedable, { user = null } = {}) {
       const a = addManual(r.code, user);
       if (!a.ok) {
         if (a.error === 'not_in_master') { counts.notInMaster++; continue; }
-        if (a.error !== 'duplicate') { counts.errors++; continue; }
+        if (a.error !== 'duplicate') { fail(r.code, a.error); continue; }
       } else {
         counts.added++;
       }
       cur = db.prepare('SELECT code_key, いろは在庫化作業有無 AS iroha, version FROM f_inbound_info WHERE code_key = ?').get(k);
-      if (!cur) { counts.errors++; continue; }
+      if (!cur) { fail(r.code, 'row_missing_after_add'); continue; }
     }
     const curVal = cur.iroha == null ? '' : String(cur.iroha).trim();
     if (curVal !== '') { counts.skipped++; continue; }   // レポート後に人が入れた等 — 触らない
     const u = updateInbound(k, { いろは在庫化作業有無: target }, user || 'work-master取込', cur.version);
-    if (u.ok) counts.seeded++; else counts.errors++;
+    if (u.ok) counts.seeded++; else fail(r.code, u.error || 'update_failed');
   }
   return counts;
 }
