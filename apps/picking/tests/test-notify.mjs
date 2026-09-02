@@ -87,8 +87,36 @@ globalThis.fetch = async (url, opts) => {
 }
 
 {
-  // LINE broadcast (PICKING_LINE_TO 無し)
+  // 🚨 回帰テスト (2026-09-02): LINEトークンがあっても、スイッチ off なら LINE には送らない。
+  // トークンは在庫検索ボット (line-search.js) と共用のため env から消せない。
+  // 「トークンがあるから送る」に戻すと従量課金が再開する
   process.env.PICKING_LINE_CHANNEL_TOKEN = 'test-token';
+  process.env.PICKING_LINE_TO = 'Uaaa, Cbbb';
+  delete process.env.PICKING_SHORTAGE_LINE;
+  calls.length = 0;
+  const r = await notifyShortage(INFO);
+  assert.equal(r, 'disabled', 'LINEトークンだけでは通知経路にならない');
+  assert.equal(calls.length, 0, 'LINE APIを一度も叩かない');
+  console.log('  ok: LINEトークンがあってもスイッチoffなら送らない (async)');
+}
+
+{
+  // 通常運用: GChat のみ (LINEトークンは残っているがスイッチ off)
+  process.env.PICKING_ALERT_WEBHOOK = 'https://chat.example/webhook';
+  calls.length = 0;
+  const r = await notifyShortage(INFO);
+  assert.equal(r, 'sent');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://chat.example/webhook');
+  assert.ok(!calls.some((c) => c.url.includes('api.line.me')), 'LINEには送らない');
+  console.log('  ok: 通常運用はGChatのみ (async)');
+}
+
+{
+  // LINE broadcast (スイッチ on・PICKING_LINE_TO 無し)
+  process.env.PICKING_SHORTAGE_LINE = 'on';
+  delete process.env.PICKING_LINE_TO;
+  delete process.env.PICKING_ALERT_WEBHOOK;
   calls.length = 0;
   const r = await notifyShortage(INFO);
   assert.equal(r, 'sent');
@@ -96,11 +124,11 @@ globalThis.fetch = async (url, opts) => {
   assert.ok(calls[0].url.endsWith('/broadcast'));
   assert.equal(calls[0].auth, 'Bearer test-token');
   assert.equal(calls[0].body.messages[0].type, 'text');
-  console.log('  ok: LINE broadcast (宛先未指定) (async)');
+  console.log('  ok: LINE broadcast (スイッチon・宛先未指定) (async)');
 }
 
 {
-  // LINE push (宛先2件) + GChat 併用
+  // LINE push (宛先2件) + GChat 併用 (スイッチ on のとき)
   process.env.PICKING_LINE_TO = 'Uaaa, Cbbb';
   process.env.PICKING_ALERT_WEBHOOK = 'https://chat.example/webhook';
   calls.length = 0;
@@ -110,7 +138,7 @@ globalThis.fetch = async (url, opts) => {
   assert.equal(pushes.length, 2);
   assert.deepEqual(pushes.map((c) => c.body.to), ['Uaaa', 'Cbbb']);
   assert.ok(calls.some((c) => c.url === 'https://chat.example/webhook'));
-  console.log('  ok: LINE push (複数宛先) + GChat 併用 (async)');
+  console.log('  ok: LINE push (複数宛先) + GChat 併用 (スイッチon) (async)');
 }
 
 {
@@ -123,6 +151,8 @@ globalThis.fetch = async (url, opts) => {
   let threw = false;
   try { await notifyShortage(INFO); } catch { threw = true; }
   assert.ok(threw, '全経路失敗は throw (呼び出し側が warn)');
+  failUrls = new Set();
+  delete process.env.PICKING_SHORTAGE_LINE;   // 以降のテストは既定 (LINE off) に戻す
   console.log('  ok: 片方失敗はsent・全滅はthrow (async)');
 }
 
@@ -176,8 +206,9 @@ globalThis.fetch = async (url, opts) => {
     delete process.env.PICKING_LINE_TO_HOLIDAY;
     assert.deepEqual(resolveLineTo(sat).to, ['Cnormal']);
   });
-  // エンドツーエンド: notifyShortage が土曜に休日グループへpushする
+  // エンドツーエンド: notifyShortage が土曜に休日グループへpushする (LINE再開時の挙動)
   process.env.PICKING_LINE_TO_HOLIDAY = 'Choliday';
+  process.env.PICKING_SHORTAGE_LINE = 'on';
   failUrls = new Set();
   calls.length = 0;
   await notifyShortage(INFO, sat);
@@ -189,6 +220,7 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: notifyShortage: 土曜=休日ライン・平日=通常ライン (async)');
   // 後続テストへの影響を戻す
   delete process.env.PICKING_LINE_TO_HOLIDAY;
+  delete process.env.PICKING_SHORTAGE_LINE;
   process.env.PICKING_LINE_TO = 'Uaaa, Cbbb';
 }
 
@@ -423,9 +455,9 @@ globalThis.fetch = async (url, opts) => {
 {
   process.env.WAREHOUSE_URL = 'http://wh.local';
   process.env.WAREHOUSE_SERVICE_TOKEN = 'tkn';
-  process.env.PICKING_LINE_CHANNEL_TOKEN = 'test-token';
-  process.env.PICKING_LINE_TO = 'Cbbb';
-  delete process.env.PICKING_ALERT_WEBHOOK;
+  // 実運用と同じ経路 (GChatのみ) で本文を検証する
+  process.env.PICKING_ALERT_WEBHOOK = 'https://chat.example/webhook';
+  delete process.env.PICKING_SHORTAGE_LINE;
   const sent = [];
   globalThis.fetch = async (url, opts) => {
     if (String(url).startsWith('http://wh.local/service-api/logizard-stock/locations')) {
@@ -441,7 +473,7 @@ globalThis.fetch = async (url, opts) => {
     return { ok: true, status: 200, text: async () => '' };
   };
   await notifyShortage(INFO);
-  const text = sent[0].messages[0].text;
+  const text = sent[0].text;
   assert.ok(text.includes('📍 他ロケ在庫'), text);
   assert.ok(text.includes('・R1FA-001-001-01 → 200個'), text);
   // warehouse 側が落ちていても通知は出る (取得できず表示)
@@ -452,10 +484,10 @@ globalThis.fetch = async (url, opts) => {
     return { ok: true, status: 200, text: async () => '' };
   };
   await notifyShortage(INFO);
-  assert.ok(sent[0].messages[0].text.includes('他ロケ在庫: 取得できず'), sent[0].messages[0].text);
+  assert.ok(sent[0].text.includes('他ロケ在庫: 取得できず'), sent[0].text);
   delete process.env.WAREHOUSE_URL;
   delete process.env.WAREHOUSE_SERVICE_TOKEN;
   console.log('  ok: 欠品通知本文に他ロケ在庫が載る / warehouse停止でも通知は出る (async)');
 }
 
-console.log(`\ntest-notify: ${passed + 12} 件 pass`);
+console.log(`\ntest-notify: ${passed + 14} 件 pass`);
