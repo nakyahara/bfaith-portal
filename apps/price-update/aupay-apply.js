@@ -25,6 +25,46 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 /** au PAY の既定店舗ID (aupay-orders.js と同じ値。env で上書きできる) */
 const DEFAULT_SHOP_ID = '54318092';
 /**
+ * VPS プロキシの既定の場所 (apps/warehouse/aupay-orders.js /
+ * apps/aupay-unshipped/service.js と同じ値)。
+ */
+const DEFAULT_PROXY_URL = 'http://133.167.122.198:8080';
+
+/**
+ * VPS プロキシの場所。
+ *
+ * ★au PAY 用の env が無ければ Yahoo 用のものを使う。
+ *   **Yahoo と au PAY は同じ VPS の同じプロセス**で、`PROXY_SECRET` も1つしか無い
+ *   (vps-proxy/aupay-proxy.js の認証はルート共通)。名前が2つあるのは経緯だけの話。
+ *
+ * ★2026-09-02 の失敗: ここを AUPAY_PROXY_URL 必須にしたせいで、
+ *   Render に au PAY 用の env が無く、引き当てが
+ *   「現在の設定価格を取得できていない」で全部止まった。
+ *   au PAY を使う既存アプリ (aupay-unshipped) は miniPC の daily-sync でしか動いておらず、
+ *   **Render 側には au PAY の env が無かった**。同じ罠を踏まないよう、
+ *   同じプロキシを指す設定を順に見る
+ */
+function proxyBase() {
+  const v = process.env.AUPAY_PROXY_BASE_URL || process.env.AUPAY_PROXY_URL
+    || process.env.YAHOO_PROXY_BASE_URL || DEFAULT_PROXY_URL;
+  return String(v).trim().replace(/\/+$/, '');
+}
+
+/**
+ * VPS プロキシの secret。**これだけは必須** (無ければ 403 になるだけなので、手前で止める)。
+ * ★Yahoo 用と同じ値。VPS は全ルートで1つの PROXY_SECRET を見ている
+ */
+function proxySecret() {
+  const v = process.env.AUPAY_PROXY_SECRET || process.env.YAHOO_PROXY_SECRET;
+  if (!v || !String(v).trim()) {
+    const err = new AupayProxyError('config',
+      'AUPAY_PROXY_SECRET (または YAHOO_PROXY_SECRET) が未設定です。au PAY は送信も取得もしません');
+    err.statusCode = 503;
+    throw err;
+  }
+  return String(v).trim();
+}
+/**
  * 送ってよい価格の上限。
  * ★VPS 側 (vps-proxy/aupay-proxy.js の MAX_AUPAY_PRICE) と同じ値。
  *   片方だけ緩いと、通ったあとに向こうで落ちて「結果不明」になる
@@ -40,16 +80,6 @@ export class AupayProxyError extends Error {
   }
 }
 
-function requireEnv(name, fallbackName = null) {
-  const v = process.env[name] || (fallbackName ? process.env[fallbackName] : null);
-  if (!v || !String(v).trim()) {
-    const err = new AupayProxyError('config',
-      `${name}${fallbackName ? ` (または ${fallbackName})` : ''} が未設定です。au PAY は送信も取得もしません`);
-    err.statusCode = 503;
-    throw err;
-  }
-  return String(v).trim();
-}
 
 /**
  * XML を素直に木にする。
@@ -178,8 +208,8 @@ export async function fetchAupayItemDetail(itemCode, deps = {}) {
   const code = String(itemCode ?? '').trim();
   if (!code) throw new AupayProxyError('input', 'itemCode が空です');
 
-  const base = requireEnv('AUPAY_PROXY_BASE_URL', 'AUPAY_PROXY_URL').replace(/\/+$/, '');
-  const secret = requireEnv('AUPAY_PROXY_SECRET');
+  const base = proxyBase();
+  const secret = proxySecret();
   const shopId = (process.env.AUPAY_SHOP_ID || DEFAULT_SHOP_ID).trim();
 
   const qs = new URLSearchParams({ shopId, itemCode: code });
@@ -352,8 +382,8 @@ export function makeAupayClient(deps = {}) {
 
 /** VPS の /aupay/update-item を叩く */
 async function defaultAupayPostUpdate(itemCode, price, expectedPrice) {
-  const base = requireEnv('AUPAY_PROXY_BASE_URL', 'AUPAY_PROXY_URL').replace(/\/+$/, '');
-  const secret = requireEnv('AUPAY_PROXY_SECRET');
+  const base = proxyBase();
+  const secret = proxySecret();
   const res = await fetch(`${base}/aupay/update-item`, {
     method: 'POST',
     headers: { 'X-Proxy-Secret': secret, 'Content-Type': 'application/json' },

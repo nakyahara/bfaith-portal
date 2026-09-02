@@ -175,15 +175,60 @@ console.log('\n── 引き当て (fetchAupayPrices) ──');
   ok(/HTTP 500/.test(dead.get('abc-002').reason), '理由に元のエラーを残す');
 }
 
-console.log('\n── env が無ければ送らない (fail-closed) ──');
+console.log('\n── プロキシの設定 (2026-09-02 の失敗の再発防止) ──');
 {
+  // ★Render には au PAY 用の env が無かった (au PAY を使う既存アプリは miniPC でしか動いていない)。
+  //   URL を必須にしていたせいで引き当てが全部止まった。
+   //  Yahoo と au PAY は同じ VPS・同じ PROXY_SECRET なので、そちらを使えるようにする
   const save = { ...process.env };
-  delete process.env.AUPAY_PROXY_BASE_URL;
-  delete process.env.AUPAY_PROXY_URL;
+  const clear = () => {
+    for (const k of ['AUPAY_PROXY_BASE_URL', 'AUPAY_PROXY_URL', 'AUPAY_PROXY_SECRET',
+      'YAHOO_PROXY_BASE_URL', 'YAHOO_PROXY_SECRET']) delete process.env[k];
+  };
+  const called = [];
+  const spy = async (url) => {
+    called.push(url);
+    return { ok: true, text: async () => '<response><result><status>0</status></result>'
+      + '<searchResult><itemInfo><itemCode>x</itemCode><itemPrice>100</itemPrice></itemInfo>'
+      + '</searchResult></response>' };
+  };
+
+  // ★au PAY の env が1つも無くても、Yahoo の設定で動く
+  clear();
+  process.env.YAHOO_PROXY_BASE_URL = 'http://vps.example:8080';
+  process.env.YAHOO_PROXY_SECRET = 'shared-secret';
+  called.length = 0;
+  const viaYahoo = await fetchAupayItemDetail('x', { fetchImpl: spy });
+  eq(viaYahoo.itemPrice, 100, '★au PAY の env が無くても Yahoo の設定で取れる (同じ VPS)');
+  ok(called[0].startsWith('http://vps.example:8080/'), 'Yahoo と同じ VPS を見る: ' + called[0]);
+
+  // au PAY の env があればそちらが優先
+  clear();
+  process.env.YAHOO_PROXY_BASE_URL = 'http://yahoo.example:8080';
+  process.env.AUPAY_PROXY_URL = 'http://aupay.example:8080';
+  process.env.AUPAY_PROXY_SECRET = 'au-secret';
+  called.length = 0;
+  await fetchAupayItemDetail('x', { fetchImpl: spy });
+  ok(called[0].startsWith('http://aupay.example:8080/'), '★au PAY 用の設定があればそちらを使う');
+
+  // ★URL が1つも無くても既定値で動く (ここを必須にして止まった)
+  clear();
+  process.env.AUPAY_PROXY_SECRET = 'au-secret';
+  called.length = 0;
+  await fetchAupayItemDetail('x', { fetchImpl: spy });
+  ok(called[0].startsWith('http://133.167.122.198:8080/'),
+    '★URL の設定が無くても既定の VPS を見る (必須にしない)');
+
+  // ★secret だけは無ければ止める (無いと 403 になるだけなので手前で止める)
+  clear();
   let caught = null;
-  try { await fetchAupayItemDetail('abc-001'); } catch (e) { caught = e; }
+  try { await fetchAupayItemDetail('x', { fetchImpl: spy }); } catch (e) { caught = e; }
   ok(caught !== null && /未設定/.test(caught.message),
-    '★プロキシの設定が無ければ取りにいかない: ' + (caught?.message || 'エラーが出なかった'));
+    '★secret が無ければ取りにいかない: ' + (caught?.message || 'エラーが出なかった'));
+  ok(/AUPAY_PROXY_SECRET/.test(caught?.message || '') && /YAHOO_PROXY_SECRET/.test(caught?.message || ''),
+    '理由に どちらの env を入れればよいか を書く');
+
+  for (const k of Object.keys(process.env)) if (!(k in save)) delete process.env[k];
   Object.assign(process.env, save);
 }
 
