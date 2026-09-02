@@ -268,8 +268,12 @@ miniPC auto-shohin-csv.js (Logizard-NyukaCSV の2ステップ目・1日1回)
   なお `INBOUND_CHECK_SYNC_ENABLED=false` は30分巡回ごと止まるため相乗り分も一緒に止まる)。
   Notion 側で対象 DB のコネクトにインテグレーションを追加しておくこと
 - 台帳 = `config/jobs-registry.mjs` `inbound-check-notion-cards` (dead-man ping)
-- ⚠「入数」はカードに送らない: 旧マスターの入数 (いろは容器あたり) と f_inbound_info の入数 (仕入箱) は
-  意味が違うため。いろは作業仕様マスタ (`f_iroha_work_master`, PR2) 整備後に載せる
+- **いろは作業仕様マスタ (`f_iroha_work_master`)** = 旧スプレッドシート「作業内容管理マスター」の置き換え (work-master.js)。
+  カードの 資材セットID・収納容器・入数・工程数・備考 はここから載る (未整備の商品は送らない — それが正常)。
+  取込は管理画面から xlsx をアップロード: 既定 **dry-run** (検証 + 「在庫化必要FLG × いろは有無」の8区分突合レポート) →
+  内容を見てから本取込。**在庫化必要FLG はこの表に持ち込まない** — 正本は `f_inbound_info.いろは在庫化作業有無`。
+  本取込時に「未設定の SKU にだけ」FLG を初期値として書き込める (食い違いはレポートのみ・自動では触らない)。
+  ⚠カードの「入数」= `units_per_container` (いろはで1容器に詰める数)。f_inbound_info の入数 (仕入箱) とは別概念で統合しない
 
 ## テスト
 
@@ -280,6 +284,7 @@ node scripts/test-inbound-check-drive.mjs                  # Drive 自動取込 
 node scripts/test-inbound-check-product-master.mjs         # 商品マスタ取込 = 期限管理 (40 項目)
 node scripts/test-inbound-check-render.mjs                 # iPad 画面のレンダリング (状態ごとの主ボタン・数量パネル)
 node scripts/test-inbound-check-notion.mjs                 # Notion 作業カード sweep (API はモック)
+node scripts/test-inbound-check-work-master.mjs            # いろは作業仕様マスタ (xlsx取込・FLG突合・seed)
 node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路
 ```
 

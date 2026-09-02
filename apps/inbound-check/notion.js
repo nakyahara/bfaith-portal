@@ -119,6 +119,7 @@ export async function ensureCardSchema({ force = false } = {}) {
   if (!names.has(DEDUPE_PROP)) add[DEDUPE_PROP] = { rich_text: {} };
   if (!names.has('destination_id')) add['destination_id'] = { number: {} };
   if (!names.has('有効期限')) add['有効期限'] = { rich_text: {} };
+  if (!names.has('工程数')) add['工程数'] = { number: {} };   // いろは作業仕様マスタ (f_iroha_work_master) 由来
   if (Object.keys(add).length > 0) {
     await notionRequest(`/databases/${dbId}`, 'PATCH', { properties: add });
     for (const [k, v] of Object.entries(add)) { names.add(k); types.set(k, Object.keys(v)[0]); }
@@ -132,6 +133,7 @@ export async function ensureCardSchema({ force = false } = {}) {
     '入庫日': 'date', '入荷管理番号': 'rich_text', 'バーコード': 'rich_text', '取引先': 'select',
     '仕入先': 'number', '取扱区分': 'select', '在庫化必要FLG': 'checkbox', '作業拠点': 'select',
     '過去30日販売数': 'rich_text', '外部出し目安': 'rich_text',
+    '資材セットID': 'rich_text', '収納容器': 'rich_text', '入数': 'number', '工程数': 'number', '備考': 'rich_text',
     '有効期限': 'rich_text', 'destination_id': 'number', [DEDUPE_PROP]: 'rich_text',
   };
   const problems = [];

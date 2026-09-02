@@ -166,6 +166,23 @@ export function createTables(db = getMirrorDB()) {
       updated_by     TEXT
     );
 
+    -- いろは作業仕様マスタ (旧「作業内容管理マスター」シートの DB 化。work-master.js が使う)。
+    -- ⭐持つのは「いろは作業に固有の属性」だけ。商品名・仕入先・取扱区分は mirror_products を JOIN。
+    --   在庫化要否 (旧 在庫化必要FLG) はここに持たない — 正本は f_inbound_info.いろは在庫化作業有無。
+    --   units_per_container = いろはで1容器に詰める数。f_inbound_info.入数 (仕入箱入数) とは別概念
+    CREATE TABLE IF NOT EXISTS f_iroha_work_master (
+      code_key            TEXT PRIMARY KEY,
+      商品コード          TEXT NOT NULL,
+      material_code       TEXT,
+      storage_container   TEXT,
+      units_per_container INTEGER CHECK (units_per_container IS NULL OR units_per_container >= 0),
+      process_count       INTEGER CHECK (process_count IS NULL OR process_count >= 0),
+      note                TEXT,
+      version             INTEGER NOT NULL DEFAULT 1,
+      updated_at          TEXT NOT NULL,
+      updated_by          TEXT
+    );
+
     -- Notion sweep の多重実行防止 lease (notion-sync.js。期限切れは自動回収 = 永久ロックにならない)
     CREATE TABLE IF NOT EXISTS f_inbound_check_notion_lease (
       id         INTEGER PRIMARY KEY CHECK (id = 1),
