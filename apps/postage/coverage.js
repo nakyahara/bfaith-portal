@@ -63,6 +63,29 @@ export function loadShipments({ since, until } = {}) {
   }
 }
 
+/**
+ * NE の受注明細から商品名を引く (手で登録するとき、名前を打ち直さなくて済むように)。
+ * 出荷実績が無い新商品は見つからない — その場合は手で入れてもらう。
+ */
+export function lookupProductName(skuCode) {
+  if (!warehouseAvailable()) return null;
+  const code = String(skuCode || '').trim();
+  if (!code) return null;
+  const wh = new Database(WAREHOUSE_DB, { readonly: true, fileMustExist: true });
+  try {
+    const r = wh.prepare(`
+      SELECT 商品名 AS name FROM raw_ne_orders
+       WHERE 商品コード = ? AND 商品名 IS NOT NULL AND 商品名 <> ''
+       ORDER BY rowid DESC LIMIT 1
+    `).get(code);
+    return r?.name || null;
+  } catch {
+    return null;   // 期待した表が無い環境では黙って諦める (補完は「あれば便利」なだけ)
+  } finally {
+    wh.close();
+  }
+}
+
 /** 判定に必要なマスタをまとめて読む。 */
 export function buildContext(forDate) {
   const db = getDB();

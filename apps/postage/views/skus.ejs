@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>商品マスタ - 郵便料金判定 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    body { background: #f5f7fa; }
+    .container { max-width: 1240px; margin: 0 auto; padding: 16px 20px 60px; }
+    .header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; flex-wrap: wrap; gap: 12px; }
+    .header-row h2 { margin: 0; }
+    .back-link { font-size: 13px; color: #2563eb; text-decoration: none; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    .card h3 { margin: 0 0 4px; font-size: 15px; color: #111; }
+    .hint { font-size: 12px; color: #6b7280; margin: 4px 0 10px; line-height: 1.7; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: right; vertical-align: middle; }
+    th { background: #f9fafb; color: #374151; font-weight: 600; text-align: center; white-space: nowrap; }
+    td.l, th.l { text-align: left; }
+    .scroll { overflow-x: auto; }
+    input[type=text], input[type=number], select { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
+    input.n { width: 78px; text-align: right; }
+    input.code { width: 170px; font-family: ui-monospace, Consolas, monospace; }
+    input.name { width: 100%; min-width: 180px; }
+    button.primary { background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
+    button.ghost { background: #fff; color: #374151; border: 1px solid #d1d5db; border-radius: 6px; padding: 5px 11px; font-size: 12px; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: default; }
+    .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+    .tab { font-size: 12.5px; padding: 5px 12px; border-radius: 999px; border: 1px solid #d1d5db; background: #fff; color: #374151; text-decoration: none; white-space: nowrap; }
+    .tab.on { background: #1f2937; color: #fff; border-color: #1f2937; }
+    .tab .c { opacity: .75; margin-left: 5px; }
+    .pill { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 10px; border: 1px solid; white-space: nowrap; }
+    .pill.ok { color: #047857; border-color: #6ee7b7; background: #ecfdf5; }
+    .pill.ng { color: #b45309; border-color: #fcd34d; background: #fffbeb; }
+    .prev { font-size: 12px; line-height: 1.5; }
+    .prev.ok b { color: #047857; }
+    .prev.ng b { color: #b45309; }
+    .prev .sub { color: #9ca3af; font-size: 11px; display: block; }
+    .msg { font-size: 12px; color: #6b7280; margin-left: 6px; }
+    .mono { font-family: ui-monospace, Consolas, monospace; }
+    .pager { display: flex; gap: 8px; align-items: center; justify-content: center; margin-top: 12px; font-size: 13px; }
+    .row-new td { background: #f8fafc; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header-row">
+    <h2>📮 商品マスタ</h2>
+    <div>
+      <a class="back-link" href="/apps/postage">← カバー率へ</a>
+      <a class="back-link" href="/" style="margin-left:14px">ポータルへ</a>
+    </div>
+  </div>
+
+  <!-- ── 新規登録 ── -->
+  <div class="card">
+    <h3>商品を1件登録する</h3>
+    <p class="hint">
+      新商品が届いたら、出荷が始まる前にここで入れておけます。商品コードを入れて枠の外をクリックすると、
+      過去に出荷したことがある商品なら名前を拾ってきます。<strong>重さと厚みは空欄のままでも登録できます</strong>
+      (資材だけ先に決めておく、という使い方ができます)。
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th class="l">商品コード</th><th class="l">商品名</th><th>重さ (g)</th><th>厚み (mm)</th><th class="l">資材</th><th></th></tr></thead>
+        <tbody>
+          <tr class="row-new" id="new-row">
+            <td class="l"><input class="code" id="n-code" type="text" placeholder="例: bluelabel-ro"></td>
+            <td class="l"><input class="name" id="n-name" type="text" placeholder="商品名"></td>
+            <td><input class="n" id="n-w" type="number" step="0.1" min="0" placeholder="未計測は空"></td>
+            <td><input class="n" id="n-t" type="number" step="0.1" min="0" placeholder="未計測は空"></td>
+            <td class="l">
+              <select id="n-m">
+                <option value="">未定</option>
+                <% materials.forEach((m) => { %><option value="<%= m.material_code %>"><%= m.display_name %></option><% }) %>
+              </select>
+            </td>
+            <td><button class="primary" data-act="add">登録</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="add-msg" class="hint"></div>
+  </div>
+
+  <!-- ── 検索 ── -->
+  <div class="card">
+    <div class="tabs">
+      <% Object.keys(filterLabels).forEach((k) => { %>
+        <a class="tab <%= filter === k ? 'on' : '' %>" href="?filter=<%= k %><%= q ? '&q=' + encodeURIComponent(q) : '' %>">
+          <%# 件数は skus.js の FILTERS と同じ条件から作っているので、一覧の件数と必ず一致する %>
+          <%= filterLabels[k] %><span class="c"><%= k === 'all' ? counts.total : (counts[k] ?? '') %></span>
+        </a>
+      <% }) %>
+    </div>
+    <form method="get" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input type="hidden" name="filter" value="<%= filter %>">
+      <input type="text" name="q" value="<%= q %>" placeholder="商品コード / 商品名で探す" style="width:280px">
+      <button class="primary" type="submit">検索</button>
+      <% if (q) { %><a class="tab" href="?filter=<%= filter %>">クリア</a><% } %>
+      <span class="msg"><%= total.toLocaleString() %> 件</span>
+    </form>
+  </div>
+
+  <!-- ── 一覧 ── -->
+  <div class="card">
+    <h3>登録した内容と、その場での判定</h3>
+    <p class="hint">
+      右端は「この商品を<strong>1個だけ</strong>送ったらどうなるか」です。入れた値が効いているかをその場で確かめられます。
+      実際の伝票は中身が複数のこともあるので、そこは伝票ごとの判定で決まります。
+      <strong>空欄にして保存すると値を消せます</strong> (打ち間違いを直せます)。
+    </p>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th class="l">商品コード</th><th class="l">商品名</th>
+            <th>重さ (g)</th><th>厚み (mm)</th><th class="l">資材</th>
+            <th>状態</th><th class="l" style="min-width:220px">1個だけ送ったら</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <% list.forEach((r) => { %>
+            <tr data-sku="<%= r.sku_code %>">
+              <td class="l mono"><%= r.sku_code %></td>
+              <td class="l" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="<%= r.display_name || '' %>"><%= r.display_name || '' %></td>
+              <td><input class="n f-w" type="number" step="0.1" min="0" value="<%= r.unit_weight_g ?? '' %>"></td>
+              <td><input class="n f-t" type="number" step="0.1" min="0" value="<%= r.thickness_mm ?? '' %>"></td>
+              <td class="l">
+                <select class="f-m">
+                  <option value="">未定</option>
+                  <% materials.forEach((m) => { %>
+                    <option value="<%= m.material_code %>" <%= r.default_material_code === m.material_code ? 'selected' : '' %>><%= m.display_name %></option>
+                  <% }) %>
+                  <%# 使用停止にした資材が設定されている行は、その資材も選択肢に残す。
+                      無いと「未定」が選ばれた状態になり、保存した瞬間に資材が消える %>
+                  <% if (r.default_material_code && !materials.some((m) => m.material_code === r.default_material_code)) { %>
+                    <option value="<%= r.default_material_code %>" selected>
+                      <%= (materialNames[r.default_material_code] || {}).name || r.default_material_code %>（使用停止）
+                    </option>
+                  <% } %>
+                </select>
+              </td>
+              <td><span class="pill <%= r.status === 'ready' ? 'ok' : 'ng' %>"><%= statusLabels[r.status] %></span></td>
+              <td class="l prev <%= r.preview.ok ? 'ok' : 'ng' %>">
+                <b><%= r.preview.text %></b>
+                <% if (r.preview.sub) { %><span class="sub"><%= r.preview.sub %></span><% } %>
+              </td>
+              <td><button class="ghost" data-act="save">保存</button></td>
+            </tr>
+          <% }) %>
+          <% if (!list.length) { %>
+            <tr><td class="l" colspan="8">該当する商品がありません<%= q ? '（検索条件を変えてみてください）' : '' %></td></tr>
+          <% } %>
+        </tbody>
+      </table>
+    </div>
+    <% const pages = Math.ceil(total / limit); if (pages > 1) { %>
+      <div class="pager">
+        <% if (page > 1) { %><a class="tab" href="?filter=<%= filter %>&q=<%= encodeURIComponent(q) %>&page=<%= page - 1 %>">← 前</a><% } %>
+        <span><%= page %> / <%= pages %></span>
+        <% if (page < pages) { %><a class="tab" href="?filter=<%= filter %>&q=<%= encodeURIComponent(q) %>&page=<%= page + 1 %>">次 →</a><% } %>
+      </div>
+    <% } %>
+  </div>
+
+  <!-- ── 資材の追加 ── -->
+  <div class="card">
+    <h3>資材を足す</h3>
+    <p class="hint">
+      商品名の末尾に出てくるのに資材マスタに無いもの (厚紙封など) はここで足します。
+      <strong>自重と外寸は空欄でも登録できます</strong>が、<strong>外寸の縦横が揃うまで判定には使われません</strong>
+      (推定値で料金を確定させないため)。
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th class="l">資材コード</th><th class="l">名前</th><th>自重 (g)</th><th>長辺 (mm)</th><th>短辺 (mm)</th><th class="l">メモ</th><th></th></tr></thead>
+        <tbody>
+          <tr class="row-new">
+            <td class="l"><input class="code" id="m-code" type="text" placeholder="atsugami_fu"></td>
+            <td class="l"><input class="name" id="m-name" type="text" placeholder="厚紙封筒"></td>
+            <td><input class="n" id="m-tare" type="number" step="0.1" min="0"></td>
+            <td><input class="n" id="m-l" type="number" step="1" min="0"></td>
+            <td><input class="n" id="m-w" type="number" step="1" min="0"></td>
+            <td class="l"><input type="text" id="m-note" placeholder="任意" style="width:160px"></td>
+            <td><button class="primary" data-act="add-mat">追加</button></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="mat-msg" class="hint"></div>
+    <p class="hint" style="margin-top:8px">既にある資材の自重・外寸は <a href="/apps/postage">カバー率の画面</a> で編集できます。</p>
+  </div>
+</div>
+
+<script>
+(function () {
+  const post = async (url, body) => {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({ ok: false, error: 'サーバの応答を読めません' }));
+    if (!j.ok) throw new Error(j.error || '保存に失敗しました');
+    return j;
+  };
+  const flash = (el, text, bad) => {
+    const s = document.createElement('span');
+    s.className = 'msg'; s.textContent = ' ' + text; s.style.color = bad ? '#b91c1c' : '#047857';
+    el.after(s); setTimeout(() => s.remove(), 3500);
+  };
+  const setPreview = (tr, p) => {
+    const cell = tr.querySelector('.prev');
+    if (!cell || !p) return;
+    cell.className = 'l prev ' + (p.ok ? 'ok' : 'ng');
+    cell.innerHTML = '';
+    const b = document.createElement('b'); b.textContent = p.text; cell.appendChild(b);
+    if (p.sub) { const s = document.createElement('span'); s.className = 'sub'; s.textContent = p.sub; cell.appendChild(s); }
+  };
+
+  // 商品コードを入れたら、過去の出荷から名前を拾ってくる
+  const codeEl = document.getElementById('n-code');
+  if (codeEl) codeEl.addEventListener('blur', async () => {
+    const code = codeEl.value.trim();
+    const nameEl = document.getElementById('n-name');
+    if (!code || nameEl.value.trim()) return;
+    try {
+      const r = await fetch('/apps/postage/api/skus/' + encodeURIComponent(code) + '/lookup');
+      const j = await r.json();
+      if (j.ok && j.display_name) {
+        nameEl.value = j.display_name;
+        document.getElementById('add-msg').textContent = '過去の出荷から商品名を拾いました';
+      }
+    } catch { /* 補完は無くても登録できるので黙って諦める */ }
+  });
+
+  document.addEventListener('click', async (ev) => {
+    const btn = ev.target.closest('button[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+
+    if (act === 'save') {
+      const tr = btn.closest('tr');
+      btn.disabled = true;
+      try {
+        const j = await post('/apps/postage/api/skus/' + encodeURIComponent(tr.dataset.sku), {
+          mode: 'replace',
+          unit_weight_g: tr.querySelector('.f-w').value.trim(),
+          thickness_mm: tr.querySelector('.f-t').value.trim(),
+          default_material_code: tr.querySelector('.f-m').value,
+        });
+        setPreview(tr, j.preview);
+        flash(btn, '保存しました');
+      } catch (e) { flash(btn, e.message, true); } finally { btn.disabled = false; }
+    }
+
+    if (act === 'add') {
+      const code = document.getElementById('n-code').value.trim();
+      const msg = document.getElementById('add-msg');
+      if (!code) { msg.textContent = '商品コードを入れてください'; return; }
+      btn.disabled = true;
+      try {
+        const j = await post('/apps/postage/api/skus/' + encodeURIComponent(code), {
+          mode: 'replace',
+          display_name: document.getElementById('n-name').value.trim(),
+          unit_weight_g: document.getElementById('n-w').value.trim(),
+          thickness_mm: document.getElementById('n-t').value.trim(),
+          default_material_code: document.getElementById('n-m').value,
+        });
+        msg.textContent = '登録しました — ' + (j.preview ? j.preview.text : '');
+        msg.style.color = j.preview && j.preview.ok ? '#047857' : '#b45309';
+        for (const id of ['n-code', 'n-name', 'n-w', 'n-t']) document.getElementById(id).value = '';
+        document.getElementById('n-m').value = '';
+      } catch (e) { msg.textContent = e.message; msg.style.color = '#b91c1c'; } finally { btn.disabled = false; }
+    }
+
+    if (act === 'add-mat') {
+      const msg = document.getElementById('mat-msg');
+      btn.disabled = true;
+      try {
+        await post('/apps/postage/api/materials', {
+          material_code: document.getElementById('m-code').value.trim(),
+          display_name: document.getElementById('m-name').value.trim(),
+          tare_weight_g: document.getElementById('m-tare').value.trim(),
+          outer_length_mm: document.getElementById('m-l').value.trim(),
+          outer_width_mm: document.getElementById('m-w').value.trim(),
+          note: document.getElementById('m-note').value.trim(),
+        });
+        msg.textContent = '追加しました。画面を読み込み直すと選べるようになります';
+        msg.style.color = '#047857';
+      } catch (e) { msg.textContent = e.message; msg.style.color = '#b91c1c'; } finally { btn.disabled = false; }
+    }
+  });
+})();
+</script>
+</body>
+</html>
