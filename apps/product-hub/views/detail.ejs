@@ -258,7 +258,7 @@
     <details class="hdr-help" style="margin:0 0 6px;">
       <summary>送られる値・項目の場所</summary>
       <p>
-        税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と JANコード (<%= draft.jan_code || '未入力' %>) は基本情報タブの値を自動で送ります。
+        税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と カタログID (JAN<%= (variation && variation.kind === 'variation' && variation.memberCount > 1) ? ' — SKU表の値をSKUごとに' : ': ' + (draft.jan_code || '未入力') %>) は基本情報タブの値を自動で送ります。
         在庫は常に 0 で登録します。<br>
         配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
         </p>
@@ -657,14 +657,17 @@
           </div>
         </div>
         <div style="flex:1">
-          <label>JANコード <span class="muted">(楽天の「カタログID」— カテゴリ・属性タブと同じ値)</span><span class="ftag ftag-m">手入力</span></label>
-          <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
+          <%# JAN (楽天のカタログID) の入力はここだけ (2026-09-02 中原さん: カテゴリ・属性タブと 2 箇所に
+              入れさせない)。バリエーションは SKU ごとに JAN が違うので、ページ代表の欄は出さず
+              右の SKU 表の「カタログID (JAN)」列が入口になる %>
           <% if (variation.kind === 'variation' && variation.members.length > 1) { %>
-            <%# 2026-08-28 中原さん要望: バリエーションありのときは SKU ごとに JAN を控える %>
-            <div class="muted" style="font-size:11px;">
-              バリエーションありです — SKUごとのJANは右の「このページに載るSKU」表で入力してください
-              (この欄はページ代表の1つ = 楽天のカタログID用)
+            <label>JANコード <span class="muted">(楽天の「カタログID」)</span><span class="ftag ftag-m">手入力</span></label>
+            <div class="muted" style="font-size:12px; padding:6px 0;">
+              バリエーションありです — SKUごとに右の「このページに載るSKU」表の「カタログID (JAN)」列で入力してください
             </div>
+          <% } else { %>
+            <label>JANコード <span class="muted">(楽天の「カタログID」として送ります。入力はここだけ)</span><span class="ftag ftag-m">手入力</span></label>
+            <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
           <% } %>
         </div>
         <div style="flex:1">
@@ -850,10 +853,16 @@
                            value="<%= skuSelectorValues[mKey] || '' %>" placeholder="例: ブラウン">
                   </td>
                   <td>
-                    <input type="text" class="sku-jan-input" inputmode="numeric" maxlength="13"
-                           style="width:130px; font-size:12px; padding:4px 6px;"
-                           data-code="<%= m.商品コード %>"
-                           value="<%= skuJans[mKey] || '' %>" placeholder="8/12/13桁">
+                    <%# SKU が実効 1 件 (除外で減った) のときはサーバーが単品扱い = 上の JANコード欄を送る。
+                        ここに入力欄を出すと画面の確認表示・バッジと送る値が食い違うので出さない (Codex R1 medium) %>
+                    <% if (variation.members.length > 1) { %>
+                      <input type="text" class="sku-jan-input" inputmode="numeric" maxlength="13"
+                             style="width:130px; font-size:12px; padding:4px 6px;"
+                             data-code="<%= m.商品コード %>"
+                             value="<%= skuJans[mKey] || '' %>" placeholder="8/12/13桁">
+                    <% } else { %>
+                      <span class="muted" style="font-size:11px;">単品扱い — 上のJANコード欄の値を送ります</span>
+                    <% } %>
                   </td>
                   <% if (showSkuPrices) { %>
                     <td>
@@ -1553,9 +1562,11 @@
         </div>
     </div>
 
-    <%# カタログID — RMS の「カタログID」と**同じ構成** (2026-09-02 中原さん: 楽天のUIと揃えないと
-        どこがどこに対応するか直感で分からない): ◉IDあり=JAN / ○IDなし=理由プルダウン。
-        JANコードの実体は product_drafts.jan_code = 基本情報タブの JAN 欄と同じ値 (どちらで直しても揃う)。
+    <%# カタログID — RMS の「カタログID」に対応する**確認表示** (2026-09-02 中原さん: 基本情報タブと
+        カテゴリ・属性タブの 2 箇所に JAN を入れさせない)。入力は基本情報タブだけ:
+          単品 = JANコード欄 (product_drafts.jan_code) / バリエーション = SKU表 (draft_sku_jans)。
+        ここは「何が送られるか」の表示と、JAN が無いときの理由 (RMS の「カタログIDなしの理由」) の選択だけ。
+        表示は initCatalogStatus (下の script) が基本情報タブの入力欄から組み立てる。
         🚨 2026-09-02 まで、この欄 (API の articleNumber) にメーカー型番を送っていて IE0228 で登録が落ちていた %>
     <%
       const exReason = rakuten && rakuten.catalog_id_exemption_reason != null
@@ -1568,26 +1579,14 @@
         [4, '4: 項目選択肢在庫商品'],
         [5, '5: 該当製品コードなし'],
       ];
-      const catalogHasId = !!draft.jan_code;
+      const isVariationPage = variation && variation.kind === 'variation' && variation.memberCount > 1;
     %>
     <div class="field">
-      <label class="req">カタログID <span class="muted">(RMSの「カタログID」と同じ。JAN = 基本情報タブのJANコードと同じ値)</span><span class="ftag ftag-m">手入力</span></label>
-      <div style="display:flex; gap:18px; align-items:center; margin:2px 0 4px;">
-        <label style="display:flex; align-items:center; gap:4px; font-size:13px; cursor:pointer; font-weight:400;">
-          <input type="radio" name="rk-catalog-mode" value="with" <%= catalogHasId ? 'checked' : '' %>> IDあり
-        </label>
-        <label style="display:flex; align-items:center; gap:4px; font-size:13px; cursor:pointer; font-weight:400;">
-          <input type="radio" name="rk-catalog-mode" value="without" <%= catalogHasId ? '' : 'checked' %>> IDなし
-        </label>
-      </div>
-      <div id="rk-catalog-with" style="<%= catalogHasId ? '' : 'display:none;' %>">
-        <input type="text" id="rk-catalog-jan" inputmode="numeric" maxlength="13" style="max-width:220px;"
-               value="<%= draft.jan_code || '' %>" placeholder="JANコード (8/12/13桁)">
-        <div class="muted" style="font-size:11px;">基本情報タブのJANコード欄と同じ値です (どちらで直しても揃います)</div>
-      </div>
-      <div id="rk-catalog-without" style="<%= catalogHasId ? 'display:none;' : '' %>">
-        <select id="rk-catalog-exemption" style="max-width:380px;">
-          <option value="" <%= exReason == null ? 'selected' : '' %>>カタログIDなしの理由 (未選択は 5: 該当製品コードなし で送ります)</option>
+      <label class="req">カタログID <span class="muted">(RMSの「カタログID」。入力は基本情報タブ — 単品はJANコード欄、バリエーションはSKU表。ここは送る内容の確認)</span><span class="ftag ftag-auto">自動</span></label>
+      <div id="rk-catalog-status" style="font-size:13px; margin:2px 0 4px;"></div>
+      <div id="rk-catalog-without">
+        <select id="rk-catalog-exemption" style="max-width:420px;">
+          <option value="" <%= exReason == null ? 'selected' : '' %>>カタログIDなしの理由 (JANが無い<%= isVariationPage ? 'SKU' : 'とき' %>に使います。未選択は 5: 該当製品コードなし)</option>
           <% for (const [v, label] of exOptions) { %>
             <option value="<%= v %>" <%= exReason === v ? 'selected' : '' %>><%= label %></option>
           <% } %>
@@ -1877,10 +1876,19 @@
     else if (transferred < imgs) m['tab-images'].push('R-Cabinet未転送 ' + (imgs - transferred) + '枚');
     m['tab-info'].push(...pageInfoMissing());
     if (!tv('rk-genre')) m['tab-category'].push('ジャンルID');
-    // カタログIDは JAN欄に値があればサーバーが自動送信する。JAN も手入力属性も無ければ必須扱い
+    // カタログIDは JAN からサーバーが自動送信する (入力は基本情報タブ: 単品=JAN欄 / バリエーション=SKU表)。
+    // 辞書で必須のジャンルは JAN の無い SKU があると登録が止まるので、基本情報タブの未入力として数える
     // (Codex R1 High-1: 無条件に除外すると「未入力0件」のまま登録が失敗する)
-    const janFilled = !!tv('f-jan');
-    const need = mandatoryAttrNames.filter((n) => n !== 'カタログID' || !janFilled);
+    const skuJanInputs = Array.from(document.querySelectorAll('.sku-jan-input'));
+    const janMissing = skuJanInputs.length > 0
+      ? skuJanInputs.filter((i) => !i.value.trim()).length
+      : (tv('f-jan') ? 0 : 1);
+    if (mandatoryAttrNames.includes('カタログID') && janMissing > 0) {
+      m['tab-basic'].push(skuJanInputs.length > 0
+        ? 'SKU表のカタログID (JAN) ' + janMissing + '件 (このジャンルの必須属性)'
+        : 'JANコード (楽天のカタログID・このジャンルの必須属性)');
+    }
+    const need = mandatoryAttrNames.filter((n) => n !== 'カタログID');
     if (need.length > 0) {
       const vals = {};
       document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
@@ -1891,7 +1899,7 @@
       });
       for (const n of need) {
         if (vals[n]) continue;
-        m['tab-category'].push(n === 'カタログID' ? '必須属性「カタログID」(基本情報タブのJAN欄入力でも可)' : '必須属性「' + n + '」');
+        m['tab-category'].push('必須属性「' + n + '」');
       }
     }
     return m;
@@ -2027,7 +2035,9 @@
       name: document.getElementById('f-name').value,
       official_url: document.getElementById('f-official-url').value,
       price: document.getElementById('f-price').value,
-      jan_code: document.getElementById('f-jan').value,
+      // JAN (単品欄) は直前の saveRakutenFields → saveJanIfChanged で保存済みなので、ここでは送らない
+      // (送ると同じ値を二重に保存し、更新ログと Notion 同期が 2 回走る — Codex R2 low)。
+      // バリエーションは SKU表 → /sku-jans。どちらも未送信 = サーバーは既存値を保持
       asin: document.getElementById('f-asin').value,
       amazon_url: document.getElementById('f-amazon-url').value,
       own_brand: document.getElementById('f-own-brand').checked,
@@ -2640,7 +2650,7 @@
         const note = document.createElement('div');
         note.className = 'muted';
         note.style.fontSize = '11px';
-        note.textContent = 'ℹ️ このジャンルはカタログIDが属性にあります。JAN欄の値が自動で送られます。';
+        note.textContent = 'ℹ️ このジャンルはカタログIDが属性にあります。基本情報タブの JAN (バリエーションは SKU表の JAN) が SKU ごとに自動で送られます。';
         info.appendChild(note);
       }
       if ((g.attributes || []).some((a) => a.name === modelAttrName)) {
@@ -2749,11 +2759,7 @@
     return {
       genre_id: document.getElementById('rk-genre').value,
       article_number: document.getElementById('rk-article').value,
-      // カタログID (RMS と同じ ◉IDあり/○IDなし)。IDあり = JAN欄の値を jan_code へ保存、
-      // IDなし = '' で jan_code をクリア (IDなしを明示的に選んだ人の意思)
-      catalog_jan: (document.querySelector('input[name="rk-catalog-mode"]:checked') || {}).value === 'with'
-        ? document.getElementById('rk-catalog-jan').value
-        : '',
+      // カタログID (JAN) 本体はここから送らない (入力は基本情報タブだけ)。ここは「IDなしの理由」だけ
       catalog_id_exemption_reason: document.getElementById('rk-catalog-exemption').value,
       // バリエーションの項目名 (カラバリのときだけ欄がある。無ければ送らない = 既存維持)
       ...(document.getElementById('rk-variant-selector')
@@ -2840,7 +2846,45 @@
     });
   }
 
+  // 単品の JAN 欄 (基本情報タブ) は /rakuten では保存されない (入口一本化で catalog_jan を廃止したため)。
+  // プレビュー・登録・出品情報の保存はすべて saveRakutenFields を通るので、ここで JAN の変更を先に
+  // 基本情報 API へ送る (Codex R1 high: 画面の確認表示は新値なのに payload が旧 jan_code で組まれていた)
+  let lastSavedJan = document.getElementById('f-jan') ? document.getElementById('f-jan').value.trim() : null;
+  // 保存は 1 本のチェーンで直列化し、保存中に打ち直された分も取り切ってから戻る
+  // (Codex R2 high: A を保存している間に B へ変えると、画面は B なのに payload が A で登録される)
+  let janSaveChain = Promise.resolve(true);
+  // 通信エラーで結果が分からなくなった印 (Codex R5 high: 応答待ち中に元の値へ戻すと lastSavedJan と一致して
+  // 保存を省略し、DB だけ新値で登録が進む)。立っている間は現在値が同じでも必ず再送し、成功したときだけ下ろす
+  let janSaveUnknown = false;
+  function saveJanIfChanged() {
+    janSaveChain = janSaveChain.then(async () => {
+      const el = document.getElementById('f-jan');
+      if (!el) return true; // バリエーションは SKU表 → /sku-jans (flushSkuJanSaves で待つ)
+      for (let i = 0; i < 5; i++) {
+        const value = el.value.trim();
+        if (value === lastSavedJan && !janSaveUnknown) return true;
+        let json;
+        try {
+          json = await post(BASE, { jan_code: value });
+        } catch (e) {
+          janSaveUnknown = true; // Codex R2 medium / R5 high
+          alert('通信エラーでJANコードを保存できませんでした。もう一度お試しください');
+          return false;
+        }
+        if (!json.ok) { alert(json.error || 'JANコードの保存に失敗しました'); return false; }
+        janSaveUnknown = false;
+        lastSavedJan = value;
+      }
+      return el.value.trim() === lastSavedJan && !janSaveUnknown;
+    });
+    return janSaveChain;
+  }
+  // SKU別JAN の保存キュー (initSkuJans が差し替える)。未保存の変更を確定して全部待ち、1 件でも失敗したら false
+  let flushSkuJanSaves = async () => true;
   async function saveRakutenFields() {
+    // JAN (単品欄 / SKU表) の保存を先に確定させる。失敗したらプレビュー・登録に進まない (Codex R2 high)
+    if (!(await saveJanIfChanged())) return false;
+    if (!(await flushSkuJanSaves())) return false;
     const json = await post(BASE + '/rakuten', collectRakutenFields());
     if (!json.ok) { alert(json.error || '保存に失敗しました'); return false; }
     return true;
@@ -3303,52 +3347,130 @@
     const inputs = [...document.querySelectorAll('.sku-jan-input')];
     if (inputs.length === 0) return;
     const result = document.getElementById('rk-result');
-    let saveChain = Promise.resolve(); // POST は1本ずつ (並行保存の後勝ち上書き防止)
-    inputs.forEach((input) => {
-      let last = input.value.trim();
-      async function save(value) {
-        if (value === last) return;
-        let json;
-        try {
-          json = await post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value });
-        } catch (e) {
-          json = { ok: false, error: '通信エラーでJANコードを保存できませんでした' };
-        }
-        if (!json.ok) {
-          alert(json.error || 'JANコードの保存に失敗しました');
-          // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ巻き戻す
-          if (input.value.trim() === value) input.value = last;
-          return;
-        }
-        last = value;
-        if (result) result.textContent = 'JANコードを保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
+    // 保存は単一の drain ワーカー: 「保存済みの値 (lastOf = DB の値) と違う入力」を実行時点の現在値で
+    // 1 件ずつ POST し、全部一致するまで回す。捕捉値のキューにしない (Codex R3 high:
+    // 待機中に追加された保存を待てない / 失敗して巻き戻した後に古い捕捉値を再送できた)
+    const lastOf = new Map(inputs.map((i) => [i, i.value.trim()]));
+    // 通信エラーで結果が分からなくなった入力 (Codex R5 high: 応答待ち中に元の値へ戻すと lastOf と一致して
+    // dirty から消え、DB だけ新値のまま flush が true になる)。再送が成功するまで dirty 扱いを外さない
+    const uncertain = new Set();
+    let draining = null;   // 実行中の drain (Promise<boolean> = その実行の開始以降に失敗が無かったか)
+    let rerun = false;     // drain 中に change が来た印 (終わる直前の取りこぼし防止)
+    // 戻り値: 'ok' = 保存した / 'rejected' = サーバーが拒否 (DB は旧値のまま) / 'unknown' = DB の値が不明 (drain を止める)
+    async function saveOne(input) {
+      const value = input.value.trim();
+      if (value === lastOf.get(input) && !uncertain.has(input)) return 'ok';
+      let json;
+      try {
+        json = await post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value });
+      } catch (e) {
+        // 通信エラーはサーバーがコミット済みの可能性がある (Codex R4 high)。DB の値が分からないので
+        // 画面は巻き戻さず uncertain に入れて drain を止める (次の change / flush で現在値を冪等に再送する)
+        uncertain.add(input);
+        alert('通信エラーでJANコードを保存できませんでした (' + input.dataset.code + ')。もう一度お試しください');
+        return 'unknown';
       }
-      input.addEventListener('change', () => {
-        const value = input.value.trim();
-        saveChain = saveChain.then(() => save(value));
-      });
-    });
+      if (!json.ok) {
+        if (uncertain.has(input)) {
+          // DB の値が分からないまま拒否された = 巻き戻す先が無い。uncertain のまま止めて再読込を促す
+          alert((json.error || 'JANコードの保存に失敗しました') + ' — 直前の保存結果が不明なため、ページを再読み込みして値を確認してください');
+          return 'unknown';
+        }
+        alert(json.error || 'JANコードの保存に失敗しました');
+        // サーバーが拒否 = DB は旧値。後続の変更値を潰さない: 表示が失敗した値のままのときだけ DB の値へ巻き戻す。
+        // 巻き戻したら確認表示 (カテゴリ・属性タブのカタログID) と必須バッジも合わせる (Codex R1 low)
+        if (input.value.trim() === value) {
+          input.value = lastOf.get(input);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        return 'rejected';
+      }
+      uncertain.delete(input);
+      lastOf.set(input, value);
+      if (result) result.textContent = 'JANコードを保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
+      return 'ok';
+    }
+    const dirtyInputs = () => inputs.filter((i) => uncertain.has(i) || i.value.trim() !== lastOf.get(i));
+    // 失敗は共有フラグではなく drain 実行の結果として持つ (Codex R4 high: 実行中の drain に合流する flush が
+    // 共有フラグをリセットすると、その drain で既に起きた失敗が消えていた)
+    function drain() {
+      if (draining) { rerun = true; return draining; }
+      draining = (async () => {
+        let ok = true;
+        do {
+          rerun = false;
+          // 拒否は巻き戻すので通常 1〜2 周で収束する。上限は保存が拒否され続けるときの安全弁
+          for (let round = 0; round < 10; round++) {
+            const dirty = dirtyInputs();
+            if (dirty.length === 0) break;
+            for (const input of dirty) {
+              const r = await saveOne(input);
+              if (r === 'unknown') return false; // 結果不明: dirty を残したまま止める (連打再送しない)
+              if (r === 'rejected') ok = false;
+            }
+          }
+        } while (rerun);
+        return ok;
+      })().finally(() => { draining = null; });
+      return draining;
+    }
+    inputs.forEach((input) => input.addEventListener('change', () => { drain(); }));
+    // プレビュー・登録・出品情報保存の前に呼ばれる (saveRakutenFields)。未保存の変更を全部確定してから、
+    // (合流した) drain の開始以降に 1 件でも失敗していたら / まだ DB と違う入力が残っていたら false (Codex R2 high)
+    flushSkuJanSaves = async () => {
+      const ok = await drain();
+      return ok && dirtyInputs().length === 0;
+    };
   })();
 
-  // カタログID: RMS と同じ「IDあり / IDなし」の切替 + 基本情報タブの JAN 欄との同期 (2026-09-02)
-  (function () {
-    const withBox = document.getElementById('rk-catalog-with');
+  // カタログID (カテゴリ・属性タブ) は確認表示だけ。入力は基本情報タブ (単品=JAN欄 / バリエーション=SKU表)
+  // に一本化した (2026-09-02 中原さん)。表示は入力欄から組み立て、入力に追従して更新する。
+  // 「IDなしの理由」は JAN の無い SKU があるときだけ見せる
+  (function initCatalogStatus() {
+    const box = document.getElementById('rk-catalog-status');
     const withoutBox = document.getElementById('rk-catalog-without');
-    if (!withBox || !withoutBox) return;
-    document.querySelectorAll('input[name="rk-catalog-mode"]').forEach((r) => {
-      r.addEventListener('change', () => {
-        const withMode = document.querySelector('input[name="rk-catalog-mode"]:checked')?.value === 'with';
-        withBox.style.display = withMode ? '' : 'none';
-        withoutBox.style.display = withMode ? 'none' : '';
-      });
-    });
-    // 同じ jan_code の 2 つのビュー (基本情報タブの JAN 欄とここ)。画面内で食い違わないよう相互コピー
-    const janHere = document.getElementById('rk-catalog-jan');
+    if (!box) return;
+    const skuInputs = Array.from(document.querySelectorAll('.sku-jan-input'));
     const janBasic = document.getElementById('f-jan');
-    if (janHere && janBasic) {
-      janHere.addEventListener('input', () => { if (janBasic.value !== janHere.value) janBasic.value = janHere.value; });
-      janBasic.addEventListener('input', () => { if (janHere.value !== janBasic.value) janHere.value = janBasic.value; });
+    function jumpToBasic(e) {
+      e.preventDefault();
+      const b = document.querySelector('#tabbar .tab-btn[data-tab="tab-basic"]');
+      if (b) b.click();
     }
+    function render() {
+      box.innerHTML = '';
+      let missing = 0;
+      const head = document.createElement('div');
+      if (skuInputs.length > 0) {
+        const ul = document.createElement('ul');
+        ul.style.cssText = 'margin:4px 0; padding-left:18px; font-size:12px;';
+        for (const i of skuInputs) {
+          const v = i.value.trim();
+          if (!v) missing += 1;
+          const li = document.createElement('li');
+          li.textContent = i.dataset.code + ' — ' + (v ? 'IDあり ' + v : 'IDなし (下の理由で送ります)');
+          ul.appendChild(li);
+        }
+        head.textContent = 'SKUごとに送ります (' + (skuInputs.length - missing) + '/' + skuInputs.length + ' 件入力済み)';
+        box.appendChild(head);
+        box.appendChild(ul);
+      } else {
+        const v = janBasic ? janBasic.value.trim() : '';
+        if (!v) missing = 1;
+        head.textContent = v ? 'IDあり — JAN ' + v : 'IDなし — 下の理由で送ります';
+        box.appendChild(head);
+      }
+      const link = document.createElement('a');
+      link.href = '#tab-basic';
+      link.style.fontSize = '12px';
+      link.textContent = skuInputs.length > 0 ? '基本情報タブのSKU表で入力する' : '基本情報タブのJANコード欄で入力する';
+      link.addEventListener('click', jumpToBasic);
+      box.appendChild(link);
+      if (withoutBox) withoutBox.style.display = missing > 0 ? '' : 'none';
+    }
+    skuInputs.forEach((i) => { i.addEventListener('input', render); i.addEventListener('change', render); });
+    if (janBasic) janBasic.addEventListener('input', render);
+    render();
   })();
 
   // SKU別の選択肢 (2026-09-02 カラバリ出品)。JAN欄と同じ作法: 入力即保存・POSTは1本ずつ

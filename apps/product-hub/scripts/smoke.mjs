@@ -1308,22 +1308,19 @@ b27 = listing.buildItemPayload(db, rkId);
 check('payload: 税率の不正値を弾く (8/10/空欄のみ)', b27.ok === false && b27.reasons.some((r) => r.includes('税率')), JSON.stringify(b27.reasons));
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
 
-// 手入力のカタログID属性と JAN欄の不一致は止める (Codex R1 Medium-4)
-db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4999999999999"]}]' WHERE draft_id = ?`).run(rkId);
+// 商品属性の行に「カタログID」を手入力する経路は廃止 (2026-09-02: 入口は基本情報タブだけ)。
+// JAN欄と一致していても弾く (旧データの掃除を促す)
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567894"]}]' WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
-check('payload: カタログID属性とJAN欄の不一致を弾く', b27.ok === false && b27.reasons.some((r) => r.includes('一致しません')), JSON.stringify(b27.reasons));
+check('payload: 属性行のカタログIDは弾く (入口は基本情報タブだけ)',
+  b27.ok === false && b27.reasons.some((r) => r.includes('属性の行に「カタログID」')), JSON.stringify(b27.reasons));
 
-// R2: 複数のカタログID属性で不一致検査を迂回できない
-db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567894"]},{"name":"カタログID","values":["4999999999999"]}]' WHERE draft_id = ?`).run(rkId);
+// JAN欄の不正値 (チェックデジット違い) は止める
+db.prepare(`UPDATE product_drafts SET jan_code = '4901234567890' WHERE id = ?`).run(rkId);
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["ノーブランド品"]}]' WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
-check('payload: カタログID属性の複数記述を弾く', b27.ok === false && b27.reasons.some((r) => r.includes('複数')), JSON.stringify(b27.reasons));
-
-// R2: JAN欄が空でも手入力カタログID自体を GTIN 検証する
-db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(rkId);
-db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567890"]}]' WHERE draft_id = ?`).run(rkId);
-b27 = listing.buildItemPayload(db, rkId);
-check('payload: 手入力カタログIDの不正値を弾く (JAN欄が空でも)',
-  b27.ok === false && b27.reasons.some((r) => r.includes('カタログID') && r.includes('不正')), JSON.stringify(b27.reasons));
+check('payload: JAN欄の不正値を弾く',
+  b27.ok === false && b27.reasons.some((r) => r.includes('JANコード') && r.includes('不正')), JSON.stringify(b27.reasons));
 db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["ノーブランド品"]}]' WHERE draft_id = ?`).run(rkId);
 
@@ -1601,7 +1598,52 @@ db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = '[{"
 db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(gdId);
 gb = listing.buildItemPayload(db, gdId);
 check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラーになる',
-  gb.ok === false && gb.reasons.some((r) => r.includes('カタログID')), JSON.stringify(gb.reasons));
+  gb.ok === false && gb.reasons.some((r) => r.includes('カタログID') && r.includes('JANコード欄')), JSON.stringify(gb.reasons));
+
+// ─── バリエーション + 辞書にカタログIDあり: 属性は SKU ごとに自分の JAN (2026-09-02 根本対策) ───
+// それまではページ代表の jan_code を全 SKU の「カタログID」属性に付けていて、SKU の articleNumber と食い違っていた。
+// ページ代表の jan_code (ここでは 4999999999999) は楽天には使わない
+{
+  insProd.run(9311, 'gdv-a', 'バリA', 'gdv');
+  insProd.run(9312, 'gdv-b', 'バリB', 'gdv');
+  const gdvId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price, jan_code) VALUES ('gdv', '辞書バリエ', 1500, '4999999999999')`).run().lastInsertRowid);
+  db.prepare(`UPDATE product_drafts SET detail_images_excluded = 1 WHERE id = ?`).run(gdvId);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, variant_selector_name)
+    VALUES (?, '900001', '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]}]', 'カラー')`).run(gdvId);
+  db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'gdv1', 0)`).run(gdvId);
+  db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gdv1', '/x/gdv1.jpg')`).run(gdvId);
+  const insSelV = db.prepare('INSERT INTO draft_sku_selector_values (draft_id, sku_code, value) VALUES (?, ?, ?)');
+  insSelV.run(gdvId, 'gdv-a', '黒');
+  insSelV.run(gdvId, 'gdv-b', '白');
+  db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(gdvId, 'gdv-a', '4901234567894');
+  let gv = listing.buildItemPayload(db, gdvId);
+  check('genre×バリエーション: JAN の無い SKU があると SKU 名つきで止まる (ページ代表の jan_code は見ない)',
+    gv.ok === false
+    && gv.reasons.some((r) => r.includes('gdv-b') && r.includes('カタログID') && r.includes('SKU表'))
+    && !gv.reasons.some((r) => r.includes('gdv-a') && r.includes('カタログID')),
+    JSON.stringify(gv.reasons));
+  db.prepare('INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)').run(gdvId, 'gdv-b', '4999999999999');
+  gv = listing.buildItemPayload(db, gdvId);
+  const catOf = (sku) => ((gv.ok && gv.payload.variants[sku].attributes) || []).filter((a) => a.name === 'カタログID').map((a) => a.values[0]);
+  check('genre×バリエーション: カタログID属性は SKU ごとに自分の JAN (articleNumber と一致)',
+    gv.ok === true
+    && catOf('gdv-a').join() === '4901234567894' && gv.payload.variants['gdv-a'].articleNumber.value === '4901234567894'
+    && catOf('gdv-b').join() === '4999999999999' && gv.payload.variants['gdv-b'].articleNumber.value === '4999999999999',
+    JSON.stringify(gv.ok ? gv.payload.variants : gv.reasons));
+  // 辞書に無いジャンルでは SKU にもカタログID属性を付けない (IE1002 対策はバリエーションでも同じ)
+  db.prepare(`UPDATE draft_rakuten SET genre_id = '999999', attributes_json = '[]' WHERE draft_id = ?`).run(gdvId);
+  gv = listing.buildItemPayload(db, gdvId);
+  check('genre×バリエーション: 辞書未取得ジャンルでは SKU にカタログID属性を付けない',
+    gv.ok === true && catOf('gdv-a').length === 0 && gv.payload.variants['gdv-a'].articleNumber.value === '4901234567894',
+    JSON.stringify(gv.ok ? gv.payload.variants : gv.reasons));
+  db.prepare('DELETE FROM draft_sku_selector_values WHERE draft_id = ?').run(gdvId);
+  db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ?').run(gdvId);
+  db.prepare('DELETE FROM draft_cabinet_images WHERE draft_id = ?').run(gdvId);
+  db.prepare('DELETE FROM draft_images WHERE draft_id = ?').run(gdvId);
+  db.prepare('DELETE FROM draft_rakuten WHERE draft_id = ?').run(gdvId);
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(gdvId);
+  db.prepare('DELETE FROM mirror_products WHERE product_id IN (9311, 9312)').run();
+}
 
 // ─── メーカー型番は「メーカー型番」欄が唯一の入口 (2026-08-31 中原さん指摘) ───
 // RMS でも入力項目は 1 つなのに、画面が「メーカー型番」欄と商品属性の 2 箇所に入れさせていた。
@@ -4720,23 +4762,29 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
       r.status === 200 && !saved.article_number && !String(saved.attributes_json).includes('OLD'),
       `${r.status} ${JSON.stringify(saved)}`);
   }
-  // カタログID (JAN) の保存 (2026-09-02: 画面の「カタログID」ブロック → product_drafts.jan_code)
-  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '4901234567894' });
-  check('カタログID: catalog_jan で jan_code が保存される',
+  // カタログID (JAN) 本体は /rakuten では受けない (2026-09-02: 入力は基本情報タブだけ)。
+  // 旧クライアントが catalog_jan を送ってきても jan_code は触らない
+  db.prepare('UPDATE product_drafts SET jan_code = ? WHERE id = ?').run('4901234567894', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '4999999999999', attributes: [] });
+  check('カタログID: /rakuten の catalog_jan は無視され jan_code は変わらない (入口は基本情報タブだけ)',
+    r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code === '4901234567894',
+    `${r.status} ${JSON.stringify(r.json)}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '', attributes: [] });
+  check('カタログID: catalog_jan の空文字でも jan_code は消えない',
     r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code === '4901234567894',
     `${r.status}`);
-  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '1234' });
-  check('カタログID: 不正な JAN は 400', r.status === 400, `${r.status} ${JSON.stringify(r.json)}`);
-  check('カタログID: 400 のとき既存の JAN は変わらない',
-    db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code === '4901234567894');
-  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_jan: '' });
-  check('カタログID: 空文字でクリアできる (IDなしを選んだ)',
-    r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code == null,
+  // 「IDなしの理由」は /rakuten で保存する (JAN の無い SKU に使う)
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_id_exemption_reason: '3', attributes: [] });
+  check('カタログID: IDなしの理由が保存される',
+    r.status === 200 && db.prepare('SELECT catalog_id_exemption_reason FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id).catalog_id_exemption_reason === 3,
     `${r.status}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { catalog_id_exemption_reason: '9', attributes: [] });
+  check('カタログID: 範囲外の理由は 400', r.status === 400, `${r.status} ${JSON.stringify(r.json)}`);
   r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [] });
-  check('カタログID: catalog_jan を送らない保存では jan_code を触らない',
-    r.status === 200 && db.prepare('SELECT jan_code FROM product_drafts WHERE id = ?').get(gdraft3.id).jan_code == null,
+  check('カタログID: 理由を送らない保存では既存の理由を維持する',
+    r.status === 200 && db.prepare('SELECT catalog_id_exemption_reason FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id).catalog_id_exemption_reason === 3,
     `${r.status}`);
+  db.prepare('UPDATE product_drafts SET jan_code = NULL WHERE id = ?').run(gdraft3.id);
 
   // 旧形式 {name, value} で残っている値も拾う (Codex R2 medium: values 配列だけ見ると消える)
   db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
@@ -5164,6 +5212,14 @@ renders.push(
       skuJans: { 'rooms-l-wh': '4912345678904' },
       skuSelectorValues: { 'rooms-l-wh': 'ホワイト' },
     }]);
+    // 除外で実効 1 SKU になったバリエーション (2026-09-02 Codex R1 medium): サーバーは単品扱い
+    // (memberCount > 1 でない) なので、画面も JAN 欄を出し SKU 表には JAN 入力欄を出さない
+    renders.push(['detail.ejs (バリエーション: 実効1SKU)', 'detail.ejs', {
+      ...d0[2],
+      draft: { ...d0[2].draft, ne_code: 'rooms', price: 1980, jan_code: '4901234567894' },
+      variation: { ...variationFixtures.rep, members: variationFixtures.rep.members.slice(0, 1), memberCount: 1 },
+      skuJans: {}, skuSelectorValues: {},
+    }]);
     // 商品情報: ブランド名・容量が入っている分岐
     renders.push(['detail.ejs (商品情報: ブランド名・容量あり)', 'detail.ejs', {
       ...d0[2],
@@ -5325,6 +5381,21 @@ for (const [name, file, data] of renders) {
   } catch (e) {
     check(`render ${name}`, false, e.message);
   }
+}
+
+// ─── カタログID (JAN) の入口は基本情報タブだけ (2026-09-02 中原さん: 2 箇所に入れさせない) ───
+{
+  // 単品の描画 = variationFixtures.single を使う fixture (「detail.ejs (full/own_brand)」は子SKUの描画)
+  const single = renderedHtml.get('detail.ejs (rakuten registered + shop categories)') || '';
+  const multi = renderedHtml.get('detail.ejs (バリエーション: SKU別JANのみ)') || '';
+  const one = renderedHtml.get('detail.ejs (バリエーション: 実効1SKU)') || '';
+  check('カタログID画面: 単品は JAN 欄が基本情報タブに 1 つ、カテゴリ・属性タブは確認表示のみ',
+    single.includes('id="f-jan"') && !single.includes('rk-catalog-jan') && !single.includes('rk-catalog-mode')
+    && single.includes('id="rk-catalog-status"') && !single.includes('class="sku-jan-input"'));
+  check('カタログID画面: バリエーションは SKU 表の JAN 入力欄だけ (ページ代表の JAN 欄は出ない)',
+    !multi.includes('id="f-jan"') && multi.includes('class="sku-jan-input"') && multi.includes('id="rk-catalog-status"'));
+  check('カタログID画面: 実効 1 SKU は単品と同じ (JAN 欄あり・SKU 表に JAN 入力欄なし) = サーバーの判定と一致',
+    one.includes('id="f-jan"') && !one.includes('class="sku-jan-input"') && one.includes('単品扱い'));
 }
 
 // ─── 画面から消した UI が戻ってこないこと (2026-08-28 中原さん指摘) ───
@@ -6148,6 +6219,231 @@ for (const [name, file, data] of renders) {
       check(`client-js syntax ${f}`, true);
     } catch (e) {
       check(`client-js syntax ${f}`, false, e.message);
+    }
+  }
+
+  // ─── SKU別JAN の保存ワーカー (detail.ejs initSkuJans) の時系列テスト (2026-09-02 Codex R3/R4 high) ───
+  // 画面の IIFE をそのまま切り出し、最小の DOM もどきと手動で応答を返す post で走らせる
+  {
+    const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+    const start = src.indexOf('(function initSkuJans() {');
+    const end = src.indexOf('\n  })();', start);
+    const iife = start >= 0 && end > start ? src.slice(start, end + '\n  })();'.length) : '';
+    check('sku-jan worker: detail.ejs から initSkuJans を切り出せる', iife.length > 200, String(iife.length));
+    class FakeEvent { constructor(type) { this.type = type; } }
+    const mkInput = (code, value) => {
+      const ls = {};
+      return {
+        value, dataset: { code },
+        addEventListener(t, fn) { (ls[t] = ls[t] || []).push(fn); },
+        dispatchEvent(ev) { (ls[ev.type] || []).forEach((fn) => fn(ev)); },
+        change(v) { this.value = v; this.dispatchEvent(new FakeEvent('change')); },
+      };
+    };
+    const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0)); };
+    function harness() {
+      const a = mkInput('sku-a', ''), b = mkInput('sku-b', '');
+      const pending = []; const alerts = []; const posts = [];
+      const ctx = {
+        document: {
+          querySelectorAll: (sel) => (sel === '.sku-jan-input' ? [a, b] : []),
+          getElementById: () => null,
+        },
+        Event: FakeEvent, alert: (m) => alerts.push(String(m)), BASE: '/x',
+        post: (url, body) => new Promise((resolve, reject) => { posts.push(body); pending.push({ body, resolve, reject }); }),
+        setTimeout, console,
+      };
+      vm.createContext(ctx);
+      const api = new vm.Script(`let flushSkuJanSaves = async () => true;\n${iife}\n({ flush: () => flushSkuJanSaves() })`, { filename: 'initSkuJans' }).runInContext(ctx);
+      return { a, b, pending, alerts, posts, flush: api.flush };
+    }
+    // 1) A の保存が通信中に flush → その間に B を変更 → A 成功 → B も保存されてから flush が true で戻る
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      const fl = h.flush();
+      await tick();
+      h.b.change('4912345678904');
+      await tick();
+      h.pending.shift().resolve({ ok: true });
+      await tick();
+      check('sku-jan worker: 待機中の変更も保存してから flush が戻る', h.pending.length === 1 && h.pending[0].body.jan_code === '4912345678904', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok = await fl;
+      check('sku-jan worker: 全部保存できたら flush=true', ok === true && h.posts.length === 2 && h.alerts.length === 0, JSON.stringify({ ok, posts: h.posts, alerts: h.alerts }));
+    }
+    // 2) サーバー拒否 → 画面は DB の値へ巻き戻り、flush=false (合流した drain の失敗が伝わる)
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      const fl = h.flush();
+      await tick();
+      h.pending.shift().resolve({ ok: false, error: 'dup' });
+      const ok = await fl;
+      check('sku-jan worker: 拒否は巻き戻し + flush=false', ok === false && h.a.value === '' && h.alerts.length === 1 && h.posts.length === 1, JSON.stringify({ ok, a: h.a.value, alerts: h.alerts }));
+      // 拒否後は dirty が無いので、次の flush は POST なしで true
+      const ok2 = await h.flush();
+      check('sku-jan worker: 拒否で巻き戻した後の flush は再送せず true', ok2 === true && h.posts.length === 1);
+    }
+    // 3) 通信エラー → 巻き戻さず dirty のまま止まる (DB がコミット済みかもしれない)。flush=false。次の flush で冪等に再送
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      const fl = h.flush();
+      await tick();
+      h.pending.shift().reject(new Error('network'));
+      const ok = await fl;
+      check('sku-jan worker: 通信エラーは巻き戻さず flush=false', ok === false && h.a.value === '4901234567894' && h.posts.length === 1, JSON.stringify({ ok, a: h.a.value, posts: h.posts }));
+      const fl2 = h.flush();
+      await tick();
+      check('sku-jan worker: 次の flush で同じ値を再送する', h.pending.length === 1 && h.pending[0].body.jan_code === '4901234567894', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok2 = await fl2;
+      check('sku-jan worker: 再送が通れば flush=true', ok2 === true && h.posts.length === 2);
+    }
+    // 4) drain の途中で 1 件目が拒否済み・2 件目が通信中に flush → 2 件目が成功しても false (失敗は drain の結果として残る)
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      h.b.change('4912345678904');
+      await tick();
+      h.pending.shift().resolve({ ok: false, error: 'dup' }); // A 拒否 → 巻き戻し
+      await tick();
+      check('sku-jan worker: 2 件目 (B) の保存が進んでいる', h.pending.length === 1 && h.pending[0].body.ne_code === 'sku-b', JSON.stringify(h.posts));
+      const fl = h.flush(); // 実行中の drain に合流
+      await tick();
+      h.pending.shift().resolve({ ok: true });
+      const ok = await fl;
+      check('sku-jan worker: 合流前に起きた拒否も flush=false に反映される', ok === false && h.a.value === '' && h.b.value === '4912345678904', JSON.stringify({ ok, a: h.a.value, b: h.b.value }));
+      const ok2 = await h.flush();
+      check('sku-jan worker: その後の flush は (dirty なし・失敗なし) true', ok2 === true && h.posts.length === 2);
+    }
+    // 5) 通信中に元の値へ戻す + 応答消失 (Codex R5 high): 画面と lastOf は一致するが DB は不明 →
+    //    uncertain のまま flush=false。次の flush で現在値 (空 = 解除) を再送し、成功して初めて true
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      h.a.change(''); // 応答待ち中に元の値へ戻す (rerun が立つ)
+      await tick();
+      h.pending.shift().reject(new Error('network')); // サーバーは A をコミットしたかもしれない
+      await tick();
+      const fl1 = h.flush();
+      await tick();
+      check('sku-jan worker: 不明な入力は画面が旧値と同じでも現在値 (空 = 解除) を再送する',
+        h.pending.length === 1 && h.pending[0].body.jan_code === '' && h.pending[0].body.ne_code === 'sku-a', JSON.stringify(h.posts));
+      h.pending.shift().reject(new Error('network'));
+      const ok = await fl1;
+      check('sku-jan worker: 再送も失敗なら flush=false のまま (DB 不明)', ok === false && h.posts.length === 2, JSON.stringify({ ok, posts: h.posts }));
+      const fl2 = h.flush();
+      await tick();
+      h.pending.shift().resolve({ ok: true });
+      const ok2 = await fl2;
+      check('sku-jan worker: 再送が通れば uncertain が消えて flush=true', ok2 === true && h.posts.length === 3, JSON.stringify({ ok2, posts: h.posts }));
+      const ok3 = await h.flush();
+      check('sku-jan worker: 確定後の flush は再送しない', ok3 === true && h.posts.length === 3);
+    }
+    // 6) 結果不明のまま再送がサーバーに拒否された (Codex R6 low): 巻き戻す先が無いので巻き戻さず、
+    //    flush=false・再読込案内。次の flush でも再送され、成功して初めて確定
+    {
+      const h = harness();
+      h.a.change('4901234567894');
+      await tick();
+      h.pending.shift().reject(new Error('network'));
+      await tick();
+      const fl1 = h.flush();
+      await tick();
+      h.pending.shift().resolve({ ok: false, error: 'dup' });
+      const ok = await fl1;
+      check('sku-jan worker: 不明中の拒否は巻き戻さず flush=false + 再読込案内',
+        ok === false && h.a.value === '4901234567894' && h.alerts.some((m) => m.includes('再読み込み')), JSON.stringify({ ok, a: h.a.value, alerts: h.alerts }));
+      const fl2 = h.flush();
+      await tick();
+      check('sku-jan worker: 不明中の拒否の後も次の flush で再送する', h.pending.length === 1 && h.pending[0].body.jan_code === '4901234567894', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok2 = await fl2;
+      check('sku-jan worker: 再送が通れば確定して flush=true', ok2 === true && h.posts.length === 3);
+    }
+  }
+
+  // ─── 単品 JAN の保存 (detail.ejs saveJanIfChanged) の時系列テスト (Codex R5 high) ───
+  {
+    const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+    const start = src.indexOf('let lastSavedJan =');
+    const end = src.indexOf('  // SKU別JAN の保存キュー', start);
+    const chunk = start >= 0 && end > start ? src.slice(start, end) : '';
+    check('jan save: detail.ejs から saveJanIfChanged を切り出せる', chunk.includes('function saveJanIfChanged') && chunk.length > 200, String(chunk.length));
+    const tick = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setTimeout(r, 0)); };
+    function harness(initial) {
+      const el = { value: initial };
+      const pending = []; const alerts = []; const posts = [];
+      const ctx = {
+        document: { getElementById: (id) => (id === 'f-jan' ? el : null) },
+        alert: (m) => alerts.push(String(m)), BASE: '/x',
+        post: (url, body) => new Promise((resolve, reject) => { posts.push(body); pending.push({ body, resolve, reject }); }),
+        setTimeout, console,
+      };
+      vm.createContext(ctx);
+      const api = new vm.Script(`${chunk}\n({ save: () => saveJanIfChanged() })`, { filename: 'saveJanIfChanged' }).runInContext(ctx);
+      return { el, pending, alerts, posts, save: api.save };
+    }
+    // X → A に変更して保存開始 → 通信中に X へ戻す → 応答消失。次の保存は値が同じでも必ず再送する
+    {
+      const h = harness('4901234567894');
+      h.el.value = '4912345678904';
+      const s1 = h.save();
+      await tick();
+      h.el.value = '4901234567894'; // 元の値へ戻す
+      h.pending.shift().reject(new Error('network'));
+      const ok1 = await s1;
+      check('jan save: 通信エラーは false + 不明状態', ok1 === false && h.alerts.length === 1, JSON.stringify({ ok1, alerts: h.alerts }));
+      const s2 = h.save();
+      await tick();
+      check('jan save: 不明状態なら現在値が lastSavedJan と同じでも再送する', h.pending.length === 1 && h.pending[0].body.jan_code === '4901234567894', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok2 = await s2;
+      check('jan save: 再送が通れば true', ok2 === true && h.posts.length === 2);
+      const ok3 = await h.save();
+      check('jan save: 確定後は値が同じなら再送しない', ok3 === true && h.posts.length === 2);
+    }
+    // 保存中の打ち直しは最新値まで保存してから戻る (Codex R2 high)
+    {
+      const h = harness('');
+      h.el.value = '4901234567894';
+      const s1 = h.save();
+      await tick();
+      h.el.value = '4912345678904'; // 応答待ち中に打ち直し
+      h.pending.shift().resolve({ ok: true });
+      await tick();
+      check('jan save: 打ち直された値も続けて保存する', h.pending.length === 1 && h.pending[0].body.jan_code === '4912345678904', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok = await s1;
+      check('jan save: 最新値まで保存できたら true', ok === true && h.posts.length === 2);
+    }
+    // 結果不明 → 再送が拒否 → それでも未確定のまま (同値を再送し続け、成功時だけ解除) (Codex R6 low)
+    {
+      const h = harness('4901234567894');
+      h.el.value = '4912345678904';
+      const s1 = h.save();
+      await tick();
+      h.pending.shift().reject(new Error('network'));
+      const ok1 = await s1;
+      const s2 = h.save();
+      await tick();
+      h.pending.shift().resolve({ ok: false, error: 'bad' });
+      const ok2 = await s2;
+      check('jan save: 不明中の拒否は false のまま', ok1 === false && ok2 === false && h.posts.length === 2, JSON.stringify({ ok1, ok2, posts: h.posts }));
+      const s3 = h.save();
+      await tick();
+      check('jan save: 拒否の後も未確定なので同値を再送する', h.pending.length === 1 && h.pending[0].body.jan_code === '4912345678904', JSON.stringify(h.posts));
+      h.pending.shift().resolve({ ok: true });
+      const ok3 = await s3;
+      const ok4 = await h.save();
+      check('jan save: 成功で確定 → 以後は再送しない', ok3 === true && ok4 === true && h.posts.length === 3);
     }
   }
 }
