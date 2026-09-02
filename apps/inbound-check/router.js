@@ -28,6 +28,10 @@ import {
 } from './db.js';
 import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProductMaster } from './drive-fetch.js';
 import { runNotionSweep, notionStatusForAdmin, resetNotionRow } from './notion-sync.js';
+import {
+  parseWorkMasterXlsx, compareIrohaFlags, applyWorkMaster, seedIrohaFlags, logWorkMasterImport,
+  workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow, importIssueCount, computeDeletions,
+} from './work-master.js';
 // 入庫情報の書き込みは inbound-info の関数を通す (いろは=有り の連動ルール・楽観ロック・
 // updated_by の記録がそこに1つだけある。ここで直に UPDATE すると規則が二重管理になる)
 import { updateInbound, getInbound, addManual } from '../inbound-info/db.js';
@@ -557,6 +561,8 @@ router.get('/admin', requireSession, api(async (req, res) => {
   try { drive = await statusForView(); } catch (e) { drive = { driveError: e.message, config: driveConfig() }; }
   let notion = null;
   try { notion = notionStatusForAdmin(); } catch (e) { notion = { error: e.message }; }
+  let workMaster = null;
+  try { workMaster = workMasterStats(); } catch (e) { workMaster = { error: e.message, total: 0, filled: 0 }; }
   res.render(path.join(__dirname, 'views/admin'), {
     title: '入荷受付チェック 管理',
     username: req.session.email,
@@ -571,6 +577,7 @@ router.get('/admin', requireSession, api(async (req, res) => {
     workers: listWorkers(),   // = スタッフマスタの有効スタッフ (表示のみ。編集は /apps/staff)
     drive,
     notion,
+    workMaster,
   });
 }));
 
@@ -615,6 +622,73 @@ router.post('/admin/notion-sync', requireSession, checkOrigin, api(async (req, r
   // 17:30 を待たずに送ってしまわない (Codex R2 #5)。「今すぐ送る」ボタンだけが full
   const r = await runNotionSweep({ actor: req.session.email, mode: retryId ? 'retry' : 'full' });
   res.status(r.ok ? 200 : (r.error === 'already_running' ? 409 : 502)).json(r);
+}));
+
+// ─── いろは作業仕様マスタ (旧「作業内容管理マスター」シートの DB 化) ───
+// 取込は xlsx をそのままアップロード。既定は dry-run (検証と FLG 突合レポートだけ)。
+// apply=1 で本取込、さらに seed=1 なら「f_inbound_info が未設定の SKU にだけ」いろは有無を書く。
+// 書き込みを伴うので管理者のみ
+router.post('/admin/work-master-import', requireAdmin, checkOrigin, upload.single('file'), api(async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'no_file', message: 'xlsx ファイルを選んでください' });
+  let buf;
+  try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch { /* 一時ファイルの掃除失敗は無視 */ } }
+  let parsed;
+  try {
+    parsed = await parseWorkMasterXlsx(buf);
+  } catch (e) {
+    logWorkMasterImport({ actor: req.session.email, fileName: req.file.originalname, ok: false, message: e.message });
+    return res.status(400).json({ ok: false, error: 'bad_xlsx', message: e.message });
+  }
+  const compare = compareIrohaFlags(parsed.rows);
+  const apply = String(req.body?.apply || '') === '1';
+  const seed = apply && String(req.body?.seed || '') === '1';
+  const issueTotal = importIssueCount(parsed.issues);
+  const del = computeDeletions(parsed.rows);   // 取込 = 全置換。xlsx に無い既存行は削除される (予告して見せる)
+  const out = {
+    ok: true, dryRun: !apply, dataRows: parsed.dataRows, rowCount: parsed.rows.length,
+    issues: parsed.issues, issueTotal,
+    wouldDelete: { count: del.count, codes: del.codes },
+    buckets: compare.buckets,
+    seedableCount: compare.seedable.length, infoOnlyCount: compare.infoOnlyCount,
+    mismatchCount: compare.mismatches.length, mismatches: compare.mismatches.slice(0, 300),
+  };
+  // ⭐検証エラーが1件でもあれば本取込は拒否 (Codex PR2 High-1)。
+  //   「入数 abc」等を null で取り込むと既存値 (180 等) を黙って消すため、xlsx 側を直してもらう
+  if (apply && issueTotal > 0) {
+    logWorkMasterImport({
+      actor: req.session.email, fileName: req.file.originalname, ok: false,
+      message: `検証エラー ${issueTotal} 件のため本取込を拒否`,
+    });
+    return res.status(400).json({
+      ...out, ok: false, dryRun: true, error: 'validation_failed',
+      message: `検証エラーが ${issueTotal} 件あります。xlsx を直して取り込み直してください (下のレポート参照)`,
+    });
+  }
+  if (apply) {
+    out.applied = applyWorkMaster(parsed.rows, { user: req.session.email });
+    if (seed) out.seeded = seedIrohaFlags(compare.seedable, { user: req.session.email });
+    logWorkMasterImport({
+      actor: req.session.email, fileName: req.file.originalname, ok: true,
+      message: `${parsed.rows.length}行 (新規${out.applied.inserted}/更新${out.applied.updated}/変化なし${out.applied.unchanged}/削除${out.applied.deleted})`
+        + (out.seeded ? ` / いろは有無を${out.seeded.seeded}件書込 (新規行${out.seeded.added})` : ''),
+    });
+  }
+  res.json(out);
+}));
+
+router.get('/admin/work-master', requireSession, api((req, res) => {
+  const q = String(req.query?.q || '').trim();
+  res.json({ ok: true, stats: workMasterStats(), rows: q ? searchWorkMaster(q) : [] });
+}));
+
+router.post('/admin/work-master/add', requireAdmin, checkOrigin, api((req, res) => {
+  const r = addWorkMasterRow(req.body?.code, req.session.email);
+  res.status(r.ok ? 200 : 400).json(r);
+}));
+
+router.post('/admin/work-master/update', requireAdmin, checkOrigin, api((req, res) => {
+  const r = updateWorkMasterRow(req.body?.code, req.body?.fields || {}, req.session.email, Number(req.body?.expect_version));
+  res.status(r.ok ? 200 : (r.error === 'conflict' ? 409 : 400)).json(r);
 }));
 
 // 端末登録: 発行したトークンは httpOnly Cookie としてこの端末にだけ渡す。登録と同時に管理者セッションを破棄

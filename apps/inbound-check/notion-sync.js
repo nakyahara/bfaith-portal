@@ -110,7 +110,7 @@ export function ensureDedupeKey(db, row) {
  *   30日分・対象表ごとに1クエリで Map を作る (mirror_sales_daily は数百万行になり得る)。
  */
 export function buildEnrichContext(db) {
-  const ctx = { products: new Map(), suppliers: new Map(), sales30: new Map(), freeStock: new Map() };
+  const ctx = { products: new Map(), suppliers: new Map(), sales30: new Map(), freeStock: new Map(), workMaster: new Map() };
   if (tableExists(db, 'mirror_products')) {
     for (const r of db.prepare('SELECT 商品コード AS code, 仕入先コード AS sup, 取扱区分 AS handling FROM mirror_products').all()) {
       const k = String(r.code || '').trim().toLowerCase();
@@ -138,6 +138,10 @@ export function buildEnrichContext(db) {
       GROUP BY LOWER(TRIM(商品ID))`).all();
     for (const r of rows) if (r.k) ctx.freeStock.set(r.k, Number(r.free) || 0);
   }
+  if (tableExists(db, 'f_iroha_work_master')) {
+    // いろは作業仕様 (資材・収納容器・容器あたり数量・工程数・備考)。旧シートの置き換え (PR2)
+    for (const r of db.prepare('SELECT * FROM f_iroha_work_master').all()) ctx.workMaster.set(r.code_key, r);
+  }
   return ctx;
 }
 
@@ -164,7 +168,7 @@ function barcodeFor(db, row) {
  * Notion プロパティを組み立てる。names (実在するプロパティ名の集合) に無い項目は送らない
  * (プロパティが改名・削除されていても、その項目だけ落ちて送信自体は成功する)。
  */
-export function buildCardProperties(row, { barcode, product, supplierName, ext, dedupeKey }, names) {
+export function buildCardProperties(row, { barcode, product, supplierName, ext, dedupeKey, wm }, names) {
   const props = {};
   const put = (name, value) => { if (names.has(name)) props[name] = value; };
   const text = (s) => [{ text: { content: String(s).slice(0, 1900) } }];
@@ -195,9 +199,16 @@ export function buildCardProperties(row, { barcode, product, supplierName, ext, 
   } else if (ext.sales30 == null) {
     put('外部出し目安', { rich_text: text('販売実績なし') });
   }
-  // ⚠「入数」は送らない: 旧マスターの入数 (いろは容器あたり数) と f_inbound_info の入数 (仕入箱入数) は
-  //   意味が違う疑いがあり、間違った意味の数字を現場に見せない (Codex設計相談R1 質問2-3。PR2 の
-  //   f_iroha_work_master 整備後に units_per_container を載せる)
+  // いろは作業仕様マスタ (f_iroha_work_master) 由来。未整備の商品は各項目を送らない (それが正常な状態)。
+  // ⚠「入数」に載せるのは units_per_container (いろはで1容器に詰める数) だけ。f_inbound_info の
+  //   入数 (仕入箱入数) は意味が違うので送らない (Codex設計相談R1 質問2-3)
+  if (wm) {
+    if (wm.material_code) put('資材セットID', { rich_text: text(wm.material_code) });
+    if (wm.storage_container) put('収納容器', { rich_text: text(wm.storage_container) });
+    if (wm.units_per_container != null) put('入数', { number: wm.units_per_container });
+    if (wm.process_count != null) put('工程数', { number: wm.process_count });
+    if (wm.note) put('備考', { rich_text: text(wm.note) });
+  }
   return props;
 }
 
@@ -452,7 +463,8 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
           const product = ctx.products.get(key) || null;
           const supplierName = product ? (ctx.suppliers.get(normSupplierCode(product.supplierCode)) || null) : null;
           const ext = calcExternal(ctx.sales30.get(key) ?? null, ctx.freeStock.get(key) ?? null);
-          const props = buildCardProperties(row, { barcode: barcodeFor(db, row), product, supplierName, ext, dedupeKey }, schema.names);
+          const wm = ctx.workMaster.get(key) || null;
+          const props = buildCardProperties(row, { barcode: barcodeFor(db, row), product, supplierName, ext, dedupeKey, wm }, schema.names);
           const created = await createCardSafe(props, dedupeKey);
           pageId = created.id;
           wasRecovered = !!created.recoveredAfterError;
