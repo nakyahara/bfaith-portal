@@ -708,6 +708,19 @@ t('ship_change: 理由・提案は必須。リスト外は拒否', () => {
   applyEvent(sr.batchId, { opId: 'q-n1', event: 'next', slipSeq: 1 }, '星');
 });
 
+t('ship_change: ネコポス二枚出しは理由なしで受け付ける (記録+通知のみ — 中原さん指示 2026-09-02)', () => {
+  const sp = parseCs03003(makeCsv([row({ slip: '0132', sku: 'q3', tb: 'TB00000000090' })]));
+  const sr = importPackBatch(sp, { matchAck: true }, 'test');
+  applyEvent(sr.batchId, { opId: 'w2-s1', event: 'start' }, '星');
+  const r = applyEvent(sr.batchId, { opId: 'w2-c1', event: 'ship_change', slipSeq: 1, proposedMethod: 'ネコポス二枚出し' }, '星');
+  assert.deepEqual(r.heldSeqs, []);          // 通常の変更依頼と同じく保留しない
+  const chg = getDB().prepare('SELECT * FROM pk_pack_ship_changes ORDER BY id DESC LIMIT 1').get();
+  assert.equal(chg.proposed_method, 'ネコポス二枚出し');
+  assert.equal(chg.reason, '入らない');       // 理由未指定は「入らない」として記録 (再送文面にも載る)
+  applyEvent(sr.batchId, { opId: 'w2-n1', event: 'next', slipSeq: 1 }, '星');
+  assert.equal(getPackBatch(sr.batchId).status, 'done');
+});
+
 // ─── ①再ピック / ②棚戻し / ③ミス記録 (⭐候補方式: 記録→梱包終了時にまとめて送信) ───
 
 const { applyTaskAction, listOpenTasks, countOpenTasks, resolveIncident, listIncidents } = svc;

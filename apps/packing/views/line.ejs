@@ -323,6 +323,7 @@
     const BATCH_ID = <%= batch.id %>;
     const SLIPS = <%- JSON.stringify(slipList).replace(/</g, '\\u003c') %>;
     const METHOD_OPTIONS = <%- JSON.stringify((typeof methodOptions !== 'undefined' && methodOptions) || []).replace(/</g, '\\u003c') %>;
+    const TWO_LABELS_OPTION = <%- JSON.stringify((typeof twoLabelsOption !== 'undefined' && twoLabelsOption) || null).replace(/</g, '\\u003c') %>;
     const SHIP_REASONS = <%- JSON.stringify((typeof shipChangeReasons !== 'undefined' && shipChangeReasons) || []).replace(/</g, '\\u003c') %>;
     const workerSel = document.getElementById('worker');
     const savedWorker = localStorage.getItem('packLineWorker');
@@ -560,7 +561,15 @@
       const ms = METHOD_OPTIONS.filter((m) => m !== x.deliveryMethod)
         .map((m) => `<button type="button" onclick="reqShipReason(${x.seq}, this.dataset.m)" data-m="${esc(m)}">${esc(m)}</button>`).join('')
         || '<div style="grid-column:1/-1; color:#868e96">候補がありません</div>';
-      openReqBox(`#${x.seq} どの配送方法にしますか? (現在: ${x.deliveryMethod || '—'})`, `<div class="reason-grid">${ms}${cancelBtn}</div>`);
+      // 📦 ネコポス二枚出し (中原さん指示 2026-09-02): 配送方法は変えず送り状を2枚に。理由入力なし
+      const two = TWO_LABELS_OPTION
+        ? `<button type="button" onclick="reqShipTwoLabels(${x.seq})" style="grid-column:1/-1; background:#fff4e6; border-color:#e8590c">📦📦 ${esc(TWO_LABELS_OPTION)} (送り状2枚)</button>` : '';
+      openReqBox(`#${x.seq} どの配送方法にしますか? (現在: ${x.deliveryMethod || '—'})`, `<div class="reason-grid">${ms}${two}${cancelBtn}</div>`);
+    }
+    function reqShipTwoLabels(seq) {
+      closeReqBox();
+      if (!confirm(`#${seq} のネコポス二枚出し (送り状2枚・2個口) を事務へ依頼します。商品と納品書は変更待ちの棚へ置いてください。よろしいですか?`)) return;
+      send('ship_change', { slip_seq: seq, proposed_method: TWO_LABELS_OPTION });
     }
     function reqShipReason(seq, method) {
       const rs = SHIP_REASONS.map((r) => `<button type="button" onclick="reqShipSend(${seq}, this.dataset.m, this.dataset.r)" data-m="${esc(method)}" data-r="${esc(r)}">${esc(r)}</button>`).join('');

@@ -612,6 +612,10 @@ export const SHIP_CHANGE_REASONS = ['入らない', '資材が違う', 'その�
 export const SHIP_CHANGE_METHOD_OPTIONS = [
   '定形外', 'ネコポス', 'ゆうパケットパフ', 'レターパック', '宅急便50サイズ', '宅急便60サイズ',
 ];
+// ④ 特殊依頼: ネコポス二枚出し (中原さん指示 2026-09-02) — 配送方法は変えず、ネコポスの
+// 送り状をもう1枚 (2個口) 発行してもらう。扱いは通常の変更依頼と同じ (記録+GChat通知のみ・
+// 現物は変更待ち棚)。理由は聞かない (実質「入らない」一択なので画面で省く — 未指定は入らない扱い)
+export const SHIP_CHANGE_TWO_LABELS = 'ネコポス二枚出し';
 
 /**
  * 端末の発生時刻を [floor, now] にクランプ (中断時間の計測用)。
@@ -968,10 +972,12 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       // paused も許可 (④⑥フォーム表示中は自動中断で計測を止めるため — 2026-08-21)
       requireSlipOp(['packing', 'paused', 'done']);
       const proposed = String(proposedMethod || '').trim();
-      if (!SHIP_CHANGE_METHOD_OPTIONS.includes(proposed)) {
+      const twoLabels = proposed === SHIP_CHANGE_TWO_LABELS;
+      if (!twoLabels && !SHIP_CHANGE_METHOD_OPTIONS.includes(proposed)) {
         throw new PackError(400, 'bad_method', '提案する配送方法を選択してください');
       }
-      if (!SHIP_CHANGE_REASONS.includes(reason)) {
+      const reasonVal = twoLabels ? (reason || '入らない') : reason;
+      if (!SHIP_CHANGE_REASONS.includes(reasonVal)) {
         throw new PackError(400, 'bad_reason', '理由を選択してください');
       }
       const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
@@ -982,7 +988,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
            reason, requested_by, status, updated_at, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?)
       `).run(batchId, slipSeq, slip.ne_slip_no, batch.folder_name, slip.delivery_method,
-        proposed, reason, worker, now, now);
+        proposed, reasonVal, worker, now, now);
     } else if (event === 'reprint' || event === 'label_missing') {
       // 🖨 伝票再印刷依頼 (2026-08-21 中原さん指示): 記録+即時通知のみ。伝票状態は変えず、
       // 梱包画面にも痕跡を出さない (理由入力なし)。完了済み伝票でも押せる (配送変更と同様)

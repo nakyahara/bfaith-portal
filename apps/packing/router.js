@@ -28,7 +28,7 @@ import { getPollerStatus, markLedgerImported } from './drive-sync.js';
 import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
-  PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, lastDoneSeqOf, getDailySummary,
+  PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, SHIP_CHANGE_TWO_LABELS, lastDoneSeqOf, getDailySummary,
   resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal, listRepickReady,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText } from './notify.js';
@@ -454,6 +454,7 @@ router.get('/work/:id(\\d+)', async (req, res, next) => {
       shipChangeReasons: SHIP_CHANGE_REASONS,
       // 提案候補 = 固定リスト (中原さん指定 2026-08-16)。判定サービス委譲 (packing-dispatch) はPhase 3
       methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
+      twoLabelsOption: SHIP_CHANGE_TWO_LABELS,
       materials,                       // seq → 資材判定 (null = fail-soft)
       materialOpts,                    // { materials: [...], candidateCodes: [...] }
       materialUndoSec: MATERIAL_UNDO_SEC,
@@ -494,6 +495,7 @@ router.get('/line/:id(\\d+)', (req, res) => {
     repickBySlip,
     tasks,
     methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
+    twoLabelsOption: SHIP_CHANGE_TWO_LABELS,
     shipChangeReasons: SHIP_CHANGE_REASONS,
     pauseReasons: PAUSE_REASONS.filter((r) => r !== '配送変更の入力'),   // 一時中断の理由 (自動中断専用は出さない)
     title: `ライン | ${batch.folder_name || batch.tb_key}`,
