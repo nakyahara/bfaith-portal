@@ -21,8 +21,9 @@ import {
   listIrohaWorkers, getIrohaWorker, addIrohaWorker, setIrohaWorkerActive,
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
+  getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
 } from './db.js';
-import { ensureFresh, changeStatus, cacheStatsForAdmin, STATUSES } from './notion-read.js';
+import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
 import { buildList } from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -171,6 +172,8 @@ router.get('/api/state', api(async (req, res) => {
     ...list,
     workers: listIrohaWorkers(),
     refresh,
+    // タイマー表示の基準 (iPad の時計を信じない — 画面はこの値とのオフセットで経過を出す)
+    serverNow: new Date().toISOString(),
     me: { session: req.iwUser || null, device: req.iwDevice ? { id: req.iwDevice.id, label: req.iwDevice.label } : null, admin: isAdmin(req) },
   });
 }));
@@ -259,6 +262,80 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
   res.json(r);
 }));
 
+// ─── 作業時間セッション (開始 / 中断・終了) ───
+
+function safeLog(entry) {
+  try { logEvent(entry); } catch (e) { console.error('[iroha-work] 操作履歴の記録に失敗 (結果はそのまま返す)', e); }
+}
+
+const deviceLabelOf = (req) => (req.iwDevice ? req.iwDevice.label : (req.iwUser ? `session:${req.iwUser}` : null));
+
+/**
+ * 作業開始。sessions は自社DBが正本 (v1からためる — 後の正本化にそのまま繋がる)。
+ * ⑤最初の開始で Notion を「未着手→作業中」へ (best-effort。Notion が失敗しても開始は成立
+ *   — Notion API 成功を現場操作成功の条件にしない)
+ */
+router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const pageId = String(req.body?.page_id || '').trim();
+  if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
+  // 開始可否は**必ず**実ページを直接再取得して判定する (Codex PR2-R3: キャッシュが3分以内でも、
+  // その間に棚入完了・取消・アーカイブ・別DB移動があり得る)。取得失敗なら開始を拒否 —
+  // どのみち Notion に書けない状況なので、素性の分からないカードで時間だけ記録しない
+  const live = await fetchCardLive(pageId);
+  if (!live.ok) {
+    const st = (live.error === 'card_gone' || live.error === 'wrong_database') ? 404 : 502;
+    return res.status(st).json({ ok: false, error: live.error, message: live.message });
+  }
+  const card = getCachePage(pageId);   // fetchCardLive が最新状態を upsert 済み
+  if (card.status === '棚入完了') return res.status(409).json({ ok: false, error: 'done_card', message: 'このカードは棚入完了です (作業をはじめるなら職員がステータスを戻してください)' });
+  if (card.status === '取消') return res.status(409).json({ ok: false, error: 'cancelled_card', message: 'このカードは取消済みです' });
+
+  const r = startSession({
+    pageId, productCode: card.product_code, title: card.title,
+    worker: w.worker, deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.already) {
+    safeLog({ action: 'session_start', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
+      deviceLabel: deviceLabelOf(req), to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+  }
+  if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
+
+  // ⑤最初の開始で 未着手→作業中 (best-effort)。Notion が遅いときに現場の応答を道連れに
+  // しないよう 8 秒で見切る — 変更処理自体は裏で続き、キャッシュへは完了時に反映される
+  let statusNow = card.status;
+  if (card.status === '未着手') {
+    const change = changeStatus({ pageId, to: '作業中', expect: '未着手', isStaff: false })
+      .catch((e) => ({ ok: false, error: 'notion_error', message: e.message }));
+    const cs = await Promise.race([change, new Promise((resolve) => setTimeout(() => resolve(null), 8000))]);
+    if (cs?.ok) statusNow = cs.status;
+    else if (cs?.error === 'conflict' && cs.current) statusNow = cs.current;
+    // タイムアウト/失敗は開始を成立させたまま、次の巡回・手動更新に任せる
+  }
+  res.json({ ok: true, already: !!r.already, sessionId: r.sessionId, startedAt: r.startedAt, status: statusNow, serverNow: new Date().toISOString() });
+}));
+
+/** 作業終了 (done) / 中断 (pause)。時間はサーバー時刻の差分で確定 */
+router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const pageId = String(req.body?.page_id || '').trim();
+  const reason = String(req.body?.reason || '');
+  if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
+  const r = stopSession({ pageId, workerId: w.worker.id, sessionId: req.body?.session_id, reason });
+  safeLog({ action: 'session_stop', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
+    deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+  if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
+  res.json(r);
+}));
+
+// セッションの取り消し (誤操作の論理削除。管理者のみ)
+router.post('/admin/sessions/:id(\\d+)/void', checkOrigin, requireAdmin, api((req, res) => {
+  const r = voidSession(Number(req.params.id), req.session.email, req.body?.reason);
+  res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 409)).json(r);
+}));
+
 // ─── 管理画面 ───
 router.get('/admin', requireSession, api((req, res) => {
   res.render(path.join(__dirname, 'views/admin'), {
@@ -273,6 +350,7 @@ router.get('/admin', requireSession, api((req, res) => {
     devices: isAdmin(req) ? listDevices() : [],
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     events: listEvents(50),
+    sessions: listSessionsForAdmin(50),
   });
 }));
 

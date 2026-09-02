@@ -93,6 +93,28 @@ export function createTables(db = getMirrorDB()) {
     );
     CREATE INDEX IF NOT EXISTS idx_iroha_events_page ON f_iroha_app_events(page_id, id);
 
+    -- 作業時間セッション (要件定義 §4 / Codex R1 Q3)。個人単位 = 複数人同時作業は複数行。
+    -- ⭐v1 は Notion が正本なのでタスク表は無く、Notion の page_id に紐づける。
+    --   raw_seconds はサーバー時刻の差分 (iPad の時計を信じない)。承認・補正 (approved) は後続PR。
+    --   voided = 誤操作の論理削除 (行は消さず集計から外す — 実測値の除外フラグ)
+    CREATE TABLE IF NOT EXISTS f_iroha_work_sessions (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      page_id        TEXT NOT NULL,
+      product_code   TEXT,
+      title_snapshot TEXT,
+      worker_id      INTEGER NOT NULL,
+      worker_name    TEXT NOT NULL,
+      device_label   TEXT,
+      started_at     TEXT NOT NULL,
+      ended_at       TEXT,
+      end_reason     TEXT CHECK (end_reason IS NULL OR end_reason IN ('done','pause','admin')),
+      raw_seconds    INTEGER,
+      voided_at      TEXT,
+      voided_by      TEXT,
+      void_reason    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_page ON f_iroha_work_sessions(page_id, id);
+
     -- 端末 (iPad)。inbound-check と同じ方式 (トークンはハッシュのみ保存)
     CREATE TABLE IF NOT EXISTS f_iroha_app_devices (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +145,19 @@ export function createTables(db = getMirrorDB()) {
       ok INTEGER NOT NULL CHECK (ok IN (0,1))
     );
   `);
+
+  // 「1作業者につき活動中セッション1件」は**DBの制約**で保証する (Codex PR2 #1:
+  // アプリ側のトランザクション検査だけだと、将来の別経路・移行コードから重複を作れる)。
+  // 部分ユニークを張る前に、万一の既存重複 (最新以外) を admin 終了で閉じておく
+  db.exec('DROP INDEX IF EXISTS idx_iroha_sessions_open');
+  db.prepare(`UPDATE f_iroha_work_sessions
+    SET ended_at = ?, end_reason = 'admin',
+        raw_seconds = MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER))
+    WHERE ended_at IS NULL AND id NOT IN (
+      SELECT MAX(id) FROM f_iroha_work_sessions WHERE ended_at IS NULL GROUP BY worker_id)`)
+    .run(utcNow(), utcNow());
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_sessions_open_uniq
+    ON f_iroha_work_sessions(worker_id) WHERE ended_at IS NULL`);
 }
 
 // ───────────────────────── Notion キャッシュ ─────────────────────────
@@ -146,6 +181,10 @@ export function replaceCache(pages, { fetchedAt = utcNow() } = {}) {
 
 export function listCache() {
   return getDB().prepare('SELECT * FROM f_iroha_app_notion_cache ORDER BY page_id').all();
+}
+
+export function getCachePage(pageId) {
+  return getDB().prepare('SELECT * FROM f_iroha_app_notion_cache WHERE page_id = ?').get(String(pageId)) || null;
 }
 
 /** ステータス変更が成功したとき、次の全体更新を待たずキャッシュへ反映する */
@@ -293,6 +332,148 @@ export function logEvent({ action, pageId = null, workerId = null, workerName = 
 
 export function listEvents(limit = 100) {
   return getDB().prepare('SELECT * FROM f_iroha_app_events ORDER BY id DESC LIMIT ?').all(Number(limit) || 100);
+}
+
+// ───────────────────────── 作業時間セッション ─────────────────────────
+
+// 終了忘れの目印 (自動確定はしない — Codex R1 Q3「未終了時間を自動確定しない」)
+export const SESSION_WARN_HOURS = 6;
+
+/**
+ * 作業開始。⭐1作業者につき活動中セッションは1件 (要件定義 §1.7 ⑤)。
+ * 別カードで作業中なら busy (どのカードかを返す — 画面が誘導する)
+ */
+export function startSession({ pageId, productCode = null, title = null, worker, deviceLabel = null }) {
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const open = db.prepare(`SELECT id, page_id, title_snapshot, started_at FROM f_iroha_work_sessions
+      WHERE worker_id = ? AND ended_at IS NULL`).get(worker.id);
+    if (open) {
+      // 同じカードなら成功扱いで既存セッションを返す (応答が消えた再送で
+      // 「実際は動いているのに開始できない」状態にしない — Codex PR2 #2)
+      if (open.page_id === pageId) return { ok: true, already: true, sessionId: open.id, startedAt: open.started_at };
+      return { ok: false, error: 'busy', open,
+        message: `「${open.title_snapshot || '別のカード'}」の作業がまだ終わっていません。先にそちらを終了・中断してください` };
+    }
+    const info = db.prepare(`INSERT INTO f_iroha_work_sessions
+      (page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(pageId, productCode, title, worker.id, worker.display_name, deviceLabel, now);
+    return { ok: true, sessionId: Number(info.lastInsertRowid), startedAt: now };
+  }).immediate();
+}
+
+/**
+ * 作業終了・中断。**開始時に発行した sessionId を必ず指定する** (Codex PR2-R2 P2:
+ * 「その作業者の活動中の行」を閉じる方式だと、遅延再送が後から始めた別セッションを誤終了する)。
+ * 同じ sessionId が既に終了済みなら成功扱いで返す (冪等)。
+ * raw_seconds はサーバー時刻の差分で確定する (上書きしない)。
+ * @returns {ok, session, remainingActive} remainingActive = このカードでまだ作業中の人数
+ */
+export function stopSession({ pageId, workerId, sessionId, reason }) {
+  if (reason !== 'done' && reason !== 'pause') return { ok: false, error: 'bad_request', message: '終了の種類が不正です' };
+  const sid = Number(sessionId);
+  if (!Number.isInteger(sid) || sid <= 0) return { ok: false, error: 'bad_request', message: 'session_id が必要です (画面を更新してください)' };
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const remainingOn = () => db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE page_id = ? AND ended_at IS NULL')
+      .get(pageId).c;
+    const row = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(sid);
+    if (!row || row.page_id !== pageId || row.worker_id !== Number(workerId)) {
+      return { ok: false, error: 'not_started', message: 'このカードで作業をはじめた記録がありません (画面を更新してください)' };
+    }
+    if (row.ended_at) {
+      // 再送 (応答消失) — 対象セッションはもう閉じている。後続の新しいセッションには触らない
+      return { ok: true, already: true,
+        session: { id: row.id, raw_seconds: row.raw_seconds, started_at: row.started_at, ended_at: row.ended_at },
+        remainingActive: remainingOn() };
+    }
+    const raw = Math.max(0, Math.floor((Date.parse(now) - Date.parse(row.started_at)) / 1000));
+    db.prepare('UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = ?, raw_seconds = ? WHERE id = ?')
+      .run(now, reason, raw, row.id);
+    return { ok: true, session: { id: row.id, raw_seconds: raw, started_at: row.started_at, ended_at: now }, remainingActive: remainingOn() };
+  }).immediate();
+}
+
+/** 活動中セッションを page_id → [{id, worker_id, worker_name, started_at}] で返す (一覧表示・終了ボタン用) */
+export function activeSessionsByPage() {
+  const map = new Map();
+  for (const r of getDB().prepare(`SELECT id, page_id, worker_id, worker_name, started_at
+    FROM f_iroha_work_sessions WHERE ended_at IS NULL ORDER BY started_at`).all()) {
+    if (!map.has(r.page_id)) map.set(r.page_id, []);
+    map.get(r.page_id).push(r);
+  }
+  return map;
+}
+
+/**
+ * 商品コードごとの実測 (カード単位の合計作業時間を平均)。voided は集計から外す。
+ * @returns Map<code_key, { avgSeconds, cards, lastSeconds }>
+ */
+export function estimateByProduct() {
+  const rows = getDB().prepare(`SELECT LOWER(TRIM(product_code)) AS k, page_id, SUM(raw_seconds) AS total, MAX(ended_at) AS last_end
+    FROM f_iroha_work_sessions
+    WHERE ended_at IS NOT NULL AND voided_at IS NULL AND product_code IS NOT NULL AND raw_seconds > 0
+    GROUP BY LOWER(TRIM(product_code)), page_id`).all();
+  const byCode = new Map();
+  for (const r of rows) {
+    if (!byCode.has(r.k)) byCode.set(r.k, []);
+    byCode.get(r.k).push(r);
+  }
+  const out = new Map();
+  for (const [k, list] of byCode) {
+    list.sort((a, b) => String(a.last_end).localeCompare(String(b.last_end)));
+    const totals = list.map(x => Number(x.total) || 0);
+    out.set(k, {
+      avgSeconds: Math.round(totals.reduce((a, b) => a + b, 0) / totals.length),
+      cards: totals.length,
+      lastSeconds: totals[totals.length - 1],
+    });
+  }
+  return out;
+}
+
+/**
+ * 管理画面用: **活動中は全件** + 終了済みは直近 limit 件。
+ * ⚠活動中を件数制限に含めない — 6時間超の終了忘れが新しい記録に押し流されて
+ *   「取り消す唯一の導線」ごと見えなくなる (Codex PR2 #3)
+ */
+export function listSessionsForAdmin(limit = 50) {
+  const db = getDB();
+  const open = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE ended_at IS NULL ORDER BY started_at').all();
+  const closed = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE ended_at IS NOT NULL ORDER BY id DESC LIMIT ?')
+    .all(Number(limit) || 50);
+  const rows = [...open, ...closed];
+  const now = Date.now();
+  for (const r of rows) {
+    r.elapsed_seconds = r.ended_at ? r.raw_seconds : Math.max(0, Math.floor((now - Date.parse(r.started_at)) / 1000));
+    r.warn_long = !r.ended_at && r.elapsed_seconds > SESSION_WARN_HOURS * 3600;
+  }
+  return rows;
+}
+
+/**
+ * セッションの取り消し (論理削除)。活動中なら同時に end_reason='admin' で閉じる。
+ * 行は消さない — 実測の集計から外れるだけ (Codex R2「実測値の除外フラグ」)
+ */
+export function voidSession(id, actor, reason) {
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const row = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(Number(id));
+    if (!row) return { ok: false, error: 'not_found', message: 'セッションが見つかりません' };
+    if (row.voided_at) return { ok: false, error: 'already_voided', message: '既に取り消し済みです' };
+    if (!row.ended_at) {
+      const raw = Math.max(0, Math.floor((Date.parse(now) - Date.parse(row.started_at)) / 1000));
+      db.prepare('UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = ?, raw_seconds = ? WHERE id = ?')
+        .run(now, 'admin', raw, row.id);
+    }
+    db.prepare('UPDATE f_iroha_work_sessions SET voided_at = ?, voided_by = ?, void_reason = ? WHERE id = ?')
+      .run(now, actor || null, reason ? String(reason).slice(0, 200) : null, row.id);
+    return { ok: true };
+  }).immediate();
 }
 
 // ───────────────────────── 端末 (iPad) — inbound-check と同じ方式 ─────────────────────────

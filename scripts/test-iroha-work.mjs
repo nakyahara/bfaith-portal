@@ -143,8 +143,9 @@ const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 initMirrorDB();
 const { getDB, replaceCache, listCache, addIrohaWorker, setIrohaWorkerActive, getIrohaWorker, listIrohaWorkers,
   setWorkerPin, verifyWorkerPin, _clearPinFails,
-  createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents } = await import('../apps/iroha-work/db.js');
-const { ensureFresh, refreshFromNotion, changeStatus, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
+  createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents,
+  startSession, stopSession, activeSessionsByPage, estimateByProduct, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
+const { ensureFresh, refreshFromNotion, changeStatus, fetchCardLive, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
 const { buildList, priorityOf, clearEnrichCache } = await import('../apps/iroha-work/service.js');
 
 const db = getDB();
@@ -414,6 +415,104 @@ console.log('\n[12] 操作履歴');
   logEvent({ action: 'status_change', pageId: pA.id, workerId: 1, workerName: 'たにがわ', deviceLabel: 'test', from: '未着手', to: '作業中', ok: true });
   const ev = listEvents(5);
   ok(ev.length > 0 && ev[0].action === 'status_change' && ev[0].ok === 1, '履歴が残る');
+}
+
+console.log('\n[12b] fetchCardLive (作業開始前の実ページ判定)');
+{
+  const pLive = mkPage({ status: '未着手', title: '開始判定', code: 'PROD-L' });
+  const r = await fetchCardLive(pLive.id);
+  ok(r.ok === true && r.status === '未着手', '実ページから今の状態を取る');
+  ok(listCache().some(x => x.page_id === pLive.id), '取った内容はキャッシュへ upsert される');
+  pLive.properties['ステータス'] = { type: 'select', select: { name: '棚入完了' } };
+  const r2 = await fetchCardLive(pLive.id);
+  ok(r2.ok === true && r2.status === '棚入完了', 'キャッシュが新しくても実ページの変更を見る (開始ゲートの根拠)');
+  mock.missingPages.add(pLive.id);
+  const r3 = await fetchCardLive(pLive.id);
+  ok(r3.ok === false && r3.error === 'card_gone', '削除済みは card_gone (開始拒否)');
+  mock.missingPages.delete(pLive.id);
+  pLive.parent = { database_id: 'other-db' };
+  const r4 = await fetchCardLive(pLive.id);
+  ok(r4.ok === false && r4.error === 'wrong_database', '別DBのページは拒否');
+  pLive.parent = { database_id: 'testdb' };
+}
+
+console.log('\n[13] 作業時間セッション');
+{
+  const w1 = addIrohaWorker({ displayName: 'やまだ', workerType: 'member', actor: 'test' });
+  const w2 = addIrohaWorker({ displayName: 'すずき', workerType: 'member', actor: 'test' });
+  const worker1 = getIrohaWorker(w1.id), worker2 = getIrohaWorker(w2.id);
+
+  const s1 = startSession({ pageId: 'sess-p1', productCode: 'PROD-A', title: '商品A', worker: worker1, deviceLabel: 'test' });
+  ok(s1.ok === true && s1.startedAt, '開始できる');
+  const again = startSession({ pageId: 'sess-p1', worker: worker1 });
+  ok(again.ok === true && again.already === true && again.sessionId === s1.sessionId,
+    '同じカードの再送は成功扱いで既存セッションを返す (応答消失からの復旧)');
+  const busy = startSession({ pageId: 'sess-p2', worker: worker1 });
+  ok(busy.error === 'busy' && busy.open.page_id === 'sess-p1', '別カードは busy (どのカードか返す) — 1人1件の原則');
+
+  // 「活動中1件」は DB 制約でも守られている (アプリを迂回した INSERT が弾かれる)
+  let uniqErr = null;
+  try {
+    getDB().prepare(`INSERT INTO f_iroha_work_sessions (page_id, worker_id, worker_name, started_at)
+      VALUES ('sess-px', ?, 'x', ?)`).run(worker1.id, new Date().toISOString());
+  } catch (e) { uniqErr = e; }
+  ok(uniqErr && /UNIQUE/i.test(uniqErr.message), '部分ユニーク索引が二重の活動中セッションを拒否');
+
+  const s2 = startSession({ pageId: 'sess-p1', productCode: 'PROD-A', title: '商品A', worker: worker2 });
+  ok(s2.ok === true, '別の人は同じカードに参加できる (複数人=複数行)');
+  ok((activeSessionsByPage().get('sess-p1') || []).length === 2, '活動中2名が一覧に出る');
+
+  const st1 = stopSession({ pageId: 'sess-p1', workerId: worker1.id, sessionId: s1.sessionId, reason: 'done' });
+  ok(st1.ok === true && st1.session.raw_seconds >= 0 && st1.remainingActive === 1, '終了 (raw_seconds はサーバー計算・残り1名)');
+  const w3 = addIrohaWorker({ displayName: 'いとう', workerType: 'member', actor: 'test' });
+  ok(stopSession({ pageId: 'sess-p1', workerId: w3.id, sessionId: s2.sessionId, reason: 'done' }).error === 'not_started',
+    '他人のセッションIDでは終了できない');
+  ok(stopSession({ pageId: 'sess-p1', workerId: worker2.id, sessionId: s2.sessionId, reason: 'bogus' }).error === 'bad_request', '不正な理由は拒否');
+  ok(stopSession({ pageId: 'sess-p1', workerId: worker2.id, reason: 'done' }).error === 'bad_request', 'session_id なしは拒否');
+  const st2 = stopSession({ pageId: 'sess-p1', workerId: worker2.id, sessionId: s2.sessionId, reason: 'pause' });
+  ok(st2.ok === true && st2.remainingActive === 0, '中断で全員離脱 (remainingActive=0 → 画面が「中断にする?」を出す)');
+  const st2again = stopSession({ pageId: 'sess-p1', workerId: worker2.id, sessionId: s2.sessionId, reason: 'pause' });
+  ok(st2again.ok === true && st2again.already === true && st2again.session.id === st2.session.id,
+    '同じセッションIDの再送は成功扱い — 冪等');
+
+  // 遅延再送が「後から始めた新しいセッション」を誤終了しない (Codex PR2-R2 P2)
+  const sB = startSession({ pageId: 'sess-p1', productCode: 'PROD-A', title: '商品A', worker: worker2 });
+  const stale = stopSession({ pageId: 'sess-p1', workerId: worker2.id, sessionId: s2.sessionId, reason: 'pause' });
+  ok(stale.ok === true && stale.already === true, '古いIDの再送は already で返る');
+  ok((activeSessionsByPage().get('sess-p1') || []).some(a => a.id === sB.sessionId), '新しいセッションは終了されず動き続ける');
+  stopSession({ pageId: 'sess-p1', workerId: worker2.id, sessionId: sB.sessionId, reason: 'done' });
+
+  // 実測の集計: カード単位の合計を商品ごとに平均。voided は外す
+  const db2 = getDB();
+  const insSess = db2.prepare(`INSERT INTO f_iroha_work_sessions
+    (page_id, product_code, worker_id, worker_name, started_at, ended_at, end_reason, raw_seconds)
+    VALUES (?, 'PROD-EST', 1, 'x', ?, ?, 'done', ?)`);
+  insSess.run('est-p1', '2026-09-01T00:00:00Z', '2026-09-01T01:00:00Z', 300);
+  insSess.run('est-p1', '2026-09-01T00:00:00Z', '2026-09-01T01:00:00Z', 300);   // 同カード2人 → 合計600
+  insSess.run('est-p2', '2026-09-02T00:00:00Z', '2026-09-02T01:00:00Z', 1200);
+  const est = estimateByProduct().get('prod-est');
+  ok(est && est.cards === 2 && est.avgSeconds === 900, `カード合計の平均 (600+1200)/2=900 (実際 ${est && est.avgSeconds})`);
+  ok(est.lastSeconds === 1200, '直近カードの実績も持つ (1回だけなら「前回」表示に使う)');
+
+  // 取り消し (論理削除) → 集計から外れる
+  const openS = startSession({ pageId: 'est-p3', productCode: 'PROD-EST', title: 'x', worker: worker1 });
+  const v = voidSession(getDB().prepare('SELECT id FROM f_iroha_work_sessions WHERE page_id = ?').get('est-p3').id, 'admin@test', '押し忘れ');
+  ok(openS.ok && v.ok === true, '活動中セッションも取り消せる (閉じて void)');
+  ok(voidSession(getDB().prepare('SELECT id FROM f_iroha_work_sessions WHERE page_id = ?').get('est-p3').id, 'admin@test').error === 'already_voided', '二重取り消しは拒否');
+  ok((activeSessionsByPage().get('est-p3') || []).length === 0, '取り消したら活動中から消える');
+  const rows = listSessionsForAdmin(10);
+  ok(rows.length > 0 && typeof rows[0].elapsed_seconds === 'number', '管理画面用一覧 (経過秒つき)');
+
+  // 活動中は件数制限に埋もれない (終了忘れの導線を失わない)
+  const oldOpen = startSession({ pageId: 'old-open', productCode: 'X', title: '古い作業中', worker: worker2 });
+  const insClosed = getDB().prepare(`INSERT INTO f_iroha_work_sessions
+    (page_id, product_code, worker_id, worker_name, started_at, ended_at, end_reason, raw_seconds)
+    VALUES (?, 'X', 99, 'x', ?, ?, 'done', 60)`);
+  for (let i = 0; i < 15; i++) insClosed.run('bulk-' + i, new Date().toISOString(), new Date().toISOString());
+  const rows2 = listSessionsForAdmin(10);
+  ok(oldOpen.ok && rows2.some(r => r.page_id === 'old-open' && !r.ended_at),
+    '終了済みが増えても活動中セッションは管理一覧に必ず出る');
+  stopSession({ pageId: 'old-open', workerId: worker2.id, sessionId: oldOpen.sessionId, reason: 'done' });
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

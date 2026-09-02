@@ -108,6 +108,17 @@
   .kv .v{font-weight:700}
   .kv.miss{border:1.5px dashed var(--amber);background:var(--amber-soft)}
   .kv.miss .v{color:var(--amber)}
+  /* ── 作業時間 ── */
+  .wchips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  .wchip{background:var(--amber-soft);color:var(--amber);border-radius:999px;padding:7px 16px;
+    font-weight:700;font-size:.92rem}
+  .wtimer{text-align:center;padding:4px 0 12px}
+  .wtimer .t{font-size:3rem;font-weight:900;font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
+  .wtimer small{display:block;color:var(--sub);font-weight:700;letter-spacing:.12em;font-size:.72rem}
+  .wbtns{display:flex;gap:12px;flex-wrap:wrap}
+  .wbtns .btn{flex:1;min-width:180px;min-height:62px;font-size:1.1rem}
+  .btn.warn{color:var(--amber);border-color:var(--amber)}
+  .est{font-size:.82rem;color:var(--sub);margin-top:10px}
   h3.sec{font-size:.95rem;margin:0 0 10px;color:var(--sub);letter-spacing:.05em}
   .nlink{font-size:.82rem;color:var(--sub);margin:10px 0 0}
   .nlink a{color:var(--accent);font-weight:700}
@@ -222,6 +233,9 @@ let state = { cards: [], statuses: [], workers: [], refresh: {}, me: {} };
 let curTab = 'all';
 let curDetail = null;      // 開いている詳細の page_id
 let worker = null;         // { id, display_name, worker_type }
+// タイマーはサーバー時刻基準 (iPadの時計を信じない)。/api/state の serverNow とのオフセットで補正
+let clockOffset = 0;
+const nowMs = () => Date.now() + clockOffset;
 
 // ─── 通知まわり (Codex R2 ①: エラーは押すまで消えない・成功はトースト) ───
 function showErr(msg, sub) {
@@ -276,6 +290,7 @@ async function loadState() {
   }
   if (!j.ok) { showErr(j.message || '読み込みに失敗しました'); return; }
   state = j;
+  if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
   renderSync();
   renderTabs();
   renderList();
@@ -360,6 +375,8 @@ function renderList() {
       masterSummary(c) || null,
     ].filter(Boolean).join(' ・ ');
     const meta2 = [
+      estText(c),
+      c.active.length > 0 ? '👤 ' + esc(c.active.map(a => a.worker_name).join('・')) + 'さんが作業中' : null,
       c.priority.kind !== 'urgent' && c.priority.kind !== 'new' ? esc(c.priority.label) : null,
       c.external_text ? esc(c.external_text) : null,
       c.expiry ? '📅 期限 ' + esc(c.expiry) : null,
@@ -403,7 +420,29 @@ function openDetail(pageId) {
   document.body.classList.add('detail-open');
   window.scrollTo(0, 0);
 }
-function closeDetail() { curDetail = null; document.body.classList.remove('detail-open'); }
+function closeDetail() { curDetail = null; document.body.classList.remove('detail-open'); clearInterval(tickId); }
+
+// ── 時間の表示 ──
+function fmtDur(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (h > 0) return h + '時間' + m + '分';
+  if (m > 0) return m + '分';
+  return s + '秒';
+}
+function fmtClock(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const mm = String(m).padStart(2, '0'), ss = String(s).padStart(2, '0');
+  return h > 0 ? h + ':' + mm + ':' + ss : mm + ':' + ss;
+}
+// 目安と実測 (1回だけなら「平均」と言わず「前回」— Codex R2)
+function estText(c) {
+  if (!c.estimate) return '⏱ 実測データなし (今回の作業時間が次回の目安になります)';
+  const e = c.estimate;
+  if (e.cards === 1) return '⏱ 前回の実績 ' + fmtDur(e.lastSeconds);
+  return '⏱ これまでの実績 平均' + fmtDur(e.avgSeconds) + ' (' + e.cards + '回)';
+}
 
 function kv(label, value, opts) {
   const miss = opts && opts.miss;
@@ -451,7 +490,126 @@ function renderDetail(c) {
       (m.source === 'card'
         ? '<p class="nlink">※作業仕様マスタに未登録のため、カード作成時の値を表示しています。</p>' : '') +
       '<p class="nlink">くわしくは 🗂 ' + (c.url ? '<a href="' + esc(c.url) + '" target="_blank" rel="noopener">Notionのカードを開く</a>' : 'Notionのカード (リンクなし)') + '</p>' +
-    '</div>';
+    '</div>' +
+
+    workCardHtml(c);
+  startTimerTick(c);
+}
+
+// ── 作業時間カード (作業する人・タイマー・開始/中断/できあがり) ──
+function myActiveOf(c) {
+  return worker ? c.active.find(a => a.worker_id === worker.id) : null;
+}
+function workCardHtml(c) {
+  const chips = c.active.map(a => {
+    const el = (nowMs() - Date.parse(a.started_at)) / 1000;
+    return '<span class="wchip">' + esc(a.worker_name) + ' さん (' + fmtDur(el) + ')</span>';
+  }).join('');
+  const mine = myActiveOf(c);
+  let controls;
+  if (mine) {
+    controls =
+      '<div class="wtimer"><div class="t num" id="wt" data-start="' + esc(mine.started_at) + '">--:--</div>' +
+      '<small>作業時間 (サーバーで記録しています)</small></div>' +
+      '<div class="wbtns">' +
+      '<button class="btn warn" id="pauseBtn" onclick="stopWork(\'pause\')">⏸ ちょっと中断 (資材が足りない など)</button>' +
+      '<button class="btn primary" id="doneBtn" onclick="stopWork(\'done\')">✅ できあがり</button>' +
+      '</div>';
+  } else if (c.status === '棚入完了') {
+    controls = '<p class="nlink">このカードは棚入完了です。</p>';
+  } else {
+    controls = '<div class="wbtns"><button class="btn primary" id="startBtn" onclick="startWork()">▶ 作業をはじめる</button></div>';
+  }
+  return '<div class="dcard"><h3 class="sec">作業する人・時間</h3>' +
+    (chips ? '<div class="wchips">' + chips + '</div>' : '') +
+    controls +
+    '<p class="est num">' + estText(c) + '</p></div>';
+}
+
+// タイマーはサーバーの started_at との差分を表示するだけ (1秒ずつ足さない — iPadの時計・スリープに強い)
+let tickId = null;
+function startTimerTick(c) {
+  clearInterval(tickId);
+  const el = document.getElementById('wt');
+  if (!el) return;
+  const start = Date.parse(el.dataset.start);
+  const p = () => { el.textContent = fmtClock((nowMs() - start) / 1000); };
+  p();
+  tickId = setInterval(p, 1000);
+}
+
+async function startWork() {
+  if (!worker) { openGate(); return; }
+  if (!curDetail) return;
+  const btn = document.getElementById('startBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  let j;
+  try {
+    const r = await fetch(BASE + '/api/sessions/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ page_id: curDetail, worker_id: worker.id }),
+    });
+    j = await r.json().catch(() => ({}));
+  } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
+  if (!j.ok) {
+    if (btn) { btn.disabled = false; btn.textContent = '▶ 作業をはじめる'; }
+    showErr(j.message || '作業をはじめられませんでした');
+    return;
+  }
+  if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
+  const c = state.cards.find(x => x.page_id === curDetail);
+  if (c) {
+    if (j.status) c.status = j.status;
+    if (!c.active.some(a => a.worker_id === worker.id)) {
+      c.active.push({ id: j.sessionId, worker_id: worker.id, worker_name: worker.display_name, started_at: j.startedAt });
+    }
+    renderTabs(); renderList(); renderDetail(c);
+  }
+  toast(j.already ? '作業中にもどりました (開始済みでした)'
+    : '作業をはじめました' + (j.status === '作業中' ? ' (Notionも「作業中」にしました)' : ''));
+}
+
+async function stopWork(reason) {
+  if (!worker || !curDetail) return;
+  const cNow = state.cards.find(x => x.page_id === curDetail);
+  const mine = cNow ? myActiveOf(cNow) : null;
+  if (!mine || !mine.id) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
+  for (const id of ['pauseBtn', 'doneBtn']) { const b = document.getElementById(id); if (b) b.disabled = true; }
+  let j;
+  try {
+    const r = await fetch(BASE + '/api/sessions/stop', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ page_id: curDetail, worker_id: worker.id, session_id: mine.id, reason }),
+    });
+    j = await r.json().catch(() => ({}));
+  } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
+  if (!j.ok) {
+    for (const id of ['pauseBtn', 'doneBtn']) { const b = document.getElementById(id); if (b) b.disabled = false; }
+    showErr(j.message || '終了できませんでした');
+    return;
+  }
+  const pid = curDetail;
+  const c = state.cards.find(x => x.page_id === pid);
+  if (c) {
+    c.active = c.active.filter(a => a.worker_id !== worker.id);
+    renderList(); renderDetail(c);
+  }
+  // ⑤ステータスとの連動は自動にしない: 人が選んで変える。促すのは**全員が離れたとき**だけ
+  //   (だれかが作業中のまま棚入完了を促すと、早まって完了にしてしまう — Codex PR2 #4)
+  if (j.remainingActive > 0) {
+    toast('作業時間 ' + fmtDur(j.session.raw_seconds) + ' を記録しました (' + j.remainingActive + '名がまだ作業中)');
+    return;
+  }
+  toast('おつかれさまでした! 作業時間 ' + fmtDur(j.session.raw_seconds) + ' を記録しました');
+  if (reason === 'pause') {
+    openSt(null, pid);
+    const m = document.getElementById('stMsg');
+    if (m) m.textContent = 'みんな作業から離れました。つづきが後になるなら「中断」を選んでください';
+  } else if (reason === 'done') {
+    openSt(null, pid);
+    const m = document.getElementById('stMsg');
+    if (m) m.textContent = 'できあがりです! 棚に入れ終わったら「棚入完了」を (職員PINが必要です)';
+  }
 }
 function openStFromDetail() { if (curDetail) openSt(null, curDetail); }
 
