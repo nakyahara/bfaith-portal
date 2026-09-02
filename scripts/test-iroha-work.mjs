@@ -515,5 +515,66 @@ console.log('\n[13] 作業時間セッション');
   stopSession({ pageId: 'old-open', workerId: worker2.id, sessionId: oldOpen.sessionId, reason: 'done' });
 }
 
+console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
+{
+  process.env.IROHA_WORK_DRIVE_FOLDER_ID = 'folder-test';
+  const { addMedia, sniffKind, countActivePhotos, softDeleteMedia, resetMedia, processMediaQueue,
+    mediaByPage, listMediaForAdmin, _setDriveUpload, MEDIA_DIR } = await import('../apps/iroha-work/media.js');
+  const worker1 = listIrohaWorkers(true).find(w => w.display_name === 'やまだ');
+  const worker2 = listIrohaWorkers(true).find(w => w.display_name === 'すずき');
+  const pMedia = mkPage({ status: '作業中', title: '写真対象', code: 'PROD-M' });
+
+  const jpeg = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(64, 1)]);
+  const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from('ftypisom'), Buffer.alloc(64, 2)]);
+  ok(sniffKind(jpeg) === 'photo' && sniffKind(mp4) === 'video' && sniffKind(Buffer.alloc(20)) === null,
+    'マジックバイト判定 (JPEG/MP4/不明)');
+
+  const tmp = (name, buf) => { const p = path.join(process.env.DATA_DIR, name); fs.writeFileSync(p, buf); return p; };
+  const a1 = addMedia({ pageId: pMedia.id, productCode: 'PROD-M', kind: 'photo', mime: 'image/jpeg',
+    filePath: tmp('a1.jpg', jpeg), worker: worker1, operationId: 'op-photo-0001' });
+  ok(a1.ok === true && a1.media.status === 'stored', '受信 → stored (即応答できる形)');
+  ok(fs.existsSync(path.join(MEDIA_DIR, 'op-photo-0001.jpg')), '実体は MEDIA_DIR へ移動');
+  const a1b = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a1b.jpg', jpeg), worker: worker1, operationId: 'op-photo-0001' });
+  ok(a1b.ok === true && a1b.already === true, '同じ operation_id の再送は既存を返す (二重登録しない)');
+  ok(addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('bad.jpg', mp4), worker: worker1, operationId: 'op-bad-000001' }).error === 'bad_file',
+    '中身が写真でなければ拒否 (Content-Type を信じない)');
+  addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a2.jpg', jpeg), worker: worker1, operationId: 'op-photo-0002' });
+  addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a3.jpg', jpeg), worker: worker2, operationId: 'op-photo-0003' });
+  ok(addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a4.jpg', jpeg), worker: worker1, operationId: 'op-photo-0004' }).error === 'cap_reached',
+    '写真は3枚まで');
+  const v1 = addMedia({ pageId: pMedia.id, kind: 'video', mime: 'video/mp4', filePath: tmp('v1.mp4', mp4), worker: worker1, operationId: 'op-video-0001' });
+  ok(v1.ok === true, '動画も受信できる');
+  ok(countActivePhotos(pMedia.id) === 3, 'countActivePhotos = 3 (棚入完了ゲートの根拠)');
+
+  // キュー: 1回目は Drive 失敗 → next_retry が付く。再実行 (reset) 後に成功 → Notion まで反映
+  let driveCalls = 0;
+  _setDriveUpload(async () => { driveCalls++; if (driveCalls <= 1) throw new Error('drive down'); return { fileId: 'f' + driveCalls, url: 'https://drive.google.com/file/d/f' + driveCalls + '/view' }; });
+  await processMediaQueue();
+  let rows = listMediaForAdmin(10).filter(m => m.page_id === pMedia.id);
+  ok(rows.some(m => m.error && m.next_retry_at), '失敗は next_retry 付きで記録 (すぐ連打しない)');
+  for (const m of rows) if (m.error) resetMedia(m.id);
+  await new Promise(r => setTimeout(r, 30));   // resetMedia の schedule 分を待つ
+  await processMediaQueue();
+  await processMediaQueue();   // 2巡目で残りの upload + Notion 反映
+  rows = listMediaForAdmin(10).filter(m => m.page_id === pMedia.id && !m.deleted_at);
+  ok(rows.every(m => m.status === 'synced' && m.drive_url), `全件 Drive→Notion まで反映 (実際: ${rows.map(m => m.status).join(',')})`);
+  ok(!fs.existsSync(path.join(MEDIA_DIR, 'op-photo-0001.jpg')), 'アップロード後に実体を削除');
+  const patched = mock.patched.filter(p => p.id === pMedia.id && p.body.properties?.['完成写真']);
+  ok(patched.length > 0 && patched[patched.length - 1].body.properties['完成写真'].files.length === 4,
+    'Notion「完成写真」に4件 (写真3+動画1) が付く');
+
+  // 論理削除: 他人は消せない / 本人は消せる / Notion から外れる
+  const target = rows.find(m => m.operation_id === 'op-photo-0003');
+  ok(softDeleteMedia(target.id, { workerId: worker1.id }).error === 'forbidden', '他人の写真は消せない');
+  ok(softDeleteMedia(target.id, { workerId: worker2.id }).ok === true, '本人は消せる (論理削除)');
+  ok(countActivePhotos(pMedia.id) === 2, '削除後は2枚');
+  await new Promise(r => setTimeout(r, 30));
+  await processMediaQueue();
+  const last = mock.patched.filter(p => p.id === pMedia.id && p.body.properties?.['完成写真']).pop();
+  ok(last.body.properties['完成写真'].files.length === 3, 'Notion 側も貼り直されて3件 (写真2+動画1)');
+  ok((mediaByPage().get(pMedia.id) || []).length === 3, '画面用一覧にも削除分は出ない');
+  _setDriveUpload(null);
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exit(fail > 0 ? 1 : 0);

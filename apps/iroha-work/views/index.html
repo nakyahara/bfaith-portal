@@ -109,6 +109,17 @@
   .kv.miss{border:1.5px dashed var(--amber);background:var(--amber-soft)}
   .kv.miss .v{color:var(--amber)}
   /* ── 作業時間 ── */
+  /* ── 完成写真・動画 ── */
+  .photos{display:flex;gap:10px;flex-wrap:wrap;margin-top:4px}
+  .ph{position:relative;width:96px;height:96px;border-radius:12px;border:1.5px solid var(--line);background:var(--well);
+    display:grid;place-items:center;color:var(--sub);font-size:.72rem;text-align:center;line-height:1.35;cursor:pointer}
+  .ph .ic{font-size:1.6rem;display:block}
+  .ph.add{border-style:dashed;border-color:var(--accent);color:var(--accent);font-weight:700}
+  .ph.mov{border-color:var(--amber)}
+  .ph .del{position:absolute;top:-8px;right:-8px;width:26px;height:26px;border-radius:50%;border:none;
+    background:var(--danger);color:#fff;font-weight:700;cursor:pointer;line-height:1}
+  .ph .stx{font-size:.66rem;color:var(--faint)}
+  .ph.err{border-color:var(--danger);color:var(--danger)}
   .wchips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
   .wchip{background:var(--amber-soft);color:var(--amber);border-radius:999px;padding:7px 16px;
     font-weight:700;font-size:.92rem}
@@ -492,8 +503,154 @@ function renderDetail(c) {
       '<p class="nlink">くわしくは 🗂 ' + (c.url ? '<a href="' + esc(c.url) + '" target="_blank" rel="noopener">Notionのカードを開く</a>' : 'Notionのカード (リンクなし)') + '</p>' +
     '</div>' +
 
+    mediaCardHtml(c) +
     workCardHtml(c);
   startTimerTick(c);
+}
+
+// ── できあがりの写真・動画 (作業のやり方のすぐ下 — 中原さんFB①「写真は上のほうに」) ──
+const KIND_ICON = { photo: '📷', video: '🎥' };
+function mediaTile(m) {
+  const st = m.error ? '❌失敗' : m.status === 'stored' ? '送信中…' : '☁保存済み';
+  const own = worker && m.worker_id === worker.id;
+  return '<div class="ph' + (m.error ? ' err' : '') + '" onclick="openMedia(event,' + m.id + ')">' +
+    (own ? '<button class="del" onclick="delMedia(event,' + m.id + ')">×</button>' : '') +
+    '<div><span class="ic">' + KIND_ICON[m.kind] + '</span>' + esc(m.worker_name || '') +
+    '<span class="stx">' + st + '</span></div></div>';
+}
+function mediaCardHtml(c) {
+  const photos = c.media.filter(m => m.kind === 'photo').length;
+  const videos = c.media.filter(m => m.kind === 'video').length;
+  const tiles = c.media.map(mediaTile).join('');
+  const pend = [...pendingTiles.values()].filter(p => p.pageId === c.page_id).map(p =>
+    '<div class="ph"><div><span class="ic">' + KIND_ICON[p.kind] + '</span>' +
+    (p.failed ? '<button class="reg" style="margin-top:2px" onclick="retryUpload(event,\'' + p.opId + '\')">↻ 再送</button>' : '<span class="stx">送信中…</span>') +
+    '</div></div>').join('');
+  const addP = photos < 3 ? '<div class="ph add" onclick="pickMedia(\'photo\')"><div><span class="ic">📷</span>写真を<br>とる</div></div>' : '';
+  const addV = videos < 1 ? '<div class="ph add mov" onclick="pickMedia(\'video\')"><div><span class="ic">🎥</span>動画を<br>とる</div></div>' : '';
+  return '<div class="dcard"><h3 class="sec">できあがりの写真・動画</h3>' +
+    '<div class="photos">' + tiles + pend + addP + addV + '</div>' +
+    '<p class="hint">写真も動画もドライブに保存されて、Notionのカードにも付きます。棚入完了には写真1枚以上が必要です (写真は3枚・動画は1本まで)。</p></div>';
+}
+
+function openMedia(ev, id) {
+  ev.stopPropagation();
+  for (const c of state.cards) {
+    const m = c.media.find(x => x.id === id);
+    if (m && m.url) { window.open(m.url, '_blank', 'noopener'); return; }
+  }
+  toast('まだ送信中です (保存されるとドライブで開けます)');
+}
+
+// ── 撮影 → (写真は縮小) → アップロード。operation_id で再送しても二重登録されない ──
+const pendingTiles = new Map();   // opId → { pageId, kind, blob, name, failed }
+const newOpId = () => Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+
+function pickMedia(kind) {
+  if (!worker) { openGate(); return; }
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = kind === 'photo' ? 'image/*' : 'video/*';
+  inp.capture = 'environment';
+  inp.onchange = () => { if (inp.files && inp.files[0]) handlePicked(kind, inp.files[0]); };
+  inp.click();
+}
+
+async function handlePicked(kind, file) {
+  const pageId = curDetail;
+  if (!pageId) return;
+  let blob = file;
+  if (kind === 'photo') {
+    try { blob = await shrinkPhoto(file); }
+    catch (e) { showErr('写真を読み込めませんでした', e.message); return; }
+  } else if (file.size > 120 * 1024 * 1024) {
+    showErr('動画が大きすぎます (120MBまで)。短めに撮り直してください');
+    return;
+  }
+  const opId = newOpId();
+  pendingTiles.set(opId, { pageId, kind, blob, failed: false });
+  rerenderDetail();
+  uploadMedia(opId);
+}
+
+// HEIC対策の本命: canvas で JPEG に変換 + 長辺1600pxへ縮小 (EXIFの位置情報もここで落ちる)
+async function shrinkPhoto(file) {
+  const bmp = await createImageBitmap(file).catch(async () => {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = new Image();
+      await new Promise((ok2, ng) => { img.onload = ok2; img.onerror = () => ng(new Error('画像を開けません')); img.src = url; });
+      return img;
+    } finally { URL.revokeObjectURL(url); }
+  });
+  const w = bmp.width, h = bmp.height;
+  const scale = Math.min(1, 1600 / Math.max(w, h));
+  const cv = document.createElement('canvas');
+  cv.width = Math.round(w * scale); cv.height = Math.round(h * scale);
+  cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+  const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.85));
+  if (!blob) throw new Error('JPEGに変換できませんでした');
+  return blob;
+}
+
+async function uploadMedia(opId) {
+  const p = pendingTiles.get(opId);
+  if (!p || !worker) return;
+  p.failed = false;
+  rerenderDetail();
+  const fd = new FormData();
+  fd.append('page_id', p.pageId);
+  fd.append('kind', p.kind);
+  fd.append('worker_id', String(worker.id));
+  fd.append('operation_id', opId);
+  fd.append('file', p.blob, p.kind === 'photo' ? 'photo.jpg' : 'video.mp4');
+  let j;
+  try {
+    const r = await fetch(BASE + '/api/media', { method: 'POST', body: fd });
+    j = await r.json().catch(() => ({}));
+  } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
+  if (!j.ok) {
+    if (j.error === 'cap_reached' || j.error === 'bad_file' || j.error === 'too_large') {
+      pendingTiles.delete(opId);
+      showErr(j.message || '送信できませんでした');
+    } else {
+      p.failed = true;   // 通信断など: blob を持ったまま「↻再送」を出す
+      showErr((j.message || '送信できませんでした') + ' — タイルの「再送」でやり直せます');
+    }
+    rerenderDetail();
+    return;
+  }
+  pendingTiles.delete(opId);
+  const c = state.cards.find(x => x.page_id === p.pageId);
+  if (c && !c.media.some(m => m.id === j.media.id)) c.media.push(j.media);
+  rerenderDetail();
+  toast(p.kind === 'photo' ? '写真を送りました (ドライブへ保存中)' : '動画を送りました (ドライブへ保存中)');
+}
+
+function retryUpload(ev, opId) { ev.stopPropagation(); uploadMedia(opId); }
+
+async function delMedia(ev, id) {
+  ev.stopPropagation();
+  if (!worker) { openGate(); return; }
+  if (!confirm('この写真・動画を削除しますか? (撮り直し用)')) return;
+  let j;
+  try {
+    const r = await fetch(BASE + '/api/media/' + id + '/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ worker_id: worker.id }),
+    });
+    j = await r.json().catch(() => ({}));
+  } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
+  if (!j.ok) { showErr(j.message || '削除できませんでした'); return; }
+  for (const c of state.cards) c.media = c.media.filter(m => m.id !== id);
+  rerenderDetail();
+  toast('削除しました');
+}
+
+function rerenderDetail() {
+  if (!curDetail) return;
+  const c = state.cards.find(x => x.page_id === curDetail);
+  if (c) renderDetail(c);
 }
 
 // ── 作業時間カード (作業する人・タイマー・開始/中断/できあがり) ──
@@ -616,6 +773,12 @@ function openStFromDetail() { if (curDetail) openSt(null, curDetail); }
 // ─── ステータス変更 (Codex R2 ①: 保存中表示・処理中は全ボタン無効・失敗は大きく) ───
 let stTarget = null;   // page_id
 let stSaving = false;
+let stSkipPhoto = false;   // 「写真なしで完了 (職員判断)」を押したときだけ true
+
+function skipPhotoDone(to) {
+  stSkipPhoto = true;
+  doSetSt(to);
+}
 
 function openSt(ev, pageId) {
   if (ev) ev.stopPropagation();
@@ -623,6 +786,7 @@ function openSt(ev, pageId) {
   const c = state.cards.find(x => x.page_id === pageId);
   if (!c) return;
   stTarget = pageId;
+  stSkipPhoto = false;
   $('#stName').textContent = c.title + ' (いま: ' + c.status + ')';
   $('#stMsg').textContent = '';
   $('#pinRow').style.display = 'none';
@@ -663,13 +827,14 @@ async function doSetSt(to) {
     const r = await fetch(BASE + '/api/status', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ page_id: stTarget, to, expect: c.status, worker_id: worker.id,
-        pin: $('#pinIn').value.trim() || undefined }),
+        pin: $('#pinIn').value.trim() || undefined, skip_photo: stSkipPhoto || undefined }),
     });
     j = await r.json().catch(() => ({}));
   } catch (e) {
     j = { ok: false, error: 'network', message: '通信できませんでした (' + e.message + ')。もう一度お試しください' };
   }
   stSaving = false;
+  stSkipPhoto = false;   // スキップは1回の送信だけに効かせる
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
 
   if (j.ok) {
@@ -692,6 +857,13 @@ async function doSetSt(to) {
     showErr(j.message || 'カードが見つかりません');
     closeDetail();
     loadState();
+    return;
+  }
+  // 写真がまだ → 撮りにいくよう促す。職員判断で「写真なしで完了」もできる (履歴に残る)
+  if (j.error === 'photo_required') {
+    const m = $('#stMsg');
+    m.innerHTML = '❌ ' + esc(j.message || 'できあがりの写真がありません') +
+      ' <button class="reg" style="margin-top:6px" onclick="skipPhotoDone(\'' + esc(to) + '\')">写真なしで完了する (職員判断)</button>';
     return;
   }
   // PIN 関連はダイアログ内で入力し直せるようにする
