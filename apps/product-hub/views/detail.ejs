@@ -3569,7 +3569,15 @@
   }
   // 全ワーカーを通した安定状態まで待つ (Codex R1 high: Promise.all 一発だと、先に終わったワーカーへ
   // 待機中に入った変更を待たずに登録へ進める)。変更の無い一巡が取れたら true
-  async function flushSkuSavers() {
+  // 同時に始まった flush (二重クリック等) は同じ実行を共有し同じ結果を返す (Codex R4 high: skuOpFailed を
+  // 片方だけが消費して、もう片方が true で保存へ進んでいた)。終わった後の新しい flush だけが再試行
+  let flushInFlight = null;
+  function flushSkuSavers() {
+    if (flushInFlight) return flushInFlight;
+    flushInFlight = flushSkuSaversOnce().finally(() => { flushInFlight = null; });
+    return flushInFlight;
+  }
+  async function flushSkuSaversOnce() {
     for (let i = 0; i < 10; i++) {
       const gen = skuSaveGeneration;
       // ワーカー外の保存 (一括入力・行削除) が走っていれば先に終わるのを待つ
@@ -3733,6 +3741,12 @@
     btn.addEventListener('click', async () => {
       if (!confirm('旧データの「カタログID」属性を削除します。各 SKU の JAN は下の表の「カタログID」の行に入っていますか？')) return;
       btn.disabled = true;
+      // 入力直後の JAN・商品仕様・理由の保存を待ち切ってから削除 → 再読み込み (Codex R4 high: 通信中の値を失う)
+      if (!(await flushSkuSavers())) {
+        alert('SKU 表の保存が終わっていない (または失敗した) ため削除しませんでした。表の値を確認してからもう一度押してください');
+        btn.disabled = false;
+        return;
+      }
       let json;
       try {
         json = await post(BASE + '/rakuten', { ...collectRakutenFields(), drop_legacy_catalog_attr: true });

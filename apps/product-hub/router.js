@@ -1158,6 +1158,7 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   // 保存する属性を確定する。attributes を送ってきたらそれを、送ってこなければ既存を使い、
   // どちらの場合も メーカー型番 の行だけは落とす (入口を 1 つに保つ)
   let attributesJson = prevRkRow?.attributes_json ?? null;
+  let droppedLegacyCatalog = false;
   if (rows) {
     const kept = rows.filter((a) => a.name !== MODEL_ATTR_NAME).map((a) => ({ name: a.name, values: [a.value] }));
     // バリエーションは旧メーカー型番の行を落とさない (Codex R3 high: 古い画面・旧クライアントの attributes で
@@ -1171,7 +1172,7 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
     // 旧データの「カタログID」属性を人の操作で削除する (SKU 表の警告ボタン。JAN は専用行に入っている前提)。
     // 2026-09-02 までの単品は属性行で持てたが、SKU 表では JAN の専用行が入口なので出品が必ず止まる (Codex R3 high)
     attributesJson = JSON.stringify(prevAttrs.filter((a) => !(a && a.name === 'カタログID')));
-    logEvent(db, draft.id, 'legacy_catalog_attr_dropped', '旧データの「カタログID」属性を削除', actorOf(req));
+    droppedLegacyCatalog = true; // 記録は更新と同じトランザクションで (Codex R4 medium: 後続の 400 でもログだけ残っていた)
   } else if (prevModels.length > 0 && !isVariationDraft) {
     // 部分更新でも、メーカー型番の行は残さない (次の保存でまた競合として出てくる)。
     // バリエーションは旧値を捨てない (SKU 表の既定値・食い違いの材料として残す)
@@ -1242,6 +1243,9 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(draft.id, genreId, attributesJson, articleNumber, catalogExemptionReason, variantSelectorName,
       shippingGroup, postageIncluded, deliveryDateId, whiteBgFileId, whiteBgRaw);
+    if (droppedLegacyCatalog) {
+      logEvent(db, draft.id, 'legacy_catalog_attr_dropped', '旧データの「カタログID」属性を削除', actorOf(req));
+    }
     if (shopCategoryIds !== null) {
       setDraftShopCategories(db, draft.id, shopCategoryIds);
       // 店舗内カテゴリが確定した記録 (AI 初期設定の「一度だけ」判定に使う。0件保存も「人が外した」意思表示)。

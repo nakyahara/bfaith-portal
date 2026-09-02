@@ -3788,6 +3788,11 @@ let wfSetParentId = null;
     check('旧カタログID属性: SKU 表には展開せず legacyCatalogIds に出す',
       !gP.names.includes('カタログID') && gP.legacyCatalogIds.join() === '4901234567894' && gP.names.includes('ブランド名'), JSON.stringify(gP.names));
   }
+  // 後続の検証で 400 なら属性も残り、削除ログも残らない (Codex R4 medium: ログが更新と同じトランザクションに)
+  r = await call('POST', `/api/drafts/${idP}/rakuten`, { genre_id: '1', drop_legacy_catalog_attr: true, shipping_method_group: 'zz' });
+  check('旧カタログID属性: 後続の検証で 400 なら属性は残り、削除ログも残らない', r.status === 400
+    && String(db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(idP)?.attributes_json).includes('カタログID')
+    && !db.prepare("SELECT 1 FROM draft_events WHERE draft_id = ? AND event = 'legacy_catalog_attr_dropped'").get(idP), JSON.stringify(r.json));
   r = await call('POST', `/api/drafts/${idP}/rakuten`, { genre_id: '1', drop_legacy_catalog_attr: true });
   {
     const row = db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(idP);
@@ -6528,6 +6533,19 @@ for (const [name, file, data] of renders) {
       const ok = await fl;
       const ok2 = await h.flush();
       check('sku-jan worker: 拒否された一括操作を待った flush は false、次の flush は true (1 回限り)', ok === false && ok2 === true, JSON.stringify({ ok, ok2 }));
+    }
+    // 0'') 同時に始まった 2 つの flush (二重クリック) は同じ結果 (Codex R4 high: 片方だけ false になっていた)
+    {
+      const h = harness();
+      let done = null;
+      h.track(new Promise((resolve) => { done = resolve; })).catch(() => {});
+      const f1 = h.flush();
+      const f2 = h.flush();
+      await tick();
+      done({ ok: false, error: 'rejected' });
+      const [r1, r2] = await Promise.all([f1, f2]);
+      const r3 = await h.flush();
+      check('sku-jan worker: 同時に始まった flush は両方 false、終わった後の新しい flush は true', r1 === false && r2 === false && r3 === true, JSON.stringify({ r1, r2, r3 }));
     }
     // 0) ワーカー外の保存 (一括入力) が実行中なら flush はその完了を待つ (Codex R2 high)
     {
