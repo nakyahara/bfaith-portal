@@ -252,12 +252,17 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
     }
   }
 
-  // 棚入完了には できあがり写真1枚以上 (要件 §6)。職員判断でスキップ可 (skip_photo。履歴に残す)
+  // 棚入完了には できあがり写真1枚以上 (要件 §6)。スキップは**本人確認済みの職員のみ**
+  // (skip_photo。changeStatus 側の staff_required に頼らず API 入口でも強制 — Codex PR3-R4)
   let skipPhotoUsed = false;
   if (to === '棚入完了' && countActivePhotos(pageId) === 0) {
     if (!req.body?.skip_photo) {
       return res.status(409).json({ ok: false, error: 'photo_required',
         message: 'できあがりの写真がまだありません。写真を1枚以上とってから棚入完了にしてください' });
+    }
+    if (!isStaff) {
+      return res.status(403).json({ ok: false, error: 'staff_required',
+        message: '写真なしでの完了は職員のみです (職員の名前を選び、PINを入れてください)' });
     }
     skipPhotoUsed = true;
   }
