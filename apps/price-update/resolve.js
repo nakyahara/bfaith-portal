@@ -230,7 +230,8 @@ function resolveAmazon(db, code) {
 
 export const MALLS = ['rakuten', 'yahoo', 'amazon', 'aupay', 'qoo10'];
 /** API で価格を更新できる (予定の) モール。M1 は読むだけ */
-export const UPDATABLE_MALLS = ['rakuten', 'yahoo'];
+// ★正は mall-capabilities.js。ここでは読み直して公開するだけ (既存の import 先を壊さない)
+export { UPDATABLE_MALLS } from './mall-capabilities.js';
 
 /**
  * 1 NEコードの全モール出品候補。

@@ -10,10 +10,13 @@
  *
  * 経路: Render → VPS プロキシ (固定IP 133.167.122.198) → api.manager.wowma.jp
  *   au PAY は API キー方式で、データセンターIP でないと通らないため VPS 必須。
- *   ★VPS の /wmshopapi/ 中継は **GET だけ**。価格を書くには専用の口を足す (M4-2)。
+ *   ★VPS の /wmshopapi/ 中継は **GET だけ**。書き込みは価格しか通れない
+ *     /aupay/update-item を通る。
  *
  * 提供:
- *   fetchAupayItemDetail(itemCode) … 商品1件を読む (価格・税・発送・カラバリの色数)
+ *   fetchAupayItemDetail(itemCode) … 商品1件を読む (価格・税・発送・カラバリの数)
+ *   planAupayUpdate(...)           … 送る前の判定 (楽観ロック・取り違え防止)
+ *   makeAupayClient(deps)          … execute.js から楽天・Yahoo と同じ形で呼ばれる
  */
 
 import { parseString } from 'xml2js';
@@ -21,6 +24,12 @@ import { parseString } from 'xml2js';
 const DEFAULT_TIMEOUT_MS = 20_000;
 /** au PAY の既定店舗ID (aupay-orders.js と同じ値。env で上書きできる) */
 const DEFAULT_SHOP_ID = '54318092';
+/**
+ * 送ってよい価格の上限。
+ * ★VPS 側 (vps-proxy/aupay-proxy.js の MAX_AUPAY_PRICE) と同じ値。
+ *   片方だけ緩いと、通ったあとに向こうで落ちて「結果不明」になる
+ */
+export const MAX_AUPAY_PRICE = 999999999;
 
 export class AupayProxyError extends Error {
   constructor(kind, message, extra = {}) {
@@ -94,7 +103,8 @@ export function toIntPrice(v) {
  * @returns {{ok:boolean, error?:string, message?:string, itemCode:string|null, itemPrice:number|null,
  *   itemPriceReadable:boolean, itemName:string|null, taxSegment:string|null, postageSegment:string|null,
  *   postage:number|null, deliveryMethodName:string|null, saleStatus:string|null,
- *   choiceCount:number, lotNumber:string|null}}
+ *   choiceCount:number|null, lotNumber:string|null}}
+ *   choiceCount … バリエーションの数。0 = 無し / null = 数えられなかった (応答に在庫情報が無い)
  */
 export function parseSearchItemInfoXml(xml) {
   const bad = (error, message) => ({
@@ -192,4 +202,172 @@ export async function fetchAupayItemDetail(itemCode, deps = {}) {
       { statusCode: res.status });
   }
   return parseSearchItemInfoXml(text);
+}
+
+/**
+ * 送る前の判定。miniPC の楽天エンドポイントと同じ形で返すので、
+ * execute.js の classify() / 試運転 / ブレーカー がそのまま効く。
+ *
+ * ★au PAY は「商品」に1つの価格しか持たない。カラバリ (registerStock) は在庫だけで
+ *   価格の項目が無い。だから **送り先のキーは商品コード**。
+ *   色のコードが渡ってきたら送らない (商品の全色を書き換えたのに、
+ *   送った後の照合は色のコードで探す、という食い違いを作らない)。
+ *
+ * @param {object} detail fetchAupayItemDetail の戻り
+ * @param {string} itemCode 送ろうとしている商品コード
+ * @param {Record<string, number>} expected 記録した時の価格
+ * @param {Record<string, number>} prices 送りたい価格
+ */
+export function planAupayUpdate(detail, itemCode, expected, prices) {
+  const bad = (status, error, message, extra = {}) => ({ ok: false, status, body: { ok: false, error, message, ...extra } });
+
+  if (!detail || detail.ok === false) {
+    return bad(404, 'ITEM_NOT_FOUND',
+      `au PAY でこの商品を取得できませんでした (${itemCode}${detail?.message ? ': ' + detail.message : ''})`);
+  }
+  // ★取ってきた商品が本当に送ろうとしている商品か (別商品に値付けしない)
+  if (String(detail.itemCode || '').trim().toLowerCase() !== String(itemCode).trim().toLowerCase()) {
+    return bad(404, 'ITEM_NOT_FOUND',
+      `取得した商品コードが違います (要求 ${itemCode} / 応答 ${detail.itemCode ?? 'なし'})`);
+  }
+
+  const wantKeys = Object.keys(prices || {});
+  if (wantKeys.length !== 1) {
+    return bad(400, 'MULTIPLE_PRICES',
+      `au PAY は商品ごとに1つの価格しか送りません (受け取った数: ${wantKeys.length})`);
+  }
+  const key = wantKeys[0];
+  // ★送るキーは商品コードでなければならない (Yahoo と同じ理由。最後の安全弁)
+  if (String(key).trim().toLowerCase() !== String(detail.itemCode).trim().toLowerCase()) {
+    return bad(400, 'SKU_KEY_MISMATCH',
+      `au PAY は商品に1つの価格しか持ちません。送る先は商品コード (${detail.itemCode}) `
+      + `でなければなりませんが、${key} が渡されました`);
+  }
+
+  const next = toIntPrice(prices[key]);
+  // ★上限は VPS 側 (MAX_AUPAY_PRICE) と同じ値にそろえる。ここが緩いと、
+  //   アプリの検査を通ったあと VPS で例外になり、HTTP 500 =「結果不明」として
+  //   ブレーカーが止まり復旧の対象にもなる (実際には1件も送っていないのに)
+  if (next === null || next < 1 || next > MAX_AUPAY_PRICE) {
+    return bad(400, 'INVALID_PRICE',
+      `送ろうとした価格が 1〜${MAX_AUPAY_PRICE} の整数円ではありません (${prices[key]})`);
+  }
+  const current = toIntPrice(detail.itemPrice);
+  if (current === null) {
+    return bad(400, 'CURRENT_PRICE_UNREADABLE', 'いまの価格を整数円として読めません');
+  }
+  // ★楽観ロック。記録した時の価格と今の価格が違えば送らない (誰かの変更を踏み潰さない)
+  const want = toIntPrice(expected?.[key]);
+  if (want === null) {
+    return bad(400, 'EXPECTED_REQUIRED', '記録時の価格が分からないため送りません');
+  }
+  if (want !== current) {
+    return {
+      ok: false, status: 409,
+      body: {
+        ok: false, state: 'conflict', error: 'CONFLICT',
+        message: '現在価格が想定と違います',
+        detail: { conflicts: [{ sku: key, expected: want, live: current, reason: '現在価格が想定と違います' }] },
+      },
+    };
+  }
+  return { ok: true, currentPrice: current, noop: current === next, sku: key, price: next };
+}
+
+/**
+ * au PAY 用のクライアント。execute.js からは楽天・Yahoo と同じ形で呼ばれる。
+ *
+ * ★au PAY の updateItemInfo は **部分更新** (2026-09-02 実測)。
+ *   価格を 980 → 981 → 980 と動かしても、商品名・説明・画像・カテゴリは 1 バイトも変わらなかった。
+ *   Yahoo の editItem (省略した項目を消す) とは違うので、価格だけ送ってよい。
+ *
+ * ⚠️フロント反映について: au PAY の API 一覧に Yahoo の submitItem にあたるものが見当たらず、
+ *   更新した直後に searchItemInfo を読むと新しい価格が返ってきた。
+ *   ただしそれで分かるのは **管理側に反映された** ことまでで、
+ *   買う人が見る商品ページに出たかどうかは確かめていない (Codex R1)。
+ *   本番の商品で1件通すときに、商品ページを目で見て確かめること。
+ *
+ * @param {object} deps テスト用の差し替え ({ getDetail / postUpdate })
+ */
+export function makeAupayClient(deps = {}) {
+  const getDetail = deps.getDetail || ((code) => fetchAupayItemDetail(code));
+  const postUpdate = deps.postUpdate || defaultAupayPostUpdate;
+
+  return {
+    /**
+     * 照合のための再取得。楽天と同じ形にそろえる。
+     * ★au PAY は商品に1つの価格なので、variants のキーは商品コードそのもの
+     */
+    async fetchItemDetail(itemCode) {
+      const d = await getDetail(itemCode);
+      if (!d || d.ok === false || d.itemPrice === null || d.itemPrice === undefined) {
+        return { item: null, status: 'not_found' };
+      }
+      // ★キーは「応答の商品コード」と「問い合わせた商品コード」の両方で引けるようにする。
+      //   応答の書き方だけを使うと、要求と大小が違った時に照合が必ず外れる
+      //   (更新は通っているのに失敗として記録される)
+      const price = { standardPrice: String(d.itemPrice) };
+      const variants = { [d.itemCode]: price };
+      if (String(itemCode).trim() !== String(d.itemCode).trim()) variants[String(itemCode).trim()] = price;
+      return { item: { manageNumber: d.itemCode, variants }, status: 'found' };
+    },
+
+    /** 価格を送る。応答は楽天エンドポイントと同じ形にそろえる */
+    async patchItemPrices(itemCode, { expected, prices }) {
+      const detail = await getDetail(itemCode);
+      const plan = planAupayUpdate(detail, itemCode, expected, prices);
+      if (!plan.ok) return { status: plan.status, body: plan.body };
+
+      if (plan.noop) {
+        return { status: 200, body: { ok: true, state: 'noop', applied: {} } };
+      }
+      const res = await postUpdate(itemCode, plan.price, plan.currentPrice);
+      if (res.status >= 200 && res.status < 300 && res.json?.ok === true) {
+        return {
+          status: 200,
+          body: { ok: true, state: 'applied', applied: { [plan.sku]: plan.price } },
+        };
+      }
+      // ★VPS が「今の価格が想定と違う」と言ってきた時は conflict として返す。
+      //   ひとまとめに失敗へ潰すと、誰かの変更とぶつかったのかが記録から分からなくなる
+      if (res.status === 409 && res.json?.error === 'CONFLICT') {
+        const c = res.json.conflict || {};
+        return {
+          status: 409,
+          body: {
+            ok: false, state: 'conflict', error: 'CONFLICT',
+            message: c.reason || '現在価格が想定と違います',
+            detail: { conflicts: [{ sku: plan.sku, expected: c.expected ?? plan.currentPrice, live: c.live ?? null, reason: c.reason || '現在価格が想定と違います' }] },
+          },
+        };
+      }
+      const message = String(res.json?.updateBody || res.body || '').slice(0, 300).replace(/\s+/g, ' ');
+      if (res.status >= 400 && res.status < 500) {
+        return { status: 400, body: { ok: false, error: 'AUPAY_REJECTED', message } };
+      }
+      return { status: res.status, body: { ok: false, message } };
+    },
+  };
+}
+
+/** VPS の /aupay/update-item を叩く */
+async function defaultAupayPostUpdate(itemCode, price, expectedPrice) {
+  const base = requireEnv('AUPAY_PROXY_BASE_URL', 'AUPAY_PROXY_URL').replace(/\/+$/, '');
+  const secret = requireEnv('AUPAY_PROXY_SECRET');
+  const res = await fetch(`${base}/aupay/update-item`, {
+    method: 'POST',
+    headers: { 'X-Proxy-Secret': secret, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      itemCode,
+      itemPrice: price,
+      // ★VPS 側でも「送る直前に読み直して照合」してもらう。
+      //   こちら側で読んでから送るまでの間に誰かが変えていたら、VPS が 409 で止める
+      expected: expectedPrice,
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* JSON でない応答はそのまま扱う */ }
+  return { status: res.status, body: text, json };
 }

@@ -24,6 +24,7 @@ import { rakutenShippingLabel, yahooPostageLabel, rakutenShippingName, yahooPost
 import { executeRun, mallWriteEnabled } from './execute.js';
 import { patchItemPrices, fetchItemDetail } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
 import { makeYahooClient } from './yahoo-apply.js';
+import { makeAupayClient } from './aupay-apply.js';
 import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -257,7 +258,12 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
             : null;
           // ★au PAY も商品に1つの価格。カラバリ (色) は在庫だけで価格を持たない。
           //   1色ぶんのつもりで変えると、その商品の色が全部同じ価格になる
-          if (p.choiceCount > 1) {
+          if (p.choiceCount === null || p.choiceCount === undefined) {
+            // ★数えられなかった = カラバリが無いとは限らない。黙って通さない (Codex R1)
+            sharedNote = 'au PAY のバリエーションの数を確かめられませんでした。'
+              + '変えるとこの商品の価格が全部変わる可能性があります';
+            note = note ? `${note} / ${sharedNote}` : sharedNote;
+          } else if (p.choiceCount > 1) {
             sharedNote = `au PAY は色ごとの価格を持ちません。変えるとこの商品の ${p.choiceCount} 通りすべてが同じ価格になります`;
             note = note ? `${note} / ${sharedNote}` : sharedNote;
           }
@@ -545,6 +551,7 @@ router.post('/api/runs/:runId/execute', async (req, res) => {
       clients: {
         rakuten: { patchItemPrices, fetchItemDetail },
         yahoo: makeYahooClient(),
+        aupay: makeAupayClient(),
       },
     });
     res.json({ ok: true, ...out });

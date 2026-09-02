@@ -7,7 +7,8 @@
  *   楽天  : miniPC /service-api/rakuten-rms/items/details-bulk → variants[sku].standardPrice
  *   Yahoo : VPS /yahoo/get-item-detail → Price (+ SubCodes[].Price)
  *   Amazon: mirror_amazon_price_snapshot_daily (日次・表示のみ。更新しないのでライブ取得は不要)
- *   auPAY / Qoo10: 価格を出さない (要件 F2)
+ *   auPAY : VPS /wmshopapi/searchItemInfo → itemPrice (2026-09-02〜)
+ *   Qoo10 : 価格を出さない (書き込み経路がまだ無い)
  *
  * 🚨M0実測: 楽天 GET の standardPrice は**文字列**で返る ("1000")。
  *    ここで整数化しておかないと、M2 の楽観ロック照合が全件 conflict になる。
@@ -444,8 +445,9 @@ export async function fetchAupayPrices(targets, deps = {}) {
         found: price != null,
         reason,
         itemName: d.itemName || null,
-        // 変えると影響を受ける色の数 (0 = カラバリ無し)
-        choiceCount: d.choiceCount || 0,
+        // 変えると影響を受ける組み合わせの数。0 = カラバリ無し / null = 数えられなかった。
+        // ★null を 0 に潰さない。潰すと「本当はカラバリがあるのに警告が出ない」が起きる (Codex R1)
+        choiceCount: d.choiceCount === null || d.choiceCount === undefined ? null : d.choiceCount,
         saleStatus: d.saleStatus || null,
         lotNumber: d.lotNumber || null,
         shipping: (d.postageSegment != null || d.deliveryMethodName != null)

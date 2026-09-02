@@ -14,6 +14,8 @@ import { createTables, insertRun, getRun } from './db.js';
 import { executeRun, mallWriteEnabled, classify, groupOperations, findSendConflicts, sendKeyOf,
   BREAKER_CONSECUTIVE_FAILURES } from './execute.js';
 import { executorGate } from './router.js';
+import { MALL_CAPABILITIES, findCapabilityProblems, killSwitchKeyOf,
+  ITEM_PRICE_MALLS, UPDATABLE_MALLS } from './mall-capabilities.js';
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -273,7 +275,13 @@ console.log('\n── モール別の送信口 (Yahoo の出品コードを楽�
   eq(mallWriteEnabled('yahoo', {}).enabled, false, '★env 未設定なら Yahoo は送らない (fail-closed)');
   eq(mallWriteEnabled('yahoo', { PRICE_UPDATE_RAKUTEN_ENABLED: '1' }).enabled, false,
     '★楽天の env では Yahoo は開かない');
-  eq(mallWriteEnabled('aupay', ENV_BOTH).enabled, false, 'au PAY はまだ送れない');
+  eq(mallWriteEnabled('aupay', { PRICE_UPDATE_AUPAY_ENABLED: '1' }).enabled, true,
+    'env を立てれば au PAY も送れる (2026-09-02〜)');
+  eq(mallWriteEnabled('aupay', {}).enabled, false, '★env 未設定なら au PAY は送らない (fail-closed)');
+  eq(mallWriteEnabled('aupay', ENV_BOTH).enabled, false,
+    '★楽天・Yahoo の env では au PAY は開かない');
+  eq(mallWriteEnabled('qoo10', { PRICE_UPDATE_AUPAY_ENABLED: '1' }).enabled, false,
+    '★送信経路の無いモールは何をしても開かない');
 }
 
 console.log('\n── noop も確認できたときだけ確定する ──');
@@ -493,6 +501,95 @@ console.log('\n── 表記ゆれ・kill switch との優先順位 ──');
   // ★全行が衝突して送るものが無くなった時
   eq(o3.summary.sent, 0, "送信数 0");
   eq(o3.summary.skipped, 2, "全行が対象外として数えられる");
+}
+
+console.log('\n── au PAY の送信 (商品に1つの価格) ──');
+{
+  const mk = (id, neCode, code, newPrice, expected) => ({
+    operationId: `puo-au-${id}-${Math.random().toString(36).slice(2, 8)}`,
+    mall: "aupay", neCode, rowKind: "single",
+    listingCode: code, skuCode: code,   // ★au PAY は送り先 = 商品コード
+    confidence: "confirmed", expectedCurrentPrice: expected, newPrice,
+    cost: 210, taxRate: 0.1, shipping: 182, feeRate: 0.12,
+    initialState: "previewed",
+  });
+  const mkClient = (live) => {
+    const sent = [];
+    return {
+      sent,
+      patchItemPrices: async (code, { prices }) => {
+        sent.push({ code, prices });
+        return { status: 200, body: { state: "applied", applied: prices } };
+      },
+      fetchItemDetail: async (code) => ({ item: { variants: { [code]: { standardPrice: String(live) } } } }),
+    };
+  };
+
+  // ★au PAY のスイッチだけで開き、au PAY のクライアントにだけ送られる
+  const c = mkClient(600);
+  const rakuten = mkClient(600);
+  const id = insertRun(db, { createdBy: "t", neCodes: ["ne-au"], limits: {},
+    operations: [mk("a", "ne-au", "au-1", 600, 577)] });
+  const out = await executeRun(db, getRun(db, id), { actor: "t",
+    clients: { aupay: c, rakuten },
+    env: { PRICE_UPDATE_AUPAY_ENABLED: "1" }, skipClaim: true });
+  eq(out.summary.applied, 1, "au PAY へ送れる");
+  eq(c.sent.length, 1, "au PAY のクライアントに届く");
+  eq(rakuten.sent.length, 0, "★別のモールのクライアントには送らない");
+  eq(c.sent[0].code, "au-1", "送り先は商品コード");
+
+  // ★同じ商品の2行が同じ値 → 1リクエストにまとまる
+  const c2 = mkClient(650);
+  const id2 = insertRun(db, { createdBy: "t", neCodes: ["ne-b1", "ne-b2"], limits: {},
+    operations: [mk("b1", "ne-b1", "au-2", 650, 577), mk("b2", "ne-b2", "au-2", 650, 577)] });
+  const out2 = await executeRun(db, getRun(db, id2), { actor: "t", clients: { aupay: c2 },
+    env: { PRICE_UPDATE_AUPAY_ENABLED: "1" }, skipClaim: true });
+  eq(c2.sent.length, 1, "★同じ商品への2行は1リクエストにまとまる");
+  eq(out2.summary.applied, 2, "2行とも成功として記録される");
+
+  // ★同じ商品に違う値 → 1件も送らない
+  const c3 = mkClient(600);
+  const id3 = insertRun(db, { createdBy: "t", neCodes: ["ne-c1", "ne-c2"], limits: {},
+    operations: [mk("c1", "ne-c1", "au-3", 600, 577), mk("c2", "ne-c2", "au-3", 650, 577)] });
+  const out3 = await executeRun(db, getRun(db, id3), { actor: "t", clients: { aupay: c3 },
+    env: { PRICE_UPDATE_AUPAY_ENABLED: "1" }, skipClaim: true });
+  eq(c3.sent.length, 0, "★同じ商品に違う新売価なら1件も送らない");
+  eq(out3.results.every((r) => r.state === "blocked"), true, "全行が blocked");
+
+  // ★送った後の照合が合わなければ成功にしない
+  const c4 = mkClient(999);   // 送ったのは 600 なのに 999 が返る
+  const id4 = insertRun(db, { createdBy: "t", neCodes: ["ne-d"], limits: {},
+    operations: [mk("d", "ne-d", "au-4", 600, 577)] });
+  const out4 = await executeRun(db, getRun(db, id4), { actor: "t", clients: { aupay: c4 },
+    env: { PRICE_UPDATE_AUPAY_ENABLED: "1" }, skipClaim: true });
+  eq(out4.summary.applied, 0, "★照合が合わなければ成功にしない");
+  eq(out4.summary.failed, 1, "失敗として残る");
+}
+
+console.log('\n── モールの設定が食い違っていないか (増やし忘れ対策) ──');
+{
+  // ★2026-09-02: au PAY を足した時、execute と resolve は直したのに pricing.js を
+  //   直し忘れ、画面では選べるのに送信の手前で必ず弾かれる状態になった。
+  //   同じ事実が散らないよう mall-capabilities.js に集約し、食い違いを機械で見つける
+  eq(findCapabilityProblems(), [], "★モールの設定に食い違いが無い");
+
+  for (const [mall, c] of Object.entries(MALL_CAPABILITIES)) {
+    if (!c.executable) continue;
+    ok(killSwitchKeyOf(mall) !== null, `${mall}: 送信スイッチの名前がある`);
+    ok(UPDATABLE_MALLS.includes(mall), `${mall}: 画面でも新売価を入れられる`);
+    ok(c.priceScope === 'sku' || c.priceScope === 'item', `${mall}: 価格の単位が決まっている`);
+    // ★スイッチを入れれば開く / 入れなければ開かない、が両方成り立つこと
+    eq(mallWriteEnabled(mall, { [c.killSwitch]: "1" }).enabled, true, `${mall}: スイッチで開く`);
+    eq(mallWriteEnabled(mall, {}).enabled, false, `${mall}: スイッチ無しでは開かない`);
+  }
+  // 更新できないモールは、ガードの側でも必ず理由つきで止まる
+  for (const [mall, c] of Object.entries(MALL_CAPABILITIES)) {
+    if (c.updatable) continue;
+    eq(mallWriteEnabled(mall, { PRICE_UPDATE_RAKUTEN_ENABLED: "1" }).enabled, false,
+      `${mall}: 更新できないモールは何をしても開かない`);
+  }
+  eq([...ITEM_PRICE_MALLS].sort(), ['aupay', 'yahoo'],
+    "★商品に1つの価格のモール = Yahoo と au PAY (楽天は SKU ごと)");
 }
 
 db.close();

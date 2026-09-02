@@ -1,7 +1,7 @@
 /**
  * price-update / 実行フロー (要件定義 v1.0 F4・M2)
  *
- * 記録した run の中から「更新できる行」だけを、楽天へ順番に送る。
+ * 記録した run の中から「更新できる行」だけを、モールへ順番に送る。
  *
  * ★ここが守ること (どれも「事故を小さく止める」ためのもの):
  *   ・実行するのは**保存済みの run**の内容だけ。画面から価格を再受領しない
@@ -21,17 +21,21 @@
  */
 import { appendEvent, claimRun } from './db.js';
 import { evaluateRow } from './pricing.js';
+import { EXECUTABLE_MALLS, ITEM_PRICE_MALLS, killSwitchKeyOf } from './mall-capabilities.js';
 
 /** 連続でこの回数失敗したら、そのモールの残りを止める */
 export const BREAKER_CONSECUTIVE_FAILURES = 2;
 
 /**
- * このバージョンで実際に送れるモール。
- * ★楽天だけ。Yahoo を有効にしても送り先のクライアントが楽天しか無いため、
- *   ここで止めないと「Yahoo の出品コードを楽天の管理番号として送る」ことになる (Codex R1 High)。
- *   Yahoo は M3 で送信経路と一緒に開ける。
+ * 実際に送れるモール (楽天 / Yahoo / au PAY)。
+ * ★正は mall-capabilities.js。ここでは読み直して公開するだけ。
+ *   同じ事実を何か所にも書くと、モールを増やした時に片方だけ直し忘れる
+ *   (2026-09-02: au PAY を足した時に pricing.js を直し忘れ、
+ *    画面では選べるのに送信の手前で必ず弾かれる状態になった)。
+ * ★送り先のクライアントが無いモールをここに入れてはいけない。
+ *   入れると「別のモールの出品コードを送る」ことになる (Codex R1 High)
  */
-export const EXECUTABLE_MALLS = ['rakuten', 'yahoo'];
+export { EXECUTABLE_MALLS };
 
 const TRUE_VALUES = new Set(['1', 'true', 'on', 'yes']);
 
@@ -43,7 +47,10 @@ export function mallWriteEnabled(mall, env = process.env) {
   if (!EXECUTABLE_MALLS.includes(mall)) {
     return { enabled: false, reason: `${mall} はこのバージョンからは更新できません (送信経路がありません)` };
   }
-  const key = { rakuten: 'PRICE_UPDATE_RAKUTEN_ENABLED', yahoo: 'PRICE_UPDATE_YAHOO_ENABLED' }[mall];
+  const key = killSwitchKeyOf(mall);
+  // ★スイッチの名前を決め忘れたモールは送らない。ここが undefined のまま進むと
+  //   「undefined が有効でないため」という読めない理由になる
+  if (!key) return { enabled: false, reason: `${mall} の送信スイッチが決まっていません (fail-closed)` };
   const on = TRUE_VALUES.has(String(env[key] ?? '').trim().toLowerCase());
   return on ? { enabled: true, reason: null } : { enabled: false, reason: `${key} が有効でないため送信しません (fail-closed)` };
 }
@@ -88,7 +95,7 @@ export function groupOperations(ops) {
 /**
  * **実際にモールへ書き込む単位** を表すキー。グループ分け (mall + listing_code) とは別物。
  *
- * ★Yahoo は商品に1つの価格しか持たない。色 (個別商品コード) は商品価格を継承するので、
+ * ★Yahoo と au PAY は商品に1つの価格しか持たない。色は商品価格を継承するので、
  *   色が違っても書き込む先は同じ商品になる。
  *   出品コードの表記ゆれ (大文字小文字) で別グループに割れても、同じ商品なら同じ送り先として見る
  *   — でないと「同じ商品へ違う価格を続けて送る」を素通りさせる (Codex R1 高)。
@@ -96,7 +103,8 @@ export function groupOperations(ops) {
  */
 export function sendKeyOf(op) {
   const n = (v) => String(v ?? '').trim().toLowerCase();
-  return op.mall === 'yahoo'
+  // ★Yahoo と au PAY は商品に1つの価格。楽天は SKU (variant) ごとに価格を持つ
+  return ITEM_PRICE_MALLS.has(op.mall)
     ? [op.mall, n(op.listing_code)].join('|')
     : [op.mall, n(op.listing_code), n(op.sku_code)].join('|');
 }
