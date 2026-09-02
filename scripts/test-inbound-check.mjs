@@ -423,5 +423,26 @@ console.log('\n[13] 完了一覧 (棚入れ・確認用)');
   ok(/商品1/.test(csv) && /商品2/.test(csv), 'CSV に明細が入る');
 }
 
+console.log('\n[14] 入庫情報の選択肢 (プルダウン)');
+{
+  const { fieldOptions } = await import('../apps/inbound-check/db.js');
+  const now2 = new Date().toISOString();
+  db.prepare(`INSERT OR REPLACE INTO f_inbound_info
+    (code_key, 商品コード, 商品名, BF保管荷姿, source, created_at, updated_at)
+    VALUES ('optx', 'optX', '選択肢テスト', '特注ケース', 'manual', ?, ?)`).run(now2, now2);
+  const o = fieldOptions();
+  ok(Array.isArray(o.BF保管荷姿) && o.BF保管荷姿.includes('特注ケース'), '入庫情報に入った新しい表記が選択肢に並ぶ (専用の表は作らない)');
+  ok(o.BF保管荷姿.includes('そのまま'), '土台の選択肢は必ず含む (1件も無い列でも空にしない)');
+  ok(o.いろは在庫化作業有無.includes('有り') && o.いろは在庫化作業有無.includes('無し'), 'いろはの選択肢');
+  ok(!o.BF保管荷姿.includes('－'), 'いろは=有り の印 (－) は選択肢に出さない');
+  ok(new Set(o.BF保管荷姿).size === o.BF保管荷姿.length, '同じ表記が二重に並ばない');
+  // よく使われている順 (件数の多い表記が上)
+  for (const c of ['o1', 'o2', 'o3']) {
+    db.prepare(`INSERT OR REPLACE INTO f_inbound_info (code_key, 商品コード, 商品名, BF保管荷姿, source, created_at, updated_at)
+      VALUES (?, ?, '順序テスト', 'よく使う', 'manual', ?, ?)`).run(c, c, now2, now2);
+  }
+  ok(fieldOptions().BF保管荷姿[0] === 'よく使う', '件数の多い表記が先頭に来る');
+}
+
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;

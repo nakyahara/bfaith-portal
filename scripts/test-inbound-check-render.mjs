@@ -113,6 +113,13 @@ const STATE = lines => ({
     partial: lines.filter(l => l.check_status !== 'checked' && l.found_qty > 0).length,
     undecided: 0, toIroha: 0, toIrohaQty: 0,
   },
+  // 選択肢はサーバーが配る (入庫情報の実データ + 土台の値)
+  field_options: {
+    いろは在庫化作業有無: ['無し', '有り', '状況による'],
+    入庫時BCシール貼りフラグ: ['不要', 'BCシール貼付必要'],
+    直接ピックロケ保管: ['無', '直接ピックロケ'],
+    BF保管荷姿: ['そのまま', 'バラ'],
+  },
   workers: [{ code: '0001', name: '山田', staff_id: 1 }],
   me: { session: null, device: { id: 1, label: 'iPad1' }, admin: false },
 });
@@ -229,6 +236,26 @@ console.log('\n[7] 期限の表示・詳細ボタン・完了一覧への導線 
   ok(/all-done[^]*完了一覧を開く/.test(r.html), '全部終わったら上に「完了一覧を開く」を出す');
   r = await renderWith([LINE()]);
   ok(!/slip-done/.test(r.html) && !/all-done/.test(r.html), '途中の伝票には一覧リンクを出さない');
+}
+
+console.log('\n[8] 入庫情報はプルダウンで選ぶ (2026-09-02 中原さん)');
+{
+  // 「文字を消さないと入れられない」自由入力をやめ、選ぶだけにする
+  const r = await renderWith([LINE()], { open: 'AR1|1|1', mode: 'info' });
+  ok(!/list="dl-/.test(r.html), '自由入力 (datalist) は使わない');
+  for (const f of ['いろは在庫化作業有無', '入庫時BCシール貼りフラグ', '直接ピックロケ保管', 'BF保管荷姿']) {
+    ok(new RegExp('<select data-f="' + f + '" data-sel="1"').test(r.html), f + ' はプルダウン');
+  }
+  ok(/<option value="__new__">➕ 新規で登録…<\/option>/.test(r.html), '「➕ 新規で登録…」の選択肢がある');
+  ok(/<option value="無し" selected>無し<\/option>/.test(r.html), '現在値が選ばれた状態で出る');
+  ok(/data-newfor="いろは在庫化作業有無"[^>]*style="display:none/.test(r.html), '新規入力欄は既定で隠れている');
+  // 選択肢に無い表記が入っている行でも、その値を消さずに出す
+  const r2 = await renderWith([LINE({ info: { ...LINE().info, storage_form: '特注ケース' } })], { open: 'AR1|1|1', mode: 'info' });
+  ok(/<option value="特注ケース" selected>/.test(r2.html), '選択肢に無い現在値も候補に足して選択済みにする');
+  ok(/<option value="">\(未設定\)<\/option>/.test(r2.html), '未設定を選べる');
+  // いろは=有り の行は下3項目を触らせない
+  const r3 = await renderWith([LINE({ info: { ...LINE().info, iroha: '有り' } })], { open: 'AR1|1|1', mode: 'info' });
+  ok(/data-f="入庫時BCシール貼りフラグ" data-sel="1" disabled/.test(r3.html), 'いろは=有り ならBCシールは選べない');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
