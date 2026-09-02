@@ -263,7 +263,9 @@ miniPC auto-shohin-csv.js (Logizard-NyukaCSV の2ステップ目・1日1回)
 - 4xx (429/409 以外。スキーマ不整合等) は自動再試行しない — 管理画面に出て「再送」で解除。
   依存プロパティの**型**も送信前に検証し、合わなければ行に書き散らさず sweep 1回の失敗にする
 - env: `NOTION_TOKEN` (既存インテグレーション共用) / `INBOUND_CHECK_NOTION_DB_ID` /
-  `INBOUND_CHECK_NOTION_CRON` (既定 `30 17 * * *`) / `INBOUND_CHECK_NOTION_ENABLED` (false で停止・非Renderは既定OFF)。
+  `INBOUND_CHECK_NOTION_CRON` (既定 `30 17 * * *`) / `INBOUND_CHECK_NOTION_ENABLED`
+  (**false で 17:30 と 30分相乗り分の両方を停止**・非Renderは既定OFF。
+  なお `INBOUND_CHECK_SYNC_ENABLED=false` は30分巡回ごと止まるため相乗り分も一緒に止まる)。
   Notion 側で対象 DB のコネクトにインテグレーションを追加しておくこと
 - 台帳 = `config/jobs-registry.mjs` `inbound-check-notion-cards` (dead-man ping)
 - ⚠「入数」はカードに送らない: 旧マスターの入数 (いろは容器あたり) と f_inbound_info の入数 (仕入箱) は

@@ -53,9 +53,13 @@ export function startInboundCheckCron() {
     try { await runScheduledMasterFetch({ actor: 'cron' }); }
     catch (e) { console.warn(`[inbound-check] cron(商品マスタ): ${e.message}`); }
     // Notion カードの「取消反映」と「一時エラーの再試行」だけ同じ巡回に相乗り (mode='retry')。
-    // 新規カードの送信は 17:30 の一括のみ (取消済みの作業指示を30分以内に消すため — Codex R1 #5 #6)
-    try { await runNotionSweep({ actor: 'cron-retry', mode: 'retry' }); }
-    catch (e) { console.warn(`[inbound-check] cron(notion-retry): ${e.message}`); }
+    // 新規カードの送信は 17:30 の一括のみ (取消済みの作業指示を30分以内に消すため — Codex R1 #5 #6)。
+    // ⭐INBOUND_CHECK_NOTION_ENABLED=false は 17:30 だけでなくこの相乗り分も止める (R2 #4)。
+    //   逆に INBOUND_CHECK_SYNC_ENABLED=false はこの巡回ごと止まるので、相乗り分も一緒に止まる
+    if (!OFF.has(String(process.env.INBOUND_CHECK_NOTION_ENABLED ?? '').trim().toLowerCase())) {
+      try { await runNotionSweep({ actor: 'cron-retry', mode: 'retry' }); }
+      catch (e) { console.warn(`[inbound-check] cron(notion-retry): ${e.message}`); }
+    }
   }, { timezone: 'Asia/Tokyo' });
   console.log(`[inbound-check] cron 起動 (${use} JST)`);
   return task;

@@ -69,7 +69,8 @@ global.fetch = async (url, opts = {}) => {
     const f = body?.filter || {};
     const value = f.rich_text?.equals ?? f.number?.equals;
     const hit = mock.queryResults.get(`${f.property}:${value}`);
-    return respond(200, { object: 'list', results: hit ? [hit] : [] });
+    const hits = hit ? (Array.isArray(hit) ? hit : [hit]) : [];
+    return respond(200, { object: 'list', results: hits });
   }
   if (u.endsWith('/pages') && method === 'POST') {
     if (mock.onCreate) { const h = mock.onCreate; mock.onCreate = null; h(); }
@@ -253,7 +254,7 @@ let d5;
   ok(notionStatusForAdmin().blocked.some(b => b.id === d5), '管理画面の「エラーで止まっている」に出る');
   resetNotionRow(d5);
   ok(collectUnsent(db).some(x => x.id === d5), '再送で対象に戻る');
-  mock.failCreate = { status: 409 };
+  mock.failCreate = { status: 409, times: 3 };   // 作成は失敗のたび再検索→再POSTするので3回分
   const r2 = await runNotionSweep({ actor: 'test' });
   const row = destRow(d5);
   ok(r2.errors === 1 && !String(row.notion_next_retry_at).startsWith('9999-'), '409 は一時エラー (30分後に再試行)');
@@ -333,7 +334,49 @@ console.log('\n[13] [R1 Med9] プロパティ型の不一致は sweep 全体を1
   ok(r2.ok && r2.sent === 1, '型を直せばそのまま送れる');
 }
 
-console.log('\n[14] 冪等: もう一度回しても何もしない');
+console.log('\n[14] [R2 High1] 応答喪失 (作成成功したが失敗に見えた) は再検索で回収');
+{
+  const dA = seedDest({ name: '商品A応答喪失' });
+  db.prepare("UPDATE f_inbound_check_destinations SET notion_dedupe_key = 'd555-lost' WHERE id = ?").run(dA);
+  mock.onCreate = () => {
+    mock.pageStates.set('page-lost', { archived: false, status: '未着手' });
+    mock.queryResults.set('台帳キー:d555-lost', { id: 'page-lost', object: 'page' });
+  };
+  mock.failCreate = { status: 500, times: 1 };   // 1回目: Notion側では作成成功・応答だけ失敗
+  const before = mock.created.length;
+  const r = await runNotionSweep({ actor: 'test' });
+  ok(r.ok && r.recovered === 1 && r.errors === 0, '失敗後の再検索で回収 (2枚目を作らない)');
+  ok(mock.created.length === before, '再POSTしない');
+  ok(destRow(dA).notion_page_id === 'page-lost', '回収した page が記録される');
+}
+
+console.log('\n[15] [R2 High1] 同じ台帳キーのカードが複数 → 要対応で止める');
+{
+  const dB = seedDest({ name: '商品A二重' });
+  db.prepare("UPDATE f_inbound_check_destinations SET notion_dedupe_key = 'd333-dup' WHERE id = ?").run(dB);
+  mock.pageStates.set('pgA', { archived: false, status: '未着手' });
+  mock.pageStates.set('pgB', { archived: false, status: '未着手' });
+  mock.queryResults.set('台帳キー:d333-dup', [{ id: 'pgA' }, { id: 'pgB' }]);
+  const r = await runNotionSweep({ actor: 'test' });
+  ok(r.errors === 1 && r.blocked === 1, '二重は失敗+要対応として数える');
+  const row = destRow(dB);
+  ok(row.notion_page_id === 'pgA', '1枚目は記録する');
+  ok(String(row.notion_error).includes('2 枚'), 'エラーに枚数が出る');
+  ok(String(row.notion_next_retry_at).startsWith('9999-'), '人が整理するまで自動では触らない');
+  ok(notionStatusForAdmin().blocked.some(b => b.id === dB), '管理画面のエラー一覧に出る');
+}
+
+console.log('\n[16] [R2 High2] 他プロセスが lease を持っていたら実行しない');
+{
+  db.prepare(`INSERT INTO f_inbound_check_notion_lease (id, holder, expires_at) VALUES (1, 'other-process', ?)
+    ON CONFLICT(id) DO UPDATE SET holder = excluded.holder, expires_at = excluded.expires_at`)
+    .run(new Date(Date.now() + 5 * 60 * 1000).toISOString());
+  const r = await runNotionSweep({ actor: 'test' });
+  ok(r.ok === false && r.error === 'already_running', '有効な他者 lease 中は already_running');
+  db.prepare('DELETE FROM f_inbound_check_notion_lease').run();
+}
+
+console.log('\n[17] 冪等: もう一度回しても何もしない');
 {
   const before = { created: mock.created.length, patched: mock.patchedPages.length };
   const r = await runNotionSweep({ actor: 'test' });

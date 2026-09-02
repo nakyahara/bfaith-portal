@@ -43,9 +43,9 @@ const backoff = (a) => 500 * 2 ** (a - 1) + Math.floor(Math.random() * 200); // 
  * 4xx (認証・スキーマ不整合など) は再試行しても直らないので即 throw する。
  * throw する Error には code='NOTION_API_ERROR' と status (あれば) が付く。
  */
-export async function notionRequest(path, method, body) {
+export async function notionRequest(path, method, body, { maxAttempts = 3 } = {}) {
   const { token } = getConfig();
-  const MAX = 3;
+  const MAX = Math.max(1, maxAttempts);
   let lastErr;
   for (let attempt = 1; attempt <= MAX; attempt++) {
     let res;
@@ -124,14 +124,28 @@ export async function ensureCardSchema({ force = false } = {}) {
     for (const [k, v] of Object.entries(add)) { names.add(k); types.set(k, Object.keys(v)[0]); }
   }
 
-  // 型の検証 (存在するのに型が違う = 人が作り替えた等)。合わないなら1回で止める
-  const expect = [
-    [DEDUPE_PROP, 'rich_text'], ['destination_id', 'number'], ['有効期限', 'rich_text'], ['ステータス', 'select'],
-  ];
-  const bad = expect.filter(([k, t]) => names.has(k) && types.get(k) !== undefined && types.get(k) !== t);
-  if (bad.length > 0) {
-    const e = new Error('Notion DB のプロパティ型が想定と違います: '
-      + bad.map(([k, t]) => `「${k}」は ${t} 型が必要 (現在 ${types.get(k)})`).join(' / '));
+  // 型の検証 (存在するのに型が違う = 人が作り替えた等)。1項目でも合わなければ、行ごとに
+  // 400 を書き散らす前にスキーマ全体の問題として1回で止める (Codex R1 #9 / R2 #3)。
+  // ⭐この一覧 = この経路が**送る全プロパティ**。送る項目を増やしたらここにも足すこと
+  const EXPECTED_TYPES = {
+    '名前': 'title', 'ステータス': 'select', '商品コード': 'rich_text', '数量': 'number',
+    '入庫日': 'date', '入荷管理番号': 'rich_text', 'バーコード': 'rich_text', '取引先': 'select',
+    '仕入先': 'number', '取扱区分': 'select', '在庫化必要FLG': 'checkbox', '作業拠点': 'select',
+    '過去30日販売数': 'rich_text', '外部出し目安': 'rich_text',
+    '有効期限': 'rich_text', 'destination_id': 'number', [DEDUPE_PROP]: 'rich_text',
+  };
+  const problems = [];
+  for (const [k, t] of Object.entries(EXPECTED_TYPES)) {
+    if (names.has(k) && types.get(k) !== undefined && types.get(k) !== t) {
+      problems.push(`「${k}」は ${t} 型が必要 (現在 ${types.get(k)})`);
+    }
+  }
+  // 名前 (title) とステータスは無いと成立しない (名前が無いと全行が落ち、ステータスが無いと取消を反映できない)
+  for (const requiredName of ['名前', 'ステータス']) {
+    if (!names.has(requiredName)) problems.push(`「${requiredName}」プロパティが見つかりません (改名した場合は元に戻してください)`);
+  }
+  if (problems.length > 0) {
+    const e = new Error('Notion DB のプロパティが想定と違います: ' + problems.join(' / '));
     e.code = 'NOTION_SCHEMA_MISMATCH';
     throw e;
   }
@@ -145,23 +159,29 @@ export function _clearSchemaCache() { schemaCache = null; }
 
 // ─── ページ操作 ───
 
-/** 台帳キーでカードを検索 (回収用)。見つからなければ null */
-export async function findCardByDedupeKey(dedupeKey) {
+/** 台帳キーでカードを検索 (回収用)。複数返る = 二重カードの検出も兼ねる (最大3件) */
+export async function findCardsByDedupeKey(dedupeKey) {
   const { dbId } = getConfig();
   const r = await notionRequest(`/databases/${dbId}/query`, 'POST', {
     filter: { property: DEDUPE_PROP, rich_text: { equals: String(dedupeKey) } },
-    page_size: 1,
+    page_size: 3,
   });
-  return r.results?.[0] || null;
+  return r.results || [];
 }
 
-/** カードを1枚作成 → { id, url } */
+/**
+ * カードを1枚作成 → { id, url }。
+ * ⚠POST は **1回だけ** (HTTP 層の自動再試行なし — Codex R2 #1)。
+ *   タイムアウト/5xx は「Notion 側では作成成功したが応答が消えた」可能性があり、
+ *   盲目的に再POSTすると2枚目ができる。曖昧な失敗のやり直しは呼び元 (notion-sync の
+ *   createCardSafe) が台帳キーで再検索してから行う
+ */
 export async function createCard(properties) {
   const { dbId } = getConfig();
   const data = await notionRequest('/pages', 'POST', {
     parent: { database_id: dbId },
     properties,
-  });
+  }, { maxAttempts: 1 });
   return { id: data.id, url: data.url };
 }
 

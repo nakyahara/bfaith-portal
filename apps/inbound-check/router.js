@@ -611,7 +611,9 @@ router.post('/admin/fetch-drive', requireSession, checkOrigin, api(async (req, r
 router.post('/admin/notion-sync', requireSession, checkOrigin, api(async (req, res) => {
   const retryId = Number(req.body?.retry_id);
   if (Number.isInteger(retryId) && retryId > 0) resetNotionRow(retryId);
-  const r = await runNotionSweep({ actor: req.session.email });
+  // 「再送」(retry_id あり) はエラー行の再処理だけ (mode='retry')。正常な新規行まで
+  // 17:30 を待たずに送ってしまわない (Codex R2 #5)。「今すぐ送る」ボタンだけが full
+  const r = await runNotionSweep({ actor: req.session.email, mode: retryId ? 'retry' : 'full' });
   res.status(r.ok ? 200 : (r.error === 'already_running' ? 409 : 502)).json(r);
 }));
 

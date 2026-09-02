@@ -20,8 +20,10 @@
  *     作った/回収したカードを取り漏らさない (R1 #3 #4)
  *   - 「作成成功→記録前に停止→取消」で孤立したカードも、取消済み行の台帳キー検索で回収して
  *     「取消」へ収束させる (R1 #1)
- *   - 多重実行は プロセス内フラグ + SQLite lease の二段 (R1 #2。Render はディスク付き=単一インスタンス
- *     だが、デプロイ切替や手動実行の重なりに備える)
+ *   - 多重実行は プロセス内フラグ + SQLite lease の二段 (R1 #2)。lease は**行を処理するたびに延長**し、
+ *     失っていたら即中断する — 長時間 sweep 中に期限が切れて別実行が侵入するのを防ぐ (R2 #2)
+ *   - カード作成 POST は HTTP 層で自動再試行しない。曖昧な失敗 (タイムアウト/5xx/429) は
+ *     台帳キーで**再検索してから**作り直す — 「実は成功していた」の二重作成防止 (R2 #1)
  *   - 4xx (429/409 以外) は自動再試行しない — ブロックして管理画面の「再送」で解除 (R1 #7)。
  *     一時エラーは 30 分後から再試行対象 (30分巡回が拾う)
  *   - 取消反映時に元ステータスを記録し、未着手以外だった行は管理画面の要確認一覧に出す
@@ -29,7 +31,7 @@
 import crypto from 'crypto';
 import { getDB } from './db.js';
 import {
-  isNotionConfigured, ensureCardSchema, findCardByDedupeKey,
+  isNotionConfigured, ensureCardSchema, findCardsByDedupeKey,
   createCard, getCardState, setCardStatus, DEDUPE_PROP,
 } from './notion.js';
 import { recordPing } from '../jobs-monitor/store.js';
@@ -266,6 +268,37 @@ function releaseLease(db, holder) {
   catch (e) { console.warn('[inbound-check notion] lease 解放失敗 (期限で自然回収されます):', e.message); }
 }
 
+/** lease の延長。自分がもう holder でなければ false (=別実行に引き継がれた → 即中断する。R2 #2) */
+function touchLease(db, holder, now = Date.now()) {
+  return db.prepare('UPDATE f_inbound_check_notion_lease SET expires_at = ? WHERE id = 1 AND holder = ?')
+    .run(new Date(now + LEASE_MS).toISOString(), holder).changes === 1;
+}
+
+/**
+ * カードを1枚作る (最大3回)。POST 自体は1回ずつで、失敗のたびに台帳キーで再検索してから
+ * やり直す — 1回目が「実は成功していた」場合に2枚目を作らない (Codex R2 #1)。
+ * @returns {{ id, recoveredAfterError?: boolean, duplicates?: number }}
+ */
+async function createCardSafe(props, dedupeKey) {
+  const MAX = 3;
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX; attempt++) {
+    try {
+      return await createCard(props);
+    } catch (e) {
+      if (isPermanentStatus(e.status)) throw e;   // 4xx は作られていないと確定できる
+      lastErr = e;
+      await sleep(500 * attempt);
+      const found = await findCardsByDedupeKey(dedupeKey);
+      if (found.length > 0) {
+        return { id: found[0].id, recoveredAfterError: true, duplicates: found.length > 1 ? found.length : 0 };
+      }
+      // 見つからない = 本当に作られていない → もう一度 POST してよい
+    }
+  }
+  throw lastErr;
+}
+
 // ─── sweep 本体 ───
 
 /** page_id のあるカードを「取消」へ倒す (取消フェーズ・孤立回収の共通処理) */
@@ -306,6 +339,14 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
       return { ok: false, error: 'already_running', message: '別の実行が進行中です (数分後にやり直してください)' };
     }
     const summary = { sent: 0, recovered: 0, raced: 0, cancelled: 0, errors: 0, skipped: 0, blocked: 0 };
+    // 行を処理するたびに lease を延長する。失っていたら (期限切れで別実行が始まった) 即中断 — R2 #2
+    const guard = () => {
+      if (!touchLease(db, holder)) {
+        const e = new Error('lease を失いました (別の実行に引き継がれています)');
+        e.code = 'LEASE_LOST';
+        throw e;
+      }
+    };
     let schema;
     try {
       schema = await ensureCardSchema();
@@ -318,12 +359,18 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
 
     // ① 孤立カードの回収 (取消済み・page_id なし。Codex R1 #1) — 取消を最優先で片付ける
     for (const row of collectOrphanCancelled(db)) {
+      guard();
       try {
         if (!row.notion_dedupe_key) { markCancelled(db, row.id, '(カード未作成)'); continue; }
-        const existing = await findCardByDedupeKey(row.notion_dedupe_key);
-        if (!existing) { markCancelled(db, row.id, '(カード未作成)'); continue; }
-        attachPage(db, row.id, existing.id, null);
-        await convergeCancelledCard(db, row.id, existing.id);
+        const found = await findCardsByDedupeKey(row.notion_dedupe_key);
+        if (found.length === 0) { markCancelled(db, row.id, '(カード未作成)'); continue; }
+        attachPage(db, row.id, found[0].id, null);
+        await convergeCancelledCard(db, row.id, found[0].id);
+        // 万一 複数枚あれば全部「取消」に倒す (取消済みの指示を1枚も有効に見せない)
+        for (const extra of found.slice(1)) {
+          try { await setCardStatus(extra.id, CANCELLED_STATUS); }
+          catch (e2) { console.warn(`[inbound-check notion] 余分カードの取消失敗 ${extra.id}: ${e2.message}`); }
+        }
         summary.cancelled++;
       } catch (e) {
         summary.errors++;
@@ -335,6 +382,7 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
     // ② 送信後に取り消された行 → カードを「取消」へ (新規作成より先に。Codex R1 #6)
     const cancelPhase = async () => {
       for (const row of collectCancelPending(db)) {
+        guard();
         try {
           await convergeCancelledCard(db, row.id, row.notion_page_id);
           summary.cancelled++;
@@ -351,48 +399,62 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
     const unsent = collectUnsent(db, { retryOnly: mode !== 'full' });
     const ctx = unsent.length > 0 ? buildEnrichContext(db) : null;
     for (const row of unsent) {
+      guard();
       // API を待っている間に取り消されているかもしれない — 直前にもう一度見る
       const fresh = db.prepare('SELECT cancelled_at, notion_page_id FROM f_inbound_check_destinations WHERE id = ?').get(row.id);
       if (!fresh || fresh.cancelled_at || fresh.notion_page_id) { summary.skipped++; continue; }
       try {
         // ⭐キーを DB に保存してから Notion を触る (作成成功→記録前に落ちても次回回収できる)
         const dedupeKey = ensureDedupeKey(db, row);
-        const existing = await findCardByDedupeKey(dedupeKey);
+        const found = await findCardsByDedupeKey(dedupeKey);
         let pageId;
         let payload;
-        if (existing) {
-          pageId = existing.id;
+        let wasRecovered = false;
+        let duplicates = found.length > 1 ? found.length : 0;
+        if (found.length > 0) {
+          pageId = found[0].id;
           payload = JSON.stringify({ recovered: true });
+          wasRecovered = true;
         } else {
           const key = String(row.code_key || row.product_id || '').trim().toLowerCase();
           const product = ctx.products.get(key) || null;
           const supplierName = product ? (ctx.suppliers.get(normSupplierCode(product.supplierCode)) || null) : null;
           const ext = calcExternal(ctx.sales30.get(key) ?? null, ctx.freeStock.get(key) ?? null);
           const props = buildCardProperties(row, { barcode: barcodeFor(db, row), product, supplierName, ext, dedupeKey }, schema.names);
-          const created = await createCard(props);
+          const created = await createCardSafe(props, dedupeKey);
           pageId = created.id;
-          payload = JSON.stringify(props);
+          wasRecovered = !!created.recoveredAfterError;
+          duplicates = created.duplicates || duplicates;
+          payload = wasRecovered ? JSON.stringify({ recovered: true }) : JSON.stringify(props);
           await sleep(CREATE_INTERVAL_MS);
         }
         const ch = markSent(db, row.id, pageId, payload);
         if (ch === 1) {
-          if (existing) summary.recovered++; else summary.sent++;
+          if (wasRecovered) summary.recovered++; else summary.sent++;
         } else {
           // 記録できなかった = 待っている間に状態が変わった (Codex R1 #3 #4)。取り漏らさず収束させる
           const cur = db.prepare('SELECT cancelled_at, notion_page_id FROM f_inbound_check_destinations WHERE id = ?').get(row.id);
           if (cur && cur.notion_page_id === pageId) {
-            if (existing) summary.recovered++; else summary.sent++;   // 別実行が同じカードを記録済み
+            if (wasRecovered) summary.recovered++; else summary.sent++;   // 別実行が同じカードを記録済み
           } else if (cur && !cur.notion_page_id) {
-            attachPage(db, row.id, pageId, payload);   // 取消済みでも紐付ける → ②の次回実行が「取消」へ倒す
+            attachPage(db, row.id, pageId, payload);   // 取消済みでも紐付ける → ②の再実行が「取消」へ倒す
             summary.raced++;
           } else {
-            // 台帳には別のカードが記録されている — 今作った方が孤立した疑い。人に見せる
+            // 台帳には別のカードが記録されている — 今回のカードが孤立した疑い。人に見せる
             summary.errors++;
             summary.blocked++;
             markSendError(db, row.id,
               `二重カードの疑い: 台帳=${cur?.notion_page_id || '?'} / 今回=${pageId}。Notion 側を確認して片方を整理してください`, true);
             console.error(`[inbound-check notion] 二重カード疑い dest#${row.id}: db=${cur?.notion_page_id} new=${pageId}`);
           }
+        }
+        if (duplicates > 1) {
+          // 同じ台帳キーのカードが複数 — 自動では消さず、人に見える形で止める (Codex R2 #1)
+          summary.errors++;
+          summary.blocked++;
+          markSendError(db, row.id,
+            `台帳キー ${dedupeKey} のカードが ${duplicates} 枚あります。Notion 側で余分な方を整理してから「再送」してください`, true);
+          console.error(`[inbound-check notion] 二重カード検出 dest#${row.id}: ${duplicates}枚`);
         }
       } catch (e) {
         summary.errors++;
