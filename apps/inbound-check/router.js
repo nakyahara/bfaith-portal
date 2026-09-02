@@ -573,7 +573,11 @@ router.post('/api/notion-sync', checkOrigin, api(async (req, res) => {
   }
   const now = Date.now();
   if (now - notionSyncLastAt < 30_000) {
-    return res.status(429).json({ ok: false, error: 'rate_limited', message: '少し待ってからもう一度押してください (30秒に1回まで)' });
+    // ⚠「失敗」ではない。直前の実行は走っている (押し直しても二重カードにはならないが、
+    //   外部APIの連打を避けるためのクールダウン)。失敗と誤読されない文言にする
+    const wait = Math.ceil((30_000 - (now - notionSyncLastAt)) / 1000);
+    return res.status(429).json({ ok: false, error: 'rate_limited',
+      message: `さっき送ったばかりです (直前の送信は実行済み)。${wait}秒あけてもう一度押せます` });
   }
   notionSyncLastAt = now;
   const r = await runNotionSweep({ actor, mode: 'full' });
