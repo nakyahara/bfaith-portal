@@ -17,6 +17,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
+  getDB,
   createDevice, verifyDevice, revokeDevice, listDevices,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
@@ -26,7 +27,8 @@ import {
   getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
-import { buildList } from './service.js';
+import { buildList, classifyMasterEdit, clearEnrichCache } from './service.js';
+import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import {
   addMedia, softDeleteMedia, countActivePhotos, resetMedia, listMediaForAdmin, schedule as scheduleMedia,
   listPageSyncForAdmin, resetPageSync,
@@ -288,6 +290,71 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
   }
   if (!r.ok) return res.status(STATUS_HTTP[r.error] || 400).json(r);
   res.json(r);
+}));
+
+// ─── 作業仕様のその場登録・修正 (f_iroha_work_master。中原さんFB③⑥) ───
+
+const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url'];
+
+/**
+ * 権限 (要件 §7 と FB③の折衷):
+ *   空欄を埋める = 作業者なら誰でも (新商品で現場が止まらない。履歴に残る)
+ *   入っている値の変更・削除 = 職員のみ (端末はPIN・ポータルセッションはそのまま)
+ * 版管理 (§1.7 ④): expect_version の楽観ロック。行が無ければ作ってから書く (mirror に居る商品のみ)
+ */
+router.post('/api/master', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const code = String(req.body?.code || '').trim();
+  if (!code) return res.status(400).json({ ok: false, error: 'bad_request', message: 'code (商品コード) が必要です' });
+  const fieldsIn = req.body?.fields;
+  if (!fieldsIn || typeof fieldsIn !== 'object' || Array.isArray(fieldsIn)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '変更内容がありません' });
+  }
+  const fields = {};
+  for (const f of MASTER_FIELDS) if (f in fieldsIn) fields[f] = fieldsIn[f];
+  if (Object.keys(fields).length === 0) return res.status(400).json({ ok: false, error: 'bad_request', message: '変更できる項目がありません' });
+
+  const k = codeKeyOf(code);
+  const db = getDB();
+  let row = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
+
+  const { fills, overwrites } = classifyMasterEdit(row, fields);
+  if (fills.length === 0 && overwrites.length === 0) {
+    return res.json({ ok: true, unchanged: true, row });
+  }
+  if (overwrites.length > 0 && !hasSessionAccess(req)) {
+    if (w.worker.worker_type !== 'staff') {
+      return res.status(403).json({ ok: false, error: 'staff_required',
+        message: '入っている値の変更は職員のみです (空欄への登録は誰でもできます)' });
+    }
+    const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
+    if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
+  }
+
+  if (!row) {
+    const add = addWorkMasterRow(code, `${w.worker.display_name} (いろはアプリ)`);
+    if (!add.ok) {
+      const msg = add.error === 'not_in_master' ? 'この商品は商品マスタに無いため登録できません (商品コードを確認してください)' : add.message;
+      return res.status(400).json({ ok: false, error: add.error, message: msg });
+    }
+    row = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
+  }
+  const expect = req.body?.expect_version == null ? row.version : Number(req.body.expect_version);
+  const r = updateWorkMasterRow(k, fields, `${w.worker.display_name} (いろはアプリ)`, expect);
+  safeLog({
+    action: 'master_edit', pageId: String(req.body?.page_id || '') || null,
+    workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+    from: code, to: [...fills.map(f => `+${f}`), ...overwrites.map(f => `!${f}`)].join(','),
+    ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}`,
+  });
+  if (!r.ok) {
+    const st = r.error === 'conflict' ? 409 : r.error === 'not_found' ? 404 : 400;
+    const msg = r.error === 'conflict' ? '他の人が先に更新しました。最新の内容を読み込みます' : r.message;
+    return res.status(st).json({ ok: false, error: r.error, message: msg, currentVersion: r.currentVersion });
+  }
+  clearEnrichCache();   // 次の /api/state から新しい作業仕様で出す
+  res.json({ ok: true, row: r.row });
 }));
 
 // ─── 完成写真・動画 ───

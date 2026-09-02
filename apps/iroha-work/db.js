@@ -191,6 +191,15 @@ export function createTables(db = getMirrorDB()) {
     );
   `);
 
+  // ── 既存テーブルへの列追加 (冪等。CREATE IF NOT EXISTS は列を増やさない) ──
+  const addCol = (table, col, ddl) => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`);
+  };
+  // 作業開始時点の作業仕様スナップショット (§1.7 ④: 後で仕様が変わっても
+  // 「当時何を見て作業したか」を残す。JSON)
+  addCol('f_iroha_work_sessions', 'master_snapshot', 'TEXT');
+
   // 「1作業者につき活動中セッション1件」は**DBの制約**で保証する (Codex PR2 #1:
   // アプリ側のトランザクション検査だけだと、将来の別経路・移行コードから重複を作れる)。
   // 部分ユニークを張る前に、万一の既存重複 (最新以外) を admin 終了で閉じておく
@@ -401,10 +410,18 @@ export function startSession({ pageId, productCode = null, title = null, worker,
       return { ok: false, error: 'busy', open,
         message: `「${open.title_snapshot || '別のカード'}」の作業がまだ終わっていません。先にそちらを終了・中断してください` };
     }
+    // 開始時点の作業仕様を残す (§1.7 ④)。マスタ未登録なら null (それも事実)
+    let snapshot = null;
+    const hasWm = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get();
+    if (productCode && hasWm) {
+      const wm = db.prepare('SELECT material_code, storage_container, units_per_container, process_count, note, video_url, version FROM f_iroha_work_master WHERE code_key = ?')
+        .get(String(productCode).trim().toLowerCase());
+      if (wm) snapshot = JSON.stringify(wm);
+    }
     const info = db.prepare(`INSERT INTO f_iroha_work_sessions
-      (page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .run(pageId, productCode, title, worker.id, worker.display_name, deviceLabel, now);
+      (page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, master_snapshot)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(pageId, productCode, title, worker.id, worker.display_name, deviceLabel, now, snapshot);
     return { ok: true, sessionId: Number(info.lastInsertRowid), startedAt: now };
   }).immediate();
 }

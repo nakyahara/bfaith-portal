@@ -636,5 +636,50 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   _setDriveUpload(null);
 }
 
+console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動画リンク・スナップショット)');
+{
+  const { classifyMasterEdit } = await import('../apps/iroha-work/service.js');
+  const { updateWorkMasterRow, addWorkMasterRow } = await import('../apps/inbound-check/work-master.js');
+  const db3 = getDB();
+
+  // classify: 空欄埋め vs 上書き
+  const row = db3.prepare("SELECT * FROM f_iroha_work_master WHERE code_key = 'prod-a'").get();
+  const c1 = classifyMasterEdit(row, { video_url: 'https://youtu.be/x' });
+  ok(c1.fills.includes('video_url') && c1.overwrites.length === 0, '空欄への登録は fills (誰でも可)');
+  const c2 = classifyMasterEdit(row, { material_code: 'D-9' });
+  ok(c2.overwrites.includes('material_code'), '入っている値の変更は overwrites (職員のみ)');
+  const c3 = classifyMasterEdit(row, { material_code: '' });
+  ok(c3.overwrites.includes('material_code'), '値の削除も overwrites');
+  const c4 = classifyMasterEdit(row, { material_code: row.material_code, note: row.note });
+  ok(c4.fills.length === 0 && c4.overwrites.length === 0, '同じ値は変更なし');
+  const c5 = classifyMasterEdit(null, { material_code: 'D-1' });
+  ok(c5.fills.includes('material_code'), '行が無い商品への登録も fills');
+
+  // 動画リンクの検証と版管理
+  const bad = updateWorkMasterRow('prod-a', { video_url: 'javascript:alert(1)' }, 'test', row.version);
+  ok(bad.ok === false && bad.error === 'bad_url', 'http(s) 以外の動画リンクは拒否');
+  const up = updateWorkMasterRow('prod-a', { video_url: 'https://youtu.be/abc' }, 'たにがわ (いろはアプリ)', row.version);
+  ok(up.ok === true && up.row.video_url === 'https://youtu.be/abc' && up.row.version === row.version + 1,
+    '動画リンク登録 + version が進む');
+  ok(updateWorkMasterRow('prod-a', { note: 'x' }, 'test', row.version).error === 'conflict',
+    '古い version では更新できない (2台同時編集の検出)');
+
+  // buildList へ video_url と version が出る
+  clearEnrichCache();
+  const { cards } = buildList();
+  const a = cards.find(c => c.product_code === 'PROD-A');
+  ok(a.master.video_url === 'https://youtu.be/abc' && a.master.version === row.version + 1,
+    '画面データに video_url と version (楽観ロック用) が載る');
+
+  // ④開始時スナップショット
+  const wS = addIrohaWorker({ displayName: 'すなぷ', workerType: 'member', actor: 'test' });
+  const sS = startSession({ pageId: 'snap-p1', productCode: 'PROD-A', title: '商品A', worker: getIrohaWorker(wS.id) });
+  const sessRow = db3.prepare('SELECT master_snapshot FROM f_iroha_work_sessions WHERE id = ?').get(sS.sessionId);
+  const snap = JSON.parse(sessRow.master_snapshot);
+  ok(snap.material_code === 'D-8' && snap.video_url === 'https://youtu.be/abc',
+    '開始時点の作業仕様がセッションに残る (§1.7 ④)');
+  stopSession({ pageId: 'snap-p1', workerId: wS.id, sessionId: sS.sessionId, reason: 'done' });
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exit(fail > 0 ? 1 : 0);
