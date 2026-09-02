@@ -647,6 +647,30 @@ export function initProductHubDB() {
       UNIQUE (draft_id, value)
     );
 
+    -- SKU別の商品仕様 (2026-09-03 中原さん: RMS と同じく「SKU 列 × 項目行」の表で入力する。
+    -- 代表カラーやメーカー型番のように SKU ごとに違う属性はページ共通の 1 行では表せない)。
+    -- ページ共通 (draft_rakuten.attributes_json / article_number) を既定値に、この表が SKU ごとに上書きする。
+    -- value '' = 「明示的に空」(既定値を打ち消す)。name 'メーカー型番' も普通の行として持つ。
+    -- 画面と出品 payload は同じ関数 (skuAttributeGrid) で読む = 見えている値がそのまま送られる
+    CREATE TABLE IF NOT EXISTS draft_sku_attributes (
+      draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      sku_code   TEXT NOT NULL,          -- LOWER(TRIM()) した SKU 商品コード (draft_sku_jans と同じ規則)
+      name       TEXT NOT NULL,          -- 属性名 (RMS の属性辞書の表記)
+      value      TEXT NOT NULL,          -- '' = 明示的に空
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, sku_code, name)
+    );
+
+    -- SKU別の「カタログIDなしの理由」(2026-09-03)。JAN の無い SKU に使う。
+    -- 行が無ければページ共通 (draft_rakuten.catalog_id_exemption_reason、未設定は 5) にフォールバック
+    CREATE TABLE IF NOT EXISTS draft_sku_catalog_exemptions (
+      draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      sku_code   TEXT NOT NULL,
+      reason     INTEGER NOT NULL CHECK (reason BETWEEN 1 AND 6),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, sku_code)
+    );
+
     CREATE TABLE IF NOT EXISTS draft_shop_categories (
       draft_id         INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
       shop_category_id INTEGER NOT NULL REFERENCES ph_shop_categories(id),

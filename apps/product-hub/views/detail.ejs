@@ -16,6 +16,12 @@
                height: 18px; border-radius: 999px; background: #dc2626; color: #fff; font-size: 11px;
                font-weight: 700; margin-left: 6px; padding: 0 5px; vertical-align: 1px; }
   .tab-btn.active .tab-badge { background: #fff; color: #dc2626; }
+  /* カタログID・商品仕様の SKU 表 (2026-09-03): 列 = SKU、行 = 項目。項目列は横スクロールしても固定 */
+  .sku-grid th.sku-grid-head { position: sticky; left: 0; z-index: 1; background: #f8fafc; min-width: 190px;
+                               text-align: left; font-weight: 600; vertical-align: top; }
+  .sku-grid thead th { background: #f1f5f9; vertical-align: top; text-align: left; white-space: nowrap; }
+  .sku-grid td { vertical-align: top; min-width: 190px; }
+  .sku-grid td input[type="text"], .sku-grid td select { width: 100%; box-sizing: border-box; }
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
   /* 工程パネル (誰のボールか)。.wf-dot は _header.ejs で共通定義 */
@@ -657,18 +663,13 @@
           </div>
         </div>
         <div style="flex:1">
-          <%# JAN (楽天のカタログID) の入力はここだけ (2026-09-02 中原さん: カテゴリ・属性タブと 2 箇所に
-              入れさせない)。バリエーションは SKU ごとに JAN が違うので、ページ代表の欄は出さず
-              右の SKU 表の「カタログID (JAN)」列が入口になる %>
-          <% if (variation.kind === 'variation' && variation.members.length > 1) { %>
-            <label>JANコード <span class="muted">(楽天の「カタログID」)</span><span class="ftag ftag-m">手入力</span></label>
-            <div class="muted" style="font-size:12px; padding:6px 0;">
-              バリエーションありです — SKUごとに右の「このページに載るSKU」表の「カタログID (JAN)」列で入力してください
-            </div>
-          <% } else { %>
-            <label>JANコード <span class="muted">(楽天の「カタログID」として送ります。入力はここだけ)</span><span class="ftag ftag-m">手入力</span></label>
-            <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
-          <% } %>
+          <%# JAN (楽天のカタログID) の入力はカテゴリ・属性タブの「カタログID・商品仕様」表 (2026-09-03 中原さん:
+              RMS と同じ SKU 列 × 項目行の表で、SKU ごとに IDあり/IDなし を選べるように)。
+              ここは場所の案内だけ (初めて見た人が探せるように) %>
+          <label>JANコード <span class="muted">(楽天の「カタログID」)</span></label>
+          <div class="muted" style="font-size:12px; padding:6px 0;">
+            <a href="#tab-category" class="jump-tab" data-tab="tab-category">カテゴリ・属性タブの「カタログID・商品仕様」の表</a>で<%= (variation.kind === 'variation' && variation.members.length > 1) ? 'SKUごとに' : '' %>入力します
+          </div>
         </div>
         <div style="flex:1">
           <!-- 税率は基本情報 (2026-08-06 中原さん指示: Yahoo!欄から移動)。楽天・Yahoo!両方の登録で使う -->
@@ -816,10 +817,9 @@
               💰 原価がSKUごとに異なります。<strong>売価もSKUごとに設定</strong>してください (空欄 = ページ代表の売価 <%= draft.price != null ? draft.price.toLocaleString() + '円' : '未設定' %> を使う。入力すると即保存)。
             </p>
           <% } %>
-          <%# SKU別JAN (2026-08-28 中原さん要望) %>
           <p class="muted" style="margin:8px 0 0; font-size:12px;">
-            🏷 <strong>カタログID (JAN) と選択肢はSKUごと</strong>に入力してください (入力すると即保存。空欄にすると解除)。
-            JANが空のSKUは、カテゴリ・属性タブの「カタログIDなしの理由」で送られます。
+            🏷 <strong>選択肢はSKUごと</strong>に入力してください (入力すると即保存。空欄にすると解除)。
+            カタログID (JAN) と商品仕様は <a href="#tab-category" class="jump-tab" data-tab="tab-category">カテゴリ・属性タブの表</a> で SKU ごとに入力します。
           </p>
           <table class="list" style="margin-top:8px;">
             <thead><tr>
@@ -829,7 +829,6 @@
               <%# 選択肢 (2026-09-02 カラバリ出品)。楽天は variants[sku].selectorValues が必須で、
                   NE 側に軸の情報が無いのでここで手入力する。列名は RMS の「バリエーション」の用語に合わせる %>
               <th style="width:130px">選択肢<br><span class="muted" style="font-weight:400; font-size:11px;">項目: <%= rakuten?.variant_selector_name || '未設定 (カテゴリ・属性タブ)' %></span></th>
-              <th style="width:140px">カタログID (JAN)</th>
               <% if (showSkuPrices) { %><th style="width:100px">売価<span class="muted" style="font-weight:400">(税込)</span></th><th style="width:110px">利益</th><% } %>
               <th style="width:70px"></th>
             </tr></thead>
@@ -851,18 +850,6 @@
                            style="width:120px; font-size:12px; padding:4px 6px;"
                            data-code="<%= m.商品コード %>"
                            value="<%= skuSelectorValues[mKey] || '' %>" placeholder="例: ブラウン">
-                  </td>
-                  <td>
-                    <%# SKU が実効 1 件 (除外で減った) のときはサーバーが単品扱い = 上の JANコード欄を送る。
-                        ここに入力欄を出すと画面の確認表示・バッジと送る値が食い違うので出さない (Codex R1 medium) %>
-                    <% if (variation.members.length > 1) { %>
-                      <input type="text" class="sku-jan-input" inputmode="numeric" maxlength="13"
-                             style="width:130px; font-size:12px; padding:4px 6px;"
-                             data-code="<%= m.商品コード %>"
-                             value="<%= skuJans[mKey] || '' %>" placeholder="8/12/13桁">
-                    <% } else { %>
-                      <span class="muted" style="font-size:11px;">単品扱い — 上のJANコード欄の値を送ります</span>
-                    <% } %>
                   </td>
                   <% if (showSkuPrices) { %>
                     <td>
@@ -1562,13 +1549,10 @@
         </div>
     </div>
 
-    <%# カタログID — RMS の「カタログID」に対応する**確認表示** (2026-09-02 中原さん: 基本情報タブと
-        カテゴリ・属性タブの 2 箇所に JAN を入れさせない)。入力は基本情報タブだけ:
-          単品 = JANコード欄 (product_drafts.jan_code) / バリエーション = SKU表 (draft_sku_jans)。
-        ここは「何が送られるか」の表示と、JAN が無いときの理由 (RMS の「カタログIDなしの理由」) の選択だけ。
-        表示は initCatalogStatus (下の script) が基本情報タブの入力欄から組み立てる。
-        🚨 2026-09-02 まで、この欄 (API の articleNumber) にメーカー型番を送っていて IE0228 で登録が落ちていた %>
+    <%# バリエーション — RMS の「バリエーション」(項目と選択肢) に対応 (2026-09-02 カラバリ出品)。
+        項目名 = variantSelectors[].displayName。選択肢は SKU ごとに基本情報タブの SKU 表で入力する %>
     <%
+      const isVariationPage = variation && variation.kind === 'variation' && variation.memberCount > 1;
       const exReason = rakuten && rakuten.catalog_id_exemption_reason != null
         ? Number(rakuten.catalog_id_exemption_reason) : null;
       // RMS 画面と同じ並び。6 (頒布会商品) は RMS の選択肢に出ないので載せない
@@ -1579,24 +1563,8 @@
         [4, '4: 項目選択肢在庫商品'],
         [5, '5: 該当製品コードなし'],
       ];
-      const isVariationPage = variation && variation.kind === 'variation' && variation.memberCount > 1;
     %>
-    <div class="field">
-      <label class="req">カタログID <span class="muted">(RMSの「カタログID」。入力は基本情報タブ — 単品はJANコード欄、バリエーションはSKU表。ここは送る内容の確認)</span><span class="ftag ftag-auto">自動</span></label>
-      <div id="rk-catalog-status" style="font-size:13px; margin:2px 0 4px;"></div>
-      <div id="rk-catalog-without">
-        <select id="rk-catalog-exemption" style="max-width:420px;">
-          <option value="" <%= exReason == null ? 'selected' : '' %>>カタログIDなしの理由 (JANが無い<%= isVariationPage ? 'SKU' : 'とき' %>に使います。未選択は 5: 該当製品コードなし)</option>
-          <% for (const [v, label] of exOptions) { %>
-            <option value="<%= v %>" <%= exReason === v ? 'selected' : '' %>><%= label %></option>
-          <% } %>
-        </select>
-      </div>
-    </div>
-
-    <%# バリエーション — RMS の「バリエーション」(項目と選択肢) に対応 (2026-09-02 カラバリ出品)。
-        項目名 = variantSelectors[].displayName。選択肢は SKU ごとに基本情報タブの SKU 表で入力する %>
-    <% if (variation && variation.kind === 'variation' && variation.memberCount > 1) { %>
+    <% if (isVariationPage) { %>
       <div class="field">
         <label>バリエーション <span class="muted">(RMSの「バリエーション」。項目名をここに、選択肢は基本情報タブのSKU表で)</span><span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="rk-variant-selector" maxlength="50" style="max-width:280px;"
@@ -1607,58 +1575,148 @@
       </div>
     <% } %>
 
-    <div class="field">
-      <label>表示先カテゴリ <span class="muted">(RMSの「表示先カテゴリ」と同じ5枠。店舗内カテゴリのこと。枠1がメインページ。RMSへは登録後に自動反映)</span><span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
-      <% if (shopCategories.length === 0) { %>
-        <p class="muted" style="margin:4px 0;">
-          カテゴリ一覧が未取り込みです。<a href="/apps/product-hub/list">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
-        </p>
-      <% } else { %>
-        <!-- AI 初期候補 (2026-08-02): 未選択ならAIが1位を自動セット、人は候補ボタン/ツリーで修正 -->
-        <div id="rk-cats-suggest" style="font-size:12px; margin-bottom:4px;"></div>
-        <%# ツリーは 5 枠の**上**に置き、既定で開いておく (2026-08-31 中原さん: 必須項目なので
-            畳んでいると記載を見逃す)。開いた状態でも枠 1〜5 がすぐ下にあるので、
-            選んだ結果がその場で見える %>
-        <details id="rk-cats-acc" open style="border:1px solid #e2e8f0; border-radius:8px; background:#fff; margin-bottom:6px;">
-          <summary style="cursor:pointer; padding:7px 10px; font-size:13px; color:#475569;">🗂 カテゴリ選択 (ツリー)</summary>
-          <div style="padding:0 10px 8px;">
-            <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin:6px 0;">
-            <div id="rk-cats" style="max-height:280px; overflow:auto;"></div>
-          </div>
-        </details>
-        <!-- RMS「表示先カテゴリ 1〜5」と同じ5枠 (2026-08-02 中原さん要望)。チェックした順に枠へ入る -->
-        <div id="rk-cat-slots" style="display:grid; gap:4px; margin-bottom:6px;"></div>
-        <script type="application/json" id="rk-cats-data"><%- JSON.stringify(shopCategories.map((c) => ({ id: c.id, path: c.path, selected: !!c.selected, slot: c.slot ?? null, inactive: !c.is_active }))).replace(/</g, '\\u003c') %></script>
+    <%# ─── カタログID・商品仕様 (2026-09-03 中原さん: RMS の商品編集画面と同じ「SKU 列 × 項目行」の表。
+        SKU ごとに IDあり/IDなし を選べ、代表カラーやメーカー型番など SKU で違う値を入れられる。
+        単品は列が 1 つ (この商品) で同じ見た目にして、初めて見た人でも迷わないようにする。
+        バリエーション: セルは入力欄を離れたら即保存 (/sku-attributes, /sku-jans, /sku-catalog-exemptions)。
+        単品: 従来どおり「カテゴリ・属性を保存」で保存 (#rk-attrs / #f-jan / #rk-article の配線は不変)。
+        🚨 2026-09-02 まで、カタログID (API の articleNumber) にメーカー型番を送っていて IE0228 で登録が落ちていた ─── %>
+    <%
+      // メーカー型番 (旧データが属性側に残っている場合の引き上げ・競合表示。単品用)
+      let rkAttrsRaw = [];
+      try { rkAttrsRaw = JSON.parse(rakuten?.attributes_json || '[]'); } catch (e) { rkAttrsRaw = []; }
+      // 旧形式 {name, value} も拾う (Codex R3 high): 取りこぼすとサーバは 400 なのに画面に値が出ない
+      const legacyModels = [...new Set(rkAttrsRaw
+        .filter((a) => a && a.name === modelAttrName)
+        .flatMap((a) => (Array.isArray(a.values) ? a.values : (a.value !== undefined ? [a.value] : [])))
+        .map((v) => String(v == null ? '' : v).trim())
+        .filter(Boolean))];
+      const legacyModel = legacyModels.length === 1 ? legacyModels[0] : '';
+      const modelConflict = legacyModels.length > 1
+        || (legacyModels.length === 1 && rakuten?.article_number && rakuten.article_number !== legacyModels[0]);
+      // 欄が空で属性側に 1 つだけ = 引き上げ表示。人がその値を見ているので解消フラグを立てておく
+      // (Codex R4 high: 立てないと、書き換えて保存 → 400 なのに解消ボタンが出ていない、で詰む)
+      const modelAutoResolve = !modelConflict && legacyModels.length === 1 && !rakuten?.article_number;
+      const modelDict = genreDict ? genreDict.attributes.find((d) => d.name === modelAttrName) : null;
+      const dictOf = (name) => (genreDict && name ? genreDict.attributes.find((d) => d.name === name) : null);
+      const hintOf = (da) => (da
+        ? [da.mandatory ? '必須' : null, da.inputMethod === 'SELECTIVE' ? '選択式' : null,
+           da.unit ? '単位:' + da.unit : null, da.maxLength ? '〜' + da.maxLength + '文字' : null]
+          .filter(Boolean).join(' / ')
+        : '');
+      // バリエーションの表: 行 = 辞書の必須属性 (カタログIDは専用行) + 値が入っている項目 (skuAttributeGrid)
+      const gridData = locals.skuAttrGrid || { names: [], bySku: {} };
+      const gridExemptions = locals.skuExemptions || {};
+      const gridNames = [];
+      if (genreDict) for (const d of genreDict.attributes) if (d.mandatory && d.name !== 'カタログID' && !gridNames.includes(d.name)) gridNames.push(d.name);
+      for (const n of gridData.names) if (!gridNames.includes(n)) gridNames.push(n);
+      const skuKeyOf = (m) => String(m.商品コード || '').trim().toLowerCase();
+    %>
+    <label>カタログID・商品仕様 <span class="muted">(RMSの「製品情報」と同じ表。列 = <%= isVariationPage ? 'SKU' : 'この商品' %>、行 = 項目。「ジャンル情報を取得」で必須の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
+    <% if (isVariationPage) { %>
+      <p class="muted" style="margin:0 0 6px; font-size:12px;">
+        入力欄を離れると<strong>即保存</strong>。「一括入力」で全SKUに同じ値を入れられます。JANが無いSKUは「IDなし」を選んで理由を選択。
+      </p>
+      <% if ((gridData.legacyCatalogIds || []).length > 0) { %>
+        <%# 旧データ (2026-09-02 までの単品の属性行) の「カタログID」。SKU 表では JAN の専用行が入口なので展開せず、
+            人が確認して削除する (Codex R3 high: 展開すると全 SKU で出品が止まり、画面から消せなかった) %>
+        <div class="banner-warn" id="rk-legacy-catalog" style="font-size:12px; margin-bottom:6px;">
+          ⚠️ 旧データの商品仕様に「カタログID」(<%= gridData.legacyCatalogIds.join(' / ') %>) が残っています。
+          JAN は下の表の「カタログID」の行に SKU ごとに入れる方式になりました。各 SKU の JAN を確認してから削除してください (削除するまで出品は止まります)。
+          <div style="margin-top:6px;"><button type="button" class="btn btn-sm" id="rk-legacy-catalog-drop">旧データの「カタログID」属性を削除する</button></div>
+        </div>
       <% } %>
-    </div>
-
-    <label>商品仕様 <span class="muted">(RMSの「商品仕様」。「ジャンル情報を取得」で必須の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
-    <table class="list" id="rk-attrs" style="margin-bottom:8px;">
-      <thead><tr><th style="width:40%">項目 (例: ブランド名)</th><th>値</th><th style="width:50px"></th></tr></thead>
+      <div style="overflow-x:auto; border:1px solid #e2e8f0; border-radius:8px; margin-bottom:8px; background:#fff;">
+        <table class="list sku-grid" id="rk-sku-grid" style="margin:0; width:max-content; min-width:100%;">
+          <thead><tr>
+            <th class="sku-grid-head">項目</th>
+            <% for (const m of variation.members) { const k = skuKeyOf(m); %>
+              <th><code style="font-size:12px"><%= m.商品コード %></code><br>
+                <span class="muted" style="font-weight:400; font-size:11px;"><%= rakuten?.variant_selector_name || '種類' %>: <%= skuSelectorValues[k] || '(未設定 — 基本情報タブのSKU表で)' %></span></th>
+            <% } %>
+          </tr></thead>
+          <tbody>
+            <tr class="sku-grid-catalog">
+              <th class="sku-grid-head">
+                <div>カタログID <span style="color:#dc2626">*必須</span></div>
+                <div class="muted" style="font-size:11px; font-weight:400;">JAN (8/12/13桁)。無ければ「IDなし」+ 理由</div>
+              </th>
+              <% for (const [mi, m] of variation.members.entries()) { const k = skuKeyOf(m); const jan = skuJans[k] || ''; const ex = gridExemptions[k] != null ? Number(gridExemptions[k]) : null; %>
+                <td class="sku-grid-catalog-cell" data-code="<%= m.商品コード %>">
+                  <div style="display:flex; gap:10px; font-size:12px; margin-bottom:3px; white-space:nowrap;">
+                    <label style="font-weight:400; cursor:pointer;"><input type="radio" class="sku-catalog-mode" name="sku-catalog-mode-<%= mi %>" value="with" <%= jan ? 'checked' : '' %>> IDあり</label>
+                    <label style="font-weight:400; cursor:pointer;"><input type="radio" class="sku-catalog-mode" name="sku-catalog-mode-<%= mi %>" value="without" <%= jan ? '' : 'checked' %>> IDなし</label>
+                  </div>
+                  <div class="sku-catalog-with" style="<%= jan ? '' : 'display:none;' %>">
+                    <input type="text" class="sku-jan-input" inputmode="numeric" maxlength="13"
+                           data-code="<%= m.商品コード %>" value="<%= jan %>" placeholder="8/12/13桁" style="font-size:12px; padding:4px 6px;">
+                  </div>
+                  <div class="sku-catalog-without" style="<%= jan ? 'display:none;' : '' %>">
+                    <select class="sku-exemption-select" data-code="<%= m.商品コード %>" style="font-size:12px; padding:4px;">
+                      <option value="" <%= ex == null ? 'selected' : '' %>>理由: <%= exReason != null ? 'ページ共通 (' + exReason + ')' : '未選択 = 5: 該当製品コードなし' %></option>
+                      <% for (const [v, label] of exOptions) { %><option value="<%= v %>" <%= ex === v ? 'selected' : '' %>><%= label %></option><% } %>
+                    </select>
+                  </div>
+                </td>
+              <% } %>
+            </tr>
+            <% for (const name of gridNames) { const da = dictOf(name); %>
+              <tr class="sku-grid-attr" data-name="<%= name %>">
+                <th class="sku-grid-head">
+                  <div><%= name %> <% if (da && da.mandatory) { %><span style="color:#dc2626">*必須</span><% } %></div>
+                  <% if (hintOf(da)) { %><div class="muted" style="font-size:11px; font-weight:400;"><%= hintOf(da) %></div><% } %>
+                  <% if (da && da.inputMethod === 'SELECTIVE') { %><div class="muted" style="font-size:11px; font-weight:400; color:#b45309;">⚠️ 楽天が用意した値と同じ表記で</div><% } %>
+                  <div style="margin-top:4px; display:flex; gap:6px;">
+                    <button type="button" class="btn btn-sm sku-grid-bulk" data-name="<%= name %>" style="font-size:11px; padding:2px 8px;">一括入力</button>
+                    <button type="button" class="btn btn-sm sku-grid-del" data-name="<%= name %>" style="font-size:11px; padding:2px 8px;" title="この行を全SKUから外す">×</button>
+                  </div>
+                </th>
+                <% for (const m of variation.members) { const k = skuKeyOf(m); const v = (gridData.bySku[k] || {})[name] || ''; %>
+                  <td><input type="text" class="sku-attr-input" maxlength="300" data-code="<%= m.商品コード %>" data-name="<%= name %>" value="<%= v %>" style="font-size:12px; padding:4px 6px;" title="複数の値は | (縦棒) で区切る"></td>
+                <% } %>
+              </tr>
+            <% } %>
+          </tbody>
+        </table>
+      </div>
+      <script type="application/json" id="rk-sku-members-json"><%- JSON.stringify(variation.members.map((m) => String(m.商品コード || '').trim())).replace(/</g, '\\u003c') %></script>
+    <% } else { %>
+    <table class="list sku-grid" id="rk-attrs" style="margin-bottom:8px;">
+      <thead><tr><th class="sku-grid-head" style="width:40%">項目</th><th>この商品 (<code style="font-size:12px"><%= draft.ne_code %></code>)</th><th style="width:50px"></th></tr></thead>
       <tbody>
+        <%# カタログID — RMS と同じ ◉IDあり=JAN / ○IDなし=理由。JAN の実体は product_drafts.jan_code (#f-jan)、
+            保存は saveJanIfChanged (プレビュー・登録・保存の前に必ず確定させる) %>
+        <tr style="background:#f8fafc;">
+          <td>
+            <div style="padding:4px 2px; font-weight:600;">カタログID <span style="color:#dc2626">*必須</span></div>
+            <div class="muted" style="font-size:11px;">JAN (8/12/13桁)。無ければ「IDなし」+ 理由</div>
+          </td>
+          <td>
+            <div style="display:flex; gap:14px; font-size:13px; margin-bottom:4px;">
+              <label style="font-weight:400; cursor:pointer;"><input type="radio" name="rk-catalog-mode" value="with" <%= draft.jan_code ? 'checked' : '' %>> IDあり</label>
+              <label style="font-weight:400; cursor:pointer;"><input type="radio" name="rk-catalog-mode" value="without" <%= draft.jan_code ? '' : 'checked' %>> IDなし</label>
+            </div>
+            <div id="rk-catalog-with" style="<%= draft.jan_code ? '' : 'display:none;' %>">
+              <input type="text" id="f-jan" inputmode="numeric" maxlength="13" style="max-width:220px;"
+                     value="<%= draft.jan_code || '' %>" placeholder="JANコード (8/12/13桁)">
+            </div>
+            <div id="rk-catalog-without" style="<%= draft.jan_code ? 'display:none;' : '' %>">
+              <select id="rk-catalog-exemption" style="max-width:380px;">
+                <option value="" <%= exReason == null ? 'selected' : '' %>>カタログIDなしの理由 (未選択は 5: 該当製品コードなし で送ります)</option>
+                <% for (const [v, label] of exOptions) { %>
+                  <option value="<%= v %>" <%= exReason === v ? 'selected' : '' %>><%= label %></option>
+                <% } %>
+              </select>
+            </div>
+          </td>
+          <td></td>
+        </tr>
         <%# メーカー型番は RMS でも「商品仕様」の中の 1 項目なので、固定行としてここに置く (2026-09-02
             中原さん: 独立欄が上部にあると、RMS のどこに対応するか分からずカタログIDと誤認する —
             実際 shaganshi で型番がカタログIDとして送られ IE0228 で落ちた)。
             値の実体は draft_rakuten.article_number のまま (#1029 の「入口は1つ」を維持。
             送信時に属性「メーカー型番」へ自動で積まれる配線も不変)。
             旧データで属性側に残っている値は引き上げて表示し、食い違いはバナーで人に選ばせる %>
-        <%
-          let rkAttrsRaw = [];
-          try { rkAttrsRaw = JSON.parse(rakuten?.attributes_json || '[]'); } catch (e) { rkAttrsRaw = []; }
-          // 旧形式 {name, value} も拾う (Codex R3 high): 取りこぼすとサーバは 400 なのに画面に値が出ない
-          const legacyModels = [...new Set(rkAttrsRaw
-            .filter((a) => a && a.name === modelAttrName)
-            .flatMap((a) => (Array.isArray(a.values) ? a.values : (a.value !== undefined ? [a.value] : [])))
-            .map((v) => String(v == null ? '' : v).trim())
-            .filter(Boolean))];
-          const legacyModel = legacyModels.length === 1 ? legacyModels[0] : '';
-          const modelConflict = legacyModels.length > 1
-            || (legacyModels.length === 1 && rakuten?.article_number && rakuten.article_number !== legacyModels[0]);
-          // 欄が空で属性側に 1 つだけ = 引き上げ表示。人がその値を見ているので解消フラグを立てておく
-          // (Codex R4 high: 立てないと、書き換えて保存 → 400 なのに解消ボタンが出ていない、で詰む)
-          const modelAutoResolve = !modelConflict && legacyModels.length === 1 && !rakuten?.article_number;
-          const modelDict = genreDict ? genreDict.attributes.find((d) => d.name === modelAttrName) : null;
-        %>
         <tr style="background:#f8fafc;">
           <td>
             <div style="padding:4px 2px; font-weight:600;"><%= modelAttrName %></div>
@@ -1697,14 +1755,7 @@
         <% for (const a of rkAttrs) { %>
           <%# 保存済みの行にも辞書の性質を出す (2026-09-02)。ここに「選択式」が出ていなかったため、
               代表カラーに自由入力した値がそのまま送られて IE0418 で登録が落ちた %>
-          <%
-            const da = genreDict && a.name ? genreDict.attributes.find((d) => d.name === a.name) : null;
-            const daHint = da
-              ? [da.mandatory ? '必須' : null, da.inputMethod === 'SELECTIVE' ? '選択式' : null,
-                 da.unit ? '単位:' + da.unit : null, da.maxLength ? '〜' + da.maxLength + '文字' : null]
-                .filter(Boolean).join(' / ')
-              : '';
-          %>
+          <% const da = dictOf(a.name); const daHint = hintOf(da); %>
           <tr>
             <td><input type="text" class="rk-attr-name" value="<%= a.name || '' %>">
               <% if (daHint) { %><div class="muted" style="font-size:11px;"><%= daHint %></div><% } %>
@@ -1721,7 +1772,8 @@
         <% } %>
       </tbody>
     </table>
-    <button type="button" class="btn btn-sm" id="rk-attr-add">＋ 属性行を追加</button>
+    <% } %>
+    <button type="button" class="btn btn-sm" id="rk-attr-add">＋ 項目を追加</button>
     <script type="application/json" id="rk-mandatory-json"><%- JSON.stringify(genreDict ? genreDict.attributes.filter((a) => a.mandatory).map((a) => a.name) : []).replace(/</g, '\\u003c') %></script>
     <%# このジャンルで使える属性の候補 (2026-08-31 中原さん要望: 何を入れられるかが分からず、
         既存の類似商品を見て手打ちしている。押すと行が増える形にして、入力欄は必要な分だけにする) %>
@@ -1729,6 +1781,33 @@
     <%# 候補ボタン用にジャンルの全属性 (必須+任意)。名前・必須・入力方式・単位・上限だけあれば足りる %>
     <script type="application/json" id="rk-attrdict-json"><%- JSON.stringify(genreDict ? genreDict.attributes.map((a) => ({ name: a.name, mandatory: !!a.mandatory, inputMethod: a.inputMethod || null, unit: a.unit || null, maxLength: a.maxLength || null, multiValueLimit: a.multiValueLimit || null })) : []).replace(/</g, '\\u003c') %></script>
     <script type="application/json" id="rk-model-attr-json"><%- JSON.stringify(modelAttrName) %></script>
+
+
+    <div class="field">
+      <label>表示先カテゴリ <span class="muted">(RMSの「表示先カテゴリ」と同じ5枠。店舗内カテゴリのこと。枠1がメインページ。RMSへは登録後に自動反映)</span><span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
+      <% if (shopCategories.length === 0) { %>
+        <p class="muted" style="margin:4px 0;">
+          カテゴリ一覧が未取り込みです。<a href="/apps/product-hub/list">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
+        </p>
+      <% } else { %>
+        <!-- AI 初期候補 (2026-08-02): 未選択ならAIが1位を自動セット、人は候補ボタン/ツリーで修正 -->
+        <div id="rk-cats-suggest" style="font-size:12px; margin-bottom:4px;"></div>
+        <%# ツリーは 5 枠の**上**に置き、既定で開いておく (2026-08-31 中原さん: 必須項目なので
+            畳んでいると記載を見逃す)。開いた状態でも枠 1〜5 がすぐ下にあるので、
+            選んだ結果がその場で見える %>
+        <details id="rk-cats-acc" open style="border:1px solid #e2e8f0; border-radius:8px; background:#fff; margin-bottom:6px;">
+          <summary style="cursor:pointer; padding:7px 10px; font-size:13px; color:#475569;">🗂 カテゴリ選択 (ツリー)</summary>
+          <div style="padding:0 10px 8px;">
+            <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin:6px 0;">
+            <div id="rk-cats" style="max-height:280px; overflow:auto;"></div>
+          </div>
+        </details>
+        <!-- RMS「表示先カテゴリ 1〜5」と同じ5枠 (2026-08-02 中原さん要望)。チェックした順に枠へ入る -->
+        <div id="rk-cat-slots" style="display:grid; gap:4px; margin-bottom:6px;"></div>
+        <script type="application/json" id="rk-cats-data"><%- JSON.stringify(shopCategories.map((c) => ({ id: c.id, path: c.path, selected: !!c.selected, slot: c.slot ?? null, inactive: !c.is_active }))).replace(/</g, '\\u003c') %></script>
+      <% } %>
+    </div>
+
 
     <div style="display:flex; gap:8px; align-items:center; margin-top:14px; flex-wrap:wrap;">
       <button class="btn btn-primary" id="rk-save-btn-cat">カテゴリ・属性を保存</button>
@@ -1816,6 +1895,12 @@
       if (remember) history.replaceState(null, '', '#' + id);
     }
     btns.forEach((b) => b.addEventListener('click', () => activate(b.dataset.tab, true)));
+    // 他タブへの案内リンク (例: 基本情報タブの「カタログID はカテゴリ・属性タブの表で入力」)
+    document.querySelectorAll('a.jump-tab').forEach((a) => a.addEventListener('click', (e) => {
+      e.preventDefault();
+      activate(a.dataset.tab, true);
+      window.scrollTo(0, 0);
+    }));
     // 初期タブ: ?tab= (工程ボードの画像ビューからのリンク等) > #hash (保存後 reload の復元)。
     // ボードは ?tab=tab-images を付けて飛ばすが、hash しか見ていなかったため基本情報タブが開いていた (2026-08-26)
     const wanted = (new URLSearchParams(location.search).get('tab') || '') || (location.hash || '').slice(1);
@@ -1879,27 +1964,40 @@
     // カタログIDは JAN からサーバーが自動送信する (入力は基本情報タブ: 単品=JAN欄 / バリエーション=SKU表)。
     // 辞書で必須のジャンルは JAN の無い SKU があると登録が止まるので、基本情報タブの未入力として数える
     // (Codex R1 High-1: 無条件に除外すると「未入力0件」のまま登録が失敗する)
+    // 入力はどちらもカテゴリ・属性タブの「カタログID・商品仕様」の表 (2026-09-03)
     const skuJanInputs = Array.from(document.querySelectorAll('.sku-jan-input'));
     const janMissing = skuJanInputs.length > 0
       ? skuJanInputs.filter((i) => !i.value.trim()).length
       : (tv('f-jan') ? 0 : 1);
     if (mandatoryAttrNames.includes('カタログID') && janMissing > 0) {
-      m['tab-basic'].push(skuJanInputs.length > 0
-        ? 'SKU表のカタログID (JAN) ' + janMissing + '件 (このジャンルの必須属性)'
-        : 'JANコード (楽天のカタログID・このジャンルの必須属性)');
+      m['tab-category'].push(skuJanInputs.length > 0
+        ? 'カタログID (JAN) 未入力のSKU ' + janMissing + '件 (このジャンルの必須属性)'
+        : 'カタログID (JAN・このジャンルの必須属性)');
     }
     const need = mandatoryAttrNames.filter((n) => n !== 'カタログID');
     if (need.length > 0) {
-      const vals = {};
-      document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
-        const nameEl = tr.querySelector('.rk-attr-name');
-        if (!nameEl) return;   // メーカー型番の固定行 (rk-article) は属性行ではない
-        const n = nameEl.value.trim();
-        if (n) vals[n] = tr.querySelector('.rk-attr-value').value.trim();
-      });
-      for (const n of need) {
-        if (vals[n]) continue;
-        m['tab-category'].push('必須属性「' + n + '」');
+      const grid = document.getElementById('rk-sku-grid');
+      if (grid) {
+        // バリエーション: SKU ごとのセルが全部埋まって初めて「入力済み」
+        const skuCount = Math.max(0, grid.querySelectorAll('thead th').length - 1);
+        for (const n of need) {
+          const cells = Array.from(grid.querySelectorAll('.sku-attr-input')).filter((c) => c.dataset.name === n);
+          const filled = cells.filter((c) => c.value.trim()).length;
+          if (filled < skuCount) m['tab-category'].push('必須属性「' + n + '」(SKU ' + (skuCount - filled) + '件)');
+        }
+      } else {
+        const vals = {};
+        document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
+          const nameEl = tr.querySelector('.rk-attr-name');
+          if (!nameEl) return;   // 固定行 (カタログID・メーカー型番) は属性行ではない
+          const n = nameEl.value.trim();
+          if (n) vals[n] = tr.querySelector('.rk-attr-value').value.trim();
+        });
+        for (const n of need) {
+          if (vals[n]) continue;
+          if (n === modelAttrName && tv('rk-article')) continue; // メーカー型番は固定行の欄
+          m['tab-category'].push('必須属性「' + n + '」');
+        }
       }
     }
     return m;
@@ -2494,10 +2592,16 @@
   try { attrDict = JSON.parse(document.getElementById('rk-attrdict-json').textContent) || []; } catch (e) {}
   try { modelAttrName = JSON.parse(document.getElementById('rk-model-attr-json').textContent) || modelAttrName; } catch (e) {}
 
+  // バリエーションの SKU 表に行を足す関数 (initSkuGrid が差し替える。単品は null のまま = #rk-attrs の行)
+  let addGridRow = null;
   function attrNamesInForm() {
     const names = new Set();
     document.querySelectorAll('#rk-attrs tbody tr .rk-attr-name').forEach((el) => {
       const v = String(el.value || '').trim();
+      if (v) names.add(v);
+    });
+    document.querySelectorAll('#rk-sku-grid tr.sku-grid-attr').forEach((tr) => {
+      const v = String(tr.dataset.name || '').trim();
       if (v) names.add(v);
     });
     return names;
@@ -2537,6 +2641,14 @@
                  a.unit ? '単位:' + a.unit : null, a.maxLength ? '〜' + a.maxLength + '文字' : null]
                  .filter(Boolean).join(' / ');
       b.addEventListener('click', () => {
+        if (addGridRow) {  // バリエーションの SKU 表: 行を足して最初の SKU のセルへ
+          const trg = addGridRow(a.name, a);
+          renderAttrSuggest();
+          const cell = trg.querySelector('.sku-attr-input');
+          if (cell) cell.focus();
+          updateTabBadges();
+          return;
+        }
         // 名前も値も空の行が余っていれば、そこを使う (押すたびに空行が増えない)
         const blank = [...document.querySelectorAll('#rk-attrs tbody tr')].find((tr) => {
           const nameEl = tr.querySelector('.rk-attr-name');   // 固定行 (メーカー型番) は対象外
@@ -2623,14 +2735,12 @@
       info.appendChild(ok); info.appendChild(mut);
 
       // 既存行の属性名を集め、無い必須属性だけ行を足す (人の入力は消さない)
-      const present = new Set();
+      const present = attrNamesInForm();
       document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
         const nameEl = tr.querySelector('.rk-attr-name');
-        if (!nameEl) return;   // メーカー型番の固定行は消さない
-        const n = nameEl.value.trim();
-        if (n) present.add(n);
+        if (!nameEl) return;   // 固定行 (カタログID・メーカー型番) は消さない
         // 空行 (name も value も空) は整理して詰める
-        if (!n && !tr.querySelector('.rk-attr-value').value.trim()) tr.remove();
+        if (!nameEl.value.trim() && !tr.querySelector('.rk-attr-value').value.trim()) tr.remove();
       });
       // 候補ボタン用の辞書も新しいジャンルのものに差し替える (2026-08-31)
       attrDict = (g.attributes || []).map((a) => ({
@@ -2640,8 +2750,9 @@
       let added = 0;
       for (const a of mandatory) {
         if (present.has(a.name)) continue;
-        if (a.name === 'カタログID') continue; // JAN欄から自動送信される (footnote 参照)
-        if (a.name === modelAttrName) continue; // 「メーカー型番」欄から自動送信される (2026-08-31)
+        if (a.name === 'カタログID') continue; // 表の「カタログID」の行 (JAN) から自動送信される
+        if (addGridRow) { addGridRow(a.name, a); added += 1; continue; } // バリエーション: メーカー型番も普通の行
+        if (a.name === modelAttrName) continue; // 単品: 「メーカー型番」の固定行から自動送信される (2026-08-31)
         addAttrRow(a.name, '', a);
         added += 1;
       }
@@ -2650,14 +2761,14 @@
         const note = document.createElement('div');
         note.className = 'muted';
         note.style.fontSize = '11px';
-        note.textContent = 'ℹ️ このジャンルはカタログIDが属性にあります。基本情報タブの JAN (バリエーションは SKU表の JAN) が SKU ごとに自動で送られます。';
+        note.textContent = 'ℹ️ このジャンルはカタログIDが属性にあります。表の「カタログID」の行の JAN が SKU ごとに自動で送られます。';
         info.appendChild(note);
       }
-      if ((g.attributes || []).some((a) => a.name === modelAttrName)) {
+      if ((g.attributes || []).some((a) => a.name === modelAttrName) && !addGridRow) {
         const note2 = document.createElement('div');
         note2.className = 'muted';
         note2.style.fontSize = '11px';
-        note2.textContent = 'ℹ️ このジャンルは' + modelAttrName + 'が属性にあります。上の「メーカー型番」欄の値が自動で送られます。';
+        note2.textContent = 'ℹ️ このジャンルは' + modelAttrName + 'が属性にあります。表の「' + modelAttrName + '」の行の値が自動で送られます。';
         info.appendChild(note2);
       }
       if (added > 0) rkResultCat.textContent = '必須属性 ' + added + ' 行を追加しました。値を埋めて保存してください';
@@ -2724,6 +2835,20 @@
   bindOpenLink('import-folder-url', 'import-folder-open');
 
   document.getElementById('rk-attr-add').addEventListener('click', () => {
+    if (addGridRow) {
+      // バリエーションの SKU 表: 項目名を聞いて行を足す (辞書に無い名前は登録時に IE1002 で止まる)
+      const name = prompt('追加する項目名 (RMS の属性名と同じ表記で)');
+      if (name === null) return;
+      const n = name.trim();
+      if (!n) return;
+      if (n === 'カタログID') { alert('カタログID (JAN) は表の「カタログID」の行で入力してください'); return; }
+      const meta = attrDict.find((a) => a.name === n) || null;
+      const tr = addGridRow(n, meta);
+      renderAttrSuggest();
+      const cell = tr.querySelector('.sku-attr-input');
+      if (cell) cell.focus();
+      return;
+    }
     const tr = document.createElement('tr');
     tr.innerHTML = '<td><input type="text" class="rk-attr-name"></td>'
       + '<td><input type="text" class="rk-attr-value"></td>'
@@ -2731,13 +2856,17 @@
     document.querySelector('#rk-attrs tbody').appendChild(tr);
   });
   // 手で属性名を打ち替えたときも候補を合わせる (打った属性は候補から消え、消した属性は戻る)
-  document.getElementById('rk-attrs').addEventListener('input', (ev) => {
-    if (ev.target.classList && ev.target.classList.contains('rk-attr-name')) renderAttrSuggest();
-  });
-  document.getElementById('rk-attrs').addEventListener('click', (ev) => {
-    const del = ev.target.closest && ev.target.closest('.rk-attr-del');
-    if (del) { del.closest('tr').remove(); renderAttrSuggest(); }
-  });
+  // (#rk-attrs は単品のときだけある。バリエーションは #rk-sku-grid)
+  const rkAttrsTable = document.getElementById('rk-attrs');
+  if (rkAttrsTable) {
+    rkAttrsTable.addEventListener('input', (ev) => {
+      if (ev.target.classList && ev.target.classList.contains('rk-attr-name')) renderAttrSuggest();
+    });
+    rkAttrsTable.addEventListener('click', (ev) => {
+      const del = ev.target.closest && ev.target.closest('.rk-attr-del');
+      if (del) { del.closest('tr').remove(); renderAttrSuggest(); }
+    });
+  }
 
   // メーカー型番の競合 (欄と商品属性に別の値がある) を人が解消したかどうか。
   // ボタンで選んだときだけ true になり、サーバはそのとき旧値を捨てる (黙って捨てない)。
@@ -2756,16 +2885,19 @@
         value: tr.querySelector('.rk-attr-value').value,
       });
     });
+    // 単品だけにある欄 (バリエーションは SKU 表で SKU ごとに即保存 → ここからは送らない = サーバーは既存維持)
+    const rkArticle = document.getElementById('rk-article');
+    const rkExemption = document.getElementById('rk-catalog-exemption');
     return {
       genre_id: document.getElementById('rk-genre').value,
-      article_number: document.getElementById('rk-article').value,
-      // カタログID (JAN) 本体はここから送らない (入力は基本情報タブだけ)。ここは「IDなしの理由」だけ
-      catalog_id_exemption_reason: document.getElementById('rk-catalog-exemption').value,
+      ...(rkArticle ? { article_number: rkArticle.value } : {}),
+      // カタログID (JAN) 本体はここから送らない (saveJanIfChanged が基本情報 API へ送る)。ここは「IDなしの理由」だけ
+      ...(rkExemption ? { catalog_id_exemption_reason: rkExemption.value } : {}),
       // バリエーションの項目名 (カラバリのときだけ欄がある。無ければ送らない = 既存維持)
       ...(document.getElementById('rk-variant-selector')
         ? { variant_selector_name: document.getElementById('rk-variant-selector').value }
         : {}),
-      attributes: attrs,
+      ...(document.getElementById('rk-attrs') ? { attributes: attrs } : {}),
       // メーカー型番の競合を人が解消したときだけ true (サーバはこのとき旧値を捨てる)
       resolve_model_conflict: modelConflictResolved,
       // 画面を開いたとき属性側に見えていた型番。サーバはこれと DB が一致するときだけ
@@ -2879,8 +3011,13 @@
     });
     return janSaveChain;
   }
-  // SKU別JAN の保存キュー (initSkuJans が差し替える)。未保存の変更を確定して全部待ち、1 件でも失敗したら false
-  let flushSkuJanSaves = async () => true;
+  // SKU ごとの即保存ワーカー一覧 (JAN / 商品仕様 / IDなしの理由。createSkuSaver が登録する)。
+  // 未保存の変更を確定して全部待ち、1 件でも失敗したら false
+  const skuSavers = [];
+  let skuSaveGeneration = 0;   // change / 一括操作の開始・終了ごとに +1 (全ワーカーを通した安定確認に使う)
+  const skuPendingOps = new Set(); // ワーカー外の保存 (一括入力・行削除) の実行中 Promise (Codex R2 high: flush が待つ)
+  let skuOpFailed = false;         // 追跡した保存が拒否/例外で終わった印 (次の flush を 1 回だけ false にする。Codex R3 medium)
+  const flushSkuJanSaves = () => flushSkuSavers();
   async function saveRakutenFields() {
     // JAN (単品欄 / SKU表) の保存を先に確定させる。失敗したらプレビュー・登録に進まない (Codex R2 high)
     if (!(await saveJanIfChanged())) return false;
@@ -3342,43 +3479,43 @@
     });
   })();
 
-  // ─── SKU別JAN (2026-08-28 中原さん要望)。入力欄を離れたら即保存 ───
-  (function initSkuJans() {
-    const inputs = [...document.querySelectorAll('.sku-jan-input')];
-    if (inputs.length === 0) return;
-    const result = document.getElementById('rk-result');
-    // 保存は単一の drain ワーカー: 「保存済みの値 (lastOf = DB の値) と違う入力」を実行時点の現在値で
-    // 1 件ずつ POST し、全部一致するまで回す。捕捉値のキューにしない (Codex R3 high:
-    // 待機中に追加された保存を待てない / 失敗して巻き戻した後に古い捕捉値を再送できた)
-    const lastOf = new Map(inputs.map((i) => [i, i.value.trim()]));
-    // 通信エラーで結果が分からなくなった入力 (Codex R5 high: 応答待ち中に元の値へ戻すと lastOf と一致して
-    // dirty から消え、DB だけ新値のまま flush が true になる)。再送が成功するまで dirty 扱いを外さない
+  // ─── SKU ごとの即保存ワーカー (2026-09-02〜03)。JAN / 商品仕様 / IDなしの理由 で共通 ───
+  // 「保存済みの値 (lastOf = DB の値) と違う入力」を実行時点の現在値で 1 件ずつ送り、全部一致するまで回す。
+  // 捕捉値のキューにしない (Codex R3 high: 待機中の変更を待てない・失敗後に古い値を再送できた)。
+  // 通信エラーは結果不明 (uncertain) として巻き戻さず、次の change / flush で現在値を冪等に再送する
+  // (Codex R4/R5 high: サーバーがコミット済みでも応答だけ失われることがある)。
+  // サーバー拒否 (ok:false) だけ DB の値へ巻き戻す。失敗は drain 実行の結果として flush に伝わる
+  function createSkuSaver({ inputs, send, label }) {
+    const list = [];
+    const lastOf = new Map();
     const uncertain = new Set();
+    const result = document.getElementById('rk-result');
     let draining = null;   // 実行中の drain (Promise<boolean> = その実行の開始以降に失敗が無かったか)
     let rerun = false;     // drain 中に change が来た印 (終わる直前の取りこぼし防止)
+    function register(input) {
+      list.push(input);
+      lastOf.set(input, input.value.trim());
+      input.addEventListener('change', () => { skuSaveGeneration += 1; drain(); });
+    }
     // 戻り値: 'ok' = 保存した / 'rejected' = サーバーが拒否 (DB は旧値のまま) / 'unknown' = DB の値が不明 (drain を止める)
     async function saveOne(input) {
       const value = input.value.trim();
       if (value === lastOf.get(input) && !uncertain.has(input)) return 'ok';
       let json;
       try {
-        json = await post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value });
+        json = await send(input, value);
       } catch (e) {
-        // 通信エラーはサーバーがコミット済みの可能性がある (Codex R4 high)。DB の値が分からないので
-        // 画面は巻き戻さず uncertain に入れて drain を止める (次の change / flush で現在値を冪等に再送する)
         uncertain.add(input);
-        alert('通信エラーでJANコードを保存できませんでした (' + input.dataset.code + ')。もう一度お試しください');
+        alert('通信エラーで' + label + 'を保存できませんでした (' + input.dataset.code + ')。もう一度お試しください');
         return 'unknown';
       }
       if (!json.ok) {
         if (uncertain.has(input)) {
-          // DB の値が分からないまま拒否された = 巻き戻す先が無い。uncertain のまま止めて再読込を促す
-          alert((json.error || 'JANコードの保存に失敗しました') + ' — 直前の保存結果が不明なため、ページを再読み込みして値を確認してください');
+          alert((json.error || label + 'の保存に失敗しました') + ' — 直前の保存結果が不明なため、ページを再読み込みして値を確認してください');
           return 'unknown';
         }
-        alert(json.error || 'JANコードの保存に失敗しました');
-        // サーバーが拒否 = DB は旧値。後続の変更値を潰さない: 表示が失敗した値のままのときだけ DB の値へ巻き戻す。
-        // 巻き戻したら確認表示 (カテゴリ・属性タブのカタログID) と必須バッジも合わせる (Codex R1 low)
+        alert(json.error || label + 'の保存に失敗しました');
+        // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ DB の値へ巻き戻す (バッジも追従)
         if (input.value.trim() === value) {
           input.value = lastOf.get(input);
           input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -3387,12 +3524,10 @@
       }
       uncertain.delete(input);
       lastOf.set(input, value);
-      if (result) result.textContent = 'JANコードを保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
+      if (result) result.textContent = label + 'を保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
       return 'ok';
     }
-    const dirtyInputs = () => inputs.filter((i) => uncertain.has(i) || i.value.trim() !== lastOf.get(i));
-    // 失敗は共有フラグではなく drain 実行の結果として持つ (Codex R4 high: 実行中の drain に合流する flush が
-    // 共有フラグをリセットすると、その drain で既に起きた失敗が消えていた)
+    const dirtyInputs = () => list.filter((i) => uncertain.has(i) || i.value.trim() !== lastOf.get(i));
     function drain() {
       if (draining) { rerun = true; return draining; }
       draining = (async () => {
@@ -3414,64 +3549,235 @@
       })().finally(() => { draining = null; });
       return draining;
     }
-    inputs.forEach((input) => input.addEventListener('change', () => { drain(); }));
-    // プレビュー・登録・出品情報保存の前に呼ばれる (saveRakutenFields)。未保存の変更を全部確定してから、
-    // (合流した) drain の開始以降に 1 件でも失敗していたら / まだ DB と違う入力が残っていたら false (Codex R2 high)
-    flushSkuJanSaves = async () => {
-      const ok = await drain();
-      return ok && dirtyInputs().length === 0;
+    const saver = {
+      register,
+      isDirty: () => dirtyInputs().length > 0,
+      // 一括入力など別経路で保存済みにした値を「DB の値」として覚える
+      markSaved(input, value) { uncertain.delete(input); lastOf.set(input, value); },
+      // 別経路の保存が結果不明 (通信エラー) になった入力: 次の change / flush で現在値を再送する
+      markUncertain(input) { uncertain.add(input); },
+      // プレビュー・登録・出品情報保存の前に呼ばれる。(合流した) drain の開始以降に 1 件でも失敗していたら /
+      // まだ DB と違う入力が残っていたら false
+      async flush() {
+        const ok = await drain();
+        return ok && dirtyInputs().length === 0;
+      },
     };
+    (inputs || []).forEach(register);
+    skuSavers.push(saver);
+    return saver;
+  }
+  // 全ワーカーを通した安定状態まで待つ (Codex R1 high: Promise.all 一発だと、先に終わったワーカーへ
+  // 待機中に入った変更を待たずに登録へ進める)。変更の無い一巡が取れたら true
+  // 同時に始まった flush (二重クリック等) は同じ実行を共有し同じ結果を返す (Codex R4 high: skuOpFailed を
+  // 片方だけが消費して、もう片方が true で保存へ進んでいた)。終わった後の新しい flush だけが再試行
+  let flushInFlight = null;
+  function flushSkuSavers() {
+    if (flushInFlight) return flushInFlight;
+    flushInFlight = flushSkuSaversOnce().finally(() => { flushInFlight = null; });
+    return flushInFlight;
+  }
+  async function flushSkuSaversOnce() {
+    for (let i = 0; i < 10; i++) {
+      const gen = skuSaveGeneration;
+      // ワーカー外の保存 (一括入力・行削除) が走っていれば先に終わるのを待つ
+      if (skuPendingOps.size > 0) await Promise.allSettled([...skuPendingOps]);
+      // 待った保存が拒否/例外で終わっていたら、この flush は失敗 (1 回限り。次の明示的な flush で再試行できる)
+      if (skuOpFailed) { skuOpFailed = false; return false; }
+      const ok = (await Promise.all(skuSavers.map((s) => s.flush()))).every(Boolean);
+      if (!ok) return false;
+      if (gen === skuSaveGeneration && skuPendingOps.size === 0 && skuSavers.every((s) => !s.isDirty())) return true;
+    }
+    return false;
+  }
+  // ワーカー外の保存 (一括入力・行削除) を flush の待ち対象にする。開始・終了で世代を進め、
+  // 拒否 (ok:false) や例外は skuOpFailed に残す (Codex R3 medium: 完了だけ待つと拒否された一括操作でも成功扱いになる)
+  function trackSkuOp(promise) {
+    const tracked = promise.then(
+      (json) => { if (!json || json.ok === false) skuOpFailed = true; return json; },
+      (err) => { skuOpFailed = true; throw err; });
+    skuPendingOps.add(tracked);
+    skuSaveGeneration += 1;
+    tracked.finally(() => { skuPendingOps.delete(tracked); skuSaveGeneration += 1; }).catch(() => {});
+    return tracked;
+  }
+
+  // ─── SKU別JAN (2026-08-28 中原さん要望)。入力欄を離れたら即保存 ───
+  (function initSkuJans() {
+    const inputs = [...document.querySelectorAll('.sku-jan-input')];
+    if (inputs.length === 0) return;
+    createSkuSaver({
+      inputs, label: 'JANコード',
+      send: (input, value) => post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value }),
+    });
   })();
 
-  // カタログID (カテゴリ・属性タブ) は確認表示だけ。入力は基本情報タブ (単品=JAN欄 / バリエーション=SKU表)
-  // に一本化した (2026-09-02 中原さん)。表示は入力欄から組み立て、入力に追従して更新する。
-  // 「IDなしの理由」は JAN の無い SKU があるときだけ見せる
-  (function initCatalogStatus() {
-    const box = document.getElementById('rk-catalog-status');
-    const withoutBox = document.getElementById('rk-catalog-without');
-    if (!box) return;
-    const skuInputs = Array.from(document.querySelectorAll('.sku-jan-input'));
-    const janBasic = document.getElementById('f-jan');
-    function jumpToBasic(e) {
-      e.preventDefault();
-      const b = document.querySelector('#tabbar .tab-btn[data-tab="tab-basic"]');
-      if (b) b.click();
-    }
-    function render() {
-      box.innerHTML = '';
-      let missing = 0;
-      const head = document.createElement('div');
-      if (skuInputs.length > 0) {
-        const ul = document.createElement('ul');
-        ul.style.cssText = 'margin:4px 0; padding-left:18px; font-size:12px;';
-        for (const i of skuInputs) {
-          const v = i.value.trim();
-          if (!v) missing += 1;
-          const li = document.createElement('li');
-          li.textContent = i.dataset.code + ' — ' + (v ? 'IDあり ' + v : 'IDなし (下の理由で送ります)');
-          ul.appendChild(li);
-        }
-        head.textContent = 'SKUごとに送ります (' + (skuInputs.length - missing) + '/' + skuInputs.length + ' 件入力済み)';
-        box.appendChild(head);
-        box.appendChild(ul);
-      } else {
-        const v = janBasic ? janBasic.value.trim() : '';
-        if (!v) missing = 1;
-        head.textContent = v ? 'IDあり — JAN ' + v : 'IDなし — 下の理由で送ります';
-        box.appendChild(head);
+  // ─── カタログID・商品仕様の SKU 表 (2026-09-03 中原さん: RMS と同じ SKU 列 × 項目行の表) ───
+  // セルは入力欄を離れたら即保存。一括入力は 1 リクエストで全 SKU。IDなし = JAN を消して理由を選ぶ
+  (function initSkuGrid() {
+    const grid = document.getElementById('rk-sku-grid');
+    if (!grid) return;
+    let members = [];
+    try { members = JSON.parse(document.getElementById('rk-sku-members-json').textContent) || []; } catch (e) {}
+    const attrSaver = createSkuSaver({
+      inputs: [...grid.querySelectorAll('.sku-attr-input')], label: '商品仕様',
+      send: (input, value) => post(BASE + '/sku-attributes', { ne_code: input.dataset.code, name: input.dataset.name, value }),
+    });
+    createSkuSaver({
+      inputs: [...grid.querySelectorAll('.sku-exemption-select')], label: 'カタログIDなしの理由',
+      send: (input, value) => post(BASE + '/sku-catalog-exemptions', { ne_code: input.dataset.code, reason: value }),
+    });
+    // ◉IDあり / ○IDなし (SKU ごと)。IDなし にしたら JAN を消して保存 (理由の select が出る)
+    grid.addEventListener('change', (ev) => {
+      const r = ev.target;
+      if (!r.classList || !r.classList.contains('sku-catalog-mode')) return;
+      const cell = r.closest('td');
+      const withMode = r.value === 'with';
+      cell.querySelector('.sku-catalog-with').style.display = withMode ? '' : 'none';
+      cell.querySelector('.sku-catalog-without').style.display = withMode ? 'none' : '';
+      const jan = cell.querySelector('.sku-jan-input');
+      if (!withMode && jan.value.trim()) {
+        jan.value = '';
+        jan.dispatchEvent(new Event('change', { bubbles: true }));
       }
-      const link = document.createElement('a');
-      link.href = '#tab-basic';
-      link.style.fontSize = '12px';
-      link.textContent = skuInputs.length > 0 ? '基本情報タブのSKU表で入力する' : '基本情報タブのJANコード欄で入力する';
-      link.addEventListener('click', jumpToBasic);
-      box.appendChild(link);
-      if (withoutBox) withoutBox.style.display = missing > 0 ? '' : 'none';
-    }
-    skuInputs.forEach((i) => { i.addEventListener('input', render); i.addEventListener('change', render); });
-    if (janBasic) janBasic.addEventListener('input', render);
-    render();
+      if (withMode) jan.focus();
+    });
+    // 行を足す (候補ボタン・「ジャンル情報を取得」・「＋ 項目を追加」から)。値が入るまで DB には無い
+    addGridRow = function (name, meta) {
+      const existing = grid.querySelector('tr.sku-grid-attr[data-name="' + CSS.escape(name) + '"]');
+      if (existing) return existing;
+      const tr = document.createElement('tr');
+      tr.className = 'sku-grid-attr';
+      tr.dataset.name = name;
+      const th = document.createElement('th');
+      th.className = 'sku-grid-head';
+      const title = document.createElement('div');
+      title.textContent = name + ' ';
+      if (meta && meta.mandatory) {
+        const req = document.createElement('span'); req.style.color = '#dc2626'; req.textContent = '*必須'; title.appendChild(req);
+      }
+      th.appendChild(title);
+      const hint = meta
+        ? [meta.mandatory ? '必須' : null, meta.inputMethod === 'SELECTIVE' ? '選択式' : null,
+           meta.unit ? '単位:' + meta.unit : null, meta.maxLength ? '〜' + meta.maxLength + '文字' : null]
+            .filter(Boolean).join(' / ')
+        : '';
+      if (hint) { const h = document.createElement('div'); h.className = 'muted'; h.style.cssText = 'font-size:11px; font-weight:400;'; h.textContent = hint; th.appendChild(h); }
+      if (meta && meta.inputMethod === 'SELECTIVE') {
+        const w = document.createElement('div'); w.className = 'muted'; w.style.cssText = 'font-size:11px; font-weight:400; color:#b45309;';
+        w.textContent = '⚠️ 楽天が用意した値と同じ表記で'; th.appendChild(w);
+      }
+      const btns = document.createElement('div');
+      btns.style.cssText = 'margin-top:4px; display:flex; gap:6px;';
+      btns.innerHTML = '<button type="button" class="btn btn-sm sku-grid-bulk" style="font-size:11px; padding:2px 8px;">一括入力</button>'
+        + '<button type="button" class="btn btn-sm sku-grid-del" style="font-size:11px; padding:2px 8px;" title="この行を全SKUから外す">×</button>';
+      btns.querySelector('.sku-grid-bulk').dataset.name = name;
+      btns.querySelector('.sku-grid-del').dataset.name = name;
+      th.appendChild(btns);
+      tr.appendChild(th);
+      for (const code of members) {
+        const td = document.createElement('td');
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'sku-attr-input';
+        input.dataset.code = code;
+        input.dataset.name = name;
+        input.maxLength = 300;
+        input.title = '複数の値は | (縦棒) で区切る';
+        input.style.cssText = 'font-size:12px; padding:4px 6px;';
+        td.appendChild(input);
+        tr.appendChild(td);
+        attrSaver.register(input);
+      }
+      grid.querySelector('tbody').appendChild(tr);
+      return tr;
+    };
+    // 一括入力 / 行を外す
+    grid.addEventListener('click', async (ev) => {
+      const bulk = ev.target.closest && ev.target.closest('.sku-grid-bulk');
+      const del = ev.target.closest && ev.target.closest('.sku-grid-del');
+      if (!bulk && !del) return;
+      const name = (bulk || del).dataset.name;
+      const cells = [...grid.querySelectorAll('.sku-attr-input[data-name="' + CSS.escape(name) + '"]')];
+      let value;
+      if (bulk) {
+        const first = cells.find((c) => c.value.trim());
+        const v = prompt('「' + name + '」を全SKUに一括入力します', first ? first.value.trim() : '');
+        if (v === null) return;
+        value = v.trim();
+      } else {
+        if (!confirm('「' + name + '」の行を全SKUから外しますか？ (値も消えます)')) return;
+        value = '';
+      }
+      let json;
+      try {
+        // flush (プレビュー・登録・保存) が完了を待てるよう追跡する (Codex R2 high)
+        json = await trackSkuOp(post(BASE + '/sku-attributes', { name, value, all: true }));
+      } catch (e) {
+        // 結果不明: サーバーが適用済みかもしれない。セルを意図した値にして「結果不明」にし、
+        // 次の change / flush で SKU ごとに同じ値を再送して収束させる (黙って旧値のままにしない)
+        cells.forEach((c) => { c.value = value; attrSaver.markUncertain(c); });
+        alert('通信エラーで一括入力の結果が分かりません。保存・登録の前に自動で再送します (画面の値をそのまま使います)');
+        updateTabBadges();
+        return;
+      }
+      if (!json.ok) { alert(json.error || '保存に失敗しました'); return; }
+      cells.forEach((c) => { c.value = value; attrSaver.markSaved(c, value); });
+      if (del) {
+        const tr = grid.querySelector('tr.sku-grid-attr[data-name="' + CSS.escape(name) + '"]');
+        if (tr) tr.remove();
+        renderAttrSuggest();
+      } else if (rkResultCat) {
+        rkResultCat.textContent = '「' + name + '」を全SKUに入れました (' + (value || '空') + ')';
+      }
+      updateTabBadges();
+    });
   })();
+
+  // 旧データの「カタログID」属性を削除する (バリエーションの SKU 表の警告)。JAN は専用行に入っている前提で人が押す
+  (function initLegacyCatalogDrop() {
+    const btn = document.getElementById('rk-legacy-catalog-drop');
+    if (!btn) return;
+    btn.addEventListener('click', async () => {
+      if (!confirm('旧データの「カタログID」属性を削除します。各 SKU の JAN は下の表の「カタログID」の行に入っていますか？')) return;
+      btn.disabled = true;
+      // 入力直後の JAN・商品仕様・理由の保存を待ち切ってから削除 → 再読み込み (Codex R4 high: 通信中の値を失う)
+      if (!(await flushSkuSavers())) {
+        alert('SKU 表の保存が終わっていない (または失敗した) ため削除しませんでした。表の値を確認してからもう一度押してください');
+        btn.disabled = false;
+        return;
+      }
+      let json;
+      try {
+        json = await post(BASE + '/rakuten', { ...collectRakutenFields(), drop_legacy_catalog_attr: true });
+      } catch (e) {
+        json = { ok: false, error: '通信エラーで削除できませんでした。もう一度お試しください' };
+      }
+      if (!json.ok) { alert(json.error || '削除に失敗しました'); btn.disabled = false; return; }
+      location.reload();
+    });
+  })();
+
+  // 単品のカタログID (表の 1 行目): ◉IDあり=JAN / ○IDなし=理由。IDなし にしたら JAN 欄を空にする
+  // (JAN の保存は saveJanIfChanged がプレビュー・登録・保存の前に確定させる)
+  (function initSingleCatalogRow() {
+    const withBox = document.getElementById('rk-catalog-with');
+    const withoutBox = document.getElementById('rk-catalog-without');
+    const jan = document.getElementById('f-jan');
+    if (!withBox || !withoutBox || !jan) return;
+    document.querySelectorAll('input[name="rk-catalog-mode"]').forEach((r) => r.addEventListener('change', () => {
+      const withMode = (document.querySelector('input[name="rk-catalog-mode"]:checked') || {}).value === 'with';
+      withBox.style.display = withMode ? '' : 'none';
+      withoutBox.style.display = withMode ? 'none' : '';
+      if (!withMode && jan.value.trim()) {
+        jan.value = '';
+        jan.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      if (withMode) jan.focus();
+    }));
+  })();
+
+
 
   // SKU別の選択肢 (2026-09-02 カラバリ出品)。JAN欄と同じ作法: 入力即保存・POSTは1本ずつ
   (function () {

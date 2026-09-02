@@ -62,7 +62,7 @@ import {
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
-  isValidGtin, MODEL_ATTR_NAME,
+  isValidGtin, MODEL_ATTR_NAME, skuAttributeGrid,
 } from './services/rakuten-listing.js';
 // ボードから楽天に出品 (2026-09-01): 画像転送 → 登録 → 後処理 を 1 本に
 import {
@@ -256,6 +256,21 @@ router.get('/detail/:id', (req, res) => {
   for (const r of db.prepare('SELECT sku_code, value FROM draft_sku_selector_values WHERE draft_id = ?').all(draft.id)) {
     skuSelectorValues[r.sku_code] = r.value;
   }
+  // SKU別の商品仕様 (2026-09-03、RMS と同じ SKU 列 × 項目行の表) と「カタログIDなしの理由」。
+  // 出品 payload と同じ関数で読む (画面に見えている値がそのまま送られる)
+  const rakutenRowForGrid = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
+  const gridRaw = (variation.kind === 'variation' && variation.memberCount > 1)
+    ? skuAttributeGrid(db, draft.id, rakutenRowForGrid, variation.members) : { names: [], bySku: new Map() };
+  // セルの表示は複数値を「 | 」で結ぶ (RMS の商品仕様と同じ区切り。保存時は | で分けて配列に戻す)
+  const skuAttrGrid = {
+    names: gridRaw.names,
+    legacyCatalogIds: gridRaw.legacyCatalogIds || [],
+    bySku: Object.fromEntries([...gridRaw.bySku.entries()].map(([k, m]) => [k, Object.fromEntries([...m.entries()].map(([n, vals]) => [n, vals.join(' | ')]))])),
+  };
+  const skuExemptions = {};
+  for (const r of db.prepare('SELECT sku_code, reason FROM draft_sku_catalog_exemptions WHERE draft_id = ?').all(draft.id)) {
+    skuExemptions[r.sku_code] = r.reason;
+  }
   const simTaxPercent = (() => {
     const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
     if (t) return Number(t[1]);
@@ -305,6 +320,7 @@ router.get('/detail/:id', (req, res) => {
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
     thumbnailUrl, fileViewUrl,
     neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices, skuJans, skuSelectorValues,
+    skuAttrGrid, skuExemptions,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
     categoryLabelsByType: CATEGORY_LABELS_BY_TYPE,
@@ -1028,10 +1044,14 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   if (genreId && !/^\d+$/.test(genreId)) {
     return res.status(400).json({ ok: false, error: 'ジャンルIDは数字で入力してください' });
   }
-  // メーカー型番は attributes の検証でも使うので、ここで先に読む
-  let articleNumber = cleanText(req.body?.article_number, 100);
   // 既存の属性は複数の判定で使うので先に読む
-  const prevRkRow = db.prepare('SELECT attributes_json, catalog_id_exemption_reason, variant_selector_name FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  const prevRkRow = db.prepare('SELECT attributes_json, article_number, catalog_id_exemption_reason, variant_selector_name FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  // メーカー型番は attributes の検証でも使うので、ここで先に読む。
+  // **送ってこない呼び出しでは既存を維持する** (Codex R1 high: バリエーションの画面には欄が無く送らないので、
+  // null で上書きすると SKU 表の既定値 = ページ共通の型番が消える)。'' = 型番なし (明示的な解除)
+  let articleNumber = req.body?.article_number !== undefined
+    ? cleanText(req.body.article_number, 100)
+    : (prevRkRow?.article_number ?? null);
   // 項目選択肢の見出し (カラバリ。「種類」「カラー」など)。送ってこなければ既存を維持する
   let variantSelectorName = prevRkRow?.variant_selector_name ?? null;
   if (req.body?.variant_selector_name !== undefined) {
@@ -1096,6 +1116,11 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
     .flatMap((a) => (Array.isArray(a.values) ? a.values : (a.value !== undefined ? [a.value] : [])))
     .map((v) => String(v == null ? '' : v).trim())
     .filter(Boolean);
+  // バリエーション (SKU 表が入口、2026-09-03) は単品用の競合チェック・旧値の整理を走らせない
+  // (Codex R2 high: 全 SKU に型番を明示しても /rakuten が 400 で止まり、画面に解消ボタンも無い)。
+  // 旧データは skuAttributeGrid が既定値/食い違いとして扱い、buildItemPayload が SKU 表への入力を促す
+  const variationForRk = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id, withMembers: false });
+  const isVariationDraft = variationForRk.kind === 'variation' && variationForRk.memberCount > 1;
   const prevModels = modelOf(prevAttrs);
   const postModels = rows ? rows.filter((a) => a.name === MODEL_ATTR_NAME).map((a) => String(a.value || '').trim()).filter(Boolean) : [];
   const modelValues = [...new Set([...postModels, ...prevModels])];
@@ -1117,7 +1142,7 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
         error: `この商品の${MODEL_ATTR_NAME}が別の画面から変わりました (いまの値: ${prevSet.join(' / ') || 'なし'})。画面を再読み込みしてから選び直してください` });
     }
   }
-  if (!resolveModel) {
+  if (!resolveModel && !isVariationDraft) {
     if (modelValues.length > 1) {
       return res.status(400).json({ ok: false, conflict: MODEL_ATTR_NAME, values: modelValues,
         error: `${MODEL_ATTR_NAME}が複数あります (${modelValues.join(' / ')})。画面の警告からどれを残すか選んでください` });
@@ -1133,14 +1158,24 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   // 保存する属性を確定する。attributes を送ってきたらそれを、送ってこなければ既存を使い、
   // どちらの場合も メーカー型番 の行だけは落とす (入口を 1 つに保つ)
   let attributesJson = prevRkRow?.attributes_json ?? null;
+  let droppedLegacyCatalog = false;
   if (rows) {
-    attributesJson = JSON.stringify(
-      rows.filter((a) => a.name !== MODEL_ATTR_NAME).map((a) => ({ name: a.name, values: [a.value] })));
+    const kept = rows.filter((a) => a.name !== MODEL_ATTR_NAME).map((a) => ({ name: a.name, values: [a.value] }));
+    // バリエーションは旧メーカー型番の行を落とさない (Codex R3 high: 古い画面・旧クライアントの attributes で
+    // 黙って失う)。SKU 表の既定値/食い違いの材料として残す
+    if (isVariationDraft) kept.push(...prevAttrs.filter((a) => a && a.name === MODEL_ATTR_NAME));
+    attributesJson = JSON.stringify(kept);
     if (parseAttributes(attributesJson) === null) {
       return res.status(400).json({ ok: false, error: '属性の形式が不正です' });
     }
-  } else if (prevModels.length > 0) {
-    // 部分更新でも、メーカー型番の行は残さない (次の保存でまた競合として出てくる)
+  } else if (req.body?.drop_legacy_catalog_attr === true) {
+    // 旧データの「カタログID」属性を人の操作で削除する (SKU 表の警告ボタン。JAN は専用行に入っている前提)。
+    // 2026-09-02 までの単品は属性行で持てたが、SKU 表では JAN の専用行が入口なので出品が必ず止まる (Codex R3 high)
+    attributesJson = JSON.stringify(prevAttrs.filter((a) => !(a && a.name === 'カタログID')));
+    droppedLegacyCatalog = true; // 記録は更新と同じトランザクションで (Codex R4 medium: 後続の 400 でもログだけ残っていた)
+  } else if (prevModels.length > 0 && !isVariationDraft) {
+    // 部分更新でも、メーカー型番の行は残さない (次の保存でまた競合として出てくる)。
+    // バリエーションは旧値を捨てない (SKU 表の既定値・食い違いの材料として残す)
     attributesJson = JSON.stringify(prevAttrs.filter((a) => !(a && a.name === MODEL_ATTR_NAME)));
   }
 
@@ -1208,6 +1243,9 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(draft.id, genreId, attributesJson, articleNumber, catalogExemptionReason, variantSelectorName,
       shippingGroup, postageIncluded, deliveryDateId, whiteBgFileId, whiteBgRaw);
+    if (droppedLegacyCatalog) {
+      logEvent(db, draft.id, 'legacy_catalog_attr_dropped', '旧データの「カタログID」属性を削除', actorOf(req));
+    }
     if (shopCategoryIds !== null) {
       setDraftShopCategories(db, draft.id, shopCategoryIds);
       // 店舗内カテゴリが確定した記録 (AI 初期設定の「一度だけ」判定に使う。0件保存も「人が外した」意思表示)。
@@ -1786,6 +1824,11 @@ router.post('/api/drafts/:id/variation/exclude', (req, res) => {
     // SKU別JAN も同じ理由で掃除する (2026-08-28)。残すと入力欄が消えて解除できない
     db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?')
       .run(draft.id, code.trim().toLowerCase());
+    // SKU別の商品仕様・カタログIDなしの理由も同じ理由で掃除する (2026-09-03)
+    db.prepare('DELETE FROM draft_sku_attributes WHERE draft_id = ? AND sku_code = ?')
+      .run(draft.id, code.trim().toLowerCase());
+    db.prepare('DELETE FROM draft_sku_catalog_exemptions WHERE draft_id = ? AND sku_code = ?')
+      .run(draft.id, code.trim().toLowerCase());
     try {
       db.prepare('INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, ?, ?)')
         .run(draft.id, code, actorOf(req));
@@ -1928,6 +1971,86 @@ router.post('/api/drafts/:id/sku-jans', (req, res) => {
       throw e;
     }
     logEvent(db, draft.id, 'sku_jan_saved', `${code} = ${jan}`, actorOf(req));
+    return { code: 200 };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true });
+});
+
+// SKU別の商品仕様 (2026-09-03 中原さん: RMS と同じ「SKU 列 × 項目行」の表で入力)。
+// value '' = 明示的に空 (ページ共通の既定値を打ち消す)。all=true で全 SKU に同じ値 (一括入力)。
+// 入力欄を離れたら即保存 (sku-jans と同じ作法)。所属確認まで 1 トランザクション
+router.post('/api/drafts/:id/sku-attributes', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  // 上限超過は黙って切り詰めず 400 (Codex R1 medium: 切り詰めると画面の値と DB が食い違ったまま保存済み扱いになる)
+  const rawName = String(req.body?.name ?? '').trim();
+  if (rawName.length > 100) return res.status(400).json({ ok: false, error: '項目名は100文字以内で入力してください' });
+  const name = cleanText(rawName, 100);
+  if (!name) return res.status(400).json({ ok: false, error: '項目名が必要です' });
+  if (name === 'カタログID') {
+    return res.status(400).json({ ok: false, error: 'カタログID (JAN) は商品仕様ではなく表の「カタログID」の行で入力してください' });
+  }
+  const value = String(req.body?.value ?? '').trim(); // '' = 明示的に空 (NOT NULL 列)
+  if (value.length > 300) return res.status(400).json({ ok: false, error: '値は300文字以内で入力してください' });
+  const all = req.body?.all === true;
+  const code = all ? '' : cleanText(req.body?.ne_code, 100);
+  if (!all && !code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const db = getDB();
+  const r = db.transaction(() => {
+    const v = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id, withMembers: true });
+    if (v.kind !== 'variation' || v.memberCount < 2) {
+      return { code: 400, error: 'このドラフトはバリエーションではありません (単品は商品仕様の表で入力してください)' };
+    }
+    const memberKeys = v.members.map((m) => String(m.商品コード || '').trim().toLowerCase());
+    const keys = all ? memberKeys : [code.trim().toLowerCase()];
+    if (!all && !memberKeys.includes(keys[0])) {
+      return { code: 409, error: `${code} はこのページのバリエーションに含まれていません。画面を再読み込みしてください` };
+    }
+    const up = db.prepare(`
+      INSERT INTO draft_sku_attributes (draft_id, sku_code, name, value) VALUES (?, ?, ?, ?)
+      ON CONFLICT(draft_id, sku_code, name) DO UPDATE SET
+        value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `);
+    for (const k of keys) up.run(draft.id, k, name, value);
+    logEvent(db, draft.id, 'sku_attribute_saved', `${name} = ${value || '(空)'} (${all ? '全SKU一括' : code})`, actorOf(req));
+    return { code: 200, count: keys.length };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true, count: r.count });
+});
+
+// SKU別の「カタログIDなしの理由」(2026-09-03)。JAN の無い SKU に使う。空欄で送れば解除 (= ページ共通の理由)
+router.post('/api/drafts/:id/sku-catalog-exemptions', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const code = cleanText(req.body?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const raw = String(req.body?.reason ?? '').trim();
+  if (raw !== '' && !/^[1-6]$/.test(raw)) {
+    return res.status(400).json({ ok: false, error: 'カタログIDなしの理由は1〜6から選んでください' });
+  }
+  const db = getDB();
+  const r = db.transaction(() => {
+    const key = code.trim().toLowerCase();
+    if (raw === '') {
+      const info = db.prepare('DELETE FROM draft_sku_catalog_exemptions WHERE draft_id = ? AND sku_code = ?').run(draft.id, key);
+      if (info.changes > 0) logEvent(db, draft.id, 'sku_catalog_exemption_saved', `${code} = (解除)`, actorOf(req));
+      return { code: 200 };
+    }
+    const v = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id, withMembers: true });
+    if (v.kind !== 'variation' || v.memberCount < 2) {
+      return { code: 400, error: 'このドラフトはバリエーションではありません' };
+    }
+    if (!v.members.some((m) => String(m.商品コード || '').trim().toLowerCase() === key)) {
+      return { code: 409, error: `${code} はこのページのバリエーションに含まれていません。画面を再読み込みしてください` };
+    }
+    db.prepare(`
+      INSERT INTO draft_sku_catalog_exemptions (draft_id, sku_code, reason) VALUES (?, ?, ?)
+      ON CONFLICT(draft_id, sku_code) DO UPDATE SET
+        reason = excluded.reason, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `).run(draft.id, key, Number(raw));
+    logEvent(db, draft.id, 'sku_catalog_exemption_saved', `${code} = ${raw}`, actorOf(req));
     return { code: 200 };
   })();
   if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
