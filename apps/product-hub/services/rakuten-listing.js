@@ -6,7 +6,9 @@
  *   - 画像は Drive → R-Cabinet 自動転送
  *   - 登録は**公開状態で行う** (2026-08-05 中原さん指示。在庫0で登録するので売れることはなく、
  *     在庫は NE 連携が入れる)。〜2026-08-05 は非公開登録→アプリの公開ボタンの二段階だった
- *   - まずは**単品ページのみ** (バリエーションページの variants/selector 構成は P3.5)
+ *   - 単品ページ + **カラバリ (バリエーションページ)** に対応 (2026-09-02)。カラバリは
+ *     項目選択肢の見出しを draft_rakuten.variant_selector_name に、SKU ごとの値を
+ *     draft_sku_selector_values に持つ (NE 側に軸の情報が無いため画面で手入力する)
  *
  * 経路: Render (この service) → miniPC /service-api/rakuten-rms/* (Cloudflare Tunnel)。
  * 楽天キーは miniPC にだけある。Render 側 env は RYS と共通の WAREHOUSE_* / CF_ACCESS_*。
@@ -1050,11 +1052,10 @@ export function buildItemPayload(db, draftId) {
   // #888 で「出品時のゲート」と画面に書いたまま配線が抜けていた。画像作成承認者の追加 (2026-08-23) で配線
   const imageBlock = imageTrackBlockReason(db, draftId);
   if (imageBlock) reasons.push(imageBlock);
-  // 単品のみ (バリエーションページの variants/selector 構成は P3.5)
-  const vari = resolveVariationGroup(db, draft.ne_code, { draftId, withMembers: false });
-  if (vari.kind === 'variation' && vari.memberCount > 1) {
-    reasons.push(`バリエーションページ (${vari.memberCount} SKU) の自動出品は未対応です (P3.5 で対応予定)`);
-  }
+  // カラバリ (バリエーションページ) は 2026-09-02 から対応。SKU ごとに
+  // 項目選択肢の値 (selectorValues) と カタログID が要る。材料は下の buildVariants で検証する
+  const vari = resolveVariationGroup(db, draft.ne_code, { draftId, withMembers: true });
+  const isVariation = vari.kind === 'variation' && vari.memberCount > 1;
   const title = (ai.rakuten_title || draft.name || '').trim();
   if (!title) reasons.push('楽天タイトル (または商品名) がありません');
   if (title.length > 255) reasons.push(`楽天タイトルが長すぎます (${title.length}文字 / 上限255)`);
@@ -1113,6 +1114,55 @@ export function buildItemPayload(db, draftId) {
   // 1 (セット商品) は articleNumberForSet (構成品の JAN 一覧) が別に必須になる。まだ送れないので止める
   if (!jan && catalogExemptionReason === 1) {
     reasons.push('カタログIDなしの理由「1: セット商品」は未対応です (構成品のJAN一覧を送る仕組みがまだありません)。JANを入力するか別の理由を選んでください');
+  }
+
+  // ─── カラバリ (バリエーションページ) の材料 (2026-09-02) ───
+  // 楽天の形: item.variantSelectors [{key, displayName, values:[{displayValue}]}]
+  //           + variants[sku].selectorValues {軸キー: 値}   (variation-resolver.js の実測に合わせる)
+  // 軸は 1 ページ 1 つだけ対応する (2軸以上は RMS 画面で組む)
+  const selectorName = String(rk.variant_selector_name || '').trim();
+  let variantRows = null;   // [{ skuCode, selectorValue, jan, price }]
+  if (isVariation) {
+    if (!selectorName) {
+      reasons.push('項目選択肢の見出し (「種類」「カラー」など) が未入力です — カテゴリ・属性タブで入れてください');
+    }
+    const selRows = new Map(db.prepare('SELECT sku_code, value FROM draft_sku_selector_values WHERE draft_id = ?')
+      .all(draftId).map((r) => [String(r.sku_code), String(r.value)]));
+    const janRows = new Map(db.prepare('SELECT sku_code, jan_code FROM draft_sku_jans WHERE draft_id = ?')
+      .all(draftId).map((r) => [String(r.sku_code), String(r.jan_code)]));
+    // 画面で入れた SKU別売価 (draft_sku_prices)。入っていればこれが最優先
+    const priceRows = new Map(db.prepare('SELECT sku_code, price FROM draft_sku_prices WHERE draft_id = ?')
+      .all(draftId).map((r) => [String(r.sku_code), Number(r.price)]));
+    variantRows = [];
+    for (const m of vari.members) {
+      const skuCode = String(m.商品コード || '').trim();
+      const key = skuCode.toLowerCase();
+      const selectorValue = String(selRows.get(key) || '').trim();
+      const skuJan = String(janRows.get(key) || '').trim();
+      if (!selectorValue) reasons.push(`SKU「${skuCode}」の${selectorName || '項目選択肢'}が未入力です`);
+      if (skuJan && !isValidGtin(skuJan)) {
+        reasons.push(`SKU「${skuCode}」のJANコード「${skuJan}」の形式が不正です (8/12/13桁 + チェックデジット)`);
+      }
+      // 売価の優先順: 画面で入れた SKU別売価 > NE の標準売価 > ページ代表の売価 (RMS は SKU ごとに必須)
+      const manualPrice = Number(priceRows.get(key));
+      const rawPrice = Number(m.標準売価);
+      const price = Number.isFinite(manualPrice) && manualPrice >= 1 ? Math.round(manualPrice)
+        : (Number.isFinite(rawPrice) && rawPrice >= 1 ? Math.round(rawPrice) : draft.price);
+      if (!Number.isInteger(price) || price < 1) {
+        reasons.push(`SKU「${skuCode}」の売価がありません (NEの標準売価も代表の売価も未設定)`);
+      }
+      variantRows.push({ skuCode, selectorValue, jan: skuJan, price });
+    }
+    // 同じ値が 2 SKU に付くと組み合わせが重複して RMS に弾かれる (DB の UNIQUE でも防ぐが、
+    // 取込など別経路で入った分に備えてここでも見る)
+    const seenValues = new Map();
+    for (const v of variantRows) {
+      if (!v.selectorValue) continue;
+      if (seenValues.has(v.selectorValue)) {
+        reasons.push(`${selectorName || '項目選択肢'}「${v.selectorValue}」が ${seenValues.get(v.selectorValue)} と ${v.skuCode} で重複しています`);
+      } else seenValues.set(v.selectorValue, v.skuCode);
+    }
+    if (variantRows.length > 40) reasons.push(`SKUが多すぎます (${variantRows.length}件 / 楽天の上限40件)`);
   }
 
   // メーカー型番はカタログIDと同じ扱い (2026-08-31 中原さん: RMS でも入力項目は 1 つなのに
@@ -1253,7 +1303,24 @@ export function buildItemPayload(db, draftId) {
     ...(whiteBg ? { whiteBgImage: { type: 'CABINET', location: whiteBg.cabinet_location } } : {}),
     payment, // 消費税率は常に明示 (2026-08-05〜)
 
-    variants: {
+    // カラバリは軸の定義を item 直下に置く (variation-resolver.js が読んでいる形と同じ)
+    ...(isVariation && variantRows ? {
+      variantSelectors: [{
+        key: selectorName,
+        displayName: selectorName,
+        values: variantRows.map((v) => ({ displayValue: v.selectorValue })),
+      }],
+    } : {}),
+
+    variants: isVariation && variantRows ? Object.fromEntries(variantRows.map((v) => [v.skuCode, {
+      merchantDefinedSkuId: v.skuCode,
+      standardPrice: v.price,
+      articleNumber: v.jan ? { value: v.jan } : { exemptionReason: catalogExemptionReason },
+      selectorValues: { [selectorName]: v.selectorValue },
+      ...(attrs.length > 0 ? { attributes: attrs } : {}),
+      ...(Object.keys(shipping).length > 0 ? { shipping } : {}),
+      ...(deliveryDateId ? { normalDeliveryDateId: Number(deliveryDateId) } : {}),
+    }])) : {
       [productCode]: {
         // システム連携用SKU番号 = 商品コード (2026-08-05 中原さん指示。NE との SKU 突合キー)
         merchantDefinedSkuId: productCode,

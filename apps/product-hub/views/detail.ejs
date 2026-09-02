@@ -823,6 +823,9 @@
               <th style="width:170px">商品コード</th><th>商品名</th><th style="width:80px">取扱区分</th><th style="width:50px">在庫</th>
               <th style="width:80px">原価<span class="muted" style="font-weight:400">(税抜)</span></th>
               <%# SKU別JAN (2026-08-28 中原さん要望)。バリエーションありのときはページ代表のJAN1つでは足りない %>
+              <%# 項目選択肢 (2026-09-02 カラバリ出品)。楽天は variants[sku].selectorValues が必須で、
+                  NE 側に軸の情報が無いのでここで手入力する %>
+              <th style="width:130px">項目選択肢<br><span class="muted" style="font-weight:400; font-size:11px;">見出しは楽天タブ</span></th>
               <th style="width:140px">JANコード</th>
               <% if (showSkuPrices) { %><th style="width:100px">売価<span class="muted" style="font-weight:400">(税込)</span></th><th style="width:110px">利益</th><% } %>
               <th style="width:70px"></th>
@@ -839,6 +842,12 @@
                   <td class="muted"><%= m.在庫数 != null ? m.在庫数 : '' %></td>
                   <td style="text-align:right;<%= mCost?.costExTax == null ? '' : 'font-variant-numeric:tabular-nums;' %>">
                     <% if (mCost?.costExTax != null) { %><%= mCost.costExTax.toLocaleString() %>円<% } else { %><span class="muted" title="NEに原価がありません">—</span><% } %>
+                  </td>
+                  <td>
+                    <input type="text" class="sku-selector-input" maxlength="100"
+                           style="width:120px; font-size:12px; padding:4px 6px;"
+                           data-code="<%= m.商品コード %>"
+                           value="<%= skuSelectorValues[mKey] || '' %>" placeholder="例: ブラウン">
                   </td>
                   <td>
                     <input type="text" class="sku-jan-input" inputmode="numeric" maxlength="13"
@@ -1635,6 +1644,19 @@
         </select>
       <% } %>
     </div>
+
+    <%# 項目選択肢の見出し (2026-09-02 カラバリ出品)。SKUごとの値は基本情報タブのSKU表で入力する。
+        楽天は variantSelectors[].displayName にこの見出しが入る %>
+    <% if (variation && variation.kind === 'variation' && variation.memberCount > 1) { %>
+      <div class="field">
+        <label>項目選択肢の見出し <span class="muted">(「種類」「カラー」など。SKUごとの値は基本情報タブのSKU表で入力します)</span><span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="rk-variant-selector" maxlength="50" style="max-width:280px;"
+               value="<%= rakuten?.variant_selector_name || '' %>" placeholder="例: カラー">
+        <p class="muted" style="margin:4px 0 0; font-size:11px;">
+          このページは <%= variation.memberCount %> SKU のバリエーションページとして登録されます。
+        </p>
+      </div>
+    <% } %>
 
     <div class="field">
       <label>店舗内カテゴリ <span class="muted">(RMSの「表示先カテゴリ」と同じ5枠。枠1がメインページ。RMSへは登録後に自動反映)</span><span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
@@ -2723,6 +2745,10 @@
       ...(document.getElementById('rk-catalog-exemption')
         ? { catalog_id_exemption_reason: document.getElementById('rk-catalog-exemption').value }
         : {}),
+      // 項目選択肢の見出し (カラバリのときだけ欄がある。無ければ送らない = 既存維持)
+      ...(document.getElementById('rk-variant-selector')
+        ? { variant_selector_name: document.getElementById('rk-variant-selector').value }
+        : {}),
       attributes: attrs,
       // メーカー型番の競合を人が解消したときだけ true (サーバはこのとき旧値を捨てる)
       resolve_model_conflict: modelConflictResolved,
@@ -3286,6 +3312,38 @@
         }
         last = value;
         if (result) result.textContent = 'JANコードを保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
+      }
+      input.addEventListener('change', () => {
+        const value = input.value.trim();
+        saveChain = saveChain.then(() => save(value));
+      });
+    });
+  })();
+
+  // SKU別の項目選択肢 (2026-09-02 カラバリ出品)。JAN欄と同じ作法: 入力即保存・POSTは1本ずつ
+  (function () {
+    const inputs = [...document.querySelectorAll('.sku-selector-input')];
+    if (inputs.length === 0) return;
+    const result = document.getElementById('rk-result');
+    let saveChain = Promise.resolve();
+    inputs.forEach((input) => {
+      let last = input.value.trim();
+      async function save(value) {
+        if (value === last) return;
+        let json;
+        try {
+          json = await post(BASE + '/sku-selector-values', { ne_code: input.dataset.code, value: value });
+        } catch (e) {
+          json = { ok: false, error: '通信エラーで項目選択肢を保存できませんでした' };
+        }
+        if (!json.ok) {
+          alert(json.error || '項目選択肢の保存に失敗しました');
+          // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ巻き戻す
+          if (input.value.trim() === value) input.value = last;
+          return;
+        }
+        last = value;
+        if (result) result.textContent = '項目選択肢を保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
       }
       input.addEventListener('change', () => {
         const value = input.value.trim();

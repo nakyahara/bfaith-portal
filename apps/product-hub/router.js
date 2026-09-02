@@ -251,6 +251,11 @@ router.get('/detail/:id', (req, res) => {
   for (const r of db.prepare('SELECT sku_code, jan_code FROM draft_sku_jans WHERE draft_id = ?').all(draft.id)) {
     skuJans[r.sku_code] = r.jan_code;
   }
+  // SKU別の項目選択肢の値 (2026-09-02、カラバリ出品。楽天の variants[sku].selectorValues)
+  const skuSelectorValues = {};
+  for (const r of db.prepare('SELECT sku_code, value FROM draft_sku_selector_values WHERE draft_id = ?').all(draft.id)) {
+    skuSelectorValues[r.sku_code] = r.value;
+  }
   const simTaxPercent = (() => {
     const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
     if (t) return Number(t[1]);
@@ -299,7 +304,7 @@ router.get('/detail/:id', (req, res) => {
     rakuten, cabinetImages, genreDict,
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
     thumbnailUrl, fileViewUrl,
-    neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices, skuJans,
+    neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices, skuJans, skuSelectorValues,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
     categoryLabelsByType: CATEGORY_LABELS_BY_TYPE,
@@ -1026,7 +1031,13 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   // メーカー型番は attributes の検証でも使うので、ここで先に読む
   let articleNumber = cleanText(req.body?.article_number, 100);
   // 既存の属性は複数の判定で使うので先に読む
-  const prevRkRow = db.prepare('SELECT attributes_json, catalog_id_exemption_reason FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  const prevRkRow = db.prepare('SELECT attributes_json, catalog_id_exemption_reason, variant_selector_name FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  // 項目選択肢の見出し (カラバリ。「種類」「カラー」など)。送ってこなければ既存を維持する
+  let variantSelectorName = prevRkRow?.variant_selector_name ?? null;
+  if (req.body?.variant_selector_name !== undefined) {
+    const nm = cleanText(req.body.variant_selector_name, 50);
+    variantSelectorName = nm || null;
+  }
   // カタログIDなしの理由 (RMS 画面の「カタログIDなしの理由」)。JAN があれば送信時に使われない。
   // **送ってこない呼び出しでは既存を維持する** (attributes と同じ方針。部分更新で黙って消さない)
   let catalogExemptionReason = prevRkRow?.catalog_id_exemption_reason ?? null;
@@ -1177,22 +1188,23 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   db.transaction(() => {
     db.prepare(`
       INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number,
-        catalog_id_exemption_reason,
+        catalog_id_exemption_reason, variant_selector_name,
         shipping_method_group, postage_included, normal_delivery_date_id,
         white_bg_drive_file_id, white_bg_drive_url)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(draft_id) DO UPDATE SET
         genre_id = excluded.genre_id,
         attributes_json = excluded.attributes_json,
         article_number = excluded.article_number,
         catalog_id_exemption_reason = excluded.catalog_id_exemption_reason,
+        variant_selector_name = excluded.variant_selector_name,
         shipping_method_group = excluded.shipping_method_group,
         postage_included = excluded.postage_included,
         normal_delivery_date_id = excluded.normal_delivery_date_id,
         white_bg_drive_file_id = excluded.white_bg_drive_file_id,
         white_bg_drive_url = excluded.white_bg_drive_url,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    `).run(draft.id, genreId, attributesJson, articleNumber, catalogExemptionReason,
+    `).run(draft.id, genreId, attributesJson, articleNumber, catalogExemptionReason, variantSelectorName,
       shippingGroup, postageIncluded, deliveryDateId, whiteBgFileId, whiteBgRaw);
     if (shopCategoryIds !== null) {
       setDraftShopCategories(db, draft.id, shopCategoryIds);
@@ -1867,7 +1879,7 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
 
 // SKU別 JANコード (2026-08-28 中原さん要望: バリエーションありのとき、ページ代表の JAN 1つだけでは
 // SKU ごとの JAN を控えられない)。空欄で送れば解除。sku-prices と同じく所属確認まで 1 トランザクション。
-// 出品 payload には使わない (バリエーションページの自動出品は P3.5 で未対応) — いまは台帳としての控え
+// 2026-09-02〜 カラバリ出品の payload (variants[sku].articleNumber) にも使う
 router.post('/api/drafts/:id/sku-jans', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
@@ -1914,6 +1926,57 @@ router.post('/api/drafts/:id/sku-jans', (req, res) => {
       throw e;
     }
     logEvent(db, draft.id, 'sku_jan_saved', `${code} = ${jan}`, actorOf(req));
+    return { code: 200 };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true });
+});
+
+// SKU別の項目選択肢の値 (2026-09-02、カラバリ出品)。楽天は variants[sku].selectorValues が必須で、
+// NE 側に軸の情報が無いため画面で手入力する。空欄で送れば解除。sku-jans と同じ作法
+router.post('/api/drafts/:id/sku-selector-values', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const code = cleanText(req.body?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const value = cleanText(req.body?.value, 100);
+  const db = getDB();
+  const r = db.transaction(() => {
+    const key = code.trim().toLowerCase();
+    if (!value) {
+      // 解除はいつでも許可 (SKU を外した後に残った行も消せるように — sku-jans と同じ方針)
+      const info = db.prepare('DELETE FROM draft_sku_selector_values WHERE draft_id = ? AND sku_code = ?')
+        .run(draft.id, key);
+      if (info.changes > 0) logEvent(db, draft.id, 'sku_selector_saved', `${code} = (解除)`, actorOf(req));
+      return { code: 200 };
+    }
+    const v = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id });
+    if (v.kind !== 'variation') {
+      return { code: 400, error: 'このドラフトはバリエーションではありません' };
+    }
+    const inGroup = v.members.some((m) => String(m.商品コード).trim().toLowerCase() === key);
+    if (!inGroup) {
+      return { code: 409, error: `${code} はこのページのバリエーションに含まれていません。画面を再読み込みしてください` };
+    }
+    // 同じ値を 2 つの SKU に付けない (組み合わせが重複すると RMS に弾かれる)
+    const dup = db.prepare(
+      'SELECT sku_code FROM draft_sku_selector_values WHERE draft_id = ? AND value = ? AND sku_code != ?'
+    ).get(draft.id, value, key);
+    if (dup) return { code: 409, error: `「${value}」は ${dup.sku_code} で既に使われています` };
+    try {
+      db.prepare(`
+        INSERT INTO draft_sku_selector_values (draft_id, sku_code, value) VALUES (?, ?, ?)
+        ON CONFLICT(draft_id, sku_code) DO UPDATE SET
+          value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      `).run(draft.id, key, value);
+    } catch (e) {
+      // UNIQUE(draft_id, value) の backstop (別経路からの取込との競合)
+      if (/UNIQUE/i.test(String(e && e.message))) {
+        return { code: 409, error: `「${value}」はこのページの別のSKUで既に使われています` };
+      }
+      throw e;
+    }
+    logEvent(db, draft.id, 'sku_selector_saved', `${code} = ${value}`, actorOf(req));
     return { code: 200 };
   })();
   if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
