@@ -55,6 +55,7 @@ import inboundInfoRouter from './apps/inbound-info/router.js';
 import { startInboundInfoCron } from './apps/inbound-info/sync-job.js';
 import inboundCheckRouter from './apps/inbound-check/router.js';
 import irohaWorkRouter from './apps/iroha-work/router.js';
+import { startMediaWorker as startIrohaMediaWorker } from './apps/iroha-work/media.js';
 import staffRouter from './apps/staff/router.js';
 import { startInboundCheckCron, startInboundCheckNotionCron } from './apps/inbound-check/sync-job.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
@@ -1652,6 +1653,9 @@ app.listen(PORT, () => {
   startInboundCheckCron();
   // 在庫化カード (いろは行き) を Notion へ1日1回まとめて送る (17:30 JST。台帳 inbound-check-notion-cards)
   startInboundCheckNotionCron();
+  // いろは作業アプリ: 完成写真・動画の Drive/Notion 送信キュー (プロセス内2分間隔の再試行。
+  // picking の画像キューと同じ扱いで、台帳対象の独立 cron ではない)
+  startIrohaMediaWorker();
   startProductHubIntakeCron();
   // 商品リンク台帳: 夜間照合 (09:45 JST) + 台帳が空なら起動時バックフィル。既定 ON (PRODUCT_LINKS_RECONCILE_ENABLED=false で停止)
   startProductLinksCron();

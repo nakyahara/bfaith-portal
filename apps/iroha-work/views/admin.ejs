@@ -160,6 +160,46 @@
     </div>
 
     <div class="iw-box">
+      <h2>📷 完成写真・動画の送信 (直近50件)</h2>
+      <p class="hint">
+        iPad から受け取った写真・動画は、裏のキューが Drive へ保存し、Notion カードの「完成写真」に貼ります
+        (2分間隔で自動再試行)。<%= driveConfigured ? '' : '⚠ IROHA_WORK_DRIVE_FOLDER_ID が未設定のため保存できません。' %>
+        10回失敗すると止まるので「再実行」で再開してください。
+      </p>
+      <table class="iw-list">
+        <tr><th>受信</th><th>カード</th><th>種類</th><th>状態</th><th>撮影者</th><% if (isAdmin) { %><th></th><% } %></tr>
+        <% for (const m of media) { %>
+          <tr class="<%= m.deleted_at ? 'revoked' : '' %>">
+            <td style="white-space:nowrap"><%= new Date(m.created_at).toLocaleString('ja-JP') %></td>
+            <td><%= m.product_code || m.page_id %></td>
+            <td><%= m.kind === 'photo' ? '📷写真' : '🎥動画' %> (<%= Math.round((m.size || 0) / 1024) %>KB)</td>
+            <td>
+              <% if (m.deleted_at) { %>削除済み
+              <% } else if (m.status === 'synced') { %>✅ Notionまで反映
+              <% } else if (m.status === 'uploaded') { %>☁ Drive保存済み (Notion待ち)
+              <% } else { %>⏳ 送信待ち<% } %>
+              <% if (m.error) { %><div class="ng"><%= m.error %></div><% } %>
+              <% if (m.drive_url) { %><a href="<%= m.drive_url %>" target="_blank" rel="noopener">開く</a><% } %>
+            </td>
+            <td><%= m.worker_name || '-' %></td>
+            <% if (isAdmin) { %>
+              <td><% if (!m.deleted_at && m.error) { %><button class="btn-sm" onclick="retryMedia(<%= m.id %>)">再実行</button><% } %></td>
+            <% } %>
+          </tr>
+        <% } %>
+        <% if (media.length === 0) { %><tr><td colspan="6">まだありません</td></tr><% } %>
+      </table>
+      <% if (pageSync.length > 0) { %>
+        <p class="hint" style="margin-top:10px"><b>Notion貼り直し待ち:</b>
+          <% for (const s of pageSync) { %>
+            <span><%= s.page_id.slice(0, 8) %>… (<%= s.attempt_count %>回<%= s.error ? ` / ${s.error}` : '' %>)
+              <% if (isAdmin && s.error) { %><button class="btn-sm" onclick="retrySync('<%= s.page_id %>')">再実行</button><% } %></span>
+          <% } %>
+        </p>
+      <% } %>
+    </div>
+
+    <div class="iw-box">
       <h2>📋 操作履歴 (直近50件)</h2>
       <p class="hint">iPad からのステータス変更などを、成功・失敗とも記録しています (だれが・どの端末で・何を)。</p>
       <table class="iw-list">
@@ -217,6 +257,16 @@
       document.getElementById('ecOut').style.display = 'block';
       document.getElementById('ecCode').textContent = json.code;
       document.getElementById('ecNote').textContent = '「' + json.label + '」用 ・ ' + json.ttlMinutes + '分間有効 ・ 1回だけ使えます';
+    }
+    async function retryMedia(id) {
+      const { json } = await post('/admin/media/' + id + '/retry');
+      if (json.ok) location.reload();
+      else alert(json.message || '再実行できませんでした');
+    }
+    async function retrySync(pageId) {
+      const { json } = await post('/admin/media-sync/retry', { page_id: pageId });
+      if (json.ok) location.reload();
+      else alert(json.message || '再実行できませんでした');
     }
     async function voidSession(id) {
       const reason = prompt('取り消しの理由 (例: 終了ボタンの押し忘れ)');

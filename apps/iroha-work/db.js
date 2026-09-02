@@ -115,6 +115,51 @@ export function createTables(db = getMirrorDB()) {
     );
     CREATE INDEX IF NOT EXISTS idx_iroha_sessions_page ON f_iroha_work_sessions(page_id, id);
 
+    -- 完成写真・動画 (要件定義 §6 / §1.7 ②outbox)。
+    -- ⭐operation_id 付き outbox: 受信時にまず行を作り (status=stored, 実体は DATA_DIR)、
+    --   Drive へは裏で送って成功するまで再試行する。再送されても operation_id で二重登録しない。
+    --   URL だけを持ち、画像そのものは DB に入れない (Codex「写真をタスク列に詰めない」)。
+    --   deleted_at = 論理削除 (撮り直し。物理削除はしない)
+    CREATE TABLE IF NOT EXISTS f_iroha_card_media (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id  TEXT NOT NULL UNIQUE,
+      page_id       TEXT NOT NULL,
+      product_code  TEXT,
+      kind          TEXT NOT NULL CHECK (kind IN ('photo','video')),
+      mime          TEXT,
+      size          INTEGER,
+      local_path    TEXT,
+      drive_file_id TEXT,
+      drive_url     TEXT,
+      status        TEXT NOT NULL CHECK (status IN ('stored','uploaded','synced')),
+      error         TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_retry_at TEXT,
+      worker_id     INTEGER,
+      worker_name   TEXT,
+      device_label  TEXT,
+      created_at    TEXT NOT NULL,
+      uploaded_at   TEXT,
+      synced_at     TEXT,
+      deleted_at    TEXT,
+      deleted_by    TEXT,
+      delete_token_hash TEXT,
+      uploader_device_id INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS idx_iroha_media_page ON f_iroha_card_media(page_id, id);
+
+    -- Notion「完成写真」貼り直しのページ単位キュー (Codex PR3 #1: 最後の1件を削除したときも
+    -- 「空にする」PATCH が必要 — メディア行の状態だけでは表現できない)。
+    -- revision = 要求のたびに +1。PATCH 中に新しい要求が来たら完了扱いにしない (PR3-R2)
+    CREATE TABLE IF NOT EXISTS f_iroha_media_page_sync (
+      page_id       TEXT PRIMARY KEY,
+      revision      INTEGER NOT NULL DEFAULT 0,
+      requested_at  TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_retry_at TEXT,
+      error         TEXT
+    );
+
     -- 端末 (iPad)。inbound-check と同じ方式 (トークンはハッシュのみ保存)
     CREATE TABLE IF NOT EXISTS f_iroha_app_devices (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,

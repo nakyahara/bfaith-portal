@@ -12,8 +12,10 @@
  *      その分、ここで全ルートを守る (manifest.json だけ素通し)
  */
 import { Router } from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import multer from 'multer';
 import {
   createDevice, verifyDevice, revokeDevice, listDevices,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
@@ -25,6 +27,11 @@ import {
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
 import { buildList } from './service.js';
+import {
+  addMedia, softDeleteMedia, countActivePhotos, resetMedia, listMediaForAdmin, schedule as scheduleMedia,
+  listPageSyncForAdmin, resetPageSync,
+  isDriveConfigured, MEDIA_DIR, MAX_VIDEO_BYTES,
+} from './media.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -245,7 +252,28 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
     }
   }
 
+  // 棚入完了には できあがり写真1枚以上 (要件 §6)。スキップは**本人確認済みの職員のみ**
+  // (skip_photo。changeStatus 側の staff_required に頼らず API 入口でも強制 — Codex PR3-R4)
+  let skipPhotoUsed = false;
+  if (to === '棚入完了' && countActivePhotos(pageId) === 0) {
+    if (!req.body?.skip_photo) {
+      return res.status(409).json({ ok: false, error: 'photo_required',
+        message: 'できあがりの写真がまだありません。写真を1枚以上とってから棚入完了にしてください' });
+    }
+    if (!isStaff) {
+      return res.status(403).json({ ok: false, error: 'staff_required',
+        message: '写真なしでの完了は職員のみです (職員の名前を選び、PINを入れてください)' });
+    }
+    skipPhotoUsed = true;
+  }
+
   const r = await changeStatus({ pageId, to, expect, isStaff });
+  // スキップの履歴は**結果が出てから**残す (変更が失敗したのに「写真なしで完了した」と
+  // 記録しない — Codex PR3 #5)
+  if (skipPhotoUsed) {
+    safeLog({ action: 'status_skip_photo', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
+      deviceLabel: deviceLabelOf(req), to, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+  }
   // 監査ログの失敗で Notion 更新済みの結果を「失敗」に見せない (Codex PR1 #6)
   try {
     logEvent({
@@ -260,6 +288,70 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
   }
   if (!r.ok) return res.status(STATUS_HTTP[r.error] || 400).json(r);
   res.json(r);
+}));
+
+// ─── 完成写真・動画 ───
+
+const MEDIA_TMP = path.join(MEDIA_DIR, 'tmp');
+try { fs.mkdirSync(MEDIA_TMP, { recursive: true }); } catch { /* 受信時にも作る */ }
+const mediaUpload = multer({ dest: MEDIA_TMP, limits: { fileSize: MAX_VIDEO_BYTES } });
+
+/**
+ * 撮影した写真・動画の受信。実体を outbox (DATA_DIR) に置いて**即応答** — Drive/Notion へは
+ * 裏のキューが送る (§1.7 ②)。operation_id で再送を冪等化。
+ */
+router.post('/api/media', checkOrigin, mediaUpload.single('file'), api((req, res) => {
+  const cleanup = () => { if (req.file) { try { fs.unlinkSync(req.file.path); } catch { /* 移動済みなら無い */ } } };
+  try {
+    const w = resolveWorker(req);
+    if (w.error) { cleanup(); return res.status(400).json({ ok: false, error: 'worker_required', message: w.error }); }
+    if (!req.file) return res.status(400).json({ ok: false, error: 'no_file', message: 'ファイルがありません' });
+    if (!isDriveConfigured()) { cleanup(); return res.status(503).json({ ok: false, error: 'not_configured', message: 'ドライブ保存が未設定です (職員の方は管理者に連絡してください)' }); }
+    const pageId = String(req.body?.page_id || '').trim();
+    const kind = String(req.body?.kind || '');
+    if (!pageId || (kind !== 'photo' && kind !== 'video')) {
+      cleanup(); return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id と kind (photo/video) が必要です' });
+    }
+    const card = getCachePage(pageId);
+    if (!card) { cleanup(); return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' }); }
+    const r = addMedia({
+      pageId, productCode: card.product_code, kind, mime: req.file.mimetype,
+      filePath: req.file.path, worker: w.worker, deviceLabel: deviceLabelOf(req),
+      deviceId: req.iwDevice ? req.iwDevice.id : null,
+      operationId: req.body?.operation_id,
+    });
+    if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' ? 409 : 400).json(r); }
+    safeLog({ action: `media_${kind}`, pageId, workerId: w.worker.id, workerName: w.worker.display_name,
+      deviceLabel: deviceLabelOf(req), to: r.already ? 'resend' : 'add', ok: true });
+    scheduleMedia();
+    res.json(r);
+  } catch (e) {
+    cleanup();
+    throw e;
+  }
+}));
+
+// 撮り直し用の削除 (論理削除)。本人確認 = アップロード時に返した削除トークン
+// (worker_id は自己申告なので使わない — Codex PR3 #2)。職員はPCの管理画面 (セッション) から
+router.post('/api/media/:id(\\d+)/delete', checkOrigin, api((req, res) => {
+  const r = softDeleteMedia(Number(req.params.id), {
+    deleteToken: req.body?.delete_token || null,
+    actor: req.iwUser || null,
+    isSession: hasSessionAccess(req),
+  });
+  res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 403)).json(r);
+}));
+
+// 失敗した送信の再実行 (管理画面)
+router.post('/admin/media/:id(\\d+)/retry', checkOrigin, requireAdmin, api((req, res) => {
+  if (!resetMedia(Number(req.params.id))) return res.status(404).json({ ok: false, error: 'not_found', message: '対象が見つかりません' });
+  res.json({ ok: true });
+}));
+
+// Notion 貼り直しの再実行 (管理画面)
+router.post('/admin/media-sync/retry', checkOrigin, requireAdmin, api((req, res) => {
+  if (!resetPageSync(String(req.body?.page_id || ''))) return res.status(404).json({ ok: false, error: 'not_found', message: '対象が見つかりません' });
+  res.json({ ok: true });
 }));
 
 // ─── 作業時間セッション (開始 / 中断・終了) ───
@@ -351,6 +443,9 @@ router.get('/admin', requireSession, api((req, res) => {
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     events: listEvents(50),
     sessions: listSessionsForAdmin(50),
+    media: listMediaForAdmin(50),
+    pageSync: listPageSyncForAdmin(),
+    driveConfigured: isDriveConfigured(),
   });
 }));
 

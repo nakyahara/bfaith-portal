@@ -1,0 +1,396 @@
+/**
+ * いろは在庫化作業アプリ — 完成写真・動画 (Drive 保存 + Notion 反映)
+ *
+ * 流れ (要件定義 §6 / §1.7 ② operation_id 付き outbox):
+ *   ①iPad から受信 → 検証 (種類・サイズ・マジックバイト・上限枚数) → DATA_DIR に実体保存 +
+ *     f_iroha_card_media に status='stored' で記録 → **即応答** (Drive を待たせない)
+ *   ②裏のキューが Drive へアップロード (成功で status='uploaded'、実体ファイルは削除)
+ *   ③カードの「完成写真」(files プロパティ) を貼り直す (成功で status='synced')
+ *   失敗は next_retry_at で再試行。同じ operation_id の再送は既存行を返す (二重登録しない)。
+ *   Notion 反映の失敗は現場操作の失敗にしない (アップロード済みならいつでも貼り直せる)。
+ *
+ * Drive は既存サービスアカウント (GOOGLE_SERVICE_ACCOUNT_KEY) + 共有ドライブのフォルダ
+ * (IROHA_WORK_DRIVE_FOLDER_ID。SA をコンテンツ管理者で追加しておく — fba-replenishment と同じ制約)。
+ * 公開リンクにはしない (フォルダの共有範囲のまま)。
+ */
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { google } from 'googleapis';
+import { getDB } from './db.js';
+import { notionRequest, isNotionConfigured } from '../inbound-check/notion.js';
+
+export const MAX_PHOTOS = 3;
+export const MAX_VIDEOS = 1;
+export const MAX_PHOTO_BYTES = 8 * 1024 * 1024;     // canvas縮小後は通常1MB未満。余裕をみて8MB
+export const MAX_VIDEO_BYTES = 120 * 1024 * 1024;
+const RETRY_BASE_MS = 2 * 60 * 1000;
+const MAX_ATTEMPTS = 10;
+const BLOCKED_UNTIL = '9999-12-31T00:00:00.000Z';   // 使い切ったら管理画面の「再実行」まで止める
+const MEDIA_PROP = '完成写真';
+
+const utcNow = () => new Date().toISOString();
+
+export const MEDIA_DIR = process.env.DATA_DIR ? path.join(process.env.DATA_DIR, 'iroha-media') : 'data/iroha-media';
+
+export function isDriveConfigured() {
+  return !!(process.env.GOOGLE_SERVICE_ACCOUNT_KEY && process.env.IROHA_WORK_DRIVE_FOLDER_ID);
+}
+
+// ─── 受信時の検証 ───
+
+/**
+ * 実体の先頭バイトで種類を確かめる (拡張子・Content-Type は自己申告なので信じない)。
+ * ftyp は HEIC/HEIF/AVIF (静止画コンテナ) にもあるため、brand で動画系だけを通す (Codex PR3 #6)
+ */
+const VIDEO_BRANDS = new Set(['isom', 'iso2', 'iso4', 'iso5', 'iso6', 'mp41', 'mp42', 'avc1', 'qt  ', 'M4V ', '3gp4', '3gp5', 'dash']);
+export function sniffKind(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'photo';           // JPEG
+  if (buf.slice(4, 8).toString('latin1') === 'ftyp') {
+    const brand = buf.slice(8, 12).toString('latin1');
+    if (VIDEO_BRANDS.has(brand)) return 'video';                                        // MP4 / MOV / 3GP
+    return null;                                                                        // HEIC/HEIF/AVIF 等は拒否
+  }
+  return null;
+}
+
+export function countActiveMedia(pageId, kind) {
+  return getDB().prepare(`SELECT COUNT(*) c FROM f_iroha_card_media
+    WHERE page_id = ? AND kind = ? AND deleted_at IS NULL`).get(pageId, kind).c;
+}
+
+/**
+ * 棚入完了ゲート用の写真枚数。送信待ち (stored) は数えるが、**10回失敗で停止した行は数えない**
+ * (Codex PR3 #4: Drive にも Notion にも残らない写真だけで完了できてしまう)
+ */
+export function countActivePhotos(pageId) {
+  return getDB().prepare(`SELECT COUNT(*) c FROM f_iroha_card_media
+    WHERE page_id = ? AND kind = 'photo' AND deleted_at IS NULL
+      AND (next_retry_at IS NULL OR next_retry_at < ?)`).get(pageId, BLOCKED_UNTIL).c;
+}
+
+/** 先頭バイトだけ読む (動画をメモリへ丸ごと載せない) */
+function readHead(filePath, n = 16) {
+  const buf = Buffer.alloc(n);
+  const fd = fs.openSync(filePath, 'r');
+  try { fs.readSync(fd, buf, 0, n, 0); } finally { fs.closeSync(fd); }
+  return buf;
+}
+
+/**
+ * 受信を outbox に積む。filePath (multer の一時ファイル) は成功時に MEDIA_DIR へ**移動**する
+ * (動画120MBをメモリやコピーで往復させない)。失敗時の一時ファイル掃除は呼び元が行う。
+ * 同じ operation_id の再送は既存行を返す (冪等)。
+ * @returns {ok:true, media, already?} | {ok:false, error, message}
+ */
+export function addMedia({ pageId, productCode = null, kind, mime, filePath, worker, deviceLabel = null, deviceId = null, operationId }) {
+  const opId = String(operationId || '').trim();
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(opId)) return { ok: false, error: 'bad_request', message: 'operation_id が不正です' };
+  const size = fs.statSync(filePath).size;
+  const sniffed = sniffKind(readHead(filePath));
+  if (sniffed !== kind) {
+    return { ok: false, error: 'bad_file', message: kind === 'photo' ? '写真 (JPEG) を送ってください' : '動画 (MP4/MOV) を送ってください' };
+  }
+  const cap = kind === 'photo' ? MAX_PHOTO_BYTES : MAX_VIDEO_BYTES;
+  if (size > cap) {
+    return { ok: false, error: 'too_large', message: `ファイルが大きすぎます (上限 ${Math.round(cap / 1024 / 1024)}MB)` };
+  }
+  const db = getDB();
+  const dup = db.prepare('SELECT * FROM f_iroha_card_media WHERE operation_id = ?').get(opId);
+  if (dup) {
+    // 応答消失→再送 (Codex PR3-R3): 削除トークンを持てていないので、**同じ端末からの再送に
+    // 限って**発行し直す (古いトークンは無効になる)。別端末からの同 operation_id には返さない
+    if (deviceId != null && dup.uploader_device_id === Number(deviceId) && !dup.deleted_at) {
+      const token = crypto.randomBytes(16).toString('base64url');
+      db.prepare('UPDATE f_iroha_card_media SET delete_token_hash = ? WHERE id = ?')
+        .run(crypto.createHash('sha256').update(token).digest('hex'), dup.id);
+      return { ok: true, already: true, media: publicMedia(dup), deleteToken: token };
+    }
+    return { ok: true, already: true, media: publicMedia(dup) };
+  }
+  const max = kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
+  if (countActiveMedia(pageId, kind) >= max) {
+    return { ok: false, error: 'cap_reached',
+      message: kind === 'photo' ? `写真は${max}枚までです。不要な写真を削除してから撮り直してください` : `動画は${max}本までです。不要な動画を削除してから撮り直してください` };
+  }
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  const ext = kind === 'photo' ? 'jpg' : 'mp4';
+  const localPath = path.join(MEDIA_DIR, `${opId}.${ext}`);
+  fs.renameSync(filePath, localPath);
+  // 削除トークン: アップロードした端末だけに一度だけ返す (worker_id は画面で選べる自己申告なので
+  // 「撮った本人」の証明に使わない — Codex PR3 #2)。サーバーはハッシュのみ保存
+  const deleteToken = crypto.randomBytes(16).toString('base64url');
+  const info = db.prepare(`INSERT INTO f_iroha_card_media
+    (operation_id, page_id, product_code, kind, mime, size, local_path, status, worker_id, worker_name, device_label, uploader_device_id, created_at, delete_token_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?, ?, ?, ?)`)
+    .run(opId, pageId, productCode, kind, mime || null, size, localPath,
+      worker.id, worker.display_name, deviceLabel, deviceId == null ? null : Number(deviceId), utcNow(),
+      crypto.createHash('sha256').update(deleteToken).digest('hex'));
+  const row = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(info.lastInsertRowid));
+  return { ok: true, media: publicMedia(row), deleteToken };
+}
+
+/** 画面へ出す形 (ローカルパス等の内部情報は出さない) */
+export function publicMedia(r) {
+  return {
+    id: r.id, kind: r.kind, status: r.status, url: r.drive_url || null,
+    worker_id: r.worker_id, worker_name: r.worker_name, created_at: r.created_at,
+    error: r.next_retry_at === BLOCKED_UNTIL ? (r.error || '失敗') : null,   // 諦めた失敗だけ画面へ
+  };
+}
+
+/** page_id → 有効なメディア一覧 (一覧・詳細表示用) */
+export function mediaByPage() {
+  const map = new Map();
+  for (const r of getDB().prepare(`SELECT * FROM f_iroha_card_media WHERE deleted_at IS NULL ORDER BY id`).all()) {
+    if (!map.has(r.page_id)) map.set(r.page_id, []);
+    map.get(r.page_id).push(publicMedia(r));
+  }
+  return map;
+}
+
+/**
+ * 論理削除。本人確認は**削除トークン** (アップロードした端末だけが持つ) か portal セッション。
+ * 貼り直しはページ単位キューへ積む — 最後の1件を消したときも「空にする」PATCH が飛ぶ (Codex PR3 #1)
+ */
+export function softDeleteMedia(id, { deleteToken = null, actor = null, isSession = false }) {
+  const db = getDB();
+  const row = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id));
+  if (!row || row.deleted_at) return { ok: false, error: 'not_found', message: '写真・動画が見つかりません' };
+  if (!isSession) {
+    const hash = deleteToken ? crypto.createHash('sha256').update(String(deleteToken)).digest('hex') : null;
+    if (!hash || hash !== row.delete_token_hash) {
+      return { ok: false, error: 'forbidden', message: '削除できるのは撮影した端末からだけです (職員はPCの管理画面から)' };
+    }
+  }
+  db.prepare('UPDATE f_iroha_card_media SET deleted_at = ?, deleted_by = ? WHERE id = ?')
+    .run(utcNow(), actor || 'device', row.id);
+  if (row.local_path) { try { fs.unlinkSync(row.local_path); } catch { /* 送信済みなら無い */ } }
+  requestPageSync(row.page_id);
+  schedule();
+  return { ok: true };
+}
+
+/** Notion 貼り直しをページ単位で予約する (即時対象になる)。revision を進めて「処理中の古い
+ *  取得内容で完了扱いされない」ようにする (Codex PR3-R2: PATCH中の削除要求が消える競合) */
+export function requestPageSync(pageId) {
+  getDB().prepare(`INSERT INTO f_iroha_media_page_sync (page_id, revision, requested_at, attempt_count, next_retry_at, error)
+    VALUES (?, 1, ?, 0, NULL, NULL)
+    ON CONFLICT(page_id) DO UPDATE SET
+      revision = f_iroha_media_page_sync.revision + 1,
+      requested_at = excluded.requested_at, attempt_count = 0, next_retry_at = NULL`)
+    .run(pageId, utcNow());
+}
+
+/** 管理画面の「再実行」: ブロックを解除して即時キュー */
+export function resetMedia(id) {
+  const n = getDB().prepare(`UPDATE f_iroha_card_media
+    SET next_retry_at = NULL, error = NULL, attempt_count = 0 WHERE id = ?`).run(Number(id)).changes;
+  if (n > 0) schedule();
+  return n > 0;
+}
+
+export function listMediaForAdmin(limit = 50) {
+  return getDB().prepare('SELECT * FROM f_iroha_card_media ORDER BY id DESC LIMIT ?').all(Number(limit) || 50);
+}
+
+// ─── Drive アップロード ───
+
+function getDriveClient() {
+  const keyBase64 = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  if (!keyBase64) throw new Error('GOOGLE_SERVICE_ACCOUNT_KEY が未設定です');
+  const keyJson = JSON.parse(Buffer.from(keyBase64, 'base64').toString('utf-8'));
+  const auth = new google.auth.GoogleAuth({ credentials: keyJson, scopes: ['https://www.googleapis.com/auth/drive'] });
+  return google.drive({ version: 'v3', auth });
+}
+
+/**
+ * 実装差し替え可能な Drive アップロード (テストでモックする)。戻り値 {fileId, url}。
+ * ⭐冪等化 (Codex PR3 #3): operation_id を appProperties に入れて作成し、**作成前に同じ
+ *   operation_id のファイルを検索して回収**する。「作成は成功したが応答が消えた」再試行で
+ *   共有ドライブに同じ写真が複数できない
+ */
+async function driveUploadReal({ localPath, filename, mime, operationId }) {
+  const folderId = process.env.IROHA_WORK_DRIVE_FOLDER_ID;
+  if (!folderId) throw new Error('IROHA_WORK_DRIVE_FOLDER_ID が未設定です');
+  const drive = getDriveClient();
+  const TIMEOUT = 120000;
+  const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
+  // 共有ドライブIDを特定して検索範囲を限定 (corpora=allDrives は incompleteSearch を返し得る — fba と同じ)
+  let driveId = null;
+  try {
+    const meta = await drive.files.get({ fileId: folderId, fields: 'id, driveId', supportsAllDrives: true }, { timeout: 30000 });
+    driveId = meta.data.driveId || null;
+  } catch (e) {
+    throw new Error(`保存先フォルダにアクセスできません。共有ドライブにサービスアカウントを「コンテンツ管理者」で追加してください (${e.message})`);
+  }
+  const list = await drive.files.list({
+    q: `appProperties has { key='iroha_op' and value='${esc(operationId)}' } and '${esc(folderId)}' in parents and trashed = false`,
+    fields: 'files(id, webViewLink), incompleteSearch',
+    pageSize: 5,
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    ...(driveId ? { corpora: 'drive', driveId } : {}),
+  }, { timeout: 30000 });
+  if (list.data.incompleteSearch) throw new Error('Drive検索が不完全 (incompleteSearch)。重複防止のため中止しました');
+  const hit = (list.data.files || [])[0];
+  if (hit) return { fileId: hit.id, url: hit.webViewLink || `https://drive.google.com/file/d/${hit.id}/view` };
+
+  const res = await drive.files.create({
+    requestBody: { name: filename, parents: [folderId], appProperties: { iroha_op: String(operationId) } },
+    media: { mimeType: mime || 'application/octet-stream', body: fs.createReadStream(localPath) },
+    fields: 'id, webViewLink',
+    supportsAllDrives: true,
+  }, { timeout: TIMEOUT });
+  return { fileId: res.data.id, url: res.data.webViewLink || `https://drive.google.com/file/d/${res.data.id}/view` };
+}
+
+let driveUploadImpl = driveUploadReal;
+export function _setDriveUpload(fn) { driveUploadImpl = fn || driveUploadReal; }
+
+// ファイル名に個人名を入れない (要件 §6): 日時 + 商品コード + 種類 + operation_id
+function filenameFor(r) {
+  const ts = String(r.created_at).replace(/[-:TZ.]/g, '').slice(0, 14);
+  const code = String(r.product_code || 'nocode').replace(/[^A-Za-z0-9_-]/g, '') || 'nocode';
+  return `${ts}_${code}_${r.kind}_${r.operation_id.slice(0, 12)}.${r.kind === 'photo' ? 'jpg' : 'mp4'}`;
+}
+
+function markFail(db, r, message) {
+  const attempts = (r.attempt_count || 0) + 1;
+  const retryAt = attempts >= MAX_ATTEMPTS ? BLOCKED_UNTIL
+    : new Date(Date.now() + RETRY_BASE_MS * attempts).toISOString();
+  db.prepare('UPDATE f_iroha_card_media SET error = ?, attempt_count = ?, next_retry_at = ? WHERE id = ?')
+    .run(String(message).slice(0, 300), attempts, retryAt, r.id);
+  if (attempts >= MAX_ATTEMPTS) console.error(`[iroha-work media] #${r.id} を${MAX_ATTEMPTS}回失敗で停止 (管理画面の再実行待ち): ${message}`);
+}
+
+// ─── Notion 反映 (カードの「完成写真」files プロパティを貼り直す) ───
+
+let mediaPropCache = null; // { at, ok }
+async function ensureMediaProp() {
+  if (mediaPropCache && Date.now() - mediaPropCache.at < 10 * 60 * 1000) return mediaPropCache.ok;
+  const dbId = process.env.INBOUND_CHECK_NOTION_DB_ID;
+  const meta = await notionRequest(`/databases/${dbId}`, 'GET');
+  const prop = meta.properties?.[MEDIA_PROP];
+  let ok = false;
+  if (!prop) {
+    await notionRequest(`/databases/${dbId}`, 'PATCH', { properties: { [MEDIA_PROP]: { files: {} } } });
+    ok = true;
+  } else if (prop.type === 'files') {
+    ok = true;
+  } else {
+    console.warn(`[iroha-work media] Notion の「${MEDIA_PROP}」が files 型ではないため反映をスキップします (${prop.type})`);
+  }
+  mediaPropCache = { at: Date.now(), ok };
+  return ok;
+}
+export function _clearMediaPropCache() { mediaPropCache = null; }
+
+/** ページの有効メディア (Drive 保存済み) を Notion の files に**貼り直す** (0件なら空にする) */
+async function syncPageToNotion(db, pageId) {
+  const rows = db.prepare(`SELECT * FROM f_iroha_card_media
+    WHERE page_id = ? AND deleted_at IS NULL AND drive_url IS NOT NULL ORDER BY id`).all(pageId);
+  const files = rows.map(r => ({ name: filenameFor(r).slice(0, 100), external: { url: r.drive_url } }));
+  await notionRequest(`/pages/${pageId}`, 'PATCH', { properties: { [MEDIA_PROP]: { files } } });
+  const now = utcNow();
+  const ids = rows.map(r => r.id);
+  if (ids.length > 0) {
+    db.prepare(`UPDATE f_iroha_card_media SET status = 'synced', synced_at = ?, error = NULL, next_retry_at = NULL
+      WHERE id IN (${ids.map(() => '?').join(',')})`).run(now, ...ids);
+  }
+}
+
+// ─── キュー (単一プロセス前提の直列ワーカー) ───
+
+let running = false;
+let timer = null;
+
+export async function processMediaQueue() {
+  if (running) return { ok: true, skipped: true };
+  running = true;
+  const db = getDB();
+  const now = utcNow();
+  const stats = { uploaded: 0, synced: 0, failed: 0 };
+  try {
+    // ①Drive へ (stored の行)。成功したらそのページの Notion 貼り直しを予約
+    const toUpload = db.prepare(`SELECT * FROM f_iroha_card_media
+      WHERE status = 'stored' AND deleted_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= ?)
+      ORDER BY id LIMIT 20`).all(now);
+    for (const r of toUpload) {
+      try {
+        if (!r.local_path || !fs.existsSync(r.local_path)) throw new Error('実体ファイルがありません (再起動で消えた可能性。撮り直してください)');
+        const { fileId, url } = await driveUploadImpl({
+          localPath: r.local_path, filename: filenameFor(r), mime: r.mime, operationId: r.operation_id,
+        });
+        db.prepare(`UPDATE f_iroha_card_media
+          SET status = 'uploaded', drive_file_id = ?, drive_url = ?, uploaded_at = ?, error = NULL, next_retry_at = NULL
+          WHERE id = ?`).run(fileId, url, utcNow(), r.id);
+        try { fs.unlinkSync(r.local_path); } catch { /* 消せなくても実害なし */ }
+        requestPageSync(r.page_id);
+        stats.uploaded++;
+      } catch (e) {
+        markFail(db, r, e.message);
+        stats.failed++;
+      }
+    }
+    // ②Notion 貼り直し (ページ単位キュー。0件=空にする PATCH も含む)。
+    //   反映は最終同期扱い — 失敗しても現場は困らない (Drive には保存済み)
+    if (isNotionConfigured()) {
+      const syncRows = db.prepare(`SELECT * FROM f_iroha_media_page_sync
+        WHERE next_retry_at IS NULL OR next_retry_at <= ? ORDER BY requested_at LIMIT 10`).all(now);
+      for (const s of syncRows) {
+        try {
+          if (!(await ensureMediaProp())) break;   // プロパティ型が合わない間は全ページ保留
+          await syncPageToNotion(db, s.page_id);
+          // ⚠PATCH を待っている間に新しい要求 (削除など) が来ていたら revision が進んでいる。
+          //   そのときは完了扱いにせず残す — 次の巡回が最新の内容で貼り直す (Codex PR3-R2)
+          const done = db.prepare('DELETE FROM f_iroha_media_page_sync WHERE page_id = ? AND revision = ?')
+            .run(s.page_id, s.revision).changes;
+          if (done > 0) stats.synced++;
+        } catch (e) {
+          const attempts = (s.attempt_count || 0) + 1;
+          const retryAt = attempts >= MAX_ATTEMPTS ? BLOCKED_UNTIL
+            : new Date(Date.now() + RETRY_BASE_MS * attempts).toISOString();
+          // 失敗の記録も revision 一致時のみ (新しい要求はカウンタ0から再試行される)
+          db.prepare(`UPDATE f_iroha_media_page_sync SET attempt_count = ?, next_retry_at = ?, error = ?
+            WHERE page_id = ? AND revision = ?`)
+            .run(attempts, retryAt, String(e.message).slice(0, 300), s.page_id, s.revision);
+          stats.failed++;
+        }
+      }
+    }
+  } finally {
+    running = false;
+  }
+  return { ok: true, ...stats };
+}
+
+/** 管理画面用: Notion 貼り直し待ち・失敗の一覧 */
+export function listPageSyncForAdmin() {
+  return getDB().prepare('SELECT * FROM f_iroha_media_page_sync ORDER BY requested_at').all();
+}
+
+/** 管理画面の「再実行」(貼り直し側): ブロック解除して即時キュー */
+export function resetPageSync(pageId) {
+  const n = getDB().prepare(`UPDATE f_iroha_media_page_sync
+    SET next_retry_at = NULL, attempt_count = 0, error = NULL WHERE page_id = ?`).run(String(pageId)).changes;
+  if (n > 0) schedule();
+  return n > 0;
+}
+
+/** すぐ1回まわす (受信・削除の直後に呼ぶ)。失敗はキューの再試行に任せる */
+export function schedule() {
+  setImmediate(() => { processMediaQueue().catch((e) => console.error('[iroha-work media] queue error', e)); });
+}
+
+/** 2分おきの再試行ワーカー (プロセス内。picking の画像キューと同じ扱いで台帳対象の cron ではない) */
+export function startMediaWorker() {
+  if (timer) return;
+  timer = setInterval(() => {
+    processMediaQueue().catch((e) => console.error('[iroha-work media] queue error', e));
+  }, 2 * 60 * 1000);
+  timer.unref?.();
+  console.log('[iroha-work] メディア送信ワーカー起動 (2分間隔で再試行)');
+}
