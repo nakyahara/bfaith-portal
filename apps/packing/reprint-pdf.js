@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { PDFDocument, PDFName, PDFDict } from 'pdf-lib';
+import { PDFDocument, PDFName, PDFDict, degrees } from 'pdf-lib';
 import { DATA_DIR } from './db.js';
 import { getShippingFolders, driveCall } from './drive.js';
 import { listDriveFilesAcross, downloadDriveFileById } from '../../lib/drive-csv.js';
@@ -46,6 +46,43 @@ export const MIN_INK_RATIO = (() => {
   if (!Number.isFinite(v) || v <= 0 || v > 1) {
     console.warn(`[packing-reprint] PACKING_MIN_INK_RATIO=${raw} は不正 (0<x<=1) → 既定 ${DEFAULT_MIN_INK_RATIO} を使います`);
     return DEFAULT_MIN_INK_RATIO;
+  }
+  return v;
+})();
+
+// ── ラベル実寸 (mm) ────────────────────────────────────────────────────────────
+// 🚨 AESの送り状は並び替えツールから **A4 (210×297mm・全面画像1枚)** で出てくるが、
+// 実際に刷るのは 100×150mm のサーマルラベル。A4のまま印刷エージェントへ渡すと
+// 「拡大されて端が切れ、ラベル2枚にまたがる」(2026-09-03 実機・NE 1544601)。
+// 倍率をエージェント側 (-print-settings) やプリンタドライバの用紙設定に委ねると、
+// **どのPCのどの設定で刷ったかで結果が変わる**ため、サーバー側でラベル実寸のPDFにして渡す。
+// こうすると noscale (等倍) でも shrink (用紙より大きいページだけ縮小) でも 100% で刷られる。
+const DEFAULT_LABEL_MM = { w: 100, h: 150 };   // Munbyn ITPP941 の 4×6インチロール
+const DEFAULT_LABEL_MARGIN_MM = 2;             // ラベル端の非印字領域で切られないための余白
+const MM = 72 / 25.4;                          // mm → PDFポイント
+
+/** "100x150" 形式の env を読む。壊れた値で安全側の既定が消えないよう、範囲外は既定に戻す */
+export const LABEL_MM = (() => {
+  const raw = process.env.PACKING_LABEL_MM;
+  if (raw == null || raw === '') return DEFAULT_LABEL_MM;
+  const m = /^\s*(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*$/.exec(raw);
+  const w = m ? Number(m[1]) : NaN;
+  const h = m ? Number(m[2]) : NaN;
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w < 20 || h < 20 || w > 500 || h > 500) {
+    console.warn(`[packing-reprint] PACKING_LABEL_MM=${raw} は不正 (例 100x150) → 既定 ${DEFAULT_LABEL_MM.w}x${DEFAULT_LABEL_MM.h} を使います`);
+    return DEFAULT_LABEL_MM;
+  }
+  return { w, h };
+})();
+
+export const LABEL_MARGIN_MM = (() => {
+  const raw = process.env.PACKING_LABEL_MARGIN_MM;
+  if (raw == null || raw === '') return DEFAULT_LABEL_MARGIN_MM;
+  const v = Number(raw);
+  // 余白が用紙の1/4を超えると送り状が読めない大きさになる。打ち間違いは既定へ戻す
+  if (!Number.isFinite(v) || v < 0 || v * 4 >= Math.min(LABEL_MM.w, LABEL_MM.h)) {
+    console.warn(`[packing-reprint] PACKING_LABEL_MARGIN_MM=${raw} は不正 → 既定 ${DEFAULT_LABEL_MARGIN_MM}mm を使います`);
+    return DEFAULT_LABEL_MARGIN_MM;
   }
   return v;
 })();
@@ -280,7 +317,7 @@ export function pageHasContent(page) {
  */
 export async function extractReprintPdf({
   folderName, neSlipNo, recipientName, siteOrderNo = null,
-  slipSeq = null, slipCount = null,
+  slipSeq = null, slipCount = null, slug = null,
 }) {
   const folders = (await getShippingFolders()).filter((f) => f.name === folderName);
   if (folders.length === 0) throw new Error(`Driveフォルダ ${folderName} が見つかりません`);
@@ -335,8 +372,9 @@ export async function extractReprintPdf({
         invoiceFiles: invoices.map((f) => ({ name: f.filename, modified_time: f.modified_time })),
       });
       if (v.ok) {
-        const r = await cutPage(pdf.buffer, v.page, sortedPdfFile.filename);
-        return { ...r, by: 'manifest', printable: true, inkRatio: v.inkRatio };
+        const r = await cutPage(pdf.buffer, v.page, sortedPdfFile.filename, { slug });
+        // ラベルに収まらないPDFは刷らせない (はみ出して2枚使う) — 人が見るリンクは渡す
+        return { ...r, by: 'manifest', printable: !r.oversized, inkRatio: v.inkRatio };
       }
       // 白紙は「探し方が悪い」のではなく**元が白紙**。位置推定に落ちても同じ紙しか出ないので止める
       if (v.reason === 'blank') {
@@ -371,12 +409,97 @@ export async function extractReprintPdf({
   if (fileSets.length === 0) throw new Error('送り状PDFを読み込めませんでした');
   const hit = decideLabelPage(fileSets, { neSlipNo, recipientName, slipSeq, slipCount });
   if (!hit) throw new Error('該当ページを一意に特定できません (テキスト0件/複数一致・位置対応も条件不成立)');
-  const r = await cutPage(fileSets[hit.file].buf, hit.page, fileSets[hit.file].filename);
+  const r = await cutPage(fileSets[hit.file].buf, hit.page, fileSets[hit.file].filename, { slug });
   return { ...r, by: hit.by, printable: false, inkRatio: null };
 }
 
-/** 1ページだけの新しいPDFを作って保存し、配信トークンを返す。明白な空ページは拒否する。 */
-async function cutPage(srcBuffer, pageIndex, filename) {
+/**
+ * ラベル実寸に収めるときの倍率と位置を決める (純関数・単位はPDFポイント)。
+ * 縦横比は保ち、中央寄せする。
+ *
+ * ⭐ 1mm以内の超過は**倍率1.0のまま**ページ枠だけラベル実寸にする。サーマルラベルは等倍が
+ * 正しく、ほぼラベル実寸のPDFを余白ぶん縮めるとバーコードが読みにくくなるため。
+ * (端の 0.5mm は等倍で刷っても同じように落ちる。ページ枠を実寸にすること自体に意味がある)
+ *
+ * @returns {{labelW,labelH,x,y,w,h,scale}|null} null = 収め直し不要 (既にラベルに収まっている)
+ */
+export function labelFitBox(pageW, pageH, labelMm = LABEL_MM, marginMm = LABEL_MARGIN_MM) {
+  const labelW = labelMm.w * MM;
+  const labelH = labelMm.h * MM;
+  if (pageW <= labelW && pageH <= labelH) return null;
+  const tol = 1 * MM;
+  const margin = marginMm * MM;
+  const scale = (pageW <= labelW + tol && pageH <= labelH + tol)
+    ? 1
+    : Math.min((labelW - margin * 2) / pageW, (labelH - margin * 2) / pageH);
+  const w = pageW * scale;
+  const h = pageH * scale;
+  return { labelW, labelH, x: (labelW - w) / 2, y: (labelH - h) / 2, w, h, scale };
+}
+
+/**
+ * ページがラベルより大きいときだけ、ラベル実寸のページに収め直す。
+ *
+ * A4の送り状 (AES) をそのまま印刷エージェントへ渡すと、等倍 (noscale) では拡大されたまま
+ * 刷られ、用紙合わせ (shrink) でもプリンタドライバの用紙設定しだいの倍率になる →
+ * 端が切れてラベル2枚にまたがる。ここで実寸に落としておけば、**どちらの設定でも 100%** で
+ * 刷られる (shrink は用紙より大きいページしか縮めないため) = 印刷側の設定に依存しない。
+ *
+ * 🚨 **既にラベル大のページ (ヤマトB2・ゆうプリR等) は触らない**。サーマルラベルは等倍が
+ * 正しく、数%でも縮めるとバーコードが読めなくなるため、縮小は「大きすぎるページ」限定。
+ *
+ * @param {import('pdf-lib').PDFDocument} doc 1ページだけのPDF
+ * @param {{w:number,h:number}} labelMm ラベル実寸 (mm)
+ * @param {number} marginMm ラベル端の余白 (mm)
+ * @returns {Promise<import('pdf-lib').PDFDocument|null>} 収め直した新PDF / 不要ならnull
+ */
+export async function fitToLabel(doc, labelMm = LABEL_MM, marginMm = LABEL_MARGIN_MM) {
+  const page = doc.getPage(0);
+  // 🚨 大きさは **CropBox** で見る。MediaBox がトンボ込みのA4で CropBox が実際の印字領域、
+  // という外部PDFだと、MediaBox基準では見えない余白まで含めて縮小してしまう。
+  // CropBox が無ければ pdf-lib が MediaBox を返すので、AESの送り状でも従来どおり
+  const crop = page.getCropBox();
+  // 🚨 embedPage は /Rotate を持ち越さない (回転前の中身がそのまま Form XObject になる) ので、
+  // 「見たままの向き」で収めるには回転をこちら側で描き直す必要がある。
+  // 90の倍数でない回転は扱えない (PDF仕様上は現れないはず) → 収め直さずに返し、
+  // **ラベルに収まらないPDFは自動印刷に載せない** (cutPage 側で printable=false にする)
+  const rotation = ((page.getRotation().angle % 360) + 360) % 360;
+  if (rotation % 90 !== 0) {
+    console.warn(`[packing-reprint] 回転${rotation}° のページはラベル実寸に収め直せません`);
+    return null;
+  }
+  const turned = rotation === 90 || rotation === 270;
+  const box = labelFitBox(
+    turned ? crop.height : crop.width, turned ? crop.width : crop.height, labelMm, marginMm);
+  if (!box) return null;
+  const out = await PDFDocument.create();
+  const embedded = await out.embedPage(page, {
+    left: crop.x, bottom: crop.y, right: crop.x + crop.width, top: crop.y + crop.height,
+  });
+  const label = out.addPage([box.labelW, box.labelH]);
+  // 回転後に box の左下が (box.x, box.y) に来るよう、回転の支点をずらす
+  // (drawPage は「支点へ平行移動 → 反時計回りに回転 → 拡大縮小」の順で描く)
+  const place = {
+    0:   { x: box.x,             y: box.y,             angle: 0 },
+    90:  { x: box.x,             y: box.y + box.h,     angle: -90 },
+    180: { x: box.x + box.w,     y: box.y + box.h,     angle: 180 },
+    270: { x: box.x + box.w,     y: box.y,             angle: 90 },
+  }[rotation];
+  label.drawPage(embedded, {
+    x: place.x, y: place.y, rotate: degrees(place.angle),
+    xScale: box.scale, yScale: box.scale,
+  });
+  return out;
+}
+
+/**
+ * 1ページだけの新しいPDFを作って保存し、配信トークンを返す。明白な空ページは拒否する。
+ *
+ * 🚨 ラベル実寸に収め直すのは **slug='aes' (Munbyn・100×150mmロール) のときだけ**。
+ * 引当分類ごとに物理プリンターも用紙も違うので、実寸が分かっている経路以外は触らない
+ * (等倍が正しい)。収めきれなかったときは `oversized` を返し、自動印刷に載せない。
+ */
+async function cutPage(srcBuffer, pageIndex, filename, { slug = null } = {}) {
   const src = await PDFDocument.load(srcBuffer);
   const out = await PDFDocument.create();
   const [page] = await out.copyPages(src, [pageIndex]);
@@ -384,12 +507,24 @@ async function cutPage(srcBuffer, pageIndex, filename) {
   if (!pageHasContent(out.getPage(0))) {
     throw new LabelUnusableError('blank', `抜き出したページに中身がありません (${filename} の ${pageIndex + 1}ページ目)`);
   }
-  const bytes = await out.save();
+  const knowsLabelSize = slug === 'aes';
+  const fitted = knowsLabelSize ? await fitToLabel(out) : null;
+  const finalDoc = fitted || out;
+  const { width, height } = finalDoc.getPage(0).getSize();
+  // 収め直したのに (または収め直せずに) まだラベルより大きい = 刷ればはみ出して2枚使う。
+  // 人が見るリンクは今までどおり渡すが、自動印刷には載せない
+  const oversized = knowsLabelSize
+    && (width > LABEL_MM.w * MM + 1 || height > LABEL_MM.h * MM + 1);
+  if (oversized) {
+    console.warn(`[packing-reprint] ${filename} の ${pageIndex + 1}ページ目は `
+      + `${Math.round(width / MM)}×${Math.round(height / MM)}mm でラベルに収まりません → 自動印刷しません`);
+  }
+  const bytes = await finalDoc.save();
   const token = crypto.randomBytes(16).toString('base64url');
   fs.mkdirSync(REPRINTS_DIR, { recursive: true });
   fs.writeFileSync(path.join(REPRINTS_DIR, `${token}.pdf`), bytes);
   // sha256 は印刷キューが配信時に実物と突合するために返す (差し替わったPDFを刷らない)
-  return { token, file: filename, sha256: sha256(Buffer.from(bytes)) };
+  return { token, file: filename, sha256: sha256(Buffer.from(bytes)), oversized };
 }
 
 /**

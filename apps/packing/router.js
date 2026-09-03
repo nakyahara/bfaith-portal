@@ -596,11 +596,15 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
       (async () => {
         try {
           const batch = getPackBatch(row.batch_id);
+          // 出力先は**引当分類 (送り状発行ソフト) ごと**に決まる (ヤマトB2 / DENZOU /
+          // ゆうプリR / 汎用送り状 で物理プリンターが違う)。フォルダの okurijo_<slug>_*.csv から読む。
+          // ⭐PDFを作る前に決める — ラベル実寸に収めてよいかが引当分類で変わるため
+          const slug = await detectOkurijoSlug(row.folder_name);
           const r = await extractReprintPdf({
             folderName: row.folder_name, neSlipNo: row.ne_slip_no, recipientName: row.recipient_name,
             siteOrderNo: row.site_order_no,
             slipSeq: row.slip_seq, slipCount: batch?.slip_count ?? null,
-            batchCreatedAt: batch?.created_at ?? null,
+            batchCreatedAt: batch?.created_at ?? null, slug,
           });
           const url = `https://picking.bfaith-wh.uk/apps/packing/reprints/${r.token}.pdf`;
           getDB().prepare('UPDATE pk_pack_reprints SET pdf_token=?, pdf_by=?, pdf_printable=?, pdf_ink_ratio=? WHERE id=?')
@@ -609,9 +613,6 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
           // その条件は enqueuePrintJob の SQL が上の UPDATE 済みの行を直接見て判定する
           // (呼び出し側の if に任せると、入口が増えたとき位置推定のPDFが積まれる)。
           // 位置推定で見つけた分は今までどおり**リンクだけ**渡して人が見て印刷する
-          // 出力先は**引当分類 (送り状発行ソフト) ごと**に決まる (ヤマトB2 / DENZOU /
-          // ゆうプリR / 汎用送り状 で物理プリンターが違う)。フォルダの okurijo_<slug>_*.csv から読む
-          const slug = await detectOkurijoSlug(row.folder_name);
           const queued = enqueuePrintJob(row.id, { pdfSha256: r.sha256, slug });
           if (queued && !queued.id) {
             console.warn(`[packing-reprint] ${row.ne_slip_no}: 自動印刷しません (${queued.reason} slug=${queued.slug ?? '-'})`);
