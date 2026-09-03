@@ -871,6 +871,20 @@ export function activeSessionsByTask() {
 }
 
 /**
+ * そのカード (task) の終わった作業。詳細の「これまでの作業」に読むだけで出す (要件 v1.3 §P Q5)。
+ * 取り消した分 (voided) は出さない。1 枚の詳細でしか使わないので task ごとに引く
+ * @returns {Array<{id, worker_name, started_at, ended_at, end_reason, raw_seconds}>} 古い順
+ */
+export function finishedSessionsOfTask(taskId) {
+  const n = Number(taskId);
+  if (!Number.isInteger(n) || n <= 0) return [];
+  return getDB().prepare(`SELECT id, worker_name, started_at, ended_at, end_reason, raw_seconds
+    FROM f_iroha_work_sessions
+    WHERE task_id = ? AND ended_at IS NOT NULL AND voided_at IS NULL
+    ORDER BY started_at, id`).all(n);
+}
+
+/**
  * 商品コードごとの実測 (カード単位の合計作業時間を平均)。voided は集計から外す。
  * @returns Map<code_key, { avgSeconds, cards, lastSeconds }>
  */

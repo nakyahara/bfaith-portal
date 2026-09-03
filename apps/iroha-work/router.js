@@ -590,6 +590,9 @@ const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_containe
 router.post('/api/options', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  // 候補じたいは商品に紐づかない共有マスタなので Notion 正本でも登録できる。ただし下見のカード id を
+  // 添えた要求は受けない (「下見の id を送っても DB が変わらない」を全ての書き込み口で同じにする)
+  if (isPreviewIdInNotionMode(req.body?.id ?? req.body?.page_id)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
   if (!hasSessionAccess(req)) {
     if (w.worker.worker_type !== 'staff') {
       return res.status(403).json({ ok: false, error: 'staff_required', message: '新しい候補の登録は職員のみです (職員の名前を選び、PINを入れてください)' });
@@ -864,6 +867,16 @@ router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
 // 撮り直し用の削除 (論理削除)。本人確認 = アップロード時に返した削除トークン
 // (worker_id は自己申告なので使わない — Codex PR3 #2)。職員はPCの管理画面 (セッション) から
 router.post('/api/media/:id(\\d+)/delete', checkOrigin, api((req, res) => {
+  // 読むだけの写真は消せない: Notion 正本の間の tasks の写真 (下見) と、終了したカードの写真 (履歴)。
+  // 画面は × を描かないが、撮った端末は削除トークンを持ったままなので、サーバーでも断る (要件 v1.3 §P Q5)
+  const row = getMediaRow(Number(req.params.id));
+  if (row && row.task_id != null) {
+    if (!isAppMode()) return res.status(409).json(PREVIEW_WRITE_REJECTED);
+    const t = getTask(row.task_id);
+    if (t && t.status === 'closed') {
+      return res.status(409).json({ ok: false, error: 'closed_task', message: '終了したカードの写真は消せません (履歴として残ります)' });
+    }
+  }
   const r = softDeleteMedia(Number(req.params.id), {
     deleteToken: req.body?.delete_token || null,
     actor: req.iwUser || null,

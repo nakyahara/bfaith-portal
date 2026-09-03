@@ -13,7 +13,7 @@
 import { buildEnrichContext } from '../inbound-check/notion-sync.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
-import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask } from './db.js';
+import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask, finishedSessionsOfTask } from './db.js';
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, HOLD_REASONS, HOLD_LABEL, CLOSE_REASONS, CLOSE_LABEL, statusLabel } from './tasks.js';
@@ -294,11 +294,25 @@ function buildTaskCards(rows) {
   return { cards, today };
 }
 
-/** 1 枚だけ (下見・履歴の詳細)。終了したタスクも返す。無ければ null */
+/** 商品画像がまだ無いカードの取り寄せを頼む (一覧・単票の共通処理。失敗しても表示は続ける) */
+function queueMissingImages(cards) {
+  const missingImg = [...new Set(cards.filter(c => c.product_code && !c.image_url).map(c => c.product_code))];
+  if (missingImg.length === 0) return;
+  try { queueEnsureImages(missingImg, 'いろは作業アプリ'); } catch (e) { console.warn('[iroha-work] 画像解決を飛ばしました:', e.message); }
+}
+
+/**
+ * 1 枚だけ (下見・履歴の詳細)。終了したタスクも返す。無ければ null。
+ * 一覧と違い、そのカードの**終わった作業** (work_history) も付ける — 詳細でしか使わないので 1 件ずつ引く
+ */
 export function buildTaskCard(id) {
   const t = getTask(id);
   if (!t) return null;
-  return buildTaskCards([t]).cards[0] || null;
+  const card = buildTaskCards([t]).cards[0] || null;
+  if (!card) return null;
+  card.work_history = finishedSessionsOfTask(t.id);
+  queueMissingImages([card]);
+  return card;
 }
 
 /**
@@ -324,10 +338,7 @@ export function buildTaskList({ facility = null } = {}) {
     return String(a.title).localeCompare(String(b.title), 'ja');
   });
 
-  const missingImg = [...new Set(cards.filter(c => c.product_code && !c.image_url).map(c => c.product_code))];
-  if (missingImg.length > 0) {
-    try { queueEnsureImages(missingImg, 'いろは作業アプリ'); } catch (e) { console.warn('[iroha-work] 画像解決を飛ばしました:', e.message); }
-  }
+  queueMissingImages(cards);
 
   return {
     mode: 'app',

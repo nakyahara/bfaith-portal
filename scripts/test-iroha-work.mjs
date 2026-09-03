@@ -1765,6 +1765,30 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         ok(rm.status === 409 && rm.json.error === 'notion_mode', '写真の送信に下見の id を送ると 409 notion_mode');
         ok(snap() === before, '下見の id をどの書き込み API に送っても DB が変わらない (tasks・作業時間・写真・作業のやり方)');
         ok(mediaTables.length > 0, '写真のテーブルを数えている (テーブル名の前提が崩れていない)');
+        // Codex R1: 写真の削除・選択肢の登録も下見/履歴の境界を越えない。認可も確かめる
+        ok((await call('GET', '/api/task-previews/' + open.id)).status === 401, '端末登録もログインも無ければ下見の詳細は 401');
+        // 撮った端末は削除トークンを持ったまま。Notion 正本に戻った後でも tasks の写真を消せないこと
+        db.prepare(`INSERT INTO f_iroha_card_media (operation_id, task_id, product_code, kind, mime, size, drive_file_id, drive_url,
+            status, worker_id, worker_name, created_at, uploaded_at, delete_token_hash)
+          VALUES ('op-preview-del1', ?, ?, 'photo', 'image/jpeg', 100, 'f-preview-del1', 'https://drive/preview-del1',
+            'uploaded', ?, 'やまだ', ?, ?, 'hash-preview')`).run(open.id, open.product_code || 'PROD-A', w1.id, new Date().toISOString(), new Date().toISOString());
+        const mediaRow = db.prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-preview-del1'").get();
+        const del = await call('POST', '/api/media/' + mediaRow.id + '/delete', { ...admin, body: {} });
+        ok(del.status === 409 && del.json.error === 'notion_mode', 'Notion 正本の間は tasks の写真を消せない (削除トークンやポータルでも)');
+        ok(db.prepare('SELECT deleted_at FROM f_iroha_card_media WHERE id = ?').get(mediaRow.id).deleted_at == null, '写真は消えていない');
+        const optBefore = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c;
+        const optRes = await call('POST', '/api/options', { cookie, body: { id: open.id, kind: 'material', code: 'PREVIEW-X', worker_id: staff2.id, pin: '4649' } });
+        ok(optRes.status === 409 && optRes.json.error === 'notion_mode', '下見の id を添えた選択肢の登録は 409');
+        ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c === optBefore, '選択肢も増えていない');
+        // 詳細には「このカードの終わった作業」が付く (一覧には付けない — 2222 枚ぶん引かない)
+        const withWork = db.prepare(`SELECT task_id FROM f_iroha_work_sessions
+          WHERE task_id IS NOT NULL AND ended_at IS NOT NULL AND voided_at IS NULL GROUP BY task_id ORDER BY task_id LIMIT 1`).get();
+        if (withWork) {
+          const dw = await call('GET', '/api/task-previews/' + withWork.task_id, { cookie });
+          ok(dw.status === 200 && Array.isArray(dw.json.card.work_history) && dw.json.card.work_history.length > 0
+            && dw.json.card.work_history.every((s) => s.worker_name && s.started_at && s.ended_at), 'そのカードの終わった作業が時系列で返る');
+          ok(pv.json.cards.every((c) => c.work_history === undefined), '一覧・ボードのカードには付けない (件数ぶん引かない)');
+        } else ok(false, '終わった作業がテストデータに無い');
       }
     }
     const ms = await call('GET', '/admin/migration/status', { ...admin });
@@ -2260,16 +2284,16 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // 下見でもカードは開く (v1.3) — ただし state の openDetail には流さない (id が正本のカードと別)。1 枚だけ読むだけで取る
   ok(/if \(!isApp\(\)\) \{ openPreviewDetail\(el\.dataset\.id\); return; \}\r?\n  if \(el\.dataset\.pick === '1'\) toggleBulk\(el\.dataset\.id\); else openDetail\(el\.dataset\.id\);/.test(html),
     '下見のカードは state の openDetail に流さない (id が正本のカードと別)');
-  ok(/const canBulk = isApp\(\) &&/.test(html), '下見では「まとめて棚入完了」を出さない');
-  ok(/\$\('#lwSave'\)\.disabled = !isApp\(\);/.test(html), '下見ではラベル待ちを保存できない');
+  ok(/const canBulk = stateCan\('tasks\.bulk_stocked'\) &&/.test(html), '下見では「まとめて棚入完了」を出さない (許可リストで判定)');
+  ok(/\$\('#lwSave'\)\.disabled = !stateCan\('task\.label_wait\.edit'\);/.test(html), '下見ではラベル待ちを保存できない (許可リストで判定)');
   // 正本が変わったとき・つながらなかったときの追随 (Codex 下見 R1)
-  ok(/if \(wasApp !== isApp\(\)\) \{ preview = null;/.test(html), '正本が変わったら下見のデータを捨てる (古い下見を新しく見せない)');
+  ok(/if \(wasApp !== isApp\(\)\) \{[\s\S]{0,80}preview = null; previewAt = null; previewDown = false;/.test(html), '正本が変わったら下見のデータを捨てる (古い下見を新しく見せない)');
   ok(/if \(curView === 'board'\) \{ if \(isApp\(\)\) renderBoard\(\); else loadPreview\(\); \}/.test(html), '更新のたびに、Notion 正本なら下見も取り直す (502 から戻ったときもここで回復)');
   ok(/previewInflight = loadPreviewOnce\(\)/.test(html), '下見の取得は同時に 1 本だけ (遅れて返った古い応答で上書きしない)');
   ok(/previewDown = true;[\s\S]{0,300}if \(!preview\)/.test(html), 'つながらないときは前回の下見を消さない');
   ok(/previewAt = Date\.now\(\);/.test(html) && /この画面を取ったのは/.test(html), 'いつ取った下見かを画面に出す');
   ok(/function renderLwSaveState/.test(html) && /renderLwSaveState\(\);/.test(html), 'ラベル待ちを開いたままでも保存ボタンが正本に追随する');
-  ok(/if \(!isApp\(\)\) \{ \$\('#lwMsg'\)\.textContent = '下見なので保存できません/.test(html), '保存の入口でも下見なら止める');
+  ok(/if \(!stateCan\('task\.label_wait\.edit'\)\) \{ \$\('#lwMsg'\)\.textContent = '下見なので保存できません/.test(html), '保存の入口でも下見なら止める');
   ok(/btn\.disabled = !isApp\(\);   \/\/ 保存中に正本が変わっていたら/.test(html), '保存後にボタンを無条件で戻さない');
   // 実機FB (2026-09-03): ボードに写真・項目タップで変更・想定作業時間の合計
   ok(/<div class="th">' \+ thumbHtml\(c\) \+ '<\/div>/.test(html), 'ボードのカードに写真を出す');
@@ -2325,6 +2349,21 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(!can\('task\.master\.edit'\)\) return;/.test(html) && /if \(curDetail && can\('task\.status\.change'\)\) openSt/.test(html)
     && /if \(!can\('task\.work\.start'\)\) return;/.test(html) && /if \(!can\('task\.media\.add'\)\) return;/.test(html), '変更・開始・撮影の入口も許可リストで止める (二重の守り)');
   ok(/capabilities: j\.capabilities/.test(html) && /capabilities: s\.capabilities \|\| \[\]/.test(html), '端末に残す前回の一覧にも許可リストを持たせる (無ければ何も許さない)');
+  // Codex R1 の指摘 (下見・履歴の読み取り専用境界)
+  ok(/const stateCan = \(name\) => \(state\.capabilities \|\| \[\]\)\.includes\(name\)/.test(html),
+    '一覧・ボード側も許可リストで判定する (前回の一覧に許可が無ければ何も許さない)');
+  ok(/stateCan\('task\.status\.change'\)\r?\n\s+\? '<button class="st /.test(html) && /'<span class="st ro /.test(html),
+    '一覧の状態は、変更が許されたときだけタップできる札 (data-st) にする');
+  ok(/function openSt\(ev, id\) \{[\s\S]{0,120}if \(!stateCan\('task\.status\.change'\)\) return;/.test(html)
+    && /function startBulk\(\) \{\r?\n  if \(!stateCan\('tasks\.bulk_stocked'\)\) return;/.test(html),
+    'ステータス変更・まとめて棚入完了は入口でも許可リストで止める (二重の守り)');
+  ok(/function forceCloseDetail\(msg\) \{\r?\n  if \(mvSaving \|\| stSaving\) return;/.test(html)
+    && /else forceCloseDetail\('このカードは一覧から外れました'\)/.test(html)
+    && /if \(curDetail\) forceCloseDetail\('正本が変わったので詳細を閉じました'\)/.test(html),
+    'カードが一覧から消えた・正本が変わったら、開いている詳細とダイアログを閉じる (古いボタンを残さない)');
+  ok(/function historyCardHtml\(c\)/.test(html) && /これまでの作業 — このカード/.test(html)
+    && /const END_REASON = \{ done: 'できあがり', pause: '中断', admin: '職員が終了' \}/.test(html),
+    '詳細に「このカードの終わった作業」(誰が・いつ・何分・理由) を読むだけで出す');
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
