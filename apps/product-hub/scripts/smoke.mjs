@@ -1249,6 +1249,76 @@ check('effectiveShippingForDraft: 複合(1y8/1y5)は楽天=定形外 + yahooDeli
 check('複合選択肢の末尾バナーは定形外と同一',
   JSON.stringify(listing.trailingBannerLocations(listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').group))
   === JSON.stringify(listing.trailingBannerLocations('1')));
+
+// ─── 配送方法の値の意味 (2026-09-03 #1149) ───────────────────────
+// 楽天グループID と 画面の複合選択肢キー を1つの列に混ぜていたため、読む側の判断漏れで
+// 「複合選択肢を選ぶと楽天に出品できない」不具合が出た (#725)。値の解釈は
+// lib/shipping-groups.js の 1 関数だけが持ち、保存 (router) と出品 (buildItemPayload) の
+// 両方がそこを通る。**画面に出る選択肢は全部、出品まで通らなければならない**
+const shipGroups = await import('../lib/shipping-groups.js');
+check('toRakutenShippingGroup: 楽天IDはそのまま / 複合は楽天IDへ分解 + ヤフー配送を返す',
+  shipGroups.toRakutenShippingGroup('5').group === '5'
+  && shipGroups.toRakutenShippingGroup('5').yahooOverride === null
+  && shipGroups.toRakutenShippingGroup('1y5').group === '1'
+  && shipGroups.toRakutenShippingGroup('1y5').yahooOverride?.yahooDelivery === 'ネコポス'
+  && shipGroups.toRakutenShippingGroup('1y8').group === '1');
+check('toRakutenShippingGroup: 未指定は空 (店舗デフォルト) / 選択肢に無い値だけ ok=false',
+  shipGroups.toRakutenShippingGroup('').ok === true && shipGroups.toRakutenShippingGroup('').group === ''
+  && shipGroups.toRakutenShippingGroup(null).ok === true
+  && shipGroups.toRakutenShippingGroup('99').ok === false
+  && shipGroups.toRakutenShippingGroup('1y9').ok === false);
+check('shippingSelectValueOf: ヤフー別扱いのときだけ複合キーへ逆引きする',
+  shipGroups.shippingSelectValueOf('1', { shipping_override: 1, delivery_label: 'ネコポス' }) === '1y5'
+  && shipGroups.shippingSelectValueOf('1', { shipping_override: 1, delivery_label: '宅急便50サイズ以上' }) === '1y8'
+  // 別扱いでない / ヤフー配送を複合の既定値から変えた → 楽天IDのまま (プルダウンは定形外を指す)
+  && shipGroups.shippingSelectValueOf('1', { shipping_override: 0, delivery_label: 'ネコポス' }) === '1'
+  && shipGroups.shippingSelectValueOf('1', { shipping_override: 1, delivery_label: '宅急便' }) === '1'
+  && shipGroups.shippingSelectValueOf('5', null) === '5');
+{
+  // 総当たり: プルダウンに出る全選択肢で「出品が止まらない」「RMS へ出るのは楽天IDだけ」
+  const setGroup = db.prepare('UPDATE draft_rakuten SET shipping_method_group = ? WHERE draft_id = ?');
+  const blocked = [];
+  const leaked = [];
+  for (const choice of [...Object.keys(listing.SHIPPING_METHOD_GROUPS), ...Object.keys(listing.YAHOO_OVERRIDE_SHIPPING_GROUPS)]) {
+    setGroup.run(choice, rkId);
+    const b = listing.buildItemPayload(db, rkId);
+    if ((b.reasons || []).some((r) => r.includes('配送方法'))) blocked.push(choice);
+    const sent = b.payload?.variants?.['rk-smoke-1']?.shipping?.shippingMethodGroup;
+    if (sent !== undefined && !listing.SHIPPING_METHOD_GROUPS[sent]) leaked.push(`${choice}→${sent}`);
+  }
+  check('payload: 画面の配送方法の選択肢は全部そのまま出品できる (複合選択肢も含む)',
+    blocked.length === 0, `止まった選択肢: ${blocked.join(',')}`);
+  check('payload: RMS へ送る shippingMethodGroup は必ず楽天グループID (複合キーは漏らさない)',
+    leaked.length === 0, leaked.join(','));
+  // 複合を選んだときは楽天=定形外として出る (ページ表記・バナーと同じ扱い)
+  setGroup.run('1y5', rkId);
+  const bOv = listing.buildItemPayload(db, rkId);
+  check('payload: 複合(1y5)は楽天グループ1 (定形外) で送る',
+    bOv.ok === true && bOv.payload.variants['rk-smoke-1'].shipping.shippingMethodGroup === '1',
+    JSON.stringify(bOv.payload?.variants?.['rk-smoke-1']?.shipping || bOv.reasons));
+  setGroup.run(null, rkId);
+}
+{
+  // マイグレーション: 旧データ (複合キーが DB に残っている) を分解する
+  db.prepare('UPDATE draft_rakuten SET shipping_method_group = ? WHERE draft_id = ?').run('1y5', rkId);
+  db.prepare('UPDATE draft_yahoo SET delivery_label = NULL, shipping_override = 0 WHERE draft_id = ?').run(rkId);
+  const moved = dbmod.migrateCompositeShippingGroups(db);
+  const rkAfter = db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(rkId);
+  const yhAfter = db.prepare('SELECT delivery_label, shipping_override FROM draft_yahoo WHERE draft_id = ?').get(rkId);
+  check('migration: 複合キーは 楽天ID + ヤフー別扱いフラグ に分解される',
+    moved >= 1 && rkAfter.shipping_method_group === '1'
+    && yhAfter.shipping_override === 1 && yhAfter.delivery_label === 'ネコポス',
+    JSON.stringify({ moved, rkAfter, yhAfter }));
+  check('migration: 冪等 (複合キーが無ければ何もしない)', dbmod.migrateCompositeShippingGroups(db) === 0);
+  // 人が変えたヤフー配送は上書きしない
+  db.prepare('UPDATE draft_rakuten SET shipping_method_group = ? WHERE draft_id = ?').run('1y8', rkId);
+  db.prepare('UPDATE draft_yahoo SET delivery_label = ? WHERE draft_id = ?').run('宅急便', rkId);
+  dbmod.migrateCompositeShippingGroups(db);
+  check('migration: 既に入っているヤフーの配送方法は上書きしない',
+    db.prepare('SELECT delivery_label FROM draft_yahoo WHERE draft_id = ?').get(rkId).delivery_label === '宅急便');
+  db.prepare('UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id = ?').run(rkId);
+  db.prepare('UPDATE draft_yahoo SET delivery_label = NULL, shipping_override = 0 WHERE draft_id = ?').run(rkId);
+}
 // SKU画像 (2026-08-07): ファイル名→SKUコード照合キー
 check('skuImageKeyOfFileName: 拡張子除去+小文字化+trim',
   listing.skuImageKeyOfFileName('Sueders-DB.JPG') === 'sueders-db'
@@ -5229,7 +5299,7 @@ const renders = [
     rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null, shipping_method_group: '5', postage_included: 1, normal_delivery_date_id: '1000', white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://drive.google.com/file/d/gw/view', published_at: null }, cabinetImages: [],
     genreDict: { genreId: '205761', genreName: '入浴剤', genrePath: '美容・コスメ > 入浴剤', fixedAt: null, fetchedAt: '2026-07-28T00:00:00Z', attributes: [{ name: 'ブランド名', mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 3, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' }] },
     neCost: { costExTax: 660, shippingCost: 237, shippingMethod: 'ネコポス', taxPercent: 10 }, profitSim: { profit: 189, marginPct: 14.8, costIncTax: 726 }, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '1y5', ...pageInfoVars,
     // 商品ページ表記: 化粧品 + NE推測の配送で全分岐を描かせる
     pageInfo: { product_type: 'cosmetics', content_volume: '50ml', size_text: null, ingredients: '水', usage_notes: null, origin_type: '海外製', origin_country: 'フランス', category_label: '化粧品', seller_name: 'メーカーA', importer_name: '輸入者B', food_name: null, food_ingredients: null, food_expiry: null, food_storage: null },
     pageInfoHtml: '<table><tr><td>x</td></tr></table>',
@@ -5240,7 +5310,7 @@ const renders = [
       { id: 2, category_id: null, path: '猫用品 > ケア用品', is_active: 1, selected: 0 },
       { id: 3, category_id: null, path: '廃止された棚', is_active: 0, selected: 1 },
     ],
-    yahoo: { yahoo_price: 1980, yahoo_price_sagawa: null, delivery_label: 'ネコポス', tax_rate: '10%', yahoo_category_id: 43494, yahoo_path: 'おもちゃ' },
+    yahoo: { yahoo_price: 1980, yahoo_price_sagawa: null, delivery_label: 'ネコポス', shipping_override: 1, tax_rate: '10%', yahoo_category_id: 43494, yahoo_path: 'おもちゃ' },
     imageProduction: { status: '参考画像収集', importance_tier: 'そこそこ力を入れる（6〜8枚）', production_type: null, aplus_content: null, aplus_related: null, camera_instruction_url: null, shipping_status: null, reference_collection: null, designer: '外注_大川さん', page_composer: null, request_text: '依頼文' },
   }],
   ['detail.ejs (rakuten registered + shop categories)', 'detail.ejs', {
@@ -5257,7 +5327,7 @@ const renders = [
     cabinetImages: [{ id: 1, drive_file_id: 'gw' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     shopCategories: [
       { id: 1, category_id: null, path: '犬用品 > おやつ', is_active: 1, selected: 1 },
       { id: 2, category_id: null, path: '猫用品', is_active: 1, selected: 1 },
@@ -5276,7 +5346,7 @@ const renders = [
     cabinetImages: [{ id: 1, drive_file_id: 'g1' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     shopCategories: [],
     yahoo: { yahoo_price: null, yahoo_price_sagawa: null, delivery_label: null, tax_rate: '8%', yahoo_category_id: null, yahoo_path: null },
     imageProduction: null,
@@ -5289,7 +5359,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5306,7 +5376,7 @@ const renders = [
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5320,7 +5390,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5333,7 +5403,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5346,7 +5416,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5360,7 +5430,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5825,6 +5895,18 @@ for (const [name, file, data] of renders) {
     dh0.includes('id="f-amazon-open"')
     && /id="f-amazon-open"[\s\S]{0,140}display:none/.test(dh0),
     dh0.includes('f-amazon-open') ? '初期状態が隠れていない' : 'ボタンが無い');
+}
+
+// ─── 配送方法プルダウンの復元 (2026-09-03 #1149 / Codex R2 low) ───────────
+// DB には楽天IDしか無いので、画面に戻すのは router が逆引きした shippingSelectValue。
+// 「保存した複合選択肢が再表示で選ばれている」ことを HTML で確かめる
+{
+  const dh = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  const sel = dh.slice(dh.indexOf('id="rk-shipping-group"'), dh.indexOf('</select>', dh.indexOf('id="rk-shipping-group"')));
+  check('配送方法: 保存済みの複合選択肢が再表示で選ばれている',
+    /value="1y5"\s+selected/.test(sel) && !/value="1"\s+selected/.test(sel), sel.slice(0, 400));
+  check('配送方法: ヤフー別扱いの商品はヤフー欄が開いた状態で描かれる',
+    /let yahooOverrideOn = true/.test(dh));
 }
 
 // ─── 画面の直し 3 点 (2026-08-31 中原さんの実務フィードバック) ───
@@ -6383,6 +6465,54 @@ for (const [name, file, data] of renders) {
     check('HTTP 詳細画面の「公開で登録」: 途中で止まった商品は 400 (ロックを取る前に判定)',
       r.status === 400 && /途中で止まって/.test(r.json.error || '') && !bl.isRakutenListingInFlight(idS), JSON.stringify(r.json));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idS);
+
+    // ─── 配送方法の保存の往復 (2026-09-03 #1149 / Codex R1 high) ───────────
+    // 画面 → 保存 → 再表示 で状態が落ちないこと。DB には楽天IDだけを入れ、
+    // 「ヤフーだけ別配送」は draft_yahoo.shipping_override が持つ
+    {
+      const rkOf = (d) => db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(d);
+      const yhOf = (d) => db.prepare('SELECT delivery_label, shipping_override FROM draft_yahoo WHERE draft_id = ?').get(d);
+      const idShip = mkDraft('SHIP-HTTP');
+      // ① 複合選択肢を保存 → 楽天は '1' (定形外)、ヤフーは別扱い + 既定の配送方法
+      let rr = await call(`/api/drafts/${idShip}/rakuten`, { shipping_method_group: '1y5', yahoo_shipping_override: 1 });
+      check('HTTP 配送方法: 複合(1y5)は 楽天ID + ヤフー別扱い に分けて保存する',
+        rr.status === 200 && rkOf(idShip).shipping_method_group === '1'
+        && yhOf(idShip).shipping_override === 1 && yhOf(idShip).delivery_label === 'ネコポス',
+        JSON.stringify({ rk: rkOf(idShip), yh: yhOf(idShip), res: rr.json }));
+      check('HTTP 配送方法: 画面に戻すときは複合キーへ逆引きする',
+        shipGroups.shippingSelectValueOf(rkOf(idShip).shipping_method_group, yhOf(idShip)) === '1y5');
+      // ② プリセットの変更 (1y5 → 1y8) はヤフーの配送方法にも反映される
+      await call(`/api/drafts/${idShip}/rakuten`, { shipping_method_group: '1y8', shipping_method_group_prev: '1y5', yahoo_shipping_override: 1 });
+      check('HTTP 配送方法: 複合を選び直すとヤフーの配送方法も追従する (1y5→1y8)',
+        yhOf(idShip).delivery_label === '宅急便50サイズ以上' && rkOf(idShip).shipping_method_group === '1',
+        JSON.stringify(yhOf(idShip)));
+      // ③ ヤフーの配送方法を手で変えたあと、**プルダウンを触らずに**楽天項目を保存しても
+      //    手で入れた値は戻らない (画面はまだ 1y8 を指している = 選び直していない)
+      await call(`/api/drafts/${idShip}/yahoo`, { delivery_label: '宅急便', shipping_override: 1 });
+      await call(`/api/drafts/${idShip}/rakuten`, { shipping_method_group: '1y8', shipping_method_group_prev: '1y8', yahoo_shipping_override: 1 });
+      check('HTTP 配送方法: 複合を選び直していなければヤフーの配送方法は書き換えない',
+        yhOf(idShip).delivery_label === '宅急便' && yhOf(idShip).shipping_override === 1,
+        JSON.stringify(yhOf(idShip)));
+      // ④ 再表示すると複合キーへ逆引きできない (定形外表示) が、その状態で保存しても別扱いは残る
+      rr = await call(`/api/drafts/${idShip}/rakuten`, { shipping_method_group: '1', shipping_method_group_prev: '1', yahoo_shipping_override: 1 });
+      check('HTTP 配送方法: ヤフーの配送方法を変えた商品を楽天保存しても別扱いは残る',
+        yhOf(idShip).shipping_override === 1 && yhOf(idShip).delivery_label === '宅急便',
+        JSON.stringify(yhOf(idShip)));
+      // ⑤ 通常の配送方法へ戻す (画面のゲートも閉じる) = 別扱いの明示的な解除
+      await call(`/api/drafts/${idShip}/rakuten`, { shipping_method_group: '5', shipping_method_group_prev: '1', yahoo_shipping_override: 0 });
+      check('HTTP 配送方法: 通常の配送方法に戻すと別扱いが解除される (ヤフーの値は残す)',
+        rkOf(idShip).shipping_method_group === '5' && yhOf(idShip).shipping_override === 0
+        && yhOf(idShip).delivery_label === '宅急便', JSON.stringify(yhOf(idShip)));
+      // ⑥ ヤフー項目を先に保存しても別扱いが立つ (保存の順序に依存しない)
+      const idShip2 = mkDraft('SHIP-HTTP-2');
+      await call(`/api/drafts/${idShip2}/yahoo`, { delivery_label: 'ネコポス', shipping_override: 1 });
+      check('HTTP 配送方法: ヤフー項目を先に保存しても別扱いが記録される',
+        yhOf(idShip2).shipping_override === 1, JSON.stringify(yhOf(idShip2)));
+      // ⑦ 選択肢に無い値は 400 (保存しない)
+      rr = await call(`/api/drafts/${idShip2}/rakuten`, { shipping_method_group: '1y9' });
+      check('HTTP 配送方法: 選択肢に無い値は 400', rr.status === 400 && /配送方法/.test(rr.json.error || ''), JSON.stringify(rr.json));
+      db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idShip, idShip2);
+    }
     server.close();
     db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?)').run(id, idU, idL);
   }
@@ -6672,6 +6802,47 @@ for (const [name, file, data] of renders) {
       const ok2 = await fl2;
       check('sku-jan worker: 再送が通れば確定して flush=true', ok2 === true && h.posts.length === 3);
     }
+  }
+
+  // ─── 楽天項目の保存が「前回の選択」を進めること (2026-09-03 #1149 / Codex R3 high) ───
+  // この画面は保存後に再読み込みしない経路があるので、送れた配送方法まで shipSelectInitial を
+  // 進めないと、2 回目以降の保存で毎回「複合選択肢を選び直した」と誤判定してしまい、
+  // 人が直したヤフーの配送方法が既定値へ戻る
+  {
+    const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+    const start = src.indexOf('  async function postRakutenFields(');
+    // 終端は次のセクションの目印で取る (ファイルが CRLF なので改行の形に依存させない)
+    const end = src.indexOf('  // 公開 / 非公開の切り替え', start);
+    const chunk = start >= 0 && end > start ? src.slice(start, end) : '';
+    check('楽天保存: detail.ejs から postRakutenFields を切り出せる',
+      chunk.includes('shipSelectInitial = payload.shipping_method_group'), String(chunk.length));
+    check('楽天保存: 送信ペイロードに画面の初期選択が入る (サーバの「選び直したか」判定の材料)',
+      src.includes('shipping_method_group_prev: shipSelectInitial'));
+    const harness = (initial, selectValue, ok) => {
+      const posts = [];
+      const h = new Function('collectRakutenFields', 'post', 'BASE', 'initial', `
+        let shipSelectInitial = initial;
+        ${chunk}
+        return { call: postRakutenFields, get: () => shipSelectInitial };
+      `)(
+        () => ({ shipping_method_group: selectValue, shipping_method_group_prev: initial }),
+        async (_url, body) => { posts.push(body); return { ok }; },
+        '/ph',
+        initial,
+      );
+      return { h, posts };
+    };
+    const t1 = harness('1y5', '1y8', true);
+    await t1.h.call();
+    check('楽天保存: 保存できたら「前回の選択」を送った値まで進める',
+      t1.h.get() === '1y8' && t1.posts[0].shipping_method_group_prev === '1y5', JSON.stringify(t1.posts));
+    const t2 = harness('1y5', '1y8', false);
+    await t2.h.call();
+    check('楽天保存: 保存できなければ進めない (次の保存でも選び直しとして扱う)', t2.h.get() === '1y5');
+    const t3 = harness('1y8', '1y8', true);
+    await t3.h.call({ drop_legacy_catalog_attr: true });
+    check('楽天保存: 追加パラメータを渡す経路も同じ扱い',
+      t3.h.get() === '1y8' && t3.posts[0].drop_legacy_catalog_attr === true, JSON.stringify(t3.posts));
   }
 
   // ─── 単品 JAN の保存 (detail.ejs saveJanIfChanged) の時系列テスト (Codex R5 high) ───

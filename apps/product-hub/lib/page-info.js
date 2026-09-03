@@ -12,7 +12,8 @@
  *
  * 食品 (一般) は食品表示法ベースの項目 (名称/原材料名/賞味期限/保存方法/販売者) を載せる。
  */
-import { SHIPPING_METHOD_GROUPS } from '../services/rakuten-listing.js';
+// 配送方法グループの正本 (services/rakuten-listing.js から取ると循環参照になる)
+import { SHIPPING_METHOD_GROUPS } from './shipping-groups.js';
 
 export const PRODUCT_TYPES = {
   general: '雑貨・その他',
