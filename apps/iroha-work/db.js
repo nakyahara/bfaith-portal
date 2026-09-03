@@ -114,6 +114,102 @@ const labelWaitsDDL = (name) => `
     );`;
 const LABEL_INDEX_DDL = 'CREATE INDEX IF NOT EXISTS idx_iroha_label_waits_task ON f_iroha_label_waits(task_id, id);';
 
+// 作業時間セッション / 完成写真。⭐page_id は「Notion 時代の証跡」なので NULL 可 (アプリ正本のカードは task_id で紐づく)。
+// どちらも無い行は作れない (CHECK)。古い版 (page_id NOT NULL) は migrateSessionMediaSchema で作り直す
+const sessionsDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      page_id        TEXT,
+      task_id        INTEGER REFERENCES f_iroha_tasks(id),
+      product_code   TEXT,
+      title_snapshot TEXT,
+      worker_id      INTEGER NOT NULL,
+      worker_name    TEXT NOT NULL,
+      device_label   TEXT,
+      started_at     TEXT NOT NULL,
+      ended_at       TEXT,
+      end_reason     TEXT CHECK (end_reason IS NULL OR end_reason IN ('done','pause','admin')),
+      raw_seconds    INTEGER,
+      voided_at      TEXT,
+      voided_by      TEXT,
+      void_reason    TEXT,
+      master_snapshot TEXT,
+      CHECK (page_id IS NOT NULL OR task_id IS NOT NULL)
+    );`;
+const SESSIONS_INDEX_DDL = `
+    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_page ON f_iroha_work_sessions(page_id, id);
+    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_task ON f_iroha_work_sessions(task_id, id);`;
+const mediaDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id  TEXT NOT NULL UNIQUE,
+      page_id       TEXT,
+      task_id       INTEGER REFERENCES f_iroha_tasks(id),
+      product_code  TEXT,
+      kind          TEXT NOT NULL CHECK (kind IN ('photo','video')),
+      mime          TEXT,
+      size          INTEGER,
+      local_path    TEXT,
+      drive_file_id TEXT,
+      drive_url     TEXT,
+      status        TEXT NOT NULL CHECK (status IN ('stored','uploaded','synced')),
+      error         TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_retry_at TEXT,
+      worker_id     INTEGER,
+      worker_name   TEXT,
+      device_label  TEXT,
+      created_at    TEXT NOT NULL,
+      uploaded_at   TEXT,
+      synced_at     TEXT,
+      deleted_at    TEXT,
+      deleted_by    TEXT,
+      delete_token_hash  TEXT,
+      uploader_device_id INTEGER,
+      unavailable_at TEXT,
+      CHECK (page_id IS NOT NULL OR task_id IS NOT NULL)
+    );`;
+const MEDIA_INDEX_DDL = `
+    CREATE INDEX IF NOT EXISTS idx_iroha_media_page ON f_iroha_card_media(page_id, id);
+    CREATE INDEX IF NOT EXISTS idx_iroha_media_task ON f_iroha_card_media(task_id, id);`;
+
+/**
+ * 作業時間・写真の page_id を NULL 可にする作り直し (アプリ正本のカードは Notion ページを持たないため)。
+ * 既存行はそのまま移す (page_id は残る = Notion 時代の証跡)。列は「新 DDL と旧テーブルの共通列」だけコピーするので、
+ * 途中の版 (task_id が無い等) からでも通る。冪等
+ */
+function migrateSessionMediaSchema(db) {
+  const notNullPageId = (t) => db.prepare(`PRAGMA table_info(${t})`).all().some((c) => c.name === 'page_id' && c.notnull === 1);
+  const targets = [
+    { table: 'f_iroha_work_sessions', ddl: sessionsDDL, index: SESSIONS_INDEX_DDL },
+    { table: 'f_iroha_card_media', ddl: mediaDDL, index: MEDIA_INDEX_DDL },
+  ].filter((t) => notNullPageId(t.table));
+  if (targets.length === 0) return false;
+  const fkWasOn = db.pragma('foreign_keys', { simple: true }) === 1;
+  if (fkWasOn) db.pragma('foreign_keys = OFF');
+  try {
+    db.transaction(() => {
+      for (const { table, ddl, index } of targets) {
+        const tmp = `${table}__new`;
+        db.exec(ddl(tmp));
+        const newCols = db.prepare(`PRAGMA table_info(${tmp})`).all().map((c) => c.name);
+        const oldCols = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+        const cols = newCols.filter((c) => oldCols.has(c));
+        db.exec(`INSERT INTO ${tmp} (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM ${table}`);
+        db.exec(`DROP TABLE ${table}`);
+        db.exec(`ALTER TABLE ${tmp} RENAME TO ${table}`);
+        db.exec(index);
+      }
+      const bad = targets.flatMap((t) => db.pragma(`foreign_key_check(${t.table})`));
+      if (bad.length > 0) throw new Error(`作業時間・写真の作り直しを中止しました (FK 違反): ${JSON.stringify(bad.slice(0, 5))}`);
+    })();
+  } finally {
+    if (fkWasOn) db.pragma('foreign_keys = ON');
+  }
+  console.log(`[iroha-work] ${targets.map((t) => t.table).join(' / ')} の page_id を NULL 可にしました (アプリ正本のカード用)`);
+  return true;
+}
+
 // 「新しい定義」に必要な制約 (個別に検査 — 一部だけ足りない版も作り直す。Codex A1 R3 Low)
 const TASKS_REQUIRED_DDL = [
   /\(status = 'closed'\) = \(close_reason IS NOT NULL\)/, /\(status = 'closed'\) = \(closed_at IS NOT NULL\)/,
@@ -328,59 +424,19 @@ export function createTables(db = getMirrorDB()) {
     CREATE INDEX IF NOT EXISTS idx_iroha_events_page ON f_iroha_app_events(page_id, id);
 
     -- 作業時間セッション (要件定義 §4 / Codex R1 Q3)。個人単位 = 複数人同時作業は複数行。
-    -- ⭐v1 は Notion が正本なのでタスク表は無く、Notion の page_id に紐づける。
     --   raw_seconds はサーバー時刻の差分 (iPad の時計を信じない)。承認・補正 (approved) は後続PR。
     --   voided = 誤操作の論理削除 (行は消さず集計から外す — 実測値の除外フラグ)
-    CREATE TABLE IF NOT EXISTS f_iroha_work_sessions (
-      id             INTEGER PRIMARY KEY AUTOINCREMENT,
-      page_id        TEXT NOT NULL,
-      product_code   TEXT,
-      title_snapshot TEXT,
-      worker_id      INTEGER NOT NULL,
-      worker_name    TEXT NOT NULL,
-      device_label   TEXT,
-      started_at     TEXT NOT NULL,
-      ended_at       TEXT,
-      end_reason     TEXT CHECK (end_reason IS NULL OR end_reason IN ('done','pause','admin')),
-      raw_seconds    INTEGER,
-      voided_at      TEXT,
-      voided_by      TEXT,
-      void_reason    TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_page ON f_iroha_work_sessions(page_id, id);
+    --   紐づけ先: Notion 正本の間は page_id、アプリ正本のカードは task_id (v1.1)
+    ${sessionsDDL('f_iroha_work_sessions')}
+    ${SESSIONS_INDEX_DDL}
 
     -- 完成写真・動画 (要件定義 §6 / §1.7 ②outbox)。
     -- ⭐operation_id 付き outbox: 受信時にまず行を作り (status=stored, 実体は DATA_DIR)、
     --   Drive へは裏で送って成功するまで再試行する。再送されても operation_id で二重登録しない。
     --   URL だけを持ち、画像そのものは DB に入れない (Codex「写真をタスク列に詰めない」)。
     --   deleted_at = 論理削除 (撮り直し。物理削除はしない)
-    CREATE TABLE IF NOT EXISTS f_iroha_card_media (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      operation_id  TEXT NOT NULL UNIQUE,
-      page_id       TEXT NOT NULL,
-      product_code  TEXT,
-      kind          TEXT NOT NULL CHECK (kind IN ('photo','video')),
-      mime          TEXT,
-      size          INTEGER,
-      local_path    TEXT,
-      drive_file_id TEXT,
-      drive_url     TEXT,
-      status        TEXT NOT NULL CHECK (status IN ('stored','uploaded','synced')),
-      error         TEXT,
-      attempt_count INTEGER NOT NULL DEFAULT 0,
-      next_retry_at TEXT,
-      worker_id     INTEGER,
-      worker_name   TEXT,
-      device_label  TEXT,
-      created_at    TEXT NOT NULL,
-      uploaded_at   TEXT,
-      synced_at     TEXT,
-      deleted_at    TEXT,
-      deleted_by    TEXT,
-      delete_token_hash TEXT,
-      uploader_device_id INTEGER
-    );
-    CREATE INDEX IF NOT EXISTS idx_iroha_media_page ON f_iroha_card_media(page_id, id);
+    ${mediaDDL('f_iroha_card_media')}
+    ${MEDIA_INDEX_DDL}
 
     -- Notion「完成写真」貼り直しのページ単位キュー (Codex PR3 #1: 最後の1件を削除したときも
     -- 「空にする」PATCH が必要 — メディア行の状態だけでは表現できない)。
@@ -449,9 +505,11 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_work_sessions', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
   addCol('f_iroha_card_media', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
   addCol('f_iroha_app_events', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
+  // 古い版 (page_id NOT NULL) の作業時間・写真は作り直す — アプリ正本のカードは Notion ページを持たない (A1b)
+  migrateSessionMediaSchema(db);
   db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_task ON f_iroha_work_sessions(task_id, id);
-    CREATE INDEX IF NOT EXISTS idx_iroha_media_task ON f_iroha_card_media(task_id, id);
+    ${SESSIONS_INDEX_DDL}
+    ${MEDIA_INDEX_DDL}
     CREATE INDEX IF NOT EXISTS idx_iroha_events_task ON f_iroha_app_events(task_id, id);
   `);
   // video_url は inbound-check 側でも足すが、いろは単独経路の起動でも保証する
@@ -657,16 +715,18 @@ export const SESSION_WARN_HOURS = 6;
  * 作業開始。⭐1作業者につき活動中セッションは1件 (要件定義 §1.7 ⑤)。
  * 別カードで作業中なら busy (どのカードかを返す — 画面が誘導する)
  */
-export function startSession({ pageId, productCode = null, title = null, worker, deviceLabel = null, masterSnapshot = undefined }) {
+export function startSession({ pageId = null, taskId = null, productCode = null, title = null, worker, deviceLabel = null, masterSnapshot = undefined }) {
   const db = getDB();
   const now = utcNow();
+  if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
   return db.transaction(() => {
-    const open = db.prepare(`SELECT id, page_id, title_snapshot, started_at FROM f_iroha_work_sessions
+    const open = db.prepare(`SELECT id, page_id, task_id, title_snapshot, started_at FROM f_iroha_work_sessions
       WHERE worker_id = ? AND ended_at IS NULL`).get(worker.id);
     if (open) {
       // 同じカードなら成功扱いで既存セッションを返す (応答が消えた再送で
       // 「実際は動いているのに開始できない」状態にしない — Codex PR2 #2)
-      if (open.page_id === pageId) return { ok: true, already: true, sessionId: open.id, startedAt: open.started_at };
+      const same = taskId != null ? Number(open.task_id) === Number(taskId) : open.page_id === pageId;
+      if (same) return { ok: true, already: true, sessionId: open.id, startedAt: open.started_at };
       return { ok: false, error: 'busy', open,
         message: `「${open.title_snapshot || '別のカード'}」の作業がまだ終わっていません。先にそちらを終了・中断してください` };
     }
@@ -685,9 +745,9 @@ export function startSession({ pageId, productCode = null, title = null, worker,
       }
     }
     const info = db.prepare(`INSERT INTO f_iroha_work_sessions
-      (page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, master_snapshot)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(pageId, productCode, title, worker.id, worker.display_name, deviceLabel, now, snapshot);
+      (page_id, task_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, master_snapshot)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(pageId, taskId == null ? null : Number(taskId), productCode, title, worker.id, worker.display_name, deviceLabel, now, snapshot);
     return { ok: true, sessionId: Number(info.lastInsertRowid), startedAt: now };
   }).immediate();
 }
@@ -699,17 +759,19 @@ export function startSession({ pageId, productCode = null, title = null, worker,
  * raw_seconds はサーバー時刻の差分で確定する (上書きしない)。
  * @returns {ok, session, remainingActive} remainingActive = このカードでまだ作業中の人数
  */
-export function stopSession({ pageId, workerId, sessionId, reason }) {
+export function stopSession({ pageId = null, taskId = null, workerId, sessionId, reason }) {
   if (reason !== 'done' && reason !== 'pause') return { ok: false, error: 'bad_request', message: '終了の種類が不正です' };
   const sid = Number(sessionId);
   if (!Number.isInteger(sid) || sid <= 0) return { ok: false, error: 'bad_request', message: 'session_id が必要です (画面を更新してください)' };
   const db = getDB();
   const now = utcNow();
+  const byTask = taskId != null;
   return db.transaction(() => {
-    const remainingOn = () => db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE page_id = ? AND ended_at IS NULL')
-      .get(pageId).c;
+    const remainingOn = () => db.prepare(`SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE ${byTask ? 'task_id = ?' : 'page_id = ?'} AND ended_at IS NULL`)
+      .get(byTask ? Number(taskId) : pageId).c;
     const row = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(sid);
-    if (!row || row.page_id !== pageId || row.worker_id !== Number(workerId)) {
+    const sameCard = row && (byTask ? Number(row.task_id) === Number(taskId) : row.page_id === pageId);
+    if (!row || !sameCard || row.worker_id !== Number(workerId)) {
       return { ok: false, error: 'not_started', message: 'このカードで作業をはじめた記録がありません (画面を更新してください)' };
     }
     if (row.ended_at) {
@@ -729,9 +791,20 @@ export function stopSession({ pageId, workerId, sessionId, reason }) {
 export function activeSessionsByPage() {
   const map = new Map();
   for (const r of getDB().prepare(`SELECT id, page_id, worker_id, worker_name, started_at
-    FROM f_iroha_work_sessions WHERE ended_at IS NULL ORDER BY started_at`).all()) {
+    FROM f_iroha_work_sessions WHERE ended_at IS NULL AND page_id IS NOT NULL ORDER BY started_at`).all()) {
     if (!map.has(r.page_id)) map.set(r.page_id, []);
     map.get(r.page_id).push(r);
+  }
+  return map;
+}
+
+/** 同上。アプリ正本のカード用に task_id で引く */
+export function activeSessionsByTask() {
+  const map = new Map();
+  for (const r of getDB().prepare(`SELECT id, task_id, worker_id, worker_name, started_at
+    FROM f_iroha_work_sessions WHERE ended_at IS NULL AND task_id IS NOT NULL ORDER BY started_at`).all()) {
+    if (!map.has(r.task_id)) map.set(r.task_id, []);
+    map.get(r.task_id).push(r);
   }
   return map;
 }
@@ -741,10 +814,11 @@ export function activeSessionsByPage() {
  * @returns Map<code_key, { avgSeconds, cards, lastSeconds }>
  */
 export function estimateByProduct() {
-  const rows = getDB().prepare(`SELECT LOWER(TRIM(product_code)) AS k, page_id, SUM(raw_seconds) AS total, MAX(ended_at) AS last_end
+  // カード単位 = task_id (アプリ正本) か page_id (Notion 時代)。同じカードの複数人・複数回を 1 件にまとめる
+  const rows = getDB().prepare(`SELECT LOWER(TRIM(product_code)) AS k, COALESCE('t' || task_id, page_id) AS card, SUM(raw_seconds) AS total, MAX(ended_at) AS last_end
     FROM f_iroha_work_sessions
     WHERE ended_at IS NOT NULL AND voided_at IS NULL AND product_code IS NOT NULL AND raw_seconds > 0
-    GROUP BY LOWER(TRIM(product_code)), page_id`).all();
+    GROUP BY LOWER(TRIM(product_code)), COALESCE('t' || task_id, page_id)`).all();
   const byCode = new Map();
   for (const r of rows) {
     if (!byCode.has(r.k)) byCode.set(r.k, []);

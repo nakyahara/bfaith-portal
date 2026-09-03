@@ -169,7 +169,7 @@ initMirrorDB();
 const { getDB, replaceCache, listCache, addIrohaWorker, setIrohaWorkerActive, getIrohaWorker, listIrohaWorkers,
   setWorkerPin, verifyWorkerPin, _clearPinFails,
   createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents,
-  startSession, stopSession, activeSessionsByPage, estimateByProduct, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
+  startSession, stopSession, activeSessionsByPage, activeSessionsByTask, estimateByProduct, getMeta, setMetaValue, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
 const { ensureFresh, refreshFromNotion, changeStatus, fetchCardLive, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
 const { buildList, priorityOf, clearEnrichCache, previousPhotosOf } = await import('../apps/iroha-work/service.js');
 
@@ -1159,6 +1159,122 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
     ok(db.pragma('foreign_keys', { simple: true }) === 1 && db.pragma('foreign_key_check').length === 0, 'foreign_keys は ON に戻り、FK 違反は無い');
     createTables(db);
     ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_tasks%'").get().c === 1, '2 回目は何もしない (冪等)');
+  }
+}
+
+console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧・作業時間・写真・作り直し');
+{
+  const T = await import('../apps/iroha-work/tasks.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const S = await import('../apps/iroha-work/service.js');
+  const { addMedia, mediaByTask, _setDriveUpload, processMediaQueue } = await import('../apps/iroha-work/media.js');
+  const db = getDB();
+  const w1 = listIrohaWorkers(true).find(w => w.display_name === 'やまだ');
+  const w2 = listIrohaWorkers(true).find(w => w.display_name === 'すずき');
+
+  // 一覧 (アプリ正本): 未完了だけ・拠点・保留理由つきラベル・今日やるが先頭
+  const mk = (over = {}) => TD.upsertTaskFromImport({
+    notion_page_id: over.page || null, status: over.status || 'not_started', facility_code: over.facility || 'iroha',
+    hold_reason_code: over.hold || null, hold_reason_note: over.holdNote || null,
+    destination_id: over.dest ?? null, product_code: over.code || 'PROD-A', product_name: over.name || '一覧テスト',
+    qty: over.qty ?? 10, arrival_date: over.arrival || '2026-09-01',
+    master_snapshot: over.snapshot === undefined ? { material_code: 'D-8', units_per_container: 180 } : over.snapshot,
+    closed_at: over.status === 'closed' ? '2026-09-03T00:00:00.000Z' : null, close_reason: over.close || null,
+  }, { batchId: 'test-a1b' }).id;
+  const tOpen = mk({ page: 'a1b-open', code: 'PROD-A', name: '未着手カード', dest: 8801 });
+  const tHold = mk({ page: 'a1b-hold', status: 'on_hold', hold: 'label_shortage', code: 'PROD-B', name: 'ラベル待ち', dest: 8802 });
+  const tExt = mk({ page: 'a1b-ext', status: 'in_progress', facility: 'rashinban', code: 'PROD-C', name: '外部で作業中', dest: 8803 });
+  const tDone = mk({ page: 'a1b-done', status: 'closed', close: 'stocked', code: 'PROD-D', name: '終了ずみ', dest: 8804 });
+  clearEnrichCache();
+  const list = S.buildTaskList();
+  const byId = (id) => list.cards.find(c => c.id === id);
+  ok(list.mode === 'app' && list.cards.length >= 3 && !byId(tDone), 'アプリ正本の一覧: 未完了だけ (終了は出ない)');
+  ok(byId(tOpen).id === tOpen && byId(tOpen).status === 'not_started' && byId(tOpen).status_label === '未着手' && byId(tOpen).version >= 1,
+    'カードは id・状態・表示名・version を持つ');
+  ok(byId(tHold).status_label === '保留 · ラベル待ち' && byId(tHold).hold_reason_code === 'label_shortage', '保留は理由つきの表示名');
+  ok(byId(tExt).facility_code === 'rashinban', '拠点を持つ (外部施設のバッジ用)');
+  ok(byId(tOpen).master.material_code === 'D-8' && byId(tOpen).master.units_per_container === 180, '作業仕様は作成時スナップショットから (masterOfTask)');
+  ok(Array.isArray(list.statuses) && list.statuses[0].value === 'not_started' && list.transitions.not_started.includes('in_progress')
+    && list.holdReasons.some(r => r.value === 'label_shortage') && list.closeReasons.some(r => r.value === 'stocked')
+    && list.facilities.length === 5 && /^\d{4}-\d{2}-\d{2}$/.test(list.today),
+    '画面に必要な選択肢 (状態・遷移・保留理由・終了理由・拠点・今日) を返す');
+
+  // 「今日やる」は一覧の先頭
+  const planned = TD.setPlannedDate({ taskId: tHold, plannedDate: S.jstToday(), expectVersion: TD.getTask(tHold).version, actor: 'test' });
+  ok(planned.ok, '前提: 「今日やる」を付ける');
+  clearEnrichCache();
+  const list2 = S.buildTaskList();
+  ok(list2.cards[0].id === tHold && list2.cards[0].today === true, '「今日やる」が一覧の先頭に来る');
+  ok(S.jstToday(new Date('2026-09-03T15:30:00Z')) === '2026-09-04', 'jstToday は JST で日付を出す (UTC 15:30 = 翌日)');
+
+  // 作業時間 (task_id)。page_id のセッションと混ざらない
+  const s1 = startSession({ taskId: tOpen, productCode: 'PROD-A', title: '未着手カード', worker: getIrohaWorker(w1.id) });
+  ok(s1.ok && !s1.already, 'task で作業開始');
+  ok(startSession({ taskId: tOpen, worker: getIrohaWorker(w1.id) }).already === true, '同じ task の再送は既存を返す');
+  const busy = startSession({ taskId: tExt, worker: getIrohaWorker(w1.id) });
+  ok(busy.ok === false && busy.error === 'busy', '別の task では二重に始められない');
+  const s2 = startSession({ taskId: tOpen, productCode: 'PROD-A', worker: getIrohaWorker(w2.id) });
+  ok(s2.ok && activeSessionsByTask().get(tOpen).length === 2, '複数人が同じ task で作業できる');
+  ok(!activeSessionsByPage().has(String(tOpen)), 'task のセッションは page 側の一覧に出ない');
+  const wrongCard = stopSession({ taskId: tExt, workerId: w1.id, sessionId: s1.sessionId, reason: 'done' });
+  ok(wrongCard.ok === false && wrongCard.error === 'not_started', '別カードの id では終了できない');
+  const st1 = stopSession({ taskId: tOpen, workerId: w1.id, sessionId: s1.sessionId, reason: 'done' });
+  ok(st1.ok && st1.remainingActive === 1, 'task で終了 (残りの作業者を数える)');
+  stopSession({ taskId: tOpen, workerId: w2.id, sessionId: s2.sessionId, reason: 'done' });
+  ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND page_id IS NULL').get(tOpen).c === 2,
+    'アプリ正本のセッションは page_id なしで記録される');
+
+  // 実測 (カード単位) は task ベースでも数えられる
+  db.prepare("UPDATE f_iroha_work_sessions SET raw_seconds = 600, ended_at = '2026-09-03T01:00:00.000Z' WHERE task_id = ?").run(tOpen);
+  const est = estimateByProduct().get('prod-a');
+  ok(est && est.cards >= 1 && est.avgSeconds > 0, '実測の集計に task のカードが入る');
+
+  // 写真 (task_id)。「前回の完成形」は同じ商品の別 task から
+  _setDriveUpload(async ({ operationId }) => ({ fileId: `f-${operationId}`, url: `https://drive/${operationId}` }));
+  const jpeg = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(64, 1)]);
+  const tmp2 = (name) => { const p = path.join(process.env.DATA_DIR, name); fs.writeFileSync(p, jpeg); return p; };
+  const m1 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('a1b1.jpg'), worker: getIrohaWorker(w1.id), operationId: 'op-a1b-0001' });
+  ok(m1.ok && mediaByTask().get(tOpen).length === 1, 'task に写真が付く');
+  await processMediaQueue();
+  const tNext = mk({ page: 'a1b-next', code: 'PROD-A', name: '次の入荷 (同じ商品)', dest: 8805 });
+  clearEnrichCache();
+  const prev = S.buildTaskList().cards.find(c => c.id === tNext).previous_photos;
+  ok(prev.length === 1 && prev[0].id === m1.media.id, '同じ商品の別 task の写真が「前回の完成形」に出る');
+  ok(S.buildTaskList().cards.find(c => c.id === tOpen).previous_photos.length === 0, '自分の task の写真は「前回」に含めない');
+  _setDriveUpload(null);
+
+  // 正本の切替 (meta)
+  ok(getMeta('source_of_truth') == null, '既定は Notion 正本 (meta 未設定)');
+  setMetaValue('source_of_truth', 'app');
+  ok(getMeta('source_of_truth') === 'app', '切替は meta に持つ (再起動しても続く)');
+  setMetaValue('source_of_truth', null);
+
+  // 古い版 (page_id NOT NULL) の作業時間・写真は起動時に作り直す
+  {
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    const nS = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c;
+    const nM = db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media').get().c;
+    db.pragma('foreign_keys = OFF');
+    db.exec(`CREATE TABLE s__old AS SELECT * FROM f_iroha_work_sessions; DROP TABLE f_iroha_work_sessions;
+      CREATE TABLE f_iroha_work_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, page_id TEXT NOT NULL, product_code TEXT, title_snapshot TEXT,
+        worker_id INTEGER NOT NULL, worker_name TEXT NOT NULL, device_label TEXT, started_at TEXT NOT NULL, ended_at TEXT, end_reason TEXT,
+        raw_seconds INTEGER, voided_at TEXT, voided_by TEXT, void_reason TEXT, master_snapshot TEXT, task_id INTEGER);
+      INSERT INTO f_iroha_work_sessions (id, page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, ended_at,
+        end_reason, raw_seconds, voided_at, voided_by, void_reason, master_snapshot, task_id)
+        SELECT id, COALESCE(page_id, 'legacy-' || id), product_code, title_snapshot, worker_id, worker_name, device_label, started_at, ended_at,
+        end_reason, raw_seconds, voided_at, voided_by, void_reason, master_snapshot, task_id FROM s__old;
+      DROP TABLE s__old;`);
+    db.pragma('foreign_keys = ON');
+    ok(db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().some(c => c.name === 'page_id' && c.notnull === 1), '前提: 古い版は page_id NOT NULL');
+    createTables(db);
+    ok(!db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().some(c => c.name === 'page_id' && c.notnull === 1), 'page_id を NULL 可に作り直す');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c === nS && db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media').get().c === nM, '行はそのまま残る');
+    ok(db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_iroha_sessions_task'").get(), '索引も作り直される');
+    let bothNull = null;
+    try { db.prepare("INSERT INTO f_iroha_work_sessions (worker_id, worker_name, started_at) VALUES (1, 'x', 'y')").run(); } catch (e) { bothNull = e; }
+    ok(bothNull && /CHECK/.test(bothNull.message), 'page_id も task_id も無い行は入らない (CHECK)');
+    createTables(db);
+    ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_work_sessions%'").get().c === 1, '2 回目は何もしない (冪等)');
   }
 }
 

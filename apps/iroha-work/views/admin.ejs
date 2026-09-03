@@ -96,6 +96,22 @@
         <input type="text" id="migConfirm" placeholder="本取込するには APPLY と入力" maxlength="10">
         <button onclick="migApply()">📥 本取込</button>
       </div>
+
+      <h3 style="margin:16px 0 6px">正本の切替</h3>
+      <p class="hint">
+        いまの正本 = <b><%= source === 'app' ? 'アプリ (f_iroha_tasks)' : 'Notion' %></b>。
+        アプリに切り替えると iPad は tasks を読み書きし、<b>Notion を一切見なくなります</b> (カードの更新も止まります)。
+        切替前に「調査 → 本取込」で件数を合わせてください。問題があれば Notion に戻せます (アプリ側の変更は tasks に残ります)。
+      </p>
+      <div class="row">
+        <input type="text" id="srcConfirm" placeholder="切り替えるには SWITCH と入力" maxlength="10">
+        <% if (source === 'app') { %>
+          <button onclick="switchSource('notion')">↩ Notion に戻す</button>
+        <% } else { %>
+          <button onclick="switchSource('app')">🚀 アプリを正本にする</button>
+        <% } %>
+        <span class="msg" id="srcMsg"></span>
+      </div>
       <pre id="migOut" style="white-space:pre-wrap;font-size:.82rem;background:#f6f7f9;border:1px solid #dde;border-radius:6px;padding:10px;max-height:420px;overflow:auto;display:none"></pre>
     </div>
     <% } %>
@@ -325,6 +341,16 @@
       migShow(json);
       document.getElementById('migConfirm').value = '';
       document.getElementById('migSince').value = json.nextSince || '';
+    }
+    async function switchSource(to) {
+      const confirm = document.getElementById('srcConfirm').value.trim();
+      if (confirm !== 'SWITCH') { setMsg('srcMsg', 'err', '切り替えるには SWITCH と入力してください'); return; }
+      const label = to === 'app' ? 'アプリ (f_iroha_tasks)' : 'Notion';
+      if (!window.confirm('正本を「' + label + '」に切り替えます。iPad の表示・記録先が変わります。よろしいですか?')) return;
+      const { json } = await post('/admin/source', { to, confirm });
+      if (!json.ok) { setMsg('srcMsg', 'err', json.message || '切り替えできませんでした'); return; }
+      setMsg('srcMsg', 'ok', '正本を ' + label + ' に切り替えました');
+      setTimeout(() => location.reload(), 800);
     }
     async function addOption(kind) {
       const code = document.getElementById('opt-' + kind).value.trim();

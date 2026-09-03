@@ -87,6 +87,8 @@
   .tag.urgent{background:var(--amber-soft);color:var(--amber)}
   .tag.new{background:var(--ok-soft);color:var(--ok)}
   .tag.miss{background:var(--danger-soft);color:var(--danger)}
+  .tag.today{background:var(--accent-soft);color:var(--accent)}
+  .tag.ext{background:var(--amber-soft);color:var(--amber)}
   .st{flex:none;font-size:.8rem;font-weight:700;border-radius:var(--r-sm);padding:6px 10px;cursor:pointer;
     border:1px solid transparent;white-space:nowrap;font-family:var(--font)}
   .st.todo{background:var(--well);color:var(--sub);border-color:var(--line)}
@@ -265,7 +267,7 @@
         <input id="pinIn" class="pin" type="tel" inputmode="numeric" maxlength="8" placeholder="****" autocomplete="off">
       </div>
       <div class="mbtns"><button class="btn" id="stCancel" onclick="closeSt()">やめる</button></div>
-      <p class="hint">ここで変えると、Notionのカードのステータスもそのまま変わります。<br>
+      <p class="hint" id="stHint">ここで変えると、Notionのカードのステータスもそのまま変わります。<br>
         「棚入完了」にすると一覧から外れます。「棚入完了」への変更・取り消しは職員の方だけができます (職員PINが必要)。</p>
     </div>
   </div>
@@ -330,10 +332,23 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 // ステータス → 見た目クラス (未知のステータスは other で「すべて」にだけ出る)
-const ST_CLASS = { '未着手':'todo', '作業中':'doing', '中断':'pause', '棚入完了':'done' };
+// 状態 → 見た目クラス。Notion 正本 (日本語) とアプリ正本 (値) の両方を引ける
+const ST_CLASS = {
+  '未着手': 'todo', '作業中': 'doing', '中断': 'pause', '棚入完了': 'done',
+  not_started: 'todo', in_progress: 'doing', on_hold: 'pause', ready_for_stocking: 'done', closed: 'done',
+};
 const stClass = s => ST_CLASS[s] || 'other';
+/** 画面に出す状態名 (アプリ正本は「保留 · ラベル待ち」のように理由つき) */
+const stLabel = c => c.status_label || c.status || '—';
+const isApp = () => state.mode === 'app';
+/** 状態の値 → 表示名 (タブ・変更ダイアログ用) */
+function stName(v) {
+  const found = (state.statuses || []).find(s => (s && s.value) === v);
+  if (found) return found.label;
+  return ({ not_started: '未着手', in_progress: '作業中', on_hold: '保留', ready_for_stocking: '棚入待ち', closed: '終了' })[v] || v;
+}
 
-let state = { cards: [], statuses: [], changeTargets: [], workers: [], refresh: {}, me: {} };
+let state = { mode: 'notion', cards: [], statuses: [], changeTargets: [], workers: [], refresh: {}, me: {} };
 let curTab = 'all';
 let curDetail = null;      // 開いている詳細の page_id
 let worker = null;         // { id, display_name, worker_type }
@@ -441,17 +456,20 @@ const isDown = j => j && (j.error === 'server_down' || j.error === 'network' || 
 const SNAP_KEY = 'iw_state_snapshot';
 function saveSnapshot(j) {
   try {
-    localStorage.setItem(SNAP_KEY, JSON.stringify({ at: Date.now(), cards: j.cards, statuses: j.statuses,
-      changeTargets: j.changeTargets, workers: j.workers, refresh: j.refresh }));
+    localStorage.setItem(SNAP_KEY, JSON.stringify({ at: Date.now(), mode: j.mode, cards: j.cards, statuses: j.statuses,
+      changeTargets: j.changeTargets, transitions: j.transitions, holdReasons: j.holdReasons, closeReasons: j.closeReasons,
+      facilities: j.facilities, today: j.today, workers: j.workers, refresh: j.refresh }));
   } catch (e) { /* 容量超過・プライベートモードなどは諦める (次の取得で出る) */ }
 }
 function restoreSnapshot() {
   let s = null;
   try { s = JSON.parse(localStorage.getItem(SNAP_KEY) || 'null'); } catch (e) { return false; }
   if (!s || !Array.isArray(s.cards)) return false;
-  state = { cards: s.cards, statuses: s.statuses || [], changeTargets: s.changeTargets || [],
+  state = { mode: s.mode || 'notion', cards: s.cards, statuses: s.statuses || [], changeTargets: s.changeTargets || [],
+    transitions: s.transitions || {}, holdReasons: s.holdReasons || [], closeReasons: s.closeReasons || [],
+    facilities: s.facilities || [], today: s.today || null,
     workers: s.workers || [], refresh: s.refresh || {}, me: {} };
-  renderTabs(); renderList(); restoreWorker();
+  renderModeTexts(); renderTabs(); renderList(); restoreWorker();
   $('#syncTxt').textContent = '前回取得 ' + fmtTime(new Date(s.at).toISOString()) + ' の一覧 · 最新を確認中…';
   return true;
 }
@@ -501,13 +519,26 @@ async function loadStateOnce() {
   saveSnapshot(j);
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
   renderSync();
+  renderModeTexts();
   renderTabs();
   renderList();
   restoreWorker();
   if (curDetail) {
-    const c = state.cards.find(x => x.page_id === curDetail);
+    const c = state.cards.find(x => x.id === curDetail);
     if (c) renderDetail(c);
   }
+}
+
+/** 正本モードで変わる固定文言 (状態変更ダイアログの注意書き・更新ボタン) */
+function renderModeTexts() {
+  const hint = document.getElementById('stHint');
+  if (hint) {
+    hint.innerHTML = isApp()
+      ? '「終了」にすると一覧から外れます (履歴には残ります)。<br>終了・取消と、終了からのやり直しは職員の方だけができます (職員PINが必要)。'
+      : 'ここで変えると、Notionのカードのステータスもそのまま変わります。<br>「棚入完了」にすると一覧から外れます。「棚入完了」への変更・取り消しは職員の方だけができます (職員PINが必要)。';
+  }
+  const rb = document.getElementById('refreshBtn');
+  if (rb) rb.style.display = isApp() ? 'none' : '';   // アプリ正本では取りに行く先が無い
 }
 
 function fmtTime(iso) {
@@ -515,25 +546,34 @@ function fmtTime(iso) {
   try { return new Date(iso).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' }); } catch (e) { return '—'; }
 }
 
+const facilityName = (code) => ((state.facilities || []).find(f => f.code === code) || {}).name || code;
+
 function renderSync() {
   const rf = state.refresh || {};
-  let txt = 'SYNC ' + fmtTime(rf.lastRefreshAt) + ' · ' + state.cards.length + ' CARDS · 状態の札をタップで変更 (Notionにも反映)';
+  let txt = isApp()
+    ? state.cards.length + ' CARDS · 状態の札をタップで変更'
+    : 'SYNC ' + fmtTime(rf.lastRefreshAt) + ' · ' + state.cards.length + ' CARDS · 状態の札をタップで変更 (Notionにも反映)';
   $('#syncTxt').textContent = txt;
   if (rf.error) showErr('Notionから最新を取得できませんでした (前回取得分を表示しています)', rf.error);
   if (rf.truncated) showWarn('カードが件数上限を超えているため最新化できていません (前回取得分を表示中。職員の方は管理画面を確認してください)');
 }
 
 // ─── タブ・一覧 ───
+/** タブの [値, 表示名]。Notion 正本は文字列配列、アプリ正本は {value,label} 配列 */
+function statusTabs() {
+  return (state.statuses || []).map(s => (typeof s === 'string' ? [s, s] : [s.value, s.label]));
+}
+
 function counts() {
   const c = { all: state.cards.length };
-  for (const s of state.statuses) c[s] = 0;
+  for (const [v] of statusTabs()) c[v] = 0;
   for (const card of state.cards) if (c[card.status] != null) c[card.status]++;
   return c;
 }
 
 function renderTabs() {
   const c = counts();
-  const tabs = [['all', 'すべて'], ...state.statuses.map(s => [s, s])];
+  const tabs = [['all', 'すべて'], ...statusTabs()];
   $('#tabs').innerHTML = tabs.map(([key, label]) =>
     '<button class="chip' + (curTab === key ? ' on' : '') + '" onclick="pickTab(\'' + esc(key) + '\')">' +
     esc(label) + ' <span class="num">' + (c[key] ?? 0) + '</span></button>').join('');
@@ -551,6 +591,10 @@ function masterSummary(c) {
 
 function rowTags(c) {
   let h = '';
+  if (c.today) h += '<span class="tag today">📌 今日やる</span>';
+  if (c.cancellation_requested_at) h += '<span class="tag urgent">⚠ 取消の確認待ち</span>';
+  if (c.migration_review) h += '<span class="tag miss">❓ 状態の確認待ち</span>';
+  if (c.facility_code && c.facility_code !== 'iroha') h += '<span class="tag ext">🏢 ' + esc(facilityName(c.facility_code)) + '</span>';
   if (c.priority.kind === 'urgent') h += '<span class="tag urgent">🔥 急ぎ・' + esc(c.priority.label) + '</span>';
   if (c.priority.kind === 'new') h += '<span class="tag new">🌱 新商品</span>';
   if (c.master.missing.length > 0) h += '<span class="tag miss">⚠ ' + esc(c.master.missing.join('・')) + ' 未登録</span>';
@@ -590,12 +634,12 @@ function renderList() {
       c.external_text ? esc(c.external_text) : null,
       c.expiry ? '📅 期限 ' + esc(c.expiry) : null,
     ].filter(Boolean).join(' ・ ');
-    return '<div class="row" onclick="openDetail(\'' + esc(c.page_id) + '\')">' +
+    return '<div class="row" onclick="openDetail(\'' + esc(c.id) + '\')">' +
       '<div class="thumb">' + thumbHtml(c) + '</div>' +
       '<div class="bd"><h2>' + rowTags(c) + esc(c.title) + '</h2>' +
       '<div class="meta num">' + meta + '</div>' +
       (meta2 ? '<div class="meta2 num">' + meta2 + '</div>' : '') + '</div>' +
-      '<button class="st ' + stClass(c.status) + '" onclick="openSt(event,\'' + esc(c.page_id) + '\')">' + esc(c.status) + ' ▾</button>' +
+      '<button class="st ' + stClass(c.status) + '" onclick="openSt(event,\'' + esc(c.id) + '\')">' + esc(stLabel(c)) + ' ▾</button>' +
       '<span class="chev">›</span></div>';
   }).join('');
 }
@@ -619,7 +663,7 @@ async function forceRefresh() {
 
 // ─── 詳細 ───
 function openDetail(pageId) {
-  const c = state.cards.find(x => x.page_id === pageId);
+  const c = state.cards.find(x => x.id === pageId);
   if (!c) return;
   curDetail = pageId;
   renderDetail(c);
@@ -661,7 +705,7 @@ function kv(label, value, opts) {
 
 function renderDetail(c) {
   const st = $('#dstate');
-  st.textContent = c.status + ' ▾';
+  st.textContent = stLabel(c) + ' ▾';
   st.className = 'st ' + stClass(c.status);
 
   const m = c.master;
@@ -701,7 +745,7 @@ function renderDetail(c) {
       '<p class="nlink">空欄への登録はだれでもできます。入っている値の変更は職員の方が「✎ 編集」から (PINが必要)。</p>' +
       (m.source === 'card'
         ? '<p class="nlink">※作業仕様マスタに未登録のため、カード作成時の値を表示しています。登録すると次回からマスタの値になります。</p>' : '') +
-      '<p class="nlink">くわしくは 🗂 ' + (c.url ? '<a href="' + esc(c.url) + '" target="_blank" rel="noopener">Notionのカードを開く</a>' : 'Notionのカード (リンクなし)') + '</p>' +
+      (c.url ? '<p class="nlink">🗂 <a href="' + esc(c.url) + '" target="_blank" rel="noopener">' + (isApp() ? '移行元のNotionカード (参考)' : 'Notionのカードを開く') + '</a></p>' : '') +
     '</div>' +
 
     mediaCardHtml(c) +
@@ -753,7 +797,7 @@ function mediaCardHtml(c) {
   const photos = c.media.filter(m => m.kind === 'photo').length;
   const videos = c.media.filter(m => m.kind === 'video').length;
   const tiles = c.media.map(mediaTile).join('');
-  const pend = [...pendingTiles.values()].filter(p => p.pageId === c.page_id).map(p =>
+  const pend = [...pendingTiles.values()].filter(p => p.pageId === c.id).map(p =>
     '<div class="ph' + (p.failed ? ' err' : '') + '">' +
     (p.previewUrl ? '<img src="' + p.previewUrl + '" alt="">' : '<div><span class="ic">' + KIND_ICON[p.kind] + '</span></div>') +
     (p.failed ? '<button class="reg" onclick="retryUpload(event,\'' + p.opId + '\')">↻ 再送</button>' : '<span class="stx">送信中</span>') +
@@ -762,7 +806,7 @@ function mediaCardHtml(c) {
   const addV = videos < 1 ? '<div class="ph add mov" onclick="pickMedia(\'video\')"><div><span class="ic">🎥</span>動画を<br>とる</div></div>' : '';
   return '<div class="dcard"><h3 class="sec">今回のできあがり — 次回の見本になります</h3>' +
     '<div class="photos">' + tiles + pend + addP + addV + '</div>' +
-    '<p class="hint">できあがった状態を撮ってください。次に同じ商品が来たとき「前回の完成形」として出ます (写真3枚・動画1本まで。ドライブとNotionにも保存)。</p></div>';
+    '<p class="hint">できあがった状態を撮ってください。次に同じ商品が来たとき「前回の完成形」として出ます (写真3枚・動画1本まで。ドライブに保存)。</p></div>';
 }
 
 // ライトボックス (その場で大きく見る)
@@ -851,7 +895,7 @@ async function uploadMedia(opId) {
   p.failed = false;
   rerenderDetail();
   const fd = new FormData();
-  fd.append('page_id', p.pageId);
+  fd.append('id', p.pageId);
   fd.append('kind', p.kind);
   fd.append('worker_id', String(worker.id));
   fd.append('operation_id', opId);
@@ -871,7 +915,7 @@ async function uploadMedia(opId) {
   pendingTiles.delete(opId);
   if (p.previewUrl) { try { URL.revokeObjectURL(p.previewUrl); } catch (e) { /* 無視 */ } }
   if (j.deleteToken && j.media) saveMediaToken(j.media.id, j.deleteToken);
-  const c = state.cards.find(x => x.page_id === p.pageId);
+  const c = state.cards.find(x => x.id === p.pageId);
   if (c && !c.media.some(m => m.id === j.media.id)) c.media.push(j.media);
   rerenderDetail();
   toast(p.kind === 'photo' ? '写真を送りました (ドライブへ保存中)' : '動画を送りました (ドライブへ保存中)');
@@ -895,7 +939,7 @@ async function delMedia(ev, id) {
 
 function rerenderDetail() {
   if (!curDetail) return;
-  const c = state.cards.find(x => x.page_id === curDetail);
+  const c = state.cards.find(x => x.id === curDetail);
   if (c) renderDetail(c);
 }
 
@@ -998,11 +1042,11 @@ function mvValues(m) {
 
 function openMaster(focus) {
   if (!worker) { openGate(); return; }
-  const c = state.cards.find(x => x.page_id === curDetail);
+  const c = state.cards.find(x => x.id === curDetail);
   if (!c) return;
-  if (!c.product_code) { showErr('商品コードのないカードは登録できません (Notion側で商品コードを入れてください)'); return; }
+  if (!c.product_code) { showErr('商品コードのないカードは登録できません (職員の方に確認してください)'); return; }
   const cur = mvValues(c.master);
-  mvCtx = { pageId: c.page_id, code: c.product_code, version: c.master.version, values: cur };
+  mvCtx = { cardId: c.id, code: c.product_code, version: c.master.version, values: cur };
   for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur[f];
   optNewKind = null; renderOpts('material'); renderOpts('container');
   $('#mvName').textContent = c.title + ' (' + c.product_code + ')';
@@ -1029,7 +1073,7 @@ async function saveMaster() {
   const j = await apiFetch('/api/master', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      code: mvCtx.code, page_id: mvCtx.pageId, fields,
+      code: mvCtx.code, id: mvCtx.cardId, fields,
       expect_version: mvCtx.version, worker_id: worker.id,
       pin: $('#mvPin').value.trim() || undefined,
     }),
@@ -1057,10 +1101,10 @@ async function saveMaster() {
     // 最新を読み込み、フォームも最新値で組み直す (古い入力のままの再保存で上書きさせない — Codex PR4 #4)
     $('#mvMsg').textContent = '⏳ ' + (j.message || '他の人が先に更新しました') + ' — 最新を読み込んでいます…';
     await loadState();
-    const c2 = state.cards.find(x => x.page_id === mvCtx.pageId);
+    const c2 = state.cards.find(x => x.id === mvCtx.cardId);
     if (c2) {
       const cur2 = mvValues(c2.master);
-      mvCtx = { pageId: c2.page_id, code: c2.product_code, version: c2.master.version, values: cur2 };
+      mvCtx = { cardId: c2.id, code: c2.product_code, version: c2.master.version, values: cur2 };
       for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur2[f];
       optNewKind = null; renderOpts('material'); renderOpts('container');
     }
@@ -1089,15 +1133,41 @@ function workCardHtml(c) {
       '<button class="btn warn" id="pauseBtn" onclick="stopWork(\'pause\')">⏸ ちょっと中断 (資材が足りない など)</button>' +
       '<button class="btn primary" id="doneBtn" onclick="stopWork(\'done\')">✅ できあがり</button>' +
       '</div>';
-  } else if (c.status === '棚入完了') {
-    controls = '<p class="nlink">このカードは棚入完了です。</p>';
+  } else if (c.status === '棚入完了' || c.status === 'closed') {
+    controls = '<p class="nlink">このカードは終わっています。</p>';
   } else {
     controls = '<div class="wbtns"><button class="btn primary" id="startBtn" onclick="startWork()">▶ 作業をはじめる</button></div>';
   }
+  // アプリ正本のみ: 今日やる / 後日 (未着手・保留のカード)。一覧では「📌 今日やる」が上に並ぶ
+  let plan = '';
+  if (isApp() && (c.status === 'not_started' || c.status === 'on_hold')) {
+    plan = '<div class="wbtns" style="margin-top:10px">' +
+      '<button class="btn" onclick="setPlanned(' + (c.today ? 'false' : 'true') + ')">' +
+      (c.today ? '📌 今日やる をやめる' : '📌 今日やる') + '</button></div>';
+  }
   return '<div class="dcard"><h3 class="sec">作業する人・時間</h3>' +
     (chips ? '<div class="wchips">' + chips + '</div>' : '') +
-    controls +
+    controls + plan +
     '<p class="est num">' + estText(c) + '</p></div>';
+}
+
+/** 「今日やる」(planned_date = 今日) / 後日 (null)。アプリ正本のみ */
+async function setPlanned(on) {
+  if (!worker || !curDetail) return;
+  const c = state.cards.find(x => x.id === curDetail);
+  if (!c) return;
+  const j = await apiFetch('/api/planned', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, planned_date: on ? (state.today || null) : null, expect_version: c.version, worker_id: worker.id }),
+  });
+  if (!j.ok) {
+    showErr(j.message || '変更できませんでした');
+    if (j.current) { applyTask(c, j.current); renderList(); renderDetail(c); }
+    return;
+  }
+  applyTask(c, j.task);
+  renderList(); renderDetail(c);
+  toast(on ? '「今日やる」にしました (一覧の上に出ます)' : '「今日やる」をやめました');
 }
 
 // タイマーはサーバーの started_at との差分を表示するだけ (1秒ずつ足さない — iPadの時計・スリープに強い)
@@ -1119,7 +1189,7 @@ async function startWork() {
   if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
   const j = await apiFetch('/api/sessions/start', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ page_id: curDetail, worker_id: worker.id }),
+    body: JSON.stringify({ id: curDetail, worker_id: worker.id }),
   });
   if (!j.ok) {
     if (btn) { btn.disabled = false; btn.textContent = '▶ 作業をはじめる'; }
@@ -1127,27 +1197,29 @@ async function startWork() {
     return;
   }
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
-  const c = state.cards.find(x => x.page_id === curDetail);
+  const c = state.cards.find(x => x.id === curDetail);
   if (c) {
+    applyTask(c, j.task);
     if (j.status) c.status = j.status;
     if (!c.active.some(a => a.worker_id === worker.id)) {
       c.active.push({ id: j.sessionId, worker_id: worker.id, worker_name: worker.display_name, started_at: j.startedAt });
     }
     renderTabs(); renderList(); renderDetail(c);
   }
+  const becameDoing = j.status === '作業中' || j.status === 'in_progress';
   toast(j.already ? '作業中にもどりました (開始済みでした)'
-    : '作業をはじめました' + (j.status === '作業中' ? ' (Notionも「作業中」にしました)' : ''));
+    : '作業をはじめました' + (becameDoing ? (isApp() ? ' (「作業中」にしました)' : ' (Notionも「作業中」にしました)') : ''));
 }
 
 async function stopWork(reason) {
   if (!worker || !curDetail) return;
-  const cNow = state.cards.find(x => x.page_id === curDetail);
+  const cNow = state.cards.find(x => x.id === curDetail);
   const mine = cNow ? myActiveOf(cNow) : null;
   if (!mine || !mine.id) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
   for (const id of ['pauseBtn', 'doneBtn']) { const b = document.getElementById(id); if (b) b.disabled = true; }
   const j = await apiFetch('/api/sessions/stop', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ page_id: curDetail, worker_id: worker.id, session_id: mine.id, reason }),
+    body: JSON.stringify({ id: curDetail, worker_id: worker.id, session_id: mine.id, reason }),
   });
   if (!j.ok) {
     for (const id of ['pauseBtn', 'doneBtn']) { const b = document.getElementById(id); if (b) b.disabled = false; }
@@ -1155,7 +1227,7 @@ async function stopWork(reason) {
     return;
   }
   const pid = curDetail;
-  const c = state.cards.find(x => x.page_id === pid);
+  const c = state.cards.find(x => x.id === pid);
   if (c) {
     c.active = c.active.filter(a => a.worker_id !== worker.id);
     renderList(); renderDetail(c);
@@ -1170,53 +1242,111 @@ async function stopWork(reason) {
   if (reason === 'pause') {
     openSt(null, pid);
     const m = document.getElementById('stMsg');
-    if (m) m.textContent = 'みんな作業から離れました。つづきが後になるなら「中断」を選んでください';
+    if (m) m.textContent = isApp() ? 'みんな作業から離れました。つづきが後になるなら「保留」を選んでください' : 'みんな作業から離れました。つづきが後になるなら「中断」を選んでください';
   } else if (reason === 'done') {
     openSt(null, pid);
     const m = document.getElementById('stMsg');
-    if (m) m.textContent = 'できあがりです! 棚に入れ終わったら「棚入完了」を (職員PINが必要です)';
+    if (m) m.textContent = isApp() ? 'できあがりです! 棚に入れ終わったら「終了 → 棚入完了」を (職員PINが必要です)' : 'できあがりです! 棚に入れ終わったら「棚入完了」を (職員PINが必要です)';
   }
 }
 function openStFromDetail() { if (curDetail) openSt(null, curDetail); }
 
 // ─── ステータス変更 (Codex R2 ①: 保存中表示・処理中は全ボタン無効・失敗は大きく) ───
-let stTarget = null;   // page_id
+let stTarget = null;   // カードの id
 let stSaving = false;
+let stStep = null;     // アプリ正本で理由を選んでいる途中 ('on_hold' | 'closed')
 
-function openSt(ev, pageId) {
+/** アプリ正本で「その変更に職員の本人確認が要るか」(サーバー tasks.js transitionNeedsStaff と同じ規則) */
+const stNeedsStaff = (from, to) => to === 'closed' || from === 'closed' || (from === 'ready_for_stocking' && to === 'in_progress');
+
+function stBtn(value, label, cur) {
+  return '<button class="btn' + (cur ? ' cur' : '') + '" data-v="' + esc(value) + '" onclick="doSetStEl(this)">' + esc(label) + '</button>';
+}
+function renderStBtns(c) {
+  if (!isApp()) {
+    // Notion 正本: 変更先はタブ (一覧に出る状態) と別 — 棚入完了は一覧に残らないが変更先としては必要
+    $('#stBtns').innerHTML = (state.changeTargets || []).map(s => stBtn(s, s, s === c.status)).join('');
+    return;
+  }
+  if (stStep === 'on_hold') {
+    $('#stBtns').innerHTML = (state.holdReasons || []).map(r => stBtn('hold:' + r.value, r.label, false)).join('')
+      + stBtn('back', '← もどる', false);
+    return;
+  }
+  if (stStep === 'closed') {
+    $('#stBtns').innerHTML = (state.closeReasons || []).map(r => stBtn('close:' + r.value, r.label, false)).join('')
+      + stBtn('back', '← もどる', false);
+    return;
+  }
+  const nexts = (state.transitions || {})[c.status] || [];
+  $('#stBtns').innerHTML = nexts.map(v => stBtn(v, stName(v) + (stNeedsStaff(c.status, v) ? ' 🔑' : ''), false)).join('')
+    || '<p class="hint">この状態から変えられる先がありません</p>';
+}
+
+function openSt(ev, id) {
   if (ev) ev.stopPropagation();
   if (!worker) { openGate(); return; }
-  const c = state.cards.find(x => x.page_id === pageId);
+  const c = state.cards.find(x => String(x.id) === String(id));
   if (!c) return;
-  stTarget = pageId;
-  $('#stName').textContent = c.title + ' (いま: ' + c.status + ')';
+  stTarget = c.id;
+  stStep = null;
+  $('#stName').textContent = c.title + ' (いま: ' + stLabel(c) + ')';
   $('#stMsg').textContent = '';
   $('#pinRow').style.display = 'none';
   $('#pinIn').value = '';
-  // 変更先はタブ (一覧に出る状態) と別: 棚入完了は一覧に残らないが変更先としては必要
-  $('#stBtns').innerHTML = (state.changeTargets || state.statuses).map(s =>
-    '<button class="btn' + (s === c.status ? ' cur' : '') + '" onclick="doSetSt(\'' + esc(s) + '\')">' + esc(s) + '</button>').join('');
+  renderStBtns(c);
   $('#stOv').classList.add('on');
 }
-function closeSt() { if (stSaving) return; $('#stOv').classList.remove('on'); stTarget = null; }
+function closeSt() { if (stSaving) return; $('#stOv').classList.remove('on'); stTarget = null; stStep = null; }
 $('#stOv').addEventListener('click', e => { if (e.target === $('#stOv')) closeSt(); });
 
-async function doSetSt(to) {
-  if (stSaving || !stTarget || !worker) return;
-  const c = state.cards.find(x => x.page_id === stTarget);
-  if (!c) { closeSt(); return; }
-  if (to === c.status) { closeSt(); return; }
+/** ボタンの値は data-v から取る (状態名を JS 文字列に埋め込まない) */
+function doSetStEl(el) { doSetSt(el.dataset.v); }
 
-  // 棚入完了が絡む変更は職員のみ (PIN で本人確認)。端末Cookie利用時だけ PIN を求める
-  const gated = to === '棚入完了' || c.status === '棚入完了';
+/** サーバーが返したタスクの最新値をカードに反映する (version を持ち越さないと次の変更が競合する) */
+function applyTask(c, t) {
+  if (!t || typeof t !== 'object') return;
+  for (const k of ['status', 'status_label', 'version', 'facility_code', 'hold_reason_code', 'hold_reason_note',
+    'planned_date', 'cancellation_requested_at', 'migration_review']) {
+    if (k in t) c[k] = t[k];
+  }
+  if ('planned_date' in t) c.today = !!(state.today && t.planned_date === state.today);
+}
+
+async function doSetSt(choice) {
+  if (stSaving || stTarget == null || !worker) return;
+  const c = state.cards.find(x => x.id === stTarget);
+  if (!c) { closeSt(); return; }
+
+  let to = choice, holdReason = null, closeReason = null, holdNote = null, reopenReason = null;
+  if (isApp()) {
+    if (choice === 'back') { stStep = null; $('#stMsg').textContent = ''; renderStBtns(c); return; }
+    if (choice.startsWith('hold:')) { to = 'on_hold'; holdReason = choice.slice(5); }
+    else if (choice.startsWith('close:')) { to = 'closed'; closeReason = choice.slice(6); }
+    // 理由が要る変更は 2 段階 (どの理由かを選んでから送る)
+    if (to === 'on_hold' && !holdReason) { stStep = 'on_hold'; $('#stMsg').textContent = '保留の理由を選んでください'; renderStBtns(c); return; }
+    if (to === 'closed' && !closeReason) { stStep = 'closed'; $('#stMsg').textContent = '終了の理由を選んでください'; renderStBtns(c); return; }
+    if (holdReason === 'other') {
+      holdNote = window.prompt('保留の理由 (その他) を書いてください');
+      if (!holdNote || !holdNote.trim()) { $('#stMsg').textContent = '❌ 「その他」は理由の記入が必要です'; return; }
+    }
+    if (c.status === 'closed') {
+      reopenReason = window.prompt('終了したカードを戻します。理由を書いてください (例: 数え間違い)');
+      if (!reopenReason || !reopenReason.trim()) { $('#stMsg').textContent = '❌ 終了から戻すには理由が必要です'; return; }
+    }
+  }
+  if (to === c.status && !holdReason && !closeReason) { closeSt(); return; }
+
+  // 職員の本人確認が要る変更は PIN を求める (端末Cookie利用時だけ)
+  const gated = isApp() ? stNeedsStaff(c.status, to) : (to === '棚入完了' || c.status === '棚入完了');
   if (gated && !state.me.session) {
     if (worker.worker_type !== 'staff') {
-      $('#stMsg').textContent = '❌ 「棚入完了」の変更は職員のみです。右上の名前を職員に切り替えてください';
+      $('#stMsg').textContent = '❌ この変更は職員のみです。右上の名前を職員に切り替えてください';
       return;
     }
     if (!$('#pinIn').value.trim()) {
       $('#pinRow').style.display = 'block';
-      $('#stMsg').textContent = '職員PINを入れてから「' + to + '」を押してください';
+      $('#stMsg').textContent = '職員PINを入れてから、もう一度選んでください';
       $('#pinIn').focus();
       return;
     }
@@ -1224,39 +1354,54 @@ async function doSetSt(to) {
 
   stSaving = true;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = true;
-  $('#stMsg').textContent = '保存中… (Notionに反映しています)';
+  $('#stMsg').textContent = isApp() ? '保存中…' : '保存中… (Notionに反映しています)';
   const j = await apiFetch('/api/status', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ page_id: stTarget, to, expect: c.status, worker_id: worker.id,
-      pin: $('#pinIn').value.trim() || undefined }),
+    body: JSON.stringify({
+      id: stTarget, to, worker_id: worker.id,
+      ...(isApp()
+        ? { expect_version: c.version, hold_reason: holdReason || undefined, hold_note: holdNote || undefined,
+            close_reason: closeReason || undefined, reason: reopenReason || undefined }
+        : { expect: c.status }),
+      pin: $('#pinIn').value.trim() || undefined,
+    }),
   });
+  stStep = null;
   stSaving = false;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
 
   // 一覧に残らないステータス (棚入完了) になったら、その場で行を外す (次の取得でも入ってこない)
   const dropCard = () => {
-    state.cards = state.cards.filter(x => x.page_id !== c.page_id);
-    if (curDetail === c.page_id) closeDetail();
+    state.cards = state.cards.filter(x => x.id !== c.id);
+    if (curDetail === c.id) closeDetail();
     renderTabs(); renderList();
   };
+  const suffix = isApp() ? '' : ' (Notionにも反映済み)';
   if (j.ok) {
     $('#stOv').classList.remove('on'); stTarget = null;
+    const label = j.status_label || j.status;
     if (j.listed === false) {
       dropCard();
-      toast('「' + j.status + '」にしました。一覧から外れます (Notionにも反映済み)');
+      toast('「' + label + '」にしました。一覧から外れます' + suffix);
       return;
     }
+    applyTask(c, j.task);
     c.status = j.status;
+    if (j.status_label) c.status_label = j.status_label;
     renderTabs(); renderList();
-    if (curDetail === c.page_id) renderDetail(c);
-    toast('「' + j.status + '」に変えました (Notionにも反映済み)');
+    if (curDetail === c.id) renderDetail(c);
+    toast('「' + label + '」に変えました' + suffix);
     return;
   }
   if (j.error === 'conflict') {
     $('#stOv').classList.remove('on'); stTarget = null;
-    showErr(j.message || 'Notion側で変更されています');
+    showErr(j.message || (isApp() ? '他の端末で変更されています' : 'Notion側で変更されています'));
     if (j.listed === false) dropCard();
-    else if (j.current) { c.status = j.current; renderTabs(); renderList(); if (curDetail === c.page_id) renderDetail(c); }
+    else if (j.current) {
+      if (typeof j.current === 'object') { applyTask(c, j.current); c.status = j.current.status; c.status_label = j.current.status_label; }
+      else c.status = j.current;
+      renderTabs(); renderList(); if (curDetail === c.id) renderDetail(c);
+    }
     loadState();
     return;
   }

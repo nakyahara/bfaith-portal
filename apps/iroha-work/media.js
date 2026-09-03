@@ -56,9 +56,15 @@ export function sniffKind(buf) {
   return null;
 }
 
-export function countActiveMedia(pageId, kind) {
+/** カードの参照: アプリ正本は task_id、Notion 正本は page_id (どちらかで数える・引く) */
+const refWhere = ({ taskId = null, pageId = null }) => (taskId != null
+  ? { sql: 'task_id = ?', arg: Number(taskId) }
+  : { sql: 'page_id = ?', arg: pageId });
+
+export function countActiveMedia(ref, kind) {
+  const w = refWhere(typeof ref === 'object' && ref !== null ? ref : { pageId: ref });
   return getDB().prepare(`SELECT COUNT(*) c FROM f_iroha_card_media
-    WHERE page_id = ? AND kind = ? AND deleted_at IS NULL`).get(pageId, kind).c;
+    WHERE ${w.sql} AND kind = ? AND deleted_at IS NULL`).get(w.arg, kind).c;
 }
 
 /** 1行 (配信 API 用。削除済みも返すので呼び元で deleted_at を見る) */
@@ -89,7 +95,7 @@ function readHead(filePath, n = 16) {
  * 同じ operation_id の再送は既存行を返す (冪等)。
  * @returns {ok:true, media, already?} | {ok:false, error, message}
  */
-export function addMedia({ pageId, productCode = null, kind, mime, filePath, worker, deviceLabel = null, deviceId = null, operationId }) {
+export function addMedia({ pageId = null, taskId = null, productCode = null, kind, mime, filePath, worker, deviceLabel = null, deviceId = null, operationId }) {
   const opId = String(operationId || '').trim();
   if (!/^[A-Za-z0-9_-]{8,64}$/.test(opId)) return { ok: false, error: 'bad_request', message: 'operation_id が不正です' };
   const size = fs.statSync(filePath).size;
@@ -114,8 +120,9 @@ export function addMedia({ pageId, productCode = null, kind, mime, filePath, wor
     }
     return { ok: true, already: true, media: publicMedia(dup) };
   }
+  if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
   const max = kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
-  if (countActiveMedia(pageId, kind) >= max) {
+  if (countActiveMedia({ pageId, taskId }, kind) >= max) {
     return { ok: false, error: 'cap_reached',
       message: kind === 'photo' ? `写真は${max}枚までです。不要な写真を削除してから撮り直してください` : `動画は${max}本までです。不要な動画を削除してから撮り直してください` };
   }
@@ -127,9 +134,9 @@ export function addMedia({ pageId, productCode = null, kind, mime, filePath, wor
   // 「撮った本人」の証明に使わない — Codex PR3 #2)。サーバーはハッシュのみ保存
   const deleteToken = crypto.randomBytes(16).toString('base64url');
   const info = db.prepare(`INSERT INTO f_iroha_card_media
-    (operation_id, page_id, product_code, kind, mime, size, local_path, status, worker_id, worker_name, device_label, uploader_device_id, created_at, delete_token_hash)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?, ?, ?, ?)`)
-    .run(opId, pageId, productCode, kind, mime || null, size, localPath,
+    (operation_id, page_id, task_id, product_code, kind, mime, size, local_path, status, worker_id, worker_name, device_label, uploader_device_id, created_at, delete_token_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?, ?, ?, ?)`)
+    .run(opId, pageId, taskId == null ? null : Number(taskId), productCode, kind, mime || null, size, localPath,
       worker.id, worker.display_name, deviceLabel, deviceId == null ? null : Number(deviceId), utcNow(),
       crypto.createHash('sha256').update(deleteToken).digest('hex'));
   const row = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(info.lastInsertRowid));
@@ -152,10 +159,14 @@ export function publicMedia(r) {
 const LOST_LOCAL_MSG = '実体ファイルがありません (再起動で消えた可能性。撮り直してください)';
 
 /** page_id → 有効なメディア一覧 (一覧・詳細表示用) */
-export function mediaByPage() {
+export function mediaByPage() { return mediaByCard('page_id'); }
+/** 同上。アプリ正本のカード用に task_id で引く */
+export function mediaByTask() { return mediaByCard('task_id'); }
+
+function mediaByCard(key) {
   const db = getDB();
   const map = new Map();
-  const rows = db.prepare(`SELECT * FROM f_iroha_card_media WHERE deleted_at IS NULL ORDER BY id`).all();
+  const rows = db.prepare(`SELECT * FROM f_iroha_card_media WHERE deleted_at IS NULL AND ${key} IS NOT NULL ORDER BY id`).all();
   const lost = db.prepare('UPDATE f_iroha_card_media SET next_retry_at = ?, error = ? WHERE id = ?');
   for (const r of rows) {
     // 送信待ちの実体が消えていたら (再起動で一時領域が飛んだ等)、キューの再試行 (最大10回) を待たずに
@@ -165,8 +176,8 @@ export function mediaByPage() {
       lost.run(BLOCKED_UNTIL, LOST_LOCAL_MSG, r.id);
       r.next_retry_at = BLOCKED_UNTIL; r.error = LOST_LOCAL_MSG;
     }
-    if (!map.has(r.page_id)) map.set(r.page_id, []);
-    map.get(r.page_id).push(publicMedia(r));
+    if (!map.has(r[key])) map.set(r[key], []);
+    map.get(r[key]).push(publicMedia(r));
   }
   return map;
 }
@@ -197,11 +208,12 @@ export function singleRange(header) {
  * 写真は完了の証拠ではなく**次回同じ商品を作る人への見本** (中原さん 2026-09-03) —
  * 同じ商品コードのカードが次に上がってきたとき、詳細の一番上に出す。
  * ローカル実体だけの行 (stored) は再起動で消え得るので候補にしない。
- * @returns Map<codeKey, Array<{id, page_id, worker_name, created_at}>>
+ * card = カードの識別子 ('t'+task_id か page_id)。「自分のカードの写真」を除くのに使う
+ * @returns Map<codeKey, Array<{id, page_id, task_id, card, worker_name, created_at}>>
  */
 export function photosByCodeKey() {
   const map = new Map();
-  const rows = getDB().prepare(`SELECT id, page_id, product_code, worker_name, created_at FROM f_iroha_card_media
+  const rows = getDB().prepare(`SELECT id, page_id, task_id, product_code, worker_name, created_at FROM f_iroha_card_media
     WHERE kind = 'photo' AND deleted_at IS NULL AND unavailable_at IS NULL
       AND drive_file_id IS NOT NULL AND product_code IS NOT NULL
     ORDER BY id DESC`).all();
@@ -209,10 +221,12 @@ export function photosByCodeKey() {
     const key = codeKeyOf(r.product_code);
     if (!key) continue;
     if (!map.has(key)) map.set(key, []);
-    map.get(key).push({ id: r.id, page_id: r.page_id, worker_name: r.worker_name, created_at: r.created_at });
+    map.get(key).push({ id: r.id, page_id: r.page_id, task_id: r.task_id, card: cardKeyOf(r), worker_name: r.worker_name, created_at: r.created_at });
   }
   return map;
 }
+/** 写真・セッションの「どのカードか」を 1 つの文字列で表す (アプリ正本は t+task_id、Notion 時代は page_id) */
+export const cardKeyOf = (r) => (r.task_id != null ? `t${r.task_id}` : r.page_id);
 
 /**
  * 論理削除。本人確認は**削除トークン** (アップロードした端末だけが持つ) か portal セッション。
