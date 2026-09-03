@@ -32,6 +32,7 @@ import { buildList, classifyMasterEdit, clearEnrichCache, masterOf } from './ser
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import {
   addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
+  recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
   listPageSyncForAdmin, resetPageSync,
   isDriveConfigured, MEDIA_DIR, MAX_VIDEO_BYTES,
 } from './media.js';
@@ -431,20 +432,6 @@ router.post('/api/media', checkOrigin, mediaUpload.single('file'), api((req, res
   }
 }));
 
-// ETag の照合 (If-None-Match / If-Range)。複数・弱い ETag (W/)・* を受ける
-function etagMatches(header, etag) {
-  if (!header) return false;
-  return String(header).split(',').map(s => s.trim().replace(/^W\//, '')).some(t => t === '*' || t === etag);
-}
-// Range は単一の bytes=a-b / bytes=a- / bytes=-n だけ Drive へ転送する。複数・不正な形は無視して全体を返す
-// (Drive の multipart/byteranges を素通しすると Content-Type が合わない — Codex R1 #1)
-function singleRange(header) {
-  const m = /^bytes=(\d*)-(\d*)$/.exec(String(header || '').trim());
-  if (!m || (m[1] === '' && m[2] === '')) return null;
-  if (m[1] !== '' && m[2] !== '' && Number(m[1]) > Number(m[2])) return null;
-  return `bytes=${m[1]}-${m[2]}`;
-}
-
 /**
  * 写真・動画の配信。iPad はサービスアカウントの Drive を直接見られない (フォルダは公開しない —
  * 要件 §6) ので、ここを通して出す。Drive 保存済みなら Drive からストリーム (単一 Range を転送 =
@@ -478,7 +465,8 @@ router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
     return res.status(304).end();
   }
   let range = singleRange(req.headers.range);
-  if (range && req.headers['if-range'] && !etagMatches(req.headers['if-range'], etag)) range = null;   // 検証子が違えば全体
+  // If-Range は強い ETag の単一一致だけ (W/・*・日付は不一致 → Range を無視して全体 — Codex R2 #2)
+  if (range && req.headers['if-range'] && !ifRangeMatches(req.headers['if-range'], etag)) range = null;
   let dl;
   try {
     dl = await driveDownload({ fileId: r.drive_file_id, range });
@@ -520,9 +508,17 @@ router.post('/api/media/:id(\\d+)/delete', checkOrigin, api((req, res) => {
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 403)).json(r);
 }));
 
-// 失敗した送信の再実行 (管理画面)
-router.post('/admin/media/:id(\\d+)/retry', checkOrigin, requireAdmin, api((req, res) => {
-  if (!resetMedia(Number(req.params.id))) return res.status(404).json({ ok: false, error: 'not_found', message: '対象が見つかりません' });
+// 失敗した送信の再実行 (管理画面)。「ドライブから消えた」印の行は Drive で実在を確かめてから解除
+// (未検証のまま表示・見本候補へ戻さない — Codex R2 #3)
+router.post('/admin/media/:id(\\d+)/retry', checkOrigin, requireAdmin, api(async (req, res) => {
+  const id = Number(req.params.id);
+  const row = getMediaRow(id);
+  if (!row || row.deleted_at) return res.status(404).json({ ok: false, error: 'not_found', message: '対象が見つかりません' });
+  if (row.unavailable_at) {
+    const r = await recheckUnavailable(id);
+    return res.status(r.ok ? 200 : (r.error === 'drive_error' ? 502 : 409)).json(r);
+  }
+  if (!resetMedia(id)) return res.status(404).json({ ok: false, error: 'not_found', message: '対象が見つかりません' });
   res.json({ ok: true });
 }));
 

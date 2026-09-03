@@ -674,8 +674,41 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
     ok(!(photosByCodeKey().get('prod-m') || []).some(p => p.id === mid), '消えた写真は「前回の完成形」候補から外れる');
     ok(mediaByPage().get(pMedia.id).find(m => m.id === mid).viewable === false, '消えた写真は表示対象外 (viewable=false)');
     ok(markMediaUnavailable(mid, 'again') === false, '二重に印は付けない');
-    resetMedia(mid);
-    ok(mediaByPage().get(pMedia.id).find(m => m.id === mid).unavailable === false, '管理画面の再実行で印が消える');
+    // 印の解除は Drive で実在を確かめてから (未検証のまま候補へ戻さない — Codex R2 #3)
+    const { recheckUnavailable, _setDriveExists, etagMatches, ifRangeMatches, singleRange } = await import('../apps/iroha-work/media.js');
+    _setDriveExists(async () => false);
+    ok((await recheckUnavailable(mid)).error === 'still_unavailable', 'Drive に無ければ再確認しても印は残る');
+    ok(mediaByPage().get(pMedia.id).find(m => m.id === mid).unavailable === true, '未検証のまま表示・候補へ戻さない');
+    _setDriveExists(async () => { const e = new Error('gone'); e.response = { status: 404 }; throw e; });
+    ok((await recheckUnavailable(mid)).error === 'still_unavailable', 'Drive の 404 も「無い」扱い');
+    _setDriveExists(async () => { throw new Error('timeout'); });
+    ok((await recheckUnavailable(mid)).error === 'drive_error', '一時的な失敗では解除も確定もしない');
+    _setDriveExists(async () => true);
+    ok((await recheckUnavailable(mid)).ok === true, 'Drive にあることを確認してから印を消す');
+    ok(mediaByPage().get(pMedia.id).find(m => m.id === mid).unavailable === false, '再確認後は表示・候補に戻る');
+    ok((await recheckUnavailable(mid)).error === 'not_unavailable', '印の無い行には何もしない');
+    _setDriveExists(null);
+
+    // 条件付きリクエストの小道具 (配信 API)
+    ok(etagMatches('"a", W/"b"', '"b"') && etagMatches('*', '"x"') && !etagMatches('"a"', '"b"') && !etagMatches('', '"a"'),
+      'If-None-Match は複数・W/・* を受ける (弱い比較)');
+    ok(ifRangeMatches('"b"', '"b"') && !ifRangeMatches('W/"b"', '"b"') && !ifRangeMatches('*', '"b"')
+      && !ifRangeMatches('Wed, 21 Oct 2015 07:28:00 GMT', '"b"') && !ifRangeMatches('"a", "b"', '"b"'),
+      'If-Range は単一の強い ETag だけ (W/・*・日付・複数は不一致 = 全体を返す)');
+    ok(singleRange('bytes=0-99') === 'bytes=0-99' && singleRange('bytes=100-') === 'bytes=100-' && singleRange('bytes=-500') === 'bytes=-500',
+      '単一 Range は転送');
+    ok(singleRange('bytes=0-99,200-299') === null && singleRange('bytes=5-2') === null && singleRange('items=0-1') === null
+      && singleRange('bytes=-') === null && singleRange('') === null && singleRange(undefined) === null,
+      '複数・逆転・不正・空は無視 (全体を返す)');
+
+    // 送信待ちの実体が消えたら、一覧生成時にその場で停止扱い (画面は失敗を出して撮り直せる — Codex R2 #1)
+    const pLost = mkPage({ status: '作業中', title: '実体消失', code: 'PROD-LOST' });
+    addMedia({ pageId: pLost.id, productCode: 'PROD-LOST', kind: 'photo', filePath: tmp('lost.jpg', jpeg), worker: worker1, operationId: 'op-lost-00001' });
+    const lostRow = getDB().prepare("SELECT * FROM f_iroha_card_media WHERE operation_id = 'op-lost-00001'").get();
+    ok(mediaByPage().get(pLost.id)[0].viewable === true, '実体があるうちは表示できる');
+    fs.unlinkSync(lostRow.local_path);
+    const lostPub = mediaByPage().get(pLost.id)[0];
+    ok(lostPub.viewable === false && /実体ファイルがありません/.test(lostPub.error || ''), '実体が消えたら停止扱い (viewable=false・失敗の理由つき)');
   }
 
   // Notion PATCH 中に削除が割り込んでも、削除の同期要求が消えない (revision 方式 — PR3-R2)
