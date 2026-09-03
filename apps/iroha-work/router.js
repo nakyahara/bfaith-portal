@@ -39,7 +39,7 @@ import { transitionNeedsStaff, TASK_STATUSES, statusLabel } from './tasks.js';
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
   listLabelWaits, upsertLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent,
-  startTaskSession, countChangesSince,
+  startTaskSession, countChangesSince, switchSourceOfTruth,
 } from './tasks-db.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import {
@@ -1049,12 +1049,10 @@ router.post('/admin/source', checkOrigin, requireAdmin, api((req, res) => {
         message: `アプリ正本にしてからの記録があります (状態変更 ${changes.tasks} 回 / 更新されたタスク ${changes.updatedTasks} 件 / 作業時間 ${changes.sessions} 件 / 写真 ${changes.media} 件)。Notion には反映されていません。それでも戻すなら force を付けてください` });
     }
   }
-  setMetaValue('source_of_truth', to);
-  setMetaValue('source_switched_at', new Date().toISOString());
-  const detail = changes ? `・Notion 未反映: 状態変更 ${changes.tasks} 回/更新タスク ${changes.updatedTasks}/作業時間 ${changes.sessions}/写真 ${changes.media}${force ? ' (force)' : ''}` : '';
-  safeLog({ action: 'source_switch', pageId: null, deviceLabel: `session:${req.iwUser}`, from, to: `${to} (未完了 ${open} 件${detail})`, ok: true });
-  console.log(`[iroha-work] 正本を ${from} → ${to} に切り替えました (${req.iwUser}・未完了 ${open} 件${detail})`);
-  res.json({ ok: true, source: to, openTasks: open, changes });
+  // 正本・切替時刻・監査ログは 1 トランザクション (失敗したら切り替わらない → api() が 500 を返す)
+  const sw = switchSourceOfTruth({ from, to, actor: req.iwUser, openTasks: open, changes, force });
+  console.log(`[iroha-work] 正本を ${from} → ${to} に切り替えました (${req.iwUser}・未完了 ${open} 件${sw.detail})`);
+  res.json({ ok: true, source: to, openTasks: open, changes, switchedAt: sw.switchedAt });
 }));
 
 // ─── 選択肢 (資材・保管箱) の管理 ───

@@ -5,7 +5,7 @@
  * 不変条件 (closed には close_reason/closed_at、on_hold には hold_reason …) は書く前に validateTaskInvariants で守る。
  * 状態変更は version の楽観ロック (2 台の iPad が同時に触っても後勝ちで壊さない) + 履歴 (f_iroha_app_events.task_id)。
  */
-import { getDB, startSession } from './db.js';
+import { getDB, startSession, setMetaValue, logEvent } from './db.js';
 import {
   OPEN_STATUSES, CLOSE_REASONS, HOLD_REASONS, DEFAULT_FACILITY,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
@@ -437,10 +437,32 @@ export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotO
 export function countChangesSince(iso) {
   const db = getDB();
   const q = (sql) => db.prepare(sql).get(iso).c;
+  // 境界は >= (切替と同じミリ秒の記録を落とさない — 過少計上の方が危険。Codex A1b R3 #2)
   return {
-    tasks: q("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_status' AND ok = 1 AND at > ?"),
-    updatedTasks: q('SELECT COUNT(*) c FROM f_iroha_tasks WHERE updated_at > ?'),
-    sessions: q('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id IS NOT NULL AND started_at > ?'),
-    media: q('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id IS NOT NULL AND created_at > ?'),
+    tasks: q("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_status' AND ok = 1 AND at >= ?"),
+    updatedTasks: q('SELECT COUNT(*) c FROM f_iroha_tasks WHERE updated_at >= ?'),
+    sessions: q('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id IS NOT NULL AND started_at >= ?'),
+    media: q('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id IS NOT NULL AND created_at >= ?'),
   };
+}
+
+let switchSourceHook = null;
+/** テスト用: 正本と切替時刻を書いた後・監査ログの前に割り込む (監査ログ失敗の再現。本番では null) */
+export function _setSwitchSourceHook(fn) { switchSourceHook = fn; }
+/**
+ * 正本の切替を 1 トランザクションで: source_of_truth・source_switched_at・監査ログ (f_iroha_app_events source_switch) を
+ * まとめて書く。どれかが失敗したら全部戻す (「切り替わったのに時刻/ログが無い」を作らない — Codex A1b R3 #1)
+ * @returns {switchedAt}
+ */
+export function switchSourceOfTruth({ from, to, actor, openTasks, changes = null, force = false }) {
+  const db = getDB();
+  return db.transaction(() => {
+    const switchedAt = utcNow();
+    setMetaValue('source_of_truth', to);
+    setMetaValue('source_switched_at', switchedAt);
+    if (switchSourceHook) switchSourceHook();
+    const detail = changes ? `・Notion 未反映: 状態変更 ${changes.tasks} 回/更新タスク ${changes.updatedTasks}/作業時間 ${changes.sessions}/写真 ${changes.media}${force ? ' (force)' : ''}` : '';
+    logEvent({ action: 'source_switch', pageId: null, deviceLabel: `session:${actor}`, from, to: `${to} (未完了 ${openTasks} 件${detail})`, ok: true });
+    return { switchedAt, detail };
+  }).immediate();
 }

@@ -1295,6 +1295,8 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     db.prepare("UPDATE f_iroha_tasks SET updated_at = '2026-01-01T00:00:00.000Z' WHERE updated_at NOT LIKE '20%'").run();
     const z = TD.countChangesSince(new Date(Date.now() + 3600_000).toISOString());
     ok(z.tasks === 0 && z.updatedTasks === 0 && z.sessions === 0 && z.media === 0, '未来を起点にすると 0');
+    const edge = db.prepare('SELECT MAX(started_at) m FROM f_iroha_work_sessions WHERE task_id IS NOT NULL').get().m;
+    ok(TD.countChangesSince(edge).sessions >= 1, '切替と同じミリ秒の記録も数える (境界は >=)');
   }
 
   // 写真の再送は同じカードのときだけ (Codex A1b R1 #3)。task の行は Notion 同期キューに入らない (同 #8)
@@ -1403,8 +1405,10 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
 
     // (d) task_id FK と紐付け CHECK はあるが、既存の UNIQUE / CHECK だけ欠ける版 (Codex A1b R2 #2)
     const LATE_SESSIONS = sqlOf('f_iroha_work_sessions').replace("end_reason     TEXT CHECK (end_reason IS NULL OR end_reason IN ('done','pause','admin'))", 'end_reason TEXT');
-    const LATE_MEDIA = sqlOf('f_iroha_card_media').replace('operation_id  TEXT NOT NULL UNIQUE', 'operation_id TEXT NOT NULL').replace("status        TEXT NOT NULL CHECK (status IN ('stored','uploaded','synced'))", 'status TEXT NOT NULL');
-    ok(!/end_reason IN/.test(LATE_SESSIONS) && !/UNIQUE/.test(LATE_MEDIA) && !/status IN/.test(LATE_MEDIA) && /task_id\s+INTEGER REFERENCES/.test(LATE_MEDIA), '前提: 制約だけ欠けた版を用意');
+    const LATE_MEDIA = sqlOf('f_iroha_card_media').replace('operation_id  TEXT NOT NULL UNIQUE', 'operation_id TEXT NOT NULL')
+      .replace("status        TEXT NOT NULL CHECK (status IN ('stored','uploaded','synced'))", 'status TEXT NOT NULL')
+      .replace("kind          TEXT NOT NULL CHECK (kind IN ('photo','video'))", 'kind TEXT NOT NULL');
+    ok(!/end_reason IN/.test(LATE_SESSIONS) && !/UNIQUE/.test(LATE_MEDIA) && !/status IN/.test(LATE_MEDIA) && !/kind IN/.test(LATE_MEDIA) && /task_id\s+INTEGER REFERENCES/.test(LATE_MEDIA), '前提: 制約だけ欠けた版を用意');
     db.pragma('foreign_keys = OFF');
     db.exec(`CREATE TEMP TABLE late_s AS SELECT * FROM f_iroha_work_sessions; CREATE TEMP TABLE late_m AS SELECT * FROM f_iroha_card_media;
       DROP TABLE f_iroha_work_sessions; DROP TABLE f_iroha_card_media; ${LATE_SESSIONS}; ${LATE_MEDIA};
@@ -1413,7 +1417,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     db.pragma('foreign_keys = ON');
     createTables(db);
     ok(/end_reason IN \('done','pause','admin'\)/.test(sqlOf('f_iroha_work_sessions')) && /operation_id\s+TEXT NOT NULL UNIQUE/.test(sqlOf('f_iroha_card_media'))
-      && /status IN \('stored','uploaded','synced'\)/.test(sqlOf('f_iroha_card_media')), 'UNIQUE / CHECK だけ欠けた版も作り直す');
+      && /status IN \('stored','uploaded','synced'\)/.test(sqlOf('f_iroha_card_media')) && /kind IN \('photo','video'\)/.test(sqlOf('f_iroha_card_media')), 'UNIQUE / CHECK (end_reason・status・kind) だけ欠けた版も作り直す');
     ok(rowsOf('f_iroha_work_sessions') === allS && rowsOf('f_iroha_card_media') === allM, '行はそのまま');
   }
 }
@@ -1484,6 +1488,16 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
   const switchedAt = getMeta('source_switched_at');
   ok(switchedAt && Date.now() - Date.parse(switchedAt) < 10_000, '切替時刻が meta に残る');
   ok((await call('POST', '/admin/source', { ...admin, body: { to: 'app', confirm: 'SWITCH' } })).json.unchanged === true, '同じ正本への切替は何もしない');
+  // 監査ログが書けなければ正本も切替時刻も戻る (1 トランザクション — Codex A1b R3 #1)
+  {
+    const auditN = db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'source_switch'").get().c;
+    TD._setSwitchSourceHook(() => { throw new Error('audit insert failed (test)'); });
+    let failed;
+    try { failed = await call('POST', '/admin/source', { ...admin, body: { to: 'notion', confirm: 'SWITCH', force: true } }); } finally { TD._setSwitchSourceHook(null); }
+    ok(failed.status === 500 && failed.json.ok === false, '監査ログが書けないと 500');
+    ok(getMeta('source_of_truth') === 'app' && getMeta('source_switched_at') === switchedAt, '正本も切替時刻も戻る');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'source_switch'").get().c === auditN, '監査ログも増えない');
+  }
   process.env.GOOGLE_SERVICE_ACCOUNT_KEY = 'test-key';   // 実際の Drive は _setDriveUpload で差し替える
   _setDriveUpload(async ({ operationId }) => ({ fileId: `f-${operationId}`, url: `https://drive/${operationId}` }));
   try {
@@ -1503,11 +1517,11 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     ok(hold.status === 200 && hold.json.ok && hold.json.status === 'on_hold' && hold.json.status_label === '保留 · ラベル待ち' && hold.json.listed === true, '状態変更 → 保留 (ラベル待ち)');
     const stale = await call('POST', '/api/status', { cookie, body: { id: task.id, worker_id: w1.id, to: 'in_progress', expect_version: cur.version } });
     ok(stale.status === 409 && stale.json.error === 'conflict' && stale.json.current?.status === 'on_hold', '古い version は競合 (現在値つき)');
-    for (const bad of ['1.5', '-1', 'abc', '0', '']) {
+    for (const bad of ['1.5', '-1', 'abc', '0', '', '9007199254740992', '1e3']) {
       const r = await call('POST', '/api/status', { cookie, body: { id: bad, worker_id: w1.id, to: 'in_progress', expect_version: 1 } });
       if (!(r.status === 400 && r.json.error === 'bad_request')) ok(false, `不正な id "${bad}" は 400 (実際 ${r.status} ${r.json?.error})`);
     }
-    ok((await call('POST', '/api/status', { cookie, body: { id: '1.5', worker_id: w1.id, to: 'in_progress', expect_version: 1 } })).status === 400, '不正な id (小数・負数・文字・0・空) は 400');
+    ok((await call('POST', '/api/status', { cookie, body: { id: '1.5', worker_id: w1.id, to: 'in_progress', expect_version: 1 } })).status === 400, '不正な id (小数・負数・文字・0・空・2^53 超・指数表記) は 400');
     ok((await call('POST', '/api/planned', { cookie, body: { id: 'x', worker_id: w1.id } })).status === 400 && (await call('GET', '/api/label-waits?task_id=abc', { cookie })).status === 400, '今日やる・ラベル待ちも id を検査する');
     const jpeg = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(64, 1)]);
     const mp = multipart({ id: String(task.id), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-http-00001' }, { name: 'a.jpg', mime: 'image/jpeg', data: jpeg });
