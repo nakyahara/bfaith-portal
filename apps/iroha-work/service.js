@@ -14,7 +14,7 @@ import { buildEnrichContext } from '../inbound-check/notion-sync.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
 import { getDB, listCache, activeSessionsByPage, estimateByProduct } from './db.js';
-import { mediaByPage } from './media.js';
+import { mediaByPage, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 
 // 「急ぎ」の線引き: 在庫切れ、または残り在庫日数がこれ以下
@@ -105,6 +105,14 @@ export function classifyMasterEdit(row, fields) {
  * 並び = 急ぎ (在庫日数昇順) → 新商品 → 通常 (在庫日数昇順) → データなし → 販売なし、
  * 同順位は入庫日の古い順 (要件定義 §5)。タブごとの絞り込みは画面側で行う。
  */
+/** 新しい順の候補 (photosByCodeKey) から、自分以外で直近に撮ったカード1件ぶんを取り出す */
+export function previousPhotosOf(candidates, ownPageId, limit = 3) {
+  const others = candidates.filter(p => p.page_id !== ownPageId);
+  if (others.length === 0) return [];
+  const lastPage = others[0].page_id;   // 先頭 = いちばん最近撮った写真 → そのカード
+  return others.filter(p => p.page_id === lastPage).slice(0, limit);
+}
+
 export function buildList() {
   const rows = listCache();
   const ctx = enrichContext();
@@ -112,6 +120,7 @@ export function buildList() {
   const activeMap = activeSessionsByPage();
   const estimates = estimateByProduct();
   const mediaMap = mediaByPage();
+  const prevPhotos = photosByCodeKey();
 
   const cards = rows.map((r) => {
     let props = {};
@@ -143,6 +152,10 @@ export function buildList() {
       active: activeMap.get(r.page_id) || [],
       estimate: (k && estimates.get(k)) || null,
       media: mediaMap.get(r.page_id) || [],
+      // 「前回の完成形」= 同じ商品コードで**直近に写真を撮った他の1カード**の写真 (最大3枚)。
+      // 複数カードの写真を混ぜない・古いカードを開いても「いちばん最近の完成形」を見せる (Codex R1 #4)。
+      // 次に同じ商品を作る人への見本 (中原さん 2026-09-03: 写真は証拠ではなく見本)
+      previous_photos: previousPhotosOf(k ? (prevPhotos.get(k) || []) : [], r.page_id),
     };
   });
 

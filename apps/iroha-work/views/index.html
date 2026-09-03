@@ -9,75 +9,88 @@
 <link rel="manifest" href="/apps/iroha-work/manifest.json">
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/app-icons/iroha-work-180.png">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@500;700;900&family=Noto+Sans+JP:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&family=Saira+Semi+Condensed:wght@500;600;700&display=swap">
 <style>
+  /* ── デザイン B「ライト・クリーンテック」(中原さん 2026-09-03 選定):
+        冷たい白の地 + 電気的な青。本文 BIZ UDPゴシック (視認性特化) / 数字 Saira Semi Condensed。
+        角は小さく (8px)、線は細く (1px)、発光はさせずコントラストで締める ── */
   :root{
-    --ink:#26312B; --sub:#5C6B62; --faint:#8A968D;
-    --ground:#F4F6F1; --surface:#FFFFFF; --line:#DFE5DC; --well:#EDF1EA;
-    --accent:#3E8E5A; --accent-ink:#FFFFFF; --accent-soft:#E3F0E7;
-    --amber:#C77D2B; --amber-soft:#F7ECDD;
-    --danger:#C2453A; --danger-soft:#F8E6E3;
-    --shadow:0 2px 10px rgba(38,49,43,.08);
+    --ink:#0F1728; --sub:#5B6472; --faint:#98A1B0;
+    --ground:#F3F5F9; --surface:#FFFFFF; --line:#D9DEE8; --well:#EEF1F7;
+    --accent:#1F5EFF; --accent-ink:#FFFFFF; --accent-soft:#E6EDFF;
+    --amber:#C97A12; --amber-soft:#FDF0DC;
+    --danger:#D63B3B; --danger-soft:#FBE5E5;
+    --ok:#0F9D6B; --ok-soft:#DDF5EA;
+    --shadow:0 1px 2px rgba(15,23,40,.06),0 4px 14px rgba(15,23,40,.06);
+    --r:8px; --r-sm:6px;
+    --font:"BIZ UDPGothic","Hiragino Sans","Yu Gothic",system-ui,sans-serif;
+    --num:"Saira Semi Condensed","BIZ UDPGothic",sans-serif;
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html{touch-action:manipulation}
-  body{margin:0;background:var(--ground);color:var(--ink);
-    font-family:"Noto Sans JP","Hiragino Sans",system-ui,sans-serif;font-size:16px;line-height:1.55}
-  h1,h2,h3,button,.chip,.st{font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
-  .num{font-variant-numeric:tabular-nums}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--font);font-size:16px;line-height:1.5}
+  h1,h2,h3,button,input{font-family:var(--font)}
+  .num{font-family:var(--num);font-variant-numeric:tabular-nums;letter-spacing:.01em}
   .app{max-width:900px;margin:0 auto;padding:12px 14px 40px}
 
   header.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
-  header.top h1{font-size:1.25rem;font-weight:900;margin:0}
-  .who{margin-left:auto;font-weight:700;background:var(--surface);border:1.5px solid var(--line);
-    border-radius:999px;padding:8px 16px;cursor:pointer;font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif;font-size:1rem}
+  header.top h1{margin:0;display:flex;flex-direction:column;line-height:1.1}
+  header.top h1 .logo{font-family:var(--num);font-weight:700;font-size:1.15rem;letter-spacing:.1em;color:var(--accent)}
+  header.top h1 .jp{font-size:.72rem;color:var(--sub);font-weight:400;letter-spacing:.06em}
+  .who{margin-left:auto;font-weight:700;background:var(--surface);border:1px solid var(--line);
+    border-radius:var(--r);padding:8px 14px;cursor:pointer;font-size:.95rem;color:var(--ink)}
 
   /* ── バナー (エラーは押すまで消えない) ── */
-  .banner{display:none;width:100%;border-radius:12px;padding:12px 16px;font-weight:700;margin-bottom:10px;cursor:pointer}
+  .banner{display:none;width:100%;border-radius:var(--r);padding:12px 16px;font-weight:700;margin-bottom:10px;cursor:pointer}
   .banner.on{display:block}
-  .banner.err{background:var(--danger-soft);color:var(--danger);border:1.5px solid var(--danger)}
-  .banner.warn{background:var(--amber-soft);color:var(--amber);border:1.5px solid var(--amber)}
+  .banner.err{background:var(--danger-soft);color:var(--danger);border:1px solid var(--danger);border-left-width:4px}
+  .banner.warn{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber);border-left-width:4px}
   .banner small{display:block;font-weight:400;font-size:.78rem;margin-top:2px}
-  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:var(--ink);color:var(--ground);
-    border-radius:12px;padding:12px 22px;font-weight:700;opacity:0;pointer-events:none;transition:opacity .25s;z-index:40;
+  .toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);background:var(--ink);color:#fff;
+    border-radius:var(--r);padding:12px 22px;font-weight:700;opacity:0;pointer-events:none;transition:opacity .25s;z-index:40;
     max-width:90vw;text-align:center}
   .toast.on{opacity:.96}
 
   .filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
-  .flabel{font-size:.78rem;color:var(--sub);font-weight:700}
-  .chip{border:1.5px solid var(--line);background:var(--surface);color:var(--sub);border-radius:999px;
-    padding:9px 18px;font-weight:700;font-size:.95rem;cursor:pointer}
-  .chip.on{background:var(--ink);border-color:var(--ink);color:var(--ground)}
-  .search{flex:1;min-width:180px;border:1.5px solid var(--line);border-radius:12px;padding:10px 14px;
+  .flabel{font-size:.72rem;color:var(--faint);font-weight:700;letter-spacing:.12em;font-family:var(--num)}
+  .chip{border:1px solid var(--line);background:var(--surface);color:var(--sub);border-radius:var(--r);
+    padding:8px 14px;font-weight:700;font-size:.92rem;cursor:pointer;display:inline-flex;gap:8px;align-items:center}
+  .chip .num{color:var(--faint);font-weight:600}
+  .chip.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  .chip.on .num{color:var(--accent-ink)}
+  .search{flex:1;min-width:180px;border:1px solid var(--line);border-radius:var(--r);padding:9px 12px;
     font-size:1rem;background:var(--surface);color:var(--ink)}
-  .sync{font-size:.75rem;color:var(--faint);width:100%;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-  .sync button{border:1.5px solid var(--line);background:var(--surface);color:var(--sub);border-radius:8px;
-    padding:4px 12px;font-size:.78rem;font-weight:700;cursor:pointer}
+  .search:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  .sync{font-size:.74rem;color:var(--faint);width:100%;display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+    font-family:var(--num);letter-spacing:.03em}
+  .sync button{border:1px solid var(--line);background:var(--surface);color:var(--sub);border-radius:var(--r-sm);
+    padding:4px 10px;font-size:.78rem;font-weight:700;cursor:pointer}
 
   /* ── リスト ── */
-  .list{display:flex;flex-direction:column;gap:10px}
+  .list{display:flex;flex-direction:column;gap:8px}
   .row{display:flex;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--line);
-    border-radius:16px;padding:10px 14px;box-shadow:var(--shadow);cursor:pointer}
-  .row .thumb{width:64px;height:64px;border-radius:12px;background:#fff;border:1px solid var(--line);
-    display:grid;place-items:center;font-size:1.6rem;flex:none;overflow:hidden}
-  .row .thumb img{width:100%;height:100%;object-fit:contain}
+    border-radius:var(--r);padding:10px 12px;cursor:pointer}
+  .row:active{border-color:var(--accent)}
+  .row .thumb{width:60px;height:60px;border-radius:var(--r-sm);background:var(--well);border:1px solid var(--line);
+    display:grid;place-items:center;font-size:1.5rem;flex:none;overflow:hidden}
+  .row .thumb img{width:100%;height:100%;object-fit:contain;background:#fff}
   .row .bd{flex:1;min-width:0}
   .row h2{margin:0;font-size:1rem;font-weight:700;line-height:1.35}
-  .row .meta{font-size:.82rem;color:var(--sub)}
-  .row .meta b{color:var(--ink);font-size:1.1em}
+  .row .meta{font-size:.82rem;color:var(--sub);margin-top:2px}
+  .row .meta b{color:var(--ink);font-size:1.15em;font-family:var(--num);font-weight:600}
   .row .meta2{font-size:.78rem;color:var(--faint);margin-top:2px}
-  .tag{display:inline-block;font-size:.74rem;font-weight:700;border-radius:7px;padding:2px 9px;
+  .tag{display:inline-block;font-size:.72rem;font-weight:700;border-radius:var(--r-sm);padding:2px 8px;
     margin-right:6px;vertical-align:1px}
-  .tag.urgent{background:var(--danger-soft);color:var(--danger)}
-  .tag.new{background:var(--accent-soft);color:var(--accent)}
-  .tag.miss{background:var(--amber-soft);color:var(--amber)}
-  .st{flex:none;font-size:.82rem;font-weight:700;border-radius:9px;padding:6px 12px;cursor:pointer;border:none;
-    font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
-  .st.todo{background:var(--well);color:var(--sub)}
-  .st.doing{background:var(--amber-soft);color:var(--amber)}
-  .st.done{background:var(--accent-soft);color:var(--accent)}
-  .st.pause{background:var(--danger-soft);color:var(--danger)}
-  .st.other{background:var(--well);color:var(--faint)}
+  .tag.urgent{background:var(--amber-soft);color:var(--amber)}
+  .tag.new{background:var(--ok-soft);color:var(--ok)}
+  .tag.miss{background:var(--danger-soft);color:var(--danger)}
+  .st{flex:none;font-size:.8rem;font-weight:700;border-radius:var(--r-sm);padding:6px 10px;cursor:pointer;
+    border:1px solid transparent;white-space:nowrap;font-family:var(--font)}
+  .st.todo{background:var(--well);color:var(--sub);border-color:var(--line)}
+  .st.doing{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+  .st.done{background:var(--ok-soft);color:var(--ok);border-color:var(--ok)}
+  .st.pause{background:var(--danger-soft);color:var(--danger);border-color:var(--danger)}
+  .st.other{background:var(--well);color:var(--faint);border-color:var(--line)}
   .row .chev{color:var(--faint);font-size:1.2rem;flex:none}
   .empty{padding:40px 10px;text-align:center;color:var(--faint)}
 
@@ -86,89 +99,108 @@
   body.detail-open .listpage{display:none}
   body.detail-open .detail{display:block}
   .backbar{display:flex;align-items:center;gap:10px;margin-bottom:12px}
-  .back{border:1.5px solid var(--line);background:var(--surface);color:var(--ink);border-radius:12px;
-    padding:10px 18px;font-size:1rem;font-weight:700;cursor:pointer}
-  .backbar .st{margin-left:auto;font-size:.95rem;padding:8px 16px}
-  .dcard{background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);
-    padding:18px;margin-bottom:14px}
+  .back{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r);
+    padding:10px 16px;font-size:1rem;font-weight:700;cursor:pointer}
+  .backbar .st{margin-left:auto;font-size:.92rem;padding:8px 14px}
+  .dcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:12px}
   .dhead{display:flex;gap:16px}
-  .dhead .thumb{width:132px;height:132px;border-radius:14px;background:#fff;border:1px solid var(--line);
-    display:grid;place-items:center;font-size:3rem;flex:none;overflow:hidden}
-  .dhead .thumb img{width:100%;height:100%;object-fit:contain}
-  .dhead h2{margin:0 0 6px;font-size:1.3rem;font-weight:900;line-height:1.35}
-  .dhead .meta{font-size:.88rem;color:var(--sub);word-break:break-all}
-  .qty{font-size:1.05rem;margin-top:6px}
-  .qty b{font-size:1.6em;font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
-  .bcode{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--well);border-radius:8px;
-    padding:2px 8px;font-size:.95em}
+  .dhead .thumb{width:120px;height:120px;border-radius:var(--r-sm);background:var(--well);border:1px solid var(--line);
+    display:grid;place-items:center;font-size:2.8rem;flex:none;overflow:hidden}
+  .dhead .thumb img{width:100%;height:100%;object-fit:contain;background:#fff}
+  .dhead h2{margin:0 0 6px;font-size:1.25rem;font-weight:700;line-height:1.35}
+  .dhead .meta{font-size:.85rem;color:var(--sub);word-break:break-all}
+  .qty{font-size:1rem;margin-top:8px;color:var(--sub)}
+  .qty b{font-size:1.9em;font-family:var(--num);font-weight:700;color:var(--ink);line-height:1}
+  .bcode{font-family:var(--num);background:var(--well);border-radius:var(--r-sm);padding:2px 8px;font-size:.95em;letter-spacing:.04em}
 
-  .kvs{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px}
-  .kv{background:var(--well);border:1px solid var(--line);border-radius:12px;padding:10px 12px}
-  .kv label{display:block;font-size:.7rem;color:var(--sub);letter-spacing:.08em;margin-bottom:3px}
+  .kvs{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
+  .kv{background:var(--well);border:1px solid var(--line);border-radius:var(--r-sm);padding:9px 12px}
+  .kv label{display:block;font-size:.72rem;color:var(--faint);letter-spacing:.08em;margin-bottom:3px}
   .kv .v{font-weight:700}
-  .kv.miss{border:1.5px dashed var(--amber);background:var(--amber-soft)}
+  .kv.miss{border:1px dashed var(--amber);background:var(--amber-soft)}
   .kv.miss .v{color:var(--amber)}
-  /* ── 作業時間 ── */
-  /* ── 完成写真・動画 ── */
-  .photos{display:flex;gap:10px;flex-wrap:wrap;margin-top:4px}
-  .ph{position:relative;width:96px;height:96px;border-radius:12px;border:1.5px solid var(--line);background:var(--well);
-    display:grid;place-items:center;color:var(--sub);font-size:.72rem;text-align:center;line-height:1.35;cursor:pointer}
-  .ph .ic{font-size:1.6rem;display:block}
-  .ph.add{border-style:dashed;border-color:var(--accent);color:var(--accent);font-weight:700}
+  .kv a{color:var(--accent)}
+
+  /* ── 写真: 「前回の完成形」(同じ商品の見本) と「今回のできあがり」 ── */
+  .photos{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;margin-top:4px}
+  .ph{position:relative;aspect-ratio:4/3;border-radius:var(--r-sm);border:1px solid var(--line);background:var(--well);
+    display:grid;place-items:center;color:var(--sub);font-size:.74rem;text-align:center;line-height:1.35;cursor:pointer;overflow:hidden}
+  .ph img,.ph video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  .ph .cap{position:absolute;left:0;right:0;bottom:0;padding:3px 8px;font-size:.7rem;background:rgba(15,23,40,.55);color:#fff;
+    font-family:var(--num);letter-spacing:.04em;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ph .ic{font-size:1.5rem;display:block}
+  .ph.add{border-style:dashed;border-color:var(--accent);color:var(--accent);font-weight:700;background:var(--surface)}
   .ph.mov{border-color:var(--amber)}
-  .ph .del{position:absolute;top:-8px;right:-8px;width:26px;height:26px;border-radius:50%;border:none;
-    background:var(--danger);color:#fff;font-weight:700;cursor:pointer;line-height:1}
-  .ph .stx{font-size:.66rem;color:var(--faint)}
+  .ph .del{position:absolute;top:6px;right:6px;width:26px;height:26px;border-radius:50%;border:none;
+    background:var(--danger);color:#fff;font-weight:700;cursor:pointer;line-height:1;z-index:2}
+  .ph .stx{position:absolute;top:6px;left:6px;font-size:.66rem;background:rgba(15,23,40,.55);color:#fff;
+    border-radius:4px;padding:2px 6px;font-family:var(--num);z-index:2}
+  .ph .reg{position:absolute;z-index:2}
   .ph.err{border-color:var(--danger);color:var(--danger)}
+  .prev .ph{border-color:var(--ok)}
+  .prevnote{font-size:.8rem;color:var(--sub);margin:0 0 8px}
+
+  /* ── 作業時間 ── */
   .wchips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-  .wchip{background:var(--amber-soft);color:var(--amber);border-radius:999px;padding:7px 16px;
-    font-weight:700;font-size:.92rem}
+  .wchip{background:var(--accent-soft);color:var(--accent);border-radius:var(--r);padding:7px 14px;font-weight:700;font-size:.92rem}
   .wtimer{text-align:center;padding:4px 0 12px}
-  .wtimer .t{font-size:3rem;font-weight:900;font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
-  .wtimer small{display:block;color:var(--sub);font-weight:700;letter-spacing:.12em;font-size:.72rem}
-  .wbtns{display:flex;gap:12px;flex-wrap:wrap}
-  .wbtns .btn{flex:1;min-width:180px;min-height:62px;font-size:1.1rem}
+  .wtimer .t{font-size:3.2rem;font-weight:700;font-family:var(--num);letter-spacing:.04em;line-height:1;color:var(--accent)}
+  .wtimer small{display:block;color:var(--faint);font-weight:700;letter-spacing:.12em;font-size:.68rem;margin-top:6px;font-family:var(--num)}
+  .wbtns{display:flex;gap:10px;flex-wrap:wrap}
+  .wbtns .btn{flex:1;min-width:180px;min-height:60px;font-size:1.1rem}
   .btn.warn{color:var(--amber);border-color:var(--amber)}
   .est{font-size:.82rem;color:var(--sub);margin-top:10px}
-  h3.sec{font-size:.95rem;margin:0 0 10px;color:var(--sub);letter-spacing:.05em}
-  .reg{margin-top:6px;border:1.5px solid var(--amber);background:var(--surface);color:var(--amber);
-    border-radius:10px;padding:6px 12px;font-weight:700;font-size:.85rem;cursor:pointer;
-    font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
+  h3.sec{font-size:.78rem;margin:0 0 10px;color:var(--faint);letter-spacing:.1em;font-weight:700;display:flex;align-items:center;gap:8px}
+  .reg{border:1px solid var(--amber);background:var(--surface);color:var(--amber);
+    border-radius:var(--r-sm);padding:5px 10px;font-weight:700;font-size:.82rem;cursor:pointer;font-family:var(--font)}
   .mfields label{display:block;font-size:.78rem;color:var(--sub);font-weight:700;margin:10px 0 3px}
-  .mfields input{width:100%;border:1.5px solid var(--line);border-radius:10px;padding:10px 12px;
+  .mfields input{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;
     font-size:1rem;background:var(--surface);color:var(--ink)}
-  .nlink{font-size:.82rem;color:var(--sub);margin:10px 0 0}
+  .mfields input:focus,.pin:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  .nlink{font-size:.8rem;color:var(--sub);margin:10px 0 0}
   .nlink a{color:var(--accent);font-weight:700}
+  .pin{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;font-size:1.3rem;
+    letter-spacing:.3em;background:var(--surface);color:var(--ink);font-family:var(--num)}
 
   /* ── ダイアログ ── */
-  .overlay{position:fixed;inset:0;background:rgba(20,26,22,.5);display:none;place-items:center;padding:16px;z-index:20}
+  .overlay{position:fixed;inset:0;background:rgba(15,23,40,.5);display:none;place-items:center;padding:16px;z-index:20}
   .overlay.on{display:grid}
-  .modal{background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);
+  .modal{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);
     padding:20px;width:min(480px,100%)}
   .modal h3{margin:0 0 4px;font-size:1.1rem}
   .modal .mname{font-size:.88rem;color:var(--sub);margin-bottom:14px}
+  .modal label{font-size:.8rem;color:var(--sub);font-weight:700}
   .stbtns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
-  .btn{min-height:58px;border-radius:14px;border:1.5px solid var(--line);
-    background:var(--surface);color:var(--ink);font-size:1.02rem;font-weight:700;cursor:pointer;
-    font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
+  .btn{min-height:56px;border-radius:var(--r);border:1px solid var(--line);
+    background:var(--surface);color:var(--ink);font-size:1.02rem;font-weight:700;cursor:pointer;font-family:var(--font)}
   .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
-  .btn.cur{outline:3px solid var(--accent);outline-offset:1px}
+  .btn.cur{outline:2px solid var(--accent);outline-offset:1px}
   .btn:disabled{opacity:.55}
   .mbtns{display:flex;gap:10px}
   .mbtns .btn{flex:1;min-height:52px}
   .msaving{font-size:.85rem;color:var(--sub);font-weight:700;min-height:1.4em;margin-bottom:8px}
   .hint{font-size:.78rem;color:var(--faint);margin-top:8px}
 
+  /* ── ライトボックス (写真・動画をその場で大きく見る) ── */
+  .lb{position:fixed;inset:0;background:rgba(6,10,20,.92);display:none;place-items:center;z-index:50;padding:12px}
+  .lb.on{display:grid}
+  .lb img,.lb video{max-width:100%;max-height:82vh;border-radius:var(--r-sm);background:#000}
+  .lb .lbcap{position:absolute;left:0;right:0;bottom:0;padding:12px 16px;color:#fff;font-size:.9rem;text-align:center;
+    font-family:var(--num);letter-spacing:.04em}
+  .lb .lbx{position:absolute;top:12px;right:12px;width:44px;height:44px;border-radius:50%;border:none;
+    background:rgba(255,255,255,.15);color:#fff;font-size:1.4rem;cursor:pointer}
+
   /* ── 作業者選択 (だれがつかう?) ── */
   .gate{position:fixed;inset:0;background:var(--ground);z-index:30;display:none;overflow:auto;padding:24px 16px}
   .gate.on{display:block}
   .gate .gwrap{max-width:640px;margin:0 auto}
-  .gate h2{font-size:1.2rem;font-weight:900}
-  .gate .gsec{font-size:.85rem;color:var(--sub);font-weight:700;margin:18px 0 8px}
+  .gate h2{font-size:1.2rem;font-weight:700}
+  .gate .gsec{font-size:.78rem;color:var(--faint);font-weight:700;margin:18px 0 8px;letter-spacing:.1em}
   .gate .names{display:flex;gap:10px;flex-wrap:wrap}
-  .gate .name{border:1.5px solid var(--line);background:var(--surface);border-radius:14px;padding:16px 22px;
-    font-size:1.1rem;font-weight:700;cursor:pointer;font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif;color:var(--ink)}
+  .gate .name{border:1px solid var(--line);background:var(--surface);border-radius:var(--r);padding:16px 22px;
+    font-size:1.1rem;font-weight:700;cursor:pointer;font-family:var(--font);color:var(--ink)}
   .gate .gnote{font-size:.8rem;color:var(--faint);margin-top:20px}
+  @media (prefers-reduced-motion: reduce){.toast{transition:none}}
 </style>
 </head>
 <body>
@@ -176,14 +208,14 @@
   <!-- ══ 画面1: リスト ══ -->
   <div class="listpage">
     <header class="top">
-      <h1>🎋 いろは在庫化</h1>
+      <h1><span class="logo">IROHA STOCK</span><span class="jp">いろは在庫化 作業画面</span></h1>
       <button class="who" id="whoBtn" onclick="openGate()">👤 —</button>
     </header>
     <div class="banner err" id="errBanner" onclick="this.classList.remove('on')"></div>
     <div class="banner warn" id="warnBanner" onclick="this.classList.remove('on')"></div>
 
     <div class="filters">
-      <span class="flabel">Notionのステータス:</span>
+      <span class="flabel">STATUS</span>
       <span id="tabs"></span>
       <input class="search" id="q" placeholder="商品名・商品コードで検索">
       <span class="sync">
@@ -212,14 +244,12 @@
       <div class="msaving" id="stMsg"></div>
       <div class="stbtns" id="stBtns"></div>
       <div id="pinRow" style="display:none;margin-bottom:12px">
-        <label style="font-size:.8rem;color:var(--sub);font-weight:700">職員PIN (棚入完了の変更に必要です)</label>
-        <input id="pinIn" type="tel" inputmode="numeric" maxlength="8" placeholder="****" autocomplete="off"
-          style="width:100%;border:1.5px solid var(--line);border-radius:10px;padding:10px 12px;font-size:1.3rem;
-                 letter-spacing:.3em;background:var(--surface);color:var(--ink)">
+        <label>職員PIN (棚入完了の変更に必要です)</label>
+        <input id="pinIn" class="pin" type="tel" inputmode="numeric" maxlength="8" placeholder="****" autocomplete="off">
       </div>
       <div class="mbtns"><button class="btn" id="stCancel" onclick="closeSt()">やめる</button></div>
       <p class="hint">ここで変えると、Notionのカードのステータスもそのまま変わります。<br>
-        「棚入完了」への変更・取り消しは職員の方だけができます (職員PINが必要)。</p>
+        「棚入完了」にすると一覧から外れます。「棚入完了」への変更・取り消しは職員の方だけができます (職員PINが必要)。</p>
     </div>
   </div>
 
@@ -238,10 +268,8 @@
         <label>作り方動画のリンク (https://…)</label><input id="mvVideo" type="url" maxlength="500" placeholder="https://">
       </div>
       <div id="mvPinRow" style="display:none;margin-top:12px">
-        <label style="font-size:.8rem;color:var(--sub);font-weight:700">職員PIN (入っている値の変更に必要です)</label>
-        <input id="mvPin" type="tel" inputmode="numeric" maxlength="8" autocomplete="off"
-          style="width:100%;border:1.5px solid var(--line);border-radius:10px;padding:10px 12px;font-size:1.3rem;
-                 letter-spacing:.3em;background:var(--surface);color:var(--ink)">
+        <label>職員PIN (入っている値の変更に必要です)</label>
+        <input id="mvPin" class="pin" type="tel" inputmode="numeric" maxlength="8" autocomplete="off">
       </div>
       <div class="mbtns" style="margin-top:14px">
         <button class="btn" id="mvCancel" onclick="closeMaster()">やめる</button>
@@ -260,6 +288,13 @@
       <div id="gateNames"></div>
       <p class="gnote">名前がないときは、職員の方が管理画面 (パソコン) から追加できます。</p>
     </div>
+  </div>
+
+  <!-- ══ 写真・動画の拡大表示 ══ -->
+  <div class="lb" id="lb" onclick="closeLb(event)">
+    <button class="lbx" onclick="closeLb()">×</button>
+    <div id="lbBody"></div>
+    <div class="lbcap" id="lbCap"></div>
   </div>
 
   <div class="toast" id="toast"></div>
@@ -354,7 +389,7 @@ function fmtTime(iso) {
 
 function renderSync() {
   const rf = state.refresh || {};
-  let txt = 'Notionと同期: ' + fmtTime(rf.lastRefreshAt) + ' ・ 🗂 カード' + state.cards.length + '枚 ・ ステータスの札をタップすると変えられます';
+  let txt = 'SYNC ' + fmtTime(rf.lastRefreshAt) + ' · ' + state.cards.length + ' CARDS · 状態の札をタップで変更 (Notionにも反映)';
   $('#syncTxt').textContent = txt;
   if (rf.error) showErr('Notionから最新を取得できませんでした (前回取得分を表示しています)', rf.error);
   if (rf.truncated) showWarn('カードが件数上限を超えているため最新化できていません (前回取得分を表示中。職員の方は管理画面を確認してください)');
@@ -519,8 +554,9 @@ function renderDetail(c) {
         (c.barcode ? ' ・ JAN <span class="bcode">' + esc(c.barcode) + '</span>' : '') +
         (c.arrival ? ' ・ 入庫 ' + esc(c.arrival) : '') +
         (c.ar_no ? ' ・ ' + esc(c.ar_no) : '') + '</div>' +
-      '<div class="qty num">つくる数: <b>' + esc(c.qty != null ? c.qty : '—') + '</b> 個</div>' +
+      '<div class="qty">つくる数: <b>' + esc(c.qty != null ? c.qty : '—') + '</b> 個</div>' +
       '</div></div></div>' +
+    prevCardHtml(c) +
 
     '<div class="dcard"><h3 class="sec">作業のやり方 <button class="reg" style="margin-left:8px" onclick="openMaster()">✎ 編集</button></h3><div class="kvs">' +
       kv('資材', m.material_code, { miss: missSet.has('資材'), reg: 'material_code' }) +
@@ -548,42 +584,86 @@ function renderDetail(c) {
   startTimerTick(c);
 }
 
-// ── できあがりの写真・動画 (作業のやり方のすぐ下 — 中原さんFB①「写真は上のほうに」) ──
+// ── 写真・動画: 「前回の完成形」(同じ商品の見本) と「今回のできあがり」 ──
+// 写真は完了の証拠ではなく、次に同じ商品を作る人への見本 (中原さん 2026-09-03)。
+// 画像は /api/media/:id/file (Render 経由) で出す — iPad はサービスアカウントの Drive を直接見られない
 const KIND_ICON = { photo: '📷', video: '🎥' };
+const fileUrl = id => BASE + '/api/media/' + id + '/file';
+function fmtDate(iso) {
+  if (!iso) return '';
+  try { const d = new Date(iso); return (d.getMonth() + 1) + '/' + d.getDate(); } catch (e) { return ''; }
+}
 // 削除トークン = アップロードした端末だけが持つ (この端末で撮った分だけ×が出る)
 function mediaTokens() { try { return JSON.parse(localStorage.getItem('iw_media_tok') || '{}'); } catch (e) { return {}; } }
 function saveMediaToken(id, tok) { try { const t = mediaTokens(); t[id] = tok; localStorage.setItem('iw_media_tok', JSON.stringify(t)); } catch (e) { /* 消せなくなるだけ */ } }
 function dropMediaToken(id) { try { const t = mediaTokens(); delete t[id]; localStorage.setItem('iw_media_tok', JSON.stringify(t)); } catch (e) { /* 無視 */ } }
+const IMG_FALLBACK = ' onerror="this.replaceWith(document.createTextNode(\'表示できません\'))"';
 function mediaTile(m) {
-  const st = m.error ? '❌失敗' : m.status === 'stored' ? '送信中…' : '☁保存済み';
   const own = !!mediaTokens()[m.id];
-  return '<div class="ph' + (m.error ? ' err' : '') + '" onclick="openMedia(event,' + m.id + ')">' +
+  const stx = m.error ? '❌ 失敗' : m.status === 'stored' ? '送信中' : '';
+  const inner = m.viewable
+    ? (m.kind === 'photo' ? '<img src="' + fileUrl(m.id) + '" alt="" loading="lazy"' + IMG_FALLBACK + '>'
+                          : '<video src="' + fileUrl(m.id) + '" preload="metadata" muted playsinline></video>')
+    : '<div><span class="ic">' + KIND_ICON[m.kind] + '</span>' + esc(m.worker_name || '') + '</div>';
+  return '<div class="ph' + (m.error ? ' err' : '') + (m.kind === 'video' ? ' mov' : '') + '" onclick="openMedia(event,' + m.id + ')">' +
+    inner +
     (own ? '<button class="del" onclick="delMedia(event,' + m.id + ')">×</button>' : '') +
-    '<div><span class="ic">' + KIND_ICON[m.kind] + '</span>' + esc(m.worker_name || '') +
-    '<span class="stx">' + st + '</span></div></div>';
+    (stx ? '<span class="stx">' + stx + '</span>' : '') +
+    '<div class="cap">' + KIND_ICON[m.kind] + ' ' + esc(fmtDate(m.created_at)) + ' ' + esc(m.worker_name || '') + '</div></div>';
+}
+// 詳細の一番上: 同じ商品コードで前に撮った写真 (次回の見本)
+function prevCardHtml(c) {
+  const prev = c.previous_photos || [];
+  if (prev.length === 0) return '';
+  // onclick には数値 id だけを埋める (人名などの文字列を JS 文字列に埋め込まない — Codex R1 #6)
+  const tiles = prev.map(p =>
+    '<div class="ph" onclick="openPrev(event,' + Number(p.id) + ')">' +
+    '<img src="' + fileUrl(p.id) + '" alt="" loading="lazy"' + IMG_FALLBACK + '>' +
+    '<div class="cap">📷 ' + esc(fmtDate(p.created_at)) + ' ' + esc(p.worker_name || '') + '</div></div>').join('');
+  return '<div class="dcard prev"><h3 class="sec">前回の完成形 — 同じ商品の写真</h3>' +
+    '<p class="prevnote">前にこの商品を在庫化したときの写真です。同じ形に仕上げてください (タップで大きく)。</p>' +
+    '<div class="photos">' + tiles + '</div></div>';
 }
 function mediaCardHtml(c) {
   const photos = c.media.filter(m => m.kind === 'photo').length;
   const videos = c.media.filter(m => m.kind === 'video').length;
   const tiles = c.media.map(mediaTile).join('');
   const pend = [...pendingTiles.values()].filter(p => p.pageId === c.page_id).map(p =>
-    '<div class="ph"><div><span class="ic">' + KIND_ICON[p.kind] + '</span>' +
-    (p.failed ? '<button class="reg" style="margin-top:2px" onclick="retryUpload(event,\'' + p.opId + '\')">↻ 再送</button>' : '<span class="stx">送信中…</span>') +
-    '</div></div>').join('');
+    '<div class="ph' + (p.failed ? ' err' : '') + '">' +
+    (p.previewUrl ? '<img src="' + p.previewUrl + '" alt="">' : '<div><span class="ic">' + KIND_ICON[p.kind] + '</span></div>') +
+    (p.failed ? '<button class="reg" onclick="retryUpload(event,\'' + p.opId + '\')">↻ 再送</button>' : '<span class="stx">送信中</span>') +
+    '</div>').join('');
   const addP = photos < 3 ? '<div class="ph add" onclick="pickMedia(\'photo\')"><div><span class="ic">📷</span>写真を<br>とる</div></div>' : '';
   const addV = videos < 1 ? '<div class="ph add mov" onclick="pickMedia(\'video\')"><div><span class="ic">🎥</span>動画を<br>とる</div></div>' : '';
-  return '<div class="dcard"><h3 class="sec">できあがりの写真・動画</h3>' +
+  return '<div class="dcard"><h3 class="sec">今回のできあがり — 次回の見本になります</h3>' +
     '<div class="photos">' + tiles + pend + addP + addV + '</div>' +
-    '<p class="hint">写真も動画もドライブに保存されて、Notionのカードにも付きます。棚入完了には写真1枚以上が必要です (写真は3枚・動画は1本まで)。</p></div>';
+    '<p class="hint">できあがった状態を撮ってください。次に同じ商品が来たとき「前回の完成形」として出ます (写真3枚・動画1本まで。ドライブとNotionにも保存)。</p></div>';
 }
 
+// ライトボックス (その場で大きく見る)
+function showLb(html, cap) { $('#lbBody').innerHTML = html; $('#lbCap').textContent = cap || ''; $('#lb').classList.add('on'); }
+function closeLb(ev) {
+  if (ev && ev.target !== $('#lb') && !ev.target.classList.contains('lbx')) return;
+  const v = $('#lbBody video'); if (v) v.pause();
+  $('#lb').classList.remove('on'); $('#lbBody').innerHTML = '';
+}
 function openMedia(ev, id) {
   ev.stopPropagation();
   for (const c of state.cards) {
     const m = c.media.find(x => x.id === id);
-    if (m && m.url) { window.open(m.url, '_blank', 'noopener'); return; }
+    if (!m) continue;
+    if (!m.viewable) { toast(m.error ? '送信に失敗しています (削除して撮り直してください)' : 'まだ送信中です'); return; }
+    const cap = KIND_ICON[m.kind] + ' ' + fmtDate(m.created_at) + ' ' + (m.worker_name || '');
+    showLb(m.kind === 'photo' ? '<img src="' + fileUrl(id) + '" alt="">' : '<video src="' + fileUrl(id) + '" controls autoplay playsinline></video>', cap);
+    return;
   }
-  toast('まだ送信中です (保存されるとドライブで開けます)');
+}
+function openPrev(ev, id) {
+  ev.stopPropagation();
+  let p = null;
+  for (const c of state.cards) { p = (c.previous_photos || []).find(x => x.id === id); if (p) break; }
+  const cap = p ? fmtDate(p.created_at) + ' ' + (p.worker_name || '') : '';
+  showLb('<img src="' + fileUrl(id) + '" alt="">', '前回の完成形 ' + cap);
 }
 
 // ── 撮影 → (写真は縮小) → アップロード。operation_id で再送しても二重登録されない ──
@@ -612,7 +692,10 @@ async function handlePicked(kind, file) {
     return;
   }
   const opId = newOpId();
-  pendingTiles.set(opId, { pageId, kind, blob, failed: false });
+  // 送信中も撮った写真をそのまま見せる (ローカルのプレビュー。成功したら解放)
+  let previewUrl = null;
+  try { previewUrl = kind === 'photo' ? URL.createObjectURL(blob) : null; } catch (e) { /* 無くても送れる */ }
+  pendingTiles.set(opId, { opId, pageId, kind, blob, failed: false, previewUrl });
   rerenderDetail();
   uploadMedia(opId);
 }
@@ -665,6 +748,7 @@ async function uploadMedia(opId) {
     return;
   }
   pendingTiles.delete(opId);
+  if (p.previewUrl) { try { URL.revokeObjectURL(p.previewUrl); } catch (e) { /* 無視 */ } }
   if (j.deleteToken && j.media) saveMediaToken(j.media.id, j.deleteToken);
   const c = state.cards.find(x => x.page_id === p.pageId);
   if (c && !c.media.some(m => m.id === j.media.id)) c.media.push(j.media);
@@ -911,12 +995,6 @@ function openStFromDetail() { if (curDetail) openSt(null, curDetail); }
 // ─── ステータス変更 (Codex R2 ①: 保存中表示・処理中は全ボタン無効・失敗は大きく) ───
 let stTarget = null;   // page_id
 let stSaving = false;
-let stSkipPhoto = false;   // 「写真なしで完了 (職員判断)」を押したときだけ true
-
-function skipPhotoDone(to) {
-  stSkipPhoto = true;
-  doSetSt(to);
-}
 
 function openSt(ev, pageId) {
   if (ev) ev.stopPropagation();
@@ -924,7 +1002,6 @@ function openSt(ev, pageId) {
   const c = state.cards.find(x => x.page_id === pageId);
   if (!c) return;
   stTarget = pageId;
-  stSkipPhoto = false;
   $('#stName').textContent = c.title + ' (いま: ' + c.status + ')';
   $('#stMsg').textContent = '';
   $('#pinRow').style.display = 'none';
@@ -966,14 +1043,13 @@ async function doSetSt(to) {
     const r = await fetch(BASE + '/api/status', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ page_id: stTarget, to, expect: c.status, worker_id: worker.id,
-        pin: $('#pinIn').value.trim() || undefined, skip_photo: stSkipPhoto || undefined }),
+        pin: $('#pinIn').value.trim() || undefined }),
     });
     j = await r.json().catch(() => ({}));
   } catch (e) {
     j = { ok: false, error: 'network', message: '通信できませんでした (' + e.message + ')。もう一度お試しください' };
   }
   stSaving = false;
-  stSkipPhoto = false;   // スキップは1回の送信だけに効かせる
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
 
   // 一覧に残らないステータス (棚入完了) になったら、その場で行を外す (次の取得でも入ってこない)
@@ -1010,13 +1086,6 @@ async function doSetSt(to) {
     loadState();
     return;
   }
-  // 写真がまだ → 撮りにいくよう促す。職員判断で「写真なしで完了」もできる (履歴に残る)
-  if (j.error === 'photo_required') {
-    const m = $('#stMsg');
-    m.innerHTML = '❌ ' + esc(j.message || 'できあがりの写真がありません') +
-      ' <button class="reg" style="margin-top:6px" onclick="skipPhotoDone(\'' + esc(to) + '\')">写真なしで完了する (職員判断)</button>';
-    return;
-  }
   // PIN 関連はダイアログ内で入力し直せるようにする
   if (j.error === 'pin_required' || j.error === 'pin_invalid') {
     $('#pinRow').style.display = 'block';
@@ -1032,7 +1101,7 @@ async function doSetSt(to) {
 // ─── 起動・巡回 ───
 loadState();
 setInterval(() => { if (!stSaving) loadState(); }, 60_000);
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeSt(); closeMaster(); closeDetail(); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeLb(); closeSt(); closeMaster(); closeDetail(); } });
 </script>
 </body>
 </html>

@@ -19,6 +19,7 @@ import crypto from 'crypto';
 import { google } from 'googleapis';
 import { getDB } from './db.js';
 import { notionRequest, isNotionConfigured } from '../inbound-check/notion.js';
+import { codeKeyOf } from '../inbound-check/work-master.js';
 
 export const MAX_PHOTOS = 3;
 export const MAX_VIDEOS = 1;
@@ -60,14 +61,18 @@ export function countActiveMedia(pageId, kind) {
     WHERE page_id = ? AND kind = ? AND deleted_at IS NULL`).get(pageId, kind).c;
 }
 
+/** 1行 (配信 API 用。削除済みも返すので呼び元で deleted_at を見る) */
+export function getMediaRow(id) {
+  return getDB().prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id)) || null;
+}
+
 /**
- * 棚入完了ゲート用の写真枚数。送信待ち (stored) は数えるが、**10回失敗で停止した行は数えない**
- * (Codex PR3 #4: Drive にも Notion にも残らない写真だけで完了できてしまう)
+ * Drive 側で消えた (404/410) 写真に印を付け、表示と「前回の完成形」候補から外す (Codex R1 #5)。
+ * 一時的な失敗 (5xx) では呼ばない。管理画面の「再実行」(resetMedia) で解除できる
  */
-export function countActivePhotos(pageId) {
-  return getDB().prepare(`SELECT COUNT(*) c FROM f_iroha_card_media
-    WHERE page_id = ? AND kind = 'photo' AND deleted_at IS NULL
-      AND (next_retry_at IS NULL OR next_retry_at < ?)`).get(pageId, BLOCKED_UNTIL).c;
+export function markMediaUnavailable(id, reason) {
+  return getDB().prepare(`UPDATE f_iroha_card_media SET unavailable_at = ?, error = ? WHERE id = ? AND unavailable_at IS NULL`)
+    .run(utcNow(), String(reason || 'unavailable').slice(0, 300), Number(id)).changes > 0;
 }
 
 /** 先頭バイトだけ読む (動画をメモリへ丸ごと載せない) */
@@ -135,17 +140,76 @@ export function addMedia({ pageId, productCode = null, kind, mime, filePath, wor
 export function publicMedia(r) {
   return {
     id: r.id, kind: r.kind, status: r.status, url: r.drive_url || null,
+    // 画面で表示できるか (Drive 保存済み、または送信待ちでローカル実体あり)。表示は /api/media/:id/file 経由。
+    // Drive から消えた行・10回失敗で停止した行 (実体が残っている保証がない) は表示しない (Codex R1 #10)
+    viewable: !r.unavailable_at && !!(r.drive_file_id || (r.local_path && r.next_retry_at !== BLOCKED_UNTIL)),
+    unavailable: !!r.unavailable_at,
     worker_id: r.worker_id, worker_name: r.worker_name, created_at: r.created_at,
     error: r.next_retry_at === BLOCKED_UNTIL ? (r.error || '失敗') : null,   // 諦めた失敗だけ画面へ
   };
 }
 
+const LOST_LOCAL_MSG = '実体ファイルがありません (再起動で消えた可能性。撮り直してください)';
+
 /** page_id → 有効なメディア一覧 (一覧・詳細表示用) */
 export function mediaByPage() {
+  const db = getDB();
   const map = new Map();
-  for (const r of getDB().prepare(`SELECT * FROM f_iroha_card_media WHERE deleted_at IS NULL ORDER BY id`).all()) {
+  const rows = db.prepare(`SELECT * FROM f_iroha_card_media WHERE deleted_at IS NULL ORDER BY id`).all();
+  const lost = db.prepare('UPDATE f_iroha_card_media SET next_retry_at = ?, error = ? WHERE id = ?');
+  for (const r of rows) {
+    // 送信待ちの実体が消えていたら (再起動で一時領域が飛んだ等)、キューの再試行 (最大10回) を待たずに
+    // その場で停止扱いにする → 画面は「失敗」を出し、利用者は撮り直せる (Codex R2 #1)。
+    // existsSync は送信待ち (stored) の行だけ = 通常 0〜数件。パスが空の行も「実体なし」(Codex R3)
+    if (r.status === 'stored' && r.next_retry_at !== BLOCKED_UNTIL && (!r.local_path || !fs.existsSync(r.local_path))) {
+      lost.run(BLOCKED_UNTIL, LOST_LOCAL_MSG, r.id);
+      r.next_retry_at = BLOCKED_UNTIL; r.error = LOST_LOCAL_MSG;
+    }
     if (!map.has(r.page_id)) map.set(r.page_id, []);
     map.get(r.page_id).push(publicMedia(r));
+  }
+  return map;
+}
+
+// ─── HTTP 条件付きリクエストの小道具 (配信 API 用。純粋関数なのでここに置いてテストする) ───
+
+/** If-None-Match: 複数・弱い ETag (W/)・* を受ける (弱い比較) */
+export function etagMatches(header, etag) {
+  if (!header) return false;
+  return String(header).split(',').map(s => s.trim().replace(/^W\//, '')).some(t => t === '*' || t === etag);
+}
+/** If-Range: 単一の**強い** ETag だけ一致。W/ と * は不一致 = Range を無視して全体を返す (Codex R2 #2)。
+ *  HTTP-date は更新日時を検証できないので不一致扱い */
+export function ifRangeMatches(header, etag) {
+  return String(header || '').trim() === etag;
+}
+/** Range は単一の bytes=a-b / a- / -n だけ Drive へ転送する。複数・逆転・不正は null (無視して全体を返す)
+ *  — Drive の multipart/byteranges を素通しすると Content-Type が合わない (Codex R1 #1) */
+export function singleRange(header) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec(String(header || '').trim());
+  if (!m || (m[1] === '' && m[2] === '')) return null;
+  if (m[1] !== '' && m[2] !== '' && Number(m[1]) > Number(m[2])) return null;
+  return `bytes=${m[1]}-${m[2]}`;
+}
+
+/**
+ * 商品コード (codeKey) → 「前回の完成形」候補 (Drive 保存済みの写真、新しい順)。
+ * 写真は完了の証拠ではなく**次回同じ商品を作る人への見本** (中原さん 2026-09-03) —
+ * 同じ商品コードのカードが次に上がってきたとき、詳細の一番上に出す。
+ * ローカル実体だけの行 (stored) は再起動で消え得るので候補にしない。
+ * @returns Map<codeKey, Array<{id, page_id, worker_name, created_at}>>
+ */
+export function photosByCodeKey() {
+  const map = new Map();
+  const rows = getDB().prepare(`SELECT id, page_id, product_code, worker_name, created_at FROM f_iroha_card_media
+    WHERE kind = 'photo' AND deleted_at IS NULL AND unavailable_at IS NULL
+      AND drive_file_id IS NOT NULL AND product_code IS NOT NULL
+    ORDER BY id DESC`).all();
+  for (const r of rows) {
+    const key = codeKeyOf(r.product_code);
+    if (!key) continue;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push({ id: r.id, page_id: r.page_id, worker_name: r.worker_name, created_at: r.created_at });
   }
   return map;
 }
@@ -183,7 +247,8 @@ export function requestPageSync(pageId) {
     .run(pageId, utcNow());
 }
 
-/** 管理画面の「再実行」: ブロックを解除して即時キュー */
+/** 管理画面の「再実行」(送信側): ブロックを解除して即時キュー。「ドライブから消えた」印は
+ *  recheckUnavailable (Drive で実在を確かめてから解除) が担当 — 未検証のまま候補へ戻さない (Codex R2 #3) */
 export function resetMedia(id) {
   const n = getDB().prepare(`UPDATE f_iroha_card_media
     SET next_retry_at = NULL, error = NULL, attempt_count = 0 WHERE id = ?`).run(Number(id)).changes;
@@ -249,6 +314,62 @@ async function driveUploadReal({ localPath, filename, mime, operationId }) {
 
 let driveUploadImpl = driveUploadReal;
 export function _setDriveUpload(fn) { driveUploadImpl = fn || driveUploadReal; }
+
+/**
+ * Drive からの取り出し (配信 API 用)。Range をそのまま渡すと 206 + Content-Range が返る (動画のシーク)。
+ * @returns {{status:number, stream:ReadableStream, contentType:string|null, contentLength:string|null, contentRange:string|null}}
+ */
+async function driveDownloadReal({ fileId, range = null }) {
+  const drive = getDriveClient();
+  const res = await drive.files.get(
+    { fileId, alt: 'media', supportsAllDrives: true },
+    { responseType: 'stream', timeout: 120000, headers: range ? { Range: range } : {} },
+  );
+  return {
+    status: res.status, stream: res.data,
+    contentType: res.headers?.['content-type'] || null,
+    contentLength: res.headers?.['content-length'] || null,
+    contentRange: res.headers?.['content-range'] || null,
+  };
+}
+let driveDownloadImpl = driveDownloadReal;
+export function _setDriveDownload(fn) { driveDownloadImpl = fn || driveDownloadReal; }
+export function driveDownload(args) { return driveDownloadImpl(args); }
+
+/** Drive にファイルが実在するか (メタデータだけ取る。ゴミ箱は「無い」扱い) */
+async function driveExistsReal(fileId) {
+  const drive = getDriveClient();
+  const r = await drive.files.get({ fileId, fields: 'id, trashed', supportsAllDrives: true }, { timeout: 30000 });
+  return !!r.data?.id && !r.data.trashed;
+}
+let driveExistsImpl = driveExistsReal;
+export function _setDriveExists(fn) { driveExistsImpl = fn || driveExistsReal; }
+
+/**
+ * 「ドライブから消えた」印の解除 (管理画面の再実行)。Drive で実在を確かめてから解除する —
+ * 未検証のまま表示・「前回の完成形」候補へ戻さない (Codex R2 #3)
+ * @returns {ok:true} | {ok:false, error:'not_found'|'not_unavailable'|'still_unavailable'|'drive_error', message}
+ */
+export async function recheckUnavailable(id) {
+  const db = getDB();
+  const r = getMediaRow(id);
+  if (!r || r.deleted_at) return { ok: false, error: 'not_found', message: '写真・動画が見つかりません' };
+  if (!r.unavailable_at) return { ok: false, error: 'not_unavailable', message: 'この行に「ドライブから消えた」印はありません' };
+  if (!r.drive_file_id) return { ok: false, error: 'still_unavailable', message: 'Drive のファイルIDがありません' };
+  let exists = false;
+  try {
+    exists = await driveExistsImpl(r.drive_file_id);
+  } catch (e) {
+    const st = Number(e?.response?.status || e?.status || e?.code) || 0;
+    if (st !== 404 && st !== 410) return { ok: false, error: 'drive_error', message: `Drive を確認できませんでした (${e.message})` };
+  }
+  if (!exists) {
+    db.prepare('UPDATE f_iroha_card_media SET error = ? WHERE id = ?').run(`Drive に無いことを再確認 (${utcNow()})`, r.id);
+    return { ok: false, error: 'still_unavailable', message: 'Drive にファイルがありません (印はそのまま)' };
+  }
+  db.prepare('UPDATE f_iroha_card_media SET unavailable_at = NULL, error = NULL WHERE id = ?').run(r.id);
+  return { ok: true };
+}
 
 // ファイル名に個人名を入れない (要件 §6): 日時 + 商品コード + 種類 + operation_id
 function filenameFor(r) {

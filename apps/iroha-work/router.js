@@ -14,6 +14,7 @@
 import { Router } from 'express';
 import fs from 'fs';
 import path from 'path';
+import { pipeline } from 'stream';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
@@ -30,7 +31,8 @@ import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES 
 import { buildList, classifyMasterEdit, clearEnrichCache, masterOf } from './service.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import {
-  addMedia, softDeleteMedia, countActivePhotos, resetMedia, listMediaForAdmin, schedule as scheduleMedia,
+  addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
+  recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
   listPageSyncForAdmin, resetPageSync,
   isDriveConfigured, MEDIA_DIR, MAX_VIDEO_BYTES,
 } from './media.js';
@@ -114,7 +116,7 @@ router.use(access);
 router.get('/manifest.json', (req, res) => {
   res.json({
     name: 'いろは在庫化', short_name: 'いろは在庫化', start_url: `${BASE}/`, scope: `${BASE}/`,
-    display: 'standalone', orientation: 'any', background_color: '#F4F6F1', theme_color: '#3E8E5A',
+    display: 'standalone', orientation: 'any', background_color: '#F3F5F9', theme_color: '#1F5EFF',
     icons: [
       { src: '/app-icons/iroha-work-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
       { src: '/app-icons/iroha-work-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
@@ -254,28 +256,9 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
     }
   }
 
-  // 棚入完了には できあがり写真1枚以上 (要件 §6)。スキップは**本人確認済みの職員のみ**
-  // (skip_photo。changeStatus 側の staff_required に頼らず API 入口でも強制 — Codex PR3-R4)
-  let skipPhotoUsed = false;
-  if (to === '棚入完了' && countActivePhotos(pageId) === 0) {
-    if (!req.body?.skip_photo) {
-      return res.status(409).json({ ok: false, error: 'photo_required',
-        message: 'できあがりの写真がまだありません。写真を1枚以上とってから棚入完了にしてください' });
-    }
-    if (!isStaff) {
-      return res.status(403).json({ ok: false, error: 'staff_required',
-        message: '写真なしでの完了は職員のみです (職員の名前を選び、PINを入れてください)' });
-    }
-    skipPhotoUsed = true;
-  }
-
+  // 写真は「次回の見本」であって完了の証拠ではない → 棚入完了に写真は要らない
+  // (中原さん 2026-09-03。旧「写真1枚以上」ゲートと skip_photo は撤去)
   const r = await changeStatus({ pageId, to, expect, isStaff });
-  // スキップの履歴は**結果が出てから**残す (変更が失敗したのに「写真なしで完了した」と
-  // 記録しない — Codex PR3 #5)
-  if (skipPhotoUsed) {
-    safeLog({ action: 'status_skip_photo', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
-      deviceLabel: deviceLabelOf(req), to, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
-  }
   // 監査ログの失敗で Notion 更新済みの結果を「失敗」に見せない (Codex PR1 #6)
   try {
     logEvent({
@@ -449,6 +432,71 @@ router.post('/api/media', checkOrigin, mediaUpload.single('file'), api((req, res
   }
 }));
 
+/**
+ * 写真・動画の配信。iPad はサービスアカウントの Drive を直接見られない (フォルダは公開しない —
+ * 要件 §6) ので、ここを通して出す。Drive 保存済みなら Drive からストリーム (単一 Range を転送 =
+ * 動画のシーク・ETag で 304)、送信待ち (stored) なら MEDIA_DIR 配下のローカル実体。
+ * 認可 = 端末認証 (access)。⭐仕様: 登録済み端末 (いろはの共用 iPad) には、削除済み以外の全写真を
+ * 見せる — 「前回の完成形」は過去カードの写真をそのまま見本にする機能で、写真は商品の完成形
+ * (個人情報ではない・ファイル名に人名も入れない)。カードや写真を個別に隠す要件が出たらここで絞る
+ * (Codex R1 #3)。キャッシュは private + no-cache (ETag で再検証。削除・端末失効が翌日まで残らない)
+ */
+router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
+  const r = getMediaRow(Number(req.params.id));
+  const fail = (status, error, message) => { res.set('Cache-Control', 'no-store'); return res.status(status).json({ ok: false, error, message }); };
+  if (!r || r.deleted_at) return fail(404, 'not_found', '写真・動画が見つかりません');
+  if (r.unavailable_at) return fail(404, 'unavailable', 'この写真はドライブから消えています');
+  const mime = r.mime || (r.kind === 'photo' ? 'image/jpeg' : 'video/mp4');
+  // ①送信待ち: ローカル実体。DB の local_path を無条件に信じず MEDIA_DIR 配下だけ送る (Codex R1 #8)
+  if (r.local_path) {
+    const abs = path.resolve(r.local_path);
+    const rel = path.relative(path.resolve(MEDIA_DIR), abs);
+    const inside = rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+    if (inside && fs.existsSync(abs)) {
+      res.set('Cache-Control', 'private, no-cache');
+      return res.sendFile(abs, { headers: { 'Content-Type': mime } });
+    }
+  }
+  if (!r.drive_file_id) return fail(409, 'not_ready', 'まだ保存中です。少し待ってから開いてください');
+  // ②Drive 保存済み: ETag = file_id。変わらなければ Drive を叩かず 304
+  const etag = `"${r.drive_file_id}"`;
+  if (etagMatches(req.headers['if-none-match'], etag)) {
+    res.set('ETag', etag); res.set('Cache-Control', 'private, no-cache');
+    return res.status(304).end();
+  }
+  let range = singleRange(req.headers.range);
+  // If-Range は強い ETag の単一一致だけ (W/・*・日付は不一致 → Range を無視して全体 — Codex R2 #2)
+  if (range && req.headers['if-range'] && !ifRangeMatches(req.headers['if-range'], etag)) range = null;
+  let dl;
+  try {
+    dl = await driveDownload({ fileId: r.drive_file_id, range });
+  } catch (e) {
+    const st = Number(e?.response?.status || e?.status || e?.code) || 0;
+    res.set('Cache-Control', 'no-store');
+    if (st === 416) { res.set('Content-Range', `bytes */${r.size || '*'}`); return res.status(416).end(); }
+    if (st === 404 || st === 410) {
+      // Drive 側で消えた → 見本候補・表示から外す (毎回壊れた写真を選び続けない — Codex R1 #5)
+      markMediaUnavailable(r.id, `Drive ${st}`);
+      return fail(404, 'unavailable', 'この写真はドライブから消えています');
+    }
+    return fail(502, 'drive_error', `ドライブから取り出せませんでした (${e.message})`);
+  }
+  res.status(dl.status || 200);
+  res.set('ETag', etag);
+  res.set('Accept-Ranges', 'bytes');
+  res.set('Cache-Control', 'private, no-cache');
+  res.type(mime);
+  if (dl.contentLength) res.set('Content-Length', String(dl.contentLength));
+  if (dl.contentRange) res.set('Content-Range', dl.contentRange);
+  // クライアントが切ったら上流 (Drive) も止める — 動画のシーク連打で不要なダウンロードを残さない (Codex R1 #7)
+  res.on('close', () => { if (!res.writableFinished) dl.stream.destroy(); });
+  pipeline(dl.stream, res, (e) => {
+    if (!e) return;
+    if (e.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.error(`[iroha-work] media #${r.id} の配信エラー`, e.message);
+    if (!res.headersSent) { try { res.status(502).end(); } catch { /* 切れていれば何もしない */ } }
+  });
+}));
+
 // 撮り直し用の削除 (論理削除)。本人確認 = アップロード時に返した削除トークン
 // (worker_id は自己申告なので使わない — Codex PR3 #2)。職員はPCの管理画面 (セッション) から
 router.post('/api/media/:id(\\d+)/delete', checkOrigin, api((req, res) => {
@@ -460,9 +508,17 @@ router.post('/api/media/:id(\\d+)/delete', checkOrigin, api((req, res) => {
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 403)).json(r);
 }));
 
-// 失敗した送信の再実行 (管理画面)
-router.post('/admin/media/:id(\\d+)/retry', checkOrigin, requireAdmin, api((req, res) => {
-  if (!resetMedia(Number(req.params.id))) return res.status(404).json({ ok: false, error: 'not_found', message: '対象が見つかりません' });
+// 失敗した送信の再実行 (管理画面)。「ドライブから消えた」印の行は Drive で実在を確かめてから解除
+// (未検証のまま表示・見本候補へ戻さない — Codex R2 #3)
+router.post('/admin/media/:id(\\d+)/retry', checkOrigin, requireAdmin, api(async (req, res) => {
+  const id = Number(req.params.id);
+  const row = getMediaRow(id);
+  if (!row || row.deleted_at) return res.status(404).json({ ok: false, error: 'not_found', message: '対象が見つかりません' });
+  if (row.unavailable_at) {
+    const r = await recheckUnavailable(id);
+    return res.status(r.ok ? 200 : (r.error === 'drive_error' ? 502 : 409)).json(r);
+  }
+  if (!resetMedia(id)) return res.status(404).json({ ok: false, error: 'not_found', message: '対象が見つかりません' });
   res.json({ ok: true });
 }));
 
