@@ -62,16 +62,18 @@ export function createTables(db = getMirrorDB()) {
     -- 作業のやり方の選択肢 (資材セット・保管箱)。中原さん 2026-09-03: 編集はテキスト入力でなく、
     -- Excel (作業仕様マスタ) にある値を初期値の選択肢にしてタップで選ぶ。初見のものはその場で追加 (職員PIN)。
     -- 画像は後から付ける (image_url)。code = 表示名 兼 f_iroha_work_master に入る値そのもの
+    -- normalized_code = 比較用 (NFKC・空白統一・大文字化)。表記揺れ (D-8 / d-8 / Ｄ－８) を別候補にしない (Codex R1 #3)
     CREATE TABLE IF NOT EXISTS f_iroha_work_options (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      kind       TEXT NOT NULL CHECK (kind IN ('material','container')),
-      code       TEXT NOT NULL,
-      image_url  TEXT,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
-      created_at TEXT NOT NULL,
-      created_by TEXT,
-      UNIQUE(kind, code)
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind            TEXT NOT NULL CHECK (kind IN ('material','container')),
+      code            TEXT NOT NULL,
+      normalized_code TEXT NOT NULL,
+      image_url       TEXT,
+      sort_order      INTEGER NOT NULL DEFAULT 0,
+      active          INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+      created_at      TEXT NOT NULL,
+      created_by      TEXT,
+      UNIQUE(kind, normalized_code)
     );
 
     -- いろは名簿 (利用者/職員)。⭐staff.db とは別 (冒頭コメント参照)。
@@ -685,7 +687,14 @@ export const OPTION_KINDS = ['material', 'container'];
 const OPTION_LABEL = { material: '資材', container: '保管箱' };
 const OPTION_COLS = 'id, kind, code, image_url, sort_order, active';
 
-/** 選択肢一覧。kind を省くと全種類、includeInactive で無効も (管理画面用) */
+/** 比較用の正規化: NFKC (全角英数・全角空白→半角) + 連続空白を1つ + trim + 大文字化。表示は入力どおり (Codex R1 #3) */
+export function normalizeOptionCode(code) {
+  return String(code == null ? '' : code).normalize('NFKC').replace(/\s+/g, ' ').trim().toUpperCase();
+}
+/** 表示用の整形 (連続空白を1つ・trim。文字種は変えない) */
+const displayCode = (code) => String(code == null ? '' : code).replace(/\s+/g, ' ').trim();
+
+/** 選択肢一覧。kind を省くと全種類、includeInactive で無効も (管理画面用)。並び = よく使う順 (sort_order 昇順 = 使用回数の負数) */
 export function listWorkOptions(kind = null, includeInactive = false) {
   return getDB().prepare(`SELECT ${OPTION_COLS} FROM f_iroha_work_options
     WHERE (? IS NULL OR kind = ?) ${includeInactive ? '' : 'AND active = 1'} ORDER BY kind, sort_order, code`).all(kind, kind);
@@ -699,21 +708,28 @@ export function workOptionsByKind(includeInactive = false) {
 }
 
 /**
- * 追加。同じ値が無効で残っていれば有効に戻す (値の正規化 = 連続空白を1つに・前後 trim)。
- * @returns {ok:true, option, already?} | {ok:false, error, message}
+ * 追加。表記揺れは normalized_code で同一視。
+ * @param allowReactivate 同じ値が無効で残っているとき有効に戻してよいか — 管理者だけ true。
+ *   職員の「＋新しく登録」で管理者の無効化を解除できないようにする (Codex R1 #1)
+ * @returns {ok:true, option, already?, reactivated?} | {ok:false, error, message}
  */
-export function addWorkOption({ kind, code, actor }) {
+export function addWorkOption({ kind, code, actor, allowReactivate = false }) {
   if (!OPTION_KINDS.includes(kind)) return { ok: false, error: 'bad_kind', message: '種類は 資材 / 保管箱 のどちらかです' };
-  const c = String(code || '').replace(/\s+/g, ' ').trim();
-  if (!c || c.length > 100) return { ok: false, error: 'bad_code', message: `${OPTION_LABEL[kind]}は1〜100文字で入力してください` };
+  const c = displayCode(code);
+  const norm = normalizeOptionCode(c);
+  if (!c || !norm || c.length > 100) return { ok: false, error: 'bad_code', message: `${OPTION_LABEL[kind]}は1〜100文字で入力してください` };
   const db = getDB();
-  const dup = db.prepare(`SELECT ${OPTION_COLS} FROM f_iroha_work_options WHERE kind = ? AND code = ?`).get(kind, c);
+  const dup = db.prepare(`SELECT ${OPTION_COLS} FROM f_iroha_work_options WHERE kind = ? AND normalized_code = ?`).get(kind, norm);
   if (dup) {
-    if (!dup.active) db.prepare('UPDATE f_iroha_work_options SET active = 1 WHERE id = ?').run(dup.id);
-    return { ok: true, already: true, option: { ...dup, active: 1 } };
+    if (dup.active) return { ok: true, already: true, option: dup };
+    if (!allowReactivate) {
+      return { ok: false, error: 'inactive_option', message: `「${dup.code}」は管理者が候補から外しています (戻すのは管理画面から)` };
+    }
+    db.prepare('UPDATE f_iroha_work_options SET active = 1 WHERE id = ?').run(dup.id);
+    return { ok: true, already: true, reactivated: true, option: { ...dup, active: 1 } };
   }
-  const info = db.prepare(`INSERT INTO f_iroha_work_options (kind, code, active, created_at, created_by) VALUES (?, ?, 1, ?, ?)`)
-    .run(kind, c, utcNow(), actor || null);
+  const info = db.prepare(`INSERT INTO f_iroha_work_options (kind, code, normalized_code, active, created_at, created_by) VALUES (?, ?, ?, 1, ?, ?)`)
+    .run(kind, c, norm, utcNow(), actor || null);
   return { ok: true, option: db.prepare(`SELECT ${OPTION_COLS} FROM f_iroha_work_options WHERE id = ?`).get(Number(info.lastInsertRowid)) };
 }
 
@@ -721,30 +737,70 @@ export function setWorkOptionActive(id, active) {
   return getDB().prepare('UPDATE f_iroha_work_options SET active = ? WHERE id = ?').run(active ? 1 : 0, Number(id)).changes > 0;
 }
 
-/** 画像 (http(s) リンク)。空なら外す。後で Drive 保存の写真に差し替えられるよう URL で持つ */
+/**
+ * 画像リンクの検証。全 iPad が候補表示のたびに読みに行くので、任意の外部 URL は許さない (Codex R1 #2:
+ * 追跡 URL・LAN 内アドレス・巨大画像)。許可 = ポータル内 (/apps/… の相対パス。将来 Render 経由配信の写真) か、
+ * https の許可ホストだけ。認証情報つきは不可
+ */
+const IMAGE_HOST_ALLOW = ['drive.google.com', 'lh3.googleusercontent.com', 'bfaith-portal.onrender.com'];
+export function validateOptionImageUrl(raw) {
+  const u = String(raw || '').trim();
+  if (!u) return { ok: true, value: null };
+  if (u.length > 500) return { ok: false, message: '画像リンクが長すぎます (500文字まで)' };
+  if (/^\/apps\/[A-Za-z0-9_\-./?=&%]+$/.test(u) && !u.includes('..')) return { ok: true, value: u };
+  let url;
+  try { url = new URL(u); } catch { return { ok: false, message: '画像は https のリンクか、ポータル内 (/apps/…) のパスを入れてください' }; }
+  if (url.protocol !== 'https:') return { ok: false, message: '画像は https のリンクだけ使えます' };
+  if (url.username || url.password) return { ok: false, message: '認証情報つきのリンクは使えません' };
+  if (!IMAGE_HOST_ALLOW.includes(url.hostname)) return { ok: false, message: `画像のリンク先は ${IMAGE_HOST_ALLOW.join(' / ')} だけ使えます` };
+  return { ok: true, value: url.toString() };
+}
+
+/** 画像リンクを設定 (空なら外す)。後で Drive 保存の写真 (Render 経由配信) に差し替えられるよう URL で持つ */
 export function setWorkOptionImage(id, imageUrl) {
-  const u = String(imageUrl || '').trim();
-  if (u && !/^https?:\/\//i.test(u)) return { ok: false, error: 'bad_url', message: '画像は http(s) のリンクを入れてください' };
-  const n = getDB().prepare('UPDATE f_iroha_work_options SET image_url = ? WHERE id = ?').run(u || null, Number(id)).changes;
+  const v = validateOptionImageUrl(imageUrl);
+  if (!v.ok) return { ok: false, error: 'bad_url', message: v.message };
+  const n = getDB().prepare('UPDATE f_iroha_work_options SET image_url = ? WHERE id = ?').run(v.value, Number(id)).changes;
   return n > 0 ? { ok: true } : { ok: false, error: 'not_found', message: '選択肢が見つかりません' };
 }
 
 /**
- * f_iroha_work_master (Excel 取込・その場登録の値) に出てくる資材・保管箱を候補に補充する (INSERT OR IGNORE)。
- * Excel を取り込み直したあとも、一覧を開いたときに新しい値が拾われる (呼び元で数分に1回)
- * @returns {{material:number, container:number}} 追加件数
+ * f_iroha_work_master (Excel 取込・その場登録の値) に出てくる資材・保管箱を候補に補充する。
+ * マスタが変わった時だけ走らせる (件数 + 最終更新のフィンガープリント。成功した時だけ記憶するので、
+ * 失敗すれば次回また試す — Codex R1 #5 #6)。表記揺れは正規化で1つにまとめ、使用回数を sort_order に
+ * (多い順 = 上に出る。手動追加分は 0 = 末尾)
+ * @returns {{material:number, container:number, skipped:boolean}} 追加件数
  */
-export function seedWorkOptionsFromMaster() {
+let seedFingerprint = null;
+export function seedWorkOptionsFromMaster({ force = false } = {}) {
   const db = getDB();
-  const out = { material: 0, container: 0 };
+  const out = { material: 0, container: 0, skipped: false };
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get()) return out;
-  const ins = db.prepare(`INSERT OR IGNORE INTO f_iroha_work_options (kind, code, active, created_at, created_by) VALUES (?, ?, 1, ?, 'seed:work_master')`);
+  const fp = db.prepare('SELECT COUNT(*) c, MAX(updated_at) u FROM f_iroha_work_master').get();
+  const key = `${fp.c}|${fp.u || ''}`;
+  if (!force && seedFingerprint === key) { out.skipped = true; return out; }
+  const ins = db.prepare(`INSERT OR IGNORE INTO f_iroha_work_options (kind, code, normalized_code, active, sort_order, created_at, created_by)
+    VALUES (?, ?, ?, 1, 0, ?, 'seed:work_master')`);
+  const bump = db.prepare('UPDATE f_iroha_work_options SET sort_order = ? WHERE kind = ? AND normalized_code = ?');
   const now = utcNow();
   db.transaction(() => {
     for (const [kind, col] of [['material', 'material_code'], ['container', 'storage_container']]) {
-      const rows = db.prepare(`SELECT DISTINCT TRIM(${col}) v FROM f_iroha_work_master WHERE ${col} IS NOT NULL AND TRIM(${col}) <> ''`).all();
-      for (const r of rows) out[kind] += ins.run(kind, r.v, now).changes;
+      const rows = db.prepare(`SELECT ${col} v, COUNT(*) n FROM f_iroha_work_master WHERE ${col} IS NOT NULL AND TRIM(${col}) <> '' GROUP BY ${col}`).all();
+      const merged = new Map();   // normalized → { code (表記: 半角のものを優先、無ければ最初に見たもの), n (合算) }
+      for (const r of rows) {
+        const c = displayCode(r.v); const k = normalizeOptionCode(c);
+        if (!k) continue;
+        const m = merged.get(k) || { code: c, n: 0, canonical: false };
+        if (!m.canonical && c.normalize('NFKC') === c) { m.code = c; m.canonical = true; }
+        m.n += r.n; merged.set(k, m);
+      }
+      for (const [k, m] of merged) {
+        out[kind] += ins.run(kind, m.code, k, now).changes;
+        bump.run(-m.n, kind, k);
+      }
     }
   })();
+  seedFingerprint = key;
   return out;
 }
+export function _resetSeedFingerprint() { seedFingerprint = null; }

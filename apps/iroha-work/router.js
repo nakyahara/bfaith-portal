@@ -111,14 +111,11 @@ const api = fn => async (req, res) => {
   }
 };
 
-// 選択肢 (資材・保管箱) は作業仕様マスタの値から数分に1回補充してから返す (Excel 再取込後も候補に出る)
-let optionsSeededAt = 0;
-function workOptionsForState() {
-  if (Date.now() - optionsSeededAt > 5 * 60 * 1000) {
-    optionsSeededAt = Date.now();
-    try { seedWorkOptionsFromMaster(); } catch (e) { console.warn('[iroha-work] 選択肢の補充に失敗 (候補は前回のまま)', e.message); }
-  }
-  return workOptionsByKind();
+// 選択肢 (資材・保管箱) は作業仕様マスタの値から補充してから返す (Excel 再取込後も候補に出る)。
+// seed 自体がマスタの変化を見て (件数+最終更新) 変わった時だけ走る。失敗しても候補は前回のまま返し、次回また試す
+function workOptionsForState(includeInactive = false) {
+  try { seedWorkOptionsFromMaster(); } catch (e) { console.warn('[iroha-work] 選択肢の補充に失敗 (候補は前回のまま)', e.message); }
+  return workOptionsByKind(includeInactive);
 }
 
 router.use(access);
@@ -319,10 +316,13 @@ router.post('/api/options', checkOrigin, api((req, res) => {
     const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
     if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
   }
-  const r = addWorkOption({ kind: req.body?.kind, code: req.body?.code, actor: `${w.worker.display_name} (いろはアプリ)` });
-  if (!r.ok) return res.status(400).json(r);
+  // 記録上の主体: ポータルセッションなら本人 (worker_id は画面で選んだ名前に過ぎない — Codex R1 #4)。
+  // 無効化された候補の復帰は管理者だけ (allowReactivate=false — Codex R1 #1)
+  const actor = hasSessionAccess(req) ? `${req.iwUser} (ポータル)` : `${w.worker.display_name} (いろはアプリ)`;
+  const r = addWorkOption({ kind: req.body?.kind, code: req.body?.code, actor, allowReactivate: false });
+  if (!r.ok) return res.status(r.error === 'inactive_option' ? 409 : 400).json(r);
   safeLog({ action: 'option_add', pageId: null, workerId: w.worker.id, workerName: w.worker.display_name,
-    deviceLabel: deviceLabelOf(req), to: `${req.body?.kind}:${r.option.code}`, ok: true });
+    deviceLabel: deviceLabelOf(req), to: `${req.body?.kind}:${r.option.code}${r.already ? ' (既存)' : ''}`, ok: true });
   res.json(r);
 }));
 
@@ -663,7 +663,7 @@ router.get('/admin', requireSession, api((req, res) => {
     statuses: STATUSES,
     cache: cacheStatsForAdmin(),
     workers: listIrohaWorkers(true),
-    options: (seedWorkOptionsFromMaster(), workOptionsByKind(true)),
+    options: workOptionsForState(true),
     devices: isAdmin(req) ? listDevices() : [],
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     events: listEvents(50),
@@ -730,7 +730,8 @@ router.post('/admin/workers/:id(\\d+)/pin', checkOrigin, requireAdmin, api((req,
 
 // ─── 選択肢 (資材・保管箱) の管理 ───
 router.post('/admin/options', checkOrigin, requireAdmin, api((req, res) => {
-  const r = addWorkOption({ kind: req.body?.kind, code: req.body?.code, actor: req.session.email });
+  // 管理者は無効化した候補を同じ値の追加で戻せる (職員はできない)
+  const r = addWorkOption({ kind: req.body?.kind, code: req.body?.code, actor: req.session.email, allowReactivate: true });
   res.status(r.ok ? 200 : 400).json(r);
 }));
 router.post('/admin/options/:id(\\d+)/active', checkOrigin, requireAdmin, api((req, res) => {

@@ -742,27 +742,53 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
 
 console.log('\n[16] 作業のやり方の選択肢 (資材・保管箱): Excel 由来の候補 + その場登録');
 {
-  const { listWorkOptions, workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, seedWorkOptionsFromMaster } = await import('../apps/iroha-work/db.js');
+  const { listWorkOptions, workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, seedWorkOptionsFromMaster,
+    normalizeOptionCode, validateOptionImageUrl, _resetSeedFingerprint } = await import('../apps/iroha-work/db.js');
   const { addWorkMasterRow: addRow, updateWorkMasterRow: updRow } = await import('../apps/inbound-check/work-master.js');
-  const seedRow = addRow('OPT-SEED-1', 'test');
-  updRow('opt-seed-1', { material_code: ' D-8 ', storage_container: '20Lコンテナ' }, 'test', seedRow.row ? seedRow.row.version : seedRow.version);
+  // 前提: マスタ 2 行に資材・保管箱 (2 行目は全角・小文字の表記揺れ)。mirror_products に無いコードなので直接 INSERT (他テストと同じ)
+  const insMaster = getDB().prepare(`INSERT INTO f_iroha_work_master (code_key, 商品コード, material_code, storage_container, version, updated_at)
+    VALUES (?, ?, ?, ?, 1, ?)`);
+  insMaster.run('opt-seed-1', 'OPT-SEED-1', ' D-8 ', '20Lコンテナ', new Date().toISOString());
+  insMaster.run('opt-seed-2', 'OPT-SEED-2', 'ｄ－８', '20lコンテナ', new Date().toISOString());
+  void addRow; void updRow;
+  _resetSeedFingerprint();
   const seeded = seedWorkOptionsFromMaster();
-  ok(seeded.material >= 1 && seeded.container >= 1, `作業仕様マスタの資材・保管箱が候補に補充される (資材${seeded.material}/保管箱${seeded.container})`);
-  ok(listWorkOptions('material').some(o => o.code === 'D-8') && listWorkOptions('container').some(o => o.code === '20Lコンテナ'), '補充された値 (trim 済み)');
+  ok(seeded.material >= 1 && seeded.container >= 1 && !seeded.skipped, `作業仕様マスタの資材・保管箱が候補に補充される (資材${seeded.material}/保管箱${seeded.container})`);
+  const d8 = listWorkOptions('material').filter(o => normalizeOptionCode(o.code) === 'D-8');
+  ok(d8.length === 1 && d8[0].code === 'D-8' && d8[0].sort_order <= -2, `全角/小文字の同じ値は1候補にまとまり (表記は半角を優先)、使用回数ぶん上に並ぶ (実際 ${JSON.stringify(d8)})`);
+  ok(listWorkOptions('container').filter(o => normalizeOptionCode(o.code) === '20LコンテナHOGE'.replace('HOGE', '')).length === 1, '保管箱も大小文字を同一視');
   const again = seedWorkOptionsFromMaster();
-  ok(again.material === 0 && again.container === 0, '2回目は増えない (INSERT OR IGNORE)');
+  ok(again.skipped === true, 'マスタが変わっていなければ走らない (フィンガープリント)');
+  getDB().prepare("UPDATE f_iroha_work_master SET updated_at = ? WHERE code_key = 'opt-seed-1'").run(new Date(Date.now() + 3600 * 1000).toISOString());   // マスタが更新された (MAX(updated_at) が進む)
+  const after = seedWorkOptionsFromMaster();
+  ok(after.skipped === false && after.material === 0, 'マスタが更新されたら走る (新しい値が無ければ増えない = 冪等)');
+  ok(normalizeOptionCode('　Ｄ－８　 x\t') === 'D-8 X', 'normalize = NFKC + 空白統一 + trim + 大文字');
+
   const a = addWorkOption({ kind: 'material', code: '  D-99   x ', actor: 'test' });
-  ok(a.ok === true && a.option.code === 'D-99 x', '追加 (前後の空白は落とし、連続空白は1つに)');
-  ok(addWorkOption({ kind: 'material', code: 'D-99 x' }).already === true, '同じ値は既存を返す');
-  ok(addWorkOption({ kind: 'shelf', code: 'x' }).error === 'bad_kind' && addWorkOption({ kind: 'container', code: '   ' }).error === 'bad_code', '種類・空値は拒否');
+  ok(a.ok === true && a.option.code === 'D-99 x', '追加 (前後の空白は落とし、連続空白は1つに。表示は入力どおり)');
+  ok(addWorkOption({ kind: 'material', code: 'd-99 X' }).already === true, '大小文字違いは既存を返す (増やさない)');
+  ok(addWorkOption({ kind: 'shelf', code: 'x' }).error === 'bad_kind' && addWorkOption({ kind: 'container', code: ' 　 ' }).error === 'bad_code', '種類・空値 (全角空白) は拒否');
   ok(setWorkOptionActive(a.option.id, false) === true && !listWorkOptions('material').some(o => o.id === a.option.id), '無効化で画面の候補から消える');
   ok(listWorkOptions('material', true).some(o => o.id === a.option.id), '管理画面 (無効含む) には残る');
-  const back = addWorkOption({ kind: 'material', code: 'D-99 x' });
-  ok(back.already === true && back.option.active === 1 && listWorkOptions('material').some(o => o.id === a.option.id), '無効の値を再登録すると有効に戻る');
-  ok(setWorkOptionImage(a.option.id, 'javascript:x').error === 'bad_url' && setWorkOptionImage(a.option.id, 'https://example.com/d99.jpg').ok === true, '画像は http(s) のみ');
-  ok(setWorkOptionImage(999999, 'https://x/y.jpg').error === 'not_found', '無い id は not_found');
+  const staffTry = addWorkOption({ kind: 'material', code: 'D-99 x' });
+  ok(staffTry.ok === false && staffTry.error === 'inactive_option' && !listWorkOptions('material').some(o => o.id === a.option.id),
+    '職員の「新しく登録」では管理者が外した候補を戻せない (Codex R1 #1)');
+  const back = addWorkOption({ kind: 'material', code: 'D-99 x', allowReactivate: true });
+  ok(back.already === true && back.reactivated === true && listWorkOptions('material').some(o => o.id === a.option.id), '管理者 (allowReactivate) なら戻せる');
+
+  // 画像リンク: 全 iPad が読みに行くので許可先を絞る (Codex R1 #2)
+  ok(validateOptionImageUrl('').ok && validateOptionImageUrl('').value === null, '空 = 外す');
+  ok(validateOptionImageUrl('/apps/iroha-work/api/media/12/file').ok, 'ポータル内のパスは可');
+  ok(!validateOptionImageUrl('/apps/../etc/passwd').ok && !validateOptionImageUrl('/etc/x.jpg').ok, 'ポータル外のパス・.. は不可');
+  ok(!validateOptionImageUrl('http://drive.google.com/x.jpg').ok, 'http は不可');
+  ok(!validateOptionImageUrl('https://evil.example.com/track.gif').ok && !validateOptionImageUrl('https://192.168.68.62/x.jpg').ok && !validateOptionImageUrl('https://localhost/x.jpg').ok, '許可外ホスト・LAN・localhost は不可');
+  ok(!validateOptionImageUrl('https://user:pw@drive.google.com/x.jpg').ok, '認証情報つきは不可');
+  ok(!validateOptionImageUrl('javascript:alert(1)').ok && !validateOptionImageUrl('https://' + 'a'.repeat(600)).ok, 'javascript: と長すぎるリンクは不可');
+  ok(validateOptionImageUrl('https://drive.google.com/uc?id=abc').ok, '許可ホストの https は可');
+  ok(setWorkOptionImage(a.option.id, 'https://evil.example.com/x.jpg').error === 'bad_url' && setWorkOptionImage(a.option.id, 'https://lh3.googleusercontent.com/d99.jpg').ok === true, 'setWorkOptionImage も同じ検証');
+  ok(setWorkOptionImage(999999, 'https://drive.google.com/y.jpg').error === 'not_found', '無い id は not_found');
   const by = workOptionsByKind();
-  ok(Array.isArray(by.material) && Array.isArray(by.container) && by.material.find(o => o.id === a.option.id).image_url === 'https://example.com/d99.jpg', 'kind ごとの一覧に画像が載る');
+  ok(Array.isArray(by.material) && Array.isArray(by.container) && by.material.find(o => o.id === a.option.id).image_url === 'https://lh3.googleusercontent.com/d99.jpg', 'kind ごとの一覧に画像が載る');
 }
 
 console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動画リンク・スナップショット)');

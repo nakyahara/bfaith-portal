@@ -157,16 +157,19 @@
   .reg{border:1px solid var(--amber);background:var(--surface);color:var(--amber);
     border-radius:var(--r-sm);padding:5px 10px;font-weight:700;font-size:.82rem;cursor:pointer;font-family:var(--font)}
   /* ── 選択肢 (資材・保管箱): Excel 由来の候補からタップで選ぶ ── */
-  .opts{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 4px}
-  .opt{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);padding:8px 12px;
-    font-size:.95rem;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:6px;min-height:40px;font-family:var(--font)}
-  .opt img{width:28px;height:28px;object-fit:cover;border-radius:4px}
+  .opts{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 4px}
+  .opt{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);padding:8px 14px;
+    font-size:.98rem;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:8px;min-height:46px;font-family:var(--font)}
+  .opt img{width:32px;height:32px;object-fit:cover;border-radius:4px}
   .opt.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
   .opt.none{color:var(--faint);border-style:dashed}
   .opt.none.on{color:var(--accent-ink)}
+  .opt.legacy{border-style:dashed;border-color:var(--amber);background:var(--amber-soft);color:var(--amber)}
+  .opt.legacy small{font-weight:400;font-size:.72rem}
   .opt.add{color:var(--accent);border-color:var(--accent);border-style:dashed;background:var(--surface)}
-  .optnew{display:flex;gap:6px;width:100%;margin-top:4px}
-  .optnew input{flex:1;border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;font-size:1rem;background:var(--surface);color:var(--ink)}
+  .optq{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;font-size:1rem;background:var(--surface);color:var(--ink);margin:2px 0 6px}
+  .optnew{display:flex;gap:8px;width:100%;margin-top:4px}
+  .optnew input{flex:1;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 10px;font-size:1rem;background:var(--surface);color:var(--ink);min-height:46px}
   .mfields label{display:block;font-size:.78rem;color:var(--sub);font-weight:700;margin:10px 0 3px}
   .mfields input{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;
     font-size:1rem;background:var(--surface);color:var(--ink)}
@@ -275,9 +278,11 @@
       <div class="msaving" id="mvMsg"></div>
       <div class="mfields">
         <label>資材 (タップして選ぶ)</label>
+        <input class="optq" id="optqMaterial" placeholder="候補をしぼる (例: D-8)" hidden oninput="filterOpts('material', this.value)">
         <div class="opts" id="optMaterial"></div>
         <input type="hidden" id="mvMaterial">
         <label>保管箱 (タップして選ぶ)</label>
+        <input class="optq" id="optqContainer" placeholder="候補をしぼる (例: 20L)" hidden oninput="filterOpts('container', this.value)">
         <div class="opts" id="optContainer"></div>
         <input type="hidden" id="mvContainer">
         <label>入数 (保管箱1つに入れる数)</label><input id="mvUnits" type="number" min="0" inputmode="numeric">
@@ -901,17 +906,27 @@ const OPT_BOX = { material: 'optMaterial', container: 'optContainer' };
 const OPT_LABEL = { material: '資材', container: '保管箱' };
 const OPT_EXAMPLE = { material: 'D-8', container: '20Lコンテナ' };
 let optNewKind = null;   // 「＋新しく登録」の入力欄を開いている種類
+const OPT_SEARCH_FROM = 12;   // 候補がこれより多いときは「しぼる」入力を出す (チップだらけで誤タップしない — Codex R1 #8)
+const optFilter = { material: '', container: '' };
+function filterOpts(kind, v) { optFilter[kind] = v || ''; renderOpts(kind); }
 function renderOpts(kind) {
   const cur = document.getElementById(OPT_FIELD[kind]).value;
-  const list = (state.options && state.options[kind]) || [];
-  // 今の値が候補に無い (古いマスタ値など) ときも「選択中」として見せる
-  const extra = cur && !list.some(o => o.code === cur) ? [{ id: 0, code: cur, image_url: null }] : [];
+  const all = (state.options && state.options[kind]) || [];
+  const qEl = document.getElementById('optq' + kind.charAt(0).toUpperCase() + kind.slice(1));
+  if (qEl) qEl.hidden = all.length <= OPT_SEARCH_FROM;
+  const q = (optFilter[kind] || '').trim().toLowerCase();
+  const list = q ? all.filter(o => o.code.toLowerCase().includes(q)) : all;
   let h = '<button type="button" class="opt none' + (cur ? '' : ' on') + '" data-code="" onclick="pickOptEl(this,\'' + kind + '\')">なし</button>';
-  for (const o of [...extra, ...list]) {
+  // 今の値が候補に無い (管理者が外した・古いマスタ値) ときは「候補外」と分かる形で選択中に見せる (Codex R1 #7)
+  if (cur && !all.some(o => o.code === cur)) {
+    h += '<button type="button" class="opt on legacy" data-code="' + esc(cur) + '" onclick="pickOptEl(this,\'' + kind + '\')">' + esc(cur) + ' <small>(候補外)</small></button>';
+  }
+  for (const o of list) {
     // 値は data-code に持たせ onclick には埋めない (人が入れた文字列を JS 文字列にしない)
     h += '<button type="button" class="opt' + (o.code === cur ? ' on' : '') + '" data-code="' + esc(o.code) + '" onclick="pickOptEl(this,\'' + kind + '\')">' +
-      (o.image_url ? '<img src="' + esc(o.image_url) + '" alt="" onerror="this.remove()">' : '') + esc(o.code) + '</button>';
+      (o.image_url ? '<img src="' + esc(o.image_url) + '" alt="' + esc(o.code) + '" loading="lazy" onerror="this.remove()">' : '') + esc(o.code) + '</button>';
   }
+  if (q && list.length === 0) h += '<span class="hint" style="align-self:center">「' + esc(q) + '」に合う候補はありません</span>';
   h += '<button type="button" class="opt add" onclick="openOptNew(\'' + kind + '\')">＋ 新しく登録</button>';
   if (optNewKind === kind) {
     h += '<div class="optnew"><input id="optNewIn" maxlength="100" placeholder="新しい' + OPT_LABEL[kind] + ' (例: ' + OPT_EXAMPLE[kind] + ')">' +
@@ -947,6 +962,7 @@ async function saveOptNew(kind) {
     if (j.error === 'pin_required' || j.error === 'pin_invalid' || j.error === 'staff_required') {
       $('#mvPinRow').style.display = 'block'; $('#mvPin').value = ''; $('#mvPin').focus();
     }
+    // inactive_option (管理者が外した候補) はメッセージを出すだけ — 職員では戻せない
     $('#mvMsg').textContent = '❌ ' + (j.message || '登録できませんでした');
     return;
   }
