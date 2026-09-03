@@ -27,6 +27,21 @@ const ITEM_NO_RE = /^\d{9,10}$/;
 /** 送ってよい価格の上限 (公式: 1〜999999999) */
 const MAX_QOO10_PRICE = 999_999_999;
 const CALL_TIMEOUT_MS = 30_000;
+/**
+ * 送信後、照合の読み直しまで待つ時間と再試行。
+ * ★2026-09-02 実運用1件目で発覚: SetGoodsPriceQty 直後の GetItemDetailInfo は
+ *   **古い価格を返すことがある** (read-after-write の遅延)。即読みで照合すると
+ *   「送れたのに VERIFY_FAILED」になる。手動測定では 2秒待っていたので気づけなかった
+ */
+const VERIFY_WAIT_MS = 2_000;
+const VERIFY_RETRIES = 2;          // 待って読む × 最大3回 (2s + 3s + 4s)
+/**
+ * ★「結果不明」系は 502 でなく 503 で返す。
+ *   Cloudflare は origin の 502/504 の本文を自分のエラーページに差し替えるため、
+ *   502 で返すと Render には理由 (JSON) が届かず「HTTP 502」しか残らない (実測)。
+ *   503 なら本文がそのまま通り、classify() でも同じ「結果不明」に落ちる
+ */
+const UNKNOWNISH_STATUS = 503;
 
 function certKey() {
   const v = String(process.env.QOO10_CERT_KEY || '').trim();
@@ -239,30 +254,42 @@ router.patch('/items/:itemNo/price', requireWrite, rateLimitMiddleware('qoo10'),
         ExpireDate: plan.proceed.expireDate,
       });
       if (r.ResultCode !== 0) {
-        console.error(`[qoo10-price] FAILED ${itemNo} op=${operationId}: ${r.ResultCode} ${r.ResultMsg}`);
+        // Qoo10 が明示的に拒否 = 価格は変わっていない。意味の分かる失敗として 400
+        // (502 にすると Cloudflare が本文を差し替えて理由が Render に届かない)
+        console.error(`[qoo10-price] rejected ${itemNo} op=${operationId}: ${r.ResultCode} ${r.ResultMsg}`);
         return {
-          status: 502,
+          status: 400,
           body: { ok: false, state: 'failed', error: 'QOO10_REJECTED', message: `Qoo10 が受け付けませんでした (${r.ResultCode}: ${String(r.ResultMsg).slice(0, 120)})` },
         };
       }
 
-      // ★送った後に読み直して、本当にその価格・数量・終了日になっているか確かめる
-      const after = await readDetail(itemNo);
+      // ★送った後に読み直して、本当にその価格・数量・終了日になっているか確かめる。
+      //   即読みは古い価格が返ることがある (実測) ので、待ってから読み、合わなければ再試行
+      let after = null;
+      for (let attempt = 0; attempt <= VERIFY_RETRIES; attempt++) {
+        await new Promise((r2) => setTimeout(r2, VERIFY_WAIT_MS + attempt * 1_000));
+        after = await readDetail(itemNo);
+        if (!after.error && after.detail.sellPrice === next) break;
+        console.log(`[qoo10-price] verify retry ${attempt + 1}/${VERIFY_RETRIES + 1} ${itemNo}: ${after.error || 'まだ ' + after.detail?.sellPrice + '円'}`);
+      }
       if (after.error || after.detail.sellPrice !== next) {
+        console.error(`[qoo10-price] VERIFY_FAILED ${itemNo} op=${operationId}: 期待 ${next} / 実際 ${after.detail?.sellPrice ?? after.error}`);
         return {
-          status: 502,
+          status: UNKNOWNISH_STATUS,
           body: {
-            ok: false, state: 'failed', error: 'VERIFY_FAILED', mayHaveChanged: true,
-            message: `送信は受け付けられましたが、読み直した価格が合いません (期待 ${next} / 実際 ${after.detail?.sellPrice ?? after.error})`,
+            ok: false, error: 'VERIFY_FAILED', mayHaveChanged: true,
+            message: `送信は受け付けられましたが、読み直した価格が合いません (期待 ${next} / 実際 ${after.detail?.sellPrice ?? after.error})。`
+              + 'Qoo10 側の反映が遅れているだけの可能性があります。QSM か商品ページで確認してください',
           },
         };
       }
       if (after.detail.itemQty !== d.itemQty || after.detail.expireDate !== d.expireDate) {
         // 価格は変わったが、守るはずの数量・終了日が変わってしまった。成功にしない (人が見る)
+        console.error(`[qoo10-price] SIDE_EFFECT ${itemNo} op=${operationId}: Qty ${d.itemQty}->${after.detail.itemQty} Exp ${d.expireDate}->${after.detail.expireDate}`);
         return {
-          status: 502,
+          status: UNKNOWNISH_STATUS,
           body: {
-            ok: false, state: 'failed', error: 'SIDE_EFFECT_DETECTED', mayHaveChanged: true, applied: { [itemNo]: next },
+            ok: false, error: 'SIDE_EFFECT_DETECTED', mayHaveChanged: true, applied: { [itemNo]: next },
             message: `価格は ${next} 円になりましたが、数量か販売終了日が変わっています `
               + `(Qty ${d.itemQty}→${after.detail.itemQty} / ExpireDate ${d.expireDate}→${after.detail.expireDate})。`
               + '★このツールの復旧は価格しか戻せません。数量と販売終了日は QSM で人が直してください',
@@ -274,9 +301,10 @@ router.patch('/items/:itemNo/price', requireWrite, rateLimitMiddleware('qoo10'),
     });
     res.status(out.status).json(out.body);
   } catch (e) {
-    // 送信の途中で落ちた可能性がある → 502 (呼び出し側が「結果不明」に倒し、再送しない)
+    // 送信の途中で落ちた可能性がある → 503 (呼び出し側が「結果不明」に倒し、再送しない)。
+    // ★502 にしない — Cloudflare が本文を差し替えて理由が Render に届かなくなる
     console.error(`[qoo10-price] ERROR ${itemNo} op=${operationId}: ${e.message}`);
-    res.status(502).json({ ok: false, error: 'QAPI_ERROR', message: e.message });
+    res.status(UNKNOWNISH_STATUS).json({ ok: false, error: 'QAPI_ERROR', mayHaveChanged: true, message: e.message });
   }
 });
 
