@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="FBA箱詰め">
+  <title>FBA箱詰め記録</title>
+  <link rel="manifest" href="/apps/fba-box/manifest.json">
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; background: #F4F5F7; color: #2B2B2B;
+      font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+    button { font-family: inherit; }
+    .hidden { display: none !important; }
+
+    /* ─ 上部バー ─ */
+    .topbar { position: sticky; top: 0; z-index: 30; background: #B5651D; color: #fff;
+      padding: 10px 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .topbar .title { font-weight: 700; font-size: 1.05em; }
+    .topbar .sp { flex: 1; }
+    .chip { background: rgba(255,255,255,0.16); border-radius: 999px; padding: 6px 14px;
+      font-size: 0.95em; border: 0; color: #fff; cursor: pointer; }
+    .chip.warn { background: #E03131; }
+    .netbar { background: #E03131; color: #fff; text-align: center; padding: 10px; font-weight: 700; }
+    .savebar { background: #F59F00; color: #fff; text-align: center; padding: 6px; font-size: 0.9em; }
+
+    /* ─ 現在の箱 ─ */
+    .boxbar { position: sticky; top: 52px; z-index: 25; background: #fff; border-bottom: 2px solid #E9ECEF;
+      padding: 10px 12px; display: flex; align-items: center; gap: 10px; overflow-x: auto; }
+    .curbox { background: #FFF4E6; border: 2px solid #E8890C; border-radius: 14px; padding: 8px 16px;
+      font-weight: 800; font-size: 1.25em; color: #B5651D; white-space: nowrap; }
+    .curbox small { display: block; font-size: 0.55em; font-weight: 600; color: #A0742E; }
+    .boxbtn { border: 2px solid #DEE2E6; background: #fff; border-radius: 12px; padding: 8px 14px;
+      font-size: 1em; font-weight: 700; color: #495057; cursor: pointer; white-space: nowrap; }
+    .boxbtn.closed { background: #F1F3F5; color: #ADB5BD; }
+    .boxbtn.newbox { border-style: dashed; color: #B5651D; border-color: #E8890C; }
+
+    /* ─ タブ (梱包グループ) ─ */
+    .tabs { display: flex; gap: 8px; padding: 10px 12px 0; overflow-x: auto; }
+    .tab { border: 0; background: #E9ECEF; color: #495057; border-radius: 10px 10px 0 0;
+      padding: 10px 18px; font-size: 1em; font-weight: 700; cursor: pointer; white-space: nowrap; }
+    .tab.on { background: #fff; color: #B5651D; box-shadow: 0 -2px 6px rgba(0,0,0,0.06); }
+
+    /* ─ 行リスト ─ */
+    .rows { background: #fff; margin: 0 0 120px; }
+    .row { display: flex; align-items: center; gap: 10px; padding: 12px; border-bottom: 1px solid #F1F3F5; cursor: pointer; }
+    .row:nth-child(even) { background: #FAFBFC; }
+    .row.done { background: #EBFBEE; }
+    .row.short { background: #FFF5F5; }
+    .row .no { min-width: 74px; text-align: center; }
+    .row .no .plan { font-size: 0.78em; color: #868E96; }
+    .row .no .fn4 { font-family: ui-monospace, Menlo, monospace; font-weight: 800; font-size: 1.5em; letter-spacing: 0.06em; }
+    .row .name { flex: 1; line-height: 1.45; font-size: 1em; }
+    .row .name .sub { font-size: 0.8em; color: #868E96; }
+    .row .qty { min-width: 108px; text-align: right; }
+    .row .qty .rem { font-size: 1.5em; font-weight: 800; }
+    .row.done .qty .rem { color: #2B8A3E; }
+    .row:not(.done) .qty .rem { color: #C92A2A; }
+    .row .qty .of { font-size: 0.82em; color: #868E96; }
+    .badge { display: inline-block; border-radius: 6px; font-size: 0.72em; padding: 2px 7px; font-weight: 700; }
+    .badge.exp { background: #FFF3BF; color: #997404; }
+    .badge.short { background: #FFE3E3; color: #C92A2A; }
+    .badge.warnm { background: #FFE8CC; color: #B5651D; }
+
+    /* ─ ダイアログ共通 ─ */
+    .ovl { position: fixed; inset: 0; background: rgba(33,37,41,0.55); z-index: 60;
+      display: flex; align-items: center; justify-content: center; padding: 16px; }
+    .dlg { background: #fff; border-radius: 18px; width: min(96vw, 560px); max-height: 92vh;
+      overflow-y: auto; padding: 18px; }
+    .dlg h2 { margin: 0 0 4px; font-size: 1.1em; }
+    .dlg .fn { font-family: ui-monospace, Menlo, monospace; font-weight: 800; font-size: 1.7em; letter-spacing: 0.08em; }
+    .dlg .fn b { color: #B5651D; font-size: 1.25em; }
+    .dlg .pname { color: #495057; line-height: 1.5; margin: 6px 0 12px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+    .bigbtn { padding: 16px; font-size: 1.15em; font-weight: 800; border: 0; border-radius: 12px;
+      background: #B5651D; color: #fff; cursor: pointer; width: 100%; }
+    .bigbtn:disabled { background: #CED4DA; }
+    .bigbtn.sub { background: #E9ECEF; color: #495057; }
+    .bigbtn.green { background: #2B8A3E; }
+    .bigbtn.red { background: #E03131; }
+    .selbtn { padding: 12px 8px; font-size: 1.05em; font-weight: 700; border: 2px solid #DEE2E6;
+      border-radius: 10px; background: #fff; color: #495057; cursor: pointer; }
+    .selbtn.on { border-color: #B5651D; background: #FFF4E6; color: #B5651D; }
+    .qtyin { width: 100%; font-size: 2em; font-weight: 800; text-align: center; padding: 10px;
+      border: 2px solid #DEE2E6; border-radius: 12px; }
+    .lbl { font-size: 0.85em; color: #868E96; font-weight: 700; margin: 14px 0 6px; }
+    .msg { min-height: 1.4em; margin-top: 10px; font-size: 0.95em; }
+    .msg.err { color: #C92A2A; font-weight: 700; }
+    select.dsel { font-size: 1.15em; padding: 10px; border-radius: 10px; border: 2px solid #DEE2E6; width: 100%; }
+
+    /* ─ トースト (元に戻す) ─ */
+    .toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: 20px; z-index: 70;
+      background: #343A40; color: #fff; border-radius: 14px; padding: 12px 16px;
+      display: flex; align-items: center; gap: 14px; box-shadow: 0 6px 24px rgba(0,0,0,0.3); }
+    .toast button { border: 0; background: #F59F00; color: #212529; font-weight: 800;
+      border-radius: 10px; padding: 10px 16px; font-size: 1em; cursor: pointer; }
+
+    /* ─ 一覧 (納品回・作業者選択) ─ */
+    .center { max-width: 640px; margin: 24px auto; padding: 0 14px; }
+    .card { background: #fff; border-radius: 16px; padding: 18px; margin-bottom: 14px; }
+    .runbtn { display: flex; justify-content: space-between; align-items: center; width: 100%;
+      padding: 16px; margin-bottom: 10px; border: 2px solid #DEE2E6; border-radius: 14px;
+      background: #fff; font-size: 1.05em; cursor: pointer; text-align: left; }
+    .runbtn:disabled { opacity: 0.5; }
+    .runbtn .st { font-size: 0.8em; font-weight: 700; border-radius: 6px; padding: 3px 8px; }
+    .st.active { background: #D3F9D8; color: #2B8A3E; }
+    .st.setup { background: #FFF3BF; color: #997404; }
+    .st.done { background: #E9ECEF; color: #868E96; }
+    .wbtn { padding: 16px 8px; font-size: 1.1em; font-weight: 700; border: 2px solid #DEE2E6;
+      border-radius: 12px; background: #fff; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="netbar" class="netbar hidden">⚠ 通信できません — いまは入力できません (表示は続きます)</div>
+
+  <!-- 納品回の選択 -->
+  <div id="screen-runs" class="center">
+    <div class="card">
+      <h2 style="margin:0 0 12px">📦 FBA箱詰め記録</h2>
+      <div id="runlist">読み込み中…</div>
+    </div>
+    <div class="card" style="text-align:center; color:#868E96; font-size:0.9em">
+      納品回が出てこないときは、本社が「納品回の開始」をしているか確認してください
+    </div>
+  </div>
+
+  <!-- 作業画面 -->
+  <div id="screen-work" class="hidden">
+    <div class="topbar">
+      <button class="chip" id="btn-back">← 回を選ぶ</button>
+      <span class="title" id="run-title"></span>
+      <span class="sp"></span>
+      <button class="chip" id="btn-worker">👤 作業者を選ぶ</button>
+      <button class="chip" id="btn-tts">🔊 読み上げ ON</button>
+    </div>
+    <div id="savebar" class="savebar hidden">送信中…</div>
+    <div class="boxbar">
+      <div class="curbox" id="curbox" title="いま詰めている箱">
+        <small>いまの箱</small><span id="curbox-code">未選択</span>
+      </div>
+      <div id="boxbtns" style="display:flex; gap:8px;"></div>
+      <button class="boxbtn newbox" id="btn-newbox">＋ 新しい箱</button>
+    </div>
+    <div class="tabs" id="tabs"></div>
+    <div class="rows" id="rows"></div>
+  </div>
+
+  <div id="ovl-root"></div>
+  <div id="toast-root"></div>
+
+  <script>
+  'use strict';
+  const BASE = '/apps/fba-box';
+  const $ = s => document.querySelector(s);
+
+  // ─── 状態 ───
+  let runs = [];
+  let S = null;              // getRunState の結果 {run, groups, rows, boxes, placements}
+  let workers = [], materials = [];
+  let curRunId = null;
+  let curGroupId = null;
+  let curBoxId = null;       // 端末ローカル (localStorage) — 「いまの箱」は端末ごと
+  let worker = null;         // {id, display_name, worker_type}
+  let ttsOn = true;
+  let online = true;
+  let pollTimer = null;
+  let dialogOpen = false;
+
+  const LS = {
+    get(k, def) { try { const v = localStorage.getItem('fbx_' + k); return v == null ? def : JSON.parse(v); } catch { return def; } },
+    set(k, v) { try { localStorage.setItem('fbx_' + k, JSON.stringify(v)); } catch { /* noop */ } },
+  };
+
+  // ─── 通信 ───
+  async function apiGet(url) {
+    const r = await fetch(BASE + url, { headers: { 'Accept': 'application/json' } });
+    const j = await r.json().catch(() => ({ ok: false, message: '応答を解釈できません' }));
+    if (!r.ok && !j.message) j.message = 'HTTP ' + r.status;
+    return j;
+  }
+  async function apiPost(url, body) {
+    const r = await fetch(BASE + url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    const j = await r.json().catch(() => ({ ok: false, message: '応答を解釈できません' }));
+    j._status = r.status;
+    return j;
+  }
+  function setOnline(v) {
+    online = v;
+    $('#netbar').classList.toggle('hidden', v);
+  }
+
+  // ─── 読み上げ (商品名短縮 + FNSKU下4桁を1文字ずつ) ───
+  const CHAR_READ = { A:'エー', B:'ビー', C:'シー', D:'ディー', E:'イー', F:'エフ', G:'ジー', H:'エイチ', I:'アイ',
+    J:'ジェー', K:'ケー', L:'エル', M:'エム', N:'エヌ', O:'オー', P:'ピー', Q:'キュー', R:'アール', S:'エス',
+    T:'ティー', U:'ユー', V:'ブイ', W:'ダブリュー', X:'エックス', Y:'ワイ', Z:'ゼット',
+    '0':'ゼロ', '1':'イチ', '2':'ニー', '3':'サン', '4':'ヨン', '5':'ゴー', '6':'ロク', '7':'ナナ', '8':'ハチ', '9':'キュー' };
+  function shortName(name, maxLen = 22) {
+    let s = String(name || '').replace(/[【\[][^】\]]*[】\]]/g, ' ').replace(/[<＜][^>＞]*[>＞]/g, ' ');
+    s = s.replace(/\s+/g, ' ').trim();
+    return s ? s.slice(0, maxLen) : '商品名なし';
+  }
+  function fn4(fnsku) { return String(fnsku || '').slice(-4).toUpperCase(); }
+  function speakRow(row) {
+    if (!ttsOn || !('speechSynthesis' in window)) return;
+    const last4 = fn4(row.fnsku).split('').map(c => CHAR_READ[c] || c).join('、');
+    const text = `${shortName(row.product_name)}。ラベル、${last4}。${row.planned_qty - row.placed}個`;
+    try {
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ja-JP'; u.rate = Number(LS.get('rate', 1.0));
+      speechSynthesis.speak(u);
+    } catch { /* 読み上げは補助 — 失敗しても操作は続行 */ }
+  }
+
+  // ─── 納品回一覧 ───
+  async function loadRuns() {
+    const j = await apiGet('/api/runs').catch(() => ({ ok: false }));
+    setOnline(!!j.ok);
+    if (!j.ok) { $('#runlist').textContent = '読み込めませんでした。しばらくして再読み込みしてください'; return; }
+    runs = j.runs;
+    const stJa = { active: '作業できます', setup: '準備中 (本社確認待ち)', done: '完了', cancelled: '取消' };
+    $('#runlist').innerHTML = runs.length === 0 ? '納品回がまだありません' : runs.map(r => `
+      <button class="runbtn" data-id="${r.id}" ${r.status === 'active' ? '' : 'disabled'}>
+        <span>${esc(r.title)}<br><small style="color:#868E96">${r.row_count}商品 / ${r.group_count}グループ</small></span>
+        <span class="st ${r.status}">${stJa[r.status] || r.status}</span>
+      </button>`).join('');
+    $('#runlist').querySelectorAll('button[data-id]').forEach(b => {
+      b.addEventListener('click', () => openRun(Number(b.dataset.id)));
+    });
+  }
+
+  // ─── 作業画面 ───
+  async function openRun(runId) {
+    curRunId = runId;
+    curBoxId = LS.get('curbox_' + runId, null);
+    await refresh(true);
+    if (!S) return;
+    $('#screen-runs').classList.add('hidden');
+    $('#screen-work').classList.remove('hidden');
+    if (!worker) pickWorker();
+    startPolling();
+  }
+  function backToRuns() {
+    stopPolling();
+    $('#screen-work').classList.add('hidden');
+    $('#screen-runs').classList.remove('hidden');
+    curRunId = null; S = null;
+    loadRuns();
+  }
+
+  async function refresh(force) {
+    if (!curRunId) return;
+    if (dialogOpen && !force) return;   // 入力中に画面を差し替えない
+    await flushPendingPlacement();      // 未確定の割当があれば先に確定させる (同じ request_id)
+    try {
+      const j = await apiGet('/api/state?run=' + curRunId);
+      setOnline(!!j.ok || j._status === 404);
+      if (!j.ok) return;
+      S = j; workers = j.workers; materials = j.materials;
+      if (!curGroupId || !S.groups.some(g => g.id === curGroupId)) curGroupId = S.groups[0]?.id || null;
+      const boxOk = S.boxes.some(b => b.id === curBoxId && b.status === 'open' && b.pack_group_id === curGroupId);
+      if (!boxOk) curBoxId = null;
+      render();
+    } catch {
+      setOnline(false);
+    }
+  }
+  function startPolling() { stopPolling(); pollTimer = setInterval(() => refresh(false), 10000); }
+  function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+  function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+
+  function render() {
+    if (!S) return;
+    $('#run-title').textContent = S.run.title;
+    $('#btn-worker').textContent = worker ? `👤 ${worker.display_name}` : '👤 作業者を選ぶ';
+    $('#btn-worker').classList.toggle('warn', !worker);
+    // タブ
+    $('#tabs').innerHTML = S.groups.map(g => {
+      const rowsOf = S.rows.filter(r => r.pack_group_id === g.id);
+      const doneN = rowsOf.filter(r => rowDone(r)).length;
+      return `<button class="tab ${g.id === curGroupId ? 'on' : ''}" data-id="${g.id}">${esc(g.sheet_name)} (${doneN}/${rowsOf.length})</button>`;
+    }).join('');
+    $('#tabs').querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => {
+      curGroupId = Number(b.dataset.id);
+      const boxOk = S.boxes.some(x => x.id === curBoxId && x.status === 'open' && x.pack_group_id === curGroupId);
+      if (!boxOk) curBoxId = null;
+      render();
+    }));
+    // 箱バー
+    const boxes = S.boxes.filter(b => b.pack_group_id === curGroupId);
+    const cur = boxes.find(b => b.id === curBoxId);
+    $('#curbox-code').textContent = cur ? `${cur.box_code} (${cur.total_qty}個)` : '未選択';
+    $('#boxbtns').innerHTML = boxes.map(b => `
+      <button class="boxbtn ${b.status === 'closed' ? 'closed' : ''}" data-id="${b.id}">
+        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個</small>
+      </button>`).join('');
+    $('#boxbtns').querySelectorAll('.boxbtn').forEach(b => b.addEventListener('click', () => openBoxDialog(Number(b.dataset.id))));
+    // 行リスト
+    const rows = S.rows.filter(r => r.pack_group_id === curGroupId);
+    $('#rows').innerHTML = rows.map(r => {
+      const rem = r.planned_qty - r.placed - (r.shortage_qty || 0);
+      const done = rowDone(r);
+      return `<div class="row ${done ? 'done' : ''} ${r.shortage_qty ? 'short' : ''}" data-id="${r.id}">
+        <div class="no"><div class="plan">${esc(r.plan_no || '—')}</div><div class="fn4">${esc(fn4(r.fnsku))}</div></div>
+        <div class="name">${esc(r.product_name || r.seller_sku)}
+          <div class="sub">${esc(r.fnsku)}
+            ${r.match_state === 'qty_mismatch' ? '<span class="badge warnm">数量注意</span>' : ''}
+            ${r.match_state === 'excel_only' ? '<span class="badge warnm">プラン外</span>' : ''}
+            ${r.shortage_qty ? `<span class="badge short">不足${r.shortage_qty}</span>` : ''}
+            ${expiryOf(r.id) ? `<span class="badge exp">期限 ${esc(expiryOf(r.id))}</span>` : ''}
+            ${r.label_worker ? `👤${esc(r.label_worker)}` : ''}${r.check_worker ? ` ✅${esc(r.check_worker)}` : ''}
+          </div>
+        </div>
+        <div class="qty"><span class="rem">${done ? '✓' : rem}</span><div class="of">${r.placed}/${r.planned_qty}</div></div>
+      </div>`;
+    }).join('');
+    $('#rows').querySelectorAll('.row').forEach(el => el.addEventListener('click', () => openRowDialog(Number(el.dataset.id))));
+  }
+  function rowDone(r) { return r.placed + (r.shortage_qty || 0) >= r.planned_qty && r.planned_qty > 0; }
+  function expiryOf(rowId) {
+    const p = (S.placements || []).find(p => p.row_id === rowId && p.expiry);
+    return p ? p.expiry : null;
+  }
+
+  // ─── ダイアログ部品 ───
+  function openDialog(html) {
+    dialogOpen = true;
+    $('#ovl-root').innerHTML = `<div class="ovl"><div class="dlg">${html}</div></div>`;
+    $('#ovl-root .ovl').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeDialog(); });
+    return $('#ovl-root .dlg');
+  }
+  function closeDialog() { dialogOpen = false; $('#ovl-root').innerHTML = ''; refresh(true); }
+
+  // ─── 作業者選択 ───
+  function pickWorker() {
+    const dlg = openDialog(`
+      <h2>👤 作業者を選んでください</h2>
+      <div class="grid3" style="margin-top:12px" id="wgrid">
+        ${workers.map(w => `<button class="wbtn" data-id="${w.id}">${esc(w.display_name)}${w.worker_type === 'staff' ? ' 🔑' : ''}</button>`).join('')}
+      </div>
+      <div class="msg" style="color:#868E96">🔑 = 職員。名簿は本社の管理画面で登録します</div>`);
+    dlg.querySelectorAll('.wbtn').forEach(b => b.addEventListener('click', () => {
+      worker = workers.find(w => w.id === Number(b.dataset.id));
+      LS.set('worker', worker.id);
+      closeDialog();
+    }));
+  }
+
+  // ─── 商品行ダイアログ (割当・担当者・読み上げ) ───
+  function openRowDialog(rowId) {
+    const r = S.rows.find(x => x.id === rowId);
+    if (!r) return;
+    const rem = r.planned_qty - r.placed - (r.shortage_qty || 0);
+    const boxes = S.boxes.filter(b => b.pack_group_id === r.pack_group_id && b.status === 'open');
+    const cur = boxes.find(b => b.id === curBoxId);
+    const knownExpiry = expiryOf(r.id);
+    speakRow(r);
+    const dlg = openDialog(`
+      <div class="fn">${esc(r.fnsku).slice(0, -4)}<b>${esc(fn4(r.fnsku))}</b></div>
+      <div class="pname">${esc(r.product_name || r.seller_sku)}
+        <button class="chip" style="background:#E9ECEF;color:#495057" id="d-tts">🔊 もう一度</button></div>
+      <div class="grid2">
+        <div>予定 <b style="font-size:1.3em">${r.planned_qty}</b></div>
+        <div>残り <b style="font-size:1.3em; color:${rem > 0 ? '#C92A2A' : '#2B8A3E'}">${rem}</b></div>
+      </div>
+      ${rem > 0 ? `
+        <div class="lbl">📦 入れる箱 ${cur ? `= <b>${esc(cur.box_code)}</b>` : '(「いまの箱」が未選択です)'}</div>
+        ${cur ? '' : `<div class="grid3">${boxes.map(b => `<button class="selbtn boxpick" data-id="${b.id}">${esc(b.box_code)}</button>`).join('')}
+          <button class="selbtn boxnew">＋新しい箱</button></div>`}
+        <div class="lbl">個数</div>
+        <input class="qtyin" id="d-qty" type="tel" inputmode="numeric" value="${rem}">
+        <div class="lbl">置いた場所 (わかれば)</div>
+        <div class="grid3">
+          <button class="selbtn layer" data-v="bottom">⬇ 下</button>
+          <button class="selbtn layer" data-v="middle">↔ 中</button>
+          <button class="selbtn layer" data-v="top">⬆ 上</button>
+        </div>
+        <div class="lbl">賞味期限 (期限のある商品だけ)</div>
+        ${knownExpiry
+          ? `<div>この商品の期限: <b>${esc(knownExpiry)}</b> (2回目からは自動で同じ期限になります)</div>`
+          : `<div class="grid3">
+              <select class="dsel" id="d-ey"><option value="">年</option>${expiryYears()}</select>
+              <select class="dsel" id="d-em"><option value="">月</option>${range(1, 12).map(m => `<option>${String(m).padStart(2, '0')}</option>`).join('')}</select>
+              <select class="dsel" id="d-ed"><option value="">日</option>${range(1, 31).map(m => `<option>${String(m).padStart(2, '0')}</option>`).join('')}</select>
+            </div>`}
+        <div style="margin-top:16px"><button class="bigbtn" id="d-add" ${cur ? '' : 'disabled'}>この箱に入れた</button></div>
+      ` : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>`}
+      <div class="lbl">👤 担当者の記録</div>
+      <div class="grid2">
+        <button class="selbtn" id="d-lw">ラベル貼り: ${esc(r.label_worker || '—')}</button>
+        <button class="selbtn" id="d-cw">確認: ${esc(r.check_worker || '—')}</button>
+      </div>
+      <div class="lbl">⚠ 困ったとき (職員)</div>
+      <div class="grid2">
+        <button class="selbtn" id="d-short">${r.shortage_qty ? `不足${r.shortage_qty} を直す` : '数が足りない'}</button>
+        <button class="selbtn" id="d-close">閉じる</button>
+      </div>
+      <div class="msg" id="d-msg"></div>`);
+
+    let layer = null;
+    dlg.querySelectorAll('.layer').forEach(b => b.addEventListener('click', () => {
+      const on = !b.classList.contains('on');
+      dlg.querySelectorAll('.layer').forEach(x => x.classList.remove('on'));
+      layer = on ? b.dataset.v : null;
+      if (on) b.classList.add('on');
+    }));
+    dlg.querySelectorAll('.boxpick').forEach(b => b.addEventListener('click', () => {
+      setCurBox(Number(b.dataset.id));
+      closeDialog(); openRowDialog(rowId);
+    }));
+    dlg.querySelector('.boxnew')?.addEventListener('click', () => { closeDialog(); newBoxDialog(() => openRowDialog(rowId)); });
+    dlg.querySelector('#d-tts').addEventListener('click', () => speakRow(r));
+    dlg.querySelector('#d-close').addEventListener('click', closeDialog);
+    dlg.querySelector('#d-lw').addEventListener('click', () => pickRowWorker(r, 'label_worker'));
+    dlg.querySelector('#d-cw').addEventListener('click', () => pickRowWorker(r, 'check_worker'));
+    dlg.querySelector('#d-short').addEventListener('click', () => shortageDialog(r));
+    dlg.querySelector('#d-add')?.addEventListener('click', async () => {
+      const msg = dlg.querySelector('#d-msg');
+      if (!worker) { msg.className = 'msg err'; msg.textContent = '先に作業者を選んでください'; pickWorker(); return; }
+      if (!online) { msg.className = 'msg err'; msg.textContent = '通信できないため入力できません'; return; }
+      const qty = Number(dlg.querySelector('#d-qty').value);
+      let expiry = knownExpiry ? null : readExpiry(dlg);
+      if (expiry === false) { msg.className = 'msg err'; msg.textContent = '期限は 年・月 まで選んでください (日は任意)'; return; }
+      dlg.querySelector('#d-add').disabled = true;
+      msg.className = 'msg'; msg.textContent = '送信中…';
+      const j = await sendPlacement({ rowId: r.id, boxId: curBoxId, qty, layer, expiry });
+      if (j.ok) {
+        closeDialog();
+        showUndoToast(j.placementId, r, qty);
+      } else {
+        msg.className = 'msg err'; msg.textContent = j.message || '登録できませんでした';
+        dlg.querySelector('#d-add').disabled = false;
+        if (j._status === 409) refresh(true);
+      }
+    });
+  }
+
+  function range(a, b) { const out = []; for (let i = a; i <= b; i++) out.push(i); return out; }
+  function expiryYears() {
+    const y = new Date().getFullYear();
+    return range(y, y + 6).map(v => `<option>${v}</option>`).join('');
+  }
+  function readExpiry(dlg) {
+    const ey = dlg.querySelector('#d-ey'), em = dlg.querySelector('#d-em'), ed = dlg.querySelector('#d-ed');
+    if (!ey) return null;
+    const y = ey.value, m = em.value, d = ed.value;
+    if (!y && !m && !d) return null;
+    if (!y || !m) return false;
+    return d ? `${y}-${m}-${d}` : `${y}-${m}`;
+  }
+
+  /**
+   * 割当送信。request_id で冪等 (サーバーは内容hashも突合)。
+   * 応答が返るまで payload ごと localStorage に残し、応答喪失後の再送でも**同じ id** を
+   * 使い続ける (Codex PR1 #6: 手動リトライで新しい id を発行すると二重登録になる)
+   */
+  /**
+   * 割当POSTの「確定した応答」判定: アプリが返した構造化JSON (ok フィールドあり) かつ 5xx でない
+   * ときだけ確定とみなす。プロキシの502や解釈不能な応答は「サーバーが処理したか不明」なので
+   * pending を保持し、同じ request_id で再送する (Codex PR1-R2 #2)
+   */
+  async function postPlacementDefinitive(body) {
+    const r = await fetch(BASE + '/api/placements', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    let j = null;
+    try { j = await r.json(); } catch { /* JSONでない = アプリ応答でない */ }
+    if (r.status >= 500 || !j || typeof j.ok !== 'boolean') {
+      throw new Error('indeterminate');   // 確定していない — 呼び出し側は pending を残す
+    }
+    j._status = r.status;
+    return j;
+  }
+  let flushing = false;
+  async function flushPendingPlacement() {
+    const pend = LS.get('pending_place', null);
+    if (!pend || flushing) return;
+    flushing = true;
+    try {
+      await postPlacementDefinitive(pend.body);   // 確定応答 (成功/業務エラー) が返ったときだけ消す
+      LS.set('pending_place', null);
+      setOnline(true);
+    } catch { /* 未確定 — pending は残す */ } finally { flushing = false; }
+  }
+  async function sendPlacement({ rowId, boxId, qty, layer, expiry }) {
+    await flushPendingPlacement();   // 前回の未確定分を先に片付ける
+    if (LS.get('pending_place', null)) {
+      return { ok: false, message: '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください' };
+    }
+    const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+    const body = {
+      run_id: curRunId, row_id: rowId, box_id: boxId, qty, layer: layer || null,
+      expiry: expiry || null, worker_id: worker.id, request_id: requestId,
+    };
+    LS.set('pending_place', { requestId, body });
+    showSaving(true);
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const j = await postPlacementDefinitive(body);
+          LS.set('pending_place', null);
+          setOnline(true);
+          return j;
+        } catch (e) {
+          if (attempt === 0) { await new Promise(r => setTimeout(r, 1200)); continue; }
+          setOnline(false);
+          return { ok: false, message: '通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)' };
+        }
+      }
+    } finally {
+      showSaving(false);
+    }
+  }
+  function showSaving(v) { $('#savebar').classList.toggle('hidden', !v); }
+
+  function showUndoToast(placementId, row, qty) {
+    $('#toast-root').innerHTML = `<div class="toast">
+      <span>✅ ${esc(shortName(row.product_name, 14))} を ${qty}個 記録しました</span>
+      <button id="undo">元に戻す</button></div>`;
+    const t = setTimeout(() => { $('#toast-root').innerHTML = ''; }, 8000);
+    $('#undo').addEventListener('click', async () => {
+      clearTimeout(t); $('#toast-root').innerHTML = '';
+      const j = await apiPost(`/api/placements/${placementId}/revoke`, { worker_id: worker.id });
+      if (!j.ok) alert(j.message || '戻せませんでした (職員を呼んでください)');
+      refresh(true);
+    });
+  }
+
+  function setCurBox(id) { curBoxId = id; LS.set('curbox_' + curRunId, id); }
+
+  // ─── 箱 ───
+  function newBoxDialog(after) {
+    const dlg = openDialog(`
+      <h2>＋ 新しい箱</h2>
+      <div class="lbl">段ボールの種類</div>
+      <div class="grid3">${materials.map(m => `<button class="selbtn mat" data-id="${esc(m.code)}">${esc(m.name)}</button>`).join('')}</div>
+      <div style="margin-top:16px"><button class="bigbtn" id="mk" disabled>箱をつくる</button></div>
+      <div class="msg" id="m-msg"></div>`);
+    let mat = null;
+    dlg.querySelectorAll('.mat').forEach(b => b.addEventListener('click', () => {
+      dlg.querySelectorAll('.mat').forEach(x => x.classList.remove('on'));
+      b.classList.add('on'); mat = b.dataset.id; dlg.querySelector('#mk').disabled = false;
+    }));
+    dlg.querySelector('#mk').addEventListener('click', async () => {
+      if (!worker) { pickWorker(); return; }
+      const j = await apiPost('/api/boxes', { pack_group_id: curGroupId, material_code: mat, worker_id: worker.id });
+      if (!j.ok) { const m = dlg.querySelector('#m-msg'); m.className = 'msg err'; m.textContent = j.message; return; }
+      setCurBox(j.boxId);
+      closeDialog();
+      alert(`📦 箱「${j.boxCode}」をつくりました。\n箱に太いペンで「${j.boxCode}」と書いてください`);
+      if (after) after();
+    });
+  }
+
+  async function openBoxDialog(boxId) {
+    const b = S.boxes.find(x => x.id === boxId);
+    if (!b) return;
+    const j = await apiGet(`/api/boxes/${boxId}`);
+    const contents = j.ok ? j.contents : [];
+    const layJa = { bottom: '下', middle: '中', top: '上' };
+    const dlg = openDialog(`
+      <h2>📦 ${esc(b.box_code)} ${b.status === 'closed' ? '(閉じた箱)' : ''}</h2>
+      <div style="color:#868E96; font-size:0.9em">${b.total_qty}個 / ${b.sku_count}種類${b.measured_weight_kg ? ` / 実測 ${b.measured_weight_kg}kg` : ''}</div>
+      <div style="margin:12px 0; max-height:40vh; overflow-y:auto">
+        ${contents.length === 0 ? 'まだ空です' : contents.map(p => `
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #F1F3F5">
+            <span>${esc(shortName(p.product_name, 18))} <small style="color:#868E96">${esc(fn4(p.fnsku))}${p.expiry ? ' / ' + esc(p.expiry) : ''}${p.placement_layer ? ' / ' + layJa[p.placement_layer] : ''}</small></span>
+            <span><b>${p.qty}個</b>
+              ${b.status === 'open' ? `<button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px; margin-left:8px">↩</button>` : ''}
+            </span>
+          </div>`).join('')}
+      </div>
+      ${b.status === 'open' ? `
+        <div class="grid2">
+          <button class="bigbtn sub" id="b-use">この箱に詰める</button>
+          <button class="bigbtn green" id="b-close2" ${contents.length === 0 ? 'disabled' : ''}>読み合わせて閉じる</button>
+        </div>` : `
+        <button class="bigbtn sub" id="b-reopen">職員: 箱を開け直す</button>`}
+      <div class="msg" id="b-msg"></div>`);
+    dlg.querySelector('#b-use')?.addEventListener('click', () => { setCurBox(b.id); closeDialog(); });
+    dlg.querySelector('#b-close2')?.addEventListener('click', () => closeBoxDialog(b, contents));
+    dlg.querySelector('#b-reopen')?.addEventListener('click', () => staffPinPrompt(async (staffWorker, pin) => {
+      const reason = prompt('開け直す理由 (例: 詰め直し)');
+      if (!reason) return;
+      const j2 = await apiPost(`/api/boxes/${b.id}/reopen`, { worker_id: staffWorker.id, pin, reason });
+      if (!j2.ok) alert(j2.message);
+      closeDialog();
+    }));
+    dlg.querySelectorAll('.rvk').forEach(btn => btn.addEventListener('click', async () => {
+      if (!worker) { pickWorker(); return; }
+      if (!confirm('この記録を取り消しますか?')) return;
+      let j2 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: worker.id });
+      if (!j2.ok && j2.error === 'staff_required') {
+        staffPinPrompt(async (staffWorker, pin) => {
+          const reason = prompt('取消の理由');
+          if (!reason) return;
+          const j3 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: staffWorker.id, pin, reason, as_staff: true });
+          if (!j3.ok) alert(j3.message);
+          closeDialog(); openBoxDialog(boxId);
+        });
+        return;
+      }
+      if (!j2.ok) alert(j2.message);
+      closeDialog(); openBoxDialog(boxId);
+    }));
+  }
+
+  /** 箱クローズ = 読み合わせ → 実測重量 → 理由・緩衝材 (要件 D6 / 結果シグナル) */
+  function closeBoxDialog(b, contents) {
+    const dlg = openDialog(`
+      <h2>✅ ${esc(b.box_code)} を閉じます — 読み合わせ</h2>
+      <div style="margin:10px 0; max-height:30vh; overflow-y:auto; background:#F8F9FA; border-radius:10px; padding:10px">
+        ${contents.map(p => `<div style="padding:4px 0">・${esc(shortName(p.product_name, 20))} <b>${p.qty}個</b>${p.expiry ? ` (期限 ${esc(p.expiry)})` : ''}</div>`).join('')}
+        <div style="border-top:1px solid #DEE2E6; margin-top:6px; padding-top:6px"><b>合計 ${b.total_qty}個 / ${b.sku_count}種類</b></div>
+      </div>
+      <div class="lbl">⚖ はかりの重さ (kg) — 必須</div>
+      <input class="qtyin" id="c-kg" type="text" inputmode="decimal" placeholder="例: 12.4">
+      <div class="lbl">箱を閉じる理由</div>
+      <div class="grid3">
+        <button class="selbtn crsn" data-v="weight_limit">重さがいっぱい</button>
+        <button class="selbtn crsn" data-v="volume_full">量がいっぱい</button>
+        <button class="selbtn crsn" data-v="items_done">商品が終わった</button>
+        <button class="selbtn crsn" data-v="fragile">壊れもの都合</button>
+        <button class="selbtn crsn" data-v="group_done">グループ終了</button>
+        <button class="selbtn crsn" data-v="other">その他</button>
+      </div>
+      <div class="lbl">緩衝材 (プチプチ・紙)</div>
+      <div class="grid3">
+        <button class="selbtn cshn" data-v="none">なし</button>
+        <button class="selbtn cshn" data-v="little">少し</button>
+        <button class="selbtn cshn" data-v="much">多い</button>
+      </div>
+      <div style="margin-top:16px"><button class="bigbtn green" id="c-go">閉じる (確定)</button></div>
+      <div class="msg" id="c-msg"></div>`);
+    let reason = null, cushion = null;
+    const pick = (cls, cb) => dlg.querySelectorAll(cls).forEach(x => x.addEventListener('click', () => {
+      dlg.querySelectorAll(cls).forEach(y => y.classList.remove('on'));
+      x.classList.add('on'); cb(x.dataset.v);
+    }));
+    pick('.crsn', v => reason = v);
+    pick('.cshn', v => cushion = v);
+    dlg.querySelector('#c-go').addEventListener('click', async () => {
+      if (!worker) { pickWorker(); return; }
+      const msg = dlg.querySelector('#c-msg');
+      const kg = parseFloat(dlg.querySelector('#c-kg').value);
+      if (!Number.isFinite(kg) || kg <= 0) { msg.className = 'msg err'; msg.textContent = 'はかりの重さ (kg) を入れてください'; return; }
+      const j = await apiPost(`/api/boxes/${b.id}/close`, {
+        worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
+      });
+      if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message; return; }
+      if (curBoxId === b.id) { curBoxId = null; LS.set('curbox_' + curRunId, null); }
+      closeDialog();
+    });
+  }
+
+  // ─── 職員PIN ───
+  function staffPinPrompt(cb) {
+    const staff = workers.filter(w => w.worker_type === 'staff');
+    const dlg = openDialog(`
+      <h2>🔑 職員の確認</h2>
+      <div class="lbl">職員</div>
+      <div class="grid3">${staff.map(w => `<button class="selbtn stf" data-id="${w.id}">${esc(w.display_name)}</button>`).join('')}</div>
+      <div class="lbl">PIN</div>
+      <input class="qtyin" id="p-pin" type="password" inputmode="numeric" maxlength="8">
+      <div style="margin-top:14px"><button class="bigbtn" id="p-go" disabled>OK</button></div>
+      <div class="msg" id="p-msg"></div>`);
+    let sw = null;
+    dlg.querySelectorAll('.stf').forEach(b => b.addEventListener('click', () => {
+      dlg.querySelectorAll('.stf').forEach(x => x.classList.remove('on'));
+      b.classList.add('on'); sw = workers.find(w => w.id === Number(b.dataset.id));
+      dlg.querySelector('#p-go').disabled = false;
+    }));
+    dlg.querySelector('#p-go').addEventListener('click', () => {
+      const pin = dlg.querySelector('#p-pin').value;
+      if (!sw || !pin) return;
+      closeDialog();
+      cb(sw, pin);
+    });
+  }
+
+  // ─── 担当者 (行) ───
+  function pickRowWorker(row, field) {
+    const dlg = openDialog(`
+      <h2>👤 ${field === 'label_worker' ? 'ラベル貼り担当' : '確認担当'}</h2>
+      <div class="grid3" style="margin-top:12px">
+        ${workers.map(w => `<button class="wbtn rw" data-name="${esc(w.display_name)}">${esc(w.display_name)}</button>`).join('')}
+        <button class="wbtn rw" data-name="">— 消す —</button>
+      </div>`);
+    dlg.querySelectorAll('.rw').forEach(b => b.addEventListener('click', async () => {
+      if (!worker) { pickWorker(); return; }
+      const body = { worker_id: worker.id };
+      body[field] = b.dataset.name || null;
+      const j = await apiPost(`/api/rows/${row.id}/workers`, body);
+      if (!j.ok) alert(j.message);
+      closeDialog();
+    }));
+  }
+
+  // ─── 不足 (職員) ───
+  function shortageDialog(row) {
+    staffPinPrompt(async (staffWorker, pin) => {
+      if (row.shortage_qty) {
+        if (confirm(`不足${row.shortage_qty} の記録を消しますか? (現物が見つかったとき)`)) {
+          const j = await apiPost(`/api/rows/${row.id}/shortage`, { worker_id: staffWorker.id, pin, clear: true });
+          if (!j.ok) alert(j.message);
+          await refresh(true);   // 解除結果をすぐ画面に反映 (Codex PR1 #10)
+        }
+        return;
+      }
+      const rem = row.planned_qty - row.placed;
+      const dlg = openDialog(`
+        <h2>⚠ 数が足りない (職員)</h2>
+        <div class="pname">${esc(shortName(row.product_name))} — 残り ${rem} 個のうち、足りない個数と理由</div>
+        <div class="lbl">足りない個数</div>
+        <input class="qtyin" id="s-qty" type="tel" inputmode="numeric" value="${rem}">
+        <div class="lbl">理由</div>
+        <div class="grid3">
+          <button class="selbtn srsn" data-v="missing">現物がない</button>
+          <button class="selbtn srsn" data-v="damaged">破損</button>
+          <button class="selbtn srsn" data-v="bad_label">ラベル不良</button>
+          <button class="selbtn srsn" data-v="wrong_item">商品違い</button>
+          <button class="selbtn srsn" data-v="expiry_issue">期限が合わない</button>
+          <button class="selbtn srsn" data-v="other">その他</button>
+        </div>
+        <div style="margin-top:14px"><button class="bigbtn red" id="s-go">不足として確定</button></div>
+        <div class="msg" id="s-msg"></div>`);
+      let reason = null;
+      dlg.querySelectorAll('.srsn').forEach(b => b.addEventListener('click', () => {
+        dlg.querySelectorAll('.srsn').forEach(x => x.classList.remove('on'));
+        b.classList.add('on'); reason = b.dataset.v;
+      }));
+      dlg.querySelector('#s-go').addEventListener('click', async () => {
+        const msg = dlg.querySelector('#s-msg');
+        if (!reason) { msg.className = 'msg err'; msg.textContent = '理由を選んでください'; return; }
+        const j = await apiPost(`/api/rows/${row.id}/shortage`, {
+          worker_id: staffWorker.id, pin, qty: Number(dlg.querySelector('#s-qty').value), reason,
+        });
+        if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message; return; }
+        closeDialog();
+      });
+    });
+  }
+
+  // ─── 初期化 ───
+  $('#btn-back').addEventListener('click', backToRuns);
+  $('#btn-worker').addEventListener('click', pickWorker);
+  $('#btn-newbox').addEventListener('click', () => newBoxDialog());
+  $('#btn-tts').addEventListener('click', () => {
+    ttsOn = !ttsOn;
+    LS.set('tts', ttsOn);
+    $('#btn-tts').textContent = ttsOn ? '🔊 読み上げ ON' : '🔇 読み上げ OFF';
+    if (!ttsOn) try { speechSynthesis.cancel(); } catch { /* noop */ }
+  });
+  ttsOn = LS.get('tts', true);
+  $('#btn-tts').textContent = ttsOn ? '🔊 読み上げ ON' : '🔇 読み上げ OFF';
+  window.addEventListener('online', () => setOnline(true));
+  window.addEventListener('offline', () => setOnline(false));
+
+  loadRuns();
+  // 前回の作業者の復元は state 取得後 (refresh のラップ内) に行う — workers は state と一緒に来る
+  const _origRefresh = refresh;
+  refresh = async function (force) {
+    await _origRefresh(force);
+    if (!worker && S) {
+      const savedId = LS.get('worker', null);
+      const w = workers.find(x => x.id === savedId && x.active);
+      if (w) { worker = w; render(); }
+    }
+  };
+  </script>
+</body>
+</html>

@@ -28,9 +28,11 @@ RUN npm ci --production
 # Python dependencies (in virtual env)
 COPY apps/aes-pdf-sorter/python/requirements.txt /app/apps/aes-pdf-sorter/python/requirements.txt
 COPY apps/fba-replenishment/python/requirements.txt /app/apps/fba-replenishment/python/requirements.txt
+COPY apps/fba-box/python/requirements.txt /app/apps/fba-box/python/requirements.txt
 RUN python3 -m venv /app/venv && \
     /app/venv/bin/pip install --no-cache-dir -r /app/apps/aes-pdf-sorter/python/requirements.txt && \
-    /app/venv/bin/pip install --no-cache-dir -r /app/apps/fba-replenishment/python/requirements.txt
+    /app/venv/bin/pip install --no-cache-dir -r /app/apps/fba-replenishment/python/requirements.txt && \
+    /app/venv/bin/pip install --no-cache-dir -r /app/apps/fba-box/python/requirements.txt
 
 # Copy application
 COPY . .

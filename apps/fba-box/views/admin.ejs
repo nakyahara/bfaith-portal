@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .fbx-wrap { max-width: 960px; margin: 0 auto; padding: 12px 16px; }
+    .fbx-box { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 18px; }
+    .fbx-box h2 { font-size: 1.0em; margin: 0 0 10px; }
+    .fbx-box p.hint { font-size: 0.85em; color: #495057; margin: 0 0 10px; line-height: 1.6; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .row input[type=text], .row input[type=file] { padding: 7px; }
+    .row select { padding: 7px; min-width: 260px; }
+    .row button { padding: 7px 18px; cursor: pointer; }
+    .msg { font-size: 0.9em; white-space: pre-wrap; } .msg.err { color: #c92a2a; } .msg.ok { color: #2b8a3e; }
+    table.fbx-list { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.fbx-list th, table.fbx-list td { border-bottom: 1px solid #dee2e6; padding: 6px 8px; text-align: left; vertical-align: top; }
+    table.fbx-list th { background: #f1f3f5; white-space: nowrap; }
+    tr.revoked td, tr.inactive td { color: #adb5bd; text-decoration: line-through; }
+    .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; }
+    .ng { color: #c92a2a; }
+    .code-big { font-size: 2em; font-weight: 700; letter-spacing: 0.2em; font-family: ui-monospace, Menlo, monospace; }
+    .st { font-size: 0.8em; font-weight: 700; border-radius: 6px; padding: 2px 8px; }
+    .st.active { background: #D3F9D8; color: #2B8A3E; }
+    .st.setup { background: #FFF3BF; color: #997404; }
+    .st.done, .st.cancelled { background: #E9ECEF; color: #868E96; }
+    details.issues { margin-top: 6px; font-size: 0.85em; }
+    code { background: #e9ecef; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📦 FBA箱詰め記録 管理</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="<%= base %>/" class="btn-logout">📱 作業画面</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="fbx-wrap">
+
+    <div class="fbx-box">
+      <h2>🚀 納品回の開始 (Excel先行フロー)</h2>
+      <p class="hint">
+        ①STA (Send to Amazon) で納品プランを作り、「個別の商品を梱包」から<b>パックリストExcelをダウンロード</b>
+        ②picking-prep を実行 (従来どおり) ③ここで両方を選んで開始 → 突合結果を確認して<b>有効化</b>すると、
+        いろはの iPad に納品回が出ます。<b>Excel と突合が終わるまで箱詰めは始められません</b> (要件 §11)。
+      </p>
+      <% if (pickingError) { %><p class="msg err">⚠ picking-prep のデータを読めません: <%= pickingError %></p><% } %>
+      <div class="row">
+        <select id="pk-run">
+          <option value="">ピッキング実行を選ぶ…</option>
+          <% for (const r of pickingRuns) { %>
+            <option value="<%= r.id %>">#<%= r.id %> — <%= r.delivery_date ? r.delivery_date + ' 納品分' : (r.run_at || '').slice(0, 16) %> (<%= r.plan_sheet_count %>シート)</option>
+          <% } %>
+        </select>
+        <input type="file" id="pk-excel" accept=".xlsx">
+        <button id="pk-go">納品回をつくる</button>
+      </div>
+      <div class="msg" id="pk-msg"></div>
+    </div>
+
+    <div class="fbx-box">
+      <h2>🗂 納品回</h2>
+      <table class="fbx-list">
+        <tr><th>#</th><th>タイトル</th><th>状態</th><th>商品/グループ</th><th>作成</th><th>操作</th></tr>
+        <% for (const r of runs) { %>
+          <tr>
+            <td><%= r.id %></td>
+            <td><%= r.title %></td>
+            <td><span class="st <%= r.status %>"><%= { setup:'準備中', active:'作業中', done:'完了', cancelled:'取消' }[r.status] || r.status %></span></td>
+            <td><%= r.row_count %>商品 / <%= r.group_count %>グループ</td>
+            <td><%= (r.created_at || '').slice(0, 16).replace('T', ' ') %><br><small><%= r.created_by || '' %></small></td>
+            <td>
+              <button class="btn-sm run-detail" data-id="<%= r.id %>">進捗</button>
+              <% if (r.status === 'setup') { %>
+                <button class="btn-sm run-activate" data-id="<%= r.id %>">✅ 有効化 (iPadに出す)</button>
+              <% } %>
+              <% if (r.status === 'active') { %>
+                <button class="btn-sm run-done" data-id="<%= r.id %>">🏁 完了にする</button>
+              <% } %>
+              <% if (r.status === 'setup' || r.status === 'active') { %>
+                <button class="btn-sm run-cancel" data-id="<%= r.id %>">取消</button>
+              <% } %>
+            </td>
+          </tr>
+        <% } %>
+        <% if (runs.length === 0) { %><tr><td colspan="6">まだありません</td></tr><% } %>
+      </table>
+      <div class="msg" id="run-msg"></div>
+      <div id="run-detail-out"></div>
+    </div>
+
+    <div class="fbx-box">
+      <h2>👤 作業者 (いろは名簿)</h2>
+      <p class="hint">iPad の名前タップに出る名簿。職員は 🔑PIN を設定すると、取消・不足確定・箱の開け直しができます。</p>
+      <div class="row">
+        <input type="text" id="w-name" placeholder="表示名 (例: たなか)" maxlength="30">
+        <select id="w-type"><option value="member">利用者</option><option value="staff">職員</option></select>
+        <button id="w-add" <%= isAdmin ? '' : 'disabled title="管理者のみ"' %>>追加</button>
+      </div>
+      <table class="fbx-list" style="margin-top:8px">
+        <tr><th>名前</th><th>区分</th><th>PIN</th><th>操作</th></tr>
+        <% for (const w of workers) { %>
+          <tr class="<%= w.active ? '' : 'inactive' %>">
+            <td><%= w.display_name %></td>
+            <td><%= w.worker_type === 'staff' ? '職員' : '利用者' %></td>
+            <td><%= w.worker_type === 'staff' ? (w.pin_set ? '設定済み' : '未設定') : '—' %></td>
+            <td>
+              <% if (isAdmin) { %>
+                <% if (w.worker_type === 'staff') { %><button class="btn-sm w-pin" data-id="<%= w.id %>">PIN設定</button><% } %>
+                <button class="btn-sm w-toggle" data-id="<%= w.id %>" data-active="<%= w.active %>"><%= w.active ? '無効にする' : '有効に戻す' %></button>
+              <% } %>
+            </td>
+          </tr>
+        <% } %>
+      </table>
+      <div class="msg" id="w-msg"></div>
+    </div>
+
+    <% if (isAdmin) { %>
+    <div class="fbx-box">
+      <h2>📱 iPad の登録</h2>
+      <p class="hint">
+        「登録コードを発行」→ iPad で <code><%= base %>/enroll</code> を開いて6桁を入力。コードは<b>10分・1回</b>だけ有効。
+        2台目はコードを<b>発行し直して</b>ください (発行すると前の未使用コードは無効になります)。
+      </p>
+      <div class="row">
+        <input type="text" id="e-label" placeholder="端末名 (例: いろはiPad 1号)" maxlength="40">
+        <button id="e-issue">登録コードを発行</button>
+      </div>
+      <div class="msg" id="e-out"></div>
+      <% if (enrollCodes.length > 0) { %>
+        <p class="hint">未使用のコード: <% for (const c of enrollCodes) { %><code><%= c.label %></code> (期限 <%= new Date(c.expires_at).toLocaleTimeString('ja-JP') %>) <% } %></p>
+      <% } %>
+      <table class="fbx-list" style="margin-top:8px">
+        <tr><th>端末</th><th>登録</th><th>最終アクセス</th><th>操作</th></tr>
+        <% for (const d of devices) { %>
+          <tr class="<%= d.revoked_at ? 'revoked' : '' %>">
+            <td><%= d.label %></td>
+            <td><%= (d.created_at || '').slice(0, 16).replace('T', ' ') %></td>
+            <td><%= d.last_seen_at ? d.last_seen_at.slice(0, 16).replace('T', ' ') : '—' %></td>
+            <td><% if (!d.revoked_at) { %><button class="btn-sm d-revoke" data-id="<%= d.id %>">解除</button><% } %></td>
+          </tr>
+        <% } %>
+        <% if (devices.length === 0) { %><tr><td colspan="4">登録された端末はありません</td></tr><% } %>
+      </table>
+    </div>
+    <% } %>
+
+    <div class="fbx-box">
+      <h2>📜 操作履歴 (直近50件)</h2>
+      <table class="fbx-list">
+        <tr><th>日時</th><th>操作</th><th>回</th><th>作業者</th><th>端末</th><th>内容</th></tr>
+        <% for (const e of events) { %>
+          <tr>
+            <td><%= (e.at || '').slice(5, 16).replace('T', ' ') %></td>
+            <td><%= e.action %><%= e.ok ? '' : ' ❌' %></td>
+            <td><%= e.run_id || '' %></td>
+            <td><%= e.worker_name || '' %></td>
+            <td><%= e.device_label || '' %></td>
+            <td style="max-width:320px; overflow-wrap:anywhere"><small><%= e.payload || e.error || '' %></small></td>
+          </tr>
+        <% } %>
+      </table>
+    </div>
+
+  </div>
+
+  <script>
+    const BASE = '<%= base %>';
+    const $ = s => document.querySelector(s);
+    async function post(url, body) {
+      const r = await fetch(BASE + url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+      return r.json().catch(() => ({ ok: false, message: 'HTTP ' + r.status }));
+    }
+    const setMsg = (el, kind, text) => { el.className = 'msg ' + (kind || ''); el.textContent = text; };
+
+    // 納品回の作成
+    $('#pk-go').addEventListener('click', async () => {
+      const runId = $('#pk-run').value;
+      const file = $('#pk-excel').files[0];
+      const msg = $('#pk-msg');
+      if (!runId) return setMsg(msg, 'err', 'ピッキング実行を選んでください');
+      if (!file) return setMsg(msg, 'err', 'パックリストExcel (.xlsx) を選んでください');
+      setMsg(msg, '', '解析・突合しています…');
+      const fd = new FormData();
+      fd.append('source_run_id', runId);
+      fd.append('excel', file);
+      const r = await fetch(BASE + '/admin/runs', { method: 'POST', body: fd });
+      const j = await r.json().catch(() => ({ ok: false, message: 'HTTP ' + r.status }));
+      if (!j.ok) {
+        let t = j.message || '作成できませんでした';
+        if (j.issues) t += '\n' + j.issues.map(i => `- [${i.kind}] ${i.sheet || ''} 行${i.excelRow || ''} ${i.fnsku || ''}`).join('\n');
+        return setMsg(msg, 'err', t);
+      }
+      let t = `✅ 納品回 #${j.runId} を作成しました (準備中)。突合結果を確認して「有効化」してください`;
+      if (!j.fingerprintKnown) t += `\n⚠ 新しいテンプレ形式です (fingerprint=${j.fingerprint})。初回はExcel出力後にSTAアップロードまで必ず確認`;
+      if (j.issues.length > 0) t += '\n注意:\n' + j.issues.map(i => `- [${i.kind}] ${i.sheet || ''} 行${i.excelRow || ''} ${i.fnsku || ''} ${i.excelQty != null ? `Excel:${i.excelQty} vs picking:${i.pickingQty}` : ''}`).join('\n');
+      setMsg(msg, 'ok', t);
+      setTimeout(() => location.reload(), j.issues.length > 0 ? 8000 : 1500);
+    });
+
+    // 納品回の操作
+    document.querySelectorAll('.run-activate').forEach(b => b.addEventListener('click', async () => {
+      const j = await post(`/admin/runs/${b.dataset.id}/activate`);
+      setMsg($('#run-msg'), j.ok ? 'ok' : 'err', j.ok ? '有効化しました (iPadに出ます)' : j.message);
+      if (j.ok) setTimeout(() => location.reload(), 800);
+    }));
+    document.querySelectorAll('.run-done').forEach(b => b.addEventListener('click', async () => {
+      if (!confirm('この納品回を完了にしますか? (以後 iPad から入力できません)')) return;
+      const j = await post(`/admin/runs/${b.dataset.id}/status`, { status: 'done' });
+      setMsg($('#run-msg'), j.ok ? 'ok' : 'err', j.ok ? '完了にしました' : j.message);
+      if (j.ok) setTimeout(() => location.reload(), 800);
+    }));
+    document.querySelectorAll('.run-cancel').forEach(b => b.addEventListener('click', async () => {
+      if (!confirm('この納品回を取消にしますか?')) return;
+      const j = await post(`/admin/runs/${b.dataset.id}/status`, { status: 'cancelled' });
+      setMsg($('#run-msg'), j.ok ? 'ok' : 'err', j.ok ? '取消しました' : j.message);
+      if (j.ok) setTimeout(() => location.reload(), 800);
+    }));
+    document.querySelectorAll('.run-detail').forEach(b => b.addEventListener('click', async () => {
+      const r = await fetch(`${BASE}/admin/runs/${b.dataset.id}`);
+      const j = await r.json().catch(() => ({ ok: false }));
+      const out = $('#run-detail-out');
+      if (!j.ok) { out.innerHTML = '<p class="msg err">読み込めませんでした</p>'; return; }
+      const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+      out.innerHTML = `<h3 style="margin:14px 0 6px">回 #${j.run.id} ${esc(j.run.title)} の進捗</h3>` +
+        j.groups.map(g => {
+          const rows = j.rows.filter(x => x.pack_group_id === g.id);
+          const boxes = j.boxes.filter(x => x.pack_group_id === g.id);
+          const done = rows.filter(x => x.placed + (x.shortage_qty || 0) >= x.planned_qty).length;
+          return `<p><b>${esc(g.sheet_name)}</b> (${esc(g.packing_group_id)}) — 行 ${done}/${rows.length} 完了 / 箱 ${boxes.length} (閉 ${boxes.filter(x => x.status === 'closed').length})</p>
+          <table class="fbx-list"><tr><th>行</th><th>プランNo</th><th>FNSKU</th><th>商品</th><th>予定</th><th>入力済</th><th>不足</th><th>担当</th></tr>` +
+            rows.map(x => `<tr><td>${x.excel_row}</td><td>${esc(x.plan_no || '')}</td><td><code>${esc(x.fnsku)}</code></td>
+              <td>${esc((x.product_name || '').slice(0, 40))}</td><td>${x.planned_qty}</td>
+              <td>${x.placed}</td><td>${x.shortage_qty ? x.shortage_qty + ' (' + esc(x.shortage_reason || '') + ')' : ''}</td>
+              <td>${esc(x.label_worker || '')}${x.check_worker ? ' / ✅' + esc(x.check_worker) : ''}</td></tr>`).join('') +
+          `</table>
+          <p>箱: ${boxes.map(x => `${esc(x.box_code)}(${x.total_qty}個${x.measured_weight_kg ? '・' + x.measured_weight_kg + 'kg' : ''}${x.status === 'closed' ? '・閉' : ''})`).join(' / ') || 'なし'}</p>`;
+        }).join('');
+    }));
+
+    // 作業者
+    $('#w-add')?.addEventListener('click', async () => {
+      const j = await post('/admin/workers', { display_name: $('#w-name').value, worker_type: $('#w-type').value });
+      setMsg($('#w-msg'), j.ok ? 'ok' : 'err', j.ok ? '追加しました' : j.message);
+      if (j.ok) setTimeout(() => location.reload(), 600);
+    });
+    document.querySelectorAll('.w-toggle').forEach(b => b.addEventListener('click', async () => {
+      const j = await post(`/admin/workers/${b.dataset.id}/active`, { active: b.dataset.active !== '1' });
+      if (j.ok) location.reload(); else setMsg($('#w-msg'), 'err', j.message);
+    }));
+    document.querySelectorAll('.w-pin').forEach(b => b.addEventListener('click', async () => {
+      const pin = prompt('職員PIN (4〜8桁の数字)');
+      if (!pin) return;
+      const j = await post(`/admin/workers/${b.dataset.id}/pin`, { pin });
+      setMsg($('#w-msg'), j.ok ? 'ok' : 'err', j.ok ? 'PINを設定しました' : j.message);
+      if (j.ok) setTimeout(() => location.reload(), 600);
+    }));
+
+    // 端末登録
+    $('#e-issue')?.addEventListener('click', async () => {
+      const j = await post('/admin/enroll-codes', { label: $('#e-label').value });
+      const out = $('#e-out');
+      if (!j.ok) return setMsg(out, 'err', j.message);
+      out.className = 'msg ok';
+      out.innerHTML = `iPad で <code>${BASE}/enroll</code> を開き、この6桁を入力: <span class="code-big">${j.code}</span> (${j.ttlMinutes}分間有効)`;
+    });
+    document.querySelectorAll('.d-revoke').forEach(b => b.addEventListener('click', async () => {
+      if (!confirm('この端末の登録を解除しますか?')) return;
+      const j = await post(`/admin/devices/${b.dataset.id}/revoke`);
+      if (j.ok) location.reload();
+    }));
+  </script>
+</body>
+</html>
