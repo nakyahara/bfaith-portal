@@ -41,6 +41,10 @@ const mock = {
   patchStatusOverride: null,   // PATCH 応答のステータスを差し替え (verify_failed 再現)
   missingPages: new Set(),
   failQuery: null,      // { status } query を失敗させる
+  // 実DB「ステータス」の選択肢 (2026-09-03 実機の Available options)。「取消」も「中断」も無い。
+  // 実 Notion は DB に無い選択肢名でフィルタすると 400 を返す (キャッシュ 0 枚の実機障害の原因)
+  statusOptions: ['未着手', '作業完了', '棚入完了', '在庫化対象外', '資材不足で作業中断', '作業中', '次回',
+    '羅針盤', 'ワークセンター', 'ジョブサポ', 'リハス', 'いろは'],
   onQuery: null,        // query 応答の直前に1回呼ぶフック (取得中の変更レース再現用)
   // ensureCardSchema 用の DB スキーマ (実DBと同じ型。inbound-check テストと同じ)
   dbProps: {
@@ -101,6 +105,14 @@ global.fetch = async (url, opts = {}) => {
     if (mock.onQuery) { const h = mock.onQuery; mock.onQuery = null; await h(); }
     const f = body?.filter || {};
     const conds = f.and || [f];
+    // 実 Notion の挙動: DB に無い選択肢名を select フィルタに使うと 400 (2026-09-03 実機で判明)
+    for (const c of conds) {
+      const v = c.property === 'ステータス' ? (c.select?.equals ?? c.select?.does_not_equal) : null;
+      if (v && !mock.statusOptions.includes(v)) {
+        return respond(400, { object: 'error', code: 'validation_error',
+          message: `select option "${v}" not found for property "ステータス". Available options: ${mock.statusOptions.map(o => `"${o}"`).join(', ')}.` });
+      }
+    }
     const stOfSnap = (p) => p.properties['ステータス']?.select?.name || null;
     let hits = snapshot.filter(p => !p.archived);
     for (const c of conds) {
@@ -173,6 +185,8 @@ mkPage({ status: '取消', title: '取消済み', code: 'PROD-X', qty: 1 });
   const rows = listCache();
   ok(rows.length === 4, 'キャッシュも4行');
   ok(!rows.some(x => x.status === '取消'), '「取消」は取らない');
+  ok(!mock.lastFilters.some(f => JSON.stringify(f || {}).includes('取消')),
+    '「取消」をフィルタに使わない (DB に無い選択肢名は Notion が 400 を返す — 2026-09-03 実機障害)');
   ok(rows.find(x => x.page_id === pDone.id), '棚入完了 (期間内) は入る');
   const doneFilter = mock.lastFilters.find(f => f?.and?.some(c => c.select?.equals === '棚入完了'));
   ok(doneFilter && doneFilter.and.some(c => c.timestamp === 'last_edited_time' && c.last_edited_time?.on_or_after), '棚入完了は期間フィルタつき');

@@ -106,7 +106,7 @@ const recentChanges = new Map();
 
 /**
  * カード一覧を Notion から取得してキャッシュを全置換する。
- *   ①未完了 (棚入完了・取消以外) は**全件** — 何ヶ月放置の未着手も消さない
+ *   ①棚入完了以外は**全件** — 何ヶ月放置の未着手も消さない。「取消」はこちらで除外
  *   ②棚入完了は直近 DONE_WINDOW_DAYS 日に編集されたものだけ
  * アーカイブ済みページは query に元々返らない。
  * 取り切れなかった (truncated) ときは置き換えず、古い完全キャッシュを守る。
@@ -115,12 +115,13 @@ export async function refreshFromNotion() {
   // スキーマ検証 (10分キャッシュ)。ステータスが select 型でなくなった等は 1回のエラーで止める
   await ensureCardSchema();
   const startedAt = Date.now();
-  const activeFilter = {
-    and: [
-      { property: STATUS_PROP, select: { does_not_equal: STATUS_DONE } },
-      { property: STATUS_PROP, select: { does_not_equal: STATUS_CANCELLED } },
-    ],
-  };
+  // ⚠「取消」をフィルタに入れない: Notion の select フィルタは DB に存在しない選択肢名を
+  //   指定すると 400 (select option "取消" not found) になり、一覧が丸ごと取れなくなる。
+  //   「取消」の選択肢は inbound-check が初めて取消を反映した時に自動作成されるので、
+  //   それまでは存在しない (2026-09-03 実機で判明: キャッシュ 0 枚)。→ 取得後にこちらで除外する。
+  //   取消が溜まって MAX_PAGES_ACTIVE に当たるようなら、DB スキーマの選択肢一覧を見て
+  //   存在する時だけフィルタに戻す (Notion 廃止のほうが先の見込み)
+  const activeFilter = { property: STATUS_PROP, select: { does_not_equal: STATUS_DONE } };
   const doneSince = new Date(startedAt - DONE_WINDOW_DAYS * 24 * 3600 * 1000).toISOString();
   const doneFilter = {
     and: [
@@ -140,7 +141,9 @@ export async function refreshFromNotion() {
   for (const page of [...a.results, ...b.results]) {
     if (seen.has(page.id)) continue;
     seen.add(page.id);
-    pages.push(parsePage(page));
+    const row = parsePage(page);
+    if (row.status === STATUS_CANCELLED) continue;   // 取消はキャッシュに入れない (上記)
+    pages.push(row);
   }
   replaceCache(pages);
   // 取得開始より後にアプリで変えたページは、置換結果 (古い) より新しい → 行ごと戻し入れる。
