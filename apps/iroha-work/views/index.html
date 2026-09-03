@@ -432,7 +432,7 @@
   <div class="overlay" id="lwOv">
     <div class="modal">
       <h3>🏷 ラベル待ちの記録</h3>
-      <p class="hint" style="margin:0 0 8px">分かっているものは入れてあります。ちがうところだけ直して保存してください。</p>
+      <p class="hint" style="margin:0 0 8px">分かっているものは入れてあります。ロット・期限だけ現物を見て打ってください。</p>
       <div class="mname" id="lwName">—</div>
       <div class="msaving" id="lwMsg"></div>
       <div class="mfields">
@@ -1083,13 +1083,15 @@ function openLw(id) {
 }
 /**
  * ラベル待ちの新規登録。iPad で打つ手間を減らすため、分かっているものは入れておく (中原さん 2026-09-03):
- * 発生日 = 今日 / 数量 = カードの数 / ロット・期限 = カードの有効期限 / ロケーション = Z (一時保管) / 記録者 = 選んでいる人
+ * 発生日 = 今日 / 数量 = カードの数 / ロケーション = Z (一時保管) / 記録者 = 選んでいる人。
+ * ロット・期限は入れない — 入荷のたびに変わるので、現物を見て打ってもらう (中原さん 2026-09-03)
  */
 function openLwNew(card) {
   const c = card || findCard(curDetail);
   if (!c) return;
   lwEditing = { task_id: c.id };
-  fillLw({ occurred_on: state.today, qty: c.qty, lot_expiry: c.expiry || '', location: 'Z' }, c.title);
+  fillLw({ occurred_on: state.today, qty: c.qty, location: 'Z' }, c.title);
+  setTimeout(() => { const el = $('#lwLot'); if (el) el.focus(); }, 50);   // ロット・期限から打ちはじめられるように
 }
 /** 下見のあいだは保存させない。ダイアログを開いたまま正本が変わっても追随する (Codex 下見 R1) */
 function renderLwSaveState() {

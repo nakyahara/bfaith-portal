@@ -2155,7 +2155,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/r\.label \+ '\u3067\u4e2d\u65ad'/.test(html), '中断の理由は「ラベル待ちで中断」「資材不足で中断」と出す');
   ok(/const order = \['label_shortage', 'materials_shortage'\]/.test(html), 'よく使う 2 つを先に出す');
   ok(/holdReason === 'label_shortage'\) setTimeout\(\(\) => openLwNew\(c\)/.test(html), 'ラベル待ちで中断したら、そのままラベル待ちの記録を開く');
-  ok(/occurred_on: state\.today, qty: c\.qty, lot_expiry: c\.expiry/.test(html), '発生日・数量・ロット期限を入れた状態で開く (打つ手間を減らす)');
+  ok(/occurred_on: state\.today, qty: c\.qty, location: 'Z'/.test(html), '発生日・数量・ロケーションを入れた状態で開く (打つ手間を減らす)');
+  ok(!/lot_expiry: c\.expiry/.test(html) && /\$\('#lwLot'\); if \(el\) el\.focus\(\)/.test(html), 'ロット・期限は入れずに、そこへカーソルを置く (現物を見て打つ)');
   ok(/外部に出す準備OK にする/.test(html) && /async function setExternalReady/.test(html), '詳細に「外部に出す準備OK」の切り替えがある');
   ok(/c\.external_ready \? '📦 外部に出せます'/.test(html) && /tag ready/.test(html), 'ボードと一覧に「外部に出せます」の印が出る');
 }
