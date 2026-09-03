@@ -199,6 +199,9 @@ export function createTables(db = getMirrorDB()) {
   // 作業開始時点の作業仕様スナップショット (§1.7 ④: 後で仕様が変わっても
   // 「当時何を見て作業したか」を残す。JSON)
   addCol('f_iroha_work_sessions', 'master_snapshot', 'TEXT');
+  // Drive 側で消えた写真の印 (配信で 404/410 を見たら付け、表示と「前回の完成形」候補から外す。
+  // 管理画面の再実行で解除 — Codex R1 #5)
+  addCol('f_iroha_card_media', 'unavailable_at', 'TEXT');
   // video_url は inbound-check 側でも足すが、いろは単独経路の起動でも保証する
   // (このアプリが先に f_iroha_work_master を SELECT すると no such column になるため)
   if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get()) {

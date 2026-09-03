@@ -105,6 +105,14 @@ export function classifyMasterEdit(row, fields) {
  * 並び = 急ぎ (在庫日数昇順) → 新商品 → 通常 (在庫日数昇順) → データなし → 販売なし、
  * 同順位は入庫日の古い順 (要件定義 §5)。タブごとの絞り込みは画面側で行う。
  */
+/** 新しい順の候補 (photosByCodeKey) から、自分以外で直近に撮ったカード1件ぶんを取り出す */
+export function previousPhotosOf(candidates, ownPageId, limit = 3) {
+  const others = candidates.filter(p => p.page_id !== ownPageId);
+  if (others.length === 0) return [];
+  const lastPage = others[0].page_id;   // 先頭 = いちばん最近撮った写真 → そのカード
+  return others.filter(p => p.page_id === lastPage).slice(0, limit);
+}
+
 export function buildList() {
   const rows = listCache();
   const ctx = enrichContext();
@@ -144,9 +152,10 @@ export function buildList() {
       active: activeMap.get(r.page_id) || [],
       estimate: (k && estimates.get(k)) || null,
       media: mediaMap.get(r.page_id) || [],
-      // 「前回の完成形」= 同じ商品コードの**他のカード**で撮った写真 (新しい順・最大3枚)。
+      // 「前回の完成形」= 同じ商品コードで**直近に写真を撮った他の1カード**の写真 (最大3枚)。
+      // 複数カードの写真を混ぜない・古いカードを開いても「いちばん最近の完成形」を見せる (Codex R1 #4)。
       // 次に同じ商品を作る人への見本 (中原さん 2026-09-03: 写真は証拠ではなく見本)
-      previous_photos: (k ? (prevPhotos.get(k) || []) : []).filter(p => p.page_id !== r.page_id).slice(0, 3),
+      previous_photos: previousPhotosOf(k ? (prevPhotos.get(k) || []) : [], r.page_id),
     };
   });
 

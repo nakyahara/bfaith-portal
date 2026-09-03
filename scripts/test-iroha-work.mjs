@@ -163,7 +163,7 @@ const { getDB, replaceCache, listCache, addIrohaWorker, setIrohaWorkerActive, ge
   createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents,
   startSession, stopSession, activeSessionsByPage, estimateByProduct, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
 const { ensureFresh, refreshFromNotion, changeStatus, fetchCardLive, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
-const { buildList, priorityOf, clearEnrichCache } = await import('../apps/iroha-work/service.js');
+const { buildList, priorityOf, clearEnrichCache, previousPhotosOf } = await import('../apps/iroha-work/service.js');
 
 const db = getDB();
 
@@ -656,6 +656,27 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   getDB().prepare("UPDATE f_iroha_card_media SET next_retry_at = '9999-12-31T00:00:00.000Z', error = 'x' WHERE operation_id = 'op-dead-00001'").run();
   ok(countActiveMedia(pDead.id, 'photo') === 1, '停止した失敗写真も枚数上限には残る (削除して撮り直す)');
   ok(!(photosByCodeKey().get('prod-x2') || []).length, '停止した失敗写真 (Drive 未保存) は「前回の完成形」候補にならない');
+  ok(mediaByPage().get(pDead.id).find(m => m.status === 'stored').viewable === false, '停止した送信待ち (実体が残る保証なし) は表示対象外 (viewable=false)');
+
+  // 「前回の完成形」は直近に撮った**1カードぶん** (複数カードの写真を混ぜない) / Drive から消えた写真は候補外 (Codex R1 #4 #5)
+  {
+    const { markMediaUnavailable } = await import('../apps/iroha-work/media.js');
+    const cands = [
+      { id: 30, page_id: 'pg-new' }, { id: 29, page_id: 'pg-new' },
+      { id: 20, page_id: 'pg-old' }, { id: 19, page_id: 'pg-old' }, { id: 18, page_id: 'pg-old' }, { id: 17, page_id: 'pg-old' },
+    ];
+    ok(previousPhotosOf(cands, 'pg-me').map(p => p.id).join() === '30,29', '直近に撮ったカード (pg-new) の写真だけ (古いカードの写真を混ぜない)');
+    ok(previousPhotosOf(cands, 'pg-new').map(p => p.id).join() === '20,19,18', '自分が直近なら、その前のカードの写真 (最大3枚)');
+    ok(previousPhotosOf([{ id: 1, page_id: 'pg-me' }], 'pg-me').length === 0, '自分の写真しか無ければ空');
+
+    const mid = getDB().prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-photo-0001'").get().id;
+    ok(markMediaUnavailable(mid, 'Drive 404') === true, 'ドライブから消えた印を付ける');
+    ok(!(photosByCodeKey().get('prod-m') || []).some(p => p.id === mid), '消えた写真は「前回の完成形」候補から外れる');
+    ok(mediaByPage().get(pMedia.id).find(m => m.id === mid).viewable === false, '消えた写真は表示対象外 (viewable=false)');
+    ok(markMediaUnavailable(mid, 'again') === false, '二重に印は付けない');
+    resetMedia(mid);
+    ok(mediaByPage().get(pMedia.id).find(m => m.id === mid).unavailable === false, '管理画面の再実行で印が消える');
+  }
 
   // Notion PATCH 中に削除が割り込んでも、削除の同期要求が消えない (revision 方式 — PR3-R2)
   const pRace2 = mkPage({ status: '作業中', title: '同期レース', code: 'PROD-R2' });

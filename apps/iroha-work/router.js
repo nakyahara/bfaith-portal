@@ -14,6 +14,7 @@
 import { Router } from 'express';
 import fs from 'fs';
 import path from 'path';
+import { pipeline } from 'stream';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
@@ -30,7 +31,7 @@ import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES 
 import { buildList, classifyMasterEdit, clearEnrichCache, masterOf } from './service.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import {
-  addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
+  addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
   listPageSyncForAdmin, resetPageSync,
   isDriveConfigured, MEDIA_DIR, MAX_VIDEO_BYTES,
 } from './media.js';
@@ -430,36 +431,82 @@ router.post('/api/media', checkOrigin, mediaUpload.single('file'), api((req, res
   }
 }));
 
+// ETag の照合 (If-None-Match / If-Range)。複数・弱い ETag (W/)・* を受ける
+function etagMatches(header, etag) {
+  if (!header) return false;
+  return String(header).split(',').map(s => s.trim().replace(/^W\//, '')).some(t => t === '*' || t === etag);
+}
+// Range は単一の bytes=a-b / bytes=a- / bytes=-n だけ Drive へ転送する。複数・不正な形は無視して全体を返す
+// (Drive の multipart/byteranges を素通しすると Content-Type が合わない — Codex R1 #1)
+function singleRange(header) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec(String(header || '').trim());
+  if (!m || (m[1] === '' && m[2] === '')) return null;
+  if (m[1] !== '' && m[2] !== '' && Number(m[1]) > Number(m[2])) return null;
+  return `bytes=${m[1]}-${m[2]}`;
+}
+
 /**
  * 写真・動画の配信。iPad はサービスアカウントの Drive を直接見られない (フォルダは公開しない —
- * 要件 §6) ので、ここを通して出す。Drive 保存済みなら Drive からストリーム (Range をそのまま
- * 転送 = 動画のシーク)、送信待ち (stored) ならローカル実体。端末認証 (access) の内側
+ * 要件 §6) ので、ここを通して出す。Drive 保存済みなら Drive からストリーム (単一 Range を転送 =
+ * 動画のシーク・ETag で 304)、送信待ち (stored) なら MEDIA_DIR 配下のローカル実体。
+ * 認可 = 端末認証 (access)。⭐仕様: 登録済み端末 (いろはの共用 iPad) には、削除済み以外の全写真を
+ * 見せる — 「前回の完成形」は過去カードの写真をそのまま見本にする機能で、写真は商品の完成形
+ * (個人情報ではない・ファイル名に人名も入れない)。カードや写真を個別に隠す要件が出たらここで絞る
+ * (Codex R1 #3)。キャッシュは private + no-cache (ETag で再検証。削除・端末失効が翌日まで残らない)
  */
 router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
   const r = getMediaRow(Number(req.params.id));
-  if (!r || r.deleted_at) return res.status(404).json({ ok: false, error: 'not_found', message: '写真・動画が見つかりません' });
+  const fail = (status, error, message) => { res.set('Cache-Control', 'no-store'); return res.status(status).json({ ok: false, error, message }); };
+  if (!r || r.deleted_at) return fail(404, 'not_found', '写真・動画が見つかりません');
+  if (r.unavailable_at) return fail(404, 'unavailable', 'この写真はドライブから消えています');
   const mime = r.mime || (r.kind === 'photo' ? 'image/jpeg' : 'video/mp4');
-  res.set('Cache-Control', 'private, max-age=86400');
-  if (r.local_path && fs.existsSync(r.local_path)) {
-    return res.sendFile(path.resolve(r.local_path), { headers: { 'Content-Type': mime } });
+  // ①送信待ち: ローカル実体。DB の local_path を無条件に信じず MEDIA_DIR 配下だけ送る (Codex R1 #8)
+  if (r.local_path) {
+    const abs = path.resolve(r.local_path);
+    const rel = path.relative(path.resolve(MEDIA_DIR), abs);
+    const inside = rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+    if (inside && fs.existsSync(abs)) {
+      res.set('Cache-Control', 'private, no-cache');
+      return res.sendFile(abs, { headers: { 'Content-Type': mime } });
+    }
   }
-  if (!r.drive_file_id) return res.status(409).json({ ok: false, error: 'not_ready', message: 'まだ保存中です。少し待ってから開いてください' });
+  if (!r.drive_file_id) return fail(409, 'not_ready', 'まだ保存中です。少し待ってから開いてください');
+  // ②Drive 保存済み: ETag = file_id。変わらなければ Drive を叩かず 304
   const etag = `"${r.drive_file_id}"`;
-  if (req.headers['if-none-match'] === etag) return res.status(304).end();
+  if (etagMatches(req.headers['if-none-match'], etag)) {
+    res.set('ETag', etag); res.set('Cache-Control', 'private, no-cache');
+    return res.status(304).end();
+  }
+  let range = singleRange(req.headers.range);
+  if (range && req.headers['if-range'] && !etagMatches(req.headers['if-range'], etag)) range = null;   // 検証子が違えば全体
   let dl;
   try {
-    dl = await driveDownload({ fileId: r.drive_file_id, range: req.headers.range || null });
+    dl = await driveDownload({ fileId: r.drive_file_id, range });
   } catch (e) {
-    return res.status(502).json({ ok: false, error: 'drive_error', message: `ドライブから取り出せませんでした (${e.message})` });
+    const st = Number(e?.response?.status || e?.status || e?.code) || 0;
+    res.set('Cache-Control', 'no-store');
+    if (st === 416) { res.set('Content-Range', `bytes */${r.size || '*'}`); return res.status(416).end(); }
+    if (st === 404 || st === 410) {
+      // Drive 側で消えた → 見本候補・表示から外す (毎回壊れた写真を選び続けない — Codex R1 #5)
+      markMediaUnavailable(r.id, `Drive ${st}`);
+      return fail(404, 'unavailable', 'この写真はドライブから消えています');
+    }
+    return fail(502, 'drive_error', `ドライブから取り出せませんでした (${e.message})`);
   }
   res.status(dl.status || 200);
   res.set('ETag', etag);
   res.set('Accept-Ranges', 'bytes');
+  res.set('Cache-Control', 'private, no-cache');
   res.type(mime);
   if (dl.contentLength) res.set('Content-Length', String(dl.contentLength));
   if (dl.contentRange) res.set('Content-Range', dl.contentRange);
-  dl.stream.on('error', (e) => { console.error(`[iroha-work] media #${r.id} の配信中に切断`, e.message); try { res.destroy(); } catch { /* 切れていれば何もしない */ } });
-  dl.stream.pipe(res);
+  // クライアントが切ったら上流 (Drive) も止める — 動画のシーク連打で不要なダウンロードを残さない (Codex R1 #7)
+  res.on('close', () => { if (!res.writableFinished) dl.stream.destroy(); });
+  pipeline(dl.stream, res, (e) => {
+    if (!e) return;
+    if (e.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.error(`[iroha-work] media #${r.id} の配信エラー`, e.message);
+    if (!res.headersSent) { try { res.status(502).end(); } catch { /* 切れていれば何もしない */ } }
+  });
 }));
 
 // 撮り直し用の削除 (論理削除)。本人確認 = アップロード時に返した削除トークン

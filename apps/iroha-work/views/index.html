@@ -615,8 +615,9 @@ function mediaTile(m) {
 function prevCardHtml(c) {
   const prev = c.previous_photos || [];
   if (prev.length === 0) return '';
+  // onclick には数値 id だけを埋める (人名などの文字列を JS 文字列に埋め込まない — Codex R1 #6)
   const tiles = prev.map(p =>
-    '<div class="ph" onclick="openPrev(event,' + p.id + ',\'' + esc(fmtDate(p.created_at) + ' ' + (p.worker_name || '')) + '\')">' +
+    '<div class="ph" onclick="openPrev(event,' + Number(p.id) + ')">' +
     '<img src="' + fileUrl(p.id) + '" alt="" loading="lazy"' + IMG_FALLBACK + '>' +
     '<div class="cap">📷 ' + esc(fmtDate(p.created_at)) + ' ' + esc(p.worker_name || '') + '</div></div>').join('');
   return '<div class="dcard prev"><h3 class="sec">前回の完成形 — 同じ商品の写真</h3>' +
@@ -657,7 +658,13 @@ function openMedia(ev, id) {
     return;
   }
 }
-function openPrev(ev, id, cap) { ev.stopPropagation(); showLb('<img src="' + fileUrl(id) + '" alt="">', '前回の完成形 ' + cap); }
+function openPrev(ev, id) {
+  ev.stopPropagation();
+  let p = null;
+  for (const c of state.cards) { p = (c.previous_photos || []).find(x => x.id === id); if (p) break; }
+  const cap = p ? fmtDate(p.created_at) + ' ' + (p.worker_name || '') : '';
+  showLb('<img src="' + fileUrl(id) + '" alt="">', '前回の完成形 ' + cap);
+}
 
 // ── 撮影 → (写真は縮小) → アップロード。operation_id で再送しても二重登録されない ──
 const pendingTiles = new Map();   // opId → { pageId, kind, blob, name, failed }

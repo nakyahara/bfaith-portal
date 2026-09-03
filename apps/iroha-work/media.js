@@ -66,6 +66,15 @@ export function getMediaRow(id) {
   return getDB().prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id)) || null;
 }
 
+/**
+ * Drive 側で消えた (404/410) 写真に印を付け、表示と「前回の完成形」候補から外す (Codex R1 #5)。
+ * 一時的な失敗 (5xx) では呼ばない。管理画面の「再実行」(resetMedia) で解除できる
+ */
+export function markMediaUnavailable(id, reason) {
+  return getDB().prepare(`UPDATE f_iroha_card_media SET unavailable_at = ?, error = ? WHERE id = ? AND unavailable_at IS NULL`)
+    .run(utcNow(), String(reason || 'unavailable').slice(0, 300), Number(id)).changes > 0;
+}
+
 /** 先頭バイトだけ読む (動画をメモリへ丸ごと載せない) */
 function readHead(filePath, n = 16) {
   const buf = Buffer.alloc(n);
@@ -131,8 +140,10 @@ export function addMedia({ pageId, productCode = null, kind, mime, filePath, wor
 export function publicMedia(r) {
   return {
     id: r.id, kind: r.kind, status: r.status, url: r.drive_url || null,
-    // 画面で表示できるか (Drive 保存済み or ローカル実体あり)。表示は /api/media/:id/file 経由
-    viewable: !!(r.drive_file_id || r.local_path),
+    // 画面で表示できるか (Drive 保存済み、または送信待ちでローカル実体あり)。表示は /api/media/:id/file 経由。
+    // Drive から消えた行・10回失敗で停止した行 (実体が残っている保証がない) は表示しない (Codex R1 #10)
+    viewable: !r.unavailable_at && !!(r.drive_file_id || (r.local_path && r.next_retry_at !== BLOCKED_UNTIL)),
+    unavailable: !!r.unavailable_at,
     worker_id: r.worker_id, worker_name: r.worker_name, created_at: r.created_at,
     error: r.next_retry_at === BLOCKED_UNTIL ? (r.error || '失敗') : null,   // 諦めた失敗だけ画面へ
   };
@@ -158,7 +169,8 @@ export function mediaByPage() {
 export function photosByCodeKey() {
   const map = new Map();
   const rows = getDB().prepare(`SELECT id, page_id, product_code, worker_name, created_at FROM f_iroha_card_media
-    WHERE kind = 'photo' AND deleted_at IS NULL AND drive_file_id IS NOT NULL AND product_code IS NOT NULL
+    WHERE kind = 'photo' AND deleted_at IS NULL AND unavailable_at IS NULL
+      AND drive_file_id IS NOT NULL AND product_code IS NOT NULL
     ORDER BY id DESC`).all();
   for (const r of rows) {
     const key = codeKeyOf(r.product_code);
@@ -202,10 +214,10 @@ export function requestPageSync(pageId) {
     .run(pageId, utcNow());
 }
 
-/** 管理画面の「再実行」: ブロックを解除して即時キュー */
+/** 管理画面の「再実行」: ブロック・「ドライブから消えた」印を解除して即時キュー */
 export function resetMedia(id) {
   const n = getDB().prepare(`UPDATE f_iroha_card_media
-    SET next_retry_at = NULL, error = NULL, attempt_count = 0 WHERE id = ?`).run(Number(id)).changes;
+    SET next_retry_at = NULL, error = NULL, attempt_count = 0, unavailable_at = NULL WHERE id = ?`).run(Number(id)).changes;
   if (n > 0) schedule();
   return n > 0;
 }
