@@ -9,7 +9,7 @@
 <link rel="manifest" href="/apps/iroha-work/manifest.json">
 <link rel="icon" type="image/png" href="/favicon.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/app-icons/iroha-work-180.png">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&family=Saira+Semi+Condensed:wght@500;600;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Saira+Semi+Condensed:wght@600;700&display=swap">
 <style>
   /* ── デザイン B「ライト・クリーンテック」(中原さん 2026-09-03 選定):
         冷たい白の地 + 電気的な青。本文 BIZ UDPゴシック (視認性特化) / 数字 Saira Semi Condensed。
@@ -23,19 +23,22 @@
     --ok:#0F9D6B; --ok-soft:#DDF5EA;
     --shadow:0 1px 2px rgba(15,23,40,.06),0 4px 14px rgba(15,23,40,.06);
     --r:8px; --r-sm:6px;
-    --font:"BIZ UDPGothic","Hiragino Sans","Yu Gothic",system-ui,sans-serif;
-    --num:"Saira Semi Condensed","BIZ UDPGothic",sans-serif;
+    /* 本文はメイリオ系 (中原さん 9/3: UD ゴシックは細くて見にくい → メイリオのような太めで字面の大きい書体に)。
+       iPad にメイリオは無いので、同じ性格のシステム書体 (ヒラギノ角ゴ) に落ちる。数字も同じ書体で桁だけ揃える */
+    --font:"Meiryo","メイリオ",-apple-system,BlinkMacSystemFont,"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic UI","Noto Sans JP",sans-serif;
+    --num:var(--font);
+    --logo:"Saira Semi Condensed",var(--font);
   }
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html{touch-action:manipulation}
-  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--font);font-size:16px;line-height:1.5}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--font);font-size:17px;line-height:1.6}
   h1,h2,h3,button,input{font-family:var(--font)}
-  .num{font-family:var(--num);font-variant-numeric:tabular-nums;letter-spacing:.01em}
+  .num{font-family:var(--num);font-variant-numeric:tabular-nums}
   .app{max-width:900px;margin:0 auto;padding:12px 14px 40px}
 
   header.top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
   header.top h1{margin:0;display:flex;flex-direction:column;line-height:1.1}
-  header.top h1 .logo{font-family:var(--num);font-weight:700;font-size:1.15rem;letter-spacing:.1em;color:var(--accent)}
+  header.top h1 .logo{font-family:var(--logo);font-weight:700;font-size:1.15rem;letter-spacing:.1em;color:var(--accent)}
   header.top h1 .jp{font-size:.72rem;color:var(--sub);font-weight:400;letter-spacing:.06em}
   .who{margin-left:auto;font-weight:700;background:var(--surface);border:1px solid var(--line);
     border-radius:var(--r);padding:8px 14px;cursor:pointer;font-size:.95rem;color:var(--ink)}
@@ -261,8 +264,8 @@
       <div class="msaving" id="mvMsg"></div>
       <div class="mfields">
         <label>資材 (資材セットID。例: D-8)</label><input id="mvMaterial" maxlength="100">
-        <label>入れもの (収納容器。例: 20Lコンテナ)</label><input id="mvContainer" maxlength="100">
-        <label>入数 (1容器に入れる数)</label><input id="mvUnits" type="number" min="0" inputmode="numeric">
+        <label>保管箱 (例: 20Lコンテナ)</label><input id="mvContainer" maxlength="100">
+        <label>入数 (保管箱1つに入れる数)</label><input id="mvUnits" type="number" min="0" inputmode="numeric">
         <label>工程数</label><input id="mvProcess" type="number" min="0" inputmode="numeric">
         <label>気をつけること (備考)</label><input id="mvNote" maxlength="300">
         <label>作り方動画のリンク (https://…)</label><input id="mvVideo" type="url" maxlength="500" placeholder="https://">
@@ -662,9 +665,9 @@ function renderDetail(c) {
 
     '<div class="dcard"><h3 class="sec">作業のやり方 <button class="reg" style="margin-left:8px" onclick="openMaster()">✎ 編集</button></h3><div class="kvs">' +
       kv('資材', m.material_code, { miss: missSet.has('資材'), reg: 'material_code' }) +
-      kv('入れもの', m.storage_container && m.units_per_container != null
+      kv('保管箱', m.storage_container && m.units_per_container != null
           ? m.storage_container + 'に ' + m.units_per_container + '個ずつ'
-          : m.storage_container, { miss: missSet.has('容器') || missSet.has('入数'), reg: 'storage_container' }) +
+          : m.storage_container, { miss: missSet.has('保管箱') || missSet.has('入数'), reg: 'storage_container' }) +
       kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程'), reg: 'process_count' }) +
       (m.video_url
         ? '<div class="kv"><label>作り方どうが</label><div class="v"><a href="' + esc(m.video_url) + '" target="_blank" rel="noopener">▶ どうがを見る</a></div></div>'

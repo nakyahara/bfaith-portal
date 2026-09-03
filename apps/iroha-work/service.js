@@ -73,7 +73,7 @@ export function masterOf(wm, props) {
     : { source: 'card', version: null, ...card, video_url: null };
   const missing = [];
   if (!m.material_code) missing.push('資材');
-  if (!m.storage_container) missing.push('容器');
+  if (!m.storage_container) missing.push('保管箱');   // 画面の呼び名は「保管箱」(中原さん 2026-09-03。旧「入れもの」)
   if (m.units_per_container == null) missing.push('入数');
   if (m.process_count == null) missing.push('工程');
   m.missing = missing;
