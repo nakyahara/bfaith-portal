@@ -84,12 +84,17 @@
         <tr><th>紐付けの衝突</th><td id="linkConflicts">
           <% if (!migration.linkConflictsTotal) { %>0 件<% } else { %>
             <b class="ng"><%= migration.linkConflictsTotal %> 件</b> — 入荷受付で確定したタスクと、Notion から取り込んだタスクが同じカードを指しています (iPad に 2 枚見える)。
-            「統合」で 1 枚にします: 残す側に行き先と Notion ページを集め、作業時間・写真・履歴も残す側へ付け替え、もう一方は終了 (取消) になります。
-            ふつうは<b>取込側を残す</b> (現場が Notion 時代から動かしてきた方)。
-            <% migration.linkConflicts.forEach((c) => { %>
-              <div class="row" style="margin-top:4px">確定 task#<%= c.task_id %> <%= c.product_code %> (<%= c.product_name %>) [<%= c.status %>] ↔ 取込 task#<%= c.other_task_id %> [<%= c.other_status %>]
-                <button onclick="mergeConflict(<%= c.task_id %>, 'import')">取込側を残して統合</button>
-                <button onclick="mergeConflict(<%= c.task_id %>, 'inbound')">確定側を残して統合</button></div>
+            「統合」で 1 枚にします: 残す側に行き先と Notion ページを集め、作業時間・写真・履歴も残す側へ付け替えます。
+            もう一方は、未終了なら終了 (取消) に、既に終了済みなら終了理由そのままで残ります。
+            ふつうは<b>取込側を残す</b> (現場が Notion 時代から動かしてきた方)。終了した側は残せません。作業中の人がいる側は消せません。
+            行き先が取消済みなら、統合後に残す側へ取消を伝えます。統合したら、開いている iPad の画面は一覧を読み直してください。
+            <% migration.linkConflicts.forEach((c) => {
+                 const keepImportNg = (c.other_status === 'closed' && c.status !== 'closed') ? '取込側は終了しています' : (c.active_sessions > 0 ? '確定側で作業中の人がいます' : '');
+                 const keepInboundNg = (c.status === 'closed' && c.other_status !== 'closed') ? '確定側は終了しています' : (c.other_active_sessions > 0 ? '取込側で作業中の人がいます' : ''); %>
+              <div class="row" style="margin-top:4px">確定 task#<%= c.task_id %> <%= c.product_code %> (<%= c.product_name %>) [<%= c.status %><%= c.active_sessions ? '・作業中' + c.active_sessions + '人' : '' %>]
+                ↔ 取込 task#<%= c.other_task_id %> [<%= c.other_status %><%= c.other_active_sessions ? '・作業中' + c.other_active_sessions + '人' : '' %>]<%= c.destination_cancelled_at ? ' ⚠行き先は取消済み' : '' %>
+                <button onclick="mergeConflict(<%= c.task_id %>, 'import')" <%= keepImportNg ? 'disabled title="' + keepImportNg + '"' : '' %>>取込側を残して統合</button>
+                <button onclick="mergeConflict(<%= c.task_id %>, 'inbound')" <%= keepInboundNg ? 'disabled title="' + keepInboundNg + '"' : '' %>>確定側を残して統合</button></div>
             <% }) %>
             <% if (migration.linkConflictsTotal > migration.linkConflicts.length) { %><br>…他 <%= migration.linkConflictsTotal - migration.linkConflicts.length %> 件 (統合すると次が出ます)<% } %>
             <div id="mergeMsg" class="msg"></div>
@@ -332,7 +337,7 @@
     function migShow(obj) { const el = document.getElementById('migOut'); el.style.display = 'block'; el.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1); }
     async function mergeConflict(taskId, keep) {
       const label = keep === 'import' ? '取込側' : '確定側';
-      if (!window.confirm('task#' + taskId + ' の衝突を統合します (' + label + 'を残し、もう一方は終了 (取消) になります)。よろしいですか?')) return;
+      if (!window.confirm('task#' + taskId + ' の衝突を統合します (' + label + 'を残し、もう一方は未終了なら終了 (取消) になります)。よろしいですか?')) return;
       const { json } = await post('/admin/migration/link-conflicts/merge', { task_id: taskId, keep });
       if (!json.ok) { setMsg('mergeMsg', 'err', json.message || '統合できませんでした'); return; }
       setMsg('mergeMsg', 'ok', 'task#' + json.kept + ' に統合しました (task#' + json.closed + ' は終了)。残り ' + json.remaining + ' 件');

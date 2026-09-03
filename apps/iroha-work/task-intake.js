@@ -11,7 +11,7 @@
  */
 import { getDB } from './db.js';
 import { DEFAULT_FACILITY } from './tasks.js';
-import { getTaskByDestination, safeLogTaskEvent } from './tasks-db.js';
+import { getTaskByDestination, safeLogTaskEvent, requestCancellation } from './tasks-db.js';
 import { normSupplierCode } from '../purchase-orders/db.js';
 
 const utcNow = () => new Date().toISOString();
@@ -139,8 +139,11 @@ const LINK_CONFLICT_FROM = `FROM f_iroha_tasks t
 export function listLinkConflicts(limit = 50) {
   const db = getDB();
   if (!tableExists(db, 'f_inbound_check_destinations')) return [];
-  return db.prepare(`SELECT t.id AS task_id, t.destination_id, t.product_code, t.product_name, t.status, d.notion_page_id,
-      o.id AS other_task_id, o.status AS other_status, o.product_code AS other_product_code
+  return db.prepare(`SELECT t.id AS task_id, t.destination_id, t.product_code, t.product_name, t.status, t.cancellation_requested_at, d.notion_page_id,
+      d.cancelled_at AS destination_cancelled_at,
+      o.id AS other_task_id, o.status AS other_status, o.product_code AS other_product_code, o.cancellation_requested_at AS other_cancellation_requested_at,
+      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id AND s.ended_at IS NULL) AS active_sessions,
+      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = o.id AND s.ended_at IS NULL) AS other_active_sessions
     ${LINK_CONFLICT_FROM} ORDER BY t.id LIMIT ?`).all(Number(limit) || 50);
 }
 /** 総件数 (一覧は先頭だけなので、件数は別に数える — Codex PR-B R3 Low) */
@@ -154,10 +157,15 @@ export function countLinkConflicts() {
 const TASK_CHILD_TABLES = ['f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events', 'f_iroha_label_waits'];
 
 /**
- * 紐付け衝突を統合する (管理者操作 — Codex PR-B R3 Medium)。
+ * 紐付け衝突を統合する (管理者操作 — Codex PR-B R3 Medium / R4 で条件を固めた)。
  * 確定時に作ったタスク (inbound) と、Notion から取り込んだタスク (import) が同じカードを指しているとき、
  * 残す側 (keep) に 行き先 (destination_id) と Notion ページ (notion_page_id) の両方を集め、もう一方の
- * 作業時間・写真・履歴・ラベル待ちを残す側へ付け替えたうえで、もう一方を「終了 (取消)」にする。1 トランザクション。
+ * 作業時間・写真・履歴・ラベル待ちを残す側へ付け替えたうえで、もう一方を終了にする (未終了なら 終了:取消。既に終了なら理由はそのまま)。1 トランザクション。
+ * 拒否する組み合わせ:
+ *   - 残す側が終了していて、消える側は開いている (行き先だけが終了タスクへ移り、一覧から消える) → keep_closed。両方終了なら通す
+ *   - 消える側で作業中の人がいる (活動中セッションを黙って別タスクへ移すと、その端末は終了できなくなる) → from_active
+ * 消える側が着手済み (作業中/保留/棚入待ち) で残す側が未着手なら、残す側を作業中に上げて started_at を引き継ぐ。
+ * 取消の要求 (行き先が取消済み / 消える側の cancellation_requested_at) は残す側へ引き継ぐ (取消済みの入荷の作業が続かない)。
  * @param taskId 確定側 (inbound) のタスク id (listLinkConflicts の task_id)
  * @param keep 'import' (取込側を残す。既定 — 現場が Notion 時代から動かしてきた方) | 'inbound' (確定側を残す)
  */
@@ -165,32 +173,59 @@ export function mergeLinkConflict({ taskId, keep = 'import', actor = null }) {
   const db = getDB();
   if (keep !== 'import' && keep !== 'inbound') return { ok: false, error: 'bad_request', message: 'keep は import / inbound のどちらかです' };
   return db.transaction(() => {
-    const c = db.prepare(`SELECT t.id AS task_id, t.destination_id, d.notion_page_id, o.id AS other_task_id ${LINK_CONFLICT_FROM} AND t.id = ?`).get(Number(taskId));
+    const c = db.prepare(`SELECT t.id AS task_id, t.destination_id, d.notion_page_id, d.cancelled_at AS destination_cancelled_at, o.id AS other_task_id
+      ${LINK_CONFLICT_FROM} AND t.id = ?`).get(Number(taskId));
     if (!c) return { ok: false, error: 'not_found', message: 'この衝突はもうありません (解消済みか、対象が変わりました)' };
-    const into = keep === 'import' ? c.other_task_id : c.task_id;
-    const from = keep === 'import' ? c.task_id : c.other_task_id;
+    const intoId = keep === 'import' ? c.other_task_id : c.task_id;
+    const fromId = keep === 'import' ? c.task_id : c.other_task_id;
+    const row = (id) => db.prepare('SELECT * FROM f_iroha_tasks WHERE id = ?').get(id);
+    const activeOf = (id) => db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL').get(id).c;
+    const into = row(intoId);
+    const from = row(fromId);
+    if (into.status === 'closed' && from.status !== 'closed') {
+      return { ok: false, error: 'keep_closed', message: `残す側 (task#${intoId}) は終了しています。開いている側 (task#${fromId}) を残してください` };
+    }
+    const fromActive = activeOf(fromId);
+    if (fromActive > 0) {
+      return { ok: false, error: 'from_active', message: `消える側 (task#${fromId}) で作業中の人が ${fromActive} 人います。作業を終了してから統合するか、そちらを残してください` };
+    }
     const now = utcNow();
     const who = actor || 'admin';
-    // ① 消える側から行き先・ページを外す (UNIQUE を空けてから残す側に付ける)
-    db.prepare('UPDATE f_iroha_tasks SET destination_id = NULL, notion_page_id = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?').run(now, who, from);
-    db.prepare('UPDATE f_iroha_tasks SET destination_id = ?, notion_page_id = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?')
-      .run(c.destination_id, c.notion_page_id, now, who, into);
+    // ① 消える側から行き先・ページを外す (UNIQUE を空けてから残す側に付ける)。取消の要求も残す側へ引き継ぐ
+    db.prepare('UPDATE f_iroha_tasks SET destination_id = NULL, notion_page_id = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?').run(now, who, fromId);
+    db.prepare(`UPDATE f_iroha_tasks SET destination_id = ?, notion_page_id = ?,
+        cancellation_requested_at = COALESCE(cancellation_requested_at, ?), cancellation_source = COALESCE(cancellation_source, ?),
+        version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?`)
+      .run(c.destination_id, c.notion_page_id, from.cancellation_requested_at, from.cancellation_source, now, who, intoId);
     // ② 記録を残す側へ付け替え
     const moved = {};
     for (const t of TASK_CHILD_TABLES) {
       if (!tableExists(db, t)) continue;
-      moved[t] = db.prepare(`UPDATE ${t} SET task_id = ? WHERE task_id = ?`).run(into, from).changes;
+      moved[t] = db.prepare(`UPDATE ${t} SET task_id = ? WHERE task_id = ?`).run(intoId, fromId).changes;
     }
-    // ③ 消える側は終了 (取消) — 履歴に「どこへ統合したか」を残す。既に終了なら理由だけ残す
-    const f = db.prepare('SELECT status FROM f_iroha_tasks WHERE id = ?').get(from);
-    if (f.status !== 'closed') {
+    // ③ 消える側が着手済みで残す側が未着手なら、残す側を作業中へ (「作業記録を持つ未着手タスク」を作らない)
+    let promoted = null;
+    if (into.status === 'not_started' && ['in_progress', 'on_hold', 'ready_for_stocking'].includes(from.status)) {
+      db.prepare('UPDATE f_iroha_tasks SET status = ?, started_at = COALESCE(started_at, ?, ?), version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?')
+        .run('in_progress', from.started_at, now, now, who, intoId);
+      promoted = `not_started→in_progress (消える側は ${from.status})`;
+    }
+    // ④ 消える側は終了 — 未終了なら 終了:取消。既に終了なら理由はそのまま。どこへ統合したか残す
+    if (from.status !== 'closed') {
       db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = ?, closed_by = ?, hold_reason_code = NULL, hold_reason_note = NULL,
         cancellation_requested_at = NULL, migration_note = COALESCE(migration_note || ' / ', '') || ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?`)
-        .run(now, who, `統合 → task#${into}`, now, who, from);
+        .run(now, who, `統合 → task#${intoId}`, now, who, fromId);
     } else {
-      db.prepare("UPDATE f_iroha_tasks SET migration_note = COALESCE(migration_note || ' / ', '') || ? WHERE id = ?").run(`統合 → task#${into}`, from);
+      db.prepare("UPDATE f_iroha_tasks SET migration_note = COALESCE(migration_note || ' / ', '') || ? WHERE id = ?").run(`統合 → task#${intoId}`, fromId);
     }
-    safeLogTaskEvent({ taskId: into, action: 'task_merge', from: `task#${from}`, to: `keep=${keep} dest#${c.destination_id} page=${c.notion_page_id} moved=${JSON.stringify(moved)}`, workerName: who, ok: true });
-    return { ok: true, kept: into, closed: from, moved };
+    safeLogTaskEvent({ taskId: intoId, action: 'task_merge', from: `task#${fromId}`,
+      to: `keep=${keep} dest#${c.destination_id} page=${c.notion_page_id} moved=${JSON.stringify(moved)}${promoted ? ' ' + promoted : ''}`, workerName: who, ok: true });
+    // ⑤ 行き先が取消済みなら、残す側にも取消を伝える (未着手・実績なしは自動で終了:取消、着手後は要確認) — 同じトランザクション
+    let cancellation = null;
+    if (c.destination_cancelled_at) cancellation = requestCancellation({ destinationId: c.destination_id, source: 'inbound_reversal', actor: who });
+    const keptNow = row(intoId);
+    return { ok: true, kept: intoId, closed: fromId, moved, promoted, keptStatus: keptNow.status,
+      cancellation: cancellation ? cancellation.action : null,
+      note: '統合前から開いていた作業画面は一覧を読み直してください (古いタスク番号では操作できません)' };
   }).immediate();
 }

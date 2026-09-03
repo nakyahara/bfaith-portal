@@ -1024,7 +1024,7 @@ router.post('/admin/migration/link-conflicts/merge', checkOrigin, requireAdmin, 
   const taskId = parseTaskId(req.body?.task_id);
   if (taskId == null) return res.status(400).json(BAD_TASK_ID);
   const r = mergeLinkConflict({ taskId, keep: String(req.body?.keep || 'import'), actor: req.iwUser });
-  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 400).json(r);
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : (r.error === 'keep_closed' || r.error === 'from_active') ? 409 : 400).json(r);
   safeLog({ action: 'link_conflict_merge', pageId: null, deviceLabel: `session:${req.iwUser}`, from: `task#${r.closed}`, to: `task#${r.kept}`, ok: true });
   res.json({ ...r, remaining: countLinkConflicts() });
 }));
