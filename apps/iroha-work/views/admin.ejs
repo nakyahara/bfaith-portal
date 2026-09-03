@@ -81,6 +81,24 @@
         </td></tr>
         <tr><th>要確認</th><td><%= migration.review %> 件 (取込時に状態を推定 / 取消の要確認)</td></tr>
         <tr><th>孤立 (task に紐づかない)</th><td>作業時間 <%= migration.orphans.sessions.length %> ページ / 写真 <%= migration.orphans.media.length %> ページ</td></tr>
+        <tr><th>名前のないカード</th><td>
+          <% if (!migration.nameless || migration.nameless.length === 0) { %>0 件<% } else { %>
+            <b class="ng"><%= migration.nameless.length %> 件</b> — 商品名が無く、<b>Notion のカードにも入荷受付の行き先にも紐づいていない</b>カードです
+            (この条件に当てはまるものだけが片づけられます)。作業時間・写真・ラベル待ちが付いていれば消さずに「終了 (在庫化対象外)」にします。
+            作業中の人がいるカードは片づけられません。
+            <% migration.nameless.forEach((t) => { %>
+              <div class="row" style="margin-top:4px">
+                task#<%= t.id %> [<%= t.status %>] 商品コード <%= t.product_code || '—' %> ・ 数量 <%= t.qty == null ? '—' : t.qty %>
+                ・ 行き先 <%= t.destination_id == null ? '—' : t.destination_id %>
+                ・ Notion <%= t.notion_page_id ? String(t.notion_page_id).slice(0, 8) + '…' : 'なし' %>
+                ・ 作った人 <%= t.created_by || '—' %>
+                <% if (t.sessions || t.media || t.label_waits) { %>(記録あり: 作業<%= t.sessions %>/写真<%= t.media %>/ラベル<%= t.label_waits %>)<% } %>
+                <button onclick="removeTask(<%= t.id %>, <%= (t.sessions || t.media || t.label_waits) ? 'true' : 'false' %>)">🗑 片づける</button>
+              </div>
+            <% }) %>
+            <div id="rmMsg" class="msg"></div>
+          <% } %>
+        </td></tr>
         <tr><th>紐付けの衝突</th><td id="linkConflicts">
           <% if (!migration.linkConflictsTotal) { %>0 件<% } else { %>
             <b class="ng"><%= migration.linkConflictsTotal %> 件</b> — 入荷受付で確定したタスクと、Notion から取り込んだタスクが同じカードを指しています (iPad に 2 枚見える)。
@@ -335,6 +353,14 @@
 
     let migPlanId = null;   // 自分が見た調査結果の ID (本取込はこれと一致する結果にだけ)
     function migShow(obj) { const el = document.getElementById('migOut'); el.style.display = 'block'; el.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1); }
+    async function removeTask(taskId, hasRecords) {
+      const what = hasRecords ? '記録が付いているので「終了 (在庫化対象外)」にします' : 'このカードを消します (元に戻せません)';
+      if (!window.confirm('task#' + taskId + ': ' + what + '。よろしいですか?')) return;
+      const { json } = await post('/admin/tasks/remove', { task_id: taskId, confirm: 'REMOVE' });
+      if (!json.ok) { setMsg('rmMsg', 'err', json.message || '片づけられませんでした'); return; }
+      setMsg('rmMsg', 'ok', 'task#' + json.id + ' を' + (json.action === 'deleted' ? '消しました' : '終了 (在庫化対象外) にしました') + '。残り ' + json.remaining + ' 件');
+      setTimeout(() => location.reload(), 800);
+    }
     async function mergeConflict(taskId, keep) {
       const label = keep === 'import' ? '取込側' : '確定側';
       if (!window.confirm('task#' + taskId + ' の衝突を統合します (' + label + 'を残し、もう一方は未終了なら終了 (取消) になります)。よろしいですか?')) return;

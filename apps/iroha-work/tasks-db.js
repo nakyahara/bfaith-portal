@@ -84,10 +84,14 @@ export function listTasksNeedingReview() {
 // ─── 履歴 ───
 
 export function logTaskEvent({ taskId, action, from = null, to = null, workerId = null, workerName = null, deviceLabel = null, ok = true, error = null }) {
-  const t = getTask(taskId);
+  // カードに紐づかない履歴 (カードを消した記録など) は task_id を NULL に。
+  // Number(null) = 0 で入れると、存在しない id 0 への外部キー違反になる
+  const id = Number(taskId);
+  const taskRef = Number.isSafeInteger(id) && id > 0 ? id : null;
+  const t = taskRef == null ? null : getTask(taskRef);
   getDB().prepare(`INSERT INTO f_iroha_app_events (at, action, page_id, task_id, worker_id, worker_name, device_label, from_value, to_value, ok, error)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(utcNow(), action, t?.notion_page_id || null, Number(taskId), workerId, workerName, deviceLabel, from, to, ok ? 1 : 0, error);
+    .run(utcNow(), action, t?.notion_page_id || null, taskRef, workerId, workerName, deviceLabel, from, to, ok ? 1 : 0, error);
 }
 export function safeLogTaskEvent(args) {
   try { logTaskEvent(args); } catch (e) { console.error('[iroha-work] タスク履歴の記録に失敗 (処理自体は完了)', e.message); }
@@ -263,6 +267,91 @@ export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = nul
     .run(d, utcNow(), actor, t.id, t.version);
   if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
   safeLogTaskEvent({ taskId: t.id, action: 'task_planned', from: t.planned_date, to: d, workerId, workerName, deviceLabel, ok: true });
+  return { ok: true, task: getTask(t.id) };
+}
+
+/**
+ * 「素性の分からないカード」の条件 (一覧と削除で同じものを使う — Codex FB R3)。
+ *   名前が無い (または「(名称なし)」) / Notion のページに紐づかない / 入荷受付の行き先にも紐づかない / まだ終わっていない
+ * どれか 1 つでも当てはまらなければ、消す対象ではない
+ */
+const STRAY_WHERE = `t.status <> 'closed'
+      AND t.notion_page_id IS NULL AND t.destination_id IS NULL
+      AND (t.product_name IS NULL OR TRIM(t.product_name) = '' OR t.product_name = '(名称なし)')`;
+
+/** 名前のないカード (取込でも入荷受付でもない行)。管理画面で人が見て消すためだけの一覧 */
+export function listNamelessTasks(limit = 50) {
+  return getDB().prepare(`SELECT t.id, t.status, t.close_reason, t.product_code, t.product_name, t.qty, t.destination_id, t.notion_page_id,
+      t.created_at, t.created_by, t.updated_by,
+      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id) AS sessions,
+      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id AND s.ended_at IS NULL) AS active_sessions,
+      (SELECT COUNT(*) FROM f_iroha_card_media m WHERE m.task_id = t.id AND m.deleted_at IS NULL) AS media,
+      (SELECT COUNT(*) FROM f_iroha_label_waits w WHERE w.task_id = t.id) AS label_waits
+    FROM f_iroha_tasks t
+    WHERE ${STRAY_WHERE}
+    ORDER BY t.id LIMIT ?`).all(Math.max(1, Math.min(200, Number(limit) || 50)));
+}
+
+/**
+ * 素性の分からないカードを片づける (管理者操作)。
+ * 作業時間・写真・ラベル待ちが 1 つも無ければ**行ごと消す**。1 つでもあれば消さずに「終了 (在庫化対象外)」にして履歴に残す
+ * (記録の持ち主を消さない)。どちらも 1 トランザクション
+ * @returns {{ok, action:'deleted'|'closed', id}}
+ */
+export function removeStrayTask({ taskId, actor = null, reason = null }) {
+  const db = getDB();
+  return db.transaction(() => {
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません' };
+    // 画面から送られた id をそのまま信じない。消していい条件をここでもう一度確かめる (Codex FB R3)
+    const stray = db.prepare(`SELECT 1 FROM f_iroha_tasks t WHERE t.id = ? AND ${STRAY_WHERE}`).get(t.id);
+    if (!stray) {
+      return { ok: false, error: 'not_stray',
+        message: 'このカードは片づけの対象ではありません (名前がある / Notion のカードがある / 入荷受付の行き先がある / もう終わっている)' };
+    }
+    const n = (sql) => db.prepare(sql).get(t.id).c;
+    const used = n('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?')
+      + n('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id = ?')
+      + n('SELECT COUNT(*) c FROM f_iroha_label_waits WHERE task_id = ?');
+    const note = reason || '素性の分からないカード (管理画面から片づけ)';
+    // 作業中の人がいるまま閉じない (カードが一覧から消えても記録が開きっぱなしになり、次の開始が塞がる — Codex FB R3)
+    const active = n('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL');
+    if (active > 0) {
+      return { ok: false, error: 'active_sessions', message: `このカードで作業中の人が ${active} 人います。作業を終えてから片づけてください` };
+    }
+    if (used > 0) {
+      if (t.status === 'closed') return { ok: true, action: 'closed', id: t.id, already: true };
+      db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'out_of_scope', closed_at = ?, closed_by = ?,
+          hold_reason_code = NULL, hold_reason_note = NULL, cancellation_requested_at = NULL,
+          migration_note = COALESCE(migration_note || ' / ', '') || ?, version = version + 1, updated_at = ?, updated_by = ?
+        WHERE id = ? AND version = ?`)
+        .run(utcNow(), actor, note, utcNow(), actor, t.id, t.version);
+      logTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: `closed:out_of_scope (${note})`, ok: true });
+      return { ok: true, action: 'closed', id: t.id };
+    }
+    // 記録が無いので消す。履歴の行だけ先に外す (task_id の FK)
+    db.prepare('DELETE FROM f_iroha_app_events WHERE task_id = ?').run(t.id);
+    db.prepare('DELETE FROM f_iroha_tasks WHERE id = ?').run(t.id);
+    logTaskEvent({ taskId: null, action: 'task_removed', to: `task#${t.id} ${t.product_code || ''} ${note}`, ok: true });
+    return { ok: true, action: 'deleted', id: t.id };
+  }).immediate();
+}
+
+/**
+ * 「外部施設に出す準備OK」の切り替え (状態とは別のチェック。Notion のチェックボックスの置き換え)。
+ * 終了したタスクでは触らない。誰でも押せる (出せる状態になったかは現場が判断する)
+ */
+export function setExternalReady({ taskId, ready, expectVersion, actor = null, workerId = null, workerName = null, deviceLabel = null }) {
+  const db = getDB();
+  const t = getTask(taskId);
+  if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+  if (t.status === 'closed') return { ok: false, error: 'done_card', message: '終了したカードは変えられません' };
+  if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
+  const v = ready ? 1 : 0;
+  const r = db.prepare('UPDATE f_iroha_tasks SET external_ready = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+    .run(v, utcNow(), actor, t.id, t.version);
+  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+  safeLogTaskEvent({ taskId: t.id, action: 'task_external_ready', from: String(t.external_ready ? 1 : 0), to: String(v), workerId, workerName, deviceLabel, ok: true });
   return { ok: true, task: getTask(t.id) };
 }
 

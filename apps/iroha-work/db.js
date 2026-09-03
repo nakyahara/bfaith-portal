@@ -38,7 +38,7 @@ const workOptionsDDL = (name) => `
 const TASKS_COLS = ['id', 'destination_id', 'notion_page_id', 'legacy_status', 'status', 'close_reason', 'facility_code', 'hold_reason_code', 'hold_reason_note',
   'planned_date', 'priority_class', 'priority_note', 'product_code', 'product_name', 'qty', 'arrival_date', 'ar_no', 'barcode', 'expiry', 'supplier', 'handling',
   'master_snapshot', 'payload', 'started_at', 'ready_at', 'closed_at', 'closed_by', 'cancellation_requested_at', 'cancellation_source',
-  'migration_review', 'migration_note', 'import_batch_id', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
+  'migration_review', 'migration_note', 'import_batch_id', 'external_ready', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
 const tasksDDL = (name) => `
     CREATE TABLE IF NOT EXISTS ${name} (
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +51,7 @@ const tasksDDL = (name) => `
       hold_reason_code TEXT CHECK (hold_reason_code IS NULL OR hold_reason_code IN ('materials_shortage','label_shortage','awaiting_instruction','other')),
       hold_reason_note TEXT,
       planned_date     TEXT,
+      external_ready   INTEGER NOT NULL DEFAULT 0 CHECK (external_ready IN (0,1)),
       priority_class   TEXT,
       priority_note    TEXT,
       product_code     TEXT,
@@ -234,9 +235,28 @@ function migrateSessionMediaSchema(db) {
 const TASKS_REQUIRED_DDL = [
   /\(status = 'closed'\) = \(close_reason IS NOT NULL\)/, /\(status = 'closed'\) = \(closed_at IS NOT NULL\)/,
   /\(status = 'on_hold'\) = \(hold_reason_code IS NOT NULL\)/, /hold_reason_code <> 'other'/, /REFERENCES f_iroha_facilities/,
+  // 列はあるが制約が無い「途中の版」も作り直す (addCol は既にある列に触れないため — Codex FB R4)
+  /external_ready\s+INTEGER NOT NULL DEFAULT 0 CHECK \(external_ready IN \(0,1\)\)/,
 ];
 const LABEL_REQUIRED_DDL = [/REFERENCES f_iroha_tasks/, /label_ordered IN \(0,1\)/, /location IN \('Z','Y','none'\)/, /reattach IN \(0,1\)/, /done IN \(0,1\)/];
 const FK_CHECK_TABLES = ['f_iroha_tasks', 'f_iroha_label_waits', 'f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events'];
+
+/**
+ * 作り直しのときに写す列と、その取り出し方 (Codex FB R4)。
+ *   - 旧テーブルに無い列は写さない (新しい定義の既定値のまま)
+ *   - 新しい定義で NOT NULL かつ既定値がある列は COALESCE(旧列, 既定値) — 古いデータの NULL でコピーを止めない
+ *   - NOT NULL で既定値も無い列に NULL があると、そこで止まる (黙って別の値を入れない。FK 検査と同じ考え方)
+ */
+function copyCols(db, oldTable, newTable, wanted) {
+  const have = new Set(db.prepare(`PRAGMA table_info(${oldTable})`).all().map((c) => c.name));
+  const def = new Map(db.prepare(`PRAGMA table_info(${newTable})`).all().map((c) => [c.name, c]));
+  const names = wanted.filter((c) => have.has(c));
+  const exprs = names.map((c) => {
+    const d = def.get(c);
+    return d && d.notnull === 1 && d.dflt_value != null ? `COALESCE(${c}, ${d.dflt_value})` : c;
+  });
+  return { names, exprs };
+}
 
 /**
  * f_iroha_tasks / f_iroha_label_waits の作り直し: CHECK・FK の無い (または一部足りない) 古い版が残っていたら、行をそのまま
@@ -259,14 +279,16 @@ function migrateTasksSchema(db) {
     db.transaction(() => {
       if (needTasks) {
         db.exec(tasksDDL('f_iroha_tasks__new'));
-        db.exec(`INSERT INTO f_iroha_tasks__new (${TASKS_COLS.join(', ')}) SELECT ${TASKS_COLS.join(', ')} FROM f_iroha_tasks`);
+        const cols = copyCols(db, 'f_iroha_tasks', 'f_iroha_tasks__new', TASKS_COLS);
+        db.exec(`INSERT INTO f_iroha_tasks__new (${cols.names.join(', ')}) SELECT ${cols.exprs.join(', ')} FROM f_iroha_tasks`);
         db.exec('DROP TABLE f_iroha_tasks');
         db.exec('ALTER TABLE f_iroha_tasks__new RENAME TO f_iroha_tasks');
         db.exec(TASKS_INDEX_DDL);
       }
       if (needLabel) {
         db.exec(labelWaitsDDL('f_iroha_label_waits__new'));
-        db.exec(`INSERT INTO f_iroha_label_waits__new (${LABEL_COLS.join(', ')}) SELECT ${LABEL_COLS.join(', ')} FROM f_iroha_label_waits`);
+        const colsL = copyCols(db, 'f_iroha_label_waits', 'f_iroha_label_waits__new', LABEL_COLS);
+        db.exec(`INSERT INTO f_iroha_label_waits__new (${colsL.names.join(', ')}) SELECT ${colsL.exprs.join(', ')} FROM f_iroha_label_waits`);
         db.exec('DROP TABLE f_iroha_label_waits');
         db.exec('ALTER TABLE f_iroha_label_waits__new RENAME TO f_iroha_label_waits');
         db.exec(LABEL_INDEX_DDL);
@@ -506,6 +528,8 @@ export function createTables(db = getMirrorDB()) {
   };
   // 作業開始時点の作業仕様スナップショット (§1.7 ④: 後で仕様が変わっても
   // 「当時何を見て作業したか」を残す。JSON)
+  // 外部施設に出す準備ができたか (状態とは別のチェック。Notion のチェックボックスの置き換え — 中原さん 2026-09-03)
+  addCol('f_iroha_tasks', 'external_ready', 'INTEGER NOT NULL DEFAULT 0 CHECK (external_ready IN (0,1))');
   addCol('f_iroha_work_sessions', 'master_snapshot', 'TEXT');
   // Drive 側で消えた写真の印 (配信で 404/410 を見たら付け、表示と「前回の完成形」候補から外す。
   // 管理画面の再実行で解除 — Codex R1 #5)

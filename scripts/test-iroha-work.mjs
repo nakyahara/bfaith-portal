@@ -1643,6 +1643,35 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok((await call('GET', '/api/history?from=0001-01-01&to=9999-12-31', { cookie })).status === 200, '端から端までの指定も通る');
       const one = await call('GET', '/api/history?q=' + encodeURIComponent('棚入待ち1'), { cookie });
       ok(one.json.total === 1 && one.json.rows[0].id === r1 && one.json.rows[0].facility_name === 'いろは', '商品名で絞れる (拠点名つき)');
+      // 外部施設に出す準備OK (HTTP)
+      const extTask = mk(9105, '外部に出す予定', 'in_progress');
+      const e1 = await call('POST', '/api/external-ready', { cookie, body: { id: extTask, ready: true, expect_version: TD.getTask(extTask).version, worker_id: w1.id } });
+      ok(e1.status === 200 && e1.json.ok && e1.json.task.external_ready === true, '外部に出す準備OK にできる (職員でなくてよい)');
+      ok((await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === extTask).external_ready === true, '一覧にも出る');
+      const e2 = await call('POST', '/api/external-ready', { cookie, body: { id: extTask, ready: false, expect_version: 1, worker_id: w1.id } });
+      ok(e2.status === 409 && e2.json.error === 'conflict' && e2.json.current, '古い version は 409 (現在値つき)');
+      ok((await call('POST', '/api/external-ready', { cookie, body: { id: 'x', ready: true, worker_id: w1.id } })).status === 400, '不正な id は 400');
+      ok((await call('POST', '/api/external-ready', { ...admin, body: { id: extTask, ready: false, expect_version: TD.getTask(extTask).version } })).status === 400,
+        '作業者を選んでいなければ 400');
+      // ready は true/false だけ (欠落・文字列・数値を「解除」と読まない — Codex FB R2)
+      for (const bad of [undefined, null, 'true', 1, 0, {}]) {
+        const body = { id: extTask, expect_version: TD.getTask(extTask).version, worker_id: w1.id };
+        if (bad !== undefined) body.ready = bad;
+        const r = await call('POST', '/api/external-ready', { cookie, body });
+        if (!(r.status === 400 && r.json.error === 'bad_request')) ok(false, `ready=${JSON.stringify(bad)} は 400 (実際 ${r.status})`);
+      }
+      ok(TD.getTask(extTask).external_ready === 1, '不正な ready でチェックが外れていない');
+      // 名前のないカードの片づけ (管理者のみ・confirm 必須)
+      const stray = Number(db.prepare(`INSERT INTO f_iroha_tasks (status, facility_code, product_name, version, created_at, created_by, updated_at, updated_by)
+        VALUES ('not_started', 'iroha', NULL, 1, ?, 'test', ?, 'test')`).run(new Date().toISOString(), new Date().toISOString()).lastInsertRowid);
+      ok((await call('POST', '/admin/tasks/remove', { cookie, body: { task_id: stray, confirm: 'REMOVE' } })).status === 403, '片づけは管理者だけ');
+      ok((await call('POST', '/admin/tasks/remove', { ...admin, body: { task_id: stray } })).json.error === 'confirm_required', 'confirm=REMOVE が要る');
+      const rm = await call('POST', '/admin/tasks/remove', { ...admin, body: { task_id: stray, confirm: 'REMOVE' } });
+      ok(rm.status === 200 && rm.json.action === 'deleted' && TD.getTask(stray) === null && typeof rm.json.remaining === 'number', '消せる (残り件数も返す)');
+      ok((await call('GET', '/admin/migration/status', { ...admin })).json.nameless !== undefined, '管理画面の状態に名前のないカードが載る');
+      ok((await call('POST', '/admin/tasks/remove', { ...admin, body: { task_id: task.id, confirm: 'REMOVE' } })).status === 409,
+        'ふつうのカード (名前あり・Notion 紐づきあり) は 409 で消せない');
+      ok(TD.getTask(task.id) !== null, '消えていない');
     }
     ok(notionCalls() === calls0, 'ここまで Notion API を 1 回も呼んでいない');
     // Notion に戻す: app 正本以降の記録があるので 409 → force で通る (件数・監査ログ・切替時刻)
@@ -1677,6 +1706,7 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         ['POST', '/api/planned', { id: 1, worker_id: w1.id }],
         ['POST', '/api/cancellation', { id: 1, worker_id: staff2.id, decision: 'cancel', pin: '4649' }],
         ['POST', '/api/review-cleared', { id: 1, worker_id: staff2.id, pin: '4649' }],
+        ['POST', '/api/external-ready', { id: 1, ready: true, worker_id: w1.id }],
       ];
       for (const [m, p2, body] of writes) {
         const r = await call(m, p2, { cookie, body });
@@ -1905,6 +1935,237 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
   ok(TD.listLabelWaits({ taskId: d, openOnly: false }).length === 1 && TD.listLabelWaits({ taskId: 999999, openOnly: false }).length === 0, 'カードで絞れる');
 }
 
+console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式をそのまま)');
+{
+  const utcNowT = () => new Date().toISOString();
+  const S2 = await import('../apps/iroha-work/service.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const db = getDB();
+  // 想定作業時間 = round(数量 × 工程数 × 5 / 3600 × 10) / 10
+  ok(S2.planHours(100, 2) === 0.3, '100個×2工程 = 0.3 時間 (1000秒→0.277…を小数1桁に)');
+  ok(S2.planHours(720, 1) === 1, '720個×1工程 = ちょうど 1 時間');
+  ok(S2.planHours(1, 1) === 0, '小さすぎる場合は 0 (切り捨てでなく四捨五入)');
+  ok(S2.planHours(null, 2) === null && S2.planHours(100, null) === null && S2.planHours(0, 2) === null && S2.planHours(100, 0) === null,
+    '数量か工程数が無い・0 なら出さない');
+  // 必要保管箱 = 入数で割る。Z 在庫があればその引当を引いた数、無ければ数量
+  ok(S2.neededBoxes(100, 10) === '10箱', '割り切れれば「N箱」');
+  ok(S2.neededBoxes(105, 10) === '10箱+5', '余りは「N箱+余り」');
+  ok(S2.neededBoxes(5, 10) === '0箱+5', '入数に満たなければ 0箱+余り');
+  ok(S2.neededBoxes(100, null) === null && S2.neededBoxes(100, 0) === null, '入数が無い・0 なら出さない (Notion と同じ)');
+  ok(S2.neededBoxes(100, 10, 30, 5) === '2箱+5', 'Z 在庫があれば Z在庫−Z引当 で計算 (30−5=25 → 2箱+5)');
+  ok(S2.neededBoxes(100, 10, 0, 0) === '10箱', 'Z 在庫が 0 なら数量で計算');
+  ok(S2.neededBoxes(100, 10, 20, 20) === '0箱', 'Z 在庫が全部引当済みなら 0箱');
+  ok(S2.neededBoxes(100, 10, 20, 30) === null, 'Z 引当が Z 在庫より多ければ (負になる) 出さない');
+  ok(S2.neededBoxes(100.5, 10) === null && S2.neededBoxes(100, 10.5) === null, '小数は出さない (箱数を保証できない)');
+  ok(S2.neededBoxes(Number.MAX_VALUE, 10) === null && S2.planHours(Number.MAX_VALUE, 2) === null, '桁があふれる値は出さない (Infinity を返さない)');
+  ok(S2.planHours(-100, 2) === null && S2.neededBoxes(-100, 10) === null, '負の数は出さない');
+
+  // 一覧のカードに乗る
+  const t = TD.upsertTaskFromImport({ notion_page_id: 'plan-1', status: 'not_started', destination_id: 9301,
+    product_code: 'PLAN-A', product_name: '想定時間テスト', qty: 100, facility_code: 'iroha',
+    master_snapshot: { units_per_container: 10, process_count: 2 } }, { batchId: 'test-plan' }).id;
+  clearEnrichCache();
+  const card = S2.buildTaskList().cards.find(c => c.id === t);
+  ok(card && card.plan_hours === 0.3 && card.boxes === '10箱', '一覧のカードに想定作業時間と必要保管箱が乗る');
+  // Z ロケの在庫があれば、そちらで数える
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
+  db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('PLAN-A', '想定時間テスト', 'Z01-001-001-01', 'Z01', '良品', 30, 5, ?, ?)`).run(new Date().toISOString(), new Date().toISOString());
+  clearEnrichCache();
+  const card2 = S2.buildTaskList().cards.find(c => c.id === t);
+  ok(card2.boxes === '2箱+5' && card2.z_stock === 30, 'Z ロケに在庫があれば、その分で必要保管箱を出す');
+  // 不良品は外に出せないので数えない (中原さん 2026-09-03)
+  db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('PLAN-A', '想定時間テスト', 'Z01-001-001-02', 'Z01', '不良品', 100, 0, ?, ?)`).run(new Date().toISOString(), new Date().toISOString());
+  clearEnrichCache();
+  const card3 = S2.buildTaskList().cards.find(c => c.id === t);
+  ok(card3.z_stock === 30 && card3.boxes === '2箱+5', 'Z ロケでも不良品は数えない (良品だけ)');
+  // Z 以外のロケは数えない
+  db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('PLAN-A', '想定時間テスト', 'P3F-001-001-01', 'P3F', '良品', 500, 0, ?, ?)`).run(new Date().toISOString(), new Date().toISOString());
+  clearEnrichCache();
+  ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === 30, 'Z 以外のロケ (本館・いろは棟) は数えない');
+  // 有効期限・入荷日で分かれた行は合算する。ブロック略称だけが Z の行も数える (Codex FB R1)
+  const insZ = db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 有効期限, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('PLAN-A', '想定時間テスト', ?, ?, '良品', ?, ?, ?, ?, ?)`);
+  const nowIso = new Date().toISOString();
+  insZ.run('Z01-001-001-03', 'Z01', '2027-01', 12, 2, nowIso, nowIso);       // ロケも略称も Z
+  insZ.run('AAAA-001-001-01', 'ZZZ', '2027-02', 8, 0, nowIso, nowIso);        // 略称だけ Z (棚以外)
+  clearEnrichCache();
+  const card4 = S2.buildTaskList().cards.find(c => c.id === t);
+  ok(card4.z_stock === 50, 'Z の行は期限・入荷日で分かれていても合算する (30+12+8)');
+  ok(card4.boxes === '4箱+3', '引当を引いて計算する (50−7=43 → 4箱+3)');
+  // 画面に出す用: 引当と、在庫ミラーをいつ取ったか (毎時更新。画面は 60 秒ごとに読み直す)
+  ok(card4.z_allocated === 7 && card4.z_free === 43, '引当と使える数もカードに乗る');
+  ok(card4.z_at && card4.z_at === db.prepare("SELECT MAX(captured_at) m FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'").get().m,
+    '在庫ミラーの取得時刻 (いちばん新しいもの) が乗る');
+  // 在庫が動いたら、次に一覧を作るときには新しい数になる (キャッシュしない)
+  db.prepare("UPDATE mirror_logizard_stock SET 在庫数 = 在庫数 + 100 WHERE 商品ID = 'PLAN-A' AND ロケ = 'Z01-001-001-01'").run();
+  clearEnrichCache();
+  ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === 150, 'ロジザード在庫が更新されたら次の読み込みで反映される');
+  db.prepare("UPDATE mirror_logizard_stock SET 在庫数 = 在庫数 - 100 WHERE 商品ID = 'PLAN-A' AND ロケ = 'Z01-001-001-01'").run();
+
+  // 羅針盤・ワークセンターに出したカードは Y ロケ (外に出している分) を見せる (中原さん 2026-09-03)
+  ok(S2.stockLocOf('rashinban') === 'Y' && S2.stockLocOf('workcenter') === 'Y', '羅針盤・ワークセンターは Y');
+  ok(S2.stockLocOf('iroha') === 'Z' && S2.stockLocOf('jobsupport') === 'Z' && S2.stockLocOf('rehas') === 'Z' && S2.stockLocOf(null) === 'Z',
+    'いろは・ジョブサポ・リハス・拠点なしは Z');
+  db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('PLAN-A', '想定時間テスト', 'Y01-001-001-01', 'Y01', '良品', 40, 4, ?, ?)`).run(nowIso, nowIso);
+  const tY = TD.upsertTaskFromImport({ notion_page_id: 'plan-y', status: 'in_progress', destination_id: 9303, facility_code: 'rashinban',
+    product_code: 'PLAN-A', product_name: '羅針盤に出した', qty: 100, master_snapshot: { units_per_container: 10, process_count: 2 } }, { batchId: 'test-plan' }).id;
+  clearEnrichCache();
+  const cards = S2.buildTaskList().cards;
+  const cY = cards.find(c => c.id === tY);
+  const cZ = cards.find(c => c.id === t);
+  ok(cY.loc_kind === 'Y' && cY.loc_stock === 40 && cY.loc_allocated === 4 && cY.loc_free === 36, '羅針盤のカードは Y ロケの在庫 (引当・使える数つき)');
+  ok(cZ.loc_kind === 'Z' && cZ.loc_stock === 50, 'いろはのカードは Z ロケのまま');
+  ok(cY.z_stock === 50, '必要保管箱は Notion の式のまま Z を使う (表示だけ Y に変える)');
+  db.prepare("DELETE FROM mirror_logizard_stock WHERE ロケ LIKE 'Y%'").run();
+  clearEnrichCache();
+  ok(S2.buildTaskList().cards.find(c => c.id === tY).loc_stock === null, 'Y に在庫が無ければ出さない (Z を代わりに出さない)');
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
+  clearEnrichCache();
+  ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === null, 'Z に在庫が無ければ null (数量で計算)');
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
+  clearEnrichCache();
+
+  // 古い DB (external_ready が無い) に列を足しても、0/1 しか入らない (Codex FB R1)
+  {
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    db.pragma('foreign_keys = OFF');
+    db.exec('CREATE TEMP TABLE er_bak AS SELECT * FROM f_iroha_tasks');
+    const cols = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name).filter((c) => c !== 'external_ready');
+    db.exec(`DROP TABLE f_iroha_tasks; CREATE TABLE f_iroha_tasks (${db.prepare("SELECT sql FROM sqlite_master WHERE name = 'er_bak'").get() ? '' : ''}`
+      + cols.map((c) => `${c} ${c === 'id' ? 'INTEGER PRIMARY KEY AUTOINCREMENT' : 'TEXT'}`).join(', ') + ');');
+    db.exec(`INSERT INTO f_iroha_tasks (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM er_bak; DROP TABLE er_bak;`);
+    db.pragma('foreign_keys = ON');
+    ok(!db.prepare('PRAGMA table_info(f_iroha_tasks)').all().some((c) => c.name === 'external_ready'), '前提: external_ready の無い古い版');
+    createTables(db);
+    const col = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().find((c) => c.name === 'external_ready');
+    ok(col && col.dflt_value === '0' && col.notnull === 1, '起動時に列が足される (既定 0・NOT NULL)');
+    let bad = null;
+    try { db.prepare('UPDATE f_iroha_tasks SET external_ready = 2 WHERE id = ?').run(t); } catch (e) { bad = e; }
+    ok(bad && /CHECK/.test(bad.message), '足した列にも CHECK が効く (0/1 しか入らない)');
+  }
+
+  // 外部施設に出す準備OK (状態とは別のチェック。Notion のチェックボックスの置き換え)
+  {
+    const cur = TD.getTask(t);
+    ok(cur.external_ready === 0, '既定はチェックなし');
+    const on = TD.setExternalReady({ taskId: t, ready: true, expectVersion: cur.version, actor: 'test' });
+    ok(on.ok && on.task.external_ready === 1 && on.task.version === cur.version + 1, 'チェックできる (version が進む)');
+    ok(TD.setExternalReady({ taskId: t, ready: false, expectVersion: cur.version, actor: 'test' }).error === 'conflict', '古い version は競合');
+    clearEnrichCache();
+    ok(S2.buildTaskList().cards.find(c => c.id === t).external_ready === true, '一覧のカードに出る');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_external_ready' AND task_id = ?").get(t).c === 1, '履歴に残る');
+    const off = TD.setExternalReady({ taskId: t, ready: false, expectVersion: TD.getTask(t).version, actor: 'test' });
+    ok(off.ok && off.task.external_ready === 0, 'やめられる');
+    ok(TD.setExternalReady({ taskId: 999999, ready: true, expectVersion: 1 }).error === 'not_found', '無いカードは not_found');
+    // 終了したカードでは触らない
+    const done = TD.upsertTaskFromImport({ notion_page_id: 'ext-closed', status: 'closed', close_reason: 'stocked',
+      closed_at: '2026-09-03T00:00:00Z', destination_id: 9302, product_code: 'PLAN-A', qty: 1 }, { batchId: 'test-plan' }).id;
+    ok(TD.setExternalReady({ taskId: done, ready: true, expectVersion: TD.getTask(done).version }).error === 'done_card', '終了したカードは変えられない');
+  }
+
+  // 名前のないカードの片づけ (中原さん 2026-09-03「名称なしのカードが 2 つある。Notion にも無いので消して」)
+  {
+    // Notion にも入荷受付にも紐づかない行 (素性の分からないカード) を作る
+    const insStray = db.prepare(`INSERT INTO f_iroha_tasks (status, facility_code, product_name, version, created_at, created_by, updated_at, updated_by)
+      VALUES ('not_started', 'iroha', ?, 1, ?, 'test', ?, 'test')`);
+    const mkNameless = (name) => Number(insStray.run(name, utcNowT(), utcNowT()).lastInsertRowid);
+    const a = mkNameless(null);
+    const b = mkNameless('(名称なし)');
+    const c2 = mkNameless('  ');
+    const keep = TD.upsertTaskFromImport({ notion_page_id: 'stray-keep', status: 'not_started', destination_id: 9404,
+      product_code: 'X', product_name: 'ちゃんと名前がある', qty: 1, facility_code: 'iroha' }, { batchId: 'test-stray' }).id;
+    const listed = TD.listNamelessTasks().map(x => x.id);
+    ok(listed.includes(a) && listed.includes(b) && listed.includes(c2) && !listed.includes(keep),
+      '名前が無い・「(名称なし)」・空白だけのカードが挙がる (名前があるものは挙がらない)');
+    ok(TD.listNamelessTasks().find(x => x.id === a).sessions === 0, '作業・写真・ラベル待ちの数も返す (消していいか判断するため)');
+    // 記録が無ければ行ごと消す
+    const r1 = TD.removeStrayTask({ taskId: a, actor: 'admin@test' });
+    ok(r1.ok && r1.action === 'deleted' && TD.getTask(a) === null, '記録が無ければ消える');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_removed'").get().c >= 1, '消したことは履歴に残る');
+    ok(TD.removeStrayTask({ taskId: a }).error === 'not_found', '消した後にもう一度呼ぶと not_found');
+    // 記録があれば消さずに「終了 (在庫化対象外)」
+    const w1x = listIrohaWorkers(true).find((x) => x.display_name === 'やまだ');
+    const s1 = startSession({ taskId: b, worker: getIrohaWorker(w1x.id) });
+    stopSession({ taskId: b, workerId: w1x.id, sessionId: s1.sessionId, reason: 'done' });
+    const r2 = TD.removeStrayTask({ taskId: b, actor: 'admin@test' });
+    const bAfter = TD.getTask(b);
+    ok(r2.ok && r2.action === 'closed' && bAfter && bAfter.status === 'closed' && bAfter.close_reason === 'out_of_scope',
+      '作業の記録があれば消さずに 終了 (在庫化対象外)');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(b).c === 1, '記録は残る (持ち主を消さない)');
+    ok(/管理画面から片づけ/.test(bAfter.migration_note || ''), 'なぜ片づけたかが残る');
+    ok(!TD.listNamelessTasks().some(x => x.id === b), '片づけたら一覧から消える');
+
+    // 片づけていいのは「名前が無い・Notion に紐づかない・入荷受付に紐づかない・終わっていない」だけ (Codex FB R3)
+    {
+      const named = Number(insStray.run('名前がある', utcNowT(), utcNowT()).lastInsertRowid);
+      ok(TD.removeStrayTask({ taskId: named }).error === 'not_stray', '名前があるカードは片づけられない');
+      ok(TD.getTask(named) !== null, '消えていない');
+      const withPage = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
+      db.prepare("UPDATE f_iroha_tasks SET notion_page_id = 'stray-has-page' WHERE id = ?").run(withPage);
+      ok(TD.removeStrayTask({ taskId: withPage }).error === 'not_stray', 'Notion のカードに紐づくものは片づけられない');
+      ok(!TD.listNamelessTasks().some(x => x.id === withPage), '一覧にも出ない');
+      const withDest = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
+      db.prepare('UPDATE f_iroha_tasks SET destination_id = 9499 WHERE id = ?').run(withDest);
+      ok(TD.removeStrayTask({ taskId: withDest }).error === 'not_stray', '入荷受付の行き先に紐づくものは片づけられない');
+      // 作業中の人がいるうちは片づけない
+      const busy = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
+      const wB = listIrohaWorkers(true).find((x) => x.display_name === 'すずき');
+      const sB = startSession({ taskId: busy, worker: getIrohaWorker(wB.id) });
+      ok(TD.removeStrayTask({ taskId: busy }).error === 'active_sessions', '作業中の人がいれば片づけられない');
+      ok(TD.getTask(busy).status !== 'closed', '状態も変わらない');
+      stopSession({ taskId: busy, workerId: wB.id, sessionId: sB.sessionId, reason: 'done' });
+      ok(TD.removeStrayTask({ taskId: busy }).action === 'closed', '作業を終えれば片づけられる (記録があるので終了)');
+    }
+    TD.removeStrayTask({ taskId: c2, actor: 'admin@test' });
+  }
+
+  // タスク表を作り直しても「外部に出す準備OK」が 0 に戻らない (Codex FB R3)
+  {
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    const keep = TD.upsertTaskFromImport({ notion_page_id: 'ext-keep', status: 'not_started', destination_id: 9420,
+      product_code: 'PLAN-A', product_name: '再構築でも残る', qty: 1, facility_code: 'iroha' }, { batchId: 'test-rebuild' }).id;
+    TD.setExternalReady({ taskId: keep, ready: true, expectVersion: TD.getTask(keep).version, actor: 'test' });
+    ok(TD.getTask(keep).external_ready === 1, '前提: チェックが付いている');
+    // CHECK を 1 つ落とした「古い版」にして、作り直しを起こす
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql;
+    const cols = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name);
+    db.pragma('foreign_keys = OFF');
+    db.exec('CREATE TEMP TABLE rb AS SELECT * FROM f_iroha_tasks; DROP TABLE f_iroha_tasks;');
+    db.exec(sql.replace("CHECK ((status = 'closed') = (close_reason IS NOT NULL)),", ''));
+    db.exec(`INSERT INTO f_iroha_tasks (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM rb; DROP TABLE rb;`);
+    db.pragma('foreign_keys = ON');
+    createTables(db);
+    ok(/\(status = 'closed'\) = \(close_reason IS NOT NULL\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql), '前提: 作り直しが起きた');
+    ok(TD.getTask(keep).external_ready === 1, '作り直しても「外部に出す準備OK」は残る');
+
+    // 列はあるが制約が欠けている「途中の版」も作り直す。NULL が入っていても既定値に寄せて止まらない (Codex FB R4)
+    {
+      const sql2 = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql;
+      const cols2 = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name);
+      const loose = sql2.replace('external_ready   INTEGER NOT NULL DEFAULT 0 CHECK (external_ready IN (0,1)),', 'external_ready INTEGER,')
+        .replace('migration_review INTEGER NOT NULL DEFAULT 0 CHECK (migration_review IN (0,1)),', 'migration_review INTEGER,');
+      ok(!/external_ready\s+INTEGER NOT NULL/.test(loose), '前提: external_ready の制約を落とした版を作る');
+      db.pragma('foreign_keys = OFF');
+      db.exec('CREATE TEMP TABLE rb2 AS SELECT * FROM f_iroha_tasks; DROP TABLE f_iroha_tasks;');
+      db.exec(loose);
+      db.exec(`INSERT INTO f_iroha_tasks (${cols2.join(', ')}) SELECT ${cols2.join(', ')} FROM rb2; DROP TABLE rb2;`);
+      db.prepare('UPDATE f_iroha_tasks SET external_ready = NULL, migration_review = NULL WHERE id = ?').run(keep);
+      db.pragma('foreign_keys = ON');
+      ok(db.prepare('SELECT external_ready e FROM f_iroha_tasks WHERE id = ?').get(keep).e === null, '前提: 古いデータに NULL がある');
+      createTables(db);
+      const def = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().find((c) => c.name === 'external_ready');
+      ok(def.notnull === 1 && def.dflt_value === '0', '制約だけ欠けた版も作り直して NOT NULL・既定値が戻る');
+      ok(/CHECK \(external_ready IN \(0,1\)\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql), 'CHECK も戻る');
+      ok(TD.getTask(keep).external_ready === 0 && TD.getTask(keep).migration_review === 0, 'NULL は既定値 (0) に寄せる (コピーが止まらない)');
+      ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c > 0, '行は残っている');
+    }
+  }
+}
+
 console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリックは委譲する)');
 {
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
@@ -1947,6 +2208,24 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function renderLwSaveState/.test(html) && /renderLwSaveState\(\);/.test(html), 'ラベル待ちを開いたままでも保存ボタンが正本に追随する');
   ok(/if \(!isApp\(\)\) \{ \$\('#lwMsg'\)\.textContent = '下見なので保存できません/.test(html), '保存の入口でも下見なら止める');
   ok(/btn\.disabled = !isApp\(\);   \/\/ 保存中に正本が変わっていたら/.test(html), '保存後にボタンを無条件で戻さない');
+  // 実機FB (2026-09-03): ボードに写真・項目タップで変更・想定作業時間の合計
+  ok(/<div class="th">' \+ thumbHtml\(c\) \+ '<\/div>/.test(html), 'ボードのカードに写真を出す');
+  ok(!/onclick="openMaster/.test(html) && /data-reg="/.test(html), '作業のやり方は項目タップで変更 (編集ボタンなし)');
+  ok(/\+ \(empty \? '＋ 登録' : '✎ 変更'\) \+/.test(html), '値があれば「変更」、無ければ「登録」と出す');
+  ok(!/mvVideo/.test(html.replace(/\/\/.*$/gm, '')), '作り方どうがは画面から外した (コメントだけ残す)');
+  ok(/const hours = mine\.reduce/.test(html), 'ボードの列に想定作業時間の合計を出す');
+  ok(/kv\('必要保管箱', c\.boxes\)/.test(html) && /kv\('想定作業時間'/.test(html), '詳細に必要保管箱と想定作業時間を出す');
+  ok(/reg: 'units_per_container'/.test(html) && /reg: 'storage_container'/.test(html), '保管箱と入数は別々にタップできる');
+  ok(/Zロケ在庫 \(一時保管\)/.test(html) && /Yロケ在庫 \(外に出している分\)/.test(html) && /時点/.test(html),
+    '詳細に在庫と取得時刻を出す (拠点によって Z か Y)');
+  // 中断の理由は「〜で中断」。ラベル待ちならそのまま記録をつける (中原さん 2026-09-03)
+  ok(/r\.label \+ '\u3067\u4e2d\u65ad'/.test(html), '中断の理由は「ラベル待ちで中断」「資材不足で中断」と出す');
+  ok(/const order = \['label_shortage', 'materials_shortage'\]/.test(html), 'よく使う 2 つを先に出す');
+  ok(/holdReason === 'label_shortage'\) setTimeout\(\(\) => openLwNew\(c\)/.test(html), 'ラベル待ちで中断したら、そのままラベル待ちの記録を開く');
+  ok(/occurred_on: state\.today, qty: c\.qty, location: 'Z'/.test(html), '発生日・数量・ロケーションを入れた状態で開く (打つ手間を減らす)');
+  ok(!/lot_expiry: c\.expiry/.test(html) && /\$\('#lwLot'\); if \(el\) el\.focus\(\)/.test(html), 'ロット・期限は入れずに、そこへカーソルを置く (現物を見て打つ)');
+  ok(/外部に出す準備OK にする/.test(html) && /async function setExternalReady/.test(html), '詳細に「外部に出す準備OK」の切り替えがある');
+  ok(/c\.external_ready \? '📦 外部に出せます'/.test(html) && /tag ready/.test(html), 'ボードと一覧に「外部に出せます」の印が出る');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
