@@ -39,6 +39,7 @@ import { transitionNeedsStaff, TASK_STATUSES, statusLabel } from './tasks.js';
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
   listLabelWaits, upsertLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
+  listNamelessTasks, removeStrayTask,
   startTaskSession, countChangesSince, switchSourceOfTruth, bulkCloseReady,
 } from './tasks-db.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
@@ -393,8 +394,10 @@ router.post('/api/external-ready', checkOrigin, api((req, res) => {
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const taskId = parseTaskId(req.body?.id);
   if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  // true / false だけ受ける (欠落や文字列を「解除」と読まない — Codex FB R2)
+  if (typeof req.body?.ready !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_request', message: 'ready は true / false で指定してください' });
   const r = setExternalReady({
-    taskId, ready: req.body?.ready === true, expectVersion: req.body?.expect_version,
+    taskId, ready: req.body.ready, expectVersion: req.body?.expect_version,
     actor: `${w.worker.display_name} (いろはアプリ)`, workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
@@ -1056,7 +1059,8 @@ let lastPlan = null;   // { planId, at, by, since, cutoff, truncated, rows, summ
 const PLAN_MAX_AGE_MS = 30 * 60 * 1000;
 function migrationStatus() {
   try {
-    return { counts: countTasksByStatus(), review: listTasksNeedingReview().length, orphans: listOrphans(20), linkConflicts: listLinkConflicts(20), linkConflictsTotal: countLinkConflicts(), files: listMigrationFiles(),
+    return { counts: countTasksByStatus(), review: listTasksNeedingReview().length, orphans: listOrphans(20), linkConflicts: listLinkConflicts(20), linkConflictsTotal: countLinkConflicts(),
+      nameless: listNamelessTasks(30), files: listMigrationFiles(),
       lastPlanAt: lastPlan ? lastPlan.at : null, lastPlanBy: lastPlan ? lastPlan.by : null, lastPlanSummary: lastPlan ? lastPlan.summary : null };
   } catch (e) {
     const ref = Date.now().toString(36);
@@ -1126,6 +1130,17 @@ router.post('/admin/migration/link-conflicts/merge', checkOrigin, requireAdmin, 
   if (!r.ok) return res.status(r.error === 'not_found' ? 404 : (r.error === 'keep_closed' || r.error === 'from_active') ? 409 : 400).json(r);
   safeLog({ action: 'link_conflict_merge', pageId: null, deviceLabel: `session:${req.iwUser}`, from: `task#${r.closed}`, to: `task#${r.kept}`, ok: true });
   res.json({ ...r, remaining: countLinkConflicts() });
+}));
+
+/** 素性の分からないカードを片づける (管理者のみ。記録が無ければ消す・あれば「在庫化対象外」で終了) */
+router.post('/admin/tasks/remove', checkOrigin, requireAdmin, api((req, res) => {
+  const taskId = parseTaskId(req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  if (req.body?.confirm !== 'REMOVE') return res.status(400).json({ ok: false, error: 'confirm_required', message: '確認のため confirm に REMOVE と入れてください' });
+  const r = removeStrayTask({ taskId, actor: req.iwUser, reason: req.body?.reason ? String(req.body.reason).slice(0, 200) : null });
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 400).json(r);
+  safeLog({ action: 'task_remove', pageId: null, deviceLabel: `session:${req.iwUser}`, to: `task#${r.id} → ${r.action}`, ok: true });
+  res.json({ ...r, remaining: listNamelessTasks(30).length });
 }));
 
 router.get('/admin/migration/status', requireAdmin, api((req, res) => {

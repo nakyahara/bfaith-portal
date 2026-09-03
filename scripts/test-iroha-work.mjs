@@ -1653,6 +1653,22 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok((await call('POST', '/api/external-ready', { cookie, body: { id: 'x', ready: true, worker_id: w1.id } })).status === 400, '不正な id は 400');
       ok((await call('POST', '/api/external-ready', { ...admin, body: { id: extTask, ready: false, expect_version: TD.getTask(extTask).version } })).status === 400,
         '作業者を選んでいなければ 400');
+      // ready は true/false だけ (欠落・文字列・数値を「解除」と読まない — Codex FB R2)
+      for (const bad of [undefined, null, 'true', 1, 0, {}]) {
+        const body = { id: extTask, expect_version: TD.getTask(extTask).version, worker_id: w1.id };
+        if (bad !== undefined) body.ready = bad;
+        const r = await call('POST', '/api/external-ready', { cookie, body });
+        if (!(r.status === 400 && r.json.error === 'bad_request')) ok(false, `ready=${JSON.stringify(bad)} は 400 (実際 ${r.status})`);
+      }
+      ok(TD.getTask(extTask).external_ready === 1, '不正な ready でチェックが外れていない');
+      // 名前のないカードの片づけ (管理者のみ・confirm 必須)
+      const stray = Number(db.prepare(`INSERT INTO f_iroha_tasks (status, facility_code, product_name, version, created_at, created_by, updated_at, updated_by)
+        VALUES ('not_started', 'iroha', NULL, 1, ?, 'test', ?, 'test')`).run(new Date().toISOString(), new Date().toISOString()).lastInsertRowid);
+      ok((await call('POST', '/admin/tasks/remove', { cookie, body: { task_id: stray, confirm: 'REMOVE' } })).status === 403, '片づけは管理者だけ');
+      ok((await call('POST', '/admin/tasks/remove', { ...admin, body: { task_id: stray } })).json.error === 'confirm_required', 'confirm=REMOVE が要る');
+      const rm = await call('POST', '/admin/tasks/remove', { ...admin, body: { task_id: stray, confirm: 'REMOVE' } });
+      ok(rm.status === 200 && rm.json.action === 'deleted' && TD.getTask(stray) === null && typeof rm.json.remaining === 'number', '消せる (残り件数も返す)');
+      ok((await call('GET', '/admin/migration/status', { ...admin })).json.nameless !== undefined, '管理画面の状態に名前のないカードが載る');
     }
     ok(notionCalls() === calls0, 'ここまで Notion API を 1 回も呼んでいない');
     // Notion に戻す: app 正本以降の記録があるので 409 → force で通る (件数・監査ログ・切替時刻)
@@ -1918,6 +1934,7 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
 
 console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式をそのまま)');
 {
+  const utcNowT = () => new Date().toISOString();
   const S2 = await import('../apps/iroha-work/service.js');
   const TD = await import('../apps/iroha-work/tasks-db.js');
   const db = getDB();
@@ -2045,6 +2062,40 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
     const done = TD.upsertTaskFromImport({ notion_page_id: 'ext-closed', status: 'closed', close_reason: 'stocked',
       closed_at: '2026-09-03T00:00:00Z', destination_id: 9302, product_code: 'PLAN-A', qty: 1 }, { batchId: 'test-plan' }).id;
     ok(TD.setExternalReady({ taskId: done, ready: true, expectVersion: TD.getTask(done).version }).error === 'done_card', '終了したカードは変えられない');
+  }
+
+  // 名前のないカードの片づけ (中原さん 2026-09-03「名称なしのカードが 2 つある。Notion にも無いので消して」)
+  {
+    // Notion にも入荷受付にも紐づかない行 (素性の分からないカード) を作る
+    const insStray = db.prepare(`INSERT INTO f_iroha_tasks (status, facility_code, product_name, version, created_at, created_by, updated_at, updated_by)
+      VALUES ('not_started', 'iroha', ?, 1, ?, 'test', ?, 'test')`);
+    const mkNameless = (name) => Number(insStray.run(name, utcNowT(), utcNowT()).lastInsertRowid);
+    const a = mkNameless(null);
+    const b = mkNameless('(名称なし)');
+    const c2 = mkNameless('  ');
+    const keep = TD.upsertTaskFromImport({ notion_page_id: 'stray-keep', status: 'not_started', destination_id: 9404,
+      product_code: 'X', product_name: 'ちゃんと名前がある', qty: 1, facility_code: 'iroha' }, { batchId: 'test-stray' }).id;
+    const listed = TD.listNamelessTasks().map(x => x.id);
+    ok(listed.includes(a) && listed.includes(b) && listed.includes(c2) && !listed.includes(keep),
+      '名前が無い・「(名称なし)」・空白だけのカードが挙がる (名前があるものは挙がらない)');
+    ok(TD.listNamelessTasks().find(x => x.id === a).sessions === 0, '作業・写真・ラベル待ちの数も返す (消していいか判断するため)');
+    // 記録が無ければ行ごと消す
+    const r1 = TD.removeStrayTask({ taskId: a, actor: 'admin@test' });
+    ok(r1.ok && r1.action === 'deleted' && TD.getTask(a) === null, '記録が無ければ消える');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_removed'").get().c >= 1, '消したことは履歴に残る');
+    ok(TD.removeStrayTask({ taskId: a }).error === 'not_found', '消した後にもう一度呼ぶと not_found');
+    // 記録があれば消さずに「終了 (在庫化対象外)」
+    const w1x = listIrohaWorkers(true).find((x) => x.display_name === 'やまだ');
+    const s1 = startSession({ taskId: b, worker: getIrohaWorker(w1x.id) });
+    stopSession({ taskId: b, workerId: w1x.id, sessionId: s1.sessionId, reason: 'done' });
+    const r2 = TD.removeStrayTask({ taskId: b, actor: 'admin@test' });
+    const bAfter = TD.getTask(b);
+    ok(r2.ok && r2.action === 'closed' && bAfter && bAfter.status === 'closed' && bAfter.close_reason === 'out_of_scope',
+      '作業の記録があれば消さずに 終了 (在庫化対象外)');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(b).c === 1, '記録は残る (持ち主を消さない)');
+    ok(/管理画面から片づけ/.test(bAfter.migration_note || ''), 'なぜ片づけたかが残る');
+    ok(!TD.listNamelessTasks().some(x => x.id === b), '片づけたら一覧から消える');
+    TD.removeStrayTask({ taskId: c2, actor: 'admin@test' });
   }
 }
 

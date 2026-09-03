@@ -1224,6 +1224,8 @@ function createTables() {
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_mlz_sku ON mirror_logizard_stock(商品ID)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_mlz_barcode ON mirror_logizard_stock(バーコード)');   // stock-botのバーコード完全一致用
+    // 商品コードの正規化キーで引く用 (いろは作業アプリの Z/Y ロケ集計。式のままだと 商品ID の索引が使えない — Codex 2026-09-03)
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mlz_sku_norm ON mirror_logizard_stock(LOWER(TRIM(商品ID)))');
   } catch (e) {
     logizardStockInitError = {
       message: String(e.message || e),

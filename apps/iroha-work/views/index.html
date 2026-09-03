@@ -1290,7 +1290,7 @@ function renderDetail(c) {
       kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程'), reg: 'process_count' }) +
       kv(c.loc_kind === 'Y' ? 'Yロケ在庫 (外に出している分)' : 'Zロケ在庫 (一時保管)',
         c.loc_stock == null ? null
-          : c.loc_stock + '個' + (c.loc_allocated ? ' (引当 ' + c.loc_allocated + ' → 使えるのは ' + c.loc_free + '個)' : '')
+          : c.loc_stock + '個 (引当 ' + (c.loc_allocated || 0) + ' → 使えるのは ' + c.loc_free + '個)'
             + (c.loc_at ? ' ・ ' + fmtDate(c.loc_at) + ' ' + fmtTime(c.loc_at) + ' 時点' : '')) +
       kv('必要保管箱', c.boxes) +
       kv('想定作業時間', c.plan_hours != null ? c.plan_hours + ' 時間' : null) +
@@ -1735,8 +1735,14 @@ async function setExternalReady(on) {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id: c.id, ready: !!on, expect_version: c.version, worker_id: worker.id }),
   });
-  if (!j.ok) { showErr(j.message || '変更できませんでした'); if (j.current) applyTask(j.current); return; }
-  applyTask(j.task);
+  if (!j.ok) {
+    showErr(j.message || '変更できませんでした');
+    if (j.current) { applyTask(c, j.current); renderList(); renderDetail(c); }
+    return;
+  }
+  applyTask(c, j.task);
+  renderList(); renderDetail(c);
+  if (curView === 'board') renderBoard();
   toast(on ? '外部に出す準備OK にしました' : '外部に出す準備OK をやめました');
 }
 
@@ -1896,7 +1902,7 @@ function doSetStEl(el) { doSetSt(el.dataset.v); }
 function applyTask(c, t) {
   if (!t || typeof t !== 'object') return;
   for (const k of ['status', 'status_label', 'version', 'facility_code', 'hold_reason_code', 'hold_reason_note',
-    'planned_date', 'cancellation_requested_at', 'migration_review']) {
+    'planned_date', 'cancellation_requested_at', 'migration_review', 'external_ready']) {
     if (k in t) c[k] = t[k];
   }
   if ('planned_date' in t) c.today = !!(state.today && t.planned_date === state.today);
