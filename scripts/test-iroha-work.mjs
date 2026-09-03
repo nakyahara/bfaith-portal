@@ -1266,29 +1266,35 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     ok(r3.ok === false && r3.error === 'done_card', '終了したカードでは始められない');
     ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(tStart).c === nBefore, '終了カードにセッションは増えない');
     ok(TD.startTaskSession({ taskId: 999999, worker: getIrohaWorker(w1.id) }).error === 'not_found', '無いカードは not_found');
-    // 状態変更が通らないときはセッションごと戻す (transaction のロールバック): not_started→in_progress が拒否される状況を
-    // 「他端末が同時に変更」の代わりに、changeTaskStatus と同じ version 条件を壊して再現する
+    // 状態変更が通らないときはセッションごと戻す (ロールバック経路を本当に踏む — Codex A1b R2 Low):
+    // セッション INSERT の直後に「別端末が同じタスクを変えた」(version が進む) をフックで起こす
     const tRb = mk({ page: 'a1b-rollback', code: 'PROD-S', name: '巻き戻し', dest: 8807 });
-    db.prepare("UPDATE f_iroha_tasks SET status = 'not_started', hold_reason_code = NULL WHERE id = ?").run(tRb);
-    const busyOpen = startSession({ taskId: tRb, worker: getIrohaWorker(w2.id) });   // w2 が作業中 (他人の開始は妨げない)
-    ok(busyOpen.ok, '前提: 別の人が先に開始 (作業中へ遷移済み)');
-    ok(TD.getTask(tRb).status === 'not_started', '前提: 直接 startSession では状態は変わらない');
-    const r4 = TD.startTaskSession({ taskId: tRb, worker: getIrohaWorker(w1.id) });
-    ok(r4.ok && r4.task.status === 'in_progress', '2 人目の開始でも未着手なら作業中にする');
-    stopSession({ taskId: tRb, workerId: w1.id, sessionId: r4.sessionId, reason: 'done' });
-    stopSession({ taskId: tRb, workerId: w2.id, sessionId: busyOpen.sessionId, reason: 'done' });
+    const before = { sessions: db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c,
+      events: db.prepare('SELECT COUNT(*) c FROM f_iroha_app_events').get().c, task: JSON.stringify(TD.getTask(tRb)) };
+    TD._setStartTaskSessionHook((t) => { db.prepare('UPDATE f_iroha_tasks SET version = version + 1 WHERE id = ?').run(t.id); });
+    let r4;
+    try { r4 = TD.startTaskSession({ taskId: tRb, worker: getIrohaWorker(w1.id) }); } finally { TD._setStartTaskSessionHook(null); }
+    ok(r4.ok === false && r4.error === 'conflict' && r4.current, '状態変更が競合したら開始は失敗 (conflict・現在値つき)');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c === before.sessions, 'セッションは残らない (ロールバック)');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_app_events').get().c === before.events, '履歴 (session_start) も残らない');
+    ok(JSON.stringify({ ...TD.getTask(tRb), version: JSON.parse(before.task).version }) === before.task && TD.getTask(tRb).status === 'not_started', 'タスクは未着手のまま (フックの version 更新も戻る)');
+    ok(TD.getTask(tRb).version === JSON.parse(before.task).version, 'version も元のまま');
+    const r5 = TD.startTaskSession({ taskId: tRb, worker: getIrohaWorker(w1.id) });
+    ok(r5.ok && r5.task.status === 'in_progress', 'フックを外せば通る');
+    stopSession({ taskId: tRb, workerId: w1.id, sessionId: r5.sessionId, reason: 'done' });
   }
 
   // 正本を app にしてからの記録の数 (Notion に戻す前の警告)
   {
     const since = new Date(Date.now() - 60_000).toISOString();
     const c = TD.countChangesSince(since);
-    ok(c.tasks > 0 && c.sessions > 0 && c.media > 0, 'countChangesSince は状態変更・作業時間・写真を数える');
+    ok(c.tasks > 0 && c.updatedTasks > 0 && c.sessions > 0 && c.media > 0, 'countChangesSince は状態変更の回数・更新タスク数・作業時間・写真を数える');
+    ok(c.tasks === db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_status' AND ok = 1 AND at > ?").get(since).c, '状態変更は履歴の回数 (同じタスクの 2 回は 2)');
     // [17] の旧版タスク行はダミーの時刻 ('x') を持つ — 文字列比較で未来扱いになるので、ここでは実時刻に直してから数える
     db.prepare("UPDATE f_iroha_tasks SET updated_at = created_at WHERE updated_at NOT LIKE '20%'").run();
     db.prepare("UPDATE f_iroha_tasks SET updated_at = '2026-01-01T00:00:00.000Z' WHERE updated_at NOT LIKE '20%'").run();
     const z = TD.countChangesSince(new Date(Date.now() + 3600_000).toISOString());
-    ok(z.tasks === 0 && z.sessions === 0 && z.media === 0, '未来を起点にすると 0');
+    ok(z.tasks === 0 && z.updatedTasks === 0 && z.sessions === 0 && z.media === 0, '未来を起点にすると 0');
   }
 
   // 写真の再送は同じカードのときだけ (Codex A1b R1 #3)。task の行は Notion 同期キューに入らない (同 #8)
@@ -1394,6 +1400,21 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     ok(rowsOf('f_iroha_work_sessions') === allS && rowsOf('f_iroha_card_media') === allM, '全行 (task の行・id 含む) がそのまま残る');
     createTables(db);
     ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_work_sessions%'").get().c === 1 && rowsOf('f_iroha_work_sessions') === allS, '2 回目は何もしない (冪等)');
+
+    // (d) task_id FK と紐付け CHECK はあるが、既存の UNIQUE / CHECK だけ欠ける版 (Codex A1b R2 #2)
+    const LATE_SESSIONS = sqlOf('f_iroha_work_sessions').replace("end_reason     TEXT CHECK (end_reason IS NULL OR end_reason IN ('done','pause','admin'))", 'end_reason TEXT');
+    const LATE_MEDIA = sqlOf('f_iroha_card_media').replace('operation_id  TEXT NOT NULL UNIQUE', 'operation_id TEXT NOT NULL').replace("status        TEXT NOT NULL CHECK (status IN ('stored','uploaded','synced'))", 'status TEXT NOT NULL');
+    ok(!/end_reason IN/.test(LATE_SESSIONS) && !/UNIQUE/.test(LATE_MEDIA) && !/status IN/.test(LATE_MEDIA) && /task_id\s+INTEGER REFERENCES/.test(LATE_MEDIA), '前提: 制約だけ欠けた版を用意');
+    db.pragma('foreign_keys = OFF');
+    db.exec(`CREATE TEMP TABLE late_s AS SELECT * FROM f_iroha_work_sessions; CREATE TEMP TABLE late_m AS SELECT * FROM f_iroha_card_media;
+      DROP TABLE f_iroha_work_sessions; DROP TABLE f_iroha_card_media; ${LATE_SESSIONS}; ${LATE_MEDIA};
+      INSERT INTO f_iroha_work_sessions (${allColsS}) SELECT ${allColsS} FROM late_s;
+      INSERT INTO f_iroha_card_media (${allColsM}) SELECT ${allColsM} FROM late_m; DROP TABLE late_s; DROP TABLE late_m;`);
+    db.pragma('foreign_keys = ON');
+    createTables(db);
+    ok(/end_reason IN \('done','pause','admin'\)/.test(sqlOf('f_iroha_work_sessions')) && /operation_id\s+TEXT NOT NULL UNIQUE/.test(sqlOf('f_iroha_card_media'))
+      && /status IN \('stored','uploaded','synced'\)/.test(sqlOf('f_iroha_card_media')), 'UNIQUE / CHECK だけ欠けた版も作り直す');
+    ok(rowsOf('f_iroha_work_sessions') === allS && rowsOf('f_iroha_card_media') === allM, '行はそのまま');
   }
 }
 
@@ -1405,6 +1426,11 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
   const { _setDriveUpload, processMediaQueue } = await import('../apps/iroha-work/media.js');
   const { default: router } = await import('../apps/iroha-work/router.js');
   const app = express();
+  // 管理者セッションの代わり (ヘッダで注入。本番は express-session が入れる)
+  app.use((req, res, next) => {
+    if (req.headers['x-test-admin'] === '1') req.session = { authenticated: true, email: 'admin@test.local', role: 'admin', allowedApps: '*' };
+    next();
+  });
   app.use('/apps/iroha-work', express.json({ limit: '256kb' }), router);
   const server = await new Promise((r) => { const sv = http.createServer(app).listen(0, '127.0.0.1', () => r(sv)); });
   const port = server.address().port;
@@ -1448,8 +1474,16 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
   const cookie = (redeem.headers['set-cookie'] || []).map((c) => c.split(';')[0]).find((c) => c.startsWith('iw_device='));
   ok(redeem.status === 200 && redeem.json.ok && cookie, '登録コードで端末 Cookie が出る');
 
-  // アプリ正本に切替 (テストの間だけ)
-  setMetaValue('source_of_truth', 'app');
+  // 正本の切替は管理者だけ・CSRF あり・未完了タスクがあれば app へ (HTTP で通す — Codex A1b R2 Low)
+  const admin = { headers: { 'x-test-admin': '1' } };
+  ok((await call('POST', '/admin/source', { cookie, body: { to: 'app', confirm: 'SWITCH' } })).status === 403, '端末 Cookie だけでは切り替えられない (管理者のみ)');
+  ok((await call('POST', '/admin/source', { headers: { ...admin.headers, origin: 'http://evil.example' }, body: { to: 'app', confirm: 'SWITCH' } })).status === 403, '別 Origin は拒否');
+  ok((await call('POST', '/admin/source', { ...admin, body: { to: 'app' } })).json.error === 'confirm_required', 'confirm=SWITCH が要る');
+  const sw = await call('POST', '/admin/source', { ...admin, body: { to: 'app', confirm: 'SWITCH' } });
+  ok(sw.status === 200 && sw.json.ok && sw.json.source === 'app' && sw.json.openTasks > 0 && getMeta('source_of_truth') === 'app', 'notion → app に切替 (未完了あり)');
+  const switchedAt = getMeta('source_switched_at');
+  ok(switchedAt && Date.now() - Date.parse(switchedAt) < 10_000, '切替時刻が meta に残る');
+  ok((await call('POST', '/admin/source', { ...admin, body: { to: 'app', confirm: 'SWITCH' } })).json.unchanged === true, '同じ正本への切替は何もしない');
   process.env.GOOGLE_SERVICE_ACCOUNT_KEY = 'test-key';   // 実際の Drive は _setDriveUpload で差し替える
   _setDriveUpload(async ({ operationId }) => ({ fileId: `f-${operationId}`, url: `https://drive/${operationId}` }));
   try {
@@ -1494,9 +1528,18 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     const del = await call('POST', `/api/media/${up.json.media.id}/delete`, { cookie, body: { delete_token: up.json.deleteToken, worker_id: w1.id } });
     ok(del.status === 200 && del.json.ok, '削除 (削除トークン)');
     ok(notionCalls() === calls0, 'ここまで Notion API を 1 回も呼んでいない');
-    // 正本を Notion に戻す前の警告 (管理者セッションが必要なので API 本体は tasks-db の数で確認)
-    const c = TD.countChangesSince(getMeta('source_switched_at') || '1970-01-01T00:00:00.000Z');
-    ok(c.tasks >= 1 && c.sessions >= 1 && c.media >= 1, '戻す前の警告に使う件数が数えられる');
+    // Notion に戻す: app 正本以降の記録があるので 409 → force で通る (件数・監査ログ・切替時刻)
+    const back = await call('POST', '/admin/source', { ...admin, body: { to: 'notion', confirm: 'SWITCH' } });
+    ok(back.status === 409 && back.json.error === 'app_changes_exist' && back.json.changes.tasks >= 2 && back.json.changes.updatedTasks >= 1
+      && back.json.changes.sessions >= 1 && back.json.changes.media >= 1, '記録があるうちは 409 app_changes_exist (状態変更 2 回以上・作業時間・写真)');
+    ok(getMeta('source_of_truth') === 'app', '409 のときは切り替わらない');
+    const forced = await call('POST', '/admin/source', { ...admin, body: { to: 'notion', confirm: 'SWITCH', force: true } });
+    ok(forced.status === 200 && forced.json.ok && forced.json.source === 'notion' && forced.json.changes.tasks === back.json.changes.tasks, 'force で戻せる (件数つき)');
+    ok(getMeta('source_of_truth') === 'notion' && getMeta('source_switched_at') > switchedAt, '正本と切替時刻が更新される');
+    const audit = db.prepare("SELECT * FROM f_iroha_app_events WHERE action = 'source_switch' ORDER BY id DESC LIMIT 1").get();
+    ok(audit && audit.from_value === 'app' && /^notion \(未完了 \d+ 件・Notion 未反映: 状態変更 \d+ 回\/更新タスク \d+\/作業時間 \d+\/写真 \d+ \(force\)\)$/.test(audit.to_value)
+      && audit.device_label === 'session:admin@test.local', '監査ログに件数と force と誰がが残る');
+    ok((await call('GET', '/api/state', { cookie })).json.mode === 'notion', '戻した後の一覧は Notion 正本');
   } finally {
     _setDriveUpload(null);
     delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;

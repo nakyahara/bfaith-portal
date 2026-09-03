@@ -394,6 +394,9 @@ export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion 
  * 「終了したカードに活動中セッションが残る」ことがない。状態変更が通らなければセッションごと戻す。
  * @param snapshotOf (task) => 開始時の実効作業仕様 (router が masterOfTask で合成) / null
  */
+let startTaskSessionHook = null;
+/** テスト用: セッション INSERT の後・状態変更の前に割り込む (「別端末が同時に変えた」の再現。本番では null) */
+export function _setStartTaskSessionHook(fn) { startTaskSessionHook = fn; }
 export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotOf = null }) {
   const db = getDB();
   const tx = db.transaction(() => {
@@ -411,6 +414,7 @@ export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotO
         deviceLabel, to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
     }
     if (!r.ok) return r;
+    if (startTaskSessionHook) startTaskSessionHook(t);
     let task = t;
     if (t.status === 'not_started') {
       const cs = changeTaskStatus({ taskId: t.id, to: 'in_progress', expectVersion: t.version,
@@ -426,12 +430,16 @@ export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotO
   }
 }
 
-/** 正本を app にしてからの記録の数 (Notion へ戻す前の警告用 — Codex A1b R1 #7) */
+/**
+ * 正本を app にしてからの記録の数 (Notion へ戻す前の警告用 — Codex A1b R1 #7)。
+ * tasks = 状態変更の回数 (履歴から。同じタスクを 2 回変えれば 2)、updatedTasks = 何かしら更新されたタスクの数 (今日やる等も含む) — R2 #1
+ */
 export function countChangesSince(iso) {
   const db = getDB();
   const q = (sql) => db.prepare(sql).get(iso).c;
   return {
-    tasks: q('SELECT COUNT(*) c FROM f_iroha_tasks WHERE updated_at > ?'),
+    tasks: q("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_status' AND ok = 1 AND at > ?"),
+    updatedTasks: q('SELECT COUNT(*) c FROM f_iroha_tasks WHERE updated_at > ?'),
     sessions: q('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id IS NOT NULL AND started_at > ?'),
     media: q('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id IS NOT NULL AND created_at > ?'),
   };

@@ -181,22 +181,25 @@ const MEDIA_INDEX_DDL = `
  * 移す前後で件数が一致すること・DB 全体の FK 検査 (作り直した表を参照する側も含む — 同 R1 #4) を通ることを確かめ、
  * 通らなければ全部戻す。冪等
  */
-const SESSION_MEDIA_REQUIRED_DDL = [/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/, /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/];
-function sessionMediaNeedsRebuild(db, table, ddl) {
+// 表ごとに「新しい定義に必要なもの」(列の有無だけでなく UNIQUE・CHECK も。欠けた途中版を見逃さない — Codex A1b R2 #2)
+const SESSION_MEDIA_COMMON_DDL = [/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/, /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/];
+const SESSIONS_REQUIRED_DDL = [...SESSION_MEDIA_COMMON_DDL, /end_reason IS NULL OR end_reason IN \('done','pause','admin'\)/];
+const MEDIA_REQUIRED_DDL = [...SESSION_MEDIA_COMMON_DDL, /operation_id\s+TEXT NOT NULL UNIQUE/, /kind IN \('photo','video'\)/, /status IN \('stored','uploaded','synced'\)/];
+function sessionMediaNeedsRebuild(db, table, ddl, required) {
   const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)?.sql;
   if (!sql) return false;   // 無ければ CREATE IF NOT EXISTS が新定義で作る
   const info = db.prepare(`PRAGMA table_info(${table})`).all();
   if (info.some((c) => c.name === 'page_id' && c.notnull === 1)) return true;
-  if (SESSION_MEDIA_REQUIRED_DDL.some((re) => !re.test(sql))) return true;
+  if (required.some((re) => !re.test(sql))) return true;
   const have = new Set(info.map((c) => c.name));
   const want = [...ddl('x').matchAll(/^\s+([a-z_]+)\s+(?:INTEGER|TEXT)/gm)].map((m) => m[1]);
   return want.some((c) => !have.has(c));
 }
 function migrateSessionMediaSchema(db) {
   const targets = [
-    { table: 'f_iroha_work_sessions', ddl: sessionsDDL, index: SESSIONS_INDEX_DDL },
-    { table: 'f_iroha_card_media', ddl: mediaDDL, index: MEDIA_INDEX_DDL },
-  ].filter((t) => sessionMediaNeedsRebuild(db, t.table, t.ddl));
+    { table: 'f_iroha_work_sessions', ddl: sessionsDDL, index: SESSIONS_INDEX_DDL, required: SESSIONS_REQUIRED_DDL },
+    { table: 'f_iroha_card_media', ddl: mediaDDL, index: MEDIA_INDEX_DDL, required: MEDIA_REQUIRED_DDL },
+  ].filter((t) => sessionMediaNeedsRebuild(db, t.table, t.ddl, t.required));
   if (targets.length === 0) return false;
   const fkWasOn = db.pragma('foreign_keys', { simple: true }) === 1;
   if (fkWasOn) db.pragma('foreign_keys = OFF');

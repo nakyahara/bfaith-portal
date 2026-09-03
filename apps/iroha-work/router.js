@@ -118,7 +118,9 @@ function requireAdmin(req, res, next) {
 /** タスク ID (正の整数) の取り出し。形式が違えば null → 呼び元は 400 (Number() 任せの NaN/小数/負数を DB 依存の 404 にしない — Codex A1b R1 Low) */
 function parseTaskId(v) {
   const s = String(v ?? '').trim();
-  return /^[1-9]\d{0,15}$/.test(s) ? Number(s) : null;
+  if (!/^[1-9]\d{0,15}$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isSafeInteger(n) ? n : null;   // 16 桁は 2^53 を超え得る (丸めた id で別の行を引かない — Codex A1b R2)
 }
 const BAD_TASK_ID = { ok: false, error: 'bad_request', message: 'カードの指定が不正です (一覧を更新してください)' };
 
@@ -1041,15 +1043,15 @@ router.post('/admin/source', checkOrigin, requireAdmin, api((req, res) => {
   const force = req.body?.force === true;
   if (to === 'notion') {
     changes = countChangesSince(getMeta('source_switched_at') || '1970-01-01T00:00:00.000Z');
-    const total = changes.tasks + changes.sessions + changes.media;
+    const total = changes.tasks + changes.updatedTasks + changes.sessions + changes.media;
     if (total > 0 && !force) {
       return res.status(409).json({ ok: false, error: 'app_changes_exist', changes,
-        message: `アプリ正本にしてからの記録が ${total} 件あります (状態変更 ${changes.tasks} / 作業時間 ${changes.sessions} / 写真 ${changes.media})。Notion には反映されていません。それでも戻すなら force を付けてください` });
+        message: `アプリ正本にしてからの記録があります (状態変更 ${changes.tasks} 回 / 更新されたタスク ${changes.updatedTasks} 件 / 作業時間 ${changes.sessions} 件 / 写真 ${changes.media} 件)。Notion には反映されていません。それでも戻すなら force を付けてください` });
     }
   }
   setMetaValue('source_of_truth', to);
   setMetaValue('source_switched_at', new Date().toISOString());
-  const detail = changes ? `・Notion 未反映の記録 ${changes.tasks}/${changes.sessions}/${changes.media}${force ? ' (force)' : ''}` : '';
+  const detail = changes ? `・Notion 未反映: 状態変更 ${changes.tasks} 回/更新タスク ${changes.updatedTasks}/作業時間 ${changes.sessions}/写真 ${changes.media}${force ? ' (force)' : ''}` : '';
   safeLog({ action: 'source_switch', pageId: null, deviceLabel: `session:${req.iwUser}`, from, to: `${to} (未完了 ${open} 件${detail})`, ok: true });
   console.log(`[iroha-work] 正本を ${from} → ${to} に切り替えました (${req.iwUser}・未完了 ${open} 件${detail})`);
   res.json({ ok: true, source: to, openTasks: open, changes });

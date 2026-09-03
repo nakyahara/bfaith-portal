@@ -351,7 +351,7 @@
       let { json } = await post('/admin/source', { to, confirm });
       if (!json.ok && json.error === 'app_changes_exist') {
         const c = json.changes || {};
-        const msg = 'アプリ正本にしてから、アプリ側で 状態変更 ' + (c.tasks || 0) + ' 件 / 作業時間 ' + (c.sessions || 0) + ' 件 / 写真 ' + (c.media || 0) + ' 件 の記録があります。\n'
+        const msg = 'アプリ正本にしてから、アプリ側で 状態変更 ' + (c.tasks || 0) + ' 回 / 更新されたタスク ' + (c.updatedTasks || 0) + ' 件 / 作業時間 ' + (c.sessions || 0) + ' 件 / 写真 ' + (c.media || 0) + ' 件 の記録があります。\n'
           + 'Notion に戻すと、iPad にはこれらが反映されていない古い Notion の状態が出ます (終了した作業のやり直し・二重記録のもと)。\n'
           + 'それでも戻しますか? (記録は tasks に残り、操作履歴に件数が残ります)';
         if (!window.confirm(msg)) { setMsg('srcMsg', 'err', '切替を中止しました'); return; }
