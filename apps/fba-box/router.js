@@ -694,10 +694,11 @@ router.get('/admin/runs/:id(\\d+)', requireSession, api((req, res) => {
   res.json({ ok: true, ...state });
 }));
 
-/** 商品画像の状態 (なぜ出ないかの切り分け) */
+/** 商品画像の状態 (なぜ出ないかの切り分け)。足りない分は裏で取りに行く (診断を見ただけで揃うように) */
 router.get('/admin/runs/:id(\\d+)/images', requireSession, api(async (req, res) => {
   const state = getRunState(Number(req.params.id));
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
+  if (state.rows.some((r) => !r.image_url && r.match_state !== 'retired')) kickImages(Number(req.params.id));
   const diag = await diagnoseRunImages(Number(req.params.id), state.rows.filter((r) => r.match_state !== 'retired'));
   const cache = new Map(listProductImages(diag.items.map((x) => x.fnsku)).map((c) => [c.fnsku, c]));
   res.json({ ok: true, ...diag, items: diag.items.map((x) => ({ ...x, cache: cache.get(String(x.fnsku).toUpperCase()) || null })) });

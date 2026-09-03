@@ -287,6 +287,7 @@
           画像あり <b>${j.counts.withImage}</b> / ${j.counts.total} 商品 ${j.counts.noAsin ? `<b class="ng">(ASIN 不明 ${j.counts.noAsin})</b>` : ''}<br>
           ${lr ? `直近の取得 (${escH((lr.at || '').slice(11, 16))}): ${lr.skipped ? `skip=${escH(lr.skipped)} ${escH(lr.message || lr.error || '')}` : `取得${lr.fetched} / 画像なし${lr.none} / 失敗${lr.failed}${lr.noAsin ? ` (ASIN不明 ${lr.noAsin})` : ''}`}${(lr.errors || []).length ? '<br>' + lr.errors.map(escH).join('<br>') : ''}` : '(まだ取得していません)'}
         </p>
+        ${j.counts.withImage < j.counts.total - j.counts.noAsin ? '<p class="hint">未取得の商品は裏で取りに行っています (1商品 0.6 秒)。しばらくして「🖼 画像」をもう一度開くと増えます。急ぐときは下のボタン。</p>' : ''}
         <div class="row"><button id="img-refresh">🔄 今すぐ取り直す</button></div>
         <table class="fbx-list" style="margin-top:8px"><tr><th>画像</th><th>FNSKU</th><th>SKU</th><th>ASIN</th><th>状態</th></tr>
         ${j.items.map(x => `<tr>
