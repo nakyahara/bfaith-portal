@@ -484,6 +484,7 @@
     const boxes = S.boxes.filter(b => b.pack_group_id === r.pack_group_id && b.status === 'open');
     const cur = boxes.find(b => b.id === curBoxId);
     const knownExpiry = expiryOf(r.id);
+    const excluded = r.match_state === 'picking_only';   // 添付した Excel (納品プラン) に無い → 入れない
     speakRow(r);
     const dlg = openDialog(`
       <div class="fn">${esc(r.fnsku).slice(0, -4)}<b>${esc(fn4(r.fnsku))}</b></div>
@@ -491,9 +492,10 @@
         <button class="chip" style="background:#E9ECEF;color:#495057" id="d-tts">🔊 もう一度</button></div>
       <div class="grid2">
         <div>予定 <b style="font-size:1.3em">${r.planned_qty}</b></div>
-        <div>残り <b style="font-size:1.3em; color:${rem > 0 ? '#C92A2A' : '#2B8A3E'}">${rem}</b></div>
+        <div>残り <b style="font-size:1.3em; color:${rem > 0 ? '#C92A2A' : '#2B8A3E'}">${excluded ? '—' : rem}</b></div>
       </div>
-      ${rem > 0 ? `
+      ${excluded ? `<div class="msg err">この商品は納品プラン (Excel) に無いので箱に入れません。${r.placed > 0 ? `すでに ${r.placed} 個入っています — 職員が取り消してください。` : ''}本社に確認してください</div>` : ''}
+      ${rem > 0 && !excluded ? `
         <div class="lbl">📦 入れる箱 ${cur ? `= <b>${esc(cur.box_code)}</b>` : '(「いまの箱」が未選択です)'}</div>
         ${cur ? '' : `<div class="grid3">${boxes.map(b => `<button class="selbtn boxpick" data-id="${b.id}">${esc(b.box_code)}</button>`).join('')}
           <button class="selbtn boxnew">＋新しい箱</button></div>`}
@@ -514,7 +516,7 @@
               <select class="dsel" id="d-ed"><option value="">日</option>${range(1, 31).map(m => `<option>${String(m).padStart(2, '0')}</option>`).join('')}</select>
             </div>`}
         <div style="margin-top:16px"><button class="bigbtn" id="d-add" ${cur ? '' : 'disabled'}>この箱に入れた</button></div>
-      ` : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>`}
+      ` : (excluded ? '' : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>`)}
       <div class="lbl">👤 担当者の記録</div>
       <div class="grid2">
         <button class="selbtn" id="d-lw">ラベル貼り: ${esc(r.label_worker || '—')}</button>

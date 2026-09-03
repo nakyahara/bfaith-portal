@@ -661,11 +661,16 @@ t('同じ picking 実行はもう一度作らない (already) / getRunBySource',
 const st4 = db.getRunState(pr.runId);
 const g1 = st4.groups[0].id, g2 = st4.groups[1].id;
 const rowsOf = (gid) => db.getRunState(pr.runId).rows.filter((r) => r.pack_group_id === gid).sort((a, b) => a.id - b.id);
+let fakePlacement = null;
 t('Excel なしでも箱を作って割当できる (箱コード = ラベル-B連番)。readiness は no_excel でブロック', () => {
   const bx = db.createBox({ packGroupId: g1, materialCode: 'box140', worker: member });
   assert.equal(bx.boxCode, '通常-B1');
   const rA = rowsOf(g1)[0];
   assert.equal(db.addPlacement({ runId: pr.runId, rowId: rA.id, boxId: bx.boxId, qty: 3, worker: member, deviceKey: 'dev:8', requestId: 'pk1' }).ok, true);
+  // Excel 添付前は「Excel に無い商品」も入れられてしまう (pending) → 添付後に picking_only_placed で止まる (下で検証)
+  const fake = rowsOf(g1).find((r) => r.fnsku === 'X0FAKE00001');
+  fakePlacement = db.addPlacement({ runId: pr.runId, rowId: fake.id, boxId: bx.boxId, qty: 1, worker: member, deviceKey: 'dev:8', requestId: 'pk-fake' });
+  assert.equal(fakePlacement.ok, true);
   const rd = db.exportReadiness(pr.runId);
   assert.ok(rd.blockers.some((b) => b.code === 'no_excel'));
   assert.equal(rd.groups[0].excelAttached, false);
@@ -760,6 +765,8 @@ t('再添付で消えた excel_only 行: 記録なしは削除 / 取消済み記
   const retired = db.getRunState(c.runId).rows.find((r) => r.id === eo2.id);
   assert.equal(retired.match_state, 'retired');
   assert.equal(retired.excel_row, null);
+  // retired 行への投入 (差し替え直後の古い画面) は拒否
+  assert.equal(db.addPlacement({ runId: c.runId, rowId: eo2.id, boxId: bx.boxId, qty: 1, worker: member, deviceKey: 'dev:9', requestId: 'eo3' }).error, 'row_excluded');
   // retired は完了判定から外れる: 行A を 3 入れて閉じれば done にできる
   const rA = db.getRunState(c.runId).rows.find((r) => r.origin === 'picking');
   db.addPlacement({ runId: c.runId, rowId: rA.id, boxId: bx.boxId, qty: 3, worker: member, deviceKey: 'dev:9', requestId: 'eo2' });
@@ -768,13 +775,18 @@ t('再添付で消えた excel_only 行: 記録なしは削除 / 取消済み記
   const pl = db.buildExportPayload(c.runId);
   assert.equal(pl.exports[0].sheets[0].cells.filter((x) => x.kind === 'qty').length, 1, 'retired 行は書かない');
 });
-t('Excel に無い商品 (picking_only) に投入があると出力ブロック。取消せば解消。完了判定からは外れる', () => {
+t('Excel に無い商品 (picking_only): 添付前の投入は出力ブロック → 取消で解消。添付後は投入・担当・不足の更新を拒否 (row_excluded)。完了判定からは外れる', () => {
   const fake = rowsOf(g1).find((r) => r.match_state === 'picking_only');
-  const bx = db.getRunState(pr.runId).boxes.find((b) => b.pack_group_id === g1);
-  const p = db.addPlacement({ runId: pr.runId, rowId: fake.id, boxId: bx.id, qty: 1, worker: member, deviceKey: 'dev:8', requestId: 'pk2' });
-  assert.equal(p.ok, true);
+  assert.equal(fake.placed, 1);
   assert.ok(db.exportReadiness(pr.runId).blockers.some((b) => b.code === 'picking_only_placed'));
-  assert.equal(db.revokePlacement({ placementId: p.placementId, byStaff: true, reason: 'Excelに無い', worker: staff, deviceKey: 'dev:8' }).ok, true);
+  const bx = db.getRunState(pr.runId).boxes.find((b) => b.pack_group_id === g1);
+  // 古い画面からの投入 (競合) は DB 層で拒否 (Codex PR2.5 R2)
+  const p = db.addPlacement({ runId: pr.runId, rowId: fake.id, boxId: bx.id, qty: 1, worker: member, deviceKey: 'dev:8', requestId: 'pk2' });
+  assert.equal(p.error, 'row_excluded');
+  assert.equal(db.setRowShortage({ rowId: fake.id, shortageQty: 1, reason: 'missing', worker: staff }).error, 'row_excluded');
+  assert.equal(db.setRowWorkers({ rowId: fake.id, labelWorker: 'x', worker: member }).error, 'row_excluded');
+  assert.equal(db.clearRowShortage({ rowId: fake.id, worker: staff }).error, 'row_excluded');
+  assert.equal(db.revokePlacement({ placementId: fakePlacement.placementId, byStaff: true, reason: 'Excelに無い', worker: staff, deviceKey: 'dev:8' }).ok, true);
   const rd = db.exportReadiness(pr.runId);
   assert.ok(!rd.blockers.some((b) => b.code === 'picking_only_placed'));
   const inc = rd.blockers.find((b) => b.code === 'rows_incomplete');

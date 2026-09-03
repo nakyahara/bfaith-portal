@@ -945,6 +945,8 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
     if (!row) return { ok: false, error: 'not_found', message: '商品行が見つかりません (画面を更新してください)' };
     if (row.run_id !== Number(runId)) return { ok: false, error: 'bad_request', message: '納品回と商品行が一致しません (画面を更新してください)' };
     if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    const excluded = rowExcludedError(row);
+    if (excluded) return excluded;
     const box = d.prepare('SELECT * FROM fbx_boxes WHERE id = ?').get(Number(boxId));
     if (!box) return { ok: false, error: 'not_found', message: '箱が見つかりません (画面を更新してください)' };
     if (box.pack_group_id !== row.pack_group_id) {
@@ -991,6 +993,16 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
 
 function placedOf(d, rowId) {
   return d.prepare('SELECT COALESCE(SUM(qty),0) q FROM fbx_placements WHERE row_id = ? AND revoked_at IS NULL').get(rowId).q;
+}
+
+/**
+ * Excel の差し替えで対象外になった行 (retired) / 添付した Excel に無い行 (picking_only) への更新は拒否
+ * (Codex PR2.5 R2: 古い画面からの投入が成功すると、完了判定・出力から外れた「幽霊の投入」になる)
+ */
+function rowExcludedError(row) {
+  if (row.match_state === 'retired') return { ok: false, error: 'row_excluded', message: 'この商品は Excel の差し替えで対象外になりました (画面を更新してください)' };
+  if (row.match_state === 'picking_only') return { ok: false, error: 'row_excluded', message: 'この商品は添付した Excel (納品プラン) に無いため入れられません (職員・本社に確認してください)' };
+  return null;
 }
 
 /**
@@ -1065,6 +1077,8 @@ export function setRowWorkers({ rowId, labelWorker, checkWorker, worker, deviceL
       .get(Number(rowId));
     if (!row) return { ok: false, error: 'not_found', message: '商品行が見つかりません' };
     if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    const excluded = rowExcludedError(row);
+    if (excluded) return excluded;
     const label = labelWorker === undefined ? undefined : (labelWorker ? String(labelWorker).slice(0, 30) : null);
     const check = checkWorker === undefined ? undefined : (checkWorker ? String(checkWorker).slice(0, 30) : null);
     d.prepare(`INSERT INTO fbx_row_work (row_id, label_worker, check_worker, updated_at) VALUES (?, ?, ?, ?)
@@ -1093,6 +1107,8 @@ export function setRowShortage({ rowId, shortageQty, reason, worker, deviceLabel
       FROM fbx_rows w JOIN fbx_runs r ON r.id = w.run_id WHERE w.id = ?`).get(Number(rowId));
     if (!row) return { ok: false, error: 'not_found', message: '商品行が見つかりません' };
     if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    const excluded = rowExcludedError(row);
+    if (excluded) return excluded;
     const remaining = row.planned_qty - row.placed;
     const q = Number(shortageQty);
     if (!Number.isInteger(q) || q <= 0 || q > remaining) {
@@ -1118,6 +1134,8 @@ export function clearRowShortage({ rowId, worker, deviceLabel }) {
       .get(Number(rowId));
     if (!row) return { ok: false, error: 'not_found', message: '商品行が見つかりません' };
     if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    const excluded = rowExcludedError(row);
+    if (excluded) return excluded;
     d.prepare('UPDATE fbx_row_work SET shortage_qty = NULL, shortage_reason = NULL, shortage_by = NULL, updated_at = ? WHERE row_id = ?')
       .run(utcNow(), row.id);
     bumpRunVersion(d, row.run_id);

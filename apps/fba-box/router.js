@@ -356,7 +356,7 @@ router.post('/api/placements', checkOrigin, api((req, res) => {
     requestId: String(req.body?.request_id || ''),
   });
   if (!r.ok) {
-    const st = { over_qty: 409, expiry_conflict: 409, box_closed: 409, wrong_group: 409, run_not_active: 409, idempotency_conflict: 409, not_found: 404 }[r.error] || 400;
+    const st = { over_qty: 409, expiry_conflict: 409, box_closed: 409, box_void: 409, wrong_group: 409, run_not_active: 409, idempotency_conflict: 409, row_excluded: 409, not_found: 404 }[r.error] || 400;
     return res.status(st).json(r);
   }
   res.json(r);
@@ -498,7 +498,7 @@ router.post('/api/rows/:id(\\d+)/shortage', checkOrigin, api((req, res) => {
     ? clearRowShortage({ rowId: Number(req.params.id), worker: w.worker, deviceLabel: deviceLabelOf(req) })
     : setRowShortage({ rowId: Number(req.params.id), shortageQty: req.body?.qty, reason: req.body?.reason, worker: w.worker, deviceLabel: deviceLabelOf(req) });
   if (!r.ok) {
-    const st = { not_found: 404, run_not_active: 409 }[r.error] || 400;
+    const st = { not_found: 404, run_not_active: 409, row_excluded: 409 }[r.error] || 400;
     return res.status(st).json(r);
   }
   res.json(r);
