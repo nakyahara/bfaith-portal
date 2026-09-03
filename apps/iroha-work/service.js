@@ -359,7 +359,8 @@ export function neededBoxes(qty, unitsPerContainer, zStock = 0, zAllocated = 0) 
 
 /**
  * Z ロケ (一時保管) の在庫。商品コードごとに 在庫数・引当数 を合計する。
- * ⚠Z の見分けは「ロケ または ブロック略称 が Z ではじまる」。Notion 時代の Z在庫数 / Z引当数 に当たる
+ * ⚠Z の見分けは「ロケ または ブロック略称 が Z ではじまる」。Notion 時代の Z在庫数 / Z引当数 に当たる。
+ * 不良品は外に出せないので**良品だけ**数える (中原さん 2026-09-03。外部出し目安の集計と同じ絞り込み)
  */
 function zStockMap() {
   const db = getDB();
@@ -367,7 +368,7 @@ function zStockMap() {
   if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mirror_logizard_stock'").get()) return map;
   const rows = db.prepare(`SELECT LOWER(TRIM(商品ID)) AS k, SUM(在庫数) AS zaiko, SUM(引当数) AS hikiate
     FROM mirror_logizard_stock
-    WHERE (ロケ LIKE 'Z%' OR ブロック略称 LIKE 'Z%')
+    WHERE (ロケ LIKE 'Z%' OR ブロック略称 LIKE 'Z%') AND 品質区分名 = '良品'
     GROUP BY LOWER(TRIM(商品ID))`).all();
   for (const r of rows) if (r.k) map.set(r.k, { stock: Number(r.zaiko) || 0, allocated: Number(r.hikiate) || 0 });
   return map;

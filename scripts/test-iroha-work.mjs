@@ -1950,6 +1950,17 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   clearEnrichCache();
   const card2 = S2.buildTaskList().cards.find(c => c.id === t);
   ok(card2.boxes === '2箱+5' && card2.z_stock === 30, 'Z ロケに在庫があれば、その分で必要保管箱を出す');
+  // 不良品は外に出せないので数えない (中原さん 2026-09-03)
+  db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('PLAN-A', '想定時間テスト', 'Z01-001-001-02', 'Z01', '不良品', 100, 0, ?, ?)`).run(new Date().toISOString(), new Date().toISOString());
+  clearEnrichCache();
+  const card3 = S2.buildTaskList().cards.find(c => c.id === t);
+  ok(card3.z_stock === 30 && card3.boxes === '2箱+5', 'Z ロケでも不良品は数えない (良品だけ)');
+  // Z 以外のロケは数えない
+  db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('PLAN-A', '想定時間テスト', 'P3F-001-001-01', 'P3F', '良品', 500, 0, ?, ?)`).run(new Date().toISOString(), new Date().toISOString());
+  clearEnrichCache();
+  ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === 30, 'Z 以外のロケ (本館・いろは棟) は数えない');
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
   clearEnrichCache();
 
