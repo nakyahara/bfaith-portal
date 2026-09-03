@@ -365,6 +365,10 @@ function migrateQuantity(db) {
   addCol(db, 'f_inbound_check_destinations', 'notion_cancel_next_retry_at', 'TEXT');
   addCol(db, 'f_inbound_check_destinations', 'notion_cancel_attempt_count', 'INTEGER');
 
+  // 作り方動画のリンク (中原さんFB⑥ 2026-09-02。いろは作業アプリ PR4 で登録・表示)。
+  // 旧シートの「作業動画URL」列は全て空で持ち込まなかった — 今後はアプリから育てる
+  addCol(db, 'f_iroha_work_master', 'video_url', 'TEXT');
+
   if (!added) return;   // ここから先は列を足した初回だけ
 
   db.transaction(() => {

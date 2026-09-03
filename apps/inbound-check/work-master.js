@@ -221,7 +221,7 @@ export function searchWorkMaster(q, limit = 50) {
     ORDER BY w.商品コード LIMIT ?`).all(like, like.toLowerCase(), like, Math.max(1, Math.min(200, limit)));
 }
 
-const EDIT_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note'];
+const EDIT_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url'];
 
 export function updateWorkMasterRow(key, fields, user, expectVersion) {
   const db = getDB();
@@ -239,6 +239,11 @@ export function updateWorkMasterRow(key, fields, user, expectVersion) {
       v = p.value;
     } else {
       v = String(v ?? '').trim() || null;
+      // 動画リンクは http(s) のみ (javascript: 等を画面のリンクにしない)
+      if (f === 'video_url' && v != null && !/^https?:\/\/\S+$/i.test(v)) {
+        return { ok: false, error: 'bad_url', message: '作り方動画は http(s) のリンクを入れてください' };
+      }
+      if (v != null && v.length > 500) return { ok: false, error: 'too_long', message: `${f} が長すぎます (500文字まで)` };
     }
     sets.push(`${f} = ?`);
     params.push(v);

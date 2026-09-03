@@ -17,6 +17,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
+  getDB,
   createDevice, verifyDevice, revokeDevice, listDevices,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
@@ -26,7 +27,8 @@ import {
   getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
-import { buildList } from './service.js';
+import { buildList, classifyMasterEdit, clearEnrichCache, masterOf } from './service.js';
+import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import {
   addMedia, softDeleteMedia, countActivePhotos, resetMedia, listMediaForAdmin, schedule as scheduleMedia,
   listPageSyncForAdmin, resetPageSync,
@@ -290,6 +292,122 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
   res.json(r);
 }));
 
+// ─── 作業仕様のその場登録・修正 (f_iroha_work_master。中原さんFB③⑥) ───
+
+const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url'];
+
+/**
+ * 権限 (要件 §7 と FB③の折衷):
+ *   空欄を埋める = 作業者なら誰でも (新商品で現場が止まらない。履歴に残る)
+ *   入っている値の変更・削除 = 職員のみ (端末はPIN・ポータルセッションはそのまま)
+ * 版管理 (§1.7 ④): expect_version の楽観ロック。行が無ければ作ってから書く (mirror に居る商品のみ)
+ */
+router.post('/api/master', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const code = String(req.body?.code || '').trim();
+  if (!code) return res.status(400).json({ ok: false, error: 'bad_request', message: 'code (商品コード) が必要です' });
+  const fieldsIn = req.body?.fields;
+  if (!fieldsIn || typeof fieldsIn !== 'object' || Array.isArray(fieldsIn)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '変更内容がありません' });
+  }
+  const fields = {};
+  for (const f of MASTER_FIELDS) if (f in fieldsIn) fields[f] = fieldsIn[f];
+  if (Object.keys(fields).length === 0) return res.status(400).json({ ok: false, error: 'bad_request', message: '変更できる項目がありません' });
+
+  const k = codeKeyOf(code);
+  const db = getDB();
+  const row = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
+
+  // シード・権限判定に使うカード値 (商品コードが一致するカードだけ)
+  const card = getCachePage(String(req.body?.page_id || ''));
+  let cardProps = {};
+  if (card && codeKeyOf(card.product_code) === k) {
+    try { cardProps = JSON.parse(card.payload || '{}'); } catch { /* 壊れていればカード値なし */ }
+  }
+
+  // DBが実際に変わるか (書き込み要否・unchanged判定) は**生値**で見る
+  const { fills, overwrites } = classifyMasterEdit(row, fields);
+  if (fills.length === 0 && overwrites.length === 0) {
+    return res.json({ ok: true, unchanged: true, row });
+  }
+  // 権限は**画面に見えていた実効値** (マスタ+カードのフォールバック合成) で見る (Codex PR4-R3:
+  // マスタが空欄でもカード値 D-8 が表示されている項目を、一般作業者が D-9 へ変えられてはいけない。
+  // 表示どおりの値を確定保存するだけなら誰でもよい)
+  const effRow = masterOf(row || null, cardProps);
+  const perm = classifyMasterEdit(effRow, fields);
+  if (perm.overwrites.length > 0 && !hasSessionAccess(req)) {
+    if (w.worker.worker_type !== 'staff') {
+      return res.status(403).json({ ok: false, error: 'staff_required',
+        message: '表示されている値の変更は職員のみです (空欄への登録は誰でもできます)' });
+    }
+    const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
+    if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
+  }
+  // 既存行の更新は expect_version 必須 (省略でロックを素通りさせない — Codex PR4 #5)
+  if (row && req.body?.expect_version == null) {
+    return res.status(400).json({ ok: false, error: 'version_required', message: '画面を更新してからやり直してください (version が必要です)' });
+  }
+
+  // ⭐行の新規作成〜更新は1トランザクション (Codex PR4 #2: 検証や競合で失敗したのに
+  //   空行だけ残ると、カード由来の表示仕様を隠してしまう)。
+  //   新規作成時は、カード作成時のスナップショット値で行を初期化してから今回の変更を
+  //   重ねる (Codex PR4 #1: 動画だけ登録した瞬間に資材・入数の表示が消えないように)
+  const editor = `${w.worker.display_name} (いろはアプリ)`;
+  const rollback = Symbol('rollback');
+  let result;
+  try {
+    result = db.transaction(() => {
+      let cur = row;
+      let applyFields = fields;
+      let expect;
+      if (!cur) {
+        const add = addWorkMasterRow(code, editor);
+        if (!add.ok) {
+          const msg = add.error === 'not_in_master' ? 'この商品は商品マスタに無いため登録できません (商品コードを確認してください)' : add.message;
+          const e = new Error(msg); e[rollback] = { status: 400, body: { ok: false, error: add.error, message: msg } }; throw e;
+        }
+        cur = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
+        expect = cur.version;
+        // カード表示中の値をシード (今回指定されなかった項目だけ)。空欄埋め扱いなので権限は不要。
+        // cardProps は上で商品コード一致を確認済み (別商品のカード値を混ぜない)
+        const seed = {
+          material_code: cardProps['資材セットID'], storage_container: cardProps['収納容器'],
+          units_per_container: cardProps['入数'], process_count: cardProps['工程数'], note: cardProps['備考'],
+        };
+        applyFields = { ...Object.fromEntries(Object.entries(seed).filter(([f, v]) => v != null && v !== '' && !(f in fields))), ...fields };
+      } else {
+        expect = Number(req.body.expect_version);
+      }
+      const r = updateWorkMasterRow(k, applyFields, editor, expect);
+      if (!r.ok) {
+        const st = r.error === 'conflict' ? 409 : r.error === 'not_found' ? 404 : 400;
+        const msg = r.error === 'conflict' ? '他の人が先に更新しました。最新の内容を読み込みます' : r.message;
+        const e = new Error(msg); e[rollback] = { status: st, body: { ok: false, error: r.error, message: msg, currentVersion: r.currentVersion } }; throw e;
+      }
+      return { ...r, applyFields };
+    }).immediate();
+  } catch (e) {
+    if (e[rollback]) return res.status(e[rollback].status).json(e[rollback].body);
+    throw e;
+  }
+
+  // 履歴は旧値→新値をJSONで残す (項目名だけだと復元できない — Codex PR4 #6)。
+  // シードで書いた項目も含め、実際に適用した applyFields を対象に。切り詰めない
+  // (入力は各フィールド上限500字までなのでJSON全体でも高々数KB — 途中切断で壊れたJSONを残さない)
+  const oldVals = {}; const newVals = {};
+  for (const f of Object.keys(result.applyFields)) { oldVals[f] = row ? row[f] : null; newVals[f] = result.row[f]; }
+  safeLog({
+    action: 'master_edit', pageId: String(req.body?.page_id || '') || null,
+    workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+    from: JSON.stringify({ code, ...oldVals }),
+    to: JSON.stringify({ v: result.row.version, ...newVals }),
+    ok: true,
+  });
+  clearEnrichCache();   // 次の /api/state から新しい作業仕様で出す
+  res.json({ ok: true, row: result.row });
+}));
+
 // ─── 完成写真・動画 ───
 
 const MEDIA_TMP = path.join(MEDIA_DIR, 'tmp');
@@ -384,9 +502,18 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   if (card.status === '棚入完了') return res.status(409).json({ ok: false, error: 'done_card', message: 'このカードは棚入完了です (作業をはじめるなら職員がステータスを戻してください)' });
   if (card.status === '取消') return res.status(409).json({ ok: false, error: 'cancelled_card', message: 'このカードは取消済みです' });
 
+  // スナップショット (§1.7 ④) は「画面に見えていた実効値」= マスタ+カードのフォールバック合成
+  let snapshot = null;
+  if (card.product_code) {
+    let props = {};
+    try { props = JSON.parse(card.payload || '{}'); } catch { /* 壊れていれば props なしで合成 */ }
+    const wm = getDB().prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?')
+      .get(String(card.product_code).trim().toLowerCase());
+    snapshot = masterOf(wm || null, props);
+  }
   const r = startSession({
     pageId, productCode: card.product_code, title: card.title,
-    worker: w.worker, deviceLabel: deviceLabelOf(req),
+    worker: w.worker, deviceLabel: deviceLabelOf(req), masterSnapshot: snapshot,
   });
   if (!r.already) {
     safeLog({ action: 'session_start', pageId, workerId: w.worker.id, workerName: w.worker.display_name,

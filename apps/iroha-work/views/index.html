@@ -131,6 +131,12 @@
   .btn.warn{color:var(--amber);border-color:var(--amber)}
   .est{font-size:.82rem;color:var(--sub);margin-top:10px}
   h3.sec{font-size:.95rem;margin:0 0 10px;color:var(--sub);letter-spacing:.05em}
+  .reg{margin-top:6px;border:1.5px solid var(--amber);background:var(--surface);color:var(--amber);
+    border-radius:10px;padding:6px 12px;font-weight:700;font-size:.85rem;cursor:pointer;
+    font-family:"Zen Maru Gothic","Noto Sans JP",sans-serif}
+  .mfields label{display:block;font-size:.78rem;color:var(--sub);font-weight:700;margin:10px 0 3px}
+  .mfields input{width:100%;border:1.5px solid var(--line);border-radius:10px;padding:10px 12px;
+    font-size:1rem;background:var(--surface);color:var(--ink)}
   .nlink{font-size:.82rem;color:var(--sub);margin:10px 0 0}
   .nlink a{color:var(--accent);font-weight:700}
 
@@ -214,6 +220,35 @@
       <div class="mbtns"><button class="btn" id="stCancel" onclick="closeSt()">やめる</button></div>
       <p class="hint">ここで変えると、Notionのカードのステータスもそのまま変わります。<br>
         「棚入完了」への変更・取り消しは職員の方だけができます (職員PINが必要)。</p>
+    </div>
+  </div>
+
+  <!-- ══ 作業のやり方 登録・修正ダイアログ ══ -->
+  <div class="overlay" id="mvOv">
+    <div class="modal">
+      <h3>✎ 作業のやり方を登録・修正</h3>
+      <div class="mname" id="mvName">—</div>
+      <div class="msaving" id="mvMsg"></div>
+      <div class="mfields">
+        <label>資材 (資材セットID。例: D-8)</label><input id="mvMaterial" maxlength="100">
+        <label>入れもの (収納容器。例: 20Lコンテナ)</label><input id="mvContainer" maxlength="100">
+        <label>入数 (1容器に入れる数)</label><input id="mvUnits" type="number" min="0" inputmode="numeric">
+        <label>工程数</label><input id="mvProcess" type="number" min="0" inputmode="numeric">
+        <label>気をつけること (備考)</label><input id="mvNote" maxlength="300">
+        <label>作り方動画のリンク (https://…)</label><input id="mvVideo" type="url" maxlength="500" placeholder="https://">
+      </div>
+      <div id="mvPinRow" style="display:none;margin-top:12px">
+        <label style="font-size:.8rem;color:var(--sub);font-weight:700">職員PIN (入っている値の変更に必要です)</label>
+        <input id="mvPin" type="tel" inputmode="numeric" maxlength="8" autocomplete="off"
+          style="width:100%;border:1.5px solid var(--line);border-radius:10px;padding:10px 12px;font-size:1.3rem;
+                 letter-spacing:.3em;background:var(--surface);color:var(--ink)">
+      </div>
+      <div class="mbtns" style="margin-top:14px">
+        <button class="btn" id="mvCancel" onclick="closeMaster()">やめる</button>
+        <button class="btn primary" id="mvSave" onclick="saveMaster()">保存</button>
+      </div>
+      <p class="hint">空欄への登録はだれでもできます。入っている値の変更は職員PINが必要です。<br>
+        保存すると、この商品の次のカードにも同じ内容が出ます (正本DBに保存)。</p>
     </div>
   </div>
 
@@ -457,8 +492,11 @@ function estText(c) {
 
 function kv(label, value, opts) {
   const miss = opts && opts.miss;
+  const reg = opts && opts.reg;   // 未登録のとき「＋その場で登録」を出す (FB③)
   return '<div class="kv' + (miss ? ' miss' : '') + '"><label>' + esc(label) + '</label><div class="v num">' +
-    (value == null || value === '' ? (miss ? '未登録' : '—') : esc(value)) + '</div></div>';
+    (value == null || value === '' ? (miss ? '未登録' : '—') : esc(value)) + '</div>' +
+    (miss && reg ? '<button class="reg" onclick="openMaster(\'' + esc(reg) + '\')">＋ その場で登録</button>' : '') +
+    '</div>';
 }
 
 function renderDetail(c) {
@@ -484,22 +522,24 @@ function renderDetail(c) {
       '<div class="qty num">つくる数: <b>' + esc(c.qty != null ? c.qty : '—') + '</b> 個</div>' +
       '</div></div></div>' +
 
-    '<div class="dcard"><h3 class="sec">作業のやり方</h3><div class="kvs">' +
-      kv('資材', m.material_code, { miss: missSet.has('資材') }) +
+    '<div class="dcard"><h3 class="sec">作業のやり方 <button class="reg" style="margin-left:8px" onclick="openMaster()">✎ 編集</button></h3><div class="kvs">' +
+      kv('資材', m.material_code, { miss: missSet.has('資材'), reg: 'material_code' }) +
       kv('入れもの', m.storage_container && m.units_per_container != null
           ? m.storage_container + 'に ' + m.units_per_container + '個ずつ'
-          : m.storage_container, { miss: missSet.has('容器') || missSet.has('入数') }) +
-      kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程') }) +
+          : m.storage_container, { miss: missSet.has('容器') || missSet.has('入数'), reg: 'storage_container' }) +
+      kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程'), reg: 'process_count' }) +
+      (m.video_url
+        ? '<div class="kv"><label>作り方どうが</label><div class="v"><a href="' + esc(m.video_url) + '" target="_blank" rel="noopener">▶ どうがを見る</a></div></div>'
+        : kv('作り方どうが', null, { miss: true, reg: 'video_url' })) +
       kv('気をつけること', m.note) +
       kv('期限', c.expiry ? c.expiry : '期限シールなし') +
       kv('参考', [prio, ...live].join(' ・ ')) +
       (c.external_text ? kv('外部出し目安', c.external_text) : '') +
       (c.supplier ? kv('取引先', c.supplier) : '') +
     '</div>' +
-      (m.missing.length > 0
-        ? '<p class="nlink">⚠ 未登録の項目があります。登録機能はこのあとの更新で入ります (それまでは職員の方が入荷受付チェックの管理画面から)。</p>' : '') +
+      '<p class="nlink">空欄への登録はだれでもできます。入っている値の変更は職員の方が「✎ 編集」から (PINが必要)。</p>' +
       (m.source === 'card'
-        ? '<p class="nlink">※作業仕様マスタに未登録のため、カード作成時の値を表示しています。</p>' : '') +
+        ? '<p class="nlink">※作業仕様マスタに未登録のため、カード作成時の値を表示しています。登録すると次回からマスタの値になります。</p>' : '') +
       '<p class="nlink">くわしくは 🗂 ' + (c.url ? '<a href="' + esc(c.url) + '" target="_blank" rel="noopener">Notionのカードを開く</a>' : 'Notionのカード (リンクなし)') + '</p>' +
     '</div>' +
 
@@ -656,6 +696,99 @@ function rerenderDetail() {
   if (!curDetail) return;
   const c = state.cards.find(x => x.page_id === curDetail);
   if (c) renderDetail(c);
+}
+
+// ── 作業のやり方の登録・修正 (FB③⑥。空欄埋め=誰でも / 上書き=職員PIN。版は楽観ロック) ──
+let mvSaving = false;
+// ⭐開いた時点の値と version を固定する (Codex PR4 #3: 60秒ポーリングが version を進めると、
+//   古い入力を新しい version で送れてしまい他人の変更を上書きする)
+let mvCtx = null;   // { pageId, code, version, values }
+const MV_MAP = { material_code: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
+  process_count: 'mvProcess', note: 'mvNote', video_url: 'mvVideo' };
+
+function mvValues(m) {
+  return {
+    material_code: m.material_code || '', storage_container: m.storage_container || '',
+    units_per_container: m.units_per_container == null ? '' : String(m.units_per_container),
+    process_count: m.process_count == null ? '' : String(m.process_count),
+    note: m.note || '', video_url: m.video_url || '',
+  };
+}
+
+function openMaster(focus) {
+  if (!worker) { openGate(); return; }
+  const c = state.cards.find(x => x.page_id === curDetail);
+  if (!c) return;
+  if (!c.product_code) { showErr('商品コードのないカードは登録できません (Notion側で商品コードを入れてください)'); return; }
+  const cur = mvValues(c.master);
+  mvCtx = { pageId: c.page_id, code: c.product_code, version: c.master.version, values: cur };
+  for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur[f];
+  $('#mvName').textContent = c.title + ' (' + c.product_code + ')';
+  $('#mvMsg').textContent = '';
+  $('#mvPinRow').style.display = 'none';
+  $('#mvPin').value = '';
+  $('#mvOv').classList.add('on');
+  if (focus && MV_MAP[focus]) document.getElementById(MV_MAP[focus]).focus();
+}
+function closeMaster() { if (mvSaving) return; $('#mvOv').classList.remove('on'); }
+$('#mvOv').addEventListener('click', e => { if (e.target === $('#mvOv')) closeMaster(); });
+
+async function saveMaster() {
+  if (mvSaving || !worker || !mvCtx) return;
+  const fields = {};
+  for (const [f, id] of Object.entries(MV_MAP)) {
+    const v = document.getElementById(id).value.trim();
+    if (v !== mvCtx.values[f]) fields[f] = v;   // 開いた時点との差分だけ送る
+  }
+  if (Object.keys(fields).length === 0) { closeMaster(); toast('変更はありませんでした'); return; }
+  mvSaving = true;
+  for (const id of ['mvSave', 'mvCancel']) document.getElementById(id).disabled = true;
+  $('#mvMsg').textContent = '保存中…';
+  let j;
+  try {
+    const r = await fetch(BASE + '/api/master', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        code: mvCtx.code, page_id: mvCtx.pageId, fields,
+        expect_version: mvCtx.version, worker_id: worker.id,
+        pin: $('#mvPin').value.trim() || undefined,
+      }),
+    });
+    j = await r.json().catch(() => ({}));
+  } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
+  mvSaving = false;
+  for (const id of ['mvSave', 'mvCancel']) document.getElementById(id).disabled = false;
+
+  if (j.ok) {
+    $('#mvOv').classList.remove('on');
+    mvCtx = null;
+    // ⭐ローカルで j.row (生値) を貼らず、サーバーの合成結果 (カードフォールバック込み) を
+    //   取り直す — 部分マスタ行で保存直後だけ資材・入数が「未登録」に見える回帰を防ぐ (PR4-R4)
+    await loadState();
+    toast(j.unchanged ? '変更はありませんでした' : '登録しました (この商品の次のカードにも反映されます)');
+    return;
+  }
+  if (j.error === 'pin_required' || j.error === 'pin_invalid') {
+    $('#mvPinRow').style.display = 'block';
+    $('#mvPin').value = '';
+    $('#mvMsg').textContent = '❌ ' + (j.message || 'PINを確認してください');
+    $('#mvPin').focus();
+    return;
+  }
+  if (j.error === 'conflict' || j.error === 'version_required') {
+    // 最新を読み込み、フォームも最新値で組み直す (古い入力のままの再保存で上書きさせない — Codex PR4 #4)
+    $('#mvMsg').textContent = '⏳ ' + (j.message || '他の人が先に更新しました') + ' — 最新を読み込んでいます…';
+    await loadState();
+    const c2 = state.cards.find(x => x.page_id === mvCtx.pageId);
+    if (c2) {
+      const cur2 = mvValues(c2.master);
+      mvCtx = { pageId: c2.page_id, code: c2.product_code, version: c2.master.version, values: cur2 };
+      for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur2[f];
+    }
+    $('#mvMsg').textContent = '❌ 他の人が先に更新したため、最新の内容に読み込み直しました。もう一度入力してください';
+    return;
+  }
+  $('#mvMsg').textContent = '❌ ' + (j.message || '保存できませんでした');
 }
 
 // ── 作業時間カード (作業する人・タイマー・開始/中断/できあがり) ──
@@ -886,7 +1019,7 @@ async function doSetSt(to) {
 // ─── 起動・巡回 ───
 loadState();
 setInterval(() => { if (!stSaving) loadState(); }, 60_000);
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeSt(); closeDetail(); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeSt(); closeMaster(); closeDetail(); } });
 </script>
 </body>
 </html>

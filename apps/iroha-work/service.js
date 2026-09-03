@@ -57,12 +57,20 @@ const PRIORITY_RANK = { urgent: 0, new: 1, normal: 2, unknown: 3, calm: 4 };
  * スナップショット (Notion プロパティ) で代用し、source で区別する。
  * missing = 現場が作業を始めるのに足りない項目 (⚠未登録バッジの根拠)
  */
-function masterOf(wm, props) {
+export function masterOf(wm, props) {
+  // ⭐項目単位でカード値へフォールバックする (Codex PR4 #1: マスタ行が「動画だけ」でも、
+  //   カードに載っている資材・入数の表示を消さない)。version はマスタ行の有無で決まる
+  const card = {
+    material_code: props['資材セットID'] || null, storage_container: props['収納容器'] || null,
+    units_per_container: props['入数'] ?? null, process_count: props['工程数'] ?? null, note: props['備考'] || null,
+  };
   const m = wm
-    ? { source: 'master', material_code: wm.material_code || null, storage_container: wm.storage_container || null,
-        units_per_container: wm.units_per_container ?? null, process_count: wm.process_count ?? null, note: wm.note || null }
-    : { source: 'card', material_code: props['資材セットID'] || null, storage_container: props['収納容器'] || null,
-        units_per_container: props['入数'] ?? null, process_count: props['工程数'] ?? null, note: props['備考'] || null };
+    ? { source: 'master', version: wm.version,
+        material_code: wm.material_code || card.material_code, storage_container: wm.storage_container || card.storage_container,
+        units_per_container: wm.units_per_container ?? card.units_per_container,
+        process_count: wm.process_count ?? card.process_count, note: wm.note || card.note,
+        video_url: wm.video_url || null }
+    : { source: 'card', version: null, ...card, video_url: null };
   const missing = [];
   if (!m.material_code) missing.push('資材');
   if (!m.storage_container) missing.push('容器');
@@ -70,6 +78,26 @@ function masterOf(wm, props) {
   if (m.process_count == null) missing.push('工程');
   m.missing = missing;
   return m;
+}
+
+/**
+ * その場登録の権限判定 (要件 §7 と FB③ の折衷。2026-09-02 実装判断):
+ *   - **空欄を埋める**だけの変更 = 作業者なら誰でも (新商品で現場が止まらないように。履歴に残る)
+ *   - **入っている値の変更・削除** = 職員のみ (マスタ編集は職員権限 — 要件 §7)
+ * @returns {fills: string[], overwrites: string[]} 変更が既存値を書き換えるかの内訳
+ */
+export function classifyMasterEdit(row, fields) {
+  const fills = [];
+  const overwrites = [];
+  for (const [f, nv] of Object.entries(fields)) {
+    const cur = row ? row[f] : null;
+    const curEmpty = cur == null || String(cur).trim() === '';
+    const next = nv == null ? '' : String(nv).trim();
+    if (curEmpty && next !== '') fills.push(f);
+    else if (!curEmpty && next !== String(cur).trim()) overwrites.push(f);
+    // curEmpty && next==='' (空→空) は変更なし扱い
+  }
+  return { fills, overwrites };
 }
 
 /**
