@@ -59,6 +59,21 @@ export function createTables(db = getMirrorDB()) {
       value TEXT
     );
 
+    -- 作業のやり方の選択肢 (資材セット・保管箱)。中原さん 2026-09-03: 編集はテキスト入力でなく、
+    -- Excel (作業仕様マスタ) にある値を初期値の選択肢にしてタップで選ぶ。初見のものはその場で追加 (職員PIN)。
+    -- 画像は後から付ける (image_url)。code = 表示名 兼 f_iroha_work_master に入る値そのもの
+    CREATE TABLE IF NOT EXISTS f_iroha_work_options (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind       TEXT NOT NULL CHECK (kind IN ('material','container')),
+      code       TEXT NOT NULL,
+      image_url  TEXT,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+      created_at TEXT NOT NULL,
+      created_by TEXT,
+      UNIQUE(kind, code)
+    );
+
     -- いろは名簿 (利用者/職員)。⭐staff.db とは別 (冒頭コメント参照)。
     -- pin_hash/pin_salt = 職員PIN (棚入完了の変更などの職員限定操作の本人確認。Codex PR1 #1:
     -- worker_id は画面で自由に選べる自己申告なので、それだけで職員権限にしない)
@@ -660,4 +675,76 @@ export function listActiveEnrollCodes() {
   return getDB().prepare(`SELECT id, label, created_by, created_at, expires_at, attempts
     FROM f_iroha_app_enroll_codes WHERE used_at IS NULL AND expires_at > ? AND attempts < ?
     ORDER BY id DESC`).all(utcNow(), ENROLL_MAX_ATTEMPTS);
+}
+
+// ─── 作業のやり方の選択肢 (資材セット・保管箱) ───
+// 中原さん 2026-09-03: 編集はテキスト入力でなく候補からタップ。Excel (作業仕様マスタ) の値を初期値に、
+// 初見のものはその場で追加。画像は後から付ける
+
+export const OPTION_KINDS = ['material', 'container'];
+const OPTION_LABEL = { material: '資材', container: '保管箱' };
+const OPTION_COLS = 'id, kind, code, image_url, sort_order, active';
+
+/** 選択肢一覧。kind を省くと全種類、includeInactive で無効も (管理画面用) */
+export function listWorkOptions(kind = null, includeInactive = false) {
+  return getDB().prepare(`SELECT ${OPTION_COLS} FROM f_iroha_work_options
+    WHERE (? IS NULL OR kind = ?) ${includeInactive ? '' : 'AND active = 1'} ORDER BY kind, sort_order, code`).all(kind, kind);
+}
+
+/** 画面用: { material: [...], container: [...] } */
+export function workOptionsByKind(includeInactive = false) {
+  const out = { material: [], container: [] };
+  for (const r of listWorkOptions(null, includeInactive)) out[r.kind].push(r);
+  return out;
+}
+
+/**
+ * 追加。同じ値が無効で残っていれば有効に戻す (値の正規化 = 連続空白を1つに・前後 trim)。
+ * @returns {ok:true, option, already?} | {ok:false, error, message}
+ */
+export function addWorkOption({ kind, code, actor }) {
+  if (!OPTION_KINDS.includes(kind)) return { ok: false, error: 'bad_kind', message: '種類は 資材 / 保管箱 のどちらかです' };
+  const c = String(code || '').replace(/\s+/g, ' ').trim();
+  if (!c || c.length > 100) return { ok: false, error: 'bad_code', message: `${OPTION_LABEL[kind]}は1〜100文字で入力してください` };
+  const db = getDB();
+  const dup = db.prepare(`SELECT ${OPTION_COLS} FROM f_iroha_work_options WHERE kind = ? AND code = ?`).get(kind, c);
+  if (dup) {
+    if (!dup.active) db.prepare('UPDATE f_iroha_work_options SET active = 1 WHERE id = ?').run(dup.id);
+    return { ok: true, already: true, option: { ...dup, active: 1 } };
+  }
+  const info = db.prepare(`INSERT INTO f_iroha_work_options (kind, code, active, created_at, created_by) VALUES (?, ?, 1, ?, ?)`)
+    .run(kind, c, utcNow(), actor || null);
+  return { ok: true, option: db.prepare(`SELECT ${OPTION_COLS} FROM f_iroha_work_options WHERE id = ?`).get(Number(info.lastInsertRowid)) };
+}
+
+export function setWorkOptionActive(id, active) {
+  return getDB().prepare('UPDATE f_iroha_work_options SET active = ? WHERE id = ?').run(active ? 1 : 0, Number(id)).changes > 0;
+}
+
+/** 画像 (http(s) リンク)。空なら外す。後で Drive 保存の写真に差し替えられるよう URL で持つ */
+export function setWorkOptionImage(id, imageUrl) {
+  const u = String(imageUrl || '').trim();
+  if (u && !/^https?:\/\//i.test(u)) return { ok: false, error: 'bad_url', message: '画像は http(s) のリンクを入れてください' };
+  const n = getDB().prepare('UPDATE f_iroha_work_options SET image_url = ? WHERE id = ?').run(u || null, Number(id)).changes;
+  return n > 0 ? { ok: true } : { ok: false, error: 'not_found', message: '選択肢が見つかりません' };
+}
+
+/**
+ * f_iroha_work_master (Excel 取込・その場登録の値) に出てくる資材・保管箱を候補に補充する (INSERT OR IGNORE)。
+ * Excel を取り込み直したあとも、一覧を開いたときに新しい値が拾われる (呼び元で数分に1回)
+ * @returns {{material:number, container:number}} 追加件数
+ */
+export function seedWorkOptionsFromMaster() {
+  const db = getDB();
+  const out = { material: 0, container: 0 };
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get()) return out;
+  const ins = db.prepare(`INSERT OR IGNORE INTO f_iroha_work_options (kind, code, active, created_at, created_by) VALUES (?, ?, 1, ?, 'seed:work_master')`);
+  const now = utcNow();
+  db.transaction(() => {
+    for (const [kind, col] of [['material', 'material_code'], ['container', 'storage_container']]) {
+      const rows = db.prepare(`SELECT DISTINCT TRIM(${col}) v FROM f_iroha_work_master WHERE ${col} IS NOT NULL AND TRIM(${col}) <> ''`).all();
+      for (const r of rows) out[kind] += ins.run(kind, r.v, now).changes;
+    }
+  })();
+  return out;
 }

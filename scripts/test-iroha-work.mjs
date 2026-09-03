@@ -740,6 +740,31 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   _setDriveUpload(null);
 }
 
+console.log('\n[16] 作業のやり方の選択肢 (資材・保管箱): Excel 由来の候補 + その場登録');
+{
+  const { listWorkOptions, workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, seedWorkOptionsFromMaster } = await import('../apps/iroha-work/db.js');
+  const { addWorkMasterRow: addRow, updateWorkMasterRow: updRow } = await import('../apps/inbound-check/work-master.js');
+  const seedRow = addRow('OPT-SEED-1', 'test');
+  updRow('opt-seed-1', { material_code: ' D-8 ', storage_container: '20Lコンテナ' }, 'test', seedRow.row ? seedRow.row.version : seedRow.version);
+  const seeded = seedWorkOptionsFromMaster();
+  ok(seeded.material >= 1 && seeded.container >= 1, `作業仕様マスタの資材・保管箱が候補に補充される (資材${seeded.material}/保管箱${seeded.container})`);
+  ok(listWorkOptions('material').some(o => o.code === 'D-8') && listWorkOptions('container').some(o => o.code === '20Lコンテナ'), '補充された値 (trim 済み)');
+  const again = seedWorkOptionsFromMaster();
+  ok(again.material === 0 && again.container === 0, '2回目は増えない (INSERT OR IGNORE)');
+  const a = addWorkOption({ kind: 'material', code: '  D-99   x ', actor: 'test' });
+  ok(a.ok === true && a.option.code === 'D-99 x', '追加 (前後の空白は落とし、連続空白は1つに)');
+  ok(addWorkOption({ kind: 'material', code: 'D-99 x' }).already === true, '同じ値は既存を返す');
+  ok(addWorkOption({ kind: 'shelf', code: 'x' }).error === 'bad_kind' && addWorkOption({ kind: 'container', code: '   ' }).error === 'bad_code', '種類・空値は拒否');
+  ok(setWorkOptionActive(a.option.id, false) === true && !listWorkOptions('material').some(o => o.id === a.option.id), '無効化で画面の候補から消える');
+  ok(listWorkOptions('material', true).some(o => o.id === a.option.id), '管理画面 (無効含む) には残る');
+  const back = addWorkOption({ kind: 'material', code: 'D-99 x' });
+  ok(back.already === true && back.option.active === 1 && listWorkOptions('material').some(o => o.id === a.option.id), '無効の値を再登録すると有効に戻る');
+  ok(setWorkOptionImage(a.option.id, 'javascript:x').error === 'bad_url' && setWorkOptionImage(a.option.id, 'https://example.com/d99.jpg').ok === true, '画像は http(s) のみ');
+  ok(setWorkOptionImage(999999, 'https://x/y.jpg').error === 'not_found', '無い id は not_found');
+  const by = workOptionsByKind();
+  ok(Array.isArray(by.material) && Array.isArray(by.container) && by.material.find(o => o.id === a.option.id).image_url === 'https://example.com/d99.jpg', 'kind ごとの一覧に画像が載る');
+}
+
 console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動画リンク・スナップショット)');
 {
   const { classifyMasterEdit } = await import('../apps/iroha-work/service.js');

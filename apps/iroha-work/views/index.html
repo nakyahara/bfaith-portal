@@ -156,6 +156,17 @@
   h3.sec{font-size:.78rem;margin:0 0 10px;color:var(--faint);letter-spacing:.1em;font-weight:700;display:flex;align-items:center;gap:8px}
   .reg{border:1px solid var(--amber);background:var(--surface);color:var(--amber);
     border-radius:var(--r-sm);padding:5px 10px;font-weight:700;font-size:.82rem;cursor:pointer;font-family:var(--font)}
+  /* ── 選択肢 (資材・保管箱): Excel 由来の候補からタップで選ぶ ── */
+  .opts{display:flex;gap:6px;flex-wrap:wrap;margin:2px 0 4px}
+  .opt{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);padding:8px 12px;
+    font-size:.95rem;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:6px;min-height:40px;font-family:var(--font)}
+  .opt img{width:28px;height:28px;object-fit:cover;border-radius:4px}
+  .opt.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  .opt.none{color:var(--faint);border-style:dashed}
+  .opt.none.on{color:var(--accent-ink)}
+  .opt.add{color:var(--accent);border-color:var(--accent);border-style:dashed;background:var(--surface)}
+  .optnew{display:flex;gap:6px;width:100%;margin-top:4px}
+  .optnew input{flex:1;border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;font-size:1rem;background:var(--surface);color:var(--ink)}
   .mfields label{display:block;font-size:.78rem;color:var(--sub);font-weight:700;margin:10px 0 3px}
   .mfields input{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;
     font-size:1rem;background:var(--surface);color:var(--ink)}
@@ -263,8 +274,12 @@
       <div class="mname" id="mvName">—</div>
       <div class="msaving" id="mvMsg"></div>
       <div class="mfields">
-        <label>資材 (資材セットID。例: D-8)</label><input id="mvMaterial" maxlength="100">
-        <label>保管箱 (例: 20Lコンテナ)</label><input id="mvContainer" maxlength="100">
+        <label>資材 (タップして選ぶ)</label>
+        <div class="opts" id="optMaterial"></div>
+        <input type="hidden" id="mvMaterial">
+        <label>保管箱 (タップして選ぶ)</label>
+        <div class="opts" id="optContainer"></div>
+        <input type="hidden" id="mvContainer">
         <label>入数 (保管箱1つに入れる数)</label><input id="mvUnits" type="number" min="0" inputmode="numeric">
         <label>工程数</label><input id="mvProcess" type="number" min="0" inputmode="numeric">
         <label>気をつけること (備考)</label><input id="mvNote" maxlength="300">
@@ -879,6 +894,71 @@ function rerenderDetail() {
   if (c) renderDetail(c);
 }
 
+// ── 選択肢 (資材・保管箱): Excel 由来の候補からタップで選ぶ。初見は「＋新しく登録」(職員PIN) ──
+// (中原さん 2026-09-03: テキスト入力だと選びにくく、初見のものを適当に入れることになる)
+const OPT_FIELD = { material: 'mvMaterial', container: 'mvContainer' };
+const OPT_BOX = { material: 'optMaterial', container: 'optContainer' };
+const OPT_LABEL = { material: '資材', container: '保管箱' };
+const OPT_EXAMPLE = { material: 'D-8', container: '20Lコンテナ' };
+let optNewKind = null;   // 「＋新しく登録」の入力欄を開いている種類
+function renderOpts(kind) {
+  const cur = document.getElementById(OPT_FIELD[kind]).value;
+  const list = (state.options && state.options[kind]) || [];
+  // 今の値が候補に無い (古いマスタ値など) ときも「選択中」として見せる
+  const extra = cur && !list.some(o => o.code === cur) ? [{ id: 0, code: cur, image_url: null }] : [];
+  let h = '<button type="button" class="opt none' + (cur ? '' : ' on') + '" data-code="" onclick="pickOptEl(this,\'' + kind + '\')">なし</button>';
+  for (const o of [...extra, ...list]) {
+    // 値は data-code に持たせ onclick には埋めない (人が入れた文字列を JS 文字列にしない)
+    h += '<button type="button" class="opt' + (o.code === cur ? ' on' : '') + '" data-code="' + esc(o.code) + '" onclick="pickOptEl(this,\'' + kind + '\')">' +
+      (o.image_url ? '<img src="' + esc(o.image_url) + '" alt="" onerror="this.remove()">' : '') + esc(o.code) + '</button>';
+  }
+  h += '<button type="button" class="opt add" onclick="openOptNew(\'' + kind + '\')">＋ 新しく登録</button>';
+  if (optNewKind === kind) {
+    h += '<div class="optnew"><input id="optNewIn" maxlength="100" placeholder="新しい' + OPT_LABEL[kind] + ' (例: ' + OPT_EXAMPLE[kind] + ')">' +
+      '<button type="button" class="reg" onclick="saveOptNew(\'' + kind + '\')">登録</button></div>';
+  }
+  document.getElementById(OPT_BOX[kind]).innerHTML = h;
+}
+function pickOptEl(el, kind) {
+  document.getElementById(OPT_FIELD[kind]).value = el.dataset.code || '';
+  optNewKind = null;
+  renderOpts(kind);
+}
+function openOptNew(kind) {
+  optNewKind = kind; renderOpts(kind);
+  const i = document.getElementById('optNewIn'); if (i) i.focus();
+}
+async function saveOptNew(kind) {
+  const inp = document.getElementById('optNewIn');
+  const code = (inp ? inp.value : '').trim();
+  if (!code) { $('#mvMsg').textContent = '❌ 値を入れてください'; return; }
+  if (!worker) { openGate(); return; }
+  const pin = $('#mvPin').value.trim();
+  if (!state.me.session && !pin) {
+    $('#mvPinRow').style.display = 'block';
+    $('#mvMsg').textContent = '新しい' + OPT_LABEL[kind] + 'の登録は職員のみです。職員PINを入れてからもう一度「登録」を押してください';
+    $('#mvPin').focus();
+    return;
+  }
+  $('#mvMsg').textContent = '登録中…';
+  const j = await apiFetch('/api/options', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind, code, worker_id: worker.id, pin: pin || undefined }) });
+  if (!j.ok) {
+    if (j.error === 'pin_required' || j.error === 'pin_invalid' || j.error === 'staff_required') {
+      $('#mvPinRow').style.display = 'block'; $('#mvPin').value = ''; $('#mvPin').focus();
+    }
+    $('#mvMsg').textContent = '❌ ' + (j.message || '登録できませんでした');
+    return;
+  }
+  state.options = state.options || { material: [], container: [] };
+  if (!state.options[kind].some(o => o.id === j.option.id)) state.options[kind].push(j.option);
+  $('#mvMsg').textContent = '';
+  document.getElementById(OPT_FIELD[kind]).value = j.option.code;
+  optNewKind = null;
+  renderOpts(kind);
+  toast('「' + j.option.code + '」を' + OPT_LABEL[kind] + 'の候補に登録しました');
+}
+
 // ── 作業のやり方の登録・修正 (FB③⑥。空欄埋め=誰でも / 上書き=職員PIN。版は楽観ロック) ──
 let mvSaving = false;
 // ⭐開いた時点の値と version を固定する (Codex PR4 #3: 60秒ポーリングが version を進めると、
@@ -904,6 +984,7 @@ function openMaster(focus) {
   const cur = mvValues(c.master);
   mvCtx = { pageId: c.page_id, code: c.product_code, version: c.master.version, values: cur };
   for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur[f];
+  optNewKind = null; renderOpts('material'); renderOpts('container');
   $('#mvName').textContent = c.title + ' (' + c.product_code + ')';
   $('#mvMsg').textContent = '';
   $('#mvPinRow').style.display = 'none';
@@ -961,6 +1042,7 @@ async function saveMaster() {
       const cur2 = mvValues(c2.master);
       mvCtx = { pageId: c2.page_id, code: c2.product_code, version: c2.master.version, values: cur2 };
       for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur2[f];
+      optNewKind = null; renderOpts('material'); renderOpts('container');
     }
     $('#mvMsg').textContent = '❌ 他の人が先に更新したため、最新の内容に読み込み直しました。もう一度入力してください';
     return;
