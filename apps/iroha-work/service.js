@@ -13,9 +13,11 @@
 import { buildEnrichContext } from '../inbound-check/notion-sync.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
-import { getDB, listCache, activeSessionsByPage, estimateByProduct } from './db.js';
-import { mediaByPage, photosByCodeKey } from './media.js';
+import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct } from './db.js';
+import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
+import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, HOLD_REASONS, HOLD_LABEL, CLOSE_REASONS, CLOSE_LABEL, statusLabel } from './tasks.js';
+import { listOpenTasks, listFacilities } from './tasks-db.js';
 
 // 「急ぎ」の線引き: 在庫切れ、または残り在庫日数がこれ以下
 export const URGENT_DAYS = 3;
@@ -58,12 +60,24 @@ const PRIORITY_RANK = { urgent: 0, new: 1, normal: 2, unknown: 3, calm: 4 };
  * missing = 現場が作業を始めるのに足りない項目 (⚠未登録バッジの根拠)
  */
 export function masterOf(wm, props) {
-  // ⭐項目単位でカード値へフォールバックする (Codex PR4 #1: マスタ行が「動画だけ」でも、
-  //   カードに載っている資材・入数の表示を消さない)。version はマスタ行の有無で決まる
-  const card = {
+  return mergeMaster(wm, {
     material_code: props['資材セットID'] || null, storage_container: props['収納容器'] || null,
     units_per_container: props['入数'] ?? null, process_count: props['工程数'] ?? null, note: props['備考'] || null,
-  };
+  });
+}
+
+/** 同上。アプリ正本のカードはカード側の値が作成時スナップショット (正規化済みの形) */
+export function masterOfTask(wm, snapshot) {
+  const s = snapshot || {};
+  return mergeMaster(wm, {
+    material_code: s.material_code || null, storage_container: s.storage_container || null,
+    units_per_container: s.units_per_container ?? null, process_count: s.process_count ?? null, note: s.note || null,
+  });
+}
+
+function mergeMaster(wm, card) {
+  // ⭐項目単位でカード値へフォールバックする (Codex PR4 #1: マスタ行が「動画だけ」でも、
+  //   カードに載っている資材・入数の表示を消さない)。version はマスタ行の有無で決まる
   const m = wm
     ? { source: 'master', version: wm.version,
         material_code: wm.material_code || card.material_code, storage_container: wm.storage_container || card.storage_container,
@@ -105,12 +119,14 @@ export function classifyMasterEdit(row, fields) {
  * 並び = 急ぎ (在庫日数昇順) → 新商品 → 通常 (在庫日数昇順) → データなし → 販売なし、
  * 同順位は入庫日の古い順 (要件定義 §5)。タブごとの絞り込みは画面側で行う。
  */
-/** 新しい順の候補 (photosByCodeKey) から、自分以外で直近に撮ったカード1件ぶんを取り出す */
-export function previousPhotosOf(candidates, ownPageId, limit = 3) {
-  const others = candidates.filter(p => p.page_id !== ownPageId);
+/** 新しい順の候補 (photosByCodeKey) から、自分以外で直近に撮ったカード1件ぶんを取り出す。
+ *  own = 自分のカードの識別子 (Notion 正本は page_id、アプリ正本は 't'+task_id) */
+export function previousPhotosOf(candidates, own, limit = 3) {
+  const key = (p) => (p.card != null ? p.card : p.page_id);   // 旧形式 (page_id だけ) の呼び出しも通す
+  const others = candidates.filter(p => key(p) !== own);
   if (others.length === 0) return [];
-  const lastPage = others[0].page_id;   // 先頭 = いちばん最近撮った写真 → そのカード
-  return others.filter(p => p.page_id === lastPage).slice(0, limit);
+  const lastCard = key(others[0]);   // 先頭 = いちばん最近撮った写真 → そのカード
+  return others.filter(p => key(p) === lastCard).slice(0, limit);
 }
 
 export function buildList() {
@@ -129,8 +145,10 @@ export function buildList() {
     const sales30 = k ? (ctx.sales30.get(k) ?? null) : null;
     const freeStock = k ? (ctx.freeStock.get(k) ?? null) : null;
     return {
+      id: r.page_id,          // 画面はモードによらず id でカードを指す (アプリ正本では task.id)
       page_id: r.page_id,
       status: r.status,
+      status_label: r.status,
       title: r.title,
       product_code: r.product_code,
       url: r.url,
@@ -178,5 +196,101 @@ export function buildList() {
     try { queueEnsureImages(missingImg, 'いろは作業アプリ'); } catch (e) { console.warn('[iroha-work] 画像解決を飛ばしました:', e.message); }
   }
 
-  return { cards, statuses: LIST_STATUSES, changeTargets: STATUSES };
+  return { mode: 'notion', cards, statuses: LIST_STATUSES, changeTargets: STATUSES };
+}
+
+/**
+ * 一覧 (アプリ正本 = f_iroha_tasks)。buildList と同じ形の cards[] を返すので画面は共通。
+ * 違いは識別子 (id = task.id) と状態 (status = 英語の値・status_label = 表示) と、拠点・保留理由・「今日やる」を持つこと。
+ * 終了 (closed) は含めない (履歴画面で見る — 中原さん 2026-09-03「完了が溜まる一方なのを何とかしたい」)
+ */
+export function buildTaskList({ facility = null } = {}) {
+  const rows = listOpenTasks({ facility });
+  const ctx = enrichContext();
+  const images = productImageMap(rows.map(r => r.product_code));
+  const activeMap = activeSessionsByTask();
+  const estimates = estimateByProduct();
+  const mediaMap = mediaByTask();
+  const prevPhotos = photosByCodeKey();
+  const today = jstToday();
+
+  const cards = rows.map((r) => {
+    let props = {};
+    try { props = JSON.parse(r.payload || '{}'); } catch { /* 壊れた payload は素の表示になるだけ */ }
+    let snapshot = null;
+    try { snapshot = r.master_snapshot ? JSON.parse(r.master_snapshot) : null; } catch { /* 同上 */ }
+    const k = keyOf(r.product_code);
+    const sales30 = k ? (ctx.sales30.get(k) ?? null) : null;
+    const freeStock = k ? (ctx.freeStock.get(k) ?? null) : null;
+    return {
+      id: r.id,
+      page_id: r.notion_page_id,          // Notion 時代の証跡 (詳細のリンク用。無ければ null)
+      status: r.status,                   // 値 (not_started …)
+      status_label: statusLabel(r),       // 表示 (「保留 · ラベル待ち」など)
+      facility_code: r.facility_code,
+      hold_reason_code: r.hold_reason_code,
+      hold_reason_note: r.hold_reason_note,
+      planned_date: r.planned_date,
+      today: r.planned_date === today,
+      version: r.version,
+      migration_review: !!r.migration_review,
+      cancellation_requested_at: r.cancellation_requested_at,
+      title: r.product_name || '(名称なし)',
+      product_code: r.product_code,
+      url: r.notion_page_id ? `https://www.notion.so/${String(r.notion_page_id).replace(/-/g, '')}` : null,
+      qty: r.qty ?? null,
+      arrival: r.arrival_date || null,
+      ar_no: r.ar_no || null,
+      barcode: r.barcode || null,
+      expiry: r.expiry || null,
+      supplier: r.supplier || null,
+      handling: r.handling || null,
+      sales_text: props['過去30日販売数'] || null,
+      external_text: props['外部出し目安'] || null,
+      image_url: images.get(k) || null,
+      master: masterOfTask(k ? ctx.workMaster.get(k) : null, snapshot),
+      live: { sales30, free_stock: freeStock },
+      priority: priorityOf(sales30, freeStock),
+      active: activeMap.get(r.id) || [],
+      estimate: (k && estimates.get(k)) || null,
+      media: mediaMap.get(r.id) || [],
+      previous_photos: previousPhotosOf(k ? (prevPhotos.get(k) || []) : [], `t${r.id}`),
+    };
+  });
+
+  // 並び: 今日やる → 優先度 (急ぎ→新商品→通常→データなし→販売なし) → 在庫日数 → 入庫が古い順
+  cards.sort((a, b) => {
+    if (a.today !== b.today) return a.today ? -1 : 1;
+    const ra = PRIORITY_RANK[a.priority.kind] ?? 9;
+    const rb = PRIORITY_RANK[b.priority.kind] ?? 9;
+    if (ra !== rb) return ra - rb;
+    const da = a.priority.days ?? Infinity;
+    const db_ = b.priority.days ?? Infinity;
+    if (da !== db_) return da - db_;
+    const aa = a.arrival || '9999-99-99';
+    const ab = b.arrival || '9999-99-99';
+    if (aa !== ab) return aa < ab ? -1 : 1;
+    return String(a.title).localeCompare(String(b.title), 'ja');
+  });
+
+  const missingImg = [...new Set(cards.filter(c => c.product_code && !c.image_url).map(c => c.product_code))];
+  if (missingImg.length > 0) {
+    try { queueEnsureImages(missingImg, 'いろは作業アプリ'); } catch (e) { console.warn('[iroha-work] 画像解決を飛ばしました:', e.message); }
+  }
+
+  return {
+    mode: 'app',
+    cards,
+    statuses: OPEN_STATUSES.map(s => ({ value: s, label: STATUS_LABEL[s] })),
+    transitions: TRANSITIONS,
+    holdReasons: HOLD_REASONS.map(v => ({ value: v, label: HOLD_LABEL[v] })),
+    closeReasons: CLOSE_REASONS.map(v => ({ value: v, label: CLOSE_LABEL[v] })),
+    facilities: listFacilities(),
+    today,
+  };
+}
+
+/** JST の今日 (YYYY-MM-DD)。「今日やる」の判定に使う */
+export function jstToday(now = new Date()) {
+  return new Date(now.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 }
