@@ -137,6 +137,7 @@ export function buildList() {
   const estimates = estimateByProduct();
   const mediaMap = mediaByPage();
   const prevPhotos = photosByCodeKey();
+  const zStock = zStockMap();
 
   const cards = rows.map((r) => {
     let props = {};
@@ -166,6 +167,10 @@ export function buildList() {
       master: masterOf(k ? ctx.workMaster.get(k) : null, props),
       live: { sales30, free_stock: freeStock },
       priority: priorityOf(sales30, freeStock),
+      plan_hours: planHours(props['数量'], masterOf(k ? ctx.workMaster.get(k) : null, props).process_count),
+      boxes: neededBoxes(props['数量'], masterOf(k ? ctx.workMaster.get(k) : null, props).units_per_container,
+        k && zStock.get(k) ? zStock.get(k).stock : 0, k && zStock.get(k) ? zStock.get(k).allocated : 0),
+      z_stock: k && zStock.get(k) ? zStock.get(k).stock : null,
       // 作業時間: いま作業中の人 + 過去の実測 (カード単位合計の平均。1回だけなら「前回」表示)
       active: activeMap.get(r.page_id) || [],
       estimate: (k && estimates.get(k)) || null,
@@ -212,6 +217,7 @@ export function buildTaskList({ facility = null } = {}) {
   const estimates = estimateByProduct();
   const mediaMap = mediaByTask();
   const prevPhotos = photosByCodeKey();
+  const zStock = zStockMap();
   const today = jstToday();
 
   const cards = rows.map((r) => {
@@ -222,6 +228,8 @@ export function buildTaskList({ facility = null } = {}) {
     const k = keyOf(r.product_code);
     const sales30 = k ? (ctx.sales30.get(k) ?? null) : null;
     const freeStock = k ? (ctx.freeStock.get(k) ?? null) : null;
+    const master = masterOfTask(k ? ctx.workMaster.get(k) : null, snapshot);
+    const z = k ? zStock.get(k) : null;
     return {
       id: r.id,
       page_id: r.notion_page_id,          // Notion 時代の証跡 (詳細のリンク用。無ければ null)
@@ -248,11 +256,15 @@ export function buildTaskList({ facility = null } = {}) {
       sales_text: props['過去30日販売数'] || null,
       external_text: props['外部出し目安'] || null,
       image_url: images.get(k) || null,
-      master: masterOfTask(k ? ctx.workMaster.get(k) : null, snapshot),
+      master,
       live: { sales30, free_stock: freeStock },
       priority: priorityOf(sales30, freeStock),
       active: activeMap.get(r.id) || [],
       estimate: (k && estimates.get(k)) || null,
+      // 想定作業時間・必要保管箱 (Notion の計算式をそのまま。ボードでは状態ごとに合計する)
+      plan_hours: planHours(r.qty, master.process_count),
+      boxes: neededBoxes(r.qty, master.units_per_container, z ? z.stock : 0, z ? z.allocated : 0),
+      z_stock: z ? z.stock : null,
       media: mediaMap.get(r.id) || [],
       previous_photos: previousPhotosOf(k ? (prevPhotos.get(k) || []) : [], `t${r.id}`),
     };
@@ -315,6 +327,49 @@ export function buildHistory({ from = null, to = null, q = null, limit = 200 } =
     total: countClosedTasks({ from, to, q }),
     limit: lim, from: from || null, to: to || null, q: q || null,
   };
+}
+
+/**
+ * 想定作業時間 (時間)。Notion の計算式そのまま: round(数量 × 工程数 × 5秒 / 3600 × 10) / 10
+ * (1 工程あたり 5 秒。中原さん 2026-09-03 提示)
+ */
+export function planHours(qty, processCount) {
+  const q = Number(qty);
+  const p = Number(processCount);
+  if (!Number.isFinite(q) || !Number.isFinite(p) || q <= 0 || p <= 0) return null;
+  return Math.round((q * p * 5) / 3600 * 10) / 10;
+}
+
+/**
+ * 必要保管箱。Notion の計算式そのまま (中原さん 2026-09-03 提示):
+ *   入数が無ければ空。Z ロケに在庫があればその引当を引いた数、無ければカードの数量を入数で割る。
+ *   割り切れれば「N箱」、余りが出れば「N箱+余り」
+ */
+export function neededBoxes(qty, unitsPerContainer, zStock = 0, zAllocated = 0) {
+  const per = Number(unitsPerContainer);
+  if (!Number.isFinite(per) || per <= 0) return null;
+  const z = Number(zStock) || 0;
+  const base = z > 0 ? z - (Number(zAllocated) || 0) : Number(qty);
+  if (!Number.isFinite(base) || base < 0) return null;
+  const boxes = Math.floor(base / per);
+  const rest = base % per;
+  return rest === 0 ? `${boxes}箱` : `${boxes}箱+${rest}`;
+}
+
+/**
+ * Z ロケ (一時保管) の在庫。商品コードごとに 在庫数・引当数 を合計する。
+ * ⚠Z の見分けは「ロケ または ブロック略称 が Z ではじまる」。Notion 時代の Z在庫数 / Z引当数 に当たる
+ */
+function zStockMap() {
+  const db = getDB();
+  const map = new Map();
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mirror_logizard_stock'").get()) return map;
+  const rows = db.prepare(`SELECT LOWER(TRIM(商品ID)) AS k, SUM(在庫数) AS zaiko, SUM(引当数) AS hikiate
+    FROM mirror_logizard_stock
+    WHERE (ロケ LIKE 'Z%' OR ブロック略称 LIKE 'Z%')
+    GROUP BY LOWER(TRIM(商品ID))`).all();
+  for (const r of rows) if (r.k) map.set(r.k, { stock: Number(r.zaiko) || 0, allocated: Number(r.hikiate) || 0 });
+  return map;
 }
 
 /** JST の今日 (YYYY-MM-DD)。「今日やる」の判定に使う */

@@ -1905,6 +1905,44 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
   ok(TD.listLabelWaits({ taskId: d, openOnly: false }).length === 1 && TD.listLabelWaits({ taskId: 999999, openOnly: false }).length === 0, 'カードで絞れる');
 }
 
+console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式をそのまま)');
+{
+  const S2 = await import('../apps/iroha-work/service.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const db = getDB();
+  // 想定作業時間 = round(数量 × 工程数 × 5 / 3600 × 10) / 10
+  ok(S2.planHours(100, 2) === 0.3, '100個×2工程 = 0.3 時間 (1000秒→0.277…を小数1桁に)');
+  ok(S2.planHours(720, 1) === 1, '720個×1工程 = ちょうど 1 時間');
+  ok(S2.planHours(1, 1) === 0, '小さすぎる場合は 0 (切り捨てでなく四捨五入)');
+  ok(S2.planHours(null, 2) === null && S2.planHours(100, null) === null && S2.planHours(0, 2) === null && S2.planHours(100, 0) === null,
+    '数量か工程数が無い・0 なら出さない');
+  // 必要保管箱 = 入数で割る。Z 在庫があればその引当を引いた数、無ければ数量
+  ok(S2.neededBoxes(100, 10) === '10箱', '割り切れれば「N箱」');
+  ok(S2.neededBoxes(105, 10) === '10箱+5', '余りは「N箱+余り」');
+  ok(S2.neededBoxes(5, 10) === '0箱+5', '入数に満たなければ 0箱+余り');
+  ok(S2.neededBoxes(100, null) === null && S2.neededBoxes(100, 0) === null, '入数が無い・0 なら出さない (Notion と同じ)');
+  ok(S2.neededBoxes(100, 10, 30, 5) === '2箱+5', 'Z 在庫があれば Z在庫−Z引当 で計算 (30−5=25 → 2箱+5)');
+  ok(S2.neededBoxes(100, 10, 0, 0) === '10箱', 'Z 在庫が 0 なら数量で計算');
+  ok(S2.neededBoxes(100, 10, 20, 20) === '0箱', 'Z 在庫が全部引当済みなら 0箱');
+
+  // 一覧のカードに乗る
+  const t = TD.upsertTaskFromImport({ notion_page_id: 'plan-1', status: 'not_started', destination_id: 9301,
+    product_code: 'PLAN-A', product_name: '想定時間テスト', qty: 100, facility_code: 'iroha',
+    master_snapshot: { units_per_container: 10, process_count: 2 } }, { batchId: 'test-plan' }).id;
+  clearEnrichCache();
+  const card = S2.buildTaskList().cards.find(c => c.id === t);
+  ok(card && card.plan_hours === 0.3 && card.boxes === '10箱', '一覧のカードに想定作業時間と必要保管箱が乗る');
+  // Z ロケの在庫があれば、そちらで数える
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
+  db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('PLAN-A', '想定時間テスト', 'Z01-001-001-01', 'Z01', '良品', 30, 5, ?, ?)`).run(new Date().toISOString(), new Date().toISOString());
+  clearEnrichCache();
+  const card2 = S2.buildTaskList().cards.find(c => c.id === t);
+  ok(card2.boxes === '2箱+5' && card2.z_stock === 30, 'Z ロケに在庫があれば、その分で必要保管箱を出す');
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
+  clearEnrichCache();
+}
+
 console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリックは委譲する)');
 {
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
@@ -1947,6 +1985,13 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function renderLwSaveState/.test(html) && /renderLwSaveState\(\);/.test(html), 'ラベル待ちを開いたままでも保存ボタンが正本に追随する');
   ok(/if \(!isApp\(\)\) \{ \$\('#lwMsg'\)\.textContent = '下見なので保存できません/.test(html), '保存の入口でも下見なら止める');
   ok(/btn\.disabled = !isApp\(\);   \/\/ 保存中に正本が変わっていたら/.test(html), '保存後にボタンを無条件で戻さない');
+  // 実機FB (2026-09-03): ボードに写真・項目タップで変更・想定作業時間の合計
+  ok(/<div class="th">' \+ thumbHtml\(c\) \+ '<\/div>/.test(html), 'ボードのカードに写真を出す');
+  ok(!/onclick="openMaster/.test(html) && /data-reg="/.test(html), '作業のやり方は項目タップで変更 (編集ボタンなし)');
+  ok(/\+ \(empty \? '＋ 登録' : '✎ 変更'\) \+/.test(html), '値があれば「変更」、無ければ「登録」と出す');
+  ok(!/mvVideo/.test(html.replace(/\/\/.*$/gm, '')), '作り方どうがは画面から外した (コメントだけ残す)');
+  ok(/const hours = mine\.reduce/.test(html), 'ボードの列に想定作業時間の合計を出す');
+  ok(/kv\('必要保管箱', c\.boxes\)/.test(html) && /kv\('想定作業時間'/.test(html), '詳細に必要保管箱と想定作業時間を出す');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

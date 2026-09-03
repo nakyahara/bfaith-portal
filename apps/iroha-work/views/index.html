@@ -813,6 +813,8 @@ function renderList() {
   $('#list').innerHTML = cards.map(c => {
     const meta = [
       c.qty != null ? '<b>' + esc(c.qty) + '</b> 個' : null,
+      c.boxes ? esc(c.boxes) : null,
+      c.plan_hours != null ? '⏱ ' + esc(c.plan_hours) + 'h' : null,
       c.arrival ? '入庫 ' + esc(c.arrival) : null,
       masterSummary(c) || null,
     ].filter(Boolean).join(' ・ ');
@@ -957,7 +959,10 @@ function renderBoard() {
     const mine = cards.filter(c => c.status === st.value);
     const canBulk = isApp() && st.value === 'ready_for_stocking' && mine.length > 0;
     const body = mine.length === 0 ? '<div class="colempty">なし</div>' : mine.map(c => bcardHtml(c, st.value)).join('');
+    // 想定作業時間の合計 (Notion のボードビューで見ていたもの)
+    const hours = mine.reduce((a, c) => a + (Number(c.plan_hours) || 0), 0);
     return '<div class="col"><h3>' + esc(st.label) + ' <span class="n">' + mine.length + '</span>' +
+      (hours > 0 ? '<span class="n">⏱ ' + (Math.round(hours * 10) / 10) + 'h</span>' : '') +
       (canBulk && !bulkIds ? '<button onclick="startBulk()">まとめて棚入完了</button>' : '') + '</h3>' + body + '</div>';
   }).join('');
   $('#board').innerHTML = cols;
@@ -965,7 +970,8 @@ function renderBoard() {
 function bcardHtml(c, status) {
   const selectable = bulkIds && status === 'ready_for_stocking';
   const sel = selectable && bulkIds.has(c.id);
-  const meta = [c.qty != null ? c.qty + ' 個' : null, c.arrival ? '入庫 ' + c.arrival : null,
+  const meta = [c.qty != null ? c.qty + ' 個' : null, c.boxes || null,
+    c.plan_hours != null ? '⏱ ' + c.plan_hours + 'h' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
   return '<div class="bcard' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
@@ -1279,6 +1285,8 @@ function renderDetail(c) {
           ? m.storage_container + 'に ' + m.units_per_container + '個ずつ'
           : m.storage_container, { miss: missSet.has('保管箱') || missSet.has('入数'), reg: 'storage_container' }) +
       kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程'), reg: 'process_count' }) +
+      kv('必要保管箱', c.boxes) +
+      kv('想定作業時間', c.plan_hours != null ? c.plan_hours + ' 時間' : null) +
       kv('気をつけること', m.note, { reg: 'note' }) +
       kv('期限', c.expiry ? c.expiry : '期限シールなし') +
       kv('参考', [prio, ...live].join(' ・ ')) +
