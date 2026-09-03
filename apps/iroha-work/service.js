@@ -13,11 +13,11 @@
 import { buildEnrichContext } from '../inbound-check/notion-sync.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
-import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct } from './db.js';
+import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask } from './db.js';
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, HOLD_REASONS, HOLD_LABEL, CLOSE_REASONS, CLOSE_LABEL, statusLabel } from './tasks.js';
-import { listOpenTasks, listFacilities } from './tasks-db.js';
+import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks } from './tasks-db.js';
 
 // 「急ぎ」の線引き: 在庫切れ、または残り在庫日数がこれ以下
 export const URGENT_DAYS = 3;
@@ -287,6 +287,33 @@ export function buildTaskList({ facility = null } = {}) {
     closeReasons: CLOSE_REASONS.map(v => ({ value: v, label: CLOSE_LABEL[v] })),
     facilities: listFacilities(),
     today,
+  };
+}
+
+/**
+ * 履歴 (終了したタスク)。一覧には出さないが DB には残す — 中原さん 2026-09-03「完了が溜まる一方なのを何とかしたい」→
+ * 期間と検索で絞って見る画面のためのデータ。作業時間の合計も出す (次の目安になる)
+ */
+export function buildHistory({ from = null, to = null, q = null, limit = 200 } = {}) {
+  const lim = Math.max(1, Math.min(500, Number(limit) || 200));
+  const rows = listClosedTasks({ from, to, q, limit: lim });
+  const secs = workSecondsByTask(rows.map((r) => r.id));
+  const facilities = listFacilities(true);
+  const facName = (code) => (facilities.find((f) => f.code === code) || {}).name || code;
+  return {
+    rows: rows.map((r) => {
+      const w = secs.get(r.id) || null;
+      return {
+        id: r.id, title: r.product_name || '(名称なし)', product_code: r.product_code, qty: r.qty ?? null,
+        arrival: r.arrival_date || null, ar_no: r.ar_no || null,
+        facility_code: r.facility_code, facility_name: facName(r.facility_code),
+        close_reason: r.close_reason, status_label: statusLabel(r),
+        closed_at: r.closed_at, closed_by: r.closed_by,
+        work_seconds: w ? w.seconds : 0, workers: w ? w.people : 0,
+      };
+    }),
+    total: countClosedTasks({ from, to, q }),
+    limit: lim, from: from || null, to: to || null, q: q || null,
   };
 }
 

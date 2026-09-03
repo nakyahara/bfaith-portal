@@ -34,12 +34,12 @@ import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES 
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
 import { countTasksByStatus, listTasksNeedingReview, listOrphans } from './tasks-db.js';
 import { OPEN_STATUSES } from './tasks.js';
-import { buildList, buildTaskList, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask } from './service.js';
+import { buildList, buildTaskList, buildHistory, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask } from './service.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel } from './tasks.js';
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
   listLabelWaits, upsertLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent,
-  startTaskSession, countChangesSince, switchSourceOfTruth,
+  startTaskSession, countChangesSince, switchSourceOfTruth, bulkCloseReady,
 } from './tasks-db.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
@@ -423,6 +423,50 @@ router.post('/api/review-cleared', checkOrigin, api((req, res) => {
   const r = clearMigrationReview({ taskId: reviewTaskId, expectVersion: req.body?.expect_version, actor: `${w.worker.display_name} (いろはアプリ)` });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
   res.json({ ok: true, task: publicTask(r.task) });
+}));
+
+/**
+ * まとめて棚入完了 (アプリ正本のみ)。棚入待ちのカードだけを 終了 (棚入完了) にする。
+ * 職員限定 (transitionNeedsStaff('ready_for_stocking','closed') と同じ扱い): ポータルのセッション、
+ * または職員の作業者 + PIN。選んだ後に状態が変わっていた分は skipped で返す
+ */
+router.post('/api/bulk-stocked', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  if (!hasSessionAccess(req)) {
+    if (w.worker.worker_type !== 'staff') return res.status(403).json({ ok: false, error: 'staff_required', message: '棚入完了にできるのは職員だけです (職員の名前を選び、PINを入れてください)' });
+    const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
+    if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
+  }
+  const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  const ids = raw.map((v) => parseTaskId(v));
+  if (ids.some((v) => v == null)) return res.status(400).json(BAD_TASK_ID);
+  const r = bulkCloseReady({
+    taskIds: ids, actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
+    workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json(r);
+  res.json(r);
+}));
+
+/** 履歴 (終了したカード。一覧には出さないので、ここで期間・商品名で探す)。アプリ正本のみ */
+router.get('/api/history', api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const day = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : null);
+  const from = day(req.query.from);
+  const to = day(req.query.to);
+  res.json({
+    ok: true,
+    // closed_at は UTC の ISO。JST の日付で絞るので 9 時間ずらす (from の 00:00 JST = 前日 15:00 UTC)
+    ...buildHistory({
+      from: from ? new Date(`${from}T00:00:00+09:00`).toISOString() : null,
+      to: to ? new Date(`${to}T00:00:00+09:00`).toISOString() : null,
+      q: req.query.q ? String(req.query.q).slice(0, 100) : null,
+      limit: req.query.limit,
+    }),
+    fromDate: from, toDate: to,
+  });
 }));
 
 /** ラベル待ち (一覧・登録・更新)。アプリ正本のみ */
