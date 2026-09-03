@@ -27,10 +27,11 @@ import {
   addPlacement, revokePlacement, adjustPlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage, setRowSendQty,
   exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
+  listProductImages,
 } from './db.js';
 import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
-import { ensureRunImages } from './images.js';
+import { ensureRunImages, diagnoseRunImages } from './images.js';
 
 /** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
 const kickImages = (runId) => { ensureRunImages(runId).catch((e) => console.warn('[fba-box] images', e.message)); };
@@ -382,7 +383,7 @@ router.post('/api/placements', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
-/** 割当の取消。利用者=自端末の直近のみ / 職員=PIN+理由 */
+/** 割当の取消 (入力ミスの訂正なので PIN 不要)。as_staff を付けた場合だけ職員PIN+理由 */
 router.post('/api/placements/:id(\\d+)/revoke', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
@@ -403,7 +404,7 @@ router.post('/api/placements/:id(\\d+)/revoke', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
-/** 割当の数の修正 (取消 + 入れ直しを 1 回で)。権限は取消と同じ (利用者 = 自端末の直近 / 職員 = as_staff+PIN+理由) */
+/** 割当の数の修正 (取消 + 入れ直しを 1 回で)。入力ミスの訂正なので PIN 不要 (中原さん 9/3) */
 router.post('/api/placements/:id(\\d+)/adjust', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
@@ -688,6 +689,23 @@ router.get('/admin/runs/:id(\\d+)', requireSession, api((req, res) => {
   const state = getRunState(Number(req.params.id));
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
   res.json({ ok: true, ...state });
+}));
+
+/** 商品画像の状態 (なぜ出ないかの切り分け) */
+router.get('/admin/runs/:id(\\d+)/images', requireSession, api(async (req, res) => {
+  const state = getRunState(Number(req.params.id));
+  if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
+  const diag = await diagnoseRunImages(Number(req.params.id), state.rows.filter((r) => r.match_state !== 'retired'));
+  const cache = new Map(listProductImages(diag.items.map((x) => x.fnsku)).map((c) => [c.fnsku, c]));
+  res.json({ ok: true, ...diag, items: diag.items.map((x) => ({ ...x, cache: cache.get(String(x.fnsku).toUpperCase()) || null })) });
+}));
+
+/** 商品画像を今すぐ取り直す (キャッシュの再試行待ちを無視) */
+router.post('/admin/runs/:id(\\d+)/images/refresh', requireSession, checkOrigin, api(async (req, res) => {
+  const state = getRunState(Number(req.params.id));
+  if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
+  const r = await ensureRunImages(Number(req.params.id), { force: true });
+  res.json({ ok: true, result: r });
 }));
 
 // ─── 本社: 出荷前チェック → Excel 出力 → STA アップ済み (PR2) ───

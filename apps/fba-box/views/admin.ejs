@@ -90,6 +90,7 @@
                 <button class="btn-sm run-activate" data-id="<%= r.id %>">✅ 有効化 (iPadに出す)</button>
               <% } %>
               <% if (r.status === 'active' || r.status === 'done') { %>
+                <button class="btn-sm run-images" data-id="<%= r.id %>">🖼 画像</button>
                 <button class="btn-sm run-excel" data-id="<%= r.id %>">📎 Excel添付</button>
                 <button class="btn-sm run-export" data-id="<%= r.id %>">📤 Excel出力</button>
                 <a class="btn-sm" href="<%= base %>/print/boxes?run=<%= r.id %>" target="_blank">🖨 箱札</a>
@@ -269,6 +270,40 @@
       setMsg(msg, 'ok', t);
       setTimeout(() => location.reload(), j.issues.length > 0 ? 8000 : 1500);
     });
+
+    // 商品画像の状態 (なぜ出ないか) と取り直し
+    document.querySelectorAll('.run-images').forEach(b => b.addEventListener('click', async () => {
+      const runId = Number(b.dataset.id);
+      const out = $('#run-detail-out');
+      out.innerHTML = '読み込み中…';
+      const r = await fetch(`${BASE}/admin/runs/${runId}/images`);
+      const j = await r.json().catch(() => ({ ok: false }));
+      if (!j.ok) { out.innerHTML = `<p class="msg err">${escH(j.message || '読み込めませんでした')}</p>`; return; }
+      const lr = j.lastRun;
+      out.innerHTML = `<h3 style="margin:14px 0 6px">🖼 商品画像 — 回 #${runId}</h3>
+        <p class="hint">
+          設定: ${j.configured ? '✅ miniPC 接続 (WAREHOUSE_SERVICE_TOKEN あり)' : '<b class="ng">⛔ WAREHOUSE_SERVICE_TOKEN が未設定 — Render の環境変数を確認してください</b>'} / ${escH(j.warehouseUrl)}<br>
+          SKU属性 (FNSKU→ASIN): ${j.attrs.error ? `<b class="ng">読めません: ${escH(j.attrs.error)}</b>` : `${j.attrs.count} 件`}<br>
+          画像あり <b>${j.counts.withImage}</b> / ${j.counts.total} 商品 ${j.counts.noAsin ? `<b class="ng">(ASIN 不明 ${j.counts.noAsin})</b>` : ''}<br>
+          ${lr ? `直近の取得 (${escH((lr.at || '').slice(11, 16))}): ${lr.skipped ? `skip=${escH(lr.skipped)} ${escH(lr.message || lr.error || '')}` : `取得${lr.fetched} / 画像なし${lr.none} / 失敗${lr.failed}${lr.noAsin ? ` (ASIN不明 ${lr.noAsin})` : ''}`}${(lr.errors || []).length ? '<br>' + lr.errors.map(escH).join('<br>') : ''}` : '(まだ取得していません)'}
+        </p>
+        <div class="row"><button id="img-refresh">🔄 今すぐ取り直す</button></div>
+        <table class="fbx-list" style="margin-top:8px"><tr><th>画像</th><th>FNSKU</th><th>SKU</th><th>ASIN</th><th>状態</th></tr>
+        ${j.items.map(x => `<tr>
+          <td>${x.imageUrl ? `<img src="${escH(x.imageUrl)}" referrerpolicy="no-referrer" style="width:40px;height:40px;object-fit:contain">` : '—'}</td>
+          <td><code>${escH(x.fnsku)}</code></td><td>${escH(x.sku || '')}</td>
+          <td>${x.asin ? `${escH(x.asin)} <small>(${escH(x.asinFrom)})</small>` : '<b class="ng">不明</b>'}</td>
+          <td>${x.cache ? `${escH(x.cache.status)}${x.cache.error_message ? ' — ' + escH(x.cache.error_message) : ''}` : '未取得'}</td></tr>`).join('')}
+        </table>`;
+      $('#img-refresh').addEventListener('click', async () => {
+        $('#img-refresh').disabled = true;
+        $('#img-refresh').textContent = '取得中… (商品数 × 0.6 秒)';
+        const jj = await post(`/admin/runs/${runId}/images/refresh`);
+        alert(jj.ok ? `取得: ${jj.result.fetched} / 画像なし: ${jj.result.none} / 失敗: ${jj.result.failed}${jj.result.skipped ? ` (skip=${jj.result.skipped} ${jj.result.message || ''})` : ''}` : (jj.message || '失敗'));
+        b.click();
+      });
+      out.scrollIntoView({ behavior: 'smooth' });
+    }));
 
     // 納品回の作成 (Excel なし) — picking 実行から
     $('#pk-go2').addEventListener('click', async () => {

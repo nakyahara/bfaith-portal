@@ -631,24 +631,14 @@
     dlg.querySelector('#d-cw').addEventListener('click', () => pickRowWorker(r, 'check_worker'));
     dlg.querySelector('#d-short').addEventListener('click', () => shortageDialog(r));
     dlg.querySelector('#d-sendqty').addEventListener('click', () => sendQtyDialog(r));
-    // 記録の修正・取消 (利用者 = 自分の端末の直近 10 分・開いた箱。それ以外は職員PIN に自動で切り替え)
+    // 記録の修正・取消 = 入力ミスの訂正なので PIN は要らない (中原さん 9/3)。閉じた箱のときだけ量り直しを案内
     dlg.querySelectorAll('.adj').forEach(btn => btn.addEventListener('click', () => adjustDialog(r, Number(btn.dataset.id), Number(btn.dataset.qty))));
     dlg.querySelectorAll('.rvk').forEach(btn => btn.addEventListener('click', async () => {
       if (!worker) { pickWorker(); return; }
       if (!confirm('この記録を取り消しますか?')) return;
       const j2 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: worker.id });
-      if (!j2.ok && j2.error === 'staff_required') {
-        staffPinPrompt(async (sw, pin) => {
-          const reason = prompt('取消の理由');
-          if (!reason) return;
-          const j3 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: sw.id, pin, reason, as_staff: true });
-          if (!j3.ok) alert(j3.message);
-          else if (boxClosed(mine.find(p => p.id === Number(btn.dataset.id))?.box_id)) alert('閉じた箱の中身を取り消しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
-          await refresh(true); openRowDialog(rowId);
-        });
-        return;
-      }
       if (!j2.ok) alert(j2.message);
+      else if (j2.boxClosed) alert('閉じた箱の中身を取り消しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
       await refresh(true); openRowDialog(rowId);
     }));
     dlg.querySelector('#d-add')?.addEventListener('click', async () => {
@@ -806,7 +796,7 @@
           <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #F1F3F5">
             <span>${esc(shortName(p.product_name, 18))} <small style="color:#868E96">${esc(fn4(p.fnsku))}${p.expiry ? ' / ' + esc(p.expiry) : ''}${p.placement_layer ? ' / ' + layJa[p.placement_layer] : ''}</small></span>
             <span><b>${p.qty}個</b>
-              ${b.status === 'open' ? `<button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px; margin-left:8px">↩</button>` : ''}
+              <button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px; margin-left:8px">↩</button>
             </span>
           </div>`).join('')}
       </div>
@@ -838,18 +828,9 @@
     dlg.querySelectorAll('.rvk').forEach(btn => btn.addEventListener('click', async () => {
       if (!worker) { pickWorker(); return; }
       if (!confirm('この記録を取り消しますか?')) return;
-      let j2 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: worker.id });
-      if (!j2.ok && j2.error === 'staff_required') {
-        staffPinPrompt(async (staffWorker, pin) => {
-          const reason = prompt('取消の理由');
-          if (!reason) return;
-          const j3 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: staffWorker.id, pin, reason, as_staff: true });
-          if (!j3.ok) alert(j3.message);
-          closeDialog(); openBoxDialog(boxId);
-        });
-        return;
-      }
+      const j2 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: worker.id });
       if (!j2.ok) alert(j2.message);
+      else if (j2.boxClosed) alert('閉じた箱の中身を取り消しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
       closeDialog(); openBoxDialog(boxId);
     }));
   }
@@ -955,27 +936,12 @@
       <input class="qtyin" id="a-qty" type="tel" inputmode="numeric" value="${currentQty}">
       <div style="margin-top:14px"><button class="bigbtn" id="a-go">この数に直す</button></div>
       <div class="msg" id="a-msg"></div>`);
-    const send = async (extra) => {
-      const qty = Number(dlg.querySelector('#a-qty').value);
-      const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
-      return apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId, ...extra });
-    };
     dlg.querySelector('#a-go').addEventListener('click', async () => {
       const msg = dlg.querySelector('#a-msg');
       const qty = Number(dlg.querySelector('#a-qty').value);
       if (!Number.isInteger(qty) || qty < 0) { msg.className = 'msg err'; msg.textContent = '0 以上の整数で入れてください'; return; }
-      let j = await send({});
-      if (!j.ok && j.error === 'staff_required') {
-        // 時間が経った・他の端末・閉じた箱 → 職員PIN
-        staffPinPrompt(async (sw, pin) => {
-          const j2 = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: sw.id, pin, as_staff: true, reason: '数の修正', qty,
-            request_id: (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2)) });
-          if (!j2.ok) alert(j2.message || '直せませんでした');
-          else if (j2.boxClosed) alert('閉じた箱の中身を直しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
-          await refresh(true); openRowDialog(row.id);
-        });
-        return;
-      }
+      const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+      const j = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId });
       if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message || '直せませんでした'; return; }
       if (j.boxClosed) alert('閉じた箱の中身を直しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
       closeDialog();

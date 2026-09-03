@@ -23,8 +23,6 @@ const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('h
 const enrollHash = (c) => crypto.createHash('sha256').update('fbx-enroll:' + String(c)).digest('hex');
 
 export const DEVICE_TTL_MS = 400 * 24 * 3600 * 1000;
-/** 利用者が自分の割当を取り消せる猶予 (それを過ぎたら職員PIN) */
-export const SELF_UNDO_MS = 10 * 60 * 1000;
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'fba-box.db');
@@ -399,6 +397,7 @@ export function createTables(d = getDB()) {
   addColumn('fbx_exports', 'sta_uploaded_by', 'TEXT');
   // 不足の内訳 (理由別 [{reason, qty}])。作業完了時の自動確定で既存の不足 (例: 破損 2) と混ざるときに理由を失わない (Codex R13 #2)
   addColumn('fbx_row_work', 'shortage_detail', 'TEXT');
+  addColumn('fbx_product_images', 'error_message', 'TEXT');   // 画像が出ない理由 (管理画面の診断)
   d.exec(`UPDATE fbx_exports SET sta_uploaded_at = (SELECT r.sta_uploaded_at FROM fbx_runs r WHERE r.sta_export_id = fbx_exports.id)
     WHERE sta_uploaded_at IS NULL AND EXISTS (SELECT 1 FROM fbx_runs r WHERE r.sta_export_id = fbx_exports.id AND r.sta_uploaded_at IS NOT NULL)`);
 
@@ -841,11 +840,22 @@ export function listRowsNeedingImages(runId, { retryAfterMs = 24 * 3600 * 1000, 
       GROUP BY w.fnsku LIMIT ?`).all(Number(runId), cutoff, Number(limit));
 }
 
-export function upsertProductImage({ fnsku, asin, url, status }) {
+export function upsertProductImage({ fnsku, asin, url, status, error = null }) {
   const st = ['ok', 'none', 'error'].includes(status) ? status : (url ? 'ok' : 'none');
-  getDB().prepare(`INSERT INTO fbx_product_images (fnsku, asin, image_url, status, fetched_at) VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(fnsku) DO UPDATE SET asin = COALESCE(excluded.asin, fbx_product_images.asin), image_url = excluded.image_url, status = excluded.status, fetched_at = excluded.fetched_at`)
-    .run(String(fnsku).trim().toUpperCase(), asin || null, url || null, st, utcNow());
+  getDB().prepare(`INSERT INTO fbx_product_images (fnsku, asin, image_url, status, error_message, fetched_at) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(fnsku) DO UPDATE SET asin = COALESCE(excluded.asin, fbx_product_images.asin), image_url = excluded.image_url,
+      status = excluded.status, error_message = excluded.error_message, fetched_at = excluded.fetched_at`)
+    .run(String(fnsku).trim().toUpperCase(), asin || null, url || null, st, error ? String(error).slice(0, 300) : null, utcNow());
+}
+
+/** 画像キャッシュの状態 (管理画面の診断用) */
+export function listProductImages(fnskus) {
+  const list = [...new Set((fnskus || []).map((f) => String(f).trim().toUpperCase()).filter(Boolean))];
+  if (list.length === 0) return [];
+  const out = [];
+  const stmt = getDB().prepare('SELECT * FROM fbx_product_images WHERE fnsku = ?');
+  for (const f of list) { const r = stmt.get(f); if (r) out.push(r); }
+  return out;
 }
 
 export function listRuns(limit = 30) {
@@ -1139,8 +1149,11 @@ function rowExcludedError(row) {
 }
 
 /**
- * 割当の取消 (論理)。利用者 = 自分の端末の直近 SELF_UNDO_MS 以内のみ。職員 (byStaff) = いつでも理由付き。
- * クローズ済みの箱の割当は職員のみ
+ * 割当の取消 (論理)。
+ * 入れる数を間違えたときの訂正は現場で完結させる (中原さん 9/3: 「間違って個数を入れて修正する場合に PIN は要らない」)
+ * → 端末・経過時間・箱の開閉では縛らない。誰が・いつ・どの端末で取り消したかは fbx_events に残る。
+ * 職員として明示的に行う場合 (byStaff) だけ理由を必須にする。
+ * ⚠ 閉じた箱の中身を変えると実測重量が合わなくなる → 呼び出し側 (adjustPlacement / 画面) が量り直しを案内する
  */
 export function revokePlacement({ placementId, byStaff = false, reason, worker, deviceKey, deviceLabel }) {
   const d = getDB();
@@ -1150,18 +1163,8 @@ export function revokePlacement({ placementId, byStaff = false, reason, worker, 
       .get(Number(placementId));
     if (!p) return { ok: false, error: 'not_found', message: '割当が見つかりません' };
     if (p.revoked_at) return { ok: true, already: true };
-    if (p.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
-    if (!byStaff) {
-      if (p.device_key !== String(deviceKey)) {
-        return { ok: false, error: 'staff_required', message: '他の端末の記録の取り消しは職員のみです' };
-      }
-      if (Date.now() - Date.parse(p.created_at) > SELF_UNDO_MS) {
-        return { ok: false, error: 'staff_required', message: '時間が経った記録の取り消しは職員のみです (職員を呼んでください)' };
-      }
-      if (p.box_status === 'closed') {
-        return { ok: false, error: 'staff_required', message: '閉じた箱の記録の取り消しは職員のみです' };
-      }
-    } else if (!String(reason || '').trim()) {
+    if (p.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません (本社が完了にしています)' };
+    if (byStaff && !String(reason || '').trim()) {
       return { ok: false, error: 'reason_required', message: '取消の理由を入力してください' };
     }
     d.prepare('UPDATE fbx_placements SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ?')
@@ -1169,16 +1172,16 @@ export function revokePlacement({ placementId, byStaff = false, reason, worker, 
     bumpRunVersion(d, p.run_id);
     logEvent({ runId: p.run_id, action: 'placement_revoke', targetType: 'placement', targetId: p.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
-      payload: { rowId: p.row_id, boxId: p.box_id, qty: p.qty, byStaff, reason: reason || null } }, d);
-    return { ok: true, placed: placedOf(d, p.row_id) };
+      payload: { rowId: p.row_id, boxId: p.box_id, qty: p.qty, byStaff, reason: reason || null,
+        otherDevice: p.device_key !== String(deviceKey ?? ''), boxClosed: p.box_status === 'closed' } }, d);
+    return { ok: true, placed: placedOf(d, p.row_id), boxClosed: p.box_status === 'closed' };
   }).immediate();
 }
 
 /**
- * 割当の数の修正 (中原さん 9/3: 入れる数を間違えて押したとき、リストの商品から直せるように)。
+ * 割当の数の修正 (中原さん 9/3: 入れる数を間違えて押したとき、リストの商品から直せるように。PIN は要らない)。
  * = 元の記録の取消 + 同じ箱・同じ期限・同じ配置で新しい数の記録 を 1 トランザクションで行う (append-only は保つ)。
- * 取消の権限規則はそのまま (利用者 = 自端末の直近 SELF_UNDO_MS 以内・開いた箱 / 職員 = 理由付きでいつでも)。
- * 新しい数 0 = 取消だけ
+ * 新しい数 0 = 取消だけ。閉じた箱でも直せる (重さが変わるので画面で量り直しを案内する)
  */
 export function adjustPlacement({ placementId, qty, byStaff = false, reason, worker, deviceKey, deviceLabel, requestId }) {
   const q = Number(qty);
@@ -1196,9 +1199,9 @@ export function adjustPlacement({ placementId, qty, byStaff = false, reason, wor
       const rv = revokePlacement({ placementId: p.id, byStaff, reason: reason || (byStaff ? '数の修正' : null), worker, deviceKey, deviceLabel });
       if (!rv.ok) return rv;
       if (q === 0) return { ok: true, placementId: null, placed: rv.placed, revokedId: p.id, from: p.qty, to: 0, boxClosed };
-      // 閉じた箱の記録は職員だけが直せる (取消側で staff_required になる) → 入れ直しも同じ箱に許可する
+      // 入れ直しは元と同じ箱なので、箱が閉じていても許可する (取消と対で「数の訂正」を成立させる)
       const add = addPlacement({ runId: p.run_id, rowId: p.row_id, boxId: p.box_id, qty: q, expiry: p.expiry, layer: p.placement_layer,
-        worker, deviceKey, deviceLabel, requestId: requestId || `adj-${p.id}-${Date.now()}`, allowClosedBox: byStaff });
+        worker, deviceKey, deviceLabel, requestId: requestId || `adj-${p.id}-${Date.now()}`, allowClosedBox: true });
       if (!add.ok) fail(add);   // 入れ直せない (残数超など) → 取消ごと戻す
       logEvent({ runId: p.run_id, action: 'placement_adjust', targetType: 'placement', targetId: add.placementId,
         workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
