@@ -86,7 +86,8 @@ export function parsePage(page) {
   };
 }
 
-async function queryPages(filter, maxPages) {
+/** Notion DB を filter でページング取得 (移行ツールからも使う)。truncated = 上限で打ち切り */
+export async function queryPages(filter, maxPages) {
   const results = [];
   let cursor = null;
   for (let i = 0; i < maxPages; i++) {

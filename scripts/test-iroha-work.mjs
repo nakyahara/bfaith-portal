@@ -910,5 +910,133 @@ console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動�
   stopSession({ pageId: 'snap-p2', workerId: wS.id, sessionId: sS2.sessionId, reason: 'done' });
 }
 
+console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行・タスク操作');
+{
+  const T = await import('../apps/iroha-work/tasks.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const M = await import('../apps/iroha-work/migrate.js');
+
+  // ── 純粋関数: 写像・遷移・不変条件 ──
+  const map = (s) => T.mapLegacyStatus(s);
+  ok(map('未着手').status === 'not_started' && map('作業中').status === 'in_progress' && map('作業完了').status === 'ready_for_stocking', '未着手/作業中/作業完了 の写像');
+  ok(map('資材不足で作業中断').status === 'on_hold' && map('資材不足で作業中断').hold_reason === 'materials_shortage', '資材不足 → 保留 (理由つき)');
+  ok(map('次回').status === 'not_started' && map('').status === 'not_started' && map('').confidence === 'inferred', '「次回」と未設定は未着手');
+  ok(map('棚入完了').close_reason === 'stocked' && map('取消').close_reason === 'cancelled' && map('在庫化対象外').close_reason === 'out_of_scope', '完了系は closed + 理由');
+  ok(map('羅針盤').status === 'in_progress' && map('羅針盤').facility === 'rashinban' && map('羅針盤').confidence === 'inferred', '施設名 = その施設に預けて作業中');
+  ok(map('いろは').confidence === 'needs_review' && map('いろは').facility === 'iroha', '「いろは」は意味未確認 → 要確認');
+  ok(map('中断').confidence === 'rejected' && map('中断').status === null, '未知のステータスは取り込まない');
+  ok(T.canTransition('not_started', 'in_progress') && !T.canTransition('not_started', 'ready_for_stocking') && T.canTransition('ready_for_stocking', 'closed') && !T.canTransition('closed', 'not_started'), '許可遷移');
+  ok(T.transitionNeedsStaff('ready_for_stocking', 'closed') && T.transitionNeedsStaff('closed', 'in_progress') && T.transitionNeedsStaff('ready_for_stocking', 'in_progress') && !T.transitionNeedsStaff('not_started', 'in_progress'), '職員限定遷移');
+  ok(T.validateTaskInvariants({ status: 'closed', close_reason: 'stocked', closed_at: 'x' }).length === 0
+    && T.validateTaskInvariants({ status: 'closed' }).length === 2
+    && T.validateTaskInvariants({ status: 'on_hold' }).length === 1
+    && T.validateTaskInvariants({ status: 'on_hold', hold_reason_code: 'other' }).length === 1
+    && T.validateTaskInvariants({ status: 'in_progress', close_reason: 'stocked' }).length === 1, '不変条件 (closed の理由/時刻・on_hold の理由・その他は備考)');
+  ok(T.statusLabel({ status: 'on_hold', hold_reason_code: 'label_shortage' }) === '保留 · ラベル待ち' && T.statusLabel({ status: 'closed', close_reason: 'stocked' }) === '終了 · 棚入完了', '表示ラベル');
+  ok(TD.listFacilities().map(f => f.code).join(',') === 'iroha,rashinban,workcenter,jobsupport,rehas', '拠点の初期値が入っている');
+
+  // ── 移行: 調査 (読むだけ) → dry-run → 本取込 (冪等) → バックフィル → 照合 ──
+  const num = (n) => ({ type: 'number', number: n });
+  const pM1 = mkPage({ status: '未着手', title: '移行A', code: 'MIG-A', qty: 10, props: { destination_id: num(9001) } });
+  const pM2 = mkPage({ status: '羅針盤', title: '移行B (外部)', code: 'MIG-B', qty: 5, props: { destination_id: num(9002) } });
+  const pM3 = mkPage({ status: '棚入完了', title: '移行C (完了)', code: 'MIG-C', qty: 3, props: { destination_id: num(9003) } });
+  const pM4 = mkPage({ status: 'いろは', title: '移行D (要確認)', code: 'MIG-D', qty: 1, props: { destination_id: num(9004) } });
+  const pM5 = mkPage({ status: '中断', title: '移行E (未知)', code: 'MIG-E', qty: 1, props: { destination_id: num(9005) } });
+  const pM6 = mkPage({ status: '作業中', title: '移行F (dest 重複)', code: 'MIG-F', qty: 2, props: { destination_id: num(9001) } });
+  const wM = listIrohaWorkers(true).find(w => w.display_name === 'やまだ');
+  const sM = startSession({ pageId: pM2.id, productCode: 'MIG-B', title: '移行B (外部)', worker: getIrohaWorker(wM.id) });
+  stopSession({ pageId: pM2.id, workerId: wM.id, sessionId: sM.sessionId, reason: 'done' });
+  const before = getDB().prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c;
+  const survey = await M.surveyNotion({ save: false });
+  ok(survey.count === mock.pages.filter(p => !p.archived).length && !survey.truncated, `調査: Notion の全ページを読む (${survey.count}枚)`);
+  ok(survey.byStatus['羅針盤'] === 1 && survey.issues.unknownStatus.some(i => i.pageId === pM5.id) && survey.issues.dupDestination.some(i => i.destinationId === 9001), '調査: ステータス別件数・未知値・destination 重複を検出');
+  ok(getDB().prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === before, '調査は DB を変えない (dry-run)');
+  const plan = M.planImport(survey.pages);
+  const rowOf = (p) => plan.rows.find(r => r.notion_page_id === p.id);
+  ok(rowOf(pM1).mapped_status === 'not_started' && rowOf(pM1).destination_id === 9001 && rowOf(pM1).will_import, 'dry-run: 未着手 → not_started');
+  ok(rowOf(pM2).mapped_status === 'in_progress' && rowOf(pM2).facility_code === 'rashinban' && rowOf(pM2).warnings.includes('started_at_unknown'), 'dry-run: 羅針盤 → 作業中 + 拠点 (開始時刻は不明の警告)');
+  ok(rowOf(pM3).mapped_status === 'closed' && rowOf(pM3).close_reason === 'stocked' && rowOf(pM3).warnings.includes('closed_at_approx'), 'dry-run: 棚入完了 → closed:stocked (終了時刻は近似)');
+  ok(rowOf(pM4).migration_review === 1 && rowOf(pM4).warnings.includes('needs_review'), 'dry-run: 「いろは」は要確認');
+  ok(rowOf(pM5).will_import === false && /未知/.test(rowOf(pM5).skip_reason), 'dry-run: 未知ステータスは取り込まない');
+  ok(rowOf(pM6).destination_id === null && rowOf(pM6).warnings.some(w => w.startsWith('dup_destination')), 'dry-run: destination 重複の 2 枚目は destination_id を外して取り込む');
+  ok(plan.summary.rejected >= 1 && plan.summary.needsReview >= 1 && typeof plan.summary.byMapped['closed:stocked'] === 'number', 'dry-run: サマリ');
+  const csv = M.planToCsv(plan.rows);
+  ok(csv.startsWith('﻿notion_page_id,') && csv.includes('MIG-A'), 'dry-run CSV (BOM つき)');
+
+  const apply1 = M.applyImport(plan.rows, { batchId: 'test-batch-1', actor: 'test' });
+  ok(apply1.inserted === plan.summary.willImport && apply1.skipped === plan.summary.rejected, `本取込: 取込予定 ${plan.summary.willImport} 件が入り、${plan.summary.rejected} 件を飛ばす`);
+  ok(apply1.backfill.sessions >= 1 && TD.getTaskByPageId(pM2.id) && getDB().prepare('SELECT task_id FROM f_iroha_work_sessions WHERE id = ?').get(sM.sessionId).task_id === TD.getTaskByPageId(pM2.id).id, '作業時間の task_id をバックフィル');
+  const tA = TD.getTaskByPageId(pM1.id), tC = TD.getTaskByPageId(pM3.id);
+  ok(tA.status === 'not_started' && tA.destination_id === 9001 && tA.version === 1 && tA.updated_by === 'import:test-batch-1', '取り込まれた行 (import が主体)');
+  ok(tC.status === 'closed' && tC.close_reason === 'stocked' && tC.closed_at && tC.closed_by === 'import', '完了カードは closed で残る');
+  ok(!TD.listOpenTasks().some(t => t.id === tC.id) && TD.listClosedTasks().some(t => t.id === tC.id), 'closed は一覧に出ず、履歴に出る');
+  const apply2 = M.applyImport(plan.rows, { batchId: 'test-batch-2', actor: 'test' });
+  ok(apply2.inserted === 0 && apply2.updated === 0 && apply2.kept === plan.summary.willImport, '2 回取り込んでも増えない・変わらない (冪等)');
+  const rec1 = M.reconcile(plan.rows);
+  ok(rec1.missing.length === 0 && rec1.rejected.length === plan.summary.rejected && rec1.tasksWithPage === plan.summary.willImport, '照合: 欠けなし・取り込まない分は説明できる');
+  ok(TD.listTasksNeedingReview().some(t => t.notion_page_id === pM4.id), '要確認一覧に「いろは」のカードが出る');
+
+  // アプリで変えた状態は、差分取込 (Notion の古い値) で戻らない
+  const moved = TD.changeTaskStatus({ taskId: tA.id, to: 'in_progress', expectVersion: tA.version, actor: 'たにがわ', isStaff: false });
+  ok(moved.ok === true && moved.task.status === 'in_progress' && moved.task.started_at, 'アプリで未着手→作業中 (started_at が付く)');
+  pM1.properties['数量'] = num(11);   // Notion 側で数量だけ直された
+  const survey2 = await M.surveyNotion({ save: false, since: '2026-01-01T00:00:00Z' });
+  ok(mock.lastFilters.some(f => f && f.timestamp === 'last_edited_time'), '差分取込は last_edited_time で絞る');
+  const apply3 = M.applyImport(M.planImport(survey2.pages).rows, { batchId: 'test-batch-3', actor: 'test' });
+  const tA2 = TD.getTask(tA.id);
+  ok(apply3.updated >= 1 && tA2.qty === 11 && tA2.status === 'in_progress' && tA2.updated_by === 'たにがわ', '差分取込: 商品情報は追随し、アプリで変えた状態は戻さない');
+
+  // ── タスク操作 ──
+  const bad1 = TD.changeTaskStatus({ taskId: tA2.id, to: 'ready_for_stocking', expectVersion: 0, actor: 'x' });
+  ok(bad1.error === 'conflict' && bad1.current, 'version が違えば conflict (最新を返す)');
+  ok(TD.changeTaskStatus({ taskId: tA2.id, to: 'not_started', expectVersion: tA2.version }).error === 'bad_transition', '作業中→未着手は許可されない');
+  const holdNo = TD.changeTaskStatus({ taskId: tA2.id, to: 'on_hold', expectVersion: tA2.version });
+  ok(holdNo.error === 'hold_reason_required', '保留には理由が必要');
+  const held = TD.changeTaskStatus({ taskId: tA2.id, to: 'on_hold', expectVersion: tA2.version, holdReason: 'label_shortage', workerId: wM.id, workerName: 'やまだ' });
+  ok(held.ok && held.task.status === 'on_hold' && held.task.hold_reason_code === 'label_shortage', '保留 (ラベル待ち)');
+  const resumed = TD.changeTaskStatus({ taskId: tA2.id, to: 'in_progress', expectVersion: held.task.version });
+  ok(resumed.ok && resumed.task.hold_reason_code === null, '再開で保留理由が消える');
+  const ready = TD.changeTaskStatus({ taskId: tA2.id, to: 'ready_for_stocking', expectVersion: resumed.task.version });
+  ok(ready.ok && ready.task.ready_at, '棚入待ち (ready_at)');
+  ok(TD.changeTaskStatus({ taskId: tA2.id, to: 'closed', expectVersion: ready.task.version, closeReason: 'stocked', isStaff: false }).error === 'staff_required', '棚入完了は職員のみ');
+  ok(TD.changeTaskStatus({ taskId: tA2.id, to: 'closed', expectVersion: ready.task.version, isStaff: true }).error === 'close_reason_required', '終了には理由が必要');
+  const closed = TD.changeTaskStatus({ taskId: tA2.id, to: 'closed', expectVersion: ready.task.version, closeReason: 'stocked', isStaff: true, actor: 'たにがわ' });
+  ok(closed.ok && closed.task.closed_at && closed.task.closed_by === 'たにがわ' && !TD.listOpenTasks().some(t => t.id === tA2.id), '棚入完了 → 一覧から消える');
+  ok(TD.changeTaskStatus({ taskId: tA2.id, to: 'in_progress', expectVersion: closed.task.version, isStaff: true }).error === 'bad_request', '終了からの再開には理由が必要');
+  const reopened = TD.changeTaskStatus({ taskId: tA2.id, to: 'in_progress', expectVersion: closed.task.version, isStaff: true, reason: '数え間違い' });
+  ok(reopened.ok && reopened.task.close_reason === null && reopened.task.closed_at === null, '職員が理由つきで再開すると終了情報が消える');
+  ok(getDB().prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_status'").get(tA2.id).c >= 6, '状態変更は履歴に残る (task_id つき)');
+  const planned = TD.setPlannedDate({ taskId: tA2.id, plannedDate: '2026-09-04', expectVersion: reopened.task.version });
+  ok(planned.ok && planned.task.planned_date === '2026-09-04' && TD.setPlannedDate({ taskId: tA2.id, plannedDate: '9/4', expectVersion: planned.task.version }).error === 'bad_request', '「今日やる」= planned_date (形式検証)');
+
+  // 取消: 未着手・実績なしは自動終了 / 実績ありは要確認 → 職員が判断
+  const tB = TD.getTaskByPageId(pM2.id);   // 作業中・作業時間あり
+  const cB = TD.requestCancellation({ destinationId: 9002, source: 'inbound_reversal' });
+  ok(cB.action === 'review' && cB.task.cancellation_requested_at && TD.listTasksNeedingReview().some(t => t.id === tB.id), '着手済み (作業時間あり) の取消は要確認');
+  ok(TD.resolveCancellation({ taskId: tB.id, decision: 'cancel', expectVersion: cB.task.version, isStaff: false }).error === 'staff_required', '取消の判断は職員のみ');
+  const cont = TD.resolveCancellation({ taskId: tB.id, decision: 'continue', expectVersion: cB.task.version, isStaff: true, actor: 'たにがわ' });
+  ok(cont.ok && cont.task.cancellation_requested_at === null && cont.task.status === 'in_progress', '続行を選ぶと要確認が消える');
+  const tNew = TD.upsertTaskFromImport({ notion_page_id: 'fresh-1', status: 'not_started', destination_id: 9100, product_code: 'FRESH', product_name: '未着手だけ' }, { batchId: 'test-batch-4' });
+  const cN = TD.requestCancellation({ destinationId: 9100 });
+  ok(cN.action === 'closed' && cN.task.close_reason === 'cancelled' && cN.task.closed_at, '未着手・実績なしの取消は自動で終了 (取消)');
+  ok(TD.requestCancellation({ destinationId: 424242 }).action === 'none', '該当 task が無ければ何もしない');
+  let dupErr = null;
+  try { TD.upsertTaskFromImport({ notion_page_id: 'fresh-2', status: 'not_started', destination_id: 9100 }, { batchId: 'x' }); } catch (e) { dupErr = e; }
+  ok(dupErr && /UNIQUE/.test(dupErr.message), 'destination_id は一意 (別ページで同じ destination は入らない)');
+  let invErr = null;
+  try { TD.upsertTaskFromImport({ notion_page_id: 'fresh-3', status: 'on_hold' }, { batchId: 'x' }); } catch (e) { invErr = e; }
+  ok(invErr && /不変条件/.test(invErr.message), '不変条件に反する取込行は拒否');
+
+  // ラベル待ち
+  const lw = TD.upsertLabelWait({ taskId: tB.id, fields: { occurred_on: '2026-09-03', recorded_by_name: 'やまだ', label_ordered: true, qty: 33, location: 'Z', note: '再発注' } });
+  ok(lw.ok && lw.row.label_ordered === 1 && lw.row.location === 'Z' && lw.row.done === 0, 'ラベル待ちの登録');
+  ok(TD.upsertLabelWait({ taskId: tB.id, fields: { location: 'X' } }).error === 'bad_request' && TD.upsertLabelWait({ taskId: tB.id, fields: { occurred_on: '9/3' } }).error === 'bad_request' && TD.upsertLabelWait({ taskId: tB.id, fields: { qty: -1 } }).error === 'bad_request', 'ロケーション・日付・数量の検証');
+  const lw2 = TD.upsertLabelWait({ id: lw.row.id, taskId: tB.id, fields: { line_notified_on: '2026-09-04', done: true }, expectVersion: lw.row.version });
+  ok(lw2.ok && lw2.row.line_notified_on === '2026-09-04' && lw2.row.done === 1 && lw2.row.version === 2, 'ラベル待ちの更新 (version が進む)');
+  ok(TD.upsertLabelWait({ id: lw.row.id, taskId: tB.id, fields: { note: 'x' }, expectVersion: 1 }).error === 'conflict', '古い version では更新できない');
+  ok(TD.listLabelWaits({ taskId: tB.id, openOnly: true }).length === 0 && TD.listLabelWaits({ taskId: tB.id, openOnly: false }).length === 1, '完了したものは未完了一覧から消える');
+  ok(TD.upsertLabelWait({ taskId: 999999, fields: {} }).error === 'not_found', '無い task には登録できない');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exit(fail > 0 ? 1 : 0);

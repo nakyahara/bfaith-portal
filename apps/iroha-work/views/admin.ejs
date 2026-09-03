@@ -64,6 +64,42 @@
       </table>
     </div>
 
+    <% if (isAdmin) { %>
+    <div class="iw-box">
+      <h2>🚚 Notion → アプリ正本化 (移行ツール)</h2>
+      <p class="hint">
+        Notion のカードを <code>f_iroha_tasks</code> に取り込みます (要件定義 v1.1 §F)。
+        <b>「調査 (dry-run)」は読むだけ</b>で DB を変えません。結果と CSV を確認してから「本取込」。何度取り込んでも同じカードは増えません (page ID で冪等)。
+        施設名ステータスのカードは「作業中 + その施設」で仮置きし<b>要確認</b>になります。完了カードも終了として取り込みます (一覧には出ません)。
+      </p>
+      <% if (migration && !migration.error) { %>
+      <table class="iw-kv" style="margin-bottom:10px">
+        <tr><th>tasks の件数</th><td>
+          <% const bs = migration.counts.byStatus || {}; %>
+          合計 <%= migration.counts.total %>
+          (未着手 <%= bs.not_started || 0 %> / 作業中 <%= bs.in_progress || 0 %> / 保留 <%= bs.on_hold || 0 %> / 棚入待ち <%= bs.ready_for_stocking || 0 %> / 終了 <%= bs.closed || 0 %>)
+        </td></tr>
+        <tr><th>要確認</th><td><%= migration.review %> 件 (取込時に状態を推定 / 取消の要確認)</td></tr>
+        <tr><th>孤立 (task に紐づかない)</th><td>作業時間 <%= migration.orphans.sessions.length %> ページ / 写真 <%= migration.orphans.media.length %> ページ</td></tr>
+        <tr><th>直近の調査</th><td><%= migration.lastPlanAt || '(未実行。サーバー再起動で消えます)' %></td></tr>
+      </table>
+      <% } else if (migration && migration.error) { %>
+        <p class="msg err">状態を取得できません: <%= migration.error %></p>
+      <% } %>
+      <div class="row" style="margin-bottom:8px">
+        <input type="text" id="migSince" placeholder="差分取込の起点 (省略=全件。例: 2026-09-03T08:00:00Z)" style="min-width:320px">
+        <button onclick="migSurvey()">🔍 調査 (dry-run)</button>
+        <a class="btn-sm" href="<%= base %>/admin/migration/plan.csv">📄 CSV</a>
+        <span class="msg" id="migMsg"></span>
+      </div>
+      <div class="row" style="margin-bottom:8px">
+        <input type="text" id="migConfirm" placeholder="本取込するには APPLY と入力" maxlength="10">
+        <button onclick="migApply()">📥 本取込</button>
+      </div>
+      <pre id="migOut" style="white-space:pre-wrap;font-size:.82rem;background:#f6f7f9;border:1px solid #dde;border-radius:6px;padding:10px;max-height:420px;overflow:auto;display:none"></pre>
+    </div>
+    <% } %>
+
     <div class="iw-box">
       <h2>🧰 作業のやり方の選択肢 (資材セット・保管箱)</h2>
       <p class="hint">
@@ -261,6 +297,29 @@
     }
     function setMsg(id, kind, text) { const el = document.getElementById(id); el.className = 'msg ' + kind; el.textContent = text; }
 
+    function migShow(obj) { const el = document.getElementById('migOut'); el.style.display = 'block'; el.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1); }
+    async function migSurvey() {
+      const since = document.getElementById('migSince').value.trim();
+      setMsg('migMsg', '', '調査中… (Notion を全件読みます。数十秒かかることがあります)');
+      const { status, json } = await post('/admin/migration/survey', { since: since || null });
+      if (!json.ok) { setMsg('migMsg', 'err', json.message || ('調査に失敗 (' + status + ')')); migShow(json); return; }
+      setMsg('migMsg', json.truncated ? 'err' : 'ok', (json.truncated ? '⚠ 取得が打ち切られました (上限超え) ' : '') + json.count + ' 枚を調査しました (DB は変えていません)');
+      migShow({ 取得: json.at, 差分起点: json.since, 枚数: json.count, ステータス別: json.byStatus, 写像の内訳: json.summary.byMapped,
+        取込予定: json.summary.willImport, 取り込まない: json.summary.rejected, 要確認: json.summary.needsReview, 警告: json.summary.warnings,
+        データの問題: json.issues, 孤立: json.orphans, 照合: { 欠け: json.reconcile.missing.length, 余り: json.reconcile.extra.length, tasks: json.reconcile.tasksByStatus },
+        要確認と取り込まない行: json.review, 保存ファイル: json.file });
+    }
+    async function migApply() {
+      const confirm = document.getElementById('migConfirm').value.trim();
+      if (confirm !== 'APPLY') { setMsg('migMsg', 'err', '本取込するには APPLY と入力してください'); return; }
+      if (!window.confirm('直近の調査結果を f_iroha_tasks に取り込みます。よろしいですか?')) return;
+      setMsg('migMsg', '', '取込中…');
+      const { status, json } = await post('/admin/migration/apply', { confirm });
+      if (!json.ok) { setMsg('migMsg', 'err', json.message || ('取込に失敗 (' + status + ')')); migShow(json); return; }
+      setMsg('migMsg', 'ok', '取り込みました: 追加 ' + json.inserted + ' / 更新 ' + json.updated + ' / 変化なし ' + json.kept + ' / 飛ばした ' + json.skipped);
+      migShow(json);
+      document.getElementById('migConfirm').value = '';
+    }
     async function addOption(kind) {
       const code = document.getElementById('opt-' + kind).value.trim();
       if (!code) { setMsg('optMsg-' + kind, 'err', '値を入れてください'); return; }
