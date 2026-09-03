@@ -132,14 +132,65 @@ export function backfillTaskLinks() {
  * いま衝突している紐付け (DB から直接): 行き先台帳にはページがあるのにタスクに無く、そのページを別のタスクが持っている。
  * 履歴 (task_link_conflict) は「起きた記録」、こちらは「今も解消していないもの」— 直せば 0 に戻る。管理画面の要確認に出す (Codex PR-B R2 #1)
  */
+const LINK_CONFLICT_FROM = `FROM f_iroha_tasks t
+    JOIN f_inbound_check_destinations d ON d.id = t.destination_id
+    JOIN f_iroha_tasks o ON o.notion_page_id = d.notion_page_id AND o.id <> t.id
+    WHERE t.notion_page_id IS NULL AND d.notion_page_id IS NOT NULL`;
 export function listLinkConflicts(limit = 50) {
   const db = getDB();
   if (!tableExists(db, 'f_inbound_check_destinations')) return [];
-  return db.prepare(`SELECT t.id AS task_id, t.destination_id, t.product_code, t.product_name, d.notion_page_id, o.id AS other_task_id, o.status AS other_status
-    FROM f_iroha_tasks t
-    JOIN f_inbound_check_destinations d ON d.id = t.destination_id
-    JOIN f_iroha_tasks o ON o.notion_page_id = d.notion_page_id AND o.id <> t.id
-    WHERE t.notion_page_id IS NULL AND d.notion_page_id IS NOT NULL
-    ORDER BY t.id LIMIT ?`).all(Number(limit) || 50);
+  return db.prepare(`SELECT t.id AS task_id, t.destination_id, t.product_code, t.product_name, t.status, d.notion_page_id,
+      o.id AS other_task_id, o.status AS other_status, o.product_code AS other_product_code
+    ${LINK_CONFLICT_FROM} ORDER BY t.id LIMIT ?`).all(Number(limit) || 50);
 }
-export function countLinkConflicts() { return listLinkConflicts(1000).length; }
+/** 総件数 (一覧は先頭だけなので、件数は別に数える — Codex PR-B R3 Low) */
+export function countLinkConflicts() {
+  const db = getDB();
+  if (!tableExists(db, 'f_inbound_check_destinations')) return 0;
+  return db.prepare(`SELECT COUNT(*) c ${LINK_CONFLICT_FROM}`).get().c;
+}
+
+// 統合で付け替える「タスクに紐づく記録」(task_id を持つ表)
+const TASK_CHILD_TABLES = ['f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events', 'f_iroha_label_waits'];
+
+/**
+ * 紐付け衝突を統合する (管理者操作 — Codex PR-B R3 Medium)。
+ * 確定時に作ったタスク (inbound) と、Notion から取り込んだタスク (import) が同じカードを指しているとき、
+ * 残す側 (keep) に 行き先 (destination_id) と Notion ページ (notion_page_id) の両方を集め、もう一方の
+ * 作業時間・写真・履歴・ラベル待ちを残す側へ付け替えたうえで、もう一方を「終了 (取消)」にする。1 トランザクション。
+ * @param taskId 確定側 (inbound) のタスク id (listLinkConflicts の task_id)
+ * @param keep 'import' (取込側を残す。既定 — 現場が Notion 時代から動かしてきた方) | 'inbound' (確定側を残す)
+ */
+export function mergeLinkConflict({ taskId, keep = 'import', actor = null }) {
+  const db = getDB();
+  if (keep !== 'import' && keep !== 'inbound') return { ok: false, error: 'bad_request', message: 'keep は import / inbound のどちらかです' };
+  return db.transaction(() => {
+    const c = db.prepare(`SELECT t.id AS task_id, t.destination_id, d.notion_page_id, o.id AS other_task_id ${LINK_CONFLICT_FROM} AND t.id = ?`).get(Number(taskId));
+    if (!c) return { ok: false, error: 'not_found', message: 'この衝突はもうありません (解消済みか、対象が変わりました)' };
+    const into = keep === 'import' ? c.other_task_id : c.task_id;
+    const from = keep === 'import' ? c.task_id : c.other_task_id;
+    const now = utcNow();
+    const who = actor || 'admin';
+    // ① 消える側から行き先・ページを外す (UNIQUE を空けてから残す側に付ける)
+    db.prepare('UPDATE f_iroha_tasks SET destination_id = NULL, notion_page_id = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?').run(now, who, from);
+    db.prepare('UPDATE f_iroha_tasks SET destination_id = ?, notion_page_id = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?')
+      .run(c.destination_id, c.notion_page_id, now, who, into);
+    // ② 記録を残す側へ付け替え
+    const moved = {};
+    for (const t of TASK_CHILD_TABLES) {
+      if (!tableExists(db, t)) continue;
+      moved[t] = db.prepare(`UPDATE ${t} SET task_id = ? WHERE task_id = ?`).run(into, from).changes;
+    }
+    // ③ 消える側は終了 (取消) — 履歴に「どこへ統合したか」を残す。既に終了なら理由だけ残す
+    const f = db.prepare('SELECT status FROM f_iroha_tasks WHERE id = ?').get(from);
+    if (f.status !== 'closed') {
+      db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = ?, closed_by = ?, hold_reason_code = NULL, hold_reason_note = NULL,
+        cancellation_requested_at = NULL, migration_note = COALESCE(migration_note || ' / ', '') || ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?`)
+        .run(now, who, `統合 → task#${into}`, now, who, from);
+    } else {
+      db.prepare("UPDATE f_iroha_tasks SET migration_note = COALESCE(migration_note || ' / ', '') || ? WHERE id = ?").run(`統合 → task#${into}`, from);
+    }
+    safeLogTaskEvent({ taskId: into, action: 'task_merge', from: `task#${from}`, to: `keep=${keep} dest#${c.destination_id} page=${c.notion_page_id} moved=${JSON.stringify(moved)}`, workerName: who, ok: true });
+    return { ok: true, kept: into, closed: from, moved };
+  }).immediate();
+}

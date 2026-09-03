@@ -37,7 +37,7 @@ import {
 import { recordPing } from '../jobs-monitor/store.js';
 import { normSupplierCode } from '../purchase-orders/db.js';
 import { sourceOfTruth } from '../iroha-work/db.js';
-import { linkTaskToNotionPage, backfillTaskLinks, listLinkConflicts } from '../iroha-work/task-intake.js';
+import { linkTaskToNotionPage, backfillTaskLinks, listLinkConflicts, countLinkConflicts } from '../iroha-work/task-intake.js';
 
 export const JOB_ID = 'inbound-check-notion-cards';
 const CANCELLED_STATUS = '取消';
@@ -637,7 +637,8 @@ export function notionStatusForAdmin() {
   return {
     configured: isNotionConfigured(),
     source: sourceOfTruth(),
-    linkConflicts: listLinkConflicts(20),   // 台帳のページを別タスクが持っている (移行の整合。人が見て直す)
+    linkConflicts: listLinkConflicts(20),   // 台帳のページを別タスクが持っている (移行の整合。在庫化アプリの管理画面で統合する)
+    linkConflictsTotal: countLinkConflicts(),
     dbIdTail: (process.env.INBOUND_CHECK_NOTION_DB_ID || '').slice(-6),
     unsent, waitingRetry, cancelPending, sentRecent, lastSyncedAt, blocked, attention,
   };

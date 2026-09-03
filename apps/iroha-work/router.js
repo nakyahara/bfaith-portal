@@ -43,7 +43,7 @@ import {
 } from './tasks-db.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
-import { listLinkConflicts } from './task-intake.js';
+import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
 import {
   addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
   recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
@@ -957,7 +957,7 @@ let lastPlan = null;   // { planId, at, by, since, cutoff, truncated, rows, summ
 const PLAN_MAX_AGE_MS = 30 * 60 * 1000;
 function migrationStatus() {
   try {
-    return { counts: countTasksByStatus(), review: listTasksNeedingReview().length, orphans: listOrphans(20), linkConflicts: listLinkConflicts(20), files: listMigrationFiles(),
+    return { counts: countTasksByStatus(), review: listTasksNeedingReview().length, orphans: listOrphans(20), linkConflicts: listLinkConflicts(20), linkConflictsTotal: countLinkConflicts(), files: listMigrationFiles(),
       lastPlanAt: lastPlan ? lastPlan.at : null, lastPlanBy: lastPlan ? lastPlan.by : null, lastPlanSummary: lastPlan ? lastPlan.summary : null };
   } catch (e) {
     const ref = Date.now().toString(36);
@@ -1017,6 +1017,16 @@ router.post('/admin/migration/apply', checkOrigin, requireAdmin, api((req, res) 
   catch (e) { return migrationFail(res, e, '本取込 (全て取り消しました)'); }
   safeLog({ action: 'migration_apply', pageId: null, deviceLabel: `session:${req.iwUser}`, to: `${lastPlan.planId}/${out.batchId}: +${out.inserted} ~${out.updated} =${out.kept} skip${out.skipped} journal=${out.journal}`, ok: true });
   res.json({ ok: true, ...out, planId: lastPlan.planId, nextSince: lastPlan.cutoff, reconcile: reconcile(lastPlan.rows, { mode: lastPlan.since ? 'delta' : 'full' }) });
+}));
+
+/** 紐付け衝突の統合 (確定側 task_id と、残す側 keep=import|inbound)。1 tx で行き先・ページ・記録を残す側へ */
+router.post('/admin/migration/link-conflicts/merge', checkOrigin, requireAdmin, api((req, res) => {
+  const taskId = parseTaskId(req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  const r = mergeLinkConflict({ taskId, keep: String(req.body?.keep || 'import'), actor: req.iwUser });
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 400).json(r);
+  safeLog({ action: 'link_conflict_merge', pageId: null, deviceLabel: `session:${req.iwUser}`, from: `task#${r.closed}`, to: `task#${r.kept}`, ok: true });
+  res.json({ ...r, remaining: countLinkConflicts() });
 }));
 
 router.get('/admin/migration/status', requireAdmin, api((req, res) => {

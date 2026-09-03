@@ -524,7 +524,7 @@ console.log('\n[PR-B] 確定時タスクとの紐付け / アプリ正本なら 
   ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_link_conflict' AND task_id = ?").get(t3id).c === 1, '履歴に task_link_conflict が残る');
   const lc = listLinkConflicts();
   ok(lc.length === 1 && lc[0].task_id === t3id && lc[0].other_task_id === TD.getTaskByDestination(dId2).id && lc[0].notion_page_id === pageOf2, 'いま衝突している紐付けを DB から一覧できる (どのタスクとどのタスクか)');
-  ok(notionStatusForAdmin().linkConflicts.length === 1 && notionStatusForAdmin().linkConflicts[0].task_id === t3id, '入荷受付の管理画面の状態に衝突が載る');
+  ok(notionStatusForAdmin().linkConflicts.length === 1 && notionStatusForAdmin().linkConflicts[0].task_id === t3id && notionStatusForAdmin().linkConflictsTotal === 1, '入荷受付の管理画面の状態に衝突が載る (一覧と総件数)');
   ok(backfillTaskLinks().conflicts === 1 && countLinkConflicts() === 1, '補修でも直らない (人が整理するまで残る)');
   db.prepare('UPDATE f_inbound_check_destinations SET notion_page_id = NULL WHERE id = ?').run(dId3);   // 整理した (台帳側を戻す)
   ok(countLinkConflicts() === 0 && notionStatusForAdmin().linkConflicts.length === 0, '解消すれば 0 に戻る (履歴は残る)');

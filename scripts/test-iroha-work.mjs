@@ -1555,7 +1555,49 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       && audit.device_label === 'session:admin@test.local', '監査ログに件数と force と誰がが残る');
     ok((await call('GET', '/api/state', { cookie })).json.mode === 'notion', '戻した後の一覧は Notion 正本');
     const ms = await call('GET', '/admin/migration/status', { ...admin });
-    ok(ms.status === 200 && ms.json.ok && Array.isArray(ms.json.linkConflicts), '移行の状態 (管理画面の元データ) に紐付け衝突の一覧が載る');
+    ok(ms.status === 200 && ms.json.ok && Array.isArray(ms.json.linkConflicts) && typeof ms.json.linkConflictsTotal === 'number', '移行の状態 (管理画面の元データ) に紐付け衝突の一覧と総件数が載る');
+
+    // 紐付け衝突の統合 (Codex PR-B R3 Medium): 確定側 (行き先あり・ページなし) と 取込側 (ページあり) が同じカード → 1 枚に
+    {
+      const { createTaskForDestination, listLinkConflicts, countLinkConflicts } = await import('../apps/iroha-work/task-intake.js');
+      const { startSession, stopSession } = await import('../apps/iroha-work/db.js');
+      const { addMedia, _setDriveUpload } = await import('../apps/iroha-work/media.js');
+      db.exec(`CREATE TABLE IF NOT EXISTS f_inbound_check_destinations (id INTEGER PRIMARY KEY, batch_id INTEGER, line_key TEXT, ar_no TEXT, product_id TEXT, product_name TEXT,
+        planned_qty INTEGER, destination TEXT, decided_from TEXT, worker TEXT, decided_at TEXT, cancelled_at TEXT, expiry_date TEXT, work_date TEXT, code_key TEXT, actual_qty INTEGER, notion_page_id TEXT)`);
+      db.prepare(`INSERT OR REPLACE INTO f_inbound_check_destinations (id, batch_id, line_key, ar_no, product_id, product_name, planned_qty, destination, decided_from, worker, decided_at, work_date, code_key, actual_qty, notion_page_id)
+        VALUES (9950, 1, 'M|1|1', 'AR-M', 'MERGE-X', '統合テスト', 5, 'iroha', 'chosen', 'test', '2026-09-03T00:00:00Z', '2026-09-03', 'merge-x', 5, 'merge-page-1')`).run();
+      const inbound = createTaskForDestination(db.prepare('SELECT * FROM f_inbound_check_destinations WHERE id = 9950').get(), { actor: 'test' }).id;
+      const imported = TD.upsertTaskFromImport({ notion_page_id: 'merge-page-1', status: 'in_progress', destination_id: null, product_code: 'MERGE-X', product_name: '統合テスト', qty: 5, started_at: '2026-09-03T01:00:00Z' }, { batchId: 'test-merge' }).id;
+      ok(countLinkConflicts() >= 1 && listLinkConflicts().some((c) => c.task_id === inbound && c.other_task_id === imported), '前提: 衝突がある');
+      // 確定側に記録を付けておく (統合で残す側へ移ることを見る)
+      const s = startSession({ taskId: inbound, worker: getIrohaWorker(w1.id) });
+      stopSession({ taskId: inbound, workerId: w1.id, sessionId: s.sessionId, reason: 'done' });
+      _setDriveUpload(async ({ operationId }) => ({ fileId: 'f-' + operationId, url: 'https://drive/' + operationId }));
+      const jpeg2 = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(64, 1)]);
+      const mp3 = path.join(process.env.DATA_DIR, 'merge.jpg'); fs.writeFileSync(mp3, jpeg2);
+      const m = addMedia({ taskId: inbound, productCode: 'MERGE-X', kind: 'photo', filePath: mp3, worker: getIrohaWorker(w1.id), operationId: 'op-merge-0001' });
+      _setDriveUpload(null);
+      ok(m.ok, '前提: 確定側に作業時間と写真');
+      ok((await call('POST', '/admin/migration/link-conflicts/merge', { cookie, body: { task_id: inbound, keep: 'import' } })).status === 403, '統合は管理者だけ');
+      ok((await call('POST', '/admin/migration/link-conflicts/merge', { ...admin, body: { task_id: inbound, keep: 'both' } })).status === 400, 'keep は import / inbound');
+      const mg = await call('POST', '/admin/migration/link-conflicts/merge', { ...admin, body: { task_id: inbound, keep: 'import' } });
+      ok(mg.status === 200 && mg.json.ok && mg.json.kept === imported && mg.json.closed === inbound, '統合 (取込側を残す)');
+      const kept = TD.getTask(imported), gone = TD.getTask(inbound);
+      ok(kept.destination_id === 9950 && kept.notion_page_id === 'merge-page-1' && kept.status === 'in_progress', '残す側に行き先とページが集まる (状態はそのまま)');
+      ok(gone.destination_id == null && gone.notion_page_id == null && gone.status === 'closed' && gone.close_reason === 'cancelled' && /統合 → task#/.test(gone.migration_note), '消える側は行き先・ページを失って終了 (取消)。どこへ統合したか残る');
+      ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(imported).c === 1 && db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id = ?').get(imported).c === 1
+        && db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(inbound).c === 0, '作業時間・写真は残す側へ付け替わる');
+      ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_merge' AND task_id = ?").get(imported).c === 1, '履歴に統合が残る');
+      ok(!listLinkConflicts().some((c) => c.task_id === inbound) && mg.json.remaining === countLinkConflicts(), '衝突は解消 (一覧から消える・残数を返す)');
+      ok((await call('POST', '/admin/migration/link-conflicts/merge', { ...admin, body: { task_id: inbound, keep: 'import' } })).status === 404, '解消済みをもう一度統合しようとすると 404');
+      // 確定側を残す向きも通る
+      db.prepare(`INSERT OR REPLACE INTO f_inbound_check_destinations (id, batch_id, line_key, ar_no, product_id, product_name, planned_qty, destination, decided_from, worker, decided_at, work_date, code_key, actual_qty, notion_page_id)
+        VALUES (9951, 1, 'M|2|1', 'AR-M', 'MERGE-Y', '統合テスト2', 2, 'iroha', 'chosen', 'test', '2026-09-03T00:00:00Z', '2026-09-03', 'merge-y', 2, 'merge-page-2')`).run();
+      const inbound2 = createTaskForDestination(db.prepare('SELECT * FROM f_inbound_check_destinations WHERE id = 9951').get()).id;
+      const imported2 = TD.upsertTaskFromImport({ notion_page_id: 'merge-page-2', status: 'not_started', destination_id: null, product_code: 'MERGE-Y', qty: 2 }, { batchId: 'test-merge' }).id;
+      const mg2 = await call('POST', '/admin/migration/link-conflicts/merge', { ...admin, body: { task_id: inbound2, keep: 'inbound' } });
+      ok(mg2.status === 200 && mg2.json.kept === inbound2 && TD.getTask(inbound2).notion_page_id === 'merge-page-2' && TD.getTask(imported2).status === 'closed' && TD.getTask(imported2).notion_page_id == null, '確定側を残す統合 (取込側が終了)');
+    }
   } finally {
     _setDriveUpload(null);
     delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;

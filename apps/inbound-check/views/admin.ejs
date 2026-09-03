@@ -151,9 +151,9 @@
         <p class="ok">✅ 正本は <b>いろは在庫化アプリ</b> です (在庫化アプリの管理画面で切替済み)。Notion カードはもう作りません — 下の送信ボタンは何もしません。</p>
       <% } %>
       <% if (notion && !notion.error && notion.linkConflicts && notion.linkConflicts.length) { %>
-        <p class="ng">⚠ 紐付けの衝突 <b><%= notion.linkConflicts.length %></b> 件: 行き先台帳の Notion カードを、確定時のタスクとは別のタスク (取込で作られた方) が持っています。
-          在庫化アプリの管理画面で片方を整理してください —
-          <% notion.linkConflicts.forEach((c) => { %><span>task#<%= c.task_id %> (<%= c.product_code %>) ↔ task#<%= c.other_task_id %></span> <% }) %></p>
+        <p class="ng">⚠ 紐付けの衝突 <b><%= notion.linkConflictsTotal %></b> 件: 行き先台帳の Notion カードを、確定時のタスクとは別のタスク (取込で作られた方) が持っています。
+          <a href="/apps/iroha-work/admin">在庫化アプリの管理画面</a>「Notion → アプリ正本化」の「紐付けの衝突」で統合してください —
+          <% notion.linkConflicts.forEach((c) => { %><span>task#<%= c.task_id %> (<%= c.product_code %>) ↔ task#<%= c.other_task_id %></span> <% }) %><% if (notion.linkConflictsTotal > notion.linkConflicts.length) { %> …他 <%= notion.linkConflictsTotal - notion.linkConflicts.length %> 件<% } %></p>
       <% } %>
       <% if (!notion || notion.error) { %>
         <p class="ng">⚠ 状態を取得できません<%= notion && notion.error ? ': ' + notion.error : '' %></p>
