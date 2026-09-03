@@ -405,6 +405,13 @@ export function createTables(d = getDB()) {
   // 2026-09-03: miniPC の応答キーを取り違えて (mainImage ← 実際は image) 全商品が「画像なし」になったキャッシュを捨てる。
   // 現行コードは none/error に必ず理由を書くので、理由が空の none = 旧バグの結果だけが消える (以後は 0 件)
   d.exec(`DELETE FROM fbx_product_images WHERE status = 'none' AND error_message IS NULL`);
+  // 同日: 応答の包み方 (result の入れ子) を取り違えて全商品が「Amazon に画像がありません」になった分を 1 回だけ捨てる。
+  // 「本当に画像が無い商品」も巻き込むが、次のアクセスで取り直して同じ結論になるだけ (fbx_meta で 1 回限り)
+  if (!d.prepare(`SELECT value FROM fbx_meta WHERE key = 'image_cache_reset_20260903'`).get()) {
+    const n = d.prepare(`DELETE FROM fbx_product_images WHERE status = 'none' AND error_message = 'Amazon に画像がありません'`).run().changes;
+    d.prepare(`INSERT INTO fbx_meta (key, value) VALUES ('image_cache_reset_20260903', ?)`).run(String(n));
+    if (n > 0) console.log(`[fba-box] 画像キャッシュを ${n} 件リセットしました (応答形の修正で取り直します)`);
+  }
   d.exec(`UPDATE fbx_exports SET sta_uploaded_at = (SELECT r.sta_uploaded_at FROM fbx_runs r WHERE r.sta_export_id = fbx_exports.id)
     WHERE sta_uploaded_at IS NULL AND EXISTS (SELECT 1 FROM fbx_runs r WHERE r.sta_export_id = fbx_exports.id AND r.sta_uploaded_at IS NOT NULL)`);
 

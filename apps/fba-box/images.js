@@ -86,11 +86,13 @@ export function sanitizeImageUrl(url) {
 
 /**
  * miniPC の /service-api/research/product/:asin の応答から MAIN 画像 URL を取り出す。
- * ⚠ 応答のキーは `image` (apps/profit-calculator/sp-api.js の getProduct)。2026-09-03 に `mainImage` を
- * 読んでいて全商品が「画像なし」になった — 別アプリの応答キーは実物で確かめる
+ * ⚠ 実物の応答は `{ ok: true, result: { asin, itemName, image, ... } }` — 画像は **result.image**。
+ * 2026-09-03 に `j.mainImage` → `j.image` と直しても出ず、実機の応答を miniPC で直接叩いて確定した。
+ * 別アプリのサービス API は「包み方 (result) とキー名」の両方を実物で確かめる
  */
 export function pickImageUrl(payload) {
-  return payload?.image || payload?.mainImage || payload?.imageUrl || null;
+  const p = payload?.result ?? payload;
+  return p?.image || p?.mainImage || p?.imageUrl || null;
 }
 
 /** ASIN → MAIN 画像 URL (null = 画像なし)。テストで差し替え可 */
