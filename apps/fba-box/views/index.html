@@ -119,7 +119,10 @@
   <!-- 納品回の選択 -->
   <div id="screen-runs" class="center">
     <div class="card">
-      <h2 style="margin:0 0 12px">📦 FBA箱詰め記録</h2>
+      <div style="display:flex; align-items:center; gap:10px; margin:0 0 12px">
+        <h2 style="margin:0; flex:1">📦 FBA箱詰め記録</h2>
+        <button class="chip" style="background:#E9ECEF; color:#495057" id="btn-roster">👥 名簿</button>
+      </div>
       <div id="runlist">読み込み中…</div>
     </div>
     <div class="card" style="text-align:center; color:#868E96; font-size:0.9em">
@@ -133,6 +136,7 @@
       <button class="chip" id="btn-back">← 回を選ぶ</button>
       <span class="title" id="run-title"></span>
       <span class="sp"></span>
+      <button class="chip" id="btn-summary">📋 まとめ</button>
       <button class="chip" id="btn-worker">👤 作業者を選ぶ</button>
       <button class="chip" id="btn-tts">🔊 読み上げ ON</button>
     </div>
@@ -293,13 +297,13 @@
       if (!boxOk) curBoxId = null;
       render();
     }));
-    // 箱バー
-    const boxes = S.boxes.filter(b => b.pack_group_id === curGroupId);
+    // 箱バー (取消した箱は出さない。Amazon 番号がずれた箱は →P1 - B2 を添える)
+    const boxes = S.boxes.filter(b => b.pack_group_id === curGroupId && b.status !== 'void');
     const cur = boxes.find(b => b.id === curBoxId);
     $('#curbox-code').textContent = cur ? `${cur.box_code} (${cur.total_qty}個)` : '未選択';
     $('#boxbtns').innerHTML = boxes.map(b => `
       <button class="boxbtn ${b.status === 'closed' ? 'closed' : ''}" data-id="${b.id}">
-        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個</small>
+        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
       </button>`).join('');
     $('#boxbtns').querySelectorAll('.boxbtn').forEach(b => b.addEventListener('click', () => openBoxDialog(Number(b.dataset.id))));
     // 行リスト
@@ -324,6 +328,28 @@
     $('#rows').querySelectorAll('.row').forEach(el => el.addEventListener('click', () => openRowDialog(Number(el.dataset.id))));
   }
   function rowDone(r) { return r.placed + (r.shortage_qty || 0) >= r.planned_qty && r.planned_qty > 0; }
+
+  // ─── まとめ (出荷前チェック): 何が残っているかを現場でも見られる ───
+  async function summaryDialog() {
+    const j = await apiGet('/api/readiness?run=' + curRunId);
+    if (!j.ok) { alert(j.message || '読み込めませんでした'); return; }
+    const r = j.readiness;
+    const item = (x, color) => `<div style="padding:6px 0; border-bottom:1px solid #F1F3F5; color:${color}">${esc(x.message)}
+      ${x.rows ? `<div style="font-size:0.85em; color:#495057">${x.rows.slice(0, 12).map(y => `・${esc(shortName(y.name, 16))} ${esc(fn4(y.fnsku))} (${y.placed}/${y.planned})`).join('<br>')}${x.rows.length > 12 ? '<br>…' : ''}</div>` : ''}
+      ${x.boxes ? `<div style="font-size:0.85em; color:#495057">${x.boxes.map(y => `・${esc(y.code)}${y.amazonName && y.amazonBoxNo !== y.boxNo ? ' → Amazon ' + esc(y.amazonName) : ''}`).join('<br>')}</div>` : ''}</div>`;
+    openDialog(`
+      <h2>📋 まとめ — ${esc(S.run.title)}</h2>
+      ${r.ok ? '<div class="msg" style="color:#2B8A3E; font-weight:700">✅ 箱詰めは完了しています。本社が Excel を出力します</div>'
+             : `<div class="lbl" style="color:#C92A2A">あと残っていること</div>${r.blockers.map(x => item(x, '#C92A2A')).join('')}`}
+      ${r.warnings.length ? `<div class="lbl">注意</div>${r.warnings.filter(w => !['exported', 'stale_export', 'sta_uploaded', 'no_dims', 'match_warnings'].includes(w.code)).map(x => item(x, '#B5651D')).join('')}` : ''}
+      <div class="lbl">箱 (箱札は 🖨 から印刷)</div>
+      ${r.groups.map(g => `<div><b>${esc(g.sheetName)}</b>: ${g.boxes.map(b => `${esc(b.code)}${b.amazonBoxNo !== b.boxNo ? '→' + esc(b.amazonName) : ''}${b.status === 'closed' ? '✓' : ''}`).join(' / ') || 'なし'}</div>`).join('')}
+      <div class="grid2" style="margin-top:14px">
+        <a class="bigbtn sub" style="text-align:center; text-decoration:none; display:block" href="${BASE}/print/boxes?run=${curRunId}" target="_blank">🖨 箱札 (全部)</a>
+        <button class="bigbtn sub" id="sm-close">閉じる</button>
+      </div>`);
+    $('#sm-close').addEventListener('click', closeDialog);
+  }
   function expiryOf(rowId) {
     const p = (S.placements || []).find(p => p.row_id === rowId && p.expiry);
     return p ? p.expiry : null;
@@ -345,12 +371,92 @@
       <div class="grid3" style="margin-top:12px" id="wgrid">
         ${workers.map(w => `<button class="wbtn" data-id="${w.id}">${esc(w.display_name)}${w.worker_type === 'staff' ? ' 🔑' : ''}</button>`).join('')}
       </div>
-      <div class="msg" style="color:#868E96">🔑 = 職員。名簿は本社の管理画面で登録します</div>`);
+      <div class="msg" style="color:#868E96">🔑 = 職員 ${workers.length === 0 ? '— まだ名簿がありません。「名簿を編集」から登録してください' : ''}</div>
+      <div style="margin-top:8px"><button class="bigbtn sub" id="w-roster">👥 名簿を編集 (追加・PIN)</button></div>`);
     dlg.querySelectorAll('.wbtn').forEach(b => b.addEventListener('click', () => {
       worker = workers.find(w => w.id === Number(b.dataset.id));
       LS.set('worker', worker.id);
       closeDialog();
     }));
+    dlg.querySelector('#w-roster').addEventListener('click', () => rosterDialog());
+  }
+
+  // ─── 名簿 (作業者・PIN) の編集 — 職員PINで守る。PIN持ちの職員がいない最初だけ無ゲート ───
+  async function rosterDialog() {
+    const j = await apiGet('/api/roster');
+    if (!j.ok) { alert(j.message || '名簿を読めませんでした'); return; }
+    const list = j.workers;
+    const dlg = openDialog(`
+      <h2>👥 名簿 (作業者)</h2>
+      ${j.bootstrap
+        ? '<div class="msg" style="color:#B5651D; font-weight:700">はじめに職員を1人登録して PIN を決めてください。以後、名簿の変更には職員の PIN が必要になります</div>'
+        : '<div class="msg" style="color:#868E96">変更には職員の PIN が必要です (🔑 = PIN 設定済み)</div>'}
+      <div class="lbl">追加する</div>
+      <input class="qtyin" id="r-name" type="text" placeholder="名前 (例: たなか)" maxlength="30" style="font-size:1.2em; text-align:left">
+      <div class="grid2" style="margin-top:8px"><button class="selbtn rt on" data-v="member">利用者</button><button class="selbtn rt" data-v="staff">職員 (PINあり)</button></div>
+      <div style="margin-top:10px"><button class="bigbtn" id="r-add">追加する</button></div>
+      <div class="lbl">いまの名簿</div>
+      <div style="max-height:36vh; overflow-y:auto">
+        ${list.length === 0 ? '<div style="color:#868E96">まだ誰もいません</div>' : list.map(w => `
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 0; border-bottom:1px solid #F1F3F5; ${w.active ? '' : 'color:#ADB5BD'}">
+            <span>${esc(w.display_name)} <small>${w.worker_type === 'staff' ? '職員' + (w.pin_set ? ' 🔑' : ' (PIN未設定)') : '利用者'}${w.active ? '' : ' / 無効'}</small></span>
+            <span style="white-space:nowrap">
+              ${w.worker_type === 'staff' && w.active ? `<button class="selbtn r-pin" data-id="${w.id}" data-name="${esc(w.display_name)}" style="padding:6px 10px">PIN${w.pin_set ? '変更' : '設定'}</button>` : ''}
+              <button class="selbtn r-act" data-id="${w.id}" data-name="${esc(w.display_name)}" data-active="${w.active ? 1 : 0}" style="padding:6px 10px">${w.active ? '無効' : '有効'}</button>
+            </span>
+          </div>`).join('')}
+      </div>
+      <div style="margin-top:12px"><button class="bigbtn sub" id="r-close">閉じる</button></div>
+      <div class="msg" id="r-msg"></div>`);
+    const msg = dlg.querySelector('#r-msg');
+    let wtype = 'member';
+    dlg.querySelectorAll('.rt').forEach(b => b.addEventListener('click', () => {
+      dlg.querySelectorAll('.rt').forEach(x => x.classList.remove('on')); b.classList.add('on'); wtype = b.dataset.v;
+    }));
+    dlg.querySelector('#r-close').addEventListener('click', closeDialog);
+    // 変更操作: bootstrap ならそのまま、そうでなければ職員PIN → 実行 → 名簿を開き直す
+    const staffList = list.filter(w => w.worker_type === 'staff' && w.active && w.pin_set);
+    const withAuth = (fn) => {
+      if (j.bootstrap) return fn({});
+      staffPinPrompt((sw, pin) => fn({ auth_worker_id: sw.id, auth_pin: pin }), staffList);
+    };
+    const done = async (p) => {
+      const r = await p;
+      if (!r.ok) alert(r.message || '変更できませんでした');
+      rosterDialog();
+    };
+    dlg.querySelector('#r-add').addEventListener('click', () => {
+      const name = dlg.querySelector('#r-name').value.trim();
+      if (!name) { msg.className = 'msg err'; msg.textContent = '名前を入れてください'; return; }
+      withAuth(auth => done(apiPost('/api/workers', { display_name: name, worker_type: wtype, ...auth })));
+    });
+    dlg.querySelectorAll('.r-pin').forEach(b => b.addEventListener('click', () => {
+      withAuth(auth => newPinDialog(b.dataset.name, (pin) => done(apiPost(`/api/workers/${b.dataset.id}/pin`, { pin, ...auth }))));
+    }));
+    dlg.querySelectorAll('.r-act').forEach(b => b.addEventListener('click', () => {
+      const toActive = b.dataset.active !== '1';
+      if (!confirm(`${b.dataset.name} を${toActive ? '有効' : '無効'}にしますか?`)) return;
+      withAuth(auth => done(apiPost(`/api/workers/${b.dataset.id}/active`, { active: toActive, ...auth })));
+    }));
+  }
+
+  /** 新しい PIN の入力 (2回・伏せ字)。window.prompt は平文表示なので使わない */
+  function newPinDialog(name, cb) {
+    const dlg = openDialog(`
+      <h2>🔑 ${esc(name)} の PIN</h2>
+      <div class="lbl">新しい PIN (4〜8桁の数字)</div>
+      <input class="qtyin" id="np-1" type="password" inputmode="numeric" maxlength="8">
+      <div class="lbl">もう一度</div>
+      <input class="qtyin" id="np-2" type="password" inputmode="numeric" maxlength="8">
+      <div style="margin-top:14px"><button class="bigbtn" id="np-go">決定</button></div>
+      <div class="msg" id="np-msg"></div>`);
+    dlg.querySelector('#np-go').addEventListener('click', () => {
+      const a = dlg.querySelector('#np-1').value, b = dlg.querySelector('#np-2').value, m = dlg.querySelector('#np-msg');
+      if (!/^\d{4,8}$/.test(a)) { m.className = 'msg err'; m.textContent = '4〜8桁の数字で入れてください'; return; }
+      if (a !== b) { m.className = 'msg err'; m.textContent = '2回の入力が違います'; return; }
+      closeDialog();
+      cb(a);
+    });
   }
 
   // ─── 商品行ダイアログ (割当・担当者・読み上げ) ───
@@ -567,8 +673,10 @@
     const contents = j.ok ? j.contents : [];
     const layJa = { bottom: '下', middle: '中', top: '上' };
     const dlg = openDialog(`
-      <h2>📦 ${esc(b.box_code)} ${b.status === 'closed' ? '(閉じた箱)' : ''}</h2>
-      <div style="color:#868E96; font-size:0.9em">${b.total_qty}個 / ${b.sku_count}種類${b.measured_weight_kg ? ` / 実測 ${b.measured_weight_kg}kg` : ''}</div>
+      <h2>📦 ${esc(b.box_code)} ${b.status === 'closed' ? '(閉じた箱)' : ''}
+        <a class="chip" style="background:#E9ECEF; color:#495057; text-decoration:none; float:right" href="${BASE}/print/boxes?run=${curRunId}&box=${b.id}" target="_blank">🖨 箱札</a></h2>
+      <div style="color:#868E96; font-size:0.9em">${b.total_qty}個 / ${b.sku_count}種類${b.measured_weight_kg ? ` / 実測 ${b.measured_weight_kg}kg` : ''}
+        ${b.amazon_box_no !== b.box_no ? `<div style="color:#C92A2A; font-weight:700">⚠ Amazon では ${esc(b.amazon_name)} になります (取消した箱があるため番号がずれています)</div>` : ''}</div>
       <div style="margin:12px 0; max-height:40vh; overflow-y:auto">
         ${contents.length === 0 ? 'まだ空です' : contents.map(p => `
           <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #F1F3F5">
@@ -582,11 +690,20 @@
         <div class="grid2">
           <button class="bigbtn sub" id="b-use">この箱に詰める</button>
           <button class="bigbtn green" id="b-close2" ${contents.length === 0 ? 'disabled' : ''}>読み合わせて閉じる</button>
-        </div>` : `
+        </div>
+        ${contents.length === 0 ? '<div style="margin-top:10px"><button class="bigbtn sub" id="b-void">職員: 使わない箱を取消</button></div>' : ''}` : `
         <button class="bigbtn sub" id="b-reopen">職員: 箱を開け直す</button>`}
       <div class="msg" id="b-msg"></div>`);
     dlg.querySelector('#b-use')?.addEventListener('click', () => { setCurBox(b.id); closeDialog(); });
     dlg.querySelector('#b-close2')?.addEventListener('click', () => closeBoxDialog(b, contents));
+    dlg.querySelector('#b-void')?.addEventListener('click', () => staffPinPrompt(async (staffWorker, pin) => {
+      const reason = prompt('取消の理由 (例: 箱が余った)');
+      if (!reason) return;
+      const j2 = await apiPost(`/api/boxes/${b.id}/void`, { worker_id: staffWorker.id, pin, reason });
+      if (!j2.ok) alert(j2.message);
+      else if (curBoxId === b.id) { curBoxId = null; LS.set('curbox_' + curRunId, null); }
+      closeDialog();
+    }));
     dlg.querySelector('#b-reopen')?.addEventListener('click', () => staffPinPrompt(async (staffWorker, pin) => {
       const reason = prompt('開け直す理由 (例: 詰め直し)');
       if (!reason) return;
@@ -661,9 +778,9 @@
     });
   }
 
-  // ─── 職員PIN ───
-  function staffPinPrompt(cb) {
-    const staff = workers.filter(w => w.worker_type === 'staff');
+  // ─── 職員PIN (staffList 省略時は state の作業者から。名簿画面は /api/roster の一覧を渡す) ───
+  function staffPinPrompt(cb, staffList) {
+    const staff = staffList || workers.filter(w => w.worker_type === 'staff');
     const dlg = openDialog(`
       <h2>🔑 職員の確認</h2>
       <div class="lbl">職員</div>
@@ -675,7 +792,7 @@
     let sw = null;
     dlg.querySelectorAll('.stf').forEach(b => b.addEventListener('click', () => {
       dlg.querySelectorAll('.stf').forEach(x => x.classList.remove('on'));
-      b.classList.add('on'); sw = workers.find(w => w.id === Number(b.dataset.id));
+      b.classList.add('on'); sw = staff.find(w => w.id === Number(b.dataset.id));
       dlg.querySelector('#p-go').disabled = false;
     }));
     dlg.querySelector('#p-go').addEventListener('click', () => {
@@ -752,6 +869,8 @@
   // ─── 初期化 ───
   $('#btn-back').addEventListener('click', backToRuns);
   $('#btn-worker').addEventListener('click', pickWorker);
+  $('#btn-roster').addEventListener('click', () => rosterDialog());
+  $('#btn-summary').addEventListener('click', () => summaryDialog());
   $('#btn-newbox').addEventListener('click', () => newBoxDialog());
   $('#btn-tts').addEventListener('click', () => {
     ttsOn = !ttsOn;

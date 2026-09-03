@@ -11,6 +11,7 @@ process.env.RENDER = '';   // ローカルテスト (DATA_DIR ガードを踏ま
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fba-box-test-'));
 const dbFile = path.join(tmp, 'test.db');
+process.env.DATA_DIR = tmp;   // excel.js の隔離保存先 (EXCEL_DIR/EXPORT_DIR) を一時ディレクトリに
 
 const db = await import('../apps/fba-box/db.js');
 const svc = await import('../apps/fba-box/service.js');
@@ -360,6 +361,293 @@ t('主要操作が fbx_events に残っている', () => {
     assert.ok(actions.has(a), `missing event: ${a}`);
   }
 });
+
+// ───────── PR2: 名簿ゲート・資材・箱取消・出荷前チェック・Excel出力 (ゴールデンファイル) ─────────
+console.log('■ PR2: 名簿・資材');
+
+t('countStaffWithPin: 有効な PIN 職員の数 (無効化で減る)', () => {
+  assert.equal(db.countStaffWithPin(), 1);
+  db.setWorkerActive(staff.id, false);
+  assert.equal(db.countStaffWithPin(), 0);
+  db.setWorkerActive(staff.id, true);
+  assert.equal(db.countStaffWithPin(), 1);
+});
+t('upsertMaterial: 検証 (コード・数値) と外寸の保存', () => {
+  assert.equal(db.upsertMaterial({ code: 'bad code!', name: 'x', actor: 't' }).error, 'bad_code');
+  assert.equal(db.upsertMaterial({ code: 'box140', name: '', actor: 't' }).error, 'bad_name');
+  assert.equal(db.upsertMaterial({ code: 'box140', name: '140', widthCm: -1, actor: 't' }).error, 'bad_number');
+  assert.equal(db.upsertMaterial({ code: 'BOX140', name: '140サイズ段ボール', tareG: 900, widthCm: 45, lengthCm: 35, heightCm: 30.5, sort: 1, actor: 't' }).ok, true);
+  const m = db.listMaterials().find((x) => x.code === 'box140');
+  assert.equal(m.width_cm, 45); assert.equal(m.height_cm, 30.5); assert.equal(m.tare_g, 900);
+  assert.equal(db.upsertMaterial({ code: 'box999', name: '一時', active: false, actor: 't' }).ok, true);
+  assert.equal(db.listMaterials().some((x) => x.code === 'box999'), false);
+  assert.equal(db.listMaterials(true).some((x) => x.code === 'box999'), true);
+});
+
+console.log('■ PR2: 実物テンプレ取込 → 箱詰め → 箱取消 → チェック → Excel出力 (python)');
+const xl = await import('../apps/fba-box/excel.js');
+const FIX = path.resolve('scripts/fixtures/fba-box');
+const fixture2 = path.join(FIX, 'packlist_v1.1_4sku_19box_expiry.xlsx');
+const ing = await xl.ingestPacklist(fs.readFileSync(fixture2), 'packlist_test.xlsx');
+t('実物テンプレ (4SKU/19箱列) を python で取込できる・箱名を拾う', () => {
+  assert.equal(ing.ok, true, JSON.stringify(ing).slice(0, 400));
+  assert.equal(ing.parsed.fingerprint, 'd337e046bbf029c1');
+  assert.equal(ing.parsed.sheets[0].boxNames['3'], 'P1 - B3');
+  assert.equal(ing.parsed.sheets[0].skuRows.length, 4);
+});
+// picking 側は Excel と同じ FNSKU/数量で作る (全行 matched)
+const realPlan = [{ slotId: 'p1', sheet: 'P1_通常', label: '通常',
+  rows: ing.parsed.sheets[0].skuRows.map((r, i) => ({ no: i + 1, fnsku: r.fnsku, productName: r.productName, qty: String(r.plannedQty) })) }];
+const m3 = svc.matchWorkbook(ing.parsed, realPlan);
+const c3 = db.createRun({
+  sourceRunId: 70, deliveryDate: '2026-09-10', title: '9/10 納品分', matchSummary: svc.summarizeMatch(m3),
+  excelFile: { originalName: 'packlist_test.xlsx', storedPath: ing.storedPath, sha256: ing.sha256, fingerprint: ing.parsed.fingerprint, metadata: ing.parsed.metadata },
+  groups: m3.groups, createdBy: 't',
+});
+db.activateRun(c3.runId, 't');
+const run3 = c3.runId;
+const s3 = db.getRunState(run3);
+const g3 = s3.groups[0].id;
+const rows3 = [...s3.rows].sort((a, b) => a.excel_row - b.excel_row);   // 予定 5, 5, 1, 30
+const mkBox = (mat) => db.createBox({ packGroupId: g3, materialCode: mat, worker: member });
+const b1 = mkBox('box140'), b2 = mkBox('box160'), b3 = mkBox('box140'), b4 = mkBox('box140');
+const put = (row, box, qty, rid) => db.addPlacement({ runId: run3, rowId: row.id, boxId: box.boxId, qty, worker: member, deviceKey: 'dev:7', deviceLabel: 'iPad7', requestId: rid });
+t('全行を投入できる (行0→B1 / 行1→B1+B2 / 行2→B2 / 行3→B4)', () => {
+  assert.equal(put(rows3[0], b1, 5, 'x1').ok, true);
+  assert.equal(put(rows3[1], b1, 3, 'x2').ok, true);
+  assert.equal(put(rows3[1], b2, 2, 'x3').ok, true);
+  assert.equal(put(rows3[2], b2, 1, 'x4').ok, true);
+  assert.equal(put(rows3[3], b4, 30, 'x5').ok, true);
+});
+t('readiness: 開いた箱・空箱がブロッカー', () => {
+  const r = db.exportReadiness(run3);
+  assert.equal(r.ok, false);
+  const codes = r.blockers.map((b) => b.code);
+  assert.ok(codes.includes('open_boxes'), codes.join());
+  assert.ok(codes.includes('empty_boxes'), codes.join());
+  assert.ok(!codes.includes('rows_incomplete'), codes.join());
+});
+t('voidBox: 中身ありは not_empty / 理由必須 / 空なら ok / 取消後は割当不可・二重は already', () => {
+  assert.equal(db.voidBox({ boxId: b1.boxId, reason: 'x', worker: staff }).error, 'not_empty');
+  assert.equal(db.voidBox({ boxId: b3.boxId, worker: staff }).error, 'reason_required');
+  assert.equal(db.voidBox({ boxId: b3.boxId, reason: '箱が余った', worker: staff }).ok, true);
+  assert.equal(put(rows3[0], b3, 1, 'x6').error, 'box_void');
+  assert.equal(db.voidBox({ boxId: b3.boxId, reason: 'again', worker: staff }).already, true);
+  assert.equal(db.closeBox({ boxId: b3.boxId, measuredKg: 1, worker: staff }).error, 'box_void');
+});
+t('Amazon 箱番号: 取消した箱を飛ばして詰める (B4 → 3番目) / 取消箱は null', () => {
+  const st = db.getRunState(run3);
+  const byId = new Map(st.boxes.map((b) => [b.id, b]));
+  assert.equal(byId.get(b1.boxId).amazon_box_no, 1);
+  assert.equal(byId.get(b2.boxId).amazon_box_no, 2);
+  assert.equal(byId.get(b3.boxId).amazon_box_no, null);
+  assert.equal(byId.get(b4.boxId).amazon_box_no, 3);
+  assert.equal(byId.get(b4.boxId).amazon_name, 'P1 - B3');
+  assert.equal(byId.get(b4.boxId).box_no, 4);
+});
+t('createBox: 取消後も box_no は再利用しない', () => {
+  const b5 = mkBox('box140');
+  assert.equal(b5.boxNo, 5);
+  assert.equal(db.voidBox({ boxId: b5.boxId, reason: '試験', worker: staff }).ok, true);
+});
+t('closeBox 3箱 → readiness ok。警告 = 欠番 / 外寸なし (box160) / 確認担当なし', () => {
+  assert.equal(db.closeBox({ boxId: b1.boxId, measuredKg: 12.4, closedReason: 'items_done', worker: staff }).ok, true);
+  assert.equal(db.closeBox({ boxId: b2.boxId, measuredKg: 8, worker: staff }).ok, true);
+  assert.equal(db.closeBox({ boxId: b4.boxId, measuredKg: 20.25, worker: staff }).ok, true);
+  const r = db.exportReadiness(run3);
+  assert.equal(r.ok, true, JSON.stringify(r.blockers));
+  const w = r.warnings.map((x) => x.code);
+  assert.ok(w.includes('box_gap'), w.join());
+  assert.ok(w.includes('no_dims'), w.join());
+  assert.ok(w.includes('unchecked_rows'), w.join());
+  assert.equal(r.groups[0].boxes.length, 3);
+  assert.equal(r.groups[0].boxes[2].amazonName, 'P1 - B3');
+  assert.equal(r.expiries.length, 0);
+});
+const payload = db.buildExportPayload(run3);
+t('buildExportPayload: 箱数1 + 数量5 + 重量3 + 外寸(140のみ)6 = 15セル、それ以外の入力セル (4行+4寸法行)×19列 は clear', () => {
+  assert.equal(payload.ok, true, JSON.stringify(payload).slice(0, 300));
+  const cells = payload.sheets[0].cells;
+  const kinds = cells.reduce((a, c) => { a[c.kind] = (a[c.kind] || 0) + 1; return a; }, {});
+  assert.deepEqual(kinds, { total_boxes: 1, qty: 5, weight: 3, width: 2, length: 2, height: 2, clear: 8 * 19 - 14 });
+  assert.equal(new Set(cells.map((c) => `${c.row}|${c.col}`)).size, cells.length, '同一セルの二重指定なし');
+  const st = ing.parsed.sheets[0];
+  assert.deepEqual(cells[0], { row: st.totalBoxes.row, col: st.totalBoxes.col, value: 3, kind: 'total_boxes' });
+  const q = cells.filter((c) => c.kind === 'qty');
+  // 行3 (予定30) は Amazon 3番目の箱 = boxColumns['3'] の列
+  assert.ok(q.some((c) => c.row === rows3[3].excel_row && c.col === st.boxColumns['3'] && c.value === 30));
+  assert.ok(q.some((c) => c.row === rows3[1].excel_row && c.col === st.boxColumns['1'] && c.value === 3));
+  assert.ok(q.some((c) => c.row === rows3[1].excel_row && c.col === st.boxColumns['2'] && c.value === 2));
+  assert.ok(cells.some((c) => c.kind === 'weight' && c.row === st.dimRows.weight && c.col === st.boxColumns['3'] && c.value === 20.25));
+  assert.ok(cells.some((c) => c.kind === 'height' && c.col === st.boxColumns['1'] && c.value === 30.5));
+  assert.equal(payload.snapshot.groups[0].boxes[2].contents[0].qty, 30);
+});
+const w3 = await xl.writePacklist({ templatePath: ing.storedPath, sheets: payload.sheets, fileTag: 'test' });
+t('writePacklist (ゴールデン): 原本非破壊で書けて独自検算を通る (再読込一致・他エントリ byte 一致・fingerprint 不変)', () => {
+  assert.equal(w3.ok, true, JSON.stringify(w3).slice(0, 400));
+  assert.equal(w3.written, 15);
+  assert.equal(w3.cleared, 8 * 19 - 14);
+  assert.equal(w3.verify.cellsChecked, payload.sheets[0].cells.length);
+  assert.equal(w3.verify.fingerprint, 'd337e046bbf029c1');
+  assert.deepEqual(w3.verify.changedEntries, ['xl/worksheets/sheet2.xml']);
+  assert.ok(fs.existsSync(w3.outputPath));
+  assert.notEqual(fs.readFileSync(w3.outputPath).length, 0);
+});
+const ingFilled = await xl.ingestPacklist(fs.readFileSync(w3.outputPath), 'filled.xlsx');
+t('記入済み (出力済み) ファイルの再アップロードは prefilled_template で拒否', () => {
+  assert.equal(ingFilled.ok, false);
+  assert.equal(ingFilled.error, 'prefilled_template');
+});
+// 記入済み原本に対しても clear で古い値が消えることを確認 (取込ガードを迂回した二重防御の検証):
+// 出力済みファイルを原本にして「数量 1 セルだけ」を書くと、他の数量・寸法は空になる
+const wClear = await xl.writePacklist({ templatePath: w3.outputPath, fileTag: 'clear', sheets: [{ sheetName: payload.sheets[0].sheetName,
+  cells: payload.sheets[0].cells.map((c) => (c.kind === 'qty' && c.value === 30 ? c : (c.kind === 'total_boxes' ? c : { row: c.row, col: c.col, value: null, kind: 'clear' }))) }] });
+t('clear: 原本に残った値を空にできる (再読込で None)', () => {
+  assert.equal(wClear.ok, true, JSON.stringify(wClear).slice(0, 400));
+  assert.equal(wClear.written, 2);
+  assert.equal(wClear.cleared, payload.sheets[0].cells.length - 2);
+});
+const fixture1 = path.join(FIX, 'packlist_v1.1_2sku_15box.xlsx');
+const ing1 = await xl.ingestPacklist(fs.readFileSync(fixture1), 'packlist_test1.xlsx');
+const w1 = ing1.ok ? await xl.writePacklist({ templatePath: ing1.storedPath, fileTag: 'test1', sheets: [{ sheetName: ing1.parsed.sheets[0].sheetName, cells: [
+  { row: ing1.parsed.sheets[0].totalBoxes.row, col: ing1.parsed.sheets[0].totalBoxes.col, value: 1, kind: 'total_boxes' },
+  { row: ing1.parsed.sheets[0].skuRows[0].row, col: ing1.parsed.sheets[0].boxColumns['1'], value: 3, kind: 'qty' },
+  { row: ing1.parsed.sheets[0].dimRows.weight, col: ing1.parsed.sheets[0].boxColumns['1'], value: 4.2, kind: 'weight' },
+] }] }) : null;
+t('writePacklist (ゴールデン2件目: 2SKU/15箱列・箱名行が9行目) も通る', () => {
+  assert.equal(ing1.ok, true, JSON.stringify(ing1).slice(0, 300));
+  assert.equal(w1.ok, true, JSON.stringify(w1).slice(0, 400));
+  assert.equal(w1.verify.cellsChecked, 3);
+});
+const wBad = await xl.writePacklist({ templatePath: ing1.storedPath, fileTag: 'bad', sheets: [{ sheetName: ing1.parsed.sheets[0].sheetName, cells: [
+  { row: ing1.parsed.sheets[0].skuRows[0].row, col: ing1.parsed.sheets[0].headers['輸送箱の数'], value: 3, kind: 'qty' } ] }] });
+t('writePacklist: 数式セル (輸送箱の数 = SUM) への書込は拒否', () => {
+  assert.equal(wBad.ok, false);
+  assert.equal(wBad.error, 'formula_cell');
+});
+const wMissing = await xl.writePacklist({ templatePath: path.join(tmp, 'nope.xlsx'), sheets: [] });
+t('writePacklist: 原本が無ければ template_missing', () => {
+  assert.equal(wMissing.error, 'template_missing');
+});
+
+const ex1 = db.recordExport({ runId: run3, excelFileId: payload.excelFile.id, dataVersion: payload.snapshot.dataVersion, fileName: 'packlist_test.xlsx',
+  storedPath: w3.outputPath, sha256: w3.sha256, snapshot: payload.snapshot, verify: w3.verify, createdBy: 't' });
+t('recordExport → listExports (最新・stale でない) / getExport でスナップショット復元', () => {
+  assert.equal(ex1.ok, true);
+  assert.equal(ex1.stale, false);
+  const list = db.listExports(run3);
+  assert.equal(list.length, 1);
+  assert.equal(list[0].stale, 0);
+  assert.equal(db.getExport(ex1.exportId).snapshot.groups[0].totalBoxes, 3);
+  assert.equal(db.getRunState(run3).exportState.stale, false);
+});
+t('資材の外寸変更 → その資材の箱を持つ未アップの納品回の版が進む (旧版になる)。名前だけの変更では進まない', () => {
+  const v0 = db.getRun(run3).data_version;
+  const r1 = db.upsertMaterial({ code: 'box140', name: '140サイズ段ボール (改)', tareG: 900, widthCm: 45, lengthCm: 35, heightCm: 30.5, sort: 1, actor: 't' });
+  assert.deepEqual(r1.bumpedRuns, []);
+  assert.equal(db.getRun(run3).data_version, v0);
+  const r2 = db.upsertMaterial({ code: 'box140', name: '140サイズ段ボール', tareG: 900, widthCm: 46, lengthCm: 35, heightCm: 30.5, sort: 1, actor: 't' });
+  // box140 の箱を持つ未アップの回 (この試験では run1 / c2 / run3) が全て対象。run3 は必ず含まれる
+  assert.ok(r2.bumpedRuns.includes(run3), JSON.stringify(r2.bumpedRuns));
+  assert.equal(db.getRun(run3).data_version, v0 + 1);
+  assert.equal(db.listExports(run3)[0].stale, 1);
+  assert.equal(db.markStaUploaded({ runId: run3, exportId: ex1.exportId, actor: 't' }).error, 'stale_export');
+  // 新しい出力の外寸は 46 になる
+  const p = db.buildExportPayload(run3);
+  assert.ok(p.sheets[0].cells.some((c) => c.kind === 'width' && c.value === 46));
+});
+t('版管理: 出力後の変更 (箱の開け直し→閉じ直し) で旧版になり、旧版の STAアップ記録は拒否', () => {
+  db.reopenBox({ boxId: b2.boxId, reason: '詰め直し', worker: staff });
+  db.closeBox({ boxId: b2.boxId, measuredKg: 8.1, worker: staff });
+  assert.equal(db.listExports(run3)[0].stale, 1);
+  assert.equal(db.getRunState(run3).exportState.stale, true);
+  assert.equal(db.exportReadiness(run3).warnings.some((w) => w.code === 'stale_export'), true);
+  assert.equal(db.markStaUploaded({ runId: run3, exportId: ex1.exportId, actor: 't' }).error, 'stale_export');
+});
+t('再出力 → STAアップ済み記録 → 納品回 done・data_version は動かない (setRunStatus も動かさない)', () => {
+  const p2 = db.buildExportPayload(run3);
+  assert.equal(p2.ok, true);
+  const ex2 = db.recordExport({ runId: run3, excelFileId: p2.excelFile.id, dataVersion: p2.snapshot.dataVersion, fileName: 'packlist_test.xlsx',
+    storedPath: w3.outputPath, sha256: w3.sha256, snapshot: p2.snapshot, verify: null, createdBy: 't' });
+  assert.equal(ex2.stale, false);
+  const before = db.getRun(run3).data_version;
+  assert.equal(db.markStaUploaded({ runId: run3, exportId: ex2.exportId, actor: 't' }).ok, true);
+  const run = db.getRun(run3);
+  assert.equal(run.status, 'done');
+  assert.equal(run.sta_export_id, ex2.exportId);
+  assert.ok(run.sta_uploaded_at);
+  assert.equal(run.data_version, before);
+  assert.equal(db.listExports(run3).find((e) => e.id === ex2.exportId).sta_uploaded, 1);
+  // done 後も readiness は出力可 (再DL用)、iPad からの割当は不可
+  assert.equal(db.exportReadiness(run3).ok, true);
+  assert.equal(put(rows3[0], b1, 1, 'x9').error, 'run_not_active');
+  // STAアップ済みの記録は上書きしない: 同じ版は冪等、別の出力は already_uploaded
+  assert.equal(db.markStaUploaded({ runId: run3, exportId: ex2.exportId, actor: 't' }).already, true);
+  const ex3 = db.recordExport({ runId: run3, excelFileId: p2.excelFile.id, dataVersion: p2.snapshot.dataVersion, fileName: 'x.xlsx',
+    storedPath: w3.outputPath, sha256: w3.sha256, snapshot: p2.snapshot, verify: null, createdBy: 't' });
+  assert.equal(db.markStaUploaded({ runId: run3, exportId: ex3.exportId, actor: 't' }).error, 'already_uploaded');
+  assert.equal(db.getRun(run3).sta_export_id, ex2.exportId);
+  // STAアップ済みの回は資材の外寸を変えても版が進まない (アップ済み Excel の版を守る)
+  const vDone = db.getRun(run3).data_version;
+  db.upsertMaterial({ code: 'box140', name: '140サイズ段ボール', tareG: 900, widthCm: 47, lengthCm: 35, heightCm: 30.5, sort: 1, actor: 't' });
+  assert.equal(db.getRun(run3).data_version, vDone);
+});
+t('名簿 bootstrap は一度 PIN が設定されたら閉じたまま (職員が全員無効でも戻らない)', () => {
+  assert.equal(db.isRosterBootstrap(), false);
+  db.setWorkerActive(staff.id, false);
+  assert.equal(db.countStaffWithPin(), 0);
+  assert.equal(db.isRosterBootstrap(), false);
+  db.setWorkerActive(staff.id, true);
+});
+t('PR2 の操作が fbx_events に残っている', () => {
+  const actions = new Set(db.listEvents(1000).map((e) => e.action));
+  for (const a of ['box_void', 'excel_export', 'run_sta_uploaded', 'material_upsert']) assert.ok(actions.has(a), `missing event: ${a}`);
+});
+
+console.log('■ PR2: fbx_boxes の void 移行');
+const Database = (await import('better-sqlite3')).default;
+const mdb = new Database(path.join(tmp, 'migrate.db'));
+mdb.pragma('journal_mode = WAL'); mdb.pragma('foreign_keys = ON');
+db.createTables(mdb);
+// PR1 時点のスキーマ (status CHECK が open/closed のみ) に戻してデータを入れる
+mdb.pragma('foreign_keys = OFF');
+mdb.exec(`DROP TABLE fbx_boxes;
+  CREATE TABLE fbx_boxes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, pack_group_id INTEGER NOT NULL REFERENCES fbx_pack_groups(id),
+    box_no INTEGER NOT NULL CHECK (box_no >= 1), box_code TEXT NOT NULL, material_code TEXT,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+    measured_weight_kg REAL CHECK (measured_weight_kg IS NULL OR measured_weight_kg > 0),
+    closed_at TEXT, closed_by TEXT, closed_reason TEXT,
+    cushion_level TEXT CHECK (cushion_level IS NULL OR cushion_level IN ('none','little','much')),
+    reopen_count INTEGER NOT NULL DEFAULT 0, created_by TEXT, created_at TEXT NOT NULL, UNIQUE(pack_group_id, box_no));`);
+mdb.pragma('foreign_keys = ON');
+mdb.exec(`INSERT INTO fbx_runs (id, source_run_id, title, status, created_at) VALUES (1, 1, 'r', 'active', 'now');
+  INSERT INTO fbx_excel_files (id, run_id, stored_path, sha256, fingerprint, uploaded_at) VALUES (1, 1, '/x', 'h', 'f', 'now');
+  INSERT INTO fbx_pack_groups (id, run_id, excel_file_id, sheet_name, packing_group_id, display_name) VALUES (1, 1, 1, 's', 'pg1', 'G1');
+  INSERT INTO fbx_rows (id, run_id, pack_group_id, excel_row, seller_sku, fnsku, planned_qty) VALUES (1, 1, 1, 6, 'sku', 'X1', 5);
+  INSERT INTO fbx_boxes (id, pack_group_id, box_no, box_code, status, measured_weight_kg, closed_at, created_at) VALUES (1, 1, 1, 'G1-B1', 'closed', 3.5, 'now', 'now');
+  INSERT INTO fbx_boxes (id, pack_group_id, box_no, box_code, created_at) VALUES (2, 1, 2, 'G1-B2', 'now');
+  INSERT INTO fbx_placements (run_id, row_id, box_id, qty, box_seq, device_key, request_id, created_at) VALUES (1, 1, 1, 5, 1, 'd', 'r', 'now');`);
+t('PR1 スキーマの fbx_boxes を void 対応へ再構築: データ保持・FK 健全・冪等', () => {
+  assert.equal(/'void'/.test(mdb.prepare(`SELECT sql FROM sqlite_master WHERE name = 'fbx_boxes'`).get().sql), false);
+  db.createTables(mdb);
+  const sql = mdb.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fbx_boxes'`).get().sql;
+  assert.ok(sql.includes("'void'"));
+  assert.ok(sql.includes('voided_at'));
+  assert.equal(mdb.prepare('SELECT COUNT(*) c FROM fbx_boxes').get().c, 2);
+  const b = mdb.prepare('SELECT * FROM fbx_boxes WHERE id = 1').get();
+  assert.equal(b.status, 'closed'); assert.equal(b.measured_weight_kg, 3.5); assert.equal(b.box_code, 'G1-B1');
+  assert.equal(mdb.prepare('SELECT box_id FROM fbx_placements').get().box_id, 1);
+  assert.deepEqual(mdb.prepare('PRAGMA foreign_key_check').all(), []);
+  assert.equal(mdb.pragma('foreign_keys', { simple: true }), 1);
+  assert.equal(mdb.prepare('SELECT COUNT(*) c FROM sqlite_master WHERE name = ?').get('fbx_boxes_new').c, 0);
+  db.createTables(mdb);   // 2回目は何もしない
+  assert.equal(mdb.prepare('SELECT COUNT(*) c FROM fbx_boxes').get().c, 2);
+  // 移行後の表で void が使える
+  mdb.prepare(`UPDATE fbx_boxes SET status = 'void', voided_at = 'now' WHERE id = 2`).run();
+  assert.equal(mdb.prepare('SELECT status FROM fbx_boxes WHERE id = 2').get().status, 'void');
+});
+mdb.close();
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed === 0 ? 0 : 1);

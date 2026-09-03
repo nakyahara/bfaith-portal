@@ -135,6 +135,7 @@ export function matchWorkbook(parsed, planSheets) {
       structure: {
         headerRow: sheet.headerRow, headers: sheet.headers, boxColumns: sheet.boxColumns,
         totalBoxes: sheet.totalBoxes, boxNameRow: sheet.boxNameRow, dimRows: sheet.dimRows,
+        boxNames: sheet.boxNames || {},   // Amazon 側の箱名 ("P1 - B3")。欠番時の対応表示・箱札に使う (PR2)
       },
       rows: m.rows,
     });

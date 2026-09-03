@@ -13,9 +13,12 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(__dirname, 'python', 'parse_packlist.py');
+const WRITE_SCRIPT = path.join(__dirname, 'python', 'write_packlist.py');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 export const EXCEL_DIR = path.join(DATA_DIR, 'fba-box-excel');
+/** Excel 出力の保存先 (版ごとに別ファイル。原本は EXCEL_DIR 直下のまま非破壊) */
+export const EXPORT_DIR = path.join(EXCEL_DIR, 'exports');
 
 export const MAX_XLSX_BYTES = 8 * 1024 * 1024;
 
@@ -27,17 +30,22 @@ function pythonCmd() {
   return process.platform === 'win32' ? 'python' : 'python3';
 }
 
-function runPython(args, { timeoutMs = 30_000 } = {}) {
+/**
+ * Python スクリプトを起動して stdout の JSON を返す。
+ * input があれば stdin に流す (書き込み指示のような大きな JSON は引数でなく stdin で渡す —
+ * [[feedback_external_cli_pass_data_via_stdin]])
+ */
+function runPython(script, args, { timeoutMs = 30_000, input = null, label = 'Excel解析' } = {}) {
   return new Promise((resolve, reject) => {
     // PYTHONUTF8: Windows ローカルでは stdout が cp932 になり JSON が壊れる (Render/Linux は元々 UTF-8)
-    const cp = spawn(pythonCmd(), [SCRIPT, ...args], {
-      stdio: ['ignore', 'pipe', 'pipe'],
+    const cp = spawn(pythonCmd(), [script, ...args], {
+      stdio: [input == null ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
     });
     let out = '', err = '';
     const timer = setTimeout(() => {
       cp.kill('SIGKILL');
-      reject(new Error('Excel解析がタイムアウトしました'));
+      reject(new Error(`${label}がタイムアウトしました`));
     }, timeoutMs);
     cp.stdout.on('data', (c) => { out += c; if (out.length > 20 * 1024 * 1024) { cp.kill('SIGKILL'); } });
     cp.stderr.on('data', (c) => { err += c; });
@@ -47,10 +55,49 @@ function runPython(args, { timeoutMs = 30_000 } = {}) {
       try {
         resolve(JSON.parse(out));
       } catch {
-        reject(new Error(`Excel解析に失敗しました (exit=${code}): ${String(err).slice(0, 300)}`));
+        reject(new Error(`${label}に失敗しました (exit=${code}): ${String(err).slice(0, 300)}`));
       }
     });
+    if (input != null) {
+      cp.stdin.on('error', () => { /* 子が先に落ちた場合の EPIPE。close 側で失敗として扱う */ });
+      cp.stdin.end(input);
+    }
   });
+}
+
+/**
+ * パックリストへの書き込み (PR2, 要件 F-7)。python/write_packlist.py が原本 zip の該当セルだけを
+ * 差し替え、再読込・byte 一致・fingerprint で独自検算した結果を返す。
+ * @param sheets [{ sheetName, cells: [{row, col, value, kind}] }]
+ * @returns { ok:true, outputPath, sha256, written, verify } | { ok:false, error, message, ... }
+ */
+export async function writePacklist({ templatePath, sheets, fileTag = 'export' }) {
+  if (!templatePath || !fs.existsSync(templatePath)) {
+    return { ok: false, error: 'template_missing', message: 'アップロードされた原本Excelが見つかりません (永続ディスクから消えた可能性)。テンプレを再アップロードしてください' };
+  }
+  fs.mkdirSync(EXPORT_DIR, { recursive: true });
+  const outputPath = path.join(EXPORT_DIR, `${String(fileTag).replace(/[^a-zA-Z0-9_-]/g, '')}-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.xlsx`);
+  let r;
+  try {
+    r = await runPython(WRITE_SCRIPT, [], {
+      timeoutMs: 60_000, label: 'Excel書き込み',
+      input: JSON.stringify({ template: templatePath, output: outputPath, sheets }),
+    });
+  } catch (e) {
+    try { fs.unlinkSync(outputPath); } catch { /* noop */ }
+    return { ok: false, error: 'write_failed', message: e.message };
+  }
+  if (!r.ok) {
+    try { fs.unlinkSync(outputPath); } catch { /* noop */ }
+    return { ok: false, error: r.error || 'write_failed', message: r.message || 'Excelに書き込めませんでした', detail: r };
+  }
+  // Python が報告した sha256 と Node 側で計算した値の一致 (別実装で二重に確認)
+  const sha256 = crypto.createHash('sha256').update(fs.readFileSync(outputPath)).digest('hex');
+  if (sha256 !== r.sha256) {
+    try { fs.unlinkSync(outputPath); } catch { /* noop */ }
+    return { ok: false, error: 'verify_failed', message: '出力ファイルのハッシュが一致しません' };
+  }
+  return { ok: true, outputPath, sha256, written: r.written, cleared: r.cleared || 0, verify: r.verify };
 }
 
 /**
@@ -73,7 +120,7 @@ export async function ingestPacklist(buffer, originalName) {
   fs.writeFileSync(storedPath, buffer);
   let parsed;
   try {
-    parsed = await runPython([storedPath]);
+    parsed = await runPython(SCRIPT, [storedPath]);
   } catch (e) {
     try { fs.unlinkSync(storedPath); } catch { /* noop */ }
     return { ok: false, error: 'parse_failed', message: e.message };
@@ -87,6 +134,14 @@ export async function ingestPacklist(buffer, originalName) {
   if (lockedCount > 0) {
     try { fs.unlinkSync(storedPath); } catch { /* noop */ }
     return { ok: false, error: 'locked_cells', message: `書き込み対象のセルが保護されています (${lockedCount}箇所)。テンプレの形式が変わった可能性があります — 手動転記に切り替えて中原さんに連絡してください` };
+  }
+  // 記入済みのテンプレ (箱数量・重量寸法に値が残っている) は受理しない (Codex PR2 #2):
+  // 出力は値のあるセルだけ書く + 空欄クリアだが、取込段階で「STA からDLした素のテンプレ」に限定して
+  // 古い数量・寸法の混入経路そのものを塞ぐ
+  const prefilled = parsed.sheets.reduce((a, s) => a + (s.prefilledTargets?.length || 0), 0);
+  if (prefilled > 0) {
+    try { fs.unlinkSync(storedPath); } catch { /* noop */ }
+    return { ok: false, error: 'prefilled_template', message: `箱数量・重量・寸法に入力済みの値があります (${prefilled}箇所)。STA からダウンロードした直後の未記入のパックリストをアップロードしてください` };
   }
   // 未知の fingerprint は受理しない (Codex PR1 #1: 列構造の意味が変わった新テンプレで
   // 作業→誤ったExcel出力まで進む事故を、警告ではなく拒否で止める)。

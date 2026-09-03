@@ -84,6 +84,10 @@
               <% if (r.status === 'setup') { %>
                 <button class="btn-sm run-activate" data-id="<%= r.id %>">✅ 有効化 (iPadに出す)</button>
               <% } %>
+              <% if (r.status === 'active' || r.status === 'done') { %>
+                <button class="btn-sm run-export" data-id="<%= r.id %>">📤 Excel出力</button>
+                <a class="btn-sm" href="<%= base %>/print/boxes?run=<%= r.id %>" target="_blank">🖨 箱札</a>
+              <% } %>
               <% if (r.status === 'active') { %>
                 <button class="btn-sm run-done" data-id="<%= r.id %>">🏁 完了にする</button>
               <% } %>
@@ -99,9 +103,19 @@
       <div id="run-detail-out"></div>
     </div>
 
+    <div class="fbx-box" id="export-box" style="display:none">
+      <h2>📤 Excel 出力 — <span id="ex-title"></span></h2>
+      <p class="hint">
+        出荷前チェックの⛔が消えたら出力できます。出力はアップロードした原本 (STA のパックリスト) の対象セルだけを書き換えたファイルで、
+        ファイル名も原本と同じです。ダウンロード → STA の「輸送箱の梱包情報」でアップロード → 期限は STA 画面で入力 → ここで「STA にアップした」を記録 (納品回が完了になります)。
+      </p>
+      <div id="ex-body"></div>
+    </div>
+
     <div class="fbx-box">
       <h2>👤 作業者 (いろは名簿)</h2>
-      <p class="hint">iPad の名前タップに出る名簿。職員は 🔑PIN を設定すると、取消・不足確定・箱の開け直しができます。</p>
+      <p class="hint">iPad の名前タップに出る名簿。職員は 🔑PIN を設定すると、取消・不足確定・箱の開け直し・箱の取消ができます。<br>
+        名簿の追加・PIN設定は <b>iPad の「👥 名簿」からいろはの職員が自分で行えます</b> (職員PINが必要。PIN持ちの職員がいない最初の1回だけ PIN なしで登録可)。ここは本社側の補助です。</p>
       <div class="row">
         <input type="text" id="w-name" placeholder="表示名 (例: たなか)" maxlength="30">
         <select id="w-type"><option value="member">利用者</option><option value="staff">職員</option></select>
@@ -127,6 +141,39 @@
     </div>
 
     <% if (isAdmin) { %>
+    <div class="fbx-box">
+      <h2>📦 資材 (段ボール) — 外寸は Excel の幅・長さ・高さ欄に入ります</h2>
+      <p class="hint">外寸 cm が空の資材で作った箱は、Excel の寸法欄が空のまま出力され STA 画面で手入力になります。自重 g は重量補助 (PR3) 用です。</p>
+      <table class="fbx-list" id="mat-table">
+        <tr><th>コード</th><th>名前</th><th>自重g</th><th>幅cm</th><th>長さcm</th><th>高さcm</th><th>並び</th><th>有効</th><th></th></tr>
+        <% for (const m of materials) { %>
+          <tr class="mat-row" data-code="<%= m.code %>">
+            <td><code><%= m.code %></code></td>
+            <td><input type="text" class="m-name" value="<%= m.name %>" maxlength="30" style="width:150px"></td>
+            <td><input type="number" class="m-tare" value="<%= m.tare_g == null ? '' : m.tare_g %>" style="width:70px"></td>
+            <td><input type="number" step="0.1" class="m-w" value="<%= m.width_cm == null ? '' : m.width_cm %>" style="width:70px"></td>
+            <td><input type="number" step="0.1" class="m-l" value="<%= m.length_cm == null ? '' : m.length_cm %>" style="width:70px"></td>
+            <td><input type="number" step="0.1" class="m-h" value="<%= m.height_cm == null ? '' : m.height_cm %>" style="width:70px"></td>
+            <td><input type="number" class="m-sort" value="<%= m.sort %>" style="width:50px"></td>
+            <td><input type="checkbox" class="m-active" <%= m.active ? 'checked' : '' %>></td>
+            <td><button class="btn-sm m-save">保存</button></td>
+          </tr>
+        <% } %>
+        <tr class="mat-row" data-code="">
+          <td><input type="text" class="m-code" placeholder="例: box120" maxlength="20" style="width:90px"></td>
+          <td><input type="text" class="m-name" placeholder="名前" maxlength="30" style="width:150px"></td>
+          <td><input type="number" class="m-tare" style="width:70px"></td>
+          <td><input type="number" step="0.1" class="m-w" style="width:70px"></td>
+          <td><input type="number" step="0.1" class="m-l" style="width:70px"></td>
+          <td><input type="number" step="0.1" class="m-h" style="width:70px"></td>
+          <td><input type="number" class="m-sort" value="5" style="width:50px"></td>
+          <td><input type="checkbox" class="m-active" checked></td>
+          <td><button class="btn-sm m-save">追加</button></td>
+        </tr>
+      </table>
+      <div class="msg" id="m-msg"></div>
+    </div>
+
     <div class="fbx-box">
       <h2>📱 iPad の登録</h2>
       <p class="hint">
@@ -247,6 +294,91 @@
           `</table>
           <p>箱: ${boxes.map(x => `${esc(x.box_code)}(${x.total_qty}個${x.measured_weight_kg ? '・' + x.measured_weight_kg + 'kg' : ''}${x.status === 'closed' ? '・閉' : ''})`).join(' / ') || 'なし'}</p>`;
         }).join('');
+    }));
+
+    // ─── Excel 出力 (PR2): 出荷前チェック → 出力 → ダウンロード → STAアップ済み ───
+    const escH = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+    async function openExportPanel(runId) {
+      const box = $('#export-box'), body = $('#ex-body');
+      box.style.display = '';
+      body.innerHTML = '読み込み中…';
+      const r = await fetch(`${BASE}/admin/runs/${runId}/readiness`);
+      const j = await r.json().catch(() => ({ ok: false }));
+      if (!j.ok) { body.innerHTML = `<p class="msg err">${escH(j.message || '読み込めませんでした')}</p>`; return; }
+      const rd = j.readiness;
+      const stJa = { setup: '準備中', active: '作業中', done: '完了', cancelled: '取消' };
+      $('#ex-title').textContent = `#${rd.run.id} ${rd.run.title} (${stJa[rd.run.status] || rd.run.status} / データ版 ${rd.run.dataVersion})`;
+      const detail = (x) =>
+        (x.rows ? `<ul style="margin:4px 0 0 18px">${x.rows.map(y => `<li>${escH((y.name || '').slice(0, 40))} <code>${escH(y.fnsku)}</code> 予定${y.planned} 入力${y.placed}${y.shortage ? ' 不足' + y.shortage : ''}${y.matchState ? ' [' + escH(y.matchState) + ']' : ''}${y.reason ? ' (' + escH(y.reason) + ')' : ''}</li>`).join('')}</ul>` : '') +
+        (x.boxes ? `<ul style="margin:4px 0 0 18px">${x.boxes.map(y => `<li>${escH(y.code)}${y.amazonName && y.amazonBoxNo !== y.boxNo ? ' → Amazon ' + escH(y.amazonName) : ''} (${y.qty}個)</li>`).join('')}</ul>` : '');
+      body.innerHTML = `
+        <h3 style="margin:8px 0 4px">出荷前チェック</h3>
+        ${rd.ok ? '<p class="msg ok">✅ ブロッカーなし — 出力できます</p>' : rd.blockers.map(x => `<div class="msg err">⛔ ${escH(x.message)}${detail(x)}</div>`).join('')}
+        ${rd.warnings.map(x => `<div class="msg" style="color:#B5651D">⚠ ${escH(x.message)}${detail(x)}</div>`).join('')}
+        <h3 style="margin:14px 0 4px">箱 ↔ Amazon 箱番号</h3>
+        ${rd.groups.map(g => `<p style="margin:4px 0"><b>${escH(g.sheetName)}</b> (${escH(g.packingGroupId)}) — ${g.boxes.length} 箱 / テンプレ上限 ${g.maxBoxColumns}</p>
+          <table class="fbx-list"><tr><th>箱札</th><th>Amazon</th><th>個数</th><th>実測kg</th><th>資材</th><th>外寸 幅×長さ×高さ</th><th>状態</th></tr>
+          ${g.boxes.map(b => `<tr><td>${escH(b.code)}</td><td ${b.amazonBoxNo !== b.boxNo ? 'class="ng"' : ''}>${escH(b.amazonName)}</td><td>${b.qty}</td><td>${b.weightKg ?? ''}</td><td>${escH(b.material || '')}</td>
+            <td>${b.dims && b.dims.width ? `${b.dims.width}×${b.dims.length}×${b.dims.height}` : '<span class="ng">未設定 (STA画面で入力)</span>'}</td><td>${b.status === 'closed' ? '閉' : '開'}</td></tr>`).join('')}
+          </table>`).join('')}
+        <h3 style="margin:14px 0 4px">期限一覧 (STA 画面へ転記 — Excel には書きません)</h3>
+        ${rd.expiries.length === 0 ? '<p class="hint">期限の記録はありません</p>' : `<table class="fbx-list"><tr><th>FNSKU</th><th>SKU</th><th>商品</th><th>期限</th><th>個数</th></tr>
+          ${rd.expiries.map(e => `<tr><td><code>${escH(e.fnsku)}</code></td><td>${escH(e.sku)}</td><td>${escH((e.name || '').slice(0, 40))}</td><td><b>${escH(e.expiry)}</b></td><td>${e.qty}</td></tr>`).join('')}</table>
+          <button class="btn-sm" id="ex-copy" style="margin-top:6px">📋 期限一覧をコピー (タブ区切り)</button>`}
+        <h3 style="margin:14px 0 4px">出力履歴</h3>
+        ${j.exports.length === 0 ? '<p class="hint">まだ出力していません</p>' : `<table class="fbx-list"><tr><th>#</th><th>データ版</th><th>作成</th><th>状態</th><th>操作</th></tr>
+          ${j.exports.map(e => `<tr><td>${e.id}</td><td>${e.data_version}</td><td>${(e.created_at || '').slice(0, 16).replace('T', ' ')}<br><small>${escH(e.created_by || '')}</small></td>
+            <td>${e.sta_uploaded ? '<span class="st active">STAアップ済み</span>' : (e.stale ? '<span class="st cancelled">旧版 (出力後にデータ変更あり)</span>' : '<span class="st setup">最新</span>')}</td>
+            <td><a class="btn-sm" href="${BASE}/admin/exports/${e.id}/download">⬇ ダウンロード</a>
+              ${!e.stale && !rd.run.staUploadedAt ? `<button class="btn-sm ex-sta" data-id="${e.id}">✅ STA にアップした</button>` : ''}</td></tr>`).join('')}</table>`}
+        <div class="row" style="margin-top:12px">
+          <button id="ex-go" ${rd.ok ? '' : 'disabled'}>📤 Excel を出力する${rd.exportState.latest && !rd.exportState.stale ? ' (同じ内容の再出力)' : ''}</button>
+          <button id="ex-close">閉じる</button>
+        </div>
+        <div class="msg" id="ex-msg"></div>`;
+      $('#ex-close').addEventListener('click', () => { box.style.display = 'none'; });
+      $('#ex-copy')?.addEventListener('click', async () => {
+        const tsv = ['FNSKU\tSKU\t商品\t期限\t個数', ...rd.expiries.map(e => [e.fnsku, e.sku, e.name, e.expiry, e.qty].join('\t'))].join('\n');
+        try { await navigator.clipboard.writeText(tsv); setMsg($('#ex-msg'), 'ok', '期限一覧をコピーしました'); }
+        catch { setMsg($('#ex-msg'), 'err', 'コピーできませんでした (表を選択してコピーしてください)'); }
+      });
+      $('#ex-go').addEventListener('click', async () => {
+        $('#ex-go').disabled = true;
+        setMsg($('#ex-msg'), '', '原本に書き込んで検算しています…');
+        const jj = await post(`/admin/runs/${runId}/exports`);
+        if (!jj.ok) {
+          setMsg($('#ex-msg'), 'err', (jj.message || '出力できませんでした') + (jj.readiness ? '\n' + jj.readiness.blockers.map(b => '- ' + b.message).join('\n') : ''));
+          $('#ex-go').disabled = false;
+          return;
+        }
+        setMsg($('#ex-msg'), 'ok', `✅ 出力 #${jj.exportId} (${jj.written} セル書込・検算OK)。ダウンロードを開始します${jj.stale ? '\n⚠ 書き込み中にデータが変わりました。もう一度出力してください' : ''}`);
+        window.location.href = jj.downloadUrl;   // attachment なので画面は残る
+        setTimeout(() => openExportPanel(runId), 1200);
+      });
+      document.querySelectorAll('.ex-sta').forEach(b => b.addEventListener('click', async () => {
+        if (!confirm('この出力ファイルを STA にアップロードしましたか?\n記録すると納品回は「完了」になり、iPad から変更できなくなります')) return;
+        const jj = await post(`/admin/runs/${runId}/sta-uploaded`, { export_id: Number(b.dataset.id) });
+        if (!jj.ok) return setMsg($('#ex-msg'), 'err', jj.message);
+        setMsg($('#ex-msg'), 'ok', 'STA アップ済みとして記録しました (納品回は完了)');
+        setTimeout(() => location.reload(), 900);
+      }));
+    }
+    document.querySelectorAll('.run-export').forEach(b => b.addEventListener('click', () => {
+      openExportPanel(Number(b.dataset.id));
+      $('#export-box').scrollIntoView({ behavior: 'smooth' });
+    }));
+
+    // 資材 (管理者)
+    document.querySelectorAll('.m-save').forEach(b => b.addEventListener('click', async () => {
+      const tr = b.closest('tr');
+      const v = cls => { const el = tr.querySelector(cls); return el ? el.value : ''; };
+      const j = await post('/admin/materials', {
+        code: tr.dataset.code || v('.m-code'), name: v('.m-name'), tare_g: v('.m-tare'),
+        width_cm: v('.m-w'), length_cm: v('.m-l'), height_cm: v('.m-h'), sort: v('.m-sort'),
+        active: tr.querySelector('.m-active').checked,
+      });
+      setMsg($('#m-msg'), j.ok ? 'ok' : 'err', j.ok ? '保存しました' : j.message);
+      if (j.ok) setTimeout(() => location.reload(), 600);
     }));
 
     // 作業者
