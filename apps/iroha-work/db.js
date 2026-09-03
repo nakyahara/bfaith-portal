@@ -508,7 +508,7 @@ export function createTables(db = getMirrorDB()) {
   // 作業開始時点の作業仕様スナップショット (§1.7 ④: 後で仕様が変わっても
   // 「当時何を見て作業したか」を残す。JSON)
   // 外部施設に出す準備ができたか (状態とは別のチェック。Notion のチェックボックスの置き換え — 中原さん 2026-09-03)
-  addCol('f_iroha_tasks', 'external_ready', 'INTEGER NOT NULL DEFAULT 0');
+  addCol('f_iroha_tasks', 'external_ready', 'INTEGER NOT NULL DEFAULT 0 CHECK (external_ready IN (0,1))');
   addCol('f_iroha_work_sessions', 'master_snapshot', 'TEXT');
   // Drive 側で消えた写真の印 (配信で 404/410 を見たら付け、表示と「前回の完成形」候補から外す。
   // 管理画面の再実行で解除 — Codex R1 #5)

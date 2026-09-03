@@ -1935,6 +1935,10 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   ok(S2.neededBoxes(100, 10, 30, 5) === '2箱+5', 'Z 在庫があれば Z在庫−Z引当 で計算 (30−5=25 → 2箱+5)');
   ok(S2.neededBoxes(100, 10, 0, 0) === '10箱', 'Z 在庫が 0 なら数量で計算');
   ok(S2.neededBoxes(100, 10, 20, 20) === '0箱', 'Z 在庫が全部引当済みなら 0箱');
+  ok(S2.neededBoxes(100, 10, 20, 30) === null, 'Z 引当が Z 在庫より多ければ (負になる) 出さない');
+  ok(S2.neededBoxes(100.5, 10) === null && S2.neededBoxes(100, 10.5) === null, '小数は出さない (箱数を保証できない)');
+  ok(S2.neededBoxes(Number.MAX_VALUE, 10) === null && S2.planHours(Number.MAX_VALUE, 2) === null, '桁があふれる値は出さない (Infinity を返さない)');
+  ok(S2.planHours(-100, 2) === null && S2.neededBoxes(-100, 10) === null, '負の数は出さない');
 
   // 一覧のカードに乗る
   const t = TD.upsertTaskFromImport({ notion_page_id: 'plan-1', status: 'not_started', destination_id: 9301,
@@ -1961,8 +1965,49 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
     VALUES ('PLAN-A', '想定時間テスト', 'P3F-001-001-01', 'P3F', '良品', 500, 0, ?, ?)`).run(new Date().toISOString(), new Date().toISOString());
   clearEnrichCache();
   ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === 30, 'Z 以外のロケ (本館・いろは棟) は数えない');
+  // 有効期限・入荷日で分かれた行は合算する。ブロック略称だけが Z の行も数える (Codex FB R1)
+  const insZ = db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 有効期限, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('PLAN-A', '想定時間テスト', ?, ?, '良品', ?, ?, ?, ?, ?)`);
+  const nowIso = new Date().toISOString();
+  insZ.run('Z01-001-001-03', 'Z01', '2027-01', 12, 2, nowIso, nowIso);       // ロケも略称も Z
+  insZ.run('AAAA-001-001-01', 'ZZZ', '2027-02', 8, 0, nowIso, nowIso);        // 略称だけ Z (棚以外)
+  clearEnrichCache();
+  const card4 = S2.buildTaskList().cards.find(c => c.id === t);
+  ok(card4.z_stock === 50, 'Z の行は期限・入荷日で分かれていても合算する (30+12+8)');
+  ok(card4.boxes === '4箱+3', '引当を引いて計算する (50−7=43 → 4箱+3)');
+  // 画面に出す用: 引当と、在庫ミラーをいつ取ったか (毎時更新。画面は 60 秒ごとに読み直す)
+  ok(card4.z_allocated === 7 && card4.z_free === 43, '引当と使える数もカードに乗る');
+  ok(card4.z_at && card4.z_at === db.prepare("SELECT MAX(captured_at) m FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'").get().m,
+    '在庫ミラーの取得時刻 (いちばん新しいもの) が乗る');
+  // 在庫が動いたら、次に一覧を作るときには新しい数になる (キャッシュしない)
+  db.prepare("UPDATE mirror_logizard_stock SET 在庫数 = 在庫数 + 100 WHERE 商品ID = 'PLAN-A' AND ロケ = 'Z01-001-001-01'").run();
+  clearEnrichCache();
+  ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === 150, 'ロジザード在庫が更新されたら次の読み込みで反映される');
+  db.prepare("UPDATE mirror_logizard_stock SET 在庫数 = 在庫数 - 100 WHERE 商品ID = 'PLAN-A' AND ロケ = 'Z01-001-001-01'").run();
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
   clearEnrichCache();
+  ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === null, 'Z に在庫が無ければ null (数量で計算)');
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
+  clearEnrichCache();
+
+  // 古い DB (external_ready が無い) に列を足しても、0/1 しか入らない (Codex FB R1)
+  {
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    db.pragma('foreign_keys = OFF');
+    db.exec('CREATE TEMP TABLE er_bak AS SELECT * FROM f_iroha_tasks');
+    const cols = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name).filter((c) => c !== 'external_ready');
+    db.exec(`DROP TABLE f_iroha_tasks; CREATE TABLE f_iroha_tasks (${db.prepare("SELECT sql FROM sqlite_master WHERE name = 'er_bak'").get() ? '' : ''}`
+      + cols.map((c) => `${c} ${c === 'id' ? 'INTEGER PRIMARY KEY AUTOINCREMENT' : 'TEXT'}`).join(', ') + ');');
+    db.exec(`INSERT INTO f_iroha_tasks (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM er_bak; DROP TABLE er_bak;`);
+    db.pragma('foreign_keys = ON');
+    ok(!db.prepare('PRAGMA table_info(f_iroha_tasks)').all().some((c) => c.name === 'external_ready'), '前提: external_ready の無い古い版');
+    createTables(db);
+    const col = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().find((c) => c.name === 'external_ready');
+    ok(col && col.dflt_value === '0' && col.notnull === 1, '起動時に列が足される (既定 0・NOT NULL)');
+    let bad = null;
+    try { db.prepare('UPDATE f_iroha_tasks SET external_ready = 2 WHERE id = ?').run(t); } catch (e) { bad = e; }
+    ok(bad && /CHECK/.test(bad.message), '足した列にも CHECK が効く (0/1 しか入らない)');
+  }
 
   // 外部施設に出す準備OK (状態とは別のチェック。Notion のチェックボックスの置き換え)
   {
@@ -2033,6 +2078,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(!/mvVideo/.test(html.replace(/\/\/.*$/gm, '')), '作り方どうがは画面から外した (コメントだけ残す)');
   ok(/const hours = mine\.reduce/.test(html), 'ボードの列に想定作業時間の合計を出す');
   ok(/kv\('必要保管箱', c\.boxes\)/.test(html) && /kv\('想定作業時間'/.test(html), '詳細に必要保管箱と想定作業時間を出す');
+  ok(/reg: 'units_per_container'/.test(html) && /reg: 'storage_container'/.test(html), '保管箱と入数は別々にタップできる');
+  ok(/kv\('Zロケ在庫 \(一時保管\)'/.test(html) && /時点/.test(html), '詳細に Z ロケの在庫と、その取得時刻を出す');
   ok(/外部に出す準備OK にする/.test(html) && /async function setExternalReady/.test(html), '詳細に「外部に出す準備OK」の切り替えがある');
   ok(/c\.external_ready \? '📦 外部に出せます'/.test(html) && /tag ready/.test(html), 'ボードと一覧に「外部に出せます」の印が出る');
 }

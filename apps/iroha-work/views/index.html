@@ -1284,10 +1284,13 @@ function renderDetail(c) {
 
     '<div class="dcard"><h3 class="sec">作業のやり方</h3><div class="kvs">' +
       kv('資材', m.material_code, { miss: missSet.has('資材'), reg: 'material_code' }) +
-      kv('保管箱', m.storage_container && m.units_per_container != null
-          ? m.storage_container + 'に ' + m.units_per_container + '個ずつ'
-          : m.storage_container, { miss: missSet.has('保管箱') || missSet.has('入数'), reg: 'storage_container' }) +
+      kv('保管箱', m.storage_container, { miss: missSet.has('保管箱'), reg: 'storage_container' }) +
+      kv('入数 (保管箱1つに入れる数)', m.units_per_container != null ? m.units_per_container + '個' : null,
+        { miss: missSet.has('入数'), reg: 'units_per_container' }) +
       kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程'), reg: 'process_count' }) +
+      kv('Zロケ在庫 (一時保管)', c.z_stock == null ? null
+        : c.z_stock + '個' + (c.z_allocated ? ' (引当 ' + c.z_allocated + ' → 使えるのは ' + c.z_free + '個)' : '')
+          + (c.z_at ? ' ・ ' + fmtDate(c.z_at) + ' ' + fmtTime(c.z_at) + ' 時点' : '')) +
       kv('必要保管箱', c.boxes) +
       kv('想定作業時間', c.plan_hours != null ? c.plan_hours + ' 時間' : null) +
       kv('気をつけること', m.note, { reg: 'note' }) +
