@@ -254,10 +254,10 @@ t('adjustPlacement: 間違えた数を直す = 取消 + 入れ直し (同じ箱)
   const cl = db.adjustPlacement({ placementId: st2.placementId, qty: 2, byStaff: true, worker: staff, deviceKey: 'dev:2', requestId: 'adj-c2' });
   assert.equal(cl.ok, true, JSON.stringify(cl)); assert.equal(cl.boxClosed, true);
   assert.equal(db.getRunState(runId).placements.find((x) => x.id === cl.placementId).box_id, box1.boxId);
-  db.reopenBox({ boxId: box1.boxId, reason: 'テスト', worker: staff });
-  // 0 = 取消だけ
+  // 0 = 取消だけ (閉じた箱のままなので boxClosed も返る = 量り直し案内)
   const z = db.adjustPlacement({ placementId: cl.placementId, qty: 0, byStaff: true, worker: staff, deviceKey: 'dev:2', requestId: 'adj5' });
-  assert.equal(z.ok, true); assert.equal(z.placementId, null);
+  assert.equal(z.ok, true); assert.equal(z.placementId, null); assert.equal(z.boxClosed, true); assert.equal(z.from, 2);
+  db.reopenBox({ boxId: box1.boxId, reason: 'テスト', worker: staff });
   assert.equal(db.getRunState(runId).rows.find((x) => x.id === rowA.id).placed, before - 4);
   assert.ok(db.listEvents(30).some((e) => e.action === 'placement_adjust'));
 });

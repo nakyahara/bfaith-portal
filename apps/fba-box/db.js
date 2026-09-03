@@ -1191,14 +1191,15 @@ export function adjustPlacement({ placementId, qty, byStaff = false, reason, wor
       if (!p) return { ok: false, error: 'not_found', message: '記録が見つかりません' };
       if (p.revoked_at) return { ok: false, error: 'revoked', message: 'この記録は既に取り消されています (画面を更新してください)' };
       if (q === p.qty) return { ok: true, unchanged: true, placementId: p.id, placed: placedOf(d, p.row_id) };
+      // 箱が閉じていれば (職員のみ通る) 中身が変わる = 重さも変わる → 取消だけでも boxClosed を返して量り直しを案内する
+      const boxClosed = d.prepare('SELECT status FROM fbx_boxes WHERE id = ?').get(p.box_id)?.status === 'closed';
       const rv = revokePlacement({ placementId: p.id, byStaff, reason: reason || (byStaff ? '数の修正' : null), worker, deviceKey, deviceLabel });
       if (!rv.ok) return rv;
-      if (q === 0) return { ok: true, placementId: null, placed: rv.placed, revokedId: p.id };
+      if (q === 0) return { ok: true, placementId: null, placed: rv.placed, revokedId: p.id, from: p.qty, to: 0, boxClosed };
       // 閉じた箱の記録は職員だけが直せる (取消側で staff_required になる) → 入れ直しも同じ箱に許可する
       const add = addPlacement({ runId: p.run_id, rowId: p.row_id, boxId: p.box_id, qty: q, expiry: p.expiry, layer: p.placement_layer,
         worker, deviceKey, deviceLabel, requestId: requestId || `adj-${p.id}-${Date.now()}`, allowClosedBox: byStaff });
       if (!add.ok) fail(add);   // 入れ直せない (残数超など) → 取消ごと戻す
-      const boxClosed = d.prepare('SELECT status FROM fbx_boxes WHERE id = ?').get(p.box_id)?.status === 'closed';
       logEvent({ runId: p.run_id, action: 'placement_adjust', targetType: 'placement', targetId: add.placementId,
         workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
         payload: { from: p.qty, to: q, revokedId: p.id, boxId: p.box_id, byStaff, boxClosed } }, d);
