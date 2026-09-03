@@ -789,30 +789,36 @@ export function setWorkOptionActive(id, active) {
  * 追跡 URL・LAN 内アドレス・巨大画像)。許可 = ポータル内 (/apps/… の相対パス。将来 Render 経由配信の写真) か、
  * https の許可ホストだけ。認証情報つきは不可
  */
-const IMAGE_HOST_ALLOW = ['drive.google.com', 'lh3.googleusercontent.com', 'bfaith-portal.onrender.com'];
+const IMAGE_HOST_ALLOW = ['drive.google.com', 'lh3.googleusercontent.com'];
 const PORTAL_ORIGIN = 'https://bfaith-portal.onrender.com';
 // ポータル内で画像として使えるのは、いろはアプリの配信エンドポイントそのものだけ (将来増えたらここに足す)
 const PORTAL_IMAGE_PATH = /^\/apps\/iroha-work\/api\/media\/\d+\/file$/;
+/**
+ * ポータル内のパスの検証。固定 origin で解析し、正規化後のパスが配信エンドポイントそのものであることを確かめる
+ * (%2e%2e や混在エンコードで /apps/ の外へ出られない — Codex 選択肢 R2 #2)。percent-encoding 入り・クエリ・ハッシュは丸ごと不可。
+ * 相対パスでも、同じポータルの絶対 URL でも同じ検証を通す (Codex 選択肢 R3: 絶対 URL で許可パスを迂回させない)
+ */
+function validatePortalImagePath(p) {
+  const bad = { ok: false, message: 'ポータル内のリンクは /apps/iroha-work/api/media/<番号>/file だけ使えます' };
+  let url;
+  try { url = new URL(p, PORTAL_ORIGIN); } catch { return bad; }
+  let decoded;
+  try { decoded = decodeURIComponent(url.pathname); } catch { return bad; }
+  if (url.origin !== PORTAL_ORIGIN || url.pathname !== decoded || decoded.includes('..') || !PORTAL_IMAGE_PATH.test(decoded) || url.search || url.hash) return bad;
+  return { ok: true, value: decoded };
+}
 export function validateOptionImageUrl(raw) {
   const u = String(raw || '').trim();
   if (!u) return { ok: true, value: null };
   if (u.length > 500) return { ok: false, message: '画像リンクが長すぎます (500文字まで)' };
-  if (u.startsWith('/')) {
-    // 固定 origin で解析し、正規化後のパスが配信エンドポイントそのものであることを確かめる
-    // (%2e%2e や混在エンコードで /apps/ の外へ出られない — Codex 選択肢 R2 #2)。percent-encoding 入りは丸ごと不可
-    const bad = { ok: false, message: 'ポータル内のリンクは /apps/iroha-work/api/media/<番号>/file だけ使えます' };
-    let url;
-    try { url = new URL(u, PORTAL_ORIGIN); } catch { return bad; }
-    let decoded;
-    try { decoded = decodeURIComponent(url.pathname); } catch { return bad; }
-    if (url.origin !== PORTAL_ORIGIN || url.pathname !== decoded || decoded.includes('..') || !PORTAL_IMAGE_PATH.test(decoded) || url.search || url.hash) return bad;
-    return { ok: true, value: decoded };
-  }
+  if (u.startsWith('/')) return validatePortalImagePath(u);
   let url;
   try { url = new URL(u); } catch { return { ok: false, message: '画像は https のリンクか、ポータル内 (/apps/…) のパスを入れてください' }; }
   if (url.protocol !== 'https:') return { ok: false, message: '画像は https のリンクだけ使えます' };
   if (url.username || url.password) return { ok: false, message: '認証情報つきのリンクは使えません' };
-  if (!IMAGE_HOST_ALLOW.includes(url.hostname)) return { ok: false, message: `画像のリンク先は ${IMAGE_HOST_ALLOW.join(' / ')} だけ使えます` };
+  // 同じポータルの絶対 URL は、相対パスと同じ制限 (配信エンドポイントだけ)。保存は相対パスに揃える
+  if (url.origin === PORTAL_ORIGIN) return validatePortalImagePath(url.pathname + url.search + url.hash);
+  if (!IMAGE_HOST_ALLOW.includes(url.hostname)) return { ok: false, message: `画像のリンク先は ${IMAGE_HOST_ALLOW.join(' / ')} か、ポータル内の配信エンドポイントだけ使えます` };
   return { ok: true, value: url.toString() };
 }
 

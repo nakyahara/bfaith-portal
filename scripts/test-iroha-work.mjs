@@ -798,6 +798,11 @@ console.log('\n[16] 作業のやり方の選択肢 (資材・保管箱): Excel �
     && !validateOptionImageUrl('/apps/iroha-work/api/media/12/file?x=1').ok && !validateOptionImageUrl('//evil.example.com/x.jpg').ok,
     'ポータル内でも配信エンドポイント以外・クエリつき・// 始まりは不可');
   ok(validateOptionImageUrl('/apps/iroha-work/api/media/12/file').value === '/apps/iroha-work/api/media/12/file', '配信エンドポイントは正規化済みの値で保存');
+  // 同じポータルの絶対 URL でも相対パスと同じ制限 (Codex R3)
+  ok(validateOptionImageUrl('https://bfaith-portal.onrender.com/apps/iroha-work/api/media/12/file').value === '/apps/iroha-work/api/media/12/file', 'ポータルの絶対 URL は相対パスに揃えて保存');
+  ok(!validateOptionImageUrl('https://bfaith-portal.onrender.com/apps/other/api/media/1/file').ok && !validateOptionImageUrl('https://bfaith-portal.onrender.com/apps/iroha-work/admin').ok
+    && !validateOptionImageUrl('https://bfaith-portal.onrender.com/apps/%2e%2e/admin').ok && !validateOptionImageUrl('https://bfaith-portal.onrender.com/apps/iroha-work/api/media/12/file?x=1').ok,
+    'ポータルの絶対 URL でも配信エンドポイント以外・エンコード・クエリは不可');
 
   // 古い版 (normalized_code 無し・UNIQUE(kind, code)) のテーブルが残っていても、起動時に統合して作り直す (Codex R2 #1)
   {
