@@ -232,6 +232,13 @@
   <script>
     const BASE = '<%= base %>';
     const $ = s => document.querySelector(s);
+    const REASON_JA = { missing: '現物がない', damaged: '破損', bad_label: 'ラベル不良', wrong_item: '商品違い', expiry_issue: '期限が合わない',
+      hq_order: '本社指示', stock_short: '在庫が少ない', not_shipped: '今回は納品しない', other: 'その他' };
+    // 不足の理由 (内訳があれば「破損 2 + 今回は納品しない 3」)
+    const shortageJa = (x) => {
+      try { const d = JSON.parse(x.shortage_detail || 'null'); if (Array.isArray(d)) return d.map(y => `${REASON_JA[y.reason] || y.reason} ${y.qty}`).join(' + '); } catch { /* noop */ }
+      return REASON_JA[x.shortage_reason] || x.shortage_reason || '';
+    };
     async function post(url, body) {
       const r = await fetch(BASE + url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
       return r.json().catch(() => ({ ok: false, message: 'HTTP ' + r.status }));
@@ -306,8 +313,13 @@
     }));
     document.querySelectorAll('.run-done').forEach(b => b.addEventListener('click', async () => {
       if (!confirm('この納品回を完了にしますか? (以後 iPad から入力できません)')) return;
-      const j = await post(`/admin/runs/${b.dataset.id}/status`, { status: 'done' });
-      setMsg($('#run-msg'), j.ok ? 'ok' : 'err', j.ok ? '完了にしました' : j.message);
+      let j = await post(`/admin/runs/${b.dataset.id}/finish`, { acknowledge: false });
+      if (!j.ok && j.error === 'incomplete') {
+        const list = j.rows.slice(0, 15).map(x => `- ${x.planNo || ''} ${(x.name || '').slice(0, 30)}: 残り ${x.remaining}`).join('\n');
+        if (!confirm(`${j.message}\n\n${list}${j.rows.length > 15 ? '\n…' : ''}\n\n残りを「今回は納品しない」として完了しますか?`)) return;
+        j = await post(`/admin/runs/${b.dataset.id}/finish`, { acknowledge: true });
+      }
+      setMsg($('#run-msg'), j.ok ? 'ok' : 'err', j.ok ? `完了にしました${j.notShipped ? ` (納品しない商品 ${j.notShipped} 行)` : ''}` : j.message);
       if (j.ok) setTimeout(() => location.reload(), 800);
     }));
     document.querySelectorAll('.run-cancel').forEach(b => b.addEventListener('click', async () => {
@@ -328,10 +340,11 @@
           const boxes = j.boxes.filter(x => x.pack_group_id === g.id);
           const done = rows.filter(x => x.placed + (x.shortage_qty || 0) >= x.planned_qty).length;
           return `<p><b>${esc(g.sheet_name)}</b> (${esc(g.packing_group_id)}) — 行 ${done}/${rows.length} 完了 / 箱 ${boxes.length} (閉 ${boxes.filter(x => x.status === 'closed').length})</p>
-          <table class="fbx-list"><tr><th>行</th><th>プランNo</th><th>FNSKU</th><th>商品</th><th>予定</th><th>入力済</th><th>不足</th><th>担当</th></tr>` +
-            rows.map(x => `<tr><td>${x.excel_row}</td><td>${esc(x.plan_no || '')}</td><td><code>${esc(x.fnsku)}</code></td>
-              <td>${esc((x.product_name || '').slice(0, 40))}</td><td>${x.planned_qty}</td>
-              <td>${x.placed}</td><td>${x.shortage_qty ? x.shortage_qty + ' (' + esc(x.shortage_reason || '') + ')' : ''}</td>
+          <table class="fbx-list"><tr><th>行</th><th>プランNo</th><th>FNSKU</th><th>商品</th><th>予定</th><th>送る数 (修正)</th><th>入力済</th><th>担当</th></tr>` +
+            rows.map(x => `<tr><td>${x.excel_row ?? ''}</td><td>${esc(x.plan_no || '')}</td><td><code>${esc(x.fnsku)}</code></td>
+              <td>${esc((x.product_name || '').slice(0, 40))}${x.match_state === 'picking_only' ? ' <span class="ng">(Excelに無い)</span>' : ''}</td><td>${x.planned_qty}</td>
+              <td>${x.shortage_qty ? `<b class="ng">${x.planned_qty} → ${x.planned_qty - x.shortage_qty}</b> <small>(${esc(shortageJa(x))}${x.shortage_by ? ' / ' + esc(x.shortage_by) : ''})</small>` : '—'}</td>
+              <td>${x.placed}</td>
               <td>${esc(x.label_worker || '')}${x.check_worker ? ' / ✅' + esc(x.check_worker) : ''}</td></tr>`).join('') +
           `</table>
           <p>箱: ${boxes.map(x => `${esc(x.box_code)}(${x.total_qty}個${x.measured_weight_kg ? '・' + x.measured_weight_kg + 'kg' : ''}${x.status === 'closed' ? '・閉' : ''})`).join(' / ') || 'なし'}</p>`;
@@ -351,7 +364,7 @@
       const stJa = { setup: '準備中', active: '作業中', done: '完了', cancelled: '取消' };
       $('#ex-title').textContent = `#${rd.run.id} ${rd.run.title} (${stJa[rd.run.status] || rd.run.status} / データ版 ${rd.run.dataVersion})`;
       const detail = (x) =>
-        (x.rows ? `<ul style="margin:4px 0 0 18px">${x.rows.map(y => `<li>${escH((y.name || '').slice(0, 40))} <code>${escH(y.fnsku)}</code> 予定${y.planned} 入力${y.placed}${y.shortage ? ' 不足' + y.shortage : ''}${y.matchState ? ' [' + escH(y.matchState) + ']' : ''}${y.reason ? ' (' + escH(y.reason) + ')' : ''}</li>`).join('')}</ul>` : '') +
+        (x.rows ? `<ul style="margin:4px 0 0 18px">${x.rows.map(y => `<li>${y.planNo ? '<b>' + escH(y.planNo) + '</b> ' : ''}${escH((y.name || '').slice(0, 40))} <code>${escH(y.fnsku)}</code> 予定${y.planned} 入力${y.placed}${y.shortage ? ` <b class="ng">送る数 ${y.planned} → ${y.sendQty}</b>` : ''}${y.matchState ? ' [' + escH(y.matchState) + ']' : ''}${y.reasonJa || y.reason ? ' (' + escH(y.reasonJa || y.reason) + ')' : ''}</li>`).join('')}</ul>` : '') +
         (x.boxes ? `<ul style="margin:4px 0 0 18px">${x.boxes.map(y => `<li>${escH(y.code)}${y.amazonName && y.amazonBoxNo !== y.boxNo ? ' → Amazon ' + escH(y.amazonName) : ''} (${y.qty}個)</li>`).join('')}</ul>` : '');
       body.innerHTML = `
         <h3 style="margin:8px 0 4px">出荷前チェック</h3>

@@ -49,9 +49,14 @@
     .row:nth-child(even) { background: #FAFBFC; }
     .row.done { background: #EBFBEE; }
     .row.short { background: #FFF5F5; }
-    .row .no { min-width: 74px; text-align: center; }
-    .row .no .plan { font-size: 0.78em; color: #868E96; }
-    .row .no .fn4 { font-family: ui-monospace, Menlo, monospace; font-weight: 800; font-size: 1.5em; letter-spacing: 0.06em; }
+    .row .no { min-width: 96px; text-align: center; }
+    /* 納品プランNo (紙のシートと同じ「通常_22」) を一番大きく — 現場はこの番号で商品を探す */
+    .row .no .plan { font-weight: 800; font-size: 1.05em; color: #495057; line-height: 1.1; white-space: nowrap; }
+    .row .no .plan b { display: block; font-size: 2em; color: #B5651D; letter-spacing: 0.02em; }
+    .thumb { width: 64px; height: 64px; border-radius: 10px; background: #F1F3F5; display: flex; align-items: center;
+      justify-content: center; overflow: hidden; flex: none; color: #ADB5BD; font-size: 1.4em; }
+    .thumb img { width: 100%; height: 100%; object-fit: contain; }
+    .thumb.big { width: 120px; height: 120px; }
     .row .name { flex: 1; line-height: 1.45; font-size: 1em; }
     .row .name .sub { font-size: 0.8em; color: #868E96; }
     .row .qty { min-width: 108px; text-align: right; }
@@ -210,16 +215,34 @@
     return s ? s.slice(0, maxLen) : '商品名なし';
   }
   function fn4(fnsku) { return String(fnsku || '').slice(-4).toUpperCase(); }
-  function speakRow(row) {
-    if (!ttsOn || !('speechSynthesis' in window)) return;
-    const last4 = fn4(row.fnsku).split('').map(c => CHAR_READ[c] || c).join('、');
-    const text = `${shortName(row.product_name)}。ラベル、${last4}。${row.planned_qty - row.placed}個`;
+  const REASON_JA = { missing: '現物がない', damaged: '破損', bad_label: 'ラベル不良', wrong_item: '商品違い', expiry_issue: '期限が合わない',
+    hq_order: '本社指示', stock_short: '在庫が少ない', not_shipped: '今回は納品しない', other: 'その他' };
+  function speak(text, force) {
+    if ((!ttsOn && !force) || !('speechSynthesis' in window)) return;
     try {
       speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       u.lang = 'ja-JP'; u.rate = Number(LS.get('rate', 1.0));
       speechSynthesis.speak(u);
     } catch { /* 読み上げは補助 — 失敗しても操作は続行 */ }
+  }
+  /** 商品を開いたときの読み上げ: 商品名 + 残数 */
+  function speakRow(row) {
+    speak(`${shortName(row.product_name)}。${Math.max(0, row.planned_qty - row.placed - (row.shortage_qty || 0))}個`);
+  }
+  /** 「下4桁を読む」ボタン: FNSKU の下4桁を 1 文字ずつ (中原さん 9/3 の指定文言) */
+  function speakDigits(row) {
+    const last4 = fn4(row.fnsku).split('').map(c => CHAR_READ[c] || c).join('、');
+    speak(`FNSKUの下4桁を読み上げます。${last4}`, true);
+  }
+  /** 納品プランNo「通常_22」→ ラベル部と番号部 (番号を大きく出す) */
+  function planParts(planNo) {
+    const s = String(planNo || '');
+    const i = s.lastIndexOf('_');
+    return i < 0 ? { label: s || '—', no: '' } : { label: s.slice(0, i), no: s.slice(i + 1) };
+  }
+  function thumbHtml(row, big) {
+    return `<div class="thumb ${big ? 'big' : ''}">${row.image_url ? `<img src="${esc(row.image_url)}" loading="lazy" referrerpolicy="no-referrer" alt="">` : '📦'}</div>`;
   }
 
   // ─── 納品回一覧 ───
@@ -327,14 +350,16 @@
     $('#rows').innerHTML = rows.map(r => {
       const rem = r.planned_qty - r.placed - (r.shortage_qty || 0);
       const done = rowDone(r);
+      const pp = planParts(r.plan_no);
       return `<div class="row ${done ? 'done' : ''} ${r.shortage_qty ? 'short' : ''}" data-id="${r.id}">
-        <div class="no"><div class="plan">${esc(r.plan_no || '—')}</div><div class="fn4">${esc(fn4(r.fnsku))}</div></div>
+        <div class="no"><div class="plan">${esc(pp.label)}<b>${esc(pp.no)}</b></div></div>
+        ${thumbHtml(r)}
         <div class="name">${esc(r.product_name || r.seller_sku)}
           <div class="sub">${esc(r.fnsku)}
             ${r.match_state === 'qty_mismatch' ? '<span class="badge warnm">数量注意</span>' : ''}
             ${r.match_state === 'excel_only' ? '<span class="badge warnm">Excelにだけある</span>' : ''}
             ${r.match_state === 'picking_only' ? '<span class="badge short">Excelに無い (入れない)</span>' : ''}
-            ${r.shortage_qty ? `<span class="badge short">不足${r.shortage_qty}</span>` : ''}
+            ${r.shortage_qty ? `<span class="badge short">送る数 ${r.planned_qty - r.shortage_qty} (予定 ${r.planned_qty}${r.shortage_reason ? '・' + esc(REASON_JA[r.shortage_reason] || r.shortage_reason) : ''})</span>` : ''}
             ${expiryOf(r.id) ? `<span class="badge exp">期限 ${esc(expiryOf(r.id))}</span>` : ''}
             ${r.label_worker ? `👤${esc(r.label_worker)}` : ''}${r.check_worker ? ` ✅${esc(r.check_worker)}` : ''}
           </div>
@@ -364,8 +389,42 @@
       <div class="grid2" style="margin-top:14px">
         <a class="bigbtn sub" style="text-align:center; text-decoration:none; display:block" href="${BASE}/print/boxes?run=${curRunId}" target="_blank">🖨 箱札 (全部)</a>
         <button class="bigbtn sub" id="sm-close">閉じる</button>
-      </div>`);
+      </div>
+      ${S.run.status === 'active' ? '<div style="margin-top:10px"><button class="bigbtn green" id="sm-finish">✅ 作業を終える (職員)</button></div>' : ''}`);
     $('#sm-close').addEventListener('click', closeDialog);
+    $('#sm-finish')?.addEventListener('click', () => finishFlow());
+  }
+
+  /**
+   * 作業を終える: 職員PIN → まだ入っていない商品があれば一覧を出して確認 → それでも完了 (残りは「今回は納品しない」)。
+   * 中身のある開いた箱は先に閉じてもらう
+   */
+  function finishFlow() {
+    staffPinPrompt(async (sw, pin) => {
+      const j = await apiPost(`/api/runs/${curRunId}/finish`, { worker_id: sw.id, pin, acknowledge: false });
+      if (j.ok) { alert(`✅ 作業を終えました${j.voidedBoxes?.length ? `\n(使わなかった箱を取消: ${j.voidedBoxes.join(', ')})` : ''}`); backToRuns(); return; }
+      if (j.error === 'open_boxes') { alert(j.message); return; }
+      if (j.error !== 'incomplete') { alert(j.message || '終えられませんでした'); return; }
+      const dlg = openDialog(`
+        <h2>⚠ まだ入っていない商品があります</h2>
+        <div class="msg" style="color:#495057">${esc(j.message)}</div>
+        <div style="max-height:40vh; overflow-y:auto; margin:10px 0; background:#FFF5F5; border-radius:10px; padding:10px">
+          ${j.rows.map(x => `<div style="padding:5px 0; border-bottom:1px solid #FFE3E3"><b>${esc(x.planNo || '')}</b> ${esc(shortName(x.name, 22))} — 予定 ${x.planned} / 入れた ${x.placed}${x.shortage ? ' / 不足 ' + x.shortage : ''} → <b style="color:#C92A2A">残り ${x.remaining}</b></div>`).join('')}
+        </div>
+        <div class="msg" style="color:#868E96">破損・自社出荷の引当などで納品しない場合はそのまま完了できます。残りは「今回は納品しない」として記録され、本社の画面に出ます</div>
+        <div class="grid2" style="margin-top:12px">
+          <button class="bigbtn sub" id="f-back">戻って続ける</button>
+          <button class="bigbtn red" id="f-go">それでも完了する</button>
+        </div>`);
+      dlg.querySelector('#f-back').addEventListener('click', closeDialog);
+      dlg.querySelector('#f-go').addEventListener('click', async () => {
+        const j2 = await apiPost(`/api/runs/${curRunId}/finish`, { worker_id: sw.id, pin, acknowledge: true });
+        if (!j2.ok) { alert(j2.message || '終えられませんでした'); return; }
+        closeDialog();
+        alert(`✅ 作業を終えました (納品しない商品 ${j2.notShipped} 行)`);
+        backToRuns();
+      });
+    });
   }
   function expiryOf(rowId) {
     const p = (S.placements || []).find(p => p.row_id === rowId && p.expiry);
@@ -485,11 +544,24 @@
     const cur = boxes.find(b => b.id === curBoxId);
     const knownExpiry = expiryOf(r.id);
     const excluded = r.match_state === 'picking_only';   // 添付した Excel (納品プラン) に無い → 入れない
+    const mine = (S.placements || []).filter(p => p.row_id === r.id).sort((a, b) => b.id - a.id);   // この商品の記録 (新しい順)
+    const boxCodeOf = (id) => (S.boxes.find(b => b.id === id) || {}).box_code || '?';
+    const boxClosed = (id) => (S.boxes.find(b => b.id === id) || {}).status === 'closed';
     speakRow(r);
+    const pp = planParts(r.plan_no);
     const dlg = openDialog(`
-      <div class="fn">${esc(r.fnsku).slice(0, -4)}<b>${esc(fn4(r.fnsku))}</b></div>
-      <div class="pname">${esc(r.product_name || r.seller_sku)}
-        <button class="chip" style="background:#E9ECEF;color:#495057" id="d-tts">🔊 もう一度</button></div>
+      <div style="display:flex; gap:14px; align-items:flex-start">
+        ${thumbHtml(r, true)}
+        <div style="flex:1; min-width:0">
+          <div style="font-weight:800; color:#495057">${esc(pp.label)}<span style="font-size:2.2em; color:#B5651D; margin-left:2px">${esc(pp.no)}</span></div>
+          <div class="fn" style="font-size:1.2em">${esc(r.fnsku).slice(0, -4)}<b>${esc(fn4(r.fnsku))}</b></div>
+          <div class="pname" style="margin:4px 0 8px">${esc(r.product_name || r.seller_sku)}</div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap">
+            <button class="chip" style="background:#B5651D" id="d-digits">🔊 下4桁を読む</button>
+            <button class="chip" style="background:#E9ECEF;color:#495057" id="d-tts">🔊 商品名</button>
+          </div>
+        </div>
+      </div>
       <div class="grid2">
         <div>予定 <b style="font-size:1.3em">${r.planned_qty}</b></div>
         <div>残り <b style="font-size:1.3em; color:${rem > 0 ? '#C92A2A' : '#2B8A3E'}">${excluded ? '—' : rem}</b></div>
@@ -517,16 +589,27 @@
             </div>`}
         <div style="margin-top:16px"><button class="bigbtn" id="d-add" ${cur ? '' : 'disabled'}>この箱に入れた</button></div>
       ` : (excluded ? '' : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>`)}
+      ${mine.length > 0 ? `
+        <div class="lbl">📝 この商品の記録 (間違えたら「数を直す」)</div>
+        <div style="background:#F8F9FA; border-radius:10px; padding:6px 10px">
+          ${mine.map(p => `<div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #E9ECEF">
+            <span><b>${esc(boxCodeOf(p.box_id))}</b> に <b style="font-size:1.2em">${p.qty}</b>個 <small style="color:#868E96">${esc(String(p.created_at || '').slice(11, 16))} ${esc(p.worker_name || '')}${boxClosed(p.box_id) ? ' / 箱は閉じ済み' : ''}</small></span>
+            <span style="white-space:nowrap"><button class="selbtn adj" data-id="${p.id}" data-qty="${p.qty}" style="padding:6px 10px">数を直す</button>
+              <button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px">取消</button></span>
+          </div>`).join('')}
+        </div>` : ''}
       <div class="lbl">👤 担当者の記録</div>
       <div class="grid2">
         <button class="selbtn" id="d-lw">ラベル貼り: ${esc(r.label_worker || '—')}</button>
         <button class="selbtn" id="d-cw">確認: ${esc(r.check_worker || '—')}</button>
       </div>
       <div class="lbl">⚠ 困ったとき (職員)</div>
-      <div class="grid2">
-        <button class="selbtn" id="d-short">${r.shortage_qty ? `不足${r.shortage_qty} を直す` : '数が足りない'}</button>
+      <div class="grid3">
+        <button class="selbtn" id="d-sendqty">${r.shortage_qty ? `送る数 ${r.planned_qty - r.shortage_qty} を直す` : '送る数を直す'}</button>
+        <button class="selbtn" id="d-short">数が足りない</button>
         <button class="selbtn" id="d-close">閉じる</button>
       </div>
+      ${r.shortage_qty ? `<div class="msg" style="color:#C92A2A">予定 ${r.planned_qty} → 送る数 ${r.planned_qty - r.shortage_qty}${r.shortage_reason ? ' (' + esc(REASON_JA[r.shortage_reason] || r.shortage_reason) + ')' : ''}</div>` : ''}
       <div class="msg" id="d-msg"></div>`);
 
     let layer = null;
@@ -541,11 +624,33 @@
       closeDialog(); openRowDialog(rowId);
     }));
     dlg.querySelector('.boxnew')?.addEventListener('click', () => { closeDialog(); newBoxDialog(() => openRowDialog(rowId)); });
-    dlg.querySelector('#d-tts').addEventListener('click', () => speakRow(r));
+    dlg.querySelector('#d-tts').addEventListener('click', () => speak(`${shortName(r.product_name)}。${Math.max(0, rem)}個`, true));
+    dlg.querySelector('#d-digits').addEventListener('click', () => speakDigits(r));
     dlg.querySelector('#d-close').addEventListener('click', closeDialog);
     dlg.querySelector('#d-lw').addEventListener('click', () => pickRowWorker(r, 'label_worker'));
     dlg.querySelector('#d-cw').addEventListener('click', () => pickRowWorker(r, 'check_worker'));
     dlg.querySelector('#d-short').addEventListener('click', () => shortageDialog(r));
+    dlg.querySelector('#d-sendqty').addEventListener('click', () => sendQtyDialog(r));
+    // 記録の修正・取消 (利用者 = 自分の端末の直近 10 分・開いた箱。それ以外は職員PIN に自動で切り替え)
+    dlg.querySelectorAll('.adj').forEach(btn => btn.addEventListener('click', () => adjustDialog(r, Number(btn.dataset.id), Number(btn.dataset.qty))));
+    dlg.querySelectorAll('.rvk').forEach(btn => btn.addEventListener('click', async () => {
+      if (!worker) { pickWorker(); return; }
+      if (!confirm('この記録を取り消しますか?')) return;
+      const j2 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: worker.id });
+      if (!j2.ok && j2.error === 'staff_required') {
+        staffPinPrompt(async (sw, pin) => {
+          const reason = prompt('取消の理由');
+          if (!reason) return;
+          const j3 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: sw.id, pin, reason, as_staff: true });
+          if (!j3.ok) alert(j3.message);
+          else if (boxClosed(mine.find(p => p.id === Number(btn.dataset.id))?.box_id)) alert('閉じた箱の中身を取り消しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
+          await refresh(true); openRowDialog(rowId);
+        });
+        return;
+      }
+      if (!j2.ok) alert(j2.message);
+      await refresh(true); openRowDialog(rowId);
+    }));
     dlg.querySelector('#d-add')?.addEventListener('click', async () => {
       const msg = dlg.querySelector('#d-msg');
       if (!worker) { msg.className = 'msg err'; msg.textContent = '先に作業者を選んでください'; pickWorker(); return; }
@@ -680,7 +785,7 @@
       if (!j.ok) { const m = dlg.querySelector('#m-msg'); m.className = 'msg err'; m.textContent = j.message; return; }
       setCurBox(j.boxId);
       closeDialog();
-      alert(`📦 箱「${j.boxCode}」をつくりました。\n箱に太いペンで「${j.boxCode}」と書いてください`);
+      alert(`📦 箱「${j.boxCode}」(${j.boxNo}箱目) をつくりました。\n箱に太いペンで「${j.boxCode}」と書いてください`);
       if (after) after();
     });
   }
@@ -840,6 +945,81 @@
     }));
   }
 
+  // ─── 記録の数を直す (間違えて押したとき): 取消 + 入れ直しを 1 回で ───
+  function adjustDialog(row, placementId, currentQty) {
+    if (!worker) { pickWorker(); return; }
+    const dlg = openDialog(`
+      <h2>✏ 数を直す</h2>
+      <div class="pname">${esc(shortName(row.product_name))} — いまの記録 <b style="font-size:1.3em">${currentQty}</b>個</div>
+      <div class="lbl">正しい個数 (0 = この記録を取り消す)</div>
+      <input class="qtyin" id="a-qty" type="tel" inputmode="numeric" value="${currentQty}">
+      <div style="margin-top:14px"><button class="bigbtn" id="a-go">この数に直す</button></div>
+      <div class="msg" id="a-msg"></div>`);
+    const send = async (extra) => {
+      const qty = Number(dlg.querySelector('#a-qty').value);
+      const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+      return apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId, ...extra });
+    };
+    dlg.querySelector('#a-go').addEventListener('click', async () => {
+      const msg = dlg.querySelector('#a-msg');
+      const qty = Number(dlg.querySelector('#a-qty').value);
+      if (!Number.isInteger(qty) || qty < 0) { msg.className = 'msg err'; msg.textContent = '0 以上の整数で入れてください'; return; }
+      let j = await send({});
+      if (!j.ok && j.error === 'staff_required') {
+        // 時間が経った・他の端末・閉じた箱 → 職員PIN
+        staffPinPrompt(async (sw, pin) => {
+          const j2 = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: sw.id, pin, as_staff: true, reason: '数の修正', qty,
+            request_id: (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2)) });
+          if (!j2.ok) alert(j2.message || '直せませんでした');
+          else if (j2.boxClosed) alert('閉じた箱の中身を直しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
+          await refresh(true); openRowDialog(row.id);
+        });
+        return;
+      }
+      if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message || '直せませんでした'; return; }
+      if (j.boxClosed) alert('閉じた箱の中身を直しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
+      closeDialog();
+      await refresh(true); openRowDialog(row.id);
+    });
+  }
+
+  // ─── 送る数の修正 (職員): 棚の在庫が予定より少ないとき等。予定 → 送る数 と理由を記録 ───
+  function sendQtyDialog(row) {
+    staffPinPrompt(async (staffWorker, pin) => {
+      const current = row.planned_qty - (row.shortage_qty || 0);
+      const dlg = openDialog(`
+        <h2>✏ 送る数を直す (職員)</h2>
+        <div class="pname">${esc(shortName(row.product_name))}</div>
+        <div class="grid3">
+          <div>予定 <b style="font-size:1.3em">${row.planned_qty}</b></div>
+          <div>入れた <b style="font-size:1.3em">${row.placed}</b></div>
+          <div>今の送る数 <b style="font-size:1.3em">${current}</b></div>
+        </div>
+        <div class="lbl">送る数 (実際に納品する個数)</div>
+        <input class="qtyin" id="q-qty" type="tel" inputmode="numeric" value="${current}">
+        <div class="lbl">理由</div>
+        <div class="grid3">
+          ${[['stock_short', '在庫が少ない'], ['damaged', '破損'], ['not_shipped', '今回は納品しない'], ['hq_order', '本社指示'], ['other', 'その他']]
+            .map(([v, ja]) => `<button class="selbtn qrsn ${(row.shortage_reason || 'stock_short') === v ? 'on' : ''}" data-v="${v}">${ja}</button>`).join('')}
+        </div>
+        <div class="msg" style="color:#868E96">予定に戻すときは送る数に予定の数 (${row.planned_qty}) を入れてください。本社の画面には「予定 → 送る数」と理由が出ます</div>
+        <div style="margin-top:14px"><button class="bigbtn" id="q-go">この数で送る</button></div>
+        <div class="msg" id="q-msg"></div>`);
+      let reason = ['stock_short', 'damaged', 'not_shipped', 'hq_order', 'other'].includes(row.shortage_reason) ? row.shortage_reason : 'stock_short';
+      dlg.querySelectorAll('.qrsn').forEach(b => b.addEventListener('click', () => {
+        dlg.querySelectorAll('.qrsn').forEach(x => x.classList.remove('on'));
+        b.classList.add('on'); reason = b.dataset.v;
+      }));
+      dlg.querySelector('#q-go').addEventListener('click', async () => {
+        const msg = dlg.querySelector('#q-msg');
+        const j = await apiPost(`/api/rows/${row.id}/send-qty`, { worker_id: staffWorker.id, pin, send_qty: Number(dlg.querySelector('#q-qty').value), reason });
+        if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message; return; }
+        dialogOpen = false; $('#ovl-root').innerHTML = '';
+        await refresh(true); openRowDialog(row.id);   // 商品の画面に戻る (一覧に落とさない)
+      });
+    });
+  }
+
   // ─── 不足 (職員) ───
   function shortageDialog(row) {
     staffPinPrompt(async (staffWorker, pin) => {
@@ -864,6 +1044,7 @@
           <button class="selbtn srsn" data-v="bad_label">ラベル不良</button>
           <button class="selbtn srsn" data-v="wrong_item">商品違い</button>
           <button class="selbtn srsn" data-v="expiry_issue">期限が合わない</button>
+          <button class="selbtn srsn" data-v="not_shipped">今回は納品しない</button>
           <button class="selbtn srsn" data-v="other">その他</button>
         </div>
         <div style="margin-top:14px"><button class="bigbtn red" id="s-go">不足として確定</button></div>
