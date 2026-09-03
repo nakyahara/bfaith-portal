@@ -828,6 +828,8 @@ function setView(v) {
   curView = v;
   for (const [k, sel] of Object.entries(PAGES)) $(sel).hidden = k !== v;
   for (const [k, sel] of Object.entries(VIEW_BTN)) { const b = $(sel); if (b) b.classList.toggle('on', k === v); }
+  // 開いた画面は必ず描き直す。一覧も同じ (ボードで選んだまま戻ったとき、選択を見えているものへそろえるため — Codex PR-C R2)
+  if (v === 'list') renderList();
   if (v === 'board') renderBoard();
   if (v === 'label') loadLabelWaits();
   if (v === 'history') loadHistory();

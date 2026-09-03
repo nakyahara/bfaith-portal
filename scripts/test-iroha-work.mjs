@@ -1585,6 +1585,9 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok(d3.json.rows.some((x) => x.id === r1) && !d3.json.rows.some((x) => x.id === r2), '終了日 9/3 を指定すると 9/3 23:59:59 JST まで入り、9/4 00:00 は入らない');
       const d4 = await call('GET', '/api/history?from=2026-09-04&to=2026-09-04&q=BULK-X', { cookie });
       ok(d4.json.rows.some((x) => x.id === r2) && !d4.json.rows.some((x) => x.id === r1), '9/4 を指定すると 9/4 の分だけ');
+      const far = await call('GET', '/api/history?to=9999-12-31&q=BULK-X', { cookie });
+      ok(far.status === 200 && far.json.rows.length > 0, '上限の年 (9999-12-31) でも 500 にならず全部出る (翌日が西暦10000 になる罠)');
+      ok((await call('GET', '/api/history?from=0001-01-01&to=9999-12-31', { cookie })).status === 200, '端から端までの指定も通る');
       const one = await call('GET', '/api/history?q=' + encodeURIComponent('棚入待ち1'), { cookie });
       ok(one.json.total === 1 && one.json.rows[0].id === r1 && one.json.rows[0].facility_name === 'いろは', '商品名で絞れる (拠点名つき)');
     }
@@ -1840,6 +1843,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // 絞り込みを変えたときに、見えないカードが選ばれたまま残らない
   ok(/function syncBulkSelection/.test(html) && /renderBoard\(\)[\s\S]{0,400}syncBulkSelection/.test(html), 'ボードは描くたびに選択を見えているものへそろえる');
   ok(/function renderList\(\)[\s\S]{0,200}syncBulkSelection/.test(html), '一覧も同じ');
+  // 画面を戻したときに描き直さないと、ボードで選んだ分が一覧の絞り込みと合わないまま残る (Codex PR-C R2)
+  ok(/function setView\(v\)[\s\S]{0,700}if \(v === 'list'\) renderList\(\);/.test(html), '画面を切り替えたら、その画面を描き直す (一覧も)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
