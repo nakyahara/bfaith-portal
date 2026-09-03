@@ -465,11 +465,12 @@ t('closeBox 3箱 → readiness ok。警告 = 欠番 / 外寸なし (box160) / �
   assert.equal(r.expiries.length, 0);
 });
 const payload = db.buildExportPayload(run3);
-t('buildExportPayload: 箱数1 + 数量5 + 重量3 + 外寸(140のみ)6 = 15セル、0 の箱は空欄のまま', () => {
+t('buildExportPayload: 箱数1 + 数量5 + 重量3 + 外寸(140のみ)6 = 15セル、それ以外の入力セル (4行+4寸法行)×19列 は clear', () => {
   assert.equal(payload.ok, true, JSON.stringify(payload).slice(0, 300));
   const cells = payload.sheets[0].cells;
   const kinds = cells.reduce((a, c) => { a[c.kind] = (a[c.kind] || 0) + 1; return a; }, {});
-  assert.deepEqual(kinds, { total_boxes: 1, qty: 5, weight: 3, width: 2, length: 2, height: 2 });
+  assert.deepEqual(kinds, { total_boxes: 1, qty: 5, weight: 3, width: 2, length: 2, height: 2, clear: 8 * 19 - 14 });
+  assert.equal(new Set(cells.map((c) => `${c.row}|${c.col}`)).size, cells.length, '同一セルの二重指定なし');
   const st = ing.parsed.sheets[0];
   assert.deepEqual(cells[0], { row: st.totalBoxes.row, col: st.totalBoxes.col, value: 3, kind: 'total_boxes' });
   const q = cells.filter((c) => c.kind === 'qty');
@@ -485,11 +486,26 @@ const w3 = await xl.writePacklist({ templatePath: ing.storedPath, sheets: payloa
 t('writePacklist (ゴールデン): 原本非破壊で書けて独自検算を通る (再読込一致・他エントリ byte 一致・fingerprint 不変)', () => {
   assert.equal(w3.ok, true, JSON.stringify(w3).slice(0, 400));
   assert.equal(w3.written, 15);
-  assert.equal(w3.verify.cellsChecked, 15);
+  assert.equal(w3.cleared, 8 * 19 - 14);
+  assert.equal(w3.verify.cellsChecked, payload.sheets[0].cells.length);
   assert.equal(w3.verify.fingerprint, 'd337e046bbf029c1');
   assert.deepEqual(w3.verify.changedEntries, ['xl/worksheets/sheet2.xml']);
   assert.ok(fs.existsSync(w3.outputPath));
   assert.notEqual(fs.readFileSync(w3.outputPath).length, 0);
+});
+const ingFilled = await xl.ingestPacklist(fs.readFileSync(w3.outputPath), 'filled.xlsx');
+t('記入済み (出力済み) ファイルの再アップロードは prefilled_template で拒否', () => {
+  assert.equal(ingFilled.ok, false);
+  assert.equal(ingFilled.error, 'prefilled_template');
+});
+// 記入済み原本に対しても clear で古い値が消えることを確認 (取込ガードを迂回した二重防御の検証):
+// 出力済みファイルを原本にして「数量 1 セルだけ」を書くと、他の数量・寸法は空になる
+const wClear = await xl.writePacklist({ templatePath: w3.outputPath, fileTag: 'clear', sheets: [{ sheetName: payload.sheets[0].sheetName,
+  cells: payload.sheets[0].cells.map((c) => (c.kind === 'qty' && c.value === 30 ? c : (c.kind === 'total_boxes' ? c : { row: c.row, col: c.col, value: null, kind: 'clear' }))) }] });
+t('clear: 原本に残った値を空にできる (再読込で None)', () => {
+  assert.equal(wClear.ok, true, JSON.stringify(wClear).slice(0, 400));
+  assert.equal(wClear.written, 2);
+  assert.equal(wClear.cleared, payload.sheets[0].cells.length - 2);
 });
 const fixture1 = path.join(FIX, 'packlist_v1.1_2sku_15box.xlsx');
 const ing1 = await xl.ingestPacklist(fs.readFileSync(fixture1), 'packlist_test1.xlsx');
@@ -525,6 +541,21 @@ t('recordExport → listExports (最新・stale でない) / getExport でスナ
   assert.equal(db.getExport(ex1.exportId).snapshot.groups[0].totalBoxes, 3);
   assert.equal(db.getRunState(run3).exportState.stale, false);
 });
+t('資材の外寸変更 → その資材の箱を持つ未アップの納品回の版が進む (旧版になる)。名前だけの変更では進まない', () => {
+  const v0 = db.getRun(run3).data_version;
+  const r1 = db.upsertMaterial({ code: 'box140', name: '140サイズ段ボール (改)', tareG: 900, widthCm: 45, lengthCm: 35, heightCm: 30.5, sort: 1, actor: 't' });
+  assert.deepEqual(r1.bumpedRuns, []);
+  assert.equal(db.getRun(run3).data_version, v0);
+  const r2 = db.upsertMaterial({ code: 'box140', name: '140サイズ段ボール', tareG: 900, widthCm: 46, lengthCm: 35, heightCm: 30.5, sort: 1, actor: 't' });
+  // box140 の箱を持つ未アップの回 (この試験では run1 / c2 / run3) が全て対象。run3 は必ず含まれる
+  assert.ok(r2.bumpedRuns.includes(run3), JSON.stringify(r2.bumpedRuns));
+  assert.equal(db.getRun(run3).data_version, v0 + 1);
+  assert.equal(db.listExports(run3)[0].stale, 1);
+  assert.equal(db.markStaUploaded({ runId: run3, exportId: ex1.exportId, actor: 't' }).error, 'stale_export');
+  // 新しい出力の外寸は 46 になる
+  const p = db.buildExportPayload(run3);
+  assert.ok(p.sheets[0].cells.some((c) => c.kind === 'width' && c.value === 46));
+});
 t('版管理: 出力後の変更 (箱の開け直し→閉じ直し) で旧版になり、旧版の STAアップ記録は拒否', () => {
   db.reopenBox({ boxId: b2.boxId, reason: '詰め直し', worker: staff });
   db.closeBox({ boxId: b2.boxId, measuredKg: 8.1, worker: staff });
@@ -550,6 +581,23 @@ t('再出力 → STAアップ済み記録 → 納品回 done・data_version は�
   // done 後も readiness は出力可 (再DL用)、iPad からの割当は不可
   assert.equal(db.exportReadiness(run3).ok, true);
   assert.equal(put(rows3[0], b1, 1, 'x9').error, 'run_not_active');
+  // STAアップ済みの記録は上書きしない: 同じ版は冪等、別の出力は already_uploaded
+  assert.equal(db.markStaUploaded({ runId: run3, exportId: ex2.exportId, actor: 't' }).already, true);
+  const ex3 = db.recordExport({ runId: run3, excelFileId: p2.excelFile.id, dataVersion: p2.snapshot.dataVersion, fileName: 'x.xlsx',
+    storedPath: w3.outputPath, sha256: w3.sha256, snapshot: p2.snapshot, verify: null, createdBy: 't' });
+  assert.equal(db.markStaUploaded({ runId: run3, exportId: ex3.exportId, actor: 't' }).error, 'already_uploaded');
+  assert.equal(db.getRun(run3).sta_export_id, ex2.exportId);
+  // STAアップ済みの回は資材の外寸を変えても版が進まない (アップ済み Excel の版を守る)
+  const vDone = db.getRun(run3).data_version;
+  db.upsertMaterial({ code: 'box140', name: '140サイズ段ボール', tareG: 900, widthCm: 47, lengthCm: 35, heightCm: 30.5, sort: 1, actor: 't' });
+  assert.equal(db.getRun(run3).data_version, vDone);
+});
+t('名簿 bootstrap は一度 PIN が設定されたら閉じたまま (職員が全員無効でも戻らない)', () => {
+  assert.equal(db.isRosterBootstrap(), false);
+  db.setWorkerActive(staff.id, false);
+  assert.equal(db.countStaffWithPin(), 0);
+  assert.equal(db.isRosterBootstrap(), false);
+  db.setWorkerActive(staff.id, true);
 });
 t('PR2 の操作が fbx_events に残っている', () => {
   const actions = new Set(db.listEvents(1000).map((e) => e.action));

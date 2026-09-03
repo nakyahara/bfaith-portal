@@ -3,8 +3,8 @@
 
 方式 = 原本 .xlsx (zip) の該当シート XML だけをセル単位で差し替える。
 openpyxl で load→save すると sharedStrings が消え・styles が書き換わり・数式のキャッシュ値が
-落ちる (2026-09-03 実物で確認) ので、STA が受け付ける保証のある「原本と同じバイト列 + 対象セル」
-に寄せる。書かないセル・他エントリは原本と byte 一致 (検証で保証)。
+落ちる (2026-09-03 実物で確認) ので、STA が受け付ける保証のある「原本の内容 + 対象セル」に寄せる。
+書かないセル・他エントリは原本と展開後の内容が一致 (検証で保証。zip の圧縮後バイト列までは同一でない)。
 
 要件 F-7: unlocked な入力セルのみ (取込時に locked 検査済み) / 数式セル不触 /
 サーバ側独自検算 (書いた値を再読込して突合・構造 fingerprint 不変)。
@@ -12,7 +12,8 @@ openpyxl で load→save すると sharedStrings が消え・styles が書き換
 入力 (stdin JSON):
   { "template": "<原本パス>", "output": "<出力パス>",
     "sheets": [ { "sheetName": "...", "cells": [ {"row": 6, "col": 13, "value": 3, "kind": "qty"}, ... ] } ] }
-出力 (stdout JSON 1個): { ok, sha256, written, verify: {...} } / { ok:false, error, message }
+  value が null のセルは「空にする」(既存の値を消す。セルが無ければ何もしない)
+出力 (stdout JSON 1個): { ok, sha256, written, cleared, verify: {...} } / { ok:false, error, message }
 """
 import hashlib
 import json
@@ -52,7 +53,9 @@ def col_index(letters):
 
 
 def number_text(v):
-    """Excel の <v> 用の数値表記 (整数は '3'、小数は '12.4')"""
+    """Excel の <v> 用の数値表記 (整数は '3'、小数は '12.4')。
+    丸めない (repr = 最短の往復可能表記) — 検算は再読込値と元値の一致を見るので、ここで丸めると
+    自分の検算に落ちる (Codex PR2 #5)。桁数の制限は DB 側 (closeBox / upsertMaterial) で行う"""
     if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise WriteError('bad_value', f'数値以外は書けません: {v!r}')
     f = float(v)
@@ -60,7 +63,7 @@ def number_text(v):
         raise WriteError('bad_value', f'不正な数値: {v!r}')
     if f.is_integer():
         return str(int(f))
-    return repr(round(f, 6))
+    return repr(f)
 
 
 def sheet_paths(zf):
@@ -156,8 +159,14 @@ def patch_row(xml, row_no, cells_to_write, styles):
                 raise WriteError('formula_cell', f'{ref} は数式セルのため書きません')
             sm = re.search(r'\bs="([^"]*)"', old_attrs)
             s_attr = f' s="{sm.group(1)}"' if sm else ''
-            existing[1] = f'<c r="{ref}"{s_attr} t="n"><v>{number_text(value)}</v></c>'
+            if value is None:
+                # クリア (Codex PR2 #2): スタイルだけ残した空セルにする
+                existing[1] = f'<c r="{ref}"{s_attr}/>'
+            else:
+                existing[1] = f'<c r="{ref}"{s_attr} t="n"><v>{number_text(value)}</v></c>'
         else:
+            if value is None:
+                continue   # 元々セルが無い = 空。何もしない
             st = style_for(styles, c)
             s_attr = f' s="{st}"' if st else ''
             new = [c, f'<c r="{ref}"{s_attr} t="n"><v>{number_text(value)}</v></c>', '']
@@ -216,8 +225,11 @@ def write(req):
     sheets = req.get('sheets') or []
     if not template or not output or not os.path.isfile(template):
         raise WriteError('bad_input', '原本 (template) / 出力先 (output) が不正です')
-    total_cells = sum(len(s.get('cells') or []) for s in sheets)
-    if total_cells == 0:
+    all_cells = [c for s in sheets for c in (s.get('cells') or [])]
+    total_cells = len(all_cells)
+    written = sum(1 for c in all_cells if c.get('value') is not None)
+    cleared = total_cells - written
+    if written == 0:
         raise WriteError('nothing_to_write', '書き込むセルがありません')
     if total_cells > MAX_CELLS:
         raise WriteError('too_many_cells', 'セル数が多すぎます')
@@ -234,7 +246,9 @@ def write(req):
                 raise WriteError('bad_input', f'シート「{name}」が二重に指定されています')
             xml = zin.read(p).decode('utf-8')
             patched[p] = patch_sheet_xml(xml, s.get('cells') or []).encode('utf-8')
-        # 出力: 原本のエントリ順・圧縮属性をそのまま、差し替えシートだけ新しい内容
+        # 出力: 原本のエントリ順・圧縮方式・属性・extra/コメントを引き継ぎ、差し替えシートだけ新しい内容。
+        # 未変更エントリも zipfile が再圧縮するため「圧縮後バイト列」までは同一にならない —
+        # 保証するのは「展開後の内容が原本と一致」(下の verify_output)
         tmp = output + '.part'
         with zipfile.ZipFile(tmp, 'w') as zout:
             for info in zin.infolist():
@@ -244,15 +258,19 @@ def write(req):
                 zi = zipfile.ZipInfo(info.filename, date_time=info.date_time)
                 zi.compress_type = info.compress_type
                 zi.external_attr = info.external_attr
+                zi.internal_attr = info.internal_attr
+                zi.create_system = info.create_system
+                zi.extra = info.extra
+                zi.comment = info.comment
                 zout.writestr(zi, data)
         os.replace(tmp, output)
 
     verify = verify_output(template, output, sheets, set(patched))
-    return {'ok': True, 'sha256': sha256_of(output), 'written': total_cells, 'verify': verify}
+    return {'ok': True, 'sha256': sha256_of(output), 'written': written, 'cleared': cleared, 'verify': verify}
 
 
 def verify_output(template, output, sheets, patched_paths):
-    """独自検算: ①書いたセルの再読込一致 ②他エントリの byte 一致 ③構造 fingerprint 不変"""
+    """独自検算: ①書いたセルの再読込一致 (クリアしたセルは空) ②他エントリの展開後内容一致 ③構造 fingerprint 不変"""
     import openpyxl
     wb = openpyxl.load_workbook(output, data_only=False)
     mismatches = []
@@ -261,9 +279,12 @@ def verify_output(template, output, sheets, patched_paths):
         ws = wb[s['sheetName']]
         for cell in s.get('cells') or []:
             got = ws.cell(row=int(cell['row']), column=int(cell['col'])).value
-            want = cell['value']
+            want = cell.get('value')
             checked += 1
-            if not isinstance(got, (int, float)) or abs(float(got) - float(want)) > 1e-9:
+            if want is None:
+                if got is not None:
+                    mismatches.append({'row': cell['row'], 'col': cell['col'], 'want': None, 'got': got})
+            elif not isinstance(got, (int, float)) or abs(float(got) - float(want)) > 1e-9:
                 mismatches.append({'row': cell['row'], 'col': cell['col'], 'want': want, 'got': got})
     if mismatches:
         raise WriteError('verify_failed', '書いた値を再読込すると一致しません', mismatches=mismatches[:20])
@@ -275,7 +296,7 @@ def verify_output(template, output, sheets, patched_paths):
         changed = [n for n in na if za.read(n) != zb.read(n)]
         unexpected = [n for n in changed if n not in patched_paths]
         if unexpected:
-            raise WriteError('verify_failed', '書き換え対象外のエントリが変わっています', entries=unexpected)
+            raise WriteError('verify_failed', '書き換え対象外のエントリの内容が変わっています', entries=unexpected)
 
     try:
         a = parse_packlist.analyze(template)

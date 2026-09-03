@@ -550,7 +550,8 @@ export function createBox({ packGroupId, materialCode, worker, deviceLabel }) {
 
 /** 箱クローズ。実測重量kg必須 (Amazon Excel の箱重量欄になる)。読み合わせは画面側の責務 */
 export function closeBox({ boxId, measuredKg, closedReason, cushionLevel, worker, deviceLabel }) {
-  const kg = Number(measuredKg);
+  // 桁は 1g (小数3桁) まで。Excel へはこの値をそのまま書く (書き込み側で丸めない — Codex PR2 #5)
+  const kg = Math.round(Number(measuredKg) * 1000) / 1000;
   if (!Number.isFinite(kg) || kg <= 0 || kg > 200) {
     return { ok: false, error: 'bad_weight', message: '実測重量 (kg) を正しく入力してください' };
   }
@@ -911,10 +912,26 @@ export function setWorkerPin(id, pin, actor) {
   if (!w) return { ok: false, error: 'not_found', message: '作業者が見つかりません' };
   if (w.worker_type !== 'staff') return { ok: false, error: 'not_staff', message: 'PINを設定できるのは職員だけです' };
   const salt = crypto.randomBytes(16).toString('hex');
-  getDB().prepare('UPDATE fbx_workers SET pin_hash = ?, pin_salt = ?, pin_fails = 0, pin_lock_until = NULL WHERE id = ?')
-    .run(pinHash(salt, p), salt, Number(id));
+  const d = getDB();
+  d.transaction(() => {
+    d.prepare('UPDATE fbx_workers SET pin_hash = ?, pin_salt = ?, pin_fails = 0, pin_lock_until = NULL WHERE id = ?')
+      .run(pinHash(salt, p), salt, Number(id));
+    // 初回の PIN 設定で名簿の初期登録 (bootstrap) を恒久的に閉じる (Codex PR2 #3: 後で職員が全員無効になっても
+    // 端末が自動的に無ゲートへ戻らない。復旧は本社の管理画面から)
+    d.prepare(`INSERT INTO fbx_meta (key, value) VALUES ('roster_bootstrap_done', '1') ON CONFLICT(key) DO NOTHING`).run();
+  }).immediate();
   safeLogEvent({ action: 'pin_set', workerId: w.id, workerName: w.display_name, deviceLabel: actor || null, ok: true });
   return { ok: true };
+}
+
+/**
+ * 名簿の初期登録モードか: PIN 持ちの有効な職員が 0 人 かつ 一度も PIN が設定されたことがない。
+ * (PIN が一度でも設定されたら fbx_meta の roster_bootstrap_done で閉じる)
+ */
+export function isRosterBootstrap() {
+  if (countStaffWithPin() > 0) return false;
+  const done = getDB().prepare(`SELECT value FROM fbx_meta WHERE key = 'roster_bootstrap_done'`).get();
+  return !done;
 }
 
 export function verifyWorkerPin(id, pin) {
@@ -1068,18 +1085,37 @@ export function upsertMaterial({ code, name, tareG, widthCm, lengthCm, heightCm,
   };
   let vals;
   try {
-    vals = { tare: num(tareG, '自重g', { integer: true }), w: num(widthCm, '幅cm', { max: 500 }), l: num(lengthCm, '長さcm', { max: 500 }), h: num(heightCm, '高さcm', { max: 500 }) };
+    // 外寸は 0.1cm 単位に丸めて保存 (Excel へはそのまま書く — 書き込み側で丸めない)
+    const r1 = (v) => (v == null ? null : Math.round(v * 10) / 10);
+    vals = { tare: num(tareG, '自重g', { integer: true }), w: r1(num(widthCm, '幅cm', { max: 500 })), l: r1(num(lengthCm, '長さcm', { max: 500 })), h: r1(num(heightCm, '高さcm', { max: 500 })) };
   } catch (e) {
     return { ok: false, error: 'bad_number', message: e.message };
   }
   const d = getDB();
-  d.prepare(`INSERT INTO fbx_box_materials (code, name, tare_g, width_cm, length_cm, height_cm, sort, active)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(code) DO UPDATE SET name = excluded.name, tare_g = excluded.tare_g, width_cm = excluded.width_cm,
-      length_cm = excluded.length_cm, height_cm = excluded.height_cm, sort = excluded.sort, active = excluded.active`)
-    .run(c, n, vals.tare, vals.w, vals.l, vals.h, Number.isInteger(Number(sort)) ? Number(sort) : 0, active === false ? 0 : 1);
-  safeLogEvent({ action: 'material_upsert', deviceLabel: actor || null, ok: true, payload: { code: c, name: n, ...vals, active: active !== false } });
-  return { ok: true, code: c };
+  return d.transaction(() => {
+    const old = d.prepare('SELECT * FROM fbx_box_materials WHERE code = ?').get(c) || null;
+    d.prepare(`INSERT INTO fbx_box_materials (code, name, tare_g, width_cm, length_cm, height_cm, sort, active)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(code) DO UPDATE SET name = excluded.name, tare_g = excluded.tare_g, width_cm = excluded.width_cm,
+        length_cm = excluded.length_cm, height_cm = excluded.height_cm, sort = excluded.sort, active = excluded.active`)
+      .run(c, n, vals.tare, vals.w, vals.l, vals.h, Number.isInteger(Number(sort)) ? Number(sort) : 0, active === false ? 0 : 1);
+    // 外寸は Excel の寸法欄に出る = 変更したらこの資材の箱を持つ未アップの納品回の版を進める (Codex PR2 #1)。
+    // そうしないと外寸変更前の出力が「最新」のまま STA アップ済みにできてしまう
+    let bumpedRuns = [];
+    const dimsChanged = !!old && (old.width_cm !== vals.w || old.length_cm !== vals.l || old.height_cm !== vals.h);
+    if (dimsChanged) {
+      bumpedRuns = d.prepare(`SELECT DISTINCT g.run_id FROM fbx_boxes b JOIN fbx_pack_groups g ON g.id = b.pack_group_id
+        JOIN fbx_runs r ON r.id = g.run_id
+        WHERE b.material_code = ? AND b.status != 'void' AND r.status IN ('active','done') AND r.sta_uploaded_at IS NULL`).all(c).map((x) => x.run_id);
+      for (const runId of bumpedRuns) {
+        bumpRunVersion(d, runId);
+        logEvent({ runId, action: 'material_dims_changed', targetType: 'run', targetId: runId, deviceLabel: actor || null, ok: true,
+          payload: { code: c, from: { w: old.width_cm, l: old.length_cm, h: old.height_cm }, to: { w: vals.w, l: vals.l, h: vals.h } } }, d);
+      }
+    }
+    logEvent({ action: 'material_upsert', deviceLabel: actor || null, ok: true, payload: { code: c, name: n, ...vals, active: active !== false, bumpedRuns } }, d);
+    return { ok: true, code: c, bumpedRuns };
+  }).immediate();
 }
 
 // ───────────────────────── Excel 出力 (PR2, 要件 F-6 / F-7 / F-7b) ─────────────────────────
@@ -1201,6 +1237,16 @@ export function buildExportPayload(runId) {
         cells.push({ row: structure.dimRows.height, col, value: dims.height, kind: 'height' });
       }
     }
+    // 書かない入力セル (数量 0・未使用の箱列・寸法未設定) は明示的に空にする (Codex PR2 #2 の二重防御。
+    // 取込時に記入済みテンプレを拒否しているので通常は既に空だが、原本に値が残っていても混入させない)
+    const writtenKeys = new Set(cells.map((c) => `${c.row}|${c.col}`));
+    const allCols = Object.values(structure.boxColumns);
+    const targetRows = [...gRows.map((r) => r.excel_row), ...Object.values(structure.dimRows)];
+    for (const row of targetRows) {
+      for (const col of allCols) {
+        if (!writtenKeys.has(`${row}|${col}`)) cells.push({ row, col, value: null, kind: 'clear' });
+      }
+    }
     sheets.push({ sheetName: g.sheet_name, cells });
     snapshotGroups.push({
       groupId: g.id, sheetName: g.sheet_name, displayName: g.display_name, packingGroupId: g.packing_group_id, totalBoxes: gBoxes.length,
@@ -1256,6 +1302,11 @@ export function markStaUploaded({ runId, exportId, actor }) {
     if (!run) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
     const ex = d.prepare('SELECT * FROM fbx_exports WHERE id = ? AND run_id = ?').get(Number(exportId), run.id);
     if (!ex) return { ok: false, error: 'not_found', message: '出力の記録が見つかりません' };
+    // 記録済みなら上書きしない (Codex PR2 #4: 実際にアップした版の監査証跡を守る)。同じ版の再記録は冪等
+    if (run.sta_export_id) {
+      if (run.sta_export_id === ex.id) return { ok: true, already: true };
+      return { ok: false, error: 'already_uploaded', message: `既に出力 #${run.sta_export_id} を STA アップ済みとして記録しています。別の版を記録するには本社で確認のうえ中原さんに連絡してください` };
+    }
     if (ex.data_version !== run.data_version) {
       return { ok: false, error: 'stale_export', message: 'この出力の後にデータが変わっています。最新データで再出力し、そのファイルを STA にアップしてから記録してください' };
     }

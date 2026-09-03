@@ -111,6 +111,15 @@ await t('PIN を持つ最後の職員は端末から無効にできない (409) 
   const r3 = await call('POST', `/api/workers/${memberId}/active`, { body: { active: true }, session: 'user', device: false });
   assert.equal(r3.j.ok, true);
 });
+await t('セッションで最後の PIN 職員を無効にしても端末が bootstrap (無ゲート) に戻らない', async () => {
+  const off = await call('POST', `/api/workers/${staffId}/active`, { body: { active: false }, session: 'admin', device: false });
+  assert.equal(off.j.ok, true);
+  assert.equal((await call('GET', '/api/roster')).j.bootstrap, false);
+  const add = await call('POST', '/api/workers', { body: { display_name: 'のっとり', worker_type: 'staff' } });
+  assert.equal(add.status, 403);
+  const on = await call('POST', `/api/workers/${staffId}/active`, { body: { active: true }, session: 'admin', device: false });
+  assert.equal(on.j.ok, true);
+});
 await t('名簿の変更操作が監査に残る (worker_add / pin_set / worker_active)', async () => {
   const actions = new Set(db.listEvents(100).map((e) => e.action));
   for (const a of ['worker_add', 'pin_set', 'worker_active']) assert.ok(actions.has(a), a);

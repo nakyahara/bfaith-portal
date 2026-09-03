@@ -19,7 +19,7 @@ import {
   createDevice, verifyDevice, revokeDevice, listDevices,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
-  listWorkers, getWorker, addWorker, setWorkerActive, setWorkerPin, verifyWorkerPin, countStaffWithPin,
+  listWorkers, getWorker, addWorker, setWorkerActive, setWorkerPin, verifyWorkerPin, isRosterBootstrap,
   listEvents, safeLogEvent, listMaterials, upsertMaterial,
   createRun, activateRun, setRunStatus, listRuns, getRun, getRunState,
   createBox, closeBox, reopenBox, voidBox, listBoxContents,
@@ -137,13 +137,14 @@ function requireStaff(req, worker) {
 /**
  * 名簿 (作業者・PIN) を iPad から編集するためのゲート (PR2, 中原さん指示「登録は自分たちで」):
  *   ①ポータルセッション = OK
- *   ②端末Cookie: PIN 設定済みの有効な職員が 0 人 = 初期登録 (bootstrap) として無ゲート
- *     (端末登録自体が本社発行の6桁コードで守られている)
+ *   ②端末Cookie: PIN 設定済みの有効な職員が 0 人 かつ 一度も PIN が設定されていない = 初期登録 (bootstrap) として無ゲート
+ *     (端末登録自体が本社発行の6桁コードで守られている。一度 PIN が設定されたら二度と無ゲートに戻らない —
+ *      職員が全員無効になった場合の復旧は本社の管理画面から)
  *   ③それ以外 = auth_worker_id (職員) + auth_pin の一致
  */
 function rosterGate(req) {
   if (hasSessionAccess(req)) return { ok: true, via: 'session', approvedBy: `session:${req.fbxUser}` };
-  if (countStaffWithPin() === 0) return { ok: true, via: 'bootstrap', approvedBy: null };
+  if (isRosterBootstrap()) return { ok: true, via: 'bootstrap', approvedBy: null };
   const w = getWorker(req.body?.auth_worker_id);
   if (!w || !w.active || w.worker_type !== 'staff') {
     return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: '名簿の変更は職員のPINが必要です (職員を選んでPINを入れてください)' } };
@@ -244,7 +245,7 @@ router.get('/api/readiness', api((req, res) => {
 
 router.get('/api/roster', api((req, res) => {
   res.json({
-    ok: true, workers: listWorkers(true), bootstrap: countStaffWithPin() === 0,
+    ok: true, workers: listWorkers(true), bootstrap: isRosterBootstrap(),
     me: { session: req.fbxUser || null, admin: isAdmin(req) },
   });
 }));
@@ -577,7 +578,7 @@ router.post('/admin/runs/:id(\\d+)/exports', requireSession, checkOrigin, api(as
     snapshot: payload.snapshot, verify: w.verify, createdBy: req.session.email,
   });
   if (!rec.ok) return res.status(409).json(rec);
-  res.json({ ok: true, exportId: rec.exportId, stale: rec.stale, written: w.written, verify: w.verify,
+  res.json({ ok: true, exportId: rec.exportId, stale: rec.stale, written: w.written, cleared: w.cleared, verify: w.verify,
     downloadUrl: `${BASE}/admin/exports/${rec.exportId}/download`, warnings: payload.snapshot.warnings });
 }));
 

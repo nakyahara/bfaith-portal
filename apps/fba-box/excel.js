@@ -97,7 +97,7 @@ export async function writePacklist({ templatePath, sheets, fileTag = 'export' }
     try { fs.unlinkSync(outputPath); } catch { /* noop */ }
     return { ok: false, error: 'verify_failed', message: '出力ファイルのハッシュが一致しません' };
   }
-  return { ok: true, outputPath, sha256, written: r.written, verify: r.verify };
+  return { ok: true, outputPath, sha256, written: r.written, cleared: r.cleared || 0, verify: r.verify };
 }
 
 /**
@@ -134,6 +134,14 @@ export async function ingestPacklist(buffer, originalName) {
   if (lockedCount > 0) {
     try { fs.unlinkSync(storedPath); } catch { /* noop */ }
     return { ok: false, error: 'locked_cells', message: `書き込み対象のセルが保護されています (${lockedCount}箇所)。テンプレの形式が変わった可能性があります — 手動転記に切り替えて中原さんに連絡してください` };
+  }
+  // 記入済みのテンプレ (箱数量・重量寸法に値が残っている) は受理しない (Codex PR2 #2):
+  // 出力は値のあるセルだけ書く + 空欄クリアだが、取込段階で「STA からDLした素のテンプレ」に限定して
+  // 古い数量・寸法の混入経路そのものを塞ぐ
+  const prefilled = parsed.sheets.reduce((a, s) => a + (s.prefilledTargets?.length || 0), 0);
+  if (prefilled > 0) {
+    try { fs.unlinkSync(storedPath); } catch { /* noop */ }
+    return { ok: false, error: 'prefilled_template', message: `箱数量・重量・寸法に入力済みの値があります (${prefilled}箇所)。STA からダウンロードした直後の未記入のパックリストをアップロードしてください` };
   }
   // 未知の fingerprint は受理しない (Codex PR1 #1: 列構造の意味が変わった新テンプレで
   // 作業→誤ったExcel出力まで進む事故を、警告ではなく拒否で止める)。

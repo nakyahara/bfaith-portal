@@ -190,12 +190,21 @@ def parse_sheet(ws):
         if is_locked:
             locked.append({'what': what, 'row': r, 'col': c})
     check_locked(total_boxes_cell['row'], total_boxes_cell['col'], 'total_boxes')
+    # 入力済みセルの検出 (Codex PR2 #2): STA からDLした直後のテンプレは箱数量・重量寸法が全て空。
+    # 値が残っている = 記入済み/出力済みファイルの再アップロード → 取込側で拒否する (古い値の混入防止)
+    prefilled = []
+    def check_prefilled(r, c, what):
+        v = ws.cell(row=r, column=c).value
+        if v is not None and str(v).strip() != '':
+            prefilled.append({'what': what, 'row': r, 'col': c})
     for row in sku_rows:
         for n in ns:
             check_locked(row['row'], box_cols[n], 'qty')
+            check_prefilled(row['row'], box_cols[n], 'qty')
     for key, r in dim_rows.items():
         for n in ns:
             check_locked(r, box_cols[n], key)
+            check_prefilled(r, box_cols[n], key)
 
     info.update({
         'packingGroupLabel': group_label,
@@ -210,6 +219,7 @@ def parse_sheet(ws):
         'dimRows': dim_rows,
         'skuRows': sku_rows,
         'lockedTargets': locked,
+        'prefilledTargets': prefilled,
     })
     return info, None
 
