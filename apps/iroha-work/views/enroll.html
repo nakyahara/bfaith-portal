@@ -64,6 +64,16 @@
     const $ = s => document.querySelector(s);
     const codeEl = $('#code'), goEl = $('#go'), msgEl = $('#msg');
 
+    // この画面に来た = この端末は未登録 (または登録が切れた)。前の利用者の一覧・作業者・削除トークン・
+    // 画面キャッシュを端末から消す。SW が /enroll へのリダイレクト結果を返す経路では作業画面の 401 処理を
+    // 通らないので、ここでも消す (Codex 落ちない化 R2 #1)。登録成功時にももう一度
+    async function clearLocalData() {
+      for (const k of ['iw_state_snapshot', 'iw_worker_id', 'iw_media_tok']) { try { localStorage.removeItem(k); } catch (e) { /* 無視 */ } }
+      try { if (window.caches) for (const k of await caches.keys()) if (k.startsWith('iroha-work-shell-')) await caches.delete(k); } catch (e) { /* 無視 */ }
+      try { const reg = await navigator.serviceWorker?.getRegistration(BASE + '/'); reg?.active?.postMessage('clear-shell'); } catch (e) { /* 無視 */ }
+    }
+    clearLocalData();
+
     function setMsg(kind, text) { msgEl.className = 'msg' + (kind ? ' ' + kind : ''); msgEl.textContent = text; }
 
     codeEl.addEventListener('input', () => {
@@ -89,6 +99,7 @@
         const j = await r.json().catch(() => ({}));
         if (j.ok) {
           setMsg('ok', '✅ 「' + j.label + '」として登録しました。開いています…');
+          await clearLocalData();   // 新しい登録で開く前に、前の端末データを確実に消す
           setTimeout(() => { location.href = BASE + '/'; }, 900);
           return;
         }

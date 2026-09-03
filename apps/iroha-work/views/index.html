@@ -319,10 +319,16 @@ let clockOffset = 0;
 const nowMs = () => Date.now() + clockOffset;
 
 // ─── 通知まわり (Codex R2 ①: エラーは押すまで消えない・成功はトースト) ───
-function showErr(msg, sub) {
+function showErr(msg, sub, kind) {
   const b = $('#errBanner');
   b.innerHTML = esc(msg) + (sub ? '<small>' + esc(sub) + '</small>' : '');
+  b.dataset.kind = kind || '';
   b.classList.add('on');
+}
+// kind を指定したら、その種類のバナーだけ消す (別のエラーを勝手に消さない)
+function hideErr(kind) {
+  const b = $('#errBanner');
+  if (!kind || b.dataset.kind === kind) b.classList.remove('on');
 }
 function showWarn(msg) { const b = $('#warnBanner'); b.textContent = msg; b.classList.add('on'); }
 let toastTimer = null;
@@ -359,18 +365,117 @@ function restoreWorker() {
   else if (!worker) openGate();
 }
 
-// ─── データ取得 ───
-async function loadState() {
+// ─── 通信の共通口 ───
+// Render は社内アプリのマージで頻繁に再起動し、その間は 502/503 の HTML が返る。例外や JSON パース失敗で
+// 画面を止めず、{ok:false, error:'server_down'} に揃えて各操作が「今は無理・あとで」を出せるようにする
+// (中原さん 2026-09-03「取れない間は良いが落ちないように」)
+const DOWN_MSG = 'サーバーが再起動中です (数十秒〜数分で戻ります)';
+const API_TIMEOUT_MS = 20000;
+async function apiFetch(path, opts) {
+  const o = Object.assign({}, opts);
+  const timeoutMs = o.timeoutMs || API_TIMEOUT_MS; delete o.timeoutMs;
+  // 応答が来ないまま固まらない (Render や回線が接続だけ保つことがある — Codex #5)
+  const ac = new AbortController();
+  const tm = setTimeout(() => ac.abort(), timeoutMs);
+  o.signal = ac.signal;
+  const down = (r, msg) => ({ ok: false, error: 'server_down', status: r.status, message: msg || DOWN_MSG });
+  const bad = (r, msg) => ({ ok: false, error: 'bad_response', status: r.status, message: msg });
   let r, j;
   try {
-    r = await fetch(BASE + '/api/state');
-    j = await r.json();
+    r = await fetch(BASE + path, o);
+    // 502/503/504 は本文の形 (HTML でも JSON でも) に関わらず「再起動中」(Codex #4)
+    if (r.status === 502 || r.status === 503 || r.status === 504) return down(r);
+    // 401 = この端末の登録が切れている (access が /api/ に返す)。前の一覧を消して登録画面へ
+    if (r.status === 401) return { ok: false, error: 'unauthorized', status: 401, message: 'この端末の登録が切れています。登録し直してください' };
+    const ct = r.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) {
+      return r.status >= 500 ? down(r) : bad(r, 'サーバーから想定外の応答です (' + r.status + ')');
+    }
+    // fetch はヘッダ到着で返る。本文が途中で止まっても固まらないよう、タイマーは JSON を読み切るまで生かす (Codex R2 #3)
+    try { j = await r.json(); }
+    catch (e) {
+      if (e.name === 'AbortError') throw e;
+      return r.status >= 500 ? down(r) : bad(r, '応答を読めませんでした');
+    }
   } catch (e) {
-    showErr('サーバーに接続できませんでした', e.message);
+    return { ok: false, error: 'network', message: e.name === 'AbortError'
+      ? '応答がありません (' + Math.round(timeoutMs / 1000) + '秒待ちました)' : '通信できませんでした (' + e.message + ')' };
+  } finally {
+    clearTimeout(tm);
+  }
+  if (!j || typeof j !== 'object') return bad(r, '応答を読めませんでした');
+  // 5xx は JSON に error があっても「再起動中」扱いで再接続する (共通例外の internal も含む — Codex R2 #4)
+  if (r.status >= 500) return down(r, j.message || DOWN_MSG);
+  return j;
+}
+// 一覧の自動再接続の対象 = 再起動中・通信断・想定外の応答 (CDN の HTML 200 など)。unauthorized は対象外 (登録し直す)
+const isDown = j => j && (j.error === 'server_down' || j.error === 'network' || j.error === 'bad_response');
+
+// ─── 前回の一覧の保存・復元 (起動時にサーバーが落ちていても、まず前回の一覧を出す) ───
+// ⚠ 端末に残るのは一覧・名簿 (表示名) まで。me (ログイン情報) は保存しない。登録が切れたら clearLocalData で消す (Codex #1)。
+//   オフラインの間は最後の一覧が見える (完全なオフライン表示と即時の失効は両立しない) — 次につながった時点で
+//   登録が切れていれば消える。iPad はいろはの共用端末で、内容は商品の作業指示 (個人情報ではない)
+const SNAP_KEY = 'iw_state_snapshot';
+function saveSnapshot(j) {
+  try {
+    localStorage.setItem(SNAP_KEY, JSON.stringify({ at: Date.now(), cards: j.cards, statuses: j.statuses,
+      changeTargets: j.changeTargets, workers: j.workers, refresh: j.refresh }));
+  } catch (e) { /* 容量超過・プライベートモードなどは諦める (次の取得で出る) */ }
+}
+function restoreSnapshot() {
+  let s = null;
+  try { s = JSON.parse(localStorage.getItem(SNAP_KEY) || 'null'); } catch (e) { return false; }
+  if (!s || !Array.isArray(s.cards)) return false;
+  state = { cards: s.cards, statuses: s.statuses || [], changeTargets: s.changeTargets || [],
+    workers: s.workers || [], refresh: s.refresh || {}, me: {} };
+  renderTabs(); renderList(); restoreWorker();
+  $('#syncTxt').textContent = '前回取得 ' + fmtTime(new Date(s.at).toISOString()) + ' の一覧 · 最新を確認中…';
+  return true;
+}
+/** 端末の登録が切れた/解除した: 前の利用者の一覧・作業者・削除トークン・画面キャッシュを端末から消す */
+async function clearLocalData() {
+  for (const k of [SNAP_KEY, 'iw_worker_id', 'iw_media_tok']) { try { localStorage.removeItem(k); } catch (e) { /* 無視 */ } }
+  try {
+    if (window.caches) for (const k of await caches.keys()) if (k.startsWith('iroha-work-shell-')) await caches.delete(k);
+  } catch (e) { /* 無視 */ }
+  try { const reg = await navigator.serviceWorker?.getRegistration(BASE + '/'); reg?.active?.postMessage('clear-shell'); } catch (e) { /* 無視 */ }
+}
+
+// ─── データ取得 (失敗しても前回の一覧を保つ。復帰は自動で試す: 5秒→10秒→…→60秒間隔) ───
+const RECONNECT_MIN_MS = 5000, RECONNECT_MAX_MS = 60000;
+let reconnectMs = RECONNECT_MIN_MS, reconnectTimer = null, serverDown = false;
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; loadState(); }, reconnectMs);
+  reconnectMs = Math.min(RECONNECT_MAX_MS, reconnectMs * 2);
+}
+let loadInflight = null;
+function loadState() {
+  if (loadInflight) return loadInflight;   // 同時に1本だけ (遅れて返った古い応答が新しい一覧を上書きしない — Codex #3)
+  loadInflight = loadStateOnce().finally(() => { loadInflight = null; });
+  return loadInflight;
+}
+async function loadStateOnce() {
+  const j = await apiFetch('/api/state');
+  if (!j.ok) {
+    if (j.error === 'unauthorized') {
+      await clearLocalData();
+      location.href = BASE + '/enroll';
+      return;
+    }
+    if (isDown(j)) {
+      serverDown = true;
+      showErr('サーバーにつながりません — 前回の一覧を表示しています', j.message + '。自動でつなぎ直します', 'down');
+      scheduleReconnect();
+      return;
+    }
+    showErr(j.message || '読み込みに失敗しました');
     return;
   }
-  if (!j.ok) { showErr(j.message || '読み込みに失敗しました'); return; }
+  if (serverDown) { serverDown = false; hideErr('down'); toast('サーバーにつながりました'); }
+  reconnectMs = RECONNECT_MIN_MS; clearTimeout(reconnectTimer); reconnectTimer = null;
   state = j;
+  saveSnapshot(j);
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
   renderSync();
   renderTabs();
@@ -479,14 +584,11 @@ async function forceRefresh() {
   const btn = $('#refreshBtn');
   btn.disabled = true; btn.textContent = '更新中…';
   try {
-    const r = await fetch(BASE + '/api/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-    const j = await r.json().catch(() => ({}));
+    const j = await apiFetch('/api/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
     if (!j.ok && j.error === 'rate_limited') { toast(j.message); return; }
-    if (!j.ok) showErr('更新できませんでした', (j.refresh && j.refresh.error) || j.message || '');
-    await loadState();
+    if (!j.ok && !isDown(j)) showErr('更新できませんでした', (j.refresh && j.refresh.error) || j.message || '');
+    await loadState();   // 落ちていればここが「前回の一覧を表示中」バナーと再接続を出す
     if (j.ok) toast('最新にしました');
-  } catch (e) {
-    showErr('更新できませんでした', e.message);
   } finally {
     btn.disabled = false; btn.textContent = '🔄 いま更新';
   }
@@ -731,11 +833,7 @@ async function uploadMedia(opId) {
   fd.append('worker_id', String(worker.id));
   fd.append('operation_id', opId);
   fd.append('file', p.blob, p.kind === 'photo' ? 'photo.jpg' : 'video.mp4');
-  let j;
-  try {
-    const r = await fetch(BASE + '/api/media', { method: 'POST', body: fd });
-    j = await r.json().catch(() => ({}));
-  } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
+  const j = await apiFetch('/api/media', { method: 'POST', body: fd, timeoutMs: 180000 });   // 動画 (最大120MB) は長めに待つ
   if (!j.ok) {
     if (j.error === 'cap_reached' || j.error === 'bad_file' || j.error === 'too_large') {
       pendingTiles.delete(opId);
@@ -761,14 +859,10 @@ function retryUpload(ev, opId) { ev.stopPropagation(); uploadMedia(opId); }
 async function delMedia(ev, id) {
   ev.stopPropagation();
   if (!confirm('この写真・動画を削除しますか? (撮り直し用)')) return;
-  let j;
-  try {
-    const r = await fetch(BASE + '/api/media/' + id + '/delete', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ delete_token: mediaTokens()[id] || null }),
-    });
-    j = await r.json().catch(() => ({}));
-  } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
+  const j = await apiFetch('/api/media/' + id + '/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ delete_token: mediaTokens()[id] || null }),
+  });
   if (!j.ok) { showErr(j.message || '削除できませんでした'); return; }
   dropMediaToken(id);
   for (const c of state.cards) c.media = c.media.filter(m => m.id !== id);
@@ -828,18 +922,14 @@ async function saveMaster() {
   mvSaving = true;
   for (const id of ['mvSave', 'mvCancel']) document.getElementById(id).disabled = true;
   $('#mvMsg').textContent = '保存中…';
-  let j;
-  try {
-    const r = await fetch(BASE + '/api/master', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        code: mvCtx.code, page_id: mvCtx.pageId, fields,
-        expect_version: mvCtx.version, worker_id: worker.id,
-        pin: $('#mvPin').value.trim() || undefined,
-      }),
-    });
-    j = await r.json().catch(() => ({}));
-  } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
+  const j = await apiFetch('/api/master', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      code: mvCtx.code, page_id: mvCtx.pageId, fields,
+      expect_version: mvCtx.version, worker_id: worker.id,
+      pin: $('#mvPin').value.trim() || undefined,
+    }),
+  });
   mvSaving = false;
   for (const id of ['mvSave', 'mvCancel']) document.getElementById(id).disabled = false;
 
@@ -922,14 +1012,10 @@ async function startWork() {
   if (!curDetail) return;
   const btn = document.getElementById('startBtn');
   if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
-  let j;
-  try {
-    const r = await fetch(BASE + '/api/sessions/start', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ page_id: curDetail, worker_id: worker.id }),
-    });
-    j = await r.json().catch(() => ({}));
-  } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
+  const j = await apiFetch('/api/sessions/start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ page_id: curDetail, worker_id: worker.id }),
+  });
   if (!j.ok) {
     if (btn) { btn.disabled = false; btn.textContent = '▶ 作業をはじめる'; }
     showErr(j.message || '作業をはじめられませんでした');
@@ -954,14 +1040,10 @@ async function stopWork(reason) {
   const mine = cNow ? myActiveOf(cNow) : null;
   if (!mine || !mine.id) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
   for (const id of ['pauseBtn', 'doneBtn']) { const b = document.getElementById(id); if (b) b.disabled = true; }
-  let j;
-  try {
-    const r = await fetch(BASE + '/api/sessions/stop', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ page_id: curDetail, worker_id: worker.id, session_id: mine.id, reason }),
-    });
-    j = await r.json().catch(() => ({}));
-  } catch (e) { j = { ok: false, message: '通信できませんでした (' + e.message + ')' }; }
+  const j = await apiFetch('/api/sessions/stop', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ page_id: curDetail, worker_id: worker.id, session_id: mine.id, reason }),
+  });
   if (!j.ok) {
     for (const id of ['pauseBtn', 'doneBtn']) { const b = document.getElementById(id); if (b) b.disabled = false; }
     showErr(j.message || '終了できませんでした');
@@ -1038,17 +1120,11 @@ async function doSetSt(to) {
   stSaving = true;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = true;
   $('#stMsg').textContent = '保存中… (Notionに反映しています)';
-  let j = null;
-  try {
-    const r = await fetch(BASE + '/api/status', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ page_id: stTarget, to, expect: c.status, worker_id: worker.id,
-        pin: $('#pinIn').value.trim() || undefined }),
-    });
-    j = await r.json().catch(() => ({}));
-  } catch (e) {
-    j = { ok: false, error: 'network', message: '通信できませんでした (' + e.message + ')。もう一度お試しください' };
-  }
+  const j = await apiFetch('/api/status', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ page_id: stTarget, to, expect: c.status, worker_id: worker.id,
+      pin: $('#pinIn').value.trim() || undefined }),
+  });
   stSaving = false;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
 
@@ -1099,8 +1175,22 @@ async function doSetSt(to) {
 }
 
 // ─── 起動・巡回 ───
+restoreSnapshot();   // まず前回の一覧を出す (サーバーが再起動中でも画面は出る)。その後すぐ最新を取りにいく
 loadState();
-setInterval(() => { if (!stSaving) loadState(); }, 60_000);
+setInterval(() => { if (!stSaving && !reconnectTimer) loadState(); }, 60_000);   // 再接続の予約中は任せる (loadState は同時1本)
+// iPad はバックグラウンドでタイマーが止まる → 前面に戻った・回線が戻った時は即つなぎ直す (Codex #7)
+const wake = () => { if (document.visibilityState === 'visible' && !stSaving) loadState(); };
+document.addEventListener('visibilitychange', wake);
+window.addEventListener('pageshow', wake);
+window.addEventListener('online', wake);
+// 画面 HTML のフォールバック (Render 再起動中に開いても真っ白にならない)。登録できなくても動作に影響なし。
+// 初回表示は SW を通っていないので、登録できたら今の画面を保存させる (Codex #2)
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register(BASE + '/sw.js', { scope: BASE + '/' })
+    .then(() => navigator.serviceWorker.ready)
+    .then(reg => { if (reg.active) reg.active.postMessage('cache-shell'); })
+    .catch(() => { /* 非対応・失敗は無視 */ });
+}
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeLb(); closeSt(); closeMaster(); closeDetail(); } });
 </script>
 </body>
