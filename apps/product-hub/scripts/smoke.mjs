@@ -1250,7 +1250,7 @@ check('複合選択肢の末尾バナーは定形外と同一',
   JSON.stringify(listing.trailingBannerLocations(listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').group))
   === JSON.stringify(listing.trailingBannerLocations('1')));
 
-// ─── 配送方法の値の意味 (2026-09-03 #1149) ───────────────────────
+// ─── 配送方法の値の意味 (2026-09-03 #1152) ───────────────────────
 // 楽天グループID と 画面の複合選択肢キー を1つの列に混ぜていたため、読む側の判断漏れで
 // 「複合選択肢を選ぶと楽天に出品できない」不具合が出た (#725)。値の解釈は
 // lib/shipping-groups.js の 1 関数だけが持ち、保存 (router) と出品 (buildItemPayload) の
@@ -5897,7 +5897,7 @@ for (const [name, file, data] of renders) {
     dh0.includes('f-amazon-open') ? '初期状態が隠れていない' : 'ボタンが無い');
 }
 
-// ─── 配送方法プルダウンの復元 (2026-09-03 #1149 / Codex R2 low) ───────────
+// ─── 配送方法プルダウンの復元 (2026-09-03 #1152 / Codex R2 low) ───────────
 // DB には楽天IDしか無いので、画面に戻すのは router が逆引きした shippingSelectValue。
 // 「保存した複合選択肢が再表示で選ばれている」ことを HTML で確かめる
 {
@@ -6466,7 +6466,7 @@ for (const [name, file, data] of renders) {
       r.status === 400 && /途中で止まって/.test(r.json.error || '') && !bl.isRakutenListingInFlight(idS), JSON.stringify(r.json));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idS);
 
-    // ─── 配送方法の保存の往復 (2026-09-03 #1149 / Codex R1 high) ───────────
+    // ─── 配送方法の保存の往復 (2026-09-03 #1152 / Codex R1 high) ───────────
     // 画面 → 保存 → 再表示 で状態が落ちないこと。DB には楽天IDだけを入れ、
     // 「ヤフーだけ別配送」は draft_yahoo.shipping_override が持つ
     {
@@ -6804,7 +6804,7 @@ for (const [name, file, data] of renders) {
     }
   }
 
-  // ─── 楽天項目の保存が「前回の選択」を進めること (2026-09-03 #1149 / Codex R3 high) ───
+  // ─── 楽天項目の保存が「前回の選択」を進めること (2026-09-03 #1152 / Codex R3 high) ───
   // この画面は保存後に再読み込みしない経路があるので、送れた配送方法まで shipSelectInitial を
   // 進めないと、2 回目以降の保存で毎回「複合選択肢を選び直した」と誤判定してしまい、
   // 人が直したヤフーの配送方法が既定値へ戻る
