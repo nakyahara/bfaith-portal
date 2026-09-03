@@ -372,7 +372,7 @@
           ${j.exports.map(e => `<tr><td>${e.id}</td><td>${escH(e.file_name || '')}</td><td>${e.data_version}</td><td>${(e.created_at || '').slice(0, 16).replace('T', ' ')}<br><small>${escH(e.created_by || '')}</small></td>
             <td>${e.sta_uploaded ? '<span class="st active">STAアップ済み</span>' : (e.stale ? '<span class="st cancelled">旧版 (出力後にデータ変更あり)</span>' : '<span class="st setup">最新</span>')}</td>
             <td><a class="btn-sm" href="${BASE}/admin/exports/${e.id}/download">⬇ ダウンロード</a>
-              ${!e.stale && !rd.run.staUploadedAt ? `<button class="btn-sm ex-sta" data-id="${e.id}">✅ STA にアップした</button>` : ''}</td></tr>`).join('')}</table>`}
+              ${!e.stale && !e.sta_uploaded && !rd.run.staUploadedAt && !(rd.fileStates || []).some(f => f.fileId === e.excel_file_id && f.uploaded) ? `<button class="btn-sm ex-sta" data-id="${e.id}">✅ STA にアップした</button>` : ''}</td></tr>`).join('')}</table>`}
         <div class="row" style="margin-top:12px">
           <button id="ex-go" ${rd.ok ? '' : 'disabled'}>📤 Excel を出力する${rd.exportState.latest && !rd.exportState.stale ? ' (同じ内容の再出力)' : ''}</button>
           <button id="ex-close">閉じる</button>
@@ -403,11 +403,11 @@
         setTimeout(() => openExportPanel(runId), 1500);
       });
       document.querySelectorAll('.ex-sta').forEach(b => b.addEventListener('click', async () => {
-        if (!confirm('この出力ファイルを STA にアップロードしましたか?\n記録すると納品回は「完了」になり、iPad から変更できなくなります')) return;
+        if (!confirm('この出力ファイルを STA にアップロードしましたか?\n付いている Excel が全部アップ済みになると納品回は「完了」になり、iPad から変更できなくなります')) return;
         const jj = await post(`/admin/runs/${runId}/sta-uploaded`, { export_id: Number(b.dataset.id) });
         if (!jj.ok) return setMsg($('#ex-msg'), 'err', jj.message);
-        setMsg($('#ex-msg'), 'ok', 'STA アップ済みとして記録しました (納品回は完了)');
-        setTimeout(() => location.reload(), 900);
+        setMsg($('#ex-msg'), 'ok', jj.runDone ? 'STA アップ済みとして記録しました (全ファイル完了 → 納品回は完了)' : `STA アップ済みとして記録しました。残り: ${(jj.remaining || []).join(', ') || 'なし'}`);
+        setTimeout(() => (jj.runDone ? location.reload() : openExportPanel(runId)), 900);
       }));
     }
     document.querySelectorAll('.run-export').forEach(b => b.addEventListener('click', () => {

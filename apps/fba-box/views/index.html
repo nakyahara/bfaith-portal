@@ -303,7 +303,7 @@
     $('#btn-worker').classList.toggle('warn', !worker);
     // タブ
     $('#tabs').innerHTML = S.groups.map(g => {
-      const rowsOf = S.rows.filter(r => r.pack_group_id === g.id);
+      const rowsOf = S.rows.filter(r => r.pack_group_id === g.id && r.match_state !== 'retired');
       const doneN = rowsOf.filter(r => rowDone(r)).length;
       return `<button class="tab ${g.id === curGroupId ? 'on' : ''}" data-id="${g.id}">${esc(g.sheet_name)} (${doneN}/${rowsOf.length})</button>`;
     }).join('');
@@ -322,8 +322,8 @@
         ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
       </button>`).join('');
     $('#boxbtns').querySelectorAll('.boxbtn').forEach(b => b.addEventListener('click', () => openBoxDialog(Number(b.dataset.id))));
-    // 行リスト
-    const rows = S.rows.filter(r => r.pack_group_id === curGroupId);
+    // 行リスト (retired = 差し替えで消えた行は出さない)
+    const rows = S.rows.filter(r => r.pack_group_id === curGroupId && r.match_state !== 'retired');
     $('#rows').innerHTML = rows.map(r => {
       const rem = r.planned_qty - r.placed - (r.shortage_qty || 0);
       const done = rowDone(r);
@@ -332,7 +332,8 @@
         <div class="name">${esc(r.product_name || r.seller_sku)}
           <div class="sub">${esc(r.fnsku)}
             ${r.match_state === 'qty_mismatch' ? '<span class="badge warnm">数量注意</span>' : ''}
-            ${r.match_state === 'excel_only' ? '<span class="badge warnm">プラン外</span>' : ''}
+            ${r.match_state === 'excel_only' ? '<span class="badge warnm">Excelにだけある</span>' : ''}
+            ${r.match_state === 'picking_only' ? '<span class="badge short">Excelに無い (入れない)</span>' : ''}
             ${r.shortage_qty ? `<span class="badge short">不足${r.shortage_qty}</span>` : ''}
             ${expiryOf(r.id) ? `<span class="badge exp">期限 ${esc(expiryOf(r.id))}</span>` : ''}
             ${r.label_worker ? `👤${esc(r.label_worker)}` : ''}${r.check_worker ? ` ✅${esc(r.check_worker)}` : ''}
@@ -343,7 +344,7 @@
     }).join('');
     $('#rows').querySelectorAll('.row').forEach(el => el.addEventListener('click', () => openRowDialog(Number(el.dataset.id))));
   }
-  function rowDone(r) { return r.placed + (r.shortage_qty || 0) >= r.planned_qty && r.planned_qty > 0; }
+  function rowDone(r) { return r.match_state === 'picking_only' || (r.placed + (r.shortage_qty || 0) >= r.planned_qty && r.planned_qty > 0); }
 
   // ─── まとめ (出荷前チェック): 何が残っているかを現場でも見られる ───
   async function summaryDialog() {

@@ -162,35 +162,45 @@ export function matchWorkbook(parsed, planSheets) {
  */
 export function matchExcelSheetsToGroups(parsedSheets, groups) {
   const gsets = groups.map((g) => ({ id: g.id, name: g.name, set: new Set((g.fnskus || []).map(norm).filter(Boolean)) }));
-  const assignments = [];
+  const sheetSets = parsedSheets.map((s) => new Set((s.skuRows || []).map((r) => norm(r.fnsku)).filter(Boolean)));
+  const overlap = sheetSets.map((fn) => gsets.map((g) => [...fn].filter((x) => g.set.has(x)).length));
+  const nS = parsedSheets.length, nG = gsets.length;
   const issues = [];
-  const taken = new Map();   // groupId → sheetIndex
-  parsedSheets.forEach((sheet, sheetIndex) => {
-    const fn = new Set((sheet.skuRows || []).map((r) => norm(r.fnsku)).filter(Boolean));
-    const scored = gsets.map((g) => ({ id: g.id, name: g.name, overlap: [...fn].filter((x) => g.set.has(x)).length }))
-      .sort((a, b) => b.overlap - a.overlap);
-    let best = scored[0];
-    if (!best || best.overlap === 0) {
-      if (parsedSheets.length === 1 && gsets.length === 1) best = { ...scored[0], overlap: 0 };
-      else { issues.push({ kind: 'unmatched_sheet', sheetName: sheet.sheetName, fnskus: fn.size }); return; }
-    }
-    if (scored[1] && scored[1].overlap === best.overlap && best.overlap > 0) {
-      issues.push({ kind: 'ambiguous_sheet', sheetName: sheet.sheetName, candidates: [best.name, scored[1].name] });
+  const fail = (extra) => ({ ok: false, assignments: [], unassignedGroups: gsets.map((g) => g.id), issues, ...extra,
+    message: `Excel のシートを納品回のグループに対応付けできません: ${issues.map((i) => `${i.sheetName || ''} (${i.kind})`).join(', ')}` });
+  // 1 シート × 1 グループで重なり 0 = 片側にしか商品が無い回。そのまま対応させる (行は excel_only / picking_only になる)
+  if (nS === 1 && nG === 1 && overlap[0][0] === 0) {
+    return { ok: true, assignments: [{ sheetIndex: 0, sheetName: parsedSheets[0].sheetName, groupId: gsets[0].id, groupName: gsets[0].name, overlap: 0 }], unassignedGroups: [], issues: [], message: null };
+  }
+  if (nS > nG) { issues.push({ kind: 'too_many_sheets', sheetName: '', sheets: nS, groups: nG }); return fail(); }
+  if (nS > 8) { issues.push({ kind: 'too_many_sheets', sheetName: '', sheets: nS }); return fail(); }
+  for (const [i, s] of parsedSheets.entries()) {
+    if (overlap[i].every((v) => v === 0)) issues.push({ kind: 'unmatched_sheet', sheetName: s.sheetName, fnskus: sheetSets[i].size });
+  }
+  if (issues.length > 0) return fail();
+  // 全シート×全グループの最大重み一対一対応 (Codex PR2.5 #5: 貪欲だと全体最適を見逃す)。
+  // n ≤ 8 なので全探索。最大値の対応が複数あれば曖昧として止める
+  let best = -1, bestCount = 0, bestAssign = null;
+  const cur = new Array(nS).fill(-1);
+  const used = new Array(nG).fill(false);
+  const rec = (i, total) => {
+    if (i === nS) {
+      if (total > best) { best = total; bestCount = 1; bestAssign = cur.slice(); } else if (total === best) bestCount++;
       return;
     }
-    if (taken.has(best.id)) {
-      issues.push({ kind: 'group_conflict', sheetName: sheet.sheetName, groupName: best.name, otherSheet: parsedSheets[taken.get(best.id)].sheetName });
-      return;
+    for (let j = 0; j < nG; j++) {
+      if (used[j] || overlap[i][j] === 0) continue;
+      used[j] = true; cur[i] = j;
+      rec(i + 1, total + overlap[i][j]);
+      used[j] = false; cur[i] = -1;
     }
-    taken.set(best.id, sheetIndex);
-    assignments.push({ sheetIndex, sheetName: sheet.sheetName, groupId: best.id, groupName: best.name, overlap: best.overlap });
-  });
-  const unassignedGroups = gsets.filter((g) => !taken.has(g.id)).map((g) => g.id);
-  const ok = issues.length === 0 && assignments.length === parsedSheets.length;
-  return {
-    ok, assignments, unassignedGroups, issues,
-    message: ok ? null : `Excel のシートを納品回のグループに対応付けできません: ${issues.map((i) => `${i.sheetName} (${i.kind})`).join(', ')}`,
   };
+  rec(0, 0);
+  if (!bestAssign) { issues.push({ kind: 'no_assignment', sheetName: '' }); return fail(); }
+  if (bestCount > 1) { issues.push({ kind: 'ambiguous', sheetName: '', optimalCount: bestCount }); return fail(); }
+  const assignments = bestAssign.map((j, i) => ({ sheetIndex: i, sheetName: parsedSheets[i].sheetName, groupId: gsets[j].id, groupName: gsets[j].name, overlap: overlap[i][j] }));
+  const takenIds = new Set(assignments.map((a) => a.groupId));
+  return { ok: true, assignments, unassignedGroups: gsets.filter((g) => !takenIds.has(g.id)).map((g) => g.id), issues: [], message: null };
 }
 
 export function groupDisplayName(sheet) {

@@ -26,7 +26,7 @@ import {
   createBox, closeBox, reopenBox, voidBox, listBoxContents,
   addPlacement, revokePlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage,
-  exportReadiness, buildExportPayload, recordExport, listExports, getExport, markStaUploaded,
+  exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
 } from './db.js';
 import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
@@ -54,9 +54,18 @@ async function loadPickingRuns(limit = 15) {
     return { runs: [], error: e.message };
   }
 }
-/** picking 実行から納品回を作る共通処理 (iPad / 本社の両方から) */
-async function createFromPicking(sourceRunId, createdBy) {
+/**
+ * picking 実行から納品回を作る共通処理 (iPad / 本社の両方から)。
+ * 端末 (fromDevice) は一覧に出している直近の実行 (loadPickingRuns) に限る — 過去 ID を列挙して回を量産させない (Codex PR2.5 #6)
+ */
+async function createFromPicking(sourceRunId, createdBy, { fromDevice = false } = {}) {
   if (!Number.isInteger(sourceRunId) || sourceRunId <= 0) return { status: 400, body: { ok: false, error: 'bad_request', message: 'ピッキング実行を選んでください' } };
+  if (fromDevice) {
+    const recent = await loadPickingRuns(15);
+    if (!recent.runs.some((r) => Number(r.id) === sourceRunId)) {
+      return { status: 403, body: { ok: false, error: 'not_recent', message: 'この実行は一覧に無いため iPad からは開始できません (本社に確認してください)' } };
+    }
+  }
   let pickingRun = null;
   try {
     pickingRun = (await pickingSource()).getPickingRun(sourceRunId);
@@ -265,7 +274,7 @@ router.get('/api/runs', api(async (req, res) => {
 
 /** picking 実行から納品回を作る (iPad から。同じ実行の回が既にあれば already でその回を返す) */
 router.post('/api/runs/from-picking', checkOrigin, api(async (req, res) => {
-  const r = await createFromPicking(Number(req.body?.source_run_id), deviceLabelOf(req));
+  const r = await createFromPicking(Number(req.body?.source_run_id), deviceLabelOf(req), { fromDevice: !hasSessionAccess(req) });
   res.status(r.status).json(r.body);
 }));
 
@@ -635,25 +644,34 @@ router.post('/admin/runs/:id(\\d+)/exports', requireSession, checkOrigin, api(as
   const runId = Number(req.params.id);
   const payload = buildExportPayload(runId);
   if (!payload.ok) return res.status(payload.error === 'not_found' ? 404 : 409).json(payload);
-  // 添付ファイルごとに 1 出力 (P1/P2 で Excel が別)。1 つでも失敗したら全体を失敗にする (半端な版を残さない)
-  const results = [];
+  // 添付ファイルごとに 1 出力 (P1/P2 で Excel が別)。全ファイルを書いて検算してから 1 トランザクションで登録し、
+  // 1 つでも失敗したら今回の生成物を消して全体を失敗にする (半端な版を残さない — Codex PR2.5 #2)
+  const written = [];
   for (const ex of payload.exports) {
     const w = await writePacklist({ templatePath: ex.excelFile.stored_path, sheets: ex.sheets, fileTag: `run${runId}-f${ex.excelFile.id}` });
     if (!w.ok) {
+      for (const x of written) { try { fs.unlinkSync(x.w.outputPath); } catch { /* noop */ } }
       safeLogEvent({ runId, action: 'excel_export', ok: false, error: `${w.error}: ${w.message}`, deviceLabel: `session:${req.session.email}` });
       return res.status(422).json({ ...w, fileName: ex.excelFile.original_name });
     }
-    const rec = recordExport({
-      runId, excelFileId: ex.excelFile.id, dataVersion: ex.snapshot.dataVersion,
-      fileName: ex.excelFile.original_name || `packlist-run${runId}.xlsx`, storedPath: w.outputPath, sha256: w.sha256,
-      snapshot: ex.snapshot, verify: w.verify, createdBy: req.session.email,
-    });
-    if (!rec.ok) return res.status(409).json(rec);
-    results.push({ exportId: rec.exportId, stale: rec.stale, written: w.written, cleared: w.cleared, verify: w.verify,
-      fileName: ex.excelFile.original_name, downloadUrl: `${BASE}/admin/exports/${rec.exportId}/download` });
+    written.push({ ex, w });
   }
+  const rec = recordExportBatch({
+    runId, createdBy: req.session.email,
+    items: written.map(({ ex, w }) => ({
+      excelFileId: ex.excelFile.id, dataVersion: ex.snapshot.dataVersion,
+      fileName: ex.excelFile.original_name || `packlist-run${runId}.xlsx`, storedPath: w.outputPath, sha256: w.sha256,
+      snapshot: ex.snapshot, verify: w.verify,
+    })),
+  });
+  if (!rec.ok) {
+    for (const x of written) { try { fs.unlinkSync(x.w.outputPath); } catch { /* noop */ } }
+    return res.status(409).json(rec);
+  }
+  const results = written.map(({ ex, w }, i) => ({ exportId: rec.exportIds[i], stale: rec.stale, written: w.written, cleared: w.cleared, verify: w.verify,
+    fileName: ex.excelFile.original_name, downloadUrl: `${BASE}/admin/exports/${rec.exportIds[i]}/download` }));
   const first = results[0];
-  res.json({ ok: true, exports: results, stale: results.some((r) => r.stale),
+  res.json({ ok: true, exports: results, stale: rec.stale,
     // 後方互換 (1 ファイルのとき)
     exportId: first.exportId, written: first.written, cleared: first.cleared, verify: first.verify, downloadUrl: first.downloadUrl,
     warnings: payload.exports[0].snapshot.warnings });

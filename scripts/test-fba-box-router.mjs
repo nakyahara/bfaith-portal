@@ -221,7 +221,9 @@ console.log('■ PR2.5: picking 実行 → iPad から作業開始 → Excel 後
 const pkRows = ing.parsed.sheets[0].skuRows.map((r, i) => ({ no: i + 1, sku: r.sku, fnsku: r.fnsku, productName: '商品' + i, qty: String(r.plannedQty) }));
 const pickingMem = [{ id: 501, delivery_date: '2026-09-25', run_at: '2026-09-03 10:00', plan_sheet_count: 1,
   result: JSON.stringify({ planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: pkRows }] }) }];
-_setPickingSource(async () => ({ getPickingRuns: () => pickingMem, getPickingRun: (id) => pickingMem.find((r) => r.id === Number(id)) || null }));
+// 502 = 直近一覧に出ない古い実行 (getPickingRun では読めるが getPickingRuns には無い)
+const pickingOld = { id: 502, delivery_date: '2026-08-01', run_at: '2026-08-01 10:00', plan_sheet_count: 1, result: pickingMem[0].result };
+_setPickingSource(async () => ({ getPickingRuns: () => pickingMem, getPickingRun: (id) => [...pickingMem, pickingOld].find((r) => r.id === Number(id)) || null }));
 let pkRunId = null;
 await t('GET /api/runs に「まだ始めていない picking 実行」が出る', async () => {
   const r = await call('GET', '/api/runs');
@@ -235,7 +237,12 @@ await t('端末から POST /api/runs/from-picking → active な納品回。二�
   pkRunId = r.j.runId;
   const again = await call('POST', '/api/runs/from-picking', { body: { source_run_id: 501 } });
   assert.equal(again.j.already, true); assert.equal(again.j.runId, pkRunId);
-  assert.equal((await call('POST', '/api/runs/from-picking', { body: { source_run_id: 999 } })).status, 404);
+  assert.equal((await call('POST', '/api/runs/from-picking', { body: { source_run_id: 999 } })).status, 403);   // 一覧に無い
+  // 一覧に出ない古い実行は端末からは 403、本社 (セッション) なら作れる
+  const old = await call('POST', '/api/runs/from-picking', { body: { source_run_id: 502 } });
+  assert.equal(old.status, 403); assert.equal(old.j.error, 'not_recent');
+  const oldAdmin = await call('POST', '/admin/runs/from-picking', { body: { source_run_id: 502 }, session: 'user', device: false });
+  assert.equal(oldAdmin.j.ok, true, JSON.stringify(oldAdmin.j));
   const list = await call('GET', '/api/runs');
   assert.equal(list.j.pickingRuns.find((x) => x.id === 501).boxRun.id, pkRunId);
   const st = await call('GET', `/api/state?run=${pkRunId}`);

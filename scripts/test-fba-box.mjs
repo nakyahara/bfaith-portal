@@ -94,6 +94,23 @@ t('matchWorkbook: pickingにあってExcelに無い = picking_only 警告', () =
 t('shortNameForSpeech: 【】<>内を除去', () => {
   assert.equal(svc.shortNameForSpeech('【水溶性】 アロマオイル10ml <チャック付き>'), 'アロマオイル10ml');
 });
+t('matchExcelSheetsToGroups: 全体最適の一対一 (貪欲だと衝突する例) / 同点は曖昧 / 重なり無しは unmatched / 1×1 は重なり 0 でも対応', () => {
+  const sheet = (name, fn) => ({ sheetName: name, skuRows: fn.map((f) => ({ fnsku: f })) });
+  // S1: G1=2/G2=1, S2: G1=3/G2=2 → 最適は S1→G2, S2→G1 (合計4)。貪欲 (S1→G1) だと S2 が衝突する
+  const groups = [{ id: 1, name: 'G1', fnskus: ['A', 'B', 'C', 'D'] }, { id: 2, name: 'G2', fnskus: ['A', 'E', 'F'] }];
+  const m = svc.matchExcelSheetsToGroups([sheet('S1', ['A', 'B', 'E']), sheet('S2', ['A', 'C', 'D', 'F'])], groups);
+  assert.equal(m.ok, true, JSON.stringify(m));
+  assert.deepEqual(m.assignments.map((a) => [a.sheetName, a.groupId]), [['S1', 2], ['S2', 1]]);
+  assert.deepEqual(m.unassignedGroups, []);
+  const amb = svc.matchExcelSheetsToGroups([sheet('S1', ['A']), sheet('S2', ['A'])], groups);
+  assert.equal(amb.ok, false); assert.ok(amb.issues.some((i) => i.kind === 'ambiguous'));
+  const un = svc.matchExcelSheetsToGroups([sheet('S1', ['Z'])], groups);
+  assert.equal(un.ok, false); assert.ok(un.issues.some((i) => i.kind === 'unmatched_sheet'));
+  const one = svc.matchExcelSheetsToGroups([sheet('S1', ['Z'])], [groups[0]]);
+  assert.equal(one.ok, true); assert.equal(one.assignments[0].overlap, 0);
+  const partial = svc.matchExcelSheetsToGroups([sheet('S1', ['E', 'F'])], groups);
+  assert.equal(partial.ok, true); assert.deepEqual(partial.unassignedGroups, [1]);
+});
 
 // ───────── run 作成〜割当 (db) ─────────
 console.log('■ 納品回・割当');
@@ -678,15 +695,78 @@ t('attachExcelToRun (P1): FNSKU の重なりでグループ1に対応。matched 
   assert.ok(db.exportReadiness(pr.runId).blockers.some((b) => b.code === 'no_excel'));
 });
 const at2 = db.attachExcelToRun({ runId: pr.runId, parsed: ing.parsed, file: { originalName: 'p2.xlsx', storedPath: ing.storedPath, sha256: ing.sha256 }, actor: 't' });
-t('attachExcelToRun (P2): 2 ファイル目はグループ2へ。Excel にだけある商品は excel_only で行が増える', () => {
+t('attachExcelToRun (P2): 2 ファイル目はグループ2へ。Excel にだけある商品は excel_only (origin=excel) で行が増える', () => {
   assert.equal(at2.ok, true, JSON.stringify(at2));
   assert.equal(at2.groups[0].groupId, g2);
   assert.equal(at2.groups[0].matched, 3);
   assert.equal(at2.groups[0].excel_only, 1);
+  assert.deepEqual(at2.unassignedGroups, []);
   assert.equal(rowsOf(g2).length, 4);
-  assert.ok(rowsOf(g2).some((r) => r.match_state === 'excel_only' && r.excel_row > 0));
+  const eo = rowsOf(g2).find((r) => r.match_state === 'excel_only');
+  assert.ok(eo && eo.excel_row > 0 && eo.origin === 'excel');
+  assert.ok(rowsOf(g1).every((r) => r.origin === 'picking'));
   assert.equal(db.getRunState(pr.runId).excelFiles.length, 2);
   assert.ok(!db.exportReadiness(pr.runId).blockers.some((b) => b.code === 'no_excel'));
+});
+t('添付の拒否: Excel の予定数 < 投入+不足 (over_placed)。取消すれば添付できる', () => {
+  // 別の納品回: 行A を予定 5 で作って 5 個投入 → Excel (予定 3) を添付 → 拒否
+  const c = db.createRunFromPicking({ pickingRun: { id: 300, delivery_date: '2026-09-21' }, planSheets: [
+    { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, sku: f1rows[0].sku, fnsku: f1rows[0].fnsku, productName: 'A', qty: '5' }, { no: 2, sku: f1rows[1].sku, fnsku: f1rows[1].fnsku, productName: 'B', qty: '3' }] },
+  ], createdBy: 't' });
+  const st = db.getRunState(c.runId);
+  const bx = db.createBox({ packGroupId: st.groups[0].id, materialCode: 'box140', worker: member });
+  const rA = st.rows.find((r) => r.plan_no === '通常_1');
+  const p = db.addPlacement({ runId: c.runId, rowId: rA.id, boxId: bx.boxId, qty: 5, worker: member, deviceKey: 'dev:9', requestId: 'op1' });
+  assert.equal(p.ok, true);
+  const bad = db.attachExcelToRun({ runId: c.runId, parsed: ing1.parsed, file: { originalName: 'p1.xlsx', storedPath: ing1.storedPath, sha256: ing1.sha256 }, actor: 't' });
+  assert.equal(bad.ok, false); assert.equal(bad.error, 'attach_conflict');
+  assert.ok(bad.conflicts.some((x) => x.kind === 'over_placed' && x.placed === 5 && x.excelQty === 3));
+  assert.equal(db.getRunState(c.runId).excelFiles.length, 0, '拒否時はファイル記録を残さない');
+  db.revokePlacement({ placementId: p.placementId, byStaff: true, reason: '多すぎ', worker: staff, deviceKey: 'dev:9' });
+  const okr = db.attachExcelToRun({ runId: c.runId, parsed: ing1.parsed, file: { originalName: 'p1.xlsx', storedPath: ing1.storedPath, sha256: ing1.sha256 }, actor: 't' });
+  assert.equal(okr.ok, true, JSON.stringify(okr));
+  assert.equal(db.getRunState(c.runId).rows.find((r) => r.id === rA.id).planned_qty, 3);
+});
+t('再添付で消えた excel_only 行: 記録なしは削除 / 取消済み記録だけなら retired / 投入ありは拒否 (excel_only_placed)', () => {
+  // picking 側に 1 SKU だけの回に fixture1 (2 SKU) を添付 → 2 つ目が excel_only
+  const c = db.createRunFromPicking({ pickingRun: { id: 301, delivery_date: '2026-09-22' }, planSheets: [
+    { slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, sku: f1rows[0].sku, fnsku: f1rows[0].fnsku, productName: 'A', qty: '3' }] },
+  ], createdBy: 't' });
+  const file = { originalName: 'p1.xlsx', storedPath: ing1.storedPath, sha256: ing1.sha256 };
+  assert.equal(db.attachExcelToRun({ runId: c.runId, parsed: ing1.parsed, file, actor: 't' }).ok, true);
+  const rows1 = db.getRunState(c.runId).rows;
+  const eo = rows1.find((r) => r.match_state === 'excel_only');
+  assert.ok(eo && eo.origin === 'excel');
+  // 2 つ目の SKU を落とした Excel で再添付 → 記録が無いので削除
+  const parsedMinus = JSON.parse(JSON.stringify(ing1.parsed));
+  parsedMinus.sheets[0].skuRows = parsedMinus.sheets[0].skuRows.filter((r) => r.fnsku !== eo.fnsku);
+  const re1 = db.attachExcelToRun({ runId: c.runId, parsed: parsedMinus, file, actor: 't' });
+  assert.equal(re1.ok, true, JSON.stringify(re1));
+  assert.equal(re1.groups[0].retired, 1);
+  assert.equal(db.getRunState(c.runId).rows.some((r) => r.id === eo.id), false, '記録なしの excel_only 行は消える');
+  // もう一度フル Excel を添付 → excel_only が再生成される → 投入して取消 → 落とした Excel で再添付 → retired (FK で残す)
+  assert.equal(db.attachExcelToRun({ runId: c.runId, parsed: ing1.parsed, file, actor: 't' }).ok, true);
+  const st = db.getRunState(c.runId);
+  const eo2 = st.rows.find((r) => r.match_state === 'excel_only');
+  const bx = db.createBox({ packGroupId: st.groups[0].id, materialCode: 'box140', worker: member });
+  const p = db.addPlacement({ runId: c.runId, rowId: eo2.id, boxId: bx.boxId, qty: 1, worker: member, deviceKey: 'dev:9', requestId: 'eo1' });
+  assert.equal(p.ok, true);
+  const blocked = db.attachExcelToRun({ runId: c.runId, parsed: parsedMinus, file, actor: 't' });
+  assert.equal(blocked.error, 'attach_conflict');
+  assert.ok(blocked.conflicts.some((x) => x.kind === 'excel_only_placed'));
+  db.revokePlacement({ placementId: p.placementId, byStaff: true, reason: 'x', worker: staff, deviceKey: 'dev:9' });
+  const re2 = db.attachExcelToRun({ runId: c.runId, parsed: parsedMinus, file, actor: 't' });
+  assert.equal(re2.ok, true, JSON.stringify(re2));
+  const retired = db.getRunState(c.runId).rows.find((r) => r.id === eo2.id);
+  assert.equal(retired.match_state, 'retired');
+  assert.equal(retired.excel_row, null);
+  // retired は完了判定から外れる: 行A を 3 入れて閉じれば done にできる
+  const rA = db.getRunState(c.runId).rows.find((r) => r.origin === 'picking');
+  db.addPlacement({ runId: c.runId, rowId: rA.id, boxId: bx.boxId, qty: 3, worker: member, deviceKey: 'dev:9', requestId: 'eo2' });
+  db.closeBox({ boxId: bx.boxId, measuredKg: 2, worker: staff });
+  assert.equal(db.exportReadiness(c.runId).ok, true, JSON.stringify(db.exportReadiness(c.runId).blockers));
+  const pl = db.buildExportPayload(c.runId);
+  assert.equal(pl.exports[0].sheets[0].cells.filter((x) => x.kind === 'qty').length, 1, 'retired 行は書かない');
 });
 t('Excel に無い商品 (picking_only) に投入があると出力ブロック。取消せば解消。完了判定からは外れる', () => {
   const fake = rowsOf(g1).find((r) => r.match_state === 'picking_only');
@@ -737,6 +817,34 @@ t('全行投入 → 出力は添付ファイルごと (2 出力)。シート名�
   assert.equal(p1.sheets[0].cells.filter((c) => c.kind === 'qty').length, 2);   // picking_only は書かない
   assert.ok(wPk.every((w) => w.ok), JSON.stringify(wPk.map((w) => w.error || 'ok')));
   assert.equal(wPk.length, 2);
+});
+t('複数 Excel の STA アップ済み: 1 ファイルでは納品回は完了しない → 全ファイルで done。同一ファイルの別出力は拒否', () => {
+  const rec = db.recordExportBatch({ runId: pr.runId, createdBy: 't', items: payloadPk.exports.map((ex, i) => ({
+    excelFileId: ex.excelFile.id, dataVersion: ex.snapshot.dataVersion, fileName: ex.excelFile.original_name, storedPath: wPk[i].outputPath, sha256: wPk[i].sha256, snapshot: ex.snapshot, verify: wPk[i].verify })) });
+  assert.equal(rec.ok, true, JSON.stringify(rec));
+  assert.equal(rec.exportIds.length, 2);
+  assert.equal(rec.stale, false);
+  assert.equal(db.recordExportBatch({ runId: pr.runId, createdBy: 't', items: [{ excelFileId: 1, dataVersion: 1 }, { excelFileId: 2, dataVersion: 2 }] }).error, 'version_mismatch');
+  const m1 = db.markStaUploaded({ runId: pr.runId, exportId: rec.exportIds[0], actor: 't' });
+  assert.equal(m1.ok, true, JSON.stringify(m1));
+  assert.equal(m1.runDone, false);
+  assert.equal(m1.remaining.length, 1);
+  assert.equal(db.getRun(pr.runId).status, 'active');
+  assert.equal(db.getRun(pr.runId).sta_uploaded_at, null);
+  assert.ok(db.exportReadiness(pr.runId).warnings.some((w) => w.code === 'sta_partial'));
+  assert.equal(db.listExports(pr.runId).find((e) => e.id === rec.exportIds[0]).sta_uploaded, 1);
+  // 同じファイルの別出力 (同じ版) を記録しようとすると拒否
+  const dup = db.recordExport({ runId: pr.runId, excelFileId: payloadPk.exports[0].excelFile.id, dataVersion: payloadPk.exports[0].snapshot.dataVersion, fileName: 'dup.xlsx', storedPath: wPk[0].outputPath, sha256: wPk[0].sha256, snapshot: payloadPk.exports[0].snapshot, verify: null, createdBy: 't' });
+  assert.equal(db.markStaUploaded({ runId: pr.runId, exportId: dup.exportId, actor: 't' }).error, 'already_uploaded');
+  // アップ済みファイルのグループへの再添付は拒否
+  const reat = db.attachExcelToRun({ runId: pr.runId, parsed: payloadPk.exports[0].excelFile.original_name === 'p1-again.xlsx' ? ing1.parsed : ing.parsed, file: { originalName: 'x.xlsx', storedPath: ing1.storedPath, sha256: ing1.sha256 }, actor: 't' });
+  assert.equal(reat.error, 'file_uploaded');
+  const m2 = db.markStaUploaded({ runId: pr.runId, exportId: rec.exportIds[1], actor: 't' });
+  assert.equal(m2.ok, true, JSON.stringify(m2));
+  assert.equal(m2.runDone, true);
+  assert.equal(db.getRun(pr.runId).status, 'done');
+  assert.ok(db.getRun(pr.runId).sta_uploaded_at);
+  assert.equal(db.markStaUploaded({ runId: pr.runId, exportId: rec.exportIds[1], actor: 't' }).already, true);
 });
 
 console.log('■ PR2: fbx_boxes の void 移行');
@@ -818,7 +926,9 @@ t('PR2 スキーマの pack_groups / rows を再構築: NULL 許容・pending/pi
   const g = mdb2.prepare('SELECT * FROM fbx_pack_groups WHERE id = 1').get();
   assert.equal(g.excel_sheet_name, '輸送箱の梱包情報'); assert.equal(g.excel_file_id, 1); assert.equal(g.max_box_columns, 15);
   const r = mdb2.prepare('SELECT * FROM fbx_rows WHERE id = 1').get();
-  assert.equal(r.match_state, 'qty_mismatch'); assert.equal(r.excel_row, 6);
+  assert.equal(r.match_state, 'qty_mismatch'); assert.equal(r.excel_row, 6); assert.equal(r.origin, 'excel');
+  assert.ok(mdb2.prepare(`SELECT sql FROM sqlite_master WHERE name = 'fbx_rows'`).get().sql.includes("'retired'"));
+  assert.ok(new Set(mdb2.prepare('PRAGMA table_info(fbx_exports)').all().map((c) => c.name)).has('sta_uploaded_at'));
   assert.deepEqual(mdb2.prepare('PRAGMA foreign_key_check').all(), []);
   assert.equal(mdb2.prepare(`SELECT COUNT(*) c FROM sqlite_master WHERE name IN ('fbx_rows_new','fbx_pack_groups_new')`).get().c, 0);
   assert.equal(mdb2.prepare(`SELECT COUNT(*) c FROM sqlite_master WHERE type = 'index' AND name = 'idx_fbx_rows_run'`).get().c, 1);
