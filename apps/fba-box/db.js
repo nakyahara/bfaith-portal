@@ -16,6 +16,7 @@ import crypto from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import Database from 'better-sqlite3';
+import { matchExcelSheetsToGroups } from './service.js';
 
 const utcNow = () => new Date().toISOString();
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
@@ -83,30 +84,118 @@ const BOXES_DDL = (name) => `
     );`;
 
 /**
- * PR1 で作られた fbx_boxes (status CHECK が open/closed のみ) を void 対応に再構築する。
- * SQLite は CHECK を ALTER できないので公式手順 (新表→コピー→DROP→RENAME) を
- * foreign_keys OFF の下で1トランザクションで行い、最後に foreign_key_check。冪等
+ * 梱包グループ = picking-prep のプラン別シート (Excel 添付前) または STA パックリストのシート (添付後)。
+ * PR2.5 (Excel 後付け) で excel_file_id / packing_group_id を NULL 許容にし、picking 由来の
+ * source_slot_id / source_label を持つ。excel_sheet_name = 書き込み先シート名 (添付後のみ)
  */
-function migrateBoxesVoid(d) {
-  const sql = d.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fbx_boxes'`).get()?.sql || '';
-  if (sql.includes("'void'")) return;
+const PACK_GROUPS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id           INTEGER NOT NULL REFERENCES fbx_runs(id),
+      excel_file_id    INTEGER REFERENCES fbx_excel_files(id),
+      sheet_name       TEXT NOT NULL,
+      excel_sheet_name TEXT,
+      packing_group_id TEXT,
+      display_name     TEXT NOT NULL,
+      source_slot_id   TEXT,
+      source_label     TEXT,
+      box_count_hint   INTEGER,
+      max_box_columns  INTEGER,
+      structure_json   TEXT,
+      UNIQUE(run_id, packing_group_id),
+      UNIQUE(run_id, source_slot_id)
+    );`;
+
+/**
+ * 商品行。Excel 添付前は excel_row / seller_sku が NULL で match_state='pending'。
+ * origin = 行の由来 (picking: picking-prep のシート行 / excel: Excel の SKU 行)。不変。
+ * picking_only = 添付した Excel に無い picking 行 (出力対象外。投入があれば出荷前チェックでブロック)
+ * retired = 前の Excel にだけあった行 (origin=excel) が差し替えで消えたが、取消済み投入の履歴があるため残した行 (表示・判定から除外)
+ */
+const ROWS_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id         INTEGER NOT NULL REFERENCES fbx_runs(id),
+      pack_group_id  INTEGER NOT NULL REFERENCES fbx_pack_groups(id),
+      origin         TEXT NOT NULL DEFAULT 'picking' CHECK (origin IN ('picking','excel')),
+      excel_row      INTEGER,
+      seller_sku     TEXT,
+      asin           TEXT,
+      fnsku          TEXT NOT NULL,
+      excel_id       TEXT,
+      product_name   TEXT,
+      planned_qty    INTEGER NOT NULL CHECK (planned_qty >= 0),
+      plan_no        TEXT,
+      source_slot_id TEXT,
+      picking_row_no INTEGER,
+      picking_qty    INTEGER,
+      match_state    TEXT NOT NULL DEFAULT 'matched'
+                     CHECK (match_state IN ('matched','qty_mismatch','excel_only','picking_only','pending','retired')),
+      requires_expiry INTEGER CHECK (requires_expiry IN (0,1)),
+      UNIQUE(pack_group_id, excel_row)
+    );`;
+
+/** 出力対象外の行 (Excel に無い / 差し替えで消えた)。完了判定・出力・iPad 表示から除外 */
+const EXCLUDED_ROW_STATES = ['picking_only', 'retired'];
+
+/**
+ * テーブル再構築 (CHECK / NOT NULL は ALTER できない)。公式手順 = 新表→コピー→DROP→RENAME を
+ * foreign_keys OFF の下で1トランザクションで行い、最後に foreign_key_check。失敗時は元のまま
+ */
+function rebuildTable(d, name, ddl, insertSql, label) {
   const fkWasOn = d.pragma('foreign_keys', { simple: true }) === 1;
   if (fkWasOn) d.pragma('foreign_keys = OFF');
   try {
     d.transaction(() => {
-      d.exec(BOXES_DDL('fbx_boxes_new'));
-      d.exec(`INSERT INTO fbx_boxes_new (id, pack_group_id, box_no, box_code, material_code, status, measured_weight_kg,
-                closed_at, closed_by, closed_reason, cushion_level, reopen_count, created_by, created_at)
-              SELECT id, pack_group_id, box_no, box_code, material_code, status, measured_weight_kg,
-                closed_at, closed_by, closed_reason, cushion_level, reopen_count, created_by, created_at FROM fbx_boxes`);
-      d.exec('DROP TABLE fbx_boxes');
-      d.exec('ALTER TABLE fbx_boxes_new RENAME TO fbx_boxes');
+      d.exec(`DROP TABLE IF EXISTS ${name}_new`);   // 前回の失敗で残った中間表を使い回さない
+      d.exec(ddl(`${name}_new`));
+      d.exec(insertSql);
+      d.exec(`DROP TABLE ${name}`);
+      d.exec(`ALTER TABLE ${name}_new RENAME TO ${name}`);
       const bad = d.prepare('PRAGMA foreign_key_check').all();
-      if (bad.length > 0) throw new Error(`[fba-box] fbx_boxes 移行後の foreign_key_check に失敗: ${JSON.stringify(bad.slice(0, 3))}`);
+      if (bad.length > 0) throw new Error(`[fba-box] ${name} 移行後の foreign_key_check に失敗: ${JSON.stringify(bad.slice(0, 3))}`);
     })();
-    console.log('[fba-box] fbx_boxes を void 対応スキーマへ移行しました');
+    console.log(`[fba-box] ${name} を${label}へ移行しました`);
   } finally {
     if (fkWasOn) d.pragma('foreign_keys = ON');
+  }
+}
+
+/** PR1 で作られた fbx_boxes (status CHECK が open/closed のみ) を void 対応に再構築する。冪等 */
+function migrateBoxesVoid(d) {
+  const sql = d.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fbx_boxes'`).get()?.sql || '';
+  if (sql.includes("'void'")) return;
+  rebuildTable(d, 'fbx_boxes', BOXES_DDL,
+    `INSERT INTO fbx_boxes_new (id, pack_group_id, box_no, box_code, material_code, status, measured_weight_kg,
+        closed_at, closed_by, closed_reason, cushion_level, reopen_count, created_by, created_at)
+      SELECT id, pack_group_id, box_no, box_code, material_code, status, measured_weight_kg,
+        closed_at, closed_by, closed_reason, cushion_level, reopen_count, created_by, created_at FROM fbx_boxes`,
+    'void 対応スキーマ');
+}
+
+/** PR2.5: Excel 後付け — fbx_pack_groups / fbx_rows の NOT NULL・CHECK を緩める。冪等 */
+function migratePickingFirst(d) {
+  const groupCols = new Set(d.prepare('PRAGMA table_info(fbx_pack_groups)').all().map((c) => c.name));
+  if (!groupCols.has('source_slot_id')) {
+    rebuildTable(d, 'fbx_pack_groups', PACK_GROUPS_DDL,
+      `INSERT INTO fbx_pack_groups_new (id, run_id, excel_file_id, sheet_name, excel_sheet_name, packing_group_id, display_name,
+          source_slot_id, source_label, box_count_hint, max_box_columns, structure_json)
+        SELECT id, run_id, excel_file_id, sheet_name, sheet_name, packing_group_id, display_name,
+          NULL, NULL, box_count_hint, max_box_columns, structure_json FROM fbx_pack_groups`,
+      'Excel 後付け対応 (excel_file_id NULL 許容)');
+  }
+  const rowsSql = d.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fbx_rows'`).get()?.sql || '';
+  if (!rowsSql.includes("'retired'")) {
+    const rowCols = new Set(d.prepare('PRAGMA table_info(fbx_rows)').all().map((c) => c.name));
+    // 既存行 (PR2 = Excel 先行で作られた) の由来は excel。origin 列が既にあればそのまま
+    const originExpr = rowCols.has('origin') ? 'origin' : `'excel'`;
+    rebuildTable(d, 'fbx_rows', ROWS_DDL,
+      `INSERT INTO fbx_rows_new (id, run_id, pack_group_id, origin, excel_row, seller_sku, asin, fnsku, excel_id, product_name, planned_qty,
+          plan_no, source_slot_id, picking_row_no, picking_qty, match_state, requires_expiry)
+        SELECT id, run_id, pack_group_id, ${originExpr}, excel_row, seller_sku, asin, fnsku, excel_id, product_name, planned_qty,
+          plan_no, source_slot_id, picking_row_no, picking_qty, match_state, requires_expiry FROM fbx_rows`,
+      'Excel 後付け対応 (excel_row NULL 許容・origin・pending/picking_only/retired)');
+    d.exec('CREATE INDEX IF NOT EXISTS idx_fbx_rows_run ON fbx_rows(run_id)');
   }
 }
 
@@ -142,41 +231,11 @@ export function createTables(d = getDB()) {
       uploaded_at   TEXT NOT NULL
     );
 
-    -- Amazon 梱包グループ (= パックリストのシート)。箱の親 (Codex R1 B3)
-    CREATE TABLE IF NOT EXISTS fbx_pack_groups (
-      id               INTEGER PRIMARY KEY AUTOINCREMENT,
-      run_id           INTEGER NOT NULL REFERENCES fbx_runs(id),
-      excel_file_id    INTEGER NOT NULL REFERENCES fbx_excel_files(id),
-      sheet_name       TEXT NOT NULL,
-      packing_group_id TEXT NOT NULL,
-      display_name     TEXT NOT NULL,
-      box_count_hint   INTEGER,
-      max_box_columns  INTEGER,
-      structure_json   TEXT,
-      UNIQUE(run_id, packing_group_id)
-    );
+    -- 梱包グループ (= picking のプラン別シート / Excel 添付後はパックリストのシート)。箱の親 (Codex R1 B3)
+    ${PACK_GROUPS_DDL('fbx_pack_groups')}
 
-    -- 商品行 (Excel の SKU 行が正本。picking-prep 側は plan_no と表示名の補強)
-    CREATE TABLE IF NOT EXISTS fbx_rows (
-      id             INTEGER PRIMARY KEY AUTOINCREMENT,
-      run_id         INTEGER NOT NULL REFERENCES fbx_runs(id),
-      pack_group_id  INTEGER NOT NULL REFERENCES fbx_pack_groups(id),
-      excel_row      INTEGER NOT NULL,
-      seller_sku     TEXT NOT NULL,
-      asin           TEXT,
-      fnsku          TEXT NOT NULL,
-      excel_id       TEXT,
-      product_name   TEXT,
-      planned_qty    INTEGER NOT NULL CHECK (planned_qty >= 0),
-      plan_no        TEXT,
-      source_slot_id TEXT,
-      picking_row_no INTEGER,
-      picking_qty    INTEGER,
-      match_state    TEXT NOT NULL DEFAULT 'matched'
-                     CHECK (match_state IN ('matched','qty_mismatch','excel_only')),
-      requires_expiry INTEGER CHECK (requires_expiry IN (0,1)),
-      UNIQUE(pack_group_id, excel_row)
-    );
+    -- 商品行 (Excel 添付後は Excel の SKU 行が正本。picking-prep 側は plan_no と表示名の補強)
+    ${ROWS_DDL('fbx_rows')}
     CREATE INDEX IF NOT EXISTS idx_fbx_rows_run ON fbx_rows(run_id);
 
     -- 行単位の作業メタ (担当者・不足確定)
@@ -325,6 +384,12 @@ export function createTables(d = getDB()) {
   addColumn('fbx_box_materials', 'length_cm', 'REAL');
   addColumn('fbx_box_materials', 'height_cm', 'REAL');
   migrateBoxesVoid(d);
+  migratePickingFirst(d);
+  // 出力 (版) ごとの STA アップ済み (Codex PR2.5 #1: 複数 Excel はファイル単位で管理)。旧 run.sta_export_id から補完
+  addColumn('fbx_exports', 'sta_uploaded_at', 'TEXT');
+  addColumn('fbx_exports', 'sta_uploaded_by', 'TEXT');
+  d.exec(`UPDATE fbx_exports SET sta_uploaded_at = (SELECT r.sta_uploaded_at FROM fbx_runs r WHERE r.sta_export_id = fbx_exports.id)
+    WHERE sta_uploaded_at IS NULL AND EXISTS (SELECT 1 FROM fbx_runs r WHERE r.sta_export_id = fbx_exports.id AND r.sta_uploaded_at IS NOT NULL)`);
 
   // 資材の初期値 (管理画面で編集可能にするのは後続PR。tare_g は現行の実測目安)
   const seeded = d.prepare('SELECT COUNT(*) c FROM fbx_box_materials').get().c;
@@ -390,12 +455,12 @@ export function createRun({ sourceRunId, deliveryDate, title, planSourceHash, ma
       .run(runId, excelFile.originalName || null, excelFile.storedPath, excelFile.sha256, excelFile.fingerprint,
         excelFile.metadata == null ? null : JSON.stringify(excelFile.metadata), createdBy || null, now);
     const fileId = Number(file.lastInsertRowid);
-    const insGroup = d.prepare(`INSERT INTO fbx_pack_groups (run_id, excel_file_id, sheet_name, packing_group_id, display_name, box_count_hint, max_box_columns, structure_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-    const insRow = d.prepare(`INSERT INTO fbx_rows (run_id, pack_group_id, excel_row, seller_sku, asin, fnsku, excel_id, product_name, planned_qty, plan_no, source_slot_id, picking_row_no, picking_qty, match_state)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const insGroup = d.prepare(`INSERT INTO fbx_pack_groups (run_id, excel_file_id, sheet_name, excel_sheet_name, packing_group_id, display_name, box_count_hint, max_box_columns, structure_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const insRow = d.prepare(`INSERT INTO fbx_rows (run_id, pack_group_id, origin, excel_row, seller_sku, asin, fnsku, excel_id, product_name, planned_qty, plan_no, source_slot_id, picking_row_no, picking_qty, match_state)
+      VALUES (?, ?, 'excel', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const g of groups) {
-      const gi = insGroup.run(runId, fileId, g.sheetName, g.packingGroupId, g.displayName,
+      const gi = insGroup.run(runId, fileId, g.sheetName, g.sheetName, g.packingGroupId, g.displayName,
         g.boxCountHint ?? null, g.maxBoxColumns ?? null, g.structure == null ? null : JSON.stringify(g.structure));
       const groupId = Number(gi.lastInsertRowid);
       for (const r of g.rows) {
@@ -408,6 +473,203 @@ export function createRun({ sourceRunId, deliveryDate, title, planSourceHash, ma
     return { ok: true, runId };
   }).immediate();
 }
+
+/**
+ * PR2.5: picking-prep の実行から納品回を作る (Excel なし = 現場起点)。
+ * グループ = プラン別シート (通常/危険/大型…)、行 = シート行 (FNSKU・数量・商品名・納品プランNo)。
+ * Excel は後から attachExcelToRun で添付する (出力に必要なのは Excel だけ、作業には不要)。
+ * 同じ picking 実行の納品回が既にあれば作らず already で返す (自動作成と iPad からの作成が重ならない)
+ */
+export function createRunFromPicking({ pickingRun, planSheets, createdBy, activate = true }) {
+  const sourceRunId = Number(pickingRun?.id);
+  if (!Number.isInteger(sourceRunId) || sourceRunId <= 0) return { ok: false, error: 'bad_request', message: 'ピッキング実行IDが不正です' };
+  const sheets = (planSheets || []).filter((s) => s && Array.isArray(s.rows) && s.rows.length > 0);
+  if (sheets.length === 0) return { ok: false, error: 'no_rows', message: 'プラン別シートに商品行がありません' };
+  const d = getDB();
+  const now = utcNow();
+  return d.transaction(() => {
+    const dup = d.prepare(`SELECT id, status FROM fbx_runs WHERE source_run_id = ? AND status IN ('setup','active','done')`).get(sourceRunId);
+    if (dup) return { ok: true, already: true, runId: dup.id, status: dup.status };
+    const title = pickingRun.delivery_date
+      ? `${pickingRun.delivery_date} 納品分`
+      : `実行#${sourceRunId} (${String(pickingRun.run_at || '').slice(0, 16)})`;
+    const run = d.prepare(`INSERT INTO fbx_runs (source_run_id, delivery_date, title, status, created_by, created_at, activated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(sourceRunId, pickingRun.delivery_date || null, title, activate ? 'active' : 'setup', createdBy || null, now, activate ? now : null);
+    const runId = Number(run.lastInsertRowid);
+    const insGroup = d.prepare(`INSERT INTO fbx_pack_groups (run_id, sheet_name, display_name, source_slot_id, source_label) VALUES (?, ?, ?, ?, ?)`);
+    const insRow = d.prepare(`INSERT INTO fbx_rows (run_id, pack_group_id, origin, seller_sku, fnsku, product_name, planned_qty, plan_no, source_slot_id, picking_row_no, picking_qty, match_state)
+      VALUES (?, ?, 'picking', ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`);
+    let rowCount = 0;
+    for (const [i, s] of sheets.entries()) {
+      const label = String(s.label || s.sheet || `P${i + 1}`).trim();
+      const slotId = String(s.slotId || s.sheet || `slot${i + 1}`);
+      const gi = insGroup.run(runId, String(s.sheet || label), label, slotId, label);
+      const groupId = Number(gi.lastInsertRowid);
+      for (const r of s.rows) {
+        const qty = Number.parseInt(r.qty, 10);
+        insRow.run(runId, groupId, r.sku ? String(r.sku).trim() : null, String(r.fnsku || '').trim().toUpperCase(),
+          r.productName || null, Number.isFinite(qty) && qty > 0 ? qty : 0, `${label}_${r.no}`, slotId, Number(r.no) || null,
+          Number.isFinite(qty) ? qty : null);
+        rowCount++;
+      }
+    }
+    logEvent({ runId, action: 'run_create', targetType: 'run', targetId: runId, deviceLabel: createdBy, ok: true,
+      payload: { sourceRunId, from: 'picking', sheets: sheets.length, rows: rowCount } }, d);
+    if (activate) logEvent({ runId, action: 'run_activate', targetType: 'run', targetId: runId, deviceLabel: createdBy, ok: true, payload: { auto: true } }, d);
+    return { ok: true, created: true, runId, status: activate ? 'active' : 'setup', groups: sheets.length, rows: rowCount };
+  }).immediate();
+}
+
+/** picking 実行ID → 納品回 (setup/active/done のうち最新)。iPad の一覧で「作業開始/続き」を出し分ける */
+export function getRunBySource(sourceRunId) {
+  return getDB().prepare(`SELECT id, status, title FROM fbx_runs WHERE source_run_id = ? AND status IN ('setup','active','done') ORDER BY id DESC LIMIT 1`)
+    .get(Number(sourceRunId)) || null;
+}
+
+/**
+ * PR2.5: 納品回に STA パックリスト Excel を添付する (作業の前でも途中でも後でもよい)。
+ * シート↔グループは FNSKU の重なりで自動対応 (service.matchExcelSheetsToGroups)、
+ * 行は FNSKU で突合 (matched / qty_mismatch / excel_only を Excel 側から、picking_only を既存行側から)。
+ * Excel が正本: planned_qty は Excel の値に更新する (数量差は警告として残す)。
+ * 再添付 (差し替え) は STA アップ済みでなければ可。1 ファイル = 1 プラン (P1/P2 で別ファイル) なので
+ * 納品回に複数ファイルを添付できる (グループごとに excel_file_id を持つ)
+ */
+export function attachExcelToRun({ runId, parsed, file, actor }) {
+  const d = getDB();
+  const now = utcNow();
+  return d.transaction(() => {
+    const run = d.prepare('SELECT * FROM fbx_runs WHERE id = ?').get(Number(runId));
+    if (!run) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
+    if (run.status === 'cancelled') return { ok: false, error: 'bad_status', message: 'この納品回は取消済みです' };
+    if (run.sta_uploaded_at) return { ok: false, error: 'sta_uploaded', message: 'STA アップ済みの納品回には Excel を差し替えできません' };
+    const groups = d.prepare('SELECT * FROM fbx_pack_groups WHERE run_id = ? ORDER BY id').all(run.id);
+    // 行ごとの投入数・確定不足 (Codex PR2.5 #3: Excel の予定数が投入数を下回る添付は拒否)
+    const rowsByGroup = new Map(groups.map((g) => [g.id, d.prepare(`SELECT w.*,
+        COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
+        (SELECT COUNT(*) FROM fbx_placements p WHERE p.row_id = w.id) AS placement_rows,
+        COALESCE((SELECT rw.shortage_qty FROM fbx_row_work rw WHERE rw.row_id = w.id), 0) AS shortage
+      FROM fbx_rows w WHERE w.pack_group_id = ? AND w.match_state != 'retired' ORDER BY w.id`).all(g.id)]));
+    const match = matchExcelSheetsToGroups(parsed.sheets, groups.map((g) => ({ id: g.id, name: g.sheet_name, fnskus: rowsByGroup.get(g.id).map((r) => r.fnsku) })));
+    if (!match.ok) return { ok: false, error: 'unmatched_sheet', message: match.message, issues: match.issues };
+    // 対応先グループの現在の Excel が (現行データ版で) STA アップ済みなら差し替え不可 (Codex PR2.5 #1)
+    const uploadedFile = d.prepare(`SELECT id FROM fbx_exports WHERE run_id = ? AND excel_file_id = ? AND sta_uploaded_at IS NOT NULL AND data_version = ? LIMIT 1`);
+    for (const a of match.assignments) {
+      const g = groups.find((x) => x.id === a.groupId);
+      if (g.excel_file_id && uploadedFile.get(run.id, g.excel_file_id, run.data_version)) {
+        return { ok: false, error: 'file_uploaded', message: `${g.sheet_name} の Excel は既に STA アップ済みとして記録されています。差し替えは中原さんに連絡してください` };
+      }
+    }
+
+    // 事前検証 (拒否条件を全て集めてから書く): 予定数 < 投入+不足 / 消える excel_only 行に投入あり / FNSKU 重複
+    const conflicts = [];
+    const plans = [];
+    for (const a of match.assignments) {
+      const sheet = parsed.sheets[a.sheetIndex];
+      const g = groups.find((x) => x.id === a.groupId);
+      const existing = new Map(rowsByGroup.get(g.id).map((r) => [normFnsku(r.fnsku), r]));
+      const seen = new Set();
+      for (const er of sheet.skuRows) {
+        const key = normFnsku(er.fnsku);
+        if (!key) continue;
+        if (seen.has(key)) return { ok: false, error: 'duplicate_identity', message: `Excel 内で FNSKU ${er.fnsku} が重複しています (手動転記に切り替えてください)` };
+        seen.add(key);
+        const row = existing.get(key);
+        if (row && row.placed + row.shortage > er.plannedQty) {
+          conflicts.push({ kind: 'over_placed', group: g.sheet_name, fnsku: er.fnsku, excelQty: er.plannedQty, placed: row.placed, shortage: row.shortage });
+        }
+      }
+      for (const [key, row] of existing) {
+        if (!seen.has(key) && row.origin === 'excel' && row.placed > 0) {
+          conflicts.push({ kind: 'excel_only_placed', group: g.sheet_name, fnsku: row.fnsku, placed: row.placed });
+        }
+      }
+      plans.push({ a, sheet, g, existing, seen });
+    }
+    if (conflicts.length > 0) {
+      return { ok: false, error: 'attach_conflict', conflicts,
+        message: '添付できません: ' + conflicts.map((c) => c.kind === 'over_placed'
+          ? `${c.fnsku} は Excel の予定 ${c.excelQty} より投入 ${c.placed}${c.shortage ? '+不足' + c.shortage : ''} が多い`
+          : `${c.fnsku} は前の Excel にだけあり投入 ${c.placed} が残っている`).join(' / ') + ' — 記録の取消・不足の解除をしてから添付するか、STA のプランを確認してください' };
+    }
+
+    const fileInfo = d.prepare(`INSERT INTO fbx_excel_files (run_id, original_name, stored_path, sha256, fingerprint, metadata_json, uploaded_by, uploaded_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(run.id, file.originalName || null, file.storedPath, file.sha256, parsed.fingerprint, JSON.stringify(parsed.metadata || {}), actor || null, now);
+    const fileId = Number(fileInfo.lastInsertRowid);
+    const updGroup = d.prepare(`UPDATE fbx_pack_groups SET excel_file_id = ?, excel_sheet_name = ?, packing_group_id = ?, box_count_hint = ?, max_box_columns = ?, structure_json = ? WHERE id = ?`);
+    const clearRows = d.prepare('UPDATE fbx_rows SET excel_row = NULL WHERE pack_group_id = ?');
+    const updRow = d.prepare(`UPDATE fbx_rows SET excel_row = ?, seller_sku = COALESCE(?, seller_sku), asin = ?, excel_id = ?, product_name = COALESCE(product_name, ?),
+      planned_qty = ?, match_state = ? WHERE id = ?`);
+    const setState = d.prepare('UPDATE fbx_rows SET match_state = ? WHERE id = ?');
+    const delRow = d.prepare('DELETE FROM fbx_rows WHERE id = ?');
+    const delRowWork = d.prepare('DELETE FROM fbx_row_work WHERE row_id = ?');
+    const insRow = d.prepare(`INSERT INTO fbx_rows (run_id, pack_group_id, origin, excel_row, seller_sku, asin, fnsku, excel_id, product_name, planned_qty, match_state)
+      VALUES (?, ?, 'excel', ?, ?, ?, ?, ?, ?, ?, 'excel_only')`);
+    const liveBoxCount = d.prepare(`SELECT COUNT(*) c FROM fbx_boxes WHERE pack_group_id = ? AND status != 'void'`);
+    const summary = [];
+    const warnings = [];
+    for (const { a, sheet, g, existing, seen } of plans) {
+      const structure = {
+        headerRow: sheet.headerRow, headers: sheet.headers, boxColumns: sheet.boxColumns, boxNames: sheet.boxNames || {},
+        totalBoxes: sheet.totalBoxes, boxNameRow: sheet.boxNameRow, dimRows: sheet.dimRows,
+      };
+      updGroup.run(fileId, sheet.sheetName, sheet.packingGroupId, sheet.totalBoxes?.value ?? null, sheet.maxBoxColumns ?? null, JSON.stringify(structure), g.id);
+      clearRows.run(g.id);
+      const counts = { matched: 0, qty_mismatch: 0, excel_only: 0, picking_only: 0, retired: 0 };
+      for (const er of sheet.skuRows) {
+        const key = normFnsku(er.fnsku);
+        if (!key) continue;
+        const row = existing.get(key);
+        if (row && row.origin === 'picking') {
+          const pickQty = row.picking_qty ?? row.planned_qty;
+          const state = pickQty === er.plannedQty ? 'matched' : 'qty_mismatch';
+          updRow.run(er.row, er.sku || null, er.asin || null, er.excelId || null, er.productName || null, er.plannedQty, state, row.id);
+          counts[state]++;
+          if (state === 'qty_mismatch') warnings.push({ kind: 'qty_mismatch', group: g.sheet_name, fnsku: er.fnsku, excelQty: er.plannedQty, pickingQty: pickQty });
+        } else if (row) {
+          // 前の Excel 由来の行が今回も載っている → excel_only のまま更新 (由来は変えない — Codex PR2.5 #4)
+          updRow.run(er.row, er.sku || null, er.asin || null, er.excelId || null, er.productName || null, er.plannedQty, 'excel_only', row.id);
+          counts.excel_only++;
+          warnings.push({ kind: 'excel_only', group: g.sheet_name, fnsku: er.fnsku, excelQty: er.plannedQty });
+        } else {
+          insRow.run(run.id, g.id, er.row, er.sku || null, er.asin || null, String(er.fnsku).trim().toUpperCase(), er.excelId || null, er.productName || null, er.plannedQty);
+          counts.excel_only++;
+          warnings.push({ kind: 'excel_only', group: g.sheet_name, fnsku: er.fnsku, excelQty: er.plannedQty });
+        }
+      }
+      for (const [key, row] of existing) {
+        if (seen.has(key)) continue;
+        if (row.origin === 'picking') {
+          setState.run('picking_only', row.id);
+          counts.picking_only++;
+          warnings.push({ kind: 'picking_only', group: g.sheet_name, fnsku: row.fnsku, pickingQty: row.planned_qty });
+        } else if (row.placement_rows === 0) {
+          // 前の Excel にだけあった行で記録が一切ない → 再生成のため消す (履歴は fbx_events に残る)
+          delRowWork.run(row.id);
+          delRow.run(row.id);
+          counts.retired++;
+        } else {
+          setState.run('retired', row.id);   // 取消済み投入の履歴がある (FK) → 残して除外
+          counts.retired++;
+        }
+      }
+      const boxes = liveBoxCount.get(g.id).c;
+      if (sheet.maxBoxColumns && boxes > sheet.maxBoxColumns) {
+        warnings.push({ kind: 'box_overflow', group: g.sheet_name, boxes, maxBoxColumns: sheet.maxBoxColumns });
+      }
+      summary.push({ groupId: g.id, sheetName: g.sheet_name, excelSheet: sheet.sheetName, packingGroupId: sheet.packingGroupId, overlap: a.overlap, ...counts });
+    }
+    bumpRunVersion(d, run.id);
+    logEvent({ runId: run.id, action: 'excel_attach', targetType: 'excel', targetId: fileId, deviceLabel: actor, ok: true,
+      payload: { fingerprint: parsed.fingerprint, sheets: summary, warnings: warnings.length } }, d);
+    // まだ Excel が無いグループ (今回の対象外で、かつ以前の添付も無い) — Codex PR2.5 #7
+    const stillNoExcel = d.prepare('SELECT id FROM fbx_pack_groups WHERE run_id = ? AND excel_file_id IS NULL').all(run.id).map((x) => x.id);
+    return { ok: true, excelFileId: fileId, groups: summary, warnings, unassignedGroups: stillNoExcel };
+  }).immediate();
+}
+
+const normFnsku = (s) => String(s ?? '').trim().toUpperCase();
 
 /** setup → active (本社が突合結果を確認して有効化) */
 export function activateRun(runId, actor) {
@@ -439,10 +701,11 @@ export function setRunStatus(runId, status, actor) {
       const openBoxes = d.prepare(`SELECT COUNT(*) c FROM fbx_boxes b JOIN fbx_pack_groups g ON g.id = b.pack_group_id
         WHERE g.run_id = ? AND b.status = 'open'`).get(run.id).c;
       if (openBoxes > 0) return { ok: false, error: 'open_boxes', message: `開いたままの箱が ${openBoxes} 箱あります。先に全ての箱を閉じてください` };
-      // 全行が「投入 + 確定不足 = 予定」でなければ完了できない (Codex PR1 #7)
+      // 全行が「投入 + 確定不足 = 予定」でなければ完了できない (Codex PR1 #7)。
+      // picking_only (添付した Excel に無い行 = プランから外れた商品) は対象外
       const bad = d.prepare(`SELECT COUNT(*) c FROM fbx_rows w
         LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
-        WHERE w.run_id = ?
+        WHERE w.run_id = ? AND w.match_state NOT IN ('picking_only','retired')
           AND COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0)
               + COALESCE(rw.shortage_qty, 0) != w.planned_qty`).get(run.id).c;
       if (bad > 0) return { ok: false, error: 'rows_incomplete', message: `投入数と不足の合計が予定数と合わない商品が ${bad} 行あります。iPad で入力を終えるか、不足を確定してから完了にしてください` };
@@ -486,6 +749,7 @@ export function getRunState(runId) {
     WHERE g.run_id = ? ORDER BY b.pack_group_id, b.box_no`).all(run.id);
   const placements = d.prepare(`SELECT p.* FROM fbx_placements p
     WHERE p.run_id = ? AND p.revoked_at IS NULL ORDER BY p.box_id, p.box_seq`).all(run.id);
+  const excelFiles = d.prepare(`SELECT id, original_name, sha256, fingerprint, uploaded_by, uploaded_at FROM fbx_excel_files WHERE run_id = ? ORDER BY id`).all(run.id);
   assignAmazonBoxNumbers(groups, boxes);
   const latest = d.prepare(`SELECT id, data_version, file_name, sha256, created_by, created_at
     FROM fbx_exports WHERE run_id = ? ORDER BY id DESC LIMIT 1`).get(run.id) || null;
@@ -495,7 +759,7 @@ export function getRunState(runId) {
     staUploadedAt: run.sta_uploaded_at || null,
     staExportId: run.sta_export_id || null,
   };
-  return { run, groups, rows, boxes, placements, exportState };
+  return { run, groups, rows, boxes, placements, exportState, excelFiles };
 }
 
 /**
@@ -681,6 +945,8 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
     if (!row) return { ok: false, error: 'not_found', message: '商品行が見つかりません (画面を更新してください)' };
     if (row.run_id !== Number(runId)) return { ok: false, error: 'bad_request', message: '納品回と商品行が一致しません (画面を更新してください)' };
     if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    const excluded = rowExcludedError(row);
+    if (excluded) return excluded;
     const box = d.prepare('SELECT * FROM fbx_boxes WHERE id = ?').get(Number(boxId));
     if (!box) return { ok: false, error: 'not_found', message: '箱が見つかりません (画面を更新してください)' };
     if (box.pack_group_id !== row.pack_group_id) {
@@ -727,6 +993,16 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
 
 function placedOf(d, rowId) {
   return d.prepare('SELECT COALESCE(SUM(qty),0) q FROM fbx_placements WHERE row_id = ? AND revoked_at IS NULL').get(rowId).q;
+}
+
+/**
+ * Excel の差し替えで対象外になった行 (retired) / 添付した Excel に無い行 (picking_only) への更新は拒否
+ * (Codex PR2.5 R2: 古い画面からの投入が成功すると、完了判定・出力から外れた「幽霊の投入」になる)
+ */
+function rowExcludedError(row) {
+  if (row.match_state === 'retired') return { ok: false, error: 'row_excluded', message: 'この商品は Excel の差し替えで対象外になりました (画面を更新してください)' };
+  if (row.match_state === 'picking_only') return { ok: false, error: 'row_excluded', message: 'この商品は添付した Excel (納品プラン) に無いため入れられません (職員・本社に確認してください)' };
+  return null;
 }
 
 /**
@@ -801,6 +1077,8 @@ export function setRowWorkers({ rowId, labelWorker, checkWorker, worker, deviceL
       .get(Number(rowId));
     if (!row) return { ok: false, error: 'not_found', message: '商品行が見つかりません' };
     if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    const excluded = rowExcludedError(row);
+    if (excluded) return excluded;
     const label = labelWorker === undefined ? undefined : (labelWorker ? String(labelWorker).slice(0, 30) : null);
     const check = checkWorker === undefined ? undefined : (checkWorker ? String(checkWorker).slice(0, 30) : null);
     d.prepare(`INSERT INTO fbx_row_work (row_id, label_worker, check_worker, updated_at) VALUES (?, ?, ?, ?)
@@ -829,6 +1107,8 @@ export function setRowShortage({ rowId, shortageQty, reason, worker, deviceLabel
       FROM fbx_rows w JOIN fbx_runs r ON r.id = w.run_id WHERE w.id = ?`).get(Number(rowId));
     if (!row) return { ok: false, error: 'not_found', message: '商品行が見つかりません' };
     if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    const excluded = rowExcludedError(row);
+    if (excluded) return excluded;
     const remaining = row.planned_qty - row.placed;
     const q = Number(shortageQty);
     if (!Number.isInteger(q) || q <= 0 || q > remaining) {
@@ -854,6 +1134,8 @@ export function clearRowShortage({ rowId, worker, deviceLabel }) {
       .get(Number(rowId));
     if (!row) return { ok: false, error: 'not_found', message: '商品行が見つかりません' };
     if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    const excluded = rowExcludedError(row);
+    if (excluded) return excluded;
     d.prepare('UPDATE fbx_row_work SET shortage_qty = NULL, shortage_reason = NULL, shortage_by = NULL, updated_at = ? WHERE row_id = ?')
       .run(utcNow(), row.id);
     bumpRunVersion(d, row.run_id);
@@ -1135,9 +1417,18 @@ export function exportReadiness(runId) {
   if (run.status !== 'active' && run.status !== 'done') {
     blockers.push({ code: 'run_status', message: `納品回が「${run.status}」のため出力できません` });
   }
+  const noExcel = groups.filter((g) => !g.excel_file_id);
+  if (noExcel.length > 0) {
+    blockers.push({ code: 'no_excel', message: `STA のパックリスト Excel が未添付のグループがあります: ${noExcel.map((g) => g.sheet_name).join(' / ')} (本社が管理画面で添付してください。箱詰め作業自体は続けられます)` });
+  }
+  const pickingOnlyPlaced = rows.filter((r) => r.match_state === 'picking_only' && r.placed > 0);
+  if (pickingOnlyPlaced.length > 0) {
+    blockers.push({ code: 'picking_only_placed', message: `添付した Excel に無い商品が箱に入っています (${pickingOnlyPlaced.length} 行)。STA のプランを確認するか、記録を取り消してください`, rows: pickingOnlyPlaced.map(rowBrief) });
+  }
   const live = boxes.filter((b) => b.status !== 'void');
   if (live.length === 0) blockers.push({ code: 'no_boxes', message: '箱がひとつもありません' });
-  const incomplete = rows.filter((r) => r.placed + (r.shortage_qty || 0) !== r.planned_qty);
+  // picking_only / retired (Excel に無い = プランから外れた) 行は完了判定から外す
+  const incomplete = rows.filter((r) => !EXCLUDED_ROW_STATES.includes(r.match_state) && r.placed + (r.shortage_qty || 0) !== r.planned_qty);
   if (incomplete.length > 0) {
     blockers.push({ code: 'rows_incomplete', message: `投入数+不足 が予定数と合わない商品が ${incomplete.length} 行あります (iPad で入力を終えるか、職員が不足を確定してください)`, rows: incomplete.map(rowBrief) });
   }
@@ -1158,8 +1449,8 @@ export function exportReadiness(runId) {
   if (unchecked.length > 0) warnings.push({ code: 'unchecked_rows', message: `確認担当が未記録の商品が ${unchecked.length} 行あります`, rows: unchecked.map(rowBrief) });
   const shortages = rows.filter((r) => r.shortage_qty > 0);
   if (shortages.length > 0) warnings.push({ code: 'shortage_rows', message: `不足確定の商品が ${shortages.length} 行あります (Excel の数量は投入数のみ。STA 側の予定数量との差は Amazon 側で調整)`, rows: shortages.map((r) => ({ ...rowBrief(r), reason: r.shortage_reason })) });
-  const matchWarn = rows.filter((r) => r.match_state !== 'matched');
-  if (matchWarn.length > 0) warnings.push({ code: 'match_warnings', message: `突合で注意のあった商品が ${matchWarn.length} 行あります`, rows: matchWarn.map((r) => ({ ...rowBrief(r), matchState: r.match_state })) });
+  const matchWarn = rows.filter((r) => ['qty_mismatch', 'excel_only', 'picking_only'].includes(r.match_state));
+  if (matchWarn.length > 0) warnings.push({ code: 'match_warnings', message: `Excel との突合で注意のあった商品が ${matchWarn.length} 行あります (qty_mismatch=数量差 / excel_only=Excel にだけある / picking_only=Excel に無い)`, rows: matchWarn.map((r) => ({ ...rowBrief(r), matchState: r.match_state })) });
   const gaps = live.filter((b) => b.amazon_box_no !== b.box_no);
   if (gaps.length > 0) warnings.push({ code: 'box_gap', message: `取消した箱があるため、箱札の番号と Amazon の箱番号がずれます (${gaps.length} 箱)。箱ラベルを貼るときは対応表を見てください`, boxes: gaps.map(boxBrief) });
   const mats = new Map(listMaterials(true).map((m) => [m.code, m]));
@@ -1170,7 +1461,12 @@ export function exportReadiness(runId) {
       ? { code: 'stale_export', message: `前回の出力 (#${exportState.latest.id}, ${exportState.latest.created_at.slice(0, 16).replace('T', ' ')}) の後にデータが変わっています。再出力してください` }
       : { code: 'exported', message: `出力済み (#${exportState.latest.id})。データは変わっていません` });
   }
+  // ファイル単位の STA アップ状況 (複数 Excel のとき、どれがまだかを出す)
+  const fileStates = exportFileStates(run.id, run.data_version);
   if (run.sta_uploaded_at) warnings.push({ code: 'sta_uploaded', message: `STA アップ済み (${run.sta_uploaded_at.slice(0, 16).replace('T', ' ')})。再出力は原則不要です` });
+  else if (fileStates.some((f) => f.uploaded)) {
+    warnings.push({ code: 'sta_partial', message: `STA アップ済み ${fileStates.filter((f) => f.uploaded).length} / ${fileStates.length} ファイル。残り: ${fileStates.filter((f) => !f.uploaded).map((f) => f.fileName).join(', ')}` });
+  }
 
   // 期限一覧 (F-7b): 行×期限で集約 (同一行は1期限がルール)
   const rowById = new Map(rows.map((r) => [r.id, r]));
@@ -1185,18 +1481,35 @@ export function exportReadiness(runId) {
 
   const groupsOut = groups.map((g) => ({
     id: g.id, sheetName: g.sheet_name, displayName: g.display_name, packingGroupId: g.packing_group_id,
-    maxBoxColumns: g.max_box_columns,
+    maxBoxColumns: g.max_box_columns, excelFileId: g.excel_file_id, excelAttached: !!g.excel_file_id,
+    excelSheetName: g.excel_sheet_name || null,
+    rowCounts: rows.filter((r) => r.pack_group_id === g.id).reduce((a, r) => { a[r.match_state] = (a[r.match_state] || 0) + 1; return a; }, {}),
     boxes: live.filter((b) => b.pack_group_id === g.id).map((b) => ({ ...boxBrief(b), weightKg: b.measured_weight_kg, material: b.material_code,
       dims: (() => { const m = mats.get(b.material_code); return m ? { width: m.width_cm, length: m.length_cm, height: m.height_cm } : null; })() })),
   }));
-  return { ok: blockers.length === 0, blockers, warnings, groups: groupsOut, expiries, exportState,
+  return { ok: blockers.length === 0, blockers, warnings, groups: groupsOut, expiries, exportState, excelFiles: st.excelFiles, fileStates,
     run: { id: run.id, title: run.title, status: run.status, dataVersion: run.data_version, staUploadedAt: run.sta_uploaded_at || null } };
+}
+
+/**
+ * 納品回に現在付いている Excel ファイル (グループが参照中) ごとの、現行データ版での出力・STA アップ状況。
+ * 納品回を done にするのは全ファイルが現行版でアップ済みになったとき (Codex PR2.5 #1)
+ */
+function exportFileStates(runId, dataVersion, d = getDB()) {
+  const files = d.prepare(`SELECT DISTINCT f.id, f.original_name FROM fbx_pack_groups g JOIN fbx_excel_files f ON f.id = g.excel_file_id
+    WHERE g.run_id = ? ORDER BY f.id`).all(runId);
+  return files.map((f) => {
+    const latest = d.prepare(`SELECT id, data_version, sta_uploaded_at FROM fbx_exports WHERE run_id = ? AND excel_file_id = ? ORDER BY id DESC LIMIT 1`).get(runId, f.id) || null;
+    const uploaded = d.prepare(`SELECT id FROM fbx_exports WHERE run_id = ? AND excel_file_id = ? AND data_version = ? AND sta_uploaded_at IS NOT NULL LIMIT 1`).get(runId, f.id, dataVersion) || null;
+    return { fileId: f.id, fileName: f.original_name, latestExportId: latest?.id || null, latestStale: !!(latest && latest.data_version < dataVersion), uploaded: !!uploaded, uploadedExportId: uploaded?.id || null };
+  });
 }
 
 /**
  * Excel 書き込み指示 (write_packlist.py の sheets) と、版として保存するスナップショットを組み立てる。
  * 書くセル = 箱数 (M3 相当) / SKU行×Amazon箱番号列の投入数 (0 は空欄のまま) / 箱ごとの実測kg・外寸。
- * 期限は書かない (JP テンプレ v1.1 に列が無い — 要件 §4)
+ * 期限は書かない (JP テンプレ v1.1 に列が無い — 要件 §4)。
+ * PR2.5: 1 納品回に複数の Excel (P1/P2 で別ファイル) があり得るので、添付ファイルごとに 1 出力 (exports[])
  */
 export function buildExportPayload(runId) {
   const ready = exportReadiness(runId);
@@ -1204,22 +1517,30 @@ export function buildExportPayload(runId) {
   if (!ready.ok) return { ok: false, error: 'not_ready', message: '出荷前チェックに未解決の項目があります', readiness: ready };
   const d = getDB();
   const st = getRunState(runId);
-  const file = d.prepare('SELECT * FROM fbx_excel_files WHERE run_id = ? ORDER BY id DESC LIMIT 1').get(st.run.id);
-  if (!file) return { ok: false, error: 'no_excel', message: '原本Excelの記録がありません' };
   const qtyByRowBox = new Map();
   for (const p of st.placements) {
     const k = `${p.row_id}|${p.box_id}`;
     qtyByRowBox.set(k, (qtyByRowBox.get(k) || 0) + p.qty);
   }
-  const sheets = [];
-  const snapshotGroups = [];
+  const files = new Map();   // excel_file_id → { excelFile, sheets, groups }
   for (const g of st.groups) {
+    if (!g.excel_file_id) return { ok: false, error: 'no_excel', message: `${g.sheet_name}: Excel が未添付です` };
     const structure = safeJson(g.structure_json);
     if (!structure?.boxColumns || !structure?.totalBoxes || !structure?.dimRows) {
-      return { ok: false, error: 'no_structure', message: `${g.sheet_name}: テンプレ構造の記録がありません (PR1 より前の納品回?)` };
+      return { ok: false, error: 'no_structure', message: `${g.sheet_name}: テンプレ構造の記録がありません (Excel を添付し直してください)` };
     }
+    let f = files.get(g.excel_file_id);
+    if (!f) {
+      const excelFile = d.prepare('SELECT * FROM fbx_excel_files WHERE id = ?').get(g.excel_file_id);
+      if (!excelFile) return { ok: false, error: 'no_excel', message: `${g.sheet_name}: 原本Excelの記録がありません` };
+      f = { excelFile, sheets: [], groups: [] };
+      files.set(g.excel_file_id, f);
+    }
+    const sheets = f.sheets;
+    const snapshotGroups = f.groups;
     const gBoxes = st.boxes.filter((b) => b.pack_group_id === g.id && b.status !== 'void').sort((a, b) => a.amazon_box_no - b.amazon_box_no);
-    const gRows = st.rows.filter((r) => r.pack_group_id === g.id);
+    // Excel に行がある商品だけ (picking_only / retired = Excel に無い行は excel_row が NULL → 出力対象外。投入があれば readiness で止まる)
+    const gRows = st.rows.filter((r) => r.pack_group_id === g.id && r.excel_row != null && !EXCLUDED_ROW_STATES.includes(r.match_state));
     const cells = [{ row: structure.totalBoxes.row, col: structure.totalBoxes.col, value: gBoxes.length, kind: 'total_boxes' }];
     const rg = ready.groups.find((x) => x.id === g.id);
     for (const b of gBoxes) {
@@ -1247,9 +1568,9 @@ export function buildExportPayload(runId) {
         if (!writtenKeys.has(`${row}|${col}`)) cells.push({ row, col, value: null, kind: 'clear' });
       }
     }
-    sheets.push({ sheetName: g.sheet_name, cells });
+    sheets.push({ sheetName: g.excel_sheet_name || g.sheet_name, cells });
     snapshotGroups.push({
-      groupId: g.id, sheetName: g.sheet_name, displayName: g.display_name, packingGroupId: g.packing_group_id, totalBoxes: gBoxes.length,
+      groupId: g.id, sheetName: g.sheet_name, excelSheetName: g.excel_sheet_name || g.sheet_name, displayName: g.display_name, packingGroupId: g.packing_group_id, totalBoxes: gBoxes.length,
       boxes: gBoxes.map((b) => ({
         boxId: b.id, boxCode: b.box_code, boxNo: b.box_no, amazonBoxNo: b.amazon_box_no, amazonName: b.amazon_name,
         weightKg: b.measured_weight_kg, material: b.material_code, dims: rg?.boxes.find((x) => x.id === b.id)?.dims || null,
@@ -1257,31 +1578,51 @@ export function buildExportPayload(runId) {
       })),
     });
   }
-  return {
-    ok: true, sheets, excelFile: file,
-    snapshot: { dataVersion: st.run.data_version, groups: snapshotGroups, expiries: ready.expiries, warnings: ready.warnings.map((w) => w.code) },
-  };
+  const exports = [...files.values()].map((f) => ({
+    excelFile: f.excelFile, sheets: f.sheets,
+    snapshot: { dataVersion: st.run.data_version, excelFileId: f.excelFile.id, groups: f.groups, expiries: ready.expiries, warnings: ready.warnings.map((w) => w.code) },
+  }));
+  return { ok: true, exports, dataVersion: st.run.data_version };
 }
 
-/** 出力結果の記録 (版)。data_version は buildExportPayload 時点の値 (書き込み中の変更は次の出力で「旧版」として出る) */
-export function recordExport({ runId, excelFileId, dataVersion, fileName, storedPath, sha256, snapshot, verify, createdBy }) {
+/**
+ * 出力結果の記録 (版)。複数ファイルは 1 トランザクションでまとめて登録 (Codex PR2.5 #2: 半端な版を残さない)。
+ * data_version は buildExportPayload 時点の値。全ファイル同一版が前提 (違えば登録しない)。
+ * 書き込み中に iPad で変更が入っていれば stale=true (次の出力で「旧版」として出る)
+ */
+export function recordExportBatch({ runId, items, createdBy }) {
+  const list = Array.isArray(items) ? items : [];
+  if (list.length === 0) return { ok: false, error: 'bad_request', message: '記録する出力がありません' };
+  const versions = new Set(list.map((x) => Number(x.dataVersion)));
+  if (versions.size !== 1) return { ok: false, error: 'version_mismatch', message: '出力ファイル間でデータ版が違います。もう一度出力してください' };
+  const dataVersion = [...versions][0];
   const d = getDB();
   return d.transaction(() => {
     const run = d.prepare('SELECT id, data_version FROM fbx_runs WHERE id = ?').get(Number(runId));
     if (!run) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
-    const info = d.prepare(`INSERT INTO fbx_exports (run_id, excel_file_id, data_version, file_name, stored_path, sha256, snapshot_json, verify_json, created_by, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(run.id, Number(excelFileId), Number(dataVersion), fileName, storedPath, sha256, JSON.stringify(snapshot), verify == null ? null : JSON.stringify(verify), createdBy || null, utcNow());
-    const exportId = Number(info.lastInsertRowid);
-    logEvent({ runId: run.id, action: 'excel_export', targetType: 'export', targetId: exportId, deviceLabel: createdBy, ok: true,
-      payload: { dataVersion: Number(dataVersion), sha256, changedDuringWrite: run.data_version !== Number(dataVersion) } }, d);
-    return { ok: true, exportId, stale: run.data_version !== Number(dataVersion) };
+    const ins = d.prepare(`INSERT INTO fbx_exports (run_id, excel_file_id, data_version, file_name, stored_path, sha256, snapshot_json, verify_json, created_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const now = utcNow();
+    const exportIds = [];
+    for (const x of list) {
+      const info = ins.run(run.id, Number(x.excelFileId), dataVersion, x.fileName, x.storedPath, x.sha256, JSON.stringify(x.snapshot), x.verify == null ? null : JSON.stringify(x.verify), createdBy || null, now);
+      const exportId = Number(info.lastInsertRowid);
+      exportIds.push(exportId);
+      logEvent({ runId: run.id, action: 'excel_export', targetType: 'export', targetId: exportId, deviceLabel: createdBy, ok: true,
+        payload: { dataVersion, sha256: x.sha256, excelFileId: Number(x.excelFileId), changedDuringWrite: run.data_version !== dataVersion } }, d);
+    }
+    return { ok: true, exportIds, exportId: exportIds[0], stale: run.data_version !== dataVersion };
   }).immediate();
 }
 
+/** 1 ファイルの記録 (recordExportBatch の薄い包み) */
+export function recordExport({ runId, excelFileId, dataVersion, fileName, storedPath, sha256, snapshot, verify, createdBy }) {
+  return recordExportBatch({ runId, createdBy, items: [{ excelFileId, dataVersion, fileName, storedPath, sha256, snapshot, verify }] });
+}
+
 export function listExports(runId) {
-  return getDB().prepare(`SELECT e.id, e.run_id, e.data_version, e.file_name, e.sha256, e.created_by, e.created_at,
-      (e.data_version < r.data_version) AS stale, (r.sta_export_id = e.id) AS sta_uploaded
+  return getDB().prepare(`SELECT e.id, e.run_id, e.excel_file_id, e.data_version, e.file_name, e.sha256, e.created_by, e.created_at,
+      (e.data_version < r.data_version) AS stale, (e.sta_uploaded_at IS NOT NULL) AS sta_uploaded, e.sta_uploaded_at
     FROM fbx_exports e JOIN fbx_runs r ON r.id = e.run_id WHERE e.run_id = ? ORDER BY e.id DESC`).all(Number(runId));
 }
 
@@ -1292,8 +1633,10 @@ export function getExport(id) {
 }
 
 /**
- * 「STA にアップした」の記録。指定した版が最新データと一致していることが条件 (旧版のアップは事故)。
- * 記録後は納品回を done にして iPad からの変更を止める (要件 F-7: STAアップ済み後は原則ロック)
+ * 「STA にアップした」の記録 = 出力 (版) 単位。指定した版が最新データと一致していることが条件 (旧版のアップは事故)。
+ * 同じファイルの現行版が既に記録済みなら別の出力は拒否 (Codex PR2 #4: 監査証跡を守る)。同じ出力の再記録は冪等。
+ * 納品回に付いている全ファイルが現行版でアップ済みになったとき、納品回を done にして iPad からの変更を止める
+ * (Codex PR2.5 #1: 複数 Excel のうち 1 つで全体を完了にしない)
  */
 export function markStaUploaded({ runId, exportId, actor }) {
   const d = getDB();
@@ -1302,18 +1645,27 @@ export function markStaUploaded({ runId, exportId, actor }) {
     if (!run) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
     const ex = d.prepare('SELECT * FROM fbx_exports WHERE id = ? AND run_id = ?').get(Number(exportId), run.id);
     if (!ex) return { ok: false, error: 'not_found', message: '出力の記録が見つかりません' };
-    // 記録済みなら上書きしない (Codex PR2 #4: 実際にアップした版の監査証跡を守る)。同じ版の再記録は冪等
-    if (run.sta_export_id) {
-      if (run.sta_export_id === ex.id) return { ok: true, already: true };
-      return { ok: false, error: 'already_uploaded', message: `既に出力 #${run.sta_export_id} を STA アップ済みとして記録しています。別の版を記録するには本社で確認のうえ中原さんに連絡してください` };
-    }
+    if (ex.sta_uploaded_at) return { ok: true, already: true, runDone: !!run.sta_uploaded_at, files: exportFileStates(run.id, run.data_version, d) };
+    if (run.sta_uploaded_at) return { ok: false, error: 'already_uploaded', message: 'この納品回は既に STA アップ済み (完了) です' };
     if (ex.data_version !== run.data_version) {
       return { ok: false, error: 'stale_export', message: 'この出力の後にデータが変わっています。最新データで再出力し、そのファイルを STA にアップしてから記録してください' };
     }
+    const other = d.prepare(`SELECT id FROM fbx_exports WHERE run_id = ? AND excel_file_id = ? AND data_version = ? AND sta_uploaded_at IS NOT NULL AND id != ?`)
+      .get(run.id, ex.excel_file_id, run.data_version, ex.id);
+    if (other) {
+      return { ok: false, error: 'already_uploaded', message: `このファイルは既に出力 #${other.id} を STA アップ済みとして記録しています。別の版を記録するには本社で確認のうえ中原さんに連絡してください` };
+    }
     if (run.status !== 'active' && run.status !== 'done') return { ok: false, error: 'bad_status', message: `この納品回は ${run.status} です` };
-    d.prepare(`UPDATE fbx_runs SET sta_uploaded_at = ?, sta_export_id = ?, status = 'done', done_at = COALESCE(done_at, ?) WHERE id = ?`)
-      .run(utcNow(), ex.id, utcNow(), run.id);
-    logEvent({ runId: run.id, action: 'run_sta_uploaded', targetType: 'export', targetId: ex.id, deviceLabel: actor, ok: true, payload: { dataVersion: ex.data_version } }, d);
-    return { ok: true };
+    const now = utcNow();
+    d.prepare('UPDATE fbx_exports SET sta_uploaded_at = ?, sta_uploaded_by = ? WHERE id = ?').run(now, actor || null, ex.id);
+    logEvent({ runId: run.id, action: 'export_sta_uploaded', targetType: 'export', targetId: ex.id, deviceLabel: actor, ok: true, payload: { dataVersion: ex.data_version, excelFileId: ex.excel_file_id } }, d);
+    const files = exportFileStates(run.id, run.data_version, d);
+    const allUploaded = files.length > 0 && files.every((f) => f.uploaded);
+    if (allUploaded) {
+      d.prepare(`UPDATE fbx_runs SET sta_uploaded_at = ?, sta_export_id = ?, status = 'done', done_at = COALESCE(done_at, ?) WHERE id = ?`)
+        .run(now, ex.id, now, run.id);
+      logEvent({ runId: run.id, action: 'run_sta_uploaded', targetType: 'run', targetId: run.id, deviceLabel: actor, ok: true, payload: { dataVersion: ex.data_version, files: files.length } }, d);
+    }
+    return { ok: true, runDone: allUploaded, files, remaining: files.filter((f) => !f.uploaded).map((f) => f.fileName) };
   }).immediate();
 }

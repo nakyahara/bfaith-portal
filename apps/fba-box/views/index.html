@@ -229,13 +229,29 @@
     if (!j.ok) { $('#runlist').textContent = '読み込めませんでした。しばらくして再読み込みしてください'; return; }
     runs = j.runs;
     const stJa = { active: '作業できます', setup: '準備中 (本社確認待ち)', done: '完了', cancelled: '取消' };
-    $('#runlist').innerHTML = runs.length === 0 ? '納品回がまだありません' : runs.map(r => `
+    // まだ納品回になっていない picking 実行 (本社の picking-prep 完了で普通は自動作成されるが、
+    // 失敗したとき・作り直したいときは現場が「作業開始」で作れる)
+    const pending = (j.pickingRuns || []).filter(p => !p.boxRun);
+    const html = runs.map(r => `
       <button class="runbtn" data-id="${r.id}" ${r.status === 'active' ? '' : 'disabled'}>
         <span>${esc(r.title)}<br><small style="color:#868E96">${r.row_count}商品 / ${r.group_count}グループ</small></span>
         <span class="st ${r.status}">${stJa[r.status] || r.status}</span>
+      </button>`).join('') + pending.map(p => `
+      <button class="runbtn" data-src="${p.id}" style="border-style:dashed">
+        <span>${esc(p.deliveryDate ? p.deliveryDate + ' 納品分' : '実行#' + p.id)}<br><small style="color:#868E96">${p.sheetCount ?? '?'}シート / まだ始めていません</small></span>
+        <span class="st setup">▶ 作業開始</span>
       </button>`).join('');
+    $('#runlist').innerHTML = html || '納品回がまだありません' + (j.pickingError ? `<br><small style="color:#C92A2A">ピッキング実行を読めません: ${esc(j.pickingError)}</small>` : '');
     $('#runlist').querySelectorAll('button[data-id]').forEach(b => {
       b.addEventListener('click', () => openRun(Number(b.dataset.id)));
+    });
+    $('#runlist').querySelectorAll('button[data-src]').forEach(b => {
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        const r = await apiPost('/api/runs/from-picking', { source_run_id: Number(b.dataset.src) });
+        if (!r.ok) { alert(r.message || '作れませんでした'); b.disabled = false; return; }
+        openRun(Number(r.runId));
+      });
     });
   }
 
@@ -287,7 +303,7 @@
     $('#btn-worker').classList.toggle('warn', !worker);
     // タブ
     $('#tabs').innerHTML = S.groups.map(g => {
-      const rowsOf = S.rows.filter(r => r.pack_group_id === g.id);
+      const rowsOf = S.rows.filter(r => r.pack_group_id === g.id && r.match_state !== 'retired');
       const doneN = rowsOf.filter(r => rowDone(r)).length;
       return `<button class="tab ${g.id === curGroupId ? 'on' : ''}" data-id="${g.id}">${esc(g.sheet_name)} (${doneN}/${rowsOf.length})</button>`;
     }).join('');
@@ -306,8 +322,8 @@
         ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
       </button>`).join('');
     $('#boxbtns').querySelectorAll('.boxbtn').forEach(b => b.addEventListener('click', () => openBoxDialog(Number(b.dataset.id))));
-    // 行リスト
-    const rows = S.rows.filter(r => r.pack_group_id === curGroupId);
+    // 行リスト (retired = 差し替えで消えた行は出さない)
+    const rows = S.rows.filter(r => r.pack_group_id === curGroupId && r.match_state !== 'retired');
     $('#rows').innerHTML = rows.map(r => {
       const rem = r.planned_qty - r.placed - (r.shortage_qty || 0);
       const done = rowDone(r);
@@ -316,7 +332,8 @@
         <div class="name">${esc(r.product_name || r.seller_sku)}
           <div class="sub">${esc(r.fnsku)}
             ${r.match_state === 'qty_mismatch' ? '<span class="badge warnm">数量注意</span>' : ''}
-            ${r.match_state === 'excel_only' ? '<span class="badge warnm">プラン外</span>' : ''}
+            ${r.match_state === 'excel_only' ? '<span class="badge warnm">Excelにだけある</span>' : ''}
+            ${r.match_state === 'picking_only' ? '<span class="badge short">Excelに無い (入れない)</span>' : ''}
             ${r.shortage_qty ? `<span class="badge short">不足${r.shortage_qty}</span>` : ''}
             ${expiryOf(r.id) ? `<span class="badge exp">期限 ${esc(expiryOf(r.id))}</span>` : ''}
             ${r.label_worker ? `👤${esc(r.label_worker)}` : ''}${r.check_worker ? ` ✅${esc(r.check_worker)}` : ''}
@@ -327,7 +344,7 @@
     }).join('');
     $('#rows').querySelectorAll('.row').forEach(el => el.addEventListener('click', () => openRowDialog(Number(el.dataset.id))));
   }
-  function rowDone(r) { return r.placed + (r.shortage_qty || 0) >= r.planned_qty && r.planned_qty > 0; }
+  function rowDone(r) { return r.match_state === 'picking_only' || (r.placed + (r.shortage_qty || 0) >= r.planned_qty && r.planned_qty > 0); }
 
   // ─── まとめ (出荷前チェック): 何が残っているかを現場でも見られる ───
   async function summaryDialog() {
@@ -467,6 +484,7 @@
     const boxes = S.boxes.filter(b => b.pack_group_id === r.pack_group_id && b.status === 'open');
     const cur = boxes.find(b => b.id === curBoxId);
     const knownExpiry = expiryOf(r.id);
+    const excluded = r.match_state === 'picking_only';   // 添付した Excel (納品プラン) に無い → 入れない
     speakRow(r);
     const dlg = openDialog(`
       <div class="fn">${esc(r.fnsku).slice(0, -4)}<b>${esc(fn4(r.fnsku))}</b></div>
@@ -474,9 +492,10 @@
         <button class="chip" style="background:#E9ECEF;color:#495057" id="d-tts">🔊 もう一度</button></div>
       <div class="grid2">
         <div>予定 <b style="font-size:1.3em">${r.planned_qty}</b></div>
-        <div>残り <b style="font-size:1.3em; color:${rem > 0 ? '#C92A2A' : '#2B8A3E'}">${rem}</b></div>
+        <div>残り <b style="font-size:1.3em; color:${rem > 0 ? '#C92A2A' : '#2B8A3E'}">${excluded ? '—' : rem}</b></div>
       </div>
-      ${rem > 0 ? `
+      ${excluded ? `<div class="msg err">この商品は納品プラン (Excel) に無いので箱に入れません。${r.placed > 0 ? `すでに ${r.placed} 個入っています — 職員が取り消してください。` : ''}本社に確認してください</div>` : ''}
+      ${rem > 0 && !excluded ? `
         <div class="lbl">📦 入れる箱 ${cur ? `= <b>${esc(cur.box_code)}</b>` : '(「いまの箱」が未選択です)'}</div>
         ${cur ? '' : `<div class="grid3">${boxes.map(b => `<button class="selbtn boxpick" data-id="${b.id}">${esc(b.box_code)}</button>`).join('')}
           <button class="selbtn boxnew">＋新しい箱</button></div>`}
@@ -497,7 +516,7 @@
               <select class="dsel" id="d-ed"><option value="">日</option>${range(1, 31).map(m => `<option>${String(m).padStart(2, '0')}</option>`).join('')}</select>
             </div>`}
         <div style="margin-top:16px"><button class="bigbtn" id="d-add" ${cur ? '' : 'disabled'}>この箱に入れた</button></div>
-      ` : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>`}
+      ` : (excluded ? '' : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>`)}
       <div class="lbl">👤 担当者の記録</div>
       <div class="grid2">
         <button class="selbtn" id="d-lw">ラベル貼り: ${esc(r.label_worker || '—')}</button>

@@ -48,23 +48,28 @@
   <div class="fbx-wrap">
 
     <div class="fbx-box">
-      <h2>🚀 納品回の開始 (Excel先行フロー)</h2>
+      <h2>🚀 納品回</h2>
       <p class="hint">
-        ①STA (Send to Amazon) で納品プランを作り、「個別の商品を梱包」から<b>パックリストExcelをダウンロード</b>
-        ②picking-prep を実行 (従来どおり) ③ここで両方を選んで開始 → 突合結果を確認して<b>有効化</b>すると、
-        いろはの iPad に納品回が出ます。<b>Excel と突合が終わるまで箱詰めは始められません</b> (要件 §11)。
+        <b>通常は何もしなくてよい</b>: picking-prep の「処理を実行」が終わると納品回が自動でできて、いろはの iPad にすぐ出ます
+        (いろはも iPad の「作業開始」から作れます)。ここは自動作成が失敗したとき・作り直したいとき用。<br>
+        STA のパックリスト Excel は<b>出力の前までに</b>各納品回の「📎 Excel添付」で付けてください (作業の前でも途中でも後でも可。P1/P2 で別ファイルならそれぞれ添付)。
       </p>
       <% if (pickingError) { %><p class="msg err">⚠ picking-prep のデータを読めません: <%= pickingError %></p><% } %>
       <div class="row">
         <select id="pk-run">
           <option value="">ピッキング実行を選ぶ…</option>
           <% for (const r of pickingRuns) { %>
-            <option value="<%= r.id %>">#<%= r.id %> — <%= r.delivery_date ? r.delivery_date + ' 納品分' : (r.run_at || '').slice(0, 16) %> (<%= r.plan_sheet_count %>シート)</option>
+            <option value="<%= r.id %>" <%= r.boxRun ? 'disabled' : '' %>>#<%= r.id %> — <%= r.delivery_date ? r.delivery_date + ' 納品分' : (r.run_at || '').slice(0, 16) %> (<%= r.plan_sheet_count %>シート)<%= r.boxRun ? ' — 納品回 #' + r.boxRun.id + ' 作成済み' : '' %></option>
           <% } %>
         </select>
-        <input type="file" id="pk-excel" accept=".xlsx">
-        <button id="pk-go">納品回をつくる</button>
+        <button id="pk-go2">📦 納品回をつくる (Excel なし)</button>
       </div>
+      <details style="margin-top:8px"><summary class="hint" style="cursor:pointer">旧: Excel を同時に添付して作る</summary>
+        <div class="row" style="margin-top:6px">
+          <input type="file" id="pk-excel" accept=".xlsx">
+          <button id="pk-go">Excel と一緒に納品回をつくる</button>
+        </div>
+      </details>
       <div class="msg" id="pk-msg"></div>
     </div>
 
@@ -85,6 +90,7 @@
                 <button class="btn-sm run-activate" data-id="<%= r.id %>">✅ 有効化 (iPadに出す)</button>
               <% } %>
               <% if (r.status === 'active' || r.status === 'done') { %>
+                <button class="btn-sm run-excel" data-id="<%= r.id %>">📎 Excel添付</button>
                 <button class="btn-sm run-export" data-id="<%= r.id %>">📤 Excel出力</button>
                 <a class="btn-sm" href="<%= base %>/print/boxes?run=<%= r.id %>" target="_blank">🖨 箱札</a>
               <% } %>
@@ -101,6 +107,7 @@
       </table>
       <div class="msg" id="run-msg"></div>
       <div id="run-detail-out"></div>
+      <input type="file" id="attach-file" accept=".xlsx" style="display:none">
     </div>
 
     <div class="fbx-box" id="export-box" style="display:none">
@@ -256,6 +263,41 @@
       setTimeout(() => location.reload(), j.issues.length > 0 ? 8000 : 1500);
     });
 
+    // 納品回の作成 (Excel なし) — picking 実行から
+    $('#pk-go2').addEventListener('click', async () => {
+      const runId = $('#pk-run').value;
+      const msg = $('#pk-msg');
+      if (!runId) return setMsg(msg, 'err', 'ピッキング実行を選んでください');
+      const j = await post('/admin/runs/from-picking', { source_run_id: Number(runId) });
+      if (!j.ok) return setMsg(msg, 'err', j.message || '作成できませんでした');
+      setMsg(msg, 'ok', j.already ? `納品回 #${j.runId} は作成済みです` : `✅ 納品回 #${j.runId} を作成しました (iPad に出ます)。Excel は出力の前までに「📎 Excel添付」で付けてください`);
+      setTimeout(() => location.reload(), 1200);
+    });
+
+    // Excel 添付 (納品回ごと。P1/P2 で別ファイルなら 2 回)
+    let attachRunId = null;
+    document.querySelectorAll('.run-excel').forEach(b => b.addEventListener('click', () => { attachRunId = b.dataset.id; $('#attach-file').value = ''; $('#attach-file').click(); }));
+    $('#attach-file').addEventListener('change', async () => {
+      const file = $('#attach-file').files[0];
+      if (!file || !attachRunId) return;
+      const msg = $('#run-msg');
+      setMsg(msg, '', `#${attachRunId} に ${file.name} を添付しています (解析・突合)…`);
+      const fd = new FormData();
+      fd.append('excel', file);
+      const r = await fetch(`${BASE}/admin/runs/${attachRunId}/excel`, { method: 'POST', body: fd });
+      const j = await r.json().catch(() => ({ ok: false, message: 'HTTP ' + r.status }));
+      if (!j.ok) {
+        let t = j.message || '添付できませんでした';
+        if (j.issues) t += '\n' + j.issues.map(i => `- ${i.kind} ${i.sheetName || ''}`).join('\n');
+        return setMsg(msg, 'err', t);
+      }
+      let t = `✅ 添付しました: ` + j.groups.map(g => `${g.sheetName} ← ${g.packingGroupId} (一致${g.matched}${g.qty_mismatch ? ' / 数量差' + g.qty_mismatch : ''}${g.excel_only ? ' / Excelのみ' + g.excel_only : ''}${g.picking_only ? ' / Excelに無い' + g.picking_only : ''})`).join('、');
+      if (j.unassignedGroups && j.unassignedGroups.length) t += `\nまだ Excel が無いグループが ${j.unassignedGroups.length} つあります (別プランの Excel を添付してください)`;
+      if (j.warnings && j.warnings.length) t += '\n注意:\n' + j.warnings.slice(0, 15).map(w => `- [${w.kind}] ${w.group || ''} ${w.fnsku || ''}${w.excelQty != null ? ` Excel:${w.excelQty}` : ''}${w.pickingQty != null ? ` picking:${w.pickingQty}` : ''}${w.boxes != null ? ` 箱${w.boxes} > 上限${w.maxBoxColumns}` : ''}`).join('\n');
+      setMsg(msg, 'ok', t);
+      setTimeout(() => openExportPanel(Number(attachRunId)), 600);
+    });
+
     // 納品回の操作
     document.querySelectorAll('.run-activate').forEach(b => b.addEventListener('click', async () => {
       const j = await post(`/admin/runs/${b.dataset.id}/activate`);
@@ -316,7 +358,7 @@
         ${rd.ok ? '<p class="msg ok">✅ ブロッカーなし — 出力できます</p>' : rd.blockers.map(x => `<div class="msg err">⛔ ${escH(x.message)}${detail(x)}</div>`).join('')}
         ${rd.warnings.map(x => `<div class="msg" style="color:#B5651D">⚠ ${escH(x.message)}${detail(x)}</div>`).join('')}
         <h3 style="margin:14px 0 4px">箱 ↔ Amazon 箱番号</h3>
-        ${rd.groups.map(g => `<p style="margin:4px 0"><b>${escH(g.sheetName)}</b> (${escH(g.packingGroupId)}) — ${g.boxes.length} 箱 / テンプレ上限 ${g.maxBoxColumns}</p>
+        ${rd.groups.map(g => `<p style="margin:4px 0"><b>${escH(g.sheetName)}</b> — ${g.excelAttached ? `Excel 添付済み (${escH(g.packingGroupId || '')}${g.excelFileId ? ' / file#' + g.excelFileId : ''}) / テンプレ上限 ${g.maxBoxColumns}` : '<span class="ng">Excel 未添付</span>'} — ${g.boxes.length} 箱 / 行: ${escH(Object.entries(g.rowCounts || {}).map(([k, v]) => k + ' ' + v).join(', '))}</p>
           <table class="fbx-list"><tr><th>箱札</th><th>Amazon</th><th>個数</th><th>実測kg</th><th>資材</th><th>外寸 幅×長さ×高さ</th><th>状態</th></tr>
           ${g.boxes.map(b => `<tr><td>${escH(b.code)}</td><td ${b.amazonBoxNo !== b.boxNo ? 'class="ng"' : ''}>${escH(b.amazonName)}</td><td>${b.qty}</td><td>${b.weightKg ?? ''}</td><td>${escH(b.material || '')}</td>
             <td>${b.dims && b.dims.width ? `${b.dims.width}×${b.dims.length}×${b.dims.height}` : '<span class="ng">未設定 (STA画面で入力)</span>'}</td><td>${b.status === 'closed' ? '閉' : '開'}</td></tr>`).join('')}
@@ -326,11 +368,11 @@
           ${rd.expiries.map(e => `<tr><td><code>${escH(e.fnsku)}</code></td><td>${escH(e.sku)}</td><td>${escH((e.name || '').slice(0, 40))}</td><td><b>${escH(e.expiry)}</b></td><td>${e.qty}</td></tr>`).join('')}</table>
           <button class="btn-sm" id="ex-copy" style="margin-top:6px">📋 期限一覧をコピー (タブ区切り)</button>`}
         <h3 style="margin:14px 0 4px">出力履歴</h3>
-        ${j.exports.length === 0 ? '<p class="hint">まだ出力していません</p>' : `<table class="fbx-list"><tr><th>#</th><th>データ版</th><th>作成</th><th>状態</th><th>操作</th></tr>
-          ${j.exports.map(e => `<tr><td>${e.id}</td><td>${e.data_version}</td><td>${(e.created_at || '').slice(0, 16).replace('T', ' ')}<br><small>${escH(e.created_by || '')}</small></td>
+        ${j.exports.length === 0 ? '<p class="hint">まだ出力していません</p>' : `<table class="fbx-list"><tr><th>#</th><th>ファイル</th><th>データ版</th><th>作成</th><th>状態</th><th>操作</th></tr>
+          ${j.exports.map(e => `<tr><td>${e.id}</td><td>${escH(e.file_name || '')}</td><td>${e.data_version}</td><td>${(e.created_at || '').slice(0, 16).replace('T', ' ')}<br><small>${escH(e.created_by || '')}</small></td>
             <td>${e.sta_uploaded ? '<span class="st active">STAアップ済み</span>' : (e.stale ? '<span class="st cancelled">旧版 (出力後にデータ変更あり)</span>' : '<span class="st setup">最新</span>')}</td>
             <td><a class="btn-sm" href="${BASE}/admin/exports/${e.id}/download">⬇ ダウンロード</a>
-              ${!e.stale && !rd.run.staUploadedAt ? `<button class="btn-sm ex-sta" data-id="${e.id}">✅ STA にアップした</button>` : ''}</td></tr>`).join('')}</table>`}
+              ${!e.stale && !e.sta_uploaded && !rd.run.staUploadedAt && !(rd.fileStates || []).some(f => f.fileId === e.excel_file_id && f.uploaded) ? `<button class="btn-sm ex-sta" data-id="${e.id}">✅ STA にアップした</button>` : ''}</td></tr>`).join('')}</table>`}
         <div class="row" style="margin-top:12px">
           <button id="ex-go" ${rd.ok ? '' : 'disabled'}>📤 Excel を出力する${rd.exportState.latest && !rd.exportState.stale ? ' (同じ内容の再出力)' : ''}</button>
           <button id="ex-close">閉じる</button>
@@ -351,16 +393,21 @@
           $('#ex-go').disabled = false;
           return;
         }
-        setMsg($('#ex-msg'), 'ok', `✅ 出力 #${jj.exportId} (${jj.written} セル書込・検算OK)。ダウンロードを開始します${jj.stale ? '\n⚠ 書き込み中にデータが変わりました。もう一度出力してください' : ''}`);
-        window.location.href = jj.downloadUrl;   // attachment なので画面は残る
-        setTimeout(() => openExportPanel(runId), 1200);
+        const list = jj.exports || [{ exportId: jj.exportId, written: jj.written, downloadUrl: jj.downloadUrl, fileName: '' }];
+        const m = $('#ex-msg');
+        m.className = 'msg ok';
+        m.innerHTML = `✅ 出力 ${list.length} ファイル (検算OK)${jj.stale ? '<br>⚠ 書き込み中にデータが変わりました。もう一度出力してください' : ''}<br>` +
+          list.map(x => `<a href="${x.downloadUrl}">⬇ #${x.exportId} ${escH(x.fileName || 'packlist.xlsx')} (${x.written} セル)</a>`).join('<br>') +
+          (list.length > 1 ? '<br><small>ファイルごとに STA の該当プランへアップロードしてください</small>' : '');
+        window.location.href = list[0].downloadUrl;   // attachment なので画面は残る (2 つ目以降はリンクから)
+        setTimeout(() => openExportPanel(runId), 1500);
       });
       document.querySelectorAll('.ex-sta').forEach(b => b.addEventListener('click', async () => {
-        if (!confirm('この出力ファイルを STA にアップロードしましたか?\n記録すると納品回は「完了」になり、iPad から変更できなくなります')) return;
+        if (!confirm('この出力ファイルを STA にアップロードしましたか?\n付いている Excel が全部アップ済みになると納品回は「完了」になり、iPad から変更できなくなります')) return;
         const jj = await post(`/admin/runs/${runId}/sta-uploaded`, { export_id: Number(b.dataset.id) });
         if (!jj.ok) return setMsg($('#ex-msg'), 'err', jj.message);
-        setMsg($('#ex-msg'), 'ok', 'STA アップ済みとして記録しました (納品回は完了)');
-        setTimeout(() => location.reload(), 900);
+        setMsg($('#ex-msg'), 'ok', jj.runDone ? 'STA アップ済みとして記録しました (全ファイル完了 → 納品回は完了)' : `STA アップ済みとして記録しました。残り: ${(jj.remaining || []).join(', ') || 'なし'}`);
+        setTimeout(() => (jj.runDone ? location.reload() : openExportPanel(runId)), 900);
       }));
     }
     document.querySelectorAll('.run-export').forEach(b => b.addEventListener('click', () => {
