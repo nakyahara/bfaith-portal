@@ -1130,14 +1130,29 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
         restocked_on TEXT, done INTEGER NOT NULL DEFAULT 0, note TEXT, version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       INSERT INTO f_iroha_label_waits SELECT * FROM f_iroha_label_waits__old;
       DROP TABLE f_iroha_tasks__old; DROP TABLE f_iroha_label_waits__old;`);
+    // 古い版に溜まり得る汚れ: task の無いラベル待ち / 宙ぶらりんの session.task_id / 拠点コードの誤り
+    db.prepare("INSERT INTO f_iroha_label_waits (task_id, note, version, created_at, updated_at) VALUES (999999, '孤立', 1, 'x', 'x')").run();
+    const sidDangling = db.prepare('SELECT MIN(id) id FROM f_iroha_work_sessions').get().id;
+    db.prepare('UPDATE f_iroha_work_sessions SET task_id = 999998 WHERE id = ?').run(sidDangling);
+    db.prepare("INSERT INTO f_iroha_tasks (status, facility_code, notion_page_id, version, created_at, updated_at) VALUES ('not_started', 'nowhere', 'old-bad-fac', 1, 'x', 'x')").run();
     db.pragma('foreign_keys = ON');
     const oldSql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql;
     ok(!/CHECK \(\(status/.test(oldSql), '前提: 古い版には不変条件の CHECK が無い');
+    let migErr = null; try { createTables(db); } catch (e) { migErr = e; }
+    ok(migErr && /FK 違反/.test(migErr.message) && !/REFERENCES f_iroha_facilities/.test(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql),
+      '補正できない違反 (拠点コードの誤り) があれば作り直しを中止して旧テーブルのまま (全部戻る)');
+    ok(db.pragma('foreign_keys', { simple: true }) === 1, '中止しても foreign_keys は ON に戻る');
+    db.pragma('foreign_keys = OFF');
+    db.prepare("UPDATE f_iroha_tasks SET facility_code = 'iroha' WHERE notion_page_id = 'old-bad-fac'").run();   // 人が直した
+    db.pragma('foreign_keys = ON');
     createTables(db);
     const newSql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql;
     const newLabelSql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_label_waits'").get().sql;
-    ok(/\(status = 'closed'\) = \(close_reason IS NOT NULL\)/.test(newSql) && /REFERENCES f_iroha_facilities/.test(newSql) && /REFERENCES f_iroha_tasks/.test(newLabelSql), '起動時に CHECK・FK 付きへ作り直される');
-    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === nTasks && db.prepare('SELECT COUNT(*) c FROM f_iroha_label_waits').get().c === nLabel, '行はそのまま移る');
+    ok(/\(status = 'closed'\) = \(close_reason IS NOT NULL\)/.test(newSql) && /REFERENCES f_iroha_facilities/.test(newSql) && /REFERENCES f_iroha_tasks/.test(newLabelSql) && /location IN \('Z','Y','none'\)/.test(newLabelSql),
+      '直した後は CHECK・FK 付きへ作り直される');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === nTasks + 1 && db.prepare('SELECT COUNT(*) c FROM f_iroha_label_waits').get().c === nLabel, '行はそのまま移る (孤立ラベル待ちは本体から外れる)');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_label_waits__orphan WHERE task_id = 999999").get().c === 1, '孤立ラベル待ちは消さずに __orphan へ退避');
+    ok(db.prepare('SELECT task_id FROM f_iroha_work_sessions WHERE id = ?').get(sidDangling).task_id === null, '宙ぶらりんの task_id は外す (page_id は残る)');
     ok(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_iroha_tasks_destination'").get(), '索引も作り直される');
     let chk2 = null; try { db.prepare("UPDATE f_iroha_tasks SET status = 'closed', close_reason = NULL WHERE id = ?").run(tB.id); } catch (e) { chk2 = e; }
     ok(chk2 && /CHECK/.test(chk2.message), '作り直し後は CHECK が効く');

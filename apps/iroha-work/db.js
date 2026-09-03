@@ -114,18 +114,31 @@ const labelWaitsDDL = (name) => `
     );`;
 const LABEL_INDEX_DDL = 'CREATE INDEX IF NOT EXISTS idx_iroha_label_waits_task ON f_iroha_label_waits(task_id, id);';
 
+// 「新しい定義」に必要な制約 (個別に検査 — 一部だけ足りない版も作り直す。Codex A1 R3 Low)
+const TASKS_REQUIRED_DDL = [
+  /\(status = 'closed'\) = \(close_reason IS NOT NULL\)/, /\(status = 'closed'\) = \(closed_at IS NOT NULL\)/,
+  /\(status = 'on_hold'\) = \(hold_reason_code IS NOT NULL\)/, /hold_reason_code <> 'other'/, /REFERENCES f_iroha_facilities/,
+];
+const LABEL_REQUIRED_DDL = [/REFERENCES f_iroha_tasks/, /label_ordered IN \(0,1\)/, /location IN \('Z','Y','none'\)/, /reattach IN \(0,1\)/, /done IN \(0,1\)/];
+const FK_CHECK_TABLES = ['f_iroha_tasks', 'f_iroha_label_waits', 'f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events'];
+
 /**
- * f_iroha_tasks / f_iroha_label_waits の作り直し: CHECK・FK の無い古い版が残っていたら、行をそのまま移して新しい定義に
- * 入れ替える (CREATE IF NOT EXISTS は制約を足せない — Codex A1 R2 #1)。判定は sqlite_master の DDL 文字列。
- * 子テーブル (sessions 等) が参照していても親を作り直せるよう、その間だけ foreign_keys を OFF にする。冪等
+ * f_iroha_tasks / f_iroha_label_waits の作り直し: CHECK・FK の無い (または一部足りない) 古い版が残っていたら、行をそのまま
+ * 移して新しい定義に入れ替える (CREATE IF NOT EXISTS は制約を足せない — Codex A1 R2 #1)。判定は sqlite_master の DDL 文字列。
+ * 子テーブル (sessions 等) が参照していても親を作り直せるよう、その間だけ foreign_keys を OFF にする。
+ * 制約を入れる前提として、同じトランザクションで孤立参照を補正 (task の無いラベル待ちは __orphan へ退避、子テーブルの
+ * 宙ぶらりんな task_id は NULL に戻す = page_id は残るので次のバックフィルで埋め直せる) してから FK を検査し、
+ * 違反が残れば全部戻す (Codex A1 R3 Medium)。冪等
  */
 function migrateTasksSchema(db) {
   const sqlOf = (name) => db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(name)?.sql || '';
-  const needTasks = !!sqlOf('f_iroha_tasks') && !/\(status = 'closed'\) = \(close_reason IS NOT NULL\)/.test(sqlOf('f_iroha_tasks'));
-  const needLabel = !!sqlOf('f_iroha_label_waits') && !/REFERENCES f_iroha_tasks/.test(sqlOf('f_iroha_label_waits'));
+  const lacks = (sql, required) => !!sql && required.some((re) => !re.test(sql));
+  const needTasks = lacks(sqlOf('f_iroha_tasks'), TASKS_REQUIRED_DDL);
+  const needLabel = lacks(sqlOf('f_iroha_label_waits'), LABEL_REQUIRED_DDL);
   if (!needTasks && !needLabel) return false;
   const fkWasOn = db.pragma('foreign_keys', { simple: true }) === 1;
   if (fkWasOn) db.pragma('foreign_keys = OFF');
+  const fixed = { orphanLabelWaits: 0, unlinked: {} };
   try {
     db.transaction(() => {
       if (needTasks) {
@@ -142,13 +155,29 @@ function migrateTasksSchema(db) {
         db.exec('ALTER TABLE f_iroha_label_waits__new RENAME TO f_iroha_label_waits');
         db.exec(LABEL_INDEX_DDL);
       }
+      // ① task の無いラベル待ちは消さずに退避
+      db.exec('CREATE TABLE IF NOT EXISTS f_iroha_label_waits__orphan AS SELECT * FROM f_iroha_label_waits WHERE 0');
+      const orphanIds = db.prepare('SELECT id FROM f_iroha_label_waits w WHERE NOT EXISTS (SELECT 1 FROM f_iroha_tasks t WHERE t.id = w.task_id)').all().map((r) => r.id);
+      if (orphanIds.length > 0) {
+        const list = orphanIds.join(',');
+        db.exec(`INSERT INTO f_iroha_label_waits__orphan SELECT * FROM f_iroha_label_waits WHERE id IN (${list}); DELETE FROM f_iroha_label_waits WHERE id IN (${list});`);
+        fixed.orphanLabelWaits = orphanIds.length;
+      }
+      // ② 子テーブルの task_id が存在しない task を指していれば外す (page_id は残る)
+      for (const t of ['f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events']) {
+        if (!db.prepare(`PRAGMA table_info(${t})`).all().some((c) => c.name === 'task_id')) continue;
+        fixed.unlinked[t] = db.prepare(`UPDATE ${t} SET task_id = NULL WHERE task_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM f_iroha_tasks x WHERE x.id = ${t}.task_id)`).run().changes;
+      }
+      // ③ 検査。補正できない違反 (拠点コードの誤り等) が残れば throw → トランザクションごと戻る
+      const bad = FK_CHECK_TABLES.flatMap((t) => db.pragma(`foreign_key_check(${t})`));
+      if (bad.length > 0) throw new Error(`タスク表の作り直しを中止しました (補正できない FK 違反): ${JSON.stringify(bad.slice(0, 5))}`);
     })();
-    const bad = db.pragma('foreign_key_check');
-    if (bad.length > 0) console.error('[iroha-work] タスク表の作り直し後に FK 違反が残っています (要確認)', bad.slice(0, 5));
   } finally {
     if (fkWasOn) db.pragma('foreign_keys = ON');
   }
-  console.log(`[iroha-work] ${[needTasks && 'f_iroha_tasks', needLabel && 'f_iroha_label_waits'].filter(Boolean).join(' / ')} を CHECK・FK 付きに作り直しました`);
+  console.log(`[iroha-work] ${[needTasks && 'f_iroha_tasks', needLabel && 'f_iroha_label_waits'].filter(Boolean).join(' / ')} を CHECK・FK 付きに作り直しました`
+    + (fixed.orphanLabelWaits ? ` (孤立ラベル待ち ${fixed.orphanLabelWaits} 件を __orphan へ退避)` : '')
+    + (Object.values(fixed.unlinked).some(Boolean) ? ` (宙ぶらりんの task_id を外した: ${JSON.stringify(fixed.unlinked)})` : ''));
   return true;
 }
 
@@ -409,10 +438,14 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_card_media', 'unavailable_at', 'TEXT');
   // 選択肢テーブルが normalized_code 無しの古い版なら作り直す (列追加だけでは UNIQUE を差し替えられない)
   migrateWorkOptionsSchema(db);
-  // タスク表が CHECK/FK 無しの古い版なら作り直す (子テーブルの task_id 追加より前に)
+  // 拠点の初期値 (無ければ足す。名前の変更は管理画面から — 今は無いので tasks.js を正とする)。
+  // タスク表の作り直し (facility_code の FK 検査) より前に入れておく
+  const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, active, sort_order) VALUES (?, ?, ?, 1, ?)');
+  for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.sort_order);
+  // タスク表が CHECK/FK 無し (または一部足りない) 古い版なら作り直す (子テーブルの task_id 追加より前に)
   migrateTasksSchema(db);
   // v1.1 正本化: 作業時間・写真・履歴を task に紐づける (page_id は Notion 時代の証跡として残す — Codex 設計相談 R3)。
-  // REFERENCES は宣言する (PRAGMA foreign_keys は mirror DB 全体に影響するので接続側の設定に従う。存在確認はサービス層でも行う)
+  // REFERENCES は宣言する (mirror DB は foreign_keys=ON。存在確認はサービス層でも行う)
   addCol('f_iroha_work_sessions', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
   addCol('f_iroha_card_media', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
   addCol('f_iroha_app_events', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
@@ -421,9 +454,6 @@ export function createTables(db = getMirrorDB()) {
     CREATE INDEX IF NOT EXISTS idx_iroha_media_task ON f_iroha_card_media(task_id, id);
     CREATE INDEX IF NOT EXISTS idx_iroha_events_task ON f_iroha_app_events(task_id, id);
   `);
-  // 拠点の初期値 (無ければ足す。名前の変更は管理画面から — 今は無いので tasks.js を正とする)
-  const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, active, sort_order) VALUES (?, ?, ?, 1, ?)');
-  for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.sort_order);
   // video_url は inbound-check 側でも足すが、いろは単独経路の起動でも保証する
   // (このアプリが先に f_iroha_work_master を SELECT すると no such column になるため)
   if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get()) {
