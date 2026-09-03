@@ -160,8 +160,8 @@ export function mediaByPage() {
   for (const r of rows) {
     // 送信待ちの実体が消えていたら (再起動で一時領域が飛んだ等)、キューの再試行 (最大10回) を待たずに
     // その場で停止扱いにする → 画面は「失敗」を出し、利用者は撮り直せる (Codex R2 #1)。
-    // existsSync は送信待ち (stored) の行だけ = 通常 0〜数件
-    if (r.status === 'stored' && r.local_path && r.next_retry_at !== BLOCKED_UNTIL && !fs.existsSync(r.local_path)) {
+    // existsSync は送信待ち (stored) の行だけ = 通常 0〜数件。パスが空の行も「実体なし」(Codex R3)
+    if (r.status === 'stored' && r.next_retry_at !== BLOCKED_UNTIL && (!r.local_path || !fs.existsSync(r.local_path))) {
       lost.run(BLOCKED_UNTIL, LOST_LOCAL_MSG, r.id);
       r.next_retry_at = BLOCKED_UNTIL; r.error = LOST_LOCAL_MSG;
     }

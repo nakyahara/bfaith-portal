@@ -709,6 +709,14 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
     fs.unlinkSync(lostRow.local_path);
     const lostPub = mediaByPage().get(pLost.id)[0];
     ok(lostPub.viewable === false && /実体ファイルがありません/.test(lostPub.error || ''), '実体が消えたら停止扱い (viewable=false・失敗の理由つき)');
+    // パス自体が欠損した送信待ち (移行ミス等) も同じ扱い (Codex R3)
+    const pNoPath = mkPage({ status: '作業中', title: 'パス欠損', code: 'PROD-NOPATH' });
+    addMedia({ pageId: pNoPath.id, productCode: 'PROD-NOPATH', kind: 'photo', filePath: tmp('nopath.jpg', jpeg), worker: worker1, operationId: 'op-nopath-0001' });
+    getDB().prepare("UPDATE f_iroha_card_media SET local_path = NULL WHERE operation_id = 'op-nopath-0001'").run();
+    const noPathPub = mediaByPage().get(pNoPath.id)[0];
+    ok(noPathPub.viewable === false && /実体ファイルがありません/.test(noPathPub.error || ''), 'local_path が空の送信待ちも停止扱い');
+    ok(getDB().prepare("SELECT next_retry_at FROM f_iroha_card_media WHERE operation_id = 'op-nopath-0001'").get().next_retry_at === '9999-12-31T00:00:00.000Z',
+      'キューの10回再試行を待たずに BLOCKED');
   }
 
   // Notion PATCH 中に削除が割り込んでも、削除の同期要求が消えない (revision 方式 — PR3-R2)
