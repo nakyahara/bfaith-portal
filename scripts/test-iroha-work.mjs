@@ -1842,9 +1842,13 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/data-fac=/.test(html) && /data-id=/.test(html) && /data-st=/.test(html), '値は data 属性で渡す');
   // 絞り込みを変えたときに、見えないカードが選ばれたまま残らない
   ok(/function syncBulkSelection/.test(html) && /renderBoard\(\)[\s\S]{0,400}syncBulkSelection/.test(html), 'ボードは描くたびに選択を見えているものへそろえる');
-  ok(/function renderList\(\)[\s\S]{0,200}syncBulkSelection/.test(html), '一覧も同じ');
+  ok(/function renderList\(\)[\s\S]{0,900}syncBulkSelection/.test(html), '一覧も同じ');
   // 画面を戻したときに描き直さないと、ボードで選んだ分が一覧の絞り込みと合わないまま残る (Codex PR-C R2)
   ok(/function setView\(v\)[\s\S]{0,700}if \(v === 'list'\) renderList\(\);/.test(html), '画面を切り替えたら、その画面を描き直す (一覧も)');
+  // 一覧の後始末 (exitBulk) が curView のガードの中にないと、ボードで選んでいる最中に /api/state が返るだけで選択が消える
+  const listBody = html.slice(html.indexOf('function renderList()'), html.indexOf('function renderList()') + 900);
+  ok(/if \(curView === 'list'\) \{[\s\S]{0,200}exitBulk\(\)/.test(listBody), 'まとめて選択の解除は「一覧を見ているとき」だけ (ボードの選択を消さない)');
+  ok(!/tabindex="-1"/.test(html), 'チェックボックスはキーボードでも操作できる (tabindex="-1" を付けない)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

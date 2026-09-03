@@ -773,12 +773,16 @@ function thumbHtml(c) {
 
 function renderList() {
   const cards = visibleCards();
-  if (curView === 'list') syncBulkSelection(cards);
-  // 「棚入待ち」だけを見ているときは、まとめて棚入完了にできる (職員操作。要件 v1.1 §B)
+  // 「棚入待ち」だけを見ているときは、まとめて棚入完了にできる (職員操作。要件 v1.1 §B)。
+  // ⚠ここの後始末は一覧を見ているときだけ。ボードで選んでいる最中も loadState() → renderList() は走るので、
+  //   無条件に exitBulk すると選択が消える (Codex PR-C R4)
   const bulkable = isApp() && curTab === 'ready_for_stocking';
   const btn = $('#bulkStart');
   if (btn) btn.hidden = !bulkable || !!bulkIds;
-  if (!bulkable && bulkIds) exitBulk();
+  if (curView === 'list') {
+    syncBulkSelection(cards);
+    if (!bulkable && bulkIds) exitBulk();
+  }
   if (cards.length === 0) {
     $('#list').innerHTML = '<div class="empty">' + ($('#q').value ? '見つかりませんでした' : 'このステータスのカードはありません') + '</div>';
     return;
@@ -799,7 +803,7 @@ function renderList() {
     const selectable = bulkIds && c.status === 'ready_for_stocking';
     const sel = selectable && bulkIds.has(c.id);
     return '<div class="row' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
-      (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + ' tabindex="-1">' : '') +
+      (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
       '<div class="thumb">' + thumbHtml(c) + '</div>' +
       '<div class="bd"><h2>' + rowTags(c) + esc(c.title) + '</h2>' +
       '<div class="meta num">' + meta + '</div>' +
@@ -899,7 +903,7 @@ function bcardHtml(c, status) {
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
   return '<div class="bcard' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
-    '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + ' tabindex="-1">' : '') +
+    '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
     (c.today ? '📌 ' : '') + esc(c.title) + '</h4>' +
     (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') + '</div>';
 }
