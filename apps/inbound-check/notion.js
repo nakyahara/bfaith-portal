@@ -114,6 +114,11 @@ export async function ensureCardSchema({ force = false } = {}) {
   const db = await notionRequest(`/databases/${dbId}`, 'GET');
   const names = new Set(Object.keys(db.properties || {}));
   const types = new Map(Object.entries(db.properties || {}).map(([k, v]) => [k, v?.type]));
+  // select 型の選択肢名 (プロパティ名 → Set)。クエリのフィルタに使う名前が DB に実在するかを
+  // 呼び元が確かめるため (存在しない名前でフィルタすると Notion は 400 を返す — iroha-work 2026-09-03)
+  const selectOptions = new Map(Object.entries(db.properties || {})
+    .filter(([, v]) => v?.type === 'select')
+    .map(([k, v]) => [k, new Set((v.select?.options || []).map(o => o?.name).filter(Boolean))]));
 
   const add = {};
   if (!names.has(DEDUPE_PROP)) add[DEDUPE_PROP] = { rich_text: {} };
@@ -159,7 +164,7 @@ export async function ensureCardSchema({ force = false } = {}) {
     e.code = 'NOTION_SCHEMA_MISMATCH';
     throw e;
   }
-  const schema = { names, types };
+  const schema = { names, types, selectOptions };
   schemaCache = { at: Date.now(), schema };
   return schema;
 }

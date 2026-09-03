@@ -28,6 +28,10 @@ export { isNotionConfigured };
 export const STATUSES = ['未着手', '作業中', '中断', '棚入完了'];
 export const STATUS_DONE = '棚入完了';
 const STATUS_CANCELLED = '取消';
+// 一覧に取り込まないステータス (中原さん 2026-09-03: 在庫化対象外・作業完了は取り込まない)。
+// Notion クエリの除外条件に入れるのは DB スキーマに実在する選択肢だけ (無い名前は 400 になる)、
+// 取得後のコード側除外は全部に掛ける (二重の安全)
+export const EXCLUDED_STATUSES = [STATUS_CANCELLED, '在庫化対象外', '作業完了'];
 const STATUS_PROP = 'ステータス';
 
 // 棚入完了は最近のものだけ一覧に出す (全履歴を毎回引かない。それより古い完了分は Notion で見る)
@@ -106,22 +110,26 @@ const recentChanges = new Map();
 
 /**
  * カード一覧を Notion から取得してキャッシュを全置換する。
- *   ①棚入完了以外は**全件** — 何ヶ月放置の未着手も消さない。「取消」はこちらで除外
+ *   ①棚入完了・除外ステータス (EXCLUDED_STATUSES) 以外は**全件** — 何ヶ月放置の未着手も消さない
  *   ②棚入完了は直近 DONE_WINDOW_DAYS 日に編集されたものだけ
  * アーカイブ済みページは query に元々返らない。
  * 取り切れなかった (truncated) ときは置き換えず、古い完全キャッシュを守る。
  */
 export async function refreshFromNotion() {
   // スキーマ検証 (10分キャッシュ)。ステータスが select 型でなくなった等は 1回のエラーで止める
-  await ensureCardSchema();
+  const schema = await ensureCardSchema();
   const startedAt = Date.now();
-  // ⚠「取消」をフィルタに入れない: Notion の select フィルタは DB に存在しない選択肢名を
-  //   指定すると 400 (select option "取消" not found) になり、一覧が丸ごと取れなくなる。
-  //   「取消」の選択肢は inbound-check が初めて取消を反映した時に自動作成されるので、
-  //   それまでは存在しない (2026-09-03 実機で判明: キャッシュ 0 枚)。→ 取得後にこちらで除外する。
-  //   取消が溜まって MAX_PAGES_ACTIVE に当たるようなら、DB スキーマの選択肢一覧を見て
-  //   存在する時だけフィルタに戻す (Notion 廃止のほうが先の見込み)
-  const activeFilter = { property: STATUS_PROP, select: { does_not_equal: STATUS_DONE } };
+  // ⚠ 除外ステータスは DB スキーマに**実在する選択肢だけ**クエリに入れる: Notion の select フィルタは
+  //   存在しない選択肢名を指定すると 400 (select option "取消" not found) になり、一覧が丸ごと
+  //   取れなくなる。「取消」は inbound-check が初めて取消を反映した時に自動作成される選択肢で、
+  //   それまで存在しない (2026-09-03 実機で判明: キャッシュ 0 枚)。実在しないものは取得後に除外
+  const known = schema?.selectOptions?.get(STATUS_PROP) || new Set();
+  const activeFilter = {
+    and: [
+      { property: STATUS_PROP, select: { does_not_equal: STATUS_DONE } },
+      ...EXCLUDED_STATUSES.filter(s => known.has(s)).map(s => ({ property: STATUS_PROP, select: { does_not_equal: s } })),
+    ],
+  };
   const doneSince = new Date(startedAt - DONE_WINDOW_DAYS * 24 * 3600 * 1000).toISOString();
   const doneFilter = {
     and: [
@@ -142,7 +150,7 @@ export async function refreshFromNotion() {
     if (seen.has(page.id)) continue;
     seen.add(page.id);
     const row = parsePage(page);
-    if (row.status === STATUS_CANCELLED) continue;   // 取消はキャッシュに入れない (上記)
+    if (EXCLUDED_STATUSES.includes(row.status)) continue;   // クエリに入れられなかった分もここで落とす (上記)
     pages.push(row);
   }
   replaceCache(pages);

@@ -57,6 +57,9 @@ const mock = {
   },
 };
 
+// 実 API の GET /databases は select プロパティに選択肢一覧 (select.options[].name) を含む
+mock.dbProps['ステータス'].select = { options: mock.statusOptions.map(name => ({ name })) };
+
 function sel(name) { return name == null ? { type: 'select', select: null } : { type: 'select', select: { name } }; }
 function rt(s) { return { type: 'rich_text', rich_text: [{ plain_text: s }] }; }
 
@@ -179,12 +182,16 @@ const pB = mkPage({ status: '作業中', title: '商品B', code: 'PROD-B', qty: 
 const pNew = mkPage({ status: null, title: null, code: 'PROD-NEW', qty: 60, props: { '資材セットID': sel('D-8'), '収納容器': sel('20Lコンテナ'), '入数': { type: 'number', number: 180 } } });
 const pDone = mkPage({ status: '棚入完了', title: '商品D', code: 'PROD-D', qty: 40 });
 mkPage({ status: '取消', title: '取消済み', code: 'PROD-X', qty: 1 });
+mkPage({ status: '在庫化対象外', title: '対象外', code: 'PROD-Y', qty: 1 });
+mkPage({ status: '作業完了', title: '作業は終わった', code: 'PROD-Z', qty: 1 });
 {
   const r = await refreshFromNotion();
-  ok(r.count === 4, `取消を除く4枚 (実際 ${r.count})`);
+  ok(r.count === 4, `取消・在庫化対象外・作業完了を除く4枚 (実際 ${r.count})`);
   const rows = listCache();
   ok(rows.length === 4, 'キャッシュも4行');
-  ok(!rows.some(x => x.status === '取消'), '「取消」は取らない');
+  ok(!rows.some(x => ['取消', '在庫化対象外', '作業完了'].includes(x.status)), '「取消」「在庫化対象外」「作業完了」は取らない (中原さん 2026-09-03)');
+  const activeFilter = mock.lastFilters.find(f => JSON.stringify(f || {}).includes('在庫化対象外'));
+  ok(activeFilter && JSON.stringify(activeFilter).includes('作業完了'), 'DB に実在する除外ステータスは Notion 側のフィルタで落とす (全件を引かない)');
   ok(!mock.lastFilters.some(f => JSON.stringify(f || {}).includes('取消')),
     '「取消」をフィルタに使わない (DB に無い選択肢名は Notion が 400 を返す — 2026-09-03 実機障害)');
   ok(rows.find(x => x.page_id === pDone.id), '棚入完了 (期間内) は入る');
