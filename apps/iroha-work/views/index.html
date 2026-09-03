@@ -1743,7 +1743,7 @@ async function setExternalReady(on) {
   });
   if (!j.ok) {
     showErr(j.message || '変更できませんでした');
-    if (j.current) { applyTask(c, j.current); renderList(); renderDetail(c); }
+    if (j.current) { applyTask(c, j.current); renderList(); renderDetail(c); if (curView === 'board') renderBoard(); }
     return;
   }
   applyTask(c, j.task);

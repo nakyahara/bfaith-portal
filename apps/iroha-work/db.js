@@ -38,7 +38,7 @@ const workOptionsDDL = (name) => `
 const TASKS_COLS = ['id', 'destination_id', 'notion_page_id', 'legacy_status', 'status', 'close_reason', 'facility_code', 'hold_reason_code', 'hold_reason_note',
   'planned_date', 'priority_class', 'priority_note', 'product_code', 'product_name', 'qty', 'arrival_date', 'ar_no', 'barcode', 'expiry', 'supplier', 'handling',
   'master_snapshot', 'payload', 'started_at', 'ready_at', 'closed_at', 'closed_by', 'cancellation_requested_at', 'cancellation_source',
-  'migration_review', 'migration_note', 'import_batch_id', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
+  'migration_review', 'migration_note', 'import_batch_id', 'external_ready', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
 const tasksDDL = (name) => `
     CREATE TABLE IF NOT EXISTS ${name} (
       id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -260,14 +260,20 @@ function migrateTasksSchema(db) {
     db.transaction(() => {
       if (needTasks) {
         db.exec(tasksDDL('f_iroha_tasks__new'));
-        db.exec(`INSERT INTO f_iroha_tasks__new (${TASKS_COLS.join(', ')}) SELECT ${TASKS_COLS.join(', ')} FROM f_iroha_tasks`);
+        // 旧テーブルに無い列は写さない (既定値のまま)。NOT NULL の列に NULL が入っていたら既定値に寄せる
+        const have = new Set(db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name));
+        const cols = TASKS_COLS.filter((c) => have.has(c));
+        const pick = (c) => (c === 'external_ready' || c === 'migration_review' ? `COALESCE(${c}, 0)` : c);
+        db.exec(`INSERT INTO f_iroha_tasks__new (${cols.join(', ')}) SELECT ${cols.map(pick).join(', ')} FROM f_iroha_tasks`);
         db.exec('DROP TABLE f_iroha_tasks');
         db.exec('ALTER TABLE f_iroha_tasks__new RENAME TO f_iroha_tasks');
         db.exec(TASKS_INDEX_DDL);
       }
       if (needLabel) {
         db.exec(labelWaitsDDL('f_iroha_label_waits__new'));
-        db.exec(`INSERT INTO f_iroha_label_waits__new (${LABEL_COLS.join(', ')}) SELECT ${LABEL_COLS.join(', ')} FROM f_iroha_label_waits`);
+        const haveL = new Set(db.prepare('PRAGMA table_info(f_iroha_label_waits)').all().map((c) => c.name));
+        const colsL = LABEL_COLS.filter((c) => haveL.has(c));
+        db.exec(`INSERT INTO f_iroha_label_waits__new (${colsL.join(', ')}) SELECT ${colsL.join(', ')} FROM f_iroha_label_waits`);
         db.exec('DROP TABLE f_iroha_label_waits');
         db.exec('ALTER TABLE f_iroha_label_waits__new RENAME TO f_iroha_label_waits');
         db.exec(LABEL_INDEX_DDL);

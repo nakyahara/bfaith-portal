@@ -271,18 +271,24 @@ export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = nul
 }
 
 /**
- * 名前のないカード (取込でも入荷受付でもない、素性の分からない行)。管理画面で人が見て消すためだけの一覧。
- * 「(名称なし)」は Notion のタイトルが空だったときに入る文字列
+ * 「素性の分からないカード」の条件 (一覧と削除で同じものを使う — Codex FB R3)。
+ *   名前が無い (または「(名称なし)」) / Notion のページに紐づかない / 入荷受付の行き先にも紐づかない / まだ終わっていない
+ * どれか 1 つでも当てはまらなければ、消す対象ではない
  */
+const STRAY_WHERE = `t.status <> 'closed'
+      AND t.notion_page_id IS NULL AND t.destination_id IS NULL
+      AND (t.product_name IS NULL OR TRIM(t.product_name) = '' OR t.product_name = '(名称なし)')`;
+
+/** 名前のないカード (取込でも入荷受付でもない行)。管理画面で人が見て消すためだけの一覧 */
 export function listNamelessTasks(limit = 50) {
   return getDB().prepare(`SELECT t.id, t.status, t.close_reason, t.product_code, t.product_name, t.qty, t.destination_id, t.notion_page_id,
       t.created_at, t.created_by, t.updated_by,
       (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id) AS sessions,
+      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id AND s.ended_at IS NULL) AS active_sessions,
       (SELECT COUNT(*) FROM f_iroha_card_media m WHERE m.task_id = t.id AND m.deleted_at IS NULL) AS media,
       (SELECT COUNT(*) FROM f_iroha_label_waits w WHERE w.task_id = t.id) AS label_waits
     FROM f_iroha_tasks t
-    WHERE t.status <> 'closed'
-      AND (t.product_name IS NULL OR TRIM(t.product_name) = '' OR t.product_name = '(名称なし)')
+    WHERE ${STRAY_WHERE}
     ORDER BY t.id LIMIT ?`).all(Math.max(1, Math.min(200, Number(limit) || 50)));
 }
 
@@ -297,11 +303,22 @@ export function removeStrayTask({ taskId, actor = null, reason = null }) {
   return db.transaction(() => {
     const t = getTask(taskId);
     if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません' };
+    // 画面から送られた id をそのまま信じない。消していい条件をここでもう一度確かめる (Codex FB R3)
+    const stray = db.prepare(`SELECT 1 FROM f_iroha_tasks t WHERE t.id = ? AND ${STRAY_WHERE}`).get(t.id);
+    if (!stray) {
+      return { ok: false, error: 'not_stray',
+        message: 'このカードは片づけの対象ではありません (名前がある / Notion のカードがある / 入荷受付の行き先がある / もう終わっている)' };
+    }
     const n = (sql) => db.prepare(sql).get(t.id).c;
     const used = n('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?')
       + n('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id = ?')
       + n('SELECT COUNT(*) c FROM f_iroha_label_waits WHERE task_id = ?');
     const note = reason || '素性の分からないカード (管理画面から片づけ)';
+    // 作業中の人がいるまま閉じない (カードが一覧から消えても記録が開きっぱなしになり、次の開始が塞がる — Codex FB R3)
+    const active = n('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL');
+    if (active > 0) {
+      return { ok: false, error: 'active_sessions', message: `このカードで作業中の人が ${active} 人います。作業を終えてから片づけてください` };
+    }
     if (used > 0) {
       if (t.status === 'closed') return { ok: true, action: 'closed', id: t.id, already: true };
       db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'out_of_scope', closed_at = ?, closed_by = ?,

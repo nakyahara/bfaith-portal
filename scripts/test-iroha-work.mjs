@@ -1669,6 +1669,9 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       const rm = await call('POST', '/admin/tasks/remove', { ...admin, body: { task_id: stray, confirm: 'REMOVE' } });
       ok(rm.status === 200 && rm.json.action === 'deleted' && TD.getTask(stray) === null && typeof rm.json.remaining === 'number', '消せる (残り件数も返す)');
       ok((await call('GET', '/admin/migration/status', { ...admin })).json.nameless !== undefined, '管理画面の状態に名前のないカードが載る');
+      ok((await call('POST', '/admin/tasks/remove', { ...admin, body: { task_id: task.id, confirm: 'REMOVE' } })).status === 409,
+        'ふつうのカード (名前あり・Notion 紐づきあり) は 409 で消せない');
+      ok(TD.getTask(task.id) !== null, '消えていない');
     }
     ok(notionCalls() === calls0, 'ここまで Notion API を 1 回も呼んでいない');
     // Notion に戻す: app 正本以降の記録があるので 409 → force で通る (件数・監査ログ・切替時刻)
@@ -2095,7 +2098,49 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
     ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(b).c === 1, '記録は残る (持ち主を消さない)');
     ok(/管理画面から片づけ/.test(bAfter.migration_note || ''), 'なぜ片づけたかが残る');
     ok(!TD.listNamelessTasks().some(x => x.id === b), '片づけたら一覧から消える');
+
+    // 片づけていいのは「名前が無い・Notion に紐づかない・入荷受付に紐づかない・終わっていない」だけ (Codex FB R3)
+    {
+      const named = Number(insStray.run('名前がある', utcNowT(), utcNowT()).lastInsertRowid);
+      ok(TD.removeStrayTask({ taskId: named }).error === 'not_stray', '名前があるカードは片づけられない');
+      ok(TD.getTask(named) !== null, '消えていない');
+      const withPage = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
+      db.prepare("UPDATE f_iroha_tasks SET notion_page_id = 'stray-has-page' WHERE id = ?").run(withPage);
+      ok(TD.removeStrayTask({ taskId: withPage }).error === 'not_stray', 'Notion のカードに紐づくものは片づけられない');
+      ok(!TD.listNamelessTasks().some(x => x.id === withPage), '一覧にも出ない');
+      const withDest = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
+      db.prepare('UPDATE f_iroha_tasks SET destination_id = 9499 WHERE id = ?').run(withDest);
+      ok(TD.removeStrayTask({ taskId: withDest }).error === 'not_stray', '入荷受付の行き先に紐づくものは片づけられない');
+      // 作業中の人がいるうちは片づけない
+      const busy = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
+      const wB = listIrohaWorkers(true).find((x) => x.display_name === 'すずき');
+      const sB = startSession({ taskId: busy, worker: getIrohaWorker(wB.id) });
+      ok(TD.removeStrayTask({ taskId: busy }).error === 'active_sessions', '作業中の人がいれば片づけられない');
+      ok(TD.getTask(busy).status !== 'closed', '状態も変わらない');
+      stopSession({ taskId: busy, workerId: wB.id, sessionId: sB.sessionId, reason: 'done' });
+      ok(TD.removeStrayTask({ taskId: busy }).action === 'closed', '作業を終えれば片づけられる (記録があるので終了)');
+    }
     TD.removeStrayTask({ taskId: c2, actor: 'admin@test' });
+  }
+
+  // タスク表を作り直しても「外部に出す準備OK」が 0 に戻らない (Codex FB R3)
+  {
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    const keep = TD.upsertTaskFromImport({ notion_page_id: 'ext-keep', status: 'not_started', destination_id: 9420,
+      product_code: 'PLAN-A', product_name: '再構築でも残る', qty: 1, facility_code: 'iroha' }, { batchId: 'test-rebuild' }).id;
+    TD.setExternalReady({ taskId: keep, ready: true, expectVersion: TD.getTask(keep).version, actor: 'test' });
+    ok(TD.getTask(keep).external_ready === 1, '前提: チェックが付いている');
+    // CHECK を 1 つ落とした「古い版」にして、作り直しを起こす
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql;
+    const cols = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name);
+    db.pragma('foreign_keys = OFF');
+    db.exec('CREATE TEMP TABLE rb AS SELECT * FROM f_iroha_tasks; DROP TABLE f_iroha_tasks;');
+    db.exec(sql.replace("CHECK ((status = 'closed') = (close_reason IS NOT NULL)),", ''));
+    db.exec(`INSERT INTO f_iroha_tasks (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM rb; DROP TABLE rb;`);
+    db.pragma('foreign_keys = ON');
+    createTables(db);
+    ok(/\(status = 'closed'\) = \(close_reason IS NOT NULL\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql), '前提: 作り直しが起きた');
+    ok(TD.getTask(keep).external_ready === 1, '作り直しても「外部に出す準備OK」は残る');
   }
 }
 

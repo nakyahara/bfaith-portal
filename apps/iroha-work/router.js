@@ -1138,7 +1138,7 @@ router.post('/admin/tasks/remove', checkOrigin, requireAdmin, api((req, res) => 
   if (taskId == null) return res.status(400).json(BAD_TASK_ID);
   if (req.body?.confirm !== 'REMOVE') return res.status(400).json({ ok: false, error: 'confirm_required', message: '確認のため confirm に REMOVE と入れてください' });
   const r = removeStrayTask({ taskId, actor: req.iwUser, reason: req.body?.reason ? String(req.body.reason).slice(0, 200) : null });
-  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 400).json(r);
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : (r.error === 'not_stray' || r.error === 'active_sessions') ? 409 : 400).json(r);
   safeLog({ action: 'task_remove', pageId: null, deviceLabel: `session:${req.iwUser}`, to: `task#${r.id} → ${r.action}`, ok: true });
   res.json({ ...r, remaining: listNamelessTasks(30).length });
 }));
