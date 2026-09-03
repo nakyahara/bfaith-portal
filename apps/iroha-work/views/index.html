@@ -273,21 +273,22 @@
 </head>
 <body>
 <div class="app">
+  <!-- ══ どの画面でも出す: 見出し・画面切替・エラーバナー ══ -->
+  <header class="top">
+    <h1><span class="logo">IROHA STOCK</span><span class="jp">いろは在庫化 作業画面</span></h1>
+    <button class="who" id="whoBtn" onclick="openGate()">👤 —</button>
+  </header>
+  <div class="views" id="views" hidden>
+    <button id="vList" class="on" onclick="setView('list')">📋 作業</button>
+    <button id="vBoard" onclick="setView('board')">🗂 ボード</button>
+    <button id="vLabel" onclick="setView('label')">🏷 ラベル待ち</button>
+    <button id="vHistory" onclick="setView('history')">📚 履歴</button>
+  </div>
+  <div class="banner err" id="errBanner" onclick="this.classList.remove('on')"></div>
+  <div class="banner warn" id="warnBanner" onclick="this.classList.remove('on')"></div>
+
   <!-- ══ 画面1: リスト ══ -->
   <div class="page listpage">
-    <header class="top">
-      <h1><span class="logo">IROHA STOCK</span><span class="jp">いろは在庫化 作業画面</span></h1>
-      <button class="who" id="whoBtn" onclick="openGate()">👤 —</button>
-    </header>
-    <div class="views" id="views" hidden>
-      <button id="vList" class="on" onclick="setView('list')">📋 作業</button>
-      <button id="vBoard" onclick="setView('board')">🗂 ボード</button>
-      <button id="vLabel" onclick="setView('label')">🏷 ラベル待ち</button>
-      <button id="vHistory" onclick="setView('history')">📚 履歴</button>
-    </div>
-    <div class="banner err" id="errBanner" onclick="this.classList.remove('on')"></div>
-    <div class="banner warn" id="warnBanner" onclick="this.classList.remove('on')"></div>
-
     <div class="filters">
       <span class="flabel">STATUS</span>
       <span id="tabs"></span>
@@ -772,6 +773,7 @@ function thumbHtml(c) {
 
 function renderList() {
   const cards = visibleCards();
+  if (curView === 'list') syncBulkSelection(cards);
   // 「棚入待ち」だけを見ているときは、まとめて棚入完了にできる (職員操作。要件 v1.1 §B)
   const bulkable = isApp() && curTab === 'ready_for_stocking';
   const btn = $('#bulkStart');
@@ -796,20 +798,26 @@ function renderList() {
     ].filter(Boolean).join(' ・ ');
     const selectable = bulkIds && c.status === 'ready_for_stocking';
     const sel = selectable && bulkIds.has(c.id);
-    return '<div class="row' + (sel ? ' sel' : '') + '" onclick="' +
-      (selectable ? 'toggleBulk(' + Number(c.id) + ')' : "openDetail('" + esc(c.id) + "')") + '">' +
-      (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') +
-        ' onclick="event.stopPropagation();toggleBulk(' + Number(c.id) + ')">' : '') +
+    return '<div class="row' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+      (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + ' tabindex="-1">' : '') +
       '<div class="thumb">' + thumbHtml(c) + '</div>' +
       '<div class="bd"><h2>' + rowTags(c) + esc(c.title) + '</h2>' +
       '<div class="meta num">' + meta + '</div>' +
       (meta2 ? '<div class="meta2 num">' + meta2 + '</div>' : '') + '</div>' +
-      (selectable ? '' : '<button class="st ' + stClass(c.status) + '" onclick="openSt(event,\'' + esc(c.id) + '\')">' + esc(stLabel(c)) + ' ▾</button>') +
+      (selectable ? '' : '<button class="st ' + stClass(c.status) + '" data-st="' + esc(c.id) + '">' + esc(stLabel(c)) + ' ▾</button>') +
       '<span class="chev">' + (selectable ? '' : '›') + '</span></div>';
   }).join('');
 }
 
 $('#q').addEventListener('input', renderList);
+// 一覧のクリックも委譲 (状態の札 / 選択 / 詳細)
+$('#list').addEventListener('click', (e) => {
+  const st = e.target.closest('[data-st]');
+  if (st) { e.stopPropagation(); openSt(e, st.dataset.st); return; }
+  const row = e.target.closest('[data-id]');
+  if (!row) return;
+  if (row.dataset.pick === '1') toggleBulk(row.dataset.id); else openDetail(row.dataset.id);
+});
 
 // ─── 画面の切替 (作業 / ボード / ラベル待ち / 履歴) ───
 const PAGES = { list: '.listpage', board: '.boardpage', label: '.labelpage', history: '.historypage' };
@@ -836,11 +844,30 @@ function facChips() {
   const facs = state.facilities || [];
   const counts = { all: state.cards.length };
   for (const c of state.cards) counts[c.facility_code] = (counts[c.facility_code] || 0) + 1;
-  const one = (v, label) => '<button class="chip' + (curFacility === v ? ' on' : '') + '" onclick="pickFacility(\'' + esc(v) + '\')">' +
+  // 値は data 属性で渡す (onclick に文字列を埋めない — HTML エスケープは JS 文字列のエスケープではない。Codex PR-C R1)
+  const one = (v, label) => '<button class="chip' + (curFacility === v ? ' on' : '') + '" data-fac="' + esc(v) + '">' +
     esc(label) + ' <span class="num">' + (counts[v] || 0) + '</span></button>';
   return one('all', 'すべて') + facs.map(f => one(f.code, f.name)).join('');
 }
 function pickFacility(code) { curFacility = code; renderBoard(); }
+// クリックは委譲で受ける (中身を作り直しても付け直さなくてよい)
+$('#facChips').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-fac]');
+  if (b) pickFacility(b.dataset.fac);
+});
+$('#board').addEventListener('click', (e) => {
+  const el = e.target.closest('[data-id]');
+  if (!el) return;
+  if (el.dataset.pick === '1') toggleBulk(el.dataset.id); else openDetail(el.dataset.id);
+});
+$('#lwBody').addEventListener('click', (e) => {
+  const tr = e.target.closest('tr[data-id]');
+  if (tr) openLw(tr.dataset.id);
+});
+$('#histBody').addEventListener('click', (e) => {
+  const tr = e.target.closest('tr[data-id]');
+  if (tr) openDetail(tr.dataset.id);
+});
 function boardCards() {
   const q = ($('#bq').value || '').trim().toLowerCase();
   return state.cards.filter(c => {
@@ -853,6 +880,7 @@ function renderBoard() {
   if (!isApp()) return;
   $('#facChips').innerHTML = facChips();
   const cards = boardCards();
+  syncBulkSelection(cards);
   const cols = (state.statuses || []).map(st => {
     const mine = cards.filter(c => c.status === st.value);
     const canBulk = st.value === 'ready_for_stocking' && mine.length > 0;
@@ -868,9 +896,8 @@ function bcardHtml(c, status) {
   const meta = [c.qty != null ? c.qty + ' 個' : null, c.arrival ? '入庫 ' + c.arrival : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
-  const onclick = selectable ? 'toggleBulk(' + Number(c.id) + ')' : "openDetail('" + esc(c.id) + "')";
-  return '<div class="bcard' + (sel ? ' sel' : '') + '" onclick="' + onclick + '">' +
-    '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + ' onclick="event.stopPropagation();toggleBulk(' + Number(c.id) + ')">' : '') +
+  return '<div class="bcard' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+    '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + ' tabindex="-1">' : '') +
     (c.today ? '📌 ' : '') + esc(c.title) + '</h4>' +
     (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') + '</div>';
 }
@@ -898,6 +925,18 @@ function renderBulk() {
   $('#bulkCnt').textContent = (bulkIds ? bulkIds.size : 0) + ' 件';
   $('#bulkBar').classList.toggle('on', !!bulkIds);
 }
+/**
+ * 選んだカードを「いま画面に見えている棚入待ち」だけに保つ (Codex PR-C R1)。
+ * 拠点や検索を変えて見えなくなったカードが選ばれたまま残ると、見ずに棚入完了にしてしまう
+ */
+function syncBulkSelection(visible) {
+  if (!bulkIds) return;
+  const ok = new Set(visible.filter(c => c.status === 'ready_for_stocking').map(c => c.id));
+  let dropped = 0;
+  for (const id of [...bulkIds]) if (!ok.has(id)) { bulkIds.delete(id); dropped++; }
+  if (dropped > 0) toast(dropped + ' 件は絞り込みで見えなくなったので選択から外しました');
+  renderBulk();
+}
 async function doBulkStocked() {
   if (!bulkIds || bulkIds.size === 0) { toast('カードを選んでください'); return; }
   const w = worker;
@@ -909,7 +948,9 @@ async function doBulkStocked() {
     pin = window.prompt(w.display_name + 'さんの職員PIN (' + ids.length + ' 件を棚入完了にします)');
     if (pin == null) return;
   }
-  if (!window.confirm(ids.length + ' 件を棚入完了にします。よろしいですか?')) return;
+  const names = ids.map(id => (findCard(id) || {}).title).filter(Boolean);
+  const list = names.slice(0, 8).join('\n') + (names.length > 8 ? '\n…ほか ' + (names.length - 8) + ' 件' : '');
+  if (!window.confirm(ids.length + ' 件を棚入完了にします。よろしいですか?\n\n' + list)) return;
   const j = await apiFetch('/api/bulk-stocked', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ids, worker_id: w.id, pin }) });
   if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
@@ -934,7 +975,7 @@ async function loadLabelWaits() {
   if (rows.length === 0) { $('#lwBody').innerHTML = '<tr><td colspan="13">' + (lwOpenOnly ? 'ラベル待ちはありません' : '記録はありません') + '</td></tr>'; return; }
   const LOC = { Z: 'Z (一時保管)', Y: 'Y (出荷禁止)', none: 'なし' };
   const yn = v => v ? '✔' : '—';
-  $('#lwBody').innerHTML = rows.map(r => '<tr onclick="openLw(' + Number(r.id) + ')">' +
+  $('#lwBody').innerHTML = rows.map(r => '<tr data-id="' + Number(r.id) + '">' +
     '<td><span class="pill ' + (r.done ? 'ok' : 'wait') + '">' + (r.done ? '完了' : '待ち') + '</span></td>' +
     '<td class="num">' + esc(r.occurred_on || '—') + '</td>' +
     '<td class="wrap">' + esc(r.product_name || '(名称なし)') + '<br><small>' + esc(r.product_code || '') + '</small></td>' +
@@ -1033,7 +1074,7 @@ async function loadHistory() {
   $('#histSum').textContent = j.total + ' 件' + (rows.length < j.total ? ' (新しい ' + rows.length + ' 件を表示)' : '');
   if (rows.length === 0) { $('#histBody').innerHTML = '<tr><td colspan="8">この期間の記録はありません</td></tr>'; return; }
   const CLOSE = { stocked: '棚入完了', cancelled: '取消', out_of_scope: '在庫化対象外' };
-  $('#histBody').innerHTML = rows.map(r => '<tr onclick="openDetail(' + Number(r.id) + ')">' +
+  $('#histBody').innerHTML = rows.map(r => '<tr data-id="' + Number(r.id) + '">' +
     '<td class="num">' + esc(fmtDateTime(r.closed_at)) + '</td>' +
     '<td class="wrap">' + esc(r.title) + '<br><small>' + esc(r.product_code || '') + '</small></td>' +
     '<td class="num">' + (r.qty == null ? '—' : esc(r.qty)) + '</td>' +

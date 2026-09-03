@@ -450,22 +450,36 @@ router.post('/api/bulk-stocked', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
+/** JST の日付 (YYYY-MM-DD) */
+const jstDay = (d) => new Date(d.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+
 /** 履歴 (終了したカード。一覧には出さないので、ここで期間・商品名で探す)。アプリ正本のみ */
 router.get('/api/history', api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
-  const day = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : null);
+  // YYYY-MM-DD かつ**実在する日**だけ受ける (2026-99-99 や 2026-02-30 は Date が例外・別の日に化ける — Codex PR-C R1)
+  const day = (v) => {
+    const t = String(v == null ? '' : v).trim();
+    if (!t) return undefined;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) return null;
+    const d = new Date(`${t}T00:00:00+09:00`);
+    if (Number.isNaN(d.getTime())) return null;
+    return jstDay(d) === t ? t : null;   // 2026-02-30 → 3/2 に正規化されたら不正
+  };
   const from = day(req.query.from);
   const to = day(req.query.to);
+  if (from === null || to === null) return res.status(400).json({ ok: false, error: 'bad_request', message: '日付は YYYY-MM-DD (実在する日) で指定してください' });
+  const jstStart = (d) => new Date(`${d}T00:00:00+09:00`).toISOString();
+  // closed_at は UTC の ISO。JST の日付で絞る。**終了日はその日を含む** ので翌日 00:00 JST が上限
+  const nextDay = (d) => jstDay(new Date(new Date(`${d}T00:00:00+09:00`).getTime() + 86400000));
   res.json({
     ok: true,
-    // closed_at は UTC の ISO。JST の日付で絞るので 9 時間ずらす (from の 00:00 JST = 前日 15:00 UTC)
     ...buildHistory({
-      from: from ? new Date(`${from}T00:00:00+09:00`).toISOString() : null,
-      to: to ? new Date(`${to}T00:00:00+09:00`).toISOString() : null,
+      from: from ? jstStart(from) : null,
+      to: to ? jstStart(nextDay(to)) : null,
       q: req.query.q ? String(req.query.q).slice(0, 100) : null,
       limit: req.query.limit,
     }),
-    fromDate: from, toDate: to,
+    fromDate: from || null, toDate: to || null,
   });
 }));
 
