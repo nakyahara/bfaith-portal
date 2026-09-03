@@ -187,7 +187,7 @@ const mkCtx = () => ({ ...ctx });
 }
 {
   const text = buildMessage({ alerts: [mkAlert({ orderNos: [] })], awaitingPayment: 0, seenToday: 1, stale: false, ctx: mkCtx() });
-  ok(text.includes('注文番号 100'), '注文番号が取れない行は梱包番号で代用する (空欄にしない)');
+  ok(text.includes('注文番号 不明 (梱包番号 100)'), '注文番号が取れない行は「不明」と明示し梱包番号を添える (梱包番号を注文番号と偽らない)');
 }
 {
   const text = buildMessage({ alerts: [mkAlert({ hasTracking: true })], awaitingPayment: 0, seenToday: 1, stale: false, ctx: mkCtx() });

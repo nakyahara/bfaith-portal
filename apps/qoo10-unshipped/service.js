@@ -231,9 +231,14 @@ function truncate(s, n) {
   return str.length > n ? `${str.slice(0, n)}…` : str;
 }
 
-/** 注文番号の表示。1梱包に複数の注文番号が入っていれば全部並べて「同梱」と添える */
+/**
+ * 注文番号の表示。1梱包に複数の注文番号が入っていれば全部並べて「同梱」と添える。
+ * 注文番号が取れない行は梱包番号を「注文番号」として出さない (QSMで検索できず誤誘導になる。Codexレビュー)。
+ * 「注文番号不明」と明示して梱包番号を添える。
+ */
 function orderNoLabel(o) {
-  const nos = Array.isArray(o.orderNos) && o.orderNos.length ? o.orderNos : [o.packNo];
+  const nos = Array.isArray(o.orderNos) ? o.orderNos.filter(Boolean) : [];
+  if (!nos.length) return `不明 (梱包番号 ${o.packNo})`;
   return nos.length > 1 ? `${nos.join(', ')} (同梱${nos.length}件)` : String(nos[0]);
 }
 
