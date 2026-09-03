@@ -36,6 +36,40 @@ let attrsSource = async () => {
 };
 export function _setAttrsSource(fn) { attrsSource = fn; }
 
+/** 直近の実行結果 (管理画面の診断用。run_id → {at, ...result}) */
+const lastRun = new Map();
+export function getLastRunResult(runId) { return lastRun.get(Number(runId)) || null; }
+
+/**
+ * FNSKU/SKU → ASIN の索引を作る。attrs が読めなければ理由を返す (画像が出ない原因の切り分け用)
+ * @returns { map: Map<'fnsku:X'|'sku:X', {asin}>, count, error }
+ */
+export async function buildAsinIndex() {
+  const map = new Map();
+  try {
+    const rows = await attrsSource();
+    for (const a of rows || []) {
+      if (a.asin) {
+        if (a.fnsku) map.set('fnsku:' + norm(a.fnsku), a);
+        if (a.amazon_sku) map.set('sku:' + norm(a.amazon_sku), a);
+      }
+    }
+    return { map, count: (rows || []).length, error: null };
+  } catch (e) {
+    return { map, count: 0, error: e.message };
+  }
+}
+
+/** 1 行の ASIN を決める: 行の asin (Excel 添付後) → FNSKU → SKU */
+export function resolveAsin(row, index) {
+  if (row.asin) return { asin: row.asin, from: 'row' };
+  const byFnsku = index.get('fnsku:' + norm(row.fnsku));
+  if (byFnsku?.asin) return { asin: byFnsku.asin, from: 'fnsku' };
+  const bySku = row.seller_sku ? index.get('sku:' + norm(row.seller_sku)) : null;
+  if (bySku?.asin) return { asin: bySku.asin, from: 'sku' };
+  return { asin: null, from: null };
+}
+
 /**
  * 画像 URL の検証: https かつ Amazon の画像ホストだけを通す (Codex R13 #5: 任意ホストの画像を iPad に読ませない)。
  * 通らなければ null (= 画像なし扱い)
@@ -71,45 +105,79 @@ const lastRunAt = new Map();
  */
 export async function ensureRunImages(runId, { force = false } = {}) {
   const id = Number(runId);
-  if (!force && !imagesConfigured()) return { skipped: 'not_configured' };
+  const remember = (r) => { lastRun.set(id, { at: new Date().toISOString(), ...r }); return r; };
+  // 設定チェックは force でも省かない (空トークンで miniPC を叩かない — Codex R17 #5)。force が無視するのは
+  // キャッシュの再試行待ちとスロットルだけ
+  if (!imagesConfigured()) return remember({ skipped: 'not_configured', message: 'Render の WAREHOUSE_SERVICE_TOKEN が未設定です (miniPC の SP-API を呼べません)' });
   if (inFlight.has(id)) return { skipped: 'in_flight' };
   if (!force && Date.now() - (lastRunAt.get(id) || 0) < THROTTLE_MS) return { skipped: 'throttled' };
   inFlight.add(id);
   lastRunAt.set(id, Date.now());
   try {
-    const rows = listRowsNeedingImages(id);
-    if (rows.length === 0) return { fetched: 0, failed: 0, none: 0, total: 0 };
-    const attrs = new Map();
-    try {
-      for (const a of await attrsSource()) {
-        if (a.fnsku) attrs.set('fnsku:' + norm(a.fnsku), a);
-        if (a.amazon_sku) attrs.set('sku:' + norm(a.amazon_sku), a);
-      }
-    } catch (e) {
-      console.warn('[fba-box] SKU属性 (ASIN) を読めません — 行の asin だけで画像を取ります:', e.message);
-    }
-    let fetched = 0, failed = 0, none = 0;
+    const opts = force ? { retryAfterMs: 0 } : {};
+    const rows = listRowsNeedingImages(id, opts);
+    if (rows.length === 0) return remember({ fetched: 0, failed: 0, none: 0, total: 0, remaining: 0 });
+    const index = await buildAsinIndex();
+    if (index.error) console.warn('[fba-box] SKU属性 (ASIN) を読めません — 行の asin だけで画像を取ります:', index.error);
+    let fetched = 0, failed = 0, none = 0, noAsin = 0;
+    const errors = [];
     for (const r of rows) {
-      const asin = r.asin || attrs.get('fnsku:' + norm(r.fnsku))?.asin || (r.seller_sku ? attrs.get('sku:' + norm(r.seller_sku))?.asin : null) || null;
-      if (!asin) { upsertProductImage({ fnsku: r.fnsku, asin: null, url: null, status: 'none' }); none++; continue; }
+      const { asin } = resolveAsin(r, index.map);
+      if (!asin) {
+        upsertProductImage({ fnsku: r.fnsku, asin: null, url: null, status: 'none', error: 'ASIN が分かりません (Excel を添付するか SKU マスタを確認)' });
+        none++; noAsin++;
+        continue;
+      }
       try {
-        const url = sanitizeImageUrl(await fetcher(asin));
-        upsertProductImage({ fnsku: r.fnsku, asin, url, status: url ? 'ok' : 'none' });
+        const raw = await fetcher(asin);
+        const url = sanitizeImageUrl(raw);
+        upsertProductImage({ fnsku: r.fnsku, asin, url, status: url ? 'ok' : 'none', error: url ? null : (raw ? `画像URLが対象外: ${String(raw).slice(0, 80)}` : 'Amazon に画像がありません') });
         if (url) fetched++; else none++;
       } catch (e) {
         failed++;
-        upsertProductImage({ fnsku: r.fnsku, asin, url: null, status: 'error' });
+        upsertProductImage({ fnsku: r.fnsku, asin, url: null, status: 'error', error: e.message });
+        if (errors.length < 5) errors.push(`${asin}: ${e.message}`);
         console.warn(`[fba-box] 画像取得失敗 ${asin}: ${e.message}`);
       }
       await new Promise((resolve) => setTimeout(resolve, INTERVAL_MS));
     }
-    return { fetched, failed, none, total: rows.length };
+    // 1 回の上限 (listRowsNeedingImages の limit) を超えて未取得の分だけを残件として数える。
+    // 今回 none/error にしたものは通常の再試行待ち (24h) に入るので数えない (Codex R18 #2)
+    const remaining = listRowsNeedingImages(id).length;
+    return remember({ fetched, failed, none, noAsin, total: rows.length, remaining, attrsCount: index.count, attrsError: index.error, errors });
   } catch (e) {
     console.error('[fba-box] ensureRunImages', e);
-    return { skipped: 'error', error: e.message };
+    return remember({ skipped: 'error', error: e.message });
   } finally {
     inFlight.delete(id);
   }
+}
+
+/**
+ * 画像が出ない原因の切り分け (管理画面から)。取得はせず、いまの状態だけを返す
+ */
+export async function diagnoseRunImages(runId, rows) {
+  const index = await buildAsinIndex();
+  const byFnsku = new Map();
+  for (const r of rows) {
+    const key = norm(r.fnsku);
+    if (!key || byFnsku.has(key)) continue;
+    const { asin, from } = resolveAsin(r, index.map);
+    byFnsku.set(key, { fnsku: r.fnsku, sku: r.seller_sku || null, rowAsin: r.asin || null, asin, asinFrom: from, imageUrl: r.image_url || null });
+  }
+  const items = [...byFnsku.values()];
+  return {
+    configured: imagesConfigured(),
+    warehouseUrl: WAREHOUSE_URL,
+    attrs: { count: index.count, error: index.error },
+    counts: {
+      total: items.length,
+      withImage: items.filter((x) => x.imageUrl).length,
+      noAsin: items.filter((x) => !x.asin).length,
+    },
+    items,
+    lastRun: getLastRunResult(runId),
+  };
 }
 
 /** テスト用: スロットルと実行中フラグを消す */

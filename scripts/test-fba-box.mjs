@@ -213,23 +213,26 @@ t('layer は manual として記録される', () => {
   assert.equal(p.layer_source, 'manual');
 });
 
-// 取消
-t('取消: 自端末の直近は利用者でも可・数が戻る', () => {
+// 取消 (入力ミスの訂正は PIN 不要 — 中原さん 9/3)
+t('取消: 自端末の記録は誰でも取り消せる・数が戻る', () => {
   const r = db.revokePlacement({ placementId: p1.placementId, worker: member, deviceKey: 'dev:1' });
   assert.equal(r.ok, true);
   assert.equal(db.getRunState(runId).rows.find(x => x.id === rowA.id).placed, 5);
 });
-t('取消: 他端末からは staff_required', () => {
+t('取消: 他の端末の記録・時間が経った記録も PIN なしで取り消せる (監査には残る)', () => {
   const p = db.addPlacement({ runId, rowId: rowA.id, boxId: box1.boxId, qty: 3, worker: member, deviceKey: 'dev:1', requestId: 'v1' });
+  db.getDB().prepare(`UPDATE fbx_placements SET created_at = '2020-01-01T00:00:00.000Z' WHERE id = ?`).run(p.placementId);
   const r = db.revokePlacement({ placementId: p.placementId, worker: member, deviceKey: 'dev:2' });
-  assert.equal(r.error, 'staff_required');
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const ev = db.listEvents(5).find((e) => e.action === 'placement_revoke');
+  assert.equal(JSON.parse(ev.payload).otherDevice, true);
 });
-t('取消: 職員は理由必須・理由付きで成功', () => {
+t('取消: 職員として明示的に行う場合だけ理由が要る', () => {
   const p = db.addPlacement({ runId, rowId: rowA.id, boxId: box1.boxId, qty: 2, worker: member, deviceKey: 'dev:1', requestId: 'v2' });
   assert.equal(db.revokePlacement({ placementId: p.placementId, byStaff: true, worker: staff, deviceKey: 'dev:2' }).error, 'reason_required');
   assert.equal(db.revokePlacement({ placementId: p.placementId, byStaff: true, reason: '誤入力', worker: staff, deviceKey: 'dev:2' }).ok, true);
 });
-t('adjustPlacement: 間違えた数を直す = 取消 + 入れ直し (同じ箱)。0 は取消だけ。残数超なら取消ごと戻す。他端末は staff_required', () => {
+t('adjustPlacement: 間違えた数を直す = 取消 + 入れ直し (同じ箱)。0 は取消だけ。残数超なら取消ごと戻す。PIN 不要 (他端末・閉じた箱でも)', () => {
   const p = db.addPlacement({ runId, rowId: rowA.id, boxId: box1.boxId, qty: 4, worker: member, deviceKey: 'dev:1', requestId: 'adj0' });
   const before = db.getRunState(runId).rows.find((x) => x.id === rowA.id).placed;
   const r = db.adjustPlacement({ placementId: p.placementId, qty: 2, worker: member, deviceKey: 'dev:1', deviceLabel: 'iPad1', requestId: 'adj1' });
@@ -244,20 +247,24 @@ t('adjustPlacement: 間違えた数を直す = 取消 + 入れ直し (同じ箱)
   assert.equal(bad.error, 'over_qty');
   assert.equal(db.getRunState(runId).placements.find((x) => x.id === r.placementId).revoked_at, null);
   assert.equal(db.getRunState(runId).rows.find((x) => x.id === rowA.id).placed, before - 2);
-  // 他端末からは職員のみ
-  assert.equal(db.adjustPlacement({ placementId: r.placementId, qty: 1, worker: member, deviceKey: 'dev:2', requestId: 'adj3' }).error, 'staff_required');
-  const st2 = db.adjustPlacement({ placementId: r.placementId, qty: 1, byStaff: true, worker: staff, deviceKey: 'dev:2', requestId: 'adj4' });
+  // 他端末からでも PIN なしで直せる
+  const st2 = db.adjustPlacement({ placementId: r.placementId, qty: 1, worker: member, deviceKey: 'dev:2', requestId: 'adj4' });
   assert.equal(st2.ok, true, JSON.stringify(st2));
-  // 閉じた箱の記録: 利用者は不可、職員は同じ箱に入れ直せる (boxClosed フラグ付き)
+  // 閉じた箱の記録も直せる → 箱が自動で開き実測重量が消える (量り直し)
   db.closeBox({ boxId: box1.boxId, measuredKg: 9.9, worker: staff });
-  assert.equal(db.adjustPlacement({ placementId: st2.placementId, qty: 2, worker: member, deviceKey: 'dev:1', requestId: 'adj-c1' }).error, 'staff_required');
-  const cl = db.adjustPlacement({ placementId: st2.placementId, qty: 2, byStaff: true, worker: staff, deviceKey: 'dev:2', requestId: 'adj-c2' });
-  assert.equal(cl.ok, true, JSON.stringify(cl)); assert.equal(cl.boxClosed, true);
+  const cl = db.adjustPlacement({ placementId: st2.placementId, qty: 2, worker: member, deviceKey: 'dev:1', requestId: 'adj-c2' });
+  assert.equal(cl.ok, true, JSON.stringify(cl)); assert.equal(cl.boxReopened, true);
+  const bx1 = db.getRunState(runId).boxes.find((x) => x.id === box1.boxId);
+  assert.equal(bx1.status, 'open'); assert.equal(bx1.measured_weight_kg, null);
   assert.equal(db.getRunState(runId).placements.find((x) => x.id === cl.placementId).box_id, box1.boxId);
-  // 0 = 取消だけ (閉じた箱のままなので boxClosed も返る = 量り直し案内)
-  const z = db.adjustPlacement({ placementId: cl.placementId, qty: 0, byStaff: true, worker: staff, deviceKey: 'dev:2', requestId: 'adj5' });
-  assert.equal(z.ok, true); assert.equal(z.placementId, null); assert.equal(z.boxClosed, true); assert.equal(z.from, 2);
-  db.reopenBox({ boxId: box1.boxId, reason: 'テスト', worker: staff });
+  // 再送 (通信断のリトライ) は同じ結果を返す — 二重に直さない
+  const again = db.adjustPlacement({ placementId: st2.placementId, qty: 2, worker: member, deviceKey: 'dev:1', requestId: 'adj-c2' });
+  assert.equal(again.ok, true); assert.equal(again.already, true); assert.equal(again.placementId, cl.placementId);
+  // 0 = 取消だけ。その再送も成功で返る
+  const z = db.adjustPlacement({ placementId: cl.placementId, qty: 0, worker: member, deviceKey: 'dev:1', requestId: 'adj5' });
+  assert.equal(z.ok, true); assert.equal(z.placementId, null); assert.equal(z.from, 2);
+  const zAgain = db.adjustPlacement({ placementId: cl.placementId, qty: 0, worker: member, deviceKey: 'dev:1', requestId: 'adj5' });
+  assert.equal(zAgain.ok, true); assert.equal(zAgain.already, true);
   assert.equal(db.getRunState(runId).rows.find((x) => x.id === rowA.id).placed, before - 4);
   assert.ok(db.listEvents(30).some((e) => e.action === 'placement_adjust'));
 });
@@ -269,6 +276,22 @@ t('box_seq は取消後も再利用しない', () => {
 });
 
 // 箱クローズ
+t('closeBox: 読み合わせ中に中身が変わっていたら閉じさせない (box_changed)', () => {
+  const v0 = db.getBox(box1.boxId).content_version;
+  const p = db.addPlacement({ runId, rowId: rowA.id, boxId: box1.boxId, qty: 1, worker: member, deviceKey: 'dev:1', requestId: 'cv1' });
+  assert.equal(p.ok, true);
+  const v1 = db.getBox(box1.boxId).content_version;
+  assert.equal(v1, v0 + 1, '割当で版が上がる');
+  const stale = db.closeBox({ boxId: box1.boxId, measuredKg: 5, worker: staff, expectedContentVersion: v0 });
+  assert.equal(stale.error, 'box_changed');
+  assert.equal(stale.contentVersion, v1);
+  db.revokePlacement({ placementId: p.placementId, worker: member, deviceKey: 'dev:1' });
+  assert.equal(db.getBox(box1.boxId).content_version, v1 + 1, '取消でも版が上がる');
+  // 版を合わせれば閉じられる
+  const v2 = db.getBox(box1.boxId).content_version;
+  assert.equal(db.closeBox({ boxId: box1.boxId, measuredKg: 5, worker: staff, expectedContentVersion: v2 }).ok, true);
+  db.reopenBox({ boxId: box1.boxId, reason: 'テスト戻し', worker: staff });
+});
 t('closeBox: 実測kg必須・不正値拒否', () => {
   assert.equal(db.closeBox({ boxId: box1.boxId, measuredKg: 0, worker: staff }).error, 'bad_weight');
   assert.equal(db.closeBox({ boxId: box1.boxId, measuredKg: 'x', worker: staff }).error, 'bad_weight');
@@ -279,10 +302,21 @@ t('closeBox 成功 → 以後の割当は box_closed', () => {
   const add = db.addPlacement({ runId, rowId: rowA.id, boxId: box1.boxId, qty: 1, worker: member, deviceKey: 'dev:1', requestId: 'c1' });
   assert.equal(add.error, 'box_closed');
 });
-t('閉じた箱の割当取消は職員のみ', () => {
+t('閉じた箱の割当も PIN なしで取り消せる → 箱が開いて実測重量が消える (量り直し)', () => {
   const st = db.getRunState(runId);
   const p = st.placements.find(x => x.box_id === box1.boxId);
-  assert.equal(db.revokePlacement({ placementId: p.id, worker: member, deviceKey: 'dev:1' }).error, 'staff_required');
+  const before = st.rows.find(x => x.id === p.row_id).placed;
+  assert.equal(st.boxes.find(x => x.id === box1.boxId).status, 'closed');
+  const r = db.revokePlacement({ placementId: p.id, worker: member, deviceKey: 'dev:1' });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.boxReopened, true);
+  const b = db.getRunState(runId).boxes.find(x => x.id === box1.boxId);
+  assert.equal(b.status, 'open'); assert.equal(b.measured_weight_kg, null);
+  assert.ok(db.listEvents(5).some(e => e.action === 'box_reopen' && JSON.parse(e.payload || '{}').auto === true));
+  // 戻す (以降のテストの前提 = 中身のある閉じた箱 を保つ)
+  db.addPlacement({ runId, rowId: p.row_id, boxId: p.box_id, qty: p.qty, expiry: p.expiry, worker: member, deviceKey: 'dev:1', requestId: 'restore-' + p.id });
+  assert.equal(db.getRunState(runId).rows.find(x => x.id === p.row_id).placed, before);
+  assert.equal(db.closeBox({ boxId: box1.boxId, measuredKg: 12.4, worker: staff }).ok, true);
 });
 t('reopenBox: 理由必須・実測がクリアされ再クローズ要', () => {
   const before = db.getRunState(runId).boxes.find(x => x.id === box1.boxId).reopen_count;
