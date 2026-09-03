@@ -1,13 +1,16 @@
 /**
- * いろは在庫化作業アプリ — Notion → f_iroha_tasks の移行ツール (要件定義 v1.1 §F / Codex 設計相談 R3)
+ * いろは在庫化作業アプリ — Notion → f_iroha_tasks の移行ツール (要件定義 v1.1 §F / Codex 設計相談 R3 / レビュー A1 R1)
  *
- * 手順 (全て管理画面から。本取込以外は DB を書き換えない):
+ * 手順 (全て管理画面から。本取込以外は Notion もローカル DB も書き換えない):
  *   1. survey  : Notion の全ページを取得して実態を集計 (ステータス別件数・未知値・台帳キー/destination の欠落と重複・
- *                作業時間/写真の孤立)。原本 JSON を DATA_DIR/iroha-migration/ に保存 (移行事故時の証跡)
- *   2. plan    : 各ページの写像 (mapLegacyStatus) と取込可否・要確認・警告を行にする = dry-run。CSV でも出せる
- *   3. apply   : 取込可の行を 1 トランザクションで upsert (notion_page_id で冪等) → sessions/media/events の task_id をバックフィル
- *   4. reconcile: Notion の page ID 集合と tasks の集合差分 (取込済 + 明示除外 + 要確認 = 全件 になるか)
- *   差分取込 = since (last_edited_time) 付きで 1〜3 を回す (切替直前に実行)。同時刻境界の取りこぼしを避けるため数分前から
+ *                作業時間/写真の孤立)。**Notion の生レスポンス**を DATA_DIR/iroha-migration/survey-raw-*.json に保存
+ *                (parser に不具合があっても再解析できる証跡)。スキーマは checkCardSchema で検証だけ (PATCH しない)
+ *   2. plan    : 各ページの写像 (mapLegacyStatus) と取込可否・要確認・警告を行にする = dry-run。既存 tasks との
+ *                destination 衝突もここで分類 (衝突は destination を外して要確認)。CSV でも出せる
+ *   3. apply   : 取込可の行を 1 トランザクションで upsert (notion_page_id で冪等) → sessions/media/events の task_id を
+ *                バックフィル。途中で一意制約や不変条件に当たれば全部戻す
+ *   4. reconcile: 全件照合 (mode=full: 欠けも余りも 0 で balanced) と差分照合 (mode=delta: 欠け 0 のみ)
+ *   差分取込 = since〜cutoff (取得開始時刻) の窓で 1〜3 を回し、次回は cutoff を since にする。取得は last_edited_time 昇順で固定
  *
  * ⚠ 完了カード (棚入完了/対象外/取消) も closed として取り込む (作業時間・写真の履歴のため。一覧には出ない — 中原さん 9/3)
  */
@@ -15,33 +18,44 @@ import fs from 'fs';
 import path from 'path';
 import { getDB } from './db.js';
 import { queryPages, parsePage } from './notion-read.js';
-import { ensureCardSchema, isNotionConfigured } from '../inbound-check/notion.js';
+import { checkCardSchema, isNotionConfigured } from '../inbound-check/notion.js';
 import { mapLegacyStatus, DEFAULT_FACILITY, OPEN_STATUSES } from './tasks.js';
 import { upsertTaskFromImport, backfillTaskIds, listOrphans, countTasksByStatus } from './tasks-db.js';
 
 const MIG_DIR = process.env.DATA_DIR ? path.join(process.env.DATA_DIR, 'iroha-migration') : 'data/iroha-migration';
 const MAX_PAGES = 100;   // 100 × 100 = 10,000 枚まで (完了カードが溜まっている想定)
 const STATUS_PROP = 'ステータス';
+const SORTS = [{ timestamp: 'last_edited_time', direction: 'ascending' }];
 
 const utcNow = () => new Date().toISOString();
 const numOrNull = (v) => (v == null || v === '' || Number.isNaN(Number(v)) ? null : Number(v));
+const tsName = (iso) => iso.replace(/[:.]/g, '-');
 
 /**
- * Notion の全ページ (アーカイブ除く) を取得してパース。since を渡すと last_edited_time 以降だけ (差分取込)
- * @returns {{pages: Array, truncated: boolean, fetchedAt: string}}
+ * Notion の全ページ (アーカイブ除く) を取得してパース。since を渡すと since〜cutoff (取得開始時刻) の窓だけ (差分取込)。
+ * スキーマは検証だけで書き換えない (Codex A1 R1 #1)
+ * @returns {{pages: Array, rawPages: Array, truncated: boolean, fetchedAt: string, since: string|null, cutoff: string}}
  */
 export async function fetchAllPages({ since = null } = {}) {
   if (!isNotionConfigured()) throw new Error('Notion 連携が未設定です (NOTION_TOKEN / INBOUND_CHECK_NOTION_DB_ID)');
-  await ensureCardSchema();
-  const filter = since ? { timestamp: 'last_edited_time', last_edited_time: { on_or_after: new Date(since).toISOString() } } : null;
-  const r = await queryPages(filter, MAX_PAGES);
-  const pages = r.results.map((p) => ({ ...parsePage(p), createdTime: p.created_time || null, archived: !!p.archived }));
-  return { pages, truncated: r.truncated, fetchedAt: utcNow() };
+  await checkCardSchema();
+  const cutoff = utcNow();   // 窓の上限を取得開始時点で固定 (走査中の編集は次回の差分で拾う — Codex A1 R1 #6)
+  let filter = null;
+  if (since) {
+    filter = { and: [
+      { timestamp: 'last_edited_time', last_edited_time: { on_or_after: new Date(since).toISOString() } },
+      { timestamp: 'last_edited_time', last_edited_time: { on_or_before: cutoff } },
+    ] };
+  }
+  const r = await queryPages(filter, MAX_PAGES, { sorts: SORTS });
+  const rawPages = r.results;
+  const pages = rawPages.map((p) => ({ ...parsePage(p), createdTime: p.created_time || null, archived: !!p.archived }));
+  return { pages, rawPages, truncated: r.truncated, fetchedAt: cutoff, since, cutoff };
 }
 
-/** 実態調査 (Notion を読むだけ。原本 JSON を保存) */
+/** 実態調査 (Notion を読むだけ。生レスポンスと集計を保存) */
 export async function surveyNotion({ since = null, save = true } = {}) {
-  const { pages, truncated, fetchedAt } = await fetchAllPages({ since });
+  const { pages, rawPages, truncated, fetchedAt, cutoff } = await fetchAllPages({ since });
   const db = getDB();
   const byStatus = {};
   const issues = { unknownStatus: [], noProductCode: [], noDedupeKey: [], noDestination: [], dupDestination: [], dupDedupe: [] };
@@ -54,37 +68,58 @@ export async function surveyNotion({ since = null, save = true } = {}) {
     if (!p.dedupeKey) issues.noDedupeKey.push({ pageId: p.pageId, title: p.title });
     const dest = numOrNull(p.props.destination_id);
     if (dest == null) issues.noDestination.push({ pageId: p.pageId, title: p.title });
-    else { if (seenDest.has(dest)) issues.dupDestination.push({ destinationId: dest, pageIds: [seenDest.get(dest), p.pageId] }); else seenDest.set(dest, p.pageId); }
-    if (p.dedupeKey) { if (seenDedupe.has(p.dedupeKey)) issues.dupDedupe.push({ dedupeKey: p.dedupeKey, pageIds: [seenDedupe.get(p.dedupeKey), p.pageId] }); else seenDedupe.set(p.dedupeKey, p.pageId); }
+    else if (seenDest.has(dest)) issues.dupDestination.push({ destinationId: dest, pageIds: [seenDest.get(dest), p.pageId] });
+    else seenDest.set(dest, p.pageId);
+    if (p.dedupeKey) {
+      if (seenDedupe.has(p.dedupeKey)) issues.dupDedupe.push({ dedupeKey: p.dedupeKey, pageIds: [seenDedupe.get(p.dedupeKey), p.pageId] });
+      else seenDedupe.set(p.dedupeKey, p.pageId);
+    }
   }
-  // 作業時間・写真・履歴が参照している page_id のうち、今回の取得に無いもの (= 削除/アーカイブ済み or 別 DB)
+  // 孤立 = DB 基準 (task に紐づいていない page_id)。全件調査のときだけ「Notion にも無い」も出す
+  // (差分調査では未更新の正常ページが取得に入らないため — Codex A1 R1 #15)
+  const unlinked = (table) => db.prepare(`SELECT DISTINCT page_id FROM ${table} WHERE task_id IS NULL AND page_id IS NOT NULL`).all().map((r) => r.page_id);
   const pageIds = new Set(pages.map((p) => p.pageId));
-  const orphan = (table) => db.prepare(`SELECT DISTINCT page_id FROM ${table} WHERE page_id IS NOT NULL`).all().map((r) => r.page_id).filter((id) => !pageIds.has(id));
-  const orphans = { sessions: orphan('f_iroha_work_sessions'), media: orphan('f_iroha_card_media') };
-  let file = null;
+  const orphans = { unlinked: { sessions: unlinked('f_iroha_work_sessions'), media: unlinked('f_iroha_card_media') } };
+  if (!since) {
+    orphans.missingInNotion = {
+      sessions: orphans.unlinked.sessions.filter((id) => !pageIds.has(id)),
+      media: orphans.unlinked.media.filter((id) => !pageIds.has(id)),
+    };
+  }
+  let file = null, rawFile = null;
   if (save) {
     fs.mkdirSync(MIG_DIR, { recursive: true });
-    file = path.join(MIG_DIR, `survey-${fetchedAt.replace(/[:.]/g, '-')}.json`);
-    fs.writeFileSync(file, JSON.stringify({ fetchedAt, since, truncated, count: pages.length, byStatus, issues, orphans, pages }, null, 1));
+    rawFile = path.join(MIG_DIR, `survey-raw-${tsName(fetchedAt)}.json`);
+    fs.writeFileSync(rawFile, JSON.stringify({ fetchedAt, since, cutoff, truncated, count: rawPages.length, pages: rawPages }));
+    file = path.join(MIG_DIR, `survey-${tsName(fetchedAt)}.json`);
+    fs.writeFileSync(file, JSON.stringify({ fetchedAt, since, cutoff, truncated, count: pages.length, byStatus, issues, orphans, pages }, null, 1));
   }
-  return { fetchedAt, since, truncated, count: pages.length, byStatus, issues, orphans, file, pages };
+  return { fetchedAt, since, cutoff, truncated, count: pages.length, byStatus, issues, orphans, file, rawFile, pages };
 }
 
 /**
- * 写像 (dry-run)。1 ページ = 1 行。will_import=false の行は apply で飛ばす (rejected / destination 重複の 2 枚目以降は
- * destination_id を外して取り込む)。
+ * 写像 (dry-run)。1 ページ = 1 行。will_import=false の行は apply で飛ばす。
+ * destination_id の衝突 (今回の取得内の重複 / 既存 tasks で別ページが持っている) は destination_id を外して取り込み、要確認にする
+ * — apply が一意制約で丸ごと戻らないようにここで分類する (Codex A1 R1 #3)
  */
-export function planImport(pages) {
+export function planImport(pages, { existingByDestination = null } = {}) {
+  const existing = existingByDestination || new Map(getDB().prepare('SELECT id, destination_id, notion_page_id FROM f_iroha_tasks WHERE destination_id IS NOT NULL').all()
+    .map((r) => [r.destination_id, r]));
   const rows = [];
   const seenDest = new Map();
   for (const p of pages) {
     const legacy = p.props[STATUS_PROP] || '';
     const m = mapLegacyStatus(legacy);
     const warnings = [];
+    let review = m.confidence === 'needs_review';
     let destinationId = numOrNull(p.props.destination_id);
     if (destinationId == null) warnings.push('no_destination');
-    else if (seenDest.has(destinationId)) { warnings.push(`dup_destination:${seenDest.get(destinationId)}`); destinationId = null; }
-    else seenDest.set(destinationId, p.pageId);
+    else if (seenDest.has(destinationId)) { warnings.push(`dup_destination:${seenDest.get(destinationId)}`); destinationId = null; review = true; }
+    else {
+      const ex = existing.get(destinationId);
+      if (ex && ex.notion_page_id !== p.pageId) { warnings.push(`dup_destination_db:task${ex.id}`); destinationId = null; review = true; }
+      else seenDest.set(destinationId, p.pageId);
+    }
     if (!p.productCode) warnings.push('no_product_code');
     if (p.props['数量'] == null) warnings.push('no_qty');
     if (m.confidence === 'needs_review') warnings.push('needs_review');
@@ -110,7 +145,7 @@ export function planImport(pages) {
       payload: props,
       started_at: startedAt, ready_at: readyAt, closed_at: closedAt,
       mapping_confidence: m.confidence, mapping_note: m.note || null, warnings,
-      migration_review: m.confidence === 'needs_review' ? 1 : 0,
+      migration_review: review ? 1 : 0,
       will_import: m.confidence !== 'rejected',
       skip_reason: m.confidence === 'rejected' ? m.note : null,
       url: p.url || null, last_edited_time: p.lastEditedTime || null,
@@ -136,13 +171,14 @@ export function planToCsv(rows) {
 
 /**
  * 本取込。will_import の行だけ、1 トランザクションで upsert (冪等) → task_id バックフィル。
- * 途中で不変条件違反が出たら全部戻す (半端な状態を残さない)
+ * 途中で一意制約・不変条件に当たったら全部戻す (半端な状態を残さない)。
+ * 証跡ファイルの書き込みは DB の commit 後 — 失敗しても取込は成功として返し、journal に理由を載せる (Codex A1 R1 #13)
  */
 export function applyImport(rows, { batchId = null, actor = null } = {}) {
   const db = getDB();
-  const id = batchId || `mig-${utcNow().replace(/[:.]/g, '-')}`;
+  const id = batchId || `mig-${tsName(utcNow())}`;
   const now = utcNow();
-  const out = { batchId: id, inserted: 0, updated: 0, kept: 0, skipped: 0, backfill: null, at: now, actor };
+  const out = { batchId: id, inserted: 0, updated: 0, kept: 0, skipped: 0, backfill: null, at: now, actor, journal: null };
   db.transaction(() => {
     for (const r of rows) {
       if (!r.will_import) { out.skipped++; continue; }
@@ -158,29 +194,37 @@ export function applyImport(rows, { batchId = null, actor = null } = {}) {
     }
     out.backfill = backfillTaskIds();
   })();
-  fs.mkdirSync(MIG_DIR, { recursive: true });
-  fs.writeFileSync(path.join(MIG_DIR, `apply-${id}.json`), JSON.stringify({ ...out, rows: rows.map((r) => ({ page: r.notion_page_id, status: r.mapped_status, will: r.will_import, warnings: r.warnings })) }, null, 1));
+  try {
+    fs.mkdirSync(MIG_DIR, { recursive: true });
+    fs.writeFileSync(path.join(MIG_DIR, `apply-${id}.json`),
+      JSON.stringify({ ...out, rows: rows.map((r) => ({ page: r.notion_page_id, status: r.mapped_status, will: r.will_import, warnings: r.warnings })) }, null, 1));
+    out.journal = 'saved';
+  } catch (e) {
+    out.journal = `failed: ${e.message}`;
+    console.error('[iroha-work migration] 取込は完了したが証跡ファイルを書けませんでした', e);
+  }
   return out;
 }
 
 /**
  * 照合: Notion の page ID 集合と tasks の集合差分。
- *   missing = 取込対象なのに tasks に無い / extra = tasks にあるが Notion に無い (削除・アーカイブ) / rejected = 取り込まない
+ *   mode=full  : 全件調査の結果に対して。missing (取込対象なのに無い) も extra (tasks にあるが Notion に無い = 削除/アーカイブ) も 0 で balanced
+ *   mode=delta : 差分調査の結果に対して。rows は窓の中だけなので extra は評価しない (missing 0 で balanced) — Codex A1 R1 #4
  */
-export function reconcile(rows) {
+export function reconcile(rows, { mode = 'full' } = {}) {
   const db = getDB();
   const taskPages = new Set(db.prepare('SELECT notion_page_id FROM f_iroha_tasks WHERE notion_page_id IS NOT NULL').all().map((r) => r.notion_page_id));
   const notionPages = new Set(rows.map((r) => r.notion_page_id));
   const missing = rows.filter((r) => r.will_import && !taskPages.has(r.notion_page_id)).map((r) => r.notion_page_id);
   const rejected = rows.filter((r) => !r.will_import).map((r) => r.notion_page_id);
-  const extra = [...taskPages].filter((id) => !notionPages.has(id));
+  const extra = mode === 'full' ? [...taskPages].filter((id) => !notionPages.has(id)) : null;
   const counts = countTasksByStatus();
   const notionOpen = rows.filter((r) => r.will_import && OPEN_STATUSES.includes(r.mapped_status)).length;
   return {
-    notionTotal: rows.length, notionOpen, willImport: rows.length - rejected.length,
+    mode, notionTotal: rows.length, notionOpen, willImport: rows.length - rejected.length,
     tasksTotal: counts.total, tasksByStatus: counts.byStatus, tasksWithPage: taskPages.size,
-    missing, rejected, extra, orphans: listOrphans(50),
-    balanced: missing.length === 0 && (rows.length === (rows.length - rejected.length) + rejected.length),
+    missing, rejected, extra, unlinked: listOrphans(50),
+    balanced: missing.length === 0 && (mode !== 'full' || extra.length === 0),
   };
 }
 

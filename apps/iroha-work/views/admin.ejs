@@ -297,28 +297,34 @@
     }
     function setMsg(id, kind, text) { const el = document.getElementById(id); el.className = 'msg ' + kind; el.textContent = text; }
 
+    let migPlanId = null;   // 自分が見た調査結果の ID (本取込はこれと一致する結果にだけ)
     function migShow(obj) { const el = document.getElementById('migOut'); el.style.display = 'block'; el.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1); }
     async function migSurvey() {
       const since = document.getElementById('migSince').value.trim();
       setMsg('migMsg', '', '調査中… (Notion を全件読みます。数十秒かかることがあります)');
       const { status, json } = await post('/admin/migration/survey', { since: since || null });
-      if (!json.ok) { setMsg('migMsg', 'err', json.message || ('調査に失敗 (' + status + ')')); migShow(json); return; }
-      setMsg('migMsg', json.truncated ? 'err' : 'ok', (json.truncated ? '⚠ 取得が打ち切られました (上限超え) ' : '') + json.count + ' 枚を調査しました (DB は変えていません)');
-      migShow({ 取得: json.at, 差分起点: json.since, 枚数: json.count, ステータス別: json.byStatus, 写像の内訳: json.summary.byMapped,
-        取込予定: json.summary.willImport, 取り込まない: json.summary.rejected, 要確認: json.summary.needsReview, 警告: json.summary.warnings,
-        データの問題: json.issues, 孤立: json.orphans, 照合: { 欠け: json.reconcile.missing.length, 余り: json.reconcile.extra.length, tasks: json.reconcile.tasksByStatus },
-        要確認と取り込まない行: json.review, 保存ファイル: json.file });
+      if (!json.ok) { migPlanId = null; setMsg('migMsg', 'err', json.message || ('調査に失敗 (' + status + ')')); migShow(json); return; }
+      migPlanId = json.planId;
+      setMsg('migMsg', json.truncated ? 'err' : 'ok', (json.truncated ? '⚠ 取得が打ち切られました (上限超え) ' : '') + json.count + ' 枚を調査しました (Notion も DB も変えていません)。調査ID ' + json.planId);
+      migShow({ 調査ID: json.planId, 取得: json.at, 差分起点: json.since, 次回の差分起点: json.nextSince, 枚数: json.count, ステータス別: json.byStatus,
+        写像の内訳: json.summary.byMapped, 取込予定: json.summary.willImport, 取り込まない: json.summary.rejected, 要確認: json.summary.needsReview, 警告: json.summary.warnings,
+        データの問題: json.issues, 孤立: json.orphans,
+        照合: { 方式: json.reconcile.mode, 欠け: json.reconcile.missing.length, 余り: json.reconcile.extra == null ? '(差分では評価しない)' : json.reconcile.extra.length, 釣り合い: json.reconcile.balanced, tasks: json.reconcile.tasksByStatus },
+        要確認と取り込まない行: json.review, 保存ファイル: { 集計: json.file, 生データ: json.rawFile } });
     }
     async function migApply() {
       const confirm = document.getElementById('migConfirm').value.trim();
       if (confirm !== 'APPLY') { setMsg('migMsg', 'err', '本取込するには APPLY と入力してください'); return; }
-      if (!window.confirm('直近の調査結果を f_iroha_tasks に取り込みます。よろしいですか?')) return;
+      if (!migPlanId) { setMsg('migMsg', 'err', '先にこの画面で「調査 (dry-run)」を実行してください'); return; }
+      if (!window.confirm('調査ID ' + migPlanId + ' の結果を f_iroha_tasks に取り込みます。よろしいですか?')) return;
       setMsg('migMsg', '', '取込中…');
-      const { status, json } = await post('/admin/migration/apply', { confirm });
+      const { status, json } = await post('/admin/migration/apply', { confirm, plan_id: migPlanId });
       if (!json.ok) { setMsg('migMsg', 'err', json.message || ('取込に失敗 (' + status + ')')); migShow(json); return; }
-      setMsg('migMsg', 'ok', '取り込みました: 追加 ' + json.inserted + ' / 更新 ' + json.updated + ' / 変化なし ' + json.kept + ' / 飛ばした ' + json.skipped);
+      setMsg('migMsg', 'ok', '取り込みました: 追加 ' + json.inserted + ' / 更新 ' + json.updated + ' / 変化なし ' + json.kept + ' / 飛ばした ' + json.skipped
+        + (json.journal === 'saved' ? '' : ' (⚠ 証跡ファイル: ' + json.journal + ')') + '。次回の差分起点: ' + json.nextSince);
       migShow(json);
       document.getElementById('migConfirm').value = '';
+      document.getElementById('migSince').value = json.nextSince || '';
     }
     async function addOption(kind) {
       const code = document.getElementById('opt-' + kind).value.trim();

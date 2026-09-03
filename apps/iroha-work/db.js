@@ -162,7 +162,7 @@ export function createTables(db = getMirrorDB()) {
       legacy_status    TEXT,
       status           TEXT NOT NULL CHECK (status IN ('not_started','in_progress','on_hold','ready_for_stocking','closed')),
       close_reason     TEXT CHECK (close_reason IS NULL OR close_reason IN ('stocked','cancelled','out_of_scope')),
-      facility_code    TEXT NOT NULL DEFAULT 'iroha',
+      facility_code    TEXT NOT NULL DEFAULT 'iroha' REFERENCES f_iroha_facilities(code),
       hold_reason_code TEXT CHECK (hold_reason_code IS NULL OR hold_reason_code IN ('materials_shortage','label_shortage','awaiting_instruction','other')),
       hold_reason_note TEXT,
       planned_date     TEXT,
@@ -192,7 +192,12 @@ export function createTables(db = getMirrorDB()) {
       created_at       TEXT NOT NULL,
       created_by       TEXT,
       updated_at       TEXT NOT NULL,
-      updated_by       TEXT
+      updated_by       TEXT,
+      -- 状態の不変条件は DB でも守る (サービス層 validateTaskInvariants と同じ規則。一経路の検証漏れで壊れない — Codex A1 R1 #7)
+      CHECK ((status = 'closed') = (close_reason IS NOT NULL)),
+      CHECK ((status = 'closed') = (closed_at IS NOT NULL)),
+      CHECK ((status = 'on_hold') = (hold_reason_code IS NOT NULL)),
+      CHECK (hold_reason_code IS NULL OR hold_reason_code <> 'other' OR (hold_reason_note IS NOT NULL AND TRIM(hold_reason_note) <> ''))
     );
     CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_tasks_destination ON f_iroha_tasks(destination_id) WHERE destination_id IS NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_tasks_notion ON f_iroha_tasks(notion_page_id) WHERE notion_page_id IS NOT NULL;
@@ -202,7 +207,7 @@ export function createTables(db = getMirrorDB()) {
     -- ラベル待ち (『ラベル待ち管理.xlsx』の DB 化。要件 v1.1 §C)。保留理由 label_shortage に付随する追跡
     CREATE TABLE IF NOT EXISTS f_iroha_label_waits (
       id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-      task_id               INTEGER NOT NULL,
+      task_id               INTEGER NOT NULL REFERENCES f_iroha_tasks(id),
       occurred_on           TEXT,
       recorded_by_worker_id INTEGER,
       recorded_by_name      TEXT,
@@ -350,10 +355,11 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_card_media', 'unavailable_at', 'TEXT');
   // 選択肢テーブルが normalized_code 無しの古い版なら作り直す (列追加だけでは UNIQUE を差し替えられない)
   migrateWorkOptionsSchema(db);
-  // v1.1 正本化: 作業時間・写真・履歴を task に紐づける (page_id は Notion 時代の証跡として残す — Codex 設計相談 R3)
-  addCol('f_iroha_work_sessions', 'task_id', 'INTEGER');
-  addCol('f_iroha_card_media', 'task_id', 'INTEGER');
-  addCol('f_iroha_app_events', 'task_id', 'INTEGER');
+  // v1.1 正本化: 作業時間・写真・履歴を task に紐づける (page_id は Notion 時代の証跡として残す — Codex 設計相談 R3)。
+  // REFERENCES は宣言する (PRAGMA foreign_keys は mirror DB 全体に影響するので接続側の設定に従う。存在確認はサービス層でも行う)
+  addCol('f_iroha_work_sessions', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
+  addCol('f_iroha_card_media', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
+  addCol('f_iroha_app_events', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_iroha_sessions_task ON f_iroha_work_sessions(task_id, id);
     CREATE INDEX IF NOT EXISTS idx_iroha_media_task ON f_iroha_card_media(task_id, id);

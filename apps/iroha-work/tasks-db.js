@@ -85,20 +85,25 @@ export function safeLogTaskEvent(args) {
 
 // ─── 取込 (Notion → tasks) ───
 
+// 差分取込で追随する商品情報 / 新規行だけに入れて以後は触らないもの (作成時スナップショット・要確認フラグ — Codex A1 R1 #2 #14) / 状態
 const IMPORT_INFO_COLS = ['destination_id', 'product_code', 'product_name', 'qty', 'arrival_date', 'ar_no', 'barcode', 'expiry', 'supplier', 'handling',
-  'master_snapshot', 'payload', 'legacy_status', 'migration_review', 'migration_note'];
+  'payload', 'legacy_status'];
+const IMPORT_NEW_ONLY_COLS = ['master_snapshot', 'migration_review', 'migration_note'];
 const IMPORT_STATE_COLS = ['status', 'close_reason', 'facility_code', 'hold_reason_code', 'hold_reason_note', 'started_at', 'ready_at', 'closed_at', 'closed_by'];
 
 /**
  * Notion の 1 ページを task に取り込む (notion_page_id で冪等)。
- *   新規: そのまま INSERT
- *   既存: 商品情報 (IMPORT_INFO_COLS) は更新。状態 (IMPORT_STATE_COLS) は **アプリ側で一度も触っていない**
- *         (updated_by が import:*) 行だけ更新 — 切替前の差分取込で Notion の変更を追いかけつつ、
- *         アプリで変えた状態を Notion の古い値で戻さない
+ *   新規: そのまま INSERT (作業仕様スナップショット・要確認フラグ込み)
+ *   既存: 商品情報 (IMPORT_INFO_COLS) は更新。**master_snapshot は作成時のまま** (後で Notion 側が変わっても現場の指示を差し替えない)、
+ *         migration_review も再設定しない (職員が確認済みにしたものを戻さない)。
+ *         状態 (IMPORT_STATE_COLS) は **アプリ側で一度も触っていない** (updated_by が import:*) 行だけ更新 —
+ *         切替前の差分取込で Notion の変更を追いかけつつ、アプリで変えた状態を Notion の古い値で戻さない
  * @returns {{action:'inserted'|'updated'|'kept', id:number}}
  */
 export function upsertTaskFromImport(row, { batchId, now = utcNow() }) {
   const db = getDB();
+  const facility = row.facility_code || DEFAULT_FACILITY;
+  if (!db.prepare('SELECT 1 FROM f_iroha_facilities WHERE code = ?').get(facility)) throw new Error(`取込行の拠点が不正です (${row.notion_page_id}): ${facility}`);
   const rec = {
     notion_page_id: String(row.notion_page_id),
     legacy_status: row.legacy_status ?? null,
@@ -125,7 +130,7 @@ export function upsertTaskFromImport(row, { batchId, now = utcNow() }) {
   const actor = `${IMPORT_ACTOR_PREFIX}${batchId}`;
   const existing = getTaskByPageId(rec.notion_page_id);
   if (!existing) {
-    const cols = ['notion_page_id', ...IMPORT_INFO_COLS, ...IMPORT_STATE_COLS, 'import_batch_id', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
+    const cols = ['notion_page_id', ...IMPORT_INFO_COLS, ...IMPORT_NEW_ONLY_COLS, ...IMPORT_STATE_COLS, 'import_batch_id', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
     const vals = cols.map((c) => {
       if (c === 'import_batch_id') return batchId;
       if (c === 'version') return 1;
@@ -212,6 +217,9 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   next.closed_at = to === 'closed' ? now : null;
   next.closed_by = to === 'closed' ? actor : null;
   if (to === 'in_progress' && !t.started_at) next.started_at = now;
+  // ready_at は「最新サイクルで棚入待ちになった時刻」。やり直し・再開で作業中に戻るときは消す (古い時刻を残さない — Codex A1 R1 #9)。
+  // 消した値は履歴 (to_value) に退避
+  if (to === 'in_progress' && (t.status === 'ready_for_stocking' || t.status === 'closed')) next.ready_at = null;
   if (to === 'ready_for_stocking') next.ready_at = now;
   if (to === 'closed' && closeReason === 'stocked' && !next.ready_at) next.ready_at = now;
   if (to === 'closed') next.cancellation_requested_at = null;
@@ -227,7 +235,8 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     .run(next.status, next.hold_reason_code, next.hold_reason_note, next.close_reason, next.closed_at, next.closed_by,
       next.started_at, next.ready_at, next.cancellation_requested_at, next.version, next.updated_at, next.updated_by, t.id, t.version);
   if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
-  safeLogTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: `${to}${closeReason ? ':' + closeReason : ''}${holdReason ? ':' + holdReason : ''}${reason ? ' (' + reason + ')' : ''}`,
+  const cleared = (t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '';
+  safeLogTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: `${to}${closeReason ? ':' + closeReason : ''}${holdReason ? ':' + holdReason : ''}${reason ? ' (' + reason + ')' : ''}${cleared}`,
     workerId, workerName, deviceLabel, ok: true });
   return { ok: true, task: getTask(t.id) };
 }
@@ -253,8 +262,9 @@ export function clearMigrationReview({ taskId, expectVersion, actor = null }) {
   const t = getTask(taskId);
   if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
   if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
-  db.prepare('UPDATE f_iroha_tasks SET migration_review = 0, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+  const r = db.prepare('UPDATE f_iroha_tasks SET migration_review = 0, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
     .run(utcNow(), actor, t.id, t.version);
+  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
   safeLogTaskEvent({ taskId: t.id, action: 'task_review_cleared', ok: true });
   return { ok: true, task: getTask(t.id) };
 }
@@ -275,21 +285,30 @@ function taskHasActivity(db, taskId) {
  */
 export function requestCancellation({ destinationId, source = 'inbound_reversal', actor = null }) {
   const db = getDB();
-  const t = getTaskByDestination(destinationId);
-  if (!t) return { ok: true, action: 'none' };
-  if (t.status === 'closed') return { ok: true, action: 'none', task: t };
-  const now = utcNow();
-  if (t.status === 'not_started' && !taskHasActivity(db, t.id)) {
-    db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = ?, closed_by = ?, hold_reason_code = NULL, hold_reason_note = NULL,
-      cancellation_requested_at = NULL, cancellation_source = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?`)
-      .run(now, actor || source, source, now, actor || source, t.id);
-    safeLogTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: 'closed:cancelled (auto)', ok: true });
-    return { ok: true, action: 'closed', task: getTask(t.id) };
-  }
-  db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?), cancellation_source = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?')
-    .run(now, source, now, actor || source, t.id);
-  safeLogTaskEvent({ taskId: t.id, action: 'task_cancel_requested', to: source, ok: true });
-  return { ok: true, action: 'review', task: getTask(t.id) };
+  // 判定と更新を 1 つの書き込みトランザクションで (判定後に誰かが開始したタスクを自動取消しない — Codex A1 R1 #10)。
+  // 自動取消の UPDATE は status と version を条件に持ち、0 行なら要確認へ倒す
+  return db.transaction(() => {
+    const t = getTaskByDestination(destinationId);
+    if (!t) return { ok: true, action: 'none' };
+    if (t.status === 'closed') return { ok: true, action: 'none', task: t };
+    const now = utcNow();
+    if (t.status === 'not_started' && !taskHasActivity(db, t.id)) {
+      const r = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = ?, closed_by = ?, hold_reason_code = NULL, hold_reason_note = NULL,
+        cancellation_requested_at = NULL, cancellation_source = ?, version = version + 1, updated_at = ?, updated_by = ?
+        WHERE id = ? AND status = 'not_started' AND version = ?`)
+        .run(now, actor || source, source, now, actor || source, t.id, t.version);
+      if (r.changes === 1) {
+        safeLogTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: 'closed:cancelled (auto)', ok: true });
+        return { ok: true, action: 'closed', task: getTask(t.id) };
+      }
+    }
+    const cur = getTask(t.id);
+    const r2 = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?), cancellation_source = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+      .run(now, source, now, actor || source, cur.id, cur.version);
+    if (r2.changes === 0) return { ok: false, error: 'conflict', message: '同時に変更されました。もう一度お試しください', current: getTask(cur.id) };
+    safeLogTaskEvent({ taskId: cur.id, action: 'task_cancel_requested', to: source, ok: true });
+    return { ok: true, action: 'review', task: getTask(cur.id) };
+  }).immediate();
 }
 
 /** 取消要確認を職員が確定 (cancel) / 続行 (continue) */
@@ -304,8 +323,9 @@ export function resolveCancellation({ taskId, decision, expectVersion, actor = n
     return changeTaskStatus({ taskId: t.id, to: 'closed', expectVersion: t.version, closeReason: 'cancelled', actor, isStaff: true, workerId, workerName, deviceLabel });
   }
   if (decision !== 'continue') return { ok: false, error: 'bad_request', message: 'decision は cancel / continue のどちらかです' };
-  db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+  const r = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
     .run(utcNow(), actor, t.id, t.version);
+  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
   safeLogTaskEvent({ taskId: t.id, action: 'task_cancel_continued', workerId, workerName, deviceLabel, ok: true });
   return { ok: true, task: getTask(t.id) };
 }

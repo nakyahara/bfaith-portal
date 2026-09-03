@@ -39,6 +39,7 @@ const mock = {
   lastFilters: [],
   patched: [],          // PATCH /pages/:id の記録
   patchStatusOverride: null,   // PATCH 応答のステータスを差し替え (verify_failed 再現)
+  dbPatches: 0,         // PATCH /databases/:id の回数 (移行の調査が Notion を書き換えないことの検証)
   missingPages: new Set(),
   failQuery: null,      // { status } query を失敗させる
   // 実DB「ステータス」の選択肢 (2026-09-03 実機の Available options)。「取消」も「中断」も無い。
@@ -95,6 +96,7 @@ global.fetch = async (url, opts = {}) => {
     return respond(200, { object: 'database', properties: JSON.parse(JSON.stringify(mock.dbProps)) });
   }
   if (u.endsWith('/databases/testdb') && method === 'PATCH') {
+    mock.dbPatches++;
     for (const [k, cfg] of Object.entries(body.properties || {})) mock.dbProps[k] = { type: Object.keys(cfg)[0] };
     return respond(200, { object: 'database' });
   }
@@ -947,8 +949,12 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   const sM = startSession({ pageId: pM2.id, productCode: 'MIG-B', title: '移行B (外部)', worker: getIrohaWorker(wM.id) });
   stopSession({ pageId: pM2.id, workerId: wM.id, sessionId: sM.sessionId, reason: 'done' });
   const before = getDB().prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c;
+  const patchesBefore = mock.dbPatches;
   const survey = await M.surveyNotion({ save: false });
   ok(survey.count === mock.pages.filter(p => !p.archived).length && !survey.truncated, `調査: Notion の全ページを読む (${survey.count}枚)`);
+  ok(mock.dbPatches === patchesBefore && Array.isArray(survey.pages) && survey.cutoff, '調査は Notion の DB を書き換えない (スキーマは検証だけ) + 窓の上限 cutoff を返す');
+  ok(mock.lastFilters[mock.lastFilters.length - 1] === null, '全件調査はフィルタなし');
+  ok(survey.orphans.unlinked && survey.orphans.missingInNotion, '全件調査は「未紐づけ」と「Notion にも無い」の両方を出す');
   ok(survey.byStatus['羅針盤'] === 1 && survey.issues.unknownStatus.some(i => i.pageId === pM5.id) && survey.issues.dupDestination.some(i => i.destinationId === 9001), '調査: ステータス別件数・未知値・destination 重複を検出');
   ok(getDB().prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === before, '調査は DB を変えない (dry-run)');
   const plan = M.planImport(survey.pages);
@@ -980,11 +986,39 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   const moved = TD.changeTaskStatus({ taskId: tA.id, to: 'in_progress', expectVersion: tA.version, actor: 'たにがわ', isStaff: false });
   ok(moved.ok === true && moved.task.status === 'in_progress' && moved.task.started_at, 'アプリで未着手→作業中 (started_at が付く)');
   pM1.properties['数量'] = num(11);   // Notion 側で数量だけ直された
+  pM1.properties['資材セットID'] = sel('D-99');   // 作業仕様も Notion 側で変わった (取込済みの指示は変えない)
+  TD.clearMigrationReview({ taskId: TD.getTaskByPageId(pM4.id).id, expectVersion: TD.getTaskByPageId(pM4.id).version, actor: 'たにがわ' });
   const survey2 = await M.surveyNotion({ save: false, since: '2026-01-01T00:00:00Z' });
-  ok(mock.lastFilters.some(f => f && f.timestamp === 'last_edited_time'), '差分取込は last_edited_time で絞る');
+  const lastF = mock.lastFilters[mock.lastFilters.length - 1];
+  ok(lastF && (lastF.and || []).some(c => c.timestamp === 'last_edited_time' && c.last_edited_time?.on_or_after) && (lastF.and || []).some(c => c.last_edited_time?.on_or_before === survey2.cutoff),
+    '差分取込は since〜cutoff の窓で絞る (上限は取得開始時刻で固定)');
+  ok(survey2.orphans.missingInNotion === undefined, '差分調査では「Notion にも無い」を出さない (窓の外の正常ページを孤立扱いしない)');
   const apply3 = M.applyImport(M.planImport(survey2.pages).rows, { batchId: 'test-batch-3', actor: 'test' });
   const tA2 = TD.getTask(tA.id);
   ok(apply3.updated >= 1 && tA2.qty === 11 && tA2.status === 'in_progress' && tA2.updated_by === 'たにがわ', '差分取込: 商品情報は追随し、アプリで変えた状態は戻さない');
+  ok(JSON.parse(tA2.master_snapshot).material_code == null, '差分取込でも作業仕様スナップショット (作成時) は変えない');
+  ok(TD.getTaskByPageId(pM4.id).migration_review === 0, '職員が確認済みにした要確認は差分取込で復活しない');
+  const rDelta = M.reconcile(M.planImport(survey2.pages).rows, { mode: 'delta' });
+  ok(rDelta.mode === 'delta' && rDelta.extra === null && rDelta.balanced === true, '差分照合は余りを評価しない');
+  const rFull = M.reconcile(M.planImport(survey2.pages).rows, { mode: 'full' });
+  ok(rFull.extra !== null && rFull.balanced === (rFull.missing.length === 0 && rFull.extra.length === 0), '全件照合は欠けも余りも 0 のときだけ釣り合う');
+
+  // 既存 task (別ページ) と同じ destination のカードが Notion にできても、本取込は一意制約で丸ごと戻らない (外して要確認)
+  // 9777 = Notion には無く、既存 task (db-only-1) だけが持つ destination → 取得内の重複ではなく DB との衝突として分類される
+  TD.upsertTaskFromImport({ notion_page_id: 'db-only-1', status: 'not_started', destination_id: 9777, product_code: 'DBONLY' }, { batchId: 'test-batch-dbonly' });
+  const pM7 = mkPage({ status: '未着手', title: '移行G (dest が既存 task と衝突)', code: 'MIG-G', qty: 1, props: { destination_id: num(9777) } });
+  const plan7 = M.planImport(M.planImport ? (await M.surveyNotion({ save: false })).pages : []);
+  const row7 = plan7.rows.find(r => r.notion_page_id === pM7.id);
+  ok(row7.destination_id === null && row7.warnings.some(w => w.startsWith('dup_destination_db:task')) && row7.migration_review === 1, 'dry-run: 既存 task の destination と衝突 → 外して要確認');
+  const apply7 = M.applyImport(plan7.rows, { batchId: 'test-batch-7', actor: 'test' });
+  ok(apply7.inserted === 1 && TD.getTaskByPageId(pM7.id).destination_id === null && apply7.journal, '本取込は成功し (丸ごと戻らない)、証跡の状態を返す');
+  // dry-run を通さない行で一意制約に当たると、その取込は全部戻る
+  const rowsBad = [
+    { notion_page_id: 'bad-1', mapped_status: 'not_started', facility_code: 'iroha', destination_id: 9900, will_import: true, warnings: [], master_snapshot: {}, payload: {} },
+    { notion_page_id: 'bad-2', mapped_status: 'not_started', facility_code: 'iroha', destination_id: 9003, will_import: true, warnings: [], master_snapshot: {}, payload: {} },
+  ];
+  let badErr = null; try { M.applyImport(rowsBad, { batchId: 'test-batch-bad' }); } catch (e) { badErr = e; }
+  ok(badErr && /UNIQUE/.test(badErr.message) && !TD.getTaskByPageId('bad-1'), '一意制約違反があれば 1 行目も含めて全部戻る (半端に残らない)');
 
   // ── タスク操作 ──
   const bad1 = TD.changeTaskStatus({ taskId: tA2.id, to: 'ready_for_stocking', expectVersion: 0, actor: 'x' });
@@ -1004,7 +1038,15 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   ok(closed.ok && closed.task.closed_at && closed.task.closed_by === 'たにがわ' && !TD.listOpenTasks().some(t => t.id === tA2.id), '棚入完了 → 一覧から消える');
   ok(TD.changeTaskStatus({ taskId: tA2.id, to: 'in_progress', expectVersion: closed.task.version, isStaff: true }).error === 'bad_request', '終了からの再開には理由が必要');
   const reopened = TD.changeTaskStatus({ taskId: tA2.id, to: 'in_progress', expectVersion: closed.task.version, isStaff: true, reason: '数え間違い' });
-  ok(reopened.ok && reopened.task.close_reason === null && reopened.task.closed_at === null, '職員が理由つきで再開すると終了情報が消える');
+  ok(reopened.ok && reopened.task.close_reason === null && reopened.task.closed_at === null && reopened.task.ready_at === null && reopened.task.started_at,
+    '職員が理由つきで再開すると終了情報と棚入待ち時刻が消える (初回開始時刻は残る)');
+  let chkErr = null;
+  try { getDB().prepare("UPDATE f_iroha_tasks SET status = 'closed' WHERE id = ?").run(tA2.id); } catch (e) { chkErr = e; }
+  ok(chkErr && /CHECK/.test(chkErr.message), 'DB の CHECK が不変条件を守る (理由なしの closed は SQL でも入らない)');
+  let fkErr = null;
+  try { getDB().prepare("UPDATE f_iroha_tasks SET facility_code = 'nowhere' WHERE id = ?").run(tA2.id); } catch (e) { fkErr = e; }
+  ok(fkErr && /FOREIGN KEY/.test(fkErr.message), '拠点は f_iroha_facilities に無い値を入れられない (FK)');
+  ok(TD.clearMigrationReview({ taskId: tA2.id, expectVersion: 0 }).error === 'conflict', '要確認クリアも version 競合を返す');
   ok(getDB().prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_status'").get(tA2.id).c >= 6, '状態変更は履歴に残る (task_id つき)');
   const planned = TD.setPlannedDate({ taskId: tA2.id, plannedDate: '2026-09-04', expectVersion: reopened.task.version });
   ok(planned.ok && planned.task.planned_date === '2026-09-04' && TD.setPlannedDate({ taskId: tA2.id, plannedDate: '9/4', expectVersion: planned.task.version }).error === 'bad_request', '「今日やる」= planned_date (形式検証)');
