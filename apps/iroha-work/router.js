@@ -28,11 +28,19 @@ import {
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
   getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
+  getMeta, setMetaValue,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
 import { countTasksByStatus, listTasksNeedingReview, listOrphans } from './tasks-db.js';
-import { buildList, classifyMasterEdit, clearEnrichCache, masterOf } from './service.js';
+import { OPEN_STATUSES } from './tasks.js';
+import { buildList, buildTaskList, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask } from './service.js';
+import { transitionNeedsStaff, TASK_STATUSES, statusLabel } from './tasks.js';
+import {
+  getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
+  listLabelWaits, upsertLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent,
+  startTaskSession, countChangesSince, switchSourceOfTruth,
+} from './tasks-db.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import {
   addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
@@ -106,6 +114,15 @@ function requireAdmin(req, res, next) {
   if (!isAdmin(req)) return res.status(403).json({ ok: false, error: 'forbidden', message: '管理者のみ実行できます' });
   next();
 }
+
+/** タスク ID (正の整数) の取り出し。形式が違えば null → 呼び元は 400 (Number() 任せの NaN/小数/負数を DB 依存の 404 にしない — Codex A1b R1 Low) */
+function parseTaskId(v) {
+  const s = String(v ?? '').trim();
+  if (!/^[1-9]\d{0,15}$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isSafeInteger(n) ? n : null;   // 16 桁は 2^53 を超え得る (丸めた id で別の行を引かない — Codex A1b R2)
+}
+const BAD_TASK_ID = { ok: false, error: 'bad_request', message: 'カードの指定が不正です (一覧を更新してください)' };
 
 const api = fn => async (req, res) => {
   try { await fn(req, res); } catch (e) {
@@ -191,12 +208,22 @@ router.get('/', (req, res) => {
 // ─── 作業 API ───
 
 /**
- * 一覧。キャッシュが古ければ Notion から取り直してから返す。
- * 取り直しに失敗しても古いキャッシュで返す (refresh.error に理由 — 現場を止めない)
+ * 正本 (要件定義 v1.1 §F の切替)。'notion' = 従来どおり Notion のカードを読み書きする /
+ * 'app' = f_iroha_tasks が正本 (Notion は見ない)。管理画面のスイッチで切り替える
+ */
+export function sourceOfTruth() { return getMeta('source_of_truth') === 'app' ? 'app' : 'notion'; }
+const isAppMode = () => sourceOfTruth() === 'app';
+
+/**
+ * 一覧。Notion 正本ならキャッシュが古いとき取り直してから返す (失敗しても古いキャッシュで返す —
+ * 現場を止めない)。アプリ正本なら自分の DB を読むだけ
  */
 router.get('/api/state', api(async (req, res) => {
-  const refresh = await ensureFresh();
-  const list = buildList();
+  const appMode = isAppMode();
+  const refresh = appMode
+    ? { fresh: true, lastRefreshAt: new Date().toISOString(), error: null, truncated: false }
+    : await ensureFresh();
+  const list = appMode ? buildTaskList() : buildList();
   res.json({
     ok: true,
     ...list,
@@ -212,6 +239,7 @@ router.get('/api/state', api(async (req, res) => {
 // 手動の「いま更新」。連打で Notion を叩かないよう 15 秒のクールダウン
 let refreshLastAt = 0;
 router.post('/api/refresh', checkOrigin, api(async (req, res) => {
+  if (isAppMode()) return res.json({ ok: true, refresh: { fresh: true, lastRefreshAt: new Date().toISOString(), error: null, truncated: false } });
   const now = Date.now();
   if (now - refreshLastAt < 15_000) {
     const wait = Math.ceil((15_000 - (now - refreshLastAt)) / 1000);
@@ -256,7 +284,8 @@ const STATUS_HTTP = {
 router.post('/api/status', checkOrigin, api(async (req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  const pageId = String(req.body?.page_id || '').trim();
+  if (isAppMode()) return changeStatusApp(req, res, w.worker);
+  const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   const to = String(req.body?.to || '').trim();
   const expect = req.body?.expect == null ? null : String(req.body.expect);
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
@@ -292,6 +321,132 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
     console.error('[iroha-work] 操作履歴の記録に失敗 (結果はそのまま返す)', e);
   }
   if (!r.ok) return res.status(STATUS_HTTP[r.error] || 400).json(r);
+  res.json(r);
+}));
+
+/**
+ * 状態変更 (アプリ正本)。許可遷移・職員限定・理由の必須・version 楽観ロックは tasks-db.changeTaskStatus が守る。
+ * 職員の本人確認は Notion 正本と同じ考え方 (セッション = 職員 / 端末は職員 worker + PIN)。
+ * 「その遷移が職員限定か」は現在の状態から決まるので、PIN を求めるのも必要なときだけ
+ */
+function changeStatusApp(req, res, worker) {
+  const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  const to = String(req.body?.to || '').trim();
+  const t = getTask(taskId);
+  if (!t) return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' });
+  if (!TASK_STATUSES.includes(to)) return res.status(400).json({ ok: false, error: 'bad_status', message: '変更先の状態が不正です' });
+  let isStaff = false;
+  if (hasSessionAccess(req)) {
+    isStaff = true;
+  } else if (worker.worker_type === 'staff' && transitionNeedsStaff(t.status, to)) {
+    const pinCheck = verifyWorkerPin(worker.id, req.body?.pin);
+    if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
+    isStaff = true;
+  }
+  const r = changeTaskStatus({
+    taskId: t.id, to, expectVersion: req.body?.expect_version,
+    closeReason: req.body?.close_reason || null,
+    holdReason: req.body?.hold_reason || null,
+    holdNote: req.body?.hold_note || null,
+    reason: req.body?.reason || null,
+    actor: hasSessionAccess(req) ? req.iwUser : `${worker.display_name} (いろはアプリ)`,
+    isStaff, workerId: worker.id, workerName: worker.display_name, deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) {
+    return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  }
+  res.json({ ok: true, already: !!r.already, task: publicTask(r.task), status: r.task.status, status_label: statusLabel(r.task), listed: r.task.status !== 'closed' });
+}
+
+/** 画面へ返すタスク (内部列は出さない)。一覧の再取得を待たずに 1 枚だけ差し替えるため */
+function publicTask(t) {
+  return {
+    id: t.id, status: t.status, status_label: statusLabel(t), version: t.version,
+    facility_code: t.facility_code, hold_reason_code: t.hold_reason_code, hold_reason_note: t.hold_reason_note,
+    planned_date: t.planned_date, cancellation_requested_at: t.cancellation_requested_at, migration_review: !!t.migration_review,
+  };
+}
+
+/** 「今日やる / 後日」(アプリ正本のみ) */
+router.post('/api/planned', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const plannedTaskId = parseTaskId(req.body?.id);
+  if (plannedTaskId == null) return res.status(400).json(BAD_TASK_ID);
+  const r = setPlannedDate({
+    taskId: plannedTaskId, plannedDate: req.body?.planned_date ?? null, expectVersion: req.body?.expect_version,
+    actor: `${w.worker.display_name} (いろはアプリ)`, workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  res.json({ ok: true, task: publicTask(r.task) });
+}));
+
+/** 取消の要確認を職員が判断する (cancel / continue)。アプリ正本のみ */
+router.post('/api/cancellation', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  let isStaff = hasSessionAccess(req);
+  if (!isStaff) {
+    if (w.worker.worker_type !== 'staff') return res.status(403).json({ ok: false, error: 'staff_required', message: '取消の判断は職員のみです' });
+    const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
+    if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
+    isStaff = true;
+  }
+  const cancelTaskId = parseTaskId(req.body?.id);
+  if (cancelTaskId == null) return res.status(400).json(BAD_TASK_ID);
+  const r = resolveCancellation({
+    taskId: cancelTaskId, decision: String(req.body?.decision || ''), expectVersion: req.body?.expect_version,
+    actor: isStaff && hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
+    isStaff, workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  res.json({ ok: true, task: publicTask(r.task) });
+}));
+
+/** 取込時に推定した状態を職員が「確認した」にする (アプリ正本のみ) */
+router.post('/api/review-cleared', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  if (!hasSessionAccess(req)) {
+    if (w.worker.worker_type !== 'staff') return res.status(403).json({ ok: false, error: 'staff_required', message: 'この操作は職員のみです' });
+    const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
+    if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
+  }
+  const reviewTaskId = parseTaskId(req.body?.id);
+  if (reviewTaskId == null) return res.status(400).json(BAD_TASK_ID);
+  const r = clearMigrationReview({ taskId: reviewTaskId, expectVersion: req.body?.expect_version, actor: `${w.worker.display_name} (いろはアプリ)` });
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  res.json({ ok: true, task: publicTask(r.task) });
+}));
+
+/** ラベル待ち (一覧・登録・更新)。アプリ正本のみ */
+router.get('/api/label-waits', api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const taskId = req.query.task_id == null ? null : parseTaskId(req.query.task_id);
+  if (req.query.task_id != null && taskId == null) return res.status(400).json(BAD_TASK_ID);
+  res.json({ ok: true, rows: listLabelWaits({ taskId, openOnly: req.query.all !== '1' }) });
+}));
+
+router.post('/api/label-waits', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const fields = { ...(req.body?.fields || {}) };
+  if (req.body?.id == null) {   // 新規は記録者を自動で入れる (誰が気づいたか)
+    if (fields.recorded_by_worker_id == null) fields.recorded_by_worker_id = w.worker.id;
+    if (!fields.recorded_by_name) fields.recorded_by_name = w.worker.display_name;
+  }
+  const labelTaskId = parseTaskId(req.body?.task_id);
+  if (labelTaskId == null) return res.status(400).json(BAD_TASK_ID);
+  const r = upsertLabelWait({
+    id: req.body?.id ?? null, taskId: labelTaskId, fields,
+    expectVersion: req.body?.expect_version ?? null, actor: `${w.worker.display_name} (いろはアプリ)`,
+  });
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json(r);
   res.json(r);
 }));
 
@@ -346,11 +501,25 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   const db = getDB();
   const row = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
 
-  // シード・権限判定に使うカード値 (商品コードが一致するカードだけ)
-  const card = getCachePage(String(req.body?.page_id || ''));
-  let cardProps = {};
-  if (card && codeKeyOf(card.product_code) === k) {
-    try { cardProps = JSON.parse(card.payload || '{}'); } catch { /* 壊れていればカード値なし */ }
+  // シード・権限判定に使うカード値 (商品コードが一致するカードだけ)。
+  // アプリ正本ならタスクの作成時スナップショット、Notion 正本ならカードのプロパティ
+  const cardId = String(req.body?.id || req.body?.page_id || '');
+  let cardValues = {};
+  if (isAppMode()) {
+    const t = parseTaskId(cardId) == null ? null : getTask(parseTaskId(cardId));
+    if (t && codeKeyOf(t.product_code) === k) {
+      try { cardValues = t.master_snapshot ? JSON.parse(t.master_snapshot) : {}; } catch { /* 壊れていればカード値なし */ }
+    }
+  } else {
+    const card = getCachePage(cardId);
+    if (card && codeKeyOf(card.product_code) === k) {
+      let props = {};
+      try { props = JSON.parse(card.payload || '{}'); } catch { /* 同上 */ }
+      cardValues = {
+        material_code: props['資材セットID'] || null, storage_container: props['収納容器'] || null,
+        units_per_container: props['入数'] ?? null, process_count: props['工程数'] ?? null, note: props['備考'] || null,
+      };
+    }
   }
 
   // DBが実際に変わるか (書き込み要否・unchanged判定) は**生値**で見る
@@ -361,7 +530,7 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   // 権限は**画面に見えていた実効値** (マスタ+カードのフォールバック合成) で見る (Codex PR4-R3:
   // マスタが空欄でもカード値 D-8 が表示されている項目を、一般作業者が D-9 へ変えられてはいけない。
   // 表示どおりの値を確定保存するだけなら誰でもよい)
-  const effRow = masterOf(row || null, cardProps);
+  const effRow = masterOfTask(row || null, cardValues);
   const perm = classifyMasterEdit(effRow, fields);
   if (perm.overwrites.length > 0 && !hasSessionAccess(req)) {
     if (w.worker.worker_type !== 'staff') {
@@ -397,10 +566,10 @@ router.post('/api/master', checkOrigin, api((req, res) => {
         cur = db.prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(k);
         expect = cur.version;
         // カード表示中の値をシード (今回指定されなかった項目だけ)。空欄埋め扱いなので権限は不要。
-        // cardProps は上で商品コード一致を確認済み (別商品のカード値を混ぜない)
+        // cardValues は上で商品コード一致を確認済み (別商品のカード値を混ぜない)
         const seed = {
-          material_code: cardProps['資材セットID'], storage_container: cardProps['収納容器'],
-          units_per_container: cardProps['入数'], process_count: cardProps['工程数'], note: cardProps['備考'],
+          material_code: cardValues.material_code, storage_container: cardValues.storage_container,
+          units_per_container: cardValues.units_per_container, process_count: cardValues.process_count, note: cardValues.note,
         };
         applyFields = { ...Object.fromEntries(Object.entries(seed).filter(([f, v]) => v != null && v !== '' && !(f in fields))), ...fields };
       } else {
@@ -452,22 +621,33 @@ router.post('/api/media', checkOrigin, mediaUpload.single('file'), api((req, res
     if (w.error) { cleanup(); return res.status(400).json({ ok: false, error: 'worker_required', message: w.error }); }
     if (!req.file) return res.status(400).json({ ok: false, error: 'no_file', message: 'ファイルがありません' });
     if (!isDriveConfigured()) { cleanup(); return res.status(503).json({ ok: false, error: 'not_configured', message: 'ドライブ保存が未設定です (職員の方は管理者に連絡してください)' }); }
-    const pageId = String(req.body?.page_id || '').trim();
+    const cardId = String(req.body?.id || req.body?.page_id || '').trim();
     const kind = String(req.body?.kind || '');
-    if (!pageId || (kind !== 'photo' && kind !== 'video')) {
-      cleanup(); return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id と kind (photo/video) が必要です' });
+    if (!cardId || (kind !== 'photo' && kind !== 'video')) {
+      cleanup(); return res.status(400).json({ ok: false, error: 'bad_request', message: 'カードと種類 (photo/video) が必要です' });
     }
-    const card = getCachePage(pageId);
-    if (!card) { cleanup(); return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' }); }
+    const appMode = isAppMode();
+    // 正本に合わせて、カードを task_id (アプリ正本) か page_id (Notion 正本) で引く
+    if (appMode && parseTaskId(cardId) == null) { cleanup(); return res.status(400).json(BAD_TASK_ID); }
+    const task = appMode ? getTask(parseTaskId(cardId)) : null;
+    const card = appMode ? null : getCachePage(cardId);
+    if (appMode ? !task : !card) { cleanup(); return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' }); }
+    const productCode = appMode ? task.product_code : card.product_code;
     const r = addMedia({
-      pageId, productCode: card.product_code, kind, mime: req.file.mimetype,
+      pageId: appMode ? null : cardId, taskId: appMode ? task.id : null,
+      productCode, kind, mime: req.file.mimetype,
       filePath: req.file.path, worker: w.worker, deviceLabel: deviceLabelOf(req),
       deviceId: req.iwDevice ? req.iwDevice.id : null,
       operationId: req.body?.operation_id,
     });
-    if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' ? 409 : 400).json(r); }
-    safeLog({ action: `media_${kind}`, pageId, workerId: w.worker.id, workerName: w.worker.display_name,
-      deviceLabel: deviceLabelOf(req), to: r.already ? 'resend' : 'add', ok: true });
+    if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' || r.error === 'operation_conflict' ? 409 : 400).json(r); }
+    if (appMode) {
+      safeLogTaskEvent({ taskId: task.id, action: `media_${kind}`, workerId: w.worker.id, workerName: w.worker.display_name,
+        deviceLabel: deviceLabelOf(req), to: r.already ? 'resend' : 'add', ok: true });
+    } else {
+      safeLog({ action: `media_${kind}`, pageId: cardId, workerId: w.worker.id, workerName: w.worker.display_name,
+        deviceLabel: deviceLabelOf(req), to: r.already ? 'resend' : 'add', ok: true });
+    }
     scheduleMedia();
     res.json(r);
   } catch (e) {
@@ -588,7 +768,8 @@ const deviceLabelOf = (req) => (req.iwDevice ? req.iwDevice.label : (req.iwUser 
 router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  const pageId = String(req.body?.page_id || '').trim();
+  if (isAppMode()) return startSessionApp(req, res, w.worker);
+  const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
   // 開始可否は**必ず**実ページを直接再取得して判定する (Codex PR2-R3: キャッシュが3分以内でも、
   // その間に棚入完了・取消・アーカイブ・別DB移動があり得る)。取得失敗なら開始を拒否 —
@@ -635,12 +816,46 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   res.json({ ok: true, already: !!r.already, sessionId: r.sessionId, startedAt: r.startedAt, status: statusNow, serverNow: new Date().toISOString() });
 }));
 
+/**
+ * 作業開始 (アプリ正本)。Notion を見ないので、判定は自分の DB のタスクだけ。
+ * 終了確認・セッション INSERT・未着手→作業中 は tasks-db.startTaskSession が 1 トランザクションで行う
+ * (別端末の終了と競合しても「終了したカードに活動中セッション」を残さない — Codex A1b R1 #2)
+ */
+function startSessionApp(req, res, worker) {
+  const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  // スナップショット (§1.7 ④) = 画面に見えていた実効値 (マスタ + タスク作成時の値のフォールバック合成)
+  const snapshotOf = (t) => {
+    if (!t.product_code) return null;
+    let snap = null;
+    try { snap = t.master_snapshot ? JSON.parse(t.master_snapshot) : null; } catch { /* 壊れていれば master だけで合成 */ }
+    const wm = getDB().prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(String(t.product_code).trim().toLowerCase());
+    return masterOfTask(wm || null, snap);
+  };
+  const r = startTaskSession({ taskId, worker, deviceLabel: deviceLabelOf(req), snapshotOf });
+  if (!r.ok) {
+    const http = r.error === 'bad_request' ? 400 : r.error === 'not_found' ? 404 : 409;
+    return res.status(http).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  }
+  res.json({ ok: true, already: !!r.already, sessionId: r.sessionId, startedAt: r.startedAt,
+    status: r.task.status, task: publicTask(r.task), serverNow: new Date().toISOString() });
+}
+
 /** 作業終了 (done) / 中断 (pause)。時間はサーバー時刻の差分で確定 */
 router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  const pageId = String(req.body?.page_id || '').trim();
   const reason = String(req.body?.reason || '');
+  if (isAppMode()) {
+    const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+    if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+    const r = stopSession({ taskId, workerId: w.worker.id, sessionId: req.body?.session_id, reason });
+    safeLogTaskEvent({ taskId, action: 'session_stop', workerId: w.worker.id, workerName: w.worker.display_name,
+      deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
+    return res.json({ ...r, task: publicTask(getTask(taskId)) });
+  }
+  const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
   const r = stopSession({ pageId, workerId: w.worker.id, sessionId: req.body?.session_id, reason });
   safeLog({ action: 'session_stop', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
@@ -668,6 +883,7 @@ router.get('/admin', requireSession, api((req, res) => {
     workers: listIrohaWorkers(true),
     options: workOptionsForState(true),
     migration: migrationStatus(),
+    source: sourceOfTruth(),
     devices: isAdmin(req) ? listDevices() : [],
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     events: listEvents(50),
@@ -802,7 +1018,41 @@ router.post('/admin/migration/apply', checkOrigin, requireAdmin, api((req, res) 
 }));
 
 router.get('/admin/migration/status', requireAdmin, api((req, res) => {
-  res.json({ ok: true, ...migrationStatus() });
+  res.json({ ok: true, ...migrationStatus(), source: sourceOfTruth() });
+}));
+
+/**
+ * 正本の切替 (要件 v1.1 §F の手順 6)。app にすると iPad は tasks を読み書きし、Notion を一切見なくなる。
+ * 空の状態で切り替えると現場の一覧が消えるので、未完了タスクが 1 件も無ければ拒否する。
+ * 戻す (notion) こともできる — 切替直後に問題が出たときの退路 (アプリ側の更新は tasks に残る)
+ */
+router.post('/admin/source', checkOrigin, requireAdmin, api((req, res) => {
+  const to = String(req.body?.to || '');
+  if (to !== 'app' && to !== 'notion') return res.status(400).json({ ok: false, error: 'bad_request', message: 'to は app / notion のどちらかです' });
+  if (req.body?.confirm !== 'SWITCH') return res.status(400).json({ ok: false, error: 'confirm_required', message: '確認のため confirm に SWITCH と入れてください' });
+  const from = sourceOfTruth();
+  if (from === to) return res.json({ ok: true, source: to, unchanged: true });
+  const counts = countTasksByStatus();
+  const open = OPEN_STATUSES.reduce((s, k) => s + (counts.byStatus[k] || 0), 0);
+  if (to === 'app' && open === 0) {
+    return res.status(409).json({ ok: false, error: 'no_tasks', message: '未完了のタスクが 1 件もありません。先に Notion からの取込を済ませてください' });
+  }
+  // Notion へ戻す: app 正本の間の記録は Notion に反映されていない。黙って戻すと古い Notion の状態が現場に出る
+  // (終了済みの再実施・二重記録のもと) ので、件数を出して force を要求し、監査ログに残す (Codex A1b R1 #7)
+  let changes = null;
+  const force = req.body?.force === true;
+  if (to === 'notion') {
+    changes = countChangesSince(getMeta('source_switched_at') || '1970-01-01T00:00:00.000Z');
+    const total = changes.tasks + changes.updatedTasks + changes.sessions + changes.media;
+    if (total > 0 && !force) {
+      return res.status(409).json({ ok: false, error: 'app_changes_exist', changes,
+        message: `アプリ正本にしてからの記録があります (状態変更 ${changes.tasks} 回 / 更新されたタスク ${changes.updatedTasks} 件 / 作業時間 ${changes.sessions} 件 / 写真 ${changes.media} 件)。Notion には反映されていません。それでも戻すなら force を付けてください` });
+    }
+  }
+  // 正本・切替時刻・監査ログは 1 トランザクション (失敗したら切り替わらない → api() が 500 を返す)
+  const sw = switchSourceOfTruth({ from, to, actor: req.iwUser, openTasks: open, changes, force });
+  console.log(`[iroha-work] 正本を ${from} → ${to} に切り替えました (${req.iwUser}・未完了 ${open} 件${sw.detail})`);
+  res.json({ ok: true, source: to, openTasks: open, changes, switchedAt: sw.switchedAt });
 }));
 
 // ─── 選択肢 (資材・保管箱) の管理 ───

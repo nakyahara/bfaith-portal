@@ -96,6 +96,23 @@
         <input type="text" id="migConfirm" placeholder="本取込するには APPLY と入力" maxlength="10">
         <button onclick="migApply()">📥 本取込</button>
       </div>
+
+      <h3 style="margin:16px 0 6px">正本の切替</h3>
+      <p class="hint">
+        いまの正本 = <b><%= source === 'app' ? 'アプリ (f_iroha_tasks)' : 'Notion' %></b>。
+        アプリに切り替えると iPad は tasks を読み書きし、<b>Notion を一切見なくなります</b> (カードの更新も止まります)。
+        切替前に「調査 → 本取込」で件数を合わせてください。問題があれば Notion に戻せますが、<b>アプリ側で付けた記録は Notion に反映されません</b>
+        (戻すときは件数を確認して強制します。記録は tasks に残ります)。
+      </p>
+      <div class="row">
+        <input type="text" id="srcConfirm" placeholder="切り替えるには SWITCH と入力" maxlength="10">
+        <% if (source === 'app') { %>
+          <button onclick="switchSource('notion')">↩ Notion に戻す</button>
+        <% } else { %>
+          <button onclick="switchSource('app')">🚀 アプリを正本にする</button>
+        <% } %>
+        <span class="msg" id="srcMsg"></span>
+      </div>
       <pre id="migOut" style="white-space:pre-wrap;font-size:.82rem;background:#f6f7f9;border:1px solid #dde;border-radius:6px;padding:10px;max-height:420px;overflow:auto;display:none"></pre>
     </div>
     <% } %>
@@ -245,7 +262,7 @@
             <td>
               <% if (m.deleted_at) { %>削除済み
               <% } else if (m.status === 'synced') { %>✅ Notionまで反映
-              <% } else if (m.status === 'uploaded') { %>☁ Drive保存済み (Notion待ち)
+              <% } else if (m.status === 'uploaded') { %><%= m.task_id != null ? '✅ Drive保存済み' : '☁ Drive保存済み (Notion待ち)' %>
               <% } else { %>⏳ 送信待ち<% } %>
               <% if (m.error) { %><div class="ng"><%= m.error %></div><% } %>
               <% if (m.drive_url) { %><a href="<%= m.drive_url %>" target="_blank" rel="noopener">開く</a><% } %>
@@ -325,6 +342,24 @@
       migShow(json);
       document.getElementById('migConfirm').value = '';
       document.getElementById('migSince').value = json.nextSince || '';
+    }
+    async function switchSource(to) {
+      const confirm = document.getElementById('srcConfirm').value.trim();
+      if (confirm !== 'SWITCH') { setMsg('srcMsg', 'err', '切り替えるには SWITCH と入力してください'); return; }
+      const label = to === 'app' ? 'アプリ (f_iroha_tasks)' : 'Notion';
+      if (!window.confirm('正本を「' + label + '」に切り替えます。iPad の表示・記録先が変わります。よろしいですか?')) return;
+      let { json } = await post('/admin/source', { to, confirm });
+      if (!json.ok && json.error === 'app_changes_exist') {
+        const c = json.changes || {};
+        const msg = 'アプリ正本にしてから、アプリ側で 状態変更 ' + (c.tasks || 0) + ' 回 / 更新されたタスク ' + (c.updatedTasks || 0) + ' 件 / 作業時間 ' + (c.sessions || 0) + ' 件 / 写真 ' + (c.media || 0) + ' 件 の記録があります。\n'
+          + 'Notion に戻すと、iPad にはこれらが反映されていない古い Notion の状態が出ます (終了した作業のやり直し・二重記録のもと)。\n'
+          + 'それでも戻しますか? (記録は tasks に残り、操作履歴に件数が残ります)';
+        if (!window.confirm(msg)) { setMsg('srcMsg', 'err', '切替を中止しました'); return; }
+        ({ json } = await post('/admin/source', { to, confirm, force: true }));
+      }
+      if (!json.ok) { setMsg('srcMsg', 'err', json.message || '切り替えできませんでした'); return; }
+      setMsg('srcMsg', 'ok', '正本を ' + label + ' に切り替えました');
+      setTimeout(() => location.reload(), 800);
     }
     async function addOption(kind) {
       const code = document.getElementById('opt-' + kind).value.trim();

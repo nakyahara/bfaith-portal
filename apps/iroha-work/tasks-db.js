@@ -5,7 +5,7 @@
  * 不変条件 (closed には close_reason/closed_at、on_hold には hold_reason …) は書く前に validateTaskInvariants で守る。
  * 状態変更は version の楽観ロック (2 台の iPad が同時に触っても後勝ちで壊さない) + 履歴 (f_iroha_app_events.task_id)。
  */
-import { getDB } from './db.js';
+import { getDB, startSession, setMetaValue, logEvent } from './db.js';
 import {
   OPEN_STATUSES, CLOSE_REASONS, HOLD_REASONS, DEFAULT_FACILITY,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
@@ -384,4 +384,85 @@ export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion 
   safeLogTaskEvent({ taskId: cur.task_id, action: 'label_wait_update', to: JSON.stringify(rec).slice(0, 300), ok: true });
   void actor;
   return { ok: true, row: db.prepare('SELECT * FROM f_iroha_label_waits WHERE id = ?').get(cur.id) };
+}
+
+// ─── 作業開始 (アプリ正本) ───
+
+/**
+ * 作業開始を 1 つの BEGIN IMMEDIATE にまとめる (Codex A1b R1 #2): タスクの再確認 (終了していないか) → セッション INSERT →
+ * 最初の開始なら 未着手→作業中。同じトランザクションなので、確認と INSERT の間に別端末が終了させることはできず、
+ * 「終了したカードに活動中セッションが残る」ことがない。状態変更が通らなければセッションごと戻す。
+ * @param snapshotOf (task) => 開始時の実効作業仕様 (router が masterOfTask で合成) / null
+ */
+let startTaskSessionHook = null;
+/** テスト用: セッション INSERT の後・状態変更の前に割り込む (「別端末が同時に変えた」の再現。本番では null) */
+export function _setStartTaskSessionHook(fn) { startTaskSessionHook = fn; }
+export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotOf = null }) {
+  const db = getDB();
+  const tx = db.transaction(() => {
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
+    if (t.status === 'closed') {
+      return { ok: false, error: 'done_card', message: 'このカードは終了しています (やり直すなら職員が状態を戻してください)' };
+    }
+    const r = startSession({
+      taskId: t.id, productCode: t.product_code, title: t.product_name, worker, deviceLabel,
+      masterSnapshot: snapshotOf ? snapshotOf(t) : undefined,
+    });
+    if (!r.already) {
+      safeLogTaskEvent({ taskId: t.id, action: 'session_start', workerId: worker.id, workerName: worker.display_name,
+        deviceLabel, to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    }
+    if (!r.ok) return r;
+    if (startTaskSessionHook) startTaskSessionHook(t);
+    let task = t;
+    if (t.status === 'not_started') {
+      const cs = changeTaskStatus({ taskId: t.id, to: 'in_progress', expectVersion: t.version,
+        actor: `${worker.display_name} (いろはアプリ)`, workerId: worker.id, workerName: worker.display_name, deviceLabel });
+      if (!cs.ok) throw Object.assign(new Error(cs.message || '状態を変更できませんでした'), { taskResult: cs });
+      task = cs.task;
+    }
+    return { ok: true, already: !!r.already, sessionId: r.sessionId, startedAt: r.startedAt, task };
+  });
+  try { return tx.immediate(); } catch (e) {
+    if (e.taskResult) return { ok: false, ...e.taskResult };   // ロールバック済み (セッションは残っていない)
+    throw e;
+  }
+}
+
+/**
+ * 正本を app にしてからの記録の数 (Notion へ戻す前の警告用 — Codex A1b R1 #7)。
+ * tasks = 状態変更の回数 (履歴から。同じタスクを 2 回変えれば 2)、updatedTasks = 何かしら更新されたタスクの数 (今日やる等も含む) — R2 #1
+ */
+export function countChangesSince(iso) {
+  const db = getDB();
+  const q = (sql) => db.prepare(sql).get(iso).c;
+  // 境界は >= (切替と同じミリ秒の記録を落とさない — 過少計上の方が危険。Codex A1b R3 #2)
+  return {
+    tasks: q("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_status' AND ok = 1 AND at >= ?"),
+    updatedTasks: q('SELECT COUNT(*) c FROM f_iroha_tasks WHERE updated_at >= ?'),
+    sessions: q('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id IS NOT NULL AND started_at >= ?'),
+    media: q('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id IS NOT NULL AND created_at >= ?'),
+  };
+}
+
+let switchSourceHook = null;
+/** テスト用: 正本と切替時刻を書いた後・監査ログの前に割り込む (監査ログ失敗の再現。本番では null) */
+export function _setSwitchSourceHook(fn) { switchSourceHook = fn; }
+/**
+ * 正本の切替を 1 トランザクションで: source_of_truth・source_switched_at・監査ログ (f_iroha_app_events source_switch) を
+ * まとめて書く。どれかが失敗したら全部戻す (「切り替わったのに時刻/ログが無い」を作らない — Codex A1b R3 #1)
+ * @returns {switchedAt}
+ */
+export function switchSourceOfTruth({ from, to, actor, openTasks, changes = null, force = false }) {
+  const db = getDB();
+  return db.transaction(() => {
+    const switchedAt = utcNow();
+    setMetaValue('source_of_truth', to);
+    setMetaValue('source_switched_at', switchedAt);
+    if (switchSourceHook) switchSourceHook();
+    const detail = changes ? `・Notion 未反映: 状態変更 ${changes.tasks} 回/更新タスク ${changes.updatedTasks}/作業時間 ${changes.sessions}/写真 ${changes.media}${force ? ' (force)' : ''}` : '';
+    logEvent({ action: 'source_switch', pageId: null, deviceLabel: `session:${actor}`, from, to: `${to} (未完了 ${openTasks} 件${detail})`, ok: true });
+    return { switchedAt, detail };
+  }).immediate();
 }
