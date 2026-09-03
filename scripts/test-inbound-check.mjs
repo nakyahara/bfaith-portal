@@ -444,5 +444,90 @@ console.log('\n[14] 入庫情報の選択肢 (プルダウン)');
   ok(fieldOptions().BF保管荷姿[0] === 'よく使う', '件数の多い表記が先頭に来る');
 }
 
+console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタスクを同時に作る / やり直し・再取込 → 取消');
+{
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const IW = await import('../apps/iroha-work/db.js');
+  const { createTaskForDestination } = await import('../apps/iroha-work/task-intake.js');
+  const taskOf = (destId) => TD.getTaskByDestination(destId);
+  const destOf = (id) => db.prepare('SELECT * FROM f_inbound_check_destinations WHERE id = ?').get(id);
+  const lineState = (key) => getState().lines.find(l => l.line_key === key);
+  const destIdOf = (key) => db.prepare('SELECT destination_id FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = ?').get(getActiveBatch().id, key)?.destination_id ?? null;
+  db.prepare(`INSERT OR REPLACE INTO f_iroha_work_master (code_key, 商品コード, material_code, storage_container, units_per_container, process_count, note, version, updated_at)
+    VALUES ('task-a', 'TASK-A', 'D-8', '透明袋', 180, 2, 'メモ', 3, '2026-09-03T00:00:00Z')`).run();
+  const imp = importCsv(makeCsv([row('AR9', 1, 'TASK-A', 6, { 商品名: 'タスク商品A', バーコード: '4599999999991' }), row('AR9', 2, 'TASK-B', 3), row('AR9', 3, 'TASK-C', 2)]),
+    { fileName: 'prb.csv', source: 'manual_upload', actor: 'tester', generatedAt: '2027-01-01T00:00:00Z' });
+  ok(imp.ok, '前提: 新しい取込');
+  const b = getActiveBatch();
+  const decideIroha = () => ({ ok: true, destination: 'iroha', decidedFrom: 'chosen', expiryDate: '2027-03' });
+  const fin = (key, extra) => finalizeLine({ batchId: b.id, lineKey: key, expectVersion: 1, expectQuantityVersion: 1, result: 'exact', mode: 'fill_remaining', worker: '山田', ...extra });
+  const f1 = fin('AR9|1|1', { fillEvent: FILL('ev-prb-1'), clientOperationId: 'op-prb-0001', decide: decideIroha });
+  ok(f1.ok && destIdOf('AR9|1|1'), '前提: いろは行きで確定');
+  const d1 = destOf(destIdOf('AR9|1|1'));
+  const t1 = taskOf(d1.id);
+  ok(t1 && t1.status === 'not_started' && t1.facility_code === 'iroha' && t1.notion_page_id == null, '確定と同時にタスクができる (未着手・いろは・Notion ページなし)');
+  ok(t1.product_code === 'TASK-A' && t1.product_name === 'タスク商品A' && t1.qty === 6 && t1.ar_no === 'AR9' && t1.barcode === '4599999999991'
+    && t1.expiry === '2027-03' && t1.arrival_date === d1.work_date, 'タスクに商品コード・名前・数量 (実数)・入荷管理番号・バーコード・有効期限・入庫日が載る');
+  const snap = JSON.parse(t1.master_snapshot);
+  ok(snap.material_code === 'D-8' && snap.storage_container === '透明袋' && snap.units_per_container === 180 && snap.process_count === 2 && snap.version === 3, '作業仕様のスナップショット (作成時点の値)');
+  const payload = JSON.parse(t1.payload);
+  ok(payload['入庫日'] === d1.work_date && payload['作業拠点'] === 'いろは' && payload.destination_id === d1.id && payload.source === 'inbound_check', 'payload は Notion 時代と同じキー名');
+  ok(t1.created_by === 'inbound:山田' && db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_created' AND task_id = ?").get(t1.id).c === 1, '誰が確定したかと履歴が残る');
+  const again = fin('AR9|1|1', { fillEvent: FILL('ev-prb-1'), clientOperationId: 'op-prb-0001', decide: decideIroha });
+  ok(again.ok && again.replayed && db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks WHERE destination_id = ?').get(d1.id).c === 1, '再送 (同じ操作ID) でタスクは増えない');
+  ok(createTaskForDestination(destOf(d1.id)).action === 'exists', '同じ行き先からもう一度作ろうとしても既存を返す (冪等)');
+  const f2 = fin('AR9|2|1', { fillEvent: FILL('ev-prb-2'), decide: () => ({ ok: true, destination: 'bfaith', decidedFrom: 'chosen' }) });
+  ok(f2.ok && destIdOf('AR9|2|1') && !taskOf(destIdOf('AR9|2|1')), 'B-Faith 行きはタスクにならない');
+  const f3 = fin('AR9|3|1', { fillEvent: FILL('ev-prb-3'), worker: '鈴木', decide: decideIroha });
+  const d3Id = destIdOf('AR9|3|1');
+  const t3 = taskOf(d3Id);
+  ok(t3 && t3.master_snapshot == null && t3.product_code === 'TASK-C' && t3.created_by === 'inbound:鈴木', '作業仕様が無い商品も未着手で作られる (スナップショット無し)');
+
+  // やり直し (未着手・実績なし) → 自動で取消
+  const s1 = lineState('AR9|1|1');
+  ok(reopenLine({ batchId: b.id, lineKey: 'AR9|1|1', expectVersion: s1.version, expectQuantityVersion: s1.quantity_version, worker: '山田', clientOperationId: 'op-prb-ro1' }).ok, '前提: やり直し');
+  const t1b = taskOf(d1.id);
+  ok(t1b.status === 'closed' && t1b.close_reason === 'cancelled' && t1b.cancellation_source === 'inbound_reversal', 'やり直すと未着手のタスクは自動で取消 (終了:取消)');
+  // 着手後のやり直し → 自動取消せず要確認
+  const w = IW.addIrohaWorker({ displayName: 'プラビー', workerType: 'member', actor: 'test' });
+  const s3 = IW.startSession({ taskId: t3.id, worker: IW.getIrohaWorker(w.id) });
+  ok(s3.ok, '前提: 別のタスクで作業を開始');
+  const ls3 = lineState('AR9|3|1');
+  ok(reopenLine({ batchId: b.id, lineKey: 'AR9|3|1', expectVersion: ls3.version, expectQuantityVersion: ls3.quantity_version, worker: '鈴木' }).ok, '前提: 着手後にやり直し');
+  const t3b = taskOf(d3Id);
+  ok(t3b.status !== 'closed' && t3b.cancellation_requested_at && t3b.cancellation_source === 'inbound_reversal', '着手後のやり直しは自動取消せず要確認 (cancellation_requested_at)');
+  IW.stopSession({ taskId: t3.id, workerId: w.id, sessionId: s3.sessionId, reason: 'done' });
+  // 再確認 → 新しい行き先 = 新しいタスク (前のは取消のまま)
+  const s1b = lineState('AR9|1|1');
+  const f1c = finalizeLine({ batchId: b.id, lineKey: 'AR9|1|1', expectVersion: s1b.version, expectQuantityVersion: s1b.quantity_version, result: 'exact', mode: 'current', worker: '山田', decide: decideIroha });
+  const d1cId = destIdOf('AR9|1|1');
+  ok(f1c.ok && d1cId && d1cId !== d1.id && taskOf(d1cId)?.status === 'not_started' && taskOf(d1.id).status === 'closed', '再確認すると新しいタスク (前のタスクは取消のまま)');
+  // 再取込で確認を引き継げない行 (予定数が変わった) → 行き先が取り消され、タスクも取消
+  const imp2 = importCsv(makeCsv([row('AR9', 1, 'TASK-A', 7), row('AR9', 2, 'TASK-B', 3), row('AR9', 3, 'TASK-C', 2)]), { fileName: 'prb2.csv', generatedAt: '2027-01-01T01:00:00Z' });
+  ok(imp2.ok, '前提: 予定数が変わった再取込');
+  const t1c = taskOf(d1cId);
+  ok(t1c.status === 'closed' && t1c.close_reason === 'cancelled' && t1c.cancellation_source === 'inbound_import', '再取込で引き継げなかった行のタスクは取消 (inbound_import)');
+  // 再取込で行ごと消えた確認済み行 → 行き先を取消 (line_removed)・タスクも取消 (Codex PR-B R1 #1)
+  const b2 = getActiveBatch();
+  const f3b = finalizeLine({ batchId: b2.id, lineKey: 'AR9|3|1', expectVersion: lineState('AR9|3|1').version, expectQuantityVersion: lineState('AR9|3|1').quantity_version, result: 'exact', mode: 'current', worker: '鈴木', decide: decideIroha });
+  ok(f3b.ok && taskOf(destIdOf('AR9|3|1'))?.status === 'not_started', '前提: 消える予定の行を確定 (タスクあり)');
+  const d3bId = destIdOf('AR9|3|1');
+  const imp3 = importCsv(makeCsv([row('AR9', 1, 'TASK-A', 7), row('AR9', 2, 'TASK-B', 3)]), { fileName: 'prb3.csv', generatedAt: '2027-01-01T02:00:00Z' });
+  ok(imp3.ok && /消えた明細の行き先 1件を取消/.test(db.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message), '前提: 行 3 が無い CSV を再取込 (ログに件数)');
+  ok(destOf(d3bId).cancelled_at && destOf(d3bId).cancel_reason === 'line_removed', '消えた明細の行き先は取消 (line_removed)');
+  const t3c = taskOf(d3bId);
+  ok(t3c.status === 'closed' && t3c.close_reason === 'cancelled' && t3c.cancellation_source === 'inbound_import', '消えた明細のタスクも取消');
+  ok(destOf(destIdOf('AR9|2|1')).cancelled_at == null, '残った行 (B-Faith 行き) はそのまま');
+  // 既に取消済みの行き先が carry に残っていても「取消 N 件」に数えない (Codex PR-B R2 Low)
+  const b3 = getActiveBatch();
+  const f2b = finalizeLine({ batchId: b3.id, lineKey: 'AR9|1|1', expectVersion: lineState('AR9|1|1').version, expectQuantityVersion: lineState('AR9|1|1').quantity_version, result: 'shortage', mode: 'current', worker: '山田', decide: decideIroha });
+  ok(f2b.ok, '前提: 行 1 を確定 (7 予定 / 6 実数 = 不足)');
+  const dPre = destIdOf('AR9|1|1');
+  db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = ?, cancelled_by = 'manual', cancel_reason = 'reopen' WHERE id = ?").run(new Date().toISOString(), dPre);
+  const imp4 = importCsv(makeCsv([row('AR9', 2, 'TASK-B', 3)]), { fileName: 'prb4.csv', generatedAt: '2027-01-01T03:00:00Z' });
+  ok(imp4.ok && !/消えた明細/.test(db.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message), '既に取消済みなら「消えた明細の取消」に数えない');
+  ok(destOf(dPre).cancel_reason === 'reopen', '取消理由も上書きしない');
+}
+
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;

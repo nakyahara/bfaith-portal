@@ -28,7 +28,7 @@ import {
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
   getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
-  getMeta, setMetaValue,
+  getMeta, setMetaValue, sourceOfTruth,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
@@ -42,6 +42,8 @@ import {
   startTaskSession, countChangesSince, switchSourceOfTruth,
 } from './tasks-db.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
+import { notionSweepRunning } from '../inbound-check/notion-sync.js';
+import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
 import {
   addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
   recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
@@ -211,7 +213,7 @@ router.get('/', (req, res) => {
  * 正本 (要件定義 v1.1 §F の切替)。'notion' = 従来どおり Notion のカードを読み書きする /
  * 'app' = f_iroha_tasks が正本 (Notion は見ない)。管理画面のスイッチで切り替える
  */
-export function sourceOfTruth() { return getMeta('source_of_truth') === 'app' ? 'app' : 'notion'; }
+// sourceOfTruth は db.js (入荷受付の Notion 送信も同じ値を見る)
 const isAppMode = () => sourceOfTruth() === 'app';
 
 /**
@@ -955,7 +957,7 @@ let lastPlan = null;   // { planId, at, by, since, cutoff, truncated, rows, summ
 const PLAN_MAX_AGE_MS = 30 * 60 * 1000;
 function migrationStatus() {
   try {
-    return { counts: countTasksByStatus(), review: listTasksNeedingReview().length, orphans: listOrphans(20), files: listMigrationFiles(),
+    return { counts: countTasksByStatus(), review: listTasksNeedingReview().length, orphans: listOrphans(20), linkConflicts: listLinkConflicts(20), linkConflictsTotal: countLinkConflicts(), files: listMigrationFiles(),
       lastPlanAt: lastPlan ? lastPlan.at : null, lastPlanBy: lastPlan ? lastPlan.by : null, lastPlanSummary: lastPlan ? lastPlan.summary : null };
   } catch (e) {
     const ref = Date.now().toString(36);
@@ -1017,6 +1019,16 @@ router.post('/admin/migration/apply', checkOrigin, requireAdmin, api((req, res) 
   res.json({ ok: true, ...out, planId: lastPlan.planId, nextSince: lastPlan.cutoff, reconcile: reconcile(lastPlan.rows, { mode: lastPlan.since ? 'delta' : 'full' }) });
 }));
 
+/** 紐付け衝突の統合 (確定側 task_id と、残す側 keep=import|inbound)。1 tx で行き先・ページ・記録を残す側へ */
+router.post('/admin/migration/link-conflicts/merge', checkOrigin, requireAdmin, api((req, res) => {
+  const taskId = parseTaskId(req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  const r = mergeLinkConflict({ taskId, keep: String(req.body?.keep || 'import'), actor: req.iwUser });
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : (r.error === 'keep_closed' || r.error === 'from_active') ? 409 : 400).json(r);
+  safeLog({ action: 'link_conflict_merge', pageId: null, deviceLabel: `session:${req.iwUser}`, from: `task#${r.closed}`, to: `task#${r.kept}`, ok: true });
+  res.json({ ...r, remaining: countLinkConflicts() });
+}));
+
 router.get('/admin/migration/status', requireAdmin, api((req, res) => {
   res.json({ ok: true, ...migrationStatus(), source: sourceOfTruth() });
 }));
@@ -1034,6 +1046,10 @@ router.post('/admin/source', checkOrigin, requireAdmin, api((req, res) => {
   if (from === to) return res.json({ ok: true, source: to, unchanged: true });
   const counts = countTasksByStatus();
   const open = OPEN_STATUSES.reduce((s, k) => s + (counts.byStatus[k] || 0), 0);
+  if (to === 'app' && notionSweepRunning()) {
+    // 17:30 の一括送信の途中で切り替えると、送信側は打ち切るが「どこまで送ったか」が読みにくい。終わってから切り替える (Codex PR-B R1 #3)
+    return res.status(409).json({ ok: false, error: 'sweep_running', message: '入荷受付の Notion 送信が動いています。終わってから (数分後に) もう一度お試しください' });
+  }
   if (to === 'app' && open === 0) {
     return res.status(409).json({ ok: false, error: 'no_tasks', message: '未完了のタスクが 1 件もありません。先に Notion からの取込を済ませてください' });
   }

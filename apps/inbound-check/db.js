@@ -16,6 +16,10 @@ import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
 import { listTapCandidates, getStaffByNo, tapName } from '../staff/db.js';
 import { parseInboundCsv } from './csv.js';
+// いろは在庫化アプリのタスク (PR-B): 「いろはで在庫化」の確定と同じトランザクションで f_iroha_tasks に 1 枚作る。
+// 取消 (やり直し・再取込) も同じ tx でタスク側へ伝える。同じ warehouse-mirror.db の同じ接続
+import { createTaskForDestination } from '../iroha-work/task-intake.js';
+import { requestCancellation } from '../iroha-work/tasks-db.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -687,6 +691,19 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     }
     const cancelDest = db.prepare(`UPDATE f_inbound_check_destinations
       SET cancelled_at = ?, cancelled_by = 'import', cancel_reason = ? WHERE id = ? AND cancelled_at IS NULL`);
+    // 行き先の取消は「実際に取り消せた (1 行)」ときだけ在庫化アプリのタスクにも伝える
+    const cancelDestAndTask = (destinationId, reason) => {
+      if (cancelDest.run(now, reason, destinationId).changes !== 1) return false;   // 既に取消済み等 (数えない)
+      requestCancellation({ destinationId, source: 'inbound_import', actor: actor || 'import' });
+      return true;
+    };
+    // ⭐新しい CSV から行ごと消えた確認済み行 (伝票の明細が削除された) も、行き先を取り消す。
+    //   ループは新 CSV の行しか見ないので、ここで先に拾う (Codex PR-B R1 #1: 消えた明細の作業指示が生き続けていた)
+    const incomingKeys = new Set(parsed.rows.map((r) => r.line_key));
+    let removed = 0;
+    for (const p of carry.values()) {
+      if (p.status === 'checked' && p.destination_id && !incomingKeys.has(p.line_key) && cancelDestAndTask(p.destination_id, 'line_removed')) removed++;
+    }
     let carried = 0;
     for (const r of parsed.rows) {
       insLine.run(batchId, r.line_key, r.ar_no, r.line_no, r.detail_no, r.product_id, r.code_key, r.product_name, r.barcode, r.planned_qty, r.received_qty, r.seq);
@@ -699,7 +716,7 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       if (keepChecked) carried++;
       // 確認を引き継げない行の行き先実績は取り消す (いろはへ送る数が二重計上されないように)
       if (p && p.status === 'checked' && p.destination_id && !keepChecked) {
-        cancelDest.run(now, sameProduct ? 'planned_changed' : 'product_changed', p.destination_id);
+        cancelDestAndTask(p.destination_id, sameProduct ? 'planned_changed' : 'product_changed');
       }
       insState.run(batchId, r.line_key, keepChecked ? 'checked' : 'unchecked',
         keepChecked ? p.checked_by : null, keepChecked ? p.checked_device : null, keepChecked ? p.checked_at : null,
@@ -707,7 +724,7 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
         keepChecked ? p.destination_id : null, sameProduct ? p.current_pack_qty : null);
     }
     logImport(db, { actor, source, fileName, ok: true, batchId,
-      message: `${parsed.rows.length}行 / ${slipsMap.size}伝票` + (carried ? ` (同日の確認 ${carried}行を引き継ぎ)` : '') });
+      message: `${parsed.rows.length}行 / ${slipsMap.size}伝票` + (carried ? ` (同日の確認 ${carried}行を引き継ぎ)` : '') + (removed ? ` (消えた明細の行き先 ${removed}件を取消)` : '') });
     cleanupOld(db);
     return { ok: true, batch: getBatch(batchId), rowCount: parsed.rows.length, slipCount: slipsMap.size, carriedOver: carried, imageSkus: parsed.rows.map(r => r.product_id) };
   });
@@ -1338,6 +1355,11 @@ export function finalizeLine({ batchId, lineKey, expectVersion, expectQuantityVe
       destinationId = Number(di.lastInsertRowid);
       db.prepare('UPDATE f_inbound_check_line_state SET destination_id = ? WHERE batch_id = ? AND line_key = ?')
         .run(destinationId, active.id, line.line_key);
+      // ⭐いろは行きは、その場で在庫化アプリのタスクになる (17:30 を待たない)。失敗すれば確定ごと巻き戻る
+      if (decided.destination === 'iroha') {
+        const dest = db.prepare('SELECT * FROM f_inbound_check_destinations WHERE id = ?').get(destinationId);
+        createTaskForDestination(dest, { actor: w, barcode: line.barcode || null });
+      }
     }
     db.prepare(`INSERT INTO f_inbound_check_events
       (batch_id, line_key, ar_no, action, worker, staff_id, device_id, device_label, created_at,
@@ -1402,6 +1424,8 @@ export function reopenLine({ batchId, lineKey, expectVersion, expectQuantityVers
     if (state.destination_id) {
       db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = ?, cancelled_by = ?, cancel_reason = 'reopen' WHERE id = ? AND cancelled_at IS NULL")
         .run(now, w, state.destination_id);
+      // 在庫化アプリのタスクにも伝える (未着手・実績なしは自動で取消、着手後は職員の要確認に倒す)
+      requestCancellation({ destinationId: state.destination_id, source: 'inbound_reversal', actor: w });
     }
     const last = db.prepare("SELECT id FROM f_inbound_check_events WHERE batch_id = ? AND line_key = ? AND action = 'check' ORDER BY id DESC LIMIT 1")
       .get(active.id, line.line_key);

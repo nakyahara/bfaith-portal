@@ -619,6 +619,8 @@ export function getMeta(key) {
 }
 
 export function setMetaValue(key, value) { setMeta(getDB(), key, value); }
+/** 正本: 'notion' | 'app' (管理画面 /admin/source で切替。入荷受付の Notion 送信もこれを見る) */
+export function sourceOfTruth() { return getMeta('source_of_truth') === 'app' ? 'app' : 'notion'; }
 
 // ───────────────────────── 作業者 (いろは名簿) ─────────────────────────
 

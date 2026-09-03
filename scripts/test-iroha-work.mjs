@@ -1554,12 +1554,156 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     ok(audit && audit.from_value === 'app' && /^notion \(未完了 \d+ 件・Notion 未反映: 状態変更 \d+ 回\/更新タスク \d+\/作業時間 \d+\/写真 \d+ \(force\)\)$/.test(audit.to_value)
       && audit.device_label === 'session:admin@test.local', '監査ログに件数と force と誰がが残る');
     ok((await call('GET', '/api/state', { cookie })).json.mode === 'notion', '戻した後の一覧は Notion 正本');
+    const ms = await call('GET', '/admin/migration/status', { ...admin });
+    ok(ms.status === 200 && ms.json.ok && Array.isArray(ms.json.linkConflicts) && typeof ms.json.linkConflictsTotal === 'number', '移行の状態 (管理画面の元データ) に紐付け衝突の一覧と総件数が載る');
+
+    // 紐付け衝突の統合 (Codex PR-B R3 Medium): 確定側 (行き先あり・ページなし) と 取込側 (ページあり) が同じカード → 1 枚に
+    {
+      const { createTaskForDestination, listLinkConflicts, countLinkConflicts } = await import('../apps/iroha-work/task-intake.js');
+      const { startSession, stopSession } = await import('../apps/iroha-work/db.js');
+      const { addMedia, _setDriveUpload } = await import('../apps/iroha-work/media.js');
+      db.exec(`CREATE TABLE IF NOT EXISTS f_inbound_check_destinations (id INTEGER PRIMARY KEY, batch_id INTEGER, line_key TEXT, ar_no TEXT, product_id TEXT, product_name TEXT,
+        planned_qty INTEGER, destination TEXT, decided_from TEXT, worker TEXT, decided_at TEXT, cancelled_at TEXT, expiry_date TEXT, work_date TEXT, code_key TEXT, actual_qty INTEGER, notion_page_id TEXT)`);
+      db.prepare(`INSERT OR REPLACE INTO f_inbound_check_destinations (id, batch_id, line_key, ar_no, product_id, product_name, planned_qty, destination, decided_from, worker, decided_at, work_date, code_key, actual_qty, notion_page_id)
+        VALUES (9950, 1, 'M|1|1', 'AR-M', 'MERGE-X', '統合テスト', 5, 'iroha', 'chosen', 'test', '2026-09-03T00:00:00Z', '2026-09-03', 'merge-x', 5, 'merge-page-1')`).run();
+      const inbound = createTaskForDestination(db.prepare('SELECT * FROM f_inbound_check_destinations WHERE id = 9950').get(), { actor: 'test' }).id;
+      const imported = TD.upsertTaskFromImport({ notion_page_id: 'merge-page-1', status: 'in_progress', destination_id: null, product_code: 'MERGE-X', product_name: '統合テスト', qty: 5, started_at: '2026-09-03T01:00:00Z' }, { batchId: 'test-merge' }).id;
+      ok(countLinkConflicts() >= 1 && listLinkConflicts().some((c) => c.task_id === inbound && c.other_task_id === imported), '前提: 衝突がある');
+      // 確定側に記録を付けておく (統合で残す側へ移ることを見る)
+      const s = startSession({ taskId: inbound, worker: getIrohaWorker(w1.id) });
+      stopSession({ taskId: inbound, workerId: w1.id, sessionId: s.sessionId, reason: 'done' });
+      _setDriveUpload(async ({ operationId }) => ({ fileId: 'f-' + operationId, url: 'https://drive/' + operationId }));
+      const jpeg2 = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(64, 1)]);
+      const mp3 = path.join(process.env.DATA_DIR, 'merge.jpg'); fs.writeFileSync(mp3, jpeg2);
+      const m = addMedia({ taskId: inbound, productCode: 'MERGE-X', kind: 'photo', filePath: mp3, worker: getIrohaWorker(w1.id), operationId: 'op-merge-0001' });
+      _setDriveUpload(null);
+      ok(m.ok, '前提: 確定側に作業時間と写真');
+      ok((await call('POST', '/admin/migration/link-conflicts/merge', { cookie, body: { task_id: inbound, keep: 'import' } })).status === 403, '統合は管理者だけ');
+      ok((await call('POST', '/admin/migration/link-conflicts/merge', { ...admin, body: { task_id: inbound, keep: 'both' } })).status === 400, 'keep は import / inbound');
+      const mg = await call('POST', '/admin/migration/link-conflicts/merge', { ...admin, body: { task_id: inbound, keep: 'import' } });
+      ok(mg.status === 200 && mg.json.ok && mg.json.kept === imported && mg.json.closed === inbound, '統合 (取込側を残す)');
+      const kept = TD.getTask(imported), gone = TD.getTask(inbound);
+      ok(kept.destination_id === 9950 && kept.notion_page_id === 'merge-page-1' && kept.status === 'in_progress', '残す側に行き先とページが集まる (状態はそのまま)');
+      ok(gone.destination_id == null && gone.notion_page_id == null && gone.status === 'closed' && gone.close_reason === 'cancelled' && /統合 → task#/.test(gone.migration_note), '消える側は行き先・ページを失って終了 (取消)。どこへ統合したか残る');
+      ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(imported).c === 1 && db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id = ?').get(imported).c === 1
+        && db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(inbound).c === 0, '作業時間・写真は残す側へ付け替わる');
+      ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_merge' AND task_id = ?").get(imported).c === 1, '履歴に統合が残る');
+      ok(!listLinkConflicts().some((c) => c.task_id === inbound) && mg.json.remaining === countLinkConflicts(), '衝突は解消 (一覧から消える・残数を返す)');
+      ok((await call('POST', '/admin/migration/link-conflicts/merge', { ...admin, body: { task_id: inbound, keep: 'import' } })).status === 404, '解消済みをもう一度統合しようとすると 404');
+      // 確定側を残す向きも通る
+      db.prepare(`INSERT OR REPLACE INTO f_inbound_check_destinations (id, batch_id, line_key, ar_no, product_id, product_name, planned_qty, destination, decided_from, worker, decided_at, work_date, code_key, actual_qty, notion_page_id)
+        VALUES (9951, 1, 'M|2|1', 'AR-M', 'MERGE-Y', '統合テスト2', 2, 'iroha', 'chosen', 'test', '2026-09-03T00:00:00Z', '2026-09-03', 'merge-y', 2, 'merge-page-2')`).run();
+      const inbound2 = createTaskForDestination(db.prepare('SELECT * FROM f_inbound_check_destinations WHERE id = 9951').get()).id;
+      const imported2 = TD.upsertTaskFromImport({ notion_page_id: 'merge-page-2', status: 'not_started', destination_id: null, product_code: 'MERGE-Y', qty: 2 }, { batchId: 'test-merge' }).id;
+      const mg2 = await call('POST', '/admin/migration/link-conflicts/merge', { ...admin, body: { task_id: inbound2, keep: 'inbound' } });
+      ok(mg2.status === 200 && mg2.json.kept === inbound2 && TD.getTask(inbound2).notion_page_id === 'merge-page-2' && TD.getTask(imported2).status === 'closed' && TD.getTask(imported2).notion_page_id == null, '確定側を残す統合 (取込側が終了)');
+
+      // Codex PR-B R4: 残す側が終了なら拒否 / 両方終了は通す / 消える側に作業中の人がいれば拒否 / 着手済みを未着手へ統合すると作業中に昇格 / 取消済み行き先は取消を伝える
+      const seedDest = (id, code, page) => db.prepare(`INSERT OR REPLACE INTO f_inbound_check_destinations (id, batch_id, line_key, ar_no, product_id, product_name, planned_qty, destination, decided_from, worker, decided_at, work_date, code_key, actual_qty, notion_page_id)
+        VALUES (?, 1, ?, 'AR-M', ?, ?, 1, 'iroha', 'chosen', 'test', '2026-09-03T00:00:00Z', '2026-09-03', ?, 1, ?)`).run(id, 'M|' + id, code, code, code.toLowerCase(), page);
+      const mkPair = (id, code, { importStatus = 'not_started', inboundStatus = null } = {}) => {
+        seedDest(id, code, 'merge-page-' + id);
+        const inb = createTaskForDestination(db.prepare('SELECT * FROM f_inbound_check_destinations WHERE id = ?').get(id)).id;
+        const imp = TD.upsertTaskFromImport({ notion_page_id: 'merge-page-' + id, status: importStatus, close_reason: importStatus === 'closed' ? 'stocked' : null, closed_at: importStatus === 'closed' ? '2026-09-03T00:00:00Z' : null,
+          destination_id: null, product_code: code, qty: 1, started_at: importStatus === 'not_started' ? null : '2026-09-03T01:00:00Z' }, { batchId: 'test-merge' }).id;
+        if (inboundStatus) db.prepare("UPDATE f_iroha_tasks SET status = ?, started_at = '2026-09-03T02:00:00Z' WHERE id = ?").run(inboundStatus, inb);
+        return { inb, imp };
+      };
+      const merge = (taskId, keep) => call('POST', '/admin/migration/link-conflicts/merge', { ...admin, body: { task_id: taskId, keep } });
+      const w2 = listIrohaWorkers(true).find((w) => w.display_name === 'すずき');
+      // (1) 取込側が終了 (棚入完了) で keep=import → 409、keep=inbound は通る
+      const p1 = mkPair(9960, 'MERGE-C1', { importStatus: 'closed' });
+      const r1 = await merge(p1.inb, 'import');
+      ok(r1.status === 409 && r1.json.error === 'keep_closed' && TD.getTask(p1.inb).destination_id === 9960, '残す側が終了なら 409 keep_closed (何も変わらない)');
+      const r1b = await merge(p1.inb, 'inbound');
+      ok(r1b.status === 200 && TD.getTask(p1.inb).notion_page_id === 'merge-page-9960' && TD.getTask(p1.imp).close_reason === 'stocked' && /統合 → task#/.test(TD.getTask(p1.imp).migration_note), '開いている確定側を残せば通る。既に終了していた側は終了理由そのまま (stocked)');
+      // (2) 両方終了 → 通す
+      const p2 = mkPair(9961, 'MERGE-C2', { importStatus: 'closed' });
+      db.prepare("UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = '2026-09-03T03:00:00Z' WHERE id = ?").run(p2.inb);
+      const r2 = await merge(p2.inb, 'import');
+      ok(r2.status === 200 && TD.getTask(p2.imp).destination_id === 9961 && TD.getTask(p2.imp).status === 'closed', '両方終了なら統合できる (履歴の整理)');
+      // (3) 消える側で作業中 → 409 from_active (両方向)
+      const p3 = mkPair(9962, 'MERGE-C3', { importStatus: 'in_progress' });
+      const sA = startSession({ taskId: p3.inb, worker: getIrohaWorker(w1.id) });
+      const r3 = await merge(p3.inb, 'import');
+      ok(r3.status === 409 && r3.json.error === 'from_active' && db.prepare('SELECT task_id FROM f_iroha_work_sessions WHERE id = ?').get(sA.sessionId).task_id === p3.inb, '消える側 (確定側) で作業中なら 409 from_active (セッションは動かない)');
+      stopSession({ taskId: p3.inb, workerId: w1.id, sessionId: sA.sessionId, reason: 'pause' });
+      const sB = startSession({ taskId: p3.imp, worker: getIrohaWorker(w2.id) });
+      const r3b = await merge(p3.inb, 'inbound');
+      ok(r3b.status === 409 && r3b.json.error === 'from_active', '消える側 (取込側) で作業中でも 409 from_active');
+      stopSession({ taskId: p3.imp, workerId: w2.id, sessionId: sB.sessionId, reason: 'pause' });
+      // (4) 取込側が作業中 (人はいない) を、未着手の確定側に統合 → 確定側が作業中へ昇格・started_at を引き継ぐ
+      const r4 = await merge(p3.inb, 'inbound');
+      const k4 = TD.getTask(p3.inb);
+      ok(r4.status === 200 && r4.json.promoted && k4.status === 'in_progress' && k4.started_at === '2026-09-03T01:00:00Z' && k4.notion_page_id === 'merge-page-9962', '着手済みの側を未着手側へ統合すると作業中に昇格 (started_at を引き継ぐ)');
+      ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(p3.inb).c === 2 && /読み直して/.test(r4.json.note), '作業時間は残す側に集まる。応答に再読込の案内');
+      // (5) 行き先が取消済み → 統合後に残す側へ取消を伝える (未着手・実績なしなら自動で終了:取消)
+      const p5 = mkPair(9963, 'MERGE-C5');
+      db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = '2026-09-03T04:00:00Z' WHERE id = 9963").run();
+      const r5 = await merge(p5.inb, 'import');
+      const k5 = TD.getTask(p5.imp);
+      ok(r5.status === 200 && r5.json.cancellation === 'closed' && k5.status === 'closed' && k5.close_reason === 'cancelled' && k5.destination_id === 9963, '取消済み行き先の統合は残す側も取消 (未着手・実績なし)');
+      // (6) 消える側に取消の要求 (要確認) があれば残す側へ引き継ぐ
+      const p6 = mkPair(9964, 'MERGE-C6', { importStatus: 'in_progress' });
+      db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T05:00:00Z', cancellation_source = 'inbound_reversal' WHERE id = ?").run(p6.inb);
+      const r6 = await merge(p6.inb, 'import');
+      ok(r6.status === 200 && TD.getTask(p6.imp).cancellation_requested_at === '2026-09-03T05:00:00Z' && TD.getTask(p6.imp).cancellation_source === 'inbound_reversal', '消える側の取消要求 (要確認) は残す側へ引き継ぐ');
+      // (7) 残す側が過去に「続行」済み (日時なし・古い出どころだけ残る) へ、取消要求中の消える側を統合 → 日時と出どころは対で消える側から (Codex PR-B R5)
+      const p7 = mkPair(9965, 'MERGE-C7', { importStatus: 'in_progress' });
+      db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, cancellation_source = 'inbound_reversal' WHERE id = ?").run(p7.imp);
+      db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T06:00:00Z', cancellation_source = 'inbound_import' WHERE id = ?").run(p7.inb);
+      const r7 = await merge(p7.inb, 'import');
+      ok(r7.status === 200 && TD.getTask(p7.imp).cancellation_requested_at === '2026-09-03T06:00:00Z' && TD.getTask(p7.imp).cancellation_source === 'inbound_import', '日時と出どころは同じ側から対で引き継ぐ (古い出どころと混ざらない)');
+      // (8) 残す側に要求があれば、消える側の要求で上書きしない
+      const p8 = mkPair(9966, 'MERGE-C8', { importStatus: 'in_progress' });
+      db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T07:00:00Z', cancellation_source = 'inbound_reversal' WHERE id = ?").run(p8.imp);
+      db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T08:00:00Z', cancellation_source = 'inbound_import' WHERE id = ?").run(p8.inb);
+      const r8 = await merge(p8.inb, 'import');
+      ok(r8.status === 200 && TD.getTask(p8.imp).cancellation_requested_at === '2026-09-03T07:00:00Z' && TD.getTask(p8.imp).cancellation_source === 'inbound_reversal', '残す側の要求はそのまま (消える側で上書きしない)');
+      ok(!listLinkConflicts().some((c) => [p1.inb, p2.inb, p3.inb, p5.inb, p6.inb, p7.inb, p8.inb].includes(c.task_id)), '統合した衝突は一覧から消える');
+    }
   } finally {
     _setDriveUpload(null);
     delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
     setMetaValue('source_of_truth', null);
     server.close();
   }
+}
+
+console.log('\n[20] 入荷受付からのタスク生成 (task-intake) と差分取込の整合');
+{
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const M = await import('../apps/iroha-work/migrate.js');
+  const S = await import('../apps/iroha-work/service.js');
+  const num = (n) => ({ type: 'number', number: n });
+  const { createTaskForDestination, linkTaskToNotionPage } = await import('../apps/iroha-work/task-intake.js');
+  const { sourceOfTruth } = await import('../apps/iroha-work/db.js');
+  const db = getDB();
+  db.prepare(`INSERT OR REPLACE INTO f_iroha_work_master (code_key, 商品コード, material_code, storage_container, units_per_container, process_count, note, version, updated_at)
+    VALUES ('intake-x', 'INTAKE-X', 'D-9', '箱', 12, 1, NULL, 2, '2026-09-03T00:00:00Z')`).run();
+  const dest = { id: 9901, destination: 'iroha', batch_id: 1, line_key: 'X|1|1', ar_no: 'AR-X', product_id: 'INTAKE-X', product_name: '入荷商品', planned_qty: 10, actual_qty: 8,
+    work_date: '2026-09-03', expiry_date: null, code_key: 'intake-x', cancelled_at: null };
+  const made = createTaskForDestination(dest, { actor: 'やまだ' });
+  const t = TD.getTask(made.id);
+  ok(made.action === 'inserted' && t.destination_id === 9901 && t.qty === 8 && t.status === 'not_started' && t.created_by === 'inbound:やまだ', '行き先 1 行からタスク 1 枚 (数量は実数)');
+  ok(t.master_snapshot && JSON.parse(t.master_snapshot).material_code === 'D-9' && JSON.parse(t.master_snapshot).units_per_container === 12, '作業仕様があればスナップショットに載る');
+  ok(createTaskForDestination(dest).action === 'exists', '同じ行き先は 2 枚にならない');
+  ok(createTaskForDestination({ ...dest, id: 9902, destination: 'bfaith' }).action === 'skipped' && createTaskForDestination({ ...dest, id: 9903, cancelled_at: 'x' }).action === 'skipped', 'B-Faith 行き・取消済みは作らない');
+  clearEnrichCache();
+  ok(S.buildTaskList().cards.some(c => c.id === made.id && c.master.material_code === 'D-9' && c.qty === 8), '一覧にそのまま出る (作業仕様つき)');
+  // Notion 正本の間にカードが作られたら紐付く → 差分取込は同じタスクの更新になる (衝突扱いしない)
+  const pg = mkPage({ status: '未着手', title: '入荷商品 (Notion 側)', code: 'INTAKE-X', qty: 8, props: { destination_id: num(9901) } });
+  const pagesOf = async () => (await M.surveyNotion({ save: false })).pages.filter(p => p.pageId === pg.id);
+  const plan0 = M.planImport(await pagesOf());
+  ok(plan0.rows[0].warnings.some(w => /dup_destination_db/.test(w)), '紐付け前は DB 既存 destination との衝突として要確認');
+  ok(linkTaskToNotionPage(9901, pg.id) === 1 && TD.getTask(made.id).notion_page_id === pg.id, 'カード作成時に notion_page_id を紐付ける');
+  ok(linkTaskToNotionPage(9901, 'other-page') === 0 && TD.getTask(made.id).notion_page_id === pg.id, '既に付いていれば触らない');
+  ok(linkTaskToNotionPage(null, pg.id) === 0 && linkTaskToNotionPage(9901, null) === 0, '引数が無ければ何もしない');
+  const plan1 = M.planImport(await pagesOf());
+  ok(!plan1.rows[0].warnings.some(w => /dup_destination_db/.test(w)) && plan1.rows[0].will_import, '紐付け後は同じタスクとして取り込める');
+  const applied = M.applyImport(plan1.rows, { batchId: 'test-intake' });
+  ok(applied.inserted === 0 && (applied.updated + applied.kept) === 1 && TD.getTaskByDestination(9901).id === made.id && TD.getTask(made.id).notion_page_id === pg.id, '取込は既存タスクの更新 (2 枚目を作らない)');
+  ok(sourceOfTruth() === 'notion', 'sourceOfTruth は db.js から引ける (既定 notion)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

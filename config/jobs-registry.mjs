@@ -570,7 +570,10 @@ export const JOBS_REGISTRY = [
     purpose: '入荷受付チェックで「いろはで在庫化」と確定した明細を Notion「在庫化作業管理」DB のカードにする'
       + ' (旧 GAS 在庫化カード生成の置き換え・2026-09-02)。1日1回の一括送信 — 当日中のやり直し (確認→取消→再確認) を'
       + '送信前に収束させるため都度送信にしない。送信後に取り消された行はカードをステータス「取消」に倒し、'
-      + '着手後の取消は管理画面の要確認一覧に出す。止まると いろはに作業カードが届かない',
+      + '着手後の取消は管理画面の要確認一覧に出す。止まると いろはに作業カードが届かない。'
+      + '⭐2026-09-03 PR-B: 確定と同時に f_iroha_tasks (在庫化アプリ) にもタスクを作るようになった。'
+      + '正本をアプリに切り替えた後 (在庫化アプリ /admin/source) は Notion へ送らず ok ping だけ打つ → '
+      + '切替が定着したらこのエントリを retired にして cron (startInboundCheckNotionCron) を外す',
     where: 'Render bfaith-portal 内 node-cron (apps/inbound-check/sync-job.js startInboundCheckNotionCron。'
       + 'INBOUND_CHECK_NOTION_ENABLED=false で停止)',
     schedule: '毎日 17:30 JST (env INBOUND_CHECK_NOTION_CRON)。手動 = 管理画面「今すぐ Notion へ送る」',

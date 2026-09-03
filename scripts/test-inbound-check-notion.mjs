@@ -481,5 +481,77 @@ console.log('\n[calcExternal 単体 + 新商品ラベル]');
   ok(calcExternal(30, 10).externalOk === 0, 'キープ数を割ると 0 (外部施設NG)');
 }
 
+console.log('\n[PR-B] 確定時タスクとの紐付け / アプリ正本なら Notion へ送らない');
+{
+  const IW = await import('../apps/iroha-work/db.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const { createTaskForDestination } = await import('../apps/iroha-work/task-intake.js');
+  const dId = seedDest({ product: 'PROD-A', line: 'L1', qty: 10, actual: 9 });
+  const made = createTaskForDestination(destRow(dId), { actor: 'テスト' });
+  ok(made.action === 'inserted' && TD.getTaskByDestination(dId).notion_page_id == null, '前提: 確定時のタスク (Notion ページなし)');
+  const r = await runNotionSweep({ actor: 'manual', mode: 'full' });
+  const d = destRow(dId);
+  ok(r.ok && d.notion_page_id && TD.getTaskByDestination(dId).notion_page_id === d.notion_page_id, 'カードを作ったらタスクに notion_page_id が付く');
+  // アプリ正本: 何もしない (Notion を 1 回も呼ばない・台帳も触らない)
+  const dId2 = seedDest({ product: 'PROD-B', line: 'L2', qty: 5, actual: 5 });
+  createTaskForDestination(destRow(dId2));
+  IW.setMetaValue('source_of_truth', 'app');
+  const origFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async (...a) => { calls++; return origFetch(...a); };
+  let r2;
+  try { r2 = await runNotionSweep({ actor: 'cron', mode: 'full' }); } finally { global.fetch = origFetch; }
+  ok(r2.ok && r2.skipped === 'app_mode' && calls === 0, 'アプリ正本の間は Notion を 1 回も呼ばない (ok・skipped=app_mode)');
+  ok(destRow(dId2).notion_page_id == null && collectUnsent(db).some(x => x.id === dId2), '未送信のまま (行き先台帳は触らない)');
+  ok(notionStatusForAdmin().source === 'app', '管理画面の状態に正本が出る');
+  IW.setMetaValue('source_of_truth', null);
+  const r3 = await runNotionSweep({ actor: 'manual', mode: 'full' });
+  ok(r3.ok && destRow(dId2).notion_page_id && TD.getTaskByDestination(dId2).notion_page_id === destRow(dId2).notion_page_id, 'Notion 正本に戻せば送る (紐付けも付く)');
+
+  // (a) 台帳に記録した後・紐付けの前に落ちた状態 → 次の sweep の先頭で補修 (Codex PR-B R1 #2)
+  const { linkTaskToNotionPage, backfillTaskLinks, countLinkConflicts, listLinkConflicts } = await import('../apps/iroha-work/task-intake.js');
+  db.prepare('UPDATE f_iroha_tasks SET notion_page_id = NULL WHERE destination_id = ?').run(dId2);
+  ok(TD.getTaskByDestination(dId2).notion_page_id == null, '前提: タスク側の紐付けだけ無い');
+  const r4 = await runNotionSweep({ actor: 'manual', mode: 'full' });
+  ok(r4.ok && r4.linked === 1 && TD.getTaskByDestination(dId2).notion_page_id === destRow(dId2).notion_page_id, '次の sweep が紐付けを補修する (linked=1)');
+  // 同じページを別タスクが持っていたら黙らない (履歴に task_link_conflict)
+  const dId3 = seedDest({ product: 'PROD-C', line: 'L3', qty: 7, actual: 7 });
+  const t3id = createTaskForDestination(destRow(dId3)).id;
+  const pageOf2 = destRow(dId2).notion_page_id;
+  db.prepare('UPDATE f_inbound_check_destinations SET notion_page_id = ? WHERE id = ?').run(pageOf2, dId3);   // 台帳が別タスクのページを指す状態
+  const res = linkTaskToNotionPage(dId3, pageOf2);
+  ok(res === 'conflict' && TD.getTaskByDestination(dId3).notion_page_id == null, '別タスクが持つページは conflict (上書きしない)');
+  ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_link_conflict' AND task_id = ?").get(t3id).c === 1, '履歴に task_link_conflict が残る');
+  const lc = listLinkConflicts();
+  ok(lc.length === 1 && lc[0].task_id === t3id && lc[0].other_task_id === TD.getTaskByDestination(dId2).id && lc[0].notion_page_id === pageOf2, 'いま衝突している紐付けを DB から一覧できる (どのタスクとどのタスクか)');
+  ok(notionStatusForAdmin().linkConflicts.length === 1 && notionStatusForAdmin().linkConflicts[0].task_id === t3id && notionStatusForAdmin().linkConflictsTotal === 1, '入荷受付の管理画面の状態に衝突が載る (一覧と総件数)');
+  ok(backfillTaskLinks().conflicts === 1 && countLinkConflicts() === 1, '補修でも直らない (人が整理するまで残る)');
+  db.prepare('UPDATE f_inbound_check_destinations SET notion_page_id = NULL WHERE id = ?').run(dId3);   // 整理した (台帳側を戻す)
+  ok(countLinkConflicts() === 0 && notionStatusForAdmin().linkConflicts.length === 0, '解消すれば 0 に戻る (履歴は残る)');
+
+  // (b) sweep の途中で正本がアプリに切り替わったら、それ以降のカードは作らない (Codex PR-B R1 #3)
+  const dId4 = seedDest({ product: 'PROD-A', line: 'L1', qty: 10, actual: 10 });
+  createTaskForDestination(destRow(dId4));
+  createTaskForDestination(destRow(dId3));
+  const unsentBefore = collectUnsent(db).map(x => x.id);
+  ok(unsentBefore.includes(dId3) && unsentBefore.includes(dId4), '前提: 未送信 2 件');
+  const createdBefore = mock.created.length;
+  const orig2 = global.fetch;
+  global.fetch = async (url, opts = {}) => {
+    const resp = await orig2(url, opts);
+    if (String(url).endsWith('/pages') && (opts.method || 'GET') === 'POST') IW.setMetaValue('source_of_truth', 'app');   // 1 枚目を作った直後に切替
+    return resp;
+  };
+  let r5;
+  try { r5 = await runNotionSweep({ actor: 'manual', mode: 'full' }); } finally { global.fetch = orig2; IW.setMetaValue('source_of_truth', null); }
+  ok(r5.ok && r5.skipped === 'app_mode' && r5.aborted === true, '途中で切り替わったら打ち切り (ok・aborted)');
+  ok(mock.created.length === createdBefore + 1, 'カードは 1 枚だけ作られた (2 枚目は作らない)');
+  const sentOne = [dId3, dId4].filter(id => destRow(id).notion_page_id);
+  ok(sentOne.length === 1 && TD.getTaskByDestination(sentOne[0]).notion_page_id === destRow(sentOne[0]).notion_page_id, '作った 1 枚は台帳とタスクに記録済み');
+  ok(collectUnsent(db).length === 1 && destRow(collectUnsent(db)[0].id).notion_error == null, '残り 1 件は未送信のまま (エラー扱いにしない)');
+  const { notionSweepRunning } = await import('../apps/inbound-check/notion-sync.js');
+  ok(notionSweepRunning() === false, '終わったら実行中フラグは下りる');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail === 0 ? 0 : 1;
