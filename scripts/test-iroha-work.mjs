@@ -1541,6 +1541,39 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     ok(card2 && card2.media?.length === 1 && card2.media[0].id === up.json.media.id, '一覧の詳細に写真が出る');
     const del = await call('POST', `/api/media/${up.json.media.id}/delete`, { cookie, body: { delete_token: up.json.deleteToken, worker_id: w1.id } });
     ok(del.status === 200 && del.json.ok, '削除 (削除トークン)');
+    // まとめて棚入完了 (PR-C): 棚入待ちのものだけ・職員だけ
+    {
+      const mk = (dest, name, status) => TD.upsertTaskFromImport({ notion_page_id: `bulk-${dest}`, status, destination_id: dest,
+        product_code: 'BULK-X', product_name: name, qty: 1, facility_code: 'iroha',
+        closed_at: status === 'closed' ? '2026-09-03T00:00:00Z' : null, close_reason: status === 'closed' ? 'stocked' : null }, { batchId: 'test-bulk' }).id;
+      const r1 = mk(9101, '棚入待ち1', 'ready_for_stocking');
+      const r2 = mk(9102, '棚入待ち2', 'ready_for_stocking');
+      const wip = mk(9103, '作業中', 'in_progress');
+      const already = mk(9104, 'もう棚入完了', 'closed');
+      const staff = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+      ok((await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [r1], worker_id: w1.id } })).status === 403, '利用者は まとめて棚入完了 にできない (職員のみ)');
+      ok((await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [r1], worker_id: staff.id, pin: '0000' } })).status === 403, '職員でも PIN が違えば拒否');
+      ok((await call('POST', '/api/bulk-stocked', { ...admin, body: { ids: [], worker_id: w1.id } })).json.error === 'bad_request', '1 件も選んでいなければ bad_request');
+      ok((await call('POST', '/api/bulk-stocked', { ...admin, body: { ids: [r1, '1.5'], worker_id: w1.id } })).status === 400, '不正な id が混ざっていれば 400 (何もしない)');
+      ok(TD.getTask(r1).status === 'ready_for_stocking', '拒否されたカードは棚入待ちのまま');
+      const bulk = await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [r1, r2, wip, already, 999999], worker_id: staff.id, pin: '4649' } });
+      ok(bulk.status === 200 && bulk.json.ok && bulk.json.done.length === 2 && bulk.json.done.includes(r1) && bulk.json.done.includes(r2), '職員 + PIN で 棚入待ち 2 件だけが棚入完了');
+      const why = Object.fromEntries((bulk.json.skipped || []).map((x) => [x.id, x.reason]));
+      ok(why[wip] === 'not_ready' && why[already] === 'already' && why[999999] === 'not_found', '飛ばした理由を返す (棚入待ちでない・すでに完了・見つからない)');
+      const done1 = TD.getTask(r1);
+      ok(done1.status === 'closed' && done1.close_reason === 'stocked' && done1.closed_at && done1.ready_at && TD.getTask(wip).status === 'in_progress', '棚入完了 (終了理由・時刻が入り、作業中は動かない)');
+      ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_status' AND task_id = ? AND to_value LIKE '%まとめて棚入完了%'").get(r1).c === 1, '履歴に残る');
+      ok(!(await call('GET', '/api/state', { cookie })).json.cards.some((c) => c.id === r1), '棚入完了したカードは一覧から消える');
+      // 履歴 (PR-C): 期間・検索・件数
+      const hist = await call('GET', '/api/history?q=BULK-X', { cookie });
+      ok(hist.status === 200 && hist.json.ok && hist.json.total >= 3 && hist.json.rows.some((x) => x.id === r1 && x.close_reason === 'stocked'), '履歴に終了したカードが出る (検索つき)');
+      ok(hist.json.rows[0].closed_at >= hist.json.rows[hist.json.rows.length - 1].closed_at, '新しい順');
+      const none = await call('GET', '/api/history?from=2999-01-01', { cookie });
+      ok(none.status === 200 && none.json.total === 0 && none.json.fromDate === '2999-01-01', '未来を起点にすると 0 件');
+      ok((await call('GET', '/api/history?from=zzz', { cookie })).json.fromDate === null, '日付でない from は無視する');
+      const one = await call('GET', '/api/history?q=' + encodeURIComponent('棚入待ち1'), { cookie });
+      ok(one.json.total === 1 && one.json.rows[0].id === r1 && one.json.rows[0].facility_name === 'いろは', '商品名で絞れる (拠点名つき)');
+    }
     ok(notionCalls() === calls0, 'ここまで Notion API を 1 回も呼んでいない');
     // Notion に戻す: app 正本以降の記録があるので 409 → force で通る (件数・監査ログ・切替時刻)
     const back = await call('POST', '/admin/source', { ...admin, body: { to: 'notion', confirm: 'SWITCH' } });
@@ -1704,6 +1737,61 @@ console.log('\n[20] 入荷受付からのタスク生成 (task-intake) と差分
   const applied = M.applyImport(plan1.rows, { batchId: 'test-intake' });
   ok(applied.inserted === 0 && (applied.updated + applied.kept) === 1 && TD.getTaskByDestination(9901).id === made.id && TD.getTask(made.id).notion_page_id === pg.id, '取込は既存タスクの更新 (2 枚目を作らない)');
   ok(sourceOfTruth() === 'notion', 'sourceOfTruth は db.js から引ける (既定 notion)');
+}
+
+console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧 (PR-C)');
+{
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const S = await import('../apps/iroha-work/service.js');
+  const { workSecondsByTask } = await import('../apps/iroha-work/db.js');
+  const db = getDB();
+  const w1 = listIrohaWorkers(true).find((w) => w.display_name === 'やまだ');
+  const mk = (dest, name, status) => TD.upsertTaskFromImport({ notion_page_id: `prc-${dest}`, status, destination_id: dest,
+    product_code: 'PRC-A', product_name: name, qty: 3, facility_code: dest % 2 ? 'iroha' : 'rashinban', arrival_date: '2026-09-01' }, { batchId: 'test-prc' }).id;
+
+  // まとめて棚入完了の境界
+  ok(TD.bulkCloseReady({ taskIds: [] }).error === 'bad_request', '空は bad_request');
+  ok(TD.bulkCloseReady({ taskIds: Array.from({ length: 201 }, (_, i) => i + 1) }).error === 'bad_request', '201 件は bad_request (一度に 200 件まで)');
+  const a = mk(9201, '棚入待ちA', 'ready_for_stocking');
+  const b = mk(9202, '棚入待ちB', 'ready_for_stocking');
+  const r = TD.bulkCloseReady({ taskIds: [a, b, a], actor: 'たにがわ (いろはアプリ)', workerId: w1.id, workerName: 'やまだ', deviceLabel: 'ipad-1' });
+  ok(r.ok && r.done.length === 2 && r.skipped.length === 0, '同じ id を 2 回渡しても 1 回だけ処理する');
+  ok(TD.getTask(a).closed_by === 'たにがわ (いろはアプリ)' && TD.getTask(a).close_reason === 'stocked', 'だれが棚入完了にしたかが残る');
+  const again = TD.bulkCloseReady({ taskIds: [a] });
+  ok(again.ok && again.done.length === 0 && again.skipped[0].reason === 'already' && again.skipped[0].title === '棚入待ちA', '2 回目は already (何も変えない)');
+
+  // 履歴: 期間・検索・作業時間
+  const c = mk(9203, '履歴C', 'ready_for_stocking');
+  const s1 = startSession({ taskId: c, worker: getIrohaWorker(w1.id) });
+  stopSession({ taskId: c, workerId: w1.id, sessionId: s1.sessionId, reason: 'done' });
+  db.prepare("UPDATE f_iroha_work_sessions SET raw_seconds = 3660 WHERE task_id = ?").run(c);
+  TD.bulkCloseReady({ taskIds: [c], actor: 'test' });
+  const secs = workSecondsByTask([c, a]);
+  ok(secs.get(c).seconds === 3660 && secs.get(c).people === 1 && !secs.has(a), '作業時間の合計をタスクごとに引ける (記録が無いタスクは入らない)');
+  ok(workSecondsByTask([]).size === 0 && workSecondsByTask([0, -1, 1.5]).size === 0, '不正な id は数えない');
+  const h = S.buildHistory({ q: 'PRC-A' });
+  ok(h.total === 3 && h.rows.length === 3 && h.rows[0].id === c, '履歴は新しい順 (終了した 3 件)');
+  const row = h.rows.find((x) => x.id === c);
+  ok(row.work_seconds === 3660 && row.workers === 1 && row.status_label === '終了 · 棚入完了' && row.facility_name === 'いろは', '履歴に作業時間・結果・拠点名が出る');
+  ok(h.rows.find((x) => x.id === 9202 || x.title === '棚入待ちB').facility_name === '羅針盤', '外部拠点の名前も出る');
+  ok(S.buildHistory({ q: 'PRC-A', limit: 1 }).rows.length === 1 && S.buildHistory({ q: 'PRC-A', limit: 1 }).total === 3, '上限をかけても総件数は正しい');
+  ok(S.buildHistory({ q: 'PRC-A', from: '2999-01-01T00:00:00Z' }).total === 0, '期間で絞れる');
+  ok(TD.countClosedTasks({ q: 'ないものPRC' }) === 0, '検索は商品名・商品コードだけ');
+
+  // ラベル待ちの一覧に商品情報が乗る
+  const d = TD.upsertTaskFromImport({ notion_page_id: 'prc-9204', status: 'on_hold', hold_reason_code: 'label_shortage', destination_id: 9204,
+    product_code: 'PRC-A', product_name: 'ラベル待ちD', qty: 3, facility_code: 'iroha', arrival_date: '2026-09-01' }, { batchId: 'test-prc' }).id;
+  const lw = TD.upsertLabelWait({ taskId: d, fields: { occurred_on: '2026-09-03', recorded_by_name: '和田', qty: 5, location: 'Z', label_ordered: true, note: 'メーカー連絡待ち' } });
+  ok(lw.ok, '前提: ラベル待ちを登録');
+  const rows = TD.listLabelWaits({});
+  const mine = rows.find((x) => x.id === lw.row.id);
+  ok(mine && mine.product_name === 'ラベル待ちD' && mine.product_code === 'PRC-A' && mine.task_status === 'on_hold' && mine.hold_reason_code === 'label_shortage',
+    '一覧に商品名・商品コード・カードの状態が乗る');
+  ok(mine.location === 'Z' && mine.label_ordered === 1 && mine.qty === 5 && mine.note === 'メーカー連絡待ち', 'xlsx の項目がそのまま返る');
+  const upd = TD.upsertLabelWait({ id: lw.row.id, taskId: d, expectVersion: lw.row.version, fields: { done: true, restocked_on: '2026-09-10' } });
+  ok(upd.ok && upd.row.done === 1, '完了にできる');
+  ok(!TD.listLabelWaits({}).some((x) => x.id === lw.row.id) && TD.listLabelWaits({ openOnly: false }).some((x) => x.id === lw.row.id), '完了は既定の一覧から消え、「すべて」には出る');
+  ok(TD.listLabelWaits({ taskId: d, openOnly: false }).length === 1 && TD.listLabelWaits({ taskId: 999999, openOnly: false }).length === 0, 'カードで絞れる');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

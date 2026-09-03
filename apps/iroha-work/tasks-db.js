@@ -55,6 +55,16 @@ export function listClosedTasks({ from = null, to = null, q = null, limit = 200 
   return getDB().prepare(`SELECT * FROM f_iroha_tasks WHERE ${conds.join(' AND ')} ORDER BY closed_at DESC, id DESC LIMIT ?`).all(...args);
 }
 
+/** 終了 (履歴) の件数。listClosedTasks と同じ絞り込みで数える (一覧は上限つきなので件数は別に数える) */
+export function countClosedTasks({ from = null, to = null, q = null } = {}) {
+  const conds = ["status = 'closed'"];
+  const args = [];
+  if (from) { conds.push('closed_at >= ?'); args.push(String(from)); }
+  if (to) { conds.push('closed_at < ?'); args.push(String(to)); }
+  if (q) { conds.push('(product_name LIKE ? OR product_code LIKE ?)'); const like = `%${String(q).trim()}%`; args.push(like, like); }
+  return getDB().prepare(`SELECT COUNT(*) c FROM f_iroha_tasks WHERE ${conds.join(' AND ')}`).get(...args).c;
+}
+
 export function countTasksByStatus() {
   const rows = getDB().prepare('SELECT status, facility_code, COUNT(*) c FROM f_iroha_tasks GROUP BY status, facility_code').all();
   const byStatus = {}; const byFacility = {};
@@ -342,7 +352,11 @@ export function listLabelWaits({ taskId = null, openOnly = true, limit = 500 } =
   if (taskId != null) { conds.push('task_id = ?'); args.push(Number(taskId)); }
   if (openOnly) conds.push('done = 0');
   args.push(Math.max(1, Math.min(5000, Number(limit) || 500)));
-  return getDB().prepare(`SELECT * FROM f_iroha_label_waits ${conds.length ? 'WHERE ' + conds.join(' AND ') : ''} ORDER BY done, occurred_on DESC, id DESC LIMIT ?`).all(...args);
+  // 画面に商品名を出すのでタスクを結合する (task_id は NOT NULL + FK。task が消えた行は __orphan へ退避済み)
+  return getDB().prepare(`SELECT w.*, t.product_code, t.product_name, t.qty AS task_qty, t.status AS task_status, t.hold_reason_code
+    FROM f_iroha_label_waits w JOIN f_iroha_tasks t ON t.id = w.task_id
+    ${conds.length ? 'WHERE ' + conds.map((c) => c.replace(/^task_id/, 'w.task_id').replace(/^done/, 'w.done')).join(' AND ') : ''}
+    ORDER BY w.done, w.occurred_on DESC, w.id DESC LIMIT ?`).all(...args);
 }
 
 /**
@@ -384,6 +398,40 @@ export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion 
   safeLogTaskEvent({ taskId: cur.task_id, action: 'label_wait_update', to: JSON.stringify(rec).slice(0, 300), ok: true });
   void actor;
   return { ok: true, row: db.prepare('SELECT * FROM f_iroha_label_waits WHERE id = ?').get(cur.id) };
+}
+
+/**
+ * 棚入完了の一括 (要件 v1.1 §B: 棚入完了はいろは職員が操作・一括ボタン可)。
+ * 「棚入待ち」のものだけを 終了 (棚入完了) にする。1 トランザクション・条件付き UPDATE なので、
+ * 選んだ後に誰かが状態を変えた分は skipped で返す (黙って終了させない)。
+ * @returns {{ok, done:[id], skipped:[{id,reason,title,status}]}}
+ */
+export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerName = null, deviceLabel = null }) {
+  const db = getDB();
+  const ids = [...new Set((Array.isArray(taskIds) ? taskIds : []).map(Number))].filter((n) => Number.isSafeInteger(n) && n > 0);
+  if (ids.length === 0) return { ok: false, error: 'bad_request', message: 'カードが選ばれていません' };
+  if (ids.length > 200) return { ok: false, error: 'bad_request', message: '一度に選べるのは 200 件までです' };
+  return db.transaction(() => {
+    const now = utcNow();
+    const done = [];
+    const skipped = [];
+    const upd = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'stocked', closed_at = ?, closed_by = ?,
+        hold_reason_code = NULL, hold_reason_note = NULL, cancellation_requested_at = NULL, ready_at = COALESCE(ready_at, ?),
+        version = version + 1, updated_at = ?, updated_by = ?
+      WHERE id = ? AND status = 'ready_for_stocking'`);
+    for (const id of ids) {
+      const t = getTask(id);
+      if (!t) { skipped.push({ id, reason: 'not_found' }); continue; }
+      const title = t.product_name || t.product_code || `#${id}`;
+      if (t.status === 'closed' && t.close_reason === 'stocked') { skipped.push({ id, reason: 'already', title }); continue; }
+      if (t.status !== 'ready_for_stocking') { skipped.push({ id, reason: 'not_ready', title, status: t.status }); continue; }
+      if (upd.run(now, actor, now, now, actor, id).changes !== 1) { skipped.push({ id, reason: 'conflict', title }); continue; }
+      safeLogTaskEvent({ taskId: id, action: 'task_status', from: 'ready_for_stocking', to: 'closed:stocked (まとめて棚入完了)',
+        workerId, workerName, deviceLabel, ok: true });
+      done.push(id);
+    }
+    return { ok: true, done, skipped };
+  }).immediate();
 }
 
 // ─── 作業開始 (アプリ正本) ───

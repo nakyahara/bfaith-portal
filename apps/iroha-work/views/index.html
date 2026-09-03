@@ -74,6 +74,8 @@
   .row{display:flex;gap:12px;align-items:center;background:var(--surface);border:1px solid var(--line);
     border-radius:var(--r);padding:10px 12px;cursor:pointer}
   .row:active{border-color:var(--accent)}
+  .row.sel{outline:2px solid var(--accent);outline-offset:-2px}
+  .row .cb{width:22px;height:22px;flex:none;accent-color:var(--accent)}
   .row .thumb{width:60px;height:60px;border-radius:var(--r-sm);background:var(--well);border:1px solid var(--line);
     display:grid;place-items:center;font-size:1.5rem;flex:none;overflow:hidden}
   .row .thumb img{width:100%;height:100%;object-fit:contain;background:#fff}
@@ -99,9 +101,56 @@
   .row .chev{color:var(--faint);font-size:1.2rem;flex:none}
   .empty{padding:40px 10px;text-align:center;color:var(--faint)}
 
+  /* ── 画面の切替 (作業 / ボード / ラベル待ち / 履歴) ── */
+  .views{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+  .views button{border:1px solid var(--line);background:var(--surface);color:var(--sub);border-radius:var(--r);
+    padding:8px 14px;font-weight:700;font-size:.92rem;cursor:pointer}
+  .views button.on{background:var(--ink);border-color:var(--ink);color:#fff}
+  body.detail-open .views{display:none}
+
+  /* ── ボード (状態 4 列。iPad 縦では横スクロール) ── */
+  .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(230px,1fr);gap:10px;overflow-x:auto;padding-bottom:10px}
+  .col{background:var(--well);border:1px solid var(--line);border-radius:var(--r);padding:8px}
+  .col h3{margin:0 0 8px;font-size:.86rem;font-weight:700;color:var(--sub);display:flex;align-items:center;gap:8px}
+  .col h3 .n{font-family:var(--num);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:0 8px;font-size:.8rem}
+  .col h3 button{margin-left:auto;border:1px solid var(--line);background:var(--surface);color:var(--sub);
+    border-radius:var(--r-sm);padding:3px 8px;font-size:.74rem;font-weight:700;cursor:pointer}
+  .bcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;margin-bottom:6px;cursor:pointer}
+  .bcard.sel{outline:2px solid var(--accent);outline-offset:-2px}
+  .bcard h4{margin:0;font-size:.92rem;font-weight:700;line-height:1.35}
+  .bcard .m{font-size:.76rem;color:var(--sub);margin-top:2px}
+  .bcard .cb{width:20px;height:20px;vertical-align:-4px;margin-right:6px;accent-color:var(--accent)}
+  .colempty{color:var(--faint);font-size:.8rem;padding:8px 4px}
+
+  /* ── まとめて操作のバー ── */
+  .bulkbar{position:fixed;left:0;right:0;bottom:0;background:var(--ink);color:#fff;padding:12px 16px;
+    display:none;gap:10px;align-items:center;z-index:35;box-shadow:0 -2px 12px rgba(15,23,40,.2)}
+  .bulkbar.on{display:flex}
+  .bulkbar .cnt{font-family:var(--num);font-weight:700;font-size:1.05rem}
+  .bulkbar button{border:0;border-radius:var(--r);padding:10px 16px;font-weight:700;font-size:.95rem;cursor:pointer}
+  .bulkbar .go{background:var(--ok);color:#fff;margin-left:auto}
+  .bulkbar .cancel{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.45)}
+
+  /* ── 表 (ラベル待ち・履歴) ── */
+  .tblwrap{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:var(--r)}
+  .tbl{width:100%;border-collapse:collapse;min-width:640px}
+  .tbl th,.tbl td{padding:9px 10px;text-align:left;font-size:.86rem;border-bottom:1px solid var(--line);white-space:nowrap}
+  .tbl th{background:var(--well);color:var(--sub);font-size:.74rem;font-weight:700;letter-spacing:.04em}
+  .tbl td.wrap{white-space:normal;min-width:180px}
+  .tbl tr:last-child td{border-bottom:0}
+  .tbl tbody tr{cursor:pointer}
+  .tbl tbody tr:active{background:var(--accent-soft)}
+  .pill{display:inline-block;font-size:.72rem;font-weight:700;border-radius:var(--r-sm);padding:2px 8px}
+  .pill.wait{background:var(--danger-soft);color:var(--danger)}
+  .pill.ok{background:var(--ok-soft);color:var(--ok)}
+  .pill.loc{background:var(--well);color:var(--sub)}
+  .tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+  .tools .date{border:1px solid var(--line);border-radius:var(--r);padding:8px 10px;font-size:.95rem;background:var(--surface);color:var(--ink)}
+  .sum{font-size:.8rem;color:var(--faint);margin:8px 2px;font-family:var(--num)}
+
   /* ── 詳細 ── */
   .detail{display:none}
-  body.detail-open .listpage{display:none}
+  body.detail-open .page{display:none}
   body.detail-open .detail{display:block}
   .backbar{display:flex;align-items:center;gap:10px;margin-bottom:12px}
   .back{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r);
@@ -225,11 +274,17 @@
 <body>
 <div class="app">
   <!-- ══ 画面1: リスト ══ -->
-  <div class="listpage">
+  <div class="page listpage">
     <header class="top">
       <h1><span class="logo">IROHA STOCK</span><span class="jp">いろは在庫化 作業画面</span></h1>
       <button class="who" id="whoBtn" onclick="openGate()">👤 —</button>
     </header>
+    <div class="views" id="views" hidden>
+      <button id="vList" class="on" onclick="setView('list')">📋 作業</button>
+      <button id="vBoard" onclick="setView('board')">🗂 ボード</button>
+      <button id="vLabel" onclick="setView('label')">🏷 ラベル待ち</button>
+      <button id="vHistory" onclick="setView('history')">📚 履歴</button>
+    </div>
     <div class="banner err" id="errBanner" onclick="this.classList.remove('on')"></div>
     <div class="banner warn" id="warnBanner" onclick="this.classList.remove('on')"></div>
 
@@ -240,10 +295,58 @@
       <span class="sync">
         <span id="syncTxt">読み込み中…</span>
         <button id="refreshBtn" onclick="forceRefresh()">🔄 いま更新</button>
+        <button id="bulkStart" onclick="startBulk()" hidden>☑ まとめて棚入完了</button>
       </span>
     </div>
 
     <div class="list" id="list"><div class="empty">読み込み中…</div></div>
+  </div>
+
+  <!-- ══ 画面1b: ボード (状態 × 拠点。Notion のボードビューの代わり) ══ -->
+  <div class="page boardpage" hidden>
+    <div class="filters">
+      <span class="flabel">拠点</span>
+      <span id="facChips"></span>
+      <input class="search" id="bq" placeholder="商品名・商品コードで検索">
+    </div>
+    <div class="board" id="board"></div>
+  </div>
+
+  <!-- ══ 画面1c: ラベル待ち ══ -->
+  <div class="page labelpage" hidden>
+    <div class="tools">
+      <span class="flabel">ラベル待ち</span>
+      <button class="chip" id="lwOpenBtn" onclick="setLwOpenOnly(true)">未完了だけ</button>
+      <button class="chip" id="lwAllBtn" onclick="setLwOpenOnly(false)">すべて</button>
+      <span class="sum" id="lwSum"></span>
+    </div>
+    <div class="tblwrap"><table class="tbl">
+      <thead><tr><th>状態</th><th>発生日</th><th>商品</th><th>数量</th><th>ロット・期限</th><th>ロケ</th>
+        <th>発注</th><th>貼り直し</th><th>LINE連絡</th><th>再連絡</th><th>入庫完了</th><th>記録者</th><th>備考</th></tr></thead>
+      <tbody id="lwBody"><tr><td colspan="13">読み込み中…</td></tr></tbody>
+    </table></div>
+    <p class="hint" style="margin-top:8px">メーカーから届いた商品のラベルが足りず、作業を止めているものの記録です。
+      新しく登録するときは、そのカードの詳細から「🏷 ラベル待ちに登録」を押してください。</p>
+  </div>
+
+  <!-- ══ 画面1d: 履歴 (終了したカード) ══ -->
+  <div class="page historypage" hidden>
+    <div class="tools">
+      <span class="flabel">期間</span>
+      <button class="chip" onclick="setHistRange(7)">7日</button>
+      <button class="chip" onclick="setHistRange(30)">30日</button>
+      <button class="chip" onclick="setHistRange(90)">90日</button>
+      <button class="chip" onclick="setHistRange(0)">すべて</button>
+      <input class="date" type="date" id="histFrom" onchange="loadHistory()">
+      <span>〜</span>
+      <input class="date" type="date" id="histTo" onchange="loadHistory()">
+      <input class="search" id="histQ" placeholder="商品名・商品コードで検索">
+    </div>
+    <div class="sum" id="histSum"></div>
+    <div class="tblwrap"><table class="tbl">
+      <thead><tr><th>終了日時</th><th>商品</th><th>数量</th><th>結果</th><th>拠点</th><th>作業時間</th><th>入庫日</th><th>だれが</th></tr></thead>
+      <tbody id="histBody"><tr><td colspan="8">読み込み中…</td></tr></tbody>
+    </table></div>
   </div>
 
   <!-- ══ 画面2: 詳細 ══ -->
@@ -305,6 +408,35 @@
     </div>
   </div>
 
+  <!-- ══ ラベル待ち 登録・修正ダイアログ ══ -->
+  <div class="overlay" id="lwOv">
+    <div class="modal">
+      <h3>🏷 ラベル待ちの記録</h3>
+      <div class="mname" id="lwName">—</div>
+      <div class="msaving" id="lwMsg"></div>
+      <div class="mfields">
+        <label>発生日</label><input id="lwOccurred" type="date">
+        <label>ロットNo・期限</label><input id="lwLot" maxlength="200" placeholder="例: L2401 (2027-03)">
+        <label>数量</label><input id="lwQty" type="number" min="0" inputmode="numeric">
+        <label>ロケーション</label>
+        <div class="opts" id="lwLoc"></div>
+        <input type="hidden" id="lwLocation">
+        <label><input id="lwOrdered" type="checkbox" class="cb"> ラベルを発注した</label>
+        <label><input id="lwReattach" type="checkbox" class="cb"> 貼り直しが必要</label>
+        <label>本社へのLINE連絡日</label><input id="lwLine" type="date">
+        <label>再連絡日</label><input id="lwRe" type="date">
+        <label>入庫完了日</label><input id="lwRestocked" type="date">
+        <label><input id="lwDone" type="checkbox" class="cb"> 完了 (一覧から外す)</label>
+        <label>備考</label><input id="lwNote" maxlength="300">
+      </div>
+      <div class="mbtns" style="margin-top:14px">
+        <button class="btn" onclick="closeLw()">やめる</button>
+        <button class="btn primary" id="lwSave" onclick="saveLw()">保存</button>
+      </div>
+      <p class="hint">Z ロケ = 一時保管 / Y ロケ = 出荷禁止。外部に預けるときは Z → Y、戻ってきたら Y → Z です。</p>
+    </div>
+  </div>
+
   <!-- ══ 作業者選択 ══ -->
   <div class="gate" id="gate">
     <div class="gwrap">
@@ -323,6 +455,13 @@
   </div>
 
   <div class="toast" id="toast"></div>
+</div>
+
+<!-- ══ まとめて棚入完了のバー ══ -->
+<div class="bulkbar" id="bulkBar">
+  <button class="cancel" onclick="exitBulk()">やめる</button>
+  <span class="cnt" id="bulkCnt">0 件</span>
+  <button class="go" onclick="doBulkStocked()">まとめて棚入完了にする</button>
 </div>
 
 <script>
@@ -350,6 +489,11 @@ function stName(v) {
 
 let state = { mode: 'notion', cards: [], statuses: [], changeTargets: [], workers: [], refresh: {}, me: {} };
 let curTab = 'all';
+let curView = 'list';       // list | board | label | history (アプリ正本のときだけ切り替えられる)
+let curFacility = 'all';    // ボードの拠点しぼりこみ
+let bulkIds = null;         // まとめて棚入完了で選んでいる id の Set (null = 選択モードではない)
+let lwOpenOnly = true;      // ラベル待ち: 未完了だけ
+let lwEditing = null;       // 編集中のラベル待ち行 (新規は {task_id})
 let curDetail = null;      // 開いている詳細のカード id (Notion 正本 = page_id 文字列 / アプリ正本 = task id 数値)
 /** カード id の比較。onclick の引数を経ると数値も文字列になるので、厳密比較せず文字列にそろえて比べる (Codex A1b R1 #1) */
 const sameId = (a, b) => a != null && b != null && String(a) === String(b);
@@ -477,7 +621,7 @@ function restoreSnapshot() {
     transitions: s.transitions || {}, holdReasons: s.holdReasons || [], closeReasons: s.closeReasons || [],
     facilities: s.facilities || [], today: s.today || null,
     workers: s.workers || [], refresh: s.refresh || {}, me: {} };
-  renderModeTexts(); ensureTabValid(); renderTabs(); renderList(); restoreWorker();
+  renderModeTexts(); renderViews(); ensureTabValid(); renderTabs(); renderList(); restoreWorker();
   $('#syncTxt').textContent = '前回取得 ' + fmtTime(new Date(s.at).toISOString()) + ' の一覧 · 最新を確認中…';
   return true;
 }
@@ -529,8 +673,10 @@ async function loadStateOnce() {
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
   renderSync();
   renderModeTexts();
+  renderViews();
   renderTabs();
   renderList();
+  if (curView === 'board') renderBoard();
   restoreWorker();
   if (curDetail) {
     const c = findCard(curDetail);
@@ -626,6 +772,11 @@ function thumbHtml(c) {
 
 function renderList() {
   const cards = visibleCards();
+  // 「棚入待ち」だけを見ているときは、まとめて棚入完了にできる (職員操作。要件 v1.1 §B)
+  const bulkable = isApp() && curTab === 'ready_for_stocking';
+  const btn = $('#bulkStart');
+  if (btn) btn.hidden = !bulkable || !!bulkIds;
+  if (!bulkable && bulkIds) exitBulk();
   if (cards.length === 0) {
     $('#list').innerHTML = '<div class="empty">' + ($('#q').value ? '見つかりませんでした' : 'このステータスのカードはありません') + '</div>';
     return;
@@ -643,17 +794,266 @@ function renderList() {
       c.external_text ? esc(c.external_text) : null,
       c.expiry ? '📅 期限 ' + esc(c.expiry) : null,
     ].filter(Boolean).join(' ・ ');
-    return '<div class="row" onclick="openDetail(\'' + esc(c.id) + '\')">' +
+    const selectable = bulkIds && c.status === 'ready_for_stocking';
+    const sel = selectable && bulkIds.has(c.id);
+    return '<div class="row' + (sel ? ' sel' : '') + '" onclick="' +
+      (selectable ? 'toggleBulk(' + Number(c.id) + ')' : "openDetail('" + esc(c.id) + "')") + '">' +
+      (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') +
+        ' onclick="event.stopPropagation();toggleBulk(' + Number(c.id) + ')">' : '') +
       '<div class="thumb">' + thumbHtml(c) + '</div>' +
       '<div class="bd"><h2>' + rowTags(c) + esc(c.title) + '</h2>' +
       '<div class="meta num">' + meta + '</div>' +
       (meta2 ? '<div class="meta2 num">' + meta2 + '</div>' : '') + '</div>' +
-      '<button class="st ' + stClass(c.status) + '" onclick="openSt(event,\'' + esc(c.id) + '\')">' + esc(stLabel(c)) + ' ▾</button>' +
-      '<span class="chev">›</span></div>';
+      (selectable ? '' : '<button class="st ' + stClass(c.status) + '" onclick="openSt(event,\'' + esc(c.id) + '\')">' + esc(stLabel(c)) + ' ▾</button>') +
+      '<span class="chev">' + (selectable ? '' : '›') + '</span></div>';
   }).join('');
 }
 
 $('#q').addEventListener('input', renderList);
+
+// ─── 画面の切替 (作業 / ボード / ラベル待ち / 履歴) ───
+const PAGES = { list: '.listpage', board: '.boardpage', label: '.labelpage', history: '.historypage' };
+const VIEW_BTN = { list: '#vList', board: '#vBoard', label: '#vLabel', history: '#vHistory' };
+function setView(v) {
+  if (!isApp()) v = 'list';                 // Notion 正本のときは作業一覧だけ
+  if (v !== 'board' && v !== 'list') exitBulk();
+  curView = v;
+  for (const [k, sel] of Object.entries(PAGES)) $(sel).hidden = k !== v;
+  for (const [k, sel] of Object.entries(VIEW_BTN)) { const b = $(sel); if (b) b.classList.toggle('on', k === v); }
+  if (v === 'board') renderBoard();
+  if (v === 'label') loadLabelWaits();
+  if (v === 'history') loadHistory();
+}
+/** アプリ正本のときだけ画面切替を出す (Notion 正本には ボード・ラベル待ち・履歴が無い) */
+function renderViews() {
+  const el = $('#views');
+  if (el) el.hidden = !isApp();
+  if (!isApp() && curView !== 'list') setView('list');
+}
+
+// ─── ボード (状態 4 列 × 拠点) ───
+function facChips() {
+  const facs = state.facilities || [];
+  const counts = { all: state.cards.length };
+  for (const c of state.cards) counts[c.facility_code] = (counts[c.facility_code] || 0) + 1;
+  const one = (v, label) => '<button class="chip' + (curFacility === v ? ' on' : '') + '" onclick="pickFacility(\'' + esc(v) + '\')">' +
+    esc(label) + ' <span class="num">' + (counts[v] || 0) + '</span></button>';
+  return one('all', 'すべて') + facs.map(f => one(f.code, f.name)).join('');
+}
+function pickFacility(code) { curFacility = code; renderBoard(); }
+function boardCards() {
+  const q = ($('#bq').value || '').trim().toLowerCase();
+  return state.cards.filter(c => {
+    if (curFacility !== 'all' && c.facility_code !== curFacility) return false;
+    if (!q) return true;
+    return String(c.title).toLowerCase().includes(q) || String(c.product_code || '').toLowerCase().includes(q);
+  });
+}
+function renderBoard() {
+  if (!isApp()) return;
+  $('#facChips').innerHTML = facChips();
+  const cards = boardCards();
+  const cols = (state.statuses || []).map(st => {
+    const mine = cards.filter(c => c.status === st.value);
+    const canBulk = st.value === 'ready_for_stocking' && mine.length > 0;
+    const body = mine.length === 0 ? '<div class="colempty">なし</div>' : mine.map(c => bcardHtml(c, st.value)).join('');
+    return '<div class="col"><h3>' + esc(st.label) + ' <span class="n">' + mine.length + '</span>' +
+      (canBulk && !bulkIds ? '<button onclick="startBulk()">まとめて棚入完了</button>' : '') + '</h3>' + body + '</div>';
+  }).join('');
+  $('#board').innerHTML = cols;
+}
+function bcardHtml(c, status) {
+  const selectable = bulkIds && status === 'ready_for_stocking';
+  const sel = selectable && bulkIds.has(c.id);
+  const meta = [c.qty != null ? c.qty + ' 個' : null, c.arrival ? '入庫 ' + c.arrival : null,
+    c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
+    c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
+  const onclick = selectable ? 'toggleBulk(' + Number(c.id) + ')' : "openDetail('" + esc(c.id) + "')";
+  return '<div class="bcard' + (sel ? ' sel' : '') + '" onclick="' + onclick + '">' +
+    '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + ' onclick="event.stopPropagation();toggleBulk(' + Number(c.id) + ')">' : '') +
+    (c.today ? '📌 ' : '') + esc(c.title) + '</h4>' +
+    (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') + '</div>';
+}
+
+// ─── まとめて棚入完了 (職員のみ) ───
+function startBulk() {
+  bulkIds = new Set();
+  renderBulk();
+  if (curView === 'board') renderBoard(); else renderList();
+}
+function exitBulk() {
+  if (!bulkIds) return;
+  bulkIds = null;
+  $('#bulkBar').classList.remove('on');
+  if (curView === 'board') renderBoard(); else renderList();
+}
+function toggleBulk(id) {
+  if (!bulkIds) return;
+  const n = Number(id);
+  if (bulkIds.has(n)) bulkIds.delete(n); else bulkIds.add(n);
+  renderBulk();
+  if (curView === 'board') renderBoard(); else renderList();
+}
+function renderBulk() {
+  $('#bulkCnt').textContent = (bulkIds ? bulkIds.size : 0) + ' 件';
+  $('#bulkBar').classList.toggle('on', !!bulkIds);
+}
+async function doBulkStocked() {
+  if (!bulkIds || bulkIds.size === 0) { toast('カードを選んでください'); return; }
+  const w = worker;
+  if (!w) { openGate(); return; }
+  const ids = [...bulkIds];
+  let pin = null;
+  if (!state.me.session) {
+    if (w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです'); return; }
+    pin = window.prompt(w.display_name + 'さんの職員PIN (' + ids.length + ' 件を棚入完了にします)');
+    if (pin == null) return;
+  }
+  if (!window.confirm(ids.length + ' 件を棚入完了にします。よろしいですか?')) return;
+  const j = await apiFetch('/api/bulk-stocked', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids, worker_id: w.id, pin }) });
+  if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
+  const skipped = (j.skipped || []).length;
+  toast(j.done.length + ' 件を棚入完了にしました' + (skipped ? ' (' + skipped + ' 件は状態が変わっていたので飛ばしました)' : ''));
+  if (skipped) showWarn((j.skipped || []).map(x => (x.title || '#' + x.id) + ': ' + BULK_SKIP[x.reason]).join(' / '));
+  exitBulk();
+  await loadState();
+}
+const BULK_SKIP = { already: 'すでに棚入完了', not_ready: '棚入待ちではありません', not_found: '見つかりません', conflict: '同時に変更されました' };
+
+// ─── ラベル待ち ───
+function setLwOpenOnly(v) { lwOpenOnly = v; loadLabelWaits(); }
+async function loadLabelWaits() {
+  if (!isApp()) return;
+  $('#lwOpenBtn').classList.toggle('on', lwOpenOnly);
+  $('#lwAllBtn').classList.toggle('on', !lwOpenOnly);
+  const j = await apiFetch('/api/label-waits' + (lwOpenOnly ? '' : '?all=1'));
+  if (!j.ok) { $('#lwBody').innerHTML = '<tr><td colspan="13">' + esc(j.message || '読み込めませんでした') + '</td></tr>'; return; }
+  const rows = j.rows || [];
+  $('#lwSum').textContent = rows.length + ' 件' + (lwOpenOnly ? ' (未完了)' : '');
+  if (rows.length === 0) { $('#lwBody').innerHTML = '<tr><td colspan="13">' + (lwOpenOnly ? 'ラベル待ちはありません' : '記録はありません') + '</td></tr>'; return; }
+  const LOC = { Z: 'Z (一時保管)', Y: 'Y (出荷禁止)', none: 'なし' };
+  const yn = v => v ? '✔' : '—';
+  $('#lwBody').innerHTML = rows.map(r => '<tr onclick="openLw(' + Number(r.id) + ')">' +
+    '<td><span class="pill ' + (r.done ? 'ok' : 'wait') + '">' + (r.done ? '完了' : '待ち') + '</span></td>' +
+    '<td class="num">' + esc(r.occurred_on || '—') + '</td>' +
+    '<td class="wrap">' + esc(r.product_name || '(名称なし)') + '<br><small>' + esc(r.product_code || '') + '</small></td>' +
+    '<td class="num">' + (r.qty == null ? '—' : esc(r.qty)) + '</td>' +
+    '<td>' + esc(r.lot_expiry || '—') + '</td>' +
+    '<td>' + (r.location ? '<span class="pill loc">' + esc(LOC[r.location] || r.location) + '</span>' : '—') + '</td>' +
+    '<td>' + yn(r.label_ordered) + '</td><td>' + yn(r.reattach) + '</td>' +
+    '<td class="num">' + esc(r.line_notified_on || '—') + '</td><td class="num">' + esc(r.re_notified_on || '—') + '</td>' +
+    '<td class="num">' + esc(r.restocked_on || '—') + '</td>' +
+    '<td>' + esc(r.recorded_by_name || '—') + '</td>' +
+    '<td class="wrap">' + esc(r.note || '') + '</td></tr>').join('');
+  lwRows = rows;
+}
+let lwRows = [];
+const LW_LOCS = [['Z', 'Z (一時保管)'], ['Y', 'Y (出荷禁止)'], ['none', 'なし']];
+function openLw(id) {
+  const r = lwRows.find(x => Number(x.id) === Number(id));
+  if (!r) return;
+  lwEditing = r;
+  fillLw(r, (r.product_name || '') + ' (' + (r.product_code || '') + ')');
+}
+/** 詳細画面から新規登録 */
+function openLwNew() {
+  const c = findCard(curDetail);
+  if (!c) return;
+  lwEditing = { task_id: c.id };
+  fillLw({ occurred_on: state.today, qty: c.qty, location: 'Z' }, c.title);
+}
+function fillLw(r, name) {
+  $('#lwName').textContent = name || '—';
+  $('#lwMsg').textContent = '';
+  $('#lwOccurred').value = r.occurred_on || '';
+  $('#lwLot').value = r.lot_expiry || '';
+  $('#lwQty').value = r.qty == null ? '' : r.qty;
+  $('#lwLocation').value = r.location || '';
+  $('#lwLoc').innerHTML = LW_LOCS.map(([v, label]) =>
+    '<button type="button" class="opt' + ($('#lwLocation').value === v ? ' on' : '') + '" onclick="pickLwLoc(\'' + v + '\')">' + esc(label) + '</button>').join('');
+  $('#lwOrdered').checked = !!r.label_ordered;
+  $('#lwReattach').checked = !!r.reattach;
+  $('#lwLine').value = r.line_notified_on || '';
+  $('#lwRe').value = r.re_notified_on || '';
+  $('#lwRestocked').value = r.restocked_on || '';
+  $('#lwDone').checked = !!r.done;
+  $('#lwNote').value = r.note || '';
+  $('#lwOv').classList.add('on');
+}
+function pickLwLoc(v) {
+  $('#lwLocation').value = v;
+  [...$('#lwLoc').children].forEach((b, i) => b.classList.toggle('on', LW_LOCS[i][0] === v));
+}
+function closeLw() { $('#lwOv').classList.remove('on'); lwEditing = null; }
+async function saveLw() {
+  if (!lwEditing) return;
+  const w = worker;
+  if (!w) { openGate(); return; }
+  const btn = $('#lwSave');
+  btn.disabled = true; $('#lwMsg').textContent = '保存しています…';
+  try {
+    const fields = {
+      occurred_on: $('#lwOccurred').value || null, lot_expiry: $('#lwLot').value || null,
+      qty: $('#lwQty').value === '' ? null : Number($('#lwQty').value),
+      location: $('#lwLocation').value || null,
+      label_ordered: $('#lwOrdered').checked, reattach: $('#lwReattach').checked,
+      line_notified_on: $('#lwLine').value || null, re_notified_on: $('#lwRe').value || null,
+      restocked_on: $('#lwRestocked').value || null, done: $('#lwDone').checked, note: $('#lwNote').value || null,
+    };
+    const body = { task_id: lwEditing.task_id, fields, worker_id: w.id };
+    if (lwEditing.id) { body.id = lwEditing.id; body.expect_version = lwEditing.version; }
+    const j = await apiFetch('/api/label-waits', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!j.ok) { $('#lwMsg').textContent = j.message || '保存できませんでした'; return; }
+    closeLw();
+    toast('ラベル待ちを保存しました');
+    if (curView === 'label') loadLabelWaits();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ─── 履歴 (終了したカード) ───
+function setHistRange(days) {
+  const to = new Date(Date.now() + 9 * 3600 * 1000);
+  $('#histTo').value = '';
+  $('#histFrom').value = days > 0 ? new Date(to.getTime() - days * 86400000).toISOString().slice(0, 10) : '';
+  loadHistory();
+}
+let histTimer = null;
+async function loadHistory() {
+  if (!isApp()) return;
+  const p = new URLSearchParams();
+  if ($('#histFrom').value) p.set('from', $('#histFrom').value);
+  if ($('#histTo').value) p.set('to', $('#histTo').value);
+  if ($('#histQ').value.trim()) p.set('q', $('#histQ').value.trim());
+  const j = await apiFetch('/api/history' + (p.toString() ? '?' + p : ''));
+  if (!j.ok) { $('#histBody').innerHTML = '<tr><td colspan="8">' + esc(j.message || '読み込めませんでした') + '</td></tr>'; return; }
+  const rows = j.rows || [];
+  $('#histSum').textContent = j.total + ' 件' + (rows.length < j.total ? ' (新しい ' + rows.length + ' 件を表示)' : '');
+  if (rows.length === 0) { $('#histBody').innerHTML = '<tr><td colspan="8">この期間の記録はありません</td></tr>'; return; }
+  const CLOSE = { stocked: '棚入完了', cancelled: '取消', out_of_scope: '在庫化対象外' };
+  $('#histBody').innerHTML = rows.map(r => '<tr onclick="openDetail(' + Number(r.id) + ')">' +
+    '<td class="num">' + esc(fmtDateTime(r.closed_at)) + '</td>' +
+    '<td class="wrap">' + esc(r.title) + '<br><small>' + esc(r.product_code || '') + '</small></td>' +
+    '<td class="num">' + (r.qty == null ? '—' : esc(r.qty)) + '</td>' +
+    '<td><span class="pill ' + (r.close_reason === 'stocked' ? 'ok' : 'loc') + '">' + esc(CLOSE[r.close_reason] || r.close_reason) + '</span></td>' +
+    '<td>' + esc(r.facility_name || '—') + '</td>' +
+    '<td class="num">' + (r.work_seconds ? fmtDur(r.work_seconds) + (r.workers > 1 ? ' (' + r.workers + '人)' : '') : '—') + '</td>' +
+    '<td class="num">' + esc(r.arrival || '—') + '</td>' +
+    '<td>' + esc(r.closed_by || '—') + '</td></tr>').join('');
+}
+function fmtDateTime(iso) {
+  if (!iso) return '—';
+  try { return new Date(iso).toLocaleString('ja-JP', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }); } catch (e) { return '—'; }
+}
+function fmtDur(sec) {
+  const m = Math.round(Number(sec) / 60);
+  return m >= 60 ? Math.floor(m / 60) + '時間' + (m % 60 ? (m % 60) + '分' : '') : m + '分';
+}
+
+$('#bq').addEventListener('input', renderBoard);
+$('#histQ').addEventListener('input', () => { clearTimeout(histTimer); histTimer = setTimeout(loadHistory, 350); });
 
 // ─── 手動更新 ───
 async function forceRefresh() {
@@ -1154,9 +1554,15 @@ function workCardHtml(c) {
       '<button class="btn" onclick="setPlanned(' + (c.today ? 'false' : 'true') + ')">' +
       (c.today ? '📌 今日やる をやめる' : '📌 今日やる') + '</button></div>';
   }
+  // アプリ正本のみ: ラベル待ちの記録 (メーカーのラベルが足りず作業を止めているもの)
+  let label = '';
+  if (isApp() && c.status !== 'closed') {
+    label = '<div class="wbtns" style="margin-top:10px">' +
+      '<button class="btn" onclick="openLwNew()">🏷 ラベル待ちに登録</button></div>';
+  }
   return '<div class="dcard"><h3 class="sec">作業する人・時間</h3>' +
     (chips ? '<div class="wchips">' + chips + '</div>' : '') +
-    controls + plan +
+    controls + plan + label +
     '<p class="est num">' + estText(c) + '</p></div>';
 }
 

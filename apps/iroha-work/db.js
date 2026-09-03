@@ -619,6 +619,22 @@ export function getMeta(key) {
 }
 
 export function setMetaValue(key, value) { setMeta(getDB(), key, value); }
+/** タスクごとの作業時間の合計 (秒。取り消した記録は除く)。履歴画面で「何分かかったか」を出す */
+export function workSecondsByTask(taskIds) {
+  const ids = [...new Set((taskIds || []).map(Number).filter((n) => Number.isSafeInteger(n) && n > 0))];
+  const out = new Map();
+  if (ids.length === 0) return out;
+  const db = getDB();
+  for (let i = 0; i < ids.length; i += 400) {
+    const chunk = ids.slice(i, i + 400);
+    const rows = db.prepare(`SELECT task_id, SUM(COALESCE(raw_seconds, 0)) AS secs, COUNT(DISTINCT worker_id) AS people
+      FROM f_iroha_work_sessions WHERE voided_at IS NULL AND ended_at IS NOT NULL AND task_id IN (${chunk.map(() => '?').join(',')})
+      GROUP BY task_id`).all(...chunk);
+    for (const r of rows) out.set(r.task_id, { seconds: Number(r.secs) || 0, people: r.people });
+  }
+  return out;
+}
+
 /** 正本: 'notion' | 'app' (管理画面 /admin/source で切替。入荷受付の Notion 送信もこれを見る) */
 export function sourceOfTruth() { return getMeta('source_of_truth') === 'app' ? 'app' : 'notion'; }
 
