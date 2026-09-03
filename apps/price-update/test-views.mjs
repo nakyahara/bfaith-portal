@@ -11,8 +11,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ejs from 'ejs';
+import { toJst, TO_JST_CLIENT_SRC } from './format.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+// 画面が使うヘルパー。router.js が render のたびに渡しているものと同じ。
+// ここで一括して足し、テスト側の呼び出しごとに書かなくて済むようにする。
+// ★これで足すので「router が渡し忘れた」事故はテンプレのテストでは出ない → 末尾で別に見る
+const VIEW_HELPERS = { toJst, toJstClientSrc: TO_JST_CLIENT_SRC };
+const _ejsRender = ejs.render.bind(ejs);
+ejs.render = (tpl, data, opts) => _ejsRender(tpl, { ...VIEW_HELPERS, ...data }, opts);
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
 
@@ -213,6 +221,50 @@ console.log('\n── 「1色のつもりが全色に効く」を画面から消
   //   ブロックされた行こそ、なぜ止まったか以外の事実も見えていないといけない
   ok(!run.includes(String.fromCharCode(125) + " else if (guard && guard.warns"),
     '★ブロック理由があっても注意書きを消さない (else if にしない)');
+}
+
+console.log('\n── 日時は JST で出す (DB は UTC) ──');
+{
+  // 2026-09-02T10:40:00Z = 日本時間 2026-09-02 19:40。
+  // ★9時間ずれたまま出していたため、中原さんが run を探して取り違えかけた (2026-09-03)
+  const file = path.join(HERE, 'views', 'index.ejs');
+  const mkRuns = (at) => ({
+    title: '価格一括改定', displayName: 'テスト', isAdmin: false,
+    limits: { maxNeCodes: 20, maxSkuRows: 100, maxRowsPerNeCode: 50 },
+    runs: [{ run_id: 'pur-x', created_at: at, created_by: 't@example.com', kind: 'normal', note: null, op_count: 1 }],
+  });
+  const html = ejs.render(fs.readFileSync(file, 'utf8'), mkRuns('2026-09-02T10:40:00.000Z'), { filename: file });
+  ok(html.includes('2026-09-02 19:40'), '一覧: UTC 10:40 が JST 19:40 で出る');
+  ok(!html.includes('2026-09-02 10:40'), '一覧: UTC のままの表記が残っていない');
+  ok(html.includes('日時 (JST)'), '一覧: 見出しに JST と書いてある');
+
+  // 日をまたぐ側 (いちばん取り違えやすい): UTC 15:30 = 翌日 00:30 JST
+  const html2 = ejs.render(fs.readFileSync(file, 'utf8'), mkRuns('2026-09-02T15:30:00.000Z'), { filename: file });
+  ok(html2.includes('2026-09-03 00:30'), '★一覧: 日をまたぐ時刻も正しく翌日になる');
+
+  const rfile = path.join(HERE, 'views', 'run.ejs');
+  const rhtml = ejs.render(fs.readFileSync(rfile, 'utf8'), {
+    title: '履歴', displayName: 'テスト', isAdmin: false,
+    run: {
+      run_id: 'pur-z', created_at: '2026-09-02T10:40:00.000Z', created_by: 't@example.com',
+      kind: 'normal', note: null, neCodes: ['abc-001'], limits: {}, operations: [],
+      events: [{ at: '2026-09-02T15:30:00.000Z', actor: 't@example.com', event: 'run_created', operation_id: null, detail_json: '{}' }],
+    },
+  }, { filename: rfile });
+  ok(rhtml.includes('2026-09-02 19:40:00'), '詳細: 見出しの日時が JST (秒まで)');
+  ok(rhtml.includes('2026-09-03 00:30:00'), '詳細: イベントの日時も JST');
+  ok(/function toJst/.test(rhtml), '★ブラウザ側にも同じ toJst が入っている (claim の表示で使う)');
+}
+
+console.log('\n── router が画面へヘルパーを渡している ──');
+{
+  // ★上の shim で足しているので、渡し忘れはテンプレのテストでは出ない。ここで直接見る
+  const router = fs.readFileSync(path.join(HERE, 'router.js'), 'utf8');
+  ok(router.includes("from './format.js'"), 'router が format.js を読み込んでいる');
+  const renders = router.split('res.render(view(').slice(1);
+  ok(renders.length === 2, `router の画面 render は 2 箇所 (実際 ${renders.length})`);
+  ok(renders.every((r) => /\btoJst\b/.test(r.slice(0, 400))), '★どの画面にも toJst を渡している');
+  ok(router.includes('toJstClientSrc'), 'run.ejs にブラウザ用のソースも渡している');
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);

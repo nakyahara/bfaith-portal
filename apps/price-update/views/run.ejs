@@ -73,7 +73,7 @@
   <div class="card">
     <h2><%= run.run_id %></h2>
     <div class="pu-note">
-      <%= run.created_at.replace('T', ' ').slice(0, 19) %> / 実行者 <%= run.created_by %> /
+      <%= toJst(run.created_at, { seconds: true }) %> (JST) / 実行者 <%= run.created_by %> /
       <% if (run.kind === 'recovery') { %><span class="chip kind-recovery">復旧 run</span>
         <% if (run.source_run_id) { %>(元: <a href="/apps/price-update/runs/<%= run.source_run_id %>"><%= run.source_run_id %></a>)<% } %>
       <% } else { %>通常 run<% } %> /
@@ -190,11 +190,11 @@
   <div class="card">
     <h2>イベント (追記のみ)</h2>
     <table class="pu">
-      <thead><tr><th>日時</th><th>操作者</th><th>イベント</th><th>対象</th><th>詳細</th></tr></thead>
+      <thead><tr><th>日時 (JST)</th><th>操作者</th><th>イベント</th><th>対象</th><th>詳細</th></tr></thead>
       <tbody>
         <% run.events.forEach(function (e) { %>
           <tr>
-            <td class="code"><%= e.at.replace('T', ' ').slice(0, 19) %></td>
+            <td class="code"><%= toJst(e.at, { seconds: true }) %></td>
             <td><%= e.actor %></td>
             <td><%= STATE_LABEL[e.event] || e.event %></td>
             <td class="code"><%= e.operation_id || '(run)' %></td>
@@ -214,6 +214,10 @@
   const $ = (id) => document.getElementById(id);
   const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);   // API の値を数として扱う (文字列を HTML に流さない)
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  // ★日時は DB に UTC で入っている。サーバ側 (format.js) と同じ関数をここでも使い、
+  //   画面の表示を JST に揃える (2つの実装がずれると run を取り違える)
+  <%- toJstClientSrc %>
 
   document.querySelectorAll('.manual-btn').forEach(function (btn) {
     btn.addEventListener('click', async function () {
@@ -258,7 +262,7 @@
     if (info.claim) {
       // ★claim は「実行を始めた」印であって「終わった」印ではない。
       //   途中で止まった run もここに入るので、完了だと言い切らない
-      $('exec-status').innerHTML = 'この履歴は <b>' + esc(info.claim.claimed_at.replace('T', ' ').slice(0, 19))
+      $('exec-status').innerHTML = 'この履歴は <b>' + esc(toJst(info.claim.claimed_at, true))
         + '</b> に <b>' + esc(info.claim.claimed_by) + '</b> が実行を開始しています。'
         + '同じ内容をもう一度送ることはしません。'
         + '<b>まだ途中の場合もあります</b> — 下の行とイベントで1行ずつ状態を確認してください'
