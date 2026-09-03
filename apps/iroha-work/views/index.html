@@ -101,6 +101,11 @@
   .row .chev{color:var(--faint);font-size:1.2rem;flex:none}
   .empty{padding:40px 10px;text-align:center;color:var(--faint)}
 
+  /* ── 切替前の下見であることの注意書き ── */
+  .preview{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber);border-left-width:4px;
+    border-radius:var(--r);padding:10px 14px;font-size:.86rem;font-weight:700;margin-bottom:10px}
+  .preview small{display:block;font-weight:400;margin-top:3px}
+
   /* ── 画面の切替 (作業 / ボード / ラベル待ち / 履歴) ── */
   .views{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
   .views button{border:1px solid var(--line);background:var(--surface);color:var(--sub);border-radius:var(--r);
@@ -305,6 +310,7 @@
 
   <!-- ══ 画面1b: ボード (状態 × 拠点。Notion のボードビューの代わり) ══ -->
   <div class="page boardpage" hidden>
+    <div class="preview" id="prevBoard" hidden></div>
     <div class="filters">
       <span class="flabel">拠点</span>
       <span id="facChips"></span>
@@ -315,6 +321,7 @@
 
   <!-- ══ 画面1c: ラベル待ち ══ -->
   <div class="page labelpage" hidden>
+    <div class="preview" id="prevLabel" hidden></div>
     <div class="tools">
       <span class="flabel">ラベル待ち</span>
       <button class="chip" id="lwOpenBtn" onclick="setLwOpenOnly(true)">未完了だけ</button>
@@ -332,6 +339,7 @@
 
   <!-- ══ 画面1d: 履歴 (終了したカード) ══ -->
   <div class="page historypage" hidden>
+    <div class="preview" id="prevHist" hidden></div>
     <div class="tools">
       <span class="flabel">期間</span>
       <button class="chip" onclick="setHistRange(7)">7日</button>
@@ -668,7 +676,10 @@ async function loadStateOnce() {
   }
   if (serverDown) { serverDown = false; hideErr('down'); toast('サーバーにつながりました'); }
   reconnectMs = RECONNECT_MIN_MS; clearTimeout(reconnectTimer); reconnectTimer = null;
+  const wasApp = isApp();
   state = j;
+  // 正本が変わったら下見のデータは捨てる (古い下見を新しいものとして見せない — Codex 下見 R1)
+  if (wasApp !== isApp()) { preview = null; previewAt = null; previewDown = false; }
   ensureTabValid();
   saveSnapshot(j);
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
@@ -677,7 +688,9 @@ async function loadStateOnce() {
   renderViews();
   renderTabs();
   renderList();
-  if (curView === 'board') renderBoard();
+  // ボードを開いている間は、正本が Notion なら下見も取り直す (切替直後・502 から戻ったときもここで回復する)
+  if (curView === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
+  renderLwSaveState();
   restoreWorker();
   if (curDetail) {
     const c = findCard(curDetail);
@@ -827,29 +840,67 @@ $('#list').addEventListener('click', (e) => {
 const PAGES = { list: '.listpage', board: '.boardpage', label: '.labelpage', history: '.historypage' };
 const VIEW_BTN = { list: '#vList', board: '#vBoard', label: '#vLabel', history: '#vHistory' };
 function setView(v) {
-  if (!isApp()) v = 'list';                 // Notion 正本のときは作業一覧だけ
   if (v !== 'board' && v !== 'list') exitBulk();
   curView = v;
   for (const [k, sel] of Object.entries(PAGES)) $(sel).hidden = k !== v;
   for (const [k, sel] of Object.entries(VIEW_BTN)) { const b = $(sel); if (b) b.classList.toggle('on', k === v); }
+  renderPreviewNote();
   // 開いた画面は必ず描き直す。一覧も同じ (ボードで選んだまま戻ったとき、選択を見えているものへそろえるため — Codex PR-C R2)
   if (v === 'list') renderList();
-  if (v === 'board') renderBoard();
+  if (v === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
   if (v === 'label') loadLabelWaits();
   if (v === 'history') loadHistory();
 }
-/** アプリ正本のときだけ画面切替を出す (Notion 正本には ボード・ラベル待ち・履歴が無い) */
-function renderViews() {
-  const el = $('#views');
-  if (el) el.hidden = !isApp();
-  if (!isApp() && curView !== 'list') setView('list');
+function renderViews() { const el = $('#views'); if (el) el.hidden = false; }
+
+// ─── 切替前の下見 (正本がまだ Notion のとき) ───
+//   ボード・ラベル待ち・履歴はアプリ側のタスクを見る画面。正本が Notion の間も「どういう形か」は見られるようにする。
+//   ただし中身は**取り込んだ時点**の状態なので、それを画面にはっきり書く。書き変えはできない (切替前に触ると Notion と食い違う)
+let preview = null;
+let previewAt = null;        // 下見を取った時刻 (画面に出す。「取り込んだ時点」と混ぜない)
+let previewInflight = null;  // 同時に 2 本走らせない
+let previewDown = false;     // つながらなかった (次の更新でまた取りにいく)
+const boardState = () => (isApp() ? state : preview);
+const PREVIEW_NOTE = '👀 見るだけの下見です (正本はまだ Notion)'
+  + '<small>ここに出ているのは Notion から取り込んだ時点の状態です。取り込んだ後に Notion で動かした分は入っていません。'
+  + '「アプリを正本にする」と、ここが本物になって書き変えもできます。</small>';
+function renderPreviewNote() {
+  const extra = previewDown
+    ? '<small>⚠ いまサーバーにつながりません。前に取れた分を出しています。</small>'
+    : (previewAt ? '<small>この画面を取ったのは ' + esc(fmtTime(new Date(previewAt).toISOString())) + ' です。</small>' : '');
+  for (const id of ['#prevBoard', '#prevLabel', '#prevHist']) {
+    const el = $(id);
+    if (!el) continue;
+    el.hidden = isApp();
+    if (!isApp()) el.innerHTML = PREVIEW_NOTE + (id === '#prevBoard' ? extra : '');
+  }
+}
+function loadPreview() {
+  if (previewInflight) return previewInflight;   // 同時に 1 本だけ (state と同じ作り)
+  previewInflight = loadPreviewOnce().finally(() => { previewInflight = null; });
+  return previewInflight;
+}
+async function loadPreviewOnce() {
+  const j = await apiFetch('/api/preview-tasks');
+  if (!j.ok) {
+    // つながらないときは前回の下見を消さない (消すと画面が空になる)。次の更新でまた取りにいく
+    previewDown = true;
+    if (!preview) $('#board').innerHTML = '<div class="colempty">' + esc(j.message || '読み込めませんでした') + ' — つながったら出ます</div>';
+    else renderBoard();
+    return;
+  }
+  previewDown = false;
+  preview = j;
+  previewAt = Date.now();
+  renderBoard();
 }
 
 // ─── ボード (状態 4 列 × 拠点) ───
 function facChips() {
-  const facs = state.facilities || [];
-  const counts = { all: state.cards.length };
-  for (const c of state.cards) counts[c.facility_code] = (counts[c.facility_code] || 0) + 1;
+  const st = boardState() || { cards: [], facilities: [] };
+  const facs = st.facilities || [];
+  const counts = { all: st.cards.length };
+  for (const c of st.cards) counts[c.facility_code] = (counts[c.facility_code] || 0) + 1;
   // 値は data 属性で渡す (onclick に文字列を埋めない — HTML エスケープは JS 文字列のエスケープではない。Codex PR-C R1)
   const one = (v, label) => '<button class="chip' + (curFacility === v ? ' on' : '') + '" data-fac="' + esc(v) + '">' +
     esc(label) + ' <span class="num">' + (counts[v] || 0) + '</span></button>';
@@ -864,6 +915,7 @@ $('#facChips').addEventListener('click', (e) => {
 $('#board').addEventListener('click', (e) => {
   const el = e.target.closest('[data-id]');
   if (!el) return;
+  if (!isApp()) { toast('下見なので開けません (アプリを正本にすると開けます)'); return; }
   if (el.dataset.pick === '1') toggleBulk(el.dataset.id); else openDetail(el.dataset.id);
 });
 $('#lwBody').addEventListener('click', (e) => {
@@ -872,24 +924,28 @@ $('#lwBody').addEventListener('click', (e) => {
 });
 $('#histBody').addEventListener('click', (e) => {
   const tr = e.target.closest('tr[data-id]');
-  if (tr) openDetail(tr.dataset.id);
+  if (!tr) return;
+  if (!isApp()) { toast('下見なので開けません (アプリを正本にすると開けます)'); return; }
+  openDetail(tr.dataset.id);
 });
 function boardCards() {
   const q = ($('#bq').value || '').trim().toLowerCase();
-  return state.cards.filter(c => {
+  return ((boardState() || {}).cards || []).filter(c => {
     if (curFacility !== 'all' && c.facility_code !== curFacility) return false;
     if (!q) return true;
     return String(c.title).toLowerCase().includes(q) || String(c.product_code || '').toLowerCase().includes(q);
   });
 }
 function renderBoard() {
-  if (!isApp()) return;
+  const bs = boardState();
+  if (!bs) { $('#board').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
+  renderPreviewNote();
   $('#facChips').innerHTML = facChips();
   const cards = boardCards();
-  syncBulkSelection(cards);
-  const cols = (state.statuses || []).map(st => {
+  if (isApp()) syncBulkSelection(cards);
+  const cols = (bs.statuses || []).map(st => {
     const mine = cards.filter(c => c.status === st.value);
-    const canBulk = st.value === 'ready_for_stocking' && mine.length > 0;
+    const canBulk = isApp() && st.value === 'ready_for_stocking' && mine.length > 0;
     const body = mine.length === 0 ? '<div class="colempty">なし</div>' : mine.map(c => bcardHtml(c, st.value)).join('');
     return '<div class="col"><h3>' + esc(st.label) + ' <span class="n">' + mine.length + '</span>' +
       (canBulk && !bulkIds ? '<button onclick="startBulk()">まとめて棚入完了</button>' : '') + '</h3>' + body + '</div>';
@@ -971,7 +1027,7 @@ const BULK_SKIP = { already: 'すでに棚入完了', not_ready: '棚入待ち�
 // ─── ラベル待ち ───
 function setLwOpenOnly(v) { lwOpenOnly = v; loadLabelWaits(); }
 async function loadLabelWaits() {
-  if (!isApp()) return;
+  renderPreviewNote();
   $('#lwOpenBtn').classList.toggle('on', lwOpenOnly);
   $('#lwAllBtn').classList.toggle('on', !lwOpenOnly);
   const j = await apiFetch('/api/label-waits' + (lwOpenOnly ? '' : '?all=1'));
@@ -1010,9 +1066,18 @@ function openLwNew() {
   lwEditing = { task_id: c.id };
   fillLw({ occurred_on: state.today, qty: c.qty, location: 'Z' }, c.title);
 }
+/** 下見のあいだは保存させない。ダイアログを開いたまま正本が変わっても追随する (Codex 下見 R1) */
+function renderLwSaveState() {
+  const btn = $('#lwSave');
+  if (!btn || !$('#lwOv').classList.contains('on')) return;
+  btn.disabled = !isApp();
+  if (!isApp()) $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)';
+  else if ($('#lwMsg').textContent.startsWith('下見なので')) $('#lwMsg').textContent = '';
+}
 function fillLw(r, name) {
   $('#lwName').textContent = name || '—';
-  $('#lwMsg').textContent = '';
+  $('#lwMsg').textContent = isApp() ? '' : '下見なので保存できません (アプリを正本にすると使えます)';
+  $('#lwSave').disabled = !isApp();
   $('#lwOccurred').value = r.occurred_on || '';
   $('#lwLot').value = r.lot_expiry || '';
   $('#lwQty').value = r.qty == null ? '' : r.qty;
@@ -1035,6 +1100,7 @@ function pickLwLoc(v) {
 function closeLw() { $('#lwOv').classList.remove('on'); lwEditing = null; }
 async function saveLw() {
   if (!lwEditing) return;
+  if (!isApp()) { $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)'; return; }
   const w = worker;
   if (!w) { openGate(); return; }
   const btn = $('#lwSave');
@@ -1056,7 +1122,7 @@ async function saveLw() {
     toast('ラベル待ちを保存しました');
     if (curView === 'label') loadLabelWaits();
   } finally {
-    btn.disabled = false;
+    btn.disabled = !isApp();   // 保存中に正本が変わっていたら押せないまま
   }
 }
 
@@ -1069,7 +1135,7 @@ function setHistRange(days) {
 }
 let histTimer = null;
 async function loadHistory() {
-  if (!isApp()) return;
+  renderPreviewNote();
   const p = new URLSearchParams();
   if ($('#histFrom').value) p.set('from', $('#histFrom').value);
   if ($('#histTo').value) p.set('to', $('#histTo').value);

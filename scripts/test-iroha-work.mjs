@@ -1657,6 +1657,35 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     ok(audit && audit.from_value === 'app' && /^notion \(未完了 \d+ 件・Notion 未反映: 状態変更 \d+ 回\/更新タスク \d+\/作業時間 \d+\/写真 \d+ \(force\)\)$/.test(audit.to_value)
       && audit.device_label === 'session:admin@test.local', '監査ログに件数と force と誰がが残る');
     ok((await call('GET', '/api/state', { cookie })).json.mode === 'notion', '戻した後の一覧は Notion 正本');
+
+    // ⭐切替前の下見 (中原さん 2026-09-03「正本にしないでも、どういう形か見たい」):
+    //   読むだけの 3 本は Notion 正本のままでも開ける。書き変えは今までどおり断る
+    {
+      const pv = await call('GET', '/api/preview-tasks', { cookie });
+      ok(pv.status === 200 && pv.json.ok && pv.json.preview === true && pv.json.mode === 'app', '下見のタスク一覧は Notion 正本でも開ける (preview=true)');
+      ok(Array.isArray(pv.json.cards) && Array.isArray(pv.json.statuses) && Array.isArray(pv.json.facilities), 'ボードに必要なもの (カード・状態・拠点) が入っている');
+      ok(pv.json.cards.every((c) => typeof c.id === 'number' && c.status && c.status_label), 'カードはアプリ側の形 (id は数値・状態は値と表示名)');
+      const lw = await call('GET', '/api/label-waits', { cookie });
+      ok(lw.status === 200 && lw.json.ok && lw.json.preview === true && Array.isArray(lw.json.rows), 'ラベル待ちの一覧も開ける (preview=true)');
+      const hi = await call('GET', '/api/history?q=BULK-X', { cookie });
+      ok(hi.status === 200 && hi.json.ok && hi.json.preview === true && hi.json.rows.length > 0, '履歴も開ける (preview=true)');
+      // 書き変えは断る (切替前に触ると Notion と食い違い、切替時の取込でも上書きされない)
+      const staff2 = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+      const writes = [
+        ['POST', '/api/bulk-stocked', { ids: [1], worker_id: staff2.id, pin: '4649' }],
+        ['POST', '/api/label-waits', { task_id: 1, worker_id: w1.id, fields: { note: 'x' } }],
+        ['POST', '/api/planned', { id: 1, worker_id: w1.id }],
+        ['POST', '/api/cancellation', { id: 1, worker_id: staff2.id, decision: 'cancel', pin: '4649' }],
+        ['POST', '/api/review-cleared', { id: 1, worker_id: staff2.id, pin: '4649' }],
+      ];
+      for (const [m, p2, body] of writes) {
+        const r = await call(m, p2, { cookie, body });
+        if (!(r.status === 409 && r.json.error === 'notion_mode')) ok(false, `${p2} は Notion 正本では 409 notion_mode (実際 ${r.status} ${r.json && r.json.error})`);
+      }
+      ok(true, '下見では書き変えできない (まとめて棚入完了・ラベル待ち登録・今日やる・取消の判断・確認ずみ)');
+      // 状態は動いていない
+      ok((await call('GET', '/api/state', { cookie })).json.mode === 'notion', '下見を見ても正本は Notion のまま');
+    }
     const ms = await call('GET', '/admin/migration/status', { ...admin });
     ok(ms.status === 200 && ms.json.ok && Array.isArray(ms.json.linkConflicts) && typeof ms.json.linkConflictsTotal === 'number', '移行の状態 (管理画面の元データ) に紐付け衝突の一覧と総件数が載る');
 
@@ -1902,6 +1931,22 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   const listBody = html.slice(html.indexOf('function renderList()'), html.indexOf('function renderList()') + 900);
   ok(/if \(curView === 'list'\) \{[\s\S]{0,200}exitBulk\(\)/.test(listBody), 'まとめて選択の解除は「一覧を見ているとき」だけ (ボードの選択を消さない)');
   ok(!/tabindex="-1"/.test(html), 'チェックボックスはキーボードでも操作できる (tabindex="-1" を付けない)');
+  // 切替前の下見: 画面切替はいつでも出す。ボードは正本が Notion なら下見データを読む。書き変えの導線は出さない
+  ok(/function renderViews\(\) \{ const el = \$\('#views'\); if \(el\) el\.hidden = false; \}/.test(html), '画面切替はいつでも出る (正本を問わない)');
+  ok(/if \(v === 'board'\) \{ if \(isApp\(\)\) renderBoard\(\); else loadPreview\(\); \}/.test(html), 'ボードは正本が Notion なら下見を読み込む');
+  ok(/const PREVIEW_NOTE = /.test(html) && /見るだけの下見です/.test(html), '下見であることを画面に書く');
+  ok(/if \(!isApp\(\)\) \{ toast\('下見なので開けません/.test(html), '下見ではカードを開かない (詳細は正本のカードなので id が別)');
+  ok(/const canBulk = isApp\(\) &&/.test(html), '下見では「まとめて棚入完了」を出さない');
+  ok(/\$\('#lwSave'\)\.disabled = !isApp\(\);/.test(html), '下見ではラベル待ちを保存できない');
+  // 正本が変わったとき・つながらなかったときの追随 (Codex 下見 R1)
+  ok(/if \(wasApp !== isApp\(\)\) \{ preview = null;/.test(html), '正本が変わったら下見のデータを捨てる (古い下見を新しく見せない)');
+  ok(/if \(curView === 'board'\) \{ if \(isApp\(\)\) renderBoard\(\); else loadPreview\(\); \}/.test(html), '更新のたびに、Notion 正本なら下見も取り直す (502 から戻ったときもここで回復)');
+  ok(/previewInflight = loadPreviewOnce\(\)/.test(html), '下見の取得は同時に 1 本だけ (遅れて返った古い応答で上書きしない)');
+  ok(/previewDown = true;[\s\S]{0,300}if \(!preview\)/.test(html), 'つながらないときは前回の下見を消さない');
+  ok(/previewAt = Date\.now\(\);/.test(html) && /この画面を取ったのは/.test(html), 'いつ取った下見かを画面に出す');
+  ok(/function renderLwSaveState/.test(html) && /renderLwSaveState\(\);/.test(html), 'ラベル待ちを開いたままでも保存ボタンが正本に追随する');
+  ok(/if \(!isApp\(\)\) \{ \$\('#lwMsg'\)\.textContent = '下見なので保存できません/.test(html), '保存の入口でも下見なら止める');
+  ok(/btn\.disabled = !isApp\(\);   \/\/ 保存中に正本が変わっていたら/.test(html), '保存後にボタンを無条件で戻さない');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
