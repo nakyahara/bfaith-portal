@@ -585,8 +585,9 @@ export function attachExcelToRun({ runId, parsed, file, actor }) {
         if (!key) continue;
         if (seen.has(key)) return { ok: false, error: 'duplicate_identity', message: `Excel 内で FNSKU ${er.fnsku} が重複しています (手動転記に切り替えてください)` };
         seen.add(key);
+        // 投入済み > Excel の予定 は拒否 (不足は後で予定に合わせて縮める/伸ばすので条件に入れない — Codex R14 #1)
         const row = existing.get(key);
-        if (row && row.placed + row.shortage > er.plannedQty) {
+        if (row && row.placed > er.plannedQty) {
           conflicts.push({ kind: 'over_placed', group: g.sheet_name, fnsku: er.fnsku, excelQty: er.plannedQty, placed: row.placed, shortage: row.shortage });
         }
       }
@@ -671,32 +672,32 @@ export function attachExcelToRun({ runId, parsed, file, actor }) {
       }
       summary.push({ groupId: g.id, sheetName: g.sheet_name, excelSheet: sheet.sheetName, packingGroupId: sheet.packingGroupId, overlap: a.overlap, ...counts });
     }
-    // 完了済み (done) の納品回への添付: 予定数が変わった/行が増えた分は iPad から直せないので、ここで不足を再計算する
-    // (投入+不足 = 予定 に揃える。増えた分は not_shipped、減った分は不足を縮める) — Codex R13 #1
+    // 添付で予定数が変わった行の不足を予定に合わせる (Codex R13 #1 / R14 #1,#2):
+    //   作業中 (active): 不足が「予定 − 投入」を超えていれば縮める (伸ばさない — 残りは現場が入れる)
+    //   完了済み (done): 投入+不足 = 予定 に揃える (増えた分は not_shipped、減った分は末尾から削る)。iPad から直せないため
+    // 内訳 (理由別) は shortageBreakdownFor で保つ
     let recomputed = 0;
-    if (run.status === 'done') {
-      const doneRows = d.prepare(`SELECT w.id, w.planned_qty, w.fnsku,
+    {
+      const affected = d.prepare(`SELECT w.id, w.planned_qty, w.fnsku,
           COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
           COALESCE(rw.shortage_qty, 0) AS shortage, rw.shortage_reason, rw.shortage_detail
         FROM fbx_rows w LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
-        WHERE w.run_id = ? AND w.match_state NOT IN ('picking_only','retired')`).all(run.id);
+        WHERE w.run_id = ? AND w.excel_row IS NOT NULL AND w.match_state NOT IN ('picking_only','retired')`).all(run.id);
       const up = d.prepare(`INSERT INTO fbx_row_work (row_id, shortage_qty, shortage_reason, shortage_detail, shortage_by, updated_at) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty, shortage_reason = excluded.shortage_reason, shortage_detail = excluded.shortage_detail,
           shortage_by = excluded.shortage_by, updated_at = excluded.updated_at`);
-      for (const r of doneRows) {
-        const need = r.planned_qty - r.placed;   // 添付後に必要な不足 (placed ≤ planned は over_placed で保証済み)
+      for (const r of affected) {
+        const gap = r.planned_qty - r.placed;   // placed ≤ planned は over_placed で保証済み
+        const need = run.status === 'done' ? gap : Math.min(r.shortage, gap);
         if (need === r.shortage) continue;
+        const bd = shortageBreakdownFor({ shortage: r.shortage, reason: r.shortage_reason, detail: r.shortage_detail }, need);
         if (need <= 0) {
           d.prepare('UPDATE fbx_row_work SET shortage_qty = NULL, shortage_reason = NULL, shortage_detail = NULL, updated_at = ? WHERE row_id = ?').run(now, r.id);
         } else {
-          const extra = need - r.shortage;
-          const detail = r.shortage > 0 && extra > 0
-            ? [{ reason: r.shortage_reason || 'other', qty: r.shortage }, { reason: 'not_shipped', qty: extra }]
-            : null;
-          up.run(r.id, need, r.shortage > 0 ? (r.shortage_reason || 'other') : 'not_shipped', detail ? JSON.stringify(detail) : null, actor || null, now);
+          up.run(r.id, need, bd.reason || 'not_shipped', bd.detail, actor || null, now);
         }
         logEvent({ runId: run.id, action: 'row_shortage', targetType: 'row', targetId: r.id, deviceLabel: actor, ok: true,
-          payload: { shortageQty: Math.max(0, need), reason: 'not_shipped', auto: true, via: 'excel_attach_after_done', from: r.shortage, planned: r.planned_qty, placed: r.placed } }, d);
+          payload: { shortageQty: Math.max(0, need), reason: bd.reason, auto: true, via: 'excel_attach', runStatus: run.status, from: r.shortage, planned: r.planned_qty, placed: r.placed, detail: safeJson(bd.detail, null) } }, d);
         recomputed++;
         warnings.push({ kind: 'shortage_recomputed', fnsku: r.fnsku, planned: r.planned_qty, placed: r.placed, shortageFrom: r.shortage, shortageTo: Math.max(0, need) });
       }
@@ -782,7 +783,7 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel }) {
     }
     const rows = d.prepare(`SELECT w.*,
         COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
-        COALESCE(rw.shortage_qty, 0) AS shortage, rw.shortage_reason
+        COALESCE(rw.shortage_qty, 0) AS shortage, rw.shortage_reason, rw.shortage_detail
       FROM fbx_rows w LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
       WHERE w.run_id = ? AND w.match_state NOT IN ('picking_only','retired') ORDER BY w.pack_group_id, w.id`).all(run.id)
       .map((r) => ({ ...r, remaining: r.planned_qty - r.placed - r.shortage })).filter((r) => r.remaining !== 0);
@@ -805,18 +806,17 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel }) {
         payload: { boxNo: b.box_no, boxCode: b.box_code, reason: '作業完了時に未使用', auto: true } }, d);
       voided.push(b.box_code);
     }
-    // 既存の不足 (例: 破損 2) があれば理由を上書きせず内訳で持つ: shortage_reason は既存のまま、detail に [{破損 2}, {not_shipped 3}] (Codex R13 #2)
+    // 既存の不足 (例: 破損 2) があれば理由を上書きせず内訳で持つ: [{破損 2}, {not_shipped 3}] (Codex R13 #2 / R14 #2)
     const upShort = d.prepare(`INSERT INTO fbx_row_work (row_id, shortage_qty, shortage_reason, shortage_detail, shortage_by, updated_at) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty, shortage_reason = excluded.shortage_reason, shortage_detail = excluded.shortage_detail,
         shortage_by = excluded.shortage_by, updated_at = excluded.updated_at`);
     let notShipped = 0;
     for (const r of rows) {
-      const detail = r.shortage > 0
-        ? [{ reason: r.shortage_reason || 'other', qty: r.shortage }, { reason: 'not_shipped', qty: r.remaining }]
-        : null;
-      upShort.run(r.id, r.shortage + r.remaining, r.shortage > 0 ? (r.shortage_reason || 'other') : 'not_shipped', detail ? JSON.stringify(detail) : null, worker?.display_name || null, now);
+      const total = r.shortage + r.remaining;
+      const bd = shortageBreakdownFor({ shortage: r.shortage, reason: r.shortage_reason, detail: r.shortage_detail }, total);
+      upShort.run(r.id, total, bd.reason || 'not_shipped', bd.detail, worker?.display_name || null, now);
       logEvent({ runId: run.id, action: 'row_shortage', targetType: 'row', targetId: r.id, workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
-        payload: { shortageQty: r.shortage + r.remaining, reason: 'not_shipped', auto: true, remaining: r.remaining, detail } }, d);
+        payload: { shortageQty: total, reason: 'not_shipped', auto: true, remaining: r.remaining, detail: safeJson(bd.detail, null) } }, d);
       notShipped++;
     }
     if (notShipped > 0 || voided.length > 0) bumpRunVersion(d, run.id);
@@ -1041,7 +1041,7 @@ export function listBoxContents(boxId) {
  *   冪等性 → 行/箱/回の状態 → 残数 → 期限制約 → box_seq 採番 → 挿入 → 監査
  * layer は任意 (manual のみ。自動推定は保存しない — Codex R2 S2)
  */
-export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, deviceKey, deviceLabel, requestId }) {
+export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, deviceKey, deviceLabel, requestId, allowClosedBox = false }) {
   const q = Number(qty);
   if (!Number.isInteger(q) || q <= 0 || q > 100000) return { ok: false, error: 'bad_qty', message: '個数は1以上の整数で入力してください' };
   if (!deviceKey || !requestId) return { ok: false, error: 'bad_request', message: 'request_id がありません (画面を更新してください)' };
@@ -1085,7 +1085,8 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
       return { ok: false, error: 'wrong_group', message: 'この箱は別の梱包グループの箱です。同じシートの箱を選んでください' };
     }
     if (box.status === 'void') return { ok: false, error: 'box_void', message: 'この箱は取消済みです。別の箱を選んでください' };
-    if (box.status !== 'open') return { ok: false, error: 'box_closed', message: 'この箱は閉じられています (職員が再オープンすれば入れられます)' };
+    // 閉じた箱への追加は不可。例外 = 職員による数の修正 (adjustPlacement) で同じ箱に入れ直すときだけ (Codex R14 #3)
+    if (box.status !== 'open' && !(allowClosedBox && box.status === 'closed')) return { ok: false, error: 'box_closed', message: 'この箱は閉じられています (職員が再オープンすれば入れられます)' };
     // 残数 = 予定 − 投入済み − 確定不足 (Codex PR1 #4: 不足確定後にその分を超えて入れられない)
     const placed = placedOf(d, row.id);
     const shortage = d.prepare('SELECT COALESCE(shortage_qty, 0) s FROM fbx_row_work WHERE row_id = ?').get(row.id)?.s || 0;
@@ -1193,13 +1194,15 @@ export function adjustPlacement({ placementId, qty, byStaff = false, reason, wor
       const rv = revokePlacement({ placementId: p.id, byStaff, reason: reason || (byStaff ? '数の修正' : null), worker, deviceKey, deviceLabel });
       if (!rv.ok) return rv;
       if (q === 0) return { ok: true, placementId: null, placed: rv.placed, revokedId: p.id };
+      // 閉じた箱の記録は職員だけが直せる (取消側で staff_required になる) → 入れ直しも同じ箱に許可する
       const add = addPlacement({ runId: p.run_id, rowId: p.row_id, boxId: p.box_id, qty: q, expiry: p.expiry, layer: p.placement_layer,
-        worker, deviceKey, deviceLabel, requestId: requestId || `adj-${p.id}-${Date.now()}` });
+        worker, deviceKey, deviceLabel, requestId: requestId || `adj-${p.id}-${Date.now()}`, allowClosedBox: byStaff });
       if (!add.ok) fail(add);   // 入れ直せない (残数超など) → 取消ごと戻す
+      const boxClosed = d.prepare('SELECT status FROM fbx_boxes WHERE id = ?').get(p.box_id)?.status === 'closed';
       logEvent({ runId: p.run_id, action: 'placement_adjust', targetType: 'placement', targetId: add.placementId,
         workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
-        payload: { from: p.qty, to: q, revokedId: p.id, boxId: p.box_id, byStaff } }, d);
-      return { ok: true, placementId: add.placementId, revokedId: p.id, placed: add.placed, from: p.qty, to: q };
+        payload: { from: p.qty, to: q, revokedId: p.id, boxId: p.box_id, byStaff, boxClosed } }, d);
+      return { ok: true, placementId: add.placementId, revokedId: p.id, placed: add.placed, from: p.qty, to: q, boxClosed };
     }).immediate();
   } catch (e) {
     if (e.result) return e.result;
@@ -1269,6 +1272,32 @@ export function setRowWorkers({ rowId, labelWorker, checkWorker, worker, deviceL
 export const SHORTAGE_REASONS = ['missing', 'damaged', 'bad_label', 'wrong_item', 'expiry_issue', 'hq_order', 'stock_short', 'not_shipped', 'other'];
 export const SHORTAGE_REASON_JA = { missing: '現物がない', damaged: '破損', bad_label: 'ラベル不良', wrong_item: '商品違い', expiry_issue: '期限が合わない',
   hq_order: '本社指示', stock_short: '在庫が少ない', not_shipped: '今回は納品しない', other: 'その他' };
+
+/**
+ * 不足の内訳 (理由別) を新しい合計に合わせる (Codex R14 #2)。
+ * 増分は「今回は納品しない (not_shipped)」へ、減分は末尾 (= 直近に足した not_shipped) から削る。
+ * @returns { reason: 先頭の理由 | null, detail: 2 件以上なら JSON | null }
+ */
+export function shortageBreakdownFor({ shortage = 0, reason = null, detail = null }, newQty) {
+  let entries = safeJson(detail, null);
+  if (!Array.isArray(entries) || entries.length === 0) entries = shortage > 0 ? [{ reason: reason || 'other', qty: shortage }] : [];
+  entries = entries.map((e) => ({ reason: e.reason || 'other', qty: Number(e.qty) || 0 })).filter((e) => e.qty > 0);
+  const cur = entries.reduce((a, e) => a + e.qty, 0);
+  const target = Math.max(0, Number(newQty) || 0);
+  if (target > cur) {
+    const ns = entries.find((e) => e.reason === 'not_shipped');
+    if (ns) ns.qty += target - cur; else entries.push({ reason: 'not_shipped', qty: target - cur });
+  } else if (target < cur) {
+    let cut = cur - target;
+    for (let i = entries.length - 1; i >= 0 && cut > 0; i--) {
+      const take = Math.min(entries[i].qty, cut);
+      entries[i].qty -= take; cut -= take;
+    }
+    entries = entries.filter((e) => e.qty > 0);
+  }
+  if (entries.length === 0) return { reason: null, detail: null };
+  return { reason: entries[0].reason, detail: entries.length > 1 ? JSON.stringify(entries) : null };
+}
 
 /**
  * 送る数の修正 (職員)。「予定 30 だが棚に 25 しかない」→ 送る数 25 = 不足 5 (理由 stock_short) として記録する

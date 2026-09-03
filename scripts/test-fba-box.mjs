@@ -248,8 +248,15 @@ t('adjustPlacement: 間違えた数を直す = 取消 + 入れ直し (同じ箱)
   assert.equal(db.adjustPlacement({ placementId: r.placementId, qty: 1, worker: member, deviceKey: 'dev:2', requestId: 'adj3' }).error, 'staff_required');
   const st2 = db.adjustPlacement({ placementId: r.placementId, qty: 1, byStaff: true, worker: staff, deviceKey: 'dev:2', requestId: 'adj4' });
   assert.equal(st2.ok, true, JSON.stringify(st2));
+  // 閉じた箱の記録: 利用者は不可、職員は同じ箱に入れ直せる (boxClosed フラグ付き)
+  db.closeBox({ boxId: box1.boxId, measuredKg: 9.9, worker: staff });
+  assert.equal(db.adjustPlacement({ placementId: st2.placementId, qty: 2, worker: member, deviceKey: 'dev:1', requestId: 'adj-c1' }).error, 'staff_required');
+  const cl = db.adjustPlacement({ placementId: st2.placementId, qty: 2, byStaff: true, worker: staff, deviceKey: 'dev:2', requestId: 'adj-c2' });
+  assert.equal(cl.ok, true, JSON.stringify(cl)); assert.equal(cl.boxClosed, true);
+  assert.equal(db.getRunState(runId).placements.find((x) => x.id === cl.placementId).box_id, box1.boxId);
+  db.reopenBox({ boxId: box1.boxId, reason: 'テスト', worker: staff });
   // 0 = 取消だけ
-  const z = db.adjustPlacement({ placementId: st2.placementId, qty: 0, byStaff: true, worker: staff, deviceKey: 'dev:2', requestId: 'adj5' });
+  const z = db.adjustPlacement({ placementId: cl.placementId, qty: 0, byStaff: true, worker: staff, deviceKey: 'dev:2', requestId: 'adj5' });
   assert.equal(z.ok, true); assert.equal(z.placementId, null);
   assert.equal(db.getRunState(runId).rows.find((x) => x.id === rowA.id).placed, before - 4);
   assert.ok(db.listEvents(30).some((e) => e.action === 'placement_adjust'));
@@ -278,13 +285,14 @@ t('閉じた箱の割当取消は職員のみ', () => {
   assert.equal(db.revokePlacement({ placementId: p.id, worker: member, deviceKey: 'dev:1' }).error, 'staff_required');
 });
 t('reopenBox: 理由必須・実測がクリアされ再クローズ要', () => {
+  const before = db.getRunState(runId).boxes.find(x => x.id === box1.boxId).reopen_count;
   assert.equal(db.reopenBox({ boxId: box1.boxId, worker: staff }).error, 'reason_required');
   const r = db.reopenBox({ boxId: box1.boxId, reason: '詰め直し', worker: staff });
   assert.equal(r.ok, true);
   const b = db.getRunState(runId).boxes.find(x => x.id === box1.boxId);
   assert.equal(b.status, 'open');
   assert.equal(b.measured_weight_kg, null);
-  assert.equal(b.reopen_count, 1);
+  assert.equal(b.reopen_count, before + 1);
 });
 t('空箱はクローズできない', () => {
   const b2 = db.createBox({ packGroupId: groupId, materialCode: 'box160', worker: member });
@@ -974,6 +982,50 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     const rd = db.exportReadiness(c6.runId);
     assert.equal(rd.ok, true, JSON.stringify(rd.blockers));
     assert.equal(db.buildExportPayload(c6.runId).ok, true);
+  });
+  t('shortageBreakdownFor: 増分は not_shipped へ、減分は末尾から削る、1 件なら detail は無し', () => {
+    const a = db.shortageBreakdownFor({ shortage: 2, reason: 'damaged', detail: null }, 5);
+    assert.equal(a.reason, 'damaged'); assert.deepEqual(JSON.parse(a.detail), [{ reason: 'damaged', qty: 2 }, { reason: 'not_shipped', qty: 3 }]);
+    const b = db.shortageBreakdownFor({ shortage: 5, reason: 'damaged', detail: a.detail }, 6);
+    assert.deepEqual(JSON.parse(b.detail), [{ reason: 'damaged', qty: 2 }, { reason: 'not_shipped', qty: 4 }]);
+    const c = db.shortageBreakdownFor({ shortage: 5, reason: 'damaged', detail: a.detail }, 1);
+    assert.equal(c.reason, 'damaged'); assert.equal(c.detail, null);
+    const z = db.shortageBreakdownFor({ shortage: 5, reason: 'damaged', detail: a.detail }, 0);
+    assert.equal(z.reason, null); assert.equal(z.detail, null);
+    const n = db.shortageBreakdownFor({ shortage: 0, reason: null, detail: null }, 3);
+    assert.equal(n.reason, 'not_shipped'); assert.equal(n.detail, null);
+  });
+  t('done 後の添付で予定が減る: 投入 ≤ 予定なら拒否せず不足を縮める (内訳も末尾から)。作業中の回でも不足が予定を超えれば縮める', () => {
+    // fixture2 の 4 SKU。picking では 4 つ目 (Excel 30) を 40 にし、5 だけ入れて完了 → 不足 35 (not_shipped) → 添付で予定 30 → 不足 25
+    const rowsPk = f2rows.map((r, i) => ({ no: i + 1, sku: r.sku, fnsku: r.fnsku, productName: 'p' + i, qty: String(i === 3 ? 40 : r.plannedQty) }));
+    const c7 = db.createRunFromPicking({ pickingRun: { id: 407, delivery_date: '2026-09-28' }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: rowsPk }], createdBy: 't' });
+    const st = db.getRunState(c7.runId);
+    const bx = db.createBox({ packGroupId: st.groups[0].id, materialCode: 'box140', worker: member });
+    for (const [i, r] of st.rows.entries()) {
+      db.addPlacement({ runId: c7.runId, rowId: r.id, boxId: bx.boxId, qty: i === 3 ? 5 : r.planned_qty, worker: member, deviceKey: 'dev:e', requestId: 'dec' + i });
+    }
+    const r4 = st.rows[3];
+    db.setRowShortage({ rowId: r4.id, shortageQty: 2, reason: 'damaged', worker: staff });   // 破損 2 を先に
+    db.closeBox({ boxId: bx.boxId, measuredKg: 4, worker: staff });
+    assert.equal(db.finishRun({ runId: c7.runId, acknowledge: true, worker: staff }).ok, true);   // 残り 33 → 破損 2 + not_shipped 33 = 35
+    assert.equal(db.getRunState(c7.runId).rows.find((x) => x.id === r4.id).shortage_qty, 35);
+    const at = db.attachExcelToRun({ runId: c7.runId, parsed: ing.parsed, file: { originalName: 'dec.xlsx', storedPath: ing.storedPath, sha256: ing.sha256 }, actor: 't' });
+    assert.equal(at.ok, true, JSON.stringify(at));
+    const row = db.getRunState(c7.runId).rows.find((x) => x.id === r4.id);
+    assert.equal(row.planned_qty, 30); assert.equal(row.shortage_qty, 25);
+    assert.deepEqual(JSON.parse(row.shortage_detail), [{ reason: 'damaged', qty: 2 }, { reason: 'not_shipped', qty: 23 }]);
+    assert.equal(db.exportReadiness(c7.runId).ok, true, JSON.stringify(db.exportReadiness(c7.runId).blockers));
+    // 作業中の回: 予定 40 (picking) → 送る数 10 (不足 30) にしてから Excel (予定 30) を添付 → 不足は 30 → 25 に縮む (投入 5)
+    const c8 = db.createRunFromPicking({ pickingRun: { id: 408, delivery_date: '2026-09-29' }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: rowsPk }], createdBy: 't' });
+    const st8 = db.getRunState(c8.runId);
+    const bx8 = db.createBox({ packGroupId: st8.groups[0].id, materialCode: 'box140', worker: member });
+    db.addPlacement({ runId: c8.runId, rowId: st8.rows[3].id, boxId: bx8.boxId, qty: 5, worker: member, deviceKey: 'dev:e', requestId: 'act1' });
+    assert.equal(db.setRowSendQty({ rowId: st8.rows[3].id, sendQty: 10, worker: staff }).ok, true);   // 不足 30
+    const at8 = db.attachExcelToRun({ runId: c8.runId, parsed: ing.parsed, file: { originalName: 'act.xlsx', storedPath: ing.storedPath, sha256: ing.sha256 }, actor: 't' });
+    assert.equal(at8.ok, true, JSON.stringify(at8));
+    const row8 = db.getRunState(c8.runId).rows.find((x) => x.id === st8.rows[3].id);
+    assert.equal(row8.planned_qty, 30); assert.equal(row8.shortage_qty, 25); assert.equal(row8.shortage_reason, 'stock_short');
+    assert.equal(db.getRun(c8.runId).status, 'active');
   });
   t('setRowShortage: 理由 not_shipped が使える', () => {
     const c2 = db.createRunFromPicking({ pickingRun: { id: 401 }, planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, fnsku: 'X0FIN00003', productName: 'x', qty: '2' }] }], createdBy: 't' });

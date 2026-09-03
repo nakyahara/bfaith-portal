@@ -970,6 +970,7 @@
           const j2 = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: sw.id, pin, as_staff: true, reason: '数の修正', qty,
             request_id: (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2)) });
           if (!j2.ok) alert(j2.message || '直せませんでした');
+          else if (j2.boxClosed) alert('閉じた箱の中身を直しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
           await refresh(true); openRowDialog(row.id);
         });
         return;
