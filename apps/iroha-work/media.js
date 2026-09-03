@@ -27,6 +27,7 @@ export const MAX_PHOTOS = 3;
 // 既に保存された動画の行とドライブのファイルはそのまま残す (画面に出さないだけ)
 export const MAX_VIDEOS = 0;
 export const MAX_PHOTO_BYTES = 8 * 1024 * 1024;     // canvas縮小後は通常1MB未満。余裕をみて8MB
+// 動画を再開するときの受け取り上限 (いまは MAX_VIDEOS = 0 なので使っていない。戻すときの値として残す)
 export const MAX_VIDEO_BYTES = 120 * 1024 * 1024;
 const RETRY_BASE_MS = 2 * 60 * 1000;
 const MAX_ATTEMPTS = 10;
@@ -101,6 +102,10 @@ function readHead(filePath, n = 16) {
 export function addMedia({ pageId = null, taskId = null, productCode = null, kind, mime, filePath, worker, deviceLabel = null, deviceId = null, operationId }) {
   const opId = String(operationId || '').trim();
   if (!/^[A-Za-z0-9_-]{8,64}$/.test(opId)) return { ok: false, error: 'bad_request', message: 'operation_id が不正です' };
+  // 種類の判定は**いちばん先**に (ファイルを見る前・再送の照合より前)。
+  // 「動画は必ず video_disabled」という約束にする — 壊れたファイルや再送で別の答えが返らないように (Codex R1)
+  if (kind === 'video') return { ok: false, error: 'video_disabled', message: '動画は今つかえません (写真をとってください)' };
+  if (kind !== 'photo') return { ok: false, error: 'bad_request', message: '種類が不正です (写真だけ受け付けます)' };
   const size = fs.statSync(filePath).size;
   const sniffed = sniffKind(readHead(filePath));
   if (sniffed !== kind) {
@@ -131,7 +136,6 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
     }
     return { ok: true, already: true, media: publicMedia(dup) };
   }
-  if (kind === 'video') return { ok: false, error: 'video_disabled', message: '動画は今つかえません (写真をとってください)' };
   const max = kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
   if (countActiveMedia({ pageId, taskId }, kind) >= max) {
     return { ok: false, error: 'cap_reached', message: `写真は${max}枚までです。不要な写真を削除してから撮り直してください` };
