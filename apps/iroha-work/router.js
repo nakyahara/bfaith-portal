@@ -426,6 +426,15 @@ router.post('/api/review-cleared', checkOrigin, api((req, res) => {
 }));
 
 /**
+ * 切替前の下見 (読むだけ)。正本が Notion でも f_iroha_tasks の一覧を返す —
+ * ボード・ラベル待ち・履歴が「どういう形か」を切り替える前に見せるため (中原さん 2026-09-03)。
+ * ⚠中身は取込時点の状態。Notion 側でその後に動かした分は入っていない (画面にもその旨を出す)
+ */
+router.get('/api/preview-tasks', api((req, res) => {
+  res.json({ ok: true, ...buildTaskList(), preview: !isAppMode(), serverNow: new Date().toISOString() });
+}));
+
+/**
  * まとめて棚入完了 (アプリ正本のみ)。棚入待ちのカードだけを 終了 (棚入完了) にする。
  * 職員限定 (transitionNeedsStaff('ready_for_stocking','closed') と同じ扱い): ポータルのセッション、
  * または職員の作業者 + PIN。選んだ後に状態が変わっていた分は skipped で返す
@@ -453,9 +462,8 @@ router.post('/api/bulk-stocked', checkOrigin, api((req, res) => {
 /** JST の日付 (YYYY-MM-DD) */
 const jstDay = (d) => new Date(d.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 
-/** 履歴 (終了したカード。一覧には出さないので、ここで期間・商品名で探す)。アプリ正本のみ */
+/** 履歴 (終了したカード。一覧には出さないので、ここで期間・商品名で探す)。読むだけなので切替前でも開ける */
 router.get('/api/history', api((req, res) => {
-  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
   // YYYY-MM-DD かつ**実在する日**だけ受ける (2026-99-99 や 2026-02-30 は Date が例外・別の日に化ける — Codex PR-C R1)
   const day = (v) => {
     const t = String(v == null ? '' : v).trim();
@@ -481,16 +489,16 @@ router.get('/api/history', api((req, res) => {
       q: req.query.q ? String(req.query.q).slice(0, 100) : null,
       limit: req.query.limit,
     }),
+    preview: !isAppMode(),
     fromDate: from || null, toDate: to || null,
   });
 }));
 
-/** ラベル待ち (一覧・登録・更新)。アプリ正本のみ */
+/** ラベル待ちの一覧。読むだけなので切替前でも開ける (登録・更新はアプリ正本のみ) */
 router.get('/api/label-waits', api((req, res) => {
-  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
   const taskId = req.query.task_id == null ? null : parseTaskId(req.query.task_id);
   if (req.query.task_id != null && taskId == null) return res.status(400).json(BAD_TASK_ID);
-  res.json({ ok: true, rows: listLabelWaits({ taskId, openOnly: req.query.all !== '1' }) });
+  res.json({ ok: true, preview: !isAppMode(), rows: listLabelWaits({ taskId, openOnly: req.query.all !== '1' }) });
 }));
 
 router.post('/api/label-waits', checkOrigin, api((req, res) => {
