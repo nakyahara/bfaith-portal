@@ -208,6 +208,7 @@ export function buildPlanSheet(planItems, mappingMap) {
     const mapping = mappingMap.get(normSku(item.sku));
     return {
       no: i + 1,
+      sku: item.sku,   // 箱詰め記録 (fba-box) が納品回を作るときの seller_sku (Excel 未添付でも SKU を持てるように)
       fnsku: item.fnsku,
       productName: mapping?.product_name || '',
       qty: item.qty,

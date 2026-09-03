@@ -34,6 +34,8 @@ import { createPickingCard, notionConfigured } from './notion-attach.js';
 // SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
 // import { fetchAllReports, normalizePlanningRow } from './sp-api-reports.js';
 // import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
+// 箱詰め記録 (apps/fba-box): picking-prep 実行完了で納品回を自動作成する (専用 fba-box.db。読み書きは fba-box 側の関数のみ)
+import { createRunFromPicking as createBoxRunFromPicking } from '../fba-box/db.js';
 import { syncSkuMappings, syncDodaiMaster } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
 import { normalizePlanningRow } from './sp-api-reports.js';
@@ -1810,7 +1812,17 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       }
     }
 
-    res.json({ success: true, runId, summary, warnings, driveSave, annotate, notion, ...result });
+    // 箱詰め記録 (fba-box) の納品回を自動作成 — いろはの iPad にすぐ出る (Excel は本社が後から添付)。
+    // best-effort: 失敗しても picking-prep の結果は成功扱い (iPad の「作業開始」からも作れる)
+    let boxRun = { attempted: true, ok: false };
+    try {
+      boxRun = { attempted: true, ...createBoxRunFromPicking({ pickingRun: { id: runId, delivery_date: deliveryDate, run_at: null }, planSheets, createdBy: req.session?.email, activate: true }) };
+    } catch (e) {
+      console.error('[Picking] 箱詰め記録の納品回作成に失敗 (best-effort):', e);
+      boxRun = { attempted: true, ok: false, error: e.message };
+    }
+
+    res.json({ success: true, runId, summary, warnings, driveSave, annotate, notion, boxRun, ...result });
   } catch (e) {
     console.error('[Picking] 処理エラー:', e);
     res.status(500).json({ error: e.message });

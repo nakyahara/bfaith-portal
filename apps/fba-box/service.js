@@ -152,6 +152,47 @@ export function matchWorkbook(parsed, planSheets) {
   return { ok, groups, issues: allIssues };
 }
 
+/**
+ * PR2.5: 添付した Excel のシート ↔ 納品回のグループ (picking のプラン別シート) を FNSKU の重なりで対応付ける。
+ * 各シートは重なりが最大のグループへ。重なり 0 は対応不可 (ただし 1 シート×1 グループならそのまま対応)。
+ * 2 シートが同じグループを取り合ったら曖昧として失敗 (本社が Excel を確認)
+ * @param parsedSheets parse_packlist の sheets
+ * @param groups [{ id, name, fnskus: string[] }]
+ * @returns { ok, assignments: [{sheetIndex, sheetName, groupId, overlap}], unassignedGroups: [id], issues, message }
+ */
+export function matchExcelSheetsToGroups(parsedSheets, groups) {
+  const gsets = groups.map((g) => ({ id: g.id, name: g.name, set: new Set((g.fnskus || []).map(norm).filter(Boolean)) }));
+  const assignments = [];
+  const issues = [];
+  const taken = new Map();   // groupId → sheetIndex
+  parsedSheets.forEach((sheet, sheetIndex) => {
+    const fn = new Set((sheet.skuRows || []).map((r) => norm(r.fnsku)).filter(Boolean));
+    const scored = gsets.map((g) => ({ id: g.id, name: g.name, overlap: [...fn].filter((x) => g.set.has(x)).length }))
+      .sort((a, b) => b.overlap - a.overlap);
+    let best = scored[0];
+    if (!best || best.overlap === 0) {
+      if (parsedSheets.length === 1 && gsets.length === 1) best = { ...scored[0], overlap: 0 };
+      else { issues.push({ kind: 'unmatched_sheet', sheetName: sheet.sheetName, fnskus: fn.size }); return; }
+    }
+    if (scored[1] && scored[1].overlap === best.overlap && best.overlap > 0) {
+      issues.push({ kind: 'ambiguous_sheet', sheetName: sheet.sheetName, candidates: [best.name, scored[1].name] });
+      return;
+    }
+    if (taken.has(best.id)) {
+      issues.push({ kind: 'group_conflict', sheetName: sheet.sheetName, groupName: best.name, otherSheet: parsedSheets[taken.get(best.id)].sheetName });
+      return;
+    }
+    taken.set(best.id, sheetIndex);
+    assignments.push({ sheetIndex, sheetName: sheet.sheetName, groupId: best.id, groupName: best.name, overlap: best.overlap });
+  });
+  const unassignedGroups = gsets.filter((g) => !taken.has(g.id)).map((g) => g.id);
+  const ok = issues.length === 0 && assignments.length === parsedSheets.length;
+  return {
+    ok, assignments, unassignedGroups, issues,
+    message: ok ? null : `Excel のシートを納品回のグループに対応付けできません: ${issues.map((i) => `${i.sheetName} (${i.kind})`).join(', ')}`,
+  };
+}
+
 export function groupDisplayName(sheet) {
   const m = /：\s*(\S+)/.exec(sheet.packingGroupLabel || '');
   const n = m ? m[1] : '1';

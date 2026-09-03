@@ -22,6 +22,7 @@ import {
   listWorkers, getWorker, addWorker, setWorkerActive, setWorkerPin, verifyWorkerPin, isRosterBootstrap,
   listEvents, safeLogEvent, listMaterials, upsertMaterial,
   createRun, activateRun, setRunStatus, listRuns, getRun, getRunState,
+  createRunFromPicking, getRunBySource, attachExcelToRun,
   createBox, closeBox, reopenBox, voidBox, listBoxContents,
   addPlacement, revokePlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage,
@@ -35,6 +36,40 @@ const router = Router();
 export const APP_ID = 'fba-box';
 const BASE = '/apps/fba-box';
 const DEVICE_COOKIE = 'fbx_device';
+
+/**
+ * picking-prep (fba-replenishment, sql.js の fba.db) のデータ源。納品回の元 (プラン別シート)。
+ * テストで差し替えられるように間接化 (_setPickingSource)。読めないときは空扱い + エラー文 (fail-soft)
+ */
+let pickingSource = async () => {
+  const m = await import('../fba-replenishment/db.js');
+  return { getPickingRuns: (n) => m.getPickingRuns(n), getPickingRun: (id) => m.getPickingRun(id) };
+};
+export function _setPickingSource(fn) { pickingSource = fn; }
+async function loadPickingRuns(limit = 15) {
+  try {
+    const src = await pickingSource();
+    return { runs: src.getPickingRuns(limit) || [], error: null };
+  } catch (e) {
+    return { runs: [], error: e.message };
+  }
+}
+/** picking 実行から納品回を作る共通処理 (iPad / 本社の両方から) */
+async function createFromPicking(sourceRunId, createdBy) {
+  if (!Number.isInteger(sourceRunId) || sourceRunId <= 0) return { status: 400, body: { ok: false, error: 'bad_request', message: 'ピッキング実行を選んでください' } };
+  let pickingRun = null;
+  try {
+    pickingRun = (await pickingSource()).getPickingRun(sourceRunId);
+  } catch (e) {
+    return { status: 502, body: { ok: false, error: 'picking_db', message: `ピッキング実行を読めませんでした: ${e.message}` } };
+  }
+  if (!pickingRun) return { status: 404, body: { ok: false, error: 'not_found', message: '指定のピッキング実行が見つかりません (保持100件を超えて消えた可能性)' } };
+  let planSheets = [];
+  try { planSheets = JSON.parse(pickingRun.result || '{}').planSheets || []; }
+  catch { return { status: 422, body: { ok: false, error: 'bad_picking_data', message: 'ピッキング実行のデータを解釈できませんでした' } }; }
+  const r = createRunFromPicking({ pickingRun, planSheets, createdBy, activate: true });
+  return { status: r.ok ? 200 : 400, body: r };
+}
 
 // ─── 共通ヘルパ (iroha-work と同じ) ───
 function readCookie(req, name) {
@@ -214,9 +249,24 @@ router.get('/', (req, res) => {
 
 // ─── 作業 API ───
 
-/** 納品回一覧 (iPad は active のみ選べる。setup/done も理由付きで見せる) */
-router.get('/api/runs', api((req, res) => {
-  res.json({ ok: true, runs: listRuns(20), serverNow: new Date().toISOString() });
+/**
+ * 納品回一覧 (iPad は active のみ選べる。setup/done も理由付きで見せる) +
+ * まだ納品回になっていない picking 実行 (PR2.5: いろはが iPad で「作業開始」して自分で作れる)
+ */
+router.get('/api/runs', api(async (req, res) => {
+  const pk = await loadPickingRuns(15);
+  const pickingRuns = pk.runs.map((r) => {
+    const box = getRunBySource(r.id);
+    return { id: r.id, deliveryDate: r.delivery_date || null, runAt: r.run_at || null, sheetCount: r.plan_sheet_count ?? null,
+      boxRun: box ? { id: box.id, status: box.status } : null };
+  });
+  res.json({ ok: true, runs: listRuns(20), pickingRuns, pickingError: pk.error, serverNow: new Date().toISOString() });
+}));
+
+/** picking 実行から納品回を作る (iPad から。同じ実行の回が既にあれば already でその回を返す) */
+router.post('/api/runs/from-picking', checkOrigin, api(async (req, res) => {
+  const r = await createFromPicking(Number(req.body?.source_run_id), deviceLabelOf(req));
+  res.status(r.status).json(r.body);
 }));
 
 /** 選択した納品回の全状態 */
@@ -451,14 +501,9 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX
 
 router.get('/admin', requireSession, api(async (req, res) => {
   // picking-prep の直近実行 (納品回の元データ候補)。fba.db は server 起動時に初期化済み
-  let pickingRuns = [];
-  let pickingError = null;
-  try {
-    const fbaDb = await import('../fba-replenishment/db.js');
-    pickingRuns = fbaDb.getPickingRuns(15);
-  } catch (e) {
-    pickingError = e.message;
-  }
+  const pk = await loadPickingRuns(15);
+  const pickingRuns = pk.runs.map((r) => ({ ...r, boxRun: getRunBySource(r.id) }));
+  const pickingError = pk.error;
   res.render(path.join(__dirname, 'views/admin'), {
     title: 'FBA箱詰め記録 管理',
     username: req.session.email,
@@ -475,8 +520,32 @@ router.get('/admin', requireSession, api(async (req, res) => {
   });
 }));
 
+/** PR2.5: picking 実行から納品回を作る (本社。Excel なし)。すぐ active */
+router.post('/admin/runs/from-picking', requireSession, checkOrigin, api(async (req, res) => {
+  const r = await createFromPicking(Number(req.body?.source_run_id), `session:${req.session.email}`);
+  res.status(r.status).json(r.body);
+}));
+
 /**
- * 納品回の開始: picking 実行を選び STA パックリストExcel をアップ → 解析 → 突合 → setup で作成。
+ * PR2.5: 納品回に STA パックリスト Excel を添付 (作業の前でも途中でも後でも)。
+ * 解析 → シート↔グループ対応 (FNSKU 重なり) → 行突合 → 差分は warnings で返す。
+ * 対応付けできない・記入済み・未知形式は 422 で添付しない (原本は消す)
+ */
+router.post('/admin/runs/:id(\\d+)/excel', requireSession, upload.single('excel'), checkOrigin, api(async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'no_file', message: 'パックリストExcel (.xlsx) を選んでください' });
+  const ing = await ingestPacklist(req.file.buffer, req.file.originalname);
+  if (!ing.ok) return res.status(422).json(ing);
+  const r = attachExcelToRun({ runId: Number(req.params.id), parsed: ing.parsed,
+    file: { originalName: req.file.originalname, storedPath: ing.storedPath, sha256: ing.sha256 }, actor: `session:${req.session.email}` });
+  if (!r.ok) {
+    try { fs.unlinkSync(ing.storedPath); } catch { /* noop */ }
+    return res.status({ not_found: 404, sta_uploaded: 409, bad_status: 409 }[r.error] || 422).json(r);
+  }
+  res.json(r);
+}));
+
+/**
+ * 納品回の開始 (旧: Excel 同時): picking 実行を選び STA パックリストExcel をアップ → 解析 → 突合 → setup で作成。
  * 突合の警告 (qty_mismatch / excel_only / picking_only) は返すが作成は通す (Excel が正本)。
  * ブロック (識別キー重複・未知形式・保護セル) は 422 で作らない
  */
@@ -489,8 +558,7 @@ router.post('/admin/runs', requireSession, upload.single('excel'), checkOrigin, 
 
   let pickingRun = null;
   try {
-    const fbaDb = await import('../fba-replenishment/db.js');
-    pickingRun = fbaDb.getPickingRun(sourceRunId);
+    pickingRun = (await pickingSource()).getPickingRun(sourceRunId);
   } catch (e) {
     return res.status(502).json({ ok: false, error: 'picking_db', message: `ピッキング実行を読めませんでした: ${e.message}` });
   }
@@ -567,19 +635,28 @@ router.post('/admin/runs/:id(\\d+)/exports', requireSession, checkOrigin, api(as
   const runId = Number(req.params.id);
   const payload = buildExportPayload(runId);
   if (!payload.ok) return res.status(payload.error === 'not_found' ? 404 : 409).json(payload);
-  const w = await writePacklist({ templatePath: payload.excelFile.stored_path, sheets: payload.sheets, fileTag: `run${runId}` });
-  if (!w.ok) {
-    safeLogEvent({ runId, action: 'excel_export', ok: false, error: `${w.error}: ${w.message}`, deviceLabel: `session:${req.session.email}` });
-    return res.status(422).json(w);
+  // 添付ファイルごとに 1 出力 (P1/P2 で Excel が別)。1 つでも失敗したら全体を失敗にする (半端な版を残さない)
+  const results = [];
+  for (const ex of payload.exports) {
+    const w = await writePacklist({ templatePath: ex.excelFile.stored_path, sheets: ex.sheets, fileTag: `run${runId}-f${ex.excelFile.id}` });
+    if (!w.ok) {
+      safeLogEvent({ runId, action: 'excel_export', ok: false, error: `${w.error}: ${w.message}`, deviceLabel: `session:${req.session.email}` });
+      return res.status(422).json({ ...w, fileName: ex.excelFile.original_name });
+    }
+    const rec = recordExport({
+      runId, excelFileId: ex.excelFile.id, dataVersion: ex.snapshot.dataVersion,
+      fileName: ex.excelFile.original_name || `packlist-run${runId}.xlsx`, storedPath: w.outputPath, sha256: w.sha256,
+      snapshot: ex.snapshot, verify: w.verify, createdBy: req.session.email,
+    });
+    if (!rec.ok) return res.status(409).json(rec);
+    results.push({ exportId: rec.exportId, stale: rec.stale, written: w.written, cleared: w.cleared, verify: w.verify,
+      fileName: ex.excelFile.original_name, downloadUrl: `${BASE}/admin/exports/${rec.exportId}/download` });
   }
-  const rec = recordExport({
-    runId, excelFileId: payload.excelFile.id, dataVersion: payload.snapshot.dataVersion,
-    fileName: payload.excelFile.original_name || `packlist-run${runId}.xlsx`, storedPath: w.outputPath, sha256: w.sha256,
-    snapshot: payload.snapshot, verify: w.verify, createdBy: req.session.email,
-  });
-  if (!rec.ok) return res.status(409).json(rec);
-  res.json({ ok: true, exportId: rec.exportId, stale: rec.stale, written: w.written, cleared: w.cleared, verify: w.verify,
-    downloadUrl: `${BASE}/admin/exports/${rec.exportId}/download`, warnings: payload.snapshot.warnings });
+  const first = results[0];
+  res.json({ ok: true, exports: results, stale: results.some((r) => r.stale),
+    // 後方互換 (1 ファイルのとき)
+    exportId: first.exportId, written: first.written, cleared: first.cleared, verify: first.verify, downloadUrl: first.downloadUrl,
+    warnings: payload.exports[0].snapshot.warnings });
 }));
 
 /** 出力ファイルのダウンロード (ファイル名は原本と同じ — STA はファイル名/タブ構造の変更不可) */

@@ -363,7 +363,13 @@ async function runProcess(){
       return;
     }
     renderResult(d);
-    document.getElementById('runMsg').textContent = '完了';
+    // 箱詰め記録 (iPad) の納品回は自動作成される。作れなかったときは iPad の「作業開始」から作れる
+    const br = d.boxRun;
+    document.getElementById('runMsg').textContent = (br && br.ok)
+      ? '完了 / 📦 箱詰め記録 (iPad) の納品回 #' + br.runId + (br.already ? ' は作成済み' : ' を作成') + ' — いろはの iPad にすぐ出ます'
+      : (br && br.attempted)
+        ? '完了 (⚠ 箱詰め記録の納品回は作れませんでした: ' + (br.message || br.error || '不明') + ' — iPad の「作業開始」から作れます)'
+        : '完了';
     loadRuns();
     // 共有ドライブへの fbanouhinbangoulist.csv (10列) 保存結果をメッセージ表示
     const ds = d.driveSave;

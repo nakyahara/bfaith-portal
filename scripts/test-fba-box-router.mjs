@@ -21,7 +21,7 @@ const db = await import('../apps/fba-box/db.js');
 const svc = await import('../apps/fba-box/service.js');
 const xl = await import('../apps/fba-box/excel.js');
 db._openForTest(path.join(tmp, 'router.db'));
-const { default: router } = await import('../apps/fba-box/router.js');
+const { default: router, _setPickingSource } = await import('../apps/fba-box/router.js');
 
 const app = express();
 app.set('view engine', 'ejs');
@@ -215,6 +215,45 @@ await t('管理画面 (admin.ejs) が描画できる', async () => {
   assert.equal(r.status, 200);
   const html = await r.text();
   assert.ok(html.includes('Excel出力') && html.includes('資材'));
+});
+
+console.log('■ PR2.5: picking 実行 → iPad から作業開始 → Excel 後付け (HTTP)');
+const pkRows = ing.parsed.sheets[0].skuRows.map((r, i) => ({ no: i + 1, sku: r.sku, fnsku: r.fnsku, productName: '商品' + i, qty: String(r.plannedQty) }));
+const pickingMem = [{ id: 501, delivery_date: '2026-09-25', run_at: '2026-09-03 10:00', plan_sheet_count: 1,
+  result: JSON.stringify({ planSheets: [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows: pkRows }] }) }];
+_setPickingSource(async () => ({ getPickingRuns: () => pickingMem, getPickingRun: (id) => pickingMem.find((r) => r.id === Number(id)) || null }));
+let pkRunId = null;
+await t('GET /api/runs に「まだ始めていない picking 実行」が出る', async () => {
+  const r = await call('GET', '/api/runs');
+  assert.equal(r.j.ok, true);
+  const p = r.j.pickingRuns.find((x) => x.id === 501);
+  assert.ok(p); assert.equal(p.boxRun, null); assert.equal(p.deliveryDate, '2026-09-25');
+});
+await t('端末から POST /api/runs/from-picking → active な納品回。二度目は already', async () => {
+  const r = await call('POST', '/api/runs/from-picking', { body: { source_run_id: 501 } });
+  assert.equal(r.j.ok, true, JSON.stringify(r.j)); assert.equal(r.j.created, true);
+  pkRunId = r.j.runId;
+  const again = await call('POST', '/api/runs/from-picking', { body: { source_run_id: 501 } });
+  assert.equal(again.j.already, true); assert.equal(again.j.runId, pkRunId);
+  assert.equal((await call('POST', '/api/runs/from-picking', { body: { source_run_id: 999 } })).status, 404);
+  const list = await call('GET', '/api/runs');
+  assert.equal(list.j.pickingRuns.find((x) => x.id === 501).boxRun.id, pkRunId);
+  const st = await call('GET', `/api/state?run=${pkRunId}`);
+  assert.equal(st.j.run.status, 'active'); assert.equal(st.j.groups[0].display_name, '通常'); assert.equal(st.j.rows.length, 2);
+});
+await t('本社: POST /admin/runs/:id/excel (multipart) で Excel を添付 → 突合結果、readiness の no_excel が消える', async () => {
+  const before = await call('GET', `/admin/runs/${pkRunId}/readiness`, { session: 'user', device: false });
+  assert.ok(before.j.readiness.blockers.some((b) => b.code === 'no_excel'));
+  const fd = new FormData();
+  fd.append('excel', new Blob([fs.readFileSync(fixture)]), 'packlist_attach.xlsx');
+  const r = await fetch(`${BASE}/admin/runs/${pkRunId}/excel`, { method: 'POST', body: fd, headers: { 'x-test-session': 'user', Origin: ORIGIN } });
+  const j = await r.json();
+  assert.equal(j.ok, true, JSON.stringify(j));
+  assert.equal(j.groups[0].matched, 2);
+  const after = await call('GET', `/admin/runs/${pkRunId}/readiness`, { session: 'user', device: false });
+  assert.ok(!after.j.readiness.blockers.some((b) => b.code === 'no_excel'));
+  assert.equal(after.j.readiness.groups[0].excelAttached, true);
+  assert.equal((await call('POST', `/admin/runs/${pkRunId}/excel`, { session: 'user', device: false })).status, 400);   // ファイルなし
 });
 
 server.close();

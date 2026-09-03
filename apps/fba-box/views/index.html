@@ -229,13 +229,29 @@
     if (!j.ok) { $('#runlist').textContent = '読み込めませんでした。しばらくして再読み込みしてください'; return; }
     runs = j.runs;
     const stJa = { active: '作業できます', setup: '準備中 (本社確認待ち)', done: '完了', cancelled: '取消' };
-    $('#runlist').innerHTML = runs.length === 0 ? '納品回がまだありません' : runs.map(r => `
+    // まだ納品回になっていない picking 実行 (本社の picking-prep 完了で普通は自動作成されるが、
+    // 失敗したとき・作り直したいときは現場が「作業開始」で作れる)
+    const pending = (j.pickingRuns || []).filter(p => !p.boxRun);
+    const html = runs.map(r => `
       <button class="runbtn" data-id="${r.id}" ${r.status === 'active' ? '' : 'disabled'}>
         <span>${esc(r.title)}<br><small style="color:#868E96">${r.row_count}商品 / ${r.group_count}グループ</small></span>
         <span class="st ${r.status}">${stJa[r.status] || r.status}</span>
+      </button>`).join('') + pending.map(p => `
+      <button class="runbtn" data-src="${p.id}" style="border-style:dashed">
+        <span>${esc(p.deliveryDate ? p.deliveryDate + ' 納品分' : '実行#' + p.id)}<br><small style="color:#868E96">${p.sheetCount ?? '?'}シート / まだ始めていません</small></span>
+        <span class="st setup">▶ 作業開始</span>
       </button>`).join('');
+    $('#runlist').innerHTML = html || '納品回がまだありません' + (j.pickingError ? `<br><small style="color:#C92A2A">ピッキング実行を読めません: ${esc(j.pickingError)}</small>` : '');
     $('#runlist').querySelectorAll('button[data-id]').forEach(b => {
       b.addEventListener('click', () => openRun(Number(b.dataset.id)));
+    });
+    $('#runlist').querySelectorAll('button[data-src]').forEach(b => {
+      b.addEventListener('click', async () => {
+        b.disabled = true;
+        const r = await apiPost('/api/runs/from-picking', { source_run_id: Number(b.dataset.src) });
+        if (!r.ok) { alert(r.message || '作れませんでした'); b.disabled = false; return; }
+        openRun(Number(r.runId));
+      });
     });
   }
 
