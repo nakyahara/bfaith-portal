@@ -2192,7 +2192,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   const listBody = html.slice(html.indexOf('function renderList()'), html.indexOf('function renderList()') + 900);
   ok(/if \(curView === 'list'\) \{[\s\S]{0,200}exitBulk\(\)/.test(listBody), 'まとめて選択の解除は「一覧を見ているとき」だけ (ボードの選択を消さない)');
   // 選択のチェックボックスに tabindex="-1" を付けない (見出しに付けるのは、読み上げの位置を移すためなので別)
-  ok(!/type="checkbox" class="cb"[^']*tabindex="-1"/.test(html), 'チェックボックスはキーボードでも操作できる');
+  ok(!/<input[^>]*class="cb"[^>]*tabindex="-1"/.test(html), 'チェックボックスはキーボードでも操作できる');
   // ダイアログ: 役割・見出しとの関連付け・背景固定・フォーカスの戻し (Codex R1)
   ok(/role="dialog" aria-modal="true" aria-labelledby="mvTitle"/.test(html), 'ダイアログとして扱われる (読み上げ)');
   ok(/body\.modal-open\{position:fixed/.test(html) && /document\.body\.classList\.add\('modal-open'\)/.test(html), '開いている間は背景を固定する');
@@ -2234,6 +2234,14 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/\.overlay\{[^}]*overflow-y:auto/.test(html), 'ダイアログが画面に収まらないときスクロールできる');
   ok(/\.opts\{display:grid[^}]*minmax\(104px/.test(html) && /aspect-ratio:1\/1/.test(html), '候補は正方形のタイル');
   ok(/<span class="thumb">' \+ \(img \?/.test(html), 'タイルに画像の枠がある (画像が無ければ絵文字)');
+  ok(/\.opts\.chips\{display:flex/.test(html) && /<div class="opts chips" id="lwLoc">/.test(html),
+    'ラベル待ちのロケーション (Z/Y/なし) はタイルにしない');
+  ok(/onerror="optImgFail\(this\)"/.test(html) && /function optImgFail\(el\)/.test(html),
+    '画像が読めなくてもタイルが空にならない');
+  ok(/const keepField = mvCtx\.field;/.test(html) && /values: cur2, field: keepField/.test(html),
+    '競合で読み直しても「開いた項目だけ送る」は変わらない');
+  ok(/if \(!ov\.contains\(document\.activeElement\)\) \{ e\.preventDefault\(\)/.test(html),
+    'フォーカスが背景に残っていても Tab はダイアログへ戻る');
   ok(/Zロケ在庫 \(一時保管\)/.test(html) && /Yロケ在庫 \(外に出している分\)/.test(html) && /時点/.test(html),
     '詳細に在庫と取得時刻を出す (拠点によって Z か Y)');
   // 中断の理由は「〜で中断」。ラベル待ちならそのまま記録をつける (中原さん 2026-09-03)

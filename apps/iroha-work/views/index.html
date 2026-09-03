@@ -243,6 +243,9 @@
   .opt.legacy small{font-weight:400;font-size:.7rem;display:block}
   .opt.add{color:var(--accent);border-color:var(--accent);border-style:dashed;background:var(--surface)}
   .opt.wide{grid-column:1/-1;aspect-ratio:auto;flex-direction:row;justify-content:center;min-height:46px}
+  /* ラベル待ちのロケーション (Z/Y/なし) は画像を持たない札。タイルにはしない */
+  .opts.chips{display:flex;flex-wrap:wrap}
+  .opts.chips .opt{aspect-ratio:auto;flex-direction:row;justify-content:center;min-height:46px;padding:8px 14px;font-size:.98rem}
   .optq{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;font-size:1rem;background:var(--surface);color:var(--ink);margin:2px 0 6px}
   .optnew{display:flex;gap:8px;width:100%;margin-top:4px;grid-column:1/-1}
   .opts .hint{grid-column:1/-1}
@@ -466,7 +469,7 @@
         <label>ロットNo・期限</label><input id="lwLot" maxlength="200" placeholder="例: L2401 (2027-03)">
         <label>数量</label><input id="lwQty" type="number" min="0" inputmode="numeric">
         <label>ロケーション</label>
-        <div class="opts" id="lwLoc"></div>
+        <div class="opts chips" id="lwLoc"></div>
         <input type="hidden" id="lwLocation">
         <label><input id="lwOrdered" type="checkbox" class="cb"> ラベルを発注した</label>
         <label><input id="lwReattach" type="checkbox" class="cb"> 貼り直しが必要</label>
@@ -1560,7 +1563,7 @@ function renderOpts(kind) {
   const tile = (cls, code, label, img, extra) =>
     '<button type="button" class="opt ' + cls + '" data-code="' + esc(code) + '" aria-pressed="' + (/\bon\b/.test(cls) ? 'true' : 'false') + '"' +
     ' onclick="pickOptEl(this,\'' + kind + '\')">' +
-    '<span class="thumb">' + (img ? '<img src="' + esc(img) + '" alt="" loading="lazy" onerror="this.remove()">' : '📦') + '</span>' +
+    '<span class="thumb">' + (img ? '<img src="' + esc(img) + '" alt="" loading="lazy" onerror="optImgFail(this)">' : '📦') + '</span>' +
     '<span class="nm">' + esc(label) + (extra || '') + '</span></button>';
   let h = '<button type="button" class="opt none wide' + (cur ? '' : ' on') + '" data-code="" aria-pressed="' + (cur ? 'false' : 'true') + '"' +
     ' onclick="pickOptEl(this,\'' + kind + '\')">なし</button>';
@@ -1581,6 +1584,8 @@ function renderOpts(kind) {
   }
   document.getElementById(OPT_BOX[kind]).innerHTML = h;
 }
+// 画像が読めなかったときは枠を消さず絵文字に戻す (消すとタイルが真っ白になる)
+function optImgFail(el) { if (el.parentNode) el.parentNode.textContent = '📦'; }
 function pickOptEl(el, kind) {
   document.getElementById(OPT_FIELD[kind]).value = el.dataset.code || '';
   optNewKind = null;
@@ -1642,6 +1647,12 @@ function openOverlay(sel) {
   document.body.classList.add('modal-open');
   ov.classList.add('on');
   ov.scrollTop = 0;
+  // フォーカスがダイアログの外に残っていると最初の Tab で背景へ抜ける。中へ移しておく
+  // (呼び出し側が改めて入力欄へ当て直しても良い)
+  if (!ov.contains(document.activeElement)) {
+    const h = ov.querySelector('h3');
+    if (h) { h.setAttribute('tabindex', '-1'); h.focus(); }
+  }
 }
 function closeOverlay(sel) {
   $(sel).classList.remove('on');
@@ -1662,6 +1673,8 @@ document.addEventListener('keydown', (e) => {
   if (items.length === 0) return;
   const first = items[0];
   const last = items[items.length - 1];
+  // 先頭/末尾の一致だけでは塞げない: 背景にフォーカスが残っている場合も中へ引き戻す
+  if (!ov.contains(document.activeElement)) { e.preventDefault(); (e.shiftKey ? last : first).focus(); return; }
   if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
   else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 });
@@ -1752,11 +1765,12 @@ async function saveMaster() {
   if (j.error === 'conflict' || j.error === 'version_required') {
     // 最新を読み込み、フォームも最新値で組み直す (古い入力のままの再保存で上書きさせない — Codex PR4 #4)
     $('#mvMsg').textContent = '⏳ ' + (j.message || '他の人が先に更新しました') + ' — 最新を読み込んでいます…';
+    const keepField = mvCtx.field;   // 開いていた項目を引き継ぐ (落とすと隠れている項目まで送ってしまう)
     await loadState();
     const c2 = state.cards.find(x => x.id === mvCtx.cardId);
     if (c2) {
       const cur2 = mvValues(c2.master);
-      mvCtx = { cardId: c2.id, code: c2.product_code, version: c2.master.version, values: cur2 };
+      mvCtx = { cardId: c2.id, code: c2.product_code, version: c2.master.version, values: cur2, field: keepField };
       for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur2[f];
       optNewKind = null; renderOpts('material'); renderOpts('container');
     }
