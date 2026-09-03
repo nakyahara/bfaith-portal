@@ -225,16 +225,24 @@
   .reg{border:1px solid var(--amber);background:var(--surface);color:var(--amber);
     border-radius:var(--r-sm);padding:5px 10px;font-weight:700;font-size:.82rem;cursor:pointer;font-family:var(--font)}
   /* ── 選択肢 (資材・保管箱): Excel 由来の候補からタップで選ぶ ── */
-  .opts{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 4px}
-  .opt{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);padding:8px 14px;
-    font-size:.98rem;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:8px;min-height:46px;font-family:var(--font)}
-  .opt img{width:32px;height:32px;object-fit:cover;border-radius:4px}
+  /* 候補は正方形のタイル。上が画像 (あとから登録できる)、下が名前 — 中原さん 2026-09-03 */
+  .opts{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px;margin:2px 0 4px}
+  .opt{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);padding:6px;
+    font-size:.88rem;font-weight:700;cursor:pointer;font-family:var(--font);
+    display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:6px;aspect-ratio:1/1;overflow:hidden}
+  .opt .thumb{width:100%;flex:1;min-height:0;border-radius:4px;background:var(--well);display:grid;place-items:center;
+    color:var(--faint);font-size:1.5rem;overflow:hidden}
+  .opt .thumb img{width:100%;height:100%;object-fit:contain;background:#fff}
+  .opt .nm{width:100%;text-align:center;line-height:1.25;word-break:break-all;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .opt.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  .opt.on .thumb{background:rgba(255,255,255,.25)}
   .opt.none{color:var(--faint);border-style:dashed}
   .opt.none.on{color:var(--accent-ink)}
   .opt.legacy{border-style:dashed;border-color:var(--amber);background:var(--amber-soft);color:var(--amber)}
-  .opt.legacy small{font-weight:400;font-size:.72rem}
+  .opt.legacy small{font-weight:400;font-size:.7rem;display:block}
   .opt.add{color:var(--accent);border-color:var(--accent);border-style:dashed;background:var(--surface)}
+  .opt.wide{grid-column:1/-1;aspect-ratio:auto;flex-direction:row;justify-content:center;min-height:46px}
   .optq{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;font-size:1rem;background:var(--surface);color:var(--ink);margin:2px 0 6px}
   .optnew{display:flex;gap:8px;width:100%;margin-top:4px}
   .optnew input{flex:1;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 10px;font-size:1rem;background:var(--surface);color:var(--ink);min-height:46px}
@@ -248,10 +256,15 @@
     letter-spacing:.3em;background:var(--surface);color:var(--ink);font-family:var(--num)}
 
   /* ── ダイアログ ── */
-  .overlay{position:fixed;inset:0;background:rgba(15,23,40,.5);display:none;place-items:center;padding:16px;z-index:20}
+  /* 画面に収まらない中身はスクロールできるように (iPad で下が切れて押せなかった — 中原さん 2026-09-03)。
+     overlay 自体をスクロール領域にし、モーダルは上下に余白をとって縦に伸ばす */
+  .overlay{position:fixed;inset:0;background:rgba(15,23,40,.5);display:none;place-items:start center;padding:16px;z-index:20;
+    overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
   .overlay.on{display:grid}
   .modal{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);
-    padding:20px;width:min(480px,100%)}
+    padding:20px;width:min(520px,100%);margin:auto 0;max-height:none}
+  /* 候補が多いときは、その枠だけスクロールする (ボタンが下に押し出されない) */
+  .opts{max-height:min(46vh,360px);overflow-y:auto;-webkit-overflow-scrolling:touch}
   .modal h3{margin:0 0 4px;font-size:1.1rem}
   .modal .mname{font-size:.88rem;color:var(--sub);margin-bottom:14px}
   .modal label{font-size:.8rem;color:var(--sub);font-weight:700}
@@ -399,21 +412,31 @@
   <!-- ══ 作業のやり方 登録・修正ダイアログ ══ -->
   <div class="overlay" id="mvOv">
     <div class="modal">
-      <h3>✎ 作業のやり方を登録・修正</h3>
+      <h3 id="mvTitle">✎ 作業のやり方を登録・修正</h3>
       <div class="mname" id="mvName">—</div>
       <div class="msaving" id="mvMsg"></div>
       <div class="mfields">
-        <label>資材 (タップして選ぶ)</label>
-        <input class="optq" id="optqMaterial" placeholder="候補をしぼる (例: D-8)" hidden oninput="filterOpts('material', this.value)">
-        <div class="opts" id="optMaterial"></div>
-        <input type="hidden" id="mvMaterial">
-        <label>保管箱 (タップして選ぶ)</label>
-        <input class="optq" id="optqContainer" placeholder="候補をしぼる (例: 20L)" hidden oninput="filterOpts('container', this.value)">
-        <div class="opts" id="optContainer"></div>
-        <input type="hidden" id="mvContainer">
-        <label>入数 (保管箱1つに入れる数)</label><input id="mvUnits" type="number" min="0" inputmode="numeric">
-        <label>工程数</label><input id="mvProcess" type="number" min="0" inputmode="numeric">
-        <label>気をつけること (備考)</label><input id="mvNote" maxlength="300">
+        <div class="mvf" data-f="material_code">
+          <label>資材 (タップして選ぶ)</label>
+          <input class="optq" id="optqMaterial" placeholder="候補をしぼる (例: D-8)" hidden oninput="filterOpts('material', this.value)">
+          <div class="opts" id="optMaterial"></div>
+          <input type="hidden" id="mvMaterial">
+        </div>
+        <div class="mvf" data-f="storage_container">
+          <label>保管箱 (タップして選ぶ)</label>
+          <input class="optq" id="optqContainer" placeholder="候補をしぼる (例: 20L)" hidden oninput="filterOpts('container', this.value)">
+          <div class="opts" id="optContainer"></div>
+          <input type="hidden" id="mvContainer">
+        </div>
+        <div class="mvf" data-f="units_per_container">
+          <label>入数 (保管箱1つに入れる数)</label><input id="mvUnits" type="number" min="0" inputmode="numeric">
+        </div>
+        <div class="mvf" data-f="process_count">
+          <label>工程数</label><input id="mvProcess" type="number" min="0" inputmode="numeric">
+        </div>
+        <div class="mvf" data-f="note">
+          <label>気をつけること (備考)</label><input id="mvNote" maxlength="300">
+        </div>
       </div>
       <div id="mvPinRow" style="display:none;margin-top:12px">
         <label>職員PIN (入っている値の変更に必要です)</label>
@@ -1530,19 +1553,22 @@ function renderOpts(kind) {
   if (qEl) qEl.hidden = all.length <= OPT_SEARCH_FROM;
   const q = optKey(optFilter[kind] || '');
   const list = q ? all.filter(o => optKey(o.code).includes(q)) : all;
-  let h = '<button type="button" class="opt none' + (cur ? '' : ' on') + '" data-code="" onclick="pickOptEl(this,\'' + kind + '\')">なし</button>';
+  const tile = (cls, code, label, img, extra) =>
+    '<button type="button" class="opt ' + cls + '" data-code="' + esc(code) + '" onclick="pickOptEl(this,\'' + kind + '\')">' +
+    '<span class="thumb">' + (img ? '<img src="' + esc(img) + '" alt="" loading="lazy" onerror="this.remove()">' : '📦') + '</span>' +
+    '<span class="nm">' + esc(label) + (extra || '') + '</span></button>';
+  let h = '<button type="button" class="opt none wide' + (cur ? '' : ' on') + '" data-code="" onclick="pickOptEl(this,\'' + kind + '\')">なし</button>';
   // 今の値が候補に無い (管理者が外した・古いマスタ値) ときは「候補外」と分かる形で選択中に見せる (Codex R1 #7)。
   // 比較はサーバーと同じ正規化 (全角/大小文字の違いを候補外にしない — Codex R2 #3)
   if (cur && !all.some(o => optKey(o.code) === curKey)) {
-    h += '<button type="button" class="opt on legacy" data-code="' + esc(cur) + '" onclick="pickOptEl(this,\'' + kind + '\')">' + esc(cur) + ' <small>(候補外)</small></button>';
+    h += tile('on legacy', cur, cur, null, '<small>(候補外)</small>');
   }
   for (const o of list) {
     // 値は data-code に持たせ onclick には埋めない (人が入れた文字列を JS 文字列にしない)
-    h += '<button type="button" class="opt' + (optKey(o.code) === curKey ? ' on' : '') + '" data-code="' + esc(o.code) + '" onclick="pickOptEl(this,\'' + kind + '\')">' +
-      (o.image_url ? '<img src="' + esc(o.image_url) + '" alt="' + esc(o.code) + '" loading="lazy" onerror="this.remove()">' : '') + esc(o.code) + '</button>';
+    h += tile(optKey(o.code) === curKey ? 'on' : '', o.code, o.code, o.image_url || null, '');
   }
   if (q && list.length === 0) h += '<span class="hint" style="align-self:center">「' + esc(q) + '」に合う候補はありません</span>';
-  h += '<button type="button" class="opt add" onclick="openOptNew(\'' + kind + '\')">＋ 新しく登録</button>';
+  h += '<button type="button" class="opt add wide" onclick="openOptNew(\'' + kind + '\')">＋ 新しく登録</button>';
   if (optNewKind === kind) {
     h += '<div class="optnew"><input id="optNewIn" maxlength="100" placeholder="新しい' + OPT_LABEL[kind] + ' (例: ' + OPT_EXAMPLE[kind] + ')">' +
       '<button type="button" class="reg" onclick="saveOptNew(\'' + kind + '\')">登録</button></div>';
@@ -1608,21 +1634,35 @@ function mvValues(m) {
   };
 }
 
-function openMaster(focus) {
+const MV_TITLE = { material_code: '資材', storage_container: '保管箱', units_per_container: '入数',
+  process_count: '工程数', note: '気をつけること' };
+/**
+ * 作業のやり方の登録・変更。**タップした項目だけ**を出す (中原さん 2026-09-03:
+ * 保管箱をタップしたら保管箱だけ)。field を指定しなければ全部出す
+ */
+function openMaster(field) {
   if (!worker) { openGate(); return; }
   const c = findCard(curDetail);
   if (!c) return;
   if (!c.product_code) { showErr('商品コードのないカードは登録できません (職員の方に確認してください)'); return; }
   const cur = mvValues(c.master);
-  mvCtx = { cardId: c.id, code: c.product_code, version: c.master.version, values: cur };
+  mvCtx = { cardId: c.id, code: c.product_code, version: c.master.version, values: cur, field: MV_MAP[field] ? field : null };
   for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur[f];
   optNewKind = null; renderOpts('material'); renderOpts('container');
+  // 出す項目を絞る (他は隠すだけ。保存は「開いた時点との差分」なので触っていない項目は送られない)
+  for (const el of document.querySelectorAll('#mvOv .mvf')) {
+    el.hidden = !!mvCtx.field && el.dataset.f !== mvCtx.field;
+  }
+  $('#mvTitle').textContent = mvCtx.field ? '✎ ' + MV_TITLE[mvCtx.field] + ' を登録・変更' : '✎ 作業のやり方を登録・修正';
   $('#mvName').textContent = c.title + ' (' + c.product_code + ')';
   $('#mvMsg').textContent = '';
   $('#mvPinRow').style.display = 'none';
   $('#mvPin').value = '';
   $('#mvOv').classList.add('on');
-  if (focus && MV_MAP[focus]) document.getElementById(MV_MAP[focus]).focus();
+  $('#mvOv').scrollTop = 0;
+  // 数字・文字の項目はすぐ打てるように。選ぶだけの項目 (資材・保管箱) はカーソルを出さない
+  const focusable = ['units_per_container', 'process_count', 'note'];
+  if (mvCtx.field && focusable.includes(mvCtx.field)) document.getElementById(MV_MAP[mvCtx.field]).focus();
 }
 function closeMaster() { if (mvSaving) return; $('#mvOv').classList.remove('on'); }
 $('#mvOv').addEventListener('click', e => { if (e.target === $('#mvOv')) closeMaster(); });

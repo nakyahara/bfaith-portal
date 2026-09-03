@@ -2216,6 +2216,14 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const hours = mine\.reduce/.test(html), 'ボードの列に想定作業時間の合計を出す');
   ok(/kv\('必要保管箱', c\.boxes\)/.test(html) && /kv\('想定作業時間'/.test(html), '詳細に必要保管箱と想定作業時間を出す');
   ok(/reg: 'units_per_container'/.test(html) && /reg: 'storage_container'/.test(html), '保管箱と入数は別々にタップできる');
+  // タップした項目だけ出す・ダイアログはスクロールできる・候補は正方形のタイル (中原さん 2026-09-03)
+  ok(/class="mvf" data-f="material_code"/.test(html) && /class="mvf" data-f="storage_container"/.test(html)
+    && /class="mvf" data-f="units_per_container"/.test(html) && /class="mvf" data-f="note"/.test(html), '登録・変更の項目はひとつずつ枠に入っている');
+  ok(/el\.hidden = !!mvCtx\.field && el\.dataset\.f !== mvCtx\.field/.test(html), 'タップした項目だけ出す (他は隠す)');
+  ok(/\$\('#mvTitle'\)\.textContent = mvCtx\.field/.test(html), '見出しにその項目の名前を出す');
+  ok(/\.overlay\{[^}]*overflow-y:auto/.test(html), 'ダイアログが画面に収まらないときスクロールできる');
+  ok(/\.opts\{display:grid[^}]*minmax\(104px/.test(html) && /aspect-ratio:1\/1/.test(html), '候補は正方形のタイル');
+  ok(/<span class="thumb">' \+ \(img \?/.test(html), 'タイルに画像の枠がある (画像が無ければ絵文字)');
   ok(/Zロケ在庫 \(一時保管\)/.test(html) && /Yロケ在庫 \(外に出している分\)/.test(html) && /時点/.test(html),
     '詳細に在庫と取得時刻を出す (拠点によって Z か Y)');
   // 中断の理由は「〜で中断」。ラベル待ちならそのまま記録をつける (中原さん 2026-09-03)
