@@ -196,12 +196,14 @@ export function applyImport(rows, { batchId = null, actor = null } = {}) {
   })();
   try {
     fs.mkdirSync(MIG_DIR, { recursive: true });
+    out.journal = 'saved';   // 証跡ファイル自身にも saved と残す (応答と食い違わない — Codex A1 R2 #3)
     fs.writeFileSync(path.join(MIG_DIR, `apply-${id}.json`),
       JSON.stringify({ ...out, rows: rows.map((r) => ({ page: r.notion_page_id, status: r.mapped_status, will: r.will_import, warnings: r.warnings })) }, null, 1));
-    out.journal = 'saved';
   } catch (e) {
-    out.journal = `failed: ${e.message}`;
-    console.error('[iroha-work migration] 取込は完了したが証跡ファイルを書けませんでした', e);
+    // パスや OS エラーの文言は画面に出さない (ログに詳細・応答は参照番号 — Codex A1 R2 #2)
+    const ref = Date.now().toString(36);
+    out.journal = `failed (参照 ${ref})`;
+    console.error(`[iroha-work migration ${ref}] 取込は完了したが証跡ファイルを書けませんでした`, e);
   }
   return out;
 }

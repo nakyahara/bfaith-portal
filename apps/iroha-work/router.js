@@ -741,7 +741,11 @@ function migrationStatus() {
   try {
     return { counts: countTasksByStatus(), review: listTasksNeedingReview().length, orphans: listOrphans(20), files: listMigrationFiles(),
       lastPlanAt: lastPlan ? lastPlan.at : null, lastPlanBy: lastPlan ? lastPlan.by : null, lastPlanSummary: lastPlan ? lastPlan.summary : null };
-  } catch (e) { return { error: e.message }; }
+  } catch (e) {
+    const ref = Date.now().toString(36);
+    console.error(`[iroha-work migration ${ref}] 状態の取得に失敗`, e);
+    return { error: `状態を取得できませんでした (参照 ${ref}。サーバーログを確認してください)` };
+  }
 }
 const issueCounts = (issues) => Object.fromEntries(Object.entries(issues).map(([k, v]) => [k, v.length]));
 // 内部例外の文言を画面に出さない (SQL・パス・Notion の詳細はログへ。画面には参照番号 — Codex A1 R1 #16)

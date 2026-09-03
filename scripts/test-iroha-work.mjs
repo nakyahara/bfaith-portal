@@ -40,6 +40,7 @@ const mock = {
   patched: [],          // PATCH /pages/:id の記録
   patchStatusOverride: null,   // PATCH 応答のステータスを差し替え (verify_failed 再現)
   dbPatches: 0,         // PATCH /databases/:id の回数 (移行の調査が Notion を書き換えないことの検証)
+  lastSorts: null,      // query の sorts (移行の取得順の検証)
   missingPages: new Set(),
   failQuery: null,      // { status } query を失敗させる
   // 実DB「ステータス」の選択肢 (2026-09-03 実機の Available options)。「取消」も「中断」も無い。
@@ -103,6 +104,7 @@ global.fetch = async (url, opts = {}) => {
   if (u.endsWith('/databases/testdb/query') && method === 'POST') {
     mock.queryCalls++;
     mock.lastFilters.push(body?.filter || null);
+    mock.lastSorts = body?.sorts || null;
     if (mock.failQuery) return respond(mock.failQuery.status, { object: 'error', message: 'query failed' });
     // レース再現: 応答内容を先にスナップショットしてからフックを走らせる
     // (「取得はもう始まっていたのに、その間にアプリでステータスが変わった」を作る)
@@ -123,7 +125,11 @@ global.fetch = async (url, opts = {}) => {
     for (const c of conds) {
       if (c.property === 'ステータス' && c.select?.does_not_equal) hits = hits.filter(p => stOfSnap(p) !== c.select.does_not_equal);
       if (c.property === 'ステータス' && c.select?.equals) hits = hits.filter(p => stOfSnap(p) === c.select.equals);
-      // timestamp フィルタはモックでは素通し (期間の値は lastFilters で検証する)
+      // last_edited_time の窓 (移行の差分取込): 実 Notion と同じく境界を含む
+      if (c.timestamp === 'last_edited_time' && c.last_edited_time) {
+        const le = c.last_edited_time;
+        hits = hits.filter(p => (!le.on_or_after || p.last_edited_time >= le.on_or_after) && (!le.on_or_before || p.last_edited_time <= le.on_or_before));
+      }
     }
     const start = Number(body.start_cursor || 0);
     const items = hits.slice(start, start + mock.pageSize);
@@ -955,6 +961,18 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   ok(mock.dbPatches === patchesBefore && Array.isArray(survey.pages) && survey.cutoff, '調査は Notion の DB を書き換えない (スキーマは検証だけ) + 窓の上限 cutoff を返す');
   ok(mock.lastFilters[mock.lastFilters.length - 1] === null, '全件調査はフィルタなし');
   ok(survey.orphans.unlinked && survey.orphans.missingInNotion, '全件調査は「未紐づけ」と「Notion にも無い」の両方を出す');
+  ok(Array.isArray(mock.lastSorts) && mock.lastSorts[0]?.timestamp === 'last_edited_time' && mock.lastSorts[0]?.direction === 'ascending', '取得は last_edited_time 昇順で固定');
+  {
+    const saved = await M.surveyNotion({ save: true });
+    ok(saved.rawFile && fs.existsSync(saved.rawFile) && saved.file && fs.existsSync(saved.file), '調査は生レスポンスと集計を別ファイルに保存する');
+    const raw = JSON.parse(fs.readFileSync(saved.rawFile, 'utf8'));
+    ok(Array.isArray(raw.pages) && raw.pages.length === saved.count && raw.pages[0].properties && raw.pages[0].properties['ステータス']?.type === 'select', '生ファイルには Notion のプロパティ構造がそのまま残る (再解析できる)');
+    const maxEdited = mock.pages.map(p => p.last_edited_time).sort().pop();   // PATCH で進んだページがあるので最大値から
+    const win = await M.surveyNotion({ save: false, since: new Date(Date.parse(maxEdited) + 1000).toISOString() });
+    ok(win.count === 0, `差分の窓 (since が全ページの更新時刻より後) なら 0 枚 (実際 ${win.count})`);
+    const win2 = await M.surveyNotion({ save: false, since: maxEdited });
+    ok(win2.count >= 1 && win2.count <= survey.count && win2.pages.every(p => p.lastEditedTime >= maxEdited), '境界 (since = 更新時刻) は含む');
+  }
   ok(survey.byStatus['羅針盤'] === 1 && survey.issues.unknownStatus.some(i => i.pageId === pM5.id) && survey.issues.dupDestination.some(i => i.destinationId === 9001), '調査: ステータス別件数・未知値・destination 重複を検出');
   ok(getDB().prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === before, '調査は DB を変えない (dry-run)');
   const plan = M.planImport(survey.pages);
@@ -1078,6 +1096,55 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   ok(TD.upsertLabelWait({ id: lw.row.id, taskId: tB.id, fields: { note: 'x' }, expectVersion: 1 }).error === 'conflict', '古い version では更新できない');
   ok(TD.listLabelWaits({ taskId: tB.id, openOnly: true }).length === 0 && TD.listLabelWaits({ taskId: tB.id, openOnly: false }).length === 1, '完了したものは未完了一覧から消える');
   ok(TD.upsertLabelWait({ taskId: 999999, fields: {} }).error === 'not_found', '無い task には登録できない');
+
+  // 証跡ファイルが書けなくても取込は成功 (DB は commit 済み)・応答にパスやOSエラーを出さない (Codex A1 R2 #2 #3)
+  {
+    const migDir = path.join(process.env.DATA_DIR, 'iroha-migration');
+    const applied = JSON.parse(fs.readFileSync(path.join(migDir, `apply-${apply1.batchId}.json`), 'utf8'));
+    ok(applied.journal === 'saved', '証跡ファイル自身にも journal=saved が残る');
+    fs.rmSync(migDir, { recursive: true, force: true });
+    fs.writeFileSync(migDir, 'not a dir');   // 書けない状態を作る
+    const pJ = mkPage({ status: '未着手', title: '証跡失敗', code: 'MIG-J', qty: 1, props: { destination_id: num(9800) } });
+    const planJ = M.planImport(M.planImport ? [{ ...(await M.surveyNotion({ save: false })).pages.find(p => p.pageId === pJ.id) }] : []);
+    const outJ = M.applyImport(planJ.rows, { batchId: 'test-batch-journal' });
+    ok(outJ.inserted === 1 && TD.getTaskByPageId(pJ.id) && /^failed \(参照 [a-z0-9]+\)$/.test(outJ.journal), '取込は成功し、journal は参照番号つきの固定文言 (パス・OSエラーを出さない)');
+    fs.rmSync(migDir, { force: true });
+  }
+
+  // 古い版 (CHECK・FK 無し) のタスク表が残っていても、起動時に行を移して作り直す (Codex A1 R2 #1)
+  {
+    const db = getDB();
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    const nTasks = db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c;
+    const nLabel = db.prepare('SELECT COUNT(*) c FROM f_iroha_label_waits').get().c;
+    const cols = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map(c => c.name);
+    db.pragma('foreign_keys = OFF');
+    db.exec(`CREATE TABLE f_iroha_tasks__old AS SELECT * FROM f_iroha_tasks;
+      CREATE TABLE f_iroha_label_waits__old AS SELECT * FROM f_iroha_label_waits;
+      DROP TABLE f_iroha_label_waits; DROP TABLE f_iroha_tasks;`);
+    // R1 版相当: 同じ列で CHECK (不変条件) と FK が無い
+    db.exec(`CREATE TABLE f_iroha_tasks (${cols.map(c => c === 'id' ? 'id INTEGER PRIMARY KEY AUTOINCREMENT' : c === 'status' ? 'status TEXT NOT NULL' : c === 'facility_code' ? "facility_code TEXT NOT NULL DEFAULT 'iroha'" : ['migration_review', 'version'].includes(c) ? `${c} INTEGER NOT NULL DEFAULT ${c === 'version' ? 1 : 0}` : ['created_at', 'updated_at'].includes(c) ? `${c} TEXT NOT NULL` : `${c} TEXT`).join(', ')});
+      INSERT INTO f_iroha_tasks SELECT * FROM f_iroha_tasks__old;
+      CREATE TABLE f_iroha_label_waits (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL, occurred_on TEXT, recorded_by_worker_id INTEGER, recorded_by_name TEXT,
+        label_ordered INTEGER NOT NULL DEFAULT 0, lot_expiry TEXT, qty INTEGER, location TEXT, reattach INTEGER NOT NULL DEFAULT 0, line_notified_on TEXT, re_notified_on TEXT,
+        restocked_on TEXT, done INTEGER NOT NULL DEFAULT 0, note TEXT, version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      INSERT INTO f_iroha_label_waits SELECT * FROM f_iroha_label_waits__old;
+      DROP TABLE f_iroha_tasks__old; DROP TABLE f_iroha_label_waits__old;`);
+    db.pragma('foreign_keys = ON');
+    const oldSql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql;
+    ok(!/CHECK \(\(status/.test(oldSql), '前提: 古い版には不変条件の CHECK が無い');
+    createTables(db);
+    const newSql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql;
+    const newLabelSql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_label_waits'").get().sql;
+    ok(/\(status = 'closed'\) = \(close_reason IS NOT NULL\)/.test(newSql) && /REFERENCES f_iroha_facilities/.test(newSql) && /REFERENCES f_iroha_tasks/.test(newLabelSql), '起動時に CHECK・FK 付きへ作り直される');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === nTasks && db.prepare('SELECT COUNT(*) c FROM f_iroha_label_waits').get().c === nLabel, '行はそのまま移る');
+    ok(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_iroha_tasks_destination'").get(), '索引も作り直される');
+    let chk2 = null; try { db.prepare("UPDATE f_iroha_tasks SET status = 'closed', close_reason = NULL WHERE id = ?").run(tB.id); } catch (e) { chk2 = e; }
+    ok(chk2 && /CHECK/.test(chk2.message), '作り直し後は CHECK が効く');
+    ok(db.pragma('foreign_keys', { simple: true }) === 1 && db.pragma('foreign_key_check').length === 0, 'foreign_keys は ON に戻り、FK 違反は無い');
+    createTables(db);
+    ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_tasks%'").get().c === 1, '2 回目は何もしない (冪等)');
+  }
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
