@@ -28,7 +28,7 @@ import {
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
   getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
-  getMeta, setMetaValue,
+  getMeta, setMetaValue, sourceOfTruth,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
@@ -211,7 +211,7 @@ router.get('/', (req, res) => {
  * 正本 (要件定義 v1.1 §F の切替)。'notion' = 従来どおり Notion のカードを読み書きする /
  * 'app' = f_iroha_tasks が正本 (Notion は見ない)。管理画面のスイッチで切り替える
  */
-export function sourceOfTruth() { return getMeta('source_of_truth') === 'app' ? 'app' : 'notion'; }
+// sourceOfTruth は db.js (入荷受付の Notion 送信も同じ値を見る)
 const isAppMode = () => sourceOfTruth() === 'app';
 
 /**

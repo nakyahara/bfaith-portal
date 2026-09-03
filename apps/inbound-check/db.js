@@ -16,6 +16,10 @@ import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
 import { listTapCandidates, getStaffByNo, tapName } from '../staff/db.js';
 import { parseInboundCsv } from './csv.js';
+// いろは在庫化アプリのタスク (PR-B): 「いろはで在庫化」の確定と同じトランザクションで f_iroha_tasks に 1 枚作る。
+// 取消 (やり直し・再取込) も同じ tx でタスク側へ伝える。同じ warehouse-mirror.db の同じ接続
+import { createTaskForDestination } from '../iroha-work/task-intake.js';
+import { requestCancellation } from '../iroha-work/tasks-db.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -700,6 +704,7 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       // 確認を引き継げない行の行き先実績は取り消す (いろはへ送る数が二重計上されないように)
       if (p && p.status === 'checked' && p.destination_id && !keepChecked) {
         cancelDest.run(now, sameProduct ? 'planned_changed' : 'product_changed', p.destination_id);
+        requestCancellation({ destinationId: p.destination_id, source: 'inbound_import', actor: 'import' });
       }
       insState.run(batchId, r.line_key, keepChecked ? 'checked' : 'unchecked',
         keepChecked ? p.checked_by : null, keepChecked ? p.checked_device : null, keepChecked ? p.checked_at : null,
@@ -1338,6 +1343,11 @@ export function finalizeLine({ batchId, lineKey, expectVersion, expectQuantityVe
       destinationId = Number(di.lastInsertRowid);
       db.prepare('UPDATE f_inbound_check_line_state SET destination_id = ? WHERE batch_id = ? AND line_key = ?')
         .run(destinationId, active.id, line.line_key);
+      // ⭐いろは行きは、その場で在庫化アプリのタスクになる (17:30 を待たない)。失敗すれば確定ごと巻き戻る
+      if (decided.destination === 'iroha') {
+        const dest = db.prepare('SELECT * FROM f_inbound_check_destinations WHERE id = ?').get(destinationId);
+        createTaskForDestination(dest, { actor: w, barcode: line.barcode || null });
+      }
     }
     db.prepare(`INSERT INTO f_inbound_check_events
       (batch_id, line_key, ar_no, action, worker, staff_id, device_id, device_label, created_at,
@@ -1402,6 +1412,8 @@ export function reopenLine({ batchId, lineKey, expectVersion, expectQuantityVers
     if (state.destination_id) {
       db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = ?, cancelled_by = ?, cancel_reason = 'reopen' WHERE id = ? AND cancelled_at IS NULL")
         .run(now, w, state.destination_id);
+      // 在庫化アプリのタスクにも伝える (未着手・実績なしは自動で取消、着手後は職員の要確認に倒す)
+      requestCancellation({ destinationId: state.destination_id, source: 'inbound_reversal', actor: w });
     }
     const last = db.prepare("SELECT id FROM f_inbound_check_events WHERE batch_id = ? AND line_key = ? AND action = 'check' ORDER BY id DESC LIMIT 1")
       .get(active.id, line.line_key);

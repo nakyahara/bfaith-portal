@@ -36,6 +36,8 @@ import {
 } from './notion.js';
 import { recordPing } from '../jobs-monitor/store.js';
 import { normSupplierCode } from '../purchase-orders/db.js';
+import { sourceOfTruth } from '../iroha-work/db.js';
+import { linkTaskToNotionPage } from '../iroha-work/task-intake.js';
 
 export const JOB_ID = 'inbound-check-notion-cards';
 const CANCELLED_STATUS = '取消';
@@ -370,6 +372,13 @@ async function convergeCancelledCard(db, rowId, pageId) {
  *                             'retry' = 取消反映・失敗行の再試行だけ (30分巡回。新規は送らない)
  */
 export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
+  if (sourceOfTruth() === 'app') {
+    // 正本がアプリ (在庫化アプリ /admin/source): 作業指示は確定時に f_iroha_tasks へ入っていて iPad はそれを見ている。
+    // Notion カードはもう作らない・取消も反映しない (Notion は「旧・更新禁止」)。
+    // 17:30 の dead-man には「役目を終えた」として ok を残す — 切替後は台帳 (inbound-check-notion-cards) を retired にする
+    if (mode === 'full') ping('ok', 'アプリ正本 — Notion カードは作らない (台帳を retired に)');
+    return { ok: true, skipped: 'app_mode', message: '正本がアプリのため Notion へは送りません (タスクは確定時に作成済み)' };
+  }
   if (!isNotionConfigured()) {
     // cron から呼ばれたのに未設定 = 「動いているべきものが動いていない」なので fail を残す。
     // 30分巡回 (retry) では静かに帰る (毎回鳴らすと通知疲れになる)
@@ -496,6 +505,7 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
         const ch = markSent(db, row.id, pageId, payload);
         if (ch === 1) {
           if (wasRecovered) summary.recovered++; else summary.sent++;
+          linkTaskToNotionPage(row.id, pageId);   // 確定時に作ったタスクへ (差分取込が同じカードを衝突扱いしない)
         } else {
           // 記録できなかった = 待っている間に状態が変わった (Codex R1 #3 #4)。取り漏らさず収束させる
           const cur = db.prepare('SELECT cancelled_at, notion_page_id FROM f_inbound_check_destinations WHERE id = ?').get(row.id);
@@ -503,6 +513,7 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
             if (wasRecovered) summary.recovered++; else summary.sent++;   // 別実行が同じカードを記録済み
           } else if (cur && !cur.notion_page_id) {
             attachPage(db, row.id, pageId, payload);   // 取消済みでも紐付ける → ②の再実行が「取消」へ倒す
+            linkTaskToNotionPage(row.id, pageId);
             summary.raced++;
           } else {
             // 台帳には別のカードが記録されている — 今回のカードが孤立した疑い。人に見せる
@@ -590,6 +601,7 @@ export function notionStatusForAdmin() {
     ORDER BY notion_cancelled_at DESC LIMIT 20`).all();
   return {
     configured: isNotionConfigured(),
+    source: sourceOfTruth(),
     dbIdTail: (process.env.INBOUND_CHECK_NOTION_DB_ID || '').slice(-6),
     unsent, waitingRetry, cancelPending, sentRecent, lastSyncedAt, blocked, attention,
   };

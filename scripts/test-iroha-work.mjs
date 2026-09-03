@@ -1562,5 +1562,41 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
   }
 }
 
+console.log('\n[20] 入荷受付からのタスク生成 (task-intake) と差分取込の整合');
+{
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const M = await import('../apps/iroha-work/migrate.js');
+  const S = await import('../apps/iroha-work/service.js');
+  const num = (n) => ({ type: 'number', number: n });
+  const { createTaskForDestination, linkTaskToNotionPage } = await import('../apps/iroha-work/task-intake.js');
+  const { sourceOfTruth } = await import('../apps/iroha-work/db.js');
+  const db = getDB();
+  db.prepare(`INSERT OR REPLACE INTO f_iroha_work_master (code_key, 商品コード, material_code, storage_container, units_per_container, process_count, note, version, updated_at)
+    VALUES ('intake-x', 'INTAKE-X', 'D-9', '箱', 12, 1, NULL, 2, '2026-09-03T00:00:00Z')`).run();
+  const dest = { id: 9901, destination: 'iroha', batch_id: 1, line_key: 'X|1|1', ar_no: 'AR-X', product_id: 'INTAKE-X', product_name: '入荷商品', planned_qty: 10, actual_qty: 8,
+    work_date: '2026-09-03', expiry_date: null, code_key: 'intake-x', cancelled_at: null };
+  const made = createTaskForDestination(dest, { actor: 'やまだ' });
+  const t = TD.getTask(made.id);
+  ok(made.action === 'inserted' && t.destination_id === 9901 && t.qty === 8 && t.status === 'not_started' && t.created_by === 'inbound:やまだ', '行き先 1 行からタスク 1 枚 (数量は実数)');
+  ok(t.master_snapshot && JSON.parse(t.master_snapshot).material_code === 'D-9' && JSON.parse(t.master_snapshot).units_per_container === 12, '作業仕様があればスナップショットに載る');
+  ok(createTaskForDestination(dest).action === 'exists', '同じ行き先は 2 枚にならない');
+  ok(createTaskForDestination({ ...dest, id: 9902, destination: 'bfaith' }).action === 'skipped' && createTaskForDestination({ ...dest, id: 9903, cancelled_at: 'x' }).action === 'skipped', 'B-Faith 行き・取消済みは作らない');
+  clearEnrichCache();
+  ok(S.buildTaskList().cards.some(c => c.id === made.id && c.master.material_code === 'D-9' && c.qty === 8), '一覧にそのまま出る (作業仕様つき)');
+  // Notion 正本の間にカードが作られたら紐付く → 差分取込は同じタスクの更新になる (衝突扱いしない)
+  const pg = mkPage({ status: '未着手', title: '入荷商品 (Notion 側)', code: 'INTAKE-X', qty: 8, props: { destination_id: num(9901) } });
+  const pagesOf = async () => (await M.surveyNotion({ save: false })).pages.filter(p => p.pageId === pg.id);
+  const plan0 = M.planImport(await pagesOf());
+  ok(plan0.rows[0].warnings.some(w => /dup_destination_db/.test(w)), '紐付け前は DB 既存 destination との衝突として要確認');
+  ok(linkTaskToNotionPage(9901, pg.id) === 1 && TD.getTask(made.id).notion_page_id === pg.id, 'カード作成時に notion_page_id を紐付ける');
+  ok(linkTaskToNotionPage(9901, 'other-page') === 0 && TD.getTask(made.id).notion_page_id === pg.id, '既に付いていれば触らない');
+  ok(linkTaskToNotionPage(null, pg.id) === 0 && linkTaskToNotionPage(9901, null) === 0, '引数が無ければ何もしない');
+  const plan1 = M.planImport(await pagesOf());
+  ok(!plan1.rows[0].warnings.some(w => /dup_destination_db/.test(w)) && plan1.rows[0].will_import, '紐付け後は同じタスクとして取り込める');
+  const applied = M.applyImport(plan1.rows, { batchId: 'test-intake' });
+  ok(applied.inserted === 0 && (applied.updated + applied.kept) === 1 && TD.getTaskByDestination(9901).id === made.id && TD.getTask(made.id).notion_page_id === pg.id, '取込は既存タスクの更新 (2 枚目を作らない)');
+  ok(sourceOfTruth() === 'notion', 'sourceOfTruth は db.js から引ける (既定 notion)');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exit(fail > 0 ? 1 : 0);
