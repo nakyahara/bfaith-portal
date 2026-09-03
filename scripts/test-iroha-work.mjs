@@ -1249,32 +1249,259 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
   ok(getMeta('source_of_truth') === 'app', '切替は meta に持つ (再起動しても続く)');
   setMetaValue('source_of_truth', null);
 
-  // 古い版 (page_id NOT NULL) の作業時間・写真は起動時に作り直す
+  // 作業開始 (アプリ正本) は 1 トランザクション: 終了カードでは始めない・未着手→作業中が同時に確定 (Codex A1b R1 #2)
+  {
+    const tStart = mk({ page: 'a1b-start', code: 'PROD-S', name: '開始テスト', dest: 8806 });
+    const r1 = TD.startTaskSession({ taskId: tStart, worker: getIrohaWorker(w1.id), deviceLabel: 'ipad-1', snapshotOf: () => ({ material_code: 'D-1' }) });
+    ok(r1.ok && !r1.already && r1.task.status === 'in_progress' && r1.task.started_at, '開始でセッションが作られ、未着手→作業中になる');
+    ok(JSON.parse(db.prepare('SELECT master_snapshot FROM f_iroha_work_sessions WHERE id = ?').get(r1.sessionId).master_snapshot).material_code === 'D-1', '開始時スナップショットは snapshotOf の値');
+    const r2 = TD.startTaskSession({ taskId: tStart, worker: getIrohaWorker(w1.id) });
+    ok(r2.ok && r2.already && r2.sessionId === r1.sessionId, '再送は既存セッション (already)');
+    stopSession({ taskId: tStart, workerId: w1.id, sessionId: r1.sessionId, reason: 'done' });
+    const cur = TD.getTask(tStart);
+    const closed = TD.changeTaskStatus({ taskId: tStart, to: 'closed', closeReason: 'stocked', expectVersion: cur.version, isStaff: true, actor: 'test' });
+    ok(closed.ok, '前提: 終了にする');
+    const nBefore = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(tStart).c;
+    const r3 = TD.startTaskSession({ taskId: tStart, worker: getIrohaWorker(w1.id) });
+    ok(r3.ok === false && r3.error === 'done_card', '終了したカードでは始められない');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(tStart).c === nBefore, '終了カードにセッションは増えない');
+    ok(TD.startTaskSession({ taskId: 999999, worker: getIrohaWorker(w1.id) }).error === 'not_found', '無いカードは not_found');
+    // 状態変更が通らないときはセッションごと戻す (transaction のロールバック): not_started→in_progress が拒否される状況を
+    // 「他端末が同時に変更」の代わりに、changeTaskStatus と同じ version 条件を壊して再現する
+    const tRb = mk({ page: 'a1b-rollback', code: 'PROD-S', name: '巻き戻し', dest: 8807 });
+    db.prepare("UPDATE f_iroha_tasks SET status = 'not_started', hold_reason_code = NULL WHERE id = ?").run(tRb);
+    const busyOpen = startSession({ taskId: tRb, worker: getIrohaWorker(w2.id) });   // w2 が作業中 (他人の開始は妨げない)
+    ok(busyOpen.ok, '前提: 別の人が先に開始 (作業中へ遷移済み)');
+    ok(TD.getTask(tRb).status === 'not_started', '前提: 直接 startSession では状態は変わらない');
+    const r4 = TD.startTaskSession({ taskId: tRb, worker: getIrohaWorker(w1.id) });
+    ok(r4.ok && r4.task.status === 'in_progress', '2 人目の開始でも未着手なら作業中にする');
+    stopSession({ taskId: tRb, workerId: w1.id, sessionId: r4.sessionId, reason: 'done' });
+    stopSession({ taskId: tRb, workerId: w2.id, sessionId: busyOpen.sessionId, reason: 'done' });
+  }
+
+  // 正本を app にしてからの記録の数 (Notion に戻す前の警告)
+  {
+    const since = new Date(Date.now() - 60_000).toISOString();
+    const c = TD.countChangesSince(since);
+    ok(c.tasks > 0 && c.sessions > 0 && c.media > 0, 'countChangesSince は状態変更・作業時間・写真を数える');
+    // [17] の旧版タスク行はダミーの時刻 ('x') を持つ — 文字列比較で未来扱いになるので、ここでは実時刻に直してから数える
+    db.prepare("UPDATE f_iroha_tasks SET updated_at = created_at WHERE updated_at NOT LIKE '20%'").run();
+    db.prepare("UPDATE f_iroha_tasks SET updated_at = '2026-01-01T00:00:00.000Z' WHERE updated_at NOT LIKE '20%'").run();
+    const z = TD.countChangesSince(new Date(Date.now() + 3600_000).toISOString());
+    ok(z.tasks === 0 && z.sessions === 0 && z.media === 0, '未来を起点にすると 0');
+  }
+
+  // 写真の再送は同じカードのときだけ (Codex A1b R1 #3)。task の行は Notion 同期キューに入らない (同 #8)
+  {
+    const { softDeleteMedia } = await import('../apps/iroha-work/media.js');
+    const other = mk({ page: 'a1b-other', code: 'PROD-Z', name: '別カード', dest: 8808 });
+    const conflict = addMedia({ taskId: other, productCode: 'PROD-Z', kind: 'photo', filePath: tmp2('a1b2.jpg'), worker: getIrohaWorker(w1.id), operationId: 'op-a1b-0001' });
+    ok(conflict.ok === false && conflict.error === 'operation_conflict', '別カードで同じ operation_id を送ると operation_conflict');
+    const conflict2 = addMedia({ pageId: 'some-page', productCode: 'PROD-A', kind: 'photo', filePath: tmp2('a1b3.jpg'), worker: getIrohaWorker(w1.id), operationId: 'op-a1b-0001' });
+    ok(conflict2.ok === false && conflict2.error === 'operation_conflict', 'Notion カードとして同じ operation_id を送っても返さない');
+    const both = addMedia({ pageId: 'p', taskId: other, productCode: 'PROD-Z', kind: 'photo', filePath: tmp2('a1b4.jpg'), worker: getIrohaWorker(w1.id), operationId: 'op-a1b-0002' });
+    ok(both.ok === false && both.error === 'bad_request', 'page_id と task_id の両方は bad_request');
+    const same = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('a1b5.jpg'), worker: getIrohaWorker(w1.id), operationId: 'op-a1b-0001' });
+    ok(same.ok && same.already && same.media.id === m1.media.id, '同じカードの再送は既存行 (冪等)');
+    const syncBefore = db.prepare('SELECT COUNT(*) c FROM f_iroha_media_page_sync').get().c;
+    ok(db.prepare('SELECT status FROM f_iroha_card_media WHERE id = ?').get(m1.media.id).status === 'uploaded', 'task の写真は Drive 保存 (uploaded) が最終状態');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_media_page_sync WHERE page_id IS NULL').get().c === 0, '同期キューに NULL ページが積まれていない');
+    const del = softDeleteMedia(m1.media.id, { isSession: true, actor: 'test' });
+    ok(del.ok && db.prepare('SELECT COUNT(*) c FROM f_iroha_media_page_sync').get().c === syncBefore, 'task の写真を削除しても同期キューは増えない');
+  }
+
+  // 古い版の作業時間・写真は起動時に作り直す (Codex A1b R1 #4 #5 + Low)。
+  //   (a) 最初の版 = page_id NOT NULL・task_id 無し。task の行は入れられないので、page の行だけの状態を作って検証する
+  //   (b) 途中の版 = page_id NULL 可・task_id 列あり・CHECK/FK 無し → 全行そのまま (id 含む) 保って作り直す
+  //   (c) FK 違反 (存在しない task_id) があれば全部戻す
   {
     const { createTables } = await import('../apps/iroha-work/db.js');
-    const nS = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c;
-    const nM = db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media').get().c;
-    db.pragma('foreign_keys = OFF');
-    db.exec(`CREATE TABLE s__old AS SELECT * FROM f_iroha_work_sessions; DROP TABLE f_iroha_work_sessions;
-      CREATE TABLE f_iroha_work_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, page_id TEXT NOT NULL, product_code TEXT, title_snapshot TEXT,
+    const sqlOf = (t) => db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name = ?").get(t)?.sql || '';
+    const rowsOf = (t) => JSON.stringify(db.prepare(`SELECT * FROM ${t} ORDER BY id`).all());
+    const OLD_SESSIONS = `CREATE TABLE f_iroha_work_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, page_id TEXT NOT NULL, product_code TEXT, title_snapshot TEXT,
         worker_id INTEGER NOT NULL, worker_name TEXT NOT NULL, device_label TEXT, started_at TEXT NOT NULL, ended_at TEXT, end_reason TEXT,
-        raw_seconds INTEGER, voided_at TEXT, voided_by TEXT, void_reason TEXT, master_snapshot TEXT, task_id INTEGER);
-      INSERT INTO f_iroha_work_sessions (id, page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, ended_at,
-        end_reason, raw_seconds, voided_at, voided_by, void_reason, master_snapshot, task_id)
-        SELECT id, COALESCE(page_id, 'legacy-' || id), product_code, title_snapshot, worker_id, worker_name, device_label, started_at, ended_at,
-        end_reason, raw_seconds, voided_at, voided_by, void_reason, master_snapshot, task_id FROM s__old;
-      DROP TABLE s__old;`);
+        raw_seconds INTEGER, voided_at TEXT, voided_by TEXT, void_reason TEXT, master_snapshot TEXT)`;
+    const OLD_MEDIA = `CREATE TABLE f_iroha_card_media (id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL UNIQUE, page_id TEXT NOT NULL,
+        product_code TEXT, kind TEXT NOT NULL, mime TEXT, size INTEGER, local_path TEXT, drive_file_id TEXT, drive_url TEXT, status TEXT NOT NULL, error TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0, next_retry_at TEXT, worker_id INTEGER, worker_name TEXT, device_label TEXT, created_at TEXT NOT NULL,
+        uploaded_at TEXT, synced_at TEXT, deleted_at TEXT, deleted_by TEXT, delete_token_hash TEXT, uploader_device_id INTEGER, unavailable_at TEXT)`;
+    const sessCols = 'id, page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, ended_at, end_reason, raw_seconds, voided_at, voided_by, void_reason, master_snapshot';
+    const mediaCols = 'id, operation_id, page_id, product_code, kind, mime, size, local_path, drive_file_id, drive_url, status, error, attempt_count, next_retry_at, worker_id, worker_name, device_label, created_at, uploaded_at, synced_at, deleted_at, deleted_by, delete_token_hash, uploader_device_id, unavailable_at';
+
+    // (a) 最初の版 — task の行を退避し、page の行だけで旧テーブルを組む
+    db.pragma('foreign_keys = OFF');
+    db.exec(`CREATE TEMP TABLE keep_s AS SELECT * FROM f_iroha_work_sessions WHERE page_id IS NULL;
+      CREATE TEMP TABLE keep_m AS SELECT * FROM f_iroha_card_media WHERE page_id IS NULL;
+      CREATE TEMP TABLE old_s AS SELECT * FROM f_iroha_work_sessions WHERE page_id IS NOT NULL;
+      CREATE TEMP TABLE old_m AS SELECT * FROM f_iroha_card_media WHERE page_id IS NOT NULL;
+      DROP TABLE f_iroha_work_sessions; DROP TABLE f_iroha_card_media;
+      ${OLD_SESSIONS}; ${OLD_MEDIA};
+      INSERT INTO f_iroha_work_sessions (${sessCols}) SELECT ${sessCols} FROM old_s;
+      INSERT INTO f_iroha_card_media (${mediaCols}) SELECT ${mediaCols} FROM old_m;`);
     db.pragma('foreign_keys = ON');
-    ok(db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().some(c => c.name === 'page_id' && c.notnull === 1), '前提: 古い版は page_id NOT NULL');
+    const pageRowsS = rowsOf('f_iroha_work_sessions'), pageRowsM = rowsOf('f_iroha_card_media');
+    ok(/page_id TEXT NOT NULL/.test(sqlOf('f_iroha_work_sessions')) && !/task_id/.test(sqlOf('f_iroha_card_media')), '前提: 最初の版 (page_id NOT NULL・task_id 無し)');
     createTables(db);
-    ok(!db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().some(c => c.name === 'page_id' && c.notnull === 1), 'page_id を NULL 可に作り直す');
-    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c === nS && db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media').get().c === nM, '行はそのまま残る');
-    ok(db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_iroha_sessions_task'").get(), '索引も作り直される');
+    const newS = sqlOf('f_iroha_work_sessions'), newM = sqlOf('f_iroha_card_media');
+    ok(/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/.test(newS) && /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/.test(newS)
+      && !/page_id\s+TEXT NOT NULL/.test(newS), '作業時間: 新しい定義 (task_id FK・CHECK・page_id NULL 可) で作り直す');
+    ok(/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/.test(newM) && /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/.test(newM)
+      && /operation_id\s+TEXT NOT NULL UNIQUE/.test(newM), '写真: 同上 (UNIQUE も残る)');
+    const strip = (j) => JSON.stringify(JSON.parse(j).map((r) => { const { task_id, ...rest } = r; return rest; }));
+    ok(strip(rowsOf('f_iroha_work_sessions')) === pageRowsS && strip(rowsOf('f_iroha_card_media')) === pageRowsM, '行 (id・全列) はそのまま。task_id は NULL');
+    ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE type='index' AND name IN ('idx_iroha_sessions_task','idx_iroha_media_task','idx_iroha_sessions_page','idx_iroha_media_page')").get().c === 4, '索引 4 本が作り直される');
     let bothNull = null;
     try { db.prepare("INSERT INTO f_iroha_work_sessions (worker_id, worker_name, started_at) VALUES (1, 'x', 'y')").run(); } catch (e) { bothNull = e; }
     ok(bothNull && /CHECK/.test(bothNull.message), 'page_id も task_id も無い行は入らない (CHECK)');
+    let badFk = null;
+    try { db.prepare("INSERT INTO f_iroha_work_sessions (task_id, worker_id, worker_name, started_at) VALUES (999999, 1, 'x', 'y')").run(); } catch (e) { badFk = e; }
+    ok(badFk && /FOREIGN KEY/.test(badFk.message), '存在しない task_id は入らない (FK)');
+    // 退避した task の行を戻す (id そのまま)
+    const keepColsS = db.prepare('PRAGMA table_info(keep_s)').all().map((c) => c.name).join(', ');
+    const keepColsM = db.prepare('PRAGMA table_info(keep_m)').all().map((c) => c.name).join(', ');
+    db.exec(`INSERT INTO f_iroha_work_sessions (${keepColsS}) SELECT ${keepColsS} FROM keep_s;
+      INSERT INTO f_iroha_card_media (${keepColsM}) SELECT ${keepColsM} FROM keep_m;
+      DROP TABLE keep_s; DROP TABLE keep_m; DROP TABLE old_s; DROP TABLE old_m;`);
+    const maxId = db.prepare('SELECT MAX(id) m FROM f_iroha_work_sessions').get().m;
+    const ins = db.prepare("INSERT INTO f_iroha_work_sessions (task_id, worker_id, worker_name, started_at, ended_at) VALUES (?, 1, 'x', 'y', 'z')").run(tOpen);
+    ok(Number(ins.lastInsertRowid) > maxId, '作り直し後も id は続き番号 (sqlite_sequence が引き継がれる)');
+    db.prepare('DELETE FROM f_iroha_work_sessions WHERE id = ?').run(Number(ins.lastInsertRowid));
+
+    // (b) 途中の版 (page_id NULL 可・task_id あり・CHECK/FK 無し) — 全行 (task の行も) そのまま保って作り直す
+    const allS = rowsOf('f_iroha_work_sessions'), allM = rowsOf('f_iroha_card_media');
+    const MID_SESSIONS = OLD_SESSIONS.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER');
+    const MID_MEDIA = OLD_MEDIA.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER');
+    const allColsS = db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().map((c) => c.name).join(', ');
+    const allColsM = db.prepare('PRAGMA table_info(f_iroha_card_media)').all().map((c) => c.name).join(', ');
+    db.pragma('foreign_keys = OFF');
+    db.exec(`CREATE TEMP TABLE mid_s AS SELECT * FROM f_iroha_work_sessions; CREATE TEMP TABLE mid_m AS SELECT * FROM f_iroha_card_media;
+      DROP TABLE f_iroha_work_sessions; DROP TABLE f_iroha_card_media; ${MID_SESSIONS}; ${MID_MEDIA};
+      INSERT INTO f_iroha_work_sessions (${allColsS}) SELECT ${allColsS} FROM mid_s;
+      INSERT INTO f_iroha_card_media (${allColsM}) SELECT ${allColsM} FROM mid_m; DROP TABLE mid_s; DROP TABLE mid_m;`);
+    db.pragma('foreign_keys = ON');
+    ok(!/CHECK/.test(sqlOf('f_iroha_work_sessions')) && !/REFERENCES/.test(sqlOf('f_iroha_card_media')), '前提: 途中の版 (page_id NULL 可だが CHECK/FK 無し)');
+    // (c) まず FK 違反を仕込む → 全部戻ること
+    db.prepare("INSERT INTO f_iroha_work_sessions (task_id, worker_id, worker_name, started_at) VALUES (999999, 1, 'orphan', 'y')").run();
+    let thrown = null;
+    try { createTables(db); } catch (e) { thrown = e; }
+    ok(thrown && /FK 違反/.test(thrown.message), '存在しない task_id があると作り直しを中止する');
+    ok(!/CHECK/.test(sqlOf('f_iroha_work_sessions')) && db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_%__new'").get().c === 0,
+      '中止したら古い表のまま・作業表も残らない (全部戻る)');
+    ok(db.pragma('foreign_keys', { simple: true }) === 1, '中止しても foreign_keys は ON に戻る');
+    db.prepare("DELETE FROM f_iroha_work_sessions WHERE worker_name = 'orphan'").run();
     createTables(db);
-    ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_work_sessions%'").get().c === 1, '2 回目は何もしない (冪等)');
+    ok(/CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/.test(sqlOf('f_iroha_work_sessions')) && /REFERENCES f_iroha_tasks/.test(sqlOf('f_iroha_card_media')), '途中の版も新しい定義に作り直す');
+    ok(rowsOf('f_iroha_work_sessions') === allS && rowsOf('f_iroha_card_media') === allM, '全行 (task の行・id 含む) がそのまま残る');
+    createTables(db);
+    ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_work_sessions%'").get().c === 1 && rowsOf('f_iroha_work_sessions') === allS, '2 回目は何もしない (冪等)');
+  }
+}
+
+console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 → 終了 → 状態変更 → 写真 (Notion API を呼ばない)');
+{
+  const express = (await import('express')).default;
+  const http = await import('node:http');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const { _setDriveUpload, processMediaQueue } = await import('../apps/iroha-work/media.js');
+  const { default: router } = await import('../apps/iroha-work/router.js');
+  const app = express();
+  app.use('/apps/iroha-work', express.json({ limit: '256kb' }), router);
+  const server = await new Promise((r) => { const sv = http.createServer(app).listen(0, '127.0.0.1', () => r(sv)); });
+  const port = server.address().port;
+  const origin = `http://127.0.0.1:${port}`;
+  // global.fetch は Notion モックなので、HTTP は node:http で直接叩く
+  function call(method, p, { body = null, headers = {}, cookie = null } = {}) {
+    return new Promise((resolve, reject) => {
+      const data = body == null ? null : Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
+      const h = { origin, ...(cookie ? { cookie } : {}), ...headers };
+      if (data && !h['content-type']) h['content-type'] = 'application/json';
+      if (data) h['content-length'] = data.length;
+      const req = http.request({ host: '127.0.0.1', port, path: '/apps/iroha-work' + p, method, headers: h }, (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          let json = null; try { json = JSON.parse(text); } catch { /* HTML 等 */ }
+          resolve({ status: res.statusCode, json, text, headers: res.headers });
+        });
+      });
+      req.on('error', reject);
+      if (data) req.write(data);
+      req.end();
+    });
+  }
+  function multipart(fields, file) {
+    const b = '----iwtest' + Date.now();
+    const parts = [];
+    for (const [k, v] of Object.entries(fields)) parts.push(Buffer.from(`--${b}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
+    parts.push(Buffer.from(`--${b}\r\nContent-Disposition: form-data; name="file"; filename="${file.name}"\r\nContent-Type: ${file.mime}\r\n\r\n`), file.data, Buffer.from(`\r\n--${b}--\r\n`));
+    return { body: Buffer.concat(parts), headers: { 'content-type': `multipart/form-data; boundary=${b}` } };
+  }
+  const notionCalls = () => mock.queryCalls + mock.patched.length + mock.dbPatches;
+  const calls0 = notionCalls();
+  const w1 = listIrohaWorkers(true).find((w) => w.display_name === 'やまだ');
+
+  // 端末登録 (コード → Cookie)
+  ok((await call('GET', '/api/state')).status === 401, '未登録の端末は 401');
+  const code = createEnrollCode('テストiPad', 'test').code;
+  const redeem = await call('POST', '/enroll/redeem', { body: { code } });
+  const cookie = (redeem.headers['set-cookie'] || []).map((c) => c.split(';')[0]).find((c) => c.startsWith('iw_device='));
+  ok(redeem.status === 200 && redeem.json.ok && cookie, '登録コードで端末 Cookie が出る');
+
+  // アプリ正本に切替 (テストの間だけ)
+  setMetaValue('source_of_truth', 'app');
+  process.env.GOOGLE_SERVICE_ACCOUNT_KEY = 'test-key';   // 実際の Drive は _setDriveUpload で差し替える
+  _setDriveUpload(async ({ operationId }) => ({ fileId: `f-${operationId}`, url: `https://drive/${operationId}` }));
+  try {
+    const task = TD.upsertTaskFromImport({ notion_page_id: 'http-1', status: 'not_started', facility_code: 'iroha', destination_id: 8901,
+      product_code: 'HTTP-A', product_name: 'HTTP テスト', qty: 3, arrival_date: '2026-09-03', master_snapshot: null }, { batchId: 'test-http' });
+    const st = await call('GET', '/api/state', { cookie });
+    const card = st.json?.cards?.find((c) => c.id === task.id);
+    ok(st.status === 200 && st.json.mode === 'app' && card && card.status === 'not_started' && card.status_label === '未着手', '一覧はアプリ正本 (mode=app・id で引ける)');
+    ok(Array.isArray(st.json.statuses) && st.json.statuses[0].value === 'not_started' && st.json.transitions && st.json.holdReasons && st.json.today, '状態・遷移・保留理由・今日を返す');
+    ok((await call('POST', '/api/sessions/start', { cookie, headers: { origin: 'http://evil.example' }, body: { id: String(task.id), worker_id: w1.id } })).status === 403, '別 Origin からの変更は拒否 (CSRF)');
+    const start = await call('POST', '/api/sessions/start', { cookie, body: { id: String(task.id), worker_id: w1.id } });
+    ok(start.status === 200 && start.json.ok && start.json.sessionId && start.json.status === 'in_progress', '開始 (文字列の id) → 作業中');
+    const stop = await call('POST', '/api/sessions/stop', { cookie, body: { id: task.id, worker_id: w1.id, session_id: start.json.sessionId, reason: 'done' } });
+    ok(stop.status === 200 && stop.json.ok && stop.json.task.status === 'in_progress', '終了 (数値の id)');
+    const cur = TD.getTask(task.id);
+    const hold = await call('POST', '/api/status', { cookie, body: { id: String(task.id), worker_id: w1.id, to: 'on_hold', hold_reason: 'label_shortage', expect_version: cur.version } });
+    ok(hold.status === 200 && hold.json.ok && hold.json.status === 'on_hold' && hold.json.status_label === '保留 · ラベル待ち' && hold.json.listed === true, '状態変更 → 保留 (ラベル待ち)');
+    const stale = await call('POST', '/api/status', { cookie, body: { id: task.id, worker_id: w1.id, to: 'in_progress', expect_version: cur.version } });
+    ok(stale.status === 409 && stale.json.error === 'conflict' && stale.json.current?.status === 'on_hold', '古い version は競合 (現在値つき)');
+    for (const bad of ['1.5', '-1', 'abc', '0', '']) {
+      const r = await call('POST', '/api/status', { cookie, body: { id: bad, worker_id: w1.id, to: 'in_progress', expect_version: 1 } });
+      if (!(r.status === 400 && r.json.error === 'bad_request')) ok(false, `不正な id "${bad}" は 400 (実際 ${r.status} ${r.json?.error})`);
+    }
+    ok((await call('POST', '/api/status', { cookie, body: { id: '1.5', worker_id: w1.id, to: 'in_progress', expect_version: 1 } })).status === 400, '不正な id (小数・負数・文字・0・空) は 400');
+    ok((await call('POST', '/api/planned', { cookie, body: { id: 'x', worker_id: w1.id } })).status === 400 && (await call('GET', '/api/label-waits?task_id=abc', { cookie })).status === 400, '今日やる・ラベル待ちも id を検査する');
+    const jpeg = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(64, 1)]);
+    const mp = multipart({ id: String(task.id), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-http-00001' }, { name: 'a.jpg', mime: 'image/jpeg', data: jpeg });
+    const up = await call('POST', '/api/media', { cookie, body: mp.body, headers: mp.headers });
+    ok(up.status === 200 && up.json.ok && up.json.media && up.json.deleteToken, '写真アップロード (task に付く)');
+    ok(db.prepare('SELECT task_id, page_id FROM f_iroha_card_media WHERE id = ?').get(up.json.media.id).task_id === task.id, '写真の行は task_id 付き・page_id なし');
+    const other = TD.upsertTaskFromImport({ notion_page_id: 'http-2', status: 'not_started', facility_code: 'iroha', destination_id: 8902,
+      product_code: 'HTTP-B', product_name: '別カード', qty: 1, arrival_date: '2026-09-03', master_snapshot: null }, { batchId: 'test-http' });
+    const mp2 = multipart({ id: String(other.id), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-http-00001' }, { name: 'b.jpg', mime: 'image/jpeg', data: jpeg });
+    const dup = await call('POST', '/api/media', { cookie, body: mp2.body, headers: mp2.headers });
+    ok(dup.status === 409 && dup.json.error === 'operation_conflict', '別カードで同じ operation_id は 409');
+    await processMediaQueue();
+    ok(db.prepare('SELECT status FROM f_iroha_card_media WHERE id = ?').get(up.json.media.id).status === 'uploaded', 'Drive 保存で完了 (uploaded)');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_media_page_sync WHERE page_id IS NULL').get().c === 0, '同期キューに NULL ページは無い');
+    const st2 = await call('GET', '/api/state', { cookie });
+    const card2 = st2.json.cards.find((c) => c.id === task.id);
+    ok(card2 && card2.media?.length === 1 && card2.media[0].id === up.json.media.id, '一覧の詳細に写真が出る');
+    const del = await call('POST', `/api/media/${up.json.media.id}/delete`, { cookie, body: { delete_token: up.json.deleteToken, worker_id: w1.id } });
+    ok(del.status === 200 && del.json.ok, '削除 (削除トークン)');
+    ok(notionCalls() === calls0, 'ここまで Notion API を 1 回も呼んでいない');
+    // 正本を Notion に戻す前の警告 (管理者セッションが必要なので API 本体は tasks-db の数で確認)
+    const c = TD.countChangesSince(getMeta('source_switched_at') || '1970-01-01T00:00:00.000Z');
+    ok(c.tasks >= 1 && c.sessions >= 1 && c.media >= 1, '戻す前の警告に使う件数が数えられる');
+  } finally {
+    _setDriveUpload(null);
+    delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+    setMetaValue('source_of_truth', null);
+    server.close();
   }
 }
 

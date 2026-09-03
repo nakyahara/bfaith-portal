@@ -174,16 +174,29 @@ const MEDIA_INDEX_DDL = `
     CREATE INDEX IF NOT EXISTS idx_iroha_media_task ON f_iroha_card_media(task_id, id);`;
 
 /**
- * 作業時間・写真の page_id を NULL 可にする作り直し (アプリ正本のカードは Notion ページを持たないため)。
- * 既存行はそのまま移す (page_id は残る = Notion 時代の証跡)。列は「新 DDL と旧テーブルの共通列」だけコピーするので、
- * 途中の版 (task_id が無い等) からでも通る。冪等
+ * 作業時間・写真の作り直し (アプリ正本のカードは Notion ページを持たないため page_id を NULL 可にし、task_id + FK + CHECK を付ける)。
+ * 判定は「新しい定義に必要なもの」を個別に見る (page_id が NULL 可か / task_id 列と FK / 両方 NULL 禁止の CHECK / 新 DDL の全列) —
+ * 一部だけ足りない途中の版も作り直す (Codex A1b R1 #5)。既存行はそのまま移す (page_id は残る = Notion 時代の証跡)。
+ * 列は「新 DDL と旧テーブルの共通列」だけコピーするので、列が少ない版からでも通る。
+ * 移す前後で件数が一致すること・DB 全体の FK 検査 (作り直した表を参照する側も含む — 同 R1 #4) を通ることを確かめ、
+ * 通らなければ全部戻す。冪等
  */
+const SESSION_MEDIA_REQUIRED_DDL = [/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/, /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/];
+function sessionMediaNeedsRebuild(db, table, ddl) {
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)?.sql;
+  if (!sql) return false;   // 無ければ CREATE IF NOT EXISTS が新定義で作る
+  const info = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (info.some((c) => c.name === 'page_id' && c.notnull === 1)) return true;
+  if (SESSION_MEDIA_REQUIRED_DDL.some((re) => !re.test(sql))) return true;
+  const have = new Set(info.map((c) => c.name));
+  const want = [...ddl('x').matchAll(/^\s+([a-z_]+)\s+(?:INTEGER|TEXT)/gm)].map((m) => m[1]);
+  return want.some((c) => !have.has(c));
+}
 function migrateSessionMediaSchema(db) {
-  const notNullPageId = (t) => db.prepare(`PRAGMA table_info(${t})`).all().some((c) => c.name === 'page_id' && c.notnull === 1);
   const targets = [
     { table: 'f_iroha_work_sessions', ddl: sessionsDDL, index: SESSIONS_INDEX_DDL },
     { table: 'f_iroha_card_media', ddl: mediaDDL, index: MEDIA_INDEX_DDL },
-  ].filter((t) => notNullPageId(t.table));
+  ].filter((t) => sessionMediaNeedsRebuild(db, t.table, t.ddl));
   if (targets.length === 0) return false;
   const fkWasOn = db.pragma('foreign_keys', { simple: true }) === 1;
   if (fkWasOn) db.pragma('foreign_keys = OFF');
@@ -191,22 +204,26 @@ function migrateSessionMediaSchema(db) {
     db.transaction(() => {
       for (const { table, ddl, index } of targets) {
         const tmp = `${table}__new`;
+        db.exec(`DROP TABLE IF EXISTS ${tmp}`);   // 中断で残った作業表があれば捨てる (行は元の表にある)
         db.exec(ddl(tmp));
         const newCols = db.prepare(`PRAGMA table_info(${tmp})`).all().map((c) => c.name);
         const oldCols = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
         const cols = newCols.filter((c) => oldCols.has(c));
+        const before = db.prepare(`SELECT COUNT(*) c FROM ${table}`).get().c;
         db.exec(`INSERT INTO ${tmp} (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM ${table}`);
+        const after = db.prepare(`SELECT COUNT(*) c FROM ${tmp}`).get().c;
+        if (before !== after) throw new Error(`${table} の作り直しを中止しました (件数不一致 ${before} → ${after})`);
         db.exec(`DROP TABLE ${table}`);
         db.exec(`ALTER TABLE ${tmp} RENAME TO ${table}`);
         db.exec(index);
       }
-      const bad = targets.flatMap((t) => db.pragma(`foreign_key_check(${t.table})`));
+      const bad = db.pragma('foreign_key_check');
       if (bad.length > 0) throw new Error(`作業時間・写真の作り直しを中止しました (FK 違反): ${JSON.stringify(bad.slice(0, 5))}`);
     })();
   } finally {
     if (fkWasOn) db.pragma('foreign_keys = ON');
   }
-  console.log(`[iroha-work] ${targets.map((t) => t.table).join(' / ')} の page_id を NULL 可にしました (アプリ正本のカード用)`);
+  console.log(`[iroha-work] ${targets.map((t) => t.table).join(' / ')} を新しい定義で作り直しました (page_id NULL 可・task_id FK・CHECK)`);
   return true;
 }
 
@@ -428,7 +445,6 @@ export function createTables(db = getMirrorDB()) {
     --   voided = 誤操作の論理削除 (行は消さず集計から外す — 実測値の除外フラグ)
     --   紐づけ先: Notion 正本の間は page_id、アプリ正本のカードは task_id (v1.1)
     ${sessionsDDL('f_iroha_work_sessions')}
-    ${SESSIONS_INDEX_DDL}
 
     -- 完成写真・動画 (要件定義 §6 / §1.7 ②outbox)。
     -- ⭐operation_id 付き outbox: 受信時にまず行を作り (status=stored, 実体は DATA_DIR)、
@@ -436,7 +452,6 @@ export function createTables(db = getMirrorDB()) {
     --   URL だけを持ち、画像そのものは DB に入れない (Codex「写真をタスク列に詰めない」)。
     --   deleted_at = 論理削除 (撮り直し。物理削除はしない)
     ${mediaDDL('f_iroha_card_media')}
-    ${MEDIA_INDEX_DDL}
 
     -- Notion「完成写真」貼り直しのページ単位キュー (Codex PR3 #1: 最後の1件を削除したときも
     -- 「空にする」PATCH が必要 — メディア行の状態だけでは表現できない)。
@@ -507,6 +522,7 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_app_events', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
   // 古い版 (page_id NOT NULL) の作業時間・写真は作り直す — アプリ正本のカードは Notion ページを持たない (A1b)
   migrateSessionMediaSchema(db);
+  // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}
     ${MEDIA_INDEX_DDL}

@@ -5,7 +5,8 @@
  *   ①iPad から受信 → 検証 (種類・サイズ・マジックバイト・上限枚数) → DATA_DIR に実体保存 +
  *     f_iroha_card_media に status='stored' で記録 → **即応答** (Drive を待たせない)
  *   ②裏のキューが Drive へアップロード (成功で status='uploaded'、実体ファイルは削除)
- *   ③カードの「完成写真」(files プロパティ) を貼り直す (成功で status='synced')
+ *   ③カードの「完成写真」(files プロパティ) を貼り直す (成功で status='synced') — Notion 正本のカード (page_id) だけ。
+ *     アプリ正本のカード (task_id) は Notion に貼る先が無いので 'uploaded' が最終状態 (同期キューには入れない)
  *   失敗は next_retry_at で再試行。同じ operation_id の再送は既存行を返す (二重登録しない)。
  *   Notion 反映の失敗は現場操作の失敗にしない (アップロード済みならいつでも貼り直せる)。
  *
@@ -107,9 +108,17 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
   if (size > cap) {
     return { ok: false, error: 'too_large', message: `ファイルが大きすぎます (上限 ${Math.round(cap / 1024 / 1024)}MB)` };
   }
+  if (pageId != null && taskId != null) return { ok: false, error: 'bad_request', message: 'カードの指定が二重です (page_id と task_id の両方)' };
+  if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
   const db = getDB();
   const dup = db.prepare('SELECT * FROM f_iroha_card_media WHERE operation_id = ?').get(opId);
   if (dup) {
+    // 再送は「同じカード」のときだけ既存行を返す。別カード (切替前の Notion カードを含む) の operation_id なら
+    // その写真を今のカードの成功として返さない (Codex A1b R1 #3)
+    const sameCard = taskId != null
+      ? (Number(dup.task_id) === Number(taskId) && dup.page_id == null)
+      : (dup.page_id === pageId && dup.task_id == null);
+    if (!sameCard) return { ok: false, error: 'operation_conflict', message: 'この送信は別のカードで使われています (撮り直してください)' };
     // 応答消失→再送 (Codex PR3-R3): 削除トークンを持てていないので、**同じ端末からの再送に
     // 限って**発行し直す (古いトークンは無効になる)。別端末からの同 operation_id には返さない
     if (deviceId != null && dup.uploader_device_id === Number(deviceId) && !dup.deleted_at) {
@@ -120,7 +129,6 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
     }
     return { ok: true, already: true, media: publicMedia(dup) };
   }
-  if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
   const max = kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
   if (countActiveMedia({ pageId, taskId }, kind) >= max) {
     return { ok: false, error: 'cap_reached',
@@ -245,14 +253,14 @@ export function softDeleteMedia(id, { deleteToken = null, actor = null, isSessio
   db.prepare('UPDATE f_iroha_card_media SET deleted_at = ?, deleted_by = ? WHERE id = ?')
     .run(utcNow(), actor || 'device', row.id);
   if (row.local_path) { try { fs.unlinkSync(row.local_path); } catch { /* 送信済みなら無い */ } }
-  requestPageSync(row.page_id);
-  schedule();
+  if (row.page_id != null) { requestPageSync(row.page_id); schedule(); }   // アプリ正本の行は Notion に貼っていない
   return { ok: true };
 }
 
 /** Notion 貼り直しをページ単位で予約する (即時対象になる)。revision を進めて「処理中の古い
  *  取得内容で完了扱いされない」ようにする (Codex PR3-R2: PATCH中の削除要求が消える競合) */
 export function requestPageSync(pageId) {
+  if (pageId == null) return;   // アプリ正本のカードには Notion ページが無い (NULL を積むと永遠に失敗し続ける — Codex A1b R1 #8)
   getDB().prepare(`INSERT INTO f_iroha_media_page_sync (page_id, revision, requested_at, attempt_count, next_retry_at, error)
     VALUES (?, 1, ?, 0, NULL, NULL)
     ON CONFLICT(page_id) DO UPDATE SET
@@ -463,7 +471,7 @@ export async function processMediaQueue() {
           SET status = 'uploaded', drive_file_id = ?, drive_url = ?, uploaded_at = ?, error = NULL, next_retry_at = NULL
           WHERE id = ?`).run(fileId, url, utcNow(), r.id);
         try { fs.unlinkSync(r.local_path); } catch { /* 消せなくても実害なし */ }
-        requestPageSync(r.page_id);
+        if (r.page_id != null) requestPageSync(r.page_id);   // task_id の行は Drive 保存で完了
         stats.uploaded++;
       } catch (e) {
         markFail(db, r, e.message);

@@ -350,7 +350,15 @@ function stName(v) {
 
 let state = { mode: 'notion', cards: [], statuses: [], changeTargets: [], workers: [], refresh: {}, me: {} };
 let curTab = 'all';
-let curDetail = null;      // 開いている詳細の page_id
+let curDetail = null;      // 開いている詳細のカード id (Notion 正本 = page_id 文字列 / アプリ正本 = task id 数値)
+/** カード id の比較。onclick の引数を経ると数値も文字列になるので、厳密比較せず文字列にそろえて比べる (Codex A1b R1 #1) */
+const sameId = (a, b) => a != null && b != null && String(a) === String(b);
+const findCard = (id) => state.cards.find(x => sameId(x.id, id)) || null;
+/** 正本が切り替わると状態の値も変わる (未着手 ↔ not_started)。無い値を選んだままだと一覧が空に見えるので「すべて」に戻す */
+function ensureTabValid() {
+  const valid = new Set(['all', ...statusTabs().map(([v]) => v)]);
+  if (!valid.has(curTab)) curTab = 'all';
+}
 let worker = null;         // { id, display_name, worker_type }
 // タイマーはサーバー時刻基準 (iPadの時計を信じない)。/api/state の serverNow とのオフセットで補正
 let clockOffset = 0;
@@ -469,7 +477,7 @@ function restoreSnapshot() {
     transitions: s.transitions || {}, holdReasons: s.holdReasons || [], closeReasons: s.closeReasons || [],
     facilities: s.facilities || [], today: s.today || null,
     workers: s.workers || [], refresh: s.refresh || {}, me: {} };
-  renderModeTexts(); renderTabs(); renderList(); restoreWorker();
+  renderModeTexts(); ensureTabValid(); renderTabs(); renderList(); restoreWorker();
   $('#syncTxt').textContent = '前回取得 ' + fmtTime(new Date(s.at).toISOString()) + ' の一覧 · 最新を確認中…';
   return true;
 }
@@ -516,6 +524,7 @@ async function loadStateOnce() {
   if (serverDown) { serverDown = false; hideErr('down'); toast('サーバーにつながりました'); }
   reconnectMs = RECONNECT_MIN_MS; clearTimeout(reconnectTimer); reconnectTimer = null;
   state = j;
+  ensureTabValid();
   saveSnapshot(j);
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
   renderSync();
@@ -524,7 +533,7 @@ async function loadStateOnce() {
   renderList();
   restoreWorker();
   if (curDetail) {
-    const c = state.cards.find(x => x.id === curDetail);
+    const c = findCard(curDetail);
     if (c) renderDetail(c);
   }
 }
@@ -662,10 +671,10 @@ async function forceRefresh() {
 }
 
 // ─── 詳細 ───
-function openDetail(pageId) {
-  const c = state.cards.find(x => x.id === pageId);
+function openDetail(id) {
+  const c = findCard(id);
   if (!c) return;
-  curDetail = pageId;
+  curDetail = c.id;
   renderDetail(c);
   document.body.classList.add('detail-open');
   window.scrollTo(0, 0);
@@ -939,7 +948,7 @@ async function delMedia(ev, id) {
 
 function rerenderDetail() {
   if (!curDetail) return;
-  const c = state.cards.find(x => x.id === curDetail);
+  const c = findCard(curDetail);
   if (c) renderDetail(c);
 }
 
@@ -1042,7 +1051,7 @@ function mvValues(m) {
 
 function openMaster(focus) {
   if (!worker) { openGate(); return; }
-  const c = state.cards.find(x => x.id === curDetail);
+  const c = findCard(curDetail);
   if (!c) return;
   if (!c.product_code) { showErr('商品コードのないカードは登録できません (職員の方に確認してください)'); return; }
   const cur = mvValues(c.master);
@@ -1154,7 +1163,7 @@ function workCardHtml(c) {
 /** 「今日やる」(planned_date = 今日) / 後日 (null)。アプリ正本のみ */
 async function setPlanned(on) {
   if (!worker || !curDetail) return;
-  const c = state.cards.find(x => x.id === curDetail);
+  const c = findCard(curDetail);
   if (!c) return;
   const j = await apiFetch('/api/planned', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1197,7 +1206,7 @@ async function startWork() {
     return;
   }
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
-  const c = state.cards.find(x => x.id === curDetail);
+  const c = findCard(curDetail);
   if (c) {
     applyTask(c, j.task);
     if (j.status) c.status = j.status;
@@ -1213,7 +1222,7 @@ async function startWork() {
 
 async function stopWork(reason) {
   if (!worker || !curDetail) return;
-  const cNow = state.cards.find(x => x.id === curDetail);
+  const cNow = findCard(curDetail);
   const mine = cNow ? myActiveOf(cNow) : null;
   if (!mine || !mine.id) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
   for (const id of ['pauseBtn', 'doneBtn']) { const b = document.getElementById(id); if (b) b.disabled = true; }
@@ -1286,7 +1295,7 @@ function renderStBtns(c) {
 function openSt(ev, id) {
   if (ev) ev.stopPropagation();
   if (!worker) { openGate(); return; }
-  const c = state.cards.find(x => String(x.id) === String(id));
+  const c = findCard(id);
   if (!c) return;
   stTarget = c.id;
   stStep = null;
@@ -1373,7 +1382,7 @@ async function doSetSt(choice) {
   // 一覧に残らないステータス (棚入完了) になったら、その場で行を外す (次の取得でも入ってこない)
   const dropCard = () => {
     state.cards = state.cards.filter(x => x.id !== c.id);
-    if (curDetail === c.id) closeDetail();
+    if (sameId(curDetail, c.id)) closeDetail();
     renderTabs(); renderList();
   };
   const suffix = isApp() ? '' : ' (Notionにも反映済み)';
@@ -1389,7 +1398,7 @@ async function doSetSt(choice) {
     c.status = j.status;
     if (j.status_label) c.status_label = j.status_label;
     renderTabs(); renderList();
-    if (curDetail === c.id) renderDetail(c);
+    if (sameId(curDetail, c.id)) renderDetail(c);
     toast('「' + label + '」に変えました' + suffix);
     return;
   }
@@ -1400,7 +1409,7 @@ async function doSetSt(choice) {
     else if (j.current) {
       if (typeof j.current === 'object') { applyTask(c, j.current); c.status = j.current.status; c.status_label = j.current.status_label; }
       else c.status = j.current;
-      renderTabs(); renderList(); if (curDetail === c.id) renderDetail(c);
+      renderTabs(); renderList(); if (sameId(curDetail, c.id)) renderDetail(c);
     }
     loadState();
     return;

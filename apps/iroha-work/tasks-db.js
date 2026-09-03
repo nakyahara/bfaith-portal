@@ -5,7 +5,7 @@
  * 不変条件 (closed には close_reason/closed_at、on_hold には hold_reason …) は書く前に validateTaskInvariants で守る。
  * 状態変更は version の楽観ロック (2 台の iPad が同時に触っても後勝ちで壊さない) + 履歴 (f_iroha_app_events.task_id)。
  */
-import { getDB } from './db.js';
+import { getDB, startSession } from './db.js';
 import {
   OPEN_STATUSES, CLOSE_REASONS, HOLD_REASONS, DEFAULT_FACILITY,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
@@ -384,4 +384,55 @@ export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion 
   safeLogTaskEvent({ taskId: cur.task_id, action: 'label_wait_update', to: JSON.stringify(rec).slice(0, 300), ok: true });
   void actor;
   return { ok: true, row: db.prepare('SELECT * FROM f_iroha_label_waits WHERE id = ?').get(cur.id) };
+}
+
+// ─── 作業開始 (アプリ正本) ───
+
+/**
+ * 作業開始を 1 つの BEGIN IMMEDIATE にまとめる (Codex A1b R1 #2): タスクの再確認 (終了していないか) → セッション INSERT →
+ * 最初の開始なら 未着手→作業中。同じトランザクションなので、確認と INSERT の間に別端末が終了させることはできず、
+ * 「終了したカードに活動中セッションが残る」ことがない。状態変更が通らなければセッションごと戻す。
+ * @param snapshotOf (task) => 開始時の実効作業仕様 (router が masterOfTask で合成) / null
+ */
+export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotOf = null }) {
+  const db = getDB();
+  const tx = db.transaction(() => {
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
+    if (t.status === 'closed') {
+      return { ok: false, error: 'done_card', message: 'このカードは終了しています (やり直すなら職員が状態を戻してください)' };
+    }
+    const r = startSession({
+      taskId: t.id, productCode: t.product_code, title: t.product_name, worker, deviceLabel,
+      masterSnapshot: snapshotOf ? snapshotOf(t) : undefined,
+    });
+    if (!r.already) {
+      safeLogTaskEvent({ taskId: t.id, action: 'session_start', workerId: worker.id, workerName: worker.display_name,
+        deviceLabel, to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    }
+    if (!r.ok) return r;
+    let task = t;
+    if (t.status === 'not_started') {
+      const cs = changeTaskStatus({ taskId: t.id, to: 'in_progress', expectVersion: t.version,
+        actor: `${worker.display_name} (いろはアプリ)`, workerId: worker.id, workerName: worker.display_name, deviceLabel });
+      if (!cs.ok) throw Object.assign(new Error(cs.message || '状態を変更できませんでした'), { taskResult: cs });
+      task = cs.task;
+    }
+    return { ok: true, already: !!r.already, sessionId: r.sessionId, startedAt: r.startedAt, task };
+  });
+  try { return tx.immediate(); } catch (e) {
+    if (e.taskResult) return { ok: false, ...e.taskResult };   // ロールバック済み (セッションは残っていない)
+    throw e;
+  }
+}
+
+/** 正本を app にしてからの記録の数 (Notion へ戻す前の警告用 — Codex A1b R1 #7) */
+export function countChangesSince(iso) {
+  const db = getDB();
+  const q = (sql) => db.prepare(sql).get(iso).c;
+  return {
+    tasks: q('SELECT COUNT(*) c FROM f_iroha_tasks WHERE updated_at > ?'),
+    sessions: q('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id IS NOT NULL AND started_at > ?'),
+    media: q('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id IS NOT NULL AND created_at > ?'),
+  };
 }
