@@ -122,6 +122,11 @@
     border-radius:var(--r-sm);padding:3px 8px;font-size:.74rem;font-weight:700;cursor:pointer}
   .bcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;margin-bottom:6px;cursor:pointer}
   .bcard.sel{outline:2px solid var(--accent);outline-offset:-2px}
+  .bcard{display:flex;gap:8px;align-items:flex-start}
+  .bcard .th{width:44px;height:44px;flex:none;border-radius:var(--r-sm);background:var(--well);border:1px solid var(--line);
+    display:grid;place-items:center;font-size:1.1rem;overflow:hidden}
+  .bcard .th img{width:100%;height:100%;object-fit:contain;background:#fff}
+  .bcard .bd{min-width:0;flex:1}
   .bcard h4{margin:0;font-size:.92rem;font-weight:700;line-height:1.35}
   .bcard .m{font-size:.76rem;color:var(--sub);margin-top:2px}
   .bcard .cb{width:20px;height:20px;vertical-align:-4px;margin-right:6px;accent-color:var(--accent)}
@@ -179,6 +184,12 @@
   .kv.miss{border:1px dashed var(--amber);background:var(--amber-soft)}
   .kv.miss .v{color:var(--amber)}
   .kv a{color:var(--accent)}
+  /* 直せる項目は、そのままタップして変更・登録する (編集ボタンは置かない — 中原さん 2026-09-03) */
+  .kv.tap{cursor:pointer;position:relative;padding-right:74px}
+  .kv.tap:active{border-color:var(--accent)}
+  .kv .edit{position:absolute;right:8px;top:50%;transform:translateY(-50%);font-size:.72rem;font-weight:700;
+    border:1px solid var(--line);background:var(--surface);color:var(--sub);border-radius:var(--r-sm);padding:3px 8px;white-space:nowrap}
+  .kv.miss .edit{border-color:var(--amber);color:var(--amber)}
 
   /* ── 写真: 「前回の完成形」(同じ商品の見本) と「今回のできあがり」 ── */
   .photos{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;margin-top:4px}
@@ -402,7 +413,6 @@
         <label>入数 (保管箱1つに入れる数)</label><input id="mvUnits" type="number" min="0" inputmode="numeric">
         <label>工程数</label><input id="mvProcess" type="number" min="0" inputmode="numeric">
         <label>気をつけること (備考)</label><input id="mvNote" maxlength="300">
-        <label>作り方動画のリンク (https://…)</label><input id="mvVideo" type="url" maxlength="500" placeholder="https://">
       </div>
       <div id="mvPinRow" style="display:none;margin-top:12px">
         <label>職員PIN (入っている値の変更に必要です)</label>
@@ -959,9 +969,11 @@ function bcardHtml(c, status) {
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
   return '<div class="bcard' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+    '<div class="th">' + thumbHtml(c) + '</div>' +
+    '<div class="bd">' +
     '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
     (c.today ? '📌 ' : '') + esc(c.title) + '</h4>' +
-    (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') + '</div>';
+    (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') + '</div></div>';
 }
 
 // ─── まとめて棚入完了 (職員のみ) ───
@@ -1216,14 +1228,26 @@ function estText(c) {
   return '⏱ これまでの実績 平均' + fmtDur(e.avgSeconds) + ' (' + e.cards + '回)';
 }
 
+/**
+ * 作業のやり方の 1 項目。reg (直せる項目) があれば、その項目をタップして変更・登録する。
+ * 値が入っていれば「✎ 変更」、空なら「＋ 登録」。編集ボタンは置かない (中原さん 2026-09-03)
+ */
 function kv(label, value, opts) {
   const miss = opts && opts.miss;
-  const reg = opts && opts.reg;   // 未登録のとき「＋その場で登録」を出す (FB③)
-  return '<div class="kv' + (miss ? ' miss' : '') + '"><label>' + esc(label) + '</label><div class="v num">' +
-    (value == null || value === '' ? (miss ? '未登録' : '—') : esc(value)) + '</div>' +
-    (miss && reg ? '<button class="reg" onclick="openMaster(\'' + esc(reg) + '\')">＋ その場で登録</button>' : '') +
-    '</div>';
+  const reg = opts && opts.reg;
+  const empty = value == null || value === '';
+  const inner = '<label>' + esc(label) + '</label><div class="v num">' +
+    (empty ? (miss ? '未登録' : '—') : esc(value)) + '</div>';
+  if (!reg) return '<div class="kv' + (miss ? ' miss' : '') + '">' + inner + '</div>';
+  return '<div class="kv tap' + (miss ? ' miss' : '') + '" data-reg="' + esc(reg) + '">' + inner +
+    '<span class="edit">' + (empty ? '＋ 登録' : '✎ 変更') + '</span></div>';
 }
+/** 直せる項目のタップ (中のリンクを押したときは開かない) */
+$('#dbody').addEventListener('click', (e) => {
+  if (e.target.closest('a')) return;
+  const el = e.target.closest('[data-reg]');
+  if (el) openMaster(el.dataset.reg);
+});
 
 function renderDetail(c) {
   const st = $('#dstate');
@@ -1249,22 +1273,19 @@ function renderDetail(c) {
       '</div></div></div>' +
     prevCardHtml(c) +
 
-    '<div class="dcard"><h3 class="sec">作業のやり方 <button class="reg" style="margin-left:8px" onclick="openMaster()">✎ 編集</button></h3><div class="kvs">' +
+    '<div class="dcard"><h3 class="sec">作業のやり方</h3><div class="kvs">' +
       kv('資材', m.material_code, { miss: missSet.has('資材'), reg: 'material_code' }) +
       kv('保管箱', m.storage_container && m.units_per_container != null
           ? m.storage_container + 'に ' + m.units_per_container + '個ずつ'
           : m.storage_container, { miss: missSet.has('保管箱') || missSet.has('入数'), reg: 'storage_container' }) +
       kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程'), reg: 'process_count' }) +
-      (m.video_url
-        ? '<div class="kv"><label>作り方どうが</label><div class="v"><a href="' + esc(m.video_url) + '" target="_blank" rel="noopener">▶ どうがを見る</a></div></div>'
-        : kv('作り方どうが', null, { miss: true, reg: 'video_url' })) +
-      kv('気をつけること', m.note) +
+      kv('気をつけること', m.note, { reg: 'note' }) +
       kv('期限', c.expiry ? c.expiry : '期限シールなし') +
       kv('参考', [prio, ...live].join(' ・ ')) +
       (c.external_text ? kv('外部出し目安', c.external_text) : '') +
       (c.supplier ? kv('取引先', c.supplier) : '') +
     '</div>' +
-      '<p class="nlink">空欄への登録はだれでもできます。入っている値の変更は職員の方が「✎ 編集」から (PINが必要)。</p>' +
+      '<p class="nlink">直したい項目をタップしてください。空欄の登録はだれでもできます。入っている値の変更は職員PINが必要です。</p>' +
       (m.source === 'card'
         ? '<p class="nlink">※作業仕様マスタに未登録のため、カード作成時の値を表示しています。登録すると次回からマスタの値になります。</p>' : '') +
       (c.url ? '<p class="nlink">🗂 <a href="' + esc(c.url) + '" target="_blank" rel="noopener">' + (isApp() ? '移行元のNotionカード (参考)' : 'Notionのカードを開く') + '</a></p>' : '') +
@@ -1554,14 +1575,15 @@ let mvSaving = false;
 //   古い入力を新しい version で送れてしまい他人の変更を上書きする)
 let mvCtx = null;   // { pageId, code, version, values }
 const MV_MAP = { material_code: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
-  process_count: 'mvProcess', note: 'mvNote', video_url: 'mvVideo' };
+  // 作り方動画のリンクは画面から外した (中原さん 2026-09-03)。DB の video_url と API は残してあるので、戻すときはここに足す
+  process_count: 'mvProcess', note: 'mvNote' };
 
 function mvValues(m) {
   return {
     material_code: m.material_code || '', storage_container: m.storage_container || '',
     units_per_container: m.units_per_container == null ? '' : String(m.units_per_container),
     process_count: m.process_count == null ? '' : String(m.process_count),
-    note: m.note || '', video_url: m.video_url || '',
+    note: m.note || '',
   };
 }
 
