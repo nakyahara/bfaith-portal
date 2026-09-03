@@ -1731,6 +1731,11 @@ function buildAmazonSkuCaseMap() {
   return m;
 }
 
+/** SKU 属性 (amazon_sku / asin / fnsku) の全件。箱詰め記録 (fba-box) が FNSKU → ASIN を引いて商品画像を取るのに使う */
+export function getFbaSkuAttrs() {
+  return queryAll('SELECT amazon_sku, asin, fnsku FROM fba_sku_attrs');
+}
+
 export function getSkuMappingsFromMirror() {
   const mdb = getMirrorDB(); // better-sqlite3 (mirror 未初期化なら throw)
   const rows = mdb.prepare(`

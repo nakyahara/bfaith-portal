@@ -354,6 +354,15 @@ export function createTables(d = getDB()) {
       value TEXT
     );
 
+    -- 商品画像 (Amazon カタログ MAIN 画像 URL。miniPC の SP-API 経由で取得、FNSKU 単位のキャッシュ — images.js)
+    CREATE TABLE IF NOT EXISTS fbx_product_images (
+      fnsku      TEXT PRIMARY KEY,
+      asin       TEXT,
+      image_url  TEXT,
+      status     TEXT NOT NULL CHECK (status IN ('ok','none','error')),
+      fetched_at TEXT NOT NULL
+    );
+
     -- Excel 出力の版 (要件 F-7)。data_version = 出力時点の fbx_runs.data_version。
     -- snapshot_json = 書いたセルと箱↔Amazon箱番号の対応 (出力後の変更は run.data_version が進むので「旧版」と分かる)
     CREATE TABLE IF NOT EXISTS fbx_exports (
@@ -718,6 +727,83 @@ export function setRunStatus(runId, status, actor) {
   }).immediate();
 }
 
+/**
+ * 作業を終える (職員 / 本社)。全部入らなくても完了できる (中原さん 9/3: 破損・自社出荷の引当で FBA に出さない商品がある)。
+ *   - 中身のある開いた箱は先に閉じてもらう (実測重量が要る) → open_boxes
+ *   - 空の開いた箱は取消して進める
+ *   - 未投入が残る行があれば acknowledge=false では incomplete で一覧を返す (最後のアラート)。
+ *     acknowledge=true なら残数を「今回は納品しない (not_shipped)」の不足として確定してから done にする
+ */
+export function finishRun({ runId, acknowledge = false, worker, deviceLabel }) {
+  const d = getDB();
+  return d.transaction(() => {
+    const run = d.prepare('SELECT * FROM fbx_runs WHERE id = ?').get(Number(runId));
+    if (!run) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
+    if (run.status === 'done') return { ok: true, already: true };
+    if (run.status !== 'active') return { ok: false, error: 'bad_status', message: `この納品回は ${run.status} です` };
+    const openBoxes = d.prepare(`SELECT b.*, COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.box_id = b.id AND p.revoked_at IS NULL), 0) AS total_qty
+      FROM fbx_boxes b JOIN fbx_pack_groups g ON g.id = b.pack_group_id WHERE g.run_id = ? AND b.status = 'open' ORDER BY b.id`).all(run.id);
+    const withContents = openBoxes.filter((b) => b.total_qty > 0);
+    if (withContents.length > 0) {
+      return { ok: false, error: 'open_boxes', boxes: withContents.map((b) => ({ id: b.id, code: b.box_code, qty: b.total_qty })),
+        message: `閉じていない箱が ${withContents.length} 箱あります (${withContents.map((b) => b.box_code).join(', ')})。読み合わせて重さを入れて閉じてから完了してください` };
+    }
+    const rows = d.prepare(`SELECT w.*,
+        COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
+        COALESCE(rw.shortage_qty, 0) AS shortage
+      FROM fbx_rows w LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
+      WHERE w.run_id = ? AND w.match_state NOT IN ('picking_only','retired') ORDER BY w.pack_group_id, w.id`).all(run.id)
+      .map((r) => ({ ...r, remaining: r.planned_qty - r.placed - r.shortage })).filter((r) => r.remaining !== 0);
+    if (rows.length > 0 && !acknowledge) {
+      return { ok: false, error: 'incomplete', rows: rows.map((r) => ({ id: r.id, fnsku: r.fnsku, name: r.product_name, planNo: r.plan_no, planned: r.planned_qty, placed: r.placed, shortage: r.shortage, remaining: r.remaining })),
+        message: `まだ入っていない商品が ${rows.length} 行あります (合計 ${rows.reduce((a, r) => a + Math.max(0, r.remaining), 0)} 個)。このまま完了すると、残りは「今回は納品しない」として記録されます` };
+    }
+    const now = utcNow();
+    const voided = [];
+    for (const b of openBoxes) {
+      d.prepare(`UPDATE fbx_boxes SET status = 'void', voided_at = ?, voided_by = ?, void_reason = ? WHERE id = ?`)
+        .run(now, worker?.display_name || null, '作業完了時に未使用', b.id);
+      logEvent({ runId: run.id, action: 'box_void', targetType: 'box', targetId: b.id, workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+        payload: { boxNo: b.box_no, boxCode: b.box_code, reason: '作業完了時に未使用', auto: true } }, d);
+      voided.push(b.box_code);
+    }
+    const upShort = d.prepare(`INSERT INTO fbx_row_work (row_id, shortage_qty, shortage_reason, shortage_by, updated_at) VALUES (?, ?, 'not_shipped', ?, ?)
+      ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty, shortage_reason = excluded.shortage_reason, shortage_by = excluded.shortage_by, updated_at = excluded.updated_at`);
+    let notShipped = 0;
+    for (const r of rows) {
+      if (r.remaining <= 0) continue;   // 超過は addPlacement / 添付で防いでいる。念のため触らない
+      upShort.run(r.id, r.shortage + r.remaining, worker?.display_name || null, now);
+      logEvent({ runId: run.id, action: 'row_shortage', targetType: 'row', targetId: r.id, workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+        payload: { shortageQty: r.shortage + r.remaining, reason: 'not_shipped', auto: true, remaining: r.remaining } }, d);
+      notShipped++;
+    }
+    if (notShipped > 0 || voided.length > 0) bumpRunVersion(d, run.id);
+    d.prepare(`UPDATE fbx_runs SET status = 'done', done_at = ? WHERE id = ?`).run(now, run.id);
+    logEvent({ runId: run.id, action: 'run_done', targetType: 'run', targetId: run.id, workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+      payload: { via: 'finish', notShippedRows: notShipped, voidedBoxes: voided } }, d);
+    return { ok: true, notShipped, voidedBoxes: voided };
+  }).immediate();
+}
+
+// ───────────────────────── 商品画像キャッシュ (images.js から使う) ─────────────────────────
+
+/** 納品回の行のうち画像が未取得 (または none/error で retryAfterMs 以上前) の FNSKU */
+export function listRowsNeedingImages(runId, { retryAfterMs = 24 * 3600 * 1000, limit = 80 } = {}) {
+  const cutoff = new Date(Date.now() - retryAfterMs).toISOString();
+  return getDB().prepare(`SELECT w.fnsku, MAX(w.asin) AS asin, MAX(w.seller_sku) AS seller_sku FROM fbx_rows w
+      LEFT JOIN fbx_product_images i ON i.fnsku = w.fnsku
+      WHERE w.run_id = ? AND w.fnsku != '' AND w.match_state != 'retired'
+        AND (i.fnsku IS NULL OR (i.status != 'ok' AND i.fetched_at <= ?))
+      GROUP BY w.fnsku LIMIT ?`).all(Number(runId), cutoff, Number(limit));
+}
+
+export function upsertProductImage({ fnsku, asin, url, status }) {
+  const st = ['ok', 'none', 'error'].includes(status) ? status : (url ? 'ok' : 'none');
+  getDB().prepare(`INSERT INTO fbx_product_images (fnsku, asin, image_url, status, fetched_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(fnsku) DO UPDATE SET asin = COALESCE(excluded.asin, fbx_product_images.asin), image_url = excluded.image_url, status = excluded.status, fetched_at = excluded.fetched_at`)
+    .run(String(fnsku).trim().toUpperCase(), asin || null, url || null, st, utcNow());
+}
+
 export function listRuns(limit = 30) {
   return getDB().prepare(`SELECT r.*,
       (SELECT COUNT(*) FROM fbx_rows w WHERE w.run_id = r.id) AS row_count,
@@ -739,9 +825,10 @@ export function getRunState(runId) {
   const groups = d.prepare('SELECT * FROM fbx_pack_groups WHERE run_id = ? ORDER BY id').all(run.id);
   const rows = d.prepare(`SELECT w.*,
       COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
-      rw.label_worker, rw.check_worker, rw.shortage_qty, rw.shortage_reason
+      rw.label_worker, rw.check_worker, rw.shortage_qty, rw.shortage_reason,
+      (SELECT i.image_url FROM fbx_product_images i WHERE i.fnsku = w.fnsku AND i.status = 'ok') AS image_url
     FROM fbx_rows w LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
-    WHERE w.run_id = ? ORDER BY w.pack_group_id, w.excel_row`).all(run.id);
+    WHERE w.run_id = ? ORDER BY w.pack_group_id, w.excel_row, w.picking_row_no, w.id`).all(run.id);
   const boxes = d.prepare(`SELECT b.*,
       COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.box_id = b.id AND p.revoked_at IS NULL), 0) AS total_qty,
       (SELECT COUNT(DISTINCT p.row_id) FROM fbx_placements p WHERE p.box_id = b.id AND p.revoked_at IS NULL) AS sku_count
@@ -782,7 +869,8 @@ function assignAmazonBoxNumbers(groups, boxes) {
 
 // ───────────────────────── 箱 ─────────────────────────
 
-const boxCodeOf = (groupName, boxNo) => `${groupName}-B${boxNo}`;
+// 箱コード = グループ名-連番 (例: 通常-1)。Amazon 側の「P1 - B1」の B (=Box) は現場に意味が無いので付けない (中原さん 9/3)
+const boxCodeOf = (groupName, boxNo) => `${groupName}-${boxNo}`;
 
 export function createBox({ packGroupId, materialCode, worker, deviceLabel }) {
   const d = getDB();
@@ -1096,8 +1184,55 @@ export function setRowWorkers({ rowId, labelWorker, checkWorker, worker, deviceL
 }
 
 /** 不足確定 (職員のみ。router 側で PIN 確認済みの前提)。shortageQty = 足りなかった個数 */
+/**
+ * 不足 (= 送る数の修正) の理由。stock_short = 棚の在庫が予定より少ない / not_shipped = 今回は FBA に納品しない
+ * (破損・自社出荷の引当など。作業完了時の自動確定にも使う)
+ */
+export const SHORTAGE_REASONS = ['missing', 'damaged', 'bad_label', 'wrong_item', 'expiry_issue', 'hq_order', 'stock_short', 'not_shipped', 'other'];
+export const SHORTAGE_REASON_JA = { missing: '現物がない', damaged: '破損', bad_label: 'ラベル不良', wrong_item: '商品違い', expiry_issue: '期限が合わない',
+  hq_order: '本社指示', stock_short: '在庫が少ない', not_shipped: '今回は納品しない', other: 'その他' };
+
+/**
+ * 送る数の修正 (職員)。「予定 30 だが棚に 25 しかない」→ 送る数 25 = 不足 5 (理由 stock_short) として記録する
+ * (中原さん 9/3)。修正前 (予定) → 修正後 (送る数) は fbx_row_work の shortage で復元でき、本社画面に出す。
+ * 送る数 = 予定 に戻せば不足は消える。投入済みより少なくはできない
+ */
+export function setRowSendQty({ rowId, sendQty, reason = 'stock_short', worker, deviceLabel }) {
+  const q = Number(sendQty);
+  if (!Number.isInteger(q) || q < 0) return { ok: false, error: 'bad_qty', message: '送る数は 0 以上の整数で入力してください' };
+  const reasonKey = String(reason || 'stock_short');
+  if (!SHORTAGE_REASONS.includes(reasonKey)) return { ok: false, error: 'bad_reason', message: '理由を選んでください' };
+  const d = getDB();
+  return d.transaction(() => {
+    const row = d.prepare(`SELECT w.*, r.status AS run_status,
+        COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
+        COALESCE((SELECT rw.shortage_qty FROM fbx_row_work rw WHERE rw.row_id = w.id), 0) AS shortage
+      FROM fbx_rows w JOIN fbx_runs r ON r.id = w.run_id WHERE w.id = ?`).get(Number(rowId));
+    if (!row) return { ok: false, error: 'not_found', message: '商品行が見つかりません' };
+    if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    const excluded = rowExcludedError(row);
+    if (excluded) return excluded;
+    if (q > row.planned_qty) return { ok: false, error: 'bad_qty', message: `送る数は予定 (${row.planned_qty}) を超えられません (増やすときは本社が STA のプランを直してください)` };
+    if (q < row.placed) return { ok: false, error: 'bad_qty', message: `既に ${row.placed} 個入っています。送る数を ${row.placed} より少なくするには先に記録を取り消してください` };
+    const before = row.planned_qty - row.shortage;
+    const shortage = row.planned_qty - q;
+    if (shortage === 0) {
+      d.prepare('UPDATE fbx_row_work SET shortage_qty = NULL, shortage_reason = NULL, shortage_by = NULL, updated_at = ? WHERE row_id = ?').run(utcNow(), row.id);
+    } else {
+      d.prepare(`INSERT INTO fbx_row_work (row_id, shortage_qty, shortage_reason, shortage_by, updated_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty, shortage_reason = excluded.shortage_reason, shortage_by = excluded.shortage_by, updated_at = excluded.updated_at`)
+        .run(row.id, shortage, reasonKey, worker?.display_name || null, utcNow());
+    }
+    bumpRunVersion(d, row.run_id);
+    logEvent({ runId: row.run_id, action: 'row_send_qty', targetType: 'row', targetId: row.id,
+      workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+      payload: { planned: row.planned_qty, from: before, to: q, shortage, reason: shortage ? reasonKey : null } }, d);
+    return { ok: true, planned: row.planned_qty, sendQty: q, shortage, from: before };
+  }).immediate();
+}
+
 export function setRowShortage({ rowId, shortageQty, reason, worker, deviceLabel }) {
-  const REASONS = ['missing', 'damaged', 'bad_label', 'wrong_item', 'expiry_issue', 'hq_order', 'other'];
+  const REASONS = SHORTAGE_REASONS;
   const reasonKey = String(reason || '');
   if (!REASONS.includes(reasonKey)) return { ok: false, error: 'bad_reason', message: '不足の理由を選んでください' };
   const d = getDB();
@@ -1412,7 +1547,8 @@ export function exportReadiness(runId) {
   const { run, groups, rows, boxes, placements, exportState } = st;
   const blockers = [], warnings = [];
   const boxBrief = (b) => ({ id: b.id, code: b.box_code, boxNo: b.box_no, amazonBoxNo: b.amazon_box_no, amazonName: b.amazon_name, qty: b.total_qty, status: b.status });
-  const rowBrief = (r) => ({ id: r.id, fnsku: r.fnsku, sku: r.seller_sku, name: r.product_name, planned: r.planned_qty, placed: r.placed, shortage: r.shortage_qty || 0 });
+  const rowBrief = (r) => ({ id: r.id, fnsku: r.fnsku, sku: r.seller_sku, name: r.product_name, planNo: r.plan_no, planned: r.planned_qty, placed: r.placed,
+    shortage: r.shortage_qty || 0, sendQty: r.planned_qty - (r.shortage_qty || 0), reason: r.shortage_reason || null, reasonJa: r.shortage_reason ? (SHORTAGE_REASON_JA[r.shortage_reason] || r.shortage_reason) : null });
 
   if (run.status !== 'active' && run.status !== 'done') {
     blockers.push({ code: 'run_status', message: `納品回が「${run.status}」のため出力できません` });
@@ -1448,7 +1584,7 @@ export function exportReadiness(runId) {
   const unchecked = rows.filter((r) => !r.check_worker);
   if (unchecked.length > 0) warnings.push({ code: 'unchecked_rows', message: `確認担当が未記録の商品が ${unchecked.length} 行あります`, rows: unchecked.map(rowBrief) });
   const shortages = rows.filter((r) => r.shortage_qty > 0);
-  if (shortages.length > 0) warnings.push({ code: 'shortage_rows', message: `不足確定の商品が ${shortages.length} 行あります (Excel の数量は投入数のみ。STA 側の予定数量との差は Amazon 側で調整)`, rows: shortages.map((r) => ({ ...rowBrief(r), reason: r.shortage_reason })) });
+  if (shortages.length > 0) warnings.push({ code: 'shortage_rows', message: `送る数を予定から修正した商品が ${shortages.length} 行あります (修正前 → 修正後と理由を確認。Excel の数量は入れた分だけ。STA 側の予定数量との差は Amazon 側で調整)`, rows: shortages.map(rowBrief) });
   const matchWarn = rows.filter((r) => ['qty_mismatch', 'excel_only', 'picking_only'].includes(r.match_state));
   if (matchWarn.length > 0) warnings.push({ code: 'match_warnings', message: `Excel との突合で注意のあった商品が ${matchWarn.length} 行あります (qty_mismatch=数量差 / excel_only=Excel にだけある / picking_only=Excel に無い)`, rows: matchWarn.map((r) => ({ ...rowBrief(r), matchState: r.match_state })) });
   const gaps = live.filter((b) => b.amazon_box_no !== b.box_no);

@@ -21,15 +21,19 @@ import {
   checkEnrollRate, recordEnrollAttempt,
   listWorkers, getWorker, addWorker, setWorkerActive, setWorkerPin, verifyWorkerPin, isRosterBootstrap,
   listEvents, safeLogEvent, listMaterials, upsertMaterial,
-  createRun, activateRun, setRunStatus, listRuns, getRun, getRunState,
+  createRun, activateRun, setRunStatus, listRuns, getRun, getRunState, finishRun,
   createRunFromPicking, getRunBySource, attachExcelToRun,
   createBox, closeBox, reopenBox, voidBox, listBoxContents,
   addPlacement, revokePlacement, setPlacementLayer,
-  setRowWorkers, setRowShortage, clearRowShortage,
+  setRowWorkers, setRowShortage, clearRowShortage, setRowSendQty,
   exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
 } from './db.js';
 import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
+import { ensureRunImages } from './images.js';
+
+/** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
+const kickImages = (runId) => { ensureRunImages(runId).catch((e) => console.warn('[fba-box] images', e.message)); };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -77,6 +81,7 @@ async function createFromPicking(sourceRunId, createdBy, { fromDevice = false } 
   try { planSheets = JSON.parse(pickingRun.result || '{}').planSheets || []; }
   catch { return { status: 422, body: { ok: false, error: 'bad_picking_data', message: 'ピッキング実行のデータを解釈できませんでした' } }; }
   const r = createRunFromPicking({ pickingRun, planSheets, createdBy, activate: true });
+  if (r.ok) kickImages(r.runId);
   return { status: r.ok ? 200 : 400, body: r };
 }
 
@@ -284,6 +289,7 @@ router.get('/api/state', api((req, res) => {
   if (!Number.isInteger(runId) || runId <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: 'run が必要です' });
   const state = getRunState(runId);
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
+  if (state.run.status === 'active' && state.rows.some((r) => !r.image_url)) kickImages(runId);
   res.json({
     ok: true, ...state,
     workers: listWorkers(),
@@ -291,6 +297,20 @@ router.get('/api/state', api((req, res) => {
     serverNow: new Date().toISOString(),
     me: { session: req.fbxUser || null, device: req.fbxDevice ? { id: req.fbxDevice.id, label: req.fbxDevice.label } : null, admin: isAdmin(req) },
   });
+}));
+
+/**
+ * 作業を終える (職員PIN or セッション)。未投入が残っていれば acknowledge なしでは 409 incomplete (アラート用の一覧)、
+ * acknowledge:true で残りを「今回は納品しない」として完了 (中原さん 9/3)
+ */
+router.post('/api/runs/:id(\\d+)/finish', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const gate = requireStaff(req, w.worker);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const r = finishRun({ runId: Number(req.params.id), acknowledge: req.body?.acknowledge === true, worker: w.worker, deviceLabel: deviceLabelOf(req) });
+  if (!r.ok) return res.status({ not_found: 404, incomplete: 409, open_boxes: 409, bad_status: 409 }[r.error] || 400).json(r);
+  res.json(r);
 }));
 
 /** 出荷前チェック (iPad の「まとめ」表示用。読み取りのみ) */
@@ -488,6 +508,17 @@ router.post('/api/rows/:id(\\d+)/workers', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
+/** 送る数の修正 (職員のみ): 棚の在庫が予定より少ないとき等。予定→送る数 と理由を記録 */
+router.post('/api/rows/:id(\\d+)/send-qty', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const gate = requireStaff(req, w.worker);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const r = setRowSendQty({ rowId: Number(req.params.id), sendQty: req.body?.send_qty, reason: req.body?.reason || 'stock_short', worker: w.worker, deviceLabel: deviceLabelOf(req) });
+  if (!r.ok) return res.status({ not_found: 404, run_not_active: 409, row_excluded: 409 }[r.error] || 400).json(r);
+  res.json(r);
+}));
+
 /** 不足確定 (職員のみ) / 解除 */
 router.post('/api/rows/:id(\\d+)/shortage', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
@@ -612,6 +643,13 @@ router.post('/admin/runs', requireSession, upload.single('excel'), checkOrigin, 
 router.post('/admin/runs/:id(\\d+)/activate', requireSession, checkOrigin, api((req, res) => {
   const r = activateRun(Number(req.params.id), `session:${req.session.email}`);
   if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 409).json(r);
+  res.json(r);
+}));
+
+/** 本社の「完了にする」の上書き版: 残りを「今回は納品しない」として完了 (acknowledge 必須) */
+router.post('/admin/runs/:id(\\d+)/finish', requireSession, checkOrigin, api((req, res) => {
+  const r = finishRun({ runId: Number(req.params.id), acknowledge: req.body?.acknowledge === true, worker: null, deviceLabel: `session:${req.session.email}` });
+  if (!r.ok) return res.status({ not_found: 404, incomplete: 409, open_boxes: 409, bad_status: 409 }[r.error] || 400).json(r);
   res.json(r);
 }));
 

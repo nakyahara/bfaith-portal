@@ -248,6 +248,34 @@ await t('端末から POST /api/runs/from-picking → active な納品回。二�
   const st = await call('GET', `/api/state?run=${pkRunId}`);
   assert.equal(st.j.run.status, 'active'); assert.equal(st.j.groups[0].display_name, '通常'); assert.equal(st.j.rows.length, 2);
 });
+await t('作業を終える: 利用者は 403 / 職員PIN + 未投入あり → 409 incomplete (一覧) / acknowledge で done', async () => {
+  const st = await call('GET', `/api/state?run=${pkRunId}`);
+  const gid = st.j.groups[0].id;
+  const bx = (await call('POST', '/api/boxes', { body: { pack_group_id: gid, material_code: 'box140', worker_id: memberId } })).j;
+  const row = st.j.rows[0];
+  assert.equal((await call('POST', '/api/placements', { body: { run_id: pkRunId, row_id: row.id, box_id: bx.boxId, qty: 1, worker_id: memberId, request_id: 'fin-1' } })).j.ok, true);
+  assert.equal((await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: memberId } })).status, 403);
+  // 送る数の修正は職員のみ
+  assert.equal((await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: memberId, send_qty: 2 } })).status, 403);
+  const sq = await call('POST', `/api/rows/${row.id}/send-qty`, { body: { worker_id: staffId, pin: '2468', send_qty: 2, reason: 'stock_short' } });
+  assert.equal(sq.j.ok, true, JSON.stringify(sq.j)); assert.equal(sq.j.shortage, row.planned_qty - 2);
+  const open = await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468' } });
+  assert.equal(open.status, 409); assert.equal(open.j.error, 'open_boxes');
+  assert.equal((await call('POST', `/api/boxes/${bx.boxId}/close`, { body: { worker_id: memberId, measured_kg: 1.2 } })).j.ok, true);
+  const inc = await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468' } });
+  assert.equal(inc.status, 409); assert.equal(inc.j.error, 'incomplete'); assert.equal(inc.j.rows.length, 2);
+  assert.equal(db.getRun(pkRunId).status, 'active');
+  const done = await call('POST', `/api/runs/${pkRunId}/finish`, { body: { worker_id: staffId, pin: '2468', acknowledge: true } });
+  assert.equal(done.j.ok, true, JSON.stringify(done.j));
+  assert.equal(done.j.notShipped, 2);
+  assert.equal(db.getRun(pkRunId).status, 'done');
+});
+// 以降の添付テストは active な回で行う (done の回にも添付はできるが、作業中の回で確認する)
+{
+  const r = await call('POST', '/admin/runs/from-picking', { body: { source_run_id: 502 }, session: 'user', device: false });
+  assert.equal(r.j.already, true);
+  pkRunId = r.j.runId;
+}
 await t('本社: POST /admin/runs/:id/excel (multipart) で Excel を添付 → 突合結果、readiness の no_excel が消える', async () => {
   const before = await call('GET', `/admin/runs/${pkRunId}/readiness`, { session: 'user', device: false });
   assert.ok(before.j.readiness.blockers.some((b) => b.code === 'no_excel'));
