@@ -159,6 +159,16 @@ await t('端末: 箱を作って割当 (worker 必須・request_id 冪等)', asy
   const again = await call('POST', '/api/placements', { body: { run_id: runId, row_id: rows[0].id, box_id: box1.boxId, qty: rows[0].planned_qty, worker_id: memberId, request_id: 'rq0' } });
   assert.equal(again.j.already, true);
 });
+await t('数を直す: POST /api/placements/:id/adjust (自端末の直近は利用者でも可)。直した後に元の数で入れ直せる', async () => {
+  const st = await call('GET', `/api/state?run=${runId}`);
+  const p = st.j.placements.find((x) => x.row_id === rows[0].id);
+  const adj = await call('POST', `/api/placements/${p.id}/adjust`, { body: { worker_id: memberId, qty: p.qty - 1, request_id: 'adj-r1' } });
+  assert.equal(adj.j.ok, true, JSON.stringify(adj.j));
+  assert.equal(adj.j.to, p.qty - 1);
+  const back = await call('POST', `/api/placements/${adj.j.placementId}/adjust`, { body: { worker_id: memberId, qty: p.qty, request_id: 'adj-r2' } });
+  assert.equal(back.j.ok, true, JSON.stringify(back.j));
+  assert.equal((await call('GET', `/api/state?run=${runId}`)).j.rows.find((r) => r.id === rows[0].id).placed, rows[0].planned_qty);
+});
 await t('箱の取消: 利用者は 403 / 職員PIN + 中身ありは 409 / 空箱は ok / 取消箱は state に void で残る', async () => {
   const r1 = await call('POST', `/api/boxes/${box2.boxId}/void`, { body: { worker_id: memberId, reason: 'x' } });
   assert.equal(r1.status, 403);

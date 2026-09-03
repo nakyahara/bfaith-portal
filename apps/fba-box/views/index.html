@@ -242,7 +242,7 @@
     return i < 0 ? { label: s || '—', no: '' } : { label: s.slice(0, i), no: s.slice(i + 1) };
   }
   function thumbHtml(row, big) {
-    return `<div class="thumb ${big ? 'big' : ''}">${row.image_url ? `<img src="${esc(row.image_url)}" loading="lazy" alt="">` : '📦'}</div>`;
+    return `<div class="thumb ${big ? 'big' : ''}">${row.image_url ? `<img src="${esc(row.image_url)}" loading="lazy" referrerpolicy="no-referrer" alt="">` : '📦'}</div>`;
   }
 
   // ─── 納品回一覧 ───
@@ -544,6 +544,9 @@
     const cur = boxes.find(b => b.id === curBoxId);
     const knownExpiry = expiryOf(r.id);
     const excluded = r.match_state === 'picking_only';   // 添付した Excel (納品プラン) に無い → 入れない
+    const mine = (S.placements || []).filter(p => p.row_id === r.id).sort((a, b) => b.id - a.id);   // この商品の記録 (新しい順)
+    const boxCodeOf = (id) => (S.boxes.find(b => b.id === id) || {}).box_code || '?';
+    const boxClosed = (id) => (S.boxes.find(b => b.id === id) || {}).status === 'closed';
     speakRow(r);
     const pp = planParts(r.plan_no);
     const dlg = openDialog(`
@@ -586,6 +589,15 @@
             </div>`}
         <div style="margin-top:16px"><button class="bigbtn" id="d-add" ${cur ? '' : 'disabled'}>この箱に入れた</button></div>
       ` : (excluded ? '' : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>`)}
+      ${mine.length > 0 ? `
+        <div class="lbl">📝 この商品の記録 (間違えたら「数を直す」)</div>
+        <div style="background:#F8F9FA; border-radius:10px; padding:6px 10px">
+          ${mine.map(p => `<div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #E9ECEF">
+            <span><b>${esc(boxCodeOf(p.box_id))}</b> に <b style="font-size:1.2em">${p.qty}</b>個 <small style="color:#868E96">${esc(String(p.created_at || '').slice(11, 16))} ${esc(p.worker_name || '')}${boxClosed(p.box_id) ? ' / 箱は閉じ済み' : ''}</small></span>
+            <span style="white-space:nowrap"><button class="selbtn adj" data-id="${p.id}" data-qty="${p.qty}" style="padding:6px 10px">数を直す</button>
+              <button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px">取消</button></span>
+          </div>`).join('')}
+        </div>` : ''}
       <div class="lbl">👤 担当者の記録</div>
       <div class="grid2">
         <button class="selbtn" id="d-lw">ラベル貼り: ${esc(r.label_worker || '—')}</button>
@@ -619,6 +631,25 @@
     dlg.querySelector('#d-cw').addEventListener('click', () => pickRowWorker(r, 'check_worker'));
     dlg.querySelector('#d-short').addEventListener('click', () => shortageDialog(r));
     dlg.querySelector('#d-sendqty').addEventListener('click', () => sendQtyDialog(r));
+    // 記録の修正・取消 (利用者 = 自分の端末の直近 10 分・開いた箱。それ以外は職員PIN に自動で切り替え)
+    dlg.querySelectorAll('.adj').forEach(btn => btn.addEventListener('click', () => adjustDialog(r, Number(btn.dataset.id), Number(btn.dataset.qty))));
+    dlg.querySelectorAll('.rvk').forEach(btn => btn.addEventListener('click', async () => {
+      if (!worker) { pickWorker(); return; }
+      if (!confirm('この記録を取り消しますか?')) return;
+      const j2 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: worker.id });
+      if (!j2.ok && j2.error === 'staff_required') {
+        staffPinPrompt(async (sw, pin) => {
+          const reason = prompt('取消の理由');
+          if (!reason) return;
+          const j3 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: sw.id, pin, reason, as_staff: true });
+          if (!j3.ok) alert(j3.message);
+          await refresh(true); openRowDialog(rowId);
+        });
+        return;
+      }
+      if (!j2.ok) alert(j2.message);
+      await refresh(true); openRowDialog(rowId);
+    }));
     dlg.querySelector('#d-add')?.addEventListener('click', async () => {
       const msg = dlg.querySelector('#d-msg');
       if (!worker) { msg.className = 'msg err'; msg.textContent = '先に作業者を選んでください'; pickWorker(); return; }
@@ -913,6 +944,42 @@
     }));
   }
 
+  // ─── 記録の数を直す (間違えて押したとき): 取消 + 入れ直しを 1 回で ───
+  function adjustDialog(row, placementId, currentQty) {
+    if (!worker) { pickWorker(); return; }
+    const dlg = openDialog(`
+      <h2>✏ 数を直す</h2>
+      <div class="pname">${esc(shortName(row.product_name))} — いまの記録 <b style="font-size:1.3em">${currentQty}</b>個</div>
+      <div class="lbl">正しい個数 (0 = この記録を取り消す)</div>
+      <input class="qtyin" id="a-qty" type="tel" inputmode="numeric" value="${currentQty}">
+      <div style="margin-top:14px"><button class="bigbtn" id="a-go">この数に直す</button></div>
+      <div class="msg" id="a-msg"></div>`);
+    const send = async (extra) => {
+      const qty = Number(dlg.querySelector('#a-qty').value);
+      const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+      return apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId, ...extra });
+    };
+    dlg.querySelector('#a-go').addEventListener('click', async () => {
+      const msg = dlg.querySelector('#a-msg');
+      const qty = Number(dlg.querySelector('#a-qty').value);
+      if (!Number.isInteger(qty) || qty < 0) { msg.className = 'msg err'; msg.textContent = '0 以上の整数で入れてください'; return; }
+      let j = await send({});
+      if (!j.ok && j.error === 'staff_required') {
+        // 時間が経った・他の端末・閉じた箱 → 職員PIN
+        staffPinPrompt(async (sw, pin) => {
+          const j2 = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: sw.id, pin, as_staff: true, reason: '数の修正', qty,
+            request_id: (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2)) });
+          if (!j2.ok) alert(j2.message || '直せませんでした');
+          await refresh(true); openRowDialog(row.id);
+        });
+        return;
+      }
+      if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message || '直せませんでした'; return; }
+      closeDialog();
+      await refresh(true); openRowDialog(row.id);
+    });
+  }
+
   // ─── 送る数の修正 (職員): 棚の在庫が予定より少ないとき等。予定 → 送る数 と理由を記録 ───
   function sendQtyDialog(row) {
     staffPinPrompt(async (staffWorker, pin) => {
@@ -929,16 +996,13 @@
         <input class="qtyin" id="q-qty" type="tel" inputmode="numeric" value="${current}">
         <div class="lbl">理由</div>
         <div class="grid3">
-          <button class="selbtn qrsn on" data-v="stock_short">在庫が少ない</button>
-          <button class="selbtn qrsn" data-v="damaged">破損</button>
-          <button class="selbtn qrsn" data-v="not_shipped">今回は納品しない</button>
-          <button class="selbtn qrsn" data-v="hq_order">本社指示</button>
-          <button class="selbtn qrsn" data-v="other">その他</button>
+          ${[['stock_short', '在庫が少ない'], ['damaged', '破損'], ['not_shipped', '今回は納品しない'], ['hq_order', '本社指示'], ['other', 'その他']]
+            .map(([v, ja]) => `<button class="selbtn qrsn ${(row.shortage_reason || 'stock_short') === v ? 'on' : ''}" data-v="${v}">${ja}</button>`).join('')}
         </div>
         <div class="msg" style="color:#868E96">予定に戻すときは送る数に予定の数 (${row.planned_qty}) を入れてください。本社の画面には「予定 → 送る数」と理由が出ます</div>
         <div style="margin-top:14px"><button class="bigbtn" id="q-go">この数で送る</button></div>
         <div class="msg" id="q-msg"></div>`);
-      let reason = 'stock_short';
+      let reason = ['stock_short', 'damaged', 'not_shipped', 'hq_order', 'other'].includes(row.shortage_reason) ? row.shortage_reason : 'stock_short';
       dlg.querySelectorAll('.qrsn').forEach(b => b.addEventListener('click', () => {
         dlg.querySelectorAll('.qrsn').forEach(x => x.classList.remove('on'));
         b.classList.add('on'); reason = b.dataset.v;
@@ -947,7 +1011,8 @@
         const msg = dlg.querySelector('#q-msg');
         const j = await apiPost(`/api/rows/${row.id}/send-qty`, { worker_id: staffWorker.id, pin, send_qty: Number(dlg.querySelector('#q-qty').value), reason });
         if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message; return; }
-        closeDialog();
+        dialogOpen = false; $('#ovl-root').innerHTML = '';
+        await refresh(true); openRowDialog(row.id);   // 商品の画面に戻る (一覧に落とさない)
       });
     });
   }

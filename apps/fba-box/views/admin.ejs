@@ -234,6 +234,11 @@
     const $ = s => document.querySelector(s);
     const REASON_JA = { missing: '現物がない', damaged: '破損', bad_label: 'ラベル不良', wrong_item: '商品違い', expiry_issue: '期限が合わない',
       hq_order: '本社指示', stock_short: '在庫が少ない', not_shipped: '今回は納品しない', other: 'その他' };
+    // 不足の理由 (内訳があれば「破損 2 + 今回は納品しない 3」)
+    const shortageJa = (x) => {
+      try { const d = JSON.parse(x.shortage_detail || 'null'); if (Array.isArray(d)) return d.map(y => `${REASON_JA[y.reason] || y.reason} ${y.qty}`).join(' + '); } catch { /* noop */ }
+      return REASON_JA[x.shortage_reason] || x.shortage_reason || '';
+    };
     async function post(url, body) {
       const r = await fetch(BASE + url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
       return r.json().catch(() => ({ ok: false, message: 'HTTP ' + r.status }));
@@ -338,7 +343,7 @@
           <table class="fbx-list"><tr><th>行</th><th>プランNo</th><th>FNSKU</th><th>商品</th><th>予定</th><th>送る数 (修正)</th><th>入力済</th><th>担当</th></tr>` +
             rows.map(x => `<tr><td>${x.excel_row ?? ''}</td><td>${esc(x.plan_no || '')}</td><td><code>${esc(x.fnsku)}</code></td>
               <td>${esc((x.product_name || '').slice(0, 40))}${x.match_state === 'picking_only' ? ' <span class="ng">(Excelに無い)</span>' : ''}</td><td>${x.planned_qty}</td>
-              <td>${x.shortage_qty ? `<b class="ng">${x.planned_qty} → ${x.planned_qty - x.shortage_qty}</b> <small>(${esc(REASON_JA[x.shortage_reason] || x.shortage_reason || '')}${x.shortage_by ? ' / ' + esc(x.shortage_by) : ''})</small>` : '—'}</td>
+              <td>${x.shortage_qty ? `<b class="ng">${x.planned_qty} → ${x.planned_qty - x.shortage_qty}</b> <small>(${esc(shortageJa(x))}${x.shortage_by ? ' / ' + esc(x.shortage_by) : ''})</small>` : '—'}</td>
               <td>${x.placed}</td>
               <td>${esc(x.label_worker || '')}${x.check_worker ? ' / ✅' + esc(x.check_worker) : ''}</td></tr>`).join('') +
           `</table>

@@ -24,7 +24,7 @@ import {
   createRun, activateRun, setRunStatus, listRuns, getRun, getRunState, finishRun,
   createRunFromPicking, getRunBySource, attachExcelToRun,
   createBox, closeBox, reopenBox, voidBox, listBoxContents,
-  addPlacement, revokePlacement, setPlacementLayer,
+  addPlacement, revokePlacement, adjustPlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage, setRowSendQty,
   exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
 } from './db.js';
@@ -403,6 +403,27 @@ router.post('/api/placements/:id(\\d+)/revoke', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
+/** 割当の数の修正 (取消 + 入れ直しを 1 回で)。権限は取消と同じ (利用者 = 自端末の直近 / 職員 = as_staff+PIN+理由) */
+router.post('/api/placements/:id(\\d+)/adjust', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  let byStaff = false;
+  if (req.body?.as_staff) {
+    const gate = requireStaff(req, w.worker);
+    if (!gate.ok) return res.status(gate.status).json(gate.body);
+    byStaff = true;
+  }
+  const r = adjustPlacement({
+    placementId: Number(req.params.id), qty: req.body?.qty, byStaff, reason: req.body?.reason,
+    worker: w.worker, deviceKey: deviceKeyOf(req), deviceLabel: deviceLabelOf(req), requestId: req.body?.request_id ? String(req.body.request_id) : null,
+  });
+  if (!r.ok) {
+    const st = { staff_required: 403, not_found: 404, revoked: 409, run_not_active: 409, over_qty: 409, box_closed: 409, box_void: 409, row_excluded: 409, reason_required: 400 }[r.error] || 400;
+    return res.status(st).json(r);
+  }
+  res.json(r);
+}));
+
 /** 配置 (下/中/上) の後付け・付け替え。閉じた箱は職員 (as_staff+PIN) のみ */
 router.post('/api/placements/:id(\\d+)/layer', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
@@ -653,8 +674,11 @@ router.post('/admin/runs/:id(\\d+)/finish', requireSession, checkOrigin, api((re
   res.json(r);
 }));
 
+/** 状態変更 (本社)。done は /finish に一本化 (監査・不足確定を迂回させない — Codex R13 #7)。ここは取消専用 */
 router.post('/admin/runs/:id(\\d+)/status', requireSession, checkOrigin, api((req, res) => {
-  const r = setRunStatus(Number(req.params.id), String(req.body?.status || ''), `session:${req.session.email}`);
+  const status = String(req.body?.status || '');
+  if (status !== 'cancelled') return res.status(400).json({ ok: false, error: 'bad_request', message: '完了は「完了にする」(finish) から行ってください。ここでは取消のみです' });
+  const r = setRunStatus(Number(req.params.id), status, `session:${req.session.email}`);
   if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 409).json(r);
   res.json(r);
 }));

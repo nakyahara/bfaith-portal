@@ -36,6 +36,20 @@ let attrsSource = async () => {
 };
 export function _setAttrsSource(fn) { attrsSource = fn; }
 
+/**
+ * 画像 URL の検証: https かつ Amazon の画像ホストだけを通す (Codex R13 #5: 任意ホストの画像を iPad に読ませない)。
+ * 通らなければ null (= 画像なし扱い)
+ */
+export function sanitizeImageUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  let u;
+  try { u = new URL(url); } catch { return null; }
+  if (u.protocol !== 'https:') return null;
+  const host = u.hostname.toLowerCase();
+  const ok = host === 'm.media-amazon.com' || host.endsWith('.media-amazon.com') || host.endsWith('.ssl-images-amazon.com') || host.endsWith('.images-amazon.com');
+  return ok ? u.toString() : null;
+}
+
 /** ASIN → MAIN 画像 URL (null = 画像なし)。テストで差し替え可 */
 let fetcher = async (asin) => {
   const res = await fetch(`${WAREHOUSE_URL}/service-api/research/product/${encodeURIComponent(asin)}`, {
@@ -79,7 +93,7 @@ export async function ensureRunImages(runId, { force = false } = {}) {
       const asin = r.asin || attrs.get('fnsku:' + norm(r.fnsku))?.asin || (r.seller_sku ? attrs.get('sku:' + norm(r.seller_sku))?.asin : null) || null;
       if (!asin) { upsertProductImage({ fnsku: r.fnsku, asin: null, url: null, status: 'none' }); none++; continue; }
       try {
-        const url = await fetcher(asin);
+        const url = sanitizeImageUrl(await fetcher(asin));
         upsertProductImage({ fnsku: r.fnsku, asin, url, status: url ? 'ok' : 'none' });
         if (url) fetched++; else none++;
       } catch (e) {
