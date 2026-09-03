@@ -17,6 +17,61 @@ import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 
 const utcNow = () => new Date().toISOString();
+
+// 作業のやり方の選択肢 (資材セット・保管箱) の DDL。作成と作り直し (下) で同じ定義を使う
+const workOptionsDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind            TEXT NOT NULL CHECK (kind IN ('material','container')),
+      code            TEXT NOT NULL,
+      normalized_code TEXT NOT NULL,
+      image_url       TEXT,
+      sort_order      INTEGER NOT NULL DEFAULT 0,
+      active          INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+      created_at      TEXT NOT NULL,
+      created_by      TEXT,
+      UNIQUE(kind, normalized_code)
+    );`;
+
+/**
+ * f_iroha_work_options の作り直し: normalized_code が無い古い版 (UNIQUE(kind, code)) が残っていたら、
+ * 同じ正規化規則で行を統合して新しい定義に入れ替える (CREATE IF NOT EXISTS は列を増やさない — Codex 選択肢 R2 #1)。
+ * 統合規則: 表記は半角のものを優先 / 1つでも有効なら有効 / 画像は最初に見つかったもの / sort_order は最小 (=使用回数最大) /
+ * created_at は最古。冪等 (2回目は何もしない)
+ */
+function migrateWorkOptionsSchema(db) {
+  const cols = db.prepare('PRAGMA table_info(f_iroha_work_options)').all().map((c) => c.name);
+  if (cols.length === 0 || cols.includes('normalized_code')) return false;
+  const rows = db.prepare('SELECT * FROM f_iroha_work_options ORDER BY id').all();
+  const merged = new Map();
+  for (const r of rows) {
+    const code = String(r.code || '').replace(/\s+/g, ' ').trim();
+    const norm = normalizeOptionCode(code);
+    if (!norm) continue;
+    const key = `${r.kind}|${norm}`;
+    const m = merged.get(key);
+    if (!m) {
+      merged.set(key, { kind: r.kind, code, norm, canonical: code.normalize('NFKC') === code, image_url: r.image_url || null,
+        sort_order: r.sort_order ?? 0, active: r.active ? 1 : 0, created_at: r.created_at || utcNow(), created_by: r.created_by || null });
+      continue;
+    }
+    if (!m.canonical && code.normalize('NFKC') === code) { m.code = code; m.canonical = true; }
+    m.image_url = m.image_url || r.image_url || null;
+    m.sort_order = Math.min(m.sort_order, r.sort_order ?? 0);
+    m.active = m.active || (r.active ? 1 : 0);
+    if (r.created_at && r.created_at < m.created_at) m.created_at = r.created_at;
+  }
+  db.transaction(() => {
+    db.exec(workOptionsDDL('f_iroha_work_options__new'));
+    const ins = db.prepare(`INSERT INTO f_iroha_work_options__new (kind, code, normalized_code, image_url, sort_order, active, created_at, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+    for (const m of merged.values()) ins.run(m.kind, m.code, m.norm, m.image_url, m.sort_order, m.active, m.created_at, m.created_by);
+    db.exec('DROP TABLE f_iroha_work_options');
+    db.exec('ALTER TABLE f_iroha_work_options__new RENAME TO f_iroha_work_options');
+  })();
+  console.log(`[iroha-work] f_iroha_work_options を normalized_code 付きに作り直しました (${rows.length}行 → ${merged.size}行)`);
+  return true;
+}
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 const enrollHash = (c) => crypto.createHash('sha256').update('iroha-enroll:' + String(c)).digest('hex');
 
@@ -62,19 +117,9 @@ export function createTables(db = getMirrorDB()) {
     -- 作業のやり方の選択肢 (資材セット・保管箱)。中原さん 2026-09-03: 編集はテキスト入力でなく、
     -- Excel (作業仕様マスタ) にある値を初期値の選択肢にしてタップで選ぶ。初見のものはその場で追加 (職員PIN)。
     -- 画像は後から付ける (image_url)。code = 表示名 兼 f_iroha_work_master に入る値そのもの
-    -- normalized_code = 比較用 (NFKC・空白統一・大文字化)。表記揺れ (D-8 / d-8 / Ｄ－８) を別候補にしない (Codex R1 #3)
-    CREATE TABLE IF NOT EXISTS f_iroha_work_options (
-      id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      kind            TEXT NOT NULL CHECK (kind IN ('material','container')),
-      code            TEXT NOT NULL,
-      normalized_code TEXT NOT NULL,
-      image_url       TEXT,
-      sort_order      INTEGER NOT NULL DEFAULT 0,
-      active          INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
-      created_at      TEXT NOT NULL,
-      created_by      TEXT,
-      UNIQUE(kind, normalized_code)
-    );
+    -- normalized_code = 比較用 (NFKC・空白統一・大文字化)。表記揺れ (D-8 / d-8 / Ｄ－８) を別候補にしない (Codex R1 #3)。
+    -- 古い版 (normalized_code 無し) からの作り直しは migrateWorkOptionsSchema (下)
+    ${workOptionsDDL('f_iroha_work_options')}
 
     -- いろは名簿 (利用者/職員)。⭐staff.db とは別 (冒頭コメント参照)。
     -- pin_hash/pin_salt = 職員PIN (棚入完了の変更などの職員限定操作の本人確認。Codex PR1 #1:
@@ -219,6 +264,8 @@ export function createTables(db = getMirrorDB()) {
   // Drive 側で消えた写真の印 (配信で 404/410 を見たら付け、表示と「前回の完成形」候補から外す。
   // 管理画面の再実行で解除 — Codex R1 #5)
   addCol('f_iroha_card_media', 'unavailable_at', 'TEXT');
+  // 選択肢テーブルが normalized_code 無しの古い版なら作り直す (列追加だけでは UNIQUE を差し替えられない)
+  migrateWorkOptionsSchema(db);
   // video_url は inbound-check 側でも足すが、いろは単独経路の起動でも保証する
   // (このアプリが先に f_iroha_work_master を SELECT すると no such column になるため)
   if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get()) {
@@ -743,11 +790,24 @@ export function setWorkOptionActive(id, active) {
  * https の許可ホストだけ。認証情報つきは不可
  */
 const IMAGE_HOST_ALLOW = ['drive.google.com', 'lh3.googleusercontent.com', 'bfaith-portal.onrender.com'];
+const PORTAL_ORIGIN = 'https://bfaith-portal.onrender.com';
+// ポータル内で画像として使えるのは、いろはアプリの配信エンドポイントそのものだけ (将来増えたらここに足す)
+const PORTAL_IMAGE_PATH = /^\/apps\/iroha-work\/api\/media\/\d+\/file$/;
 export function validateOptionImageUrl(raw) {
   const u = String(raw || '').trim();
   if (!u) return { ok: true, value: null };
   if (u.length > 500) return { ok: false, message: '画像リンクが長すぎます (500文字まで)' };
-  if (/^\/apps\/[A-Za-z0-9_\-./?=&%]+$/.test(u) && !u.includes('..')) return { ok: true, value: u };
+  if (u.startsWith('/')) {
+    // 固定 origin で解析し、正規化後のパスが配信エンドポイントそのものであることを確かめる
+    // (%2e%2e や混在エンコードで /apps/ の外へ出られない — Codex 選択肢 R2 #2)。percent-encoding 入りは丸ごと不可
+    const bad = { ok: false, message: 'ポータル内のリンクは /apps/iroha-work/api/media/<番号>/file だけ使えます' };
+    let url;
+    try { url = new URL(u, PORTAL_ORIGIN); } catch { return bad; }
+    let decoded;
+    try { decoded = decodeURIComponent(url.pathname); } catch { return bad; }
+    if (url.origin !== PORTAL_ORIGIN || url.pathname !== decoded || decoded.includes('..') || !PORTAL_IMAGE_PATH.test(decoded) || url.search || url.hash) return bad;
+    return { ok: true, value: decoded };
+  }
   let url;
   try { url = new URL(u); } catch { return { ok: false, message: '画像は https のリンクか、ポータル内 (/apps/…) のパスを入れてください' }; }
   if (url.protocol !== 'https:') return { ok: false, message: '画像は https のリンクだけ使えます' };

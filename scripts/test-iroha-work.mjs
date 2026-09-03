@@ -789,6 +789,41 @@ console.log('\n[16] 作業のやり方の選択肢 (資材・保管箱): Excel �
   ok(setWorkOptionImage(999999, 'https://drive.google.com/y.jpg').error === 'not_found', '無い id は not_found');
   const by = workOptionsByKind();
   ok(Array.isArray(by.material) && Array.isArray(by.container) && by.material.find(o => o.id === a.option.id).image_url === 'https://lh3.googleusercontent.com/d99.jpg', 'kind ごとの一覧に画像が載る');
+
+  // %2e%2e や混在エンコードで /apps/ の境界を抜けられない。ポータル内は配信エンドポイントそのものだけ (Codex R2 #2)
+  ok(!validateOptionImageUrl('/apps/%2e%2e/admin').ok && !validateOptionImageUrl('/apps/%2E%2E/admin').ok
+    && !validateOptionImageUrl('/apps/iroha-work/api/media/1/%2E%2E/../file').ok && !validateOptionImageUrl('/apps/iroha-work/api/media/%31/file').ok,
+    '%2e%2e・%2E%2E・混在・数字のエンコードは不可');
+  ok(!validateOptionImageUrl('/apps/iroha-work/admin').ok && !validateOptionImageUrl('/apps/other/api/media/1/file').ok
+    && !validateOptionImageUrl('/apps/iroha-work/api/media/12/file?x=1').ok && !validateOptionImageUrl('//evil.example.com/x.jpg').ok,
+    'ポータル内でも配信エンドポイント以外・クエリつき・// 始まりは不可');
+  ok(validateOptionImageUrl('/apps/iroha-work/api/media/12/file').value === '/apps/iroha-work/api/media/12/file', '配信エンドポイントは正規化済みの値で保存');
+
+  // 古い版 (normalized_code 無し・UNIQUE(kind, code)) のテーブルが残っていても、起動時に統合して作り直す (Codex R2 #1)
+  {
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    const db = getDB();
+    db.exec('DROP TABLE f_iroha_work_options');
+    db.exec(`CREATE TABLE f_iroha_work_options (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, code TEXT NOT NULL, image_url TEXT,
+      sort_order INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, created_by TEXT, UNIQUE(kind, code))`);
+    const insOld = db.prepare('INSERT INTO f_iroha_work_options (kind, code, image_url, sort_order, active, created_at) VALUES (?,?,?,?,?,?)');
+    insOld.run('material', 'ｄ－８', null, -1, 0, '2026-09-01T00:00:00.000Z');
+    insOld.run('material', 'D-8', 'https://drive.google.com/x.jpg', -3, 1, '2026-09-02T00:00:00.000Z');
+    insOld.run('container', '20Lコンテナ', null, 0, 1, '2026-09-02T00:00:00.000Z');
+    createTables(db);
+    ok(db.prepare('PRAGMA table_info(f_iroha_work_options)').all().some(c => c.name === 'normalized_code'), '古いテーブルは normalized_code 付きに作り直される');
+    const mat = db.prepare("SELECT * FROM f_iroha_work_options WHERE kind = 'material'").all();
+    ok(mat.length === 1 && mat[0].code === 'D-8' && mat[0].normalized_code === 'D-8' && mat[0].active === 1
+      && mat[0].image_url === 'https://drive.google.com/x.jpg' && mat[0].sort_order === -3 && mat[0].created_at === '2026-09-01T00:00:00.000Z',
+      `表記揺れの旧行は1つに統合 (半角表記・有効・画像・使用回数最大・最古の作成日時を採用) 実際 ${JSON.stringify(mat)}`);
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_options WHERE kind = 'container'").get().c === 1, '保管箱はそのまま');
+    let dupErr = null;
+    try { db.prepare("INSERT INTO f_iroha_work_options (kind, code, normalized_code, active, created_at) VALUES ('material','d-8','D-8',1,'x')").run(); } catch (e) { dupErr = e; }
+    ok(dupErr && /UNIQUE/.test(dupErr.message), '作り直し後は UNIQUE(kind, normalized_code) が効く');
+    createTables(db);
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_options").get().c === 2, '2回目の起動では何もしない (冪等)');
+    _resetSeedFingerprint();
+  }
 }
 
 console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動画リンク・スナップショット)');

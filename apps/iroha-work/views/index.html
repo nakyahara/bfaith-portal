@@ -907,23 +907,27 @@ const OPT_LABEL = { material: '資材', container: '保管箱' };
 const OPT_EXAMPLE = { material: 'D-8', container: '20Lコンテナ' };
 let optNewKind = null;   // 「＋新しく登録」の入力欄を開いている種類
 const OPT_SEARCH_FROM = 12;   // 候補がこれより多いときは「しぼる」入力を出す (チップだらけで誤タップしない — Codex R1 #8)
+// サーバー (normalizeOptionCode) と同じ比較キー: NFKC + 空白統一 + trim + 大文字
+const optKey = s => String(s == null ? '' : s).normalize('NFKC').replace(/\s+/g, ' ').trim().toUpperCase();
 const optFilter = { material: '', container: '' };
 function filterOpts(kind, v) { optFilter[kind] = v || ''; renderOpts(kind); }
 function renderOpts(kind) {
   const cur = document.getElementById(OPT_FIELD[kind]).value;
+  const curKey = optKey(cur);
   const all = (state.options && state.options[kind]) || [];
   const qEl = document.getElementById('optq' + kind.charAt(0).toUpperCase() + kind.slice(1));
   if (qEl) qEl.hidden = all.length <= OPT_SEARCH_FROM;
-  const q = (optFilter[kind] || '').trim().toLowerCase();
-  const list = q ? all.filter(o => o.code.toLowerCase().includes(q)) : all;
+  const q = optKey(optFilter[kind] || '');
+  const list = q ? all.filter(o => optKey(o.code).includes(q)) : all;
   let h = '<button type="button" class="opt none' + (cur ? '' : ' on') + '" data-code="" onclick="pickOptEl(this,\'' + kind + '\')">なし</button>';
-  // 今の値が候補に無い (管理者が外した・古いマスタ値) ときは「候補外」と分かる形で選択中に見せる (Codex R1 #7)
-  if (cur && !all.some(o => o.code === cur)) {
+  // 今の値が候補に無い (管理者が外した・古いマスタ値) ときは「候補外」と分かる形で選択中に見せる (Codex R1 #7)。
+  // 比較はサーバーと同じ正規化 (全角/大小文字の違いを候補外にしない — Codex R2 #3)
+  if (cur && !all.some(o => optKey(o.code) === curKey)) {
     h += '<button type="button" class="opt on legacy" data-code="' + esc(cur) + '" onclick="pickOptEl(this,\'' + kind + '\')">' + esc(cur) + ' <small>(候補外)</small></button>';
   }
   for (const o of list) {
     // 値は data-code に持たせ onclick には埋めない (人が入れた文字列を JS 文字列にしない)
-    h += '<button type="button" class="opt' + (o.code === cur ? ' on' : '') + '" data-code="' + esc(o.code) + '" onclick="pickOptEl(this,\'' + kind + '\')">' +
+    h += '<button type="button" class="opt' + (optKey(o.code) === curKey ? ' on' : '') + '" data-code="' + esc(o.code) + '" onclick="pickOptEl(this,\'' + kind + '\')">' +
       (o.image_url ? '<img src="' + esc(o.image_url) + '" alt="' + esc(o.code) + '" loading="lazy" onerror="this.remove()">' : '') + esc(o.code) + '</button>';
   }
   if (q && list.length === 0) h += '<span class="hint" style="align-self:center">「' + esc(q) + '」に合う候補はありません</span>';
