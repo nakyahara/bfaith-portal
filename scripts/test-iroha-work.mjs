@@ -2151,6 +2151,11 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/reg: 'units_per_container'/.test(html) && /reg: 'storage_container'/.test(html), '保管箱と入数は別々にタップできる');
   ok(/Zロケ在庫 \(一時保管\)/.test(html) && /Yロケ在庫 \(外に出している分\)/.test(html) && /時点/.test(html),
     '詳細に在庫と取得時刻を出す (拠点によって Z か Y)');
+  // 中断の理由は「〜で中断」。ラベル待ちならそのまま記録をつける (中原さん 2026-09-03)
+  ok(/r\.label \+ '\u3067\u4e2d\u65ad'/.test(html), '中断の理由は「ラベル待ちで中断」「資材不足で中断」と出す');
+  ok(/const order = \['label_shortage', 'materials_shortage'\]/.test(html), 'よく使う 2 つを先に出す');
+  ok(/holdReason === 'label_shortage'\) setTimeout\(\(\) => openLwNew\(c\)/.test(html), 'ラベル待ちで中断したら、そのままラベル待ちの記録を開く');
+  ok(/occurred_on: state\.today, qty: c\.qty, lot_expiry: c\.expiry/.test(html), '発生日・数量・ロット期限を入れた状態で開く (打つ手間を減らす)');
   ok(/外部に出す準備OK にする/.test(html) && /async function setExternalReady/.test(html), '詳細に「外部に出す準備OK」の切り替えがある');
   ok(/c\.external_ready \? '📦 外部に出せます'/.test(html) && /tag ready/.test(html), 'ボードと一覧に「外部に出せます」の印が出る');
 }

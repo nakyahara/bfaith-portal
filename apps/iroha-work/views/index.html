@@ -432,6 +432,7 @@
   <div class="overlay" id="lwOv">
     <div class="modal">
       <h3>🏷 ラベル待ちの記録</h3>
+      <p class="hint" style="margin:0 0 8px">分かっているものは入れてあります。ちがうところだけ直して保存してください。</p>
       <div class="mname" id="lwName">—</div>
       <div class="msaving" id="lwMsg"></div>
       <div class="mfields">
@@ -1080,12 +1081,15 @@ function openLw(id) {
   lwEditing = r;
   fillLw(r, (r.product_name || '') + ' (' + (r.product_code || '') + ')');
 }
-/** 詳細画面から新規登録 */
-function openLwNew() {
-  const c = findCard(curDetail);
+/**
+ * ラベル待ちの新規登録。iPad で打つ手間を減らすため、分かっているものは入れておく (中原さん 2026-09-03):
+ * 発生日 = 今日 / 数量 = カードの数 / ロット・期限 = カードの有効期限 / ロケーション = Z (一時保管) / 記録者 = 選んでいる人
+ */
+function openLwNew(card) {
+  const c = card || findCard(curDetail);
   if (!c) return;
   lwEditing = { task_id: c.id };
-  fillLw({ occurred_on: state.today, qty: c.qty, location: 'Z' }, c.title);
+  fillLw({ occurred_on: state.today, qty: c.qty, lot_expiry: c.expiry || '', location: 'Z' }, c.title);
 }
 /** 下見のあいだは保存させない。ダイアログを開いたまま正本が変わっても追随する (Codex 下見 R1) */
 function renderLwSaveState() {
@@ -1864,7 +1868,11 @@ function renderStBtns(c) {
     return;
   }
   if (stStep === 'on_hold') {
-    $('#stBtns').innerHTML = (state.holdReasons || []).map(r => stBtn('hold:' + r.value, r.label, false)).join('')
+    // よく使う 2 つ (ラベル待ち・資材不足) を先に。文言は「〜で中断」(中原さん 2026-09-03)
+    const order = ['label_shortage', 'materials_shortage'];
+    const rs = [...(state.holdReasons || [])].sort((a, b) =>
+      (order.indexOf(a.value) < 0 ? 9 : order.indexOf(a.value)) - (order.indexOf(b.value) < 0 ? 9 : order.indexOf(b.value)));
+    $('#stBtns').innerHTML = rs.map(r => stBtn('hold:' + r.value, r.label + 'で中断', false)).join('')
       + stBtn('back', '← もどる', false);
     return;
   }
@@ -1983,6 +1991,8 @@ async function doSetSt(choice) {
     applyTask(c, j.task);
     c.status = j.status;
     if (j.status_label) c.status_label = j.status_label;
+    // ラベル待ちで中断したら、そのまま記録をつける (発生日・数量・ロット期限・記録者は入れておく)
+    if (isApp() && holdReason === 'label_shortage') setTimeout(() => openLwNew(c), 0);
     renderTabs(); renderList();
     if (sameId(curDetail, c.id)) renderDetail(c);
     toast('「' + label + '」に変えました' + suffix);
