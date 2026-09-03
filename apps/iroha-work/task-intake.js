@@ -128,8 +128,18 @@ export function backfillTaskLinks() {
   return out;
 }
 
-/** 紐付け衝突 (task_link_conflict) の未解決件数 — 管理画面の要確認に出す */
-export function countLinkConflicts() {
+/**
+ * いま衝突している紐付け (DB から直接): 行き先台帳にはページがあるのにタスクに無く、そのページを別のタスクが持っている。
+ * 履歴 (task_link_conflict) は「起きた記録」、こちらは「今も解消していないもの」— 直せば 0 に戻る。管理画面の要確認に出す (Codex PR-B R2 #1)
+ */
+export function listLinkConflicts(limit = 50) {
   const db = getDB();
-  return db.prepare("SELECT COUNT(DISTINCT task_id) c FROM f_iroha_app_events WHERE action = 'task_link_conflict'").get().c;
+  if (!tableExists(db, 'f_inbound_check_destinations')) return [];
+  return db.prepare(`SELECT t.id AS task_id, t.destination_id, t.product_code, t.product_name, d.notion_page_id, o.id AS other_task_id, o.status AS other_status
+    FROM f_iroha_tasks t
+    JOIN f_inbound_check_destinations d ON d.id = t.destination_id
+    JOIN f_iroha_tasks o ON o.notion_page_id = d.notion_page_id AND o.id <> t.id
+    WHERE t.notion_page_id IS NULL AND d.notion_page_id IS NOT NULL
+    ORDER BY t.id LIMIT ?`).all(Number(limit) || 50);
 }
+export function countLinkConflicts() { return listLinkConflicts(1000).length; }

@@ -81,6 +81,13 @@
         </td></tr>
         <tr><th>要確認</th><td><%= migration.review %> 件 (取込時に状態を推定 / 取消の要確認)</td></tr>
         <tr><th>孤立 (task に紐づかない)</th><td>作業時間 <%= migration.orphans.sessions.length %> ページ / 写真 <%= migration.orphans.media.length %> ページ</td></tr>
+        <tr><th>紐付けの衝突</th><td>
+          <% if (!migration.linkConflicts || migration.linkConflicts.length === 0) { %>0 件<% } else { %>
+            <b class="ng"><%= migration.linkConflicts.length %> 件</b> — 入荷受付で確定したタスクと、Notion から取り込んだタスクが同じカードを指しています (2 枚に見える)。
+            取込側のタスクを終了 (取消) にするか、確定側を消してください:
+            <% migration.linkConflicts.forEach((c) => { %><br>task#<%= c.task_id %> <%= c.product_code %> (<%= c.product_name %>) ↔ 取込 task#<%= c.other_task_id %> [<%= c.other_status %>] page <%= String(c.notion_page_id).slice(0, 8) %>…<% }) %>
+          <% } %>
+        </td></tr>
         <tr><th>直近の調査</th><td><%= migration.lastPlanAt || '(未実行。サーバー再起動で消えます)' %></td></tr>
       </table>
       <% } else if (migration && migration.error) { %>

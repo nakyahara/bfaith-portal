@@ -1554,6 +1554,8 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     ok(audit && audit.from_value === 'app' && /^notion \(未完了 \d+ 件・Notion 未反映: 状態変更 \d+ 回\/更新タスク \d+\/作業時間 \d+\/写真 \d+ \(force\)\)$/.test(audit.to_value)
       && audit.device_label === 'session:admin@test.local', '監査ログに件数と force と誰がが残る');
     ok((await call('GET', '/api/state', { cookie })).json.mode === 'notion', '戻した後の一覧は Notion 正本');
+    const ms = await call('GET', '/admin/migration/status', { ...admin });
+    ok(ms.status === 200 && ms.json.ok && Array.isArray(ms.json.linkConflicts), '移行の状態 (管理画面の元データ) に紐付け衝突の一覧が載る');
   } finally {
     _setDriveUpload(null);
     delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;

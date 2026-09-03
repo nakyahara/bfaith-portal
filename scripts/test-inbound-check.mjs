@@ -518,6 +518,15 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   const t3c = taskOf(d3bId);
   ok(t3c.status === 'closed' && t3c.close_reason === 'cancelled' && t3c.cancellation_source === 'inbound_import', '消えた明細のタスクも取消');
   ok(destOf(destIdOf('AR9|2|1')).cancelled_at == null, '残った行 (B-Faith 行き) はそのまま');
+  // 既に取消済みの行き先が carry に残っていても「取消 N 件」に数えない (Codex PR-B R2 Low)
+  const b3 = getActiveBatch();
+  const f2b = finalizeLine({ batchId: b3.id, lineKey: 'AR9|1|1', expectVersion: lineState('AR9|1|1').version, expectQuantityVersion: lineState('AR9|1|1').quantity_version, result: 'shortage', mode: 'current', worker: '山田', decide: decideIroha });
+  ok(f2b.ok, '前提: 行 1 を確定 (7 予定 / 6 実数 = 不足)');
+  const dPre = destIdOf('AR9|1|1');
+  db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = ?, cancelled_by = 'manual', cancel_reason = 'reopen' WHERE id = ?").run(new Date().toISOString(), dPre);
+  const imp4 = importCsv(makeCsv([row('AR9', 2, 'TASK-B', 3)]), { fileName: 'prb4.csv', generatedAt: '2027-01-01T03:00:00Z' });
+  ok(imp4.ok && !/消えた明細/.test(db.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message), '既に取消済みなら「消えた明細の取消」に数えない');
+  ok(destOf(dPre).cancel_reason === 'reopen', '取消理由も上書きしない');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

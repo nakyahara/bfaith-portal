@@ -509,17 +509,25 @@ console.log('\n[PR-B] 確定時タスクとの紐付け / アプリ正本なら 
   ok(r3.ok && destRow(dId2).notion_page_id && TD.getTaskByDestination(dId2).notion_page_id === destRow(dId2).notion_page_id, 'Notion 正本に戻せば送る (紐付けも付く)');
 
   // (a) 台帳に記録した後・紐付けの前に落ちた状態 → 次の sweep の先頭で補修 (Codex PR-B R1 #2)
-  const { linkTaskToNotionPage, backfillTaskLinks, countLinkConflicts } = await import('../apps/iroha-work/task-intake.js');
+  const { linkTaskToNotionPage, backfillTaskLinks, countLinkConflicts, listLinkConflicts } = await import('../apps/iroha-work/task-intake.js');
   db.prepare('UPDATE f_iroha_tasks SET notion_page_id = NULL WHERE destination_id = ?').run(dId2);
   ok(TD.getTaskByDestination(dId2).notion_page_id == null, '前提: タスク側の紐付けだけ無い');
   const r4 = await runNotionSweep({ actor: 'manual', mode: 'full' });
   ok(r4.ok && r4.linked === 1 && TD.getTaskByDestination(dId2).notion_page_id === destRow(dId2).notion_page_id, '次の sweep が紐付けを補修する (linked=1)');
   // 同じページを別タスクが持っていたら黙らない (履歴に task_link_conflict)
   const dId3 = seedDest({ product: 'PROD-C', line: 'L3', qty: 7, actual: 7 });
-  createTaskForDestination(destRow(dId3));
-  const res = linkTaskToNotionPage(dId3, destRow(dId2).notion_page_id);
-  ok(res === 'conflict' && countLinkConflicts() === 1 && TD.getTaskByDestination(dId3).notion_page_id == null, '別タスクが持つページは conflict として履歴に残す (上書きしない)');
-  ok(backfillTaskLinks().conflicts === 0, '衝突は台帳側のページが無い限り再発しない');
+  const t3id = createTaskForDestination(destRow(dId3)).id;
+  const pageOf2 = destRow(dId2).notion_page_id;
+  db.prepare('UPDATE f_inbound_check_destinations SET notion_page_id = ? WHERE id = ?').run(pageOf2, dId3);   // 台帳が別タスクのページを指す状態
+  const res = linkTaskToNotionPage(dId3, pageOf2);
+  ok(res === 'conflict' && TD.getTaskByDestination(dId3).notion_page_id == null, '別タスクが持つページは conflict (上書きしない)');
+  ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_link_conflict' AND task_id = ?").get(t3id).c === 1, '履歴に task_link_conflict が残る');
+  const lc = listLinkConflicts();
+  ok(lc.length === 1 && lc[0].task_id === t3id && lc[0].other_task_id === TD.getTaskByDestination(dId2).id && lc[0].notion_page_id === pageOf2, 'いま衝突している紐付けを DB から一覧できる (どのタスクとどのタスクか)');
+  ok(notionStatusForAdmin().linkConflicts.length === 1 && notionStatusForAdmin().linkConflicts[0].task_id === t3id, '入荷受付の管理画面の状態に衝突が載る');
+  ok(backfillTaskLinks().conflicts === 1 && countLinkConflicts() === 1, '補修でも直らない (人が整理するまで残る)');
+  db.prepare('UPDATE f_inbound_check_destinations SET notion_page_id = NULL WHERE id = ?').run(dId3);   // 整理した (台帳側を戻す)
+  ok(countLinkConflicts() === 0 && notionStatusForAdmin().linkConflicts.length === 0, '解消すれば 0 に戻る (履歴は残る)');
 
   // (b) sweep の途中で正本がアプリに切り替わったら、それ以降のカードは作らない (Codex PR-B R1 #3)
   const dId4 = seedDest({ product: 'PROD-A', line: 'L1', qty: 10, actual: 10 });

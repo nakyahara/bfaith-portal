@@ -43,6 +43,7 @@ import {
 } from './tasks-db.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
+import { listLinkConflicts } from './task-intake.js';
 import {
   addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
   recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
@@ -956,7 +957,7 @@ let lastPlan = null;   // { planId, at, by, since, cutoff, truncated, rows, summ
 const PLAN_MAX_AGE_MS = 30 * 60 * 1000;
 function migrationStatus() {
   try {
-    return { counts: countTasksByStatus(), review: listTasksNeedingReview().length, orphans: listOrphans(20), files: listMigrationFiles(),
+    return { counts: countTasksByStatus(), review: listTasksNeedingReview().length, orphans: listOrphans(20), linkConflicts: listLinkConflicts(20), files: listMigrationFiles(),
       lastPlanAt: lastPlan ? lastPlan.at : null, lastPlanBy: lastPlan ? lastPlan.by : null, lastPlanSummary: lastPlan ? lastPlan.summary : null };
   } catch (e) {
     const ref = Date.now().toString(36);
