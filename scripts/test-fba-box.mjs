@@ -276,6 +276,22 @@ t('box_seq は取消後も再利用しない', () => {
 });
 
 // 箱クローズ
+t('closeBox: 読み合わせ中に中身が変わっていたら閉じさせない (box_changed)', () => {
+  const v0 = db.getBox(box1.boxId).content_version;
+  const p = db.addPlacement({ runId, rowId: rowA.id, boxId: box1.boxId, qty: 1, worker: member, deviceKey: 'dev:1', requestId: 'cv1' });
+  assert.equal(p.ok, true);
+  const v1 = db.getBox(box1.boxId).content_version;
+  assert.equal(v1, v0 + 1, '割当で版が上がる');
+  const stale = db.closeBox({ boxId: box1.boxId, measuredKg: 5, worker: staff, expectedContentVersion: v0 });
+  assert.equal(stale.error, 'box_changed');
+  assert.equal(stale.contentVersion, v1);
+  db.revokePlacement({ placementId: p.placementId, worker: member, deviceKey: 'dev:1' });
+  assert.equal(db.getBox(box1.boxId).content_version, v1 + 1, '取消でも版が上がる');
+  // 版を合わせれば閉じられる
+  const v2 = db.getBox(box1.boxId).content_version;
+  assert.equal(db.closeBox({ boxId: box1.boxId, measuredKg: 5, worker: staff, expectedContentVersion: v2 }).ok, true);
+  db.reopenBox({ boxId: box1.boxId, reason: 'テスト戻し', worker: staff });
+});
 t('closeBox: 実測kg必須・不正値拒否', () => {
   assert.equal(db.closeBox({ boxId: box1.boxId, measuredKg: 0, worker: staff }).error, 'bad_weight');
   assert.equal(db.closeBox({ boxId: box1.boxId, measuredKg: 'x', worker: staff }).error, 'bad_weight');

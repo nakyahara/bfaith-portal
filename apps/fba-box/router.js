@@ -23,7 +23,7 @@ import {
   listEvents, safeLogEvent, listMaterials, upsertMaterial,
   createRun, activateRun, setRunStatus, listRuns, getRun, getRunState, finishRun,
   createRunFromPicking, getRunBySource, attachExcelToRun,
-  createBox, closeBox, reopenBox, voidBox, listBoxContents,
+  createBox, closeBox, reopenBox, voidBox, listBoxContents, getBox,
   addPlacement, revokePlacement, adjustPlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage, setRowSendQty,
   exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
@@ -452,9 +452,11 @@ router.post('/api/boxes', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
-/** 箱の中身 (読み合わせ用) */
+/** 箱の中身 (読み合わせ用)。contentVersion = 閉じるときに送り返す版 (途中で変わったら閉じさせない) */
 router.get('/api/boxes/:id(\\d+)', api((req, res) => {
-  res.json({ ok: true, contents: listBoxContents(Number(req.params.id)) });
+  const box = getBox(Number(req.params.id));
+  if (!box) return res.status(404).json({ ok: false, error: 'not_found', message: '箱が見つかりません' });
+  res.json({ ok: true, contents: listBoxContents(box.id), box: { id: box.id, status: box.status, contentVersion: box.content_version } });
 }));
 
 /** 箱クローズ (読み合わせ後・実測kg必須) */
@@ -465,9 +467,10 @@ router.post('/api/boxes/:id(\\d+)/close', checkOrigin, api((req, res) => {
     boxId: Number(req.params.id), measuredKg: req.body?.measured_kg,
     closedReason: req.body?.closed_reason, cushionLevel: req.body?.cushion_level,
     worker: w.worker, deviceLabel: deviceLabelOf(req),
+    expectedContentVersion: req.body?.content_version ?? null,
   });
   if (!r.ok) {
-    const st = { not_found: 404, already_closed: 409, run_not_active: 409, empty_box: 409 }[r.error] || 400;
+    const st = { not_found: 404, already_closed: 409, run_not_active: 409, empty_box: 409, box_changed: 409, box_void: 409 }[r.error] || 400;
     return res.status(st).json(r);
   }
   res.json(r);

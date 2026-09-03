@@ -785,6 +785,7 @@
     if (!b) return;
     const j = await apiGet(`/api/boxes/${boxId}`);
     const contents = j.ok ? j.contents : [];
+    const contentVersion = j.ok ? (j.box?.contentVersion ?? null) : null;   // 読み合わせを始めた時点の版
     const layJa = { bottom: '下', middle: '中', top: '上' };
     const dlg = openDialog(`
       <h2>📦 ${esc(b.box_code)} ${b.status === 'closed' ? '(閉じた箱)' : ''}
@@ -809,7 +810,7 @@
         <button class="bigbtn sub" id="b-reopen">職員: 箱を開け直す</button>`}
       <div class="msg" id="b-msg"></div>`);
     dlg.querySelector('#b-use')?.addEventListener('click', () => { setCurBox(b.id); closeDialog(); });
-    dlg.querySelector('#b-close2')?.addEventListener('click', () => closeBoxDialog(b, contents));
+    dlg.querySelector('#b-close2')?.addEventListener('click', () => closeBoxDialog(b, contents, contentVersion));
     dlg.querySelector('#b-void')?.addEventListener('click', () => staffPinPrompt(async (staffWorker, pin) => {
       const reason = prompt('取消の理由 (例: 箱が余った)');
       if (!reason) return;
@@ -836,7 +837,7 @@
   }
 
   /** 箱クローズ = 読み合わせ → 実測重量 → 理由・緩衝材 (要件 D6 / 結果シグナル) */
-  function closeBoxDialog(b, contents) {
+  function closeBoxDialog(b, contents, contentVersion) {
     const dlg = openDialog(`
       <h2>✅ ${esc(b.box_code)} を閉じます — 読み合わせ</h2>
       <div style="margin:10px 0; max-height:30vh; overflow-y:auto; background:#F8F9FA; border-radius:10px; padding:10px">
@@ -876,8 +877,17 @@
       if (!Number.isFinite(kg) || kg <= 0) { msg.className = 'msg err'; msg.textContent = 'はかりの重さ (kg) を入れてください'; return; }
       const j = await apiPost(`/api/boxes/${b.id}/close`, {
         worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
+        content_version: contentVersion,
       });
-      if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message; return; }
+      if (!j.ok) {
+        if (j.error === 'box_changed') {   // 他の iPad で中身が直された → 読み合わせからやり直す
+          closeDialog();
+          alert(j.message);
+          openBoxDialog(b.id);
+          return;
+        }
+        msg.className = 'msg err'; msg.textContent = j.message; return;
+      }
       if (curBoxId === b.id) { curBoxId = null; LS.set('curbox_' + curRunId, null); }
       closeDialog();
     });

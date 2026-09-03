@@ -73,6 +73,7 @@ const BOXES_DDL = (name) => `
       closed_reason TEXT,
       cushion_level TEXT CHECK (cushion_level IS NULL OR cushion_level IN ('none','little','much')),
       reopen_count  INTEGER NOT NULL DEFAULT 0,
+      content_version INTEGER NOT NULL DEFAULT 0,
       voided_at     TEXT,
       voided_by     TEXT,
       void_reason   TEXT,
@@ -169,6 +170,7 @@ function migrateBoxesVoid(d) {
       SELECT id, pack_group_id, box_no, box_code, material_code, status, measured_weight_kg,
         closed_at, closed_by, closed_reason, cushion_level, reopen_count, created_by, created_at FROM fbx_boxes`,
     'void 対応スキーマ');
+  // 再構築後に PR2.6 以降の列を足し直す (rebuildTable は BOXES_DDL の形で作るので content_version は含まれる)
 }
 
 /** PR2.5: Excel 後付け — fbx_pack_groups / fbx_rows の NOT NULL・CHECK を緩める。冪等 */
@@ -398,6 +400,8 @@ export function createTables(d = getDB()) {
   // 不足の内訳 (理由別 [{reason, qty}])。作業完了時の自動確定で既存の不足 (例: 破損 2) と混ざるときに理由を失わない (Codex R13 #2)
   addColumn('fbx_row_work', 'shortage_detail', 'TEXT');
   addColumn('fbx_product_images', 'error_message', 'TEXT');   // 画像が出ない理由 (管理画面の診断)
+  // 箱の中身が変わるたびに +1。読み合わせ画面が持っている版と違えばクローズを拒否する (Codex R18 #1)
+  addColumn('fbx_boxes', 'content_version', 'INTEGER NOT NULL DEFAULT 0');
   d.exec(`UPDATE fbx_exports SET sta_uploaded_at = (SELECT r.sta_uploaded_at FROM fbx_runs r WHERE r.sta_export_id = fbx_exports.id)
     WHERE sta_uploaded_at IS NULL AND EXISTS (SELECT 1 FROM fbx_runs r WHERE r.sta_export_id = fbx_exports.id AND r.sta_uploaded_at IS NOT NULL)`);
 
@@ -955,7 +959,7 @@ export function createBox({ packGroupId, materialCode, worker, deviceLabel }) {
 }
 
 /** 箱クローズ。実測重量kg必須 (Amazon Excel の箱重量欄になる)。読み合わせは画面側の責務 */
-export function closeBox({ boxId, measuredKg, closedReason, cushionLevel, worker, deviceLabel }) {
+export function closeBox({ boxId, measuredKg, closedReason, cushionLevel, worker, deviceLabel, expectedContentVersion = null }) {
   // 桁は 1g (小数3桁) まで。Excel へはこの値をそのまま書く (書き込み側で丸めない — Codex PR2 #5)
   const kg = Math.round(Number(measuredKg) * 1000) / 1000;
   if (!Number.isFinite(kg) || kg <= 0 || kg > 200) {
@@ -975,6 +979,11 @@ export function closeBox({ boxId, measuredKg, closedReason, cushionLevel, worker
     if (b.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
     if (b.status === 'closed') return { ok: false, error: 'already_closed', message: 'この箱は既に閉じられています' };
     if (b.status === 'void') return { ok: false, error: 'box_void', message: 'この箱は取消済みです' };
+    // 読み合わせを始めてから中身が変わっていたら閉じさせない (Codex R18 #1: 古い重量で閉じる事故を防ぐ)
+    if (expectedContentVersion != null && Number(expectedContentVersion) !== b.content_version) {
+      return { ok: false, error: 'box_changed', contentVersion: b.content_version,
+        message: 'この箱の中身が変わりました (他の iPad で直された可能性)。もう一度読み合わせてから閉じてください' };
+    }
     const qty = d.prepare('SELECT COALESCE(SUM(qty),0) q FROM fbx_placements WHERE box_id = ? AND revoked_at IS NULL').get(b.id).q;
     if (qty === 0) return { ok: false, error: 'empty_box', message: '空の箱は閉じられません (使わない箱は職員が「箱を取消」してください)' };
     d.prepare(`UPDATE fbx_boxes SET status = 'closed', measured_weight_kg = ?, closed_at = ?, closed_by = ?, closed_reason = ?, cushion_level = ? WHERE id = ?`)
@@ -1042,6 +1051,11 @@ export function listBoxContents(boxId) {
   return getDB().prepare(`SELECT p.*, w.seller_sku, w.fnsku, w.product_name, w.plan_no
     FROM fbx_placements p JOIN fbx_rows w ON w.id = p.row_id
     WHERE p.box_id = ? AND p.revoked_at IS NULL ORDER BY p.box_seq`).all(Number(boxId));
+}
+
+/** 箱の現在値 (読み合わせ画面が content_version を持つため) */
+export function getBox(boxId) {
+  return getDB().prepare('SELECT * FROM fbx_boxes WHERE id = ?').get(Number(boxId)) || null;
 }
 
 // ───────────────────────── 割当 (物理投入) ─────────────────────────
@@ -1125,6 +1139,7 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
       .run(row.run_id, row.id, box.id, q, exp, seq, lay, lay ? 'manual' : null,
         worker?.id ?? null, worker?.display_name ?? null, String(deviceKey), String(requestId), requestHash, utcNow());
     const placementId = Number(info.lastInsertRowid);
+    d.prepare('UPDATE fbx_boxes SET content_version = content_version + 1 WHERE id = ?').run(box.id);
     bumpRunVersion(d, row.run_id);
     logEvent({ runId: row.run_id, action: 'placement_add', targetType: 'placement', targetId: placementId,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
@@ -1177,6 +1192,7 @@ export function revokePlacement({ placementId, byStaff = false, reason, worker, 
     }
     d.prepare('UPDATE fbx_placements SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ?')
       .run(utcNow(), worker?.display_name || null, reason ? String(reason).slice(0, 200) : null, p.id);
+    d.prepare('UPDATE fbx_boxes SET content_version = content_version + 1 WHERE id = ?').run(p.box_id);
     bumpRunVersion(d, p.run_id);
     // 監査: 誰が (worker) どの端末から (deviceLabel) 誰の記録を (originDevice) 取り消したか (Codex R17 #3)
     logEvent({ runId: p.run_id, action: 'placement_revoke', targetType: 'placement', targetId: p.id,
@@ -1225,7 +1241,8 @@ export function adjustPlacement({ placementId, qty, byStaff = false, reason, wor
       logEvent({ runId: p.run_id, action: 'placement_adjust', targetType: 'placement', targetId: add.placementId,
         workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
         payload: { from: p.qty, to: q, revokedId: p.id, boxId: p.box_id, byStaff, boxReopened,
-          originWorker: p.worker_name || null, originDeviceKey: p.device_key, actorDeviceKey: String(deviceKey ?? '') } }, d);
+          originWorker: p.worker_name || null, originDeviceKey: p.device_key, actorDeviceKey: String(deviceKey ?? ''),
+          otherDevice: p.device_key !== String(deviceKey ?? '') } }, d);
       return { ok: true, placementId: add.placementId, revokedId: p.id, placed: add.placed, from: p.qty, to: q, boxReopened };
     }).immediate();
   } catch (e) {

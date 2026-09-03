@@ -141,8 +141,9 @@ export async function ensureRunImages(runId, { force = false } = {}) {
       }
       await new Promise((resolve) => setTimeout(resolve, INTERVAL_MS));
     }
-    // 1 回の上限 (listRowsNeedingImages の limit) を超えた分は残る → 呼び出し側に伝える (Codex R17 #4)
-    const remaining = listRowsNeedingImages(id, opts).length;
+    // 1 回の上限 (listRowsNeedingImages の limit) を超えて未取得の分だけを残件として数える。
+    // 今回 none/error にしたものは通常の再試行待ち (24h) に入るので数えない (Codex R18 #2)
+    const remaining = listRowsNeedingImages(id).length;
     return remember({ fetched, failed, none, noAsin, total: rows.length, remaining, attrsCount: index.count, attrsError: index.error, errors });
   } catch (e) {
     console.error('[fba-box] ensureRunImages', e);
