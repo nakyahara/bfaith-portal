@@ -507,6 +507,42 @@ console.log('\n[PR-B] 確定時タスクとの紐付け / アプリ正本なら 
   IW.setMetaValue('source_of_truth', null);
   const r3 = await runNotionSweep({ actor: 'manual', mode: 'full' });
   ok(r3.ok && destRow(dId2).notion_page_id && TD.getTaskByDestination(dId2).notion_page_id === destRow(dId2).notion_page_id, 'Notion 正本に戻せば送る (紐付けも付く)');
+
+  // (a) 台帳に記録した後・紐付けの前に落ちた状態 → 次の sweep の先頭で補修 (Codex PR-B R1 #2)
+  const { linkTaskToNotionPage, backfillTaskLinks, countLinkConflicts } = await import('../apps/iroha-work/task-intake.js');
+  db.prepare('UPDATE f_iroha_tasks SET notion_page_id = NULL WHERE destination_id = ?').run(dId2);
+  ok(TD.getTaskByDestination(dId2).notion_page_id == null, '前提: タスク側の紐付けだけ無い');
+  const r4 = await runNotionSweep({ actor: 'manual', mode: 'full' });
+  ok(r4.ok && r4.linked === 1 && TD.getTaskByDestination(dId2).notion_page_id === destRow(dId2).notion_page_id, '次の sweep が紐付けを補修する (linked=1)');
+  // 同じページを別タスクが持っていたら黙らない (履歴に task_link_conflict)
+  const dId3 = seedDest({ product: 'PROD-C', line: 'L3', qty: 7, actual: 7 });
+  createTaskForDestination(destRow(dId3));
+  const res = linkTaskToNotionPage(dId3, destRow(dId2).notion_page_id);
+  ok(res === 'conflict' && countLinkConflicts() === 1 && TD.getTaskByDestination(dId3).notion_page_id == null, '別タスクが持つページは conflict として履歴に残す (上書きしない)');
+  ok(backfillTaskLinks().conflicts === 0, '衝突は台帳側のページが無い限り再発しない');
+
+  // (b) sweep の途中で正本がアプリに切り替わったら、それ以降のカードは作らない (Codex PR-B R1 #3)
+  const dId4 = seedDest({ product: 'PROD-A', line: 'L1', qty: 10, actual: 10 });
+  createTaskForDestination(destRow(dId4));
+  createTaskForDestination(destRow(dId3));
+  const unsentBefore = collectUnsent(db).map(x => x.id);
+  ok(unsentBefore.includes(dId3) && unsentBefore.includes(dId4), '前提: 未送信 2 件');
+  const createdBefore = mock.created.length;
+  const orig2 = global.fetch;
+  global.fetch = async (url, opts = {}) => {
+    const resp = await orig2(url, opts);
+    if (String(url).endsWith('/pages') && (opts.method || 'GET') === 'POST') IW.setMetaValue('source_of_truth', 'app');   // 1 枚目を作った直後に切替
+    return resp;
+  };
+  let r5;
+  try { r5 = await runNotionSweep({ actor: 'manual', mode: 'full' }); } finally { global.fetch = orig2; IW.setMetaValue('source_of_truth', null); }
+  ok(r5.ok && r5.skipped === 'app_mode' && r5.aborted === true, '途中で切り替わったら打ち切り (ok・aborted)');
+  ok(mock.created.length === createdBefore + 1, 'カードは 1 枚だけ作られた (2 枚目は作らない)');
+  const sentOne = [dId3, dId4].filter(id => destRow(id).notion_page_id);
+  ok(sentOne.length === 1 && TD.getTaskByDestination(sentOne[0]).notion_page_id === destRow(sentOne[0]).notion_page_id, '作った 1 枚は台帳とタスクに記録済み');
+  ok(collectUnsent(db).length === 1 && destRow(collectUnsent(db)[0].id).notion_error == null, '残り 1 件は未送信のまま (エラー扱いにしない)');
+  const { notionSweepRunning } = await import('../apps/inbound-check/notion-sync.js');
+  ok(notionSweepRunning() === false, '終わったら実行中フラグは下りる');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

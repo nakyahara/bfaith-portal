@@ -99,7 +99,37 @@ export function linkTaskToNotionPage(destinationId, pageId) {
     return db.prepare('UPDATE f_iroha_tasks SET notion_page_id = ? WHERE destination_id = ? AND notion_page_id IS NULL')
       .run(String(pageId), Number(destinationId)).changes;
   } catch (e) {
-    if (/UNIQUE constraint failed: f_iroha_tasks\.notion_page_id/.test(e.message)) return 0;   // 取込で別タスクが持っている
-    throw e;
+    if (!/UNIQUE constraint failed: f_iroha_tasks\.notion_page_id/.test(e.message)) throw e;
+    // 同じページが別のタスク (取込で作られた方) に付いている = 移行の整合が崩れている。黙って 0 にせず履歴に残して人に見せる (Codex PR-B R1 #2)
+    const t = getTaskByDestination(destinationId);
+    const other = db.prepare('SELECT id FROM f_iroha_tasks WHERE notion_page_id = ?').get(String(pageId));
+    console.error(`[iroha-work] Notion ページ ${pageId} を dest#${destinationId} のタスク#${t?.id} に紐付けられません (タスク#${other?.id} が同じページを持っています)`);
+    if (t) safeLogTaskEvent({ taskId: t.id, action: 'task_link_conflict', to: String(pageId), ok: false, error: `同じ Notion ページをタスク#${other?.id} が持っています (移行の整合を確認)` });
+    return 'conflict';
   }
+}
+
+/**
+ * 行き先台帳には notion_page_id があるのにタスクに無い行を埋める (カード作成→紐付けの間で落ちた分の修復。sweep の先頭で呼ぶ — Codex PR-B R1 #2)。
+ * @returns {{linked:number, conflicts:number}}
+ */
+export function backfillTaskLinks() {
+  const db = getDB();
+  if (!tableExists(db, 'f_inbound_check_destinations')) return { linked: 0, conflicts: 0 };
+  const rows = db.prepare(`SELECT t.destination_id, d.notion_page_id
+    FROM f_iroha_tasks t JOIN f_inbound_check_destinations d ON d.id = t.destination_id
+    WHERE t.notion_page_id IS NULL AND d.notion_page_id IS NOT NULL`).all();
+  const out = { linked: 0, conflicts: 0 };
+  for (const r of rows) {
+    const res = linkTaskToNotionPage(r.destination_id, r.notion_page_id);
+    if (res === 1) out.linked++;
+    else if (res === 'conflict') out.conflicts++;
+  }
+  return out;
+}
+
+/** 紐付け衝突 (task_link_conflict) の未解決件数 — 管理画面の要確認に出す */
+export function countLinkConflicts() {
+  const db = getDB();
+  return db.prepare("SELECT COUNT(DISTINCT task_id) c FROM f_iroha_app_events WHERE action = 'task_link_conflict'").get().c;
 }

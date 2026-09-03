@@ -37,7 +37,7 @@ import {
 import { recordPing } from '../jobs-monitor/store.js';
 import { normSupplierCode } from '../purchase-orders/db.js';
 import { sourceOfTruth } from '../iroha-work/db.js';
-import { linkTaskToNotionPage } from '../iroha-work/task-intake.js';
+import { linkTaskToNotionPage, backfillTaskLinks } from '../iroha-work/task-intake.js';
 
 export const JOB_ID = 'inbound-check-notion-cards';
 const CANCELLED_STATUS = '取消';
@@ -396,6 +396,8 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
     const summary = { sent: 0, recovered: 0, raced: 0, cancelled: 0, errors: 0, skipped: 0, blocked: 0 };
     // 行を処理するたびに lease を延長する。失っていたら (期限切れで別実行が始まった) 即中断 — R2 #2
     const guard = () => {
+      // 正本が途中でアプリに切り替わったら、それ以降の Notion 書き込みはしない (切替の境界を厳密に — Codex PR-B R1 #3)
+      assertNotionSource();
       if (!touchLease(db, holder)) {
         const e = new Error('lease を失いました (別の実行に引き継がれています)');
         e.code = 'LEASE_LOST';
@@ -411,6 +413,12 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
       if (mode === 'full') ping('fail', String(e.message).slice(0, 180));
       return { ok: false, error: e.code === 'NOTION_SCHEMA_MISMATCH' ? 'schema_mismatch' : 'schema_error', message: e.message };
     }
+
+    // ⓪ 行き先台帳にはページがあるのにタスクに無い行を埋める (カード作成→紐付けの間で落ちた分。Codex PR-B R1 #2)
+    const bf = backfillTaskLinks();
+    summary.linked = bf.linked;
+    summary.linkConflicts = bf.conflicts;
+    if (bf.linked || bf.conflicts) console.log(`[inbound-check notion] タスクへの紐付けを補修: ${bf.linked} 件${bf.conflicts ? ` (衝突 ${bf.conflicts} 件 — 要確認)` : ''}`);
 
     // ① 孤立カードの回収 (取消済み・page_id なし。Codex R1 #1) — 取消を最優先で片付ける
     for (const row of collectOrphanCancelled(db)) {
@@ -495,6 +503,7 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
           const ext = calcExternal(ctx.sales30.get(key) ?? null, ctx.freeStock.get(key) ?? null);
           const wm = ctx.workMaster.get(key) || null;
           const props = buildCardProperties(row, { barcode: barcodeFor(db, row), product, supplierName, ext, dedupeKey, wm }, schema.names);
+          assertNotionSource();   // 検索を待っている間に切り替わっていたら作らない
           const created = await createCardSafe(props, dedupeKey);
           pageId = created.id;
           wasRecovered = !!created.recoveredAfterError;
@@ -502,18 +511,25 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
           payload = wasRecovered ? JSON.stringify({ recovered: true }) : JSON.stringify(props);
           await sleep(CREATE_INTERVAL_MS);
         }
-        const ch = markSent(db, row.id, pageId, payload);
+        // 台帳への記録と、確定時に作ったタスクへの紐付けは同じトランザクション (片方だけ残ると差分取込が衝突扱いする — Codex PR-B R1 #2)
+        const ch = db.transaction(() => {
+          const c = markSent(db, row.id, pageId, payload);
+          if (c === 1) linkTaskToNotionPage(row.id, pageId);
+          return c;
+        })();
         if (ch === 1) {
           if (wasRecovered) summary.recovered++; else summary.sent++;
-          linkTaskToNotionPage(row.id, pageId);   // 確定時に作ったタスクへ (差分取込が同じカードを衝突扱いしない)
         } else {
           // 記録できなかった = 待っている間に状態が変わった (Codex R1 #3 #4)。取り漏らさず収束させる
           const cur = db.prepare('SELECT cancelled_at, notion_page_id FROM f_inbound_check_destinations WHERE id = ?').get(row.id);
           if (cur && cur.notion_page_id === pageId) {
             if (wasRecovered) summary.recovered++; else summary.sent++;   // 別実行が同じカードを記録済み
+            linkTaskToNotionPage(row.id, pageId);   // 別実行が紐付けまで済ませていれば 0 行 (冪等)
           } else if (cur && !cur.notion_page_id) {
-            attachPage(db, row.id, pageId, payload);   // 取消済みでも紐付ける → ②の再実行が「取消」へ倒す
-            linkTaskToNotionPage(row.id, pageId);
+            db.transaction(() => {
+              attachPage(db, row.id, pageId, payload);   // 取消済みでも紐付ける → ②の再実行が「取消」へ倒す
+              linkTaskToNotionPage(row.id, pageId);
+            })();
             summary.raced++;
           } else {
             // 台帳には別のカードが記録されている — 今回のカードが孤立した疑い。人に見せる
@@ -533,6 +549,7 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
           console.error(`[inbound-check notion] 二重カード検出 dest#${row.id}: ${duplicates}枚`);
         }
       } catch (e) {
+        if (e.code === 'SOURCE_SWITCHED') throw e;   // 行のエラーではない (再試行に積まない)
         summary.errors++;
         if (markSendError(db, row.id, e.message, isPermanentStatus(e.status))) summary.blocked++;
         console.warn(`[inbound-check notion] 送信失敗 dest#${row.id} ${row.product_id}: ${e.message}`);
@@ -554,6 +571,12 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
     if (mode === 'full') ping(summary.errors > 0 ? 'fail' : 'ok', note);
     return { ok: summary.errors === 0, ...summary, note };
   } catch (e) {
+    if (e.code === 'SOURCE_SWITCHED') {
+      // 途中で正本がアプリになった: ここまでに作ったカードは台帳・タスクに記録済み。残りは作らない (失敗ではない)
+      console.log(`[inbound-check notion] sweep (${actor}/${mode}): 正本がアプリに切り替わったため打ち切り`);
+      if (mode === 'full') ping('ok', 'アプリ正本に切替 — 残りは送らない');
+      return { ok: true, skipped: 'app_mode', aborted: true, message: e.message };
+    }
     console.error('[inbound-check notion] sweep 失敗:', e);
     if (mode === 'full') ping('fail', String(e.message).slice(0, 180));
     return { ok: false, error: 'sweep_failed', message: e.message };
@@ -562,6 +585,18 @@ export async function runNotionSweep({ actor = 'manual', mode = 'full' } = {}) {
     running = false;
   }
 }
+
+/** 正本がアプリなら例外 (sweep の各 Notion 書き込みの直前で呼ぶ) */
+function assertNotionSource() {
+  if (sourceOfTruth() === 'app') {
+    const e = new Error('正本がアプリに切り替わったため Notion への送信を打ち切りました');
+    e.code = 'SOURCE_SWITCHED';
+    throw e;
+  }
+}
+
+/** 送信処理が動いているか (在庫化アプリの正本切替が、実行中の sweep と競合しないように見る) */
+export function notionSweepRunning() { return running; }
 
 function ping(status, note) {
   try { recordPing(JOB_ID, status, note, Date.now()); }

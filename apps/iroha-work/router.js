@@ -42,6 +42,7 @@ import {
   startTaskSession, countChangesSince, switchSourceOfTruth,
 } from './tasks-db.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
+import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import {
   addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
   recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
@@ -1034,6 +1035,10 @@ router.post('/admin/source', checkOrigin, requireAdmin, api((req, res) => {
   if (from === to) return res.json({ ok: true, source: to, unchanged: true });
   const counts = countTasksByStatus();
   const open = OPEN_STATUSES.reduce((s, k) => s + (counts.byStatus[k] || 0), 0);
+  if (to === 'app' && notionSweepRunning()) {
+    // 17:30 の一括送信の途中で切り替えると、送信側は打ち切るが「どこまで送ったか」が読みにくい。終わってから切り替える (Codex PR-B R1 #3)
+    return res.status(409).json({ ok: false, error: 'sweep_running', message: '入荷受付の Notion 送信が動いています。終わってから (数分後に) もう一度お試しください' });
+  }
   if (to === 'app' && open === 0) {
     return res.status(409).json({ ok: false, error: 'no_tasks', message: '未完了のタスクが 1 件もありません。先に Notion からの取込を済ませてください' });
   }

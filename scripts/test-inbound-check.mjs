@@ -507,6 +507,17 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   ok(imp2.ok, '前提: 予定数が変わった再取込');
   const t1c = taskOf(d1cId);
   ok(t1c.status === 'closed' && t1c.close_reason === 'cancelled' && t1c.cancellation_source === 'inbound_import', '再取込で引き継げなかった行のタスクは取消 (inbound_import)');
+  // 再取込で行ごと消えた確認済み行 → 行き先を取消 (line_removed)・タスクも取消 (Codex PR-B R1 #1)
+  const b2 = getActiveBatch();
+  const f3b = finalizeLine({ batchId: b2.id, lineKey: 'AR9|3|1', expectVersion: lineState('AR9|3|1').version, expectQuantityVersion: lineState('AR9|3|1').quantity_version, result: 'exact', mode: 'current', worker: '鈴木', decide: decideIroha });
+  ok(f3b.ok && taskOf(destIdOf('AR9|3|1'))?.status === 'not_started', '前提: 消える予定の行を確定 (タスクあり)');
+  const d3bId = destIdOf('AR9|3|1');
+  const imp3 = importCsv(makeCsv([row('AR9', 1, 'TASK-A', 7), row('AR9', 2, 'TASK-B', 3)]), { fileName: 'prb3.csv', generatedAt: '2027-01-01T02:00:00Z' });
+  ok(imp3.ok && /消えた明細の行き先 1件を取消/.test(db.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message), '前提: 行 3 が無い CSV を再取込 (ログに件数)');
+  ok(destOf(d3bId).cancelled_at && destOf(d3bId).cancel_reason === 'line_removed', '消えた明細の行き先は取消 (line_removed)');
+  const t3c = taskOf(d3bId);
+  ok(t3c.status === 'closed' && t3c.close_reason === 'cancelled' && t3c.cancellation_source === 'inbound_import', '消えた明細のタスクも取消');
+  ok(destOf(destIdOf('AR9|2|1')).cancelled_at == null, '残った行 (B-Faith 行き) はそのまま');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
