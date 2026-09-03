@@ -21,6 +21,7 @@ const {
   findUnshipped,
   countAwaitingPayment,
   summarize,
+  orderNosOf,
   findUnshippedOrders,
   buildMessage,
   MAX_LINES,
@@ -71,23 +72,25 @@ section('候補抽出 (一時DB)');
 initDB();
 const db = getDB();
 db.exec(`CREATE TABLE IF NOT EXISTS raw_qoo10_orders (
-  order_id TEXT, pack_no TEXT, shipping_status TEXT, payment_method TEXT, item_title TEXT,
+  order_id TEXT, source_order_key TEXT, pack_no TEXT, shipping_status TEXT, payment_method TEXT, item_title TEXT,
   order_qty INTEGER, total REAL, tracking_no TEXT, order_date TEXT, last_seen_at TEXT,
   is_frozen_after_horizon INTEGER DEFAULT 0
 )`);
 const TODAY = '2026-08-10';
 const ctx = { ...buildContext(new Date('2026-08-10T08:00:00+09:00'), 12), now: new Date('2026-08-10T08:00:00+09:00') };
 const ins = db.prepare(`INSERT INTO raw_qoo10_orders
-  (order_id, pack_no, shipping_status, payment_method, item_title, order_qty, total, tracking_no, order_date, last_seen_at, is_frozen_after_horizon)
-  VALUES (@order_id, @pack_no, @shipping_status, @payment_method, @item_title, @qty, @total, @tracking_no, @order_date, @last_seen_at, @frozen)`);
+  (order_id, source_order_key, pack_no, shipping_status, payment_method, item_title, order_qty, total, tracking_no, order_date, last_seen_at, is_frozen_after_horizon)
+  VALUES (@order_id, @source_order_key, @pack_no, @shipping_status, @payment_method, @item_title, @qty, @total, @tracking_no, @order_date, @last_seen_at, @frozen)`);
+// source_order_key = Qoo10 の注文番号 (本番は 'api:<注文番号>' が order_id。テストは 'api:1' → '1')
 const row = (o) => ins.run({
   order_id: 'api:1', pack_no: '100', shipping_status: 'Seller confirm(3)', payment_method: 'PayPay',
   item_title: '商品A', qty: 1, total: 1000, tracking_no: '', order_date: '2026-08-05 10:00:00',
-  last_seen_at: `${TODAY}T07:58:00.000+09:00`, frozen: 0, ...o,
+  last_seen_at: `${TODAY}T07:58:00.000+09:00`, frozen: 0,
+  source_order_key: String(o.order_id || 'api:1').replace(/^api:/, ''), ...o,
 });
 
 row({ order_id: 'api:1', pack_no: '100' });                                   // ← 検知対象
-row({ order_id: 'api:2', pack_no: '100', item_title: '商品B', total: 500 });   // 同じ梱包 = まとめる
+row({ order_id: 'api:2', pack_no: '100', item_title: '商品B', total: 500 });   // 同じ梱包 = まとめる (注文番号は別)
 row({ order_id: 'api:3', pack_no: '200', shipping_status: 'Delivered(5)' });   // 発送済み
 row({ order_id: 'api:4', pack_no: '201', shipping_status: 'On delivery(4)' }); // 配送中
 row({ order_id: 'api:5', pack_no: '202', shipping_status: 'Awaiting shipping(1)', payment_method: 'コンビニ決済' }); // 入金待ち
@@ -100,6 +103,7 @@ eq(countSeenToday(TODAY), 6, '今日の同期で確認できた件数 (frozen �
   const rows = findUnshipped(ctx);
   eq(rows.length, 1, '検知は1件 (梱包単位にまとまる)');
   eq(rows[0].pack_no, '100', '梱包番号');
+  eq(orderNosOf(rows[0]), ['1', '2'], '同じ梱包の注文番号を全部集める (QSMは注文番号で検索する)');
   eq(rows[0].item_count, 2, '同じ梱包の明細をまとめる');
   eq(rows[0].total, 1500, '金額を合算する');
   // 🚨キャンセル済み (last_seen_at が古い) を拾わないことが Qoo10版の肝
@@ -113,6 +117,7 @@ eq(countAwaitingPayment(ctx), 1, '入金待ちは参考として数える');
 {
   const s = summarize(findUnshipped(ctx)[0], ctx);
   eq(s.packNo, '100', '梱包番号');
+  eq(s.orderNos, ['1', '2'], '通知用にも注文番号が載る');
   eq(s.elapsedHours, 118, '注文からの経過時間');
   eq(s.hasTracking, false, '追跡番号なし');
   eq(s.qty, 2, '数量の合算');
@@ -123,6 +128,12 @@ eq(countAwaitingPayment(ctx), 1, '入金待ちは参考として数える');
   eq(r.stale, false, '今日の同期があれば stale ではない');
   eq(r.awaitingPayment, 1, '入金待ちの件数');
 }
+
+section('orderNosOf');
+eq(orderNosOf({ order_keys: '1216505367,1216505366', order_id: 'api:1216505366' }), ['1216505366', '1216505367'], '昇順に揃える');
+eq(orderNosOf({ order_keys: '', order_id: 'api:1218369750' }), ['1218369750'], 'source_order_key が無ければ order_id から');
+eq(orderNosOf({ order_keys: '0', order_id: 'legacy:419962378:5' }), ['legacy:419962378:5'], "legacy の '0' は注文番号として使わない");
+eq(orderNosOf({ order_keys: '5,5', order_id: 'api:5' }), ['5'], '重複は落とす');
 
 // ─── 鮮度チェック (Qoo10版の肝) ───
 section('同期が走っていない日は判定を見送る');
@@ -141,7 +152,7 @@ section('同期が走っていない日は判定を見送る');
 // ─── buildMessage ───
 section('buildMessage');
 const mkAlert = (over = {}) => ({
-  packNo: '100', orderId: 'api:1',
+  packNo: '100', orderId: 'api:1', orderNos: ['1216801633'],
   orderedAt: new Date('2026-08-05T10:00:00+09:00'),
   elapsedHours: 118, shippingStatus: 'Seller confirm(3)', paymentMethod: 'PayPay',
   hasTracking: false, total: 1500, qty: 2, itemCount: 2, itemTitle: '商品A',
@@ -161,12 +172,22 @@ const mkCtx = () => ({ ...ctx });
 {
   const text = buildMessage({ alerts: [mkAlert()], awaitingPayment: 3, seenToday: 767, stale: false, ctx: mkCtx() });
   ok(text.includes('🚨 出荷漏れの可能性 *1件*'), '件数');
-  ok(text.includes('梱包番号 100'), '梱包番号');
+  ok(text.includes('注文番号 1216801633'), '注文番号を出す (QSMは注文番号で検索する)');
+  ok(!text.includes('梱包番号'), '梱包番号は出さない (現場が探せない)');
+  ok(!text.includes('100'), '梱包番号の値も出さない');
   ok(text.includes('¥1,500'), '金額');
   ok(text.includes('PayPay'), '決済方法');
   ok(text.includes('118時間経過'), '経過時間');
   ok(text.includes('商品A ほか1点'), '明細のまとめ表示');
   ok(text.includes('入金待ちで止まっている注文 3件'), '入金待ちを参考として出す');
+}
+{
+  const text = buildMessage({ alerts: [mkAlert({ orderNos: ['1216505366', '1216505367'] })], awaitingPayment: 0, seenToday: 1, stale: false, ctx: mkCtx() });
+  ok(text.includes('注文番号 1216505366, 1216505367 (同梱2件)'), '1梱包に複数注文なら全部並べて同梱と添える');
+}
+{
+  const text = buildMessage({ alerts: [mkAlert({ orderNos: [] })], awaitingPayment: 0, seenToday: 1, stale: false, ctx: mkCtx() });
+  ok(text.includes('注文番号 不明 (梱包番号 100)'), '注文番号が取れない行は「不明」と明示し梱包番号を添える (梱包番号を注文番号と偽らない)');
 }
 {
   const text = buildMessage({ alerts: [mkAlert({ hasTracking: true })], awaitingPayment: 0, seenToday: 1, stale: false, ctx: mkCtx() });
