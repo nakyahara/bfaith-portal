@@ -448,7 +448,7 @@
     </div>
   </div>
 
-  <!-- ══ 写真・動画の拡大表示 ══ -->
+  <!-- ══ 写真の拡大表示 ══ -->
   <div class="lb" id="lb" onclick="closeLb(event)">
     <button class="lbx" onclick="closeLb()">×</button>
     <div id="lbBody"></div>
@@ -1212,6 +1212,8 @@ function renderDetail(c) {
 // ── 写真・動画: 「前回の完成形」(同じ商品の見本) と「今回のできあがり」 ──
 // 写真は完了の証拠ではなく、次に同じ商品を作る人への見本 (中原さん 2026-09-03)。
 // 画像は /api/media/:id/file (Render 経由) で出す — iPad はサービスアカウントの Drive を直接見られない
+// 撮影動画は当面なし (中原さん 2026-09-03: iPad で再生できなかった)。戻すときはここを true に
+const VIDEO_ENABLED = false;
 const KIND_ICON = { photo: '📷', video: '🎥' };
 const fileUrl = id => BASE + '/api/media/' + id + '/file';
 function fmtDate(iso) {
@@ -1250,19 +1252,21 @@ function prevCardHtml(c) {
     '<div class="photos">' + tiles + '</div></div>';
 }
 function mediaCardHtml(c) {
-  const photos = c.media.filter(m => m.kind === 'photo').length;
-  const videos = c.media.filter(m => m.kind === 'video').length;
-  const tiles = c.media.map(mediaTile).join('');
+  // 動画は当面なし (VIDEO_ENABLED)。既に撮ってあるものも画面には出さない (データは消していない)
+  const media = VIDEO_ENABLED ? c.media : c.media.filter(m => m.kind === 'photo');
+  const photos = media.length;
+  const tiles = media.map(mediaTile).join('');
   const pend = [...pendingTiles.values()].filter(p => p.pageId === c.id).map(p =>
     '<div class="ph' + (p.failed ? ' err' : '') + '">' +
     (p.previewUrl ? '<img src="' + p.previewUrl + '" alt="">' : '<div><span class="ic">' + KIND_ICON[p.kind] + '</span></div>') +
     (p.failed ? '<button class="reg" onclick="retryUpload(event,\'' + p.opId + '\')">↻ 再送</button>' : '<span class="stx">送信中</span>') +
     '</div>').join('');
   const addP = photos < 3 ? '<div class="ph add" onclick="pickMedia(\'photo\')"><div><span class="ic">📷</span>写真を<br>とる</div></div>' : '';
-  const addV = videos < 1 ? '<div class="ph add mov" onclick="pickMedia(\'video\')"><div><span class="ic">🎥</span>動画を<br>とる</div></div>' : '';
+  const videos = VIDEO_ENABLED ? c.media.filter(m => m.kind === 'video').length : 0;
+  const addV = VIDEO_ENABLED && videos < 1 ? '<div class="ph add mov" onclick="pickMedia(\'video\')"><div><span class="ic">🎥</span>動画を<br>とる</div></div>' : '';
   return '<div class="dcard"><h3 class="sec">今回のできあがり — 次回の見本になります</h3>' +
     '<div class="photos">' + tiles + pend + addP + addV + '</div>' +
-    '<p class="hint">できあがった状態を撮ってください。次に同じ商品が来たとき「前回の完成形」として出ます (写真3枚・動画1本まで。ドライブに保存)。</p></div>';
+    '<p class="hint">できあがった状態を撮ってください。次に同じ商品が来たとき「前回の完成形」として出ます (写真3枚まで。ドライブに保存)。</p></div>';
 }
 
 // ライトボックス (その場で大きく見る)
@@ -1279,7 +1283,8 @@ function openMedia(ev, id) {
     if (!m) continue;
     if (!m.viewable) { toast(m.error ? '送信に失敗しています (削除して撮り直してください)' : 'まだ送信中です'); return; }
     const cap = KIND_ICON[m.kind] + ' ' + fmtDate(m.created_at) + ' ' + (m.worker_name || '');
-    showLb(m.kind === 'photo' ? '<img src="' + fileUrl(id) + '" alt="">' : '<video src="' + fileUrl(id) + '" controls autoplay playsinline></video>', cap);
+    showLb(m.kind === 'photo' ? '<img src="' + fileUrl(id) + '" alt="">'
+      : '<video src="' + fileUrl(id) + '" controls autoplay playsinline></video>', cap);
     return;
   }
 }
@@ -1297,6 +1302,7 @@ const newOpId = () => Date.now().toString(36) + '-' + Math.random().toString(36)
 
 function pickMedia(kind) {
   if (!worker) { openGate(); return; }
+  if (kind !== 'photo' && !VIDEO_ENABLED) { toast('動画は今つかえません (写真をとってください)'); return; }
   const inp = document.createElement('input');
   inp.type = 'file';
   inp.accept = kind === 'photo' ? 'image/*' : 'video/*';
@@ -1312,9 +1318,6 @@ async function handlePicked(kind, file) {
   if (kind === 'photo') {
     try { blob = await shrinkPhoto(file); }
     catch (e) { showErr('写真を読み込めませんでした', e.message); return; }
-  } else if (file.size > 120 * 1024 * 1024) {
-    showErr('動画が大きすぎます (120MBまで)。短めに撮り直してください');
-    return;
   }
   const opId = newOpId();
   // 送信中も撮った写真をそのまま見せる (ローカルのプレビュー。成功したら解放)
@@ -1356,7 +1359,7 @@ async function uploadMedia(opId) {
   fd.append('worker_id', String(worker.id));
   fd.append('operation_id', opId);
   fd.append('file', p.blob, p.kind === 'photo' ? 'photo.jpg' : 'video.mp4');
-  const j = await apiFetch('/api/media', { method: 'POST', body: fd, timeoutMs: 180000 });   // 動画 (最大120MB) は長めに待つ
+  const j = await apiFetch('/api/media', { method: 'POST', body: fd, timeoutMs: 60000 });
   if (!j.ok) {
     if (j.error === 'cap_reached' || j.error === 'bad_file' || j.error === 'too_large') {
       pendingTiles.delete(opId);
@@ -1374,14 +1377,14 @@ async function uploadMedia(opId) {
   const c = state.cards.find(x => x.id === p.pageId);
   if (c && !c.media.some(m => m.id === j.media.id)) c.media.push(j.media);
   rerenderDetail();
-  toast(p.kind === 'photo' ? '写真を送りました (ドライブへ保存中)' : '動画を送りました (ドライブへ保存中)');
+  toast('写真を送りました (ドライブへ保存中)');
 }
 
 function retryUpload(ev, opId) { ev.stopPropagation(); uploadMedia(opId); }
 
 async function delMedia(ev, id) {
   ev.stopPropagation();
-  if (!confirm('この写真・動画を削除しますか? (撮り直し用)')) return;
+  if (!confirm('この写真を削除しますか? (撮り直し用)')) return;
   const j = await apiFetch('/api/media/' + id + '/delete', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ delete_token: mediaTokens()[id] || null }),

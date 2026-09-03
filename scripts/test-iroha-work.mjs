@@ -582,8 +582,11 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   ok(a1.deleteToken && a3.deleteToken && a1.deleteToken !== a3.deleteToken, '削除トークンは行ごとに別');
   ok(addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a4.jpg', jpeg), worker: worker1, operationId: 'op-photo-0004' }).error === 'cap_reached',
     '写真は3枚まで');
+  // 動画は当面なし (中原さん 2026-09-03: iPad で再生できなかった)。入口で断る
   const v1 = addMedia({ pageId: pMedia.id, kind: 'video', mime: 'video/mp4', filePath: tmp('v1.mp4', mp4), worker: worker1, operationId: 'op-video-0001' });
-  ok(v1.ok === true, '動画も受信できる');
+  ok(v1.ok === false && v1.error === 'video_disabled', '動画は受け付けない (video_disabled)');
+  ok(fs.existsSync(path.join(process.env.DATA_DIR, 'v1.mp4')), '断ったときは一時ファイルを取り込まない (呼び元が片づける)');
+  ok(countActiveMedia(pMedia.id, 'video') === 0, '動画は 1 本も入らない');
   ok(countActiveMedia(pMedia.id, 'photo') === 3, '有効な写真 3 枚 (枚数上限の根拠)');
 
   // キュー: 1回目は「Drive に作成できたが応答が消えた」→ 再試行は operation_id で**回収**し
@@ -607,13 +610,13 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   await processMediaQueue();   // 2巡目で残りの upload + Notion 反映
   rows = listMediaForAdmin(10).filter(m => m.page_id === pMedia.id && !m.deleted_at);
   ok(rows.every(m => m.status === 'synced' && m.drive_url), `全件 Drive→Notion まで反映 (実際: ${rows.map(m => m.status).join(',')})`);
-  ok(driveFiles.size === 4, `Drive のファイルは4つだけ (再試行で二重作成しない。実際 ${driveFiles.size})`);
+  ok(driveFiles.size === 3, `Drive のファイルは3つだけ (写真のみ・再試行で二重作成しない。実際 ${driveFiles.size})`);
   ok(rows.find(m => m.operation_id === 'op-photo-0001').drive_file_id === 'f-op-photo-0001',
     '応答消失した1件も同じファイルを回収して紐づく');
   ok(!fs.existsSync(path.join(MEDIA_DIR, 'op-photo-0001.jpg')), 'アップロード後に実体を削除');
   const patched = mock.patched.filter(p => p.id === pMedia.id && p.body.properties?.['完成写真']);
-  ok(patched.length > 0 && patched[patched.length - 1].body.properties['完成写真'].files.length === 4,
-    'Notion「完成写真」に4件 (写真3+動画1) が付く');
+  ok(patched.length > 0 && patched[patched.length - 1].body.properties['完成写真'].files.length === 3,
+    'Notion「完成写真」に3件 (写真3) が付く');
 
   // 「前回の完成形」: 同じ商品コードの**別カード**に、Drive 保存済みの写真が新しい順で付く
   // (中原さん 2026-09-03: 写真は完了の証拠ではなく、次に同じ商品を作る人への見本)
@@ -642,8 +645,36 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   await new Promise(r => setTimeout(r, 30));
   await processMediaQueue();
   const last = mock.patched.filter(p => p.id === pMedia.id && p.body.properties?.['完成写真']).pop();
-  ok(last.body.properties['完成写真'].files.length === 3, 'Notion 側も貼り直されて3件 (写真2+動画1)');
-  ok((mediaByPage().get(pMedia.id) || []).length === 3, '画面用一覧にも削除分は出ない');
+  ok(last.body.properties['完成写真'].files.length === 2, 'Notion 側も貼り直されて2件 (写真2)');
+  ok((mediaByPage().get(pMedia.id) || []).length === 2, '画面用一覧にも削除分は出ない');
+
+  // 動画をやめる前に撮ってあった動画は、そのまま残す (行・ドライブのファイル・削除トークン・Notion の貼り付け)。
+  // 写真を足したり消したりしても影響を受けない (Codex 動画 R1)
+  {
+    const pLegacy = mkPage({ status: '作業中', title: '前に動画も撮ったカード', code: 'PROD-LEG' });
+    const now = new Date().toISOString();
+    getDB().prepare(`INSERT INTO f_iroha_card_media (operation_id, page_id, product_code, kind, mime, size, drive_file_id, drive_url,
+        status, worker_id, worker_name, created_at, uploaded_at, delete_token_hash)
+      VALUES ('op-legacy-vid1', ?, 'PROD-LEG', 'video', 'video/mp4', 1234, 'f-legacy-vid1', 'https://drive/legacy-vid1',
+        'uploaded', ?, 'やまだ', ?, ?, 'hash-legacy')`).run(pLegacy.id, worker1.id, now, now);
+    const before = getDB().prepare("SELECT * FROM f_iroha_card_media WHERE operation_id = 'op-legacy-vid1'").get();
+    const p1 = addMedia({ pageId: pLegacy.id, productCode: 'PROD-LEG', kind: 'photo', filePath: tmp('leg1.jpg', jpeg), worker: worker1, operationId: 'op-legacy-ph01' });
+    ok(p1.ok, '前提: 同じカードに写真を足せる');
+    await processMediaQueue(); await processMediaQueue();
+    const patchedLeg = mock.patched.filter(x => x.id === pLegacy.id && x.body.properties?.['完成写真']).pop();
+    const urls = (patchedLeg ? patchedLeg.body.properties['完成写真'].files : []).map(f => f.external.url);
+    ok(urls.includes('https://drive/legacy-vid1'), 'Notion の完成写真に、前からある動画の URL が残る');
+    ok(urls.length === 2, '写真とあわせて 2 件 (動画を外さない)');
+    ok(softDeleteMedia(getDB().prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-legacy-ph01'").get().id, { deleteToken: p1.deleteToken }).ok, '前提: 足した写真を消す');
+    await new Promise(r => setTimeout(r, 30));
+    await processMediaQueue();
+    const afterDel = mock.patched.filter(x => x.id === pLegacy.id && x.body.properties?.['完成写真']).pop();
+    ok(afterDel.body.properties['完成写真'].files.map(f => f.external.url).includes('https://drive/legacy-vid1'), '写真を消しても動画は Notion に残る');
+    const after = getDB().prepare("SELECT * FROM f_iroha_card_media WHERE operation_id = 'op-legacy-vid1'").get();
+    ok(after.deleted_at == null && after.drive_file_id === before.drive_file_id && after.delete_token_hash === before.delete_token_hash
+      && after.page_id === before.page_id && after.kind === 'video', '動画の行はそのまま (消えない・変わらない)');
+    ok((mediaByPage().get(pLegacy.id) || []).some(m => m.kind === 'video'), '画面用のデータには動画も入っている (出すかどうかは画面側の判断)');
+  }
 
   // 最後の1件を消したときも Notion を「空にする」PATCH が飛ぶ (Codex PR3 #1)
   const pSolo = mkPage({ status: '作業中', title: '1枚だけ', code: 'PROD-S' });
@@ -1533,6 +1564,28 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     const mp2 = multipart({ id: String(other.id), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-http-00001' }, { name: 'b.jpg', mime: 'image/jpeg', data: jpeg });
     const dup = await call('POST', '/api/media', { cookie, body: mp2.body, headers: mp2.headers });
     ok(dup.status === 409 && dup.json.error === 'operation_conflict', '別カードで同じ operation_id は 409');
+    // 動画は入口で断る。大きすぎるファイルは HTML や 500 でなく JSON の 413 (Codex 動画 R1)
+    {
+      const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypisom', 'latin1'), Buffer.alloc(64, 2)]);
+      const mv = multipart({ id: String(task.id), kind: 'video', worker_id: String(w1.id), operation_id: 'op-http-video1' },
+        { name: 'v.mp4', mime: 'video/mp4', data: mp4 });
+      const rv = await call('POST', '/api/media', { cookie, body: mv.body, headers: mv.headers });
+      ok(rv.status === 400 && rv.json.error === 'video_disabled', '動画は 400 video_disabled');
+      ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_card_media WHERE operation_id = 'op-http-video1'").get().c === 0, '動画は 1 行も入らない');
+      const big = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(9 * 1024 * 1024, 1)]);
+      const mb = multipart({ id: String(task.id), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-http-big001' },
+        { name: 'big.jpg', mime: 'image/jpeg', data: big });
+      const rb = await call('POST', '/api/media', { cookie, body: mb.body, headers: mb.headers });
+      ok(rb.status === 413 && rb.json && rb.json.error === 'too_large', '大きすぎる写真は JSON の 413 (HTML や 500 にしない)');
+      ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_card_media WHERE operation_id = 'op-http-big001'").get().c === 0, '受け取らなかった分は記録も残らない');
+      const bigV = multipart({ id: String(task.id), kind: 'video', worker_id: String(w1.id), operation_id: 'op-http-bigv01' },
+        { name: 'big.mp4', mime: 'video/mp4', data: big });
+      const rbv = await call('POST', '/api/media', { cookie, body: bigV.body, headers: bigV.headers });
+      ok(rbv.status === 413 && rbv.json.error === 'too_large', '大きすぎる動画も JSON で返る (上限で先に弾かれる)');
+      const { MEDIA_DIR: MD } = await import('../apps/iroha-work/media.js');
+      const tmpDir = path.join(MD, 'tmp');
+      ok(!fs.existsSync(tmpDir) || fs.readdirSync(tmpDir).length === 0, '一時ファイルを残さない');
+    }
     await processMediaQueue();
     ok(db.prepare('SELECT status FROM f_iroha_card_media WHERE id = ?').get(up.json.media.id).status === 'uploaded', 'Drive 保存で完了 (uploaded)');
     ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_media_page_sync WHERE page_id IS NULL').get().c === 0, '同期キューに NULL ページは無い');
