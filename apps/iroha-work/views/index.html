@@ -275,7 +275,7 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp
 const ST_CLASS = { '未着手':'todo', '作業中':'doing', '中断':'pause', '棚入完了':'done' };
 const stClass = s => ST_CLASS[s] || 'other';
 
-let state = { cards: [], statuses: [], workers: [], refresh: {}, me: {} };
+let state = { cards: [], statuses: [], changeTargets: [], workers: [], refresh: {}, me: {} };
 let curTab = 'all';
 let curDetail = null;      // 開いている詳細の page_id
 let worker = null;         // { id, display_name, worker_type }
@@ -929,7 +929,8 @@ function openSt(ev, pageId) {
   $('#stMsg').textContent = '';
   $('#pinRow').style.display = 'none';
   $('#pinIn').value = '';
-  $('#stBtns').innerHTML = state.statuses.map(s =>
+  // 変更先はタブ (一覧に出る状態) と別: 棚入完了は一覧に残らないが変更先としては必要
+  $('#stBtns').innerHTML = (state.changeTargets || state.statuses).map(s =>
     '<button class="btn' + (s === c.status ? ' cur' : '') + '" onclick="doSetSt(\'' + esc(s) + '\')">' + esc(s) + '</button>').join('');
   $('#stOv').classList.add('on');
 }
@@ -975,18 +976,30 @@ async function doSetSt(to) {
   stSkipPhoto = false;   // スキップは1回の送信だけに効かせる
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
 
+  // 一覧に残らないステータス (棚入完了) になったら、その場で行を外す (次の取得でも入ってこない)
+  const dropCard = () => {
+    state.cards = state.cards.filter(x => x.page_id !== c.page_id);
+    if (curDetail === c.page_id) closeDetail();
+    renderTabs(); renderList();
+  };
   if (j.ok) {
+    $('#stOv').classList.remove('on'); stTarget = null;
+    if (j.listed === false) {
+      dropCard();
+      toast('「' + j.status + '」にしました。一覧から外れます (Notionにも反映済み)');
+      return;
+    }
     c.status = j.status;
     renderTabs(); renderList();
     if (curDetail === c.page_id) renderDetail(c);
-    $('#stOv').classList.remove('on'); stTarget = null;
     toast('「' + j.status + '」に変えました (Notionにも反映済み)');
     return;
   }
   if (j.error === 'conflict') {
     $('#stOv').classList.remove('on'); stTarget = null;
     showErr(j.message || 'Notion側で変更されています');
-    if (j.current) { c.status = j.current; renderTabs(); renderList(); if (curDetail === c.page_id) renderDetail(c); }
+    if (j.listed === false) dropCard();
+    else if (j.current) { c.status = j.current; renderTabs(); renderList(); if (curDetail === c.page_id) renderDetail(c); }
     loadState();
     return;
   }

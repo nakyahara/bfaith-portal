@@ -15,7 +15,7 @@ import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
 import { getDB, listCache, activeSessionsByPage, estimateByProduct } from './db.js';
 import { mediaByPage } from './media.js';
-import { STATUSES } from './notion-read.js';
+import { STATUSES, LIST_STATUSES } from './notion-read.js';
 
 // 「急ぎ」の線引き: 在庫切れ、または残り在庫日数がこれ以下
 export const URGENT_DAYS = 3;
@@ -165,5 +165,5 @@ export function buildList() {
     try { queueEnsureImages(missingImg, 'いろは作業アプリ'); } catch (e) { console.warn('[iroha-work] 画像解決を飛ばしました:', e.message); }
   }
 
-  return { cards, statuses: STATUSES };
+  return { cards, statuses: LIST_STATUSES, changeTargets: STATUSES };
 }
