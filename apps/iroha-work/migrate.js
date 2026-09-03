@@ -16,7 +16,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { getDB } from './db.js';
+import { getDB, setMetaValue } from './db.js';
 import { queryPages, parsePage } from './notion-read.js';
 import { checkCardSchema, isNotionConfigured } from '../inbound-check/notion.js';
 import { mapLegacyStatus, DEFAULT_FACILITY, OPEN_STATUSES } from './tasks.js';
@@ -193,6 +193,9 @@ export function applyImport(rows, { batchId = null, actor = null } = {}) {
       out[res.action]++;
     }
     out.backfill = backfillTaskIds();
+    // 「Notion の状態をいつ取り込んだか」— 下見の詳細で API 取得時刻と区別して出す (Codex R4 Q5)
+    setMetaValue('last_import_at', now);
+    setMetaValue('last_import_batch', id);
   })();
   try {
     fs.mkdirSync(MIG_DIR, { recursive: true });

@@ -17,7 +17,7 @@ import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateB
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, HOLD_REASONS, HOLD_LABEL, CLOSE_REASONS, CLOSE_LABEL, statusLabel } from './tasks.js';
-import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks } from './tasks-db.js';
+import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask } from './tasks-db.js';
 
 // 「急ぎ」の線引き: 在庫切れ、または残り在庫日数がこれ以下
 export const URGENT_DAYS = 3;
@@ -213,12 +213,11 @@ export function buildList() {
 }
 
 /**
- * 一覧 (アプリ正本 = f_iroha_tasks)。buildList と同じ形の cards[] を返すので画面は共通。
+ * タスク行 → 画面のカード。一覧・ボード・下見・履歴の詳細で同じ形 (buildList と同じ cards[] の形なので画面は共通)。
  * 違いは識別子 (id = task.id) と状態 (status = 英語の値・status_label = 表示) と、拠点・保留理由・「今日やる」を持つこと。
- * 終了 (closed) は含めない (履歴画面で見る — 中原さん 2026-09-03「完了が溜まる一方なのを何とかしたい」)
+ * rows に closed が混ざっていてもそのまま作る (履歴の詳細用)。並べ替えと画像の取り寄せは呼び出し側
  */
-export function buildTaskList({ facility = null } = {}) {
-  const rows = listOpenTasks({ facility });
+function buildTaskCards(rows) {
   const ctx = enrichContext();
   const images = productImageMap(rows.map(r => r.product_code));
   const activeMap = activeSessionsByTask();
@@ -292,6 +291,23 @@ export function buildTaskList({ facility = null } = {}) {
       previous_photos: previousPhotosOf(k ? (prevPhotos.get(k) || []) : [], `t${r.id}`),
     };
   });
+  return { cards, today };
+}
+
+/** 1 枚だけ (下見・履歴の詳細)。終了したタスクも返す。無ければ null */
+export function buildTaskCard(id) {
+  const t = getTask(id);
+  if (!t) return null;
+  return buildTaskCards([t]).cards[0] || null;
+}
+
+/**
+ * 一覧 (アプリ正本 = f_iroha_tasks)。
+ * 終了 (closed) は含めない (履歴画面で見る — 中原さん 2026-09-03「完了が溜まる一方なのを何とかしたい」)
+ */
+export function buildTaskList({ facility = null } = {}) {
+  const rows = listOpenTasks({ facility });
+  const { cards, today } = buildTaskCards(rows);
 
   // 並び: 今日やる → 優先度 (急ぎ→新商品→通常→データなし→販売なし) → 在庫日数 → 入庫が古い順
   cards.sort((a, b) => {

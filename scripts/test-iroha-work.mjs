@@ -1097,8 +1097,9 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   ok(fkErr && /FOREIGN KEY/.test(fkErr.message), '拠点は f_iroha_facilities に無い値を入れられない (FK)');
   ok(TD.clearMigrationReview({ taskId: tA2.id, expectVersion: 0 }).error === 'conflict', '要確認クリアも version 競合を返す');
   ok(getDB().prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_status'").get(tA2.id).c >= 6, '状態変更は履歴に残る (task_id つき)');
-  const planned = TD.setPlannedDate({ taskId: tA2.id, plannedDate: '2026-09-04', expectVersion: reopened.task.version });
-  ok(planned.ok && planned.task.planned_date === '2026-09-04' && TD.setPlannedDate({ taskId: tA2.id, plannedDate: '9/4', expectVersion: planned.task.version }).error === 'bad_request', '「今日やる」= planned_date (形式検証)');
+  // ⚠固定日付を「今日」になり得る日にすると、その日に後段の「今日やるが先頭」の検証が壊れる (2026-09-04 に実際に壊れた) → 来ない日付にする
+  const planned = TD.setPlannedDate({ taskId: tA2.id, plannedDate: '2099-12-31', expectVersion: reopened.task.version });
+  ok(planned.ok && planned.task.planned_date === '2099-12-31' && TD.setPlannedDate({ taskId: tA2.id, plannedDate: '9/4', expectVersion: planned.task.version }).error === 'bad_request', '「今日やる」= planned_date (形式検証)');
 
   // 取消: 未着手・実績なしは自動終了 / 実績ありは要確認 → 職員が判断
   const tB = TD.getTaskByPageId(pM2.id);   // 作業中・作業時間あり
@@ -1715,6 +1716,56 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok(true, '下見では書き変えできない (まとめて棚入完了・ラベル待ち登録・今日やる・取消の判断・確認ずみ)');
       // 状態は動いていない
       ok((await call('GET', '/api/state', { cookie })).json.mode === 'notion', '下見を見ても正本は Notion のまま');
+
+      // ⭐下見の詳細 (要件 v1.3 §P Q5 / PR1): ボード・履歴から 1 枚だけ読むだけで開ける。何も許さない (capabilities 空)。
+      //   下見のカード id をどの書き込み API に送っても DB は変わらない
+      {
+        const stN = await call('GET', '/api/state', { cookie });
+        ok(Array.isArray(stN.json.capabilities) && ['task.status.change', 'task.work.start', 'task.media.add', 'task.master.edit'].every((c) => stN.json.capabilities.includes(c))
+          && !stN.json.capabilities.includes('task.plan.assign'), 'Notion 正本の一覧は 状態変更・作業開始・写真・作業のやり方 を許し、今日やる等は許さない');
+        ok(Array.isArray(pv.json.capabilities) && pv.json.capabilities.length === 0, '下見のボードは何も許さない (capabilities が空)');
+        const open = db.prepare("SELECT id, product_code FROM f_iroha_tasks WHERE status != 'closed' ORDER BY id LIMIT 1").get();
+        const closed = db.prepare("SELECT id FROM f_iroha_tasks WHERE status = 'closed' ORDER BY id LIMIT 1").get();
+        const d = await call('GET', '/api/task-previews/' + open.id, { cookie });
+        ok(d.status === 200 && d.json.ok && d.json.preview === true && d.json.card && d.json.card.id === open.id, '下見の詳細が 1 枚だけ返る (id は数値)');
+        ok(Array.isArray(d.json.capabilities) && d.json.capabilities.length === 0, '下見の詳細は何も許さない (capabilities が空)');
+        ok(d.json.card.master && Array.isArray(d.json.card.media) && Array.isArray(d.json.card.previous_photos) && Array.isArray(d.json.card.active)
+          && d.json.card.live && 'plan_hours' in d.json.card && 'boxes' in d.json.card && 'loc_at' in d.json.card,
+          '詳細に必要なもの (作業のやり方・写真・前回の完成形・作業中の人・販売/在庫・想定時間・必要保管箱・在庫の時刻) が入っている');
+        ok(typeof d.json.notionSyncedAt === 'string' && typeof d.json.serverNow === 'string', 'Notion を取り込んだ時刻 (取込で記録) と、サーバーの今の時刻が付く');
+        if (closed) {
+          const dc = await call('GET', '/api/task-previews/' + closed.id, { cookie });
+          ok(dc.status === 200 && dc.json.ok && dc.json.card.status === 'closed', '履歴 (終了) のカードも読める');
+        } else ok(false, '終了したタスクがテストデータに無い');
+        ok((await call('GET', '/api/task-previews/999999', { cookie })).status === 404, '無いカードは 404');
+        ok((await call('GET', '/api/task-previews/abc', { cookie })).status === 404, '数値でない id は 404');
+        // 下見のカード id を書き込み API に送っても、DB は 1 行も変わらない
+        const mediaTables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'f_iroha%media%' AND name NOT LIKE '%sync%'").all().map((r) => r.name);
+        const snap = () => JSON.stringify({
+          tasks: db.prepare('SELECT id, status, version, updated_at, updated_by FROM f_iroha_tasks ORDER BY id').all(),
+          sessions: db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c,
+          media: mediaTables.map((t) => db.prepare(`SELECT COUNT(*) c FROM ${t}`).get().c),
+          master: db.prepare('SELECT code_key, note, version FROM f_iroha_work_master ORDER BY code_key').all(),
+        });
+        const before = snap();
+        const writes2 = [
+          ['POST', '/api/status', { id: open.id, to: '作業中', worker_id: w1.id }],
+          ['POST', '/api/master', { id: open.id, code: open.product_code || 'PROD-A', fields: { note: 'preview-write' }, worker_id: w1.id }],
+          ['POST', '/api/sessions/start', { id: open.id, worker_id: w1.id }],
+          ['POST', '/api/sessions/stop', { id: open.id, worker_id: w1.id, reason: 'pause' }],
+        ];
+        for (const [m, p2, body] of writes2) {
+          const r = await call(m, p2, { cookie, body });
+          if (!(r.status === 409 && r.json.error === 'notion_mode')) ok(false, `${p2} に下見の id を送ると 409 notion_mode (実際 ${r.status} ${r.json && r.json.error})`);
+        }
+        ok(true, '状態変更・作業のやり方・作業の開始/中断 に下見の id を送ると 409 notion_mode');
+        const jpegPv = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(64, 1)]);
+        const mpPv = multipart({ id: String(open.id), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-preview-00001' }, { name: 'a.jpg', mime: 'image/jpeg', data: jpegPv });
+        const rm = await call('POST', '/api/media', { cookie, body: mpPv.body, headers: mpPv.headers });
+        ok(rm.status === 409 && rm.json.error === 'notion_mode', '写真の送信に下見の id を送ると 409 notion_mode');
+        ok(snap() === before, '下見の id をどの書き込み API に送っても DB が変わらない (tasks・作業時間・写真・作業のやり方)');
+        ok(mediaTables.length > 0, '写真のテーブルを数えている (テーブル名の前提が崩れていない)');
+      }
     }
     const ms = await call('GET', '/admin/migration/status', { ...admin });
     ok(ms.status === 200 && ms.json.ok && Array.isArray(ms.json.linkConflicts) && typeof ms.json.linkConflictsTotal === 'number', '移行の状態 (管理画面の元データ) に紐付け衝突の一覧と総件数が載る');
@@ -2206,7 +2257,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function renderViews\(\) \{ const el = \$\('#views'\); if \(el\) el\.hidden = false; \}/.test(html), '画面切替はいつでも出る (正本を問わない)');
   ok(/if \(v === 'board'\) \{ if \(isApp\(\)\) renderBoard\(\); else loadPreview\(\); \}/.test(html), 'ボードは正本が Notion なら下見を読み込む');
   ok(/const PREVIEW_NOTE = /.test(html) && /見るだけの下見です/.test(html), '下見であることを画面に書く');
-  ok(/if \(!isApp\(\)\) \{ toast\('下見なので開けません/.test(html), '下見ではカードを開かない (詳細は正本のカードなので id が別)');
+  // 下見でもカードは開く (v1.3) — ただし state の openDetail には流さない (id が正本のカードと別)。1 枚だけ読むだけで取る
+  ok(/if \(!isApp\(\)\) \{ openPreviewDetail\(el\.dataset\.id\); return; \}\r?\n  if \(el\.dataset\.pick === '1'\) toggleBulk\(el\.dataset\.id\); else openDetail\(el\.dataset\.id\);/.test(html),
+    '下見のカードは state の openDetail に流さない (id が正本のカードと別)');
   ok(/const canBulk = isApp\(\) &&/.test(html), '下見では「まとめて棚入完了」を出さない');
   ok(/\$\('#lwSave'\)\.disabled = !isApp\(\);/.test(html), '下見ではラベル待ちを保存できない');
   // 正本が変わったとき・つながらなかったときの追随 (Codex 下見 R1)
@@ -2252,6 +2305,45 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(!/lot_expiry: c\.expiry/.test(html) && /\$\('#lwLot'\); if \(el\) el\.focus\(\)/.test(html), 'ロット・期限は入れずに、そこへカーソルを置く (現物を見て打つ)');
   ok(/外部に出す準備OK にする/.test(html) && /async function setExternalReady/.test(html), '詳細に「外部に出す準備OK」の切り替えがある');
   ok(/c\.external_ready \? '📦 外部に出せます'/.test(html) && /tag ready/.test(html), 'ボードと一覧に「外部に出せます」の印が出る');
+
+  // ⭐下見・履歴の詳細を読むだけで開く (要件 v1.3 §P Q5 / PR1): 許可リスト (capabilities) に無い操作は描かない (default-deny)
+  ok(/const can = \(name\) => detailCaps\.includes\(name\)/.test(html), '許された操作は detailCaps (サーバーの capabilities) で判定する');
+  ok(/if \(!isApp\(\)\) \{ openPreviewDetail\(el\.dataset\.id\); return; \}/.test(html), 'ボードのカードは下見でも開く (読むだけ)');
+  ok(!/下見なので開けません/.test(html), '「下見なので開けません」は無くなった');
+  ok(/openPreviewDetail\(tr\.dataset\.id\)/.test(html), '履歴の行からも読むだけで開く (終了したカードは一覧に無い)');
+  ok(/apiFetch\('\/api\/task-previews\/' \+ encodeURIComponent\(id\)\)/.test(html), '詳細は 1 枚だけサーバーから取る');
+  ok(/showDetail\(fallback, 'preview', \[\], \{ stale: true \}\)/.test(html), '取れなければボードに載っていた中身で開き、最新でないと出す');
+  ok(/<span id="dstateWrap"><\/span>/.test(html) && !/<button class="st todo" id="dstate"/.test(html), '状態のボタンは静的に置かない (許されたときだけ描く)');
+  ok(/can\('task\.status\.change'\)\s*\?\s*'<button class="st /.test(html) && /'<span class="st ro /.test(html), '許されなければ状態は札 (span) で出す');
+  ok(/if \(!reg \|\| !can\('task\.master\.edit'\)\) return/.test(html), '作業のやり方の「変更・登録」は許されたときだけ data-reg を付ける');
+  ok(/const addP = can\('task\.media\.add'\) && photos < 3/.test(html), '「写真をとる」の枠は許されたときだけ');
+  ok(/own && can\('task\.media\.add'\)/.test(html) && /\(canPhoto \? pend : ''\)/.test(html), '写真の × と送信中の枠も許されたときだけ');
+  ok(/if \(!can\('task\.work\.start'\)\) \{/.test(html), '「作業をはじめる」「中断」「できあがり」は許されたときだけ');
+  ok(/can\('task\.plan\.assign'\) && \(c\.status === 'not_started'/.test(html) && /can\('task\.external_ready'\) && c\.status !== 'closed'/.test(html)
+    && /can\('task\.label_wait\.edit'\) && c\.status !== 'closed'/.test(html), '今日やる・外部準備OK・ラベル待ち登録も許可リストで出し分ける');
+  ok(/function detailNoteHtml\(c\)/.test(html) && /に取り込んだ時点/.test(html) && /いまのアプリの記録/.test(html), '下見の詳細には「何がいつ時点か」を分けて出す');
+  ok(/if \(!can\('task\.master\.edit'\)\) return;/.test(html) && /if \(curDetail && can\('task\.status\.change'\)\) openSt/.test(html)
+    && /if \(!can\('task\.work\.start'\)\) return;/.test(html) && /if \(!can\('task\.media\.add'\)\) return;/.test(html), '変更・開始・撮影の入口も許可リストで止める (二重の守り)');
+  ok(/capabilities: j\.capabilities/.test(html) && /capabilities: s\.capabilities \|\| \[\]/.test(html), '端末に残す前回の一覧にも許可リストを持たせる (無ければ何も許さない)');
+  ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
+  ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
+  const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
+  ok(/const CACHE = 'iroha-work-shell-v2'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+}
+
+console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許可リスト');
+{
+  const { capabilitiesFor, CAP } = await import('../apps/iroha-work/capabilities.js');
+  const app = capabilitiesFor('app'), notion = capabilitiesFor('notion'), pv = capabilitiesFor('preview');
+  ok(Array.isArray(pv) && pv.length === 0, '下見・履歴は何も許さない');
+  ok([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT].every(c => notion.includes(c))
+    && ![CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].some(c => notion.includes(c)),
+    'Notion 正本 = 状態変更・作業開始・写真・作業のやり方 (今日やる等は許さない)');
+  ok(notion.every(c => app.includes(c)) && [CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].every(c => app.includes(c)),
+    'アプリ正本 = Notion 正本の全部 + 今日やる・外部準備OK・取消の判断・ラベル待ち・まとめて棚入完了');
+  app.push('x'); pv.push('y');
+  ok(!capabilitiesFor('app').includes('x') && capabilitiesFor('preview').length === 0, '返した配列を壊しても共有の定義は変わらない');
+  ok(capabilitiesFor('unknown').length === 0 && capabilitiesFor(undefined).length === 0, '知らないモードは何も許さない (default-deny)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

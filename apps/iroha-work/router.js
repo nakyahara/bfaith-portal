@@ -34,7 +34,8 @@ import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES 
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
 import { countTasksByStatus, listTasksNeedingReview, listOrphans } from './tasks-db.js';
 import { OPEN_STATUSES } from './tasks.js';
-import { buildList, buildTaskList, buildHistory, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask } from './service.js';
+import { buildList, buildTaskList, buildTaskCard, buildHistory, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask } from './service.js';
+import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel } from './tasks.js';
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
@@ -126,6 +127,12 @@ function parseTaskId(v) {
   return Number.isSafeInteger(n) ? n : null;   // 16 桁は 2^53 を超え得る (丸めた id で別の行を引かない — Codex A1b R2)
 }
 const BAD_TASK_ID = { ok: false, error: 'bad_request', message: 'カードの指定が不正です (一覧を更新してください)' };
+/**
+ * Notion 正本のとき、数値の id (= f_iroha_tasks の id。下見のボード・履歴の詳細で見えるカード) を
+ * 書き込み先に受け取らない。画面は許可リスト (capabilities) で操作を描かないが、サーバーでも必ず断る (要件 v1.3 §P Q5)
+ */
+const PREVIEW_WRITE_REJECTED = { ok: false, error: 'notion_mode', message: '下見のカードには書き込めません (正本は Notion です)' };
+const isPreviewIdInNotionMode = (cardId) => !isAppMode() && parseTaskId(cardId) != null;
 
 const api = fn => async (req, res) => {
   try { await fn(req, res); } catch (e) {
@@ -233,6 +240,8 @@ router.get('/api/state', api(async (req, res) => {
     workers: listIrohaWorkers(),
     options: workOptionsForState(),
     refresh,
+    // 画面に許す操作。画面はこのリストにある操作だけ描く (default-deny — 要件 v1.3 §P Q5)
+    capabilities: capabilitiesFor(appMode ? 'app' : 'notion'),
     // タイマー表示の基準 (iPad の時計を信じない — 画面はこの値とのオフセットで経過を出す)
     serverNow: new Date().toISOString(),
     me: { session: req.iwUser || null, device: req.iwDevice ? { id: req.iwDevice.id, label: req.iwDevice.label } : null, admin: isAdmin(req) },
@@ -292,6 +301,7 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
   const to = String(req.body?.to || '').trim();
   const expect = req.body?.expect == null ? null : String(req.body.expect);
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
+  if (isPreviewIdInNotionMode(pageId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
 
   // 職員としての本人確認。PIN はリクエストが職員限定操作 (棚入完了が絡む) のときだけ要求する
   let isStaff = false;
@@ -450,8 +460,32 @@ router.post('/api/review-cleared', checkOrigin, api((req, res) => {
  * ⚠中身は取込時点の状態。Notion 側でその後に動かした分は入っていない (画面にもその旨を出す)
  */
 router.get('/api/preview-tasks', api((req, res) => {
-  res.json({ ok: true, ...buildTaskList(), preview: !isAppMode(), serverNow: new Date().toISOString() });
+  res.json({ ok: true, ...buildTaskList(), preview: !isAppMode(), capabilities: capabilitiesFor('preview'), serverNow: new Date().toISOString() });
 }));
+
+/**
+ * 詳細 1 枚を読むだけで返す (下見のボード・履歴から開く。要件 v1.3 §P Q5 / PR1)。正本を問わず開けるが、
+ * 何も許さない (capabilities: [])。終了したタスクも返す (履歴)。
+ * 鮮度は項目ごとに違う: 状態 = Notion を取り込んだ時点 (notionSyncedAt)・在庫 = card.loc_at・
+ * 作業のやり方/写真/作業時間 = いまのアプリ DB — 画面で分けて出す
+ */
+router.get('/api/task-previews/:id(\\d+)', api((req, res) => {
+  const card = buildTaskCard(parseTaskId(req.params.id));
+  if (!card) return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません' });
+  res.json({
+    ok: true, preview: true, card, capabilities: capabilitiesFor('preview'),
+    notionSyncedAt: lastNotionImportAt(), serverNow: new Date().toISOString(),
+  });
+}));
+/** Notion を最後に取り込んだ時刻。meta に無ければ (この記録を始める前の取込)、取込が最後に書いた行の時刻で代える */
+function lastNotionImportAt() {
+  const m = getMeta('last_import_at');
+  if (m) return m;
+  try {
+    const r = getDB().prepare("SELECT MAX(updated_at) AS at FROM f_iroha_tasks WHERE updated_by LIKE 'import:%'").get();
+    return (r && r.at) || null;
+  } catch { return null; }
+}
 
 /**
  * まとめて棚入完了 (アプリ正本のみ)。棚入待ちのカードだけを 終了 (棚入完了) にする。
@@ -593,6 +627,7 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   // シード・権限判定に使うカード値 (商品コードが一致するカードだけ)。
   // アプリ正本ならタスクの作成時スナップショット、Notion 正本ならカードのプロパティ
   const cardId = String(req.body?.id || req.body?.page_id || '');
+  if (isPreviewIdInNotionMode(cardId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
   let cardValues = {};
   if (isAppMode()) {
     const t = parseTaskId(cardId) == null ? null : getTask(parseTaskId(cardId));
@@ -725,6 +760,7 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
     if (!req.file) return res.status(400).json({ ok: false, error: 'no_file', message: 'ファイルがありません' });
     if (!isDriveConfigured()) { cleanup(); return res.status(503).json({ ok: false, error: 'not_configured', message: 'ドライブ保存が未設定です (職員の方は管理者に連絡してください)' }); }
     const cardId = String(req.body?.id || req.body?.page_id || '').trim();
+    if (isPreviewIdInNotionMode(cardId)) { cleanup(); return res.status(409).json(PREVIEW_WRITE_REJECTED); }
     const kind = String(req.body?.kind || '');
     if (kind === 'video') { cleanup(); return res.status(400).json({ ok: false, error: 'video_disabled', message: '動画は今つかえません (写真をとってください)' }); }
     if (!cardId || kind !== 'photo') {
@@ -875,6 +911,7 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   if (isAppMode()) return startSessionApp(req, res, w.worker);
   const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
+  if (isPreviewIdInNotionMode(pageId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
   // 開始可否は**必ず**実ページを直接再取得して判定する (Codex PR2-R3: キャッシュが3分以内でも、
   // その間に棚入完了・取消・アーカイブ・別DB移動があり得る)。取得失敗なら開始を拒否 —
   // どのみち Notion に書けない状況なので、素性の分からないカードで時間だけ記録しない
@@ -961,6 +998,7 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
   }
   const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
+  if (isPreviewIdInNotionMode(pageId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
   const r = stopSession({ pageId, workerId: w.worker.id, sessionId: req.body?.session_id, reason });
   safeLog({ action: 'session_stop', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
     deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
