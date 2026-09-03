@@ -1105,6 +1105,11 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     db.getDB().prepare('UPDATE fbx_rows SET asin = ? WHERE fnsku = ?').run('B0OTHER001', 'X0FIN00001');
     assert.deepEqual(db.listRowsNeedingImages(c.runId).map((x) => x.fnsku), ['X0FIN00001']);
     db.getDB().prepare('UPDATE fbx_rows SET asin = NULL WHERE fnsku = ?').run('X0FIN00001');
+    // miniPC の応答キーは image (getProduct)。mainImage を読んでいて全商品が「画像なし」になった 2026-09-03 の再発防止
+    assert.equal(img.pickImageUrl({ ok: true, asin: 'B0', image: 'https://m.media-amazon.com/images/I/x.jpg' }), 'https://m.media-amazon.com/images/I/x.jpg');
+    assert.equal(img.pickImageUrl({ ok: true, mainImage: 'https://m.media-amazon.com/images/I/y.jpg' }), 'https://m.media-amazon.com/images/I/y.jpg');
+    assert.equal(img.pickImageUrl({ ok: true, image: '' }), null);
+    assert.equal(img.pickImageUrl(null), null);
     assert.equal(img.sanitizeImageUrl('https://m.media-amazon.com/images/I/a.jpg'), 'https://m.media-amazon.com/images/I/a.jpg');
     assert.equal(img.sanitizeImageUrl('http://m.media-amazon.com/images/I/a.jpg'), null);
     assert.equal(img.sanitizeImageUrl('https://evil.example.com/a.jpg'), null);

@@ -402,6 +402,9 @@ export function createTables(d = getDB()) {
   addColumn('fbx_product_images', 'error_message', 'TEXT');   // 画像が出ない理由 (管理画面の診断)
   // 箱の中身が変わるたびに +1。読み合わせ画面が持っている版と違えばクローズを拒否する (Codex R18 #1)
   addColumn('fbx_boxes', 'content_version', 'INTEGER NOT NULL DEFAULT 0');
+  // 2026-09-03: miniPC の応答キーを取り違えて (mainImage ← 実際は image) 全商品が「画像なし」になったキャッシュを捨てる。
+  // 現行コードは none/error に必ず理由を書くので、理由が空の none = 旧バグの結果だけが消える (以後は 0 件)
+  d.exec(`DELETE FROM fbx_product_images WHERE status = 'none' AND error_message IS NULL`);
   d.exec(`UPDATE fbx_exports SET sta_uploaded_at = (SELECT r.sta_uploaded_at FROM fbx_runs r WHERE r.sta_export_id = fbx_exports.id)
     WHERE sta_uploaded_at IS NULL AND EXISTS (SELECT 1 FROM fbx_runs r WHERE r.sta_export_id = fbx_exports.id AND r.sta_uploaded_at IS NOT NULL)`);
 
