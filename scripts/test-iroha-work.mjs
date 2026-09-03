@@ -543,7 +543,7 @@ console.log('\n[13] 作業時間セッション');
 console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
 {
   process.env.IROHA_WORK_DRIVE_FOLDER_ID = 'folder-test';
-  const { addMedia, sniffKind, countActivePhotos, softDeleteMedia, resetMedia, processMediaQueue,
+  const { addMedia, sniffKind, countActiveMedia, photosByCodeKey, softDeleteMedia, resetMedia, processMediaQueue,
     mediaByPage, listMediaForAdmin, _setDriveUpload, MEDIA_DIR } = await import('../apps/iroha-work/media.js');
   const worker1 = listIrohaWorkers(true).find(w => w.display_name === 'やまだ');
   const worker2 = listIrohaWorkers(true).find(w => w.display_name === 'すずき');
@@ -569,14 +569,14 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   ok(a1c.already === true && !a1c.deleteToken, '別端末からの同 operation_id にはトークンを返さない');
   ok(addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('bad.jpg', mp4), worker: worker1, operationId: 'op-bad-000001' }).error === 'bad_file',
     '中身が写真でなければ拒否 (Content-Type を信じない)');
-  addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a2.jpg', jpeg), worker: worker1, operationId: 'op-photo-0002' });
-  const a3 = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a3.jpg', jpeg), worker: worker2, deviceId: 11, operationId: 'op-photo-0003' });
+  addMedia({ pageId: pMedia.id, productCode: 'PROD-M', kind: 'photo', filePath: tmp('a2.jpg', jpeg), worker: worker1, operationId: 'op-photo-0002' });
+  const a3 = addMedia({ pageId: pMedia.id, productCode: 'PROD-M', kind: 'photo', filePath: tmp('a3.jpg', jpeg), worker: worker2, deviceId: 11, operationId: 'op-photo-0003' });
   ok(a1.deleteToken && a3.deleteToken && a1.deleteToken !== a3.deleteToken, '削除トークンは行ごとに別');
   ok(addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a4.jpg', jpeg), worker: worker1, operationId: 'op-photo-0004' }).error === 'cap_reached',
     '写真は3枚まで');
   const v1 = addMedia({ pageId: pMedia.id, kind: 'video', mime: 'video/mp4', filePath: tmp('v1.mp4', mp4), worker: worker1, operationId: 'op-video-0001' });
   ok(v1.ok === true, '動画も受信できる');
-  ok(countActivePhotos(pMedia.id) === 3, 'countActivePhotos = 3 (棚入完了ゲートの根拠)');
+  ok(countActiveMedia(pMedia.id, 'photo') === 3, '有効な写真 3 枚 (枚数上限の根拠)');
 
   // キュー: 1回目は「Drive に作成できたが応答が消えた」→ 再試行は operation_id で**回収**し
   // 二重作成しない (Codex PR3 #3 の契約をモックで再現)
@@ -607,12 +607,30 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   ok(patched.length > 0 && patched[patched.length - 1].body.properties['完成写真'].files.length === 4,
     'Notion「完成写真」に4件 (写真3+動画1) が付く');
 
+  // 「前回の完成形」: 同じ商品コードの**別カード**に、Drive 保存済みの写真が新しい順で付く
+  // (中原さん 2026-09-03: 写真は完了の証拠ではなく、次に同じ商品を作る人への見本)
+  {
+    const { upsertCachePage } = await import('../apps/iroha-work/db.js');
+    const pNext = mkPage({ status: '未着手', title: '同じ商品の次回', code: 'prod-m' });   // 大小文字違いでも同じ商品
+    upsertCachePage(parsePage(pNext));
+    upsertCachePage(parsePage(pMedia));   // 写真を撮ったカード自身も一覧に居る状態で比べる
+    clearEnrichCache();
+    const list = buildList().cards;
+    const next = list.find(c => c.page_id === pNext.id);
+    const self = list.find(c => c.page_id === pMedia.id);
+    ok(next && next.previous_photos.length === 3, `次回のカードに前回の写真3枚 (実際 ${next && next.previous_photos.length})`);
+    ok(next && next.previous_photos.every(p => p.page_id === pMedia.id && p.worker_name && p.created_at), '前回のカードの写真 (撮った人・日時つき)');
+    ok(next && next.previous_photos[0].id > next.previous_photos[2].id, '新しい順');
+    ok(self && self.previous_photos.length === 0, '自分のカードの写真は「前回」に含めない');
+    ok(self && self.media.every(m => m.viewable === true), 'Drive 保存済みは viewable (画面は /api/media/:id/file で表示)');
+  }
+
   // 論理削除: 削除トークンが合わなければ消せない (worker_id 偽装は無意味) / 合えば消せる
   const target = rows.find(m => m.operation_id === 'op-photo-0003');
   ok(softDeleteMedia(target.id, { deleteToken: a1.deleteToken }).error === 'forbidden', '別の写真のトークンでは消せない');
   ok(softDeleteMedia(target.id, { deleteToken: null }).error === 'forbidden', 'トークンなしも消せない');
   ok(softDeleteMedia(target.id, { deleteToken: a3.deleteToken }).ok === true, '撮影した端末のトークンなら消せる (論理削除)');
-  ok(countActivePhotos(pMedia.id) === 2, '削除後は2枚');
+  ok(countActiveMedia(pMedia.id, 'photo') === 2, '削除後は2枚');
   await new Promise(r => setTimeout(r, 30));
   await processMediaQueue();
   const last = mock.patched.filter(p => p.id === pMedia.id && p.body.properties?.['完成写真']).pop();
@@ -629,14 +647,15 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   await processMediaQueue();
   const soloLast = mock.patched.filter(p => p.id === pSolo.id && p.body.properties?.['完成写真']).pop();
   ok(soloLast && soloLast.body.properties['完成写真'].files.length === 0, 'Notion の完成写真が空になる');
-  ok(countActivePhotos(pSolo.id) === 0, '棚入完了ゲートも0枚扱い');
+  ok(countActiveMedia(pSolo.id, 'photo') === 0, '削除後は 0 枚');
 
   // 恒久失敗 (10回) した写真は棚入完了ゲートに数えない (Codex PR3 #4)
   const pDead = mkPage({ status: '作業中', title: '失敗だけ', code: 'PROD-X2' });
   addMedia({ pageId: pDead.id, kind: 'photo', filePath: tmp('d1.jpg', jpeg), worker: worker1, operationId: 'op-dead-00001' });
-  ok(countActivePhotos(pDead.id) === 1, '送信待ち (stored) は数える');
+  ok(countActiveMedia(pDead.id, 'photo') === 1, '送信待ち (stored) も枚数上限には数える');
   getDB().prepare("UPDATE f_iroha_card_media SET next_retry_at = '9999-12-31T00:00:00.000Z', error = 'x' WHERE operation_id = 'op-dead-00001'").run();
-  ok(countActivePhotos(pDead.id) === 0, '停止した失敗写真は数えない (保存されない写真だけで完了できない)');
+  ok(countActiveMedia(pDead.id, 'photo') === 1, '停止した失敗写真も枚数上限には残る (削除して撮り直す)');
+  ok(!(photosByCodeKey().get('prod-x2') || []).length, '停止した失敗写真 (Drive 未保存) は「前回の完成形」候補にならない');
 
   // Notion PATCH 中に削除が割り込んでも、削除の同期要求が消えない (revision 方式 — PR3-R2)
   const pRace2 = mkPage({ status: '作業中', title: '同期レース', code: 'PROD-R2' });

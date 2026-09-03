@@ -30,7 +30,7 @@ import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES 
 import { buildList, classifyMasterEdit, clearEnrichCache, masterOf } from './service.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import {
-  addMedia, softDeleteMedia, countActivePhotos, resetMedia, listMediaForAdmin, schedule as scheduleMedia,
+  addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
   listPageSyncForAdmin, resetPageSync,
   isDriveConfigured, MEDIA_DIR, MAX_VIDEO_BYTES,
 } from './media.js';
@@ -114,7 +114,7 @@ router.use(access);
 router.get('/manifest.json', (req, res) => {
   res.json({
     name: 'いろは在庫化', short_name: 'いろは在庫化', start_url: `${BASE}/`, scope: `${BASE}/`,
-    display: 'standalone', orientation: 'any', background_color: '#F4F6F1', theme_color: '#3E8E5A',
+    display: 'standalone', orientation: 'any', background_color: '#F3F5F9', theme_color: '#1F5EFF',
     icons: [
       { src: '/app-icons/iroha-work-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
       { src: '/app-icons/iroha-work-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
@@ -254,28 +254,9 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
     }
   }
 
-  // 棚入完了には できあがり写真1枚以上 (要件 §6)。スキップは**本人確認済みの職員のみ**
-  // (skip_photo。changeStatus 側の staff_required に頼らず API 入口でも強制 — Codex PR3-R4)
-  let skipPhotoUsed = false;
-  if (to === '棚入完了' && countActivePhotos(pageId) === 0) {
-    if (!req.body?.skip_photo) {
-      return res.status(409).json({ ok: false, error: 'photo_required',
-        message: 'できあがりの写真がまだありません。写真を1枚以上とってから棚入完了にしてください' });
-    }
-    if (!isStaff) {
-      return res.status(403).json({ ok: false, error: 'staff_required',
-        message: '写真なしでの完了は職員のみです (職員の名前を選び、PINを入れてください)' });
-    }
-    skipPhotoUsed = true;
-  }
-
+  // 写真は「次回の見本」であって完了の証拠ではない → 棚入完了に写真は要らない
+  // (中原さん 2026-09-03。旧「写真1枚以上」ゲートと skip_photo は撤去)
   const r = await changeStatus({ pageId, to, expect, isStaff });
-  // スキップの履歴は**結果が出てから**残す (変更が失敗したのに「写真なしで完了した」と
-  // 記録しない — Codex PR3 #5)
-  if (skipPhotoUsed) {
-    safeLog({ action: 'status_skip_photo', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
-      deviceLabel: deviceLabelOf(req), to, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
-  }
   // 監査ログの失敗で Notion 更新済みの結果を「失敗」に見せない (Codex PR1 #6)
   try {
     logEvent({
@@ -447,6 +428,38 @@ router.post('/api/media', checkOrigin, mediaUpload.single('file'), api((req, res
     cleanup();
     throw e;
   }
+}));
+
+/**
+ * 写真・動画の配信。iPad はサービスアカウントの Drive を直接見られない (フォルダは公開しない —
+ * 要件 §6) ので、ここを通して出す。Drive 保存済みなら Drive からストリーム (Range をそのまま
+ * 転送 = 動画のシーク)、送信待ち (stored) ならローカル実体。端末認証 (access) の内側
+ */
+router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
+  const r = getMediaRow(Number(req.params.id));
+  if (!r || r.deleted_at) return res.status(404).json({ ok: false, error: 'not_found', message: '写真・動画が見つかりません' });
+  const mime = r.mime || (r.kind === 'photo' ? 'image/jpeg' : 'video/mp4');
+  res.set('Cache-Control', 'private, max-age=86400');
+  if (r.local_path && fs.existsSync(r.local_path)) {
+    return res.sendFile(path.resolve(r.local_path), { headers: { 'Content-Type': mime } });
+  }
+  if (!r.drive_file_id) return res.status(409).json({ ok: false, error: 'not_ready', message: 'まだ保存中です。少し待ってから開いてください' });
+  const etag = `"${r.drive_file_id}"`;
+  if (req.headers['if-none-match'] === etag) return res.status(304).end();
+  let dl;
+  try {
+    dl = await driveDownload({ fileId: r.drive_file_id, range: req.headers.range || null });
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: 'drive_error', message: `ドライブから取り出せませんでした (${e.message})` });
+  }
+  res.status(dl.status || 200);
+  res.set('ETag', etag);
+  res.set('Accept-Ranges', 'bytes');
+  res.type(mime);
+  if (dl.contentLength) res.set('Content-Length', String(dl.contentLength));
+  if (dl.contentRange) res.set('Content-Range', dl.contentRange);
+  dl.stream.on('error', (e) => { console.error(`[iroha-work] media #${r.id} の配信中に切断`, e.message); try { res.destroy(); } catch { /* 切れていれば何もしない */ } });
+  dl.stream.pipe(res);
 }));
 
 // 撮り直し用の削除 (論理削除)。本人確認 = アップロード時に返した削除トークン

@@ -19,6 +19,7 @@ import crypto from 'crypto';
 import { google } from 'googleapis';
 import { getDB } from './db.js';
 import { notionRequest, isNotionConfigured } from '../inbound-check/notion.js';
+import { codeKeyOf } from '../inbound-check/work-master.js';
 
 export const MAX_PHOTOS = 3;
 export const MAX_VIDEOS = 1;
@@ -60,14 +61,9 @@ export function countActiveMedia(pageId, kind) {
     WHERE page_id = ? AND kind = ? AND deleted_at IS NULL`).get(pageId, kind).c;
 }
 
-/**
- * 棚入完了ゲート用の写真枚数。送信待ち (stored) は数えるが、**10回失敗で停止した行は数えない**
- * (Codex PR3 #4: Drive にも Notion にも残らない写真だけで完了できてしまう)
- */
-export function countActivePhotos(pageId) {
-  return getDB().prepare(`SELECT COUNT(*) c FROM f_iroha_card_media
-    WHERE page_id = ? AND kind = 'photo' AND deleted_at IS NULL
-      AND (next_retry_at IS NULL OR next_retry_at < ?)`).get(pageId, BLOCKED_UNTIL).c;
+/** 1行 (配信 API 用。削除済みも返すので呼び元で deleted_at を見る) */
+export function getMediaRow(id) {
+  return getDB().prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id)) || null;
 }
 
 /** 先頭バイトだけ読む (動画をメモリへ丸ごと載せない) */
@@ -135,6 +131,8 @@ export function addMedia({ pageId, productCode = null, kind, mime, filePath, wor
 export function publicMedia(r) {
   return {
     id: r.id, kind: r.kind, status: r.status, url: r.drive_url || null,
+    // 画面で表示できるか (Drive 保存済み or ローカル実体あり)。表示は /api/media/:id/file 経由
+    viewable: !!(r.drive_file_id || r.local_path),
     worker_id: r.worker_id, worker_name: r.worker_name, created_at: r.created_at,
     error: r.next_retry_at === BLOCKED_UNTIL ? (r.error || '失敗') : null,   // 諦めた失敗だけ画面へ
   };
@@ -146,6 +144,27 @@ export function mediaByPage() {
   for (const r of getDB().prepare(`SELECT * FROM f_iroha_card_media WHERE deleted_at IS NULL ORDER BY id`).all()) {
     if (!map.has(r.page_id)) map.set(r.page_id, []);
     map.get(r.page_id).push(publicMedia(r));
+  }
+  return map;
+}
+
+/**
+ * 商品コード (codeKey) → 「前回の完成形」候補 (Drive 保存済みの写真、新しい順)。
+ * 写真は完了の証拠ではなく**次回同じ商品を作る人への見本** (中原さん 2026-09-03) —
+ * 同じ商品コードのカードが次に上がってきたとき、詳細の一番上に出す。
+ * ローカル実体だけの行 (stored) は再起動で消え得るので候補にしない。
+ * @returns Map<codeKey, Array<{id, page_id, worker_name, created_at}>>
+ */
+export function photosByCodeKey() {
+  const map = new Map();
+  const rows = getDB().prepare(`SELECT id, page_id, product_code, worker_name, created_at FROM f_iroha_card_media
+    WHERE kind = 'photo' AND deleted_at IS NULL AND drive_file_id IS NOT NULL AND product_code IS NOT NULL
+    ORDER BY id DESC`).all();
+  for (const r of rows) {
+    const key = codeKeyOf(r.product_code);
+    if (!key) continue;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push({ id: r.id, page_id: r.page_id, worker_name: r.worker_name, created_at: r.created_at });
   }
   return map;
 }
@@ -249,6 +268,27 @@ async function driveUploadReal({ localPath, filename, mime, operationId }) {
 
 let driveUploadImpl = driveUploadReal;
 export function _setDriveUpload(fn) { driveUploadImpl = fn || driveUploadReal; }
+
+/**
+ * Drive からの取り出し (配信 API 用)。Range をそのまま渡すと 206 + Content-Range が返る (動画のシーク)。
+ * @returns {{status:number, stream:ReadableStream, contentType:string|null, contentLength:string|null, contentRange:string|null}}
+ */
+async function driveDownloadReal({ fileId, range = null }) {
+  const drive = getDriveClient();
+  const res = await drive.files.get(
+    { fileId, alt: 'media', supportsAllDrives: true },
+    { responseType: 'stream', timeout: 120000, headers: range ? { Range: range } : {} },
+  );
+  return {
+    status: res.status, stream: res.data,
+    contentType: res.headers?.['content-type'] || null,
+    contentLength: res.headers?.['content-length'] || null,
+    contentRange: res.headers?.['content-range'] || null,
+  };
+}
+let driveDownloadImpl = driveDownloadReal;
+export function _setDriveDownload(fn) { driveDownloadImpl = fn || driveDownloadReal; }
+export function driveDownload(args) { return driveDownloadImpl(args); }
 
 // ファイル名に個人名を入れない (要件 §6): 日時 + 商品コード + 種類 + operation_id
 function filenameFor(r) {

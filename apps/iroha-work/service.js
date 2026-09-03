@@ -14,7 +14,7 @@ import { buildEnrichContext } from '../inbound-check/notion-sync.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
 import { getDB, listCache, activeSessionsByPage, estimateByProduct } from './db.js';
-import { mediaByPage } from './media.js';
+import { mediaByPage, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 
 // 「急ぎ」の線引き: 在庫切れ、または残り在庫日数がこれ以下
@@ -112,6 +112,7 @@ export function buildList() {
   const activeMap = activeSessionsByPage();
   const estimates = estimateByProduct();
   const mediaMap = mediaByPage();
+  const prevPhotos = photosByCodeKey();
 
   const cards = rows.map((r) => {
     let props = {};
@@ -143,6 +144,9 @@ export function buildList() {
       active: activeMap.get(r.page_id) || [],
       estimate: (k && estimates.get(k)) || null,
       media: mediaMap.get(r.page_id) || [],
+      // 「前回の完成形」= 同じ商品コードの**他のカード**で撮った写真 (新しい順・最大3枚)。
+      // 次に同じ商品を作る人への見本 (中原さん 2026-09-03: 写真は証拠ではなく見本)
+      previous_photos: (k ? (prevPhotos.get(k) || []) : []).filter(p => p.page_id !== r.page_id).slice(0, 3),
     };
   });
 
