@@ -56,6 +56,25 @@ const APPS = [
       <rect x="228" y="150" width="56" height="248" rx="10" fill="#fff" opacity="0.92"/>
       <path d="M256 118 C 210 140, 210 176, 256 176 C 302 176, 302 140, 256 118 Z" fill="#fff" opacity="0.92"/>`,
   },
+  {
+    slug: 'iroha-work',
+    label: 'いろは在庫化',
+    bg: ['#0ca678', '#087f5b'],     // ティール = いろは (梱包の緑と並ばないが、念のため色味を変える)
+    // 棚 (2段・商品が並ぶ) + 上から商品を入れる矢印 = 「在庫化 (棚入れ)」。
+    // 単色プレースホルダだったものを置き換え (中原さん 2026-09-03「分かりやすい在庫化みたいな形に」)
+    art: `
+      <rect x="104" y="196" width="304" height="216" rx="18" fill="rgba(255,255,255,0.18)"/>
+      <path d="M104 304 L408 304" stroke="#fff" stroke-width="14" opacity="0.55"/>
+      <rect x="128" y="232" width="56" height="56" rx="10" fill="#fff" opacity="0.92"/>
+      <rect x="200" y="232" width="56" height="56" rx="10" fill="#fff" opacity="0.92"/>
+      <rect x="128" y="340" width="56" height="56" rx="10" fill="#fff" opacity="0.92"/>
+      <rect x="200" y="340" width="56" height="56" rx="10" fill="#fff" opacity="0.92"/>
+      <rect x="272" y="340" width="56" height="56" rx="10" fill="#fff" opacity="0.92"/>
+      <rect x="300" y="80" width="72" height="72" rx="12" fill="#fff" opacity="0.92"/>
+      <path d="M336 168 L336 244" stroke="#fff" stroke-width="30" stroke-linecap="round"/>
+      <path d="M298 212 L336 254 L374 212" fill="none" stroke="#fff" stroke-width="30"
+            stroke-linecap="round" stroke-linejoin="round"/>`,
+  },
 ];
 
 const SIZES = [180, 192, 512];
