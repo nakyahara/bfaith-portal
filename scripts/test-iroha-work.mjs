@@ -1570,7 +1570,24 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok(hist.json.rows[0].closed_at >= hist.json.rows[hist.json.rows.length - 1].closed_at, '新しい順');
       const none = await call('GET', '/api/history?from=2999-01-01', { cookie });
       ok(none.status === 200 && none.json.total === 0 && none.json.fromDate === '2999-01-01', '未来を起点にすると 0 件');
-      ok((await call('GET', '/api/history?from=zzz', { cookie })).json.fromDate === null, '日付でない from は無視する');
+      for (const bad of ['zzz', '2026-99-99', '2026-02-30', '2026-13-01', '20260903']) {
+        const r = await call('GET', '/api/history?from=' + bad, { cookie });
+        if (r.status !== 400) ok(false, `不正な日付 ${bad} は 400 (実際 ${r.status})`);
+      }
+      ok((await call('GET', '/api/history?from=2026-99-99', { cookie })).status === 400
+        && (await call('GET', '/api/history?to=2026-02-30', { cookie })).status === 400, '実在しない日付は 400 (500 にしない)');
+      ok((await call('GET', '/api/history?from=2026-02-29', { cookie })).status === 400
+        && (await call('GET', '/api/history?from=2024-02-29', { cookie })).status === 200, '閏日は年で判定する (2026/2/29 は無い・2024/2/29 はある)');
+      // JST の日付境界: 終了日はその日を含む
+      db.prepare("UPDATE f_iroha_tasks SET closed_at = '2026-09-03T14:59:59.000Z' WHERE id = ?").run(r1);   // JST 9/3 23:59:59
+      db.prepare("UPDATE f_iroha_tasks SET closed_at = '2026-09-03T15:00:00.000Z' WHERE id = ?").run(r2);   // JST 9/4 00:00:00
+      const d3 = await call('GET', '/api/history?from=2026-09-03&to=2026-09-03&q=BULK-X', { cookie });
+      ok(d3.json.rows.some((x) => x.id === r1) && !d3.json.rows.some((x) => x.id === r2), '終了日 9/3 を指定すると 9/3 23:59:59 JST まで入り、9/4 00:00 は入らない');
+      const d4 = await call('GET', '/api/history?from=2026-09-04&to=2026-09-04&q=BULK-X', { cookie });
+      ok(d4.json.rows.some((x) => x.id === r2) && !d4.json.rows.some((x) => x.id === r1), '9/4 を指定すると 9/4 の分だけ');
+      const far = await call('GET', '/api/history?to=9999-12-31&q=BULK-X', { cookie });
+      ok(far.status === 200 && far.json.rows.length > 0, '上限の年 (9999-12-31) でも 500 にならず全部出る (翌日が西暦10000 になる罠)');
+      ok((await call('GET', '/api/history?from=0001-01-01&to=9999-12-31', { cookie })).status === 200, '端から端までの指定も通る');
       const one = await call('GET', '/api/history?q=' + encodeURIComponent('棚入待ち1'), { cookie });
       ok(one.json.total === 1 && one.json.rows[0].id === r1 && one.json.rows[0].facility_name === 'いろは', '商品名で絞れる (拠点名つき)');
     }
@@ -1778,6 +1795,18 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
   ok(S.buildHistory({ q: 'PRC-A', from: '2999-01-01T00:00:00Z' }).total === 0, '期間で絞れる');
   ok(TD.countClosedTasks({ q: 'ないものPRC' }) === 0, '検索は商品名・商品コードだけ');
 
+  // 監査ログ (操作履歴) が書けなければ、棚入完了ごと戻す (権限のいる操作なので記録を落とさない — Codex PR-C R1)
+  {
+    const e1 = mk(9205, 'ログ失敗E', 'ready_for_stocking');
+    db.exec('ALTER TABLE f_iroha_app_events RENAME TO f_iroha_app_events__bak');
+    let threw = null;
+    try { TD.bulkCloseReady({ taskIds: [e1], actor: 'test' }); } catch (e) { threw = e; }
+    db.exec('ALTER TABLE f_iroha_app_events__bak RENAME TO f_iroha_app_events');
+    ok(threw && /no such table/i.test(threw.message), '履歴を書けないと例外になる (握り潰さない)');
+    ok(TD.getTask(e1).status === 'ready_for_stocking' && TD.getTask(e1).closed_at == null, '棚入完了は取り消される (棚入待ちのまま)');
+    ok(TD.bulkCloseReady({ taskIds: [e1], actor: 'test' }).done.length === 1, '履歴が戻ればやり直せる');
+  }
+
   // ラベル待ちの一覧に商品情報が乗る
   const d = TD.upsertTaskFromImport({ notion_page_id: 'prc-9204', status: 'on_hold', hold_reason_code: 'label_shortage', destination_id: 9204,
     product_code: 'PRC-A', product_name: 'ラベル待ちD', qty: 3, facility_code: 'iroha', arrival_date: '2026-09-01' }, { batchId: 'test-prc' }).id;
@@ -1792,6 +1821,34 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
   ok(upd.ok && upd.row.done === 1, '完了にできる');
   ok(!TD.listLabelWaits({}).some((x) => x.id === lw.row.id) && TD.listLabelWaits({ openOnly: false }).some((x) => x.id === lw.row.id), '完了は既定の一覧から消え、「すべて」には出る');
   ok(TD.listLabelWaits({ taskId: d, openOnly: false }).length === 1 && TD.listLabelWaits({ taskId: 999999, openOnly: false }).length === 0, 'カードで絞れる');
+}
+
+console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリックは委譲する)');
+{
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  // ⭐#views (画面切替) が .page の中にあると、ボードへ移った瞬間に切替ボタンごと消えて戻れない (Codex PR-C R1 重大)
+  const viewsAt = html.indexOf('<div class="views"');
+  const firstPageAt = html.indexOf('<div class="page ');
+  ok(viewsAt > 0 && firstPageAt > 0 && viewsAt < firstPageAt, '画面切替は最初の .page より前にある (どの画面でも出る)');
+  const headerAt = html.indexOf('<header class="top">');
+  ok(headerAt > 0 && headerAt < firstPageAt, '見出しも .page の外');
+  ok(html.indexOf('id="errBanner"') < firstPageAt && html.indexOf('id="warnBanner"') < firstPageAt, 'エラー・注意のバナーも .page の外 (どの画面でも見える)');
+  for (const id of ['listpage', 'boardpage', 'labelpage', 'historypage']) {
+    ok(html.includes(`class="page ${id}"`), `${id} は .page (詳細を開くと隠れる)`);
+  }
+  // 値をインラインの onclick に埋めない (HTML エスケープは JS 文字列のエスケープではない)
+  const inline = [...html.matchAll(/onclick="[^"]*(toggleBulk|openLw|openDetail|pickFacility|openSt)\(/g)].map((m) => m[0]);
+  ok(inline.length === 0, 'カード・行・チップのクリックは委譲 (onclick に値を埋め込まない): ' + (inline[0] || 'なし'));
+  ok(/data-fac=/.test(html) && /data-id=/.test(html) && /data-st=/.test(html), '値は data 属性で渡す');
+  // 絞り込みを変えたときに、見えないカードが選ばれたまま残らない
+  ok(/function syncBulkSelection/.test(html) && /renderBoard\(\)[\s\S]{0,400}syncBulkSelection/.test(html), 'ボードは描くたびに選択を見えているものへそろえる');
+  ok(/function renderList\(\)[\s\S]{0,900}syncBulkSelection/.test(html), '一覧も同じ');
+  // 画面を戻したときに描き直さないと、ボードで選んだ分が一覧の絞り込みと合わないまま残る (Codex PR-C R2)
+  ok(/function setView\(v\)[\s\S]{0,700}if \(v === 'list'\) renderList\(\);/.test(html), '画面を切り替えたら、その画面を描き直す (一覧も)');
+  // 一覧の後始末 (exitBulk) が curView のガードの中にないと、ボードで選んでいる最中に /api/state が返るだけで選択が消える
+  const listBody = html.slice(html.indexOf('function renderList()'), html.indexOf('function renderList()') + 900);
+  ok(/if \(curView === 'list'\) \{[\s\S]{0,200}exitBulk\(\)/.test(listBody), 'まとめて選択の解除は「一覧を見ているとき」だけ (ボードの選択を消さない)');
+  ok(!/tabindex="-1"/.test(html), 'チェックボックスはキーボードでも操作できる (tabindex="-1" を付けない)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

@@ -415,18 +415,22 @@ export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerN
     const now = utcNow();
     const done = [];
     const skipped = [];
+    // 対象は 1 回の SELECT で引く (200 件×3 クエリにしない — Codex PR-C R1 Low)
+    const found = new Map(db.prepare(`SELECT id, status, close_reason, product_name, product_code FROM f_iroha_tasks
+      WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids).map((r) => [r.id, r]));
     const upd = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'stocked', closed_at = ?, closed_by = ?,
         hold_reason_code = NULL, hold_reason_note = NULL, cancellation_requested_at = NULL, ready_at = COALESCE(ready_at, ?),
         version = version + 1, updated_at = ?, updated_by = ?
       WHERE id = ? AND status = 'ready_for_stocking'`);
     for (const id of ids) {
-      const t = getTask(id);
+      const t = found.get(id);
       if (!t) { skipped.push({ id, reason: 'not_found' }); continue; }
       const title = t.product_name || t.product_code || `#${id}`;
       if (t.status === 'closed' && t.close_reason === 'stocked') { skipped.push({ id, reason: 'already', title }); continue; }
       if (t.status !== 'ready_for_stocking') { skipped.push({ id, reason: 'not_ready', title, status: t.status }); continue; }
       if (upd.run(now, actor, now, now, actor, id).changes !== 1) { skipped.push({ id, reason: 'conflict', title }); continue; }
-      safeLogTaskEvent({ taskId: id, action: 'task_status', from: 'ready_for_stocking', to: 'closed:stocked (まとめて棚入完了)',
+      // 履歴は握り潰さない (権限のいる操作。記録できないなら全部やり直す — Codex PR-C R1)
+      logTaskEvent({ taskId: id, action: 'task_status', from: 'ready_for_stocking', to: 'closed:stocked (まとめて棚入完了)',
         workerId, workerName, deviceLabel, ok: true });
       done.push(id);
     }
