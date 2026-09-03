@@ -1,7 +1,7 @@
 /**
  * FBA納品 箱詰め記録 — 商品画像 (Amazon カタログの MAIN 画像 URL)
  *
- * 取得元 = miniPC の /service-api/research/product/:asin (SP-API Catalog Items, mainImage)。
+ * 取得元 = miniPC の /service-api/research/product/:asin (SP-API Catalog Items。応答のキーは image)。
  * SP-API の鍵は miniPC にしか無い ([[feedback_render_vs_minipc_api_placement]]) ので Render からは
  * サービス API 経由。結果は fbx_product_images に FNSKU 単位でキャッシュ (ok は恒久、none/error は翌日再試行)。
  * 画像は補助なので best-effort: 取れなくても作業は続く。
@@ -84,6 +84,15 @@ export function sanitizeImageUrl(url) {
   return ok ? u.toString() : null;
 }
 
+/**
+ * miniPC の /service-api/research/product/:asin の応答から MAIN 画像 URL を取り出す。
+ * ⚠ 応答のキーは `image` (apps/profit-calculator/sp-api.js の getProduct)。2026-09-03 に `mainImage` を
+ * 読んでいて全商品が「画像なし」になった — 別アプリの応答キーは実物で確かめる
+ */
+export function pickImageUrl(payload) {
+  return payload?.image || payload?.mainImage || payload?.imageUrl || null;
+}
+
 /** ASIN → MAIN 画像 URL (null = 画像なし)。テストで差し替え可 */
 let fetcher = async (asin) => {
   const res = await fetch(`${WAREHOUSE_URL}/service-api/research/product/${encodeURIComponent(asin)}`, {
@@ -92,7 +101,7 @@ let fetcher = async (asin) => {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const j = await res.json();
   if (!j.ok) throw new Error(j.message || j.error || 'ng');
-  return j.mainImage || null;
+  return pickImageUrl(j);
 };
 export function _setFetcher(fn) { fetcher = fn; }
 
