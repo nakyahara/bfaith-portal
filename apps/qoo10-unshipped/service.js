@@ -31,6 +31,12 @@
  *
  * 個人情報:
  *   注文者情報は読まない・出さない。扱うのは注文番号・日時・金額・商品名のみ。
+ *
+ * 表示する番号 (2026-09-03 変更):
+ *   通知には**注文番号** (source_order_key = Qoo10 の orderNo) を出す。QSM で注文を探すときは
+ *   注文番号で検索するため、梱包番号 (packNo) では現場が探せなかった。
+ *   まとめる単位は従来どおり梱包 (= 1発送) のまま。1梱包に注文番号が複数入ることがある
+ *   (本番実測 1,607梱包中49梱包 ≒ 3%) ので、その場合は注文番号を全部並べて「同梱」と添える。
  */
 import { getDB } from '../warehouse/db.js';
 import { jstDateStr } from '../../lib/jst-date.js';
@@ -106,6 +112,7 @@ export function countSeenToday(today) {
  *
  * 明細行が複数あるので **pack_no (梱包単位 = 1発送)** でまとめる。
  * pack_no が無い行は order_id を代わりのキーにする。
+ * 通知に出す注文番号は source_order_key (Qoo10 の orderNo。1行 = 1注文番号) を梱包内で全部集める。
  */
 export function findUnshipped(ctx) {
   const db = getDB();
@@ -113,6 +120,7 @@ export function findUnshipped(ctx) {
     SELECT COALESCE(NULLIF(CAST(pack_no AS TEXT), ''), order_id) AS group_key,
            MAX(CAST(pack_no AS TEXT))  AS pack_no,
            MIN(order_id)               AS order_id,
+           GROUP_CONCAT(DISTINCT source_order_key) AS order_keys,
            MIN(order_date)             AS order_date,
            MAX(shipping_status)        AS shipping_status,
            MAX(payment_method)         AS payment_method,
@@ -146,12 +154,24 @@ export function countAwaitingPayment(ctx) {
   return row?.n ?? 0;
 }
 
+/**
+ * 梱包内の注文番号を配列にする。
+ * source_order_key が空の行 (旧 legacy 行) は order_id の 'api:' を剥がして代用する。
+ * GROUP_CONCAT(DISTINCT) の並び順は保証されないので、ここで昇順に揃える。
+ */
+export function orderNosOf(row) {
+  const raw = String(row.order_keys || '').split(',').map(s => s.trim()).filter(s => s && s !== '0');
+  const nos = raw.length ? raw : [String(row.order_id || '').replace(/^api:/, '')].filter(Boolean);
+  return [...new Set(nos)].sort();
+}
+
 /** 1件を通知用に整える */
 export function summarize(row, ctx) {
   const orderedAt = parseQoo10Datetime(row.order_date);
   return {
     packNo: row.pack_no || row.group_key,
     orderId: row.order_id,
+    orderNos: orderNosOf(row),
     orderedAt,
     elapsedHours: orderedAt ? Math.round((ctx.now.getTime() - orderedAt.getTime()) / 36e5 * 10) / 10 : null,
     shippingStatus: row.shipping_status,
@@ -211,6 +231,12 @@ function truncate(s, n) {
   return str.length > n ? `${str.slice(0, n)}…` : str;
 }
 
+/** 注文番号の表示。1梱包に複数の注文番号が入っていれば全部並べて「同梱」と添える */
+function orderNoLabel(o) {
+  const nos = Array.isArray(o.orderNos) && o.orderNos.length ? o.orderNos : [o.packNo];
+  return nos.length > 1 ? `${nos.join(', ')} (同梱${nos.length}件)` : String(nos[0]);
+}
+
 function itemLabel(o) {
   if (!o.itemTitle) return '(商品名なし)';
   const head = truncate(o.itemTitle, 40);
@@ -242,7 +268,7 @@ export function buildMessage({ alerts, awaitingPayment, seenToday, stale, ctx })
   } else {
     lines.push(`🚨 出荷漏れの可能性 *${alerts.length}件*`);
     for (const o of alerts.slice(0, MAX_LINES)) {
-      lines.push(`・梱包番号 ${o.packNo}  ${yen(o.total)}  ${o.paymentMethod}${o.hasTracking ? '  [追跡番号あり]' : ''}`);
+      lines.push(`・注文番号 ${orderNoLabel(o)}  ${yen(o.total)}  ${o.paymentMethod}${o.hasTracking ? '  [追跡番号あり]' : ''}`);
       lines.push(`   注文 ${fmtJst(o.orderedAt)} (${o.elapsedHours}時間経過)`);
       lines.push(`   ${itemLabel(o)}`);
     }
