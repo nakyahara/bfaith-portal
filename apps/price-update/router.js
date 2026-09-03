@@ -27,6 +27,7 @@ import { makeYahooClient } from './yahoo-apply.js';
 import { makeAupayClient } from './aupay-apply.js';
 import { makeQoo10Client } from './qoo10-apply.js';
 import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
+import { toJst, TO_JST_CLIENT_SRC } from './format.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -386,6 +387,7 @@ router.get('/', (req, res) => {
     isAdmin: isAdmin(req),
     limits: runLimits(),
     runs: listRuns(db, 20),
+    toJst,
   });
 });
 
@@ -398,6 +400,8 @@ router.get('/runs/:runId', (req, res) => {
     displayName: req.session?.displayName || req.session?.email || '',
     isAdmin: isAdmin(req),
     run,
+    toJst,
+    toJstClientSrc: TO_JST_CLIENT_SRC,
   });
 });
 
