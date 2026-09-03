@@ -299,7 +299,10 @@
         $('#img-refresh').disabled = true;
         $('#img-refresh').textContent = '取得中… (商品数 × 0.6 秒)';
         const jj = await post(`/admin/runs/${runId}/images/refresh`);
-        alert(jj.ok ? `取得: ${jj.result.fetched} / 画像なし: ${jj.result.none} / 失敗: ${jj.result.failed}${jj.result.skipped ? ` (skip=${jj.result.skipped} ${jj.result.message || ''})` : ''}` : (jj.message || '失敗'));
+        alert(jj.ok
+          ? (jj.result.skipped ? `実行できません: ${jj.result.skipped} ${jj.result.message || ''}`
+            : `取得: ${jj.result.fetched} / 画像なし: ${jj.result.none} / 失敗: ${jj.result.failed}${jj.result.noAsin ? ` (ASIN不明 ${jj.result.noAsin})` : ''}${jj.result.remaining ? `\nまだ ${jj.result.remaining} 件残っています。もう一度押してください` : ''}`)
+          : (jj.message || '失敗'));
         b.click();
       });
       out.scrollIntoView({ behavior: 'smooth' });

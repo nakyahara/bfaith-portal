@@ -1051,7 +1051,7 @@ export function listBoxContents(boxId) {
  *   冪等性 → 行/箱/回の状態 → 残数 → 期限制約 → box_seq 採番 → 挿入 → 監査
  * layer は任意 (manual のみ。自動推定は保存しない — Codex R2 S2)
  */
-export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, deviceKey, deviceLabel, requestId, allowClosedBox = false }) {
+export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, deviceKey, deviceLabel, requestId }) {
   const q = Number(qty);
   if (!Number.isInteger(q) || q <= 0 || q > 100000) return { ok: false, error: 'bad_qty', message: '個数は1以上の整数で入力してください' };
   if (!deviceKey || !requestId) return { ok: false, error: 'bad_request', message: 'request_id がありません (画面を更新してください)' };
@@ -1095,8 +1095,7 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
       return { ok: false, error: 'wrong_group', message: 'この箱は別の梱包グループの箱です。同じシートの箱を選んでください' };
     }
     if (box.status === 'void') return { ok: false, error: 'box_void', message: 'この箱は取消済みです。別の箱を選んでください' };
-    // 閉じた箱への追加は不可。例外 = 職員による数の修正 (adjustPlacement) で同じ箱に入れ直すときだけ (Codex R14 #3)
-    if (box.status !== 'open' && !(allowClosedBox && box.status === 'closed')) return { ok: false, error: 'box_closed', message: 'この箱は閉じられています (職員が再オープンすれば入れられます)' };
+    if (box.status !== 'open') return { ok: false, error: 'box_closed', message: 'この箱は閉じられています (職員が再オープンすれば入れられます)' };
     // 残数 = 予定 − 投入済み − 確定不足 (Codex PR1 #4: 不足確定後にその分を超えて入れられない)
     const placed = placedOf(d, row.id);
     const shortage = d.prepare('SELECT COALESCE(shortage_qty, 0) s FROM fbx_row_work WHERE row_id = ?').get(row.id)?.s || 0;
@@ -1167,14 +1166,25 @@ export function revokePlacement({ placementId, byStaff = false, reason, worker, 
     if (byStaff && !String(reason || '').trim()) {
       return { ok: false, error: 'reason_required', message: '取消の理由を入力してください' };
     }
+    // 閉じた箱の中身が変わったら実測重量は合わない → 箱を開けて量り直しにする (Codex R17 #2:
+    // 古い重量が Excel に出る事故を防ぐ。開いた箱は出荷前チェックでブロックされる)
+    if (p.box_status === 'closed') {
+      d.prepare(`UPDATE fbx_boxes SET status = 'open', measured_weight_kg = NULL, closed_at = NULL, closed_by = NULL,
+        closed_reason = NULL, cushion_level = NULL, reopen_count = reopen_count + 1 WHERE id = ?`).run(p.box_id);
+      logEvent({ runId: p.run_id, action: 'box_reopen', targetType: 'box', targetId: p.box_id,
+        workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+        payload: { reason: '中身の訂正で自動オープン', auto: true, placementId: p.id } }, d);
+    }
     d.prepare('UPDATE fbx_placements SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ?')
       .run(utcNow(), worker?.display_name || null, reason ? String(reason).slice(0, 200) : null, p.id);
     bumpRunVersion(d, p.run_id);
+    // 監査: 誰が (worker) どの端末から (deviceLabel) 誰の記録を (originDevice) 取り消したか (Codex R17 #3)
     logEvent({ runId: p.run_id, action: 'placement_revoke', targetType: 'placement', targetId: p.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { rowId: p.row_id, boxId: p.box_id, qty: p.qty, byStaff, reason: reason || null,
-        otherDevice: p.device_key !== String(deviceKey ?? ''), boxClosed: p.box_status === 'closed' } }, d);
-    return { ok: true, placed: placedOf(d, p.row_id), boxClosed: p.box_status === 'closed' };
+        originWorker: p.worker_name || null, originDeviceKey: p.device_key, actorDeviceKey: String(deviceKey ?? ''),
+        otherDevice: p.device_key !== String(deviceKey ?? ''), boxReopened: p.box_status === 'closed' } }, d);
+    return { ok: true, placed: placedOf(d, p.row_id), boxReopened: p.box_status === 'closed' };
   }).immediate();
 }
 
@@ -1188,25 +1198,35 @@ export function adjustPlacement({ placementId, qty, byStaff = false, reason, wor
   if (!Number.isInteger(q) || q < 0 || q > 100000) return { ok: false, error: 'bad_qty', message: '個数は 0 以上の整数で入力してください' };
   const d = getDB();
   const fail = (r) => { const e = new Error('adjust_failed'); e.result = r; throw e; };
+  const reqId = requestId ? String(requestId) : `adj-${Number(placementId)}-${Date.now()}`;
   try {
     return d.transaction(() => {
       const p = d.prepare('SELECT * FROM fbx_placements WHERE id = ?').get(Number(placementId));
       if (!p) return { ok: false, error: 'not_found', message: '記録が見つかりません' };
-      if (p.revoked_at) return { ok: false, error: 'revoked', message: 'この記録は既に取り消されています (画面を更新してください)' };
+      // 再送 (通信断でのリトライ) の冪等性 (Codex R17 #1): 同じ端末×request_id で既に入れ直していればその結果を返す。
+      // qty=0 (取消だけ) の再送は、元の記録が取消済みなら成功として返す
+      const prevAdd = deviceKey ? d.prepare('SELECT * FROM fbx_placements WHERE device_key = ? AND request_id = ?').get(String(deviceKey), reqId) : null;
+      if (prevAdd && prevAdd.id !== p.id) {
+        return { ok: true, already: true, placementId: prevAdd.id, revokedId: p.id, placed: placedOf(d, prevAdd.row_id), from: p.qty, to: prevAdd.qty };
+      }
+      if (p.revoked_at) {
+        if (q === 0) return { ok: true, already: true, placementId: null, revokedId: p.id, placed: placedOf(d, p.row_id), from: p.qty, to: 0 };
+        return { ok: false, error: 'revoked', message: 'この記録は既に取り消されています (画面を更新してください)' };
+      }
       if (q === p.qty) return { ok: true, unchanged: true, placementId: p.id, placed: placedOf(d, p.row_id) };
-      // 箱が閉じていれば (職員のみ通る) 中身が変わる = 重さも変わる → 取消だけでも boxClosed を返して量り直しを案内する
-      const boxClosed = d.prepare('SELECT status FROM fbx_boxes WHERE id = ?').get(p.box_id)?.status === 'closed';
       const rv = revokePlacement({ placementId: p.id, byStaff, reason: reason || (byStaff ? '数の修正' : null), worker, deviceKey, deviceLabel });
       if (!rv.ok) return rv;
-      if (q === 0) return { ok: true, placementId: null, placed: rv.placed, revokedId: p.id, from: p.qty, to: 0, boxClosed };
-      // 入れ直しは元と同じ箱なので、箱が閉じていても許可する (取消と対で「数の訂正」を成立させる)
+      // 閉じた箱だった場合は revokePlacement が箱を開けている (量り直し) → 入れ直しは普通に通る
+      const boxReopened = !!rv.boxReopened;
+      if (q === 0) return { ok: true, placementId: null, placed: rv.placed, revokedId: p.id, from: p.qty, to: 0, boxReopened };
       const add = addPlacement({ runId: p.run_id, rowId: p.row_id, boxId: p.box_id, qty: q, expiry: p.expiry, layer: p.placement_layer,
-        worker, deviceKey, deviceLabel, requestId: requestId || `adj-${p.id}-${Date.now()}`, allowClosedBox: true });
+        worker, deviceKey, deviceLabel, requestId: reqId });
       if (!add.ok) fail(add);   // 入れ直せない (残数超など) → 取消ごと戻す
       logEvent({ runId: p.run_id, action: 'placement_adjust', targetType: 'placement', targetId: add.placementId,
         workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
-        payload: { from: p.qty, to: q, revokedId: p.id, boxId: p.box_id, byStaff, boxClosed } }, d);
-      return { ok: true, placementId: add.placementId, revokedId: p.id, placed: add.placed, from: p.qty, to: q, boxClosed };
+        payload: { from: p.qty, to: q, revokedId: p.id, boxId: p.box_id, byStaff, boxReopened,
+          originWorker: p.worker_name || null, originDeviceKey: p.device_key, actorDeviceKey: String(deviceKey ?? '') } }, d);
+      return { ok: true, placementId: add.placementId, revokedId: p.id, placed: add.placed, from: p.qty, to: q, boxReopened };
     }).immediate();
   } catch (e) {
     if (e.result) return e.result;

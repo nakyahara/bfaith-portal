@@ -106,14 +106,17 @@ const lastRunAt = new Map();
 export async function ensureRunImages(runId, { force = false } = {}) {
   const id = Number(runId);
   const remember = (r) => { lastRun.set(id, { at: new Date().toISOString(), ...r }); return r; };
-  if (!force && !imagesConfigured()) return remember({ skipped: 'not_configured', message: 'Render の WAREHOUSE_SERVICE_TOKEN が未設定です (miniPC の SP-API を呼べません)' });
+  // 設定チェックは force でも省かない (空トークンで miniPC を叩かない — Codex R17 #5)。force が無視するのは
+  // キャッシュの再試行待ちとスロットルだけ
+  if (!imagesConfigured()) return remember({ skipped: 'not_configured', message: 'Render の WAREHOUSE_SERVICE_TOKEN が未設定です (miniPC の SP-API を呼べません)' });
   if (inFlight.has(id)) return { skipped: 'in_flight' };
   if (!force && Date.now() - (lastRunAt.get(id) || 0) < THROTTLE_MS) return { skipped: 'throttled' };
   inFlight.add(id);
   lastRunAt.set(id, Date.now());
   try {
-    const rows = listRowsNeedingImages(id, force ? { retryAfterMs: 0 } : {});
-    if (rows.length === 0) return remember({ fetched: 0, failed: 0, none: 0, total: 0 });
+    const opts = force ? { retryAfterMs: 0 } : {};
+    const rows = listRowsNeedingImages(id, opts);
+    if (rows.length === 0) return remember({ fetched: 0, failed: 0, none: 0, total: 0, remaining: 0 });
     const index = await buildAsinIndex();
     if (index.error) console.warn('[fba-box] SKU属性 (ASIN) を読めません — 行の asin だけで画像を取ります:', index.error);
     let fetched = 0, failed = 0, none = 0, noAsin = 0;
@@ -138,7 +141,9 @@ export async function ensureRunImages(runId, { force = false } = {}) {
       }
       await new Promise((resolve) => setTimeout(resolve, INTERVAL_MS));
     }
-    return remember({ fetched, failed, none, noAsin, total: rows.length, attrsCount: index.count, attrsError: index.error, errors });
+    // 1 回の上限 (listRowsNeedingImages の limit) を超えた分は残る → 呼び出し側に伝える (Codex R17 #4)
+    const remaining = listRowsNeedingImages(id, opts).length;
+    return remember({ fetched, failed, none, noAsin, total: rows.length, remaining, attrsCount: index.count, attrsError: index.error, errors });
   } catch (e) {
     console.error('[fba-box] ensureRunImages', e);
     return remember({ skipped: 'error', error: e.message });

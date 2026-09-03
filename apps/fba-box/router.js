@@ -700,8 +700,8 @@ router.get('/admin/runs/:id(\\d+)/images', requireSession, api(async (req, res) 
   res.json({ ok: true, ...diag, items: diag.items.map((x) => ({ ...x, cache: cache.get(String(x.fnsku).toUpperCase()) || null })) });
 }));
 
-/** 商品画像を今すぐ取り直す (キャッシュの再試行待ちを無視) */
-router.post('/admin/runs/:id(\\d+)/images/refresh', requireSession, checkOrigin, api(async (req, res) => {
+/** 商品画像を今すぐ取り直す (キャッシュの再試行待ちを無視)。SP-API を叩くので管理者のみ (Codex R17 #6) */
+router.post('/admin/runs/:id(\\d+)/images/refresh', checkOrigin, requireAdmin, api(async (req, res) => {
   const state = getRunState(Number(req.params.id));
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
   const r = await ensureRunImages(Number(req.params.id), { force: true });

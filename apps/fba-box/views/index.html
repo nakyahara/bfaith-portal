@@ -638,7 +638,7 @@
       if (!confirm('この記録を取り消しますか?')) return;
       const j2 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: worker.id });
       if (!j2.ok) alert(j2.message);
-      else if (j2.boxClosed) alert('閉じた箱の中身を取り消しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
+      else if (j2.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
       await refresh(true); openRowDialog(rowId);
     }));
     dlg.querySelector('#d-add')?.addEventListener('click', async () => {
@@ -830,7 +830,7 @@
       if (!confirm('この記録を取り消しますか?')) return;
       const j2 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: worker.id });
       if (!j2.ok) alert(j2.message);
-      else if (j2.boxClosed) alert('閉じた箱の中身を取り消しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
+      else if (j2.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
       closeDialog(); openBoxDialog(boxId);
     }));
   }
@@ -943,7 +943,7 @@
       const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
       const j = await apiPost(`/api/placements/${placementId}/adjust`, { worker_id: worker.id, qty, request_id: requestId });
       if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message || '直せませんでした'; return; }
-      if (j.boxClosed) alert('閉じた箱の中身を直しました。箱の重さが変わっていれば、箱を開け直して量り直してください');
+      if (j.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
       closeDialog();
       await refresh(true); openRowDialog(row.id);
     });
