@@ -1938,6 +1938,15 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(!isApp\(\)\) \{ toast\('下見なので開けません/.test(html), '下見ではカードを開かない (詳細は正本のカードなので id が別)');
   ok(/const canBulk = isApp\(\) &&/.test(html), '下見では「まとめて棚入完了」を出さない');
   ok(/\$\('#lwSave'\)\.disabled = !isApp\(\);/.test(html), '下見ではラベル待ちを保存できない');
+  // 正本が変わったとき・つながらなかったときの追随 (Codex 下見 R1)
+  ok(/if \(wasApp !== isApp\(\)\) \{ preview = null;/.test(html), '正本が変わったら下見のデータを捨てる (古い下見を新しく見せない)');
+  ok(/if \(curView === 'board'\) \{ if \(isApp\(\)\) renderBoard\(\); else loadPreview\(\); \}/.test(html), '更新のたびに、Notion 正本なら下見も取り直す (502 から戻ったときもここで回復)');
+  ok(/previewInflight = loadPreviewOnce\(\)/.test(html), '下見の取得は同時に 1 本だけ (遅れて返った古い応答で上書きしない)');
+  ok(/previewDown = true;[\s\S]{0,300}if \(!preview\)/.test(html), 'つながらないときは前回の下見を消さない');
+  ok(/previewAt = Date\.now\(\);/.test(html) && /この画面を取ったのは/.test(html), 'いつ取った下見かを画面に出す');
+  ok(/function renderLwSaveState/.test(html) && /renderLwSaveState\(\);/.test(html), 'ラベル待ちを開いたままでも保存ボタンが正本に追随する');
+  ok(/if \(!isApp\(\)\) \{ \$\('#lwMsg'\)\.textContent = '下見なので保存できません/.test(html), '保存の入口でも下見なら止める');
+  ok(/btn\.disabled = !isApp\(\);   \/\/ 保存中に正本が変わっていたら/.test(html), '保存後にボタンを無条件で戻さない');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

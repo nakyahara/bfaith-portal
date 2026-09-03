@@ -676,7 +676,10 @@ async function loadStateOnce() {
   }
   if (serverDown) { serverDown = false; hideErr('down'); toast('サーバーにつながりました'); }
   reconnectMs = RECONNECT_MIN_MS; clearTimeout(reconnectTimer); reconnectTimer = null;
+  const wasApp = isApp();
   state = j;
+  // 正本が変わったら下見のデータは捨てる (古い下見を新しいものとして見せない — Codex 下見 R1)
+  if (wasApp !== isApp()) { preview = null; previewAt = null; previewDown = false; }
   ensureTabValid();
   saveSnapshot(j);
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
@@ -685,7 +688,9 @@ async function loadStateOnce() {
   renderViews();
   renderTabs();
   renderList();
-  if (curView === 'board') renderBoard();
+  // ボードを開いている間は、正本が Notion なら下見も取り直す (切替直後・502 から戻ったときもここで回復する)
+  if (curView === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
+  renderLwSaveState();
   restoreWorker();
   if (curDetail) {
     const c = findCard(curDetail);
@@ -852,22 +857,41 @@ function renderViews() { const el = $('#views'); if (el) el.hidden = false; }
 //   ボード・ラベル待ち・履歴はアプリ側のタスクを見る画面。正本が Notion の間も「どういう形か」は見られるようにする。
 //   ただし中身は**取り込んだ時点**の状態なので、それを画面にはっきり書く。書き変えはできない (切替前に触ると Notion と食い違う)
 let preview = null;
+let previewAt = null;        // 下見を取った時刻 (画面に出す。「取り込んだ時点」と混ぜない)
+let previewInflight = null;  // 同時に 2 本走らせない
+let previewDown = false;     // つながらなかった (次の更新でまた取りにいく)
 const boardState = () => (isApp() ? state : preview);
 const PREVIEW_NOTE = '👀 見るだけの下見です (正本はまだ Notion)'
   + '<small>ここに出ているのは Notion から取り込んだ時点の状態です。取り込んだ後に Notion で動かした分は入っていません。'
   + '「アプリを正本にする」と、ここが本物になって書き変えもできます。</small>';
 function renderPreviewNote() {
+  const extra = previewDown
+    ? '<small>⚠ いまサーバーにつながりません。前に取れた分を出しています。</small>'
+    : (previewAt ? '<small>この画面を取ったのは ' + esc(fmtTime(new Date(previewAt).toISOString())) + ' です。</small>' : '');
   for (const id of ['#prevBoard', '#prevLabel', '#prevHist']) {
     const el = $(id);
     if (!el) continue;
     el.hidden = isApp();
-    if (!isApp()) el.innerHTML = PREVIEW_NOTE;
+    if (!isApp()) el.innerHTML = PREVIEW_NOTE + (id === '#prevBoard' ? extra : '');
   }
 }
-async function loadPreview() {
+function loadPreview() {
+  if (previewInflight) return previewInflight;   // 同時に 1 本だけ (state と同じ作り)
+  previewInflight = loadPreviewOnce().finally(() => { previewInflight = null; });
+  return previewInflight;
+}
+async function loadPreviewOnce() {
   const j = await apiFetch('/api/preview-tasks');
-  if (!j.ok) { $('#board').innerHTML = '<div class="colempty">' + esc(j.message || '読み込めませんでした') + '</div>'; return; }
+  if (!j.ok) {
+    // つながらないときは前回の下見を消さない (消すと画面が空になる)。次の更新でまた取りにいく
+    previewDown = true;
+    if (!preview) $('#board').innerHTML = '<div class="colempty">' + esc(j.message || '読み込めませんでした') + ' — つながったら出ます</div>';
+    else renderBoard();
+    return;
+  }
+  previewDown = false;
   preview = j;
+  previewAt = Date.now();
   renderBoard();
 }
 
@@ -1042,6 +1066,14 @@ function openLwNew() {
   lwEditing = { task_id: c.id };
   fillLw({ occurred_on: state.today, qty: c.qty, location: 'Z' }, c.title);
 }
+/** 下見のあいだは保存させない。ダイアログを開いたまま正本が変わっても追随する (Codex 下見 R1) */
+function renderLwSaveState() {
+  const btn = $('#lwSave');
+  if (!btn || !$('#lwOv').classList.contains('on')) return;
+  btn.disabled = !isApp();
+  if (!isApp()) $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)';
+  else if ($('#lwMsg').textContent.startsWith('下見なので')) $('#lwMsg').textContent = '';
+}
 function fillLw(r, name) {
   $('#lwName').textContent = name || '—';
   $('#lwMsg').textContent = isApp() ? '' : '下見なので保存できません (アプリを正本にすると使えます)';
@@ -1068,6 +1100,7 @@ function pickLwLoc(v) {
 function closeLw() { $('#lwOv').classList.remove('on'); lwEditing = null; }
 async function saveLw() {
   if (!lwEditing) return;
+  if (!isApp()) { $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)'; return; }
   const w = worker;
   if (!w) { openGate(); return; }
   const btn = $('#lwSave');
@@ -1089,7 +1122,7 @@ async function saveLw() {
     toast('ラベル待ちを保存しました');
     if (curView === 'label') loadLabelWaits();
   } finally {
-    btn.disabled = false;
+    btn.disabled = !isApp();   // 保存中に正本が変わっていたら押せないまま
   }
 }
 
