@@ -105,8 +105,11 @@ let fetcher = async (asin) => {
 };
 export function _setFetcher(fn) { fetcher = fn; }
 
-const inFlight = new Set();
+/** 実行中の取得 (run_id → Promise)。「今すぐ取り直す」は終わるのを待ってから走る */
+const inFlight = new Map();
 const lastRunAt = new Map();
+// 裏の取得を待つ上限。待ち + 自分の取得が HTTP のタイムアウト (Render のプロキシ ~100秒) に収まる長さにする
+const WAIT_FOR_RUNNING_MS = 45_000;
 
 /**
  * 納品回の行のうち画像が無いものを取りに行く (直列・間隔付き)。fire-and-forget 前提で例外は投げない。
@@ -118,10 +121,19 @@ export async function ensureRunImages(runId, { force = false } = {}) {
   // 設定チェックは force でも省かない (空トークンで miniPC を叩かない — Codex R17 #5)。force が無視するのは
   // キャッシュの再試行待ちとスロットルだけ
   if (!imagesConfigured()) return remember({ skipped: 'not_configured', message: 'Render の WAREHOUSE_SERVICE_TOKEN が未設定です (miniPC の SP-API を呼べません)' });
-  if (inFlight.has(id)) return { skipped: 'in_flight' };
+  if (inFlight.has(id)) {
+    // 裏の取得が走っている: 自動 (force なし) はそのまま任せる。「今すぐ取り直す」は終わるのを待ってから実行する
+    if (!force) return { skipped: 'in_flight' };
+    const deadline = Date.now() + WAIT_FOR_RUNNING_MS;
+    while (inFlight.has(id) && Date.now() < deadline) {
+      try { await inFlight.get(id); } catch { /* 走っていた実行の失敗はここでは無視 */ }
+    }
+    if (inFlight.has(id)) return { skipped: 'in_flight', message: '画像の取得がまだ続いています。少し待ってからもう一度押してください' };
+  }
   if (!force && Date.now() - (lastRunAt.get(id) || 0) < THROTTLE_MS) return { skipped: 'throttled' };
-  inFlight.add(id);
   lastRunAt.set(id, Date.now());
+  let done;
+  inFlight.set(id, new Promise((resolve) => { done = resolve; }));
   try {
     const opts = force ? { retryAfterMs: 0 } : {};
     const rows = listRowsNeedingImages(id, opts);
@@ -159,6 +171,7 @@ export async function ensureRunImages(runId, { force = false } = {}) {
     return remember({ skipped: 'error', error: e.message });
   } finally {
     inFlight.delete(id);
+    done();   // 待っている「今すぐ取り直す」を解放する
   }
 }
 

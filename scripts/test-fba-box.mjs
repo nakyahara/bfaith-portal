@@ -1141,6 +1141,22 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     assert.equal(db.getDB().prepare(`SELECT status FROM fbx_product_images WHERE fnsku = 'X0FIN00003'`).get().status, 'error');
     assert.equal(notConf.skipped, 'not_configured');
   });
+  // 「今すぐ取り直す」を取得中に押しても in_flight で弾かれず、終わるのを待ってから実行する (9/3 実機で in_flight 表示)
+  img._resetImageState();
+  process.env.WAREHOUSE_SERVICE_TOKEN = 'test-token';
+  db.getDB().prepare(`DELETE FROM fbx_product_images WHERE fnsku IN ('X0FIN00001','X0FIN00002')`).run();
+  img._setAttrsSource(async () => [{ amazon_sku: 'sku-f1', asin: 'B0SLOW0001', fnsku: 'X0FIN00001' }, { amazon_sku: 'sku-f2', asin: 'B0SLOW0002', fnsku: 'X0FIN00002' }]);
+  let slowCalls = 0;
+  img._setFetcher(async () => { slowCalls++; await new Promise((r) => setTimeout(r, 200)); return 'https://m.media-amazon.com/images/I/slow.jpg'; });
+  const [r1, r2] = await Promise.all([img.ensureRunImages(c.runId, { force: true }), img.ensureRunImages(c.runId, { force: true })]);
+  delete process.env.WAREHOUSE_SERVICE_TOKEN;
+  t('ensureRunImages: 取得中に「今すぐ取り直す」を押しても in_flight で弾かず、待ってから実行する', () => {
+    assert.equal(r1.skipped, undefined, JSON.stringify(r1));
+    assert.equal(r2.skipped, undefined, JSON.stringify(r2));
+    assert.equal(r1.fetched + r2.fetched, 2, '2 商品を取得 (二重取得しない)');
+    assert.equal(slowCalls, 2);
+    assert.equal(db.getRunState(c.runId).rows.filter((x) => x.image_url).length >= 1, true);
+  });
   img._resetImageState();
 }
 
