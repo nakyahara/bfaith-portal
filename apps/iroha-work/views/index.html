@@ -378,31 +378,34 @@ async function apiFetch(path, opts) {
   const ac = new AbortController();
   const tm = setTimeout(() => ac.abort(), timeoutMs);
   o.signal = ac.signal;
-  let r;
-  try { r = await fetch(BASE + path, o); }
-  catch (e) {
-    clearTimeout(tm);
+  const down = (r, msg) => ({ ok: false, error: 'server_down', status: r.status, message: msg || DOWN_MSG });
+  const bad = (r, msg) => ({ ok: false, error: 'bad_response', status: r.status, message: msg });
+  let r, j;
+  try {
+    r = await fetch(BASE + path, o);
+    // 502/503/504 は本文の形 (HTML でも JSON でも) に関わらず「再起動中」(Codex #4)
+    if (r.status === 502 || r.status === 503 || r.status === 504) return down(r);
+    // 401 = この端末の登録が切れている (access が /api/ に返す)。前の一覧を消して登録画面へ
+    if (r.status === 401) return { ok: false, error: 'unauthorized', status: 401, message: 'この端末の登録が切れています。登録し直してください' };
+    const ct = r.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) {
+      return r.status >= 500 ? down(r) : bad(r, 'サーバーから想定外の応答です (' + r.status + ')');
+    }
+    // fetch はヘッダ到着で返る。本文が途中で止まっても固まらないよう、タイマーは JSON を読み切るまで生かす (Codex R2 #3)
+    try { j = await r.json(); }
+    catch (e) {
+      if (e.name === 'AbortError') throw e;
+      return r.status >= 500 ? down(r) : bad(r, '応答を読めませんでした');
+    }
+  } catch (e) {
     return { ok: false, error: 'network', message: e.name === 'AbortError'
       ? '応答がありません (' + Math.round(timeoutMs / 1000) + '秒待ちました)' : '通信できませんでした (' + e.message + ')' };
+  } finally {
+    clearTimeout(tm);
   }
-  clearTimeout(tm);
-  // 502/503/504 は本文の形 (HTML でも JSON でも) に関わらず「再起動中」(Codex #4)
-  if (r.status === 502 || r.status === 503 || r.status === 504) return { ok: false, error: 'server_down', status: r.status, message: DOWN_MSG };
-  // 401 = この端末の登録が切れている (access が /api/ に返す)。前の一覧を消して登録画面へ
-  if (r.status === 401) return { ok: false, error: 'unauthorized', status: 401, message: 'この端末の登録が切れています。登録し直してください' };
-  const ct = r.headers.get('content-type') || '';
-  if (!ct.includes('application/json')) {
-    if (r.status >= 500) return { ok: false, error: 'server_down', status: r.status, message: DOWN_MSG };
-    return { ok: false, error: 'bad_response', status: r.status, message: 'サーバーから想定外の応答です (' + r.status + ')' };
-  }
-  let j;
-  try { j = await r.json(); }
-  catch (e) {
-    return r.status >= 500 ? { ok: false, error: 'server_down', status: r.status, message: DOWN_MSG }
-      : { ok: false, error: 'bad_response', status: r.status, message: '応答を読めませんでした' };
-  }
-  if (!j || typeof j !== 'object') return { ok: false, error: 'bad_response', status: r.status, message: '応答を読めませんでした' };
-  if (r.status >= 500 && !j.error) return { ok: false, error: 'server_down', status: r.status, message: j.message || DOWN_MSG };
+  if (!j || typeof j !== 'object') return bad(r, '応答を読めませんでした');
+  // 5xx は JSON に error があっても「再起動中」扱いで再接続する (共通例外の internal も含む — Codex R2 #4)
+  if (r.status >= 500) return down(r, j.message || DOWN_MSG);
   return j;
 }
 // 一覧の自動再接続の対象 = 再起動中・通信断・想定外の応答 (CDN の HTML 200 など)。unauthorized は対象外 (登録し直す)
