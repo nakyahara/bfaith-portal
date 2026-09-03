@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>箱札 — <%= run.title %></title>
+  <style>
+    /* 箱札 (要件 F-8): A4 横 1箱1面。ブラウザ印刷 (iPad AirPrint / 本社プリンタ) */
+    @page { size: A4 landscape; margin: 12mm; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; color: #111; background: #fff; }
+    .toolbar { padding: 10px 14px; background: #F4F5F7; border-bottom: 1px solid #DEE2E6; display: flex; gap: 12px; align-items: center; }
+    .toolbar button { font-size: 1.05em; padding: 8px 18px; border-radius: 10px; border: 0; background: #B5651D; color: #fff; }
+    .tag { page-break-after: always; break-after: page; height: 100vh; display: flex; flex-direction: column;
+      justify-content: center; align-items: center; text-align: center; padding: 10mm; border: 3px dashed #CED4DA; margin: 8px; }
+    .tag:last-child { page-break-after: auto; break-after: auto; }
+    .code { font-size: 32vw; line-height: 1; font-weight: 900; letter-spacing: 0.02em; font-family: ui-monospace, Menlo, monospace; }
+    .amazon { font-size: 6vw; margin-top: 3vh; font-weight: 700; }
+    .amazon.diff { color: #C92A2A; }
+    .meta { font-size: 3vw; margin-top: 3vh; color: #495057; line-height: 1.5; }
+    .fill { display: flex; gap: 6vw; margin-top: 3vh; font-size: 3vw; color: #495057; }
+    .fill span { border-bottom: 2px solid #495057; min-width: 18vw; display: inline-block; }
+    @media print { .toolbar { display: none; } .tag { border: none; margin: 0; height: 100vh; } }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button onclick="window.print()">🖨 印刷</button>
+    <span><%= run.title %> — 箱札 <%= boxes.length %> 枚 (A4横・1箱1面)</span>
+  </div>
+  <% if (boxes.length === 0) { %><p style="padding:20px">印刷する箱がありません</p><% } %>
+  <% for (const b of boxes) { %>
+    <div class="tag">
+      <div class="code"><%= b.box_code %></div>
+      <div class="amazon <%= b.amazon_box_no !== b.box_no ? 'diff' : '' %>">
+        Amazon: <%= b.amazon_name || ('B' + b.amazon_box_no) %><%= b.amazon_box_no !== b.box_no ? ' (番号ずれ注意)' : '' %>
+      </div>
+      <div class="meta">
+        <%= run.title %> / <%= b.group ? b.group.sheet_name : '' %> (<%= b.group ? b.group.display_name : '' %>)<br>
+        <%= b.material_code || '' %> <%= b.measured_weight_kg ? ' / ' + b.measured_weight_kg + ' kg' : '' %>
+      </div>
+      <div class="fill"><span>重さ: &nbsp; kg</span><span>担当: </span></div>
+    </div>
+  <% } %>
+</body>
+</html>

@@ -59,6 +59,57 @@ export function _openForTest(file) {
   return db;
 }
 
+/** fbx_boxes の DDL (新規作成と void 移行のテーブル再構築で共用) */
+const BOXES_DDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      pack_group_id INTEGER NOT NULL REFERENCES fbx_pack_groups(id),
+      box_no        INTEGER NOT NULL CHECK (box_no >= 1),
+      box_code      TEXT NOT NULL,
+      material_code TEXT,
+      status        TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed','void')),
+      measured_weight_kg REAL CHECK (measured_weight_kg IS NULL OR measured_weight_kg > 0),
+      closed_at     TEXT,
+      closed_by     TEXT,
+      closed_reason TEXT,
+      cushion_level TEXT CHECK (cushion_level IS NULL OR cushion_level IN ('none','little','much')),
+      reopen_count  INTEGER NOT NULL DEFAULT 0,
+      voided_at     TEXT,
+      voided_by     TEXT,
+      void_reason   TEXT,
+      created_by    TEXT,
+      created_at    TEXT NOT NULL,
+      UNIQUE(pack_group_id, box_no)
+    );`;
+
+/**
+ * PR1 で作られた fbx_boxes (status CHECK が open/closed のみ) を void 対応に再構築する。
+ * SQLite は CHECK を ALTER できないので公式手順 (新表→コピー→DROP→RENAME) を
+ * foreign_keys OFF の下で1トランザクションで行い、最後に foreign_key_check。冪等
+ */
+function migrateBoxesVoid(d) {
+  const sql = d.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'fbx_boxes'`).get()?.sql || '';
+  if (sql.includes("'void'")) return;
+  const fkWasOn = d.pragma('foreign_keys', { simple: true }) === 1;
+  if (fkWasOn) d.pragma('foreign_keys = OFF');
+  try {
+    d.transaction(() => {
+      d.exec(BOXES_DDL('fbx_boxes_new'));
+      d.exec(`INSERT INTO fbx_boxes_new (id, pack_group_id, box_no, box_code, material_code, status, measured_weight_kg,
+                closed_at, closed_by, closed_reason, cushion_level, reopen_count, created_by, created_at)
+              SELECT id, pack_group_id, box_no, box_code, material_code, status, measured_weight_kg,
+                closed_at, closed_by, closed_reason, cushion_level, reopen_count, created_by, created_at FROM fbx_boxes`);
+      d.exec('DROP TABLE fbx_boxes');
+      d.exec('ALTER TABLE fbx_boxes_new RENAME TO fbx_boxes');
+      const bad = d.prepare('PRAGMA foreign_key_check').all();
+      if (bad.length > 0) throw new Error(`[fba-box] fbx_boxes 移行後の foreign_key_check に失敗: ${JSON.stringify(bad.slice(0, 3))}`);
+    })();
+    console.log('[fba-box] fbx_boxes を void 対応スキーマへ移行しました');
+  } finally {
+    if (fkWasOn) d.pragma('foreign_keys = ON');
+  }
+}
+
 export function createTables(d = getDB()) {
   d.exec(`
     -- 納品回。source_run_id = picking-prep の picking_run_history.id (スナップショット元)
@@ -149,23 +200,8 @@ export function createTables(d = getDB()) {
     );
 
     -- 輸送箱。UNIQUE(pack_group_id, box_no)。closed_reason / cushion_level = 結果シグナル (Codex R2 S2)
-    CREATE TABLE IF NOT EXISTS fbx_boxes (
-      id            INTEGER PRIMARY KEY AUTOINCREMENT,
-      pack_group_id INTEGER NOT NULL REFERENCES fbx_pack_groups(id),
-      box_no        INTEGER NOT NULL CHECK (box_no >= 1),
-      box_code      TEXT NOT NULL,
-      material_code TEXT,
-      status        TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
-      measured_weight_kg REAL CHECK (measured_weight_kg IS NULL OR measured_weight_kg > 0),
-      closed_at     TEXT,
-      closed_by     TEXT,
-      closed_reason TEXT,
-      cushion_level TEXT CHECK (cushion_level IS NULL OR cushion_level IN ('none','little','much')),
-      reopen_count  INTEGER NOT NULL DEFAULT 0,
-      created_by    TEXT,
-      created_at    TEXT NOT NULL,
-      UNIQUE(pack_group_id, box_no)
-    );
+    -- void = 使わなかった箱の取消 (PR2)。box_no は再利用しない (箱札に書いた番号を動かさない)
+    ${BOXES_DDL('fbx_boxes')}
 
     -- 物理投入 (append-only 正本。取消は revoked_at)。box_seq = 箱内連番 (取消後も再利用しない)
     CREATE TABLE IF NOT EXISTS fbx_placements (
@@ -258,14 +294,37 @@ export function createTables(d = getDB()) {
       key   TEXT PRIMARY KEY,
       value TEXT
     );
+
+    -- Excel 出力の版 (要件 F-7)。data_version = 出力時点の fbx_runs.data_version。
+    -- snapshot_json = 書いたセルと箱↔Amazon箱番号の対応 (出力後の変更は run.data_version が進むので「旧版」と分かる)
+    CREATE TABLE IF NOT EXISTS fbx_exports (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id        INTEGER NOT NULL REFERENCES fbx_runs(id),
+      excel_file_id INTEGER NOT NULL REFERENCES fbx_excel_files(id),
+      data_version  INTEGER NOT NULL,
+      file_name     TEXT NOT NULL,
+      stored_path   TEXT NOT NULL,
+      sha256        TEXT NOT NULL,
+      snapshot_json TEXT NOT NULL,
+      verify_json   TEXT,
+      created_by    TEXT,
+      created_at    TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_fbx_exports_run ON fbx_exports(run_id, id);
   `);
 
   // 列追加のマイグレーション (CREATE IF NOT EXISTS は既存表を変えない —
   // [[feedback_schema_change_needs_migration_and_real_test]])。冪等
-  const placementCols = new Set(d.prepare('PRAGMA table_info(fbx_placements)').all().map((c) => c.name));
-  if (!placementCols.has('request_hash')) {
-    d.exec('ALTER TABLE fbx_placements ADD COLUMN request_hash TEXT');
-  }
+  const colsOf = (table) => new Set(d.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+  const addColumn = (table, col, ddl) => { if (!colsOf(table).has(col)) d.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`); };
+  addColumn('fbx_placements', 'request_hash', 'TEXT');
+  // PR2: STAアップ済みの記録 (以後は原則ロック) / 資材の外寸 (Excel の幅・長さ・高さ欄)
+  addColumn('fbx_runs', 'sta_uploaded_at', 'TEXT');
+  addColumn('fbx_runs', 'sta_export_id', 'INTEGER');
+  addColumn('fbx_box_materials', 'width_cm', 'REAL');
+  addColumn('fbx_box_materials', 'length_cm', 'REAL');
+  addColumn('fbx_box_materials', 'height_cm', 'REAL');
+  migrateBoxesVoid(d);
 
   // 資材の初期値 (管理画面で編集可能にするのは後続PR。tare_g は現行の実測目安)
   const seeded = d.prepare('SELECT COUNT(*) c FROM fbx_box_materials').get().c;
@@ -290,6 +349,16 @@ export function logEvent({ runId = null, action, targetType = null, targetId = n
 export function safeLogEvent(entry, d) {
   try { logEvent(entry, d); } catch (e) { console.error('[fba-box] 監査イベントの記録に失敗 (結果はそのまま返す)', e); }
 }
+
+/**
+ * Excel の中身に影響する変更 (割当・箱・不足) のたびに data_version を進める。
+ * 出力済み Excel の data_version と比べて「旧版」を判定する (要件 F-7)。呼び出し側のトランザクション内で使う
+ */
+function bumpRunVersion(d, runId) {
+  d.prepare('UPDATE fbx_runs SET data_version = data_version + 1 WHERE id = ?').run(Number(runId));
+}
+
+const safeJson = (s, def = null) => { try { return s == null ? def : JSON.parse(s); } catch { return def; } };
 
 export function listEvents(limit = 100, runId = null) {
   const d = getDB();
@@ -378,7 +447,8 @@ export function setRunStatus(runId, status, actor) {
               + COALESCE(rw.shortage_qty, 0) != w.planned_qty`).get(run.id).c;
       if (bad > 0) return { ok: false, error: 'rows_incomplete', message: `投入数と不足の合計が予定数と合わない商品が ${bad} 行あります。iPad で入力を終えるか、不足を確定してから完了にしてください` };
     }
-    d.prepare('UPDATE fbx_runs SET status = ?, done_at = ?, data_version = data_version + 1 WHERE id = ?')
+    // 状態変更は Excel の中身を変えないので data_version は進めない (出力済みの版を「旧版」にしない)
+    d.prepare('UPDATE fbx_runs SET status = ?, done_at = ? WHERE id = ?')
       .run(status, status === 'done' ? utcNow() : null, run.id);
     logEvent({ runId: run.id, action: `run_${status}`, targetType: 'run', targetId: run.id, deviceLabel: actor, ok: true }, d);
     return { ok: true };
@@ -416,7 +486,34 @@ export function getRunState(runId) {
     WHERE g.run_id = ? ORDER BY b.pack_group_id, b.box_no`).all(run.id);
   const placements = d.prepare(`SELECT p.* FROM fbx_placements p
     WHERE p.run_id = ? AND p.revoked_at IS NULL ORDER BY p.box_id, p.box_seq`).all(run.id);
-  return { run, groups, rows, boxes, placements };
+  assignAmazonBoxNumbers(groups, boxes);
+  const latest = d.prepare(`SELECT id, data_version, file_name, sha256, created_by, created_at
+    FROM fbx_exports WHERE run_id = ? ORDER BY id DESC LIMIT 1`).get(run.id) || null;
+  const exportState = {
+    latest,
+    stale: !!(latest && latest.data_version < run.data_version),
+    staUploadedAt: run.sta_uploaded_at || null,
+    staExportId: run.sta_export_id || null,
+  };
+  return { run, groups, rows, boxes, placements, exportState };
+}
+
+/**
+ * Amazon 側の箱番号 (Excel の「輸送箱n」列) を割り当てる。取消 (void) した箱は飛ばして
+ * box_no 順に 1..N を詰める → 欠番があると箱札の番号 (box_no) と Amazon 番号がずれるので、
+ * boxes[].amazon_box_no / amazon_name を画面・箱札・チェックリストに出す
+ */
+function assignAmazonBoxNumbers(groups, boxes) {
+  for (const g of groups) {
+    const names = safeJson(g.structure_json, {})?.boxNames || {};
+    let n = 0;
+    for (const b of boxes.filter((x) => x.pack_group_id === g.id).sort((a, c) => a.box_no - c.box_no)) {
+      if (b.status === 'void') { b.amazon_box_no = null; b.amazon_name = null; continue; }
+      n += 1;
+      b.amazon_box_no = n;
+      b.amazon_name = names[String(n)] || `B${n}`;
+    }
+  }
 }
 
 // ───────────────────────── 箱 ─────────────────────────
@@ -443,6 +540,7 @@ export function createBox({ packGroupId, materialCode, worker, deviceLabel }) {
       VALUES (?, ?, ?, ?, ?, ?)`)
       .run(g.id, next, boxCodeOf(g.display_name, next), materialCode || null, worker?.display_name || null, utcNow());
     const boxId = Number(info.lastInsertRowid);
+    bumpRunVersion(d, g.run_id);
     logEvent({ runId: g.run_id, action: 'box_create', targetType: 'box', targetId: boxId,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { boxNo: next, materialCode: materialCode || null } }, d);
@@ -469,10 +567,12 @@ export function closeBox({ boxId, measuredKg, closedReason, cushionLevel, worker
     if (!b) return { ok: false, error: 'not_found', message: '箱が見つかりません' };
     if (b.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
     if (b.status === 'closed') return { ok: false, error: 'already_closed', message: 'この箱は既に閉じられています' };
+    if (b.status === 'void') return { ok: false, error: 'box_void', message: 'この箱は取消済みです' };
     const qty = d.prepare('SELECT COALESCE(SUM(qty),0) q FROM fbx_placements WHERE box_id = ? AND revoked_at IS NULL').get(b.id).q;
-    if (qty === 0) return { ok: false, error: 'empty_box', message: '空の箱は閉じられません (使わない箱は職員が取り消してください)' };
+    if (qty === 0) return { ok: false, error: 'empty_box', message: '空の箱は閉じられません (使わない箱は職員が「箱を取消」してください)' };
     d.prepare(`UPDATE fbx_boxes SET status = 'closed', measured_weight_kg = ?, closed_at = ?, closed_by = ?, closed_reason = ?, cushion_level = ? WHERE id = ?`)
       .run(kg, utcNow(), worker?.display_name || null, reason, cushion, b.id);
+    bumpRunVersion(d, b.run_id);
     logEvent({ runId: b.run_id, action: 'box_close', targetType: 'box', targetId: b.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { measuredKg: kg, closedReason: reason, cushionLevel: cushion, totalQty: qty } }, d);
@@ -494,9 +594,39 @@ export function reopenBox({ boxId, reason, worker, deviceLabel }) {
     if (b.status !== 'closed') return { ok: false, error: 'not_closed', message: 'この箱は閉じられていません' };
     d.prepare(`UPDATE fbx_boxes SET status = 'open', measured_weight_kg = NULL, closed_at = NULL, closed_by = NULL,
       closed_reason = NULL, cushion_level = NULL, reopen_count = reopen_count + 1 WHERE id = ?`).run(b.id);
+    bumpRunVersion(d, b.run_id);
     logEvent({ runId: b.run_id, action: 'box_reopen', targetType: 'box', targetId: b.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { reason: r, previousWeightKg: b.measured_weight_kg, previousClosedAt: b.closed_at } }, d);
+    return { ok: true };
+  }).immediate();
+}
+
+/**
+ * 使わなかった箱の取消 (職員のみ・理由必須)。中身が残っていれば先に取り消してもらう。
+ * box_no は再利用しない (箱札の番号を動かさない) ので Amazon 箱番号は詰め直しになる —
+ * 画面で「G1-B3 → Amazon P1 - B2」の対応を出す (assignAmazonBoxNumbers)
+ */
+export function voidBox({ boxId, reason, worker, deviceLabel }) {
+  const r = String(reason || '').trim();
+  if (!r) return { ok: false, error: 'reason_required', message: '取消の理由を入力してください' };
+  const d = getDB();
+  return d.transaction(() => {
+    const b = d.prepare(`SELECT b.*, g.run_id, run.status AS run_status FROM fbx_boxes b
+      JOIN fbx_pack_groups g ON g.id = b.pack_group_id JOIN fbx_runs run ON run.id = g.run_id WHERE b.id = ?`)
+      .get(Number(boxId));
+    if (!b) return { ok: false, error: 'not_found', message: '箱が見つかりません' };
+    if (b.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
+    if (b.status === 'void') return { ok: true, already: true };
+    const qty = d.prepare('SELECT COALESCE(SUM(qty),0) q FROM fbx_placements WHERE box_id = ? AND revoked_at IS NULL').get(b.id).q;
+    if (qty > 0) return { ok: false, error: 'not_empty', message: `この箱には ${qty} 個の記録があります。先に中身を取り消してから箱を取消してください` };
+    d.prepare(`UPDATE fbx_boxes SET status = 'void', voided_at = ?, voided_by = ?, void_reason = ?,
+      measured_weight_kg = NULL, closed_at = NULL, closed_by = NULL WHERE id = ?`)
+      .run(utcNow(), worker?.display_name || null, r.slice(0, 200), b.id);
+    bumpRunVersion(d, b.run_id);
+    logEvent({ runId: b.run_id, action: 'box_void', targetType: 'box', targetId: b.id,
+      workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+      payload: { boxNo: b.box_no, boxCode: b.box_code, reason: r, previousStatus: b.status } }, d);
     return { ok: true };
   }).immediate();
 }
@@ -555,6 +685,7 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
     if (box.pack_group_id !== row.pack_group_id) {
       return { ok: false, error: 'wrong_group', message: 'この箱は別の梱包グループの箱です。同じシートの箱を選んでください' };
     }
+    if (box.status === 'void') return { ok: false, error: 'box_void', message: 'この箱は取消済みです。別の箱を選んでください' };
     if (box.status !== 'open') return { ok: false, error: 'box_closed', message: 'この箱は閉じられています (職員が再オープンすれば入れられます)' };
     // 残数 = 予定 − 投入済み − 確定不足 (Codex PR1 #4: 不足確定後にその分を超えて入れられない)
     const placed = placedOf(d, row.id);
@@ -585,6 +716,7 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
       .run(row.run_id, row.id, box.id, q, exp, seq, lay, lay ? 'manual' : null,
         worker?.id ?? null, worker?.display_name ?? null, String(deviceKey), String(requestId), requestHash, utcNow());
     const placementId = Number(info.lastInsertRowid);
+    bumpRunVersion(d, row.run_id);
     logEvent({ runId: row.run_id, action: 'placement_add', targetType: 'placement', targetId: placementId,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { rowId: row.id, boxId: box.id, boxNo: box.box_no, qty: q, expiry: exp, layer: lay, boxSeq: seq } }, d);
@@ -624,6 +756,7 @@ export function revokePlacement({ placementId, byStaff = false, reason, worker, 
     }
     d.prepare('UPDATE fbx_placements SET revoked_at = ?, revoked_by = ?, revoke_reason = ? WHERE id = ?')
       .run(utcNow(), worker?.display_name || null, reason ? String(reason).slice(0, 200) : null, p.id);
+    bumpRunVersion(d, p.run_id);
     logEvent({ runId: p.run_id, action: 'placement_revoke', targetType: 'placement', targetId: p.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { rowId: p.row_id, boxId: p.box_id, qty: p.qty, byStaff, reason: reason || null } }, d);
@@ -704,6 +837,7 @@ export function setRowShortage({ rowId, shortageQty, reason, worker, deviceLabel
       ON CONFLICT(row_id) DO UPDATE SET shortage_qty = excluded.shortage_qty,
         shortage_reason = excluded.shortage_reason, shortage_by = excluded.shortage_by, updated_at = excluded.updated_at`)
       .run(row.id, q, reasonKey, worker?.display_name || null, utcNow());
+    bumpRunVersion(d, row.run_id);
     logEvent({ runId: row.run_id, action: 'row_shortage', targetType: 'row', targetId: row.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { shortageQty: q, reason: reasonKey } }, d);
@@ -721,6 +855,7 @@ export function clearRowShortage({ rowId, worker, deviceLabel }) {
     if (row.run_status !== 'active') return { ok: false, error: 'run_not_active', message: 'この納品回は作業できる状態ではありません' };
     d.prepare('UPDATE fbx_row_work SET shortage_qty = NULL, shortage_reason = NULL, shortage_by = NULL, updated_at = ? WHERE row_id = ?')
       .run(utcNow(), row.id);
+    bumpRunVersion(d, row.run_id);
     logEvent({ runId: row.run_id, action: 'row_shortage_clear', targetType: 'row', targetId: row.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true }, d);
     return { ok: true };
@@ -755,6 +890,14 @@ export function addWorker({ displayName, workerType, actor }) {
 
 export function setWorkerActive(id, active) {
   return getDB().prepare('UPDATE fbx_workers SET active = ? WHERE id = ?').run(active ? 1 : 0, Number(id)).changes > 0;
+}
+
+/**
+ * PIN 設定済みの有効な職員の数。0 のときだけ iPad からの名簿登録を無ゲートで許す (初期登録 = bootstrap)。
+ * 端末Cookie 自体が本社発行の6桁コードで守られているので、最初の職員1人はいろはが自分で登録できる
+ */
+export function countStaffWithPin() {
+  return getDB().prepare(`SELECT COUNT(*) c FROM fbx_workers WHERE worker_type = 'staff' AND active = 1 AND pin_hash IS NOT NULL`).get().c;
 }
 
 const PIN_MAX_FAILS = 5;
@@ -907,6 +1050,219 @@ export function listActiveEnrollCodes() {
     .all(utcNow(), ENROLL_MAX_ATTEMPTS);
 }
 
-export function listMaterials() {
-  return getDB().prepare('SELECT * FROM fbx_box_materials WHERE active = 1 ORDER BY sort, code').all();
+export function listMaterials(includeInactive = false) {
+  return getDB().prepare(`SELECT * FROM fbx_box_materials ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY sort, code`).all();
+}
+
+/** 資材の追加・編集 (管理者)。外寸 cm は Excel の幅・長さ・高さ欄に入る (未設定なら空欄 = STA 画面で入力) */
+export function upsertMaterial({ code, name, tareG, widthCm, lengthCm, heightCm, sort, active, actor }) {
+  const c = String(code || '').trim().toLowerCase();
+  if (!/^[a-z0-9_-]{1,20}$/.test(c)) return { ok: false, error: 'bad_code', message: 'コードは英数字・-・_ で1〜20文字' };
+  const n = String(name || '').trim();
+  if (!n || n.length > 30) return { ok: false, error: 'bad_name', message: '名前は1〜30文字で入力してください' };
+  const num = (v, label, { integer = false, max = 100000 } = {}) => {
+    if (v == null || v === '') return null;
+    const x = Number(v);
+    if (!Number.isFinite(x) || x < 0 || x > max || (integer && !Number.isInteger(x))) throw new Error(`${label} の値が不正です`);
+    return x;
+  };
+  let vals;
+  try {
+    vals = { tare: num(tareG, '自重g', { integer: true }), w: num(widthCm, '幅cm', { max: 500 }), l: num(lengthCm, '長さcm', { max: 500 }), h: num(heightCm, '高さcm', { max: 500 }) };
+  } catch (e) {
+    return { ok: false, error: 'bad_number', message: e.message };
+  }
+  const d = getDB();
+  d.prepare(`INSERT INTO fbx_box_materials (code, name, tare_g, width_cm, length_cm, height_cm, sort, active)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(code) DO UPDATE SET name = excluded.name, tare_g = excluded.tare_g, width_cm = excluded.width_cm,
+      length_cm = excluded.length_cm, height_cm = excluded.height_cm, sort = excluded.sort, active = excluded.active`)
+    .run(c, n, vals.tare, vals.w, vals.l, vals.h, Number.isInteger(Number(sort)) ? Number(sort) : 0, active === false ? 0 : 1);
+  safeLogEvent({ action: 'material_upsert', deviceLabel: actor || null, ok: true, payload: { code: c, name: n, ...vals, active: active !== false } });
+  return { ok: true, code: c };
+}
+
+// ───────────────────────── Excel 出力 (PR2, 要件 F-6 / F-7 / F-7b) ─────────────────────────
+
+/**
+ * 出荷前チェックリスト (F-6)。blockers があれば Excel 出力不可、warnings は出力可だが本社が確認する。
+ * 併せて箱↔Amazon箱番号の対応・期限一覧 (F-7b: Excel には書かず STA 画面へ転記する) を返す
+ */
+export function exportReadiness(runId) {
+  const st = getRunState(runId);
+  if (!st) return null;
+  const { run, groups, rows, boxes, placements, exportState } = st;
+  const blockers = [], warnings = [];
+  const boxBrief = (b) => ({ id: b.id, code: b.box_code, boxNo: b.box_no, amazonBoxNo: b.amazon_box_no, amazonName: b.amazon_name, qty: b.total_qty, status: b.status });
+  const rowBrief = (r) => ({ id: r.id, fnsku: r.fnsku, sku: r.seller_sku, name: r.product_name, planned: r.planned_qty, placed: r.placed, shortage: r.shortage_qty || 0 });
+
+  if (run.status !== 'active' && run.status !== 'done') {
+    blockers.push({ code: 'run_status', message: `納品回が「${run.status}」のため出力できません` });
+  }
+  const live = boxes.filter((b) => b.status !== 'void');
+  if (live.length === 0) blockers.push({ code: 'no_boxes', message: '箱がひとつもありません' });
+  const incomplete = rows.filter((r) => r.placed + (r.shortage_qty || 0) !== r.planned_qty);
+  if (incomplete.length > 0) {
+    blockers.push({ code: 'rows_incomplete', message: `投入数+不足 が予定数と合わない商品が ${incomplete.length} 行あります (iPad で入力を終えるか、職員が不足を確定してください)`, rows: incomplete.map(rowBrief) });
+  }
+  const openBoxes = live.filter((b) => b.status === 'open' && b.total_qty > 0);
+  if (openBoxes.length > 0) blockers.push({ code: 'open_boxes', message: `閉じていない箱が ${openBoxes.length} 箱あります (読み合わせ→実測重量→閉じる)`, boxes: openBoxes.map(boxBrief) });
+  const emptyBoxes = live.filter((b) => b.total_qty === 0);
+  if (emptyBoxes.length > 0) blockers.push({ code: 'empty_boxes', message: `空の箱が ${emptyBoxes.length} 箱あります (使わない箱は職員が iPad で「箱を取消」してください)`, boxes: emptyBoxes.map(boxBrief) });
+  const noWeight = live.filter((b) => b.status === 'closed' && !(Number(b.measured_weight_kg) > 0));
+  if (noWeight.length > 0) blockers.push({ code: 'no_weight', message: `実測重量のない箱が ${noWeight.length} 箱あります`, boxes: noWeight.map(boxBrief) });
+  for (const g of groups) {
+    const n = live.filter((b) => b.pack_group_id === g.id).length;
+    if (g.max_box_columns && n > g.max_box_columns) {
+      blockers.push({ code: 'box_overflow', message: `${g.sheet_name}: 箱数 ${n} がテンプレの上限 ${g.max_box_columns} を超えています (STA で箱数を増やして再DL→差し替え)` });
+    }
+  }
+
+  const unchecked = rows.filter((r) => !r.check_worker);
+  if (unchecked.length > 0) warnings.push({ code: 'unchecked_rows', message: `確認担当が未記録の商品が ${unchecked.length} 行あります`, rows: unchecked.map(rowBrief) });
+  const shortages = rows.filter((r) => r.shortage_qty > 0);
+  if (shortages.length > 0) warnings.push({ code: 'shortage_rows', message: `不足確定の商品が ${shortages.length} 行あります (Excel の数量は投入数のみ。STA 側の予定数量との差は Amazon 側で調整)`, rows: shortages.map((r) => ({ ...rowBrief(r), reason: r.shortage_reason })) });
+  const matchWarn = rows.filter((r) => r.match_state !== 'matched');
+  if (matchWarn.length > 0) warnings.push({ code: 'match_warnings', message: `突合で注意のあった商品が ${matchWarn.length} 行あります`, rows: matchWarn.map((r) => ({ ...rowBrief(r), matchState: r.match_state })) });
+  const gaps = live.filter((b) => b.amazon_box_no !== b.box_no);
+  if (gaps.length > 0) warnings.push({ code: 'box_gap', message: `取消した箱があるため、箱札の番号と Amazon の箱番号がずれます (${gaps.length} 箱)。箱ラベルを貼るときは対応表を見てください`, boxes: gaps.map(boxBrief) });
+  const mats = new Map(listMaterials(true).map((m) => [m.code, m]));
+  const noDims = live.filter((b) => { const m = mats.get(b.material_code); return !(m && m.width_cm > 0 && m.length_cm > 0 && m.height_cm > 0); });
+  if (noDims.length > 0) warnings.push({ code: 'no_dims', message: `外寸が未設定の資材の箱が ${noDims.length} 箱あります (Excel の幅・長さ・高さは空欄 → STA 画面で入力。管理画面の資材で外寸を登録すると次回から自動)`, boxes: noDims.map(boxBrief) });
+  if (exportState.latest) {
+    warnings.push(exportState.stale
+      ? { code: 'stale_export', message: `前回の出力 (#${exportState.latest.id}, ${exportState.latest.created_at.slice(0, 16).replace('T', ' ')}) の後にデータが変わっています。再出力してください` }
+      : { code: 'exported', message: `出力済み (#${exportState.latest.id})。データは変わっていません` });
+  }
+  if (run.sta_uploaded_at) warnings.push({ code: 'sta_uploaded', message: `STA アップ済み (${run.sta_uploaded_at.slice(0, 16).replace('T', ' ')})。再出力は原則不要です` });
+
+  // 期限一覧 (F-7b): 行×期限で集約 (同一行は1期限がルール)
+  const rowById = new Map(rows.map((r) => [r.id, r]));
+  const expMap = new Map();
+  for (const p of placements) {
+    if (!p.expiry) continue;
+    const key = `${p.row_id}|${p.expiry}`;
+    if (!expMap.has(key)) { const r = rowById.get(p.row_id); expMap.set(key, { rowId: p.row_id, fnsku: r?.fnsku, sku: r?.seller_sku, name: r?.product_name, expiry: p.expiry, qty: 0 }); }
+    expMap.get(key).qty += p.qty;
+  }
+  const expiries = [...expMap.values()].sort((a, b) => (a.fnsku || '').localeCompare(b.fnsku || ''));
+
+  const groupsOut = groups.map((g) => ({
+    id: g.id, sheetName: g.sheet_name, displayName: g.display_name, packingGroupId: g.packing_group_id,
+    maxBoxColumns: g.max_box_columns,
+    boxes: live.filter((b) => b.pack_group_id === g.id).map((b) => ({ ...boxBrief(b), weightKg: b.measured_weight_kg, material: b.material_code,
+      dims: (() => { const m = mats.get(b.material_code); return m ? { width: m.width_cm, length: m.length_cm, height: m.height_cm } : null; })() })),
+  }));
+  return { ok: blockers.length === 0, blockers, warnings, groups: groupsOut, expiries, exportState,
+    run: { id: run.id, title: run.title, status: run.status, dataVersion: run.data_version, staUploadedAt: run.sta_uploaded_at || null } };
+}
+
+/**
+ * Excel 書き込み指示 (write_packlist.py の sheets) と、版として保存するスナップショットを組み立てる。
+ * 書くセル = 箱数 (M3 相当) / SKU行×Amazon箱番号列の投入数 (0 は空欄のまま) / 箱ごとの実測kg・外寸。
+ * 期限は書かない (JP テンプレ v1.1 に列が無い — 要件 §4)
+ */
+export function buildExportPayload(runId) {
+  const ready = exportReadiness(runId);
+  if (!ready) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
+  if (!ready.ok) return { ok: false, error: 'not_ready', message: '出荷前チェックに未解決の項目があります', readiness: ready };
+  const d = getDB();
+  const st = getRunState(runId);
+  const file = d.prepare('SELECT * FROM fbx_excel_files WHERE run_id = ? ORDER BY id DESC LIMIT 1').get(st.run.id);
+  if (!file) return { ok: false, error: 'no_excel', message: '原本Excelの記録がありません' };
+  const qtyByRowBox = new Map();
+  for (const p of st.placements) {
+    const k = `${p.row_id}|${p.box_id}`;
+    qtyByRowBox.set(k, (qtyByRowBox.get(k) || 0) + p.qty);
+  }
+  const sheets = [];
+  const snapshotGroups = [];
+  for (const g of st.groups) {
+    const structure = safeJson(g.structure_json);
+    if (!structure?.boxColumns || !structure?.totalBoxes || !structure?.dimRows) {
+      return { ok: false, error: 'no_structure', message: `${g.sheet_name}: テンプレ構造の記録がありません (PR1 より前の納品回?)` };
+    }
+    const gBoxes = st.boxes.filter((b) => b.pack_group_id === g.id && b.status !== 'void').sort((a, b) => a.amazon_box_no - b.amazon_box_no);
+    const gRows = st.rows.filter((r) => r.pack_group_id === g.id);
+    const cells = [{ row: structure.totalBoxes.row, col: structure.totalBoxes.col, value: gBoxes.length, kind: 'total_boxes' }];
+    const rg = ready.groups.find((x) => x.id === g.id);
+    for (const b of gBoxes) {
+      const col = structure.boxColumns[String(b.amazon_box_no)];
+      if (!col) return { ok: false, error: 'box_overflow', message: `${g.sheet_name}: 箱 ${b.box_code} の列がテンプレにありません` };
+      for (const r of gRows) {
+        const q = qtyByRowBox.get(`${r.id}|${b.id}`) || 0;
+        if (q > 0) cells.push({ row: r.excel_row, col, value: q, kind: 'qty' });
+      }
+      cells.push({ row: structure.dimRows.weight, col, value: Number(b.measured_weight_kg), kind: 'weight' });
+      const dims = rg?.boxes.find((x) => x.id === b.id)?.dims;
+      if (dims && dims.width > 0 && dims.length > 0 && dims.height > 0) {
+        cells.push({ row: structure.dimRows.width, col, value: dims.width, kind: 'width' });
+        cells.push({ row: structure.dimRows.length, col, value: dims.length, kind: 'length' });
+        cells.push({ row: structure.dimRows.height, col, value: dims.height, kind: 'height' });
+      }
+    }
+    sheets.push({ sheetName: g.sheet_name, cells });
+    snapshotGroups.push({
+      groupId: g.id, sheetName: g.sheet_name, displayName: g.display_name, packingGroupId: g.packing_group_id, totalBoxes: gBoxes.length,
+      boxes: gBoxes.map((b) => ({
+        boxId: b.id, boxCode: b.box_code, boxNo: b.box_no, amazonBoxNo: b.amazon_box_no, amazonName: b.amazon_name,
+        weightKg: b.measured_weight_kg, material: b.material_code, dims: rg?.boxes.find((x) => x.id === b.id)?.dims || null,
+        contents: gRows.map((r) => ({ rowId: r.id, fnsku: r.fnsku, sku: r.seller_sku, qty: qtyByRowBox.get(`${r.id}|${b.id}`) || 0 })).filter((x) => x.qty > 0),
+      })),
+    });
+  }
+  return {
+    ok: true, sheets, excelFile: file,
+    snapshot: { dataVersion: st.run.data_version, groups: snapshotGroups, expiries: ready.expiries, warnings: ready.warnings.map((w) => w.code) },
+  };
+}
+
+/** 出力結果の記録 (版)。data_version は buildExportPayload 時点の値 (書き込み中の変更は次の出力で「旧版」として出る) */
+export function recordExport({ runId, excelFileId, dataVersion, fileName, storedPath, sha256, snapshot, verify, createdBy }) {
+  const d = getDB();
+  return d.transaction(() => {
+    const run = d.prepare('SELECT id, data_version FROM fbx_runs WHERE id = ?').get(Number(runId));
+    if (!run) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
+    const info = d.prepare(`INSERT INTO fbx_exports (run_id, excel_file_id, data_version, file_name, stored_path, sha256, snapshot_json, verify_json, created_by, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(run.id, Number(excelFileId), Number(dataVersion), fileName, storedPath, sha256, JSON.stringify(snapshot), verify == null ? null : JSON.stringify(verify), createdBy || null, utcNow());
+    const exportId = Number(info.lastInsertRowid);
+    logEvent({ runId: run.id, action: 'excel_export', targetType: 'export', targetId: exportId, deviceLabel: createdBy, ok: true,
+      payload: { dataVersion: Number(dataVersion), sha256, changedDuringWrite: run.data_version !== Number(dataVersion) } }, d);
+    return { ok: true, exportId, stale: run.data_version !== Number(dataVersion) };
+  }).immediate();
+}
+
+export function listExports(runId) {
+  return getDB().prepare(`SELECT e.id, e.run_id, e.data_version, e.file_name, e.sha256, e.created_by, e.created_at,
+      (e.data_version < r.data_version) AS stale, (r.sta_export_id = e.id) AS sta_uploaded
+    FROM fbx_exports e JOIN fbx_runs r ON r.id = e.run_id WHERE e.run_id = ? ORDER BY e.id DESC`).all(Number(runId));
+}
+
+export function getExport(id) {
+  const row = getDB().prepare('SELECT * FROM fbx_exports WHERE id = ?').get(Number(id));
+  if (!row) return null;
+  return { ...row, snapshot: safeJson(row.snapshot_json), verify: safeJson(row.verify_json) };
+}
+
+/**
+ * 「STA にアップした」の記録。指定した版が最新データと一致していることが条件 (旧版のアップは事故)。
+ * 記録後は納品回を done にして iPad からの変更を止める (要件 F-7: STAアップ済み後は原則ロック)
+ */
+export function markStaUploaded({ runId, exportId, actor }) {
+  const d = getDB();
+  return d.transaction(() => {
+    const run = d.prepare('SELECT * FROM fbx_runs WHERE id = ?').get(Number(runId));
+    if (!run) return { ok: false, error: 'not_found', message: '納品回が見つかりません' };
+    const ex = d.prepare('SELECT * FROM fbx_exports WHERE id = ? AND run_id = ?').get(Number(exportId), run.id);
+    if (!ex) return { ok: false, error: 'not_found', message: '出力の記録が見つかりません' };
+    if (ex.data_version !== run.data_version) {
+      return { ok: false, error: 'stale_export', message: 'この出力の後にデータが変わっています。最新データで再出力し、そのファイルを STA にアップしてから記録してください' };
+    }
+    if (run.status !== 'active' && run.status !== 'done') return { ok: false, error: 'bad_status', message: `この納品回は ${run.status} です` };
+    d.prepare(`UPDATE fbx_runs SET sta_uploaded_at = ?, sta_export_id = ?, status = 'done', done_at = COALESCE(done_at, ?) WHERE id = ?`)
+      .run(utcNow(), ex.id, utcNow(), run.id);
+    logEvent({ runId: run.id, action: 'run_sta_uploaded', targetType: 'export', targetId: ex.id, deviceLabel: actor, ok: true, payload: { dataVersion: ex.data_version } }, d);
+    return { ok: true };
+  }).immediate();
 }

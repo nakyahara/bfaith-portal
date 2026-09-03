@@ -11,6 +11,7 @@
  * 正本 = AI_reference『システム設計\FBA納品箱詰め記録_要件定義_20260902.md』
  */
 import { Router } from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
@@ -18,14 +19,15 @@ import {
   createDevice, verifyDevice, revokeDevice, listDevices,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
-  listWorkers, getWorker, addWorker, setWorkerActive, setWorkerPin, verifyWorkerPin,
-  listEvents, safeLogEvent, listMaterials,
+  listWorkers, getWorker, addWorker, setWorkerActive, setWorkerPin, verifyWorkerPin, countStaffWithPin,
+  listEvents, safeLogEvent, listMaterials, upsertMaterial,
   createRun, activateRun, setRunStatus, listRuns, getRun, getRunState,
-  createBox, closeBox, reopenBox, listBoxContents,
+  createBox, closeBox, reopenBox, voidBox, listBoxContents,
   addPlacement, revokePlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage,
+  exportReadiness, buildExportPayload, recordExport, listExports, getExport, markStaUploaded,
 } from './db.js';
-import { ingestPacklist, MAX_XLSX_BYTES } from './excel.js';
+import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -132,6 +134,25 @@ function requireStaff(req, worker) {
   return { ok: true, via: 'pin' };
 }
 
+/**
+ * 名簿 (作業者・PIN) を iPad から編集するためのゲート (PR2, 中原さん指示「登録は自分たちで」):
+ *   ①ポータルセッション = OK
+ *   ②端末Cookie: PIN 設定済みの有効な職員が 0 人 = 初期登録 (bootstrap) として無ゲート
+ *     (端末登録自体が本社発行の6桁コードで守られている)
+ *   ③それ以外 = auth_worker_id (職員) + auth_pin の一致
+ */
+function rosterGate(req) {
+  if (hasSessionAccess(req)) return { ok: true, via: 'session', approvedBy: `session:${req.fbxUser}` };
+  if (countStaffWithPin() === 0) return { ok: true, via: 'bootstrap', approvedBy: null };
+  const w = getWorker(req.body?.auth_worker_id);
+  if (!w || !w.active || w.worker_type !== 'staff') {
+    return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: '名簿の変更は職員のPINが必要です (職員を選んでPINを入れてください)' } };
+  }
+  const pinCheck = verifyWorkerPin(w.id, req.body?.auth_pin);
+  if (!pinCheck.ok) return { ok: false, status: pinCheck.error === 'pin_locked' ? 429 : 403, body: { ok: false, ...pinCheck } };
+  return { ok: true, via: 'pin', approvedBy: w.display_name };
+}
+
 router.use(access);
 
 // ─── PWA manifest ───
@@ -210,6 +231,58 @@ router.get('/api/state', api((req, res) => {
     serverNow: new Date().toISOString(),
     me: { session: req.fbxUser || null, device: req.fbxDevice ? { id: req.fbxDevice.id, label: req.fbxDevice.label } : null, admin: isAdmin(req) },
   });
+}));
+
+/** 出荷前チェック (iPad の「まとめ」表示用。読み取りのみ) */
+router.get('/api/readiness', api((req, res) => {
+  const r = exportReadiness(Number(req.query.run));
+  if (!r) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
+  res.json({ ok: true, readiness: r });
+}));
+
+// ─── 名簿 (作業者・PIN) — iPad から職員が編集する (PR2) ───
+
+router.get('/api/roster', api((req, res) => {
+  res.json({
+    ok: true, workers: listWorkers(true), bootstrap: countStaffWithPin() === 0,
+    me: { session: req.fbxUser || null, admin: isAdmin(req) },
+  });
+}));
+
+router.post('/api/workers', checkOrigin, api((req, res) => {
+  const gate = rosterGate(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const r = addWorker({ displayName: req.body?.display_name, workerType: req.body?.worker_type, actor: gate.approvedBy || deviceLabelOf(req) });
+  if (!r.ok) return res.status(r.error === 'duplicate' ? 409 : 400).json(r);
+  safeLogEvent({ action: 'worker_add', workerId: r.id, workerName: String(req.body?.display_name || '').trim(), deviceLabel: deviceLabelOf(req), ok: true,
+    payload: { workerType: req.body?.worker_type, via: gate.via, approvedBy: gate.approvedBy } });
+  res.json(r);
+}));
+
+router.post('/api/workers/:id(\\d+)/pin', checkOrigin, api((req, res) => {
+  const gate = rosterGate(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const r = setWorkerPin(Number(req.params.id), req.body?.pin, `${deviceLabelOf(req)} (${gate.via}${gate.approvedBy ? ':' + gate.approvedBy : ''})`);
+  res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 400)).json(r);
+}));
+
+router.post('/api/workers/:id(\\d+)/active', checkOrigin, api((req, res) => {
+  if (typeof req.body?.active !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_request', message: 'active (true/false) が必要です' });
+  const gate = rosterGate(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const target = getWorker(Number(req.params.id));
+  if (!target) return res.status(404).json({ ok: false, error: 'not_found', message: '作業者が見つかりません' });
+  // 端末からは「PIN を持つ最後の職員」を無効にできない (名簿ゲートが空になり誰でも登録できる状態に戻るため)
+  if (!req.body.active && gate.via !== 'session' && target.worker_type === 'staff' && target.active) {
+    const pinStaff = listWorkers().filter((w) => w.worker_type === 'staff' && w.pin_set);
+    if (pinStaff.length <= 1 && pinStaff.some((w) => w.id === target.id)) {
+      return res.status(409).json({ ok: false, error: 'last_staff', message: 'PINを持つ職員が他にいないため無効にできません (先に別の職員を登録してPINを設定してください)' });
+    }
+  }
+  setWorkerActive(target.id, req.body.active);
+  safeLogEvent({ action: 'worker_active', workerId: target.id, workerName: target.display_name, deviceLabel: deviceLabelOf(req), ok: true,
+    payload: { active: req.body.active, via: gate.via, approvedBy: gate.approvedBy } });
+  res.json({ ok: true });
 }));
 
 /** 割当の追加 (F-2: 原子的残数検証+冪等性) */
@@ -312,6 +385,37 @@ router.post('/api/boxes/:id(\\d+)/reopen', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
+/** 使わなかった箱の取消 (職員のみ・理由必須・中身は空であること) */
+router.post('/api/boxes/:id(\\d+)/void', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const gate = requireStaff(req, w.worker);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const r = voidBox({ boxId: Number(req.params.id), reason: req.body?.reason, worker: w.worker, deviceLabel: deviceLabelOf(req) });
+  if (!r.ok) {
+    const st = { not_found: 404, not_empty: 409, run_not_active: 409, reason_required: 400 }[r.error] || 400;
+    return res.status(st).json(r);
+  }
+  res.json(r);
+}));
+
+/**
+ * 箱札 (要件 F-8): A4 横 1箱1面。iPad の共有→プリント (AirPrint) か、本社で印刷して同梱。
+ * ?run=ID (&group=GID | &box=BID)。PDF 生成ライブラリは使わずブラウザ印刷 (日本語フォント埋め込み不要)
+ */
+router.get('/print/boxes', api((req, res) => {
+  const state = getRunState(Number(req.query.run));
+  if (!state) return res.status(404).send('納品回が見つかりません');
+  const groupId = req.query.group ? Number(req.query.group) : null;
+  const boxId = req.query.box ? Number(req.query.box) : null;
+  const boxes = state.boxes.filter((b) => b.status !== 'void' && (!groupId || b.pack_group_id === groupId) && (!boxId || b.id === boxId));
+  const groupById = new Map(state.groups.map((g) => [g.id, g]));
+  res.render(path.join(__dirname, 'views/print-boxes'), {
+    run: state.run, boxes: boxes.map((b) => ({ ...b, group: groupById.get(b.pack_group_id) })),
+    printedAt: new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }),
+  });
+}));
+
 /** 行のラベル貼り担当 / 確認担当 */
 router.post('/api/rows/:id(\\d+)/workers', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
@@ -363,7 +467,7 @@ router.get('/admin', requireSession, api(async (req, res) => {
     runs: listRuns(30),
     pickingRuns, pickingError,
     workers: listWorkers(true),
-    materials: listMaterials(),
+    materials: listMaterials(true),
     devices: isAdmin(req) ? listDevices() : [],
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     events: listEvents(50),
@@ -444,6 +548,63 @@ router.get('/admin/runs/:id(\\d+)', requireSession, api((req, res) => {
   const state = getRunState(Number(req.params.id));
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
   res.json({ ok: true, ...state });
+}));
+
+// ─── 本社: 出荷前チェック → Excel 出力 → STA アップ済み (PR2) ───
+
+router.get('/admin/runs/:id(\\d+)/readiness', requireSession, api((req, res) => {
+  const readiness = exportReadiness(Number(req.params.id));
+  if (!readiness) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
+  res.json({ ok: true, readiness, exports: listExports(Number(req.params.id)) });
+}));
+
+/**
+ * Excel 出力: チェック (blockers 無し) → 書き込み指示を組む → python で原本に書く (独自検算込み) → 版として記録。
+ * 書いている最中に iPad で変更が入った場合は data_version がずれ、応答と一覧に「旧版」と出る
+ */
+router.post('/admin/runs/:id(\\d+)/exports', requireSession, checkOrigin, api(async (req, res) => {
+  const runId = Number(req.params.id);
+  const payload = buildExportPayload(runId);
+  if (!payload.ok) return res.status(payload.error === 'not_found' ? 404 : 409).json(payload);
+  const w = await writePacklist({ templatePath: payload.excelFile.stored_path, sheets: payload.sheets, fileTag: `run${runId}` });
+  if (!w.ok) {
+    safeLogEvent({ runId, action: 'excel_export', ok: false, error: `${w.error}: ${w.message}`, deviceLabel: `session:${req.session.email}` });
+    return res.status(422).json(w);
+  }
+  const rec = recordExport({
+    runId, excelFileId: payload.excelFile.id, dataVersion: payload.snapshot.dataVersion,
+    fileName: payload.excelFile.original_name || `packlist-run${runId}.xlsx`, storedPath: w.outputPath, sha256: w.sha256,
+    snapshot: payload.snapshot, verify: w.verify, createdBy: req.session.email,
+  });
+  if (!rec.ok) return res.status(409).json(rec);
+  res.json({ ok: true, exportId: rec.exportId, stale: rec.stale, written: w.written, verify: w.verify,
+    downloadUrl: `${BASE}/admin/exports/${rec.exportId}/download`, warnings: payload.snapshot.warnings });
+}));
+
+/** 出力ファイルのダウンロード (ファイル名は原本と同じ — STA はファイル名/タブ構造の変更不可) */
+router.get('/admin/exports/:id(\\d+)/download', requireSession, api((req, res) => {
+  const ex = getExport(Number(req.params.id));
+  if (!ex) return res.status(404).json({ ok: false, error: 'not_found', message: '出力が見つかりません' });
+  if (!fs.existsSync(ex.stored_path)) return res.status(410).json({ ok: false, error: 'file_gone', message: '出力ファイルが見つかりません (再出力してください)' });
+  const name = String(ex.file_name || 'packlist.xlsx').replace(/[\r\n"]/g, '_');
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_');
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+  res.setHeader('Cache-Control', 'no-store');
+  fs.createReadStream(ex.stored_path).on('error', (e) => { console.error('[fba-box] export download', e); if (!res.headersSent) res.status(500).end(); }).pipe(res);
+}));
+
+router.post('/admin/runs/:id(\\d+)/sta-uploaded', requireSession, checkOrigin, api((req, res) => {
+  const r = markStaUploaded({ runId: Number(req.params.id), exportId: Number(req.body?.export_id), actor: `session:${req.session.email}` });
+  if (!r.ok) return res.status({ not_found: 404, stale_export: 409, bad_status: 409 }[r.error] || 400).json(r);
+  res.json(r);
+}));
+
+/** 資材 (管理者): 名前・自重・外寸。外寸は Excel の幅/長さ/高さ欄に自動で入る */
+router.post('/admin/materials', checkOrigin, requireAdmin, api((req, res) => {
+  const b = req.body || {};
+  const r = upsertMaterial({ code: b.code, name: b.name, tareG: b.tare_g, widthCm: b.width_cm, lengthCm: b.length_cm, heightCm: b.height_cm, sort: b.sort, active: b.active !== false, actor: req.session.email });
+  res.status(r.ok ? 200 : 400).json(r);
 }));
 
 // ─── 管理者: 端末・登録コード・作業者 ───

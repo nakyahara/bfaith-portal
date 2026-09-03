@@ -126,6 +126,12 @@ def parse_sheet(ws):
             box_cols[n] = c
     if not box_cols:
         return None, 'no_box_columns'
+    # Amazon 側の箱名 (=IF(M3>=n,"P1 - Bn","") の文字列部分)。表示・箱札用で、無ければ None
+    box_names = {}
+    for n, c in box_cols.items():
+        v = ws.cell(row=box_name_row, column=c).value
+        m = re.search(r'"([^"]+)"', v) if isinstance(v, str) and v.startswith('=') else None
+        box_names[str(n)] = m.group(1) if m else None
     ns = sorted(box_cols)
     if ns[0] != 1 or ns != list(range(1, len(ns) + 1)):
         return None, 'box_columns_not_contiguous'
@@ -198,6 +204,7 @@ def parse_sheet(ws):
         'headerRow': header_row,
         'headers': headers,
         'boxColumns': {str(n): box_cols[n] for n in ns},
+        'boxNames': box_names,
         'maxBoxColumns': len(ns),
         'boxNameRow': box_name_row,
         'dimRows': dim_rows,
@@ -207,10 +214,19 @@ def parse_sheet(ws):
     return info, None
 
 
-def main():
-    if len(sys.argv) != 2:
-        fail('bad_args', 'usage: parse_packlist.py <xlsx>')
-    path = sys.argv[1]
+class ParseError(Exception):
+    """analyze() の失敗 (error, message, extra)"""
+    def __init__(self, error, message, **extra):
+        super().__init__(message)
+        self.error = error
+        self.message = message
+        self.extra = extra
+
+
+def analyze(path):
+    """ワークブックを構造解析して結果 dict を返す。未知形式は ParseError"""
+    def fail(error, message, **extra):
+        raise ParseError(error, message, **extra)
     try:
         import openpyxl
     except Exception as e:  # venv 未整備
@@ -274,13 +290,23 @@ def main():
     }, ensure_ascii=False, sort_keys=True)
     fingerprint = hashlib.sha256(fp_src.encode('utf-8')).hexdigest()[:16]
 
-    print(json.dumps({
+    return {
         'ok': True,
         'metadata': meta,
         'fingerprint': fingerprint,
         'sheets': sheets,
         'sheetErrors': errors,
-    }, ensure_ascii=False))
+    }
+
+
+def main():
+    if len(sys.argv) != 2:
+        fail('bad_args', 'usage: parse_packlist.py <xlsx>')
+    try:
+        result = analyze(sys.argv[1])
+    except ParseError as e:
+        fail(e.error, e.message, **e.extra)
+    print(json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == '__main__':
