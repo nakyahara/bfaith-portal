@@ -4,6 +4,7 @@
   "token": "PASTE_DEVICE_TOKEN_HERE",
   "pollSec": 4,
   "heartbeatSec": 45,
+  "printScaling": "shrink",
   "sumatraPath": "C:\\tools\\slip-print-agent\\SumatraPDF.exe",
   "workDir": "C:\\tools\\slip-print-agent\\work"
 }

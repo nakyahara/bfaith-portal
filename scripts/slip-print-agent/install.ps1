@@ -79,6 +79,12 @@ $settings = New-ScheduledTaskSettingsSet `
   -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+  # Stop the running agent first, otherwise the OLD agent.ps1 keeps running and the new
+  # task never starts a fresh one (MultipleInstances = IgnoreNew).
+  Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" |
+    Where-Object { $_.CommandLine -like ('*' + $agent + '*') } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 Register-ScheduledTask -TaskName $TaskName -Action $action `
