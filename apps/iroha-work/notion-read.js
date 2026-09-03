@@ -86,12 +86,14 @@ export function parsePage(page) {
   };
 }
 
-async function queryPages(filter, maxPages) {
+/** Notion DB を filter でページング取得 (移行ツールからも使う)。truncated = 上限で打ち切り */
+export async function queryPages(filter, maxPages, { sorts = null } = {}) {
   const results = [];
   let cursor = null;
   for (let i = 0; i < maxPages; i++) {
     const body = { page_size: 100 };
     if (filter) body.filter = filter;
+    if (sorts) body.sorts = sorts;   // 走査中の順序変動で取りこぼさないよう、移行では last_edited_time 昇順で固定
     if (cursor) body.start_cursor = cursor;
     const r = await notionRequest(`/databases/${dbId()}/query`, 'POST', body);
     results.push(...(r.results || []));

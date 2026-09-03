@@ -169,6 +169,26 @@ export async function ensureCardSchema({ force = false } = {}) {
   return schema;
 }
 
+/**
+ * スキーマの**検証だけ** (PATCH しない)。移行ツールの調査 (読むだけ) 用 — ensureCardSchema は不足プロパティを
+ * 足すために DB を書き換えるので、「調査は Notion を変えない」を守るにはこちらを使う (Codex A1 R1 #1)
+ * @returns {{names:Set<string>, statusOptions:string[]}}
+ */
+export async function checkCardSchema() {
+  const { dbId } = getConfig();
+  const db = await notionRequest(`/databases/${dbId}`, 'GET');
+  const props = db.properties || {};
+  const problems = [];
+  for (const k of ['名前', 'ステータス']) if (!props[k]) problems.push(`「${k}」プロパティが見つかりません`);
+  if (props['ステータス'] && props['ステータス'].type !== 'select') problems.push(`「ステータス」は select 型が必要 (現在 ${props['ステータス'].type})`);
+  if (problems.length > 0) {
+    const e = new Error('Notion DB のプロパティが想定と違います: ' + problems.join(' / '));
+    e.code = 'NOTION_SCHEMA_MISMATCH';
+    throw e;
+  }
+  return { names: new Set(Object.keys(props)), statusOptions: (props['ステータス'].select?.options || []).map((o) => o?.name).filter(Boolean) };
+}
+
 /** テストからキャッシュを消すため */
 export function _clearSchemaCache() { schemaCache = null; }
 

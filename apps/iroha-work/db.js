@@ -15,6 +15,7 @@
  */
 import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { FACILITIES } from './tasks.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -32,6 +33,153 @@ const workOptionsDDL = (name) => `
       created_by      TEXT,
       UNIQUE(kind, normalized_code)
     );`;
+
+// 在庫化タスク / ラベル待ちの DDL (作成と作り直しで共用。列一覧は INSERT … SELECT にも使う)
+const TASKS_COLS = ['id', 'destination_id', 'notion_page_id', 'legacy_status', 'status', 'close_reason', 'facility_code', 'hold_reason_code', 'hold_reason_note',
+  'planned_date', 'priority_class', 'priority_note', 'product_code', 'product_name', 'qty', 'arrival_date', 'ar_no', 'barcode', 'expiry', 'supplier', 'handling',
+  'master_snapshot', 'payload', 'started_at', 'ready_at', 'closed_at', 'closed_by', 'cancellation_requested_at', 'cancellation_source',
+  'migration_review', 'migration_note', 'import_batch_id', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
+const tasksDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      destination_id   INTEGER,
+      notion_page_id   TEXT,
+      legacy_status    TEXT,
+      status           TEXT NOT NULL CHECK (status IN ('not_started','in_progress','on_hold','ready_for_stocking','closed')),
+      close_reason     TEXT CHECK (close_reason IS NULL OR close_reason IN ('stocked','cancelled','out_of_scope')),
+      facility_code    TEXT NOT NULL DEFAULT 'iroha' REFERENCES f_iroha_facilities(code),
+      hold_reason_code TEXT CHECK (hold_reason_code IS NULL OR hold_reason_code IN ('materials_shortage','label_shortage','awaiting_instruction','other')),
+      hold_reason_note TEXT,
+      planned_date     TEXT,
+      priority_class   TEXT,
+      priority_note    TEXT,
+      product_code     TEXT,
+      product_name     TEXT,
+      qty              INTEGER,
+      arrival_date     TEXT,
+      ar_no            TEXT,
+      barcode          TEXT,
+      expiry           TEXT,
+      supplier         TEXT,
+      handling         TEXT,
+      master_snapshot  TEXT,
+      payload          TEXT,
+      started_at       TEXT,
+      ready_at         TEXT,
+      closed_at        TEXT,
+      closed_by        TEXT,
+      cancellation_requested_at TEXT,
+      cancellation_source       TEXT,
+      migration_review INTEGER NOT NULL DEFAULT 0 CHECK (migration_review IN (0,1)),
+      migration_note   TEXT,
+      import_batch_id  TEXT,
+      version          INTEGER NOT NULL DEFAULT 1,
+      created_at       TEXT NOT NULL,
+      created_by       TEXT,
+      updated_at       TEXT NOT NULL,
+      updated_by       TEXT,
+      -- 状態の不変条件は DB でも守る (サービス層 validateTaskInvariants と同じ規則。一経路の検証漏れで壊れない — Codex A1 R1 #7)
+      CHECK ((status = 'closed') = (close_reason IS NOT NULL)),
+      CHECK ((status = 'closed') = (closed_at IS NOT NULL)),
+      CHECK ((status = 'on_hold') = (hold_reason_code IS NOT NULL)),
+      CHECK (hold_reason_code IS NULL OR hold_reason_code <> 'other' OR (hold_reason_note IS NOT NULL AND TRIM(hold_reason_note) <> ''))
+    );`;
+const TASKS_INDEX_DDL = `
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_tasks_destination ON f_iroha_tasks(destination_id) WHERE destination_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_tasks_notion ON f_iroha_tasks(notion_page_id) WHERE notion_page_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_iroha_tasks_status ON f_iroha_tasks(status, facility_code);
+    CREATE INDEX IF NOT EXISTS idx_iroha_tasks_code ON f_iroha_tasks(product_code);`;
+const LABEL_COLS = ['id', 'task_id', 'occurred_on', 'recorded_by_worker_id', 'recorded_by_name', 'label_ordered', 'lot_expiry', 'qty', 'location', 'reattach',
+  'line_notified_on', 're_notified_on', 'restocked_on', 'done', 'note', 'version', 'created_at', 'updated_at'];
+const labelWaitsDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id               INTEGER NOT NULL REFERENCES f_iroha_tasks(id),
+      occurred_on           TEXT,
+      recorded_by_worker_id INTEGER,
+      recorded_by_name      TEXT,
+      label_ordered         INTEGER NOT NULL DEFAULT 0 CHECK (label_ordered IN (0,1)),
+      lot_expiry            TEXT,
+      qty                   INTEGER,
+      location              TEXT CHECK (location IS NULL OR location IN ('Z','Y','none')),
+      reattach              INTEGER NOT NULL DEFAULT 0 CHECK (reattach IN (0,1)),
+      line_notified_on      TEXT,
+      re_notified_on        TEXT,
+      restocked_on          TEXT,
+      done                  INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0,1)),
+      note                  TEXT,
+      version               INTEGER NOT NULL DEFAULT 1,
+      created_at            TEXT NOT NULL,
+      updated_at            TEXT NOT NULL
+    );`;
+const LABEL_INDEX_DDL = 'CREATE INDEX IF NOT EXISTS idx_iroha_label_waits_task ON f_iroha_label_waits(task_id, id);';
+
+// 「新しい定義」に必要な制約 (個別に検査 — 一部だけ足りない版も作り直す。Codex A1 R3 Low)
+const TASKS_REQUIRED_DDL = [
+  /\(status = 'closed'\) = \(close_reason IS NOT NULL\)/, /\(status = 'closed'\) = \(closed_at IS NOT NULL\)/,
+  /\(status = 'on_hold'\) = \(hold_reason_code IS NOT NULL\)/, /hold_reason_code <> 'other'/, /REFERENCES f_iroha_facilities/,
+];
+const LABEL_REQUIRED_DDL = [/REFERENCES f_iroha_tasks/, /label_ordered IN \(0,1\)/, /location IN \('Z','Y','none'\)/, /reattach IN \(0,1\)/, /done IN \(0,1\)/];
+const FK_CHECK_TABLES = ['f_iroha_tasks', 'f_iroha_label_waits', 'f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events'];
+
+/**
+ * f_iroha_tasks / f_iroha_label_waits の作り直し: CHECK・FK の無い (または一部足りない) 古い版が残っていたら、行をそのまま
+ * 移して新しい定義に入れ替える (CREATE IF NOT EXISTS は制約を足せない — Codex A1 R2 #1)。判定は sqlite_master の DDL 文字列。
+ * 子テーブル (sessions 等) が参照していても親を作り直せるよう、その間だけ foreign_keys を OFF にする。
+ * 制約を入れる前提として、同じトランザクションで孤立参照を補正 (task の無いラベル待ちは __orphan へ退避、子テーブルの
+ * 宙ぶらりんな task_id は NULL に戻す = page_id は残るので次のバックフィルで埋め直せる) してから FK を検査し、
+ * 違反が残れば全部戻す (Codex A1 R3 Medium)。冪等
+ */
+function migrateTasksSchema(db) {
+  const sqlOf = (name) => db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(name)?.sql || '';
+  const lacks = (sql, required) => !!sql && required.some((re) => !re.test(sql));
+  const needTasks = lacks(sqlOf('f_iroha_tasks'), TASKS_REQUIRED_DDL);
+  const needLabel = lacks(sqlOf('f_iroha_label_waits'), LABEL_REQUIRED_DDL);
+  if (!needTasks && !needLabel) return false;
+  const fkWasOn = db.pragma('foreign_keys', { simple: true }) === 1;
+  if (fkWasOn) db.pragma('foreign_keys = OFF');
+  const fixed = { orphanLabelWaits: 0, unlinked: {} };
+  try {
+    db.transaction(() => {
+      if (needTasks) {
+        db.exec(tasksDDL('f_iroha_tasks__new'));
+        db.exec(`INSERT INTO f_iroha_tasks__new (${TASKS_COLS.join(', ')}) SELECT ${TASKS_COLS.join(', ')} FROM f_iroha_tasks`);
+        db.exec('DROP TABLE f_iroha_tasks');
+        db.exec('ALTER TABLE f_iroha_tasks__new RENAME TO f_iroha_tasks');
+        db.exec(TASKS_INDEX_DDL);
+      }
+      if (needLabel) {
+        db.exec(labelWaitsDDL('f_iroha_label_waits__new'));
+        db.exec(`INSERT INTO f_iroha_label_waits__new (${LABEL_COLS.join(', ')}) SELECT ${LABEL_COLS.join(', ')} FROM f_iroha_label_waits`);
+        db.exec('DROP TABLE f_iroha_label_waits');
+        db.exec('ALTER TABLE f_iroha_label_waits__new RENAME TO f_iroha_label_waits');
+        db.exec(LABEL_INDEX_DDL);
+      }
+      // ① task の無いラベル待ちは消さずに退避
+      db.exec('CREATE TABLE IF NOT EXISTS f_iroha_label_waits__orphan AS SELECT * FROM f_iroha_label_waits WHERE 0');
+      const orphanIds = db.prepare('SELECT id FROM f_iroha_label_waits w WHERE NOT EXISTS (SELECT 1 FROM f_iroha_tasks t WHERE t.id = w.task_id)').all().map((r) => r.id);
+      if (orphanIds.length > 0) {
+        const list = orphanIds.join(',');
+        db.exec(`INSERT INTO f_iroha_label_waits__orphan SELECT * FROM f_iroha_label_waits WHERE id IN (${list}); DELETE FROM f_iroha_label_waits WHERE id IN (${list});`);
+        fixed.orphanLabelWaits = orphanIds.length;
+      }
+      // ② 子テーブルの task_id が存在しない task を指していれば外す (page_id は残る)
+      for (const t of ['f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events']) {
+        if (!db.prepare(`PRAGMA table_info(${t})`).all().some((c) => c.name === 'task_id')) continue;
+        fixed.unlinked[t] = db.prepare(`UPDATE ${t} SET task_id = NULL WHERE task_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM f_iroha_tasks x WHERE x.id = ${t}.task_id)`).run().changes;
+      }
+      // ③ 検査。補正できない違反 (拠点コードの誤り等) が残れば throw → トランザクションごと戻る
+      const bad = FK_CHECK_TABLES.flatMap((t) => db.pragma(`foreign_key_check(${t})`));
+      if (bad.length > 0) throw new Error(`タスク表の作り直しを中止しました (補正できない FK 違反): ${JSON.stringify(bad.slice(0, 5))}`);
+    })();
+  } finally {
+    if (fkWasOn) db.pragma('foreign_keys = ON');
+  }
+  console.log(`[iroha-work] ${[needTasks && 'f_iroha_tasks', needLabel && 'f_iroha_label_waits'].filter(Boolean).join(' / ')} を CHECK・FK 付きに作り直しました`
+    + (fixed.orphanLabelWaits ? ` (孤立ラベル待ち ${fixed.orphanLabelWaits} 件を __orphan へ退避)` : '')
+    + (Object.values(fixed.unlinked).some(Boolean) ? ` (宙ぶらりんの task_id を外した: ${JSON.stringify(fixed.unlinked)})` : ''));
+  return true;
+}
 
 /**
  * f_iroha_work_options の作り直し: normalized_code が無い古い版 (UNIQUE(kind, code)) が残っていたら、
@@ -137,6 +285,30 @@ export function createTables(db = getMirrorDB()) {
       created_at   TEXT NOT NULL,
       created_by   TEXT
     );
+
+    -- ─── アプリ正本化 (要件定義 v1.1・2026-09-03。状態モデルは tasks.js) ───
+    -- 拠点 (いろは + 外部施設)。初期値は tasks.js の FACILITIES (seedFacilities)
+    CREATE TABLE IF NOT EXISTS f_iroha_facilities (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      code       TEXT NOT NULL UNIQUE,
+      name       TEXT NOT NULL,
+      external   INTEGER NOT NULL DEFAULT 0 CHECK (external IN (0,1)),
+      active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- 在庫化タスク (= 入荷明細 1 件)。v1.1 でアプリの正本になる。
+    --   destination_id = 入荷受付台帳 (f_inbound_check_destinations.id)。Notion からの初期取込分は notion_page_id で冪等
+    --   表示用の商品情報はカード作成時の値、作業仕様は master_snapshot (作成時の JSON — 後でマスタが変わっても指示は変えない)
+    --   終了 (closed) も削除せず残す (作業時間・写真の履歴)。一覧・カンバンは OPEN_STATUSES だけ
+    --   migration_review = 取込時に状態を推定した行 (施設名ステータス等)。職員が確認して 0 にする
+    --   (DDL は tasksDDL — 古い版 (CHECK/FK 無し) が残っていれば migrateTasksSchema で作り直す)
+    ${tasksDDL('f_iroha_tasks')}
+    ${TASKS_INDEX_DDL}
+
+    -- ラベル待ち (『ラベル待ち管理.xlsx』の DB 化。要件 v1.1 §C)。保留理由 label_shortage に付随する追跡
+    ${labelWaitsDDL('f_iroha_label_waits')}
+    ${LABEL_INDEX_DDL}
 
     -- 操作履歴 (append-only。Codex R2「操作履歴」強く推奨)。
     -- ステータス変更など Notion への書き込みは成功・失敗ともここに残す
@@ -266,6 +438,22 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_card_media', 'unavailable_at', 'TEXT');
   // 選択肢テーブルが normalized_code 無しの古い版なら作り直す (列追加だけでは UNIQUE を差し替えられない)
   migrateWorkOptionsSchema(db);
+  // 拠点の初期値 (無ければ足す。名前の変更は管理画面から — 今は無いので tasks.js を正とする)。
+  // タスク表の作り直し (facility_code の FK 検査) より前に入れておく
+  const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, active, sort_order) VALUES (?, ?, ?, 1, ?)');
+  for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.sort_order);
+  // タスク表が CHECK/FK 無し (または一部足りない) 古い版なら作り直す (子テーブルの task_id 追加より前に)
+  migrateTasksSchema(db);
+  // v1.1 正本化: 作業時間・写真・履歴を task に紐づける (page_id は Notion 時代の証跡として残す — Codex 設計相談 R3)。
+  // REFERENCES は宣言する (mirror DB は foreign_keys=ON。存在確認はサービス層でも行う)
+  addCol('f_iroha_work_sessions', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
+  addCol('f_iroha_card_media', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
+  addCol('f_iroha_app_events', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_task ON f_iroha_work_sessions(task_id, id);
+    CREATE INDEX IF NOT EXISTS idx_iroha_media_task ON f_iroha_card_media(task_id, id);
+    CREATE INDEX IF NOT EXISTS idx_iroha_events_task ON f_iroha_app_events(task_id, id);
+  `);
   // video_url は inbound-check 側でも足すが、いろは単独経路の起動でも保証する
   // (このアプリが先に f_iroha_work_master を SELECT すると no such column になるため)
   if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get()) {

@@ -12,6 +12,7 @@
  *      その分、ここで全ルートを守る (manifest.json だけ素通し)
  */
 import { Router } from 'express';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { pipeline } from 'stream';
@@ -29,6 +30,8 @@ import {
   getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
+import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
+import { countTasksByStatus, listTasksNeedingReview, listOrphans } from './tasks-db.js';
 import { buildList, classifyMasterEdit, clearEnrichCache, masterOf } from './service.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import {
@@ -664,6 +667,7 @@ router.get('/admin', requireSession, api((req, res) => {
     cache: cacheStatsForAdmin(),
     workers: listIrohaWorkers(true),
     options: workOptionsForState(true),
+    migration: migrationStatus(),
     devices: isAdmin(req) ? listDevices() : [],
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     events: listEvents(50),
@@ -726,6 +730,79 @@ router.post('/admin/workers/:id(\\d+)/active', checkOrigin, requireAdmin, api((r
 router.post('/admin/workers/:id(\\d+)/pin', checkOrigin, requireAdmin, api((req, res) => {
   const r = setWorkerPin(Number(req.params.id), req.body?.pin, req.session.email);
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 400)).json(r);
+}));
+
+// ─── Notion → tasks の移行 (要件 v1.1 §F。管理者だけ。調査/dry-run は読むだけ、本取込だけが書く) ───
+// 直近の調査結果はプロセス内に保持 (再取得せずに CSV / 本取込へ進むため)。Render 再起動で消えたら調査し直す。
+// plan_id (ランダム) で「本取込するのは自分が見た調査結果」を担保 — 別の管理者が調査し直した結果を適用しない (Codex A1 R1 #12)
+let lastPlan = null;   // { planId, at, by, since, cutoff, truncated, rows, summary }
+const PLAN_MAX_AGE_MS = 30 * 60 * 1000;
+function migrationStatus() {
+  try {
+    return { counts: countTasksByStatus(), review: listTasksNeedingReview().length, orphans: listOrphans(20), files: listMigrationFiles(),
+      lastPlanAt: lastPlan ? lastPlan.at : null, lastPlanBy: lastPlan ? lastPlan.by : null, lastPlanSummary: lastPlan ? lastPlan.summary : null };
+  } catch (e) {
+    const ref = Date.now().toString(36);
+    console.error(`[iroha-work migration ${ref}] 状態の取得に失敗`, e);
+    return { error: `状態を取得できませんでした (参照 ${ref}。サーバーログを確認してください)` };
+  }
+}
+const issueCounts = (issues) => Object.fromEntries(Object.entries(issues).map(([k, v]) => [k, v.length]));
+// 内部例外の文言を画面に出さない (SQL・パス・Notion の詳細はログへ。画面には参照番号 — Codex A1 R1 #16)
+function migrationFail(res, e, what) {
+  const ref = Date.now().toString(36);
+  console.error(`[iroha-work migration ${ref}] ${what} に失敗`, e);
+  const known = e && e.code === 'NOTION_SCHEMA_MISMATCH' ? e.message : null;
+  return res.status(500).json({ ok: false, error: 'internal', message: known || `${what}に失敗しました (参照 ${ref}。サーバーログを確認してください)` });
+}
+
+router.post('/admin/migration/survey', checkOrigin, requireAdmin, api(async (req, res) => {
+  const since = req.body?.since ? String(req.body.since) : null;
+  if (since && Number.isNaN(Date.parse(since))) return res.status(400).json({ ok: false, error: 'bad_request', message: 'since は日時 (ISO) で指定してください' });
+  let survey, plan;
+  try {
+    survey = await surveyNotion({ since });
+    plan = planImport(survey.pages);
+  } catch (e) { return migrationFail(res, e, '調査'); }
+  const planId = crypto.randomBytes(6).toString('base64url');
+  lastPlan = { planId, at: survey.fetchedAt, by: req.iwUser, since, cutoff: survey.cutoff, truncated: survey.truncated, rows: plan.rows, summary: plan.summary };
+  safeLog({ action: 'migration_survey', pageId: null, deviceLabel: `session:${req.iwUser}`, to: `${planId}: ${survey.count}枚${since ? ' since ' + since : ''}`, ok: !survey.truncated });
+  res.json({
+    ok: true, planId, at: survey.fetchedAt, by: req.iwUser, since, cutoff: survey.cutoff, nextSince: survey.cutoff,
+    truncated: survey.truncated, count: survey.count, byStatus: survey.byStatus,
+    issues: issueCounts(survey.issues), issueDetail: survey.issues,
+    orphans: { unlinked: { sessions: survey.orphans.unlinked.sessions.length, media: survey.orphans.unlinked.media.length },
+      missingInNotion: survey.orphans.missingInNotion ? { sessions: survey.orphans.missingInNotion.sessions.length, media: survey.orphans.missingInNotion.media.length } : null },
+    file: survey.file ? path.basename(survey.file) : null, rawFile: survey.rawFile ? path.basename(survey.rawFile) : null, summary: plan.summary,
+    review: plan.rows.filter(r => r.migration_review || !r.will_import).map(r => ({ page: r.notion_page_id, title: r.title, legacy: r.legacy_status, mapped: r.mapped_status, facility: r.facility_code, warnings: r.warnings, skip: r.skip_reason, url: r.url })),
+    reconcile: reconcile(plan.rows, { mode: since ? 'delta' : 'full' }),
+  });
+}));
+
+router.get('/admin/migration/plan.csv', requireAdmin, api((req, res) => {
+  if (!lastPlan) return res.status(409).json({ ok: false, error: 'no_plan', message: '先に「調査 (dry-run)」を実行してください' });
+  res.type('text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="iroha-migration-plan-${lastPlan.at.slice(0, 19).replace(/[:]/g, '')}.csv"`);
+  res.send(planToCsv(lastPlan.rows));
+}));
+
+router.post('/admin/migration/apply', checkOrigin, requireAdmin, api((req, res) => {
+  if (!lastPlan) return res.status(409).json({ ok: false, error: 'no_plan', message: '先に「調査 (dry-run)」を実行してください' });
+  if (req.body?.confirm !== 'APPLY') return res.status(400).json({ ok: false, error: 'confirm_required', message: '確認のため confirm に APPLY と入れてください' });
+  if (!req.body?.plan_id || req.body.plan_id !== lastPlan.planId) {
+    return res.status(409).json({ ok: false, error: 'plan_mismatch', message: `調査結果が違います (直近の調査は ${lastPlan.by} が ${lastPlan.at} に実行)。画面を更新して調査し直してください` });
+  }
+  if (lastPlan.truncated) return res.status(409).json({ ok: false, error: 'truncated', message: 'Notion の取得が上限で打ち切られているため取り込めません (件数を確認してください)' });
+  if (Date.now() - Date.parse(lastPlan.at) > PLAN_MAX_AGE_MS) return res.status(409).json({ ok: false, error: 'stale_plan', message: '調査が 30 分以上前のものです。調査し直してから取り込んでください' });
+  let out;
+  try { out = applyImport(lastPlan.rows, { actor: req.iwUser }); }
+  catch (e) { return migrationFail(res, e, '本取込 (全て取り消しました)'); }
+  safeLog({ action: 'migration_apply', pageId: null, deviceLabel: `session:${req.iwUser}`, to: `${lastPlan.planId}/${out.batchId}: +${out.inserted} ~${out.updated} =${out.kept} skip${out.skipped} journal=${out.journal}`, ok: true });
+  res.json({ ok: true, ...out, planId: lastPlan.planId, nextSince: lastPlan.cutoff, reconcile: reconcile(lastPlan.rows, { mode: lastPlan.since ? 'delta' : 'full' }) });
+}));
+
+router.get('/admin/migration/status', requireAdmin, api((req, res) => {
+  res.json({ ok: true, ...migrationStatus() });
 }));
 
 // ─── 選択肢 (資材・保管箱) の管理 ───
