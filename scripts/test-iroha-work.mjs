@@ -6,7 +6,7 @@
  *
  * 検証項目 (要件定義 §1.5/§1.7 と Codex設計相談R2 §2 のシナリオ):
  *   1. env 未設定なら fail-closed (エラー文言つきで古いキャッシュ表示)
- *   2. 取得: 未完了は全件 + 棚入完了は期間フィルタ / 「取消」は取らない / 重複ページは1回
+ *   2. 取得: 未完了は全件 / 棚入完了・取消・在庫化対象外・作業完了は取らない / 重複ページは1回
  *   3. パース: ステータス未設定 → 未着手 / 名前なし → (名称なし)
  *   4. キャッシュ鮮度: 期間内は再取得しない / force で取り直す
  *   5. 取得失敗: キャッシュは残す + last_refresh_error に記録
@@ -186,17 +186,16 @@ mkPage({ status: '在庫化対象外', title: '対象外', code: 'PROD-Y', qty: 
 mkPage({ status: '作業完了', title: '作業は終わった', code: 'PROD-Z', qty: 1 });
 {
   const r = await refreshFromNotion();
-  ok(r.count === 4, `取消・在庫化対象外・作業完了を除く4枚 (実際 ${r.count})`);
+  ok(r.count === 3, `棚入完了・取消・在庫化対象外・作業完了を除く3枚 (実際 ${r.count})`);
   const rows = listCache();
-  ok(rows.length === 4, 'キャッシュも4行');
-  ok(!rows.some(x => ['取消', '在庫化対象外', '作業完了'].includes(x.status)), '「取消」「在庫化対象外」「作業完了」は取らない (中原さん 2026-09-03)');
+  ok(rows.length === 3, 'キャッシュも3行');
+  ok(!rows.some(x => ['棚入完了', '取消', '在庫化対象外', '作業完了'].includes(x.status)), '「棚入完了」「取消」「在庫化対象外」「作業完了」は取らない (中原さん 2026-09-03)');
+  ok(!rows.find(x => x.page_id === pDone.id), '棚入完了のカードは入らない');
+  ok(!mock.lastFilters.some(f => f?.and?.some(c => c.select?.equals === '棚入完了')), '棚入完了を別クエリで引かない');
   const activeFilter = mock.lastFilters.find(f => JSON.stringify(f || {}).includes('在庫化対象外'));
   ok(activeFilter && JSON.stringify(activeFilter).includes('作業完了'), 'DB に実在する除外ステータスは Notion 側のフィルタで落とす (全件を引かない)');
   ok(!mock.lastFilters.some(f => JSON.stringify(f || {}).includes('取消')),
     '「取消」をフィルタに使わない (DB に無い選択肢名は Notion が 400 を返す — 2026-09-03 実機障害)');
-  ok(rows.find(x => x.page_id === pDone.id), '棚入完了 (期間内) は入る');
-  const doneFilter = mock.lastFilters.find(f => f?.and?.some(c => c.select?.equals === '棚入完了'));
-  ok(doneFilter && doneFilter.and.some(c => c.timestamp === 'last_edited_time' && c.last_edited_time?.on_or_after), '棚入完了は期間フィルタつき');
 }
 
 console.log('\n[3] パース');
@@ -225,7 +224,7 @@ console.log('\n[5] 取得失敗はキャッシュ温存 + エラー記録');
   const r = await ensureFresh({ force: true });
   mock.failQuery = null;
   ok(r.fresh === false && r.error, 'エラーを返す');
-  ok(listCache().length === 4, 'キャッシュは消えない');
+  ok(listCache().length === 3, 'キャッシュは消えない');
   ok(cacheStatsForAdmin().lastRefreshError, '管理画面用にも残る');
 }
 
@@ -264,7 +263,7 @@ console.log('\n[7] buildList: 作業仕様・優先度・並び');
   clearEnrichCache();
 
   const { cards } = buildList();
-  ok(cards.length === 4, `4枚 (実際 ${cards.length})`);
+  ok(cards.length === 3, `3枚 (棚入完了は一覧に出ない。実際 ${cards.length})`);
   const a = cards.find(c => c.product_code === 'PROD-A');
   ok(a.master.source === 'master' && a.master.material_code === 'D-8' && a.master.missing.length === 0,
     '作業仕様はマスタ優先・未登録なし');
@@ -307,8 +306,11 @@ console.log('\n[9] changeStatus');
   ok(r4.ok === false && r4.error === 'staff_required', '棚入完了への変更は職員のみ');
   const r5 = await changeStatus({ pageId: pA.id, to: '棚入完了', expect: '作業中', isStaff: true });
   ok(r5.ok === true, '職員なら棚入完了にできる');
+  ok(r5.listed === false && !listCache().some(x => x.page_id === pA.id), '棚入完了にしたカードは一覧 (キャッシュ) から外れる (listed=false)');
   const r6 = await changeStatus({ pageId: pA.id, to: '作業中', expect: '棚入完了', isStaff: false });
   ok(r6.ok === false && r6.error === 'staff_required', '棚入完了からの取り消しも職員のみ');
+  const r6b = await changeStatus({ pageId: pA.id, to: '作業中', expect: '棚入完了', isStaff: true });
+  ok(r6b.ok === true && r6b.listed === true && listCache().some(x => x.page_id === pA.id), '職員が棚入完了から戻すと一覧に再び現れる (listed=true)');
 
   mock.missingPages.add(pB.id);
   const r7 = await changeStatus({ pageId: pB.id, to: '作業中', expect: '作業中', isStaff: false });
@@ -375,10 +377,10 @@ console.log('\n[9c] 取得中のステータス変更を全置換で巻き戻さ
 
 console.log('\n[9d] 取得中の 棚入完了→未完了 で行が消えない (R2 #1)');
 {
-  // 棚入完了のカードをキャッシュに入れておく
+  // 棚入完了のカードは取り込まない (キャッシュに無い) — そこから作業中へ戻すと行が現れる
   const pD = mkPage({ status: '棚入完了', title: '完了から戻す', code: 'PROD-D2' });
   await refreshFromNotion();
-  ok(listCache().some(x => x.page_id === pD.id), '前提: 完了カードがキャッシュにある');
+  ok(!listCache().some(x => x.page_id === pD.id), '前提: 棚入完了のカードはキャッシュに無い (取り込まない)');
   // 未完了クエリのスナップショット後 (=このカードは含まれない) に 棚入完了→作業中 へ変更。
   // 完了クエリ時点ではもう作業中なので、どちらのクエリ結果にも入らない
   mock.onQuery = async () => {

@@ -25,22 +25,22 @@ import { getDB, replaceCache, listCache, updateCacheStatus, upsertCachePage, rem
 
 export { isNotionConfigured };
 
-export const STATUSES = ['未着手', '作業中', '中断', '棚入完了'];
+export const STATUSES = ['未着手', '作業中', '中断', '棚入完了'];   // 変更先 (棚入完了は職員のみ)
 export const STATUS_DONE = '棚入完了';
 const STATUS_CANCELLED = '取消';
-// 一覧に取り込まないステータス (中原さん 2026-09-03: 在庫化対象外・作業完了は取り込まない)。
+// 一覧に取り込まないステータス (中原さん 2026-09-03: 在庫化対象外・作業完了・棚入完了は取り込まない。
+// 棚入完了にしたカードはその場で一覧から外れる。完了分は Notion で見る)。
 // Notion クエリの除外条件に入れるのは DB スキーマに実在する選択肢だけ (無い名前は 400 になる)、
 // 取得後のコード側除外は全部に掛ける (二重の安全)
-export const EXCLUDED_STATUSES = [STATUS_CANCELLED, '在庫化対象外', '作業完了'];
+export const EXCLUDED_STATUSES = [STATUS_CANCELLED, '在庫化対象外', '作業完了', STATUS_DONE];
+// 一覧のタブ (= 取り込む状態)。変更先 (STATUSES) とは別物
+export const LIST_STATUSES = STATUSES.filter(s => !EXCLUDED_STATUSES.includes(s));
 const STATUS_PROP = 'ステータス';
 
-// 棚入完了は最近のものだけ一覧に出す (全履歴を毎回引かない。それより古い完了分は Notion で見る)
-export const DONE_WINDOW_DAYS = 14;
 // キャッシュの鮮度。これより古ければ /api/state が自動で取り直す
 export const CACHE_FRESH_MS = 3 * 60 * 1000;
 // ページング上限 (暴走ガード。超えたら取得を諦めて古い完全キャッシュを守る — 黙って欠けさせない)
 const MAX_PAGES_ACTIVE = 10;   // 未完了カード 最大1000枚
-const MAX_PAGES_DONE = 5;      // 直近の棚入完了 最大500枚
 
 function dbId() {
   return process.env.INBOUND_CHECK_NOTION_DB_ID;
@@ -108,10 +108,16 @@ async function queryPages(filter, maxPages) {
 //   未完了クエリ (変更前に実行) にも完了クエリ (変更後に実行) にも入らず、行が消えるため
 const recentChanges = new Map();
 
+/** パース済みの行をキャッシュに反映する。取り込まないステータス (棚入完了など) なら行を消す = 一覧から外す */
+function applyToCache(row, pageId = row?.pageId) {
+  if (!row || EXCLUDED_STATUSES.includes(row.status)) removeCachePage(pageId);
+  else upsertCachePage(row);
+}
+
 /**
  * カード一覧を Notion から取得してキャッシュを全置換する。
- *   ①棚入完了・除外ステータス (EXCLUDED_STATUSES) 以外は**全件** — 何ヶ月放置の未着手も消さない
- *   ②棚入完了は直近 DONE_WINDOW_DAYS 日に編集されたものだけ
+ *   除外ステータス (EXCLUDED_STATUSES = 棚入完了・取消・在庫化対象外・作業完了) 以外は**全件** —
+ *   何ヶ月放置の未着手も消さない。完了分は取り込まない (中原さん 2026-09-03)。
  * アーカイブ済みページは query に元々返らない。
  * 取り切れなかった (truncated) ときは置き換えず、古い完全キャッシュを守る。
  */
@@ -122,31 +128,25 @@ export async function refreshFromNotion() {
   // ⚠ 除外ステータスは DB スキーマに**実在する選択肢だけ**クエリに入れる: Notion の select フィルタは
   //   存在しない選択肢名を指定すると 400 (select option "取消" not found) になり、一覧が丸ごと
   //   取れなくなる。「取消」は inbound-check が初めて取消を反映した時に自動作成される選択肢で、
-  //   それまで存在しない (2026-09-03 実機で判明: キャッシュ 0 枚)。実在しないものは取得後に除外
+  //   それまで存在しない (2026-09-03 実機で判明: キャッシュ 0 枚)。実在しないものは取得後に除外。
+  //   棚入完了だけは運用上必ず存在する (無いとアプリが成立しない) ので無条件に入れる
   const known = schema?.selectOptions?.get(STATUS_PROP) || new Set();
   const activeFilter = {
     and: [
       { property: STATUS_PROP, select: { does_not_equal: STATUS_DONE } },
-      ...EXCLUDED_STATUSES.filter(s => known.has(s)).map(s => ({ property: STATUS_PROP, select: { does_not_equal: s } })),
-    ],
-  };
-  const doneSince = new Date(startedAt - DONE_WINDOW_DAYS * 24 * 3600 * 1000).toISOString();
-  const doneFilter = {
-    and: [
-      { property: STATUS_PROP, select: { equals: STATUS_DONE } },
-      { timestamp: 'last_edited_time', last_edited_time: { on_or_after: doneSince } },
+      ...EXCLUDED_STATUSES.filter(s => s !== STATUS_DONE && known.has(s))
+        .map(s => ({ property: STATUS_PROP, select: { does_not_equal: s } })),
     ],
   };
   const a = await queryPages(activeFilter, MAX_PAGES_ACTIVE);
-  const b = await queryPages(doneFilter, MAX_PAGES_DONE);
-  if (a.truncated || b.truncated) {
+  if (a.truncated) {
     setMetaValue('truncated', '1');
-    console.warn(`[iroha-work] Notion 取得がページ上限で打ち切り → キャッシュは置き換えない (未完了${a.results.length}件/完了${b.results.length}件)`);
+    console.warn(`[iroha-work] Notion 取得がページ上限で打ち切り → キャッシュは置き換えない (${a.results.length}件)`);
     return { count: null, truncated: true };
   }
   const seen = new Set();
   const pages = [];
-  for (const page of [...a.results, ...b.results]) {
+  for (const page of a.results) {
     if (seen.has(page.id)) continue;
     seen.add(page.id);
     const row = parsePage(page);
@@ -154,10 +154,11 @@ export async function refreshFromNotion() {
     pages.push(row);
   }
   replaceCache(pages);
-  // 取得開始より後にアプリで変えたページは、置換結果 (古い) より新しい → 行ごと戻し入れる。
-  // 取得開始より前の変更は Notion 側の取得結果に含まれているので覚え書きを消す
+  // 取得開始より後にアプリで変えたページは、置換結果 (古い) より新しい → 行ごと戻し入れる
+  // (棚入完了にした分は applyToCache が消す)。取得開始より前の変更は Notion 側の取得結果に
+  // 含まれているので覚え書きを消す
   for (const [pageId, ch] of recentChanges) {
-    if (ch.at >= startedAt) upsertCachePage(ch.row);
+    if (ch.at >= startedAt) applyToCache(ch.row, pageId);
     else recentChanges.delete(pageId);
   }
   setMetaValue('truncated', null);
@@ -269,11 +270,13 @@ async function changeStatusLocked({ pageId, to, expect, isStaff }) {
   if (current === to) {
     // もう目的の状態 (他の端末で同じ変更が済んでいた)。エラーにしない
     updateCacheStatus(pageId, current, page.last_edited_time);
-    return { ok: true, status: current, already: true };
+    if (EXCLUDED_STATUSES.includes(current)) removeCachePage(pageId);   // 他端末/Notion で完了済みなら一覧から外す
+    return { ok: true, status: current, already: true, listed: !EXCLUDED_STATUSES.includes(current) };
   }
   if (current !== expect) {
     updateCacheStatus(pageId, current, page.last_edited_time);
-    return { ok: false, error: 'conflict', current,
+    if (EXCLUDED_STATUSES.includes(current)) removeCachePage(pageId);   // 他端末/Notion で完了済みなら一覧から外す
+    return { ok: false, error: 'conflict', current, listed: !EXCLUDED_STATUSES.includes(current),
       message: `Notion 側で「${current}」に変更されています。最新の状態を表示します` };
   }
   if ((to === STATUS_DONE || current === STATUS_DONE) && !isStaff) {
@@ -296,9 +299,10 @@ async function changeStatusLocked({ pageId, to, expect, isStaff }) {
   }
   // PATCH 応答はページ全体なので、行まるごとキャッシュへ反映する
   const parsed = parsePage(updated);
-  upsertCachePage(parsed);
+  applyToCache(parsed);
   recentChanges.set(pageId, { row: parsed, at: Date.now() });
-  return { ok: true, status: to };
+  // listed=false = 一覧に残らない変更 (棚入完了)。画面はこれで行を外す
+  return { ok: true, status: to, listed: !EXCLUDED_STATUSES.includes(to) };
 }
 
 /**
@@ -326,7 +330,7 @@ export async function fetchCardLive(pageId) {
     return { ok: false, error: 'wrong_database', message: 'このページは在庫化作業管理のカードではありません' };
   }
   const parsed = parsePage(page);
-  upsertCachePage(parsed);
+  applyToCache(parsed);
   return { ok: true, status: parsed.status, row: parsed };
 }
 
