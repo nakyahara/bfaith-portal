@@ -91,6 +91,7 @@
   .tag.miss{background:var(--danger-soft);color:var(--danger)}
   .tag.today{background:var(--accent-soft);color:var(--accent)}
   .tag.ext{background:var(--amber-soft);color:var(--amber)}
+  .tag.ready{background:var(--ok-soft);color:var(--ok)}
   .st{flex:none;font-size:.8rem;font-weight:700;border-radius:var(--r-sm);padding:6px 10px;cursor:pointer;
     border:1px solid transparent;white-space:nowrap;font-family:var(--font)}
   .st.todo{background:var(--well);color:var(--sub);border-color:var(--line)}
@@ -773,6 +774,7 @@ function rowTags(c) {
   if (c.today) h += '<span class="tag today">📌 今日やる</span>';
   if (c.cancellation_requested_at) h += '<span class="tag urgent">⚠ 取消の確認待ち</span>';
   if (c.migration_review) h += '<span class="tag miss">❓ 状態の確認待ち</span>';
+  if (c.external_ready) h += '<span class="tag ready">📦 外部に出せます</span>';
   if (c.facility_code && c.facility_code !== 'iroha') h += '<span class="tag ext">🏢 ' + esc(facilityName(c.facility_code)) + '</span>';
   if (c.priority.kind === 'urgent') h += '<span class="tag urgent">🔥 急ぎ・' + esc(c.priority.label) + '</span>';
   if (c.priority.kind === 'new') h += '<span class="tag new">🌱 新商品</span>';
@@ -972,6 +974,7 @@ function bcardHtml(c, status) {
   const sel = selectable && bulkIds.has(c.id);
   const meta = [c.qty != null ? c.qty + ' 個' : null, c.boxes || null,
     c.plan_hours != null ? '⏱ ' + c.plan_hours + 'h' : null,
+    c.external_ready ? '📦 外部に出せます' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
   return '<div class="bcard' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
@@ -1700,6 +1703,13 @@ function workCardHtml(c) {
       '<button class="btn" onclick="setPlanned(' + (c.today ? 'false' : 'true') + ')">' +
       (c.today ? '📌 今日やる をやめる' : '📌 今日やる') + '</button></div>';
   }
+  // アプリ正本のみ: 外部施設に出す準備ができたか (状態とは別のチェック。Notion のチェックボックスの置き換え)
+  let ext = '';
+  if (isApp() && c.status !== 'closed') {
+    ext = '<div class="wbtns" style="margin-top:10px">' +
+      '<button class="btn' + (c.external_ready ? ' primary' : '') + '" onclick="setExternalReady(' + (c.external_ready ? 'false' : 'true') + ')">' +
+      (c.external_ready ? '📦 外部に出す準備OK をやめる' : '📦 外部に出す準備OK にする') + '</button></div>';
+  }
   // アプリ正本のみ: ラベル待ちの記録 (メーカーのラベルが足りず作業を止めているもの)
   let label = '';
   if (isApp() && c.status !== 'closed') {
@@ -1708,8 +1718,22 @@ function workCardHtml(c) {
   }
   return '<div class="dcard"><h3 class="sec">作業する人・時間</h3>' +
     (chips ? '<div class="wchips">' + chips + '</div>' : '') +
-    controls + plan + label +
+    controls + plan + ext + label +
     '<p class="est num">' + estText(c) + '</p></div>';
+}
+
+/** 「外部施設に出す準備OK」の切り替え。アプリ正本のみ */
+async function setExternalReady(on) {
+  if (!worker || !curDetail) return;
+  const c = findCard(curDetail);
+  if (!c) return;
+  const j = await apiFetch('/api/external-ready', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, ready: !!on, expect_version: c.version, worker_id: worker.id }),
+  });
+  if (!j.ok) { showErr(j.message || '変更できませんでした'); if (j.current) applyTask(j.current); return; }
+  applyTask(j.task);
+  toast(on ? '外部に出す準備OK にしました' : '外部に出す準備OK をやめました');
 }
 
 /** 「今日やる」(planned_date = 今日) / 後日 (null)。アプリ正本のみ */

@@ -240,6 +240,7 @@ export function buildTaskList({ facility = null } = {}) {
       hold_reason_note: r.hold_reason_note,
       planned_date: r.planned_date,
       today: r.planned_date === today,
+      external_ready: !!r.external_ready,
       version: r.version,
       migration_review: !!r.migration_review,
       cancellation_requested_at: r.cancellation_requested_at,

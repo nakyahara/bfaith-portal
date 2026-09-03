@@ -1643,6 +1643,16 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok((await call('GET', '/api/history?from=0001-01-01&to=9999-12-31', { cookie })).status === 200, '端から端までの指定も通る');
       const one = await call('GET', '/api/history?q=' + encodeURIComponent('棚入待ち1'), { cookie });
       ok(one.json.total === 1 && one.json.rows[0].id === r1 && one.json.rows[0].facility_name === 'いろは', '商品名で絞れる (拠点名つき)');
+      // 外部施設に出す準備OK (HTTP)
+      const extTask = mk(9105, '外部に出す予定', 'in_progress');
+      const e1 = await call('POST', '/api/external-ready', { cookie, body: { id: extTask, ready: true, expect_version: TD.getTask(extTask).version, worker_id: w1.id } });
+      ok(e1.status === 200 && e1.json.ok && e1.json.task.external_ready === true, '外部に出す準備OK にできる (職員でなくてよい)');
+      ok((await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === extTask).external_ready === true, '一覧にも出る');
+      const e2 = await call('POST', '/api/external-ready', { cookie, body: { id: extTask, ready: false, expect_version: 1, worker_id: w1.id } });
+      ok(e2.status === 409 && e2.json.error === 'conflict' && e2.json.current, '古い version は 409 (現在値つき)');
+      ok((await call('POST', '/api/external-ready', { cookie, body: { id: 'x', ready: true, worker_id: w1.id } })).status === 400, '不正な id は 400');
+      ok((await call('POST', '/api/external-ready', { ...admin, body: { id: extTask, ready: false, expect_version: TD.getTask(extTask).version } })).status === 400,
+        '作業者を選んでいなければ 400');
     }
     ok(notionCalls() === calls0, 'ここまで Notion API を 1 回も呼んでいない');
     // Notion に戻す: app 正本以降の記録があるので 409 → force で通る (件数・監査ログ・切替時刻)
@@ -1677,6 +1687,7 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         ['POST', '/api/planned', { id: 1, worker_id: w1.id }],
         ['POST', '/api/cancellation', { id: 1, worker_id: staff2.id, decision: 'cancel', pin: '4649' }],
         ['POST', '/api/review-cleared', { id: 1, worker_id: staff2.id, pin: '4649' }],
+        ['POST', '/api/external-ready', { id: 1, ready: true, worker_id: w1.id }],
       ];
       for (const [m, p2, body] of writes) {
         const r = await call(m, p2, { cookie, body });
@@ -1941,6 +1952,25 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   ok(card2.boxes === '2箱+5' && card2.z_stock === 30, 'Z ロケに在庫があれば、その分で必要保管箱を出す');
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
   clearEnrichCache();
+
+  // 外部施設に出す準備OK (状態とは別のチェック。Notion のチェックボックスの置き換え)
+  {
+    const cur = TD.getTask(t);
+    ok(cur.external_ready === 0, '既定はチェックなし');
+    const on = TD.setExternalReady({ taskId: t, ready: true, expectVersion: cur.version, actor: 'test' });
+    ok(on.ok && on.task.external_ready === 1 && on.task.version === cur.version + 1, 'チェックできる (version が進む)');
+    ok(TD.setExternalReady({ taskId: t, ready: false, expectVersion: cur.version, actor: 'test' }).error === 'conflict', '古い version は競合');
+    clearEnrichCache();
+    ok(S2.buildTaskList().cards.find(c => c.id === t).external_ready === true, '一覧のカードに出る');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_external_ready' AND task_id = ?").get(t).c === 1, '履歴に残る');
+    const off = TD.setExternalReady({ taskId: t, ready: false, expectVersion: TD.getTask(t).version, actor: 'test' });
+    ok(off.ok && off.task.external_ready === 0, 'やめられる');
+    ok(TD.setExternalReady({ taskId: 999999, ready: true, expectVersion: 1 }).error === 'not_found', '無いカードは not_found');
+    // 終了したカードでは触らない
+    const done = TD.upsertTaskFromImport({ notion_page_id: 'ext-closed', status: 'closed', close_reason: 'stocked',
+      closed_at: '2026-09-03T00:00:00Z', destination_id: 9302, product_code: 'PLAN-A', qty: 1 }, { batchId: 'test-plan' }).id;
+    ok(TD.setExternalReady({ taskId: done, ready: true, expectVersion: TD.getTask(done).version }).error === 'done_card', '終了したカードは変えられない');
+  }
 }
 
 console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリックは委譲する)');
@@ -1992,6 +2022,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(!/mvVideo/.test(html.replace(/\/\/.*$/gm, '')), '作り方どうがは画面から外した (コメントだけ残す)');
   ok(/const hours = mine\.reduce/.test(html), 'ボードの列に想定作業時間の合計を出す');
   ok(/kv\('必要保管箱', c\.boxes\)/.test(html) && /kv\('想定作業時間'/.test(html), '詳細に必要保管箱と想定作業時間を出す');
+  ok(/外部に出す準備OK にする/.test(html) && /async function setExternalReady/.test(html), '詳細に「外部に出す準備OK」の切り替えがある');
+  ok(/c\.external_ready \? '📦 外部に出せます'/.test(html) && /tag ready/.test(html), 'ボードと一覧に「外部に出せます」の印が出る');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

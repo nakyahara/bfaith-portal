@@ -38,7 +38,7 @@ import { buildList, buildTaskList, buildHistory, classifyMasterEdit, clearEnrich
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel } from './tasks.js';
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
-  listLabelWaits, upsertLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent,
+  listLabelWaits, upsertLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
   startTaskSession, countChangesSince, switchSourceOfTruth, bulkCloseReady,
 } from './tasks-db.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
@@ -367,6 +367,7 @@ function publicTask(t) {
     id: t.id, status: t.status, status_label: statusLabel(t), version: t.version,
     facility_code: t.facility_code, hold_reason_code: t.hold_reason_code, hold_reason_note: t.hold_reason_note,
     planned_date: t.planned_date, cancellation_requested_at: t.cancellation_requested_at, migration_review: !!t.migration_review,
+    external_ready: !!t.external_ready,
   };
 }
 
@@ -379,6 +380,21 @@ router.post('/api/planned', checkOrigin, api((req, res) => {
   if (plannedTaskId == null) return res.status(400).json(BAD_TASK_ID);
   const r = setPlannedDate({
     taskId: plannedTaskId, plannedDate: req.body?.planned_date ?? null, expectVersion: req.body?.expect_version,
+    actor: `${w.worker.display_name} (いろはアプリ)`, workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  res.json({ ok: true, task: publicTask(r.task) });
+}));
+
+/** 「外部施設に出す準備OK」の切り替え (アプリ正本のみ)。状態とは別のチェック */
+router.post('/api/external-ready', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const taskId = parseTaskId(req.body?.id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  const r = setExternalReady({
+    taskId, ready: req.body?.ready === true, expectVersion: req.body?.expect_version,
     actor: `${w.worker.display_name} (いろはアプリ)`, workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });

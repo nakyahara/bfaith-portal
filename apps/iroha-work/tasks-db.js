@@ -266,6 +266,24 @@ export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = nul
   return { ok: true, task: getTask(t.id) };
 }
 
+/**
+ * 「外部施設に出す準備OK」の切り替え (状態とは別のチェック。Notion のチェックボックスの置き換え)。
+ * 終了したタスクでは触らない。誰でも押せる (出せる状態になったかは現場が判断する)
+ */
+export function setExternalReady({ taskId, ready, expectVersion, actor = null, workerId = null, workerName = null, deviceLabel = null }) {
+  const db = getDB();
+  const t = getTask(taskId);
+  if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+  if (t.status === 'closed') return { ok: false, error: 'done_card', message: '終了したカードは変えられません' };
+  if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
+  const v = ready ? 1 : 0;
+  const r = db.prepare('UPDATE f_iroha_tasks SET external_ready = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+    .run(v, utcNow(), actor, t.id, t.version);
+  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+  safeLogTaskEvent({ taskId: t.id, action: 'task_external_ready', from: String(t.external_ready ? 1 : 0), to: String(v), workerId, workerName, deviceLabel, ok: true });
+  return { ok: true, task: getTask(t.id) };
+}
+
 /** 取込時に推定した状態を職員が確認済みにする */
 export function clearMigrationReview({ taskId, expectVersion, actor = null }) {
   const db = getDB();
