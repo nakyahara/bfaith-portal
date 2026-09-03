@@ -2191,7 +2191,17 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // 一覧の後始末 (exitBulk) が curView のガードの中にないと、ボードで選んでいる最中に /api/state が返るだけで選択が消える
   const listBody = html.slice(html.indexOf('function renderList()'), html.indexOf('function renderList()') + 900);
   ok(/if \(curView === 'list'\) \{[\s\S]{0,200}exitBulk\(\)/.test(listBody), 'まとめて選択の解除は「一覧を見ているとき」だけ (ボードの選択を消さない)');
-  ok(!/tabindex="-1"/.test(html), 'チェックボックスはキーボードでも操作できる (tabindex="-1" を付けない)');
+  // 選択のチェックボックスに tabindex="-1" を付けない (見出しに付けるのは、読み上げの位置を移すためなので別)
+  ok(!/<input[^>]*class="cb"[^>]*tabindex="-1"/.test(html), 'チェックボックスはキーボードでも操作できる');
+  // ダイアログ: 役割・見出しとの関連付け・背景固定・フォーカスの戻し (Codex R1)
+  ok(/role="dialog" aria-modal="true" aria-labelledby="mvTitle"/.test(html), 'ダイアログとして扱われる (読み上げ)');
+  ok(/body\.modal-open\{position:fixed/.test(html) && /document\.body\.classList\.add\('modal-open'\)/.test(html), '開いている間は背景を固定する');
+  ok(/window\.scrollTo\(0, overlayScrollY\)/.test(html) && /overlayReturn\.focus\(\)/.test(html), '閉じたら元の位置とフォーカスに戻す');
+  ok(/if \(e\.key !== 'Tab'\) return;/.test(html), 'Tab はダイアログの中で回る');
+  ok(/aria-pressed=/.test(html) && /role="group" aria-label="資材の候補"/.test(html), 'どれを選んでいるかが支援技術にも伝わる');
+  ok(/\.optnew\{[^}]*grid-column:1\/-1/.test(html), '新しく登録の欄は横いっぱいに出る');
+  ok(/const targets = mvCtx\.field \? \[\[mvCtx\.field, MV_MAP\[mvCtx\.field\]\]\] : Object\.entries\(MV_MAP\)/.test(html), '送るのは開いた項目だけ');
+  ok(!/\$\('#(mv|st|lw)Ov'\)\.classList\.(add|remove)\('on'\)/.test(html), 'ダイアログの開け閉めは openOverlay / closeOverlay に揃える (背景固定の解除漏れを作らない)');
   // 切替前の下見: 画面切替はいつでも出す。ボードは正本が Notion なら下見データを読む。書き変えの導線は出さない
   ok(/function renderViews\(\) \{ const el = \$\('#views'\); if \(el\) el\.hidden = false; \}/.test(html), '画面切替はいつでも出る (正本を問わない)');
   ok(/if \(v === 'board'\) \{ if \(isApp\(\)\) renderBoard\(\); else loadPreview\(\); \}/.test(html), 'ボードは正本が Notion なら下見を読み込む');
@@ -2216,6 +2226,22 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const hours = mine\.reduce/.test(html), 'ボードの列に想定作業時間の合計を出す');
   ok(/kv\('必要保管箱', c\.boxes\)/.test(html) && /kv\('想定作業時間'/.test(html), '詳細に必要保管箱と想定作業時間を出す');
   ok(/reg: 'units_per_container'/.test(html) && /reg: 'storage_container'/.test(html), '保管箱と入数は別々にタップできる');
+  // タップした項目だけ出す・ダイアログはスクロールできる・候補は正方形のタイル (中原さん 2026-09-03)
+  ok(/class="mvf" data-f="material_code"/.test(html) && /class="mvf" data-f="storage_container"/.test(html)
+    && /class="mvf" data-f="units_per_container"/.test(html) && /class="mvf" data-f="note"/.test(html), '登録・変更の項目はひとつずつ枠に入っている');
+  ok(/el\.hidden = !!mvCtx\.field && el\.dataset\.f !== mvCtx\.field/.test(html), 'タップした項目だけ出す (他は隠す)');
+  ok(/\$\('#mvTitle'\)\.textContent = mvCtx\.field/.test(html), '見出しにその項目の名前を出す');
+  ok(/\.overlay\{[^}]*overflow-y:auto/.test(html), 'ダイアログが画面に収まらないときスクロールできる');
+  ok(/\.opts\{display:grid[^}]*minmax\(104px/.test(html) && /aspect-ratio:1\/1/.test(html), '候補は正方形のタイル');
+  ok(/<span class="thumb">' \+ \(img \?/.test(html), 'タイルに画像の枠がある (画像が無ければ絵文字)');
+  ok(/\.opts\.chips\{display:flex/.test(html) && /<div class="opts chips" id="lwLoc">/.test(html),
+    'ラベル待ちのロケーション (Z/Y/なし) はタイルにしない');
+  ok(/onerror="optImgFail\(this\)"/.test(html) && /function optImgFail\(el\)/.test(html),
+    '画像が読めなくてもタイルが空にならない');
+  ok(/const keepField = mvCtx\.field;/.test(html) && /values: cur2, field: keepField/.test(html),
+    '競合で読み直しても「開いた項目だけ送る」は変わらない');
+  ok(/if \(!ov\.contains\(document\.activeElement\)\) \{ e\.preventDefault\(\)/.test(html),
+    'フォーカスが背景に残っていても Tab はダイアログへ戻る');
   ok(/Zロケ在庫 \(一時保管\)/.test(html) && /Yロケ在庫 \(外に出している分\)/.test(html) && /時点/.test(html),
     '詳細に在庫と取得時刻を出す (拠点によって Z か Y)');
   // 中断の理由は「〜で中断」。ラベル待ちならそのまま記録をつける (中原さん 2026-09-03)
