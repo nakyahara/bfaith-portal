@@ -469,13 +469,10 @@ router.get('/api/history', api((req, res) => {
   const to = day(req.query.to);
   if (from === null || to === null) return res.status(400).json({ ok: false, error: 'bad_request', message: '日付は YYYY-MM-DD (実在する日) で指定してください' });
   const jstStart = (d) => new Date(`${d}T00:00:00+09:00`).toISOString();
-  // closed_at は UTC の ISO。JST の日付で絞る。**終了日はその日を含む** ので翌日 00:00 JST が上限。
-  // ⚠9999-12-31 の翌日は西暦 10000 = 拡張年表記になり toISOString / 文字列比較が壊れる → 上限を付けない (それ以降の記録は無い)
-  const upperOf = (d) => {
-    const next = new Date(new Date(`${d}T00:00:00+09:00`).getTime() + 86400000);
-    if (next.getUTCFullYear() > 9999) return null;
-    return jstStart(jstDay(next));
-  };
+  // closed_at は UTC の ISO。JST の日付で絞る。**終了日はその日を含む** ので、その日の 00:00 JST + 24 時間が上限。
+  // ⚠日付の文字列に戻してから解釈し直さない (9999-12-31 の翌日は西暦 10000 = 拡張年表記になり、切り出しに耐えない)。
+  //   ここは「時刻そのもの」を上限にするので、その問題が起きない — Codex PR-C R3
+  const upperOf = (d) => new Date(new Date(`${d}T00:00:00+09:00`).getTime() + 86400000).toISOString();
   res.json({
     ok: true,
     ...buildHistory({
