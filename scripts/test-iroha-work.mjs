@@ -740,6 +740,97 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   _setDriveUpload(null);
 }
 
+console.log('\n[16] 作業のやり方の選択肢 (資材・保管箱): Excel 由来の候補 + その場登録');
+{
+  const { listWorkOptions, workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, seedWorkOptionsFromMaster,
+    normalizeOptionCode, validateOptionImageUrl, _resetSeedFingerprint } = await import('../apps/iroha-work/db.js');
+  const { addWorkMasterRow: addRow, updateWorkMasterRow: updRow } = await import('../apps/inbound-check/work-master.js');
+  // 前提: マスタ 2 行に資材・保管箱 (2 行目は全角・小文字の表記揺れ)。mirror_products に無いコードなので直接 INSERT (他テストと同じ)
+  const insMaster = getDB().prepare(`INSERT INTO f_iroha_work_master (code_key, 商品コード, material_code, storage_container, version, updated_at)
+    VALUES (?, ?, ?, ?, 1, ?)`);
+  insMaster.run('opt-seed-1', 'OPT-SEED-1', ' D-8 ', '20Lコンテナ', new Date().toISOString());
+  insMaster.run('opt-seed-2', 'OPT-SEED-2', 'ｄ－８', '20lコンテナ', new Date().toISOString());
+  void addRow; void updRow;
+  _resetSeedFingerprint();
+  const seeded = seedWorkOptionsFromMaster();
+  ok(seeded.material >= 1 && seeded.container >= 1 && !seeded.skipped, `作業仕様マスタの資材・保管箱が候補に補充される (資材${seeded.material}/保管箱${seeded.container})`);
+  const d8 = listWorkOptions('material').filter(o => normalizeOptionCode(o.code) === 'D-8');
+  ok(d8.length === 1 && d8[0].code === 'D-8' && d8[0].sort_order <= -2, `全角/小文字の同じ値は1候補にまとまり (表記は半角を優先)、使用回数ぶん上に並ぶ (実際 ${JSON.stringify(d8)})`);
+  ok(listWorkOptions('container').filter(o => normalizeOptionCode(o.code) === '20LコンテナHOGE'.replace('HOGE', '')).length === 1, '保管箱も大小文字を同一視');
+  const again = seedWorkOptionsFromMaster();
+  ok(again.skipped === true, 'マスタが変わっていなければ走らない (フィンガープリント)');
+  getDB().prepare("UPDATE f_iroha_work_master SET updated_at = ? WHERE code_key = 'opt-seed-1'").run(new Date(Date.now() + 3600 * 1000).toISOString());   // マスタが更新された (MAX(updated_at) が進む)
+  const after = seedWorkOptionsFromMaster();
+  ok(after.skipped === false && after.material === 0, 'マスタが更新されたら走る (新しい値が無ければ増えない = 冪等)');
+  ok(normalizeOptionCode('　Ｄ－８　 x\t') === 'D-8 X', 'normalize = NFKC + 空白統一 + trim + 大文字');
+
+  const a = addWorkOption({ kind: 'material', code: '  D-99   x ', actor: 'test' });
+  ok(a.ok === true && a.option.code === 'D-99 x', '追加 (前後の空白は落とし、連続空白は1つに。表示は入力どおり)');
+  ok(addWorkOption({ kind: 'material', code: 'd-99 X' }).already === true, '大小文字違いは既存を返す (増やさない)');
+  ok(addWorkOption({ kind: 'shelf', code: 'x' }).error === 'bad_kind' && addWorkOption({ kind: 'container', code: ' 　 ' }).error === 'bad_code', '種類・空値 (全角空白) は拒否');
+  ok(setWorkOptionActive(a.option.id, false) === true && !listWorkOptions('material').some(o => o.id === a.option.id), '無効化で画面の候補から消える');
+  ok(listWorkOptions('material', true).some(o => o.id === a.option.id), '管理画面 (無効含む) には残る');
+  const staffTry = addWorkOption({ kind: 'material', code: 'D-99 x' });
+  ok(staffTry.ok === false && staffTry.error === 'inactive_option' && !listWorkOptions('material').some(o => o.id === a.option.id),
+    '職員の「新しく登録」では管理者が外した候補を戻せない (Codex R1 #1)');
+  const back = addWorkOption({ kind: 'material', code: 'D-99 x', allowReactivate: true });
+  ok(back.already === true && back.reactivated === true && listWorkOptions('material').some(o => o.id === a.option.id), '管理者 (allowReactivate) なら戻せる');
+
+  // 画像リンク: 全 iPad が読みに行くので許可先を絞る (Codex R1 #2)
+  ok(validateOptionImageUrl('').ok && validateOptionImageUrl('').value === null, '空 = 外す');
+  ok(validateOptionImageUrl('/apps/iroha-work/api/media/12/file').ok, 'ポータル内のパスは可');
+  ok(!validateOptionImageUrl('/apps/../etc/passwd').ok && !validateOptionImageUrl('/etc/x.jpg').ok, 'ポータル外のパス・.. は不可');
+  ok(!validateOptionImageUrl('http://drive.google.com/x.jpg').ok, 'http は不可');
+  ok(!validateOptionImageUrl('https://evil.example.com/track.gif').ok && !validateOptionImageUrl('https://192.168.68.62/x.jpg').ok && !validateOptionImageUrl('https://localhost/x.jpg').ok, '許可外ホスト・LAN・localhost は不可');
+  ok(!validateOptionImageUrl('https://user:pw@drive.google.com/x.jpg').ok, '認証情報つきは不可');
+  ok(!validateOptionImageUrl('javascript:alert(1)').ok && !validateOptionImageUrl('https://' + 'a'.repeat(600)).ok, 'javascript: と長すぎるリンクは不可');
+  ok(validateOptionImageUrl('https://drive.google.com/uc?id=abc').ok, '許可ホストの https は可');
+  ok(setWorkOptionImage(a.option.id, 'https://evil.example.com/x.jpg').error === 'bad_url' && setWorkOptionImage(a.option.id, 'https://lh3.googleusercontent.com/d99.jpg').ok === true, 'setWorkOptionImage も同じ検証');
+  ok(setWorkOptionImage(999999, 'https://drive.google.com/y.jpg').error === 'not_found', '無い id は not_found');
+  const by = workOptionsByKind();
+  ok(Array.isArray(by.material) && Array.isArray(by.container) && by.material.find(o => o.id === a.option.id).image_url === 'https://lh3.googleusercontent.com/d99.jpg', 'kind ごとの一覧に画像が載る');
+
+  // %2e%2e や混在エンコードで /apps/ の境界を抜けられない。ポータル内は配信エンドポイントそのものだけ (Codex R2 #2)
+  ok(!validateOptionImageUrl('/apps/%2e%2e/admin').ok && !validateOptionImageUrl('/apps/%2E%2E/admin').ok
+    && !validateOptionImageUrl('/apps/iroha-work/api/media/1/%2E%2E/../file').ok && !validateOptionImageUrl('/apps/iroha-work/api/media/%31/file').ok,
+    '%2e%2e・%2E%2E・混在・数字のエンコードは不可');
+  ok(!validateOptionImageUrl('/apps/iroha-work/admin').ok && !validateOptionImageUrl('/apps/other/api/media/1/file').ok
+    && !validateOptionImageUrl('/apps/iroha-work/api/media/12/file?x=1').ok && !validateOptionImageUrl('//evil.example.com/x.jpg').ok,
+    'ポータル内でも配信エンドポイント以外・クエリつき・// 始まりは不可');
+  ok(validateOptionImageUrl('/apps/iroha-work/api/media/12/file').value === '/apps/iroha-work/api/media/12/file', '配信エンドポイントは正規化済みの値で保存');
+  // 同じポータルの絶対 URL でも相対パスと同じ制限 (Codex R3)
+  ok(validateOptionImageUrl('https://bfaith-portal.onrender.com/apps/iroha-work/api/media/12/file').value === '/apps/iroha-work/api/media/12/file', 'ポータルの絶対 URL は相対パスに揃えて保存');
+  ok(!validateOptionImageUrl('https://bfaith-portal.onrender.com/apps/other/api/media/1/file').ok && !validateOptionImageUrl('https://bfaith-portal.onrender.com/apps/iroha-work/admin').ok
+    && !validateOptionImageUrl('https://bfaith-portal.onrender.com/apps/%2e%2e/admin').ok && !validateOptionImageUrl('https://bfaith-portal.onrender.com/apps/iroha-work/api/media/12/file?x=1').ok,
+    'ポータルの絶対 URL でも配信エンドポイント以外・エンコード・クエリは不可');
+
+  // 古い版 (normalized_code 無し・UNIQUE(kind, code)) のテーブルが残っていても、起動時に統合して作り直す (Codex R2 #1)
+  {
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    const db = getDB();
+    db.exec('DROP TABLE f_iroha_work_options');
+    db.exec(`CREATE TABLE f_iroha_work_options (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, code TEXT NOT NULL, image_url TEXT,
+      sort_order INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, created_by TEXT, UNIQUE(kind, code))`);
+    const insOld = db.prepare('INSERT INTO f_iroha_work_options (kind, code, image_url, sort_order, active, created_at) VALUES (?,?,?,?,?,?)');
+    insOld.run('material', 'ｄ－８', null, -1, 0, '2026-09-01T00:00:00.000Z');
+    insOld.run('material', 'D-8', 'https://drive.google.com/x.jpg', -3, 1, '2026-09-02T00:00:00.000Z');
+    insOld.run('container', '20Lコンテナ', null, 0, 1, '2026-09-02T00:00:00.000Z');
+    createTables(db);
+    ok(db.prepare('PRAGMA table_info(f_iroha_work_options)').all().some(c => c.name === 'normalized_code'), '古いテーブルは normalized_code 付きに作り直される');
+    const mat = db.prepare("SELECT * FROM f_iroha_work_options WHERE kind = 'material'").all();
+    ok(mat.length === 1 && mat[0].code === 'D-8' && mat[0].normalized_code === 'D-8' && mat[0].active === 1
+      && mat[0].image_url === 'https://drive.google.com/x.jpg' && mat[0].sort_order === -3 && mat[0].created_at === '2026-09-01T00:00:00.000Z',
+      `表記揺れの旧行は1つに統合 (半角表記・有効・画像・使用回数最大・最古の作成日時を採用) 実際 ${JSON.stringify(mat)}`);
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_options WHERE kind = 'container'").get().c === 1, '保管箱はそのまま');
+    let dupErr = null;
+    try { db.prepare("INSERT INTO f_iroha_work_options (kind, code, normalized_code, active, created_at) VALUES ('material','d-8','D-8',1,'x')").run(); } catch (e) { dupErr = e; }
+    ok(dupErr && /UNIQUE/.test(dupErr.message), '作り直し後は UNIQUE(kind, normalized_code) が効く');
+    createTables(db);
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_options").get().c === 2, '2回目の起動では何もしない (冪等)');
+    _resetSeedFingerprint();
+  }
+}
+
 console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動画リンク・スナップショット)');
 {
   const { classifyMasterEdit } = await import('../apps/iroha-work/service.js');

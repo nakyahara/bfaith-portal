@@ -65,6 +65,39 @@
     </div>
 
     <div class="iw-box">
+      <h2>🧰 作業のやり方の選択肢 (資材セット・保管箱)</h2>
+      <p class="hint">
+        iPad の「作業のやり方」編集で<b>タップして選ぶ</b>候補です。作業仕様マスタ (Excel) にある値は自動で補充されます。
+        初見のものは iPad からも職員PINで追加できます。画像 (http リンク) を付けると iPad の候補にサムネイルが出ます。
+      </p>
+      <% for (const kind of ['material', 'container']) { const label = kind === 'material' ? '資材セット' : '保管箱'; const list = (options && options[kind]) || []; %>
+        <h3 style="margin:12px 0 6px"><%= label %> (有効 <%= list.filter(o => o.active).length %>)</h3>
+        <% if (isAdmin) { %>
+        <div class="row" style="margin-bottom:8px">
+          <input type="text" id="opt-<%= kind %>" placeholder="<%= label %>を追加 (例: <%= kind === 'material' ? 'D-8' : '20Lコンテナ' %>)" maxlength="100">
+          <button onclick="addOption('<%= kind %>')">追加</button>
+          <span class="msg" id="optMsg-<%= kind %>"></span>
+        </div>
+        <% } %>
+        <table class="iw-list">
+          <tr><th>値</th><th>画像</th><th>状態</th><% if (isAdmin) { %><th></th><% } %></tr>
+          <% for (const o of list) { %>
+            <tr class="<%= o.active ? '' : 'inactive' %>">
+              <td><%= o.code %></td>
+              <td><% if (o.image_url) { %><a href="<%= o.image_url %>" target="_blank" rel="noopener">画像</a><% } else { %>-<% } %></td>
+              <td><%= o.active ? '有効' : '無効' %></td>
+              <% if (isAdmin) { %><td>
+                <button class="btn-sm" onclick="setOptionImage(<%= o.id %>)">画像リンク</button>
+                <button class="btn-sm" onclick="toggleOption(<%= o.id %>, <%= o.active ? 'false' : 'true' %>)"><%= o.active ? '無効にする' : '戻す' %></button>
+              </td><% } %>
+            </tr>
+          <% } %>
+          <% if (list.length === 0) { %><tr><td colspan="4">まだありません (作業仕様マスタを取り込むと自動で入ります)</td></tr><% } %>
+        </table>
+      <% } %>
+    </div>
+
+    <div class="iw-box">
       <h2>👤 作業者 (いろは名簿)</h2>
       <p class="hint">
         iPad の名前タップに出る名簿です。<b>スタッフマスタ (B-Faith) とは別</b>で、いろはの利用者・職員をここで管理します。
@@ -228,6 +261,25 @@
     }
     function setMsg(id, kind, text) { const el = document.getElementById(id); el.className = 'msg ' + kind; el.textContent = text; }
 
+    async function addOption(kind) {
+      const code = document.getElementById('opt-' + kind).value.trim();
+      if (!code) { setMsg('optMsg-' + kind, 'err', '値を入れてください'); return; }
+      const { json } = await post('/admin/options', { kind, code });
+      if (json.ok) location.reload();
+      else setMsg('optMsg-' + kind, 'err', json.message || '追加できませんでした');
+    }
+    async function toggleOption(id, active) {
+      const { json } = await post('/admin/options/' + id + '/active', { active });
+      if (json.ok) location.reload();
+      else alert(json.message || '変更できませんでした');
+    }
+    async function setOptionImage(id) {
+      const url = prompt('画像のリンク (https://…)。空にすると外します');
+      if (url == null) return;
+      const { json } = await post('/admin/options/' + id + '/image', { image_url: url.trim() });
+      if (json.ok) location.reload();
+      else alert(json.message || '設定できませんでした');
+    }
     async function addWorker() {
       const name = document.getElementById('wName').value.trim();
       const type = document.getElementById('wType').value;

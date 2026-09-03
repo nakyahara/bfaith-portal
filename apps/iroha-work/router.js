@@ -23,6 +23,7 @@ import {
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
   listIrohaWorkers, getIrohaWorker, addIrohaWorker, setIrohaWorkerActive,
+  workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, seedWorkOptionsFromMaster,
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
   getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
@@ -110,6 +111,13 @@ const api = fn => async (req, res) => {
   }
 };
 
+// 選択肢 (資材・保管箱) は作業仕様マスタの値から補充してから返す (Excel 再取込後も候補に出る)。
+// seed 自体がマスタの変化を見て (件数+最終更新) 変わった時だけ走る。失敗しても候補は前回のまま返し、次回また試す
+function workOptionsForState(includeInactive = false) {
+  try { seedWorkOptionsFromMaster(); } catch (e) { console.warn('[iroha-work] 選択肢の補充に失敗 (候補は前回のまま)', e.message); }
+  return workOptionsByKind(includeInactive);
+}
+
 router.use(access);
 
 // ─── Service Worker (Render 再起動中でも画面が真っ白にならないための、画面 HTML のフォールバック) ───
@@ -190,6 +198,7 @@ router.get('/api/state', api(async (req, res) => {
     ok: true,
     ...list,
     workers: listIrohaWorkers(),
+    options: workOptionsForState(),
     refresh,
     // タイマー表示の基準 (iPad の時計を信じない — 画面はこの値とのオフセットで経過を出す)
     serverNow: new Date().toISOString(),
@@ -293,6 +302,30 @@ const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_containe
  *   入っている値の変更・削除 = 職員のみ (端末はPIN・ポータルセッションはそのまま)
  * 版管理 (§1.7 ④): expect_version の楽観ロック。行が無ければ作ってから書く (mirror に居る商品のみ)
  */
+/**
+ * 選択肢 (資材・保管箱) のその場登録 — 初見のものを適当に入れず、次からタップで選べるようにする
+ * (中原さん 2026-09-03)。候補の品質を守るため職員PIN必須 (ポータルセッションなら不要)
+ */
+router.post('/api/options', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  if (!hasSessionAccess(req)) {
+    if (w.worker.worker_type !== 'staff') {
+      return res.status(403).json({ ok: false, error: 'staff_required', message: '新しい候補の登録は職員のみです (職員の名前を選び、PINを入れてください)' });
+    }
+    const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
+    if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
+  }
+  // 記録上の主体: ポータルセッションなら本人 (worker_id は画面で選んだ名前に過ぎない — Codex R1 #4)。
+  // 無効化された候補の復帰は管理者だけ (allowReactivate=false — Codex R1 #1)
+  const actor = hasSessionAccess(req) ? `${req.iwUser} (ポータル)` : `${w.worker.display_name} (いろはアプリ)`;
+  const r = addWorkOption({ kind: req.body?.kind, code: req.body?.code, actor, allowReactivate: false });
+  if (!r.ok) return res.status(r.error === 'inactive_option' ? 409 : 400).json(r);
+  safeLog({ action: 'option_add', pageId: null, workerId: w.worker.id, workerName: w.worker.display_name,
+    deviceLabel: deviceLabelOf(req), to: `${req.body?.kind}:${r.option.code}${r.already ? ' (既存)' : ''}`, ok: true });
+  res.json(r);
+}));
+
 router.post('/api/master', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
@@ -630,6 +663,7 @@ router.get('/admin', requireSession, api((req, res) => {
     statuses: STATUSES,
     cache: cacheStatsForAdmin(),
     workers: listIrohaWorkers(true),
+    options: workOptionsForState(true),
     devices: isAdmin(req) ? listDevices() : [],
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     events: listEvents(50),
@@ -691,6 +725,22 @@ router.post('/admin/workers/:id(\\d+)/active', checkOrigin, requireAdmin, api((r
 // 職員PIN の設定・再設定 (管理者のみ。PIN は保存せずハッシュのみ)
 router.post('/admin/workers/:id(\\d+)/pin', checkOrigin, requireAdmin, api((req, res) => {
   const r = setWorkerPin(Number(req.params.id), req.body?.pin, req.session.email);
+  res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 400)).json(r);
+}));
+
+// ─── 選択肢 (資材・保管箱) の管理 ───
+router.post('/admin/options', checkOrigin, requireAdmin, api((req, res) => {
+  // 管理者は無効化した候補を同じ値の追加で戻せる (職員はできない)
+  const r = addWorkOption({ kind: req.body?.kind, code: req.body?.code, actor: req.session.email, allowReactivate: true });
+  res.status(r.ok ? 200 : 400).json(r);
+}));
+router.post('/admin/options/:id(\\d+)/active', checkOrigin, requireAdmin, api((req, res) => {
+  if (typeof req.body?.active !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_request', message: 'active (true/false) が必要です' });
+  if (!setWorkOptionActive(Number(req.params.id), req.body.active)) return res.status(404).json({ ok: false, error: 'not_found', message: '選択肢が見つかりません' });
+  res.json({ ok: true });
+}));
+router.post('/admin/options/:id(\\d+)/image', checkOrigin, requireAdmin, api((req, res) => {
+  const r = setWorkOptionImage(Number(req.params.id), req.body?.image_url);
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 400)).json(r);
 }));
 
