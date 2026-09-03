@@ -235,9 +235,28 @@ function migrateSessionMediaSchema(db) {
 const TASKS_REQUIRED_DDL = [
   /\(status = 'closed'\) = \(close_reason IS NOT NULL\)/, /\(status = 'closed'\) = \(closed_at IS NOT NULL\)/,
   /\(status = 'on_hold'\) = \(hold_reason_code IS NOT NULL\)/, /hold_reason_code <> 'other'/, /REFERENCES f_iroha_facilities/,
+  // 列はあるが制約が無い「途中の版」も作り直す (addCol は既にある列に触れないため — Codex FB R4)
+  /external_ready\s+INTEGER NOT NULL DEFAULT 0 CHECK \(external_ready IN \(0,1\)\)/,
 ];
 const LABEL_REQUIRED_DDL = [/REFERENCES f_iroha_tasks/, /label_ordered IN \(0,1\)/, /location IN \('Z','Y','none'\)/, /reattach IN \(0,1\)/, /done IN \(0,1\)/];
 const FK_CHECK_TABLES = ['f_iroha_tasks', 'f_iroha_label_waits', 'f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events'];
+
+/**
+ * 作り直しのときに写す列と、その取り出し方 (Codex FB R4)。
+ *   - 旧テーブルに無い列は写さない (新しい定義の既定値のまま)
+ *   - 新しい定義で NOT NULL かつ既定値がある列は COALESCE(旧列, 既定値) — 古いデータの NULL でコピーを止めない
+ *   - NOT NULL で既定値も無い列に NULL があると、そこで止まる (黙って別の値を入れない。FK 検査と同じ考え方)
+ */
+function copyCols(db, oldTable, newTable, wanted) {
+  const have = new Set(db.prepare(`PRAGMA table_info(${oldTable})`).all().map((c) => c.name));
+  const def = new Map(db.prepare(`PRAGMA table_info(${newTable})`).all().map((c) => [c.name, c]));
+  const names = wanted.filter((c) => have.has(c));
+  const exprs = names.map((c) => {
+    const d = def.get(c);
+    return d && d.notnull === 1 && d.dflt_value != null ? `COALESCE(${c}, ${d.dflt_value})` : c;
+  });
+  return { names, exprs };
+}
 
 /**
  * f_iroha_tasks / f_iroha_label_waits の作り直し: CHECK・FK の無い (または一部足りない) 古い版が残っていたら、行をそのまま
@@ -260,20 +279,16 @@ function migrateTasksSchema(db) {
     db.transaction(() => {
       if (needTasks) {
         db.exec(tasksDDL('f_iroha_tasks__new'));
-        // 旧テーブルに無い列は写さない (既定値のまま)。NOT NULL の列に NULL が入っていたら既定値に寄せる
-        const have = new Set(db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name));
-        const cols = TASKS_COLS.filter((c) => have.has(c));
-        const pick = (c) => (c === 'external_ready' || c === 'migration_review' ? `COALESCE(${c}, 0)` : c);
-        db.exec(`INSERT INTO f_iroha_tasks__new (${cols.join(', ')}) SELECT ${cols.map(pick).join(', ')} FROM f_iroha_tasks`);
+        const cols = copyCols(db, 'f_iroha_tasks', 'f_iroha_tasks__new', TASKS_COLS);
+        db.exec(`INSERT INTO f_iroha_tasks__new (${cols.names.join(', ')}) SELECT ${cols.exprs.join(', ')} FROM f_iroha_tasks`);
         db.exec('DROP TABLE f_iroha_tasks');
         db.exec('ALTER TABLE f_iroha_tasks__new RENAME TO f_iroha_tasks');
         db.exec(TASKS_INDEX_DDL);
       }
       if (needLabel) {
         db.exec(labelWaitsDDL('f_iroha_label_waits__new'));
-        const haveL = new Set(db.prepare('PRAGMA table_info(f_iroha_label_waits)').all().map((c) => c.name));
-        const colsL = LABEL_COLS.filter((c) => haveL.has(c));
-        db.exec(`INSERT INTO f_iroha_label_waits__new (${colsL.join(', ')}) SELECT ${colsL.join(', ')} FROM f_iroha_label_waits`);
+        const colsL = copyCols(db, 'f_iroha_label_waits', 'f_iroha_label_waits__new', LABEL_COLS);
+        db.exec(`INSERT INTO f_iroha_label_waits__new (${colsL.names.join(', ')}) SELECT ${colsL.exprs.join(', ')} FROM f_iroha_label_waits`);
         db.exec('DROP TABLE f_iroha_label_waits');
         db.exec('ALTER TABLE f_iroha_label_waits__new RENAME TO f_iroha_label_waits');
         db.exec(LABEL_INDEX_DDL);

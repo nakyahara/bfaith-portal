@@ -2141,6 +2141,28 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
     createTables(db);
     ok(/\(status = 'closed'\) = \(close_reason IS NOT NULL\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql), '前提: 作り直しが起きた');
     ok(TD.getTask(keep).external_ready === 1, '作り直しても「外部に出す準備OK」は残る');
+
+    // 列はあるが制約が欠けている「途中の版」も作り直す。NULL が入っていても既定値に寄せて止まらない (Codex FB R4)
+    {
+      const sql2 = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql;
+      const cols2 = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name);
+      const loose = sql2.replace('external_ready   INTEGER NOT NULL DEFAULT 0 CHECK (external_ready IN (0,1)),', 'external_ready INTEGER,')
+        .replace('migration_review INTEGER NOT NULL DEFAULT 0 CHECK (migration_review IN (0,1)),', 'migration_review INTEGER,');
+      ok(!/external_ready\s+INTEGER NOT NULL/.test(loose), '前提: external_ready の制約を落とした版を作る');
+      db.pragma('foreign_keys = OFF');
+      db.exec('CREATE TEMP TABLE rb2 AS SELECT * FROM f_iroha_tasks; DROP TABLE f_iroha_tasks;');
+      db.exec(loose);
+      db.exec(`INSERT INTO f_iroha_tasks (${cols2.join(', ')}) SELECT ${cols2.join(', ')} FROM rb2; DROP TABLE rb2;`);
+      db.prepare('UPDATE f_iroha_tasks SET external_ready = NULL, migration_review = NULL WHERE id = ?').run(keep);
+      db.pragma('foreign_keys = ON');
+      ok(db.prepare('SELECT external_ready e FROM f_iroha_tasks WHERE id = ?').get(keep).e === null, '前提: 古いデータに NULL がある');
+      createTables(db);
+      const def = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().find((c) => c.name === 'external_ready');
+      ok(def.notnull === 1 && def.dflt_value === '0', '制約だけ欠けた版も作り直して NOT NULL・既定値が戻る');
+      ok(/CHECK \(external_ready IN \(0,1\)\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql), 'CHECK も戻る');
+      ok(TD.getTask(keep).external_ready === 0 && TD.getTask(keep).migration_review === 0, 'NULL は既定値 (0) に寄せる (コピーが止まらない)');
+      ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c > 0, '行は残っている');
+    }
   }
 }
 
