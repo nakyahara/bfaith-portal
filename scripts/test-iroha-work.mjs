@@ -1648,7 +1648,19 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T05:00:00Z', cancellation_source = 'inbound_reversal' WHERE id = ?").run(p6.inb);
       const r6 = await merge(p6.inb, 'import');
       ok(r6.status === 200 && TD.getTask(p6.imp).cancellation_requested_at === '2026-09-03T05:00:00Z' && TD.getTask(p6.imp).cancellation_source === 'inbound_reversal', '消える側の取消要求 (要確認) は残す側へ引き継ぐ');
-      ok(!listLinkConflicts().some((c) => [p1.inb, p2.inb, p3.inb, p5.inb, p6.inb].includes(c.task_id)), '統合した衝突は一覧から消える');
+      // (7) 残す側が過去に「続行」済み (日時なし・古い出どころだけ残る) へ、取消要求中の消える側を統合 → 日時と出どころは対で消える側から (Codex PR-B R5)
+      const p7 = mkPair(9965, 'MERGE-C7', { importStatus: 'in_progress' });
+      db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, cancellation_source = 'inbound_reversal' WHERE id = ?").run(p7.imp);
+      db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T06:00:00Z', cancellation_source = 'inbound_import' WHERE id = ?").run(p7.inb);
+      const r7 = await merge(p7.inb, 'import');
+      ok(r7.status === 200 && TD.getTask(p7.imp).cancellation_requested_at === '2026-09-03T06:00:00Z' && TD.getTask(p7.imp).cancellation_source === 'inbound_import', '日時と出どころは同じ側から対で引き継ぐ (古い出どころと混ざらない)');
+      // (8) 残す側に要求があれば、消える側の要求で上書きしない
+      const p8 = mkPair(9966, 'MERGE-C8', { importStatus: 'in_progress' });
+      db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T07:00:00Z', cancellation_source = 'inbound_reversal' WHERE id = ?").run(p8.imp);
+      db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T08:00:00Z', cancellation_source = 'inbound_import' WHERE id = ?").run(p8.inb);
+      const r8 = await merge(p8.inb, 'import');
+      ok(r8.status === 200 && TD.getTask(p8.imp).cancellation_requested_at === '2026-09-03T07:00:00Z' && TD.getTask(p8.imp).cancellation_source === 'inbound_reversal', '残す側の要求はそのまま (消える側で上書きしない)');
+      ok(!listLinkConflicts().some((c) => [p1.inb, p2.inb, p3.inb, p5.inb, p6.inb, p7.inb, p8.inb].includes(c.task_id)), '統合した衝突は一覧から消える');
     }
   } finally {
     _setDriveUpload(null);

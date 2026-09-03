@@ -193,10 +193,14 @@ export function mergeLinkConflict({ taskId, keep = 'import', actor = null }) {
     const who = actor || 'admin';
     // ① 消える側から行き先・ページを外す (UNIQUE を空けてから残す側に付ける)。取消の要求も残す側へ引き継ぐ
     db.prepare('UPDATE f_iroha_tasks SET destination_id = NULL, notion_page_id = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?').run(now, who, fromId);
-    db.prepare(`UPDATE f_iroha_tasks SET destination_id = ?, notion_page_id = ?,
-        cancellation_requested_at = COALESCE(cancellation_requested_at, ?), cancellation_source = COALESCE(cancellation_source, ?),
+    // 取消の要求は「日時と出どころ」を対で引き継ぐ (残す側に要求が無く、消える側にあるときだけ。別々に COALESCE すると
+    // 「続行」で日時だけ消えた残す側の古い出どころと混ざる — Codex PR-B R5)
+    const carry = !into.cancellation_requested_at && from.cancellation_requested_at;
+    db.prepare(`UPDATE f_iroha_tasks SET destination_id = ?, notion_page_id = ?, cancellation_requested_at = ?, cancellation_source = ?,
         version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?`)
-      .run(c.destination_id, c.notion_page_id, from.cancellation_requested_at, from.cancellation_source, now, who, intoId);
+      .run(c.destination_id, c.notion_page_id,
+        carry ? from.cancellation_requested_at : into.cancellation_requested_at,
+        carry ? from.cancellation_source : into.cancellation_source, now, who, intoId);
     // ② 記録を残す側へ付け替え
     const moved = {};
     for (const t of TASK_CHILD_TABLES) {
