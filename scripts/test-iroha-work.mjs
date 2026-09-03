@@ -1984,6 +1984,25 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   clearEnrichCache();
   ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === 150, 'ロジザード在庫が更新されたら次の読み込みで反映される');
   db.prepare("UPDATE mirror_logizard_stock SET 在庫数 = 在庫数 - 100 WHERE 商品ID = 'PLAN-A' AND ロケ = 'Z01-001-001-01'").run();
+
+  // 羅針盤・ワークセンターに出したカードは Y ロケ (外に出している分) を見せる (中原さん 2026-09-03)
+  ok(S2.stockLocOf('rashinban') === 'Y' && S2.stockLocOf('workcenter') === 'Y', '羅針盤・ワークセンターは Y');
+  ok(S2.stockLocOf('iroha') === 'Z' && S2.stockLocOf('jobsupport') === 'Z' && S2.stockLocOf('rehas') === 'Z' && S2.stockLocOf(null) === 'Z',
+    'いろは・ジョブサポ・リハス・拠点なしは Z');
+  db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('PLAN-A', '想定時間テスト', 'Y01-001-001-01', 'Y01', '良品', 40, 4, ?, ?)`).run(nowIso, nowIso);
+  const tY = TD.upsertTaskFromImport({ notion_page_id: 'plan-y', status: 'in_progress', destination_id: 9303, facility_code: 'rashinban',
+    product_code: 'PLAN-A', product_name: '羅針盤に出した', qty: 100, master_snapshot: { units_per_container: 10, process_count: 2 } }, { batchId: 'test-plan' }).id;
+  clearEnrichCache();
+  const cards = S2.buildTaskList().cards;
+  const cY = cards.find(c => c.id === tY);
+  const cZ = cards.find(c => c.id === t);
+  ok(cY.loc_kind === 'Y' && cY.loc_stock === 40 && cY.loc_allocated === 4 && cY.loc_free === 36, '羅針盤のカードは Y ロケの在庫 (引当・使える数つき)');
+  ok(cZ.loc_kind === 'Z' && cZ.loc_stock === 50, 'いろはのカードは Z ロケのまま');
+  ok(cY.z_stock === 50, '必要保管箱は Notion の式のまま Z を使う (表示だけ Y に変える)');
+  db.prepare("DELETE FROM mirror_logizard_stock WHERE ロケ LIKE 'Y%'").run();
+  clearEnrichCache();
+  ok(S2.buildTaskList().cards.find(c => c.id === tY).loc_stock === null, 'Y に在庫が無ければ出さない (Z を代わりに出さない)');
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
   clearEnrichCache();
   ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === null, 'Z に在庫が無ければ null (数量で計算)');
@@ -2079,7 +2098,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const hours = mine\.reduce/.test(html), 'ボードの列に想定作業時間の合計を出す');
   ok(/kv\('必要保管箱', c\.boxes\)/.test(html) && /kv\('想定作業時間'/.test(html), '詳細に必要保管箱と想定作業時間を出す');
   ok(/reg: 'units_per_container'/.test(html) && /reg: 'storage_container'/.test(html), '保管箱と入数は別々にタップできる');
-  ok(/kv\('Zロケ在庫 \(一時保管\)'/.test(html) && /時点/.test(html), '詳細に Z ロケの在庫と、その取得時刻を出す');
+  ok(/Zロケ在庫 \(一時保管\)/.test(html) && /Yロケ在庫 \(外に出している分\)/.test(html) && /時点/.test(html),
+    '詳細に在庫と取得時刻を出す (拠点によって Z か Y)');
   ok(/外部に出す準備OK にする/.test(html) && /async function setExternalReady/.test(html), '詳細に「外部に出す準備OK」の切り替えがある');
   ok(/c\.external_ready \? '📦 外部に出せます'/.test(html) && /tag ready/.test(html), 'ボードと一覧に「外部に出せます」の印が出る');
 }

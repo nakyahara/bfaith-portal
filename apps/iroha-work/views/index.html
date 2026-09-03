@@ -1288,9 +1288,10 @@ function renderDetail(c) {
       kv('入数 (保管箱1つに入れる数)', m.units_per_container != null ? m.units_per_container + '個' : null,
         { miss: missSet.has('入数'), reg: 'units_per_container' }) +
       kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程'), reg: 'process_count' }) +
-      kv('Zロケ在庫 (一時保管)', c.z_stock == null ? null
-        : c.z_stock + '個' + (c.z_allocated ? ' (引当 ' + c.z_allocated + ' → 使えるのは ' + c.z_free + '個)' : '')
-          + (c.z_at ? ' ・ ' + fmtDate(c.z_at) + ' ' + fmtTime(c.z_at) + ' 時点' : '')) +
+      kv(c.loc_kind === 'Y' ? 'Yロケ在庫 (外に出している分)' : 'Zロケ在庫 (一時保管)',
+        c.loc_stock == null ? null
+          : c.loc_stock + '個' + (c.loc_allocated ? ' (引当 ' + c.loc_allocated + ' → 使えるのは ' + c.loc_free + '個)' : '')
+            + (c.loc_at ? ' ・ ' + fmtDate(c.loc_at) + ' ' + fmtTime(c.loc_at) + ' 時点' : '')) +
       kv('必要保管箱', c.boxes) +
       kv('想定作業時間', c.plan_hours != null ? c.plan_hours + ' 時間' : null) +
       kv('気をつけること', m.note, { reg: 'note' }) +
