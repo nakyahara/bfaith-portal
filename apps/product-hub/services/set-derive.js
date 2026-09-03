@@ -141,10 +141,12 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
     // 売価・佐川売価はセットで変わるのでコピーしない (税率・配送・カテゴリだけ引き継ぐ)
     const py = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(parentId);
     if (py) {
+      // shipping_override (ヤフーだけ別配送) は配送方法の一部なので一緒に引き継ぐ。
+      // 抜かすと親が「定形外（ヤフーのみネコポス）」でもセットは楽天と同じ扱いになる
       db.prepare(`
-        INSERT INTO draft_yahoo (draft_id, delivery_label, tax_rate, yahoo_category_id, yahoo_path)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(setId, py.delivery_label, py.tax_rate, py.yahoo_category_id, py.yahoo_path);
+        INSERT INTO draft_yahoo (draft_id, delivery_label, shipping_override, tax_rate, yahoo_category_id, yahoo_path)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(setId, py.delivery_label, py.shipping_override ?? 0, py.tax_rate, py.yahoo_category_id, py.yahoo_path);
     }
     // 商品ページ表記は**許可リスト**でコピーする (Codex R1 high 2026-08-23)。
     // 全列コピーすると「50ml」の 2 個セットが内容量 50ml のまま出て、法定表示が誤る。

@@ -16,6 +16,7 @@
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { syncDraftLinks } from '../product-links/sync.js';
 import { fileViewUrl } from './lib/drive-link.js';
+import { YAHOO_OVERRIDE_SHIPPING_GROUPS } from './lib/shipping-groups.js';
 
 export const DRAFT_STATUSES = [
   'draft', 'ready_for_ai', 'review', 'approved', 'listed', 'expanded', 'on_hold', 'excluded',
@@ -396,6 +397,69 @@ export function migrateShopCategorySlots(db) {
   return true;
 }
 
+/**
+ * 配送方法の複合選択肢 ('1y5' / '1y8') を draft_rakuten から追い出す (2026-09-03)。
+ *
+ * 旧: shipping_method_group に「楽天の配送方法グループID」と「画面の複合選択肢キー」が混在。
+ *     読む側が毎回どちらか判断する必要があり、判断漏れで複合を選んだ商品が楽天に出品できず、
+ *     RMS へ存在しない値 ('1y5') を送りかけていた (#725 → #1152)。
+ * 新: 楽天側は楽天グループIDだけ / ヤフーを別扱いにするかは draft_yahoo.shipping_override。
+ *
+ * ヤフーの配送方法は既に入っていればそれを尊重し、空のときだけ複合の既定値を入れる。
+ * 何を書き換えたかは draft_events に残す。冪等 (複合キーが無ければ何もしない)
+ */
+export function migrateCompositeShippingGroups(db) {
+  const keys = Object.keys(YAHOO_OVERRIDE_SHIPPING_GROUPS);
+  if (keys.length === 0) return 0;
+  const pick = db.prepare(`
+    SELECT draft_id, TRIM(shipping_method_group) AS key FROM draft_rakuten
+    WHERE TRIM(COALESCE(shipping_method_group, '')) IN (${keys.map(() => '?').join(',')})
+  `);
+  if (pick.all(...keys).length === 0) return 0;
+
+  // 既に入っているヤフーの配送方法は残す (TRIM した値で上書きしないよう CASE で分ける)
+  const upsertYahoo = db.prepare(`
+    INSERT INTO draft_yahoo (draft_id, delivery_label, shipping_override) VALUES (?, ?, 1)
+    ON CONFLICT(draft_id) DO UPDATE SET
+      shipping_override = 1,
+      delivery_label = CASE
+        WHEN TRIM(COALESCE(draft_yahoo.delivery_label, '')) = '' THEN excluded.delivery_label
+        ELSE draft_yahoo.delivery_label END,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  `);
+  // 抽出から更新までを 1 トランザクションに収め、楽天側は「まだ複合キーのままの行」だけを
+  // 条件付きで書き換える。人が同時に配送方法を変えていたら、その行には触らない
+  const setGroup = db.prepare(`
+    UPDATE draft_rakuten SET shipping_method_group = ?
+    WHERE draft_id = ? AND TRIM(COALESCE(shipping_method_group, '')) = ?
+  `);
+  const note = db.prepare(`
+    INSERT INTO draft_events (draft_id, event, detail, actor)
+    VALUES (?, 'shipping_group_normalized', ?, 'migration')
+  `);
+  let moved = 0;
+  try {
+    db.transaction(() => {
+      for (const r of pick.all(...keys)) {
+        const ov = YAHOO_OVERRIDE_SHIPPING_GROUPS[r.key];
+        if (setGroup.run(ov.rakutenGroup, r.draft_id, r.key).changes !== 1) continue;
+        upsertYahoo.run(r.draft_id, ov.yahooDelivery);
+        note.run(r.draft_id, `配送方法「${ov.label}」を 楽天=${ov.rakutenGroup} + ヤフー別扱い (${ov.yahooDelivery}) に分けました`);
+        moved += 1;
+      }
+    })();
+  } catch (e) {
+    // 起動は止めない。分解できなくても出品側は toRakutenShippingGroup が複合キーを解決するので
+    // 実害は「画面の見た目が旧のまま」に留まる (次回起動で再試行される)
+    console.warn('[product-hub] 配送方法の複合選択肢を分解できませんでした:', e.message);
+    return 0;
+  }
+  if (moved > 0) {
+    console.log(`[product-hub] 配送方法の複合選択肢を ${moved} 件分解しました (楽天ID + ヤフー別扱いフラグ)`);
+  }
+  return moved;
+}
+
 export function initProductHubDB() {
   if (initialized) return getMirrorDB();
   const db = getMirrorDB();
@@ -484,6 +548,10 @@ export function initProductHubDB() {
       yahoo_price         INTEGER CHECK (yahoo_price IS NULL OR (yahoo_price BETWEEN 0 AND 1000000000000)),
       yahoo_price_sagawa  INTEGER CHECK (yahoo_price_sagawa IS NULL OR (yahoo_price_sagawa BETWEEN 0 AND 1000000000000)),
       delivery_label      TEXT,
+      -- ヤフーだけ楽天と別の配送・売価で出すか (2026-09-03)。基本情報の配送方法で
+      -- 「定形外（ヤフーのみ…）」を選ぶと 1。楽天側の配送方法グループとは別の情報なので
+      -- draft_rakuten.shipping_method_group には混ぜない (lib/shipping-groups.js 参照)
+      shipping_override   INTEGER NOT NULL DEFAULT 0 CHECK (shipping_override IN (0, 1)),
       tax_rate            TEXT,
       yahoo_category_id   INTEGER,
       yahoo_path          TEXT,
@@ -1053,6 +1121,13 @@ export function initProductHubDB() {
     if (!rkCols.has(col)) db.exec(`ALTER TABLE draft_rakuten ADD COLUMN ${col} ${ddl}`);
   }
 
+  // ヤフー別扱いフラグ (2026-09-03)。デプロイ済み DB への冪等 ALTER
+  const yhCols = new Set(db.prepare('PRAGMA table_info(draft_yahoo)').all().map((c) => c.name));
+  if (!yhCols.has('shipping_override')) {
+    db.exec('ALTER TABLE draft_yahoo ADD COLUMN shipping_override INTEGER NOT NULL DEFAULT 0');
+  }
+  migrateCompositeShippingGroups(db);
+
   // Drive 画像の更新日時 (2026-08-08 スタッフ指摘: Drive で画像を上書きしてもサムネが
   // 古いまま表示される)。サムネURLに版数として載せ、ブラウザとサーバーのキャッシュを外す
   const imgCols = new Set(db.prepare('PRAGMA table_info(draft_images)').all().map((c) => c.name));
@@ -1576,17 +1651,20 @@ export function upsertDraftYahoo(db, draftId, fields) {
     yahoo_price: fields.yahoo_price !== undefined ? fields.yahoo_price : (existing.yahoo_price ?? null),
     yahoo_price_sagawa: fields.yahoo_price_sagawa !== undefined ? fields.yahoo_price_sagawa : (existing.yahoo_price_sagawa ?? null),
     delivery_label: fields.delivery_label !== undefined ? fields.delivery_label : (existing.delivery_label ?? null),
+    // 楽天の配送方法プルダウン (基本情報) が決める値。ヤフー項目の保存では触らない
+    shipping_override: fields.shipping_override !== undefined ? (fields.shipping_override ? 1 : 0) : (existing.shipping_override ?? 0),
     tax_rate: fields.tax_rate !== undefined ? fields.tax_rate : (existing.tax_rate ?? null),
     yahoo_category_id: fields.yahoo_category_id !== undefined ? fields.yahoo_category_id : (existing.yahoo_category_id ?? null),
     yahoo_path: fields.yahoo_path !== undefined ? fields.yahoo_path : (existing.yahoo_path ?? null),
   };
   db.prepare(`
-    INSERT INTO draft_yahoo (draft_id, yahoo_price, yahoo_price_sagawa, delivery_label, tax_rate, yahoo_category_id, yahoo_path)
-    VALUES (@draft_id, @yahoo_price, @yahoo_price_sagawa, @delivery_label, @tax_rate, @yahoo_category_id, @yahoo_path)
+    INSERT INTO draft_yahoo (draft_id, yahoo_price, yahoo_price_sagawa, delivery_label, shipping_override, tax_rate, yahoo_category_id, yahoo_path)
+    VALUES (@draft_id, @yahoo_price, @yahoo_price_sagawa, @delivery_label, @shipping_override, @tax_rate, @yahoo_category_id, @yahoo_path)
     ON CONFLICT(draft_id) DO UPDATE SET
       yahoo_price = excluded.yahoo_price,
       yahoo_price_sagawa = excluded.yahoo_price_sagawa,
       delivery_label = excluded.delivery_label,
+      shipping_override = excluded.shipping_override,
       tax_rate = excluded.tax_rate,
       yahoo_category_id = excluded.yahoo_category_id,
       yahoo_path = excluded.yahoo_path,

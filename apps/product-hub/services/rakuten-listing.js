@@ -25,9 +25,16 @@ import { google } from 'googleapis';
 import { getDB, logEvent } from '../db.js';
 import { resolveVariationGroup, getNeCost } from '../lib/variation.js';
 import { imageTrackBlockReason } from '../lib/workflow-progress.js';
-// ⚠️ page-info.js はこのファイルの SHIPPING_METHOD_GROUPS を import する (循環参照)。
-//    双方とも関数呼び出し時にしか使わないので ESM 的に安全。module 評価時に参照しないこと
 import { validatePageInfo, buildPageInfoHtml, mapNeShippingToRakuten } from '../lib/page-info.js';
+// 配送方法の「値の意味」の正本 (定数と変換はこの1ファイルだけが決める)。
+// db.js のマイグレーションからも使うため、循環参照を避けて lib/ に置いてある
+import {
+  SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS, toRakutenShippingGroup,
+} from '../lib/shipping-groups.js';
+
+// 既存の import 元 (router.js / smoke.mjs) を壊さないための再公開。新しいコードは
+// lib/shipping-groups.js から直接取ること
+export { SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS, toRakutenShippingGroup };
 
 // ─── miniPC proxy client (rakuten-rms-proxy.js と同じ env / 認証) ───
 
@@ -820,28 +827,6 @@ export async function fetchGenreAttributes(db, genreId, { force = false, fetcher
 
 export const MAX_RAKUTEN_IMAGES = 20;
 
-/** B-Faith 店舗の配送方法グループ (RYS rakuten-to-notion-draft.js の実測変換表と同一 ID) */
-export const SHIPPING_METHOD_GROUPS = {
-  '1': '定形外',
-  '3': '飛脚宅配便',
-  '4': '宅急便',
-  '5': 'ネコポス',
-  '6': 'クリックポスト',
-  '7': 'ヤマト運輸宅急便',
-  '8': '宅急便50サイズ以上',
-  '9': 'ゆうパケットパフ',
-};
-
-/**
- * 楽天=定形外のまま Yahoo! だけ別配送にする複合選択肢 (2026-08-06 中原さん指示)。
- * 楽天側 (ページ表記・末尾バナー) は rakutenGroup として振る舞い、
- * Yahoo!の配送方法プルダウンには yahooDelivery を初期セットする
- */
-export const YAHOO_OVERRIDE_SHIPPING_GROUPS = {
-  '1y8': { label: '定形外（ヤフーのみ宅急便50サイズ）', rakutenGroup: '1', yahooDelivery: '宅急便50サイズ以上' },
-  '1y5': { label: '定形外（ヤフーのみネコポス）', rakutenGroup: '1', yahooDelivery: 'ネコポス' },
-};
-
 /**
  * draft_yahoo.tax_rate ('8%' / '10%' の文字列) → RMS payment.taxRate。
  * 2026-08-05 平串の実登録で「送らない = 店舗デフォルト」のはずが RMS の消費税率が
@@ -915,14 +900,19 @@ export const COMMON_TRAILING_BANNERS = [
  * 商品ページ表記の発送方法表示と末尾バナーの選択で共通に使う (router のプレビューも同じ関数)
  */
 export function effectiveShippingForDraft(db, neCode, shippingMethodGroup) {
-  const g = String(shippingMethodGroup ?? '').trim();
-  // 複合選択肢は楽天側では rakutenGroup として振る舞う (ページ表記・バナーとも定形外)
-  const ov = YAHOO_OVERRIDE_SHIPPING_GROUPS[g];
-  if (ov) return { group: ov.rakutenGroup, label: SHIPPING_METHOD_GROUPS[ov.rakutenGroup], yahooDelivery: ov.yahooDelivery };
-  if (g && SHIPPING_METHOD_GROUPS[g]) return { group: g, label: SHIPPING_METHOD_GROUPS[g] };
+  // 値の解釈は toRakutenShippingGroup ただ1つ。DB には楽天グループIDしか入らないが、
+  // 旧データ (分解前の複合キー) が残っていても同じ結果になるようここを通す
+  const r = toRakutenShippingGroup(shippingMethodGroup);
   // 不正な明示指定は NE へフォールバックして隠さない (buildItemPayload 側は理由で停止する。
   // プレビューも「配送バナーなし」に揃え、直すべき状態が見えるようにする — Codex R2)
-  if (g) return { group: null, label: null, invalid: true };
+  if (!r.ok) return { group: null, label: null, invalid: true };
+  if (r.group) {
+    return {
+      group: r.group,
+      label: SHIPPING_METHOD_GROUPS[r.group],
+      ...(r.yahooOverride ? { yahooDelivery: r.yahooOverride.yahooDelivery } : {}),
+    };
+  }
   return mapNeShippingToRakuten(db, getNeCost(db, neCode)?.shippingMethod);
 }
 
@@ -1322,8 +1312,10 @@ export function buildItemPayload(db, draftId) {
     }
   }
 
-  if (rk.shipping_method_group != null && String(rk.shipping_method_group).trim() !== ''
-      && !SHIPPING_METHOD_GROUPS[String(rk.shipping_method_group).trim()]) {
+  // 配送方法は生値で判定しない (複合選択肢 '1y5' は楽天の値ではないので、生値を楽天IDとして
+  // 見ると「画面では指定済みなのに不正扱い」になる — #725 で作り込んだ不具合)
+  const shippingResolved = toRakutenShippingGroup(rk.shipping_method_group);
+  if (!shippingResolved.ok) {
     reasons.push('配送方法の指定が不正です');
   }
   if (rk.normal_delivery_date_id != null && String(rk.normal_delivery_date_id).trim() !== ''
@@ -1364,8 +1356,9 @@ export function buildItemPayload(db, draftId) {
     return list;
   };
 
-  // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる
-  const shippingGroup = String(rk.shipping_method_group ?? '').trim();
+  // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる。
+  // RMS へ出るのは**必ず楽天グループID** (複合選択肢は上で '1' 等に解決済み)
+  const shippingGroup = shippingResolved.group || '';
   const shipping = {
     ...(shippingGroup ? { shippingMethodGroup: shippingGroup } : {}),
     ...(rk.postage_included != null ? { postageIncluded: rk.postage_included === 1 } : {}),

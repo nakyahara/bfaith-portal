@@ -686,7 +686,7 @@
             <option value="">未設定 (店舗デフォルト)</option>
             <%
               // 未設定なら NE 配送方法のマッピングをデフォルト選択 (保存で確定)
-              const shipDefault = String(rakuten?.shipping_method_group || '') || (neShipping.group || '');
+              const shipDefault = String(shippingSelectValue || '') || (neShipping.group || '');
             %>
             <% for (const [gid, gname] of Object.entries(shippingGroups)) { %>
               <option value="<%= gid %>" <%= shipDefault === gid ? 'selected' : '' %>><%= gname %></option>
@@ -2905,10 +2905,24 @@
       model_conflict_seen: modelSeenValues,
       shop_category_ids: getShopCatOrderedIds(),   // 枠順 (配列順=slot。先頭=メインページ)
       shipping_method_group: document.getElementById('rk-shipping-group').value,
+      // 画面が持つ「ヤフー別扱い」をそのまま送る (プルダウンからは復元できないため)
+      yahoo_shipping_override: yahooOverrideOn ? 1 : 0,
+      // 画面を開いたときの選択 (これと違えば「複合選択肢を選び直した」)
+      shipping_method_group_prev: shipSelectInitial,
       postage_included: document.getElementById('rk-postage').value,
       normal_delivery_date_id: document.getElementById('rk-delivery-date').value,
       white_bg_url: document.getElementById('rk-whitebg').value,
     };
+  }
+
+  // 楽天項目の送信。**保存できた配送方法まで shipSelectInitial を進める** — この画面は保存後に
+  // 再読み込みしない経路 (プレビュー・登録へ続く) があり、進めないと 2 回目以降の保存で毎回
+  // 「複合選択肢を選び直した」と誤判定して、人が直したヤフーの配送方法を既定値へ戻してしまう
+  async function postRakutenFields(extra) {
+    const payload = { ...collectRakutenFields(), ...(extra || {}) };
+    const json = await post(BASE + '/rakuten', payload);
+    if (json.ok) shipSelectInitial = payload.shipping_method_group;
+    return json;
   }
 
   // 公開 / 非公開の切り替え (アプリから登録した商品のみ)
@@ -3022,7 +3036,7 @@
     // JAN (単品欄 / SKU表) の保存を先に確定させる。失敗したらプレビュー・登録に進まない (Codex R2 high)
     if (!(await saveJanIfChanged())) return false;
     if (!(await flushSkuJanSaves())) return false;
-    const json = await post(BASE + '/rakuten', collectRakutenFields());
+    const json = await postRakutenFields();
     if (!json.ok) { alert(json.error || '保存に失敗しました'); return false; }
     return true;
   }
@@ -3749,7 +3763,7 @@
       }
       let json;
       try {
-        json = await post(BASE + '/rakuten', { ...collectRakutenFields(), drop_legacy_catalog_attr: true });
+        json = await postRakutenFields({ drop_legacy_catalog_attr: true });
       } catch (e) {
         json = { ok: false, error: '通信エラーで削除できませんでした。もう一度お試しください' };
       }
@@ -3830,6 +3844,8 @@
       yahoo_price: document.getElementById('y-price').value,
       yahoo_price_sagawa: document.getElementById('y-price-sagawa').value,
       delivery_label: document.getElementById('y-delivery').value,
+      // 楽天項目より先に保存しても「別扱い」が落ちないよう、こちらでも現在値を送る
+      shipping_override: yahooOverrideOn ? 1 : 0,
       tax_rate: document.getElementById('y-tax').value,
       yahoo_category_id: document.getElementById('y-category-id').value,
       yahoo_path: document.getElementById('y-path').value,
@@ -3840,24 +3856,40 @@
   // 通常は楽天と同じ配送・売価で出すため入力不可。基本情報の配送方法で
   // 「定形外（ヤフーのみ…）」を選んだときだけ入力可になり、対応する配送方法を初期セットする
   const YAHOO_SHIP_OVERRIDES = <%- JSON.stringify(yahooOverrideGroups) %>;
+  // 「ヤフーだけ別配送・別売価で出す」の現在値 (draft_yahoo.shipping_override)。
+  // プルダウンの値だけからは復元できない — ヤフーの配送方法を複合の既定値から変えた商品は
+  // 複合キーへ逆引きできず「定形外」表示になるため、その状態で楽天項目を保存すると
+  // 別扱いが解除されてしまう。**保存時は画面が持つこの値をそのまま送る** (rakutenPayload /
+  // yahooPayload の両方。どちらを先に押しても同じ状態が保たれる)
+  let yahooOverrideOn = <%= yahoo?.shipping_override ? 'true' : 'false' %>;
+  // 画面を開いたときの配送方法の選択。保存時に一緒に送り、サーバは「プルダウンで複合選択肢を
+  // 選び直したか」をこれで判定する (1y5 → 1y8 ならヤフーの配送方法も追従させ、選び直して
+  // いなければ人が入れた値に触らない)。DB の値からの逆引きでは、ヤフーの配送方法を変えた商品を
+  // 「選び直した」と誤判定してしまう
+  let shipSelectInitial = '';
   (function () {
     const rkShip = document.getElementById('rk-shipping-group');
     const yPrice = document.getElementById('y-price');
     const yDelivery = document.getElementById('y-delivery');
     const hint = document.getElementById('y-gate-hint');
     if (!rkShip || !yPrice || !yDelivery) return;
+    shipSelectInitial = rkShip.value;
     function updateYahooGate(fromChange) {
       const ov = YAHOO_SHIP_OVERRIDES[rkShip.value];
-      yPrice.disabled = !ov;
-      yDelivery.disabled = !ov;
-      if (ov) {
-        if (fromChange || !yDelivery.value) yDelivery.value = ov.yahooDelivery;
-        hint.textContent = 'Yahoo!は「' + ov.yahooDelivery + '」で出す設定です (プルダウンで変更可。保存は「Yahoo!項目を保存」)';
+      // プルダウンを操作したときだけ状態が変わる (初期表示は保存値のまま)
+      if (fromChange) yahooOverrideOn = !!ov;
+      const overrideOn = yahooOverrideOn;
+      yPrice.disabled = !overrideOn;
+      yDelivery.disabled = !overrideOn;
+      if (ov && (fromChange || !yDelivery.value)) yDelivery.value = ov.yahooDelivery;
+      if (overrideOn) {
+        hint.textContent = 'Yahoo!は「' + (yDelivery.value || (ov ? ov.yahooDelivery : '')) + '」で出す設定です (プルダウンで変更可。保存は「Yahoo!項目を保存」)';
       } else {
         hint.textContent = '楽天と同じ配送・売価で出すため入力不要です (基本情報の配送方法で「定形外（ヤフーのみ…）」を選ぶと入力できます)';
       }
     }
     rkShip.addEventListener('change', () => updateYahooGate(true));
+    yDelivery.addEventListener('change', () => updateYahooGate(false));
     updateYahooGate(false);
   })();
 

@@ -58,12 +58,17 @@ import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } fr
 import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
-  setItemVisibility, SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS,
+  setItemVisibility,
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
   isValidGtin, MODEL_ATTR_NAME, skuAttributeGrid,
 } from './services/rakuten-listing.js';
+// 配送方法の値の意味 (楽天グループID / 画面の複合選択肢) はこの1ファイルが決める
+import {
+  SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS,
+  toRakutenShippingGroup, shippingSelectValueOf,
+} from './lib/shipping-groups.js';
 // ボードから楽天に出品 (2026-09-01): 画像転送 → 登録 → 後処理 を 1 本に
 import {
   listToRakutenFromBoard, afterRakutenRegistered, acquireRakutenListingLock, assertRakutenListable, rememberUnknownOutcome,
@@ -328,6 +333,9 @@ router.get('/detail/:id', (req, res) => {
     shopCategories: listShopCategoriesForDraft(db, draft.id),
     shippingGroups: SHIPPING_METHOD_GROUPS,
     yahooOverrideGroups: YAHOO_OVERRIDE_SHIPPING_GROUPS,
+    // プルダウンに selected させる値。DB は楽天IDだけを持つので、ヤフー別扱いのときは
+    // 複合選択肢のキーへ戻す (逆引きできない組み合わせは楽天IDのまま = 定形外を指す)
+    shippingSelectValue: shippingSelectValueOf(rakuten?.shipping_method_group, yahoo),
     trailingBanners,
     // 工程パネル (誰のボールか)。行が無ければ表示時に自己修復で作られる
     workflow: progressOf(draft.id, { db }),
@@ -789,6 +797,9 @@ router.post('/api/drafts/:id/yahoo', (req, res) => {
     yahoo_price: b.yahoo_price !== undefined ? sanitizeMoney(b.yahoo_price) : undefined,
     yahoo_price_sagawa: b.yahoo_price_sagawa !== undefined ? sanitizeMoney(b.yahoo_price_sagawa) : undefined,
     delivery_label: b.delivery_label !== undefined ? cleanText(b.delivery_label, 100) : undefined,
+    // ヤフー別扱い: 画面が持つ現在値。楽天項目とどちらを先に保存しても状態が揃うよう、
+    // 両方の保存 API が同じ値を書く (送られてこなければ既存値を維持)
+    shipping_override: b.shipping_override !== undefined ? (Number(b.shipping_override) ? 1 : 0) : undefined,
     tax_rate: b.tax_rate !== undefined ? cleanText(b.tax_rate, 20) : undefined,
     yahoo_category_id: catId,
     yahoo_path: b.yahoo_path !== undefined ? cleanText(b.yahoo_path, 500) : undefined,
@@ -1199,11 +1210,15 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
     }
     shopCategoryIds = ids;
   }
-  // 配送・納期 (2026-07-27 仕様: 公開に必要な情報はアプリで持つ)
-  const shippingGroup = cleanText(req.body?.shipping_method_group, 10);
-  if (shippingGroup && !SHIPPING_METHOD_GROUPS[shippingGroup] && !YAHOO_OVERRIDE_SHIPPING_GROUPS[shippingGroup]) {
+  // 配送・納期 (2026-07-27 仕様: 公開に必要な情報はアプリで持つ)。
+  // 複合選択肢 ('1y5' 等) は**ここで分解**し、DB には楽天グループIDだけを入れる。
+  // ヤフーを別扱いにするかは draft_yahoo.shipping_override が持つ (lib/shipping-groups.js)
+  const shippingRaw = cleanText(req.body?.shipping_method_group, 10);
+  const shippingInput = toRakutenShippingGroup(shippingRaw);
+  if (!shippingInput.ok) {
     return res.status(400).json({ ok: false, error: '配送方法の指定が不正です' });
   }
+  const shippingGroup = shippingInput.group;
   let postageIncluded = null;
   if (req.body?.postage_included === '1' || req.body?.postage_included === 1) postageIncluded = 1;
   else if (req.body?.postage_included === '0' || req.body?.postage_included === 0) postageIncluded = 0;
@@ -1223,6 +1238,8 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   }
 
   db.transaction(() => {
+    // 保存前のヤフー側の状態 (別扱いフラグの引き継ぎと、配送方法の初期セット判定に使う)
+    const yahooPrev = db.prepare('SELECT delivery_label, shipping_override FROM draft_yahoo WHERE draft_id = ?').get(draft.id);
     db.prepare(`
       INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number,
         catalog_id_exemption_reason, variant_selector_name,
@@ -1243,6 +1260,28 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(draft.id, genreId, attributesJson, articleNumber, catalogExemptionReason, variantSelectorName,
       shippingGroup, postageIncluded, deliveryDateId, whiteBgFileId, whiteBgRaw);
+    // 「ヤフーだけ別配送」は楽天の配送方法グループとは別の情報なので draft_yahoo 側に持つ。
+    //   - 複合選択肢を選んでいれば当然 ON
+    //   - 通常の配送方法でも、画面が「別扱い中」と言っていれば維持する。ヤフーの配送方法を
+    //     複合の既定値から変えた商品は複合キーへ逆引きできず「定形外」表示になるので、
+    //     プルダウンの値だけで判定すると保存のたびに別扱いが解除されてしまう
+    const overrideFromScreen = req.body?.yahoo_shipping_override !== undefined
+      ? !!Number(req.body.yahoo_shipping_override)
+      : !!yahooPrev?.shipping_override;
+    // ヤフーの配送方法を複合の既定値で埋めるのは「未設定のとき」と「プルダウンで別の複合へ
+    // 選び直したとき」(1y5 → 1y8) だけ。同じ複合のまま保存し直しても、人が入れた値は書き換えない。
+    // 選び直したかは**画面が持っていた初期選択**で判定する — DB からの逆引きだと、ヤフーの
+    // 配送方法を変えた商品 (逆引き不能 = '1') を毎回「選び直した」と誤判定して値を戻してしまう。
+    // 前回値が送られてこない呼び出し (API 直叩き) は「選び直していない」= 人の値を壊さない側に倒す
+    const presetChanged = !!shippingInput.yahooOverride
+      && req.body?.shipping_method_group_prev !== undefined
+      && cleanText(req.body.shipping_method_group_prev, 10) !== shippingRaw;
+    upsertDraftYahoo(db, draft.id, {
+      shipping_override: (shippingInput.yahooOverride || overrideFromScreen) ? 1 : 0,
+      ...(shippingInput.yahooOverride && (presetChanged || !String(yahooPrev?.delivery_label || '').trim())
+        ? { delivery_label: shippingInput.yahooOverride.yahooDelivery }
+        : {}),
+    });
     if (droppedLegacyCatalog) {
       logEvent(db, draft.id, 'legacy_catalog_attr_dropped', '旧データの「カタログID」属性を削除', actorOf(req));
     }
