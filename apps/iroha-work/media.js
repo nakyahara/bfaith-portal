@@ -23,7 +23,9 @@ import { notionRequest, isNotionConfigured } from '../inbound-check/notion.js';
 import { codeKeyOf } from '../inbound-check/work-master.js';
 
 export const MAX_PHOTOS = 3;
-export const MAX_VIDEOS = 1;
+// 動画は当面なし (中原さん 2026-09-03: iPad でうまく再生できなかった)。0 = 新しく受け付けない。
+// 既に保存された動画の行とドライブのファイルはそのまま残す (画面に出さないだけ)
+export const MAX_VIDEOS = 0;
 export const MAX_PHOTO_BYTES = 8 * 1024 * 1024;     // canvas縮小後は通常1MB未満。余裕をみて8MB
 export const MAX_VIDEO_BYTES = 120 * 1024 * 1024;
 const RETRY_BASE_MS = 2 * 60 * 1000;
@@ -129,10 +131,10 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
     }
     return { ok: true, already: true, media: publicMedia(dup) };
   }
+  if (kind === 'video') return { ok: false, error: 'video_disabled', message: '動画は今つかえません (写真をとってください)' };
   const max = kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
   if (countActiveMedia({ pageId, taskId }, kind) >= max) {
-    return { ok: false, error: 'cap_reached',
-      message: kind === 'photo' ? `写真は${max}枚までです。不要な写真を削除してから撮り直してください` : `動画は${max}本までです。不要な動画を削除してから撮り直してください` };
+    return { ok: false, error: 'cap_reached', message: `写真は${max}枚までです。不要な写真を削除してから撮り直してください` };
   }
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
   const ext = kind === 'photo' ? 'jpg' : 'mp4';

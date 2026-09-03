@@ -48,7 +48,7 @@ import {
   addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
   recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
   listPageSyncForAdmin, resetPageSync,
-  isDriveConfigured, MEDIA_DIR, MAX_VIDEO_BYTES,
+  isDriveConfigured, MEDIA_DIR, MAX_PHOTO_BYTES,
 } from './media.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -670,7 +670,8 @@ router.post('/api/master', checkOrigin, api((req, res) => {
 
 const MEDIA_TMP = path.join(MEDIA_DIR, 'tmp');
 try { fs.mkdirSync(MEDIA_TMP, { recursive: true }); } catch { /* 受信時にも作る */ }
-const mediaUpload = multer({ dest: MEDIA_TMP, limits: { fileSize: MAX_VIDEO_BYTES } });
+// 動画は当面なしなので、受け取る上限は写真の分だけ (中原さん 2026-09-03)
+const mediaUpload = multer({ dest: MEDIA_TMP, limits: { fileSize: MAX_PHOTO_BYTES } });
 
 /**
  * 撮影した写真・動画の受信。実体を outbox (DATA_DIR) に置いて**即応答** — Drive/Notion へは
@@ -685,8 +686,9 @@ router.post('/api/media', checkOrigin, mediaUpload.single('file'), api((req, res
     if (!isDriveConfigured()) { cleanup(); return res.status(503).json({ ok: false, error: 'not_configured', message: 'ドライブ保存が未設定です (職員の方は管理者に連絡してください)' }); }
     const cardId = String(req.body?.id || req.body?.page_id || '').trim();
     const kind = String(req.body?.kind || '');
-    if (!cardId || (kind !== 'photo' && kind !== 'video')) {
-      cleanup(); return res.status(400).json({ ok: false, error: 'bad_request', message: 'カードと種類 (photo/video) が必要です' });
+    if (kind === 'video') { cleanup(); return res.status(400).json({ ok: false, error: 'video_disabled', message: '動画は今つかえません (写真をとってください)' }); }
+    if (!cardId || kind !== 'photo') {
+      cleanup(); return res.status(400).json({ ok: false, error: 'bad_request', message: 'カードと種類 (photo) が必要です' });
     }
     const appMode = isAppMode();
     // 正本に合わせて、カードを task_id (アプリ正本) か page_id (Notion 正本) で引く

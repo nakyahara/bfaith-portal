@@ -582,8 +582,11 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   ok(a1.deleteToken && a3.deleteToken && a1.deleteToken !== a3.deleteToken, '削除トークンは行ごとに別');
   ok(addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a4.jpg', jpeg), worker: worker1, operationId: 'op-photo-0004' }).error === 'cap_reached',
     '写真は3枚まで');
+  // 動画は当面なし (中原さん 2026-09-03: iPad で再生できなかった)。入口で断る
   const v1 = addMedia({ pageId: pMedia.id, kind: 'video', mime: 'video/mp4', filePath: tmp('v1.mp4', mp4), worker: worker1, operationId: 'op-video-0001' });
-  ok(v1.ok === true, '動画も受信できる');
+  ok(v1.ok === false && v1.error === 'video_disabled', '動画は受け付けない (video_disabled)');
+  ok(fs.existsSync(path.join(process.env.DATA_DIR, 'v1.mp4')), '断ったときは一時ファイルを取り込まない (呼び元が片づける)');
+  ok(countActiveMedia(pMedia.id, 'video') === 0, '動画は 1 本も入らない');
   ok(countActiveMedia(pMedia.id, 'photo') === 3, '有効な写真 3 枚 (枚数上限の根拠)');
 
   // キュー: 1回目は「Drive に作成できたが応答が消えた」→ 再試行は operation_id で**回収**し
@@ -607,13 +610,13 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   await processMediaQueue();   // 2巡目で残りの upload + Notion 反映
   rows = listMediaForAdmin(10).filter(m => m.page_id === pMedia.id && !m.deleted_at);
   ok(rows.every(m => m.status === 'synced' && m.drive_url), `全件 Drive→Notion まで反映 (実際: ${rows.map(m => m.status).join(',')})`);
-  ok(driveFiles.size === 4, `Drive のファイルは4つだけ (再試行で二重作成しない。実際 ${driveFiles.size})`);
+  ok(driveFiles.size === 3, `Drive のファイルは3つだけ (写真のみ・再試行で二重作成しない。実際 ${driveFiles.size})`);
   ok(rows.find(m => m.operation_id === 'op-photo-0001').drive_file_id === 'f-op-photo-0001',
     '応答消失した1件も同じファイルを回収して紐づく');
   ok(!fs.existsSync(path.join(MEDIA_DIR, 'op-photo-0001.jpg')), 'アップロード後に実体を削除');
   const patched = mock.patched.filter(p => p.id === pMedia.id && p.body.properties?.['完成写真']);
-  ok(patched.length > 0 && patched[patched.length - 1].body.properties['完成写真'].files.length === 4,
-    'Notion「完成写真」に4件 (写真3+動画1) が付く');
+  ok(patched.length > 0 && patched[patched.length - 1].body.properties['完成写真'].files.length === 3,
+    'Notion「完成写真」に3件 (写真3) が付く');
 
   // 「前回の完成形」: 同じ商品コードの**別カード**に、Drive 保存済みの写真が新しい順で付く
   // (中原さん 2026-09-03: 写真は完了の証拠ではなく、次に同じ商品を作る人への見本)
@@ -642,8 +645,8 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   await new Promise(r => setTimeout(r, 30));
   await processMediaQueue();
   const last = mock.patched.filter(p => p.id === pMedia.id && p.body.properties?.['完成写真']).pop();
-  ok(last.body.properties['完成写真'].files.length === 3, 'Notion 側も貼り直されて3件 (写真2+動画1)');
-  ok((mediaByPage().get(pMedia.id) || []).length === 3, '画面用一覧にも削除分は出ない');
+  ok(last.body.properties['完成写真'].files.length === 2, 'Notion 側も貼り直されて2件 (写真2)');
+  ok((mediaByPage().get(pMedia.id) || []).length === 2, '画面用一覧にも削除分は出ない');
 
   // 最後の1件を消したときも Notion を「空にする」PATCH が飛ぶ (Codex PR3 #1)
   const pSolo = mkPage({ status: '作業中', title: '1枚だけ', code: 'PROD-S' });
