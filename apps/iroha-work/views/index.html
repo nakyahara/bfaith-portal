@@ -244,7 +244,8 @@
   .opt.add{color:var(--accent);border-color:var(--accent);border-style:dashed;background:var(--surface)}
   .opt.wide{grid-column:1/-1;aspect-ratio:auto;flex-direction:row;justify-content:center;min-height:46px}
   .optq{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;font-size:1rem;background:var(--surface);color:var(--ink);margin:2px 0 6px}
-  .optnew{display:flex;gap:8px;width:100%;margin-top:4px}
+  .optnew{display:flex;gap:8px;width:100%;margin-top:4px;grid-column:1/-1}
+  .opts .hint{grid-column:1/-1}
   .optnew input{flex:1;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 10px;font-size:1rem;background:var(--surface);color:var(--ink);min-height:46px}
   .mfields label{display:block;font-size:.78rem;color:var(--sub);font-weight:700;margin:10px 0 3px}
   .mfields input{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;
@@ -261,6 +262,8 @@
   .overlay{position:fixed;inset:0;background:rgba(15,23,40,.5);display:none;place-items:start center;padding:16px;z-index:20;
     overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
   .overlay.on{display:grid}
+  /* ダイアログ表示中は背景を固定 (iOS でスクロールが後ろへ伝わり、閉じたとき位置がずれるのを防ぐ) */
+  body.modal-open{position:fixed;left:0;right:0;width:100%;overflow:hidden}
   .modal{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);
     padding:20px;width:min(520px,100%);margin:auto 0;max-height:none}
   /* 候補が多いときは、その枠だけスクロールする (ボタンが下に押し出されない) */
@@ -411,21 +414,21 @@
 
   <!-- ══ 作業のやり方 登録・修正ダイアログ ══ -->
   <div class="overlay" id="mvOv">
-    <div class="modal">
-      <h3 id="mvTitle">✎ 作業のやり方を登録・修正</h3>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mvTitle">
+      <h3 id="mvTitle" tabindex="-1">✎ 作業のやり方を登録・修正</h3>
       <div class="mname" id="mvName">—</div>
       <div class="msaving" id="mvMsg"></div>
       <div class="mfields">
         <div class="mvf" data-f="material_code">
           <label>資材 (タップして選ぶ)</label>
           <input class="optq" id="optqMaterial" placeholder="候補をしぼる (例: D-8)" hidden oninput="filterOpts('material', this.value)">
-          <div class="opts" id="optMaterial"></div>
+          <div class="opts" id="optMaterial" role="group" aria-label="資材の候補"></div>
           <input type="hidden" id="mvMaterial">
         </div>
         <div class="mvf" data-f="storage_container">
           <label>保管箱 (タップして選ぶ)</label>
           <input class="optq" id="optqContainer" placeholder="候補をしぼる (例: 20L)" hidden oninput="filterOpts('container', this.value)">
-          <div class="opts" id="optContainer"></div>
+          <div class="opts" id="optContainer" role="group" aria-label="保管箱の候補"></div>
           <input type="hidden" id="mvContainer">
         </div>
         <div class="mvf" data-f="units_per_container">
@@ -1141,13 +1144,13 @@ function fillLw(r, name) {
   $('#lwRestocked').value = r.restocked_on || '';
   $('#lwDone').checked = !!r.done;
   $('#lwNote').value = r.note || '';
-  $('#lwOv').classList.add('on');
+  openOverlay('#lwOv');
 }
 function pickLwLoc(v) {
   $('#lwLocation').value = v;
   [...$('#lwLoc').children].forEach((b, i) => b.classList.toggle('on', LW_LOCS[i][0] === v));
 }
-function closeLw() { $('#lwOv').classList.remove('on'); lwEditing = null; }
+function closeLw() { closeOverlay('#lwOv'); lwEditing = null; }
 async function saveLw() {
   if (!lwEditing) return;
   if (!isApp()) { $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)'; return; }
@@ -1553,11 +1556,14 @@ function renderOpts(kind) {
   if (qEl) qEl.hidden = all.length <= OPT_SEARCH_FROM;
   const q = optKey(optFilter[kind] || '');
   const list = q ? all.filter(o => optKey(o.code).includes(q)) : all;
+  // 選んでいるかどうかは見た目だけでなく aria-pressed でも伝える (読み上げ・キーボード — Codex R1)
   const tile = (cls, code, label, img, extra) =>
-    '<button type="button" class="opt ' + cls + '" data-code="' + esc(code) + '" onclick="pickOptEl(this,\'' + kind + '\')">' +
+    '<button type="button" class="opt ' + cls + '" data-code="' + esc(code) + '" aria-pressed="' + (/\bon\b/.test(cls) ? 'true' : 'false') + '"' +
+    ' onclick="pickOptEl(this,\'' + kind + '\')">' +
     '<span class="thumb">' + (img ? '<img src="' + esc(img) + '" alt="" loading="lazy" onerror="this.remove()">' : '📦') + '</span>' +
     '<span class="nm">' + esc(label) + (extra || '') + '</span></button>';
-  let h = '<button type="button" class="opt none wide' + (cur ? '' : ' on') + '" data-code="" onclick="pickOptEl(this,\'' + kind + '\')">なし</button>';
+  let h = '<button type="button" class="opt none wide' + (cur ? '' : ' on') + '" data-code="" aria-pressed="' + (cur ? 'false' : 'true') + '"' +
+    ' onclick="pickOptEl(this,\'' + kind + '\')">なし</button>';
   // 今の値が候補に無い (管理者が外した・古いマスタ値) ときは「候補外」と分かる形で選択中に見せる (Codex R1 #7)。
   // 比較はサーバーと同じ正規化 (全角/大小文字の違いを候補外にしない — Codex R2 #3)
   if (cur && !all.some(o => optKey(o.code) === curKey)) {
@@ -1625,6 +1631,41 @@ const MV_MAP = { material_code: 'mvMaterial', storage_container: 'mvContainer', 
   // 作り方動画のリンクは画面から外した (中原さん 2026-09-03)。DB の video_url と API は残してあるので、戻すときはここに足す
   process_count: 'mvProcess', note: 'mvNote' };
 
+// ─── ダイアログの開け閉め (背景を止める・元の場所へフォーカスを戻す・Tab を中に閉じ込める) ───
+let overlayReturn = null;      // 開く前にフォーカスしていた要素
+let overlayScrollY = 0;
+function openOverlay(sel) {
+  const ov = $(sel);
+  overlayReturn = document.activeElement;
+  overlayScrollY = window.scrollY;
+  document.body.style.top = (-overlayScrollY) + 'px';
+  document.body.classList.add('modal-open');
+  ov.classList.add('on');
+  ov.scrollTop = 0;
+}
+function closeOverlay(sel) {
+  $(sel).classList.remove('on');
+  if (document.querySelectorAll('.overlay.on').length > 0) return;   // 別のダイアログが開いていれば戻さない
+  document.body.classList.remove('modal-open');
+  document.body.style.top = '';
+  window.scrollTo(0, overlayScrollY);
+  try { if (overlayReturn && overlayReturn.focus) overlayReturn.focus(); } catch (e) { /* 消えていれば何もしない */ }
+  overlayReturn = null;
+}
+// Tab をダイアログの中だけで回す
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Tab') return;
+  const ov = document.querySelector('.overlay.on');
+  if (!ov) return;
+  const items = [...ov.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+    .filter(el => !el.disabled && el.offsetParent !== null);
+  if (items.length === 0) return;
+  const first = items[0];
+  const last = items[items.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
+
 function mvValues(m) {
   return {
     material_code: m.material_code || '', storage_container: m.storage_container || '',
@@ -1658,19 +1699,22 @@ function openMaster(field) {
   $('#mvMsg').textContent = '';
   $('#mvPinRow').style.display = 'none';
   $('#mvPin').value = '';
-  $('#mvOv').classList.add('on');
-  $('#mvOv').scrollTop = 0;
-  // 数字・文字の項目はすぐ打てるように。選ぶだけの項目 (資材・保管箱) はカーソルを出さない
+  openOverlay('#mvOv');
+  // 数字・文字の項目はすぐ打てるように。選ぶだけの項目 (資材・保管箱) は見出しにフォーカス
+  // (キーボードを出さずに、読み上げの位置をダイアログへ移す — Codex R1)
   const focusable = ['units_per_container', 'process_count', 'note'];
   if (mvCtx.field && focusable.includes(mvCtx.field)) document.getElementById(MV_MAP[mvCtx.field]).focus();
+  else $('#mvTitle').focus();
 }
-function closeMaster() { if (mvSaving) return; $('#mvOv').classList.remove('on'); }
+function closeMaster() { if (mvSaving) return; closeOverlay('#mvOv'); }
 $('#mvOv').addEventListener('click', e => { if (e.target === $('#mvOv')) closeMaster(); });
 
 async function saveMaster() {
   if (mvSaving || !worker || !mvCtx) return;
   const fields = {};
-  for (const [f, id] of Object.entries(MV_MAP)) {
+  // 開いた項目だけを見る (隠している項目は比べない — 将来ほかの処理が値を書き換えても巻き込まれない。Codex R1)
+  const targets = mvCtx.field ? [[mvCtx.field, MV_MAP[mvCtx.field]]] : Object.entries(MV_MAP);
+  for (const [f, id] of targets) {
     const v = document.getElementById(id).value.trim();
     if (v !== mvCtx.values[f]) fields[f] = v;   // 開いた時点との差分だけ送る
   }
@@ -1690,7 +1734,7 @@ async function saveMaster() {
   for (const id of ['mvSave', 'mvCancel']) document.getElementById(id).disabled = false;
 
   if (j.ok) {
-    $('#mvOv').classList.remove('on');
+    closeOverlay('#mvOv');
     mvCtx = null;
     // ⭐ローカルで j.row (生値) を貼らず、サーバーの合成結果 (カードフォールバック込み) を
     //   取り直す — 部分マスタ行で保存直後だけ資材・入数が「未登録」に見える回帰を防ぐ (PR4-R4)
@@ -1940,9 +1984,9 @@ function openSt(ev, id) {
   $('#pinRow').style.display = 'none';
   $('#pinIn').value = '';
   renderStBtns(c);
-  $('#stOv').classList.add('on');
+  openOverlay('#stOv');
 }
-function closeSt() { if (stSaving) return; $('#stOv').classList.remove('on'); stTarget = null; stStep = null; }
+function closeSt() { if (stSaving) return; closeOverlay('#stOv'); stTarget = null; stStep = null; }
 $('#stOv').addEventListener('click', e => { if (e.target === $('#stOv')) closeSt(); });
 
 /** ボタンの値は data-v から取る (状態名を JS 文字列に埋め込まない) */
@@ -2023,7 +2067,7 @@ async function doSetSt(choice) {
   };
   const suffix = isApp() ? '' : ' (Notionにも反映済み)';
   if (j.ok) {
-    $('#stOv').classList.remove('on'); stTarget = null;
+    closeOverlay('#stOv'); stTarget = null;
     const label = j.status_label || j.status;
     if (j.listed === false) {
       dropCard();
@@ -2041,7 +2085,7 @@ async function doSetSt(choice) {
     return;
   }
   if (j.error === 'conflict') {
-    $('#stOv').classList.remove('on'); stTarget = null;
+    closeOverlay('#stOv'); stTarget = null;
     showErr(j.message || (isApp() ? '他の端末で変更されています' : 'Notion側で変更されています'));
     if (j.listed === false) dropCard();
     else if (j.current) {
@@ -2053,7 +2097,7 @@ async function doSetSt(choice) {
     return;
   }
   if (j.error === 'card_gone') {
-    $('#stOv').classList.remove('on'); stTarget = null;
+    closeOverlay('#stOv'); stTarget = null;
     showErr(j.message || 'カードが見つかりません');
     closeDetail();
     loadState();

@@ -2191,7 +2191,17 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // 一覧の後始末 (exitBulk) が curView のガードの中にないと、ボードで選んでいる最中に /api/state が返るだけで選択が消える
   const listBody = html.slice(html.indexOf('function renderList()'), html.indexOf('function renderList()') + 900);
   ok(/if \(curView === 'list'\) \{[\s\S]{0,200}exitBulk\(\)/.test(listBody), 'まとめて選択の解除は「一覧を見ているとき」だけ (ボードの選択を消さない)');
-  ok(!/tabindex="-1"/.test(html), 'チェックボックスはキーボードでも操作できる (tabindex="-1" を付けない)');
+  // 選択のチェックボックスに tabindex="-1" を付けない (見出しに付けるのは、読み上げの位置を移すためなので別)
+  ok(!/type="checkbox" class="cb"[^']*tabindex="-1"/.test(html), 'チェックボックスはキーボードでも操作できる');
+  // ダイアログ: 役割・見出しとの関連付け・背景固定・フォーカスの戻し (Codex R1)
+  ok(/role="dialog" aria-modal="true" aria-labelledby="mvTitle"/.test(html), 'ダイアログとして扱われる (読み上げ)');
+  ok(/body\.modal-open\{position:fixed/.test(html) && /document\.body\.classList\.add\('modal-open'\)/.test(html), '開いている間は背景を固定する');
+  ok(/window\.scrollTo\(0, overlayScrollY\)/.test(html) && /overlayReturn\.focus\(\)/.test(html), '閉じたら元の位置とフォーカスに戻す');
+  ok(/if \(e\.key !== 'Tab'\) return;/.test(html), 'Tab はダイアログの中で回る');
+  ok(/aria-pressed=/.test(html) && /role="group" aria-label="資材の候補"/.test(html), 'どれを選んでいるかが支援技術にも伝わる');
+  ok(/\.optnew\{[^}]*grid-column:1\/-1/.test(html), '新しく登録の欄は横いっぱいに出る');
+  ok(/const targets = mvCtx\.field \? \[\[mvCtx\.field, MV_MAP\[mvCtx\.field\]\]\] : Object\.entries\(MV_MAP\)/.test(html), '送るのは開いた項目だけ');
+  ok(!/\$\('#(mv|st|lw)Ov'\)\.classList\.(add|remove)\('on'\)/.test(html), 'ダイアログの開け閉めは openOverlay / closeOverlay に揃える (背景固定の解除漏れを作らない)');
   // 切替前の下見: 画面切替はいつでも出す。ボードは正本が Notion なら下見データを読む。書き変えの導線は出さない
   ok(/function renderViews\(\) \{ const el = \$\('#views'\); if \(el\) el\.hidden = false; \}/.test(html), '画面切替はいつでも出る (正本を問わない)');
   ok(/if \(v === 'board'\) \{ if \(isApp\(\)\) renderBoard\(\); else loadPreview\(\); \}/.test(html), 'ボードは正本が Notion なら下見を読み込む');
