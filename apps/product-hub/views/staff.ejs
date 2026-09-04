@@ -53,11 +53,38 @@
   <!-- ═══ 工程フロー ═══ -->
   <div class="card">
     <h2>🔁 工程の流れ <span class="muted" style="font-weight:400">(この並びがそのままボードの列になります)</span></h2>
-    <div class="track-title">本流</div>
+    <div class="track-title">本流【単品】</div>
     <div class="flow">
       <% overview.main.forEach(function (st, i) { %>
         <div class="flow-step <%= st.role_code ? '' : 'system' %>">
           <div class="flow-label"><%= st.label %></div>
+          <div class="flow-role"><%= st.role_label || 'システム (担当者なし)' %></div>
+          <div class="flow-staff">
+            <% if (!st.role_code) { %>
+              <span class="muted">夜間バッチ<%= st.stall_days ? ` / ${st.stall_days}日で警告` : '' %></span>
+            <% } else if (st.default_staff_name) { %>
+              <span class="dot" style="background:<%= st.default_staff_color || '#94a3b8' %>"></span>
+              <span><%= st.default_staff_name %></span>
+              <% if (st.member_count > 1) { %><span class="mini">他<%= st.member_count - 1 %>人</span><% } %>
+            <% } else if (st.member_count > 0) { %>
+              <span class="muted"><%= st.member_count %>人 (既定なし)</span>
+            <% } else { %>
+              <span class="warn-text">未割り当て</span>
+            <% } %>
+          </div>
+        </div>
+        <div class="flow-arrow">→</div>
+      <% }); %>
+      <div class="flow-step flow-done"><div class="flow-label" style="margin:0">✅ 完了</div></div>
+    </div>
+
+    <%# セット商品は単品と別の流れ (2026-09-04)。単品の「基本情報入力」「AI情報入力待ち」の代わりに
+        「構成決定」「NE登録」があり、「出品・展開」だけは単品と共用する %>
+    <div class="track-title">本流【セット商品】<span style="font-weight:400">— 単品から派生したセットはこちらの列で進みます</span></div>
+    <div class="flow">
+      <% overview.set.forEach(function (st, i) { %>
+        <div class="flow-step <%= st.role_code ? '' : 'system' %>">
+          <div class="flow-label"><%= st.label %><% if (st.track !== 'set') { %> <span class="mini">単品と共用</span><% } %></div>
           <div class="flow-role"><%= st.role_label || 'システム (担当者なし)' %></div>
           <div class="flow-staff">
             <% if (!st.role_code) { %>
@@ -306,7 +333,8 @@
                 <% if (isAdmin) { %><input type="text" class="s-label" value="<%= st.label %>" maxlength="40">
                 <% } else { %><%= st.label %><% } %>
               </td>
-              <td class="muted"><%= st.track === 'image' ? `画像 ${st.image_kind === 'detail' ? '詳細' : 'TOP'}` : '本流' %></td>
+              <td class="muted"><%= st.track === 'image' ? `画像 ${st.image_kind === 'detail' ? '詳細' : 'TOP'}`
+                : (st.track === 'set' ? 'セット' : '本流') %></td>
               <td>
                 <% if (isAdmin) { %>
                   <select class="s-role">
@@ -341,7 +369,8 @@
         <div style="display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap;">
           <input type="text" id="new-step-label" placeholder="新しい工程名" style="max-width:220px;" maxlength="40">
           <select id="new-step-track" style="width:auto;">
-            <option value="main">本流</option>
+            <option value="main">本流 (単品)</option>
+            <option value="set">セット商品</option>
             <option value="image:detail">画像トラック (商品詳細画像)</option>
           </select>
           <select id="new-step-role" style="width:auto;">

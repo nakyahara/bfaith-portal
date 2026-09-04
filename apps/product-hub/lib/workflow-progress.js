@@ -15,10 +15,14 @@
  *     claim/lease と一覧タブが status を引き続き参照するため (実体化された導出値)
  */
 import { getDB, logEvent, gateReasons, imageTrackV2At, MATERIAL_STATUS_LABELS, GENERATION_BLOCK_CODES, CHECKING_REASON_LABELS } from '../db.js';
-import { describeSetDecision, SET_DECISIONS_CLOSING } from './set-decision.js';
+import { describeSetDecision, SET_DECISIONS_CLOSING, SET_NE_STEP_CODE } from './set-decision.js';
 
-/** セット展開判断の工程コード (判断を記録してからでないと決着できない) */
+/** セット展開判断の工程コード (判断を記録してからでないと決着できない)。単品側の工程 */
 const SET_REVIEW_STEP = 'set_review';
+/** セット側の「NE登録」。本コードが確定したら自動で done になる工程 (人は押さない) */
+const SET_NE_STEP = SET_NE_STEP_CODE;
+/** セット企画者が担当に関わらず動かせる工程 (出品準備 = 承認は含めない。§4.1 の回答どおり) */
+const SET_PLANNER_STEPS = ['set_compose', SET_NE_STEP, 'set_content'];
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
 import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 
@@ -65,15 +69,20 @@ export const ESCAPE_STATUSES = ['on_hold', 'excluded'];
  */
 export function deriveDraftStatus(db, draftId) {
   const id = Number(draftId);
+  // 本流の関門を順に見て、最初に決着していないものの status を返す。
+  // セットは工程テンプレートが違うので**見る工程コードも違う** (2026-09-04 §4.1)。
+  // status の語彙は増やさない — ボードのフィルタや既存表示が status を使っているため
+  const gates = stepTracksFor(db, id).isSet
+    ? [['set_compose', 'draft'], ['set_ne_register', 'ready_for_ai'], ['set_content', 'review'], ['set_prep', 'review']]
+    : [['basic_info', 'draft'], ['ai_generate', 'ready_for_ai'], ['desc_review', 'review'], ['title_approve', 'review']];
+  const codes = [...gates.map(([code]) => code), LISTING_STEP];
   const rows = db.prepare(`
     SELECT step_code, state FROM draft_step_progress
-    WHERE draft_id = ? AND step_code IN ('basic_info', 'ai_generate', 'desc_review', 'title_approve', 'listing')
-  `).all(id);
+    WHERE draft_id = ? AND step_code IN (${codes.map(() => '?').join(', ')})
+  `).all(id, ...codes);
   const settled = new Set(rows.filter((r) => r.state === 'done' || r.state === 'skip').map((r) => r.step_code));
-  if (!settled.has('basic_info')) return 'draft';
-  if (!settled.has('ai_generate')) return 'ready_for_ai';
-  if (!settled.has('desc_review') || !settled.has('title_approve')) return 'review';
-  if (settled.has('listing')) return 'expanded';
+  for (const [code, status] of gates) if (!settled.has(code)) return status;
+  if (settled.has(LISTING_STEP)) return 'expanded';
   const rakuten = db.prepare(`
     SELECT 1 FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten' AND state = 'done'
   `).get(id) || db.prepare(`
@@ -248,17 +257,52 @@ function isRealDate(s) {
  *     「自分が担当する + 状態変更」を 1 回の更新で許す (version 1 増・イベント 1 件)。
  *     admin 以外がボードで列を跨ぐたびに詳細画面で引き受けを押す手間をなくす
  */
+/**
+ * セット工程を担当に関わらず動かせる人か (= セット企画者)。
+ * router 側の「NE 本コードの差し替え」もこの判定を使う — 工程は動かせるのに
+ * 差し替えだけ 403、という食い違いを作らないため (2026-09-04 Codex R2)
+ */
+export function canOperateSetStep(db, staffId) {
+  return hasRole(db, staffId, 'set_planner');
+}
+
+/** そのスタッフがその役割を持つか (無効にされた人・役割は「持たない」扱い) */
+function hasRole(db, staffId, roleCode) {
+  if (staffId == null) return false;
+  return !!db.prepare(`
+    SELECT 1 FROM ph_staff_roles sr
+    JOIN ph_staff s ON s.id = sr.staff_id AND s.active = 1
+    JOIN ph_roles r ON r.code = sr.role_code AND r.active = 1
+    WHERE sr.staff_id = ? AND sr.role_code = ?
+  `).get(Number(staffId), roleCode);
+}
+
+/** 本人扱いで通す範囲 (「対象外」は admin だけ・他人への付け替えも admin だけ) */
+function assertOwnerScope(patch, actorStaffId) {
+  if (patch?.state === 'skip') throw forbidden('「対象外」にできるのは管理者だけです');
+  if (patch?.assignee_id !== undefined) {
+    const to = patch.assignee_id === '' || patch.assignee_id == null ? null : Number(patch.assignee_id);
+    // 自分の担当を外す (未割り当てに戻す) のは可。他人への付け替えは admin の操作
+    if (to !== null && to !== actorStaffId) throw forbidden('担当者を他の人に変更できるのは管理者だけです');
+  }
+}
+
 function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false }) {
   if (isAdmin) return;
 
   // 自分の担当工程
   if (row.assignee_id != null && row.assignee_id === actorStaffId) {
-    if (patch?.state === 'skip') throw forbidden('「対象外」にできるのは管理者だけです');
-    if (patch?.assignee_id !== undefined) {
-      const to = patch.assignee_id === '' || patch.assignee_id == null ? null : Number(patch.assignee_id);
-      // 自分の担当を外す (未割り当てに戻す) のは可。他人への付け替えは admin の操作
-      if (to !== null && to !== actorStaffId) throw forbidden('担当者を他の人に変更できるのは管理者だけです');
-    }
+    assertOwnerScope(patch, actorStaffId);
+    return;
+  }
+
+  // 🚨 セット企画者は「構成決定 / NE登録 / 商品情報作成・確認」を担当に関わらず操作できる
+  // (中原さん 2026-09-04:「セット企画者が NE登録・商品情報も編集できるようにして」)。
+  // 1人が構成を決めて NE 登録を依頼し、説明文まで通しで面倒を見るため。
+  // **出品準備 (承認) は含めない** — 単品の「タイトル確認」と同じく承認者の工程で、
+  // ここまで通すと企画者が自分の企画を自分で承認できてしまう。単品 (track='main') にも効かせない
+  if (SET_PLANNER_STEPS.includes(row.step_code) && hasRole(db, actorStaffId, 'set_planner')) {
+    assertOwnerScope(patch, actorStaffId);
     return;
   }
 
@@ -302,12 +346,37 @@ function defaultAssigneeByRole(db) {
 }
 
 /**
+ * その商品が持つ工程トラック (2026-09-04 要件定義 §4.1)。
+ *
+ * セット商品は単品の「基本情報入力」「AI情報入力待ち」が実質不要で、代わりに単品には無い
+ * 「NE登録」の待ちがある。同じ6列に押し込むと列の意味が壊れるので、専用のテンプレートを持つ。
+ * 🚨 セットかどうかの判定は **parent_draft_id ただ1つ** (種別列を別に持たない)。
+ * 画像トラックはどちらにも付く。「出品・展開」(listing) は track='main' だが**両方が使う**ため、
+ * セットでも main の listing だけは持たせる (モール別状態・出品ゲートが listing に紐づいている)
+ */
+export function stepTracksFor(db, draftId) {
+  const row = db.prepare('SELECT parent_draft_id FROM product_drafts WHERE id = ?').get(Number(draftId));
+  return row?.parent_draft_id != null
+    ? { isSet: true, tracks: ['set', 'image'] }
+    : { isSet: false, tracks: ['main', 'image'] };
+}
+
+/** そのドラフトが持つべき工程か (セットは set+image+listing / 単品は main+image) */
+function stepAppliesTo(step, isSet) {
+  if (step.track === 'image') return true;
+  if (isSet) return step.track === 'set' || step.code === LISTING_STEP;
+  return step.track === 'main';
+}
+
+/**
  * 工程行の自己修復生成。足りない工程だけ INSERT する (既存行は触らない)。
  * @returns {number} 追加した行数
  */
 export function ensureProgress(db, draftId) {
   const id = Number(draftId);
-  const steps = db.prepare('SELECT code, track, image_kind, role_code, sort FROM ph_steps WHERE active = 1 ORDER BY track, sort').all();
+  const { isSet } = stepTracksFor(db, id);
+  const steps = db.prepare('SELECT code, track, image_kind, role_code, sort FROM ph_steps WHERE active = 1 ORDER BY track, sort')
+    .all().filter((st) => stepAppliesTo(st, isSet));
   if (steps.length === 0) return 0;
   const existing = new Set(
     db.prepare('SELECT step_code FROM draft_step_progress WHERE draft_id = ?').all(id).map((r) => r.step_code)
@@ -408,18 +477,25 @@ export function ensureProgress(db, draftId) {
 export function ensureProgressForMany(db, draftIds) {
   const ids = (Array.isArray(draftIds) ? draftIds : []).map(Number).filter(Number.isInteger);
   if (ids.length === 0) return 0;
-  const stepCount = db.prepare('SELECT COUNT(*) AS c FROM ph_steps WHERE active = 1').get().c;
-  if (stepCount === 0) return 0;
+  const allSteps = db.prepare('SELECT code, track FROM ph_steps WHERE active = 1').all();
+  if (allSteps.length === 0) return 0;
+  // 期待件数は**セットと単品で違う** (セットは main を持たず set + listing を持つ)。
+  // 全工程数と比べると、セットは常に「足りない」と判定されて毎回 ensureProgress が空打ちされる
+  const expectedFor = (isSet) => allSteps.filter((st) => stepAppliesTo(st, isSet)).length;
+  const expectedSingle = expectedFor(false);
+  const expectedSet = expectedFor(true);
   const placeholders = ids.map(() => '?').join(',');
-  const have = new Map(db.prepare(`
-    SELECT p.draft_id, COUNT(*) AS c
-    FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
-    WHERE p.draft_id IN (${placeholders}) GROUP BY p.draft_id
-  `).all(...ids).map((r) => [r.draft_id, r.c]));
+  const rows = db.prepare(`
+    SELECT d.id, d.parent_draft_id,
+      (SELECT COUNT(*) FROM draft_step_progress p
+        JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+        WHERE p.draft_id = d.id) AS c
+    FROM product_drafts d WHERE d.id IN (${placeholders})
+  `).all(...ids);
   let fixed = 0;
-  for (const id of ids) {
-    if ((have.get(id) || 0) >= stepCount) continue;
-    if (ensureProgress(db, id) > 0) fixed++;
+  for (const r of rows) {
+    if (r.c >= (r.parent_draft_id != null ? expectedSet : expectedSingle)) continue;
+    if (ensureProgress(db, r.id) > 0) fixed++;
   }
   return fixed;
 }
@@ -556,7 +632,9 @@ export function progressOf(draftId, { db = null } = {}) {
     ORDER BY s.track = 'image', s.sort, s.code
   `).all(id);
 
-  const main = rows.filter((r) => r.track === 'main');
+  // 「本流」= 単品なら main、セットなら set (+ 共用の listing)。
+  // セットは専用のテンプレートを持つので、ここで振り分けないと工程が空に見える (2026-09-04)
+  const main = rows.filter((r) => r.track === 'main' || r.track === 'set');
   const image = rows.filter((r) => r.track === 'image');
   const kinds = splitImageRows(image);
   const detailExcluded = draft?.detail_images_excluded === 1;
@@ -730,9 +808,19 @@ export function setStepState(
   if (patch?.state === 'skip' && row.skippable === 0 && row.track === 'image') {
     throw badRequest(`「${row.label}」は対象外にできません`);
   }
-  // 「セット展開判断」は**判断を記録してから**でないと決着できない (2026-09-04 §4.2)。
-  // 🚨 ここに置くのは、ボードの D&D (moveBoardCard) も詳細画面もこの関数を通るため。
-  // ルーター側だけに置くと、⑤から次の列へドラッグしただけで判断なしに閉じられる (Codex R1 high)
+  // 🚨 工程を閉じる条件はここに置く。ボードの D&D (moveBoardCard) も詳細画面もこの関数を通るので、
+  // ルーター側だけに置くと、列へドラッグしただけで条件を素通りできる (Codex R1 high)。
+  //
+  // NE登録は「本コードが確定したら自動で done」の工程 (§4.1)。仮コードのまま閉じると、
+  // 商品情報・出品準備が仮コードの商品で進んでしまう。D&D だけでなく**全部の経路**で止める
+  // (詳細画面の工程パネル・API 直叩き。admin も同じ — 権限ではなくデータの筋の話)
+  if (code === SET_NE_STEP && (patch?.state === 'done' || patch?.state === 'skip')) {
+    const d = db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(id);
+    if (d?.provisional_code === 1) {
+      throw badRequest('NE 本コードの確認待ちです。NE に登録され本コードが確定すると自動で完了します');
+    }
+  }
+  // 「セット展開判断」は**判断を記録してから**でないと決着できない (2026-09-04 §4.2)
   if (code === SET_REVIEW_STEP && (patch?.state === 'done' || patch?.state === 'skip')) {
     const last = db.prepare(`
       SELECT decision FROM draft_set_decisions WHERE draft_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1
@@ -922,7 +1010,7 @@ export function setStepState(
     if (event) logEvent(db, id, 'step_changed', boardClaim ? `${event} (ボードD&D: 自動引き受け)` : event, actor);
     // 本流工程の状態が動いたら status を導出し直す (同一トランザクション = 食い違いを残さない)
     let draftStatus = null;
-    if (stateChanged && row.track === 'main') {
+    if (stateChanged && (row.track === 'main' || row.track === 'set')) {
       draftStatus = recomputeDraftStatus(db, id, { actor }).status;
     }
     // 2026-08-31: TOP画像の 4 工程を廃止したので、⑤⑥-2 からの自動追随も無くした。
@@ -974,10 +1062,18 @@ export function moveBoardCard(
       : db.prepare(`
           SELECT p.step_code, p.state, NULL AS image_stage FROM draft_step_progress p
           JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
-          WHERE p.draft_id = ? AND s.track = 'main'
+          ${/* 本流はドラフトによって main か set のどちらか (セットは専用テンプレート・
+                2026-09-04)。片方に決め打つと、セットは listing だけの 1 行になって動かせない */''}
+          WHERE p.draft_id = ? AND s.track IN ('main', 'set')
           ORDER BY s.sort, s.code
         `).all(id);
     if (rows.length === 0) throw badRequest('工程が見つかりません');
+    // 全体ビューのセットカードは**投影された列**に載っている (§4.6)。落とし先も本流の列コードで
+    // 来るので、セット工程へ戻してから動かす。セットビューからの移動は既にセット工程コードなので素通り
+    if (view !== 'image' && to && to !== BOARD_DONE_COL && !rows.some((r) => r.step_code === to)) {
+      const back = SET_STEP_PROJECTION_BACK[to];
+      if (back && rows.some((r) => r.step_code === back)) to = back;
+    }
     const rawIdx = rows.findIndex((r) => r.state !== 'done' && r.state !== 'skip');
     const currentCode = rawIdx === -1 ? null : rows[rawIdx].step_code;
     if ((expectedCurrent || null) !== currentCode) {
@@ -1034,6 +1130,9 @@ export function moveBoardCard(
         { isAdmin, actorStaffId, boardClaim: claim });
     };
     if (tIdx > curIdx) {
+      // NE登録を飛び越せないことはここでは見ない。通過する工程は 1 つずつ setStepState を通り、
+      // そこで「仮コードのままでは閉じられない」が効く (同じ判断を 2 箇所に持つと、
+      // 本コードが確定したあとも D&D だけ 400 になる — Codex R2 medium)
       for (let i = curIdx; i < tIdx; i++) setWithClaim(rows[i].step_code, 'done');
       // 移動先 (= いまやる番) も未割り当てなら移動者に付ける (Codex R1: ドラッグ = 「自分が次工程を持っていく」の意思表示。
       // 付けないと次の操作でまた「自分が担当する」が要る)。完了列 (tIdx = rows.length) には移動先が無い
@@ -1078,6 +1177,9 @@ export function boardColumnKeys(db, view) {
   for (const r of rows) {
     if (view === 'image') {
       if (r.track === 'image') keys.add(r.image_stage || `code:${r.code}`);
+    } else if (view === 'set') {
+      // セットビューの列 = セット工程 + 単品と共用の「出品・展開」
+      if (r.track === 'set' || r.code === LISTING_STEP) keys.add(r.code);
     } else if (r.track === 'main') {
       keys.add(r.code);
     }
@@ -1103,10 +1205,11 @@ export function boardColumnKeys(db, view) {
  * @param {Array<{id: number, kind?: string}>} items 上から順のカード (画面に見えている分)
  */
 export function saveBoardOrder(db, { view, col, items }) {
-  if (view !== 'main' && view !== 'image') throw badRequest('ビューの指定が不正です');
+  if (!['main', 'all', 'single', 'set', 'image'].includes(view)) throw badRequest('ビューの指定が不正です');
+  const orderView = orderViewOf(view === 'all' ? 'main' : view);
   const colKey = String(col || '').trim();
   if (!colKey) throw badRequest('列が指定されていません');
-  if (!boardColumnKeys(db, view).has(colKey)) throw badRequest(`列 ${colKey} は存在しません`);
+  if (!boardColumnKeys(db, view === 'all' ? 'main' : view).has(colKey)) throw badRequest(`列 ${colKey} は存在しません`);
 
   const seen = new Set();
   const sent = [];
@@ -1134,7 +1237,7 @@ export function saveBoardOrder(db, { view, col, items }) {
   return db.transaction(() => {
     const existing = db.prepare(`
       SELECT draft_id, kind FROM ph_board_order WHERE view = ? AND col = ? ORDER BY sort, draft_id, kind
-    `).all(view, colKey).map((r) => ({ id: r.draft_id, kind: r.kind || '', key: `${r.draft_id}|${r.kind || ''}` }));
+    `).all(orderView, colKey).map((r) => ({ id: r.draft_id, kind: r.kind || '', key: `${r.draft_id}|${r.kind || ''}` }));
     const existingKeys = new Set(existing.map((x) => x.key));
     const sentKeys = new Set(sent.map((x) => x.key));
 
@@ -1155,7 +1258,7 @@ export function saveBoardOrder(db, { view, col, items }) {
       ON CONFLICT (view, draft_id, kind) DO UPDATE SET
         col = excluded.col, sort = excluded.sort, updated_at = excluded.updated_at
     `);
-    merged.forEach((x, n) => up.run(view, x.id, x.kind, colKey, n));
+    merged.forEach((x, n) => up.run(orderView, x.id, x.kind, colKey, n));
     return { saved: sent.length, ordered: merged.length };
   })();
 }
@@ -1176,7 +1279,40 @@ export function saveBoardOrder(db, { view, col, items }) {
  * @param {boolean} opts.checkingOnly 「確認中」のカードだけ (2026-08-31: 情報待ちの商品を拾う)
  * @returns {{view: string, columns: Array, doneCards: Array, doneTotal: number, total: number, truncated: boolean, checkingTotal: number}}
  */
+/**
+ * セット工程 → 全体ビューの本流列への投影 (2026-09-04 §4.6)。
+ * 全体ビューはセットも単品と同じ 6 列に並べたいので、セット工程を本流の列に写す。
+ * **カードには本当の工程名を出す** (投影であることを隠さない)。D&D はこの逆写像で戻す。
+ * `listing` は単品と共用なので写像に入れない (そのままの列に載る)。
+ */
+export const SET_STEP_PROJECTION = {
+  set_compose: 'basic_info',
+  set_ne_register: 'basic_info',
+  set_content: 'desc_review',
+  set_prep: 'title_approve',
+};
+
+/** 投影の逆写像 (全体ビューでセットカードを落とした列 → 本当のセット工程) */
+const SET_STEP_PROJECTION_BACK = Object.fromEntries(
+  // 1つの列に 2 工程が写るところ (基本情報入力 ← 構成決定 / NE登録) は**先頭の工程**に戻す。
+  // 前へ動かすときは通過する工程を順に done にするので、先頭に戻せば意味が変わらない
+  Object.entries(SET_STEP_PROJECTION).reverse().map(([setCode, mainCode]) => [mainCode, setCode]),
+);
+
+/**
+ * 並び順 (`ph_board_order`) を保存するキーとしての view (2026-09-04)。
+ * `single` は全体と**同じ列**なので並び順も共有する (分けると単品ビューで並べ替えた順が
+ * 全体ビューで元に戻る)。`set` は列そのものが違うので独立させる。
+ */
+function orderViewOf(view) {
+  if (view === 'image') return 'image';
+  if (view === 'set') return 'set';
+  return 'main';
+}
+
 export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, checkingOnly = false, imageKind = null, limit = 800, mallSummary = null } = {}) {
+  // 要件定義の呼び名は all だが、既存の URL・保存済みの並び順は view='main'。別名として受ける
+  if (view === 'all') view = 'main';
   const steps = db.prepare(`
     SELECT code, label, track, image_kind, image_stage, sort, role_code, stall_days FROM ph_steps
     WHERE active = 1 ORDER BY track = 'image', sort, code
@@ -1275,6 +1411,10 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     ${candidateSql}
     ${checkingOnly ? 'AND d.checking_since IS NOT NULL' : ''}
     ${view === 'image' ? 'AND d.detail_images_excluded = 0' : ''}
+    ${/* セット / 単品ビュー (2026-09-04 §5.1)。JS 側で捨てると LIMIT を食い潰して
+          対象の商品がボードから欠ける — 絞り込みは必ず LIMIT の前に置く */''}
+    ${view === 'set' ? 'AND d.parent_draft_id IS NOT NULL' : ''}
+    ${view === 'single' ? 'AND d.parent_draft_id IS NULL' : ''}
     ORDER BY d.updated_at DESC
     LIMIT ?
   `).all(...candidateParams, limit + 1);
@@ -1302,6 +1442,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       byStage.get(key).stepCodes.push(s.code);
     }
     columns = [...byStage.values()].sort((a, b) => a.sort - b.sort || String(a.key).localeCompare(String(b.key)));
+  } else if (view === 'set') {
+    // セットビューはセット工程の列。listing は単品と共用の工程なので、そのまま末尾に付く
+    columns = steps.filter((s) => s.track === 'set' || s.code === LISTING_STEP).map((s) => ({ ...s, cards: [] }));
   } else {
     columns = steps.filter((s) => s.track === 'main').map((s) => ({ ...s, cards: [] }));
   }
@@ -1451,14 +1594,20 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       const imageUnassigned = activeKindCurrents.some((c) => c.role_code && c.assignee_id == null);
       if (!mainUnassigned && !imageUnassigned) continue;
     }
-    if (p.current) colByStep.get(p.current.step_code)?.cards.push(baseCard);
-    else doneCards.push(baseCard);
+    if (p.current) {
+      // 全体ビューではセット工程を本流の列に**投影して**置く (§4.6)。
+      // セットビューは投影しない (セット工程そのものが列になっているため)
+      const colCode = view === 'main' && d.parent_draft_id != null
+        ? (SET_STEP_PROJECTION[p.current.step_code] || p.current.step_code)
+        : p.current.step_code;
+      colByStep.get(colCode)?.cards.push(baseCard);
+    } else doneCards.push(baseCard);
     cardsById.set(d.id, baseCard);
   }
 
   // 「出品・展開」のカードはモールの進み具合が要る (どこまで並んだかが本体なので)。
   // 循環 import を避けるため、呼び出し側から渡された関数で解決する
-  if (view === 'main' && mallSummary && cardsById.size > 0) {
+  if (view !== 'image' && mallSummary && cardsById.size > 0) {
     const malls = mallSummary(db, [...cardsById.keys()]);
     for (const [id, card] of cardsById) card.malls = malls.get(id) || null;
   }
@@ -1467,7 +1616,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // 手で並べ替えたカードはその順を優先する (2026-08-28 中原さん要望)。
   // 手動順は「その列に置いたもの」だけ効かせる — 工程が変わって別の列に出たカードは
   // 既定順に戻す (別の列で付けた番号を持ち込むと、置いた覚えのない位置に割り込む)
-  const manual = loadBoardOrder(db, view, drafts.map((d) => d.id));
+  const manual = loadBoardOrder(db, orderViewOf(view), drafts.map((d) => d.id));
   // 手動順の後片付け (Codex R2 中)。詳細画面から工程を進めた場合など、D&D を通らずに列が
   // 変わったカードは「前の列に置いた記録」が残る。表示には効かないが行が溜まり、あとで
   // その列を並べ替えたとき見えないカードとして差し込み位置を押し下げる。
@@ -1577,7 +1726,9 @@ export function progressSummaryFor(db, draftIds) {
   }
   for (const id of ids) {
     const all = byDraft.get(id) || [];
-    const main = all.filter((r) => r.track === 'main');
+    // 「本流」= 単品なら main、セットなら set (+ 共用の listing)。progressOf と同じ区分に揃える —
+    // ここで main だけを見ると、セットのカードは listing しか無い扱いになって列がズレる
+    const main = all.filter((r) => r.track === 'main' || r.track === 'set');
     const image = all.filter((r) => r.track === 'image');
     const kinds = splitImageRows(image);
     const detailExcluded = all[0]?.detail_images_excluded === 1;

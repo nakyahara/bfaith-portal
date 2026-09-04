@@ -6,6 +6,7 @@
  */
 import path from 'path';
 import fs from 'fs';
+import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import ejs from 'ejs';
 
@@ -2700,8 +2701,12 @@ const wf = await import('../lib/workflow.js');
   // 「担当者が 1 人もいない工程」の検知 (画面の警告バナー)
   const ov = wf.workflowOverview();
   check('担当者0人の役割を検知する', ov.unassignedRoles.some((u) => u.role === '商品承認者'), JSON.stringify(ov.unassignedRoles));
-  check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 10,
-    `main=${ov.main.length} image=${ov.image.length}`);
+  check('overview は本流・セット・画像に分かれる', ov.main.length === 6 && ov.image.length === 10 && ov.set.length === 5,
+    `main=${ov.main.length} set=${ov.set.length} image=${ov.image.length}`);
+  check('overview: セットの流れは構成決定から始まり、出品・展開は単品と共用',
+    ov.set[0].code === 'set_compose' && ov.set[ov.set.length - 1].code === 'listing',
+    ov.set.map((s) => s.code).join(','));
+  check('overview: 単品の流れにセット工程を混ぜない', !ov.main.some((s) => s.track === 'set'));
 }
 
 // ─── ワークフロー: 商品 × 工程の進捗 (2026-08-23) ───
@@ -3212,7 +3217,12 @@ let wfSetParentId = null;
 
   // 工程の開始位置
   const sp = wfp.progressOf(r.draftId, { db });
-  check('AIモードは AI情報入力待ち から', sp.current?.step_code === 'ai_generate');
+  // セットはセット専用の工程を持つ (2026-09-04)。単品の基本情報・AI待ちは無く、構成決定から始まる
+  check('セットはセット工程の「構成決定」から始まる (単品の①②は持たない)',
+    sp.current?.step_code === 'set_compose'
+    && sp.main.every((x) => x.step_code === 'set_compose' || x.step_code === 'set_ne_register'
+      || x.step_code === 'set_content' || x.step_code === 'set_prep' || x.step_code === 'listing'),
+    JSON.stringify(sp.main.map((x) => x.step_code)));
   check('セットの画像トラックは未着手', sp.image.every((s) => s.state === 'todo'));
   check('構成が保存される',
     db.prepare('SELECT qty FROM draft_set_members WHERE set_draft_id = ?').get(r.draftId).qty === 2);
@@ -3226,7 +3236,9 @@ let wfSetParentId = null;
   check('2件目は連番になる', r2.neCode === 'SET-WF-SET-P-02', r2.neCode);
   check('copyモードは説明文をコピーする',
     db.prepare('SELECT content FROM draft_ai_outputs WHERE draft_id = ? AND kind = ?').get(r2.draftId, 'rakuten_title')?.content === '単品のタイトル');
-  check('copyモードは 商品説明確認 から', wfp.progressOf(r2.draftId, { db }).current?.step_code === 'desc_review');
+  // モードの違いは**説明文の初期値だけ**。どちらも工程は「構成決定」から始まる
+  check('copyモードでも工程は 構成決定 から (違いは説明文を引き継ぐかどうか)',
+    wfp.progressOf(r2.draftId, { db }).current?.step_code === 'set_compose');
 
   // 検証
   let modeErr = null;
@@ -3283,6 +3295,27 @@ let wfSetParentId = null;
     VALUES (99401, 'WF-SET-REAL', 'セット商品 実コード', '1', '取扱中', '1', 'WF-SET-REAL', '2026-08-23T00:00:00Z')
   `).run();
   check('NEに現れたら自動で確定する', sd.reconcileProvisionalCode(db, { ...notInNe }) === true);
+  // 本コードが確定したら「NE登録」工程も閉じる。人は押せない工程なので、ここで閉じないと
+  // カードが NE登録の列に残り続ける (2026-09-04 §4.1 / Codex R3 medium)
+  check('本コードが確定したら NE登録の工程も自動で閉じる',
+    db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`)
+      .get(r.draftId)?.state === 'done',
+    db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`)
+      .get(r.draftId)?.state);
+  check('自動完了は 2 度目には何もしない (冪等)', sd.closeNeStepIfConfirmed(db, r.draftId) === false);
+  // 確定と工程完了が別々に落ちた場合の取り残しを、次に開いたときに直す (Codex R4 medium)
+  db.prepare(`UPDATE draft_step_progress SET state = 'todo', done_at = NULL, done_by = NULL
+    WHERE draft_id = ? AND step_code = 'set_ne_register'`).run(r.draftId);
+  sd.reconcileProvisionalCode(db, db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId));
+  check('確定済みなのに工程が取り残されていたら次に開いたときに直す',
+    db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`)
+      .get(r.draftId)?.state === 'done');
+  // 単品は NE登録工程を持たないが、移行の失敗などで行が残っても触らないこと
+  db.prepare(`INSERT INTO draft_step_progress (draft_id, step_code, state) VALUES (?, 'set_ne_register', 'todo')`).run(parentId);
+  check('自動完了は単品には効かない (行が残っていても閉じない)',
+    sd.closeNeStepIfConfirmed(db, parentId) === false
+    && db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`).get(parentId)?.state === 'todo');
+  db.prepare(`DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`).run(parentId);
   check('確定後は出品ゲートが開く',
     !(listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /商品コード/.test(x)));
   check('確定後は Notion カードも作れる',
@@ -3295,6 +3328,272 @@ let wfSetParentId = null;
   check('セットから親が引ける', info?.parent?.id === parentId);
   check('セットの構成が引ける', info.members[0].qty === 2);
   check('単品では setInfo が null', sd.setInfoOf(db, parentId) === null);
+}
+
+// ─── セット工程トラック (2026-09-04 §4.1/§4.6/§5.1) ───
+{
+  const parentId = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, status, created_by, price)
+    VALUES ('WF-TRK-P', 'トラック検証の単品', 'draft', 'smoke', 1000)
+  `).run().lastInsertRowid);
+  wfp.ensureProgress(db, parentId);
+  const setId = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code)
+    VALUES ('SET-WF-TRK-P-01', 'トラック検証のセット', 'draft', 'smoke', ?, 1)
+  `).run(parentId).lastInsertRowid);
+  const codesOf = (id) => db.prepare(`
+    SELECT p.step_code, s.track FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code
+    WHERE p.draft_id = ? ORDER BY s.track, s.sort
+  `).all(id);
+
+  // ① 工程テンプレートの振り分け
+  wfp.ensureProgress(db, setId);
+  const setSteps = codesOf(setId);
+  check('セットは set + image の行だけを持つ',
+    setSteps.filter((r) => r.track === 'set').length === 4
+    && setSteps.filter((r) => r.track === 'main').length === 1     // listing は単品と共用
+    && setSteps.find((r) => r.track === 'main').step_code === 'listing'
+    && setSteps.some((r) => r.track === 'image'),
+    JSON.stringify(setSteps.map((r) => r.step_code)));
+  check('セットは単品の基本情報・AI待ち・セット展開判断を持たない',
+    !setSteps.some((r) => ['basic_info', 'ai_generate', 'desc_review', 'title_approve', 'set_review'].includes(r.step_code)));
+  check('単品はセット工程を持たない',
+    !codesOf(parentId).some((r) => r.track === 'set'));
+
+  // ② status の導出 (語彙は増やさず既存に写す)
+  const st = () => wfp.deriveDraftStatus(db, setId);
+  const doStep = (code, state) => db.prepare(
+    `UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?`).run(state, setId, code);
+  check('セット: 構成決定が未了なら draft', st() === 'draft', st());
+  doStep('set_compose', 'done');
+  check('セット: NE登録待ちは ready_for_ai', st() === 'ready_for_ai', st());
+  doStep('set_ne_register', 'done');
+  check('セット: 商品情報作成中は review', st() === 'review', st());
+  doStep('set_content', 'done');
+  check('セット: 出品準備が残っていれば review のまま', st() === 'review', st());
+  doStep('set_prep', 'done');
+  check('セット: 出品準備まで済めば approved', st() === 'approved', st());
+  doStep('listing', 'done');
+  check('セット: 出品・展開が閉じたら expanded', st() === 'expanded', st());
+  for (const c of ['set_compose', 'set_ne_register', 'set_content', 'set_prep', 'listing']) doStep(c, 'todo');
+
+  // ③ ボードのビュー
+  const boardOf = (view) => wfp.boardData(db, { view, mallSummary: ms.mallSummaryFor });
+  const bSet = boardOf('set');
+  check('view=set の列はセット工程 + 出品・展開',
+    bSet.columns.map((c) => c.code).join(',') === 'set_compose,set_ne_register,set_content,set_prep,listing',
+    bSet.columns.map((c) => c.code).join(','));
+  const idsIn = (b) => new Set(b.columns.flatMap((c) => c.cards.map((x) => x.id)).concat(b.doneCards.map((x) => x.id)));
+  check('view=set にはセットだけが出る', idsIn(bSet).has(setId) && !idsIn(bSet).has(parentId));
+  const bSingle = boardOf('single');
+  check('view=single にはセットが出ない', idsIn(bSingle).has(parentId) && !idsIn(bSingle).has(setId));
+  check('view=single の列は本流のまま', bSingle.columns.some((c) => c.code === 'basic_info'));
+  const bAll = boardOf('main');
+  check('view=all にはセットも単品も出る', idsIn(bAll).has(setId) && idsIn(bAll).has(parentId));
+  check('all は main の別名', boardOf('all').columns.length === bAll.columns.length);
+
+  // ④ 投影 (§4.6): セット工程は本流の列に写るが、カードは本当の工程名を持つ
+  const colOfSet = bAll.columns.find((c) => c.cards.some((x) => x.id === setId));
+  check('全体ビュー: 構成決定のセットは「基本情報入力」の列に投影される',
+    colOfSet?.code === 'basic_info', colOfSet?.code);
+  check('全体ビュー: カードは本当のセット工程を持つ (列名と違うことを隠さない)',
+    colOfSet.cards.find((x) => x.id === setId)?.current?.step_code === 'set_compose');
+  doStep('set_compose', 'done'); doStep('set_ne_register', 'done');
+  const colContent = boardOf('main').columns.find((c) => c.cards.some((x) => x.id === setId));
+  check('全体ビュー: 商品情報作成は「商品説明確認」の列に投影される',
+    colContent?.code === 'desc_review', colContent?.code);
+  for (const c of ['set_compose', 'set_ne_register']) doStep(c, 'todo');
+
+  // ⑤ D&D (§4.6): 全体ビューで本流の列に落としても、動くのは本当のセット工程
+  const ADMIN2 = { isAdmin: true, actorStaffId: null };
+  let neSkip = null;
+  try {
+    wfp.moveBoardCard(setId, { view: 'main', to: 'desc_review', expectedCurrent: 'set_compose' }, 'smoke', ADMIN2);
+  } catch (e) { neSkip = e; }
+  check('D&D: NE登録は飛び越せない', neSkip?.status === 400 && /NE 本コード/.test(neSkip.message), neSkip?.message);
+  // 逆に、本コードが確定していれば D&D でも通れる。止める理由は「仮コード」であって工程ではない
+  // (D&D 側にも別の判断を置くと、確定後もボードだけ 400 になる — Codex R2 medium)
+  db.prepare('UPDATE product_drafts SET provisional_code = 0 WHERE id = ?').run(setId);
+  wfp.moveBoardCard(setId, { view: 'main', to: 'desc_review', expectedCurrent: 'set_compose' }, 'smoke', ADMIN2);
+  check('D&D: 本コードが確定していれば NE登録を通過して先へ進める',
+    wfp.progressOf(setId, { db }).current?.step_code === 'set_content',
+    wfp.progressOf(setId, { db }).current?.step_code);
+  for (const c of ['set_compose', 'set_ne_register', 'set_content']) doStep(c, 'todo');
+  db.prepare('UPDATE product_drafts SET provisional_code = 1 WHERE id = ?').run(setId);
+  // 構成決定と NE登録は同じ列 (基本情報入力) に写るので、その列に落としても動かない
+  const noMove = wfp.moveBoardCard(setId, { view: 'main', to: 'basic_info', expectedCurrent: 'set_compose' }, 'smoke', ADMIN2);
+  check('D&D: 同じ列に落としても工程は動かない', noMove.changed === false
+    && wfp.progressOf(setId, { db }).current?.step_code === 'set_compose');
+  // セットビューはセット工程コードそのままで動く
+  wfp.moveBoardCard(setId, { view: 'set', to: 'set_ne_register', expectedCurrent: 'set_compose' }, 'smoke', ADMIN2);
+  check('D&D: セットビューはセット工程コードで動く',
+    wfp.progressOf(setId, { db }).current?.step_code === 'set_ne_register');
+  // NE登録が済んでいれば、全体ビューの「商品説明確認」列に落として 商品情報作成 へ進める
+  doStep('set_ne_register', 'done');
+  wfp.moveBoardCard(setId, { view: 'main', to: 'desc_review', expectedCurrent: 'set_content' }, 'smoke', ADMIN2);
+  check('D&D: 全体ビューの列は本当のセット工程に写して動かす',
+    wfp.progressOf(setId, { db }).current?.step_code === 'set_content',
+    wfp.progressOf(setId, { db }).current?.step_code);
+  wfp.moveBoardCard(setId, { view: 'main', to: 'title_approve', expectedCurrent: 'set_content' }, 'smoke', ADMIN2);
+  check('D&D: 「タイトル確認」の列は 出品準備 に写る',
+    wfp.progressOf(setId, { db }).current?.step_code === 'set_prep',
+    wfp.progressOf(setId, { db }).current?.step_code);
+  wfp.moveBoardCard(setId, { view: 'main', to: 'basic_info', expectedCurrent: 'set_prep' }, 'smoke', ADMIN2);
+  check('D&D: 差し戻しも投影先から本当の工程に戻る',
+    wfp.progressOf(setId, { db }).current?.step_code === 'set_compose',
+    wfp.progressOf(setId, { db }).current?.step_code);
+  // セットが持たない列 (AI情報入力待ち・セット展開判断) には落とせない
+  let noColErr = null;
+  try {
+    wfp.moveBoardCard(setId, { view: 'main', to: 'ai_generate', expectedCurrent: 'set_compose' }, 'smoke', ADMIN2);
+  } catch (e) { noColErr = e; }
+  check('D&D: セットが持たない列には落とせない', noColErr?.status === 400, noColErr?.message || '通ってしまった');
+
+  // ⑥ 権限 (§4.1): セット企画者はセット工程の全部を操作できる。単品には効かない
+  const plannerId = Number(db.prepare(
+    `INSERT INTO ph_staff (name, active) VALUES ('セット企画 太郎', 1)`).run().lastInsertRowid);
+  db.prepare(`INSERT INTO ph_staff_roles (staff_id, role_code) VALUES (?, 'set_planner')`).run(plannerId);
+  const asPlanner = { isAdmin: false, actorStaffId: plannerId };
+  // 担当ロールが registrar の工程 (NE登録・商品情報) も、担当者未割り当てのまま動かせる
+  db.prepare(`UPDATE draft_step_progress SET assignee_id = NULL WHERE draft_id = ?`).run(setId);
+  wfp.setStepState(setId, 'set_compose', { state: 'done' }, 'planner', asPlanner);
+  let contentErr = null;
+  try { wfp.setStepState(setId, 'set_content', { state: 'done' }, 'planner', asPlanner); } catch (e) { contentErr = e; }
+  check('セット企画者は担当ロールが別のセット工程も操作できる', contentErr === null, contentErr?.message);
+  let mainErr = null;
+  try { wfp.setStepState(parentId, 'basic_info', { state: 'done' }, 'planner', asPlanner); } catch (e) { mainErr = e; }
+  check('セット企画者でも単品の工程には効かない', mainErr?.status === 403, mainErr?.message || '通ってしまった');
+  let skipErr = null;
+  try { wfp.setStepState(setId, 'set_content', { state: 'skip' }, 'planner', asPlanner); } catch (e) { skipErr = e; }
+  check('セット企画者でも「対象外」は管理者だけ', skipErr?.status === 403, skipErr?.message || '通ってしまった');
+  // 出品準備 (承認) は承認者の工程。企画者が自分の企画を自分で承認できてしまわないこと (Codex R1 high)
+  let prepErr = null;
+  try { wfp.setStepState(setId, 'set_prep', { state: 'done' }, 'planner', asPlanner); } catch (e) { prepErr = e; }
+  check('セット企画者は出品準備 (承認) までは通せない', prepErr?.status === 403, prepErr?.message || '通ってしまった');
+  // 本コードの差し替え (router の /set-code) も同じ物差しを使う。ここが食い違うと
+  // 「工程は動かせるのに差し替えだけ 403」になる (Codex R2 high)
+  check('セット企画者かどうかの判定は 1 箇所 (router の本コード差し替えも同じ)',
+    wfp.canOperateSetStep(db, plannerId) === true && wfp.canOperateSetStep(db, null) === false);
+
+  // NE登録は仮コードのままでは閉じられない。D&D だけでなく工程 API も塞ぐ (Codex R1 high)
+  let neManual = null;
+  try { wfp.setStepState(setId, 'set_ne_register', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { neManual = e; }
+  check('NE登録: 仮コードのままでは管理者でも閉じられない',
+    neManual?.status === 400 && /本コード/.test(neManual.message), neManual?.message || '通ってしまった');
+  let neSkipManual = null;
+  try { wfp.setStepState(setId, 'set_ne_register', { state: 'skip' }, 'smoke', ADMIN2); } catch (e) { neSkipManual = e; }
+  check('NE登録: 「対象外」で迂回もできない', neSkipManual?.status === 400, neSkipManual?.message || '通ってしまった');
+  db.prepare('UPDATE product_drafts SET provisional_code = 0 WHERE id = ?').run(setId);
+  wfp.setStepState(setId, 'set_ne_register', { state: 'done' }, 'smoke', ADMIN2);
+  check('NE登録: 本コードが確定していれば閉じられる',
+    db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`)
+      .get(setId)?.state === 'done');
+  db.prepare('UPDATE product_drafts SET provisional_code = 1 WHERE id = ?').run(setId);
+
+  // ⑦ 既存セットの移行 (§4.1)。PR2 以前に作られたセットは本流の進捗を持っている
+  const legacyId = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code)
+    VALUES ('SET-WF-TRK-P-99', '移行検証の旧セット', 'draft', 'smoke', ?, 1)
+  `).run(parentId).lastInsertRowid);
+  db.prepare('DELETE FROM draft_step_progress WHERE draft_id = ?').run(legacyId);
+  const legacyIns = db.prepare(
+    'INSERT INTO draft_step_progress (draft_id, step_code, state, note) VALUES (?, ?, ?, ?)');
+  for (const [code, state] of [['basic_info', 'done'], ['ai_generate', 'done'], ['desc_review', 'done'],
+    ['title_approve', 'todo'], ['set_review', 'todo'], ['listing', 'todo']]) {
+    legacyIns.run(legacyId, code, state, code === 'desc_review' ? '説明文は確認済み' : null);
+  }
+  const moved = dbmod.migrateSetDraftsToSetTrack(db);
+  const after = Object.fromEntries(db.prepare(
+    'SELECT step_code, state FROM draft_step_progress WHERE draft_id = ?').all(legacyId).map((r) => [r.step_code, r.state]));
+  check('移行: 旧セットを1件写した', moved === 1, String(moved));
+  check('移行: 基本情報 + AI待ち → 構成決定 (done)', after.set_compose === 'done', JSON.stringify(after));
+  check('移行: 先に進んでいれば NE登録も done (仮コードでは進めないため)', after.set_ne_register === 'done');
+  check('移行: 商品説明確認 → 商品情報作成 (状態も引き継ぐ)', after.set_content === 'done');
+  check('移行: タイトル確認 → 出品準備 (todo のまま)', after.set_prep === 'todo');
+  check('移行: 出品・展開は単品と共用なので残す', after.listing === 'todo');
+  check('移行: 旧の本流工程は消す (列が二重に並ばないように)',
+    !['basic_info', 'ai_generate', 'desc_review', 'title_approve', 'set_review'].some((c) => after[c]),
+    JSON.stringify(after));
+  check('移行: note も引き継ぐ (作業の記録を捨てない)',
+    db.prepare(`SELECT note FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_content'`)
+      .get(legacyId)?.note === '説明文は確認済み');
+  check('移行: 何を写したか履歴に残る',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'set_steps_migrated'`).get(legacyId).c === 1);
+  check('移行: 2回目は何もしない (冪等)', dbmod.migrateSetDraftsToSetTrack(db) === 0);
+  check('移行: 単品には触らない',
+    codesOf(parentId).some((r) => r.step_code === 'basic_info') && !codesOf(parentId).some((r) => r.track === 'set'));
+
+  // 移行先が既にある場合 (先行デプロイ・自己修復で todo だけ作られた)。
+  // 決着している方を採らないと、進んでいた商品が未着手に巻き戻る (Codex R1 medium)
+  const halfId = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code)
+    VALUES ('SET-WF-TRK-P-98', '途中まで移行した旧セット', 'draft', 'smoke', ?, 1)
+  `).run(parentId).lastInsertRowid);
+  db.prepare('DELETE FROM draft_step_progress WHERE draft_id = ?').run(halfId);
+  for (const [code, state] of [['set_compose', 'todo'], ['set_content', 'todo'],
+    ['basic_info', 'done'], ['ai_generate', 'done'], ['desc_review', 'done'], ['listing', 'todo']]) {
+    legacyIns.run(halfId, code, state, null);
+  }
+  dbmod.migrateSetDraftsToSetTrack(db);
+  const half = Object.fromEntries(db.prepare(
+    'SELECT step_code, state FROM draft_step_progress WHERE draft_id = ?').all(halfId).map((r) => [r.step_code, r.state]));
+  check('移行: 既に todo で作られていた set 工程にも旧の done を写す (巻き戻さない)',
+    half.set_compose === 'done' && half.set_content === 'done', JSON.stringify(half));
+  check('移行: 途中まででも旧の本流工程は消える', !half.basic_info && !half.desc_review, JSON.stringify(half));
+
+  // 一度移行したあとに旧コードが動いて main 行が戻っても、次の起動で直る (Codex R1 medium)。
+  // イベントの有無で冪等を決めると、混ざったまま二度と直らない
+  legacyIns.run(legacyId, 'basic_info', 'todo', null);
+  check('移行: 移行済みでも旧行が残っていれば直す (自己修復)',
+    dbmod.migrateSetDraftsToSetTrack(db) === 1
+    && !db.prepare(`SELECT 1 FROM draft_step_progress WHERE draft_id = ? AND step_code = 'basic_info'`).get(legacyId));
+  check('移行: 直したあとは何もしない', dbmod.migrateSetDraftsToSetTrack(db) === 0);
+
+  // ⑧ 移行が**起動時に走る**こと。ここを呼び忘れると、本番に既にあるセットは旧工程のまま残り、
+  //    ボードで列が二重に並ぶ (関数を直接呼ぶテストだけでは呼び忘れに気づけない)。
+  //    初期化は 1 プロセス 1 回きり (initialized フラグ) なので、別プロセスで作った DB で確かめる
+  {
+    const bootDir = path.join(process.env.DATA_DIR, 'boot-migration');
+    fs.rmSync(bootDir, { recursive: true, force: true });
+    fs.mkdirSync(bootDir, { recursive: true });
+    const script = [
+      "process.env.DATA_DIR = process.argv[2];",
+      "const mm = await import('../../warehouse-mirror/db.js');",
+      "const m = await import('../db.js');",
+      "mm.initMirrorDB(); const db = m.initProductHubDB();",
+      // 旧形式 (本流工程を持つセット) を仕込む
+      "const pid = db.prepare(`INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('BOOT-P','親','draft','smoke')`).run().lastInsertRowid;",
+      "const sid = db.prepare(`INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code) VALUES ('BOOT-SET','セット','draft','smoke',?,1)`).run(pid).lastInsertRowid;",
+      "db.prepare('DELETE FROM draft_step_progress WHERE draft_id = ?').run(sid);",
+      "const ins = db.prepare('INSERT INTO draft_step_progress (draft_id, step_code, state) VALUES (?,?,?)');",
+      "for (const c of ['basic_info','ai_generate','desc_review','title_approve','set_review','listing']) ins.run(sid, c, 'done');",
+      "db.close();",
+      "console.log(JSON.stringify({ sid }));",
+    ].join('\n');
+    const boot = [
+      "process.env.DATA_DIR = process.argv[2];",
+      "const mm = await import('../../warehouse-mirror/db.js');",
+      "const m = await import('../db.js');",
+      "mm.initMirrorDB(); const db = m.initProductHubDB();",   // ← ここで移行が走るはず
+      "const rows = db.prepare(`SELECT p.step_code, s.track FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code WHERE p.draft_id = (SELECT id FROM product_drafts WHERE ne_code = 'BOOT-SET')`).all();",
+      "console.log(JSON.stringify(rows.map((r) => r.step_code + ':' + r.track)));",
+    ].join('\n');
+    const runNode = (src) => {
+      const f = path.join(bootDir, 'run.mjs');
+      // db.js を相対 import するので scripts/ に置く (import 元と同じ深さ)
+      const target = path.join(__dirname, `.boot-${Date.now()}.mjs`);
+      fs.writeFileSync(target, src);
+      try {
+        return execFileSync(process.execPath, [target, bootDir], { encoding: 'utf-8' })
+          .trim().split('\n').pop();
+      } finally { fs.rmSync(target, { force: true }); fs.rmSync(f, { force: true }); }
+    };
+    runNode(script);
+    const after = JSON.parse(runNode(boot));
+    check('移行: 起動時の初期化で走る (呼び忘れるとボードの列が二重に並ぶ)',
+      after.some((x) => x.startsWith('set_compose:set')) && after.includes('listing:main')
+      && !after.some((x) => x.startsWith('basic_info:')), JSON.stringify(after));
+  }
 }
 
 // ─── かんばんボード (2026-08-23) ───
@@ -5964,6 +6263,8 @@ renders.push(
             mk(95001, {
               ne_code: 'SET-silicateclay800-01', name: '有機 珪酸塩白土 800g 2個セット',
               isSet: true, setChildrenCount: 0, setDecision: null,
+              // 全体ビューは「基本情報入力」の列に投影して置くので、本当の工程名がカードに要る (§4.6)
+              current: { ...base.current, step_code: 'set_ne_register', label: 'NE登録' },
               set: { parentId: 900, parentNeCode: 'silicateclay800', members: 'silicateclay800 × 2',
                 provisional: true, neState: 'requested', neError: null, parentChanged: false },
             }),
@@ -6020,6 +6321,30 @@ renders.push(
             mk(90007, { malls: malls('todo'), rakutenRegisteredAt: '2026-09-01T00:00:00Z', rakutenLastError: null }),
           ],
         }),
+      },
+    };
+  })()],
+  // セット工程ビュー (2026-09-04 §5.1)。列がセット工程になり、投影のタグは出さない
+  ['board.ejs (セット工程ビュー)', 'board.ejs', (() => {
+    const base = boardBase.board.columns.flatMap((c) => c.cards)[0];
+    const card = {
+      ...base, id: 95101, ne_code: 'SET-silicateclay800-01', name: '有機 珪酸塩白土 800g 2個セット',
+      isSet: true, setChildrenCount: 0, setDecision: null,
+      current: { ...base.current, step_code: 'set_compose', label: '構成決定' },
+      set: { parentId: 900, parentNeCode: 'silicateclay800', members: 'silicateclay800 × 2',
+        provisional: true, neState: 'requested', neError: null, parentChanged: false },
+    };
+    return {
+      ...boardBase, boardView: 'set',
+      board: {
+        ...boardBase.board, view: 'set', doneCards: [], doneTotal: 0, total: 1,
+        columns: [
+          { code: 'set_compose', label: '構成決定', track: 'set', sort: 10, role_code: 'set_planner', stall_days: null, cards: [card] },
+          { code: 'set_ne_register', label: 'NE登録', track: 'set', sort: 20, role_code: 'registrar', stall_days: 3, cards: [] },
+          { code: 'set_content', label: '商品情報作成・確認', track: 'set', sort: 30, role_code: 'registrar', stall_days: null, cards: [] },
+          { code: 'set_prep', label: '出品準備', track: 'set', sort: 40, role_code: 'approver', stall_days: null, cards: [] },
+          { code: 'listing', label: '出品・展開', track: 'main', sort: 60, role_code: null, stall_days: null, cards: [] },
+        ],
       },
     };
   })()],
@@ -6477,6 +6802,24 @@ for (const [name, file, data] of renders) {
     hold.includes('判断: 保留') && hold.includes('売れ行きを見てから'), hold.slice(0, 300));
   check('⑤の判断: 「セットを作成」はカードに出さない (派生の件数で分かる)',
     !parent.includes('判断: セットを作成'));
+
+  // 全体ビューはセット工程を本流の列に投影して置くので、本当の工程名を必ず出す (§4.6)
+  check('セットカード: 全体ビューでは本当のセット工程名を出す (投影を隠さない)',
+    c1.includes('セット工程: NE登録'), c1.slice(0, 500));
+  check('セットカード: 単品には工程名のタグを付けない', !parent.includes('セット工程:'));
+
+  // セット工程ビューは列そのものがセット工程なので、投影の断り書きは要らない
+  const bhSet = renderedHtml.get('board.ejs (セット工程ビュー)') || '';
+  check('セット工程ビュー: 列がセット工程になる',
+    bhSet.includes('構成決定') && bhSet.includes('NE登録') && bhSet.includes('商品情報作成・確認')
+    && bhSet.includes('出品準備') && !bhSet.includes('基本情報入力'), bhSet.slice(0, 200));
+  check('セット工程ビュー: 列名と工程が同じなので投影のタグは出さない',
+    !bhSet.includes('セット工程: '));
+  check('セット工程ビュー: タブは自分が選ばれた状態になる',
+    /class="kb-tab on"[^>]*href="[^"]*view=set"/.test(bhSet)
+    || /href="[^"]*view=set"[^>]*class="kb-tab on"/.test(bhSet)
+    || bhSet.includes('view=set') && /kb-tab on[^<]*">🧩 セット工程/.test(bhSet),
+    (bhSet.match(/<a class="kb-tab[^>]*>[^<]*<\/a>/g) || []).join(' | '));
 }
 
 // ─── 詳細画面の RMS リンク (2026-09-04) ───────────────────────────────────

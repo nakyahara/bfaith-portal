@@ -39,12 +39,12 @@ import {
   progressOf, setStepState, progressSummaryFor, ensureProgress, ensureProgressForMany, boardData, STEP_STATE_LABELS,
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
   ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
-  moveBoardCard, saveBoardOrder, assertStepOperable,} from './lib/workflow-progress.js';
+  moveBoardCard, saveBoardOrder, assertStepOperable, canOperateSetStep,} from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
 } from './lib/mall-status.js';
 import {
-  createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode,
+  createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode, closeNeStepIfConfirmed,
   recordSetDecision, latestSetDecision, describeSetDecision,
   SET_DECISIONS_CLOSING, SET_DECISION_REASONS, NE_STATE_LABELS,
 } from './services/set-derive.js';
@@ -2377,7 +2377,10 @@ router.get('/board', (req, res) => {
   const unassignedOnly = filterParam === 'unassigned';
   // 確認中だけを見る (2026-08-31 スタッフ要望: 情報待ちのカードを一括で拾う)
   const checkingOnly = filterParam === 'checking';
-  const boardView = String(req.query.view || '') === 'image' ? 'image' : 'main';
+  // ビュー (2026-09-04 §5.1)。all は main の別名 (要件定義の呼び名)。
+  // 知らない値は全体に倒す — 壊れたブックマークで空の画面を見せない
+  const rawView = String(req.query.view || '');
+  const boardView = ['single', 'set', 'image'].includes(rawView) ? rawView : 'main';
   // 種別の絞り込み (TOP画像 / 商品詳細画像) は 2026-08-31 に廃止 (カードが 1 商品 1 枚になった)。
   // 古いブックマークの ?kind=top をそのまま効かせると、カードも列も空の画面になり、
   // 画面から外す手段も無い (チップを消したため) — 受け取らずに無視する
@@ -2692,12 +2695,16 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
   if (draft.provisional_code !== 1) {
     return res.status(400).json({ ok: false, error: 'この商品の商品コードは仮ではありません' });
   }
-  // 出品先を決める不可逆な操作なので、担当者本人か admin だけに許す (Codex R1 high)
+  // 出品先を決める不可逆な操作なので、担当者本人か admin だけに許す (Codex R1 high)。
+  // セット企画者はセットの NE登録工程を動かせる (§4.1) ので、本コードの入力もできないと
+  // 「工程は進められるが肝心の差し替えだけ 403」になる (Codex R2 high)
   const isAdmin = req.session?.role === 'admin';
   if (!isAdmin) {
     const me = staffByPortalEmail(req.session?.email);
     const cur = progressOf(draft.id, { db }).current;
-    if (!cur || cur.assignee_id == null || cur.assignee_id !== (me?.id ?? null)) {
+    const isOwner = cur && cur.assignee_id != null && cur.assignee_id === (me?.id ?? null);
+    const isSetPlanner = draft.parent_draft_id != null && canOperateSetStep(db, me?.id ?? null);
+    if (!isOwner && !isSetPlanner) {
       return res.status(403).json({ ok: false, error: '商品コードの差し替えは、いまの工程の担当者か管理者だけができます' });
     }
   }
@@ -2720,15 +2727,24 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
   // 曖昧なまま仮フラグを落とすと、誤ったコードで楽天に登録される
   const neKind = resolveVariationGroup(db, code, { withMembers: false }).kind;
   const inNe = neKind === 'single' || neKind === 'variation';
-  const info = db.prepare(`
-    UPDATE product_drafts SET ne_code = ?, provisional_code = ?,
-      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    WHERE id = ? AND provisional_code = 1 AND ne_code = ?
-  `).run(code, inNe ? 0 : 1, draft.id, draft.ne_code);
-  if (info.changes !== 1) {
+  // 差し替え・記録・工程完了は**ひとまとまり**にする。分けると「本コードは確定したのに
+  // NE登録の工程は未完了」が残り、以後 reconcileProvisionalCode も素通りする (Codex R4 medium)
+  const changed = db.transaction(() => {
+    const info = db.prepare(`
+      UPDATE product_drafts SET ne_code = ?, provisional_code = ?,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND provisional_code = 1 AND ne_code = ?
+    `).run(code, inNe ? 0 : 1, draft.id, draft.ne_code);
+    if (info.changes !== 1) return false;
+    logEvent(db, draft.id, 'set_code_fixed', `${draft.ne_code} → ${code}${inNe ? '' : ' (NE商品マスタに未確認)'}`, actorOf(req));
+    // 本コードが確定したら「NE登録」工程はここで閉じる (人が押せない工程なので、
+    // 閉じないとカードが NE登録の列に残り続ける)
+    if (inNe) closeNeStepIfConfirmed(db, draft.id, actorOf(req));
+    return true;
+  })();
+  if (!changed) {
     return res.status(409).json({ ok: false, error: '別の操作が先に商品コードを変更しました。画面を読み直してください' });
   }
-  logEvent(db, draft.id, 'set_code_fixed', `${draft.ne_code} → ${code}${inNe ? '' : ' (NE商品マスタに未確認)'}`, actorOf(req));
   res.json({ ok: true, neCode: code, inNe });
 });
 

@@ -456,7 +456,7 @@ export function createStep(input) {
   const label = trimOrNull(input?.label, MAX_LABEL_LEN);
   if (!label) throw badRequest('工程名を入力してください');
   const track = trimOrNull(input?.track) || 'main';
-  if (track !== 'main' && track !== 'image') throw badRequest('トラックの指定が不正です');
+  if (!['main', 'set', 'image'].includes(track)) throw badRequest('トラックの指定が不正です');
   // 画像トラックは TOP/詳細 で別々に進むので、どちらの工程かを必ず指定させる。
   // 未指定を許すとゲート・ボードの種別分けからこぼれる (fail-safe で TOP 扱いにはするが意図が残らない)
   let imageKind = null;
@@ -500,6 +500,8 @@ export function workflowOverview() {
   }
   return {
     main: steps.filter((s) => s.track === 'main'),
+    // セットは単品と別の流れ (2026-09-04)。「出品・展開」だけは単品と共用なので両方に出る
+    set: steps.filter((s) => s.track === 'set' || s.code === 'listing'),
     image: steps.filter((s) => s.track === 'image'),
     unassignedRoles,
   };
