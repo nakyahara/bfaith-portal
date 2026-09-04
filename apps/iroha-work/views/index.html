@@ -752,8 +752,11 @@ async function loadStateOnce() {
   if (curView === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
   renderLwSaveState();
   restoreWorker();
-  // 一覧・ボードから開いている詳細だけ描き直す (下見・履歴の詳細は state に無いので触らない)
-  if (curDetail && detailSrc === 'state') {
+  // 開いている詳細を追いかける。一覧・ボードのものは state から、下見・履歴のものは取り直す
+  //   (取込や他の端末の操作で中身が変わる。「いまのアプリの記録」と書いている以上、古いまま置かない — Codex PR1 R2)
+  if (curDetail && detailSrc === 'preview') {
+    openPreviewDetail(curDetail, { silent: true });
+  } else if (curDetail && detailSrc === 'state') {
     const c = findCard(curDetail);
     // 一覧から消えた (他の端末で終了した・取り込みで変わった) なら閉じる。
     // 古い詳細を残すと、そこに描かれた操作ボタンが「もう無いカード」に効いてしまう
@@ -854,7 +857,7 @@ function renderList() {
   // 「棚入待ち」だけを見ているときは、まとめて棚入完了にできる (職員操作。要件 v1.1 §B)。
   // ⚠ここの後始末は一覧を見ているときだけ。ボードで選んでいる最中も loadState() → renderList() は走るので、
   //   無条件に exitBulk すると選択が消える (Codex PR-C R4)
-  const bulkable = stateCan('tasks.bulk_stocked') && curTab === 'ready_for_stocking';
+  const bulkable = stateCan('tasks.bulk_stocked') && curTab === 'ready_for_stocking';   // 許可が無ければボタンは出さない (hidden)
   const btn = $('#bulkStart');
   if (btn) btn.hidden = !bulkable || !!bulkIds;
   if (curView === 'list') {
@@ -1080,6 +1083,7 @@ function syncBulkSelection(visible) {
   renderBulk();
 }
 async function doBulkStocked() {
+  if (!stateCan('tasks.bulk_stocked')) return;   // 許可リストに無ければ動かない (ボタンも描いていない。二重の守り)
   if (!bulkIds || bulkIds.size === 0) { toast('カードを選んでください'); return; }
   const w = worker;
   if (!w) { openGate(); return; }
@@ -1155,7 +1159,7 @@ function openLwNew(card) {
 function renderLwSaveState() {
   const btn = $('#lwSave');
   if (!btn || !$('#lwOv').classList.contains('on')) return;
-  btn.disabled = !stateCan('task.label_wait.edit');
+  btn.disabled = !stateCan('task.label_wait.edit');   // 許可が無ければ押せない (保存の入口でも見る)
   if (!stateCan('task.label_wait.edit')) $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)';
   else if ($('#lwMsg').textContent.startsWith('下見なので')) $('#lwMsg').textContent = '';
 }
@@ -1207,7 +1211,7 @@ async function saveLw() {
     toast('ラベル待ちを保存しました');
     if (curView === 'label') loadLabelWaits();
   } finally {
-    btn.disabled = !isApp();   // 保存中に正本が変わっていたら押せないまま
+    btn.disabled = !stateCan('task.label_wait.edit');   // 保存中に許可が変わっていたら押せないまま
   }
 }
 
@@ -1279,17 +1283,33 @@ function openDetail(id) {
  * 下見・履歴: 1 枚だけサーバーから取って読むだけで開く (capabilities は空 = 何の操作も描かない)。
  * 取れなければ、ボードに載っていた下見のカードならその時点の中身で開く (最新を取れなかったと出す)
  */
-async function openPreviewDetail(id) {
+/**
+ * 世代番号。カードを選ぶ・戻る・正本が変わるたびに進める。
+ * 遅れて返ってきた応答が、別のカードや閉じた後の画面を勝手に開かないようにする (Codex PR1 R2)
+ */
+let detailGen = 0;
+async function openPreviewDetail(id, { silent = false } = {}) {
+  const gen = ++detailGen;
+  const wasApp = isApp();
   const j = await apiFetch('/api/task-previews/' + encodeURIComponent(id));
+  // 待っている間に別のカードを開いた・戻った・正本が変わった → この応答は捨てる
+  if (gen !== detailGen || isApp() !== wasApp) return;
   if (!j.ok) {
+    if (j.error === 'not_found') {
+      if (!silent) showErr('このカードはもうありません');
+      if (sameId(curDetail, id)) forceCloseDetail('このカードはもうありません');
+      return;
+    }
+    if (silent) return;                 // 巡回での取り直しは、失敗しても今の表示を残す
     const fallback = ((preview && preview.cards) || []).find(x => sameId(x.id, id)) || null;
     if (!fallback) { showErr(j.message || 'カードを開けませんでした'); return; }
-    showDetail(fallback, 'preview', [], { stale: true });
+    showDetail(fallback, 'preview', [], { stale: true, fetchedAt: null });
     return;
   }
-  showDetail(j.card, 'preview', j.capabilities, { notionSyncedAt: j.notionSyncedAt || null });
+  showDetail(j.card, 'preview', j.capabilities, { notionSyncedAt: j.notionSyncedAt || null, fetchedAt: j.serverNow || null });
 }
 function showDetail(c, src, caps, meta) {
+  detailGen++;
   curDetail = c.id;
   detailSrc = src;
   detailCard = c;
@@ -1300,15 +1320,35 @@ function showDetail(c, src, caps, meta) {
   window.scrollTo(0, 0);
 }
 function closeDetail() {
+  detailGen++;
   curDetail = null; detailSrc = null; detailCard = null; detailCaps = []; detailMeta = {};
   document.body.classList.remove('detail-open'); clearInterval(tickId);
 }
-/** 開いているダイアログごと詳細を閉じる (カードが消えた・正本が変わった)。保存中は触らない */
+/**
+ * 開いているダイアログごと詳細を閉じる (カードが消えた・正本が変わった)。
+ * 保存中は画面を引き剥がせないので、**許可リストを空にして操作を止め**、予約しておいて通信が終わったら閉じる
+ * (そのまま残すと、失敗応答でボタンが再び押せるようになってしまう — Codex PR1 R2)
+ */
+let pendingForceClose = null;
 function forceCloseDetail(msg) {
-  if (mvSaving || stSaving) return;
+  detailCaps = [];                      // これ以降 can() は全部 false (入口の守りが効く)
+  detailGen++;                          // 走っている詳細取得の応答を捨てる
+  if (mvSaving || stSaving) {
+    pendingForceClose = msg || '画面が変わったので詳細を閉じました';
+    for (const id of ['mvSave', 'stCancel']) { const b = document.getElementById(id); if (b) b.disabled = true; }
+    return;
+  }
+  pendingForceClose = null;
   for (const ov of document.querySelectorAll('.overlay.on')) closeOverlay('#' + ov.id);
   closeDetail();
   if (msg) toast(msg);
+}
+/** 保存の通信が終わったら呼ぶ。閉じる予約があれば、そこで閉じる */
+function settleForceClose() {
+  if (!pendingForceClose || mvSaving || stSaving) return;
+  const msg = pendingForceClose;
+  pendingForceClose = null;
+  forceCloseDetail(msg);
 }
 
 // ── 時間の表示 ──
@@ -1625,10 +1665,11 @@ async function uploadMedia(opId) {
   toast('写真を送りました (ドライブへ保存中)');
 }
 
-function retryUpload(ev, opId) { ev.stopPropagation(); uploadMedia(opId); }
+function retryUpload(ev, opId) { ev.stopPropagation(); if (!can('task.media.add')) return; uploadMedia(opId); }
 
 async function delMedia(ev, id) {
   ev.stopPropagation();
+  if (!can('task.media.add')) return;   // 読むだけ (下見・履歴) では消さない (× も描いていない。二重の守り)
   if (!confirm('この写真を削除しますか? (撮り直し用)')) return;
   const j = await apiFetch('/api/media/' + id + '/delete', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1833,6 +1874,7 @@ $('#mvOv').addEventListener('click', e => { if (e.target === $('#mvOv')) closeMa
 
 async function saveMaster() {
   if (mvSaving || !worker || !mvCtx) return;
+  if (!can('task.master.edit')) return;   // 読むだけ (下見・履歴) では保存しない
   const fields = {};
   // 開いた項目だけを見る (隠している項目は比べない — 将来ほかの処理が値を書き換えても巻き込まれない。Codex R1)
   const targets = mvCtx.field ? [[mvCtx.field, MV_MAP[mvCtx.field]]] : Object.entries(MV_MAP);
@@ -1854,6 +1896,7 @@ async function saveMaster() {
   });
   mvSaving = false;
   for (const id of ['mvSave', 'mvCancel']) document.getElementById(id).disabled = false;
+  settleForceClose();   // 通信中に「閉じる」が予約されていれば、ここで閉じる
 
   if (j.ok) {
     closeOverlay('#mvOv');
@@ -1945,7 +1988,7 @@ function workCardHtml(c) {
 
 /** 「外部施設に出す準備OK」の切り替え。アプリ正本のみ */
 async function setExternalReady(on) {
-  if (!worker || !curDetail) return;
+  if (!worker || !curDetail || !can('task.external_ready')) return;
   const c = findCard(curDetail);
   if (!c) return;
   const j = await apiFetch('/api/external-ready', {
@@ -1965,7 +2008,7 @@ async function setExternalReady(on) {
 
 /** 「今日やる」(planned_date = 今日) / 後日 (null)。アプリ正本のみ */
 async function setPlanned(on) {
-  if (!worker || !curDetail) return;
+  if (!worker || !curDetail || !can('task.plan.assign')) return;
   const c = findCard(curDetail);
   if (!c) return;
   const j = await apiFetch('/api/planned', {
@@ -2025,7 +2068,7 @@ async function startWork() {
 }
 
 async function stopWork(reason) {
-  if (!worker || !curDetail) return;
+  if (!worker || !curDetail || !can('task.work.start')) return;   // 開始できない画面では終了・中断もしない
   const cNow = findCard(curDetail);
   const mine = cNow ? myActiveOf(cNow) : null;
   if (!mine || !mine.id) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
@@ -2133,6 +2176,7 @@ function applyTask(c, t) {
 
 async function doSetSt(choice) {
   if (stSaving || stTarget == null || !worker) return;
+  if (!stateCan('task.status.change')) { closeSt(); return; }   // 許可リストに無ければ変えない (札も描いていない)
   const c = state.cards.find(x => x.id === stTarget);
   if (!c) { closeSt(); return; }
 
@@ -2187,6 +2231,7 @@ async function doSetSt(choice) {
   stStep = null;
   stSaving = false;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
+  settleForceClose();   // 通信中に「閉じる」が予約されていれば、ここで閉じる
 
   // 一覧に残らないステータス (棚入完了) になったら、その場で行を外す (次の取得でも入ってこない)
   const dropCard = () => {

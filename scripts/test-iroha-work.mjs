@@ -2359,7 +2359,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/previewAt = Date\.now\(\);/.test(html) && /この画面を取ったのは/.test(html), 'いつ取った下見かを画面に出す');
   ok(/function renderLwSaveState/.test(html) && /renderLwSaveState\(\);/.test(html), 'ラベル待ちを開いたままでも保存ボタンが正本に追随する');
   ok(/if \(!stateCan\('task\.label_wait\.edit'\)\) \{ \$\('#lwMsg'\)\.textContent = '下見なので保存できません/.test(html), '保存の入口でも下見なら止める');
-  ok(/btn\.disabled = !isApp\(\);   \/\/ 保存中に正本が変わっていたら/.test(html), '保存後にボタンを無条件で戻さない');
+  ok(/btn\.disabled = !stateCan\('task\.label_wait\.edit'\);   \/\/ 保存中に許可が変わっていたら/.test(html),
+    '保存後にボタンを無条件で戻さない (許可リストで判断する。正本だけを見ない)');
   // 実機FB (2026-09-03): ボードに写真・項目タップで変更・想定作業時間の合計
   ok(/<div class="th">' \+ thumbHtml\(c\) \+ '<\/div>/.test(html), 'ボードのカードに写真を出す');
   ok(!/onclick="openMaster/.test(html) && /data-reg="/.test(html), '作業のやり方は項目タップで変更 (編集ボタンなし)');
@@ -2401,7 +2402,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(!/下見なので開けません/.test(html), '「下見なので開けません」は無くなった');
   ok(/openPreviewDetail\(tr\.dataset\.id\)/.test(html), '履歴の行からも読むだけで開く (終了したカードは一覧に無い)');
   ok(/apiFetch\('\/api\/task-previews\/' \+ encodeURIComponent\(id\)\)/.test(html), '詳細は 1 枚だけサーバーから取る');
-  ok(/showDetail\(fallback, 'preview', \[\], \{ stale: true \}\)/.test(html), '取れなければボードに載っていた中身で開き、最新でないと出す');
+  ok(/showDetail\(fallback, 'preview', \[\], \{ stale: true, fetchedAt: null \}\)/.test(html), '取れなければボードに載っていた中身で開き、最新でないと出す');
+  ok(/if \(j\.error === 'not_found'\)/.test(html) && /このカードはもうありません/.test(html), '消えたカードは閉じる (404)');
   ok(/<span id="dstateWrap"><\/span>/.test(html) && !/<button class="st todo" id="dstate"/.test(html), '状態のボタンは静的に置かない (許されたときだけ描く)');
   ok(/can\('task\.status\.change'\)\s*\?\s*'<button class="st /.test(html) && /'<span class="st ro /.test(html), '許されなければ状態は札 (span) で出す');
   ok(/if \(!reg \|\| !can\('task\.master\.edit'\)\) return/.test(html), '作業のやり方の「変更・登録」は許されたときだけ data-reg を付ける');
@@ -2422,10 +2424,29 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function openSt\(ev, id\) \{[\s\S]{0,120}if \(!stateCan\('task\.status\.change'\)\) return;/.test(html)
     && /function startBulk\(\) \{\r?\n  if \(!stateCan\('tasks\.bulk_stocked'\)\) return;/.test(html),
     'ステータス変更・まとめて棚入完了は入口でも許可リストで止める (二重の守り)');
-  ok(/function forceCloseDetail\(msg\) \{\r?\n  if \(mvSaving \|\| stSaving\) return;/.test(html)
-    && /else forceCloseDetail\('このカードは一覧から外れました'\)/.test(html)
+  ok(/else forceCloseDetail\('このカードは一覧から外れました'\)/.test(html)
     && /if \(curDetail\) forceCloseDetail\('正本が変わったので詳細を閉じました'\)/.test(html),
     'カードが一覧から消えた・正本が変わったら、開いている詳細とダイアログを閉じる (古いボタンを残さない)');
+  // 保存中でも「もう触れない」ようにし、通信が終わったら必ず閉じる (Codex PR1 R2)
+  ok(/function forceCloseDetail\(msg\) \{[\s\S]{0,200}detailCaps = \[\];/.test(html), '閉じるときは許可リストを空にする (失敗応答でボタンが戻らない)');
+  ok(/pendingForceClose = msg/.test(html) && /function settleForceClose/.test(html)
+    && (html.match(/settleForceClose\(\);/g) || []).length >= 2, '保存中は閉じるのを予約し、通信が終わったら閉じる (作業のやり方・状態変更の両方)');
+  // 遅れて返った詳細の応答で、別のカードや閉じた画面を開かない
+  ok(/let detailGen = 0;/.test(html) && /const gen = \+\+detailGen;/.test(html)
+    && /if \(gen !== detailGen \|\| isApp\(\) !== wasApp\) return;/.test(html), '詳細の取得に世代を持たせ、遅れた応答は捨てる');
+  // 下見・履歴の詳細も巡回で取り直す
+  ok(/if \(curDetail && detailSrc === 'preview'\) \{\s*\r?\n\s*openPreviewDetail\(curDetail, \{ silent: true \}\);/.test(html),
+    '下見・履歴の詳細も 60 秒ごとに取り直す (「いまの記録」と書いている以上、古いまま置かない)');
+  // 入口の守り (許可リストが無ければ関数の中で止まる)
+  for (const [fn, cap] of [['doBulkStocked', "stateCan\\('tasks\\.bulk_stocked'\\)"], ['saveMaster', "can\\('task\\.master\\.edit'\\)"],
+    ['setExternalReady', "can\\('task\\.external_ready'\\)"], ['setPlanned', "can\\('task\\.plan\\.assign'\\)"],
+    ['stopWork', "can\\('task\\.work\\.start'\\)"], ['doSetSt', "stateCan\\('task\\.status\\.change'\\)"]]) {
+    const body = html.slice(html.indexOf('function ' + fn + '('), html.indexOf('function ' + fn + '(') + 400);
+    if (!new RegExp(cap).test(body)) ok(false, fn + ' の入口で許可リストを見ている');
+  }
+  ok(/function retryUpload\(ev, opId\) \{ ev\.stopPropagation\(\); if \(!can\('task\.media\.add'\)\) return;/.test(html)
+    && /async function delMedia[\s\S]{0,160}if \(!can\('task\.media\.add'\)\) return;/.test(html), '写真の再送・削除も入口で止める');
+  ok(true, '書き込みの関数はすべて入口で許可リストを見る');
   ok(/function historyCardHtml\(c\)/.test(html) && /これまでの作業 — このカード/.test(html)
     && /const END_REASON = \{ done: 'できあがり', pause: '中断', admin: '職員が終了' \}/.test(html),
     '詳細に「このカードの終わった作業」(誰が・いつ・何分・理由) を読むだけで出す');
