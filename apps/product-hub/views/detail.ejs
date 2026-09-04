@@ -528,11 +528,11 @@ th.attr-unknown { color: #dc2626; }
             その式を1行で見せる。人が値付けした後は「初期値は〜でした」に言い方を変える %>
         <% if (setInfo.priceOrigin) { %>
           <div class="muted" style="margin-top:6px; font-size:12px;">
-            <% if (setInfo.priceOrigin.untouched) { %>
-              売価は「<%= setInfo.priceOrigin.text %>」を初期値として入れています（税込。送料・値引きは含みません）。
-              <strong>ここから値付けしてください。</strong>
+            売価の目安（構成の単品売価の合計）は「<%= setInfo.priceOrigin.text %>」です（税込。送料・値引きは含みません）。
+            <% if (setInfo.priceOrigin.priceEmpty) { %>
+              <strong>売価がまだ入っていません。</strong>
             <% } else { %>
-              売価の目安（構成の単品売価の合計）は「<%= setInfo.priceOrigin.text %>」です（税込。送料・値引きは含みません）。
+              作成時に入れた初期値は下のイベント欄（<code>price_prefilled</code>）で確認できます。
             <% } %>
           </div>
         <% } %>
@@ -4899,8 +4899,10 @@ th.attr-unknown { color: #dc2626; }
       row.appendChild(del);
       setMembersBox.appendChild(row);
     }
-    if (setMembersBox) {
-      addMemberRow('<%= draft.ne_code %>', 2);
+    /** 開いた時点の初期状態: 「この商品 × 2」の1行 + 「行を追加」の配線 */
+    function initSetMembers(parentCode) {
+      if (!setMembersBox) return;
+      addMemberRow(parentCode, 2);
       const addBtn = document.getElementById('set-member-add');
       if (addBtn) addBtn.addEventListener('click', function () { addMemberRow('', 1); });
     }
@@ -4917,6 +4919,11 @@ th.attr-unknown { color: #dc2626; }
       }
       return out;
     }
+    <%# ここまでが smoke の切り出し範囲 (EJS の埋め込みを混ぜない — 素の JS として動かすため)。
+        HTMLエスケープした値を JS 文字列に入れない (Codex low): `'` を含む商品コードが
+        `&#39;` という別のコードになって単価が引けなくなる。JSON で埋めて `<` だけ潰す %>
+    initSetMembers(<%- JSON.stringify(draft.ne_code || '').replace(/</g, '\\u003c') %>);
+
     async function createSet(mode) {
       const out = document.getElementById('set-create-result');
       const members = readSetMembers();

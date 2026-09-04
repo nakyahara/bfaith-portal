@@ -1462,8 +1462,13 @@ export function buildItemPayload(db, draftId) {
   };
 
   // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる。
-  // RMS へ出るのは**必ず楽天グループID** (複合選択肢は上で '1' 等に解決済み)
-  const shippingGroup = shippingResolved.group || '';
+  // RMS へ出るのは**必ず楽天グループID** (複合選択肢は上で '1' 等に解決済み)。
+  // 🚨 アプリ未指定のときは **NE の配送方法へフォールバックする** (2026-09-04 §4.4 決⑥ / Codex high)。
+  //    ここで生値 (shippingResolved) を使うと、画面と末尾バナーは NE の「ネコポス」を出しているのに
+  //    RMS へは配送方法が送られず店舗デフォルトになる — 見えているものと出るものが食い違う。
+  //    配送方法をコピーしないセットは全部この経路に乗るので、ここが生値だと決⑥が成り立たない。
+  //    解決は画面・バナーと同じ effectiveShippingForDraft ただ1つ (物差しを2つ持たない)
+  const shippingGroup = effectiveShip.group || '';
   const shipping = {
     ...(shippingGroup ? { shippingMethodGroup: shippingGroup } : {}),
     ...(rk.postage_included != null ? { postageIncluded: rk.postage_included === 1 } : {}),

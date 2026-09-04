@@ -91,10 +91,19 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
   if (!parent) throw badRequest('元の商品が見つかりません');
   if (parent.parent_draft_id) throw badRequest('セット商品からさらにセットは作れません');
 
-  // 構成 (何を何個)。未指定なら「親を 2 個」を初期値にする (もっとも多い形)
-  const rawMembers = Array.isArray(opts?.members) && opts.members.length > 0
-    ? opts.members
-    : [{ ne_code: parent.ne_code, qty: 2 }];
+  // 構成 (何を何個)。**未指定**のときだけ「親を 2 個」を初期値にする (もっとも多い形)。
+  // 🚨 明示的に空 (`members: []`) や配列でない値を「親×2」に化けさせない (Codex medium 2026-09-04):
+  //    画面は空構成を押させないのに API だけ黙って別の構成を作ると、送ったものと違うセットができる
+  let rawMembers;
+  if (opts?.members == null) {
+    rawMembers = [{ ne_code: parent.ne_code, qty: 2 }];
+  } else if (!Array.isArray(opts.members)) {
+    throw badRequest('構成の指定が不正です (配列で送ってください)');
+  } else if (opts.members.length === 0) {
+    throw badRequest('構成を1行以上入れてください');
+  } else {
+    rawMembers = opts.members;
+  }
   if (rawMembers.length > MAX_MEMBERS) throw badRequest(`セットの構成は ${MAX_MEMBERS} 件までです`);
   const members = [];
   const seen = new Set();
@@ -346,8 +355,12 @@ export function setInfoOf(db, draftId) {
         total: calc.total,
         lines: calc.lines,
         text: describeSetPrice(calc),
-        // 人がまだ触っていない (= 初期値のまま) かどうか。文言を変えるために使う
-        untouched: row.price != null && Number(row.price) === calc.total,
+        // 🚨 「人がまだ触っていない」を **今の売価と計算値の一致**で判定してはいけない
+        //    (Codex medium 2026-09-04): 偶然同じ値を入れた / 作成後に単品の売価が変わった /
+        //    構成を後から変えた、のどれでも嘘になる。売価の変更はイベントに残していないので
+        //    「初期値のまま」は名乗れない。**作成時に何を入れたかは price_prefilled (append-only)
+        //    がイベント欄で見せる**。ここは「いまの構成での目安」だけを言う
+        priceEmpty: row.price == null,
       };
     })(),
   };

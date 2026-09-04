@@ -4,9 +4,10 @@
  * 「単品売価 × 個数」の和を初期値として入れ、人はそこから値付けする。今までは空で、
  * 毎回ゼロから打ち直していた。**確定値ではなく叩き台**なので、人が変える前提。
  *
- * 単価の引き先は 2 つ。順番に意味がある:
- *   ① アプリのドラフトの売価  … 人が売り場向けに決めた値。いちばん近い
- *   ② NE mirror の標準売価    … まだアプリに無い商品コード (親以外を混ぜたセット) 用
+ * 単価の引き先は 3 つ。順番に意味がある:
+ *   ①  アプリのドラフトの売価      … 人が売り場向けに決めた値。いちばん近い
+ *   ①' 子SKU の売価 (draft_sku_prices) … バリエーションの SKU 単位で人が決めた値
+ *   ②  NE mirror の標準売価        … まだアプリに無い商品コード (親以外を混ぜたセット) 用
  *
  * 🚨 1 件でも単価が引けなければ **合計を作らない (null)**。欠けたまま足すと
  *    「2 個セットなのに 1 個ぶんの値段」が初期値として入り、人が「入っている」と見て
@@ -24,21 +25,43 @@ function priceOrNull(v) {
 
 /**
  * 商品コード 1 件の単価。
- * @returns {{value: number, source: 'draft'|'ne'}|null} 引けなければ null
+ * @returns {{value: number, source: 'draft'|'sku'|'ne'}|null} 引けなければ null
  */
 export function unitPriceOf(db, neCode) {
   const code = norm(neCode);
   if (!code) return null;
 
+  // 🚨 どの引き先でも「**全行が一致するときだけ**採用する」(variation.js と同じ扱い)。
+  //    正規化 (LOWER(TRIM())) で複数行に当たることは実際にある — `product_drafts` の
+  //    UNIQUE は生の ne_code にしか効かないので `ABC` と ` abc ` が同居できる。
+  //    そこで `ORDER BY id LIMIT 1` を採ると、**どちらの値が出るかは運**になる。
+  //    「どの単価か分からない」は引けないのと同じ (fail-closed)
+  const agreedPrice = (values) => {
+    const vals = new Set(values.map(priceOrNull));
+    if (vals.size !== 1) return null;      // 割れている / 有効値と無効値の混在
+    return [...vals][0];                   // 全部無効なら null
+  };
+
   // ① アプリのドラフト。**セットは数えない** (parent_draft_id IS NULL = 単品だけ)。
   //    セットの売価を単価として拾うと、セットのセットのような値になる
-  const d = db.prepare(`
+  const drafts = db.prepare(`
     SELECT price FROM product_drafts
     WHERE LOWER(TRIM(ne_code)) = ? AND parent_draft_id IS NULL AND price IS NOT NULL
-    ORDER BY id LIMIT 1
-  `).get(code);
-  const fromDraft = priceOrNull(d?.price);
+  `).all(code);
+  const fromDraft = drafts.length > 0 ? agreedPrice(drafts.map((d) => d.price)) : null;
   if (fromDraft != null) return { value: fromDraft, source: 'draft' };
+  // 値が割れているのに次の引き先へ落ちると「人が入れた値を無視して NE を採る」になる。
+  // 人が直すべき状態なので、ここで止める (Codex high 2026-09-04)
+  if (drafts.length > 0) return null;
+
+  // ①' バリエーションの子SKU に付けた売価 (`draft_sku_prices`)。単品のドラフトが無くても、
+  //     人が SKU ごとに決めた売価があればそれが「アプリの値」(Codex medium 2026-09-04)。
+  //     どのドラフトに属する行かは問わないが、割れていたら採らない
+  const skuRows = db.prepare('SELECT price FROM draft_sku_prices WHERE sku_code = ?').all(code);
+  if (skuRows.length > 0) {
+    const fromSku = agreedPrice(skuRows.map((r) => r.price));
+    return fromSku == null ? null : { value: fromSku, source: 'sku' };
+  }
 
   // ② NE mirror の標準売価 (税込)。mirror が未取込の環境では黙って null
   if (!mirrorReady(db)) return null;
@@ -49,19 +72,15 @@ export function unitPriceOf(db, neCode) {
     return null;
   }
   if (rows.length === 0) return null;
-  // 正規化で複数行に当たることがある (バリエーションの取り違え)。値が割れていたら
-  // どれかを黙って採らない — 「どの単価か分からない」は引けないのと同じ (variation.js と同じ扱い)
-  const vals = new Set(rows.map((r) => priceOrNull(r.標準売価)));
-  if (vals.size !== 1) return null;
-  const only = [...vals][0];
-  return only == null ? null : { value: only, source: 'ne' };
+  const fromNe = agreedPrice(rows.map((r) => r.標準売価));
+  return fromNe == null ? null : { value: fromNe, source: 'ne' };
 }
 
 /**
  * 構成から売価の初期値を出す。
  * @param {Array<{ne_code?: string, code?: string, qty: number}>} members
  * @returns {{total: number|null, lines: Array<{code: string, qty: number, unit: number|null,
- *   subtotal: number|null, source: 'draft'|'ne'|null}>, missing: string[]}}
+ *   subtotal: number|null, source: 'draft'|'sku'|'ne'|null}>, missing: string[]}}
  *   total は全件の単価が引けたときだけ入る。missing = 引けなかった商品コード
  */
 export function setPriceFromMembers(db, members) {
