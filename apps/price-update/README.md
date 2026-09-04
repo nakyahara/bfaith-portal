@@ -32,17 +32,35 @@ Amazon は対象外 (価格改定ツールが別にあるため、ここでは�
 | `PRICE_UPDATE_EXECUTORS` | **実行するなら必須** | 実行してよい人のメール (カンマ区切り)。**未設定だと誰も実行できない**。管理者でも名簿に無ければ実行できない |
 | `PRICE_UPDATE_RAKUTEN_ENABLED` | 実行するなら必須 | `1` / `true` のときだけ楽天へ送る。止めたいときはこれを消すのが一番速い |
 | `PRICE_UPDATE_YAHOO_ENABLED` | Yahoo を更新するなら必須 | 同上 (Yahoo 用)。★Yahoo は**フロント反映が非同期**。実行が終わっても客に見えるまで時間がかかる |
+| `LINEGIFT_SHOP_ID` | LINEギフトの価格を出すなら必須 | **miniPC 側の env**。LINEギフトのショップID (数字)。管理画面URL `/shops/<ここ>/` から取れる。未設定だと LINEギフト行は「取得できません」になる |
 | `PRICE_UPDATE_MAX_NE_CODES` | 任意 | 1回に扱えるNEコード数の上限 (既定 20) |
 | `PRICE_UPDATE_MAX_SKU_ROWS` | 任意 | 1回に扱える行数の上限 (既定 100)。1コードあたりは 50 行で固定 |
 
 閲覧の権限は `/admin` の画面権限 (`price-update`) で付ける。**閲覧できても実行はできない** —
 実行は上の名簿だけが決める。
 
+### 🚨LINEギフトは「表示だけ」
+
+LINEギフトに kill switch はない。**書き込む口がそもそも無い**ため。
+
+価格専用の更新APIが無く `PATCH /api/v1/shops/{shop_id}/items/{item_id}` = **商品まるごと更新**
+しか無い。Yahoo `editItem` と同じ「送らなかった項目が消える」危険があり、しかも
+**GET が返す画像は `id`+`url` なのに PATCH は `temporary_uuid` を要求する**ので、
+読んだ画像をそのまま送り返せない = 全上書きだった場合に**復元できない**。
+
+部分更新かどうかを検証用商品で実測するまで、書き込みは作らない。
+
+**引き当ての注意**: 商品APIは数値の `item_id` でしか引けず、その手がかりは受注実績
+(`raw_linegift_orders`) から取っている。**売れたことが無い商品は手がかりが無いので確定しない**が、
+それは「出品していない」ではない。画面にも「出品の有無は判定していません」と出る。
+(全出品の一覧APIが使えるようになれば、この制限は無くなる)
+
 ## テスト
 
 ```
 node apps/price-update/test-pricing.mjs
 node apps/price-update/test-resolve.mjs
+node apps/price-update/test-linegift-read.mjs
 node apps/price-update/test-views.mjs
 node apps/price-update/test-execute.mjs
 ```

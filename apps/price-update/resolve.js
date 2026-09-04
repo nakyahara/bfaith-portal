@@ -212,6 +212,18 @@ function resolveQoo10(db, code) {
   }));
 }
 
+/**
+ * LINEギフト: 表示のみ (更新対象外)。出品コード = variation.code = NEコード という規則で引く。
+ * ★対応表は持たない。実在するかは live 取得 (miniPC 経由で商品APIに聞く) が答える。
+ *   Yahoo / au PAY と同じ「規則で候補を出して、API が確認できたものだけ確定」の形。
+ */
+function resolveLinegift(db, code) {
+  return [{
+    mall: 'linegift', listingCode: code, skuCode: null,
+    confidence: 'rule', source: '規則 (variation.code=NEコード)',
+  }];
+}
+
 /** Amazon: 表示のみ (更新対象外)。seller_sku は mirror_sku_resolved 経由 */
 function resolveAmazon(db, code) {
   return db.prepare(`
@@ -228,7 +240,7 @@ function resolveAmazon(db, code) {
   }));
 }
 
-export const MALLS = ['rakuten', 'yahoo', 'amazon', 'aupay', 'qoo10'];
+export const MALLS = ['rakuten', 'yahoo', 'amazon', 'aupay', 'qoo10', 'linegift'];
 /** API で価格を更新できる (予定の) モール。M1 は読むだけ */
 // ★正は mall-capabilities.js。ここでは読み直して公開するだけ (既存の import 先を壊さない)
 export { UPDATABLE_MALLS } from './mall-capabilities.js';
@@ -247,6 +259,7 @@ export function resolveListings(db, code) {
     amazon: resolveAmazon(db, code),
     aupay: resolveAupay(db, code),
     qoo10: resolveQoo10(db, code),
+    linegift: resolveLinegift(db, code),
   };
   const out = [];
   for (const mall of MALLS) {
@@ -275,6 +288,9 @@ export function listingUrl(mall, listingCode, extra = {}) {
     case 'aupay': return 'https://manager.wowma.jp/';
     // Qoo10 は商品番号があれば客が見る商品ページへ (無ければ QSM)
     case 'qoo10': return `https://www.qoo10.jp/g/${encodeURIComponent(c)}`;
+    // LINEギフトは出品コードから公開URLを作れない (数値の商品IDで決まる)。
+    // 商品ページのURLは live 取得の応答 (web_url) が持っているので、router がそちらを使う
+    case 'linegift': return null;
     default: return null;
   }
 }
