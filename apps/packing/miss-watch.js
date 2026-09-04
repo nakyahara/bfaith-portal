@@ -27,10 +27,11 @@ import { getDB, utcNow, jstToday } from './db.js';
 // ⭐判定の起点は Drive への配置時刻ではなく pk_batches.created_at (ピッキング取込時刻)
 const GRACE_MIN = Number(process.env.PACKING_MISS_GRACE_MIN || 40);
 // 検知の対象にする日数。当日だけを見ると**猶予の途中で日を跨いだバッチを永久に見失う**
-// (23:40 に取り込まれると 0:00 時点でまだ20分 → 翌日からは当日扱いされない — Codexレビュー High)
-const LOOKBACK_DAYS = 3;
-// 古すぎる取りこぼしは今さら鳴らさない (この機能を入れた日に過去の分が一斉に鳴るのを防ぐ)
-const MAX_AGE_MIN = LOOKBACK_DAYS * 24 * 60;
+// (23:40 に取り込まれると 0:00 時点でまだ20分 → 翌日からは当日扱いされない — Codexレビュー High)。
+// この機能を入れた日に過去の取りこぼしが一斉に鳴るのも、この範囲で自然に抑えられる。
+// ⭐見張り自体が数日止まった場合は、その間の取りこぼしをここでは拾えない。
+//   ポーラーの生存は jobs-monitor の dead-man (packing-drive-poller) が別途見ている
+const LOOKBACK_DAYS = Number(process.env.PACKING_MISS_LOOKBACK_DAYS || 3);
 // 1周期に送る未送信行の上限 (溜まっても1通が巨大にならないように)
 const FLUSH_LIMIT = 50;
 
@@ -39,7 +40,7 @@ const FLUSH_LIMIT = 50;
  * @returns {{kind, folderName, workDate, detail, alertKey}[]}
  */
 export function findMisses({ workDate = null, nowMs = Date.now(), graceMin = GRACE_MIN,
-  lookbackDays = LOOKBACK_DAYS, maxAgeMin = MAX_AGE_MIN } = {}) {
+  lookbackDays = LOOKBACK_DAYS } = {}) {
   const db = getDB();
   const out = [];
   // 単日指定 (テスト・調査用) と、直近数日の範囲指定を両立させる
@@ -67,10 +68,9 @@ export function findMisses({ workDate = null, nowMs = Date.now(), graceMin = GRA
   } catch { return out; }
 
   for (const r of notImported) {
-    // 取り込まれたばかりのものは「まだ来ていないだけ」なので待つ。
-    // 逆に古すぎるものは今さら鳴らさない (この機能の導入日に過去分が一斉に鳴らないように)
+    // 取り込まれたばかりのものは「まだ来ていないだけ」なので待つ (どこまで遡るかは work_date 側で絞る)
     const ageMin = (nowMs - Date.parse(`${r.created_at}${r.created_at.endsWith('Z') ? '' : 'Z'}`)) / 60000;
-    if (!(ageMin >= graceMin) || ageMin > maxAgeMin) continue;
+    if (!(ageMin >= graceMin)) continue;
     out.push({
       kind: 'not_imported',
       pkBatchId: r.id,
@@ -135,7 +135,9 @@ export function pendingAlerts({ limit = FLUSH_LIMIT } = {}) {
     SELECT alert_key, kind, work_date, folder_name, detail, attempts, last_error
     FROM pk_pack_miss_alerts
     WHERE notified_at IS NULL
-    ORDER BY work_date, kind, folder_name
+    -- ⭐試行回数の少ないものを先に。古い50件が送信に失敗し続けると、後ろの行が
+    --   永久に試されなくなる (Codexレビュー)
+    ORDER BY attempts, work_date, kind, folder_name
     LIMIT ?
   `).all(limit);
 }

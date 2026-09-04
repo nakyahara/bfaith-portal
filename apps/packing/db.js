@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 18;
+const SCHEMA_VERSION = 19;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -541,6 +541,16 @@ const MIGRATIONS = {
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_miss_alerts_pending ON pk_pack_miss_alerts(notified_at)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_miss_alerts_date ON pk_pack_miss_alerts(work_date)');
+  },
+  // v19: v18 のテーブル定義を後から直したので、**既に v18 を当てたDBにも列を足す**。
+  //   マイグレーションは一度当たると再実行されない。定義だけ書き換えると、新しいDBには
+  //   列があるのに v18 適用済みDBには無い、という食い違いが残る (Codexレビュー High)。
+  //   新規DB (v18 で pk_batch_id 込みで作られる) では ALTER をスキップする
+  19: () => {
+    const cols = db.prepare('PRAGMA table_info(pk_pack_miss_alerts)').all().map((c) => c.name);
+    if (!cols.includes('pk_batch_id')) db.exec('ALTER TABLE pk_pack_miss_alerts ADD COLUMN pk_batch_id INTEGER');
+    db.exec('DROP INDEX IF EXISTS idx_pk_pack_miss_alerts_date');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_miss_alerts_pending ON pk_pack_miss_alerts(notified_at)');
   },
 };
 

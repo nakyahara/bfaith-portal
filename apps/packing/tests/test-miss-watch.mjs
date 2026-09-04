@@ -204,10 +204,11 @@ t('猶予の途中で日を跨いだバッチも検知できる', () => {
   assert.equal(misses[0].workDate, yesterday);
 });
 
-t('古すぎる取りこぼしは今さら鳴らさない', () => {
+t('検知の範囲より古い日付は見ない (導入日に過去分が一斉に鳴らない)', () => {
   addPickBatch({ folder: '出荷_51', ageMin: 60 * 24 * 10, workDate: jstToday(new Date(Date.now() - 10 * 86400_000)) });
-  assert.equal(findMisses().filter((m) => m.folderName === '出荷_51').length, 0,
-    '導入日に過去分が一斉に鳴らない');
+  assert.equal(findMisses().filter((m) => m.folderName === '出荷_51').length, 0, '既定 (直近3日) の外');
+  assert.equal(findMisses({ lookbackDays: 30 }).filter((m) => m.folderName === '出荷_51').length, 1,
+    '範囲を広げれば調査用に拾える (年齢での二重の足切りはしない)');
 });
 
 t('同じ日に同名フォルダの別バッチがあっても両方が残る', () => {
@@ -222,6 +223,16 @@ t('同じ日に同名フォルダの別バッチがあっても両方が残る',
   assert.equal(pendingAlerts().filter((r) => r.folder_name === '出荷_52').length, 1,
     '片方を鳴らしても、もう片方は未送信のまま残る');
   assert.deepEqual([a.id, b.id].sort(), misses.map((m) => m.pkBatchId).sort());
+});
+
+await ta('失敗を重ねた行のせいで後続が永久に試されない、が起きない', async () => {
+  // 古い行が送信に失敗し続けても、新しい行が送られること (attempts 順)
+  getDB().prepare(`INSERT INTO pk_pack_miss_alerts (alert_key, kind, work_date, pk_batch_id, folder_name, detail, attempts, created_at)
+    VALUES ('stuck:not_imported:1', 'not_imported', '2020-01-01', 1, '出荷_STUCK', '失敗し続ける行', 99, ?)`).run(utcNow());
+  addPickBatch({ folder: '出荷_53', ageMin: 60 });
+  const sent = [];
+  await missWatchStep(async (text) => { sent.push(text); return true; });
+  assert.ok(sent.some((x) => x.includes('出荷_53')), '新しい行が送られる');
 });
 
 console.log(`test-miss-watch: ${passed} 件 pass`);
