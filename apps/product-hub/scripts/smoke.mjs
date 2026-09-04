@@ -3523,6 +3523,228 @@ let wfSetParentId = null;
   check('移行: 単品には触らない',
     codesOf(parentId).some((r) => r.step_code === 'basic_info') && !codesOf(parentId).some((r) => r.track === 'set'));
 
+  // ⑨ NE登録の進み (2026-09-04 §4.3/§5.5)。工程とは別に「どこで止まっているか」を持つ
+  {
+    const neId = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code, ne_registration_state)
+      VALUES ('SET-WF-TRK-P-97', 'NE進み検証のセット', 'draft', 'smoke', ?, 1, 'not_requested')
+    `).run(parentId).lastInsertRowid);
+    wfp.ensureProgress(db, neId);
+
+    check('NE: 初期は未要求', sd.setInfoOf(db, neId).neState === 'not_requested');
+    sd.setNeRegistrationState(db, neId, { state: 'requested' }, '中原 実紀');
+    const req1 = sd.setInfoOf(db, neId);
+    check('NE: 依頼済みにすると日時と人が残る',
+      req1.neState === 'requested' && !!req1.neRequestedAt && req1.neRequestedBy === '中原 実紀',
+      JSON.stringify({ s: req1.neState, at: req1.neRequestedAt, by: req1.neRequestedBy }));
+
+    let noReason = null;
+    try { sd.setNeRegistrationState(db, neId, { state: 'needs_action' }, 'smoke'); } catch (e) { noReason = e; }
+    check('NE: 要対応は理由が必須 (理由の無い要対応は誰も動かせない)',
+      noReason?.status === 400, noReason?.message || '通ってしまった');
+    sd.setNeRegistrationState(db, neId, { state: 'needs_action', reason: '商品コードが重複していた' }, 'smoke');
+    check('NE: 要対応は理由まで持つ',
+      sd.setInfoOf(db, neId).neError === '商品コードが重複していた');
+    sd.setNeRegistrationState(db, neId, { state: 'requested' }, 'smoke');
+    check('NE: 再要求すると理由は消える', sd.setInfoOf(db, neId).neError === null);
+
+    let badState = null;
+    try { sd.setNeRegistrationState(db, neId, { state: 'confirmed' }, 'smoke'); } catch (e) { badState = e; }
+    check('NE: 「確定」は人が指定できない (provisional_code=0 が唯一の真)',
+      badState?.status === 400, badState?.message || '通ってしまった');
+    let notSet = null;
+    try { sd.setNeRegistrationState(db, parentId, { state: 'requested' }, 'smoke'); } catch (e) { notSet = e; }
+    check('NE: 単品には効かない (理由も「セットではない」と言う)',
+      notSet?.status === 400 && /セット商品ではありません/.test(notSet.message),
+      notSet?.message || '通ってしまった');
+
+    // 表示上の「確定」は列ではなく provisional_code から出す
+    db.prepare('UPDATE product_drafts SET provisional_code = 0 WHERE id = ?').run(neId);
+    check('NE: 本コードが確定したら状態は「確定」と出す (列は requested のまま)',
+      sd.setInfoOf(db, neId).neState === 'confirmed'
+      && db.prepare('SELECT ne_registration_state FROM product_drafts WHERE id = ?').get(neId).ne_registration_state === 'requested');
+    let afterFix = null;
+    try { sd.setNeRegistrationState(db, neId, { state: 'requested' }, 'smoke'); } catch (e) { afterFix = e; }
+    check('NE: 確定後はもう動かせない', afterFix?.status === 400, afterFix?.message || '通ってしまった');
+    db.prepare('UPDATE product_drafts SET provisional_code = 1 WHERE id = ?').run(neId);
+
+    // 要対応ビュー (§5.5)
+    sd.setNeRegistrationState(db, neId, { state: 'needs_action', reason: 'コード重複' }, 'smoke');
+    const rows = wfp.neRegistrationRows(db);
+    const mine = rows.find((r) => r.id === neId);
+    check('要対応ビュー: 仮コードのセットが並ぶ', !!mine, `rows=${rows.length}`);
+    check('要対応ビュー: 状態・理由・次にやること が行に入る',
+      mine.state === 'needs_action' && mine.error === 'コード重複' && /再要求/.test(mine.next),
+      JSON.stringify(mine).slice(0, 200));
+    check('要対応ビュー: 親と構成が分かる', mine.parentId === parentId);
+    check('要対応ビュー: 単品は出さない', !rows.some((r) => r.id === parentId));
+    check('要対応ビュー: 要対応が先頭 (人が動かないと止まったままのものから)',
+      rows[0].state === 'needs_action', rows.map((r) => r.state).join(','));
+
+    // 🚨 並び順は LIMIT の前に効かせる (Codex R1 high)。新しい「未要求」が上限を食い潰して、
+    // いちばん見たい「要対応」が表から消えることがあってはいけない
+    {
+      const filler = [];
+      for (let i = 0; i < 5; i++) {
+        filler.push(Number(db.prepare(`
+          INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code,
+            ne_registration_state, updated_at)
+          VALUES (?, ?, 'draft', 'smoke', ?, 1, 'not_requested', '2099-01-01T00:00:00.000Z')
+        `).run(`SET-FILL-${i}`, `未要求の新しいセット ${i}`, parentId).lastInsertRowid));
+      }
+      const capped = wfp.neRegistrationRows(db, { limit: 3 });
+      check('要対応ビュー: 上限で切っても「要対応」が残る (並びは SQL 側)',
+        capped.some((r) => r.id === neId) && capped[0].state === 'needs_action',
+        capped.map((r) => `${r.state}:${r.id}`).join(','));
+      for (const id of filler) db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+    }
+
+    // 表示のついでの reconcile は「確定しうる行」だけに通す (Codex R1 medium)。
+    // 仮コードのまま (NE に無い) セットを毎回照合すると、1画面の GET が数千SQLになる
+    {
+      let called = 0;
+      const spy = (dbx, d) => { called += 1; return sd.reconcileProvisionalCode(dbx, d); };
+      wfp.neRegistrationRows(db, { reconcile: spy });
+      check('要対応ビュー: NE に無いコードは照合しない (画面が同期SQLで詰まらない)',
+        called === 0, `called=${called}`);
+    }
+
+    // 🚨 確定の取り込みは表示の LIMIT と切り離す (Codex R2 medium)。
+    // ① 表示件数に穴が空かない ② 表示対象の外 (古い行) も拾われる
+    {
+      const olds = [];
+      for (let i = 0; i < 3; i++) {
+        olds.push(Number(db.prepare(`
+          INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code,
+            ne_registration_state, updated_at)
+          VALUES (?, ?, 'draft', 'smoke', ?, 1, 'requested', '2000-01-01T00:00:00.000Z')
+        `).run(`WF-OLD-CONF-${i}`, `古い確定待ちセット ${i}`, parentId).lastInsertRowid));
+      }
+      for (const id of olds) wfp.ensureProgress(db, id);
+      // 3件のうち1件だけ NE に載せる (残り2件は仮のまま = 表に残るべき)
+      db.prepare(`
+        INSERT INTO mirror_products
+          (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
+        VALUES (99403, 'WF-OLD-CONF-0', '古い確定待ち 実コード', '1', '取扱中', '1', 'WF-OLD-CONF-0', '2026-09-04T00:00:00Z')
+      `).run();
+      // 新しい未要求で表示上限を埋めても、古い行の確定は拾われる
+      const capped = wfp.neRegistrationRows(db, { reconcile: sd.reconcileProvisionalCode, limit: 2 });
+      check('要対応ビュー: 表示の上限に関わらず古い行の確定も拾う',
+        db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(olds[0]).provisional_code === 0,
+        '古い行が確定していない');
+      check('要対応ビュー: 確定した行が抜けても上限まで行が埋まる (穴が空かない)',
+        capped.length === 2 && !capped.some((r) => r.id === olds[0]),
+        `len=${capped.length} ids=${capped.map((r) => r.id).join(',')}`);
+      check('要対応ビュー: 確定した行は NE登録の工程も閉じている',
+        db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`)
+          .get(olds[0])?.state === 'done');
+      db.prepare('DELETE FROM mirror_products WHERE product_id = 99403').run();
+      for (const id of olds) db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+    }
+
+    // ボードを開いたときも同じように拾う (§4.3)。表示は updated_at DESC の上限で切られるので、
+    // 古いセットは表示対象に入らない — それでも確定は進む必要がある (Codex R2 medium)
+    {
+      const oldId = Number(db.prepare(`
+        INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code,
+          ne_registration_state, updated_at)
+        VALUES ('WF-BOARD-CONF', 'ボードから確定するセット', 'draft', 'smoke', ?, 1, 'requested', '2000-01-01T00:00:00.000Z')
+      `).run(parentId).lastInsertRowid);
+      wfp.ensureProgress(db, oldId);
+      db.prepare(`
+        INSERT INTO mirror_products
+          (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
+        VALUES (99404, 'WF-BOARD-CONF', 'ボード確定 実コード', '1', '取扱中', '1', 'WF-BOARD-CONF', '2026-09-04T00:00:00Z')
+      `).run();
+      // limit=1 = この古い行は表示対象に入らない。それでも確定は進む
+      // (確定すると updated_at が今になるので、結果としてボードにも載る = 取り込みが先に走った証拠)
+      wfp.boardData(db, { view: 'main', limit: 1, reconcileSet: sd.reconcileProvisionalCode });
+      check('ボード: 表示の上限に入っていなくても、NEに載ったセットは確定させる',
+        db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(oldId).provisional_code === 0,
+        '確定していない');
+      check('ボード: 確定したら NE登録の工程も閉じている',
+        db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`)
+          .get(oldId)?.state === 'done');
+      db.prepare('DELETE FROM mirror_products WHERE product_id = 99404').run();
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(oldId);
+    }
+
+    // 🚨 確定できない行が上限を食い潰して、後ろの行が永久に処理されないことがあってはいけない
+    // (Codex R3 medium)。バリエーションから外した (detached) コードは NE に載っていても
+    // reconcile が必ず false を返すので、候補に残すと毎回それが先頭を占める
+    {
+      // 確定できない行を先に (古い updated_at で) 置き、そのあとに確定できる行を置く
+      const stuck = Number(db.prepare(`
+        INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code, updated_at)
+        VALUES ('WF-DETACHED-CONF', '外してあって確定できないセット', 'draft', 'smoke', ?, 1, '1999-01-01T00:00:00.000Z')
+      `).run(parentId).lastInsertRowid);
+      const okId = Number(db.prepare(`
+        INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code, updated_at)
+        VALUES ('WF-AFTER-STUCK', '確定できない行の後ろにあるセット', 'draft', 'smoke', ?, 1, '1999-01-02T00:00:00.000Z')
+      `).run(parentId).lastInsertRowid);
+      wfp.ensureProgress(db, stuck); wfp.ensureProgress(db, okId);
+      const insM = db.prepare(`
+        INSERT INTO mirror_products
+          (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
+        VALUES (?, ?, ?, '1', '取扱中', '1', ?, '2026-09-04T00:00:00Z')
+      `);
+      insM.run(99405, 'WF-DETACHED-CONF', '外した商品', 'WF-DETACHED-CONF');
+      insM.run(99406, 'WF-AFTER-STUCK', '後ろの行', 'WF-AFTER-STUCK');
+      db.prepare(`INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, 'WF-DETACHED-CONF', 'smoke')`)
+        .run(stuck);
+      // 上限1でも、確定できない行は候補に入らないので後ろの行が処理される
+      wfp.reconcileConfirmableSets(db, sd.reconcileProvisionalCode, { max: 1 });
+      check('確定できない行が上限を食い潰さない (後ろの行が永久に止まらない)',
+        db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(okId).provisional_code === 0,
+        '後ろの行が処理されていない');
+      check('バリエーションから外したコードは確定させない',
+        db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(stuck).provisional_code === 1);
+      db.prepare(`DELETE FROM draft_variation_exclusions WHERE ne_code = 'WF-DETACHED-CONF'`).run();
+      for (const pid of [99405, 99406]) db.prepare('DELETE FROM mirror_products WHERE product_id = ?').run(pid);
+      for (const id of [stuck, okId]) db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+    }
+
+    // 確定したものは表から消える (工程ビューで見る)
+    db.prepare('UPDATE product_drafts SET provisional_code = 0 WHERE id = ?').run(neId);
+    check('要対応ビュー: 本コードが確定したら消える',
+      !wfp.neRegistrationRows(db).some((r) => r.id === neId));
+    db.prepare('UPDATE product_drafts SET provisional_code = 1 WHERE id = ?').run(neId);
+
+    // 表示のついでに取り込みを追いかける (mirror は毎時なので画面を開くだけで追いつく)
+    db.prepare(`UPDATE product_drafts SET ne_code = 'WF-NE-REAL' WHERE id = ?`).run(neId);
+    db.prepare(`
+      INSERT INTO mirror_products
+        (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
+      VALUES (99402, 'WF-NE-REAL', 'NE進み検証 実コード', '1', '取扱中', '1', 'WF-NE-REAL', '2026-09-04T00:00:00Z')
+    `).run();
+    const afterReconcile = wfp.neRegistrationRows(db, { reconcile: sd.reconcileProvisionalCode });
+    check('要対応ビュー: 表示のついでに NE の取り込みを拾って表から落とす',
+      !afterReconcile.some((r) => r.id === neId)
+      && db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(neId).provisional_code === 0);
+    check('要対応ビュー: 拾ったら NE登録の工程も閉じている',
+      db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`)
+        .get(neId)?.state === 'done');
+    db.prepare('DELETE FROM mirror_products WHERE product_id = 99402').run();
+  }
+
+  // ⑩ 親の更新の知らせ (§4.5)。自動追随はしない — 見て判断してもらう
+  {
+    const chId = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code, parent_snapshot_at)
+      VALUES ('SET-WF-TRK-P-96', '親更新検証のセット', 'draft', 'smoke', ?, 1, ?)
+    `).run(parentId, '2026-09-01T00:00:00.000Z').lastInsertRowid);
+    db.prepare(`UPDATE product_drafts SET updated_at = '2026-09-02T00:00:00.000Z' WHERE id = ?`).run(parentId);
+    check('親更新: 派生後に親が変わったら知らせる', sd.setInfoOf(db, chId).parentChanged === true);
+    check('親更新: 「確認した」で覚え直す', sd.ackParentSnapshot(db, chId, 'smoke') === true);
+    check('親更新: 確認したら知らせは消える', sd.setInfoOf(db, chId).parentChanged === false);
+    check('親更新: 単品には効かない', sd.ackParentSnapshot(db, parentId, 'smoke') === false);
+    check('親更新: 履歴に残る',
+      db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'parent_snapshot_ack'`).get(chId).c === 1);
+    // 自動追随はしない = 親の値がセットに入ってこない
+    check('親更新: 親の値をセットに写さない (自動追随しない)',
+      db.prepare('SELECT price FROM product_drafts WHERE id = ?').get(chId).price == null);
+  }
+
   // 移行先が既にある場合 (先行デプロイ・自己修復で todo だけ作られた)。
   // 決着している方を採らないと、進んでいた商品が未着手に巻き戻る (Codex R1 medium)
   const halfId = Number(db.prepare(`
@@ -6101,6 +6323,20 @@ renders.push(
       { ...d0[2], setDrafts: sd.setDraftsOf(db, wfSetParentId), setInfo: null }]);
     renders.push(['detail.ejs (セット商品・仮コード警告)', 'detail.ejs',
       { ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId) }]);
+    // NE の進み (§5.3): 要対応で止まっていて、親も派生後に更新された状態。
+    // 配送方法は空 = セットはコピーしないので「NE確定待ち」が出る
+    renders.push(['detail.ejs (セット商品・NE要対応)', 'detail.ejs', {
+      ...d0[2], setDrafts: [], rakuten: { ...d0[2].rakuten, shipping_method_group: null },
+      neShipping: { group: null, label: null }, neCost: { ...d0[2].neCost, shippingMethod: null },
+      setInfo: {
+        ...sd.setInfoOf(db, wfSetDraftId),
+        provisional: true,   // 本コードを入れる前 (この画面の主役の状態)
+        neState: 'needs_action', neError: '商品コード「plastic-set」は既に使われています',
+        neRequestedAt: '2026-09-01T09:30:00.000Z', neRequestedBy: '中原 実紀',
+        parentChanged: true,
+        priceOrigin: { unit: 1980, qty: 2, total: 3960 },
+      },
+    }]);
   }
   // SKU別原価・売価 (2026-08-24): 原価がSKUで異なる分岐 (原価列 + SKU別売価入力 + 保存済み値)
   if (d0) {
@@ -6348,6 +6584,29 @@ renders.push(
       },
     };
   })()],
+  // NE要対応ビュー (2026-09-04 §5.5)。列ではなく表なので、行が読めるかを見る
+  ['board.ejs (NE要対応)', 'board.ejs', {
+    ...boardBase, boardView: 'ne',
+    board: { view: 'ne', columns: [], doneCards: [], doneTotal: 0, total: 3, truncated: false, checkingTotal: 0 },
+    neRows: [
+      { id: 96001, neCode: 'SET-plastic-01', name: 'プラスチックシール 2種セット', status: 'draft',
+        updatedAt: '2026-09-04T00:00:00Z', parentId: 901, parentNeCode: 'plastic', parentName: 'プラスチックシール',
+        members: 'plastic-ki × 1 + plastic-ks × 1', state: 'needs_action',
+        stateLabel: sd.NE_STATE_LABELS.needs_action, error: '商品コード「plastic-set」は既に使われています',
+        requestedAt: '2026-09-01T00:00:00Z', requestedBy: '中原 実紀', waitingDays: 3,
+        next: '理由を直して再要求する', stillTemporary: true },
+      { id: 96002, neCode: 'silicateclay800-2set', name: '有機 珪酸塩白土 800g 2個セット', status: 'draft',
+        updatedAt: '2026-09-03T00:00:00Z', parentId: 900, parentNeCode: 'silicateclay800', parentName: '珪酸塩白土',
+        members: 'silicateclay800 × 2', state: 'requested', stateLabel: sd.NE_STATE_LABELS.requested,
+        error: null, requestedAt: '2026-09-03T00:00:00Z', requestedBy: '中原 実紀', waitingDays: 1,
+        next: '本コードが決まったら入力する', stillTemporary: false },
+      { id: 96003, neCode: 'SET-shaganshi-01', name: '遮眼子 3個セット', status: 'draft',
+        updatedAt: '2026-09-04T00:00:00Z', parentId: 902, parentNeCode: 'shaganshi', parentName: '遮眼子',
+        members: 'shaganshi × 3', state: 'not_requested', stateLabel: sd.NE_STATE_LABELS.not_requested,
+        error: null, requestedAt: null, requestedBy: null, waitingDays: null,
+        next: 'ネクストエンジンに登録を依頼する', stillTemporary: true },
+    ],
+  }],
   ['board.ejs (空)', 'board.ejs', {
     ...boardBase,
     board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false, checkingTotal: 0 },
@@ -6387,6 +6646,9 @@ for (const [name, file, data] of renders) {
         isAdmin: true, myStaffId: null,
         mallStatus: ms.mallStatusOf(wfDraftId, { db }),
         setDrafts: [], setInfo: null,
+        // NE登録の進みの表示名 (2026-09-04)。router が board にも detail にも渡している
+        NE_STATE_LABELS: sd.NE_STATE_LABELS,
+        neRows: [],
         skuPrices: {},
         trailingBanners: [
           { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
@@ -6815,6 +7077,49 @@ for (const [name, file, data] of renders) {
     && bhSet.includes('出品準備') && !bhSet.includes('基本情報入力'), bhSet.slice(0, 200));
   check('セット工程ビュー: 列名と工程が同じなので投影のタグは出さない',
     !bhSet.includes('セット工程: '));
+
+  // NE要対応ビュー (§5.5)。列ではなく表 — 止まっているセットを1画面で見比べる
+  const bhNe = renderedHtml.get('board.ejs (NE要対応)') || '';
+  check('NE要対応: 表に状態・商品・コード・次にやること が出る',
+    bhNe.includes('NE: 要対応') && bhNe.includes('プラスチックシール 2種セット')
+    && bhNe.includes('SET-plastic-01') && bhNe.includes('理由を直して再要求する'), bhNe.slice(0, 200));
+  check('NE要対応: 止まっている理由をそのまま出す',
+    bhNe.includes('既に使われています'));
+  check('NE要対応: 親と構成が分かる',
+    bhNe.includes('plastic-ki × 1 + plastic-ks × 1'));
+  check('NE要対応: 依頼から3日以上は目立たせる (工程の滞留警告と同じ物差し)',
+    /class="ne-late"/.test(bhNe));
+  check('NE要対応: 仮コードは (仮) と分かり、本コード入力済みは「NE取込待ち」と出す',
+    bhNe.includes('(仮)') && bhNe.includes('NE取込待ち'));
+  check('NE要対応: 未要求には「NEに登録を依頼した」、要対応には「再要求」を出す',
+    bhNe.includes('NEに登録を依頼した') && bhNe.includes('再要求'), '');
+  check('NE要対応: 依頼済みには「登録できなかった」を出す',
+    bhNe.includes('登録できなかった'));
+  check('NE要対応: 列 (かんばん) は出さない',
+    !/<div class="kb">\s*<div class="kb-col/.test(bhNe));
+  check('NE要対応: タブに件数を出す', /kb-tab-n">3</.test(bhNe));
+
+  // セットの詳細画面 (§5.3)
+  const dhSet = renderedHtml.get('detail.ejs (セット商品・NE要対応)') || '';
+  check('セット詳細: NE の進みをステッパーで出す',
+    /class="ne-stepper"/.test(dhSet) && dhSet.includes('未要求') && dhSet.includes('要求済み・反映待ち')
+    && dhSet.includes('本コード確定'), dhSet.slice(0, 200));
+  check('セット詳細: 要対応なら理由まで出す',
+    dhSet.includes('要対応') && dhSet.includes('既に使われています'));
+  check('セット詳細: 依頼した日時と人を出す',
+    dhSet.includes('2026-09-01 09:30') && dhSet.includes('中原 実紀'), '');
+  check('セット詳細: 要対応には「再要求する」を出す',
+    /ne-state-btn[^>]*data-state="requested"/.test(dhSet));
+  check('セット詳細: 親が更新されていたら知らせ、確認するボタンを出す',
+    dhSet.includes('派生したあとに親商品が更新されています') && dhSet.includes('id="parent-ack-btn"'));
+  check('セット詳細: 売価の由来を1行で出す (単品×個数)',
+    dhSet.includes('単品 1,980円 × 2個') && dhSet.includes('3,960円'), '');
+  check('セット詳細: 配送方法は「NE確定待ち」と理由を出す (コピーしていないため)',
+    dhSet.includes('NE確定待ち') && dhSet.includes('個数で箱もサイズも変わる'), '');
+  // 単品の詳細にはセットの表示を出さない
+  const dhSingle = renderedHtml.get('detail.ejs') || '';
+  check('単品の詳細には NE の進みを出さない',
+    !/class="ne-stepper"/.test(dhSingle) && !dhSingle.includes('NE確定待ち'));
   check('セット工程ビュー: タブは自分が選ばれた状態になる',
     /class="kb-tab on"[^>]*href="[^"]*view=set"/.test(bhSet)
     || /href="[^"]*view=set"[^>]*class="kb-tab on"/.test(bhSet)

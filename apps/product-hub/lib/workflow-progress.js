@@ -15,7 +15,7 @@
  *     claim/lease と一覧タブが status を引き続き参照するため (実体化された導出値)
  */
 import { getDB, logEvent, gateReasons, imageTrackV2At, MATERIAL_STATUS_LABELS, GENERATION_BLOCK_CODES, CHECKING_REASON_LABELS } from '../db.js';
-import { describeSetDecision, SET_DECISIONS_CLOSING, SET_NE_STEP_CODE } from './set-decision.js';
+import { describeSetDecision, SET_DECISIONS_CLOSING, SET_NE_STEP_CODE, NE_STATE_LABELS } from './set-decision.js';
 
 /** セット展開判断の工程コード (判断を記録してからでないと決着できない)。単品側の工程 */
 const SET_REVIEW_STEP = 'set_review';
@@ -25,6 +25,9 @@ const SET_NE_STEP = SET_NE_STEP_CODE;
 const SET_PLANNER_STEPS = ['set_compose', SET_NE_STEP, 'set_content'];
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
 import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
+// NE 商品マスタでの実在判定 (単独 / バリエーション / 重複 / 除外) は variation.js が正。
+// 「確定できる行か」をここで書き直さない — 判定が 2 箇所に散ると必ずズレる
+import { resolveVariationGroupsBatch } from './variation.js';
 
 export const STEP_STATES = ['todo', 'doing', 'done', 'skip'];
 
@@ -1310,7 +1313,122 @@ function orderViewOf(view) {
   return 'main';
 }
 
-export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, checkingOnly = false, imageKind = null, limit = 800, mallSummary = null } = {}) {
+/**
+ * NE に本コードが載ったセットを確定させる (2026-09-04 §4.3)。画面を開いたついでに走らせる。
+ *
+ * 🚨 **表示用の LIMIT とは切り離して DB 全体から拾う** (Codex R2 medium)。
+ * 「表示されている行だけ」を見ると、古いセットは新しい商品に押し出されて永久に確定されず、
+ * NE登録の列に残り続ける。表示の前に走らせるので、確定した分はそのまま画面に反映される。
+ *
+ * 対象は「仮コード かつ mirror に同じ商品コードがある」= **確定しうる行だけ**。
+ * 仮コードのまま (SET-xxx) の行は mirror に無いので即座に落ち、通常は 0〜数件しか残らない。
+ * 全件を `reconcile` に通すと 1 回の GET が数千本の同期SQLになる (better-sqlite3 は同期 =
+ * その間イベントループが止まる) ため、この足切りが要る。照合は LOWER(TRIM())
+ * ([[feedback-sku-case-normalization]])。実在判定そのものは reconcile 側が厳密に行う。
+ *
+ * @param {(db, draft) => boolean} reconcile 確定処理 (循環 import を避けて呼び出し側から注入)
+ * @returns 確定させた件数
+ */
+export function reconcileConfirmableSets(db, reconcile, { max = 200 } = {}) {
+  if (typeof reconcile !== 'function') return 0;
+  // ① 仮コードのセットのうち、NE に同じ商品コードがある行 (= 確定しうる行)。
+  //    ここは上限を付けない — 数十件のオーダーで、次の一括判定で更に絞られる
+  const cands = db.prepare(`
+    SELECT d.id, d.ne_code, d.provisional_code, d.parent_draft_id
+    FROM product_drafts d
+    WHERE d.parent_draft_id IS NOT NULL AND d.provisional_code = 1
+      AND d.status NOT IN ('on_hold', 'excluded')
+      AND EXISTS (
+        SELECT 1 FROM mirror_products m
+        WHERE LOWER(TRIM(m.商品コード)) = LOWER(TRIM(d.ne_code))
+      )
+    ORDER BY d.updated_at
+  `).all();
+  if (cands.length === 0) return 0;
+  // ② 「確定できるか」の判定は**一括版に任せる** (Codex R3 medium)。
+  //    NE にコードが重複している (conflict) / バリエーションから外した (detached) 行は
+  //    reconcile が必ず false を返すので、候補に残すと毎回それが上限を食い潰し、
+  //    その後ろの確定できる行が永久に処理されない。判定を SQL に書き写すと
+  //    resolveVariationGroup と二重管理になるので、既存の一括判定をそのまま使う
+  const kinds = resolveVariationGroupsBatch(db, cands.map((d) => d.ne_code));
+  const confirmable = cands.filter((d) => {
+    const k = kinds.get(String(d.ne_code || '').trim().toLowerCase())?.kind;
+    return k === 'single' || k === 'variation';
+  });
+  let done = 0;
+  for (const d of confirmable.slice(0, max)) {
+    // 1 件の失敗で画面を潰さない (確定できなかった行は次に開いたときにまた拾う)
+    try { if (reconcile(db, { ...d })) done += 1; } catch { /* noop */ }
+  }
+  return done;
+}
+
+/**
+ * NE要対応ビューの行 (2026-09-04 §5.5)。
+ *
+ * 列 (かんばん) ではなく**表**。「NE に依頼したまま止まっているセット」を1画面で拾うためのもので、
+ * ボードの列に混ぜると 1 行が 1 枚のカードになって見比べられない。
+ * 本コードが確定したものは出さない (それはセット工程ビューで見る)。
+ *
+ * 並びは needs_action → requested (古い順) → not_requested。
+ * 「いま人が動かないと止まったままのもの」が上に来る。
+ * @param {(db, draft) => void} [reconcile] 本コードの取り込みを追いかける関数 (注入。
+ *   mirror は毎時なので、この画面を開くだけで追いつく。新しい定期実行は作らない)
+ */
+export function neRegistrationRows(db, { reconcile = null, limit = 300 } = {}) {
+  // 🚨 確定の取り込みは **表示のクエリより先に** 走らせる (Codex R2 medium)。
+  // 先に LIMIT で切ってから確定分を落とすと、表示件数に穴が空く
+  // (先頭 300 件が全部確定したら、301 件目以降に要対応があってもレスポンスは空になる)
+  reconcileConfirmableSets(db, reconcile);
+  // 🚨 並び順は **LIMIT の前に** SQL で効かせる (Codex R1 high)。
+  // updated_at で切ってから JS で並べ替えると、新しい「未要求」が上限を食い潰して、
+  // いちばん見たい「要対応」「何日も待っている依頼」が表から丸ごと消える
+  const rows = db.prepare(`
+    SELECT d.id, d.ne_code, d.name, d.status, d.updated_at, d.provisional_code,
+           d.ne_registration_state, d.ne_registration_error,
+           d.ne_registration_requested_at, d.ne_registration_requested_by,
+           p.id AS parent_id, p.ne_code AS parent_ne_code, p.name AS parent_name,
+           (SELECT GROUP_CONCAT(member_ne_code || ' × ' || qty, ' + ')
+              FROM (SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = d.id ORDER BY sort)) AS members
+    FROM product_drafts d
+    LEFT JOIN product_drafts p ON p.id = d.parent_draft_id
+    WHERE d.parent_draft_id IS NOT NULL AND d.provisional_code = 1
+      AND d.status NOT IN ('on_hold', 'excluded')
+    ORDER BY CASE COALESCE(d.ne_registration_state, 'not_requested')
+               WHEN 'needs_action' THEN 0
+               WHEN 'requested' THEN 1
+               WHEN 'processing' THEN 1
+               ELSE 2 END,
+             COALESCE(d.ne_registration_requested_at, d.updated_at),
+             d.id
+    LIMIT ?
+  `).all(limit);
+  // 確定済みは上の SELECT が provisional_code=1 で弾いているので、ここでの選別は要らない
+  // 並び順も SQL が決めている (ここで並べ替え直さない = 判断を 2 箇所に持たない)
+  return rows.map((r) => {
+    const state = r.ne_registration_state || 'not_requested';
+    return {
+      id: r.id, neCode: r.ne_code, name: r.name, status: r.status, updatedAt: r.updated_at,
+      parentId: r.parent_id, parentNeCode: r.parent_ne_code, parentName: r.parent_name,
+      members: r.members || null,
+      state,
+      stateLabel: NE_STATE_LABELS[state] || state,
+      error: r.ne_registration_error || null,
+      requestedAt: r.ne_registration_requested_at || null,
+      requestedBy: r.ne_registration_requested_by || null,
+      // 依頼してから何日経ったか (滞留は工程の stall_days が警告するが、表でも見えた方が早い)
+      waitingDays: r.ne_registration_requested_at ? daysSinceIso(r.ne_registration_requested_at) : null,
+      // 「次にやること」を文にして渡す (テンプレで状態から分岐させない)
+      next: state === 'needs_action' ? '理由を直して再要求する'
+        : state === 'requested' || state === 'processing' ? '本コードが決まったら入力する'
+          : 'ネクストエンジンに登録を依頼する',
+      // 仮コードそのものか (本コードを入れたが NE 未取込、との区別)
+      stillTemporary: /^SET-/i.test(String(r.ne_code || '')),
+    };
+  });
+}
+
+export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, checkingOnly = false, imageKind = null, limit = 800, mallSummary = null, reconcileSet = null } = {}) {
   // 要件定義の呼び名は all だが、既存の URL・保存済みの並び順は view='main'。別名として受ける
   if (view === 'all') view = 'main';
   const steps = db.prepare(`
@@ -1321,6 +1439,12 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // 進捗行がまだ 1 つも無いドラフトを先に埋める。これをやらないと、下の絞り込みが
   // draft_step_progress を見る以上、新規ドラフトが「自分のボール」に永久に出てこない
   ensureMissingProgress(db);
+
+  // 仮コードのセットが NE に載っていないか、ボードを開いたついでに見る (§4.3)。
+  // 🚨 下の LIMIT より**前**に走らせる — 表示対象の中だけを見ると、古いセットは
+  // 新しい商品に押し出されて永久に確定されない (Codex R2 medium)。
+  // mirror は毎時なので、画面を開くだけで追いつく (新しい定期実行は作らない)
+  reconcileConfirmableSets(db, reconcileSet);
 
   // 絞り込みがあるときは **LIMIT の前に** 対象を絞る (Codex R1 medium)。
   // 全件から updated_at 順に 800 件取ってから絞ると、件数が増えたとき古い未完了商品が
@@ -1421,6 +1545,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   const truncated = drafts.length > limit;
   if (truncated) drafts.length = limit;
 
+  // 仮コードのセットは、NE に本コードが載っていないか**ボードを開いたときにも**見る (§4.3)。
+  // mirror は毎時なので、画面を開くだけで追いつく (新しい定期実行は作らない)。
+  // 確定すれば工程「NE登録」も閉じるので、この後の集計に反映される
   // 工程を後から足した場合の穴埋め (行はあるが足りないケース)
   ensureProgressForMany(db, drafts.map((d) => d.id));
   const summary = progressSummaryFor(db, drafts.map((d) => d.id));
