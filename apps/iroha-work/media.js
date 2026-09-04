@@ -105,18 +105,20 @@ export function flushUnavailableReports() {
   const db = getDB();
   let n = 0;
   for (const [id, { reason, driveFileId }] of entries) {
-    if (driveFileId != null) {
-      const cur = db.prepare('SELECT drive_file_id FROM f_iroha_card_media WHERE id = ?').get(id);
-      if (!cur || cur.drive_file_id !== driveFileId) continue;   // 送り直された = 古い報告は捨てる
-    }
-    if (markMediaUnavailable(id, reason)) n++;
+    // 送り直されていれば (drive_file_id が変わっていれば) 何も起きない = 古い報告は捨てられる
+    if (markMediaUnavailable(id, reason, driveFileId == null ? undefined : driveFileId)) n++;
   }
   return n;
 }
 
-export function markMediaUnavailable(id, reason) {
-  return getDB().prepare(`UPDATE f_iroha_card_media SET unavailable_at = ?, error = ? WHERE id = ? AND unavailable_at IS NULL`)
-    .run(utcNow(), String(reason || 'unavailable').slice(0, 300), Number(id)).changes > 0;
+export function markMediaUnavailable(id, reason, driveFileId = undefined) {
+  // ⭐実体の照合は**この UPDATE の中で**行う。別に SELECT して確かめると、その間に管理画面から
+  //   送り直されて別の実体になり、新しい実体に古い 404 を貼ってしまう (Codex PR1 R13)
+  const sql = `UPDATE f_iroha_card_media SET unavailable_at = ?, error = ?
+    WHERE id = ? AND unavailable_at IS NULL${driveFileId === undefined ? '' : ' AND drive_file_id IS ?'}`;
+  const args = [utcNow(), String(reason || 'unavailable').slice(0, 300), Number(id)];
+  if (driveFileId !== undefined) args.push(driveFileId);
+  return getDB().prepare(sql).run(...args).changes > 0;
 }
 
 /** 先頭バイトだけ読む (動画をメモリへ丸ごと載せない) */
@@ -265,10 +267,20 @@ export function sweepStagedMedia(maxAgeMs = STAGE_TTL_MS) {
   let dropped = 0;
   // ⭐自分が見たときの札・時刻のままの行しか動かさない。見た後に同じ端末から再送されていたら、
   //   それは新しい要求のものなので触らない (Codex PR1 R10)
-  const dropIfSame = (r) => db.prepare('DELETE FROM f_iroha_card_media WHERE id = ? AND staged_claim IS ? AND staged_at = ?')
+  // 見た後に職員が消していたら、行は残したまま実体だけ片づける (履歴から行を消さない — Codex PR1 R13)
+  const dropIfSame = (r) => db.prepare(`DELETE FROM f_iroha_card_media
+    WHERE id = ? AND staged_claim IS ? AND staged_at = ? AND deleted_at IS NULL`)
     .run(r.id, r.staged_claim, r.staged_at).changes > 0;
   for (const r of rows) {
     const p = stagedPathOf(r.operation_id, r.kind, r.staged_claim);
+    // 前の札で置いたまま残ったファイル (再送の途中で落ちた分) をここでも片づける — Codex PR1 R13
+    try {
+      for (const f of fs.readdirSync(MEDIA_DIR)) {
+        if (f.startsWith(r.operation_id + '.') && path.join(MEDIA_DIR, f) !== p) {
+          try { fs.unlinkSync(path.join(MEDIA_DIR, f)); } catch { /* 消せなければ次の回に */ }
+        }
+      }
+    } catch { /* 保管場所がまだ無いだけ */ }
     if (!fs.existsSync(p)) {
       if (dropIfSame(r)) dropped++;
       continue;
@@ -315,7 +327,9 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
         .run(crypto.createHash('sha256').update(token).digest('hex'), claim, utcNow(), size, mime || null,
           worker.id, worker.display_name, deviceLabel, dup.id);
       const fresh = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(dup.id);
-      return { ok: true, already: true, media: publicMedia(fresh), deleteToken: token, claim,
+      // 前の札で置いたファイルはもうどの行からも指されない。呼び出し側が片づける (Codex PR1 R13)
+      const stale = dup.staged_claim && dup.staged_claim !== claim ? stagedPathOf(opId, dup.kind, dup.staged_claim) : null;
+      return { ok: true, already: true, media: publicMedia(fresh), deleteToken: token, claim, stale,
         move: { from: filePath, to: stagedPathOf(opId, dup.kind, claim) } };
     }
     if (dup.staged_at) {

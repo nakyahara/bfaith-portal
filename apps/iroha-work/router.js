@@ -900,6 +900,8 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
     if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' || r.error === 'operation_conflict' ? 409 : 400).json(r); }
     // 実体を置くのはトランザクションを抜けてから。置いてはじめて staging → stored に上げる。
     // 上げる前に落ちても、行は staging のまま = 一覧にも送信キューにも出ず、再送で置き直せる (Codex PR1 R7)
+    // 前の札で置いたファイルはもうどの行からも指されない (再送で置き場所が変わった) — 片づける
+    if (r.stale) { try { fs.unlinkSync(r.stale); } catch { /* 無ければよい */ } }
     if (r.move) {
       try {
         moveStoredFile(r.move);
@@ -952,6 +954,7 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
     }
     scheduleMedia();
     delete r.move;    // 保管場所のパスは画面に返さない
+    delete r.stale;   // 同上
     delete r.claim;   // 札はサーバーの中だけで使う
     res.json(r);
   } catch (e) {

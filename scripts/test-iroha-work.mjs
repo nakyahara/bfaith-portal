@@ -736,6 +736,14 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
       ok(flushUnavailableReports() === 1, 'キューの回で印を付ける');
       ok(getDB().prepare('SELECT unavailable_at FROM f_iroha_card_media WHERE id = ?').get(other).unavailable_at != null, '印が付いている');
       ok(flushUnavailableReports() === 0, '溜まった報告は一度で片づく');
+      // 報告してから反映するまでに送り直されていたら、新しい実体に古い 404 を貼らない (Codex PR1 R13)
+      getDB().prepare('UPDATE f_iroha_card_media SET unavailable_at = NULL, error = NULL, drive_file_id = ? WHERE id = ?')
+        .run('f-old-file', other);
+      reportMediaUnavailable(other, 'Drive 404', 'f-old-file');
+      getDB().prepare('UPDATE f_iroha_card_media SET drive_file_id = ? WHERE id = ?').run('f-new-file', other);
+      ok(flushUnavailableReports() === 0, '送り直された後なら印を付けない');
+      ok(getDB().prepare('SELECT unavailable_at FROM f_iroha_card_media WHERE id = ?').get(other).unavailable_at == null,
+        '新しい実体に古い 404 は貼られない');
       getDB().prepare('UPDATE f_iroha_card_media SET unavailable_at = NULL, error = NULL WHERE id = ?').run(other);
     }
     // 印の解除は Drive で実在を確かめてから (未検証のまま候補へ戻さない — Codex R2 #3)
@@ -1308,6 +1316,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-stage-0001', deferMove: true });
     ok(again.ok && again.already && again.media.id === st.media.id && again.move, '撮った端末からの再送は同じ行を返し、置き直す指示が付く');
     ok(again.claim && again.claim !== st.claim, '札は要求ごとに新しくなる (古い要求は公開できない)');
+    ok(again.stale && again.stale === st.move.to, '前の札で置いたファイルを片づける指示が付く (置き場所が変わるため)');
     moveStoredFile(again.move);
     ok(promoteStagedMedia(again.media.id, again.move.to, { claim: st.claim }).reason === 'taken', '古い札では公開できない');
     const promoted = promoteStagedMedia(again.media.id, again.move.to, { claim: again.claim });
@@ -1363,6 +1372,8 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
         db.prepare("UPDATE f_iroha_card_media SET staged_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(st4.media.id);
         const sw0 = sweepStagedMedia();
         ok(sw0.promoted === 0 && sw0.dropped === 0, '片づけの対象にもしない (消された行はそのまま履歴に残す)');
+        ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media WHERE id = ?').get(st4.media.id).c === 1,
+          '行そのものは消さない (論理削除の記録を残す)');
         db.prepare('DELETE FROM f_iroha_card_media WHERE id = ?').run(st4.media.id);
         try { fs.unlinkSync(st4.move.to); } catch { /* 無ければよい */ }
       }
@@ -2650,7 +2661,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/<span id="dstateWrap"><\/span>/.test(html) && !/<button class="st todo" id="dstate"/.test(html), '状態のボタンは静的に置かない (許されたときだけ描く)');
   ok(/can\('task\.status\.change'\)\s*\?\s*'<button class="st /.test(html) && /'<span class="st ro /.test(html), '許されなければ状態は札 (span) で出す');
   ok(/if \(!reg \|\| !can\('task\.master\.edit'\)\) return/.test(html), '作業のやり方の「変更・登録」は許されたときだけ data-reg を付ける');
-  ok(/const addP = can\('task\.media\.add'\) && photos < 3/.test(html), '「写真をとる」の枠は許されたときだけ');
+  ok(/const addP = can\('task\.media\.add'\) && photos < 3/.test(html)
+    && /const photos = media\.filter\(m => m\.kind === 'photo'\)\.length \+ pending\.filter\(p => p\.kind === 'photo'\)\.length;/.test(html),
+    '「写真をとる」の枠は許されたときだけ。送信中の分も枚数に数える (Codex PR1 R13)');
   ok(/own && can\('task\.media\.add'\)/.test(html) && /\(canPhoto \? pend : ''\)/.test(html), '写真の × と送信中の枠も許されたときだけ');
   ok(/if \(!can\('task\.work\.start'\)\) \{/.test(html), '「作業をはじめる」「中断」「できあがり」は許されたときだけ');
   ok(/can\('task\.plan\.assign'\) && \(c\.status === 'not_started'/.test(html) && /can\('task\.external_ready'\) && c\.status !== 'closed'/.test(html)

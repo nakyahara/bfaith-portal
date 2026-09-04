@@ -1558,9 +1558,11 @@ function prevCardHtml(c) {
 function mediaCardHtml(c) {
   // 動画は当面なし (VIDEO_ENABLED)。既に撮ってあるものも画面には出さない (データは消していない)
   const media = VIDEO_ENABLED ? c.media : c.media.filter(m => m.kind === 'photo');
-  const photos = media.length;
   const tiles = media.map(mediaTile).join('');
-  const pend = [...pendingTiles.values()].filter(p => p.pageId === c.id).map(p =>
+  const pending = [...pendingTiles.values()].filter(p => p.pageId === c.id);
+  // 送信中の分も枚数に数える (撮って・縮めて・送ってから断られないように — Codex PR1 R13)
+  const photos = media.filter(m => m.kind === 'photo').length + pending.filter(p => p.kind === 'photo').length;
+  const pend = pending.map(p =>
     '<div class="ph' + (p.failed ? ' err' : '') + '">' +
     (p.previewUrl ? '<img src="' + p.previewUrl + '" alt="">' : '<div><span class="ic">' + KIND_ICON[p.kind] + '</span></div>') +
     (p.failed ? '<button class="reg" onclick="retryUpload(event,\'' + p.opId + '\')">↻ 再送</button>' : '<span class="stx">送信中</span>') +
@@ -1568,7 +1570,7 @@ function mediaCardHtml(c) {
   // 撮る・送り直す・消す は許されたときだけ描く (下見・履歴では写真は見るだけ)
   const canPhoto = can('task.media.add');
   const addP = can('task.media.add') && photos < 3 ? '<div class="ph add" onclick="pickMedia(\'photo\')"><div><span class="ic">📷</span>写真を<br>とる</div></div>' : '';
-  const videos = VIDEO_ENABLED ? c.media.filter(m => m.kind === 'video').length : 0;
+  const videos = VIDEO_ENABLED ? c.media.filter(m => m.kind === 'video').length + pending.filter(p => p.kind === 'video').length : 0;
   const addV = VIDEO_ENABLED && canPhoto && videos < 1 ? '<div class="ph add mov" onclick="pickMedia(\'video\')"><div><span class="ic">🎥</span>動画を<br>とる</div></div>' : '';
   return '<div class="dcard"><h3 class="sec">今回のできあがり — 次回の見本になります</h3>' +
     '<div class="photos">' + tiles + (canPhoto ? pend : '') + addP + addV + '</div>' +
