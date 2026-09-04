@@ -6922,6 +6922,30 @@ for (const [name, file, data] of renders) {
     }
   }
 
+{
+  // ジャンルを差し替えたとき、前のジャンルの属性が残ると出品直前に IE1002 で弾かれる。
+  // その場で気づけるよう、辞書に無い属性を赤くして一覧を出す (2026-09-04)
+  const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+  check('属性のずれ: 警告の置き場所が属性表にある', src.includes('id="rk-attr-unknown"'));
+  check('属性のずれ: 判定は属性候補の描画と同じタイミングで走る (呼び忘れが起きない)',
+    /function renderAttrSuggest\(\)\s*\{\s*markAttrsNotInGenre\(\);/.test(src));
+  check('属性のずれ: 単品の行と SKU 表の行の両方を見る',
+    /#rk-attrs tbody tr \.rk-attr-name/.test(src.slice(src.indexOf('function markAttrsNotInGenre')))
+    && /#rk-sku-grid tr\.sku-grid-attr/.test(src.slice(src.indexOf('function markAttrsNotInGenre'))));
+  check('属性のずれ: 出品前チェックと同じ言葉 (IE1002) で知らせる',
+    src.slice(src.indexOf('function markAttrsNotInGenre')).includes('IE1002'));
+  {
+    const fn = src.slice(src.indexOf('function markAttrsNotInGenre'), src.indexOf('function renderAttrSuggest'));
+    // 装飾はクラスで重ねる。style を直接書くと addAttrRow が塗った必須属性の枠色を消す (Codex R3)
+    check('属性のずれ: 装飾はクラスの付け外しで行う (必須属性の枠色を消さない)',
+      /classList\.toggle\('attr-unknown'/.test(fn) && !/\.style\[/.test(fn) && !/style\.borderColor\s*=/.test(fn), fn.slice(0, 200));
+    check('属性のずれ: 辞書が空のときは何も赤くしない (取得前に全部を誤検知しない)',
+      /known\.size > 0/.test(fn));
+    check('属性のずれ: 専用クラスのスタイルが定義されている',
+      /input\.attr-unknown\s*\{/.test(src) && /th\.attr-unknown\s*\{/.test(src));
+  }
+}
+
   // ─── 楽天項目の保存が「前回の選択」を進めること (2026-09-03 #1152 / Codex R3 high) ───
   // この画面は保存後に再読み込みしない経路があるので、送れた配送方法まで shipSelectInitial を
   // 進めないと、2 回目以降の保存で毎回「複合選択肢を選び直した」と誤判定してしまい、

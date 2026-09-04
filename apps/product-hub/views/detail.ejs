@@ -1,5 +1,9 @@
 <%- include('_header') %>
 <style>
+/* いまのジャンルの属性辞書に無い属性 (#1165)。必須属性の薄い赤 (#fca5a5・インライン) とは
+   別物なので、インラインスタイルを書き換えずクラスで重ねる */
+input.attr-unknown { border-color: #dc2626 !important; background: #fef2f2; }
+th.attr-unknown { color: #dc2626; }
   /* 説明文3欄プレビュー: 送信HTMLの画像は width=100% (楽天ページでは正)。
      プレビュー枠で原寸表示すると巨大な帯になって読めないため、表示だけスマホ幅相当に
      縮小して中央寄せする (コピーされるHTMLはそのまま — 2026-08-05 中原さん指摘) */
@@ -1789,6 +1793,8 @@
     <script type="application/json" id="rk-mandatory-json"><%- JSON.stringify(genreDict ? genreDict.attributes.filter((a) => a.mandatory).map((a) => a.name) : []).replace(/</g, '\\u003c') %></script>
     <%# このジャンルで使える属性の候補 (2026-08-31 中原さん要望: 何を入れられるかが分からず、
         既存の類似商品を見て手打ちしている。押すと行が増える形にして、入力欄は必要な分だけにする) %>
+    <%# ジャンルを差し替えたときに残る「前のジャンルの属性」を出品前に気づけるようにする (#1165) %>
+    <div id="rk-attr-unknown" style="margin-top:10px;"></div>
     <div id="rk-attr-suggest" style="margin-top:10px;"></div>
     <%# 候補ボタン用にジャンルの全属性 (必須+任意)。名前・必須・入力方式・単位・上限だけあれば足りる %>
     <script type="application/json" id="rk-attrdict-json"><%- JSON.stringify(genreDict ? genreDict.attributes.map((a) => ({ name: a.name, mandatory: !!a.mandatory, inputMethod: a.inputMethod || null, unit: a.unit || null, maxLength: a.maxLength || null, multiValueLimit: a.multiValueLimit || null })) : []).replace(/</g, '\\u003c') %></script>
@@ -2672,7 +2678,42 @@
     return names;
   }
 
+  // 今のジャンルの辞書に無い属性を目立たせる (2026-09-04 中原さん要望)。
+  // ジャンルを差し替えると、前のジャンルでだけ必要だった属性が行に残る。値は消さない方が
+  // 正しい (同じ属性名なら使い回せる) 一方、辞書に無い属性は**出品直前のチェックで
+  // IE1002 として弾かれる**ので、差し替えたその場で気づけるようにする。
+  // 消す手段は各行の × ボタン (既にある) に任せる
+  function markAttrsNotInGenre() {
+    const box = document.getElementById('rk-attr-unknown');
+    const known = new Set(attrDict.map((a) => a.name));
+    const stale = [];
+    // 装飾はクラスの付け外しで行う。addAttrRow が必須属性の枠色をインラインで塗っているので、
+    // style を直接書き換えると正常な必須属性の表示を消してしまう (Codex R3)
+    const paint = (el, name) => {
+      const bad = !!name && known.size > 0 && !known.has(name);
+      el.classList.toggle('attr-unknown', bad);
+      el.title = bad ? 'このジャンルの属性辞書にありません。このままだと出品時に IE1002 で止まります' : '';
+      if (bad && !stale.includes(name)) stale.push(name);
+    };
+    document.querySelectorAll('#rk-attrs tbody tr .rk-attr-name').forEach((el) => {
+      paint(el, String(el.value || '').trim());
+    });
+    document.querySelectorAll('#rk-sku-grid tr.sku-grid-attr').forEach((tr) => {
+      const th = tr.querySelector('th');
+      if (th) paint(th, String(tr.dataset.name || '').trim());
+    });
+    if (!box) return;
+    box.textContent = '';
+    if (attrDict.length === 0 || stale.length === 0) return;
+    const msg = document.createElement('div');
+    msg.style.cssText = 'font-size:12px; color:#b45309; border:1px solid #fcd34d; background:#fffbeb; border-radius:6px; padding:6px 8px;';
+    msg.textContent = '⚠ いまのジャンルに無い属性が ' + stale.length + ' 件あります: ' + stale.join(' / ')
+      + '　このままだと出品時に止まります (登録エラー IE1002)。表の × で外してください';
+    box.appendChild(msg);
+  }
+
   function renderAttrSuggest() {
+    markAttrsNotInGenre();
     const box = document.getElementById('rk-attr-suggest');
     if (!box) return;
     box.textContent = '';
