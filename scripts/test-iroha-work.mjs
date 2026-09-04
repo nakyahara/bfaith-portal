@@ -2947,7 +2947,33 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v2'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v3'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  // ══ P2: ボードに 3 軸を載せる (要件 §W-4) ══
+  ok(/<div id="gaugeWrap"><\/div>/.test(html) && !/class="gauge"/.test(html.slice(0, html.indexOf('<script'))),
+    '明日やる分のゲージは静的に置かない (職員のときだけボタンにする)');
+  ok(/if \(!stateCan\('task\.plan\.assign'\)\) return '<div class="gauge">' \+ inner \+ '<\/div>';/.test(html),
+    '許可が無ければゲージはただの表示 (「明日の計画 ›」の入口を描かない)');
+  ok(/function planTagsHtml\(c\)/.test(html) && /const canFac = stateCan\('task\.facility\.assign'\);/.test(html)
+    && /const canWhen = stateCan\('task\.plan\.assign'\);/.test(html),
+    'カードの「どこが」「いつ」の札は許可リストで出し分ける');
+  ok(/canFac\s*\r?\n?\s*\? '<button class="tag ' \+ facCls \+ '" data-fac-of=/.test(html) && /: '<span class="tag ' \+ facCls \+ '"/.test(html),
+    '許可が無ければ札は span で描く (ボタンを描いて無効にしない)');
+  ok(/function toggleTomorrow\(id\) \{\r?\n\s+if \(!stateCan\('task\.plan\.assign'\)\) return;/.test(html)
+    && /function openFacPick\(id\) \{\r?\n\s+if \(!stateCan\('task\.facility\.assign'\)\) return;/.test(html),
+    '札の入口でも許可リストを見る (二重の守り)');
+  ok(/const facBtn = e\.target\.closest\('\[data-fac-of\]'\);/.test(html) && /e\.stopPropagation\(\); openFacPick/.test(html),
+    '札のタップはカードを開くより先に受ける (札を押したのに詳細が開かない)');
+  ok(/boardCols = 'status'/.test(html) && /\[\['status', '進捗'\], \['fac', '拠点'\]\]/.test(html) && !/\['when', '予定'\]/.test(html),
+    '列の分け方は 進捗 / 拠点 だけ (「予定」の列は作らない = また 1 列に 2 つの意味が混ざる)');
+  ok(/curWhen !== 'all' && \(curWhen === 'none' \? !!c\.when : c\.when !== curWhen\)/.test(html),
+    '「予定」は列ではなく絞り込み (すべて/今日やる/明日やる/未定)');
+  ok(/one\('all', 'すべて'\) \+ one\('none', '未定'\)/.test(html), '拠点の絞り込みに「未定」がある');
+  ok(/function staffLeftText\(\)/.test(html) && /職員モード あと/.test(html), '職員モードの残り時間を小さく出す');
+  ok(/async function askStaffUnlock\(\)/.test(html) && /'\/api\/staff-unlock'/.test(html),
+    '職員モードが切れていたら PIN を聞いて、そのまま続きをやる');
+  ok(/'\/api\/plan'/.test(html) && /'\/api\/facility'/.test(html), '新しい口 (/api/plan・/api/facility) を使う');
+  ok(!/'\/api\/planned'/.test(html), '古い口 (/api/planned) はもう画面から呼ばない');
+  ok(/'planned_date', 'when',/.test(html), '応答の when をカードに反映する (札がすぐ変わる)');
 }
 
 console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許可リスト');
