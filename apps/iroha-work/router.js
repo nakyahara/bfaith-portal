@@ -87,8 +87,26 @@ function staffModeOf(req) {
 }
 
 /**
+ * 書く直前に (更新と同じトランザクションの中で) もう一度確かめる関門。
+ * 職員モードが切れていないか + その人がいまも有効な職員か (別の接続で無効にされ得る — Codex P1 R2)
+ */
+function planGuardOf(req, worker) {
+  return () => {
+    if (!staffModeOf(req).staff) return { ok: false, error: 'staff_required', message: '職員モードが切れました (PINを入れ直してください)' };
+    if (hasSessionAccess(req)) return null;   // ポータルの人は名簿の状態に関係なく職員
+    const now = getIrohaWorker(worker.id);
+    if (!now || !now.active || now.worker_type !== 'staff') {
+      return { ok: false, error: 'staff_required', message: 'この作業者は計画を決められません (一覧を更新してください)' };
+    }
+    return null;
+  };
+}
+
+/**
  * 計画の操作 (いつ / どこが) の入口。職員モード中ならそのまま、そうでなければ職員 PIN を受け付ける
  * (受け取ったらその端末を職員モードにする = 続けてタップできる)。
+ * ⚠**送られてきた中身を確かめた後に呼ぶこと**。先に呼ぶと、中身が不正で 400 を返すのに
+ *   端末だけ 30 分開いてしまう (Codex P1 R2)
  * @returns {{ok:true, worker, staffUntil}} | {{ok:false, status, body}}
  */
 function requireStaffPlan(req) {
@@ -328,6 +346,7 @@ router.get('/api/state', api(async (req, res) => {
     ? { fresh: true, lastRefreshAt: new Date().toISOString(), error: null, truncated: false }
     : await ensureFresh();
   const list = appMode ? buildTaskList() : buildList();
+  const staffMode = staffModeOf(req);   // 1 回だけ読む (許可リストと staff_mode が食い違わない — Codex P1 R2)
   res.json({
     ok: true,
     ...list,
@@ -336,8 +355,8 @@ router.get('/api/state', api(async (req, res) => {
     refresh,
     // 画面に許す操作。画面はこのリストにある操作だけ描く (default-deny — 要件 v1.3 §P Q5)。
     // 計画 (いつ / どこが) は職員モードのときだけ入る (要件 §W-1)
-    capabilities: capabilitiesFor(appMode ? 'app' : 'notion', { staff: staffModeOf(req).staff }),
-    staff_mode: staffModeOf(req),
+    capabilities: capabilitiesFor(appMode ? 'app' : 'notion', { staff: staffMode.staff }),
+    staff_mode: staffMode,
     // タイマー表示の基準 (iPad の時計を信じない — 画面はこの値とのオフセットで経過を出す)
     serverNow: new Date().toISOString(),
     me: { session: req.iwUser || null, device: req.iwDevice ? { id: req.iwDevice.id, label: req.iwDevice.label } : null, admin: isAdmin(req) },
@@ -485,14 +504,21 @@ function publicTask(t) {
  */
 router.post('/api/planned', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
-  const gate = requireStaffPlan(req);
-  if (!gate.ok) return res.status(gate.status).json(gate.body);
   const plannedTaskId = parseTaskId(req.body?.id);
   if (plannedTaskId == null) return res.status(400).json(BAD_TASK_ID);
+  // ⭐入れられる日付は「今日 / 明日 / 未定」だけ (新しい /api/plan と同じ)。
+  //   ここを開けたままだと、古い入口から先の日付や存在しない日付を直に入れられる (Codex P1 R2)
+  const dateIn = req.body?.planned_date ?? null;
+  const todayP = jstToday();
+  if (dateIn !== null && dateIn !== todayP && dateIn !== jstTomorrow(todayP)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '入れられるのは今日か明日だけです (画面を更新してください)' });
+  }
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
   const r = setPlannedDate({
-    taskId: plannedTaskId, plannedDate: req.body?.planned_date ?? null, expectVersion: req.body?.expect_version,
+    taskId: plannedTaskId, plannedDate: dateIn, expectVersion: req.body?.expect_version,
     actor: `${gate.worker.display_name} (いろはアプリ)`, workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req),
-    guard: () => (staffModeOf(req).staff ? null : { ok: false, error: 'staff_required', message: '職員モードが切れました (PINを入れ直してください)' }),
+    guard: planGuardOf(req, gate.worker),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
   res.json({ ok: true, task: publicTask(r.task) });
@@ -530,21 +556,22 @@ router.post('/api/staff-lock', checkOrigin, api((req, res) => {
 const PLAN_WHEN = new Set(['today', 'tomorrow']);
 router.post('/api/plan', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
-  const gate = requireStaffPlan(req);
-  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  // ⭐中身を先に見る (不正な要求で職員モードだけ開いてしまわないように — Codex P1 R2)
   const taskId = parseTaskId(req.body?.id);
   if (taskId == null) return res.status(400).json(BAD_TASK_ID);
   const when = req.body?.when ?? null;
   if (when !== null && !PLAN_WHEN.has(when)) {
     return res.status(400).json({ ok: false, error: 'bad_request', message: 'when は today / tomorrow / null のどれかです' });
   }
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
   const today = jstToday();
   const date = when === 'today' ? today : when === 'tomorrow' ? jstTomorrow(today) : null;
   const r = setPlannedDate({
     taskId, plannedDate: date, expectVersion: req.body?.expect_version,
     actor: `${gate.worker.display_name} (いろはアプリ)`, workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req),
-    // 書く直前にも職員モードを見る (見てから書くまでに終了・期限切れが起こり得る — 要件 §U-2)
-    guard: () => (staffModeOf(req).staff ? null : { ok: false, error: 'staff_required', message: '職員モードが切れました (PINを入れ直してください)' }),
+    // 書く直前にも職員モードと「いまも有効な職員か」を見る (要件 §U-2)
+    guard: planGuardOf(req, gate.worker),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
   res.json({ ok: true, task: publicTask(r.task), staff_mode: staffModeOf(req) });
@@ -556,18 +583,19 @@ router.post('/api/plan', checkOrigin, api((req, res) => {
  */
 router.post('/api/facility', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
-  const gate = requireStaffPlan(req);
-  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  // ⭐中身を先に見る (不正な要求で職員モードだけ開いてしまわないように — Codex P1 R2)
   const taskId = parseTaskId(req.body?.id);
   if (taskId == null) return res.status(400).json(BAD_TASK_ID);
   const code = req.body?.facility_code ?? null;
   if (code !== null && typeof code !== 'string') {
     return res.status(400).json({ ok: false, error: 'bad_request', message: 'facility_code は拠点コードか null です' });
   }
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
   const r = setFacility({
     taskId, facilityCode: code, expectVersion: req.body?.expect_version,
     actor: `${gate.worker.display_name} (いろはアプリ)`, workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req),
-    guard: () => (staffModeOf(req).staff ? null : { ok: false, error: 'staff_required', message: '職員モードが切れました (PINを入れ直してください)' }),
+    guard: planGuardOf(req, gate.worker),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
   res.json({ ok: true, task: publicTask(r.task), staff_mode: staffModeOf(req) });

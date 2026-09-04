@@ -1800,9 +1800,10 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         db.prepare('SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ?').get(closedId).c,
       ]);
       const staffHist = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+      const SVC = await import('../apps/iroha-work/service.js');
       const beforeHist = snapHist();
       const closedWrites = [
-        ['/api/planned', { id: closedId, worker_id: w1.id, planned_date: '2099-12-31', expect_version: TD.getTask(closedId).version }, 'admin'],
+        ['/api/planned', { id: closedId, worker_id: w1.id, planned_date: SVC.jstToday(), expect_version: TD.getTask(closedId).version }, 'admin'],
         ['/api/review-cleared', { id: closedId, worker_id: staffHist.id, pin: '4649', expect_version: TD.getTask(closedId).version }],
         ['/api/label-waits', { task_id: closedId, worker_id: w1.id, fields: { note: '履歴に足す' } }],
         ['/api/master', { id: closedId, code: 'HIST-A', worker_id: w1.id, fields: { note: 'x' }, expect_version: 1 }],
@@ -2053,6 +2054,31 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         ok((await call('GET', '/api/plan', { cookie })).status === 200, '拠点が未定のカードがあっても明日の計画が開ける');
         ok((await call('GET', '/api/task-previews/' + t3, { cookie })).status === 200, '拠点が未定でも詳細が開ける');
         ok((await call('GET', '/api/history', { cookie })).status === 200, '履歴も開ける');
+
+        // ⑫ 不正な要求では職員モードが開かない (中身を先に見る — Codex P1 R2)
+        await call('POST', '/api/staff-lock', { cookie });
+        const badWhen = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'someday', expect_version: v(), worker_id: staffP.id, pin: '4649' } });
+        ok(badWhen.status === 400, '知らない when は 400');
+        ok((await call('GET', '/api/state', { cookie })).json.staff_mode.staff === false, '正しい PIN でも、中身が不正なら職員モードは開かない');
+        const badId = await call('POST', '/api/facility', { cookie, body: { id: 'x', facility_code: 'iroha', worker_id: staffP.id, pin: '4649' } });
+        ok(badId.status === 400 && (await call('GET', '/api/state', { cookie })).json.staff_mode.staff === false, '拠点の口も同じ');
+
+        // ⑬ 古い入口も「今日 / 明日 / 未定」だけ (先の日付・存在しない日付を直に入れられない)
+        const far = await call('POST', '/api/planned', { ...admin, body: { id: t1, planned_date: '2099-12-31', expect_version: v(), worker_id: staffP.id } });
+        ok(far.status === 400 && far.json.error === 'bad_request', '古い入口に先の日付を送ると 400');
+        const nodate = await call('POST', '/api/planned', { ...admin, body: { id: t1, planned_date: '2026-02-31', expect_version: v(), worker_id: staffP.id } });
+        ok(nodate.status === 400, '存在しない日付も 400');
+        ok(TD.getTask(t1).planned_date == null, 'どちらも DB は変わらない');
+        const okOld = await call('POST', '/api/planned', { ...admin, body: { id: t1, planned_date: tomorrow, expect_version: v(), worker_id: staffP.id } });
+        ok(okOld.status === 200 && TD.getTask(t1).planned_date === tomorrow, '明日なら古い入口でも通る');
+
+        // ⑭ 書く直前に「いまも有効な職員か」を見る (別の接続で無効にされ得る)
+        await call('POST', '/api/staff-unlock', { cookie, body: { worker_id: staffP.id, pin: '4649' } });
+        setIrohaWorkerActive(staffP.id, false, 'test');
+        const gone = await call('POST', '/api/plan', { cookie, body: { id: t1, when: null, expect_version: v(), worker_id: staffP.id } });
+        ok(gone.status !== 200, '無効にされた職員では通らない');
+        ok(TD.getTask(t1).planned_date === tomorrow, 'DB も変わらない');
+        setIrohaWorkerActive(staffP.id, true, 'test');
       }
 
       // 名前のないカードの片づけ (管理者のみ・confirm 必須)
