@@ -171,6 +171,7 @@ const mediaDDL = (name) => `
       staged_at      TEXT,
       staged_claim   TEXT,
       delete_token_hash_prev TEXT,
+      delete_token_hashes    TEXT,
       CHECK (page_id IS NOT NULL OR task_id IS NOT NULL)
     );`;
 const MEDIA_INDEX_DDL = `
@@ -560,6 +561,7 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_card_media', 'staged_claim', 'TEXT');
   // 1 つ前の削除トークン (再送で配り直した直後、先に返したトークンが無効にならないように — Codex PR1 R10)
   addCol('f_iroha_card_media', 'delete_token_hash_prev', 'TEXT');
+  addCol('f_iroha_card_media', 'delete_token_hashes', 'TEXT');   // 未失効のトークン (新しい順・最大5世代)
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}

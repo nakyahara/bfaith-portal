@@ -574,6 +574,19 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   ok(!!a1b.deleteToken && a1b.deleteToken !== a1.deleteToken,
     '同じ端末からの再送には削除トークンを発行し直す (応答消失でも削除できる — PR3-R3)');
   const a1c = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a1c.jpg', jpeg), worker: worker1, deviceId: 22, operationId: 'op-photo-0001' });
+  // ⭐再送でトークンを配り直しても、前のトークンは何世代か生きている (応答の順が入れ替わっても
+  //   撮った本人が消せる — Codex PR1 R11)
+  {
+    const first = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('tok1.jpg', jpeg), worker: worker1, deviceId: 44, operationId: 'op-token-0001' });
+    const t1 = first.deleteToken;
+    let last = null;
+    for (const n of [2, 3, 4]) {
+      last = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('tok' + n + '.jpg', jpeg), worker: worker1, deviceId: 44, operationId: 'op-token-0001' }).deleteToken;
+    }
+    ok(t1 && last && t1 !== last, '再送のたびに新しいトークンを返す');
+    ok(softDeleteMedia(first.media.id, { deleteToken: t1 }).ok === true, '3 回配り直した後でも、最初のトークンで消せる');
+    ok(softDeleteMedia(first.media.id, { deleteToken: 'wrong-token' }).ok === false, '関係ないトークンでは消せない');
+  }
   ok(a1c.already === true && !a1c.deleteToken, '別端末からの同 operation_id にはトークンを返さない');
   ok(addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('bad.jpg', mp4), worker: worker1, operationId: 'op-bad-000001' }).error === 'bad_file',
     '中身が写真でなければ拒否 (Content-Type を信じない)');
@@ -1318,6 +1331,26 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       db.prepare('UPDATE f_iroha_tasks SET status = ?, close_reason = NULL, closed_at = NULL, closed_by = NULL WHERE id = ?').run(wasStatus, tOpen);
       db.prepare("DELETE FROM f_iroha_card_media WHERE operation_id = 'op-gate-00001'").run();
       try { fs.unlinkSync(st2.move.to); } catch { /* 無ければよい */ }
+      // 関門は Notion のカードに紐づく写真にも効く (page_id だけの行 — Codex PR1 R11)
+      const { cardWriteBlockReason } = await import('../apps/iroha-work/media.js');
+      ok(cardWriteBlockReason({ task_id: tOpen, page_id: null }) === null, 'アプリ正本の未終了カードなら書ける');
+      ok(cardWriteBlockReason({ task_id: 999999, page_id: null }) === 'card_required', '無いカードには書けない');
+      ok(cardWriteBlockReason({ task_id: null, page_id: 'pg-any' }) === 'notion_card_retired',
+        'アプリ正本になったら、Notion のカードに紐づく写真はもう変えられない');
+      // 置いている間に枠が埋まったら公開しない (Codex PR1 R11)
+      const st3 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('cap1.jpg'),
+        worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-cap-000001', deferMove: true });
+      moveStoredFile(st3.move);
+      const insPub = db.prepare(`INSERT INTO f_iroha_card_media (operation_id, task_id, product_code, kind, mime, size,
+          drive_file_id, status, worker_id, worker_name, created_at)
+        VALUES (?, ?, 'PROD-A', 'photo', 'image/jpeg', 100, ?, 'uploaded', ?, 'やまだ', ?)`);
+      insPub.run('op-cap-fill01', tOpen, 'f-cap-1', w1.id, new Date().toISOString());   // これで公開済みが上限の 3 枚
+      ok(mediaByTask().get(tOpen).length === 3, '公開済みが 3 枚 (上限) になった');
+      ok(promoteStagedMedia(st3.media.id, st3.move.to, { claim: st3.claim }).reason === 'cap_reached',
+        '枠が埋まっていれば公開しない (後から上限を超えない)');
+      db.prepare("DELETE FROM f_iroha_card_media WHERE operation_id IN ('op-cap-000001','op-cap-fill01')").run();
+      try { fs.unlinkSync(st3.move.to); } catch { /* 無ければよい */ }
+      ok(mediaByTask().get(tOpen).length === 2, '片づけて元に戻す');
     }
     // 後の検査 (「前回の完成形」の枚数) に影響させないよう片づける
     db.prepare('DELETE FROM f_iroha_card_media WHERE operation_id = ?').run('op-stage-0001');
@@ -1465,7 +1498,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       && !/page_id\s+TEXT NOT NULL/.test(newS), '作業時間: 新しい定義 (task_id FK・CHECK・page_id NULL 可) で作り直す');
     ok(/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/.test(newM) && /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/.test(newM)
       && /operation_id\s+TEXT NOT NULL UNIQUE/.test(newM), '写真: 同上 (UNIQUE も残る)');
-    const strip = (j) => JSON.stringify(JSON.parse(j).map((r) => { const { task_id, staged_at, staged_claim, delete_token_hash_prev, ...rest } = r; return rest; }));
+    const strip = (j) => JSON.stringify(JSON.parse(j).map((r) => { const { task_id, staged_at, staged_claim, delete_token_hash_prev, delete_token_hashes, ...rest } = r; return rest; }));
     ok(strip(rowsOf('f_iroha_work_sessions')) === pageRowsS && strip(rowsOf('f_iroha_card_media')) === pageRowsM, '行 (id・全列) はそのまま。task_id は NULL');
     ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE type='index' AND name IN ('idx_iroha_sessions_task','idx_iroha_media_task','idx_iroha_sessions_page','idx_iroha_media_page')").get().c === 4, '索引 4 本が作り直される');
     let bothNull = null;
@@ -1488,7 +1521,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     // (b) 途中の版 (page_id NULL 可・task_id あり・CHECK/FK 無し) — 全行 (task の行も) そのまま保って作り直す
     const allS = rowsOf('f_iroha_work_sessions'), allM = rowsOf('f_iroha_card_media');
     const MID_SESSIONS = OLD_SESSIONS.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER');
-    const MID_MEDIA = OLD_MEDIA.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER').replace('unavailable_at TEXT)', 'unavailable_at TEXT, staged_at TEXT, staged_claim TEXT, delete_token_hash_prev TEXT)');
+    const MID_MEDIA = OLD_MEDIA.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER').replace('unavailable_at TEXT)', 'unavailable_at TEXT, staged_at TEXT, staged_claim TEXT, delete_token_hash_prev TEXT, delete_token_hashes TEXT)');
     const allColsS = db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().map((c) => c.name).join(', ');
     const allColsM = db.prepare('PRAGMA table_info(f_iroha_card_media)').all().map((c) => c.name).join(', ');
     db.pragma('foreign_keys = OFF');
@@ -2543,7 +2576,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(!isApp\(\)\) \{ openPreviewDetail\(el\.dataset\.id\); return; \}\r?\n  if \(el\.dataset\.pick === '1'\) toggleBulk\(el\.dataset\.id\); else openDetail\(el\.dataset\.id\);/.test(html),
     '下見のカードは state の openDetail に流さない (id が正本のカードと別)');
   ok(/const canBulk = stateCan\('tasks\.bulk_stocked'\) &&/.test(html), '下見では「まとめて棚入完了」を出さない (許可リストで判定)');
-  ok(/\$\('#lwSave'\)\.disabled = !stateCan\('task\.label_wait\.edit'\);/.test(html), '下見ではラベル待ちを保存できない (許可リストで判定)');
+  ok(/<span id="lwSaveWrap"><\/span>/.test(html), 'ラベル待ちの「保存」は静的に置かない (許可されたときだけ描く — Codex PR1 R11)');
+  ok(/const may = stateCan\('task\.label_wait\.edit'\);/.test(html) && /wrap\.innerHTML = may \?/.test(html),
+    '下見ではラベル待ちの保存ボタンを描かない (無効化して見せるのではなく)');
   // 正本が変わったとき・つながらなかったときの追随 (Codex 下見 R1)
   ok(/if \(wasApp !== isApp\(\)\) \{[\s\S]{0,80}preview = null; previewAt = null; previewDown = false;/.test(html), '正本が変わったら下見のデータを捨てる (古い下見を新しく見せない)');
   ok(/if \(curView === 'board'\) \{ if \(isApp\(\)\) renderBoard\(\); else loadPreview\(\); \}/.test(html), '更新のたびに、Notion 正本なら下見も取り直す (502 から戻ったときもここで回復)');

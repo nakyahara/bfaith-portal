@@ -47,10 +47,10 @@ import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-che
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
 import {
-  addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
+  addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
   reportMediaUnavailable, recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
   listPageSyncForAdmin, resetPageSync,
-  isDriveConfigured, MEDIA_DIR, MAX_PHOTO_BYTES,
+  isDriveConfigured, MEDIA_DIR, MAX_PHOTO_BYTES, MAX_PHOTOS,
 } from './media.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -913,6 +913,12 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
       const promoted = promoteStagedMedia(r.media.id, r.move.to, { claim: r.claim });
       if (promoted.ok) {
         r.media = promoted.media;
+      } else if (promoted.reason === 'cap_reached') {
+        // 置いている間に他の写真で枠が埋まった (Codex PR1 R11)
+        try { dropMedia(r.media.id, r.claim); } catch { /* 消せなくても応答は失敗にする */ }
+        try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
+        return res.status(409).json({ ok: false, error: 'cap_reached',
+          message: `写真は${MAX_PHOTOS}枚までです。不要な写真を削除してから撮り直してください` });
       } else if (promoted.reason === 'not_writable') {
         // 実体を置いている間にカードが終了した / 正本が Notion に戻った。写真は残さない (Codex PR1 R10)
         try { dropMedia(r.media.id, r.claim); } catch { /* 消せなくても応答は失敗にする */ }
@@ -1023,14 +1029,18 @@ router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
 router.post('/api/media/:id(\\d+)/delete', checkOrigin, api((req, res) => {
   // 読むだけの写真は消せない: Notion 正本の間の tasks の写真 (下見) と、終了したカードの写真 (履歴)。
   // 画面は × を描かないが、撮った端末は削除トークンを持ったままなので、サーバーでも断る (要件 v1.3 §P Q5)
-  // ⭐判定と削除を 1 つのトランザクションに (判定の後・消す前に終了されると履歴の写真が消える — Codex PR1 R5)
+  // ⭐判定と削除を 1 つのトランザクションに (判定の後・消す前に終了されると履歴の写真が消える — Codex PR1 R5)。
+  //   判定は写真を足すときと同じ関門 = そのカードに**いま**書けるか (Notion のカードの写真も同じ — Codex PR1 R11)
   const out = getDB().transaction(() => {
     const row = getMediaRow(Number(req.params.id));
-    if (row && row.task_id != null) {
-      if (!isAppMode()) return { deny: { status: 409, body: PREVIEW_WRITE_REJECTED } };
-      const t = getTask(row.task_id);
-      if (t && t.status === 'closed') {
+    if (row && !row.deleted_at) {
+      const blocked = cardWriteBlockReason(row);
+      if (blocked === 'notion_mode') return { deny: { status: 409, body: PREVIEW_WRITE_REJECTED } };
+      if (blocked === 'closed_task') {
         return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: '終了したカードの写真は消せません (履歴として残ります)' } } };
+      }
+      if (blocked) {
+        return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: 'このカードの写真はもう変えられません (履歴として残ります)' } } };
       }
     }
     return { r: softDeleteMedia(Number(req.params.id), {

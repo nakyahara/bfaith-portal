@@ -176,20 +176,24 @@ export function stagedPathOf(opId, kind, claim) {
 export const STAGE_TTL_MS = 30 * 60 * 1000;
 
 /**
- * その写真の持ち主のカードに、**いま**書き込めるか (Codex PR1 R10)。
+ * その写真の持ち主のカードに、**いま**書き込めるか (Codex PR1 R10 / R11)。
  * 公開はトランザクションの外 (ファイルを置いた後) に来るので、確かめたときから
- * カードが終了したり正本が変わったりし得る。公開の瞬間にもここを通す。
+ * カードが終了したり正本が変わったりし得る。公開のときも、消すときもここを通す。
+ * @returns {null} 書ける / {string} 断る理由 (notion_mode / closed_task / card_required)
  */
-function cardWritableFor(row) {
+export function cardWriteBlockReason(row) {
   const db = getDB();
   const app = sourceOfTruth() === 'app';
   if (row.task_id != null) {
-    if (!app) return false;   // 正本が Notion に戻っていれば、tasks のカードは下見 = 読むだけ
+    if (!app) return 'notion_mode';   // 正本が Notion に戻っていれば、tasks のカードは下見 = 読むだけ
     const t = db.prepare('SELECT status FROM f_iroha_tasks WHERE id = ?').get(row.task_id);
-    return !!t && t.status !== 'closed';
+    if (!t) return 'card_required';
+    return t.status === 'closed' ? 'closed_task' : null;
   }
-  if (app) return false;      // 正本がアプリなら、Notion のカードにはもう書かない
-  return !!db.prepare('SELECT page_id FROM f_iroha_app_notion_cache WHERE page_id = ?').get(row.page_id);
+  // Notion のカードに紐づく写真。正本がアプリなら、もう Notion のカードには書かない
+  if (app) return 'notion_card_retired';
+  return db.prepare('SELECT page_id FROM f_iroha_app_notion_cache WHERE page_id = ?').get(row.page_id)
+    ? null : 'card_required';
 }
 
 /**
@@ -208,7 +212,15 @@ export function promoteStagedMedia(id, localPath, { claim = null, stagedAt = nul
     // 別の要求が先に置いて公開した (同じ operation_id の二重送信)。写真としては成立しているので、
     // その行をそのまま返す。実体は相手が置いたものが正 — こちらから消さない
     if (!cur.staged_at) return { ok: false, reason: 'taken', media: publicMedia(cur) };
-    if (!cardWritableFor(cur)) return { ok: false, reason: 'not_writable' };
+    if (cardWriteBlockReason(cur)) return { ok: false, reason: 'not_writable' };
+    // ⭐枚数上限も**この**トランザクションの中で見る。外で見ると、見た後・公開する前に
+    //   別の送信で枠が埋まる (30 分以上止まっていた送信が再開する場合も含む — Codex PR1 R11)
+    const max = cur.kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
+    const key = cur.task_id != null ? 'task_id' : 'page_id';
+    const live = db.prepare(`SELECT COUNT(*) c FROM f_iroha_card_media
+      WHERE ${key} = ? AND kind = ? AND deleted_at IS NULL AND staged_at IS NULL AND id != ?`)
+      .get(cur.task_id != null ? cur.task_id : cur.page_id, cur.kind, cur.id).c;
+    if (live >= max) return { ok: false, reason: 'cap_reached' };
     const n = db.prepare(`UPDATE f_iroha_card_media SET staged_at = NULL, staged_claim = NULL, local_path = ?
       WHERE id = ? AND staged_at IS NOT NULL AND staged_claim IS ?
         ${stagedAt == null ? '' : 'AND staged_at = ?'}`)
@@ -258,11 +270,9 @@ export function sweepStagedMedia(maxAgeMs = STAGE_TTL_MS) {
       if (dropIfSame(r)) dropped++;
       continue;
     }
-    // 実体は置けたが公開の前に落ちた → 写真は無事なので公開する。ただし、その間に新しい写真で
-    // 枠が埋まっていたら公開しない (後から上限を超えない — Codex PR1 R10)
-    const max = r.kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
-    const room = countActiveMedia({ pageId: r.page_id, taskId: r.task_id }, r.kind) < max;
-    if (room && promoteStagedMedia(r.id, p, { claim: r.staged_claim, stagedAt: r.staged_at }).ok) { promoted++; continue; }
+    // 実体は置けたが公開の前に落ちた → 写真は無事なので公開する。書けなくなっていたり
+    // 枠が埋まっていたら公開しない (判定は promoteStagedMedia の中 = 同じトランザクション)
+    if (promoteStagedMedia(r.id, p, { claim: r.staged_claim, stagedAt: r.staged_at }).ok) { promoted++; continue; }
     if (dropIfSame(r)) { dropped++; try { fs.unlinkSync(p); } catch { /* 無ければよい */ } }
   }
   if (promoted > 0 || dropped > 0) console.log(`[iroha-work] 置き去りの写真を片づけました 公開=${promoted} 破棄=${dropped}`);
@@ -313,10 +323,11 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
     // 限って**発行し直す (古いトークンは無効になる)。別端末からの同 operation_id には返さない
     if (deviceId != null && dup.uploader_device_id === Number(deviceId) && !dup.deleted_at) {
       const token = crypto.randomBytes(16).toString('base64url');
-      // ⭐直前のトークンも 1 つだけ生かしておく。同じ再送が二重に届くと、先に返したトークンが
-      //   端末に届く前に無効になり、撮った本人が消せなくなる (Codex PR1 R10)
-      db.prepare('UPDATE f_iroha_card_media SET delete_token_hash_prev = delete_token_hash, delete_token_hash = ? WHERE id = ?')
-        .run(crypto.createHash('sha256').update(token).digest('hex'), dup.id);
+      // ⭐前のトークンも 5 世代まで生かしておく。同じ再送が何本も重なって応答の順が入れ替わると、
+      //   端末に最後に届く応答が古い世代のこともある (撮った本人が消せなくなる — Codex PR1 R10 / R11)
+      const h = crypto.createHash('sha256').update(token).digest('hex');
+      db.prepare('UPDATE f_iroha_card_media SET delete_token_hashes = ?, delete_token_hash = ? WHERE id = ?')
+        .run(pushTokenHash(dup, h), h, dup.id);
       return { ok: true, already: true, media: publicMedia(dup), deleteToken: token };
     }
     return { ok: true, already: true, media: publicMedia(dup) };
@@ -448,14 +459,28 @@ export const cardKeyOf = (r) => (r.task_id != null ? `t${r.task_id}` : r.page_id
  * 論理削除。本人確認は**削除トークン** (アップロードした端末だけが持つ) か portal セッション。
  * 貼り直しはページ単位キューへ積む — 最後の1件を消したときも「空にする」PATCH が飛ぶ (Codex PR3 #1)
  */
+/** 有効な削除トークンのハッシュ一覧 (新しい順・最大 5 世代)。古い行は単一列しか持たない */
+const TOKEN_HISTORY = 5;
+function tokenHashesOf(row) {
+  let list = [];
+  try { list = JSON.parse(row.delete_token_hashes || '[]'); } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  if (row.delete_token_hash && !list.includes(row.delete_token_hash)) list.unshift(row.delete_token_hash);
+  if (row.delete_token_hash_prev && !list.includes(row.delete_token_hash_prev)) list.push(row.delete_token_hash_prev);
+  return list;
+}
+function pushTokenHash(row, hash) {
+  return JSON.stringify([hash, ...tokenHashesOf(row).filter((h) => h !== hash)].slice(0, TOKEN_HISTORY));
+}
+
 export function softDeleteMedia(id, { deleteToken = null, actor = null, isSession = false }) {
   const db = getDB();
   const row = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id));
   if (!row || row.deleted_at) return { ok: false, error: 'not_found', message: '写真・動画が見つかりません' };
   if (!isSession) {
     const hash = deleteToken ? crypto.createHash('sha256').update(String(deleteToken)).digest('hex') : null;
-    // 直前のトークンも受ける (再送で配り直した直後の 1 世代だけ — Codex PR1 R10)
-    if (!hash || (hash !== row.delete_token_hash && hash !== row.delete_token_hash_prev)) {
+    // 前に配ったトークンも受ける (再送が重なって応答の順が入れ替わっても消せるように — Codex PR1 R11)
+    if (!hash || !tokenHashesOf(row).includes(hash)) {
       return { ok: false, error: 'forbidden', message: '削除できるのは撮影した端末からだけです (職員はPCの管理画面から)' };
     }
   }

@@ -486,7 +486,7 @@
       </div>
       <div class="mbtns" style="margin-top:14px">
         <button class="btn" onclick="closeLw()">やめる</button>
-        <button class="btn primary" id="lwSave" onclick="saveLw()">保存</button>
+        <span id="lwSaveWrap"></span>
       </div>
       <p class="hint">Z ロケ = 一時保管 / Y ロケ = 出荷禁止。外部に預けるときは Z → Y、戻ってきたら Y → Z です。</p>
     </div>
@@ -1161,16 +1161,20 @@ function openLwNew(card) {
 }
 /** 下見のあいだは保存させない。ダイアログを開いたまま正本が変わっても追随する (Codex 下見 R1) */
 function renderLwSaveState() {
-  const btn = $('#lwSave');
-  if (!btn || !$('#lwOv').classList.contains('on')) return;
-  btn.disabled = !stateCan('task.label_wait.edit');   // 許可が無ければ押せない (保存の入口でも見る)
-  if (!stateCan('task.label_wait.edit')) $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)';
+  const wrap = $('#lwSaveWrap');
+  if (!wrap) return;
+  // ⭐許可が無ければボタンを**描かない** (無効化して見せるのではなく。他の操作と同じ — Codex PR1 R11)
+  const may = stateCan('task.label_wait.edit');
+  const had = !!$('#lwSave');
+  if (may !== had) wrap.innerHTML = may ? '<button class="btn primary" id="lwSave" onclick="saveLw()">保存</button>' : '';
+  if (!$('#lwOv').classList.contains('on')) return;
+  if (!may) $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)';
   else if ($('#lwMsg').textContent.startsWith('下見なので')) $('#lwMsg').textContent = '';
 }
 function fillLw(r, name) {
   $('#lwName').textContent = name || '—';
   $('#lwMsg').textContent = stateCan('task.label_wait.edit') ? '' : '下見なので保存できません (アプリを正本にすると使えます)';
-  $('#lwSave').disabled = !stateCan('task.label_wait.edit');
+  renderLwSaveState();
   $('#lwOccurred').value = r.occurred_on || '';
   $('#lwLot').value = r.lot_expiry || '';
   $('#lwQty').value = r.qty == null ? '' : r.qty;
@@ -1197,6 +1201,7 @@ async function saveLw() {
   const w = worker;
   if (!w) { openGate(); return; }
   const btn = $('#lwSave');
+  if (!btn) return;
   btn.disabled = true; $('#lwMsg').textContent = '保存しています…';
   try {
     const fields = {
