@@ -866,6 +866,11 @@ async function loadStateOnce() {
   // ボードを開いている間は、正本が Notion なら下見も取り直す (切替直後・502 から戻ったときもここで回復する)
   if (curView === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
   renderLwSaveState();
+  // ⭐計画の許可を失ったら、計画の画面と「どこが」の窓を閉じる (作った DOM を残さない — Codex P3 R1)
+  if (!stateCan('task.plan.assign')) {
+    if (curView === 'plan') { planData = null; setView('board'); }
+    if (facPickCtx) closeFacPick();
+  }
   restoreWorker();
   // 開いている詳細を追いかける。一覧・ボードのものは state から、下見・履歴のものは取り直す
   //   (取込や他の端末の操作で中身が変わる。「いまのアプリの記録」と書いている以上、古いまま置かない — Codex PR1 R2)
@@ -1320,12 +1325,15 @@ function openFacPick(id) {
     '<button class="opt" data-pick-fac="">未定にする</button>';
   openOverlay('#facOv');
 }
-function closeFacPick() { closeOverlay('#facOv'); facPickFor = null; planPendingWhen = null; }
+function closeFacPick() { closeOverlay('#facOv'); facPickFor = null; facPickCtx = null; }
 $('#facOpts').addEventListener('click', (e) => {
   const b = e.target.closest('[data-pick-fac]');
-  if (b && facPickFor != null) saveFacility(facPickFor, b.dataset.pickFac || null);
+  if (!b || !facPickCtx || facPickCtx.saving) return;   // 送信中の連打は受けない
+  facPickCtx.saving = true;
+  // ⭐このタップの内容をここで確定させる (通信の後にグローバルを読み直さない)
+  saveFacility(facPickCtx.id, b.dataset.pickFac || null, facPickCtx.thenWhen);
 });
-async function saveFacility(id, code) {
+async function saveFacility(id, code, thenWhen) {
   // 計画画面のカードは一覧に無いことがある (候補) ので、両方から探す
   const c = findCard(id) || planCard(id);
   const w = worker;
@@ -1334,25 +1342,27 @@ async function saveFacility(id, code) {
   const j = await apiFetch('/api/facility', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id, facility_code: code, expect_version: c.version, worker_id: w.id }) });
   if (!j.ok) {
+    if (facPickCtx) facPickCtx.saving = false;   // 直せるように戻す
     // 版がずれていたら最新を入れてから知らせる (古い版のまま押し続けても通らないため — Codex P2 R1)
-    if (j.current) { const inList2 = findCard(id); if (inList2) applyTask(inList2, j.current); redrawAfterPlan(); if (curView === 'plan') await loadPlan(); }
+    if (j.current) { const inList2 = findCard(id); if (inList2) applyTask(inList2, j.current); redrawAfterPlan(); if (curView === 'plan') await loadPlan({ force: true }); }
     $('#facMsg').textContent = j.message || '変えられませんでした';
     // 職員モードが切れていたら PIN を聞いて、そのまま同じ拠点をもう一度送る
-    return planError(j, () => saveFacility(id, code), { silent: true });
+    return planError(j, () => saveFacility(id, code, thenWhen), { silent: true });
   }
-  const pending = planPendingWhen;
   closeFacPick();
   if (j.staff_mode) state.staff_mode = j.staff_mode;
   const inList = findCard(id);
   if (inList) applyTask(inList, j.task);
-  if (pending) {
+  if (thenWhen) {
     // 「どこが」を決めた流れで、そのまま明日やる分に積む (版は保存で 1 つ進んでいるので取り直す)
-    await loadPlan();
-    await savePlanWhen(id, pending);
+    await loadPlan({ force: true });
+    const done = await savePlanWhen(id, thenWhen);
+    // ⭐2 段目が通らなかったら「拠点だけ変わった」ことをはっきり伝える (中途半端なまま黙らない)
+    if (!done) showWarn('「' + c.title + '」の作業する場所は変えましたが、明日やる分には入れられませんでした。もう一度お試しください');
     return;
   }
   redrawAfterPlan();
-  if (curView === 'plan') await loadPlan();   // 計画画面から変えたときは拠点別の内訳も直す
+  if (curView === 'plan') await loadPlan({ force: true });   // 計画画面から変えたときは拠点別の内訳も直す
   toast('「' + c.title + '」→ ' + (code ? facilityName(code) : '未定'));
 }
 
@@ -1386,22 +1396,30 @@ async function askStaffUnlock() {
 // ─── ⭐明日の計画 (職員だけ。ボードのゲージから開く。要件 §W-4) ───
 let planData = null;
 let planInflight = null;
+let planGen = 0;        // 取得の世代。遅れて返った古い応答で新しい中身を上書きしない
 
 function openPlanPage() {
   if (!stateCan('task.plan.assign')) return;   // 許可が無ければ開かない (入口も描いていない)
   setView('plan');
 }
-function loadPlan() {
-  if (planInflight) return planInflight;       // 同時に 1 本だけ (一覧・下見と同じ作り)
-  planInflight = loadPlanOnce().finally(() => { planInflight = null; });
+/**
+ * @param force 変えた後の取り直し。⭐進行中の取得を使い回さない —
+ *   その取得は変える前に始まっているので、待って使うと古い中身が残る (Codex P3 R1)
+ */
+function loadPlan({ force = false } = {}) {
+  if (planInflight && !force) return planInflight;   // 同時に 1 本だけ (一覧・下見と同じ作り)
+  const next = planInflight ? planInflight.catch(() => {}).then(() => loadPlanOnce()) : loadPlanOnce();
+  planInflight = next.finally(() => { if (planInflight === next) planInflight = null; });
   return planInflight;
 }
 async function loadPlanOnce() {
+  const gen = ++planGen;
   const j = await apiFetch('/api/plan');
+  if (gen !== planGen) return;   // 新しい取得が始まっていた → この応答は捨てる
   if (!j.ok) {
     // 職員モードが切れていたら PIN を聞いて、そのまま開き直す
     if (j.error === 'staff_required' || j.error === 'pin_required' || j.error === 'pin_invalid') {
-      if (await askStaffUnlock()) { await loadState(); return loadPlanOnce(); }
+      if (await askStaffUnlock()) { await loadState(); planGen = gen - 1; return loadPlanOnce(); }
       setView('board');
       return;
     }
@@ -1445,8 +1463,10 @@ function renderPlan() {
   const byFac = (d.by_facility || []).map((f) => '<span>' + esc(f.name) + ' ' + f.count + ' 件 · ' + esc(fmtHours(f.hours)) + '</span>').join('');
   const und = d.unassigned_count || 0;
   $('#planByFac').innerHTML = byFac + (und ? '<span class="warn">どこが未定 ' + und + ' 件</span>' : '');
+  // 「どこが」は許可があるときだけ描く (無効化して見せない — 要件 §U-7)
+  const pileActs = stateCan('task.facility.assign') ? [['どこが', '', 'fac'], ['－ 外す', '', 'none']] : [['－ 外す', '', 'none']];
   $('#planPile').innerHTML = pile.length === 0 ? '<div class="colempty">左の候補を「＋ 明日やる」で足してください</div>'
-    : pile.map((c) => pcardHtml(c, [['どこが', '', 'fac'], ['－ 外す', '', 'none']])).join('');
+    : pile.map((c) => pcardHtml(c, pileActs)).join('');
 }
 
 /** 計画画面のカード。理由 (なぜ上に出るか) を必ず添える */
@@ -1476,46 +1496,56 @@ function planAction(e) {
   const act = b.dataset.planAct;
   if (act === 'fac') { openPlanFacPick(id); return; }
   const when = act === 'none' ? null : act;
-  // ⭐候補から「明日やる」に積むときは、どこが作業するかも一緒に聞く (要件 §W-4)。
-  //   「まだ決めない」も選べる — 決まっていなくても積めるようにする
-  const c = planCard(id);
-  if (when === 'tomorrow' && c && !c.facility_code && stateCan('task.facility.assign')) {
-    planPendingWhen = when;
-    openPlanFacPick(id);
+  // ⭐「明日やる」に積むときは、どこが作業するかも一緒に聞く (要件 §W-4)。
+  //   すでに決まっているカードでも、いまの拠点を選んだ状態で確認してから積む。
+  //   「まだ決めない」も選べる (決まっていなくても積める)。拠点を変えられない人はそのまま積む
+  if (when === 'tomorrow' && planCard(id) && stateCan('task.facility.assign')) {
+    openPlanFacPick(id, 'tomorrow');
     return;
   }
   savePlanWhen(id, when);
 }
 
 /** 計画画面から「いつ」を変える。⭐変えたら計画も一覧も取り直す */
+/** @returns true = 通った (呼び元が「途中まで」を知らせられるように) */
 async function savePlanWhen(id, when) {
-  if (!stateCan('task.plan.assign')) return;
+  if (!stateCan('task.plan.assign')) return false;
   const w = worker;
-  if (!w) { openGate(); return; }
+  if (!w) { openGate(); return false; }
   const c = planCard(id);
-  if (!c) return;
+  if (!c) return false;
   const j = await apiFetch('/api/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id, when, expect_version: c.version, worker_id: w.id }) });
   if (!j.ok) {
-    if (j.error === 'conflict') { await loadPlan(); showErr('他の端末で変更されていました (最新にしました)'); return; }
-    return planError(j, () => savePlanWhen(id, when));
+    if (j.error === 'conflict') { await loadPlan({ force: true }); showErr('他の端末で変更されていました (最新にしました)'); return false; }
+    await planError(j, () => savePlanWhen(id, when));
+    return false;
   }
   if (j.staff_mode) state.staff_mode = j.staff_mode;
-  await Promise.all([loadPlan(), loadState()]);
+  await Promise.all([loadPlan({ force: true }), loadState()]);
   toast('「' + c.title + '」' + (when === 'tomorrow' ? 'を明日やる分に入れました' : when === 'today' ? 'を今日やる分にしました' : 'を計画から外しました'));
+  return true;
 }
 /** 計画画面で「どこが」を選ぶ (候補から積むとき・後から直すとき) */
-let planPendingWhen = null;   // 「どこが」を聞いた後に続けてやる「いつ」(候補から積むとき)
-function openPlanFacPick(id) {
+/**
+ * 「どこが」を聞く窓。thenWhen を渡すと、選んだ後にそのまま「いつ」も保存する (候補から積む流れ)。
+ * ⭐待っている内容はこの ctx に持ち、非同期の後にグローバルを読み直さない (Codex P3 R1)
+ */
+let facPickCtx = null;   // { id, thenWhen, saving }
+function openPlanFacPick(id, thenWhen) {
   if (!stateCan('task.facility.assign')) return;
   const c = planCard(id);
   if (!c) return;
   facPickFor = id;
-  $('#facTitle').textContent = '「' + c.title + '」はどこが作業しますか?';
+  facPickCtx = { id, thenWhen: thenWhen ?? null, saving: false };
+  $('#facTitle').textContent = thenWhen === 'tomorrow'
+    ? '「' + c.title + '」を明日やります。どこが作業しますか?'
+    : '「' + c.title + '」はどこが作業しますか?';
   $('#facMsg').textContent = '';
+  // いまの拠点が分かるようにする (すでに決まっているカードでも、確認してから積めるように)
   $('#facOpts').innerHTML = (state.facilities || []).map((f) =>
-    '<button class="opt" data-pick-fac="' + esc(f.code) + '">' + esc(f.name) + '</button>').join('') +
-    '<button class="opt" data-pick-fac="">未定にする</button>';
+    '<button class="opt' + (c.facility_code === f.code ? ' on' : '') + '" data-pick-fac="' + esc(f.code) + '">' + esc(f.name) + '</button>').join('') +
+    '<button class="opt' + (c.facility_code ? '' : ' on') + '" data-pick-fac="">' + (thenWhen ? 'まだ決めない' : '未定にする') + '</button>';
   openOverlay('#facOv');
 }
 /** 計画画面のデータからカードを探す (一覧に無いカード = 候補も含むため) */
