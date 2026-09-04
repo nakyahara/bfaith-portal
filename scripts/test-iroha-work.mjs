@@ -2041,6 +2041,13 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         const mediaRow = db.prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-preview-del1'").get();
         const del = await call('POST', '/api/media/' + mediaRow.id + '/delete', { ...admin, body: {} });
         ok(del.status === 409 && del.json.error === 'notion_mode', 'Notion 正本の間は tasks の写真を消せない (削除トークンやポータルでも)');
+        // 断った試行そのものも、そのカードの履歴に足さない (履歴もカードの中身 — Codex PR1 R17)
+        {
+          const evBefore = db.prepare('SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id IS NOT NULL').get().c;
+          await call('POST', '/api/sessions/stop', { cookie, body: { id: open.id, worker_id: w1.id, reason: 'pause', session_id: 1 } });
+          ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id IS NOT NULL').get().c === evBefore,
+            '下見のカードには、断った操作の記録も残さない');
+        }
         ok(db.prepare('SELECT deleted_at FROM f_iroha_card_media WHERE id = ?').get(mediaRow.id).deleted_at == null, '写真は消えていない');
         const optBefore = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c;
         const optRes = await call('POST', '/api/options', { cookie, body: { id: open.id, kind: 'material', code: 'PREVIEW-X', worker_id: staff2.id, pin: '4649' } });
@@ -2274,6 +2281,7 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
     ok(TD.resolveCancellation({ taskId: nt, decision: 'cancel', expectVersion: TD.getTask(nt).version, isStaff: true, actor: 'test' }).error === 'notion_mode',
       '取消の判断 (取消) も断る');
     ok(TD.getTask(nt).cancellation_requested_at != null, '取消の要確認は消えていない');
+    ok(TD.taskErrorStatus('notion_mode') === 409, '正本が切り替わった競合は 409 (入力不正の 400 ではない)');
     db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL WHERE id = ?').run(nt);
     ok(TD.getTask(nt).status === 'ready_for_stocking' && TD.getTask(nt).external_ready === 0, 'どれも DB を変えていない');
     setMetaValue('source_of_truth', 'app');

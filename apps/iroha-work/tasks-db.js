@@ -207,7 +207,8 @@ export function listOrphans(limit = 100) {
 // ─── 状態変更 ───
 
 const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, hold_reason_required: 400, close_reason_required: 400, not_found: 404, bad_request: 400,
-  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409 };
+  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409,
+  notion_mode: 409 };   // 取得後に正本が切り替わった = 競合 (入力不正ではない — Codex PR1 R17)
 export function taskErrorStatus(error) { return HTTP_BY_ERROR[error] || 400; }
 
 /**

@@ -1114,6 +1114,14 @@ function safeLog(entry) {
 const deviceLabelOf = (req) => (req.iwDevice ? req.iwDevice.label : (req.iwUser ? `session:${req.iwUser}` : null));
 
 /**
+ * 「読むだけになったカードだから断った」ときのエラー (Codex PR1 R17)。
+ * ⭐このときは**操作履歴も足さない** — 履歴もカードの中身なので、
+ *   終了したカード・下見のカードは失敗イベントでも増やさない
+ */
+const READ_ONLY_REJECTS = new Set(['notion_mode', 'closed_task', 'card_required', 'done_card']);
+const isReadOnlyReject = (r) => !!r && r.ok === false && READ_ONLY_REJECTS.has(r.error);
+
+/**
  * 作業開始。sessions は自社DBが正本 (v1からためる — 後の正本化にそのまま繋がる)。
  * ⑤最初の開始で Notion を「未着手→作業中」へ (best-effort。Notion が失敗しても開始は成立
  *   — Notion API 成功を現場操作成功の条件にしない)
@@ -1157,7 +1165,7 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
       return null;
     },
   });
-  if (!r.already) {
+  if (!r.already && !isReadOnlyReject(r)) {
     safeLog({ action: 'session_start', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
       deviceLabel: deviceLabelOf(req), to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
   }
@@ -1223,8 +1231,10 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
         return null;
       },
     });
-    safeLogTaskEvent({ taskId, action: 'session_stop', workerId: w.worker.id, workerName: w.worker.display_name,
-      deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    if (!isReadOnlyReject(r)) {
+      safeLogTaskEvent({ taskId, action: 'session_stop', workerId: w.worker.id, workerName: w.worker.display_name,
+        deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    }
     if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
     return res.json({ ...r, task: publicTask(getTask(taskId)) });
   }
@@ -1239,8 +1249,10 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
       return null;
     },
   });
-  safeLog({ action: 'session_stop', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
-    deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+  if (!isReadOnlyReject(r)) {
+    safeLog({ action: 'session_stop', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
+      deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+  }
   if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
   res.json(r);
 }));
