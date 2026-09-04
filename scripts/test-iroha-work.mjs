@@ -3022,7 +3022,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v4'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v5'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -3072,8 +3072,20 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // ══ P2: ボードに 3 軸を載せる (要件 §W-4) ══
   ok(/<div id="gaugeWrap"><\/div>/.test(html) && !/class="gauge"/.test(html.slice(0, html.indexOf('<script'))),
     '明日やる分のゲージは静的に置かない (職員のときだけボタンにする)');
-  ok(/if \(!stateCan\('task\.plan\.assign'\)\) return '<div class="gauge">' \+ inner \+ '<\/div>';/.test(html),
+  ok(/if \(!isApp\(\)\) return '<div class="gauge">' \+ inner \+ '<span class="staff">見るだけ \(正本はまだ Notion\)<\/span><\/div>';/.test(html),
+    '下見のあいだもゲージは出す (見るだけと書く)');
+  ok(/if \(!stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+return '<div class="gauge">' \+ inner \+ '<span class="staff">明日の計画を決められるのは職員です/.test(html),
     '許可が無ければゲージはただの表示 (「明日の計画 ›」の入口を描かない)');
+  // ⭐職員モードに入る入口 (これが無いと、計画の操作が一生描かれない)
+  ok(/<button class="who" id="staffBtn" hidden><\/button>/.test(html) && /function renderStaffBtn\(\)/.test(html),
+    'ヘッダに「職員モード」のボタンがある');
+  ok(/if \(!w \|\| w\.worker_type !== 'staff'\) \{ b\.hidden = true; return; \}/.test(html),
+    '職員を選んでいるときだけ出す (利用者には出さない)');
+  ok(/if \(sm\.via === 'session'\) \{ b\.hidden = true; return; \}/.test(html),
+    'ポータルから入っている人には要らない (最初から職員扱い)');
+  ok(/'🔓 職員モード あと' \+ min \+ '分'/.test(html) && /async function endStaffMode\(\)/.test(html),
+    '入っていれば残り時間を出し、その場で終われる');
+  ok(/renderStaffBtn\(\);   \/\/ 職員を選んだら/.test(html), '作業者を選び直したらボタンも出し直す');
   ok(/function planTagsHtml\(c\)/.test(html) && /const canFac = stateCan\('task\.facility\.assign'\);/.test(html)
     && /const canWhen = stateCan\('task\.plan\.assign'\);/.test(html),
     'カードの「どこが」「いつ」の札は許可リストで出し分ける');
