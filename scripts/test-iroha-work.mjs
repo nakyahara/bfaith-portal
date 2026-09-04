@@ -1385,6 +1385,16 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
         fs.utimesSync(st4.move.to, old, old);
         ok(sweepOrphanFiles().removed === 1 && !fs.existsSync(st4.move.to),
           '十分に古くなれば、消された行の実体は片づける');
+        // 受信中の一時領域 (MEDIA_DIR/tmp) に取り残されたファイルも片づける (Codex PR1 R16)
+        {
+          const tmpDir = path.join(process.env.DATA_DIR, 'iroha-media', 'tmp');
+          fs.mkdirSync(tmpDir, { recursive: true });
+          const leftover = path.join(tmpDir, 'multer-leftover');
+          fs.writeFileSync(leftover, jpeg);
+          ok(sweepOrphanFiles().removed === 0 && fs.existsSync(leftover), '受信中のものには触らない');
+          fs.utimesSync(leftover, old, old);
+          ok(sweepOrphanFiles().removed === 1 && !fs.existsSync(leftover), '十分に古くなれば片づける');
+        }
         db.prepare('DELETE FROM f_iroha_card_media WHERE id = ?').run(st4.media.id);
       }
     }
@@ -2258,6 +2268,13 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
     ok(TD.setExternalReady({ taskId: nt, ready: true, expectVersion: TD.getTask(nt).version }).error === 'notion_mode', '外部準備OKも断る');
     ok(TD.changeTaskStatus({ taskId: nt, to: 'in_progress', expectVersion: TD.getTask(nt).version, isStaff: true, actor: 'test' }).error === 'notion_mode', '状態変更も断る');
     ok(TD.upsertLabelWait({ taskId: nt, fields: { note: 'x' } }).error === 'notion_mode', 'ラベル待ちの登録も断る');
+    db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = ? WHERE id = ?').run(new Date().toISOString(), nt);
+    ok(TD.resolveCancellation({ taskId: nt, decision: 'continue', expectVersion: TD.getTask(nt).version, isStaff: true, actor: 'test' }).error === 'notion_mode',
+      '取消の判断 (続行) も断る');
+    ok(TD.resolveCancellation({ taskId: nt, decision: 'cancel', expectVersion: TD.getTask(nt).version, isStaff: true, actor: 'test' }).error === 'notion_mode',
+      '取消の判断 (取消) も断る');
+    ok(TD.getTask(nt).cancellation_requested_at != null, '取消の要確認は消えていない');
+    db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL WHERE id = ?').run(nt);
     ok(TD.getTask(nt).status === 'ready_for_stocking' && TD.getTask(nt).external_ready === 0, 'どれも DB を変えていない');
     setMetaValue('source_of_truth', 'app');
   }

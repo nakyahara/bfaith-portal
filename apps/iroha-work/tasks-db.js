@@ -462,8 +462,6 @@ export function requestCancellation({ destinationId, source = 'inbound_reversal'
 
 /** 取消要確認を職員が確定 (cancel) / 続行 (continue) */
 export function resolveCancellation({ taskId, decision, expectVersion, actor = null, isStaff = false, workerId = null, workerName = null, deviceLabel = null }) {
-  const notApp = appModeGuard();
-  if (notApp) return notApp;
   const db = getDB();
   const t = getTask(taskId);
   if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
@@ -474,11 +472,16 @@ export function resolveCancellation({ taskId, decision, expectVersion, actor = n
     return changeTaskStatus({ taskId: t.id, to: 'closed', expectVersion: t.version, closeReason: 'cancelled', actor, isStaff: true, workerId, workerName, deviceLabel });
   }
   if (decision !== 'continue') return { ok: false, error: 'bad_request', message: 'decision は cancel / continue のどちらかです' };
-  const r = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-    .run(utcNow(), actor, t.id, t.version);
-  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
-  safeLogTaskEvent({ taskId: t.id, action: 'task_cancel_continued', workerId, workerName, deviceLabel, ok: true });
-  return { ok: true, task: getTask(t.id) };
+  // 正本の確認は更新と同じトランザクションの中で (cancel の側は changeTaskStatus が同じ関門を通る — Codex PR1 R16)
+  return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    const r = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+      .run(utcNow(), actor, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_cancel_continued', workerId, workerName, deviceLabel, ok: true });
+    return { ok: true, task: getTask(t.id) };
+  }).immediate();
 }
 
 // ─── ラベル待ち (要件 v1.1 §C) ───

@@ -268,6 +268,17 @@ export function sweepOrphanFiles(maxAgeMs = 24 * 3600 * 1000) {
   let names = [];
   try { names = fs.readdirSync(MEDIA_DIR); } catch { return { removed: 0 }; }   // 保管場所がまだ無い
   const limit = Date.now() - maxAgeMs;
+  // 受信中の一時領域 (MEDIA_DIR/tmp) も見る。commit の後・保管場所へ移す前に落ちると、
+  // ここに実体だけが残る (どの行からも指されない — Codex PR1 R16)
+  const TMP = path.join(MEDIA_DIR, 'tmp');
+  for (const name of (() => { try { return fs.readdirSync(TMP); } catch { return []; } })()) {
+    const full = path.join(TMP, name);
+    try {
+      const st = fs.statSync(full);
+      if (!st.isFile() || st.mtimeMs >= limit) continue;   // 受信中のものには触らない
+      fs.unlinkSync(full); removed++;
+    } catch { /* 消せなければ次の回に */ }
+  }
   for (const name of names) {
     const full = path.join(MEDIA_DIR, name);
     let st = null;

@@ -1213,7 +1213,16 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
     // 終了カード (履歴) は読むだけ。記録も足さない (Codex PR1 R3)。
     // 「終了したのに作業中」が残っていたら、管理画面の取り消し (voidSession) で片づける
     if (isClosedCardId(taskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
-    const r = stopSession({ taskId, workerId: w.worker.id, sessionId: req.body?.session_id, reason });
+    const r = stopSession({ taskId, workerId: w.worker.id, sessionId: req.body?.session_id, reason,
+      // ⭐記録を書く直前に、正本とカードをもう一度確かめる (見てから書くまでに切り替わる — Codex PR1 R16)
+      guard: () => {
+        if (!isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
+        const t = getTask(taskId);
+        if (!t) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+        if (t.status === 'closed') return CLOSED_WRITE_REJECTED;
+        return null;
+      },
+    });
     safeLogTaskEvent({ taskId, action: 'session_stop', workerId: w.worker.id, workerName: w.worker.display_name,
       deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
     if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);

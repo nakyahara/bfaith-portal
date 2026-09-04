@@ -762,7 +762,11 @@ async function loadStateOnce() {
     const c = findCard(curDetail);
     // 一覧から消えた (他の端末で終了した・取り込みで変わった) なら閉じる。
     // 古い詳細を残すと、そこに描かれた操作ボタンが「もう無いカード」に効いてしまう
-    if (c) { detailCard = c; detailCaps = state.capabilities || []; renderDetail(c); }
+    // 一覧のカードには「これまでの作業」を付けていない。差し替えで消さないよう引き継ぐ (Codex PR1 R16)
+    if (c) {
+      if (detailCard && detailCard.work_history && c.work_history === undefined) c.work_history = detailCard.work_history;
+      detailCard = c; detailCaps = state.capabilities || []; renderDetail(c);
+    }
     else forceCloseDetail('このカードは一覧から外れました');
   }
 }
@@ -1723,6 +1727,7 @@ function retryUpload(ev, opId) { ev.stopPropagation(); if (!can('task.media.add'
 /** 送れなかった写真を捨てる (撮り直せるように枠を空ける — Codex PR1 R14) */
 async function dropPending(ev, opId) {
   ev.stopPropagation();
+  if (!can('task.media.add')) return;   // 許可リストに無ければ動かない (他の写真操作と同じ)
   const p = pendingTiles.get(opId);
   if (!p) return;
   if (!window.confirm('この写真をやめますか? (もう一度とり直せます)')) return;
