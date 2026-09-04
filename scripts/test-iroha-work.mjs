@@ -1374,8 +1374,15 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
         ok(sw0.promoted === 0 && sw0.dropped === 0, '片づけの対象にもしない (消された行はそのまま履歴に残す)');
         ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media WHERE id = ?').get(st4.media.id).c === 1,
           '行そのものは消さない (論理削除の記録を残す)');
+        // 消された行の実体は、十分に古くなってから片づける (行は残したまま)
+        const { sweepOrphanFiles } = await import('../apps/iroha-work/media.js');
+        ok(sweepOrphanFiles().removed === 0, '新しいファイルには触らない (送信中・再送中を巻き込まない)');
+        ok(fs.existsSync(st4.move.to), 'まだ実体は残っている');
+        const old = new Date(Date.now() - 48 * 3600 * 1000);
+        fs.utimesSync(st4.move.to, old, old);
+        ok(sweepOrphanFiles().removed === 1 && !fs.existsSync(st4.move.to),
+          '十分に古くなれば、消された行の実体は片づける');
         db.prepare('DELETE FROM f_iroha_card_media WHERE id = ?').run(st4.media.id);
-        try { fs.unlinkSync(st4.move.to); } catch { /* 無ければよい */ }
       }
     }
     // 後の検査 (「前回の完成形」の枚数) に影響させないよう片づける
@@ -2222,6 +2229,15 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
 
   // まとめて棚入完了の境界
   const bvv = (id) => ({ id, version: TD.getTask(id) ? TD.getTask(id).version : 0 });   // 選んだときの版
+  // 記録を入れる直前の見直し (Notion の実ページを取っている間に正本が変わることがある — Codex PR1 R14)
+  {
+    const wG = listIrohaWorkers(true).find((x) => x.display_name === 'すずき');
+    const before = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c;
+    const blocked = startSession({ pageId: 'guard-page', worker: getIrohaWorker(wG.id),
+      guard: () => ({ ok: false, error: 'notion_mode', message: '正本が変わりました' }) });
+    ok(blocked.ok === false && blocked.error === 'notion_mode', '直前の見直しで断れる');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c === before, '記録も増えていない');
+  }
   ok(TD.bulkCloseReady({ taskIds: [] }).error === 'bad_request', '空は bad_request');
   ok(TD.bulkCloseReady({ taskIds: Array.from({ length: 201 }, (_, i) => bvv(i + 1)) }).error === 'bad_request', '201 件は bad_request (一度に 200 件まで)');
   ok(TD.bulkCloseReady({ taskIds: [1] }).error === 'bad_request', '版を添えない指定は受けない (入口だけの検査にしない)');
@@ -2703,6 +2719,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   }
   ok(/function retryUpload\(ev, opId\) \{ ev\.stopPropagation\(\); if \(!can\('task\.media\.add'\)\) return;/.test(html)
     && /async function delMedia[\s\S]{0,160}if \(!can\('task\.media\.add'\)\) return;/.test(html), '写真の再送・削除も入口で止める');
+  ok(/function dropPending\(ev, opId\)/.test(html) && /pendingTiles\.delete\(opId\);/.test(html),
+    '送れなかった写真は「やめる」で捨てられる (枠を空けて撮り直せる — Codex PR1 R14)');
   ok(true, '書き込みの関数はすべて入口で許可リストを見る');
   ok(/function historyCardHtml\(c\)/.test(html) && /これまでの作業 — このカード/.test(html)
     && /const END_REASON = \{ done: 'できあがり', pause: '中断', admin: '職員が終了' \}/.test(html),

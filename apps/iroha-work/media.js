@@ -91,7 +91,10 @@ export function getMediaRow(id) {
  */
 const pendingUnavailable = new Map();
 export function reportMediaUnavailable(id, reason, driveFileId = null) {
-  pendingUnavailable.set(Number(id), { reason: String(reason || 'unavailable'), driveFileId });
+  // ⭐鍵は id だけでなく実体 (drive_file_id) も含める。送り直しの前後で配信要求の完了順が
+  //   入れ替わっても、新しい実体の報告を古い報告が押しのけない (Codex PR1 R14)
+  pendingUnavailable.set(`${Number(id)}:${driveFileId == null ? '' : driveFileId}`,
+    { id: Number(id), reason: String(reason || 'unavailable'), driveFileId });
   schedule();
 }
 /**
@@ -104,7 +107,7 @@ export function flushUnavailableReports() {
   pendingUnavailable.clear();
   const db = getDB();
   let n = 0;
-  for (const [id, { reason, driveFileId }] of entries) {
+  for (const [, { id, reason, driveFileId }] of entries) {
     // 送り直されていれば (drive_file_id が変わっていれば) 何も起きない = 古い報告は捨てられる
     if (markMediaUnavailable(id, reason, driveFileId == null ? undefined : driveFileId)) n++;
   }
@@ -254,6 +257,36 @@ export function dropMedia(id, claim = null) {
 }
 
 /**
+ * どの行からも指されていない実体ファイルを片づける (Codex PR1 R14)。
+ * ⭐**十分に古いものだけ**を見る — 送信中・再送中のファイルを巻き込まないため。
+ * これがないと、再送で置き場所が変わった分や、論理削除された staging 行の実体が永久に残る。
+ * @param maxAgeMs これより古いファイルだけを対象にする (既定 24 時間)
+ */
+export function sweepOrphanFiles(maxAgeMs = 24 * 3600 * 1000) {
+  const db = getDB();
+  let removed = 0;
+  let names = [];
+  try { names = fs.readdirSync(MEDIA_DIR); } catch { return { removed: 0 }; }   // 保管場所がまだ無い
+  const limit = Date.now() - maxAgeMs;
+  for (const name of names) {
+    const full = path.join(MEDIA_DIR, name);
+    let st = null;
+    try { st = fs.statSync(full); } catch { continue; }
+    if (!st.isFile() || st.mtimeMs >= limit) continue;   // 新しいものには触らない
+    const opId = name.split('.')[0];
+    const row = db.prepare('SELECT kind, local_path, staged_at, staged_claim, deleted_at FROM f_iroha_card_media WHERE operation_id = ?').get(opId);
+    // 行そのものが無い / その行は消されている → もう誰も見ない
+    if (row && !row.deleted_at) {
+      if (row.local_path && path.resolve(row.local_path) === path.resolve(full)) continue;   // 公開済みで参照されている
+      if (row.staged_at && stagedPathOf(opId, row.kind, row.staged_claim) === full) continue; // いまの札の置き場所
+    }
+    try { fs.unlinkSync(full); removed++; } catch { /* 消せなければ次の回に */ }
+  }
+  if (removed > 0) console.log(`[iroha-work] どこからも指されていない写真の実体を ${removed} 件片づけました`);
+  return { removed };
+}
+
+/**
  * 置き去りの staging 行を片づける (Codex PR1 R8)。iPad の再読込・端末再起動で再送が来なくなると、
  * 行だけが残って写真の枚数上限を食いつぶす。実体が置けているものは公開し、無いものは消す。
  * @param maxAgeMs これより古い staging 行だけを見る (送信中のものを巻き込まない)
@@ -273,14 +306,6 @@ export function sweepStagedMedia(maxAgeMs = STAGE_TTL_MS) {
     .run(r.id, r.staged_claim, r.staged_at).changes > 0;
   for (const r of rows) {
     const p = stagedPathOf(r.operation_id, r.kind, r.staged_claim);
-    // 前の札で置いたまま残ったファイル (再送の途中で落ちた分) をここでも片づける — Codex PR1 R13
-    try {
-      for (const f of fs.readdirSync(MEDIA_DIR)) {
-        if (f.startsWith(r.operation_id + '.') && path.join(MEDIA_DIR, f) !== p) {
-          try { fs.unlinkSync(path.join(MEDIA_DIR, f)); } catch { /* 消せなければ次の回に */ }
-        }
-      }
-    } catch { /* 保管場所がまだ無いだけ */ }
     if (!fs.existsSync(p)) {
       if (dropIfSame(r)) dropped++;
       continue;
@@ -716,6 +741,8 @@ export async function processMediaQueue() {
   try {
     // 実体を置けないまま残った行を片づける (枚数上限を食いつぶさない — Codex PR1 R8)
     sweepStagedMedia();
+    // どの行からも指されていない実体ファイルを片づける (十分に古いものだけ — Codex PR1 R14)
+    sweepOrphanFiles();
     // 配信で見つかった「ドライブから消えた」写真の印をここで付ける (GET では書かない — Codex PR1 R9)
     flushUnavailableReports();
     // ①Drive へ (stored の行)。成功したらそのページの Notion 貼り直しを予約

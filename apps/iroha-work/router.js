@@ -1123,6 +1123,13 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   const r = startSession({
     pageId, productCode: card.product_code, title: card.title,
     worker: w.worker, deviceLabel: deviceLabelOf(req), masterSnapshot: snapshot,
+    // ⭐Notion の実ページを取りに行っている間に正本が切り替わる・カードが消えることがある。
+    //   記録を入れる直前に (同じトランザクションの中で) もう一度確かめる (Codex PR1 R14)
+    guard: () => {
+      if (isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
+      if (!getCachePage(pageId)) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+      return null;
+    },
   });
   if (!r.already) {
     safeLog({ action: 'session_start', pageId, workerId: w.worker.id, workerName: w.worker.display_name,

@@ -789,11 +789,17 @@ export const SESSION_WARN_HOURS = 6;
  * 作業開始。⭐1作業者につき活動中セッションは1件 (要件定義 §1.7 ⑤)。
  * 別カードで作業中なら busy (どのカードかを返す — 画面が誘導する)
  */
-export function startSession({ pageId = null, taskId = null, productCode = null, title = null, worker, deviceLabel = null, masterSnapshot = undefined }) {
+/**
+ * @param guard 記録を入れる**直前**に (このトランザクションの中で) もう一度確かめる関数。
+ *   断るなら { ok:false, error, message } を返す。Notion の実ページを取りに行っている間に
+ *   正本が切り替わる・カードが消えることがあるため (Codex PR1 R14)
+ */
+export function startSession({ pageId = null, taskId = null, productCode = null, title = null, worker, deviceLabel = null, masterSnapshot = undefined, guard = null }) {
   const db = getDB();
   const now = utcNow();
   if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
   return db.transaction(() => {
+    if (guard) { const g = guard(); if (g) return g; }
     const open = db.prepare(`SELECT id, page_id, task_id, title_snapshot, started_at FROM f_iroha_work_sessions
       WHERE worker_id = ? AND ended_at IS NULL`).get(worker.id);
     if (open) {
