@@ -379,3 +379,94 @@ export function effectiveHasVariation(info, draft) {
   if (info && (info.kind === 'single' || info.kind === 'detached')) return { value: false, source: 'ne' };
   return { value: !!(draft && draft.has_variation), source: 'manual' };
 }
+
+/**
+ * 利益シミュレーションで選べる「配送方法 → 配送費」の一覧 (2026-09-04 中原さん要望)。
+ *
+ * 背景: 利益の配送費は NE の送料 (= NE が配送方法から自動算出した値) をそのまま使うので、
+ * 画面で配送方法を変えても金額が動かなかった。「この商品をどの配送方法で送るか」で
+ * 利益は変わるので、その場で試算できるようにする。
+ *
+ * ⚠️ 楽天の配送方法グループ (8種) と NE の配送方法 (サイズ別) は**粒度が違う**。
+ *    楽天「宅急便50サイズ以上」は NE の 50/60/80/100/120 サイズ (479〜945円) のどれにもなる。
+ *    だから選択肢は **NE の配送方法**で持つ (送料が一意に決まる方)。
+ *
+ * 実データ (2026-09-04 実測・取扱中7,239件): 配送方法ごとの送料はほぼ1種類。
+ * 宅急便50/60/80 だけ 2 種類 (端数違い) あるので**最頻値**を採る。
+ */
+export function listNeShippingOptions(db) {
+  try {
+    const rows = db.prepare(`
+      SELECT TRIM(配送方法) AS method, 送料 AS cost, COUNT(*) AS n
+      FROM mirror_products
+      WHERE 取扱区分 = '取扱中'
+        AND 配送方法 IS NOT NULL AND TRIM(配送方法) != ''
+        AND 送料 IS NOT NULL AND 送料 >= 0
+      GROUP BY TRIM(配送方法), 送料
+    `).all();
+    // 配送方法ごとに「一番多く使われている送料」を代表値にする。
+    // 同数のときは**高い方**を採る (利益を実際より良く見せない側に倒す)
+    const best = new Map(); // method -> { cost, n, total }
+    for (const r of rows) {
+      const method = String(r.method).trim();
+      const cur = best.get(method);
+      const total = (cur?.total || 0) + r.n;
+      const wins = !cur || r.n > cur.n || (r.n === cur.n && Number(r.cost) > cur.cost);
+      if (wins) best.set(method, { cost: Number(r.cost), n: r.n, total });
+      else best.set(method, { ...cur, total });
+    }
+    return [...best.entries()]
+      .map(([method, v]) => ({ method, cost: v.cost, count: v.total }))
+      .sort((a, b) => b.count - a.count);
+  } catch (_) {
+    return []; // mirror 未同期でも画面は出す
+  }
+}
+
+/**
+ * 楽天の配送方法グループ → NE の配送方法名にかかる語 (2026-09-04)。
+ * 利益シミュレーションで**候補を上に集めるためだけ**の目安で、これで確定はしない
+ * (最終的に人が選ぶ)。掲載HTMLに出る mapNeShippingToRakuten の割当とは別物 —
+ * あちらは誤ると商品ページの表記が誤るので部分一致を避けている
+ */
+export const RAKUTEN_GROUP_NE_HINTS = {
+  '1': ['定形'],          // 定形外 → 定形内 / 定形外規格内 / 定形外規格外
+  '3': ['飛脚'],          // 飛脚宅配便
+  '4': ['宅急便'],        // 宅急便
+  '5': ['ネコポス'],
+  '6': ['クリックポスト'],
+  '7': ['宅急便'],        // ヤマト運輸宅急便
+  '8': ['宅急便'],        // 宅急便50サイズ以上
+  '9': ['ゆうパケット'],  // ゆうパケットパフ
+};
+
+/**
+ * 利益シミュレーションの配送方法の選択肢 (2026-09-04)。
+ *
+ * 🚨 **その商品がいま使っている配送方法だけは、代表値ではなく実際の NE 送料**にする。
+ * 代表値 (最頻値) で上書きすると、開いただけで利益額が実際と違う数字に変わってしまう
+ * (例: この商品は宅急便60サイズ 544円だが、最頻値は 538円 — Codex R1 P1)。
+ * 一覧に無い配送方法 (その商品しか使っていない等) も、実送料で先頭に足す。
+ */
+export function profitShipChoices(options, neMethod, neShippingCost) {
+  const cur = String(neMethod ?? '').trim();
+  // ⚠️ Number(null) は 0。null を先に弾かないと「送料0円」として選択肢に残り、
+  //    利益を過大に見せる (profit.js の computeProfit と同じ注意)
+  const actual = (neShippingCost == null || neShippingCost === '') ? NaN : Number(neShippingCost);
+  const hasActual = Number.isFinite(actual) && actual >= 0;
+  const list = (options || []).map((o) => ({ ...o, isCurrent: cur !== '' && o.method === cur }));
+  if (hasActual && !list.some((o) => o.isCurrent)) {
+    // 配送方法名が分からなくても送料があれば、その実値を先頭に置く。
+    // 置かないと画面が先頭候補を初期選択して、開いただけで利益額が代表送料に変わる
+    // (バリエーションで送料は一致・配送方法名だけ割れている場合など — Codex R3 P1)
+    list.unshift({
+      method: cur || 'NEの登録送料 (配送方法は未設定)',
+      cost: actual, count: 0, isCurrent: true,
+    });
+  } else if (cur && !list.some((o) => o.isCurrent)) {
+    list.unshift({ method: cur, cost: null, count: 0, isCurrent: true });
+  }
+  return list
+    .map((o) => (o.isCurrent && hasActual ? { ...o, cost: actual } : o))
+    .filter((o) => o.cost != null);
+}

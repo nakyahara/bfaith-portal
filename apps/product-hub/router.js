@@ -52,7 +52,7 @@ import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
 import { buildPromptTemplates } from './lib/prompt-templates.js';
-import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost } from './lib/variation.js';
+import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost, listNeShippingOptions, profitShipChoices, RAKUTEN_GROUP_NE_HINTS } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
@@ -325,6 +325,10 @@ router.get('/detail/:id', (req, res) => {
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
     thumbnailUrl, fileViewUrl,
     neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices, skuJans, skuSelectorValues,
+    // 利益シミュレーションで配送方法を差し替えて試算するための材料 (2026-09-04)。
+    // 楽天の配送方法グループとは粒度が違うので NE の配送方法で持つ (lib/variation.js 参照)
+    neShippingOptions: profitShipChoices(listNeShippingOptions(db), neCost?.shippingMethod, neCost?.shippingCost),
+    rakutenGroupNeHints: RAKUTEN_GROUP_NE_HINTS,
     skuAttrGrid, skuExemptions,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
