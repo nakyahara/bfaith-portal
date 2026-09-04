@@ -174,13 +174,13 @@ await ta('通知先が無くても異常は残る (取込を止めない)', asyn
     '鳴らせなくても outbox には残る');
 });
 
-await ta('日付を跨いだ未送信も拾い直す', async () => {
+await ta('日付を跨いだ未送信も拾い直す (日付で切り捨てない)', async () => {
   // webhook が落ちたまま日を跨ぐと、当日分しか探さない実装では永久に見失う
-  getDB().prepare(`INSERT INTO pk_pack_miss_alerts (alert_key, kind, work_date, folder_name, detail, attempts, created_at)
-    VALUES ('old:not_imported:出荷_99', 'not_imported', date('now','-1 day'), '出荷_99', '昨日の未送信', 3, ?)`).run(utcNow());
+  getDB().prepare(`INSERT INTO pk_pack_miss_alerts (alert_key, kind, work_date, pk_batch_id, folder_name, detail, attempts, created_at)
+    VALUES ('old:not_imported:99', 'not_imported', date('now','-30 day'), 99, '出荷_99', '30日前の未送信', 3, ?)`).run(utcNow());
   const sent = [];
   await missWatchStep(async (text) => { sent.push(text); return true; });
-  assert.ok(sent.some((x) => x.includes('出荷_99')), '前日の未送信が送られる');
+  assert.ok(sent.some((x) => x.includes('出荷_99')), '何日前の未送信でも送られる (日付で切り捨てない)');
   assert.equal(pendingAlerts().filter((x) => x.folder_name === '出荷_99').length, 0);
 });
 
@@ -192,6 +192,36 @@ await ta('種類ごとに1通にまとめる', async () => {
   const notImported = texts.find((x) => x.includes('来ていない'));
   assert.ok(notImported, 'not_imported の通知がある');
   assert.ok(notImported.includes('出荷_22') && notImported.includes('出荷_23'), '2件が1通にまとまる');
+});
+
+t('猶予の途中で日を跨いだバッチも検知できる', () => {
+  // 当日分しか探さない実装だと、23:40 に取り込まれたバッチは 0:00 時点でまだ猶予中 (20分) で
+  // 鳴らず、翌日からは当日扱いされないので永久に消える (Codexレビュー High)
+  const yesterday = jstToday(new Date(Date.now() - 86400_000));
+  addPickBatch({ folder: '出荷_50', ageMin: 90, workDate: yesterday });
+  const misses = findMisses().filter((m) => m.folderName === '出荷_50');
+  assert.equal(misses.length, 1, '前日付のバッチでも猶予を過ぎていれば鳴る');
+  assert.equal(misses[0].workDate, yesterday);
+});
+
+t('古すぎる取りこぼしは今さら鳴らさない', () => {
+  addPickBatch({ folder: '出荷_51', ageMin: 60 * 24 * 10, workDate: jstToday(new Date(Date.now() - 10 * 86400_000)) });
+  assert.equal(findMisses().filter((m) => m.folderName === '出荷_51').length, 0,
+    '導入日に過去分が一斉に鳴らない');
+});
+
+t('同じ日に同名フォルダの別バッチがあっても両方が残る', () => {
+  // alert_key がフォルダ名基準だと、片方が通知済みのときもう片方が ON CONFLICT で消える
+  const a = addPickBatch({ folder: '出荷_52', ageMin: 60 });
+  const b = addPickBatch({ folder: '出荷_52', ageMin: 60 });
+  const misses = findMisses().filter((m) => m.folderName === '出荷_52' && m.kind === 'not_imported');
+  assert.equal(misses.length, 2);
+  assert.notEqual(misses[0].alertKey, misses[1].alertKey, 'キーがバッチごとに別');
+  recordMisses(misses);
+  markNotified(misses[0].alertKey);
+  assert.equal(pendingAlerts().filter((r) => r.folder_name === '出荷_52').length, 1,
+    '片方を鳴らしても、もう片方は未送信のまま残る');
+  assert.deepEqual([a.id, b.id].sort(), misses.map((m) => m.pkBatchId).sort());
 });
 
 console.log(`test-miss-watch: ${passed} 件 pass`);

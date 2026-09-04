@@ -12,8 +12,9 @@
  *
  * ⭐**検知した時点で pk_pack_miss_alerts に行を作る (outbox)**。送信はそのあと。
  *   「送れたときだけ notified_at を書く」だけだと、webhook が落ちたまま日付を跨いだ異常を
- *   永久に見失う (検知は当日分しか走らないため — Codexレビュー High)。行が残っていれば、
- *   何日後でも送れたときに鳴る。
+ *   永久に見失う (Codexレビュー High)。行が残っていれば何日後でも送れたときに鳴る。
+ * ⭐検知は当日だけでなく直近数日を見る。当日だけだと、猶予 (40分) の途中で日を跨いだバッチが
+ *   翌日には当日扱いされず、一度も検知されないまま消える。
  * ⭐通知は at-least-once。送信直後・markNotified 前に落ちれば同じ内容がもう一度鳴る。
  *   「鳴らし損ねない」を優先し、まれな重複は許容する (webhook 側に冪等キーが無いため
  *   exactly-once は作れない — Codexレビュー)。
@@ -25,16 +26,25 @@ import { getDB, utcNow, jstToday } from './db.js';
 // no_picking のリトライ (2分×15回=30分) を見込んでも 40分あれば「来ていない」と断じてよい。
 // ⭐判定の起点は Drive への配置時刻ではなく pk_batches.created_at (ピッキング取込時刻)
 const GRACE_MIN = Number(process.env.PACKING_MISS_GRACE_MIN || 40);
-// 未送信のまま残っている異常を何日ぶんまで拾い直すか
-const FLUSH_DAYS = 3;
+// 検知の対象にする日数。当日だけを見ると**猶予の途中で日を跨いだバッチを永久に見失う**
+// (23:40 に取り込まれると 0:00 時点でまだ20分 → 翌日からは当日扱いされない — Codexレビュー High)
+const LOOKBACK_DAYS = 3;
+// 古すぎる取りこぼしは今さら鳴らさない (この機能を入れた日に過去の分が一斉に鳴るのを防ぐ)
+const MAX_AGE_MIN = LOOKBACK_DAYS * 24 * 60;
+// 1周期に送る未送信行の上限 (溜まっても1通が巨大にならないように)
+const FLUSH_LIMIT = 50;
 
 /**
  * 鳴らすべき取りこぼしを探す (DBを読むだけ)。
  * @returns {{kind, folderName, workDate, detail, alertKey}[]}
  */
-export function findMisses({ workDate = jstToday(), nowMs = Date.now(), graceMin = GRACE_MIN } = {}) {
+export function findMisses({ workDate = null, nowMs = Date.now(), graceMin = GRACE_MIN,
+  lookbackDays = LOOKBACK_DAYS, maxAgeMin = MAX_AGE_MIN } = {}) {
   const db = getDB();
   const out = [];
+  // 単日指定 (テスト・調査用) と、直近数日の範囲指定を両立させる
+  const from = workDate || jstToday(new Date(nowMs - lookbackDays * 86400_000));
+  const to = workDate || jstToday(new Date(nowMs));
 
   // 1) ピッキングにあるのに梱包に無い。
   //    ⭐突合キーは pk_batch_id / tb_no (フォルダ名は日をまたいで使い回される表示用の名前で、
@@ -44,28 +54,30 @@ export function findMisses({ workDate = jstToday(), nowMs = Date.now(), graceMin
   let notImported = [];
   try {
     notImported = db.prepare(`
-      SELECT b.id, b.folder_name, b.slip_count, b.created_at, b.status
+      SELECT b.id, b.folder_name, b.slip_count, b.created_at, b.status, b.work_date
       FROM pk_batches b
-      WHERE b.work_date = ? AND b.folder_name IS NOT NULL
+      WHERE b.work_date BETWEEN ? AND ? AND b.folder_name IS NOT NULL
         AND b.validity = 'valid' AND b.status != 'cancelled' AND b.origin != 'repick'
         AND NOT EXISTS (
           SELECT 1 FROM pk_pack_batches p
           WHERE (p.pk_batch_id = b.id OR p.tb_key = b.tb_no) AND p.validity = 'valid'
         )
-      ORDER BY b.folder_name
-    `).all(workDate);
+      ORDER BY b.work_date, b.folder_name
+    `).all(from, to);
   } catch { return out; }
 
   for (const r of notImported) {
-    // 取り込まれたばかりのものは「まだ来ていないだけ」なので待つ
+    // 取り込まれたばかりのものは「まだ来ていないだけ」なので待つ。
+    // 逆に古すぎるものは今さら鳴らさない (この機能の導入日に過去分が一斉に鳴らないように)
     const ageMin = (nowMs - Date.parse(`${r.created_at}${r.created_at.endsWith('Z') ? '' : 'Z'}`)) / 60000;
-    if (!(ageMin >= graceMin)) continue;
+    if (!(ageMin >= graceMin) || ageMin > maxAgeMin) continue;
     out.push({
       kind: 'not_imported',
+      pkBatchId: r.id,
       folderName: r.folder_name,
-      workDate,
+      workDate: r.work_date,
       detail: `${r.slip_count}伝票 (ピッキングは${Math.round(ageMin)}分前に取込済み・${r.status})`,
-      alertKey: `${workDate}:not_imported:${r.folder_name}`,
+      alertKey: `${r.work_date}:not_imported:${r.id}`,
     });
   }
 
@@ -73,20 +85,21 @@ export function findMisses({ workDate = jstToday(), nowMs = Date.now(), graceMin
   let suggested = [];
   try {
     suggested = db.prepare(`
-      SELECT folder_name, hikiate_class FROM pk_batches
-      WHERE work_date = ? AND folder_name IS NOT NULL AND class_source = 'suggested'
+      SELECT id, folder_name, hikiate_class, work_date FROM pk_batches
+      WHERE work_date BETWEEN ? AND ? AND folder_name IS NOT NULL AND class_source = 'suggested'
         AND validity = 'valid' AND status != 'cancelled' AND origin != 'repick'
-      ORDER BY folder_name
-    `).all(workDate);
+      ORDER BY work_date, folder_name
+    `).all(from, to);
   } catch { return out; }
 
   for (const r of suggested) {
     out.push({
       kind: 'class_suggested',
+      pkBatchId: r.id,
       folderName: r.folder_name,
-      workDate,
+      workDate: r.work_date,
       detail: r.hikiate_class,
-      alertKey: `${workDate}:class_suggested:${r.folder_name}`,
+      alertKey: `${r.work_date}:class_suggested:${r.id}`,
     });
   }
   return out;
@@ -100,23 +113,31 @@ export function recordMisses(misses) {
   const db = getDB();
   const now = utcNow();
   const ins = db.prepare(`
-    INSERT INTO pk_pack_miss_alerts (alert_key, kind, work_date, folder_name, detail, attempts, created_at)
-    VALUES (?, ?, ?, ?, ?, 0, ?)
+    INSERT INTO pk_pack_miss_alerts (alert_key, kind, work_date, pk_batch_id, folder_name, detail, attempts, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 0, ?)
     ON CONFLICT(alert_key) DO NOTHING
   `);
-  const tx = db.transaction((rows) => { for (const m of rows) ins.run(m.alertKey, m.kind, m.workDate, m.folderName, m.detail ?? null, now); });
+  const tx = db.transaction((rows) => {
+    for (const m of rows) ins.run(m.alertKey, m.kind, m.workDate, m.pkBatchId ?? null, m.folderName, m.detail ?? null, now);
+  });
   tx(misses);
   return misses.length;
 }
 
-/** まだ送れていない異常 (直近 days 日ぶん)。日付を跨いだ未送信もここで拾い直す。 */
-export function pendingAlerts({ days = FLUSH_DAYS } = {}) {
+/**
+ * まだ送れていない異常。
+ * ⭐日付では切り捨てない。webhook の障害が長引いたときに未送信行を黙って捨てると、
+ *   「何日後でも送れたときに鳴る」という outbox の前提が崩れる (Codexレビュー High)。
+ *   件数が膨らむ場合に備えて1周期の通知量だけ LIMIT で抑える (残りは次の周期で送られる)。
+ */
+export function pendingAlerts({ limit = FLUSH_LIMIT } = {}) {
   return getDB().prepare(`
     SELECT alert_key, kind, work_date, folder_name, detail, attempts, last_error
     FROM pk_pack_miss_alerts
-    WHERE notified_at IS NULL AND work_date >= date('now', '-' || ? || ' days')
+    WHERE notified_at IS NULL
     ORDER BY work_date, kind, folder_name
-  `).all(days);
+    LIMIT ?
+  `).all(limit);
 }
 
 /** 送信できたものを記録する (送れたときだけ呼ぶ)。 */
@@ -174,6 +195,9 @@ export async function missWatchStep(post, opts = {}) {
         for (const m of group) markNotified(m.alert_key);
         notified += group.length;
         console.log(`[packing-miss-watch] 通知: ${kind} ${group.map((m) => m.folder_name).join(',')}`);
+      } else {
+        // false = 送信先が無い等で送れなかった。例外と同じく失敗として残す (Codexレビュー)
+        markFailed(group.map((m) => m.alert_key), '送信されませんでした (webhook 未設定または拒否)');
       }
     } catch (e) {
       markFailed(group.map((m) => m.alert_key), e.message);
