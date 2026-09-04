@@ -228,7 +228,10 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
   const zStock = stockMapByPrefix(rows.map((r) => keyOf(r.product_code)), 'Z');
   // 外部 (羅針盤・ワークセンター) に出したカードは Y ロケを見せる。その拠点のカードの商品だけ引く
   const yStock = stockMapByPrefix(rows.filter((r) => stockLocOf(r.facility_code) === 'Y').map((r) => keyOf(r.product_code)), 'Y');
+  // 大きさ (嵩) = 配送方法。明日どれをやるかの並びに使う (要件 §W-1)
+  const sizes = sizeMapByCode(rows.map((r) => keyOf(r.product_code)));
   const today = jstToday();
+  const tomorrow = jstTomorrow(today);
 
   const cards = rows.map((r) => {
     let props = {};
@@ -253,6 +256,12 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       hold_reason_note: r.hold_reason_note,
       planned_date: r.planned_date,
       today: r.planned_date === today,
+      // ⭐3 軸のうちの「いつ」。planned_date (実日付) から出す — today / tomorrow / over (やり残し) / later / null (未定)
+      planned_date: r.planned_date || null,
+      when: r.status === 'closed' ? null : whenOf(r.planned_date, today, tomorrow),
+      // ⭐大きさ (嵩)。並びに使い、画面には配送方法の名前で出す。分からなければ null
+      size_rank: (k && sizes.get(k)) ? sizes.get(k).rank : null,
+      size_label: (k && sizes.get(k)) ? sizes.get(k).label : null,
       external_ready: !!r.external_ready,
       version: r.version,
       migration_review: !!r.migration_review,
@@ -293,6 +302,40 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
     };
   });
   return { cards, today };
+}
+
+/**
+ * 「明日の計画」画面のデータ (職員だけが開く。要件 §W-3)。
+ *   candidates = まだ予定の無い未着手カード。優先順に並べる (在庫日数 → 入荷が古い → 大きい)
+ *   tomorrow   = 明日やる分。拠点ごとの内訳もつける
+ *   carry_over = やり残し (今日より前の予定で、まだ終わっていない)。**自動では動かさない**
+ * 画面は 4〜6 時間を目安に選ぶ。超えても入れられる (ハードな上限にしない)
+ */
+export function buildPlan() {
+  const today = jstToday();
+  const tomorrow = jstTomorrow(today);
+  const { cards } = buildTaskCards(listOpenTasks({}));
+  const byWhen = (w) => cards.filter((c) => c.when === w).sort(comparePlanOrder);
+  const tomorrowCards = byWhen('tomorrow');
+  const facilities = listFacilities();
+  const byFacility = facilities.map((f) => {
+    const list = tomorrowCards.filter((c) => c.facility_code === f.code);
+    return { code: f.code, name: f.name, ...sumPlanHours(list) };
+  }).filter((x) => x.count > 0);
+  return {
+    today_ymd: today,
+    tomorrow_ymd: tomorrow,
+    // 予定の無い未着手だけを候補に出す。保留 (資材不足・ラベル待ち) は再開できるまで混ぜない (要件 §W)
+    candidates: cards.filter((c) => c.when == null && c.status === 'not_started').sort(comparePlanOrder),
+    tomorrow: tomorrowCards,
+    carry_over: byWhen('over'),
+    totals: sumPlanHours(tomorrowCards),
+    by_facility: byFacility,
+    unassigned_count: tomorrowCards.filter((c) => !c.facility_code).length,
+    facilities,
+    // 目安 (画面のゲージの帯)。超えても入れられる
+    target_hours: { min: 4, max: 6 },
+  };
 }
 
 /** 商品画像がまだ無いカードの取り寄せを頼む (一覧・単票の共通処理。失敗しても表示は続ける) */
@@ -344,8 +387,13 @@ export function buildTaskList({ facility = null, readOnly = false } = {}) {
   // 読むだけ (下見) では画像の取り寄せも起こさない — 開くだけで DB が変わらない (Codex PR1 R7 / R8)
   if (!readOnly) queueMissingImages(cards);
 
+  // 上のゲージ用。明日やる分の件数と合計時間 (工程数の無いカードは 0 で足さず別に数える — 要件 §W-3)
+  const tomorrowPlan = sumPlanHours(cards.filter((c) => c.when === 'tomorrow'));
+
   return {
     mode: 'app',
+    tomorrow_plan: tomorrowPlan,
+    today_ymd: today,
     cards,
     statuses: OPEN_STATUSES.map(s => ({ value: s, label: STATUS_LABEL[s] })),
     transitions: TRANSITIONS,
@@ -420,6 +468,94 @@ export function neededBoxes(qty, unitsPerContainer, zStock = 0, zAllocated = 0) 
  *   Y = 出荷禁止 (外部施設に出している分)。外に預けると Z→Y、戻ると Y→Z (中原さん)
  * 見分けは「ロケ または ブロック略称 がその文字ではじまる」
  */
+/**
+ * 大きさ (嵩) — 商品の**配送方法**で簡易的に見なす (中原さん 2026-09-04・要件 §W-1)。
+ * 定形外 ＜ ネコポス ＜ ゆうパケットポスト ＜ 50 サイズ ＜ 60 サイズ。
+ * 大きい物から片づける理由 = 在庫化待ちの荷物が置き場スペースを取るので、大きい物を先に減らすと
+ * 在庫化スペースに残っている商品を後から探しやすくなる。**体積の厳密さは要らない** (並び順にだけ使う)
+ */
+const SIZE_RULES = [
+  { rank: 5, label: '60サイズ',           re: /60\s*サイズ|発払|宅急便コンパクト|レターパック/ },
+  { rank: 4, label: '50サイズ',           re: /50\s*サイズ|宅急便/ },
+  { rank: 3, label: 'ゆうパケットポスト', re: /ゆうパケット|ゆうパック|クリックポスト/ },
+  { rank: 2, label: 'ネコポス',           re: /ネコポス|メール便/ },
+  { rank: 1, label: '定形外',             re: /定形外|定形/ },
+];
+/** 配送方法の文字列 → { rank, label }。分からなければ null (並びは最後・画面は「大きさ 不明」) */
+export function sizeOfShipping(text) {
+  const t = String(text || '').trim();
+  if (!t) return null;
+  for (const r of SIZE_RULES) if (r.re.test(t)) return { rank: r.rank, label: r.label };
+  return null;
+}
+
+/** 商品コード → 大きさ。統合商品マスタ (mirror_products.配送方法) から引く。無い環境では空 */
+function sizeMapByCode(codeKeys) {
+  const db = getDB();
+  const map = new Map();
+  const keys = [...new Set((codeKeys || []).filter(Boolean))];
+  if (keys.length === 0) return map;
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mirror_products'").get()) return map;
+  for (let i = 0; i < keys.length; i += 400) {
+    const chunk = keys.slice(i, i + 400);
+    const rows = db.prepare(`SELECT LOWER(TRIM(商品コード)) AS k, 配送方法 AS m FROM mirror_products
+      WHERE LOWER(TRIM(商品コード)) IN (${chunk.map(() => '?').join(',')})`).all(...chunk);
+    for (const r of rows) { const s = r.k ? sizeOfShipping(r.m) : null; if (s) map.set(r.k, s); }
+  }
+  return map;
+}
+
+/**
+ * 「いつやるか」— planned_date (実日付) から決める (要件 §W-2)。日付は JST。
+ * 深夜の書き換えバッチは作らない。日付が変わるだけで「明日」が「今日」になる
+ */
+export function whenOf(plannedDate, today = jstToday(), tomorrow = null) {
+  if (!plannedDate) return null;
+  const d = String(plannedDate);
+  if (d === today) return 'today';
+  if (d === (tomorrow || jstTomorrow(today))) return 'tomorrow';
+  if (d > today) return 'later';
+  return 'over';   // 今日より前で、まだ終わっていない = やり残し
+}
+/** JST の明日 (YYYY-MM-DD) */
+export function jstTomorrow(today = jstToday()) {
+  return new Date(Date.parse(`${today}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
+}
+
+/**
+ * 「明日はどれをやるか」を決めるときの並び (中原さん 2026-09-04・要件 §W-3)。
+ *   ① 親会社の在庫が少ない (回転が早く、販売が多くて減っている) — priority の帯 → 在庫日数
+ *   ② 入荷日が古い順
+ *   ③ 大きさが大きい順 (置き場が空くので)
+ * 同点は id。**同じ入力なら必ず同じ順**になる (画面とサーバーで並びがぶれない)
+ */
+export function comparePlanOrder(a, b) {
+  const ra = PRIORITY_RANK[a.priority?.kind] ?? 9;
+  const rb = PRIORITY_RANK[b.priority?.kind] ?? 9;
+  if (ra !== rb) return ra - rb;
+  const da = a.priority?.days ?? Infinity;
+  const db_ = b.priority?.days ?? Infinity;
+  if (da !== db_) return da - db_;
+  const aa = a.arrival || '9999-99-99';
+  const ab = b.arrival || '9999-99-99';
+  if (aa !== ab) return aa < ab ? -1 : 1;
+  const sa = a.size_rank ?? -1;
+  const sb = b.size_rank ?? -1;
+  if (sa !== sb) return sb - sa;       // 大きいほど先
+  return (a.id || 0) - (b.id || 0);
+}
+
+/** 明日やる分の合計 (ゲージ用)。工程数の無いカードは 0 で足さず「時間不明」として数える */
+export function sumPlanHours(cards) {
+  let hours = 0;
+  let unknown = 0;
+  for (const c of cards) {
+    if (c.plan_hours == null) unknown += 1;
+    else hours += c.plan_hours;
+  }
+  return { hours: Math.round(hours * 10) / 10, count: cards.length, unknown_hours_count: unknown };
+}
+
 function stockMapByPrefix(codeKeys, prefix) {
   const db = getDB();
   const map = new Map();

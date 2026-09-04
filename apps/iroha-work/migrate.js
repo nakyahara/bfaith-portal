@@ -19,7 +19,7 @@ import path from 'path';
 import { getDB, setMetaValue } from './db.js';
 import { queryPages, parsePage } from './notion-read.js';
 import { checkCardSchema, isNotionConfigured } from '../inbound-check/notion.js';
-import { mapLegacyStatus, DEFAULT_FACILITY, OPEN_STATUSES } from './tasks.js';
+import { mapLegacyStatus, OPEN_STATUSES } from './tasks.js';
 import { upsertTaskFromImport, backfillTaskIds, listOrphans, countTasksByStatus } from './tasks-db.js';
 
 const MIG_DIR = process.env.DATA_DIR ? path.join(process.env.DATA_DIR, 'iroha-migration') : 'data/iroha-migration';
@@ -133,7 +133,7 @@ export function planImport(pages, { existingByDestination = null } = {}) {
     rows.push({
       notion_page_id: p.pageId, title: p.title, legacy_status: legacy || null,
       mapped_status: status, close_reason: m.close_reason || null, hold_reason_code: m.hold_reason || null,
-      facility_code: m.facility || DEFAULT_FACILITY,
+      facility_code: m.facility || null,   // ⭐Notion のステータスに施設名が無ければ「未定」(要件 §W-2)
       destination_id: destinationId,
       product_code: p.productCode || null, product_name: p.title || null, qty: numOrNull(props['数量']),
       arrival_date: props['入庫日'] || null, ar_no: props['入荷管理番号'] || null, barcode: props['バーコード'] || null,

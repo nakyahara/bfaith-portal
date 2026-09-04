@@ -47,7 +47,8 @@ const tasksDDL = (name) => `
       legacy_status    TEXT,
       status           TEXT NOT NULL CHECK (status IN ('not_started','in_progress','on_hold','ready_for_stocking','closed')),
       close_reason     TEXT CHECK (close_reason IS NULL OR close_reason IN ('stocked','cancelled','out_of_scope')),
-      facility_code    TEXT NOT NULL DEFAULT 'iroha' REFERENCES f_iroha_facilities(code),
+      -- ⭐NULL = どこが作業するか未定。いろはも正式な割り振り先なので「未定 = いろは」と見なさない (要件 §W-2)
+      facility_code    TEXT REFERENCES f_iroha_facilities(code),
       hold_reason_code TEXT CHECK (hold_reason_code IS NULL OR hold_reason_code IN ('materials_shortage','label_shortage','awaiting_instruction','other')),
       hold_reason_note TEXT,
       planned_date     TEXT,
@@ -241,6 +242,8 @@ const TASKS_REQUIRED_DDL = [
   /\(status = 'on_hold'\) = \(hold_reason_code IS NOT NULL\)/, /hold_reason_code <> 'other'/, /REFERENCES f_iroha_facilities/,
   // 列はあるが制約が無い「途中の版」も作り直す (addCol は既にある列に触れないため — Codex FB R4)
   /external_ready\s+INTEGER NOT NULL DEFAULT 0 CHECK \(external_ready IN \(0,1\)\)/,
+  // 拠点は NULL (未定) を許す版か。古い版は NOT NULL DEFAULT 'iroha' なので作り直す (要件 §W-2)
+  /facility_code\s+TEXT REFERENCES f_iroha_facilities\(code\)/,
 ];
 const LABEL_REQUIRED_DDL = [/REFERENCES f_iroha_tasks/, /label_ordered IN \(0,1\)/, /location IN \('Z','Y','none'\)/, /reattach IN \(0,1\)/, /done IN \(0,1\)/];
 const FK_CHECK_TABLES = ['f_iroha_tasks', 'f_iroha_label_waits', 'f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events'];
@@ -538,6 +541,10 @@ export function createTables(db = getMirrorDB()) {
   // Drive 側で消えた写真の印 (配信で 404/410 を見たら付け、表示と「前回の完成形」候補から外す。
   // 管理画面の再実行で解除 — Codex R1 #5)
   addCol('f_iroha_card_media', 'unavailable_at', 'TEXT');
+  // 端末の「職員モード」: 職員 PIN を 1 回入れると、この時刻まで計画の操作を PIN なしで通す。
+  // 明日の計画は何件も続けてタップするので、毎回 PIN を聞くと現場が止まる (要件 §W-3)
+  addCol('f_iroha_app_devices', 'staff_unlock_until', 'TEXT');
+  addCol('f_iroha_app_devices', 'staff_unlock_worker_id', 'INTEGER');
   // 選択肢テーブルが normalized_code 無しの古い版なら作り直す (列追加だけでは UNIQUE を差し替えられない)
   migrateWorkOptionsSchema(db);
   // 拠点の初期値 (無ければ足す。名前の変更は管理画面から — 今は無いので tasks.js を正とする)。
@@ -989,6 +996,9 @@ export function voidSession(id, actor, reason) {
 
 // ───────────────────────── 端末 (iPad) — inbound-check と同じ方式 ─────────────────────────
 
+/** 職員モードの長さ。30 分 (要件 §W-3) */
+export const STAFF_UNLOCK_MS = 30 * 60 * 1000;
+
 export function createDevice(label, actor) {
   const l = String(label || '').trim();
   if (!l || l.length > 40) throw new Error('端末名は1〜40文字');
@@ -1009,6 +1019,26 @@ export function verifyDevice(token) {
     db.prepare('UPDATE f_iroha_app_devices SET last_seen_at = ? WHERE id = ?').run(now, row.id);
   }
   return row;
+}
+
+/** 端末の職員モード。PIN を確かめた側が呼ぶ。@returns 期限 (ISO) */
+export function startStaffUnlock(deviceId, workerId, ms = STAFF_UNLOCK_MS) {
+  const until = new Date(Date.now() + ms).toISOString();
+  getDB().prepare('UPDATE f_iroha_app_devices SET staff_unlock_until = ?, staff_unlock_worker_id = ? WHERE id = ?')
+    .run(until, workerId == null ? null : Number(workerId), Number(deviceId));
+  return until;
+}
+/** いま職員モードか (期限切れは false)。@returns {until, workerId} | null */
+export function staffUnlockOf(deviceId) {
+  if (deviceId == null) return null;
+  const row = getDB().prepare('SELECT staff_unlock_until AS until, staff_unlock_worker_id AS workerId FROM f_iroha_app_devices WHERE id = ?').get(Number(deviceId));
+  if (!row || !row.until || Date.parse(row.until) <= Date.now()) return null;
+  return row;
+}
+/** 職員モードを終える (端末を置いて離れるとき・管理画面から) */
+export function endStaffUnlock(deviceId) {
+  return getDB().prepare('UPDATE f_iroha_app_devices SET staff_unlock_until = NULL, staff_unlock_worker_id = NULL WHERE id = ?')
+    .run(Number(deviceId)).changes > 0;
 }
 
 export function revokeDevice(id) {

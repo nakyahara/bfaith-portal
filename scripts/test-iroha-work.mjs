@@ -1192,7 +1192,7 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
       DROP TABLE f_iroha_label_waits; DROP TABLE f_iroha_tasks;`);
     // R1 版相当: 同じ列で CHECK (不変条件) と FK が無い
     db.exec(`CREATE TABLE f_iroha_tasks (${cols.map(c => c === 'id' ? 'id INTEGER PRIMARY KEY AUTOINCREMENT' : c === 'status' ? 'status TEXT NOT NULL' : c === 'facility_code' ? "facility_code TEXT NOT NULL DEFAULT 'iroha'" : ['migration_review', 'version'].includes(c) ? `${c} INTEGER NOT NULL DEFAULT ${c === 'version' ? 1 : 0}` : ['created_at', 'updated_at'].includes(c) ? `${c} TEXT NOT NULL` : `${c} TEXT`).join(', ')});
-      INSERT INTO f_iroha_tasks SELECT * FROM f_iroha_tasks__old;
+      INSERT INTO f_iroha_tasks (${cols.join(', ')}) SELECT ${cols.map((c) => (c === 'facility_code' ? "COALESCE(facility_code, 'iroha')" : c)).join(', ')} FROM f_iroha_tasks__old;
       CREATE TABLE f_iroha_label_waits (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL, occurred_on TEXT, recorded_by_worker_id INTEGER, recorded_by_name TEXT,
         label_ordered INTEGER NOT NULL DEFAULT 0, lot_expiry TEXT, qty INTEGER, location TEXT, reattach INTEGER NOT NULL DEFAULT 0, line_notified_on TEXT, re_notified_on TEXT,
         restocked_on TEXT, done INTEGER NOT NULL DEFAULT 0, note TEXT, version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -1311,7 +1311,8 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-cancel-0001' });
     ok(late.ok === false && late.error === 'cancelled', '遅れて届いた元の送信は成立しない');
     ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_card_media WHERE operation_id = 'op-cancel-0001'").get().c === 0, '写真も増えていない');
-    ok(sweepMediaCancels(0) >= 1, '古い控えは片づく');
+    db.prepare("UPDATE f_iroha_media_cancels SET created_at = '2000-01-01T00:00:00.000Z' WHERE operation_id = 'op-cancel-0001'").run();
+    ok(sweepMediaCancels() >= 1, '古い控えは片づく (既定 7 日)');
     ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_media_cancels").get().c === 0, '控えは残らない');
   }
   // ⭐実体を置く前に落ちた行 (staged_at あり) は「無いもの」として扱い、再送で置き直せる (Codex PR1 R7)
@@ -1939,6 +1940,99 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         if (!(r.status === 400 && r.json.error === 'bad_request')) ok(false, `ready=${JSON.stringify(bad)} は 400 (実際 ${r.status})`);
       }
       ok(TD.getTask(extTask).external_ready === 1, '不正な ready でチェックが外れていない');
+      // ══ ⭐3 軸: いつ (明日やる) / どこが (拠点) — 計画は職員だけ (要件 §W-5) ══
+      {
+        const S2 = await import('../apps/iroha-work/service.js');
+        const staffP = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+        const memberP = listIrohaWorkers().find((x) => x.worker_type !== 'staff');   // 有効な利用者だけ
+        const today = S2.jstToday();
+        const tomorrow = S2.jstTomorrow(today);
+        const t1 = mk(9401, '計画テストA', 'not_started');
+        const v = () => TD.getTask(t1).version;
+
+        // ① 利用者には計画を許さない (capabilities にも API にも)
+        const stM = await call('GET', '/api/state', { cookie });
+        ok(!stM.json.capabilities.includes('task.plan.assign') && !stM.json.capabilities.includes('task.facility.assign'),
+          '職員モードでなければ「いつ」「どこが」は許可リストに無い');
+        ok(stM.json.staff_mode && stM.json.staff_mode.staff === false, '職員モードでないことが state に出る');
+        const byMember = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'tomorrow', expect_version: v(), worker_id: memberP.id } });
+        ok(byMember.status === 403 && byMember.json.error === 'staff_required', '利用者が「いつ」を変えようとすると 403');
+        ok(TD.getTask(t1).planned_date == null, 'DB は変わらない');
+        const facByMember = await call('POST', '/api/facility', { cookie, body: { id: t1, facility_code: 'rashinban', expect_version: v(), worker_id: memberP.id } });
+        ok(facByMember.status === 403 && facByMember.json.error === 'staff_required', '利用者が「どこが」を変えようとすると 403');
+        ok((await call('GET', '/api/plan', { cookie })).status === 403, '明日の計画は利用者には見せない');
+
+        // ② 職員モード: PIN を 1 回 → 30 分
+        ok((await call('POST', '/api/staff-unlock', { cookie, body: { worker_id: staffP.id, pin: '0000' } })).status === 403, 'PIN が違えば職員モードに入れない');
+        ok((await call('POST', '/api/staff-unlock', { cookie, body: { worker_id: memberP.id, pin: '4649' } })).status === 403, '利用者は職員モードに入れない');
+        const unlock = await call('POST', '/api/staff-unlock', { cookie, body: { worker_id: staffP.id, pin: '4649' } });
+        ok(unlock.status === 200 && unlock.json.staff_mode.staff === true && unlock.json.staff_mode.until, '職員 PIN で職員モードに入る (期限つき)');
+        const stS = await call('GET', '/api/state', { cookie });
+        ok(stS.json.capabilities.includes('task.plan.assign') && stS.json.capabilities.includes('task.facility.assign'),
+          '職員モード中は「いつ」「どこが」が許可リストに入る');
+
+        // ③ PIN なしで続けてタップできる (計画は何件も続く)
+        const p1 = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'tomorrow', expect_version: v(), worker_id: staffP.id } });
+        ok(p1.status === 200 && p1.json.ok && p1.json.task.planned_date === tomorrow, 'PIN なしで「明日やる」にできる (実日付が入る)');
+        ok(p1.json.task.when === 'tomorrow', '返ってくるカードの when が tomorrow');
+        const p2 = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'today', expect_version: v(), worker_id: staffP.id } });
+        ok(p2.status === 200 && p2.json.task.planned_date === today && p2.json.task.when === 'today', '「今日やる」にもできる');
+        const p3 = await call('POST', '/api/plan', { cookie, body: { id: t1, when: null, expect_version: v(), worker_id: staffP.id } });
+        ok(p3.status === 200 && p3.json.task.planned_date == null && p3.json.task.when == null, '「未定」に戻せる');
+        ok((await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'sometime', expect_version: v(), worker_id: staffP.id } })).status === 400, '知らない when は 400');
+        ok((await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'tomorrow', expect_version: 999, worker_id: staffP.id } })).status === 409, '版が古ければ 409');
+
+        // ④ 「どこが」は拠点だけを変える (進捗も予定も変えない)
+        await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'tomorrow', expect_version: v(), worker_id: staffP.id } });
+        const before = TD.getTask(t1);
+        const f1 = await call('POST', '/api/facility', { cookie, body: { id: t1, facility_code: 'rashinban', expect_version: v(), worker_id: staffP.id } });
+        ok(f1.status === 200 && f1.json.task.facility_code === 'rashinban', '拠点を変えられる');
+        const afterF = TD.getTask(t1);
+        ok(afterF.status === before.status && afterF.planned_date === before.planned_date, '拠点を変えても進捗と予定は変わらない');
+        const f2 = await call('POST', '/api/facility', { cookie, body: { id: t1, facility_code: null, expect_version: v(), worker_id: staffP.id } });
+        ok(f2.status === 200 && f2.json.task.facility_code == null, '「未定」に戻せる (NULL)');
+        ok((await call('POST', '/api/facility', { cookie, body: { id: t1, facility_code: 'nowhere', expect_version: v(), worker_id: staffP.id } })).status === 400, '無い拠点は 400');
+        const beforePlan = TD.getTask(t1).planned_date;
+        await call('POST', '/api/facility', { cookie, body: { id: t1, facility_code: 'iroha', expect_version: v(), worker_id: staffP.id } });
+        ok(TD.getTask(t1).planned_date === beforePlan, '拠点の変更で予定が消えない');
+
+        // ⑤ 明日の計画のデータ
+        const plan = await call('GET', '/api/plan', { cookie });
+        ok(plan.status === 200 && plan.json.ok && plan.json.today_ymd === today && plan.json.tomorrow_ymd === tomorrow, '明日の計画が開ける (今日・明日の日付つき)');
+        ok(plan.json.tomorrow.some((c) => c.id === t1), '明日やる分に入っている');
+        ok(!plan.json.candidates.some((c) => c.id === t1), '候補には出ない (もう予定がある)');
+        ok(plan.json.candidates.every((c) => c.when == null && c.status === 'not_started'), '候補は「予定なし かつ 未着手」だけ');
+        ok(plan.json.by_facility.some((f) => f.code === 'iroha' && f.count >= 1), '拠点ごとの内訳が出る');
+        ok(typeof plan.json.totals.hours === 'number' && typeof plan.json.totals.unknown_hours_count === 'number', '合計時間と「時間不明」の件数が出る');
+        ok(plan.json.target_hours.min === 4 && plan.json.target_hours.max === 6, '目安は 4〜6 時間');
+        // 並びが決定的
+        const twice = await call('GET', '/api/plan', { cookie });
+        ok(JSON.stringify(plan.json.candidates.map((c) => c.id)) === JSON.stringify(twice.json.candidates.map((c) => c.id)), '候補の並びは何度引いても同じ');
+
+        // ⑥ ゲージ用の合計が一覧にも出る
+        const stG = await call('GET', '/api/state', { cookie });
+        ok(stG.json.tomorrow_plan && stG.json.tomorrow_plan.count >= 1 && stG.json.today_ymd === today, 'ボードのゲージ用に「明日やる分」の件数と合計が出る');
+        ok(stG.json.cards.find((c) => c.id === t1).when === 'tomorrow', 'カードに when が付く');
+        ok('size_label' in stG.json.cards[0] && 'size_rank' in stG.json.cards[0], 'カードに大きさ (配送方法) が付く');
+
+        // ⑦ やり残し = 今日より前の予定で、まだ終わっていない。**自動では動かさない**
+        const t2 = mk(9402, 'やり残しテスト', 'in_progress');
+        db.prepare('UPDATE f_iroha_tasks SET planned_date = ? WHERE id = ?').run('2020-01-01', t2);
+        const plan2 = await call('GET', '/api/plan', { cookie });
+        ok(plan2.json.carry_over.some((c) => c.id === t2), 'やり残しに出る');
+        await call('GET', '/api/state', { cookie });
+        await call('GET', '/api/plan', { cookie });
+        ok(TD.getTask(t2).planned_date === '2020-01-01', '一覧や計画を開いても予定日は自動で動かない');
+
+        // ⑧ 職員モードが切れたら断る。ポータル (管理画面) は常に通る
+        ok((await call('POST', '/api/staff-lock', { cookie })).json.staff_mode.staff === false, '職員モードを終えられる');
+        const afterLock = await call('POST', '/api/plan', { cookie, body: { id: t1, when: null, expect_version: v(), worker_id: staffP.id } });
+        ok(afterLock.status === 403 && ['staff_required', 'pin_required'].includes(afterLock.json.error), '職員モードが切れたら 403 (PIN を入れ直す)');
+        const withPin = await call('POST', '/api/plan', { cookie, body: { id: t1, when: null, expect_version: v(), worker_id: staffP.id, pin: '4649' } });
+        ok(withPin.status === 200 && withPin.json.staff_mode.staff === true, 'PIN を添えれば通り、そのまま職員モードに入る');
+        ok((await call('GET', '/api/plan', { ...admin })).status === 200, 'ポータル (管理画面) からは職員モードなしで見られる');
+      }
+
       // 名前のないカードの片づけ (管理者のみ・confirm 必須)
       const stray = Number(db.prepare(`INSERT INTO f_iroha_tasks (status, facility_code, product_name, version, created_at, created_by, updated_at, updated_by)
         VALUES ('not_started', 'iroha', NULL, 1, ?, 'test', ?, 'test')`).run(new Date().toISOString(), new Date().toISOString()).lastInsertRowid);
@@ -2796,12 +2890,20 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   const app = capabilitiesFor('app'), notion = capabilitiesFor('notion'), pv = capabilitiesFor('preview');
   ok(Array.isArray(pv) && pv.length === 0, '下見・履歴は何も許さない');
   ok([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT].every(c => notion.includes(c))
-    && ![CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].some(c => notion.includes(c)),
+    && ![CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].some(c => notion.includes(c)),
     'Notion 正本 = 状態変更・作業開始・写真・作業のやり方 (今日やる等は許さない)');
-  ok(notion.every(c => app.includes(c)) && [CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].every(c => app.includes(c)),
-    'アプリ正本 = Notion 正本の全部 + 今日やる・外部準備OK・取消の判断・確認ずみ・ラベル待ち・まとめて棚入完了');
+  ok(notion.every(c => app.includes(c)) && [CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].every(c => app.includes(c)),
+    'アプリ正本 = Notion 正本の全部 + 外部準備OK・取消の判断・確認ずみ・ラベル待ち・まとめて棚入完了');
+  // ⭐計画 (いつ / どこが) は職員のときだけ (要件 §W-1)
+  const staffCaps = capabilitiesFor('app', { staff: true });
+  ok(!app.includes(CAP.PLAN_ASSIGN) && !app.includes(CAP.FACILITY_ASSIGN), '利用者には「いつ」「どこが」を許さない');
+  ok(staffCaps.includes(CAP.PLAN_ASSIGN) && staffCaps.includes(CAP.FACILITY_ASSIGN), '職員には「いつ」「どこが」を許す');
+  ok(app.every((c) => staffCaps.includes(c)), '職員は利用者にできることを全部できる');
+  ok(capabilitiesFor('notion', { staff: true }).length === notion.length, 'Notion 正本では職員でも計画は許さない (planned_date はアプリ正本の持ちもの)');
+  ok(capabilitiesFor('preview', { staff: true }).length === 0, '下見・履歴は職員でも何も許さない');
   // 書き込み口が capability を持たないまま増えていないか (Codex PR1 R6)
-  ok(app.length === 10 && new Set(app).size === app.length, 'アプリ正本の許可は 10 個・重複なし (増やしたら画面の判定も足す)');
+  ok(app.length === 9 && new Set(app).size === app.length, 'アプリ正本 (利用者) の許可は 9 個・重複なし (増やしたら画面の判定も足す)');
+  ok(staffCaps.length === 11 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 11 個・重複なし');
   app.push('x'); pv.push('y');
   ok(!capabilitiesFor('app').includes('x') && capabilitiesFor('preview').length === 0, '返した配列を壊しても共有の定義は変わらない');
   ok(capabilitiesFor('unknown').length === 0 && capabilitiesFor(undefined).length === 0, '知らないモードは何も許さない (default-deny)');

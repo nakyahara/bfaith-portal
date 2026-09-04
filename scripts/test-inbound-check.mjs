@@ -465,7 +465,8 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   ok(f1.ok && destIdOf('AR9|1|1'), '前提: いろは行きで確定');
   const d1 = destOf(destIdOf('AR9|1|1'));
   const t1 = taskOf(d1.id);
-  ok(t1 && t1.status === 'not_started' && t1.facility_code === 'iroha' && t1.notion_page_id == null, '確定と同時にタスクができる (未着手・いろは・Notion ページなし)');
+  ok(t1 && t1.status === 'not_started' && t1.facility_code == null && t1.notion_page_id == null,
+    '確定と同時にタスクができる (未着手・拠点は未定・Notion ページなし)');
   ok(t1.product_code === 'TASK-A' && t1.product_name === 'タスク商品A' && t1.qty === 6 && t1.ar_no === 'AR9' && t1.barcode === '4599999999991'
     && t1.expiry === '2027-03' && t1.arrival_date === d1.work_date, 'タスクに商品コード・名前・数量 (実数)・入荷管理番号・バーコード・有効期限・入庫日が載る');
   const snap = JSON.parse(t1.master_snapshot);

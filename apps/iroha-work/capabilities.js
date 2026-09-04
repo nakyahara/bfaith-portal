@@ -25,19 +25,25 @@ export const CAP = Object.freeze({
   REVIEW_CLEAR: 'task.review.clear',
   LABEL_WAIT_EDIT: 'task.label_wait.edit',
   BULK_STOCKED: 'tasks.bulk_stocked',
+  // ⭐計画は職員だけ (要件 §W-1)。「いつやるか」と「どこが作業するか」を決めるのは職員の仕事で、
+  //   利用者はボードで見るだけ。許可が無ければ札もボタンにせず、明日の計画の入口も描かない
+  FACILITY_ASSIGN: 'task.facility.assign',
 });
 
 const CAPS_NOTION = Object.freeze([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT]);
-const CAPS_APP = Object.freeze([...CAPS_NOTION, CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR,
+const CAPS_APP = Object.freeze([...CAPS_NOTION, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR,
   CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED]);
+/** ⭐職員のときだけ足す = 計画 (いつ / どこが)。利用者の画面には札のボタンも計画の入口も描かない */
+const CAPS_STAFF = Object.freeze([CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN]);
 const CAPS_PREVIEW = Object.freeze([]);
 
 /**
  * @param {'notion'|'app'|'preview'} mode
+ * @param {{staff?: boolean}} who staff = 職員モード中の端末、またはポータルの職員
  * @returns {string[]} 新しい配列 (呼び出し側が壊しても共有定数は変わらない)
  */
-export function capabilitiesFor(mode) {
-  if (mode === 'app') return [...CAPS_APP];
+export function capabilitiesFor(mode, { staff = false } = {}) {
+  if (mode === 'app') return staff ? [...CAPS_APP, ...CAPS_STAFF] : [...CAPS_APP];
   if (mode === 'notion') return [...CAPS_NOTION];
-  return [...CAPS_PREVIEW];
+  return [...CAPS_PREVIEW];   // 下見・履歴は誰でも読むだけ (職員でも何も許さない)
 }
