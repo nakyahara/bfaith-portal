@@ -18,7 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { google } from 'googleapis';
-import { getDB } from './db.js';
+import { getDB, sourceOfTruth } from './db.js';
 import { notionRequest, isNotionConfigured } from '../inbound-check/notion.js';
 import { codeKeyOf } from '../inbound-check/work-master.js';
 
@@ -90,17 +90,27 @@ export function getMediaRow(id) {
  * 実際に印を付けるのは送信キューの回 (processMediaQueue)
  */
 const pendingUnavailable = new Map();
-export function reportMediaUnavailable(id, reason) {
-  pendingUnavailable.set(Number(id), String(reason || 'unavailable'));
+export function reportMediaUnavailable(id, reason, driveFileId = null) {
+  pendingUnavailable.set(Number(id), { reason: String(reason || 'unavailable'), driveFileId });
   schedule();
 }
-/** 溜まった報告を反映する (キューの回から呼ぶ) */
+/**
+ * 溜まった報告を反映する (キューの回から呼ぶ)。⭐報告したときと同じ実体 (drive_file_id) の行にだけ
+ * 印を付ける — 報告から反映までの間に管理画面で送り直されていたら、新しい実体に古い 404 を貼らない (Codex PR1 R10)
+ */
 export function flushUnavailableReports() {
   if (pendingUnavailable.size === 0) return 0;
   const entries = [...pendingUnavailable.entries()];
   pendingUnavailable.clear();
+  const db = getDB();
   let n = 0;
-  for (const [id, reason] of entries) if (markMediaUnavailable(id, reason)) n++;
+  for (const [id, { reason, driveFileId }] of entries) {
+    if (driveFileId != null) {
+      const cur = db.prepare('SELECT drive_file_id FROM f_iroha_card_media WHERE id = ?').get(id);
+      if (!cur || cur.drive_file_id !== driveFileId) continue;   // 送り直された = 古い報告は捨てる
+    }
+    if (markMediaUnavailable(id, reason)) n++;
+  }
   return n;
 }
 
@@ -166,25 +176,45 @@ export function stagedPathOf(opId, kind, claim) {
 export const STAGE_TTL_MS = 30 * 60 * 1000;
 
 /**
- * 実体を置き終えた staging 行を公開する。⭐札 (claim) を持つ要求だけが上げられる。
- * 上げられなかったときは、別の要求が先に上げたのか・行が消えたのかを返す (Codex PR1 R8)
- * @returns {{ok:true, media}} | {{ok:false, reason:'taken'|'gone', media?}}
+ * その写真の持ち主のカードに、**いま**書き込めるか (Codex PR1 R10)。
+ * 公開はトランザクションの外 (ファイルを置いた後) に来るので、確かめたときから
+ * カードが終了したり正本が変わったりし得る。公開の瞬間にもここを通す。
  */
-export function promoteStagedMedia(id, localPath, claim = null) {
+function cardWritableFor(row) {
+  const db = getDB();
+  const app = sourceOfTruth() === 'app';
+  if (row.task_id != null) {
+    if (!app) return false;   // 正本が Notion に戻っていれば、tasks のカードは下見 = 読むだけ
+    const t = db.prepare('SELECT status FROM f_iroha_tasks WHERE id = ?').get(row.task_id);
+    return !!t && t.status !== 'closed';
+  }
+  if (app) return false;      // 正本がアプリなら、Notion のカードにはもう書かない
+  return !!db.prepare('SELECT page_id FROM f_iroha_app_notion_cache WHERE page_id = ?').get(row.page_id);
+}
+
+/**
+ * 実体を置き終えた staging 行を公開する。⭐札 (claim) と staged_at の両方が、
+ * 自分が見たときのままである要求だけが上げられる (Codex PR1 R8 / R10)。
+ * 公開の瞬間に「そのカードにいま書けるか」も確かめる (置いている間に終了・正本切替が起き得る)。
+ * @returns {{ok:true, media}} | {{ok:false, reason:'taken'|'gone'|'no_file'|'not_writable', media?}}
+ */
+export function promoteStagedMedia(id, localPath, { claim = null, stagedAt = null } = {}) {
   const db = getDB();
   // 実体が無いまま公開しない (置けたつもりで DB だけ進めない — Codex PR1 R9)
   if (!fs.existsSync(localPath)) return { ok: false, reason: 'no_file' };
   return db.transaction(() => {
-    const n = db.prepare(`UPDATE f_iroha_card_media SET staged_at = NULL, staged_claim = NULL, local_path = ?
-      WHERE id = ? AND staged_at IS NOT NULL AND (staged_claim IS ? OR ? IS NULL)`)
-      .run(localPath, Number(id), claim, claim).changes;
-    const row = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id));
-    if (n > 0) return { ok: true, media: publicMedia(row) };
-    if (!row) return { ok: false, reason: 'gone' };
+    const cur = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id));
+    if (!cur) return { ok: false, reason: 'gone' };
     // 別の要求が先に置いて公開した (同じ operation_id の二重送信)。写真としては成立しているので、
     // その行をそのまま返す。実体は相手が置いたものが正 — こちらから消さない
-    if (!row.staged_at) return { ok: false, reason: 'taken', media: publicMedia(row) };
-    return { ok: false, reason: 'taken' };
+    if (!cur.staged_at) return { ok: false, reason: 'taken', media: publicMedia(cur) };
+    if (!cardWritableFor(cur)) return { ok: false, reason: 'not_writable' };
+    const n = db.prepare(`UPDATE f_iroha_card_media SET staged_at = NULL, staged_claim = NULL, local_path = ?
+      WHERE id = ? AND staged_at IS NOT NULL AND staged_claim IS ?
+        ${stagedAt == null ? '' : 'AND staged_at = ?'}`)
+      .run(...[localPath, Number(id), claim].concat(stagedAt == null ? [] : [stagedAt])).changes;
+    if (n === 0) return { ok: false, reason: 'taken' };
+    return { ok: true, media: publicMedia(db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id))) };
   }).immediate();
 }
 
@@ -214,17 +244,26 @@ export function dropMedia(id, claim = null) {
 export function sweepStagedMedia(maxAgeMs = STAGE_TTL_MS) {
   const db = getDB();
   const limit = new Date(Date.now() - maxAgeMs).toISOString();
-  const rows = db.prepare('SELECT id, operation_id, kind, staged_claim FROM f_iroha_card_media WHERE staged_at IS NOT NULL AND staged_at < ?').all(limit);
+  const rows = db.prepare(`SELECT id, operation_id, kind, page_id, task_id, staged_claim, staged_at
+    FROM f_iroha_card_media WHERE staged_at IS NOT NULL AND staged_at < ?`).all(limit);
   let promoted = 0;
   let dropped = 0;
+  // ⭐自分が見たときの札・時刻のままの行しか動かさない。見た後に同じ端末から再送されていたら、
+  //   それは新しい要求のものなので触らない (Codex PR1 R10)
+  const dropIfSame = (r) => db.prepare('DELETE FROM f_iroha_card_media WHERE id = ? AND staged_claim IS ? AND staged_at = ?')
+    .run(r.id, r.staged_claim, r.staged_at).changes > 0;
   for (const r of rows) {
     const p = stagedPathOf(r.operation_id, r.kind, r.staged_claim);
-    if (fs.existsSync(p)) {
-      // 実体は置けたが公開の前に落ちた → 写真は無事なので公開する
-      if (promoteStagedMedia(r.id, p).ok) promoted++;
-    } else if (db.prepare('DELETE FROM f_iroha_card_media WHERE id = ? AND staged_at IS NOT NULL').run(r.id).changes > 0) {
-      dropped++;
+    if (!fs.existsSync(p)) {
+      if (dropIfSame(r)) dropped++;
+      continue;
     }
+    // 実体は置けたが公開の前に落ちた → 写真は無事なので公開する。ただし、その間に新しい写真で
+    // 枠が埋まっていたら公開しない (後から上限を超えない — Codex PR1 R10)
+    const max = r.kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
+    const room = countActiveMedia({ pageId: r.page_id, taskId: r.task_id }, r.kind) < max;
+    if (room && promoteStagedMedia(r.id, p, { claim: r.staged_claim, stagedAt: r.staged_at }).ok) { promoted++; continue; }
+    if (dropIfSame(r)) { dropped++; try { fs.unlinkSync(p); } catch { /* 無ければよい */ } }
   }
   if (promoted > 0 || dropped > 0) console.log(`[iroha-work] 置き去りの写真を片づけました 公開=${promoted} 破棄=${dropped}`);
   return { promoted, dropped };
@@ -274,7 +313,9 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
     // 限って**発行し直す (古いトークンは無効になる)。別端末からの同 operation_id には返さない
     if (deviceId != null && dup.uploader_device_id === Number(deviceId) && !dup.deleted_at) {
       const token = crypto.randomBytes(16).toString('base64url');
-      db.prepare('UPDATE f_iroha_card_media SET delete_token_hash = ? WHERE id = ?')
+      // ⭐直前のトークンも 1 つだけ生かしておく。同じ再送が二重に届くと、先に返したトークンが
+      //   端末に届く前に無効になり、撮った本人が消せなくなる (Codex PR1 R10)
+      db.prepare('UPDATE f_iroha_card_media SET delete_token_hash_prev = delete_token_hash, delete_token_hash = ? WHERE id = ?')
         .run(crypto.createHash('sha256').update(token).digest('hex'), dup.id);
       return { ok: true, already: true, media: publicMedia(dup), deleteToken: token };
     }
@@ -413,7 +454,8 @@ export function softDeleteMedia(id, { deleteToken = null, actor = null, isSessio
   if (!row || row.deleted_at) return { ok: false, error: 'not_found', message: '写真・動画が見つかりません' };
   if (!isSession) {
     const hash = deleteToken ? crypto.createHash('sha256').update(String(deleteToken)).digest('hex') : null;
-    if (!hash || hash !== row.delete_token_hash) {
+    // 直前のトークンも受ける (再送で配り直した直後の 1 世代だけ — Codex PR1 R10)
+    if (!hash || (hash !== row.delete_token_hash && hash !== row.delete_token_hash_prev)) {
       return { ok: false, error: 'forbidden', message: '削除できるのは撮影した端末からだけです (職員はPCの管理画面から)' };
     }
   }

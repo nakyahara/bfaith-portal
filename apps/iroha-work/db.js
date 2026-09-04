@@ -170,6 +170,7 @@ const mediaDDL = (name) => `
       unavailable_at TEXT,
       staged_at      TEXT,
       staged_claim   TEXT,
+      delete_token_hash_prev TEXT,
       CHECK (page_id IS NOT NULL OR task_id IS NOT NULL)
     );`;
 const MEDIA_INDEX_DDL = `
@@ -557,6 +558,8 @@ export function createTables(db = getMirrorDB()) {
   // 「いまこの行の実体を置こうとしている要求」の札。二重送信が同時に来ても、札を持つ側だけが
   // 公開・後始末をする (負けた側が相手の実体や行を消さない — Codex PR1 R8)
   addCol('f_iroha_card_media', 'staged_claim', 'TEXT');
+  // 1 つ前の削除トークン (再送で配り直した直後、先に返したトークンが無効にならないように — Codex PR1 R10)
+  addCol('f_iroha_card_media', 'delete_token_hash_prev', 'TEXT');
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}

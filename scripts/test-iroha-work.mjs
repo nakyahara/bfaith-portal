@@ -1280,6 +1280,8 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
   const m1 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('a1b1.jpg'), worker: getIrohaWorker(w1.id), operationId: 'op-a1b-0001' });
   ok(m1.ok && mediaByTask().get(tOpen).length === 1, 'task に写真が付く');
   // ⭐実体を置く前に落ちた行 (staged_at あり) は「無いもの」として扱い、再送で置き直せる (Codex PR1 R7)
+  const { setMetaValue: setMeta18 } = await import('../apps/iroha-work/db.js');
+  setMeta18('source_of_truth', 'app');   // 写真の公開は「そのカードにいま書けるとき」だけ (Codex PR1 R10)
   {
     const st = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('stage1.jpg'),
       worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-stage-0001', deferMove: true });
@@ -1294,12 +1296,29 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     ok(again.ok && again.already && again.media.id === st.media.id && again.move, '撮った端末からの再送は同じ行を返し、置き直す指示が付く');
     ok(again.claim && again.claim !== st.claim, '札は要求ごとに新しくなる (古い要求は公開できない)');
     moveStoredFile(again.move);
-    ok(promoteStagedMedia(again.media.id, again.move.to, st.claim).reason === 'taken', '古い札では公開できない');
-    const promoted = promoteStagedMedia(again.media.id, again.move.to, again.claim);
+    ok(promoteStagedMedia(again.media.id, again.move.to, { claim: st.claim }).reason === 'taken', '古い札では公開できない');
+    const promoted = promoteStagedMedia(again.media.id, again.move.to, { claim: again.claim });
     ok(promoted.ok && fs.existsSync(again.move.to), '実体を置いてから公開する');
     ok(mediaByTask().get(tOpen).length === 2, '置いてはじめて一覧に出る');
-    const twice = promoteStagedMedia(again.media.id, again.move.to, again.claim);
+    const twice = promoteStagedMedia(again.media.id, again.move.to, { claim: again.claim });
     ok(twice.ok === false && twice.reason === 'taken' && twice.media, '二重に公開はせず、公開済みの行を返す');
+    // ⭐実体を置いている間にカードが終わっていたら公開しない (Codex PR1 R10)
+    {
+      const st2 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('gate1.jpg'),
+        worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-gate-00001', deferMove: true });
+      moveStoredFile(st2.move);
+      setMeta18('source_of_truth', 'notion');
+      ok(promoteStagedMedia(st2.media.id, st2.move.to, { claim: st2.claim }).reason === 'not_writable',
+        '正本が Notion に戻っていたら公開しない (下見のカードに写真が増えない)');
+      setMeta18('source_of_truth', 'app');
+      const wasStatus = TD.getTask(tOpen).status;
+      db.prepare("UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'stocked', closed_at = ?, closed_by = 'test' WHERE id = ?").run(new Date().toISOString(), tOpen);
+      ok(promoteStagedMedia(st2.media.id, st2.move.to, { claim: st2.claim }).reason === 'not_writable',
+        '終了したカードにも公開しない (履歴の写真が後から増えない)');
+      db.prepare('UPDATE f_iroha_tasks SET status = ?, close_reason = NULL, closed_at = NULL, closed_by = NULL WHERE id = ?').run(wasStatus, tOpen);
+      db.prepare("DELETE FROM f_iroha_card_media WHERE operation_id = 'op-gate-00001'").run();
+      try { fs.unlinkSync(st2.move.to); } catch { /* 無ければよい */ }
+    }
     // 後の検査 (「前回の完成形」の枚数) に影響させないよう片づける
     db.prepare('DELETE FROM f_iroha_card_media WHERE operation_id = ?').run('op-stage-0001');
     try { fs.unlinkSync(again.move.to); } catch { /* 無ければよい */ }
@@ -1325,6 +1344,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     try { fs.unlinkSync(g2.move.to); } catch { /* 無ければよい */ }
     ok(mediaByTask().get(tOpen).length === 1, '片づけて元に戻す');
   }
+  setMeta18('source_of_truth', null);   // 正本は既定 (Notion) に戻す
   await processMediaQueue();
   const tNext = mk({ page: 'a1b-next', code: 'PROD-A', name: '次の入荷 (同じ商品)', dest: 8805 });
   clearEnrichCache();
@@ -1445,7 +1465,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       && !/page_id\s+TEXT NOT NULL/.test(newS), '作業時間: 新しい定義 (task_id FK・CHECK・page_id NULL 可) で作り直す');
     ok(/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/.test(newM) && /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/.test(newM)
       && /operation_id\s+TEXT NOT NULL UNIQUE/.test(newM), '写真: 同上 (UNIQUE も残る)');
-    const strip = (j) => JSON.stringify(JSON.parse(j).map((r) => { const { task_id, staged_at, staged_claim, ...rest } = r; return rest; }));
+    const strip = (j) => JSON.stringify(JSON.parse(j).map((r) => { const { task_id, staged_at, staged_claim, delete_token_hash_prev, ...rest } = r; return rest; }));
     ok(strip(rowsOf('f_iroha_work_sessions')) === pageRowsS && strip(rowsOf('f_iroha_card_media')) === pageRowsM, '行 (id・全列) はそのまま。task_id は NULL');
     ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE type='index' AND name IN ('idx_iroha_sessions_task','idx_iroha_media_task','idx_iroha_sessions_page','idx_iroha_media_page')").get().c === 4, '索引 4 本が作り直される');
     let bothNull = null;
@@ -1468,7 +1488,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     // (b) 途中の版 (page_id NULL 可・task_id あり・CHECK/FK 無し) — 全行 (task の行も) そのまま保って作り直す
     const allS = rowsOf('f_iroha_work_sessions'), allM = rowsOf('f_iroha_card_media');
     const MID_SESSIONS = OLD_SESSIONS.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER');
-    const MID_MEDIA = OLD_MEDIA.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER').replace('unavailable_at TEXT)', 'unavailable_at TEXT, staged_at TEXT, staged_claim TEXT)');
+    const MID_MEDIA = OLD_MEDIA.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER').replace('unavailable_at TEXT)', 'unavailable_at TEXT, staged_at TEXT, staged_claim TEXT, delete_token_hash_prev TEXT)');
     const allColsS = db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().map((c) => c.name).join(', ');
     const allColsM = db.prepare('PRAGMA table_info(f_iroha_card_media)').all().map((c) => c.name).join(', ');
     db.pragma('foreign_keys = OFF');

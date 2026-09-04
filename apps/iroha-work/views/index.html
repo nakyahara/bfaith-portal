@@ -1654,6 +1654,14 @@ async function shrinkPhoto(file) {
 async function uploadMedia(opId) {
   const p = pendingTiles.get(opId);
   if (!p || !worker) return;
+  // カメラ・ファイル選択は非同期。開いている間に正本や開いている詳細が変わり得るので、
+  // 実際に送る直前にも許可リストと相手のカードを確かめる (Codex PR1 R10)
+  if (!can('task.media.add') || String(p.pageId) !== String(curDetail)) {
+    pendingTiles.delete(opId);
+    rerenderDetail();
+    showErr('このカードには写真を足せなくなりました');
+    return;
+  }
   p.failed = false;
   rerenderDetail();
   const fd = new FormData();

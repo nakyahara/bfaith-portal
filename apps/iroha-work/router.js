@@ -910,9 +910,15 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
         console.error('[iroha-work] 写真の保存に失敗', e);
         return res.status(500).json({ ok: false, error: 'store_failed', message: '写真を保存できませんでした (もう一度とってください)' });
       }
-      const promoted = promoteStagedMedia(r.media.id, r.move.to, r.claim);
+      const promoted = promoteStagedMedia(r.media.id, r.move.to, { claim: r.claim });
       if (promoted.ok) {
         r.media = promoted.media;
+      } else if (promoted.reason === 'not_writable') {
+        // 実体を置いている間にカードが終了した / 正本が Notion に戻った。写真は残さない (Codex PR1 R10)
+        try { dropMedia(r.media.id, r.claim); } catch { /* 消せなくても応答は失敗にする */ }
+        try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
+        return res.status(409).json({ ok: false, error: 'closed_task',
+          message: '保存の途中でこのカードは変えられなくなりました (もう一度とってください)' });
       } else if (promoted.media) {
         // 同じ送信が二重に届き、もう一方が先に公開した。写真としては成立しているのでそのまま返す。
         // 置いた実体 (自分の札のファイル) は誰も参照しないので片づける
@@ -991,7 +997,7 @@ router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
     if (st === 404 || st === 410) {
       // Drive 側で消えた → 見本候補・表示から外す (毎回壊れた写真を選び続けない — Codex R1 #5)。
       // 印を付けるのはキューの回。配信 (GET) 自体は DB を変えない (Codex PR1 R9)
-      reportMediaUnavailable(r.id, `Drive ${st}`);
+      reportMediaUnavailable(r.id, `Drive ${st}`, r.drive_file_id);
       return fail(404, 'unavailable', 'この写真はドライブから消えています');
     }
     return fail(502, 'drive_error', `ドライブから取り出せませんでした (${e.message})`);
