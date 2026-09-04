@@ -663,6 +663,16 @@ th.attr-unknown { color: #dc2626; }
                 <div class="profit-fig"><span class="lbl">利益率</span><span class="val" id="profit-sim-margin">—</span></div>
               </div>
               <div id="profit-sim-body" class="muted" style="font-size:11px; margin-top:4px;"></div>
+              <%# 配送方法を差し替えて試算する (2026-09-04 中原さん要望: 配送方法を変えても
+                  金額が動かなかった)。楽天の配送方法グループは粒度が粗く送料が一意に決まらないので、
+                  選択肢は NE の配送方法 (= 送料が決まる方) にする %>
+              <div style="margin-top:6px;">
+                <label style="font-size:11px; margin-bottom:2px;" class="muted">配送方法で試算</label>
+                <select id="profit-ship-select" style="width:100%; font-size:12px;"
+                        data-current="<%= neCost?.shippingMethod || '' %>"></select>
+                <div id="profit-ship-note" class="muted" style="font-size:11px; margin-top:2px;"></div>
+              </div>
+              <script type="application/json" id="profit-ship-data"><%- JSON.stringify({ options: neShippingOptions || [], hints: rakutenGroupNeHints || {} }).replace(/</g, '\\u003c') %></script>
             <% } %>
           </div>
         </div>
@@ -703,7 +713,9 @@ th.attr-unknown { color: #dc2626; }
           <% if (!rakuten?.shipping_method_group && neShipping.group) { %>
             <div class="muted" style="font-size:11px;">NEの配送方法「<%= neCost?.shippingMethod %>」から自動選択 (保存で確定)</div>
           <% } %>
-          <div class="muted" style="font-size:11px;">※利益計算の配送費はNEの配送方法から自動算出 (ここを変えても計算は変わりません)</div>
+          <%# 2026-09-04: 利益の配送費を「配送方法で試算」から選べるようにしたので、
+              「変えても計算は変わりません」ではなくなった (候補が上に集まる) %>
+          <div class="muted" style="font-size:11px;">※ここは楽天へ送る配送方法です。利益計算の配送費は左の「配送方法で試算」で選びます (ここを変えると候補が上に集まります)</div>
         </div>
         <div style="flex:1; min-width:120px;">
           <label>送料<span class="ftag ftag-auto">自動</span></label>
@@ -3499,10 +3511,11 @@ th.attr-unknown { color: #dc2626; }
     const body = document.getElementById('profit-sim-body');
     if (!box || !body) return; // 原価/送料が無いときは静的メッセージのみ
     const cost = Number(box.dataset.cost);
-    const ship = Number(box.dataset.ship);
     const tax = Number(box.dataset.tax);
     const take = Number(box.dataset.take);
     const priceInput = document.getElementById('f-price');
+    // 配送費は「選んでいる配送方法」で決まる (2026-09-04)。初期値は NE の送料
+    let ship = Number(box.dataset.ship);
     // 利益額・利益率は大きい数字で別枠に出す (2026-09-01)。内訳と未入力メッセージは body 側
     const figs = document.getElementById('profit-sim-figs');
     const amountEl = document.getElementById('profit-sim-amount');
@@ -3531,6 +3544,77 @@ th.attr-unknown { color: #dc2626; }
         + ' − 配送費' + Math.round(ship).toLocaleString();
     }
     priceInput.addEventListener('input', render);
+
+    // ─── 配送方法を差し替えて試算する ───────────────────────────────
+    // 楽天の配送方法グループ (8種) と NE の配送方法 (サイズ別) は粒度が違い、
+    // 楽天「宅急便50サイズ以上」は NE の 50〜120 サイズ (479〜945円) のどれにもなる。
+    // なので選択肢は NE の配送方法にし、楽天のプルダウンを変えたら**候補を上に集める**
+    // (絞り込みではなく並べ替え — 対応表は目安で、決めるのは人)
+    (function initProfitShipPicker() {
+      const sel = document.getElementById('profit-ship-select');
+      const note = document.getElementById('profit-ship-note');
+      const holder = document.getElementById('profit-ship-data');
+      if (!sel || !holder) return;
+      let data = { options: [], hints: {} };
+      try { data = JSON.parse(holder.textContent) || data; } catch (e) { /* 無ければ選択肢なし */ }
+      if (!data.options.length) { sel.closest('div').hidden = true; return; }
+      const neCurrent = sel.dataset.current || '';
+      const rkShip = document.getElementById('rk-shipping-group');
+
+      function build() {
+        const chosen = sel.value || neCurrent;
+        // 楽天で選んでいるグループに関係しそうな配送方法を上のグループに集める
+        const raw = rkShip ? String(rkShip.value || '') : '';
+        const group = raw.replace(/y\d+$/, '');   // 複合選択肢 (1y5 等) は楽天側のグループで見る
+        const hints = data.hints[group] || [];
+        const match = (o) => hints.some((h) => o.method.includes(h));
+        const near = data.options.filter(match);
+        const rest = data.options.filter((o) => !match(o));
+        sel.replaceChildren();
+        const addTo = (parent, list) => {
+          for (const o of list) {
+            const op = document.createElement('option');
+            op.value = o.method;
+            op.dataset.cost = o.cost;
+            op.textContent = o.method + ' (' + Math.round(o.cost).toLocaleString() + '円'
+              + (o.isCurrent ? '・NEの登録値' : '') + ')';
+            parent.appendChild(op);
+          }
+        };
+        if (near.length && rest.length) {
+          const g1 = document.createElement('optgroup');
+          g1.label = '楽天の指定に近いもの';
+          addTo(g1, near);
+          sel.appendChild(g1);
+          const g2 = document.createElement('optgroup');
+          g2.label = 'その他';
+          addTo(g2, rest);
+          sel.appendChild(g2);
+        } else {
+          addTo(sel, data.options);
+        }
+        // 選択中の配送方法を保つ。無ければ「NEの登録値」の行 → それも無ければ先頭。
+        // ここで実送料の行を外すと、開いただけで利益額が代表送料に変わる (Codex R3 P1)
+        const current = data.options.find((o) => o.isCurrent);
+        const want = [chosen, neCurrent].find((v) => v && data.options.some((o) => o.method === v));
+        sel.value = want || current?.method || data.options[0].method;
+        apply();
+      }
+      function apply() {
+        const op = sel.selectedOptions[0];
+        if (!op) return;
+        ship = Number(op.dataset.cost);
+        const isCur = !!data.options.find((o) => o.method === sel.value)?.isCurrent;
+        note.textContent = isCur
+          ? 'NE に登録されている送料です'
+          : 'NE は「' + (neCurrent || '未設定') + '」です — ここでの変更は試算だけで、NE や出品内容は変わりません';
+        render();
+      }
+      sel.addEventListener('change', apply);
+      if (rkShip) rkShip.addEventListener('change', build);
+      build();
+    })();
+
     render();
   })();
 
