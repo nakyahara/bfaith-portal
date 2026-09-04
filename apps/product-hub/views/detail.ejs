@@ -524,11 +524,16 @@ th.attr-unknown { color: #dc2626; }
             <span class="muted">（構成: <%= setInfo.members.map((m) => `${m.member_ne_code}×${m.qty}`).join(' ＋ ') %>）</span>
           <% } %>
         </div>
-        <%# 売価の由来 (§5.3)。単品×個数を初期値に入れているので、その式を1行で見せる %>
+        <%# 売価の由来 (§5.3/§4.4)。構成の「単品売価 × 個数」の和を初期値として**実際に入れて**いるので、
+            その式を1行で見せる。人が値付けした後は「初期値は〜でした」に言い方を変える %>
         <% if (setInfo.priceOrigin) { %>
           <div class="muted" style="margin-top:6px; font-size:12px;">
-            売価は「単品 <%= setInfo.priceOrigin.unit.toLocaleString() %>円 × <%= setInfo.priceOrigin.qty %>個
-            = <%= setInfo.priceOrigin.total.toLocaleString() %>円」を初期値として入れています（送料・値引きは含みません）。
+            <% if (setInfo.priceOrigin.untouched) { %>
+              売価は「<%= setInfo.priceOrigin.text %>」を初期値として入れています（税込。送料・値引きは含みません）。
+              <strong>ここから値付けしてください。</strong>
+            <% } else { %>
+              売価の目安（構成の単品売価の合計）は「<%= setInfo.priceOrigin.text %>」です（税込。送料・値引きは含みません）。
+            <% } %>
           </div>
         <% } %>
         <%# 親が派生後に変わった (§4.5)。自動追随はしない — 見て判断してもらう %>
@@ -621,20 +626,32 @@ th.attr-unknown { color: #dc2626; }
         <details style="margin-top:8px;">
           <summary style="cursor:pointer; font-size:13px; color:#1d4ed8;">セット商品を作る</summary>
           <div style="margin-top:8px;">
-            <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
-              <div style="flex:0 0 90px;">
-                <label>個数</label>
-                <input type="number" id="set-qty" value="2" min="1" max="999">
-              </div>
-              <div style="flex:1; min-width:220px;">
-                <label>セット商品名 <span class="muted">(空なら自動)</span></label>
-                <input type="text" id="set-name" placeholder="<%= draft.name %> 2個セット" maxlength="300">
-              </div>
+            <%# 構成は複数行で指定できる (§5.6)。既定は「この商品 × 2」= いちばん多い形。
+                候補はこの商品と、バリエーションがあればその子SKU (混載セットの入口) %>
+            <label>構成 <span class="muted">(何を何個入れるか)</span></label>
+            <datalist id="set-member-codes">
+              <option value="<%= draft.ne_code %>"><%= draft.name %></option>
+              <% if (variation.kind === 'variation') { %>
+                <% for (const m of variation.members) { %>
+                  <option value="<%= m.商品コード %>"><%= m.商品名 || '' %></option>
+                <% } %>
+              <% } %>
+            </datalist>
+            <div id="set-members" style="display:grid; gap:6px; margin:4px 0 6px;"></div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+              <button type="button" class="btn btn-sm" id="set-member-add">＋ 行を追加</button>
+              <span class="muted" style="font-size:11.5px;">同じ商品の複数個も、別商品を混ぜたセットもここで指定します</span>
+            </div>
+            <div style="flex:1; min-width:220px;">
+              <label>セット商品名 <span class="muted">(空なら自動)</span></label>
+              <input type="text" id="set-name" placeholder="<%= draft.name %> 2個セット" maxlength="300">
             </div>
             <p class="muted" style="margin:8px 0; font-size:12px;">
               商品コードは <code>SET-<%= draft.ne_code %>-01</code> のような<strong>仮コード</strong>で作ります。
               ネクストエンジンに登録したら本コードへ差し替えてください（差し替えるまで楽天出品はできません）。
-              画像・売価・JANはセット用に作り直しになるので引き継ぎません。
+              <br>売価は<strong>構成の「単品売価 × 個数」の合計</strong>を初期値として入れます（そこから値付けしてください）。
+              <strong>配送方法は引き継ぎません</strong>（個数で箱もサイズも変わるため。NEに本コードが載ると自動で選ばれます）。
+              画像・JANはセット用に作り直しになるので引き継ぎません。
             </p>
             <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
               <button class="btn btn-primary btn-sm" id="set-ai-btn">AIに書き換えてもらう</button>
@@ -4840,12 +4857,77 @@ th.attr-unknown { color: #dc2626; }
     });
 
     // ─── セット商品 ───
+    // 構成は複数行 (§5.6)。行 = 商品コード × 個数。既定は「この商品 × 2」
+    const setMembersBox = document.getElementById('set-members');
+    function addMemberRow(code, qty) {
+      if (!setMembersBox) return;
+      const row = document.createElement('div');
+      row.className = 'set-member-row';
+      row.style.cssText = 'display:flex; gap:6px; align-items:center;';
+      const codeInput = document.createElement('input');
+      codeInput.type = 'text';
+      codeInput.className = 'set-member-code';
+      codeInput.setAttribute('list', 'set-member-codes');
+      codeInput.placeholder = '商品コード';
+      codeInput.maxLength = 100;
+      codeInput.value = code || '';
+      codeInput.style.cssText = 'flex:1; min-width:160px;';
+      const qtyInput = document.createElement('input');
+      qtyInput.type = 'number';
+      qtyInput.className = 'set-member-qty';
+      qtyInput.min = '1';
+      qtyInput.max = '999';
+      qtyInput.value = String(qty || 1);
+      qtyInput.style.cssText = 'flex:0 0 80px;';
+      const unit = document.createElement('span');
+      unit.className = 'muted';
+      unit.style.cssText = 'font-size:12px;';
+      unit.textContent = '個';
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'btn btn-sm';
+      del.textContent = '✕';
+      del.title = 'この行を消す';
+      // 最後の1行は消せない (構成が空のセットは作れない)。消せるかは押した時点で数える
+      del.addEventListener('click', function () {
+        if (setMembersBox.querySelectorAll('.set-member-row').length <= 1) return;
+        row.remove();
+      });
+      row.appendChild(codeInput);
+      row.appendChild(qtyInput);
+      row.appendChild(unit);
+      row.appendChild(del);
+      setMembersBox.appendChild(row);
+    }
+    if (setMembersBox) {
+      addMemberRow('<%= draft.ne_code %>', 2);
+      const addBtn = document.getElementById('set-member-add');
+      if (addBtn) addBtn.addEventListener('click', function () { addMemberRow('', 1); });
+    }
+    /** 画面の行 → API に送る構成。空行は落とす (人が行を足して埋めなかった場合) */
+    function readSetMembers() {
+      if (!setMembersBox) return [];
+      const out = [];
+      const rows = setMembersBox.querySelectorAll('.set-member-row');
+      for (const r of rows) {
+        const code = (r.querySelector('.set-member-code').value || '').trim();
+        const qty = Number(r.querySelector('.set-member-qty').value);
+        if (!code) continue;
+        out.push({ ne_code: code, qty: qty });
+      }
+      return out;
+    }
     async function createSet(mode) {
       const out = document.getElementById('set-create-result');
-      const qty = Number(document.getElementById('set-qty').value);
-      if (!Number.isInteger(qty) || qty < 1) { out.textContent = '個数を入れてください'; return; }
+      const members = readSetMembers();
+      if (members.length === 0) { out.textContent = '構成を1行以上入れてください'; return; }
+      // 個数はサーバーでも弾くが、押した瞬間に理由が出るほうが直しやすい
+      const badQty = members.find(function (m) { return !Number.isInteger(m.qty) || m.qty < 1 || m.qty > 999; });
+      if (badQty) { out.textContent = '「' + badQty.ne_code + '」の個数を 1〜999 で入れてください'; return; }
       const label = mode === 'ai' ? 'AIに書き換えてもらう' : 'コピーしてすぐ直す';
-      if (!confirm('この商品からセット商品を作ります (' + label + ')。\n商品コードは仮コードになります。\n\nよろしいですか?')) return;
+      const compo = members.map(function (m) { return m.ne_code + '×' + m.qty; }).join(' + ');
+      if (!confirm('この商品からセット商品を作ります (' + label + ')。\n構成: ' + compo
+        + '\n商品コードは仮コードになります。\n\nよろしいですか?')) return;
       const btns = [document.getElementById('set-ai-btn'), document.getElementById('set-copy-btn')];
       btns.forEach(function (b) { b.disabled = true; });
       out.textContent = '作成中…';
@@ -4854,7 +4936,7 @@ th.attr-unknown { color: #dc2626; }
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             mode: mode, name: document.getElementById('set-name').value,
-            members: [{ ne_code: '<%= draft.ne_code %>', qty: qty }],
+            members: members,
             // 親の「セット商品作成検討」を閉じる操作なので、その工程の版数を添える
             parent_step_version: <%= (workflow.main.find((s) => s.step_code === 'set_review') || {}).version %>,
           }),
