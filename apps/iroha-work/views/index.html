@@ -133,6 +133,45 @@
   .bcard .cb{width:20px;height:20px;vertical-align:-4px;margin-right:6px;accent-color:var(--accent)}
   .colempty{color:var(--faint);font-size:.8rem;padding:8px 4px}
 
+  /* ── 「どこが」「いつ」の札 (3 軸のうち 2 つ。職員だけボタンになる — 要件 §W-4) ── */
+  .tags{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
+  .tag{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);
+    padding:4px 9px;font-size:.8rem;font-weight:700;display:inline-flex;align-items:center;gap:5px;line-height:1.3}
+  button.tag{min-height:36px;cursor:pointer}
+  .tag .k{font-size:.66rem;color:var(--faint);font-weight:700;letter-spacing:.04em}
+  .tag.none{color:var(--faint);border-style:dashed}
+  .tag.tomorrow{background:var(--accent);border-color:var(--accent);color:#fff}
+  .tag.tomorrow .k{color:rgba(255,255,255,.75)}
+  .tag.todayp{background:var(--ok);border-color:var(--ok);color:#fff}
+  .tag.todayp .k{color:rgba(255,255,255,.8)}
+  .tag.over{background:var(--amber-soft);border-color:#F2D9AE;color:var(--amber)}
+  .tag.over .k{color:var(--amber)}
+
+  /* ── 明日やる分のゲージ (職員はタップで「明日の計画」へ) ── */
+  .gauge{display:flex;align-items:center;gap:12px;background:var(--accent-soft);border:1px solid #C9D7FF;
+    border-radius:var(--r);padding:8px 14px;margin-bottom:10px;width:100%;text-align:left;font-family:var(--font)}
+  button.gauge{cursor:pointer;min-height:56px}
+  button.gauge:hover{box-shadow:0 0 0 2px var(--accent-soft)}
+  .gauge .lbl{font-weight:700;font-size:.88rem;color:var(--accent);flex:none}
+  .gauge .big{font-family:var(--num);font-size:1.3rem;font-weight:700;line-height:1;flex:none}
+  .gauge .big small{font-size:.78rem;color:var(--sub);margin:0 5px 0 2px;font-weight:600}
+  .gauge .bar{position:relative;flex:1;min-width:80px;max-width:200px;height:12px;background:#fff;
+    border:1px solid #C9D7FF;border-radius:999px;overflow:hidden}
+  .gauge .bar .band{position:absolute;top:0;bottom:0;left:50%;width:25%;background:var(--ok-soft);
+    border-left:2px solid var(--ok);border-right:2px solid var(--ok)}
+  .gauge .bar .fill{position:absolute;top:0;bottom:0;left:0;background:var(--accent);transition:width .25s}
+  .gauge .bar .fill.over{background:var(--amber)}
+  .gauge .st{font-size:.8rem;font-weight:700;flex:none}
+  .gauge .st.ok{color:var(--ok)} .gauge .st.under{color:var(--sub)} .gauge .st.over{color:var(--amber)}
+  .gauge .go{margin-left:auto;font-weight:700;color:var(--accent);font-size:.88rem;flex:none}
+  .gauge .staff{margin-left:auto;font-size:.74rem;color:var(--sub);flex:none}
+
+  /* ── 列の分け方 ── */
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:var(--surface)}
+  .seg button{border:0;background:transparent;color:var(--sub);padding:7px 13px;font-weight:700;font-size:.84rem;
+    min-height:38px;cursor:pointer;font-family:var(--font)}
+  .seg button.on{background:var(--ink);color:#fff}
+
   /* ── まとめて操作のバー ── */
   .bulkbar{position:fixed;left:0;right:0;bottom:0;background:var(--ink);color:#fff;padding:12px 16px;
     display:none;gap:10px;align-items:center;z-index:35;box-shadow:0 -2px 12px rgba(15,23,40,.2)}
@@ -346,9 +385,15 @@
   <!-- ══ 画面1b: ボード (状態 × 拠点。Notion のボードビューの代わり) ══ -->
   <div class="page boardpage" hidden>
     <div class="preview" id="prevBoard" hidden></div>
+    <!-- 明日やる分の合計。職員はここから「明日の計画」を開く (要件 §W-4) -->
+    <div id="gaugeWrap"></div>
     <div class="filters">
+      <span class="flabel">列の分け方</span>
+      <span class="seg" id="colSeg"></span>
       <span class="flabel">拠点</span>
       <span id="facChips"></span>
+      <span class="flabel">予定</span>
+      <span id="whenChips"></span>
       <input class="search" id="bq" placeholder="商品名・商品コードで検索">
     </div>
     <div class="board" id="board"></div>
@@ -492,6 +537,16 @@
     </div>
   </div>
 
+  <!-- ══ どこが作業するか (「どこが」の札から。職員だけ) ══ -->
+  <div class="ov" id="facOv" hidden>
+    <div class="modal">
+      <h3 id="facTitle">どこが作業しますか?</h3>
+      <div class="opts" id="facOpts"></div>
+      <p class="msg" id="facMsg"></p>
+      <div class="mbtns"><button class="btn" onclick="closeFacPick()">やめる</button></div>
+    </div>
+  </div>
+
   <!-- ══ 作業者選択 ══ -->
   <div class="gate" id="gate">
     <div class="gwrap">
@@ -545,6 +600,8 @@ function stName(v) {
 let state = { mode: 'notion', cards: [], statuses: [], changeTargets: [], workers: [], refresh: {}, me: {} };
 let curTab = 'all';
 let curView = 'list';       // list | board | label | history (アプリ正本のときだけ切り替えられる)
+let boardCols = 'status';   // ボードの列の分け方: status (進捗) | fac (拠点)。「予定」の列は作らない (要件 §W-4)
+let curWhen = 'all';        // 予定の絞り込み: all | today | tomorrow | none
 let curFacility = 'all';    // ボードの拠点しぼりこみ
 let bulkIds = null;         // まとめて棚入完了で選んでいる id → 選んだときの版 の Map (null = 選択モードではない)
 let lwOpenOnly = true;      // ラベル待ち: 未完了だけ
@@ -976,16 +1033,66 @@ async function loadPreviewOnce() {
   renderBoard();
 }
 
-// ─── ボード (状態 4 列 × 拠点) ───
+// ─── ボード (要件 §W-4: 列 = 進捗 or 拠点。「どこが」「いつ」はカードの札) ───
+/** 「いつ」の表示名。カードの札と絞り込みで同じ言葉を使う */
+const WHEN_LABEL = { today: '今日やる', tomorrow: '明日やる', over: 'やり残し', later: '先の予定' };
+const WHEN_CLASS = { today: 'todayp', tomorrow: 'tomorrow', over: 'over', later: '' };
+
+/** 明日やる分の合計 (上のゲージ)。職員はタップで「明日の計画」へ。利用者は見るだけ */
+function gaugeHtml() {
+  const p = (state && state.tomorrow_plan) || { hours: 0, count: 0, unknown_hours_count: 0 };
+  const h = Math.floor(p.hours);
+  const m = Math.round((p.hours - h) * 60);
+  const pct = Math.min(100, (p.hours / 8) * 100);
+  const over = p.hours > 6;
+  const st = p.hours < 4 ? ['under', p.count + ' 件 · あと ' + fmtHours(4 - p.hours) + ' で目安']
+    : p.hours <= 6 ? ['ok', p.count + ' 件 · 目安内 (4〜6 時間)']
+    : ['over', p.count + ' 件 · 目安を ' + fmtHours(p.hours - 6) + ' 超えています'];
+  const unknown = p.unknown_hours_count > 0 ? ' <span class="st under">時間不明 ' + esc(String(p.unknown_hours_count)) + ' 件</span>' : '';
+  const inner = '<span class="lbl">明日やる分</span>' +
+    '<span class="big">' + esc(String(h)) + '<small>時間</small>' + esc(String(m).padStart(2, '0')) + '<small>分</small></span>' +
+    '<span class="bar"><span class="band"></span><span class="fill' + (over ? ' over' : '') + '" style="width:' + pct + '%"></span></span>' +
+    '<span class="st ' + st[0] + '">' + esc(st[1]) + '</span>' + unknown;
+  // ⭐計画は職員だけ。許可が無ければボタンにせず、入口 (›) も描かない (要件 §W-4)
+  if (!stateCan('task.plan.assign')) return '<div class="gauge">' + inner + '</div>';
+  const left = staffLeftText();
+  return '<button class="gauge" onclick="openPlanPage()">' + inner +
+    '<span class="go">明日の計画 ›</span>' + (left ? '<span class="staff">' + esc(left) + '</span>' : '') + '</button>';
+}
+/** 職員モードの残り時間 (切れる前に気づけるように) */
+function staffLeftText() {
+  const sm = state && state.staff_mode;
+  if (!sm || !sm.staff || !sm.until) return '';
+  const min = Math.max(0, Math.round((Date.parse(sm.until) - Date.now()) / 60000));
+  return '職員モード あと ' + min + ' 分';
+}
+function fmtHours(h) {
+  const m = Math.max(0, Math.round(h * 60));
+  return m >= 60 ? Math.floor(m / 60) + ' 時間' + (m % 60 ? String(m % 60) + ' 分' : '') : m + ' 分';
+}
+function colSegHtml() {
+  return [['status', '進捗'], ['fac', '拠点']]
+    .map(([v, l]) => '<button class="' + (boardCols === v ? 'on' : '') + '" data-col="' + v + '">' + l + '</button>').join('');
+}
+function whenChips() {
+  const cards = ((boardState() || {}).cards || []);
+  const n = (v) => (v === 'all' ? cards.length : v === 'none' ? cards.filter(c => !c.when).length : cards.filter(c => c.when === v).length);
+  // 札に出る「いつ」は絞り込みでも選べるようにする (やり残しだけ見たい、があるため — Codex P2 R1)
+  return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定']]
+    .map(([v, l]) => '<button class="chip' + (curWhen === v ? ' on' : '') + '" data-when="' + v + '">' + l +
+      ' <span class="num">' + n(v) + '</span></button>').join('');
+}
 function facChips() {
   const st = boardState() || { cards: [], facilities: [] };
   const facs = st.facilities || [];
   const counts = { all: st.cards.length };
   for (const c of st.cards) counts[c.facility_code] = (counts[c.facility_code] || 0) + 1;
   // 値は data 属性で渡す (onclick に文字列を埋めない — HTML エスケープは JS 文字列のエスケープではない。Codex PR-C R1)
+  counts.none = st.cards.filter(c => !c.facility_code).length;
   const one = (v, label) => '<button class="chip' + (curFacility === v ? ' on' : '') + '" data-fac="' + esc(v) + '">' +
     esc(label) + ' <span class="num">' + (counts[v] || 0) + '</span></button>';
-  return one('all', 'すべて') + facs.map(f => one(f.code, f.name)).join('');
+  // 「未定」= どこが作業するか決まっていないカード (要件 §W-2)
+  return one('all', 'すべて') + one('none', '未定') + facs.map(f => one(f.code, f.name)).join('');
 }
 function pickFacility(code) { curFacility = code; renderBoard(); }
 // クリックは委譲で受ける (中身を作り直しても付け直さなくてよい)
@@ -993,7 +1100,20 @@ $('#facChips').addEventListener('click', (e) => {
   const b = e.target.closest('[data-fac]');
   if (b) pickFacility(b.dataset.fac);
 });
+$('#colSeg').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-col]');
+  if (b) { boardCols = b.dataset.col; renderBoard(); }
+});
+$('#whenChips').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-when]');
+  if (b) { curWhen = b.dataset.when; renderBoard(); }
+});
 $('#board').addEventListener('click', (e) => {
+  // ⭐札は「カードを開く」より先に受ける (札をタップしたのに詳細が開かないように)
+  const facBtn = e.target.closest('[data-fac-of]');
+  if (facBtn) { e.stopPropagation(); openFacPick(facBtn.dataset.facOf); return; }
+  const whenBtn = e.target.closest('[data-when-of]');
+  if (whenBtn) { e.stopPropagation(); toggleTomorrow(whenBtn.dataset.whenOf); return; }
   const el = e.target.closest('[data-id]');
   if (!el) return;
   // 下見 (正本が Notion) でも詳細は読むだけで開ける (中原さん 2026-09-03「これで何がどう変わるのか想像できない」)
@@ -1013,7 +1133,8 @@ $('#histBody').addEventListener('click', (e) => {
 function boardCards() {
   const q = ($('#bq').value || '').trim().toLowerCase();
   return ((boardState() || {}).cards || []).filter(c => {
-    if (curFacility !== 'all' && c.facility_code !== curFacility) return false;
+    if (curFacility !== 'all' && (curFacility === 'none' ? !!c.facility_code : c.facility_code !== curFacility)) return false;
+    if (curWhen !== 'all' && (curWhen === 'none' ? !!c.when : c.when !== curWhen)) return false;
     if (!q) return true;
     return String(c.title).toLowerCase().includes(q) || String(c.product_code || '').toLowerCase().includes(q);
   });
@@ -1022,16 +1143,24 @@ function renderBoard() {
   const bs = boardState();
   if (!bs) { $('#board').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
   renderPreviewNote();
+  $('#gaugeWrap').innerHTML = isApp() ? gaugeHtml() : '';
+  $('#colSeg').innerHTML = colSegHtml();
   $('#facChips').innerHTML = facChips();
+  $('#whenChips').innerHTML = whenChips();
   const cards = boardCards();
   if (isApp()) syncBulkSelection(cards);
-  const cols = (bs.statuses || []).map(st => {
-    const mine = cards.filter(c => c.status === st.value);
-    const canBulk = stateCan('tasks.bulk_stocked') && st.value === 'ready_for_stocking' && mine.length > 0;
-    const body = mine.length === 0 ? '<div class="colempty">なし</div>' : mine.map(c => bcardHtml(c, st.value)).join('');
+  // 列の分け方 = 進捗 (既定) か 拠点。「予定」の列は作らない — また 1 列に 2 つの意味が混ざるため (要件 §W-4)
+  const groups = boardCols === 'fac'
+    ? [{ label: '未定', pick: (c) => !c.facility_code, status: null },
+       ...(bs.facilities || []).map(f => ({ label: f.name, pick: (c) => c.facility_code === f.code, status: null }))]
+    : (bs.statuses || []).map(st => ({ label: st.label, pick: (c) => c.status === st.value, status: st.value }));
+  const cols = groups.map(g => {
+    const mine = cards.filter(g.pick);
+    const canBulk = stateCan('tasks.bulk_stocked') && g.status === 'ready_for_stocking' && mine.length > 0;
+    const body = mine.length === 0 ? '<div class="colempty">なし</div>' : mine.map(c => bcardHtml(c, c.status)).join('');
     // 想定作業時間の合計 (Notion のボードビューで見ていたもの)
     const hours = mine.reduce((a, c) => a + (Number(c.plan_hours) || 0), 0);
-    return '<div class="col"><h3>' + esc(st.label) + ' <span class="n">' + mine.length + '</span>' +
+    return '<div class="col"><h3>' + esc(g.label) + ' <span class="n">' + mine.length + '</span>' +
       (hours > 0 ? '<span class="n">⏱ ' + (Math.round(hours * 10) / 10) + 'h</span>' : '') +
       (canBulk && !bulkIds ? '<button onclick="startBulk()">まとめて棚入完了</button>' : '') + '</h3>' + body + '</div>';
   }).join('');
@@ -1049,8 +1178,147 @@ function bcardHtml(c, status) {
     '<div class="th">' + thumbHtml(c) + '</div>' +
     '<div class="bd">' +
     '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
-    (c.today ? '📌 ' : '') + esc(c.title) + '</h4>' +
-    (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') + '</div></div>';
+    esc(c.title) + '</h4>' +
+    (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') +
+    planTagsHtml(c) + '</div></div>';
+}
+
+/**
+ * ⭐カードの「どこが」「いつ」の札 (要件 §W-4)。
+ * 職員はタップして変えられる。利用者は**同じ札を span で描く** — ボタンを描いて無効にしない (§U-7)
+ */
+function planTagsHtml(c) {
+  if (!isApp()) return '';                       // 下見 (Notion 正本) は計画そのものが無い
+  const facTxt = c.facility_code ? facilityName(c.facility_code) : '未定';
+  const whenTxt = c.when ? WHEN_LABEL[c.when] : '未定';
+  const whenCls = c.when ? (WHEN_CLASS[c.when] || '') : 'none';
+  const facCls = c.facility_code ? '' : 'none';
+  const canFac = stateCan('task.facility.assign');
+  const canWhen = stateCan('task.plan.assign');
+  const fac = canFac
+    ? '<button class="tag ' + facCls + '" data-fac-of="' + esc(c.id) + '"><span class="k">どこが</span>' + esc(facTxt) + '</button>'
+    : '<span class="tag ' + facCls + '"><span class="k">どこが</span>' + esc(facTxt) + '</span>';
+  const when = canWhen
+    ? '<button class="tag ' + whenCls + '" data-when-of="' + esc(c.id) + '"><span class="k">いつ</span>' + esc(whenTxt) + '</button>'
+    : '<span class="tag ' + whenCls + '"><span class="k">いつ</span>' + esc(whenTxt) + '</span>';
+  return '<div class="tags">' + fac + when + '</div>';
+}
+
+// ─── ⭐「いつ」「どこが」を変える (職員だけ。要件 §W-4) ───
+/** 「明日やる」↔「未定」を切り替える。今日やる分・やり残しは「明日の計画」で扱う */
+async function toggleTomorrow(id, want) {
+  if (!stateCan('task.plan.assign')) return;          // 許可が無ければ動かない (札もボタンにしていない)
+  const c = findCard(id);
+  if (!c) return;
+  const w = worker;
+  if (!w) { openGate(); return; }
+  // ⭐最初に決めた「どうしたいか」を持ち回る。PIN を入れている間に別の端末が変えても、
+  //   やり直しで逆の操作にならないようにする (Codex P2 R2)
+  const next = want !== undefined ? want : (c.when === 'tomorrow' ? null : 'tomorrow');
+  const j = await apiFetch('/api/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, when: next, expect_version: c.version, worker_id: w.id }) });
+  if (!j.ok) return planError(j, () => toggleTomorrow(id, next));
+  applyTask(c, j.task);
+  if (j.staff_mode) state.staff_mode = j.staff_mode;
+  redrawAfterPlan();
+  toast(next ? '「' + c.title + '」を明日やる分に入れました' : '「' + c.title + '」を明日やる分から外しました');
+}
+
+/**
+ * 計画を変えた後の描き直し。⭐一覧もボードも両方描く — 札はボードから押すので、
+ * ボードだけ描くと一覧に戻ったとき古い予定・拠点が残る (Codex P2 R1)
+ */
+function redrawAfterPlan() {
+  recountTomorrow();
+  renderList();
+  renderBoard();
+  if (curDetail && detailCard) renderDetail(detailCard, { keepScroll: true });
+}
+/**
+ * 上のゲージ (明日やる分) を手元のカードから数え直す。
+ * 応答で変わるのは 1 枚だけなので、取得時の集計をそのままにすると件数・合計が古いまま残る (Codex P2 R1)
+ */
+function recountTomorrow() {
+  if (!state || !Array.isArray(state.cards)) return;
+  const mine = state.cards.filter(c => c.when === 'tomorrow');
+  let hours = 0;
+  let unknown = 0;
+  for (const c of mine) { if (c.plan_hours == null) unknown += 1; else hours += Number(c.plan_hours) || 0; }
+  state.tomorrow_plan = { hours: Math.round(hours * 10) / 10, count: mine.length, unknown_hours_count: unknown };
+}
+
+let facPickFor = null;
+/** 「どこが作業するか」を選ぶ (5 拠点 + 未定) */
+function openFacPick(id) {
+  if (!stateCan('task.facility.assign')) return;
+  const c = findCard(id);
+  if (!c) return;
+  facPickFor = id;
+  $('#facTitle').textContent = '「' + c.title + '」はどこが作業しますか?';
+  $('#facMsg').textContent = '';
+  const facs = (state.facilities || []);
+  $('#facOpts').innerHTML = facs.map(f =>
+    '<button class="opt" data-pick-fac="' + esc(f.code) + '">' + esc(f.name) + '</button>').join('') +
+    '<button class="opt" data-pick-fac="">未定にする</button>';
+  openOverlay('#facOv');
+}
+function closeFacPick() { closeOverlay('#facOv'); facPickFor = null; }
+$('#facOpts').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-pick-fac]');
+  if (b && facPickFor != null) saveFacility(facPickFor, b.dataset.pickFac || null);
+});
+async function saveFacility(id, code) {
+  const c = findCard(id);
+  const w = worker;
+  if (!c || !w) { closeFacPick(); if (!w) openGate(); return; }
+  $('#facMsg').textContent = '保存しています…';
+  const j = await apiFetch('/api/facility', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, facility_code: code, expect_version: c.version, worker_id: w.id }) });
+  if (!j.ok) {
+    // 版がずれていたら最新を入れてから知らせる (古い版のまま押し続けても通らないため — Codex P2 R1)
+    if (j.current) { applyTask(c, j.current); redrawAfterPlan(); }
+    $('#facMsg').textContent = j.message || '変えられませんでした';
+    // 職員モードが切れていたら PIN を聞いて、そのまま同じ拠点をもう一度送る
+    return planError(j, () => saveFacility(id, code), { silent: true });
+  }
+  closeFacPick();
+  applyTask(c, j.task);
+  if (j.staff_mode) state.staff_mode = j.staff_mode;
+  redrawAfterPlan();
+  toast('「' + c.title + '」→ ' + (code ? facilityName(code) : '未定'));
+}
+
+/**
+ * 計画の操作でエラーが出たとき。職員モードが切れていたら PIN を聞いて、そのまま続きをやる
+ * (現場で「押したのに何も起きない」を作らない)
+ */
+async function planError(j, retry, { silent = false } = {}) {
+  if (j.error === 'staff_required' || j.error === 'pin_required' || j.error === 'pin_invalid') {
+    if (await askStaffUnlock()) { await loadState(); if (retry) await retry(); return; }
+    return;
+  }
+  if (!silent) showErr(j.message || '変えられませんでした');
+  loadState();
+}
+
+/** 職員モードに入る (PIN を 1 回)。入れたら true */
+async function askStaffUnlock() {
+  const w = worker;
+  if (!w) { openGate(); return false; }
+  if (w.worker_type !== 'staff') { showErr('明日の計画を決められるのは職員だけです'); return false; }
+  const pin = window.prompt(w.display_name + 'さんの職員PIN (30分ぶん開きます)');
+  if (pin == null) return false;
+  const j = await apiFetch('/api/staff-unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ worker_id: w.id, pin }) });
+  if (!j.ok) { showErr(j.message || '職員モードに入れませんでした'); return false; }
+  toast('職員モードに入りました (' + (j.minutes || 30) + '分)');
+  return true;
+}
+
+/** 「明日の計画」画面 (P3 で作る)。いまはゲージから開こうとしたら知らせるだけ */
+function openPlanPage() {
+  if (!stateCan('task.plan.assign')) return;
+  toast('「明日の計画」の画面はこの次に作ります (いまはカードの札から決められます)');
 }
 
 // ─── まとめて棚入完了 (職員のみ) ───
@@ -2084,22 +2352,22 @@ async function setExternalReady(on) {
   toast(on ? '外部に出す準備OK にしました' : '外部に出す準備OK をやめました');
 }
 
-/** 「今日やる」(planned_date = 今日) / 後日 (null)。アプリ正本のみ */
+/** 「今日やる」(planned_date = 今日) / 未定 (null)。アプリ正本のみ・職員だけ (要件 §W-1) */
 async function setPlanned(on) {
   if (!worker || !curDetail || !can('task.plan.assign')) return;
   const c = findCard(curDetail);
   if (!c) return;
-  const j = await apiFetch('/api/planned', {
+  const j = await apiFetch('/api/plan', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: c.id, planned_date: on ? (state.today || null) : null, expect_version: c.version, worker_id: worker.id }),
+    body: JSON.stringify({ id: c.id, when: on ? 'today' : null, expect_version: c.version, worker_id: worker.id }),
   });
   if (!j.ok) {
-    showErr(j.message || '変更できませんでした');
-    if (j.current) { applyTask(c, j.current); renderList(); renderDetail(c); }
-    return;
+    if (j.current) { applyTask(c, j.current); redrawAfterPlan(); }
+    return planError(j, () => setPlanned(on));
   }
   applyTask(c, j.task);
-  renderList(); renderDetail(c);
+  if (j.staff_mode) state.staff_mode = j.staff_mode;
+  redrawAfterPlan();
   toast(on ? '「今日やる」にしました (一覧の上に出ます)' : '「今日やる」をやめました');
 }
 
@@ -2246,7 +2514,7 @@ function doSetStEl(el) { doSetSt(el.dataset.v); }
 function applyTask(c, t) {
   if (!t || typeof t !== 'object') return;
   for (const k of ['status', 'status_label', 'version', 'facility_code', 'hold_reason_code', 'hold_reason_note',
-    'planned_date', 'cancellation_requested_at', 'migration_review', 'external_ready']) {
+    'planned_date', 'when', 'cancellation_requested_at', 'migration_review', 'external_ready']) {
     if (k in t) c[k] = t[k];
   }
   if ('planned_date' in t) c.today = !!(state.today && t.planned_date === state.today);

@@ -2055,6 +2055,32 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         ok((await call('GET', '/api/task-previews/' + t3, { cookie })).status === 200, '拠点が未定でも詳細が開ける');
         ok((await call('GET', '/api/history', { cookie })).status === 200, '履歴も開ける');
 
+        // ⑫a 「明日やる」を変えるとゲージの合計 (tomorrow_plan) も動く (Codex P2 R1)
+        {
+          const before = (await call('GET', '/api/state', { cookie })).json.tomorrow_plan;
+          const t4 = mk(9411, 'ゲージ確認', 'not_started');
+          db.prepare('UPDATE f_iroha_tasks SET qty = 100, master_snapshot = ? WHERE id = ?')
+            .run(JSON.stringify({ units_per_container: 10, process_count: 2 }), t4);
+          clearEnrichCache();
+          await call('POST', '/api/plan', { cookie, body: { id: t4, when: 'tomorrow', expect_version: TD.getTask(t4).version, worker_id: staffP.id } });
+          const after = (await call('GET', '/api/state', { cookie })).json.tomorrow_plan;
+          ok(after.count === before.count + 1, '明日やる分の件数が 1 増える');
+          ok(Math.round((after.hours - before.hours) * 10) / 10 === 0.3, '合計時間も増える (100個×2工程×5秒 = 0.3h)');
+          await call('POST', '/api/plan', { cookie, body: { id: t4, when: null, expect_version: TD.getTask(t4).version, worker_id: staffP.id } });
+          const back = (await call('GET', '/api/state', { cookie })).json.tomorrow_plan;
+          ok(back.count === before.count && Math.round(back.hours * 10) === Math.round(before.hours * 10), '外すと元に戻る');
+          // 工程数の無いカードは 0 で足さず「時間不明」に数える
+          const t5 = mk(9412, '工程数なし', 'not_started');
+          db.prepare('UPDATE f_iroha_tasks SET qty = 50, master_snapshot = NULL, product_code = NULL WHERE id = ?').run(t5);
+          clearEnrichCache();
+          const p5 = await call('POST', '/api/plan', { cookie, body: { id: t5, when: 'tomorrow', expect_version: TD.getTask(t5).version, worker_id: staffP.id } });
+          ok(p5.status === 200 && p5.json.ok, '工程数の無いカードも明日やる分に入れられる');
+          const unk = (await call('GET', '/api/state', { cookie })).json.tomorrow_plan;
+          ok(unk.unknown_hours_count === before.unknown_hours_count + 1 && Math.round(unk.hours * 10) === Math.round(before.hours * 10),
+            '工程数の無いカードは「時間不明」がちょうど 1 増え、合計時間には足さない');
+          await call('POST', '/api/plan', { cookie, body: { id: t5, when: null, expect_version: TD.getTask(t5).version, worker_id: staffP.id } });
+        }
+
         // ⑫ 不正な要求では職員モードが開かない (中身を先に見る — Codex P1 R2)
         await call('POST', '/api/staff-lock', { cookie });
         const badWhen = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'someday', expect_version: v(), worker_id: staffP.id, pin: '4649' } });
@@ -2947,7 +2973,50 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v2'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v3'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  // ══ P2: ボードに 3 軸を載せる (要件 §W-4) ══
+  ok(/<div id="gaugeWrap"><\/div>/.test(html) && !/class="gauge"/.test(html.slice(0, html.indexOf('<script'))),
+    '明日やる分のゲージは静的に置かない (職員のときだけボタンにする)');
+  ok(/if \(!stateCan\('task\.plan\.assign'\)\) return '<div class="gauge">' \+ inner \+ '<\/div>';/.test(html),
+    '許可が無ければゲージはただの表示 (「明日の計画 ›」の入口を描かない)');
+  ok(/function planTagsHtml\(c\)/.test(html) && /const canFac = stateCan\('task\.facility\.assign'\);/.test(html)
+    && /const canWhen = stateCan\('task\.plan\.assign'\);/.test(html),
+    'カードの「どこが」「いつ」の札は許可リストで出し分ける');
+  ok(/canFac\s*\r?\n?\s*\? '<button class="tag ' \+ facCls \+ '" data-fac-of=/.test(html) && /: '<span class="tag ' \+ facCls \+ '"/.test(html),
+    '許可が無ければ札は span で描く (ボタンを描いて無効にしない)');
+  ok(/function toggleTomorrow\(id, want\) \{\r?\n\s+if \(!stateCan\('task\.plan\.assign'\)\) return;/.test(html)
+    && /function openFacPick\(id\) \{\r?\n\s+if \(!stateCan\('task\.facility\.assign'\)\) return;/.test(html),
+    '札の入口でも許可リストを見る (二重の守り)');
+  ok(/const facBtn = e\.target\.closest\('\[data-fac-of\]'\);/.test(html) && /e\.stopPropagation\(\); openFacPick/.test(html),
+    '札のタップはカードを開くより先に受ける (札を押したのに詳細が開かない)');
+  ok(/boardCols = 'status'/.test(html) && /\[\['status', '進捗'\], \['fac', '拠点'\]\]/.test(html) && !/\['when', '予定'\]/.test(html),
+    '列の分け方は 進捗 / 拠点 だけ (「予定」の列は作らない = また 1 列に 2 つの意味が混ざる)');
+  ok(/curWhen !== 'all' && \(curWhen === 'none' \? !!c\.when : c\.when !== curWhen\)/.test(html),
+    '「予定」は列ではなく絞り込み (すべて/今日やる/明日やる/未定)');
+  ok(/one\('all', 'すべて'\) \+ one\('none', '未定'\)/.test(html), '拠点の絞り込みに「未定」がある');
+  ok(/function staffLeftText\(\)/.test(html) && /職員モード あと/.test(html), '職員モードの残り時間を小さく出す');
+  ok(/async function askStaffUnlock\(\)/.test(html) && /'\/api\/staff-unlock'/.test(html),
+    '職員モードが切れていたら PIN を聞いて、そのまま続きをやる');
+  ok(/'\/api\/plan'/.test(html) && /'\/api\/facility'/.test(html), '新しい口 (/api/plan・/api/facility) を使う');
+  ok(!/'\/api\/planned'/.test(html), '古い口 (/api/planned) はもう画面から呼ばない');
+  ok(/'planned_date', 'when',/.test(html), '応答の when をカードに反映する (札がすぐ変わる)');
+  // Codex P2 R1
+  ok(/function redrawAfterPlan\(\) \{\r?\n\s+recountTomorrow\(\);\r?\n\s+renderList\(\);\r?\n\s+renderBoard\(\);/.test(html),
+    '計画を変えたら 一覧・ボード・ゲージ を全部描き直す (ボードだけ描くと一覧に古い値が残る)');
+  ok(/function recountTomorrow\(\)/.test(html) && /state\.tomorrow_plan = \{ hours:/.test(html),
+    '上のゲージは手元のカードから数え直す (取得時の集計のままにしない)');
+  ok(/async function saveFacility\(id, code\)/.test(html) && /return planError\(j, \(\) => saveFacility\(id, code\), \{ silent: true \}\);/.test(html),
+    '拠点の保存も、職員モードが切れたら PIN を聞いて同じ拠点をもう一度送る');
+  ok(/if \(j\.current\) \{ applyTask\(c, j\.current\); redrawAfterPlan\(\); \}\r?\n\s+\$\('#facMsg'\)/.test(html),
+    '版がずれていたら最新を入れてから知らせる (古い版のまま押し続けない)');
+  ok(/\['over', 'やり残し'\]/.test(html) && /\['later', '先の予定'\]/.test(html),
+    '札に出る「いつ」は全部 (やり残し・先の予定も) 絞り込める');
+  ok(/const next = want !== undefined \? want :/.test(html) && /planError\(j, \(\) => toggleTomorrow\(id, next\)\)/.test(html),
+    'PIN を入れている間に別の端末が変えても、やり直しで逆の操作にならない (最初に決めた値を持ち回る)');
+  ok(/esc\(String\(p\.unknown_hours_count\)\)/.test(html) && /esc\(String\(h\)\)/.test(html),
+    'ゲージの数字も esc を通す (画面の文字列はすべてエスケープ)');
+  ok(!/renderList\(\); renderDetail\(c\);\r?\n\s+if \(curView === 'board'\) renderBoard\(\);\r?\n\s+toast\(on \? '「今日やる」/.test(html),
+    '詳細の「今日やる」も同じ描き直しに揃える');
 }
 
 console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許可リスト');
