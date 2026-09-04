@@ -911,6 +911,24 @@ export function initProductHubDB() {
       PRIMARY KEY (set_draft_id, member_ne_code)
     );
 
+    -- 「セット展開判断」(工程 set_review) の結果 (2026-09-04 要件定義)。
+    -- 派生を作ったときだけ工程が閉じる作りだと「まだ検討していない」と「検討して作らないと決めた」が
+    -- 区別できない。判断そのものを残し、⑤はこの記録があるときだけ閉じられる。
+    -- append-only (やり直したら新しい行。最新行が今の判断)
+    CREATE TABLE IF NOT EXISTS draft_set_decisions (
+      id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id             INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      -- create=セットを新規作成 / existing=既存のセットがある / none=作らない / hold=保留 (⑤は閉じない)
+      decision             TEXT NOT NULL CHECK (decision IN ('create', 'existing', 'none', 'hold')),
+      -- none のとき必須 (中原さん 2026-09-04: 自由入力ではなく選択式)
+      reason_code          TEXT CHECK (reason_code IN ('shipping_loss', 'low_demand', 'supply_unstable', 'single_enough', 'other')),
+      reason_text          TEXT,   -- reason_code='other' のとき必須。hold のメモもここ
+      linked_set_draft_id  INTEGER REFERENCES product_drafts(id) ON DELETE SET NULL,  -- create / existing のとき
+      decided_by           TEXT,
+      decided_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_dsd_draft ON draft_set_decisions(draft_id, decided_at);
+
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
     -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)
@@ -1319,6 +1337,27 @@ export function initProductHubDB() {
       if (!/duplicate column/i.test(String(e?.message || ''))) throw e;
     }
   }
+  // セット商品の NE 登録の進み (2026-09-04 要件定義 §4.3)。**セットだけが使う**。
+  //   not_requested → requested →(NE に本コードが現れる)→ 確定 / needs_action → requested
+  // 🚨「本コード確定」はここに持たない。provisional_code=0 が唯一の真で、表示はそこから導出する
+  //   (確定を2箇所に持つと、出品ゲートと画面表示がズレる)。
+  // 将来 NE の書き込みAPIを使うときに processing が埋まる。手動でも自動でも同じ状態で扱う
+  for (const [col, ddl] of [
+    ['ne_registration_state', "TEXT CHECK (ne_registration_state IN ('not_requested', 'requested', 'processing', 'needs_action'))"],
+    ['ne_registration_requested_at', 'TEXT'],
+    ['ne_registration_requested_by', 'TEXT'],
+    ['ne_registration_error', 'TEXT'],
+    // 派生した時点の親の updated_at。親がその後に変わったら画面で知らせる (自動追随はしない)
+    ['parent_snapshot_at', 'TEXT'],
+  ]) {
+    if (draftCols2.has(col)) continue;
+    try {
+      db.exec(`ALTER TABLE product_drafts ADD COLUMN ${col} ${ddl}`);
+    } catch (e) {
+      if (!/duplicate column/i.test(String(e?.message || ''))) throw e;
+    }
+  }
+
   // TOP画像をどれぐらい力を入れて作るかの目安 (2026-08-24 中原さん。Notion 画像情報DB の分類を移植)。
   // 自社商品限定の draft_image_production.importance_tier (枚数の目安) とは別物 — こちらは仕入商品にも付ける
   if (!draftCols2.has('image_priority')) {

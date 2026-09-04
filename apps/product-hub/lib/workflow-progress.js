@@ -15,6 +15,10 @@
  *     claim/lease と一覧タブが status を引き続き参照するため (実体化された導出値)
  */
 import { getDB, logEvent, gateReasons, imageTrackV2At, MATERIAL_STATUS_LABELS, GENERATION_BLOCK_CODES, CHECKING_REASON_LABELS } from '../db.js';
+import { describeSetDecision, SET_DECISIONS_CLOSING } from './set-decision.js';
+
+/** セット展開判断の工程コード (判断を記録してからでないと決着できない) */
+const SET_REVIEW_STEP = 'set_review';
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
 import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 
@@ -664,6 +668,34 @@ export function setDetailImagesExcluded(draftId, excluded, actor, { isAdmin = fa
 }
 
 /**
+ * その工程を「いま操作してよいか」だけを確かめる (状態は変えない・2026-09-04)。
+ *
+ * 工程を触る前に別の記録を残す処理 (セット展開判断) が使う。先に記録してから
+ * setStepState で弾かれると、判断の履歴だけが残ってしまう (Codex R1 high)。
+ * 権限判定と版数の見方は setStepState と同じものを使う (別に書くとズレる)。
+ */
+export function assertStepOperable(db, draftId, stepCode, expectedVersion, { isAdmin = false, actorStaffId = null, requireVersion = false } = {}) {
+  const id = Number(draftId);
+  const code = String(stepCode || '');
+  ensureProgress(db, id);
+  const row = db.prepare(`
+    SELECT p.*, s.label, s.role_code, s.track, s.image_kind, s.skippable FROM draft_step_progress p
+    JOIN ph_steps s ON s.code = p.step_code
+    WHERE p.draft_id = ? AND p.step_code = ?
+  `).get(id, code);
+  if (!row) throw badRequest('この商品にその工程がありません');
+  assertStepPermission(db, row, { state: row.state }, { isAdmin, actorStaffId, boardClaim: false });
+  const expected = expectedVersion == null ? null : Number(expectedVersion);
+  if (requireVersion && !Number.isInteger(expected)) {
+    throw conflict('画面が古い可能性があります。読み直してから操作してください');
+  }
+  if (Number.isInteger(expected) && expected !== row.version) {
+    throw conflict('別の人がこの工程を先に更新しました。画面を読み直してください');
+  }
+  return row;
+}
+
+/**
  * 工程の状態・担当者・メモを更新する。
  * done にした時刻と操作者を残すのは、あとで「この工程は誰が何日で回しているか」を測るため。
  */
@@ -697,6 +729,17 @@ export function setStepState(
   // 2026-08-26 v2: 工程属性 skippable=0 は「対象外」にできない (詳細 ①〜⑥。⑦⑧⑨ は可)
   if (patch?.state === 'skip' && row.skippable === 0 && row.track === 'image') {
     throw badRequest(`「${row.label}」は対象外にできません`);
+  }
+  // 「セット展開判断」は**判断を記録してから**でないと決着できない (2026-09-04 §4.2)。
+  // 🚨 ここに置くのは、ボードの D&D (moveBoardCard) も詳細画面もこの関数を通るため。
+  // ルーター側だけに置くと、⑤から次の列へドラッグしただけで判断なしに閉じられる (Codex R1 high)
+  if (code === SET_REVIEW_STEP && (patch?.state === 'done' || patch?.state === 'skip')) {
+    const last = db.prepare(`
+      SELECT decision FROM draft_set_decisions WHERE draft_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1
+    `).get(id);
+    if (!last || !SET_DECISIONS_CLOSING.includes(last.decision)) {
+      throw badRequest('セットを作るかどうかの判断を先に記録してください (作成 / 既存あり / 作らない)');
+    }
   }
   // 導出は skip も「決着」に数えるので、ゲートを迂回できる工程は skip を禁止する (Codex R1 medium):
   // basic_info の skip = 材料チェックなしで AI キュー入り / listing の skip = 展開せず「展開済み」表示
@@ -1210,6 +1253,19 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       (SELECT 1 FROM draft_images i WHERE i.draft_id = d.id AND i.sort = 0 LIMIT 1) AS has_top_image,
       ${/* ボードから楽天に出品した結果 (2026-09-01)。出品・展開の列のカードだけが読む。
             registered_at があれば「登録済み」、無くて last_error があれば「失敗 (理由)」 */''}
+      ${/* セット商品 (2026-09-04 §5.2)。カードで単品と見分けられるようにする。
+            親子・仮コード・NE登録の進み・派生件数・最新の判断を**構造化して**渡す
+            (テンプレで文字列から判定しない) */''}
+      d.parent_draft_id, d.provisional_code, d.ne_registration_state, d.ne_registration_error,
+      d.parent_snapshot_at,
+      (SELECT ne_code FROM product_drafts p WHERE p.id = d.parent_draft_id) AS parent_ne_code,
+      (SELECT updated_at FROM product_drafts p WHERE p.id = d.parent_draft_id) AS parent_updated_at,
+      (SELECT COUNT(*) FROM product_drafts c WHERE c.parent_draft_id = d.id) AS set_children_count,
+      (SELECT GROUP_CONCAT(member_ne_code || ' × ' || qty, ' + ')
+         FROM (SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = d.id ORDER BY sort)) AS set_members,
+      (SELECT decision FROM draft_set_decisions sd WHERE sd.draft_id = d.id ORDER BY sd.decided_at DESC, sd.id DESC LIMIT 1) AS set_decision,
+      (SELECT reason_code FROM draft_set_decisions sd WHERE sd.draft_id = d.id ORDER BY sd.decided_at DESC, sd.id DESC LIMIT 1) AS set_decision_reason_code,
+      (SELECT reason_text FROM draft_set_decisions sd WHERE sd.draft_id = d.id ORDER BY sd.decided_at DESC, sd.id DESC LIMIT 1) AS set_decision_reason_text,
       (SELECT registered_at FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_registered_at,
       (SELECT last_error FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_last_error,
       (SELECT listing_outcome FROM draft_rakuten r WHERE r.draft_id = d.id) AS rakuten_listing_outcome,
@@ -1257,6 +1313,35 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // 表示に残ったカードだけ後からモール状況を足す (全件に足すと無駄なクエリになる)
   const cardsById = new Map();
 
+  // カードに常時出すセット商品のサマリー (2026-09-04 §5.2)。
+  // 🚨 カードの**トップレベル**に置く (テンプレは c.isSet / c.set を読む)。
+  // 画像サマリーの中に入れると c.image.isSet になり、実データでは何も出なくなる
+  const setSummaryOf = (d) => ({
+    // isSet の判定は parent_draft_id ただ1つ (種別列を別に持たない)
+    isSet: d.parent_draft_id != null,
+    set: d.parent_draft_id == null ? null : {
+      parentId: d.parent_draft_id,
+      parentNeCode: d.parent_ne_code || null,
+      members: d.set_members || null,
+      provisional: d.provisional_code === 1,
+      // 「本コード確定」は provisional_code=0 から導出する (状態列に持たせない)
+      neState: d.provisional_code === 1 ? (d.ne_registration_state || 'not_requested') : 'confirmed',
+      neError: d.ne_registration_error || null,
+      // 親が派生後に変わったか (自動追随はしない。人に知らせるだけ)
+      parentChanged: !!(d.parent_updated_at && d.parent_snapshot_at && d.parent_updated_at > d.parent_snapshot_at),
+    },
+    setChildrenCount: d.set_children_count || 0,
+    // 表示名まで作って渡す (テンプレで関数を呼ばない = カードと詳細で言葉がズレない)
+    setDecision: d.set_decision ? {
+      decision: d.set_decision,
+      label: describeSetDecision({
+        decision: d.set_decision,
+        reason_code: d.set_decision_reason_code,
+        reason_text: d.set_decision_reason_text,
+      }),
+    } : null,
+  });
+
   // カードに常時出す画像側のサマリー (どちらのビューでも同じものを見せる = 2 重管理をなくす)
   const imageSummaryOf = (p, d) => ({
     // TOP画像は工程を廃止した (2026-08-31) ので **枠1 が登録されているか** が作成済みの判定。
@@ -1289,6 +1374,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       first_image_id: d.first_image_id, first_image_mtime: d.first_image_mtime,
       current: p.current, stalledDays: p.stalledDays, doneCount: p.doneCount, totalCount: p.totalCount,
       image: imageSummaryOf(p, d),
+      ...setSummaryOf(d),
       // 画像制作だけの保留 (2026-08-26)。画像ビューではバッジを出し、滞留の赤枠は付けない (止めているのは意図)
       imageOnHold: d.image_workflow_state === 'on_hold',
       imageHoldNote: d.image_hold_note || null,

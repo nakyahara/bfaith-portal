@@ -17,6 +17,18 @@
   .kb-card[draggable="true"] { cursor: grab; }
   .kb-card.dragging { opacity: .45; }
   .kb-card-link { display: block; text-decoration: none; color: inherit; }
+  /* セット商品 (2026-09-04)。単品と見分けられるよう左に色の縁を置く (単品の青とは別の色) */
+  .kb-card.is-set { border-left: 3px solid #6d28d9; }
+  .kb-tag.set { background: #f1ecfd; color: #6d28d9; border-color: #c9b8f5; font-weight: 700; }
+  .kb-tag.ne-not_requested { background: #f1f5f9; color: #475569; border-color: #cbd5e1; }
+  .kb-tag.ne-requested, .kb-tag.ne-processing { background: #fef3c7; color: #92400e; border-color: #fcd34d; }
+  .kb-tag.ne-confirmed { background: #dcfce7; color: #166534; border-color: #86efac; }
+  .kb-tag.ne-needs_action { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
+  .kb-tag.decision { background: #e0e7ff; color: #3730a3; border-color: #a5b4fc; }
+  .kb-setline { font-size: 10px; color: #64748b; line-height: 1.4; }
+  .kb-setline .prov { color: #92400e; font-weight: 600; }
+  .kb-parent-changed { font-size: 10px; color: #92400e; background: #fffbeb; border: 1px solid #fcd34d;
+    border-radius: 4px; padding: 2px 5px; }
   .kb-tags { display: flex; flex-wrap: wrap; gap: 3px; margin: 2px 0; }
   .kb-tag { font-size: 10px; border-radius: 4px; padding: 1px 5px; background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0; }
   .kb-tag.mat-none { color: #94a3b8; }
@@ -236,8 +248,9 @@
           <% for (const c of col.cards) { %>
             <% const stalled = boardView === 'image' ? c.kindStalledDays : c.stalledDays; %>
             <% const currentCode = boardView === 'image' ? (c.kindCurrent && c.kindCurrent.step_code) : (c.current && c.current.step_code); %>
-            <div class="kb-card <%= stalled ? 'stalled' : '' %><%= c.checking ? ' checking' : '' %><%= boardView === 'image' ? ` kind-${c.kind}` : '' %>" draggable="true"
+            <div class="kb-card <%= stalled ? 'stalled' : '' %><%= c.checking ? ' checking' : '' %><%= c.isSet ? ' is-set' : '' %><%= boardView === 'image' ? ` kind-${c.kind}` : '' %>" draggable="true"
                  data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>"
+                 data-set="<%= c.isSet ? '1' : '' %>"
                  data-current="<%= currentCode || '' %>"
                  <%# 楽天の状態 (2026-09-01): 「出品・展開」に落としたとき、済み/対象外なら出品の確認を出さない %>
                  data-rk="<%= c.rakutenRegisteredAt ? 'done' : (((c.malls || []).find((m) => m.code === 'rakuten') || {}).state || '') %>"
@@ -265,6 +278,22 @@
               <% } %>
               <%# AI が「人の確認待ち」にした商品 (2026-08-28)。列は動かさず理由をカードに出す %>
               <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
+              <%# セット商品 (2026-09-04 §5.2)。単品と見分けられるように、種別・親・構成・NEの進みを出す。
+                  値はサーバー側で構造化して渡している (ここで文字列から判定しない) %>
+              <% if (c.isSet && c.set) { %>
+                <div class="kb-tags">
+                  <span class="kb-tag set">🎁 セット</span>
+                  <span class="kb-tag ne-<%= c.set.neState %>"><%= NE_STATE_LABELS[c.set.neState] || c.set.neState %></span>
+                </div>
+                <% if (c.set.neState === 'needs_action' && c.set.neError) { %>
+                  <div class="kb-hold" title="<%= c.set.neError %>">⚠ <%= c.set.neError %></div>
+                <% } %>
+                <% if (c.set.parentChanged) { %><div class="kb-parent-changed">親が更新されています</div><% } %>
+              <% } %>
+              <%# ⑤の判断 (作らない・保留)。何も決めていないカードと区別する %>
+              <% if (!c.isSet && c.setDecision && c.setDecision.decision !== 'create') { %>
+                <div class="kb-tags"><span class="kb-tag decision">判断: <%= c.setDecision.label %></span></div>
+              <% } %>
               <div class="kb-card-top">
                 <% if (c.first_image_id) { %>
                   <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
@@ -273,7 +302,15 @@
                 <% } %>
                 <div style="min-width:0;">
                   <div class="kb-name"><%= c.name %></div>
-                  <div class="kb-code"><%= c.ne_code %></div>
+                  <div class="kb-code"><%= c.ne_code %><% if (c.isSet && c.set && c.set.provisional) { %> <span class="prov">(仮)</span><% } %></div>
+                  <% if (c.isSet && c.set) { %>
+                    <div class="kb-setline">
+                      親: <%= c.set.parentNeCode || '—' %><% if (c.set.members) { %>　構成: <%= c.set.members %><% } %>
+                    </div>
+                  <% } %>
+                  <% if (!c.isSet && c.setChildrenCount > 0) { %>
+                    <div class="kb-setline">🎁 派生セット <%= c.setChildrenCount %>件</div>
+                  <% } %>
                 </div>
               </div>
               <div class="kb-meta">
