@@ -29,12 +29,12 @@ import { validatePageInfo, buildPageInfoHtml, mapNeShippingToRakuten } from '../
 // 配送方法の「値の意味」の正本 (定数と変換はこの1ファイルだけが決める)。
 // db.js のマイグレーションからも使うため、循環参照を避けて lib/ に置いてある
 import {
-  SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS, toRakutenShippingGroup,
+  SHIPPING_METHOD_GROUPS, ALL_SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS, toRakutenShippingGroup,
 } from '../lib/shipping-groups.js';
 
 // 既存の import 元 (router.js / smoke.mjs) を壊さないための再公開。新しいコードは
 // lib/shipping-groups.js から直接取ること
-export { SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS, toRakutenShippingGroup };
+export { SHIPPING_METHOD_GROUPS, ALL_SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS, toRakutenShippingGroup };
 
 // ─── miniPC proxy client (rakuten-rms-proxy.js と同じ env / 認証) ───
 
@@ -961,7 +961,7 @@ export function effectiveShippingForDraft(db, neCode, shippingMethodGroup) {
   if (r.group) {
     return {
       group: r.group,
-      label: SHIPPING_METHOD_GROUPS[r.group],
+      label: ALL_SHIPPING_METHOD_GROUPS[r.group],   // 選択肢から外した値でも名前は出す
       ...(r.yahooOverride ? { yahooDelivery: r.yahooOverride.yahooDelivery } : {}),
     };
   }

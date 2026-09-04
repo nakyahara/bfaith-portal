@@ -388,7 +388,7 @@ export function effectiveHasVariation(info, draft) {
  * 利益は変わるので、その場で試算できるようにする。
  *
  * ⚠️ 楽天の配送方法グループ (8種) と NE の配送方法 (サイズ別) は**粒度が違う**。
- *    楽天「宅急便50サイズ以上」は NE の 50/60/80/100/120 サイズ (479〜945円) のどれにもなる。
+ *    楽天「宅急便50サイズ以下」は NE の 50/60/80/100/120 サイズ (479〜945円) のどれにもなる。
  *    だから選択肢は **NE の配送方法**で持つ (送料が一意に決まる方)。
  *
  * 実データ (2026-09-04 実測・取扱中7,239件): 配送方法ごとの送料はほぼ1種類。
@@ -415,9 +415,15 @@ export function listNeShippingOptions(db) {
       if (wins) best.set(method, { cost: Number(r.cost), n: r.n, total });
       else best.set(method, { ...cur, total });
     }
+    // 送料の安い順に並べる (2026-09-04 中原さん要望)。利用数順だと金額がバラバラに並んで
+    // 探しにくい。同額なら配送方法名で揃えて、並びが実行のたびに変わらないようにする
     return [...best.entries()]
       .map(([method, v]) => ({ method, cost: v.cost, count: v.total }))
-      .sort((a, b) => b.count - a.count);
+      // localeCompare は別の文字列でも 0 を返すことがある (合成済み「ガ」と「カ+結合濁点」など)。
+      // その場合は挿入順に引きずられるので、最後にコード単位で決める (Codex R1 P2)
+      .sort((a, b) => a.cost - b.cost
+        || a.method.localeCompare(b.method, 'ja')
+        || (a.method < b.method ? -1 : a.method > b.method ? 1 : 0));
   } catch (_) {
     return []; // mirror 未同期でも画面は出す
   }
@@ -436,7 +442,7 @@ export const RAKUTEN_GROUP_NE_HINTS = {
   '5': ['ネコポス'],
   '6': ['クリックポスト'],
   '7': ['宅急便'],        // ヤマト運輸宅急便
-  '8': ['宅急便'],        // 宅急便50サイズ以上
+  '8': ['宅急便'],        // 宅急便50サイズ以下
   '9': ['ゆうパケット'],  // ゆうパケットパフ
 };
 

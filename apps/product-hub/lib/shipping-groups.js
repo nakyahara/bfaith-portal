@@ -20,17 +20,36 @@
  * 依存の無いこのモジュールに置く (循環参照を作らない)。
  */
 
-/** B-Faith 店舗の配送方法グループ (RYS rakuten-to-notion-draft.js の実測変換表と同一 ID) */
-export const SHIPPING_METHOD_GROUPS = {
-  '1': '定形外',
-  '3': '飛脚宅配便',
-  '4': '宅急便',
-  '5': 'ネコポス',
-  '6': 'クリックポスト',
-  '7': 'ヤマト運輸宅急便',
-  '8': '宅急便50サイズ以上',
-  '9': 'ゆうパケットパフ',
-};
+// 配送方法の名前の正本 (楽天の配送方法セット一覧を写したもの)。
+// price-update と product-hub で別々に持つとズレるので、こちらから読む
+import { RAKUTEN_SHIPPING_METHODS } from '../../price-update/shipping-labels.js';
+
+/**
+ * B-Faith 店舗の配送方法グループ。
+ *
+ * 🚨 名前の正本は **apps/price-update/shipping-labels.js の RAKUTEN_SHIPPING_METHODS**
+ * (楽天の配送方法セット一覧を中原さんが写したもの)。ここで別に書いていたため、
+ * 2026-09-04 まで RMS の実物と食い違っていた (中原さんが画面のスクショで発見):
+ *   4 = 「宅急便」と出していたが実物は **ゆうパック**
+ *   8 = 「宅急便50サイズ以上」と出していたが実物は **宅急便50サイズ以下** (以上/以下が逆)
+ * 送る値は ID なので楽天側の設定自体は正しかったが、**人がラベルを見て選ぶ**ので実害がある。
+ * 二重に持たない — 表を増やすとまたズレる ([[feedback_one_column_two_meanings]] と同じ)。
+ *
+ * 「現在使用不可」の配送方法は**選ばせない**が、**検証では通す**。
+ * 選択肢から外すだけにしないと、万一その値が保存されている商品を開いたときに
+ * 「未設定」に見えて、保存し直した拍子に配送方法が消える (Codex R2)。
+ */
+const ALL_GROUPS = Object.fromEntries(
+  Object.entries(RAKUTEN_SHIPPING_METHODS).map(([id, name]) => [String(id), name])
+);
+
+/** 画面のプルダウンに出す配送方法 (「現在使用不可」は選ばせない) */
+export const SHIPPING_METHOD_GROUPS = Object.fromEntries(
+  Object.entries(ALL_GROUPS).filter(([, name]) => !name.includes('現在使用不可'))
+);
+
+/** 検証用: 楽天が持つ全部。既に保存されている値を「不正」にしないための逃がし口 */
+export const ALL_SHIPPING_METHOD_GROUPS = ALL_GROUPS;
 
 /**
  * 楽天=定形外のまま Yahoo! だけ別配送にする複合選択肢 (2026-08-06 中原さん指示)。
@@ -38,7 +57,9 @@ export const SHIPPING_METHOD_GROUPS = {
  * Yahoo!の配送方法プルダウンには yahooDelivery を初期セットする
  */
 export const YAHOO_OVERRIDE_SHIPPING_GROUPS = {
-  '1y8': { label: '定形外（ヤフーのみ宅急便50サイズ）', rakutenGroup: '1', yahooDelivery: '宅急便50サイズ以上' },
+  // yahooDelivery は Yahoo!欄のプルダウンに初期セットする値。その選択肢は楽天の表を
+  // 流用しているので、ラベル修正 (2026-09-04) に合わせて「以下」に揃える
+  '1y8': { label: '定形外（ヤフーのみ宅急便50サイズ）', rakutenGroup: '1', yahooDelivery: '宅急便50サイズ以下' },
   '1y5': { label: '定形外（ヤフーのみネコポス）', rakutenGroup: '1', yahooDelivery: 'ネコポス' },
 };
 
@@ -56,7 +77,9 @@ export function toRakutenShippingGroup(raw) {
   if (!g) return { ok: true, group: '', yahooOverride: null };
   const ov = YAHOO_OVERRIDE_SHIPPING_GROUPS[g];
   if (ov) return { ok: true, group: ov.rakutenGroup, yahooOverride: ov };
-  if (SHIPPING_METHOD_GROUPS[g]) return { ok: true, group: g, yahooOverride: null };
+  // 検証は全部の配送方法で行う (選択肢から外した「現在使用不可」が保存されていても、
+  // それを理由に出品を止めない — 使えるかどうかを決めるのは楽天側)
+  if (ALL_SHIPPING_METHOD_GROUPS[g]) return { ok: true, group: g, yahooOverride: null };
   return { ok: false, group: null, yahooOverride: null };
 }
 

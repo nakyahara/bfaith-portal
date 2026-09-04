@@ -1244,7 +1244,7 @@ check('effectiveShippingForDraft: 不正指定(99)はフォールバックせず
 check('effectiveShippingForDraft: 複合(1y8/1y5)は楽天=定形外 + yahooDelivery付き',
   listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').group === '1'
   && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').label === '定形外'
-  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').yahooDelivery === '宅急便50サイズ以上'
+  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').yahooDelivery === '宅急便50サイズ以下'
   && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y5').yahooDelivery === 'ネコポス');
 check('複合選択肢の末尾バナーは定形外と同一',
   JSON.stringify(listing.trailingBannerLocations(listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').group))
@@ -1256,6 +1256,43 @@ check('複合選択肢の末尾バナーは定形外と同一',
 // lib/shipping-groups.js の 1 関数だけが持ち、保存 (router) と出品 (buildItemPayload) の
 // 両方がそこを通る。**画面に出る選択肢は全部、出品まで通らなければならない**
 const shipGroups = await import('../lib/shipping-groups.js');
+{
+  // 🚨 配送方法の名前は price-update/shipping-labels.js が正本 (楽天の配送方法セット一覧)。
+  // product-hub で別に書いていたため 2026-09-04 まで実物と食い違っていた
+  // (4 = 「宅急便」→実物は**ゆうパック** / 8 = 「宅急便50サイズ以上」→実物は**以下**)。
+  // 送る値は ID なので楽天側の設定は正しかったが、人はラベルを見て選ぶので実害がある
+  const labels = await import('../../price-update/shipping-labels.js');
+  const src = labels.RAKUTEN_SHIPPING_METHODS;
+  check('配送方法の名前: 正本 (price-update の一覧) と食い違わない',
+    Object.entries(shipGroups.SHIPPING_METHOD_GROUPS)
+      .every(([id, name]) => src[id] === name),
+    JSON.stringify(shipGroups.SHIPPING_METHOD_GROUPS));
+  check('配送方法の名前: 実物どおり (4=ゆうパック / 8=宅急便50サイズ以下)',
+    shipGroups.SHIPPING_METHOD_GROUPS['4'] === 'ゆうパック'
+    && shipGroups.SHIPPING_METHOD_GROUPS['8'] === '宅急便50サイズ以下'
+    && shipGroups.SHIPPING_METHOD_GROUPS['1'] === '定形外');
+  check('配送方法の名前: 「現在使用不可」は選ばせない (楽天側で使えない)',
+    !shipGroups.SHIPPING_METHOD_GROUPS['2']
+    && src[2].includes('現在使用不可')
+    && Object.values(shipGroups.SHIPPING_METHOD_GROUPS).every((n) => !n.includes('現在使用不可')));
+  // 🚨 選択肢から外すだけ。既に保存されている値を「不正」にはしない (Codex R2):
+  //    出品の検証で弾くと、その商品はもう出品できなくなる
+  check('配送方法の名前: 選択肢に無い値でも、保存済みなら検証は通す',
+    shipGroups.toRakutenShippingGroup('2').ok === true
+    && shipGroups.toRakutenShippingGroup('2').group === '2'
+    && !!shipGroups.ALL_SHIPPING_METHOD_GROUPS['2']);
+  check('配送方法の名前: 楽天が持たない番号はこれまでどおり不正',
+    shipGroups.toRakutenShippingGroup('99').ok === false
+    && shipGroups.toRakutenShippingGroup('0').ok === false);
+  check('配送方法の名前: 使える配送方法は正本から漏らさない',
+    Object.keys(src).filter((id) => !src[id].includes('現在使用不可'))
+      .every((id) => !!shipGroups.SHIPPING_METHOD_GROUPS[id]));
+  // 複合選択肢がヤフー欄に初期セットする値も、選択肢 (楽天の表を流用) に実在すること
+  check('配送方法の名前: 複合選択肢のヤフー初期値が選択肢に実在する',
+    Object.values(shipGroups.YAHOO_OVERRIDE_SHIPPING_GROUPS)
+      .every((ov) => Object.values(shipGroups.SHIPPING_METHOD_GROUPS).includes(ov.yahooDelivery)),
+    JSON.stringify(Object.values(shipGroups.YAHOO_OVERRIDE_SHIPPING_GROUPS).map((o) => o.yahooDelivery)));
+}
 check('toRakutenShippingGroup: 楽天IDはそのまま / 複合は楽天IDへ分解 + ヤフー配送を返す',
   shipGroups.toRakutenShippingGroup('5').group === '5'
   && shipGroups.toRakutenShippingGroup('5').yahooOverride === null
@@ -1269,7 +1306,7 @@ check('toRakutenShippingGroup: 未指定は空 (店舗デフォルト) / 選択�
   && shipGroups.toRakutenShippingGroup('1y9').ok === false);
 check('shippingSelectValueOf: ヤフー別扱いのときだけ複合キーへ逆引きする',
   shipGroups.shippingSelectValueOf('1', { shipping_override: 1, delivery_label: 'ネコポス' }) === '1y5'
-  && shipGroups.shippingSelectValueOf('1', { shipping_override: 1, delivery_label: '宅急便50サイズ以上' }) === '1y8'
+  && shipGroups.shippingSelectValueOf('1', { shipping_override: 1, delivery_label: '宅急便50サイズ以下' }) === '1y8'
   // 別扱いでない / ヤフー配送を複合の既定値から変えた → 楽天IDのまま (プルダウンは定形外を指す)
   && shipGroups.shippingSelectValueOf('1', { shipping_override: 0, delivery_label: 'ネコポス' }) === '1'
   && shipGroups.shippingSelectValueOf('1', { shipping_override: 1, delivery_label: '宅急便' }) === '1'
@@ -2043,7 +2080,7 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
 // ─── 利益の配送費を配送方法で試算し直す (2026-09-04 中原さん報告) ──────────
 // 「配送方法を変えても利益額が変わらない」= 配送費が NE の送料の固定値だったため。
 // 選択肢は **NE の配送方法** で持つ (楽天のグループ8種は粒度が粗く、
-// 「宅急便50サイズ以上」は NE の 50〜120 サイズ 479〜945円 のどれにもなって一意に決まらない)
+// 「宅急便50サイズ以下」は NE の 50〜120 サイズ 479〜945円 のどれにもなって一意に決まらない)
 {
   const vari = await import('../lib/variation.js');
   db.prepare('DELETE FROM mirror_products WHERE product_id BETWEEN 99500 AND 99599').run();
@@ -2064,8 +2101,10 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     JSON.stringify(opts));
   check('配送費の試算: 取扱中でない商品の配送方法は選択肢に出さない',
     !byMethod['まぼろし便'], JSON.stringify(opts.map((o) => o.method)));
-  check('配送費の試算: 使われている数の多い順に並ぶ (よく使う配送方法が上)',
-    opts[0].method === '宅急便60サイズ' && opts[0].count === 4 && byMethod['ネコポス'].count === 2,
+  check('配送費の試算: 送料の安い順に並ぶ (2026-09-04 中原さん要望: 金額がバラバラだと探しにくい)',
+    opts[0].method === 'ネコポス' && opts[0].cost === 237
+    && opts[1].method === '宅急便60サイズ' && opts[1].cost === 538
+    && byMethod['宅急便60サイズ'].count === 4,
     JSON.stringify(opts));
   {
     // 🚨 開いただけで利益額が変わってはいけない (Codex R1 P1)。
@@ -2110,6 +2149,13 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
     ins2.run(99603, 'tie-4', 237, 'ネコポス');
     const o2 = Object.fromEntries(vari.listNeShippingOptions(db).map((o) => [o.method, o]));
     check('配送費の試算: 代表送料が同数なら高い方を採る', o2['同数便']?.cost === 500, JSON.stringify(o2['同数便']));
+    // 送料が同額のものは名前順。**挿入順と逆**に入れて、並べ替えが効いていることを確かめる
+    // (実データを同じ比較関数で並べ直して比べるだけだと、何を入れても通ってしまう — Codex R1 P2)
+    ins2.run(99604, 'tie-5', 777, 'い便');
+    ins2.run(99605, 'tie-6', 777, 'あ便');
+    const same = vari.listNeShippingOptions(db).filter((o) => o.cost === 777).map((o) => o.method);
+    check('配送費の試算: 送料が同額なら配送方法名で並ぶ (入れた順に引きずられない)',
+      JSON.stringify(same) === JSON.stringify(['あ便', 'い便']), JSON.stringify(same));
     // 前段の 2 件 + ここの ' ネコポス ' と 'ネコポス' = 4 件が 1 つに合算される
     check('配送費の試算: 配送方法名の前後の空白は同じものとして数える',
       o2['ネコポス']?.count === 4 && o2[' ネコポス '] === undefined, JSON.stringify(o2['ネコポス']));
@@ -5515,7 +5561,7 @@ const renders = [
     rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null, shipping_method_group: '5', postage_included: 1, normal_delivery_date_id: '1000', white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://drive.google.com/file/d/gw/view', published_at: null }, cabinetImages: [],
     genreDict: { genreId: '205761', genreName: '入浴剤', genrePath: '美容・コスメ > 入浴剤', fixedAt: null, fetchedAt: '2026-07-28T00:00:00Z', attributes: [{ name: 'ブランド名', mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 3, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' }] },
     neCost: { costExTax: 660, shippingCost: 237, shippingMethod: 'ネコポス', taxPercent: 10 }, profitSim: { profit: 189, marginPct: 14.8, costIncTax: 726 }, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, neShippingOptions: [{ method: 'ネコポス', cost: 237, count: 3832 }, { method: '宅急便60サイズ', cost: 538, count: 417 }, { method: '</script><script>alert(1)</script>', cost: 999, count: 1 }], rakutenGroupNeHints: { '5': ['ネコポス'], '8': ['宅急便'] }, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '1y5', ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [{ method: 'ネコポス', cost: 237, count: 3832 }, { method: '宅急便60サイズ', cost: 538, count: 417 }, { method: '</script><script>alert(1)</script>', cost: 999, count: 1 }], rakutenGroupNeHints: { '5': ['ネコポス'], '8': ['宅急便'] }, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '1y5', ...pageInfoVars,
     // 商品ページ表記: 化粧品 + NE推測の配送で全分岐を描かせる
     pageInfo: { product_type: 'cosmetics', content_volume: '50ml', size_text: null, ingredients: '水', usage_notes: null, origin_type: '海外製', origin_country: 'フランス', category_label: '化粧品', seller_name: 'メーカーA', importer_name: '輸入者B', food_name: null, food_ingredients: null, food_expiry: null, food_storage: null },
     pageInfoHtml: '<table><tr><td>x</td></tr></table>',
@@ -5543,7 +5589,7 @@ const renders = [
     cabinetImages: [{ id: 1, drive_file_id: 'gw' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     shopCategories: [
       { id: 1, category_id: null, path: '犬用品 > おやつ', is_active: 1, selected: 1 },
       { id: 2, category_id: null, path: '猫用品', is_active: 1, selected: 1 },
@@ -5562,7 +5608,7 @@ const renders = [
     cabinetImages: [{ id: 1, drive_file_id: 'g1' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     shopCategories: [],
     yahoo: { yahoo_price: null, yahoo_price_sagawa: null, delivery_label: null, tax_rate: '8%', yahoo_category_id: null, yahoo_path: null },
     imageProduction: null,
@@ -5575,7 +5621,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5592,7 +5638,7 @@ const renders = [
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5606,7 +5652,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5619,7 +5665,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5632,7 +5678,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5646,7 +5692,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -6155,6 +6201,9 @@ for (const [name, file, data] of renders) {
 {
   const dh = renderedHtml.get('detail.ejs (full/own_brand)') || '';
   const sel = dh.slice(dh.indexOf('id="rk-shipping-group"'), dh.indexOf('</select>', dh.indexOf('id="rk-shipping-group"')));
+  // 選択肢から外した配送方法 (「現在使用不可」) が保存されていても、その行を足して選択状態を保つ
+  check('配送方法: 選択肢に無い保存値でも option を足して選択状態を保つ (Codex R3)',
+    /allShippingGroups\[shipDefault\]/.test(fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8')));
   check('配送方法: 保存済みの複合選択肢が再表示で選ばれている',
     /value="1y5"\s+selected/.test(sel) && !/value="1"\s+selected/.test(sel), sel.slice(0, 400));
   check('配送方法: ヤフー別扱いの商品はヤフー欄が開いた状態で描かれる',
@@ -6749,7 +6798,7 @@ for (const [name, file, data] of renders) {
       // ② プリセットの変更 (1y5 → 1y8) はヤフーの配送方法にも反映される
       await call(`/api/drafts/${idShip}/rakuten`, { shipping_method_group: '1y8', shipping_method_group_prev: '1y5', yahoo_shipping_override: 1 });
       check('HTTP 配送方法: 複合を選び直すとヤフーの配送方法も追従する (1y5→1y8)',
-        yhOf(idShip).delivery_label === '宅急便50サイズ以上' && rkOf(idShip).shipping_method_group === '1',
+        yhOf(idShip).delivery_label === '宅急便50サイズ以下' && rkOf(idShip).shipping_method_group === '1',
         JSON.stringify(yhOf(idShip)));
       // ③ ヤフーの配送方法を手で変えたあと、**プルダウンを触らずに**楽天項目を保存しても
       //    手で入れた値は戻らない (画面はまだ 1y8 を指している = 選び直していない)
@@ -6773,7 +6822,14 @@ for (const [name, file, data] of renders) {
       await call(`/api/drafts/${idShip2}/yahoo`, { delivery_label: 'ネコポス', shipping_override: 1 });
       check('HTTP 配送方法: ヤフー項目を先に保存しても別扱いが記録される',
         yhOf(idShip2).shipping_override === 1, JSON.stringify(yhOf(idShip2)));
-      // ⑦ 選択肢に無い値は 400 (保存しない)
+      // ⑦ 選択肢から外した配送方法 (「現在使用不可」) が保存済みでも、触らず保存すれば残る。
+      //    弾くとその商品は出品できなくなり、黙って別の値にすると配送方法が入れ替わる (Codex R2/R3)
+      db.prepare('UPDATE draft_rakuten SET shipping_method_group = ? WHERE draft_id = ?').run('2', idShip);
+      rr = await call(`/api/drafts/${idShip}/rakuten`, { shipping_method_group: '2', shipping_method_group_prev: '2' });
+      check('HTTP 配送方法: 選択肢から外した値も、保存済みなら弾かず残す',
+        rr.status === 200 && rkOf(idShip).shipping_method_group === '2',
+        JSON.stringify({ status: rr.status, rk: rkOf(idShip), res: rr.json }));
+      // ⑧ 選択肢に無い値は 400 (保存しない)
       rr = await call(`/api/drafts/${idShip2}/rakuten`, { shipping_method_group: '1y9' });
       check('HTTP 配送方法: 選択肢に無い値は 400', rr.status === 400 && /配送方法/.test(rr.json.error || ''), JSON.stringify(rr.json));
       db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idShip, idShip2);

@@ -61,7 +61,7 @@ export function convertTaxRate(rakutenTaxRate) {
  *     楽天 ID 5 (ネコポス) → Yahoo 6 (ネコポス) → Notion 「ネコポス」
  *     楽天 ID 6 (クリックポスト) → Yahoo 9 (クリックポスト) → Notion 「クリックポスト」
  *     楽天 ID 7 (ヤマト運輸宅急便) → Yahoo 11 (クロネコ宅急便) → Notion 「ヤマト宅急便」
- *     楽天 ID 8 (宅急便50サイズ以上) → Yahoo 10 (宅急便ヤマト50サイズ用) → Notion 「ヤマト50サイズ」
+ *     楽天 ID 8 (宅急便50サイズ以下) → Yahoo 10 (宅急便ヤマト50サイズ用) → Notion 「ヤマト50サイズ」
  *     楽天 ID 9 (ゆうパケットパフ) → Yahoo 12 (ゆうパケットパフ) → Notion 「ゆうパケットパフ」
  *
  *   override (delivery_mapping seed 001_initial.sql:22-23 で実装済): Notion が 定形外（ヤフーのみ宅急便50）→
