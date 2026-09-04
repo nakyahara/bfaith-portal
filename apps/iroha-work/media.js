@@ -331,8 +331,11 @@ export function mediaByTask(opts) { return mediaByCard('task_id', opts); }
 function mediaByCard(key, { ids = null, repair = true } = {}) {
   const db = getDB();
   const map = new Map();
+  // task_id は数値・page_id は文字列。取り違えると絞り込みが空になるので、キーに合わせて整える
   const only = Array.isArray(ids)
-    ? [...new Set(ids.map(Number).filter((n) => Number.isSafeInteger(n)))]
+    ? (key === 'task_id'
+      ? [...new Set(ids.map(Number).filter((n) => Number.isSafeInteger(n)))]
+      : [...new Set(ids.map((v) => String(v)).filter((v) => v !== ''))])
     : null;
   if (only && only.length === 0) return map;
   // 実体をまだ置いていない行 (staged_at あり) は「無いもの」として扱う — 画面にも出さない (Codex PR1 R7)
