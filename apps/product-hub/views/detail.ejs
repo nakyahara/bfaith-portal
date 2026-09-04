@@ -217,6 +217,7 @@ th.attr-unknown { color: #dc2626; }
       <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
         🟢 <strong>楽天で公開中</strong>
         <a href="<%= rakutenItemUrl %>" target="_blank" rel="noopener" style="margin-left:8px; font-weight:600;">🔗 楽天の商品ページを開く ↗</a>
+        <% if (rakutenRmsUrl) { %><a href="<%= rakutenRmsUrl %>" target="_blank" rel="noopener" style="margin-left:8px; font-weight:600;" title="RMS の商品編集画面を開きます">🛠 RMSで編集 ↗</a><% } %>
         <span class="muted">(公開: <%= rakuten.published_at.replace('T',' ').slice(0,16) %> — アプリの記録。RMS画面で直接変更した場合はズレます)</span><br>
         問題があれば「非公開に戻す」で売り場から下げられます。
         <div style="margin-top:8px;">
@@ -484,7 +485,8 @@ th.attr-unknown { color: #dc2626; }
               <td class="muted" style="font-size:12px;"><%= m.listed_at ? String(m.listed_at).slice(0, 10) : '—' %></td>
               <td>
                 <% if (m.code === 'rakuten' && m.state === 'done') { %>
-                  <a href="<%= rakutenItemUrl %>" target="_blank" rel="noopener" style="font-size:12px;">楽天の商品ページ</a><br>
+                  <a href="<%= rakutenItemUrl %>" target="_blank" rel="noopener" style="font-size:12px;">楽天の商品ページ</a>
+                  <% if (rakutenRmsUrl) { %> / <a href="<%= rakutenRmsUrl %>" target="_blank" rel="noopener" style="font-size:12px;">RMSで編集</a><% } %><br>
                 <% } else if (m.item_url) { %>
                   <a href="<%= m.item_url %>" target="_blank" rel="noopener" style="font-size:12px;">掲載ページ</a><br>
                 <% } %>

@@ -335,6 +335,8 @@
                 // 掲載URL: 保存されていなければ商品コードから組み立てる (詳細画面を開かずに登録済みになった商品は
                 // ensureMallStatus が done で作るので URL を持たない)
                 const rkUrl = (rkMall && rkMall.itemUrl) || (typeof rakutenItemPageUrl === 'function' && c.ne_code ? rakutenItemPageUrl(c.ne_code) : null);
+                // RMS の商品編集ページ (2026-09-04 中原さん要望: 出品済みの商品をその場で直せるように)
+                const rkRmsUrl = (typeof rakutenRmsItemUrl === 'function' && c.ne_code) ? rakutenRmsItemUrl(c.ne_code) : null;
                 const rkOutcome = c.rakutenListingOutcome || null;
                 // 実行中のまま 15 分以上動いていない = プロセス再起動などで途中で止まった (実行中は通常 1〜2 分)
                 const rkAttemptMs = c.rakutenListingAttemptAt ? Date.parse(c.rakutenListingAttemptAt) : NaN;
@@ -344,6 +346,7 @@
                 <div class="kb-rk kb-rk-done">
                   🛒 楽天: 出品済み
                   <% if (rkUrl) { %><a href="<%= rkUrl %>" target="_blank" rel="noopener" class="kb-rk-link">商品ページ ↗</a><% } %>
+                  <% if (rkRmsUrl) { %><a href="<%= rkRmsUrl %>" target="_blank" rel="noopener" class="kb-rk-link" title="RMS の商品編集画面を開きます">RMS ↗</a><% } %>
                   <% if (!(rkMall && rkMall.state === 'done')) { %>
                     <div class="kb-rk-warn">⚠ モール別の状況が未更新です (詳細画面で楽天を「完了」にしてください)</div>
                   <% } %>

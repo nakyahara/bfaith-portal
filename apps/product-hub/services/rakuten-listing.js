@@ -1039,6 +1039,23 @@ export function rakutenItemPageUrl(manageNumber) {
   return `https://item.rakuten.co.jp/${encodeURIComponent(shop)}/${encodeURIComponent(String(manageNumber).trim().toLowerCase())}/`;
 }
 
+/**
+ * RMS の商品編集ページURL (2026-09-04 中原さんから実URLを受領)。
+ *   https://item.rms.rakuten.co.jp/rms-sku/shops/373343/item/edit/silicateclay800
+ * セッションやトークンは含まれず、**店舗ID + 商品管理番号だけ**で開ける。
+ * 商品管理番号は RMS 仕様で小文字 (registerItem も toLowerCase して送っている)。
+ * 店舗ID (373343) は env PH_RAKUTEN_SHOP_ID で上書きできる
+ */
+export function rakutenRmsItemUrl(manageNumber) {
+  const code = String(manageNumber ?? '').trim().toLowerCase();
+  if (!code) return null;
+  // env は「未設定なら既定値」。空文字や空白を既定値へ倒すと、設定ミスに気づけない
+  const raw = process.env.PH_RAKUTEN_SHOP_ID;
+  const shopId = (raw === undefined ? '373343' : String(raw)).trim();
+  if (!/^\d+$/.test(shopId)) return null;   // 設定ミスで壊れたURLを出さない
+  return `https://item.rms.rakuten.co.jp/rms-sku/shops/${shopId}/item/edit/${encodeURIComponent(code)}`;
+}
+
 /** UI プレビュー用: location → 公開画像URL (buildSalesDescriptionHtml と同じベース解決) */
 export function cabinetImageUrl(location) {
   let base = (process.env.PH_CABINET_IMAGE_BASE || CABINET_IMAGE_BASE).replace(/\/+$/, '');
