@@ -36,32 +36,38 @@ export function unitPriceOf(db, neCode) {
   //    UNIQUE は生の ne_code にしか効かないので `ABC` と ` abc ` が同居できる。
   //    そこで `ORDER BY id LIMIT 1` を採ると、**どちらの値が出るかは運**になる。
   //    「どの単価か分からない」は引けないのと同じ (fail-closed)
-  const agreedPrice = (values) => {
+  //
+  // 3 つの答えを区別する (Codex medium 2026-09-04 2巡目):
+  //   'none'     … その引き先には値が無い → **次の引き先へ落ちてよい**
+  //   'value'    … 全行が同じ有効値 → 採用
+  //   'conflict' … 値が割れている / 有効値と無効値 (未入力・0円) が混在 → **止める**
+  // 「有効値と未入力の混在」を有効値の勝ちにすると、どちらのドラフトが正か分からないまま
+  // 値段を入れてしまう。人が直すべき状態なので止める
+  const agree = (values) => {
+    if (values.length === 0) return { kind: 'none' };
     const vals = new Set(values.map(priceOrNull));
-    if (vals.size !== 1) return null;      // 割れている / 有効値と無効値の混在
-    return [...vals][0];                   // 全部無効なら null
+    if (vals.size !== 1) return { kind: 'conflict' };
+    const only = [...vals][0];
+    return only == null ? { kind: 'none' } : { kind: 'value', value: only };
   };
 
   // ① アプリのドラフト。**セットは数えない** (parent_draft_id IS NULL = 単品だけ)。
   //    セットの売価を単価として拾うと、セットのセットのような値になる
   const drafts = db.prepare(`
     SELECT price FROM product_drafts
-    WHERE LOWER(TRIM(ne_code)) = ? AND parent_draft_id IS NULL AND price IS NOT NULL
+    WHERE LOWER(TRIM(ne_code)) = ? AND parent_draft_id IS NULL
   `).all(code);
-  const fromDraft = drafts.length > 0 ? agreedPrice(drafts.map((d) => d.price)) : null;
-  if (fromDraft != null) return { value: fromDraft, source: 'draft' };
-  // 値が割れているのに次の引き先へ落ちると「人が入れた値を無視して NE を採る」になる。
-  // 人が直すべき状態なので、ここで止める (Codex high 2026-09-04)
-  if (drafts.length > 0) return null;
+  const fromDraft = agree(drafts.map((d) => d.price));
+  if (fromDraft.kind === 'conflict') return null;
+  if (fromDraft.kind === 'value') return { value: fromDraft.value, source: 'draft' };
 
   // ①' バリエーションの子SKU に付けた売価 (`draft_sku_prices`)。単品のドラフトが無くても、
   //     人が SKU ごとに決めた売価があればそれが「アプリの値」(Codex medium 2026-09-04)。
   //     どのドラフトに属する行かは問わないが、割れていたら採らない
   const skuRows = db.prepare('SELECT price FROM draft_sku_prices WHERE sku_code = ?').all(code);
-  if (skuRows.length > 0) {
-    const fromSku = agreedPrice(skuRows.map((r) => r.price));
-    return fromSku == null ? null : { value: fromSku, source: 'sku' };
-  }
+  const fromSku = agree(skuRows.map((r) => r.price));
+  if (fromSku.kind === 'conflict') return null;
+  if (fromSku.kind === 'value') return { value: fromSku.value, source: 'sku' };
 
   // ② NE mirror の標準売価 (税込)。mirror が未取込の環境では黙って null
   if (!mirrorReady(db)) return null;
@@ -71,9 +77,8 @@ export function unitPriceOf(db, neCode) {
   } catch (_) {
     return null;
   }
-  if (rows.length === 0) return null;
-  const fromNe = agreedPrice(rows.map((r) => r.標準売価));
-  return fromNe == null ? null : { value: fromNe, source: 'ne' };
+  const fromNe = agree(rows.map((r) => r.標準売価));
+  return fromNe.kind === 'value' ? { value: fromNe.value, source: 'ne' } : null;
 }
 
 /**

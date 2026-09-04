@@ -1233,12 +1233,23 @@ check('payload: アプリ指定なしは NE配送方法から定形外バナー�
   bNe.ok === true && bNe.payload.images.some((i) => i.location === '/07722747/08581403/teikeigai_soryomuryo.jpg')
   && !bNe.payload.images.some((i) => i.location === '/07722747/09610094/imgrc0104897185.jpg'),
   JSON.stringify(bNe.payload?.images || bNe.reasons));
-// 🚨 バナーだけでなく **RMS へ送る配送方法そのもの** も NE へフォールバックする (Codex high 2026-09-04)。
-// ここが生値のままだと、画面と末尾バナーは「定形外」を出しているのに RMS には配送方法が
-// 送られず店舗デフォルトになる。配送方法をコピーしないセット (§4.4 決⑥) は全部この経路に乗る
-check('🚨 payload: アプリ指定なしは NE配送方法を RMS へも送る (バナーと payload を食い違わせない)',
-  bNe.payload?.variants?.['rk-smoke-1']?.shipping?.shippingMethodGroup === '1',
+// 🚨 RMS へ送る配送方法は **セットだけ** NE へフォールバックする (§4.4 決⑥ / Codex high 2巡目)。
+// 単品まで NE に落とすと、いま店舗デフォルトで出ている商品の配送方法が黙って変わる = 決⑥の範囲外。
+// バナー (上のテスト) は従来どおり NE を見るので、単品では「バナー = 定形外 / RMS = 店舗デフォルト」
+// のままになる。これは既存の挙動で、変えるかどうかは中原さんの判断待ち
+check('payload: 単品はアプリ指定なしなら配送方法を送らない (従来どおり店舗デフォルトに任せる)',
+  bNe.payload?.variants?.['rk-smoke-1']?.shipping?.shippingMethodGroup === undefined,
   JSON.stringify(bNe.payload?.variants?.['rk-smoke-1']?.shipping || bNe.reasons));
+check('🚨 payload の配送方法: セットだけ NE へフォールバックする (単品は従来どおり)',
+  listing.payloadShippingGroup({ parent_draft_id: 7 }, { group: '1' }, { group: null }) === '1'
+  && listing.payloadShippingGroup({ parent_draft_id: null }, { group: '1' }, { group: null }) === ''
+  // アプリで明示指定されていれば、セットでも単品でもその値 (effective も同じ値を返す)
+  && listing.payloadShippingGroup({ parent_draft_id: 7 }, { group: '9' }, { group: '9' }) === '9'
+  && listing.payloadShippingGroup({ parent_draft_id: null }, { group: '9' }, { group: '9' }) === '9',
+  JSON.stringify([
+    listing.payloadShippingGroup({ parent_draft_id: 7 }, { group: '1' }, { group: null }),
+    listing.payloadShippingGroup({ parent_draft_id: null }, { group: '1' }, { group: null }),
+  ]));
 check('effectiveShippingForDraft: アプリ指定(9)が NE(定形外=1) より優先 / 指定なしはNE',
   listing.effectiveShippingForDraft(db, 'rk-smoke-1', '9').group === '9'
   && listing.effectiveShippingForDraft(db, 'rk-smoke-1', null).group === '1');
@@ -3288,6 +3299,22 @@ let wfSetParentId = null;
     db.prepare(`UPDATE product_drafts SET price = 900 WHERE ne_code = ' setprice-dup '`).run();
     check('🚨 売価の初期値: 同じ商品コードで売価が割れていたら採らない (どちらが正か分からない)',
       sp.unitPriceOf(db, 'setprice-dup') === null, JSON.stringify(sp.unitPriceOf(db, 'setprice-dup')));
+    // 「有効値と未入力の混在」も割れている扱い (Codex medium 2巡目)。どちらのドラフトが正か
+    // 分からないまま値段を入れてしまわない
+    db.prepare(`UPDATE product_drafts SET price = NULL WHERE ne_code = ' setprice-dup '`).run();
+    check('🚨 売価の初期値: 片方が売価未入力なら「一致」とみなさない (どちらが正か分からない)',
+      sp.unitPriceOf(db, 'setprice-dup') === null, JSON.stringify(sp.unitPriceOf(db, 'setprice-dup')));
+    // 全部が未入力なら「その引き先には値が無い」= 次の引き先へ落ちてよい (止めない)
+    db.prepare(`UPDATE product_drafts SET price = NULL WHERE LOWER(TRIM(ne_code)) = 'setprice-dup'`).run();
+    db.prepare(`INSERT OR REPLACE INTO mirror_products
+      (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 標準売価, 原価, 送料, 配送方法, 消費税率, updated_at)
+      VALUES (99715, 'setprice-dup', 'NEにもある', '1', '取扱中', 'ok', 222, 50, 120, '定形外', 0.1, '2026-09-04T00:00:00Z')`).run();
+    check('売価の初期値: ドラフトが全部売価未入力なら NE の標準売価へ落ちてよい',
+      sp.unitPriceOf(db, 'setprice-dup')?.value === 222 && sp.unitPriceOf(db, 'setprice-dup')?.source === 'ne',
+      JSON.stringify(sp.unitPriceOf(db, 'setprice-dup')));
+    db.prepare(`DELETE FROM mirror_products WHERE product_id = 99715`).run();
+    db.prepare(`UPDATE product_drafts SET price = 700 WHERE ne_code = 'SETPRICE-DUP'`).run();
+    db.prepare(`UPDATE product_drafts SET price = 900 WHERE ne_code = ' setprice-dup '`).run();
     check('🚨 売価の初期値: 売価が割れているとき NE の標準売価へ落ちない (人が入れた値を無視しない)',
       (() => {
         db.prepare(`INSERT OR REPLACE INTO mirror_products
@@ -7939,6 +7966,41 @@ for (const [name, file, data] of renders) {
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idCas);
       sessionRole = 'staff';
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDec);
+    }
+
+    // ─── セット作成を実物のルートで通す (2026-09-04 §5.6 / Codex 2巡目) ──────
+    // 画面 → API → DB の往復。ここを通さないと「関数は正しいがルートが受け取れていない」が残る
+    {
+      sessionRole = 'admin';
+      const idSetHttp = mkDraft('SETHTTP-P', { atListing: false });
+      db.prepare('UPDATE product_drafts SET price = 1200 WHERE id = ?').run(idSetHttp);
+      db.prepare(`INSERT OR REPLACE INTO mirror_products
+        (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 標準売価, 原価, 送料, 配送方法, 消費税率, updated_at)
+        VALUES (99720, 'sethttp-mix', '混ぜる商品', '1', '取扱中', 'ok', 300, 100, 120, '定形外', 0.1, '2026-09-04T00:00:00Z')`).run();
+      const ver = () => wfp.progressOf(idSetHttp, { db }).main.find((x) => x.step_code === 'set_review').version;
+      let rs = await call(`/api/drafts/${idSetHttp}/set-drafts`,
+        { mode: 'ai', members: [], parent_step_version: ver() });
+      check('HTTP セット作成: 構成が空なら 400 (黙って「親×2」にしない)',
+        rs.status === 400 && /構成/.test(rs.json.error || ''), JSON.stringify(rs.json));
+      rs = await call(`/api/drafts/${idSetHttp}/set-drafts`,
+        { mode: 'ai', members: [{ ne_code: 'SETHTTP-P', qty: 2 }, { ne_code: 'sethttp-mix', qty: 1 }], parent_step_version: ver() });
+      check('HTTP セット作成: 複数行の構成をそのまま受け取る', rs.status === 200 && !!rs.json.draftId, JSON.stringify(rs.json));
+      const madeId = rs.json.draftId;
+      check('HTTP セット作成: 構成が順番どおり保存される',
+        db.prepare('SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort')
+          .all(madeId).map((x) => `${x.member_ne_code}x${x.qty}`).join(',') === 'SETHTTP-Px2,sethttp-mixx1',
+        JSON.stringify(db.prepare('SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort').all(madeId)));
+      check('HTTP セット作成: 売価は構成の和が入る (1,200×2 + 300×1 = 2,700)',
+        db.prepare('SELECT price FROM product_drafts WHERE id = ?').get(madeId).price === 2700,
+        String(db.prepare('SELECT price FROM product_drafts WHERE id = ?').get(madeId).price));
+      check('HTTP セット作成: 配送方法は入らない (NE 確定待ち)',
+        (db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(madeId) || {}).shipping_method_group == null);
+      rs = await call(`/api/drafts/${idSetHttp}/set-drafts`,
+        { mode: 'ai', members: [{ ne_code: 'SETHTTP-P', qty: 0 }], parent_step_version: ver() });
+      check('HTTP セット作成: 個数が不正なら 400', rs.status === 400, JSON.stringify(rs.json));
+      db.prepare('DELETE FROM mirror_products WHERE product_id = 99720').run();
+      db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(madeId, idSetHttp);
+      sessionRole = 'staff';
     }
 
     // ─── 配送方法の保存の往復 (2026-09-03 #1152 / Codex R1 high) ───────────
