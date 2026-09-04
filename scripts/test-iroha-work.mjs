@@ -1595,6 +1595,29 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     ok(card2 && card2.media?.length === 1 && card2.media[0].id === up.json.media.id, '一覧の詳細に写真が出る');
     const del = await call('POST', `/api/media/${up.json.media.id}/delete`, { cookie, body: { delete_token: up.json.deleteToken, worker_id: w1.id } });
     ok(del.status === 200 && del.json.ok, '削除 (削除トークン)');
+    // 履歴 (終了したカード) は読むだけ: 写真を足せない・消せない (アプリ正本でも。PR1 の境界)
+    {
+      const closedId = TD.upsertTaskFromImport({ notion_page_id: 'hist-media', status: 'closed', close_reason: 'stocked',
+        closed_at: '2026-09-04T00:00:00Z', destination_id: 8899, product_code: 'HIST-A', product_name: '終了したカード', qty: 1,
+        facility_code: 'iroha' }, { batchId: 'test-hist' }).id;
+      const mpc = multipart({ id: String(closedId), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-hist-000001' },
+        { name: 'h.jpg', mime: 'image/jpeg', data: jpeg });
+      const addClosed = await call('POST', '/api/media', { cookie, body: mpc.body, headers: mpc.headers });
+      ok(addClosed.status === 409 && addClosed.json.error === 'closed_task', '終了したカードには写真を足せない');
+      ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_card_media WHERE operation_id = 'op-hist-000001'").get().c === 0, '行も残らない');
+      // 終了前に撮ってあった写真は、終了後は消せない (履歴として残る)
+      db.prepare(`INSERT INTO f_iroha_card_media (operation_id, task_id, product_code, kind, mime, size, drive_file_id, drive_url,
+          status, worker_id, worker_name, created_at, uploaded_at, delete_token_hash)
+        VALUES ('op-hist-old001', ?, 'HIST-A', 'photo', 'image/jpeg', 100, 'f-hist-old', 'https://drive/hist-old',
+          'uploaded', ?, 'やまだ', ?, ?, 'hash-hist')`).run(closedId, w1.id, new Date().toISOString(), new Date().toISOString());
+      const oldId = db.prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-hist-old001'").get().id;
+      const delClosed = await call('POST', '/api/media/' + oldId + '/delete', { ...admin, body: {} });
+      ok(delClosed.status === 409 && delClosed.json.error === 'closed_task', '終了したカードの写真は消せない');
+      ok(db.prepare('SELECT deleted_at FROM f_iroha_card_media WHERE id = ?').get(oldId).deleted_at == null, '写真は残る');
+      const pv = await call('GET', '/api/task-previews/' + closedId, { cookie });
+      ok(pv.status === 200 && pv.json.ok && pv.json.card.status === 'closed' && pv.json.capabilities.length === 0,
+        '終了したカードの詳細は読むだけで開ける');
+    }
     // まとめて棚入完了 (PR-C): 棚入待ちのものだけ・職員だけ
     {
       const mk = (dest, name, status) => TD.upsertTaskFromImport({ notion_page_id: `bulk-${dest}`, status, destination_id: dest,

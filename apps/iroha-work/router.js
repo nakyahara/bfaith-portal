@@ -775,6 +775,11 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
     const task = appMode ? getTask(parseTaskId(cardId)) : null;
     const card = appMode ? null : getCachePage(cardId);
     if (appMode ? !task : !card) { cleanup(); return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' }); }
+    // 終了したカード (履歴) には足せない。削除を断っているのと同じ理由 — 履歴は読むだけ (要件 v1.3 §P Q5)
+    if (appMode && task.status === 'closed') {
+      cleanup();
+      return res.status(409).json({ ok: false, error: 'closed_task', message: '終了したカードには写真を足せません (履歴として残ります)' });
+    }
     const productCode = appMode ? task.product_code : card.product_code;
     const r = addMedia({
       pageId: appMode ? null : cardId, taskId: appMode ? task.id : null,
