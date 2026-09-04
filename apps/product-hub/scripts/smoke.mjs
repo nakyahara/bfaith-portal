@@ -2010,6 +2010,59 @@ const igRoot = ichiba.normalizeGenreSearch({
 check('ichiba: root は path に含めない・子は child ラップを剥がす',
   ichiba.genrePathOf(igRoot) === '' && igRoot.children[0].genreId === '100371'
   && igRoot.children[0].name === 'レディースファッション');
+// ─── 他社の商品ページURL → ジャンルID (2026-09-04) ────────────────────────
+// 🚨 商品検索API では引けない (itemCode は `<店舗>:<数字>` の内部IDで、URL 末尾の
+// 商品管理番号とは別物 — 2026-09-04 実測)。公開ページの埋め込み JSON から読む
+check('genre-from-url: 楽天の商品ページURLだけ受け付け、クエリを落として正規化する',
+  ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016/')?.url === 'https://item.rakuten.co.jp/ideshokai/pui016/'
+  && ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016/?rafcid=wsc_i_is_123')?.url === 'https://item.rakuten.co.jp/ideshokai/pui016/'
+  && ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016')?.itemCode === 'pui016'
+  && ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016/#tab')?.shopCode === 'ideshokai');
+{
+  // 🚨 利用者が貼った URL を取りに行くので SSRF を作らない。item.rakuten.co.jp 以外は全部拒否
+  const rejected = [
+    'http://item.rakuten.co.jp/shop/item/',            // https 以外
+    'https://item.rakuten.co.jp.evil.example/shop/it/', // ホストの後方一致すり抜け
+    'https://evil.example/shop/item/',
+    'https://item.rakuten.co.jp:8080/shop/item/',       // 別ポート
+    'https://user:pw@item.rakuten.co.jp/shop/item/',    // 認証情報つき
+    'https://127.0.0.1/shop/item/',
+    'http://169.254.169.254/latest/meta-data/',         // クラウドのメタデータ
+    'https://item.rakuten.co.jp/shop/',                 // 商品部分が無い
+    'https://item.rakuten.co.jp/../etc/passwd/',
+    'https://a.r10.to/xxxxx',                           // 短縮URL (転送先を保証できない)
+    'file:///etc/passwd', 'javascript:alert(1)', '', null, undefined,
+  ];
+  const leaked = rejected.filter((u) => ichiba.parseRakutenItemUrl(u) !== null);
+  check('genre-from-url: 楽天の商品ページ以外の URL は全部拒否する (SSRF を作らない)',
+    leaked.length === 0, JSON.stringify(leaked));
+}
+check('genre-from-url: 壊れた percent encoding は例外にせず不正URL扱い (Codex R1 low)',
+  ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/shop/%/') === null
+  && ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/%E4%B8%8D%E6%AD%A3/%/') === null);
+check('genre-from-url: 埋め込み JSON の genreId を一意に取り出す',
+  ichiba.extractGenreIdFromHtml('x &quot;data&quot;: { &quot;genreId&quot;: 568908, &quot;price&quot;: } y') === '568908');
+check('genre-from-url: 緩い一致で拾えるノイズ (全ページに出る 100005) は混ぜない',
+  ichiba.extractGenreIdFromHtml('genre_id=100005 ... &quot;genreId&quot;: 215261,') === '215261');
+check('genre-from-url: 一意に決まらなければ null (誤ったジャンルを返さない)',
+  ichiba.extractGenreIdFromHtml('&quot;genreId&quot;: 111, &quot;genreId&quot;: 222') === null
+  && ichiba.extractGenreIdFromHtml('ジャンルの手がかりが無いページ') === null
+  && ichiba.extractGenreIdFromHtml('') === null);
+{
+  // 楽天の商品ページは EUC-JP。ヘッダ/meta の charset に従い、不明なら EUC-JP で読む
+  const eucBytes = Buffer.from([0xa4, 0xb3, 0xa4, 0xf3]); // 「こん」(EUC-JP)
+  check('genre-from-url: charset 指定が無ければ EUC-JP として読む',
+    ichiba.decodeItemPage(eucBytes, null) === 'こん', JSON.stringify(ichiba.decodeItemPage(eucBytes, null)));
+  check('genre-from-url: charset が UTF-8 ならそれに従う',
+    ichiba.decodeItemPage(Buffer.from('こん', 'utf8'), 'text/html; charset=UTF-8') === 'こん');
+}
+{
+  // URL が不正なら API を叩かずに断る (ネットワークに出ない)
+  const bad = await ichiba.genreIdFromItemUrl('https://evil.example/x/y/');
+  check('genre-from-url: 不正な URL はページを取りに行かずに断る',
+    bad.ok === false && /item\.rakuten\.co\.jp/.test(bad.error), JSON.stringify(bad));
+}
+
 // env 未設定時の fail-closed (ツリー=設定案内 / 提案=資格情報エラー)
 delete process.env.RAKUTEN_WS_APP_ID;
 delete process.env.RAKUTEN_APP_ID;
@@ -6868,6 +6921,30 @@ for (const [name, file, data] of renders) {
       check('sku-jan worker: 再送が通れば確定して flush=true', ok2 === true && h.posts.length === 3);
     }
   }
+
+{
+  // ジャンルを差し替えたとき、前のジャンルの属性が残ると出品直前に IE1002 で弾かれる。
+  // その場で気づけるよう、辞書に無い属性を赤くして一覧を出す (2026-09-04)
+  const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+  check('属性のずれ: 警告の置き場所が属性表にある', src.includes('id="rk-attr-unknown"'));
+  check('属性のずれ: 判定は属性候補の描画と同じタイミングで走る (呼び忘れが起きない)',
+    /function renderAttrSuggest\(\)\s*\{\s*markAttrsNotInGenre\(\);/.test(src));
+  check('属性のずれ: 単品の行と SKU 表の行の両方を見る',
+    /#rk-attrs tbody tr \.rk-attr-name/.test(src.slice(src.indexOf('function markAttrsNotInGenre')))
+    && /#rk-sku-grid tr\.sku-grid-attr/.test(src.slice(src.indexOf('function markAttrsNotInGenre'))));
+  check('属性のずれ: 出品前チェックと同じ言葉 (IE1002) で知らせる',
+    src.slice(src.indexOf('function markAttrsNotInGenre')).includes('IE1002'));
+  {
+    const fn = src.slice(src.indexOf('function markAttrsNotInGenre'), src.indexOf('function renderAttrSuggest'));
+    // 装飾はクラスで重ねる。style を直接書くと addAttrRow が塗った必須属性の枠色を消す (Codex R3)
+    check('属性のずれ: 装飾はクラスの付け外しで行う (必須属性の枠色を消さない)',
+      /classList\.toggle\('attr-unknown'/.test(fn) && !/\.style\[/.test(fn) && !/style\.borderColor\s*=/.test(fn), fn.slice(0, 200));
+    check('属性のずれ: 辞書が空のときは何も赤くしない (取得前に全部を誤検知しない)',
+      /known\.size > 0/.test(fn));
+    check('属性のずれ: 専用クラスのスタイルが定義されている',
+      /input\.attr-unknown\s*\{/.test(src) && /th\.attr-unknown\s*\{/.test(src));
+  }
+}
 
   // ─── 楽天項目の保存が「前回の選択」を進めること (2026-09-03 #1152 / Codex R3 high) ───
   // この画面は保存後に再読み込みしない経路があるので、送れた配送方法まで shipSelectInitial を
