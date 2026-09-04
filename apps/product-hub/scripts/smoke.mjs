@@ -1376,6 +1376,36 @@ check('cabinetFilePath: 21文字になる商品コードは短縮する (silicat
     `miniPC=${m ? Number(m[1]) + 1 : '(読めず)'} / product-hub=${listing.CABINET_PATH_MAX}`);
 }
 // Cabinet ファイルパス: 情報が落ちる置換はハッシュ付与で一意化 (Codex High-3)
+// ─── RMS の商品編集ページURL (2026-09-04 中原さんから実URLを受領) ──────────
+//   https://item.rms.rakuten.co.jp/rms-sku/shops/373343/item/edit/silicateclay800
+//   セッションやトークンは含まれず、店舗ID + 商品管理番号だけで開ける
+{
+  // 既定値を確かめるので env は必ず外してから測る (本番相当の env が設定された環境でも
+  // このテストが落ちないように。最後に必ず戻す — Codex R1 medium)
+  const beforeShopId = process.env.PH_RAKUTEN_SHOP_ID;
+  try {
+    delete process.env.PH_RAKUTEN_SHOP_ID;
+    check('RMSリンク: 受け取った実URLと同じ形を組み立てる',
+      listing.rakutenRmsItemUrl('silicateclay800')
+        === 'https://item.rms.rakuten.co.jp/rms-sku/shops/373343/item/edit/silicateclay800');
+    check('RMSリンク: 商品管理番号は小文字にする (RMS 仕様。registerItem と揃える)',
+      listing.rakutenRmsItemUrl('SilicateClay800').endsWith('/item/edit/silicateclay800'));
+    check('RMSリンク: 商品コードが無ければリンクを作らない',
+      listing.rakutenRmsItemUrl('') === null && listing.rakutenRmsItemUrl(null) === null
+      && listing.rakutenRmsItemUrl('   ') === null);
+    process.env.PH_RAKUTEN_SHOP_ID = '999999';
+    check('RMSリンク: 店舗IDは env で上書きできる',
+      listing.rakutenRmsItemUrl('x').includes('/shops/999999/'));
+    for (const bad of ['not-a-number', '', '   ', '12a']) {
+      process.env.PH_RAKUTEN_SHOP_ID = bad;
+      check(`RMSリンク: 店舗IDの設定ミス (${JSON.stringify(bad)}) では壊れたURLを出さない`,
+        listing.rakutenRmsItemUrl('x') === null);
+    }
+  } finally {
+    if (beforeShopId === undefined) delete process.env.PH_RAKUTEN_SHOP_ID;
+    else process.env.PH_RAKUTEN_SHOP_ID = beforeShopId;
+  }
+}
 check('skuCabinetFilePath: 素直なコードはそのまま / 特殊文字はハッシュ付与で衝突しない',
   listing.skuCabinetFilePath('sueders-db') === 'sueders-db-sku.jpg'
   && listing.skuCabinetFilePath('a_b') !== listing.skuCabinetFilePath('a.b')
@@ -5772,6 +5802,7 @@ const boardBase = {
   boardView: 'main', imageKindLabels: wfp.IMAGE_KIND_LABELS,
   // 出品・展開の列で楽天の商品ページを組み立てる (2026-09-01)
   rakutenItemPageUrl: (mn) => `https://item.rakuten.co.jp/b-faith/${String(mn).toLowerCase()}/`,
+  rakutenRmsItemUrl: (mn) => `https://item.rms.rakuten.co.jp/rms-sku/shops/373343/item/edit/${String(mn).toLowerCase()}`,
   isAdmin: true,
 };
 renders.push(
@@ -5842,6 +5873,7 @@ for (const [name, file, data] of renders) {
         // 詳細画面の「← 戻る」の戻り先 (router の backLinkOf 相当。既定 = 一覧)
         backLink: { url: '/apps/product-hub/list', label: '← 一覧に戻る' },
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
+        rakutenRmsUrl: 'https://item.rms.rakuten.co.jp/rms-sku/shops/373343/item/edit/rk-smoke-1',
         skuImages: [],
         skuJans: {}, skuSelectorValues: {},
         imagePriorities: dbmod.IMAGE_PRIORITIES,
@@ -6015,6 +6047,11 @@ for (const [name, file, data] of renders) {
     check('ボード(出品): カードに data-rk (楽天の状態) と data-name が付く',
       /data-rk="todo"[\s\S]{0,80}data-name="出品テスト 90001"/.test(bhL) && bhL.includes('data-rk="done"'),
       (bhL.match(/data-rk="[^"]*"/g) || []).slice(0, 4).join(' '));
+    // RMS の商品編集ページへのリンク (2026-09-04 中原さん要望)。出品済みのカードだけに出す
+    check('RMSリンク: 出品済みのカードに RMS へのリンクが出る',
+      c3.includes('/rms-sku/shops/373343/item/edit/lst-90003') && c3.includes('RMS ↗'), c3.slice(-260));
+    check('RMSリンク: まだ出品していない・失敗したカードには出さない',
+      !c1.includes('item.rms.rakuten.co.jp') && !c2.includes('item.rms.rakuten.co.jp'));
     const c4 = cardOf(90004), c5 = cardOf(90005), c6 = cardOf(90006), c7 = cardOf(90007);
     check('ボード(出品): 結果不明のカードは「やり直す」を出さず、RMS で確認の案内 + 管理者だけの再実行ボタン',
       c4.includes('確認できませんでした') && c4.includes('lst-90004') && !c4.includes('やり直す')
@@ -6095,6 +6132,21 @@ for (const [name, file, data] of renders) {
     inside.slice(-200));
   check('配送費の試算: 選べる配送方法が画面に埋め込まれる',
     inside.includes('ネコポス') && inside.includes('237'));
+}
+
+// ─── 詳細画面の RMS リンク (2026-09-04) ───────────────────────────────────
+{
+  const dh = renderedHtml.get('detail.ejs (rakuten published)') || '';
+  // 「楽天で公開中」バナーの中。モール別の表にも入れてあるが、そちらは楽天を「完了」に
+  // したときだけ出るのでこのフィクスチャでは描かれない
+  const hits = (dh.match(/item\.rms\.rakuten\.co\.jp/g) || []).length;
+  check('RMSリンク: 詳細画面 (公開済み) の商品ページリンクの隣に RMS も出る',
+    hits >= 1 && dh.includes('RMSで編集') && dh.includes('/rms-sku/shops/373343/item/edit/'), 'hits=' + hits);
+  // 未登録の商品には出さない (router は常に URL を渡すが、テンプレ側の
+  // 「公開中」/「楽天=完了」の条件で描かれない)
+  const dh0 = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  check('RMSリンク: 楽天に登録していない商品の詳細画面には出さない',
+    !dh0.includes('item.rms.rakuten.co.jp'));
 }
 
 // ─── 配送方法プルダウンの復元 (2026-09-03 #1152 / Codex R2 low) ───────────

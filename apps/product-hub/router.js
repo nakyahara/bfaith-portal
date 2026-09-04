@@ -59,7 +59,7 @@ import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFaile
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility,
-  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl, rakutenRmsItemUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
   isValidGtin, MODEL_ATTR_NAME, skuAttributeGrid,
@@ -314,6 +314,8 @@ router.get('/detail/:id', (req, res) => {
     backLink: backLinkOf(req.query),
     draft, refs, images, specs, aiOutputs, events, yahoo, imageProduction,
     rakutenItemUrl: rakutenItemPageUrl(draft.ne_code),
+    // RMS の商品編集ページ (2026-09-04 中原さん要望)。店舗ID+商品管理番号だけで開ける
+    rakutenRmsUrl: rakutenRmsItemUrl(draft.ne_code),
     skuImages: db.prepare('SELECT * FROM draft_sku_images WHERE draft_id = ? ORDER BY sku_code').all(draft.id),
     gate: gateReasons(db, draft),
     nextStatuses,
@@ -2396,6 +2398,8 @@ router.get('/board', (req, res) => {
     // 楽天の商品ページ URL は商品コードから決まる (draft_mall_status には保存しない設計)。
     // 出品・展開の列のカードで「商品ページ ↗」を組み立てるために渡す (2026-09-01)
     rakutenItemPageUrl,
+    // RMS の商品編集ページも同じくカードから開けるようにする (2026-09-04 中原さん要望)
+    rakutenRmsItemUrl,
     // 結果不明 (outcome=unknown) の商品を再実行する「確認済みで再実行」は管理者だけに出す
     isAdmin: req.session?.role === 'admin',
   });
