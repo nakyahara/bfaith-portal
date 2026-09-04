@@ -318,6 +318,8 @@ router.get('/detail/:id', (req, res) => {
     backLink: backLinkOf(req.query),
     // NE登録の進みの表示名 (2026-09-04)。カードと詳細で同じ言葉を使う
     NE_STATE_LABELS,
+    // ⑤「セット展開判断」の「作らない」理由の選択肢 (§5.4)。ボードと同じ辞書を使う
+    setDecisionReasons: SET_DECISION_REASONS,
     draft, refs, images, specs, aiOutputs, events, yahoo, imageProduction,
     rakutenItemUrl: rakutenItemPageUrl(draft.ne_code),
     // RMS の商品編集ページ (2026-09-04 中原さん要望)。店舗ID+商品管理番号だけで開ける
