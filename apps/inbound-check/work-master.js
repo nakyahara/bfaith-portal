@@ -221,7 +221,7 @@ export function searchWorkMaster(q, limit = 50) {
     ORDER BY w.商品コード LIMIT ?`).all(like, like.toLowerCase(), like, Math.max(1, Math.min(200, limit)));
 }
 
-const EDIT_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url'];
+const EDIT_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'size_class'];
 
 export function updateWorkMasterRow(key, fields, user, expectVersion) {
   const db = getDB();
@@ -239,6 +239,14 @@ export function updateWorkMasterRow(key, fields, user, expectVersion) {
       v = p.value;
     } else {
       v = String(v ?? '').trim() || null;
+      // 大きさは S / M / L だけ。空は「未登録に戻す」= NULL。小文字でも受ける
+      // (DB の CHECK に落ちる前にここで整える — 空文字をそのまま入れると 500 になる。Codex P4 R1)
+      if (f === 'size_class' && v != null) {
+        v = v.toUpperCase();
+        if (!['S', 'M', 'L'].includes(v)) {
+          return { ok: false, error: 'bad_size', message: '大きさは 大 / 中 / 小 から選んでください' };
+        }
+      }
       // 動画リンクは http(s) のみ (javascript: 等を画面のリンクにしない)
       if (f === 'video_url' && v != null && !/^https?:\/\/\S+$/i.test(v)) {
         return { ok: false, error: 'bad_url', message: '作り方動画は http(s) のリンクを入れてください' };
