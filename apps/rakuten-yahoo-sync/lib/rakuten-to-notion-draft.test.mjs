@@ -142,7 +142,7 @@ test('mapShippingToNotion: 楽天 ID 5 (ネコポス) → ネコポス', () => {
 test('mapShippingToNotion: 楽天 ID 7 (ヤマト運輸宅急便) → ヤマト宅急便', () => {
   assert.equal(mapShippingToNotion('7'), 'ヤマト宅急便');
 });
-test('mapShippingToNotion: 楽天 ID 8 (宅急便50サイズ以上) → ヤマト50サイズ', () => {
+test('mapShippingToNotion: 楽天 ID 8 (宅急便50サイズ以下) → ヤマト50サイズ', () => {
   assert.equal(mapShippingToNotion('8'), 'ヤマト50サイズ');
 });
 test('mapShippingToNotion: 楽天 ID 9 (ゆうパケットパフ) → ゆうパケットパフ', () => {

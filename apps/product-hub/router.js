@@ -66,7 +66,7 @@ import {
 } from './services/rakuten-listing.js';
 // 配送方法の値の意味 (楽天グループID / 画面の複合選択肢) はこの1ファイルが決める
 import {
-  SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS,
+  SHIPPING_METHOD_GROUPS, ALL_SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS,
   toRakutenShippingGroup, shippingSelectValueOf,
 } from './lib/shipping-groups.js';
 // ボードから楽天に出品 (2026-09-01): 画像転送 → 登録 → 後処理 を 1 本に
@@ -338,6 +338,8 @@ router.get('/detail/:id', (req, res) => {
     adResponsibilityText: adResponsibility(),
     shopCategories: listShopCategoriesForDraft(db, draft.id),
     shippingGroups: SHIPPING_METHOD_GROUPS,
+    // 選択肢からは外したが保存済みかもしれない値 (「現在使用不可」) の名前を出すための全表
+    allShippingGroups: ALL_SHIPPING_METHOD_GROUPS,
     yahooOverrideGroups: YAHOO_OVERRIDE_SHIPPING_GROUPS,
     // プルダウンに selected させる値。DB は楽天IDだけを持つので、ヤフー別扱いのときは
     // 複合選択肢のキーへ戻す (逆引きできない組み合わせは楽天IDのまま = 定形外を指す)

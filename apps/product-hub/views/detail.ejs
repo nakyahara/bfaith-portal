@@ -707,6 +707,12 @@ th.attr-unknown { color: #dc2626; }
             <% for (const [gid, gname] of Object.entries(shippingGroups)) { %>
               <option value="<%= gid %>" <%= shipDefault === gid ? 'selected' : '' %>><%= gname %></option>
             <% } %>
+            <%# 選択肢から外した配送方法 (「現在使用不可」) が保存されている商品は、その行を足して
+                選択状態を保つ。足さないと別の値が選ばれた状態で描かれ、保存し直した拍子に
+                配送方法が変わってしまう (2026-09-04 / Codex R3) %>
+            <% if (shipDefault && !shippingGroups[shipDefault] && allShippingGroups[shipDefault]) { %>
+              <option value="<%= shipDefault %>" selected><%= allShippingGroups[shipDefault] %></option>
+            <% } %>
             <%# 複合選択肢: 楽天=定形外のまま Yahoo! だけ別配送 (2026-08-06 中原さん指示) %>
             <% for (const [gid, ov] of Object.entries(yahooOverrideGroups)) { %>
               <option value="<%= gid %>" <%= shipDefault === gid ? 'selected' : '' %>><%= ov.label %></option>
@@ -3549,7 +3555,7 @@ th.attr-unknown { color: #dc2626; }
 
     // ─── 配送方法を差し替えて試算する ───────────────────────────────
     // 楽天の配送方法グループ (8種) と NE の配送方法 (サイズ別) は粒度が違い、
-    // 楽天「宅急便50サイズ以上」は NE の 50〜120 サイズ (479〜945円) のどれにもなる。
+    // 楽天「宅急便50サイズ以下」は NE の 50〜120 サイズ (479〜945円) のどれにもなる。
     // なので選択肢は NE の配送方法にし、楽天のプルダウンを変えたら**候補を上に集める**
     // (絞り込みではなく並べ替え — 対応表は目安で、決めるのは人)
     (function initProfitShipPicker() {
