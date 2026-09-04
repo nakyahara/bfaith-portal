@@ -1726,7 +1726,7 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       if (!(r.status === 400 && r.json.error === 'bad_request')) ok(false, `不正な id "${bad}" は 400 (実際 ${r.status} ${r.json?.error})`);
     }
     ok((await call('POST', '/api/status', { cookie, body: { id: '1.5', worker_id: w1.id, to: 'in_progress', expect_version: 1 } })).status === 400, '不正な id (小数・負数・文字・0・空・2^53 超・指数表記) は 400');
-    ok((await call('POST', '/api/planned', { cookie, body: { id: 'x', worker_id: w1.id } })).status === 400 && (await call('GET', '/api/label-waits?task_id=abc', { cookie })).status === 400, '今日やる・ラベル待ちも id を検査する');
+    ok((await call('POST', '/api/planned', { ...admin, body: { id: 'x', worker_id: w1.id } })).status === 400 && (await call('GET', '/api/label-waits?task_id=abc', { cookie })).status === 400, '今日やる・ラベル待ちも id を検査する');
     const jpeg = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(64, 1)]);
     const mp = multipart({ id: String(task.id), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-http-00001' }, { name: 'a.jpg', mime: 'image/jpeg', data: jpeg });
     const up = await call('POST', '/api/media', { cookie, body: mp.body, headers: mp.headers });
@@ -1802,15 +1802,16 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       const staffHist = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
       const beforeHist = snapHist();
       const closedWrites = [
-        ['/api/planned', { id: closedId, worker_id: w1.id, planned_date: '2099-12-31', expect_version: TD.getTask(closedId).version }],
+        ['/api/planned', { id: closedId, worker_id: w1.id, planned_date: '2099-12-31', expect_version: TD.getTask(closedId).version }, 'admin'],
         ['/api/review-cleared', { id: closedId, worker_id: staffHist.id, pin: '4649', expect_version: TD.getTask(closedId).version }],
         ['/api/label-waits', { task_id: closedId, worker_id: w1.id, fields: { note: '履歴に足す' } }],
         ['/api/master', { id: closedId, code: 'HIST-A', worker_id: w1.id, fields: { note: 'x' }, expect_version: 1 }],
         ['/api/options', { id: closedId, kind: 'material', code: 'HIST-NEW', worker_id: staffHist.id, pin: '4649' }],
         ['/api/external-ready', { id: closedId, ready: true, worker_id: w1.id, expect_version: TD.getTask(closedId).version }],
       ];
-      for (const [p2, body] of closedWrites) {
-        const r = await call('POST', p2, { cookie, body });
+      for (const [p2, body, as] of closedWrites) {
+        // as='admin' = 職員だけの口 (計画) は管理画面から叩いて「終了カードは 409」を見る
+        const r = await call('POST', p2, as === 'admin' ? { ...admin, body } : { cookie, body });
         if (!(r.status === 409 && (r.json.error === 'closed_task' || r.json.error === 'done_card'))) {
           ok(false, `${p2} に終了カードの id を送ると 409 (実際 ${r.status} ${r.json && r.json.error})`);
         }
@@ -2031,6 +2032,27 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         const withPin = await call('POST', '/api/plan', { cookie, body: { id: t1, when: null, expect_version: v(), worker_id: staffP.id, pin: '4649' } });
         ok(withPin.status === 200 && withPin.json.staff_mode.staff === true, 'PIN を添えれば通り、そのまま職員モードに入る');
         ok((await call('GET', '/api/plan', { ...admin })).status === 200, 'ポータル (管理画面) からは職員モードなしで見られる');
+
+        // ⑨ 古い入口 (/api/planned) も同じ関門を通る — 画面から隠しても直接叩けてしまうため (Codex P1 R1)
+        await call('POST', '/api/staff-lock', { cookie });
+        const oldApi = await call('POST', '/api/planned', { cookie, body: { id: t1, planned_date: tomorrow, expect_version: v(), worker_id: memberP.id } });
+        ok(oldApi.status === 403, '古い /api/planned も利用者には通さない (画面から隠しても直接叩ける)');
+        ok(TD.getTask(t1).planned_date == null, '断ったので予定も入っていない');
+        // ⑩ 職員モード中でも、記録に残る「やった人」が職員でなければ通さない
+        await call('POST', '/api/staff-unlock', { cookie, body: { worker_id: staffP.id, pin: '4649' } });
+        const asMember = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'tomorrow', expect_version: v(), worker_id: memberP.id } });
+        ok(asMember.status === 403 && asMember.json.error === 'staff_required',
+          '職員が開けた端末でも、利用者の名前では計画を変えられない (「利用者がやった」記録を作らない)');
+
+        // ⑪ 拠点が未定 (NULL) のまま読める — 一覧・明日の計画・詳細
+        const t3 = mk(9403, '拠点未定のまま', 'not_started');
+        db.prepare('UPDATE f_iroha_tasks SET facility_code = NULL WHERE id = ?').run(t3);
+        const stN = await call('GET', '/api/state', { cookie });
+        const cN = stN.json.cards.find((c) => c.id === t3);
+        ok(stN.status === 200 && cN && cN.facility_code == null, '拠点が未定でも一覧に出る');
+        ok((await call('GET', '/api/plan', { cookie })).status === 200, '拠点が未定のカードがあっても明日の計画が開ける');
+        ok((await call('GET', '/api/task-previews/' + t3, { cookie })).status === 200, '拠点が未定でも詳細が開ける');
+        ok((await call('GET', '/api/history', { cookie })).status === 200, '履歴も開ける');
       }
 
       // 名前のないカードの片づけ (管理者のみ・confirm 必須)
@@ -2471,6 +2493,24 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   ok(S2.neededBoxes(100.5, 10) === null && S2.neededBoxes(100, 10.5) === null, '小数は出さない (箱数を保証できない)');
   ok(S2.neededBoxes(Number.MAX_VALUE, 10) === null && S2.planHours(Number.MAX_VALUE, 2) === null, '桁があふれる値は出さない (Infinity を返さない)');
   ok(S2.planHours(-100, 2) === null && S2.neededBoxes(-100, 10) === null, '負の数は出さない');
+  // ⭐日付は JST。UTC 15:00 = JST 翌日 0:00 の境目を固定の時刻で確かめる (Codex P1 R1)
+  ok(S2.jstToday(new Date('2026-09-04T14:59:59Z')) === '2026-09-04', 'UTC 14:59 はまだ 9/4 (JST 23:59)');
+  ok(S2.jstToday(new Date('2026-09-04T15:00:00Z')) === '2026-09-05', 'UTC 15:00 で 9/5 になる (JST 0:00)');
+  ok(S2.jstTomorrow('2026-09-04') === '2026-09-05' && S2.jstTomorrow('2026-08-31') === '2026-09-01'
+    && S2.jstTomorrow('2026-12-31') === '2027-01-01' && S2.jstTomorrow('2028-02-28') === '2028-02-29',
+    '明日の計算は月末・年末・うるう年でも合う');
+  ok(S2.whenOf('2026-09-05', '2026-09-04') === 'tomorrow' && S2.whenOf('2026-09-04', '2026-09-04') === 'today'
+    && S2.whenOf('2026-09-03', '2026-09-04') === 'over' && S2.whenOf('2026-09-30', '2026-09-04') === 'later'
+    && S2.whenOf(null, '2026-09-04') === null, '今日 / 明日 / やり残し / 先 / 未定 を日付で分ける');
+  ok(S2.whenOf('2026-08-31', '2026-09-01') === 'over' && S2.whenOf('2026-09-01', '2026-08-31') === 'tomorrow',
+    '月をまたいでも「昨日」「明日」を取り違えない');
+  // 大きさ (配送方法で見なす)。大きいほど先にやる
+  ok(S2.sizeOfShipping('定形外郵便').rank === 1 && S2.sizeOfShipping('ヤマト(ネコポス)').rank === 2
+    && S2.sizeOfShipping('ゆうパケットパフ').rank === 3 && S2.sizeOfShipping('ヤマト宅急便【50サイズ専用】').rank === 4
+    && S2.sizeOfShipping('ヤマト(発払い)B2v6').rank === 5, '配送方法から大きさの順が出る (定形外<ネコポス<ゆうパケット<50<発払い)');
+  ok(S2.sizeOfShipping('') === null && S2.sizeOfShipping(null) === null && S2.sizeOfShipping('AES') === null,
+    '分からない配送方法は null (並びは最後・画面は「大きさ 不明」)');
+  ok(S2.sizeOfShipping('宅急便50サイズ以下').rank === 4, '「50サイズ」は 60 の規則に吸われない (上から大きい順に見る)');
 
   // 一覧のカードに乗る
   const t = TD.upsertTaskFromImport({ notion_page_id: 'plan-1', status: 'not_started', destination_id: 9301,

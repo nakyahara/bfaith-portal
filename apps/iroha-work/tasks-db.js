@@ -292,18 +292,20 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
 }
 
 /** 「今日やる」(planned_date = YYYY-MM-DD) / 後日 (null)。未着手・保留のタスクだけ */
-export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = null, workerId = null, workerName = null, deviceLabel = null }) {
+export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
   const db = getDB();
-  const t = getTask(taskId);
-  if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
-  // 版の確認が先 (別の端末が先に終了させていたら、closed_task ではなく競合として最新を返す — Codex PR1 R7)
-  if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
-  if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
   const d = plannedDate == null || plannedDate === '' ? null : String(plannedDate);
   if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) return { ok: false, error: 'bad_request', message: '日付は YYYY-MM-DD で指定してください' };
+  // ⭐確かめるところから書くところまで全部 1 つのトランザクションに (要件 §U-2)
   return db.transaction(() => {
+    if (guard) { const g0 = guard(); if (g0) return g0; }
     const g = appModeGuard();
     if (g) return g;
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+    // 版の確認が先 (別の端末が先に終了させていたら、closed_task ではなく競合として最新を返す — Codex PR1 R7)
+    if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
+    if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
     const r = db.prepare('UPDATE f_iroha_tasks SET planned_date = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
       .run(d, utcNow(), actor, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
@@ -407,20 +409,24 @@ export function setExternalReady({ taskId, ready, expectVersion, actor = null, w
  * 拠点を変えたら進捗が戻った、のような軸をまたぐ副作用を作らない。NULL = 未定に戻す。
  * 職員だけが呼ぶ (権限の判定は router)
  */
-export function setFacility({ taskId, facilityCode, expectVersion, actor = null, workerId = null, workerName = null, deviceLabel = null }) {
+export function setFacility({ taskId, facilityCode, expectVersion, actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
   const db = getDB();
-  const t = getTask(taskId);
-  if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
-  // 版の確認が先 (他の操作と同じ契約 — Codex PR1 R7 / R18)
-  if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
-  if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
+  // 空文字は「未定」として受ける (画面の選択なしがそのまま来る)
   const code = facilityCode == null || facilityCode === '' ? null : String(facilityCode);
-  if (code && !db.prepare('SELECT 1 FROM f_iroha_facilities WHERE code = ? AND active = 1').get(code)) {
-    return { ok: false, error: 'bad_request', message: 'その拠点は選べません' };
-  }
+  // ⭐確かめるところから書くところまで全部 1 つのトランザクションに (要件 §U-2)。
+  //   拠点の有効性まで中で見る — 外で見ると、見た後・書く前に miniPC がその拠点を無効にできる
   return db.transaction(() => {
+    if (guard) { const g0 = guard(); if (g0) return g0; }
     const g = appModeGuard();
     if (g) return g;
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+    // 版の確認が先 (他の操作と同じ契約 — Codex PR1 R7 / R18)
+    if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
+    if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
+    if (code && !db.prepare('SELECT 1 FROM f_iroha_facilities WHERE code = ? AND active = 1').get(code)) {
+      return { ok: false, error: 'bad_request', message: 'その拠点は選べません' };
+    }
     const r = db.prepare('UPDATE f_iroha_tasks SET facility_code = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
       .run(code, utcNow(), actor, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };

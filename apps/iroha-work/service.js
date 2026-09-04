@@ -257,7 +257,6 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       planned_date: r.planned_date,
       today: r.planned_date === today,
       // ⭐3 軸のうちの「いつ」。planned_date (実日付) から出す — today / tomorrow / over (やり残し) / later / null (未定)
-      planned_date: r.planned_date || null,
       when: r.status === 'closed' ? null : whenOf(r.planned_date, today, tomorrow),
       // ⭐大きさ (嵩)。並びに使い、画面には配送方法の名前で出す。分からなければ null
       size_rank: (k && sizes.get(k)) ? sizes.get(k).rank : null,
@@ -474,10 +473,13 @@ export function neededBoxes(qty, unitsPerContainer, zStock = 0, zAllocated = 0) 
  * 大きい物から片づける理由 = 在庫化待ちの荷物が置き場スペースを取るので、大きい物を先に減らすと
  * 在庫化スペースに残っている商品を後から探しやすくなる。**体積の厳密さは要らない** (並び順にだけ使う)
  */
+// ⚠上から順に見る。**大きいものを先に**判定する (「宅急便50サイズ」は 60 の規則に当たらないこと)
 const SIZE_RULES = [
-  { rank: 5, label: '60サイズ',           re: /60\s*サイズ|発払|宅急便コンパクト|レターパック/ },
+  // 発払い = サイズ指定のないヤマト宅急便。当社では 50 サイズに収まらないものに使う = いちばん大きい扱い
+  // (梱包機振り分け apps/packing-dispatch の段階も 定形外1 < ネコポス2 < ゆうパケットパフ3 < 宅急便50=4 < 発払い5)
+  { rank: 5, label: '60サイズ以上',       re: /60\s*サイズ|発払|宅急便コンパクト/ },
   { rank: 4, label: '50サイズ',           re: /50\s*サイズ|宅急便/ },
-  { rank: 3, label: 'ゆうパケットポスト', re: /ゆうパケット|ゆうパック|クリックポスト/ },
+  { rank: 3, label: 'ゆうパケットポスト', re: /ゆうパケット|ゆうパック|クリックポスト|レターパック/ },
   { rank: 2, label: 'ネコポス',           re: /ネコポス|メール便/ },
   { rank: 1, label: '定形外',             re: /定形外|定形/ },
 ];

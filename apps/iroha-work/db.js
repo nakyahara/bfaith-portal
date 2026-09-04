@@ -1032,7 +1032,8 @@ export function startStaffUnlock(deviceId, workerId, ms = STAFF_UNLOCK_MS) {
 export function staffUnlockOf(deviceId) {
   if (deviceId == null) return null;
   const row = getDB().prepare('SELECT staff_unlock_until AS until, staff_unlock_worker_id AS workerId FROM f_iroha_app_devices WHERE id = ?').get(Number(deviceId));
-  if (!row || !row.until || Date.parse(row.until) <= Date.now()) return null;
+  const at = row ? Date.parse(row.until || '') : NaN;
+  if (!Number.isFinite(at) || at <= Date.now()) return null;   // 壊れた期限は「切れている」扱い
   return row;
 }
 /** 職員モードを終える (端末を置いて離れるとき・管理画面から) */

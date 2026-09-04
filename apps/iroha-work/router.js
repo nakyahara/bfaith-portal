@@ -95,7 +95,11 @@ function requireStaffPlan(req) {
   const w = resolveWorker(req);
   if (w.error) return { ok: false, status: 400, body: { ok: false, error: 'worker_required', message: w.error } };
   const mode = staffModeOf(req);
-  if (mode.staff) return { ok: true, worker: w.worker, staffUntil: mode.until };
+  // ⭐職員モード中でも、記録に残る「やった人」が職員でなければ通さない。
+  //   そうしないと、職員が開けた端末で利用者の名前を選び「利用者が計画を決めた」記録になる (Codex P1 R1)
+  if (mode.staff && (mode.via === 'session' || w.worker.worker_type === 'staff')) {
+    return { ok: true, worker: w.worker, staffUntil: mode.until };
+  }
   // 職員モードでない → その場で PIN を受ける
   if (w.worker.worker_type !== 'staff') {
     return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: '明日の計画を決められるのは職員だけです (職員の名前を選び、PINを入れてください)' } };
@@ -474,16 +478,21 @@ function publicTask(t) {
   };
 }
 
-/** 「今日やる / 後日」(アプリ正本のみ) */
+/**
+ * 「今日やる / 後日」(アプリ正本のみ)。⭐P1 で /api/plan に置き換えた古い入口。
+ * 画面が使わなくなったら消す (要件 §W-3) が、**残っている間も同じ職員の関門を通す** —
+ * 画面からボタンを消しても、この口を直接叩けば計画を変えられてしまう (Codex P1 R1)
+ */
 router.post('/api/planned', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
-  const w = resolveWorker(req);
-  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
   const plannedTaskId = parseTaskId(req.body?.id);
   if (plannedTaskId == null) return res.status(400).json(BAD_TASK_ID);
   const r = setPlannedDate({
     taskId: plannedTaskId, plannedDate: req.body?.planned_date ?? null, expectVersion: req.body?.expect_version,
-    actor: `${w.worker.display_name} (いろはアプリ)`, workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+    actor: `${gate.worker.display_name} (いろはアプリ)`, workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req),
+    guard: () => (staffModeOf(req).staff ? null : { ok: false, error: 'staff_required', message: '職員モードが切れました (PINを入れ直してください)' }),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
   res.json({ ok: true, task: publicTask(r.task) });
@@ -534,6 +543,8 @@ router.post('/api/plan', checkOrigin, api((req, res) => {
   const r = setPlannedDate({
     taskId, plannedDate: date, expectVersion: req.body?.expect_version,
     actor: `${gate.worker.display_name} (いろはアプリ)`, workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req),
+    // 書く直前にも職員モードを見る (見てから書くまでに終了・期限切れが起こり得る — 要件 §U-2)
+    guard: () => (staffModeOf(req).staff ? null : { ok: false, error: 'staff_required', message: '職員モードが切れました (PINを入れ直してください)' }),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
   res.json({ ok: true, task: publicTask(r.task), staff_mode: staffModeOf(req) });
@@ -556,6 +567,7 @@ router.post('/api/facility', checkOrigin, api((req, res) => {
   const r = setFacility({
     taskId, facilityCode: code, expectVersion: req.body?.expect_version,
     actor: `${gate.worker.display_name} (いろはアプリ)`, workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req),
+    guard: () => (staffModeOf(req).staff ? null : { ok: false, error: 'staff_required', message: '職員モードが切れました (PINを入れ直してください)' }),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
   res.json({ ok: true, task: publicTask(r.task), staff_mode: staffModeOf(req) });
