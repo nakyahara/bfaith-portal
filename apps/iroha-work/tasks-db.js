@@ -5,13 +5,22 @@
  * 不変条件 (closed には close_reason/closed_at、on_hold には hold_reason …) は書く前に validateTaskInvariants で守る。
  * 状態変更は version の楽観ロック (2 台の iPad が同時に触っても後勝ちで壊さない) + 履歴 (f_iroha_app_events.task_id)。
  */
-import { getDB, startSession, setMetaValue, logEvent } from './db.js';
+import { getDB, startSession, setMetaValue, logEvent, sourceOfTruth } from './db.js';
 import {
   OPEN_STATUSES, CLOSE_REASONS, HOLD_REASONS, DEFAULT_FACILITY,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
 } from './tasks.js';
 
 const utcNow = () => new Date().toISOString();
+
+/**
+ * ⭐アプリ正本のときだけ書ける操作の関門 (Codex PR1 R15)。
+ * ルーターで正本を見てから、更新するまでの間に Notion 正本へ戻されることがある
+ * (正本の切替はカードの version を変えないので、楽観ロックでは気づけない)。
+ * だから**更新と同じトランザクションの中で**もう一度見る。
+ */
+const NOT_APP_MODE = { ok: false, error: 'notion_mode', message: '正本が Notion に戻りました (一覧を更新してください)' };
+const appModeGuard = () => (sourceOfTruth() === 'app' ? null : NOT_APP_MODE);
 const IMPORT_ACTOR_PREFIX = 'import:';
 
 // ─── 参照 ───
@@ -197,7 +206,9 @@ export function listOrphans(limit = 100) {
 
 // ─── 状態変更 ───
 
-const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, hold_reason_required: 400, close_reason_required: 400, not_found: 404, bad_request: 400 };
+const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, hold_reason_required: 400, close_reason_required: 400, not_found: 404, bad_request: 400,
+  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409,
+  notion_mode: 409 };   // 取得後に正本が切り替わった = 競合 (入力不正ではない — Codex PR1 R17)
 export function taskErrorStatus(error) { return HTTP_BY_ERROR[error] || 400; }
 
 /**
@@ -223,6 +234,7 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   if (t.status === 'closed' && !String(reason || '').trim()) {
     return { ok: false, error: 'bad_request', message: '終了したタスクを再開するには理由が必要です' };
   }
+  // 作業中の人がいるまま終了にしない (実際の検査は下のトランザクションの中。ここでは早めに弾くだけ)
   const now = utcNow();
   const next = { ...t, status: to, version: t.version + 1, updated_at: now, updated_by: actor };
   next.hold_reason_code = to === 'on_hold' ? holdReason : null;
@@ -243,15 +255,38 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     if (to === 'closed') return { ok: false, error: 'close_reason_required', message: `終了の理由が必要です (${CLOSE_REASONS.join(' / ')})` };
     return { ok: false, error: 'bad_request', message: problems.join(' / ') };
   }
-  const r = db.prepare(`UPDATE f_iroha_tasks SET status = ?, hold_reason_code = ?, hold_reason_note = ?, close_reason = ?, closed_at = ?, closed_by = ?,
-      started_at = ?, ready_at = ?, cancellation_requested_at = ?, version = ?, updated_at = ?, updated_by = ?
-    WHERE id = ? AND version = ?`)
-    .run(next.status, next.hold_reason_code, next.hold_reason_note, next.close_reason, next.closed_at, next.closed_by,
-      next.started_at, next.ready_at, next.cancellation_requested_at, next.version, next.updated_at, next.updated_by, t.id, t.version);
-  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
-  const cleared = (t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '';
-  safeLogTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: `${to}${closeReason ? ':' + closeReason : ''}${holdReason ? ':' + holdReason : ''}${reason ? ' (' + reason + ')' : ''}${cleared}`,
-    workerId, workerName, deviceLabel, ok: true });
+  // 状態の更新と記録を 1 つのトランザクションで。**終了からのやり直しは、理由が残らないなら再開もしない**
+  // (例外的な操作なので、なぜ再開したかが消えるくらいなら失敗させる — Codex PR1 R3)。
+  // それ以外は今までどおり、記録に失敗しても操作は成立させる (現場を止めない)
+  const reopening = t.status === 'closed';
+  const applied = db.transaction(() => {
+    if (appModeGuard()) return { notApp: true };   // 正本が Notion に戻っていたら書かない (Codex PR1 R15)
+    // 先に version を見る。別の端末が先に変えていたなら「競合」であって「作業中」ではない (Codex PR1 R5)
+    const now2 = db.prepare('SELECT version FROM f_iroha_tasks WHERE id = ?').get(t.id);
+    if (!now2 || now2.version !== t.version) return false;
+    // 終了にするなら、**このトランザクションの中で**作業中の人を数える。
+    // 外で数えると、数えた後・更新する前に別の接続 (miniPC も同じ DB を見る) が作業を始められる (Codex PR1 R4)
+    if (to === 'closed') {
+      const active = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL AND voided_at IS NULL').get(t.id).c;
+      if (active > 0) return { active };
+    }
+    const r = db.prepare(`UPDATE f_iroha_tasks SET status = ?, hold_reason_code = ?, hold_reason_note = ?, close_reason = ?, closed_at = ?, closed_by = ?,
+        started_at = ?, ready_at = ?, cancellation_requested_at = ?, version = ?, updated_at = ?, updated_by = ?
+      WHERE id = ? AND version = ?`)
+      .run(next.status, next.hold_reason_code, next.hold_reason_note, next.close_reason, next.closed_at, next.closed_by,
+        next.started_at, next.ready_at, next.cancellation_requested_at, next.version, next.updated_at, next.updated_by, t.id, t.version);
+    if (r.changes === 0) return false;
+    const cleared = (t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '';
+    const line = { taskId: t.id, action: 'task_status', from: t.status, to: `${to}${closeReason ? ':' + closeReason : ''}${holdReason ? ':' + holdReason : ''}${reason ? ' (' + reason + ')' : ''}${cleared}`,
+      workerId, workerName, deviceLabel, ok: true };
+    if (reopening) logTaskEvent(line); else safeLogTaskEvent(line);
+    return true;
+  }).immediate();
+  if (applied && applied.notApp) return NOT_APP_MODE;
+  if (applied && applied.active) {
+    return { ok: false, error: 'active_sessions', message: `このカードで作業中の人が ${applied.active} 人います。作業を終えてから変えてください` };
+  }
+  if (!applied) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
   return { ok: true, task: getTask(t.id) };
 }
 
@@ -260,14 +295,20 @@ export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = nul
   const db = getDB();
   const t = getTask(taskId);
   if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+  // 版の確認が先 (別の端末が先に終了させていたら、closed_task ではなく競合として最新を返す — Codex PR1 R7)
   if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
+  if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
   const d = plannedDate == null || plannedDate === '' ? null : String(plannedDate);
   if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) return { ok: false, error: 'bad_request', message: '日付は YYYY-MM-DD で指定してください' };
-  const r = db.prepare('UPDATE f_iroha_tasks SET planned_date = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-    .run(d, utcNow(), actor, t.id, t.version);
-  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
-  safeLogTaskEvent({ taskId: t.id, action: 'task_planned', from: t.planned_date, to: d, workerId, workerName, deviceLabel, ok: true });
-  return { ok: true, task: getTask(t.id) };
+  return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    const r = db.prepare('UPDATE f_iroha_tasks SET planned_date = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+      .run(d, utcNow(), actor, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_planned', from: t.planned_date, to: d, workerId, workerName, deviceLabel, ok: true });
+    return { ok: true, task: getTask(t.id) };
+  }).immediate();
 }
 
 /**
@@ -284,8 +325,8 @@ export function listNamelessTasks(limit = 50) {
   return getDB().prepare(`SELECT t.id, t.status, t.close_reason, t.product_code, t.product_name, t.qty, t.destination_id, t.notion_page_id,
       t.created_at, t.created_by, t.updated_by,
       (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id) AS sessions,
-      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id AND s.ended_at IS NULL) AS active_sessions,
-      (SELECT COUNT(*) FROM f_iroha_card_media m WHERE m.task_id = t.id AND m.deleted_at IS NULL) AS media,
+      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id AND s.ended_at IS NULL AND s.voided_at IS NULL) AS active_sessions,
+      (SELECT COUNT(*) FROM f_iroha_card_media m WHERE m.task_id = t.id AND m.deleted_at IS NULL AND m.staged_at IS NULL) AS media,
       (SELECT COUNT(*) FROM f_iroha_label_waits w WHERE w.task_id = t.id) AS label_waits
     FROM f_iroha_tasks t
     WHERE ${STRAY_WHERE}
@@ -315,7 +356,7 @@ export function removeStrayTask({ taskId, actor = null, reason = null }) {
       + n('SELECT COUNT(*) c FROM f_iroha_label_waits WHERE task_id = ?');
     const note = reason || '素性の分からないカード (管理画面から片づけ)';
     // 作業中の人がいるまま閉じない (カードが一覧から消えても記録が開きっぱなしになり、次の開始が塞がる — Codex FB R3)
-    const active = n('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL');
+    const active = n('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL AND voided_at IS NULL');
     if (active > 0) {
       return { ok: false, error: 'active_sessions', message: `このカードで作業中の人が ${active} 人います。作業を終えてから片づけてください` };
     }
@@ -345,14 +386,19 @@ export function setExternalReady({ taskId, ready, expectVersion, actor = null, w
   const db = getDB();
   const t = getTask(taskId);
   if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
-  if (t.status === 'closed') return { ok: false, error: 'done_card', message: '終了したカードは変えられません' };
+  // 版の確認が先 (他の操作と同じ契約 — Codex PR1 R18)
   if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
+  if (t.status === 'closed') return { ok: false, error: 'done_card', message: '終了したカードは変えられません' };
   const v = ready ? 1 : 0;
-  const r = db.prepare('UPDATE f_iroha_tasks SET external_ready = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-    .run(v, utcNow(), actor, t.id, t.version);
-  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
-  safeLogTaskEvent({ taskId: t.id, action: 'task_external_ready', from: String(t.external_ready ? 1 : 0), to: String(v), workerId, workerName, deviceLabel, ok: true });
-  return { ok: true, task: getTask(t.id) };
+  return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    const r = db.prepare('UPDATE f_iroha_tasks SET external_ready = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+      .run(v, utcNow(), actor, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_external_ready', from: String(t.external_ready ? 1 : 0), to: String(v), workerId, workerName, deviceLabel, ok: true });
+    return { ok: true, task: getTask(t.id) };
+  }).immediate();
 }
 
 /** 取込時に推定した状態を職員が確認済みにする */
@@ -360,12 +406,18 @@ export function clearMigrationReview({ taskId, expectVersion, actor = null }) {
   const db = getDB();
   const t = getTask(taskId);
   if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+  // 版の確認が先 (setPlannedDate と同じ契約 — Codex PR1 R7)
   if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
-  const r = db.prepare('UPDATE f_iroha_tasks SET migration_review = 0, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-    .run(utcNow(), actor, t.id, t.version);
-  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
-  safeLogTaskEvent({ taskId: t.id, action: 'task_review_cleared', ok: true });
-  return { ok: true, task: getTask(t.id) };
+  if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
+  return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    const r = db.prepare('UPDATE f_iroha_tasks SET migration_review = 0, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+      .run(utcNow(), actor, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_review_cleared', ok: true });
+    return { ok: true, task: getTask(t.id) };
+  }).immediate();
 }
 
 // ─── 取消 (入荷受付のやり直し → PR-B で呼ぶ。要件 v1.1 §E) ───
@@ -422,11 +474,16 @@ export function resolveCancellation({ taskId, decision, expectVersion, actor = n
     return changeTaskStatus({ taskId: t.id, to: 'closed', expectVersion: t.version, closeReason: 'cancelled', actor, isStaff: true, workerId, workerName, deviceLabel });
   }
   if (decision !== 'continue') return { ok: false, error: 'bad_request', message: 'decision は cancel / continue のどちらかです' };
-  const r = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-    .run(utcNow(), actor, t.id, t.version);
-  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
-  safeLogTaskEvent({ taskId: t.id, action: 'task_cancel_continued', workerId, workerName, deviceLabel, ok: true });
-  return { ok: true, task: getTask(t.id) };
+  // 正本の確認は更新と同じトランザクションの中で (cancel の側は changeTaskStatus が同じ関門を通る — Codex PR1 R16)
+  return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    const r = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+      .run(utcNow(), actor, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_cancel_continued', workerId, workerName, deviceLabel, ok: true });
+    return { ok: true, task: getTask(t.id) };
+  }).immediate();
 }
 
 // ─── ラベル待ち (要件 v1.1 §C) ───
@@ -454,6 +511,11 @@ export function listLabelWaits({ taskId = null, openOnly = true, limit = 500 } =
  */
 export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion = null, actor = null }) {
   const db = getDB();
+  return db.transaction(() => appModeGuard() || upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor })).immediate();
+}
+/** 持ち主の確認と書き込みを同じトランザクションで (終了直後に記録が入らないように — Codex PR1 R4) */
+function upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor }) {
+  const db = getDB();
   const rec = {};
   for (const f of LABEL_FIELDS) {
     if (!(f in fields)) continue;
@@ -470,6 +532,7 @@ export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion 
   if (id == null) {
     const t = getTask(taskId);
     if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+    if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードには記録を足せません (履歴として残ります)' };
     const cols = Object.keys(rec);
     const info = db.prepare(`INSERT INTO f_iroha_label_waits (task_id${cols.map((c) => ', ' + c).join('')}, version, created_at, updated_at)
       VALUES (?${cols.map(() => ', ?').join('')}, 1, ?, ?)`).run(t.id, ...cols.map((c) => rec[c]), now, now);
@@ -478,6 +541,12 @@ export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion 
   }
   const cur = db.prepare('SELECT * FROM f_iroha_label_waits WHERE id = ?').get(Number(id));
   if (!cur) return { ok: false, error: 'not_found', message: 'ラベル待ちの記録が見つかりません' };
+  // その記録が本当にそのカードのものか (別のカードの id を添えて書き換えられないように — Codex PR1 R2)
+  if (taskId != null && Number(cur.task_id) !== Number(taskId)) {
+    return { ok: false, error: 'not_found', message: 'ラベル待ちの記録が見つかりません' };
+  }
+  const owner = getTask(cur.task_id);
+  if (owner && owner.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードの記録は変えられません (履歴として残ります)' };
   if (expectVersion == null || Number(expectVersion) !== cur.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: cur };
   const cols = Object.keys(rec);
   if (cols.length === 0) return { ok: true, row: cur, unchanged: true };
@@ -497,27 +566,51 @@ export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion 
  */
 export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerName = null, deviceLabel = null }) {
   const db = getDB();
-  const ids = [...new Set((Array.isArray(taskIds) ? taskIds : []).map(Number))].filter((n) => Number.isSafeInteger(n) && n > 0);
+  // ⭐選ぶときに見えていた版 ({ id, version }) を必ず添えてもらう。単票の変更と同じ楽観ロックにする
+  //   (入口だけの検査にせず、この関数自体が版なしを受けない — Codex PR1 R7 / R8)
+  const seen = new Set();
+  const items = [];
+  for (const v of (Array.isArray(taskIds) ? taskIds : [])) {
+    if (!v || typeof v !== 'object' || v.version == null) {
+      return { ok: false, error: 'bad_request', message: 'カードごとの版 (version) が必要です。一覧を更新してから選び直してください' };
+    }
+    const id = Number(v.id);
+    const ver = Number(v.version);
+    if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(ver) || ver < 0) {
+      return { ok: false, error: 'bad_request', message: 'カードの指定が不正です' };
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    items.push({ id, version: ver });
+  }
+  const ids = items.map((x) => x.id);
   if (ids.length === 0) return { ok: false, error: 'bad_request', message: 'カードが選ばれていません' };
   if (ids.length > 200) return { ok: false, error: 'bad_request', message: '一度に選べるのは 200 件までです' };
   return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
     const now = utcNow();
     const done = [];
     const skipped = [];
     // 対象は 1 回の SELECT で引く (200 件×3 クエリにしない — Codex PR-C R1 Low)
-    const found = new Map(db.prepare(`SELECT id, status, close_reason, product_name, product_code FROM f_iroha_tasks
+    const found = new Map(db.prepare(`SELECT id, status, close_reason, product_name, product_code, version FROM f_iroha_tasks
       WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids).map((r) => [r.id, r]));
-    const upd = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'stocked', closed_at = ?, closed_by = ?,
+    const updVer = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'stocked', closed_at = ?, closed_by = ?,
         hold_reason_code = NULL, hold_reason_note = NULL, cancellation_requested_at = NULL, ready_at = COALESCE(ready_at, ?),
         version = version + 1, updated_at = ?, updated_by = ?
-      WHERE id = ? AND status = 'ready_for_stocking'`);
-    for (const id of ids) {
+      WHERE id = ? AND status = 'ready_for_stocking' AND version = ?`);
+    for (const { id, version } of items) {
       const t = found.get(id);
       if (!t) { skipped.push({ id, reason: 'not_found' }); continue; }
       const title = t.product_name || t.product_code || `#${id}`;
+      // 版の食い違いが先 (選んでから誰かが動かしていたなら「競合」。already・not_ready・作業中と混同しない — Codex PR1 R8)
+      if (t.version !== version) { skipped.push({ id, reason: 'conflict', title }); continue; }
       if (t.status === 'closed' && t.close_reason === 'stocked') { skipped.push({ id, reason: 'already', title }); continue; }
       if (t.status !== 'ready_for_stocking') { skipped.push({ id, reason: 'not_ready', title, status: t.status }); continue; }
-      if (upd.run(now, actor, now, now, actor, id).changes !== 1) { skipped.push({ id, reason: 'conflict', title }); continue; }
+      if (db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL AND voided_at IS NULL').get(id).c > 0) {
+        skipped.push({ id, reason: 'active_sessions', title }); continue;   // 作業中のまま終了にしない (Codex PR1 R3)
+      }
+      if (updVer.run(now, actor, now, now, actor, id, version).changes !== 1) { skipped.push({ id, reason: 'conflict', title }); continue; }
       // 履歴は握り潰さない (権限のいる操作。記録できないなら全部やり直す — Codex PR-C R1)
       logTaskEvent({ taskId: id, action: 'task_status', from: 'ready_for_stocking', to: 'closed:stocked (まとめて棚入完了)',
         workerId, workerName, deviceLabel, ok: true });
@@ -541,6 +634,8 @@ export function _setStartTaskSessionHook(fn) { startTaskSessionHook = fn; }
 export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotOf = null }) {
   const db = getDB();
   const tx = db.transaction(() => {
+    const g = appModeGuard();   // 見てから書くまでに Notion 正本へ戻ることがある (Codex PR1 R18)
+    if (g) return g;
     const t = getTask(taskId);
     if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
     if (t.status === 'closed') {

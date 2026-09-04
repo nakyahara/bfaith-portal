@@ -574,6 +574,19 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
   ok(!!a1b.deleteToken && a1b.deleteToken !== a1.deleteToken,
     '同じ端末からの再送には削除トークンを発行し直す (応答消失でも削除できる — PR3-R3)');
   const a1c = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('a1c.jpg', jpeg), worker: worker1, deviceId: 22, operationId: 'op-photo-0001' });
+  // ⭐再送でトークンを配り直しても、前のトークンは何世代か生きている (応答の順が入れ替わっても
+  //   撮った本人が消せる — Codex PR1 R11)
+  {
+    const first = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('tok1.jpg', jpeg), worker: worker1, deviceId: 44, operationId: 'op-token-0001' });
+    const t1 = first.deleteToken;
+    let last = null;
+    for (const n of [2, 3, 4]) {
+      last = addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('tok' + n + '.jpg', jpeg), worker: worker1, deviceId: 44, operationId: 'op-token-0001' }).deleteToken;
+    }
+    ok(t1 && last && t1 !== last, '再送のたびに新しいトークンを返す');
+    ok(softDeleteMedia(first.media.id, { deleteToken: t1 }).ok === true, '3 回配り直した後でも、最初のトークンで消せる');
+    ok(softDeleteMedia(first.media.id, { deleteToken: 'wrong-token' }).ok === false, '関係ないトークンでは消せない');
+  }
   ok(a1c.already === true && !a1c.deleteToken, '別端末からの同 operation_id にはトークンを返さない');
   ok(addMedia({ pageId: pMedia.id, kind: 'photo', filePath: tmp('bad.jpg', mp4), worker: worker1, operationId: 'op-bad-000001' }).error === 'bad_file',
     '中身が写真でなければ拒否 (Content-Type を信じない)');
@@ -713,6 +726,26 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
     ok(!(photosByCodeKey().get('prod-m') || []).some(p => p.id === mid), '消えた写真は「前回の完成形」候補から外れる');
     ok(mediaByPage().get(pMedia.id).find(m => m.id === mid).viewable === false, '消えた写真は表示対象外 (viewable=false)');
     ok(markMediaUnavailable(mid, 'again') === false, '二重に印は付けない');
+    // ⭐配信 (GET) から呼ぶ報告は、その場では DB を変えない — キューの回でまとめて印を付ける (Codex PR1 R9)
+    {
+      const { reportMediaUnavailable, flushUnavailableReports } = await import('../apps/iroha-work/media.js');
+      const other = getDB().prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-photo-0002'").get().id;
+      reportMediaUnavailable(other, 'Drive 404');
+      ok(getDB().prepare('SELECT unavailable_at FROM f_iroha_card_media WHERE id = ?').get(other).unavailable_at == null,
+        '報告しただけでは印は付かない (読むだけの画面で写真を開いても DB が変わらない)');
+      ok(flushUnavailableReports() === 1, 'キューの回で印を付ける');
+      ok(getDB().prepare('SELECT unavailable_at FROM f_iroha_card_media WHERE id = ?').get(other).unavailable_at != null, '印が付いている');
+      ok(flushUnavailableReports() === 0, '溜まった報告は一度で片づく');
+      // 報告してから反映するまでに送り直されていたら、新しい実体に古い 404 を貼らない (Codex PR1 R13)
+      getDB().prepare('UPDATE f_iroha_card_media SET unavailable_at = NULL, error = NULL, drive_file_id = ? WHERE id = ?')
+        .run('f-old-file', other);
+      reportMediaUnavailable(other, 'Drive 404', 'f-old-file');
+      getDB().prepare('UPDATE f_iroha_card_media SET drive_file_id = ? WHERE id = ?').run('f-new-file', other);
+      ok(flushUnavailableReports() === 0, '送り直された後なら印を付けない');
+      ok(getDB().prepare('SELECT unavailable_at FROM f_iroha_card_media WHERE id = ?').get(other).unavailable_at == null,
+        '新しい実体に古い 404 は貼られない');
+      getDB().prepare('UPDATE f_iroha_card_media SET unavailable_at = NULL, error = NULL WHERE id = ?').run(other);
+    }
     // 印の解除は Drive で実在を確かめてから (未検証のまま候補へ戻さない — Codex R2 #3)
     const { recheckUnavailable, _setDriveExists, etagMatches, ifRangeMatches, singleRange } = await import('../apps/iroha-work/media.js');
     _setDriveExists(async () => false);
@@ -950,6 +983,9 @@ console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動�
 }
 
 console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行・タスク操作');
+// ⭐タスクの書き換えは「アプリ正本のときだけ」通る (更新と同じトランザクションで見る — Codex PR1 R15)。
+//   この節は正本をアプリにして試す (終わりで既定に戻す)
+{ const { setMetaValue: sm17 } = await import('../apps/iroha-work/db.js'); sm17('source_of_truth', 'app'); }
 {
   const T = await import('../apps/iroha-work/tasks.js');
   const TD = await import('../apps/iroha-work/tasks-db.js');
@@ -1097,8 +1133,9 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   ok(fkErr && /FOREIGN KEY/.test(fkErr.message), '拠点は f_iroha_facilities に無い値を入れられない (FK)');
   ok(TD.clearMigrationReview({ taskId: tA2.id, expectVersion: 0 }).error === 'conflict', '要確認クリアも version 競合を返す');
   ok(getDB().prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_status'").get(tA2.id).c >= 6, '状態変更は履歴に残る (task_id つき)');
-  const planned = TD.setPlannedDate({ taskId: tA2.id, plannedDate: '2026-09-04', expectVersion: reopened.task.version });
-  ok(planned.ok && planned.task.planned_date === '2026-09-04' && TD.setPlannedDate({ taskId: tA2.id, plannedDate: '9/4', expectVersion: planned.task.version }).error === 'bad_request', '「今日やる」= planned_date (形式検証)');
+  // ⚠固定日付を「今日」になり得る日にすると、その日に後段の「今日やるが先頭」の検証が壊れる (2026-09-04 に実際に壊れた) → 来ない日付にする
+  const planned = TD.setPlannedDate({ taskId: tA2.id, plannedDate: '2099-12-31', expectVersion: reopened.task.version });
+  ok(planned.ok && planned.task.planned_date === '2099-12-31' && TD.setPlannedDate({ taskId: tA2.id, plannedDate: '9/4', expectVersion: planned.task.version }).error === 'bad_request', '「今日やる」= planned_date (形式検証)');
 
   // 取消: 未着手・実績なしは自動終了 / 実績ありは要確認 → 職員が判断
   const tB = TD.getTaskByPageId(pM2.id);   // 作業中・作業時間あり
@@ -1198,7 +1235,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
   const T = await import('../apps/iroha-work/tasks.js');
   const TD = await import('../apps/iroha-work/tasks-db.js');
   const S = await import('../apps/iroha-work/service.js');
-  const { addMedia, mediaByTask, _setDriveUpload, processMediaQueue } = await import('../apps/iroha-work/media.js');
+  const { addMedia, mediaByTask, moveStoredFile, promoteStagedMedia, sweepStagedMedia, countActiveMedia, _setDriveUpload, processMediaQueue } = await import('../apps/iroha-work/media.js');
   const db = getDB();
   const w1 = listIrohaWorkers(true).find(w => w.display_name === 'やまだ');
   const w2 = listIrohaWorkers(true).find(w => w.display_name === 'すずき');
@@ -1266,6 +1303,138 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
   const tmp2 = (name) => { const p = path.join(process.env.DATA_DIR, name); fs.writeFileSync(p, jpeg); return p; };
   const m1 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('a1b1.jpg'), worker: getIrohaWorker(w1.id), operationId: 'op-a1b-0001' });
   ok(m1.ok && mediaByTask().get(tOpen).length === 1, 'task に写真が付く');
+  // 取り消した送信は、遅れて届いても成立させない (通信が切れている間に「やめる」が通っている — Codex PR1 R18)
+  {
+    const { recordMediaCancel, sweepMediaCancels } = await import('../apps/iroha-work/media.js');
+    ok(recordMediaCancel('op-cancel-0001', { deviceId: 31 }) === true, '取り消しを控える (行が無くても)');
+    const late = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('late.jpg'),
+      worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-cancel-0001' });
+    ok(late.ok === false && late.error === 'cancelled', '遅れて届いた元の送信は成立しない');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_card_media WHERE operation_id = 'op-cancel-0001'").get().c === 0, '写真も増えていない');
+    ok(sweepMediaCancels(0) >= 1, '古い控えは片づく');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_media_cancels").get().c === 0, '控えは残らない');
+  }
+  // ⭐実体を置く前に落ちた行 (staged_at あり) は「無いもの」として扱い、再送で置き直せる (Codex PR1 R7)
+  const { setMetaValue: setMeta18 } = await import('../apps/iroha-work/db.js');
+  setMeta18('source_of_truth', 'app');   // 写真の公開は「そのカードにいま書けるとき」だけ (Codex PR1 R10)
+  {
+    const st = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('stage1.jpg'),
+      worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-stage-0001', deferMove: true });
+    ok(st.ok && st.move && !fs.existsSync(st.move.to), '実体はまだ置かれていない (トランザクションの外で置く)');
+    ok(mediaByTask().get(tOpen).length === 1, '置く前の行は一覧に出ない');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_card_media WHERE staged_at IS NOT NULL").get().c === 1, '印 (staged_at) は付いている');
+    const other = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('stage9.jpg'),
+      worker: getIrohaWorker(w1.id), deviceId: 99, operationId: 'op-stage-0001', deferMove: true });
+    ok(other.ok === false && other.error === 'not_ready', '別の端末からの同じ送信では置き直せない (乗っ取り防止)');
+    const again = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('stage2.jpg'),
+      worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-stage-0001', deferMove: true });
+    ok(again.ok && again.already && again.media.id === st.media.id && again.move, '撮った端末からの再送は同じ行を返し、置き直す指示が付く');
+    ok(again.claim && again.claim !== st.claim, '札は要求ごとに新しくなる (古い要求は公開できない)');
+    ok(again.stale && again.stale === st.move.to, '前の札で置いたファイルを片づける指示が付く (置き場所が変わるため)');
+    moveStoredFile(again.move);
+    ok(promoteStagedMedia(again.media.id, again.move.to, { claim: st.claim }).reason === 'taken', '古い札では公開できない');
+    const promoted = promoteStagedMedia(again.media.id, again.move.to, { claim: again.claim });
+    ok(promoted.ok && fs.existsSync(again.move.to), '実体を置いてから公開する');
+    ok(mediaByTask().get(tOpen).length === 2, '置いてはじめて一覧に出る');
+    const twice = promoteStagedMedia(again.media.id, again.move.to, { claim: again.claim });
+    ok(twice.ok === false && twice.reason === 'taken' && twice.media, '二重に公開はせず、公開済みの行を返す');
+    // ⭐実体を置いている間にカードが終わっていたら公開しない (Codex PR1 R10)
+    {
+      const st2 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('gate1.jpg'),
+        worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-gate-00001', deferMove: true });
+      moveStoredFile(st2.move);
+      setMeta18('source_of_truth', 'notion');
+      ok(promoteStagedMedia(st2.media.id, st2.move.to, { claim: st2.claim }).reason === 'not_writable',
+        '正本が Notion に戻っていたら公開しない (下見のカードに写真が増えない)');
+      setMeta18('source_of_truth', 'app');
+      const wasStatus = TD.getTask(tOpen).status;
+      db.prepare("UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'stocked', closed_at = ?, closed_by = 'test' WHERE id = ?").run(new Date().toISOString(), tOpen);
+      ok(promoteStagedMedia(st2.media.id, st2.move.to, { claim: st2.claim }).reason === 'not_writable',
+        '終了したカードにも公開しない (履歴の写真が後から増えない)');
+      db.prepare('UPDATE f_iroha_tasks SET status = ?, close_reason = NULL, closed_at = NULL, closed_by = NULL WHERE id = ?').run(wasStatus, tOpen);
+      db.prepare("DELETE FROM f_iroha_card_media WHERE operation_id = 'op-gate-00001'").run();
+      try { fs.unlinkSync(st2.move.to); } catch { /* 無ければよい */ }
+      // 関門は Notion のカードに紐づく写真にも効く (page_id だけの行 — Codex PR1 R11)
+      const { cardWriteBlockReason } = await import('../apps/iroha-work/media.js');
+      ok(cardWriteBlockReason({ task_id: tOpen, page_id: null }) === null, 'アプリ正本の未終了カードなら書ける');
+      ok(cardWriteBlockReason({ task_id: 999999, page_id: null }) === 'card_required', '無いカードには書けない');
+      ok(cardWriteBlockReason({ task_id: null, page_id: 'pg-any' }) === 'notion_card_retired',
+        'アプリ正本になったら、Notion のカードに紐づく写真はもう変えられない');
+      // 置いている間に枠が埋まったら公開しない (Codex PR1 R11)
+      const st3 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('cap1.jpg'),
+        worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-cap-000001', deferMove: true });
+      moveStoredFile(st3.move);
+      const insPub = db.prepare(`INSERT INTO f_iroha_card_media (operation_id, task_id, product_code, kind, mime, size,
+          drive_file_id, status, worker_id, worker_name, created_at)
+        VALUES (?, ?, 'PROD-A', 'photo', 'image/jpeg', 100, ?, 'uploaded', ?, 'やまだ', ?)`);
+      insPub.run('op-cap-fill01', tOpen, 'f-cap-1', w1.id, new Date().toISOString());   // これで公開済みが上限の 3 枚
+      ok(mediaByTask().get(tOpen).length === 3, '公開済みが 3 枚 (上限) になった');
+      ok(promoteStagedMedia(st3.media.id, st3.move.to, { claim: st3.claim }).reason === 'cap_reached',
+        '枠が埋まっていれば公開しない (後から上限を超えない)');
+      db.prepare("DELETE FROM f_iroha_card_media WHERE operation_id IN ('op-cap-000001','op-cap-fill01')").run();
+      try { fs.unlinkSync(st3.move.to); } catch { /* 無ければよい */ }
+      ok(mediaByTask().get(tOpen).length === 2, '片づけて元に戻す');
+      // 消された staging 行は公開しない (職員が管理画面から消した後に実体を結びつけない — Codex PR1 R12)
+      {
+        const st4 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('del1.jpg'),
+          worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-staged-del1', deferMove: true });
+        moveStoredFile(st4.move);
+        db.prepare('UPDATE f_iroha_card_media SET deleted_at = ?, deleted_by = ? WHERE id = ?')
+          .run(new Date().toISOString(), 'test', st4.media.id);
+        ok(promoteStagedMedia(st4.media.id, st4.move.to, { claim: st4.claim }).reason === 'gone',
+          '消された行は公開できない');
+        db.prepare("UPDATE f_iroha_card_media SET staged_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(st4.media.id);
+        const sw0 = sweepStagedMedia();
+        ok(sw0.promoted === 0 && sw0.dropped === 0, '片づけの対象にもしない (消された行はそのまま履歴に残す)');
+        ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media WHERE id = ?').get(st4.media.id).c === 1,
+          '行そのものは消さない (論理削除の記録を残す)');
+        // 消された行の実体は、十分に古くなってから片づける (行は残したまま)
+        const { sweepOrphanFiles } = await import('../apps/iroha-work/media.js');
+        ok(sweepOrphanFiles().removed === 0, '新しいファイルには触らない (送信中・再送中を巻き込まない)');
+        ok(fs.existsSync(st4.move.to), 'まだ実体は残っている');
+        const old = new Date(Date.now() - 48 * 3600 * 1000);
+        fs.utimesSync(st4.move.to, old, old);
+        ok(sweepOrphanFiles().removed === 1 && !fs.existsSync(st4.move.to),
+          '十分に古くなれば、消された行の実体は片づける');
+        // 受信中の一時領域 (MEDIA_DIR/tmp) に取り残されたファイルも片づける (Codex PR1 R16)
+        {
+          const tmpDir = path.join(process.env.DATA_DIR, 'iroha-media', 'tmp');
+          fs.mkdirSync(tmpDir, { recursive: true });
+          const leftover = path.join(tmpDir, 'multer-leftover');
+          fs.writeFileSync(leftover, jpeg);
+          ok(sweepOrphanFiles().removed === 0 && fs.existsSync(leftover), '受信中のものには触らない');
+          fs.utimesSync(leftover, old, old);
+          ok(sweepOrphanFiles().removed === 1 && !fs.existsSync(leftover), '十分に古くなれば片づける');
+        }
+        db.prepare('DELETE FROM f_iroha_card_media WHERE id = ?').run(st4.media.id);
+      }
+    }
+    // 後の検査 (「前回の完成形」の枚数) に影響させないよう片づける
+    db.prepare('DELETE FROM f_iroha_card_media WHERE operation_id = ?').run('op-stage-0001');
+    try { fs.unlinkSync(again.move.to); } catch { /* 無ければよい */ }
+    ok(mediaByTask().get(tOpen).length === 1, '片づけたので元の 1 枚に戻る');
+  }
+  // ⭐置き去りの staging 行を片づける (iPad の再読込などで再送が来なくなった分 — Codex PR1 R8)
+  {
+    const before = countActiveMedia({ taskId: tOpen }, 'photo');
+    const g1 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('sweep1.jpg'),
+      worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-sweep-0001', deferMove: true });
+    const g2 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('sweep2.jpg'),
+      worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-sweep-0002', deferMove: true });
+    ok(countActiveMedia({ taskId: tOpen }, 'photo') === before + 2, '送信中の行は枚数上限に数える (並行送信で上限を超えない)');
+    moveStoredFile(g2.move);   // 実体は置けたが、公開の前に落ちた
+    db.prepare("UPDATE f_iroha_card_media SET staged_at = ? WHERE operation_id IN ('op-sweep-0001','op-sweep-0002')")
+      .run('2000-01-01T00:00:00.000Z');
+    ok(countActiveMedia({ taskId: tOpen }, 'photo') === before, '置き去りになった古い行は枠に数えない (sweep 待ちで詰まらせない)');
+    const sw = sweepStagedMedia();
+    ok(sw.promoted === 1 && sw.dropped === 1, '実体が置けているものは公開し、無いものは破棄する');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_card_media WHERE operation_id = 'op-sweep-0001'").get().c === 0, '実体の無い行は残らない');
+    ok(mediaByTask().get(tOpen).some((m) => m.id === g2.media.id), '実体のある行は一覧に出る');
+    db.prepare("DELETE FROM f_iroha_card_media WHERE operation_id = 'op-sweep-0002'").run();
+    try { fs.unlinkSync(g2.move.to); } catch { /* 無ければよい */ }
+    ok(mediaByTask().get(tOpen).length === 1, '片づけて元に戻す');
+  }
+  setMeta18('source_of_truth', null);   // 正本は既定 (Notion) に戻す
   await processMediaQueue();
   const tNext = mk({ page: 'a1b-next', code: 'PROD-A', name: '次の入荷 (同じ商品)', dest: 8805 });
   clearEnrichCache();
@@ -1279,6 +1448,8 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
   setMetaValue('source_of_truth', 'app');
   ok(getMeta('source_of_truth') === 'app', '切替は meta に持つ (再起動しても続く)');
   setMetaValue('source_of_truth', null);
+  // ここから先はタスクを書き換える (アプリ正本のときだけ通る — Codex PR1 R15)。節の終わりで戻す
+  setMetaValue('source_of_truth', 'app');
 
   // 作業開始 (アプリ正本) は 1 トランザクション: 終了カードでは始めない・未着手→作業中が同時に確定 (Codex A1b R1 #2)
   {
@@ -1386,7 +1557,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       && !/page_id\s+TEXT NOT NULL/.test(newS), '作業時間: 新しい定義 (task_id FK・CHECK・page_id NULL 可) で作り直す');
     ok(/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/.test(newM) && /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/.test(newM)
       && /operation_id\s+TEXT NOT NULL UNIQUE/.test(newM), '写真: 同上 (UNIQUE も残る)');
-    const strip = (j) => JSON.stringify(JSON.parse(j).map((r) => { const { task_id, ...rest } = r; return rest; }));
+    const strip = (j) => JSON.stringify(JSON.parse(j).map((r) => { const { task_id, staged_at, staged_claim, delete_token_hash_prev, delete_token_hashes, ...rest } = r; return rest; }));
     ok(strip(rowsOf('f_iroha_work_sessions')) === pageRowsS && strip(rowsOf('f_iroha_card_media')) === pageRowsM, '行 (id・全列) はそのまま。task_id は NULL');
     ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE type='index' AND name IN ('idx_iroha_sessions_task','idx_iroha_media_task','idx_iroha_sessions_page','idx_iroha_media_page')").get().c === 4, '索引 4 本が作り直される');
     let bothNull = null;
@@ -1409,7 +1580,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     // (b) 途中の版 (page_id NULL 可・task_id あり・CHECK/FK 無し) — 全行 (task の行も) そのまま保って作り直す
     const allS = rowsOf('f_iroha_work_sessions'), allM = rowsOf('f_iroha_card_media');
     const MID_SESSIONS = OLD_SESSIONS.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER');
-    const MID_MEDIA = OLD_MEDIA.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER');
+    const MID_MEDIA = OLD_MEDIA.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER').replace('unavailable_at TEXT)', 'unavailable_at TEXT, staged_at TEXT, staged_claim TEXT, delete_token_hash_prev TEXT, delete_token_hashes TEXT)');
     const allColsS = db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().map((c) => c.name).join(', ');
     const allColsM = db.prepare('PRAGMA table_info(f_iroha_card_media)').all().map((c) => c.name).join(', ');
     db.pragma('foreign_keys = OFF');
@@ -1453,6 +1624,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
   }
 }
 
+setMetaValue('source_of_truth', null);   // [18] で立てた正本を既定 (Notion) に戻す
 console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 → 終了 → 状態変更 → 写真 (Notion API を呼ばない)');
 {
   const express = (await import('express')).default;
@@ -1594,6 +1766,106 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     ok(card2 && card2.media?.length === 1 && card2.media[0].id === up.json.media.id, '一覧の詳細に写真が出る');
     const del = await call('POST', `/api/media/${up.json.media.id}/delete`, { cookie, body: { delete_token: up.json.deleteToken, worker_id: w1.id } });
     ok(del.status === 200 && del.json.ok, '削除 (削除トークン)');
+    // 履歴 (終了したカード) は読むだけ: 写真を足せない・消せない (アプリ正本でも。PR1 の境界)
+    {
+      const closedId = TD.upsertTaskFromImport({ notion_page_id: 'hist-media', status: 'closed', close_reason: 'stocked',
+        closed_at: '2026-09-04T00:00:00Z', destination_id: 8899, product_code: 'HIST-A', product_name: '終了したカード', qty: 1,
+        facility_code: 'iroha' }, { batchId: 'test-hist' }).id;
+      const mpc = multipart({ id: String(closedId), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-hist-000001' },
+        { name: 'h.jpg', mime: 'image/jpeg', data: jpeg });
+      const addClosed = await call('POST', '/api/media', { cookie, body: mpc.body, headers: mpc.headers });
+      ok(addClosed.status === 409 && addClosed.json.error === 'closed_task', '終了したカードには写真を足せない');
+      ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_card_media WHERE operation_id = 'op-hist-000001'").get().c === 0, '行も残らない');
+      // 終了前に撮ってあった写真は、終了後は消せない (履歴として残る)
+      db.prepare(`INSERT INTO f_iroha_card_media (operation_id, task_id, product_code, kind, mime, size, drive_file_id, drive_url,
+          status, worker_id, worker_name, created_at, uploaded_at, delete_token_hash)
+        VALUES ('op-hist-old001', ?, 'HIST-A', 'photo', 'image/jpeg', 100, 'f-hist-old', 'https://drive/hist-old',
+          'uploaded', ?, 'やまだ', ?, ?, 'hash-hist')`).run(closedId, w1.id, new Date().toISOString(), new Date().toISOString());
+      const oldId = db.prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-hist-old001'").get().id;
+      const delClosed = await call('POST', '/api/media/' + oldId + '/delete', { ...admin, body: {} });
+      ok(delClosed.status === 409 && delClosed.json.error === 'closed_task', '終了したカードの写真は消せない');
+      ok(db.prepare('SELECT deleted_at FROM f_iroha_card_media WHERE id = ?').get(oldId).deleted_at == null, '写真は残る');
+      const pv = await call('GET', '/api/task-previews/' + closedId, { cookie });
+      ok(pv.status === 200 && pv.json.ok && pv.json.card.status === 'closed' && pv.json.capabilities.length === 0,
+        '終了したカードの詳細は読むだけで開ける');
+      // 写真だけでなく、タスクに紐づく書き込み口はすべて断る (Codex PR1 R2 重大)
+      const snapHist = () => JSON.stringify([
+        db.prepare('SELECT * FROM f_iroha_tasks WHERE id = ?').get(closedId),
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_label_waits WHERE task_id = ?').get(closedId).c,
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id = ?').get(closedId).c,
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c,
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_work_master').get().c,
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(closedId).c,
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ?').get(closedId).c,
+      ]);
+      const staffHist = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+      const beforeHist = snapHist();
+      const closedWrites = [
+        ['/api/planned', { id: closedId, worker_id: w1.id, planned_date: '2099-12-31', expect_version: TD.getTask(closedId).version }],
+        ['/api/review-cleared', { id: closedId, worker_id: staffHist.id, pin: '4649', expect_version: TD.getTask(closedId).version }],
+        ['/api/label-waits', { task_id: closedId, worker_id: w1.id, fields: { note: '履歴に足す' } }],
+        ['/api/master', { id: closedId, code: 'HIST-A', worker_id: w1.id, fields: { note: 'x' }, expect_version: 1 }],
+        ['/api/options', { id: closedId, kind: 'material', code: 'HIST-NEW', worker_id: staffHist.id, pin: '4649' }],
+        ['/api/external-ready', { id: closedId, ready: true, worker_id: w1.id, expect_version: TD.getTask(closedId).version }],
+      ];
+      for (const [p2, body] of closedWrites) {
+        const r = await call('POST', p2, { cookie, body });
+        if (!(r.status === 409 && (r.json.error === 'closed_task' || r.json.error === 'done_card'))) {
+          ok(false, `${p2} に終了カードの id を送ると 409 (実際 ${r.status} ${r.json && r.json.error})`);
+        }
+      }
+      ok(true, '今日やる・確認ずみ・ラベル待ち・作業のやり方・候補・外部準備OK に終了カードの id を送ると 409');
+      // 終了カードでは作業を止められない (記録も足さない)
+      const stopClosed = await call('POST', '/api/sessions/stop', { cookie, body: { id: closedId, worker_id: w1.id, session_id: 1, reason: 'done' } });
+      ok(stopClosed.status === 409 && stopClosed.json.error === 'closed_task', '終了したカードでは作業を止められない');
+      // カードの指定を省いても、作業のやり方・候補は登録できない (検査を素通りできない)
+      for (const p3 of ['/api/master', '/api/options']) {
+        for (const body of [{ kind: 'material', code: 'X1', worker_id: staffHist.id, pin: '4649' },
+          { id: '', kind: 'material', code: 'X2', worker_id: staffHist.id, pin: '4649' },
+          { id: 'zzz', kind: 'material', code: 'X3', worker_id: staffHist.id, pin: '4649' },
+          { id: 999999, kind: 'material', code: 'X4', worker_id: staffHist.id, pin: '4649' }]) {
+          const r = await call('POST', p3, { cookie, body });
+          if (!(r.status === 409 && (r.json.error === 'card_required' || r.json.error === 'closed_task'))) {
+            ok(false, `${p3} は カードの指定 ${JSON.stringify(body.id)} を断る (実際 ${r.status} ${r.json && r.json.error})`);
+          }
+        }
+      }
+      ok(true, '作業のやり方・候補の登録は、書けるカードを添えないと通らない (省略・空・でたらめ・無い id)');
+      // 添えたカードと、書き換える商品が同じでなければ通さない
+      // (適当な未終了カードを添えて、下見・履歴にしかない別商品のやり方を書き換えられないように — Codex PR1 R4)
+      {
+        const other = TD.upsertTaskFromImport({ notion_page_id: 'mismatch-open', status: 'not_started', destination_id: 8896,
+          product_code: 'PROD-NEW', product_name: '開いているカード', qty: 1, facility_code: 'iroha' }, { batchId: 'test-mis' }).id;
+        const beforeMaster = db.prepare("SELECT COUNT(*) c FROM f_iroha_work_master WHERE code_key = 'hist-a'").get().c;
+        const bad = await call('POST', '/api/master', { cookie, body: { id: other, code: 'HIST-A',
+          fields: { note: 'よそのカードから' }, worker_id: staffHist.id, pin: '4649', expect_version: 1 } });
+        ok(bad.status === 409 && bad.json.error === 'card_mismatch', 'カードとちがう商品の作業のやり方は書き換えられない');
+        ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_master WHERE code_key = 'hist-a'").get().c === beforeMaster,
+          'その商品のマスタは 1 行も増えていない');
+        const mv = db.prepare("SELECT version FROM f_iroha_work_master WHERE code_key = 'prod-new'").get();
+        const good = await call('POST', '/api/master', { cookie, body: { id: other, code: 'PROD-NEW',
+          fields: { note: '自分のカードから' }, worker_id: staffHist.id, pin: '4649', expect_version: mv ? mv.version : 1 } });
+        ok(good.status === 200 && good.json.ok, '自分のカードの商品なら通る (商品マスタにある商品)');
+      }
+      ok(snapHist() === beforeHist, 'ここまでで終了カードの記録は 1 行も変わっていない');
+      ok(snapHist() === beforeHist, '終了カードの id をどの書き込み API に送っても DB が変わらない');
+      // ラベル待ちの記録は「そのカードのもの」でなければ書き換えられない (別カードの id を添えても通らない)
+      {
+        const openTask = TD.upsertTaskFromImport({ notion_page_id: 'lw-owner', status: 'on_hold', hold_reason_code: 'label_shortage',
+          destination_id: 8898, product_code: 'LW-A', product_name: 'ラベル待ちの持ち主', qty: 1, facility_code: 'iroha' }, { batchId: 'test-lw' }).id;
+        const otherTask = TD.upsertTaskFromImport({ notion_page_id: 'lw-other', status: 'not_started',
+          destination_id: 8897, product_code: 'LW-B', product_name: 'よその card', qty: 1, facility_code: 'iroha' }, { batchId: 'test-lw' }).id;
+        const lw = TD.upsertLabelWait({ taskId: openTask, fields: { occurred_on: '2026-09-04', qty: 1 } });
+        ok(lw.ok, '前提: ラベル待ちを 1 件登録');
+        const stolen = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: otherTask, worker_id: w1.id,
+          expect_version: lw.row.version, fields: { note: 'よそから書き換え' } } });
+        ok(stolen.status === 404 && stolen.json.error === 'not_found', '別のカードの id を添えた更新は通らない');
+        ok(db.prepare('SELECT note FROM f_iroha_label_waits WHERE id = ?').get(lw.row.id).note == null, '中身も変わらない');
+        const mine = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: openTask, worker_id: w1.id,
+          expect_version: lw.row.version, fields: { note: '正しい持ち主から' } } });
+        ok(mine.status === 200 && mine.json.ok, '正しいカードからは更新できる');
+      }
+    }
     // まとめて棚入完了 (PR-C): 棚入待ちのものだけ・職員だけ
     {
       const mk = (dest, name, status) => TD.upsertTaskFromImport({ notion_page_id: `bulk-${dest}`, status, destination_id: dest,
@@ -1604,12 +1876,18 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       const wip = mk(9103, '作業中', 'in_progress');
       const already = mk(9104, 'もう棚入完了', 'closed');
       const staff = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
-      ok((await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [r1], worker_id: w1.id } })).status === 403, '利用者は まとめて棚入完了 にできない (職員のみ)');
-      ok((await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [r1], worker_id: staff.id, pin: '0000' } })).status === 403, '職員でも PIN が違えば拒否');
+      const bv = (id) => ({ id, version: TD.getTask(id) ? TD.getTask(id).version : 0 });   // 画面が添える「選んだときの版」
+      ok((await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [bv(r1)], worker_id: w1.id } })).status === 403, '利用者は まとめて棚入完了 にできない (職員のみ)');
+      ok((await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [bv(r1)], worker_id: staff.id, pin: '0000' } })).status === 403, '職員でも PIN が違えば拒否');
       ok((await call('POST', '/api/bulk-stocked', { ...admin, body: { ids: [], worker_id: w1.id } })).json.error === 'bad_request', '1 件も選んでいなければ bad_request');
-      ok((await call('POST', '/api/bulk-stocked', { ...admin, body: { ids: [r1, '1.5'], worker_id: w1.id } })).status === 400, '不正な id が混ざっていれば 400 (何もしない)');
+      ok((await call('POST', '/api/bulk-stocked', { ...admin, body: { ids: [bv(r1), { id: '1.5', version: 1 }], worker_id: w1.id } })).status === 400, '不正な id が混ざっていれば 400 (何もしない)');
+      ok((await call('POST', '/api/bulk-stocked', { ...admin, body: { ids: [r1], worker_id: w1.id } })).status === 400, '版を添えない古い画面からの要求は 400 (何もしない)');
+      // 選んでから別の端末が変えていた分は飛ばす (楽観ロック — Codex PR1 R7)
+      ok((await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [{ id: r1, version: TD.getTask(r1).version + 5 }],
+        worker_id: staff.id, pin: '4649' } })).json.skipped[0].reason === 'conflict', '選んだときと版が違えば飛ばす');
+      ok(TD.getTask(r1).status === 'ready_for_stocking', '飛ばした分は状態も変わらない');
       ok(TD.getTask(r1).status === 'ready_for_stocking', '拒否されたカードは棚入待ちのまま');
-      const bulk = await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [r1, r2, wip, already, 999999], worker_id: staff.id, pin: '4649' } });
+      const bulk = await call('POST', '/api/bulk-stocked', { cookie, body: { ids: [bv(r1), bv(r2), bv(wip), bv(already), bv(999999)], worker_id: staff.id, pin: '4649' } });
       ok(bulk.status === 200 && bulk.json.ok && bulk.json.done.length === 2 && bulk.json.done.includes(r1) && bulk.json.done.includes(r2), '職員 + PIN で 棚入待ち 2 件だけが棚入完了');
       const why = Object.fromEntries((bulk.json.skipped || []).map((x) => [x.id, x.reason]));
       ok(why[wip] === 'not_ready' && why[already] === 'already' && why[999999] === 'not_found', '飛ばした理由を返す (棚入待ちでない・すでに完了・見つからない)');
@@ -1701,7 +1979,7 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       // 書き変えは断る (切替前に触ると Notion と食い違い、切替時の取込でも上書きされない)
       const staff2 = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
       const writes = [
-        ['POST', '/api/bulk-stocked', { ids: [1], worker_id: staff2.id, pin: '4649' }],
+        ['POST', '/api/bulk-stocked', { ids: [{ id: 1, version: 1 }], worker_id: staff2.id, pin: '4649' }],
         ['POST', '/api/label-waits', { task_id: 1, worker_id: w1.id, fields: { note: 'x' } }],
         ['POST', '/api/planned', { id: 1, worker_id: w1.id }],
         ['POST', '/api/cancellation', { id: 1, worker_id: staff2.id, decision: 'cancel', pin: '4649' }],
@@ -1715,6 +1993,111 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok(true, '下見では書き変えできない (まとめて棚入完了・ラベル待ち登録・今日やる・取消の判断・確認ずみ)');
       // 状態は動いていない
       ok((await call('GET', '/api/state', { cookie })).json.mode === 'notion', '下見を見ても正本は Notion のまま');
+
+      // ⭐下見の詳細 (要件 v1.3 §P Q5 / PR1): ボード・履歴から 1 枚だけ読むだけで開ける。何も許さない (capabilities 空)。
+      //   下見のカード id をどの書き込み API に送っても DB は変わらない
+      {
+        const stN = await call('GET', '/api/state', { cookie });
+        ok(Array.isArray(stN.json.capabilities) && ['task.status.change', 'task.work.start', 'task.media.add', 'task.master.edit'].every((c) => stN.json.capabilities.includes(c))
+          && !stN.json.capabilities.includes('task.plan.assign'), 'Notion 正本の一覧は 状態変更・作業開始・写真・作業のやり方 を許し、今日やる等は許さない');
+        ok(Array.isArray(pv.json.capabilities) && pv.json.capabilities.length === 0, '下見のボードは何も許さない (capabilities が空)');
+        const open = db.prepare("SELECT id, product_code FROM f_iroha_tasks WHERE status != 'closed' ORDER BY id LIMIT 1").get();
+        const closed = db.prepare("SELECT id FROM f_iroha_tasks WHERE status = 'closed' ORDER BY id LIMIT 1").get();
+        const d = await call('GET', '/api/task-previews/' + open.id, { cookie });
+        ok(d.status === 200 && d.json.ok && d.json.preview === true && d.json.card && d.json.card.id === open.id, '下見の詳細が 1 枚だけ返る (id は数値)');
+        ok(Array.isArray(d.json.capabilities) && d.json.capabilities.length === 0, '下見の詳細は何も許さない (capabilities が空)');
+        ok(d.json.card.master && Array.isArray(d.json.card.media) && Array.isArray(d.json.card.previous_photos) && Array.isArray(d.json.card.active)
+          && d.json.card.live && 'plan_hours' in d.json.card && 'boxes' in d.json.card && 'loc_at' in d.json.card,
+          '詳細に必要なもの (作業のやり方・写真・前回の完成形・作業中の人・販売/在庫・想定時間・必要保管箱・在庫の時刻) が入っている');
+        ok(typeof d.json.notionSyncedAt === 'string' && typeof d.json.serverNow === 'string', 'Notion を取り込んだ時刻 (取込で記録) と、サーバーの今の時刻が付く');
+        if (closed) {
+          const dc = await call('GET', '/api/task-previews/' + closed.id, { cookie });
+          ok(dc.status === 200 && dc.json.ok && dc.json.card.status === 'closed', '履歴 (終了) のカードも読める');
+        } else ok(false, '終了したタスクがテストデータに無い');
+        ok((await call('GET', '/api/task-previews/999999', { cookie })).status === 404, '無いカードは 404');
+        ok((await call('GET', '/api/task-previews/abc', { cookie })).status === 404, '数値でない id は 404');
+        // 下見のカード id を書き込み API に送っても、DB は 1 行も変わらない
+        const mediaTables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'f_iroha%media%' AND name NOT LIKE '%sync%'").all().map((r) => r.name);
+        const snap = () => JSON.stringify({
+          tasks: db.prepare('SELECT id, status, version, updated_at, updated_by FROM f_iroha_tasks ORDER BY id').all(),
+          sessions: db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c,
+          media: mediaTables.map((t) => db.prepare(`SELECT COUNT(*) c FROM ${t}`).get().c),
+          master: db.prepare('SELECT code_key, note, version FROM f_iroha_work_master ORDER BY code_key').all(),
+        });
+        const before = snap();
+        const writes2 = [
+          ['POST', '/api/status', { id: open.id, to: '作業中', worker_id: w1.id }],
+          ['POST', '/api/master', { id: open.id, code: open.product_code || 'PROD-A', fields: { note: 'preview-write' }, worker_id: w1.id }],
+          ['POST', '/api/sessions/start', { id: open.id, worker_id: w1.id }],
+          ['POST', '/api/sessions/stop', { id: open.id, worker_id: w1.id, reason: 'pause' }],
+        ];
+        for (const [m, p2, body] of writes2) {
+          const r = await call(m, p2, { cookie, body });
+          if (!(r.status === 409 && r.json.error === 'notion_mode')) ok(false, `${p2} に下見の id を送ると 409 notion_mode (実際 ${r.status} ${r.json && r.json.error})`);
+        }
+        ok(true, '状態変更・作業のやり方・作業の開始/中断 に下見の id を送ると 409 notion_mode');
+        const jpegPv = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(64, 1)]);
+        const mpPv = multipart({ id: String(open.id), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-preview-00001' }, { name: 'a.jpg', mime: 'image/jpeg', data: jpegPv });
+        const rm = await call('POST', '/api/media', { cookie, body: mpPv.body, headers: mpPv.headers });
+        ok(rm.status === 409 && rm.json.error === 'notion_mode', '写真の送信に下見の id を送ると 409 notion_mode');
+        ok(snap() === before, '下見の id をどの書き込み API に送っても DB が変わらない (tasks・作業時間・写真・作業のやり方)');
+        ok(mediaTables.length > 0, '写真のテーブルを数えている (テーブル名の前提が崩れていない)');
+        // Codex R1: 写真の削除・選択肢の登録も下見/履歴の境界を越えない。認可も確かめる
+        ok((await call('GET', '/api/task-previews/' + open.id)).status === 401, '端末登録もログインも無ければ下見の詳細は 401');
+        // 撮った端末は削除トークンを持ったまま。Notion 正本に戻った後でも tasks の写真を消せないこと
+        db.prepare(`INSERT INTO f_iroha_card_media (operation_id, task_id, product_code, kind, mime, size, drive_file_id, drive_url,
+            status, worker_id, worker_name, created_at, uploaded_at, delete_token_hash)
+          VALUES ('op-preview-del1', ?, ?, 'photo', 'image/jpeg', 100, 'f-preview-del1', 'https://drive/preview-del1',
+            'uploaded', ?, 'やまだ', ?, ?, 'hash-preview')`).run(open.id, open.product_code || 'PROD-A', w1.id, new Date().toISOString(), new Date().toISOString());
+        const mediaRow = db.prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-preview-del1'").get();
+        const del = await call('POST', '/api/media/' + mediaRow.id + '/delete', { ...admin, body: {} });
+        ok(del.status === 409 && del.json.error === 'notion_mode', 'Notion 正本の間は tasks の写真を消せない (削除トークンやポータルでも)');
+        // 断った試行そのものも、そのカードの履歴に足さない (履歴もカードの中身 — Codex PR1 R17)
+        {
+          const evBefore = db.prepare('SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id IS NOT NULL').get().c;
+          await call('POST', '/api/sessions/stop', { cookie, body: { id: open.id, worker_id: w1.id, reason: 'pause', session_id: 1 } });
+          ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id IS NOT NULL').get().c === evBefore,
+            '下見のカードには、断った操作の記録も残さない');
+        }
+        ok(db.prepare('SELECT deleted_at FROM f_iroha_card_media WHERE id = ?').get(mediaRow.id).deleted_at == null, '写真は消えていない');
+        const optBefore = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c;
+        const optRes = await call('POST', '/api/options', { cookie, body: { id: open.id, kind: 'material', code: 'PREVIEW-X', worker_id: staff2.id, pin: '4649' } });
+        ok(optRes.status === 409 && optRes.json.error === 'notion_mode', '下見の id を添えた選択肢の登録は 409');
+        ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c === optBefore, '選択肢も増えていない');
+        // ⭐読むだけの詳細は、写真の「実体が無い」印すら書かない (開くだけで DB が変わらない — Codex PR1 R8)
+        {
+          db.prepare(`INSERT INTO f_iroha_card_media (operation_id, task_id, product_code, kind, mime, size, local_path,
+              status, worker_id, worker_name, created_at)
+            VALUES ('op-preview-lost1', ?, 'PROD-A', 'photo', 'image/jpeg', 100, ?, 'stored', ?, 'やまだ', ?)`)
+            .run(open.id, path.join(process.env.DATA_DIR, 'no-such-file.jpg'), w1.id, new Date().toISOString());
+          const lost = db.prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-preview-lost1'").get();
+          const d2 = await call('GET', '/api/task-previews/' + open.id, { cookie });
+          ok(d2.status === 200, '実体の無い写真があっても下見の詳細は開ける');
+          ok(db.prepare('SELECT next_retry_at, error FROM f_iroha_card_media WHERE id = ?').get(lost.id).next_retry_at == null,
+            '読むだけなので「失敗」の印は付けない');
+          db.prepare('DELETE FROM f_iroha_card_media WHERE id = ?').run(lost.id);
+        }
+        // 商品コードの無い Notion カードを添えても、よその商品の作業のやり方は書き換えられない (Codex PR1 R5)
+        {
+          db.prepare(`INSERT OR REPLACE INTO f_iroha_app_notion_cache (page_id, status, title, product_code, fetched_at)
+            VALUES ('cache-nocode', '未着手', '商品コードなし', NULL, ?)`).run(new Date().toISOString());
+          const beforeM = db.prepare("SELECT COUNT(*) c FROM f_iroha_work_master WHERE code_key = 'hist-a'").get().c;
+          const r = await call('POST', '/api/master', { cookie, body: { id: 'cache-nocode', code: 'HIST-A',
+            fields: { note: '商品コードなしのカードから' }, worker_id: staff2.id, pin: '4649', expect_version: 1 } });
+          ok(r.status === 409 && r.json.error === 'card_mismatch', '商品コードの無いカードを添えた作業のやり方の書き換えは 409');
+          ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_master WHERE code_key = 'hist-a'").get().c === beforeM,
+            'その商品のマスタは変わっていない');
+        }
+        // 詳細には「このカードの終わった作業」が付く (一覧には付けない — 2222 枚ぶん引かない)
+        const withWork = db.prepare(`SELECT task_id FROM f_iroha_work_sessions
+          WHERE task_id IS NOT NULL AND ended_at IS NOT NULL AND voided_at IS NULL GROUP BY task_id ORDER BY task_id LIMIT 1`).get();
+        if (withWork) {
+          const dw = await call('GET', '/api/task-previews/' + withWork.task_id, { cookie });
+          ok(dw.status === 200 && Array.isArray(dw.json.card.work_history) && dw.json.card.work_history.length > 0
+            && dw.json.card.work_history.every((s) => s.worker_name && s.started_at && s.ended_at), 'そのカードの終わった作業が時系列で返る');
+          ok(pv.json.cards.every((c) => c.work_history === undefined), '一覧・ボードのカードには付けない (件数ぶん引かない)');
+        } else ok(false, '終わった作業がテストデータに無い');
+      }
     }
     const ms = await call('GET', '/admin/migration/status', { ...admin });
     ok(ms.status === 200 && ms.json.ok && Array.isArray(ms.json.linkConflicts) && typeof ms.json.linkConflictsTotal === 'number', '移行の状態 (管理画面の元データ) に紐付け衝突の一覧と総件数が載る');
@@ -1870,6 +2253,7 @@ console.log('\n[20] 入荷受付からのタスク生成 (task-intake) と差分
 
 console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧 (PR-C)');
 {
+  setMetaValue('source_of_truth', 'app');   // タスクの書き換えはアプリ正本のときだけ通る (Codex PR1 R15)
   const TD = await import('../apps/iroha-work/tasks-db.js');
   const S = await import('../apps/iroha-work/service.js');
   const { workSecondsByTask } = await import('../apps/iroha-work/db.js');
@@ -1879,14 +2263,48 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
     product_code: 'PRC-A', product_name: name, qty: 3, facility_code: dest % 2 ? 'iroha' : 'rashinban', arrival_date: '2026-09-01' }, { batchId: 'test-prc' }).id;
 
   // まとめて棚入完了の境界
+  const bvv = (id) => ({ id, version: TD.getTask(id) ? TD.getTask(id).version : 0 });   // 選んだときの版
+  // 記録を入れる直前の見直し (Notion の実ページを取っている間に正本が変わることがある — Codex PR1 R14)
+  {
+    const wG = listIrohaWorkers(true).find((x) => x.display_name === 'すずき');
+    const before = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c;
+    const blocked = startSession({ pageId: 'guard-page', worker: getIrohaWorker(wG.id),
+      guard: () => ({ ok: false, error: 'notion_mode', message: '正本が変わりました' }) });
+    ok(blocked.ok === false && blocked.error === 'notion_mode', '直前の見直しで断れる');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions').get().c === before, '記録も増えていない');
+  }
   ok(TD.bulkCloseReady({ taskIds: [] }).error === 'bad_request', '空は bad_request');
-  ok(TD.bulkCloseReady({ taskIds: Array.from({ length: 201 }, (_, i) => i + 1) }).error === 'bad_request', '201 件は bad_request (一度に 200 件まで)');
+  ok(TD.bulkCloseReady({ taskIds: Array.from({ length: 201 }, (_, i) => bvv(i + 1)) }).error === 'bad_request', '201 件は bad_request (一度に 200 件まで)');
+  ok(TD.bulkCloseReady({ taskIds: [1] }).error === 'bad_request', '版を添えない指定は受けない (入口だけの検査にしない)');
+  // ⭐正本が Notion に戻っていたら、タスクの書き換えは通らない (正本の切替は version を変えないので、
+  //   楽観ロックでは気づけない。更新と同じトランザクションの中で見る — Codex PR1 R15)
+  {
+    const nt = mk(9299, '正本チェック用', 'ready_for_stocking');
+    setMetaValue('source_of_truth', null);
+    ok(TD.bulkCloseReady({ taskIds: [bvv(nt)] }).error === 'notion_mode', 'まとめて棚入完了は断る');
+    ok(TD.setPlannedDate({ taskId: nt, plannedDate: '2099-12-31', expectVersion: TD.getTask(nt).version }).error === 'notion_mode', '今日やるも断る');
+    ok(TD.setExternalReady({ taskId: nt, ready: true, expectVersion: TD.getTask(nt).version }).error === 'notion_mode', '外部準備OKも断る');
+    ok(TD.changeTaskStatus({ taskId: nt, to: 'in_progress', expectVersion: TD.getTask(nt).version, isStaff: true, actor: 'test' }).error === 'notion_mode', '状態変更も断る');
+    ok(TD.upsertLabelWait({ taskId: nt, fields: { note: 'x' } }).error === 'notion_mode', 'ラベル待ちの登録も断る');
+    db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = ? WHERE id = ?').run(new Date().toISOString(), nt);
+    ok(TD.resolveCancellation({ taskId: nt, decision: 'continue', expectVersion: TD.getTask(nt).version, isStaff: true, actor: 'test' }).error === 'notion_mode',
+      '取消の判断 (続行) も断る');
+    ok(TD.resolveCancellation({ taskId: nt, decision: 'cancel', expectVersion: TD.getTask(nt).version, isStaff: true, actor: 'test' }).error === 'notion_mode',
+      '取消の判断 (取消) も断る');
+    ok(TD.getTask(nt).cancellation_requested_at != null, '取消の要確認は消えていない');
+    ok(TD.taskErrorStatus('notion_mode') === 409, '正本が切り替わった競合は 409 (入力不正の 400 ではない)');
+    ok(TD.startTaskSession({ taskId: nt, worker: getIrohaWorker(w1.id) }).error === 'notion_mode', '作業開始も断る');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(nt).c === 0, '記録も増えていない');
+    db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL WHERE id = ?').run(nt);
+    ok(TD.getTask(nt).status === 'ready_for_stocking' && TD.getTask(nt).external_ready === 0, 'どれも DB を変えていない');
+    setMetaValue('source_of_truth', 'app');
+  }
   const a = mk(9201, '棚入待ちA', 'ready_for_stocking');
   const b = mk(9202, '棚入待ちB', 'ready_for_stocking');
-  const r = TD.bulkCloseReady({ taskIds: [a, b, a], actor: 'たにがわ (いろはアプリ)', workerId: w1.id, workerName: 'やまだ', deviceLabel: 'ipad-1' });
+  const r = TD.bulkCloseReady({ taskIds: [bvv(a), bvv(b), bvv(a)], actor: 'たにがわ (いろはアプリ)', workerId: w1.id, workerName: 'やまだ', deviceLabel: 'ipad-1' });
   ok(r.ok && r.done.length === 2 && r.skipped.length === 0, '同じ id を 2 回渡しても 1 回だけ処理する');
   ok(TD.getTask(a).closed_by === 'たにがわ (いろはアプリ)' && TD.getTask(a).close_reason === 'stocked', 'だれが棚入完了にしたかが残る');
-  const again = TD.bulkCloseReady({ taskIds: [a] });
+  const again = TD.bulkCloseReady({ taskIds: [bvv(a)] });
   ok(again.ok && again.done.length === 0 && again.skipped[0].reason === 'already' && again.skipped[0].title === '棚入待ちA', '2 回目は already (何も変えない)');
 
   // 履歴: 期間・検索・作業時間
@@ -1894,7 +2312,7 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
   const s1 = startSession({ taskId: c, worker: getIrohaWorker(w1.id) });
   stopSession({ taskId: c, workerId: w1.id, sessionId: s1.sessionId, reason: 'done' });
   db.prepare("UPDATE f_iroha_work_sessions SET raw_seconds = 3660 WHERE task_id = ?").run(c);
-  TD.bulkCloseReady({ taskIds: [c], actor: 'test' });
+  TD.bulkCloseReady({ taskIds: [bvv(c)], actor: 'test' });
   const secs = workSecondsByTask([c, a]);
   ok(secs.get(c).seconds === 3660 && secs.get(c).people === 1 && !secs.has(a), '作業時間の合計をタスクごとに引ける (記録が無いタスクは入らない)');
   ok(workSecondsByTask([]).size === 0 && workSecondsByTask([0, -1, 1.5]).size === 0, '不正な id は数えない');
@@ -1912,11 +2330,11 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
     const e1 = mk(9205, 'ログ失敗E', 'ready_for_stocking');
     db.exec('ALTER TABLE f_iroha_app_events RENAME TO f_iroha_app_events__bak');
     let threw = null;
-    try { TD.bulkCloseReady({ taskIds: [e1], actor: 'test' }); } catch (e) { threw = e; }
+    try { TD.bulkCloseReady({ taskIds: [bvv(e1)], actor: 'test' }); } catch (e) { threw = e; }
     db.exec('ALTER TABLE f_iroha_app_events__bak RENAME TO f_iroha_app_events');
     ok(threw && /no such table/i.test(threw.message), '履歴を書けないと例外になる (握り潰さない)');
     ok(TD.getTask(e1).status === 'ready_for_stocking' && TD.getTask(e1).closed_at == null, '棚入完了は取り消される (棚入待ちのまま)');
-    ok(TD.bulkCloseReady({ taskIds: [e1], actor: 'test' }).done.length === 1, '履歴が戻ればやり直せる');
+    ok(TD.bulkCloseReady({ taskIds: [bvv(e1)], actor: 'test' }).done.length === 1, '履歴が戻ればやり直せる');
   }
 
   // ラベル待ちの一覧に商品情報が乗る
@@ -2120,6 +2538,54 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
       stopSession({ taskId: busy, workerId: wB.id, sessionId: sB.sessionId, reason: 'done' });
       ok(TD.removeStrayTask({ taskId: busy }).action === 'closed', '作業を終えれば片づけられる (記録があるので終了)');
     }
+
+    // 作業中の人がいるまま終了にしない (終了カードは読むだけなので、記録が開いたまま取り残される — Codex PR1 R3)
+    {
+      const t2 = TD.upsertTaskFromImport({ notion_page_id: 'busy-close', status: 'ready_for_stocking', destination_id: 9505,
+        product_code: 'PLAN-A', product_name: '作業中のまま終了', qty: 1, facility_code: 'iroha' }, { batchId: 'test-busy' }).id;
+      const wB2 = listIrohaWorkers(true).find((x) => x.display_name === 'すずき');
+      const sB2 = startSession({ taskId: t2, worker: getIrohaWorker(wB2.id) });
+      const closeTry = TD.changeTaskStatus({ taskId: t2, to: 'closed', closeReason: 'stocked',
+        expectVersion: TD.getTask(t2).version, isStaff: true, actor: 'test' });
+      ok(closeTry.error === 'active_sessions', '作業中の人がいれば終了にできない');
+      ok(TD.getTask(t2).status === 'ready_for_stocking', '状態も変わらない');
+      const bulkTry = TD.bulkCloseReady({ taskIds: [{ id: t2, version: TD.getTask(t2).version }], actor: 'test' });
+      ok(bulkTry.done.length === 0 && bulkTry.skipped[0].reason === 'active_sessions', 'まとめて棚入完了でも飛ばす');
+      stopSession({ taskId: t2, workerId: wB2.id, sessionId: sB2.sessionId, reason: 'done' });
+      ok(TD.bulkCloseReady({ taskIds: [{ id: t2, version: TD.getTask(t2).version }], actor: 'test' }).done.length === 1, '作業を終えれば終了にできる');
+      // 版ずれと「作業中」を取り違えない: 別の端末が先に動かしていたら competing でなく conflict (Codex PR1 R5)
+      {
+        const t3 = TD.upsertTaskFromImport({ notion_page_id: 'busy-stale', status: 'ready_for_stocking', destination_id: 9506,
+          product_code: 'PLAN-A', product_name: '版ずれ + 作業中', qty: 1, facility_code: 'iroha' }, { batchId: 'test-busy' }).id;
+        const wB3 = listIrohaWorkers(true).find((x) => x.display_name === 'すずき');
+        const sB3 = startSession({ taskId: t3, worker: getIrohaWorker(wB3.id) });
+        const stale = TD.getTask(t3).version - 1;
+        const r3 = TD.changeTaskStatus({ taskId: t3, to: 'closed', closeReason: 'stocked', expectVersion: stale, isStaff: true, actor: 'test' });
+        ok(r3.ok === false && r3.error === 'conflict', '版が古ければ (作業中でも) 競合として断る — 作業中扱いにしない');
+        stopSession({ taskId: t3, workerId: wB3.id, sessionId: sB3.sessionId, reason: 'done' });
+        // 取り消したセッションは「作業中」に数えない (終わっていない行として残っていても — Codex PR1 R6)
+        const t4 = TD.upsertTaskFromImport({ notion_page_id: 'busy-void', status: 'ready_for_stocking', destination_id: 9507,
+          product_code: 'PLAN-A', product_name: '取り消し済みの作業', qty: 1, facility_code: 'iroha' }, { batchId: 'test-busy' }).id;
+        db.prepare(`INSERT INTO f_iroha_work_sessions (task_id, worker_id, worker_name, started_at, voided_at, voided_by)
+          VALUES (?, ?, 'すずき', ?, ?, 'test')`).run(t4, wB3.id, utcNowT(), utcNowT());
+        ok(db.prepare('SELECT ended_at FROM f_iroha_work_sessions WHERE task_id = ?').get(t4).ended_at == null,
+          '取り消し済みだが終わっていない記録がある');
+        ok(TD.bulkCloseReady({ taskIds: [{ id: t4, version: TD.getTask(t4).version }], actor: 'test' }).done.length === 1, 'それでもまとめて棚入完了は通る');
+        ok(TD.getTask(t4).status === 'closed', '終了になっている');
+      }
+      // 終了からのやり直しは、理由の記録が書けなければ再開そのものを取り消す
+      db.exec('ALTER TABLE f_iroha_app_events RENAME TO f_iroha_app_events__bak2');
+      let reopenErr = null;
+      try {
+        TD.changeTaskStatus({ taskId: t2, to: 'in_progress', expectVersion: TD.getTask(t2).version,
+          isStaff: true, actor: 'test', reason: 'やり直し' });
+      } catch (e) { reopenErr = e; }
+      db.exec('ALTER TABLE f_iroha_app_events__bak2 RENAME TO f_iroha_app_events');
+      ok(reopenErr && /no such table/i.test(reopenErr.message), 'やり直しの理由を書けないと例外になる');
+      ok(TD.getTask(t2).status === 'closed', '再開も取り消される (理由の残らない再開をしない)');
+      ok(TD.changeTaskStatus({ taskId: t2, to: 'in_progress', expectVersion: TD.getTask(t2).version,
+        isStaff: true, actor: 'test', reason: 'やり直し' }).ok, '記録が戻ればやり直せる');
+    }
     TD.removeStrayTask({ taskId: c2, actor: 'admin@test' });
   }
 
@@ -2166,6 +2632,7 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   }
 }
 
+setMetaValue('source_of_truth', null);   // [21]〜[23] で立てた正本を既定 (Notion) に戻す
 console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリックは委譲する)');
 {
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
@@ -2206,18 +2673,23 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function renderViews\(\) \{ const el = \$\('#views'\); if \(el\) el\.hidden = false; \}/.test(html), '画面切替はいつでも出る (正本を問わない)');
   ok(/if \(v === 'board'\) \{ if \(isApp\(\)\) renderBoard\(\); else loadPreview\(\); \}/.test(html), 'ボードは正本が Notion なら下見を読み込む');
   ok(/const PREVIEW_NOTE = /.test(html) && /見るだけの下見です/.test(html), '下見であることを画面に書く');
-  ok(/if \(!isApp\(\)\) \{ toast\('下見なので開けません/.test(html), '下見ではカードを開かない (詳細は正本のカードなので id が別)');
-  ok(/const canBulk = isApp\(\) &&/.test(html), '下見では「まとめて棚入完了」を出さない');
-  ok(/\$\('#lwSave'\)\.disabled = !isApp\(\);/.test(html), '下見ではラベル待ちを保存できない');
+  // 下見でもカードは開く (v1.3) — ただし state の openDetail には流さない (id が正本のカードと別)。1 枚だけ読むだけで取る
+  ok(/if \(!isApp\(\)\) \{ openPreviewDetail\(el\.dataset\.id\); return; \}\r?\n  if \(el\.dataset\.pick === '1'\) toggleBulk\(el\.dataset\.id\); else openDetail\(el\.dataset\.id\);/.test(html),
+    '下見のカードは state の openDetail に流さない (id が正本のカードと別)');
+  ok(/const canBulk = stateCan\('tasks\.bulk_stocked'\) &&/.test(html), '下見では「まとめて棚入完了」を出さない (許可リストで判定)');
+  ok(/<span id="lwSaveWrap"><\/span>/.test(html), 'ラベル待ちの「保存」は静的に置かない (許可されたときだけ描く — Codex PR1 R11)');
+  ok(/const may = stateCan\('task\.label_wait\.edit'\);/.test(html) && /wrap\.innerHTML = may \?/.test(html),
+    '下見ではラベル待ちの保存ボタンを描かない (無効化して見せるのではなく)');
   // 正本が変わったとき・つながらなかったときの追随 (Codex 下見 R1)
-  ok(/if \(wasApp !== isApp\(\)\) \{ preview = null;/.test(html), '正本が変わったら下見のデータを捨てる (古い下見を新しく見せない)');
+  ok(/if \(wasApp !== isApp\(\)\) \{[\s\S]{0,80}preview = null; previewAt = null; previewDown = false;/.test(html), '正本が変わったら下見のデータを捨てる (古い下見を新しく見せない)');
   ok(/if \(curView === 'board'\) \{ if \(isApp\(\)\) renderBoard\(\); else loadPreview\(\); \}/.test(html), '更新のたびに、Notion 正本なら下見も取り直す (502 から戻ったときもここで回復)');
   ok(/previewInflight = loadPreviewOnce\(\)/.test(html), '下見の取得は同時に 1 本だけ (遅れて返った古い応答で上書きしない)');
   ok(/previewDown = true;[\s\S]{0,300}if \(!preview\)/.test(html), 'つながらないときは前回の下見を消さない');
   ok(/previewAt = Date\.now\(\);/.test(html) && /この画面を取ったのは/.test(html), 'いつ取った下見かを画面に出す');
   ok(/function renderLwSaveState/.test(html) && /renderLwSaveState\(\);/.test(html), 'ラベル待ちを開いたままでも保存ボタンが正本に追随する');
-  ok(/if \(!isApp\(\)\) \{ \$\('#lwMsg'\)\.textContent = '下見なので保存できません/.test(html), '保存の入口でも下見なら止める');
-  ok(/btn\.disabled = !isApp\(\);   \/\/ 保存中に正本が変わっていたら/.test(html), '保存後にボタンを無条件で戻さない');
+  ok(/if \(!stateCan\('task\.label_wait\.edit'\)\) \{ \$\('#lwMsg'\)\.textContent = '下見なので保存できません/.test(html), '保存の入口でも下見なら止める');
+  ok(/btn\.disabled = !stateCan\('task\.label_wait\.edit'\);   \/\/ 保存中に許可が変わっていたら/.test(html),
+    '保存後にボタンを無条件で戻さない (許可リストで判断する。正本だけを見ない)');
   // 実機FB (2026-09-03): ボードに写真・項目タップで変更・想定作業時間の合計
   ok(/<div class="th">' \+ thumbHtml\(c\) \+ '<\/div>/.test(html), 'ボードのカードに写真を出す');
   ok(!/onclick="openMaster/.test(html) && /data-reg="/.test(html), '作業のやり方は項目タップで変更 (編集ボタンなし)');
@@ -2252,6 +2724,87 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(!/lot_expiry: c\.expiry/.test(html) && /\$\('#lwLot'\); if \(el\) el\.focus\(\)/.test(html), 'ロット・期限は入れずに、そこへカーソルを置く (現物を見て打つ)');
   ok(/外部に出す準備OK にする/.test(html) && /async function setExternalReady/.test(html), '詳細に「外部に出す準備OK」の切り替えがある');
   ok(/c\.external_ready \? '📦 外部に出せます'/.test(html) && /tag ready/.test(html), 'ボードと一覧に「外部に出せます」の印が出る');
+
+  // ⭐下見・履歴の詳細を読むだけで開く (要件 v1.3 §P Q5 / PR1): 許可リスト (capabilities) に無い操作は描かない (default-deny)
+  ok(/const can = \(name\) => detailCaps\.includes\(name\)/.test(html), '許された操作は detailCaps (サーバーの capabilities) で判定する');
+  ok(/if \(!isApp\(\)\) \{ openPreviewDetail\(el\.dataset\.id\); return; \}/.test(html), 'ボードのカードは下見でも開く (読むだけ)');
+  ok(!/下見なので開けません/.test(html), '「下見なので開けません」は無くなった');
+  ok(/openPreviewDetail\(tr\.dataset\.id\)/.test(html), '履歴の行からも読むだけで開く (終了したカードは一覧に無い)');
+  ok(/apiFetch\('\/api\/task-previews\/' \+ encodeURIComponent\(id\)\)/.test(html), '詳細は 1 枚だけサーバーから取る');
+  ok(/showDetail\(fallback, 'preview', \[\], \{ stale: true, fetchedAt: null \}\)/.test(html), '取れなければボードに載っていた中身で開き、最新でないと出す');
+  ok(/if \(j\.error === 'not_found'\)/.test(html) && /このカードはもうありません/.test(html), '消えたカードは閉じる (404)');
+  ok(/<span id="dstateWrap"><\/span>/.test(html) && !/<button class="st todo" id="dstate"/.test(html), '状態のボタンは静的に置かない (許されたときだけ描く)');
+  ok(/can\('task\.status\.change'\)\s*\?\s*'<button class="st /.test(html) && /'<span class="st ro /.test(html), '許されなければ状態は札 (span) で出す');
+  ok(/if \(!reg \|\| !can\('task\.master\.edit'\)\) return/.test(html), '作業のやり方の「変更・登録」は許されたときだけ data-reg を付ける');
+  ok(/const addP = can\('task\.media\.add'\) && photos < 3/.test(html)
+    && /const photos = media\.filter\(m => m\.kind === 'photo'\)\.length \+ pending\.filter\(p => p\.kind === 'photo'\)\.length;/.test(html),
+    '「写真をとる」の枠は許されたときだけ。送信中の分も枚数に数える (Codex PR1 R13)');
+  ok(/own && can\('task\.media\.add'\)/.test(html) && /\(canPhoto \? pend : ''\)/.test(html), '写真の × と送信中の枠も許されたときだけ');
+  ok(/if \(!can\('task\.work\.start'\)\) \{/.test(html), '「作業をはじめる」「中断」「できあがり」は許されたときだけ');
+  ok(/can\('task\.plan\.assign'\) && \(c\.status === 'not_started'/.test(html) && /can\('task\.external_ready'\) && c\.status !== 'closed'/.test(html)
+    && /can\('task\.label_wait\.edit'\) && c\.status !== 'closed'/.test(html), '今日やる・外部準備OK・ラベル待ち登録も許可リストで出し分ける');
+  ok(/function detailNoteHtml\(c\)/.test(html) && /に取り込んだ時点/.test(html) && /いまのアプリの記録/.test(html), '下見の詳細には「何がいつ時点か」を分けて出す');
+  ok(/if \(!can\('task\.master\.edit'\)\) return;/.test(html) && /if \(curDetail && can\('task\.status\.change'\)\) openSt/.test(html)
+    && /if \(!can\('task\.work\.start'\)\) return;/.test(html) && /if \(!can\('task\.media\.add'\)\) return;/.test(html), '変更・開始・撮影の入口も許可リストで止める (二重の守り)');
+  ok(/capabilities: j\.capabilities/.test(html) && /capabilities: \[\], me: \{\} \};/.test(html),
+    '端末に残した前回の一覧からは許可リストを復元しない (つながるまでは何も許さない — Codex PR1 R12)');
+  // Codex R1 の指摘 (下見・履歴の読み取り専用境界)
+  ok(/const stateCan = \(name\) => \(state\.capabilities \|\| \[\]\)\.includes\(name\)/.test(html),
+    '一覧・ボード側も許可リストで判定する (前回の一覧に許可が無ければ何も許さない)');
+  ok(/stateCan\('task\.status\.change'\)\r?\n\s+\? '<button class="st /.test(html) && /'<span class="st ro /.test(html),
+    '一覧の状態は、変更が許されたときだけタップできる札 (data-st) にする');
+  ok(/function openSt\(ev, id\) \{[\s\S]{0,120}if \(!stateCan\('task\.status\.change'\)\) return;/.test(html)
+    && /function startBulk\(\) \{\r?\n  if \(!stateCan\('tasks\.bulk_stocked'\)\) return;/.test(html),
+    'ステータス変更・まとめて棚入完了は入口でも許可リストで止める (二重の守り)');
+  ok(/else forceCloseDetail\('このカードは一覧から外れました'\)/.test(html)
+    && /if \(curDetail\) forceCloseDetail\('正本が変わったので詳細を閉じました'\)/.test(html),
+    'カードが一覧から消えた・正本が変わったら、開いている詳細とダイアログを閉じる (古いボタンを残さない)');
+  // 保存中でも「もう触れない」ようにし、通信が終わったら必ず閉じる (Codex PR1 R2)
+  ok(/function forceCloseDetail\(msg\) \{[\s\S]{0,200}detailCaps = \[\];/.test(html), '閉じるときは許可リストを空にする (失敗応答でボタンが戻らない)');
+  ok(/pendingForceClose = msg/.test(html) && /function settleForceClose/.test(html)
+    && (html.match(/settleForceClose\(\);/g) || []).length >= 2, '保存中は閉じるのを予約し、通信が終わったら閉じる (作業のやり方・状態変更の両方)');
+  // 遅れて返った詳細の応答で、別のカードや閉じた画面を開かない
+  ok(/let detailGen = 0;/.test(html) && /const gen = \+\+detailGen;/.test(html)
+    && /if \(gen !== detailGen \|\| isApp\(\) !== wasApp\) return;/.test(html), '詳細の取得に世代を持たせ、遅れた応答は捨てる');
+  // 下見・履歴の詳細も巡回で取り直す
+  ok(/if \(curDetail && detailSrc === 'preview'\) \{\s*\r?\n\s*openPreviewDetail\(curDetail, \{ silent: true \}\);/.test(html),
+    '下見・履歴の詳細も 60 秒ごとに取り直す (「いまの記録」と書いている以上、古いまま置かない)');
+  // 入口の守り (許可リストが無ければ関数の中で止まる)
+  for (const [fn, cap] of [['doBulkStocked', "stateCan\\('tasks\\.bulk_stocked'\\)"], ['saveMaster', "can\\('task\\.master\\.edit'\\)"],
+    ['setExternalReady', "can\\('task\\.external_ready'\\)"], ['setPlanned', "can\\('task\\.plan\\.assign'\\)"],
+    ['stopWork', "can\\('task\\.work\\.start'\\)"], ['doSetSt', "stateCan\\('task\\.status\\.change'\\)"]]) {
+    const body = html.slice(html.indexOf('function ' + fn + '('), html.indexOf('function ' + fn + '(') + 400);
+    if (!new RegExp(cap).test(body)) ok(false, fn + ' の入口で許可リストを見ている');
+  }
+  ok(/function retryUpload\(ev, opId\) \{ ev\.stopPropagation\(\); if \(!can\('task\.media\.add'\)\) return;/.test(html)
+    && /async function delMedia[\s\S]{0,160}if \(!can\('task\.media\.add'\)\) return;/.test(html), '写真の再送・削除も入口で止める');
+  ok(/function dropPending\(ev, opId\)/.test(html) && /pendingTiles\.delete\(opId\);/.test(html),
+    '送れなかった写真は「やめる」で捨てられる (枠を空けて撮り直せる — Codex PR1 R14)');
+  ok(true, '書き込みの関数はすべて入口で許可リストを見る');
+  ok(/function historyCardHtml\(c\)/.test(html) && /これまでの作業 — このカード/.test(html)
+    && /const END_REASON = \{ done: 'できあがり', pause: '中断', admin: '職員が終了' \}/.test(html),
+    '詳細に「このカードの終わった作業」(誰が・いつ・何分・理由) を読むだけで出す');
+  ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
+  ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
+  const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
+  ok(/const CACHE = 'iroha-work-shell-v2'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+}
+
+console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許可リスト');
+{
+  const { capabilitiesFor, CAP } = await import('../apps/iroha-work/capabilities.js');
+  const app = capabilitiesFor('app'), notion = capabilitiesFor('notion'), pv = capabilitiesFor('preview');
+  ok(Array.isArray(pv) && pv.length === 0, '下見・履歴は何も許さない');
+  ok([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT].every(c => notion.includes(c))
+    && ![CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].some(c => notion.includes(c)),
+    'Notion 正本 = 状態変更・作業開始・写真・作業のやり方 (今日やる等は許さない)');
+  ok(notion.every(c => app.includes(c)) && [CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].every(c => app.includes(c)),
+    'アプリ正本 = Notion 正本の全部 + 今日やる・外部準備OK・取消の判断・確認ずみ・ラベル待ち・まとめて棚入完了');
+  // 書き込み口が capability を持たないまま増えていないか (Codex PR1 R6)
+  ok(app.length === 10 && new Set(app).size === app.length, 'アプリ正本の許可は 10 個・重複なし (増やしたら画面の判定も足す)');
+  app.push('x'); pv.push('y');
+  ok(!capabilitiesFor('app').includes('x') && capabilitiesFor('preview').length === 0, '返した配列を壊しても共有の定義は変わらない');
+  ok(capabilitiesFor('unknown').length === 0 && capabilitiesFor(undefined).length === 0, '知らないモードは何も許さない (default-deny)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

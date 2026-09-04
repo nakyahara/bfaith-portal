@@ -166,7 +166,9 @@
   .backbar{display:flex;align-items:center;gap:10px;margin-bottom:12px}
   .back{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r);
     padding:10px 16px;font-size:1rem;font-weight:700;cursor:pointer}
-  .backbar .st{margin-left:auto;font-size:.92rem;padding:8px 14px}
+  .backbar #dstateWrap{margin-left:auto;display:flex}
+  .backbar .st{font-size:.92rem;padding:8px 14px}
+  .st.ro{cursor:default}   /* 読むだけ (下見・履歴): 状態は札。ボタンにしない */
   .dcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:12px}
   .dhead{display:flex;gap:16px}
   .dhead .thumb{width:120px;height:120px;border-radius:var(--r-sm);background:var(--well);border:1px solid var(--line);
@@ -221,6 +223,8 @@
   .wbtns .btn{flex:1;min-width:180px;min-height:60px;font-size:1.1rem}
   .btn.warn{color:var(--amber);border-color:var(--amber)}
   .est{font-size:.82rem;color:var(--sub);margin-top:10px}
+  .whist{margin:0;padding-left:1.2em;font-size:.92rem;line-height:1.7}
+  .whist li{color:var(--ink)}
   h3.sec{font-size:.78rem;margin:0 0 10px;color:var(--faint);letter-spacing:.1em;font-weight:700;display:flex;align-items:center;gap:8px}
   .reg{border:1px solid var(--amber);background:var(--surface);color:var(--amber);
     border-radius:var(--r-sm);padding:5px 10px;font-weight:700;font-size:.82rem;cursor:pointer;font-family:var(--font)}
@@ -393,7 +397,8 @@
   <div class="detail">
     <div class="backbar">
       <button class="back" onclick="closeDetail()">‹ 一覧にもどる</button>
-      <button class="st todo" id="dstate" onclick="openStFromDetail()">—</button>
+      <!-- 状態: 変更が許されていればボタン、読むだけなら札 (renderDetail が描く。静的なボタンを置かない) -->
+      <span id="dstateWrap"></span>
     </div>
     <div id="dbody"></div>
   </div>
@@ -481,7 +486,7 @@
       </div>
       <div class="mbtns" style="margin-top:14px">
         <button class="btn" onclick="closeLw()">やめる</button>
-        <button class="btn primary" id="lwSave" onclick="saveLw()">保存</button>
+        <span id="lwSaveWrap"></span>
       </div>
       <p class="hint">Z ロケ = 一時保管 / Y ロケ = 出荷禁止。外部に預けるときは Z → Y、戻ってきたら Y → Z です。</p>
     </div>
@@ -541,13 +546,23 @@ let state = { mode: 'notion', cards: [], statuses: [], changeTargets: [], worker
 let curTab = 'all';
 let curView = 'list';       // list | board | label | history (アプリ正本のときだけ切り替えられる)
 let curFacility = 'all';    // ボードの拠点しぼりこみ
-let bulkIds = null;         // まとめて棚入完了で選んでいる id の Set (null = 選択モードではない)
+let bulkIds = null;         // まとめて棚入完了で選んでいる id → 選んだときの版 の Map (null = 選択モードではない)
 let lwOpenOnly = true;      // ラベル待ち: 未完了だけ
 let lwEditing = null;       // 編集中のラベル待ち行 (新規は {task_id})
 let curDetail = null;      // 開いている詳細のカード id (Notion 正本 = page_id 文字列 / アプリ正本 = task id 数値)
 /** カード id の比較。onclick の引数を経ると数値も文字列になるので、厳密比較せず文字列にそろえて比べる (Codex A1b R1 #1) */
 const sameId = (a, b) => a != null && b != null && String(a) === String(b);
 const findCard = (id) => state.cards.find(x => sameId(x.id, id)) || null;
+// ─── 詳細の文脈: どこから開いたか (state = 一覧・ボード / preview = 下見・履歴) と、許された操作 ───
+// 画面はサーバーが返した capabilities にある操作だけ描く (default-deny)。「描いてから隠す」はしない (要件 v1.3 §P Q5)
+let detailSrc = null;        // 'state' | 'preview'
+let detailCard = null;       // 開いているカード (preview のときは API で取った 1 枚)
+let detailCaps = [];         // 許された操作 (無ければ何も許さない)
+let detailMeta = {};         // preview の付随情報 (Notion を取り込んだ時刻・最新を取れなかった印)
+const can = (name) => detailCaps.includes(name);
+// 一覧・ボード側 (詳細の外) で許された操作。端末に残した前回の一覧に許可リストが無ければ何も許さない
+// — つながる前の画面から書き込みの導線を出さない (default-deny — 要件 v1.3 §P Q5)
+const stateCan = (name) => (state.capabilities || []).includes(name);
 /** 正本が切り替わると状態の値も変わる (未着手 ↔ not_started)。無い値を選んだままだと一覧が空に見えるので「すべて」に戻す */
 function ensureTabValid() {
   const valid = new Set(['all', ...statusTabs().map(([v]) => v)]);
@@ -660,7 +675,7 @@ function saveSnapshot(j) {
   try {
     localStorage.setItem(SNAP_KEY, JSON.stringify({ at: Date.now(), mode: j.mode, cards: j.cards, statuses: j.statuses,
       changeTargets: j.changeTargets, transitions: j.transitions, holdReasons: j.holdReasons, closeReasons: j.closeReasons,
-      facilities: j.facilities, today: j.today, workers: j.workers, refresh: j.refresh }));
+      facilities: j.facilities, today: j.today, workers: j.workers, refresh: j.refresh, capabilities: j.capabilities }));
   } catch (e) { /* 容量超過・プライベートモードなどは諦める (次の取得で出る) */ }
 }
 function restoreSnapshot() {
@@ -670,7 +685,9 @@ function restoreSnapshot() {
   state = { mode: s.mode || 'notion', cards: s.cards, statuses: s.statuses || [], changeTargets: s.changeTargets || [],
     transitions: s.transitions || {}, holdReasons: s.holdReasons || [], closeReasons: s.closeReasons || [],
     facilities: s.facilities || [], today: s.today || null,
-    workers: s.workers || [], refresh: s.refresh || {}, me: {} };
+    // ⭐前回の許可リストは復元しない。正本が変わっていることがあるので、/api/state が返るまでは
+    //   何も許さない (つながる前は default-deny — Codex PR1 R12)
+    workers: s.workers || [], refresh: s.refresh || {}, capabilities: [], me: {} };
   renderModeTexts(); renderViews(); ensureTabValid(); renderTabs(); renderList(); restoreWorker();
   $('#syncTxt').textContent = '前回取得 ' + fmtTime(new Date(s.at).toISOString()) + ' の一覧 · 最新を確認中…';
   return true;
@@ -720,7 +737,11 @@ async function loadStateOnce() {
   const wasApp = isApp();
   state = j;
   // 正本が変わったら下見のデータは捨てる (古い下見を新しいものとして見せない — Codex 下見 R1)
-  if (wasApp !== isApp()) { preview = null; previewAt = null; previewDown = false; }
+  if (wasApp !== isApp()) {
+    preview = null; previewAt = null; previewDown = false;
+    // 正本が変わると id も許される操作も変わる。開いている詳細は閉じる (古いボタンを残さない)
+    if (curDetail) forceCloseDetail('正本が変わったので詳細を閉じました');
+  }
   ensureTabValid();
   saveSnapshot(j);
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
@@ -733,9 +754,21 @@ async function loadStateOnce() {
   if (curView === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
   renderLwSaveState();
   restoreWorker();
-  if (curDetail) {
+  // 開いている詳細を追いかける。一覧・ボードのものは state から、下見・履歴のものは取り直す
+  //   (取込や他の端末の操作で中身が変わる。「いまのアプリの記録」と書いている以上、古いまま置かない — Codex PR1 R2)
+  if (curDetail && detailSrc === 'preview') {
+    openPreviewDetail(curDetail, { silent: true });
+  } else if (curDetail && detailSrc === 'state') {
     const c = findCard(curDetail);
-    if (c) renderDetail(c);
+    // 一覧から消えた (他の端末で終了した・取り込みで変わった) なら閉じる。
+    // 古い詳細を残すと、そこに描かれた操作ボタンが「もう無いカード」に効いてしまう
+    // 一覧のカードには「これまでの作業」を付けていない。差し替えで消さないよう引き継ぐ (Codex PR1 R16)
+    if (c) {
+      if (detailCard && detailCard.work_history && c.work_history === undefined) c.work_history = detailCard.work_history;
+      detailCard = c; detailCaps = state.capabilities || []; renderDetail(c);
+      fillWorkHistory(curDetail);   // 別の端末が終えた分も出す (Codex PR1 R18)
+    }
+    else forceCloseDetail('このカードは一覧から外れました');
   }
 }
 
@@ -831,7 +864,7 @@ function renderList() {
   // 「棚入待ち」だけを見ているときは、まとめて棚入完了にできる (職員操作。要件 v1.1 §B)。
   // ⚠ここの後始末は一覧を見ているときだけ。ボードで選んでいる最中も loadState() → renderList() は走るので、
   //   無条件に exitBulk すると選択が消える (Codex PR-C R4)
-  const bulkable = isApp() && curTab === 'ready_for_stocking';
+  const bulkable = stateCan('tasks.bulk_stocked') && curTab === 'ready_for_stocking';   // 許可が無ければボタンは出さない (hidden)
   const btn = $('#bulkStart');
   if (btn) btn.hidden = !bulkable || !!bulkIds;
   if (curView === 'list') {
@@ -865,7 +898,11 @@ function renderList() {
       '<div class="bd"><h2>' + rowTags(c) + esc(c.title) + '</h2>' +
       '<div class="meta num">' + meta + '</div>' +
       (meta2 ? '<div class="meta2 num">' + meta2 + '</div>' : '') + '</div>' +
-      (selectable ? '' : '<button class="st ' + stClass(c.status) + '" data-st="' + esc(c.id) + '">' + esc(stLabel(c)) + ' ▾</button>') +
+      // 状態: 変更が許されていればタップできる札 (data-st)、許されていなければただの札
+      (selectable ? ''
+        : stateCan('task.status.change')
+          ? '<button class="st ' + stClass(c.status) + '" data-st="' + esc(c.id) + '">' + esc(stLabel(c)) + ' ▾</button>'
+          : '<span class="st ro ' + stClass(c.status) + '">' + esc(stLabel(c)) + '</span>') +
       '<span class="chev">' + (selectable ? '' : '›') + '</span></div>';
   }).join('');
 }
@@ -959,7 +996,8 @@ $('#facChips').addEventListener('click', (e) => {
 $('#board').addEventListener('click', (e) => {
   const el = e.target.closest('[data-id]');
   if (!el) return;
-  if (!isApp()) { toast('下見なので開けません (アプリを正本にすると開けます)'); return; }
+  // 下見 (正本が Notion) でも詳細は読むだけで開ける (中原さん 2026-09-03「これで何がどう変わるのか想像できない」)
+  if (!isApp()) { openPreviewDetail(el.dataset.id); return; }
   if (el.dataset.pick === '1') toggleBulk(el.dataset.id); else openDetail(el.dataset.id);
 });
 $('#lwBody').addEventListener('click', (e) => {
@@ -969,8 +1007,8 @@ $('#lwBody').addEventListener('click', (e) => {
 $('#histBody').addEventListener('click', (e) => {
   const tr = e.target.closest('tr[data-id]');
   if (!tr) return;
-  if (!isApp()) { toast('下見なので開けません (アプリを正本にすると開けます)'); return; }
-  openDetail(tr.dataset.id);
+  // 終了したカードは一覧 (state) に無い。正本を問わず、読むだけで 1 枚取って開く
+  openPreviewDetail(tr.dataset.id);
 });
 function boardCards() {
   const q = ($('#bq').value || '').trim().toLowerCase();
@@ -989,7 +1027,7 @@ function renderBoard() {
   if (isApp()) syncBulkSelection(cards);
   const cols = (bs.statuses || []).map(st => {
     const mine = cards.filter(c => c.status === st.value);
-    const canBulk = isApp() && st.value === 'ready_for_stocking' && mine.length > 0;
+    const canBulk = stateCan('tasks.bulk_stocked') && st.value === 'ready_for_stocking' && mine.length > 0;
     const body = mine.length === 0 ? '<div class="colempty">なし</div>' : mine.map(c => bcardHtml(c, st.value)).join('');
     // 想定作業時間の合計 (Notion のボードビューで見ていたもの)
     const hours = mine.reduce((a, c) => a + (Number(c.plan_hours) || 0), 0);
@@ -1017,7 +1055,8 @@ function bcardHtml(c, status) {
 
 // ─── まとめて棚入完了 (職員のみ) ───
 function startBulk() {
-  bulkIds = new Set();
+  if (!stateCan('tasks.bulk_stocked')) return;
+  bulkIds = new Map();
   renderBulk();
   if (curView === 'board') renderBoard(); else renderList();
 }
@@ -1030,7 +1069,8 @@ function exitBulk() {
 function toggleBulk(id) {
   if (!bulkIds) return;
   const n = Number(id);
-  if (bulkIds.has(n)) bulkIds.delete(n); else bulkIds.add(n);
+  // 選んだときに見えていた版を覚えておく (選んでから別の端末が変えていたら、送るときに飛ばされる — Codex PR1 R7)
+  if (bulkIds.has(n)) bulkIds.delete(n); else bulkIds.set(n, (findCard(n) || {}).version);
   renderBulk();
   if (curView === 'board') renderBoard(); else renderList();
 }
@@ -1046,15 +1086,16 @@ function syncBulkSelection(visible) {
   if (!bulkIds) return;
   const ok = new Set(visible.filter(c => c.status === 'ready_for_stocking').map(c => c.id));
   let dropped = 0;
-  for (const id of [...bulkIds]) if (!ok.has(id)) { bulkIds.delete(id); dropped++; }
+  for (const id of [...bulkIds.keys()]) if (!ok.has(id)) { bulkIds.delete(id); dropped++; }
   if (dropped > 0) toast(dropped + ' 件は絞り込みで見えなくなったので選択から外しました');
   renderBulk();
 }
 async function doBulkStocked() {
+  if (!stateCan('tasks.bulk_stocked')) return;   // 許可リストに無ければ動かない (ボタンも描いていない。二重の守り)
   if (!bulkIds || bulkIds.size === 0) { toast('カードを選んでください'); return; }
   const w = worker;
   if (!w) { openGate(); return; }
-  const ids = [...bulkIds];
+  const ids = [...bulkIds.keys()];
   let pin = null;
   if (!state.me.session) {
     if (w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです'); return; }
@@ -1065,15 +1106,18 @@ async function doBulkStocked() {
   const list = names.slice(0, 8).join('\n') + (names.length > 8 ? '\n…ほか ' + (names.length - 8) + ' 件' : '');
   if (!window.confirm(ids.length + ' 件を棚入完了にします。よろしいですか?\n\n' + list)) return;
   const j = await apiFetch('/api/bulk-stocked', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids, worker_id: w.id, pin }) });
+    body: JSON.stringify({ ids: ids.map((id) => ({ id, version: bulkIds.get(id) })), worker_id: w.id, pin }) });
   if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
   const skipped = (j.skipped || []).length;
-  toast(j.done.length + ' 件を棚入完了にしました' + (skipped ? ' (' + skipped + ' 件は状態が変わっていたので飛ばしました)' : ''));
-  if (skipped) showWarn((j.skipped || []).map(x => (x.title || '#' + x.id) + ': ' + BULK_SKIP[x.reason]).join(' / '));
+  // 飛ばした理由は「状態が変わった」だけではない (作業中・見つからない・すでに完了) — 理由は下の警告に出す
+  toast(j.done.length + ' 件を棚入完了にしました' + (skipped ? ' (' + skipped + ' 件は棚入完了にできませんでした)' : ''));
+  if (skipped) showWarn((j.skipped || []).map(x => (x.title || '#' + x.id) + ': ' + bulkSkipLabel(x.reason)).join(' / '));
   exitBulk();
   await loadState();
 }
-const BULK_SKIP = { already: 'すでに棚入完了', not_ready: '棚入待ちではありません', not_found: '見つかりません', conflict: '同時に変更されました' };
+const BULK_SKIP = { already: 'すでに棚入完了', not_ready: '棚入待ちではありません', not_found: '見つかりません',
+  conflict: '同時に変更されました', active_sessions: '作業中の人がいます' };
+const bulkSkipLabel = (reason) => BULK_SKIP[reason] || '棚入完了にできませんでした';
 
 // ─── ラベル待ち ───
 function setLwOpenOnly(v) { lwOpenOnly = v; loadLabelWaits(); }
@@ -1124,16 +1168,20 @@ function openLwNew(card) {
 }
 /** 下見のあいだは保存させない。ダイアログを開いたまま正本が変わっても追随する (Codex 下見 R1) */
 function renderLwSaveState() {
-  const btn = $('#lwSave');
-  if (!btn || !$('#lwOv').classList.contains('on')) return;
-  btn.disabled = !isApp();
-  if (!isApp()) $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)';
+  const wrap = $('#lwSaveWrap');
+  if (!wrap) return;
+  // ⭐許可が無ければボタンを**描かない** (無効化して見せるのではなく。他の操作と同じ — Codex PR1 R11)
+  const may = stateCan('task.label_wait.edit');
+  const had = !!$('#lwSave');
+  if (may !== had) wrap.innerHTML = may ? '<button class="btn primary" id="lwSave" onclick="saveLw()">保存</button>' : '';
+  if (!$('#lwOv').classList.contains('on')) return;
+  if (!may) $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)';
   else if ($('#lwMsg').textContent.startsWith('下見なので')) $('#lwMsg').textContent = '';
 }
 function fillLw(r, name) {
   $('#lwName').textContent = name || '—';
-  $('#lwMsg').textContent = isApp() ? '' : '下見なので保存できません (アプリを正本にすると使えます)';
-  $('#lwSave').disabled = !isApp();
+  $('#lwMsg').textContent = stateCan('task.label_wait.edit') ? '' : '下見なので保存できません (アプリを正本にすると使えます)';
+  renderLwSaveState();
   $('#lwOccurred').value = r.occurred_on || '';
   $('#lwLot').value = r.lot_expiry || '';
   $('#lwQty').value = r.qty == null ? '' : r.qty;
@@ -1156,10 +1204,11 @@ function pickLwLoc(v) {
 function closeLw() { closeOverlay('#lwOv'); lwEditing = null; }
 async function saveLw() {
   if (!lwEditing) return;
-  if (!isApp()) { $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)'; return; }
+  if (!stateCan('task.label_wait.edit')) { $('#lwMsg').textContent = '下見なので保存できません (アプリを正本にすると使えます)'; return; }
   const w = worker;
   if (!w) { openGate(); return; }
   const btn = $('#lwSave');
+  if (!btn) return;
   btn.disabled = true; $('#lwMsg').textContent = '保存しています…';
   try {
     const fields = {
@@ -1178,7 +1227,7 @@ async function saveLw() {
     toast('ラベル待ちを保存しました');
     if (curView === 'label') loadLabelWaits();
   } finally {
-    btn.disabled = !isApp();   // 保存中に正本が変わっていたら押せないまま
+    btn.disabled = !stateCan('task.label_wait.edit');   // 保存中に許可が変わっていたら押せないまま
   }
 }
 
@@ -1240,15 +1289,106 @@ async function forceRefresh() {
 }
 
 // ─── 詳細 ───
+/** 一覧・ボードのカード (state) を開く。許された操作は /api/state が返した capabilities */
 function openDetail(id) {
   const c = findCard(id);
   if (!c) return;
-  curDetail = c.id;
-  renderDetail(c);
-  document.body.classList.add('detail-open');
-  window.scrollTo(0, 0);
+  showDetail(c, 'state', state.capabilities || []);
+  fillWorkHistory(id);
 }
-function closeDetail() { curDetail = null; document.body.classList.remove('detail-open'); clearInterval(tickId); }
+/**
+ * 「これまでの作業」は件数ぶん引かないよう一覧には付けていない。詳細を開いたときに 1 枚だけ取る
+ * (読むだけの API なので、これで DB は変わらない — Codex PR1 R15)
+ */
+async function fillWorkHistory(id) {
+  if (!isApp()) return;   // Notion 正本の一覧はページ id (この API は tasks の id)
+  const gen = detailGen;
+  const j = await apiFetch('/api/task-previews/' + encodeURIComponent(id));
+  if (gen !== detailGen || !sameId(curDetail, id) || detailSrc !== 'state') return;   // 別のカードを開いた
+  if (!j.ok || !j.card) return;
+  if (detailCard) {
+    detailCard.work_history = j.card.work_history || [];
+    renderDetail(detailCard, { keepScroll: true });
+  }
+}
+/**
+ * 下見・履歴: 1 枚だけサーバーから取って読むだけで開く (capabilities は空 = 何の操作も描かない)。
+ * 取れなければ、ボードに載っていた下見のカードならその時点の中身で開く (最新を取れなかったと出す)
+ */
+/**
+ * 世代番号。カードを選ぶ・戻る・正本が変わるたびに進める。
+ * 遅れて返ってきた応答が、別のカードや閉じた後の画面を勝手に開かないようにする (Codex PR1 R2)
+ */
+let detailGen = 0;
+async function openPreviewDetail(id, { silent = false } = {}) {
+  const gen = ++detailGen;
+  const wasApp = isApp();
+  const j = await apiFetch('/api/task-previews/' + encodeURIComponent(id));
+  // 待っている間に別のカードを開いた・戻った・正本が変わった → この応答は捨てる
+  if (gen !== detailGen || isApp() !== wasApp) return;
+  if (!j.ok) {
+    if (j.error === 'not_found') {
+      if (!silent) showErr('このカードはもうありません');
+      if (sameId(curDetail, id)) forceCloseDetail('このカードはもうありません');
+      return;
+    }
+    if (silent) {
+      // 巡回での取り直しは、内容を残したまま「最新を確認できていない」と出す (古いまま黙らない — Codex PR1 R3)
+      detailMeta = { ...detailMeta, stale: true };
+      if (detailCard) renderDetail(detailCard, { keepScroll: true });
+      return;
+    }
+    const fallback = ((preview && preview.cards) || []).find(x => sameId(x.id, id)) || null;
+    if (!fallback) { showErr(j.message || 'カードを開けませんでした'); return; }
+    showDetail(fallback, 'preview', [], { stale: true, fetchedAt: null });
+    return;
+  }
+  showDetail(j.card, 'preview', j.capabilities,
+    { notionSyncedAt: j.notionSyncedAt || null, fetchedAt: j.serverNow || null, stale: false },
+    { keepScroll: silent });   // 巡回の取り直しでは読んでいる位置を動かさない
+}
+function showDetail(c, src, caps, meta, opts) {
+  detailGen++;
+  curDetail = c.id;
+  detailSrc = src;
+  detailCard = c;
+  detailCaps = Array.isArray(caps) ? caps : [];
+  detailMeta = meta || {};
+  renderDetail(c, opts);
+  document.body.classList.add('detail-open');
+  if (!(opts && opts.keepScroll)) window.scrollTo(0, 0);   // 60 秒の取り直しで先頭へ戻さない (Codex PR1 R3)
+}
+function closeDetail() {
+  detailGen++;
+  curDetail = null; detailSrc = null; detailCard = null; detailCaps = []; detailMeta = {};
+  document.body.classList.remove('detail-open'); clearInterval(tickId);
+}
+/**
+ * 開いているダイアログごと詳細を閉じる (カードが消えた・正本が変わった)。
+ * 保存中は画面を引き剥がせないので、**許可リストを空にして操作を止め**、予約しておいて通信が終わったら閉じる
+ * (そのまま残すと、失敗応答でボタンが再び押せるようになってしまう — Codex PR1 R2)
+ */
+let pendingForceClose = null;
+function forceCloseDetail(msg) {
+  detailCaps = [];                      // これ以降 can() は全部 false (入口の守りが効く)
+  detailGen++;                          // 走っている詳細取得の応答を捨てる
+  if (mvSaving || stSaving) {
+    pendingForceClose = msg || '画面が変わったので詳細を閉じました';
+    for (const id of ['mvSave', 'stCancel']) { const b = document.getElementById(id); if (b) b.disabled = true; }
+    return;
+  }
+  pendingForceClose = null;
+  for (const ov of document.querySelectorAll('.overlay.on')) closeOverlay('#' + ov.id);
+  closeDetail();
+  if (msg) toast(msg);
+}
+/** 保存の通信が終わったら呼ぶ。閉じる予約があれば、そこで閉じる */
+function settleForceClose() {
+  if (!pendingForceClose || mvSaving || stSaving) return;
+  const msg = pendingForceClose;
+  pendingForceClose = null;
+  forceCloseDetail(msg);
+}
 
 // ── 時間の表示 ──
 function fmtDur(sec) {
@@ -1282,7 +1422,8 @@ function kv(label, value, opts) {
   const empty = value == null || value === '';
   const inner = '<label>' + esc(label) + '</label><div class="v num">' +
     (empty ? (miss ? '未登録' : '—') : esc(value)) + '</div>';
-  if (!reg) return '<div class="kv' + (miss ? ' miss' : '') + '">' + inner + '</div>';
+  // 変更・登録が許されていなければ (下見・履歴) タップの印も data-reg も付けない
+  if (!reg || !can('task.master.edit')) return '<div class="kv' + (miss ? ' miss' : '') + '">' + inner + '</div>';
   return '<div class="kv tap' + (miss ? ' miss' : '') + '" data-reg="' + esc(reg) + '">' + inner +
     '<span class="edit">' + (empty ? '＋ 登録' : '✎ 変更') + '</span></div>';
 }
@@ -1293,10 +1434,34 @@ $('#dbody').addEventListener('click', (e) => {
   if (el) openMaster(el.dataset.reg);
 });
 
-function renderDetail(c) {
-  const st = $('#dstate');
-  st.textContent = stLabel(c) + ' ▾';
-  st.className = 'st ' + stClass(c.status);
+/** 下見・履歴で開いたときの注意書き。何が「いつ時点」かを項目ごとに分けて出す (Codex R4 Q5) */
+function detailNoteHtml(c) {
+  if (detailSrc !== 'preview') return '';
+  const when = (iso) => fmtDate(iso) + ' ' + fmtTime(iso);
+  const head = c.status === 'closed' ? '終了したカードです (履歴)。ここからは操作できません。'
+    : isApp() ? '読むだけで開いています。'
+    : '👀 見るだけの下見です (正本はまだ Notion)。ここからは操作できません。';
+  const stateSrc = isApp() ? '状態: いまのアプリの記録'
+    : 'Notion の状態: ' + (detailMeta.notionSyncedAt ? when(detailMeta.notionSyncedAt) + ' に取り込んだ時点' : '取り込んだ時点');
+  // アプリの記録は**いつ取ったか**を書く。「いまの記録」と言い切ると、取り直せていないときに嘘になる (Codex PR1 R3)
+  const appSrc = '作業のやり方・写真・作業時間: '
+    + (detailMeta.fetchedAt ? when(detailMeta.fetchedAt) + ' に取得' : 'ボードを読み込んだ時点');
+  return '<div class="preview' + (detailMeta.stale ? ' stale' : '') + '">' + head +
+    '<small>' + stateSrc + ' ・ 在庫: ' + (c.loc_at ? when(c.loc_at) + ' 時点' : '未取得') +
+    ' ・ ' + appSrc +
+    (detailMeta.stale ? ' ・ ⚠ いま最新を確認できません (上の時点の中身を出しています)' : '') + '</small></div>';
+}
+
+function renderDetail(c, opts) {
+  const keepScroll = !!(opts && opts.keepScroll);
+  const scrollY = keepScroll ? window.scrollY : 0;
+  // 状態: 変更が許されていればボタン、読むだけなら札 (静的なボタンを置いてから隠さない)
+  const wrap = $('#dstateWrap');
+  if (wrap) {
+    wrap.innerHTML = can('task.status.change')
+      ? '<button class="st ' + stClass(c.status) + '" id="dstate" onclick="openStFromDetail()">' + esc(stLabel(c)) + ' ▾</button>'
+      : '<span class="st ro ' + stClass(c.status) + '" id="dstate">' + esc(stLabel(c)) + '</span>';
+  }
 
   const m = c.master;
   const missSet = new Set(m.missing);
@@ -1306,6 +1471,7 @@ function renderDetail(c) {
   const prio = (c.priority.kind === 'urgent' ? '🔥 ' : '') + c.priority.label;
 
   $('#dbody').innerHTML =
+    detailNoteHtml(c) +
     '<div class="dcard"><div class="dhead">' +
       '<div class="thumb">' + thumbHtml(c) + '</div>' +
       '<div><h2>' + rowTags(c) + esc(c.title) + '</h2>' +
@@ -1335,15 +1501,37 @@ function renderDetail(c) {
       (c.external_text ? kv('外部出し目安', c.external_text) : '') +
       (c.supplier ? kv('取引先', c.supplier) : '') +
     '</div>' +
-      '<p class="nlink">直したい項目をタップしてください。空欄の登録はだれでもできます。入っている値の変更は職員PINが必要です。</p>' +
+      (can('task.master.edit')
+        ? '<p class="nlink">直したい項目をタップしてください。空欄の登録はだれでもできます。入っている値の変更は職員PINが必要です。</p>' : '') +
       (m.source === 'card'
         ? '<p class="nlink">※作業仕様マスタに未登録のため、カード作成時の値を表示しています。登録すると次回からマスタの値になります。</p>' : '') +
       (c.url ? '<p class="nlink">🗂 <a href="' + esc(c.url) + '" target="_blank" rel="noopener">' + (isApp() ? '移行元のNotionカード (参考)' : 'Notionのカードを開く') + '</a></p>' : '') +
     '</div>' +
 
     mediaCardHtml(c) +
+    historyCardHtml(c) +
     workCardHtml(c);
   startTimerTick(c);
+  // 60 秒の取り直しでは、読んでいた位置に戻す (先頭へ飛ばさない — Codex PR1 R3)
+  if (keepScroll) window.scrollTo(0, scrollY);
+}
+
+/**
+ * このカードの終わった作業 (読むだけ)。1 枚だけ取る詳細 (下見・履歴) にだけ付く。
+ * 「前回の実績」は同じ商品の他のカードの平均なので別物 — こちらは**このカード**で誰が何分やったか
+ */
+const END_REASON = { done: 'できあがり', pause: '中断', admin: '職員が終了' };
+function historyCardHtml(c) {
+  const rows = c.work_history || [];
+  if (rows.length === 0) return '';
+  const total = rows.reduce((a, r) => a + (Number(r.raw_seconds) || 0), 0);
+  const items = rows.map(r =>
+    '<li><b>' + esc(r.worker_name || '—') + '</b> さん ・ ' + esc(fmtDate(r.started_at) + ' ' + fmtTime(r.started_at)) +
+    ' 〜 ' + esc(fmtTime(r.ended_at)) + ' ・ ' + esc(fmtDur(Number(r.raw_seconds) || 0)) +
+    ' ・ ' + esc(END_REASON[r.end_reason] || r.end_reason || '—') + '</li>').join('');
+  return '<div class="dcard"><h3 class="sec">これまでの作業 — このカード</h3>' +
+    '<ul class="whist">' + items + '</ul>' +
+    '<p class="est num">合計 ' + esc(fmtDur(total)) + ' (' + rows.length + '回)</p></div>';
 }
 
 // ── 写真・動画: 「前回の完成形」(同じ商品の見本) と「今回のできあがり」 ──
@@ -1371,7 +1559,7 @@ function mediaTile(m) {
     : '<div><span class="ic">' + KIND_ICON[m.kind] + '</span>' + esc(m.worker_name || '') + '</div>';
   return '<div class="ph' + (m.error ? ' err' : '') + (m.kind === 'video' ? ' mov' : '') + '" onclick="openMedia(event,' + m.id + ')">' +
     inner +
-    (own ? '<button class="del" onclick="delMedia(event,' + m.id + ')">×</button>' : '') +
+    (own && can('task.media.add') ? '<button class="del" onclick="delMedia(event,' + m.id + ')">×</button>' : '') +
     (stx ? '<span class="stx">' + stx + '</span>' : '') +
     '<div class="cap">' + KIND_ICON[m.kind] + ' ' + esc(fmtDate(m.created_at)) + ' ' + esc(m.worker_name || '') + '</div></div>';
 }
@@ -1391,19 +1579,28 @@ function prevCardHtml(c) {
 function mediaCardHtml(c) {
   // 動画は当面なし (VIDEO_ENABLED)。既に撮ってあるものも画面には出さない (データは消していない)
   const media = VIDEO_ENABLED ? c.media : c.media.filter(m => m.kind === 'photo');
-  const photos = media.length;
   const tiles = media.map(mediaTile).join('');
-  const pend = [...pendingTiles.values()].filter(p => p.pageId === c.id).map(p =>
+  const pending = [...pendingTiles.values()].filter(p => p.pageId === c.id);
+  // 送信中の分も枚数に数える (撮って・縮めて・送ってから断られないように — Codex PR1 R13)
+  const photos = media.filter(m => m.kind === 'photo').length + pending.filter(p => p.kind === 'photo').length;
+  const pend = pending.map(p =>
     '<div class="ph' + (p.failed ? ' err' : '') + '">' +
     (p.previewUrl ? '<img src="' + p.previewUrl + '" alt="">' : '<div><span class="ic">' + KIND_ICON[p.kind] + '</span></div>') +
-    (p.failed ? '<button class="reg" onclick="retryUpload(event,\'' + p.opId + '\')">↻ 再送</button>' : '<span class="stx">送信中</span>') +
+    (p.failed
+      ? '<button class="reg" onclick="retryUpload(event,\'' + p.opId + '\')">↻ 再送</button>' +
+        '<button class="x" onclick="dropPending(event,\'' + p.opId + '\')" aria-label="この写真をやめる">×</button>'
+      : '<span class="stx">送信中</span>') +
     '</div>').join('');
-  const addP = photos < 3 ? '<div class="ph add" onclick="pickMedia(\'photo\')"><div><span class="ic">📷</span>写真を<br>とる</div></div>' : '';
-  const videos = VIDEO_ENABLED ? c.media.filter(m => m.kind === 'video').length : 0;
-  const addV = VIDEO_ENABLED && videos < 1 ? '<div class="ph add mov" onclick="pickMedia(\'video\')"><div><span class="ic">🎥</span>動画を<br>とる</div></div>' : '';
+  // 撮る・送り直す・消す は許されたときだけ描く (下見・履歴では写真は見るだけ)
+  const canPhoto = can('task.media.add');
+  const addP = can('task.media.add') && photos < 3 ? '<div class="ph add" onclick="pickMedia(\'photo\')"><div><span class="ic">📷</span>写真を<br>とる</div></div>' : '';
+  const videos = VIDEO_ENABLED ? c.media.filter(m => m.kind === 'video').length + pending.filter(p => p.kind === 'video').length : 0;
+  const addV = VIDEO_ENABLED && canPhoto && videos < 1 ? '<div class="ph add mov" onclick="pickMedia(\'video\')"><div><span class="ic">🎥</span>動画を<br>とる</div></div>' : '';
   return '<div class="dcard"><h3 class="sec">今回のできあがり — 次回の見本になります</h3>' +
-    '<div class="photos">' + tiles + pend + addP + addV + '</div>' +
-    '<p class="hint">できあがった状態を撮ってください。次に同じ商品が来たとき「前回の完成形」として出ます (写真3枚まで。ドライブに保存)。</p></div>';
+    '<div class="photos">' + tiles + (canPhoto ? pend : '') + addP + addV + '</div>' +
+    (canPhoto
+      ? '<p class="hint">できあがった状態を撮ってください。次に同じ商品が来たとき「前回の完成形」として出ます (写真3枚まで。ドライブに保存)。</p>'
+      : (photos === 0 ? '<p class="hint">まだ写真はありません。</p>' : '')) + '</div>';
 }
 
 // ライトボックス (その場で大きく見る)
@@ -1415,7 +1612,8 @@ function closeLb(ev) {
 }
 function openMedia(ev, id) {
   ev.stopPropagation();
-  for (const c of state.cards) {
+  // 開いている詳細のカード (下見・履歴は state に無い) → 一覧の順に探す
+  for (const c of (detailCard ? [detailCard, ...state.cards] : state.cards)) {
     const m = c.media.find(x => x.id === id);
     if (!m) continue;
     if (!m.viewable) { toast(m.error ? '送信に失敗しています (削除して撮り直してください)' : 'まだ送信中です'); return; }
@@ -1428,7 +1626,7 @@ function openMedia(ev, id) {
 function openPrev(ev, id) {
   ev.stopPropagation();
   let p = null;
-  for (const c of state.cards) { p = (c.previous_photos || []).find(x => x.id === id); if (p) break; }
+  for (const c of (detailCard ? [detailCard, ...state.cards] : state.cards)) { p = (c.previous_photos || []).find(x => x.id === id); if (p) break; }
   const cap = p ? fmtDate(p.created_at) + ' ' + (p.worker_name || '') : '';
   showLb('<img src="' + fileUrl(id) + '" alt="">', '前回の完成形 ' + cap);
 }
@@ -1438,6 +1636,7 @@ const pendingTiles = new Map();   // opId → { pageId, kind, blob, name, failed
 const newOpId = () => Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
 
 function pickMedia(kind) {
+  if (!can('task.media.add')) return;   // 読むだけ (下見・履歴) では撮らない
   if (!worker) { openGate(); return; }
   if (kind !== 'photo' && !VIDEO_ENABLED) { toast('動画は今つかえません (写真をとってください)'); return; }
   const inp = document.createElement('input');
@@ -1488,6 +1687,14 @@ async function shrinkPhoto(file) {
 async function uploadMedia(opId) {
   const p = pendingTiles.get(opId);
   if (!p || !worker) return;
+  // カメラ・ファイル選択は非同期。開いている間に正本や開いている詳細が変わり得るので、
+  // 実際に送る直前にも許可リストと相手のカードを確かめる (Codex PR1 R10)
+  if (!can('task.media.add') || String(p.pageId) !== String(curDetail)) {
+    pendingTiles.delete(opId);
+    rerenderDetail();
+    showErr('このカードには写真を足せなくなりました');
+    return;
+  }
   p.failed = false;
   rerenderDetail();
   const fd = new FormData();
@@ -1517,10 +1724,28 @@ async function uploadMedia(opId) {
   toast('写真を送りました (ドライブへ保存中)');
 }
 
-function retryUpload(ev, opId) { ev.stopPropagation(); uploadMedia(opId); }
+function retryUpload(ev, opId) { ev.stopPropagation(); if (!can('task.media.add')) return; uploadMedia(opId); }
+/** 送れなかった写真を捨てる (撮り直せるように枠を空ける — Codex PR1 R14) */
+async function dropPending(ev, opId) {
+  ev.stopPropagation();
+  if (!can('task.media.add')) return;   // 許可リストに無ければ動かない (他の写真操作と同じ)
+  const p = pendingTiles.get(opId);
+  if (!p) return;
+  if (!window.confirm('この写真をやめますか? (もう一度とり直せます)')) return;
+  // ⭐通信が切れただけで、サーバーでは受け取れていることがある。先にサーバー側も取り消す
+  //   (取り消せないまま画面から消すと、枠を使ったまま消せない写真が残る — Codex PR1 R15)
+  const j = await apiFetch('/api/media/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: p.pageId, operation_id: opId }) });
+  if (!j.ok) { showErr(j.message || 'この写真をやめられませんでした'); return; }
+  if (p.previewUrl) { try { URL.revokeObjectURL(p.previewUrl); } catch (e) { /* 解放できなくてもよい */ } }
+  pendingTiles.delete(opId);
+  rerenderDetail();
+  loadState();   // サーバー側にあった分が消えたかもしれないので一覧を取り直す
+}
 
 async function delMedia(ev, id) {
   ev.stopPropagation();
+  if (!can('task.media.add')) return;   // 読むだけ (下見・履歴) では消さない (× も描いていない。二重の守り)
   if (!confirm('この写真を削除しますか? (撮り直し用)')) return;
   const j = await apiFetch('/api/media/' + id + '/delete', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -1596,6 +1821,7 @@ function openOptNew(kind) {
   const i = document.getElementById('optNewIn'); if (i) i.focus();
 }
 async function saveOptNew(kind) {
+  if (!can('task.master.edit') || !mvCtx) return;   // 読むだけ (下見・履歴) では登録しない
   const inp = document.getElementById('optNewIn');
   const code = (inp ? inp.value : '').trim();
   if (!code) { $('#mvMsg').textContent = '❌ 値を入れてください'; return; }
@@ -1609,7 +1835,8 @@ async function saveOptNew(kind) {
   }
   $('#mvMsg').textContent = '登録中…';
   const j = await apiFetch('/api/options', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kind, code, worker_id: worker.id, pin: pin || undefined }) });
+    // どのカードから登録したかを添える (サーバーは「いま書けるカード」か必ず確かめる — Codex PR1 R3)
+    body: JSON.stringify({ id: mvCtx.cardId, kind, code, worker_id: worker.id, pin: pin || undefined }) });
   if (!j.ok) {
     if (j.error === 'pin_required' || j.error === 'pin_invalid' || j.error === 'staff_required') {
       $('#mvPinRow').style.display = 'block'; $('#mvPin').value = ''; $('#mvPin').focus();
@@ -1695,6 +1922,7 @@ const MV_TITLE = { material_code: '資材', storage_container: '保管箱', unit
  * 保管箱をタップしたら保管箱だけ)。field を指定しなければ全部出す
  */
 function openMaster(field) {
+  if (!can('task.master.edit')) return;   // 読むだけ (下見・履歴) では開かない (data-reg も付けていない。二重の守り)
   if (!worker) { openGate(); return; }
   const c = findCard(curDetail);
   if (!c) return;
@@ -1724,6 +1952,7 @@ $('#mvOv').addEventListener('click', e => { if (e.target === $('#mvOv')) closeMa
 
 async function saveMaster() {
   if (mvSaving || !worker || !mvCtx) return;
+  if (!can('task.master.edit')) return;   // 読むだけ (下見・履歴) では保存しない
   const fields = {};
   // 開いた項目だけを見る (隠している項目は比べない — 将来ほかの処理が値を書き換えても巻き込まれない。Codex R1)
   const targets = mvCtx.field ? [[mvCtx.field, MV_MAP[mvCtx.field]]] : Object.entries(MV_MAP);
@@ -1745,6 +1974,7 @@ async function saveMaster() {
   });
   mvSaving = false;
   for (const id of ['mvSave', 'mvCancel']) document.getElementById(id).disabled = false;
+  settleForceClose();   // 通信中に「閉じる」が予約されていれば、ここで閉じる
 
   if (j.ok) {
     closeOverlay('#mvOv');
@@ -1791,7 +2021,11 @@ function workCardHtml(c) {
   }).join('');
   const mine = myActiveOf(c);
   let controls;
-  if (mine) {
+  if (!can('task.work.start')) {
+    // 読むだけ (下見・履歴): 開始・中断・できあがりのボタンは描かない。いま作業中の人だけ見せる
+    controls = (c.status === '棚入完了' || c.status === 'closed') ? '<p class="nlink">このカードは終わっています。</p>'
+      : (chips ? '' : '<p class="nlink">いま作業している人はいません。</p>');
+  } else if (mine) {
     controls =
       '<div class="wtimer"><div class="t num" id="wt" data-start="' + esc(mine.started_at) + '">--:--</div>' +
       '<small>作業時間 (サーバーで記録しています)</small></div>' +
@@ -1806,21 +2040,21 @@ function workCardHtml(c) {
   }
   // アプリ正本のみ: 今日やる / 後日 (未着手・保留のカード)。一覧では「📌 今日やる」が上に並ぶ
   let plan = '';
-  if (isApp() && (c.status === 'not_started' || c.status === 'on_hold')) {
+  if (can('task.plan.assign') && (c.status === 'not_started' || c.status === 'on_hold')) {
     plan = '<div class="wbtns" style="margin-top:10px">' +
       '<button class="btn" onclick="setPlanned(' + (c.today ? 'false' : 'true') + ')">' +
       (c.today ? '📌 今日やる をやめる' : '📌 今日やる') + '</button></div>';
   }
   // アプリ正本のみ: 外部施設に出す準備ができたか (状態とは別のチェック。Notion のチェックボックスの置き換え)
   let ext = '';
-  if (isApp() && c.status !== 'closed') {
+  if (can('task.external_ready') && c.status !== 'closed') {
     ext = '<div class="wbtns" style="margin-top:10px">' +
       '<button class="btn' + (c.external_ready ? ' primary' : '') + '" onclick="setExternalReady(' + (c.external_ready ? 'false' : 'true') + ')">' +
       (c.external_ready ? '📦 外部に出す準備OK をやめる' : '📦 外部に出す準備OK にする') + '</button></div>';
   }
   // アプリ正本のみ: ラベル待ちの記録 (メーカーのラベルが足りず作業を止めているもの)
   let label = '';
-  if (isApp() && c.status !== 'closed') {
+  if (can('task.label_wait.edit') && c.status !== 'closed') {
     label = '<div class="wbtns" style="margin-top:10px">' +
       '<button class="btn" onclick="openLwNew()">🏷 ラベル待ちに登録</button></div>';
   }
@@ -1832,7 +2066,7 @@ function workCardHtml(c) {
 
 /** 「外部施設に出す準備OK」の切り替え。アプリ正本のみ */
 async function setExternalReady(on) {
-  if (!worker || !curDetail) return;
+  if (!worker || !curDetail || !can('task.external_ready')) return;
   const c = findCard(curDetail);
   if (!c) return;
   const j = await apiFetch('/api/external-ready', {
@@ -1852,7 +2086,7 @@ async function setExternalReady(on) {
 
 /** 「今日やる」(planned_date = 今日) / 後日 (null)。アプリ正本のみ */
 async function setPlanned(on) {
-  if (!worker || !curDetail) return;
+  if (!worker || !curDetail || !can('task.plan.assign')) return;
   const c = findCard(curDetail);
   if (!c) return;
   const j = await apiFetch('/api/planned', {
@@ -1882,6 +2116,7 @@ function startTimerTick(c) {
 }
 
 async function startWork() {
+  if (!can('task.work.start')) return;   // 読むだけ (下見・履歴) では始めない
   if (!worker) { openGate(); return; }
   if (!curDetail) return;
   const btn = document.getElementById('startBtn');
@@ -1911,7 +2146,7 @@ async function startWork() {
 }
 
 async function stopWork(reason) {
-  if (!worker || !curDetail) return;
+  if (!worker || !curDetail || !can('task.work.start')) return;   // 開始できない画面では終了・中断もしない
   const cNow = findCard(curDetail);
   const mine = cNow ? myActiveOf(cNow) : null;
   if (!mine || !mine.id) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
@@ -1948,7 +2183,7 @@ async function stopWork(reason) {
     if (m) m.textContent = isApp() ? 'できあがりです! 棚に入れ終わったら「終了 → 棚入完了」を (職員PINが必要です)' : 'できあがりです! 棚に入れ終わったら「棚入完了」を (職員PINが必要です)';
   }
 }
-function openStFromDetail() { if (curDetail) openSt(null, curDetail); }
+function openStFromDetail() { if (curDetail && can('task.status.change')) openSt(null, curDetail); }
 
 // ─── ステータス変更 (Codex R2 ①: 保存中表示・処理中は全ボタン無効・失敗は大きく) ───
 let stTarget = null;   // カードの id
@@ -1988,6 +2223,7 @@ function renderStBtns(c) {
 
 function openSt(ev, id) {
   if (ev) ev.stopPropagation();
+  if (!stateCan('task.status.change')) return;   // 許可リストに無ければ開かない (札も描いていない。二重の守り)
   if (!worker) { openGate(); return; }
   const c = findCard(id);
   if (!c) return;
@@ -2018,6 +2254,7 @@ function applyTask(c, t) {
 
 async function doSetSt(choice) {
   if (stSaving || stTarget == null || !worker) return;
+  if (!stateCan('task.status.change')) { closeSt(); return; }   // 許可リストに無ければ変えない (札も描いていない)
   const c = state.cards.find(x => x.id === stTarget);
   if (!c) { closeSt(); return; }
 
@@ -2072,6 +2309,7 @@ async function doSetSt(choice) {
   stStep = null;
   stSaving = false;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
+  settleForceClose();   // 通信中に「閉じる」が予約されていれば、ここで閉じる
 
   // 一覧に残らないステータス (棚入完了) になったら、その場で行を外す (次の取得でも入ってこない)
   const dropCard = () => {

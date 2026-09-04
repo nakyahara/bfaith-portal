@@ -13,11 +13,11 @@
 import { buildEnrichContext } from '../inbound-check/notion-sync.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
-import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask } from './db.js';
+import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask, finishedSessionsOfTask } from './db.js';
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, HOLD_REASONS, HOLD_LABEL, CLOSE_REASONS, CLOSE_LABEL, statusLabel } from './tasks.js';
-import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks } from './tasks-db.js';
+import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask } from './tasks-db.js';
 
 // 「急ぎ」の線引き: 在庫切れ、または残り在庫日数がこれ以下
 export const URGENT_DAYS = 3;
@@ -213,17 +213,17 @@ export function buildList() {
 }
 
 /**
- * 一覧 (アプリ正本 = f_iroha_tasks)。buildList と同じ形の cards[] を返すので画面は共通。
+ * タスク行 → 画面のカード。一覧・ボード・下見・履歴の詳細で同じ形 (buildList と同じ cards[] の形なので画面は共通)。
  * 違いは識別子 (id = task.id) と状態 (status = 英語の値・status_label = 表示) と、拠点・保留理由・「今日やる」を持つこと。
- * 終了 (closed) は含めない (履歴画面で見る — 中原さん 2026-09-03「完了が溜まる一方なのを何とかしたい」)
+ * rows に closed が混ざっていてもそのまま作る (履歴の詳細用)。並べ替えと画像の取り寄せは呼び出し側。
+ * readOnly = 下見・履歴。DB を一切変えない (写真の修復印も付けない・対象カードの写真だけ引く — Codex PR1 R8)
  */
-export function buildTaskList({ facility = null } = {}) {
-  const rows = listOpenTasks({ facility });
+function buildTaskCards(rows, { readOnly = false } = {}) {
   const ctx = enrichContext();
   const images = productImageMap(rows.map(r => r.product_code));
   const activeMap = activeSessionsByTask();
   const estimates = estimateByProduct();
-  const mediaMap = mediaByTask();
+  const mediaMap = mediaByTask(readOnly ? { ids: rows.map((r) => r.id), repair: false } : undefined);
   const prevPhotos = photosByCodeKey();
   const zStock = stockMapByPrefix(rows.map((r) => keyOf(r.product_code)), 'Z');
   // 外部 (羅針盤・ワークセンター) に出したカードは Y ロケを見せる。その拠点のカードの商品だけ引く
@@ -292,6 +292,39 @@ export function buildTaskList({ facility = null } = {}) {
       previous_photos: previousPhotosOf(k ? (prevPhotos.get(k) || []) : [], `t${r.id}`),
     };
   });
+  return { cards, today };
+}
+
+/** 商品画像がまだ無いカードの取り寄せを頼む (一覧・単票の共通処理。失敗しても表示は続ける) */
+function queueMissingImages(cards) {
+  const missingImg = [...new Set(cards.filter(c => c.product_code && !c.image_url).map(c => c.product_code))];
+  if (missingImg.length === 0) return;
+  try { queueEnsureImages(missingImg, 'いろは作業アプリ'); } catch (e) { console.warn('[iroha-work] 画像解決を飛ばしました:', e.message); }
+}
+
+/**
+ * 1 枚だけ (下見・履歴の詳細)。終了したタスクも返す。無ければ null。
+ * 一覧と違い、そのカードの**終わった作業** (work_history) も付ける — 詳細でしか使わないので 1 件ずつ引く
+ */
+export function buildTaskCard(id, { queueImages = true, readOnly = false } = {}) {
+  const t = getTask(id);
+  if (!t) return null;
+  const card = buildTaskCards([t], { readOnly }).cards[0] || null;
+  if (!card) return null;
+  card.work_history = finishedSessionsOfTask(t.id);
+  // ⭐下見・履歴 (読むだけ) では取り寄せない。開くだけで画像キューの DB が変わると
+  //   「読むだけの画面では何も書かない」という境界が崩れる (Codex PR1 R7)
+  if (queueImages) queueMissingImages([card]);
+  return card;
+}
+
+/**
+ * 一覧 (アプリ正本 = f_iroha_tasks)。
+ * 終了 (closed) は含めない (履歴画面で見る — 中原さん 2026-09-03「完了が溜まる一方なのを何とかしたい」)
+ */
+export function buildTaskList({ facility = null, readOnly = false } = {}) {
+  const rows = listOpenTasks({ facility });
+  const { cards, today } = buildTaskCards(rows, { readOnly });
 
   // 並び: 今日やる → 優先度 (急ぎ→新商品→通常→データなし→販売なし) → 在庫日数 → 入庫が古い順
   cards.sort((a, b) => {
@@ -308,10 +341,8 @@ export function buildTaskList({ facility = null } = {}) {
     return String(a.title).localeCompare(String(b.title), 'ja');
   });
 
-  const missingImg = [...new Set(cards.filter(c => c.product_code && !c.image_url).map(c => c.product_code))];
-  if (missingImg.length > 0) {
-    try { queueEnsureImages(missingImg, 'いろは作業アプリ'); } catch (e) { console.warn('[iroha-work] 画像解決を飛ばしました:', e.message); }
-  }
+  // 読むだけ (下見) では画像の取り寄せも起こさない — 開くだけで DB が変わらない (Codex PR1 R7 / R8)
+  if (!readOnly) queueMissingImages(cards);
 
   return {
     mode: 'app',

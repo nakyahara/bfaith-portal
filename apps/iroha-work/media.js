@@ -18,7 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { google } from 'googleapis';
-import { getDB } from './db.js';
+import { getDB, sourceOfTruth } from './db.js';
 import { notionRequest, isNotionConfigured } from '../inbound-check/notion.js';
 import { codeKeyOf } from '../inbound-check/work-master.js';
 
@@ -67,8 +67,12 @@ const refWhere = ({ taskId = null, pageId = null }) => (taskId != null
 
 export function countActiveMedia(ref, kind) {
   const w = refWhere(typeof ref === 'object' && ref !== null ? ref : { pageId: ref });
+  // 送信中の行 (staged_at が新しい) は枠として数える — 並行送信で上限を超えないため。
+  // 置き去りになった古い行は数えない (sweep が片づけるまで枠を食いつぶさない) — Codex PR1 R8 / R9
+  const fresh = new Date(Date.now() - STAGE_TTL_MS).toISOString();
   return getDB().prepare(`SELECT COUNT(*) c FROM f_iroha_card_media
-    WHERE ${w.sql} AND kind = ? AND deleted_at IS NULL`).get(w.arg, kind).c;
+    WHERE ${w.sql} AND kind = ? AND deleted_at IS NULL AND (staged_at IS NULL OR staged_at >= ?)`)
+    .get(w.arg, kind, fresh).c;
 }
 
 /** 1行 (配信 API 用。削除済みも返すので呼び元で deleted_at を見る) */
@@ -80,9 +84,44 @@ export function getMediaRow(id) {
  * Drive 側で消えた (404/410) 写真に印を付け、表示と「前回の完成形」候補から外す (Codex R1 #5)。
  * 一時的な失敗 (5xx) では呼ばない。管理画面の「再実行」(resetMedia) で解除できる
  */
-export function markMediaUnavailable(id, reason) {
-  return getDB().prepare(`UPDATE f_iroha_card_media SET unavailable_at = ?, error = ? WHERE id = ? AND unavailable_at IS NULL`)
-    .run(utcNow(), String(reason || 'unavailable').slice(0, 300), Number(id)).changes > 0;
+/**
+ * 「ドライブから消えていた」の報告を溜める。⭐配信 (GET) は DB を変えない —
+ * 読むだけの画面 (下見・履歴) で写真を開いただけで DB が変わらないようにするため (Codex PR1 R9)。
+ * 実際に印を付けるのは送信キューの回 (processMediaQueue)
+ */
+const pendingUnavailable = new Map();
+export function reportMediaUnavailable(id, reason, driveFileId = null) {
+  // ⭐鍵は id だけでなく実体 (drive_file_id) も含める。送り直しの前後で配信要求の完了順が
+  //   入れ替わっても、新しい実体の報告を古い報告が押しのけない (Codex PR1 R14)
+  pendingUnavailable.set(`${Number(id)}:${driveFileId == null ? '' : driveFileId}`,
+    { id: Number(id), reason: String(reason || 'unavailable'), driveFileId });
+  schedule();
+}
+/**
+ * 溜まった報告を反映する (キューの回から呼ぶ)。⭐報告したときと同じ実体 (drive_file_id) の行にだけ
+ * 印を付ける — 報告から反映までの間に管理画面で送り直されていたら、新しい実体に古い 404 を貼らない (Codex PR1 R10)
+ */
+export function flushUnavailableReports() {
+  if (pendingUnavailable.size === 0) return 0;
+  const entries = [...pendingUnavailable.entries()];
+  pendingUnavailable.clear();
+  const db = getDB();
+  let n = 0;
+  for (const [, { id, reason, driveFileId }] of entries) {
+    // 送り直されていれば (drive_file_id が変わっていれば) 何も起きない = 古い報告は捨てられる
+    if (markMediaUnavailable(id, reason, driveFileId == null ? undefined : driveFileId)) n++;
+  }
+  return n;
+}
+
+export function markMediaUnavailable(id, reason, driveFileId = undefined) {
+  // ⭐実体の照合は**この UPDATE の中で**行う。別に SELECT して確かめると、その間に管理画面から
+  //   送り直されて別の実体になり、新しい実体に古い 404 を貼ってしまう (Codex PR1 R13)
+  const sql = `UPDATE f_iroha_card_media SET unavailable_at = ?, error = ?
+    WHERE id = ? AND unavailable_at IS NULL${driveFileId === undefined ? '' : ' AND drive_file_id IS ?'}`;
+  const args = [utcNow(), String(reason || 'unavailable').slice(0, 300), Number(id)];
+  if (driveFileId !== undefined) args.push(driveFileId);
+  return getDB().prepare(sql).run(...args).changes > 0;
 }
 
 /** 先頭バイトだけ読む (動画をメモリへ丸ごと載せない) */
@@ -99,7 +138,11 @@ function readHead(filePath, n = 16) {
  * 同じ operation_id の再送は既存行を返す (冪等)。
  * @returns {ok:true, media, already?} | {ok:false, error, message}
  */
-export function addMedia({ pageId = null, taskId = null, productCode = null, kind, mime, filePath, worker, deviceLabel = null, deviceId = null, operationId }) {
+/**
+ * 受け取ったファイルの検査 (DB を触らない)。トランザクションに入る前にここまで済ませておくと、
+ * SQLite の書き込みロックを持ったままファイルを読まずに済む (この DB は miniPC も開く — Codex PR1 R6)
+ */
+export function inspectMediaUpload({ kind, filePath, operationId }) {
   const opId = String(operationId || '').trim();
   if (!/^[A-Za-z0-9_-]{8,64}$/.test(opId)) return { ok: false, error: 'bad_request', message: 'operation_id が不正です' };
   // 種類の判定は**いちばん先**に (ファイルを見る前・再送の照合より前)。
@@ -115,9 +158,208 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
   if (size > cap) {
     return { ok: false, error: 'too_large', message: `ファイルが大きすぎます (上限 ${Math.round(cap / 1024 / 1024)}MB)` };
   }
+  return { ok: true, opId, size };
+}
+
+/**
+ * 実体を置く前の行の状態。⭐ここに居る行は「まだ無いもの」として扱う —
+ * 一覧にも出さず、Drive への送信キューも拾わない (キューは status='stored' だけを見る)。
+ * commit の後に実体を置いてから promoteStagedMedia で 'stored' に上げる (Codex PR1 R7)
+ */
+export const MEDIA_STAGING = 'staging';   // 印は staged_at 列。status の取りうる値は増やさない
+
+/**
+ * 保管場所での置き場所。⭐札 (claim) ごとに別のファイル名にする —
+ * 同じ operation_id の二重送信が同じパスを奪い合うと、負けた側が勝った側の実体を消してしまう (Codex PR1 R9)
+ */
+export function stagedPathOf(opId, kind, claim) {
+  const ext = kind === 'photo' ? 'jpg' : 'mp4';
+  return path.join(MEDIA_DIR, claim ? `${opId}.${claim}.${ext}` : `${opId}.${ext}`);
+}
+
+/** 置き去りの staging 行とみなすまでの時間。ここを過ぎた行は sweep が片づけ、枚数上限にも数えない */
+export const STAGE_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * その写真の持ち主のカードに、**いま**書き込めるか (Codex PR1 R10 / R11)。
+ * 公開はトランザクションの外 (ファイルを置いた後) に来るので、確かめたときから
+ * カードが終了したり正本が変わったりし得る。公開のときも、消すときもここを通す。
+ * @returns {null} 書ける / {string} 断る理由 (notion_mode / closed_task / card_required)
+ */
+export function cardWriteBlockReason(row) {
+  const db = getDB();
+  const app = sourceOfTruth() === 'app';
+  if (row.task_id != null) {
+    if (!app) return 'notion_mode';   // 正本が Notion に戻っていれば、tasks のカードは下見 = 読むだけ
+    const t = db.prepare('SELECT status FROM f_iroha_tasks WHERE id = ?').get(row.task_id);
+    if (!t) return 'card_required';
+    return t.status === 'closed' ? 'closed_task' : null;
+  }
+  // Notion のカードに紐づく写真。正本がアプリなら、もう Notion のカードには書かない
+  if (app) return 'notion_card_retired';
+  return db.prepare('SELECT page_id FROM f_iroha_app_notion_cache WHERE page_id = ?').get(row.page_id)
+    ? null : 'card_required';
+}
+
+/**
+ * 実体を置き終えた staging 行を公開する。⭐札 (claim) と staged_at の両方が、
+ * 自分が見たときのままである要求だけが上げられる (Codex PR1 R8 / R10)。
+ * 公開の瞬間に「そのカードにいま書けるか」も確かめる (置いている間に終了・正本切替が起き得る)。
+ * @returns {{ok:true, media}} | {{ok:false, reason:'taken'|'gone'|'no_file'|'not_writable', media?}}
+ */
+export function promoteStagedMedia(id, localPath, { claim = null, stagedAt = null } = {}) {
+  const db = getDB();
+  // 実体が無いまま公開しない (置けたつもりで DB だけ進めない — Codex PR1 R9)
+  if (!fs.existsSync(localPath)) return { ok: false, reason: 'no_file' };
+  return db.transaction(() => {
+    const cur = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id));
+    if (!cur) return { ok: false, reason: 'gone' };
+    // 消された行は公開しない (職員が管理画面から消した後に実体を結びつけない — Codex PR1 R12)
+    if (cur.deleted_at) return { ok: false, reason: 'gone' };
+    // 別の要求が先に置いて公開した (同じ operation_id の二重送信)。写真としては成立しているので、
+    // その行をそのまま返す。実体は相手が置いたものが正 — こちらから消さない
+    if (!cur.staged_at) return { ok: false, reason: 'taken', media: publicMedia(cur) };
+    const blocked = cardWriteBlockReason(cur);
+    if (blocked) return { ok: false, reason: 'not_writable', blocked };   // 本当の理由も返す (Codex PR1 R12)
+    // ⭐枚数上限も**この**トランザクションの中で見る。外で見ると、見た後・公開する前に
+    //   別の送信で枠が埋まる (30 分以上止まっていた送信が再開する場合も含む — Codex PR1 R11)
+    const max = cur.kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
+    const key = cur.task_id != null ? 'task_id' : 'page_id';
+    const live = db.prepare(`SELECT COUNT(*) c FROM f_iroha_card_media
+      WHERE ${key} = ? AND kind = ? AND deleted_at IS NULL AND staged_at IS NULL AND id != ?`)
+      .get(cur.task_id != null ? cur.task_id : cur.page_id, cur.kind, cur.id).c;
+    if (live >= max) return { ok: false, reason: 'cap_reached' };
+    const n = db.prepare(`UPDATE f_iroha_card_media SET staged_at = NULL, staged_claim = NULL, local_path = ?
+      WHERE id = ? AND staged_at IS NOT NULL AND deleted_at IS NULL AND staged_claim IS ?
+        ${stagedAt == null ? '' : 'AND staged_at = ?'}`)
+      .run(...[localPath, Number(id), claim].concat(stagedAt == null ? [] : [stagedAt])).changes;
+    if (n === 0) return { ok: false, reason: 'taken' };
+    return { ok: true, media: publicMedia(db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id))) };
+  }).immediate();
+}
+
+/** 送信の取り消しを控える (行が無くても覚えておく)。@returns 覚えたか */
+export function recordMediaCancel(opId, { deviceId = null, actor = null } = {}) {
+  return getDB().prepare(`INSERT INTO f_iroha_media_cancels (operation_id, device_id, actor, created_at)
+    VALUES (?, ?, ?, ?) ON CONFLICT(operation_id) DO NOTHING`)
+    .run(String(opId), deviceId == null ? null : Number(deviceId), actor, utcNow()).changes > 0;
+}
+
+/** 古い取り消しの控えを片づける (7 日。遅れて届く送信はとっくに諦めている) */
+export function sweepMediaCancels(maxAgeMs = 7 * 24 * 3600 * 1000) {
+  return getDB().prepare('DELETE FROM f_iroha_media_cancels WHERE created_at < ?')
+    .run(new Date(Date.now() - maxAgeMs).toISOString()).changes;
+}
+
+/** 一時ファイルを保管場所へ移す。deferMove で呼んだ側が、トランザクションを抜けてから呼ぶ */
+export function moveStoredFile(move) {
+  if (!move) return;
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  fs.renameSync(move.from, move.to);
+}
+
+/**
+ * 実体を置けなかった行を消す (行だけ残して「実体のない写真」を作らない — Codex PR1 R6)。
+ * ⭐札を渡したときは「まだ公開されておらず、自分が札を持っている」ときだけ消す。
+ * 二重送信の負けた側が、相手が公開した行まで消さないため (Codex PR1 R8)
+ */
+export function dropMedia(id, claim = null) {
+  if (claim == null) return getDB().prepare('DELETE FROM f_iroha_card_media WHERE id = ?').run(Number(id)).changes;
+  return getDB().prepare('DELETE FROM f_iroha_card_media WHERE id = ? AND staged_at IS NOT NULL AND staged_claim IS ?')
+    .run(Number(id), claim).changes;
+}
+
+/**
+ * どの行からも指されていない実体ファイルを片づける (Codex PR1 R14)。
+ * ⭐**十分に古いものだけ**を見る — 送信中・再送中のファイルを巻き込まないため。
+ * これがないと、再送で置き場所が変わった分や、論理削除された staging 行の実体が永久に残る。
+ * @param maxAgeMs これより古いファイルだけを対象にする (既定 24 時間)
+ */
+export function sweepOrphanFiles(maxAgeMs = 24 * 3600 * 1000) {
+  const db = getDB();
+  let removed = 0;
+  let names = [];
+  try { names = fs.readdirSync(MEDIA_DIR); } catch { return { removed: 0 }; }   // 保管場所がまだ無い
+  const limit = Date.now() - maxAgeMs;
+  // 受信中の一時領域 (MEDIA_DIR/tmp) も見る。commit の後・保管場所へ移す前に落ちると、
+  // ここに実体だけが残る (どの行からも指されない — Codex PR1 R16)
+  const TMP = path.join(MEDIA_DIR, 'tmp');
+  for (const name of (() => { try { return fs.readdirSync(TMP); } catch { return []; } })()) {
+    const full = path.join(TMP, name);
+    try {
+      const st = fs.statSync(full);
+      if (!st.isFile() || st.mtimeMs >= limit) continue;   // 受信中のものには触らない
+      fs.unlinkSync(full); removed++;
+    } catch { /* 消せなければ次の回に */ }
+  }
+  for (const name of names) {
+    const full = path.join(MEDIA_DIR, name);
+    let st = null;
+    try { st = fs.statSync(full); } catch { continue; }
+    if (!st.isFile() || st.mtimeMs >= limit) continue;   // 新しいものには触らない
+    const opId = name.split('.')[0];
+    const row = db.prepare('SELECT kind, local_path, staged_at, staged_claim, deleted_at FROM f_iroha_card_media WHERE operation_id = ?').get(opId);
+    // 行そのものが無い / その行は消されている → もう誰も見ない
+    if (row && !row.deleted_at) {
+      if (row.local_path && path.resolve(row.local_path) === path.resolve(full)) continue;   // 公開済みで参照されている
+      if (row.staged_at && stagedPathOf(opId, row.kind, row.staged_claim) === full) continue; // いまの札の置き場所
+    }
+    try { fs.unlinkSync(full); removed++; } catch { /* 消せなければ次の回に */ }
+  }
+  if (removed > 0) console.log(`[iroha-work] どこからも指されていない写真の実体を ${removed} 件片づけました`);
+  return { removed };
+}
+
+/**
+ * 置き去りの staging 行を片づける (Codex PR1 R8)。iPad の再読込・端末再起動で再送が来なくなると、
+ * 行だけが残って写真の枚数上限を食いつぶす。実体が置けているものは公開し、無いものは消す。
+ * @param maxAgeMs これより古い staging 行だけを見る (送信中のものを巻き込まない)
+ */
+export function sweepStagedMedia(maxAgeMs = STAGE_TTL_MS) {
+  const db = getDB();
+  const limit = new Date(Date.now() - maxAgeMs).toISOString();
+  const rows = db.prepare(`SELECT id, operation_id, kind, page_id, task_id, staged_claim, staged_at
+    FROM f_iroha_card_media WHERE staged_at IS NOT NULL AND deleted_at IS NULL AND staged_at < ?`).all(limit);
+  let promoted = 0;
+  let dropped = 0;
+  // ⭐自分が見たときの札・時刻のままの行しか動かさない。見た後に同じ端末から再送されていたら、
+  //   それは新しい要求のものなので触らない (Codex PR1 R10)
+  // 見た後に職員が消していたら、行は残したまま実体だけ片づける (履歴から行を消さない — Codex PR1 R13)
+  const dropIfSame = (r) => db.prepare(`DELETE FROM f_iroha_card_media
+    WHERE id = ? AND staged_claim IS ? AND staged_at = ? AND deleted_at IS NULL`)
+    .run(r.id, r.staged_claim, r.staged_at).changes > 0;
+  for (const r of rows) {
+    const p = stagedPathOf(r.operation_id, r.kind, r.staged_claim);
+    if (!fs.existsSync(p)) {
+      if (dropIfSame(r)) dropped++;
+      continue;
+    }
+    // 実体は置けたが公開の前に落ちた → 写真は無事なので公開する。書けなくなっていたり
+    // 枠が埋まっていたら公開しない (判定は promoteStagedMedia の中 = 同じトランザクション)
+    if (promoteStagedMedia(r.id, p, { claim: r.staged_claim, stagedAt: r.staged_at }).ok) { promoted++; continue; }
+    if (dropIfSame(r)) { dropped++; try { fs.unlinkSync(p); } catch { /* 無ければよい */ } }
+  }
+  if (promoted > 0 || dropped > 0) console.log(`[iroha-work] 置き去りの写真を片づけました 公開=${promoted} 破棄=${dropped}`);
+  return { promoted, dropped };
+}
+
+/** staging 行を今回の送信で置き直すときの更新 (実体を差し替えるので中身の情報も今回のものにする) */
+const STAGED_RESEND_SQL = `UPDATE f_iroha_card_media
+  SET delete_token_hash = ?, staged_claim = ?, staged_at = ?, size = ?, mime = ?,
+      worker_id = ?, worker_name = ?, device_label = ?
+  WHERE id = ?`;
+
+export function addMedia({ pageId = null, taskId = null, productCode = null, kind, mime, filePath, worker, deviceLabel = null, deviceId = null, operationId, inspected = null, deferMove = false }) {
+  const ins = inspected && inspected.ok ? inspected : inspectMediaUpload({ kind, filePath, operationId });
+  if (!ins.ok) return ins;
+  const { opId, size } = ins;
   if (pageId != null && taskId != null) return { ok: false, error: 'bad_request', message: 'カードの指定が二重です (page_id と task_id の両方)' };
   if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
   const db = getDB();
+  // 取り消された送信は、遅れて届いても成立させない (通信が切れている間に「やめる」が通っている — Codex PR1 R18)
+  if (db.prepare('SELECT 1 FROM f_iroha_media_cancels WHERE operation_id = ?').get(opId)) {
+    return { ok: false, error: 'cancelled', message: 'この写真は取り消されています (もう一度とってください)' };
+  }
   const dup = db.prepare('SELECT * FROM f_iroha_card_media WHERE operation_id = ?').get(opId);
   if (dup) {
     // 再送は「同じカード」のときだけ既存行を返す。別カード (切替前の Notion カードを含む) の operation_id なら
@@ -126,12 +368,37 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
       ? (Number(dup.task_id) === Number(taskId) && dup.page_id == null)
       : (dup.page_id === pageId && dup.task_id == null);
     if (!sameCard) return { ok: false, error: 'operation_conflict', message: 'この送信は別のカードで使われています (撮り直してください)' };
+    // 実体を置く前に落ちた行 (staging) は、今回送られてきたファイルで置き直して復旧させる。
+    // これをしないと「DB にだけ残った写真」が、再送のたびに実体なしで成功扱いになる (Codex PR1 R7)。
+    // ⭐撮った端末からの再送だけ。実体を差し替えるので、大きさ・形式・撮った人も今回のもので更新する。
+    //   新しい札 (claim) を立て、これを持つ要求だけが公開・後始末をする (Codex PR1 R8)
+    const sameDevice = deviceId != null && dup.uploader_device_id === Number(deviceId);
+    if (dup.staged_at && !dup.deleted_at && deferMove && sameDevice) {
+      const token = crypto.randomBytes(16).toString('base64url');
+      const claim = crypto.randomBytes(12).toString('base64url');
+      db.prepare(STAGED_RESEND_SQL)
+        .run(crypto.createHash('sha256').update(token).digest('hex'), claim, utcNow(), size, mime || null,
+          worker.id, worker.display_name, deviceLabel, dup.id);
+      const fresh = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(dup.id);
+      // 前の札で置いたファイルはもうどの行からも指されない。呼び出し側が片づける (Codex PR1 R13)
+      const stale = dup.staged_claim && dup.staged_claim !== claim ? stagedPathOf(opId, dup.kind, dup.staged_claim) : null;
+      return { ok: true, already: true, media: publicMedia(fresh), deleteToken: token, claim, stale,
+        move: { from: filePath, to: stagedPathOf(opId, dup.kind, claim) } };
+    }
+    if (dup.staged_at) {
+      // まだ置けていない行がある。別端末からの同 operation_id はここで止める (乗っ取り防止)
+      return { ok: false, error: 'not_ready', message: 'まだ保存中です。少し待ってから撮り直してください' };
+    }
     // 応答消失→再送 (Codex PR3-R3): 削除トークンを持てていないので、**同じ端末からの再送に
     // 限って**発行し直す (古いトークンは無効になる)。別端末からの同 operation_id には返さない
     if (deviceId != null && dup.uploader_device_id === Number(deviceId) && !dup.deleted_at) {
       const token = crypto.randomBytes(16).toString('base64url');
-      db.prepare('UPDATE f_iroha_card_media SET delete_token_hash = ? WHERE id = ?')
-        .run(crypto.createHash('sha256').update(token).digest('hex'), dup.id);
+      // ⭐前のトークンも 5 世代まで生かしておく。同じ再送が何本も重なって応答の順が入れ替わると、
+      //   端末に最後に届く応答が古い世代のこともある (撮った本人が消せなくなる — Codex PR1 R10 / R11)
+      const h = crypto.createHash('sha256').update(token).digest('hex');
+      db.prepare(`UPDATE f_iroha_card_media
+        SET delete_token_hashes = ?, delete_token_hash = ?, delete_token_hash_prev = NULL WHERE id = ?`)
+        .run(pushTokenHash(dup, h), h, dup.id);
       return { ok: true, already: true, media: publicMedia(dup), deleteToken: token };
     }
     return { ok: true, already: true, media: publicMedia(dup) };
@@ -140,21 +407,23 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
   if (countActiveMedia({ pageId, taskId }, kind) >= max) {
     return { ok: false, error: 'cap_reached', message: `写真は${max}枚までです。不要な写真を削除してから撮り直してください` };
   }
-  fs.mkdirSync(MEDIA_DIR, { recursive: true });
-  const ext = kind === 'photo' ? 'jpg' : 'mp4';
-  const localPath = path.join(MEDIA_DIR, `${opId}.${ext}`);
-  fs.renameSync(filePath, localPath);
+  const claim = deferMove ? crypto.randomBytes(12).toString('base64url') : null;
+  const localPath = stagedPathOf(opId, kind, claim);
+  // deferMove のときは移さない。呼び出し側がトランザクションを抜けてから moveStoredFile を呼び、
+  // 置けてから promoteStagedMedia で 'stored' に上げる (Codex PR1 R6 / R7)
+  if (!deferMove) moveStoredFile({ from: filePath, to: localPath });
   // 削除トークン: アップロードした端末だけに一度だけ返す (worker_id は画面で選べる自己申告なので
   // 「撮った本人」の証明に使わない — Codex PR3 #2)。サーバーはハッシュのみ保存
   const deleteToken = crypto.randomBytes(16).toString('base64url');
   const info = db.prepare(`INSERT INTO f_iroha_card_media
-    (operation_id, page_id, task_id, product_code, kind, mime, size, local_path, status, worker_id, worker_name, device_label, uploader_device_id, created_at, delete_token_hash)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?, ?, ?, ?)`)
-    .run(opId, pageId, taskId == null ? null : Number(taskId), productCode, kind, mime || null, size, localPath,
+    (operation_id, page_id, task_id, product_code, kind, mime, size, local_path, staged_at, staged_claim, status, worker_id, worker_name, device_label, uploader_device_id, created_at, delete_token_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?, ?, ?, ?)`)
+    .run(opId, pageId, taskId == null ? null : Number(taskId), productCode, kind, mime || null, size,
+      deferMove ? null : localPath, deferMove ? utcNow() : null, claim,
       worker.id, worker.display_name, deviceLabel, deviceId == null ? null : Number(deviceId), utcNow(),
       crypto.createHash('sha256').update(deleteToken).digest('hex'));
   const row = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(info.lastInsertRowid));
-  return { ok: true, media: publicMedia(row), deleteToken };
+  return { ok: true, media: publicMedia(row), deleteToken, claim, move: deferMove ? { from: filePath, to: localPath } : null };
 }
 
 /** 画面へ出す形 (ローカルパス等の内部情報は出さない) */
@@ -173,22 +442,37 @@ export function publicMedia(r) {
 const LOST_LOCAL_MSG = '実体ファイルがありません (再起動で消えた可能性。撮り直してください)';
 
 /** page_id → 有効なメディア一覧 (一覧・詳細表示用) */
-export function mediaByPage() { return mediaByCard('page_id'); }
+export function mediaByPage(opts) { return mediaByCard('page_id', opts); }
 /** 同上。アプリ正本のカード用に task_id で引く */
-export function mediaByTask() { return mediaByCard('task_id'); }
+export function mediaByTask(opts) { return mediaByCard('task_id', opts); }
 
-function mediaByCard(key) {
+/**
+ * @param ids     見るカードを絞る (null = 全部)。1 枚開くだけで全カードを走らないため (Codex PR1 R8)
+ * @param repair  実体の消えた行に「失敗」の印を付けるか。⭐読むだけの画面 (下見・履歴) では false —
+ *                開いただけで DB が変わらないようにする (Codex PR1 R8)
+ */
+function mediaByCard(key, { ids = null, repair = true } = {}) {
   const db = getDB();
   const map = new Map();
-  const rows = db.prepare(`SELECT * FROM f_iroha_card_media WHERE deleted_at IS NULL AND ${key} IS NOT NULL ORDER BY id`).all();
+  // task_id は数値・page_id は文字列。取り違えると絞り込みが空になるので、キーに合わせて整える
+  const only = Array.isArray(ids)
+    ? (key === 'task_id'
+      ? [...new Set(ids.map(Number).filter((n) => Number.isSafeInteger(n)))]
+      : [...new Set(ids.map((v) => String(v)).filter((v) => v !== ''))])
+    : null;
+  if (only && only.length === 0) return map;
+  // 実体をまだ置いていない行 (staged_at あり) は「無いもの」として扱う — 画面にも出さない (Codex PR1 R7)
+  const rows = db.prepare(`SELECT * FROM f_iroha_card_media
+    WHERE deleted_at IS NULL AND staged_at IS NULL AND ${key} IS NOT NULL
+      ${only ? `AND ${key} IN (${only.map(() => '?').join(',')})` : ''} ORDER BY id`).all(...(only || []));
   const lost = db.prepare('UPDATE f_iroha_card_media SET next_retry_at = ?, error = ? WHERE id = ?');
   for (const r of rows) {
     // 送信待ちの実体が消えていたら (再起動で一時領域が飛んだ等)、キューの再試行 (最大10回) を待たずに
     // その場で停止扱いにする → 画面は「失敗」を出し、利用者は撮り直せる (Codex R2 #1)。
     // existsSync は送信待ち (stored) の行だけ = 通常 0〜数件。パスが空の行も「実体なし」(Codex R3)
     if (r.status === 'stored' && r.next_retry_at !== BLOCKED_UNTIL && (!r.local_path || !fs.existsSync(r.local_path))) {
-      lost.run(BLOCKED_UNTIL, LOST_LOCAL_MSG, r.id);
-      r.next_retry_at = BLOCKED_UNTIL; r.error = LOST_LOCAL_MSG;
+      if (repair) lost.run(BLOCKED_UNTIL, LOST_LOCAL_MSG, r.id);
+      r.next_retry_at = BLOCKED_UNTIL; r.error = LOST_LOCAL_MSG;   // 印を付けなくても画面には「失敗」を出す
     }
     if (!map.has(r[key])) map.set(r[key], []);
     map.get(r[key]).push(publicMedia(r));
@@ -246,13 +530,33 @@ export const cardKeyOf = (r) => (r.task_id != null ? `t${r.task_id}` : r.page_id
  * 論理削除。本人確認は**削除トークン** (アップロードした端末だけが持つ) か portal セッション。
  * 貼り直しはページ単位キューへ積む — 最後の1件を消したときも「空にする」PATCH が飛ぶ (Codex PR3 #1)
  */
+/**
+ * 有効な削除トークンのハッシュ一覧 (新しい順・最大 5 世代)。
+ * 古い行は単一列 (delete_token_hash) しか持たない。途中の版の delete_token_hash_prev も拾うが、
+ * ⭐**必ず 5 件に切る** — 旧列が枠から漏れて「6 世代目が無期限に有効」にならないように (Codex PR1 R12)
+ */
+const TOKEN_HISTORY = 5;
+function tokenHashesOf(row) {
+  let list = [];
+  try { list = JSON.parse(row.delete_token_hashes || '[]'); } catch { list = []; }
+  if (!Array.isArray(list)) list = [];
+  list = list.filter((h) => typeof h === 'string' && h);
+  if (row.delete_token_hash && !list.includes(row.delete_token_hash)) list.unshift(row.delete_token_hash);
+  if (row.delete_token_hash_prev && !list.includes(row.delete_token_hash_prev)) list.push(row.delete_token_hash_prev);
+  return list.slice(0, TOKEN_HISTORY);
+}
+function pushTokenHash(row, hash) {
+  return JSON.stringify([hash, ...tokenHashesOf(row).filter((h) => h !== hash)].slice(0, TOKEN_HISTORY));
+}
+
 export function softDeleteMedia(id, { deleteToken = null, actor = null, isSession = false }) {
   const db = getDB();
   const row = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id));
   if (!row || row.deleted_at) return { ok: false, error: 'not_found', message: '写真・動画が見つかりません' };
   if (!isSession) {
     const hash = deleteToken ? crypto.createHash('sha256').update(String(deleteToken)).digest('hex') : null;
-    if (!hash || hash !== row.delete_token_hash) {
+    // 前に配ったトークンも受ける (再送が重なって応答の順が入れ替わっても消せるように — Codex PR1 R11)
+    if (!hash || !tokenHashesOf(row).includes(hash)) {
       return { ok: false, error: 'forbidden', message: '削除できるのは撮影した端末からだけです (職員はPCの管理画面から)' };
     }
   }
@@ -463,9 +767,16 @@ export async function processMediaQueue() {
   const now = utcNow();
   const stats = { uploaded: 0, synced: 0, failed: 0 };
   try {
+    // 実体を置けないまま残った行を片づける (枚数上限を食いつぶさない — Codex PR1 R8)
+    sweepStagedMedia();
+    // どの行からも指されていない実体ファイルを片づける (十分に古いものだけ — Codex PR1 R14)
+    sweepOrphanFiles();
+    sweepMediaCancels();   // 古い取り消しの控えを片づける
+    // 配信で見つかった「ドライブから消えた」写真の印をここで付ける (GET では書かない — Codex PR1 R9)
+    flushUnavailableReports();
     // ①Drive へ (stored の行)。成功したらそのページの Notion 貼り直しを予約
     const toUpload = db.prepare(`SELECT * FROM f_iroha_card_media
-      WHERE status = 'stored' AND deleted_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= ?)
+      WHERE status = 'stored' AND staged_at IS NULL AND deleted_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= ?)
       ORDER BY id LIMIT 20`).all(now);
     for (const r of toUpload) {
       try {

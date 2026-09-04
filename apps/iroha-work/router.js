@@ -34,7 +34,8 @@ import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES 
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
 import { countTasksByStatus, listTasksNeedingReview, listOrphans } from './tasks-db.js';
 import { OPEN_STATUSES } from './tasks.js';
-import { buildList, buildTaskList, buildHistory, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask } from './service.js';
+import { buildList, buildTaskList, buildTaskCard, buildHistory, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask } from './service.js';
+import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel } from './tasks.js';
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
@@ -46,10 +47,10 @@ import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-che
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
 import {
-  addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
-  recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
+  addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
+  reportMediaUnavailable, recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
   listPageSyncForAdmin, resetPageSync,
-  isDriveConfigured, MEDIA_DIR, MAX_PHOTO_BYTES,
+  isDriveConfigured, MEDIA_DIR, MAX_PHOTO_BYTES, MAX_PHOTOS,
 } from './media.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -126,6 +127,69 @@ function parseTaskId(v) {
   return Number.isSafeInteger(n) ? n : null;   // 16 桁は 2^53 を超え得る (丸めた id で別の行を引かない — Codex A1b R2)
 }
 const BAD_TASK_ID = { ok: false, error: 'bad_request', message: 'カードの指定が不正です (一覧を更新してください)' };
+/**
+ * Notion 正本のとき、数値の id (= f_iroha_tasks の id。下見のボード・履歴の詳細で見えるカード) を
+ * 書き込み先に受け取らない。画面は許可リスト (capabilities) で操作を描かないが、サーバーでも必ず断る (要件 v1.3 §P Q5)
+ */
+const PREVIEW_WRITE_REJECTED = { ok: false, error: 'notion_mode', message: '下見のカードには書き込めません (正本は Notion です)' };
+const isPreviewIdInNotionMode = (cardId) => !isAppMode() && parseTaskId(cardId) != null;
+const CLOSED_WRITE_REJECTED = { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
+/**
+ * 履歴 (終了したカード) の id で書き込みに来ていないか。画面は許可リストで操作を描かないが、
+ * 古いタブや作った要求からは届くので、**書き込み口はすべて**ここを通す (要件 v1.3 §P Q5 / Codex PR1 R2)。
+ * 「終了からのやり直し」だけは職員 + 理由つきの正式な操作なので /api/status に残す
+ */
+function isClosedCardId(cardId) {
+  if (!isAppMode()) return false;
+  const id = parseTaskId(cardId);
+  if (id == null) return false;
+  const t = getTask(id);
+  return !!t && t.status === 'closed';
+}
+/**
+ * 詳細から呼ぶ書き込み (作業のやり方・候補の登録) の入口。**カードの指定を必須**にして、
+ * そのカードが「いま書ける」ものかをサーバーで確かめる。断るなら返す本文、通るなら null。
+ * 省略・空・でたらめな id で検査を素通りできないようにする (Codex PR1 R3)
+ */
+/**
+ * カードの確認と書き込みを 1 つのトランザクションで行う (Codex PR1 R5)。
+ * 確認した直後に別の接続がカードを終了させても、書き込みが後から成立しないようにする。
+ * fn が返した値をそのまま返す。断るときは { deny } を返す
+ */
+function inWritableCard(rawId, opts, fn) {
+  return getDB().transaction(() => {
+    const gate = writableCard(rawId, opts);
+    if (gate.deny) return { deny: gate.deny };
+    return fn(gate);
+  }).immediate();
+}
+
+function writableCard(rawId, { code = null } = {}) {
+  const cardId = String(rawId == null ? '' : rawId).trim();
+  if (!cardId) return { deny: { ok: false, error: 'card_required', message: 'どのカードからの操作かが必要です (一覧を更新してください)' } };
+  let productCode = null;
+  if (isAppMode()) {
+    const id = parseTaskId(cardId);
+    const t = id == null ? null : getTask(id);
+    if (!t) return { deny: { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' } };
+    if (t.status === 'closed') return { deny: CLOSED_WRITE_REJECTED };
+    productCode = t.product_code;
+  } else {
+    // Notion 正本: 数値 id は下見のカード。通すのはキャッシュにある Notion のカードだけ
+    if (parseTaskId(cardId) != null) return { deny: PREVIEW_WRITE_REJECTED };
+    const page = getCachePage(cardId);
+    if (!page) return { deny: { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' } };
+    productCode = page.product_code;
+  }
+  // ⭐そのカードの商品と、書き換えようとしている商品が同じか。ここを見ないと、
+  //   「開いている適当なカード」を添えて、下見・履歴にしかない別商品の作業のやり方を書き換えられる (Codex PR1 R4)
+  if (code != null) {
+    if (!productCode || codeKeyOf(productCode) !== codeKeyOf(code)) {
+      return { deny: { ok: false, error: 'card_mismatch', message: 'カードとちがう商品には登録できません (一覧を更新してください)' } };
+    }
+  }
+  return { productCode };
+}
 
 const api = fn => async (req, res) => {
   try { await fn(req, res); } catch (e) {
@@ -233,6 +297,8 @@ router.get('/api/state', api(async (req, res) => {
     workers: listIrohaWorkers(),
     options: workOptionsForState(),
     refresh,
+    // 画面に許す操作。画面はこのリストにある操作だけ描く (default-deny — 要件 v1.3 §P Q5)
+    capabilities: capabilitiesFor(appMode ? 'app' : 'notion'),
     // タイマー表示の基準 (iPad の時計を信じない — 画面はこの値とのオフセットで経過を出す)
     serverNow: new Date().toISOString(),
     me: { session: req.iwUser || null, device: req.iwDevice ? { id: req.iwDevice.id, label: req.iwDevice.label } : null, admin: isAdmin(req) },
@@ -292,6 +358,7 @@ router.post('/api/status', checkOrigin, api(async (req, res) => {
   const to = String(req.body?.to || '').trim();
   const expect = req.body?.expect == null ? null : String(req.body.expect);
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
+  if (isPreviewIdInNotionMode(pageId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
 
   // 職員としての本人確認。PIN はリクエストが職員限定操作 (棚入完了が絡む) のときだけ要求する
   let isStaff = false;
@@ -450,8 +517,34 @@ router.post('/api/review-cleared', checkOrigin, api((req, res) => {
  * ⚠中身は取込時点の状態。Notion 側でその後に動かした分は入っていない (画面にもその旨を出す)
  */
 router.get('/api/preview-tasks', api((req, res) => {
-  res.json({ ok: true, ...buildTaskList(), preview: !isAppMode(), serverNow: new Date().toISOString() });
+  // 読むだけ: 画像の取り寄せも、写真の修復印も起こさない (Codex PR1 R8)
+  res.json({ ok: true, ...buildTaskList({ readOnly: true }), preview: !isAppMode(), capabilities: capabilitiesFor('preview'), serverNow: new Date().toISOString() });
 }));
+
+/**
+ * 詳細 1 枚を読むだけで返す (下見のボード・履歴から開く。要件 v1.3 §P Q5 / PR1)。正本を問わず開けるが、
+ * 何も許さない (capabilities: [])。終了したタスクも返す (履歴)。
+ * 鮮度は項目ごとに違う: 状態 = Notion を取り込んだ時点 (notionSyncedAt)・在庫 = card.loc_at・
+ * 作業のやり方/写真/作業時間 = いまのアプリ DB — 画面で分けて出す
+ */
+router.get('/api/task-previews/:id(\\d+)', api((req, res) => {
+  // 読むだけなので、画像の取り寄せ (キューへの書き込み) も起こさない — Codex PR1 R7
+  const card = buildTaskCard(parseTaskId(req.params.id), { queueImages: false, readOnly: true });
+  if (!card) return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません' });
+  res.json({
+    ok: true, preview: true, card, capabilities: capabilitiesFor('preview'),
+    notionSyncedAt: lastNotionImportAt(), serverNow: new Date().toISOString(),
+  });
+}));
+/** Notion を最後に取り込んだ時刻。meta に無ければ (この記録を始める前の取込)、取込が最後に書いた行の時刻で代える */
+function lastNotionImportAt() {
+  const m = getMeta('last_import_at');
+  if (m) return m;
+  try {
+    const r = getDB().prepare("SELECT MAX(updated_at) AS at FROM f_iroha_tasks WHERE updated_by LIKE 'import:%'").get();
+    return (r && r.at) || null;
+  } catch { return null; }
+}
 
 /**
  * まとめて棚入完了 (アプリ正本のみ)。棚入待ちのカードだけを 終了 (棚入完了) にする。
@@ -467,11 +560,22 @@ router.post('/api/bulk-stocked', checkOrigin, api((req, res) => {
     const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
     if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
   }
+  // 画面は「選んだときに見えていた版」を必ず添える。選んでから別の端末が変えていたら、その分は飛ばす
+  // (単票の変更と同じ楽観ロック — Codex PR1 R7)
   const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
-  const ids = raw.map((v) => parseTaskId(v));
-  if (ids.some((v) => v == null)) return res.status(400).json(BAD_TASK_ID);
+  const items = raw.map((v) => {
+    // null・空文字・false を Number() が 0 にするので、数値であることを先に見る (Codex PR1 R8)
+    if (!v || typeof v !== 'object' || typeof v.version !== 'number') return null;
+    const id = parseTaskId(v.id);
+    if (id == null || !Number.isSafeInteger(v.version) || v.version < 0) return null;
+    return { id, version: v.version };
+  });
+  if (items.some((v) => v == null)) {
+    return res.status(400).json({ ok: false, error: 'bad_request',
+      message: '画面が古いようです。一覧を更新してから選び直してください' });
+  }
   const r = bulkCloseReady({
-    taskIds: ids, actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
+    taskIds: items, actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json(r);
@@ -556,6 +660,13 @@ const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_containe
 router.post('/api/options', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  // 候補じたいは商品に紐づかない共有マスタなので Notion 正本でも登録できる。ただし下見のカード id を
+  // 添えた要求は受けない (「下見の id を送っても DB が変わらない」を全ての書き込み口で同じにする)
+  // 候補の登録は詳細のダイアログからしか呼ばない。どのカードから来たかを必ず添えてもらい、
+  // 「いま書けるカード」でなければ断る (省略・空・でたらめで検査を素通りできないように — Codex PR1 R3)
+  // 断る条件は下の書き込みと同じトランザクションでもう一度見る (ここは先に軽く弾くだけ)
+  const optGate = writableCard(req.body?.id ?? req.body?.page_id);
+  if (optGate.deny) return res.status(409).json(optGate.deny);
   if (!hasSessionAccess(req)) {
     if (w.worker.worker_type !== 'staff') {
       return res.status(403).json({ ok: false, error: 'staff_required', message: '新しい候補の登録は職員のみです (職員の名前を選び、PINを入れてください)' });
@@ -566,7 +677,9 @@ router.post('/api/options', checkOrigin, api((req, res) => {
   // 記録上の主体: ポータルセッションなら本人 (worker_id は画面で選んだ名前に過ぎない — Codex R1 #4)。
   // 無効化された候補の復帰は管理者だけ (allowReactivate=false — Codex R1 #1)
   const actor = hasSessionAccess(req) ? `${req.iwUser} (ポータル)` : `${w.worker.display_name} (いろはアプリ)`;
-  const r = addWorkOption({ kind: req.body?.kind, code: req.body?.code, actor, allowReactivate: false });
+  const r = inWritableCard(req.body?.id ?? req.body?.page_id, {},
+    () => addWorkOption({ kind: req.body?.kind, code: req.body?.code, actor, allowReactivate: false }));
+  if (r.deny) return res.status(409).json(r.deny);
   if (!r.ok) return res.status(r.error === 'inactive_option' ? 409 : 400).json(r);
   safeLog({ action: 'option_add', pageId: null, workerId: w.worker.id, workerName: w.worker.display_name,
     deviceLabel: deviceLabelOf(req), to: `${req.body?.kind}:${r.option.code}${r.already ? ' (既存)' : ''}`, ok: true });
@@ -578,6 +691,10 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const code = String(req.body?.code || '').trim();
   if (!code) return res.status(400).json({ ok: false, error: 'bad_request', message: 'code (商品コード) が必要です' });
+  // どのカードからの操作かを、中身の検証より前に確かめる。カードとその商品が一致していることも必須
+  // (省略・でたらめ・よそのカードで素通りさせない — Codex PR1 R3 / R4)
+  const masterGate = writableCard(req.body?.id ?? req.body?.page_id, { code });
+  if (masterGate.deny) return res.status(409).json(masterGate.deny);
   const fieldsIn = req.body?.fields;
   if (!fieldsIn || typeof fieldsIn !== 'object' || Array.isArray(fieldsIn)) {
     return res.status(400).json({ ok: false, error: 'bad_request', message: '変更内容がありません' });
@@ -643,6 +760,9 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   let result;
   try {
     result = db.transaction(() => {
+      // 書き込みの直前にもう一度カードを見る (確認の後に別の接続が終了させていたら、ここで止める)
+      const gate = writableCard(req.body?.id ?? req.body?.page_id, { code });
+      if (gate.deny) { const e = new Error('card'); e[rollback] = { status: 409, body: gate.deny }; throw e; }
       let cur = row;
       let applyFields = fields;
       let expect;
@@ -725,6 +845,7 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
     if (!req.file) return res.status(400).json({ ok: false, error: 'no_file', message: 'ファイルがありません' });
     if (!isDriveConfigured()) { cleanup(); return res.status(503).json({ ok: false, error: 'not_configured', message: 'ドライブ保存が未設定です (職員の方は管理者に連絡してください)' }); }
     const cardId = String(req.body?.id || req.body?.page_id || '').trim();
+    if (isPreviewIdInNotionMode(cardId)) { cleanup(); return res.status(409).json(PREVIEW_WRITE_REJECTED); }
     const kind = String(req.body?.kind || '');
     if (kind === 'video') { cleanup(); return res.status(400).json({ ok: false, error: 'video_disabled', message: '動画は今つかえません (写真をとってください)' }); }
     if (!cardId || kind !== 'photo') {
@@ -736,23 +857,105 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
     const task = appMode ? getTask(parseTaskId(cardId)) : null;
     const card = appMode ? null : getCachePage(cardId);
     if (appMode ? !task : !card) { cleanup(); return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' }); }
-    const productCode = appMode ? task.product_code : card.product_code;
-    const r = addMedia({
-      pageId: appMode ? null : cardId, taskId: appMode ? task.id : null,
-      productCode, kind, mime: req.file.mimetype,
-      filePath: req.file.path, worker: w.worker, deviceLabel: deviceLabelOf(req),
-      deviceId: req.iwDevice ? req.iwDevice.id : null,
-      operationId: req.body?.operation_id,
-    });
+    // 終了したカード (履歴) には足せない。削除を断っているのと同じ理由 — 履歴は読むだけ (要件 v1.3 §P Q5)。
+    // ファイルの検査 (大きさ・中身が本当に JPEG か) はトランザクションに入る前に済ませる。
+    // 書き込みロックを持ったままファイルを読まない (miniPC も同じ DB を開く — Codex PR1 R6)
+    const inspected = inspectMediaUpload({ kind, filePath: req.file.path, operationId: req.body?.operation_id });
+    if (!inspected.ok) { cleanup(); return res.status(400).json(inspected); }
+    // ⭐正本モードもカードも**トランザクションの中で読み直す**。外で読むと、読んだ後・書く前に
+    //   正本が Notion に戻ったり、カードが終了したりできる (Codex PR1 R5 / R6)
+    const NOT_FOUND = { status: 404, body: { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' } };
+    const out = getDB().transaction(() => {
+      const nowApp = isAppMode();
+      let taskNow = null;
+      let cardNow = null;
+      if (nowApp) {
+        const tid = parseTaskId(cardId);
+        taskNow = tid == null ? null : getTask(tid);
+        if (!taskNow) return { deny: NOT_FOUND };
+        if (taskNow.status === 'closed') {
+          return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: '終了したカードには写真を足せません (履歴として残ります)' } } };
+        }
+      } else {
+        // 正本が Notion に戻っていたら、数値 id は下見のカード。書かせない
+        if (parseTaskId(cardId) != null) return { deny: { status: 409, body: PREVIEW_WRITE_REJECTED } };
+        cardNow = getCachePage(cardId);
+        if (!cardNow) return { deny: NOT_FOUND };
+      }
+      return {
+        appMode: nowApp,
+        taskId: nowApp ? taskNow.id : null,
+        r: addMedia({
+          pageId: nowApp ? null : cardId, taskId: nowApp ? taskNow.id : null,
+          // 商品コードも読み直した行から取る (取込と重なって食い違わないように)
+          productCode: nowApp ? taskNow.product_code : cardNow.product_code, kind, mime: req.file.mimetype,
+          filePath: req.file.path, worker: w.worker, deviceLabel: deviceLabelOf(req),
+          deviceId: req.iwDevice ? req.iwDevice.id : null,
+          operationId: req.body?.operation_id, inspected, deferMove: true,
+        }),
+      };
+    }).immediate();
+    if (out.deny) { cleanup(); return res.status(out.deny.status).json(out.deny.body); }
+    const r = out.r;
     if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' || r.error === 'operation_conflict' ? 409 : 400).json(r); }
-    if (appMode) {
-      safeLogTaskEvent({ taskId: task.id, action: `media_${kind}`, workerId: w.worker.id, workerName: w.worker.display_name,
+    // 実体を置くのはトランザクションを抜けてから。置いてはじめて staging → stored に上げる。
+    // 上げる前に落ちても、行は staging のまま = 一覧にも送信キューにも出ず、再送で置き直せる (Codex PR1 R7)
+    // 前の札で置いたファイルはもうどの行からも指されない (再送で置き場所が変わった) — 片づける
+    if (r.stale) { try { fs.unlinkSync(r.stale); } catch { /* 無ければよい */ } }
+    if (r.move) {
+      try {
+        moveStoredFile(r.move);
+      } catch (e) {
+        // 片づけるのは「自分の札のまま・まだ公開されていない」行だけ (二重送信の相手の行は消さない)
+        try { dropMedia(r.media.id, r.claim); } catch { /* 消せなくても応答は失敗にする */ }
+        cleanup();
+        console.error('[iroha-work] 写真の保存に失敗', e);
+        return res.status(500).json({ ok: false, error: 'store_failed', message: '写真を保存できませんでした (もう一度とってください)' });
+      }
+      const promoted = promoteStagedMedia(r.media.id, r.move.to, { claim: r.claim });
+      if (promoted.ok) {
+        r.media = promoted.media;
+      } else if (promoted.reason === 'cap_reached') {
+        // 置いている間に他の写真で枠が埋まった (Codex PR1 R11)
+        try { dropMedia(r.media.id, r.claim); } catch { /* 消せなくても応答は失敗にする */ }
+        try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
+        return res.status(409).json({ ok: false, error: 'cap_reached',
+          message: `写真は${MAX_PHOTOS}枚までです。不要な写真を削除してから撮り直してください` });
+      } else if (promoted.reason === 'not_writable') {
+        // 実体を置いている間にカードが終了した / 正本が Notion に戻った。写真は残さない (Codex PR1 R10)。
+        // 断った本当の理由をそのまま返す (画面が「下見だから」と「終了したから」を区別できるように — R12)
+        try { dropMedia(r.media.id, r.claim); } catch { /* 消せなくても応答は失敗にする */ }
+        try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
+        if (promoted.blocked === 'notion_mode') return res.status(409).json(PREVIEW_WRITE_REJECTED);
+        return res.status(409).json({ ok: false, error: promoted.blocked === 'closed_task' ? 'closed_task' : 'card_required',
+          message: '保存の途中でこのカードは変えられなくなりました (もう一度とってください)' });
+      } else if (promoted.media) {
+        // 同じ送信が二重に届き、もう一方が先に公開した。写真としては成立しているのでそのまま返す。
+        // 置いた実体 (自分の札のファイル) は誰も参照しないので片づける
+        try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
+        r.media = promoted.media;
+        r.already = true;
+        // 削除トークンは勝った要求のものが有効。自分のものを返すと iPad が消せないトークンを持つ (Codex PR1 R9)
+        delete r.deleteToken;
+      } else {
+        // 行が消えている (カードが変わった等)。置いた実体は誰も参照しないので片づける
+        try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
+        return res.status(409).json({ ok: false, error: 'not_ready', message: '保存の途中でカードが変わりました (もう一度とってください)' });
+      }
+    } else {
+      cleanup();   // 再送で既存の行を返した場合。今回の一時ファイルは使わないので片づける
+    }
+    if (out.appMode) {
+      safeLogTaskEvent({ taskId: out.taskId, action: `media_${kind}`, workerId: w.worker.id, workerName: w.worker.display_name,
         deviceLabel: deviceLabelOf(req), to: r.already ? 'resend' : 'add', ok: true });
     } else {
       safeLog({ action: `media_${kind}`, pageId: cardId, workerId: w.worker.id, workerName: w.worker.display_name,
         deviceLabel: deviceLabelOf(req), to: r.already ? 'resend' : 'add', ok: true });
     }
     scheduleMedia();
+    delete r.move;    // 保管場所のパスは画面に返さない
+    delete r.stale;   // 同上
+    delete r.claim;   // 札はサーバーの中だけで使う
     res.json(r);
   } catch (e) {
     cleanup();
@@ -803,8 +1006,9 @@ router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
     res.set('Cache-Control', 'no-store');
     if (st === 416) { res.set('Content-Range', `bytes */${r.size || '*'}`); return res.status(416).end(); }
     if (st === 404 || st === 410) {
-      // Drive 側で消えた → 見本候補・表示から外す (毎回壊れた写真を選び続けない — Codex R1 #5)
-      markMediaUnavailable(r.id, `Drive ${st}`);
+      // Drive 側で消えた → 見本候補・表示から外す (毎回壊れた写真を選び続けない — Codex R1 #5)。
+      // 印を付けるのはキューの回。配信 (GET) 自体は DB を変えない (Codex PR1 R9)
+      reportMediaUnavailable(r.id, `Drive ${st}`, r.drive_file_id);
       return fail(404, 'unavailable', 'この写真はドライブから消えています');
     }
     return fail(502, 'drive_error', `ドライブから取り出せませんでした (${e.message})`);
@@ -828,12 +1032,63 @@ router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
 // 撮り直し用の削除 (論理削除)。本人確認 = アップロード時に返した削除トークン
 // (worker_id は自己申告なので使わない — Codex PR3 #2)。職員はPCの管理画面 (セッション) から
 router.post('/api/media/:id(\\d+)/delete', checkOrigin, api((req, res) => {
-  const r = softDeleteMedia(Number(req.params.id), {
-    deleteToken: req.body?.delete_token || null,
-    actor: req.iwUser || null,
-    isSession: hasSessionAccess(req),
-  });
+  // 読むだけの写真は消せない: Notion 正本の間の tasks の写真 (下見) と、終了したカードの写真 (履歴)。
+  // 画面は × を描かないが、撮った端末は削除トークンを持ったままなので、サーバーでも断る (要件 v1.3 §P Q5)
+  // ⭐判定と削除を 1 つのトランザクションに (判定の後・消す前に終了されると履歴の写真が消える — Codex PR1 R5)。
+  //   判定は写真を足すときと同じ関門 = そのカードに**いま**書けるか (Notion のカードの写真も同じ — Codex PR1 R11)
+  const out = getDB().transaction(() => {
+    const row = getMediaRow(Number(req.params.id));
+    if (row && !row.deleted_at) {
+      const blocked = cardWriteBlockReason(row);
+      if (blocked === 'notion_mode') return { deny: { status: 409, body: PREVIEW_WRITE_REJECTED } };
+      if (blocked === 'closed_task') {
+        return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: '終了したカードの写真は消せません (履歴として残ります)' } } };
+      }
+      if (blocked) {
+        return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: 'このカードの写真はもう変えられません (履歴として残ります)' } } };
+      }
+    }
+    return { r: softDeleteMedia(Number(req.params.id), {
+      deleteToken: req.body?.delete_token || null,
+      actor: req.iwUser || null,
+      isSession: hasSessionAccess(req),
+    }) };
+  }).immediate();
+  if (out.deny) return res.status(out.deny.status).json(out.deny.body);
+  const r = out.r;
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 403)).json(r);
+}));
+
+/**
+ * 送信を取り消す (画面の「やめる」)。⭐通信が切れただけで、サーバーでは成立していることがある。
+ * その場合、端末は削除トークンを受け取れていないので消せない — この口で撮った端末だけが取り消せる
+ * (本人確認 = 端末登録。worker_id は自己申告なので使わない — Codex PR1 R15)
+ */
+router.post('/api/media/cancel', checkOrigin, api((req, res) => {
+  const opId = String(req.body?.operation_id || '').trim();
+  if (!opId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'operation_id が必要です' });
+  const out = getDB().transaction(() => {
+    const row = getDB().prepare('SELECT * FROM f_iroha_card_media WHERE operation_id = ?').get(opId);
+    if (!row) {
+      // まだ届いていないだけかもしれない (通信が切れている)。⭐取り消しを控えて、
+      //   遅れて届いた元の送信を成立させない (Codex PR1 R18)
+      recordMediaCancel(opId, { deviceId: req.iwDevice ? req.iwDevice.id : null, actor: req.iwUser || null });
+      return { r: { ok: true, already: true } };
+    }
+    if (row.deleted_at) return { r: { ok: true, already: true } };
+    // 撮った端末か、PCの管理画面 (ポータル) からだけ
+    const mine = req.iwDevice && Number(row.uploader_device_id) === Number(req.iwDevice.id);
+    if (!mine && !hasSessionAccess(req)) {
+      return { deny: { status: 403, body: { ok: false, error: 'forbidden', message: '取り消せるのは撮影した端末からだけです' } } };
+    }
+    const blocked = cardWriteBlockReason(row);
+    if (blocked === 'notion_mode') return { deny: { status: 409, body: PREVIEW_WRITE_REJECTED } };
+    if (blocked) return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: 'このカードの写真はもう変えられません' } } };
+    recordMediaCancel(opId, { deviceId: req.iwDevice ? req.iwDevice.id : null, actor: req.iwUser || null });
+    return { r: softDeleteMedia(row.id, { actor: req.iwUser || null, isSession: true }) };
+  }).immediate();
+  if (out.deny) return res.status(out.deny.status).json(out.deny.body);
+  res.status(out.r.ok ? 200 : 409).json(out.r);
 }));
 
 // 失敗した送信の再実行 (管理画面)。「ドライブから消えた」印の行は Drive で実在を確かめてから解除
@@ -865,6 +1120,14 @@ function safeLog(entry) {
 const deviceLabelOf = (req) => (req.iwDevice ? req.iwDevice.label : (req.iwUser ? `session:${req.iwUser}` : null));
 
 /**
+ * 「読むだけになったカードだから断った」ときのエラー (Codex PR1 R17)。
+ * ⭐このときは**操作履歴も足さない** — 履歴もカードの中身なので、
+ *   終了したカード・下見のカードは失敗イベントでも増やさない
+ */
+const READ_ONLY_REJECTS = new Set(['notion_mode', 'closed_task', 'card_required', 'done_card']);
+const isReadOnlyReject = (r) => !!r && r.ok === false && READ_ONLY_REJECTS.has(r.error);
+
+/**
  * 作業開始。sessions は自社DBが正本 (v1からためる — 後の正本化にそのまま繋がる)。
  * ⑤最初の開始で Notion を「未着手→作業中」へ (best-effort。Notion が失敗しても開始は成立
  *   — Notion API 成功を現場操作成功の条件にしない)
@@ -875,6 +1138,7 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   if (isAppMode()) return startSessionApp(req, res, w.worker);
   const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
+  if (isPreviewIdInNotionMode(pageId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
   // 開始可否は**必ず**実ページを直接再取得して判定する (Codex PR2-R3: キャッシュが3分以内でも、
   // その間に棚入完了・取消・アーカイブ・別DB移動があり得る)。取得失敗なら開始を拒否 —
   // どのみち Notion に書けない状況なので、素性の分からないカードで時間だけ記録しない
@@ -899,8 +1163,15 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   const r = startSession({
     pageId, productCode: card.product_code, title: card.title,
     worker: w.worker, deviceLabel: deviceLabelOf(req), masterSnapshot: snapshot,
+    // ⭐Notion の実ページを取りに行っている間に正本が切り替わる・カードが消えることがある。
+    //   記録を入れる直前に (同じトランザクションの中で) もう一度確かめる (Codex PR1 R14)
+    guard: () => {
+      if (isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
+      if (!getCachePage(pageId)) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+      return null;
+    },
   });
-  if (!r.already) {
+  if (!r.already && !isReadOnlyReject(r)) {
     safeLog({ action: 'session_start', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
       deviceLabel: deviceLabelOf(req), to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
   }
@@ -953,17 +1224,41 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
   if (isAppMode()) {
     const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
     if (taskId == null) return res.status(400).json(BAD_TASK_ID);
-    const r = stopSession({ taskId, workerId: w.worker.id, sessionId: req.body?.session_id, reason });
-    safeLogTaskEvent({ taskId, action: 'session_stop', workerId: w.worker.id, workerName: w.worker.display_name,
-      deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    // 終了カード (履歴) は読むだけ。記録も足さない (Codex PR1 R3)。
+    // 「終了したのに作業中」が残っていたら、管理画面の取り消し (voidSession) で片づける
+    if (isClosedCardId(taskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
+    const r = stopSession({ taskId, workerId: w.worker.id, sessionId: req.body?.session_id, reason,
+      // ⭐記録を書く直前に、正本とカードをもう一度確かめる (見てから書くまでに切り替わる — Codex PR1 R16)
+      guard: () => {
+        if (!isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
+        const t = getTask(taskId);
+        if (!t) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+        if (t.status === 'closed') return CLOSED_WRITE_REJECTED;
+        return null;
+      },
+    });
+    if (!isReadOnlyReject(r)) {
+      safeLogTaskEvent({ taskId, action: 'session_stop', workerId: w.worker.id, workerName: w.worker.display_name,
+        deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    }
     if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
     return res.json({ ...r, task: publicTask(getTask(taskId)) });
   }
   const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
-  const r = stopSession({ pageId, workerId: w.worker.id, sessionId: req.body?.session_id, reason });
-  safeLog({ action: 'session_stop', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
-    deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+  if (isPreviewIdInNotionMode(pageId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
+  const r = stopSession({ pageId, workerId: w.worker.id, sessionId: req.body?.session_id, reason,
+    // ⭐記録を書く直前に、正本とカードをもう一度確かめる (開始と同じ — Codex PR1 R15)
+    guard: () => {
+      if (isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
+      if (!getCachePage(pageId)) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+      return null;
+    },
+  });
+  if (!isReadOnlyReject(r)) {
+    safeLog({ action: 'session_stop', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
+      deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+  }
   if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
   res.json(r);
 }));

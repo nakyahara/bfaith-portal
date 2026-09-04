@@ -168,6 +168,10 @@ const mediaDDL = (name) => `
       delete_token_hash  TEXT,
       uploader_device_id INTEGER,
       unavailable_at TEXT,
+      staged_at      TEXT,
+      staged_claim   TEXT,
+      delete_token_hash_prev TEXT,
+      delete_token_hashes    TEXT,
       CHECK (page_id IS NOT NULL OR task_id IS NOT NULL)
     );`;
 const MEDIA_INDEX_DDL = `
@@ -549,6 +553,24 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_app_events', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
   // 古い版 (page_id NOT NULL) の作業時間・写真は作り直す — アプリ正本のカードは Notion ページを持たない (A1b)
   migrateSessionMediaSchema(db);
+  // 実体をまだ置いていない行の印 (Codex PR1 R7)。ここに値がある間は一覧にも送信キューにも出さない。
+  // 作り直しの後に足す (作り直しは mediaDDL を使うので新しい DB には既にある)
+  addCol('f_iroha_card_media', 'staged_at', 'TEXT');
+  // 「いまこの行の実体を置こうとしている要求」の札。二重送信が同時に来ても、札を持つ側だけが
+  // 公開・後始末をする (負けた側が相手の実体や行を消さない — Codex PR1 R8)
+  addCol('f_iroha_card_media', 'staged_claim', 'TEXT');
+  // 1 つ前の削除トークン (再送で配り直した直後、先に返したトークンが無効にならないように — Codex PR1 R10)
+  addCol('f_iroha_card_media', 'delete_token_hash_prev', 'TEXT');
+  addCol('f_iroha_card_media', 'delete_token_hashes', 'TEXT');   // 未失効のトークン (新しい順・最大5世代)
+  // 取り消した送信の控え (Codex PR1 R18)。「取り消し → 遅れて届いた元の送信が成立」を防ぐ。
+  // 通信が切れた送信は、サーバーに届いていないだけかもしれない = 行が無くても取り消しを覚えておく
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_iroha_media_cancels (
+      operation_id TEXT PRIMARY KEY,
+      device_id    INTEGER,
+      actor        TEXT,
+      created_at   TEXT NOT NULL
+    );`);
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}
@@ -776,13 +798,20 @@ export const SESSION_WARN_HOURS = 6;
  * 作業開始。⭐1作業者につき活動中セッションは1件 (要件定義 §1.7 ⑤)。
  * 別カードで作業中なら busy (どのカードかを返す — 画面が誘導する)
  */
-export function startSession({ pageId = null, taskId = null, productCode = null, title = null, worker, deviceLabel = null, masterSnapshot = undefined }) {
+/**
+ * @param guard 記録を入れる**直前**に (このトランザクションの中で) もう一度確かめる関数。
+ *   断るなら { ok:false, error, message } を返す。Notion の実ページを取りに行っている間に
+ *   正本が切り替わる・カードが消えることがあるため (Codex PR1 R14)
+ */
+export function startSession({ pageId = null, taskId = null, productCode = null, title = null, worker, deviceLabel = null, masterSnapshot = undefined, guard = null }) {
   const db = getDB();
   const now = utcNow();
   if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
   return db.transaction(() => {
+    if (guard) { const g = guard(); if (g) return g; }
+    // 取り消し済み (voided_at) の記録は「作業中」に数えない — 終了の判定と揃える (Codex PR1 R15)
     const open = db.prepare(`SELECT id, page_id, task_id, title_snapshot, started_at FROM f_iroha_work_sessions
-      WHERE worker_id = ? AND ended_at IS NULL`).get(worker.id);
+      WHERE worker_id = ? AND ended_at IS NULL AND voided_at IS NULL`).get(worker.id);
     if (open) {
       // 同じカードなら成功扱いで既存セッションを返す (応答が消えた再送で
       // 「実際は動いているのに開始できない」状態にしない — Codex PR2 #2)
@@ -820,7 +849,11 @@ export function startSession({ pageId = null, taskId = null, productCode = null,
  * raw_seconds はサーバー時刻の差分で確定する (上書きしない)。
  * @returns {ok, session, remainingActive} remainingActive = このカードでまだ作業中の人数
  */
-export function stopSession({ pageId = null, taskId = null, workerId, sessionId, reason }) {
+/**
+ * @param guard 書き込む**直前**に (このトランザクションの中で) もう一度確かめる関数。
+ *   断るなら { ok:false, error, message } を返す (Codex PR1 R15)
+ */
+export function stopSession({ pageId = null, taskId = null, workerId, sessionId, reason, guard = null }) {
   if (reason !== 'done' && reason !== 'pause') return { ok: false, error: 'bad_request', message: '終了の種類が不正です' };
   const sid = Number(sessionId);
   if (!Number.isInteger(sid) || sid <= 0) return { ok: false, error: 'bad_request', message: 'session_id が必要です (画面を更新してください)' };
@@ -828,7 +861,8 @@ export function stopSession({ pageId = null, taskId = null, workerId, sessionId,
   const now = utcNow();
   const byTask = taskId != null;
   return db.transaction(() => {
-    const remainingOn = () => db.prepare(`SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE ${byTask ? 'task_id = ?' : 'page_id = ?'} AND ended_at IS NULL`)
+    if (guard) { const g = guard(); if (g) return g; }
+    const remainingOn = () => db.prepare(`SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE ${byTask ? 'task_id = ?' : 'page_id = ?'} AND ended_at IS NULL AND voided_at IS NULL`)
       .get(byTask ? Number(taskId) : pageId).c;
     const row = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(sid);
     const sameCard = row && (byTask ? Number(row.task_id) === Number(taskId) : row.page_id === pageId);
@@ -868,6 +902,20 @@ export function activeSessionsByTask() {
     map.get(r.task_id).push(r);
   }
   return map;
+}
+
+/**
+ * そのカード (task) の終わった作業。詳細の「これまでの作業」に読むだけで出す (要件 v1.3 §P Q5)。
+ * 取り消した分 (voided) は出さない。1 枚の詳細でしか使わないので task ごとに引く
+ * @returns {Array<{id, worker_name, started_at, ended_at, end_reason, raw_seconds}>} 古い順
+ */
+export function finishedSessionsOfTask(taskId) {
+  const n = Number(taskId);
+  if (!Number.isInteger(n) || n <= 0) return [];
+  return getDB().prepare(`SELECT id, worker_name, started_at, ended_at, end_reason, raw_seconds
+    FROM f_iroha_work_sessions
+    WHERE task_id = ? AND ended_at IS NOT NULL AND voided_at IS NULL
+    ORDER BY started_at, id`).all(n);
 }
 
 /**
