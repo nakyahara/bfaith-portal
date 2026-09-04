@@ -1059,6 +1059,32 @@ router.post('/api/media/:id(\\d+)/delete', checkOrigin, api((req, res) => {
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 403)).json(r);
 }));
 
+/**
+ * 送信を取り消す (画面の「やめる」)。⭐通信が切れただけで、サーバーでは成立していることがある。
+ * その場合、端末は削除トークンを受け取れていないので消せない — この口で撮った端末だけが取り消せる
+ * (本人確認 = 端末登録。worker_id は自己申告なので使わない — Codex PR1 R15)
+ */
+router.post('/api/media/cancel', checkOrigin, api((req, res) => {
+  const opId = String(req.body?.operation_id || '').trim();
+  if (!opId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'operation_id が必要です' });
+  const out = getDB().transaction(() => {
+    const row = getDB().prepare('SELECT * FROM f_iroha_card_media WHERE operation_id = ?').get(opId);
+    if (!row) return { r: { ok: true, already: true } };            // サーバーには何も無い = 取り消し済みと同じ
+    if (row.deleted_at) return { r: { ok: true, already: true } };
+    // 撮った端末か、PCの管理画面 (ポータル) からだけ
+    const mine = req.iwDevice && Number(row.uploader_device_id) === Number(req.iwDevice.id);
+    if (!mine && !hasSessionAccess(req)) {
+      return { deny: { status: 403, body: { ok: false, error: 'forbidden', message: '取り消せるのは撮影した端末からだけです' } } };
+    }
+    const blocked = cardWriteBlockReason(row);
+    if (blocked === 'notion_mode') return { deny: { status: 409, body: PREVIEW_WRITE_REJECTED } };
+    if (blocked) return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: 'このカードの写真はもう変えられません' } } };
+    return { r: softDeleteMedia(row.id, { actor: req.iwUser || null, isSession: true }) };
+  }).immediate();
+  if (out.deny) return res.status(out.deny.status).json(out.deny.body);
+  res.status(out.r.ok ? 200 : 409).json(out.r);
+}));
+
 // 失敗した送信の再実行 (管理画面)。「ドライブから消えた」印の行は Drive で実在を確かめてから解除
 // (未検証のまま表示・見本候補へ戻さない — Codex R2 #3)
 router.post('/admin/media/:id(\\d+)/retry', checkOrigin, requireAdmin, api(async (req, res) => {
@@ -1196,7 +1222,14 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
   const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
   if (isPreviewIdInNotionMode(pageId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
-  const r = stopSession({ pageId, workerId: w.worker.id, sessionId: req.body?.session_id, reason });
+  const r = stopSession({ pageId, workerId: w.worker.id, sessionId: req.body?.session_id, reason,
+    // ⭐記録を書く直前に、正本とカードをもう一度確かめる (開始と同じ — Codex PR1 R15)
+    guard: () => {
+      if (isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
+      if (!getCachePage(pageId)) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+      return null;
+    },
+  });
   safeLog({ action: 'session_stop', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
     deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
   if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);

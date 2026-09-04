@@ -1289,6 +1289,22 @@ function openDetail(id) {
   const c = findCard(id);
   if (!c) return;
   showDetail(c, 'state', state.capabilities || []);
+  fillWorkHistory(id);
+}
+/**
+ * 「これまでの作業」は件数ぶん引かないよう一覧には付けていない。詳細を開いたときに 1 枚だけ取る
+ * (読むだけの API なので、これで DB は変わらない — Codex PR1 R15)
+ */
+async function fillWorkHistory(id) {
+  if (!isApp()) return;   // Notion 正本の一覧はページ id (この API は tasks の id)
+  const gen = detailGen;
+  const j = await apiFetch('/api/task-previews/' + encodeURIComponent(id));
+  if (gen !== detailGen || !sameId(curDetail, id) || detailSrc !== 'state') return;   // 別のカードを開いた
+  if (!j.ok || !j.card) return;
+  if (detailCard) {
+    detailCard.work_history = j.card.work_history || [];
+    renderDetail(detailCard, { keepScroll: true });
+  }
 }
 /**
  * 下見・履歴: 1 枚だけサーバーから取って読むだけで開く (capabilities は空 = 何の操作も描かない)。
@@ -1705,14 +1721,20 @@ async function uploadMedia(opId) {
 
 function retryUpload(ev, opId) { ev.stopPropagation(); if (!can('task.media.add')) return; uploadMedia(opId); }
 /** 送れなかった写真を捨てる (撮り直せるように枠を空ける — Codex PR1 R14) */
-function dropPending(ev, opId) {
+async function dropPending(ev, opId) {
   ev.stopPropagation();
   const p = pendingTiles.get(opId);
   if (!p) return;
-  if (!window.confirm('この写真をやめますか? (送れていないので、もう一度とり直せます)')) return;
+  if (!window.confirm('この写真をやめますか? (もう一度とり直せます)')) return;
+  // ⭐通信が切れただけで、サーバーでは受け取れていることがある。先にサーバー側も取り消す
+  //   (取り消せないまま画面から消すと、枠を使ったまま消せない写真が残る — Codex PR1 R15)
+  const j = await apiFetch('/api/media/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: p.pageId, operation_id: opId }) });
+  if (!j.ok) { showErr(j.message || 'この写真をやめられませんでした'); return; }
   if (p.previewUrl) { try { URL.revokeObjectURL(p.previewUrl); } catch (e) { /* 解放できなくてもよい */ } }
   pendingTiles.delete(opId);
   rerenderDetail();
+  loadState();   // サーバー側にあった分が消えたかもしれないので一覧を取り直す
 }
 
 async function delMedia(ev, id) {

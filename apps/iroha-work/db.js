@@ -800,8 +800,9 @@ export function startSession({ pageId = null, taskId = null, productCode = null,
   if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
   return db.transaction(() => {
     if (guard) { const g = guard(); if (g) return g; }
+    // 取り消し済み (voided_at) の記録は「作業中」に数えない — 終了の判定と揃える (Codex PR1 R15)
     const open = db.prepare(`SELECT id, page_id, task_id, title_snapshot, started_at FROM f_iroha_work_sessions
-      WHERE worker_id = ? AND ended_at IS NULL`).get(worker.id);
+      WHERE worker_id = ? AND ended_at IS NULL AND voided_at IS NULL`).get(worker.id);
     if (open) {
       // 同じカードなら成功扱いで既存セッションを返す (応答が消えた再送で
       // 「実際は動いているのに開始できない」状態にしない — Codex PR2 #2)
@@ -839,7 +840,11 @@ export function startSession({ pageId = null, taskId = null, productCode = null,
  * raw_seconds はサーバー時刻の差分で確定する (上書きしない)。
  * @returns {ok, session, remainingActive} remainingActive = このカードでまだ作業中の人数
  */
-export function stopSession({ pageId = null, taskId = null, workerId, sessionId, reason }) {
+/**
+ * @param guard 書き込む**直前**に (このトランザクションの中で) もう一度確かめる関数。
+ *   断るなら { ok:false, error, message } を返す (Codex PR1 R15)
+ */
+export function stopSession({ pageId = null, taskId = null, workerId, sessionId, reason, guard = null }) {
   if (reason !== 'done' && reason !== 'pause') return { ok: false, error: 'bad_request', message: '終了の種類が不正です' };
   const sid = Number(sessionId);
   if (!Number.isInteger(sid) || sid <= 0) return { ok: false, error: 'bad_request', message: 'session_id が必要です (画面を更新してください)' };
@@ -847,7 +852,8 @@ export function stopSession({ pageId = null, taskId = null, workerId, sessionId,
   const now = utcNow();
   const byTask = taskId != null;
   return db.transaction(() => {
-    const remainingOn = () => db.prepare(`SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE ${byTask ? 'task_id = ?' : 'page_id = ?'} AND ended_at IS NULL`)
+    if (guard) { const g = guard(); if (g) return g; }
+    const remainingOn = () => db.prepare(`SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE ${byTask ? 'task_id = ?' : 'page_id = ?'} AND ended_at IS NULL AND voided_at IS NULL`)
       .get(byTask ? Number(taskId) : pageId).c;
     const row = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(sid);
     const sameCard = row && (byTask ? Number(row.task_id) === Number(taskId) : row.page_id === pageId);

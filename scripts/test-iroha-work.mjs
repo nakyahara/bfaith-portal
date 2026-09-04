@@ -983,6 +983,9 @@ console.log('\n[15] 作業仕様のその場登録 (classify・版管理・動�
 }
 
 console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行・タスク操作');
+// ⭐タスクの書き換えは「アプリ正本のときだけ」通る (更新と同じトランザクションで見る — Codex PR1 R15)。
+//   この節は正本をアプリにして試す (終わりで既定に戻す)
+{ const { setMetaValue: sm17 } = await import('../apps/iroha-work/db.js'); sm17('source_of_truth', 'app'); }
 {
   const T = await import('../apps/iroha-work/tasks.js');
   const TD = await import('../apps/iroha-work/tasks-db.js');
@@ -1424,6 +1427,8 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
   setMetaValue('source_of_truth', 'app');
   ok(getMeta('source_of_truth') === 'app', '切替は meta に持つ (再起動しても続く)');
   setMetaValue('source_of_truth', null);
+  // ここから先はタスクを書き換える (アプリ正本のときだけ通る — Codex PR1 R15)。節の終わりで戻す
+  setMetaValue('source_of_truth', 'app');
 
   // 作業開始 (アプリ正本) は 1 トランザクション: 終了カードでは始めない・未着手→作業中が同時に確定 (Codex A1b R1 #2)
   {
@@ -1598,6 +1603,7 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
   }
 }
 
+setMetaValue('source_of_truth', null);   // [18] で立てた正本を既定 (Notion) に戻す
 console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 → 終了 → 状態変更 → 写真 (Notion API を呼ばない)');
 {
   const express = (await import('express')).default;
@@ -2219,6 +2225,7 @@ console.log('\n[20] 入荷受付からのタスク生成 (task-intake) と差分
 
 console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧 (PR-C)');
 {
+  setMetaValue('source_of_truth', 'app');   // タスクの書き換えはアプリ正本のときだけ通る (Codex PR1 R15)
   const TD = await import('../apps/iroha-work/tasks-db.js');
   const S = await import('../apps/iroha-work/service.js');
   const { workSecondsByTask } = await import('../apps/iroha-work/db.js');
@@ -2241,6 +2248,19 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
   ok(TD.bulkCloseReady({ taskIds: [] }).error === 'bad_request', '空は bad_request');
   ok(TD.bulkCloseReady({ taskIds: Array.from({ length: 201 }, (_, i) => bvv(i + 1)) }).error === 'bad_request', '201 件は bad_request (一度に 200 件まで)');
   ok(TD.bulkCloseReady({ taskIds: [1] }).error === 'bad_request', '版を添えない指定は受けない (入口だけの検査にしない)');
+  // ⭐正本が Notion に戻っていたら、タスクの書き換えは通らない (正本の切替は version を変えないので、
+  //   楽観ロックでは気づけない。更新と同じトランザクションの中で見る — Codex PR1 R15)
+  {
+    const nt = mk(9299, '正本チェック用', 'ready_for_stocking');
+    setMetaValue('source_of_truth', null);
+    ok(TD.bulkCloseReady({ taskIds: [bvv(nt)] }).error === 'notion_mode', 'まとめて棚入完了は断る');
+    ok(TD.setPlannedDate({ taskId: nt, plannedDate: '2099-12-31', expectVersion: TD.getTask(nt).version }).error === 'notion_mode', '今日やるも断る');
+    ok(TD.setExternalReady({ taskId: nt, ready: true, expectVersion: TD.getTask(nt).version }).error === 'notion_mode', '外部準備OKも断る');
+    ok(TD.changeTaskStatus({ taskId: nt, to: 'in_progress', expectVersion: TD.getTask(nt).version, isStaff: true, actor: 'test' }).error === 'notion_mode', '状態変更も断る');
+    ok(TD.upsertLabelWait({ taskId: nt, fields: { note: 'x' } }).error === 'notion_mode', 'ラベル待ちの登録も断る');
+    ok(TD.getTask(nt).status === 'ready_for_stocking' && TD.getTask(nt).external_ready === 0, 'どれも DB を変えていない');
+    setMetaValue('source_of_truth', 'app');
+  }
   const a = mk(9201, '棚入待ちA', 'ready_for_stocking');
   const b = mk(9202, '棚入待ちB', 'ready_for_stocking');
   const r = TD.bulkCloseReady({ taskIds: [bvv(a), bvv(b), bvv(a)], actor: 'たにがわ (いろはアプリ)', workerId: w1.id, workerName: 'やまだ', deviceLabel: 'ipad-1' });
@@ -2574,6 +2594,7 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   }
 }
 
+setMetaValue('source_of_truth', null);   // [21]〜[23] で立てた正本を既定 (Notion) に戻す
 console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリックは委譲する)');
 {
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');

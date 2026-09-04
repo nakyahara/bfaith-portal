@@ -5,13 +5,22 @@
  * 不変条件 (closed には close_reason/closed_at、on_hold には hold_reason …) は書く前に validateTaskInvariants で守る。
  * 状態変更は version の楽観ロック (2 台の iPad が同時に触っても後勝ちで壊さない) + 履歴 (f_iroha_app_events.task_id)。
  */
-import { getDB, startSession, setMetaValue, logEvent } from './db.js';
+import { getDB, startSession, setMetaValue, logEvent, sourceOfTruth } from './db.js';
 import {
   OPEN_STATUSES, CLOSE_REASONS, HOLD_REASONS, DEFAULT_FACILITY,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
 } from './tasks.js';
 
 const utcNow = () => new Date().toISOString();
+
+/**
+ * ⭐アプリ正本のときだけ書ける操作の関門 (Codex PR1 R15)。
+ * ルーターで正本を見てから、更新するまでの間に Notion 正本へ戻されることがある
+ * (正本の切替はカードの version を変えないので、楽観ロックでは気づけない)。
+ * だから**更新と同じトランザクションの中で**もう一度見る。
+ */
+const NOT_APP_MODE = { ok: false, error: 'notion_mode', message: '正本が Notion に戻りました (一覧を更新してください)' };
+const appModeGuard = () => (sourceOfTruth() === 'app' ? null : NOT_APP_MODE);
 const IMPORT_ACTOR_PREFIX = 'import:';
 
 // ─── 参照 ───
@@ -250,6 +259,7 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   // それ以外は今までどおり、記録に失敗しても操作は成立させる (現場を止めない)
   const reopening = t.status === 'closed';
   const applied = db.transaction(() => {
+    if (appModeGuard()) return { notApp: true };   // 正本が Notion に戻っていたら書かない (Codex PR1 R15)
     // 先に version を見る。別の端末が先に変えていたなら「競合」であって「作業中」ではない (Codex PR1 R5)
     const now2 = db.prepare('SELECT version FROM f_iroha_tasks WHERE id = ?').get(t.id);
     if (!now2 || now2.version !== t.version) return false;
@@ -271,6 +281,7 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     if (reopening) logTaskEvent(line); else safeLogTaskEvent(line);
     return true;
   }).immediate();
+  if (applied && applied.notApp) return NOT_APP_MODE;
   if (applied && applied.active) {
     return { ok: false, error: 'active_sessions', message: `このカードで作業中の人が ${applied.active} 人います。作業を終えてから変えてください` };
   }
@@ -288,11 +299,15 @@ export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = nul
   if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
   const d = plannedDate == null || plannedDate === '' ? null : String(plannedDate);
   if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) return { ok: false, error: 'bad_request', message: '日付は YYYY-MM-DD で指定してください' };
-  const r = db.prepare('UPDATE f_iroha_tasks SET planned_date = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-    .run(d, utcNow(), actor, t.id, t.version);
-  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
-  safeLogTaskEvent({ taskId: t.id, action: 'task_planned', from: t.planned_date, to: d, workerId, workerName, deviceLabel, ok: true });
-  return { ok: true, task: getTask(t.id) };
+  return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    const r = db.prepare('UPDATE f_iroha_tasks SET planned_date = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+      .run(d, utcNow(), actor, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_planned', from: t.planned_date, to: d, workerId, workerName, deviceLabel, ok: true });
+    return { ok: true, task: getTask(t.id) };
+  }).immediate();
 }
 
 /**
@@ -373,11 +388,15 @@ export function setExternalReady({ taskId, ready, expectVersion, actor = null, w
   if (t.status === 'closed') return { ok: false, error: 'done_card', message: '終了したカードは変えられません' };
   if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
   const v = ready ? 1 : 0;
-  const r = db.prepare('UPDATE f_iroha_tasks SET external_ready = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-    .run(v, utcNow(), actor, t.id, t.version);
-  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
-  safeLogTaskEvent({ taskId: t.id, action: 'task_external_ready', from: String(t.external_ready ? 1 : 0), to: String(v), workerId, workerName, deviceLabel, ok: true });
-  return { ok: true, task: getTask(t.id) };
+  return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    const r = db.prepare('UPDATE f_iroha_tasks SET external_ready = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+      .run(v, utcNow(), actor, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_external_ready', from: String(t.external_ready ? 1 : 0), to: String(v), workerId, workerName, deviceLabel, ok: true });
+    return { ok: true, task: getTask(t.id) };
+  }).immediate();
 }
 
 /** 取込時に推定した状態を職員が確認済みにする */
@@ -388,11 +407,15 @@ export function clearMigrationReview({ taskId, expectVersion, actor = null }) {
   // 版の確認が先 (setPlannedDate と同じ契約 — Codex PR1 R7)
   if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
   if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
-  const r = db.prepare('UPDATE f_iroha_tasks SET migration_review = 0, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-    .run(utcNow(), actor, t.id, t.version);
-  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
-  safeLogTaskEvent({ taskId: t.id, action: 'task_review_cleared', ok: true });
-  return { ok: true, task: getTask(t.id) };
+  return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    const r = db.prepare('UPDATE f_iroha_tasks SET migration_review = 0, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+      .run(utcNow(), actor, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_review_cleared', ok: true });
+    return { ok: true, task: getTask(t.id) };
+  }).immediate();
 }
 
 // ─── 取消 (入荷受付のやり直し → PR-B で呼ぶ。要件 v1.1 §E) ───
@@ -439,6 +462,8 @@ export function requestCancellation({ destinationId, source = 'inbound_reversal'
 
 /** 取消要確認を職員が確定 (cancel) / 続行 (continue) */
 export function resolveCancellation({ taskId, decision, expectVersion, actor = null, isStaff = false, workerId = null, workerName = null, deviceLabel = null }) {
+  const notApp = appModeGuard();
+  if (notApp) return notApp;
   const db = getDB();
   const t = getTask(taskId);
   if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
@@ -481,7 +506,7 @@ export function listLabelWaits({ taskId = null, openOnly = true, limit = 500 } =
  */
 export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion = null, actor = null }) {
   const db = getDB();
-  return db.transaction(() => upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor })).immediate();
+  return db.transaction(() => appModeGuard() || upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor })).immediate();
 }
 /** 持ち主の確認と書き込みを同じトランザクションで (終了直後に記録が入らないように — Codex PR1 R4) */
 function upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor }) {
@@ -557,6 +582,8 @@ export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerN
   if (ids.length === 0) return { ok: false, error: 'bad_request', message: 'カードが選ばれていません' };
   if (ids.length > 200) return { ok: false, error: 'bad_request', message: '一度に選べるのは 200 件までです' };
   return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
     const now = utcNow();
     const done = [];
     const skipped = [];
