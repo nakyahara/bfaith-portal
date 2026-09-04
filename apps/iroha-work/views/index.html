@@ -1048,9 +1048,9 @@ function gaugeHtml() {
   const st = p.hours < 4 ? ['under', p.count + ' 件 · あと ' + fmtHours(4 - p.hours) + ' で目安']
     : p.hours <= 6 ? ['ok', p.count + ' 件 · 目安内 (4〜6 時間)']
     : ['over', p.count + ' 件 · 目安を ' + fmtHours(p.hours - 6) + ' 超えています'];
-  const unknown = p.unknown_hours_count > 0 ? ' <span class="st under">時間不明 ' + p.unknown_hours_count + ' 件</span>' : '';
+  const unknown = p.unknown_hours_count > 0 ? ' <span class="st under">時間不明 ' + esc(String(p.unknown_hours_count)) + ' 件</span>' : '';
   const inner = '<span class="lbl">明日やる分</span>' +
-    '<span class="big">' + h + '<small>時間</small>' + String(m).padStart(2, '0') + '<small>分</small></span>' +
+    '<span class="big">' + esc(String(h)) + '<small>時間</small>' + esc(String(m).padStart(2, '0')) + '<small>分</small></span>' +
     '<span class="bar"><span class="band"></span><span class="fill' + (over ? ' over' : '') + '" style="width:' + pct + '%"></span></span>' +
     '<span class="st ' + st[0] + '">' + esc(st[1]) + '</span>' + unknown;
   // ⭐計画は職員だけ。許可が無ければボタンにせず、入口 (›) も描かない (要件 §W-4)
@@ -1077,7 +1077,8 @@ function colSegHtml() {
 function whenChips() {
   const cards = ((boardState() || {}).cards || []);
   const n = (v) => (v === 'all' ? cards.length : v === 'none' ? cards.filter(c => !c.when).length : cards.filter(c => c.when === v).length);
-  return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['none', '未定']]
+  // 札に出る「いつ」は絞り込みでも選べるようにする (やり残しだけ見たい、があるため — Codex P2 R1)
+  return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['none', '未定']]
     .map(([v, l]) => '<button class="chip' + (curWhen === v ? ' on' : '') + '" data-when="' + v + '">' + l +
       ' <span class="num">' + n(v) + '</span></button>').join('');
 }
@@ -1221,10 +1222,27 @@ async function toggleTomorrow(id) {
   toast(next ? '「' + c.title + '」を明日やる分に入れました' : '「' + c.title + '」を明日やる分から外しました');
 }
 
-/** 計画を変えた後の描き直し (一覧・ボード・開いている詳細) */
+/**
+ * 計画を変えた後の描き直し。⭐一覧もボードも両方描く — 札はボードから押すので、
+ * ボードだけ描くと一覧に戻ったとき古い予定・拠点が残る (Codex P2 R1)
+ */
 function redrawAfterPlan() {
-  if (curView === 'board') renderBoard(); else renderList();
+  recountTomorrow();
+  renderList();
+  renderBoard();
   if (curDetail && detailCard) renderDetail(detailCard, { keepScroll: true });
+}
+/**
+ * 上のゲージ (明日やる分) を手元のカードから数え直す。
+ * 応答で変わるのは 1 枚だけなので、取得時の集計をそのままにすると件数・合計が古いまま残る (Codex P2 R1)
+ */
+function recountTomorrow() {
+  if (!state || !Array.isArray(state.cards)) return;
+  const mine = state.cards.filter(c => c.when === 'tomorrow');
+  let hours = 0;
+  let unknown = 0;
+  for (const c of mine) { if (c.plan_hours == null) unknown += 1; else hours += Number(c.plan_hours) || 0; }
+  state.tomorrow_plan = { hours: Math.round(hours * 10) / 10, count: mine.length, unknown_hours_count: unknown };
 }
 
 let facPickFor = null;
@@ -1243,35 +1261,41 @@ function openFacPick(id) {
   openOverlay('#facOv');
 }
 function closeFacPick() { closeOverlay('#facOv'); facPickFor = null; }
-$('#facOpts').addEventListener('click', async (e) => {
+$('#facOpts').addEventListener('click', (e) => {
   const b = e.target.closest('[data-pick-fac]');
-  if (!b || facPickFor == null) return;
-  const id = facPickFor;
-  const code = b.dataset.pickFac || null;
+  if (b && facPickFor != null) saveFacility(facPickFor, b.dataset.pickFac || null);
+});
+async function saveFacility(id, code) {
   const c = findCard(id);
   const w = worker;
   if (!c || !w) { closeFacPick(); if (!w) openGate(); return; }
   $('#facMsg').textContent = '保存しています…';
   const j = await apiFetch('/api/facility', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id, facility_code: code, expect_version: c.version, worker_id: w.id }) });
-  if (!j.ok) { $('#facMsg').textContent = j.message || '変えられませんでした'; return; }
+  if (!j.ok) {
+    // 版がずれていたら最新を入れてから知らせる (古い版のまま押し続けても通らないため — Codex P2 R1)
+    if (j.current) { applyTask(c, j.current); redrawAfterPlan(); }
+    $('#facMsg').textContent = j.message || '変えられませんでした';
+    // 職員モードが切れていたら PIN を聞いて、そのまま同じ拠点をもう一度送る
+    return planError(j, () => saveFacility(id, code), { silent: true });
+  }
   closeFacPick();
   applyTask(c, j.task);
   if (j.staff_mode) state.staff_mode = j.staff_mode;
   redrawAfterPlan();
   toast('「' + c.title + '」→ ' + (code ? facilityName(code) : '未定'));
-});
+}
 
 /**
  * 計画の操作でエラーが出たとき。職員モードが切れていたら PIN を聞いて、そのまま続きをやる
  * (現場で「押したのに何も起きない」を作らない)
  */
-async function planError(j, retry) {
+async function planError(j, retry, { silent = false } = {}) {
   if (j.error === 'staff_required' || j.error === 'pin_required' || j.error === 'pin_invalid') {
     if (await askStaffUnlock()) { await loadState(); if (retry) await retry(); return; }
     return;
   }
-  showErr(j.message || '変えられませんでした');
+  if (!silent) showErr(j.message || '変えられませんでした');
   loadState();
 }
 
@@ -2336,13 +2360,12 @@ async function setPlanned(on) {
     body: JSON.stringify({ id: c.id, when: on ? 'today' : null, expect_version: c.version, worker_id: worker.id }),
   });
   if (!j.ok) {
-    if (j.current) { applyTask(c, j.current); renderList(); renderDetail(c); }
+    if (j.current) { applyTask(c, j.current); redrawAfterPlan(); }
     return planError(j, () => setPlanned(on));
   }
   applyTask(c, j.task);
   if (j.staff_mode) state.staff_mode = j.staff_mode;
-  renderList(); renderDetail(c);
-  if (curView === 'board') renderBoard();
+  redrawAfterPlan();
   toast(on ? '「今日やる」にしました (一覧の上に出ます)' : '「今日やる」をやめました');
 }
 

@@ -2055,6 +2055,31 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         ok((await call('GET', '/api/task-previews/' + t3, { cookie })).status === 200, '拠点が未定でも詳細が開ける');
         ok((await call('GET', '/api/history', { cookie })).status === 200, '履歴も開ける');
 
+        // ⑫a 「明日やる」を変えるとゲージの合計 (tomorrow_plan) も動く (Codex P2 R1)
+        {
+          const before = (await call('GET', '/api/state', { cookie })).json.tomorrow_plan;
+          const t4 = mk(9411, 'ゲージ確認', 'not_started');
+          db.prepare('UPDATE f_iroha_tasks SET qty = 100, master_snapshot = ? WHERE id = ?')
+            .run(JSON.stringify({ units_per_container: 10, process_count: 2 }), t4);
+          clearEnrichCache();
+          await call('POST', '/api/plan', { cookie, body: { id: t4, when: 'tomorrow', expect_version: TD.getTask(t4).version, worker_id: staffP.id } });
+          const after = (await call('GET', '/api/state', { cookie })).json.tomorrow_plan;
+          ok(after.count === before.count + 1, '明日やる分の件数が 1 増える');
+          ok(Math.round((after.hours - before.hours) * 10) / 10 === 0.3, '合計時間も増える (100個×2工程×5秒 = 0.3h)');
+          await call('POST', '/api/plan', { cookie, body: { id: t4, when: null, expect_version: TD.getTask(t4).version, worker_id: staffP.id } });
+          const back = (await call('GET', '/api/state', { cookie })).json.tomorrow_plan;
+          ok(back.count === before.count && Math.round(back.hours * 10) === Math.round(before.hours * 10), '外すと元に戻る');
+          // 工程数の無いカードは 0 で足さず「時間不明」に数える
+          const t5 = mk(9412, '工程数なし', 'not_started');
+          db.prepare('UPDATE f_iroha_tasks SET qty = 50, master_snapshot = NULL, product_code = NULL WHERE id = ?').run(t5);
+          clearEnrichCache();
+          await call('POST', '/api/plan', { cookie, body: { id: t5, when: 'tomorrow', expect_version: TD.getTask(t5).version, worker_id: staffP.id } });
+          const unk = (await call('GET', '/api/state', { cookie })).json.tomorrow_plan;
+          ok(unk.unknown_hours_count >= 1 && Math.round(unk.hours * 10) === Math.round(before.hours * 10),
+            '工程数の無いカードは「時間不明」に数え、合計時間には足さない');
+          await call('POST', '/api/plan', { cookie, body: { id: t5, when: null, expect_version: TD.getTask(t5).version, worker_id: staffP.id } });
+        }
+
         // ⑫ 不正な要求では職員モードが開かない (中身を先に見る — Codex P1 R2)
         await call('POST', '/api/staff-lock', { cookie });
         const badWhen = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'someday', expect_version: v(), worker_id: staffP.id, pin: '4649' } });
@@ -2974,6 +2999,20 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/'\/api\/plan'/.test(html) && /'\/api\/facility'/.test(html), '新しい口 (/api/plan・/api/facility) を使う');
   ok(!/'\/api\/planned'/.test(html), '古い口 (/api/planned) はもう画面から呼ばない');
   ok(/'planned_date', 'when',/.test(html), '応答の when をカードに反映する (札がすぐ変わる)');
+  // Codex P2 R1
+  ok(/function redrawAfterPlan\(\) \{\r?\n\s+recountTomorrow\(\);\r?\n\s+renderList\(\);\r?\n\s+renderBoard\(\);/.test(html),
+    '計画を変えたら 一覧・ボード・ゲージ を全部描き直す (ボードだけ描くと一覧に古い値が残る)');
+  ok(/function recountTomorrow\(\)/.test(html) && /state\.tomorrow_plan = \{ hours:/.test(html),
+    '上のゲージは手元のカードから数え直す (取得時の集計のままにしない)');
+  ok(/async function saveFacility\(id, code\)/.test(html) && /return planError\(j, \(\) => saveFacility\(id, code\), \{ silent: true \}\);/.test(html),
+    '拠点の保存も、職員モードが切れたら PIN を聞いて同じ拠点をもう一度送る');
+  ok(/if \(j\.current\) \{ applyTask\(c, j\.current\); redrawAfterPlan\(\); \}\r?\n\s+\$\('#facMsg'\)/.test(html),
+    '版がずれていたら最新を入れてから知らせる (古い版のまま押し続けない)');
+  ok(/\['over', 'やり残し'\]/.test(html), '「やり残し」だけを絞り込める (札に出る値は絞り込みにもある)');
+  ok(/esc\(String\(p\.unknown_hours_count\)\)/.test(html) && /esc\(String\(h\)\)/.test(html),
+    'ゲージの数字も esc を通す (画面の文字列はすべてエスケープ)');
+  ok(!/renderList\(\); renderDetail\(c\);\r?\n\s+if \(curView === 'board'\) renderBoard\(\);\r?\n\s+toast\(on \? '「今日やる」/.test(html),
+    '詳細の「今日やる」も同じ描き直しに揃える');
 }
 
 console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許可リスト');
