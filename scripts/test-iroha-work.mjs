@@ -2080,6 +2080,22 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
           let sizeErr = null;
           try { db.prepare("UPDATE f_iroha_work_master SET size_class = 'XL' WHERE code_key = 'size-a'").run(); } catch (e) { sizeErr = e; }
           ok(sizeErr && /CHECK/.test(sizeErr.message), '知らない大きさは入らない (DB の CHECK)');
+          // HTTP 経由でも: 未登録に戻せる / 小文字で送れる / 知らない値は断る (Codex P4 R1)
+          const mver = () => db.prepare("SELECT version FROM f_iroha_work_master WHERE code_key = 'size-a'").get().version;
+          const clear = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { size_class: '' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(clear.status === 200 && clear.json.ok, '空を送ると「未登録」に戻せる (500 にならない)');
+          ok(db.prepare("SELECT size_class FROM f_iroha_work_master WHERE code_key = 'size-a'").get().size_class == null, 'DB からも消える');
+          clearEnrichCache();
+          ok((await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === t6).size_label == null, '一覧でも「大きさ 不明」に戻る');
+          const lower = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { size_class: ' m ' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(lower.status === 200 && db.prepare("SELECT size_class FROM f_iroha_work_master WHERE code_key = 'size-a'").get().size_class === 'M',
+            '小文字・前後の空白でも受け取って M として入る');
+          const badSize = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { size_class: 'XL' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(badSize.status === 400 && badSize.json.error === 'bad_size', '知らない大きさは 400 (500 にしない)');
+          ok(db.prepare("SELECT size_class FROM f_iroha_work_master WHERE code_key = 'size-a'").get().size_class === 'M', '断ったので値も変わらない');
         }
         ok((await call('GET', '/api/history', { cookie })).status === 200, '履歴も開ける');
 
