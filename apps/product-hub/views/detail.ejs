@@ -352,7 +352,9 @@ th.attr-unknown { color: #dc2626; }
             <% const isDetailKind = s.track === 'image' && s.image_kind === 'detail'; %>
             <%# 詳細画像が「対象外」の商品では detail 側の工程を触らせない (フラグが正) %>
             <% const editable = canEditStep(s) && !(isDetailKind && workflow.detailExcluded); %>
+            <%# data-prev-state = いまの状態。⑤で「完了」を選んだときに選択を戻すために使う (2026-09-04) %>
             <tr data-step="<%= s.step_code %>" data-version="<%= s.version == null ? '' : s.version %>"
+                data-prev-state="<%= s.state %>"
                 <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:#eff6ff"' : (isDetailKind && workflow.detailExcluded ? 'style="opacity:.45"' : '') %>>
               <td>
                 <% if (s.track === 'image') { %>
@@ -1856,6 +1858,63 @@ th.attr-unknown { color: #dc2626; }
 
 
   <!-- ジャンル選択モーダル (RMS の「ジャンルID選択」と同じ操作感) -->
+  <%# セット展開判断 (2026-09-04 要件定義 §5.4)。⑤は判断を記録してからでないと閉じられない。
+      「新規作成」は上部の「セット商品を作る」が入口なので、ここでは選ばせない %>
+  <div id="setdec-modal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,.45); z-index:1000;">
+    <div style="background:#fff; max-width:560px; margin:8vh auto; border-radius:12px; padding:18px 20px; display:flex; flex-direction:column; gap:10px;">
+      <div style="display:flex; align-items:center;">
+        <h2 style="margin:0; font-size:16px;">セット展開判断</h2>
+        <span style="flex:1"></span>
+        <button type="button" class="btn btn-sm" id="setdec-close">✕</button>
+      </div>
+      <p class="muted" style="margin:0; font-size:12px;">
+        この商品をセットにするか決めます。<strong>作らない・保留も記録します</strong>
+        (後から「まだ検討していない」のか「検討して作らないと決めた」のかが分かるように)。
+      </p>
+      <label style="display:flex; gap:8px; align-items:flex-start; border:1px solid #e2e8f0; border-radius:6px; padding:8px 10px;">
+        <input type="radio" name="setdec" value="none" checked>
+        <span><strong>セットは作らない</strong><br><span class="muted" style="font-size:11.5px;">理由を選んでください</span></span>
+      </label>
+      <div id="setdec-none-box" style="padding-left:26px; display:grid; gap:6px;">
+        <select id="setdec-reason" style="width:100%;">
+          <% for (const [code, label] of Object.entries(setDecisionReasons)) { %>
+            <option value="<%= code %>"><%= label %></option>
+          <% } %>
+        </select>
+        <input type="text" id="setdec-reason-text" maxlength="200" placeholder="「その他」を選んだときは一言" hidden>
+      </div>
+      <% if (setDrafts.length) { %>
+        <label style="display:flex; gap:8px; align-items:flex-start; border:1px solid #e2e8f0; border-radius:6px; padding:8px 10px;">
+          <input type="radio" name="setdec" value="existing">
+          <span><strong>既存のセットがある</strong><br><span class="muted" style="font-size:11.5px;">二重に作らないよう、そのセットに紐づけます</span></span>
+        </label>
+        <div id="setdec-existing-box" style="padding-left:26px;" hidden>
+          <select id="setdec-linked" style="width:100%;">
+            <% for (const sdr of setDrafts) { %>
+              <option value="<%= sdr.id %>"><%= sdr.ne_code %> — <%= sdr.name %></option>
+            <% } %>
+          </select>
+        </div>
+      <% } %>
+      <label style="display:flex; gap:8px; align-items:flex-start; border:1px solid #e2e8f0; border-radius:6px; padding:8px 10px;">
+        <input type="radio" name="setdec" value="hold">
+        <span><strong>保留</strong><br><span class="muted" style="font-size:11.5px;">この工程は開いたままにして、何日待っているかを数え続けます</span></span>
+      </label>
+      <div id="setdec-hold-box" style="padding-left:26px;" hidden>
+        <input type="text" id="setdec-hold-note" maxlength="200" placeholder="メモ (例: 売れ行きを見てから)" style="width:100%;">
+      </div>
+      <p class="muted" style="margin:0; font-size:11.5px;">
+        セットを新しく作る場合は、このまま閉じて画面上部の「🎁 セット商品を作る」から作成してください
+        (作成すると判断も一緒に記録され、この工程が閉じます)。
+      </p>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button type="button" class="btn btn-primary btn-sm" id="setdec-apply">この判断で記録</button>
+        <button type="button" class="btn btn-sm" id="setdec-cancel">キャンセル</button>
+        <span class="muted" id="setdec-result"></span>
+      </div>
+    </div>
+  </div>
+
   <div id="genre-modal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,.45); z-index:1000;">
     <div style="background:#fff; max-width:640px; margin:6vh auto; border-radius:12px; padding:18px 20px; max-height:84vh; display:flex; flex-direction:column;">
       <div style="display:flex; align-items:center;">
@@ -4529,6 +4588,84 @@ th.attr-unknown { color: #dc2626; }
       }
     }
 
+    // ─── セット展開判断のダイアログ (2026-09-04) ───
+    const decModal = document.getElementById('setdec-modal');
+    let decRow = null;
+    function decChoice() {
+      const el = decModal ? decModal.querySelector('input[name="setdec"]:checked') : null;
+      return el ? el.value : 'none';
+    }
+    function decSync() {
+      if (!decModal) return;
+      const v = decChoice();
+      const noneBox = document.getElementById('setdec-none-box');
+      const exBox = document.getElementById('setdec-existing-box');
+      const holdBox = document.getElementById('setdec-hold-box');
+      if (noneBox) noneBox.hidden = v !== 'none';
+      if (exBox) exBox.hidden = v !== 'existing';
+      if (holdBox) holdBox.hidden = v !== 'hold';
+      const rt = document.getElementById('setdec-reason-text');
+      const reason = document.getElementById('setdec-reason');
+      if (rt && reason) rt.hidden = !(v === 'none' && reason.value === 'other');
+    }
+    function openSetDecision(tr) {
+      if (!decModal) return;
+      decRow = tr;
+      document.getElementById('setdec-result').textContent = '';
+      decSync();
+      decModal.style.display = 'block';
+    }
+    function closeSetDecision() { if (decModal) decModal.style.display = 'none'; }
+    if (decModal) {
+      decModal.querySelectorAll('input[name="setdec"]').forEach((el) => el.addEventListener('change', decSync));
+      const reason = document.getElementById('setdec-reason');
+      if (reason) reason.addEventListener('change', decSync);
+      document.getElementById('setdec-close').addEventListener('click', closeSetDecision);
+      document.getElementById('setdec-cancel').addEventListener('click', closeSetDecision);
+      decModal.addEventListener('click', (ev) => { if (ev.target === decModal) closeSetDecision(); });
+      document.getElementById('setdec-apply').addEventListener('click', async () => {
+        if (!decRow) return;
+        const btn = document.getElementById('setdec-apply');
+        const res = document.getElementById('setdec-result');
+        const v = decChoice();
+        const body = {
+          decision: v,
+          // 工程の版数を一緒に送る = 古い画面からの後勝ちをサーバーが弾く
+          expected_version: decRow.dataset.version === '' ? null : Number(decRow.dataset.version),
+        };
+        if (v === 'none') {
+          body.reason_code = document.getElementById('setdec-reason').value;
+          body.reason_text = document.getElementById('setdec-reason-text').value.trim();
+          if (body.reason_code === 'other' && !body.reason_text) { res.textContent = '「その他」を選んだときは一言書いてください'; return; }
+        } else if (v === 'existing') {
+          const sel = document.getElementById('setdec-linked');
+          if (!sel || !sel.value) { res.textContent = '紐づけるセットを選んでください'; return; }
+          body.linked_set_draft_id = Number(sel.value);
+        } else if (v === 'hold') {
+          body.reason_text = document.getElementById('setdec-hold-note').value.trim();
+        }
+        btn.disabled = true;
+        res.textContent = '記録中…';
+        try {
+          const r = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/set-decision', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+          });
+          const j = await r.json();
+          if (!j.ok) {
+            res.textContent = '';
+            alert(j.error || '記録できませんでした');
+            // 409 = 別の人が先に動かした。古い画面のまま操作を続けさせない
+            if (r.status === 409) location.reload();
+            return;
+          }
+          location.reload();
+        } catch (e) {
+          res.textContent = '';
+          alert('通信エラー: ' + e.message);
+        } finally { btn.disabled = false; }
+      });
+    }
+
     card.querySelectorAll('tr[data-step]').forEach(function (tr) {
       const state = tr.querySelector('.wf-state');
       const assignee = tr.querySelector('.wf-assignee');
@@ -4536,6 +4673,13 @@ th.attr-unknown { color: #dc2626; }
       const note = tr.querySelector('.wf-note');
       if (state) {
         state.addEventListener('change', async function () {
+          // 「セット展開判断」は判断を記録してからでないと閉じられない (2026-09-04)。
+          // ここで捕まえて判断ダイアログを開く (記録できたら工程もサーバー側で閉じる)
+          if (tr.dataset.step === 'set_review' && state.value === 'done') {
+            state.value = tr.dataset.prevState || 'todo';
+            openSetDecision(tr);
+            return;
+          }
           const r = await save(tr, { state: state.value });
           // 完了で次の工程へボールが移る・工程からステータスが導出し直される (PR4) と
           // 上部の表示が変わるので読み直す。連続で複数工程を片付けたい場合もあるので、

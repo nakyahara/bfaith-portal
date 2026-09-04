@@ -3102,6 +3102,9 @@ const ms = await import('../lib/mall-status.js');
     wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state === 'done');
   // セット検討がまだ残っているので、この時点では全工程完了ではない
   check('出品が終わってもセット検討が残る', wfp.progressOf(id, { db }).current?.step_code === 'set_review');
+  // ⑤は判断を記録してからでないと閉じられない (2026-09-04)。ここでは「作らない」と決めて閉じる
+  // (set-derive の import はこの下なので、記録そのものを直接入れる)
+  db.prepare(`INSERT INTO draft_set_decisions (draft_id, decision, reason_code, decided_by) VALUES (?, 'none', 'single_enough', 'admin')`).run(id);
   wfp.setStepState(id, 'set_review', { state: 'done' }, 'admin', ADMIN);
   check('全工程が終わってボードの完了列へ', wfp.progressOf(id, { db }).mainDone === true);
   check('対象外は掲載済に数えない', ms.mallStatusOf(id, { db }).doneCount === 5);
@@ -5629,7 +5632,7 @@ const renders = [
     rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null, shipping_method_group: '5', postage_included: 1, normal_delivery_date_id: '1000', white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://drive.google.com/file/d/gw/view', published_at: null }, cabinetImages: [],
     genreDict: { genreId: '205761', genreName: '入浴剤', genrePath: '美容・コスメ > 入浴剤', fixedAt: null, fetchedAt: '2026-07-28T00:00:00Z', attributes: [{ name: 'ブランド名', mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 3, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' }] },
     neCost: { costExTax: 660, shippingCost: 237, shippingMethod: 'ネコポス', taxPercent: 10 }, profitSim: { profit: 189, marginPct: 14.8, costIncTax: 726 }, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [{ method: 'ネコポス', cost: 237, count: 3832 }, { method: '宅急便60サイズ', cost: 538, count: 417 }, { method: '</script><script>alert(1)</script>', cost: 999, count: 1 }], rakutenGroupNeHints: { '5': ['ネコポス'], '8': ['宅急便'] }, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '1y5', ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: [{ method: 'ネコポス', cost: 237, count: 3832 }, { method: '宅急便60サイズ', cost: 538, count: 417 }, { method: '</script><script>alert(1)</script>', cost: 999, count: 1 }], rakutenGroupNeHints: { '5': ['ネコポス'], '8': ['宅急便'] }, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '1y5', ...pageInfoVars,
     // 商品ページ表記: 化粧品 + NE推測の配送で全分岐を描かせる
     pageInfo: { product_type: 'cosmetics', content_volume: '50ml', size_text: null, ingredients: '水', usage_notes: null, origin_type: '海外製', origin_country: 'フランス', category_label: '化粧品', seller_name: 'メーカーA', importer_name: '輸入者B', food_name: null, food_ingredients: null, food_expiry: null, food_storage: null },
     pageInfoHtml: '<table><tr><td>x</td></tr></table>',
@@ -5657,7 +5660,7 @@ const renders = [
     cabinetImages: [{ id: 1, drive_file_id: 'gw' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     shopCategories: [
       { id: 1, category_id: null, path: '犬用品 > おやつ', is_active: 1, selected: 1 },
       { id: 2, category_id: null, path: '猫用品', is_active: 1, selected: 1 },
@@ -5676,7 +5679,7 @@ const renders = [
     cabinetImages: [{ id: 1, drive_file_id: 'g1' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     shopCategories: [],
     yahoo: { yahoo_price: null, yahoo_price_sagawa: null, delivery_label: null, tax_rate: '8%', yahoo_category_id: null, yahoo_path: null },
     imageProduction: null,
@@ -5689,7 +5692,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5706,7 +5709,7 @@ const renders = [
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5720,7 +5723,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5733,7 +5736,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5746,7 +5749,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5760,7 +5763,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, allShippingGroups: listing.ALL_SHIPPING_METHOD_GROUPS, setDecisionReasons: sd.SET_DECISION_REASONS, neShippingOptions: [], rakutenGroupNeHints: {}, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, shippingSelectValue: '', ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -5917,6 +5920,8 @@ const boardBase = {
   // 出品・展開の列で楽天の商品ページを組み立てる (2026-09-01)
   rakutenItemPageUrl: (mn) => `https://item.rakuten.co.jp/b-faith/${String(mn).toLowerCase()}/`,
   rakutenRmsItemUrl: (mn) => `https://item.rms.rakuten.co.jp/rms-sku/shops/373343/item/edit/${String(mn).toLowerCase()}`,
+  // セット商品の表示 (2026-09-04)。router が渡しているものと同じ
+  NE_STATE_LABELS: sd.NE_STATE_LABELS,
   isAdmin: true,
 };
 renders.push(
@@ -5944,6 +5949,52 @@ renders.push(
       doneTotal: 1,
     },
   }],
+  // セット商品のカード (2026-09-04 §5.2)。単品と見分けられるか・親と構成・NEの進み・⑤の判断
+  ['board.ejs (セット商品のカード)', 'board.ejs', (() => {
+    const base = boardBase.board.columns.flatMap((c) => c.cards)[0];
+    const mk = (id, over) => ({ ...base, id, ne_code: `SETCARD-${id}`, name: `セット表示テスト ${id}`, ...over });
+    return {
+      ...boardBase,
+      board: {
+        ...boardBase.board,
+        columns: boardBase.board.columns.map((c, i) => (i !== 0 ? c : {
+          ...c,
+          cards: [
+            // 仮コードのまま NE 反映待ち
+            mk(95001, {
+              ne_code: 'SET-silicateclay800-01', name: '有機 珪酸塩白土 800g 2個セット',
+              isSet: true, setChildrenCount: 0, setDecision: null,
+              set: { parentId: 900, parentNeCode: 'silicateclay800', members: 'silicateclay800 × 2',
+                provisional: true, neState: 'requested', neError: null, parentChanged: false },
+            }),
+            // NE 登録に失敗して人の対応待ち + 親が更新された
+            mk(95002, {
+              ne_code: 'SET-plastic-01', name: 'プラスチックシール 2種セット',
+              isSet: true, setChildrenCount: 0, setDecision: null,
+              set: { parentId: 901, parentNeCode: 'plastic', members: 'plastic-ki × 1 + plastic-ks × 1',
+                provisional: true, neState: 'needs_action', neError: '商品コード「plastic-set」は既に使われています',
+                parentChanged: true },
+            }),
+            // 本コードが確定したセット
+            mk(95003, {
+              ne_code: 'silicateclay800-3set', name: '有機 珪酸塩白土 800g 3個セット',
+              isSet: true, setChildrenCount: 0, setDecision: null,
+              set: { parentId: 900, parentNeCode: 'silicateclay800', members: 'silicateclay800 × 3',
+                provisional: false, neState: 'confirmed', neError: null, parentChanged: false },
+            }),
+            // 親 (派生2件を持つ単品)
+            mk(95004, { ne_code: 'silicateclay800', name: '有機 珪酸塩白土 800g', isSet: false, set: null, setChildrenCount: 2, setDecision: { decision: 'create', label: sd.describeSetDecision({ decision: 'create' }) } }),
+            // ⑤で「作らない」と判断した単品
+            mk(95005, { ne_code: 'kansho-yp100', name: 'ゆうパケット用 緩衝材 100枚', isSet: false, set: null, setChildrenCount: 0,
+              setDecision: { decision: 'none', label: sd.describeSetDecision({ decision: 'none', reason_code: 'shipping_loss' }) } }),
+            // ⑤で保留にした単品
+            mk(95006, { ne_code: 'hoyu-1', name: '保留テスト', isSet: false, set: null, setChildrenCount: 0,
+              setDecision: { decision: 'hold', label: sd.describeSetDecision({ decision: 'hold', reason_text: '売れ行きを見てから' }) } }),
+          ],
+        })),
+      },
+    };
+  })()],
   // 出品・展開の列 (2026-09-01 楽天出品ボタン/結果)。未出品・失敗・出品済み の 3 枚を並べる
   ['board.ejs (出品・展開にカード)', 'board.ejs', (() => {
     const base = boardBase.board.columns.flatMap((c) => c.cards)[0];
@@ -6246,6 +6297,186 @@ for (const [name, file, data] of renders) {
     inside.slice(-200));
   check('配送費の試算: 選べる配送方法が画面に埋め込まれる',
     inside.includes('ネコポス') && inside.includes('237'));
+}
+
+// ─── セット展開判断の記録 (2026-09-04 要件定義 §4.2) ──────────────────────
+// 派生を作ったときだけ⑤が閉じる作りでは「まだ検討していない」と「作らないと決めた」が
+// 区別できなかった。判断そのものを残し、⑤はこの記録があるときだけ閉じられる
+{
+  const newDraft = (code) => Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES (?, ?, 'draft', 'smoke')`
+  ).run(code, `判断テスト ${code}`).lastInsertRowid);
+  const decId = newDraft('SETDEC-1');
+  const other = newDraft('SETDEC-OTHER');
+  const setDec = (input) => { try { return { ok: true, r: sd.recordSetDecision(db, decId, input, 'smoke') }; } catch (e) { return { ok: false, status: e.status, msg: e.message }; } };
+
+  check('セット判断: 「作らない」は理由を選ばないと記録できない',
+    setDec({ decision: 'none' }).status === 400
+    && setDec({ decision: 'none', reason_code: 'nope' }).status === 400, '');
+  check('セット判断: 「その他」を選んだら一言も要る',
+    setDec({ decision: 'none', reason_code: 'other' }).status === 400
+    && setDec({ decision: 'none', reason_code: 'other', reason_text: '別ルートで検討' }).ok === true, '');
+  check('セット判断: 選択肢にある理由なら記録できる',
+    setDec({ decision: 'none', reason_code: 'shipping_loss' }).ok === true);
+  check('セット判断: 最新の1件が「いまの判断」(append-only なので履歴は残る)',
+    sd.latestSetDecision(db, decId).decision === 'none'
+    && sd.latestSetDecision(db, decId).reason_code === 'shipping_loss'
+    && db.prepare('SELECT COUNT(*) c FROM draft_set_decisions WHERE draft_id = ?').get(decId).c === 2,
+    JSON.stringify(sd.latestSetDecision(db, decId)));
+  check('セット判断: 表示名は理由まで含む (カードと詳細で同じ言葉)',
+    sd.describeSetDecision(sd.latestSetDecision(db, decId)) === '作らない (送料負け (単価が低い))',
+    sd.describeSetDecision(sd.latestSetDecision(db, decId)));
+  check('セット判断: 「既存あり」は自分から作ったセットしか紐づけられない',
+    setDec({ decision: 'existing' }).status === 400
+    && setDec({ decision: 'existing', linked_set_draft_id: other }).status === 400, '');
+  check('セット判断: 「保留」はメモだけで記録でき、⑤を閉じない',
+    setDec({ decision: 'hold', reason_text: '売れ行きを見てから' }).r.closing === false
+    && sd.SET_DECISIONS_CLOSING.includes('none') && !sd.SET_DECISIONS_CLOSING.includes('hold'));
+  check('セット判断: 判断の指定そのものが不正なら記録しない',
+    setDec({ decision: 'maybe' }).status === 400 && setDec({}).status === 400);
+  db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(decId, other);
+}
+{
+  // 派生を作ると「セットを作成」が自動で記録され、⑤が閉じる (記録 → 完了の順)
+  const pid = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, price, created_by) VALUES ('setdec-create', '判断テスト 作成', 'approved', 1980, 'smoke')`
+  ).run().lastInsertRowid);
+  wfp.progressOf(pid, { db });
+  // ⑤を閉じる操作なので版数が要る (楽観ロックを迂回しない)
+  const pv = wfp.progressOf(pid, { db }).main.find((x) => x.step_code === 'set_review').version;
+  const r = sd.createSetDraft(pid, { mode: 'copy', members: [{ ne_code: 'setdec-create', qty: 2 }], parent_step_version: pv }, 'smoke', { isAdmin: true, actorStaffId: null });
+  const last = sd.latestSetDecision(db, pid);
+  check('セット判断: 派生を作ると「セットを作成」が記録され、派生先に紐づく',
+    last?.decision === 'create' && last.linked_set_draft_id === r.draftId, JSON.stringify(last));
+  const setRow = db.prepare('SELECT parent_snapshot_at, ne_registration_state, provisional_code FROM product_drafts WHERE id = ?').get(r.draftId);
+  check('セット作成: 派生時点の親を覚える (親が後で変わったら知らせるため)',
+    !!setRow.parent_snapshot_at, JSON.stringify(setRow));
+  check('セット作成: NE 登録はまず「未要求」から始まる',
+    setRow.ne_registration_state === 'not_requested' && setRow.provisional_code === 1, JSON.stringify(setRow));
+  db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(pid, r.draftId);
+}
+
+// ─── ⑤を閉じる画面 (2026-09-04 §5.4) ────────────────────────────────────
+// 🚨 判断なしで⑤を閉じられなくした以上、画面から判断を送れないと工程が詰まる (Codex R3 high)
+{
+  const dh = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+  const at = dh.indexOf('id="setdec-modal"');
+  const modal = at >= 0 ? dh.slice(at, at + 3000) : '';
+  check('セット判断の画面: 判断を選ぶダイアログが描かれている', at > 0);
+  check('セット判断の画面: 作らない・保留を選べる',
+    /name="setdec" value="none"/.test(modal) && /name="setdec" value="hold"/.test(modal), modal.slice(0, 200));
+  check('セット判断の画面: 「作らない」の理由は選択式 (自由入力ではない)',
+    modal.includes('id="setdec-reason"') && modal.includes('送料負け') && modal.includes('需要が見込めない'),
+    modal.slice(modal.indexOf('setdec-reason'), modal.indexOf('setdec-reason') + 300));
+  check('セット判断の画面: 新規作成はここでは選ばせない (作成の入口へ案内する)',
+    !/name="setdec" value="create"/.test(modal) && modal.includes('セット商品を作る'));
+  check('セット判断の画面: ⑤で「完了」を選んだらダイアログを開く (そのままでは閉じられない)',
+    /tr\.dataset\.step === 'set_review' && state\.value === 'done'/.test(src) && /openSetDecision\(tr\)/.test(src));
+  check('セット判断の画面: 記録は工程の版数を添えて送り、409 なら読み直す',
+    /set-decision/.test(src)
+    && /expected_version: decRow\.dataset\.version/.test(src)
+    && /r\.status === 409[\s\S]{0,80}location\.reload/.test(src));
+  check('セット判断の画面: 工程の行は今の状態を持つ (完了を選び直しても戻せる)',
+    /data-prev-state="<%= s\.state %>"/.test(src));
+}
+
+// ─── ⑤のガードは D&D でも効く / カードは boardData の結果で確かめる (2026-09-04) ──
+{
+  // 🚨 ボードのドラッグは moveBoardCard が直接 setStepState を呼ぶ。ルーター側だけに
+  // ガードを置くと、⑤から次の列へドラッグしただけで判断なしに閉じられる (Codex R1 high)
+  const pid = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, price, official_url, created_by)
+     VALUES ('setdnd-1', 'D&Dテスト', 'approved', 1000, 'https://example.com/dnd', 'smoke')`
+  ).run().lastInsertRowid);
+  wfp.progressOf(pid, { db });
+  const ver = () => wfp.progressOf(pid, { db }).main.find((x) => x.step_code === 'set_review').version;
+  // ⑤まで進めてから、次の列へドラッグする (掴んだ時点の現在工程を CAS で渡す)
+  for (const code of ['basic_info', 'ai_generate', 'desc_review', 'title_approve']) {
+    const v = wfp.progressOf(pid, { db }).main.find((x) => x.step_code === code).version;
+    wfp.setStepState(pid, code, { state: 'done', expected_version: v }, 'smoke', { isAdmin: true, actorStaffId: null });
+  }
+  let moveErr = null;
+  try {
+    wfp.moveBoardCard(pid, { view: 'main', to: 'listing', expectedCurrent: 'set_review' }, 'smoke', { isAdmin: true, actorStaffId: null });
+  } catch (e) { moveErr = e; }
+  check('セット判断: 判断がなければ D&D でも⑤を通り越せない',
+    moveErr?.status === 400 && /判断を先に記録/.test(moveErr.message || ''), moveErr?.message || '例外が出ていない');
+  check('セット判断: 通り越せなかったので⑤は開いたまま',
+    wfp.progressOf(pid, { db }).main.find((x) => x.step_code === 'set_review').state !== 'done');
+  db.prepare(`INSERT INTO draft_set_decisions (draft_id, decision, reason_code, decided_by) VALUES (?, 'none', 'low_demand', 'smoke')`).run(pid);
+  wfp.setStepState(pid, 'set_review', { state: 'done', expected_version: ver() }, 'smoke', { isAdmin: true, actorStaffId: null });
+  check('セット判断: 判断を記録すれば閉じられる',
+    wfp.progressOf(pid, { db }).main.find((x) => x.step_code === 'set_review').state === 'done');
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(pid);
+}
+{
+  // 🚨 カードの値は **boardData が実際に返すもの**で確かめる。手で組んだフィクスチャだけだと、
+  // 置き場所を間違えても (c.image.isSet のように入れ子になっても) テストが通ってしまう (Codex R1 high)
+  const parentId = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, price, created_by) VALUES ('setcard-parent', 'カード結合テスト 親', 'approved', 1500, 'smoke')`
+  ).run().lastInsertRowid);
+  wfp.progressOf(parentId, { db });
+  const pv = wfp.progressOf(parentId, { db }).main.find((x) => x.step_code === 'set_review').version;
+  const made = sd.createSetDraft(parentId, { mode: 'copy', members: [{ ne_code: 'setcard-parent', qty: 2 }], parent_step_version: pv },
+    'smoke', { isAdmin: true, actorStaffId: null });
+  const cards = wfp.boardData(db, {}).columns.flatMap((c) => c.cards);
+  const setCard = cards.find((c) => c.id === made.draftId);
+  const parentCard = cards.find((c) => c.id === parentId);
+  check('カード(実データ): セットは isSet と親・構成・NEの進みをトップレベルに持つ',
+    setCard && setCard.isSet === true && setCard.set?.parentNeCode === 'setcard-parent'
+    && setCard.set.members === 'setcard-parent × 2' && setCard.set.provisional === true
+    && setCard.set.neState === 'not_requested', JSON.stringify(setCard && { isSet: setCard.isSet, set: setCard.set }));
+  check('カード(実データ): 単品は isSet=false で、派生の件数を持つ',
+    parentCard && parentCard.isSet === false && parentCard.setChildrenCount === 1,
+    JSON.stringify(parentCard && { isSet: parentCard.isSet, n: parentCard.setChildrenCount }));
+  check('カード(実データ): 親の判断は「セットを作成」として残る',
+    parentCard?.setDecision?.decision === 'create' && parentCard.setDecision.label === 'セットを作成',
+    JSON.stringify(parentCard?.setDecision));
+  // 本コードに差し替えたら「確定」になる (確定は provisional_code から導出。状態列に持たない)
+  db.prepare('UPDATE product_drafts SET provisional_code = 0 WHERE id = ?').run(made.draftId);
+  const after = wfp.boardData(db, {}).columns.flatMap((c) => c.cards).find((c) => c.id === made.draftId);
+  check('カード(実データ): 本コードが確定したら NE の進みも「確定」になる',
+    after?.set?.neState === 'confirmed' && after.set.provisional === false, JSON.stringify(after?.set));
+  db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(parentId, made.draftId);
+}
+
+// ─── セット商品のカード (2026-09-04 要件定義 §5.2) ────────────────────────
+// ボード上でセットが単品と見分けられること。判定はサーバー側で構造化して渡した値だけを使い、
+// テンプレで商品コードの文字列から推測しない
+{
+  const bh = renderedHtml.get('board.ejs (セット商品のカード)') || '';
+  const cardOf = (id) => {
+    const seg = bh.split('<div class="kb-card ').find((x) => x.includes(`data-draft="${id}"`)) || '';
+    return seg.split(/<div class="kb-card[" ]/)[0].split('<script>')[0];
+  };
+  const c1 = cardOf(95001), c2 = cardOf(95002), c3 = cardOf(95003);
+  const parent = cardOf(95004), none = cardOf(95005), hold = cardOf(95006);
+
+  check('セットカード: セットと分かる印と、親・構成が出る',
+    c1.includes('data-set="1"') && c1.includes('🎁 セット')
+    && c1.includes('親: silicateclay800') && c1.includes('silicateclay800 × 2'), c1.slice(0, 400));
+  check('セットカード: 仮コードは (仮) と分かる',
+    c1.includes('SET-silicateclay800-01') && c1.includes('(仮)'));
+  check('セットカード: NE の進みが出る (反映待ち)',
+    c1.includes('NE: 要求済み・反映待ち'), c1.slice(0, 300));
+  check('セットカード: NE で止まっているカードは理由まで出る',
+    c2.includes('NE: 要対応') && c2.includes('plastic-set') && c2.includes('既に使われています'), c2.slice(0, 400));
+  check('セットカード: 親が更新されていたら知らせる (自動追随はしない)',
+    c2.includes('親が更新されています') && !c1.includes('親が更新されています'));
+  check('セットカード: 本コードが確定したら「確定」と出し (仮) を出さない',
+    c3.includes('NE: 本コード確定') && !c3.includes('(仮)'), c3.slice(0, 300));
+
+  check('セットカード: 親のカードには派生の件数を出す (一覧は詳細画面)',
+    parent.includes('派生セット 2件') && !parent.includes('data-set="1"'), parent.slice(0, 300));
+  check('セットカード: 親のカードに「セット」の印は付けない',
+    !parent.includes('🎁 セット'));
+  check('⑤の判断: 「作らない」はカードに理由まで出す',
+    none.includes('判断: 作らない') && none.includes('送料負け'), none.slice(0, 300));
+  check('⑤の判断: 「保留」もカードに出す (未検討と区別する)',
+    hold.includes('判断: 保留') && hold.includes('売れ行きを見てから'), hold.slice(0, 300));
+  check('⑤の判断: 「セットを作成」はカードに出さない (派生の件数で分かる)',
+    !parent.includes('判断: セットを作成'));
 }
 
 // ─── 詳細画面の RMS リンク (2026-09-04) ───────────────────────────────────
@@ -6802,7 +7033,8 @@ for (const [name, file, data] of renders) {
     const express = (await import('express')).default;
     const routerMod = await import('../router.js');
     const app = express();
-    app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'staff' }; next(); });
+    let sessionRole = 'staff';
+    app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: sessionRole }; next(); });
     app.use('/ph', routerMod.default);
     const server = app.listen(0);
     const base = `http://127.0.0.1:${server.address().port}/ph`;
@@ -6847,6 +7079,49 @@ for (const [name, file, data] of renders) {
     check('HTTP 詳細画面の「公開で登録」: 途中で止まった商品は 400 (ロックを取る前に判定)',
       r.status === 400 && /途中で止まって/.test(r.json.error || '') && !bl.isRakutenListingInFlight(idS), JSON.stringify(r.json));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idS);
+
+    // ─── セット展開判断 (2026-09-04 §4.2) ────────────────────────────────
+    // ⑤は「判断を記録してから」でないと閉じられない。派生を作ったときだけ閉じる作りでは
+    // 「まだ検討していない」と「作らないと決めた」が区別できなかった
+    {
+      const idDec = mkDraft('SETDEC-HTTP', { atListing: false });
+      sessionRole = 'admin';   // ⑤を閉じるのは担当者か管理者 (smoke のアカウントは担当者に紐づかない)
+      const stepVer = () => wfp.progressOf(idDec, { db }).main.find((x) => x.step_code === 'set_review').version;
+      let rr = await call(`/api/drafts/${idDec}/steps/set_review`, { state: 'done', expected_version: stepVer() });
+      check('HTTP セット判断: 判断を記録せずに⑤は閉じられない',
+        rr.status === 400 && /判断を先に記録/.test(rr.json.error || ''), JSON.stringify(rr.json));
+      rr = await call(`/api/drafts/${idDec}/set-decision`, { decision: 'none', expected_version: stepVer() });
+      check('HTTP セット判断: 「作らない」は理由を選ばないと 400', rr.status === 400, JSON.stringify(rr.json));
+      check('HTTP セット判断: 弾かれたときは判断の履歴も残さない (記録と工程更新は同じトランザクション)',
+        db.prepare('SELECT COUNT(*) c FROM draft_set_decisions WHERE draft_id = ?').get(idDec).c === 0);
+      // 「新規作成」は作成の入口だけが記録する (派生を作らずに⑤を閉じられないように)
+      rr = await call(`/api/drafts/${idDec}/set-decision`, { decision: 'create', expected_version: stepVer() });
+      check('HTTP セット判断: 「新規作成」はこの口では受けない', rr.status === 400 && /セット商品を作る/.test(rr.json.error || ''), JSON.stringify(rr.json));
+      rr = await call(`/api/drafts/${idDec}/set-decision`, { decision: 'hold', reason_text: '売れ行きを見てから', expected_version: stepVer() });
+      check('HTTP セット判断: 「保留」は記録できるが⑤は開いたまま (滞留を数え続ける)',
+        rr.status === 200 && rr.json.closed === false
+        && wfp.progressOf(idDec, { db }).main.find((x) => x.step_code === 'set_review').state !== 'done',
+        JSON.stringify(rr.json));
+      rr = await call(`/api/drafts/${idDec}/set-decision`, { decision: 'none', reason_code: 'low_demand', expected_version: stepVer() });
+      check('HTTP セット判断: 「作らない」を記録すると⑤が閉じる',
+        rr.status === 200 && rr.json.closed === true
+        && wfp.progressOf(idDec, { db }).main.find((x) => x.step_code === 'set_review').state === 'done',
+        JSON.stringify(rr.json));
+      check('HTTP セット判断: 判断は履歴として残る (保留 → 作らない の 2 件)',
+        db.prepare('SELECT COUNT(*) c FROM draft_set_decisions WHERE draft_id = ?').get(idDec).c === 2);
+      // 🚨 判断は状態が変わらなくても版数を消費する。古い画面から続けて送れてはいけない (Codex R2)
+      const idCas = mkDraft('SETDEC-CAS', { atListing: false });
+      const casVer = wfp.progressOf(idCas, { db }).main.find((x) => x.step_code === 'set_review').version;
+      const first = await call(`/api/drafts/${idCas}/set-decision`, { decision: 'hold', reason_text: '1回目', expected_version: casVer });
+      const second = await call(`/api/drafts/${idCas}/set-decision`, { decision: 'hold', reason_text: '2回目', expected_version: casVer });
+      check('HTTP セット判断: 同じ版数で続けて送ると 2 回目は 409 (状態が変わらなくても版数を消費する)',
+        first.status === 200 && second.status === 409, JSON.stringify({ first: first.status, second: second.status, msg: second.json?.error }));
+      check('HTTP セット判断: 弾かれた 2 回目は履歴に残らない',
+        db.prepare('SELECT COUNT(*) c FROM draft_set_decisions WHERE draft_id = ?').get(idCas).c === 1);
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idCas);
+      sessionRole = 'staff';
+      db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDec);
+    }
 
     // ─── 配送方法の保存の往復 (2026-09-03 #1152 / Codex R1 high) ───────────
     // 画面 → 保存 → 再表示 で状態が落ちないこと。DB には楽天IDだけを入れ、

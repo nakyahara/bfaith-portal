@@ -13,6 +13,13 @@
 import { getDB, logEvent } from '../db.js';
 import { ensureProgress, setStepState } from '../lib/workflow-progress.js';
 import { resolveVariationGroup } from '../lib/variation.js';
+// 判断の語彙・理由・表示名は lib 側が正 (カードを組み立てる workflow-progress.js も同じものを使う)
+import {
+  SET_DECISIONS, SET_DECISIONS_CLOSING, SET_DECISION_REASONS, NE_STATE_LABELS, describeSetDecision,
+} from '../lib/set-decision.js';
+
+// 既存の import 元 (router.js / smoke.mjs) を壊さないための再公開
+export { SET_DECISIONS, SET_DECISIONS_CLOSING, SET_DECISION_REASONS, NE_STATE_LABELS, describeSetDecision };
 
 /** 生成モード: ai = AI 工程から / copy = 商品説明確認から */
 export const SET_MODES = ['ai', 'copy'];
@@ -108,13 +115,16 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
     const info = db.prepare(`
       INSERT INTO product_drafts (
         ne_code, name, status, official_url, amazon_url, own_brand, has_variation,
-        memo, source, created_by, parent_draft_id, provisional_code
-      ) VALUES (?, ?, 'draft', ?, ?, ?, 0, ?, 'portal', ?, ?, 1)
+        memo, source, created_by, parent_draft_id, provisional_code,
+        ne_registration_state, parent_snapshot_at
+      ) VALUES (?, ?, 'draft', ?, ?, ?, 0, ?, 'portal', ?, ?, 1, 'not_requested', ?)
     `).run(
       neCode, name.slice(0, 300),
       parent.official_url, parent.amazon_url, parent.own_brand,
       `${parent.ne_code} から作ったセット商品`,
       actor || null, parentId,
+      // 派生した時点の親。親がこの後に変わったら「親が更新されています」を出す (§4.5)
+      parent.updated_at || null,
     );
     const setId = Number(info.lastInsertRowid);
 
@@ -200,7 +210,11 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
       done('basic_info');
     }
 
-    // 親の「セット商品作成検討」を完了にする (判断が済んだので親は先へ進める)。
+    // 「セットを作った」という判断を先に残す (2026-09-04 §4.2)。
+    // ⑤はこの記録があるときだけ閉じられる — 記録の前に閉じると順序が逆になる
+    recordSetDecision(db, parentId, { decision: 'create', linked_set_draft_id: setId }, actor);
+
+    // 親の「セット展開判断」を完了にする (判断が済んだので親は先へ進める)。
     // 直接 UPDATE せず setStepState を通す (Codex R1 medium 2026-08-23):
     // 権限判定と版数 CAS を迂回すると、他人がレビュー中の工程を古い画面から閉じられる
     setStepState(parentId, 'set_review', {
@@ -263,4 +277,50 @@ export function setInfoOf(db, draftId) {
       'SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort'
     ).all(id),
   };
+}
+
+// ─── 「セット展開判断」の記録 (2026-09-04 要件定義 §4.2) ────────────────────
+//
+// 派生を作ったときだけ工程⑤が閉じる作りでは「まだ検討していない」と「検討して作らないと
+// 決めた」が区別できなかった。判断そのものを残し、⑤はこの記録があるときだけ閉じられる。
+
+/**
+ * 判断を1件記録する (append-only)。⑤を閉じるかは呼び出し側が SET_DECISIONS_CLOSING で判断する。
+ * @param {object} input {decision, reason_code?, reason_text?, linked_set_draft_id?}
+ */
+export function recordSetDecision(db, draftId, input, actor) {
+  const decision = String(input?.decision || '').trim();
+  if (!SET_DECISIONS.includes(decision)) throw badRequest('判断の指定が不正です');
+  const reasonCode = String(input?.reason_code || '').trim() || null;
+  const reasonText = String(input?.reason_text || '').trim().slice(0, 500) || null;
+  if (decision === 'none') {
+    // 「作らない」は後から理由を思い出せないと意味がないので必須にする
+    if (!reasonCode || !SET_DECISION_REASONS[reasonCode]) throw badRequest('作らない理由を選んでください');
+    if (reasonCode === 'other' && !reasonText) throw badRequest('「その他」を選んだときは理由を書いてください');
+  } else if (reasonCode && !SET_DECISION_REASONS[reasonCode]) {
+    throw badRequest('作らない理由の指定が不正です');
+  }
+  let linked = input?.linked_set_draft_id == null ? null : Number(input.linked_set_draft_id);
+  if (linked != null && !Number.isInteger(linked)) throw badRequest('紐づけるセットの指定が不正です');
+  if (decision === 'existing') {
+    if (linked == null) throw badRequest('紐づけるセット商品を選んでください');
+    // 自分から派生したセットだけを紐づけられる (他人のセットを勝手に紐づけない)
+    const own = db.prepare('SELECT 1 FROM product_drafts WHERE id = ? AND parent_draft_id = ?').get(linked, Number(draftId));
+    if (!own) throw badRequest('この商品から作られたセットではありません');
+  }
+  if (decision === 'none' || decision === 'hold') linked = null;
+  db.prepare(`
+    INSERT INTO draft_set_decisions (draft_id, decision, reason_code, reason_text, linked_set_draft_id, decided_by)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(Number(draftId), decision, decision === 'none' ? reasonCode : null, reasonText, linked, actor || null);
+  logEvent(db, draftId, 'set_decision_recorded', describeSetDecision({ decision, reason_code: reasonCode, reason_text: reasonText }), actor);
+  return { decision, closing: SET_DECISIONS_CLOSING.includes(decision) };
+}
+
+/** 最新の判断 (無ければ null)。カードと詳細画面が使う */
+export function latestSetDecision(db, draftId) {
+  return db.prepare(`
+    SELECT decision, reason_code, reason_text, linked_set_draft_id, decided_by, decided_at
+    FROM draft_set_decisions WHERE draft_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1
+  `).get(Number(draftId)) || null;
 }

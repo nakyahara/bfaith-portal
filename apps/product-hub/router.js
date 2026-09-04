@@ -39,12 +39,15 @@ import {
   progressOf, setStepState, progressSummaryFor, ensureProgress, ensureProgressForMany, boardData, STEP_STATE_LABELS,
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
   ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
-  moveBoardCard, saveBoardOrder,
-} from './lib/workflow-progress.js';
+  moveBoardCard, saveBoardOrder, assertStepOperable,} from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
 } from './lib/mall-status.js';
-import { createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode } from './services/set-derive.js';
+import {
+  createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode,
+  recordSetDecision, latestSetDecision, describeSetDecision,
+  SET_DECISIONS_CLOSING, SET_DECISION_REASONS, NE_STATE_LABELS,
+} from './services/set-derive.js';
 import { syncDraftLinks } from '../product-links/sync.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { backLinkOf } from './lib/back-link.js';
@@ -2397,6 +2400,8 @@ router.get('/board', (req, res) => {
     stepStateLabels: STEP_STATE_LABELS,
     imageKindLabels: IMAGE_KIND_LABELS,
     imagePriorities: IMAGE_PRIORITIES,
+    // セット商品の表示に使う辞書 (2026-09-04)。表示名を1箇所に持つ
+    NE_STATE_LABELS, setDecisionReasons: SET_DECISION_REASONS,
     // 楽天の商品ページ URL は商品コードから決まる (draft_mall_status には保存しない設計)。
     // 出品・展開の列のカードで「商品ページ ↗」を組み立てるために渡す (2026-09-01)
     rakutenItemPageUrl,
@@ -2613,6 +2618,52 @@ router.post('/api/drafts/:id/own-brand', (req, res) => {
     return { own_brand: value, image_priority: imagePriority };
   })();
   res.json({ ok: true, ...saved });
+});
+
+// セット展開判断の記録 (2026-09-04 §4.2)。「作らない」「保留」「既存あり」の入口。
+// 「新規作成」は下の派生生成 API が作成と同時に記録する
+router.post('/api/drafts/:id/set-decision', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  try {
+    // 「セットを作成」はここでは受けない (Codex R1 medium)。派生を作らずに記録できると、
+    // セットが無いのに「作成した」判断で⑤が閉じる。作成は下の派生生成 API が同時に記録する
+    if (String(req.body?.decision || '') === 'create') {
+      return res.status(400).json({ ok: false, error: 'セットの新規作成は「セット商品を作る」から行ってください' });
+    }
+    const me = staffByPortalEmail(req.session?.email);
+    const ctx = { isAdmin: req.session?.role === 'admin', actorStaffId: me?.id ?? null, requireVersion: true };
+    // 🚨 記録と工程の更新は 1 つのトランザクションで行う (Codex R1 high)。
+    // 先に記録してから権限・版数で弾かれると、判断の履歴だけが残る。
+    // 「保留」も⑤を触る操作なので、記録の前に同じ権限・版数を確かめる
+    const out = db.transaction(() => {
+      const row = assertStepOperable(db, draft.id, 'set_review', req.body?.expected_version, ctx);
+      // 🚨 判断は⑤に対する操作なので、**状態が変わらなくても版数を1つ消費する** (Codex R2)。
+      // 消費しないと「保留 → 保留」のように状態が動かないとき CAS が効かず、
+      // 古い画面から続けて別の判断を送れてしまう
+      const bumped = db.prepare(`
+        UPDATE draft_step_progress
+        SET version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE draft_id = ? AND step_code = 'set_review' AND version = ?
+      `).run(draft.id, row.version);
+      if (bumped.changes !== 1) {
+        const e = new Error('別の人がこの工程を先に更新しました。画面を読み直してください');
+        e.status = 409;
+        throw e;
+      }
+      const nextVersion = row.version + 1;
+      const r = recordSetDecision(db, draft.id, req.body || {}, actorOf(req));
+      if (r.closing) {
+        setStepState(draft.id, 'set_review', { state: 'done', expected_version: nextVersion }, actorOf(req), ctx);
+      } else if (row.state !== 'todo') {
+        // 「保留」に戻したら⑤も開き直す (最新の判断が「保留」なのに完了のままだと辻褄が合わない)
+        setStepState(draft.id, 'set_review', { state: 'todo', expected_version: nextVersion }, actorOf(req), ctx);
+      }
+      return r;
+    })();
+    res.json({ ok: true, decision: out.decision, closed: out.closing, latest: latestSetDecision(db, draft.id) });
+  } catch (e) { workflowError(res, e); }
 });
 
 // セット商品の派生ドラフト生成 (工程「セット商品作成検討」から)。
