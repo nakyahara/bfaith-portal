@@ -1104,11 +1104,13 @@ async function doBulkStocked() {
   const skipped = (j.skipped || []).length;
   // 飛ばした理由は「状態が変わった」だけではない (作業中・見つからない・すでに完了) — 理由は下の警告に出す
   toast(j.done.length + ' 件を棚入完了にしました' + (skipped ? ' (' + skipped + ' 件は棚入完了にできませんでした)' : ''));
-  if (skipped) showWarn((j.skipped || []).map(x => (x.title || '#' + x.id) + ': ' + BULK_SKIP[x.reason]).join(' / '));
+  if (skipped) showWarn((j.skipped || []).map(x => (x.title || '#' + x.id) + ': ' + bulkSkipLabel(x.reason)).join(' / '));
   exitBulk();
   await loadState();
 }
-const BULK_SKIP = { already: 'すでに棚入完了', not_ready: '棚入待ちではありません', not_found: '見つかりません', conflict: '同時に変更されました' };
+const BULK_SKIP = { already: 'すでに棚入完了', not_ready: '棚入待ちではありません', not_found: '見つかりません',
+  conflict: '同時に変更されました', active_sessions: '作業中の人がいます' };
+const bulkSkipLabel = (reason) => BULK_SKIP[reason] || '棚入完了にできませんでした';
 
 // ─── ラベル待ち ───
 function setLwOpenOnly(v) { lwOpenOnly = v; loadLabelWaits(); }

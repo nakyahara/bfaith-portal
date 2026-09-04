@@ -47,8 +47,8 @@ import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-che
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
 import {
-  addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
-  recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
+  addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
+  reportMediaUnavailable, recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
   listPageSyncForAdmin, resetPageSync,
   isDriveConfigured, MEDIA_DIR, MAX_PHOTO_BYTES,
 } from './media.js';
@@ -914,9 +914,13 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
       if (promoted.ok) {
         r.media = promoted.media;
       } else if (promoted.media) {
-        // 同じ送信が二重に届き、もう一方が先に公開した。写真としては成立しているのでそのまま返す
+        // 同じ送信が二重に届き、もう一方が先に公開した。写真としては成立しているのでそのまま返す。
+        // 置いた実体 (自分の札のファイル) は誰も参照しないので片づける
+        try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
         r.media = promoted.media;
         r.already = true;
+        // 削除トークンは勝った要求のものが有効。自分のものを返すと iPad が消せないトークンを持つ (Codex PR1 R9)
+        delete r.deleteToken;
       } else {
         // 行が消えている (カードが変わった等)。置いた実体は誰も参照しないので片づける
         try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
@@ -985,8 +989,9 @@ router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
     res.set('Cache-Control', 'no-store');
     if (st === 416) { res.set('Content-Range', `bytes */${r.size || '*'}`); return res.status(416).end(); }
     if (st === 404 || st === 410) {
-      // Drive 側で消えた → 見本候補・表示から外す (毎回壊れた写真を選び続けない — Codex R1 #5)
-      markMediaUnavailable(r.id, `Drive ${st}`);
+      // Drive 側で消えた → 見本候補・表示から外す (毎回壊れた写真を選び続けない — Codex R1 #5)。
+      // 印を付けるのはキューの回。配信 (GET) 自体は DB を変えない (Codex PR1 R9)
+      reportMediaUnavailable(r.id, `Drive ${st}`);
       return fail(404, 'unavailable', 'この写真はドライブから消えています');
     }
     return fail(502, 'drive_error', `ドライブから取り出せませんでした (${e.message})`);

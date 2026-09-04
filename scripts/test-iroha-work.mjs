@@ -713,6 +713,18 @@ console.log('\n[14] 完成写真・動画 (outbox → Drive → Notion)');
     ok(!(photosByCodeKey().get('prod-m') || []).some(p => p.id === mid), '消えた写真は「前回の完成形」候補から外れる');
     ok(mediaByPage().get(pMedia.id).find(m => m.id === mid).viewable === false, '消えた写真は表示対象外 (viewable=false)');
     ok(markMediaUnavailable(mid, 'again') === false, '二重に印は付けない');
+    // ⭐配信 (GET) から呼ぶ報告は、その場では DB を変えない — キューの回でまとめて印を付ける (Codex PR1 R9)
+    {
+      const { reportMediaUnavailable, flushUnavailableReports } = await import('../apps/iroha-work/media.js');
+      const other = getDB().prepare("SELECT id FROM f_iroha_card_media WHERE operation_id = 'op-photo-0002'").get().id;
+      reportMediaUnavailable(other, 'Drive 404');
+      ok(getDB().prepare('SELECT unavailable_at FROM f_iroha_card_media WHERE id = ?').get(other).unavailable_at == null,
+        '報告しただけでは印は付かない (読むだけの画面で写真を開いても DB が変わらない)');
+      ok(flushUnavailableReports() === 1, 'キューの回で印を付ける');
+      ok(getDB().prepare('SELECT unavailable_at FROM f_iroha_card_media WHERE id = ?').get(other).unavailable_at != null, '印が付いている');
+      ok(flushUnavailableReports() === 0, '溜まった報告は一度で片づく');
+      getDB().prepare('UPDATE f_iroha_card_media SET unavailable_at = NULL, error = NULL WHERE id = ?').run(other);
+    }
     // 印の解除は Drive で実在を確かめてから (未検証のまま候補へ戻さない — Codex R2 #3)
     const { recheckUnavailable, _setDriveExists, etagMatches, ifRangeMatches, singleRange } = await import('../apps/iroha-work/media.js');
     _setDriveExists(async () => false);
@@ -1281,8 +1293,8 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-stage-0001', deferMove: true });
     ok(again.ok && again.already && again.media.id === st.media.id && again.move, '撮った端末からの再送は同じ行を返し、置き直す指示が付く');
     ok(again.claim && again.claim !== st.claim, '札は要求ごとに新しくなる (古い要求は公開できない)');
-    ok(promoteStagedMedia(again.media.id, again.move.to, st.claim).reason === 'taken', '古い札では公開できない');
     moveStoredFile(again.move);
+    ok(promoteStagedMedia(again.media.id, again.move.to, st.claim).reason === 'taken', '古い札では公開できない');
     const promoted = promoteStagedMedia(again.media.id, again.move.to, again.claim);
     ok(promoted.ok && fs.existsSync(again.move.to), '実体を置いてから公開する');
     ok(mediaByTask().get(tOpen).length === 2, '置いてはじめて一覧に出る');
@@ -1300,10 +1312,11 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-sweep-0001', deferMove: true });
     const g2 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('sweep2.jpg'),
       worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-sweep-0002', deferMove: true });
-    ok(countActiveMedia({ taskId: tOpen }, 'photo') === before, '置く前の行は枚数上限に数えない (枠を食いつぶさない)');
+    ok(countActiveMedia({ taskId: tOpen }, 'photo') === before + 2, '送信中の行は枚数上限に数える (並行送信で上限を超えない)');
     moveStoredFile(g2.move);   // 実体は置けたが、公開の前に落ちた
     db.prepare("UPDATE f_iroha_card_media SET staged_at = ? WHERE operation_id IN ('op-sweep-0001','op-sweep-0002')")
       .run('2000-01-01T00:00:00.000Z');
+    ok(countActiveMedia({ taskId: tOpen }, 'photo') === before, '置き去りになった古い行は枠に数えない (sweep 待ちで詰まらせない)');
     const sw = sweepStagedMedia();
     ok(sw.promoted === 1 && sw.dropped === 1, '実体が置けているものは公開し、無いものは破棄する');
     ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_card_media WHERE operation_id = 'op-sweep-0001'").get().c === 0, '実体の無い行は残らない');
