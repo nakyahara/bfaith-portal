@@ -10,7 +10,7 @@
  * 呼び元 (inbound-check/db.js) のトランザクション内で呼ぶ — 同じ warehouse-mirror.db の同じ接続なので、確定と一緒にコミット/ロールバックされる。
  */
 import { getDB } from './db.js';
-import { DEFAULT_FACILITY } from './tasks.js';
+
 import { getTaskByDestination, safeLogTaskEvent, requestCancellation } from './tasks-db.js';
 import { normSupplierCode } from '../purchase-orders/db.js';
 
@@ -73,9 +73,10 @@ export function createTaskForDestination(dest, { actor = null, barcode = null } 
   const info = db.prepare(`INSERT INTO f_iroha_tasks
       (destination_id, status, facility_code, product_code, product_name, qty, arrival_date, ar_no, barcode, expiry, supplier, handling,
        master_snapshot, payload, version, created_at, created_by, updated_at, updated_by)
-    VALUES (?, 'not_started', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+    -- ⭐拠点は NULL (未定) で作る。どこが作業するかは職員が「明日の計画」で決める (要件 §W-2)
+    VALUES (?, 'not_started', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
     ON CONFLICT(destination_id) WHERE destination_id IS NOT NULL DO NOTHING`)
-    .run(dest.id, DEFAULT_FACILITY, dest.product_id || null, dest.product_name || dest.product_id || null, qty,
+    .run(dest.id, dest.product_id || null, dest.product_name || dest.product_id || null, qty,
       dest.work_date || null, dest.ar_no || null, e.barcode, dest.expiry_date || null, e.supplierName, e.product?.handling || null,
       snapshot ? JSON.stringify(snapshot) : null, JSON.stringify(payload), now, who, now, who);
   if (info.changes === 0) {
