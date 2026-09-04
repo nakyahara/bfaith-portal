@@ -541,7 +541,22 @@ export function lineKindOf(hikiateClass) {
   return null;
 }
 
-/** バッチの引当分類名 (picking pk_batches — 参照のみ・未初期化環境では null)。 */
+/**
+ * バッチの引当分類と、その**出どころ** (picking pk_batches — 参照のみ・未初期化環境では null)。
+ * source='suggested' は Drive の引当パターンtxt が取れず CSV から推定した値で、
+ * 実際の分類と違うことがある (2026-09-04: 出荷_17 が《2つ折り》→《3つ折り》)。画面で警告する。
+ */
+export function batchClassInfo(db, batch) {
+  if (!batch?.pk_batch_id) return { name: null, source: null };
+  try {
+    const r = db.prepare('SELECT hikiate_class, class_source FROM pk_batches WHERE id = ?').get(batch.pk_batch_id);
+    return { name: r?.hikiate_class ?? null, source: r?.class_source ?? null };
+  } catch {
+    return { name: null, source: null };
+  }
+}
+
+/** バッチの引当分類名 (既存の呼び出し向け)。 */
 export function batchHikiateClass(db, batch) {
   if (!batch?.pk_batch_id) return null;
   try {

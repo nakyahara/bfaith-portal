@@ -123,6 +123,10 @@
       <div class="card <%= b.status === 'done' ? 'done' : '' %>">
         <div class="card-main">
           <div class="card-title"><%= b.origin === 'repick' ? '🔴' : '' %><%= b.folder_name || '' %> <%= b.hikiate_class %></div>
+          <% if (b.class_source === 'suggested') { %>
+            <%# Driveの引当パターンtxtが取れず推定した分類 = 現物と違うことがある (2026-09-04) %>
+            <div style="font-size:.85rem; color:#c5221f; font-weight:600;">⚠ この引当分類は推定です (現物を確認してください)</div>
+          <% } %>
           <% if (b.origin === 'repick') { %>
             <div style="font-size:.85rem; color:#c5221f; font-weight:600;">
               依頼元 <%= b.origin_ref || '-' %> / 依頼: <%= b.requested_by || '-' %> (計測対象外)

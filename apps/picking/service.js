@@ -276,8 +276,12 @@ export function isStaleInstructDate(instructDate, today = jstToday()) {
  *   - 既存あり (ready 以外) → 409 already_started (作業開始後の上書きは不可)
  * @returns {{batchId, replaced}}
  */
-export function importBatch(preview, { hikiateClass, folderName, overwrite }, actor) {
+export function importBatch(preview, { hikiateClass, classSource, folderName, overwrite }, actor) {
   const cls = String(hikiateClass ?? '').trim();
+  // 引当分類の出どころ。'txt'=Driveの引当パターンtxt (確か) / 'suggested'=CSVからの推定 (要確認) /
+  // 'manual'=人が選んだ。⭐未指定は null (出所不明) にする。'manual' に丸めると、呼び出し側が
+  // 渡し忘れたときに「人が確認済み」を騙って警告対象から外れてしまう (Codexレビュー)
+  const src = ['txt', 'suggested', 'manual'].includes(classSource) ? classSource : null;
   const folder = String(folderName ?? '').trim() || null;
   if (!cls) throw new PkError(400, 'no_class', '引当分類を選択してください');
   // 管理者入力にも長さ上限を置く (Codex R1 low)。パターン名の最長は約60文字
@@ -308,11 +312,11 @@ export function importBatch(preview, { hikiateClass, folderName, overwrite }, ac
       db.prepare('DELETE FROM pk_lines WHERE batch_id = ?').run(existing.id);
       db.prepare('DELETE FROM pk_slip_lines WHERE batch_id = ?').run(existing.id);
       db.prepare(`
-        UPDATE pk_batches SET hikiate_class=?, folder_name=?, work_date=?, instruct_date=?,
+        UPDATE pk_batches SET hikiate_class=?, class_source=?, folder_name=?, work_date=?, instruct_date=?,
           composition=?, delivery_method=?, invoice_soft=?,
           line_count=?, slip_count=?, total_qty=?, csv_sha256=?, imported_by=?, updated_at=?
         WHERE id=?
-      `).run(cls, folder, jstToday(), preview.instructDate,
+      `).run(cls, src, folder, jstToday(), preview.instructDate,
         preview.composition, preview.deliveryMethod, preview.invoiceSoft,
         preview.lines.length, preview.slipCount, preview.totalQty, preview.csvSha256,
         actor, now, existing.id);
@@ -321,11 +325,11 @@ export function importBatch(preview, { hikiateClass, folderName, overwrite }, ac
     } else {
       const info = db.prepare(`
         INSERT INTO pk_batches
-          (tb_no, hikiate_class, folder_name, work_date, instruct_date, composition,
+          (tb_no, hikiate_class, class_source, folder_name, work_date, instruct_date, composition,
            delivery_method, invoice_soft, line_count, slip_count, total_qty,
            status, csv_sha256, imported_by, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)
-      `).run(preview.tbNo, cls, folder, jstToday(),
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)
+      `).run(preview.tbNo, cls, src, folder, jstToday(),
         preview.instructDate, preview.composition, preview.deliveryMethod, preview.invoiceSoft,
         preview.lines.length, preview.slipCount, preview.totalQty, preview.csvSha256,
         actor, now, now);

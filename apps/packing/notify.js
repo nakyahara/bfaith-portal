@@ -146,6 +146,27 @@ export async function postReprintText(text) {
   return true;
 }
 
+// ─── ⚠ 取りこぼしの見張り (miss-watch.js) の通知 ───
+// env: PACKING_MISS_WEBHOOK → 未設定なら PACKING_SHIP_CHANGE_WEBHOOK へフォールバック。
+// 「梱包に来ていない出荷グループがある」は事務・管理が拾うべき知らせなので、
+// 配送方法変更と同じスペースで受けられるようにしておく (専用にしたければ env を足すだけ)。
+export function missWebhookConfigured() {
+  return !!(process.env.PACKING_MISS_WEBHOOK || process.env.PACKING_SHIP_CHANGE_WEBHOOK);
+}
+
+export async function postMissText(text) {
+  const url = process.env.PACKING_MISS_WEBHOOK || process.env.PACKING_SHIP_CHANGE_WEBHOOK;
+  if (!url) return false;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
+  return true;
+}
+
 // ─── 📦 梱包資材の変更通知 (要件『梱包資材表示_要件定義_20260823.md』§5.3) ───
 // 送り先 = 「配送ルール承認」スペースの incoming webhook (中原さん決定 2026-08-24: 相乗り)。
 // env: PACKING_MATERIAL_WEBHOOK → fallback PACKING_SHIP_CHANGE_WEBHOOK。

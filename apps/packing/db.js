@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 19;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -520,6 +520,37 @@ const MIGRATIONS = {
   //   カウンタ (202) が合わなかった)。to_pas_count ⊆ excluded_count。PAS の本日累計に加算する
   17: () => {
     db.exec('ALTER TABLE pk_pack_line_runs ADD COLUMN to_pas_count INTEGER');
+  },
+  // v18: 取りこぼしの見張り (2026-09-04 障害の再発防止)。
+  //   ピッキングに来ているのに梱包へ来ていない出荷グループ / 引当分類が推定値のまま確定した
+  //   バッチを見つけて GChat に鳴らす。**検知した時点で行を作る (outbox)** ので、webhook が
+  //   落ちていても異常を見失わない (当日を跨いでも未送信行として残り、次に送れたときに鳴る)。
+  //   未送信行は日付で切り捨てない (何日後でも送れたときに鳴る)。
+  18: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_miss_alerts (
+      alert_key   TEXT PRIMARY KEY,     -- <work_date>:<kind>:<pk_batch_id> (フォルダ名は使い回されるので使わない)
+      kind        TEXT NOT NULL,          -- 'not_imported' | 'class_suggested'
+      work_date   TEXT NOT NULL,
+      pk_batch_id INTEGER,                -- pk_batches.id (調査用。FKは張らない = picking 側の作り直しに巻き込まれない)
+      folder_name TEXT NOT NULL,          -- 表示用
+      detail      TEXT,
+      attempts    INTEGER NOT NULL DEFAULT 0,
+      last_error  TEXT,
+      notified_at TEXT,                   -- 送れたときだけ入る (送信前に印を付けない)
+      created_at  TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_miss_alerts_pending ON pk_pack_miss_alerts(notified_at)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_miss_alerts_date ON pk_pack_miss_alerts(work_date)');
+  },
+  // v19: v18 のテーブル定義を後から直したので、**既に v18 を当てたDBにも列を足す**。
+  //   マイグレーションは一度当たると再実行されない。定義だけ書き換えると、新しいDBには
+  //   列があるのに v18 適用済みDBには無い、という食い違いが残る (Codexレビュー High)。
+  //   新規DB (v18 で pk_batch_id 込みで作られる) では ALTER をスキップする
+  19: () => {
+    const cols = db.prepare('PRAGMA table_info(pk_pack_miss_alerts)').all().map((c) => c.name);
+    if (!cols.includes('pk_batch_id')) db.exec('ALTER TABLE pk_pack_miss_alerts ADD COLUMN pk_batch_id INTEGER');
+    db.exec('DROP INDEX IF EXISTS idx_pk_pack_miss_alerts_date');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_miss_alerts_pending ON pk_pack_miss_alerts(notified_at)');
   },
 };
 
