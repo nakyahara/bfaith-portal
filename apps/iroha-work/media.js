@@ -122,6 +122,27 @@ export function inspectMediaUpload({ kind, filePath, operationId }) {
   return { ok: true, opId, size };
 }
 
+/**
+ * 実体を置く前の行の状態。⭐ここに居る行は「まだ無いもの」として扱う —
+ * 一覧にも出さず、Drive への送信キューも拾わない (キューは status='stored' だけを見る)。
+ * commit の後に実体を置いてから promoteStagedMedia で 'stored' に上げる (Codex PR1 R7)
+ */
+export const MEDIA_STAGING = 'staging';   // 印は staged_at 列。status の取りうる値は増やさない
+
+/** 保管場所での置き場所 (operation_id から一意に決まる。staging 行の復旧にも使う) */
+export function stagedPathOf(opId, kind) {
+  return path.join(MEDIA_DIR, `${opId}.${kind === 'photo' ? 'jpg' : 'mp4'}`);
+}
+
+/** 実体を置き終えた staging 行を公開する。上がらなければ (既に消された等) null */
+export function promoteStagedMedia(id, localPath) {
+  const db = getDB();
+  const n = db.prepare(`UPDATE f_iroha_card_media SET staged_at = NULL, local_path = ?
+    WHERE id = ? AND staged_at IS NOT NULL`).run(localPath, Number(id)).changes;
+  if (n === 0) return null;
+  return publicMedia(db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id)));
+}
+
 /** 一時ファイルを保管場所へ移す。deferMove で呼んだ側が、トランザクションを抜けてから呼ぶ */
 export function moveStoredFile(move) {
   if (!move) return;
@@ -149,6 +170,18 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
       ? (Number(dup.task_id) === Number(taskId) && dup.page_id == null)
       : (dup.page_id === pageId && dup.task_id == null);
     if (!sameCard) return { ok: false, error: 'operation_conflict', message: 'この送信は別のカードで使われています (撮り直してください)' };
+    // 実体を置く前に落ちた行 (staging) は、今回送られてきたファイルで置き直して復旧させる。
+    // これをしないと「DB にだけ残った写真」が、再送のたびに実体なしで成功扱いになる (Codex PR1 R7)
+    if (dup.staged_at && !dup.deleted_at && deferMove) {
+      const token = crypto.randomBytes(16).toString('base64url');
+      db.prepare('UPDATE f_iroha_card_media SET delete_token_hash = ? WHERE id = ?')
+        .run(crypto.createHash('sha256').update(token).digest('hex'), dup.id);
+      return { ok: true, already: true, media: publicMedia(dup), deleteToken: token,
+        move: { from: filePath, to: stagedPathOf(opId, dup.kind) } };
+    }
+    if (dup.staged_at) {
+      return { ok: false, error: 'not_ready', message: 'まだ保存中です。少し待ってから撮り直してください' };
+    }
     // 応答消失→再送 (Codex PR3-R3): 削除トークンを持てていないので、**同じ端末からの再送に
     // 限って**発行し直す (古いトークンは無効になる)。別端末からの同 operation_id には返さない
     if (deviceId != null && dup.uploader_device_id === Number(deviceId) && !dup.deleted_at) {
@@ -163,17 +196,18 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
   if (countActiveMedia({ pageId, taskId }, kind) >= max) {
     return { ok: false, error: 'cap_reached', message: `写真は${max}枚までです。不要な写真を削除してから撮り直してください` };
   }
-  const ext = kind === 'photo' ? 'jpg' : 'mp4';
-  const localPath = path.join(MEDIA_DIR, `${opId}.${ext}`);
-  // deferMove のときは移さない。呼び出し側がトランザクションを抜けてから moveStoredFile を呼ぶ
+  const localPath = stagedPathOf(opId, kind);
+  // deferMove のときは移さない。呼び出し側がトランザクションを抜けてから moveStoredFile を呼び、
+  // 置けてから promoteStagedMedia で 'stored' に上げる (Codex PR1 R6 / R7)
   if (!deferMove) moveStoredFile({ from: filePath, to: localPath });
   // 削除トークン: アップロードした端末だけに一度だけ返す (worker_id は画面で選べる自己申告なので
   // 「撮った本人」の証明に使わない — Codex PR3 #2)。サーバーはハッシュのみ保存
   const deleteToken = crypto.randomBytes(16).toString('base64url');
   const info = db.prepare(`INSERT INTO f_iroha_card_media
-    (operation_id, page_id, task_id, product_code, kind, mime, size, local_path, status, worker_id, worker_name, device_label, uploader_device_id, created_at, delete_token_hash)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?, ?, ?, ?)`)
-    .run(opId, pageId, taskId == null ? null : Number(taskId), productCode, kind, mime || null, size, localPath,
+    (operation_id, page_id, task_id, product_code, kind, mime, size, local_path, staged_at, status, worker_id, worker_name, device_label, uploader_device_id, created_at, delete_token_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'stored', ?, ?, ?, ?, ?, ?)`)
+    .run(opId, pageId, taskId == null ? null : Number(taskId), productCode, kind, mime || null, size,
+      deferMove ? null : localPath, deferMove ? utcNow() : null,
       worker.id, worker.display_name, deviceLabel, deviceId == null ? null : Number(deviceId), utcNow(),
       crypto.createHash('sha256').update(deleteToken).digest('hex'));
   const row = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(info.lastInsertRowid));
@@ -203,7 +237,9 @@ export function mediaByTask() { return mediaByCard('task_id'); }
 function mediaByCard(key) {
   const db = getDB();
   const map = new Map();
-  const rows = db.prepare(`SELECT * FROM f_iroha_card_media WHERE deleted_at IS NULL AND ${key} IS NOT NULL ORDER BY id`).all();
+  // 実体をまだ置いていない行 (staged_at あり) は「無いもの」として扱う — 画面にも出さない (Codex PR1 R7)
+  const rows = db.prepare(`SELECT * FROM f_iroha_card_media
+    WHERE deleted_at IS NULL AND staged_at IS NULL AND ${key} IS NOT NULL ORDER BY id`).all();
   const lost = db.prepare('UPDATE f_iroha_card_media SET next_retry_at = ?, error = ? WHERE id = ?');
   for (const r of rows) {
     // 送信待ちの実体が消えていたら (再起動で一時領域が飛んだ等)、キューの再試行 (最大10回) を待たずに
@@ -488,7 +524,7 @@ export async function processMediaQueue() {
   try {
     // ①Drive へ (stored の行)。成功したらそのページの Notion 貼り直しを予約
     const toUpload = db.prepare(`SELECT * FROM f_iroha_card_media
-      WHERE status = 'stored' AND deleted_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= ?)
+      WHERE status = 'stored' AND staged_at IS NULL AND deleted_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= ?)
       ORDER BY id LIMIT 20`).all(now);
     for (const r of toUpload) {
       try {

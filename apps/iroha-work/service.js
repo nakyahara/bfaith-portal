@@ -305,13 +305,15 @@ function queueMissingImages(cards) {
  * 1 枚だけ (下見・履歴の詳細)。終了したタスクも返す。無ければ null。
  * 一覧と違い、そのカードの**終わった作業** (work_history) も付ける — 詳細でしか使わないので 1 件ずつ引く
  */
-export function buildTaskCard(id) {
+export function buildTaskCard(id, { queueImages = true } = {}) {
   const t = getTask(id);
   if (!t) return null;
   const card = buildTaskCards([t]).cards[0] || null;
   if (!card) return null;
   card.work_history = finishedSessionsOfTask(t.id);
-  queueMissingImages([card]);
+  // ⭐下見・履歴 (読むだけ) では取り寄せない。開くだけで画像キューの DB が変わると
+  //   「読むだけの画面では何も書かない」という境界が崩れる (Codex PR1 R7)
+  if (queueImages) queueMissingImages([card]);
   return card;
 }
 

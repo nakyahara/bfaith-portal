@@ -168,6 +168,7 @@ const mediaDDL = (name) => `
       delete_token_hash  TEXT,
       uploader_device_id INTEGER,
       unavailable_at TEXT,
+      staged_at      TEXT,
       CHECK (page_id IS NOT NULL OR task_id IS NOT NULL)
     );`;
 const MEDIA_INDEX_DDL = `
@@ -549,6 +550,9 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_app_events', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
   // 古い版 (page_id NOT NULL) の作業時間・写真は作り直す — アプリ正本のカードは Notion ページを持たない (A1b)
   migrateSessionMediaSchema(db);
+  // 実体をまだ置いていない行の印 (Codex PR1 R7)。ここに値がある間は一覧にも送信キューにも出さない。
+  // 作り直しの後に足す (作り直しは mediaDDL を使うので新しい DB には既にある)
+  addCol('f_iroha_card_media', 'staged_at', 'TEXT');
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}

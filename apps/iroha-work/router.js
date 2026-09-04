@@ -47,7 +47,7 @@ import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-che
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
 import {
-  addMedia, inspectMediaUpload, moveStoredFile, dropMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
+  addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
   recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
   listPageSyncForAdmin, resetPageSync,
   isDriveConfigured, MEDIA_DIR, MAX_PHOTO_BYTES,
@@ -527,7 +527,8 @@ router.get('/api/preview-tasks', api((req, res) => {
  * 作業のやり方/写真/作業時間 = いまのアプリ DB — 画面で分けて出す
  */
 router.get('/api/task-previews/:id(\\d+)', api((req, res) => {
-  const card = buildTaskCard(parseTaskId(req.params.id));
+  // 読むだけなので、画像の取り寄せ (キューへの書き込み) も起こさない — Codex PR1 R7
+  const card = buildTaskCard(parseTaskId(req.params.id), { queueImages: false });
   if (!card) return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません' });
   res.json({
     ok: true, preview: true, card, capabilities: capabilitiesFor('preview'),
@@ -558,11 +559,22 @@ router.post('/api/bulk-stocked', checkOrigin, api((req, res) => {
     const pinCheck = verifyWorkerPin(w.worker.id, req.body?.pin);
     if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
   }
+  // 画面は「選んだときに見えていた版」を必ず添える。選んでから別の端末が変えていたら、その分は飛ばす
+  // (単票の変更と同じ楽観ロック — Codex PR1 R7)
   const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
-  const ids = raw.map((v) => parseTaskId(v));
-  if (ids.some((v) => v == null)) return res.status(400).json(BAD_TASK_ID);
+  const items = raw.map((v) => {
+    const id = parseTaskId(v && typeof v === 'object' ? v.id : v);
+    if (id == null) return null;
+    const ver = v && typeof v === 'object' ? Number(v.version) : NaN;
+    if (!Number.isSafeInteger(ver) || ver < 0) return null;
+    return { id, version: ver };
+  });
+  if (items.some((v) => v == null)) {
+    return res.status(400).json({ ok: false, error: 'bad_request',
+      message: '画面が古いようです。一覧を更新してから選び直してください' });
+  }
   const r = bulkCloseReady({
-    taskIds: ids, actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
+    taskIds: items, actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json(r);
@@ -885,7 +897,8 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
     if (out.deny) { cleanup(); return res.status(out.deny.status).json(out.deny.body); }
     const r = out.r;
     if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' || r.error === 'operation_conflict' ? 409 : 400).json(r); }
-    // 実体を置くのはトランザクションを抜けてから。置けなければ行を消して「無かったこと」にする
+    // 実体を置くのはトランザクションを抜けてから。置いてはじめて staging → stored に上げる。
+    // 上げる前に落ちても、行は staging のまま = 一覧にも送信キューにも出ず、再送で置き直せる (Codex PR1 R7)
     if (r.move) {
       try {
         moveStoredFile(r.move);
@@ -895,6 +908,15 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
         console.error('[iroha-work] 写真の保存に失敗', e);
         return res.status(500).json({ ok: false, error: 'store_failed', message: '写真を保存できませんでした (もう一度とってください)' });
       }
+      const promoted = promoteStagedMedia(r.media.id, r.move.to);
+      if (!promoted) {
+        // 上げられない = その行は既に消されている。置いた実体も片づけて、撮り直してもらう
+        try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
+        return res.status(409).json({ ok: false, error: 'not_ready', message: '保存の途中でカードが変わりました (もう一度とってください)' });
+      }
+      r.media = promoted;
+    } else {
+      cleanup();   // 再送で既存の行を返した場合。今回の一時ファイルは使わないので片づける
     }
     if (out.appMode) {
       safeLogTaskEvent({ taskId: out.taskId, action: `media_${kind}`, workerId: w.worker.id, workerName: w.worker.display_name,

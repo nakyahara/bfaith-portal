@@ -546,7 +546,7 @@ let state = { mode: 'notion', cards: [], statuses: [], changeTargets: [], worker
 let curTab = 'all';
 let curView = 'list';       // list | board | label | history (アプリ正本のときだけ切り替えられる)
 let curFacility = 'all';    // ボードの拠点しぼりこみ
-let bulkIds = null;         // まとめて棚入完了で選んでいる id の Set (null = 選択モードではない)
+let bulkIds = null;         // まとめて棚入完了で選んでいる id → 選んだときの版 の Map (null = 選択モードではない)
 let lwOpenOnly = true;      // ラベル待ち: 未完了だけ
 let lwEditing = null;       // 編集中のラベル待ち行 (新規は {task_id})
 let curDetail = null;      // 開いている詳細のカード id (Notion 正本 = page_id 文字列 / アプリ正本 = task id 数値)
@@ -1049,7 +1049,7 @@ function bcardHtml(c, status) {
 // ─── まとめて棚入完了 (職員のみ) ───
 function startBulk() {
   if (!stateCan('tasks.bulk_stocked')) return;
-  bulkIds = new Set();
+  bulkIds = new Map();
   renderBulk();
   if (curView === 'board') renderBoard(); else renderList();
 }
@@ -1062,7 +1062,8 @@ function exitBulk() {
 function toggleBulk(id) {
   if (!bulkIds) return;
   const n = Number(id);
-  if (bulkIds.has(n)) bulkIds.delete(n); else bulkIds.add(n);
+  // 選んだときに見えていた版を覚えておく (選んでから別の端末が変えていたら、送るときに飛ばされる — Codex PR1 R7)
+  if (bulkIds.has(n)) bulkIds.delete(n); else bulkIds.set(n, (findCard(n) || {}).version);
   renderBulk();
   if (curView === 'board') renderBoard(); else renderList();
 }
@@ -1078,7 +1079,7 @@ function syncBulkSelection(visible) {
   if (!bulkIds) return;
   const ok = new Set(visible.filter(c => c.status === 'ready_for_stocking').map(c => c.id));
   let dropped = 0;
-  for (const id of [...bulkIds]) if (!ok.has(id)) { bulkIds.delete(id); dropped++; }
+  for (const id of [...bulkIds.keys()]) if (!ok.has(id)) { bulkIds.delete(id); dropped++; }
   if (dropped > 0) toast(dropped + ' 件は絞り込みで見えなくなったので選択から外しました');
   renderBulk();
 }
@@ -1087,7 +1088,7 @@ async function doBulkStocked() {
   if (!bulkIds || bulkIds.size === 0) { toast('カードを選んでください'); return; }
   const w = worker;
   if (!w) { openGate(); return; }
-  const ids = [...bulkIds];
+  const ids = [...bulkIds.keys()];
   let pin = null;
   if (!state.me.session) {
     if (w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです'); return; }
@@ -1098,7 +1099,7 @@ async function doBulkStocked() {
   const list = names.slice(0, 8).join('\n') + (names.length > 8 ? '\n…ほか ' + (names.length - 8) + ' 件' : '');
   if (!window.confirm(ids.length + ' 件を棚入完了にします。よろしいですか?\n\n' + list)) return;
   const j = await apiFetch('/api/bulk-stocked', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids, worker_id: w.id, pin }) });
+    body: JSON.stringify({ ids: ids.map((id) => ({ id, version: bulkIds.get(id) })), worker_id: w.id, pin }) });
   if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
   const skipped = (j.skipped || []).length;
   toast(j.done.length + ' 件を棚入完了にしました' + (skipped ? ' (' + skipped + ' 件は状態が変わっていたので飛ばしました)' : ''));
