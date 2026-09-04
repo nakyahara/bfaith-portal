@@ -197,7 +197,8 @@ export function listOrphans(limit = 100) {
 
 // ─── 状態変更 ───
 
-const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, hold_reason_required: 400, close_reason_required: 400, not_found: 404, bad_request: 400 };
+const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, hold_reason_required: 400, close_reason_required: 400, not_found: 404, bad_request: 400,
+  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409 };
 export function taskErrorStatus(error) { return HTTP_BY_ERROR[error] || 400; }
 
 /**
@@ -260,6 +261,7 @@ export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = nul
   const db = getDB();
   const t = getTask(taskId);
   if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+  if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
   if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
   const d = plannedDate == null || plannedDate === '' ? null : String(plannedDate);
   if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) return { ok: false, error: 'bad_request', message: '日付は YYYY-MM-DD で指定してください' };
@@ -360,6 +362,7 @@ export function clearMigrationReview({ taskId, expectVersion, actor = null }) {
   const db = getDB();
   const t = getTask(taskId);
   if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+  if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
   if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
   const r = db.prepare('UPDATE f_iroha_tasks SET migration_review = 0, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
     .run(utcNow(), actor, t.id, t.version);
@@ -470,6 +473,7 @@ export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion 
   if (id == null) {
     const t = getTask(taskId);
     if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+    if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードには記録を足せません (履歴として残ります)' };
     const cols = Object.keys(rec);
     const info = db.prepare(`INSERT INTO f_iroha_label_waits (task_id${cols.map((c) => ', ' + c).join('')}, version, created_at, updated_at)
       VALUES (?${cols.map(() => ', ?').join('')}, 1, ?, ?)`).run(t.id, ...cols.map((c) => rec[c]), now, now);
@@ -478,6 +482,12 @@ export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion 
   }
   const cur = db.prepare('SELECT * FROM f_iroha_label_waits WHERE id = ?').get(Number(id));
   if (!cur) return { ok: false, error: 'not_found', message: 'ラベル待ちの記録が見つかりません' };
+  // その記録が本当にそのカードのものか (別のカードの id を添えて書き換えられないように — Codex PR1 R2)
+  if (taskId != null && Number(cur.task_id) !== Number(taskId)) {
+    return { ok: false, error: 'not_found', message: 'ラベル待ちの記録が見つかりません' };
+  }
+  const owner = getTask(cur.task_id);
+  if (owner && owner.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードの記録は変えられません (履歴として残ります)' };
   if (expectVersion == null || Number(expectVersion) !== cur.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: cur };
   const cols = Object.keys(rec);
   if (cols.length === 0) return { ok: true, row: cur, unchanged: true };

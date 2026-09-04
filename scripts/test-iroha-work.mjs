@@ -1617,6 +1617,48 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       const pv = await call('GET', '/api/task-previews/' + closedId, { cookie });
       ok(pv.status === 200 && pv.json.ok && pv.json.card.status === 'closed' && pv.json.capabilities.length === 0,
         '終了したカードの詳細は読むだけで開ける');
+      // 写真だけでなく、タスクに紐づく書き込み口はすべて断る (Codex PR1 R2 重大)
+      const snapHist = () => JSON.stringify([
+        db.prepare('SELECT * FROM f_iroha_tasks WHERE id = ?').get(closedId),
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_label_waits WHERE task_id = ?').get(closedId).c,
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id = ?').get(closedId).c,
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c,
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_work_master').get().c,
+      ]);
+      const staffHist = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+      const beforeHist = snapHist();
+      const closedWrites = [
+        ['/api/planned', { id: closedId, worker_id: w1.id, planned_date: '2099-12-31', expect_version: TD.getTask(closedId).version }],
+        ['/api/review-cleared', { id: closedId, worker_id: staffHist.id, pin: '4649', expect_version: TD.getTask(closedId).version }],
+        ['/api/label-waits', { task_id: closedId, worker_id: w1.id, fields: { note: '履歴に足す' } }],
+        ['/api/master', { id: closedId, code: 'HIST-A', worker_id: w1.id, fields: { note: 'x' }, expect_version: 1 }],
+        ['/api/options', { id: closedId, kind: 'material', code: 'HIST-NEW', worker_id: staffHist.id, pin: '4649' }],
+        ['/api/external-ready', { id: closedId, ready: true, worker_id: w1.id, expect_version: TD.getTask(closedId).version }],
+      ];
+      for (const [p2, body] of closedWrites) {
+        const r = await call('POST', p2, { cookie, body });
+        if (!(r.status === 409 && (r.json.error === 'closed_task' || r.json.error === 'done_card'))) {
+          ok(false, `${p2} に終了カードの id を送ると 409 (実際 ${r.status} ${r.json && r.json.error})`);
+        }
+      }
+      ok(true, '今日やる・確認ずみ・ラベル待ち・作業のやり方・候補・外部準備OK に終了カードの id を送ると 409');
+      ok(snapHist() === beforeHist, '終了カードの id をどの書き込み API に送っても DB が変わらない');
+      // ラベル待ちの記録は「そのカードのもの」でなければ書き換えられない (別カードの id を添えても通らない)
+      {
+        const openTask = TD.upsertTaskFromImport({ notion_page_id: 'lw-owner', status: 'on_hold', hold_reason_code: 'label_shortage',
+          destination_id: 8898, product_code: 'LW-A', product_name: 'ラベル待ちの持ち主', qty: 1, facility_code: 'iroha' }, { batchId: 'test-lw' }).id;
+        const otherTask = TD.upsertTaskFromImport({ notion_page_id: 'lw-other', status: 'not_started',
+          destination_id: 8897, product_code: 'LW-B', product_name: 'よその card', qty: 1, facility_code: 'iroha' }, { batchId: 'test-lw' }).id;
+        const lw = TD.upsertLabelWait({ taskId: openTask, fields: { occurred_on: '2026-09-04', qty: 1 } });
+        ok(lw.ok, '前提: ラベル待ちを 1 件登録');
+        const stolen = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: otherTask, worker_id: w1.id,
+          expect_version: lw.row.version, fields: { note: 'よそから書き換え' } } });
+        ok(stolen.status === 404 && stolen.json.error === 'not_found', '別のカードの id を添えた更新は通らない');
+        ok(db.prepare('SELECT note FROM f_iroha_label_waits WHERE id = ?').get(lw.row.id).note == null, '中身も変わらない');
+        const mine = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: openTask, worker_id: w1.id,
+          expect_version: lw.row.version, fields: { note: '正しい持ち主から' } } });
+        ok(mine.status === 200 && mine.json.ok, '正しいカードからは更新できる');
+      }
     }
     // まとめて棚入完了 (PR-C): 棚入待ちのものだけ・職員だけ
     {

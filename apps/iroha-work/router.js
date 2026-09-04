@@ -133,6 +133,19 @@ const BAD_TASK_ID = { ok: false, error: 'bad_request', message: 'カードの指
  */
 const PREVIEW_WRITE_REJECTED = { ok: false, error: 'notion_mode', message: '下見のカードには書き込めません (正本は Notion です)' };
 const isPreviewIdInNotionMode = (cardId) => !isAppMode() && parseTaskId(cardId) != null;
+const CLOSED_WRITE_REJECTED = { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
+/**
+ * 履歴 (終了したカード) の id で書き込みに来ていないか。画面は許可リストで操作を描かないが、
+ * 古いタブや作った要求からは届くので、**書き込み口はすべて**ここを通す (要件 v1.3 §P Q5 / Codex PR1 R2)。
+ * 「終了からのやり直し」だけは職員 + 理由つきの正式な操作なので /api/status に残す
+ */
+function isClosedCardId(cardId) {
+  if (!isAppMode()) return false;
+  const id = parseTaskId(cardId);
+  if (id == null) return false;
+  const t = getTask(id);
+  return !!t && t.status === 'closed';
+}
 
 const api = fn => async (req, res) => {
   try { await fn(req, res); } catch (e) {
@@ -593,6 +606,7 @@ router.post('/api/options', checkOrigin, api((req, res) => {
   // 候補じたいは商品に紐づかない共有マスタなので Notion 正本でも登録できる。ただし下見のカード id を
   // 添えた要求は受けない (「下見の id を送っても DB が変わらない」を全ての書き込み口で同じにする)
   if (isPreviewIdInNotionMode(req.body?.id ?? req.body?.page_id)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
+  if (isClosedCardId(req.body?.id ?? req.body?.page_id)) return res.status(409).json(CLOSED_WRITE_REJECTED);
   if (!hasSessionAccess(req)) {
     if (w.worker.worker_type !== 'staff') {
       return res.status(403).json({ ok: false, error: 'staff_required', message: '新しい候補の登録は職員のみです (職員の名前を選び、PINを入れてください)' });
@@ -631,6 +645,7 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   // アプリ正本ならタスクの作成時スナップショット、Notion 正本ならカードのプロパティ
   const cardId = String(req.body?.id || req.body?.page_id || '');
   if (isPreviewIdInNotionMode(cardId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
+  if (isClosedCardId(cardId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
   let cardValues = {};
   if (isAppMode()) {
     const t = parseTaskId(cardId) == null ? null : getTask(parseTaskId(cardId));
