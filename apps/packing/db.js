@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -520,6 +520,22 @@ const MIGRATIONS = {
   //   カウンタ (202) が合わなかった)。to_pas_count ⊆ excluded_count。PAS の本日累計に加算する
   17: () => {
     db.exec('ALTER TABLE pk_pack_line_runs ADD COLUMN to_pas_count INTEGER');
+  },
+  // v18: 取りこぼしの見張り (2026-09-04 障害の再発防止)。
+  //   ピッキングに来ているのに梱包へ来ていない出荷グループ / 引当分類が推定値のまま確定した
+  //   バッチを見つけて GChat に鳴らす。同じ件で鳴り続けないよう「鳴らした事実」をここに残す
+  //   (alert_key = <work_date>:<kind>:<folder_name> で1件1回)
+  18: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_miss_alerts (
+      alert_key   TEXT PRIMARY KEY,
+      kind        TEXT NOT NULL,          -- 'not_imported' | 'class_suggested'
+      work_date   TEXT NOT NULL,
+      folder_name TEXT NOT NULL,
+      detail      TEXT,
+      notified_at TEXT,                   -- 送れたときだけ入る (送信前に印を付けない)
+      created_at  TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_miss_alerts_date ON pk_pack_miss_alerts(work_date)');
   },
 };
 

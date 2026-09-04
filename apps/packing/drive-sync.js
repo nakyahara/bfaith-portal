@@ -16,7 +16,8 @@
  * 定期実行の台帳: config/jobs-registry.mjs の packing-drive-poller を参照。
  */
 import { getDB, utcNow } from './db.js';
-import { notifyShipChange, notifyReprint, postMaterialText, materialWebhookConfigured, postReprintText } from './notify.js';
+import { notifyShipChange, notifyReprint, postMaterialText, materialWebhookConfigured, postReprintText, postMissText, missWebhookConfigured } from './notify.js';
+import { missWatchStep } from './miss-watch.js';
 import { sweepPrintJobs, pendingAlerts, markAlerted, alertTextFor } from './print-queue.js';
 import { materialNotifyStep, purgeOldViews } from './materials.js';
 import { cleanupReprintPdfs } from './reprint-pdf.js';
@@ -336,6 +337,13 @@ export function startPackingDrivePoller() {
       purgeOldViews();   // 表示観測ログの180日 purge (要件§7)
       cleanupReprintPdfs();
       await sweepPrintJobsStep();
+      // ⚠ 取りこぼしの見張り (ピッキングにあるのに梱包に無い / 分類が推定値のまま)。
+      // ここが落ちても取込は止めない (fail-soft) が、失敗はログに残す
+      try {
+        await missWatchStep(missWebhookConfigured() ? postMissText : null);
+      } catch (e) {
+        console.warn(`[packing-drive-poller] 取りこぼしの見張りに失敗: ${e.message}`);
+      }
       // ピッキング「後で取りに行く」依頼を取込済みバッチへ展開 (欠品フローv2 PR2・fail-soft)。
       // 欠品はピッキング中 = 梱包CSVの取込前が普通なので、取込後のここで追いつくのが主経路
       try { (await import('../picking/service.js')).bindPendingLaterRequests(); }

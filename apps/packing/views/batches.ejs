@@ -116,7 +116,12 @@
         <div class="card-main">
           <div class="card-title"><%= b.folder_name || b.tb_key %></div>
           <% if (b.hikiateClass) { %>
-            <div style="font-size:.8rem;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;"><%= b.hikiateClass %></div>
+            <div style="font-size:.8rem;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;">
+              <%= b.hikiateClass %></div>
+            <% if (b.classSource === 'suggested') { %>
+              <%# Driveの引当パターンtxtが取れず推定した分類 = 現物と違うことがある %>
+              <div style="font-size:.78rem;color:#c5221f;font-weight:600;">⚠ この引当分類は推定です (現物を確認してください)</div>
+            <% } %>
           <% } %>
           <div class="card-meta">
             <span>伝票 <b><%= b.done_slips %></b>/<b><%= b.slip_count %></b></span>

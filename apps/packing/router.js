@@ -29,7 +29,7 @@ import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, SHIP_CHANGE_TWO_LABELS, lastDoneSeqOf, getDailySummary,
-  resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal, listRepickReady,
+  resolveIncident, lineKindOf, batchHikiateClass, batchClassInfo, listLineRuns, lineDailyTotal, listRepickReady,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText } from './notify.js';
 import {
@@ -326,7 +326,9 @@ router.get('/', (req, res) => {
   const batches = listPackBatches(workDate);
   // 引当分類名 (表示) とライン種別 (pas/melt/null — 作業ボタンの振り分け)
   for (const b of batches) {
-    b.hikiateClass = batchHikiateClass(getDB(), b);
+    const cls = batchClassInfo(getDB(), b);
+    b.hikiateClass = cls.name;
+    b.classSource = cls.source;   // 'suggested' なら画面で「推定」と分かるようにする
     b.lineKind = lineKindOf(b.hikiateClass);
   }
   res.render(path.join(__dirname, 'views/batches'), {

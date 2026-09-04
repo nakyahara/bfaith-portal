@@ -11,7 +11,7 @@ const dir = path.dirname(fileURLToPath(import.meta.url));
 const suites = ['test-import.mjs', 'test-stats.mjs', 'test-ne-names.mjs', 'test-materials.mjs',
   'test-reprint.mjs', 'test-reprint-manifest.mjs', 'test-print-queue.mjs', 'test-print-api.mjs',
   'test-views.mjs', 'test-print-agent.mjs', 'test-work-nav.mjs',
-  'test-notify-shipchange.mjs', 'test-line.mjs'];
+  'test-notify-shipchange.mjs', 'test-line.mjs', 'test-miss-watch.mjs'];
 
 let failed = 0;
 for (const f of suites) {
