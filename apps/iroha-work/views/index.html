@@ -1078,7 +1078,7 @@ function whenChips() {
   const cards = ((boardState() || {}).cards || []);
   const n = (v) => (v === 'all' ? cards.length : v === 'none' ? cards.filter(c => !c.when).length : cards.filter(c => c.when === v).length);
   // 札に出る「いつ」は絞り込みでも選べるようにする (やり残しだけ見たい、があるため — Codex P2 R1)
-  return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['none', '未定']]
+  return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定']]
     .map(([v, l]) => '<button class="chip' + (curWhen === v ? ' on' : '') + '" data-when="' + v + '">' + l +
       ' <span class="num">' + n(v) + '</span></button>').join('');
 }
@@ -1206,16 +1206,18 @@ function planTagsHtml(c) {
 
 // ─── ⭐「いつ」「どこが」を変える (職員だけ。要件 §W-4) ───
 /** 「明日やる」↔「未定」を切り替える。今日やる分・やり残しは「明日の計画」で扱う */
-async function toggleTomorrow(id) {
+async function toggleTomorrow(id, want) {
   if (!stateCan('task.plan.assign')) return;          // 許可が無ければ動かない (札もボタンにしていない)
   const c = findCard(id);
   if (!c) return;
   const w = worker;
   if (!w) { openGate(); return; }
-  const next = c.when === 'tomorrow' ? null : 'tomorrow';
+  // ⭐最初に決めた「どうしたいか」を持ち回る。PIN を入れている間に別の端末が変えても、
+  //   やり直しで逆の操作にならないようにする (Codex P2 R2)
+  const next = want !== undefined ? want : (c.when === 'tomorrow' ? null : 'tomorrow');
   const j = await apiFetch('/api/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id, when: next, expect_version: c.version, worker_id: w.id }) });
-  if (!j.ok) return planError(j, () => toggleTomorrow(id));
+  if (!j.ok) return planError(j, () => toggleTomorrow(id, next));
   applyTask(c, j.task);
   if (j.staff_mode) state.staff_mode = j.staff_mode;
   redrawAfterPlan();

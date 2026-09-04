@@ -2073,10 +2073,11 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
           const t5 = mk(9412, '工程数なし', 'not_started');
           db.prepare('UPDATE f_iroha_tasks SET qty = 50, master_snapshot = NULL, product_code = NULL WHERE id = ?').run(t5);
           clearEnrichCache();
-          await call('POST', '/api/plan', { cookie, body: { id: t5, when: 'tomorrow', expect_version: TD.getTask(t5).version, worker_id: staffP.id } });
+          const p5 = await call('POST', '/api/plan', { cookie, body: { id: t5, when: 'tomorrow', expect_version: TD.getTask(t5).version, worker_id: staffP.id } });
+          ok(p5.status === 200 && p5.json.ok, '工程数の無いカードも明日やる分に入れられる');
           const unk = (await call('GET', '/api/state', { cookie })).json.tomorrow_plan;
-          ok(unk.unknown_hours_count >= 1 && Math.round(unk.hours * 10) === Math.round(before.hours * 10),
-            '工程数の無いカードは「時間不明」に数え、合計時間には足さない');
+          ok(unk.unknown_hours_count === before.unknown_hours_count + 1 && Math.round(unk.hours * 10) === Math.round(before.hours * 10),
+            '工程数の無いカードは「時間不明」がちょうど 1 増え、合計時間には足さない');
           await call('POST', '/api/plan', { cookie, body: { id: t5, when: null, expect_version: TD.getTask(t5).version, worker_id: staffP.id } });
         }
 
@@ -2983,7 +2984,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     'カードの「どこが」「いつ」の札は許可リストで出し分ける');
   ok(/canFac\s*\r?\n?\s*\? '<button class="tag ' \+ facCls \+ '" data-fac-of=/.test(html) && /: '<span class="tag ' \+ facCls \+ '"/.test(html),
     '許可が無ければ札は span で描く (ボタンを描いて無効にしない)');
-  ok(/function toggleTomorrow\(id\) \{\r?\n\s+if \(!stateCan\('task\.plan\.assign'\)\) return;/.test(html)
+  ok(/function toggleTomorrow\(id, want\) \{\r?\n\s+if \(!stateCan\('task\.plan\.assign'\)\) return;/.test(html)
     && /function openFacPick\(id\) \{\r?\n\s+if \(!stateCan\('task\.facility\.assign'\)\) return;/.test(html),
     '札の入口でも許可リストを見る (二重の守り)');
   ok(/const facBtn = e\.target\.closest\('\[data-fac-of\]'\);/.test(html) && /e\.stopPropagation\(\); openFacPick/.test(html),
@@ -3008,7 +3009,10 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '拠点の保存も、職員モードが切れたら PIN を聞いて同じ拠点をもう一度送る');
   ok(/if \(j\.current\) \{ applyTask\(c, j\.current\); redrawAfterPlan\(\); \}\r?\n\s+\$\('#facMsg'\)/.test(html),
     '版がずれていたら最新を入れてから知らせる (古い版のまま押し続けない)');
-  ok(/\['over', 'やり残し'\]/.test(html), '「やり残し」だけを絞り込める (札に出る値は絞り込みにもある)');
+  ok(/\['over', 'やり残し'\]/.test(html) && /\['later', '先の予定'\]/.test(html),
+    '札に出る「いつ」は全部 (やり残し・先の予定も) 絞り込める');
+  ok(/const next = want !== undefined \? want :/.test(html) && /planError\(j, \(\) => toggleTomorrow\(id, next\)\)/.test(html),
+    'PIN を入れている間に別の端末が変えても、やり直しで逆の操作にならない (最初に決めた値を持ち回る)');
   ok(/esc\(String\(p\.unknown_hours_count\)\)/.test(html) && /esc\(String\(h\)\)/.test(html),
     'ゲージの数字も esc を通す (画面の文字列はすべてエスケープ)');
   ok(!/renderList\(\); renderDetail\(c\);\r?\n\s+if \(curView === 'board'\) renderBoard\(\);\r?\n\s+toast\(on \? '「今日やる」/.test(html),
