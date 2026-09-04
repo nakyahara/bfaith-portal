@@ -2973,7 +2973,47 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v3'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v4'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  // ══ P3: 明日の計画の画面 (職員だけ) ══
+  ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
+  ok(/if \(v === 'plan' && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
+    '許可が無ければ計画の画面に入れない (古い画面からの復帰でも)');
+  ok(/function openPlanPage\(\) \{[\s\S]{0,80}if \(!stateCan\('task\.plan\.assign'\)\) return;/.test(html), 'ゲージからの入口でも許可を見る');
+  ok(/async function loadPlanOnce\(\)/.test(html) && /if \(await askStaffUnlock\(\)\) \{ await loadState\(\); planGen = gen - 1; return loadPlanOnce\(\); \}/.test(html),
+    '職員モードが切れていたら PIN を聞いて開き直す');
+  ok(/const gen = \+\+planGen;/.test(html) && /if \(gen !== planGen\) return;/.test(html),
+    '遅れて返った古い応答で新しい中身を上書きしない');
+  ok(/const next = planInflight \? planInflight\.catch\(\(\) => \{\}\)\.then\(\(\) => loadPlanOnce\(\)\) : loadPlanOnce\(\);/.test(html),
+    '変えた後の取り直しは、変える前に始まった取得を使い回さない');
+  ok(/if \(!planData\) \$\('#planCand'\)\.innerHTML/.test(html), 'つながらないときは前回の中身を消さない');
+  ok(/やり残し ' \+ carry\.length \+ ' 件 — どうしますか \(自動では動かしません\)/.test(html)
+    && /\['明日やる', 'primary', 'tomorrow'\]/.test(html) && /\['未定に戻す', 'warn', 'none'\]/.test(html),
+    'やり残しは先頭に出して、職員が「明日やる / 今日やる / 未定に戻す」を選ぶ');
+  ok(/選ぶたびに保存されます \(確定ボタンはありません\)/.test(html), '選ぶたびに保存 (確定ボタンを作らない)');
+  ok(/if \(when === 'tomorrow' && planCard\(id\) && stateCan\('task\.facility\.assign'\)\)/.test(html),
+    '「明日やる」に積むときは、拠点が決まっていても確認してから積む (いまの拠点を選んだ状態で出す)');
+  ok(/'まだ決めない' : '未定にする'/.test(html), '積む流れでは「まだ決めない」も選べる (決まっていなくても積める)');
+  ok(/const pileActs = stateCan\('task\.facility\.assign'\) \? \[\['どこが'/.test(html),
+    '「どこが」のボタンは許可があるときだけ描く (無効化して見せない)');
+  ok(/if \(!stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+planData = null;\r?\n\s+clearPlanDom\(\);/.test(html)
+    && /function clearPlanDom\(\)/.test(html),
+    '計画の許可を失ったら、描いたものを消す (隠すだけにしない — hidden の画面に押せるボタンを残さない)');
+  ok(/\} else if \(planData\) \{\r?\n\s+renderPlan\(\);/.test(html),
+    '許可が変わったら計画の中身を描き直す (「どこが」だけ失った場合もボタンが消える)');
+  ok(/facPickCtx = \{ id, thenWhen: null, saving: false \};/.test(html),
+    'ボードから「どこが」を開くときも ctx を作る (作らないとタップが受け取られない)');
+  ok(/planInflight = next;\r?\n\s+next\.finally\(\(\) => \{ if \(planInflight === next\) planInflight = null; \}\);/.test(html),
+    '取得が終わったら planInflight を null に戻す (finally の戻り値を入れると自分と比べられない)');
+  ok(/facPickCtx = \{ id, thenWhen: thenWhen \?\? null, saving: false \};/.test(html)
+    && /if \(!b \|\| !facPickCtx \|\| facPickCtx\.saving\) return;/.test(html),
+    '「どこが → 明日やる」は 1 つの操作として持ち回る (通信の後にグローバルを読み直さない・連打を受けない)');
+  ok(/const done = await savePlanWhen\(id, thenWhen\);/.test(html) && /作業する場所は変えましたが、明日やる分には入れられませんでした/.test(html),
+    '2 段目が通らなかったら「拠点だけ変わった」とはっきり伝える');
+  ok(/どこが未定 ' \+ und \+ ' 件/.test(html), '拠点が未定の件数を警告に出す');
+  ok(/data-plan-act=/.test(html) && /\$\('#planCand'\)\.addEventListener\('click'/.test(html),
+    '計画画面のボタンも data-* + 委譲で受ける (onclick に値を埋めない)');
+  ok(/function pcardHtml\(c, actions\)/.test(html) && /大きさ 不明/.test(html),
+    'カードに理由 (在庫・入荷・大きさ) を添える。大きさが分からなければそう出す');
   // ══ P2: ボードに 3 軸を載せる (要件 §W-4) ══
   ok(/<div id="gaugeWrap"><\/div>/.test(html) && !/class="gauge"/.test(html.slice(0, html.indexOf('<script'))),
     '明日やる分のゲージは静的に置かない (職員のときだけボタンにする)');
@@ -3005,9 +3045,10 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '計画を変えたら 一覧・ボード・ゲージ を全部描き直す (ボードだけ描くと一覧に古い値が残る)');
   ok(/function recountTomorrow\(\)/.test(html) && /state\.tomorrow_plan = \{ hours:/.test(html),
     '上のゲージは手元のカードから数え直す (取得時の集計のままにしない)');
-  ok(/async function saveFacility\(id, code\)/.test(html) && /return planError\(j, \(\) => saveFacility\(id, code\), \{ silent: true \}\);/.test(html),
+  ok(/async function saveFacility\(id, code, thenWhen\)/.test(html)
+    && /return planError\(j, \(\) => saveFacility\(id, code, thenWhen\), \{ silent: true \}\);/.test(html),
     '拠点の保存も、職員モードが切れたら PIN を聞いて同じ拠点をもう一度送る');
-  ok(/if \(j\.current\) \{ applyTask\(c, j\.current\); redrawAfterPlan\(\); \}\r?\n\s+\$\('#facMsg'\)/.test(html),
+  ok(/if \(j\.current\) \{ const inList2 = findCard\(id\); if \(inList2\) applyTask\(inList2, j\.current\); redrawAfterPlan\(\);/.test(html),
     '版がずれていたら最新を入れてから知らせる (古い版のまま押し続けない)');
   ok(/\['over', 'やり残し'\]/.test(html) && /\['later', '先の予定'\]/.test(html),
     '札に出る「いつ」は全部 (やり残し・先の予定も) 絞り込める');
