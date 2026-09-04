@@ -151,20 +151,31 @@ function isClosedCardId(cardId) {
  * そのカードが「いま書ける」ものかをサーバーで確かめる。断るなら返す本文、通るなら null。
  * 省略・空・でたらめな id で検査を素通りできないようにする (Codex PR1 R3)
  */
-function writableCardOr409(rawId) {
+function writableCard(rawId, { code = null } = {}) {
   const cardId = String(rawId == null ? '' : rawId).trim();
-  if (!cardId) return { ok: false, error: 'card_required', message: 'どのカードからの操作かが必要です (一覧を更新してください)' };
+  if (!cardId) return { deny: { ok: false, error: 'card_required', message: 'どのカードからの操作かが必要です (一覧を更新してください)' } };
+  let productCode = null;
   if (isAppMode()) {
     const id = parseTaskId(cardId);
     const t = id == null ? null : getTask(id);
-    if (!t) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
-    if (t.status === 'closed') return CLOSED_WRITE_REJECTED;
-    return null;
+    if (!t) return { deny: { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' } };
+    if (t.status === 'closed') return { deny: CLOSED_WRITE_REJECTED };
+    productCode = t.product_code;
+  } else {
+    // Notion 正本: 数値 id は下見のカード。通すのはキャッシュにある Notion のカードだけ
+    if (parseTaskId(cardId) != null) return { deny: PREVIEW_WRITE_REJECTED };
+    const page = getCachePage(cardId);
+    if (!page) return { deny: { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' } };
+    productCode = page.product_code;
   }
-  // Notion 正本: 数値 id は下見のカード。通すのはキャッシュにある Notion のカードだけ
-  if (parseTaskId(cardId) != null) return PREVIEW_WRITE_REJECTED;
-  if (!getCachePage(cardId)) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
-  return null;
+  // ⭐そのカードの商品と、書き換えようとしている商品が同じか。ここを見ないと、
+  //   「開いている適当なカード」を添えて、下見・履歴にしかない別商品の作業のやり方を書き換えられる (Codex PR1 R4)
+  if (code != null) {
+    if (!productCode || codeKeyOf(productCode) !== codeKeyOf(code)) {
+      return { deny: { ok: false, error: 'card_mismatch', message: 'カードとちがう商品には登録できません (一覧を更新してください)' } };
+    }
+  }
+  return { productCode };
 }
 
 const api = fn => async (req, res) => {
@@ -627,8 +638,8 @@ router.post('/api/options', checkOrigin, api((req, res) => {
   // 添えた要求は受けない (「下見の id を送っても DB が変わらない」を全ての書き込み口で同じにする)
   // 候補の登録は詳細のダイアログからしか呼ばない。どのカードから来たかを必ず添えてもらい、
   // 「いま書けるカード」でなければ断る (省略・空・でたらめで検査を素通りできないように — Codex PR1 R3)
-  const optGate = writableCardOr409(req.body?.id ?? req.body?.page_id);
-  if (optGate) return res.status(409).json(optGate);
+  const optGate = writableCard(req.body?.id ?? req.body?.page_id);
+  if (optGate.deny) return res.status(409).json(optGate.deny);
   if (!hasSessionAccess(req)) {
     if (w.worker.worker_type !== 'staff') {
       return res.status(403).json({ ok: false, error: 'staff_required', message: '新しい候補の登録は職員のみです (職員の名前を選び、PINを入れてください)' });
@@ -649,11 +660,12 @@ router.post('/api/options', checkOrigin, api((req, res) => {
 router.post('/api/master', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  // どのカードからの操作かを先に確かめる (中身の検証より前。省略・でたらめで素通りさせない — Codex PR1 R3)
-  const masterGate = writableCardOr409(req.body?.id ?? req.body?.page_id);
-  if (masterGate) return res.status(409).json(masterGate);
   const code = String(req.body?.code || '').trim();
   if (!code) return res.status(400).json({ ok: false, error: 'bad_request', message: 'code (商品コード) が必要です' });
+  // どのカードからの操作かを、中身の検証より前に確かめる。カードとその商品が一致していることも必須
+  // (省略・でたらめ・よそのカードで素通りさせない — Codex PR1 R3 / R4)
+  const masterGate = writableCard(req.body?.id ?? req.body?.page_id, { code });
+  if (masterGate.deny) return res.status(409).json(masterGate.deny);
   const fieldsIn = req.body?.fields;
   if (!fieldsIn || typeof fieldsIn !== 'object' || Array.isArray(fieldsIn)) {
     return res.status(400).json({ ok: false, error: 'bad_request', message: '変更内容がありません' });

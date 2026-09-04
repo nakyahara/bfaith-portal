@@ -1660,6 +1660,22 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         }
       }
       ok(true, '作業のやり方・候補の登録は、書けるカードを添えないと通らない (省略・空・でたらめ・無い id)');
+      // 添えたカードと、書き換える商品が同じでなければ通さない
+      // (適当な未終了カードを添えて、下見・履歴にしかない別商品のやり方を書き換えられないように — Codex PR1 R4)
+      {
+        const other = TD.upsertTaskFromImport({ notion_page_id: 'mismatch-open', status: 'not_started', destination_id: 8896,
+          product_code: 'PROD-NEW', product_name: '開いているカード', qty: 1, facility_code: 'iroha' }, { batchId: 'test-mis' }).id;
+        const beforeMaster = db.prepare("SELECT COUNT(*) c FROM f_iroha_work_master WHERE code_key = 'hist-a'").get().c;
+        const bad = await call('POST', '/api/master', { cookie, body: { id: other, code: 'HIST-A',
+          fields: { note: 'よそのカードから' }, worker_id: staffHist.id, pin: '4649', expect_version: 1 } });
+        ok(bad.status === 409 && bad.json.error === 'card_mismatch', 'カードとちがう商品の作業のやり方は書き換えられない');
+        ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_master WHERE code_key = 'hist-a'").get().c === beforeMaster,
+          'その商品のマスタは 1 行も増えていない');
+        const mv = db.prepare("SELECT version FROM f_iroha_work_master WHERE code_key = 'prod-new'").get();
+        const good = await call('POST', '/api/master', { cookie, body: { id: other, code: 'PROD-NEW',
+          fields: { note: '自分のカードから' }, worker_id: staffHist.id, pin: '4649', expect_version: mv ? mv.version : 1 } });
+        ok(good.status === 200 && good.json.ok, '自分のカードの商品なら通る (商品マスタにある商品)');
+      }
       ok(snapHist() === beforeHist, 'ここまでで終了カードの記録は 1 行も変わっていない');
       ok(snapHist() === beforeHist, '終了カードの id をどの書き込み API に送っても DB が変わらない');
       // ラベル待ちの記録は「そのカードのもの」でなければ書き換えられない (別カードの id を添えても通らない)

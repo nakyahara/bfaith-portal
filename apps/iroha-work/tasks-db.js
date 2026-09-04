@@ -224,11 +224,7 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   if (t.status === 'closed' && !String(reason || '').trim()) {
     return { ok: false, error: 'bad_request', message: '終了したタスクを再開するには理由が必要です' };
   }
-  // 作業中の人がいるまま終了にしない。終了カードは読むだけなので、記録が開いたまま取り残される (Codex PR1 R3)
-  if (to === 'closed') {
-    const active = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL').get(t.id).c;
-    if (active > 0) return { ok: false, error: 'active_sessions', message: `このカードで作業中の人が ${active} 人います。作業を終えてから変えてください` };
-  }
+  // 作業中の人がいるまま終了にしない (実際の検査は下のトランザクションの中。ここでは早めに弾くだけ)
   const now = utcNow();
   const next = { ...t, status: to, version: t.version + 1, updated_at: now, updated_by: actor };
   next.hold_reason_code = to === 'on_hold' ? holdReason : null;
@@ -254,6 +250,12 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   // それ以外は今までどおり、記録に失敗しても操作は成立させる (現場を止めない)
   const reopening = t.status === 'closed';
   const applied = db.transaction(() => {
+    // 終了にするなら、**このトランザクションの中で**作業中の人を数える。
+    // 外で数えると、数えた後・更新する前に別の接続 (miniPC も同じ DB を見る) が作業を始められる (Codex PR1 R4)
+    if (to === 'closed') {
+      const active = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL').get(t.id).c;
+      if (active > 0) return { active };
+    }
     const r = db.prepare(`UPDATE f_iroha_tasks SET status = ?, hold_reason_code = ?, hold_reason_note = ?, close_reason = ?, closed_at = ?, closed_by = ?,
         started_at = ?, ready_at = ?, cancellation_requested_at = ?, version = ?, updated_at = ?, updated_by = ?
       WHERE id = ? AND version = ?`)
@@ -265,7 +267,10 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
       workerId, workerName, deviceLabel, ok: true };
     if (reopening) logTaskEvent(line); else safeLogTaskEvent(line);
     return true;
-  })();
+  }).immediate();
+  if (applied && applied.active) {
+    return { ok: false, error: 'active_sessions', message: `このカードで作業中の人が ${applied.active} 人います。作業を終えてから変えてください` };
+  }
   if (!applied) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
   return { ok: true, task: getTask(t.id) };
 }
@@ -470,6 +475,11 @@ export function listLabelWaits({ taskId = null, openOnly = true, limit = 500 } =
  * fields = xlsx の列そのまま (発生日/記録者/発注済/ロット期限/数量/ロケーション Z・Y・none/貼り直し/LINE連絡日/再連絡日/入庫完了日/完了/備考)
  */
 export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion = null, actor = null }) {
+  const db = getDB();
+  return db.transaction(() => upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor })).immediate();
+}
+/** 持ち主の確認と書き込みを同じトランザクションで (終了直後に記録が入らないように — Codex PR1 R4) */
+function upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor }) {
   const db = getDB();
   const rec = {};
   for (const f of LABEL_FIELDS) {
