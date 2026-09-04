@@ -32,3 +32,5 @@ vps-proxy/*.bak*
 scripts/slip-print-agent/config.json
 scripts/slip-print-agent/SumatraPDF.exe
 scripts/slip-print-agent/work/
+.codex-pr4a*
+.codex-round2.md
