@@ -2053,6 +2053,34 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         ok(stN.status === 200 && cN && cN.facility_code == null, '拠点が未定でも一覧に出る');
         ok((await call('GET', '/api/plan', { cookie })).status === 200, '拠点が未定のカードがあっても明日の計画が開ける');
         ok((await call('GET', '/api/task-previews/' + t3, { cookie })).status === 200, '拠点が未定でも詳細が開ける');
+        // ⑪b 大きさ: 配送方法で分からない商品は、職員が「作業のやり方」で登録できる (要件 §W-2)
+        {
+          // 商品マスタ (mirror_products) に無い商品は「作業のやり方」を作れないので、
+          // 配送方法が空の商品を 1 つ足してから試す
+          db.prepare(`INSERT OR IGNORE INTO mirror_products (商品コード, 商品名, 商品区分, 原価状態, 配送方法, updated_at)
+            VALUES ('SIZE-A', '大きさ未登録の商品', '通常', 'ok', NULL, ?)`).run(new Date().toISOString());
+          const t6 = mk(9413, '大きさ未登録', 'not_started');
+          db.prepare("UPDATE f_iroha_tasks SET product_code = 'SIZE-A' WHERE id = ?").run(t6);
+          clearEnrichCache();
+          const before = (await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === t6);
+          ok(before.size_label == null && before.size_rank == null, '配送方法が分からなければ「大きさ 不明」');
+          const mv = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { size_class: 'L' }, worker_id: staffP.id, pin: '4649', expect_version: 1 } });
+          ok(mv.status === 200 && mv.json.ok, '職員が大きさを登録できる');
+          clearEnrichCache();
+          const after = (await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === t6);
+          ok(after.size_rank === 5 && after.size_label === '大', '登録した大きさが一覧に出る');
+          // 配送方法が分かる商品では、そちらを優先する (登録より配送方法が先)
+          db.prepare("UPDATE mirror_products SET 配送方法 = '定形外郵便' WHERE 商品コード = 'SIZE-A'").run();
+          clearEnrichCache();
+          const both = (await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === t6);
+          ok(both.size_rank === 1 && both.size_label === '定形外', '配送方法が分かればそちらを使う (登録は受け皿)');
+          db.prepare("UPDATE mirror_products SET 配送方法 = NULL WHERE 商品コード = 'SIZE-A'").run();
+          // 知らない大きさは DB の CHECK で入らない
+          let sizeErr = null;
+          try { db.prepare("UPDATE f_iroha_work_master SET size_class = 'XL' WHERE code_key = 'size-a'").run(); } catch (e) { sizeErr = e; }
+          ok(sizeErr && /CHECK/.test(sizeErr.message), '知らない大きさは入らない (DB の CHECK)');
+        }
         ok((await call('GET', '/api/history', { cookie })).status === 200, '履歴も開ける');
 
         // ⑫a 「明日やる」を変えるとゲージの合計 (tomorrow_plan) も動く (Codex P2 R1)
@@ -2563,6 +2591,11 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   ok(S2.sizeOfShipping('') === null && S2.sizeOfShipping(null) === null && S2.sizeOfShipping('AES') === null,
     '分からない配送方法は null (並びは最後・画面は「大きさ 不明」)');
   ok(S2.sizeOfShipping('宅急便50サイズ以下').rank === 4, '「50サイズ」は 60 の規則に吸われない (上から大きい順に見る)');
+  // 職員がその場で登録する大きさ (配送方法で分からない商品の受け皿 — 要件 §W-2)
+  ok(S2.sizeOfClass('L').rank === 5 && S2.sizeOfClass('M').rank === 3 && S2.sizeOfClass('S').rank === 1,
+    '大 / 中 / 小 も並びの順を持つ');
+  ok(S2.sizeOfClass('l').rank === 5, '小文字でも読む');
+  ok(S2.sizeOfClass('') === null && S2.sizeOfClass(null) === null && S2.sizeOfClass('XL') === null, '知らない値は null');
 
   // 一覧のカードに乗る
   const t = TD.upsertTaskFromImport({ notion_page_id: 'plan-1', status: 'not_started', destination_id: 9301,
@@ -3014,6 +3047,12 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '計画画面のボタンも data-* + 委譲で受ける (onclick に値を埋めない)');
   ok(/function pcardHtml\(c, actions\)/.test(html) && /大きさ 不明/.test(html),
     'カードに理由 (在庫・入荷・大きさ) を添える。大きさが分からなければそう出す');
+  // ══ P4: 大きさのその場登録 ══
+  ok(/<div class="mvf" data-f="size_class">/.test(html) && /const SIZE_OPTS = \[\['L', '大'\], \['M', '中'\], \['S', '小'\], \['', '未登録'\]\];/.test(html),
+    '「作業のやり方」で大きさを大/中/小から選べる (未登録にも戻せる)');
+  ok(/size_class: 'mvSize'/.test(html), '大きさも他の項目と同じ仕組みで保存する');
+  ok(/data-size=/.test(html) && /\$\('#mvSizeOpts'\)\.addEventListener\('click'/.test(html),
+    '大きさの選択も data-* + 委譲で受ける');
   // ══ P2: ボードに 3 軸を載せる (要件 §W-4) ══
   ok(/<div id="gaugeWrap"><\/div>/.test(html) && !/class="gauge"/.test(html.slice(0, html.indexOf('<script'))),
     '明日やる分のゲージは静的に置かない (職員のときだけボタンにする)');

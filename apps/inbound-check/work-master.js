@@ -221,7 +221,7 @@ export function searchWorkMaster(q, limit = 50) {
     ORDER BY w.商品コード LIMIT ?`).all(like, like.toLowerCase(), like, Math.max(1, Math.min(200, limit)));
 }
 
-const EDIT_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url'];
+const EDIT_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'size_class'];
 
 export function updateWorkMasterRow(key, fields, user, expectVersion) {
   const db = getDB();

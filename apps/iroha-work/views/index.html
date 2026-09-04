@@ -549,6 +549,11 @@
         <div class="mvf" data-f="note">
           <label>気をつけること (備考)</label><input id="mvNote" maxlength="300">
         </div>
+        <div class="mvf" data-f="size_class">
+          <label>大きさ (配送方法から分からないときだけ)</label>
+          <div class="opts chips" id="mvSizeOpts" role="group" aria-label="大きさ"></div>
+          <input id="mvSize" type="hidden">
+        </div>
       </div>
       <div id="mvPinRow" style="display:none;margin-top:12px">
         <label>職員PIN (入っている値の変更に必要です)</label>
@@ -2390,7 +2395,20 @@ let mvSaving = false;
 let mvCtx = null;   // { pageId, code, version, values }
 const MV_MAP = { material_code: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
   // 作り方動画のリンクは画面から外した (中原さん 2026-09-03)。DB の video_url と API は残してあるので、戻すときはここに足す
-  process_count: 'mvProcess', note: 'mvNote' };
+  process_count: 'mvProcess', note: 'mvNote', size_class: 'mvSize' };
+/** 大きさの選択肢 (明日どれをやるかの並びに使う。ふだんは配送方法から見なす — 要件 §W-2) */
+const SIZE_OPTS = [['L', '大'], ['M', '中'], ['S', '小'], ['', '未登録']];
+function renderSizeOpts() {
+  const cur = $('#mvSize').value || '';
+  $('#mvSizeOpts').innerHTML = SIZE_OPTS.map(([v, l]) =>
+    '<button type="button" class="opt' + (cur === v ? ' on' : '') + '" data-size="' + v + '">' + l + '</button>').join('');
+}
+$('#mvSizeOpts').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-size]');
+  if (!b) return;
+  $('#mvSize').value = b.dataset.size;
+  renderSizeOpts();
+});
 
 // ─── ダイアログの開け閉め (背景を止める・元の場所へフォーカスを戻す・Tab を中に閉じ込める) ───
 let overlayReturn = null;      // 開く前にフォーカスしていた要素
@@ -2459,6 +2477,7 @@ function openMaster(field) {
   const cur = mvValues(c.master);
   mvCtx = { cardId: c.id, code: c.product_code, version: c.master.version, values: cur, field: MV_MAP[field] ? field : null };
   for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur[f];
+  renderSizeOpts();
   optNewKind = null; renderOpts('material'); renderOpts('container');
   // 出す項目を絞る (他は隠すだけ。保存は「開いた時点との差分」なので触っていない項目は送られない)
   for (const el of document.querySelectorAll('#mvOv .mvf')) {

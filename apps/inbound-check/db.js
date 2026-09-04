@@ -372,6 +372,9 @@ function migrateQuantity(db) {
   // 作り方動画のリンク (中原さんFB⑥ 2026-09-02。いろは作業アプリ PR4 で登録・表示)。
   // 旧シートの「作業動画URL」列は全て空で持ち込まなかった — 今後はアプリから育てる
   addCol(db, 'f_iroha_work_master', 'video_url', 'TEXT');
+  // 大きさ (嵩)。ふだんは商品の配送方法から見なすが、分からない商品は職員がここで登録する
+  // (S=小 / M=中 / L=大)。明日どれをやるかの並びにだけ使う — 要件 §W-2
+  addCol(db, 'f_iroha_work_master', 'size_class', "TEXT CHECK (size_class IS NULL OR size_class IN ('S','M','L'))");
 
   if (!added) return;   // ここから先は列を足した初回だけ
 

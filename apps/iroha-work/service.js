@@ -83,8 +83,9 @@ function mergeMaster(wm, card) {
         material_code: wm.material_code || card.material_code, storage_container: wm.storage_container || card.storage_container,
         units_per_container: wm.units_per_container ?? card.units_per_container,
         process_count: wm.process_count ?? card.process_count, note: wm.note || card.note,
-        video_url: wm.video_url || null }
-    : { source: 'card', version: null, ...card, video_url: null };
+        // 大きさはマスタだけが持つ (カードには無い項目。ふだんは配送方法から見なす — 要件 §W-2)
+        video_url: wm.video_url || null, size_class: wm.size_class || null }
+    : { source: 'card', version: null, ...card, video_url: null, size_class: null };
   const missing = [];
   if (!m.material_code) missing.push('資材');
   if (!m.storage_container) missing.push('保管箱');   // 画面の呼び名は「保管箱」(中原さん 2026-09-03。旧「入れもの」)
@@ -491,18 +492,42 @@ export function sizeOfShipping(text) {
   return null;
 }
 
-/** 商品コード → 大きさ。統合商品マスタ (mirror_products.配送方法) から引く。無い環境では空 */
+/** 職員がその場で登録する「大きさ」(配送方法で分からない商品の受け皿。要件 §W-2) */
+const SIZE_CLASS = { S: { rank: 1, label: '小' }, M: { rank: 3, label: '中' }, L: { rank: 5, label: '大' } };
+export const sizeOfClass = (v) => SIZE_CLASS[String(v || '').toUpperCase()] || null;
+
+/**
+ * 商品コード → 大きさ。決め方は 3 段 (要件 §W-2):
+ *   ① 商品の配送方法 (mirror_products.配送方法) から見なす
+ *   ② 無ければ、職員が登録した大きさ (f_iroha_work_master.size_class = S/M/L)
+ *   ③ どちらも無ければ「不明」(並びは最後・画面にもそう出す)
+ */
 function sizeMapByCode(codeKeys) {
   const db = getDB();
   const map = new Map();
   const keys = [...new Set((codeKeys || []).filter(Boolean))];
   if (keys.length === 0) return map;
-  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mirror_products'").get()) return map;
+  const has = (t) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
+  const hasProducts = has('mirror_products');
+  const hasMaster = has('f_iroha_work_master')
+    && db.prepare("PRAGMA table_info(f_iroha_work_master)").all().some((c) => c.name === 'size_class');
   for (let i = 0; i < keys.length; i += 400) {
     const chunk = keys.slice(i, i + 400);
-    const rows = db.prepare(`SELECT LOWER(TRIM(商品コード)) AS k, 配送方法 AS m FROM mirror_products
-      WHERE LOWER(TRIM(商品コード)) IN (${chunk.map(() => '?').join(',')})`).all(...chunk);
-    for (const r of rows) { const s = r.k ? sizeOfShipping(r.m) : null; if (s) map.set(r.k, s); }
+    const ph = chunk.map(() => '?').join(',');
+    if (hasProducts) {
+      const rows = db.prepare(`SELECT LOWER(TRIM(商品コード)) AS k, 配送方法 AS m FROM mirror_products
+        WHERE LOWER(TRIM(商品コード)) IN (${ph})`).all(...chunk);
+      for (const r of rows) { const s = r.k ? sizeOfShipping(r.m) : null; if (s) map.set(r.k, s); }
+    }
+    if (hasMaster) {
+      // 配送方法で分からなかった商品だけ、職員の登録で埋める (配送方法のほうを優先)
+      const rest = chunk.filter((k) => !map.has(k));
+      if (rest.length > 0) {
+        const rows = db.prepare(`SELECT code_key AS k, size_class AS s FROM f_iroha_work_master
+          WHERE code_key IN (${rest.map(() => '?').join(',')}) AND size_class IS NOT NULL`).all(...rest);
+        for (const r of rows) { const s = sizeOfClass(r.s); if (s) map.set(r.k, { ...s, from: 'master' }); }
+      }
+    }
   }
   return map;
 }
