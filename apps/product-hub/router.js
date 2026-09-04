@@ -62,7 +62,7 @@ import {
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl, rakutenRmsItemUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
-  isValidGtin, MODEL_ATTR_NAME, skuAttributeGrid,
+  isValidGtin, MODEL_ATTR_NAME, skuAttributeGrid, genreIdFromItemUrl,
 } from './services/rakuten-listing.js';
 // 配送方法の値の意味 (楽天グループID / 画面の複合選択肢) はこの1ファイルが決める
 import {
@@ -74,7 +74,7 @@ import {
   listToRakutenFromBoard, afterRakutenRegistered, acquireRakutenListingLock, assertRakutenListable, rememberUnknownOutcome,
 } from './services/board-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
-import { fetchGenreChildren, suggestGenreByName, genrePathOf, genreIdFromItemUrl } from './lib/ichiba-genre.js';
+import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {

@@ -2056,6 +2056,8 @@ db.prepare(`DELETE FROM ph_genre_attributes WHERE genre_id = '900001'`).run();
 
 // ─── ジャンルツリー (IchibaGenre/Search) の正規化 / パス組み立て ───
 const ichiba = await import('../lib/ichiba-genre.js');
+// 商品ページからジャンルIDを読む処理は別モジュール (取得は miniPC 側で動く)
+const itemPage = await import('../../../lib/rakuten-item-page.js');
 const ICHIBA_FIXTURE = {
   current: { genreId: 111145, genreName: '付箋紙', genreLevel: 5 },
   parents: [
@@ -2171,10 +2173,10 @@ check('ichiba: root は path に含めない・子は child ラップを剥が�
 // 🚨 商品検索API では引けない (itemCode は `<店舗>:<数字>` の内部IDで、URL 末尾の
 // 商品管理番号とは別物 — 2026-09-04 実測)。公開ページの埋め込み JSON から読む
 check('genre-from-url: 楽天の商品ページURLだけ受け付け、クエリを落として正規化する',
-  ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016/')?.url === 'https://item.rakuten.co.jp/ideshokai/pui016/'
-  && ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016/?rafcid=wsc_i_is_123')?.url === 'https://item.rakuten.co.jp/ideshokai/pui016/'
-  && ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016')?.itemCode === 'pui016'
-  && ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016/#tab')?.shopCode === 'ideshokai');
+  itemPage.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016/')?.url === 'https://item.rakuten.co.jp/ideshokai/pui016/'
+  && itemPage.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016/?rafcid=wsc_i_is_123')?.url === 'https://item.rakuten.co.jp/ideshokai/pui016/'
+  && itemPage.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016')?.itemCode === 'pui016'
+  && itemPage.parseRakutenItemUrl('https://item.rakuten.co.jp/ideshokai/pui016/#tab')?.shopCode === 'ideshokai');
 {
   // 🚨 利用者が貼った URL を取りに行くので SSRF を作らない。item.rakuten.co.jp 以外は全部拒否
   const rejected = [
@@ -2186,38 +2188,104 @@ check('genre-from-url: 楽天の商品ページURLだけ受け付け、クエリ
     'https://127.0.0.1/shop/item/',
     'http://169.254.169.254/latest/meta-data/',         // クラウドのメタデータ
     'https://item.rakuten.co.jp/shop/',                 // 商品部分が無い
+    'https://item.rakuten.co.jp/shop/item/extra/path',  // 余分なパス (黙って別URLにしない)
     'https://item.rakuten.co.jp/../etc/passwd/',
     'https://a.r10.to/xxxxx',                           // 短縮URL (転送先を保証できない)
     'file:///etc/passwd', 'javascript:alert(1)', '', null, undefined,
   ];
-  const leaked = rejected.filter((u) => ichiba.parseRakutenItemUrl(u) !== null);
+  const leaked = rejected.filter((u) => itemPage.parseRakutenItemUrl(u) !== null);
   check('genre-from-url: 楽天の商品ページ以外の URL は全部拒否する (SSRF を作らない)',
     leaked.length === 0, JSON.stringify(leaked));
 }
 check('genre-from-url: 壊れた percent encoding は例外にせず不正URL扱い (Codex R1 low)',
-  ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/shop/%/') === null
-  && ichiba.parseRakutenItemUrl('https://item.rakuten.co.jp/%E4%B8%8D%E6%AD%A3/%/') === null);
+  itemPage.parseRakutenItemUrl('https://item.rakuten.co.jp/shop/%/') === null
+  && itemPage.parseRakutenItemUrl('https://item.rakuten.co.jp/%E4%B8%8D%E6%AD%A3/%/') === null);
 check('genre-from-url: 埋め込み JSON の genreId を一意に取り出す',
-  ichiba.extractGenreIdFromHtml('x &quot;data&quot;: { &quot;genreId&quot;: 568908, &quot;price&quot;: } y') === '568908');
+  itemPage.extractGenreIdFromHtml('x &quot;data&quot;: { &quot;genreId&quot;: 568908, &quot;price&quot;: } y') === '568908');
 check('genre-from-url: 緩い一致で拾えるノイズ (全ページに出る 100005) は混ぜない',
-  ichiba.extractGenreIdFromHtml('genre_id=100005 ... &quot;genreId&quot;: 215261,') === '215261');
+  itemPage.extractGenreIdFromHtml('genre_id=100005 ... &quot;genreId&quot;: 215261,') === '215261');
 check('genre-from-url: 一意に決まらなければ null (誤ったジャンルを返さない)',
-  ichiba.extractGenreIdFromHtml('&quot;genreId&quot;: 111, &quot;genreId&quot;: 222') === null
-  && ichiba.extractGenreIdFromHtml('ジャンルの手がかりが無いページ') === null
-  && ichiba.extractGenreIdFromHtml('') === null);
+  itemPage.extractGenreIdFromHtml('&quot;genreId&quot;: 111, &quot;genreId&quot;: 222') === null
+  && itemPage.extractGenreIdFromHtml('ジャンルの手がかりが無いページ') === null
+  && itemPage.extractGenreIdFromHtml('') === null);
 {
   // 楽天の商品ページは EUC-JP。ヘッダ/meta の charset に従い、不明なら EUC-JP で読む
   const eucBytes = Buffer.from([0xa4, 0xb3, 0xa4, 0xf3]); // 「こん」(EUC-JP)
   check('genre-from-url: charset 指定が無ければ EUC-JP として読む',
-    ichiba.decodeItemPage(eucBytes, null) === 'こん', JSON.stringify(ichiba.decodeItemPage(eucBytes, null)));
+    itemPage.decodeItemPage(eucBytes, null) === 'こん', JSON.stringify(itemPage.decodeItemPage(eucBytes, null)));
   check('genre-from-url: charset が UTF-8 ならそれに従う',
-    ichiba.decodeItemPage(Buffer.from('こん', 'utf8'), 'text/html; charset=UTF-8') === 'こん');
+    itemPage.decodeItemPage(Buffer.from('こん', 'utf8'), 'text/html; charset=UTF-8') === 'こん');
 }
 {
-  // URL が不正なら API を叩かずに断る (ネットワークに出ない)
-  const bad = await ichiba.genreIdFromItemUrl('https://evil.example/x/y/');
-  check('genre-from-url: 不正な URL はページを取りに行かずに断る',
-    bad.ok === false && /item\.rakuten\.co\.jp/.test(bad.error), JSON.stringify(bad));
+  // URL が不正なら miniPC を呼ばずに断る (往復を無駄にしない・ネットワークに出ない)
+  let calls = 0;
+  const countingFetcher = async () => { calls += 1; return { status: 200, data: {} }; };
+  const bad = await listing.genreIdFromItemUrl('https://evil.example/x/y/', { fetcher: countingFetcher });
+  check('genre-from-url: 不正な URL は取りに行かずに断る',
+    bad.ok === false && calls === 0 && /item\.rakuten\.co\.jp/.test(bad.error), JSON.stringify({ bad, calls }));
+}
+{
+  // miniPC の口を差し替えて、実際に通して確かめる (ソース検査だけだと受け渡しを守れない)
+  let seen = null;
+  const okFetcher = async (p, opts) => {
+    seen = { path: p, body: opts?.body, method: opts?.method };
+    return { status: 200, data: { ok: true, genreId: 507768, shopCode: 'x', itemCode: 'y' } };
+  };
+  const r = await listing.genreIdFromItemUrl('https://item.rakuten.co.jp/fujiwarayohojo/b0czr58swk/?rafcid=zz', { fetcher: okFetcher });
+  check('genre-from-url: miniPC の口へ、クエリを落とした URL を POST する',
+    seen?.path === '/service-api/rakuten-rms/item-page/genre' && seen.method === 'POST'
+    && seen.body?.url === 'https://item.rakuten.co.jp/fujiwarayohojo/b0czr58swk/', JSON.stringify(seen));
+  check('genre-from-url: 応答の genreId を文字列で返す (画面と DB は文字列で扱う)',
+    r.ok === true && r.genreId === '507768' && typeof r.genreId === 'string'
+    && r.shopCode === 'fujiwarayohojo' && r.itemCode === 'b0czr58swk', JSON.stringify(r));
+  // miniPC は読めなかった理由を 400 + message で返す。その文言をそのまま画面に出す
+  const ng = await listing.genreIdFromItemUrl('https://item.rakuten.co.jp/a/b/', {
+    fetcher: async () => ({ status: 400, data: { ok: false, error: 'ITEM_PAGE_GENRE_NOT_FOUND', message: 'このページからは読み取れませんでした' } }),
+  });
+  check('genre-from-url: miniPC が返した理由をそのまま画面へ出す',
+    ng.ok === false && ng.error === 'このページからは読み取れませんでした', JSON.stringify(ng));
+  // 本文が取れないとき (CF が差し替えた等) でも、状況が分かる文言にする
+  const noBody = await listing.genreIdFromItemUrl('https://item.rakuten.co.jp/a/b/', {
+    fetcher: async () => ({ status: 502, data: null }),
+  });
+  check('genre-from-url: 理由が取れないときは HTTP を添えて返す',
+    noBody.ok === false && /HTTP 502/.test(noBody.error), JSON.stringify(noBody));
+  // 通信そのものが落ちたときも画面を壊さない
+  const boom = await listing.genreIdFromItemUrl('https://item.rakuten.co.jp/a/b/', {
+    fetcher: async () => { throw new Error('fetch failed'); },
+  });
+  check('genre-from-url: 通信エラーでも例外にせずメッセージで返す',
+    boom.ok === false && /fetch failed/.test(boom.error), JSON.stringify(boom));
+}
+{
+  // 🚨 取得は **miniPC 経由**にした (2026-09-04)。Render (海外IP) から楽天の公開ページを
+  // 取ると読み取れなかったため。miniPC = 日本のIP からは同じ実装で必ず取れる。
+  // ここでは miniPC の口を差し替えて、呼び先と受け渡しを確かめる
+  const src = fs.readFileSync(path.join(__dirname, '..', 'services', 'rakuten-listing.js'), 'utf8');
+  const fn = src.slice(src.indexOf('export async function genreIdFromItemUrl'));
+  check('genre-from-url: 取得は miniPC の口を呼ぶ (Render から直接取りに行かない)',
+    fn.includes("'/service-api/rakuten-rms/item-page/genre'") && !/\bfetch\(/.test(fn.slice(0, 1400)));
+  check('genre-from-url: miniPC へは組み直した URL を渡す (クエリを持ち込まない)',
+    /body: \{ url: parsed\.url \}/.test(fn));
+  // miniPC 側の口が、共用モジュールの処理をそのまま使っていること (検証を二重に書かない)
+  const svc = fs.readFileSync(path.join(__dirname, '..', '..', 'warehouse', 'rakuten-rms-service.js'), 'utf8');
+  check('genre-from-url: miniPC 側は共用モジュールで取得する (検証を書き直さない)',
+    svc.includes("from '../../lib/rakuten-item-page.js'")
+    && svc.includes("router.post('/item-page/genre'"));
+  // 🚨 待ち行列を二重に持たない (Codex R1/R2):
+  //    RMS API のセマフォに載せると業務側の処理を止める。かといって専用セマフォを重ねると、
+  //    そちらの待ちは無制限で最悪待ち時間が読めず、呼び出し側のタイムアウトを超える。
+  //    待ち行列は lib/rakuten-item-page.js の1箇所だけにする
+  check('genre-from-url: miniPC の口にセマフォを重ねない (待ち行列は1箇所)',
+    /router\.post\('\/item-page\/genre', async \(req, res\)/.test(svc)
+    && !/item-page\/genre', rateLimitMiddleware/.test(svc));
+  const lib = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'lib', 'rakuten-item-page.js'), 'utf8');
+  check('genre-from-url: 最悪待ち時間が呼び出し側のタイムアウトに収まる',
+    /MAX_PAGE_QUEUE = 2;/.test(lib) && /PAGE_MIN_GAP_MS = 2000;/.test(lib)
+    && /AbortSignal\.timeout\(15_000\)/.test(lib)   // 2*(15+2)=34s < 40s
+    && /timeoutMs: 40_000/.test(fn));
+  check('genre-from-url: miniPC は読めなかった理由を 400 で返す (CF が本文を差し替えない)',
+    /ITEM_PAGE_GENRE_NOT_FOUND[\s\S]{0,200}status: 400|status: 400[\s\S]{0,200}ITEM_PAGE_GENRE_NOT_FOUND/.test(svc));
 }
 
 // env 未設定時の fail-closed (ツリー=設定案内 / 提案=資格情報エラー)

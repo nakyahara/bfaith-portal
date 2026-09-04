@@ -26,6 +26,8 @@ import { getDB, logEvent } from '../db.js';
 import { resolveVariationGroup, getNeCost } from '../lib/variation.js';
 import { imageTrackBlockReason } from '../lib/workflow-progress.js';
 import { validatePageInfo, buildPageInfoHtml, mapNeShippingToRakuten } from '../lib/page-info.js';
+// URL の検証は miniPC 側と同じものを使う (別に書くと判定がズレる)
+import { parseRakutenItemUrl } from '../../../lib/rakuten-item-page.js';
 // 配送方法の「値の意味」の正本 (定数と変換はこの1ファイルだけが決める)。
 // db.js のマイグレーションからも使うため、循環参照を避けて lib/ に置いてある
 import {
@@ -1037,6 +1039,40 @@ export function buildDescriptionPreview(db, draftId) {
 export function rakutenItemPageUrl(manageNumber) {
   const shop = (process.env.PH_RAKUTEN_SHOP_SLUG || 'b-faith').trim();
   return `https://item.rakuten.co.jp/${encodeURIComponent(shop)}/${encodeURIComponent(String(manageNumber).trim().toLowerCase())}/`;
+}
+
+/**
+ * 他社の商品ページURL → 楽天ジャンルID (2026-09-04)。
+ *
+ * 🚨 取得は **miniPC が代理で行う**。Render から同じ URL を取ると読み取れなかった
+ * (miniPC = 日本のIP からは同じ実装で必ず取れる)。楽天への口を miniPC に集約する方針とも合う。
+ * URL の検証・SSRF 対策・ページからの抽出は lib/rakuten-item-page.js (miniPC 側で動く)。
+ *
+ * @returns {{ok:true, genreId, shopCode, itemCode}|{ok:false, error}}
+ */
+export async function genreIdFromItemUrl(url, { fetcher = callWarehouse } = {}) {
+  // 明らかに違う入力は miniPC を呼ばずに断る (往復を無駄にしない。判定は共用モジュール)
+  const parsed = parseRakutenItemUrl(url);
+  if (!parsed) {
+    return { ok: false, error: '楽天の商品ページURL (https://item.rakuten.co.jp/店舗コード/商品管理番号/) を貼ってください' };
+  }
+  let r;
+  try {
+    // miniPC 側は取得を直列化する (実行中1 + 待ち1・2秒間隔・15秒で打ち切り) ので
+    // 最悪 2*(15+2) = 34秒。それより短く切ると、待たされた要求が必ず失敗する
+    r = await fetcher('/service-api/rakuten-rms/item-page/genre', {
+      method: 'POST', body: { url: parsed.url }, timeoutMs: 40_000,
+    });
+  } catch (e) {
+    return { ok: false, error: `商品ページを調べられませんでした (${String(e.message || e).slice(0, 120)})` };
+  }
+  const genreId = r.data?.genreId ?? r.data?.data?.genreId;
+  if (r.status === 200 && genreId) {
+    return { ok: true, genreId: String(genreId), shopCode: parsed.shopCode, itemCode: parsed.itemCode, cached: r.data?.cached === true };
+  }
+  // miniPC は理由を 400 で返す (Cloudflare が本文を差し替えないステータス)。
+  // 本文が取れないときは状況が分かるように HTTP を出す
+  return { ok: false, error: r.data?.message || r.data?.error || `商品ページを調べられませんでした (HTTP ${r.status})` };
 }
 
 /**
