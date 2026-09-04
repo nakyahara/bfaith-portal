@@ -21,6 +21,9 @@ import express, { Router } from 'express';
 import { rateLimitMiddleware } from './rate-limiter.js';
 import { okResponse, errorResponse } from './error-handler.js';
 import { rakutenRequest, describeRmsError, rmsErrorSuffix, RMS_AUTH_HINT } from './rakuten-client.js';
+// 楽天の公開商品ページから genreId を読む処理 (SSRF 対策込み)。product-hub と同じものを使う —
+// 別に書くと検証がズレる。取得を miniPC でやるのは、Render (海外IP) では読めなかったため
+import { genreIdFromItemUrl } from '../../lib/rakuten-item-page.js';
 
 const router = Router();
 
@@ -874,6 +877,30 @@ async function parseCabinetXml(text) {
   const { parseStringPromise } = await import('xml2js');
   return parseStringPromise(String(text || ''), { explicitArray: false });
 }
+
+// ==========================================
+// 他社の商品ページ → 楽天ジャンルID (2026-09-04)
+//   Render から楽天の公開ページを取ると読み取れないため、miniPC が代理で取りに行く。
+//   読み取り専用 (requireWrite は不要)。URL の検証と SSRF 対策は共用モジュール側。
+//
+//   🚨 rateLimitMiddleware は付けない。取得の直列化 (2秒間隔) と待ち行列の上限は
+//   lib/rakuten-item-page.js が持っており、**両方に待ち行列があると最悪待ち時間が読めなくなる**
+//   (外側のセマフォの待ちは無制限で、呼び出し側のタイムアウトを超える — Codex R2)。
+//   RMS API のセマフォとは無関係なので、業務側の処理を止めることもない
+// ==========================================
+router.post('/item-page/genre', async (req, res) => {
+  try {
+    const r = await genreIdFromItemUrl(req.body?.url);
+    if (!r.ok) {
+      // 「読めなかった」は利用者の入力の問題なので 400 (Cloudflare が本文を差し替えない)
+      return errorResponse(res, { status: 400, error: 'ITEM_PAGE_GENRE_NOT_FOUND', message: r.error, requestId: req.requestId });
+    }
+    okResponse(res, { genreId: r.genreId, shopCode: r.shopCode, itemCode: r.itemCode, cached: r.cached === true });
+  } catch (e) {
+    console.error(`[rakuten-rms] item-page/genre 例外: ${e.message}`);
+    errorResponse(res, { status: 503, error: 'ITEM_PAGE_FETCH_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
 
 router.post('/cabinet/folder-ensure', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
   try {
