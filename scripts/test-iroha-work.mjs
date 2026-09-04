@@ -1624,6 +1624,8 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id = ?').get(closedId).c,
         db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c,
         db.prepare('SELECT COUNT(*) c FROM f_iroha_work_master').get().c,
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(closedId).c,
+        db.prepare('SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ?').get(closedId).c,
       ]);
       const staffHist = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
       const beforeHist = snapHist();
@@ -1642,6 +1644,23 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         }
       }
       ok(true, '今日やる・確認ずみ・ラベル待ち・作業のやり方・候補・外部準備OK に終了カードの id を送ると 409');
+      // 終了カードでは作業を止められない (記録も足さない)
+      const stopClosed = await call('POST', '/api/sessions/stop', { cookie, body: { id: closedId, worker_id: w1.id, session_id: 1, reason: 'done' } });
+      ok(stopClosed.status === 409 && stopClosed.json.error === 'closed_task', '終了したカードでは作業を止められない');
+      // カードの指定を省いても、作業のやり方・候補は登録できない (検査を素通りできない)
+      for (const p3 of ['/api/master', '/api/options']) {
+        for (const body of [{ kind: 'material', code: 'X1', worker_id: staffHist.id, pin: '4649' },
+          { id: '', kind: 'material', code: 'X2', worker_id: staffHist.id, pin: '4649' },
+          { id: 'zzz', kind: 'material', code: 'X3', worker_id: staffHist.id, pin: '4649' },
+          { id: 999999, kind: 'material', code: 'X4', worker_id: staffHist.id, pin: '4649' }]) {
+          const r = await call('POST', p3, { cookie, body });
+          if (!(r.status === 409 && (r.json.error === 'card_required' || r.json.error === 'closed_task'))) {
+            ok(false, `${p3} は カードの指定 ${JSON.stringify(body.id)} を断る (実際 ${r.status} ${r.json && r.json.error})`);
+          }
+        }
+      }
+      ok(true, '作業のやり方・候補の登録は、書けるカードを添えないと通らない (省略・空・でたらめ・無い id)');
+      ok(snapHist() === beforeHist, 'ここまでで終了カードの記録は 1 行も変わっていない');
       ok(snapHist() === beforeHist, '終了カードの id をどの書き込み API に送っても DB が変わらない');
       // ラベル待ちの記録は「そのカードのもの」でなければ書き換えられない (別カードの id を添えても通らない)
       {
@@ -2259,6 +2278,34 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
       ok(TD.getTask(busy).status !== 'closed', '状態も変わらない');
       stopSession({ taskId: busy, workerId: wB.id, sessionId: sB.sessionId, reason: 'done' });
       ok(TD.removeStrayTask({ taskId: busy }).action === 'closed', '作業を終えれば片づけられる (記録があるので終了)');
+    }
+
+    // 作業中の人がいるまま終了にしない (終了カードは読むだけなので、記録が開いたまま取り残される — Codex PR1 R3)
+    {
+      const t2 = TD.upsertTaskFromImport({ notion_page_id: 'busy-close', status: 'ready_for_stocking', destination_id: 9505,
+        product_code: 'PLAN-A', product_name: '作業中のまま終了', qty: 1, facility_code: 'iroha' }, { batchId: 'test-busy' }).id;
+      const wB2 = listIrohaWorkers(true).find((x) => x.display_name === 'すずき');
+      const sB2 = startSession({ taskId: t2, worker: getIrohaWorker(wB2.id) });
+      const closeTry = TD.changeTaskStatus({ taskId: t2, to: 'closed', closeReason: 'stocked',
+        expectVersion: TD.getTask(t2).version, isStaff: true, actor: 'test' });
+      ok(closeTry.error === 'active_sessions', '作業中の人がいれば終了にできない');
+      ok(TD.getTask(t2).status === 'ready_for_stocking', '状態も変わらない');
+      const bulkTry = TD.bulkCloseReady({ taskIds: [t2], actor: 'test' });
+      ok(bulkTry.done.length === 0 && bulkTry.skipped[0].reason === 'active_sessions', 'まとめて棚入完了でも飛ばす');
+      stopSession({ taskId: t2, workerId: wB2.id, sessionId: sB2.sessionId, reason: 'done' });
+      ok(TD.bulkCloseReady({ taskIds: [t2], actor: 'test' }).done.length === 1, '作業を終えれば終了にできる');
+      // 終了からのやり直しは、理由の記録が書けなければ再開そのものを取り消す
+      db.exec('ALTER TABLE f_iroha_app_events RENAME TO f_iroha_app_events__bak2');
+      let reopenErr = null;
+      try {
+        TD.changeTaskStatus({ taskId: t2, to: 'in_progress', expectVersion: TD.getTask(t2).version,
+          isStaff: true, actor: 'test', reason: 'やり直し' });
+      } catch (e) { reopenErr = e; }
+      db.exec('ALTER TABLE f_iroha_app_events__bak2 RENAME TO f_iroha_app_events');
+      ok(reopenErr && /no such table/i.test(reopenErr.message), 'やり直しの理由を書けないと例外になる');
+      ok(TD.getTask(t2).status === 'closed', '再開も取り消される (理由の残らない再開をしない)');
+      ok(TD.changeTaskStatus({ taskId: t2, to: 'in_progress', expectVersion: TD.getTask(t2).version,
+        isStaff: true, actor: 'test', reason: 'やり直し' }).ok, '記録が戻ればやり直せる');
     }
     TD.removeStrayTask({ taskId: c2, actor: 'admin@test' });
   }

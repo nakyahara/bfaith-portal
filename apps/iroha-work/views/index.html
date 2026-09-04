@@ -1300,24 +1300,31 @@ async function openPreviewDetail(id, { silent = false } = {}) {
       if (sameId(curDetail, id)) forceCloseDetail('このカードはもうありません');
       return;
     }
-    if (silent) return;                 // 巡回での取り直しは、失敗しても今の表示を残す
+    if (silent) {
+      // 巡回での取り直しは、内容を残したまま「最新を確認できていない」と出す (古いまま黙らない — Codex PR1 R3)
+      detailMeta = { ...detailMeta, stale: true };
+      if (detailCard) renderDetail(detailCard, { keepScroll: true });
+      return;
+    }
     const fallback = ((preview && preview.cards) || []).find(x => sameId(x.id, id)) || null;
     if (!fallback) { showErr(j.message || 'カードを開けませんでした'); return; }
     showDetail(fallback, 'preview', [], { stale: true, fetchedAt: null });
     return;
   }
-  showDetail(j.card, 'preview', j.capabilities, { notionSyncedAt: j.notionSyncedAt || null, fetchedAt: j.serverNow || null });
+  showDetail(j.card, 'preview', j.capabilities,
+    { notionSyncedAt: j.notionSyncedAt || null, fetchedAt: j.serverNow || null, stale: false },
+    { keepScroll: silent });   // 巡回の取り直しでは読んでいる位置を動かさない
 }
-function showDetail(c, src, caps, meta) {
+function showDetail(c, src, caps, meta, opts) {
   detailGen++;
   curDetail = c.id;
   detailSrc = src;
   detailCard = c;
   detailCaps = Array.isArray(caps) ? caps : [];
   detailMeta = meta || {};
-  renderDetail(c);
+  renderDetail(c, opts);
   document.body.classList.add('detail-open');
-  window.scrollTo(0, 0);
+  if (!(opts && opts.keepScroll)) window.scrollTo(0, 0);   // 60 秒の取り直しで先頭へ戻さない (Codex PR1 R3)
 }
 function closeDetail() {
   detailGen++;
@@ -1404,13 +1411,18 @@ function detailNoteHtml(c) {
     : '👀 見るだけの下見です (正本はまだ Notion)。ここからは操作できません。';
   const stateSrc = isApp() ? '状態: いまのアプリの記録'
     : 'Notion の状態: ' + (detailMeta.notionSyncedAt ? when(detailMeta.notionSyncedAt) + ' に取り込んだ時点' : '取り込んだ時点');
-  return '<div class="preview">' + head +
+  // アプリの記録は**いつ取ったか**を書く。「いまの記録」と言い切ると、取り直せていないときに嘘になる (Codex PR1 R3)
+  const appSrc = '作業のやり方・写真・作業時間: '
+    + (detailMeta.fetchedAt ? when(detailMeta.fetchedAt) + ' に取得' : 'ボードを読み込んだ時点');
+  return '<div class="preview' + (detailMeta.stale ? ' stale' : '') + '">' + head +
     '<small>' + stateSrc + ' ・ 在庫: ' + (c.loc_at ? when(c.loc_at) + ' 時点' : '未取得') +
-    ' ・ 作業のやり方・写真・作業時間: いまのアプリの記録' +
-    (detailMeta.stale ? ' ・ ⚠ 最新を取れなかったので、ボードを読み込んだ時点の中身です' : '') + '</small></div>';
+    ' ・ ' + appSrc +
+    (detailMeta.stale ? ' ・ ⚠ いま最新を確認できません (上の時点の中身を出しています)' : '') + '</small></div>';
 }
 
-function renderDetail(c) {
+function renderDetail(c, opts) {
+  const keepScroll = !!(opts && opts.keepScroll);
+  const scrollY = keepScroll ? window.scrollY : 0;
   // 状態: 変更が許されていればボタン、読むだけなら札 (静的なボタンを置いてから隠さない)
   const wrap = $('#dstateWrap');
   if (wrap) {
@@ -1468,6 +1480,8 @@ function renderDetail(c) {
     historyCardHtml(c) +
     workCardHtml(c);
   startTimerTick(c);
+  // 60 秒の取り直しでは、読んでいた位置に戻す (先頭へ飛ばさない — Codex PR1 R3)
+  if (keepScroll) window.scrollTo(0, scrollY);
 }
 
 /**
@@ -1745,6 +1759,7 @@ function openOptNew(kind) {
   const i = document.getElementById('optNewIn'); if (i) i.focus();
 }
 async function saveOptNew(kind) {
+  if (!can('task.master.edit') || !mvCtx) return;   // 読むだけ (下見・履歴) では登録しない
   const inp = document.getElementById('optNewIn');
   const code = (inp ? inp.value : '').trim();
   if (!code) { $('#mvMsg').textContent = '❌ 値を入れてください'; return; }
@@ -1758,7 +1773,8 @@ async function saveOptNew(kind) {
   }
   $('#mvMsg').textContent = '登録中…';
   const j = await apiFetch('/api/options', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kind, code, worker_id: worker.id, pin: pin || undefined }) });
+    // どのカードから登録したかを添える (サーバーは「いま書けるカード」か必ず確かめる — Codex PR1 R3)
+    body: JSON.stringify({ id: mvCtx.cardId, kind, code, worker_id: worker.id, pin: pin || undefined }) });
   if (!j.ok) {
     if (j.error === 'pin_required' || j.error === 'pin_invalid' || j.error === 'staff_required') {
       $('#mvPinRow').style.display = 'block'; $('#mvPin').value = ''; $('#mvPin').focus();

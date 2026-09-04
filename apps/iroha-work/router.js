@@ -146,6 +146,26 @@ function isClosedCardId(cardId) {
   const t = getTask(id);
   return !!t && t.status === 'closed';
 }
+/**
+ * 詳細から呼ぶ書き込み (作業のやり方・候補の登録) の入口。**カードの指定を必須**にして、
+ * そのカードが「いま書ける」ものかをサーバーで確かめる。断るなら返す本文、通るなら null。
+ * 省略・空・でたらめな id で検査を素通りできないようにする (Codex PR1 R3)
+ */
+function writableCardOr409(rawId) {
+  const cardId = String(rawId == null ? '' : rawId).trim();
+  if (!cardId) return { ok: false, error: 'card_required', message: 'どのカードからの操作かが必要です (一覧を更新してください)' };
+  if (isAppMode()) {
+    const id = parseTaskId(cardId);
+    const t = id == null ? null : getTask(id);
+    if (!t) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+    if (t.status === 'closed') return CLOSED_WRITE_REJECTED;
+    return null;
+  }
+  // Notion 正本: 数値 id は下見のカード。通すのはキャッシュにある Notion のカードだけ
+  if (parseTaskId(cardId) != null) return PREVIEW_WRITE_REJECTED;
+  if (!getCachePage(cardId)) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+  return null;
+}
 
 const api = fn => async (req, res) => {
   try { await fn(req, res); } catch (e) {
@@ -605,8 +625,10 @@ router.post('/api/options', checkOrigin, api((req, res) => {
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   // 候補じたいは商品に紐づかない共有マスタなので Notion 正本でも登録できる。ただし下見のカード id を
   // 添えた要求は受けない (「下見の id を送っても DB が変わらない」を全ての書き込み口で同じにする)
-  if (isPreviewIdInNotionMode(req.body?.id ?? req.body?.page_id)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
-  if (isClosedCardId(req.body?.id ?? req.body?.page_id)) return res.status(409).json(CLOSED_WRITE_REJECTED);
+  // 候補の登録は詳細のダイアログからしか呼ばない。どのカードから来たかを必ず添えてもらい、
+  // 「いま書けるカード」でなければ断る (省略・空・でたらめで検査を素通りできないように — Codex PR1 R3)
+  const optGate = writableCardOr409(req.body?.id ?? req.body?.page_id);
+  if (optGate) return res.status(409).json(optGate);
   if (!hasSessionAccess(req)) {
     if (w.worker.worker_type !== 'staff') {
       return res.status(403).json({ ok: false, error: 'staff_required', message: '新しい候補の登録は職員のみです (職員の名前を選び、PINを入れてください)' });
@@ -627,6 +649,9 @@ router.post('/api/options', checkOrigin, api((req, res) => {
 router.post('/api/master', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  // どのカードからの操作かを先に確かめる (中身の検証より前。省略・でたらめで素通りさせない — Codex PR1 R3)
+  const masterGate = writableCardOr409(req.body?.id ?? req.body?.page_id);
+  if (masterGate) return res.status(409).json(masterGate);
   const code = String(req.body?.code || '').trim();
   if (!code) return res.status(400).json({ ok: false, error: 'bad_request', message: 'code (商品コード) が必要です' });
   const fieldsIn = req.body?.fields;
@@ -644,8 +669,6 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   // シード・権限判定に使うカード値 (商品コードが一致するカードだけ)。
   // アプリ正本ならタスクの作成時スナップショット、Notion 正本ならカードのプロパティ
   const cardId = String(req.body?.id || req.body?.page_id || '');
-  if (isPreviewIdInNotionMode(cardId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
-  if (isClosedCardId(cardId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
   let cardValues = {};
   if (isAppMode()) {
     const t = parseTaskId(cardId) == null ? null : getTask(parseTaskId(cardId));
@@ -1023,6 +1046,9 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
   if (isAppMode()) {
     const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
     if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+    // 終了カード (履歴) は読むだけ。記録も足さない (Codex PR1 R3)。
+    // 「終了したのに作業中」が残っていたら、管理画面の取り消し (voidSession) で片づける
+    if (isClosedCardId(taskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
     const r = stopSession({ taskId, workerId: w.worker.id, sessionId: req.body?.session_id, reason });
     safeLogTaskEvent({ taskId, action: 'session_stop', workerId: w.worker.id, workerName: w.worker.display_name,
       deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });

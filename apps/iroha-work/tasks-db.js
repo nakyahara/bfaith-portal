@@ -224,6 +224,11 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   if (t.status === 'closed' && !String(reason || '').trim()) {
     return { ok: false, error: 'bad_request', message: '終了したタスクを再開するには理由が必要です' };
   }
+  // 作業中の人がいるまま終了にしない。終了カードは読むだけなので、記録が開いたまま取り残される (Codex PR1 R3)
+  if (to === 'closed') {
+    const active = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL').get(t.id).c;
+    if (active > 0) return { ok: false, error: 'active_sessions', message: `このカードで作業中の人が ${active} 人います。作業を終えてから変えてください` };
+  }
   const now = utcNow();
   const next = { ...t, status: to, version: t.version + 1, updated_at: now, updated_by: actor };
   next.hold_reason_code = to === 'on_hold' ? holdReason : null;
@@ -244,15 +249,24 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     if (to === 'closed') return { ok: false, error: 'close_reason_required', message: `終了の理由が必要です (${CLOSE_REASONS.join(' / ')})` };
     return { ok: false, error: 'bad_request', message: problems.join(' / ') };
   }
-  const r = db.prepare(`UPDATE f_iroha_tasks SET status = ?, hold_reason_code = ?, hold_reason_note = ?, close_reason = ?, closed_at = ?, closed_by = ?,
-      started_at = ?, ready_at = ?, cancellation_requested_at = ?, version = ?, updated_at = ?, updated_by = ?
-    WHERE id = ? AND version = ?`)
-    .run(next.status, next.hold_reason_code, next.hold_reason_note, next.close_reason, next.closed_at, next.closed_by,
-      next.started_at, next.ready_at, next.cancellation_requested_at, next.version, next.updated_at, next.updated_by, t.id, t.version);
-  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
-  const cleared = (t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '';
-  safeLogTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: `${to}${closeReason ? ':' + closeReason : ''}${holdReason ? ':' + holdReason : ''}${reason ? ' (' + reason + ')' : ''}${cleared}`,
-    workerId, workerName, deviceLabel, ok: true });
+  // 状態の更新と記録を 1 つのトランザクションで。**終了からのやり直しは、理由が残らないなら再開もしない**
+  // (例外的な操作なので、なぜ再開したかが消えるくらいなら失敗させる — Codex PR1 R3)。
+  // それ以外は今までどおり、記録に失敗しても操作は成立させる (現場を止めない)
+  const reopening = t.status === 'closed';
+  const applied = db.transaction(() => {
+    const r = db.prepare(`UPDATE f_iroha_tasks SET status = ?, hold_reason_code = ?, hold_reason_note = ?, close_reason = ?, closed_at = ?, closed_by = ?,
+        started_at = ?, ready_at = ?, cancellation_requested_at = ?, version = ?, updated_at = ?, updated_by = ?
+      WHERE id = ? AND version = ?`)
+      .run(next.status, next.hold_reason_code, next.hold_reason_note, next.close_reason, next.closed_at, next.closed_by,
+        next.started_at, next.ready_at, next.cancellation_requested_at, next.version, next.updated_at, next.updated_by, t.id, t.version);
+    if (r.changes === 0) return false;
+    const cleared = (t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '';
+    const line = { taskId: t.id, action: 'task_status', from: t.status, to: `${to}${closeReason ? ':' + closeReason : ''}${holdReason ? ':' + holdReason : ''}${reason ? ' (' + reason + ')' : ''}${cleared}`,
+      workerId, workerName, deviceLabel, ok: true };
+    if (reopening) logTaskEvent(line); else safeLogTaskEvent(line);
+    return true;
+  })();
+  if (!applied) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
   return { ok: true, task: getTask(t.id) };
 }
 
@@ -527,6 +541,9 @@ export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerN
       const title = t.product_name || t.product_code || `#${id}`;
       if (t.status === 'closed' && t.close_reason === 'stocked') { skipped.push({ id, reason: 'already', title }); continue; }
       if (t.status !== 'ready_for_stocking') { skipped.push({ id, reason: 'not_ready', title, status: t.status }); continue; }
+      if (db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL').get(id).c > 0) {
+        skipped.push({ id, reason: 'active_sessions', title }); continue;   // 作業中のまま終了にしない (Codex PR1 R3)
+      }
       if (upd.run(now, actor, now, now, actor, id).changes !== 1) { skipped.push({ id, reason: 'conflict', title }); continue; }
       // 履歴は握り潰さない (権限のいる操作。記録できないなら全部やり直す — Codex PR-C R1)
       logTaskEvent({ taskId: id, action: 'task_status', from: 'ready_for_stocking', to: 'closed:stocked (まとめて棚入完了)',
