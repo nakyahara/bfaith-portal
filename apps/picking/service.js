@@ -279,8 +279,9 @@ export function isStaleInstructDate(instructDate, today = jstToday()) {
 export function importBatch(preview, { hikiateClass, classSource, folderName, overwrite }, actor) {
   const cls = String(hikiateClass ?? '').trim();
   // 引当分類の出どころ。'txt'=Driveの引当パターンtxt (確か) / 'suggested'=CSVからの推定 (要確認) /
-  // 'manual'=人が選んだ。未指定は 'manual' 扱い (画面・APIからの取込は人が確認しているため)
-  const src = ['txt', 'suggested', 'manual'].includes(classSource) ? classSource : 'manual';
+  // 'manual'=人が選んだ。⭐未指定は null (出所不明) にする。'manual' に丸めると、呼び出し側が
+  // 渡し忘れたときに「人が確認済み」を騙って警告対象から外れてしまう (Codexレビュー)
+  const src = ['txt', 'suggested', 'manual'].includes(classSource) ? classSource : null;
   const folder = String(folderName ?? '').trim() || null;
   if (!cls) throw new PkError(400, 'no_class', '引当分類を選択してください');
   // 管理者入力にも長さ上限を置く (Codex R1 low)。パターン名の最長は約60文字

@@ -901,6 +901,7 @@ function buildSummary(preview) {
 function runImport(preview, req) {
   return importBatch(preview, {
     hikiateClass: req.body.hikiate_class,
+    classSource: 'manual',   // 管理画面の取込 = 人が分類を選んで確定している
     folderName: req.body.folder_name,
     overwrite: String(req.body.overwrite) === '1',
   }, req.session.email);

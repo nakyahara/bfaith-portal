@@ -61,6 +61,7 @@ router.post('/import', (req, res, next) => {
     const staleDate = isStaleInstructDate(preview.instructDate);
     const result = importBatch(preview, {
       hikiateClass: patternName,
+      classSource: 'manual',   // 呼び出し側が pattern_name を明示してくる経路 (推定ではない)
       folderName: String(req.body.folder_name || '').trim() || null,
       overwrite: true,   // ready のバッチに限る (importBatch 内で enforce)。作業開始後は 409
     }, `ingest:${patternName.slice(0, 40)}`);

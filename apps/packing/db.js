@@ -523,8 +523,9 @@ const MIGRATIONS = {
   },
   // v18: 取りこぼしの見張り (2026-09-04 障害の再発防止)。
   //   ピッキングに来ているのに梱包へ来ていない出荷グループ / 引当分類が推定値のまま確定した
-  //   バッチを見つけて GChat に鳴らす。同じ件で鳴り続けないよう「鳴らした事実」をここに残す
-  //   (alert_key = <work_date>:<kind>:<folder_name> で1件1回)
+  //   バッチを見つけて GChat に鳴らす。**検知した時点で行を作る (outbox)** ので、webhook が
+  //   落ちていても異常を見失わない (当日を跨いでも未送信行として残り、次に送れたときに鳴る)。
+  //   alert_key = <work_date>:<kind>:<folder_name>
   18: () => {
     db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_miss_alerts (
       alert_key   TEXT PRIMARY KEY,
@@ -532,9 +533,12 @@ const MIGRATIONS = {
       work_date   TEXT NOT NULL,
       folder_name TEXT NOT NULL,
       detail      TEXT,
+      attempts    INTEGER NOT NULL DEFAULT 0,
+      last_error  TEXT,
       notified_at TEXT,                   -- 送れたときだけ入る (送信前に印を付けない)
       created_at  TEXT NOT NULL
     )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_miss_alerts_pending ON pk_pack_miss_alerts(notified_at, work_date)');
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_miss_alerts_date ON pk_pack_miss_alerts(work_date)');
   },
 };

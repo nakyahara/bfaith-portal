@@ -326,33 +326,36 @@ export function startPackingDrivePoller() {
     if (_polling) return;
     _polling = true;
     try {
-      _status.lastStats = await pollOnce();
-      _status.lastAt = utcNow();
-      _status.lastError = null;
-      await retryShipChangeNotify();
-      await retryReprintNotify();
-      // 資材変更の通知 outbox (undo 猶予後に送信・at-least-once — 要件『梱包資材表示』§5.3)。
-      // webhook 未設定時は claim しない (管理画面に構成エラー表示)
-      await materialNotifyStep(materialWebhookConfigured() ? postMaterialText : null);
-      purgeOldViews();   // 表示観測ログの180日 purge (要件§7)
-      cleanupReprintPdfs();
-      await sweepPrintJobsStep();
-      // ⚠ 取りこぼしの見張り (ピッキングにあるのに梱包に無い / 分類が推定値のまま)。
-      // ここが落ちても取込は止めない (fail-soft) が、失敗はログに残す
+      try {
+        _status.lastStats = await pollOnce();
+        _status.lastAt = utcNow();
+        _status.lastError = null;
+        await retryShipChangeNotify();
+        await retryReprintNotify();
+        // 資材変更の通知 outbox (undo 猶予後に送信・at-least-once — 要件『梱包資材表示』§5.3)。
+        // webhook 未設定時は claim しない (管理画面に構成エラー表示)
+        await materialNotifyStep(materialWebhookConfigured() ? postMaterialText : null);
+        purgeOldViews();   // 表示観測ログの180日 purge (要件§7)
+        cleanupReprintPdfs();
+        await sweepPrintJobsStep();
+        // ピッキング「後で取りに行く」依頼を取込済みバッチへ展開 (欠品フローv2 PR2・fail-soft)。
+        // 欠品はピッキング中 = 梱包CSVの取込前が普通なので、取込後のここで追いつくのが主経路
+        try { (await import('../picking/service.js')).bindPendingLaterRequests(); }
+        catch { /* picking無効環境では何もしない */ }
+        await pingJobsMonitor();
+        await pingPrintAgentAlive();
+      } catch (e) {
+        _status.lastError = String(e.message).slice(0, 300);
+        console.warn(`[packing-drive-poller] ポーリング失敗: ${e.message}`);
+      }
+      // ⚠ 取りこぼしの見張りは**取込が失敗した周期でも必ず走らせる**。
+      // Drive 障害で pollOnce が落ちるときこそ「梱包に来ていない」を鳴らす必要があり、
+      // 上の try に含めると監視が要る場面でだけ監視が止まる (Codexレビュー High)
       try {
         await missWatchStep(missWebhookConfigured() ? postMissText : null);
       } catch (e) {
         console.warn(`[packing-drive-poller] 取りこぼしの見張りに失敗: ${e.message}`);
       }
-      // ピッキング「後で取りに行く」依頼を取込済みバッチへ展開 (欠品フローv2 PR2・fail-soft)。
-      // 欠品はピッキング中 = 梱包CSVの取込前が普通なので、取込後のここで追いつくのが主経路
-      try { (await import('../picking/service.js')).bindPendingLaterRequests(); }
-      catch { /* picking無効環境では何もしない */ }
-      await pingJobsMonitor();
-      await pingPrintAgentAlive();
-    } catch (e) {
-      _status.lastError = String(e.message).slice(0, 300);
-      console.warn(`[packing-drive-poller] ポーリング失敗: ${e.message}`);
     } finally {
       _polling = false;
     }
