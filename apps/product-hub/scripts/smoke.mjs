@@ -7825,6 +7825,55 @@ for (const [name, file, data] of renders) {
       check('HTTP 配送方法: 選択肢に無い値は 400', rr.status === 400 && /配送方法/.test(rr.json.error || ''), JSON.stringify(rr.json));
       db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idShip, idShip2);
     }
+
+    // ─── 画面が本当に描けるか (2026-09-04 本番 500 の再発防止) ──────────────
+    // 🚨 テンプレートの render テストは変数を**自前で**用意するので、router 側の渡し忘れを
+    // 素通りさせる。実際 #1176 で detail.ejs に setDecisionReasons を使う枠を足したのに
+    // router の res.render に足し忘れ、smoke は ALL PASS のまま本番の詳細画面が
+    // ReferenceError で 500 になった (board.ejs には渡っていた)。
+    // テンプレートが使う変数を router が全部渡しているかは、実物のルートを叩くまで分からない。
+    {
+      const getHtml = async (p) => {
+        const res = await fetch(base + p, { headers: { Accept: 'text/html' } });
+        return { status: res.status, html: await res.text() };
+      };
+      const idPage = mkDraft('PAGE-SINGLE', { atListing: false });
+      // セット (parent_draft_id がセットの定義。仮コードのまま = NE 登録待ちの見た目も描かせる)
+      const idSet = Number(db.prepare(
+        `INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code, ne_registration_state)
+         VALUES ('SET-PAGE-SINGLE-01', 'ページ描画テスト 2個セット', 'draft', 'smoke', ?, 1, 'requested')`,
+      ).run(idPage).lastInsertRowid);
+      db.prepare('INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, 2, 0)')
+        .run(idSet, 'PAGE-SINGLE');
+      wfp.ensureProgress(db, idSet);
+
+      let pr = await getHtml(`/detail/${idPage}`);
+      check('HTTP 画面: 単品の詳細が 200 で描ける (テンプレートの変数を router が全部渡している)',
+        pr.status === 200, `${pr.status} ${pr.html.slice(0, 400)}`);
+      check('HTTP 画面: ⑤の「作らない」理由の選択肢が実際に描かれる (setDecisionReasons の渡し忘れ検出)',
+        Object.values(sd.SET_DECISION_REASONS).every((label) => pr.html.includes(label)),
+        Object.keys(sd.SET_DECISION_REASONS).join(','));
+      check('HTTP 画面: 親のカードに派生セットが出る', pr.html.includes('SET-PAGE-SINGLE-01'));
+
+      pr = await getHtml(`/detail/${idSet}`);
+      check('HTTP 画面: セットの詳細が 200 で描ける', pr.status === 200, `${pr.status} ${pr.html.slice(0, 400)}`);
+
+      for (const [label, p] of [
+        ['一覧', '/list'],
+        ['ボード (全体)', '/board'],
+        ['ボード (単品)', '/board?view=single'],
+        ['ボード (セット工程)', '/board?view=set'],
+        ['ボード (画像)', '/board?view=image'],
+        ['ボード (NE要対応)', '/board?view=ne'],
+        ['新規作成', '/new'],
+        ['担当者・工程の設定', '/staff'],
+      ]) {
+        // eslint-disable-next-line no-await-in-loop
+        const rp = await getHtml(p);
+        check(`HTTP 画面: ${label} が 200 で描ける (${p})`, rp.status === 200, `${rp.status} ${rp.html.slice(0, 400)}`);
+      }
+      db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idSet, idPage);
+    }
     server.close();
     db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?)').run(id, idU, idL);
   }
