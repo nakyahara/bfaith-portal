@@ -3022,7 +3022,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v4'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v5'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -3072,8 +3072,29 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // ══ P2: ボードに 3 軸を載せる (要件 §W-4) ══
   ok(/<div id="gaugeWrap"><\/div>/.test(html) && !/class="gauge"/.test(html.slice(0, html.indexOf('<script'))),
     '明日やる分のゲージは静的に置かない (職員のときだけボタンにする)');
-  ok(/if \(!stateCan\('task\.plan\.assign'\)\) return '<div class="gauge">' \+ inner \+ '<\/div>';/.test(html),
+  ok(/if \(!isApp\(\)\) return '<div class="gauge">' \+ inner \+ '<span class="staff">見るだけ \(正本はまだ Notion\)<\/span><\/div>';/.test(html),
+    '下見のあいだもゲージは出す (見るだけと書く)');
+  ok(/if \(!stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+return '<div class="gauge">' \+ inner \+ '<span class="staff">明日の計画を決められるのは職員です/.test(html),
     '許可が無ければゲージはただの表示 (「明日の計画 ›」の入口を描かない)');
+  // ⭐職員モードに入る入口 (これが無いと、計画の操作が一生描かれない)
+  ok(/<button class="who" id="staffBtn" hidden><\/button>/.test(html) && /function renderStaffBtn\(\)/.test(html),
+    'ヘッダに「職員モード」のボタンがある');
+  ok(/const hide = \(\) => \{ b\.hidden = true; b\.textContent = ''; b\.onclick = null; \};/.test(html),
+    '出さないときは中身も動きも消す (hidden にするだけで押せる要素を残さない)');
+  ok(/if \(sm\.via === 'session'\) return hide\(\);/.test(html) && /if \(!w \|\| w\.worker_type !== 'staff'\) return hide\(\);/.test(html),
+    '職員を選んでいるときだけ出す (利用者・ポータルの人には出さない)');
+  ok(/Math\.max\(1, Math\.ceil\(leftMs \/ 60000\)\)/.test(html),
+    '残り時間は切り上げ (「あと0分」で押せるままにしない)');
+  ok(/setInterval\(\(\) => \{ if \(state && state\.staff_mode && state\.staff_mode\.staff\) renderStaffBtn\(\); \}, 30000\);/.test(html),
+    '残り時間は 30 秒ごとに見直す (通信が無くても固まらない)');
+  ok(/if \(sm\.until && leftMs <= 0\) \{\r?\n\s+\/\/[^\r\n]*\r?\n\s+dropPlanCaps\(\);/.test(html),
+    '期限が来たら画面の中の許可を落として取り直す (計画のボタンが残らない)');
+  ok(/function dropPlanCaps\(\)/.test(html) && /state\.capabilities = \(state\.capabilities \|\| \[\]\)\.filter\(\(c\) => c !== 'task\.plan\.assign' && c !== 'task\.facility\.assign'\);/.test(html),
+    '職員モードを抜けたら、画面の中の許可もその場で落とす');
+  ok(/if \(!j\.ok\) \{ showErr\(j\.message \|\| '職員モードを終われませんでした'\); return; \}/.test(html)
+    && /dropPlanCaps\(\);\r?\n\s+toast\('職員モードを終わりました'\);/.test(html),
+    '終わるときは取り直しの成功に頼らない (通信が失敗しても「終わったのにボタンが残る」を作らない)');
+  ok(/renderStaffBtn\(\);   \/\/ 職員を選んだら/.test(html), '作業者を選び直したらボタンも出し直す');
   ok(/function planTagsHtml\(c\)/.test(html) && /const canFac = stateCan\('task\.facility\.assign'\);/.test(html)
     && /const canWhen = stateCan\('task\.plan\.assign'\);/.test(html),
     'カードの「どこが」「いつ」の札は許可リストで出し分ける');

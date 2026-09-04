@@ -390,6 +390,7 @@
   <header class="top">
     <h1><span class="logo">IROHA STOCK</span><span class="jp">いろは在庫化 作業画面</span></h1>
     <button class="who" id="whoBtn" onclick="openGate()">👤 —</button>
+    <button class="who" id="staffBtn" hidden></button>
   </header>
   <div class="views" id="views" hidden>
     <button id="vList" class="on" onclick="setView('list')">📋 作業</button>
@@ -736,6 +737,7 @@ function restoreWorker() {
   const w = state.workers.find(x => x.id === id);
   if (w) { worker = w; $('#whoBtn').textContent = '👤 ' + w.display_name + (w.worker_type === 'staff' ? ' (職員)' : '') + ' ▾'; }
   else if (!worker) openGate();
+  renderStaffBtn();   // 職員を選んだら「職員モードに入る」が出る (利用者を選んだら消える)
 }
 
 // ─── 通信の共通口 ───
@@ -871,6 +873,7 @@ async function loadStateOnce() {
   // ボードを開いている間は、正本が Notion なら下見も取り直す (切替直後・502 から戻ったときもここで回復する)
   if (curView === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
   renderLwSaveState();
+  renderStaffBtn();
   // ⭐許可が変わったら計画の中身も作り直す。失ったら**描いたものを消す** —
   //   隠すだけだと、hidden の画面に押せるボタンが残る (Codex P3 R1 / R2)
   if (!stateCan('task.plan.assign')) {
@@ -1114,7 +1117,8 @@ const WHEN_CLASS = { today: 'todayp', tomorrow: 'tomorrow', over: 'over', later:
 
 /** 明日やる分の合計 (上のゲージ)。職員はタップで「明日の計画」へ。利用者は見るだけ */
 function gaugeHtml() {
-  const p = (state && state.tomorrow_plan) || { hours: 0, count: 0, unknown_hours_count: 0 };
+  // 下見 (正本が Notion) のときも出す。中身は下見のデータから (見るだけ)
+  const p = ((boardState() || {}).tomorrow_plan) || { hours: 0, count: 0, unknown_hours_count: 0 };
   const h = Math.floor(p.hours);
   const m = Math.round((p.hours - h) * 60);
   const pct = Math.min(100, (p.hours / 8) * 100);
@@ -1127,8 +1131,12 @@ function gaugeHtml() {
     '<span class="big">' + esc(String(h)) + '<small>時間</small>' + esc(String(m).padStart(2, '0')) + '<small>分</small></span>' +
     '<span class="bar"><span class="band"></span><span class="fill' + (over ? ' over' : '') + '" style="width:' + pct + '%"></span></span>' +
     '<span class="st ' + st[0] + '">' + esc(st[1]) + '</span>' + unknown;
-  // ⭐計画は職員だけ。許可が無ければボタンにせず、入口 (›) も描かない (要件 §W-4)
-  if (!stateCan('task.plan.assign')) return '<div class="gauge">' + inner + '</div>';
+  // ⭐計画は職員だけ。許可が無ければボタンにせず、入口 (›) も描かない (要件 §W-4)。
+  //   下見のあいだは正本が Notion なので、誰であっても見るだけ
+  if (!isApp()) return '<div class="gauge">' + inner + '<span class="staff">見るだけ (正本はまだ Notion)</span></div>';
+  if (!stateCan('task.plan.assign')) {
+    return '<div class="gauge">' + inner + '<span class="staff">明日の計画を決められるのは職員です</span></div>';
+  }
   const left = staffLeftText();
   return '<button class="gauge" onclick="openPlanPage()">' + inner +
     '<span class="go">明日の計画 ›</span>' + (left ? '<span class="staff">' + esc(left) + '</span>' : '') + '</button>';
@@ -1217,7 +1225,7 @@ function renderBoard() {
   const bs = boardState();
   if (!bs) { $('#board').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
   renderPreviewNote();
-  $('#gaugeWrap').innerHTML = isApp() ? gaugeHtml() : '';
+  $('#gaugeWrap').innerHTML = gaugeHtml();
   $('#colSeg').innerHTML = colSegHtml();
   $('#facChips').innerHTML = facChips();
   $('#whenChips').innerHTML = whenChips();
@@ -1390,6 +1398,70 @@ async function planError(j, retry, { silent = false } = {}) {
   }
   if (!silent) showErr(j.message || '変えられませんでした');
   loadState();
+}
+
+/**
+ * ⭐ヘッダの「職員モード」ボタン。これが無いと、職員モードに入る入口がどこにも無かった
+ * (計画の操作をしようとしたときにしか PIN を聞かないのに、その操作は職員モードでないと描かれない)。
+ * 職員が選ばれているときだけ出す。入っていれば残り時間と「終わる」を出す
+ */
+function renderStaffBtn() {
+  const b = $('#staffBtn');
+  if (!b) return;
+  // 出さないときは**中身も動きも消す** — hidden にするだけだと、押せる要素が残る (要件 §U-7)
+  const hide = () => { b.hidden = true; b.textContent = ''; b.onclick = null; };
+  const w = worker;
+  const sm = (state && state.staff_mode) || {};
+  // ポータル (PC の管理画面) から入っている人は最初から職員扱いなので、ボタンは要らない
+  if (sm.via === 'session') return hide();
+  if (!w || w.worker_type !== 'staff') return hide();
+  b.hidden = false;
+  if (sm.staff) {
+    const leftMs = sm.until ? Date.parse(sm.until) - Date.now() : 0;
+    if (sm.until && leftMs <= 0) {
+      // 期限が来た → 画面の中の許可も落として取り直す (計画のボタンが残らない)
+      dropPlanCaps();
+      loadState();
+      return;
+    }
+    // 切り上げ (あと 30 秒でも「あと1分」。0 分と出して押せるままにしない)
+    b.textContent = '🔓 職員モード あと' + Math.max(1, Math.ceil(leftMs / 60000)) + '分';
+    b.onclick = endStaffMode;
+  } else {
+    b.textContent = '🔑 職員モードに入る';
+    b.onclick = async () => { if (await askStaffUnlock()) await loadState(); };
+  }
+}
+// 残り時間は放っておくと固まる (通信が無ければ描き直されない)。30 秒ごとに見直す
+setInterval(() => { if (state && state.staff_mode && state.staff_mode.staff) renderStaffBtn(); }, 30000);
+
+/**
+ * 画面の中の「計画の許可」をその場で落とす。
+ * サーバーに頼まなくても、職員モードを終えた瞬間・期限が来た瞬間にボタンを消すため
+ */
+function dropPlanCaps() {
+  if (!state) return;
+  state.staff_mode = { staff: false };
+  state.capabilities = (state.capabilities || []).filter((c) => c !== 'task.plan.assign' && c !== 'task.facility.assign');
+  planData = null;
+  clearPlanDom();
+  if (curView === 'plan') setView('board');
+  if (facPickCtx) closeFacPick();
+  renderStaffBtn();
+  renderList();
+  renderBoard();
+  if (curDetail && detailCard) renderDetail(detailCard, { keepScroll: true });
+}
+
+async function endStaffMode() {
+  if (!window.confirm('職員モードを終わりますか? (明日の計画は決められなくなります)')) return;
+  const j = await apiFetch('/api/staff-lock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  if (!j.ok) { showErr(j.message || '職員モードを終われませんでした'); return; }
+  // ⭐取り直しを待たずに、その場で許可を落とす。
+  //   ここで loadState() の成功に頼ると、通信が失敗したときに「終わったのにボタンが残る」(Codex R1)
+  dropPlanCaps();
+  toast('職員モードを終わりました');
+  loadState();   // 念のため取り直す (失敗しても上で落としてある)
 }
 
 /** 職員モードに入る (PIN を 1 回)。入れたら true */
