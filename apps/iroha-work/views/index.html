@@ -685,7 +685,9 @@ function restoreSnapshot() {
   state = { mode: s.mode || 'notion', cards: s.cards, statuses: s.statuses || [], changeTargets: s.changeTargets || [],
     transitions: s.transitions || {}, holdReasons: s.holdReasons || [], closeReasons: s.closeReasons || [],
     facilities: s.facilities || [], today: s.today || null,
-    workers: s.workers || [], refresh: s.refresh || {}, capabilities: s.capabilities || [], me: {} };
+    // ⭐前回の許可リストは復元しない。正本が変わっていることがあるので、/api/state が返るまでは
+    //   何も許さない (つながる前は default-deny — Codex PR1 R12)
+    workers: s.workers || [], refresh: s.refresh || {}, capabilities: [], me: {} };
   renderModeTexts(); renderViews(); ensureTabValid(); renderTabs(); renderList(); restoreWorker();
   $('#syncTxt').textContent = '前回取得 ' + fmtTime(new Date(s.at).toISOString()) + ' の一覧 · 最新を確認中…';
   return true;

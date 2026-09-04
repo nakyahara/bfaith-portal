@@ -1351,6 +1351,21 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       db.prepare("DELETE FROM f_iroha_card_media WHERE operation_id IN ('op-cap-000001','op-cap-fill01')").run();
       try { fs.unlinkSync(st3.move.to); } catch { /* 無ければよい */ }
       ok(mediaByTask().get(tOpen).length === 2, '片づけて元に戻す');
+      // 消された staging 行は公開しない (職員が管理画面から消した後に実体を結びつけない — Codex PR1 R12)
+      {
+        const st4 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('del1.jpg'),
+          worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-staged-del1', deferMove: true });
+        moveStoredFile(st4.move);
+        db.prepare('UPDATE f_iroha_card_media SET deleted_at = ?, deleted_by = ? WHERE id = ?')
+          .run(new Date().toISOString(), 'test', st4.media.id);
+        ok(promoteStagedMedia(st4.media.id, st4.move.to, { claim: st4.claim }).reason === 'gone',
+          '消された行は公開できない');
+        db.prepare("UPDATE f_iroha_card_media SET staged_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").run(st4.media.id);
+        const sw0 = sweepStagedMedia();
+        ok(sw0.promoted === 0 && sw0.dropped === 0, '片づけの対象にもしない (消された行はそのまま履歴に残す)');
+        db.prepare('DELETE FROM f_iroha_card_media WHERE id = ?').run(st4.media.id);
+        try { fs.unlinkSync(st4.move.to); } catch { /* 無ければよい */ }
+      }
     }
     // 後の検査 (「前回の完成形」の枚数) に影響させないよう片づける
     db.prepare('DELETE FROM f_iroha_card_media WHERE operation_id = ?').run('op-stage-0001');
@@ -2643,7 +2658,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function detailNoteHtml\(c\)/.test(html) && /に取り込んだ時点/.test(html) && /いまのアプリの記録/.test(html), '下見の詳細には「何がいつ時点か」を分けて出す');
   ok(/if \(!can\('task\.master\.edit'\)\) return;/.test(html) && /if \(curDetail && can\('task\.status\.change'\)\) openSt/.test(html)
     && /if \(!can\('task\.work\.start'\)\) return;/.test(html) && /if \(!can\('task\.media\.add'\)\) return;/.test(html), '変更・開始・撮影の入口も許可リストで止める (二重の守り)');
-  ok(/capabilities: j\.capabilities/.test(html) && /capabilities: s\.capabilities \|\| \[\]/.test(html), '端末に残す前回の一覧にも許可リストを持たせる (無ければ何も許さない)');
+  ok(/capabilities: j\.capabilities/.test(html) && /capabilities: \[\], me: \{\} \};/.test(html),
+    '端末に残した前回の一覧からは許可リストを復元しない (つながるまでは何も許さない — Codex PR1 R12)');
   // Codex R1 の指摘 (下見・履歴の読み取り専用境界)
   ok(/const stateCan = \(name\) => \(state\.capabilities \|\| \[\]\)\.includes\(name\)/.test(html),
     '一覧・ボード側も許可リストで判定する (前回の一覧に許可が無ければ何も許さない)');

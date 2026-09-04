@@ -209,10 +209,13 @@ export function promoteStagedMedia(id, localPath, { claim = null, stagedAt = nul
   return db.transaction(() => {
     const cur = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(id));
     if (!cur) return { ok: false, reason: 'gone' };
+    // 消された行は公開しない (職員が管理画面から消した後に実体を結びつけない — Codex PR1 R12)
+    if (cur.deleted_at) return { ok: false, reason: 'gone' };
     // 別の要求が先に置いて公開した (同じ operation_id の二重送信)。写真としては成立しているので、
     // その行をそのまま返す。実体は相手が置いたものが正 — こちらから消さない
     if (!cur.staged_at) return { ok: false, reason: 'taken', media: publicMedia(cur) };
-    if (cardWriteBlockReason(cur)) return { ok: false, reason: 'not_writable' };
+    const blocked = cardWriteBlockReason(cur);
+    if (blocked) return { ok: false, reason: 'not_writable', blocked };   // 本当の理由も返す (Codex PR1 R12)
     // ⭐枚数上限も**この**トランザクションの中で見る。外で見ると、見た後・公開する前に
     //   別の送信で枠が埋まる (30 分以上止まっていた送信が再開する場合も含む — Codex PR1 R11)
     const max = cur.kind === 'photo' ? MAX_PHOTOS : MAX_VIDEOS;
@@ -222,7 +225,7 @@ export function promoteStagedMedia(id, localPath, { claim = null, stagedAt = nul
       .get(cur.task_id != null ? cur.task_id : cur.page_id, cur.kind, cur.id).c;
     if (live >= max) return { ok: false, reason: 'cap_reached' };
     const n = db.prepare(`UPDATE f_iroha_card_media SET staged_at = NULL, staged_claim = NULL, local_path = ?
-      WHERE id = ? AND staged_at IS NOT NULL AND staged_claim IS ?
+      WHERE id = ? AND staged_at IS NOT NULL AND deleted_at IS NULL AND staged_claim IS ?
         ${stagedAt == null ? '' : 'AND staged_at = ?'}`)
       .run(...[localPath, Number(id), claim].concat(stagedAt == null ? [] : [stagedAt])).changes;
     if (n === 0) return { ok: false, reason: 'taken' };
@@ -257,7 +260,7 @@ export function sweepStagedMedia(maxAgeMs = STAGE_TTL_MS) {
   const db = getDB();
   const limit = new Date(Date.now() - maxAgeMs).toISOString();
   const rows = db.prepare(`SELECT id, operation_id, kind, page_id, task_id, staged_claim, staged_at
-    FROM f_iroha_card_media WHERE staged_at IS NOT NULL AND staged_at < ?`).all(limit);
+    FROM f_iroha_card_media WHERE staged_at IS NOT NULL AND deleted_at IS NULL AND staged_at < ?`).all(limit);
   let promoted = 0;
   let dropped = 0;
   // ⭐自分が見たときの札・時刻のままの行しか動かさない。見た後に同じ端末から再送されていたら、
@@ -326,7 +329,8 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
       // ⭐前のトークンも 5 世代まで生かしておく。同じ再送が何本も重なって応答の順が入れ替わると、
       //   端末に最後に届く応答が古い世代のこともある (撮った本人が消せなくなる — Codex PR1 R10 / R11)
       const h = crypto.createHash('sha256').update(token).digest('hex');
-      db.prepare('UPDATE f_iroha_card_media SET delete_token_hashes = ?, delete_token_hash = ? WHERE id = ?')
+      db.prepare(`UPDATE f_iroha_card_media
+        SET delete_token_hashes = ?, delete_token_hash = ?, delete_token_hash_prev = NULL WHERE id = ?`)
         .run(pushTokenHash(dup, h), h, dup.id);
       return { ok: true, already: true, media: publicMedia(dup), deleteToken: token };
     }
@@ -459,15 +463,20 @@ export const cardKeyOf = (r) => (r.task_id != null ? `t${r.task_id}` : r.page_id
  * 論理削除。本人確認は**削除トークン** (アップロードした端末だけが持つ) か portal セッション。
  * 貼り直しはページ単位キューへ積む — 最後の1件を消したときも「空にする」PATCH が飛ぶ (Codex PR3 #1)
  */
-/** 有効な削除トークンのハッシュ一覧 (新しい順・最大 5 世代)。古い行は単一列しか持たない */
+/**
+ * 有効な削除トークンのハッシュ一覧 (新しい順・最大 5 世代)。
+ * 古い行は単一列 (delete_token_hash) しか持たない。途中の版の delete_token_hash_prev も拾うが、
+ * ⭐**必ず 5 件に切る** — 旧列が枠から漏れて「6 世代目が無期限に有効」にならないように (Codex PR1 R12)
+ */
 const TOKEN_HISTORY = 5;
 function tokenHashesOf(row) {
   let list = [];
   try { list = JSON.parse(row.delete_token_hashes || '[]'); } catch { list = []; }
   if (!Array.isArray(list)) list = [];
+  list = list.filter((h) => typeof h === 'string' && h);
   if (row.delete_token_hash && !list.includes(row.delete_token_hash)) list.unshift(row.delete_token_hash);
   if (row.delete_token_hash_prev && !list.includes(row.delete_token_hash_prev)) list.push(row.delete_token_hash_prev);
-  return list;
+  return list.slice(0, TOKEN_HISTORY);
 }
 function pushTokenHash(row, hash) {
   return JSON.stringify([hash, ...tokenHashesOf(row).filter((h) => h !== hash)].slice(0, TOKEN_HISTORY));

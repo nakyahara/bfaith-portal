@@ -920,10 +920,12 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
         return res.status(409).json({ ok: false, error: 'cap_reached',
           message: `写真は${MAX_PHOTOS}枚までです。不要な写真を削除してから撮り直してください` });
       } else if (promoted.reason === 'not_writable') {
-        // 実体を置いている間にカードが終了した / 正本が Notion に戻った。写真は残さない (Codex PR1 R10)
+        // 実体を置いている間にカードが終了した / 正本が Notion に戻った。写真は残さない (Codex PR1 R10)。
+        // 断った本当の理由をそのまま返す (画面が「下見だから」と「終了したから」を区別できるように — R12)
         try { dropMedia(r.media.id, r.claim); } catch { /* 消せなくても応答は失敗にする */ }
         try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
-        return res.status(409).json({ ok: false, error: 'closed_task',
+        if (promoted.blocked === 'notion_mode') return res.status(409).json(PREVIEW_WRITE_REJECTED);
+        return res.status(409).json({ ok: false, error: promoted.blocked === 'closed_task' ? 'closed_task' : 'card_required',
           message: '保存の途中でこのカードは変えられなくなりました (もう一度とってください)' });
       } else if (promoted.media) {
         // 同じ送信が二重に届き、もう一方が先に公開した。写真としては成立しているのでそのまま返す。
