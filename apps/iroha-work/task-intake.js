@@ -142,8 +142,8 @@ export function listLinkConflicts(limit = 50) {
   return db.prepare(`SELECT t.id AS task_id, t.destination_id, t.product_code, t.product_name, t.status, t.cancellation_requested_at, d.notion_page_id,
       d.cancelled_at AS destination_cancelled_at,
       o.id AS other_task_id, o.status AS other_status, o.product_code AS other_product_code, o.cancellation_requested_at AS other_cancellation_requested_at,
-      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id AND s.ended_at IS NULL) AS active_sessions,
-      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = o.id AND s.ended_at IS NULL) AS other_active_sessions
+      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id AND s.ended_at IS NULL AND s.voided_at IS NULL) AS active_sessions,
+      (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = o.id AND s.ended_at IS NULL AND s.voided_at IS NULL) AS other_active_sessions
     ${LINK_CONFLICT_FROM} ORDER BY t.id LIMIT ?`).all(Number(limit) || 50);
 }
 /** 総件数 (一覧は先頭だけなので、件数は別に数える — Codex PR-B R3 Low) */
@@ -179,7 +179,7 @@ export function mergeLinkConflict({ taskId, keep = 'import', actor = null }) {
     const intoId = keep === 'import' ? c.other_task_id : c.task_id;
     const fromId = keep === 'import' ? c.task_id : c.other_task_id;
     const row = (id) => db.prepare('SELECT * FROM f_iroha_tasks WHERE id = ?').get(id);
-    const activeOf = (id) => db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL').get(id).c;
+    const activeOf = (id) => db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL AND voided_at IS NULL').get(id).c;
     const into = row(intoId);
     const from = row(fromId);
     if (into.status === 'closed' && from.status !== 'closed') {

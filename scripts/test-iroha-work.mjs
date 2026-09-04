@@ -2321,6 +2321,26 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
       ok(bulkTry.done.length === 0 && bulkTry.skipped[0].reason === 'active_sessions', 'まとめて棚入完了でも飛ばす');
       stopSession({ taskId: t2, workerId: wB2.id, sessionId: sB2.sessionId, reason: 'done' });
       ok(TD.bulkCloseReady({ taskIds: [t2], actor: 'test' }).done.length === 1, '作業を終えれば終了にできる');
+      // 版ずれと「作業中」を取り違えない: 別の端末が先に動かしていたら competing でなく conflict (Codex PR1 R5)
+      {
+        const t3 = TD.upsertTaskFromImport({ notion_page_id: 'busy-stale', status: 'ready_for_stocking', destination_id: 9506,
+          product_code: 'PLAN-A', product_name: '版ずれ + 作業中', qty: 1, facility_code: 'iroha' }, { batchId: 'test-busy' }).id;
+        const wB3 = listIrohaWorkers(true).find((x) => x.display_name === 'すずき');
+        const sB3 = startSession({ taskId: t3, worker: getIrohaWorker(wB3.id) });
+        const stale = TD.getTask(t3).version - 1;
+        const r3 = TD.changeTaskStatus({ taskId: t3, to: 'closed', closeReason: 'stocked', expectVersion: stale, isStaff: true, actor: 'test' });
+        ok(r3.ok === false && r3.error === 'conflict', '版が古ければ (作業中でも) 競合として断る — 作業中扱いにしない');
+        stopSession({ taskId: t3, workerId: wB3.id, sessionId: sB3.sessionId, reason: 'done' });
+        // 取り消したセッションは「作業中」に数えない (終わっていない行として残っていても — Codex PR1 R6)
+        const t4 = TD.upsertTaskFromImport({ notion_page_id: 'busy-void', status: 'ready_for_stocking', destination_id: 9507,
+          product_code: 'PLAN-A', product_name: '取り消し済みの作業', qty: 1, facility_code: 'iroha' }, { batchId: 'test-busy' }).id;
+        db.prepare(`INSERT INTO f_iroha_work_sessions (task_id, worker_id, worker_name, started_at, voided_at, voided_by)
+          VALUES (?, ?, 'すずき', ?, ?, 'test')`).run(t4, wB3.id, utcNowT(), utcNowT());
+        ok(db.prepare('SELECT ended_at FROM f_iroha_work_sessions WHERE task_id = ?').get(t4).ended_at == null,
+          '取り消し済みだが終わっていない記録がある');
+        ok(TD.bulkCloseReady({ taskIds: [t4], actor: 'test' }).done.length === 1, 'それでもまとめて棚入完了は通る');
+        ok(TD.getTask(t4).status === 'closed', '終了になっている');
+      }
       // 終了からのやり直しは、理由の記録が書けなければ再開そのものを取り消す
       db.exec('ALTER TABLE f_iroha_app_events RENAME TO f_iroha_app_events__bak2');
       let reopenErr = null;
@@ -2536,10 +2556,12 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   const app = capabilitiesFor('app'), notion = capabilitiesFor('notion'), pv = capabilitiesFor('preview');
   ok(Array.isArray(pv) && pv.length === 0, '下見・履歴は何も許さない');
   ok([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT].every(c => notion.includes(c))
-    && ![CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].some(c => notion.includes(c)),
+    && ![CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].some(c => notion.includes(c)),
     'Notion 正本 = 状態変更・作業開始・写真・作業のやり方 (今日やる等は許さない)');
-  ok(notion.every(c => app.includes(c)) && [CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].every(c => app.includes(c)),
-    'アプリ正本 = Notion 正本の全部 + 今日やる・外部準備OK・取消の判断・ラベル待ち・まとめて棚入完了');
+  ok(notion.every(c => app.includes(c)) && [CAP.PLAN_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED].every(c => app.includes(c)),
+    'アプリ正本 = Notion 正本の全部 + 今日やる・外部準備OK・取消の判断・確認ずみ・ラベル待ち・まとめて棚入完了');
+  // 書き込み口が capability を持たないまま増えていないか (Codex PR1 R6)
+  ok(app.length === 10 && new Set(app).size === app.length, 'アプリ正本の許可は 10 個・重複なし (増やしたら画面の判定も足す)');
   app.push('x'); pv.push('y');
   ok(!capabilitiesFor('app').includes('x') && capabilitiesFor('preview').length === 0, '返した配列を壊しても共有の定義は変わらない');
   ok(capabilitiesFor('unknown').length === 0 && capabilitiesFor(undefined).length === 0, '知らないモードは何も許さない (default-deny)');

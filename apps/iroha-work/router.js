@@ -47,7 +47,7 @@ import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-che
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
 import {
-  addMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
+  addMedia, inspectMediaUpload, moveStoredFile, dropMedia, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload, markMediaUnavailable,
   recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
   listPageSyncForAdmin, resetPageSync,
   isDriveConfigured, MEDIA_DIR, MAX_PHOTO_BYTES,
@@ -845,38 +845,66 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
     const card = appMode ? null : getCachePage(cardId);
     if (appMode ? !task : !card) { cleanup(); return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' }); }
     // 終了したカード (履歴) には足せない。削除を断っているのと同じ理由 — 履歴は読むだけ (要件 v1.3 §P Q5)。
-    // ⭐確かめるところと足すところを 1 つのトランザクションに入れる。外で確かめると、確かめた後・
-    //   足す前に別の接続がカードを終了させられる (miniPC も同じ DB を見る — Codex PR1 R5)
+    // ファイルの検査 (大きさ・中身が本当に JPEG か) はトランザクションに入る前に済ませる。
+    // 書き込みロックを持ったままファイルを読まない (miniPC も同じ DB を開く — Codex PR1 R6)
+    const inspected = inspectMediaUpload({ kind, filePath: req.file.path, operationId: req.body?.operation_id });
+    if (!inspected.ok) { cleanup(); return res.status(400).json(inspected); }
+    // ⭐正本モードもカードも**トランザクションの中で読み直す**。外で読むと、読んだ後・書く前に
+    //   正本が Notion に戻ったり、カードが終了したりできる (Codex PR1 R5 / R6)
     const NOT_FOUND = { status: 404, body: { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' } };
     const out = getDB().transaction(() => {
-      if (appMode) {
-        const cur = getTask(task.id);
-        if (!cur) return { deny: NOT_FOUND };
-        if (cur.status === 'closed') {
+      const nowApp = isAppMode();
+      let taskNow = null;
+      let cardNow = null;
+      if (nowApp) {
+        const tid = parseTaskId(cardId);
+        taskNow = tid == null ? null : getTask(tid);
+        if (!taskNow) return { deny: NOT_FOUND };
+        if (taskNow.status === 'closed') {
           return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: '終了したカードには写真を足せません (履歴として残ります)' } } };
         }
-      } else if (!getCachePage(cardId)) {
-        return { deny: NOT_FOUND };
+      } else {
+        // 正本が Notion に戻っていたら、数値 id は下見のカード。書かせない
+        if (parseTaskId(cardId) != null) return { deny: { status: 409, body: PREVIEW_WRITE_REJECTED } };
+        cardNow = getCachePage(cardId);
+        if (!cardNow) return { deny: NOT_FOUND };
       }
-      return { r: addMedia({
-        pageId: appMode ? null : cardId, taskId: appMode ? task.id : null,
-        productCode: appMode ? task.product_code : card.product_code, kind, mime: req.file.mimetype,
-        filePath: req.file.path, worker: w.worker, deviceLabel: deviceLabelOf(req),
-        deviceId: req.iwDevice ? req.iwDevice.id : null,
-        operationId: req.body?.operation_id,
-      }) };
+      return {
+        appMode: nowApp,
+        taskId: nowApp ? taskNow.id : null,
+        r: addMedia({
+          pageId: nowApp ? null : cardId, taskId: nowApp ? taskNow.id : null,
+          // 商品コードも読み直した行から取る (取込と重なって食い違わないように)
+          productCode: nowApp ? taskNow.product_code : cardNow.product_code, kind, mime: req.file.mimetype,
+          filePath: req.file.path, worker: w.worker, deviceLabel: deviceLabelOf(req),
+          deviceId: req.iwDevice ? req.iwDevice.id : null,
+          operationId: req.body?.operation_id, inspected, deferMove: true,
+        }),
+      };
     }).immediate();
     if (out.deny) { cleanup(); return res.status(out.deny.status).json(out.deny.body); }
     const r = out.r;
     if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' || r.error === 'operation_conflict' ? 409 : 400).json(r); }
-    if (appMode) {
-      safeLogTaskEvent({ taskId: task.id, action: `media_${kind}`, workerId: w.worker.id, workerName: w.worker.display_name,
+    // 実体を置くのはトランザクションを抜けてから。置けなければ行を消して「無かったこと」にする
+    if (r.move) {
+      try {
+        moveStoredFile(r.move);
+      } catch (e) {
+        try { dropMedia(r.media.id); } catch { /* 消せなくても応答は失敗にする */ }
+        cleanup();
+        console.error('[iroha-work] 写真の保存に失敗', e);
+        return res.status(500).json({ ok: false, error: 'store_failed', message: '写真を保存できませんでした (もう一度とってください)' });
+      }
+    }
+    if (out.appMode) {
+      safeLogTaskEvent({ taskId: out.taskId, action: `media_${kind}`, workerId: w.worker.id, workerName: w.worker.display_name,
         deviceLabel: deviceLabelOf(req), to: r.already ? 'resend' : 'add', ok: true });
     } else {
       safeLog({ action: `media_${kind}`, pageId: cardId, workerId: w.worker.id, workerName: w.worker.display_name,
         deviceLabel: deviceLabelOf(req), to: r.already ? 'resend' : 'add', ok: true });
     }
     scheduleMedia();
+    delete r.move;   // 保管場所のパスは画面に返さない
     res.json(r);
   } catch (e) {
     cleanup();

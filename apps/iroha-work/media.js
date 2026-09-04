@@ -99,7 +99,11 @@ function readHead(filePath, n = 16) {
  * 同じ operation_id の再送は既存行を返す (冪等)。
  * @returns {ok:true, media, already?} | {ok:false, error, message}
  */
-export function addMedia({ pageId = null, taskId = null, productCode = null, kind, mime, filePath, worker, deviceLabel = null, deviceId = null, operationId }) {
+/**
+ * 受け取ったファイルの検査 (DB を触らない)。トランザクションに入る前にここまで済ませておくと、
+ * SQLite の書き込みロックを持ったままファイルを読まずに済む (この DB は miniPC も開く — Codex PR1 R6)
+ */
+export function inspectMediaUpload({ kind, filePath, operationId }) {
   const opId = String(operationId || '').trim();
   if (!/^[A-Za-z0-9_-]{8,64}$/.test(opId)) return { ok: false, error: 'bad_request', message: 'operation_id が不正です' };
   // 種類の判定は**いちばん先**に (ファイルを見る前・再送の照合より前)。
@@ -115,6 +119,25 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
   if (size > cap) {
     return { ok: false, error: 'too_large', message: `ファイルが大きすぎます (上限 ${Math.round(cap / 1024 / 1024)}MB)` };
   }
+  return { ok: true, opId, size };
+}
+
+/** 一時ファイルを保管場所へ移す。deferMove で呼んだ側が、トランザクションを抜けてから呼ぶ */
+export function moveStoredFile(move) {
+  if (!move) return;
+  fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  fs.renameSync(move.from, move.to);
+}
+
+/** 実体を置けなかった行を消す (行だけ残して「実体のない写真」を作らない — Codex PR1 R6) */
+export function dropMedia(id) {
+  return getDB().prepare('DELETE FROM f_iroha_card_media WHERE id = ?').run(Number(id)).changes;
+}
+
+export function addMedia({ pageId = null, taskId = null, productCode = null, kind, mime, filePath, worker, deviceLabel = null, deviceId = null, operationId, inspected = null, deferMove = false }) {
+  const ins = inspected && inspected.ok ? inspected : inspectMediaUpload({ kind, filePath, operationId });
+  if (!ins.ok) return ins;
+  const { opId, size } = ins;
   if (pageId != null && taskId != null) return { ok: false, error: 'bad_request', message: 'カードの指定が二重です (page_id と task_id の両方)' };
   if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
   const db = getDB();
@@ -140,10 +163,10 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
   if (countActiveMedia({ pageId, taskId }, kind) >= max) {
     return { ok: false, error: 'cap_reached', message: `写真は${max}枚までです。不要な写真を削除してから撮り直してください` };
   }
-  fs.mkdirSync(MEDIA_DIR, { recursive: true });
   const ext = kind === 'photo' ? 'jpg' : 'mp4';
   const localPath = path.join(MEDIA_DIR, `${opId}.${ext}`);
-  fs.renameSync(filePath, localPath);
+  // deferMove のときは移さない。呼び出し側がトランザクションを抜けてから moveStoredFile を呼ぶ
+  if (!deferMove) moveStoredFile({ from: filePath, to: localPath });
   // 削除トークン: アップロードした端末だけに一度だけ返す (worker_id は画面で選べる自己申告なので
   // 「撮った本人」の証明に使わない — Codex PR3 #2)。サーバーはハッシュのみ保存
   const deleteToken = crypto.randomBytes(16).toString('base64url');
@@ -154,7 +177,7 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
       worker.id, worker.display_name, deviceLabel, deviceId == null ? null : Number(deviceId), utcNow(),
       crypto.createHash('sha256').update(deleteToken).digest('hex'));
   const row = db.prepare('SELECT * FROM f_iroha_card_media WHERE id = ?').get(Number(info.lastInsertRowid));
-  return { ok: true, media: publicMedia(row), deleteToken };
+  return { ok: true, media: publicMedia(row), deleteToken, move: deferMove ? { from: filePath, to: localPath } : null };
 }
 
 /** 画面へ出す形 (ローカルパス等の内部情報は出さない) */
