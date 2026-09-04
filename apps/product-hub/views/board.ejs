@@ -26,6 +26,11 @@
   .kb-tag.ne-needs_action { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
   .kb-tag.decision { background: #e0e7ff; color: #3730a3; border-color: #a5b4fc; }
   .kb-tag.setstep { background: #faf5ff; color: #7e22ce; border-color: #ddd6fe; }
+  .kb-tab-n { display:inline-block; min-width:16px; padding:0 4px; border-radius:8px; background:#fecaca; color:#991b1b; font-size:11px; }
+  .ne-table td { vertical-align: top; }
+  .ne-err { margin-top:4px; font-size:11px; color:#991b1b; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ne-late { color:#b91c1c; font-weight:700; }
+  .ne-table .prov { color: #92400e; font-weight: 600; font-size: 11px; }
   .kb-setline { font-size: 10px; color: #64748b; line-height: 1.4; }
   .kb-setline .prov { color: #92400e; font-weight: 600; }
   .kb-parent-changed { font-size: 10px; color: #92400e; background: #fffbeb; border: 1px solid #fcd34d;
@@ -168,6 +173,7 @@
       <a class="kb-tab <%= boardView === 'single' ? 'on' : '' %>" href="<%= boardUrl({ view: 'single' }) %>">単品</a>
       <a class="kb-tab <%= boardView === 'set' ? 'on' : '' %>" href="<%= boardUrl({ view: 'set' }) %>">🧩 セット工程</a>
       <a class="kb-tab <%= boardView === 'image' ? 'on' : '' %>" href="<%= boardUrl({ view: 'image' }) %>">🖼 画像で並べる</a>
+      <a class="kb-tab <%= boardView === 'ne' ? 'on' : '' %>" href="<%= boardUrl({ view: 'ne' }) %>">📮 NE要対応<% if (typeof neRows !== 'undefined' && neRows.length) { %> <span class="kb-tab-n"><%= neRows.length %></span><% } %></a>
     </span>
     <a class="chip <%= !assigneeParam && !unassignedOnly && !checkingOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: '' }) %>">すべて</a>
     <% if (me) { %>
@@ -234,7 +240,67 @@
     };
   %>
 
-  <div class="kb">
+  <%# NE要対応 (2026-09-04 §5.5)。列ではなく**表** — 「NEに依頼したまま止まっているセット」を
+      1画面で見比べるためのもので、カードに散らすと比べられない %>
+  <% if (boardView === 'ne') { %>
+    <div class="card" style="margin-top:10px;">
+      <% if (!neRows.length) { %>
+        <p class="muted" style="margin:0;">NE登録を待っているセット商品はありません。</p>
+      <% } else { %>
+        <p class="muted" style="margin:0 0 8px; font-size:12px;">
+          本コードが確定したセットはこの表から消えます（工程「NE登録」も自動で完了になります）。
+        </p>
+        <table class="list ne-table">
+          <thead>
+            <tr><th style="width:150px;">状態</th><th>セット商品</th><th style="width:200px;">商品コード</th>
+              <th style="width:110px;">依頼から</th><th style="width:210px;">次にやること</th></tr>
+          </thead>
+          <tbody>
+            <% for (const r of neRows) { %>
+              <tr data-ne-draft="<%= r.id %>">
+                <td>
+                  <span class="kb-tag ne-<%= r.state %>"><%= r.stateLabel %></span>
+                  <% if (r.error) { %><div class="ne-err" title="<%= r.error %>">⚠ <%= r.error %></div><% } %>
+                </td>
+                <td>
+                  <a href="/apps/product-hub/detail/<%= r.id %>?back=<%= encodeURIComponent(backParam) %>"><%= r.name %></a>
+                  <div class="muted" style="font-size:11px;">
+                    親: <% if (r.parentId) { %><a href="/apps/product-hub/detail/<%= r.parentId %>"><%= r.parentNeCode %></a><% } else { %>—<% } %>
+                    <% if (r.members) { %>　構成: <%= r.members %><% } %>
+                  </div>
+                </td>
+                <td>
+                  <code style="font-size:11px;"><%= r.neCode %></code>
+                  <% if (r.stillTemporary) { %><span class="prov">(仮)</span>
+                  <% } else { %><div class="muted" style="font-size:11px;">NE取込待ち</div><% } %>
+                </td>
+                <td class="muted" style="font-size:12px;">
+                  <% if (r.waitingDays == null) { %>—
+                  <% } else { %><span class="<%= r.waitingDays >= 3 ? 'ne-late' : '' %>"><%= r.waitingDays %>日</span><% } %>
+                  <% if (r.requestedBy) { %><div style="font-size:11px;"><%= r.requestedBy %></div><% } %>
+                </td>
+                <td>
+                  <div style="font-size:12px;"><%= r.next %></div>
+                  <div style="display:flex; gap:6px; margin-top:4px; flex-wrap:wrap;">
+                    <% if (r.state === 'not_requested' || r.state === 'needs_action') { %>
+                      <button class="btn btn-sm ne-act" data-draft="<%= r.id %>" data-state="requested">
+                        <%= r.state === 'needs_action' ? '再要求' : 'NEに登録を依頼した' %>
+                      </button>
+                    <% } else { %>
+                      <button class="btn btn-sm ne-act" data-draft="<%= r.id %>" data-state="needs_action">登録できなかった</button>
+                    <% } %>
+                    <a class="btn btn-sm" href="/apps/product-hub/detail/<%= r.id %>?back=<%= encodeURIComponent(backParam) %>">本コードを入力</a>
+                  </div>
+                </td>
+              </tr>
+            <% } %>
+          </tbody>
+        </table>
+      <% } %>
+    </div>
+  <% } %>
+
+  <div class="kb"<%= boardView === 'ne' ? ' hidden' : '' %>>
     <% for (const col of board.columns) { %>
       <div class="kb-col <%= col.role_code ? '' : 'system' %>" data-col="<%= col.code || col.key %>">
         <div class="kb-col-head">
@@ -839,6 +905,34 @@
         location.reload();
       } finally {
         sameDraft.forEach(function (o) { o.disabled = false; });
+      }
+    });
+  });
+
+  // ─── NE要対応の表 (2026-09-04 §5.5) ───
+  // 「NEに登録を依頼した」/「登録できなかった (理由)」/「再要求」。
+  // 本コードの入力は詳細画面 (入口を2つ持つと、どちらが正か分からなくなる)
+  document.querySelectorAll('.ne-act').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const id = btn.dataset.draft;
+      const state = btn.dataset.state;
+      let reason = null;
+      if (state === 'needs_action') {
+        reason = prompt('登録できなかった理由を入れてください（例: 商品コードが重複していた）');
+        if (reason == null) return;
+        if (!reason.trim()) { alert('理由を入れてください'); return; }
+      }
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/apps/product-hub/api/drafts/${id}/ne-registration`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ state, reason }),
+        });
+        const j = await res.json();
+        if (j.ok) location.reload();
+        else { alert(j.error || '更新できませんでした'); btn.disabled = false; }
+      } catch (err) {
+        alert('通信に失敗しました'); btn.disabled = false;
       }
     });
   });

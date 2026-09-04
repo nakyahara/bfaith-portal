@@ -39,12 +39,13 @@ import {
   progressOf, setStepState, progressSummaryFor, ensureProgress, ensureProgressForMany, boardData, STEP_STATE_LABELS,
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
   ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
-  moveBoardCard, saveBoardOrder, assertStepOperable, canOperateSetStep,} from './lib/workflow-progress.js';
+  moveBoardCard, saveBoardOrder, assertStepOperable, canOperateSetStep, neRegistrationRows,} from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
 } from './lib/mall-status.js';
 import {
   createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode, closeNeStepIfConfirmed,
+  setNeRegistrationState, ackParentSnapshot,
   recordSetDecision, latestSetDecision, describeSetDecision,
   SET_DECISIONS_CLOSING, SET_DECISION_REASONS, NE_STATE_LABELS,
 } from './services/set-derive.js';
@@ -315,6 +316,8 @@ router.get('/detail/:id', (req, res) => {
     displayName: req.session?.displayName || req.session?.email || '',
     // 「← 戻る」の戻り先。ボードのカードから開いたらそのボードへ戻す (2026-08-28)
     backLink: backLinkOf(req.query),
+    // NE登録の進みの表示名 (2026-09-04)。カードと詳細で同じ言葉を使う
+    NE_STATE_LABELS,
     draft, refs, images, specs, aiOutputs, events, yahoo, imageProduction,
     rakutenItemUrl: rakutenItemPageUrl(draft.ne_code),
     // RMS の商品編集ページ (2026-09-04 中原さん要望)。店舗ID+商品管理番号だけで開ける
@@ -2380,18 +2383,25 @@ router.get('/board', (req, res) => {
   // ビュー (2026-09-04 §5.1)。all は main の別名 (要件定義の呼び名)。
   // 知らない値は全体に倒す — 壊れたブックマークで空の画面を見せない
   const rawView = String(req.query.view || '');
-  const boardView = ['single', 'set', 'image'].includes(rawView) ? rawView : 'main';
+  const boardView = ['single', 'set', 'image', 'ne'].includes(rawView) ? rawView : 'main';
   // 種別の絞り込み (TOP画像 / 商品詳細画像) は 2026-08-31 に廃止 (カードが 1 商品 1 枚になった)。
   // 古いブックマークの ?kind=top をそのまま効かせると、カードも列も空の画面になり、
   // 画面から外す手段も無い (チップを消したため) — 受け取らずに無視する
   const imageKind = null;
+  // NE要対応は列ではなく表 (§5.5)。表示のついでに本コードの取り込みを追いかける
+  // (mirror は毎時なので、画面を開くだけで追いつく。新しい定期実行は作らない)
+  const neRows = boardView === 'ne' ? neRegistrationRows(db, { reconcile: reconcileProvisionalCode }) : [];
   // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
-  const board = boardData(db, { view: boardView, assigneeId, unassignedOnly, checkingOnly, imageKind, mallSummary: mallSummaryFor });
+  const board = boardView === 'ne'
+    ? { view: 'ne', columns: [], doneCards: [], doneTotal: 0, total: neRows.length, truncated: false, checkingTotal: 0 }
+    : boardData(db, { view: boardView, assigneeId, unassignedOnly, checkingOnly, imageKind,
+      mallSummary: mallSummaryFor, reconcileSet: reconcileProvisionalCode });
   res.render(view('board.ejs'), {
     title: '工程ボード',
     displayName: req.session?.displayName || req.session?.email || '',
     board,
     boardView,
+    neRows,
     staff: listStaff(),
     me,
     assigneeId,
@@ -2686,6 +2696,49 @@ router.post('/api/drafts/:id/set-drafts', (req, res) => {
   } catch (e) { workflowError(res, e); }
 });
 
+/**
+ * セットの操作権限 (2026-09-04 §4.3/§5.3)。
+ * 「NE登録まわり」は現工程の担当者・セット企画者・admin ができる。
+ * 本コードの差し替え (/set-code) と同じ物差しにしておかないと、
+ * 「依頼済みにはできるが本コードは入れられない」のような食い違いが出る。
+ */
+function canOperateSetDraft(db, req, draft) {
+  if (req.session?.role === 'admin') return true;
+  const me = staffByPortalEmail(req.session?.email);
+  const cur = progressOf(draft.id, { db }).current;
+  if (cur && cur.assignee_id != null && cur.assignee_id === (me?.id ?? null)) return true;
+  return draft.parent_draft_id != null && canOperateSetStep(db, me?.id ?? null);
+}
+
+// NE登録の進み (§4.3)。工程 set_ne_register とは別に「いつ依頼して、どこで止まっているか」を持つ。
+// 「本コード確定」はここでは受けない — provisional_code=0 が唯一の真で、確定は /set-code か
+// reconcileProvisionalCode が行う (状態を2箇所に持たない)
+router.post('/api/drafts/:id/ne-registration', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  if (!canOperateSetDraft(db, req, draft)) {
+    return res.status(403).json({ ok: false, error: 'NE登録の操作は、いまの工程の担当者かセット企画者、管理者だけができます' });
+  }
+  try {
+    const r = setNeRegistrationState(db, draft.id, req.body || {}, actorOf(req));
+    res.json({ ok: true, state: r.state, reason: r.reason });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 「親の更新を確認した」(§4.5)。自動追随はしないので、人が見たことだけを覚える
+router.post('/api/drafts/:id/parent-snapshot-ack', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  if (!canOperateSetDraft(db, req, draft)) {
+    return res.status(403).json({ ok: false, error: 'この操作は、いまの工程の担当者かセット企画者、管理者だけができます' });
+  }
+  const ok = ackParentSnapshot(db, draft.id, actorOf(req));
+  if (!ok) return res.status(400).json({ ok: false, error: 'セット商品ではありません' });
+  res.json({ ok: true });
+});
+
 // 仮コード (SET-xxx-01) を NE 登録後の本コードへ差し替える。
 // これをやらないと buildItemPayload が出品を止める (manage_number は後から変えられないため)
 router.post('/api/drafts/:id/set-code', (req, res) => {
@@ -2697,16 +2750,11 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
   }
   // 出品先を決める不可逆な操作なので、担当者本人か admin だけに許す (Codex R1 high)。
   // セット企画者はセットの NE登録工程を動かせる (§4.1) ので、本コードの入力もできないと
-  // 「工程は進められるが肝心の差し替えだけ 403」になる (Codex R2 high)
+  // 「工程は進められるが肝心の差し替えだけ 403」になる (Codex R2 high)。
+  // 判定は NE登録まわりの他の操作と同じヘルパを使う (物差しを2つ持たない)
   const isAdmin = req.session?.role === 'admin';
-  if (!isAdmin) {
-    const me = staffByPortalEmail(req.session?.email);
-    const cur = progressOf(draft.id, { db }).current;
-    const isOwner = cur && cur.assignee_id != null && cur.assignee_id === (me?.id ?? null);
-    const isSetPlanner = draft.parent_draft_id != null && canOperateSetStep(db, me?.id ?? null);
-    if (!isOwner && !isSetPlanner) {
-      return res.status(403).json({ ok: false, error: '商品コードの差し替えは、いまの工程の担当者か管理者だけができます' });
-    }
+  if (!canOperateSetDraft(db, req, draft)) {
+    return res.status(403).json({ ok: false, error: '商品コードの差し替えは、いまの工程の担当者か管理者だけができます' });
   }
   const code = cleanText(req.body?.ne_code, 100);
   if (!code) return res.status(400).json({ ok: false, error: '商品コードを入力してください' });
@@ -2737,6 +2785,16 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
     `).run(code, inNe ? 0 : 1, draft.id, draft.ne_code);
     if (info.changes !== 1) return false;
     logEvent(db, draft.id, 'set_code_fixed', `${draft.ne_code} → ${code}${inNe ? '' : ' (NE商品マスタに未確認)'}`, actorOf(req));
+    // NE に未確認のまま入れた = 「登録は依頼した (反映待ち)」。要対応で止まっていたなら解除する。
+    // ここを書かないと、本コードを入れたのにカードが「未要求」「要対応」のまま残る (§4.3 の遷移図)
+    if (!inNe) {
+      db.prepare(`
+        UPDATE product_drafts SET ne_registration_state = 'requested', ne_registration_error = NULL,
+          ne_registration_requested_at = COALESCE(ne_registration_requested_at, ?),
+          ne_registration_requested_by = COALESCE(ne_registration_requested_by, ?)
+        WHERE id = ?
+      `).run(new Date().toISOString(), actorOf(req), draft.id);
+    }
     // 本コードが確定したら「NE登録」工程はここで閉じる (人が押せない工程なので、
     // 閉じないとカードが NE登録の列に残り続ける)
     if (inNe) closeNeStepIfConfirmed(db, draft.id, actorOf(req));

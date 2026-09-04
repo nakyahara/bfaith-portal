@@ -293,16 +293,92 @@ export function setDraftsOf(db, parentDraftId) {
 /** このセットの構成と親 (セット側の画面に出す) */
 export function setInfoOf(db, draftId) {
   const id = Number(draftId);
-  const row = db.prepare('SELECT parent_draft_id, provisional_code FROM product_drafts WHERE id = ?').get(id);
+  const row = db.prepare(`
+    SELECT parent_draft_id, provisional_code, ne_registration_state, ne_registration_error,
+           ne_registration_requested_at, ne_registration_requested_by, parent_snapshot_at, price
+    FROM product_drafts WHERE id = ?
+  `).get(id);
   if (!row?.parent_draft_id) return null;
-  const parent = db.prepare('SELECT id, ne_code, name FROM product_drafts WHERE id = ?').get(row.parent_draft_id);
+  const parent = db.prepare(
+    'SELECT id, ne_code, name, price, updated_at FROM product_drafts WHERE id = ?').get(row.parent_draft_id);
+  const members = db.prepare(
+    'SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort').all(id);
   return {
     parent: parent || null,
     provisional: row.provisional_code === 1,
-    members: db.prepare(
-      'SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort'
-    ).all(id),
+    members,
+    // 「本コード確定」は列に持たない。provisional_code=0 が唯一の真で、表示はそこから導出する (§4.3)
+    neState: row.provisional_code === 1 ? (row.ne_registration_state || 'not_requested') : 'confirmed',
+    neError: row.ne_registration_error || null,
+    neRequestedAt: row.ne_registration_requested_at || null,
+    neRequestedBy: row.ne_registration_requested_by || null,
+    // 親が派生後に変わったか (自動追随はしない。人に知らせるだけ — §4.5)
+    parentChanged: !!(parent?.updated_at && row.parent_snapshot_at && parent.updated_at > row.parent_snapshot_at),
+    // 売価の初期値がどこから来たか (§5.3)。単品×個数で入れているので、その式を1行で見せる
+    priceOrigin: (parent?.price != null && members.length === 1 && members[0].member_ne_code === parent.ne_code)
+      ? { unit: parent.price, qty: members[0].qty, total: parent.price * members[0].qty }
+      : null,
   };
+}
+
+// ─── NE登録の進み (2026-09-04 要件定義 §4.3) ──────────────────────────────
+//
+// 工程 (set_ne_register) とは別に、「NE にいつ依頼して、どこで止まっているか」を状態で持つ。
+// 🚨「本コード確定」はここに持たない — provisional_code=0 が唯一の真 (§4.3)。
+
+/** 人が動かせる遷移先。processing は将来の API 化用 (人は押さない) */
+export const NE_STATES_MANUAL = ['requested', 'needs_action'];
+
+/**
+ * NE登録の進みを1つ動かす (§4.3)。
+ * - `requested`: 「NEに登録を依頼した」。依頼した日時と人を残す (滞留警告は工程の stall_days が見る)
+ * - `needs_action`: 「登録できなかった」。**理由は必須** — 理由の無い要対応は誰も動かせない
+ * 本コードが確定済み (provisional_code=0) の商品はもう動かさない。
+ */
+export function setNeRegistrationState(db, draftId, input, actor) {
+  const id = Number(draftId);
+  const state = String(input?.state || '').trim();
+  if (!NE_STATES_MANUAL.includes(state)) throw badRequest('NE登録の状態指定が不正です');
+  const d = db.prepare(
+    'SELECT parent_draft_id, provisional_code, ne_code, ne_registration_state FROM product_drafts WHERE id = ?').get(id);
+  if (!d) throw badRequest('商品が見つかりません');
+  if (d.parent_draft_id == null) throw badRequest('セット商品ではありません');
+  if (d.provisional_code !== 1) throw badRequest('この商品は本コードが確定しています');
+  const reason = state === 'needs_action' ? String(input?.reason || '').trim().slice(0, 500) : null;
+  if (state === 'needs_action' && !reason) throw badRequest('登録できなかった理由を入れてください');
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    db.prepare(`
+      UPDATE product_drafts
+      SET ne_registration_state = ?,
+          ne_registration_error = ?,
+          ne_registration_requested_at = CASE WHEN ? = 'requested' THEN ? ELSE ne_registration_requested_at END,
+          ne_registration_requested_by = CASE WHEN ? = 'requested' THEN ? ELSE ne_registration_requested_by END,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?
+    `).run(state, reason, state, now, state, actor || null, id);
+    logEvent(db, id, 'ne_registration_state',
+      state === 'requested'
+        ? `NE登録: 依頼済みにしました (${d.ne_code})`
+        : `NE登録: 要対応にしました — ${reason}`,
+      actor);
+  })();
+  return { state, reason };
+}
+
+/**
+ * 「親の更新を確認した」(§4.5)。親の更新時刻を今の値で覚え直すだけ — 自動追随はしない。
+ * @returns 覚え直したか (セットでない・親がいないなら false)
+ */
+export function ackParentSnapshot(db, draftId, actor) {
+  const id = Number(draftId);
+  const d = db.prepare('SELECT parent_draft_id FROM product_drafts WHERE id = ?').get(id);
+  if (!d?.parent_draft_id) return false;
+  const parent = db.prepare('SELECT updated_at FROM product_drafts WHERE id = ?').get(d.parent_draft_id);
+  if (!parent) return false;
+  db.prepare('UPDATE product_drafts SET parent_snapshot_at = ? WHERE id = ?').run(parent.updated_at, id);
+  logEvent(db, id, 'parent_snapshot_ack', '親の更新を確認しました', actor);
+  return true;
 }
 
 // ─── 「セット展開判断」の記録 (2026-09-04 要件定義 §4.2) ────────────────────

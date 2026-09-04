@@ -84,6 +84,13 @@ th.attr-unknown { color: #dc2626; }
   .sku-profit { font-size: 14px; font-weight: 700; color: #0f172a; white-space: nowrap; }
   .sku-profit.neg { color: #dc2626; }
   .sku-profit.none { font-size: 12px; font-weight: 400; color: #94a3b8; }
+  /* NE登録の進み (2026-09-04 §5.3)。工程とは別に「どこで止まっているか」を1行で見せる */
+  .ne-stepper { display:flex; align-items:center; gap:4px; flex-wrap:wrap; font-size:11px; }
+  .ne-step { padding:2px 8px; border-radius:10px; border:1px solid #e2e8f0; background:#f8fafc; color:#64748b; }
+  .ne-step.on { background:#fef3c7; color:#92400e; border-color:#fcd34d; font-weight:700; }
+  .ne-step.on.ok { background:#dcfce7; color:#166534; border-color:#86efac; }
+  .ne-step.on.bad { background:#fee2e2; color:#991b1b; border-color:#fca5a5; }
+  .ne-arrow { color:#cbd5e1; }
 </style>
 <div class="wrap wide">
 
@@ -517,6 +524,49 @@ th.attr-unknown { color: #dc2626; }
             <span class="muted">（構成: <%= setInfo.members.map((m) => `${m.member_ne_code}×${m.qty}`).join(' ＋ ') %>）</span>
           <% } %>
         </div>
+        <%# 売価の由来 (§5.3)。単品×個数を初期値に入れているので、その式を1行で見せる %>
+        <% if (setInfo.priceOrigin) { %>
+          <div class="muted" style="margin-top:6px; font-size:12px;">
+            売価は「単品 <%= setInfo.priceOrigin.unit.toLocaleString() %>円 × <%= setInfo.priceOrigin.qty %>個
+            = <%= setInfo.priceOrigin.total.toLocaleString() %>円」を初期値として入れています（送料・値引きは含みません）。
+          </div>
+        <% } %>
+        <%# 親が派生後に変わった (§4.5)。自動追随はしない — 見て判断してもらう %>
+        <% if (setInfo.parentChanged) { %>
+          <div style="margin-top:8px; padding:6px 8px; background:#fff; border:1px solid #fbbf24; border-radius:6px; font-size:12px;">
+            🔔 派生したあとに親商品が更新されています。
+            <% if (setInfo.parent) { %>
+              <a href="/apps/product-hub/detail/<%= setInfo.parent.id %>">親を見る</a>
+            <% } %>
+            （セットには自動で反映しません）
+            <button class="btn btn-sm" id="parent-ack-btn" style="margin-left:6px;">確認した</button>
+            <span class="muted" id="parent-ack-result"></span>
+          </div>
+        <% } %>
+
+        <%# NE登録の進み (§5.3)。工程「NE登録」とは別に、どこで止まっているかを出す。
+            「本コード確定」は provisional_code から導出した値 (列には持たない) %>
+        <div class="ne-stepper" style="margin-top:10px;">
+          <% for (const st of ['not_requested', 'requested', 'processing', 'confirmed']) { %>
+            <span class="ne-step <%= setInfo.neState === st ? 'on' : '' %><%= st === 'confirmed' && setInfo.neState === 'confirmed' ? ' ok' : '' %>">
+              <%= (NE_STATE_LABELS[st] || st).replace('NE: ', '') %>
+            </span>
+            <% if (st !== 'confirmed') { %><span class="ne-arrow">→</span><% } %>
+          <% } %>
+          <% if (setInfo.neState === 'needs_action') { %>
+            <span class="ne-step on bad"><%= (NE_STATE_LABELS.needs_action || '').replace('NE: ', '') %></span>
+          <% } %>
+        </div>
+        <% if (setInfo.neState === 'needs_action' && setInfo.neError) { %>
+          <div style="margin-top:6px; font-size:12px; color:#991b1b;">⚠ <%= setInfo.neError %></div>
+        <% } %>
+        <% if (setInfo.neRequestedAt) { %>
+          <div class="muted" style="margin-top:4px; font-size:11px;">
+            依頼: <%= setInfo.neRequestedAt.slice(0, 16).replace('T', ' ') %>
+            <%= setInfo.neRequestedBy ? ` / ${setInfo.neRequestedBy}` : '' %>
+          </div>
+        <% } %>
+
         <% if (setInfo.provisional) { %>
           <% const stillTemp = /^SET-/i.test(String(draft.ne_code || '')); %>
           <div style="margin-top:8px; font-size:13px; color:#b45309;">
@@ -528,9 +578,17 @@ th.attr-unknown { color: #dc2626; }
               <strong>取り込まれるとこの画面を開いたときに自動で解除されます。</strong>それまで楽天には出品できません。
             <% } %>
           </div>
-          <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
+          <div style="display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap;">
             <input type="text" id="set-code-input" placeholder="ネクストエンジンの商品コード" style="max-width:280px;" maxlength="100">
             <button class="btn btn-primary btn-sm" id="set-code-btn">本コードに差し替える</button>
+            <%# 進みを動かす操作 (§4.3)。押せるのは工程の担当者・セット企画者・管理者 %>
+            <% if (setInfo.neState === 'not_requested') { %>
+              <button class="btn btn-sm ne-state-btn" data-state="requested">NEに登録を依頼した</button>
+            <% } else if (setInfo.neState === 'needs_action') { %>
+              <button class="btn btn-sm ne-state-btn" data-state="requested">再要求する</button>
+            <% } else { %>
+              <button class="btn btn-sm ne-state-btn" data-state="needs_action">登録できなかった</button>
+            <% } %>
             <span class="muted" id="set-code-result"></span>
           </div>
         <% } %>
@@ -722,6 +780,15 @@ th.attr-unknown { color: #dc2626; }
           </select>
           <% if (!rakuten?.shipping_method_group && neShipping.group) { %>
             <div class="muted" style="font-size:11px;">NEの配送方法「<%= neCost?.shippingMethod %>」から自動選択 (保存で確定)</div>
+          <% } %>
+          <%# セットは配送方法をコピーしていない (§5.3)。個数で箱もサイズも変わるため。
+              NE に本コードが載れば、単品と同じ「NEから自動選択」に乗る %>
+          <% if (setInfo && !rakuten?.shipping_method_group && !neShipping.group) { %>
+            <div style="font-size:11px; color:#b45309;">
+              NE確定待ち — 親の配送方法は<%= setInfo.parent ? `「${setInfo.parent.name}」の` : '' %>ものですが、
+              個数で箱もサイズも変わるためコピーしていません。ネクストエンジンに本コードが載ると自動で選ばれます
+              （それまでは手で選んでも構いません）。
+            </div>
           <% } %>
           <%# 2026-09-04: 利益の配送費を「配送方法で試算」から選べるようにしたので、
               「変えても計算は変わりません」ではなくなった (候補が上に集まる) %>
@@ -4839,6 +4906,43 @@ th.attr-unknown { color: #dc2626; }
           alert('通信エラー: ' + e.message);
           setCodeBtn.disabled = false;
         }
+      });
+    }
+
+    // NE登録の進み (§4.3)。「依頼した」「登録できなかった (理由)」「再要求」
+    document.querySelectorAll('.ne-state-btn').forEach(function (btn) {
+      btn.addEventListener('click', async function () {
+        const state = btn.dataset.state;
+        let reason = null;
+        if (state === 'needs_action') {
+          reason = prompt('登録できなかった理由を入れてください（例: 商品コードが重複していた）');
+          if (reason === null) return;
+          if (!reason.trim()) { alert('理由を入れてください'); return; }
+        }
+        btn.disabled = true;
+        try {
+          const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/ne-registration', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ state: state, reason: reason }),
+          });
+          const j = await res.json();
+          if (j.ok) location.reload();
+          else { alert(j.error || '更新できませんでした'); btn.disabled = false; }
+        } catch (e) { alert('通信エラー: ' + e.message); btn.disabled = false; }
+      });
+    });
+
+    // 親の更新を確認した (§4.5)。覚え直すだけ — セットには自動で反映しない
+    const parentAck = document.getElementById('parent-ack-btn');
+    if (parentAck) {
+      parentAck.addEventListener('click', async function () {
+        parentAck.disabled = true;
+        try {
+          const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/parent-snapshot-ack', { method: 'POST' });
+          const j = await res.json();
+          if (j.ok) location.reload();
+          else { alert(j.error || '更新できませんでした'); parentAck.disabled = false; }
+        } catch (e) { alert('通信エラー: ' + e.message); parentAck.disabled = false; }
       });
     }
   })();
