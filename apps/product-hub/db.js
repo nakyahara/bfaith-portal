@@ -218,12 +218,34 @@ export const STEP_SEEDS = [
     description: '出品してよいかの承認ゲート',
   },
   {
-    code: 'set_review', label: 'セット商品作成検討', track: 'main', role_code: 'set_planner', sort: 50,
-    description: 'セットを作るか判断する。作る場合も派生ドラフトを別に立てるので単品の出品は止めない',
+    code: 'set_review', label: 'セット展開判断', track: 'main', role_code: 'set_planner', sort: 50,
+    description: 'セットを作るか判断し、結果 (作成 / 既存あり / 作らない / 保留) を記録する。作る場合も派生ドラフトを別に立てるので単品の出品は止めない',
   },
   {
     code: 'listing', label: '出品・展開', track: 'main', role_code: null, sort: 60,
     description: '楽天 / Yahoo / auPAY / メルカリ / Qoo10 をモールごとに進める (担当はモール別に持つ)',
+  },
+  // ─── セット商品の工程 (2026-09-04 要件定義 §4.1) ───
+  // セットは単品の①基本情報②AI待ちが実質不要で、代わりに単品には無い「NE登録」の待ちがある。
+  // 同じ6列に押し込むと列の意味が壊れるので、セット専用のテンプレートを持つ。
+  // 🚨 最後の「出品・展開」(listing) は**単品と同じ工程コードを共用**する —
+  //    モール別状態・出品ゲート・ボードからの楽天出品が全部 listing に紐づいているため、
+  //    別コードにすると全部二重になる
+  {
+    code: 'set_compose', label: '構成決定', track: 'set', role_code: 'set_planner', sort: 10,
+    description: '何を何個入れるか・バリエーションごとの組み合わせを決める',
+  },
+  {
+    code: 'set_ne_register', label: 'NE登録', track: 'set', role_code: 'registrar', sort: 20, stall_days: 3,
+    description: 'ネクストエンジンにセット商品を登録し、仮コードを本コードへ差し替える。本コードが NE で確認できたら自動で完了になる',
+  },
+  {
+    code: 'set_content', label: '商品情報作成・確認', track: 'set', role_code: 'registrar', sort: 30,
+    description: '売価・説明文・タイトル・配送方法をセット用に整える',
+  },
+  {
+    code: 'set_prep', label: '出品準備', track: 'set', role_code: 'approver', sort: 40,
+    description: '出品してよいかの承認ゲート (単品のタイトル確認にあたる)',
   },
   // 画像トラックは TOP画像 (サムネイル) と商品詳細画像で**別々に**進む (2026-08-24 中原さん:
   // 依頼・制作・承認のタイミングも担当も分かれる。単純な仕入れ商品は詳細画像を作らないこともある)。
@@ -839,9 +861,10 @@ export function initProductHubDB() {
     CREATE TABLE IF NOT EXISTS ph_steps (
       code        TEXT PRIMARY KEY,                  -- basic_info / ai_generate / …
       label       TEXT NOT NULL,
-      -- main = かんばん上段 (直列に進む本流) / image = 画像トラック (基本情報の後から並行で走る)。
+      -- main = かんばん上段 (単品の本流) / image = 画像トラック (基本情報の後から並行で走る) /
+      -- set = セット商品の本流 (2026-09-04)。単品とセットは工程の中身が違うので別テンプレートにしている。
       -- 画像を本流に混ぜると外注のリードタイム分だけ全体が延びるため分けている (中原さん合意 2026-08-23)
-      track       TEXT NOT NULL DEFAULT 'main' CHECK (track IN ('main', 'image')),
+      track       TEXT NOT NULL DEFAULT 'main' CHECK (track IN ('main', 'image', 'set')),
       -- 画像トラックの種別 (2026-08-24 中原さん: TOP画像と商品詳細画像は別々に進む)。
       -- 工程を kind ごとに複製する方式 — 進捗テーブルの PK・権限・楽観ロックが「1工程=1行」のまま使える
       image_kind  TEXT CHECK (image_kind IN ('top', 'detail')),
@@ -946,7 +969,7 @@ export function initProductHubDB() {
     -- kind は画像ビューの種別 (top/detail)。本流ビューは '' (空文字) を使う。
     -- 現場の目安情報なのでロックも版数も持たない (最後に置いた人の並びが正)。
     CREATE TABLE IF NOT EXISTS ph_board_order (
-      view       TEXT NOT NULL,                   -- main / image
+      view       TEXT NOT NULL,                   -- main (全体・単品ビュー共通) / image / set
       draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
       kind       TEXT NOT NULL DEFAULT '',        -- image ビューのみ top / detail
       col        TEXT NOT NULL,                   -- 置いた列 (工程コード / 画像ステージ / done)
@@ -1418,6 +1441,7 @@ export function initProductHubDB() {
   `);
   // 属性 (skippable / listing_gate) は管理画面で変えられないので、既存行も seed の値に揃える (列追加の後追いを含む)
   const stepAttr = db.prepare('UPDATE ph_steps SET skippable = ?, listing_gate = ? WHERE code = ? AND (skippable != ? OR listing_gate != ?)');
+  migrateStepTrackSet(db);   // seed より前 (CHECK が古いと下の INSERT が無音で落ちる)
   db.transaction(() => {
     for (const r of ROLE_SEEDS) roleSeed.run(r.code, r.label, r.sort);
     for (const s of STEP_SEEDS) {
@@ -1433,9 +1457,18 @@ export function initProductHubDB() {
     }
     migrateImageKindSplit(db);
     migrateDetailTrackV2(db);
+    migrateSetDraftsToSetTrack(db);
     retireTopImageSteps(db);
     syncOwnBrandImagePriority(db);
   })();
+  // seed の取りこぼしを無音にしない。`INSERT OR IGNORE` は重複だけでなく **CHECK 制約違反も
+  // 「無視」する** ので、track に新しい値を足した日に既存 DB では1件も入らず、
+  // 画面だけ動いて工程が空になる (2026-09-04 に実際に踏んだ)。起動時に落として気づけるようにする
+  const hasStep = db.prepare('SELECT 1 FROM ph_steps WHERE code = ?');
+  const missingSeeds = STEP_SEEDS.map((s) => s.code).filter((code) => !hasStep.get(code));
+  if (missingSeeds.length > 0) {
+    throw new Error(`[product-hub] 工程 seed が投入されませんでした: ${missingSeeds.join(', ')}`);
+  }
 
   initialized = true;
   return db;
@@ -1457,6 +1490,139 @@ export function syncOwnBrandImagePriority(db) {
   db.prepare(`
     UPDATE product_drafts SET image_priority = ? WHERE image_priority IS NULL AND own_brand = 1
   `).run(OWN_BRAND_IMAGE_PRIORITY);
+}
+
+/**
+ * 既存セットの進捗を、単品の本流工程から**セット工程**へ写す (2026-09-04 §4.1、冪等)。
+ *
+ * セット工程は後から足したので、#890 以降に作られたセットは単品と同じ本流工程 (基本情報入力…) を
+ * 持っている。**捨てずに写す**:
+ *   `basic_info` + `ai_generate` → `set_compose` / `desc_review` → `set_content` /
+ *   `title_approve` → `set_prep` / `set_review` → 無視 (セット自身にセット展開判断は要らない) /
+ *   `listing` → そのまま (単品と共用の工程なので触らない)
+ *
+ * `set_ne_register` は旧に対応する工程が無い。**その先の工程が1つでも決着していれば NE 登録は
+ * 済んでいる**とみなして done にする (仮コードのままでは商品説明も出品も進められないため)。
+ * `provisional_code` は既定 0 の列なので、既存行では「本コード」の根拠にならない (Codex 級の罠)。
+ *
+ * 写した後の main 行は消す。残すと本流に単品の列とセットの列が二重に並ぶ (`progressOf` は
+ * main と set の両方を本流として読む)。何をどう写したかは `draft_events` の `set_steps_migrated`。
+ */
+export function migrateSetDraftsToSetTrack(db) {
+  // 判定は「旧行が残っているか」だけ (Codex R1 medium)。移行済みイベントの有無で決めると、
+  // 一度移行したあとに旧コードが動いて main 行が再生成された場合、二度と直らない。
+  // main と set が混ざった商品は本流の列が二重になり、カードが列から消える。
+  // listing は共用なので「旧行あり」の根拠から外す
+  const targets = db.prepare(`
+    SELECT d.id FROM product_drafts d
+    WHERE d.parent_draft_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code
+        WHERE p.draft_id = d.id AND s.track = 'main' AND p.step_code != 'listing')
+  `).all().map((r) => r.id);
+  if (targets.length === 0) return 0;
+
+  const oldRows = db.prepare(
+    'SELECT step_code, state, assignee_id, due_date, started_at, done_at, done_by, note'
+    + ' FROM draft_step_progress WHERE draft_id = ?');
+  // 移行先が既にある (先行デプロイ・自己修復で todo だけ作られた) ときは、
+  // **決着している方を採る** (Codex R1 medium)。DO NOTHING にすると、旧行の done を写さないまま
+  // 下の DELETE で旧行が消え、進んでいた商品が未着手に巻き戻る
+  const ins = db.prepare(`
+    INSERT INTO draft_step_progress
+      (draft_id, step_code, state, assignee_id, due_date, started_at, done_at, done_by, note)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(draft_id, step_code) DO UPDATE SET
+      state      = CASE WHEN draft_step_progress.state = 'todo' THEN excluded.state ELSE draft_step_progress.state END,
+      assignee_id = COALESCE(draft_step_progress.assignee_id, excluded.assignee_id),
+      due_date   = COALESCE(draft_step_progress.due_date, excluded.due_date),
+      started_at = COALESCE(draft_step_progress.started_at, excluded.started_at),
+      done_at    = CASE WHEN draft_step_progress.state = 'todo' THEN excluded.done_at ELSE draft_step_progress.done_at END,
+      done_by    = CASE WHEN draft_step_progress.state = 'todo' THEN excluded.done_by ELSE draft_step_progress.done_by END,
+      note       = COALESCE(draft_step_progress.note, excluded.note),
+      version    = draft_step_progress.version + 1
+  `);
+  // 旧行の掃除。listing はセットも使い続けるので必ず残す
+  const delOld = db.prepare(`
+    DELETE FROM draft_step_progress
+    WHERE draft_id = ? AND step_code != 'listing'
+      AND step_code IN (SELECT code FROM ph_steps WHERE track = 'main')
+  `);
+  const settled = (st) => st === 'done' || st === 'skip';
+  let migrated = 0;
+  for (const id of targets) {
+    const old = Object.fromEntries(oldRows.all(id).map((r) => [r.step_code, r]));
+    // 合成 (set_compose) は「全部決着で done / 1つでも着手で doing」。
+    // 1対1 の写しは state をそのまま持ち越す (skip の「対象外」も意味を変えずに残す)
+    const compose = ['basic_info', 'ai_generate'].map((c) => old[c]?.state).filter(Boolean);
+    const composeState = compose.length === 0 ? 'todo'
+      : compose.every(settled) ? 'done'
+        : compose.includes('doing') ? 'doing' : 'todo';
+    // NE登録: その先が決着していれば済んでいる (仮コードのままでは先へ進めないため)
+    const neDone = ['desc_review', 'title_approve', 'listing'].some((c) => settled(old[c]?.state));
+    const plan = [
+      { to: 'set_compose', state: composeState, src: old.basic_info || old.ai_generate || null },
+      { to: 'set_ne_register', state: neDone ? 'done' : 'todo', src: null },
+      { to: 'set_content', state: old.desc_review?.state || 'todo', src: old.desc_review || null },
+      { to: 'set_prep', state: old.title_approve?.state || 'todo', src: old.title_approve || null },
+    ];
+    const now = new Date().toISOString();
+    for (const q of plan) {
+      const done = settled(q.state);
+      ins.run(
+        id, q.to, q.state, q.src?.assignee_id ?? null, q.src?.due_date ?? null, q.src?.started_at ?? null,
+        done ? (q.src?.done_at ?? now) : null,
+        done ? (q.src?.done_by ?? 'migration_set') : null,
+        q.src?.note ?? null,
+      );
+    }
+    const oldDesc = Object.entries(old).map(([c, r]) => `${c}=${r.state}`).join(' ') || '(旧行なし)';
+    delOld.run(id);
+    logEvent(db, id, 'set_steps_migrated',
+      `本流工程 → セット工程へ移行 (${plan.map((q) => `${q.to}=${q.state}`).join(' ')}) / 旧: ${oldDesc}`,
+      'migration_set');
+    migrated += 1;
+  }
+  return migrated;
+}
+
+/**
+ * ph_steps.track に 'set' を許す (2026-09-04 セット商品工程)。
+ *
+ * CHECK 制約は ALTER では変えられず、テーブル定義は `CREATE TABLE IF NOT EXISTS` なので
+ * **既存 DB では永久に古い CHECK のまま**。作り直す以外に手がない。冪等 (制約を見て判断)。
+ */
+function migrateStepTrackSet(db) {
+  const cur = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='ph_steps'").get()?.sql || '';
+  const check = /CHECK\s*\(\s*track\s+IN\s*\(([^)]*)\)\s*\)/i.exec(cur);
+  if (!check || /'set'/.test(check[1])) return;   // 制約が無い / もう 'set' を許している
+  // 作り直しの間だけ FK を切る (draft_step_progress.step_code が ph_steps を参照している)。
+  // 元が ON だったときだけ戻す — 呼び出し側が意図的に切っている場合を勝手に ON にしない
+  const fkWasOn = db.pragma('foreign_keys', { simple: true }) === 1;
+  if (fkWasOn) db.pragma('foreign_keys = OFF');
+  try {
+    // index は DROP TABLE で道連れになるので、SQL を退避して作り直す (数を数え上げずに済む)
+    const indexes = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='ph_steps' AND sql IS NOT NULL",
+    ).all().map((r) => r.sql);
+    // 列は PRAGMA から取る。skippable / listing_gate のように後から ALTER で足した列があり、
+    // 定義の並び順は DB によって違う (列名を明示しないと中身がズレて入る)
+    const cols = db.pragma('table_info(ph_steps)').map((c) => `"${c.name}"`).join(', ');
+    db.transaction(() => {
+      db.exec(cur.replace('ph_steps', 'ph_steps_new')
+        .replace(check[0], "CHECK (track IN ('main', 'image', 'set'))"));
+      db.exec(`INSERT INTO ph_steps_new (${cols}) SELECT ${cols} FROM ph_steps`);
+      db.exec('DROP TABLE ph_steps');
+      db.exec('ALTER TABLE ph_steps_new RENAME TO ph_steps');
+      for (const sql of indexes) db.exec(sql);
+    })();
+    const violations = db.pragma('foreign_key_check(draft_step_progress)');
+    if (violations.length > 0) {
+      console.warn(`[product-hub] ph_steps 作り直し後に FK 違反 ${violations.length} 件`);
+    }
+  } finally {
+    if (fkWasOn) db.pragma('foreign_keys = ON');
+  }
 }
 
 /**

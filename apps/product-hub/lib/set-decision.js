@@ -7,6 +7,13 @@
  * 依存を持たない純粋なモジュールにしておく。
  */
 
+/**
+ * セット側の「NE登録」工程のコード。
+ * 本コードが確定したら**自動で done**、人は押せない (§4.1)。工程を閉じる側 (workflow-progress) と
+ * 確定を検知する側 (services/set-derive) の両方が使うので、語彙はここが正本
+ */
+export const SET_NE_STEP_CODE = 'set_ne_register';
+
 /** ⑤を閉じられる判断 (hold は「保留」なので閉じない) */
 export const SET_DECISIONS_CLOSING = ['create', 'existing', 'none'];
 export const SET_DECISIONS = [...SET_DECISIONS_CLOSING, 'hold'];

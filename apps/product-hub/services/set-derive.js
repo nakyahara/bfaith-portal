@@ -12,6 +12,7 @@
  */
 import { getDB, logEvent } from '../db.js';
 import { ensureProgress, setStepState } from '../lib/workflow-progress.js';
+import { SET_NE_STEP_CODE } from '../lib/set-decision.js';
 import { resolveVariationGroup } from '../lib/variation.js';
 // 判断の語彙・理由・表示名は lib 側が正 (カードを組み立てる workflow-progress.js も同じものを使う)
 import {
@@ -189,25 +190,18 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
       SELECT ?, shop_category_id, slot FROM draft_shop_categories WHERE draft_id = ?
     `).run(setId, parentId);
 
-    // 工程を作り、開始位置をモードで決める。
-    //   ai   … 基本情報だけ済み → AI がセット用のタイトル・説明文を書く
-    //   copy … AI 工程も飛ばして人がすぐ直す
+    // 工程を作る。セットは**セット専用のテンプレート** (構成決定 → NE登録 → 商品情報作成・確認 →
+    // 出品準備 → 出品・展開) を持つので、単品の「基本情報入力」「AI情報入力待ち」は無い。
+    // どちらのモードでも「構成決定」から始まり、モードの違いは**説明文の初期値**だけ
+    // (2026-09-04 要件定義 §4.1/§5.6):
+    //   ai   … 説明文を持たせず、AI にセット用へ書かせる
+    //   copy … 単品の説明文を引き継いで、人がセット用に直す
     ensureProgress(db, setId);
-    const done = (code) => db.prepare(`
-      UPDATE draft_step_progress SET state = 'done', done_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-        done_by = ?, version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE draft_id = ? AND step_code = ? AND state != 'done'
-    `).run(actor || 'system', setId, code);
     if (mode === 'copy') {
-      // 説明文を引き継いでから「商品説明確認」に置く (人が直す前提)
       db.prepare(`
         INSERT INTO draft_ai_outputs (draft_id, kind, content, generated_at, model_note, edited_by_human)
         SELECT ?, kind, content, generated_at, '単品からコピー', 0 FROM draft_ai_outputs WHERE draft_id = ?
       `).run(setId, parentId);
-      done('basic_info');
-      done('ai_generate');
-    } else {
-      done('basic_info');
     }
 
     // 「セットを作った」という判断を先に残す (2026-09-04 §4.2)。
@@ -237,19 +231,51 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
  * 詳細画面を開くたびに呼ぶ自己修復 (mirror の毎時取込を待つ間、出品ゲートは閉じたまま)。
  * @returns {boolean} この呼び出しで確定したか
  */
+/**
+ * 本コードが確定したセットの「NE登録」工程を自動で閉じる (2026-09-04 §4.1)。
+ *
+ * この工程は人が押せない (setStepState が仮コードのままの done/skip を拒否する)。
+ * ここで閉じないと、本コードが確定してもカードが NE登録の列に残り続ける。
+ * **確定と同じトランザクションから呼ぶこと** — 分けると「確定したのに工程は未完了」が残る。
+ * @returns 閉じたか (既に決着済み・単品・仮コードのままなら false)
+ */
+export function closeNeStepIfConfirmed(db, draftId, actor = 'system') {
+  const id = Number(draftId);
+  const d = db.prepare('SELECT parent_draft_id, provisional_code FROM product_drafts WHERE id = ?').get(id);
+  if (!d || d.parent_draft_id == null || d.provisional_code !== 0) return false;
+  const row = db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?')
+    .get(id, SET_NE_STEP_CODE);
+  if (!row || row.state === 'done' || row.state === 'skip') return false;
+  // システムによる完了。担当者が誰であっても閉じる (人の操作ではないので権限判定は通さない)
+  setStepState(id, SET_NE_STEP_CODE, { state: 'done' }, actor, { isAdmin: true });
+  return true;
+}
+
 export function reconcileProvisionalCode(db, draft) {
-  if (!draft || draft.provisional_code !== 1) return false;
+  if (!draft) return false;
+  if (draft.provisional_code !== 1) {
+    // 既に確定済み。工程だけ取り残されていないか見て収束させる (Codex R4 medium:
+    // 確定と工程完了が別々に落ちた場合、ここを通さないと二度と直らない)
+    closeNeStepIfConfirmed(db, draft.id);
+    return false;
+  }
   // まだ仮コードそのもの (SET-xxx-01) なら確定しようがない
   if (/^SET-/i.test(String(draft.ne_code || ''))) return false;
   if (!confirmedInNe(resolveVariationGroup(db, draft.ne_code, { withMembers: false }).kind)) return false;
-  const info = db.prepare(`
-    UPDATE product_drafts SET provisional_code = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    WHERE id = ? AND provisional_code = 1
-  `).run(draft.id);
-  if (info.changes !== 1) return false;
-  logEvent(db, draft.id, 'set_code_confirmed', `${draft.ne_code} をNE商品マスタで確認しました`, 'system');
-  draft.provisional_code = 0;
-  return true;
+  // 確定・記録・工程完了は**ひとまとまり**。分けると「本コードは確定したのに工程は未完了」が残り、
+  // 次からは provisional_code !== 1 で素通りするので直る機会が無くなる (Codex R4 medium)
+  const done = db.transaction(() => {
+    const info = db.prepare(`
+      UPDATE product_drafts SET provisional_code = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND provisional_code = 1
+    `).run(draft.id);
+    if (info.changes !== 1) return false;
+    logEvent(db, draft.id, 'set_code_confirmed', `${draft.ne_code} をNE商品マスタで確認しました`, 'system');
+    closeNeStepIfConfirmed(db, draft.id);
+    return true;
+  })();
+  if (done) draft.provisional_code = 0;
+  return done;
 }
 
 /** この商品から作られたセット (親側の画面に出す) */

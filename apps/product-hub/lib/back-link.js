@@ -7,7 +7,14 @@
  * ?back= の中身は**素通ししない**。既知のキーだけを拾って URL を組み直すので、
  * 外部サイトへ飛ばされる余地がない (オープンリダイレクト対策)。
  * ボード側 (board.ejs) が付ける印は v=board + view/assignee/filter/kind。
+ * view の語彙: (無し)=全体 / single / set / image。
  */
+
+const BACK_LABELS = {
+  image: '← 工程ボード (画像) に戻る',
+  single: '← 工程ボード (単品) に戻る',
+  set: '← 工程ボード (セット) に戻る',
+};
 
 export const LIST_BACK_LINK = { url: '/apps/product-hub/list', label: '← 一覧に戻る' };
 
@@ -19,8 +26,11 @@ export function backLinkOf(query) {
   try { src = new URLSearchParams(raw); } catch { return LIST_BACK_LINK; }
   if (src.get('v') !== 'board') return LIST_BACK_LINK;
   const p = new URLSearchParams();
-  const isImage = src.get('view') === 'image';
-  if (isImage) p.set('view', 'image');
+  // ビューはホワイトリスト (2026-09-04 セット工程で single / set が増えた)。
+  // ここに足さないと、セット工程ボードからカードを開いて戻ったとき全体ビューに落ちる
+  const view = String(src.get('view') ?? '');
+  const isImage = view === 'image';
+  if (['image', 'single', 'set'].includes(view)) p.set('view', view);
   const assignee = String(src.get('assignee') ?? '');
   if (assignee === 'me' || /^\d{1,9}$/.test(assignee)) p.set('assignee', assignee);
   const filter = src.get('filter');
@@ -33,6 +43,6 @@ export function backLinkOf(query) {
   const qs = p.toString();
   return {
     url: '/apps/product-hub/board' + (qs ? '?' + qs : ''),
-    label: isImage ? '← 工程ボード (画像) に戻る' : '← 工程ボードに戻る',
+    label: BACK_LABELS[view] || '← 工程ボードに戻る',
   };
 }
