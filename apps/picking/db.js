@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -308,6 +308,14 @@ const MIGRATIONS = {
       active_staff_count INTEGER,         -- 前回成功時の有効スタッフ数 (激減ガードの基準)
       last_generated_at  TEXT             -- 前回成功時の generated_at (後着した古い応答を弾く)
     )`);
+  },
+  // v13: 引当分類の出どころを記録する (2026-09-04 障害の再発防止)。
+  //   Drive の 引当パターン_*.txt が取れないと importBatch は CSV からの**推定値**で確定してしまい、
+  //   「もっともらしい別の分類」が黙って入る (実際に 出荷_17 が《2つ折り》→《3つ折り》になった)。
+  //   確定の根拠を残し、推定のときは画面と GChat で分かるようにする。
+  //   NULL = v13 より前に取り込んだ行 (出どころ不明) なので警告の対象にしない
+  13: () => {
+    db.exec('ALTER TABLE pk_batches ADD COLUMN class_source TEXT');   // 'txt' | 'suggested' | 'manual'
   },
 };
 

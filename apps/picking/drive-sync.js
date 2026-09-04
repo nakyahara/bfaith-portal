@@ -133,10 +133,15 @@ export async function pollOnce(deps = {}) {
       }
       const preview = parseCs03002(dl.buffer);
       const folderName = /^出荷_\d+$/.test(f.parent_name || '') ? f.parent_name : null;
-      const pattern = (folderName && patternByFolder.get(folderName))
-        || preview.suggestions[0] || '(Drive自動取込)';
+      // 引当パターンtxt が取れたか (=分類が確か) を記録する。
+      // txt が無いと CSV からの推定値で確定してしまい、「もっともらしい別の分類」が
+      // 黙って入る (2026-09-04: 出荷_17 が《2つ折り》→《3つ折り》になった)。
+      // ネコポス+B2 は候補が4つあり CSV からは区別できないため、推定は当てにならない
+      const fromTxt = (folderName && patternByFolder.get(folderName)) || null;
+      const pattern = fromTxt || preview.suggestions[0] || '(Drive自動取込)';
       const result = importBatch(preview, {
-        hikiateClass: pattern, folderName, overwrite: true,
+        hikiateClass: pattern, classSource: fromTxt ? 'txt' : 'suggested',
+        folderName, overwrite: true,
       }, 'drive-poller');
       // 台帳の成功記録を画像キュー投入より先に行う (後段の例外で「取込済みなのにfailed」に
       // ならないように — Codex medium)
@@ -148,7 +153,7 @@ export async function pollOnce(deps = {}) {
       if (result.replayed) stats.replayed++;
       else {
         stats.imported++;
-        console.log(`[picking-drive-poller] 取込: ${folderName || f.filename} (${pattern})${result.replaced ? ' 上書き' : ''}${preview.qtyWarningCount > 0 ? ` ⚠数量警告${preview.qtyWarningCount}件` : ''}`);
+        console.log(`[picking-drive-poller] 取込: ${folderName || f.filename} (${pattern}${fromTxt ? '' : ' ⚠推定'})${result.replaced ? ' 上書き' : ''}${preview.qtyWarningCount > 0 ? ` ⚠数量警告${preview.qtyWarningCount}件` : ''}`);
       }
     } catch (e) {
       // already_started (作業開始後の内容変更) は上書きしない仕様どおりの skip 扱い
