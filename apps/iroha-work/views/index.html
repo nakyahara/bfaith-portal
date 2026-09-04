@@ -1102,7 +1102,8 @@ async function doBulkStocked() {
     body: JSON.stringify({ ids: ids.map((id) => ({ id, version: bulkIds.get(id) })), worker_id: w.id, pin }) });
   if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
   const skipped = (j.skipped || []).length;
-  toast(j.done.length + ' 件を棚入完了にしました' + (skipped ? ' (' + skipped + ' 件は状態が変わっていたので飛ばしました)' : ''));
+  // 飛ばした理由は「状態が変わった」だけではない (作業中・見つからない・すでに完了) — 理由は下の警告に出す
+  toast(j.done.length + ' 件を棚入完了にしました' + (skipped ? ' (' + skipped + ' 件は棚入完了にできませんでした)' : ''));
   if (skipped) showWarn((j.skipped || []).map(x => (x.title || '#' + x.id) + ': ' + BULK_SKIP[x.reason]).join(' / '));
   exitBulk();
   await loadState();

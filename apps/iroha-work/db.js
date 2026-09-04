@@ -169,6 +169,7 @@ const mediaDDL = (name) => `
       uploader_device_id INTEGER,
       unavailable_at TEXT,
       staged_at      TEXT,
+      staged_claim   TEXT,
       CHECK (page_id IS NOT NULL OR task_id IS NOT NULL)
     );`;
 const MEDIA_INDEX_DDL = `
@@ -553,6 +554,9 @@ export function createTables(db = getMirrorDB()) {
   // 実体をまだ置いていない行の印 (Codex PR1 R7)。ここに値がある間は一覧にも送信キューにも出さない。
   // 作り直しの後に足す (作り直しは mediaDDL を使うので新しい DB には既にある)
   addCol('f_iroha_card_media', 'staged_at', 'TEXT');
+  // 「いまこの行の実体を置こうとしている要求」の札。二重送信が同時に来ても、札を持つ側だけが
+  // 公開・後始末をする (負けた側が相手の実体や行を消さない — Codex PR1 R8)
+  addCol('f_iroha_card_media', 'staged_claim', 'TEXT');
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}

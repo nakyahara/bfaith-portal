@@ -310,7 +310,7 @@ export function listNamelessTasks(limit = 50) {
       t.created_at, t.created_by, t.updated_by,
       (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id) AS sessions,
       (SELECT COUNT(*) FROM f_iroha_work_sessions s WHERE s.task_id = t.id AND s.ended_at IS NULL AND s.voided_at IS NULL) AS active_sessions,
-      (SELECT COUNT(*) FROM f_iroha_card_media m WHERE m.task_id = t.id AND m.deleted_at IS NULL) AS media,
+      (SELECT COUNT(*) FROM f_iroha_card_media m WHERE m.task_id = t.id AND m.deleted_at IS NULL AND m.staged_at IS NULL) AS media,
       (SELECT COUNT(*) FROM f_iroha_label_waits w WHERE w.task_id = t.id) AS label_waits
     FROM f_iroha_tasks t
     WHERE ${STRAY_WHERE}
@@ -536,16 +536,22 @@ function upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor }) {
  */
 export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerName = null, deviceLabel = null }) {
   const db = getDB();
-  // 選ぶときに見えていた版 ({ id, version }) も受ける。版を添えた分は「選んでから変わっていたら飛ばす」
-  // (単票の変更と同じ楽観ロック — Codex PR1 R7)。数値だけの指定は版を見ない (画面からは常に版を添える)
+  // ⭐選ぶときに見えていた版 ({ id, version }) を必ず添えてもらう。単票の変更と同じ楽観ロックにする
+  //   (入口だけの検査にせず、この関数自体が版なしを受けない — Codex PR1 R7 / R8)
   const seen = new Set();
   const items = [];
   for (const v of (Array.isArray(taskIds) ? taskIds : [])) {
-    const id = Number(v && typeof v === 'object' ? v.id : v);
-    if (!Number.isSafeInteger(id) || id <= 0 || seen.has(id)) continue;
-    const ver = v && typeof v === 'object' && v.version != null ? Number(v.version) : null;
+    if (!v || typeof v !== 'object' || v.version == null) {
+      return { ok: false, error: 'bad_request', message: 'カードごとの版 (version) が必要です。一覧を更新してから選び直してください' };
+    }
+    const id = Number(v.id);
+    const ver = Number(v.version);
+    if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(ver) || ver < 0) {
+      return { ok: false, error: 'bad_request', message: 'カードの指定が不正です' };
+    }
+    if (seen.has(id)) continue;
     seen.add(id);
-    items.push({ id, version: Number.isSafeInteger(ver) ? ver : null });
+    items.push({ id, version: ver });
   }
   const ids = items.map((x) => x.id);
   if (ids.length === 0) return { ok: false, error: 'bad_request', message: 'カードが選ばれていません' };
@@ -557,10 +563,6 @@ export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerN
     // 対象は 1 回の SELECT で引く (200 件×3 クエリにしない — Codex PR-C R1 Low)
     const found = new Map(db.prepare(`SELECT id, status, close_reason, product_name, product_code, version FROM f_iroha_tasks
       WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids).map((r) => [r.id, r]));
-    const upd = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'stocked', closed_at = ?, closed_by = ?,
-        hold_reason_code = NULL, hold_reason_note = NULL, cancellation_requested_at = NULL, ready_at = COALESCE(ready_at, ?),
-        version = version + 1, updated_at = ?, updated_by = ?
-      WHERE id = ? AND status = 'ready_for_stocking'`);
     const updVer = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'stocked', closed_at = ?, closed_by = ?,
         hold_reason_code = NULL, hold_reason_note = NULL, cancellation_requested_at = NULL, ready_at = COALESCE(ready_at, ?),
         version = version + 1, updated_at = ?, updated_by = ?
@@ -569,15 +571,14 @@ export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerN
       const t = found.get(id);
       if (!t) { skipped.push({ id, reason: 'not_found' }); continue; }
       const title = t.product_name || t.product_code || `#${id}`;
+      // 版の食い違いが先 (選んでから誰かが動かしていたなら「競合」。already・not_ready・作業中と混同しない — Codex PR1 R8)
+      if (t.version !== version) { skipped.push({ id, reason: 'conflict', title }); continue; }
       if (t.status === 'closed' && t.close_reason === 'stocked') { skipped.push({ id, reason: 'already', title }); continue; }
       if (t.status !== 'ready_for_stocking') { skipped.push({ id, reason: 'not_ready', title, status: t.status }); continue; }
       if (db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL AND voided_at IS NULL').get(id).c > 0) {
         skipped.push({ id, reason: 'active_sessions', title }); continue;   // 作業中のまま終了にしない (Codex PR1 R3)
       }
-      const changed = version == null
-        ? upd.run(now, actor, now, now, actor, id).changes
-        : updVer.run(now, actor, now, now, actor, id, version).changes;
-      if (changed !== 1) { skipped.push({ id, reason: 'conflict', title }); continue; }
+      if (updVer.run(now, actor, now, now, actor, id, version).changes !== 1) { skipped.push({ id, reason: 'conflict', title }); continue; }
       // 履歴は握り潰さない (権限のいる操作。記録できないなら全部やり直す — Codex PR-C R1)
       logTaskEvent({ taskId: id, action: 'task_status', from: 'ready_for_stocking', to: 'closed:stocked (まとめて棚入完了)',
         workerId, workerName, deviceLabel, ok: true });

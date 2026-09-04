@@ -215,14 +215,15 @@ export function buildList() {
 /**
  * タスク行 → 画面のカード。一覧・ボード・下見・履歴の詳細で同じ形 (buildList と同じ cards[] の形なので画面は共通)。
  * 違いは識別子 (id = task.id) と状態 (status = 英語の値・status_label = 表示) と、拠点・保留理由・「今日やる」を持つこと。
- * rows に closed が混ざっていてもそのまま作る (履歴の詳細用)。並べ替えと画像の取り寄せは呼び出し側
+ * rows に closed が混ざっていてもそのまま作る (履歴の詳細用)。並べ替えと画像の取り寄せは呼び出し側。
+ * readOnly = 下見・履歴。DB を一切変えない (写真の修復印も付けない・対象カードの写真だけ引く — Codex PR1 R8)
  */
-function buildTaskCards(rows) {
+function buildTaskCards(rows, { readOnly = false } = {}) {
   const ctx = enrichContext();
   const images = productImageMap(rows.map(r => r.product_code));
   const activeMap = activeSessionsByTask();
   const estimates = estimateByProduct();
-  const mediaMap = mediaByTask();
+  const mediaMap = mediaByTask(readOnly ? { ids: rows.map((r) => r.id), repair: false } : undefined);
   const prevPhotos = photosByCodeKey();
   const zStock = stockMapByPrefix(rows.map((r) => keyOf(r.product_code)), 'Z');
   // 外部 (羅針盤・ワークセンター) に出したカードは Y ロケを見せる。その拠点のカードの商品だけ引く
@@ -305,10 +306,10 @@ function queueMissingImages(cards) {
  * 1 枚だけ (下見・履歴の詳細)。終了したタスクも返す。無ければ null。
  * 一覧と違い、そのカードの**終わった作業** (work_history) も付ける — 詳細でしか使わないので 1 件ずつ引く
  */
-export function buildTaskCard(id, { queueImages = true } = {}) {
+export function buildTaskCard(id, { queueImages = true, readOnly = false } = {}) {
   const t = getTask(id);
   if (!t) return null;
-  const card = buildTaskCards([t]).cards[0] || null;
+  const card = buildTaskCards([t], { readOnly }).cards[0] || null;
   if (!card) return null;
   card.work_history = finishedSessionsOfTask(t.id);
   // ⭐下見・履歴 (読むだけ) では取り寄せない。開くだけで画像キューの DB が変わると
@@ -321,9 +322,9 @@ export function buildTaskCard(id, { queueImages = true } = {}) {
  * 一覧 (アプリ正本 = f_iroha_tasks)。
  * 終了 (closed) は含めない (履歴画面で見る — 中原さん 2026-09-03「完了が溜まる一方なのを何とかしたい」)
  */
-export function buildTaskList({ facility = null } = {}) {
+export function buildTaskList({ facility = null, readOnly = false } = {}) {
   const rows = listOpenTasks({ facility });
-  const { cards, today } = buildTaskCards(rows);
+  const { cards, today } = buildTaskCards(rows, { readOnly });
 
   // 並び: 今日やる → 優先度 (急ぎ→新商品→通常→データなし→販売なし) → 在庫日数 → 入庫が古い順
   cards.sort((a, b) => {
@@ -340,7 +341,8 @@ export function buildTaskList({ facility = null } = {}) {
     return String(a.title).localeCompare(String(b.title), 'ja');
   });
 
-  queueMissingImages(cards);
+  // 読むだけ (下見) では画像の取り寄せも起こさない — 開くだけで DB が変わらない (Codex PR1 R7 / R8)
+  if (!readOnly) queueMissingImages(cards);
 
   return {
     mode: 'app',

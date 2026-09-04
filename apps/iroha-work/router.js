@@ -517,7 +517,8 @@ router.post('/api/review-cleared', checkOrigin, api((req, res) => {
  * ⚠中身は取込時点の状態。Notion 側でその後に動かした分は入っていない (画面にもその旨を出す)
  */
 router.get('/api/preview-tasks', api((req, res) => {
-  res.json({ ok: true, ...buildTaskList(), preview: !isAppMode(), capabilities: capabilitiesFor('preview'), serverNow: new Date().toISOString() });
+  // 読むだけ: 画像の取り寄せも、写真の修復印も起こさない (Codex PR1 R8)
+  res.json({ ok: true, ...buildTaskList({ readOnly: true }), preview: !isAppMode(), capabilities: capabilitiesFor('preview'), serverNow: new Date().toISOString() });
 }));
 
 /**
@@ -528,7 +529,7 @@ router.get('/api/preview-tasks', api((req, res) => {
  */
 router.get('/api/task-previews/:id(\\d+)', api((req, res) => {
   // 読むだけなので、画像の取り寄せ (キューへの書き込み) も起こさない — Codex PR1 R7
-  const card = buildTaskCard(parseTaskId(req.params.id), { queueImages: false });
+  const card = buildTaskCard(parseTaskId(req.params.id), { queueImages: false, readOnly: true });
   if (!card) return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません' });
   res.json({
     ok: true, preview: true, card, capabilities: capabilitiesFor('preview'),
@@ -563,11 +564,11 @@ router.post('/api/bulk-stocked', checkOrigin, api((req, res) => {
   // (単票の変更と同じ楽観ロック — Codex PR1 R7)
   const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
   const items = raw.map((v) => {
-    const id = parseTaskId(v && typeof v === 'object' ? v.id : v);
-    if (id == null) return null;
-    const ver = v && typeof v === 'object' ? Number(v.version) : NaN;
-    if (!Number.isSafeInteger(ver) || ver < 0) return null;
-    return { id, version: ver };
+    // null・空文字・false を Number() が 0 にするので、数値であることを先に見る (Codex PR1 R8)
+    if (!v || typeof v !== 'object' || typeof v.version !== 'number') return null;
+    const id = parseTaskId(v.id);
+    if (id == null || !Number.isSafeInteger(v.version) || v.version < 0) return null;
+    return { id, version: v.version };
   });
   if (items.some((v) => v == null)) {
     return res.status(400).json({ ok: false, error: 'bad_request',
@@ -903,18 +904,24 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
       try {
         moveStoredFile(r.move);
       } catch (e) {
-        try { dropMedia(r.media.id); } catch { /* 消せなくても応答は失敗にする */ }
+        // 片づけるのは「自分の札のまま・まだ公開されていない」行だけ (二重送信の相手の行は消さない)
+        try { dropMedia(r.media.id, r.claim); } catch { /* 消せなくても応答は失敗にする */ }
         cleanup();
         console.error('[iroha-work] 写真の保存に失敗', e);
         return res.status(500).json({ ok: false, error: 'store_failed', message: '写真を保存できませんでした (もう一度とってください)' });
       }
-      const promoted = promoteStagedMedia(r.media.id, r.move.to);
-      if (!promoted) {
-        // 上げられない = その行は既に消されている。置いた実体も片づけて、撮り直してもらう
+      const promoted = promoteStagedMedia(r.media.id, r.move.to, r.claim);
+      if (promoted.ok) {
+        r.media = promoted.media;
+      } else if (promoted.media) {
+        // 同じ送信が二重に届き、もう一方が先に公開した。写真としては成立しているのでそのまま返す
+        r.media = promoted.media;
+        r.already = true;
+      } else {
+        // 行が消えている (カードが変わった等)。置いた実体は誰も参照しないので片づける
         try { fs.unlinkSync(r.move.to); } catch { /* 無ければよい */ }
         return res.status(409).json({ ok: false, error: 'not_ready', message: '保存の途中でカードが変わりました (もう一度とってください)' });
       }
-      r.media = promoted;
     } else {
       cleanup();   // 再送で既存の行を返した場合。今回の一時ファイルは使わないので片づける
     }
@@ -926,7 +933,8 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
         deviceLabel: deviceLabelOf(req), to: r.already ? 'resend' : 'add', ok: true });
     }
     scheduleMedia();
-    delete r.move;   // 保管場所のパスは画面に返さない
+    delete r.move;    // 保管場所のパスは画面に返さない
+    delete r.claim;   // 札はサーバーの中だけで使う
     res.json(r);
   } catch (e) {
     cleanup();
