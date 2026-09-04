@@ -7832,6 +7832,10 @@ for (const [name, file, data] of renders) {
     // router の res.render に足し忘れ、smoke は ALL PASS のまま本番の詳細画面が
     // ReferenceError で 500 になった (board.ejs には渡っていた)。
     // テンプレートが使う変数を router が全部渡しているかは、実物のルートを叩くまで分からない。
+    // ⚠️ 実物のルートなので副作用も本物: `/board` と `/board?view=ne` は reconcileConfirmableSets を
+    //    通り、この DB にある**他の**仮コードのセットも (NE mirror に本コードがあれば) 確定させる。
+    //    ここで作る SET-PAGE-SINGLE-01 は `SET-` のままなので確定されないが、
+    //    「仮のままであること」に依存するテストをこの後ろに足さないこと (Codex low 2026-09-04)。
     {
       const getHtml = async (p) => {
         const res = await fetch(base + p, { headers: { Accept: 'text/html' } });
