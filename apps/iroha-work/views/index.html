@@ -866,11 +866,17 @@ async function loadStateOnce() {
   // ボードを開いている間は、正本が Notion なら下見も取り直す (切替直後・502 から戻ったときもここで回復する)
   if (curView === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
   renderLwSaveState();
-  // ⭐計画の許可を失ったら、計画の画面と「どこが」の窓を閉じる (作った DOM を残さない — Codex P3 R1)
+  // ⭐許可が変わったら計画の中身も作り直す。失ったら**描いたものを消す** —
+  //   隠すだけだと、hidden の画面に押せるボタンが残る (Codex P3 R1 / R2)
   if (!stateCan('task.plan.assign')) {
-    if (curView === 'plan') { planData = null; setView('board'); }
+    planData = null;
+    clearPlanDom();
+    if (curView === 'plan') setView('board');
     if (facPickCtx) closeFacPick();
+  } else if (planData) {
+    renderPlan();   // 「どこが」の許可だけ失った場合も、ここでボタンが消える
   }
+  if (!stateCan('task.facility.assign') && facPickCtx) closeFacPick();
   restoreWorker();
   // 開いている詳細を追いかける。一覧・ボードのものは state から、下見・履歴のものは取り直す
   //   (取込や他の端末の操作で中身が変わる。「いまのアプリの記録」と書いている以上、古いまま置かない — Codex PR1 R2)
@@ -1317,6 +1323,8 @@ function openFacPick(id) {
   const c = findCard(id);
   if (!c) return;
   facPickFor = id;
+  // ⭐ボードから開くときも ctx を作る (作らないとタップが受け取られない — Codex P3 R2)
+  facPickCtx = { id, thenWhen: null, saving: false };
   $('#facTitle').textContent = '「' + c.title + '」はどこが作業しますか?';
   $('#facMsg').textContent = '';
   const facs = (state.facilities || []);
@@ -1408,9 +1416,12 @@ function openPlanPage() {
  */
 function loadPlan({ force = false } = {}) {
   if (planInflight && !force) return planInflight;   // 同時に 1 本だけ (一覧・下見と同じ作り)
+  // ⚠finally() は**別の Promise を返す**。それを planInflight に入れると自分自身と比べられず、
+  //   いつまでも null に戻らない = 2 回目から取り直さなくなる (Codex P3 R2)
   const next = planInflight ? planInflight.catch(() => {}).then(() => loadPlanOnce()) : loadPlanOnce();
-  planInflight = next.finally(() => { if (planInflight === next) planInflight = null; });
-  return planInflight;
+  planInflight = next;
+  next.finally(() => { if (planInflight === next) planInflight = null; });
+  return next;
 }
 async function loadPlanOnce() {
   const gen = ++planGen;
@@ -1432,6 +1443,12 @@ async function loadPlanOnce() {
   renderPlan();
 }
 
+/** 計画画面に描いたものを消す (許可を失ったとき。隠すだけにしない) */
+function clearPlanDom() {
+  for (const sel of ['#planCarry', '#planCand', '#planPile', '#planByFac']) { const el = $(sel); if (el) el.innerHTML = ''; }
+  const n1 = $('#planCandN'); if (n1) n1.textContent = '0';
+  const n2 = $('#planPileN'); if (n2) n2.textContent = '0';
+}
 function renderPlan() {
   const d = planData;
   if (!d) { $('#planCand').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }

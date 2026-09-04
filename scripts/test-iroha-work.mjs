@@ -2995,8 +2995,15 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/'まだ決めない' : '未定にする'/.test(html), '積む流れでは「まだ決めない」も選べる (決まっていなくても積める)');
   ok(/const pileActs = stateCan\('task\.facility\.assign'\) \? \[\['どこが'/.test(html),
     '「どこが」のボタンは許可があるときだけ描く (無効化して見せない)');
-  ok(/if \(!stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+if \(curView === 'plan'\) \{ planData = null; setView\('board'\); \}/.test(html),
-    '計画の許可を失ったら、計画の画面と「どこが」の窓を閉じる (作った DOM を残さない)');
+  ok(/if \(!stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+planData = null;\r?\n\s+clearPlanDom\(\);/.test(html)
+    && /function clearPlanDom\(\)/.test(html),
+    '計画の許可を失ったら、描いたものを消す (隠すだけにしない — hidden の画面に押せるボタンを残さない)');
+  ok(/\} else if \(planData\) \{\r?\n\s+renderPlan\(\);/.test(html),
+    '許可が変わったら計画の中身を描き直す (「どこが」だけ失った場合もボタンが消える)');
+  ok(/facPickCtx = \{ id, thenWhen: null, saving: false \};/.test(html),
+    'ボードから「どこが」を開くときも ctx を作る (作らないとタップが受け取られない)');
+  ok(/planInflight = next;\r?\n\s+next\.finally\(\(\) => \{ if \(planInflight === next\) planInflight = null; \}\);/.test(html),
+    '取得が終わったら planInflight を null に戻す (finally の戻り値を入れると自分と比べられない)');
   ok(/facPickCtx = \{ id, thenWhen: thenWhen \?\? null, saving: false \};/.test(html)
     && /if \(!b \|\| !facPickCtx \|\| facPickCtx\.saving\) return;/.test(html),
     '「どこが → 明日やる」は 1 つの操作として持ち回る (通信の後にグローバルを読み直さない・連打を受けない)');
