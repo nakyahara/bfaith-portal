@@ -166,6 +166,40 @@
   .gauge .go{margin-left:auto;font-weight:700;color:var(--accent);font-size:.88rem;flex:none}
   .gauge .staff{margin-left:auto;font-size:.74rem;color:var(--sub);flex:none}
 
+  /* ── 明日の計画 (職員だけ。要件 §W-4) ── */
+  .planhead{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+  .planhead h2{margin:0;font-size:1.05rem}
+  .plan2{display:grid;grid-template-columns:1.15fr .85fr;gap:14px;align-items:start}
+  @media (max-width:860px){ .plan2{grid-template-columns:1fr} }
+  .pane{background:var(--well);border:1px solid var(--line);border-radius:var(--r);padding:10px}
+  .pane > h3{margin:0 0 8px;font-size:.86rem;color:var(--sub);display:flex;align-items:center;gap:8px;font-weight:700}
+  .pane > h3 .n{font-family:var(--num);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:0 8px;font-size:.8rem}
+  .pane > h3 .sum{margin-left:auto;font-weight:600;font-size:.8rem;color:var(--ink)}
+  .pane.pile{background:#EEF3FF;border-color:#C9D7FF}
+  .pane.pile > h3{color:var(--accent)}
+  .byfac{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+  .byfac span{font-size:.76rem;background:var(--surface);border:1px solid #C9D7FF;border-radius:999px;padding:2px 9px}
+  .byfac span.warn{background:var(--amber-soft);border-color:#F2D9AE;color:var(--amber);font-weight:700}
+  .carry{background:var(--amber-soft);border:1px solid #F2D9AE;border-radius:var(--r);padding:8px 10px;margin-bottom:10px}
+  .carry > h3{margin:0 0 6px;font-size:.86rem;color:var(--amber);font-weight:700}
+  .pcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;margin-bottom:6px;
+    display:flex;gap:8px;align-items:flex-start}
+  .pcard .th{width:44px;height:44px;flex:none;border-radius:var(--r-sm);background:var(--well);border:1px solid var(--line);
+    display:grid;place-items:center;font-size:1.1rem;overflow:hidden}
+  .pcard .th img{width:100%;height:100%;object-fit:contain;background:#fff}
+  .pcard .bd{min-width:0;flex:1}
+  .pcard h4{margin:0;font-size:.92rem;font-weight:700;line-height:1.35}
+  .pcard .m{font-size:.76rem;color:var(--sub);margin-top:2px}
+  .pcard .why{margin-top:5px;display:flex;flex-wrap:wrap;gap:4px}
+  .pcard .why span{font-size:.72rem;border-radius:999px;padding:1px 8px;background:var(--well);color:var(--sub);border:1px solid var(--line)}
+  .pcard .why span.urgent{background:var(--danger-soft);color:var(--danger);border-color:#F3C1C1;font-weight:700}
+  .pcard .why span.size{background:#F1EAFB;color:#6B3FB5;border-color:#DCCDF5;font-weight:700}
+  .pcard .act{flex:none;align-self:center;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+  .pbtn{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);
+    padding:8px 12px;font-size:.88rem;font-weight:700;min-height:42px;cursor:pointer;font-family:var(--font)}
+  .pbtn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .pbtn.warn{color:var(--amber);border-color:#F2D9AE}
+
   /* ── 列の分け方 ── */
   .seg{display:inline-flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:var(--surface)}
   .seg button{border:0;background:transparent;color:var(--sub);padding:7px 13px;font-weight:700;font-size:.84rem;
@@ -397,6 +431,28 @@
       <input class="search" id="bq" placeholder="商品名・商品コードで検索">
     </div>
     <div class="board" id="board"></div>
+  </div>
+
+  <!-- ══ 画面1d: 明日の計画 (職員だけ。ボードのゲージから開く) ══ -->
+  <div class="page planpage" hidden>
+    <div class="planhead">
+      <button class="btn" onclick="setView('board')">‹ ボードへ戻る</button>
+      <h2 id="planTitle">明日の計画</h2>
+      <span id="planStaff" class="flabel"></span>
+    </div>
+    <p class="hint" id="planHint"></p>
+    <div id="planCarry"></div>
+    <div class="plan2">
+      <div class="pane">
+        <h3>候補 <span class="n" id="planCandN">0</span><span class="sum">在庫が少ない → 入荷が古い → 大きい</span></h3>
+        <div id="planCand"></div>
+      </div>
+      <div class="pane pile">
+        <h3>明日やる分 <span class="n" id="planPileN">0</span><span class="sum" id="planPileSum"></span></h3>
+        <div class="byfac" id="planByFac"></div>
+        <div id="planPile"></div>
+      </div>
+    </div>
   </div>
 
   <!-- ══ 画面1c: ラベル待ち ══ -->
@@ -975,9 +1031,10 @@ $('#list').addEventListener('click', (e) => {
 });
 
 // ─── 画面の切替 (作業 / ボード / ラベル待ち / 履歴) ───
-const PAGES = { list: '.listpage', board: '.boardpage', label: '.labelpage', history: '.historypage' };
+const PAGES = { list: '.listpage', board: '.boardpage', plan: '.planpage', label: '.labelpage', history: '.historypage' };
 const VIEW_BTN = { list: '#vList', board: '#vBoard', label: '#vLabel', history: '#vHistory' };
 function setView(v) {
+  if (v === 'plan' && !stateCan('task.plan.assign')) v = 'board';   // 計画は職員だけ (要件 §W-1)
   if (v !== 'board' && v !== 'list') exitBulk();
   curView = v;
   for (const [k, sel] of Object.entries(PAGES)) $(sel).hidden = k !== v;
@@ -986,6 +1043,7 @@ function setView(v) {
   // 開いた画面は必ず描き直す。一覧も同じ (ボードで選んだまま戻ったとき、選択を見えているものへそろえるため — Codex PR-C R2)
   if (v === 'list') renderList();
   if (v === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
+  if (v === 'plan') loadPlan();
   if (v === 'label') loadLabelWaits();
   if (v === 'history') loadHistory();
 }
@@ -1262,13 +1320,14 @@ function openFacPick(id) {
     '<button class="opt" data-pick-fac="">未定にする</button>';
   openOverlay('#facOv');
 }
-function closeFacPick() { closeOverlay('#facOv'); facPickFor = null; }
+function closeFacPick() { closeOverlay('#facOv'); facPickFor = null; planPendingWhen = null; }
 $('#facOpts').addEventListener('click', (e) => {
   const b = e.target.closest('[data-pick-fac]');
   if (b && facPickFor != null) saveFacility(facPickFor, b.dataset.pickFac || null);
 });
 async function saveFacility(id, code) {
-  const c = findCard(id);
+  // 計画画面のカードは一覧に無いことがある (候補) ので、両方から探す
+  const c = findCard(id) || planCard(id);
   const w = worker;
   if (!c || !w) { closeFacPick(); if (!w) openGate(); return; }
   $('#facMsg').textContent = '保存しています…';
@@ -1276,15 +1335,24 @@ async function saveFacility(id, code) {
     body: JSON.stringify({ id, facility_code: code, expect_version: c.version, worker_id: w.id }) });
   if (!j.ok) {
     // 版がずれていたら最新を入れてから知らせる (古い版のまま押し続けても通らないため — Codex P2 R1)
-    if (j.current) { applyTask(c, j.current); redrawAfterPlan(); }
+    if (j.current) { const inList2 = findCard(id); if (inList2) applyTask(inList2, j.current); redrawAfterPlan(); if (curView === 'plan') await loadPlan(); }
     $('#facMsg').textContent = j.message || '変えられませんでした';
     // 職員モードが切れていたら PIN を聞いて、そのまま同じ拠点をもう一度送る
     return planError(j, () => saveFacility(id, code), { silent: true });
   }
+  const pending = planPendingWhen;
   closeFacPick();
-  applyTask(c, j.task);
   if (j.staff_mode) state.staff_mode = j.staff_mode;
+  const inList = findCard(id);
+  if (inList) applyTask(inList, j.task);
+  if (pending) {
+    // 「どこが」を決めた流れで、そのまま明日やる分に積む (版は保存で 1 つ進んでいるので取り直す)
+    await loadPlan();
+    await savePlanWhen(id, pending);
+    return;
+  }
   redrawAfterPlan();
+  if (curView === 'plan') await loadPlan();   // 計画画面から変えたときは拠点別の内訳も直す
   toast('「' + c.title + '」→ ' + (code ? facilityName(code) : '未定'));
 }
 
@@ -1315,10 +1383,156 @@ async function askStaffUnlock() {
   return true;
 }
 
-/** 「明日の計画」画面 (P3 で作る)。いまはゲージから開こうとしたら知らせるだけ */
+// ─── ⭐明日の計画 (職員だけ。ボードのゲージから開く。要件 §W-4) ───
+let planData = null;
+let planInflight = null;
+
 function openPlanPage() {
+  if (!stateCan('task.plan.assign')) return;   // 許可が無ければ開かない (入口も描いていない)
+  setView('plan');
+}
+function loadPlan() {
+  if (planInflight) return planInflight;       // 同時に 1 本だけ (一覧・下見と同じ作り)
+  planInflight = loadPlanOnce().finally(() => { planInflight = null; });
+  return planInflight;
+}
+async function loadPlanOnce() {
+  const j = await apiFetch('/api/plan');
+  if (!j.ok) {
+    // 職員モードが切れていたら PIN を聞いて、そのまま開き直す
+    if (j.error === 'staff_required' || j.error === 'pin_required' || j.error === 'pin_invalid') {
+      if (await askStaffUnlock()) { await loadState(); return loadPlanOnce(); }
+      setView('board');
+      return;
+    }
+    // つながらないときは前回の中身を消さない (消すと画面が空になる)
+    if (!planData) $('#planCand').innerHTML = '<div class="colempty">' + esc(j.message || '読み込めませんでした') + ' — つながったら出ます</div>';
+    showErr(j.message || '明日の計画を開けませんでした');
+    return;
+  }
+  planData = j;
+  renderPlan();
+}
+
+function renderPlan() {
+  const d = planData;
+  if (!d) { $('#planCand').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
+  $('#planTitle').textContent = '明日の計画 — ' + fmtYmd(d.tomorrow_ymd);
+  $('#planStaff').textContent = staffLeftText();
+  const t = d.totals || { hours: 0, count: 0, unknown_hours_count: 0 };
+  const lo = (d.target_hours || {}).min ?? 4;
+  const hi = (d.target_hours || {}).max ?? 6;
+  $('#planHint').textContent = '1 日にできるのは ' + lo + '〜' + hi + ' 時間ぶんです。左の候補を「＋ 明日やる」で右に足してください。'
+    + '選ぶたびに保存されます (確定ボタンはありません)。目安を超えても入れられます。';
+  // やり残し (自動では動かさない。職員が決める)
+  const carry = d.carry_over || [];
+  $('#planCarry').innerHTML = carry.length === 0 ? '' :
+    '<div class="carry"><h3>やり残し ' + carry.length + ' 件 — どうしますか (自動では動かしません)</h3>' +
+    carry.map((c) => pcardHtml(c, [
+      ['明日やる', 'primary', 'tomorrow'],
+      ['今日やる', '', 'today'],
+      ['未定に戻す', 'warn', 'none'],
+    ])).join('') + '</div>';
+  // 候補 (優先順)
+  const cand = d.candidates || [];
+  $('#planCandN').textContent = cand.length;
+  $('#planCand').innerHTML = cand.length === 0 ? '<div class="colempty">候補はありません</div>'
+    : cand.map((c) => pcardHtml(c, [['＋ 明日やる', 'primary', 'tomorrow']])).join('');
+  // 明日やる分
+  const pile = d.tomorrow || [];
+  $('#planPileN').textContent = pile.length;
+  $('#planPileSum').textContent = fmtHours(t.hours) + (t.unknown_hours_count ? ' (時間不明 ' + t.unknown_hours_count + ' 件)' : '');
+  const byFac = (d.by_facility || []).map((f) => '<span>' + esc(f.name) + ' ' + f.count + ' 件 · ' + esc(fmtHours(f.hours)) + '</span>').join('');
+  const und = d.unassigned_count || 0;
+  $('#planByFac').innerHTML = byFac + (und ? '<span class="warn">どこが未定 ' + und + ' 件</span>' : '');
+  $('#planPile').innerHTML = pile.length === 0 ? '<div class="colempty">左の候補を「＋ 明日やる」で足してください</div>'
+    : pile.map((c) => pcardHtml(c, [['どこが', '', 'fac'], ['－ 外す', '', 'none']])).join('');
+}
+
+/** 計画画面のカード。理由 (なぜ上に出るか) を必ず添える */
+function pcardHtml(c, actions) {
+  const why = [];
+  if (c.priority) why.push('<span class="' + (c.priority.kind === 'urgent' ? 'urgent' : '') + '">' + esc(c.priority.label) + '</span>');
+  if (c.arrival) why.push('<span>入荷 ' + esc(c.arrival) + '</span>');
+  why.push(c.size_label ? '<span class="size">' + esc(c.size_label) + '</span>' : '<span>大きさ 不明</span>');
+  const meta = [c.qty != null ? c.qty + ' 個' : null,
+    c.plan_hours != null ? '見込 ' + c.plan_hours + 'h' : '見込 不明',
+    c.facility_code ? facilityName(c.facility_code) : 'どこが 未定'].filter(Boolean).join(' ・ ');
+  const acts = actions.map(([label, cls, act]) =>
+    '<button class="pbtn ' + cls + '" data-plan-act="' + act + '" data-plan-id="' + esc(c.id) + '">' + esc(label) + '</button>').join('');
+  return '<div class="pcard"><div class="th">' + thumbHtml(c) + '</div><div class="bd">' +
+    '<h4>' + esc(c.title) + '</h4><div class="m num">' + esc(meta) + '</div>' +
+    '<div class="why">' + why.join('') + '</div></div><div class="act">' + acts + '</div></div>';
+}
+
+// 計画画面のボタンは委譲で受ける (中身を作り直しても付け直さなくてよい)
+$('#planCarry').addEventListener('click', (e) => planAction(e));
+$('#planCand').addEventListener('click', (e) => planAction(e));
+$('#planPile').addEventListener('click', (e) => planAction(e));
+function planAction(e) {
+  const b = e.target.closest('[data-plan-act]');
+  if (!b) return;
+  const id = b.dataset.planId;
+  const act = b.dataset.planAct;
+  if (act === 'fac') { openPlanFacPick(id); return; }
+  const when = act === 'none' ? null : act;
+  // ⭐候補から「明日やる」に積むときは、どこが作業するかも一緒に聞く (要件 §W-4)。
+  //   「まだ決めない」も選べる — 決まっていなくても積めるようにする
+  const c = planCard(id);
+  if (when === 'tomorrow' && c && !c.facility_code && stateCan('task.facility.assign')) {
+    planPendingWhen = when;
+    openPlanFacPick(id);
+    return;
+  }
+  savePlanWhen(id, when);
+}
+
+/** 計画画面から「いつ」を変える。⭐変えたら計画も一覧も取り直す */
+async function savePlanWhen(id, when) {
   if (!stateCan('task.plan.assign')) return;
-  toast('「明日の計画」の画面はこの次に作ります (いまはカードの札から決められます)');
+  const w = worker;
+  if (!w) { openGate(); return; }
+  const c = planCard(id);
+  if (!c) return;
+  const j = await apiFetch('/api/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, when, expect_version: c.version, worker_id: w.id }) });
+  if (!j.ok) {
+    if (j.error === 'conflict') { await loadPlan(); showErr('他の端末で変更されていました (最新にしました)'); return; }
+    return planError(j, () => savePlanWhen(id, when));
+  }
+  if (j.staff_mode) state.staff_mode = j.staff_mode;
+  await Promise.all([loadPlan(), loadState()]);
+  toast('「' + c.title + '」' + (when === 'tomorrow' ? 'を明日やる分に入れました' : when === 'today' ? 'を今日やる分にしました' : 'を計画から外しました'));
+}
+/** 計画画面で「どこが」を選ぶ (候補から積むとき・後から直すとき) */
+let planPendingWhen = null;   // 「どこが」を聞いた後に続けてやる「いつ」(候補から積むとき)
+function openPlanFacPick(id) {
+  if (!stateCan('task.facility.assign')) return;
+  const c = planCard(id);
+  if (!c) return;
+  facPickFor = id;
+  $('#facTitle').textContent = '「' + c.title + '」はどこが作業しますか?';
+  $('#facMsg').textContent = '';
+  $('#facOpts').innerHTML = (state.facilities || []).map((f) =>
+    '<button class="opt" data-pick-fac="' + esc(f.code) + '">' + esc(f.name) + '</button>').join('') +
+    '<button class="opt" data-pick-fac="">未定にする</button>';
+  openOverlay('#facOv');
+}
+/** 計画画面のデータからカードを探す (一覧に無いカード = 候補も含むため) */
+function planCard(id) {
+  if (!planData) return null;
+  for (const k of ['candidates', 'tomorrow', 'carry_over']) {
+    const hit = (planData[k] || []).find((x) => sameId(x.id, id));
+    if (hit) return hit;
+  }
+  return null;
+}
+/** 2026-09-05 → 9/5 (金) */
+function fmtYmd(ymd) {
+  if (!ymd) return '';
+  const d = new Date(ymd + 'T00:00:00+09:00');
+  const w = ['日', '月', '火', '水', '木', '金', '土'][d.getDay()];
+  return (d.getMonth() + 1) + '/' + d.getDate() + ' (' + w + ')';
 }
 
 // ─── まとめて棚入完了 (職員のみ) ───
