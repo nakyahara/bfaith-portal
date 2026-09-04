@@ -205,12 +205,19 @@ export async function listToRakutenFromBoard(draftId, { actor = null, forceUnkno
       already: (tr.results || []).filter((r) => r.outcome === 'already').length,
       failed: tr.failed || 0,
       errors: (tr.results || []).filter((r) => r.outcome === 'failed').map((r) => r.error || '').filter(Boolean),
+      // Drive 取得で落ちたか (共有設定の案内を出すかの判定に使う。文言では判定しない)
+      driveFailed: (tr.results || []).some((r) => r.outcome === 'failed' && r.source === 'drive'),
     };
     if (transferSummary.failed > 0) {
       // 未転送のまま登録しても registerItem の前提チェックで止まる。理由を転送側の言葉で残す
+      // Drive の共有を疑う案内は「理由が無い」か「Drive 取得で落ちた」ときだけ添える。
+      // R-Cabinet 側の理由 (ファイル名が長い等) が出ているのに Drive を疑わせると、
+      // 本当の理由が埋もれて調べる方向を間違える (#1163)
+      const why = transferSummary.errors[0];
+      const driveHint = (!why || transferSummary.driveFailed)
+        ? '。Drive の画像フォルダがサービスアカウントに共有されているか確認してください' : '';
       return fail('transfer', `画像 ${transferSummary.failed} 枚を R-Cabinet に転送できませんでした`
-        + (transferSummary.errors[0] ? ` (${transferSummary.errors[0].slice(0, 200)})` : '')
-        + '。Drive の画像フォルダがサービスアカウントに共有されているか確認してください', { transfer: transferSummary });
+        + (why ? ` (${why.slice(0, 200)})` : '') + driveHint, { transfer: transferSummary });
     }
 
     // ② 登録 (前提チェック → RMS PUT)

@@ -951,15 +951,27 @@ router.post('/cabinet/folder-ensure', requireWrite, rateLimitMiddleware('rakuten
 router.post('/cabinet/upload', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
   try {
     const folderId = Number(req.body?.folderId);
-    const filePath = String(req.body?.filePath || '').trim();
+    // **生の値のまま検証する** (Codex R2/R3 medium)。先に整形すると "foo\nbar.jpg" が
+    // "foobar.jpg" に、"foo.jpg\n" が trim で "foo.jpg" になって、意図しない名前で通ってしまう。
+    // 呼び出し側 (product-hub) は cabinetFilePath / skuCabinetFilePath が作った値しか送らない
+    const filePath = String(req.body?.filePath || '');
+    // 400 のメッセージとログに載せる用 (制御文字でログ行を偽装させない)
+    const shownPath = filePath.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 60);
     const fileName = String(req.body?.fileName || filePath).trim();
     const fileBase64 = String(req.body?.fileBase64 || '');
     if (!Number.isInteger(folderId) || folderId <= 0) {
       return errorResponse(res, { status: 400, error: 'INVALID_FOLDER_ID', message: 'folderId が必要です', requestId: req.requestId });
     }
-    // filePath は画像URLの一部になる。この route は JPEG 専用 (Content-Type と整合させる)
-    if (!/^[a-z0-9][a-z0-9\-]{0,30}\.jpg$/.test(filePath)) {
-      return errorResponse(res, { status: 400, error: 'INVALID_FILE_PATH', message: 'filePath は英数小文字とハイフン + .jpg で指定してください', requestId: req.requestId });
+    // filePath は画像URLの一部になる。この route は JPEG 専用 (Content-Type と整合させる)。
+    // 🚨 長さの上限は **拡張子を除いて20文字** (2026-09-04 実測。21文字は楽天が resultCode 3001 で
+    // 拒否する)。ここを 31 文字で通していたため、長い商品コードの画像が楽天まで飛んで失敗し、
+    // 呼び出し側には理由の消えた 502 だけが届いていた (#1163)
+    if (!/^[a-z0-9][a-z0-9\-]{0,19}\.jpg$/.test(filePath)) {
+      return errorResponse(res, {
+        status: 400, error: 'INVALID_FILE_PATH',
+        message: `filePath は英数小文字とハイフンで20文字以内 + .jpg で指定してください (R-Cabinet の制限。受け取った値: ${shownPath})`,
+        requestId: req.requestId,
+      });
     }
     let buf;
     try {
@@ -996,10 +1008,13 @@ router.post('/cabinet/upload', requireWrite, rateLimitMiddleware('rakuten'), asy
     const result = parsed?.result?.cabinetFileInsertResult;
     const code = String(result?.resultCode ?? '');
     if (ins.status !== 200 || code !== '0') {
+      // 🚨 502/504 だと Cloudflare が本文を自分のエラーページに差し替えるため、ここで入れた
+      // 理由が呼び出し側に届かない (503 は素通しされる)。失敗はログにも残す — 残していなかった
+      // せいで「HTTP 502 とだけ出て、miniPC 側にも痕跡が無い」状態になっていた (#1163)
+      const detail = `file insert 失敗 path=${shownPath} (HTTP ${ins.status} / resultCode ${code || 'なし'} / ${String(result?.message || parsed?.result?.status?.message || '').slice(0, 120)})`;
+      console.error(`[rakuten-rms] cabinet upload ${detail}`);
       return errorResponse(res, {
-        status: 502, error: 'CABINET_UPLOAD_FAILED',
-        message: `file insert 失敗 (HTTP ${ins.status} / resultCode ${code || 'なし'})`,
-        requestId: req.requestId,
+        status: 503, error: 'CABINET_UPLOAD_FAILED', message: detail, requestId: req.requestId,
       });
     }
     const fileId = Number(result.FileId);
@@ -1021,7 +1036,9 @@ router.post('/cabinet/upload', requireWrite, rateLimitMiddleware('rakuten'), asy
     console.log(`[rakuten-rms] cabinet upload fileId=${fileId} path=${filePath} location=${location}`);
     okResponse(res, { fileId, fileUrl, location });
   } catch (e) {
-    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+    // 502 ではなく 503 (Cloudflare が本文を差し替えないので理由が呼び出し側に届く)
+    console.error(`[rakuten-rms] cabinet upload 例外 path=${String(req.body?.filePath || '').replace(/[\x00-\x1f\x7f]/g, '').slice(0, 60)}: ${e.message}`);
+    errorResponse(res, { status: 503, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
   }
 });
 

@@ -1325,15 +1325,67 @@ check('skuImageKeyOfFileName: 拡張子除去+小文字化+trim',
   && listing.skuImageKeyOfFileName(' sueders-db.png ') === 'sueders-db'
   && listing.skuImageKeyOfFileName('sueders-db') === 'sueders-db'
   && listing.skuImageKeyOfFileName('sueders-db.backup.jpg') === 'sueders-db.backup');
+// ─── R-Cabinet の filePath は 20文字以内 (2026-09-04 実測 / #1163) ─────────
+// 🚨 21文字は楽天が resultCode 3001 で拒否する。商品コードが 15 文字以上の商品は
+// 白抜き (`<コード>-white` = 21文字) が必ず転送できず、理由の消えた 502 だけが出ていた。
+// **miniPC の入力チェックと同じ形** (先頭英数 + 20文字以内 + .jpg) を守ること
+const CAB_OK = /^[a-z0-9][a-z0-9-]{0,19}\.jpg$/;
+// この形の検証が「末尾の改行や前後の空白を通さない」こと。JS の $ は (m フラグが無ければ)
+// 文字列の終端だけに一致するので通らない — Perl/Python の $ とは違う。将来 m フラグが
+// 付いたり検証の形が変わったら落ちるように、実際の値で確かめておく (Codex R4)
+check('cabinetFilePath: 改行や前後空白を含む値は検証を通らない',
+  !CAB_OK.test('ok-1.jpg\n') && !CAB_OK.test('ok-1.jpg\r\n') && !CAB_OK.test(' ok-1.jpg')
+  && !CAB_OK.test('foo\nbar.jpg') && CAB_OK.test('ok-1.jpg'));
+check('cabinetFilePath: 20文字に収まる商品コードは従来どおりの名前 (転送済みを作り直さない)',
+  listing.cabinetFilePath('plastic', 'white') === 'plastic-white.jpg'
+  && listing.cabinetFilePath('plastic', '3') === 'plastic-3.jpg'
+  && listing.cabinetFilePath('siratamaishi', 'white') === 'siratamaishi-white.jpg'   // 18文字 (実績)
+  && listing.cabinetFilePath('PLASTIC', '1') === 'plastic-1.jpg');                   // 小文字化
+check('cabinetFilePath: 21文字になる商品コードは短縮する (silicateclay800-white が落ちていた実例)',
+  listing.cabinetFilePath('silicateclay800', 'white') !== 'silicateclay800-white.jpg'
+  && CAB_OK.test(listing.cabinetFilePath('silicateclay800', 'white'))
+  // 商品画像側 (17文字) は 20文字に収まるので従来のまま = 転送済みの 8 枚を作り直さない
+  && listing.cabinetFilePath('silicateclay800', '8') === 'silicateclay800-8.jpg');
+{
+  // 総当たり: 実在しうる商品コードの長さ × 枠 (white / 1〜20) が全部 20文字以内に収まること。
+  // 1つでも溢れると、その商品はその枠だけ転送できず出品が止まる
+  const suffixes = ['white', ...Array.from({ length: 20 }, (_, i) => String(i + 1))];
+  const codes = ['a', 'plastic', 'silicateclay800', 'x'.repeat(30), 'とても長い日本語の商品コード', 'a_b.c', '---leading', '9start'];
+  const bad = [];
+  for (const code of codes) {
+    for (const s of suffixes) {
+      const p = listing.cabinetFilePath(code, s);
+      if (!CAB_OK.test(p)) bad.push(`${code}/${s}→${p}`);
+    }
+  }
+  check('cabinetFilePath: どの商品コード × どの枠でも 20文字以内・先頭英数に収まる', bad.length === 0, bad.slice(0, 5).join(' '));
+  // 切り詰めても別商品と衝突しない (overWrite=true なので衝突すると他商品の画像を静かに壊す)
+  const long1 = 'a'.repeat(25);
+  check('cabinetFilePath: 先頭が同じ長い商品コード同士でも衝突しない',
+    listing.cabinetFilePath(long1, 'white') !== listing.cabinetFilePath(`${long1}b`, 'white')
+    && listing.cabinetFilePath(long1, '1') !== listing.cabinetFilePath(long1, '2'));
+}
+{
+  // 🚨 上限は product-hub (名前を作る側) と miniPC (受け取って検証する側) の2箇所にある。
+  // ここがズレていたのが #1163 の遠因 (miniPC=31文字 / 楽天の実際=20文字) なので、
+  // ズレたら気づけるようにソースから読んで突き合わせる
+  const svc = fs.readFileSync(path.join(__dirname, '..', '..', 'warehouse', 'rakuten-rms-service.js'), 'utf8');
+  const m = svc.match(/\{0,(\d+)\}\\\.jpg\$/);
+  check('cabinetFilePath: miniPC 側の filePath 検証と上限が一致している (20文字)',
+    !!m && Number(m[1]) + 1 === listing.CABINET_PATH_MAX && listing.CABINET_PATH_MAX === 20,
+    `miniPC=${m ? Number(m[1]) + 1 : '(読めず)'} / product-hub=${listing.CABINET_PATH_MAX}`);
+}
 // Cabinet ファイルパス: 情報が落ちる置換はハッシュ付与で一意化 (Codex High-3)
 check('skuCabinetFilePath: 素直なコードはそのまま / 特殊文字はハッシュ付与で衝突しない',
   listing.skuCabinetFilePath('sueders-db') === 'sueders-db-sku.jpg'
   && listing.skuCabinetFilePath('a_b') !== listing.skuCabinetFilePath('a.b')
-  && /^[a-z0-9][a-z0-9\-]{0,30}\.jpg$/.test(listing.skuCabinetFilePath('a_b'))
-  && /^[a-z0-9][a-z0-9\-]{0,30}\.jpg$/.test(listing.skuCabinetFilePath('とても長い日本語のSKUコード仮に置いたもの'))
-  && /^[a-z0-9][a-z0-9\-]{0,30}\.jpg$/.test(listing.skuCabinetFilePath('x'.repeat(96))));
+  && CAB_OK.test(listing.skuCabinetFilePath('a_b'))
+  && CAB_OK.test(listing.skuCabinetFilePath('とても長い日本語のSKUコード仮に置いたもの'))
+  && CAB_OK.test(listing.skuCabinetFilePath('x'.repeat(96))));
 check('skuCabinetFilePath: 切り詰めが必要な長い同接頭辞SKUも衝突しない (R2 High)',
   listing.skuCabinetFilePath('a'.repeat(40)) !== listing.skuCabinetFilePath('a'.repeat(40) + 'b'));
+check('skuCabinetFilePath: 実績のある短いSKUの名前は変わらない (転送済みを作り直さない)',
+  listing.skuCabinetFilePath('plastic-ki') === 'plastic-ki-sku.jpg');
 db.prepare(`DELETE FROM mirror_products WHERE product_id = 99401`).run();
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
 
@@ -6341,7 +6393,7 @@ for (const [name, file, data] of renders) {
     const id = mkDraft('LST-TRF');
     let registerCalled = false;
     const r = await bl.listToRakutenFromBoard(id, { actor: 'smoke', deps: {
-      transfer: async () => ({ ok: false, uploaded: 1, failed: 1, results: [{ outcome: 'uploaded' }, { outcome: 'failed', error: 'Drive 403: not shared' }] }),
+      transfer: async () => ({ ok: false, uploaded: 1, failed: 1, results: [{ outcome: 'uploaded' }, { outcome: 'failed', source: 'drive', error: 'Drive 403: not shared' }] }),
       register: async () => { registerCalled = true; return okRegister(id); },
     } });
     check('ボード出品: 転送に失敗したら登録を呼ばない', r.ok === false && r.stage === 'transfer' && !registerCalled, JSON.stringify(r).slice(0, 160));
@@ -6350,6 +6402,19 @@ for (const [name, file, data] of renders) {
       String(rkOf(id).last_error));
     check('ボード出品: 転送失敗では楽天モールは動かない', (mallOf(id).state || 'todo') !== 'done', JSON.stringify(mallOf(id)));
     db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+    // R-Cabinet 側で落ちたときに Drive の共有を疑わせない (#1163: 的外れな案内で
+    // 「ファイル名が長すぎる」という本当の理由が埋もれ、調べる方向を間違えた)
+    const idCab = mkDraft('LST-TRF-CAB');
+    await bl.listToRakutenFromBoard(idCab, { actor: 'smoke', deps: {
+      transfer: async () => ({ ok: false, uploaded: 0, failed: 1, results: [
+        { outcome: 'failed', source: 'cabinet', error: 'file insert 失敗 path=x-white.jpg (HTTP 400 / resultCode 3001)' },
+      ] }),
+      register: async () => okRegister(idCab),
+    } });
+    check('ボード出品: R-Cabinet 側の理由が出ているときは Drive の共有を疑わせない',
+      /resultCode 3001/.test(rkOf(idCab).last_error || '') && !/共有/.test(rkOf(idCab).last_error || ''),
+      String(rkOf(idCab).last_error));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idCab);
   }
   {
     // 画像が 1 枚も無い

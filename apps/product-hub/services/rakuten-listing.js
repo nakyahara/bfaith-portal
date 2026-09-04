@@ -389,11 +389,19 @@ export async function transferImagesToCabinet(draftId, { actor = null } = {}) {
       continue;
     }
     try {
-      const raw = await downloadDriveImage(img.drive_file_id);
+      // どの段で落ちたかを結果に残す (呼び出し側が「Drive の共有を疑え」の案内を出すか決める。
+      // メッセージの文言で判定すると、Google が返す 'File not found' のような文に引っかからない
+      // — Codex R1 medium)
+      let raw;
+      try {
+        raw = await downloadDriveImage(img.drive_file_id);
+      } catch (e) {
+        throw Object.assign(new Error(String(e.message || e)), { source: 'drive' });
+      }
       const jpeg = await toCabinetJpeg(raw);
-      // ファイル名は「商品コード-連番」(白抜きは -white)。同名は overWrite=true で置き換わる (再転送に安全)
-      const baseName = String(draft.ne_code).toLowerCase().replace(/[^a-z0-9\-]/g, '-');
-      const filePath = img.isWhiteBg ? `${baseName}-white.jpg` : `${baseName}-${n}.jpg`;
+      // ファイル名は「商品コード-連番」(白抜きは -white)。同名は overWrite=true で置き換わる (再転送に安全)。
+      // 20文字を超える商品コードはハッシュ入りの短い名前になる (cabinetFilePath 参照)
+      const filePath = cabinetFilePath(draft.ne_code, img.isWhiteBg ? 'white' : String(n));
       const up = await callWarehouse('/service-api/rakuten-rms/cabinet/upload', {
         method: 'POST',
         body: { folderId, filePath, fileName: img.isWhiteBg ? `${draft.ne_code} 白抜き` : `${draft.ne_code} ${n}`, fileBase64: jpeg.toString('base64') },
@@ -413,8 +421,13 @@ export async function transferImagesToCabinet(draftId, { actor = null } = {}) {
       `).run(draftId, img.drive_file_id, location, fileId ?? null, img.drive_modified_time || null);
       results.push({ driveFileId: img.drive_file_id, outcome: 'uploaded', location });
     } catch (e) {
-      // Drive の権限エラーはここに落ちる (SA がフォルダに共有されていない等)。画像単位で報告
-      results.push({ driveFileId: img.drive_file_id, outcome: 'failed', error: String(e.message || e).slice(0, 300) });
+      // Drive の権限エラー (SA がフォルダに共有されていない等) と R-Cabinet 側の失敗を
+      // source で区別して画像単位で報告する
+      results.push({
+        driveFileId: img.drive_file_id, outcome: 'failed',
+        source: e?.source === 'drive' ? 'drive' : 'cabinet',
+        error: String(e.message || e).slice(0, 300),
+      });
     }
   }
   const uploaded = results.filter((r) => r.outcome === 'uploaded').length;
@@ -506,21 +519,60 @@ export function skuImageKeyOfFileName(name) {
 }
 
 /**
+ * R-Cabinet の filePath の上限 (拡張子 .jpg を除いた文字数)。
+ *
+ * 🚨 2026-09-04 に実測した楽天の実際の制限。1文字でも超えると file insert が
+ * **resultCode 3001 (Input Parameter Error)** で拒否される:
+ *   silicateclay800-whitx (21文字) → HTTP 400 / resultCode 3001
+ *   silicateclay800-whit  (20文字) → HTTP 200 / resultCode 0
+ * それまでコードは「31文字以内」を前提にしており、商品コードが 15 文字以上の商品は
+ * 白抜き画像 (`<コード>-white`) が必ず転送できなかった (#1163)。
+ */
+export const CABINET_PATH_MAX = 20;
+
+/** 先頭は英数字でなければならない (R-Cabinet の制約)。切り詰めの後始末も兼ねる */
+function cabinetSafeHead(s, max) {
+  const head = String(s).slice(0, Math.max(1, max)).replace(/-+$/, '');
+  if (!head) return 'x';
+  return /^[a-z0-9]/.test(head) ? head : `x${head}`.slice(0, Math.max(1, max));
+}
+
+/**
+ * 商品画像 / 白抜き背景画像の R-Cabinet ファイルパス (pure・smoke対象)。
+ *
+ * **20文字に収まるときは従来どおりの名前**にする — 既に転送済みの商品のファイル名を
+ * 変えると、R-Cabinet に同じ画像が二重にでき、出品済みページの画像URLとも食い違う。
+ * 超えるときだけ、商品コードのハッシュを挟んだ短い名前にする。単純な切り詰めだと
+ * 先頭が同じ別商品と衝突し、overWrite=true で**他商品の画像を静かに上書き**してしまう
+ *
+ * @param {string} neCode 商品コード (NE)
+ * @param {string} suffix 'white' (白抜き) か '1'〜'20' (商品画像の枠番)
+ */
+export function cabinetFilePath(neCode, suffix) {
+  const sfx = String(suffix);
+  const safe = String(neCode).toLowerCase().replace(/[^a-z0-9\-]/g, '-').replace(/^-+/, '');
+  const plain = `${safe}-${sfx}`;
+  if (safe && /^[a-z0-9]/.test(plain) && plain.length <= CABINET_PATH_MAX) return `${plain}.jpg`;
+  // ハッシュは 8 桁 (Codex R1 最優先): 20文字枠でも 8 桁は入る。桁を削ると同接頭辞の商品が
+  // 増えたときの衝突確率が跳ね上がり、衝突は overWrite=true で他商品の画像を静かに壊す
+  const tail = `-${crypto.createHash('sha1').update(String(neCode)).digest('hex').slice(0, 8)}-${sfx}`;
+  return `${cabinetSafeHead(safe || 'x', CABINET_PATH_MAX - tail.length)}${tail}.jpg`;
+}
+
+/**
  * SKU画像の R-Cabinet ファイルパス (pure・smoke対象)。
  * 単純な英数置換だと a_b / a.b が同じ a-b になり別SKUの画像を上書きし得る (Codex High-3)
  * → 置換で情報が落ちる場合は元コードのハッシュ8桁を付けて一意にする。
- * cabinet/upload の制約 (先頭英数・計31文字以内 + .jpg) に収まるよう切り詰める
+ * cabinet/upload の制約 (先頭英数・計20文字以内 + .jpg) に収まるよう切り詰める
  */
 export function skuCabinetFilePath(skuCode) {
   const sku = String(skuCode);
-  let safe = sku.replace(/[^a-z0-9\-]/g, '-').replace(/^-+/, '');
+  const safe = sku.replace(/[^a-z0-9\-]/g, '-').replace(/^-+/, '');
   // 置換で情報が落ちる場合に加え、**切り詰めが必要な場合も**ハッシュを付ける
   // (Codex R2 High: 先頭が同じ長いSKU同士が切り詰めで衝突する)
-  const lossless = safe === sku && safe.length <= 31 - '-sku'.length;
+  const lossless = safe === sku && safe.length <= CABINET_PATH_MAX - '-sku'.length;
   const tail = lossless ? '-sku' : `-${crypto.createHash('sha1').update(sku).digest('hex').slice(0, 8)}-sku`;
-  safe = (safe || 'x').slice(0, Math.max(1, 31 - tail.length));
-  if (!/^[a-z0-9]/.test(safe)) safe = `x${safe}`.slice(0, Math.max(1, 31 - tail.length));
-  return `${safe}${tail}.jpg`;
+  return `${cabinetSafeHead(safe || 'x', CABINET_PATH_MAX - tail.length)}${tail}.jpg`;
 }
 
 /** Drive フォルダから「SKUコード」名のファイルを draft_sku_images に取り込む */
