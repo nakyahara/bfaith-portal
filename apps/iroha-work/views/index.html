@@ -766,6 +766,7 @@ async function loadStateOnce() {
     if (c) {
       if (detailCard && detailCard.work_history && c.work_history === undefined) c.work_history = detailCard.work_history;
       detailCard = c; detailCaps = state.capabilities || []; renderDetail(c);
+      fillWorkHistory(curDetail);   // 別の端末が終えた分も出す (Codex PR1 R18)
     }
     else forceCloseDetail('このカードは一覧から外れました');
   }

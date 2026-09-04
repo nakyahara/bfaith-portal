@@ -47,7 +47,7 @@ import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-che
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
 import {
-  addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
+  addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
   reportMediaUnavailable, recheckUnavailable, etagMatches, ifRangeMatches, singleRange,
   listPageSyncForAdmin, resetPageSync,
   isDriveConfigured, MEDIA_DIR, MAX_PHOTO_BYTES, MAX_PHOTOS,
@@ -1069,7 +1069,12 @@ router.post('/api/media/cancel', checkOrigin, api((req, res) => {
   if (!opId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'operation_id が必要です' });
   const out = getDB().transaction(() => {
     const row = getDB().prepare('SELECT * FROM f_iroha_card_media WHERE operation_id = ?').get(opId);
-    if (!row) return { r: { ok: true, already: true } };            // サーバーには何も無い = 取り消し済みと同じ
+    if (!row) {
+      // まだ届いていないだけかもしれない (通信が切れている)。⭐取り消しを控えて、
+      //   遅れて届いた元の送信を成立させない (Codex PR1 R18)
+      recordMediaCancel(opId, { deviceId: req.iwDevice ? req.iwDevice.id : null, actor: req.iwUser || null });
+      return { r: { ok: true, already: true } };
+    }
     if (row.deleted_at) return { r: { ok: true, already: true } };
     // 撮った端末か、PCの管理画面 (ポータル) からだけ
     const mine = req.iwDevice && Number(row.uploader_device_id) === Number(req.iwDevice.id);
@@ -1079,6 +1084,7 @@ router.post('/api/media/cancel', checkOrigin, api((req, res) => {
     const blocked = cardWriteBlockReason(row);
     if (blocked === 'notion_mode') return { deny: { status: 409, body: PREVIEW_WRITE_REJECTED } };
     if (blocked) return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: 'このカードの写真はもう変えられません' } } };
+    recordMediaCancel(opId, { deviceId: req.iwDevice ? req.iwDevice.id : null, actor: req.iwUser || null });
     return { r: softDeleteMedia(row.id, { actor: req.iwUser || null, isSession: true }) };
   }).immediate();
   if (out.deny) return res.status(out.deny.status).json(out.deny.body);

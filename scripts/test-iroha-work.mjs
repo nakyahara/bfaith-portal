@@ -1303,6 +1303,17 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
   const tmp2 = (name) => { const p = path.join(process.env.DATA_DIR, name); fs.writeFileSync(p, jpeg); return p; };
   const m1 = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('a1b1.jpg'), worker: getIrohaWorker(w1.id), operationId: 'op-a1b-0001' });
   ok(m1.ok && mediaByTask().get(tOpen).length === 1, 'task に写真が付く');
+  // 取り消した送信は、遅れて届いても成立させない (通信が切れている間に「やめる」が通っている — Codex PR1 R18)
+  {
+    const { recordMediaCancel, sweepMediaCancels } = await import('../apps/iroha-work/media.js');
+    ok(recordMediaCancel('op-cancel-0001', { deviceId: 31 }) === true, '取り消しを控える (行が無くても)');
+    const late = addMedia({ taskId: tOpen, productCode: 'PROD-A', kind: 'photo', filePath: tmp2('late.jpg'),
+      worker: getIrohaWorker(w1.id), deviceId: 31, operationId: 'op-cancel-0001' });
+    ok(late.ok === false && late.error === 'cancelled', '遅れて届いた元の送信は成立しない');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_card_media WHERE operation_id = 'op-cancel-0001'").get().c === 0, '写真も増えていない');
+    ok(sweepMediaCancels(0) >= 1, '古い控えは片づく');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_media_cancels").get().c === 0, '控えは残らない');
+  }
   // ⭐実体を置く前に落ちた行 (staged_at あり) は「無いもの」として扱い、再送で置き直せる (Codex PR1 R7)
   const { setMetaValue: setMeta18 } = await import('../apps/iroha-work/db.js');
   setMeta18('source_of_truth', 'app');   // 写真の公開は「そのカードにいま書けるとき」だけ (Codex PR1 R10)
@@ -2282,6 +2293,8 @@ console.log('\n[21] まとめて棚入完了・履歴・ラベル待ちの一覧
       '取消の判断 (取消) も断る');
     ok(TD.getTask(nt).cancellation_requested_at != null, '取消の要確認は消えていない');
     ok(TD.taskErrorStatus('notion_mode') === 409, '正本が切り替わった競合は 409 (入力不正の 400 ではない)');
+    ok(TD.startTaskSession({ taskId: nt, worker: getIrohaWorker(w1.id) }).error === 'notion_mode', '作業開始も断る');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(nt).c === 0, '記録も増えていない');
     db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL WHERE id = ?').run(nt);
     ok(TD.getTask(nt).status === 'ready_for_stocking' && TD.getTask(nt).external_ready === 0, 'どれも DB を変えていない');
     setMetaValue('source_of_truth', 'app');

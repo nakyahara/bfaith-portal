@@ -386,8 +386,9 @@ export function setExternalReady({ taskId, ready, expectVersion, actor = null, w
   const db = getDB();
   const t = getTask(taskId);
   if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
-  if (t.status === 'closed') return { ok: false, error: 'done_card', message: '終了したカードは変えられません' };
+  // 版の確認が先 (他の操作と同じ契約 — Codex PR1 R18)
   if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
+  if (t.status === 'closed') return { ok: false, error: 'done_card', message: '終了したカードは変えられません' };
   const v = ready ? 1 : 0;
   return db.transaction(() => {
     const g = appModeGuard();
@@ -633,6 +634,8 @@ export function _setStartTaskSessionHook(fn) { startTaskSessionHook = fn; }
 export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotOf = null }) {
   const db = getDB();
   const tx = db.transaction(() => {
+    const g = appModeGuard();   // 見てから書くまでに Notion 正本へ戻ることがある (Codex PR1 R18)
+    if (g) return g;
     const t = getTask(taskId);
     if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
     if (t.status === 'closed') {

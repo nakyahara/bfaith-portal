@@ -562,6 +562,15 @@ export function createTables(db = getMirrorDB()) {
   // 1 つ前の削除トークン (再送で配り直した直後、先に返したトークンが無効にならないように — Codex PR1 R10)
   addCol('f_iroha_card_media', 'delete_token_hash_prev', 'TEXT');
   addCol('f_iroha_card_media', 'delete_token_hashes', 'TEXT');   // 未失効のトークン (新しい順・最大5世代)
+  // 取り消した送信の控え (Codex PR1 R18)。「取り消し → 遅れて届いた元の送信が成立」を防ぐ。
+  // 通信が切れた送信は、サーバーに届いていないだけかもしれない = 行が無くても取り消しを覚えておく
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_iroha_media_cancels (
+      operation_id TEXT PRIMARY KEY,
+      device_id    INTEGER,
+      actor        TEXT,
+      created_at   TEXT NOT NULL
+    );`);
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}

@@ -238,6 +238,19 @@ export function promoteStagedMedia(id, localPath, { claim = null, stagedAt = nul
   }).immediate();
 }
 
+/** 送信の取り消しを控える (行が無くても覚えておく)。@returns 覚えたか */
+export function recordMediaCancel(opId, { deviceId = null, actor = null } = {}) {
+  return getDB().prepare(`INSERT INTO f_iroha_media_cancels (operation_id, device_id, actor, created_at)
+    VALUES (?, ?, ?, ?) ON CONFLICT(operation_id) DO NOTHING`)
+    .run(String(opId), deviceId == null ? null : Number(deviceId), actor, utcNow()).changes > 0;
+}
+
+/** 古い取り消しの控えを片づける (7 日。遅れて届く送信はとっくに諦めている) */
+export function sweepMediaCancels(maxAgeMs = 7 * 24 * 3600 * 1000) {
+  return getDB().prepare('DELETE FROM f_iroha_media_cancels WHERE created_at < ?')
+    .run(new Date(Date.now() - maxAgeMs).toISOString()).changes;
+}
+
 /** 一時ファイルを保管場所へ移す。deferMove で呼んだ側が、トランザクションを抜けてから呼ぶ */
 export function moveStoredFile(move) {
   if (!move) return;
@@ -343,6 +356,10 @@ export function addMedia({ pageId = null, taskId = null, productCode = null, kin
   if (pageId != null && taskId != null) return { ok: false, error: 'bad_request', message: 'カードの指定が二重です (page_id と task_id の両方)' };
   if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
   const db = getDB();
+  // 取り消された送信は、遅れて届いても成立させない (通信が切れている間に「やめる」が通っている — Codex PR1 R18)
+  if (db.prepare('SELECT 1 FROM f_iroha_media_cancels WHERE operation_id = ?').get(opId)) {
+    return { ok: false, error: 'cancelled', message: 'この写真は取り消されています (もう一度とってください)' };
+  }
   const dup = db.prepare('SELECT * FROM f_iroha_card_media WHERE operation_id = ?').get(opId);
   if (dup) {
     // 再送は「同じカード」のときだけ既存行を返す。別カード (切替前の Notion カードを含む) の operation_id なら
@@ -754,6 +771,7 @@ export async function processMediaQueue() {
     sweepStagedMedia();
     // どの行からも指されていない実体ファイルを片づける (十分に古いものだけ — Codex PR1 R14)
     sweepOrphanFiles();
+    sweepMediaCancels();   // 古い取り消しの控えを片づける
     // 配信で見つかった「ドライブから消えた」写真の印をここで付ける (GET では書かない — Codex PR1 R9)
     flushUnavailableReports();
     // ①Drive へ (stored の行)。成功したらそのページの Notion 貼り直しを予約
