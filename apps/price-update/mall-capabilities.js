@@ -46,6 +46,19 @@ export const MALL_CAPABILITIES = {
     // ★Amazon は「経路が無い」のではなく「このツールでは扱わない」。理由が違うので文言を分ける
     blockReason: 'Amazon は本ツールの更新対象外です (既存の価格管理の仕組みを使ってください)',
   },
+  linegift: {
+    label: 'LINEギフト',
+    // 2026-09-04〜: 現在売価は読める (GET /api/v1/shops/{shop_id}/items/{item_id} の price)。
+    // ★更新はしない。価格専用の更新APIが無く PATCH /items/{item_id} = 商品まるごと更新しか無いため
+    //   (Yahoo editItem と同じ「送らなかった項目が消える」危険)。さらに GET が返す画像は id+url なのに
+    //   PATCH は temporary_uuid を要求するので、読んだ画像を送り返せない = 全上書きなら復元できない。
+    //   部分更新かを実測するまで書き込みは作らない。
+    updatable: false,
+    executable: false,
+    // variations に price が無い (在庫だけ) ことを実データで確認済 (2026-09-04 nikukyu15)
+    priceScope: 'item',
+    blockReason: 'LINEギフトは価格だけを変える API が無いため、本ツールでは表示のみです (更新は管理画面で)',
+  },
   qoo10: {
     label: 'Qoo10',
     // 2026-09-02〜: ItemsOrder.SetGoodsPriceQty (価格専用 API) で更新できる。

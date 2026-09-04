@@ -106,7 +106,7 @@ console.log('\n── 引き当て (mirror 由来はすべて rule 以下) ─�
   ok(!!set && set.rowKind === 'set', 'セットも一覧に入る');
   eq(set.cost, 1300, 'セット行の原価は構成から再計算した値');
   const malls = [...new Set(single.listings.map((l) => l.mall))].sort();
-  eq(malls, ['amazon', 'aupay', 'qoo10', 'rakuten', 'yahoo'].filter((m) => malls.includes(m)), 'モールごとに候補が出る');
+  eq(malls, ['amazon', 'aupay', 'linegift', 'qoo10', 'rakuten', 'yahoo'].filter((m) => malls.includes(m)), 'モールごとに候補が出る');
   ok(single.listings.every((l) => l.confidence !== 'confirmed'), '★mirror 由来だけでは confirmed にしない');
   const yahoo = single.listings.filter((l) => l.mall === 'yahoo');
   ok(yahoo.some((l) => l.listingCode === 'abc-001'), 'Yahoo は「出品コード=NEコード」規則で候補を出す');
@@ -518,7 +518,7 @@ console.log('\n── 引き当てできないモールは行を消さず「未�
 {
   const { targets } = buildTargets(db, ['abc-002']);   // 楽天/Amazon の map を持たない商品
   const malls = targets[0].listings.map((l) => l.mall).sort();
-  eq(malls, ['amazon', 'aupay', 'qoo10', 'rakuten', 'yahoo'], '5モールすべての行が出る');
+  eq(malls, ['amazon', 'aupay', 'linegift', 'qoo10', 'rakuten', 'yahoo'], '6モールすべての行が出る');
   const rak = targets[0].listings.find((l) => l.mall === 'rakuten');
   eq(rak.confidence, 'unresolved', '楽天は未解決');
   eq(rak.listingCode, null, '出品コードは空');

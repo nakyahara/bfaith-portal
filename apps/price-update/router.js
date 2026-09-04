@@ -19,6 +19,7 @@ import { getDB, insertRun, appendEvent, getRun, listRuns, newId, runClaim, recov
 import { planRecovery, buildRecoveryOperations, RECOVERABLE_STATES } from './recovery.js';
 import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
 import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot, fetchAupayPrices, fetchQoo10Prices } from './live-price.js';
+import { fetchLinegiftPrices } from './linegift-read.js';
 import { evaluateRow, runLimits, mergeGuardWarns } from './pricing.js';
 import { rakutenShippingLabel, yahooPostageLabel, rakutenShippingName, yahooPostageName, aupayPostageLabel } from './shipping-labels.js';
 import { executeRun, mallWriteEnabled } from './execute.js';
@@ -148,6 +149,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   const yahooTargets = [];
   const aupayTargets = [];
   const qoo10Targets = [];
+  const linegiftTargets = [];
   const amazonSkus = [];
   for (const t of targets) {
     for (const l of t.listings) {
@@ -161,6 +163,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       else if (l.mall === 'yahoo') yahooTargets.push({ key: l.listingCode, candidates: l.candidates || [l.listingCode] });
       else if (l.mall === 'aupay') aupayTargets.push({ key: l.listingCode, candidates: [l.listingCode] });
       else if (l.mall === 'qoo10') qoo10Targets.push({ key: rakutenRowKey(t, l), itemNo: l.listingCode });
+      else if (l.mall === 'linegift') linegiftTargets.push({ key: rakutenRowKey(t, l), code: l.listingCode });
       else if (l.mall === 'amazon') amazonSkus.push(l.listingCode);
     }
   }
@@ -170,6 +173,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   let yahooPrices = new Map();
   let aupayPrices = new Map();
   let qoo10Prices = new Map();
+  let linegiftPrices = new Map();
   if (rakutenTargets.length > 0) {
     try {
       rakutenPrices = await fetchRakutenPrices(rakutenTargets, deps);
@@ -196,6 +200,13 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       qoo10Prices = await fetchQoo10Prices(qoo10Targets, deps);
     } catch (e) {
       notices.push(`Qoo10 の設定価格を取得できませんでした: ${e.message}`);
+    }
+  }
+  if (linegiftTargets.length > 0) {
+    try {
+      linegiftPrices = await (deps.fetchLinegiftPrices || fetchLinegiftPrices)(linegiftTargets, deps);
+    } catch (e) {
+      notices.push(`LINEギフトの設定価格を取得できませんでした: ${e.message}`);
     }
   }
   const amazonSnap = loadAmazonSnapshot(db, amazonSkus);
@@ -294,6 +305,19 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
           sharedNote = 'Qoo10 のオプション価格は商品価格への差額です。変えると全オプションの実売価がいっしょに動きます';
           note = note ? `${note} / ${sharedNote}` : sharedNote;
         } else {
+          note = p?.reason || '設定価格を取得できませんでした';
+        }
+      } else if (l.mall === 'linegift') {
+        // ★表示だけ。updatable:false なので新売価の入力欄は出ない (mall-capabilities.js)
+        const p = linegiftPrices.get(rakutenRowKey(t, l));
+        if (p?.found) {
+          price = p.price; priceSource = 'LINEギフト 商品API (ライブ)'; priceIsLive = true;
+          confidence = 'confirmed';
+          if (p.itemCode) listingCode = p.itemCode;
+          if (p.webUrl) url = p.webUrl;   // 出品コードからは組み立てられないので応答の web_url を使う
+          note = '表示のみ (更新は管理画面で)';
+        } else {
+          // 🚨「未出品」とは言わない。引き当てできなかっただけかもしれない
           note = p?.reason || '設定価格を取得できませんでした';
         }
       } else if (l.mall === 'amazon') {

@@ -58,6 +58,7 @@ import fbaServiceRouter from './fba-service.js';
 import researchServiceRouter from './research-service.js';
 import rakutenRmsServiceRouter from './rakuten-rms-service.js';
 import qoo10PriceServiceRouter from './qoo10-price-service.js';
+import linegiftPriceServiceRouter from './linegift-price-service.js';
 import rankcheckServiceRouter from './rankcheck-service.js';
 import crossSellServiceRouter from './cross-sell-service.js';
 import selectSetServiceRouter from './select-set-service.js';
@@ -67,6 +68,8 @@ router.use('/fba', fbaServiceRouter);
 router.use('/research', researchServiceRouter);
 router.use('/rakuten-rms', rakutenRmsServiceRouter);
 router.use('/qoo10', qoo10PriceServiceRouter);
+// ★LINEギフトは読み取り専用 (書き込みの口は作っていない。理由は linegift-price-service.js の冒頭)
+router.use('/linegift', linegiftPriceServiceRouter);
 router.use('/rankcheck', rankcheckServiceRouter);
 router.use('/cross-sell', crossSellServiceRouter);
 router.use('/select-set', selectSetServiceRouter);
