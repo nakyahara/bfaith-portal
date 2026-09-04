@@ -1880,6 +1880,17 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         const optRes = await call('POST', '/api/options', { cookie, body: { id: open.id, kind: 'material', code: 'PREVIEW-X', worker_id: staff2.id, pin: '4649' } });
         ok(optRes.status === 409 && optRes.json.error === 'notion_mode', '下見の id を添えた選択肢の登録は 409');
         ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c === optBefore, '選択肢も増えていない');
+        // 商品コードの無い Notion カードを添えても、よその商品の作業のやり方は書き換えられない (Codex PR1 R5)
+        {
+          db.prepare(`INSERT OR REPLACE INTO f_iroha_app_notion_cache (page_id, status, title, product_code, fetched_at)
+            VALUES ('cache-nocode', '未着手', '商品コードなし', NULL, ?)`).run(new Date().toISOString());
+          const beforeM = db.prepare("SELECT COUNT(*) c FROM f_iroha_work_master WHERE code_key = 'hist-a'").get().c;
+          const r = await call('POST', '/api/master', { cookie, body: { id: 'cache-nocode', code: 'HIST-A',
+            fields: { note: '商品コードなしのカードから' }, worker_id: staff2.id, pin: '4649', expect_version: 1 } });
+          ok(r.status === 409 && r.json.error === 'card_mismatch', '商品コードの無いカードを添えた作業のやり方の書き換えは 409');
+          ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_master WHERE code_key = 'hist-a'").get().c === beforeM,
+            'その商品のマスタは変わっていない');
+        }
         // 詳細には「このカードの終わった作業」が付く (一覧には付けない — 2222 枚ぶん引かない)
         const withWork = db.prepare(`SELECT task_id FROM f_iroha_work_sessions
           WHERE task_id IS NOT NULL AND ended_at IS NOT NULL AND voided_at IS NULL GROUP BY task_id ORDER BY task_id LIMIT 1`).get();

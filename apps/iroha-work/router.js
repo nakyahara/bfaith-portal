@@ -151,6 +151,19 @@ function isClosedCardId(cardId) {
  * そのカードが「いま書ける」ものかをサーバーで確かめる。断るなら返す本文、通るなら null。
  * 省略・空・でたらめな id で検査を素通りできないようにする (Codex PR1 R3)
  */
+/**
+ * カードの確認と書き込みを 1 つのトランザクションで行う (Codex PR1 R5)。
+ * 確認した直後に別の接続がカードを終了させても、書き込みが後から成立しないようにする。
+ * fn が返した値をそのまま返す。断るときは { deny } を返す
+ */
+function inWritableCard(rawId, opts, fn) {
+  return getDB().transaction(() => {
+    const gate = writableCard(rawId, opts);
+    if (gate.deny) return { deny: gate.deny };
+    return fn(gate);
+  }).immediate();
+}
+
 function writableCard(rawId, { code = null } = {}) {
   const cardId = String(rawId == null ? '' : rawId).trim();
   if (!cardId) return { deny: { ok: false, error: 'card_required', message: 'どのカードからの操作かが必要です (一覧を更新してください)' } };
@@ -638,6 +651,7 @@ router.post('/api/options', checkOrigin, api((req, res) => {
   // 添えた要求は受けない (「下見の id を送っても DB が変わらない」を全ての書き込み口で同じにする)
   // 候補の登録は詳細のダイアログからしか呼ばない。どのカードから来たかを必ず添えてもらい、
   // 「いま書けるカード」でなければ断る (省略・空・でたらめで検査を素通りできないように — Codex PR1 R3)
+  // 断る条件は下の書き込みと同じトランザクションでもう一度見る (ここは先に軽く弾くだけ)
   const optGate = writableCard(req.body?.id ?? req.body?.page_id);
   if (optGate.deny) return res.status(409).json(optGate.deny);
   if (!hasSessionAccess(req)) {
@@ -650,7 +664,9 @@ router.post('/api/options', checkOrigin, api((req, res) => {
   // 記録上の主体: ポータルセッションなら本人 (worker_id は画面で選んだ名前に過ぎない — Codex R1 #4)。
   // 無効化された候補の復帰は管理者だけ (allowReactivate=false — Codex R1 #1)
   const actor = hasSessionAccess(req) ? `${req.iwUser} (ポータル)` : `${w.worker.display_name} (いろはアプリ)`;
-  const r = addWorkOption({ kind: req.body?.kind, code: req.body?.code, actor, allowReactivate: false });
+  const r = inWritableCard(req.body?.id ?? req.body?.page_id, {},
+    () => addWorkOption({ kind: req.body?.kind, code: req.body?.code, actor, allowReactivate: false }));
+  if (r.deny) return res.status(409).json(r.deny);
   if (!r.ok) return res.status(r.error === 'inactive_option' ? 409 : 400).json(r);
   safeLog({ action: 'option_add', pageId: null, workerId: w.worker.id, workerName: w.worker.display_name,
     deviceLabel: deviceLabelOf(req), to: `${req.body?.kind}:${r.option.code}${r.already ? ' (既存)' : ''}`, ok: true });
@@ -731,6 +747,9 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   let result;
   try {
     result = db.transaction(() => {
+      // 書き込みの直前にもう一度カードを見る (確認の後に別の接続が終了させていたら、ここで止める)
+      const gate = writableCard(req.body?.id ?? req.body?.page_id, { code });
+      if (gate.deny) { const e = new Error('card'); e[rollback] = { status: 409, body: gate.deny }; throw e; }
       let cur = row;
       let applyFields = fields;
       let expect;
@@ -825,19 +844,30 @@ router.post('/api/media', checkOrigin, mediaUploadOne, api((req, res) => {
     const task = appMode ? getTask(parseTaskId(cardId)) : null;
     const card = appMode ? null : getCachePage(cardId);
     if (appMode ? !task : !card) { cleanup(); return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' }); }
-    // 終了したカード (履歴) には足せない。削除を断っているのと同じ理由 — 履歴は読むだけ (要件 v1.3 §P Q5)
-    if (appMode && task.status === 'closed') {
-      cleanup();
-      return res.status(409).json({ ok: false, error: 'closed_task', message: '終了したカードには写真を足せません (履歴として残ります)' });
-    }
-    const productCode = appMode ? task.product_code : card.product_code;
-    const r = addMedia({
-      pageId: appMode ? null : cardId, taskId: appMode ? task.id : null,
-      productCode, kind, mime: req.file.mimetype,
-      filePath: req.file.path, worker: w.worker, deviceLabel: deviceLabelOf(req),
-      deviceId: req.iwDevice ? req.iwDevice.id : null,
-      operationId: req.body?.operation_id,
-    });
+    // 終了したカード (履歴) には足せない。削除を断っているのと同じ理由 — 履歴は読むだけ (要件 v1.3 §P Q5)。
+    // ⭐確かめるところと足すところを 1 つのトランザクションに入れる。外で確かめると、確かめた後・
+    //   足す前に別の接続がカードを終了させられる (miniPC も同じ DB を見る — Codex PR1 R5)
+    const NOT_FOUND = { status: 404, body: { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' } };
+    const out = getDB().transaction(() => {
+      if (appMode) {
+        const cur = getTask(task.id);
+        if (!cur) return { deny: NOT_FOUND };
+        if (cur.status === 'closed') {
+          return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: '終了したカードには写真を足せません (履歴として残ります)' } } };
+        }
+      } else if (!getCachePage(cardId)) {
+        return { deny: NOT_FOUND };
+      }
+      return { r: addMedia({
+        pageId: appMode ? null : cardId, taskId: appMode ? task.id : null,
+        productCode: appMode ? task.product_code : card.product_code, kind, mime: req.file.mimetype,
+        filePath: req.file.path, worker: w.worker, deviceLabel: deviceLabelOf(req),
+        deviceId: req.iwDevice ? req.iwDevice.id : null,
+        operationId: req.body?.operation_id,
+      }) };
+    }).immediate();
+    if (out.deny) { cleanup(); return res.status(out.deny.status).json(out.deny.body); }
+    const r = out.r;
     if (!r.ok) { cleanup(); return res.status(r.error === 'cap_reached' || r.error === 'operation_conflict' ? 409 : 400).json(r); }
     if (appMode) {
       safeLogTaskEvent({ taskId: task.id, action: `media_${kind}`, workerId: w.worker.id, workerName: w.worker.display_name,
@@ -924,19 +954,24 @@ router.get('/api/media/:id(\\d+)/file', api(async (req, res) => {
 router.post('/api/media/:id(\\d+)/delete', checkOrigin, api((req, res) => {
   // 読むだけの写真は消せない: Notion 正本の間の tasks の写真 (下見) と、終了したカードの写真 (履歴)。
   // 画面は × を描かないが、撮った端末は削除トークンを持ったままなので、サーバーでも断る (要件 v1.3 §P Q5)
-  const row = getMediaRow(Number(req.params.id));
-  if (row && row.task_id != null) {
-    if (!isAppMode()) return res.status(409).json(PREVIEW_WRITE_REJECTED);
-    const t = getTask(row.task_id);
-    if (t && t.status === 'closed') {
-      return res.status(409).json({ ok: false, error: 'closed_task', message: '終了したカードの写真は消せません (履歴として残ります)' });
+  // ⭐判定と削除を 1 つのトランザクションに (判定の後・消す前に終了されると履歴の写真が消える — Codex PR1 R5)
+  const out = getDB().transaction(() => {
+    const row = getMediaRow(Number(req.params.id));
+    if (row && row.task_id != null) {
+      if (!isAppMode()) return { deny: { status: 409, body: PREVIEW_WRITE_REJECTED } };
+      const t = getTask(row.task_id);
+      if (t && t.status === 'closed') {
+        return { deny: { status: 409, body: { ok: false, error: 'closed_task', message: '終了したカードの写真は消せません (履歴として残ります)' } } };
+      }
     }
-  }
-  const r = softDeleteMedia(Number(req.params.id), {
-    deleteToken: req.body?.delete_token || null,
-    actor: req.iwUser || null,
-    isSession: hasSessionAccess(req),
-  });
+    return { r: softDeleteMedia(Number(req.params.id), {
+      deleteToken: req.body?.delete_token || null,
+      actor: req.iwUser || null,
+      isSession: hasSessionAccess(req),
+    }) };
+  }).immediate();
+  if (out.deny) return res.status(out.deny.status).json(out.deny.body);
+  const r = out.r;
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 403)).json(r);
 }));
 

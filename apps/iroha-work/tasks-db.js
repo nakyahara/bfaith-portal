@@ -250,6 +250,9 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   // それ以外は今までどおり、記録に失敗しても操作は成立させる (現場を止めない)
   const reopening = t.status === 'closed';
   const applied = db.transaction(() => {
+    // 先に version を見る。別の端末が先に変えていたなら「競合」であって「作業中」ではない (Codex PR1 R5)
+    const now2 = db.prepare('SELECT version FROM f_iroha_tasks WHERE id = ?').get(t.id);
+    if (!now2 || now2.version !== t.version) return false;
     // 終了にするなら、**このトランザクションの中で**作業中の人を数える。
     // 外で数えると、数えた後・更新する前に別の接続 (miniPC も同じ DB を見る) が作業を始められる (Codex PR1 R4)
     if (to === 'closed') {
