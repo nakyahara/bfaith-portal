@@ -74,7 +74,7 @@ import {
   listToRakutenFromBoard, afterRakutenRegistered, acquireRakutenListingLock, assertRakutenListable, rememberUnknownOutcome,
 } from './services/board-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
-import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
+import { fetchGenreChildren, suggestGenreByName, genrePathOf, genreIdFromItemUrl } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {
@@ -1413,6 +1413,29 @@ router.get('/api/rakuten/genre-children', async (req, res) => {
   } catch (e) {
     const status = e?.statusCode === 503 ? 503 : 502;
     res.status(status).json({ ok: false, error: String(e.message || e).slice(0, 200) });
+  }
+});
+
+// 他社の商品ページURLからジャンルIDを調べる (2026-09-04 中原さん要望)。
+// 商品検索API では引けない (itemCode は内部IDで、URL 末尾の商品管理番号とは別物 — 実測) ため
+// 公開ページの埋め込み JSON から読む。ジャンル名は RMS の属性辞書で補完し、
+// **末端ジャンルでなければそこで 404 になる** = そのまま出品に使えるかまで分かる
+router.post('/api/rakuten/genre-from-url', async (req, res) => {
+  try {
+    const r = await genreIdFromItemUrl(req.body?.url);
+    if (!r.ok) return res.status(400).json({ ok: false, error: r.error });
+    const db = getDB();
+    let path = null;
+    let usable = false;
+    // 鮮度管理と「廃止・非末端化したジャンルの 404 で古い行を消す」は fetchGenreAttributes が持つ。
+    // 無期限のキャッシュを先に見ると、使えなくなったジャンルを「使えます」と表示してしまう (Codex R1)
+    try {
+      const g = await fetchGenreAttributes(db, r.genreId, { timeoutMs: 10_000 });
+      if (g.ok) { path = g.genre.genrePath || g.genre.genreName || null; usable = true; }
+    } catch (_) { /* miniPC 不達や末端でないジャンルはパス無しで返す (ID は返せる) */ }
+    res.json({ ok: true, genreId: r.genreId, path, usable, shopCode: r.shopCode, itemCode: r.itemCode, cached: r.cached === true });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 200) });
   }
 });
 
