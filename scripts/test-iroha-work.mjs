@@ -3079,12 +3079,21 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // ⭐職員モードに入る入口 (これが無いと、計画の操作が一生描かれない)
   ok(/<button class="who" id="staffBtn" hidden><\/button>/.test(html) && /function renderStaffBtn\(\)/.test(html),
     'ヘッダに「職員モード」のボタンがある');
-  ok(/if \(!w \|\| w\.worker_type !== 'staff'\) \{ b\.hidden = true; return; \}/.test(html),
-    '職員を選んでいるときだけ出す (利用者には出さない)');
-  ok(/if \(sm\.via === 'session'\) \{ b\.hidden = true; return; \}/.test(html),
-    'ポータルから入っている人には要らない (最初から職員扱い)');
-  ok(/'🔓 職員モード あと' \+ min \+ '分'/.test(html) && /async function endStaffMode\(\)/.test(html),
-    '入っていれば残り時間を出し、その場で終われる');
+  ok(/const hide = \(\) => \{ b\.hidden = true; b\.textContent = ''; b\.onclick = null; \};/.test(html),
+    '出さないときは中身も動きも消す (hidden にするだけで押せる要素を残さない)');
+  ok(/if \(sm\.via === 'session'\) return hide\(\);/.test(html) && /if \(!w \|\| w\.worker_type !== 'staff'\) return hide\(\);/.test(html),
+    '職員を選んでいるときだけ出す (利用者・ポータルの人には出さない)');
+  ok(/Math\.max\(1, Math\.ceil\(leftMs \/ 60000\)\)/.test(html),
+    '残り時間は切り上げ (「あと0分」で押せるままにしない)');
+  ok(/setInterval\(\(\) => \{ if \(state && state\.staff_mode && state\.staff_mode\.staff\) renderStaffBtn\(\); \}, 30000\);/.test(html),
+    '残り時間は 30 秒ごとに見直す (通信が無くても固まらない)');
+  ok(/if \(sm\.until && leftMs <= 0\) \{\r?\n\s+\/\/[^\r\n]*\r?\n\s+dropPlanCaps\(\);/.test(html),
+    '期限が来たら画面の中の許可を落として取り直す (計画のボタンが残らない)');
+  ok(/function dropPlanCaps\(\)/.test(html) && /state\.capabilities = \(state\.capabilities \|\| \[\]\)\.filter\(\(c\) => c !== 'task\.plan\.assign' && c !== 'task\.facility\.assign'\);/.test(html),
+    '職員モードを抜けたら、画面の中の許可もその場で落とす');
+  ok(/if \(!j\.ok\) \{ showErr\(j\.message \|\| '職員モードを終われませんでした'\); return; \}/.test(html)
+    && /dropPlanCaps\(\);\r?\n\s+toast\('職員モードを終わりました'\);/.test(html),
+    '終わるときは取り直しの成功に頼らない (通信が失敗しても「終わったのにボタンが残る」を作らない)');
   ok(/renderStaffBtn\(\);   \/\/ 職員を選んだら/.test(html), '作業者を選び直したらボタンも出し直す');
   ok(/function planTagsHtml\(c\)/.test(html) && /const canFac = stateCan\('task\.facility\.assign'\);/.test(html)
     && /const canWhen = stateCan\('task\.plan\.assign'\);/.test(html),

@@ -1408,26 +1408,60 @@ async function planError(j, retry, { silent = false } = {}) {
 function renderStaffBtn() {
   const b = $('#staffBtn');
   if (!b) return;
+  // 出さないときは**中身も動きも消す** — hidden にするだけだと、押せる要素が残る (要件 §U-7)
+  const hide = () => { b.hidden = true; b.textContent = ''; b.onclick = null; };
   const w = worker;
   const sm = (state && state.staff_mode) || {};
   // ポータル (PC の管理画面) から入っている人は最初から職員扱いなので、ボタンは要らない
-  if (sm.via === 'session') { b.hidden = true; return; }
-  if (!w || w.worker_type !== 'staff') { b.hidden = true; return; }
+  if (sm.via === 'session') return hide();
+  if (!w || w.worker_type !== 'staff') return hide();
   b.hidden = false;
   if (sm.staff) {
-    const min = sm.until ? Math.max(0, Math.round((Date.parse(sm.until) - Date.now()) / 60000)) : 0;
-    b.textContent = '🔓 職員モード あと' + min + '分';
+    const leftMs = sm.until ? Date.parse(sm.until) - Date.now() : 0;
+    if (sm.until && leftMs <= 0) {
+      // 期限が来た → 画面の中の許可も落として取り直す (計画のボタンが残らない)
+      dropPlanCaps();
+      loadState();
+      return;
+    }
+    // 切り上げ (あと 30 秒でも「あと1分」。0 分と出して押せるままにしない)
+    b.textContent = '🔓 職員モード あと' + Math.max(1, Math.ceil(leftMs / 60000)) + '分';
     b.onclick = endStaffMode;
   } else {
     b.textContent = '🔑 職員モードに入る';
     b.onclick = async () => { if (await askStaffUnlock()) await loadState(); };
   }
 }
+// 残り時間は放っておくと固まる (通信が無ければ描き直されない)。30 秒ごとに見直す
+setInterval(() => { if (state && state.staff_mode && state.staff_mode.staff) renderStaffBtn(); }, 30000);
+
+/**
+ * 画面の中の「計画の許可」をその場で落とす。
+ * サーバーに頼まなくても、職員モードを終えた瞬間・期限が来た瞬間にボタンを消すため
+ */
+function dropPlanCaps() {
+  if (!state) return;
+  state.staff_mode = { staff: false };
+  state.capabilities = (state.capabilities || []).filter((c) => c !== 'task.plan.assign' && c !== 'task.facility.assign');
+  planData = null;
+  clearPlanDom();
+  if (curView === 'plan') setView('board');
+  if (facPickCtx) closeFacPick();
+  renderStaffBtn();
+  renderList();
+  renderBoard();
+  if (curDetail && detailCard) renderDetail(detailCard, { keepScroll: true });
+}
+
 async function endStaffMode() {
   if (!window.confirm('職員モードを終わりますか? (明日の計画は決められなくなります)')) return;
-  await apiFetch('/api/staff-lock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
-  await loadState();
+  const j = await apiFetch('/api/staff-lock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  if (!j.ok) { showErr(j.message || '職員モードを終われませんでした'); return; }
+  // ⭐取り直しを待たずに、その場で許可を落とす。
+  //   ここで loadState() の成功に頼ると、通信が失敗したときに「終わったのにボタンが残る」(Codex R1)
+  dropPlanCaps();
   toast('職員モードを終わりました');
+  loadState();   // 念のため取り直す (失敗しても上で落としてある)
 }
 
 /** 職員モードに入る (PIN を 1 回)。入れたら true */
