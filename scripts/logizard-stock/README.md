@@ -8,6 +8,8 @@ Logizard (毎時 9-18時)
   ↓ ① auto-zaiko.js (C:\tools\logizard-automation、Edgeヘッドレス、多段検証つきDL)
 C:\tools\logizard-automation\out\logizard_zaikosu.csv
   ↓ ② apps/warehouse/csv-import.js logizard  → warehouse.db raw_lz_inventory (全置換・単一トランザクション)
+  ├→ ②b scripts/logizard-stock/archive-snapshot.mjs → data\logizard-history\YYYY\MM\zaiko_YYYYMMDD_HHMM.csv.gz
+  │   (在庫の履歴。2026-09-05 から。毎時 90 日 + 日次永久、manifest.jsonl、任意で rclone offsite)
   ├→ 欠品LINE通知: PickingServer が service-api (/service-api/logizard-stock/locations) 経由で
   │   「同一SKUの他ロケ在庫」を通知本文に載せる (ローカル参照・fail-soft)
   └→ ③ apps/warehouse/sync-to-render.js --logizard-only → Render mirror_logizard_stock (全置換+件数検証)
@@ -16,8 +18,19 @@ C:\tools\logizard-automation\out\logizard_zaikosu.csv
 ## 設計の要点
 
 - **欠品通知はローカル参照** (miniPC内で完結)。Render/回線障害が現場の通知を止めない。
-- **時系列は持たない**。常に最新スナップショットのみ (`raw_lz_inventory` 全置換)。
+- **DB 側は時系列を持たない**。常に最新スナップショットのみ (`raw_lz_inventory` 全置換)。
   取込は DELETE+INSERT を**単一トランザクション**で行い、通知が取込中に空テーブルを見ることはない。
+- **履歴は CSV の圧縮保存で持つ (②b、2026-09-05〜)**。Company DB構想の実機確認で「在庫の時系列がどこにも無い
+  (DB は全置換、CSV も上書き)」と分かり、本命 (Company DB の追記表、Phase 3) までの 0 円対策として追加。
+  - 保存先 `C:\Users\bfaith\bfaith-portal\data\logizard-history\YYYY\MM\zaiko_YYYYMMDD_HHMM.csv.gz`
+    (時刻 = CSV の更新時刻 JST。2.7MB → 約 0.2〜0.3MB)。`manifest.jsonl` に 1 行/回 (snapshot_at, rows, sha256)
+  - 二重保存しない: 前回と sha256 + 更新時刻が同じ CSV、更新時刻が 3 時間より古い CSV (DL 失敗で残った旧ファイル) は skip
+  - 世代: 毎時ファイルは 90 日、それより古い日は「その日の最後の 1 本」だけ残す (= 日次スナップショット永久)
+  - offsite: `BACKUP_RCLONE_REMOTE` (例 gdrive:bfaith-backup/warehouse) があれば兄弟 `gdrive:bfaith-backup/logizard-history` へ
+    直近 2 日分を `rclone copy` (削除はしない)。`LOGIZARD_HISTORY_RCLONE_REMOTE` で明示も可。失敗しても取込結果は変えない
+  - 失敗時: ping は ok/partial のまま、note に `archive failed`。ログは同じ `logizard-stock-hourly.log`
+  - 読み方 (例): `zcat 2026/09/zaiko_20260905_1800.csv.gz | iconv -f CP932 -t UTF-8 | head`。列は ①の CSV と同じ
+    (在庫日, ブロック略称, ロケ, 商品ID, 在庫数(引当数を含む), 引当数 …)。Phase 3 でこの gz 群を Company DB へ初期ロードする
 - **鮮度は必ず表示**。通知に「HH:MM時点」(sync_meta.logizard_last_import 由来) を添え、
   180分超は「⚠古い可能性」。**0件 (なし) と取得不能 (取得できず) は別表示**。
 - mirror push は **取込90分以内のときだけ** 送る (古い snapshot の再送で synced_at だけ
