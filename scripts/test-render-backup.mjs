@@ -21,7 +21,9 @@ delete process.env.GCHAT_WEBHOOK;
     CREATE TABLE mirror_products (id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE mart_pl (id INTEGER PRIMARY KEY, v REAL);
     CREATE TABLE sync_run_ledger (id INTEGER PRIMARY KEY, note TEXT);
-    CREATE TABLE po_orders (id INTEGER PRIMARY KEY, supplier TEXT, status TEXT);
+    -- 生成列 (VIRTUAL / STORED) は INSERT 対象外 → 論理エクスポートが SELECT * に依存しないことの回帰テスト (Codex R1)
+    CREATE TABLE po_orders (id INTEGER PRIMARY KEY, supplier TEXT, status TEXT, qty INTEGER NOT NULL DEFAULT 1,
+      qty_x2 INTEGER GENERATED ALWAYS AS (qty * 2) VIRTUAL, qty_x3 INTEGER GENERATED ALWAYS AS (qty * 3) STORED);
     CREATE TABLE f_mis_shipments (id INTEGER PRIMARY KEY, detail TEXT);
     CREATE TABLE inv_snapshot (id INTEGER PRIMARY KEY, month TEXT);
     CREATE TABLE ai_reports (id INTEGER PRIMARY KEY, body TEXT);

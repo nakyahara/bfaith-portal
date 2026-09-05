@@ -263,7 +263,14 @@ function logicalExport(srcPath, destPath) {
     dest.exec('BEGIN');
     for (const t of tables) dest.exec(t.sql);
     for (const t of tables) {
-      dest.exec(`INSERT INTO main."${t.name}" SELECT * FROM src."${t.name}"`);
+      // 生成列 (GENERATED ALWAYS AS) は INSERT できないので、書き込める列だけを列挙する
+      // (table_xinfo の hidden: 0=通常列 / 2=VIRTUAL 生成列 / 3=STORED 生成列。Codex R1 Medium)
+      const cols = dest.prepare(`PRAGMA src.table_xinfo("${t.name}")`).all()
+        .filter((c) => c.hidden === 0)
+        .map((c) => `"${c.name.replace(/"/g, '""')}"`);
+      if (cols.length === 0) throw new Error(`mirror-primary: ${t.name} に書き込める列が無い`);
+      const list = cols.join(', ');
+      dest.exec(`INSERT INTO main."${t.name}" (${list}) SELECT ${list} FROM src."${t.name}"`);
     }
     dest.exec('COMMIT');
     // 対象テーブルのインデックスを tbl_name で正確に選択 (SQL文字列の正規表現判定はしない)
