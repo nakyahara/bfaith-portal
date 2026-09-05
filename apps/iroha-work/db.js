@@ -28,6 +28,7 @@ const workOptionsDDL = (name) => `
       normalized_code TEXT NOT NULL,
       image_url       TEXT,
       sort_order      INTEGER NOT NULL DEFAULT 0,
+      manual_sort     INTEGER,
       active          INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
       created_at      TEXT NOT NULL,
       created_by      TEXT,
@@ -566,6 +567,8 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_app_devices', 'staff_unlock_worker_id', 'INTEGER');
   // 選択肢テーブルが normalized_code 無しの古い版なら作り直す (列追加だけでは UNIQUE を差し替えられない)
   migrateWorkOptionsSchema(db);
+  // 管理画面で決めた表示順 (NULL = よく使う順のまま。中原さん 2026-09-05)
+  addCol('f_iroha_work_options', 'manual_sort', 'INTEGER');
   // 拠点の初期値 (無ければ足す。名前の変更は管理画面から — 今は無いので tasks.js を正とする)。
   // タスク表の作り直し (facility_code の FK 検査) より前に入れておく
   const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, active, sort_order) VALUES (?, ?, ?, 1, ?)');
@@ -1153,7 +1156,12 @@ export function listActiveEnrollCodes() {
 
 export const OPTION_KINDS = ['material', 'container'];
 const OPTION_LABEL = { material: '資材', container: '保管箱' };
-const OPTION_COLS = 'id, kind, code, image_url, sort_order, active';
+const OPTION_COLS = 'id, kind, code, image_url, sort_order, manual_sort, active';
+/**
+ * 並び順: 管理画面で手で並べたもの (manual_sort) を先頭に、その順で。
+ * 決めていないものはこれまでどおり「よく使う順」(sort_order = 使用回数の負数) → コード順
+ */
+const OPTION_ORDER = 'CASE WHEN manual_sort IS NULL THEN 1 ELSE 0 END, manual_sort, sort_order, code';
 
 /** 比較用の正規化: NFKC (全角英数・全角空白→半角) + 連続空白を1つ + trim + 大文字化。表示は入力どおり (Codex R1 #3) */
 export function normalizeOptionCode(code) {
@@ -1165,7 +1173,7 @@ const displayCode = (code) => String(code == null ? '' : code).replace(/\s+/g, '
 /** 選択肢一覧。kind を省くと全種類、includeInactive で無効も (管理画面用)。並び = よく使う順 (sort_order 昇順 = 使用回数の負数) */
 export function listWorkOptions(kind = null, includeInactive = false) {
   return getDB().prepare(`SELECT ${OPTION_COLS} FROM f_iroha_work_options
-    WHERE (? IS NULL OR kind = ?) ${includeInactive ? '' : 'AND active = 1'} ORDER BY kind, sort_order, code`).all(kind, kind);
+    WHERE (? IS NULL OR kind = ?) ${includeInactive ? '' : 'AND active = 1'} ORDER BY kind, ${OPTION_ORDER}`).all(kind, kind);
 }
 
 /** 画面用: { material: [...], container: [...] } */
@@ -1231,6 +1239,8 @@ export const BUILTIN_OPTION_IMAGES = [
   { kind: 'material', path: '/app-images/iroha-work/t22-5-31-a4.png', label: 'T22.5-31 (A4用 225×310)', keys: ['T22.5-31', 'T22.5-31(A4)', 'T22.5-31(A4用)', 'T22.5-31 A4', 'T22-5-31'] },
   { kind: 'material', path: '/app-images/iroha-work/t16-22-5-a5.png', label: 'T16-22.5 (A5用 160×225)', keys: ['T16-22.5', 'T16-22.5(A5)', 'T16-22.5(A5用)', 'T16-22.5 A5', 'T16-22-5'] },
   { kind: 'material', path: '/app-images/iroha-work/t15-30.png', label: 'T15-30 (150×300)', keys: ['T15-30'] },
+  { kind: 'material', path: '/app-images/iroha-work/t13-24.png', label: 'T13-24 (130×240)', keys: ['T13-24'] },
+  { kind: 'material', path: '/app-images/iroha-work/t12-18.png', label: 'T12-18 (グリーティングカード 120×180)', keys: ['T12-18'] },
   { kind: 'material', path: '/app-images/iroha-work/t10-28.png', label: 'T10-28 (100×280)', keys: ['T10-28'] },
   { kind: 'material', path: '/app-images/iroha-work/t10-15.png', label: 'T10-15 (写真L判用 100×150)', keys: ['T10-15'] },
   { kind: 'material', path: '/app-images/iroha-work/t9-8.png', label: 'T9-8 (90×80)', keys: ['T9-8'] },
@@ -1292,6 +1302,38 @@ export function validateOptionImageUrl(raw) {
   if (url.origin === PORTAL_ORIGIN) return validatePortalImagePath(url.pathname + url.search + url.hash);
   if (!IMAGE_HOST_ALLOW.includes(url.hostname)) return { ok: false, message: `画像のリンク先は ${IMAGE_HOST_ALLOW.join(' / ')} か、ポータル内の配信エンドポイントだけ使えます` };
   return { ok: true, value: url.toString() };
+}
+
+/**
+ * 表示順を 1 つ動かす (中原さん 2026-09-05: 資材の表示順を設定できるように)。
+ * 動かした種類の全候補に manual_sort を 1..n で振り直すので、以後その kind は手で決めた順で並ぶ。
+ * dir = 'up' | 'down' | 'top' | 'bottom' | 'auto' (auto = 手動指定をやめて「よく使う順」に戻す)
+ */
+export function moveWorkOption(id, dir) {
+  const db = getDB();
+  const target = db.prepare(`SELECT id, kind FROM f_iroha_work_options WHERE id = ?`).get(Number(id));
+  if (!target) return { ok: false, error: 'not_found', message: '選択肢が見つかりません' };
+  if (!['up', 'down', 'top', 'bottom', 'auto'].includes(dir)) return { ok: false, error: 'bad_dir', message: '向きが不正です' };
+  return db.transaction(() => {
+    if (dir === 'auto') {
+      db.prepare(`UPDATE f_iroha_work_options SET manual_sort = NULL WHERE kind = ?`).run(target.kind);
+      return { ok: true, kind: target.kind, reset: true };
+    }
+    // 無効なものも含めた「いま見えている順」で並べ替える (管理画面の表示順と一致させる)
+    const list = db.prepare(`SELECT id FROM f_iroha_work_options WHERE kind = ? ORDER BY ${OPTION_ORDER}`).all(target.kind).map((r) => r.id);
+    const i = list.indexOf(target.id);
+    if (i < 0) return { ok: false, error: 'not_found', message: '選択肢が見つかりません' };
+    let j = i;
+    if (dir === 'up') j = Math.max(0, i - 1);
+    else if (dir === 'down') j = Math.min(list.length - 1, i + 1);
+    else if (dir === 'top') j = 0;
+    else if (dir === 'bottom') j = list.length - 1;
+    list.splice(i, 1);
+    list.splice(j, 0, target.id);
+    const upd = db.prepare('UPDATE f_iroha_work_options SET manual_sort = ? WHERE id = ?');
+    list.forEach((optId, n) => upd.run(n + 1, optId));
+    return { ok: true, kind: target.kind, position: j + 1, total: list.length, moved: j !== i };
+  })();
 }
 
 /** 画像リンクを設定 (空なら外す)。後で Drive 保存の写真 (Render 経由配信) に差し替えられるよう URL で持つ */

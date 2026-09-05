@@ -24,7 +24,7 @@ import {
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
   listIrohaWorkers, getIrohaWorker, addIrohaWorker, setIrohaWorkerActive,
-  workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, seedWorkOptionsFromMaster, BUILTIN_OPTION_IMAGES,
+  workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, moveWorkOption, seedWorkOptionsFromMaster, BUILTIN_OPTION_IMAGES,
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
   getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
@@ -1685,6 +1685,12 @@ router.post('/admin/options/:id(\\d+)/active', checkOrigin, requireAdmin, api((r
 }));
 router.post('/admin/options/:id(\\d+)/image', checkOrigin, requireAdmin, api((req, res) => {
   const r = setWorkOptionImage(Number(req.params.id), req.body?.image_url);
+  res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 400)).json(r);
+}));
+
+/** 表示順の入れ替え (up/down/top/bottom)。auto = 手で決めた順をやめて「よく使う順」に戻す */
+router.post('/admin/options/:id(\\d+)/sort', checkOrigin, requireAdmin, api((req, res) => {
+  const r = moveWorkOption(Number(req.params.id), String(req.body?.dir || ''));
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 400)).json(r);
 }));
 
