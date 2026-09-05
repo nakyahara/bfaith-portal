@@ -195,7 +195,11 @@ function Set-Ledger {
 
 function Get-SpoolJobIds {
   param([string] $PrinterName)
-  try { return @(Get-PrintJob -PrinterName $PrinterName -ErrorAction Stop | ForEach-Object { [int]$_.Id }) }
+  # Unary comma: PowerShell unrolls a returned array, so an EMPTY queue would otherwise reach
+  # the caller as $null and be mistaken for "could not read the queue" (the label agent failed
+  # its very first real job this way on 2026-09-05 - it only worked here because the Munbyn
+  # queue always had leftover jobs).
+  try { return ,@(Get-PrintJob -PrinterName $PrinterName -ErrorAction Stop | ForEach-Object { [int]$_.Id }) }
   catch { return $null }   # $null = could not look (different from "queue is empty")
 }
 
