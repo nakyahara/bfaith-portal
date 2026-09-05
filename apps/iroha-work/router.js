@@ -135,7 +135,7 @@ function requireStaffPlan(req) {
   }
   // 職員モードでない → その場で PIN を受ける
   if (w.worker.worker_type !== 'staff') {
-    return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: '明日の計画を決められるのは職員だけです (職員の名前を選び、PINを入れてください)' } };
+    return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: 'これは職員だけができる操作です (職員の名前を選び、PINを入れてください)' } };
   }
   const pin = verifyWorkerPin(w.worker.id, req.body?.pin);
   if (!pin.ok) return { ok: false, status: STATUS_HTTP[pin.error] || 403, body: { ok: false, ...pin } };
@@ -687,18 +687,20 @@ router.get('/api/plan', api((req, res) => {
 /** 「外部施設に出す準備OK」の切り替え (アプリ正本のみ)。状態とは別のチェック */
 router.post('/api/external-ready', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
-  const w = resolveWorker(req);
-  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  // ⭐中身を先に見る (不正な要求で職員モードだけ開いてしまわないように — Codex P1 R2)
   const taskId = parseTaskId(req.body?.id);
   if (taskId == null) return res.status(400).json(BAD_TASK_ID);
   // true / false だけ受ける (欠落や文字列を「解除」と読まない — Codex FB R2)
   if (typeof req.body?.ready !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_request', message: 'ready は true / false で指定してください' });
+  // ⭐外部に出す判断は職員 (監修 F-5)。計画と同じ門 — 職員モード中はそのまま、切れていれば PIN を受ける
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
   const r = setExternalReady({
     taskId, ready: req.body.ready, expectVersion: req.body?.expect_version,
-    actor: `${w.worker.display_name} (いろはアプリ)`, workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+    actor: `${gate.worker.display_name} (いろはアプリ)`, workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
-  res.json({ ok: true, task: publicTask(r.task) });
+  res.json({ ok: true, task: publicTask(r.task), staff_mode: staffModeOf(req) });
 }));
 
 /** 取消の要確認を職員が判断する (cancel / continue)。アプリ正本のみ */

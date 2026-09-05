@@ -87,6 +87,9 @@
   .row .meta{font-size:.82rem;color:var(--sub);margin-top:2px}
   .row .meta b{color:var(--ink);font-size:1.15em;font-family:var(--num);font-weight:600}
   .row .meta2{font-size:.78rem;color:var(--faint);margin-top:2px}
+  /* 一覧の札は商品名の**下**に (商品名を右へ押し出していた — 監修) */
+  .rtags{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}
+  .rtags .tag{margin-right:0}
   .tag{display:inline-block;font-size:.72rem;font-weight:700;border-radius:var(--r-sm);padding:2px 8px;
     margin-right:6px;vertical-align:1px}
   .tag.urgent{background:var(--amber-soft);color:var(--amber)}
@@ -120,9 +123,11 @@
   body.detail-open .views{display:none}
 
   /* ── ボード (状態 4 列。iPad 縦では横スクロール) ── */
-  .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(230px,1fr);gap:10px;overflow-x:auto;padding-bottom:10px}
-  .col{background:var(--well);border:1px solid var(--line);border-radius:var(--r);padding:8px}
-  .col h3{margin:0 0 8px;font-size:.86rem;font-weight:700;color:var(--sub);display:flex;align-items:center;gap:8px}
+  /* 列は画面幅で割る (4 列なら 25%)。列数は renderBoard() が grid-template-columns で入れる。狭いときだけ横スクロール (監修) */
+  .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:10px;overflow-x:auto;padding-bottom:10px}
+  .col{background:var(--well);border:1px solid var(--line);border-radius:var(--r);padding:8px;min-width:0}
+  .col h3{margin:0 0 8px;font-size:.86rem;font-weight:700;color:var(--sub);display:flex;align-items:center;gap:8px;white-space:nowrap}
+  .col h3 .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
   .col h3 .n{font-family:var(--num);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:0 8px;font-size:.8rem}
   .col h3 button{margin-left:auto;border:1px solid var(--line);background:var(--surface);color:var(--sub);
     border-radius:var(--r-sm);padding:3px 8px;font-size:.74rem;font-weight:700;cursor:pointer}
@@ -133,7 +138,8 @@
     display:grid;place-items:center;font-size:1.1rem;overflow:hidden}
   .bcard .th img{width:100%;height:100%;object-fit:contain;background:#fff}
   .bcard .bd{min-width:0;flex:1}
-  .bcard h4{margin:0;font-size:.92rem;font-weight:700;line-height:1.35}
+  .bcard h4{margin:0;font-size:.92rem;font-weight:700;line-height:1.35;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}   /* 2 行で省略 (タップで詳細に飛ぶ) */
   .bcard .m{font-size:.76rem;color:var(--sub);margin-top:2px}
   .bcard .cb{width:20px;height:20px;vertical-align:-4px;margin-right:6px;accent-color:var(--accent)}
   .colempty{color:var(--faint);font-size:.8rem;padding:8px 4px}
@@ -141,7 +147,7 @@
   /* ── 「どこが」「いつ」の札 (3 軸のうち 2 つ。職員だけボタンになる — 要件 §W-4) ── */
   .tags{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
   .tag{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);
-    padding:4px 9px;font-size:.8rem;font-weight:700;display:inline-flex;align-items:center;gap:5px;line-height:1.3}
+    padding:4px 9px;font-size:.8rem;font-weight:700;display:inline-flex;align-items:center;gap:5px;line-height:1.3;white-space:nowrap}
   button.tag{min-height:36px;cursor:pointer}
   .tag .k{font-size:.66rem;color:var(--faint);font-weight:700;letter-spacing:.04em}
   .tag.none{color:var(--faint);border-style:dashed}
@@ -195,8 +201,9 @@
   .pcard .bd{min-width:0;flex:1}
   .pcard h4{margin:0;font-size:.92rem;font-weight:700;line-height:1.35}
   .pcard .m{font-size:.76rem;color:var(--sub);margin-top:2px}
-  .pcard .why{margin-top:5px;display:flex;flex-wrap:wrap;gap:4px}
-  .pcard .why span{font-size:.72rem;border-radius:999px;padding:1px 8px;background:var(--well);color:var(--sub);border:1px solid var(--line)}
+  .pcard .why{margin-top:5px;display:flex;flex-wrap:nowrap;gap:4px;overflow-x:auto;-webkit-overflow-scrolling:touch}   /* 「入荷／2026-09-／02」と折れていた (監修) */
+  .pcard .why span{font-size:.72rem;border-radius:999px;padding:1px 8px;background:var(--well);color:var(--sub);border:1px solid var(--line);white-space:nowrap;flex:none}
+  .pcard .why span.unk{background:var(--amber-soft);color:var(--amber);border-color:var(--amber)}
   .pcard .why span.urgent{background:var(--danger-soft);color:var(--danger);border-color:#F3C1C1;font-weight:700}
   .pcard .why span.size{background:#F1EAFB;color:#6B3FB5;border-color:#DCCDF5;font-weight:700}
   .pcard .act{flex:none;align-self:center;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
@@ -374,6 +381,9 @@
   .thing .tbody{padding:10px 12px 12px}
   .thing label{display:block;font-size:.72rem;color:var(--faint);letter-spacing:.08em;font-weight:700}
   .thing .nm{font-size:1.24rem;font-weight:700;line-height:1.3;margin-top:2px;word-break:break-all}
+  .thing.compact{display:flex;align-items:center;gap:8px;padding-right:10px}   /* 未登録: 空の写真枠を出さず 1 行に (監修) */
+  .thing.compact .tbody{flex:1;min-width:0}
+  .thing.compact .strip{flex:none}
   .thing.miss{border-color:var(--amber);background:var(--amber-soft)}
   .thing.miss .nm{color:var(--amber)}
   .thing.miss .wiedit{color:var(--amber);border-color:var(--amber);background:transparent}
@@ -539,6 +549,10 @@
   .modal .mname{font-size:.88rem;color:var(--sub);margin-bottom:14px}
   .modal label{font-size:.8rem;color:var(--sub);font-weight:700}
   .stbtns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+  .stbtns .btn small{display:block;font-size:.72rem;font-weight:600;opacity:.75;margin-top:2px}   /* 「棚入待ち」= 何を待つかの一言 (監修) */
+  /* ラベル待ちの表: 職員の事務 (発注・LINE連絡・再連絡・入庫完了・記録者) は職員モードのときだけ (監修) */
+  .tbl.member th:nth-child(n+7):nth-child(-n+12),.tbl.member td:nth-child(n+7):nth-child(-n+12){display:none}
+  .chip.ro{opacity:.6;cursor:default;pointer-events:none}
   .btn{min-height:56px;border-radius:var(--r);border:1px solid var(--line);
     background:var(--surface);color:var(--ink);font-size:1.02rem;font-weight:700;cursor:pointer;font-family:var(--font)}
   .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
@@ -650,13 +664,13 @@
       <button class="chip" id="lwAllBtn" onclick="setLwOpenOnly(false)">すべて</button>
       <span class="sum" id="lwSum"></span>
     </div>
-    <div class="tblwrap"><table class="tbl">
+    <div class="tblwrap"><table class="tbl" id="lwTable">
       <thead><tr><th>状態</th><th>発生日</th><th>商品</th><th>数量</th><th>ロット・期限</th><th>ロケ</th>
         <th>発注</th><th>貼り直し</th><th>LINE連絡</th><th>再連絡</th><th>入庫完了</th><th>記録者</th><th>備考</th></tr></thead>
       <tbody id="lwBody"><tr><td colspan="13">読み込み中…</td></tr></tbody>
     </table></div>
     <p class="hint" style="margin-top:8px">メーカーから届いた商品のラベルが足りず、作業を止めているものの記録です。
-      新しく登録するときは、そのカードの詳細から「🏷 ラベル待ちに登録」を押してください。</p>
+      新しく登録するときは、カードで「⛔ 止まった → ラベルが足りない」を選ぶと開きます (職員はカードの詳細からも登録できます)。</p>
   </div>
 
   <!-- ══ 画面1d: 履歴 (終了したカード) ══ -->
@@ -852,12 +866,16 @@
         <label>ロケーション</label>
         <div class="opts chips" id="lwLoc"></div>
         <input type="hidden" id="lwLocation">
-        <label class="cbrow"><input id="lwOrdered" type="checkbox" class="cb"> ラベルを発注した</label>
         <label class="cbrow"><input id="lwReattach" type="checkbox" class="cb"> 貼り直しが必要</label>
+        <!-- 職員の事務 (発注・本社連絡・入庫完了・完了) は職員モードのときだけ出す (監修 F-5)。隠れている間は読み込んだ値のまま保存される -->
+        <div id="lwStaffFields">
+        <label class="cbrow"><input id="lwOrdered" type="checkbox" class="cb"> ラベルを発注した</label>
         <label>本社へのLINE連絡日</label><input id="lwLine" type="date">
         <label>再連絡日</label><input id="lwRe" type="date">
         <label>入庫完了日</label><input id="lwRestocked" type="date">
         <label class="cbrow"><input id="lwDone" type="checkbox" class="cb"> 完了 (一覧から外す)</label>
+        </div>
+        <p class="hint" id="lwStaffNote" hidden>ラベルの発注・本社への連絡・入庫完了・完了は職員が記録します (職員モードで開くと出ます)。</p>
         <label>備考</label><input id="lwNote" maxlength="300">
       </div>
       <div class="mbtns" style="margin-top:14px">
@@ -881,8 +899,8 @@
   <!-- ══ 作業者選択 ══ -->
   <div class="gate" id="gate">
     <div class="gwrap">
-      <h2>👤 だれがつかいますか?</h2>
-      <p style="color:var(--sub);font-size:.9rem">じぶんの名前をおしてください。ステータスを変えるときの記録に使います。</p>
+      <h2>👤 この iPad をつかう人をおしてください</h2>
+      <p style="color:var(--sub);font-size:.9rem">記録に「だれがやったか」として残ります。作業する人は、はじめるときに別にえらべます (何人でも)。</p>
       <div id="gateNames"></div>
       <p class="gnote">名前がないときは、職員の方が管理画面 (パソコン) から追加できます。</p>
     </div>
@@ -1216,8 +1234,8 @@ const facilityName = (code) => ((state.facilities || []).find(f => f.code === co
 function renderSync() {
   const rf = state.refresh || {};
   let txt = isApp()
-    ? state.cards.length + ' CARDS · 状態の札をタップで変更'
-    : 'SYNC ' + fmtTime(rf.lastRefreshAt) + ' · ' + state.cards.length + ' CARDS · 状態の札をタップで変更 (Notionにも反映)';
+    ? state.cards.length + ' 件'
+    : fmtTime(rf.lastRefreshAt) + ' に取得 · ' + state.cards.length + ' 件 (状態の札をタップで変更。Notionにも反映)';
   $('#syncTxt').textContent = txt;
   if (rf.error) showErr('Notionから最新を取得できませんでした (前回取得分を表示しています)', rf.error);
   if (rf.truncated) showWarn('カードが件数上限を超えているため最新化できていません (前回取得分を表示中。職員の方は管理画面を確認してください)');
@@ -1258,7 +1276,8 @@ function masterSummary(c) {
   return parts.join(' ・ ');
 }
 
-function rowTags(c) {
+function rowTags(c, opts) {
+  const short = !!(opts && opts.short);   // 一覧では短く (内訳は詳細で — 監修)
   let h = '';
   // ⛔ 止まっている理由 (案A)。進捗の札とは別。いちばん先に出す (作業できないことが先に分かる)
   if (c.blocked) h += '<span class="tag blocked">⛔ ' + esc(c.blocked.label) + 'で止まっています</span>';
@@ -1268,8 +1287,10 @@ function rowTags(c) {
   if (c.external_ready) h += '<span class="tag ready">📦 外部に出せます</span>';
   if (c.facility_code && c.facility_code !== 'iroha') h += '<span class="tag ext">🏢 ' + esc(facilityName(c.facility_code)) + '</span>';
   if (c.priority.kind === 'urgent') h += '<span class="tag urgent">🔥 急ぎ・' + esc(c.priority.label) + '</span>';
-  if (c.priority.kind === 'new') h += '<span class="tag new">🌱 新商品</span>';
-  if (c.master.missing.length > 0) h += '<span class="tag miss">⚠ ' + esc(c.master.missing.join('・')) + ' 未登録</span>';
+  // 🌱「はじめての商品」= この商品の作業実績がまだ無い (利用者に役立つ意味 — 監修)。
+  //   売上データの有無 (旧「新商品」) は職員向けの判断材料なので、職員モードの meta2 に出す
+  if (!c.estimate) h += '<span class="tag new">🌱 はじめての商品</span>';
+  if (c.master.missing.length > 0) h += '<span class="tag miss">⚠ ' + (short ? '未登録 ' + c.master.missing.length : esc(c.master.missing.join('・')) + ' 未登録') + '</span>';
   return h;
 }
 
@@ -1308,23 +1329,28 @@ function renderList() {
     const meta = [
       c.qty != null ? '<b>' + esc(c.qty) + '</b> 個' : null,
       c.boxes ? esc(c.boxes) : null,
-      c.plan_hours != null ? '⏱ ' + esc(c.plan_hours) + 'h' : null,
+      c.plan_hours != null ? '⏱ ' + esc(approxHours(c.plan_hours)) : null,
       c.arrival ? '入庫 ' + esc(c.arrival) : null,
       masterSummary(c) || null,
     ].filter(Boolean).join(' ・ ');
+    // 在庫日数・売上・外部出し目安は職員の判断材料 → 職員モードのときだけ (利用者の一覧から外す — 監修 F-5)
+    const staffUI = isStaffUI();
     const meta2 = [
-      estText(c),
+      estText(c, { short: true }),
       c.active.length > 0 ? '👤 ' + esc(c.active.map(a => a.worker_name).join('・')) + 'さんが作業中' : null,
-      c.priority.kind !== 'urgent' && c.priority.kind !== 'new' ? esc(c.priority.label) : null,
-      c.external_text ? esc(c.external_text) : null,
+      // 「作業中」なのにだれも作業していない = 中断し忘れ・止まった札の付け忘れの発見に (監修)
+      c.status === 'in_progress' && c.active.length === 0 && !c.blocked ? '⏸ いまはだれも作業していません' : null,
+      staffUI && c.priority.kind !== 'urgent' ? esc(c.priority.kind === 'new' ? '売上データなし' : c.priority.label) : null,
+      staffUI && c.external_text ? esc(c.external_text) : null,
       c.expiry ? '📅 期限 ' + esc(c.expiry) : null,
     ].filter(Boolean).join(' ・ ');
+    const tags = rowTags(c, { short: true });
     const selectable = bulkIds && c.status === 'ready_for_stocking';
     const sel = selectable && bulkIds.has(c.id);
     return '<div class="row' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
       (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
       '<div class="thumb">' + thumbHtml(c) + '</div>' +
-      '<div class="bd"><h2>' + rowTags(c) + esc(c.title) + '</h2>' +
+      '<div class="bd"><h2>' + esc(c.title) + '</h2>' + (tags ? '<div class="rtags">' + tags + '</div>' : '') +
       '<div class="meta num">' + meta + '</div>' +
       (meta2 ? '<div class="meta2 num">' + meta2 + '</div>' : '') + '</div>' +
       // 状態: 変更が許されていればタップできる札 (data-st)、許されていなければただの札
@@ -1410,6 +1436,8 @@ async function loadPreviewOnce() {
 // ─── ボード (要件 §W-4: 列 = 進捗 or 拠点。「どこが」「いつ」はカードの札) ───
 /** 「いつ」の表示名。カードの札と絞り込みで同じ言葉を使う */
 const WHEN_LABEL = { today: '今日やる', tomorrow: '明日やる', over: 'やり残し', later: '先の予定' };
+/** カードの札では短く (「い／つ／今日や／る」と折れていた — 監修)。絞り込みのチップは WHEN_LABEL のまま */
+const WHEN_SHORT = { today: '今日', tomorrow: '明日', over: 'やり残し', later: '先の予定' };
 const WHEN_CLASS = { today: 'todayp', tomorrow: 'tomorrow', over: 'over', later: '' };
 
 /** ボードから「明日の計画」に入るところ。決められるのは職員だけ。下見・利用者は見るだけ */
@@ -1456,7 +1484,8 @@ function gaugeHtml(totals, target) {
     : ['over', p.count + ' 件 · 目安を ' + fmtHours(p.hours - hi) + ' 超えています'];
   const unknown = p.unknown_hours_count > 0 ? ' <span class="st under">時間不明 ' + esc(String(p.unknown_hours_count)) + ' 件</span>' : '';
   const inner = '<span class="lbl">明日やる分</span>' +
-    '<span class="big">' + esc(String(h)) + '<small>時間</small>' + esc(String(m).padStart(2, '0')) + '<small>分</small></span>' +
+    // 「0 時間 00 分」と読ませない → 1 時間未満は「M 分」(監修)
+    '<span class="big">' + (h > 0 ? esc(String(h)) + '<small>時間</small>' + esc(String(m).padStart(2, '0')) + '<small>分</small>' : esc(String(m)) + '<small>分</small>') + '</span>' +
     '<span class="bar"><span class="band" style="' + band + '"></span><span class="fill' + (over ? ' over' : '') + '" style="width:' + pct + '%"></span></span>' +
     '<span class="st ' + st[0] + '">' + esc(st[1]) + '</span>' + unknown;
   // 計画画面の中に置く「今どれくらい入っているか」の表示。入口はボードの大きなボタン
@@ -1472,8 +1501,24 @@ function staffLeftText() {
 }
 function fmtHours(h) {
   const m = Math.max(0, Math.round(h * 60));
-  return m >= 60 ? Math.floor(m / 60) + ' 時間' + (m % 60 ? String(m % 60) + ' 分' : '') : m + ' 分';
+  return m >= 60 ? Math.floor(m / 60) + ' 時間' + (m % 60 ? ' ' + String(m % 60) + ' 分' : '') : m + ' 分';
 }
+/** 想定作業時間。「0.3h」のような小数は読めない (監修) → 「約 20 分」「約 1 時間 10 分」 */
+function approxHours(h) {
+  if (h == null || !Number.isFinite(Number(h))) return '';
+  return '約 ' + fmtHours(Number(h));
+}
+/** 'YYYY-MM-DD' → 'M/D' (チップで折り返さないように)。日付でなければそのまま */
+function fmtMd(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(ymd || ''));
+  return m ? Number(m[2]) + '/' + Number(m[3]) : String(ymd || '');
+}
+/**
+ * ⭐職員向けの表示か (Notion リンク・在庫日数・売上・外部出し目安・ラベル待ちの事務項目 — 監修 F-5)。
+ * 職員モードで許可リストに入る「計画」の許可を目印にする — 職員モードが終わると enforceWorkerCaps / dropPlanCaps が
+ * 落とすので、利用者に切り替えた瞬間に職員向けの表示も消える (描いてから隠さない — 要件 §U-7)
+ */
+function isStaffUI() { return stateCan('task.plan.assign'); }
 function colSegHtml() {
   return [['status', '進捗'], ['fac', '拠点']]
     .map(([v, l]) => '<button class="' + (boardCols === v ? 'on' : '') + '" data-col="' + v + '">' + l + '</button>').join('');
@@ -1500,7 +1545,11 @@ function facChips() {
   const one = (v, label) => '<button class="chip' + (curFacility === v ? ' on' : '') + '" data-fac="' + esc(v) + '">' +
     esc(label) + ' <span class="num">' + (counts[v] || 0) + '</span></button>';
   // 「未定」= どこが作業するか決まっていないカード (要件 §W-2)
-  return one('all', 'すべて') + one('none', '未定') + facs.map(f => one(f.code, f.name)).join('');
+  // 0 件の拠点は畳む (5 拠点が常に並ぶと iPad 縦で 2 行に折れる — 監修)。選んでいる拠点は 0 件でも出す
+  const shown = facs.filter(f => (counts[f.code] || 0) > 0 || curFacility === f.code);
+  const hidden = facs.length - shown.length;
+  return one('all', 'すべて') + one('none', '未定') + shown.map(f => one(f.code, f.name)).join('') +
+    (hidden > 0 ? '<span class="chip ro">ほか ' + hidden + ' 拠点 0</span>' : '');
 }
 function pickFacility(code) { curFacility = code; renderBoard(); }
 // クリックは委譲で受ける (中身を作り直しても付け直さなくてよい)
@@ -1593,11 +1642,13 @@ function renderBoard() {
     // 想定作業時間の合計 (Notion のボードビューで見ていたもの)
     const hours = mine.reduce((a, c) => a + (Number(c.plan_hours) || 0), 0);
     return '<div class="col"' + (g.drop != null ? ' data-drop="' + esc(g.drop) + '"' + (boardCols === 'fac' ? ' data-drop-kind="fac"' : '') : '') +
-      '><h3>' + esc(g.label) + ' <span class="n">' + mine.length + '</span>' +
-      (hours > 0 ? '<span class="n">⏱ ' + (Math.round(hours * 10) / 10) + 'h</span>' : '') +
+      '><h3><span class="t">' + esc(g.label) + '</span><span class="n">' + mine.length + '</span>' +
+      (hours > 0 ? '<span class="n">⏱ ' + esc(approxHours(hours)) + '</span>' : '') +
       (canBulk && !bulkIds ? '<button onclick="startBulk()">まとめて棚入完了</button>' : '') + '</h3>' + body + '</div>';
   }).join('');
   $('#board').innerHTML = cols;
+  // 列は画面幅で割る (4 列なら 25%)。狭くて 170px を切るときだけ横スクロール (右端が切れて気づけなかった — 監修)
+  $('#board').style.gridTemplateColumns = 'repeat(' + groups.length + ', minmax(170px, 1fr))';
 }
 /** 掴み手。⭐動かせるときだけ描く (動かせないのに掴めるように見せない — 要件 §U-7) */
 function gripHtml() { return '<span class="grip" data-grip aria-hidden="true">⠿</span>'; }
@@ -1611,13 +1662,13 @@ function bcardHtml(c, status) {
     c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
     c.hold_memo ? '📝 メモ' : null,
     c.boxes || null,
-    c.plan_hours != null ? '⏱ ' + c.plan_hours + 'h' : null,
+    c.plan_hours != null ? '⏱ ' + approxHours(c.plan_hours) : null,
     c.external_ready ? '📦 外部に出せます' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
   return '<div class="bcard' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
     (grab ? gripHtml() : '') +
-    '<div class="th">' + thumbHtml(c) + '</div>' +
+    (c.image_url ? '<div class="th">' + thumbHtml(c) + '</div>' : '') +   // 📦 の空枠は幅を取るだけなので、写真があるカードだけ (監修)
     '<div class="bd">' +
     '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
     esc(c.title) + '</h4>' +
@@ -1631,7 +1682,7 @@ function bcardHtml(c, status) {
  */
 function planTagsHtml(c) {
   const facTxt = c.facility_code ? facilityName(c.facility_code) : '未定';
-  const whenTxt = c.when ? WHEN_LABEL[c.when] : '未定';
+  const whenTxt = c.when ? (WHEN_SHORT[c.when] || WHEN_LABEL[c.when]) : '未定';
   const whenCls = c.when ? (WHEN_CLASS[c.when] || '') : 'none';
   const facCls = c.facility_code ? '' : 'none';
   // 下見 (正本が Notion) では見るだけ = 札は span。切替の前でも「どう見えるか」は分かる
@@ -1639,11 +1690,12 @@ function planTagsHtml(c) {
   const canWhen = isApp() && stateCan('task.plan.assign');
   const fac = canFac
     ? '<button class="tag ' + facCls + '" data-fac-of="' + esc(c.id) + '"><span class="k">どこが</span>' + esc(facTxt) + '</button>'
-    : '<span class="tag ' + facCls + '"><span class="k">どこが</span>' + esc(facTxt) + '</span>';
+    : (c.facility_code ? '<span class="tag ' + facCls + '"><span class="k">どこが</span>' + esc(facTxt) + '</span>' : '');
   const when = canWhen
     ? '<button class="tag ' + whenCls + '" data-when-of="' + esc(c.id) + '"><span class="k">いつ</span>' + esc(whenTxt) + '</button>'
-    : '<span class="tag ' + whenCls + '"><span class="k">いつ</span>' + esc(whenTxt) + '</span>';
-  return '<div class="tags">' + fac + when + '</div>';
+    : (c.when ? '<span class="tag ' + whenCls + '"><span class="k">いつ</span>' + esc(whenTxt) + '</span>' : '');
+  // ⭐変えられない人 (利用者) には「未定」の札を出さない — 決まっているものだけ見せる (監修 F-5)
+  return (fac || when) ? '<div class="tags">' + fac + when + '</div>' : '';
 }
 
 // ─── ⭐「いつ」「どこが」を変える (職員だけ。要件 §W-4) ───
@@ -2087,8 +2139,7 @@ function renderPlan() {
   $('#planHint').textContent = ro
     ? '👀 見るだけの下見です (正本はまだ Notion)。1 日にできるのは ' + lo + '〜' + hi + ' 時間ぶんで、'
       + 'この順に候補が並びます。「アプリを正本にする」と、ここで明日の分を決められるようになります。'
-    : '1 日にできるのは ' + lo + '〜' + hi + ' 時間ぶんです。左の候補を「＋ 明日やる」で右に足してください。'
-      + '選ぶたびに保存されます (確定ボタンはありません)。目安を超えても入れられます。';
+    : planHintText(lo, hi);
   // やり残し (自動では動かさない。職員が決める)
   const carry = d.carry_over || [];
   const carryActs = ro ? [] : [
@@ -2119,15 +2170,28 @@ function renderPlan() {
     : pile.map((c) => pcardHtml(c, pileActs, !ro)).join('');
 }
 
+/** 計画の説明文。長い説明は初回だけ、2 回目からは目安だけ (毎回同じ長文を読ませない — 監修)。「読んだ」は端末に残す */
+function planHintText(lo, hi) {
+  let seen = false;
+  try { seen = localStorage.getItem('iw_plan_hint_seen') === '1'; localStorage.setItem('iw_plan_hint_seen', '1'); } catch (e) { /* 残せなければ毎回出す */ }
+  if (seen) return '目安 ' + lo + '〜' + hi + ' 時間。左の候補を「＋ 明日やる」で足すと、そのまま保存されます。';
+  return '1 日にできるのは ' + lo + '〜' + hi + ' 時間ぶんです。左の候補を「＋ 明日やる」で右に足してください。'
+    + '選ぶたびに保存されます (確定ボタンはありません)。目安を超えても入れられます。';
+}
 /** 計画画面のカード。理由 (なぜ上に出るか) を必ず添える */
 function pcardHtml(c, actions, grab) {
   const why = [];
   if (c.blocked) why.push('<span class="urgent">⛔ ' + esc(c.blocked.label) + '</span>');
   if (c.priority) why.push('<span class="' + (c.priority.kind === 'urgent' ? 'urgent' : '') + '">' + esc(c.priority.label) + '</span>');
-  if (c.arrival) why.push('<span>入荷 ' + esc(c.arrival) + '</span>');
-  why.push(c.size_label ? '<span class="size">' + esc(c.size_label) + '</span>' : '<span>大きさ 不明</span>');
+  if (c.arrival) why.push('<span>入荷 ' + esc(fmtMd(c.arrival)) + '</span>');
+  // 不明が 2 つ並ぶなら 1 つにまとめる (「見込 不明」「大きさ 不明」で札が 3 つ — 監修)
+  const noHours = c.plan_hours == null;
+  const noSize = !c.size_label;
+  if (noHours && noSize) why.push('<span class="unk">⚠ 見込・大きさ 不明</span>');
+  else if (noSize) why.push('<span class="unk">大きさ 不明</span>');
+  else why.push('<span class="size">' + esc(c.size_label) + '</span>');
   const meta = [c.qty != null ? c.qty + ' 個' : null,
-    c.plan_hours != null ? '見込 ' + c.plan_hours + 'h' : '見込 不明',
+    noHours ? (noSize ? null : '見込 不明') : '見込 ' + approxHours(c.plan_hours),
     c.facility_code ? facilityName(c.facility_code) : 'どこが 未定'].filter(Boolean).join(' ・ ');
   const acts = actions.map(([label, cls, act]) =>
     '<button class="pbtn ' + cls + '" data-plan-act="' + act + '" data-plan-id="' + esc(c.id) + '">' + esc(label) + '</button>').join('');
@@ -2313,6 +2377,8 @@ async function loadLabelWaits() {
   if (rows.length === 0) { $('#lwBody').innerHTML = '<tr><td colspan="13">' + (lwOpenOnly ? 'ラベル待ちはありません' : '記録はありません') + '</td></tr>'; return; }
   const LOC = { Z: 'Z (一時保管)', Y: 'Y (出荷禁止)', none: 'なし' };
   const yn = v => v ? '✔' : '—';
+  // 職員の事務の列 (発注・LINE連絡・再連絡・入庫完了・記録者) は職員モードのときだけ (利用者には 7 列 — 監修)
+  const tbl = $('#lwTable'); if (tbl) tbl.classList.toggle('member', !isStaffUI());
   $('#lwBody').innerHTML = rows.map(r => '<tr data-id="' + Number(r.id) + '">' +
     '<td><span class="pill ' + (r.done ? 'ok' : 'wait') + '">' + (r.done ? '完了' : '待ち') + '</span></td>' +
     '<td class="num">' + esc(r.occurred_on || '—') + '</td>' +
@@ -2363,6 +2429,10 @@ function fillLw(r, name) {
   $('#lwName').textContent = name || '—';
   $('#lwMsg').textContent = stateCan('task.label_wait.edit') ? '' : '下見なので保存できません (アプリを正本にすると使えます)';
   renderLwSaveState();
+  // 職員の事務項目は職員モードのときだけ見せる (隠れている間は読み込んだ値のまま保存される — 監修 F-5)
+  const staffUI = isStaffUI();
+  $('#lwStaffFields').hidden = !staffUI;
+  $('#lwStaffNote').hidden = staffUI;
   $('#lwOccurred').value = r.occurred_on || '';
   $('#lwLot').value = r.lot_expiry || '';
   $('#lwQty').value = r.qty == null ? '' : r.qty;
@@ -2580,6 +2650,8 @@ function fmtDur(sec) {
   if (m > 0) return m + '分';
   return s + '秒';
 }
+/** 終わった作業の長さ。「4秒 ・ できあがり」は読み手が戸惑う → 1 分未満はまとめる (監修) */
+function fmtDurHist(sec) { return Number(sec) < 60 ? '1分未満' : fmtDur(sec); }
 function fmtClock(sec) {
   sec = Math.max(0, Math.floor(sec));
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
@@ -2587,8 +2659,9 @@ function fmtClock(sec) {
   return h > 0 ? h + ':' + mm + ':' + ss : mm + ':' + ss;
 }
 // 目安と実測 (1回だけなら「平均」と言わず「前回」— Codex R2)
-function estText(c) {
-  if (!c.estimate) return '⏱ 実測データなし (今回の作業時間が次回の目安になります)';
+function estText(c, opts) {
+  // 一覧では短く (毎行に説明文を出さない — 監修)。詳細では説明つき
+  if (!c.estimate) return (opts && opts.short) ? '⏱ 実測なし' : '⏱ 実測データなし (今回の作業時間が次回の目安になります)';
   const e = c.estimate;
   if (e.cards === 1) return '⏱ 前回の実績 ' + fmtDur(e.lastSeconds);
   return '⏱ これまでの実績 平均' + fmtDur(e.avgSeconds) + ' (' + e.cards + '回)';
@@ -2625,9 +2698,11 @@ function workInfoHtml(c, m, missSet) {
   const thing = (label, value, reg, optKind, miss, strip) => {
     const empty = value == null || value === '';
     const img = empty ? null : optionImageFor(optKind, value);
-    return open('thing' + (miss ? ' miss' : ''), reg) +
-      (img ? '<span class="ph"><img src="' + esc(img) + '" alt="" loading="lazy" onerror="optImgFail(this)"></span>'
-           : '<span class="ph none">' + (empty ? '登録すると<br>写真が出ます' : '写真がまだありません') + '</span>') +
+    // 未登録のときは空の写真枠を出さない — 空の正方形 2 つが画面の半分を占めていた (監修)。登録した瞬間に写真カードになる
+    return open('thing' + (miss ? ' miss' : '') + (empty ? ' compact' : ''), reg) +
+      (empty ? ''
+        : img ? '<span class="ph"><img src="' + esc(img) + '" alt="" loading="lazy" onerror="optImgFail(this)"></span>'
+              : '<span class="ph none">写真がまだありません</span>') +
       '<div class="tbody"><label>' + esc(label) + '</label>' +
       '<div class="nm num">' + (empty ? (miss ? '⚠ 未登録' : '未設定') : esc(value)) + '</div></div>' +
       (strip || '') + chip(empty) + '</div>';
@@ -2642,11 +2717,11 @@ function workInfoHtml(c, m, missSet) {
     chip(units == null) + '</div>';
 
   // ② 作業のしかた
-  const wrow = (label, html, reg, miss, why) => {
+  const wrow = (label, html, reg, miss, why, emptyText) => {
     const empty = html == null;
     return open('wrow' + (miss ? ' miss' : ''), reg) +
       '<label>' + esc(label) + '</label><div class="v num">' +
-      (empty ? (miss ? '⚠ 未登録' : '<span class="none">未設定</span>') : html) +
+      (empty ? (miss ? '⚠ 未登録' : '<span class="none">' + esc(emptyText || '未設定') + '</span>') : html) +
       (miss && why ? '<span class="why">' + esc(why) + '</span>' : '') + '</div>' +
       chip(empty) + '</div>';
   };
@@ -2680,12 +2755,14 @@ function workInfoHtml(c, m, missSet) {
     '<div class="wigroup">作業のしかた</div><div class="wrows">' +
       wrow('工程', m.process_count != null ? big(m.process_count, '工程') : null,
         'process_count', missSet.has('工程'), '作業前に登録してください') +
-      wrow('期限シール', m.expiry_seal == null ? null : (m.expiry_seal ? 'あり (赤で上に出します)' : 'なし'), 'expiry_seal') +
+      // 「未設定」を「貼らない」と読まれると貼り忘れが起きる (監修)
+      wrow('期限シール', m.expiry_seal == null ? null : (m.expiry_seal ? 'あり (赤で上に出します)' : 'なし'), 'expiry_seal', false, null, '未設定 (貼るかどうか職員に確認)') +
       wrow('大きさ', sizeClassText(m.size_class), 'size_class') +
       (c.expiry ? wrow('この入荷の有効期限', esc(c.expiry), null) : '') +
       careRow +
     '</div>' + care +
-    '<div class="wigroup">参考にするもの</div>' + ref;
+    // 在庫日数・売上・フリー在庫・外部出し目安・取引先 (職員向けの判断材料) は上部のチップから、ここへ下ろす (監修)
+    '<div class="wigroup">参考にするもの</div>' + ref + headFactsHtml(c);
 }
 /** 未登録の数 (見出しの札に出す)。0 なら札を出さない */
 function missBadge(m) {
@@ -2813,7 +2890,6 @@ function renderDetail(c, opts) {
         (c.arrival ? ' ・ 入庫 ' + esc(c.arrival) : '') +
         (c.ar_no ? ' ・ ' + esc(c.ar_no) : '') + '</div>' +
       headNumsHtml(c) +
-      headFactsHtml(c) +
       '</div></div>' +
       sealHtml(c) + blockedHtml(c) + careHtml(c) + memoHtml(c) +
       '</div>' +
@@ -2825,7 +2901,8 @@ function renderDetail(c, opts) {
         ? '<p class="nlink">直したい項目をタップしてください。空欄の登録はだれでもできます。入っている値の変更は職員PINが必要です。</p>' : '') +
       (m.source === 'card'
         ? '<p class="nlink">※作業仕様マスタに未登録のため、カード作成時の値を表示しています。登録すると次回からマスタの値になります。</p>' : '') +
-      (c.url ? '<p class="nlink">🗂 <a href="' + esc(c.url) + '" target="_blank" rel="noopener">' + (isApp() ? '移行元のNotionカード (参考)' : 'Notionのカードを開く') + '</a></p>' : '') +
+      // Notion はログインが要る → 利用者が押すと迷子になる。職員モードのときだけ (監修 F-5)
+      (c.url && isStaffUI() ? '<p class="nlink">🗂 <a href="' + esc(c.url) + '" target="_blank" rel="noopener">' + (isApp() ? '移行元のNotionカード (参考)' : 'Notionのカードを開く') + '</a></p>' : '') +
     '</div>' +
 
     mediaCardHtml(c) +
@@ -2852,7 +2929,7 @@ function historyCardHtml(c) {
   const total = rows.reduce((a, r) => a + (Number(r.raw_seconds) || 0), 0);
   const items = rows.map(r =>
     '<li><b>' + esc(r.worker_name || '—') + '</b> さん ・ ' + esc(fmtDate(r.started_at) + ' ' + fmtTime(r.started_at)) +
-    ' 〜 ' + esc(fmtTime(r.ended_at)) + ' ・ ' + esc(fmtDur(Number(r.raw_seconds) || 0)) +
+    ' 〜 ' + esc(fmtTime(r.ended_at)) + ' ・ ' + esc(fmtDurHist(Number(r.raw_seconds) || 0)) +
     ' ・ ' + esc(END_REASON[r.end_reason] || r.end_reason || '—') + '</li>').join('');
   return '<div class="dcard"><h3 class="sec">これまでの作業 — このカード</h3>' +
     '<ul class="whist">' + items + '</ul>' +
@@ -2921,7 +2998,9 @@ function mediaCardHtml(c) {
   const addP = can('task.media.add') && photos < 3 ? '<div class="ph add" onclick="pickMedia(\'photo\')"><div><span class="ic">📷</span>写真を<br>とる</div></div>' : '';
   const videos = VIDEO_ENABLED ? c.media.filter(m => m.kind === 'video').length + pending.filter(p => p.kind === 'video').length : 0;
   const addV = VIDEO_ENABLED && canPhoto && videos < 1 ? '<div class="ph add mov" onclick="pickMedia(\'video\')"><div><span class="ic">🎥</span>動画を<br>とる</div></div>' : '';
-  return '<div class="dcard"><h3 class="sec">今回のできあがり — 次回の見本になります</h3>' +
+  // 作業前・作業中は「できあがったら写真をとる」、棚入待ち以降で「今回のできあがり」(監修)
+  const donePhase = c.status === 'ready_for_stocking' || c.status === 'closed' || c.status === '棚入待ち' || c.status === '棚入完了';
+  return '<div class="dcard"><h3 class="sec">' + (donePhase ? '今回のできあがり — 次回の見本になります' : 'できあがったら写真をとる — 次回の見本になります') + '</h3>' +
     '<div class="photos">' + tiles + (canPhoto ? pend : '') + addP + addV + '</div>' +
     (canPhoto
       ? '<p class="hint">できあがった状態を撮ってください。次に同じ商品が来たとき「前回の完成形」として出ます (写真3枚まで。ドライブに保存)。</p>'
@@ -3604,16 +3683,18 @@ function workCardHtml(c) {
       '<button class="btn" onclick="setPlanned(' + (c.today ? 'false' : 'true') + ')">' +
       (c.today ? '📌 今日やる をやめる' : '📌 今日やる') + '</button></div>';
   }
-  // アプリ正本のみ: 外部施設に出す準備ができたか (状態とは別のチェック。Notion のチェックボックスの置き換え)
+  // アプリ正本のみ: 外部施設に出す準備ができたか (状態とは別のチェック。Notion のチェックボックスの置き換え)。
+  // ⭐許可は職員モードのときだけ入る (監修 F-5: 利用者が押す場面がない)
   let ext = '';
   if (can('task.external_ready') && c.status !== 'closed') {
     ext = '<div class="wbtns" style="margin-top:10px">' +
       '<button class="btn' + (c.external_ready ? ' primary' : '') + '" onclick="setExternalReady(' + (c.external_ready ? 'false' : 'true') + ')">' +
       (c.external_ready ? '📦 外部に出す準備OK をやめる' : '📦 外部に出す準備OK にする') + '</button></div>';
   }
-  // アプリ正本のみ: ラベル待ちの記録 (メーカーのラベルが足りず作業を止めているもの)
+  // アプリ正本のみ: ラベル待ちの記録 (メーカーのラベルが足りず作業を止めているもの)。
+  // ⭐登録の入口は職員モードのときだけ描く — 利用者は「⛔ 止まった → ラベルが足りない」で自動で開く (監修 F-5)
   let label = '';
-  if (can('task.label_wait.edit') && c.status !== 'closed') {
+  if (can('task.label_wait.edit') && c.status !== 'closed' && isStaffUI()) {
     label = '<div class="wbtns" style="margin-top:10px">' +
       '<button class="btn" onclick="openLwNew()">🏷 ラベル待ちに登録</button></div>';
   }
@@ -3633,11 +3714,12 @@ async function setExternalReady(on) {
     body: JSON.stringify({ id: c.id, ready: !!on, expect_version: c.version, worker_id: worker.id }),
   });
   if (!j.ok) {
-    showErr(j.message || '変更できませんでした');
     if (j.current) { applyTask(c, j.current); renderList(); renderDetail(c); if (curView === 'board') renderBoard(); }
-    return;
+    // 職員モードが切れていたら PIN を聞いて、そのまま同じ操作をやり直す (計画と同じ門 — 監修 F-5)
+    return planError(j, () => setExternalReady(on));
   }
   applyTask(c, j.task);
+  if (j.staff_mode) state.staff_mode = j.staff_mode;
   renderList(); renderDetail(c);
   if (curView === 'board') renderBoard();
   toast(on ? '外部に出す準備OK にしました' : '外部に出す準備OK をやめました');
@@ -3695,10 +3777,11 @@ function openCrew() {
   crewCard = c.id;
   crewSel = new Set();
   // 端末を操作している人は最初から入れておく (たいていその人も作業する)。
-  // ただし別のカードで作業中・もうこのカードに入っている人は入れない
+  // ただし別のカードで作業中・もうこのカードに入っている人は入れない。
+  // ⭐操作している人が職員なら入れない — 職員が「作業した人」として毎回記録されがち (監修)
   const away = busyElsewhere(c.id);
   const here = new Set((c.active || []).map(a => a.worker_id));
-  if (worker && !away.has(worker.id) && !here.has(worker.id)) crewSel.add(worker.id);
+  if (worker && worker.worker_type !== 'staff' && !away.has(worker.id) && !here.has(worker.id)) crewSel.add(worker.id);
   $('#crewName').textContent = c.title;
   $('#crewMsg').textContent = '';
   renderCrew();
@@ -3720,7 +3803,7 @@ function renderCrew() {
     const isHere = here.has(w.id);
     const elsewhere = away.get(w.id);
     const on = isHere || crewSel.has(w.id);
-    // すでに作業中の人は外せない (外すのは「終わった」で終了するとき)。
+    // すでに作業中の人は外せない (外すのは、その人の札の「ぬける」)。
     // 別のカードで作業中の人は選べない — 選ばせてサーバーに断られるより、先に理由を見せる
     const locked = isHere || !!elsewhere;
     const sub = isHere ? '<span class="sub">いま作業中</span>'
@@ -3886,8 +3969,11 @@ let stStep = null;     // アプリ正本で終了の理由を選んでいる途
 /** アプリ正本で「その変更に職員の本人確認が要るか」(サーバー tasks.js transitionNeedsStaff と同じ規則) */
 const stNeedsStaff = (from, to) => to === 'closed' || from === 'closed' || (from === 'ready_for_stocking' && to === 'in_progress');
 
-function stBtn(value, label, cur) {
-  return '<button class="btn' + (cur ? ' cur' : '') + '" data-v="' + esc(value) + '" onclick="doSetStEl(this)">' + esc(label) + '</button>';
+/** 変更先の一言 (「棚入待ち」= 何を待つのか分からない — 監修) */
+const ST_DESC = { in_progress: '作業をつづける', ready_for_stocking: 'できあがり・棚に入れる前', closed: '棚に入れた／取消 (一覧から外れる)' };
+function stBtn(value, label, cur, desc) {
+  return '<button class="btn' + (cur ? ' cur' : '') + '" data-v="' + esc(value) + '" onclick="doSetStEl(this)">' + esc(label) +
+    (desc ? '<small>' + esc(desc) + '</small>' : '') + '</button>';
 }
 function renderStBtns(c) {
   if (!isApp()) {
@@ -3899,11 +3985,17 @@ function renderStBtns(c) {
   if (stStep === 'closed') {
     $('#stBtns').innerHTML = (state.closeReasons || []).map(r => stBtn('close:' + r.value, r.label, false)).join('')
       + stBtn('back', '← もどる', false);
+    const hint2 = document.getElementById('stHint');
+    if (hint2) hint2.innerHTML = '「終了」にすると一覧から外れます (履歴には残ります)。';
     return;
   }
   const nexts = (state.transitions || {})[c.status] || [];
-  $('#stBtns').innerHTML = nexts.map(v => stBtn(v, stName(v) + (stNeedsStaff(c.status, v) ? ' 🔑' : ''), false)).join('')
+  // 🔑 の意味が分からない → 「(職員)」と書く (監修)
+  $('#stBtns').innerHTML = nexts.map(v => stBtn(v, stName(v) + (stNeedsStaff(c.status, v) ? ' (職員)' : ''), false, ST_DESC[v])).join('')
     || '<p class="hint">この状態から変えられる先がありません</p>';
+  // その段に関係する注記だけ出す (監修)
+  const hint = document.getElementById('stHint');
+  if (hint) hint.innerHTML = '「終了」は職員が棚に入れてから (職員PINが必要)。終了にすると一覧から外れます (履歴には残ります)。';
 }
 
 /**
