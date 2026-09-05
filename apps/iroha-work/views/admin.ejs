@@ -23,6 +23,21 @@
     tr.revoked td, tr.inactive td { color: #adb5bd; text-decoration: line-through; }
     .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; }
     .ng { color: #c92a2a; }
+    /* 作業の記録をさがす */
+    .iw-find { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin-bottom: 10px; }
+    .iw-find label { display: block; font-size: 0.78em; color: #495057; font-weight: 700; }
+    .iw-find input, .iw-find select { display: block; width: 100%; margin-top: 3px; padding: 7px; font-size: 0.95rem; box-sizing: border-box; }
+    .iw-findbtns { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+    .iw-findbtns:empty { display: none; }
+    .iw-sum { font-size: 0.9em; color: #495057; background: #fff; border: 1px solid #dee2e6; border-radius: 6px;
+      padding: 9px 12px; margin-bottom: 10px; line-height: 1.7; }
+    .iw-sum b { font-size: 1.25em; color: #212529; font-variant-numeric: tabular-nums; }
+    .iw-tag { display: inline-block; font-size: 0.85em; font-weight: 700; border-radius: 999px; padding: 1px 8px; }
+    .iw-tag.done { background: #d3f9d8; color: #2b8a3e; }
+    .iw-tag.pause { background: #fff3bf; color: #a1670b; }
+    .iw-tag.now { background: #d0ebff; color: #1864ab; }
+    .iw-tag.admin, .iw-tag.void { background: #f1f3f5; color: #868e96; }
+    td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
     .code-big { font-size: 2em; font-weight: 700; letter-spacing: 0.2em; font-family: ui-monospace, Menlo, monospace; }
     code { background: #e9ecef; padding: 1px 5px; border-radius: 4px; }
   </style>
@@ -272,6 +287,41 @@
     </div>
     <% } %>
 
+    <!-- 中原さん 2026-09-05:「あとで誰がいつ何の作業をしたのかを検索できるようになっているといい」 -->
+    <div class="iw-box">
+      <h2>🔎 作業の記録をさがす</h2>
+      <p class="hint">1行 = 1人ぶんの作業です。合計は<b>しぼり込んだ全件</b>で出しています (表に出ている分だけの合計ではありません)。
+        期間は日本時間の日付で、両端の日を含みます。</p>
+      <div class="iw-find">
+        <label>だれが
+          <select id="fWho">
+            <option value="">ぜんいん</option>
+            <% for (const w of workers) { %>
+              <option value="<%= w.id %>"><%= w.display_name %><%= w.worker_type === 'staff' ? ' (職員)' : '' %><%= w.active ? '' : ' [無効]' %></option>
+            <% } %>
+          </select>
+        </label>
+        <label>いつから<input type="date" id="fFrom"></label>
+        <label>いつまで<input type="date" id="fTo"></label>
+        <label>何の作業 (商品名・商品コード)<input type="search" id="fQ" placeholder="例: みつろう / 0726-"></label>
+        <label>取り消した記録
+          <select id="fVoid"><option value="">ふくめない</option><option value="1">ふくめる</option></select>
+        </label>
+      </div>
+      <div class="iw-findbtns">
+        <button class="btn-sm" onclick="findSessions(0)">さがす</button>
+        <button class="btn-sm" onclick="clearFind()">条件をクリア</button>
+        <% if (isAdmin) { %>
+          <button class="btn-sm" onclick="csvFind()">📄 CSVでダウンロード</button>
+        <% } else { %>
+          <span class="hint" style="margin:0">CSV の書き出しは管理者のみです (まとめて持ち出せるため)。</span>
+        <% } %>
+      </div>
+      <div class="iw-sum" id="fSum">条件を入れて「さがす」を押してください。</div>
+      <table class="iw-list" id="fTbl" style="display:none"></table>
+      <div class="iw-findbtns" id="fMore"></div>
+    </div>
+
     <div class="iw-box">
       <h2>⏱ 作業時間セッション (直近50件)</h2>
       <p class="hint">開始/終了はサーバー時刻で記録します。<b>終了忘れは自動で確定しません</b> —
@@ -362,6 +412,88 @@
       return { status: r.status, json: await r.json().catch(() => ({})) };
     }
     function setMsg(id, kind, text) { const el = document.getElementById(id); el.className = 'msg ' + kind; el.textContent = text; }
+
+    // ── 作業の記録をさがす (中原さん 2026-09-05) ──
+    const FIND_PAGE = 100;
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const val = (id) => document.getElementById(id).value.trim();
+    function findParams() {
+      const p = new URLSearchParams();
+      if (val('fWho')) p.set('worker_id', val('fWho'));
+      if (val('fFrom')) p.set('from', val('fFrom'));
+      if (val('fTo')) p.set('to', val('fTo'));
+      if (val('fQ')) p.set('q', val('fQ'));
+      if (val('fVoid')) p.set('voided', '1');
+      return p;
+    }
+    /** 秒 → 「1時間25分」。0分でも「0分」と出す (空欄にしない) */
+    function findDur(sec) {
+      const m = Math.round((Number(sec) || 0) / 60);
+      return m >= 60 ? Math.floor(m / 60) + '時間' + (m % 60) + '分' : m + '分';
+    }
+    const findJst = (iso) => (iso ? new Date(iso).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '');
+    async function findSessions(offset) {
+      const p = findParams();
+      p.set('limit', String(FIND_PAGE));
+      p.set('offset', String(offset || 0));
+      const sum = document.getElementById('fSum');
+      sum.textContent = 'さがしています…';
+      const r = await fetch(BASE + '/admin/sessions/search?' + p.toString());
+      const j = await r.json().catch(() => ({}));
+      if (!j.ok) { sum.textContent = '❌ ' + (j.message || 'さがせませんでした'); return; }
+      const s = j.summary;
+      // 合計時間は**終わったぶんだけ**。作業中はまだ確定していないので足さない (見るたびに増える数字を工賃に使わない)
+      sum.innerHTML = '件数 <b>' + s.count + '</b> 件 ／ 合計時間 (終わったぶん) <b>' + findDur(s.totalSeconds) + '</b>'
+        + ' ／ 人数 <b>' + s.workers + '</b> 人 ／ 商品 <b>' + s.products + '</b> 種類 ／ カード <b>' + s.cards + '</b> 枚'
+        + (s.open ? ' ／ <span class="ng">いま作業中 ' + s.open + ' 件 (合計時間には入れていません)</span>' : '');
+      const tbl = document.getElementById('fTbl');
+      const head = '<tr><th>いつ</th><th>だれが</th><th>何を</th><th>時間</th><th>終わり方</th><th>いっしょにやった人</th></tr>';
+      const rows = j.rows.map((x) => {
+        const tag = x.voided_at ? '<span class="iw-tag void">取り消し</span>'
+          : !x.ended_at ? '<span class="iw-tag now">作業中</span>'
+          : x.end_reason === 'done' ? '<span class="iw-tag done">できあがり</span>'
+          : x.end_reason === 'pause' ? '<span class="iw-tag pause">中断</span>'
+          : '<span class="iw-tag admin">職員が終了</span>';
+        return '<tr class="' + (x.voided_at ? 'revoked' : '') + '">'
+          + '<td class="num">' + esc(findJst(x.started_at)) + (x.ended_at ? '<br>〜 ' + esc(findJst(x.ended_at)) : '<br>〜 いま') + '</td>'
+          + '<td>' + esc(x.worker_name) + '</td>'
+          + '<td>' + esc(x.title_snapshot || '(名前なし)') + '<br><small>' + esc(x.product_code || '') + '</small></td>'
+          + '<td class="num' + (x.warn_long ? ' ng' : '') + '">' + (x.warn_long ? '⚠ ' : '') + findDur(x.elapsed_seconds) + '</td>'
+          + '<td>' + tag + '</td>'
+          + '<td>' + esc((x.mates || []).join('、')) + '</td></tr>';
+      }).join('');
+      tbl.innerHTML = head + (rows || '<tr><td colspan="6">見つかりませんでした</td></tr>');
+      tbl.style.display = '';
+      const from = (offset || 0);
+      document.getElementById('fMore').innerHTML =
+        (from > 0 ? '<button class="btn-sm" onclick="findSessions(' + Math.max(0, from - FIND_PAGE) + ')">← 前の' + FIND_PAGE + '件</button>' : '')
+        + (j.truncated ? '<button class="btn-sm" onclick="findSessions(' + (from + FIND_PAGE) + ')">次の' + FIND_PAGE + '件 →</button>' : '')
+        + (j.rows.length ? '<span style="font-size:.85em;color:#868e96">' + (from + 1) + '〜' + (from + j.rows.length) + ' 件目を表示中</span>' : '');
+    }
+    function clearFind() {
+      for (const id of ['fWho', 'fFrom', 'fTo', 'fQ', 'fVoid']) document.getElementById(id).value = '';
+      document.getElementById('fTbl').style.display = 'none';
+      document.getElementById('fMore').innerHTML = '';
+      document.getElementById('fSum').textContent = '条件を入れて「さがす」を押してください。';
+    }
+    /** CSV は件数が多すぎると 422 で断られる (欠けたCSVを渡さないため)。理由を画面に出す */
+    async function csvFind() {
+      const url = BASE + '/admin/sessions/search.csv?' + findParams().toString();
+      const r = await fetch(url);
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        document.getElementById('fSum').textContent = '❌ ' + (j.message || 'CSVを出せませんでした');
+        return;
+      }
+      const blob = await r.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = (r.headers.get('content-disposition') || '').match(/filename="([^"]+)"/)?.[1] || 'iroha-work-sessions.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    }
 
     let migPlanId = null;   // 自分が見た調査結果の ID (本取込はこれと一致する結果にだけ)
     function migShow(obj) { const el = document.getElementById('migOut'); el.style.display = 'block'; el.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1); }

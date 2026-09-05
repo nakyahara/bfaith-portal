@@ -5,7 +5,7 @@
  * 不変条件 (closed には close_reason/closed_at、on_hold には hold_reason …) は書く前に validateTaskInvariants で守る。
  * 状態変更は version の楽観ロック (2 台の iPad が同時に触っても後勝ちで壊さない) + 履歴 (f_iroha_app_events.task_id)。
  */
-import { getDB, startSession, setMetaValue, logEvent, sourceOfTruth } from './db.js';
+import { getDB, startSessions, setMetaValue, logEvent, sourceOfTruth } from './db.js';
 import {
   OPEN_STATUSES, CLOSE_REASONS, HOLD_REASONS,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
@@ -754,8 +754,13 @@ export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerN
 let startTaskSessionHook = null;
 /** テスト用: セッション INSERT の後・状態変更の前に割り込む (「別端末が同時に変えた」の再現。本番では null) */
 export function _setStartTaskSessionHook(fn) { startTaskSessionHook = fn; }
-export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotOf = null }) {
+/**
+ * @param worker 端末を操作している人 (状態変更の actor・ログに残る)
+ * @param workers 実際に作業する人たち (複数可)。省略時は操作者ひとり
+ */
+export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null }) {
   const db = getDB();
+  const crew = (Array.isArray(workers) && workers.length) ? workers : [worker];
   const tx = db.transaction(() => {
     const g = appModeGuard();   // 見てから書くまでに Notion 正本へ戻ることがある (Codex PR1 R18)
     if (g) return g;
@@ -764,12 +769,15 @@ export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotO
     if (t.status === 'closed') {
       return { ok: false, error: 'done_card', message: 'このカードは終了しています (やり直すなら職員が状態を戻してください)' };
     }
-    const r = startSession({
-      taskId: t.id, productCode: t.product_code, title: t.product_name, worker, deviceLabel,
+    const r = startSessions({
+      taskId: t.id, productCode: t.product_code, title: t.product_name, workers: crew, deviceLabel,
       masterSnapshot: snapshotOf ? snapshotOf(t) : undefined,
     });
-    if (!r.already) {
-      safeLogTaskEvent({ taskId: t.id, action: 'session_start', workerId: worker.id, workerName: worker.display_name,
+    // 記録は**人ごと**に残す (誰の分が新しく始まったかが後で分かるように)
+    for (const w of crew) {
+      const s = r.ok ? r.sessions.find((x) => x.workerId === Number(w.id)) : null;
+      if (s?.already) continue;
+      safeLogTaskEvent({ taskId: t.id, action: 'session_start', workerId: w.id, workerName: w.display_name,
         deviceLabel, to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
     }
     if (!r.ok) return r;
@@ -781,7 +789,10 @@ export function startTaskSession({ taskId, worker, deviceLabel = null, snapshotO
       if (!cs.ok) throw Object.assign(new Error(cs.message || '状態を変更できませんでした'), { taskResult: cs });
       task = cs.task;
     }
-    return { ok: true, already: !!r.already, sessionId: r.sessionId, startedAt: r.startedAt, task };
+    // sessionId は「操作した人ぶん」を返す (いなければ先頭)。既存の画面・再送がそのまま動く
+    const mine = r.sessions.find((s) => s.workerId === Number(worker.id)) || r.sessions[0];
+    return { ok: true, already: !!r.already, sessions: r.sessions,
+      sessionId: mine.sessionId, startedAt: r.startedAt, task };
   });
   try { return tx.immediate(); } catch (e) {
     if (e.taskResult) return { ok: false, ...e.taskResult };   // ロールバック済み (セッションは残っていない)

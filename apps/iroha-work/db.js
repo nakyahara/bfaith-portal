@@ -833,42 +833,89 @@ export const SESSION_WARN_HOURS = 6;
  *   正本が切り替わる・カードが消えることがあるため (Codex PR1 R14)
  */
 export function startSession({ pageId = null, taskId = null, productCode = null, title = null, worker, deviceLabel = null, masterSnapshot = undefined, guard = null }) {
+  const r = startSessions({ pageId, taskId, productCode, title, workers: [worker], deviceLabel, masterSnapshot, guard });
+  if (!r.ok) return r;
+  const s = r.sessions[0];
+  return { ok: true, already: !!s.already, sessionId: s.sessionId, startedAt: s.startedAt };
+}
+
+/**
+ * 複数人での作業開始 (中原さん 9/5「一人で作業するわけではないから作業する人を選択できるようにしたい」)。
+ * 選んだ人ぶんの行を **1 つのトランザクションで** 作る。1人でも別カードで作業中なら誰も開始しない
+ * — 一部だけ記録が残ると「4人でやったのに3人分」になり、工賃も実測もそのぶん狂うため。
+ * 同じカードで既に作業中の人は already として数えるだけ (途中で人を足すとき・重複タップの再送対策)。
+ * ⭐「1作業者につき活動中1件」の制約 (idx_iroha_sessions_open_uniq) はそのまま守る。
+ * @param workers [{id, display_name}] 1件以上
+ * @returns {ok, sessions:[{sessionId, workerId, workerName, startedAt, already}]} / {ok:false, error:'busy', busy:[…]}
+ */
+export function startSessions({ pageId = null, taskId = null, productCode = null, title = null, workers, deviceLabel = null, masterSnapshot = undefined, guard = null }) {
   const db = getDB();
   const now = utcNow();
   if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
+  // id は正の整数だけ (0・負数を DB 層でも通さない — 呼び元が router とは限らない)
+  const list = (Array.isArray(workers) ? workers : []).filter((w) => w && Number.isSafeInteger(Number(w.id)) && Number(w.id) > 0);
+  if (!list.length) return { ok: false, error: 'worker_required', message: '作業する人を選んでください' };
+  // 同じ人を2回選んでも1行にする (画面の重複・再送で二重に数えない)
+  const uniq = [...new Map(list.map((w) => [Number(w.id), w])).values()];
   return db.transaction(() => {
     if (guard) { const g = guard(); if (g) return g; }
-    // 取り消し済み (voided_at) の記録は「作業中」に数えない — 終了の判定と揃える (Codex PR1 R15)
-    const open = db.prepare(`SELECT id, page_id, task_id, title_snapshot, started_at FROM f_iroha_work_sessions
-      WHERE worker_id = ? AND ended_at IS NULL AND voided_at IS NULL`).get(worker.id);
-    if (open) {
+    // ⭐取りに行く条件は**部分ユニーク索引 (idx_iroha_sessions_open_uniq) と同じ ended_at IS NULL** にする。
+    //   索引は voided を除かないので、ここで voided を先に外すと「作業中ではない」と判断した直後に
+    //   INSERT が UNIQUE 違反で落ちる (Codex 指摘)。取り消し済みで開いたままの行は異常なので、
+    //   落とさずに理由を返して職員に直してもらう
+    const openOf = db.prepare(`SELECT id, page_id, task_id, title_snapshot, started_at, voided_at FROM f_iroha_work_sessions
+      WHERE worker_id = ? AND ended_at IS NULL`);
+    const isSameCard = (open) => (taskId != null ? Number(open.task_id) === Number(taskId) : open.page_id === pageId);
+    // ⭐先に全員ぶん調べてから入れる (何行か入れた後で断らない — 途中まで記録が残るのを防ぐ)
+    const busy = [];
+    const already = new Map();
+    const broken = [];
+    for (const w of uniq) {
+      const open = openOf.get(Number(w.id));
+      if (!open) continue;
+      if (open.voided_at) { broken.push({ workerId: Number(w.id), workerName: w.display_name, open }); continue; }
       // 同じカードなら成功扱いで既存セッションを返す (応答が消えた再送で
       // 「実際は動いているのに開始できない」状態にしない — Codex PR2 #2)
-      const same = taskId != null ? Number(open.task_id) === Number(taskId) : open.page_id === pageId;
-      if (same) return { ok: true, already: true, sessionId: open.id, startedAt: open.started_at };
-      return { ok: false, error: 'busy', open,
-        message: `「${open.title_snapshot || '別のカード'}」の作業がまだ終わっていません。先にそちらを終了・中断してください` };
+      if (isSameCard(open)) already.set(Number(w.id), open);
+      else busy.push({ workerId: Number(w.id), workerName: w.display_name, open });
     }
-    // 開始時点の作業仕様を残す (§1.7 ④)。呼び元 (router) が「画面に見えていた実効値」
-    // (マスタ+カードのフォールバック合成 = service.masterOf) を渡す — Codex PR4-R2 #1。
-    // 渡されなければマスタ行の生値で代用 (テスト・移行経路用)
-    let snapshot = null;
-    if (masterSnapshot !== undefined) {
-      snapshot = masterSnapshot == null ? null : JSON.stringify(masterSnapshot);
-    } else {
-      const hasWm = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get();
-      if (productCode && hasWm) {
-        const wm = db.prepare('SELECT material_code, storage_container, units_per_container, process_count, note, video_url, version FROM f_iroha_work_master WHERE code_key = ?')
-          .get(String(productCode).trim().toLowerCase());
-        if (wm) snapshot = JSON.stringify(wm);
-      }
+    if (broken.length) {
+      const who = broken.map((b) => b.workerName).join('、');
+      return { ok: false, error: 'stuck_session', busy: broken, open: broken[0].open,
+        message: `${who} さんに、取り消し済みなのに終わっていない記録が残っています。職員の方が管理画面から片づけてください` };
     }
-    const info = db.prepare(`INSERT INTO f_iroha_work_sessions
+    if (busy.length) {
+      const who = busy.map((b) => `${b.workerName} さんは「${b.open.title_snapshot || '別のカード'}」`).join('、');
+      return { ok: false, error: 'busy', busy, open: busy[0].open,
+        message: `${who} の作業がまだ終わっていません。先にそちらを終了・中断するか、その人を外してください` };
+    }
+    const snapshot = startSnapshotJson(db, productCode, masterSnapshot);
+    const ins = db.prepare(`INSERT INTO f_iroha_work_sessions
       (page_id, task_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, master_snapshot)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(pageId, taskId == null ? null : Number(taskId), productCode, title, worker.id, worker.display_name, deviceLabel, now, snapshot);
-    return { ok: true, sessionId: Number(info.lastInsertRowid), startedAt: now };
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    const sessions = uniq.map((w) => {
+      const open = already.get(Number(w.id));
+      if (open) return { sessionId: open.id, workerId: Number(w.id), workerName: w.display_name, startedAt: open.started_at, already: true };
+      const info = ins.run(pageId, taskId == null ? null : Number(taskId), productCode, title,
+        Number(w.id), w.display_name, deviceLabel, now, snapshot);
+      return { sessionId: Number(info.lastInsertRowid), workerId: Number(w.id), workerName: w.display_name, startedAt: now, already: false };
+    });
+    return { ok: true, sessions, startedAt: now, already: sessions.every((s) => s.already) };
   }).immediate();
+}
+
+/**
+ * 開始時点の作業仕様 (§1.7 ④)。呼び元 (router) が「画面に見えていた実効値」
+ * (マスタ+カードのフォールバック合成 = service.masterOf) を渡す — Codex PR4-R2 #1。
+ * 渡されなければマスタ行の生値で代用 (テスト・移行経路用)
+ */
+function startSnapshotJson(db, productCode, masterSnapshot) {
+  if (masterSnapshot !== undefined) return masterSnapshot == null ? null : JSON.stringify(masterSnapshot);
+  const hasWm = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_master'").get();
+  if (!productCode || !hasWm) return null;
+  const wm = db.prepare('SELECT material_code, storage_container, units_per_container, process_count, note, video_url, version FROM f_iroha_work_master WHERE code_key = ?')
+    .get(String(productCode).trim().toLowerCase());
+  return wm ? JSON.stringify(wm) : null;
 }
 
 /**
@@ -908,6 +955,62 @@ export function stopSession({ pageId = null, taskId = null, workerId, sessionId,
     db.prepare('UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = ?, raw_seconds = ? WHERE id = ?')
       .run(now, reason, raw, row.id);
     return { ok: true, session: { id: row.id, raw_seconds: raw, started_at: row.started_at, ended_at: now }, remainingActive: remainingOn() };
+  }).immediate();
+}
+
+/**
+ * まとめて終了・中断 (複数人で始めた作業を iPad 1台から終わらせる)。
+ * 対象は**開始時に発行した sessionId の配列**で指定する。「そのカードの活動中を全部」にしないのは、
+ * 遅延した再送が、後から入ってきた人のセッションまで巻き込んで終了させてしまうため
+ * (単数版 stopSession と同じ理由 — Codex PR2-R2 P2)。
+ * 既に終わっている id が混ざっていても成功扱い (冪等)。
+ * @returns {ok, stopped:[{id, workerName, raw_seconds, already}], totalSeconds, remainingActive}
+ */
+export function stopSessions({ pageId = null, taskId = null, sessionIds, reason, guard = null }) {
+  if (reason !== 'done' && reason !== 'pause') return { ok: false, error: 'bad_request', message: '終了の種類が不正です' };
+  const ids = [...new Set((Array.isArray(sessionIds) ? sessionIds : []).map(Number))]
+    .filter((n) => Number.isInteger(n) && n > 0);
+  if (!ids.length) return { ok: false, error: 'bad_request', message: 'session_id が必要です (画面を更新してください)' };
+  const db = getDB();
+  const now = utcNow();
+  const byTask = taskId != null;
+  return db.transaction(() => {
+    if (guard) { const g = guard(); if (g) return g; }
+    const get = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?');
+    const upd = db.prepare('UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = ?, raw_seconds = ? WHERE id = ?');
+    // ⭐先に全部たしかめる。db.transaction は**値を返すと commit する** (巻き戻すのは throw のときだけ) —
+    //   閉じながら確かめると、断る前に閉じた分だけが残ってしまう
+    const targets = [];
+    for (const id of ids) {
+      const row = get.get(id);
+      const sameCard = row && (byTask ? Number(row.task_id) === Number(taskId) : row.page_id === pageId);
+      // 1件でも別カード・存在しない id なら**何も閉じない** (画面が古い証拠。部分的に閉じて混乱させない)
+      if (!row || !sameCard) return { ok: false, error: 'not_started', message: 'このカードで作業をはじめた記録がありません (画面を更新してください)' };
+      targets.push(row);
+    }
+    const stopped = [];
+    for (const row of targets) {
+      if (row.ended_at) {
+        // 既に閉じている = 再送。⭐**実際に記録されている終わり方**を返す —
+        // 先に pause で閉じたところへ done の再送が来たとき、呼び元が「done になった」と誤解しない (Codex 指摘)
+        stopped.push({ id: row.id, workerId: row.worker_id, workerName: row.worker_name,
+          raw_seconds: row.raw_seconds, started_at: row.started_at, ended_at: row.ended_at,
+          end_reason: row.end_reason, already: true });
+        continue;
+      }
+      const raw = Math.max(0, Math.floor((Date.parse(now) - Date.parse(row.started_at)) / 1000));
+      upd.run(now, reason, raw, row.id);
+      stopped.push({ id: row.id, workerId: row.worker_id, workerName: row.worker_name,
+        raw_seconds: raw, started_at: row.started_at, ended_at: now, end_reason: reason, already: false });
+    }
+    const remainingActive = db.prepare(`SELECT COUNT(*) c FROM f_iroha_work_sessions
+      WHERE ${byTask ? 'task_id = ?' : 'page_id = ?'} AND ended_at IS NULL AND voided_at IS NULL`)
+      .get(byTask ? Number(taskId) : pageId).c;
+    const first = stopped[0];
+    return { ok: true, stopped, remainingActive,
+      totalSeconds: stopped.reduce((a, s) => a + (Number(s.raw_seconds) || 0), 0),
+      // 単数版と同じ形も返す (呼び元・既存画面がそのまま読めるように)
+      session: first ? { id: first.id, raw_seconds: first.raw_seconds, started_at: first.started_at, ended_at: first.ended_at } : null };
   }).immediate();
 }
 
@@ -992,6 +1095,137 @@ export function listSessionsForAdmin(limit = 50) {
     r.warn_long = !r.ended_at && r.elapsed_seconds > SESSION_WARN_HOURS * 3600;
   }
   return rows;
+}
+
+/**
+ * JST の日付 (YYYY-MM-DD) → その日の 00:00 JST を UTC ISO で。不正なら null。
+ * ⭐形だけ見ても足りない: Date.parse('2026-02-30T00:00:00+09:00') は 3/2 に繰り上がって
+ *   「有効な日付」になってしまう (Codex 指摘・実測ずみ)。年月日で往復して実在日か確かめる
+ */
+export function jstDayStartUtc(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || '').trim());
+  if (!m) return null;
+  const [, y, mo, d] = m.map(Number);
+  const t = Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00+09:00`);
+  if (Number.isNaN(t)) return null;
+  const back = new Date(t + 9 * 3600000).toISOString().slice(0, 10);   // JST に戻して同じ日付か
+  return back === `${m[1]}-${m[2]}-${m[3]}` ? new Date(t).toISOString() : null;
+}
+
+/** LIMIT / OFFSET に渡せる整数だけ通す。1.5 や Infinity をそのまま渡すと SQLite が datatype mismatch で落ちる */
+function intInRange(v, fallback, min, max) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+/** 検索の上限。1回に返す最大件数 (画面のページ送り用) */
+export const SESSION_SEARCH_MAX = 500;
+
+/**
+ * 作業の記録をさがす (中原さん 9/5「あとで誰がいつ何の作業をしたのかを検索できるようになっているといい」)。
+ * 1行 = 1人ぶんの作業。期間は **JST の日付**で受け取り、保存してある UTC の範囲に直して引く
+ * (started_at をそのまま前方一致させると JST 9時前が前日に落ちる — feedback_jst_to_iso_string_trap)。
+ * @param workerId 作業者ID (null = 全員) / from,to JSTの日付 (両端を含む) / q 商品名・商品コードの部分一致
+ * @returns {rows, summary:{count, totalSeconds, workers, products, cards, open}, truncated}
+ */
+export function searchSessions({ workerId = null, from = null, to = null, q = null, includeVoided = false, limit = 200, offset = 0 } = {}) {
+  const db = getDB();
+  const where = [];
+  const args = [];
+  if (!includeVoided) where.push('s.voided_at IS NULL');
+  const wid = Number(workerId);
+  if (Number.isInteger(wid) && wid > 0) { where.push('s.worker_id = ?'); args.push(wid); }
+  const fromUtc = jstDayStartUtc(from);
+  if (fromUtc) { where.push('s.started_at >= ?'); args.push(fromUtc); }
+  const toStart = jstDayStartUtc(to);
+  if (toStart) {   // 「いつまで」はその日を**含む** → 翌日 00:00 JST の手前まで
+    where.push('s.started_at < ?');
+    args.push(new Date(Date.parse(toStart) + 86400000).toISOString());
+  }
+  const kw = String(q || '').trim();
+  if (kw) {
+    where.push('(s.title_snapshot LIKE ? ESCAPE \'\\\' OR s.product_code LIKE ? ESCAPE \'\\\')');
+    const like = `%${kw.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
+    args.push(like, like);
+  }
+  const sql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const cap = intInRange(limit, 200, 1, SESSION_SEARCH_MAX);
+  const skip = intInRange(offset, 0, 0, 1_000_000);
+
+  // 合計は**絞り込んだ全件**で出す (画面に出ている 200 件ぶんだけの合計にしない)。
+  // ⭐totalSeconds は**終わったぶんだけ**。作業中はまだ確定していないので足さない
+  //   (工賃の計算に使う数字が、見るたびに増えていくことになる — 画面のラベルも「終わったぶん」と書く)
+  const summary = db.prepare(`SELECT COUNT(*) AS count,
+      COALESCE(SUM(CASE WHEN s.ended_at IS NOT NULL THEN s.raw_seconds ELSE 0 END), 0) AS totalSeconds,
+      COUNT(DISTINCT s.worker_id) AS workers,
+      COUNT(DISTINCT LOWER(TRIM(s.product_code))) AS products,
+      COUNT(DISTINCT COALESCE('t' || s.task_id, s.page_id)) AS cards,
+      SUM(CASE WHEN s.ended_at IS NULL THEN 1 ELSE 0 END) AS open
+    FROM f_iroha_work_sessions s ${sql}`).get(...args);
+
+  const rows = db.prepare(`SELECT s.id, s.task_id, s.page_id, s.product_code, s.title_snapshot,
+      s.worker_id, s.worker_name, s.device_label, s.started_at, s.ended_at, s.end_reason,
+      s.raw_seconds, s.voided_at, s.void_reason
+    FROM f_iroha_work_sessions s ${sql}
+    ORDER BY s.started_at DESC, s.id DESC LIMIT ? OFFSET ?`).all(...args, cap, skip);
+
+  const now = Date.now();
+  for (const r of rows) {
+    r.card_key = r.task_id != null ? `t${r.task_id}` : r.page_id;
+    r.elapsed_seconds = r.ended_at ? r.raw_seconds : Math.max(0, Math.floor((now - Date.parse(r.started_at)) / 1000));
+    r.warn_long = !r.ended_at && r.elapsed_seconds > SESSION_WARN_HOURS * 3600;
+  }
+  attachMates(db, rows);
+  return { rows, summary, truncated: summary.count > skip + rows.length };
+}
+
+/**
+ * 「いっしょにやった人」を各行に付ける。同じカードで**時間が重なっている**他の人だけ
+ * (同じカードでも別の日にやった人は一緒に働いていないので入れない)
+ */
+function attachMates(db, rows) {
+  if (!rows.length) return;
+  const tasks = [...new Set(rows.filter((r) => r.task_id != null).map((r) => Number(r.task_id)))];
+  const pages = [...new Set(rows.filter((r) => r.task_id == null && r.page_id).map((r) => r.page_id))];
+  // ⭐同じカードを何年も使う運用があるので、**この検索結果の時間帯**に限って引く
+  //   (カード指定だけだと、1日ぶんの検索でもそのカードの全履歴を読むことになる — Codex 指摘)
+  const winFrom = rows.reduce((a, r) => (a && a < r.started_at ? a : r.started_at), null);
+  const open = rows.some((r) => !r.ended_at);
+  const winTo = open ? null : rows.reduce((a, r) => (a && a > r.ended_at ? a : r.ended_at), null);
+  // 重なりを見るので、相手は「この時間帯より後に始まっていない」かつ「この時間帯より前に終わっていない」もの
+  const bound = ' AND (ended_at IS NULL OR ended_at >= ?)' + (winTo ? ' AND started_at <= ?' : '');
+  const boundArgs = winTo ? [winFrom, winTo] : [winFrom];
+  const all = [];
+  const ph = (n) => new Array(n).fill('?').join(',');
+  if (tasks.length) {
+    all.push(...db.prepare(`SELECT id, task_id, NULL AS page_id, worker_id, worker_name, started_at, ended_at
+      FROM f_iroha_work_sessions WHERE voided_at IS NULL AND task_id IN (${ph(tasks.length)})${bound}`)
+      .all(...tasks, ...boundArgs));
+  }
+  if (pages.length) {
+    all.push(...db.prepare(`SELECT id, NULL AS task_id, page_id, worker_id, worker_name, started_at, ended_at
+      FROM f_iroha_work_sessions WHERE voided_at IS NULL AND page_id IN (${ph(pages.length)})${bound}`)
+      .all(...pages, ...boundArgs));
+  }
+  const byCard = new Map();
+  for (const s of all) {
+    const key = s.task_id != null ? `t${s.task_id}` : s.page_id;
+    if (!byCard.has(key)) byCard.set(key, []);
+    byCard.get(key).push(s);
+  }
+  const FAR = 8640000000000;   // 終わっていない = まだ続いている扱い
+  for (const r of rows) {
+    const aFrom = Date.parse(r.started_at);
+    const aTo = r.ended_at ? Date.parse(r.ended_at) : FAR;
+    const names = [];
+    for (const s of byCard.get(r.card_key) || []) {
+      if (s.id === r.id || s.worker_id === r.worker_id) continue;
+      const bTo = s.ended_at ? Date.parse(s.ended_at) : FAR;
+      if (aFrom < bTo && Date.parse(s.started_at) < aTo && !names.includes(s.worker_name)) names.push(s.worker_name);
+    }
+    r.mates = names;
+  }
 }
 
 /**

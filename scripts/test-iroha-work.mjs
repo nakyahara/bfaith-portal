@@ -169,7 +169,7 @@ initMirrorDB();
 const { getDB, replaceCache, listCache, addIrohaWorker, setIrohaWorkerActive, getIrohaWorker, listIrohaWorkers,
   setWorkerPin, verifyWorkerPin, _clearPinFails,
   createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents,
-  startSession, stopSession, activeSessionsByPage, activeSessionsByTask, estimateByProduct, getMeta, setMetaValue, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
+  startSession, startSessions, stopSession, stopSessions, searchSessions, jstDayStartUtc, activeSessionsByPage, activeSessionsByTask, estimateByProduct, getMeta, setMetaValue, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
 const { ensureFresh, refreshFromNotion, changeStatus, fetchCardLive, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
 const { buildList, priorityOf, clearEnrichCache, previousPhotosOf } = await import('../apps/iroha-work/service.js');
 
@@ -3206,11 +3206,22 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '期限シールは「あり」のときだけ赤で出す (なしは出さない)');
   ok(/function headFactsHtml\(c\)/.test(html) && /c\.external_text/.test(html) && /c\.supplier/.test(html),
     '参考・外部出し目安・取引先も上部に出す');
-  ok(/<h3 class="sec">作業情報<\/h3>/.test(html) && !/<h3 class="sec">作業のやり方<\/h3>/.test(html),
-    '「作業のやり方」を「作業情報」に変える');
-  ok(/kv\('大きさ', sizeClassText\(m\.size_class\), \{ reg: 'size_class' \}\)/.test(html),
-    '大きさもタイルから登録できる (P4 で項目だけ足して開けなくなっていた)');
-  ok(/kv\('期限シール'/.test(html) && /reg: 'expiry_seal'/.test(html), '期限シールもタイルから変えられる');
+  ok(/<h3 class="sec">作業情報' \+ missBadge\(m\)/.test(html) && !/<h3 class="sec">作業のやり方</.test(html),
+    '「作業のやり方」を「作業情報」に変える (未登録の数も見出しに出す)');
+  ok(/wrow\('大きさ', sizeClassText\(m\.size_class\), 'size_class'\)/.test(html),
+    '大きさは行から登録できる (P4 で項目だけ足して開けなくなっていた)');
+  ok(/wrow\('期限シール'/.test(html) && /'expiry_seal'\)/.test(html), '期限シールも行から変えられる');
+  // 作業情報の作り (中原さん 2026-09-05:「写真がないやつはカードみたいな表示にしなくていい。Zロケ在庫も工程も見にくい」)
+  ok(/<div class="wigroup">使うもの<\/div>/.test(html) && /<div class="wigroup">作業のしかた<\/div>/.test(html)
+    && /<div class="wigroup">参考にするもの<\/div>/.test(html), '作業情報は「使うもの・作業のしかた・参考にするもの」の3つに分ける');
+  ok(/thing\('資材 \(袋\)'/.test(html) && /thing\('保管箱と入れ方'/.test(html) && !/thing\('工程'/.test(html),
+    '写真で見分けるもの (資材・保管箱) だけ写真カード。工程・期限シール・大きさは行にする');
+  ok(/1箱に <b class="num">' \+ esc\(String\(units\)\) \+ '<\/b> 個ずつ入れる/.test(html),
+    '入数は保管箱とセットで読ませる (120 が総数か1箱ぶんか迷わない)');
+  ok(/miss \? '⚠ 未登録' : '<span class="none">未設定<\/span>'/.test(html) && /note \? esc\(note\) : '特になし'/.test(html),
+    '空欄を「—」で済ませず、登録が要るもの (未登録) と なくてよいもの (未設定・特になし) を分ける');
+  ok(/<span class="ro">見るだけ<\/span>/.test(html) && /使えるのは ' \+ esc\(String\(c\.loc_free\)\)/.test(html),
+    'Zロケ在庫は「見るだけ」の参考欄に下ろし、使える数を先に大きく出す');
 
   // ══ できた数・中断メモ (要件 §Y。中原さん 2026-09-05) ══
   ok(/n\('できた数', done, '個', 'done'\)/.test(html) && /const rest = \(c\.qty != null && done != null\) \? Math\.max\(0, c\.qty - done\) : null;/.test(html)
@@ -3252,7 +3263,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/'done_qty', 'hold_memo',/.test(html), 'サーバーの返事のできた数・中断メモをカードに反映する (取り直しを待たない)');
   ok(/c\.done_qty != null \? '✅ できた ' \+ c\.done_qty/.test(html) && /c\.hold_memo \? '📝 メモ' : null/.test(html),
     'ボードのカードでも「途中まで進んでいる」が分かる');
-  ok(/reg: 'units_per_container'/.test(html) && /reg: 'storage_container'/.test(html), '保管箱と入数は別々にタップできる');
+  ok(/'units_per_container'\)/.test(html) && /'storage_container', 'container'/.test(html), '保管箱と入数は別々にタップできる (帯の data-reg が内側で勝つ)');
   // タップした項目だけ出す・ダイアログはスクロールできる・候補は正方形のタイル (中原さん 2026-09-03)
   ok(/class="mvf" data-f="material_code"/.test(html) && /class="mvf" data-f="storage_container"/.test(html)
     && /class="mvf" data-f="units_per_container"/.test(html) && /class="mvf" data-f="note"/.test(html), '登録・変更の項目はひとつずつ枠に入っている');
@@ -3290,12 +3301,12 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(j\.error === 'not_found'\)/.test(html) && /このカードはもうありません/.test(html), '消えたカードは閉じる (404)');
   ok(/<span id="dstateWrap"><\/span>/.test(html) && !/<button class="st todo" id="dstate"/.test(html), '状態のボタンは静的に置かない (許されたときだけ描く)');
   ok(/can\('task\.status\.change'\)\s*\?\s*'<button class="st /.test(html) && /'<span class="st ro /.test(html), '許されなければ状態は札 (span) で出す');
-  ok(/if \(!reg \|\| !can\('task\.master\.edit'\)\) return/.test(html), '作業のやり方の「変更・登録」は許されたときだけ data-reg を付ける');
+  ok(/\(ed && reg \? ' data-reg="' \+ esc\(reg\) \+ '"' : ''\)/.test(html), '作業情報の「変更・登録」は許されたときだけ data-reg を付ける');
   ok(/const addP = can\('task\.media\.add'\) && photos < 3/.test(html)
     && /const photos = media\.filter\(m => m\.kind === 'photo'\)\.length \+ pending\.filter\(p => p\.kind === 'photo'\)\.length;/.test(html),
     '「写真をとる」の枠は許されたときだけ。送信中の分も枚数に数える (Codex PR1 R13)');
   ok(/own && can\('task\.media\.add'\)/.test(html) && /\(canPhoto \? pend : ''\)/.test(html), '写真の × と送信中の枠も許されたときだけ');
-  ok(/if \(!can\('task\.work\.start'\)\) \{/.test(html), '「作業をはじめる」「中断」「できあがり」は許されたときだけ');
+  ok(/const canStop = can\('task\.work\.start'\);/.test(html) && /if \(!canStop\) \{/.test(html), '「作業をはじめる」「中断」「できあがり」は許されたときだけ');
   ok(/can\('task\.plan\.assign'\) && \(c\.status === 'not_started'/.test(html) && /can\('task\.external_ready'\) && c\.status !== 'closed'/.test(html)
     && /can\('task\.label_wait\.edit'\) && c\.status !== 'closed'/.test(html), '今日やる・外部準備OK・ラベル待ち登録も許可リストで出し分ける');
   ok(/function detailNoteHtml\(c\)/.test(html) && /に取り込んだ時点/.test(html) && /いまのアプリの記録/.test(html), '下見の詳細には「何がいつ時点か」を分けて出す');
@@ -3550,6 +3561,126 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   app.push('x'); pv.push('y');
   ok(!capabilitiesFor('app').includes('x') && capabilitiesFor('preview').length === 0, '返した配列を壊しても共有の定義は変わらない');
   ok(capabilitiesFor('unknown').length === 0 && capabilitiesFor(undefined).length === 0, '知らないモードは何も許さない (default-deny)');
+}
+
+console.log('\n[24] 複数人での作業開始・まとめ終了・記録の検索 (中原さん 9/5)');
+{
+  const mk = (name) => getIrohaWorker(addIrohaWorker({ displayName: name, workerType: 'member', actor: 'test' }).id);
+  const a = mk('crew-A'), b = mk('crew-B'), c = mk('crew-C');
+
+  // ── 1人も選ばないと始められない (中原さん 9/5「作業者を選んでないとスタートできない仕様に」) ──
+  ok(startSessions({ pageId: 'crew-1', workers: [] }).error === 'worker_required', '0人では開始できない');
+  ok(startSessions({ pageId: 'crew-1', workers: null }).error === 'worker_required', 'workers 未指定でも開始できない');
+  ok(startSessions({ workers: [a] }).error === 'bad_request', 'カード未指定は拒否');
+
+  // ── 3人まとめて開始 = 3行 ──
+  const s = startSessions({ pageId: 'crew-1', productCode: 'CREW-X', title: 'みつろうクリーム', workers: [a, b, c], deviceLabel: 'ipad-1' });
+  ok(s.ok === true && s.sessions.length === 3, '3人ぶんの行ができる');
+  ok(new Set(s.sessions.map((x) => x.sessionId)).size === 3, '3人それぞれ別の sessionId');
+  ok((activeSessionsByPage().get('crew-1') || []).length === 3, '活動中3名が一覧に出る');
+
+  // ── 同じ人を2回選んでも1行 (重複タップ・再送) ──
+  const dup = startSessions({ pageId: 'crew-2', workers: [mk('crew-D'), null].filter(Boolean) });
+  const d = getIrohaWorker(dup.sessions[0].workerId);
+  const dup2 = startSessions({ pageId: 'crew-2', workers: [d, d] });
+  ok(dup2.ok === true && dup2.sessions.length === 1 && dup2.sessions[0].already === true,
+    '同じ人を2回選んでも1行 (既存を返すだけ)');
+
+  // ── 途中から人を足せる (既に入っている人は already) ──
+  const e = mk('crew-E');
+  const add = startSessions({ pageId: 'crew-1', productCode: 'CREW-X', title: 'みつろうクリーム', workers: [a, e] });
+  ok(add.ok === true && add.sessions.find((x) => x.workerId === a.id).already === true
+    && add.sessions.find((x) => x.workerId === e.id).already === false, '途中で人を足せる (既存の人は already)');
+  ok((activeSessionsByPage().get('crew-1') || []).length === 4, '足した人を含めて4名');
+
+  // ── ⭐1人でも別カードで作業中なら**誰も**開始しない (一部だけ記録が残ると人数が狂う) ──
+  const f = mk('crew-F'), g = mk('crew-G');
+  const busy = startSessions({ pageId: 'crew-3', workers: [f, a, g] });
+  ok(busy.error === 'busy' && busy.busy.length === 1 && busy.busy[0].workerId === a.id, '別カードで作業中の人を名指しで返す');
+  ok(/crew-A/.test(busy.message) && /みつろうクリーム/.test(busy.message), 'メッセージに誰がどのカードかを出す');
+  ok(!activeSessionsByPage().get('crew-3'), '断られたときは1行も入っていない (途中まで入れない)');
+
+  // ── まとめ終了 ──
+  const ids = [...(activeSessionsByPage().get('crew-1') || [])].map((x) => x.id);
+  ok(stopSessions({ pageId: 'crew-1', sessionIds: ids, reason: 'bogus' }).error === 'bad_request', '不正な理由は拒否');
+  ok(stopSessions({ pageId: 'crew-1', sessionIds: [], reason: 'done' }).error === 'bad_request', 'session_ids が空なら拒否');
+  const other = startSessions({ pageId: 'crew-9', workers: [f] }).sessions[0].sessionId;
+  ok(stopSessions({ pageId: 'crew-1', sessionIds: [ids[0], other], reason: 'done' }).error === 'not_started',
+    '別カードの id が混ざったら**1件も**閉じない');
+  ok((activeSessionsByPage().get('crew-1') || []).length === 4, '断られた後も4名は作業中のまま');
+  const st = stopSessions({ pageId: 'crew-1', sessionIds: ids, reason: 'done' });
+  ok(st.ok === true && st.stopped.length === 4 && st.remainingActive === 0, '4人まとめて終了 (残り0名)');
+  ok(st.totalSeconds >= 0 && st.stopped.every((x) => x.raw_seconds >= 0), '人ごとに作業時間が入る');
+  const stAgain = stopSessions({ pageId: 'crew-1', sessionIds: ids, reason: 'done' });
+  ok(stAgain.ok === true && stAgain.stopped.every((x) => x.already === true), '同じ id の再送は冪等 (already)');
+
+  // ── 記録の検索 ──
+  const all = searchSessions({ q: 'みつろう' });
+  ok(all.summary.count === 4 && all.rows.length === 4, '商品名の部分一致で4件 (4人ぶん)');
+  // 合計時間は「終わったぶん」だけ。作業中の行に raw_seconds が入っていても足さない (異常データ前提にしない)
+  const openW = mk('crew-O');
+  const openS = startSessions({ pageId: 'crew-1', productCode: 'CREW-X', title: 'みつろうクリーム', workers: [openW] }).sessions[0].sessionId;
+  getDB().prepare('UPDATE f_iroha_work_sessions SET raw_seconds = 99999 WHERE id = ?').run(openS);
+  const withOpen = searchSessions({ q: 'みつろう' });
+  ok(withOpen.summary.count === 5 && withOpen.summary.open === 1, '作業中も件数には入る');
+  ok(withOpen.summary.totalSeconds === all.summary.totalSeconds, '合計時間には作業中の分を足さない (終わったぶんだけ)');
+  stopSessions({ pageId: 'crew-1', sessionIds: [openS], reason: 'done' });
+  getDB().prepare('DELETE FROM f_iroha_work_sessions WHERE id = ?').run(openS);
+  ok(all.summary.workers === 4 && all.summary.cards === 1, '人数4・カード1');
+  const byWorker = searchSessions({ workerId: a.id, q: 'みつろう' });
+  ok(byWorker.summary.count === 1 && byWorker.rows[0].worker_name === 'crew-A', '人でしぼれる');
+  ok(byWorker.rows[0].mates.length === 3, 'いっしょにやった人 (時間が重なる他の3人) が出る');
+  ok(searchSessions({ q: 'CREW-X' }).summary.count === 4, '商品コードでも引ける');
+  ok(searchSessions({ q: 'そんな商品はない' }).summary.count === 0, '当たらなければ0件');
+  ok(searchSessions({ q: '%' }).summary.count === 0, 'LIKE のワイルドカードは文字として扱う (全件返さない)');
+
+  // 期間は JST の日付で受ける (UTC 前提で比較すると JST 9時前が前日に落ちる)
+  const jstToday_ = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
+  ok(searchSessions({ q: 'みつろう', from: jstToday_, to: jstToday_ }).summary.count === 4, '今日 (JST) で引ける');
+  const tomorrow = new Date(Date.now() + 9 * 3600000 + 86400000).toISOString().slice(0, 10);
+  ok(searchSessions({ q: 'みつろう', from: tomorrow }).summary.count === 0, '明日からにすると0件');
+  ok(searchSessions({ q: 'みつろう', to: tomorrow }).summary.count === 4, '「いつまで」はその日を含む');
+  // DB 層は壊れた日付を条件にしない (無視して全件)。⭐**断るのは router の役目** —
+  // 画面には「日付が正しくありません」と出す (絞ったつもりで全件が出るのを防ぐ。test-iroha-work-api.mjs)
+  ok(searchSessions({ q: 'みつろう', from: 'こわれた日付' }).summary.count === 4, 'DB 層は壊れた日付を条件にしない (断るのは router)');
+  ok(jstDayStartUtc('2026-09-05') === '2026-09-04T15:00:00.000Z', 'JST の日付は 00:00 JST = 前日15:00 UTC');
+  ok(jstDayStartUtc('2026-02-30') === null, '実在しない日 (2/30) は弾く — Date.parse だと 3/2 に繰り上がってしまう');
+  ok(jstDayStartUtc('2026-13-01') === null && jstDayStartUtc('2026-9-5') === null && jstDayStartUtc('') === null,
+    '月13・桁足らず・空も弾く');
+  // LIMIT/OFFSET に整数でない値が来ても落とさない (SQLite は datatype mismatch を投げる)
+  ok(searchSessions({ q: 'みつろう', limit: 1.5 }).rows.length === 4, 'limit が小数なら既定値で動く');
+  ok(searchSessions({ q: 'みつろう', offset: Infinity }).rows.length === 4, 'offset が Infinity なら 0 として動く');
+  ok(searchSessions({ q: 'みつろう', limit: -5, offset: -1 }).rows.length === 1, '負数は最小・最大に丸める (落ちない)');
+  ok(searchSessions({ q: 'みつろう', limit: 1e9 }).rows.length === 4, '大きすぎる limit も上限で頭打ち');
+
+  // 終わり方の食い違い: 先に pause で閉じた行へ done の再送 → **実際に入っている pause** を返す
+  const px = mk('crew-P');
+  const pxS = startSessions({ pageId: 'crew-p', productCode: 'CREW-P', title: '中断テスト', workers: [px] }).sessions[0].sessionId;
+  stopSessions({ pageId: 'crew-p', sessionIds: [pxS], reason: 'pause' });
+  const late = stopSessions({ pageId: 'crew-p', sessionIds: [pxS], reason: 'done' });
+  ok(late.ok === true && late.stopped[0].already === true && late.stopped[0].end_reason === 'pause',
+    '再送の終わり方が違っても、実際に記録されている方 (pause) を返す');
+
+  // 取り消し済みなのに終わっていない行 (異常データ)。UNIQUE 索引は ended_at IS NULL だけを見るので、
+  // voided を「作業中ではない」と判断すると INSERT が UNIQUE 違反で落ちる → 落とさず理由を返す
+  const zx = mk('crew-Z');
+  const zxS = startSessions({ pageId: 'crew-z', workers: [zx] }).sessions[0].sessionId;
+  getDB().prepare('UPDATE f_iroha_work_sessions SET voided_at = ? WHERE id = ?').run(new Date().toISOString(), zxS);
+  const stuck = startSessions({ pageId: 'crew-z2', workers: [zx] });
+  ok(stuck.ok === false && stuck.error === 'stuck_session' && /crew-Z/.test(stuck.message),
+    '取り消し済みなのに開いたままの記録があれば、落とさず職員に片づけてもらう');
+  ok(startSessions({ pageId: 'crew-z3', workers: [{ id: 0, display_name: 'ゼロ' }] }).error === 'worker_required',
+    'DB 層でも id が 0・負数の作業者は通さない');
+
+  // 取り消した記録は既定で出さない (実測から外すのと同じ扱い)
+  voidSession(ids[0], 'test@example.com', '押し間違い');
+  ok(searchSessions({ q: 'みつろう' }).summary.count === 3, '取り消した分は出ない');
+  ok(searchSessions({ q: 'みつろう', includeVoided: true }).summary.count === 4, 'voided=1 なら取り消しも出せる');
+
+  // 上限を超えても「合計」は絞り込んだ全件で出す (画面に出た分だけの合計にしない)
+  const page1 = searchSessions({ q: 'みつろう', limit: 2 });
+  ok(page1.rows.length === 2 && page1.summary.count === 3 && page1.truncated === true, '件数制限しても合計は全件・続きがあると分かる');
+  ok(searchSessions({ q: 'みつろう', limit: 2, offset: 2 }).rows.length === 1, 'offset で続きが読める');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

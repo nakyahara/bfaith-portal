@@ -321,22 +321,80 @@
   .care label{display:block;font-size:.72rem;color:var(--amber);letter-spacing:.08em;font-weight:700;margin-bottom:2px}
   .care .v{font-weight:700;font-size:1.05rem;line-height:1.5;color:#7A4A05;white-space:pre-wrap}
 
-  .kvs{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
-  .kv{background:var(--well);border:1px solid var(--line);border-radius:var(--r-sm);padding:9px 12px}
-  .kv label{display:block;font-size:.72rem;color:var(--faint);letter-spacing:.08em;margin-bottom:3px}
-  .kv .v{font-weight:700}
-  .kv.miss{border:1px dashed var(--amber);background:var(--amber-soft)}
-  .kv.miss .v{color:var(--amber)}
-  .kv a{color:var(--accent)}
-  /* 直せる項目は、そのままタップして変更・登録する (編集ボタンは置かない — 中原さん 2026-09-03) */
-  .kv.tap{cursor:pointer;position:relative;padding-right:74px}
-  .kv.tap:active{border-color:var(--accent)}
-  .kv .edit{position:absolute;right:8px;top:50%;transform:translateY(-50%);font-size:.72rem;font-weight:700;
-    border:1px solid var(--line);background:var(--surface);color:var(--sub);border-radius:var(--r-sm);padding:3px 8px;white-space:nowrap}
-  /* 写真つき (資材・保管箱) は写真を広く使うため、変更ボタンを右上に寄せて右の余白を空けない */
-  .kv.tap.hasimg{padding-right:12px}
-  .kv.hasimg .edit{top:9px;transform:none}
-  .kv.miss .edit{border-color:var(--amber);color:var(--amber)}
+  /* ── 作業情報 (中原さん 2026-09-05:「写真がないやつはカードみたいな表示にしなくていい。
+       Zロケ在庫も工程も見にくい」) ── 人が見る順に 3 つに分ける:
+       ① 使うもの = 写真で見分けるもの (資材・保管箱) だけ大きな写真カード
+       ② 作業のしかた = 数字・あるなしの項目は行 (1行56px。どこを押しても直せる)
+       ③ 参考情報 = Zロケ在庫。読むだけと分かる見た目に下ろす
+       空欄は「—」で済ませず、登録が要る (⚠未登録) と なくてよい (特になし/未設定) を分ける */
+  .wigroup{font-size:.72rem;letter-spacing:.1em;color:var(--faint);font-weight:700;margin:16px 0 8px}
+  .wigroup:first-child{margin-top:0}
+  h3.sec .misscnt{margin-left:auto;font-size:.78rem;font-weight:700;color:var(--amber);letter-spacing:0;
+    background:var(--amber-soft);border:1px solid var(--amber);border-radius:999px;padding:2px 10px}
+  /* 直す口 (＋登録 / ✎変更) は 3 つの見た目で共通の札にする */
+  .wiedit{position:absolute;top:8px;right:8px;font-size:.72rem;font-weight:700;color:var(--sub);
+    background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:3px 9px;white-space:nowrap}
+  /* ① 使うもの */
+  .things{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:10px;align-items:start}
+  .thing{position:relative;border:1px solid var(--line);border-radius:var(--r);background:var(--surface);overflow:hidden}
+  .thing.tap{cursor:pointer}
+  .thing.tap:active{border-color:var(--accent)}
+  .thing .ph{display:block;width:100%;aspect-ratio:1/1;background:#fff;border-bottom:1px solid var(--line);
+    display:grid;place-items:center;overflow:hidden}
+  .thing .ph img{width:100%;height:100%;object-fit:contain}
+  .thing .ph.none{background:var(--well);color:var(--faint);font-size:.84rem;text-align:center;padding:12px;line-height:1.5}
+  .thing .tbody{padding:10px 12px 12px}
+  .thing label{display:block;font-size:.72rem;color:var(--faint);letter-spacing:.08em;font-weight:700}
+  .thing .nm{font-size:1.24rem;font-weight:700;line-height:1.3;margin-top:2px;word-break:break-all}
+  .thing.miss{border-color:var(--amber);background:var(--amber-soft)}
+  .thing.miss .nm{color:var(--amber)}
+  .thing.miss .wiedit{color:var(--amber);border-color:var(--amber);background:transparent}
+  /* 入数は保管箱とセットで読ませる (「1箱に120個ずつ」— 120 が総数か1箱分か迷わない)。
+     ここだけ別の項目なので、帯そのものを押すと入数の変更になる (data-reg は内側が勝つ) */
+  .thing .strip{position:relative;display:block;border-top:1px solid var(--line);background:var(--well);
+    padding:11px 74px 11px 12px;font-size:.96rem;color:var(--sub);min-height:46px}
+  .thing .strip.tap{cursor:pointer}
+  .thing .strip b{color:var(--ink);font-size:1.3em;font-weight:700}
+  .thing .strip .wiedit{top:50%;transform:translateY(-50%)}
+  .thing .strip.miss{background:var(--amber-soft);color:var(--amber);font-weight:700}
+  .thing .strip.miss .wiedit{color:var(--amber);border-color:var(--amber);background:transparent}
+  /* ② 作業のしかた */
+  .wrows{border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:var(--surface)}
+  .wrow{position:relative;display:flex;align-items:center;gap:12px;min-height:56px;padding:8px 74px 8px 12px;
+    border-bottom:1px solid var(--line)}
+  .wrow:last-child{border-bottom:0}
+  .wrow.tap{cursor:pointer}
+  .wrow.tap:active{background:var(--well)}
+  .wrow label{flex:none;width:8.5em;font-size:.86rem;color:var(--sub);font-weight:700}
+  .wrow .v{flex:1;font-size:1.04rem;font-weight:700;line-height:1.35}
+  .wrow .v .big{font-size:1.5rem}
+  .wrow .v .unit{font-size:.86rem;font-weight:600;color:var(--sub);margin-left:2px}
+  .wrow .v .none{font-weight:600;color:var(--sub)}
+  .wrow .wiedit{top:50%;transform:translateY(-50%)}
+  .wrow.miss{background:var(--amber-soft)}
+  .wrow.miss .v{color:var(--amber)}
+  .wrow.miss .wiedit{color:var(--amber);border-color:var(--amber);background:transparent}
+  .wrow .why{display:block;font-size:.76rem;font-weight:600;color:var(--amber)}
+  /* 気をつけること: 中身があるときだけ目立たせる (無いのに黄色いと毎回びっくりする) */
+  .wicare{position:relative;display:flex;gap:10px;align-items:flex-start;border:1px solid var(--amber);
+    background:var(--amber-soft);border-radius:var(--r);padding:11px 74px 11px 12px;margin-top:12px}
+  .wicare.tap{cursor:pointer}
+  .wicare.empty{border-color:var(--line);background:var(--well)}
+  .wicare .ic{flex:none;font-size:1.05rem;line-height:1.4}
+  .wicare label{display:block;font-size:.72rem;letter-spacing:.08em;color:var(--amber);font-weight:700}
+  .wicare.empty label{color:var(--faint)}
+  .wicare .v{font-size:1.02rem;font-weight:700;line-height:1.45}
+  .wicare.empty .v{color:var(--sub);font-weight:600}
+  .wicare .wiedit{top:50%;transform:translateY(-50%)}
+  /* ③ 参考情報 (Zロケ在庫)。使える数を先に大きく、内訳は小さく下に */
+  .wiref{background:var(--well);border:1px solid var(--line);border-radius:var(--r);padding:11px 13px;margin-top:12px}
+  .wiref .t{font-size:.76rem;letter-spacing:.06em;color:var(--sub);font-weight:700;display:flex;align-items:center;gap:6px}
+  .wiref .ro{margin-left:auto;font-size:.7rem;font-weight:700;color:var(--faint);border:1px solid var(--line);
+    border-radius:999px;padding:1px 8px;background:var(--surface);letter-spacing:0}
+  .wiref .main{font-size:1.3rem;font-weight:700;margin-top:4px}
+  .wiref .main .unit{font-size:.68em;color:var(--sub);margin-left:2px}
+  .wiref .main.none{font-size:1rem;color:var(--sub);font-weight:600}
+  .wiref .detail{font-size:.84rem;color:var(--sub);margin-top:2px}
 
   /* ── 写真: 「前回の完成形」(同じ商品の見本) と「今回のできあがり」 ── */
   .photos{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;margin-top:4px}
@@ -359,7 +417,29 @@
 
   /* ── 作業時間 ── */
   .wchips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-  .wchip{background:var(--accent-soft);color:var(--accent);border-radius:var(--r);padding:7px 14px;font-weight:700;font-size:.92rem}
+  .wchip{display:inline-flex;align-items:center;gap:8px;background:var(--accent-soft);color:var(--accent);
+    border-radius:var(--r);padding:7px 8px 7px 14px;font-weight:700;font-size:.92rem}
+  /* 人ごとに先に上がれる (4人で始めて1人だけ先に抜ける、が普通に起きる) */
+  .wchip .wx{border:1px solid var(--accent);background:var(--surface);color:var(--accent);border-radius:var(--r-sm);
+    padding:4px 9px;font-size:.78rem;font-weight:700;cursor:pointer;font-family:var(--font);min-height:32px}
+  .wchip.solo{padding-right:14px}
+  /* ── 作業する人をえらぶ (複数) ── */
+  .crew{display:grid;grid-template-columns:repeat(auto-fill,minmax(134px,1fr));gap:8px}
+  .crewp{display:flex;align-items:center;gap:9px;border:1px solid var(--line);background:var(--surface);color:var(--ink);
+    border-radius:var(--r-sm);padding:9px 11px;min-height:52px;text-align:left;cursor:pointer;
+    font-family:var(--font);font-size:1rem;font-weight:700;line-height:1.25}
+  .crewp .box{flex:none;width:22px;height:22px;border:2px solid var(--line);border-radius:5px;
+    display:grid;place-items:center;font-size:.82rem;color:transparent;background:var(--surface)}
+  .crewp[aria-pressed="true"]{border-color:var(--accent);background:var(--accent-soft)}
+  .crewp[aria-pressed="true"] .box{border-color:var(--accent);background:var(--accent);color:var(--accent-ink)}
+  .crewp .sub{display:block;font-size:.7rem;font-weight:700;color:var(--amber);letter-spacing:0}
+  .crewp:disabled{cursor:default;opacity:1}
+  .crewp.here{border-color:var(--accent);background:var(--accent-soft)}
+  .crewp.here .sub{color:var(--accent)}
+  .crewp.away{border-color:var(--amber);background:var(--amber-soft)}
+  .crewsum{font-size:.94rem;color:var(--sub);margin:12px 0;min-height:1.6em}
+  .crewsum b{color:var(--ink)}
+  .crewsum .need{color:var(--amber);font-weight:700}
   .wtimer{text-align:center;padding:4px 0 12px}
   .wtimer .t{font-size:3.2rem;font-weight:700;font-family:var(--num);letter-spacing:.04em;line-height:1;color:var(--accent)}
   .wtimer small{display:block;color:var(--faint);font-weight:700;letter-spacing:.12em;font-size:.68rem;margin-top:6px;font-family:var(--num)}
@@ -385,12 +465,6 @@
   .opt .thumb{width:100%;aspect-ratio:1/1;flex:none;border-radius:4px;background:var(--well);display:grid;place-items:center;
     color:var(--faint);font-size:1.5rem;overflow:hidden}
   .opt .thumb img{width:100%;height:100%;object-fit:contain;background:#fff}
-  /* 作業情報の資材・保管箱の写真。手元で見て分かる大きさに (中原さん 2026-09-05: もっと大きく)。
-     横に小さく添えず、値の上に正方形で大きく置く */
-  .kv .v.withimg{display:flex;flex-direction:column;align-items:flex-start;gap:8px}
-  .kv .kvthumb{width:100%;max-width:180px;aspect-ratio:1/1;flex:none;border-radius:8px;background:#fff;border:1px solid var(--line);
-    display:grid;place-items:center;overflow:hidden;font-size:1.6rem}
-  .kv .kvthumb img{width:100%;height:100%;object-fit:contain}
   .opt .nm{width:100%;text-align:center;line-height:1.25;word-break:break-all;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .opt.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
@@ -611,6 +685,25 @@
       <div class="mbtns"><button class="btn" id="stCancel" onclick="closeSt()">やめる</button></div>
       <p class="hint" id="stHint">ここで変えると、Notionのカードのステータスもそのまま変わります。<br>
         「棚入完了」にすると一覧から外れます。「棚入完了」への変更・取り消しは職員の方だけができます (職員PINが必要)。</p>
+    </div>
+  </div>
+
+  <!-- ══ 作業する人 (複数えらべる) ══
+       中原さん 2026-09-05:「一人で作業するわけではないから作業する人を選択できるようにしたい」。
+       iPad は3台しかないので、1台1人だと4人以上で作業したときに記録が残らなかった -->
+  <div class="overlay" id="crewOv">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="crewTitle">
+      <h3 id="crewTitle" tabindex="-1">👥 作業する人をえらぶ</h3>
+      <div class="mname" id="crewName">—</div>
+      <div class="msaving" id="crewMsg"></div>
+      <div id="crewBody"></div>
+      <div class="crewsum" id="crewSum"></div>
+      <div class="mbtns">
+        <button class="btn" onclick="closeCrew()">やめる</button>
+        <button class="btn primary" id="crewGo" onclick="crewStart()" disabled>▶ 作業をはじめる</button>
+      </div>
+      <p class="hint">えらんだ人ぜんぶに、この作業の記録がつきます。あとから足すこともできます。<br>
+        名前がないときは、職員の方が管理画面 (パソコン) から追加できます。</p>
     </div>
   </div>
 
@@ -2368,18 +2461,86 @@ function optionImageFor(kind, value) {
   const hit = list.find(o => optKey(o.code) === k);
   return hit && hit.image_url ? hit.image_url : null;
 }
-function kv(label, value, opts) {
-  const miss = opts && opts.miss;
-  const reg = opts && opts.reg;
-  const empty = value == null || value === '';
-  const img = !empty && opts && opts.optKind ? optionImageFor(opts.optKind, value) : null;
-  const inner = '<label>' + esc(label) + '</label><div class="v num' + (img ? ' withimg' : '') + '">' +
-    (img ? '<span class="kvthumb"><img src="' + esc(img) + '" alt="" loading="lazy" onerror="optImgFail(this)"></span>' : '') +
-    '<span>' + (empty ? (miss ? '未登録' : '—') : esc(value)) + '</span></div>';
-  // 変更・登録が許されていなければ (下見・履歴) タップの印も data-reg も付けない
-  if (!reg || !can('task.master.edit')) return '<div class="kv' + (miss ? ' miss' : '') + (img ? ' hasimg' : '') + '">' + inner + '</div>';
-  return '<div class="kv tap' + (miss ? ' miss' : '') + (img ? ' hasimg' : '') + '" data-reg="' + esc(reg) + '">' + inner +
-    '<span class="edit">' + (empty ? '＋ 登録' : '✎ 変更') + '</span></div>';
+/**
+ * 作業情報 (中原さん 2026-09-05:「写真がないやつはカードみたいな表示にしなくていい。
+ * Zロケ在庫も工程も見にくい」)。人が見る順に 3 つに分ける:
+ *   ① 使うもの     — 資材・保管箱。写真で見分けるので大きな写真カード
+ *   ② 作業のしかた — 工程・期限シール・大きさ。数字とあるなしだけなので行で並べる
+ *   ③ 参考情報     — Zロケ在庫。作業中に変えるものではないので読むだけと分かる形で下ろす
+ * 空欄は「—」で済ませず、**登録が要る (⚠ 未登録)** と **なくてよい (特になし/未設定)** を分ける。
+ * 変更・登録が許されていなければ (下見・履歴) タップの印も data-reg も付けない
+ */
+function workInfoHtml(c, m, missSet) {
+  const ed = can('task.master.edit');
+  const chip = (empty) => (ed ? '<span class="wiedit">' + (empty ? '＋ 登録' : '✎ 変更') + '</span>' : '');
+  const open = (cls, reg) => '<div class="' + cls + (ed && reg ? ' tap' : '') + '"'
+    + (ed && reg ? ' data-reg="' + esc(reg) + '"' : '') + '>';
+
+  // ① 使うもの。写真は正方形で全部見えるように (object-fit:contain)
+  const thing = (label, value, reg, optKind, miss, strip) => {
+    const empty = value == null || value === '';
+    const img = empty ? null : optionImageFor(optKind, value);
+    return open('thing' + (miss ? ' miss' : ''), reg) +
+      (img ? '<span class="ph"><img src="' + esc(img) + '" alt="" loading="lazy" onerror="optImgFail(this)"></span>'
+           : '<span class="ph none">' + (empty ? '登録すると<br>写真が出ます' : '写真がまだありません') + '</span>') +
+      '<div class="tbody"><label>' + esc(label) + '</label>' +
+      '<div class="nm num">' + (empty ? (miss ? '⚠ 未登録' : '未設定') : esc(value)) + '</div></div>' +
+      (strip || '') + chip(empty) + '</div>';
+  };
+  // 入数は保管箱とセットで読ませる (「1箱に120個ずつ入れる」— 120 が総数か1箱分か迷わない)。
+  // 帯だけ別の項目なので data-reg を内側に置く (closest は内側が勝つ)
+  const unitsMiss = missSet.has('入数');
+  const units = m.units_per_container;
+  const unitsStrip = open('strip' + (unitsMiss ? ' miss' : ''), 'units_per_container') +
+    (units != null ? '1箱に <b class="num">' + esc(String(units)) + '</b> 個ずつ入れる'
+      : (unitsMiss ? '⚠ 入数が未登録' : '入数は未設定')) +
+    chip(units == null) + '</div>';
+
+  // ② 作業のしかた
+  const wrow = (label, html, reg, miss, why) => {
+    const empty = html == null;
+    return open('wrow' + (miss ? ' miss' : ''), reg) +
+      '<label>' + esc(label) + '</label><div class="v num">' +
+      (empty ? (miss ? '⚠ 未登録' : '<span class="none">未設定</span>') : html) +
+      (miss && why ? '<span class="why">' + esc(why) + '</span>' : '') + '</div>' +
+      chip(empty) + '</div>';
+  };
+  const big = (v, unit) => '<span class="big">' + esc(String(v)) + '</span><span class="unit">' + unit + '</span>';
+
+  // ③ 気をつけること — 中身があるときだけ目立たせる (無いのに黄色いと毎回びっくりする)
+  const note = m.note;
+  const care = open('wicare' + (note ? '' : ' empty'), 'note') +
+    '<span class="ic" aria-hidden="true">' + (note ? '⚠' : '💬') + '</span>' +
+    '<div><label>気をつけること</label><div class="v">' + (note ? esc(note) : '特になし') + '</div></div>' +
+    chip(!note) + '</div>';
+
+  // ④ 参考情報 (在庫) — 使える数を先に大きく、内訳は小さく下に
+  const locLabel = c.loc_kind === 'Y' ? 'Yロケ在庫 (外に出している分)' : 'Zロケ在庫 (一時保管)';
+  const ref = '<div class="wiref"><div class="t">ⓘ ' + esc(locLabel) + '<span class="ro">見るだけ</span></div>' +
+    (c.loc_stock == null
+      ? '<div class="main none">まだ取れていません</div>'
+      : '<div class="main num">使えるのは ' + esc(String(c.loc_free)) + '<span class="unit">個</span></div>' +
+        '<div class="detail num">在庫 ' + esc(String(c.loc_stock)) + '個 − 引当 ' + esc(String(c.loc_allocated || 0)) + '個' +
+        (c.loc_at ? ' ・ ' + fmtDate(c.loc_at) + ' ' + fmtTime(c.loc_at) + ' 時点' : '') + '</div>') +
+    '</div>';
+
+  return '<div class="wigroup">使うもの</div><div class="things">' +
+      thing('資材 (袋)', m.material_code, 'material_code', 'material', missSet.has('資材')) +
+      thing('保管箱と入れ方', m.storage_container, 'storage_container', 'container', missSet.has('保管箱'), unitsStrip) +
+    '</div>' +
+    '<div class="wigroup">作業のしかた</div><div class="wrows">' +
+      wrow('工程', m.process_count != null ? big(m.process_count, '工程') : null,
+        'process_count', missSet.has('工程'), '作業前に登録してください') +
+      wrow('期限シール', m.expiry_seal == null ? null : (m.expiry_seal ? 'あり (赤で上に出します)' : 'なし'), 'expiry_seal') +
+      wrow('大きさ', sizeClassText(m.size_class), 'size_class') +
+      (c.expiry ? wrow('この入荷の有効期限', esc(c.expiry), null) : '') +
+    '</div>' + care +
+    '<div class="wigroup">参考にするもの</div>' + ref;
+}
+/** 未登録の数 (見出しの札に出す)。0 なら札を出さない */
+function missBadge(m) {
+  const n = (m.missing || []).length;
+  return n ? '<span class="misscnt">⚠ 未登録 ' + n + '件</span>' : '';
 }
 /** 直せる項目のタップ (中のリンクを押したときは開かない) */
 $('#dbody').addEventListener('click', (e) => {
@@ -2508,21 +2669,8 @@ function renderDetail(c, opts) {
       '</div>' +
     prevCardHtml(c) +
 
-    '<div class="dcard"><h3 class="sec">作業情報</h3><div class="kvs">' +
-      kv('資材', m.material_code, { miss: missSet.has('資材'), reg: 'material_code', optKind: 'material' }) +
-      kv('保管箱', m.storage_container, { miss: missSet.has('保管箱'), reg: 'storage_container', optKind: 'container' }) +
-      kv('入数 (保管箱1つに入れる数)', m.units_per_container != null ? m.units_per_container + '個' : null,
-        { miss: missSet.has('入数'), reg: 'units_per_container' }) +
-      kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程'), reg: 'process_count' }) +
-      kv(c.loc_kind === 'Y' ? 'Yロケ在庫 (外に出している分)' : 'Zロケ在庫 (一時保管)',
-        c.loc_stock == null ? null
-          : c.loc_stock + '個 (引当 ' + (c.loc_allocated || 0) + ' → 使えるのは ' + c.loc_free + '個)'
-            + (c.loc_at ? ' ・ ' + fmtDate(c.loc_at) + ' ' + fmtTime(c.loc_at) + ' 時点' : '')) +
-      kv('気をつけること', m.note, { reg: 'note' }) +
-      kv('期限シール', m.expiry_seal == null ? null : (m.expiry_seal ? 'あり (赤で上に出します)' : 'なし'), { reg: 'expiry_seal' }) +
-      kv('大きさ', sizeClassText(m.size_class), { reg: 'size_class' }) +
-      (c.expiry ? kv('この入荷の有効期限', c.expiry) : '') +
-    '</div>' +
+    '<div class="dcard"><h3 class="sec">作業情報' + missBadge(m) + '</h3>' +
+      workInfoHtml(c, m, missSet) +
       (can('task.master.edit')
         ? '<p class="nlink">直したい項目をタップしてください。空欄の登録はだれでもできます。入っている値の変更は職員PINが必要です。</p>' : '') +
       (m.source === 'card'
@@ -3063,32 +3211,35 @@ async function saveMaster() {
 }
 
 // ── 作業時間カード (作業する人・タイマー・開始/中断/できあがり) ──
-function myActiveOf(c) {
-  return worker ? c.active.find(a => a.worker_id === worker.id) : null;
-}
 function workCardHtml(c) {
+  const canStop = can('task.work.start');
   const chips = c.active.map(a => {
     const el = (nowMs() - Date.parse(a.started_at)) / 1000;
-    return '<span class="wchip">' + esc(a.worker_name) + ' さん (' + fmtDur(el) + ')</span>';
+    // 人ごとに先に上がれる (4人で始めて1人だけ先に抜ける、は普通に起きる)
+    return '<span class="wchip' + (canStop ? '' : ' solo') + '">' + esc(a.worker_name) + ' さん (' + fmtDur(el) + ')' +
+      (canStop ? '<button class="wx" onclick="stopOne(' + a.id + ')">終わった</button>' : '') + '</span>';
   }).join('');
-  const mine = myActiveOf(c);
   let controls;
-  if (!can('task.work.start')) {
+  if (!canStop) {
     // 読むだけ (下見・履歴): 開始・中断・できあがりのボタンは描かない。いま作業中の人だけ見せる
     controls = (c.status === '棚入完了' || c.status === 'closed') ? '<p class="nlink">このカードは終わっています。</p>'
       : (chips ? '' : '<p class="nlink">いま作業している人はいません。</p>');
-  } else if (mine) {
+  } else if (c.active.length) {
+    // 複数人で作業していることがある。タイマーは**いちばん早く始めた人**を基準にする
+    const first = c.active.reduce((a, b) => (Date.parse(a.started_at) <= Date.parse(b.started_at) ? a : b));
     controls =
-      '<div class="wtimer"><div class="t num" id="wt" data-start="' + esc(mine.started_at) + '">--:--</div>' +
-      '<small>作業時間 (サーバーで記録しています)</small></div>' +
+      '<div class="wtimer"><div class="t num" id="wt" data-start="' + esc(first.started_at) + '">--:--</div>' +
+      '<small>' + (c.active.length > 1 ? c.active.length + '人で作業中 ' : '') + '(サーバーで記録しています)</small></div>' +
       '<div class="wbtns">' +
+      '<button class="btn" onclick="openCrew()">＋ 人を追加</button>' +
       '<button class="btn warn" id="pauseBtn" onclick="stopWork(\'pause\')">⏸ ちょっと中断 (資材が足りない など)</button>' +
-      '<button class="btn primary" id="doneBtn" onclick="stopWork(\'done\')">✅ できあがり</button>' +
+      '<button class="btn primary" id="doneBtn" onclick="stopWork(\'done\')">✅ ' +
+        (c.active.length > 1 ? 'みんなできあがり' : 'できあがり') + '</button>' +
       '</div>';
   } else if (c.status === '棚入完了' || c.status === 'closed') {
     controls = '<p class="nlink">このカードは終わっています。</p>';
   } else {
-    controls = '<div class="wbtns"><button class="btn primary" id="startBtn" onclick="startWork()">▶ 作業をはじめる</button></div>';
+    controls = '<div class="wbtns"><button class="btn primary" id="startBtn" onclick="openCrew()">▶ 作業をはじめる</button></div>';
   }
   // アプリ正本のみ: 今日やる / 後日 (未着手・保留のカード)。一覧では「📌 今日やる」が上に並ぶ
   let plan = '';
@@ -3167,45 +3318,144 @@ function startTimerTick(c) {
   tickId = setInterval(p, 1000);
 }
 
-async function startWork() {
+// ── 作業する人をえらぶ (複数。中原さん 2026-09-05) ──
+let crewSel = new Set();    // これから足す人 (すでに作業中の人は含めない)
+let crewCard = null;
+
+/** その人が**別のカード**で作業中かどうか。worker_id → そのカードの名前 */
+function busyElsewhere(exceptCardId) {
+  const map = new Map();
+  for (const c of state.cards) {
+    if (sameId(c.id, exceptCardId)) continue;
+    for (const a of (c.active || [])) map.set(a.worker_id, c.title);
+  }
+  return map;
+}
+function openCrew() {
   if (!can('task.work.start')) return;   // 読むだけ (下見・履歴) では始めない
   if (!worker) { openGate(); return; }
-  if (!curDetail) return;
-  const btn = document.getElementById('startBtn');
-  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  const c = findCard(curDetail);
+  if (!c) return;
+  crewCard = c.id;
+  crewSel = new Set();
+  // 端末を操作している人は最初から入れておく (たいていその人も作業する)。
+  // ただし別のカードで作業中・もうこのカードに入っている人は入れない
+  const away = busyElsewhere(c.id);
+  const here = new Set((c.active || []).map(a => a.worker_id));
+  if (worker && !away.has(worker.id) && !here.has(worker.id)) crewSel.add(worker.id);
+  $('#crewName').textContent = c.title;
+  $('#crewMsg').textContent = '';
+  renderCrew();
+  $('#crewOv').classList.add('on');
+  const h = document.getElementById('crewTitle');
+  if (h) h.focus();
+}
+function closeCrew() { $('#crewOv').classList.remove('on'); crewCard = null; }
+function toggleCrew(id) {
+  if (crewSel.has(id)) crewSel.delete(id); else crewSel.add(id);
+  renderCrew();
+}
+function renderCrew() {
+  const c = findCard(crewCard);
+  if (!c) { closeCrew(); return; }
+  const away = busyElsewhere(c.id);
+  const here = new Set((c.active || []).map(a => a.worker_id));
+  const person = (w) => {
+    const isHere = here.has(w.id);
+    const elsewhere = away.get(w.id);
+    const on = isHere || crewSel.has(w.id);
+    // すでに作業中の人は外せない (外すのは「終わった」で終了するとき)。
+    // 別のカードで作業中の人は選べない — 選ばせてサーバーに断られるより、先に理由を見せる
+    const locked = isHere || !!elsewhere;
+    const sub = isHere ? '<span class="sub">いま作業中</span>'
+      : elsewhere ? '<span class="sub">' + esc(elsewhere) + ' で作業中</span>' : '';
+    return '<button type="button" class="crewp' + (isHere ? ' here' : '') + (elsewhere ? ' away' : '') + '"' +
+      ' aria-pressed="' + (on ? 'true' : 'false') + '"' +
+      (locked ? ' disabled' : ' onclick="toggleCrew(' + w.id + ')"') + '>' +
+      '<span class="box" aria-hidden="true">✓</span>' +
+      '<span>' + esc(w.display_name) + sub + '</span></button>';
+  };
+  const chunk = (label, ws) => (ws.length ? '<div class="gsec">' + label + '</div><div class="crew">' + ws.map(person).join('') + '</div>' : '');
+  const members = state.workers.filter(w => w.worker_type === 'member');
+  const staff = state.workers.filter(w => w.worker_type === 'staff');
+  $('#crewBody').innerHTML = (chunk('利用者', members) + chunk('職員', staff)) ||
+    '<p style="color:var(--faint)">作業者がまだ登録されていません。職員の方が管理画面から追加してください。</p>';
+  const names = [...crewSel].map(id => (state.workers.find(w => w.id === id) || {}).display_name).filter(Boolean);
+  $('#crewSum').innerHTML = names.length
+    ? 'えらんだ人: <b>' + names.map(esc).join('、') + '</b> (' + names.length + '人)'
+    : '<span class="need">作業する人をえらぶと、はじめられます</span>';
+  // ⭐1人もえらんでいなければ始められない (中原さん 2026-09-05)。サーバー側も同じ条件で断る
+  const go = $('#crewGo');
+  go.disabled = names.length === 0;
+  go.textContent = here.size
+    ? (names.length ? '＋ ' + names.length + '人を追加する' : '＋ 人を追加する')
+    : (names.length ? '▶ ' + names.length + '人で作業をはじめる' : '▶ 作業をはじめる');
+}
+async function crewStart() {
+  const ids = [...crewSel];
+  if (!ids.length) return;             // ボタンは disabled だが、二重に守る
+  const go = $('#crewGo');
+  go.disabled = true;
+  $('#crewMsg').textContent = '保存中…';
+  const ok = await startWork(ids);
+  $('#crewMsg').textContent = '';
+  if (ok) closeCrew();
+  else renderCrew();                    // 断られたら選び直せる状態に戻す
+}
+
+/** @param ids 作業する人の worker_id (1件以上)。@returns 開始できたか */
+async function startWork(ids) {
+  if (!can('task.work.start')) return false;   // 読むだけ (下見・履歴) では始めない
+  if (!worker) { openGate(); return false; }
+  if (!curDetail || !ids || !ids.length) return false;
   const j = await apiFetch('/api/sessions/start', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: curDetail, worker_id: worker.id }),
+    body: JSON.stringify({ id: curDetail, worker_id: worker.id, worker_ids: ids }),
   });
   if (!j.ok) {
-    if (btn) { btn.disabled = false; btn.textContent = '▶ 作業をはじめる'; }
     showErr(j.message || '作業をはじめられませんでした');
-    return;
+    return false;
   }
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
   const c = findCard(curDetail);
   if (c) {
     applyTask(c, j.task);
     if (j.status) c.status = j.status;
-    if (!c.active.some(a => a.worker_id === worker.id)) {
-      c.active.push({ id: j.sessionId, worker_id: worker.id, worker_name: worker.display_name, started_at: j.startedAt });
+    for (const s of (j.sessions || [])) {
+      if (c.active.some(a => a.worker_id === s.workerId)) continue;
+      c.active.push({ id: s.sessionId, worker_id: s.workerId, worker_name: s.workerName, started_at: s.startedAt });
     }
     renderTabs(); renderList(); renderDetail(c);
   }
+  const added = (j.sessions || []).filter(s => !s.already);
   const becameDoing = j.status === '作業中' || j.status === 'in_progress';
-  toast(j.already ? '作業中にもどりました (開始済みでした)'
-    : '作業をはじめました' + (becameDoing ? (isApp() ? ' (「作業中」にしました)' : ' (Notionも「作業中」にしました)') : ''));
+  if (!added.length) toast('作業中にもどりました (開始済みでした)');
+  else toast((added.length > 1 ? added.length + '人で作業をはじめました' : '作業をはじめました') +
+    (becameDoing ? (isApp() ? ' (「作業中」にしました)' : ' (Notionも「作業中」にしました)') : ''));
+  return true;
 }
 
-async function stopWork(reason) {
+/** その人だけ先に上がる (複数人で始めて1人だけ抜ける)。残りの人はそのまま作業を続ける */
+async function stopOne(sessionId) {
+  const c = findCard(curDetail);
+  const a = c && c.active.find(x => x.id === sessionId);
+  if (!a) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
+  await stopWork('done', [sessionId]);
+}
+
+/**
+ * 作業の終了・中断。既定では**いま作業中の人ぜんぶ**を終わらせる (iPad 1台からまとめて上がる)。
+ * @param only 特定のセッションだけ終わらせるとき (「終わった」ボタン)
+ */
+async function stopWork(reason, only) {
   if (!worker || !curDetail || !can('task.work.start')) return;   // 開始できない画面では終了・中断もしない
   const cNow = findCard(curDetail);
-  const mine = cNow ? myActiveOf(cNow) : null;
-  if (!mine || !mine.id) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
+  const ids = only || (cNow ? cNow.active.map(a => a.id) : []).filter(Boolean);
+  if (!ids.length) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
   for (const id of ['pauseBtn', 'doneBtn']) { const b = document.getElementById(id); if (b) b.disabled = true; }
   const j = await apiFetch('/api/sessions/stop', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: curDetail, worker_id: worker.id, session_id: mine.id, reason }),
+    body: JSON.stringify({ id: curDetail, worker_id: worker.id, session_ids: ids, reason }),
   });
   if (!j.ok) {
     for (const id of ['pauseBtn', 'doneBtn']) { const b = document.getElementById(id); if (b) b.disabled = false; }
@@ -3215,16 +3465,20 @@ async function stopWork(reason) {
   const pid = curDetail;
   const c = state.cards.find(x => x.id === pid);
   if (c) {
-    c.active = c.active.filter(a => a.worker_id !== worker.id);
+    const done = new Set((j.stopped || []).map(s => s.id));
+    c.active = c.active.filter(a => !done.has(a.id));
     renderList(); renderDetail(c);
   }
   // ⑤ステータスとの連動は自動にしない: 人が選んで変える。促すのは**全員が離れたとき**だけ
   //   (だれかが作業中のまま棚入完了を促すと、早まって完了にしてしまう — Codex PR2 #4)
+  // 何人ぶん記録したかを出す (「自分の分だけ止まったのでは」と迷わせない)
+  const n = (j.stopped || []).length;
+  const durText = n > 1 ? n + '人ぶんの作業時間 (合計 ' + fmtDur(j.totalSeconds) + ')' : '作業時間 ' + fmtDur(j.session.raw_seconds);
   if (j.remainingActive > 0) {
-    toast('作業時間 ' + fmtDur(j.session.raw_seconds) + ' を記録しました (' + j.remainingActive + '名がまだ作業中)');
+    toast(durText + ' を記録しました (' + j.remainingActive + '名がまだ作業中)');
     return;
   }
-  toast('おつかれさまでした! 作業時間 ' + fmtDur(j.session.raw_seconds) + ' を記録しました');
+  toast('おつかれさまでした! ' + durText + ' を記録しました');
   if (reason === 'pause') {
     openSt(null, pid);
     const m = document.getElementById('stMsg');
