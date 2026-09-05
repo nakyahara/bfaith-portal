@@ -40,7 +40,7 @@ import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './
 import { setTaskBlock, clearTaskBlock, blockedOf } from './tasks-db.js';
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
-  listLabelWaits, upsertLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
+  listLabelWaits, upsertLabelWait, getLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
   listNamelessTasks, removeStrayTask, setFacility, setProgress,
   startTaskSession, countChangesSince, switchSourceOfTruth, bulkCloseReady,
 } from './tasks-db.js';
@@ -135,7 +135,7 @@ function requireStaffPlan(req) {
   }
   // 職員モードでない → その場で PIN を受ける
   if (w.worker.worker_type !== 'staff') {
-    return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: '明日の計画を決められるのは職員だけです (職員の名前を選び、PINを入れてください)' } };
+    return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: 'これは職員だけができる操作です (職員の名前を選び、PINを入れてください)' } };
   }
   const pin = verifyWorkerPin(w.worker.id, req.body?.pin);
   if (!pin.ok) return { ok: false, status: STATUS_HTTP[pin.error] || 403, body: { ok: false, ...pin } };
@@ -687,18 +687,20 @@ router.get('/api/plan', api((req, res) => {
 /** 「外部施設に出す準備OK」の切り替え (アプリ正本のみ)。状態とは別のチェック */
 router.post('/api/external-ready', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
-  const w = resolveWorker(req);
-  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  // ⭐中身を先に見る (不正な要求で職員モードだけ開いてしまわないように — Codex P1 R2)
   const taskId = parseTaskId(req.body?.id);
   if (taskId == null) return res.status(400).json(BAD_TASK_ID);
   // true / false だけ受ける (欠落や文字列を「解除」と読まない — Codex FB R2)
   if (typeof req.body?.ready !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_request', message: 'ready は true / false で指定してください' });
+  // ⭐外部に出す判断は職員 (監修 F-5)。計画と同じ門 — 職員モード中はそのまま、切れていれば PIN を受ける
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
   const r = setExternalReady({
     taskId, ready: req.body.ready, expectVersion: req.body?.expect_version,
-    actor: `${w.worker.display_name} (いろはアプリ)`, workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+    actor: `${gate.worker.display_name} (いろはアプリ)`, workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
-  res.json({ ok: true, task: publicTask(r.task) });
+  res.json({ ok: true, task: publicTask(r.task), staff_mode: staffModeOf(req) });
 }));
 
 /** 取消の要確認を職員が判断する (cancel / continue)。アプリ正本のみ */
@@ -926,23 +928,63 @@ router.get('/api/label-waits', api((req, res) => {
   res.json({ ok: true, preview: !isAppMode(), rows: listLabelWaits({ taskId, openOnly: req.query.all !== '1' }) });
 }));
 
+/**
+ * ラベル待ちのうち**職員だけが書ける項目** (発注・本社への連絡・再連絡・入庫完了・完了・記録者 — 監修 F-5 / Codex PR-C R1 #1)。
+ * 画面は職員モードのときだけ出すが、API も同じ線を引く (DevTools からの書き換えで「完了」にされ、札まで外れないように)
+ */
+const LW_STAFF_FIELDS = ['label_ordered', 'line_notified_on', 're_notified_on', 'restocked_on', 'done', 'recorded_by_worker_id', 'recorded_by_name'];
+const LW_STAFF_BOOL = new Set(['label_ordered', 'done']);
+/** 送られた職員項目を「いまの値 (新規なら空) と同じ」と「変えようとしている」に分ける。同じものは無視してよい (隠れた項目の読み込み値をそのまま送ってくるため) */
+function lwStaffFieldChanges(fields, cur) {
+  const same = [];
+  const diff = [];
+  for (const f of LW_STAFF_FIELDS) {
+    if (!(f in fields)) continue;
+    const v = fields[f];
+    const c = cur ? cur[f] : null;
+    const eq = LW_STAFF_BOOL.has(f) ? (!!v === !!c) : ((v == null || v === '') ? (c == null || c === '') : String(v) === String(c));
+    (eq ? same : diff).push(f);
+  }
+  return { same, diff };
+}
+
 router.post('/api/label-waits', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const fields = { ...(req.body?.fields || {}) };
-  if (req.body?.id == null) {   // 新規は記録者を自動で入れる (誰が気づいたか)
-    if (fields.recorded_by_worker_id == null) fields.recorded_by_worker_id = w.worker.id;
-    if (!fields.recorded_by_name) fields.recorded_by_name = w.worker.display_name;
-  }
   const labelTaskId = parseTaskId(req.body?.task_id);
   if (labelTaskId == null) return res.status(400).json(BAD_TASK_ID);
+  // ⭐職員だけの項目を**変えようとしている**ときだけ職員の門を通す (職員モード中はそのまま・切れていれば PIN)。
+  //   いまの値と同じ送信は無視する (利用者の画面は項目を隠したまま読み込み値を送る)
+  let actorWorker = w.worker;
+  const sm = staffModeFor(req, w.worker);
+  const staffNow = sm.staff && (sm.via === 'session' || w.worker.worker_type === 'staff');
+  if (!staffNow) {
+    const cur = req.body?.id != null ? getLabelWait(req.body.id) : null;
+    const changed = lwStaffFieldChanges(fields, cur);
+    for (const f of changed.same) delete fields[f];
+    if (changed.diff.length > 0) {
+      const gate = requireStaffPlan(req);
+      if (!gate.ok) {
+        const body = gate.body.error === 'staff_required'
+          ? { ...gate.body, message: 'ラベルの発注・本社への連絡・入庫完了・完了は職員が記録します (職員の名前を選び、PINを入れてください)' }
+          : gate.body;
+        return res.status(gate.status).json({ ...body, fields: changed.diff });
+      }
+      actorWorker = gate.worker;
+    }
+  }
+  if (req.body?.id == null) {   // 新規は記録者を自動で入れる (誰が気づいたか)。利用者が別人を名乗る値は上の門で断られている
+    if (fields.recorded_by_worker_id == null) fields.recorded_by_worker_id = actorWorker.id;
+    if (!fields.recorded_by_name) fields.recorded_by_name = actorWorker.display_name;
+  }
   const r = upsertLabelWait({
     id: req.body?.id ?? null, taskId: labelTaskId, fields,
-    expectVersion: req.body?.expect_version ?? null, actor: `${w.worker.display_name} (いろはアプリ)`,
+    expectVersion: req.body?.expect_version ?? null, actor: `${actorWorker.display_name} (いろはアプリ)`,
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json(r);
-  res.json(r);
+  res.json({ ...r, staff_mode: staffModeOf(req) });
 }));
 
 // ─── 作業仕様のその場登録・修正 (f_iroha_work_master。中原さんFB③⑥) ───

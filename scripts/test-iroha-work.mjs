@@ -2099,7 +2099,7 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         ['/api/label-waits', { task_id: closedId, worker_id: w1.id, fields: { note: '履歴に足す' } }],
         ['/api/master', { id: closedId, code: 'HIST-A', worker_id: w1.id, fields: { note: 'x' }, expect_version: 1 }],
         ['/api/options', { id: closedId, kind: 'material', code: 'HIST-NEW', worker_id: staffHist.id, pin: '4649' }],
-        ['/api/external-ready', { id: closedId, ready: true, worker_id: w1.id, expect_version: TD.getTask(closedId).version }],
+        ['/api/external-ready', { id: closedId, ready: true, worker_id: w1.id, expect_version: TD.getTask(closedId).version }, 'admin'],   // 職員だけの口 (監修 F-5)
       ];
       for (const [p2, body, as] of closedWrites) {
         // as='admin' = 職員だけの口 (計画) は管理画面から叩いて「終了カードは 409」を見る
@@ -2158,6 +2158,24 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         const mine = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: openTask, worker_id: w1.id,
           expect_version: lw.row.version, fields: { note: '正しい持ち主から' } } });
         ok(mine.status === 200 && mine.json.ok, '正しいカードからは更新できる');
+        // ⭐職員だけの項目 (発注・本社連絡・入庫完了・完了・記録者) は利用者から変えられない (監修 F-5 / Codex PR-C R1 #1)
+        const sameVals = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: openTask, worker_id: w1.id,
+          expect_version: mine.json.row.version, fields: { note: '同じ値なら通る', done: false, label_ordered: false, line_notified_on: null } } });
+        ok(sameVals.status === 200 && sameVals.json.ok && sameVals.json.row.done === 0 && sameVals.json.row.note === '同じ値なら通る',
+          '隠れた項目を「いまの値のまま」送るのは通る (利用者の画面は読み込んだ値をそのまま送る)');
+        const tryDone = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: openTask, worker_id: w1.id,
+          expect_version: sameVals.json.row.version, fields: { done: true } } });
+        ok(tryDone.status === 403 && tryDone.json.error === 'staff_required' && db.prepare('SELECT done FROM f_iroha_label_waits WHERE id = ?').get(lw.row.id).done === 0,
+          '利用者が「完了」にしようとすると 403 (中身も変わらない)');
+        const fakeBy = await call('POST', '/api/label-waits', { cookie, body: { task_id: openTask, worker_id: w1.id,
+          fields: { occurred_on: '2026-09-05', qty: 2, recorded_by_name: '職員のふり' } } });
+        ok(fakeBy.status === 403, '新規でも記録者を別人にはできない');
+        const lwStaff = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+        const byStaff = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: openTask, worker_id: lwStaff.id,
+          expect_version: sameVals.json.row.version, fields: { done: true }, pin: '4649' } });
+        ok(byStaff.status === 200 && byStaff.json.ok && byStaff.json.row.done === 1 && byStaff.json.staff_mode && byStaff.json.staff_mode.staff === true,
+          '職員が PIN を添えれば「完了」にできる (そのまま職員モードに入る)');
+        ok((await call('POST', '/api/staff-lock', { cookie })).json.staff_mode.staff === false, '後片づけ: 職員モードを終える');
       }
     }
     // まとめて棚入完了 (PR-C): 棚入待ちのものだけ・職員だけ
@@ -2217,11 +2235,18 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok(one.json.total === 1 && one.json.rows[0].id === r1 && one.json.rows[0].facility_name === 'いろは', '商品名で絞れる (拠点名つき)');
       // 外部施設に出す準備OK (HTTP)
       const extTask = mk(9105, '外部に出す予定', 'in_progress');
-      const e1 = await call('POST', '/api/external-ready', { cookie, body: { id: extTask, ready: true, expect_version: TD.getTask(extTask).version, worker_id: w1.id } });
-      ok(e1.status === 200 && e1.json.ok && e1.json.task.external_ready === true, '外部に出す準備OK にできる (職員でなくてよい)');
+      // ⭐外部に出す判断は職員 (監修 F-5)。利用者は 403、職員は PIN を添えれば通る (計画と同じ門)
+      const extStaff = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+      const e0 = await call('POST', '/api/external-ready', { cookie, body: { id: extTask, ready: true, expect_version: TD.getTask(extTask).version, worker_id: w1.id } });
+      ok(e0.status === 403 && e0.json.error === 'staff_required', '外部に出す準備OK は職員だけ (利用者は 403)');
+      ok(TD.getTask(extTask).external_ready === 0, '断られたら変わらない');
+      const e1 = await call('POST', '/api/external-ready', { cookie, body: { id: extTask, ready: true, expect_version: TD.getTask(extTask).version, worker_id: extStaff.id, pin: '4649' } });
+      ok(e1.status === 200 && e1.json.ok && e1.json.task.external_ready === true && e1.json.staff_mode && e1.json.staff_mode.staff === true,
+        '職員が PIN を添えれば通り、そのまま職員モードに入る (応答に staff_mode)');
       ok((await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === extTask).external_ready === true, '一覧にも出る');
-      const e2 = await call('POST', '/api/external-ready', { cookie, body: { id: extTask, ready: false, expect_version: 1, worker_id: w1.id } });
-      ok(e2.status === 409 && e2.json.error === 'conflict' && e2.json.current, '古い version は 409 (現在値つき)');
+      const e2 = await call('POST', '/api/external-ready', { cookie, body: { id: extTask, ready: false, expect_version: 1, worker_id: extStaff.id } });
+      ok(e2.status === 409 && e2.json.error === 'conflict' && e2.json.current, '古い version は 409 (現在値つき。職員モード中は PIN 不要)');
+      ok((await call('POST', '/api/staff-lock', { cookie })).json.staff_mode.staff === false, '後片づけ: 職員モードを終える (次のテストは職員モードなしが前提)');
       ok((await call('POST', '/api/external-ready', { cookie, body: { id: 'x', ready: true, worker_id: w1.id } })).status === 400, '不正な id は 400');
       ok((await call('POST', '/api/external-ready', { ...admin, body: { id: extTask, ready: false, expect_version: TD.getTask(extTask).version } })).status === 400,
         '作業者を選んでいなければ 400');
@@ -2987,6 +3012,11 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   clearEnrichCache();
   const card = S2.buildTaskList().cards.find(c => c.id === t);
   ok(card && card.plan_hours === 0.3 && card.boxes === '10箱', '一覧のカードに想定作業時間と必要保管箱が乗る');
+  ok(card.boxes_calc && card.boxes_calc.boxes === 10 && card.boxes_calc.full === 10 && card.boxes_calc.rest === 0 && card.boxes_calc.per === 10,
+    '用意する箱の数 (boxes_calc) も乗る');
+  ok(S2.neededBoxesCalc(200, 120).boxes === 2 && S2.neededBoxesCalc(200, 120).rest === 80 && S2.neededBoxesCalc(180, 120).boxes === 2 && S2.neededBoxesCalc(180, 120).full === 1
+    && S2.neededBoxesCalc(0, 120).boxes === 0 && S2.neededBoxesCalc(5, 0) === null,
+    '「1箱+80」= 用意する箱は 2 (余りの箱も数える — 監修 PR-D)。入数なしは null');
   // Z ロケの在庫があれば、そちらで数える
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
   db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
@@ -3042,10 +3072,27 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   ok(cY.z_stock === 50, '必要保管箱は Notion の式のまま Z を使う (表示だけ Y に変える)');
   db.prepare("DELETE FROM mirror_logizard_stock WHERE ロケ LIKE 'Y%'").run();
   clearEnrichCache();
-  ok(S2.buildTaskList().cards.find(c => c.id === tY).loc_stock === null, 'Y に在庫が無ければ出さない (Z を代わりに出さない)');
+  {
+    // ⭐行が無い = その拠点のロケに 0 (ミラーが取れている限り)。Z を代わりに出さない (監修 B-8)
+    const cY2 = S2.buildTaskList().cards.find(c => c.id === tY);
+    const mirrorMax = db.prepare('SELECT MAX(captured_at) m FROM mirror_logizard_stock').get().m;
+    ok(cY2.loc_kind === 'Y' && cY2.loc_stock === 0 && cY2.loc_free === 0 && cY2.loc_at === mirrorMax,
+      'Y に行が無ければ「Y に在庫 0」(ミラーの最新時刻つき。Z を代わりに出さない)');
+  }
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
   clearEnrichCache();
-  ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === null, 'Z に在庫が無ければ null (数量で計算)');
+  {
+    const cZ2 = S2.buildTaskList().cards.find(c => c.id === t);
+    ok(cZ2.z_stock === 0 && cZ2.loc_stock === 0 && cZ2.boxes === '10箱', 'Z に行が無ければ 0 個 (必要保管箱は数量で計算 — 監修 B-8)');
+    // 本当に取れていない = ミラーが空 → null (「まだ取れていません」)。0 と取れていないは別のこと
+    db.exec('CREATE TABLE _mirror_bak AS SELECT * FROM mirror_logizard_stock');
+    db.exec('DELETE FROM mirror_logizard_stock');
+    clearEnrichCache();
+    const cZ3 = S2.buildTaskList().cards.find(c => c.id === t);
+    ok(cZ3.z_stock === null && cZ3.loc_stock === null && cZ3.loc_at === null && cZ3.boxes === '10箱', 'ミラーが空なら null (取れていない)。必要保管箱は数量で出る');
+    db.exec('INSERT INTO mirror_logizard_stock SELECT * FROM _mirror_bak; DROP TABLE _mirror_bak');
+    clearEnrichCache();
+  }
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
   clearEnrichCache();
 
@@ -3265,7 +3312,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // ダイアログ: 役割・見出しとの関連付け・背景固定・フォーカスの戻し (Codex R1)
   ok(/role="dialog" aria-modal="true" aria-labelledby="mvTitle"/.test(html), 'ダイアログとして扱われる (読み上げ)');
   ok(/body\.modal-open\{position:fixed/.test(html) && /document\.body\.classList\.add\('modal-open'\)/.test(html), '開いている間は背景を固定する');
-  ok(/window\.scrollTo\(0, overlayScrollY\)/.test(html) && /overlayReturn\.focus\(\)/.test(html), '閉じたら元の位置とフォーカスに戻す');
+  ok(/window\.scrollTo\(0, entry \? entry\.scrollY : overlayScrollY\)/.test(html) && /focusBack\(entry \? entry\.ret : overlayReturn\)/.test(html),
+    '閉じたら元の位置とフォーカスに戻す (重ねたダイアログでもダイアログごとの戻り先 — Codex PR #1197 R2)');
   ok(/if \(e\.key !== 'Tab'\) return;/.test(html), 'Tab はダイアログの中で回る');
   ok(/aria-pressed=/.test(html) && /role="group" aria-label="資材の候補"/.test(html), 'どれを選んでいるかが支援技術にも伝わる');
   ok(/\.optnew\{[^}]*grid-column:1\/-1/.test(html), '新しく登録の欄は横いっぱいに出る');
@@ -3293,13 +3341,33 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/btn\.disabled = !stateCan\('task\.label_wait\.edit'\);   \/\/ 保存中に許可が変わっていたら/.test(html),
     '保存後にボタンを無条件で戻さない (許可リストで判断する。正本だけを見ない)');
   // 実機FB (2026-09-03): ボードに写真・項目タップで変更・想定作業時間の合計
-  ok(/<div class="th">' \+ thumbHtml\(c\) \+ '<\/div>/.test(html), 'ボードのカードに写真を出す');
+  ok(/\(c\.image_url \? '<div class="th">' \+ thumbHtml\(c\) \+ '<\/div>' : ''\)/.test(html), 'ボードのカードに写真を出す (写真が無いカードは空枠を出さない — 監修)');
+  // 監修 PR-D: 意味を正す
+  ok(/function boxesText\(c, opts\)/.test(html) && /boxesText\(c, \{ short: true \}\)/.test(html) && /n\('必要保管箱', boxesText\(c\) \|\| null, ''\)/.test(html),
+    '必要保管箱は「用意する箱の数」で出す (boxes_calc。元の式の文字列は c.boxes に残す)');
+  ok(/: c\.loc_stock === 0\s*\r?\n?\s*\? '<div class="main none">在庫なし \(0 個\)<\/div>'/.test(html) && /まだ取れていません \(在庫の取り込みが無い\)/.test(html),
+    'Zロケ「0 個」と「まだ取れていません」を分ける (監修 B-8)');
+  ok(!/保留/.test(html.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')), '画面の文言に「保留」が残っていない (案A: 止まった／中断)');
+  // 監修 PR-E (R-1): window.prompt / confirm は iOS のホーム画面アプリで出ないことがある → 専用ダイアログ
+  ok(!/window\.prompt\(|window\.confirm\(|[^.\w]confirm\(|[^.\w]prompt\(/.test(html), 'window.prompt / confirm を使わない (監修 R-1)');
+  ok(/function ask\(o\)/.test(html) && /id="askOv"/.test(html) && /function askDone\(ok\)/.test(html), '確認・PIN・理由は専用ダイアログ ask() で受ける');
+  ok(/const pin = await ask\(\{ title: '🔑 職員モードに入る'/.test(html) && /input: 'pin'/.test(html), '職員PIN も ask (数字キーボード)');
+  ok(/reopenReason = await ask\(\{[^\n]*required: true/.test(html), '終了から戻す理由は必須のまま (空では通さない)');
+  ok(/if \(\$\('#askOv'\)\.classList\.contains\('on'\)\) \{ askDone\(false\); return; \}/.test(html), 'Esc は確認ダイアログだけ閉じる (下のダイアログは残す)');
+  ok(/const ov = \$\('#askOv'\)\.classList\.contains\('on'\) \? \$\('#askOv'\) : document\.querySelector\('\.overlay\.on'\);/.test(html),
+    'Tab はいちばん上の ask の中で回す (Codex R1 #5)');
+  ok(/const overlayStack = \[\];/.test(html) && /overlayStack\.push\(\{ sel, ret: document\.activeElement, scrollY \}\);/.test(html)
+    && /const entry = i >= 0 \? overlayStack\.splice\(i, 1\)\[0\] : null;/.test(html) && /window\.scrollTo\(0, entry \? entry\.scrollY : overlayScrollY\);/.test(html),
+    'ダイアログの戻り先・スクロール位置はダイアログごとにスタックで持つ (重ねても全部閉じたあと元の場所へ戻る — Codex R2)');
+  ok(!/_prevFocus/.test(html), 'ask 側の自前の戻し (_prevFocus) は無い (二重管理しない)');
+  ok(/\.tbl\.member th:nth-child\(7\),\.tbl\.member td:nth-child\(7\),/.test(html) && !/nth-child\(n\+7\)/.test(html), 'ラベル待ちの表: 貼り直し (8 列目) は利用者にも見せる (Codex R1 #3)');
+  ok(/if \(await askStaffUnlock\(\)\) \{ await loadState\(\); return saveLw\(\); \}/.test(html), 'ラベル待ちの保存で職員の門に断られたら PIN → 保存し直し');
   ok(!/onclick="openMaster/.test(html) && /data-reg="/.test(html), '作業のやり方は項目タップで変更 (編集ボタンなし)');
   ok(/\+ \(empty \? '＋ 登録' : '✎ 変更'\) \+/.test(html), '値があれば「変更」、無ければ「登録」と出す');
   ok(!/mvVideo/.test(html.replace(/\/\/.*$/gm, '')), '作り方どうがは画面から外した (コメントだけ残す)');
   ok(/const hours = mine\.reduce/.test(html), 'ボードの列に想定作業時間の合計を出す');
   ok(/function headNumsHtml\(c\)/.test(html) && /n\('つくる数'/.test(html)
-    && /n\('必要保管箱', c\.boxes/.test(html) && /n\('想定作業時間'/.test(html),
+    && /n\('必要保管箱', boxesText\(c\) \|\| null, ''\)/.test(html) && /n\('想定作業時間', c\.plan_hours != null \? approxHours\(c\.plan_hours\) : null, ''\)/.test(html),
     '必要保管箱と想定作業時間は「つくる数」の横に出す (作業情報の枠からは外す)');
   ok(/function careHtml\(c\)/.test(html) && /class="care"/.test(html),
     '気をつけることは上部に強調して出す (中身があるときだけ)');
@@ -3312,7 +3380,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '「作業のやり方」を「作業情報」に変える (未登録の数も見出しに出す)');
   ok(/wrow\('大きさ', sizeClassText\(m\.size_class\), 'size_class'\)/.test(html),
     '大きさは行から登録できる (P4 で項目だけ足して開けなくなっていた)');
-  ok(/wrow\('期限シール'/.test(html) && /'expiry_seal'\)/.test(html), '期限シールも行から変えられる');
+  ok(/wrow\('期限シール'/.test(html) && /'expiry_seal', false, null, '未設定 \(貼るかどうか職員に確認\)'\)/.test(html),
+    '期限シールも行から変えられる。未設定は「貼らない」と読まれないよう一言添える (監修)');
   // 作業情報の作り (中原さん 2026-09-05:「写真がないやつはカードみたいな表示にしなくていい。Zロケ在庫も工程も見にくい」)
   ok(/<div class="wigroup">使うもの<\/div>/.test(html) && /<div class="wigroup">作業のしかた<\/div>/.test(html)
     && /<div class="wigroup">参考にするもの<\/div>/.test(html), '作業情報は「使うもの・作業のしかた・参考にするもの」の3つに分ける');
@@ -3320,7 +3389,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '写真で見分けるもの (資材・保管箱) だけ写真カード。工程・期限シール・大きさは行にする');
   ok(/1箱に <b class="num">' \+ esc\(String\(units\)\) \+ '<\/b> 個ずつ入れる/.test(html),
     '入数は保管箱とセットで読ませる (120 が総数か1箱ぶんか迷わない)');
-  ok(/miss \? '⚠ 未登録' : '<span class="none">未設定<\/span>'/.test(html) && /<div class="v">特になし<\/div>/.test(html),
+  ok(/miss \? '⚠ 未登録' : '<span class="none">' \+ esc\(emptyText \|\| '未設定'\) \+ '<\/span>'/.test(html) && /<div class="v">特になし<\/div>/.test(html),
     '空欄を「—」で済ませず、登録が要るもの (未登録) と なくてよいもの (未設定・特になし) を分ける');
   // 監修 PR-A (2026-09-05)
   ok(/上の黄色い枠に出しています/.test(html) && /const care = note \? '' : open\('wicare empty', 'note'\)/.test(html),
@@ -3639,7 +3708,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '残り時間は 30 秒ごとに見直す (通信が無くても固まらない)');
   ok(/if \(sm\.until && leftMs <= 0\) \{\r?\n\s+\/\/[^\r\n]*\r?\n\s+dropPlanCaps\(\);/.test(html),
     '期限が来たら画面の中の許可を落として取り直す (計画のボタンが残らない)');
-  ok(/function dropPlanCaps\(\)/.test(html) && /state\.capabilities = \(state\.capabilities \|\| \[\]\)\.filter\(\(c\) => c !== 'task\.plan\.assign' && c !== 'task\.facility\.assign'\);/.test(html),
+  ok(/function dropPlanCaps\(\)/.test(html) && /state\.capabilities = \(state\.capabilities \|\| \[\]\)\.filter\(\(c\) => c !== 'task\.plan\.assign' && c !== 'task\.facility\.assign' && c !== 'task\.external_ready'\);/.test(html),
     '職員モードを抜けたら、画面の中の許可もその場で落とす');
   ok(/if \(!j\.ok\) \{ showErr\(j\.message \|\| '職員モードを終われませんでした'\); return; \}/.test(html)
     && /dropPlanCaps\(\);\r?\n\s+toast\('職員モードを終わりました'\);/.test(html),
@@ -3648,8 +3717,12 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const canFac = isApp\(\) && stateCan\('task\.facility\.assign'\);/.test(html)
     && /const canWhen = isApp\(\) && stateCan\('task\.plan\.assign'\);/.test(html),
     'カードの「どこが」「いつ」の札は許可リストで出し分ける (下見では span = 見るだけ)');
-  ok(/canFac\s*\r?\n?\s*\? '<button class="tag ' \+ facCls \+ '" data-fac-of=/.test(html) && /: '<span class="tag ' \+ facCls \+ '"/.test(html),
+  ok(/canFac\s*\r?\n?\s*\? '<button class="tag ' \+ facCls \+ '" data-fac-of=/.test(html) && /: \(c\.facility_code \? '<span class="tag ' \+ facCls \+ '"/.test(html),
     '許可が無ければ札は span で描く (ボタンを描いて無効にしない)');
+  ok(/: \(c\.when \? '<span class="tag ' \+ whenCls \+ '"/.test(html) && /return \(fac \|\| when\) \? '<div class="tags">' \+ fac \+ when \+ '<\/div>' : '';/.test(html),
+    '利用者には「未定」の札を出さない — 決まっている「どこが」「いつ」だけ (監修 F-5)');
+  ok(/const WHEN_SHORT = \{ today: '今日', tomorrow: '明日', over: 'やり残し', later: '先の予定' \};/.test(html) && /WHEN_SHORT\[c\.when\]/.test(html),
+    'カードの札は短い言葉 (「い／つ／今日や／る」と折れない)');
   ok(/function toggleTomorrow\(id, want\) \{\r?\n\s+if \(!stateCan\('task\.plan\.assign'\)\) return;/.test(html)
     && /function openFacPick\(id\) \{\r?\n\s+if \(!stateCan\('task\.facility\.assign'\)\) return;/.test(html),
     '札の入口でも許可リストを見る (二重の守り)');
@@ -3694,8 +3767,10 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   ok([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT].every(c => notion.includes(c))
     && ![CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED, CAP.BLOCK].some(c => notion.includes(c)),
     'Notion 正本 = 状態変更・作業開始・写真・作業のやり方 (今日やる・止まった等は許さない)');
-  ok(notion.every(c => app.includes(c)) && [CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED, CAP.BLOCK].every(c => app.includes(c)),
-    'アプリ正本 = Notion 正本の全部 + 外部準備OK・取消の判断・確認ずみ・ラベル待ち・まとめて棚入完了・⛔止まった');
+  ok(notion.every(c => app.includes(c)) && [CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED, CAP.BLOCK].every(c => app.includes(c)),
+    'アプリ正本 = Notion 正本の全部 + 取消の判断・確認ずみ・ラベル待ち・まとめて棚入完了・⛔止まった');
+  ok(!app.includes(CAP.EXTERNAL_READY) && capabilitiesFor('app', { staff: true }).includes(CAP.EXTERNAL_READY),
+    '外部に出す準備OK は職員だけ (どこに預けるかの判断 — 監修 F-5)');
   // ⭐計画 (いつ / どこが) は職員のときだけ (要件 §W-1)
   const staffCaps = capabilitiesFor('app', { staff: true });
   ok(!app.includes(CAP.PLAN_ASSIGN) && !app.includes(CAP.FACILITY_ASSIGN), '利用者には「いつ」「どこが」を許さない');
@@ -3704,7 +3779,7 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   ok(capabilitiesFor('notion', { staff: true }).length === notion.length, 'Notion 正本では職員でも計画は許さない (planned_date はアプリ正本の持ちもの)');
   ok(capabilitiesFor('preview', { staff: true }).length === 0, '下見・履歴は職員でも何も許さない');
   // 書き込み口が capability を持たないまま増えていないか (Codex PR1 R6)
-  ok(app.length === 10 && new Set(app).size === app.length, 'アプリ正本 (利用者) の許可は 10 個・重複なし (増やしたら画面の判定も足す)');
+  ok(app.length === 9 && new Set(app).size === app.length, 'アプリ正本 (利用者) の許可は 9 個・重複なし (増やしたら画面の判定も足す)');
   ok(staffCaps.length === 12 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 12 個・重複なし');
   app.push('x'); pv.push('y');
   ok(!capabilitiesFor('app').includes('x') && capabilitiesFor('preview').length === 0, '返した配列を壊しても共有の定義は変わらない');

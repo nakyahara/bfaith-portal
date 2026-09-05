@@ -40,6 +40,12 @@
     td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
     .code-big { font-size: 2em; font-weight: 700; letter-spacing: 0.2em; font-family: ui-monospace, Menlo, monospace; }
     code { background: #e9ecef; padding: 1px 5px; border-radius: 4px; }
+    /* 目次 (10 節が縦に並ぶ → 日常的に使う 3 つを先頭に — 監修) */
+    .iw-toc { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin: 0 0 14px; padding: 10px 12px;
+      background: #fff; border: 1px solid #dee2e6; border-radius: 8px; position: sticky; top: 0; z-index: 5; }
+    .iw-toc .lbl { font-size: .75rem; color: #6c757d; font-weight: 700; margin-left: 6px; }
+    .iw-toc a { font-size: .85rem; text-decoration: none; color: #0d6efd; border: 1px solid #cfe2ff; background: #f0f6ff; border-radius: 999px; padding: 3px 10px; }
+    .iw-box h2 { scroll-margin-top: 64px; }
   </style>
 </head>
 <body>
@@ -57,8 +63,16 @@
 
   <div class="iw-wrap">
 
+    <nav class="iw-toc" aria-label="目次">
+      <span class="lbl">よく使う</span>
+      <a href="#sec-workers">👤 名簿</a><a href="#sec-options">🧰 選択肢</a><a href="#sec-find">🔎 記録をさがす</a>
+      <span class="lbl">設定・確認</span>
+      <a href="#sec-devices">📱 iPad</a><a href="#sec-notion">🗂 Notion</a><a href="#sec-migrate">🚚 移行</a>
+      <a href="#sec-sessions">⏱ セッション</a><a href="#sec-media">📷 写真</a><a href="#sec-log">📋 操作履歴</a>
+    </nav>
+
     <div class="iw-box">
-      <h2>🗂 Notion 連携 (カードの取得)</h2>
+      <h2 id="sec-notion">🗂 Notion 連携 (カードの取得)</h2>
       <p class="hint">
         カードの一覧は Notion「在庫化作業管理」から取得したキャッシュを表示します (進捗の正本は当面 Notion)。
         作業画面を開くと3分おきに自動で最新化され、iPad の「🔄 いま更新」でも取り直せます。
@@ -81,7 +95,7 @@
 
     <% if (isAdmin) { %>
     <div class="iw-box">
-      <h2>🚚 Notion → アプリ正本化 (移行ツール)</h2>
+      <h2 id="sec-migrate">🚚 Notion → アプリ正本化 (移行ツール)</h2>
       <p class="hint">
         Notion のカードを <code>f_iroha_tasks</code> に取り込みます (要件定義 v1.1 §F)。
         <b>「調査 (dry-run)」は読むだけ</b>で DB を変えません。結果と CSV を確認してから「本取込」。何度取り込んでも同じカードは増えません (page ID で冪等)。
@@ -171,7 +185,7 @@
     <% } %>
 
     <div class="iw-box">
-      <h2>🧰 作業のやり方の選択肢 (資材セット・保管箱)</h2>
+      <h2 id="sec-options">🧰 作業のやり方の選択肢 (資材セット・保管箱)</h2>
       <p class="hint">
         iPad の「作業のやり方」編集で<b>タップして選ぶ</b>候補です。作業仕様マスタ (Excel) にある値は自動で補充されます。
         初見のものは iPad からも職員PINで追加できます。画像 (http リンク) を付けると iPad の候補にサムネイルが出ます。
@@ -216,7 +230,7 @@
     </div>
 
     <div class="iw-box">
-      <h2>👤 作業者 (いろは名簿)</h2>
+      <h2 id="sec-workers">👤 作業者 (いろは名簿)</h2>
       <p class="hint">
         iPad の名前タップに出る名簿です。<b>スタッフマスタ (B-Faith) とは別</b>で、いろはの利用者・職員をここで管理します。
         「棚入完了」への変更は<b>職員</b>だけができます。名前はフルネームでなく現場の呼び名 (表示名) で登録してください。
@@ -255,7 +269,7 @@
 
     <% if (isAdmin) { %>
     <div class="iw-box">
-      <h2>📱 iPad の登録</h2>
+      <h2 id="sec-devices">📱 iPad の登録</h2>
       <p class="hint">
         いろはの iPad で <code><%= base %>/enroll</code> を開き、ここで発行した6桁コードを入れると登録されます
         (10分間・1台1回。入荷受付チェックと同じ方式)。
@@ -290,7 +304,7 @@
 
     <!-- 中原さん 2026-09-05:「あとで誰がいつ何の作業をしたのかを検索できるようになっているといい」 -->
     <div class="iw-box">
-      <h2>🔎 作業の記録をさがす</h2>
+      <h2 id="sec-find">🔎 作業の記録をさがす</h2>
       <p class="hint">1行 = 1人ぶんの作業です。合計は<b>しぼり込んだ全件</b>で出しています (表に出ている分だけの合計ではありません)。
         期間は日本時間の日付で、両端の日を含みます。</p>
       <div class="iw-find">
@@ -324,7 +338,7 @@
     </div>
 
     <div class="iw-box">
-      <h2>⏱ 作業時間セッション (直近50件)</h2>
+      <h2 id="sec-sessions">⏱ 作業時間セッション (直近50件)</h2>
       <p class="hint">開始/終了はサーバー時刻で記録します。<b>終了忘れは自動で確定しません</b> —
         6時間を超えて「作業中」のものは ⚠ が付くので、確認のうえ「取り消し」してください (行は消えず、集計から外れるだけ)。</p>
       <table class="iw-list">
@@ -346,7 +360,7 @@
     </div>
 
     <div class="iw-box">
-      <h2>📷 完成写真・動画の送信 (直近50件)</h2>
+      <h2 id="sec-media">📷 完成写真・動画の送信 (直近50件)</h2>
       <p class="hint">
         iPad から受け取った写真・動画は、裏のキューが Drive へ保存し、Notion カードの「完成写真」に貼ります
         (2分間隔で自動再試行)。<%= driveConfigured ? '' : '⚠ IROHA_WORK_DRIVE_FOLDER_ID が未設定のため保存できません。' %>
@@ -386,7 +400,7 @@
     </div>
 
     <div class="iw-box">
-      <h2>📋 操作履歴 (直近50件)</h2>
+      <h2 id="sec-log">📋 操作履歴 (直近50件)</h2>
       <p class="hint">iPad からのステータス変更などを、成功・失敗とも記録しています (だれが・どの端末で・何を)。</p>
       <table class="iw-list">
         <tr><th>日時</th><th>操作</th><th>内容</th><th>作業者</th><th>端末</th><th>結果</th></tr>
@@ -440,6 +454,11 @@
       const sum = document.getElementById('fSum');
       sum.textContent = 'さがしています…';
       const r = await fetch(BASE + '/admin/sessions/search?' + p.toString());
+      // ポータルのログインが切れていると 302 → ログイン画面の HTML が返る (JSON にならない)。理由と行き先を書く (監修)
+      if (r.redirected || !(r.headers.get('content-type') || '').includes('json')) {
+        sum.innerHTML = '❌ ログインが切れています。<a href="/login">ログインし直す</a> → このページを開き直してください';
+        return;
+      }
       const j = await r.json().catch(() => ({}));
       if (!j.ok) { sum.textContent = '❌ ' + (j.message || 'さがせませんでした'); return; }
       const s = j.summary;

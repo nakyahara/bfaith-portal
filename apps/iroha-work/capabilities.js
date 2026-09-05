@@ -33,10 +33,13 @@ export const CAP = Object.freeze({
 });
 
 const CAPS_NOTION = Object.freeze([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT]);
-const CAPS_APP = Object.freeze([...CAPS_NOTION, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR,
+const CAPS_APP = Object.freeze([...CAPS_NOTION, CAP.CANCELLATION, CAP.REVIEW_CLEAR,
   CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED, CAP.BLOCK]);
-/** ⭐職員のときだけ足す = 計画 (いつ / どこが)。利用者の画面には札のボタンも計画の入口も描かない */
-const CAPS_STAFF = Object.freeze([CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN]);
+/**
+ * ⭐職員のときだけ足す = 計画 (いつ / どこが) と 外部出し (どこに預けるかの判断)。
+ * 利用者の画面には札のボタンも計画の入口も外部出しのボタンも描かない (要件 §W-1 / 監修 F-5 2026-09-05)
+ */
+const CAPS_STAFF = Object.freeze([CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN, CAP.EXTERNAL_READY]);
 const CAPS_PREVIEW = Object.freeze([]);
 
 /**

@@ -751,6 +751,12 @@ export function listLabelWaits({ taskId = null, openOnly = true, limit = 500 } =
  * ラベル待ちの登録・更新 (id 無し = 新規)。更新は version の楽観ロック。
  * fields = xlsx の列そのまま (発生日/記録者/発注済/ロット期限/数量/ロケーション Z・Y・none/貼り直し/LINE連絡日/再連絡日/入庫完了日/完了/備考)
  */
+/** ラベル待ちの 1 行 (無ければ null)。API が「いまの値と同じか」を見るのに使う */
+export function getLabelWait(id) {
+  const n = Number(id);
+  if (!Number.isSafeInteger(n)) return null;
+  return getDB().prepare('SELECT * FROM f_iroha_label_waits WHERE id = ?').get(n) || null;
+}
 export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion = null, actor = null }) {
   const db = getDB();
   // ⭐札を外せなかったときは例外で巻き戻す (値を return すると commit されるため — Codex PR #1193 R1 #4)。

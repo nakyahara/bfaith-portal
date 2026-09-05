@@ -140,6 +140,7 @@ export function buildList() {
   const mediaMap = mediaByPage();
   const prevPhotos = photosByCodeKey();
   const zStock = stockMapByPrefix(rows.map((r) => keyOf(r.product_code)), 'Z');
+  const mirrorAt = mirrorCapturedAt();
 
   const cards = rows.map((r) => {
     let props = {};
@@ -172,15 +173,10 @@ export function buildList() {
       plan_hours: planHours(props['数量'], masterOf(k ? ctx.workMaster.get(k) : null, props).process_count),
       boxes: neededBoxes(props['数量'], masterOf(k ? ctx.workMaster.get(k) : null, props).units_per_container,
         k && zStock.get(k) ? zStock.get(k).stock : 0, k && zStock.get(k) ? zStock.get(k).allocated : 0),
-      z_stock: k && zStock.get(k) ? zStock.get(k).stock : null,
-      z_allocated: k && zStock.get(k) ? zStock.get(k).allocated : null,
-      z_free: k && zStock.get(k) ? zStock.get(k).stock - zStock.get(k).allocated : null,
-      z_at: k && zStock.get(k) ? zStock.get(k).captured : null,
-      loc_kind: 'Z',
-      loc_stock: k && zStock.get(k) ? zStock.get(k).stock : null,
-      loc_allocated: k && zStock.get(k) ? zStock.get(k).allocated : null,
-      loc_free: k && zStock.get(k) ? zStock.get(k).stock - zStock.get(k).allocated : null,
-      loc_at: k && zStock.get(k) ? zStock.get(k).captured : null,
+      boxes_calc: neededBoxesCalc(props['数量'], masterOf(k ? ctx.workMaster.get(k) : null, props).units_per_container,
+        k && zStock.get(k) ? zStock.get(k).stock : 0, k && zStock.get(k) ? zStock.get(k).allocated : 0),
+      // Z ロケ行が無ければ「Z に 0」(ミラーが取れている限り)。取れていなければ null (監修 B-8)
+      ...locFields(k ? zStock.get(k) : null, k ? zStock.get(k) : null, 'Z', mirrorAt),
       // 作業時間: いま作業中の人 + 過去の実測 (カード単位合計の平均。1回だけなら「前回」表示)
       active: activeMap.get(r.page_id) || [],
       estimate: (k && estimates.get(k)) || null,
@@ -230,6 +226,7 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
   const zStock = stockMapByPrefix(rows.map((r) => keyOf(r.product_code)), 'Z');
   // 外部 (羅針盤・ワークセンター) に出したカードは Y ロケを見せる。その拠点のカードの商品だけ引く
   const yStock = stockMapByPrefix(rows.filter((r) => stockLocOf(r.facility_code) === 'Y').map((r) => keyOf(r.product_code)), 'Y');
+  const mirrorAt = mirrorCapturedAt();
   // 大きさ (嵩) = 配送方法。明日どれをやるかの並びに使う (要件 §W-1)
   const sizes = sizeMapByCode(rows.map((r) => keyOf(r.product_code)));
   const today = jstToday();
@@ -293,16 +290,10 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       // 想定作業時間・必要保管箱 (Notion の計算式をそのまま。ボードでは状態ごとに合計する)
       plan_hours: planHours(r.qty, master.process_count),
       boxes: neededBoxes(r.qty, master.units_per_container, z ? z.stock : 0, z ? z.allocated : 0),
-      // Z ロケ (一時保管) の在庫。在庫ミラーは毎時更新で、画面は 60 秒ごとに取り直すので自動で新しくなる
-      z_stock: z ? z.stock : null,
-      z_allocated: z ? z.allocated : null,
-      z_free: z ? z.stock - z.allocated : null,
-      z_at: z ? z.captured : null,
-      loc_kind: locKind,
-      loc_stock: loc ? loc.stock : null,
-      loc_allocated: loc ? loc.allocated : null,
-      loc_free: loc ? loc.stock - loc.allocated : null,
-      loc_at: loc ? loc.captured : null,
+      boxes_calc: neededBoxesCalc(r.qty, master.units_per_container, z ? z.stock : 0, z ? z.allocated : 0),
+      // Z ロケ (一時保管) の在庫。在庫ミラーは毎時更新で、画面は 60 秒ごとに取り直すので自動で新しくなる。
+      // ⭐行が無い = その商品は Z に 0 個 (ミラーが取れている限り)。取れていなければ null (監修 B-8)
+      ...locFields(z, loc, locKind, mirrorAt),
       media: mediaMap.get(r.id) || [],
       previous_photos: previousPhotosOf(k ? (prevPhotos.get(k) || []) : [], `t${r.id}`),
     };
@@ -458,15 +449,24 @@ export function planHours(qty, processCount) {
  *   割り切れれば「N箱」、余りが出れば「N箱+余り」
  */
 export function neededBoxes(qty, unitsPerContainer, zStock = 0, zAllocated = 0) {
+  const c = neededBoxesCalc(qty, unitsPerContainer, zStock, zAllocated);
+  if (!c) return null;
+  return c.rest === 0 ? `${c.full}箱` : `${c.full}箱+${c.rest}`;
+}
+/**
+ * 必要保管箱の中身。full = いっぱいになる箱、rest = 余り、boxes = **人が用意する箱の数** (余りがあれば +1)。
+ * Notion の式 (上) は「1箱+80」= いっぱい 1 + 余り 80 と読むが、用意するのは 2 箱 (監修 PR-D 2026-09-05。表示は画面側 boxesText)
+ */
+export function neededBoxesCalc(qty, unitsPerContainer, zStock = 0, zAllocated = 0) {
   const per = Number(unitsPerContainer);
   if (!Number.isSafeInteger(per) || per <= 0) return null;
   const z = Number(zStock) || 0;
   const base = z > 0 ? z - (Number(zAllocated) || 0) : Number(qty);
   // 整数で数えられる範囲だけ (小数・桁あふれは箱数を保証できないので出さない — Codex FB R1)
   if (!Number.isSafeInteger(base) || base < 0) return null;
-  const boxes = Math.floor(base / per);
+  const full = Math.floor(base / per);
   const rest = base % per;
-  return rest === 0 ? `${boxes}箱` : `${boxes}箱+${rest}`;
+  return { full, rest, per, base, boxes: full + (rest > 0 ? 1 : 0) };
 }
 
 /**
@@ -609,6 +609,31 @@ function stockMapByPrefix(codeKeys, prefix) {
     for (const r of rows) if (r.k) map.set(r.k, { stock: Number(r.zaiko) || 0, allocated: Number(r.hikiate) || 0, captured: r.captured || null, locs: r.locs });
   }
   return map;
+}
+
+/**
+ * 在庫ミラーが「取れている」か = 1 行でもあれば、その取得時刻 (MAX(captured_at))。無ければ null。
+ * ⭐その商品の Z ロケ行が無い = 「取れていない」ではなく「Z に在庫 0」(監修 B-8: 0 なら P ロケから持ってくる、と現場の判断が違う)。
+ *   本当に取れていないのは、ミラーの表が無い・空のときだけ
+ */
+function mirrorCapturedAt() {
+  const db = getDB();
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mirror_logizard_stock'").get()) return null;
+  const r = db.prepare('SELECT MAX(captured_at) AS captured FROM mirror_logizard_stock').get();
+  return (r && r.captured) || null;
+}
+/** ロケ別の在庫の表示値。行があればその値、ミラーが取れていれば 0 (時刻はミラーの最新)、取れていなければ null (「まだ取れていません」) */
+function locView(loc, mirrorAt) {
+  if (loc) return { stock: loc.stock, allocated: loc.allocated, free: loc.stock - loc.allocated, at: loc.captured };
+  if (mirrorAt) return { stock: 0, allocated: 0, free: 0, at: mirrorAt };
+  return { stock: null, allocated: null, free: null, at: null };
+}
+/** カードに乗せる Z ロケ・表示ロケの在庫 (z_* は必要保管箱の式が使う Z、loc_* は拠点で Z か Y に変わる表示用) */
+function locFields(z, loc, locKind, mirrorAt) {
+  const zv = locView(z, mirrorAt);
+  const lv = locView(loc, mirrorAt);
+  return { z_stock: zv.stock, z_allocated: zv.allocated, z_free: zv.free, z_at: zv.at,
+    loc_kind: locKind, loc_stock: lv.stock, loc_allocated: lv.allocated, loc_free: lv.free, loc_at: lv.at };
 }
 
 /**
