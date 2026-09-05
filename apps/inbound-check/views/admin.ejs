@@ -321,16 +321,99 @@
     <div class="ic-box">
       <h2>登録済み端末</h2>
       <table class="ic-list">
-        <thead><tr><th>ID</th><th>端末名</th><th>登録者</th><th>登録日</th><th>最終利用</th><th></th></tr></thead>
+        <thead><tr><th>ID</th><th>種別</th><th>端末名</th><th>出力先</th><th>登録者</th><th>登録日</th><th>最終利用</th><th></th></tr></thead>
         <tbody>
           <% for (const d of devices) { %>
             <tr class="<%= d.revoked_at ? 'revoked' : '' %>">
-              <td><%= d.id %></td><td><%= d.label %></td><td><%= d.created_by %></td>
-              <td><%= (d.created_at || '').slice(0, 10) %></td><td><%= (d.last_seen_at || '-').slice(0, 10) %></td>
+              <td><%= d.id %></td>
+              <td><%= d.kind === 'agent' ? '🏷 印刷' : '📱 iPad' %></td>
+              <td><%= d.label %></td>
+              <td>
+                <% if (d.kind === 'agent' && !d.revoked_at) { %>
+                  <input type="text" class="dev-printer" data-id="<%= d.id %>" value="<%= d.printer_name || '' %>" maxlength="120" style="width:180px;font-size:13px">
+                  <button type="button" class="btn-sm btn-printer" data-id="<%= d.id %>">保存</button>
+                <% } else { %><%= d.printer_name || '-' %><% } %>
+              </td>
+              <td><%= d.created_by %></td>
+              <td><%= (d.created_at || '').slice(0, 10) %></td>
+              <td>
+                <% if (d.kind === 'agent') { %>
+                  <span data-jst="<%= d.heartbeat_at || '' %>"></span><% if (!d.heartbeat_at) { %>-<% } %>
+                  <% if (d.heartbeat_note) { %><br><span style="color:#868e96;font-size:0.85em"><%= d.heartbeat_note %></span><% } %>
+                <% } else { %><%= (d.last_seen_at || '-').slice(0, 10) %><% } %>
+              </td>
               <td><% if (!d.revoked_at) { %><button class="btn-sm btn-revoke" data-id="<%= d.id %>">失効</button><% } else { %>失効済み<% } %></td>
             </tr>
           <% } %>
-          <% if (devices.length === 0) { %><tr><td colspan="6" style="color:#868e96">まだ登録がありません</td></tr><% } %>
+          <% if (devices.length === 0) { %><tr><td colspan="8" style="color:#868e96">まだ登録がありません</td></tr><% } %>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="ic-box">
+      <h2>🏷 倉庫PCの値札印刷エージェントを登録する (Brother QL-700)</h2>
+      <p class="hint">
+        iPad の「🏷 シール発行」を押したときに<b>倉庫PCの QL-700 から値札 (BCシール) を自動で出す</b>ための登録です。
+        この画面は<b>中原さんの PC で操作してかまいません</b> (iPad の登録と違ってログアウトされません)。<br>
+        プリンター名は<b>倉庫PCの「プリンターとスキャナー」に出ている表記どおり</b>に入れてください (例: <code>Brother QL-700</code>)。
+        ここに書いた名前<b>だけ</b>がその PC の出力先になり、PC 側の設定では変えられません (別のプリンターから値札が出る事故を防ぐため)。<br>
+        発行されるトークンは<b>この1回しか表示されません</b>。倉庫PCで <code>1_設置する.bat</code> を管理者として実行し、貼り付けてください
+        (手順 = AI_reference『システム設計\_tools\倉庫PC_値札印刷エージェント\やること.md』③)。
+      </p>
+      <div class="row">
+        <input type="text" id="agentLabel" placeholder="端末名 (例: 倉庫PC)" maxlength="40">
+        <input type="text" id="agentPrinter" placeholder="プリンター名 (例: Brother QL-700)" maxlength="120">
+        <button id="agentBtn" type="button">登録してトークンを発行</button>
+        <span id="agentMsg" class="msg"></span>
+      </div>
+      <div id="agentToken" style="display:none; margin-top:10px">
+        <div class="hint" style="margin-bottom:4px"><b>この端末のトークン (この画面を離れると二度と見られません)</b></div>
+        <textarea id="agentTokenBox" readonly rows="2" style="width:100%;font-family:monospace;font-size:13px"></textarea>
+      </div>
+      <% if (printAgents && printAgents.length) { %>
+        <table class="ic-list" style="margin-top:12px">
+          <thead><tr><th>端末</th><th>プリンター</th><th>状態</th><th>b-PAC</th><th>用紙「値札 62x67」</th><th>版 / PC</th></tr></thead>
+          <tbody>
+            <% for (const a of printAgents) { %>
+              <tr>
+                <td>#<%= a.id %> <%= a.label %></td>
+                <td><%= a.printer_name || '-' %></td>
+                <td><%= a.online ? '🟢 応答あり' : (a.heartbeat_at ? '🔴 応答なし (10分以上)' : '⚪ 未接続 (まだ設置していない)') %>
+                  <% if (a.heartbeat_at) { %><br><small><span data-jst="<%= a.heartbeat_at %>"></span></small><% } %></td>
+                <td><%= a.bpac === null ? '-' : (a.bpac ? '✅' : '❌ 未導入') %></td>
+                <td><%= a.paper_ok === null ? '-' : (a.paper_ok ? '✅ 登録済' : '❌ 未登録') %></td>
+                <td><%= a.version || '-' %> / <%= a.host || '-' %></td>
+              </tr>
+            <% } %>
+          </tbody>
+        </table>
+      <% } %>
+    </div>
+
+    <div class="ic-box">
+      <h2>🏷 直近の値札印刷ジョブ</h2>
+      <p class="hint">
+        iPad から依頼した順に、倉庫PCが取りに来て刷った結果です。
+        <b>❓ 結果不明</b> は「紙が出たかどうか分からない」= 二重印刷を避けるため自動では刷り直していません。<b>QL-700 の実物を見てから</b> iPad でもう一度押してください。
+        <b>🙋 印刷係が応答しません</b> は倉庫PCが寝ている / エージェントが動いていないときで、自動印刷は取り消してあります (P-touch Editor で手で刷る)。
+      </p>
+      <table class="ic-list">
+        <thead><tr><th>ID</th><th>商品</th><th>バーコード</th><th>入数</th><th>枚数</th><th>状態</th><th>出力先</th><th>依頼</th><th>備考</th></tr></thead>
+        <tbody>
+          <% for (const j of (printJobs || [])) { %>
+            <tr>
+              <td><%= j.id %></td>
+              <td><%= j.product_name %><br><small style="color:#868e96"><%= j.product_code %></small></td>
+              <td><%= j.barcode %> <small>(<%= String(j.barcode_type || '').toUpperCase() %>)</small></td>
+              <td><%= j.pack_qty || '-' %></td>
+              <td><%= j.copies %></td>
+              <td><%= PRINT_STATE_LABELS[j.state] || j.state %></td>
+              <td><%= j.printer_name %><br><small style="color:#868e96"><%= j.device_label || '' %></small></td>
+              <td><%= j.requested_by || '-' %><br><small><span data-jst="<%= j.created_at %>"></span></small></td>
+              <td><%= j.error || '' %></td>
+            </tr>
+          <% } %>
+          <% if (!printJobs || printJobs.length === 0) { %><tr><td colspan="9" style="color:#868e96">印刷ジョブはまだありません</td></tr><% } %>
         </tbody>
       </table>
     </div>
@@ -431,9 +514,34 @@
       else msg($('#deviceMsg'), false, j.message || ('HTTP ' + status));
     });
     document.querySelectorAll('.btn-revoke').forEach(b => b.addEventListener('click', async () => {
-      if (!confirm('端末 #' + b.dataset.id + ' を失効させますか? (その iPad は再登録が必要になります)')) return;
+      if (!confirm('端末 #' + b.dataset.id + ' を失効させますか? (その iPad / 倉庫PC は再登録が必要になります)')) return;
       const { j } = await postJson(BASE + '/admin/devices/' + b.dataset.id + '/revoke');
       if (j.ok) location.reload(); else alert(j.message || 'エラー');
+    }));
+    // 🏷 値札印刷エージェント (倉庫PC) の登録 → トークンを1回だけ表示
+    const agentBtn = $('#agentBtn');
+    if (agentBtn) agentBtn.addEventListener('click', async () => {
+      const label = $('#agentLabel').value.trim();
+      const printer = $('#agentPrinter').value.trim();
+      if (!label || !printer) return msg($('#agentMsg'), false, '端末名とプリンター名を入力してください');
+      if (!confirm('印刷エージェントとして「' + label + '」を登録します。出力先プリンター: ' + printer + '\nよろしいですか?')) return;
+      agentBtn.disabled = true;
+      try {
+        const { status, j } = await postJson(BASE + '/admin/devices', { label, kind: 'agent', printer_name: printer });
+        if (!j.ok) return msg($('#agentMsg'), false, j.message || ('HTTP ' + status));
+        $('#agentToken').style.display = 'block';
+        $('#agentTokenBox').value = j.token;
+        msg($('#agentMsg'), true, '登録しました。トークンを控えてから画面を閉じてください');
+      } catch (e) { msg($('#agentMsg'), false, '通信できませんでした: ' + e.message); }
+      finally { agentBtn.disabled = false; }
+    });
+    document.querySelectorAll('.btn-printer').forEach(b => b.addEventListener('click', async () => {
+      const box = document.querySelector('.dev-printer[data-id="' + b.dataset.id + '"]');
+      const name = box ? box.value.trim() : '';
+      if (!name) return alert('プリンター名を入れてください (外したいときは端末を失効させてください)');
+      const { j } = await postJson(BASE + '/admin/devices/' + b.dataset.id + '/printer', { printer_name: name });
+      if (j.ok) { if (j.cancelled) alert('保存しました。印刷待ちだった ' + j.cancelled + ' 件は出力先が変わったため取り消しました (iPad から出し直してください)'); location.reload(); }
+      else alert(j.message || 'エラー');
     }));
     const addW = $('#addWorkerBtn');
     if (addW) addW.addEventListener('click', async () => {

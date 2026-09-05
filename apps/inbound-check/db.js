@@ -275,7 +275,51 @@ export function createTables(db = getMirrorDB()) {
       revoked_at   TEXT
     );
 
+    -- 🏷 値札 (BCシール) の印刷ジョブ (print-queue.js)。iPad が積み、倉庫PCの印刷エージェントが pull で取る。
+    -- 🚨 lease した時点でジョブ JSON を渡している (= 紙が出たかもしれない) ので、期限切れでも queued へ戻さない。
+    --    状態は安全の要なので CHECK で DB 側にも書く (未知の状態が入ると監視から外れて「気づかないまま出ない」になる)
+    CREATE TABLE IF NOT EXISTS f_inbound_check_print_jobs (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_request_id TEXT NOT NULL UNIQUE,      -- iPad の冪等ID (二重タップ・応答消失の再送で2枚出ない)
+      batch_id          INTEGER NOT NULL,
+      line_key          TEXT NOT NULL,
+      code_key          TEXT NOT NULL,
+      product_code      TEXT NOT NULL,
+      product_name      TEXT NOT NULL,
+      barcode           TEXT NOT NULL,
+      barcode_type      TEXT NOT NULL CHECK (barcode_type IN ('jan','fnsku')),
+      pack_qty          TEXT NOT NULL DEFAULT '',  -- 入数 (空 = 印字しない)
+      copies            INTEGER NOT NULL CHECK (copies BETWEEN 1 AND 50),
+      printer_name      TEXT NOT NULL,             -- 積んだ時点の出力先。エージェントはこの名前にだけ出す
+      target_device_id  INTEGER NOT NULL REFERENCES f_inbound_check_devices(id),
+      requested_by      TEXT,
+      requested_device  TEXT,
+      state             TEXT NOT NULL CHECK (state IN ('queued','leased','submitted','completed','failed','manual','unknown')),
+      lease_device_id   INTEGER REFERENCES f_inbound_check_devices(id),
+      lease_token       TEXT,                      -- 報告時の照合 (別の端末・古い lease の報告を弾く)
+      lease_expires_at  TEXT,                      -- 報告の受付期限 (過ぎたら unknown)
+      spool_job_id      TEXT,
+      error             TEXT,
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL,
+      leased_at         TEXT,
+      submitted_at      TEXT,
+      finished_at       TEXT,
+      alerted_state     TEXT,                      -- 通知し終えた状態 (送信成功後にだけ入れる)
+      CHECK (state NOT IN ('leased','submitted')
+             OR (lease_device_id IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_state ON f_inbound_check_print_jobs(state, id);
+    CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_line ON f_inbound_check_print_jobs(batch_id, line_key, id);
+
   `);
+  // 🏷 印刷エージェント (倉庫PC) も同じ端末表で扱う (kind で区別)。iPad と同じ発行・失効の導線に乗せる。
+  //   printer_name は**サーバー側が端末に紐づけて持つ** (エージェント側の設定ミスで別のプリンターに出さない)
+  addCol(db, 'f_inbound_check_devices', 'kind', "TEXT NOT NULL DEFAULT 'ipad'");
+  addCol(db, 'f_inbound_check_devices', 'printer_name', 'TEXT');
+  addCol(db, 'f_inbound_check_devices', 'heartbeat_at', 'TEXT');
+  addCol(db, 'f_inbound_check_devices', 'heartbeat_note', 'TEXT');
+  addCol(db, 'f_inbound_check_devices', 'heartbeat_json', 'TEXT');
   // 作業者表は PR1 (#1055) で作ったが、スタッフマスタ (apps/staff) に一本化したので廃止。
   // 無条件 DROP はしない (Codex R4 High): 行が 0 のときだけ落とす。誰かが先に登録していたら表を残して警告
   // (その名前はスタッフマスタに手で登録してから、この表を手動で落とす)
@@ -434,13 +478,58 @@ function migrateQuantity(db) {
 
 // ───────────────────────── 端末 (iPad) ─────────────────────────
 
-export function createDevice(label, actor) {
+/**
+ * 端末を登録し、平文トークンを返す (保存はハッシュのみ。トークンはこの1回しか得られない)。
+ * kind='agent' は倉庫PCの値札印刷エージェント — 出力先プリンターを**サーバー側で**この端末に紐づける
+ * (エージェント側の設定ミスで別のプリンターに値札を出さないため)。
+ */
+export function createDevice(label, actor, { kind = 'ipad', printerName = null } = {}) {
   const l = String(label || '').trim();
   if (!l || l.length > 40) throw new Error('端末名は1〜40文字');
+  if (kind !== 'ipad' && kind !== 'agent') throw new Error('端末の種別が不正です');
+  const db = getDB();
   const token = crypto.randomBytes(32).toString('base64url');
-  const info = getDB().prepare(`INSERT INTO f_inbound_check_devices (token_hash, label, created_by, created_at) VALUES (?, ?, ?, ?)`)
-    .run(hashToken(token), l, actor, utcNow());
-  return { token, id: Number(info.lastInsertRowid) };
+  return db.transaction(() => {
+    let printer = null;
+    if (kind === 'agent') {
+      const chk = validatePrinterName(db, printerName, null);
+      if (!chk.ok) throw new Error(chk.message);
+      printer = chk.name;
+    }
+    const info = db.prepare(`INSERT INTO f_inbound_check_devices (token_hash, label, created_by, created_at, kind, printer_name) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run(hashToken(token), l, actor, utcNow(), kind, printer);
+    return { token, id: Number(info.lastInsertRowid) };
+  }).immediate();
+}
+
+/**
+ * プリンター名の検査。🚨 有効なエージェント同士で同名は許さない — Windows のプリンター名は PC ごとの
+ * ローカル名なので、倉庫PCと出荷PCの両方に「Brother QL-700」があると、どちらの実機から出るか決められない
+ */
+function validatePrinterName(db, printerName, selfId) {
+  const name = String(printerName == null ? '' : printerName).trim();
+  if (!name || name.length > 120) return { ok: false, error: 'bad_printer', message: 'プリンター名を1〜120文字で入力してください (「プリンターとスキャナー」の表記どおり)' };
+  const other = db.prepare(`SELECT id, label FROM f_inbound_check_devices WHERE kind = 'agent' AND revoked_at IS NULL AND printer_name = ? AND id <> ?`)
+    .get(name, selfId == null ? -1 : selfId);
+  if (other) return { ok: false, error: 'duplicate_printer', message: `「${name}」は別の端末「${other.label}」に登録済みです。プリンター名は PC ごとのローカル名なので、同じ名前だとどちらの実機か決められません (どちらかの PC で名前を変えてください)` };
+  return { ok: true, name };
+}
+
+/** 印刷エージェントの出力先プリンターを付け替える。印刷待ちのジョブは古い名前のまま残るので manual に倒す (lease 時にも同じ検査がある) */
+export function setAgentPrinter(deviceId, printerName) {
+  const db = getDB();
+  return db.transaction(() => {
+    const dev = db.prepare(`SELECT id, printer_name FROM f_inbound_check_devices WHERE id = ? AND kind = 'agent' AND revoked_at IS NULL`).get(deviceId);
+    if (!dev) return { ok: false, error: 'not_agent', message: '有効な印刷エージェント端末ではありません' };
+    const chk = validatePrinterName(db, printerName, deviceId);
+    if (!chk.ok) return chk;
+    const now = utcNow();
+    db.prepare('UPDATE f_inbound_check_devices SET printer_name = ? WHERE id = ?').run(chk.name, deviceId);
+    const dropped = dev.printer_name === chk.name ? 0 : db.prepare(`UPDATE f_inbound_check_print_jobs SET state = 'manual', error = ?, finished_at = ?, updated_at = ?
+      WHERE target_device_id = ? AND state = 'queued' AND printer_name <> ?`)
+      .run(`出力先プリンター名が変わったため自動印刷を取り消しました (${dev.printer_name} → ${chk.name})`, now, now, deviceId, chk.name).changes;
+    return { ok: true, printer_name: chk.name, cancelled: dropped };
+  }).immediate();
 }
 
 export function verifyDevice(token) {
@@ -553,7 +642,8 @@ export function revokeDevice(id) {
 }
 
 export function listDevices() {
-  return getDB().prepare('SELECT id, label, created_by, created_at, last_seen_at, revoked_at FROM f_inbound_check_devices ORDER BY id').all();
+  return getDB().prepare(`SELECT id, label, created_by, created_at, last_seen_at, revoked_at, kind, printer_name, heartbeat_at, heartbeat_note
+    FROM f_inbound_check_devices ORDER BY id`).all();
 }
 
 // ───────────────────────── 作業者 (名前タップ) = スタッフマスタ (apps/staff) を参照 ─────────────────────────
@@ -759,7 +849,9 @@ export function cleanupOld(db = getDB(), now = new Date()) {
   const logCut = new Date(now.getTime() - LOG_RETENTION_DAYS * 86400_000).toISOString();
   const a = db.prepare("DELETE FROM f_inbound_check_batches WHERE status = 'superseded' AND imported_at < ?").run(cut).changes;
   const b = db.prepare('DELETE FROM f_inbound_check_import_log WHERE at < ?').run(logCut).changes;
-  return { batches: a, logs: b };
+  // 🏷 値札の印刷ジョブは取込ログと同じ 90 日 (終わったものだけ。進行中は消さない)
+  const c = db.prepare(`DELETE FROM f_inbound_check_print_jobs WHERE state NOT IN ('queued','leased','submitted') AND updated_at < ?`).run(logCut).changes;
+  return { batches: a, logs: b, printJobs: c };
 }
 
 // ───────────────────────── 表示用の結合 (入数・行き先・ピックロケ) ─────────────────────────

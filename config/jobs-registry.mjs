@@ -98,6 +98,29 @@ export const JOBS_REGISTRY = [
       + '手順と切り分け表 = リポジトリ scripts/slip-print-agent/README.md。'
       + '⚠ 未導入のうちは ping しない設計なので、この項目が出たら「導入済みなのに止まった」',
   },
+  {
+    id: 'nefuda-print-agent',
+    type: 'heartbeat',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: '入荷受付チェック iPad の「🏷 シール発行」を押したら倉庫PCの Brother QL-700 から値札 (BCシール) を'
+      + '自動で出す常駐エージェント (2026-09-05)。倉庫PC (DESKTOP-HUIUSPG) のタスクスケジューラで SYSTEM 実行'
+      + ' (サインイン不要)。Render の印刷キュー (/apps/inbound-check/print/*) へ4秒ごとに pull で聞きに行く一方向通信で、'
+      + 'Render から倉庫PCへは繋がない。b-PAC でテンプレ (値札発行.lbx のコピー) に差し込み → GDI で印刷。'
+      + '止まると iPad の依頼が3分で「印刷係が応答しません」になり、値札は今までどおり P-touch Editor で手で刷る (P2)',
+    where: '倉庫PC C:\\tools\\nefuda-print-agent\\agent.ps1 (タスク名 BFaith-NefudaPrintAgent)。'
+      + 'Render 側の見張り = apps/inbound-check/sync-job.js startInboundCheckPrintQueueWorker (30秒間隔・INBOUND_CHECK_PRINT_ENABLED)',
+    schedule: '常駐 (4秒間隔で /print/next・45秒ごとに heartbeat。生存 ping は1時間に1回へ間引き)',
+    // ⭐ping は**エージェント自身ではなく Render が中継する** (倉庫PCへ JOBS_MONITOR_TOKEN を配らずに済ませる)。
+    //   Render が f_inbound_check_devices.heartbeat_at を見て、10分以内なら ok を打つ = エージェントが死ねば ping も止まる
+    max_age_hours: 3,
+    lifecycle: 'permanent',
+    runbook: '倉庫PCで Get-Content C:\\tools\\nefuda-print-agent\\work\\agent.log -Tail 30 -Encoding UTF8 / '
+      + '2_状態を見る.bat (RESULT_status.txt)。401 = トークン失効 → /apps/inbound-check/admin で登録し直して 1_設置する.bat。'
+      + '409 = 出力先プリンター未登録 → 管理画面で Brother QL-700 を登録。b-PAC 未導入 / 用紙「値札 62x67」未登録は管理画面の端末一覧に出る。'
+      + '手順と切り分け表 = AI_reference システム設計\\_tools\\倉庫PC_値札印刷エージェント\\README.md。'
+      + '⚠ 未導入のうちは ping しない設計なので、この項目が出たら「導入済みなのに止まった」',
+  },
   // ─────────────── heartbeat (Render 常駐: inquiry-hub) ───────────────
   {
     id: 'inquiry-hub-sync',

@@ -160,6 +160,21 @@
     .btn-plus { min-width: 116px; min-height: 46px; border: 1px solid #1c7ed6; border-radius: 10px; background: #e7f5ff; color: #1864ab; font-size: 0.95em; font-weight: 700; cursor: pointer; padding: 0 8px; }
     .btn-plus:disabled { opacity: 0.45; }
     .btn-plus.setup { border-color: #f08c00; background: #fff9db; color: #e8590c; }
+    /* 🏷 値札 (BCシール) 発行。倉庫PCの QL-700 から出す。結果は行の下に出る */
+    .btn-seal { min-width: 116px; min-height: 46px; border: 1px solid #d9480f; border-radius: 10px; background: #fff4e6; color: #d9480f; font-size: 0.95em; font-weight: 700; cursor: pointer; padding: 0 8px; }
+    .btn-seal:disabled { opacity: 0.5; cursor: default; }
+    .pjob { font-size: 0.78em; text-align: center; line-height: 1.4; padding: 4px 6px; border-radius: 8px; background: #f1f3f5; color: #495057; max-width: 150px; }
+    .pjob.s-completed { background: #d3f9d8; color: #2b8a3e; }
+    .pjob.s-failed { background: #ffe3e3; color: #c92a2a; font-weight: 700; }
+    .pjob.s-unknown, .pjob.s-manual { background: #fff3bf; color: #7a5c00; font-weight: 700; }
+    .pjob.s-queued, .pjob.s-leased, .pjob.s-submitted { background: #e7f5ff; color: #1864ab; }
+    .modal.print .fld { margin: 10px 0; }
+    .modal.print .fld label { display: block; font-size: 0.85em; color: #495057; margin-bottom: 4px; }
+    .modal.print .fld input, .modal.print .fld select { font-size: 1.15em; padding: 10px; width: 100%; box-sizing: border-box; border: 1px solid #ced4da; border-radius: 8px; }
+    .modal.print .fld .ro { font-size: 1.05em; padding: 6px 0; }
+    .modal.print .fld .ro small { color: #868e96; }
+    .modal.print .pmsg { font-size: 0.9em; color: #c92a2a; min-height: 1.2em; }
+    .modal.print .pwarn { font-size: 0.88em; color: #7a5c00; background: #fff3bf; padding: 8px 10px; border-radius: 8px; margin-top: 6px; }
     .sending { font-size: 0.78em; color: #868e96; text-align: center; }
     .sending.err { color: #c92a2a; font-weight: 700; }
 
@@ -263,7 +278,7 @@
     </div>
   </div>
   <div class="banner" id="banner"></div>
-  <div class="legend">凡例: 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り<br><b>[数量を数える]</b> = 箱数やバラを入れる (＋1箱もここ) ／ <b>[全部あり]</b> = 予定数が全部そろった ／ 商品名をタップすると入数やいろはの設定を直せます ／ <a href="/apps/inbound-check/guide">📖 くわしい使い方</a></div>
+  <div class="legend">凡例: 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り<br><b>[数量を数える]</b> = 箱数やバラを入れる (＋1箱もここ) ／ <b>[全部あり]</b> = 予定数が全部そろった ／ <b>[🏷 シール発行]</b> = 倉庫PCの QL-700 から値札 (BCシール) を出す (貼付必要の商品だけ。❓結果不明のときは実物を見てから) ／ 商品名をタップすると入数やいろはの設定を直せます ／ <a href="/apps/inbound-check/guide">📖 くわしい使い方</a></div>
   <div class="wrap" id="list"></div>
   <div class="foot"><a href="/apps/inbound-check/done">📋 完了一覧</a> ・ <a href="/apps/inbound-check/guide">📖 使い方</a> ・ <a href="/apps/inbound-check/admin">管理画面 (取込・端末)</a> ・ <a href="/">ポータル</a></div>
 
@@ -299,6 +314,19 @@
       <div class="actions">
         <button type="button" id="confirmCancel">やめる</button>
         <button type="button" id="confirmOk" class="danger">はい</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 🏷 値札 (BCシール) 発行: 押す前に 商品名・バーコード・入数・枚数・出力先 を1回確認する -->
+  <div class="overlay" id="printBox">
+    <div class="modal print">
+      <h2>🏷 値札シールを出す</h2>
+      <div id="printBody"></div>
+      <div class="pmsg" id="printMsg"></div>
+      <div class="actions">
+        <button type="button" id="printCancel">やめる</button>
+        <button type="button" class="primary" id="printOk" style="background:#d9480f;border-color:#d9480f;color:#fff;font-weight:700">🏷 発行する</button>
       </div>
     </div>
   </div>
@@ -597,7 +625,7 @@
         + (checked ? '<div class="who">✅ ' + esc(l.checked_by || '') + ' ' + esc(fmtJst(l.checked_at)) + '</div>' : '')
         + (!checked && l.prev_checked ? '<div class="prev">前回 ' + esc(fmtJst(l.prev_checked.at)) + ' に ' + esc(l.prev_checked.by || '') + ' が確認済み (今日は未確認)</div>' : '')
         + '</div>'
-        + '<div class="act">' + mainBtnHtml(l) + plusBtnHtml(l) + sendingHtml(l) + '</div></div>'
+        + '<div class="act">' + mainBtnHtml(l) + plusBtnHtml(l) + printBtnHtml(l) + printJobHtml(l) + sendingHtml(l) + '</div></div>'
         + '<div class="detail">' + (open ? detailHtml(l) : '') + '</div>'
         + '</div>';
     }
@@ -1557,6 +1585,7 @@
         return;
       }
       if (act === 'retry') { retrySend(line); return; }
+      if (act === 'print') { openPrintBox(line); return; }
 
       // ── 詳細・入庫情報 ──
       if (act === 'detail') {
@@ -1692,6 +1721,116 @@
       } finally {
         b.disabled = false;
         b.textContent = '🗂 Notionへ送る';
+      }
+    });
+
+    // ─────────── 🏷 値札 (BCシール) 発行 → 倉庫PCの QL-700 ───────────
+    // 入庫時BCシール貼りフラグが「貼付必要」の行にだけボタンを出す。押す前に確認ダイアログ1回。
+    // 結果はサーバーの印刷キューの状態を 5 秒ポーリングで行の下に出す (✅ / ⚠ / ❓)。
+    // 🚨「❓ 結果不明」のときは**もう1回押す前に実物を見る** (二重印刷 = 別の箱に貼られると棚が狂う)
+    const PRINT_ACTIVE = ['queued', 'leased', 'submitted'];
+    // 「BCシール貼付必要」= 出す / 「不要」「－」= 出さない。⚠「不要」は「要」を含むので部分一致にしない
+    const SEAL_NO = /^(不要|無|無し|なし|－|-|ー|―)$/;
+    const SEAL_YES = /(必要|貼付|有|あり)/;
+    function sealNeeded(l) {
+      const s = String(l.info && l.info.bc_seal ? l.info.bc_seal : '').trim();
+      return !!s && !SEAL_NO.test(s) && SEAL_YES.test(s);
+    }
+    function printAgents() { return state.print_agents || []; }
+    function printBtnHtml(l) {
+      // 印刷できる倉庫PCが1台も登録されていなければ出さない (押しても出ないボタンを見せない)
+      if (!sealNeeded(l) || printAgents().length === 0) return '';
+      const j = l.print_job;
+      if (j && PRINT_ACTIVE.includes(j.state)) return '<button type="button" class="btn-seal" disabled>🖨 印刷中…</button>';
+      if (!barcodeType(l.barcode)) return '';
+      const label = j && j.state === 'unknown' ? '🏷 もう一度発行' : (j && j.state === 'completed' ? '🏷 追加で発行' : '🏷 シール発行');
+      return '<button type="button" class="btn-seal" data-act="print">' + label + '</button>';
+    }
+    function printJobHtml(l) {
+      const j = l.print_job;
+      if (!j) return '';
+      const at = j.finished_at || j.updated_at;
+      let extra = '';
+      if (j.state === 'unknown') extra = '<br><b>もう1回押す前に実物を見る</b>';
+      else if (j.state === 'manual') extra = '<br>P-touch で手で刷ってください';
+      else if (j.state === 'failed' && j.error) extra = '<br>' + esc(String(j.error).slice(0, 60));
+      return '<div class="pjob s-' + esc(j.state) + '">' + esc(j.label || j.state) + ' <small>' + j.copies + '枚 ' + esc(fmtJst(at)) + '</small>' + extra + '</div>';
+    }
+    // JAN = 数字だけ / FNSKU = 英字を含む英数字 (サーバー・エージェントと同じ規則)
+    function barcodeType(bc) {
+      const s = String(bc == null ? '' : bc).trim();
+      if (!s) return null;
+      if (/^[0-9]+$/.test(s)) return 'jan';
+      if (/^[A-Za-z0-9]+$/.test(s) && /[A-Za-z]/.test(s)) return 'fnsku';
+      return null;
+    }
+    let printLine = null;
+    let printReqId = null;   // ダイアログを開くたびに1つ。同じ依頼の再送は同じIDで送る (2枚出ない)
+    function openPrintBox(line) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      const agents = printAgents();
+      if (agents.length === 0) { banner('warn', '値札を印刷する倉庫PCが登録されていません (管理画面で印刷エージェントを登録)'); return; }
+      printLine = line;
+      printReqId = newId();
+      const type = barcodeType(line.barcode);
+      const pack = line.pack_qty || '';
+      const copies = Math.min(50, Math.max(1, pack ? Math.ceil(line.planned_qty / pack) : 1));
+      const first = agents.find(a => a.online) || agents[0];
+      const opts = agents.map(a => '<option value="' + a.id + '"' + (a.id === first.id ? ' selected' : '') + '>' + esc(a.label) + ' — ' + esc(a.printer_name || '(プリンター未登録)') + (a.online ? '' : ' (応答なし)') + '</option>').join('');
+      const warn = [];
+      if (!first.online) warn.push('倉庫PCの印刷係がしばらく応答していません。押しても出ないときは倉庫PCの電源・スリープを確認してください');
+      if (first.bpac === false) warn.push('倉庫PCに b-PAC が入っていないため、いまは印刷できません');
+      if (first.paper_ok === false) warn.push('QL-700 に用紙「値札 62x67」が登録されていないため、印刷に失敗します');
+      $('#printBody').innerHTML =
+        '<div class="fld"><label>商品</label><div class="ro"><b>' + esc(line.product_name) + '</b><br><small>' + esc(line.product_id) + '</small></div></div>'
+        + '<div class="fld"><label>バーコード</label><div class="ro">' + esc(line.barcode || '') + ' <small>(' + (type ? type.toUpperCase() : '不明') + ')</small></div></div>'
+        + '<div class="fld"><label>入数 (シールに印字。空欄なら印字しない)</label><input type="number" inputmode="numeric" min="1" step="1" id="printPack" value="' + esc(pack) + '" placeholder="未登録"></div>'
+        + '<div class="fld"><label>枚数 (1〜50。目安 = 予定 ' + line.planned_qty + ' 個 ÷ 入数)</label><input type="number" inputmode="numeric" min="1" max="50" step="1" id="printCopies" value="' + copies + '"></div>'
+        + '<div class="fld"><label>出力先 (倉庫PC)</label>' + (agents.length > 1 ? '<select id="printTarget">' + opts + '</select>'
+          : '<div class="ro" data-target="' + first.id + '">' + esc(first.label) + ' — ' + esc(first.printer_name || '') + (first.online ? '' : ' <small>(応答なし)</small>') + '</div>') + '</div>'
+        + (warn.length ? '<div class="pwarn">⚠ ' + warn.map(esc).join('<br>⚠ ') + '</div>' : '');
+      $('#printMsg').textContent = '';
+      $('#printOk').disabled = false;
+      $('#printBox').classList.add('on');
+    }
+    function closePrintBox() { $('#printBox').classList.remove('on'); printLine = null; }
+    $('#printCancel').addEventListener('click', closePrintBox);
+    $('#printOk').addEventListener('click', async () => {
+      const line = printLine;
+      if (!line || !state.batch) return;
+      const packEl = $('#printPack'), copiesEl = $('#printCopies'), sel = $('#printTarget');
+      const packRaw = packEl ? String(packEl.value || '').trim() : '';
+      const copies = copiesEl ? Number(copiesEl.value) : NaN;
+      const msgEl = $('#printMsg');
+      if (packRaw && (!/^\d+$/.test(packRaw) || Number(packRaw) < 1)) { msgEl.textContent = '入数は1以上の整数で入れてください (空欄なら印字しません)'; return; }
+      if (!Number.isInteger(copies) || copies < 1 || copies > 50) { msgEl.textContent = '枚数は 1〜50 で入れてください'; return; }
+      const tEl = $('#printBody') && $('#printBody').querySelector ? $('#printBody').querySelector('[data-target]') : null;
+      const target = sel ? Number(sel.value) : (tEl ? Number(tEl.getAttribute('data-target')) : null);
+      $('#printOk').disabled = true;
+      msgEl.textContent = '送信しています…';
+      try {
+        const r = await postJson(API + '/print/jobs', {
+          worker_code: workerCode() || undefined, batch_id: state.batch.id, line_key: line.line_key,
+          copies, pack_qty: packRaw || null, target_device_id: target, client_request_id: printReqId,
+        });
+        const j = r.json || {};
+        if (r.status === 401) { location.href = '/login'; return; }
+        if (j.ok) {
+          line.print_job = j.job;
+          closePrintBox();
+          render(true);
+          banner('ok', '🏷 ' + esc(line.product_name) + ' の値札 ' + j.job.copies + '枚 を倉庫PCに依頼しました。出たら ✅ が行に出ます');
+          setTimeout(() => { if ($('#banner').classList.contains('ok')) banner(null); }, 6000);
+          return;
+        }
+        if (j.error === 'worker_required') { closePrintBox(); openWorkerPick(); return; }
+        if (j.error === 'in_progress' && j.job) { line.print_job = j.job; closePrintBox(); render(true); return; }
+        if (j.error === 'stale_batch') { closePrintBox(); lastJson = ''; load(); return; }
+        msgEl.textContent = j.message || j.error || ('HTTP ' + r.status);
+        $('#printOk').disabled = false;
+      } catch (e) {
+        msgEl.textContent = '送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2枚にはなりません)';
+        $('#printOk').disabled = false;
       }
     });
 

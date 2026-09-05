@@ -29,6 +29,10 @@
 | `/apps/inbound-check/admin` | ポータルセッション (アプリ権限) | 管理画面。CSV 取込はアプリ利用者全員 |
 | `/apps/inbound-check/admin/devices` `/workers` `/history(.csv)` | admin のみ | 端末登録・作業者・履歴 |
 | `/apps/inbound-check/device/exit` (POST) | 端末 | 端末Cookie を外す |
+| `/apps/inbound-check/api/print/jobs` (POST) | 登録端末 or セッション | 🏷 **値札 (BCシール) を倉庫PCの QL-700 から出す** (印刷キューに積む。冪等ID必須) |
+| `/apps/inbound-check/api/print/targets` | 同上 | 印刷できる倉庫PC (印刷エージェント) の一覧 |
+| `/apps/inbound-check/print/next` `/print/:id/status` `/print/:id/submitted` `/print/:id/completed` `/print/heartbeat` | **倉庫PCの印刷エージェントのみ** (`Authorization: Bearer <端末トークン>`・kind=agent) | 印刷キューの pull / 報告 / 生存報告。iPad の端末Cookieでは絶対に通らない |
+| `/apps/inbound-check/admin/devices` (POST `kind:'agent'`) `/admin/devices/:id/printer` `/admin/print-jobs` | admin のみ | 印刷エージェントの登録 (トークンは1回だけ表示)・出力先プリンターの付け替え・直近の印刷ジョブ |
 
 server.js では `requireAppAccess` を掛けずに mount する (端末Cookie を通すため)。認可は router 内で全ルートに掛ける (manifest.json だけ素通し)。
 
@@ -62,6 +66,31 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
     保管ロケの空いているところに入れてよい (中原さん 2026-09-01)。取得失敗ではなく正常な状態なので警告色にしない。
     実測では 16行中5行がこれに当たる (在庫ミラーには在庫0の商品の行が無いため)
 - 保持期間: superseded バッチとその子 = 365日、取込ログ = 90日 (取込時に掃除)
+
+## 🏷 値札 (BCシール) 発行 — 倉庫PCの Brother QL-700 から自動で出す (2026-09-05)
+
+中原さん 2026-09-05:「このアプリからシールを出せるようにしたい。フォーマットは `値札発行.lbx`、データはこのアプリ内の情報から」。
+倉庫PC側 (b-PAC × QL-700 の印刷エージェント) は先に実機テスト済み (AI_reference『システム設計\_tools\倉庫PC_値札印刷エージェント\』)。
+ここはその**サーバー側** = 印刷キュー + iPad のボタン + 管理画面。
+
+```
+iPad 行の「🏷 シール発行」(入庫時BCシール貼りフラグ = 貼付必要 の行にだけ出る)
+  → 確認ダイアログ1回 (商品名・バーコード・入数・枚数・出力先) → POST /api/print/jobs (冪等ID)
+  → f_inbound_check_print_jobs に queued
+  ← 倉庫PCのエージェントが GET /print/next を4秒ごとに pull (Authorization: Bearer <端末トークン>)
+  → b-PAC で値札テンプレに 商品名 / 入数 / JAN or FNSKU を差し込み → QL-700 → POST /print/:id/submitted → /completed
+  → iPad の行に ✅ / ⚠ / ❓ (5秒ポーリングの /api/state に print_job が付く)
+```
+
+- **データは画面の値ではなく active バッチの明細から取る** (商品名・商品ID・バーコード)。入数と枚数は確認ダイアログで人が決めた値 (枚数の既定 = ceil(予定数 ÷ 入数)、上限 50 = エージェントと同じ)
+- バーコードは数字だけ = JAN / 英字を含む英数字 = FNSKU (`apps/inbound-info/nefuda-print.js` と同じ規則)。空・記号入りは積まない (理由を iPad に返す)
+- **出力先は登録済みの印刷エージェント (`f_inbound_check_devices.kind='agent'` + `printer_name`)**。1台なら自動、2台以上なら iPad で選ぶ (勝手に選んで別の実機から出さない)。プリンター名は有効な端末同士で重複不可 (Windows のプリンター名は PC ごとのローカル名)
+- 🚨 **送り状の印刷キュー (apps/packing) との違い = PDF が無い。lease した時点でジョブ JSON を渡している = 紙が出たかもしれない**。だから lease の期限が切れても **queued へ戻さない** (二重印刷より欠落を選ぶ)。状態: `queued → leased → submitted → completed` / `failed` (刷る前の失敗。もう一度押してよい) / `unknown` (報告なし・スプーラー投入後の失敗。**実物を確認**) / `manual` (3分たっても誰も取りに来ない = 倉庫PCが寝ている。自動印刷は取り消し、手で刷る)
+- 冪等: `client_request_id` (UNIQUE) の再送は同じジョブ。同じ明細の進行中ジョブがあるうちは新しく積めない (409 `in_progress`)。終わった後は「追加で発行」できる
+- 遅れて届いた同じ lease の報告 (エージェント再起動後の台帳突合) は `unknown → completed/failed` に上書きする (「実物を確認」より確かな情報を捨てない)
+- 見張り = `sync-job.js startInboundCheckPrintQueueWorker` (Render 内 30秒間隔・`INBOUND_CHECK_PRINT_ENABLED`)。滞留→manual / 報告なし→unknown / `INBOUND_CHECK_PRINT_WEBHOOK` があれば結果を GChat へ (送れた分だけ通知済みにする) / エージェントの heartbeat が10分以内なら jobs-monitor の `nefuda-print-agent` へ ok を中継 (倉庫PCに JOBS_MONITOR_TOKEN を配らない)
+- エージェント側の契約 (JSON の形・状態コード) は `倉庫PC_値札印刷エージェント\README.md`「サーバー側に実装するもの」が正。ここを変えるときは `agent.ps1` も直す
+- テスト: `node scripts/test-inbound-check-print.mjs` (DB 層 + 実 HTTP の認証境界)
 
 ## 数量 (部分確認) — 要件定義 v1.3 §11
 

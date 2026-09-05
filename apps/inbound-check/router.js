@@ -19,7 +19,7 @@ import multer from 'multer';
 import {
   getState, importCsv, getActiveBatch, listBatches, listImportLog, listEvents, eventsCsv,
   applyQuantityEvents, listQuantityEvents, finalizeLine, reopenLine,
-  createDevice, verifyDevice, revokeDevice, listDevices,
+  createDevice, verifyDevice, revokeDevice, listDevices, setAgentPrinter,
   resolveDestination, infoForLine, setExpiryManaged, setPendingExpiry, pendingExpiryFor,
   listDestinations, destinationsCsv, IROHA_YES, IROHA_NO,
   listCompletedSlips, completedSlipsCsv,
@@ -37,6 +37,11 @@ import {
 // updated_by の記録がそこに1つだけある。ここで直に UPDATE すると規則が二重管理になる)
 import { updateInbound, getInbound, addManual } from '../inbound-info/db.js';
 import { queueEnsureImages } from '../picking/images.js';
+// 🏷 値札 (BCシール) 印刷キュー: iPad が積み、倉庫PCの印刷エージェントが /print/* を pull で取りに来る
+import {
+  enqueuePrintJob, leaseNextJob, markSubmitted, markFinished, getJobStatusFor, recordHeartbeat,
+  latestJobsForBatch, listPrintAgents, listPrintJobs, publicJob, PRINT_STATE_LABELS, LEASE_SEC, MAX_COPIES,
+} from './print-queue.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -93,9 +98,15 @@ function access(req, res, next) {
   // 端末登録の画面と API はログイン不要 (登録コード自体が認証。共用 iPad に管理者パスワードを打たせない)
   // 手順書も認証なし: 登録がまだ済んでいない iPad からこそ読まれるページのため (中身は手順だけ)
   if (req.path === '/enroll' || req.path === '/enroll/redeem' || req.path === '/guide') return next();
+  // 🏷 印刷エージェント (倉庫PC) は Cookie ではなく Authorization ヘッダーで名乗る。
+  //   /print/ 配下はここでは素通しし、router.use('/print', requirePrintAgent) が kind='agent' の端末だけを通す
+  //   (iPad の端末Cookieでは絶対に印刷ジョブを取れない)。ルートを列挙しないのは、後から /print/... を
+  //   足したときに「正規のエージェントが access に弾かれる」ズレを作らないため
+  if (req.path === '/print' || req.path.startsWith('/print/')) return next();
   if (hasSessionAccess(req)) { req.icUser = req.session.email; return next(); }
   const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
-  if (device) { req.icDevice = device; return next(); }
+  // エージェントのトークンを Cookie に入れても作業画面には入れない (端末の種別ごとに入口を分ける)
+  if (device && device.kind !== 'agent') { req.icDevice = device; return next(); }
   if (req.path.startsWith('/api/')) return res.status(401).json({ ok: false, error: 'unauthorized', message: 'ログインまたは端末登録が必要です' });
   // ⭐iPad (未登録) は /login ではなく端末登録画面へ送る。
   //   ホーム画面の PWA と Safari は Cookie 保存領域が別なので、PWA 側で登録を完結させる必要がある
@@ -125,6 +136,72 @@ const api = fn => async (req, res) => {
 };
 
 router.use(access);
+
+// ─── 🏷 値札印刷キュー: 倉庫PCの印刷エージェントが pull で取りに来る ───
+// 契約 = AI_reference『システム設計\_tools\倉庫PC_値札印刷エージェント\README.md』「サーバー側に実装するもの」
+// (agent.ps1 が前提にしている API 形状。ここを変えるときはエージェント側も直す)
+/** エージェント認証。**Authorization ヘッダーのみ**で、iPad の端末Cookieは受け付けない */
+function requirePrintAgent(req, res, next) {
+  const m = /^Bearer\s+(\S+)$/.exec(req.headers.authorization || '');
+  const device = m ? verifyDevice(m[1]) : null;
+  if (!device || device.kind !== 'agent') {
+    return res.status(401).json({ ok: false, error: 'unauthorized', message: '印刷エージェントとして認証されていません' });
+  }
+  req.printAgent = device;
+  next();
+}
+// /print/ 配下は**この1行で**エージェント認証を必須にする (個々のルートに付け忘れてもここで止まる)
+router.use('/print', requirePrintAgent);
+
+/** 次に刷るものを1件 lease して返す。無ければ 204 (エージェントは数秒後にまた聞きに来る)。 */
+router.get('/print/next', requirePrintAgent, api((req, res) => {
+  // 出力先プリンターが登録されていない端末には**lease する前に**断る (掴んでから断ると unknown に落ちる)
+  if (!req.printAgent.printer_name) {
+    return res.status(409).json({ ok: false, error: 'no_printer', message: 'この端末に出力先プリンターが登録されていません (管理画面で登録してください)' });
+  }
+  const job = leaseNextJob(req.printAgent);
+  if (!job) return res.status(204).end();
+  res.json({ ok: true, job });
+}));
+
+/** エージェントが再起動したとき、掴んでいたジョブがどうなったか確かめる照会 (自分の lease 分のみ) */
+router.get('/print/:id(\\d+)/status', requirePrintAgent, api((req, res) => {
+  const row = getJobStatusFor(Number(req.params.id), req.printAgent.id);
+  if (!row) return res.status(404).json({ ok: false, error: 'not_found', message: 'このジョブを保持していません' });
+  res.json({ ok: true, job: row });
+}));
+
+router.post('/print/:id(\\d+)/submitted', requirePrintAgent, api((req, res) => {
+  const r = markSubmitted(Number(req.params.id), {
+    deviceId: req.printAgent.id, leaseToken: String(req.body?.lease || ''),
+    spoolJobId: req.body?.spool_job_id ?? null,
+  });
+  if (!r.ok) return res.status(409).json({ ok: false, error: 'not_leased', message: `報告を受け付けられません (${r.reason})` });
+  // replayed = 応答が届かなかった前回と同じ報告。エージェントが「もう投入済み」と分かる
+  res.json({ ok: true, replayed: !!r.replayed });
+}));
+
+router.post('/print/:id(\\d+)/completed', requirePrintAgent, api((req, res) => {
+  // 「刷れた/刷れなかった」は真偽値でしか受け取らない (未指定・"false" を成功扱いにしない)
+  if (typeof req.body?.ok !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_ok', message: 'ok は true / false で送ってください' });
+  const r = markFinished(Number(req.params.id), {
+    deviceId: req.printAgent.id, leaseToken: String(req.body.lease || ''),
+    ok: req.body.ok, error: req.body.error ?? null,
+    // uncertain = 「刷れなかった」と言い切れない (スプーラーに渡した後に落ちた等) → unknown (実物を確認)
+    uncertain: req.body.uncertain === true,
+  });
+  if (!r.ok) return res.status(409).json({ ok: false, error: 'not_leased', message: `報告を受け付けられません (${r.reason})` });
+  res.json({ ok: true, replayed: !!r.replayed, state: r.state });
+}));
+
+router.post('/print/heartbeat', requirePrintAgent, api((req, res) => {
+  const b = req.body || {};
+  recordHeartbeat(req.printAgent.id, {
+    note: b.note ?? null, version: b.version ?? null, bpac: b.bpac, host: b.host ?? null,
+    paperFormat: b.paperFormat ?? null, paperFormatOk: b.paperFormatOk, printerReports: b.printerReports ?? null,
+  });
+  res.json({ ok: true, lease_sec: LEASE_SEC });
+}));
 
 // ─── PWA manifest (ホーム画面追加用) ───
 router.get('/manifest.json', (req, res) => {
@@ -231,12 +308,46 @@ router.get('/', (req, res) => {
 // ─── 作業 API ───
 router.get('/api/state', api((req, res) => {
   const state = getState();
+  // 🏷 明細ごとの最新の値札印刷ジョブ (結果は5秒ポーリングで行に出る) + 印刷できる倉庫PCがいるか
+  if (state.batch) {
+    const jobs = latestJobsForBatch(state.batch.id);
+    for (const l of state.lines) l.print_job = jobs.get(l.line_key) || null;
+  }
+  const agents = listPrintAgents();
   res.json({
     ok: true,
     ...state,
+    print_agents: agents.map(a => ({ id: a.id, label: a.label, printer_name: a.printer_name, online: a.online, bpac: a.bpac, paper_ok: a.paper_ok })),
     workers: listWorkers(false),
     me: { session: req.icUser || null, device: req.icDevice ? { id: req.icDevice.id, label: req.icDevice.label } : null, admin: isAdmin(req) },
   });
+}));
+
+// ─── 🏷 値札 (BCシール) を倉庫PCの QL-700 から出す (iPad の「🏷 シール発行」) ───
+// 中原さん 2026-09-05:「このアプリからシールを出せるようにしたい。データはこのアプリ内の情報から」。
+// 商品名・バーコード・商品IDは**画面の値ではなく active バッチの明細**から取る (改ざん・古い表示を刷らない)。
+// 入数と枚数は確認ダイアログで人が決めた値。冪等ID (client_request_id) で二重タップ・応答消失の再送を1ジョブに畳む
+router.post('/api/print/jobs', checkOrigin, api((req, res) => {
+  const a = actorOf(req, res);
+  if (!a) return;
+  const b = req.body || {};
+  const r = enqueuePrintJob({
+    batchId: intOrNull(b.batch_id), lineKey: String(b.line_key || ''),
+    copies: intOrNull(b.copies), packQty: b.pack_qty == null || b.pack_qty === '' ? null : b.pack_qty,
+    targetDeviceId: b.target_device_id == null || b.target_device_id === '' ? null : intOrNull(b.target_device_id),
+    clientRequestId: b.client_request_id,
+    requestedBy: a.worker, requestedDevice: a.deviceLabel,
+  });
+  if (!r.ok) {
+    const status = r.error === 'in_progress' || r.error === 'stale_batch' ? 409 : r.error === 'not_found' ? 404 : 400;
+    return res.status(status).json(r);
+  }
+  res.json(r);
+}));
+
+// 印刷できる倉庫PC (出力先) の一覧。2台以上あるときは iPad がここから選ぶ
+router.get('/api/print/targets', api((req, res) => {
+  res.json({ ok: true, max_copies: MAX_COPIES, agents: listPrintAgents() });
 }));
 
 function resolveWorker(req) {
@@ -627,6 +738,10 @@ router.get('/admin', requireSession, api(async (req, res) => {
     importLog: listImportLog(20),
     devices: isAdmin(req) ? listDevices() : [],
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
+    // 🏷 値札印刷エージェント (倉庫PC) と直近の印刷ジョブ
+    printAgents: isAdmin(req) ? listPrintAgents() : [],
+    printJobs: isAdmin(req) ? listPrintJobs(30) : [],
+    PRINT_STATE_LABELS,
     workers: listWorkers(),   // = スタッフマスタの有効スタッフ (表示のみ。編集は /apps/staff)
     drive,
     notion,
@@ -743,6 +858,20 @@ router.post('/admin/work-master/update', requireAdmin, checkOrigin, api((req, re
 router.post('/admin/devices', checkOrigin, requireAdmin, api((req, res) => {
   const label = String(req.body?.label || '').trim();
   if (!label || label.length > 40) return res.status(400).json({ ok: false, error: 'bad_label', message: '端末名を1〜40文字で入力してください' });
+
+  // 🏷 印刷エージェント (倉庫PC) は iPad と発行導線は同じだが扱いが逆:
+  //   - Cookie ではなく**平文トークンをこの1回だけ画面に表示**する (エージェントの config.json に貼る)
+  //   - 管理者セッションは破棄しない (登録しているのは中原さんの PC で、共用端末ではない)
+  //   - 出力先プリンター名をサーバー側で紐づける (エージェントの設定ミスで別プリンターに出さない)
+  if (String(req.body?.kind || '') === 'agent') {
+    let created;
+    try {
+      created = createDevice(label, req.session.email, { kind: 'agent', printerName: req.body?.printer_name });
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: 'bad_printer', message: e.message });
+    }
+    return res.json({ ok: true, kind: 'agent', id: created.id, token: created.token });
+  }
   const { token, id: deviceId } = createDevice(label, req.session.email);
   req.session.destroy((err) => {
     if (err) {
@@ -765,6 +894,17 @@ router.post('/admin/devices', checkOrigin, requireAdmin, api((req, res) => {
 router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, requireAdmin, api((req, res) => {
   if (!revokeDevice(Number(req.params.id))) return res.status(404).json({ ok: false, error: 'not_found', message: '端末が見つかりません' });
   res.json({ ok: true });
+}));
+
+// 🏷 印刷エージェントの出力先プリンターを付け替える (登録し直さずに直せるように)
+router.post('/admin/devices/:id(\\d+)/printer', checkOrigin, requireAdmin, api((req, res) => {
+  const r = setAgentPrinter(Number(req.params.id), req.body?.printer_name);
+  res.status(r.ok ? 200 : (r.error === 'not_agent' ? 404 : 400)).json(r);
+}));
+
+// 管理画面の「直近の印刷ジョブ」を更新なしで見るための JSON (管理者)
+router.get('/admin/print-jobs', requireAdmin, api((req, res) => {
+  res.json({ ok: true, jobs: listPrintJobs(50).map(j => ({ ...publicJob(j), device_label: j.device_label })), agents: listPrintAgents() });
 }));
 
 // この端末の登録を解除: サーバー側のトークンも失効させてから Cookie を消す (Cookie だけ消すと
