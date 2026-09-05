@@ -39,6 +39,8 @@ function throwsCode(fn, code, name) {
   passed++; console.log(`  ok: ${name}`);
 }
 
+// PR-2 で name/picker/at が付いたので、配賦の中身 (sku/qty/kind) だけを比べる
+const core = (arr) => (arr || []).map(({ sku, qty, kind }) => ({ sku, qty, kind }));
 let op = 0;
 const ev = (batchId, event, extra = {}, worker = '星立夏') =>
   applyEvent(batchId, { opId: `t${++op}`, event, ...extra }, worker);
@@ -134,8 +136,8 @@ t('梱包画面: 配賦された伝票に 🕒 バッジ (kind=later)', () => {
   const st = getWorkState(packA);
   const bySeq = new Map(st.slips.map((s) => [s.seq, s.pickingShortages]));
   assert.equal(bySeq.get(1).length, 0, '無傷の伝票には出ない');
-  assert.deepEqual(bySeq.get(2), [{ sku: 'testsku', qty: 1, kind: 'later' }]);
-  assert.deepEqual(bySeq.get(3), [{ sku: 'testsku', qty: 1, kind: 'later' }]);
+  assert.deepEqual(core(bySeq.get(2)), [{ sku: 'testsku', qty: 1, kind: 'later' }]);
+  assert.deepEqual(core(bySeq.get(3)), [{ sku: 'testsku', qty: 1, kind: 'later' }]);
 });
 
 // ═══ ③ back: 未着手なら取り下げ・対応中なら拒否 ═══════════════════════════
@@ -184,7 +186,7 @@ t('none: 配賦は kind=none・依頼なし・展開なし', () => {
 
 t('none: 梱包画面は ❌ バッジ・伝票は保留にしない', () => {
   const st = getWorkState(packB);
-  assert.deepEqual(st.slips[0].pickingShortages, [{ sku: 'testsku', qty: 1, kind: 'none' }]);
+  assert.deepEqual(core(st.slips[0].pickingShortages), [{ sku: 'testsku', qty: 1, kind: 'none' }]);
   assert.equal(st.slips[0].status, 'pending', '保留にはしない (表示のみ — 要件§4.4)');
 });
 

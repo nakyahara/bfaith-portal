@@ -518,9 +518,11 @@
 
       const warns = (s.warns || []).map((w) => `<span class="warn-badge">${esc(WARN_LABELS[w] || w)}</span>`).join('');
       // ピッキング欠品の配賦バッジ (欠品フローv2 PR2)。この伝票に入るはずの商品が足りない
+      // 商品名で読む (SKU コードだけだと梱包者は商品を特定できない — 例外処理監査 U-23)
+      const pname = (p) => p.name ? `${esc(p.name)} <small>${esc(p.sku)}</small>` : esc(p.sku);
       const pshort = (s.pickingShortages || []).map((p) => p.kind === 'none'
-        ? `<span class="warn-badge" style="background:#ffe3e3; border-color:#e03131; color:#c92a2a;">❌ ピッキング欠品: どのロケにもありません (${esc(p.sku)} × ${p.qty})</span>`
-        : `<span class="warn-badge" style="background:#fff3bf; border-color:#f08c00; color:#e8590c;">🕒 ピッキング欠品: 後で取りに行きます (${esc(p.sku)} × ${p.qty})</span>`).join('');
+        ? `<span class="warn-badge" style="background:#ffe3e3; border-color:#e03131; color:#c92a2a;">❌ ピッキング欠品: どのロケにもありません — ${pname(p)} × ${p.qty}</span>`
+        : `<span class="warn-badge" style="background:#fff3bf; border-color:#f08c00; color:#e8590c;">🕒 ピッキング欠品: 3階が後で取りに行きます — ${pname(p)} × ${p.qty}</span>`).join('');
       // 明細数に応じた表示密度 (スクロールなしで全明細が見えるように)
       $('paper').dataset.density = s.lines.length <= 1 ? '1' : s.lines.length <= 3 ? '2' : '3';
       const lines = s.lines.map((l) => `
@@ -603,20 +605,22 @@
       // 完了取消リンク: 最後に完了した伝票を閲覧中のときだけ
       $('undoLink').style.display = (!viewingPending && !viewingHeld && viewSeq === lastDoneSeq) ? 'block' : 'none';
       // 再ピック保留の伝票: 受領/取下げボタン (受領はピッカーが「持って行った」後のみ活性)
-      $('repickLink').style.display = (viewingHeld && repickSet.has(viewSeq)) ? 'block' : 'none';
       const ready = repickReadySet.has(viewSeq);
-      // 🚫 3階「在庫なし」の報告がある伝票: 「⏳待ち」で待たせ続けず、赤い箱で知らせて「在庫なしを確認」を出す
-      const na = viewingHeld ? (stockoutBySlip[viewSeq] || []) : [];
+      // 🚫 3階「在庫なし」の報告がある伝票 (保留中の再ピックで unavailable / 未処理の伝票に ❌ どこにもない):
+      // 「⏳待ち」で待たせ続けず、赤い箱で知らせて「在庫なしを確認」を出す (PR-2 で ❌ の伝票にも)
+      const na = stockoutBySlip[viewSeq] || [];
+      $('repickLink').style.display = ((viewingHeld && repickSet.has(viewSeq)) || na.length) ? 'block' : 'none';
       $('stockoutBox').style.display = na.length ? 'block' : 'none';
       if (na.length) {
         $('stockoutList').innerHTML = na.map((t) =>
-          `🚫 <b>${esc(t.product_name || t.sku)}</b> × ${t.unavailable_qty ?? t.req_qty}${(t.fulfilled_qty || 0) > 0 ? ` <small>(${t.fulfilled_qty}個は他ロケから届きます)</small>` : ''} — 3階: ${esc(t.claimed_by || t.requested_by || '-')} ${jstHm(t.updated_at)}`).join('<br>');
+          `🚫 <b>${esc(t.product_name || t.sku)}</b> <small>${esc(t.sku)}</small> × ${t.unavailable_qty ?? t.req_qty}${(t.fulfilled_qty || 0) > 0 ? ` <small>(${t.fulfilled_qty}個は他ロケから届きます)</small>` : ''} — ${t.source === 'picking' ? 'ピッキング時に「どのロケにもない」' : '再ピックで「在庫なし」'}: ${esc(t.claimed_by || t.requested_by || '-')} ${jstHm(t.updated_at)}`).join('<br>');
         // ボタンはサーバーが許可する伝票にだけ (他の商品の再ピック中・未送信候補ありは 409 になる — Codex R1)
         const canAck = stockoutAckSet.has(viewSeq);
         $('stockoutAckBtn').style.display = canAck ? '' : 'none';
         $('stockoutWait').style.display = canAck ? 'none' : '';
       }
-      $('receiveBtn').style.display = (na.length && !ready) ? 'none' : '';
+      $('receiveBtn').style.display = (!viewingHeld || (na.length && !ready)) ? 'none' : '';
+      $('foundBtn').style.display = viewingHeld ? '' : 'none';
       $('receiveBtn').disabled = !ready;
       $('receiveBtn').textContent = ready ? '📦 再ピック品を受け取った (再開)' : '⏳ 再ピック対応待ち…';
       $('prevBtn').disabled = viewSeq <= 1;

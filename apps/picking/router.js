@@ -25,7 +25,7 @@ import {
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
   getPickingStats, getTodayProgress, getMissStats, statsRange, loadStatsLines, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
-import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask } from './service.js';
+import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask, announceShortageToPacking } from './service.js';
 import { notifyShortage, notifyShortageUndo } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
@@ -401,6 +401,8 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     }
     // 「後で取りに行く」を梱包タスクへ展開 (梱包が取込済みなら即・未取込なら reconcile が追いつく)
     try { bindPendingLaterRequests(); } catch { /* fail-soft */ }
+    // 1階の全端末へ 🕒/❌ のバナー (配賦した伝票ごと・対象伝票へのリンク付き — 例外処理監査 PR-2)
+    try { announceShortageToPacking(batchId, Number(req.body.line_seq), worker.name); } catch (e) { console.warn(`[picking] 欠品バナー失敗: ${e.message}`); }
   }
   // 欠品記録の取消 (back) は通知先へ訂正を流す (通知は消せないので追送 — Codex R1)
   if (req.body.event === 'back' && !result.replayed && undoneShortage) {

@@ -107,6 +107,12 @@
     const jstHm = (iso) => { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; };
     const TASK_LABEL = { requested: '⏳ ピッカー対応待ち', claimed: '🏃 ピッカーが取りに行っています', fulfilled: '✅ 届きました' };
   %>
+  <script>
+    // ブラウザ側でも時刻を JST の HH:MM にする (伝票情報の 🕒/❌ 行用)
+    function jstHm(iso) { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; }
+  </script>
+  <%
+  %>
   <% if (liveRun) { %>
     <div class="live-bar <%= isPaused ? 'paused' : 'running' %>">
       <span><%= isPaused ? '⏸ 計測停止中 (一時中断)' : `⏱ 計測中 — ${liveLabel}` %></span>
@@ -255,6 +261,23 @@
       <div class="phase-card" id="reqCard">
         <h2>📮 伝票ごとの依頼 <span class="sub">再ピック・サイズ変更・再印刷</span></h2>
         <div class="phase-meta" style="font-size:.9rem; color:#555">紙で作業していても、伝票を選べばここから依頼できます (梱包画面と同じ経路で届きます)。</div>
+        <%# ❌ ピッキング時の「どこにもない」(PR-2): 3階がもう探した商品。再依頼せず「在庫なしを確認」で出荷保留にする %>
+        <% const noneSlips = slipList.filter((x) => x.status === 'pending' && (x.pickingShortages || []).some((p) => p.kind === 'none')); %>
+        <% if (noneSlips.length > 0) { %>
+          <div style="margin-top:10px; font-weight:700; color:#c92a2a">❌ ピッキング時に「どのロケにもない」 <%= noneSlips.length %> 件 — 3階に無い商品です (再ピック依頼は不要)</div>
+          <% for (const ns of noneSlips) { %>
+            <div class="open-req stockout" data-seq="<%= ns.seq %>">
+              <div class="grow">#<%= ns.seq %> <%= ns.slipNo %> / <%= ns.recipientName || '' %> (NE <%= ns.neSlipNo %>)
+                <% for (const p of ns.pickingShortages) { %>
+                  <div style="color:<%= p.kind === 'none' ? '#c92a2a' : '#e8590c' %>; font-weight:700"><%= p.kind === 'none' ? '❌' : '🕒' %> <%= p.name || p.sku %> <span class="sub">(<%= p.sku %>)</span> × <%= p.qty %> — <%= p.kind === 'none' ? 'どのロケにもありません' : '後で取りに行きます' %> — 3階 <%= p.picker || '-' %> <%= jstHm(p.at) %></div>
+                <% } %>
+              </div>
+              <% if (ackSet.has(ns.seq)) { %>
+                <button type="button" class="danger" onclick="stockoutAck(<%= ns.seq %>)">🚫 在庫なしを確認 → 出荷保留にする (事務へ通知)</button>
+              <% } %>
+            </div>
+          <% } %>
+        <% } %>
         <% if (heldSlips.length > 0 || incList.length > 0 || stockoutSlips.length > 0) { %>
           <div style="margin-top:10px; font-weight:700">進行中の依頼</div>
           <% for (const hs of heldSlips) {
@@ -269,6 +292,9 @@
                const nameOf = (sku) => (hs.lines.find((l) => l.sku === sku) || {}).name || sku; %>
             <div class="open-req <%= ready ? 'ready' : (na.length ? 'stockout' : '') %>" data-seq="<%= hs.seq %>">
               <div class="grow">#<%= hs.seq %> <%= hs.slipNo %> / <%= hs.recipientName || '' %> (NE <%= hs.neSlipNo %>)
+                <% for (const p of (hs.pickingShortages || [])) { %>
+                  <div style="color:<%= p.kind === 'none' ? '#c92a2a' : '#e8590c' %>"><%= p.kind === 'none' ? '❌' : '🕒' %> ピッキング欠品: <%= p.name || p.sku %> × <%= p.qty %> — <%= p.kind === 'none' ? 'どのロケにもありません' : '3階が後で取りに行きます' %> (<%= p.picker || '-' %> <%= jstHm(p.at) %>)</div>
+                <% } %>
                 <% for (const c of cands) { %>
                   <div>📝 <%= nameOf(c.sku) %> × <%= c.qty %> — <b>未送信</b>
                     <button type="button" class="danger" onclick="resolveInc(<%= c.id %>, 'confirm')">ピッキングへ送信</button>
@@ -501,6 +527,7 @@
       const stockout = x.status === 'cancelled' && x.holdReason === 'stockout';
       info.innerHTML = `<div class="nm">${esc(slipLabel(x))}</div>`
         + `<div>配送方法: ${esc(x.deliveryMethod || '—')}${x.siteOrderNo ? ` / 受注番号: ${esc(x.siteOrderNo)}` : ''}${held ? ' / <b>⏳ 再ピック保留中</b>' : ''}${stockout ? ' / <b style="color:#c92a2a">🚫 出荷保留 (在庫なし)</b>' : ''}</div>`
+        + (x.pickingShortages || []).map((p) => `<div style="color:${p.kind === 'none' ? '#c92a2a' : '#e8590c'}; font-weight:700">${p.kind === 'none' ? '❌' : '🕒'} ピッキング欠品: ${esc(p.name || p.sku)} × ${p.qty} — ${p.kind === 'none' ? 'どのロケにもありません (再ピック依頼は不要・「在庫なしを確認」へ)' : '3階が後で取りに行きます'} (${esc(p.picker || '-')} ${jstHm(p.at)})</div>`).join('')
         + x.lines.map((l) => `<div>・${esc(l.name)} <span class="sub">(${esc(l.sku)})</span> × <b>${l.qty}</b></div>`).join('');
       info.style.display = 'block';
       // 出荷保留 (在庫なし) で閉じた伝票には再ピック依頼を出さない (事務が NE で扱う)

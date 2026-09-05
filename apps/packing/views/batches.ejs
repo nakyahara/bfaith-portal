@@ -132,6 +132,11 @@
               <span class="match-warn">⚠ <%= b.match_status === 'no_picking' ? 'ピッキング未取込' : 'ピッキング不一致' %></span>
             <% } %>
             <% if (b.worker) { %><span>👤 <%= b.worker %></span><% } %>
+            <%# 欠品まわりの待ち (PR-2): どのバッチが1階の確認 / 3階の再ピックを待っているかを一覧で %>
+            <% const sh = b.shortage || {}; %>
+            <% if (sh.stockoutWait > 0) { %><span class="st" style="background:#ffe3e3; color:#c92a2a; font-weight:700">🚫 在庫なし <%= sh.stockoutWait %> (要確認)</span><% } %>
+            <% if (sh.repickWait > 0) { %><span class="st" style="background:#fff3bf; color:#e8590c; font-weight:700">⏳ 再ピック待ち <%= sh.repickWait %></span><% } %>
+            <% if (sh.closed > 0) { %><span class="st" style="background:#f1f3f5; color:#868e96">出荷保留 <%= sh.closed %></span><% } %>
           </div>
         </div>
         <div class="card-actions">

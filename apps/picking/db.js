@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 15;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -327,6 +327,13 @@ const MIGRATIONS = {
     db.exec('ALTER TABLE pk_floor_alerts ADD COLUMN task_id INTEGER');
     db.exec('ALTER TABLE pk_floor_alerts ADD COLUMN resolved_at TEXT');
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_floor_alerts_task ON pk_floor_alerts(task_id, kind)');
+  },
+  // v15: バナーの汎用キー (例外処理監査 PR-2)。ピッカーの欠品 (🕒後で/❌どこにもない) を1階の全端末へ出すバナーは
+  //   タスクではなく配賦 (受注) に紐づくので、'alloc:<batch>:<seq>:<ne_slip_no>' を ref_key に持ち、
+  //   back で取り消したとき・1階が閉じたときに ref_key で解決する
+  15: () => {
+    db.exec('ALTER TABLE pk_floor_alerts ADD COLUMN ref_key TEXT');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_floor_alerts_ref ON pk_floor_alerts(ref_key)');
   },
 };
 
