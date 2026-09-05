@@ -37,7 +37,26 @@ function requireJudgeKey(req, res, next) {
   next();
 }
 
+// ── 呼び出し回数の上限 (プロセス内・1 分の窓) ──
+// 1 日の呼び出しは出荷の回数 (数回) + やり直し程度。キー漏洩やランチャーの再送ループで
+// 同期処理 (判定 + SQLite INSERT) がイベントループを塞ぎ続けるのを防ぐ
+export const RATE_LIMIT = { windowMs: 60_000, maxCalls: 30 };
+const callTimes = [];
+function rateLimit(req, res, next) {
+  const now = Date.now();
+  while (callTimes.length && now - callTimes[0] > RATE_LIMIT.windowMs) callTimes.shift();
+  if (callTimes.length >= RATE_LIMIT.maxCalls) {
+    res.setHeader('Retry-After', String(Math.ceil((callTimes[0] + RATE_LIMIT.windowMs - now) / 1000)));
+    return res.status(429).json({ ok: false, error: `呼び出しが多すぎます (1分に ${RATE_LIMIT.maxCalls} 回まで)` });
+  }
+  callTimes.push(now);
+  next();
+}
+/** テスト用。窓を空にする */
+export function _resetRateLimit() { callTimes.length = 0; }
+
 router.use(requireJudgeKey);
+// 本体 (server.js) の共通 JSON parser はこの経路を除外している。認証 → ここで初めて body を読む (256kb)
 router.use(express.json({ limit: '256kb' }));
 
 router.get('/health', (_req, res) => {
@@ -51,7 +70,7 @@ router.get('/health', (_req, res) => {
   });
 });
 
-router.post('/batch', (req, res) => {
+router.post('/batch', rateLimit, (req, res) => {
   try {
     const r = judgeBatch({
       slip_nos: req.body?.slip_nos,

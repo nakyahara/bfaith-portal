@@ -38,6 +38,11 @@ const eq = (a, b, what) => {
   ins.run('S4', 'teikeigai', 'Yahoo', 'y-4', '{broken', '2026-09-05T00:30:00.000Z');              // 壊れた JSON
   ins.run('S5', 'teikeigai', 'Yahoo', 'y-5', items([['SKU-A', 2]]), '2026-09-05T00:30:00.000Z');  // 2個・大文字
   ins.run('S6', 'teikeigai', 'Yahoo', 'y-6', items([['sku-a', 1.5]]), '2026-09-05T00:30:00.000Z'); // 小数の数量
+  ins.run('S7', '', 'Yahoo', 'y-7', items([['sku-a', 1]]), '2026-09-05T00:30:00.000Z');             // 配送方法が空 (本番は NOT NULL 列)
+  ins.run('S8', 'mystery', 'Yahoo', 'y-8', items([['sku-a', 1]]), '2026-09-05T00:30:00.000Z');      // 未知のコード
+  ins.run('S10', ' TEIKEIGAI ', 'Yahoo', 'y-10', items([['sku-a', 1]]), '2026-09-05T00:30:00.000Z'); // 表記ゆれ
+  ins.run('S11', 'teikeigai', 'Yahoo', 'y-11', JSON.stringify([{ product_code: 'sku-a', qty: 1 }, { qty: 1 }]), '2026-09-05T00:30:00.000Z'); // 1明細だけ壊れている
+  ins.run('S12', 'teikeigai', 'Yahoo', 'y-12', JSON.stringify([{ product_code: 'sku-a', qty: true }]), '2026-09-05T00:30:00.000Z');  // 数量が真偽値
   d.close();
 }
 
@@ -51,7 +56,7 @@ initPostageDB();
   ins.run('sku-nw', '重さ未登録', null, 1, 'chabuto');
 }
 
-const { default: judgeRouter } = await import('./judge-router.js');
+const { default: judgeRouter, _resetRateLimit, RATE_LIMIT } = await import('./judge-router.js');
 const app = express();
 app.use('/apps/postage/judge-api', judgeRouter);
 const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
@@ -83,7 +88,19 @@ await t('伝票番号が空なら 400', async () => { eq((await call({ slip_nos:
 await t('501 件は 400', async () => { eq((await call({ slip_nos: Array.from({ length: 501 }, (_, i) => `X${i}`) })).status, 400); });
 await t('文字列でない伝票番号は 400', async () => { eq((await call({ slip_nos: [{ a: 1 }] })).status, 400); });
 await t('date の形式違いは 400', async () => { eq((await call({ slip_nos: ['S1'], date: '2026/09/05' })).status, 400); });
+await t('実在しない日付 (2026-02-31) は 400 (Date.parse の丸めで通さない)', async () => {
+  const r = await call({ slip_nos: ['S1'], date: '2026-02-31' });
+  eq(r.status, 400); eq(/実在しない/.test((await r.json()).error), true);
+});
+await t('遠すぎる日付 (2 年前 / 1 年後) は 400', async () => {
+  eq((await call({ slip_nos: ['S1'], date: '2024-01-01' })).status, 400);
+  eq((await call({ slip_nos: ['S1'], date: '2027-09-05' })).status, 400);
+});
 await t('壊れた JSON は 400', async () => { eq((await call(null, { raw: '{oops' })).status, 400); });
+await t('256KB を超える本文は 413', async () => {
+  const big = { slip_nos: ['S1'], pad: 'x'.repeat(300 * 1024) };
+  eq((await call(big)).status, 413);
+});
 await t('検証で弾いたときは判定ログに何も残らない', async () => {
   eq(getDB().prepare('SELECT COUNT(*) n FROM pm_print_decisions').get().n, 0);
 });
@@ -108,7 +125,9 @@ await t('不明: 理由つきで「不明 (…)」', async () => {
 await t('定形外でない伝票は対象外 (何も刷らない)', async () => {
   eq(by.S3.status, 'skipped'); eq(by.S3.print_text, ''); eq(by.S3.method_code, 'letterpack'); eq(by.S3.status_label, '対象外');
 });
-await t('壊れた構成は不明 (黙って確定しない)', async () => { eq(by.S4.status, 'unknown'); eq(by.S4.reason, 'no_lines'); });
+await t('壊れた JSON は「構成が壊れている」→ 不明 (黙って確定しない)', async () => {
+  eq(by.S4.status, 'unknown'); eq(by.S4.reason, 'broken_composition'); eq(by.S4.print_text, '不明 (商品構成が壊れている (packing-dispatch の記録が読めない))');
+});
 await t('大文字の商品コードも当たる・数量 2 は重さも厚みも 2 倍', async () => {
   eq(by.S5.status, 'confirmed'); eq(by.S5.weight_g, 35.5); eq(by.S5.thickness_mm, 3);
 });
@@ -126,14 +145,37 @@ await t('判定IDは 6桁日付-4文字 (読み間違えやすい 0/O/1/I/L を�
   }
   eq(new Set(j1.results.map((x) => x.decision_id)).size, 8, '全部違う');
 });
+const j2 = await (await call({ slip_nos: ['S7', 'S8', 'S10', 'S11', 'S12'] })).json();
+const by2 = Object.fromEntries(j2.results.map((x) => [x.slip_no, x]));
+await t('配送方法が空 / 未知のコードは「対象外」にせず不明 (定形外の伝票が黙って空印字にならない)', async () => {
+  eq(by2.S7.status, 'unknown'); eq(by2.S7.reason, 'unknown_method'); eq(by2.S7.print_text, '不明 (配送方法が判定できない)');
+  eq(by2.S8.status, 'unknown'); eq(by2.S8.reason, 'unknown_method'); eq(by2.S8.detail, 'mystery');
+});
+await t('配送方法コードの表記ゆれ (" TEIKEIGAI ") は定形外として判定する', async () => {
+  eq(by2.S10.status, 'confirmed'); eq(by2.S10.method_code, 'teikeigai');
+});
+await t('1 明細でも読めない構成は「壊れている」→ 不明 (読めた 1 商品だけで確定しない)', async () => {
+  eq(by2.S11.status, 'unknown'); eq(by2.S11.reason, 'broken_composition');
+  eq(by2.S12.status, 'unknown'); eq(by2.S12.reason, 'broken_composition', '数量が true');
+  const r = getDB().prepare("SELECT lines_json, composition_source FROM pm_print_decisions WHERE slip_no='S11'").get();
+  eq(r.lines_json, '[]'); eq(r.composition_source, 'packing-dispatch');
+});
+await t('1 分の呼び出し上限を超えると 429 (Retry-After つき)', async () => {
+  _resetRateLimit();
+  let last;
+  for (let i = 0; i < RATE_LIMIT.maxCalls + 1; i++) last = await call({ slip_nos: ['S1'] });
+  eq(last.status, 429); eq(Number(last.headers.get('retry-after')) >= 1, true);
+  _resetRateLimit();
+  eq((await call({ slip_nos: ['S1'] })).status, 200);
+});
 await t('明細そのもの (lines) は応答に含めない (ランチャーには要らない)', async () => { eq('lines' in by.S1, false); });
 
 console.log('\n■ 判定ログ');
 await t('送った伝票が全部ログに残る (対象外も)', async () => {
-  const rows = getDB().prepare('SELECT * FROM pm_print_decisions ORDER BY rowid').all();
+  const rows = getDB().prepare("SELECT * FROM pm_print_decisions WHERE batch_ref='出荷_13' ORDER BY rowid").all();
   eq(rows.length, 8);
   eq(rows.map((r) => r.slip_no), ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S9', 'S1']);
-  eq(rows.every((r) => r.source === 'launcher' && r.batch_ref === '出荷_13'), true);
+  eq(rows.every((r) => r.source === 'launcher'), true);
 });
 await t('印字した文言・金額・構成が固定保存される', async () => {
   const r = getDB().prepare("SELECT * FROM pm_print_decisions WHERE slip_no='S5'").get();
@@ -147,15 +189,21 @@ await t('見つからない伝票は構成なし・出どころ NULL で残る',
   eq(r.lines_json, '[]'); eq(r.composition_source, null); eq(r.method_code, null);
 });
 await t('同じ伝票をもう一度送ると別の判定IDで別レコード (再印字)', async () => {
+  const before = getDB().prepare("SELECT COUNT(*) n FROM pm_print_decisions WHERE slip_no='S1'").get().n;
   const r = await call({ slip_nos: ['S1'] });
   const j = await r.json();
   eq(j.results[0].decision_id !== by.S1.decision_id, true);
-  eq(getDB().prepare("SELECT COUNT(*) n FROM pm_print_decisions WHERE slip_no='S1'").get().n, 3);
+  eq(getDB().prepare("SELECT COUNT(*) n FROM pm_print_decisions WHERE slip_no='S1'").get().n, before + 1);
 });
-await t('料金表が無い日 (改定前) は不明 (no_tariff)', async () => {
-  const r = await call({ slip_nos: ['S1'], date: '2020-01-01' });
-  const j = await r.json();
-  eq(j.tariff, null); eq(j.results[0].reason, 'no_tariff');
+await t('料金表が決まらない日 (有効期間が重なる版がある) は不明 (no_tariff)・API は落ちない', async () => {
+  getDB().prepare("INSERT INTO pm_tariff_versions (name, valid_from) VALUES ('重複版','2025-01-01')").run();
+  try {
+    const r = await call({ slip_nos: ['S1'] });
+    const j = await r.json();
+    eq(r.status, 200); eq(j.tariff, null); eq(j.results[0].reason, 'no_tariff');
+  } finally {
+    getDB().prepare("DELETE FROM pm_tariff_versions WHERE name='重複版'").run();
+  }
 });
 await t('マスタを直せば次の呼び出しから効く (sku-nw に重さを入れる)', async () => {
   getDB().prepare("UPDATE pm_skus SET unit_weight_g=20 WHERE sku_code='sku-nw'").run();

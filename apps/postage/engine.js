@@ -26,6 +26,8 @@ export const UNKNOWN_REASONS = {
   missing_material_thickness: '資材の厚み未登録',
   missing_thickness: '商品の厚み未登録',
   missing_composition: '商品構成が見つからない',
+  broken_composition: '商品構成が壊れている (packing-dispatch の記録が読めない)',
+  unknown_method: '配送方法が判定できない',
   not_teikeigai: '定形外の伝票ではない',
   near_weight_boundary: '重量が料金の境界に近い (要実測)',
   near_thickness_boundary: '厚みがサイズの境界に近い (要実測)',

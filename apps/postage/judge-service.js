@@ -16,10 +16,13 @@ import { judge, UNKNOWN_REASONS } from './engine.js';
 import { getDB, jstToday } from './db.js';
 import { buildContext } from './coverage.js';
 import {
-  readCompositions, normalizeSlipNo, mirrorAvailable, COMPOSITION_SOURCE, TEIKEIGAI_METHOD_CODE,
+  readCompositions, normalizeSlipNo, mirrorAvailable, COMPOSITION_SOURCE, TEIKEIGAI_METHOD_CODE, KNOWN_OTHER_METHOD_CODES,
 } from './composition.js';
 
 export const MAX_SLIPS_PER_CALL = 500;   // 1日の定形外は多くて 90 通。桁違いは呼び方の誤り
+// 判定日として受ける範囲。過去は再印字・検証用に 400 日、未来は翌月の料金改定を試す程度
+const DATE_PAST_DAYS = 400;
+const DATE_FUTURE_DAYS = 45;
 
 export class JudgeInputError extends Error {}
 
@@ -50,8 +53,16 @@ export function newDecisionId(dateYmd) {
 
 function validateDate(v) {
   if (v === undefined || v === null || v === '') return jstToday();
-  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v) || Number.isNaN(Date.parse(`${v}T00:00:00Z`))) {
-    throw new JudgeInputError('date は YYYY-MM-DD で指定してください');
+  // 2026-02-31 は Date.parse が 3/3 に丸めて通してしまう → 往復して同じ文字列になる日付だけ受ける
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) throw new JudgeInputError('date は YYYY-MM-DD で指定してください');
+  const t = Date.parse(`${v}T00:00:00Z`);
+  if (!Number.isFinite(t) || new Date(t).toISOString().slice(0, 10) !== v) {
+    throw new JudgeInputError(`date が実在しない日付です: ${v}`);
+  }
+  const today = Date.parse(`${jstToday()}T00:00:00Z`);
+  const diffDays = (t - today) / 86400000;
+  if (diffDays < -DATE_PAST_DAYS || diffDays > DATE_FUTURE_DAYS) {
+    throw new JudgeInputError(`date は今日から ${DATE_PAST_DAYS} 日前〜${DATE_FUTURE_DAYS} 日後の範囲で指定してください: ${v}`);
   }
   return v;
 }
@@ -88,8 +99,14 @@ export function judgeBatch(input = {}) {
   const actor = shortStr(input.actor, 120);
 
   const ctx = buildContext(date);
-  const compositionAvailable = mirrorAvailable();
-  const comps = compositionAvailable ? readCompositions(slipNos) : new Map();
+  // 構成が読めないときは API を落とさず「全件不明」で返す (印字自体は止めない。紙には「不明」が出る)
+  let compositionAvailable = mirrorAvailable();
+  let comps = new Map();
+  let readError = null;
+  if (compositionAvailable) {
+    try { comps = readCompositions(slipNos); }
+    catch (e) { compositionAvailable = false; readError = e; console.error('[postage judge] packing-dispatch の読み取りに失敗', e); }
+  }
 
   const results = slipNos.map((slipNo) => {
     const comp = comps.get(slipNo) || null;
@@ -97,13 +114,19 @@ export function judgeBatch(input = {}) {
     if (!comp) {
       r = {
         status: 'unknown', reason: 'missing_composition', reasonLabel: UNKNOWN_REASONS.missing_composition,
-        detail: compositionAvailable ? 'packing-dispatch に出力の記録が無い' : 'packing-dispatch のデータが読めません',
+        detail: compositionAvailable ? 'packing-dispatch に出力の記録が無い'
+          : (readError ? 'packing-dispatch のデータが読めません (読み取りエラー)' : 'packing-dispatch のデータが読めません'),
       };
-    } else if (comp.method_code !== TEIKEIGAI_METHOD_CODE) {
-      // レターパック等。定形外の判定を当てはめない (何も刷らない)
+    } else if (comp.method_code === TEIKEIGAI_METHOD_CODE) {
+      r = comp.broken
+        ? { status: 'unknown', reason: 'broken_composition', reasonLabel: UNKNOWN_REASONS.broken_composition, detail: null }
+        : judge({ lines: comp.lines }, ctx);
+    } else if (KNOWN_OTHER_METHOD_CODES.has(comp.method_code)) {
+      // レターパック等、登録済みの別配送方法。定形外の判定を当てはめない (何も刷らない)
       r = { status: 'skipped', reason: 'not_teikeigai', reasonLabel: UNKNOWN_REASONS.not_teikeigai, detail: comp.method_code };
     } else {
-      r = judge({ lines: comp.lines }, ctx);
+      // 空・NULL・未知のコード。「対象外」にすると定形外の伝票が黙って空印字になるので不明に落とす
+      r = { status: 'unknown', reason: 'unknown_method', reasonLabel: UNKNOWN_REASONS.unknown_method, detail: comp.method_code || '(空)' };
     }
     const printText = printTextOf(r);
     return {
@@ -122,8 +145,8 @@ export function judgeBatch(input = {}) {
       reason: r.status === 'confirmed' ? null : r.reason,
       reason_label: r.status === 'confirmed' ? null : (r.reasonLabel || null),
       detail: r.status === 'confirmed' ? null : (r.detail || null),
-      method_code: comp?.method_code || null,
-      lines: comp ? comp.lines.map((l) => ({ sku_code: l.sku_code, qty: l.qty })) : [],
+      method_code: comp ? (comp.method_code || null) : null,
+      lines: comp && !comp.broken ? comp.lines.map((l) => ({ sku_code: l.sku_code, qty: l.qty })) : [],
       decision_id: null,   // 保存時に採番
     };
   });
@@ -151,7 +174,7 @@ export function judgeBatch(input = {}) {
             weight_g: row.weight_g, thickness_mm: row.thickness_mm,
             tariff_version_id: ctx.tariff?.tariff_version_id ?? null,
             method_code: row.method_code,
-            composition_source: row.method_code ? COMPOSITION_SOURCE : null,
+            composition_source: comps.has(row.slip_no) ? COMPOSITION_SOURCE : null,
             lines_json: JSON.stringify(row.lines),
             print_text: row.print_text,
             requested_by: actor,

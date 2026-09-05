@@ -322,6 +322,8 @@ app.use((req, res, next) => {
     // /apps/stock-bot は Chat Bearer 検証 (stockBotAuth) 後に専用 parser (256kb) が走る。
     // 認証前に body を読まない (未認可 DoS 面を閉じる)
     if (normalizedPath.startsWith('/apps/stock-bot')) return next();
+    // /apps/postage/judge-api は x-api-key 検証後に専用 parser (256kb) が走る (伝票出しPCのランチャー向け)
+    if (normalizedPath.startsWith('/apps/postage/judge-api')) return next();
     // mirror read API (GET専用、監査S-2で認証追加) への POST も認証前 body parse を避ける
     // (POST は router 側に route が無く 404 になるだけなので parse 不要)。
     if (/^\/apps\/mirror\/api\/(products|sales|status|download)(\/|$)/.test(normalizedPath)) return next();

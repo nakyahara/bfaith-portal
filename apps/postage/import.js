@@ -93,6 +93,9 @@ export function materialFromName(name) {
 
 // 想定外に巨大なファイルで固まらないための上限
 const MAX_ROWS = 20000;
+// 資材の厚みを表から自動で入れる条件: この行数以上で同じ値 / 封筒〜プチ袋として妥当な範囲 (mm)
+export const MATERIAL_THICKNESS_MIN_ROWS = 10;
+export const MATERIAL_THICKNESS_RANGE_MM = [0.5, 10];
 
 /** xlsx / csv → [{__row, sku_code: …}, …] */
 async function readRows(filePath) {
@@ -145,7 +148,9 @@ async function readRows(filePath) {
  * 取込。dryRun=true なら検証だけして DB を変更しない (既定)。
  * @returns {{importRunId, dryRun, applied, issues, summary}}
  */
-export async function importWeightFile(filePath, { dryRun = true, actor = 'system' } = {}) {
+export async function importWeightFile(filePath, {
+  dryRun = true, actor = 'system', materialThicknessMinRows = MATERIAL_THICKNESS_MIN_ROWS,
+} = {}) {
   if (!fs.existsSync(filePath)) throw new Error(`ファイルがありません: ${filePath}`);
   const db = getDB();
   const { rows, sheetName } = await readRows(filePath);
@@ -260,42 +265,6 @@ export async function importWeightFile(filePath, { dryRun = true, actor = 'syste
     bySku.get(sku).push({ row: r.__row, rec, hasError });
   }
 
-  // ── 資材の厚み: 表の値を資材ごとに集め、マスタと突き合わせる ──
-  // マスタに値がある → 違う値が表にあれば注意 (行の値は使わない)
-  // マスタが空     → 表の中で揃っていればその値を入れる (揃っていなければ人に返す)
-  // 要修正の行は数えない (列ズレ行の値を根拠にしない)
-  const thicknessByMaterial = new Map();   // material_code → Map(mm → 行数)
-  for (const entries of bySku.values()) {
-    for (const e of entries) {
-      if (e.hasError || !e.rec.default_material_code || e.rec.material_thickness_mm === null) continue;
-      const m = thicknessByMaterial.get(e.rec.default_material_code) || new Map();
-      m.set(e.rec.material_thickness_mm, (m.get(e.rec.material_thickness_mm) || 0) + 1);
-      thicknessByMaterial.set(e.rec.default_material_code, m);
-    }
-  }
-  const materialThicknessToFill = [];   // [{material_code, mm}]
-  for (const [code, dist] of thicknessByMaterial) {
-    const master = db.prepare('SELECT display_name, thickness_mm FROM pm_materials WHERE material_code=?').get(code);
-    if (!master) continue;
-    const name = master.display_name || code;
-    const sorted = [...dist.entries()].sort((a, b) => b[1] - a[1]);
-    const distText = sorted.map(([mm, n]) => `${mm}mm×${n}行`).join(' / ');
-    if (Number.isFinite(master.thickness_mm)) {
-      for (const [mm, n] of sorted) {
-        if (Math.abs(mm - master.thickness_mm) > 0.05) {
-          addIssue(null, null, 'warn', 'material_thickness_mismatch', '資材の厚み', `${mm}mm`,
-            `資材「${name}」の厚みはマスタでは ${master.thickness_mm}mm です (表では ${mm}mm が ${n}行。行の値は使いません)`);
-        }
-      }
-    } else if (sorted.length === 1) {
-      materialThicknessToFill.push({ material_code: code, mm: sorted[0][0] });
-      addIssue(null, null, 'warn', 'material_thickness_fill', '資材の厚み', `${sorted[0][0]}mm`,
-        `資材「${name}」の厚みがマスタに無いので、表の値 ${sorted[0][0]}mm (${sorted[0][1]}行で一致) を${dryRun ? '取り込むときに入れます' : '入れました'}`);
-    } else {
-      addIssue(null, null, 'warn', 'material_thickness_ambiguous', '資材の厚み', distText,
-        `資材「${name}」の厚みが表の中で揃っていません (${distText})。資材マスタに手で入れてください`);
-    }
-  }
 
   // ── 2周目: SKU 単位で採否を決める ──
   const parsed = new Map();
@@ -318,6 +287,54 @@ export async function importWeightFile(filePath, { dryRun = true, actor = 'syste
       addIssue(entries[0].row, sku, 'warn', 'duplicate_sku', '商品コード', sku, `同じ内容の重複 (${at})`);
     }
     parsed.set(sku, entries[0].rec);
+  }
+
+  // ── 資材の厚み: 表の値を資材ごとに集め、マスタと突き合わせる ──
+  // マスタに値がある → 違う値が表にあれば注意 (行の値は使わない)
+  // マスタが空     → 表の中で揃っていて、行数が十分で、封筒として妥当な値ならその値を入れる。
+  //                  それ以外は人に返す (1 セルの誤入力が全商品の判定に効く列なので、自動で入れる条件は厳しめ)
+  // **採用した SKU の行だけ** 数える (要修正・重複で見送った SKU の行を根拠にしない。Codex R1 P1)
+  const thicknessByMaterial = new Map();   // material_code → Map(mm → 行数)
+  for (const [sku, entries] of bySku) {
+    if (!parsed.has(sku)) continue;
+    for (const e of entries) {
+      if (!e.rec.default_material_code || e.rec.material_thickness_mm === null) continue;
+      const m = thicknessByMaterial.get(e.rec.default_material_code) || new Map();
+      m.set(e.rec.material_thickness_mm, (m.get(e.rec.material_thickness_mm) || 0) + 1);
+      thicknessByMaterial.set(e.rec.default_material_code, m);
+    }
+  }
+  const materialThicknessToFill = [];   // [{material_code, mm}]
+  for (const [code, dist] of thicknessByMaterial) {
+    const master = db.prepare('SELECT display_name, thickness_mm FROM pm_materials WHERE material_code=?').get(code);
+    if (!master) continue;
+    const name = master.display_name || code;
+    const sorted = [...dist.entries()].sort((a, b) => b[1] - a[1]);
+    const distText = sorted.map(([mm, n]) => `${mm}mm×${n}行`).join(' / ');
+    if (Number.isFinite(master.thickness_mm)) {
+      for (const [mm, n] of sorted) {
+        if (Math.abs(mm - master.thickness_mm) > 0.05) {
+          addIssue(null, null, 'warn', 'material_thickness_mismatch', '資材の厚み', `${mm}mm`,
+            `資材「${name}」の厚みはマスタでは ${master.thickness_mm}mm です (表では ${mm}mm が ${n}行。行の値は使いません)`);
+        }
+      }
+    } else if (sorted.length > 1) {
+      addIssue(null, null, 'warn', 'material_thickness_ambiguous', '資材の厚み', distText,
+        `資材「${name}」の厚みが表の中で揃っていません (${distText})。資材マスタに手で入れてください`);
+    } else {
+      const [mm, n] = sorted[0];
+      if (n < materialThicknessMinRows) {
+        addIssue(null, null, 'warn', 'material_thickness_candidate', '資材の厚み', `${mm}mm`,
+          `資材「${name}」の厚みがマスタに無く、表では ${mm}mm ですが ${n}行だけなので自動では入れません (${materialThicknessMinRows}行以上で入れます)。資材マスタに手で入れてください`);
+      } else if (mm < MATERIAL_THICKNESS_RANGE_MM[0] || mm > MATERIAL_THICKNESS_RANGE_MM[1]) {
+        addIssue(null, null, 'warn', 'material_thickness_candidate', '資材の厚み', `${mm}mm`,
+          `資材「${name}」の厚み ${mm}mm は資材の厚みとして不自然です (${MATERIAL_THICKNESS_RANGE_MM[0]}〜${MATERIAL_THICKNESS_RANGE_MM[1]}mm の外)。自動では入れません`);
+      } else {
+        materialThicknessToFill.push({ material_code: code, mm });
+        addIssue(null, null, 'warn', 'material_thickness_fill', '資材の厚み', `${mm}mm`,
+          `資材「${name}」の厚みがマスタに無いので、表の値 ${mm}mm (${n}行で一致) を${dryRun ? '取り込むときに入れます' : '入れました'}`);
+      }
+    }
   }
 
   const insIssue = db.prepare(`INSERT INTO pm_import_issues

@@ -20,19 +20,29 @@ const MIRROR_DB = process.env.POSTAGE_MIRROR_DB || path.join(DATA_DIR, 'warehous
 export const COMPOSITION_SOURCE = 'packing-dispatch';
 /** packing-dispatch の配送方法コード。定形 (110円) も NE 上は「定形外郵便」なので teikeigai に含まれる */
 export const TEIKEIGAI_METHOD_CODE = 'teikeigai';
+/**
+ * packing-dispatch に登録されている「定形外ではない」配送方法コード (apps/packing-dispatch/db.js SHIPPING_METHODS)。
+ * これらだけを「対象外」にする。ここに無いコード・空・NULL は「不明」に落とす
+ * (表記ゆれやデータ破損で定形外の伝票が黙って空印字にならないように)
+ */
+export const KNOWN_OTHER_METHOD_CODES = new Set([
+  'nekopos', 'yupacketpuff', 'takkyu50', 'hatsubarai', 'letterpack', 'aes',
+  'yupack', 'clickpost', 'fukuyama', 'seino',
+]);
 
 function open() {
   return new Database(MIRROR_DB, { readonly: true, fileMustExist: true });
 }
 
-/** packing-dispatch の表が読める状態か (ファイルがあっても表が無い環境 = 未稼働では false)。 */
+// 読むのに要る列。列が足りない旧スキーマ・別物のファイルは「読めない」扱いにする
+const PROBE_SQL = 'SELECT ne_uketsuke_no, shipping_method_code, product_items_json, exported_at FROM pd_shipment_tracking LIMIT 0';
+
+/** packing-dispatch の表が読める状態か (ファイルがあっても表・列が無い環境 = 未稼働では false)。 */
 export function mirrorAvailable() {
   if (!fs.existsSync(MIRROR_DB)) return false;
   try {
     const db = open();
-    try {
-      return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pd_shipment_tracking'").get();
-    } finally { db.close(); }
+    try { db.prepare(PROBE_SQL).all(); return true; } finally { db.close(); }
   } catch {
     return false;
   }
@@ -46,24 +56,32 @@ export function normalizeSlipNo(v) {
 export function normalizeSku(v) {
   return String(v ?? '').normalize('NFKC').trim().toLowerCase();
 }
+export function normalizeMethodCode(v) {
+  return String(v ?? '').normalize('NFKC').trim().toLowerCase();
+}
 
 /**
  * product_items_json → 判定エンジンの明細。
- * 壊れた JSON は空配列 (判定側で no_lines → 不明に落ちる。黙って確定しない)。
- * 数量は変換しない (小数・0 の扱いはエンジンが決める)。
+ *
+ * 1 明細でも読めない (配列でない / 要素がオブジェクトでない / 商品コードが空 / 数量が JSON の数値でない) なら
+ * **構成全体を壊れている扱い** にする (`broken: true`・lines は空)。
+ * 読めた明細だけで判定すると、2 商品のうち 1 つが欠けたまま安い区分で確定してしまう (Codex R1 P1)。
+ * 数量は `Number()` で寄せない: `true` が 1 個として通る。packing-dispatch は数値で保存している。
+ * @returns {{lines: Array<{sku_code, qty, product_name}>, broken: boolean}}
  */
 export function parseItems(json) {
   let items;
-  try { items = JSON.parse(json || '[]'); } catch { return []; }
-  if (!Array.isArray(items)) return [];
-  return items
-    .filter((it) => it && typeof it === 'object')
-    .map((it) => ({
-      sku_code: normalizeSku(it.product_code),
-      qty: it.qty,
-      product_name: typeof it.product_name === 'string' ? it.product_name : null,
-    }))
-    .filter((l) => l.sku_code);
+  try { items = JSON.parse(json ?? '[]'); } catch { return { lines: [], broken: true }; }
+  if (!Array.isArray(items)) return { lines: [], broken: true };
+  const lines = [];
+  for (const it of items) {
+    if (!it || typeof it !== 'object' || Array.isArray(it)) return { lines: [], broken: true };
+    const sku = normalizeSku(it.product_code);
+    if (!sku) return { lines: [], broken: true };
+    if (typeof it.qty !== 'number' || !Number.isFinite(it.qty)) return { lines: [], broken: true };
+    lines.push({ sku_code: sku, qty: it.qty, product_name: typeof it.product_name === 'string' ? it.product_name : null });
+  }
+  return { lines, broken: false };
 }
 
 function chunk(arr, n) {
@@ -74,13 +92,14 @@ function chunk(arr, n) {
 
 /**
  * 伝票番号 → 構成。見つからない伝票は Map に入らない (呼び出し側で「構成なし」にする)。
+ * DB が読めなければ例外 (呼び出し側が「全件不明」にするか決める)。
  * @param {string[]} slipNos 正規化済みの伝票番号
- * @returns {Map<string, {slip_no, method_code, exported_at, shop_name, lines}>}
+ * @returns {Map<string, {slip_no, method_code, exported_at, shop_name, lines, broken}>}
  */
 export function readCompositions(slipNos) {
   const out = new Map();
   const list = [...new Set(slipNos.map(normalizeSlipNo).filter(Boolean))];
-  if (!list.length || !mirrorAvailable()) return out;
+  if (!list.length) return out;
   const db = open();
   try {
     for (const part of chunk(list, 200)) {
@@ -90,12 +109,13 @@ export function readCompositions(slipNos) {
          WHERE ne_uketsuke_no IN (${part.map(() => '?').join(',')})
       `).all(...part);
       for (const r of rows) {
-        out.set(normalizeSlipNo(r.ne_uketsuke_no), {
-          slip_no: normalizeSlipNo(r.ne_uketsuke_no),
-          method_code: r.shipping_method_code,
+        const slip = normalizeSlipNo(r.ne_uketsuke_no);
+        out.set(slip, {
+          slip_no: slip,
+          method_code: normalizeMethodCode(r.shipping_method_code),
           exported_at: r.exported_at,
           shop_name: r.shop_name,
-          lines: parseItems(r.product_items_json),
+          ...parseItems(r.product_items_json),
         });
       }
     }
@@ -128,7 +148,7 @@ export function loadMirrorShipments({ since, until } = {}) {
   const db = open();
   try {
     const params = [TEIKEIGAI_METHOD_CODE];
-    let where = 'shipping_method_code = ? AND exported_at IS NOT NULL';
+    let where = "lower(trim(COALESCE(shipping_method_code, ''))) = ? AND exported_at IS NOT NULL";
     if (since) { where += ' AND exported_at >= ?'; params.push(jstDayStartUtc(since)); }
     if (until) { where += ' AND exported_at < ?'; params.push(jstDayStartUtc(nextDay(until))); }
     const rows = db.prepare(`
@@ -138,7 +158,7 @@ export function loadMirrorShipments({ since, until } = {}) {
     return rows.map((r) => ({
       slip_no: normalizeSlipNo(r.ne_uketsuke_no),
       ship_date: jstDateOf(r.exported_at),
-      lines: parseItems(r.product_items_json),
+      ...parseItems(r.product_items_json),
     })).filter((s) => s.ship_date);
   } finally { db.close(); }
 }

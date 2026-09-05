@@ -49,9 +49,10 @@ async function makeXlsx(file) {
   ws.addRow(['sku-e', 'テスト商品E_長3封', 20, '白ビ袋', '11g', '', '', '1.5cm']);
   // 重さ未登録 (空欄は許す)
   ws.addRow(['sku-f', 'テスト商品F_長3封', '', '茶封筒', '5g', '', '', '0.3cm']);
-  // 重複 (内容が違う) — どちらが正か決まるまで **先頭行も含めて** 取り込まない
-  ws.addRow(['sku-g', 'テスト商品G_長3封', 20, '茶封筒', '5g', '', '', '0.4cm']);
-  ws.addRow(['sku-g', 'テスト商品G_長3封', 99, '茶封筒', '5g', '', '', '0.4cm']);
+  // 重複 (内容が違う) — どちらが正か決まるまで **先頭行も含めて** 取り込まない。
+  // この行の「資材の厚み 0.9cm」は見送る SKU の行なので、茶封筒の厚みの根拠に使ってはいけない
+  ws.addRow(['sku-g', 'テスト商品G_長3封', 20, '茶封筒', '5g', '', '0.9cm', '0.4cm']);
+  ws.addRow(['sku-g', 'テスト商品G_長3封', 99, '茶封筒', '5g', '', '0.9cm', '0.4cm']);
   // 重さ 0 → 入力ミスとして丸ごと見送り
   ws.addRow(['sku-h', 'テスト商品H_長3封', 0, '茶封筒', '5g', '', '', '0.1cm']);
   // 資材の厚みだけ入っていて商品の厚みが空 (2026-09-05 の表で 26 件) → 列ズレではない。商品の厚みは未登録のまま取り込む
@@ -79,6 +80,7 @@ function makeMirror(file) {
     ins.run('M3', 'teikeigai', 'Yahoo', 'y-3', items([['sku-zzz', 1, '表に無い商品']]), '2026-06-02T01:00:00.000Z');
     ins.run('M4', 'teikeigai', 'Yahoo', 'y-4', '{broken', '2026-06-02T01:00:00.000Z');              // 壊れた JSON
     ins.run('M5', 'teikeigai', 'Yahoo', 'y-5', items([['sku-a', 1]]), '2026-05-31T14:59:59.000Z');  // JST 5/31 23:59 → 期間外
+    ins.run('M6', ' Teikeigai ', 'Yahoo', 'y-6', items([['sku-a', 1, 'ミラー商品A']]), '2026-06-02T01:00:00.000Z'); // 表記ゆれでも定形外
   })();
   d.close();
 }
@@ -160,7 +162,8 @@ t('有効期間が重なる料金表があったら判定を止める', () => {
 });
 
 console.log('\n■ 取込 (dry-run)');
-const dry = await importWeightFile(xlsx, { dryRun: true, actor: 'smoke' });
+// fixture は数行しか無いので、資材の厚みの自動登録に要る行数を 2 に下げる (本番既定は 10)
+const dry = await importWeightFile(xlsx, { dryRun: true, actor: 'smoke', materialThicknessMinRows: 2 });
 t('dry-run では pm_skus に入らない', () => {
   eq(getDB().prepare('SELECT COUNT(*) n FROM pm_skus').get().n, 0);
 });
@@ -202,8 +205,15 @@ t('資材列と商品名サフィックスの食い違いを拾う', () => {
   eq(dry.issues.some((i) => i.kind === 'material_mismatch' && i.sku_code === 'sku-e'), true);
 });
 
+t('行数が足りない資材は自動で入れず「手で入れて」と出る (本番既定 10 行)', async () => {
+  const d = await importWeightFile(xlsx, { dryRun: true, actor: 'smoke' });
+  eq(d.issues.some((i) => i.kind === 'material_thickness_fill'), false);
+  const c = d.issues.find((i) => i.kind === 'material_thickness_candidate' && /茶封筒/.test(i.message));
+  eq(!!c && /10行以上/.test(c.message), true, c?.message);
+});
+
 console.log('\n■ 取込 (反映)');
-const applied = await importWeightFile(xlsx, { dryRun: false, actor: 'smoke' });
+const applied = await importWeightFile(xlsx, { dryRun: false, actor: 'smoke', materialThicknessMinRows: 2 });
 t('資材列が空でも商品名の末尾から資材が入る', () => {
   eq(getDB().prepare("SELECT default_material_code m FROM pm_skus WHERE sku_code='sku-b'").get().m, 'shiropuchi');
 });
@@ -237,9 +247,13 @@ t('資材マスタの厚みが空なら、表で揃っている値を入れる (
 t('表の中で揃っていない資材は入れない (白プチ)', () => {
   eq(getDB().prepare("SELECT thickness_mm t FROM pm_materials WHERE material_code='shiropuchi'").get().t, null);
 });
+t('見送った SKU の行 (茶封筒 0.9cm) は厚みの根拠に使われない', () => {
+  // 使われていたら 1mm と 9mm で「揃っていない」になり、1mm は入らなかったはず
+  eq(applied.issues.some((i) => i.kind === 'material_thickness_ambiguous' && /茶封筒/.test(i.message)), false);
+});
 t('人が入れた資材の厚みは表で上書きしない', async () => {
   getDB().prepare("UPDATE pm_materials SET thickness_mm=1.5 WHERE material_code='chabuto'").run();
-  const again = await importWeightFile(xlsx, { dryRun: false, actor: 'smoke' });
+  const again = await importWeightFile(xlsx, { dryRun: false, actor: 'smoke', materialThicknessMinRows: 2 });
   eq(getDB().prepare("SELECT thickness_mm t FROM pm_materials WHERE material_code='chabuto'").get().t, 1.5);
   eq(again.issues.some((i) => i.kind === 'material_thickness_mismatch' && /茶封筒/.test(i.message)), true, '食い違いは注意として出る');
   getDB().prepare("UPDATE pm_materials SET thickness_mm=1 WHERE material_code='chabuto'").run();
@@ -326,14 +340,14 @@ t('増えた分は規格内140円 (30 + 10 + 0.5 = 40.5g・厚さ 20+2 = 22mm)',
 console.log('\n■ packing-dispatch の出力履歴を実績にする (Render)');
 t('読める出どころが両方並ぶ (warehouse が先)', () => { eq(availableSources(), ['warehouse', 'packing-dispatch']); });
 const repM = coverageReport({ since: '2026-06-01', source: 'packing-dispatch' });
-t('定形外 (teikeigai) だけ数える・期間外 (JST 5/31) は入らない', () => {
-  eq(repM.source, 'packing-dispatch'); eq(repM.total, 3, JSON.stringify(repM.byDate));
+t('定形外 (teikeigai・表記ゆれ含む) だけ数える・期間外 (JST 5/31) は入らない', () => {
+  eq(repM.source, 'packing-dispatch'); eq(repM.total, 4, JSON.stringify(repM.byDate));
 });
 t('商品コードは小文字に寄せて突き合わせる (SKU-A → sku-a で定形110円)', () => {
-  eq(repM.confirmed, 1); eq(repM.bands[0].band_code, 'teikei_50');
+  eq(repM.confirmed, 2); eq(repM.bands[0].band_code, 'teikei_50');
 });
-t('壊れた JSON は明細なし → 不明 (黙って確定しない)', () => {
-  eq(repM.reasons.some((r) => r.reason === 'no_lines'), true, JSON.stringify(repM.reasons));
+t('壊れた JSON は「構成が壊れている」→ 不明 (黙って確定しない)', () => {
+  eq(repM.reasons.some((r) => r.reason === 'broken_composition'), true, JSON.stringify(repM.reasons));
 });
 t('出荷日は出力日の JST', () => { eq(repM.byDate.map((d) => d.date).sort(), ['2026-06-01', '2026-06-02']); });
 t('商品名は出力履歴からも引ける', () => {
@@ -341,10 +355,23 @@ t('商品名は出力履歴からも引ける', () => {
   eq(lookupProductName('sku-a'), 'sku-a', 'warehouse があればそちらが先');
 });
 t('伝票番号で構成を引ける (無い伝票は Map に入らない)', () => {
-  const m = readCompositions(['M1', ' M2 ', 'nope']);
-  eq([...m.keys()].sort(), ['M1', 'M2']);
+  const m = readCompositions(['M1', ' M2 ', 'nope', 'M4', 'M6']);
+  eq([...m.keys()].sort(), ['M1', 'M2', 'M4', 'M6']);
   eq(m.get('M1').lines, [{ sku_code: 'sku-a', qty: 1, product_name: 'ミラー商品A' }]);
+  eq(m.get('M1').broken, false);
   eq(m.get('M2').method_code, 'letterpack');
+  eq(m.get('M4').broken, true); eq(m.get('M4').lines, []);
+  eq(m.get('M6').method_code, 'teikeigai', '配送方法コードは trim + 小文字に寄せる');
+});
+t('1 明細でも読めなければ構成全体を壊れている扱い (読めた分だけで判定しない)', async () => {
+  const { parseItems } = await import('./composition.js');
+  eq(parseItems(JSON.stringify([{ product_code: 'sku-a', qty: 1 }, { qty: 1 }])).broken, true, '商品コード欠け');
+  eq(parseItems(JSON.stringify([{ product_code: 'sku-a', qty: true }])).broken, true, '数量が真偽値');
+  eq(parseItems(JSON.stringify([{ product_code: 'sku-a', qty: '2' }])).broken, true, '数量が文字列');
+  eq(parseItems(JSON.stringify([{ product_code: 'sku-a', qty: 2 }, 'x'])).broken, true, '要素が文字列');
+  eq(parseItems('{"a":1}').broken, true, '配列でない');
+  eq(parseItems(JSON.stringify([{ product_code: ' SKU-A ', qty: 2 }])), { lines: [{ sku_code: 'sku-a', qty: 2, product_name: null }], broken: false });
+  eq(parseItems('[]'), { lines: [], broken: false }, '空配列は壊れていない (明細なし → no_lines)');
 });
 t('存在しない出どころを指定したら available:false', () => {
   eq(coverageReport({ since: '2026-06-01', source: 'nope' }).available, true, 'auto 扱い');

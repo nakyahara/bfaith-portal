@@ -155,7 +155,10 @@ export function coverageReport({ since, until, source = 'auto' } = {}) {
 
   for (const s of shipments) {
     const ctx = ctxFor(s.ship_date);
-    const r = judge(s, ctx);
+    // packing-dispatch の記録が壊れている伝票は、読めた明細だけで判定しない (1 商品欠けたまま安い区分になる)
+    const r = s.broken
+      ? { status: 'unknown', reason: 'broken_composition' }
+      : judge(s, ctx);
     const d = byDate.get(s.ship_date) || { date: s.ship_date, total: 0, confirmed: 0 };
     d.total++;
     if (r.status === 'confirmed') {
