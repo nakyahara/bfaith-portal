@@ -581,8 +581,6 @@
       <div class="mname" id="dqName">—</div>
       <div class="msaving" id="dqMsg"></div>
       <div id="dqBody"></div>
-      <div class="mbtns"><button class="btn" id="dqCancel" onclick="closeDq()">やめる</button>
-        <button class="btn primary" id="dqSave" onclick="saveProgress()">保存する</button></div>
       <p class="hint">数え間違いはここで直せます。中断メモは次にやる人が読みます。</p>
     </div>
   </div>
@@ -2394,9 +2392,15 @@ function headNumsHtml(c) {
     (canEditProgress(c) ? '<button class="edit" onclick="openDq(null)">✎ できた数</button>' : '') +
     '</div>';
 }
-/** できた数・中断メモを直せるか。状態を変えられる人なら直せる (作業した本人が直せないと現場が止まる) */
+/**
+ * できた数・中断メモを直せるか。状態を変えられる人なら直せる (作業した本人が直せないと現場が止まる)。
+ * ⭐**棚入待ち・終了は直せない** — そこまで来たら「全部そろった」なので、数だけ書き換えられると意味が崩れる。
+ *   数え間違いに気づいたら、職員が「やり直し」で作業中に戻してから直す (Codex R1 重大1)
+ */
 function canEditProgress(c) {
-  return isApp() && detailSrc !== 'preview' && c.status !== 'closed' && can('task.status.change');
+  return isApp() && detailSrc !== 'preview'
+    && c.status !== 'closed' && c.status !== 'ready_for_stocking'
+    && can('task.status.change');
 }
 /** 中断メモ — 次にやる人が読むもの。カードを開いたらすぐ見えるところに出す (要件 §Y-3) */
 function memoHtml(c) {
@@ -3310,7 +3314,10 @@ function openDq(id) {
   dqTarget = c.id;
   $('#dqName').textContent = c.title;
   $('#dqMsg').textContent = '';
-  $('#dqBody').innerHTML = dqPanelHtml(c, '');
+  // ⭐操作のボタンも許可を見てから描く。静的に置いておくと「許可の無い操作を DOM に描かない」が崩れる (Codex R1 中3)
+  $('#dqBody').innerHTML = dqPanelHtml(c, '') +
+    '<div class="mbtns"><button class="btn" id="dqCancel" onclick="closeDq()">やめる</button>' +
+    '<button class="btn primary" id="dqSave" onclick="saveProgress()">保存する</button></div>';
   openOverlay('#dqOv');
 }
 function closeDq() { if (dqSaving) return; closeOverlay('#dqOv'); dqTarget = null; $('#dqBody').innerHTML = ''; }
@@ -3323,14 +3330,16 @@ async function saveProgress() {
   const v = dqValues('#dqBody');
   if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#dqMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
   dqSaving = true;
-  $('#dqSave').disabled = true; $('#dqCancel').disabled = true;
+  for (const b of ['#dqSave', '#dqCancel']) { const el = $(b); if (el) el.disabled = true; }
   $('#dqMsg').textContent = '保存中…';
   const j = await apiFetch('/api/progress', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id: dqTarget, worker_id: worker.id, expect_version: c.version, done_qty: v.qty, hold_memo: v.memo }),
   });
   dqSaving = false;
-  $('#dqSave').disabled = false; $('#dqCancel').disabled = false;
+  const btnSave = $('#dqSave'), btnCancel = $('#dqCancel');
+  if (btnSave) btnSave.disabled = false;
+  if (btnCancel) btnCancel.disabled = false;
   if (j.ok) {
     applyTask(c, j.task);
     closeOverlay('#dqOv'); dqTarget = null; $('#dqBody').innerHTML = '';

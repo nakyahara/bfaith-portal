@@ -208,7 +208,7 @@ export function listOrphans(limit = 100) {
 // ─── 状態変更 ───
 
 const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, hold_reason_required: 400, close_reason_required: 400, not_found: 404, bad_request: 400,
-  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409, bad_done_qty: 400, bad_hold_memo: 400,
+  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409, bad_done_qty: 400, bad_hold_memo: 400, ready_task: 409,
   notion_mode: 409 };   // 取得後に正本が切り替わった = 競合 (入力不正ではない — Codex PR1 R17)
 export function taskErrorStatus(error) { return HTTP_BY_ERROR[error] || 400; }
 
@@ -223,8 +223,13 @@ export function taskErrorStatus(error) { return HTTP_BY_ERROR[error] || 400; }
  */
 export function normalizeDoneQty(v) {
   if (v === undefined) return { skip: true };
-  if (v === null || v === '') return { value: null };
-  const n = Number(v);
+  if (v === null) return { value: null };
+  // ⚠Number(' ') も Number(true) も Number([]) も数になる。**空白だけは「数えていない」**、
+  //   それ以外の型は受けない — でないと未入力が黙って 0 個になる (Codex R1 軽微4)
+  if (typeof v !== 'number' && typeof v !== 'string') return { error: 'bad_done_qty', message: 'できた数は数で入れてください' };
+  const t = typeof v === 'string' ? v.trim() : v;
+  if (t === '') return { value: null };
+  const n = Number(t);
   if (!Number.isInteger(n) || n < 0) return { error: 'bad_done_qty', message: 'できた数は 0 以上の整数で入れてください' };
   if (n > 1_000_000) return { error: 'bad_done_qty', message: 'できた数が大きすぎます' };
   return { value: n };
@@ -233,7 +238,8 @@ export function normalizeDoneQty(v) {
 export function normalizeHoldMemo(v) {
   if (v === undefined) return { skip: true };
   if (v === null) return { value: null };
-  const t = String(v).trim();
+  if (typeof v !== 'string') return { error: 'bad_hold_memo', message: '中断メモは文字で入れてください' };
+  const t = v.trim();
   if (t.length > 500) return { error: 'bad_hold_memo', message: '中断メモは 500 文字までです' };
   return { value: t === '' ? null : t };
 }
@@ -282,7 +288,9 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   // 棚入待ち・棚入完了は「全部そろってから」(中原さん 2026-09-05)。数えていなくても、そこまで来たら全部できたとみなす。
   // 中断メモは申し送りなので、作業が終わったら消す (消した中身は履歴に残す)
   if (to === 'ready_for_stocking' || (to === 'closed' && closeReason === 'stocked')) {
-    if (t.qty != null) next.done_qty = t.qty;
+    // ⭐つくる数が分からないカードは、できた数も「数えていない」に戻す。
+    //   途中の数 (5 個) をそのまま残すと、それが完成数なのか途中経過なのか分からなくなる (Codex R1 中2)
+    next.done_qty = t.qty ?? null;
     next.hold_memo = null;
   }
   const problems = validateTaskInvariants(next);
@@ -497,6 +505,11 @@ export function setProgress({ taskId, doneQty = undefined, holdMemo = undefined,
     if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
     if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
     if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
+    // ⭐棚入待ち = 「全部そろった」。あとから数だけ書き換えられると、その意味が崩れる (Codex R1 重大1)。
+    //   数え間違いに気づいたら、職員が「やり直し」で作業中に戻してから直す
+    if (t.status === 'ready_for_stocking') {
+      return { ok: false, error: 'ready_task', message: '棚入待ちのカードは「全部そろった」扱いです。直すには職員が作業中に戻してください' };
+    }
     const nextQty = dq.skip ? (t.done_qty ?? null) : dq.value;
     const nextMemo = hm.skip ? (t.hold_memo ?? null) : hm.value;
     if (nextQty === (t.done_qty ?? null) && nextMemo === (t.hold_memo ?? null)) return { ok: true, task: t, already: true };
