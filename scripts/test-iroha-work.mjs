@@ -3325,8 +3325,16 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
       ok(TD.getTask(named) !== null, '消えていない');
       const withPage = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
       db.prepare("UPDATE f_iroha_tasks SET notion_page_id = 'stray-has-page' WHERE id = ?").run(withPage);
-      ok(TD.removeStrayTask({ taskId: withPage }).error === 'not_stray', 'Notion のカードに紐づくものは片づけられない');
+      // ⭐正本が Notion の間は Notion 側で直す。アプリが正本になったら (Notion はもう見ない) 片づけられる (中原さん 2026-09-05)
+      const srcBefore = getMeta('source_of_truth');
+      setMetaValue('source_of_truth', 'notion');
+      ok(TD.removeStrayTask({ taskId: withPage }).error === 'not_stray', '正本が Notion の間は、Notion のカードに紐づくものは片づけられない');
       ok(!TD.listNamelessTasks().some(x => x.id === withPage), '一覧にも出ない');
+      setMetaValue('source_of_truth', 'app');
+      ok(TD.listNamelessTasks().some(x => x.id === withPage), 'アプリが正本なら、名前の無い取込カードも一覧に出る');
+      const rmPage = TD.removeStrayTask({ taskId: withPage, actor: 'admin@test' });
+      ok(rmPage.ok && rmPage.action === 'deleted' && TD.getTask(withPage) === null, 'アプリが正本なら片づけられる (記録が無ければ消える)');
+      setMetaValue('source_of_truth', srcBefore);
       const withDest = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
       db.prepare('UPDATE f_iroha_tasks SET destination_id = 9499 WHERE id = ?').run(withDest);
       ok(TD.removeStrayTask({ taskId: withDest }).error === 'not_stray', '入荷受付の行き先に紐づくものは片づけられない');

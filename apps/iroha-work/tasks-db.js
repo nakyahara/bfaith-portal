@@ -547,11 +547,19 @@ export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = nul
  *   名前が無い (または「(名称なし)」) / Notion のページに紐づかない / 入荷受付の行き先にも紐づかない / まだ終わっていない
  * どれか 1 つでも当てはまらなければ、消す対象ではない
  */
-const STRAY_WHERE = `t.status <> 'closed'
-      AND t.notion_page_id IS NULL AND t.destination_id IS NULL
+/**
+ * 片づけていいカード = 名前が無い・入荷受付の行き先に紐づかない・終わっていない。
+ * ⭐Notion のカードに紐づくものは、正本が Notion の間は片づけない (直すのは Notion 側)。
+ *   アプリが正本になったら Notion は見ないので、名前の無い取込カードも片づけられる (中原さん 2026-09-05 切替後「名称なしの空白が 2 件」)
+ */
+function strayWhere() {
+  return `t.status <> 'closed'
+      AND t.destination_id IS NULL
+      ${sourceOfTruth() === 'app' ? '' : 'AND t.notion_page_id IS NULL'}
       AND (t.product_name IS NULL OR TRIM(t.product_name) = '' OR t.product_name = '(名称なし)')`;
+}
 
-/** 名前のないカード (取込でも入荷受付でもない行)。管理画面で人が見て消すためだけの一覧 */
+/** 名前のないカード (入荷受付由来でない行。Notion 由来は正本がアプリのときだけ)。管理画面で人が見て消すためだけの一覧 */
 export function listNamelessTasks(limit = 50) {
   return getDB().prepare(`SELECT t.id, t.status, t.close_reason, t.product_code, t.product_name, t.qty, t.destination_id, t.notion_page_id,
       t.created_at, t.created_by, t.updated_by,
@@ -560,7 +568,7 @@ export function listNamelessTasks(limit = 50) {
       (SELECT COUNT(*) FROM f_iroha_card_media m WHERE m.task_id = t.id AND m.deleted_at IS NULL AND m.staged_at IS NULL) AS media,
       (SELECT COUNT(*) FROM f_iroha_label_waits w WHERE w.task_id = t.id) AS label_waits
     FROM f_iroha_tasks t
-    WHERE ${STRAY_WHERE}
+    WHERE ${strayWhere()}
     ORDER BY t.id LIMIT ?`).all(Math.max(1, Math.min(200, Number(limit) || 50)));
 }
 
@@ -576,10 +584,12 @@ export function removeStrayTask({ taskId, actor = null, reason = null }) {
     const t = getTask(taskId);
     if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません' };
     // 画面から送られた id をそのまま信じない。消していい条件をここでもう一度確かめる (Codex FB R3)
-    const stray = db.prepare(`SELECT 1 FROM f_iroha_tasks t WHERE t.id = ? AND ${STRAY_WHERE}`).get(t.id);
+    const stray = db.prepare(`SELECT 1 FROM f_iroha_tasks t WHERE t.id = ? AND ${strayWhere()}`).get(t.id);
     if (!stray) {
       return { ok: false, error: 'not_stray',
-        message: 'このカードは片づけの対象ではありません (名前がある / Notion のカードがある / 入荷受付の行き先がある / もう終わっている)' };
+        message: sourceOfTruth() === 'app'
+          ? 'このカードは片づけの対象ではありません (名前がある / 入荷受付の行き先がある / もう終わっている)'
+          : 'このカードは片づけの対象ではありません (名前がある / Notion のカードがある = Notion 側で直す / 入荷受付の行き先がある / もう終わっている)' };
     }
     const n = (sql) => db.prepare(sql).get(t.id).c;
     const used = n('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?')
