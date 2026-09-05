@@ -37,7 +37,7 @@ const workOptionsDDL = (name) => `
 
 // 在庫化タスク / ラベル待ちの DDL (作成と作り直しで共用。列一覧は INSERT … SELECT にも使う)
 const TASKS_COLS = ['id', 'destination_id', 'notion_page_id', 'legacy_status', 'status', 'close_reason', 'facility_code', 'hold_reason_code', 'hold_reason_note',
-  'done_qty', 'hold_memo',
+  'done_qty', 'hold_memo', 'blocked_reason', 'blocked_note', 'blocked_at', 'blocked_by',
   'planned_date', 'priority_class', 'priority_note', 'product_code', 'product_name', 'qty', 'arrival_date', 'ar_no', 'barcode', 'expiry', 'supplier', 'handling',
   'master_snapshot', 'payload', 'started_at', 'ready_at', 'closed_at', 'closed_by', 'cancellation_requested_at', 'cancellation_source',
   'migration_review', 'migration_note', 'import_batch_id', 'external_ready', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
@@ -47,17 +47,25 @@ const tasksDDL = (name) => `
       destination_id   INTEGER,
       notion_page_id   TEXT,
       legacy_status    TEXT,
+      -- ⭐進捗は 4 つ (2026-09-05 案A)。'on_hold' は旧値 — 起動時の移行 (migrateOnHoldToBlocked) で blocked_reason へ写す。
+      --   全 DB が移行し終わるまで CHECK には残す (作り直しのとき旧行を写せなくなるため)
       status           TEXT NOT NULL CHECK (status IN ('not_started','in_progress','on_hold','ready_for_stocking','closed')),
       close_reason     TEXT CHECK (close_reason IS NULL OR close_reason IN ('stocked','cancelled','out_of_scope')),
       -- ⭐NULL = どこが作業するか未定。いろはも正式な割り振り先なので「未定 = いろは」と見なさない (要件 §W-2)
       facility_code    TEXT REFERENCES f_iroha_facilities(code),
+      -- 旧: 保留の理由 (status='on_hold' のときだけ)。案A 以降は書かない (blocked_reason へ)。列は移行の証跡として残す
       hold_reason_code TEXT CHECK (hold_reason_code IS NULL OR hold_reason_code IN ('materials_shortage','label_shortage','awaiting_instruction','other')),
       hold_reason_note TEXT,
       -- ⭐途中まで何個できたか (要件 §Y)。NULL = まだ数えていない。0 (1 個もできていない) と区別する
       done_qty         INTEGER CHECK (done_qty IS NULL OR done_qty >= 0),
-      -- ⭐中断メモ = 次にやる人への申し送り (要件 §Y-3)。「ラベルは貼り終わり、袋詰めの途中」など。
-      --   保留理由「その他」の備考 (hold_reason_note) とは別もの
+      -- ⭐中断メモ = 次にやる人への申し送り (要件 §Y-3)。「ラベルは貼り終わり、袋詰めの途中」など
       hold_memo        TEXT,
+      -- ⭐止まっている理由の札 (要件 §Y-2 = 案A、中原さん 2026-09-05)。進捗 (status) とは別の軸。
+      --   未着手・作業中だけが持てる (棚入待ち・終了はもう作業しない)。「その他」はメモ必須
+      blocked_reason   TEXT CHECK (blocked_reason IS NULL OR blocked_reason IN ('materials_shortage','label_shortage','awaiting_instruction','other')),
+      blocked_note     TEXT,
+      blocked_at       TEXT,
+      blocked_by       TEXT,
       planned_date     TEXT,
       external_ready   INTEGER NOT NULL DEFAULT 0 CHECK (external_ready IN (0,1)),
       priority_class   TEXT,
@@ -91,7 +99,13 @@ const tasksDDL = (name) => `
       CHECK ((status = 'closed') = (close_reason IS NOT NULL)),
       CHECK ((status = 'closed') = (closed_at IS NOT NULL)),
       CHECK ((status = 'on_hold') = (hold_reason_code IS NOT NULL)),
-      CHECK (hold_reason_code IS NULL OR hold_reason_code <> 'other' OR (hold_reason_note IS NOT NULL AND TRIM(hold_reason_note) <> ''))
+      CHECK (hold_reason_code IS NULL OR hold_reason_code <> 'other' OR (hold_reason_note IS NOT NULL AND TRIM(hold_reason_note) <> '')),
+      -- 止まっている理由は 未着手・作業中 だけ (閉じるときに消し忘れた経路があっても DB が止める)
+      CHECK (blocked_reason IS NULL OR status IN ('not_started','in_progress')),
+      CHECK (blocked_reason IS NULL OR blocked_reason <> 'other' OR (blocked_note IS NOT NULL AND TRIM(blocked_note) <> '')),
+      -- 札の 4 列は一組: 理由が無いのにメモ・時刻・人だけ残さない / 理由があるなら いつ止めたか (blocked_at) は必須 (Codex PR #1193 R1 #5)
+      CHECK (blocked_reason IS NOT NULL OR (blocked_note IS NULL AND blocked_at IS NULL AND blocked_by IS NULL)),
+      CHECK (blocked_reason IS NULL OR blocked_at IS NOT NULL)
     );`;
 const TASKS_INDEX_DDL = `
     CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_tasks_destination ON f_iroha_tasks(destination_id) WHERE destination_id IS NOT NULL;
@@ -253,6 +267,10 @@ const TASKS_REQUIRED_DDL = [
   /facility_code\s+TEXT REFERENCES f_iroha_facilities\(code\)/,
   // できた数 (要件 §Y)。列だけ足した版と区別するため CHECK まで見る
   /done_qty\s+INTEGER CHECK \(done_qty IS NULL OR done_qty >= 0\)/,
+  // 止まっている理由 (案A 2026-09-05)。addCol で列だけ足した版は表レベルの CHECK が無いので作り直す
+  /blocked_reason IS NULL OR status IN \('not_started','in_progress'\)/,
+  /blocked_reason IS NOT NULL OR \(blocked_note IS NULL AND blocked_at IS NULL AND blocked_by IS NULL\)/,
+  /blocked_reason IS NULL OR blocked_at IS NOT NULL/,   // 理由があるなら「いつ止めたか」必須 (Codex PR #1193 R2)
 ];
 const LABEL_REQUIRED_DDL = [/REFERENCES f_iroha_tasks/, /label_ordered IN \(0,1\)/, /location IN \('Z','Y','none'\)/, /reattach IN \(0,1\)/, /done IN \(0,1\)/];
 const FK_CHECK_TABLES = ['f_iroha_tasks', 'f_iroha_label_waits', 'f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events'];
@@ -382,6 +400,64 @@ function migrateWorkOptionsSchema(db) {
   console.log(`[iroha-work] f_iroha_work_options を normalized_code 付きに作り直しました (${rows.length}行 → ${merged.size}行)`);
   return true;
 }
+/**
+ * 旧「保留」を「進捗 + 止まっている理由」に写す (要件 §Y-2 = 案A、中原さん 2026-09-05)。
+ *   status='on_hold' → 作業を始めた記録 (started_at) があれば 'in_progress'、無ければ 'not_started'
+ *   hold_reason_code/note → blocked_reason/note、blocked_at = 最後に触った時刻 (止めた時刻は残っていない)
+ * 冪等: on_hold の行が無ければ何もしない。CHECK ((status='on_hold') = (hold_reason_code IS NOT NULL)) は
+ * 両方消すので満たしたまま。件数は操作履歴に残す (後から「いつ何件写したか」を追えるように)
+ */
+/**
+ * 旧「保留」の不整合行を、新しい定義の CHECK ((status='on_hold') = (hold_reason_code IS NOT NULL)) に通る形へ。
+ *   on_hold で理由なし → 'other' + メモ (理由が記録されていなかった旨)。移行 (migrateOnHoldToBlocked) がそのまま札へ写す
+ *   on_hold でないのに理由あり → 理由を消す (古い残骸。何を消したかは操作履歴に残す)
+ * CHECK 付きの表では該当行は存在しえないので、実質 CHECK 無しの古い版だけが対象。冪等
+ */
+function normalizeLegacyHoldRows(db) {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_tasks'").get()) return { fixedNoReason: 0, fixedStray: 0 };
+  const cols = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name);
+  if (!cols.includes('hold_reason_code')) return { fixedNoReason: 0, fixedStray: 0 };
+  const noReason = db.prepare(`UPDATE f_iroha_tasks
+      SET hold_reason_code = 'other',
+          hold_reason_note = COALESCE(NULLIF(TRIM(COALESCE(hold_reason_note, '')), ''), '移行: 保留の理由が記録されていませんでした')
+      WHERE status = 'on_hold' AND hold_reason_code IS NULL`).run().changes;
+  const strays = db.prepare("SELECT id, hold_reason_code FROM f_iroha_tasks WHERE status <> 'on_hold' AND hold_reason_code IS NOT NULL").all();
+  if (strays.length) {
+    db.prepare("UPDATE f_iroha_tasks SET hold_reason_code = NULL, hold_reason_note = NULL WHERE status <> 'on_hold' AND hold_reason_code IS NOT NULL").run();
+  }
+  if (noReason || strays.length) {
+    try {
+      logEvent({ action: 'migration_on_hold_fix', to: `理由なしの保留 ${noReason} 件を「その他」に / 保留でないのに理由が残っていた ${strays.length} 件を消去 (${strays.map((s) => `#${s.id}:${s.hold_reason_code}`).slice(0, 20).join(', ')})`, ok: true });
+    } catch (e) { console.error('[iroha-work] 不整合行の補正の記録に失敗 (補正そのものは完了)', e.message); }
+    console.log(`[iroha-work] 旧「保留」の不整合行を補正: 理由なし ${noReason} 件 / 残骸 ${strays.length} 件`);
+  }
+  return { fixedNoReason: noReason, fixedStray: strays.length };
+}
+
+function migrateOnHoldToBlocked(db) {
+  const cols = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name);
+  if (!cols.includes('blocked_reason')) return 0;
+  const n = db.prepare("SELECT COUNT(*) c FROM f_iroha_tasks WHERE status = 'on_hold'").get().c;
+  if (n === 0) return 0;
+  const now = utcNow();
+  db.transaction(() => {
+    db.prepare(`UPDATE f_iroha_tasks SET
+        blocked_reason = COALESCE(hold_reason_code, 'other'),
+        blocked_note   = CASE WHEN hold_reason_code IS NULL THEN '移行: 保留の理由が記録されていませんでした' ELSE hold_reason_note END,
+        blocked_at     = COALESCE(blocked_at, updated_at, ?),
+        blocked_by     = 'migration:on_hold',
+        status         = CASE WHEN started_at IS NOT NULL THEN 'in_progress' ELSE 'not_started' END,
+        hold_reason_code = NULL, hold_reason_note = NULL,
+        version = version + 1, updated_at = ?, updated_by = 'migration:on_hold'
+      WHERE status = 'on_hold'`).run(now, now);
+    try {
+      logEvent({ action: 'migration_on_hold', to: `${n} 件を「保留」から「進捗 + 止まっている理由」へ写しました`, ok: true });
+    } catch (e) { console.error('[iroha-work] 移行の記録に失敗 (移行そのものは完了)', e.message); }
+  })();
+  console.log(`[iroha-work] 旧「保留」${n} 件を blocked_reason へ移行しました`);
+  return n;
+}
+
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 const enrollHash = (c) => crypto.createHash('sha256').update('iroha-enroll:' + String(c)).digest('hex');
 
@@ -557,6 +633,11 @@ export function createTables(db = getMirrorDB()) {
   // 途中まで何個できたか / 次にやる人への申し送り (要件 §Y。中原さん 2026-09-05)
   addCol('f_iroha_tasks', 'done_qty', 'INTEGER CHECK (done_qty IS NULL OR done_qty >= 0)');
   addCol('f_iroha_tasks', 'hold_memo', 'TEXT');
+  // 止まっている理由の札 (案A 2026-09-05)。表レベルの CHECK は migrateTasksSchema の作り直しで付く
+  addCol('f_iroha_tasks', 'blocked_reason', "TEXT CHECK (blocked_reason IS NULL OR blocked_reason IN ('materials_shortage','label_shortage','awaiting_instruction','other'))");
+  addCol('f_iroha_tasks', 'blocked_note', 'TEXT');
+  addCol('f_iroha_tasks', 'blocked_at', 'TEXT');
+  addCol('f_iroha_tasks', 'blocked_by', 'TEXT');
   addCol('f_iroha_work_sessions', 'master_snapshot', 'TEXT');
   // Drive 側で消えた写真の印 (配信で 404/410 を見たら付け、表示と「前回の完成形」候補から外す。
   // 管理画面の再実行で解除 — Codex R1 #5)
@@ -573,8 +654,14 @@ export function createTables(db = getMirrorDB()) {
   // タスク表の作り直し (facility_code の FK 検査) より前に入れておく
   const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, active, sort_order) VALUES (?, ?, ?, 1, ?)');
   for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.sort_order);
+  // ⭐作り直し (INSERT … SELECT) の前に、旧「保留」の不整合行を CHECK に通る形へ直す。
+  //   CHECK 無しの古い版には「on_hold なのに理由が無い」「on_hold でないのに理由がある」行が残りうる —
+  //   そのまま新しい定義へ写すと CHECK 違反で作り直しごと失敗し、下の移行にも届かない (Codex PR #1193 R1 #1)
+  normalizeLegacyHoldRows(db);
   // タスク表が CHECK/FK 無し (または一部足りない) 古い版なら作り直す (子テーブルの task_id 追加より前に)
   migrateTasksSchema(db);
+  // 旧「保留」(status='on_hold') を「作業中/未着手 + 止まっている理由」へ (案A 2026-09-05)。列が揃った後に 1 回だけ
+  migrateOnHoldToBlocked(db);
   // v1.1 正本化: 作業時間・写真・履歴を task に紐づける (page_id は Notion 時代の証跡として残す — Codex 設計相談 R3)。
   // REFERENCES は宣言する (mirror DB は foreign_keys=ON。存在確認はサービス層でも行う)
   addCol('f_iroha_work_sessions', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');

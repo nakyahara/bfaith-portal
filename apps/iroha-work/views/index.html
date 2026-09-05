@@ -92,6 +92,8 @@
   .tag.today{background:var(--accent-soft);color:var(--accent)}
   .tag.ext{background:var(--amber-soft);color:var(--amber)}
   .tag.ready{background:var(--ok-soft);color:var(--ok)}
+  /* ⛔ 止まっている理由の札 (要件 §Y-2 = 案A)。進捗の札とは別に、赤で先頭に */
+  .tag.blocked{background:var(--danger-soft);color:var(--danger);border:1px solid var(--danger)}
   .st{flex:none;font-size:.8rem;font-weight:700;border-radius:var(--r-sm);padding:6px 10px;cursor:pointer;
     border:1px solid transparent;white-space:nowrap;font-family:var(--font)}
   .st.todo{background:var(--well);color:var(--sub);border-color:var(--line)}
@@ -268,6 +270,29 @@
   .backbar #dstateWrap{margin-left:auto;display:flex}
   .backbar .st{font-size:.92rem;padding:8px 14px}
   .st.ro{cursor:default}   /* 読むだけ (下見・履歴): 状態は札。ボタンにしない */
+  /* ── 詳細の画面下の固定バー (監修 F-1、中原さん 2026-09-05)。
+       はじめる / タイマー / ひとやすみ / できあがり / ⛔止まった を、長い詳細をスクロールしなくても押せる位置に ── */
+  body.detail-open .app{padding-bottom:136px}
+  body.detail-open .toast{bottom:150px}   /* 固定バーに重ねない */
+  .dbar{position:fixed;left:0;right:0;bottom:0;z-index:15;background:var(--surface);border-top:1px solid var(--line);
+    box-shadow:0 -4px 18px rgba(15,23,40,.08);padding:10px 14px calc(10px + env(safe-area-inset-bottom))}
+  .dbar .in{max-width:900px;margin:0 auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .dbar .btn{flex:1 1 150px;min-height:56px;font-size:1.02rem}
+  .dbar .btn.stop{flex:0 1 auto;color:var(--danger);border-color:var(--danger);background:var(--surface)}
+  .dbar .tm{flex:0 0 auto;text-align:center;line-height:1.05;padding:0 6px;min-width:120px}
+  .dbar .tm .t{font-size:2rem;font-weight:700;font-family:var(--num);color:var(--accent);letter-spacing:.03em}
+  .dbar .tm small{display:block;font-size:.7rem;color:var(--faint);font-weight:700;letter-spacing:.08em;margin-top:2px}
+  .dbar .ro{flex:1;color:var(--sub);font-weight:700;font-size:.95rem}
+  /* 止まっている理由の帯 (詳細の上部。読む用) */
+  .blockban{margin-top:10px;background:var(--danger-soft);border:1px solid var(--danger);border-left:5px solid var(--danger);
+    border-radius:var(--r-sm);padding:10px 12px;display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}
+  .blockban .ic{font-size:1.2rem;line-height:1.3}
+  .blockban b{color:var(--danger);font-size:1.05rem}
+  .blockban .sub{display:block;color:var(--sub);font-size:.86rem;margin-top:2px}
+  .blockban .btn{margin-left:auto;min-height:44px;padding:6px 14px;font-size:.92rem}
+  /* ⛔ 止まった の理由ボタン (2 列)。選んだものを赤で */
+  .reasons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+  .reasons .btn.on{outline:2px solid var(--danger);outline-offset:1px;background:var(--danger-soft);border-color:var(--danger);color:var(--danger)}
   .dcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:12px}
   .dhead{display:flex;gap:16px}
   .dhead .thumb{width:120px;height:120px;border-radius:var(--r-sm);background:var(--well);border:1px solid var(--line);
@@ -660,6 +685,8 @@
       <span id="dstateWrap"></span>
     </div>
     <div id="dbody"></div>
+    <!-- 画面下の固定バー (はじめる / タイマー / ひとやすみ / できあがり / ⛔止まった)。renderDetail が許可を見て描く -->
+    <div class="dbar" id="dbar" hidden></div>
   </div>
 
   <!-- ══ ステータス変更ダイアログ ══ -->
@@ -704,6 +731,54 @@
       </div>
       <p class="hint">えらんだ人ぜんぶに、この作業の記録がつきます。あとから足すこともできます。<br>
         名前がないときは、職員の方が管理画面 (パソコン) から追加できます。</p>
+    </div>
+  </div>
+
+  <!-- ══ ⛔ 止まった (要件 §Y-2 = 案A、中原さん 2026-09-05)
+       進捗は変えず「止まっている理由」の札を付ける。作業を始めていなくても押せる ══ -->
+  <div class="overlay" id="blockOv">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="blockTitle">
+      <h3 id="blockTitle" tabindex="-1">⛔ 何で止まりましたか?</h3>
+      <div class="mname" id="blockName">—</div>
+      <div class="msaving" id="blockMsg"></div>
+      <div class="reasons" id="blockReasons"></div>
+      <div id="blockBody"></div>
+      <div class="mbtns">
+        <button class="btn" id="blockCancel" onclick="closeBlock()">やめる</button>
+        <button class="btn primary" id="blockGo" onclick="submitBlock()" disabled>この理由で止める</button>
+      </div>
+      <p class="hint">進捗はそのまま (作業中なら作業中のまま) で、カードに「⛔ ○○で止まっています」の札が付きます。作業中の人のタイマーは止まります。<br>
+        解消したら「▶ 作業をはじめる」で札が外れます。</p>
+    </div>
+  </div>
+
+  <!-- ══ ✅ できあがり → 棚入待ち (監修 B-7 / F-3) ══ -->
+  <div class="overlay" id="doneOv">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="doneTitle">
+      <h3 id="doneTitle" tabindex="-1">✅ できあがりです!</h3>
+      <div class="mname" id="doneName">—</div>
+      <div class="msaving" id="doneMsg"></div>
+      <div id="doneBody"></div>
+      <div class="mbtns">
+        <button class="btn" id="doneLater" onclick="closeDone()">あとで決める</button>
+        <button class="btn primary" id="doneGo" onclick="submitDone()">棚入待ちにする</button>
+      </div>
+      <p class="hint">「棚入待ち」= できあがって、棚に入れるのを待っている状態です。棚に入れたら職員が「終了」にします。</p>
+    </div>
+  </div>
+
+  <!-- ══ 止まっているカードを始める前の確認 ══ -->
+  <div class="overlay" id="unblockOv">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="unblockTitle">
+      <h3 id="unblockTitle" tabindex="-1">⛔ まだ止まっています</h3>
+      <div class="mname" id="unblockName">—</div>
+      <p id="unblockText" style="font-size:1.05rem;font-weight:700;margin:6px 0 14px"></p>
+      <div class="msaving" id="unblockMsg"></div>
+      <div class="mbtns">
+        <button class="btn" onclick="closeUnblock()">まだ</button>
+        <button class="btn primary" id="unblockGo" onclick="confirmUnblock()">はい、解消した → はじめる</button>
+      </div>
+      <p class="hint">「はい」を押すと札が外れて、作業がはじまります。</p>
     </div>
   </div>
 
@@ -837,7 +912,7 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp
 // 状態 → 見た目クラス。Notion 正本 (日本語) とアプリ正本 (値) の両方を引ける
 const ST_CLASS = {
   '未着手': 'todo', '作業中': 'doing', '中断': 'pause', '棚入完了': 'done',
-  not_started: 'todo', in_progress: 'doing', on_hold: 'pause', ready_for_stocking: 'done', closed: 'done',
+  not_started: 'todo', in_progress: 'doing', ready_for_stocking: 'done', closed: 'done',
 };
 const stClass = s => ST_CLASS[s] || 'other';
 /** 画面に出す状態名 (アプリ正本は「保留 · ラベル待ち」のように理由つき) */
@@ -847,7 +922,7 @@ const isApp = () => state.mode === 'app';
 function stName(v) {
   const found = (state.statuses || []).find(s => (s && s.value) === v);
   if (found) return found.label;
-  return ({ not_started: '未着手', in_progress: '作業中', on_hold: '保留', ready_for_stocking: '棚入待ち', closed: '終了' })[v] || v;
+  return ({ not_started: '未着手', in_progress: '作業中', ready_for_stocking: '棚入待ち', closed: '終了' })[v] || v;
 }
 
 let state = { mode: 'notion', cards: [], statuses: [], changeTargets: [], workers: [], refresh: {}, me: {} };
@@ -875,7 +950,7 @@ const can = (name) => detailCaps.includes(name);
 const stateCan = (name) => (state.capabilities || []).includes(name);
 /** 正本が切り替わると状態の値も変わる (未着手 ↔ not_started)。無い値を選んだままだと一覧が空に見えるので「すべて」に戻す */
 function ensureTabValid() {
-  const valid = new Set(['all', ...statusTabs().map(([v]) => v)]);
+  const valid = new Set(['all', 'blocked', ...statusTabs().map(([v]) => v)]);
   if (!valid.has(curTab)) curTab = 'all';
 }
 let worker = null;         // { id, display_name, worker_type }
@@ -985,7 +1060,7 @@ const SNAP_KEY = 'iw_state_snapshot';
 function saveSnapshot(j) {
   try {
     localStorage.setItem(SNAP_KEY, JSON.stringify({ at: Date.now(), mode: j.mode, cards: j.cards, statuses: j.statuses,
-      changeTargets: j.changeTargets, transitions: j.transitions, holdReasons: j.holdReasons, closeReasons: j.closeReasons,
+      changeTargets: j.changeTargets, transitions: j.transitions, blockReasons: j.blockReasons, closeReasons: j.closeReasons,
       facilities: j.facilities, today: j.today, workers: j.workers, refresh: j.refresh, capabilities: j.capabilities }));
   } catch (e) { /* 容量超過・プライベートモードなどは諦める (次の取得で出る) */ }
 }
@@ -994,7 +1069,7 @@ function restoreSnapshot() {
   try { s = JSON.parse(localStorage.getItem(SNAP_KEY) || 'null'); } catch (e) { return false; }
   if (!s || !Array.isArray(s.cards)) return false;
   state = { mode: s.mode || 'notion', cards: s.cards, statuses: s.statuses || [], changeTargets: s.changeTargets || [],
-    transitions: s.transitions || {}, holdReasons: s.holdReasons || [], closeReasons: s.closeReasons || [],
+    transitions: s.transitions || {}, blockReasons: s.blockReasons || [], closeReasons: s.closeReasons || [],
     facilities: s.facilities || [], today: s.today || null,
     // ⭐前回の許可リストは復元しない。正本が変わっていることがあるので、/api/state が返るまでは
     //   何も許さない (つながる前は default-deny — Codex PR1 R12)
@@ -1138,15 +1213,19 @@ function statusTabs() {
 }
 
 function counts() {
-  const c = { all: state.cards.length };
+  const c = { all: state.cards.length, blocked: 0 };
   for (const [v] of statusTabs()) c[v] = 0;
-  for (const card of state.cards) if (c[card.status] != null) c[card.status]++;
+  for (const card of state.cards) {
+    if (c[card.status] != null) c[card.status]++;
+    if (card.blocked) c.blocked++;   // ⛔ 止まっている (進捗とは別の札 — 案A)
+  }
   return c;
 }
 
 function renderTabs() {
   const c = counts();
-  const tabs = [['all', 'すべて'], ...statusTabs()];
+  // 「⛔ 止まっている」は進捗のタブではなく札の絞り込み。1 件以上あるときだけ出す
+  const tabs = [['all', 'すべて'], ...statusTabs(), ...(c.blocked > 0 ? [['blocked', '⛔ 止まっている']] : [])];
   $('#tabs').innerHTML = tabs.map(([key, label]) =>
     '<button class="chip' + (curTab === key ? ' on' : '') + '" onclick="pickTab(\'' + esc(key) + '\')">' +
     esc(label) + ' <span class="num">' + (c[key] ?? 0) + '</span></button>').join('');
@@ -1164,6 +1243,8 @@ function masterSummary(c) {
 
 function rowTags(c) {
   let h = '';
+  // ⛔ 止まっている理由 (案A)。進捗の札とは別。いちばん先に出す (作業できないことが先に分かる)
+  if (c.blocked) h += '<span class="tag blocked">⛔ ' + esc(c.blocked.label) + 'で止まっています</span>';
   if (c.today) h += '<span class="tag today">📌 今日やる</span>';
   if (c.cancellation_requested_at) h += '<span class="tag urgent">⚠ 取消の確認待ち</span>';
   if (c.migration_review) h += '<span class="tag miss">❓ 状態の確認待ち</span>';
@@ -1178,7 +1259,8 @@ function rowTags(c) {
 function visibleCards() {
   const q = $('#q').value.trim().toLowerCase();
   return state.cards.filter(c => {
-    if (curTab !== 'all' && c.status !== curTab) return false;
+    if (curTab === 'blocked') { if (!c.blocked) return false; }
+    else if (curTab !== 'all' && c.status !== curTab) return false;
     if (!q) return true;
     return String(c.title).toLowerCase().includes(q) || String(c.product_code || '').toLowerCase().includes(q);
   });
@@ -1378,9 +1460,13 @@ function colSegHtml() {
 }
 function whenChips() {
   const cards = ((boardState() || {}).cards || []);
-  const n = (v) => (v === 'all' ? cards.length : v === 'none' ? cards.filter(c => !c.when).length : cards.filter(c => c.when === v).length);
-  // 札に出る「いつ」は絞り込みでも選べるようにする (やり残しだけ見たい、があるため — Codex P2 R1)
-  return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定']]
+  const n = (v) => (v === 'all' ? cards.length : v === 'none' ? cards.filter(c => !c.when).length
+    : v === 'blocked' ? cards.filter(c => c.blocked).length : cards.filter(c => c.when === v).length);
+  // 札に出る「いつ」は絞り込みでも選べるようにする (やり残しだけ見たい、があるため — Codex P2 R1)。
+  // 「⛔ 止まっている」は旧「保留」列の代わり (案A: 保留は進捗ではなく札なので、列ではなく絞り込み)。1 件以上あるときだけ
+  const blockedN = cards.filter(c => c.blocked).length;
+  return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定'],
+    ...(blockedN > 0 || curWhen === 'blocked' ? [['blocked', '⛔ 止まっている']] : [])]
     .map(([v, l]) => '<button class="chip' + (curWhen === v ? ' on' : '') + '" data-when="' + v + '">' + l +
       ' <span class="num">' + n(v) + '</span></button>').join('');
 }
@@ -1455,7 +1541,9 @@ function boardCards() {
   const q = ($('#bq').value || '').trim().toLowerCase();
   return ((boardState() || {}).cards || []).filter(c => {
     if (curFacility !== 'all' && (curFacility === 'none' ? !!c.facility_code : c.facility_code !== curFacility)) return false;
-    if (curWhen !== 'all' && (curWhen === 'none' ? !!c.when : c.when !== curWhen)) return false;
+    // 「⛔ 止まっている」は予定の値ではなく札の絞り込み (案A)
+    if (curWhen === 'blocked') { if (!c.blocked) return false; }
+    else if (curWhen !== 'all' && (curWhen === 'none' ? !!c.when : c.when !== curWhen)) return false;
     if (!q) return true;
     return String(c.title).toLowerCase().includes(q) || String(c.product_code || '').toLowerCase().includes(q);
   });
@@ -1498,7 +1586,8 @@ function bcardHtml(c, status) {
   // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
   const grab = isApp() && !bulkIds && (boardCols === 'fac' ? stateCan('task.facility.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
-  const meta = [c.qty != null ? c.qty + ' 個' : null,
+  const meta = [c.blocked ? '⛔ ' + c.blocked.label : null,
+    c.qty != null ? c.qty + ' 個' : null,
     c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
     c.hold_memo ? '📝 メモ' : null,
     c.boxes || null,
@@ -1979,6 +2068,7 @@ function renderPlan() {
 /** 計画画面のカード。理由 (なぜ上に出るか) を必ず添える */
 function pcardHtml(c, actions, grab) {
   const why = [];
+  if (c.blocked) why.push('<span class="urgent">⛔ ' + esc(c.blocked.label) + '</span>');
   if (c.priority) why.push('<span class="' + (c.priority.kind === 'urgent' ? 'urgent' : '') + '">' + esc(c.priority.label) + '</span>');
   if (c.arrival) why.push('<span>入荷 ' + esc(c.arrival) + '</span>');
   why.push(c.size_label ? '<span class="size">' + esc(c.size_label) + '</span>' : '<span>大きさ 不明</span>');
@@ -2399,6 +2489,7 @@ function closeDetail() {
   detailGen++;
   curDetail = null; detailSrc = null; detailCard = null; detailCaps = []; detailMeta = {};
   document.body.classList.remove('detail-open'); clearInterval(tickId);
+  const bar = $('#dbar'); if (bar) { bar.hidden = true; bar.innerHTML = ''; }
 }
 /**
  * 開いているダイアログごと詳細を閉じる (カードが消えた・正本が変わった)。
@@ -2665,7 +2756,7 @@ function renderDetail(c, opts) {
       headNumsHtml(c) +
       headFactsHtml(c) +
       '</div></div>' +
-      sealHtml(c) + careHtml(c) + memoHtml(c) +
+      sealHtml(c) + blockedHtml(c) + careHtml(c) + memoHtml(c) +
       '</div>' +
     prevCardHtml(c) +
 
@@ -2681,6 +2772,11 @@ function renderDetail(c, opts) {
     mediaCardHtml(c) +
     historyCardHtml(c) +
     workCardHtml(c);
+  // 画面下の固定バー (はじめる / タイマー / ひとやすみ / できあがり / ⛔止まった — 監修 F-1)。許可が無ければ出さない
+  const bar = $('#dbar');
+  const barH = barHtml(c);
+  bar.innerHTML = barH;
+  bar.hidden = !barH;
   startTimerTick(c);
   // 60 秒の取り直しでは、読んでいた位置に戻す (先頭へ飛ばさない — Codex PR1 R3)
   if (keepScroll) window.scrollTo(0, scrollY);
@@ -3210,40 +3306,241 @@ async function saveMaster() {
   $('#mvMsg').textContent = '❌ ' + (j.message || '保存できませんでした');
 }
 
-// ── 作業時間カード (作業する人・タイマー・開始/中断/できあがり) ──
+// ─── ⛔ 止まった / 札を外す / ✅ できあがり / 画面下の固定バー (要件 §Y-2 = 案A、中原さん 2026-09-05) ───
+
+/** 詳細上部の帯: 止まっている理由。職員モードなら手で外せる (それ以外は「作業をはじめる」で外れる) */
+function blockedHtml(c) {
+  const b = c.blocked;
+  if (!b) return '';
+  const when = b.at ? fmtDate(b.at) + ' ' + fmtTime(b.at) : '';
+  // 誰が止めたか — 人の名前だけ出す (取込・移行が付けた札は「取込で」)。「(いろはアプリ)」の添え字は落とす
+  const by = !b.by ? '' : /^(import|migration):/.test(b.by) ? '取込' : b.by.replace(/ \(いろはアプリ\)$/, '');
+  const canManual = isApp() && detailSrc !== 'preview' && can('task.block') && stateCan('task.plan.assign');   // 職員モードだけ
+  return '<div class="blockban"><span class="ic" aria-hidden="true">⛔</span><div>' +
+    '<b>' + esc(b.label) + 'で止まっています</b>' +
+    (b.note ? '<span class="sub">' + esc(b.note) + '</span>' : '') +
+    '<span class="sub">' + esc([when, by].filter(Boolean).join(' ・ ')) + (when || by ? ' に止めました。' : '') +
+      '解消したら「▶ 作業をはじめる」で札が外れます</span></div>' +
+    (canManual ? '<button class="btn" onclick="unblockOnly()">札を外す (職員)</button>' : '') + '</div>';
+}
+
+/** 画面下の固定バー。許可が無い (下見・履歴・Notion 正本の読むだけ) なら空 = 出さない */
+function barHtml(c) {
+  // 許可ごとに描く: はじめる/ひとやすみ/できあがり = task.work.start、⛔止まった = task.block。どちらも無ければ出さない
+  const canWork = can('task.work.start');
+  const stopBtn = isApp() && can('task.block') ? '<button class="btn stop" onclick="openBlock()">⛔ 止まった</button>' : '';
+  if (!canWork && !stopBtn) return '';
+  if (c.status === 'closed' || c.status === '棚入完了') return '';
+  if (c.status === 'ready_for_stocking') return canWork ? '<div class="in"><span class="ro">✅ できあがり済み — 棚に入れたら職員が「終了」にします</span></div>' : '';
+  if (!canWork) return '<div class="in">' + stopBtn + '</div>';
+  if (c.active.length) {
+    // 複数人で作業していることがある。タイマーは**いちばん早く始めた人**を基準にする
+    const first = c.active.reduce((a, b) => (Date.parse(a.started_at) <= Date.parse(b.started_at) ? a : b));
+    return '<div class="in">' +
+      '<div class="tm"><div class="t num" id="wt" data-start="' + esc(first.started_at) + '">--:--</div><small>' +
+        (c.active.length > 1 ? c.active.length + '人で作業中' : '作業中') + '</small></div>' +
+      '<button class="btn warn" id="pauseBtn" onclick="stopWork(\'pause\')">⏸ ひとやすみ</button>' +
+      '<button class="btn primary" id="doneBtn" onclick="stopWork(\'done\')">✅ ' + (c.active.length > 1 ? 'みんなできあがり' : 'できあがり') + '</button>' +
+      stopBtn + '</div>';
+  }
+  return '<div class="in"><button class="btn primary" id="startBtn" onclick="openCrew()">▶ 作業をはじめる</button>' + stopBtn + '</div>';
+}
+
+// ── ⛔ 止まった ──
+let blockTarget = null, blockReason = null, blockSaving = false;
+function openBlock() {
+  if (!can('task.block') || !isApp()) return;
+  if (!worker) { openGate(); return; }
+  const c = findCard(curDetail);
+  if (!c) return;
+  if (c.status !== 'not_started' && c.status !== 'in_progress') { showErr('できあがったカードは止められません'); return; }
+  blockTarget = c.id; blockReason = null;
+  $('#blockName').textContent = c.title;
+  $('#blockMsg').textContent = '';
+  renderBlock(c);
+  openOverlay('#blockOv');
+  $('#blockTitle').focus();
+}
+function renderBlock(c) {
+  const rs = state.blockReasons || [];
+  $('#blockReasons').innerHTML = rs.map(r =>
+    '<button type="button" class="btn' + (blockReason === r.value ? ' on' : '') + '" data-block-reason="' + esc(r.value) + '">' + esc(r.button || r.label) + '</button>').join('');
+  // 理由を選んだら、何個までできたか (任意) + メモ。「その他」はメモ必須
+  $('#blockBody').innerHTML = blockReason
+    ? dqPanelHtml(c, '', { memoLabel: blockReason === 'other' ? '何で止まりましたか (必須) — 次にやる人にも見えます' : '中断メモ (任意) — 次にやる人が読みます' })
+    : '<p class="hint">まず理由を 1 つ選んでください。</p>';
+  $('#blockGo').disabled = !blockReason;
+}
+$('#blockReasons').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-block-reason]');
+  if (!b) return;
+  blockReason = b.dataset.blockReason;
+  const c = findCard(blockTarget);
+  if (c) renderBlock(c);
+});
+function closeBlock() { if (blockSaving) return; closeOverlay('#blockOv'); blockTarget = null; blockReason = null; }
+$('#blockOv').addEventListener('click', e => { if (e.target === $('#blockOv')) closeBlock(); });
+async function submitBlock() {
+  if (blockSaving || blockTarget == null || !worker || !blockReason) return;
+  const c = findCard(blockTarget);
+  if (!c) { closeBlock(); return; }
+  const v = dqValues('#blockBody');
+  if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#blockMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
+  if (blockReason === 'other' && !v.memo) { $('#blockMsg').textContent = '❌ 「その他」は何で止まったかをメモに書いてください'; return; }
+  blockSaving = true;
+  for (const id of ['blockGo', 'blockCancel']) document.getElementById(id).disabled = true;
+  $('#blockMsg').textContent = '保存中…';
+  let j;
+  try {
+    j = await apiFetch('/api/block', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      // できた数は入れたときだけ送る (空 = 前の値のまま)。メモも書いたときだけ。
+      // 「その他」のメモは止まった理由 (blocked_note) にだけ入れる — 申し送り (hold_memo) と二重に持たない (Codex PR #1193 R1 #7)
+      body: JSON.stringify({ id: c.id, worker_id: worker.id, reason: blockReason, expect_version: c.version,
+        ...(v.qty != null ? { done_qty: v.qty } : {}),
+        ...(blockReason === 'other' ? { note: v.memo } : (v.memo ? { hold_memo: v.memo } : {})) }),
+    });
+  } finally {
+    blockSaving = false;
+    for (const id of ['blockGo', 'blockCancel']) document.getElementById(id).disabled = false;
+  }
+  if (j.ok) {
+    applyTask(c, j.task);
+    c.active = [];   // タイマーは全員止まった
+    const reason = blockReason;
+    closeOverlay('#blockOv'); blockTarget = null; blockReason = null;
+    renderTabs(); renderList();
+    if (sameId(curDetail, c.id)) renderDetail(c);
+    if (curView === 'board') renderBoard();
+    toast('⛔ 「' + (j.task.blocked ? j.task.blocked.label : '') + 'で止まっています」にしました' +
+      (j.stopped && j.stopped.length ? ' (' + j.stopped.length + '人のタイマーを止めました)' : ''));
+    // ラベルが足りないなら、そのままラベル待ちの記録をつける (発生日・数量・ロケ・記録者は入れておく)
+    if (reason === 'label_shortage' && stateCan('task.label_wait.edit')) setTimeout(() => openLwNew(c), 0);
+    return;
+  }
+  if (j.error === 'conflict' && j.current) { applyTask(c, j.current); if (sameId(curDetail, c.id)) renderDetail(c); }
+  $('#blockMsg').textContent = '❌ ' + (j.message || '止められませんでした');
+}
+
+// ── 止まっているカードを始める前の確認 ──
+let unblockCtx = null;   // { ids }
+let unblockSaving = false;
+function openUnblock(c, ids) {
+  unblockCtx = { ids };
+  $('#unblockName').textContent = c.title || '';
+  const b = c.blocked;
+  $('#unblockText').textContent = b
+    ? 'まだ「' + b.label + '」で止まっています' + (b.note ? '（' + b.note + '）' : '') + '。解消しましたか?'
+    : 'まだ止まっています。解消しましたか?';
+  $('#unblockMsg').textContent = '';
+  openOverlay('#unblockOv');
+  $('#unblockTitle').focus();
+}
+function closeUnblock() { if (unblockSaving) return; closeOverlay('#unblockOv'); unblockCtx = null; }
+async function confirmUnblock() {
+  if (!unblockCtx || unblockSaving) return;
+  const ids = unblockCtx.ids;
+  unblockSaving = true;
+  $('#unblockGo').disabled = true;
+  $('#unblockMsg').textContent = '保存中…';
+  let r;
+  try { r = await startWork(ids, { clearBlock: true }); }
+  finally {
+    unblockSaving = false;
+    $('#unblockGo').disabled = false;
+    $('#unblockMsg').textContent = '';
+  }
+  if (r === true) { closeUnblock(); closeCrew(); }
+}
+/** 職員が手で札を外す (始めはしない) */
+async function unblockOnly() {
+  if (!worker || !curDetail || !can('task.block')) return;
+  const c = findCard(curDetail);
+  if (!c || !c.blocked) return;
+  const j = await apiFetch('/api/unblock', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, worker_id: worker.id, expect_version: c.version }) });
+  if (!j.ok) {
+    if (j.current) { applyTask(c, j.current); renderDetail(c); }
+    showErr(j.message || '札を外せませんでした');
+    return;
+  }
+  applyTask(c, j.task);
+  renderTabs(); renderList(); renderDetail(c);
+  if (curView === 'board') renderBoard();
+  toast('札を外しました');
+}
+
+// ── ✅ できあがり → 棚入待ち (監修 B-7 / F-3) ──
+let doneTarget = null, doneSaving = false;
+function openDone(c) {
+  if (!can('task.status.change')) return;
+  doneTarget = c.id;
+  $('#doneName').textContent = c.title;
+  $('#doneMsg').textContent = '';
+  $('#doneBody').innerHTML = dqPanelHtml(c, '', { title: '何個できましたか', memo: false, defaultAll: true });
+  openOverlay('#doneOv');
+  $('#doneTitle').focus();
+}
+function closeDone() { if (doneSaving) return; closeOverlay('#doneOv'); doneTarget = null; $('#doneBody').innerHTML = ''; }
+$('#doneOv').addEventListener('click', e => { if (e.target === $('#doneOv')) closeDone(); });
+async function submitDone() {
+  if (doneSaving || doneTarget == null || !worker) return;
+  const c = findCard(doneTarget);
+  if (!c) { closeDone(); return; }
+  const v = dqValues('#doneBody');
+  if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#doneMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
+  doneSaving = true;
+  for (const id of ['doneGo', 'doneLater']) document.getElementById(id).disabled = true;
+  $('#doneMsg').textContent = '保存中…';
+  let j;
+  try {
+    j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: c.id, to: 'ready_for_stocking', worker_id: worker.id, expect_version: c.version,
+        ...(v.qty != null ? { done_qty: v.qty } : {}) }) });
+  } finally {
+    doneSaving = false;
+    for (const id of ['doneGo', 'doneLater']) document.getElementById(id).disabled = false;
+  }
+  if (j.ok) {
+    applyTask(c, j.task);
+    c.status = j.status;
+    if (j.status_label) c.status_label = j.status_label;
+    closeOverlay('#doneOv'); doneTarget = null; $('#doneBody').innerHTML = '';
+    renderTabs(); renderList();
+    if (sameId(curDetail, c.id)) renderDetail(c);
+    if (curView === 'board') renderBoard();
+    toast('「棚入待ち」にしました。棚に入れたら職員が「終了」にします');
+    return;
+  }
+  if (j.error === 'conflict' && j.current) { applyTask(c, j.current); c.status = j.current.status; if (sameId(curDetail, c.id)) renderDetail(c); }
+  $('#doneMsg').textContent = '❌ ' + (j.message || '変えられませんでした');
+}
+
+// ── 作業時間カード (作業する人・ぬける・人を追加) ──
 function workCardHtml(c) {
   const canStop = can('task.work.start');
   const chips = c.active.map(a => {
     const el = (nowMs() - Date.parse(a.started_at)) / 1000;
-    // 人ごとに先に上がれる (4人で始めて1人だけ先に抜ける、は普通に起きる)
+    // 人ごとに先に上がれる (4人で始めて1人だけ先に抜ける、は普通に起きる)。「ぬける」= その人のタイマーだけ止める (pause)
     return '<span class="wchip' + (canStop ? '' : ' solo') + '">' + esc(a.worker_name) + ' さん (' + fmtDur(el) + ')' +
-      (canStop ? '<button class="wx" onclick="stopOne(' + a.id + ')">終わった</button>' : '') + '</span>';
+      (canStop ? '<button class="wx" onclick="stopOne(' + a.id + ')">ぬける</button>' : '') + '</span>';
   }).join('');
+  // ⭐はじめる / タイマー / ひとやすみ / できあがり / ⛔止まった は画面下の固定バー (barHtml — 監修 F-1)。ここには残さない
   let controls;
   if (!canStop) {
     // 読むだけ (下見・履歴): 開始・中断・できあがりのボタンは描かない。いま作業中の人だけ見せる
     controls = (c.status === '棚入完了' || c.status === 'closed') ? '<p class="nlink">このカードは終わっています。</p>'
       : (chips ? '' : '<p class="nlink">いま作業している人はいません。</p>');
   } else if (c.active.length) {
-    // 複数人で作業していることがある。タイマーは**いちばん早く始めた人**を基準にする
-    const first = c.active.reduce((a, b) => (Date.parse(a.started_at) <= Date.parse(b.started_at) ? a : b));
-    controls =
-      '<div class="wtimer"><div class="t num" id="wt" data-start="' + esc(first.started_at) + '">--:--</div>' +
-      '<small>' + (c.active.length > 1 ? c.active.length + '人で作業中 ' : '') + '(サーバーで記録しています)</small></div>' +
-      '<div class="wbtns">' +
-      '<button class="btn" onclick="openCrew()">＋ 人を追加</button>' +
-      '<button class="btn warn" id="pauseBtn" onclick="stopWork(\'pause\')">⏸ ちょっと中断 (資材が足りない など)</button>' +
-      '<button class="btn primary" id="doneBtn" onclick="stopWork(\'done\')">✅ ' +
-        (c.active.length > 1 ? 'みんなできあがり' : 'できあがり') + '</button>' +
-      '</div>';
+    controls = '<div class="wbtns"><button class="btn" onclick="openCrew()">＋ 人を追加</button></div>';
   } else if (c.status === '棚入完了' || c.status === 'closed') {
     controls = '<p class="nlink">このカードは終わっています。</p>';
   } else {
-    controls = '<div class="wbtns"><button class="btn primary" id="startBtn" onclick="openCrew()">▶ 作業をはじめる</button></div>';
+    controls = '<p class="nlink">「▶ 作業をはじめる」は画面の下にあります。</p>';
   }
-  // アプリ正本のみ: 今日やる / 後日 (未着手・保留のカード)。一覧では「📌 今日やる」が上に並ぶ
+  // アプリ正本のみ: 今日やる / 後日 (未着手・作業中のカード)。一覧では「📌 今日やる」が上に並ぶ
   let plan = '';
-  if (can('task.plan.assign') && (c.status === 'not_started' || c.status === 'on_hold')) {
+  if (can('task.plan.assign') && (c.status === 'not_started' || c.status === 'in_progress')) {
     plan = '<div class="wbtns" style="margin-top:10px">' +
       '<button class="btn" onclick="setPlanned(' + (c.today ? 'false' : 'true') + ')">' +
       (c.today ? '📌 今日やる をやめる' : '📌 今日やる') + '</button></div>';
@@ -3397,22 +3694,42 @@ async function crewStart() {
   const go = $('#crewGo');
   go.disabled = true;
   $('#crewMsg').textContent = '保存中…';
-  const ok = await startWork(ids);
+  const r = await startWork(ids);
   $('#crewMsg').textContent = '';
-  if (ok) closeCrew();
-  else renderCrew();                    // 断られたら選び直せる状態に戻す
+  if (r === true) closeCrew();
+  else if (r !== 'blocked') renderCrew();   // 断られたら選び直せる状態に戻す。止まっているときは確認ダイアログが上に出ている
 }
 
-/** @param ids 作業する人の worker_id (1件以上)。@returns 開始できたか */
-async function startWork(ids) {
+/**
+ * @param ids 作業する人の worker_id (1件以上)
+ * @param opts { clearBlock } 止まっている札を外して始める (確認ダイアログで「はい」を押した後)
+ * @returns true = 開始できた / 'blocked' = 止まっているので確認を出した / false = 断られた
+ */
+async function startWork(ids, opts) {
   if (!can('task.work.start')) return false;   // 読むだけ (下見・履歴) では始めない
   if (!worker) { openGate(); return false; }
   if (!curDetail || !ids || !ids.length) return false;
+  const cur = findCard(curDetail);
   const j = await apiFetch('/api/sessions/start', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: curDetail, worker_id: worker.id, worker_ids: ids }),
+    // 札を外して始めるときは、確認した版 (expect_version) も送る — 確認している間に理由が付け替わっていたら断られる
+    body: JSON.stringify({ id: curDetail, worker_id: worker.id, worker_ids: ids,
+      ...(opts && opts.clearBlock ? { clear_block: true, expect_version: cur ? cur.version : undefined } : {}) }),
   });
   if (!j.ok) {
+    // ⛔ 止まっている札が付いたまま → 「解消しましたか?」を聞いてから clear_block で送り直す (案A)
+    if (j.error === 'blocked') {
+      if (cur && j.task) applyTask(cur, j.task);
+      openUnblock(cur || { title: '', blocked: j.blocked }, ids);
+      return 'blocked';
+    }
+    // 確認している間に札が変わった (別の端末が理由を付け替えた / 外した) → 最新で描き直して、もう一度確認
+    if (j.error === 'conflict' && opts && opts.clearBlock && cur && j.current) {
+      applyTask(cur, j.current);
+      renderList(); if (sameId(curDetail, cur.id)) renderDetail(cur);
+      if (cur.blocked) { openUnblock(cur, ids); toast('止まっている理由が変わっていました。もう一度確かめてください'); return 'blocked'; }
+      return startWork(ids);   // もう外れていた → 普通に始める
+    }
     showErr(j.message || '作業をはじめられませんでした');
     return false;
   }
@@ -3435,19 +3752,26 @@ async function startWork(ids) {
   return true;
 }
 
-/** その人だけ先に上がる (複数人で始めて1人だけ抜ける)。残りの人はそのまま作業を続ける */
+/**
+ * 「ぬける」— その人だけタイマーを止める (複数人で始めて 1 人だけ帰る)。残りの人はそのまま続ける。
+ * ⭐記録は pause (できあがりではない — 監修 B-6: 旧「終わった」は done で残っていて、最後の 1 人が押すと「できあがりです!」が出ていた)
+ */
 async function stopOne(sessionId) {
   const c = findCard(curDetail);
   const a = c && c.active.find(x => x.id === sessionId);
   if (!a) { showErr('作業の記録が見つかりません。画面を更新します'); loadState(); return; }
-  await stopWork('done', [sessionId]);
+  await stopWork('pause', [sessionId], { leaving: a.worker_name });
 }
 
 /**
- * 作業の終了・中断。既定では**いま作業中の人ぜんぶ**を終わらせる (iPad 1台からまとめて上がる)。
- * @param only 特定のセッションだけ終わらせるとき (「終わった」ボタン)
+ * タイマーを止める。既定では**いま作業中の人ぜんぶ** (iPad 1台からまとめて)。
+ *   pause = ⏸ ひとやすみ (理由なし・札なし。もどったら「作業をはじめる」)
+ *   done  = ✅ できあがり → 全員止まったら「何個できたか → 棚入待ちにする」のダイアログ (監修 B-7 / F-3)
+ * 止まる理由があるとき (ラベル不足など) は stopWork ではなく openBlock (⛔ 止まった) — 札を付けてタイマーも止める
+ * @param only 特定のセッションだけ止めるとき (「ぬける」)
+ * @param opts { leaving: 名前 } ぬける人の名前 (トーストの文言用)
  */
-async function stopWork(reason, only) {
+async function stopWork(reason, only, opts) {
   if (!worker || !curDetail || !can('task.work.start')) return;   // 開始できない画面では終了・中断もしない
   const cNow = findCard(curDetail);
   const ids = only || (cNow ? cNow.active.map(a => a.id) : []).filter(Boolean);
@@ -3469,24 +3793,28 @@ async function stopWork(reason, only) {
     c.active = c.active.filter(a => !done.has(a.id));
     renderList(); renderDetail(c);
   }
-  // ⑤ステータスとの連動は自動にしない: 人が選んで変える。促すのは**全員が離れたとき**だけ
-  //   (だれかが作業中のまま棚入完了を促すと、早まって完了にしてしまう — Codex PR2 #4)
   // 何人ぶん記録したかを出す (「自分の分だけ止まったのでは」と迷わせない)
   const n = (j.stopped || []).length;
   const durText = n > 1 ? n + '人ぶんの作業時間 (合計 ' + fmtDur(j.totalSeconds) + ')' : '作業時間 ' + fmtDur(j.session.raw_seconds);
-  if (j.remainingActive > 0) {
-    toast(durText + ' を記録しました (' + j.remainingActive + '名がまだ作業中)');
+  const rest = j.remainingActive > 0 ? ' (' + j.remainingActive + '名がまだ作業中)' : '';
+  if (opts && opts.leaving) {
+    toast(opts.leaving + ' さんが抜けました (' + fmtDur(j.session.raw_seconds) + ')' + (j.remainingActive > 0 ? rest : '。止まる理由があれば「⛔ 止まった」を押してください'));
     return;
   }
-  toast('おつかれさまでした! ' + durText + ' を記録しました');
   if (reason === 'pause') {
+    toast('ひとやすみ。' + durText + ' を記録しました' + (j.remainingActive > 0 ? rest : '。もどったら「▶ 作業をはじめる」を押してください'));
+    return;
+  }
+  // ✅ できあがり: ステータスとの連動は自動にしない (人が選んで変える)。促すのは**全員が離れたとき**だけ
+  //   (だれかが作業中のまま完了を促すと、早まって完了にしてしまう — Codex PR2 #4)。
+  //   Notion 正本では今までどおり状態変更ダイアログ、アプリ正本では「何個できたか → 棚入待ちにする」(監修 B-7 / F-3)
+  toast('おつかれさまでした! ' + durText + ' を記録しました' + rest);
+  if (j.remainingActive > 0) return;
+  if (isApp() && c) openDone(c);
+  else {
     openSt(null, pid);
     const m = document.getElementById('stMsg');
-    if (m) m.textContent = isApp() ? 'みんな作業から離れました。つづきが後になるなら「保留」を選んでください' : 'みんな作業から離れました。つづきが後になるなら「中断」を選んでください';
-  } else if (reason === 'done') {
-    openSt(null, pid);
-    const m = document.getElementById('stMsg');
-    if (m) m.textContent = isApp() ? 'できあがりです! 棚に入れ終わったら「終了 → 棚入完了」を (職員PINが必要です)' : 'できあがりです! 棚に入れ終わったら「棚入完了」を (職員PINが必要です)';
+    if (m) m.textContent = 'できあがりです! 棚に入れ終わったら「棚入完了」を (職員PINが必要です)';
   }
 }
 function openStFromDetail() { if (curDetail && can('task.status.change')) openSt(null, curDetail); }
@@ -3494,8 +3822,7 @@ function openStFromDetail() { if (curDetail && can('task.status.change')) openSt
 // ─── ステータス変更 (Codex R2 ①: 保存中表示・処理中は全ボタン無効・失敗は大きく) ───
 let stTarget = null;   // カードの id
 let stSaving = false;
-let stStep = null;     // アプリ正本で理由を選んでいる途中 ('on_hold' | 'closed' | 'hold_qty')
-let stHold = null;     // 中断で選んだ理由 { reason, note } (数を聞いている間だけ持つ)
+let stStep = null;     // アプリ正本で終了の理由を選んでいる途中 ('closed')。「止まった」は別ダイアログ (openBlock)
 
 /** アプリ正本で「その変更に職員の本人確認が要るか」(サーバー tasks.js transitionNeedsStaff と同じ規則) */
 const stNeedsStaff = (from, to) => to === 'closed' || from === 'closed' || (from === 'ready_for_stocking' && to === 'in_progress');
@@ -3509,27 +3836,10 @@ function renderStBtns(c) {
     $('#stBtns').innerHTML = (state.changeTargets || []).map(s => stBtn(s, s, s === c.status)).join('');
     return;
   }
-  if (stStep === 'on_hold') {
-    // よく使う 2 つ (ラベル待ち・資材不足) を先に。文言は「〜で中断」(中原さん 2026-09-03)
-    const order = ['label_shortage', 'materials_shortage'];
-    const rs = [...(state.holdReasons || [])].sort((a, b) =>
-      (order.indexOf(a.value) < 0 ? 9 : order.indexOf(a.value)) - (order.indexOf(b.value) < 0 ? 9 : order.indexOf(b.value)));
-    $('#stBtns').innerHTML = rs.map(r => stBtn('hold:' + r.value, r.label + 'で中断', false)).join('')
-      + stBtn('back', '← もどる', false);
-    return;
-  }
+  // 「止まった」(旧 保留) は進捗ではないので、このダイアログには無い → openBlock() (案A)
   if (stStep === 'closed') {
     $('#stBtns').innerHTML = (state.closeReasons || []).map(r => stBtn('close:' + r.value, r.label, false)).join('')
       + stBtn('back', '← もどる', false);
-    return;
-  }
-  // ⭐中断するとき「何個までできましたか」+ 中断メモ を 1 回だけ聞く (要件 §Y)。
-  //   数は任意 — 数えていないなら「数えずに中断する」で進める (0 個と混ぜない)
-  if (stStep === 'hold_qty') {
-    $('#stBtns').innerHTML = dqPanelHtml(c,
-      stBtn('hold_go', 'この数で中断する', false) +
-      stBtn('hold_skip', 'できた数は変えずに中断する', false) +
-      stBtn('back', '← もどる', false));
     return;
   }
   const nexts = (state.transitions || {})[c.status] || [];
@@ -3542,8 +3852,10 @@ function renderStBtns(c) {
  * 中断するときと、あとから直すときで同じ形を使う。**数は任意** — 数えていないなら空のままでよい
  * (空 = まだ数えていない。0 個 = 1 個もできていない。この 2 つは別のこととして扱う)
  */
-function dqPanelHtml(c, actions) {
-  const cur = c.done_qty == null ? '' : String(c.done_qty);
+function dqPanelHtml(c, actions, opts) {
+  const o = Object.assign({ title: '何個までできましたか', memo: true, memoLabel: '中断メモ (任意) — 次にやる人が読みます', defaultAll: false }, opts || {});
+  // できあがりのダイアログでは「全部」を既定にする (数えていなければ つくる数 = できた数 とみなす — 要件 §Y)
+  const cur = c.done_qty == null ? (o.defaultAll && c.qty != null ? String(c.qty) : '') : String(c.done_qty);
   const memo = c.hold_memo || '';
   const quick = [['0', 'まだ 0 個']];
   if (c.qty != null) {
@@ -3551,16 +3863,15 @@ function dqPanelHtml(c, actions) {
     quick.push([String(c.qty), '全部 (' + c.qty + ' 個)']);
   }
   return '<div class="dq">' +
-    '<label>何個までできましたか</label>' +
+    '<label>' + esc(o.title) + '</label>' +
     '<div class="row"><input class="dqIn" type="number" inputmode="numeric" min="0" step="1" value="' + esc(cur) + '" placeholder="—">' +
       '<span class="of">' + (c.qty != null ? '／ つくる数 ' + esc(String(c.qty)) + ' 個' : '／ つくる数は不明') + '</span></div>' +
     '<div class="quick">' + quick.map(([v, l]) =>
       '<button type="button" data-dq="' + esc(v) + '">' + esc(l) + '</button>').join('') +
       '<button type="button" data-dq="">数えていない</button></div>' +
-    '<p class="sub">数えていないときは空のままで構いません (0 個とは別のこととして残します)。' +
-      '前に数えた値をそのままにするなら「できた数は変えずに中断する」を押してください</p>' +
-    '<label style="margin-top:10px">中断メモ (任意) — 次にやる人が読みます</label>' +
-    '<textarea class="dqMemo" maxlength="500" placeholder="例: ラベルは貼り終わり、袋詰めの途中です">' + esc(memo) + '</textarea>' +
+    '<p class="sub">数えていないときは空のままで構いません (0 個とは別のこととして残します)。空のまま進めると、前に数えた値はそのまま残ります</p>' +
+    (o.memo ? '<label style="margin-top:10px">' + esc(o.memoLabel) + '</label>' +
+      '<textarea class="dqMemo" maxlength="500" placeholder="例: ラベルは貼り終わり、袋詰めの途中です">' + esc(memo) + '</textarea>' : '') +
     '</div>' + actions;
 }
 /**
@@ -3644,7 +3955,6 @@ function openSt(ev, id) {
   if (!c) return;
   stTarget = c.id;
   stStep = null;
-  stHold = null;
   $('#stName').textContent = c.title + ' (いま: ' + stLabel(c) + ')';
   $('#stMsg').textContent = '';
   $('#pinRow').style.display = 'none';
@@ -3652,7 +3962,7 @@ function openSt(ev, id) {
   renderStBtns(c);
   openOverlay('#stOv');
 }
-function closeSt() { if (stSaving) return; closeOverlay('#stOv'); stTarget = null; stStep = null; stHold = null; }
+function closeSt() { if (stSaving) return; closeOverlay('#stOv'); stTarget = null; stStep = null; }
 $('#stOv').addEventListener('click', e => { if (e.target === $('#stOv')) closeSt(); });
 
 /** ボタンの値は data-v から取る (状態名を JS 文字列に埋め込まない) */
@@ -3661,7 +3971,7 @@ function doSetStEl(el) { doSetSt(el.dataset.v); }
 /** サーバーが返したタスクの最新値をカードに反映する (version を持ち越さないと次の変更が競合する) */
 function applyTask(c, t) {
   if (!t || typeof t !== 'object') return;
-  for (const k of ['status', 'status_label', 'version', 'facility_code', 'hold_reason_code', 'hold_reason_note',
+  for (const k of ['status', 'status_label', 'version', 'facility_code', 'blocked', 'blocked_label',
     'done_qty', 'hold_memo',
     'planned_date', 'when', 'cancellation_requested_at', 'migration_review', 'external_ready']) {
     if (k in t) c[k] = t[k];
@@ -3675,45 +3985,20 @@ async function doSetSt(choice) {
   const c = state.cards.find(x => x.id === stTarget);
   if (!c) { closeSt(); return; }
 
-  let to = choice, holdReason = null, closeReason = null, holdNote = null, reopenReason = null;
-  let doneQty, holdMemo;   // undefined = 送らない (今の値のまま)
+  let to = choice, closeReason = null, reopenReason = null;
+  const doneQty = undefined, holdMemo = undefined;   // このダイアログでは触らない (できあがりは submitDone が /api/status に載せる)
   if (isApp()) {
-    if (choice === 'back') { stStep = null; stHold = null; $('#stMsg').textContent = ''; renderStBtns(c); return; }
-    // 数を聞いている段からの送信 (理由は stHold に持っている)
-    if (choice === 'hold_go' || choice === 'hold_skip') {
-      if (!stHold) { stStep = null; renderStBtns(c); return; }
-      const v = dqValues('#stBtns');
-      if (choice === 'hold_go') {
-        if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#stMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
-        doneQty = v.qty;                 // null なら「数えていない」に戻す
-      }
-      // 「できた数は変えずに中断する」= done_qty を送らない (前に数えた値をそのまま残す)。
-      // 前の値を黙って消さないためで、ボタンの名前もそう書いてある (Codex R2 中1)
-      holdMemo = v.memo;                 // メモはどちらでも残す
-      to = 'on_hold'; holdReason = stHold.reason; holdNote = stHold.note;
-    } else if (choice.startsWith('hold:')) { to = 'on_hold'; holdReason = choice.slice(5); }
-    else if (choice.startsWith('close:')) { to = 'closed'; closeReason = choice.slice(6); }
-    // 理由が要る変更は 2 段階 (どの理由かを選んでから送る)
-    if (to === 'on_hold' && !holdReason) { stStep = 'on_hold'; stHold = null; $('#stMsg').textContent = '保留の理由を選んでください'; renderStBtns(c); return; }
+    if (choice === 'back') { stStep = null; $('#stMsg').textContent = ''; renderStBtns(c); return; }
+    if (choice.startsWith('close:')) { to = 'closed'; closeReason = choice.slice(6); }
+    // 理由が要る変更 (終了) は 2 段階 (どの理由かを選んでから送る)。
+    // 「止まった」は進捗ではないので別のダイアログ (openBlock — 案A 2026-09-05)
     if (to === 'closed' && !closeReason) { stStep = 'closed'; $('#stMsg').textContent = '終了の理由を選んでください'; renderStBtns(c); return; }
-    if (holdReason === 'other' && !holdNote) {
-      holdNote = window.prompt('保留の理由 (その他) を書いてください');
-      if (!holdNote || !holdNote.trim()) { $('#stMsg').textContent = '❌ 「その他」は理由の記入が必要です'; return; }
-    }
-    // 理由を選んだら、次は「何個までできましたか」(要件 §Y)
-    if (to === 'on_hold' && stStep !== 'hold_qty') {
-      stHold = { reason: holdReason, note: holdNote };
-      stStep = 'hold_qty';
-      $('#stMsg').textContent = '何個までできましたか (分からなければ数えずに進めます)';
-      renderStBtns(c);
-      return;
-    }
     if (c.status === 'closed') {
       reopenReason = window.prompt('終了したカードを戻します。理由を書いてください (例: 数え間違い)');
       if (!reopenReason || !reopenReason.trim()) { $('#stMsg').textContent = '❌ 終了から戻すには理由が必要です'; return; }
     }
   }
-  if (to === c.status && !holdReason && !closeReason) { closeSt(); return; }
+  if (to === c.status && !closeReason) { closeSt(); return; }
 
   // 職員の本人確認が要る変更は PIN を求める (端末Cookie利用時だけ)
   const gated = isApp() ? stNeedsStaff(c.status, to) : (to === '棚入完了' || c.status === '棚入完了');
@@ -3738,7 +4023,7 @@ async function doSetSt(choice) {
     body: JSON.stringify({
       id: stTarget, to, worker_id: worker.id,
       ...(isApp()
-        ? { expect_version: c.version, hold_reason: holdReason || undefined, hold_note: holdNote || undefined,
+        ? { expect_version: c.version,
             ...(doneQty !== undefined ? { done_qty: doneQty } : {}),
             ...(holdMemo !== undefined ? { hold_memo: holdMemo } : {}),
             close_reason: closeReason || undefined, reason: reopenReason || undefined }
@@ -3747,7 +4032,6 @@ async function doSetSt(choice) {
     }),
   });
   stStep = null;
-  stHold = null;
   stSaving = false;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
   settleForceClose();   // 通信中に「閉じる」が予約されていれば、ここで閉じる
@@ -3770,8 +4054,6 @@ async function doSetSt(choice) {
     applyTask(c, j.task);
     c.status = j.status;
     if (j.status_label) c.status_label = j.status_label;
-    // ラベル待ちで中断したら、そのまま記録をつける (発生日・数量・ロット期限・記録者は入れておく)
-    if (isApp() && holdReason === 'label_shortage') setTimeout(() => openLwNew(c), 0);
     renderTabs(); renderList();
     if (sameId(curDetail, c.id)) renderDetail(c);
     toast('「' + label + '」に変えました' + suffix);
@@ -3825,7 +4107,7 @@ if ('serviceWorker' in navigator) {
     .then(reg => { if (reg.active) reg.active.postMessage('cache-shell'); })
     .catch(() => { /* 非対応・失敗は無視 */ });
 }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeLb(); closeSt(); closeMaster(); closeDetail(); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeDetail(); } });
 </script>
 </body>
 </html>

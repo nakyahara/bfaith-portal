@@ -210,7 +210,7 @@ export function mergeLinkConflict({ taskId, keep = 'import', actor = null }) {
     }
     // ③ 消える側が着手済みで残す側が未着手なら、残す側を作業中へ (「作業記録を持つ未着手タスク」を作らない)
     let promoted = null;
-    if (into.status === 'not_started' && ['in_progress', 'on_hold', 'ready_for_stocking'].includes(from.status)) {
+    if (into.status === 'not_started' && ['in_progress', 'ready_for_stocking'].includes(from.status)) {
       db.prepare('UPDATE f_iroha_tasks SET status = ?, started_at = COALESCE(started_at, ?, ?), version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?')
         .run('in_progress', from.started_at, now, now, who, intoId);
       promoted = `not_started→in_progress (消える側は ${from.status})`;
@@ -218,6 +218,7 @@ export function mergeLinkConflict({ taskId, keep = 'import', actor = null }) {
     // ④ 消える側は終了 — 未終了なら 終了:取消。既に終了なら理由はそのまま。どこへ統合したか残す
     if (from.status !== 'closed') {
       db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = ?, closed_by = ?, hold_reason_code = NULL, hold_reason_note = NULL,
+        blocked_reason = NULL, blocked_note = NULL, blocked_at = NULL, blocked_by = NULL,
         cancellation_requested_at = NULL, migration_note = COALESCE(migration_note || ' / ', '') || ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?`)
         .run(now, who, `統合 → task#${intoId}`, now, who, fromId);
     } else {

@@ -36,7 +36,8 @@ import { countTasksByStatus, listTasksNeedingReview, listOrphans } from './tasks
 import { OPEN_STATUSES } from './tasks.js';
 import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
-import { transitionNeedsStaff, TASK_STATUSES, statusLabel } from './tasks.js';
+import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
+import { setTaskBlock, clearTaskBlock, blockedOf } from './tasks-db.js';
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
   listLabelWaits, upsertLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
@@ -523,10 +524,8 @@ function changeStatusApp(req, res, worker) {
   const r = changeTaskStatus({
     taskId: t.id, to, expectVersion: req.body?.expect_version,
     closeReason: req.body?.close_reason || null,
-    holdReason: req.body?.hold_reason || null,
-    holdNote: req.body?.hold_note || null,
     // ⭐できた数と中断メモ (要件 §Y)。送られたときだけ書き換える。
-    //   状態と同じ 1 回の書き込みに載せる — 分けると「保留にはなったが数は入らなかった」が起きる
+    //   状態と同じ 1 回の書き込みに載せる — 分けると「状態は変わったが数は入らなかった」が起きる
     doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
     reason: req.body?.reason || null,
@@ -543,7 +542,9 @@ function changeStatusApp(req, res, worker) {
 function publicTask(t) {
   return {
     id: t.id, status: t.status, status_label: statusLabel(t), version: t.version,
-    facility_code: t.facility_code, hold_reason_code: t.hold_reason_code, hold_reason_note: t.hold_reason_note,
+    facility_code: t.facility_code,
+    // ⭐止まっている理由の札 (案A)。一覧のカードと同じ形 (blocked / blocked_label)
+    blocked: blockedOf(t), blocked_label: blockLabel(t),
     done_qty: t.done_qty ?? null, hold_memo: t.hold_memo || null,
     planned_date: t.planned_date, when: t.status === 'closed' ? null : whenOf(t.planned_date), cancellation_requested_at: t.cancellation_requested_at, migration_review: !!t.migration_review,
     external_ready: !!t.external_ready,
@@ -734,6 +735,54 @@ router.post('/api/progress', checkOrigin, api((req, res) => {
 }));
 
 /** 取込時に推定した状態を職員が「確認した」にする (アプリ正本のみ) */
+/**
+ * ⛔ 止まった (要件 §Y-2 = 案A、中原さん 2026-09-05)。
+ * 進捗 (status) は変えず「止まっている理由」の札を付け、このカードで作業中の人のタイマーを全員止める。
+ * できた数・中断メモも一緒に受ける (状態変更と同じ 1 回の書き込み)。利用者が押せる (許可 task.block)
+ */
+router.post('/api/block', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const blockTaskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+  if (blockTaskId == null) return res.status(400).json(BAD_TASK_ID);
+  if (isClosedCardId(blockTaskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
+  const r = setTaskBlock({
+    taskId: blockTaskId, reason: String(req.body?.reason || ''), note: req.body?.note ?? null,
+    expectVersion: req.body?.expect_version,
+    doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+    holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
+    workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  res.json({ ok: true, task: publicTask(r.task), stopped: r.stopped, serverNow: new Date().toISOString() });
+}));
+
+/**
+ * 札を外す (作業は始めない)。⭐職員だけ — 画面でボタンを隠すだけでは権限にならない (Codex PR #1193 R1 #3)。
+ * ポータルのセッション、または端末の職員モード (PIN で開けた 30 分) のときだけ通す。
+ * 利用者が「解消した」と言って始めるのは /api/sessions/start の clear_block (開始と同時にだけ外せる)
+ */
+router.post('/api/unblock', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  if (!staffModeOf(req).staff) {
+    return res.status(403).json({ ok: false, error: 'staff_required', message: '札を手で外せるのは職員だけです (職員モードに入ってください)。作業を始めるなら「▶ 作業をはじめる」から外せます' });
+  }
+  const unblockTaskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+  if (unblockTaskId == null) return res.status(400).json(BAD_TASK_ID);
+  if (isClosedCardId(unblockTaskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
+  const r = clearTaskBlock({
+    taskId: unblockTaskId, expectVersion: req.body?.expect_version ?? null, via: 'manual',
+    actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
+    workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  res.json({ ok: true, already: !!r.already, task: publicTask(r.task) });
+}));
+
 router.post('/api/review-cleared', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
   const w = resolveWorker(req);
@@ -1459,10 +1508,12 @@ function startSessionApp(req, res, worker, crew) {
     const wm = getDB().prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(String(t.product_code).trim().toLowerCase());
     return masterOfTask(wm || null, snap);
   };
-  const r = startTaskSession({ taskId, worker, workers: crew, deviceLabel: deviceLabelOf(req), snapshotOf });
+  // ⭐止まっている札が付いたカードは、画面で「解消した」と確かめてから clear_block: true で送り直す (案A)
+  const r = startTaskSession({ taskId, worker, workers: crew, deviceLabel: deviceLabelOf(req), snapshotOf,
+    clearBlock: req.body?.clear_block === true, expectVersion: req.body?.expect_version ?? null });
   if (!r.ok) {
     const http = r.error === 'bad_request' ? 400 : r.error === 'not_found' ? 404 : 409;
-    return res.status(http).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+    return res.status(http).json({ ...r, task: r.task ? publicTask(r.task) : undefined, current: r.current ? publicTask(r.current) : undefined });
   }
   res.json({ ok: true, already: !!r.already, sessions: r.sessions, sessionId: r.sessionId, startedAt: r.startedAt,
     status: r.task.status, task: publicTask(r.task), serverNow: new Date().toISOString() });

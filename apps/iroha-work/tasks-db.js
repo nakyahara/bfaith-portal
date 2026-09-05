@@ -2,12 +2,12 @@
  * いろは在庫化作業アプリ — タスク (f_iroha_tasks) の DB 操作 (要件定義 v1.1)
  *
  * 状態モデル・遷移ルール・写像は tasks.js (純粋関数)。ここは DB の読み書きだけ。
- * 不変条件 (closed には close_reason/closed_at、on_hold には hold_reason …) は書く前に validateTaskInvariants で守る。
+ * 不変条件 (closed には close_reason/closed_at、止まっている理由 blocked_reason は未着手・作業中だけ …) は書く前に validateTaskInvariants で守る。
  * 状態変更は version の楽観ロック (2 台の iPad が同時に触っても後勝ちで壊さない) + 履歴 (f_iroha_app_events.task_id)。
  */
 import { getDB, startSessions, setMetaValue, logEvent, sourceOfTruth } from './db.js';
 import {
-  OPEN_STATUSES, CLOSE_REASONS, HOLD_REASONS,
+  OPEN_STATUSES, CLOSE_REASONS, BLOCK_REASONS, BLOCK_LABEL, BLOCKABLE_STATUSES, LEGACY_ON_HOLD,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
 } from './tasks.js';
 
@@ -49,8 +49,8 @@ export function getTaskByDestination(destinationId) {
 export function listOpenTasks({ facility = null } = {}) {
   const ph = OPEN_STATUSES.map(() => '?').join(',');
   return getDB().prepare(`SELECT * FROM f_iroha_tasks WHERE status IN (${ph}) ${facility ? 'AND facility_code = ?' : ''}
-    ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'not_started' THEN 1 WHEN 'on_hold' THEN 2 ELSE 3 END,
-      planned_date IS NULL, planned_date, arrival_date, id`).all(...OPEN_STATUSES, ...(facility ? [facility] : []));
+    ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'not_started' THEN 1 ELSE 3 END,
+      blocked_reason IS NOT NULL, planned_date IS NULL, planned_date, arrival_date, id`).all(...OPEN_STATUSES, ...(facility ? [facility] : []));
 }
 
 /** 履歴 (終了したもの)。期間・検索で絞る — 溜まる一方でも一覧を邪魔しない (中原さん 9/3) */
@@ -81,7 +81,9 @@ export function countTasksByStatus() {
     byStatus[r.status] = (byStatus[r.status] || 0) + r.c;
     if (OPEN_STATUSES.includes(r.status)) byFacility[r.facility_code] = (byFacility[r.facility_code] || 0) + r.c;
   }
-  return { byStatus, byFacility, total: rows.reduce((s, r) => s + r.c, 0) };
+  // 止まっている札 (案A) は進捗とは別に数える (管理画面の内訳用)
+  const blocked = getDB().prepare('SELECT COUNT(*) c FROM f_iroha_tasks WHERE blocked_reason IS NOT NULL').get().c;
+  return { byStatus, byFacility, blocked, total: rows.reduce((s, r) => s + r.c, 0) };
 }
 
 /** 要確認 (取込時に状態を推定 / 取消要求) の一覧 — 職員が片付ける */
@@ -112,7 +114,8 @@ export function safeLogTaskEvent(args) {
 const IMPORT_INFO_COLS = ['destination_id', 'product_code', 'product_name', 'qty', 'arrival_date', 'ar_no', 'barcode', 'expiry', 'supplier', 'handling',
   'payload', 'legacy_status'];
 const IMPORT_NEW_ONLY_COLS = ['master_snapshot', 'migration_review', 'migration_note'];
-const IMPORT_STATE_COLS = ['status', 'close_reason', 'facility_code', 'hold_reason_code', 'hold_reason_note', 'started_at', 'ready_at', 'closed_at', 'closed_by'];
+const IMPORT_STATE_COLS = ['status', 'close_reason', 'facility_code', 'hold_reason_code', 'hold_reason_note',
+  'blocked_reason', 'blocked_note', 'blocked_at', 'blocked_by', 'started_at', 'ready_at', 'closed_at', 'closed_by'];
 
 /**
  * Notion の 1 ページを task に取り込む (notion_page_id で冪等)。
@@ -128,14 +131,26 @@ export function upsertTaskFromImport(row, { batchId, now = utcNow() }) {
   // 拠点は Notion のステータスに施設名が入っていたものだけ。無ければ NULL (未定) — いろはを既定にしない (要件 §W-2)
   const facility = row.facility_code || null;
   if (facility && !db.prepare('SELECT 1 FROM f_iroha_facilities WHERE code = ?').get(facility)) throw new Error(`取込行の拠点が不正です (${row.notion_page_id}): ${facility}`);
+  // 旧「保留」の取込行は「進捗 + 止まっている理由」に読み替える (案A 2026-09-05)。
+  // 保留の理由が無い旧行は「その他」+ メモ (理由不明) で止まっている札を付ける — 黙って「未着手」に戻さない
+  const legacyHold = row.status === LEGACY_ON_HOLD;
+  const status = legacyHold ? (row.started_at ? 'in_progress' : 'not_started') : row.status;
+  const blockedReason = row.blocked_reason ?? (legacyHold ? (row.hold_reason_code || 'other') : null);
+  const blockedNote = row.blocked_note ?? (legacyHold
+    ? (row.hold_reason_code ? (row.hold_reason_note ?? null) : '取込: 保留の理由が記録されていませんでした')
+    : null);
   const rec = {
     notion_page_id: String(row.notion_page_id),
     legacy_status: row.legacy_status ?? null,
-    status: row.status,
+    status,
     close_reason: row.close_reason ?? null,
     facility_code: facility,
-    hold_reason_code: row.hold_reason_code ?? null,
-    hold_reason_note: row.hold_reason_note ?? null,
+    hold_reason_code: null,   // 旧列。書かない (validateTaskInvariants が拒否する)
+    hold_reason_note: null,
+    blocked_reason: blockedReason,
+    blocked_note: blockedNote,
+    blocked_at: blockedReason ? (row.blocked_at ?? now) : null,
+    blocked_by: blockedReason ? (row.blocked_by ?? `import:${batchId}`) : null,
     destination_id: row.destination_id == null ? null : Number(row.destination_id),
     product_code: row.product_code ?? null, product_name: row.product_name ?? null,
     qty: row.qty == null ? null : Number(row.qty),
@@ -207,8 +222,10 @@ export function listOrphans(limit = 100) {
 
 // ─── 状態変更 ───
 
-const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, hold_reason_required: 400, close_reason_required: 400, not_found: 404, bad_request: 400,
+const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, close_reason_required: 400, not_found: 404, bad_request: 400,
   closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409, bad_done_qty: 400, bad_hold_memo: 400, ready_task: 409,
+  // 止まっている理由 (案A): 理由が無い/不正 = 400、止められない状態 = 409、止まっているので始められない = 409
+  block_reason_required: 400, bad_block: 409, blocked: 409,
   notion_mode: 409 };   // 取得後に正本が切り替わった = 競合 (入力不正ではない — Codex PR1 R17)
 export function taskErrorStatus(error) { return HTTP_BY_ERROR[error] || 400; }
 
@@ -244,7 +261,7 @@ export function normalizeHoldMemo(v) {
   return { value: t === '' ? null : t };
 }
 
-export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null, holdReason = null, holdNote = null,
+export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null,
   doneQty = undefined, holdMemo = undefined,
   actor = null, isStaff = false, workerId = null, workerName = null, deviceLabel = null, reason = null }) {
   const db = getDB();
@@ -266,8 +283,10 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   // 作業中の人がいるまま終了にしない (実際の検査は下のトランザクションの中。ここでは早めに弾くだけ)
   const now = utcNow();
   const next = { ...t, status: to, version: t.version + 1, updated_at: now, updated_by: actor };
-  next.hold_reason_code = to === 'on_hold' ? holdReason : null;
-  next.hold_reason_note = to === 'on_hold' ? (holdNote || null) : null;
+  next.hold_reason_code = null;   // 旧列。案A 以降は書かない
+  next.hold_reason_note = null;
+  // ⭐止まっている理由は 未着手・作業中 だけが持てる。棚入待ち・終了へ進むときは札を外す (外した中身は履歴へ)
+  if (!BLOCKABLE_STATUSES.includes(to)) { next.blocked_reason = null; next.blocked_note = null; next.blocked_at = null; next.blocked_by = null; }
   next.close_reason = to === 'closed' ? closeReason : null;
   next.closed_at = to === 'closed' ? now : null;
   next.closed_by = to === 'closed' ? actor : null;
@@ -295,7 +314,6 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   }
   const problems = validateTaskInvariants(next);
   if (problems.length > 0) {
-    if (to === 'on_hold') return { ok: false, error: 'hold_reason_required', message: `保留の理由を選んでください (${HOLD_REASONS.join(' / ')})${holdReason === 'other' ? '。「その他」は備考も必要です' : ''}` };
     if (to === 'closed') return { ok: false, error: 'close_reason_required', message: `終了の理由が必要です (${CLOSE_REASONS.join(' / ')})` };
     return { ok: false, error: 'bad_request', message: problems.join(' / ') };
   }
@@ -315,18 +333,21 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
       if (active > 0) return { active };
     }
     const r = db.prepare(`UPDATE f_iroha_tasks SET status = ?, hold_reason_code = ?, hold_reason_note = ?, close_reason = ?, closed_at = ?, closed_by = ?,
+        blocked_reason = ?, blocked_note = ?, blocked_at = ?, blocked_by = ?,
         started_at = ?, ready_at = ?, cancellation_requested_at = ?, done_qty = ?, hold_memo = ?, version = ?, updated_at = ?, updated_by = ?
       WHERE id = ? AND version = ?`)
       .run(next.status, next.hold_reason_code, next.hold_reason_note, next.close_reason, next.closed_at, next.closed_by,
+        next.blocked_reason ?? null, next.blocked_note ?? null, next.blocked_at ?? null, next.blocked_by ?? null,
         next.started_at, next.ready_at, next.cancellation_requested_at, next.done_qty ?? null, next.hold_memo ?? null,
         next.version, next.updated_at, next.updated_by, t.id, t.version);
     if (r.changes === 0) return false;
-    const cleared = (t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '';
+    const cleared = ((t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '')
+      + ((t.blocked_reason && !next.blocked_reason) ? ` 札解除(${t.blocked_reason})` : '');
     // できた数と中断メモも履歴に残す。消えた申し送りを後から追えるように (ready_at と同じ考え方)
     const dqTxt = (next.done_qty ?? null) !== (t.done_qty ?? null) ? ` できた${t.done_qty ?? '—'}→${next.done_qty ?? '—'}` : '';
     const hmTxt = (next.hold_memo ?? null) !== (t.hold_memo ?? null)
       ? (next.hold_memo ? ` メモ:${next.hold_memo}` : ` メモ消去(${t.hold_memo})`) : '';
-    const line = { taskId: t.id, action: 'task_status', from: t.status, to: `${to}${closeReason ? ':' + closeReason : ''}${holdReason ? ':' + holdReason : ''}${reason ? ' (' + reason + ')' : ''}${cleared}${dqTxt}${hmTxt}`,
+    const line = { taskId: t.id, action: 'task_status', from: t.status, to: `${to}${closeReason ? ':' + closeReason : ''}${reason ? ' (' + reason + ')' : ''}${cleared}${dqTxt}${hmTxt}`,
       workerId, workerName, deviceLabel, ok: true };
     if (reopening) logTaskEvent(line); else safeLogTaskEvent(line);
     return true;
@@ -339,7 +360,104 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   return { ok: true, task: getTask(t.id) };
 }
 
-/** 「今日やる」(planned_date = YYYY-MM-DD) / 後日 (null)。未着手・保留のタスクだけ */
+// ─── 止まっている理由の札 (要件 §Y-2 = 案A、中原さん 2026-09-05) ───
+
+/** 止まっている理由を、画面に返す形に */
+export function blockedOf(t) {
+  if (!t || !t.blocked_reason) return null;
+  return { reason: t.blocked_reason, label: BLOCK_LABEL[t.blocked_reason] || t.blocked_reason,
+    note: t.blocked_note || null, at: t.blocked_at || null, by: t.blocked_by || null };
+}
+
+/**
+ * 「⛔ 止まった」— 理由の札を付ける。進捗 (status) は変えない (作業中なら作業中のまま。80/180 の情報を失わない)。
+ * 同じトランザクションで **このカードで作業中の人のタイマーを全員止める** (end_reason='pause'。止まっている間は数えない)。
+ * できた数・中断メモも一緒に受ける (要件 §Y と同じ 1 回の書き込み)。
+ * expect_version の楽観ロック — 止めて外して再開した後に遅れて届いた古い「止まった」が、新しい作業を止めないように。
+ * @returns {ok, task, stopped:[{id, worker_id, worker_name, raw_seconds}]} / {ok:false, error, message, current?}
+ */
+export function setTaskBlock({ taskId, reason, note = null, doneQty = undefined, holdMemo = undefined, expectVersion,
+  actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
+  const db = getDB();
+  if (!BLOCK_REASONS.includes(reason)) {
+    return { ok: false, error: 'block_reason_required', message: `止まった理由を選んでください (${BLOCK_REASONS.join(' / ')})` };
+  }
+  const noteText = note == null ? null : String(note).trim().slice(0, 300) || null;
+  if (reason === 'other' && !noteText) return { ok: false, error: 'block_reason_required', message: '「その他」は何で止まったかをメモに書いてください' };
+  const dq = normalizeDoneQty(doneQty);
+  if (dq.error) return { ok: false, error: dq.error, message: dq.message };
+  const hm = normalizeHoldMemo(holdMemo);
+  if (hm.error) return { ok: false, error: hm.error, message: hm.message };
+  return db.transaction(() => {
+    if (guard) { const g0 = guard(); if (g0) return g0; }
+    const g = appModeGuard();
+    if (g) return g;
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
+    if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: t };
+    if (!BLOCKABLE_STATUSES.includes(t.status)) {
+      return { ok: false, error: 'bad_block', message: t.status === 'closed' ? '終了したカードは止められません (履歴として残ります)' : 'できあがったカード (棚入待ち) は止められません。やり直すなら職員が作業中に戻してください' };
+    }
+    const now = utcNow();
+    const nextQty = dq.skip ? (t.done_qty ?? null) : dq.value;
+    const nextMemo = hm.skip ? (t.hold_memo ?? null) : hm.value;
+    const next = { ...t, blocked_reason: reason, blocked_note: noteText, blocked_at: now, blocked_by: actor, done_qty: nextQty, hold_memo: nextMemo };
+    const problems = validateTaskInvariants(next);
+    if (problems.length > 0) return { ok: false, error: 'bad_request', message: problems.join(' / ') };
+    const r = db.prepare(`UPDATE f_iroha_tasks SET blocked_reason = ?, blocked_note = ?, blocked_at = ?, blocked_by = ?,
+        done_qty = ?, hold_memo = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?`)
+      .run(reason, noteText, now, actor, nextQty, nextMemo, now, actor, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
+    // 止まっている間は作業時間を数えない → このカードで作業中の人を全員止める (pause)
+    const active = db.prepare('SELECT id, worker_id, worker_name, started_at FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL AND voided_at IS NULL').all(t.id);
+    const upd = db.prepare("UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = 'pause', raw_seconds = ? WHERE id = ?");
+    const stopped = active.map((s) => {
+      const raw = Math.max(0, Math.floor((Date.parse(now) - Date.parse(s.started_at)) / 1000));
+      upd.run(now, raw, s.id);
+      safeLogTaskEvent({ taskId: t.id, action: 'session_stop', workerId: s.worker_id, workerName: s.worker_name, deviceLabel, to: `pause (止まった: ${reason})`, ok: true });
+      return { id: s.id, worker_id: s.worker_id, worker_name: s.worker_name, raw_seconds: raw };
+    });
+    const dqTxt = nextQty !== (t.done_qty ?? null) ? ` できた${t.done_qty ?? '—'}→${nextQty ?? '—'}` : '';
+    const hmTxt = nextMemo !== (t.hold_memo ?? null) ? (nextMemo ? ` メモ:${nextMemo}` : ' メモ消去') : '';
+    // 履歴は safe (失敗しても札とタイマー停止は成立させる — 現場を止めない。他の操作と同じ方針)。
+    // 誰のタイマーを止めたかは f_iroha_work_sessions 自体 (ended_at / end_reason='pause') に残るので、履歴が欠けても追える
+    safeLogTaskEvent({ taskId: t.id, action: 'task_blocked', from: t.blocked_reason || null,
+      to: `${reason}${noteText ? ' (' + noteText + ')' : ''}${stopped.length ? ` タイマー停止 ${stopped.length} 人` : ''}${dqTxt}${hmTxt}`,
+      workerId, workerName, deviceLabel, ok: true });
+    return { ok: true, task: getTask(t.id), stopped };
+  }).immediate();
+}
+
+/**
+ * 札を外す (「はい、届いた」/ ラベル待ちの記録を完了にした / 職員が手で外す)。進捗は変えない。
+ * expectVersion は省略可 (「作業をはじめる」から呼ぶときは版を持っていない — 人が確認して押した操作なので、そのまま外す)。
+ * 外れていなければ already。@param via 何から外したか (履歴に残す)
+ */
+export function clearTaskBlock({ taskId, expectVersion = null, via = 'manual', actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
+  const db = getDB();
+  return db.transaction(() => {
+    if (guard) { const g0 = guard(); if (g0) return g0; }
+    const g = appModeGuard();
+    if (g) return g;
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
+    if (expectVersion != null && Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: t };
+    if (!t.blocked_reason) return { ok: true, task: t, already: true };
+    return clearTaskBlockInTx(db, t, { via, actor, workerId, workerName, deviceLabel });
+  }).immediate();
+}
+/** 同上 (トランザクションの中から呼ぶ用: 作業開始・ラベル待ちの完了と同じ書き込みにまとめる) */
+function clearTaskBlockInTx(db, t, { via, actor = null, workerId = null, workerName = null, deviceLabel = null }) {
+  const now = utcNow();
+  const r = db.prepare(`UPDATE f_iroha_tasks SET blocked_reason = NULL, blocked_note = NULL, blocked_at = NULL, blocked_by = NULL,
+      version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?`).run(now, actor, t.id, t.version);
+  if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
+  safeLogTaskEvent({ taskId: t.id, action: 'task_unblocked', from: `${t.blocked_reason}${t.blocked_note ? ' (' + t.blocked_note + ')' : ''}`, to: via,
+    workerId, workerName, deviceLabel, ok: true });
+  return { ok: true, task: getTask(t.id) };
+}
+
+/** 「今日やる」(planned_date = YYYY-MM-DD) / 後日 (null)。未着手・作業中のタスク */
 export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
   const db = getDB();
   const d = plannedDate == null || plannedDate === '' ? null : String(plannedDate);
@@ -414,7 +532,7 @@ export function removeStrayTask({ taskId, actor = null, reason = null }) {
     if (used > 0) {
       if (t.status === 'closed') return { ok: true, action: 'closed', id: t.id, already: true };
       db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'out_of_scope', closed_at = ?, closed_by = ?,
-          hold_reason_code = NULL, hold_reason_note = NULL, cancellation_requested_at = NULL,
+          hold_reason_code = NULL, hold_reason_note = NULL, blocked_reason = NULL, blocked_note = NULL, blocked_at = NULL, blocked_by = NULL, cancellation_requested_at = NULL,
           migration_note = COALESCE(migration_note || ' / ', '') || ?, version = version + 1, updated_at = ?, updated_by = ?
         WHERE id = ? AND version = ?`)
         .run(utcNow(), actor, note, utcNow(), actor, t.id, t.version);
@@ -568,6 +686,7 @@ export function requestCancellation({ destinationId, source = 'inbound_reversal'
     const now = utcNow();
     if (t.status === 'not_started' && !taskHasActivity(db, t.id)) {
       const r = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = ?, closed_by = ?, hold_reason_code = NULL, hold_reason_note = NULL,
+        blocked_reason = NULL, blocked_note = NULL, blocked_at = NULL, blocked_by = NULL,
         cancellation_requested_at = NULL, cancellation_source = ?, version = version + 1, updated_at = ?, updated_by = ?
         WHERE id = ? AND status = 'not_started' AND version = ?`)
         .run(now, actor || source, source, now, actor || source, t.id, t.version);
@@ -622,7 +741,7 @@ export function listLabelWaits({ taskId = null, openOnly = true, limit = 500 } =
   if (openOnly) conds.push('done = 0');
   args.push(Math.max(1, Math.min(5000, Number(limit) || 500)));
   // 画面に商品名を出すのでタスクを結合する (task_id は NOT NULL + FK。task が消えた行は __orphan へ退避済み)
-  return getDB().prepare(`SELECT w.*, t.product_code, t.product_name, t.qty AS task_qty, t.status AS task_status, t.hold_reason_code
+  return getDB().prepare(`SELECT w.*, t.product_code, t.product_name, t.qty AS task_qty, t.status AS task_status, t.blocked_reason
     FROM f_iroha_label_waits w JOIN f_iroha_tasks t ON t.id = w.task_id
     ${conds.length ? 'WHERE ' + conds.map((c) => c.replace(/^task_id/, 'w.task_id').replace(/^done/, 'w.done')).join(' AND ') : ''}
     ORDER BY w.done, w.occurred_on DESC, w.id DESC LIMIT ?`).all(...args);
@@ -634,7 +753,14 @@ export function listLabelWaits({ taskId = null, openOnly = true, limit = 500 } =
  */
 export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion = null, actor = null }) {
   const db = getDB();
-  return db.transaction(() => appModeGuard() || upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor })).immediate();
+  // ⭐札を外せなかったときは例外で巻き戻す (値を return すると commit されるため — Codex PR #1193 R1 #4)。
+  //   「完了にしたのに札だけ残る」を作らない。呼び元には ok:false の結果として返す
+  try {
+    return db.transaction(() => appModeGuard() || upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor })).immediate();
+  } catch (e) {
+    if (e && e.rollbackResult) return e.rollbackResult;
+    throw e;
+  }
 }
 /** 持ち主の確認と書き込みを同じトランザクションで (終了直後に記録が入らないように — Codex PR1 R4) */
 function upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor }) {
@@ -677,8 +803,19 @@ function upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor }) {
     .run(...cols.map((c) => rec[c]), now, cur.id, cur.version);
   if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: db.prepare('SELECT * FROM f_iroha_label_waits WHERE id = ?').get(cur.id) };
   safeLogTaskEvent({ taskId: cur.task_id, action: 'label_wait_update', to: JSON.stringify(rec).slice(0, 300), ok: true });
-  void actor;
-  return { ok: true, row: db.prepare('SELECT * FROM f_iroha_label_waits WHERE id = ?').get(cur.id) };
+  // ⭐ラベル待ちの記録を「完了」にしたら、カードの「ラベル待ちで止まっています」の札も同じ書き込みで外す (案A)。
+  //   他の記録がまだ未完了なら外さない (ロットが 2 つあって片方だけ届いた、など)
+  let unblocked = null;
+  if (rec.done === 1 && !cur.done && owner && owner.blocked_reason === 'label_shortage') {
+    const stillOpen = db.prepare('SELECT COUNT(*) c FROM f_iroha_label_waits WHERE task_id = ? AND done = 0').get(cur.task_id).c;
+    if (stillOpen === 0) {
+      const u = clearTaskBlockInTx(db, owner, { via: 'label_wait_done', actor });
+      if (!u.ok) throw Object.assign(new Error(u.message || '札を外せませんでした'), { rollbackResult: u });   // 記録の更新ごと巻き戻す
+      unblocked = u.task;
+    }
+  }
+  // task = 札が外れたときだけ (画面がカードをその場で差し替える。外れなければ undefined)
+  return { ok: true, row: db.prepare('SELECT * FROM f_iroha_label_waits WHERE id = ?').get(cur.id), task: unblocked || undefined, unblocked: !!unblocked };
 }
 
 /**
@@ -719,7 +856,8 @@ export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerN
     const found = new Map(db.prepare(`SELECT id, status, close_reason, product_name, product_code, version FROM f_iroha_tasks
       WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids).map((r) => [r.id, r]));
     const updVer = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'stocked', closed_at = ?, closed_by = ?,
-        hold_reason_code = NULL, hold_reason_note = NULL, cancellation_requested_at = NULL, ready_at = COALESCE(ready_at, ?),
+        hold_reason_code = NULL, hold_reason_note = NULL, blocked_reason = NULL, blocked_note = NULL, blocked_at = NULL, blocked_by = NULL,
+        cancellation_requested_at = NULL, ready_at = COALESCE(ready_at, ?),
         version = version + 1, updated_at = ?, updated_by = ?
       WHERE id = ? AND status = 'ready_for_stocking' AND version = ?`);
     for (const { id, version } of items) {
@@ -758,16 +896,35 @@ export function _setStartTaskSessionHook(fn) { startTaskSessionHook = fn; }
  * @param worker 端末を操作している人 (状態変更の actor・ログに残る)
  * @param workers 実際に作業する人たち (複数可)。省略時は操作者ひとり
  */
-export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null }) {
+export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null }) {
   const db = getDB();
   const crew = (Array.isArray(workers) && workers.length) ? workers : [worker];
   const tx = db.transaction(() => {
     const g = appModeGuard();   // 見てから書くまでに Notion 正本へ戻ることがある (Codex PR1 R18)
     if (g) return g;
-    const t = getTask(taskId);
+    let t = getTask(taskId);
     if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
     if (t.status === 'closed') {
       return { ok: false, error: 'done_card', message: 'このカードは終了しています (やり直すなら職員が状態を戻してください)' };
+    }
+    // ⭐止まっている札が付いたまま始めない。画面は「まだ○○で止まっています。解消しましたか?」を出し、
+    //   「はい」なら clear_block: true で送り直す → 同じトランザクションで札を外してから始める (案A)
+    if (t.blocked_reason) {
+      if (!clearBlock) {
+        const b = blockedOf(t);
+        return { ok: false, error: 'blocked', blocked: b, task: t,
+          message: `まだ「${b.label}」で止まっています。解消していれば、確認してから始められます` };
+      }
+      // ⭐画面で確認した札 (版) と同じときだけ外す。確認している間に別の端末が理由を付け替えていたら、
+      //   その新しい札を黙って外さず、もう一度確認してもらう (Codex PR #1193 R1 #2)
+      if (expectVersion == null) return { ok: false, error: 'bad_request', message: '確認した版 (expect_version) が必要です (画面を更新してください)' };
+      if (Number(expectVersion) !== t.version) {
+        return { ok: false, error: 'conflict', current: t, blocked: blockedOf(t),
+          message: '止まっている理由が変わっています。もう一度確かめてください' };
+      }
+      const c = clearTaskBlockInTx(db, t, { via: 'start', actor: `${worker.display_name} (いろはアプリ)`, workerId: worker.id, workerName: worker.display_name, deviceLabel });
+      if (!c.ok) return c;
+      t = c.task;
     }
     const r = startSessions({
       taskId: t.id, productCode: t.product_code, title: t.product_name, workers: crew, deviceLabel,
