@@ -864,7 +864,9 @@ console.log('\n[16] 作業のやり方の選択肢 (資材・保管箱): Excel �
   {
     const { BUILTIN_OPTION_IMAGES, applyBuiltinOptionImages } = await import('../apps/iroha-work/db.js');
     const fsMod = await import('node:fs');
-    ok(BUILTIN_OPTION_IMAGES.length === 7 && BUILTIN_OPTION_IMAGES.every(b => fsMod.existsSync('public' + b.path)), '同梱画像 7 枚が public/app-images/iroha-work にある');
+    ok(BUILTIN_OPTION_IMAGES.length === 22 && BUILTIN_OPTION_IMAGES.every(b => fsMod.existsSync('public' + b.path)), '同梱画像 22 種が public/app-images/iroha-work にある');
+    ok(new Set(BUILTIN_OPTION_IMAGES.flatMap(b => b.keys.map(k => b.kind + ':' + normalizeOptionCode(k)))).size
+       === BUILTIN_OPTION_IMAGES.reduce((a, b) => a + b.keys.length, 0), '同じ kind で重複する key が無い (別の資材の写真が出ない)');
     ok(validateOptionImageUrl('/app-images/iroha-work/vinyl-313.png').ok, '同梱画像のパスは使える');
     ok(!validateOptionImageUrl('/app-images/iroha-work/../../server.js').ok && !validateOptionImageUrl('/app-images/other/x.png').ok, '同梱以外のパス・上位への脱出は不可');
     // 20Lコンテナ (表記揺れ 2 行) は seed 済み → 画像が付く。付いた後は上書きしない

@@ -1222,10 +1222,27 @@ const BUILTIN_IMAGE_PATH = /^\/app-images\/iroha-work\/[a-z0-9-]+\.png$/;
  * 完全一致しなければ付けない (別の資材に間違った写真を出さない)
  */
 export const BUILTIN_OPTION_IMAGES = [
-  { kind: 'material', path: '/app-images/iroha-work/vinyl-313.png', label: '313 ビニール袋 (260×380)', keys: ['313ビニール袋', 'ビニール袋313', 'ビニール袋 313', '313', 'NO.313', 'No.313'] },
-  { kind: 'material', path: '/app-images/iroha-work/vinyl-312.png', label: '312 ビニール袋 (230×340)', keys: ['312ビニール袋', 'ビニール袋312', 'ビニール袋 312', '312', 'NO.312', 'No.312'] },
-  { kind: 'material', path: '/app-images/iroha-work/vinyl-310.png', label: '310 ビニール袋 (180×270)', keys: ['310ビニール袋', 'ビニール袋310', 'ビニール袋 310', '310', 'NO.310', 'No.310'] },
-  { kind: 'material', path: '/app-images/iroha-work/vinyl-308.png', label: '308 ビニール袋 (130×250)', keys: ['308ビニール袋', 'ビニール袋308', 'ビニール袋 308', '308', 'NO.308', 'No.308'] },
+  { kind: 'material', path: '/app-images/iroha-work/vinyl-313.png', label: '313 ビニール袋 (260×380)', keys: ['313ビニール袋', 'ビニール袋313', 'ビニール袋 313', '313', 'No.313'] },
+  { kind: 'material', path: '/app-images/iroha-work/vinyl-312.png', label: '312 ビニール袋 (230×340)', keys: ['312ビニール袋', 'ビニール袋312', 'ビニール袋 312', '312', 'No.312'] },
+  { kind: 'material', path: '/app-images/iroha-work/vinyl-310.png', label: '310 ビニール袋 (180×270)', keys: ['310ビニール袋', 'ビニール袋310', 'ビニール袋 310', '310', 'No.310'] },
+  { kind: 'material', path: '/app-images/iroha-work/vinyl-308.png', label: '308 ビニール袋 (130×250)', keys: ['308ビニール袋', 'ビニール袋308', 'ビニール袋 308', '308', 'No.308'] },
+  // ピュアパック (テープ付 OPP)。Excel の値は T28-43 のような形。サイズ目安の括弧つき表記も拾う
+  { kind: 'material', path: '/app-images/iroha-work/t28-43.png', label: 'T28-43 ピュアパック (A3判用 280×430)', keys: ['T28-43', 'T28-43(A3)', 'T28-43(A3用)', 'T28-43 A3'] },
+  { kind: 'material', path: '/app-images/iroha-work/t22-5-31-a4.png', label: 'T22.5-31 (A4用 225×310)', keys: ['T22.5-31', 'T22.5-31(A4)', 'T22.5-31(A4用)', 'T22.5-31 A4', 'T22-5-31'] },
+  { kind: 'material', path: '/app-images/iroha-work/t16-22-5-a5.png', label: 'T16-22.5 (A5用 160×225)', keys: ['T16-22.5', 'T16-22.5(A5)', 'T16-22.5(A5用)', 'T16-22.5 A5', 'T16-22-5'] },
+  { kind: 'material', path: '/app-images/iroha-work/t15-30.png', label: 'T15-30 (150×300)', keys: ['T15-30'] },
+  { kind: 'material', path: '/app-images/iroha-work/t10-28.png', label: 'T10-28 (100×280)', keys: ['T10-28'] },
+  { kind: 'material', path: '/app-images/iroha-work/t10-15.png', label: 'T10-15 (写真L判用 100×150)', keys: ['T10-15'] },
+  { kind: 'material', path: '/app-images/iroha-work/t9-8.png', label: 'T9-8 (90×80)', keys: ['T9-8'] },
+  { kind: 'material', path: '/app-images/iroha-work/t8-18.png', label: 'T8-18 (A7用長形)', keys: ['T8-18'] },
+  { kind: 'material', path: '/app-images/iroha-work/t7-18.png', label: 'T7-18 (70×180)', keys: ['T7-18'] },
+  { kind: 'material', path: '/app-images/iroha-work/t7-8.png', label: 'T7-8 (70×80)', keys: ['T7-8'] },
+  { kind: 'material', path: '/app-images/iroha-work/t6-16.png', label: 'T6-16 (60×160)', keys: ['T6-16'] },
+  { kind: 'material', path: '/app-images/iroha-work/t6-10.png', label: 'T6-10 (A8用 60×100)', keys: ['T6-10', 'T6-10(A8)', 'T6-10(A8用)'] },
+  // チャックポリ (厚口)
+  { kind: 'material', path: '/app-images/iroha-work/zip-d-8.png', label: 'D-8 チャックポリ (A7用 85×120)', keys: ['D-8', 'D8', 'D-8(A7)', 'D-8(A7用)'] },
+  { kind: 'material', path: '/app-images/iroha-work/zip-b-8.png', label: 'B-8 チャックポリ (A8用 60×85)', keys: ['B-8', 'B8', 'B-8(A8)', 'B-8(A8用)'] },
+  { kind: 'material', path: '/app-images/iroha-work/warabanshi.png', label: 'わら半紙', keys: ['わら半紙', 'ワラ半紙', 'わらばんし'] },
   { kind: 'container', path: '/app-images/iroha-work/carton-120.png', label: '120 段ボール', keys: ['120段ボール', '段ボール120', '120ダンボール', 'ダンボール120', '120'] },
   { kind: 'container', path: '/app-images/iroha-work/container-20l.png', label: '20L コンテナ', keys: ['20Lコンテナ', 'コンテナ20L', '20L', '20リットルコンテナ'] },
   { kind: 'container', path: '/app-images/iroha-work/container-9l.png', label: '9L コンテナ', keys: ['9Lコンテナ', 'コンテナ9L', '9L', '9リットルコンテナ'] },
