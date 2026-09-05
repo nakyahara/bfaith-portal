@@ -25,6 +25,8 @@ import { google } from 'googleapis';
 import { getDB, logEvent } from '../db.js';
 import { resolveVariationGroup, getNeCost } from '../lib/variation.js';
 import { imageTrackBlockReason } from '../lib/workflow-progress.js';
+// セットの画像の計画 (§4.7)。「作る」ことにした枠が埋まるまで出品させない
+import { pendingImagePlanSlots } from './set-derive.js';
 import { validatePageInfo, buildPageInfoHtml, mapNeShippingToRakuten } from '../lib/page-info.js';
 // URL の検証は miniPC 側と同じものを使う (別に書くと判定がズレる)
 import { parseRakutenItemUrl } from '../../../lib/rakuten-item-page.js';
@@ -1214,6 +1216,14 @@ export function buildItemPayload(db, draftId) {
   // #888 で「出品時のゲート」と画面に書いたまま配線が抜けていた。画像作成承認者の追加 (2026-08-23) で配線
   const imageBlock = imageTrackBlockReason(db, draftId);
   if (imageBlock) reasons.push(imageBlock);
+  // セットの画像の計画 (§4.7)。「直して使う/作り直す」の枠が空のままなら出品しない。
+  // 工程が done でも、あとから計画を変えれば画像は無い状態に戻る (Codex R1 high)
+  if (draft.parent_draft_id != null) {
+    const pending = pendingImagePlanSlots(db, draftId);
+    if (pending.length > 0) {
+      reasons.push(`画像の計画で作ることにした枠がまだ空です (${pending.map((p) => p.label).join(' / ')})`);
+    }
+  }
   // カラバリ (バリエーションページ) は 2026-09-02 から対応。SKU ごとに
   // 項目選択肢の値 (selectorValues) と カタログID が要る。材料は下の buildVariants で検証する
   const vari = resolveVariationGroup(db, draft.ne_code, { draftId, withMembers: true });

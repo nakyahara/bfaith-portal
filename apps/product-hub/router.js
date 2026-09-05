@@ -45,13 +45,17 @@ import {
 } from './lib/mall-status.js';
 import {
   createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode, closeNeStepIfConfirmed,
-  setNeRegistrationState, ackParentSnapshot,
+  setNeRegistrationState, ackParentSnapshot, setImagePlansOf, replaceSetImagePlans, pendingImagePlanSlots,
   recordSetDecision, latestSetDecision, describeSetDecision,
   SET_DECISIONS_CLOSING, SET_DECISION_REASONS, NE_STATE_LABELS,
 } from './services/set-derive.js';
 import { syncDraftLinks } from '../product-links/sync.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { backLinkOf } from './lib/back-link.js';
+// セットの画像計画の語彙 (§4.7)。画面と依頼書で同じ言葉を使う
+import {
+  SET_IMAGE_ACTIONS, SET_IMAGE_ACTION_LABELS, productionInstructions, imageSortOfSlot,
+} from './lib/set-image-plan.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
@@ -318,6 +322,12 @@ router.get('/detail/:id', (req, res) => {
     backLink: backLinkOf(req.query),
     // NE登録の進みの表示名 (2026-09-04)。カードと詳細で同じ言葉を使う
     NE_STATE_LABELS,
+    // 画像の引き継ぎ計画 (§4.7)。セットのときだけ中身が入る
+    setImagePlans: draft.parent_draft_id != null ? setImagePlansOf(db, draft.id) : [],
+    setImageActions: SET_IMAGE_ACTIONS,
+    setImageActionLabels: SET_IMAGE_ACTION_LABELS,
+    setImageInstructions: draft.parent_draft_id != null
+      ? productionInstructions(setImagePlansOf(db, draft.id)) : [],
     // ⑤「セット展開判断」の「作らない」理由の選択肢 (§5.4)。ボードと同じ辞書を使う
     setDecisionReasons: SET_DECISION_REASONS,
     draft, refs, images, specs, aiOutputs, events, yahoo, imageProduction,
@@ -598,11 +608,30 @@ router.post('/api/drafts/:id/images', (req, res) => {
     });
   }
   const db = getDB();
-  const maxSort = db.prepare('SELECT COALESCE(MAX(sort), -1) AS m FROM draft_images WHERE draft_id = ?').get(draft.id).m;
+  // 🚨 **空いている枠から埋める** (2026-09-05 / Codex R1 medium)。末尾に足すだけだと、
+  // セットの画像計画で「商品画像1を直して」と空けた枠に、届いた画像が入らず別の枠になる。
+  // 単品でも「途中の画像を消して入れ直す」がそのまま枠に戻るので自然
+  const used = new Set(db.prepare('SELECT sort FROM draft_images WHERE draft_id = ?')
+    .all(draft.id).map((r) => Number(r.sort)));
+  let nextSort = null;
+  // セットは「作ることにした枠」を先に埋める (Codex R2 medium)。単に最小の空きへ入れると、
+  // 「使わない」で空けた枠が先にあるとき、依頼した枠ではなくそちらに入ってしまう
+  if (draft.parent_draft_id != null) {
+    const waiting = pendingImagePlanSlots(db, draft.id)
+      .map((pl) => imageSortOfSlot(pl.slot))
+      .filter((n) => n != null && !used.has(n))
+      .sort((a, b) => a - b);
+    if (waiting.length > 0) [nextSort] = waiting;
+  }
+  // それ以外は空いている最小の枠から埋める (途中を消して入れ直すとそこに戻る)
+  if (nextSort == null) {
+    nextSort = 0;
+    while (used.has(nextSort)) nextSort += 1;
+  }
   try {
     const info = db.prepare(`
       INSERT INTO draft_images (draft_id, drive_file_id, drive_url, sort) VALUES (?, ?, ?, ?)
-    `).run(draft.id, parsed.id, isHttpUrl(raw) ? raw : null, maxSort + 1);
+    `).run(draft.id, parsed.id, isHttpUrl(raw) ? raw : null, nextSort);
     res.json({ ok: true, id: info.lastInsertRowid, thumb: thumbnailUrl(parsed.id, 320) });
   } catch (e) {
     if (String(e.message).includes('UNIQUE')) {
@@ -2725,6 +2754,21 @@ router.post('/api/drafts/:id/ne-registration', (req, res) => {
   try {
     const r = setNeRegistrationState(db, draft.id, req.body || {}, actorOf(req));
     res.json({ ok: true, state: r.state, reason: r.reason });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 画像の引き継ぎ計画 (§4.7)。枠ごとに そのまま使う/直して使う/作り直す/使わない を置き換える。
+// 変えると「そのまま使う」枠の画像がコピーされ、制作工程が todo ⇄ skip で追従する
+router.put('/api/drafts/:id/set-image-plan', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  if (!canOperateSetDraft(db, req, draft)) {
+    return res.status(403).json({ ok: false, error: '画像の計画を変えられるのは、いまの工程の担当者かセット企画者、管理者だけです' });
+  }
+  try {
+    const r = replaceSetImagePlans(db, draft.id, req.body?.items, actorOf(req));
+    res.json({ ok: true, ...r, plans: setImagePlansOf(db, draft.id) });
   } catch (e) { workflowError(res, e); }
 });
 

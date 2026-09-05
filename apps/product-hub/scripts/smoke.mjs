@@ -3180,6 +3180,8 @@ const ms = await import('../lib/mall-status.js');
 
 // ─── セット商品の派生ドラフト (2026-08-23) ───
 const sd = await import('../services/set-derive.js');
+// セットの画像の引き継ぎ計画の語彙 (§4.7)
+const sip = await import('../lib/set-image-plan.js');
 let wfSetDraftId = null;
 let wfSetParentId = null;
 {
@@ -3534,6 +3536,266 @@ let wfSetParentId = null;
   check('セットから親が引ける', info?.parent?.id === parentId);
   check('セットの構成が引ける', info.members[0].qty === 2);
   check('単品では setInfo が null', sd.setInfoOf(db, parentId) === null);
+}
+
+// ─── セットの画像の引き継ぎ計画 (2026-09-04 §4.7) ───
+// 中原さん: 「詳細画像の既定は『作らない』ではなく、単品の詳細画像で**何枚目を修正**みたいな形で
+// 指示を送れるように」。枠ごとに そのまま使う/直して使う/作り直す/使わない を決める
+{
+  const parentId = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, status, price, created_by)
+    VALUES ('WF-IMG-P', '画像計画の親', 'approved', 1000, 'smoke')
+  `).run().lastInsertRowid);
+  // 親の画像: 白抜き (slot 0) + TOP (sort 0 = slot 1) + 商品画像2枚 (sort 1,2 = slot 2,3)
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, white_bg_drive_file_id, white_bg_drive_url)
+    VALUES (?, '565004', 'pw-white', 'https://drive.google.com/file/d/pw-white/view')`).run(parentId);
+  for (const [fid, sort] of [['pimg-top', 0], ['pimg-01', 1], ['pimg-02', 2]]) {
+    db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, drive_url, sort) VALUES (?, ?, ?, ?)')
+      .run(parentId, fid, `https://drive.google.com/file/d/${fid}/view`, sort);
+  }
+  wfp.progressOf(parentId, { db });
+  const pv = () => wfp.progressOf(parentId, { db }).main.find((x) => x.step_code === 'set_review').version;
+  const r = sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'WF-IMG-P', qty: 2 }], parent_step_version: pv() }, 'smoke', ADMIN);
+  const setId = r.draftId;
+
+  // ① 枠の数え方 (lib)。**既存の楽天スロット番号に合わせる** (1=TOP / 2=_01)。
+  //    draft_images.sort とは 1 ずれるので、変換を1箇所に閉じ込めている
+  check('枠: TOP は slot 1・_01 は slot 2 (draft_images.sort とは 1 ずれる)',
+    sip.slotOfImageSort(0) === 1 && sip.slotOfImageSort(1) === 2
+    && sip.imageSortOfSlot(1) === 0 && sip.imageSortOfSlot(2) === 1
+    && sip.imageSortOfSlot(sip.WHITE_BG_SLOT) === null);
+  check('枠: 呼び名は画面と依頼書で同じ',
+    sip.slotLabel(0) === '白抜き' && sip.slotLabel(1) === 'TOP画像' && sip.slotLabel(3) === '商品画像 2');
+
+  // ② 作成時に親の全枠ぶんの計画ができ、既定は「そのまま使う」
+  const plans0 = sd.setImagePlansOf(db, setId);
+  check('作成時: 親の全枠ぶんの計画ができる (白抜き + TOP + 商品画像2枚 = 4枠)',
+    plans0.length === 4 && plans0.map((p) => p.slot).join(',') === '0,1,2,3',
+    JSON.stringify(plans0.map((p) => p.slot)));
+  check('作成時: 既定は「そのまま使う」', plans0.every((p) => p.action === 'reuse'));
+  check('作成時: 親のどの画像かを覚えている (後から差し替わっても計画が読める)',
+    plans0.find((p) => p.slot === 1)?.parent_drive_file_id === 'pimg-top'
+    && plans0.find((p) => p.slot === 0)?.parent_drive_file_id === 'pw-white');
+
+  // ③ 「そのまま使う」枠の画像はセットにコピーされる (白抜きは楽天の欄へ)
+  const setImgs = db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ? ORDER BY sort').all(setId);
+  check('そのまま使う: 画像がセットにコピーされ、枠の位置も保たれる',
+    setImgs.map((i) => `${i.sort}:${i.drive_file_id}`).join(',') === '0:pimg-top,1:pimg-01,2:pimg-02',
+    JSON.stringify(setImgs));
+  check('そのまま使う: 白抜きは楽天の欄にコピーされる',
+    db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(setId)?.white_bg_drive_file_id === 'pw-white');
+  check('コピーは何度やっても増えない (計画を直すたびに走るため)',
+    sd.applyReuseImages(db, setId).copied === 0
+    && db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(setId).c === 3);
+
+  // ④ 全部そのまま使うなら制作は要らない = 画像の工程は「対象外」で決着
+  const detailSteps = () => db.prepare(`
+    SELECT p.step_code, p.state FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+    WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail' ORDER BY s.sort
+  `).all(setId);
+  check('全部そのまま使う → 画像の制作工程は「対象外」で決着する',
+    detailSteps().length > 0 && detailSteps().every((x) => x.state === 'skip'),
+    JSON.stringify(detailSteps().map((x) => x.state)));
+
+  // ⑤ 1枠でも「直して使う」にすると制作が動き出し、指示が依頼に載る
+  const put = (items) => sd.replaceSetImagePlans(db, setId, items, 'smoke');
+  put([
+    { slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
+    { slot: 2, action: 'modify', instruction: '2個並べた写真に' },
+    { slot: 3, action: 'drop' },
+  ]);
+  check('直して使う: 1枠でも入れば制作工程が「対象外」から戻る',
+    detailSteps().every((x) => x.state === 'todo'), JSON.stringify(detailSteps().map((x) => x.state)));
+  const ins = sip.productionInstructions(sd.setImagePlansOf(db, setId));
+  check('直して使う: 依頼に「どの枠を・どう直すか」が載る',
+    ins.length === 1 && ins[0].text === '商品画像 1: 直して使う — 2個並べた写真に', JSON.stringify(ins));
+  check('直して使う: 親からコピーしてあった画像は枠から外す (空で待つ)',
+    !db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND drive_file_id = ?').get(setId, 'pimg-01'),
+    JSON.stringify(db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ? ORDER BY sort').all(setId)));
+  check('使わない: その枠も空になる',
+    !db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND drive_file_id = ?').get(setId, 'pimg-02'));
+  check('そのまま使う枠は残る (TOP・白抜き)',
+    !!db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND drive_file_id = ?').get(setId, 'pimg-top')
+    && db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(setId)?.white_bg_drive_file_id === 'pw-white');
+  check('使わない: 枠を落としても他の枠は残る',
+    sd.setImagePlansOf(db, setId).find((p) => p.slot === 3)?.action === 'drop');
+
+  // ⑥ 「直して使う」は指示が必須 (指示の無い依頼は作れない)
+  let noIns = null;
+  try { put([{ slot: 2, action: 'modify', instruction: '  ' }]); } catch (e) { noIns = e; }
+  check('直して使う: どう直すかを書いていなければ 400',
+    noIns?.status === 400 && /どう直すか/.test(noIns.message), noIns?.message || '通ってしまった');
+  let badSlot = null;
+  try { put([{ slot: 9, action: 'reuse' }]); } catch (e) { badSlot = e; }
+  check('親に無い枠は受けない', badSlot?.status === 400, badSlot?.message || '通ってしまった');
+  let badAct = null;
+  try { put([{ slot: 1, action: 'unknown' }]); } catch (e) { badAct = e; }
+  check('知らない指定は受けない', badAct?.status === 400, badAct?.message || '通ってしまった');
+  let notSet = null;
+  try { sd.replaceSetImagePlans(db, parentId, [{ slot: 1, action: 'reuse' }], 'smoke'); } catch (e) { notSet = e; }
+  check('単品には計画を作らせない', notSet?.status === 400, notSet?.message || '通ってしまった');
+
+  // ⑥' 🚨 人が入れ直した画像・制作の成果物は、計画を変えても消さない。
+  //     消えるのは「親からコピーしたままのもの」だけ (届いた画像が消えるようでは使えない)
+  db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)')
+    .run(setId, 'made-by-designer', 1);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'recreate' },
+    { slot: 2, action: 'modify', instruction: '2個並べた写真に' }, { slot: 3, action: 'drop' }]);
+  check('🚨 制作で入った画像は、計画を変えても消さない',
+    !!db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND drive_file_id = ?').get(setId, 'made-by-designer'),
+    JSON.stringify(db.prepare('SELECT drive_file_id FROM draft_images WHERE draft_id = ?').all(setId)));
+  check('作り直す: 親からコピーしてあった TOP は外れる',
+    !db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND drive_file_id = ?').get(setId, 'pimg-top'));
+  db.prepare('DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = ?').run(setId, 'made-by-designer');
+
+  // ⑦ 戻せば制作工程もまた「対象外」になる (todo のものだけ。人が進めた done は触らない)
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' }, { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+  check('全部そのまま使うに戻せば、制作工程はまた「対象外」になる',
+    detailSteps().every((x) => x.state === 'skip'), JSON.stringify(detailSteps().map((x) => x.state)));
+  const firstStep = detailSteps()[0].step_code;
+  db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = ?`).run(setId, firstStep);
+  put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
+    { slot: 2, action: 'recreate', instruction: '' }, { slot: 3, action: 'reuse' }]);
+  check('🚨 人が進めた工程 (done) は巻き戻さない',
+    detailSteps().find((x) => x.step_code === firstStep)?.state === 'done',
+    JSON.stringify(detailSteps()));
+  check('作り直す: 指示は無くてもよい (直して使う と違う)',
+    sd.setImagePlansOf(db, setId).find((p) => p.slot === 2)?.action === 'recreate');
+
+  // ⑧ 履歴に残る (何をどう変えたか)
+  check('計画の変更は履歴に残る',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'set_image_plan_changed'`).get(setId).c >= 1);
+  check('作成時の計画も履歴に残る',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'set_image_plan_seeded'`).get(setId).c === 1);
+
+  // ⑧' 🚨 制作が全部 done のあとに「直して使う」を足しても、出品は止まる (Codex R1 high)。
+  //     工程は人の作業の記録なので巻き戻さない。出品ゲートは**実際に画像があるか**で見る
+  {
+    put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
+      { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+    db.prepare(`
+      UPDATE draft_step_progress SET state = 'done'
+      WHERE draft_id = ? AND step_code IN (SELECT code FROM ph_steps WHERE track = 'image')
+    `).run(setId);
+    check('計画が全部そのまま使うなら、作る予定の枠は無い',
+      sd.pendingImagePlanSlots(db, setId).length === 0);
+    put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
+      { slot: 2, action: 'modify', instruction: '2個並べた写真に' }, { slot: 3, action: 'reuse' }]);
+    const pend = sd.pendingImagePlanSlots(db, setId);
+    check('🚨 制作が done でも、あとから足した「直して使う」の枠は「まだ空」と分かる',
+      pend.length === 1 && pend[0].slot === 2, JSON.stringify(pend.map((x) => x.slot)));
+    check('🚨 その状態では出品ゲートが止める (工程が done でも)',
+      (listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, setId).reasons || []));
+    // 画像が届けば止まらない (計画より後に入った画像であること)
+    db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)')
+      .run(setId, 'made-01', sip.imageSortOfSlot(2));
+    check('画像が届けば、計画の枠では止まらなくなる',
+      sd.pendingImagePlanSlots(db, setId).length === 0
+      && !(listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, setId).reasons || []));
+
+    // 🚨 指示を変えたら、**前の指示で作った画像では満たされない** (Codex R2 high)。
+    // 「2個並べて」の成果物が入っていても、「3個並べて」に変えたら作り直しが要る
+    put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
+      { slot: 2, action: 'modify', instruction: '3個並べた写真に' }, { slot: 3, action: 'reuse' }]);
+    check('🚨 指示を変えたら、前の指示で作った画像では満たされない',
+      sd.pendingImagePlanSlots(db, setId).map((x) => x.slot).join(',') === '2',
+      JSON.stringify(sd.pendingImagePlanSlots(db, setId).map((x) => x.slot)));
+    check('🚨 指示を変えたあとは出品も止まる',
+      (listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画で作ることにした枠/.test(x)));
+
+    // 🚨 指定を変えた枠は、変えた先が何であれ前の画像を残さない (Codex R3 high)
+    db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)')
+      .run(setId, 'made-02', sip.imageSortOfSlot(2));
+    put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
+      { slot: 2, action: 'drop' }, { slot: 3, action: 'reuse' }]);
+    check('🚨 直して使う → 使わない: 前の成果物は枠から外れる (使わないのに出品に残らない)',
+      !db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND drive_file_id = ?').get(setId, 'made-02'),
+      JSON.stringify(db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ?').all(setId)));
+    db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)')
+      .run(setId, 'made-03', sip.imageSortOfSlot(2));
+    put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
+      { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+    check('🚨 直して使う → そのまま使う: 前の成果物ではなく親の画像に戻る',
+      !db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND drive_file_id = ?').get(setId, 'made-03')
+      && db.prepare('SELECT drive_file_id FROM draft_images WHERE draft_id = ? AND sort = ?')
+        .get(setId, sip.imageSortOfSlot(2))?.drive_file_id === 'pimg-01',
+      JSON.stringify(db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ? ORDER BY sort').all(setId)));
+
+    db.prepare('DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = ?').run(setId, 'made-01');
+  }
+
+  // ⑧'' 🚨 同じ画像を別の枠へ移したあとに計画を変えても、移した先からは消さない (Codex R1 medium)
+  {
+    put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
+      { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+    // TOP の画像 (pimg-top) を人が商品画像2の枠へ移した
+    db.prepare('UPDATE draft_images SET sort = ? WHERE draft_id = ? AND drive_file_id = ?')
+      .run(sip.imageSortOfSlot(3), setId, 'pimg-top');
+    put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'recreate' },
+      { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+    check('🚨 別の枠へ移した画像は、計画を変えても消さない',
+      !!db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND drive_file_id = ? AND sort = ?')
+        .get(setId, 'pimg-top', sip.imageSortOfSlot(3)),
+      JSON.stringify(db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ?').all(setId)));
+    // 🚨 その状態で元の枠を「そのまま使う」に戻しても、同じ画像は 1 商品に 1 回しか置けないので
+    //    枠は空のまま。**使うつもりの枠が空**なら出品を止める (Codex R4 high)
+    put([{ slot: 0, action: 'reuse' }, { slot: 1, action: 'reuse' },
+      { slot: 2, action: 'reuse' }, { slot: 3, action: 'reuse' }]);
+    check('🚨 「そのまま使う」なのに枠が空 (画像が別の枠にある) なら未達として数える',
+      sd.pendingImagePlanSlots(db, setId).some((x) => x.slot === 1),
+      JSON.stringify({
+        pending: sd.pendingImagePlanSlots(db, setId).map((x) => x.slot),
+        images: db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ?').all(setId),
+      }));
+    check('🚨 その状態では出品も止まる',
+      (listing.buildItemPayload(db, setId).reasons || []).some((x) => /画像の計画/.test(x)));
+    check('使わない枠は空でよい (未達に数えない)',
+      !sd.pendingImagePlanSlots(db, setId).some((x) => x.action === 'drop'));
+    db.prepare('DELETE FROM draft_images WHERE draft_id = ?').run(setId);
+  }
+
+  // ⑧''' 導入前に作られたセット (計画が無い) にも、あとから計画を作る (Codex R4 medium)
+  {
+    const oldSetId = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, status, created_by, parent_draft_id, provisional_code)
+      VALUES ('WF-IMG-OLD', '導入前に作られたセット', 'draft', 'smoke', ?, 1)
+    `).run(parentId).lastInsertRowid);
+    wfp.ensureProgress(db, oldSetId);
+    // 人が入れた画像と、進行中の画像制作がある状態
+    db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)')
+      .run(oldSetId, 'hand-made', 0);
+    const detailOf = (id) => db.prepare(`
+      SELECT p.state FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+      WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail' ORDER BY s.sort
+    `).all(id).map((x) => x.state);
+    check('前提: 導入前のセットには計画が無い', sd.setImagePlansOf(db, oldSetId).length === 0);
+    const before = detailOf(oldSetId).join(',');
+    check('バックフィル: 親の枠ぶんの計画があとから作られる',
+      sd.backfillSetImagePlans(db) >= 1 && sd.setImagePlansOf(db, oldSetId).length === 4,
+      JSON.stringify(sd.setImagePlansOf(db, oldSetId).map((x) => x.slot)));
+    check('🚨 バックフィルは画像も工程も触らない (動いている制作を止めない)',
+      detailOf(oldSetId).join(',') === before
+      && db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(oldSetId).c === 1,
+      `${before} → ${detailOf(oldSetId).join(',')}`);
+    check('バックフィル: 2 回目は何もしない (冪等)', sd.backfillSetImagePlans(db) === 0);
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(oldSetId);
+  }
+
+  // ⑨ 親に画像が 1 枚も無いセットを「制作不要」にしない (画像ゼロで出品ゲートを素通りさせない)
+  const bareId = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-IMG-BARE', '画像の無い親', 'approved', 'smoke')
+  `).run().lastInsertRowid);
+  wfp.progressOf(bareId, { db });
+  const bareVer = () => wfp.progressOf(bareId, { db }).main.find((x) => x.step_code === 'set_review').version;
+  const rb = sd.createSetDraft(bareId, { mode: 'ai', parent_step_version: bareVer() }, 'smoke', ADMIN);
+  check('🚨 親に画像が無ければ計画は空。制作工程を「対象外」にしない',
+    sd.setImagePlansOf(db, rb.draftId).length === 0
+    && db.prepare(`
+      SELECT COUNT(*) AS c FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+      WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail' AND p.state = 'skip'
+    `).get(rb.draftId).c === 0);
 }
 
 // ─── セット工程トラック (2026-09-04 §4.1/§4.6/§5.1) ───
@@ -3995,6 +4257,9 @@ let wfSetParentId = null;
       "db.prepare('DELETE FROM draft_step_progress WHERE draft_id = ?').run(sid);",
       "const ins = db.prepare('INSERT INTO draft_step_progress (draft_id, step_code, state) VALUES (?,?,?)');",
       "for (const c of ['basic_info','ai_generate','desc_review','title_approve','set_review','listing']) ins.run(sid, c, 'done');",
+      // 画像の計画 (§4.7) も起動時に埋まること。親に画像を置き、セットの計画は消しておく
+      "db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'boot-top', 0)`).run(pid);",
+      "db.prepare('DELETE FROM draft_set_image_plans WHERE set_draft_id = ?').run(sid);",
       "db.close();",
       "console.log(JSON.stringify({ sid }));",
     ].join('\n');
@@ -4003,8 +4268,10 @@ let wfSetParentId = null;
       "const mm = await import('../../warehouse-mirror/db.js');",
       "const m = await import('../db.js');",
       "mm.initMirrorDB(); const db = m.initProductHubDB();",   // ← ここで移行が走るはず
-      "const rows = db.prepare(`SELECT p.step_code, s.track FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code WHERE p.draft_id = (SELECT id FROM product_drafts WHERE ne_code = 'BOOT-SET')`).all();",
-      "console.log(JSON.stringify(rows.map((r) => r.step_code + ':' + r.track)));",
+      "const sid2 = db.prepare(`SELECT id FROM product_drafts WHERE ne_code = 'BOOT-SET'`).get().id;",
+      "const rows = db.prepare(`SELECT p.step_code, s.track FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code WHERE p.draft_id = ?`).all(sid2);",
+      "const plans = db.prepare('SELECT slot, action FROM draft_set_image_plans WHERE set_draft_id = ?').all(sid2);",
+      "console.log(JSON.stringify({ steps: rows.map((r) => r.step_code + ':' + r.track), plans: plans }));",
     ].join('\n');
     const runNode = (src) => {
       const f = path.join(bootDir, 'run.mjs');
@@ -4019,8 +4286,13 @@ let wfSetParentId = null;
     runNode(script);
     const after = JSON.parse(runNode(boot));
     check('移行: 起動時の初期化で走る (呼び忘れるとボードの列が二重に並ぶ)',
-      after.some((x) => x.startsWith('set_compose:set')) && after.includes('listing:main')
-      && !after.some((x) => x.startsWith('basic_info:')), JSON.stringify(after));
+      after.steps.some((x) => x.startsWith('set_compose:set')) && after.steps.includes('listing:main')
+      && !after.steps.some((x) => x.startsWith('basic_info:')), JSON.stringify(after.steps));
+    // 🚨 画像の計画も**初期化の中で同期的に**埋まること。待たずに始めると、再起動直後の
+    //    最初のリクエストが出品だったとき計画 0 件で画像のゲートを素通りする (Codex R5 high)
+    check('画像の計画: 起動時の初期化で埋まる (待たずに始めると出品ゲートを素通りする)',
+      after.plans.length === 1 && after.plans[0].slot === 1 && after.plans[0].action === 'reuse',
+      JSON.stringify(after.plans));
   }
 }
 
@@ -5277,6 +5549,79 @@ let wfSetParentId = null;
   check('整合化: 重要度=他社なのに own_brand=1 → 0 に直す', bfRow(bf2).own_brand === 0);
   check('整合化: own_brand=1 で重要度未設定 → 自社商品を入れる', bfRow(bf3).image_priority === '自社商品（重要度：高）');
   for (const id of [bf1, bf2, bf3]) db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+
+  // ─── 画像の引き継ぎ計画: 実ルートで画面と API を通す (§4.7) ───
+  // テンプレートの描画テストだけでは router の渡し忘れを検知できない (#1181 の教訓)
+  {
+    const pIm = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('HTTP-IMG-P', '画像計画HTTPの親', 'smoke')
+    `).run().lastInsertRowid);
+    db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort)
+      VALUES (?, 'hp-top', 0), (?, 'hp-01', 1), (?, 'hp-02', 2)`).run(pIm, pIm, pIm);
+    wfp.progressOf(pIm, { db });
+    const ver = () => wfp.progressOf(pIm, { db }).main.find((x) => x.step_code === 'set_review').version;
+    const made = sd.createSetDraft(pIm, { mode: 'ai', parent_step_version: ver() }, 'smoke',
+      { isAdmin: true, actorStaffId: null });
+    const sIm = made.draftId;
+
+    const htmlIm = await (await fetch(`${base}/detail/${sIm}`)).text();
+    check('画像の計画: セットの詳細を実ルートで開ける (200 で表が描ける)',
+      htmlIm.includes('親の画像をどう使うか') && htmlIm.includes('TOP画像'), htmlIm.slice(0, 150));
+
+    let rIm = await call('PUT', `/api/drafts/${sIm}/set-image-plan`, {
+      items: [{ slot: 1, action: 'reuse' }, { slot: 2, action: 'modify', instruction: '2個並べた写真に' },
+        { slot: 3, action: 'reuse' }],
+    });
+    check('画像の計画: API で置き換えられる',
+      rIm.status === 200 && rIm.json.ok === true
+      && rIm.json.plans.find((x) => x.slot === 2)?.instruction === '2個並べた写真に',
+      JSON.stringify(rIm.json).slice(0, 200));
+    check('画像の計画: 「直して使う」にすると制作工程が動き出す',
+      rIm.json.needsProduction === true);
+    check('画像の計画: その枠の画像は空に戻る (制作の成果物を待つ)',
+      !db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND drive_file_id = ?').get(sIm, 'hp-01'));
+
+    rIm = await call('PUT', `/api/drafts/${sIm}/set-image-plan`, {
+      items: [{ slot: 1, action: 'reuse' }, { slot: 2, action: 'modify', instruction: '' },
+        { slot: 3, action: 'reuse' }],
+    });
+    check('画像の計画: 「直して使う」で指示が空なら 400', rIm.status === 400, JSON.stringify(rIm.json));
+    rIm = await call('PUT', `/api/drafts/${pIm}/set-image-plan`, { items: [{ slot: 1, action: 'reuse' }] });
+    check('画像の計画: 単品には作らせない', rIm.status === 400, JSON.stringify(rIm.json));
+
+    // 依頼の内容が画面に出る (作る人がここだけ見れば分かる)
+    const htmlIm2 = await (await fetch(`${base}/detail/${sIm}`)).text();
+    check('画像の計画: 依頼に載る指示が画面に出る',
+      htmlIm2.includes('この画像を作ってください') && htmlIm2.includes('2個並べた写真に'), '');
+
+    // 🚨 空けた枠に、画面から足した画像がそのまま入る (Codex R1 medium)。
+    //    末尾に足すだけだと「商品画像1を直して」と空けた枠に届かない
+    const addImg = await call('POST', `/api/drafts/${sIm}/images`,
+      { url: 'https://drive.google.com/file/d/made-by-http/view' });
+    check('画像の計画: 空いた枠に、画面から足した画像が入る (末尾ではなく途中の空きへ)',
+      addImg.status === 200
+      && db.prepare('SELECT sort FROM draft_images WHERE draft_id = ? AND drive_file_id = ?')
+        .get(sIm, 'made-by-http')?.sort === sip.imageSortOfSlot(2),
+      JSON.stringify(db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ? ORDER BY sort').all(sIm)));
+
+    // 🚨 「使わない」で空けた枠が前にあっても、**作ることにした枠**に入る (Codex R2 medium)。
+    //    単に最小の空きへ入れると、依頼した枠ではなく使わない枠が埋まってしまう
+    await call('PUT', `/api/drafts/${sIm}/set-image-plan`, {
+      // slot 1 を「使わない」で空け、slot 2 は指示を変える (= 作り直しが要る = 枠が空く)。
+      // 空きが 2 つできるので、どちらへ入るかで判定できる
+      items: [{ slot: 1, action: 'drop' }, { slot: 2, action: 'modify', instruction: '3個並べた写真に' },
+        { slot: 3, action: 'reuse' }],
+    });
+    const add2 = await call('POST', `/api/drafts/${sIm}/images`,
+      { url: 'https://drive.google.com/file/d/made-for-modify/view' });
+    check('画像の計画: 「使わない」で空いた枠より、「作る」ことにした枠を先に埋める',
+      add2.status === 200
+      && db.prepare('SELECT sort FROM draft_images WHERE draft_id = ? AND drive_file_id = ?')
+        .get(sIm, 'made-for-modify')?.sort === sip.imageSortOfSlot(2),
+      JSON.stringify(db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ? ORDER BY sort').all(sIm)));
+
+    db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(sIm, pIm);
+  }
 
   // ─── 配送方法: 「選んでいない」が保存で勝手に埋まらないこと (2026-09-05 / Codex high) ───
   // 画面は全項目をまとめて送る (collectRakutenFields) ので、未選択のとき NE の値を
@@ -6603,6 +6948,19 @@ renders.push(
       { ...d0[2], setDrafts: sd.setDraftsOf(db, wfSetParentId), setInfo: null }]);
     renders.push(['detail.ejs (セット商品・仮コード警告)', 'detail.ejs',
       { ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId) }]);
+    // 画像の引き継ぎ計画 (§4.7): 枠ごとの表と、依頼に載る指示
+    renders.push(['detail.ejs (セット商品・画像の計画)', 'detail.ejs', {
+      ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId),
+      setImagePlans: [
+        { slot: 0, parent_drive_file_id: 'pw-white', action: 'reuse', instruction: null, label: '白抜き' },
+        { slot: 1, parent_drive_file_id: 'pimg-top', action: 'reuse', instruction: null, label: 'TOP画像' },
+        { slot: 2, parent_drive_file_id: 'pimg-01', action: 'modify', instruction: '2個並べた写真に', label: '商品画像 1' },
+        { slot: 3, parent_drive_file_id: 'pimg-02', action: 'drop', instruction: null, label: '商品画像 2' },
+      ],
+      setImageInstructions: sip.productionInstructions([
+        { slot: 2, action: 'modify', instruction: '2個並べた写真に' },
+      ]),
+    }]);
     // NE の進み (§5.3): 要対応で止まっていて、親も派生後に更新された状態。
     // 配送方法は空 = セットはコピーしないので「NE確定待ち」が出る
     renders.push(['detail.ejs (セット商品・NE要対応)', 'detail.ejs', {
@@ -6930,6 +7288,9 @@ for (const [name, file, data] of renders) {
         // NE登録の進みの表示名 (2026-09-04)。router が board にも detail にも渡している
         NE_STATE_LABELS: sd.NE_STATE_LABELS,
         neRows: [],
+        // セットの画像の引き継ぎ計画 (2026-09-04 §4.7)。router が detail に渡している
+        setImagePlans: [], setImageInstructions: [],
+        setImageActions: sip.SET_IMAGE_ACTIONS, setImageActionLabels: sip.SET_IMAGE_ACTION_LABELS,
         skuPrices: {},
         trailingBanners: [
           { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
@@ -7398,6 +7759,22 @@ for (const [name, file, data] of renders) {
     dhSet.slice(Math.max(0, dhSet.indexOf('売価の目安')), dhSet.indexOf('売価の目安') + 200));
   check('セット詳細: 配送方法は「NE確定待ち」と理由を出す (コピーしていないため)',
     dhSet.includes('NE確定待ち') && dhSet.includes('個数で箱もサイズも変わる'), '');
+  // 画像の引き継ぎ計画 (§4.7)
+  const dhImg = renderedHtml.get('detail.ejs (セット商品・画像の計画)') || '';
+  check('画像の計画: 枠ごとの表を出す (親の画像・どうする・指示)',
+    dhImg.includes('親の画像をどう使うか') && dhImg.includes('白抜き') && dhImg.includes('TOP画像')
+    && dhImg.includes('商品画像 1'), dhImg.slice(0, 200));
+  check('画像の計画: いまの指定が選ばれた状態で出る',
+    /<select class="sip-action"[\s\S]*?<option value="modify" selected>直して使う<\/option>/.test(dhImg), '');
+  check('画像の計画: 指示文がそのまま入っている',
+    dhImg.includes('value="2個並べた写真に"'), '');
+  check('画像の計画: 制作の依頼に載る内容を別に見せる (作る人がここだけ見れば分かる)',
+    dhImg.includes('この画像を作ってください')
+    && dhImg.includes('<strong>商品画像 1</strong>: 直して使う — 2個並べた写真に'),
+    dhImg.slice(Math.max(0, dhImg.indexOf('この画像を作ってください')), dhImg.indexOf('この画像を作ってください') + 300));
+  check('画像の計画: 単品の詳細には出さない',
+    !(renderedHtml.get('detail.ejs (セットの親・作成済み一覧)') || '').includes('親の画像をどう使うか'));
+
   // 単品の詳細にはセットの表示を出さない
   // 🚨 キーは**描画テストの名前**であってファイル名ではない。'detail.ejs' では常に undefined になり、
   //    この下の否定形テスト (「出さない」) が空文字列に対して素通りしていた (2026-09-04 発見)
