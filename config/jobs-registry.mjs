@@ -398,8 +398,13 @@ export const JOBS_REGISTRY = [
     type: 'scheduled_job',
     importance: 'P2',
     owner: '中原さん',
-    purpose: 'ロジザード在庫スナップショットの毎時取込 (欠品LINE通知の他ロケ在庫表示 + Render mirror_logizard_stock)',
-    where: 'miniPC TaskScheduler [LogizardZaikoHourly]',
+    purpose: 'ロジザード在庫スナップショットの毎時取込 (欠品LINE通知の他ロケ在庫表示 + Render mirror_logizard_stock)。'
+      + '⭐2026-09-05 から step 2b で取込済 CSV を data\\logizard-history\\YYYY\\MM\\zaiko_YYYYMMDD_HHMM.csv.gz に圧縮保存 = '
+      + '在庫の履歴 (それまで毎時全置換で時系列がどこにも無かった、Company DB構想 D-7)。毎時 90 日 + 日次 (その日の最後) 永久。'
+      + 'BACKUP_RCLONE_REMOTE があれば最終要素を logizard-history に置き換えた先へ履歴フォルダ全体を rclone copy (offsite、削除なし)。'
+      + 'archive の結果はジョブ結果 (ok/partial) を変えず ping の note に写す: "archive skipped (stale csv)" (CSV が古い/空 = その時間の履歴無し) / '
+      + '"archive offsite failed" (保存は済、rclone 失敗) / "archive failed" (gzip・検証・同名衝突)',
+    where: 'miniPC TaskScheduler [LogizardZaikoHourly] (scripts/logizard-stock/run-hourly.ps1 → archive-snapshot.mjs)',
     schedule: '毎日 09:00-18:00 の毎時00分 (10回。どれか1回の成功で当日ok。日中の停止は欠品通知の「HH:MM時点」表示でも見える)',
     anchor_hour_jst: 9,
     anchor_minute_jst: 0,
@@ -408,7 +413,9 @@ export const JOBS_REGISTRY = [
     // mirror push 失敗が7時間 (ほぼ丸一日分) 続いたら stalled (ローカルの欠品通知は生きている)
     partial_max_days: 6,
     lifecycle: 'permanent',
-    runbook: 'C:\\Users\\bfaith\\bfaith-portal\\logs\\logizard-stock-hourly.log と C:\\tools\\logizard-automation\\logs を確認。手動再実行: powershell -File C:\\Users\\bfaith\\bfaith-portal\\scripts\\logizard-stock\\run-hourly.ps1',
+    runbook: 'C:\\Users\\bfaith\\bfaith-portal\\logs\\logizard-stock-hourly.log と C:\\tools\\logizard-automation\\logs を確認。手動再実行: powershell -File C:\\Users\\bfaith\\bfaith-portal\\scripts\\logizard-stock\\run-hourly.ps1。'
+      + '履歴の確認: data\\logizard-history\\manifest.jsonl の末尾 (1 時間に 1 行増える)。archive だけ手動: node -r dotenv/config scripts/logizard-stock/archive-snapshot.mjs (--dry-run 可)。'
+      + '設計と復元方法 = scripts/logizard-stock/README.md',
   },
   // logizard-kinkyu-hokyu (miniPC 毎日08:50 の緊急在庫補充) は 2026-08-09 に台帳から撤去。
   //   miniPCのTaskScheduler [Logizard-KinkyuHokyu] は同日 /DISABLE 済み (削除はしていない)。

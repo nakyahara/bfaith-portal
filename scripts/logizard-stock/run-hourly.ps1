@@ -57,15 +57,37 @@ if ($code -ne 0) {
   exit 1
 }
 
+# Step 2b: archive the imported CSV as data\logizard-history\YYYY\MM\zaiko_YYYYMMDD_HHMM.csv.gz
+#   (stock history did not exist anywhere before 2026-09-05: raw_lz_inventory is a full replace and the
+#    CSV is overwritten every hour). Retention: hourly 90 days, daily last-of-day forever, optional rclone offsite.
+#   Never changes the job result (ok/partial); outcome goes to the log and to the ping note:
+#     exit 0 = archived (or same CSV as last hour)   exit 3 = skipped, CSV stale/empty -> gap in history this hour
+#     exit 4 = archived but rclone offsite failed    other  = archive failed (gzip/verify/collision)
+$archiveNote = $null
+cmd /c "node -r dotenv/config scripts\logizard-stock\archive-snapshot.mjs --csv `"$csv`" >> `"$log`" 2>&1"
+$code = $LASTEXITCODE
+if ($code -eq 3) {
+  Write-Log 'step2b archive SKIPPED (csv stale or empty) - history has a gap this hour'
+  $archiveNote = 'archive skipped (stale csv)'
+} elseif ($code -eq 4) {
+  Write-Log 'step2b archive ok but OFFSITE FAILED (local copy kept, rclone catches up next hour)'
+  $archiveNote = 'archive offsite failed'
+} elseif ($code -ne 0) {
+  Write-Log "step2b archive FAILED (exit $code) - import is ok, history has a gap this hour"
+  $archiveNote = 'archive failed'
+}
+
 # Step 3: mirror push to Render (freshness-guarded full replace + count verification)
 cmd /c "node apps\warehouse\sync-to-render.js --logizard-only >> `"$log`" 2>&1"
 $code = $LASTEXITCODE
 if ($code -ne 0) {
   Write-Log "step3 mirror push FAILED (exit $code) - local import is ok"
-  Send-Ping 'partial' 'mirror push failed'
+  $note = 'mirror push failed'
+  if ($archiveNote) { $note = "$note; $archiveNote" }
+  Send-Ping 'partial' $note
   exit 0
 }
 
 Write-Log 'all steps ok'
-Send-Ping 'ok' $null
+Send-Ping 'ok' $archiveNote
 exit 0
