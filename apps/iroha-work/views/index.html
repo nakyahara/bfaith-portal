@@ -279,6 +279,9 @@
   .bulkbar .cnt{font-family:var(--num);font-weight:700;font-size:1.05rem}
   .bulkbar button{border:0;border-radius:var(--r);padding:10px 16px;font-weight:700;font-size:.95rem;cursor:pointer}
   .bulkbar .go{background:var(--ok);color:#fff;margin-left:auto}
+  /* ✅ 棚入待ち → 棚入完了 (1 枚ずつ。職員モードだけ) — 中原さん 2026-09-05 */
+  .stockbtn{flex:none;border:1px solid var(--ok);background:var(--ok-soft);color:var(--ok);border-radius:var(--r-sm);padding:6px 10px;font-weight:700;font-size:.85rem;cursor:pointer;min-height:36px;margin-right:6px}
+  .bcard .stockbtn{margin:6px 0 0;display:inline-block}
   .bulkbar .cancel{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.45)}
 
   /* ── 表 (ラベル待ち・履歴) ── */
@@ -1481,6 +1484,7 @@ function renderList() {
       '<div class="meta num">' + meta + '</div>' +
       (meta2 ? '<div class="meta2 num">' + meta2 + '</div>' : '') + '</div>' +
       // 状態: 変更が許されていればタップできる札 (data-st)、許されていなければただの札
+      (selectable ? '' : stockBtnHtml(c)) +
       (selectable ? ''
         : stateCan('task.status.change')
           ? '<button class="st ' + stClass(c.status) + '" data-st="' + esc(c.id) + '">' + esc(stLabel(c)) + ' ▾</button>'
@@ -1493,6 +1497,8 @@ function renderList() {
 $('#q').addEventListener('input', renderList);
 // 一覧のクリックも委譲 (状態の札 / 選択 / 詳細)
 $('#list').addEventListener('click', (e) => {
+  const stockBtn = e.target.closest('[data-stock-of]');
+  if (stockBtn) { e.stopPropagation(); stockOne(stockBtn.dataset.stockOf); return; }   // ✅ 1 枚だけ棚入完了
   const st = e.target.closest('[data-st]');
   if (st) { e.stopPropagation(); openSt(e, st.dataset.st); return; }
   const row = e.target.closest('[data-id]');
@@ -1735,6 +1741,8 @@ $('#board').addEventListener('click', (e) => {
   if (facBtn) { e.stopPropagation(); openFacPick(facBtn.dataset.facOf); return; }
   const whenBtn = e.target.closest('[data-when-of]');
   if (whenBtn) { e.stopPropagation(); openWhenPick(whenBtn.dataset.whenOf); return; }   // 今日 / 明日 / 未定 から選ぶ
+  const stockBtn = e.target.closest('[data-stock-of]');
+  if (stockBtn) { e.stopPropagation(); stockOne(stockBtn.dataset.stockOf); return; }   // ✅ 1 枚だけ棚入完了
   const el = e.target.closest('[data-id]');
   if (!el) return;
   // 下見 (正本が Notion) でも詳細は読むだけで開ける (中原さん 2026-09-03「これで何がどう変わるのか想像できない」)
@@ -1798,6 +1806,11 @@ function renderBoard() {
 }
 /** 掴み手。⭐動かせるときだけ描く (動かせないのに掴めるように見せない — 要件 §U-7) */
 function gripHtml() { return '<span class="grip" data-grip aria-hidden="true">⠿</span>'; }
+/** 棚入待ちのカードに「✅ 棚入完了」(職員モードだけ。まとめて選んでいる間は出さない) — 中原さん 2026-09-05 */
+function stockBtnHtml(c) {
+  if (c.status !== 'ready_for_stocking' || bulkIds || !isApp() || !stateCan('tasks.bulk_stocked') || !isStaffUI()) return '';
+  return '<button class="stockbtn" data-stock-of="' + esc(c.id) + '">✅ 棚入完了</button>';
+}
 function bcardHtml(c, status) {
   const selectable = bulkIds && status === 'ready_for_stocking';
   // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
@@ -1820,7 +1833,7 @@ function bcardHtml(c, status) {
     // ⛔ 止まっている理由は赤い 1 行で (小さな文字に埋めない — 中原さん 2026-09-05)
     (c.blocked ? '<div class="bblk">⛔ ' + esc(c.blocked.label) + 'で止まっています</div>' : '') +
     (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') +
-    planTagsHtml(c) + '</div></div>';
+    planTagsHtml(c) + stockBtnHtml(c) + '</div></div>';
 }
 
 /**
@@ -2656,30 +2669,53 @@ function syncBulkSelection(visible) {
   if (dropped > 0) toast(dropped + ' 件は絞り込みで見えなくなったので選択から外しました');
   renderBulk();
 }
-async function doBulkStocked() {
+/**
+ * 棚入完了にする (まとめて・1 枚) — 職員だけ。⭐**先に確認、次に PIN** (中原さん 2026-09-05「ワンクッション入れて」):
+ * 何を終了にするかを一覧で見せて「はい」を押してもらい、そのあと PIN。終了にすると一覧から外れる (履歴には残る) ことも書く
+ * @param entries [{ id, version }] 選んだときに見えていた版 (別の端末が変えていたら、その 1 枚は飛ばされる)
+ */
+async function completeStocked(entries, { fromBulk = false } = {}) {
   if (!stateCan('tasks.bulk_stocked')) return;   // 許可リストに無ければ動かない (ボタンも描いていない。二重の守り)
-  if (!bulkIds || bulkIds.size === 0) { toast('カードを選んでください'); return; }
+  const items = (entries || []).filter((x) => x && x.id != null);
+  if (!items.length) { toast('カードを選んでください'); return; }
   const w = worker;
   if (!w) { openGate(); return; }
-  const ids = [...bulkIds.keys()];
+  if (!state.me.session && w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです (右上の名前を職員に替えてください)'); return; }
+  const names = items.map((x) => (findCard(x.id) || {}).title).filter(Boolean);
+  const list = names.slice(0, 8).join('\n') + (names.length > 8 ? '\n…ほか ' + (names.length - 8) + ' 件' : '');
+  // ① 確認 (ワンクッション)。何を終了にするか・戻せない (一覧から外れる) ことを見せる
+  const okGo = await ask({
+    title: items.length === 1 ? '「' + (names[0] || '') + '」を棚入完了にしますか?' : '本当に ' + items.length + ' 件を棚入完了にしますか?',
+    text: (items.length === 1 ? '' : list + '\n\n') + '棚に入れ終わったものだけにしてください。終了にすると一覧から外れます (履歴には残ります)',
+    ok: items.length === 1 ? 'はい、棚入完了にする' : 'はい、' + items.length + ' 件を棚入完了にする', cancel: 'やめる', danger: true,
+  });
+  if (!okGo) return;
+  // ② 職員PIN (端末から。ポータルから入っている人は職員なので要らない)
   let pin = null;
   if (!state.me.session) {
-    if (w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです'); return; }
-    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください (' + ids.length + ' 件を棚入完了にします)', input: 'pin', ok: 'つづける' });
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '棚入完了にする' });
     if (pin == null) return;
   }
-  const names = ids.map(id => (findCard(id) || {}).title).filter(Boolean);
-  const list = names.slice(0, 8).join('\n') + (names.length > 8 ? '\n…ほか ' + (names.length - 8) + ' 件' : '');
-  if (!(await ask({ title: ids.length + ' 件を棚入完了にします', text: list, ok: '棚入完了にする' }))) return;
   const j = await apiFetch('/api/bulk-stocked', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids: ids.map((id) => ({ id, version: bulkIds.get(id) })), worker_id: w.id, pin }) });
+    body: JSON.stringify({ ids: items.map((x) => ({ id: x.id, version: x.version })), worker_id: w.id, pin }) });
   if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
   const skipped = (j.skipped || []).length;
   // 飛ばした理由は「状態が変わった」だけではない (作業中・見つからない・すでに完了) — 理由は下の警告に出す
   toast(j.done.length + ' 件を棚入完了にしました' + (skipped ? ' (' + skipped + ' 件は棚入完了にできませんでした)' : ''));
   if (skipped) showWarn((j.skipped || []).map(x => (x.title || '#' + x.id) + ': ' + bulkSkipLabel(x.reason)).join(' / '));
-  exitBulk();
+  if (fromBulk) exitBulk();
   await loadState();
+}
+async function doBulkStocked() {
+  if (!stateCan('tasks.bulk_stocked')) return;   // 許可リストに無ければ動かない (ボタンも描いていない。二重の守り)
+  if (!bulkIds || bulkIds.size === 0) { toast('カードを選んでください'); return; }
+  await completeStocked([...bulkIds.entries()].map(([id, version]) => ({ id, version })), { fromBulk: true });
+}
+/** 棚入待ちのカード 1 枚を棚入完了に (ボード・一覧の ✅ から — 中原さん 2026-09-05「個別に完了できるように」) */
+async function stockOne(id) {
+  const c = findCard(id);
+  if (!c || c.status !== 'ready_for_stocking') { showErr('棚入待ちのカードではありません。画面を更新します'); loadState(); return; }
+  await completeStocked([{ id: c.id, version: c.version }]);
 }
 const BULK_SKIP = { already: 'すでに棚入完了', not_ready: '棚入待ちではありません', not_found: '見つかりません',
   conflict: '同時に変更されました', active_sessions: '作業中の人がいます' };

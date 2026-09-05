@@ -3624,6 +3624,11 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok((html.match(/\['unblocked', '止まっていない'\]/g) || []).length === 2 && /curTab === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html)
     && /curWhen === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html) && /c\.unblocked = c\.all - c\.blocked;/.test(html),
     '「止まっていない」(⛔ を除く) の絞り込みが一覧とボードの両方にある (中原さん 2026-09-05)');
+  ok(/async function completeStocked\(entries, \{ fromBulk = false \} = \{\}\)/.test(html) && /const okGo = await ask\(\{[\s\S]{0,700}\}\);\s*if \(!okGo\) return;\s*\/\/ ② 職員PIN/.test(html),
+    'まとめて棚入完了は「先に確認 (何を・戻せない) → 次に PIN」のワンクッション (中原さん 2026-09-05)');
+  ok(/async function stockOne\(id\)/.test(html) && /function stockBtnHtml\(c\)/.test(html) && (html.match(/closest\('\[data-stock-of\]'\)/g) || []).length === 2
+    && /c\.status !== 'ready_for_stocking' \|\| bulkIds \|\| !isApp\(\) \|\| !stateCan\('tasks\.bulk_stocked'\) \|\| !isStaffUI\(\)/.test(html),
+    '棚入待ちのカードに ✅ 棚入完了 (1 枚ずつ。職員モードだけ・まとめて選択中は出さない) — 一覧とボードの両方');
   ok(!/on_hold/.test(html) && !/holdReasons/.test(html) && !/hold_qty/.test(html), '画面から旧「保留」(on_hold / holdReasons / hold_qty) が消えている');
   ok(/function canEditProgress\(c\)/.test(html)
     && /c\.status !== 'closed' && c\.status !== 'ready_for_stocking'/.test(html)
