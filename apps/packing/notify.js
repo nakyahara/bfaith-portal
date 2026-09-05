@@ -116,11 +116,13 @@ export async function notifyStockout({ folder, slipSeq, neSlipNo, siteOrderNo = 
     return false;
   }
   const hm = (iso) => { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; };
+  // 商品名・送り先名は改行と装飾記号を落とす (通知の行構造を壊さない — Codex R1 Low)
+  const ct = (v) => String(v ?? '-').replace(/[\r\n\t]+/g, ' ').replace(/[*_~`]/g, '').slice(0, 200) || '-';
   const text = [
     '🚫 *出荷保留 (在庫なし)* — NE で出荷保留にして、お客様対応をお願いします (3階に在庫がありませんでした)',
-    `伝票: *${neSlipNo}* (${folder || '-'}${slipSeq ? ` #${slipSeq}` : ''}) / モール伝票番号: ${siteOrderNo || '-'} / 送り先: ${recipientName || '-'}`,
-    ...items.map((i) => `・${i.name || i.sku} (${i.sku}) × ${i.qty}個 — 3階: ${i.claimedBy || '-'} ${hm(i.at)}`),
-    `確認: ${worker} (商品と納品書は出荷保留の棚)`,
+    `伝票: *${ct(neSlipNo)}* (${ct(folder)}${slipSeq ? ` #${slipSeq}` : ''}) / モール伝票番号: ${ct(siteOrderNo)} / 送り先: ${ct(recipientName)}`,
+    ...items.map((i) => `・${ct(i.name || i.sku)} (${ct(i.sku)}) × ${i.qty}個 在庫なし${i.delivered > 0 ? ` (${i.delivered}個は他ロケから確保して1階へ)` : ''} — 3階: ${ct(i.claimedBy)} ${hm(i.at)}`),
+    `確認: ${ct(worker)} (商品と納品書は出荷保留の棚)`,
   ].join('\n');
   const res = await fetch(url, {
     method: 'POST',

@@ -320,8 +320,13 @@ const MIGRATIONS = {
   // v14: 現場間バナーに「対象伝票を開く」リンクを持たせる (例外処理監査 PR-1・2026-09-05)。
   //   3階の「在庫なし」を1階の全端末に赤バナーで知らせ、その伝票へ直接飛べるようにする
   //   (以前は在庫なしが1階のどの画面にも出ず、伝票が「⏳再ピック対応待ち」のまま何日も残った)
+  //   task_id = 元になった梱包タスク (在庫なしバナー)。タスクが在庫なしでなくなったら resolved_at で消す
+  //   (以前はメッセージ文字列でしか重複排除できず、見つかった/届けた後も4時間残った — Codex R1)
   14: () => {
     db.exec('ALTER TABLE pk_floor_alerts ADD COLUMN link TEXT');
+    db.exec('ALTER TABLE pk_floor_alerts ADD COLUMN task_id INTEGER');
+    db.exec('ALTER TABLE pk_floor_alerts ADD COLUMN resolved_at TEXT');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_floor_alerts_task ON pk_floor_alerts(task_id, kind)');
   },
 };
 

@@ -102,6 +102,7 @@
     const heldSlips = slipList.filter((x) => x.status === 'held' && x.holdReason === 'repick');
     // 🚫 3階「在庫なし」の報告 (seq → 商品) と、1階が確認して閉じた伝票 (出荷保留・在庫なし) — 例外処理監査 PR-1
     const stockoutMap = (typeof stockoutBySlip !== 'undefined' && stockoutBySlip) ? stockoutBySlip : {};
+    const ackSet = new Set((typeof stockoutAckSeqs !== 'undefined' && stockoutAckSeqs) || []);   // 「在庫なしを確認」できる伝票 (サーバーと同じ条件)
     const stockoutSlips = slipList.filter((x) => x.status === 'cancelled' && x.holdReason === 'stockout');
     const jstHm = (iso) => { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; };
     const TASK_LABEL = { requested: '⏳ ピッカー対応待ち', claimed: '🏃 ピッカーが取りに行っています', fulfilled: '✅ 届きました' };
@@ -264,7 +265,7 @@
                const ready = cands.length === 0 && tks.length > 0 && tks.every((t) => t.status === 'fulfilled');
                // 3階が「在庫なし」にした商品。他の依頼が残っていなければ「在庫なしを確認」で伝票を閉じられる
                const na = stockoutMap[hs.seq] || [];
-               const canAck = cands.length === 0 && tks.length === 0 && na.length > 0;
+               const canAck = na.length > 0 && ackSet.has(hs.seq);
                const nameOf = (sku) => (hs.lines.find((l) => l.sku === sku) || {}).name || sku; %>
             <div class="open-req <%= ready ? 'ready' : (na.length ? 'stockout' : '') %>" data-seq="<%= hs.seq %>">
               <div class="grow">#<%= hs.seq %> <%= hs.slipNo %> / <%= hs.recipientName || '' %> (NE <%= hs.neSlipNo %>)
@@ -278,7 +279,10 @@
                     <button type="button" class="found-sku" data-seq="<%= hs.seq %>" data-sku="<%= t.sku %>" data-name="<%= nameOf(t.sku) %>">見つかった</button></div>
                 <% } %>
                 <% for (const t of na) { %>
-                  <div style="color:#c92a2a; font-weight:700">🚫 <%= nameOf(t.sku) %> × <%= t.req_qty %> — 3階: 在庫なし (<%= t.claimed_by || t.requested_by || '-' %> <%= jstHm(t.updated_at) %>)</div>
+                  <div style="color:#c92a2a; font-weight:700">🚫 <%= nameOf(t.sku) %> × <%= t.unavailable_qty ?? t.req_qty %><%= (t.fulfilled_qty || 0) > 0 ? ` (${t.fulfilled_qty}個は他ロケから届きます)` : '' %> — 3階: 在庫なし (<%= t.claimed_by || t.requested_by || '-' %> <%= jstHm(t.updated_at) %>)</div>
+                <% } %>
+                <% if (na.length > 0 && !canAck) { %>
+                  <div class="sub" style="color:#c92a2a">他の商品の再ピック・未送信の候補が片付くと「在庫なしを確認」で出荷保留にできます</div>
                 <% } %>
                 <% if (cands.length === 0 && tks.length === 0 && na.length === 0) { %><div>⏳ 保留中</div><% } %>
               </div>
@@ -398,8 +402,8 @@
           if (r.status === 409) location.reload();
           return;
         }
-        if (r.body && r.body.stockoutNotify === 'failed') {
-          alert('伝票を出荷保留 (在庫なし) にしましたが、事務への通知に失敗しました。口頭かチャットで伝えてください');
+        if (r.body && r.body.stockoutNotify && r.body.stockoutNotify !== 'sent') {
+          alert('伝票を出荷保留 (在庫なし) にしました。事務への通知はまだ届いていません (自動で再送します)。急ぐなら口頭かチャットで伝えてください');
         }
         location.reload();
       } finally {

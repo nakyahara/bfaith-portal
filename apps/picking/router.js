@@ -264,6 +264,13 @@ router.post('/api/tasks/:id(\\d+)/:action', checkOrigin, async (req, res) => {
     const psvc = await packingSvc();
     if (!psvc) return res.status(404).json({ error: '梱包連携は無効です' });
     const worker = resolveWorker(req);
+    // 再ピックは 🔴バッチに一本化 (Q4 決定 2026-09-05)。この API は棚戻しだけ — 古い画面・直接リクエストからの
+    // 二経路更新 (片方で在庫なし・片方で確保) を残さない (Codex R1 High)
+    const target = psvc.getTask(Number(req.params.id));
+    if (!target) return res.status(404).json({ error: '依頼が見つかりません', code: 'not_found' });
+    if (target.kind !== 'return') {
+      return res.status(409).json({ error: '再ピックはバッチ一覧の 🔴バッチから操作してください', code: 'repick_batch_only' });
+    }
     const t = psvc.applyTaskAction(Number(req.params.id), String(req.params.action), worker.name);
     if (t._notifyUnavailable) {
       import('../packing/notify.js')
@@ -437,9 +444,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   // replay でも実行する (Codexレビュー: 同期の一時失敗後、同一op_id再送で収束させる。
   // 各アクションは遷移ガードつきで二重適用は失敗ログ止まり=無害)。分岐は syncRepickTask (テスト対象)
   {
-    const sync = syncRepickTask(batchId,
-      { event: req.body.event, lineSeq: req.body.line_seq == null ? null : Number(req.body.line_seq) },
-      worker.name, await packingSvc());
+    const sync = syncRepickTask(batchId, { event: req.body.event }, worker.name, await packingSvc());
     if (sync.unavailable) {
       const { task, remaining, altQty } = sync.unavailable;
       import('../packing/notify.js')

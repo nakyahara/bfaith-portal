@@ -4,9 +4,11 @@
  * 守りたいこと:
  *   ① 再ピックバッチで「他ロケで全量確保」→ タスクは fulfilled (以前は unavailable になっていた — 9/3・9/5 実発生)
  *   ② 再ピックバッチでは「後で取りに行く」を使えない (依頼が pending_binding で迷子になる — 9/1 実発生)
- *   ③ 「どこにもない」→ unavailable + 1階の全端末へ赤バナー (link つき)。配賦は作らない
- *   ④ unavailable → fulfill を許す (後で見つけた・届けた)
- *   ⑤ 棚戻しキューは棚戻しだけ (再ピックは 🔴バッチに一本化 — Q4)
+ *   ③ 「どこにもない」→ unavailable + 1階の全端末へ赤バナー (task_id・link つき)。配賦は作らない。部分確保は内訳を保存
+ *   ④ back / cancel で取り消したら claimed / requested へ戻り、バナーは閉じる (Codex R1 High: 後から fulfilled に化けない)
+ *   ⑤ 同期は状態から収束する = replay・障害後にバナーを作り直す (task_id で1本に集約)
+ *   ⑥ 1階が受け取り済みなら back できない
+ *   ⑦ 棚戻しキューは棚戻しだけ (再ピックは 🔴バッチに一本化 — Q4)
  *
  * 実行: node apps/picking/tests/test-unavailable-flow.mjs
  */
@@ -41,6 +43,7 @@ function throwsCode(fn, code, name) {
 let op = 0;
 const ev = (batchId, event, extra = {}, worker = '星立夏') =>
   applyEvent(batchId, { opId: `t${++op}`, event, ...extra }, worker);
+const lastOp = () => `t${op}`;
 
 function mkPickBatch(tbNo, { sku, lineQty, slipQtys }) {
   const info = db.prepare(`INSERT INTO pk_batches
@@ -71,12 +74,12 @@ function mkPackBatch(tbNo, { sku, slipQtys }) {
   });
   return batchId;
 }
-/** ピッカーが「後で取りに行く」→ 展開 → 🔴再ピックバッチ を作って返す。 */
-function laterToRepick(tbNo, sku) {
-  const pk = mkPickBatch(tbNo, { sku, lineQty: 1, slipQtys: [1] });
-  const pb = mkPackBatch(tbNo, { sku, slipQtys: [1] });
+/** ピッカーが「後で取りに行く」(qty 個) → 展開 → 🔴再ピックバッチ を作って返す。 */
+function laterToRepick(tbNo, sku, qty = 1) {
+  const pk = mkPickBatch(tbNo, { sku, lineQty: qty, slipQtys: [qty] });
+  const pb = mkPackBatch(tbNo, { sku, slipQtys: [qty] });
   ev(pk, 'start');
-  ev(pk, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'later' });
+  ev(pk, 'shortage', { lineSeq: 1, shortageQty: qty, altQty: 0, remaining: 'later' });
   bindPendingLaterRequests();
   reconcileRepickBatches();
   const task = db.prepare("SELECT * FROM pk_pack_tasks WHERE batch_id=? AND kind='repick' ORDER BY id DESC LIMIT 1").get(pb);
@@ -84,7 +87,11 @@ function laterToRepick(tbNo, sku) {
   assert.ok(rb, '🔴再ピックバッチが作られる');
   return { pk, pb, task, rb };
 }
-const taskStatus = (id) => db.prepare('SELECT status FROM pk_pack_tasks WHERE id=?').get(id).status;
+const taskRow = (id) => db.prepare('SELECT * FROM pk_pack_tasks WHERE id=?').get(id);
+const taskStatus = (id) => taskRow(id).status;
+const batchStatus = (id) => db.prepare('SELECT status FROM pk_batches WHERE id=?').get(id).status;
+const stockoutAlerts = (taskId) => listFloorAlerts('to_packing').filter((a) => a.kind === 'stockout' && a.task_id === taskId);
+const sync = (rbId, event, worker = '田中美波') => syncRepickTask(rbId, { event }, worker, psvc);
 
 // ═══ ① 他ロケで全量確保 → fulfilled ═══════════════════════════════════════════
 console.log('── 再ピックバッチで他ロケから全量確保 ──');
@@ -92,20 +99,24 @@ console.log('── 再ピックバッチで他ロケから全量確保 ──')
   const { task, rb } = laterToRepick('U1', 'sku-u1');
   t('start → claimed', () => {
     ev(rb.id, 'start', {}, '田中美波');
-    syncRepickTask(rb.id, { event: 'start', lineSeq: null }, '田中美波', psvc);
+    const r = sync(rb.id, 'start');
+    assert.deepEqual(r.actions, ['claim']);
     assert.equal(taskStatus(task.id), 'claimed');
   });
   t('欠品ボタン → 他ロケで1個確保 (残り0) → バッチ done・タスク fulfilled (在庫なしにならない)', () => {
     ev(rb.id, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 1, altBlock: 'P3FA', altLocation: '004-020-05', remaining: null }, '田中美波');
-    const r = syncRepickTask(rb.id, { event: 'shortage', lineSeq: 1 }, '田中美波', psvc);
+    const r = sync(rb.id, 'shortage');
     assert.equal(r.unavailable, null, '在庫なし通知は出ない');
-    assert.equal(db.prepare('SELECT status FROM pk_batches WHERE id=?').get(rb.id).status, 'done');
+    assert.equal(batchStatus(rb.id), 'done');
     assert.equal(taskStatus(task.id), 'fulfilled');
-    assert.equal(listFloorAlerts('to_packing').filter((a) => a.kind === 'stockout').length, 0, '赤バナーは出ない');
+    assert.equal(taskRow(task.id).fulfilled_qty, 1);
+    assert.equal(stockoutAlerts(task.id).length, 0, '赤バナーは出ない');
   });
-  t('梱包側は受領待ち (repickReady) として見える', () => {
-    const ready = psvc.listRepickReady();
-    assert.ok(ready.some((g) => g.tasks.some((x) => x.id === task.id)), 'fulfilled = 緑バナーの元');
+  t('梱包側は受領待ち (repickReady) として見える / 同期を再実行しても変わらない (replay)', () => {
+    assert.ok(psvc.listRepickReady().some((g) => g.tasks.some((x) => x.id === task.id)), 'fulfilled = 緑バナーの元');
+    const r = sync(rb.id, 'shortage');
+    assert.deepEqual(r.actions, []);
+    assert.equal(taskStatus(task.id), 'fulfilled');
   });
 }
 
@@ -114,51 +125,143 @@ console.log('── 再ピックバッチでの「後で取りに行く」 ─�
 {
   const { rb, task } = laterToRepick('U2', 'sku-u2');
   ev(rb.id, 'start', {}, '田中美波');
+  sync(rb.id, 'start');
   throwsCode(() => ev(rb.id, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'later' }, '田中美波'),
     'later_in_repick', '再ピックバッチの「後で取りに行く」は 400 later_in_repick');
   t('拒否されたので依頼 (pk_later_requests) は増えていない・バッチも進んでいない', () => {
     assert.equal(db.prepare("SELECT COUNT(*) c FROM pk_later_requests WHERE batch_id=?").get(rb.id).c, 0);
     assert.equal(db.prepare('SELECT status FROM pk_lines WHERE batch_id=? AND seq=1').get(rb.id).status, 'pending');
-    assert.equal(taskStatus(task.id), 'requested');
+    assert.equal(taskStatus(task.id), 'claimed');
   });
 
   // ═══ ③ どこにもない → unavailable + 赤バナー ═══════════════════════════════
   console.log('── 再ピックバッチで「どこにもない」 ──');
   t('shortage(none) → タスク unavailable・配賦なし・バッチ done でも fulfill しない', () => {
     ev(rb.id, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' }, '田中美波');
-    const r = syncRepickTask(rb.id, { event: 'shortage', lineSeq: 1 }, '田中美波', psvc);
+    const r = sync(rb.id, 'shortage');
     assert.ok(r.unavailable, '在庫なし通知の情報が返る');
     assert.equal(r.unavailable.remaining, 1);
     assert.equal(taskStatus(task.id), 'unavailable');
+    assert.equal(taskRow(task.id).unavailable_qty, 1);
+    assert.equal(taskRow(task.id).fulfilled_qty, 0);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM pk_shortage_allocations WHERE batch_id=?').get(rb.id).c, 0, '再ピックバッチには配賦を作らない');
-    assert.equal(db.prepare('SELECT status FROM pk_batches WHERE id=?').get(rb.id).status, 'done');
-    // done 後の同期でも fulfill に化けない (在庫なしの明細がある)
-    syncRepickTask(rb.id, { event: 'next', lineSeq: 1 }, '田中美波', psvc);
+    assert.equal(batchStatus(rb.id), 'done');
+    // done 後の同期 (replay) でも fulfill に化けない・通知情報も付かない
+    const r2 = sync(rb.id, 'shortage');
+    assert.deepEqual(r2.actions, []);
+    assert.equal(r2.unavailable, null, 'replay では GChat 用の情報は付かない');
     assert.equal(taskStatus(task.id), 'unavailable');
   });
-  t('1階の全端末へ赤バナー (商品・伝票・数量・誰が) + 対象伝票へのリンク', () => {
-    const a = listFloorAlerts('to_packing').find((x) => x.kind === 'stockout');
-    assert.ok(a, 'stockout バナーがある');
-    assert.match(a.message, /在庫なし/);
-    assert.match(a.message, /出荷_88 #1/);
-    assert.match(a.message, /田中美波/);
-    assert.equal(a.link, `/apps/packing/work/${task.batch_id}?seq=1`);
+  t('1階の全端末へ赤バナー (商品・伝票・数量・誰が) + 対象伝票へのリンク + task_id', () => {
+    const a = stockoutAlerts(task.id);
+    assert.equal(a.length, 1, 'stockout バナーは1本');
+    assert.match(a[0].message, /在庫なし/);
+    assert.match(a[0].message, /出荷_88 #1/);
+    assert.match(a[0].message, /田中美波/);
+    assert.equal(a[0].link, `/apps/packing/work/${task.batch_id}?seq=1`);
   });
-  t('梱包側 getWorkState に在庫なしの報告 (stockoutBySlip) が出る', () => {
+  t('梱包側 getWorkState に在庫なしの報告 (stockoutBySlip) と確認可否 (stockoutAckSeqs) が出る', () => {
     const st = psvc.getWorkState(task.batch_id);
     assert.deepEqual(Object.keys(st.stockoutBySlip), ['1']);
     assert.equal(st.stockoutBySlip[1][0].sku, 'sku-u2');
     assert.equal(st.stockoutBySlip[1][0].claimed_by, '田中美波');
+    assert.deepEqual(st.stockoutAckSeqs, [1]);
   });
-  // ═══ ④ unavailable → fulfill ═════════════════════════════════════════════
-  t('在庫なしにした後で届けた: unavailable → fulfill を許す', () => {
-    psvc.applyTaskAction(task.id, 'fulfill', '田中美波');
-    assert.equal(taskStatus(task.id), 'fulfilled');
-    assert.deepEqual(Object.keys(psvc.getWorkState(task.batch_id).stockoutBySlip), [], '在庫なしの報告は消える');
+  // ═══ ⑤ 障害・replay 後の自己修復 ═══════════════════════════════════════
+  t('バナーが消えていても (障害) 同期でもう一度作る。残っていれば増やさない', () => {
+    db.prepare("DELETE FROM pk_floor_alerts WHERE task_id=? AND kind='stockout'").run(task.id);
+    sync(rb.id, 'shortage');
+    assert.equal(stockoutAlerts(task.id).length, 1);
+    sync(rb.id, 'next');
+    assert.equal(stockoutAlerts(task.id).length, 1);
   });
 }
 
-// ═══ ⑤ 棚戻しキューは棚戻しだけ ═══════════════════════════════════════════════
+// ═══ ④ back / cancel で取り消す ═══════════════════════════════════════════════
+console.log('── back / cancel の同期 ──');
+{
+  const { rb, task } = laterToRepick('U4', 'sku-u4');
+  ev(rb.id, 'start', {}, '田中美波');
+  sync(rb.id, 'start');
+  ev(rb.id, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' }, '田中美波');
+  const shortOp = lastOp();
+  sync(rb.id, 'shortage');
+  assert.equal(taskStatus(task.id), 'unavailable');
+  assert.equal(stockoutAlerts(task.id).length, 1);
+  t('back (done → picking) → タスク claimed (resume)・部分数量クリア・赤バナーは閉じる', () => {
+    ev(rb.id, 'back', { lineSeq: 1, undoOpId: shortOp }, '田中美波');
+    assert.equal(batchStatus(rb.id), 'picking');
+    const r = sync(rb.id, 'back');
+    assert.deepEqual(r.actions, ['resume']);
+    assert.equal(taskStatus(task.id), 'claimed');
+    assert.equal(taskRow(task.id).unavailable_qty, null);
+    assert.equal(stockoutAlerts(task.id).length, 0, 'バナーは resolved');
+  });
+  t('cancel (picking → ready) → タスク requested (reopen)', () => {
+    ev(rb.id, 'cancel', {}, '田中美波');
+    assert.equal(batchStatus(rb.id), 'ready');
+    const r = sync(rb.id, 'cancel');
+    assert.deepEqual(r.actions, ['reopen']);
+    assert.equal(taskStatus(task.id), 'requested');
+  });
+  t('やり直して通常完了 → fulfilled (取り消した在庫なしは残らない)', () => {
+    ev(rb.id, 'start', {}, '田中美波');
+    sync(rb.id, 'start');
+    ev(rb.id, 'next', { lineSeq: 1 }, '田中美波');
+    const r = sync(rb.id, 'next');
+    assert.deepEqual(r.actions, ['fulfill']);
+    assert.equal(taskStatus(task.id), 'fulfilled');
+    assert.equal(stockoutAlerts(task.id).length, 0);
+  });
+  t('完了後の back (done → picking) → fulfilled → claimed に戻る', () => {
+    ev(rb.id, 'back', { lineSeq: 1, undoOpId: lastOp() }, '田中美波');
+    const r = sync(rb.id, 'back');
+    assert.deepEqual(r.actions, ['resume']);
+    assert.equal(taskStatus(task.id), 'claimed');
+  });
+}
+
+console.log('── 部分確保 (3個中2個は他ロケで確保・1個は在庫なし) ──');
+{
+  const { rb, task } = laterToRepick('U5', 'sku-u5', 3);
+  ev(rb.id, 'start', {}, '田中美波');
+  sync(rb.id, 'start');
+  t('unavailable_qty=1 / fulfilled_qty=2 が保存され、バナーと通知情報に内訳が出る', () => {
+    ev(rb.id, 'shortage', { lineSeq: 1, shortageQty: 3, altQty: 2, altBlock: 'P3FB', altLocation: '002-013-03', remaining: 'none' }, '田中美波');
+    const r = sync(rb.id, 'shortage');
+    assert.equal(taskStatus(task.id), 'unavailable');
+    assert.equal(taskRow(task.id).unavailable_qty, 1);
+    assert.equal(taskRow(task.id).fulfilled_qty, 2);
+    assert.equal(r.unavailable.remaining, 1);
+    assert.equal(r.unavailable.altQty, 2);
+    assert.match(stockoutAlerts(task.id)[0].message, /×1 \(2個は届けます\)/);
+    const st = psvc.getWorkState(task.batch_id);
+    assert.equal(st.stockoutBySlip[1][0].unavailable_qty, 1);
+    assert.equal(st.stockoutBySlip[1][0].fulfilled_qty, 2);
+  });
+}
+
+// ═══ ⑥ 1階が受け取り済みなら back できない ═══════════════════════════════════
+console.log('── 受領後の back ──');
+{
+  const { rb, task, pb } = laterToRepick('U6', 'sku-u6');
+  ev(rb.id, 'start', {}, '田中美波');
+  sync(rb.id, 'start');
+  ev(rb.id, 'next', { lineSeq: 1 }, '田中美波');
+  sync(rb.id, 'next');
+  assert.equal(taskStatus(task.id), 'fulfilled');
+  psvc.applyEvent(pb, { opId: `p${++op}`, event: 'receive', slipSeq: 1 }, '三宅晴菜');
+  assert.equal(taskStatus(task.id), 'received');
+  throwsCode(() => ev(rb.id, 'back', { lineSeq: 1, undoOpId: `t${op - 1}` }, '田中美波'),
+    'already_received', '1階が受け取った後は back できない (409 already_received)');
+  t('received は終端: 同期しても触らない', () => {
+    const r = sync(rb.id, 'next');
+    assert.deepEqual(r.actions, []);
+    assert.equal(taskStatus(task.id), 'received');
+  });
+}
+
+// ═══ ⑦ 棚戻しキューは棚戻しだけ ═══════════════════════════════════════════════
 console.log('── /tasks は棚戻し専用 ──');
 {
   const { pb } = laterToRepick('U3', 'sku-u3');
@@ -169,6 +272,11 @@ console.log('── /tasks は棚戻し専用 ──');
     assert.ok(ret.length >= 1 && ret.every((x) => x.kind === 'return'));
     assert.ok(psvc.listOpenTasks().some((x) => x.kind === 'repick'));
     assert.equal(psvc.countOpenTasks({ kind: 'return' }), 1);
+  });
+  t('getTask で種別を引ける (API の棚戻し限定ガード用)', () => {
+    const ret = psvc.listOpenTasks({ kind: 'return' })[0];
+    assert.equal(psvc.getTask(ret.id).kind, 'return');
+    assert.equal(psvc.getTask(999999), null);
   });
 }
 

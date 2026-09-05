@@ -477,6 +477,7 @@ router.get('/line/:id(\\d+)', (req, res) => {
   let incidents = [];
   let repickBySlip = {};
   let stockoutBySlip = {};   // 3階「在庫なし」の報告 (保留伝票 seq → 商品)
+  let stockoutAckSeqs = [];  // そのうち「在庫なしを確認」できる伝票
   let tasks = [];
   try {
     const st = getWorkState(batch.id);
@@ -489,6 +490,7 @@ router.get('/line/:id(\\d+)', (req, res) => {
     incidents = st.incidents.map((i) => ({ id: i.id, slipSeq: i.slip_seq, kind: i.kind, sku: i.sku, qty: i.qty }));
     repickBySlip = st.repickBySlip || {};
     stockoutBySlip = st.stockoutBySlip || {};
+    stockoutAckSeqs = st.stockoutAckSeqs || [];
     // 未完了の再ピックタスク (SKU 単位の状態表示・SKU 単位の「見つかった」用)
     tasks = getDB().prepare(`SELECT id, slip_seq AS slipSeq, sku, req_qty AS qty, status FROM pk_pack_tasks
       WHERE batch_id=? AND kind='repick' AND status IN ('requested','claimed','fulfilled') ORDER BY id`).all(batch.id);
@@ -498,6 +500,7 @@ router.get('/line/:id(\\d+)', (req, res) => {
     incidents,
     repickBySlip,
     stockoutBySlip,
+    stockoutAckSeqs,
     tasks,
     methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
     twoLabelsOption: SHIP_CHANGE_TWO_LABELS,
@@ -568,12 +571,18 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   }
   // ①②のGChat通知 (fail-soft・DBのタスク行が正本。replayでは taskNotify が付かない=再送しない)
   if (result.taskNotify?.kind === 'stockout') {
-    // 🚫 在庫なしを確認 → 事務へ (NE で出荷保留にしてもらう)。成否を画面に返す (失敗は口頭連絡へ)
+    // 🚫 在庫なしを確認 → 事務へ (NE で出荷保留にしてもらう)。outbox (pk_pack_stockouts) の行が正本で、
+    // 送れたときだけ notified_at。失敗・未設定はポーラーが再送する。成否は画面にも返す
+    const n = result.taskNotify;
+    const stamp = () => new Date().toISOString().slice(0, 19) + 'Z';
     try {
-      const sent = await notifyStockout({ ...result.taskNotify, worker });
-      if (!sent) result.stockoutNotify = 'failed';
+      const sent = await notifyStockout({ ...n, worker });
+      getDB().prepare('UPDATE pk_pack_stockouts SET notified_at=?, notify_error=? WHERE id=?')
+        .run(sent ? stamp() : null, sent ? null : 'webhook未設定', n.stockoutId);
+      result.stockoutNotify = sent ? 'sent' : 'failed';
     } catch (e) {
-      console.warn(`[packing-notify] 出荷保留 (在庫なし) 通知失敗 (${result.taskNotify.neSlipNo}): ${e.message}`);
+      console.warn(`[packing-notify] 出荷保留 (在庫なし) 通知失敗 (${n.neSlipNo}): ${e.message}`);
+      getDB().prepare('UPDATE pk_pack_stockouts SET notify_error=? WHERE id=?').run(String(e.message).slice(0, 200), n.stockoutId);
       result.stockoutNotify = 'failed';
     }
   } else if (result.taskNotify) {
@@ -916,6 +925,7 @@ router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
     repickSeqs: s.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
     repickUnavailableSeqs: Object.keys(s.stockoutBySlip || {}).map(Number),
     stockoutBySlip: s.stockoutBySlip || {},
+    stockoutAckSeqs: s.stockoutAckSeqs || [],
     stockoutSeqs: s.slips.filter((x) => x.status === 'cancelled' && x.hold_reason === 'stockout').map((x) => x.seq),
     incidents: s.incidents,
     lastDoneSeq: lastDoneSeqOf(Number(req.params.id)),

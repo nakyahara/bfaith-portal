@@ -201,6 +201,7 @@
         <div style="font-weight:800; color:#c92a2a; font-size:17px">🚫 3階から「在庫なし」の報告</div>
         <div id="stockoutList" style="margin:6px 0 10px; font-size:15px"></div>
         <button type="button" id="stockoutAckBtn" style="width:100%; padding:12px; background:#e03131; color:#fff; border:none; border-radius:10px; font-weight:800; font-size:16px">在庫なしを確認 → この伝票を出荷保留にする (事務へ通知)</button>
+        <div id="stockoutWait" style="display:none; font-size:14px; color:#c92a2a">この伝票には他の商品の再ピック・未送信の候補が残っています。それが片付く (受け取った / 見つかった / 送信) と、ここで出荷保留にできます</div>
         <div style="font-size:12.5px; color:#868e96; margin-top:6px">商品と納品書は出荷保留の棚へ。NE の出荷保留は事務が行います</div>
       </div>
       <button type="button" id="receiveBtn" style="border-color:#2b8a3e; color:#2b8a3e; font-weight:700; padding:10px 18px; font-size:16px">📦 再ピック品を受け取った (再開)</button>
@@ -377,6 +378,7 @@
       repickSeqs: state.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
       repickReadySeqs: Object.entries(state.repickBySlip || {}).filter(([, st]) => st === 'fulfilled').map(([q]) => Number(q)),
       stockoutBySlip: state.stockoutBySlip || {},   // 3階「在庫なし」の報告がある保留伝票 (seq → 商品)
+      stockoutAckSeqs: state.stockoutAckSeqs || [],  // そのうち「在庫なしを確認」できる伝票 (サーバーと同じ条件)
       stockoutSeqs: state.slips.filter((x) => x.status === 'cancelled' && x.hold_reason === 'stockout').map((x) => x.seq),
       incidents: (state.incidents || []).map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku, actualName: i.actual_name || null, qty: i.qty, slipSeq: i.slip_seq })),
       methodOptions: typeof methodOptions === 'undefined' ? [] : methodOptions,
@@ -449,6 +451,11 @@
     const repickReadySet = new Set(STATE.repickReadySeqs || []);
     const stockoutSet = new Set(STATE.stockoutSeqs || []);   // 1階が「在庫なしを確認」して閉じた伝票 (出荷保留・在庫なし)
     let stockoutBySlip = STATE.stockoutBySlip || {};         // 3階「在庫なし」の報告 (保留伝票 seq → [{sku, product_name, req_qty, claimed_by, updated_at}])
+    const stockoutAckSet = new Set(STATE.stockoutAckSeqs || []);   // 「在庫なしを確認」できる伝票 (他の再ピック・候補が残っていない)
+    // 同期判定用: 在庫なし報告の中身 (件数・数量・時刻) まで含めた版 (キーだけだと2件目や数量変更で描き直されない — Codex R1)
+    const stockoutVersion = () => Object.entries(stockoutBySlip)
+      .flatMap(([seq, rows]) => (rows || []).map((t) => `${seq}:${t.id}:${t.sku}:${t.unavailable_qty ?? t.req_qty}:${t.updated_at}`))
+      .sort().join('|') + '#' + [...stockoutAckSet].sort().join(',');
     const jstHm = (iso) => { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; };
     let incidents = STATE.incidents || [];   // 未確定のミス候補 (完了サマリで確定/取下げ)
     let currentSeq = STATE.currentSeq;  // 次に梱包する伝票 = 最小の未処理 (null=全完了)
@@ -598,7 +605,11 @@
       $('stockoutBox').style.display = na.length ? 'block' : 'none';
       if (na.length) {
         $('stockoutList').innerHTML = na.map((t) =>
-          `🚫 <b>${esc(t.product_name || t.sku)}</b> × ${t.req_qty} — 3階: ${esc(t.claimed_by || t.requested_by || '-')} ${jstHm(t.updated_at)}`).join('<br>');
+          `🚫 <b>${esc(t.product_name || t.sku)}</b> × ${t.unavailable_qty ?? t.req_qty}${(t.fulfilled_qty || 0) > 0 ? ` <small>(${t.fulfilled_qty}個は他ロケから届きます)</small>` : ''} — 3階: ${esc(t.claimed_by || t.requested_by || '-')} ${jstHm(t.updated_at)}`).join('<br>');
+        // ボタンはサーバーが許可する伝票にだけ (他の商品の再ピック中・未送信候補ありは 409 になる — Codex R1)
+        const canAck = stockoutAckSet.has(viewSeq);
+        $('stockoutAckBtn').style.display = canAck ? '' : 'none';
+        $('stockoutWait').style.display = canAck ? 'none' : '';
       }
       $('receiveBtn').style.display = (na.length && !ready) ? 'none' : '';
       $('receiveBtn').disabled = !ready;
@@ -801,13 +812,17 @@
       if (body.stockoutNotify === 'failed') {
         showToast('🚨 事務への出荷保留 (在庫なし) の通知に失敗しました。口頭かチャットで直接伝えてください');
       }
-      const stateKey = () => `${currentSeq}|${doneSet.size}|${worker}|${lastDoneSeq}|${paused}|${stockoutSet.size}|${Object.keys(stockoutBySlip).join(',')}`;
+      const stateKey = () => `${currentSeq}|${doneSet.size}|${worker}|${lastDoneSeq}|${paused}|${stockoutSet.size}|${stockoutVersion()}`;
       const before = stateKey();
       if (Array.isArray(body.stockoutSeqs)) {
         stockoutSet.clear();
         for (const q of body.stockoutSeqs) stockoutSet.add(q);
       }
       if (body.stockoutBySlip && typeof body.stockoutBySlip === 'object') stockoutBySlip = body.stockoutBySlip;
+      if (Array.isArray(body.stockoutAckSeqs)) {
+        stockoutAckSet.clear();
+        for (const q of body.stockoutAckSeqs) stockoutAckSet.add(q);
+      }
       currentSeq = body.currentSeq;
       if (Array.isArray(body.doneSeqs)) {
         // ズレ回復 (順序外完了) があるため、doneSet はサーバーの一覧から再構築する
@@ -1172,7 +1187,9 @@
         $('endHint').innerHTML = '保留中の伝票: ' + heldList.map((q) => repickReadySet.has(q)
           ? `<button type="button" class="end-receive" data-seq="${q}" style="margin:4px; padding:10px 16px; background:#2b8a3e; color:#fff; border:none; border-radius:10px; font-weight:800; font-size:16px">📦 #${q} 届いた分を受け取る (再開)</button>`
           : (stockoutBySlip[q] || []).length
-            ? `<button type="button" class="end-stockout" data-seq="${q}" style="margin:4px; padding:10px 16px; background:#e03131; color:#fff; border:none; border-radius:10px; font-weight:800; font-size:16px">🚫 #${q} 3階: 在庫なし → 確認して出荷保留にする</button>`
+            ? (stockoutAckSet.has(q)
+              ? `<button type="button" class="end-stockout" data-seq="${q}" style="margin:4px; padding:10px 16px; background:#e03131; color:#fff; border:none; border-radius:10px; font-weight:800; font-size:16px">🚫 #${q} 3階: 在庫なし → 確認して出荷保留にする</button>`
+              : `<span style="display:inline-block; margin:4px; padding:8px 12px; background:#ffe3e3; color:#c92a2a; border-radius:10px">🚫 #${q} 在庫なし (他の商品の再ピック待ち)</span>`)
             : `<span style="display:inline-block; margin:4px; padding:8px 12px; background:#f1f3f5; border-radius:10px">⏳ #${q} 再ピック対応待ち</span>`).join('')
           + '<div style="font-size:13px; margin-top:4px">ピッカーが持ってきたら「受け取る」で再開します (上の緑バナーからも可)。在庫なしの伝票は「確認」で閉じると事務へ通知されます</div>';
         $('endHint').querySelectorAll('.end-receive').forEach((b) => b.addEventListener('click', () => receiveSlip(Number(b.dataset.seq))));
@@ -1478,7 +1495,7 @@
       try {
         const r = await enqueueAndWait('stockout_ack', seq, {});
         if (!r.ok) { showToast(r.body?.error || `エラー (${r.status})`); return; }
-        heldSet.delete(seq); repickSet.delete(seq); stockoutSet.add(seq); delete stockoutBySlip[seq];
+        heldSet.delete(seq); repickSet.delete(seq); stockoutSet.add(seq); delete stockoutBySlip[seq]; stockoutAckSet.delete(seq);
         currentSeq = minPending();
         if ($('doneOverlay').style.display === 'flex') { $('doneOverlay').style.display = 'none'; overlayMode = null; }
         if (r.body?.batchStatus === 'done') {
@@ -1492,9 +1509,9 @@
           if (currentSeq != null) { viewSeq = currentSeq; jumpMode = false; jumpTargetSeq = null; }
           render();
         }
-        showToast(r.body?.stockoutNotify === 'failed'
-          ? `🚨 伝票 #${seq} を出荷保留にしましたが、事務への通知に失敗しました。口頭かチャットで伝えてください`
-          : `伝票 #${seq} を出荷保留 (在庫なし) にしました。事務へ通知済みです`);
+        showToast(r.body?.stockoutNotify === 'sent'
+          ? `伝票 #${seq} を出荷保留 (在庫なし) にしました。事務へ通知済みです`
+          : `🚨 伝票 #${seq} を出荷保留にしました。事務への通知はまだ届いていません (自動で再送します)。急ぐなら口頭かチャットで伝えてください`);
         if (window.__floorAlertsPoll) window.__floorAlertsPoll();
       } finally { receiving = false; }
     }
