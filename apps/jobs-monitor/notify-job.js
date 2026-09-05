@@ -22,9 +22,9 @@
  *   JOBS_DIGEST_TIME_JST     — サマリ時刻 'HH:MM' (既定 '08:50')
  */
 import cron from 'node-cron';
-import { JOBS_REGISTRY, validateRegistry } from '../../config/jobs-registry.mjs';
+import { JOBS_REGISTRY, RETIRED_JOBS, validateRegistry } from '../../config/jobs-registry.mjs';
 import {
-  getStates, ensureFirstSeen, getAlertState, setAlertState, clearAlertState, getMeta, setMeta,
+  getStates, ensureFirstSeen, getAlertState, setAlertState, clearAlertState, getMeta, setMeta, purgeJobStates,
 } from './store.js';
 import {
   evaluateAll, needsImmediateAlert, realertIntervalMs, buildDigest, todayJst,
@@ -32,6 +32,8 @@ import {
 import { sendGChatMessage } from '../profit-analysis/gchat-client.js';
 
 const REGISTERED = new Set(JOBS_REGISTRY.map((e) => e.id));
+// 退役した id は「台帳に無い id」として鳴らさない (記録は起動時に purgeJobStates で消す)
+const RETIRED = new Set(RETIRED_JOBS.map((e) => e.id));
 
 /** 送信できたかを返す。成功/失敗を meta に刻む (/health が通知経路の健全性を見るため) */
 async function notify(text, nowMs = Date.now()) {
@@ -106,7 +108,7 @@ export async function runEvaluation(nowMs = Date.now()) {
 
     // 毎朝のサマリ (時刻を過ぎた最初の評価で送る。送信成功時だけ日付を刻む = 失敗したら次の5分で再試行)
     if (digestDue(nowMs)) {
-      const unknown = Object.keys(states).filter((id) => !REGISTERED.has(id));
+      const unknown = Object.keys(states).filter((id) => !REGISTERED.has(id) && !RETIRED.has(id));
       const sent = await notify(buildDigest(results, unknown, nowMs), nowMs);
       if (sent) {
         setMeta('last_digest_date', todayJst(nowMs));
@@ -139,6 +141,13 @@ export function startJobsMonitor() {
     setMeta('registry_error', '');
   }
   if (!getMeta('monitoring_since')) setMeta('monitoring_since', Date.now());
+  // 退役したジョブの記録を消す (残っていると「台帳に無い id」として毎朝出る)
+  try {
+    const purged = purgeJobStates(RETIRED_JOBS.map((e) => e.id));
+    if (purged > 0) console.log(`[jobs-monitor] 退役ジョブの記録を消しました: ${purged} 件 (${RETIRED_JOBS.map((e) => e.id).join(', ')})`);
+  } catch (e) {
+    console.error('[jobs-monitor] 退役ジョブの記録の削除に失敗:', e.message);
+  }
 
   cron.schedule('*/5 * * * *', () => {
     runEvaluation().catch((e) => console.error('[jobs-monitor] 評価失敗:', e.message));

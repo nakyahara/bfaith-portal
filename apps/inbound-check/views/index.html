@@ -271,7 +271,8 @@
       <button type="button" class="btn-reload" id="reloadBtn">🔄 更新</button>
       <!-- 🚚 予定していない納品をロジザードに入れた直後に押す (定時 08:40/11:45 を待たない) -->
       <button type="button" class="btn-reload" id="refreshBtn" style="display:none">🚚 いま取りに行く</button>
-      <button type="button" class="btn-reload" id="notionBtn">🗂 Notionへ送る</button>
+      <!-- 🗂 Notion は 2026-09-05 に廃止。正本が Notion に戻されたとき (退路) だけ出す -->
+      <button type="button" class="btn-reload" id="notionBtn" style="display:none">🗂 Notionへ送る</button>
       <div class="seg">
         <button type="button" data-filter="todo" class="on">残りあり</button>
         <button type="button" data-filter="all">すべて</button>
@@ -404,6 +405,7 @@
           state = j;
           render();
           renderRefresh();   // 🚚「いま取りに行く」の進み具合 (他の iPad が押した分もここに出る)
+          renderNotionBtn(); // 🗂 Notion は廃止 — 正本が Notion に戻されたときだけボタンを出す
         }
         // 最新の一覧を取得できた = 旧バッチ警告と通信エラーは解除
         if (stale) { stale = false; banner(null); }
@@ -1302,7 +1304,7 @@
       if (gateMissing.includes('iroha')) {
         p.push('<section><h3>行き先</h3><div class="pick2">'
           + '<button type="button" data-g="dest" data-v="iroha" class="' + (c.destination === 'iroha' ? 'on' : '') + '">'
-          + '<b>🏠 いろはへ</b><small>いろはで在庫化作業</small></button>'
+          + '<b>🏠 いろはへ</b><small>いろはで在庫化作業 (確認すると在庫化アプリの「未着手」に入ります)</small></button>'
           + '<button type="button" data-g="dest" data-v="bfaith" class="' + (c.destination === 'bfaith' ? 'on' : '') + '">'
           + '<b>🏢 B-Faith</b><small>自社で入庫する</small></button>'
           + '</div>'
@@ -1702,6 +1704,12 @@
 
     $('#q').addEventListener('input', () => { query = $('#q').value.trim(); editDirty = false; render(); });
 
+    // 🗂 Notion「在庫化作業管理」は 2026-09-05 に廃止。いろは行きは「確認」した時点で在庫化アプリの未着手に入る。
+    //    このボタンは、在庫化アプリの正本を Notion に戻したとき (退路) にだけ出す
+    function renderNotionBtn() {
+      const b = $('#notionBtn');
+      if (b) b.style.display = state.iroha_source === 'notion' ? '' : 'none';
+    }
     // 🗂 Notionへ送る (iPadからも押せる。冪等 = 何回押しても二重カードにならない — 2026-09-02 中原さん)
     $('#notionBtn').addEventListener('click', async () => {
       const b = $('#notionBtn');
@@ -1715,6 +1723,7 @@
         const j = await r.json().catch(() => ({}));
         if (r.status === 401) { location.href = '/login'; return; }
         if (j.ok) banner('ok', '🗂 Notionへ送りました: ' + esc(j.note || '完了'));
+        else if (j.error === 'notion_retired') { renderNotionBtn(); banner('warn', '🗂 ' + esc(j.message || 'Notion は廃止されました'), { sticky: true }); }
         else if (j.error === 'worker_required') { openWorkerPick(); banner('warn', '作業者を選んでからもう一度押してください'); }
         else if (j.error === 'rate_limited' || j.error === 'already_running') banner('warn', '⏱ ' + esc(j.message || '実行中です。少し待ってください'), { sticky: true });
         else banner('err', '🗂 送信できませんでした: ' + esc(j.note || j.message || j.error || ('HTTP ' + r.status)), { sticky: true });

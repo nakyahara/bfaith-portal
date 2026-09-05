@@ -58,7 +58,7 @@ import irohaWorkRouter from './apps/iroha-work/router.js';
 import fbaBoxRouter from './apps/fba-box/router.js';
 import { startMediaWorker as startIrohaMediaWorker } from './apps/iroha-work/media.js';
 import staffRouter from './apps/staff/router.js';
-import { startInboundCheckCron, startInboundCheckNotionCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
+import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
 import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorkerRouter } from './apps/packing-dispatch/router.js';
 import packingDispatchRuleChangeApiRouter from './apps/packing-dispatch/rule-change-api.js';
@@ -1669,8 +1669,8 @@ app.listen(PORT, () => {
   // 既定で有効 (JST 09:00 = ミラー同期完了後)。止める場合のみ INBOUND_INFO_SYNC_ENABLED=false
   startInboundInfoCron();
   startInboundCheckCron();
-  // 在庫化カード (いろは行き) を Notion へ1日1回まとめて送る (17:30 JST。台帳 inbound-check-notion-cards)
-  startInboundCheckNotionCron();
+  // (2026-09-05 廃止) 在庫化カードの Notion 送信 (17:30 cron・台帳 inbound-check-notion-cards) は無くなった。
+  // いろは行きの作業指示は「確認」と同じトランザクションで在庫化アプリ (f_iroha_tasks) の未着手に入る
   // 🏷 値札印刷キューの見張り (30秒間隔。滞留→manual / 報告なし→unknown / 倉庫PCエージェントの生存を台帳 nefuda-print-agent へ中継)
   startInboundCheckPrintQueueWorker();
   // いろは作業アプリ: 完成写真・動画の Drive/Notion 送信キュー (プロセス内2分間隔の再試行。

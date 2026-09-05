@@ -141,6 +141,28 @@ export function clearAlertState(jobId) {
   getJobsDB().prepare('DELETE FROM alert_state WHERE job_id = ?').run(jobId);
 }
 
+/**
+ * 退役したジョブ (config/jobs-registry.mjs RETIRED_JOBS) の記録を消す。
+ * 台帳から外しただけだと job_state の行が残り、毎朝「台帳に無い id から ping が来ています」と鳴り続ける。
+ * 起動時に呼ぶ (退路で手動実行して ping が来ても、次の起動でまた消える)。
+ * @returns {number} 消した job_state の行数
+ */
+export function purgeJobStates(ids) {
+  const list = [...new Set((ids || []).map((s) => String(s || '')).filter(Boolean))];
+  if (list.length === 0) return 0;
+  const d = getJobsDB();
+  const tx = d.transaction((arr) => {
+    let n = 0;
+    for (const id of arr) {
+      n += d.prepare('DELETE FROM job_state WHERE job_id = ?').run(id).changes;
+      d.prepare('DELETE FROM alert_state WHERE job_id = ?').run(id);
+      d.prepare('DELETE FROM entry_seen WHERE job_id = ?').run(id);
+    }
+    return n;
+  });
+  return tx(list);
+}
+
 export function getMeta(key) {
   const r = getJobsDB().prepare('SELECT value FROM meta WHERE key = ?').get(key);
   return r ? r.value : null;

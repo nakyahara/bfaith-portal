@@ -321,14 +321,24 @@ miniPC auto-shohin-csv.js (Logizard-NyukaCSV の2ステップ目・1日1回)
 
 倉庫の iPad で管理者としてログイン → 管理画面「この端末を登録」 → トークンは httpOnly Cookie `ic_device` (path=/apps/inbound-check、400日) としてその端末だけに渡り、**同時に管理者セッションを破棄**する (共用端末に管理者ログインを残さない)。⚠ ホーム画面に追加した PWA から開いて登録する (Safari 本体と Cookie 保存領域が別)。
 
-## Notion 作業カード (いろはの在庫化作業管理)
+## いろはへの作業指示 = 在庫化アプリの「未着手」 (Notion は 2026-09-05 に廃止)
 
-「いろはで在庫化」と確定した明細 (`f_inbound_check_destinations`) を、Notion「在庫化作業管理」DB のカードにする
-(旧 GAS 在庫化カード生成の置き換え。設計 = Downloads『在庫化カード置き換え_Codex設計相談R1_20260902.md』)。
+「いろはで在庫化」と確定した明細 (`f_inbound_check_destinations`) は、**確認と同じトランザクションで
+在庫化アプリ (`apps/iroha-work`) の `f_iroha_tasks` に未着手として入る** (`iroha-work/task-intake.js createTaskForDestination`)。
+やり直し・再取込で行が消えた場合の取消も同じ経路 (`requestCancellation`)。iPad の在庫化アプリは即時にそれを見る。
 
-- **1日1回 17:30 JST に一括送信** (`sync-job.js startInboundCheckNotionCron` → `notion-sync.js runNotionSweep`)。
-  都度送信にしないのは、当日中のやり直し (確認→取消→再確認) を送信前に収束させるため (中原さん 2026-09-02)。
-  管理画面の「今すぐ Notion へ送る」で夕方を待たずに送れる
+- **Notion「在庫化作業管理」は 2026-09-05 に運用廃止** (中原さん)。17:30 の cron・30分巡回への相乗り・台帳
+  `inbound-check-notion-cards` は外した (`config/jobs-registry.mjs` の `RETIRED_JOBS` に退役記録)。
+  iPad の「🗂 Notionへ送る」は出ない。`POST /api/notion-sync` `/admin/notion-sync` は 410 `notion_retired`
+- 退路: 在庫化アプリの `/admin/source` で正本を `notion` に戻したときだけ、上のボタンと API が従来どおり動く
+  (自動送信は戻らない — 手動のみ)。`notion-sync.js` はそのために残してある
+- 正本の切替そのものと取込・紐付けの衝突は在庫化アプリ側 (`/apps/iroha-work/admin`)。
+  正本 = `f_iroha_app_meta.source_of_truth` (`iroha-work/db.js sourceOfTruth()`)
+
+### (廃止前の設計メモ — notion-sync.js を読むときの参考)
+
+- 1日1回 17:30 JST に一括送信していた (`runNotionSweep`)。都度送信にしなかったのは、当日中のやり直し
+  (確認→取消→再確認) を送信前に収束させるため (中原さん 2026-09-02)
 - **outbox + reconcile**: 送信状態は台帳の行に持つ (`notion_page_id` / `notion_synced_at` / …)。
   カードには**台帳キー** (行ごとの永続ランダムキー。作成前に DB へ保存) を必ず入れ、作成前に
   同キーで検索して回収する (「作成成功→記録前に停止」の二重カード防止。行IDは DB 作り直しで
