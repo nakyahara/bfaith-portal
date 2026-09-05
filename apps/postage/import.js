@@ -7,6 +7,8 @@
  *   - 商品コードの重複 29件
  *   - 単位つきの文字列 (`5g` `0.1cm`) と数値が同じ列に混在
  * これらを黙って取り込むと、静かに間違った料金が出る。
+ * 2026-09-05 の表では「資材の厚み」が資材ごとに系統的に埋まった (茶封筒 0.1cm / 白プチ 0.2cm)。
+ * この列は資材の属性なので、資材ごとに集めてマスタと突き合わせる (行ごとには使わない)。
  *
  * 採否は **SKU 単位** で決める (Codex R1 P1)。
  *   - 1行でも要修正があれば、その商品は丸ごと取り込まない。
@@ -204,11 +206,20 @@ export async function importWeightFile(filePath, { dryRun = true, actor = 'syste
       addIssue(r.__row, sku, 'warn', 'thickness_unit_assumed', '商品の厚み', r.thickness_mm,
         `単位がないので cm とみなしました (${th.value}mm)。mm で書くなら "3mm" のように単位をつけてください`);
     }
-    // 「商品の厚み」が空で「資材の厚み」に値がある = 列ズレ
-    if (th.value === null && r.material_thickness !== null && r.material_thickness !== undefined && r.material_thickness !== '') {
-      if (parseThicknessMm(r.material_thickness).value !== null) {
-        err(r.__row, sku, 'error', 'column_shift', '資材の厚み', r.material_thickness,
-          '商品の厚みが空で資材の厚みだけ入っています — 列が1つずれた可能性');
+    // ── 資材の厚み (資材の属性。行ごとの値でマスタを上書きしない。資材ごとに集めて後で突き合わせる) ──
+    // 以前は「商品の厚みが空で資材の厚みだけある」を列ズレ扱いにしていたが、資材の厚みが資材ごとに
+    // 系統的に埋まった表 (2026-09-05) で 26 件が誤検知になった。列ズレの本当の目印は
+    // 「送り状の重さに cm」なので、そちらだけで弾く
+    let matTh = { value: null };
+    if (r.material_thickness !== null && r.material_thickness !== undefined && r.material_thickness !== '') {
+      matTh = parseThicknessMm(r.material_thickness);
+      if (matTh.err === 'weight_unit_in_thickness_column') {
+        err(r.__row, sku, 'error', 'column_shift', '資材の厚み', r.material_thickness, '資材の厚みの列に g が入っています (列ズレの疑い)');
+        matTh = { value: null };
+      } else if (matTh.err || (matTh.value !== null && matTh.value <= 0)) {
+        addIssue(r.__row, sku, 'warn', 'unparsable_material_thickness', '資材の厚み', r.material_thickness,
+          '資材の厚みとして読めません (この列は資材マスタとの突き合わせにだけ使います)');
+        matTh = { value: null };
       }
     }
 
@@ -243,9 +254,47 @@ export async function importWeightFile(filePath, { dryRun = true, actor = 'syste
       thickness_mm: th.value,
       default_material_code: materialCode,
       material_source: materialSource,
+      material_thickness_mm: matTh.value,   // 集計にだけ使う。pm_skus には入れない
     };
     if (!bySku.has(sku)) bySku.set(sku, []);
     bySku.get(sku).push({ row: r.__row, rec, hasError });
+  }
+
+  // ── 資材の厚み: 表の値を資材ごとに集め、マスタと突き合わせる ──
+  // マスタに値がある → 違う値が表にあれば注意 (行の値は使わない)
+  // マスタが空     → 表の中で揃っていればその値を入れる (揃っていなければ人に返す)
+  // 要修正の行は数えない (列ズレ行の値を根拠にしない)
+  const thicknessByMaterial = new Map();   // material_code → Map(mm → 行数)
+  for (const entries of bySku.values()) {
+    for (const e of entries) {
+      if (e.hasError || !e.rec.default_material_code || e.rec.material_thickness_mm === null) continue;
+      const m = thicknessByMaterial.get(e.rec.default_material_code) || new Map();
+      m.set(e.rec.material_thickness_mm, (m.get(e.rec.material_thickness_mm) || 0) + 1);
+      thicknessByMaterial.set(e.rec.default_material_code, m);
+    }
+  }
+  const materialThicknessToFill = [];   // [{material_code, mm}]
+  for (const [code, dist] of thicknessByMaterial) {
+    const master = db.prepare('SELECT display_name, thickness_mm FROM pm_materials WHERE material_code=?').get(code);
+    if (!master) continue;
+    const name = master.display_name || code;
+    const sorted = [...dist.entries()].sort((a, b) => b[1] - a[1]);
+    const distText = sorted.map(([mm, n]) => `${mm}mm×${n}行`).join(' / ');
+    if (Number.isFinite(master.thickness_mm)) {
+      for (const [mm, n] of sorted) {
+        if (Math.abs(mm - master.thickness_mm) > 0.05) {
+          addIssue(null, null, 'warn', 'material_thickness_mismatch', '資材の厚み', `${mm}mm`,
+            `資材「${name}」の厚みはマスタでは ${master.thickness_mm}mm です (表では ${mm}mm が ${n}行。行の値は使いません)`);
+        }
+      }
+    } else if (sorted.length === 1) {
+      materialThicknessToFill.push({ material_code: code, mm: sorted[0][0] });
+      addIssue(null, null, 'warn', 'material_thickness_fill', '資材の厚み', `${sorted[0][0]}mm`,
+        `資材「${name}」の厚みがマスタに無いので、表の値 ${sorted[0][0]}mm (${sorted[0][1]}行で一致) を${dryRun ? '取り込むときに入れます' : '入れました'}`);
+    } else {
+      addIssue(null, null, 'warn', 'material_thickness_ambiguous', '資材の厚み', distText,
+        `資材「${name}」の厚みが表の中で揃っていません (${distText})。資材マスタに手で入れてください`);
+    }
   }
 
   // ── 2周目: SKU 単位で採否を決める ──
@@ -292,8 +341,15 @@ export async function importWeightFile(filePath, { dryRun = true, actor = 'syste
         updated_at            = excluded.updated_at,
         updated_by            = excluded.updated_by
     `);
+    // 資材の厚みは **空のときだけ** 入れる (人が入れた値を表で上書きしない)
+    const fillMat = db.prepare(`UPDATE pm_materials SET thickness_mm=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'), updated_by=?
+      WHERE material_code=? AND thickness_mm IS NULL`);
     db.transaction(() => {
-      for (const row of parsed.values()) { up.run({ ...row, actor }); applied++; }
+      for (const row of parsed.values()) {
+        const { material_thickness_mm, ...rec } = row;
+        up.run({ ...rec, actor }); applied++;
+      }
+      for (const f of materialThicknessToFill) fillMat.run(f.mm, actor, f.material_code);
       for (const i of issues) insIssue.run(runId, i.row_no, i.sku_code, i.severity, i.kind, i.column_name, i.raw_value, i.message);
     })();
   } else {
@@ -313,6 +369,7 @@ export async function importWeightFile(filePath, { dryRun = true, actor = 'syste
     withThickness: [...parsed.values()].filter((r) => r.thickness_mm !== null).length,
     withMaterial: [...parsed.values()].filter((r) => r.default_material_code).length,
     materialFromSuffix: [...parsed.values()].filter((r) => r.material_source === 'name_suffix').length,
+    materialThicknessFilled: dryRun ? 0 : materialThicknessToFill.length,
     errors: issues.filter((i) => i.severity === 'error').length,
     warns: issues.filter((i) => i.severity === 'warn').length,
   };

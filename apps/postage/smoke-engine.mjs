@@ -26,17 +26,20 @@ const BANDS = [
   { mail_type: 'kikakugai', band_code: 'kikakugai_4000', display_name: '規格外 4kg以内',        max_weight_g: 4000, amount_yen: 1750 },
 ];
 
+// 資材の厚み (thickness_mm) は商品の厚みに足される。茶封筒 1mm / 白プチ 2mm (2026-09-05 の表の値)
 const MATERIALS = new Map([
   // 長形3号 = 定形サイズそのもの。実測済み
-  ['chabuto',    { display_name: '茶封筒', tare_weight_g: 5,  outer_length_mm: 235, outer_width_mm: 120, dims_verified: 1 }],
+  ['chabuto',    { display_name: '茶封筒', tare_weight_g: 5,  thickness_mm: 1, outer_length_mm: 235, outer_width_mm: 120, dims_verified: 1 }],
   // 外寸未測定 (実運用の初期状態)
-  ['shiropuchi', { display_name: '白プチ', tare_weight_g: 10, outer_length_mm: null, outer_width_mm: null, dims_verified: 0 }],
+  ['shiropuchi', { display_name: '白プチ', tare_weight_g: 10, thickness_mm: 2, outer_length_mm: null, outer_width_mm: null, dims_verified: 0 }],
   // 規格内に収まる大きさ
-  ['shirobi',    { display_name: '白ビ袋', tare_weight_g: 11, outer_length_mm: 320, outer_width_mm: 240, dims_verified: 1 }],
+  ['shirobi',    { display_name: '白ビ袋', tare_weight_g: 11, thickness_mm: 1, outer_length_mm: 320, outer_width_mm: 240, dims_verified: 1 }],
   // 規格外になる大きさ
-  ['ookibako',   { display_name: '大箱',   tare_weight_g: 50, outer_length_mm: 450, outer_width_mm: 300, dims_verified: 1 }],
+  ['ookibako',   { display_name: '大箱',   tare_weight_g: 50, thickness_mm: 2, outer_length_mm: 450, outer_width_mm: 300, dims_verified: 1 }],
   // 外寸は入っているが「推定値」— 判定に使ってはいけない
-  ['suitei',     { display_name: '推定封筒', tare_weight_g: 5, outer_length_mm: 235, outer_width_mm: 120, dims_verified: 0 }],
+  ['suitei',     { display_name: '推定封筒', tare_weight_g: 5, thickness_mm: 1, outer_length_mm: 235, outer_width_mm: 120, dims_verified: 0 }],
+  // 厚みが未登録 (旧DBから移行した直後の状態)
+  ['noth',       { display_name: '厚み未登録封筒', tare_weight_g: 5, thickness_mm: null, outer_length_mm: 235, outer_width_mm: 120, dims_verified: 1 }],
 ]);
 
 function ctx(over = {}) {
@@ -54,6 +57,24 @@ t('茶封筒・薄い・軽い → 定形110円', () => {
   const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 15, thickness_mm: 1, default_material_code: 'chabuto' } }) }));
   eq(r.status, 'confirmed'); eq(r.mailType, 'teikei'); eq(r.amountYen, 110);
   eq(r.weightG, 20.5, '15 + 5 + 0.5');
+  eq(r.thicknessMm, 2, '商品 1mm + 封筒 1mm');
+  eq(r.materialThicknessMm, 1);
+});
+
+t('資材の厚みが足される (商品 8mm + 封筒 1mm = 9mm → 定形の境界 1mm 以内で不明)', () => {
+  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 8, default_material_code: 'chabuto' } }) }));
+  eq(r.status, 'unknown'); eq(r.reason, 'near_thickness_boundary'); eq(r.thicknessMm, 9);
+});
+
+t('資材の厚みが未登録 → missing_material_thickness (0 とみなして定形にしない)', () => {
+  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 9.5, default_material_code: 'noth' } }) }));
+  eq(r.status, 'unknown'); eq(r.reason, 'missing_material_thickness');
+  eq(r.weightG, 15.5, '重量そのものは計算できている');
+});
+
+t('資材の厚み未登録は、商品の厚み未登録より先に返す (3件直せば全部に効くほうを先に)', () => {
+  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 10, default_material_code: 'noth' } }) }));
+  eq(r.reason, 'missing_material_thickness');
 });
 
 t('茶封筒・厚い(20mm) → 規格内140円', () => {
@@ -66,10 +87,10 @@ t('茶封筒・薄いが 50g超 → 定形にならず規格内180円', () => {
   eq(r.status, 'confirmed'); eq(r.mailType, 'kikakunai'); eq(r.amountYen, 180);
 });
 
-t('数量複数 → 重さも厚みも数量ぶん積む', () => {
+t('数量複数 → 重さも厚みも数量ぶん積む (資材の厚みは1回だけ)', () => {
   const r = judge(ship(['a', 3]), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 5, default_material_code: 'chabuto' } }) }));
   eq(r.status, 'confirmed'); eq(r.weightG, 35.5, '10*3 + 5 + 0.5');
-  eq(r.thicknessMm, 15); eq(r.mailType, 'kikakunai', '15mm は定形10mmを超える');
+  eq(r.thicknessMm, 16, '5*3 + 封筒1'); eq(r.mailType, 'kikakunai', '16mm は定形10mmを超える');
 });
 
 t('大きい資材 → 規格外', () => {
@@ -103,20 +124,28 @@ t('境界まで 5.1g → 確定してよい', () => {
 });
 
 t('厚みが定形の上限10mmぎりぎり → near_thickness_boundary', () => {
-  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 9.5, default_material_code: 'chabuto' } }) }));
+  // 商品 8.5 + 封筒 1 = 9.5mm
+  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 8.5, default_material_code: 'chabuto' } }) }));
   eq(r.status, 'unknown'); eq(r.reason, 'near_thickness_boundary');
 });
 
 t('厚みが10mmをわずかに超える → 規格内と言い切らず不明', () => {
-  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 10.5, default_material_code: 'chabuto' } }) }));
+  // 商品 9.5 + 封筒 1 = 10.5mm
+  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 9.5, default_material_code: 'chabuto' } }) }));
   eq(r.status, 'unknown'); eq(r.reason, 'near_thickness_boundary');
 });
 
+t('厚みが10mmを安全幅より超える → 規格内で確定', () => {
+  // 商品 9.5 + 封筒 1 = 10.5mm → 安全幅 1mm 以内なので不明。商品 10 + 封筒 1 = 11mm でも 1mm 以内。11 + 1 = 12mm で確定
+  const r = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 10, thickness_mm: 11, default_material_code: 'chabuto' } }) }));
+  eq(r.status, 'confirmed'); eq(r.mailType, 'kikakunai'); eq(r.thicknessMm, 12);
+});
+
 t('数量複数のときは厚みの安全幅が倍 (1mm→2mm)', () => {
-  // 単品なら 8mm は 10mm から 2mm 離れていて確定できるが、2個 = 合計 8mm でも重なり方が読めない
-  const single = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 5, thickness_mm: 8, default_material_code: 'chabuto' } }) }));
+  // 単品なら 7+1 = 8mm は 10mm から 2mm 離れていて確定できるが、2個 = 合計 3.5*2+1 = 8mm でも重なり方が読めない
+  const single = judge(ship(['a', 1]), ctx({ skus: sku({ a: { unit_weight_g: 5, thickness_mm: 7, default_material_code: 'chabuto' } }) }));
   eq(single.status, 'confirmed'); eq(single.mailType, 'teikei');
-  const dbl = judge(ship(['a', 2]), ctx({ skus: sku({ a: { unit_weight_g: 5, thickness_mm: 4, default_material_code: 'chabuto' } }) }));
+  const dbl = judge(ship(['a', 2]), ctx({ skus: sku({ a: { unit_weight_g: 5, thickness_mm: 3.5, default_material_code: 'chabuto' } }) }));
   eq(dbl.status, 'unknown'); eq(dbl.reason, 'near_thickness_boundary', '合計8mm・上限10mm・安全幅2mm');
 });
 
@@ -160,7 +189,7 @@ t('厚み 0 も欠測として扱う', () => {
 
 t('資材の自重 0 は未登録として扱う', () => {
   const mats = new Map(MATERIALS);
-  mats.set('zeromat', { display_name: 'ゼロ', tare_weight_g: 0, outer_length_mm: 235, outer_width_mm: 120, dims_verified: 1 });
+  mats.set('zeromat', { display_name: 'ゼロ', tare_weight_g: 0, thickness_mm: 1, outer_length_mm: 235, outer_width_mm: 120, dims_verified: 1 });
   const r = judge(ship(['a', 1]), ctx({
     skus: sku({ a: { unit_weight_g: 15, thickness_mm: 1, default_material_code: 'zeromat' } }), materials: mats,
   }));
@@ -191,11 +220,11 @@ t('4kg超 → over_maximum (最大料金に丸めない)', () => {
 
 t('3辺合計が90cm超 → over_maximum', () => {
   const mats = new Map(MATERIALS);
-  mats.set('nagai', { display_name: '長物', tare_weight_g: 100, outer_length_mm: 590, outer_width_mm: 300, dims_verified: 1 });
+  mats.set('nagai', { display_name: '長物', tare_weight_g: 100, thickness_mm: 2, outer_length_mm: 590, outer_width_mm: 300, dims_verified: 1 });
   const r = judge(ship(['a', 1]), ctx({
     skus: sku({ a: { unit_weight_g: 100, thickness_mm: 100, default_material_code: 'nagai' } }), materials: mats,
   }));
-  eq(r.status, 'unknown'); eq(r.reason, 'over_maximum', '590+300+100=990 > 900');
+  eq(r.status, 'unknown'); eq(r.reason, 'over_maximum', '590+300+102=992 > 900');
 });
 
 console.log('\n■ 入力の頑健さ');
@@ -216,7 +245,7 @@ t('小数の文字列は拒否', () => {
 });
 t('外寸の長短を逆に入れても同じ結果', () => {
   const mats = new Map(MATERIALS);
-  mats.set('rev', { display_name: '逆', tare_weight_g: 5, outer_length_mm: 120, outer_width_mm: 235, dims_verified: 1 });
+  mats.set('rev', { display_name: '逆', tare_weight_g: 5, thickness_mm: 1, outer_length_mm: 120, outer_width_mm: 235, dims_verified: 1 });
   const r = judge(ship(['a', 1]), ctx({
     skus: sku({ a: { unit_weight_g: 15, thickness_mm: 1, default_material_code: 'rev' } }), materials: mats,
   }));

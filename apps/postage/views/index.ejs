@@ -48,15 +48,21 @@
   <div class="header-row">
     <h2>📮 郵便料金判定</h2>
     <div>
-      <a class="back-link" href="/apps/postage/skus">商品マスタ →</a>
+      <a class="back-link" href="/apps/postage/decisions">判定ログ →</a>
+      <a class="back-link" href="/apps/postage/skus" style="margin-left:14px">商品マスタ →</a>
       <a class="back-link" href="/" style="margin-left:14px">ポータルへ戻る</a>
     </div>
   </div>
 
-  <% if (!warehouseOk) { %>
+  <% if (!report.available) { %>
     <div class="banner">
       <h3>出荷実績が読めません</h3>
-      <p>カバー率は miniPC の <span class="mono">warehouse.db</span> (NE受注) を見て出します。この画面が動くのは miniPC のポータルだけです。マスタの編集と取込はここでもできます。</p>
+      <p>カバー率は miniPC の <span class="mono">warehouse.db</span> (NE受注) か、Render の packing-dispatch 出力履歴 (<span class="mono">warehouse-mirror.db</span>) を見て出します。この環境にはどちらも無いようです。マスタの編集と取込はここでもできます。</p>
+    </div>
+  <% } else if (report.source === 'packing-dispatch') { %>
+    <div class="banner tip">
+      <h3>出荷実績 = packing-dispatch の出力履歴</h3>
+      <p>NE → ロジザードの CSV を出した伝票 (2026-06-04〜) を定形外の実績として使っています。出荷日は CSV 出力日で近似しています。印字時の判定もこのデータで行います。</p>
     </div>
   <% } %>
 
@@ -64,6 +70,14 @@
   <form class="card" method="get" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
     <label>期間 <input type="date" name="since" value="<%= since %>"></label>
     <label>〜 <input type="date" name="until" value="<%= until %>"></label>
+    <% if (sources.length > 1) { %>
+      <label>実績の出どころ
+        <select name="source">
+          <option value="auto" <%= source === 'auto' ? 'selected' : '' %>>自動</option>
+          <% sources.forEach((s) => { %><option value="<%= s %>" <%= source === s ? 'selected' : '' %>><%= sourceLabels[s] %></option><% }) %>
+        </select>
+      </label>
+    <% } %>
     <button class="primary" type="submit">集計</button>
     <span class="msg">既定は直近90日。短すぎると季節の偏りで判断を誤ります</span>
   </form>
@@ -81,11 +95,11 @@
     <!-- ── いま一番効くこと ── -->
     <% if (report.blockedMaterials && report.blockedMaterials.length) { %>
       <div class="banner tip">
-        <h3>いま一番効くこと — 資材の外寸を測る</h3>
+        <h3>いま一番効くこと — 資材の外寸・厚みを入れる</h3>
         <p>
-          資材の外寸が入っていないと、定形か規格内かが決められず「不明」になります。下の資材マスタで縦横を入れてください。
+          資材の外寸が入っていないと定形か規格内かが決められず、資材の厚みが無いと定形 10mm の境界が見られません。どちらも「不明」になります。下の資材マスタで入れてください。
           <% report.blockedMaterials.forEach((m) => { %>
-            <br><strong><%= m.display_name %></strong> を測ると <strong><%= m.count.toLocaleString() %> 通</strong>が動きます。
+            <br><strong><%= m.display_name %></strong> の<%= m.need %>を入れると <strong><%= m.count.toLocaleString() %> 通</strong>が動きます。
           <% }) %>
         </p>
       </div>
@@ -163,11 +177,11 @@
     <h3>資材マスタ</h3>
     <p class="hint">
       外寸は「定形 / 規格内 / 規格外」を決めるために使います。<strong>縦横の両方が入って初めて判定に使えます</strong>。
-      片方だけでは「不明」のままです。厚みは商品側で持つので、ここには入れません。
+      片方だけでは「不明」のままです。厚みは資材そのものの厚み (封筒 1mm・プチ袋 2mm など) で、商品の厚みと足して定形 10mm を見ます。<strong>空だと「不明」になります</strong>。
     </p>
     <div class="scroll">
       <table>
-        <thead><tr><th class="l">資材</th><th>自重 (g)</th><th>長辺 (mm)</th><th>短辺 (mm)</th><th>外寸</th><th class="l">メモ</th><th></th></tr></thead>
+        <thead><tr><th class="l">資材</th><th>自重 (g)</th><th>長辺 (mm)</th><th>短辺 (mm)</th><th>厚み (mm)</th><th>外寸</th><th class="l">メモ</th><th></th></tr></thead>
         <tbody>
           <% materials.forEach((m) => { %>
             <tr data-code="<%= m.material_code %>">
@@ -175,6 +189,7 @@
               <td><input class="n mat-tare" type="number" step="0.1" min="0" value="<%= m.tare_weight_g ?? '' %>"></td>
               <td><input class="n mat-l" type="number" step="1" min="0" value="<%= m.outer_length_mm ?? '' %>"></td>
               <td><input class="n mat-w" type="number" step="1" min="0" value="<%= m.outer_width_mm ?? '' %>"></td>
+              <td><input class="n mat-t" type="number" step="0.1" min="0" value="<%= m.thickness_mm ?? '' %>"></td>
               <td><% if (m.dims_verified) { %><span class="pill ok">実測</span><% } else { %><span class="pill err">未測定</span><% } %></td>
               <td class="l msg"><%= m.note || '' %></td>
               <td><button class="ghost" data-act="save-mat">保存</button></td>
@@ -237,8 +252,14 @@
     <p class="hint">
       登録 <%= skuStats.total %> 件 ／ 重さ <%= skuStats.with_weight %> ／ 厚み <%= skuStats.with_thickness %> ／ 資材 <%= skuStats.with_material %>。
       料金表 = <%= tariff ? tariff.name : '未設定' %> (<%= tariff ? tariff.valid_from : '' %>〜)。
-      送り状シールなどの固定加算 = <%= overheads.map(o => o.name + ' ' + o.weight_g + 'g').join(' / ') || 'なし' %>
     </p>
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+      <% overheads.forEach((o) => { %>
+        <label data-overhead="<%= o.code %>"><%= o.name %> <input class="n oh-w" type="number" step="0.1" min="0" max="50" value="<%= o.weight_g %>"> g
+          <button class="ghost" data-act="save-overhead">保存</button></label>
+      <% }) %>
+      <span class="msg">1通ごとに必ず足す重さ。<%= overheads.some(o => o.updated_by === 'seed') ? '種の値は 0.5g (8/30 実測)。2g に決めたなら直してください' : '' %></span>
+    </div>
     <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
       <label>重量の安全幅 <input class="n" id="mg" type="number" step="0.5" min="0" max="100" value="<%= settings.boundary_margin_g || 5 %>"> g</label>
       <label>厚みの安全幅 <input class="n" id="mt" type="number" step="0.5" min="0" max="20" value="<%= settings.thickness_margin_mm || 1 %>"> mm</label>
@@ -274,8 +295,19 @@
       try {
         await post('/apps/postage/api/materials/' + encodeURIComponent(tr.dataset.code), {
           tare_weight_g: val('.mat-tare'), outer_length_mm: val('.mat-l'), outer_width_mm: val('.mat-w'),
+          thickness_mm: val('.mat-t'),
         });
         flash(btn, '保存しました。集計し直すと反映されます');
+      } catch (e) { flash(btn, e.message, true); } finally { btn.disabled = false; }
+    }
+
+    if (act === 'save-overhead') {
+      const label = btn.closest('label[data-overhead]');
+      const w = label.querySelector('.oh-w').value.trim();
+      btn.disabled = true;
+      try {
+        await post('/apps/postage/api/overheads/' + encodeURIComponent(label.dataset.overhead), { weight_g: w });
+        flash(btn, '保存しました。次の判定から効きます');
       } catch (e) { flash(btn, e.message, true); } finally { btn.disabled = false; }
     }
 

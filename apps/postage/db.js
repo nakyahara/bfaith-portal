@@ -5,7 +5,9 @@
  *
  * 目的 (PR1a): 商品の重さ・厚み・資材のマスタを持ち、定形外の伝票 1 通ごとに
  *   「定形110円 / 規格内◯円 / 規格外◯円 / 不明」を判定できるようにする。
- *   印字 (ラベル CSV への列追加) は PR1b。判定ログの永続化も PR1b。
+ * PR1b: 伝票番号のリストを受けて判定し、判定ログ (pm_print_decisions) を残す API を足した。
+ *   構成は packing-dispatch (warehouse-mirror.db の pd_shipment_tracking) から引く — composition.js。
+ *   ラベル CSV への列追加そのものは伝票出しPCのランチャー側 (shipping-upload-launcher)。
  *
  * 設計 (Codex R1/R2 反映):
  *   - 専用DB postage.db を DATA_DIR に持つ (warehouse.db は読み取り専用で参照するだけ)
@@ -115,6 +117,10 @@ function createTables() {
     updated_at        TEXT NOT NULL DEFAULT (${NOW}),
     updated_by        TEXT
   )`);
+  // 資材そのものの厚み (封筒 1mm・プチ袋 2mm など)。商品の厚みと足して定形10mm / 規格内30mm を見る。
+  // 未登録 = NULL。NULL のまま 0 とみなさない (定形の 10mm 境界で 1〜2mm はそのまま料金差になる)。
+  // 既存DBには列が無いので ALTER で足す (CREATE IF NOT EXISTS は既存の列を変えない)
+  ensureColumn('pm_materials', 'thickness_mm', 'REAL CHECK (thickness_mm IS NULL OR thickness_mm > 0)');
 
   // ─── 1通あたりの固定加算 (送り状シール・納品書など) ────────
   db.exec(`CREATE TABLE IF NOT EXISTS pm_overheads (
@@ -165,6 +171,44 @@ function createTables() {
   )`);
   db.exec(`CREATE INDEX IF NOT EXISTS ix_pm_import_issues_run
     ON pm_import_issues(import_run_id, severity)`);
+
+  // ─── 判定ログ (印字1回 = 1行) ─────────────────────────────
+  // 送り状シールに刷った内容の証跡。**印字した文言と金額を固定保存** する
+  // (後で料金表やマスタが変わっても「あの日、紙に何を出したか」が追える)。
+  // 再印字は別レコード。decision_id はシールに載せ、紙と DB を再接続する識別子になる。
+  db.exec(`CREATE TABLE IF NOT EXISTS pm_print_decisions (
+    decision_id        TEXT PRIMARY KEY,                -- 例 260905-K7Q2 (シールに印字)
+    slip_no            TEXT NOT NULL,                   -- NE 伝票番号
+    judged_at          TEXT NOT NULL DEFAULT (${NOW}),
+    judge_date         TEXT NOT NULL,                   -- 料金表を引いた日 (JST YYYY-MM-DD)
+    source             TEXT NOT NULL,                   -- 呼び出し元 (launcher 等)
+    batch_ref          TEXT,                            -- 出荷_XX など (任意)
+    status             TEXT NOT NULL CHECK (status IN ('confirmed','unknown','skipped')),
+    reason             TEXT,                            -- unknown / skipped の理由コード
+    detail             TEXT,
+    mail_type          TEXT,
+    band_code          TEXT,
+    band_name          TEXT,
+    amount_yen         INTEGER CHECK (amount_yen IS NULL OR amount_yen > 0),
+    material_code      TEXT,
+    material_name      TEXT,
+    weight_g           REAL,
+    thickness_mm       REAL,
+    tariff_version_id  INTEGER,
+    method_code        TEXT,                            -- packing-dispatch の配送方法コード
+    composition_source TEXT,                            -- 構成をどこから取ったか
+    lines_json         TEXT NOT NULL,                   -- 判定時点の構成スナップショット
+    print_text         TEXT NOT NULL,                   -- 実際に返した印字文言 (固定保存)
+    requested_by       TEXT
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS ix_pm_print_decisions_slip ON pm_print_decisions(slip_no, judged_at)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS ix_pm_print_decisions_date ON pm_print_decisions(judge_date, status)`);
+}
+
+/** 既存の表に列を足す (無ければ)。CREATE IF NOT EXISTS は既存の列構成を変えないので、列追加は必ずここを通す。 */
+function ensureColumn(table, column, ddl) {
+  const has = db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+  if (!has) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
 }
 
 /**
