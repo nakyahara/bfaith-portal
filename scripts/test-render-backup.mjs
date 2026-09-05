@@ -21,10 +21,16 @@ delete process.env.GCHAT_WEBHOOK;
     CREATE TABLE mirror_products (id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE mart_pl (id INTEGER PRIMARY KEY, v REAL);
     CREATE TABLE sync_run_ledger (id INTEGER PRIMARY KEY, note TEXT);
-    CREATE TABLE po_orders (id INTEGER PRIMARY KEY, supplier TEXT, status TEXT);
+    -- 生成列 (VIRTUAL / STORED) は INSERT 対象外 → 論理エクスポートが SELECT * に依存しないことの回帰テスト (Codex R1)
+    CREATE TABLE po_orders (id INTEGER PRIMARY KEY, supplier TEXT, status TEXT, qty INTEGER NOT NULL DEFAULT 1,
+      qty_x2 INTEGER GENERATED ALWAYS AS (qty * 2) VIRTUAL, qty_x3 INTEGER GENERATED ALWAYS AS (qty * 3) STORED);
     CREATE TABLE f_mis_shipments (id INTEGER PRIMARY KEY, detail TEXT);
     CREATE TABLE inv_snapshot (id INTEGER PRIMARY KEY, month TEXT);
     CREATE TABLE ai_reports (id INTEGER PRIMARY KEY, body TEXT);
+    -- FK の子 (名前順で先) → 親 (名前順で後)。2026-09-05 本番初回で draft_step_progress → ph_steps がこの形で
+    -- 「no such table: main.ph_steps」を起こした。論理エクスポートが作成順・FK 検査に依存しないことの回帰テスト
+    CREATE TABLE a_step_progress (id INTEGER PRIMARY KEY, step_id INTEGER NOT NULL REFERENCES z_steps(id));
+    CREATE TABLE z_steps (id INTEGER PRIMARY KEY, name TEXT);
     CREATE INDEX idx_po_orders_status ON po_orders(status);
     CREATE VIEW v_po_summary AS SELECT status, count(*) c FROM po_orders GROUP BY status;
     CREATE TRIGGER trg_mis_append BEFORE DELETE ON f_mis_shipments BEGIN SELECT RAISE(ABORT, 'append-only'); END;
@@ -35,6 +41,8 @@ delete process.env.GCHAT_WEBHOOK;
   db.prepare('INSERT INTO f_mis_shipments (detail) VALUES (?)').run('m-1');
   db.prepare('INSERT INTO inv_snapshot (month) VALUES (?)').run('2026-06');
   db.prepare('INSERT INTO ai_reports (body) VALUES (?)').run('r-1');
+  db.prepare('INSERT INTO z_steps (id, name) VALUES (1, ?)').run('step-1');
+  db.prepare('INSERT INTO a_step_progress (step_id) VALUES (1)').run(); // 子→親 FK あり。子が先にエクスポートされる
   db.close();
 }
 // ── inquiry-hub.db ──

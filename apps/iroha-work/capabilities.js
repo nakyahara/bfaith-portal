@@ -30,9 +30,11 @@ export const CAP = Object.freeze({
   FACILITY_ASSIGN: 'task.facility.assign',
   /** ⛔ 止まった / 札を外す (案A 2026-09-05)。利用者が押す */
   BLOCK: 'task.block',
+  /** 📅 きょうのみんなの作業 (日報) を読む (監修 2026-09-05)。読むだけだが default-deny の表に載せる (Codex PR #1200 R1 #10) */
+  DAILY_REPORT: 'report.daily',
 });
 
-const CAPS_NOTION = Object.freeze([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT]);
+const CAPS_NOTION = Object.freeze([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT, CAP.DAILY_REPORT]);
 const CAPS_APP = Object.freeze([...CAPS_NOTION, CAP.CANCELLATION, CAP.REVIEW_CLEAR,
   CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED, CAP.BLOCK]);
 /**

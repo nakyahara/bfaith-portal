@@ -253,11 +253,26 @@ function logicalExport(srcPath, destPath) {
     // 素のパスで ATTACH (?mode=ro は URI ファイル名でしか効かず SQLITE_CANTOPEN になる。
     // このコードは src に対して SELECT しか発行しない)
     dest.exec(`ATTACH DATABASE '${srcPath.replace(/'/g, "''")}' AS src`);
-    // 元DB側は1つの読み取りトランザクションで一貫断面を取る
+    // FK 検査は切る (トランザクション外でないと効かない)。better-sqlite3 は既定 ON なので、
+    // 親テーブルより先に子テーブルへ INSERT すると「no such table: main.<親>」で落ちる
+    // (2026-09-05 初回実運用: draft_step_progress → ph_steps の FK で FATAL、7 週間分の初回バックアップが失敗)。
+    // ここは元 DB の一貫断面をそのまま写すだけなので、写し側で FK を検証する意味はない
+    dest.pragma('foreign_keys = OFF');
+    // 元DB側は1つの読み取りトランザクションで一貫断面を取る。
+    // 先に全テーブルを作ってから INSERT する (FK OFF に加えて、作成順に依存しない二段構え)
     dest.exec('BEGIN');
+    for (const t of tables) dest.exec(t.sql);
     for (const t of tables) {
-      dest.exec(t.sql);
-      dest.exec(`INSERT INTO main."${t.name}" SELECT * FROM src."${t.name}"`);
+      // 識別子は二重引用符で囲み、名前に含まれる " は "" に (テーブル名・列名とも。Codex R2 Medium)
+      const qt = `"${t.name.replace(/"/g, '""')}"`;
+      // 生成列 (GENERATED ALWAYS AS) は INSERT できないので、書き込める列だけを列挙する
+      // (table_xinfo の hidden: 0=通常列 / 2=VIRTUAL 生成列 / 3=STORED 生成列。Codex R1 Medium)
+      const cols = dest.prepare(`PRAGMA src.table_xinfo(${qt})`).all()
+        .filter((c) => c.hidden === 0)
+        .map((c) => `"${c.name.replace(/"/g, '""')}"`);
+      if (cols.length === 0) throw new Error(`mirror-primary: ${t.name} に書き込める列が無い`);
+      const list = cols.join(', ');
+      dest.exec(`INSERT INTO main.${qt} (${list}) SELECT ${list} FROM src.${qt}`);
     }
     dest.exec('COMMIT');
     // 対象テーブルのインデックスを tbl_name で正確に選択 (SQL文字列の正規表現判定はしない)

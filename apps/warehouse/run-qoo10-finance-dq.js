@@ -31,6 +31,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
+import { monthMode, pickThresholds, modeLabel } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -43,7 +44,6 @@ const dbPath = path.join(DATA_DIR, 'warehouse.db');
 if (!fs.existsSync(dbPath)) { console.error(`FATAL: warehouse.db not found at ${dbPath}`); process.exit(2); }
 
 const checkedAt = new Date().toISOString();
-function isCurrentMonth(ym) { const nowJst = new Date(Date.now() + 9 * 3600 * 1000); return ym === nowJst.toISOString().slice(0, 7); }
 
 const THRESHOLDS_PAST = {
   row_count_drift:                       { warn: 0,    error: 0 },
@@ -70,8 +70,11 @@ const THRESHOLDS_CURRENT = {
   ...THRESHOLDS_PAST,
   whitelist_coverage_pct: { warn: 70.0, error: 60.0 },  // 当月 70% (Delivered 遷移ラグ考慮、LINEギフト 同型)
 };
-const isCur = isCurrentMonth(monthStr);
-const THRESHOLDS = isCur ? THRESHOLDS_CURRENT : THRESHOLDS_PAST;
+// 月の判定は共通ヘルパー (当月 / 前月+月初14日以内 / 過去)。前月の月初は Delivered(5) 遷移ラグで
+// coverage が構造的に低いので whitelist_coverage_pct だけ当月閾値を使う (2026-08 で 5 日間 sync 停止の再発防止)
+const mode = monthMode(monthStr);
+const isCur = mode === 'current';
+const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -84,7 +87,7 @@ function recordResult(name, severity, actual, threshold, details = null) {
   if (severity !== 'info') issues.push({ name, severity, actual, threshold, details });
 }
 
-console.log(`=== Qoo10 DQ gate: ${runId} (month=${monthStr}, ${isCur ? 'CURRENT' : 'PAST'} mode) ===`);
+console.log(`=== Qoo10 DQ gate: ${runId} (month=${monthStr}, ${modeLabel(mode)} mode) ===`);
 db.prepare(`DELETE FROM dq_run_results WHERE run_id = ?`).run(runId);
 
 // Check 1: row_count_drift

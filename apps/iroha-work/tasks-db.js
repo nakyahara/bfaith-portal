@@ -424,7 +424,8 @@ export function setTaskBlock({ taskId, reason, note = null, doneQty = undefined,
     safeLogTaskEvent({ taskId: t.id, action: 'task_blocked', from: t.blocked_reason || null,
       to: `${reason}${noteText ? ' (' + noteText + ')' : ''}${stopped.length ? ` タイマー停止 ${stopped.length} 人` : ''}${dqTxt}${hmTxt}`,
       workerId, workerName, deviceLabel, ok: true });
-    return { ok: true, task: getTask(t.id), stopped };
+    // before = 札を付ける前の「できた数」「申し送り」(取り消しで戻すため — Codex PR #1200 R1 #4)
+    return { ok: true, task: getTask(t.id), stopped, before: { done_qty: t.done_qty ?? null, hold_memo: t.hold_memo ?? null } };
   }).immediate();
 }
 
@@ -455,6 +456,67 @@ function clearTaskBlockInTx(db, t, { via, actor = null, workerId = null, workerN
   safeLogTaskEvent({ taskId: t.id, action: 'task_unblocked', from: `${t.blocked_reason}${t.blocked_note ? ' (' + t.blocked_note + ')' : ''}`, to: via,
     workerId, workerName, deviceLabel, ok: true });
   return { ok: true, task: getTask(t.id) };
+}
+
+/**
+ * 「⛔ 止まった」の取り消し (誤タップ — 監修 2026-09-05)。直後 (withinMs、既定 60 秒) だけ。
+ * 札を外し、札を付けたときに止めたセッション (blocked_at と同時刻に pause で閉じたもの) をもう一度動かす。
+ * 別の作業を始めてしまった人の分は動かさず skipped に返す (札を外すのは成立させる)
+ */
+export function undoTaskBlock({ taskId, expectVersion = null, sessionIds = null, restore = null, withinMs = 60000, actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
+  const db = getDB();
+  const now = utcNow();
+  try {
+    return db.transaction(() => {
+      if (guard) { const g0 = guard(); if (g0) return g0; }
+      const g = appModeGuard();
+      if (g) return g;
+      const t = getTask(taskId);
+      if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
+      // 札を付けたときの版のまま、のときだけ (だれかが触っていたら戻さない)。版なしの呼び出しも通さない
+      if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されているのでもどせません。最新の状態を表示します', current: t };
+      if (!t.blocked_reason) return { ok: true, task: t, already: true, reopened: [], skipped: [] };
+      const blockedMs = Date.parse(t.blocked_at || '');
+      if (!Number.isFinite(blockedMs) || Date.now() - blockedMs < 0 || Date.now() - blockedMs > withinMs) {
+        return { ok: false, error: 'too_late', message: '時間が経ったのでもどせません。「▶ 作業をはじめる」で札を外してください' };
+      }
+      // 札を付けたときに止めたセッション = 切符に書いてある id のうち、blocked_at と同時刻に pause で閉じたもの
+      const ids = Array.isArray(sessionIds) ? sessionIds.map(Number).filter((n) => Number.isInteger(n) && n > 0) : null;
+      const stopped = ids
+        ? (ids.length ? db.prepare(`SELECT id, worker_id, worker_name, started_at FROM f_iroha_work_sessions
+            WHERE task_id = ? AND end_reason = 'pause' AND ended_at = ? AND voided_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`).all(t.id, t.blocked_at, ...ids) : [])
+        : db.prepare("SELECT id, worker_id, worker_name, started_at FROM f_iroha_work_sessions WHERE task_id = ? AND end_reason = 'pause' AND ended_at = ? AND voided_at IS NULL").all(t.id, t.blocked_at);
+      // 切符に書いた記録が 1 つでも見つからない (取り消された・変えられた) なら戻さない (Codex R2 #2)
+      if (ids && stopped.length !== new Set(ids).size) return { ok: false, error: 'conflict', message: '止めた記録が変わったのでもどせません。最新の状態を表示します', current: t };
+      // ⭐全員戻せるときだけ戻す — 札だけ外れて一部のタイマーが止まったまま、という状態を作らない (Codex R1 #5)
+      const openOf = db.prepare('SELECT id FROM f_iroha_work_sessions WHERE worker_id = ? AND ended_at IS NULL LIMIT 1');
+      for (const s of stopped) {
+        if (openOf.get(s.worker_id)) return { ok: false, error: 'busy', message: s.worker_name + ' さんは別の作業をはじめているのでもどせません (札はそのまま)' };
+      }
+      // 札を外し、同時に入れた「できた数」「申し送り」も付ける前の値に戻す (Codex R1 #4)
+      const dq = restore && 'done_qty' in restore ? restore.done_qty : t.done_qty;
+      const hm = restore && 'hold_memo' in restore ? restore.hold_memo : t.hold_memo;
+      const r = db.prepare(`UPDATE f_iroha_tasks SET blocked_reason = NULL, blocked_note = NULL, blocked_at = NULL, blocked_by = NULL,
+          done_qty = ?, hold_memo = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?`)
+        .run(dq ?? null, hm ?? null, now, actor, t.id, t.version);
+      if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
+      const upd = db.prepare('UPDATE f_iroha_work_sessions SET ended_at = NULL, end_reason = NULL, raw_seconds = NULL WHERE id = ? AND ended_at IS NOT NULL');
+      const reopened = [];
+      for (const s of stopped) {
+        upd.run(s.id);
+        reopened.push({ id: s.id, worker_id: s.worker_id, worker_name: s.worker_name, started_at: s.started_at, already: false });
+        safeLogTaskEvent({ taskId: t.id, action: 'session_undo_stop', workerId: s.worker_id, workerName: s.worker_name, deviceLabel, to: 'undo block', ok: true });
+      }
+      safeLogTaskEvent({ taskId: t.id, action: 'task_unblocked', from: `${t.blocked_reason}${t.blocked_note ? ' (' + t.blocked_note + ')' : ''}`, to: 'undo', workerId, workerName, deviceLabel, ok: true });
+      safeLogTaskEvent({ taskId: t.id, action: 'task_block_undo', from: t.blocked_reason,
+        to: `タイマー再開 ${reopened.length} 人${dq !== (t.done_qty ?? null) ? ` できた数 ${t.done_qty ?? '—'}→${dq ?? '—'}` : ''}`,
+        workerId, workerName, deviceLabel, ok: true });
+      return { ok: true, task: getTask(t.id), reopened, skipped: [] };
+    }).immediate();
+  } catch (e) {
+    if (e && /SQLITE_CONSTRAINT/.test(String(e.code || e.message))) return { ok: false, error: 'busy', message: '別の作業がはじまっているのでもどせません (札はそのまま)' };
+    throw e;
+  }
 }
 
 /** 「今日やる」(planned_date = YYYY-MM-DD) / 後日 (null)。未着手・作業中のタスク */
