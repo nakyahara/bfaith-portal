@@ -44,7 +44,7 @@
   <header class="portal-header">
     <div class="header-left">
       <h1>B-Faith Portal</h1>
-      <span class="page-title">🔴 再ピック・棚戻し</span>
+      <span class="page-title">↩ 棚戻し</span>
     </div>
     <div class="header-right">
       <a href="/apps/picking/" class="btn-logout">← バッチ一覧</a>
@@ -52,7 +52,7 @@
   </header>
 
   <div class="pk-wrap">
-    <div class="muted" style="margin-bottom:8px"><%= tasks.length %> 件の依頼 (梱包現場から)。60秒ごとに自動更新</div>
+    <div class="muted" style="margin-bottom:8px"><%= tasks.length %> 件の棚戻し依頼 (梱包現場から)。再ピックはバッチ一覧の 🔴 で。60秒ごとに自動更新</div>
     <% if (tasks.length === 0) { %><div class="pk-empty">依頼はありません 🎉</div><% } %>
 
     <% for (const t of tasks) { %>

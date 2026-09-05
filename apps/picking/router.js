@@ -25,7 +25,7 @@ import {
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
   getPickingStats, getTodayProgress, getMissStats, statsRange, loadStatsLines, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
-import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests } from './service.js';
+import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask } from './service.js';
 import { notifyShortage, notifyShortageUndo } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
@@ -219,7 +219,7 @@ router.get('/', async (req, res) => {
     .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
   let openTasks = 0;
   const psvc = await packingSvc();
-  if (psvc) { try { openTasks = psvc.countOpenTasks(); } catch { openTasks = 0; } }
+  if (psvc) { try { openTasks = psvc.countOpenTasks({ kind: 'return' }); } catch { openTasks = 0; } }   // 棚戻しのみ (再ピックは 🔴バッチ)
   res.render(path.join(__dirname, 'views/batches'), {
     openTasks,
     title: 'ピッキング支援',
@@ -238,11 +238,13 @@ router.get('/', async (req, res) => {
 router.get('/tasks', async (req, res) => {
   const psvc = await packingSvc();
   if (!psvc) return res.status(404).send('梱包連携は無効です');
+  // 再ピックは 🔴バッチに一本化 (Q4 決定 2026-09-05)。このキューは棚戻し専用 —
+  // 同じ依頼に入口が2つあると、片方で「在庫なし」・片方で他ロケ確保、と記録が割れる (9/5 に実発生)
   let tasks = [];
-  try { tasks = psvc.listOpenTasks(); } catch { tasks = []; }
+  try { tasks = psvc.listOpenTasks({ kind: 'return' }); } catch { tasks = []; }
   const images = getImageMap(tasks.map((t) => t.sku));
   res.render(path.join(__dirname, 'views/tasks'), {
-    title: '再ピック・棚戻し',
+    title: '棚戻し',
     workers: listWorkers(),
     tasks: tasks.map((t) => ({
       ...t,
@@ -262,12 +264,19 @@ router.post('/api/tasks/:id(\\d+)/:action', checkOrigin, async (req, res) => {
     const psvc = await packingSvc();
     if (!psvc) return res.status(404).json({ error: '梱包連携は無効です' });
     const worker = resolveWorker(req);
-    const t = psvc.applyTaskAction(Number(req.params.id), String(req.params.action), worker.name);
-    if (t._notifyUnavailable) {
-      import('../packing/notify.js')
-        .then(({ notifyTaskUnavailable }) => notifyTaskUnavailable(t, worker.name))
-        .catch((e) => console.warn(`[picking] 在庫なし通知失敗: ${e.message}`));
+    // 再ピックは 🔴バッチに一本化 (Q4 決定 2026-09-05)。この API は棚戻しだけ — 古い画面・直接リクエストからの
+    // 二経路更新 (片方で在庫なし・片方で確保) を残さない (Codex R1 High)
+    const target = psvc.getTask(Number(req.params.id));
+    if (!target) return res.status(404).json({ error: '依頼が見つかりません', code: 'not_found' });
+    if (target.kind !== 'return') {
+      return res.status(409).json({ error: '再ピックはバッチ一覧の 🔴バッチから操作してください', code: 'repick_batch_only' });
     }
+    // 棚戻しの操作は 対応する / 棚に戻した / 取下げ だけ。「在庫なし」は再ピック (=🔴バッチの欠品シート) の概念で、
+    // 棚戻しに流すと伝票の出荷保留バナーを誤って作る (Codex R2 Medium)
+    if (!['claim', 'fulfill', 'cancel'].includes(String(req.params.action))) {
+      return res.status(400).json({ error: '棚戻しではこの操作はできません', code: 'bad_return_action' });
+    }
+    const t = psvc.applyTaskAction(Number(req.params.id), String(req.params.action), worker.name);
     res.json({ ok: true, id: t.id, status: t.status });
   } catch (e) {
     // packing 側の業務エラー (PackError) も picking の PkError と同じ形で返す
@@ -424,35 +433,16 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   }
   // 🔴ピッキング漏れバッチ → 梱包タスクの状態同期 (fail-soft・トランザクション外)。
   // 開始=対応中 (claim) / 完了=持って行った (fulfill→梱包画面の「再ピック届いた」表示へ) /
-  // 欠品=在庫なしエスカレーション (unavailable)。
+  // 欠品で残りあり=在庫なし (unavailable + 1階の全端末へ赤バナー)。他ロケで全量確保は通常の完了と同じ。
   // replay でも実行する (Codexレビュー: 同期の一時失敗後、同一op_id再送で収束させる。
-  // 各アクションは遷移ガードつきで二重適用は失敗ログ止まり=無害)
+  // 各アクションは遷移ガードつきで二重適用は失敗ログ止まり=無害)。分岐は syncRepickTask (テスト対象)
   {
-    const b = getBatch(batchId);
-    if (b?.origin === 'repick' && b.pack_task_id) {
-      const psvc = await packingSvc();
-      if (psvc) {
-        const act = (action) => {
-          try { return psvc.applyTaskAction(b.pack_task_id, action, worker.name); }
-          catch (e) {
-            console.warn(`[picking] 漏れバッチのタスク同期 (${action}) 失敗 (task=${b.pack_task_id}): ${e.message}`);
-            return null;
-          }
-        };
-        if (req.body.event === 'start') act('claim');
-        if (req.body.event === 'shortage') {
-          const t = act('unavailable');
-          if (t?._notifyUnavailable) {
-            import('../packing/notify.js')
-              .then(({ notifyTaskUnavailable }) => notifyTaskUnavailable(t, worker.name))
-              .catch((e) => console.warn(`[picking] 在庫なし通知失敗: ${e.message}`));
-          }
-        }
-        if (b.status === 'done') {
-          act('claim');   // 開始同期が漏れていた場合の追いつき (claimed済みは失敗ログのみ=無害)
-          act('fulfill'); // fulfilled = 梱包側の受領待ち (梱包ヘッダーの緑バナーはこの状態から導出)
-        }
-      }
+    const sync = syncRepickTask(batchId, { event: req.body.event }, worker.name, await packingSvc());
+    if (sync.unavailable) {
+      const { task, remaining, altQty } = sync.unavailable;
+      import('../packing/notify.js')
+        .then(({ notifyTaskUnavailable }) => notifyTaskUnavailable(task, worker.name, { remaining, altQty }))
+        .catch((e) => console.warn(`[picking] 在庫なし通知失敗: ${e.message}`));
     }
   }
   res.json({ ok: true, ...result });

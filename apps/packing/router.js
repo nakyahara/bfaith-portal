@@ -30,8 +30,9 @@ import {
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, SHIP_CHANGE_TWO_LABELS, lastDoneSeqOf, getDailySummary,
   resolveIncident, lineKindOf, batchHikiateClass, batchClassInfo, listLineRuns, lineDailyTotal, listRepickReady,
+  claimStockoutNotify, markStockoutNotify,
 } from './service.js';
-import { notifyShipChange, notifyTask, notifyReprint, postReprintText } from './notify.js';
+import { notifyShipChange, notifyTask, notifyReprint, postReprintText, notifyStockout } from './notify.js';
 import {
   extractReprintPdf, cleanupReprintPdfs, detectOkurijoSlug, REPRINTS_DIR, LabelUnusableError,
 } from './reprint-pdf.js';
@@ -476,6 +477,9 @@ router.get('/line/:id(\\d+)', (req, res) => {
   let slips = [];
   let incidents = [];
   let repickBySlip = {};
+  let stockoutBySlip = {};   // 3階「在庫なし」の報告 (保留伝票 seq → 商品)
+  let stockoutAckSeqs = [];  // そのうち「在庫なしを確認」できる伝票
+  let stockoutNotifyBySlip = {};   // 閉じた伝票の事務通知の状態 (sent / pending)
   let tasks = [];
   try {
     const st = getWorkState(batch.id);
@@ -487,6 +491,9 @@ router.get('/line/:id(\\d+)', (req, res) => {
     }));
     incidents = st.incidents.map((i) => ({ id: i.id, slipSeq: i.slip_seq, kind: i.kind, sku: i.sku, qty: i.qty }));
     repickBySlip = st.repickBySlip || {};
+    stockoutBySlip = st.stockoutBySlip || {};
+    stockoutAckSeqs = st.stockoutAckSeqs || [];
+    stockoutNotifyBySlip = st.stockoutNotifyBySlip || {};
     // 未完了の再ピックタスク (SKU 単位の状態表示・SKU 単位の「見つかった」用)
     tasks = getDB().prepare(`SELECT id, slip_seq AS slipSeq, sku, req_qty AS qty, status FROM pk_pack_tasks
       WHERE batch_id=? AND kind='repick' AND status IN ('requested','claimed','fulfilled') ORDER BY id`).all(batch.id);
@@ -495,6 +502,9 @@ router.get('/line/:id(\\d+)', (req, res) => {
     slips,
     incidents,
     repickBySlip,
+    stockoutBySlip,
+    stockoutAckSeqs,
+    stockoutNotifyBySlip,
     tasks,
     methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
     twoLabelsOption: SHIP_CHANGE_TWO_LABELS,
@@ -564,7 +574,25 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     enqueuePackBatchNotionSync(Number(req.params.id));
   }
   // ①②のGChat通知 (fail-soft・DBのタスク行が正本。replayでは taskNotify が付かない=再送しない)
-  if (result.taskNotify) {
+  if (result.taskNotify?.kind === 'stockout') {
+    // 🚫 在庫なしを確認 → 事務へ (NE で出荷保留にしてもらう)。outbox (pk_pack_stockouts) の行が正本で、
+    // 送れたときだけ notified_at。失敗・未設定はポーラーが再送する。成否は画面にも返す
+    const n = result.taskNotify;
+    // 送信権を取ってから送る (ポーラーの再送と同じ行を同時に送らない)。取れなければポーラーに任せる
+    if (!claimStockoutNotify(n.stockoutId)) {
+      result.stockoutNotify = 'pending';
+    } else {
+      try {
+        const sent = await notifyStockout({ ...n, worker });
+        markStockoutNotify(n.stockoutId, sent, sent ? null : 'webhook未設定');
+        result.stockoutNotify = sent ? 'sent' : 'failed';
+      } catch (e) {
+        console.warn(`[packing-notify] 出荷保留 (在庫なし) 通知失敗 (${n.neSlipNo}): ${e.message}`);
+        markStockoutNotify(n.stockoutId, false, e.message);
+        result.stockoutNotify = 'failed';
+      }
+    }
+  } else if (result.taskNotify) {
     notifyTask(result.taskNotify, worker)
       .catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${result.taskNotify.sku}): ${e.message}`));
   }
@@ -902,6 +930,11 @@ router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
     doneSeqs: s.slips.filter((x) => x.status === 'done').map((x) => x.seq),
     heldSeqs: s.slips.filter((x) => x.status === 'held').map((x) => x.seq),
     repickSeqs: s.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
+    repickUnavailableSeqs: Object.keys(s.stockoutBySlip || {}).map(Number),
+    stockoutBySlip: s.stockoutBySlip || {},
+    stockoutAckSeqs: s.stockoutAckSeqs || [],
+    stockoutSeqs: s.slips.filter((x) => x.status === 'cancelled' && x.hold_reason === 'stockout').map((x) => x.seq),
+    stockoutNotifyBySlip: s.stockoutNotifyBySlip || {},
     incidents: s.incidents,
     lastDoneSeq: lastDoneSeqOf(Number(req.params.id)),
     pauseReason: s.batch.pause_reason || null,

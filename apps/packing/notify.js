@@ -95,12 +95,43 @@ export async function notifyTask(info, worker) {
   return postTask(lines.join('\n'));
 }
 
-export async function notifyTaskUnavailable(task, worker) {
+export async function notifyTaskUnavailable(task, worker, { remaining = null, altQty = 0 } = {}) {
   return postTask([
-    '🚨 *再ピックできません (在庫なし等)* — 出荷可否の判断が必要です',
-    `商品: *${task.sku}* × ${task.req_qty}個 / 依頼元: ${task.folder_name || '-'}${task.slip_seq ? ` #${task.slip_seq}` : ''}`,
+    '🚨 *再ピックできません (在庫なし)* — 1階が「在庫なしを確認」すると出荷保留の通知が届きます',
+    `商品: *${task.sku}*${task.product_name ? ` (${task.product_name})` : ''} × ${task.req_qty}個 / 依頼元: ${task.folder_name || '-'}${task.slip_seq ? ` #${task.slip_seq}` : ''}`,
+    ...(remaining != null && altQty > 0 ? [`うち ${altQty}個 は他ロケで確保して届けます (足りないのは ${remaining}個)`] : []),
     `報告: ${worker}`,
   ].join('\n'));
+}
+
+/**
+ * 🚫 出荷保留 (在庫なし) — 1階の梱包者が3階の「在庫なし」を確認して伝票を閉じたとき (Q1 決定 2026-09-05 = 案a)。
+ * 事務が NE で出荷保留にする起点。宛先 = 配送方法変更と同じ事務スペース (PACKING_SHIP_CHANGE_WEBHOOK)。
+ * 通知はチャネル・伝票の状態 (pk_pack_slips cancelled/stockout) が正本
+ */
+export async function notifyStockout({ folder, slipSeq, neSlipNo, siteOrderNo = null, recipientName = null, worker, items = [] }) {
+  const url = process.env.PACKING_SHIP_CHANGE_WEBHOOK;
+  if (!url) {
+    console.warn('[packing-notify] PACKING_SHIP_CHANGE_WEBHOOK 未設定 → 出荷保留 (在庫なし) の GChat 通知なし');
+    return false;
+  }
+  const hm = (iso) => { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; };
+  // 商品名・送り先名は改行と装飾記号を落とす (通知の行構造を壊さない — Codex R1 Low)
+  const ct = (v) => String(v ?? '-').replace(/[\r\n\t]+/g, ' ').replace(/[*_~`]/g, '').slice(0, 200) || '-';
+  const text = [
+    '🚫 *出荷保留 (在庫なし)* — NE で出荷保留にして、お客様対応をお願いします (3階に在庫がありませんでした)',
+    `伝票: *${ct(neSlipNo)}* (${ct(folder)}${slipSeq ? ` #${slipSeq}` : ''}) / モール伝票番号: ${ct(siteOrderNo)} / 送り先: ${ct(recipientName)}`,
+    ...items.map((i) => `・${ct(i.name || i.sku)} (${ct(i.sku)}) × ${i.qty}個 在庫なし${i.delivered > 0 ? ` (${i.delivered}個は他ロケから確保して1階へ)` : ''} — 3階: ${ct(i.claimedBy)} ${hm(i.at)}`),
+    `確認: ${ct(worker)} (商品と納品書は出荷保留の棚)`,
+  ].join('\n');
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
+  return true;
 }
 
 // 🖨 伝票再印刷依頼 (2026-08-21 中原さん指示)。env: PACKING_REPRINT_WEBHOOK (バックオフィス連絡)。

@@ -16,12 +16,15 @@
  * 定期実行の台帳: config/jobs-registry.mjs の packing-drive-poller を参照。
  */
 import { getDB, utcNow } from './db.js';
-import { notifyShipChange, notifyReprint, postMaterialText, materialWebhookConfigured, postReprintText, postMissText, missWebhookConfigured } from './notify.js';
+import { notifyShipChange, notifyReprint, postMaterialText, materialWebhookConfigured, postReprintText, postMissText, missWebhookConfigured, notifyStockout } from './notify.js';
 import { missWatchStep } from './miss-watch.js';
 import { sweepPrintJobs, pendingAlerts, markAlerted, alertTextFor } from './print-queue.js';
 import { materialNotifyStep, purgeOldViews } from './materials.js';
 import { cleanupReprintPdfs } from './reprint-pdf.js';
-import { parseCs03003, importPackBatch, checkPickingMatch, isStaleSagyoDate, PackError } from './service.js';
+import {
+  parseCs03003, importPackBatch, checkPickingMatch, isStaleSagyoDate, PackError,
+  listPendingStockoutNotifies, countStaleStockoutNotifies, claimStockoutNotify, markStockoutNotify,
+} from './service.js';
 import { getShippingFolders, listNouhinCsvFiles, downloadNouhinCsv } from './drive.js';
 
 /**
@@ -256,6 +259,36 @@ async function retryShipChangeNotify() {
   }
 }
 
+/**
+ * 🚫 出荷保留 (在庫なし) 通知の再送 (直近2日・未通知のみ・1周期3件まで — ④と同型)。
+ * 「在庫なしを確認」は伝票を閉じる強い操作で、事務通知が業務上必須 (Q1 決定 2026-09-05) —
+ * 送信前に落ちても outbox 行 (pk_pack_stockouts) が残るのでここで追いつく
+ */
+async function retryStockoutNotify() {
+  let rows = [];
+  try {
+    rows = listPendingStockoutNotifies(3);   // 期間で切らない (2日で打ち切ると未通知が永久に残る — Codex R2 High)
+    const stale = countStaleStockoutNotifies();
+    if (stale > 0) console.error(`[packing-drive-poller] 出荷保留 (在庫なし) の未通知が2日以上滞留: ${stale}件 (webhook/ポーラーを確認)`);
+  } catch { return; }   // v20未適用
+  for (const row of rows) {
+    if (!claimStockoutNotify(row.id)) continue;   // router が送信中
+    try {
+      let items = [];
+      try { items = JSON.parse(row.items_json) || []; } catch { items = []; }
+      const sent = await notifyStockout({
+        folder: row.folder_name, slipSeq: row.slip_seq, neSlipNo: row.ne_slip_no,
+        siteOrderNo: row.site_order_no, recipientName: row.recipient_name,
+        worker: `${row.worker} (再送)`, items,
+      });
+      markStockoutNotify(row.id, sent, sent ? null : 'webhook未設定');
+      if (sent) console.log(`[packing-drive-poller] 出荷保留 (在庫なし) 通知を再送: ${row.ne_slip_no}`);
+    } catch (e) {
+      markStockoutNotify(row.id, false, e.message);
+    }
+  }
+}
+
 /** 🖨再印刷通知の再送 (直近2日・未通知のみ・1周期3件まで — ④と同型)。 */
 async function retryReprintNotify() {
   const db = getDB();
@@ -332,6 +365,7 @@ export function startPackingDrivePoller() {
         _status.lastError = null;
         await retryShipChangeNotify();
         await retryReprintNotify();
+        await retryStockoutNotify();
         // 資材変更の通知 outbox (undo 猶予後に送信・at-least-once — 要件『梱包資材表示』§5.3)。
         // webhook 未設定時は claim しない (管理画面に構成エラー表示)
         await materialNotifyStep(materialWebhookConfigured() ? postMaterialText : null);

@@ -516,6 +516,12 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
         throw new PkError(409, 'repick_cancelled', 'この再ピック依頼は梱包側で取下げられました (一覧に戻ると整理されます)');
       }
     }
+    // 🔴再ピックバッチの back/cancel: 1階が受け取り済みなら戻せない (タスクは終端・現物は1階にある)
+    if (batch.origin === 'repick' && batch.pack_task_id && (event === 'back' || event === 'cancel')) {
+      let ts = null;
+      try { ts = db.prepare('SELECT status FROM pk_pack_tasks WHERE id = ?').get(batch.pack_task_id)?.status ?? null; } catch { ts = null; }
+      if (ts === 'received') throw new PkError(409, 'already_received', '梱包側が受け取り済みのため戻せません');
+    }
 
     let transition = null;   // started / completed / reopened (Notion連携のトリガ)
     if (event === 'takeover') {
@@ -658,14 +664,24 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
           if (rem != null && !['later', 'none'].includes(rem)) {
             throw new PkError(400, 'bad_remaining', '残りの扱いは later か none です');
           }
+          // 🔴再ピックバッチ (梱包からの依頼・自分の「後で」の受け皿) の中で「後で取りに行く」は使えない。
+          // 受注明細 (pk_slip_lines) が無いので配賦できず、依頼が pending_binding のまま迷子になる
+          // (9/1 に実発生。例外処理監査 A-3)。取れなければ「どこにもない」= 在庫なしとして1階へ伝える
+          if (batch.origin === 'repick' && rem === 'later') {
+            throw new PkError(400, 'later_in_repick',
+              '再ピックでは「後で取りに行く」は使えません。取れなければ「どこにもない」を選んでください');
+          }
           db.prepare(`UPDATE pk_lines SET status='shortage', done_at=?, shortage_qty=?,
               alt_block=?, alt_location=?, alt_qty=?, remaining_qty=?, remaining=?
             WHERE batch_id=? AND seq=?`)
             .run(now, q, altBlk, altLoc, a > 0 ? a : null, remQty, rem, batchId, lineSeq);
           closeShortageSession(db, batch, lineSeq, clampedEventTime(clientAt, now), now);
           // v2 PR2: 残りを受注に配賦し (梱包の 🕒/❌ バッジの元)、「後で」は依頼として積む。
-          // 梱包タスクへの展開はトランザクション外 (bindPendingLaterRequests — router/reconcile/ポーラー)
-          recordShortageAllocations(db, batch, line, lineSeq, { remQty, rem, worker }, now);
+          // 梱包タスクへの展開はトランザクション外 (bindPendingLaterRequests — router/reconcile/ポーラー)。
+          // 再ピックバッチには受注明細が無いので配賦しない (在庫なしは syncRepickTask がタスク側へ伝える)
+          if (batch.origin !== 'repick') {
+            recordShortageAllocations(db, batch, line, lineSeq, { remQty, rem, worker }, now);
+          }
         } else {
           db.prepare("UPDATE pk_lines SET status='done', done_at=? WHERE batch_id=? AND seq=?")
             .run(now, batchId, lineSeq);
@@ -1490,38 +1506,142 @@ export const FLOOR_ALERT_KINDS = {
   lift:    { direction: 'to_packing', message: '🛗 リフトの中身を出してください' },
   unload:  { direction: 'to_picking', message: '📦 ピッキング済みの商品を下してください' },
   repick_done: { direction: 'to_packing', message: null },   // 不足分ピッキング完了 (メッセージは依頼ごとに動的)
+  // 3階「在庫なし」→ 1階の全端末へ (例外処理監査 PR-1)。メッセージは依頼ごとに動的・link で対象伝票へ飛ぶ
+  stockout: { direction: 'to_packing', message: null },
 };
 
 /** アラート発報。同種の未確認が生きていれば重ねない (連打・二重依頼の集約)。 */
-export function createFloorAlert(kind, requestedBy, customMessage = null) {
+export function createFloorAlert(kind, requestedBy, customMessage = null, link = null, taskId = null) {
   const def = FLOOR_ALERT_KINDS[kind];
   if (!def) throw new PkError(400, 'bad_kind', '不明なアラート種別です');
   const message = def.message || String(customMessage || '').slice(0, 160);
   if (!message) throw new PkError(400, 'no_message', 'メッセージが必要です');
   const db = getDB();
   // 集約チェック+INSERTは同一トランザクション (Codex: 同時押下の重複防止)。
-  // 集約キーは (kind, message) — repick_done は依頼ごとにメッセージが違うため別々に出る
+  // 集約キーは (kind, message) — repick_done は依頼ごとにメッセージが違うため別々に出る。
+  // task_id 付き (在庫なし) は (kind, task_id) で集約 = 同じタスクの未解決バナーは1本だけ
   return db.transaction(() => {
-    const dup = db.prepare(`
-      SELECT id FROM pk_floor_alerts
-      WHERE kind = ? AND message = ? AND acked_at IS NULL AND created_at >= datetime('now', '-4 hours')
-    `).get(kind, message);
+    const dup = taskId != null
+      ? db.prepare(`SELECT id FROM pk_floor_alerts
+          WHERE kind = ? AND task_id = ? AND acked_at IS NULL AND resolved_at IS NULL`).get(kind, taskId)
+      : db.prepare(`SELECT id FROM pk_floor_alerts
+          WHERE kind = ? AND message = ? AND acked_at IS NULL AND resolved_at IS NULL AND created_at >= datetime('now', '-4 hours')`).get(kind, message);
     if (dup) return { id: dup.id, existed: true };
     const info = db.prepare(`
-      INSERT INTO pk_floor_alerts (direction, kind, message, requested_by, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(def.direction, kind, message, requestedBy || null, utcNow());
+      INSERT INTO pk_floor_alerts (direction, kind, message, requested_by, created_at, link, task_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(def.direction, kind, message, requestedBy || null, utcNow(), link ? String(link).slice(0, 200) : null, taskId);
     return { id: Number(info.lastInsertRowid), existed: false };
   }).immediate();
 }
 
-/** 表示対象 (未確認・4時間以内 — 古いバナーを翌日まで残さない)。 */
+/** 表示対象 (未確認・未解決・4時間以内 — 古いバナーを翌日まで残さない)。 */
 export function listFloorAlerts(direction) {
   return getDB().prepare(`
-    SELECT id, kind, message, requested_by, created_at FROM pk_floor_alerts
-    WHERE direction = ? AND acked_at IS NULL AND created_at >= datetime('now', '-4 hours')
+    SELECT id, kind, message, requested_by, created_at, link, task_id FROM pk_floor_alerts
+    WHERE direction = ? AND acked_at IS NULL AND resolved_at IS NULL AND created_at >= datetime('now', '-4 hours')
     ORDER BY id
   `).all(direction);
+}
+
+/**
+ * タスク由来のバナーを状態遷移と同時に閉じる (在庫なし → 見つかった/届けた/取り消し/1階が確認)。
+ * packing からも呼ぶ (picking 所有テーブルへの書き込みはこの関数経由)。fail-soft (テーブル未適用は 0)
+ */
+export function resolveFloorAlertsByTask(taskId, kind = 'stockout', dbh = null) {
+  try {
+    // packing のトランザクション内から呼ぶときは同じ接続 (dbh) を使う — 別接続だと書き込みロック待ちになる
+    return (dbh || getDB()).prepare(`UPDATE pk_floor_alerts SET resolved_at=?
+      WHERE task_id=? AND kind=? AND resolved_at IS NULL`).run(utcNow(), taskId, kind).changes;
+  } catch { return 0; }
+}
+
+// 🔴再ピックバッチ → 梱包タスクの同期: 「いまのバッチ状態から望ましいタスク状態」を導いて収束させる。
+//   ready → requested / picking・paused → claimed / done → 在庫なしの明細があれば unavailable、なければ fulfilled
+// イベント名で分岐しない (back/cancel で取り消した欠品が同期されず、後から fulfilled に化ける穴 — Codex R1 High)。
+// 終端 (received/cancelled/returned) には触らない
+const TASK_SYNC_TERMINAL = new Set(['received', 'cancelled', 'returned']);
+const TASK_SYNC_PATHS = {
+  'requested>claimed': ['claim'],
+  'requested>fulfilled': ['claim', 'fulfill'],
+  'requested>unavailable': ['unavailable'],
+  'claimed>fulfilled': ['fulfill'],
+  'claimed>unavailable': ['unavailable'],
+  'claimed>requested': ['reopen'],
+  'unavailable>claimed': ['resume'],
+  'unavailable>fulfilled': ['fulfill'],
+  'unavailable>requested': ['reopen'],
+  'fulfilled>claimed': ['resume'],
+  'fulfilled>requested': ['reopen'],
+  'fulfilled>unavailable': ['resume', 'unavailable'],
+};
+
+/**
+ * 🔴再ピックバッチの作業イベント → 梱包タスク (pk_pack_tasks) の状態同期 (例外処理監査 PR-1)。
+ * router から毎イベント後に呼ぶ (トランザクション外・fail-soft・replay でも呼ぶ = 収束させる)。
+ *   - 他ロケで全量確保して完了 → fulfilled (1階の受領待ち)。以前は shortage を全部 unavailable にしていた
+ *     ため、他ロケで確保できても「在庫なし」と記録されていた (9/3・9/5 に実発生)
+ *   - 残りありで完了 → unavailable + 1階の全端末へ赤バナー (task_id で1本に集約。未解決が無ければ作り直す
+ *     = 障害・replay 後の自己修復) + 部分確保の内訳 (fulfilled_qty / unavailable_qty) をタスクに保存
+ *   - back / cancel → claimed / requested へ戻し、赤バナーを閉じる
+ * @param psvc packing service (無効環境は null → 何もしない)
+ * @returns {{actions: string[], unavailable: null|{task, remaining, altQty}, desired: string|null, status: string|null}}
+ *          unavailable = 今回 unavailable へ遷移したときだけ (GChat 通知用。replay では付かない)
+ */
+export function syncRepickTask(batchId, { event = null } = {}, workerName, psvc) {
+  const none = { actions: [], unavailable: null, desired: null, status: null };
+  const b = getBatch(batchId);
+  if (!b || b.origin !== 'repick' || !b.pack_task_id || !psvc?.getTask) return none;
+  const taskId = b.pack_task_id;
+  let task = null;
+  try { task = psvc.getTask(taskId); } catch (e) { console.warn(`[picking] 漏れバッチのタスク読取失敗 (task=${taskId}): ${e.message}`); return none; }
+  if (!task) return none;
+  const lines = listLines(batchId);
+  const stockoutQty = lines.filter((l) => l.status === 'shortage')
+    .reduce((s, l) => s + (Number(l.remaining_qty ?? l.shortage_qty ?? 0) || 0), 0);
+  const desired = b.status === 'ready' ? 'requested'
+    : (b.status === 'picking' || b.status === 'paused') ? 'claimed'
+      : b.status === 'done' ? (stockoutQty > 0 ? 'unavailable' : 'fulfilled')
+        : null;   // cancelled/invalid は reconcileRepickBatches が畳む
+  const actions = [];
+  if (desired && !TASK_SYNC_TERMINAL.has(task.status) && task.status !== desired) {
+    for (const action of (TASK_SYNC_PATHS[`${task.status}>${desired}`] || [])) {
+      try {
+        const extra = action === 'unavailable'
+          ? { unavailableQty: Math.min(stockoutQty, task.req_qty), fulfilledQty: Math.max(0, task.req_qty - stockoutQty) }
+          : {};
+        task = psvc.applyTaskAction(taskId, action, workerName, extra);
+        actions.push(action);
+      } catch (e) {
+        // 別経路 (1階の操作等) で先に動いた等。現状態を読み直して判定に使う
+        console.warn(`[picking] 漏れバッチのタスク同期 (${action}) 失敗 (task=${taskId}, event=${event}): ${e.message}`);
+        try { task = psvc.getTask(taskId) || task; } catch { /* 読めなければ直前の値 */ }
+        break;
+      }
+    }
+    if (task.status !== desired) {
+      console.warn(`[picking] 漏れバッチのタスク同期が収束しません (task=${taskId} status=${task.status} desired=${desired} event=${event})`);
+    }
+  }
+  let unavailable = null;
+  if (task.status === 'unavailable') {
+    const unavailableQty = task.unavailable_qty ?? Math.min(stockoutQty || task.req_qty, task.req_qty);
+    const fulfilledQty = task.fulfilled_qty ?? Math.max(0, task.req_qty - unavailableQty);
+    if (actions.includes('unavailable')) unavailable = { task, remaining: unavailableQty, altQty: fulfilledQty };
+    // 1階の全端末に赤バナー (Q2 決定 2026-09-05: バナーで・分かりやすく = 商品名・伝票・数量・誰が)。
+    // task_id で集約するので毎回呼んでよい (未解決が残っていれば作らない)
+    try {
+      const name = task.product_name || task.sku;
+      const ref = `${task.folder_name || '-'}${task.slip_seq ? ` #${task.slip_seq}` : ''}`;
+      const who = task.claimed_by || workerName;
+      const msg = `🚫 在庫なし: ${ref} ${name} ×${unavailableQty}${fulfilledQty > 0 ? ` (${fulfilledQty}個は届けます)` : ''} — 3階 ${who}`;
+      const link = task.slip_seq ? `/apps/packing/work/${task.batch_id}?seq=${task.slip_seq}` : `/apps/packing/work/${task.batch_id}`;
+      createFloorAlert('stockout', who, msg, link, task.id);
+    } catch (e) { console.warn(`[picking] 在庫なしバナーの発報失敗: ${e.message}`); }
+  } else {
+    resolveFloorAlertsByTask(taskId, 'stockout');   // 在庫なしでなくなった (届けた/戻した) → バナーを閉じる
+  }
+  return { actions, unavailable, desired, status: task.status };
 }
 
 /** OKタップで確認済みに (全端末から消える)。direction=呼び出し側の表示方向 —

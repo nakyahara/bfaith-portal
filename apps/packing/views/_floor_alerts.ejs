@@ -16,6 +16,9 @@
     var html = alerts.map(function (a) {
       return '<div style="background:#e03131; color:#fff; padding:14px 16px; display:flex; align-items:center; gap:12px; font-size:18px; font-weight:800; border-bottom:2px solid #fff">'
         + '<span style="flex:1">' + esc(a.message) + (a.requested_by ? '<small style="font-weight:400">（依頼: ' + esc(a.requested_by) + '）</small>' : '') + '</span>'
+        // 対象伝票へのリンク (在庫なしバナー等)。同一サイトの /apps/ 配下だけ通す
+        + (a.link && /^\/apps\/[A-Za-z0-9_\-\/?=&.#]*$/.test(String(a.link))
+          ? '<a href="' + esc(a.link) + '" style="padding:10px 20px; border-radius:10px; background:#fff; color:#e03131; font-weight:800; font-size:16px; text-decoration:none; white-space:nowrap">対象伝票を開く</a>' : '')
         + btn('data-ack="' + a.id + '"', '確認して閉じる', '#e03131', '#fff')
         + '</div>';
     }).join('');

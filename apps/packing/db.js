@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 19;
+const SCHEMA_VERSION = 20;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -551,6 +551,38 @@ const MIGRATIONS = {
     if (!cols.includes('pk_batch_id')) db.exec('ALTER TABLE pk_pack_miss_alerts ADD COLUMN pk_batch_id INTEGER');
     db.exec('DROP INDEX IF EXISTS idx_pk_pack_miss_alerts_date');
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_miss_alerts_pending ON pk_pack_miss_alerts(notified_at)');
+  },
+  // v20: 3階「在庫なし」の扱い (例外処理監査 PR-1・Q1 決定 2026-09-05)。
+  //   - pk_pack_tasks.close_reason: 'stockout' = 1階が「在庫なしを確認」して閉じた (status='cancelled' と組)。
+  //     未確認の在庫なし (unavailable) と確認済みの終端を区別する (Codex R1 High)
+  //   - fulfilled_qty / unavailable_qty: 部分確保 (5個中2個は他ロケで確保・3個は在庫なし) の内訳
+  //   - pk_pack_stockouts: 「在庫なしを確認」の事務通知の outbox。伝票を閉じるのと同じトランザクションで行を作り、
+  //     送れたときだけ notified_at。未送信はポーラーが再送する (配送変更④と同型。通知はチャネル・行が正本)
+  20: () => {
+    // 列は存在確認してから足す (v19 と同じ作法 — 部分適用済み DB や、テストで古い版を手作りした DB でも落ちない)
+    const hasTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pk_pack_tasks'").get();
+    if (hasTable) {
+      const cols = db.prepare('PRAGMA table_info(pk_pack_tasks)').all().map((c) => c.name);
+      if (!cols.includes('close_reason')) db.exec('ALTER TABLE pk_pack_tasks ADD COLUMN close_reason TEXT');
+      if (!cols.includes('fulfilled_qty')) db.exec('ALTER TABLE pk_pack_tasks ADD COLUMN fulfilled_qty INTEGER');
+      if (!cols.includes('unavailable_qty')) db.exec('ALTER TABLE pk_pack_tasks ADD COLUMN unavailable_qty INTEGER');
+    }
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_stockouts (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id       INTEGER NOT NULL REFERENCES pk_pack_batches(id),
+      slip_seq       INTEGER NOT NULL,
+      ne_slip_no     TEXT NOT NULL,
+      site_order_no  TEXT,
+      recipient_name TEXT,
+      folder_name    TEXT,
+      items_json     TEXT NOT NULL,        -- [{sku, name, qty, claimedBy, at}]
+      worker         TEXT NOT NULL,        -- 確認した梱包者
+      notified_at    TEXT,
+      notify_error   TEXT,
+      claimed_at     TEXT,                 -- 送信中の印 (router とポーラーが同じ行を同時に送らない。10分で失効)
+      created_at     TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_stockouts_pending ON pk_pack_stockouts(notified_at)');
   },
 };
 
