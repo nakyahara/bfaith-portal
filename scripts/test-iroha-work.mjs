@@ -3321,7 +3321,8 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
     // 片づけていいのは「名前が無い・Notion に紐づかない・入荷受付に紐づかない・終わっていない」だけ (Codex FB R3)
     {
       const named = Number(insStray.run('名前がある', utcNowT(), utcNowT()).lastInsertRowid);
-      ok(TD.removeStrayTask({ taskId: named }).error === 'not_stray', '名前があるカードは片づけられない');
+      db.prepare("UPDATE f_iroha_tasks SET product_code = 'NAMED-1' WHERE id = ?").run(named);
+      ok(TD.removeStrayTask({ taskId: named }).error === 'not_stray', '名前と商品コードがあるカードは片づけられない');
       ok(TD.getTask(named) !== null, '消えていない');
       const withPage = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
       db.prepare("UPDATE f_iroha_tasks SET notion_page_id = 'stray-has-page' WHERE id = ?").run(withPage);
@@ -3334,6 +3335,15 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
       ok(TD.listNamelessTasks().some(x => x.id === withPage), 'アプリが正本なら、名前の無い取込カードも一覧に出る');
       const rmPage = TD.removeStrayTask({ taskId: withPage, actor: 'admin@test' });
       ok(rmPage.ok && rmPage.action === 'deleted' && TD.getTask(withPage) === null, 'アプリが正本なら片づけられる (記録が無ければ消える)');
+      // ⭐名前があっても商品コードの無いカードは、アプリが正本なら片づけられる (作業のやり方も登録できず、在庫にも結べない — 中原さん 2026-09-05「木製スティック」)
+      const noCode = Number(insStray.run('木製スティック', utcNowT(), utcNowT()).lastInsertRowid);
+      setMetaValue('source_of_truth', 'notion');
+      ok(TD.removeStrayTask({ taskId: noCode }).error === 'not_stray' && !TD.listNamelessTasks().some(x => x.id === noCode), '正本が Notion の間は、名前があれば片づけられない (一覧にも出ない)');
+      setMetaValue('source_of_truth', 'app');
+      ok(TD.listNamelessTasks().some(x => x.id === noCode && x.product_name === '木製スティック'), 'アプリが正本なら、商品コードの無いカードも一覧に出る (名前つき)');
+      const rmCode = TD.removeStrayTask({ taskId: noCode, actor: 'admin@test' });
+      ok(rmCode.ok && rmCode.action === 'deleted' && TD.getTask(noCode) === null, 'アプリが正本なら片づけられる');
+      ok(!TD.listNamelessTasks().some(x => x.id === named), '名前と商品コードがあるカードは、アプリが正本でも一覧に出ない');
       setMetaValue('source_of_truth', srcBefore);
       const withDest = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
       db.prepare('UPDATE f_iroha_tasks SET destination_id = 9499 WHERE id = ?').run(withDest);
