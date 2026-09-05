@@ -12,7 +12,7 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { JOBS_REGISTRY } from '../../config/jobs-registry.mjs';
+import { JOBS_REGISTRY, RETIRED_JOBS } from '../../config/jobs-registry.mjs';
 import { recordPing, getStates, getMeta } from './store.js';
 import { evaluateAll } from './evaluate.js';
 
@@ -20,6 +20,8 @@ const router = Router();
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{1,63}$/;
 const REGISTERED = new Set(JOBS_REGISTRY.map((e) => e.id));
+// 退役した id (台帳から外したもの)。ping が来ても「台帳に無い id」としては扱わない (毎朝鳴らさない)
+const RETIRED = new Set(RETIRED_JOBS.map((e) => e.id));
 // 評価ループ (5分間隔) がこの時間止まっていたら health を 503 にする
 const EVAL_STALE_MS = 15 * 60 * 1000;
 
@@ -92,8 +94,8 @@ router.post('/ping/:id', requireToken, (req, res) => {
 router.get('/status', requireToken, (req, res) => {
   const states = getStates();
   const results = evaluateAll(JOBS_REGISTRY, states, Date.now());
-  const unknown = Object.keys(states).filter((id) => !REGISTERED.has(id));
-  res.json({ evaluatedAt: new Date().toISOString(), results, unknownIds: unknown });
+  const unknown = Object.keys(states).filter((id) => !REGISTERED.has(id) && !RETIRED.has(id));
+  res.json({ evaluatedAt: new Date().toISOString(), results, unknownIds: unknown, retiredIds: RETIRED_JOBS.map((e) => e.id) });
 });
 
 export default router;

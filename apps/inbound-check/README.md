@@ -321,30 +321,40 @@ miniPC auto-shohin-csv.js (Logizard-NyukaCSV の2ステップ目・1日1回)
 
 倉庫の iPad で管理者としてログイン → 管理画面「この端末を登録」 → トークンは httpOnly Cookie `ic_device` (path=/apps/inbound-check、400日) としてその端末だけに渡り、**同時に管理者セッションを破棄**する (共用端末に管理者ログインを残さない)。⚠ ホーム画面に追加した PWA から開いて登録する (Safari 本体と Cookie 保存領域が別)。
 
-## Notion 作業カード (いろはの在庫化作業管理)
+## いろはへの作業指示 = 在庫化アプリの「未着手」 (Notion は 2026-09-05 に廃止)
 
-「いろはで在庫化」と確定した明細 (`f_inbound_check_destinations`) を、Notion「在庫化作業管理」DB のカードにする
-(旧 GAS 在庫化カード生成の置き換え。設計 = Downloads『在庫化カード置き換え_Codex設計相談R1_20260902.md』)。
+「いろはで在庫化」と確定した明細 (`f_inbound_check_destinations`) は、**確認と同じトランザクションで
+在庫化アプリ (`apps/iroha-work`) の `f_iroha_tasks` に未着手として入る** (`iroha-work/task-intake.js createTaskForDestination`)。
+やり直し・再取込で行が消えた場合の取消も同じ経路 (`requestCancellation`)。iPad の在庫化アプリは即時にそれを見る。
 
-- **1日1回 17:30 JST に一括送信** (`sync-job.js startInboundCheckNotionCron` → `notion-sync.js runNotionSweep`)。
-  都度送信にしないのは、当日中のやり直し (確認→取消→再確認) を送信前に収束させるため (中原さん 2026-09-02)。
-  管理画面の「今すぐ Notion へ送る」で夕方を待たずに送れる
+- **Notion「在庫化作業管理」は 2026-09-05 に運用廃止** (中原さん)。17:30 の cron・30分巡回への相乗り・台帳
+  `inbound-check-notion-cards` は外した (`config/jobs-registry.mjs` の `RETIRED_JOBS` に退役記録)。
+  iPad の「🗂 Notionへ送る」は出ない。`POST /api/notion-sync` `/admin/notion-sync` は 410 `notion_retired`
+- 退路: 在庫化アプリの `/admin/source` で正本を `notion` に戻したときだけ、上のボタンと API が従来どおり動く
+  (自動送信は戻らない — 手動のみ)。`notion-sync.js` はそのために残してある
+- 正本の切替そのものと取込・紐付けの衝突は在庫化アプリ側 (`/apps/iroha-work/admin`)。
+  正本 = `f_iroha_app_meta.source_of_truth` (`iroha-work/db.js sourceOfTruth()`)
+
+### (廃止前の設計メモ — notion-sync.js を読むときの参考。**以下はすべて廃止済み・現在は動いていない**)
+
+- 1日1回 17:30 JST に一括送信していた (`runNotionSweep`)。都度送信にしなかったのは、当日中のやり直し
+  (確認→取消→再確認) を送信前に収束させるため (中原さん 2026-09-02)。**cron は削除済み**
 - **outbox + reconcile**: 送信状態は台帳の行に持つ (`notion_page_id` / `notion_synced_at` / …)。
   カードには**台帳キー** (行ごとの永続ランダムキー。作成前に DB へ保存) を必ず入れ、作成前に
   同キーで検索して回収する (「作成成功→記録前に停止」の二重カード防止。行IDは DB 作り直しで
   振り直されるため回収キーにしない)。送信後に取り消された行はカードをステータス**「取消」**に倒し、
   取消時のカードが未着手以外なら管理画面の要確認一覧に出す (取消済みの作業指示を有効に見せない)。
   「作成成功→記録前に停止→取消」で孤立したカードも台帳キー検索で回収して「取消」へ収束させる
-- **取消の反映と一時エラーの再試行だけは 30 分巡回に相乗り** (`mode='retry'`。既存 Drive cron の
-  1ステップ。新規カードの送信は 17:30 の一括のみ)。多重実行はプロセス内フラグ + SQLite lease で防ぐ
+- 取消の反映と一時エラーの再試行は 30 分巡回に相乗りしていた (`mode='retry'`。既存 Drive cron の
+  1ステップ。新規カードの送信は 17:30 の一括のみ)。**相乗りは削除済み** — 退路で手動送信したときの
+  多重実行防止 (プロセス内フラグ + SQLite lease) だけが生きている
 - 4xx (429/409 以外。スキーマ不整合等) は自動再試行しない — 管理画面に出て「再送」で解除。
   依存プロパティの**型**も送信前に検証し、合わなければ行に書き散らさず sweep 1回の失敗にする
-- env: `NOTION_TOKEN` (既存インテグレーション共用) / `INBOUND_CHECK_NOTION_DB_ID` /
-  `INBOUND_CHECK_NOTION_CRON` (既定 `30 17 * * *`) / `INBOUND_CHECK_NOTION_ENABLED`
-  (**false で 17:30 と 30分相乗り分の両方を停止**・非Renderは既定OFF。
-  なお `INBOUND_CHECK_SYNC_ENABLED=false` は30分巡回ごと止まるため相乗り分も一緒に止まる)。
-  Notion 側で対象 DB のコネクトにインテグレーションを追加しておくこと
-- 台帳 = `config/jobs-registry.mjs` `inbound-check-notion-cards` (dead-man ping)
+- env: 退路の手動送信に要るのは `NOTION_TOKEN` (既存インテグレーション共用) と `INBOUND_CHECK_NOTION_DB_ID` だけ。
+  `INBOUND_CHECK_NOTION_CRON` / `INBOUND_CHECK_NOTION_ENABLED` は**もう読まない** (残っていても無害。
+  設定しても cron は戻らない)
+- 台帳 `inbound-check-notion-cards` は**退役済み** (`config/jobs-registry.mjs` の `RETIRED_JOBS` に記録。
+  現役の台帳には無く、jobs-monitor も評価しない)
 - **いろは作業仕様マスタ (`f_iroha_work_master`)** = 旧スプレッドシート「作業内容管理マスター」の置き換え (work-master.js)。
   カードの 資材セットID・収納容器・入数・工程数・備考 はここから載る (未整備の商品は送らない — それが正常)。
   取込は管理画面から xlsx をアップロード: 既定 **dry-run** (検証レポート) → 内容を見てから本取込。

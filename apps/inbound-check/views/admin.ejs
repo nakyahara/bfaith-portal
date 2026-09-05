@@ -152,29 +152,45 @@
     </div>
 
     <div class="ic-box">
-      <h2>🗂 Notion 作業カード (いろはの在庫化作業管理)</h2>
+      <%# 正本 = 'app' (通常・Notion 廃止) / 'notion' (退路) / 'unknown' (状態を取れなかった — 断定しない) %>
+      <% const notionMode = (notion && !notion.error) ? (notion.source === 'notion' ? 'notion' : 'app') : 'unknown'; %>
+      <% const notionRetired = notionMode === 'app'; %>
+      <% if (notionMode === 'unknown') { %>
+      <h2>🏠 いろはへの作業指示</h2>
+      <p class="ng">⚠ 正本 (在庫化アプリ / Notion) の状態を取得できませんでした<%= notion && notion.error ? ': ' + notion.error : '' %>。
+        通常は在庫化アプリが正本で Notion は廃止 (2026-09-05) ですが、この画面からは断定できません。
+        <a href="/apps/iroha-work/admin" target="_blank" rel="noopener">在庫化アプリの管理画面</a>で正本を確認してください。</p>
+      <% } else if (notionRetired) { %>
+      <h2>🏠 いろはへの作業指示 (在庫化アプリ)</h2>
       <p class="hint">
-        「いろはで在庫化」と確定した明細は、<b>確定と同時に いろは在庫化アプリのタスク</b> になります (iPad の一覧に即時)。
-        正本が Notion の間は、それに加えて <b>1日1回 夕方 17:30</b> に Notion「在庫化作業管理」DB のカードも作ります
-        (当日中のやり直しを送信前に収束させるため、都度は送りません)。夕方を待たずに送りたいときはボタンで。
-        送信後に取り消された明細は、カードのステータスを<b>「取消」</b>に変えます。
+        「いろはで在庫化」と確定した明細は、<b>確定と同時に いろは在庫化アプリの「未着手」</b> に入ります (iPad の一覧に即時)。
+        取り消し (やり直し・再取込で消えた行) も同じ経路で反映されます。<br>
+        <b>Notion「在庫化作業管理」は 2026-09-05 に運用廃止</b>になりました。17:30 の送信も、送信ボタンもありません。
+        カードの状況は <a href="/apps/iroha-work/" target="_blank" rel="noopener">在庫化アプリ</a> /
+        取込や紐付けの整理は <a href="/apps/iroha-work/admin" target="_blank" rel="noopener">在庫化アプリの管理画面</a> で。
       </p>
-      <% if (notion && !notion.error && notion.source === 'app') { %>
-        <p class="ok">✅ 正本は <b>いろは在庫化アプリ</b> です (在庫化アプリの管理画面で切替済み)。Notion カードはもう作りません — 下の送信ボタンは何もしません。</p>
+      <% } else { %>
+      <h2>🗂 Notion 作業カード (いろはの在庫化作業管理) — 退路モード</h2>
+      <p class="hint">
+        ⚠ 在庫化アプリの正本が <b>Notion に戻されています</b> (/admin/source)。Notion は 2026-09-05 に運用廃止のため
+        <b>17:30 の自動送信はもうありません</b>。送るなら下のボタンで手動に。アプリへ戻したらこの節は消えます。
+      </p>
       <% } %>
       <% if (notion && !notion.error && notion.linkConflicts && notion.linkConflicts.length) { %>
         <p class="ng">⚠ 紐付けの衝突 <b><%= notion.linkConflictsTotal %></b> 件: 行き先台帳の Notion カードを、確定時のタスクとは別のタスク (取込で作られた方) が持っています。
           <a href="/apps/iroha-work/admin">在庫化アプリの管理画面</a>「Notion → アプリ正本化」の「紐付けの衝突」で統合してください —
           <% notion.linkConflicts.forEach((c) => { %><span>task#<%= c.task_id %> (<%= c.product_code %>) ↔ task#<%= c.other_task_id %></span> <% }) %><% if (notion.linkConflictsTotal > notion.linkConflicts.length) { %> …他 <%= notion.linkConflictsTotal - notion.linkConflicts.length %> 件<% } %></p>
       <% } %>
-      <% if (!notion || notion.error) { %>
-        <p class="ng">⚠ 状態を取得できません<%= notion && notion.error ? ': ' + notion.error : '' %></p>
+      <% if (notionMode === 'unknown') { %>
+        <%# 上で理由を出した。数字やボタンは出さない (正本が分からないまま送らせない) %>
+      <% } else if (notionRetired) { %>
+        <%# Notion 廃止: 送信待ち/再送/要確認 は Notion 時代の数字なので出さない %>
       <% } else if (!notion.configured) { %>
         <p class="ng">⚠ 未設定です。Render の env に <code>INBOUND_CHECK_NOTION_DB_ID</code> を追加し、
           Notion 側で「在庫化作業管理」DB のコネクトに既存インテグレーションを追加してください (NOTION_TOKEN は共用)。</p>
       <% } else { %>
         <p>送信待ち <b><%= notion.unsent %></b> 件 ・ 取消の反映待ち <b><%= notion.cancelPending %></b> 件
-          <% if (notion.waitingRetry) { %> ・ 一時エラーの再試行待ち <b><%= notion.waitingRetry %></b> 件 (30分おきに自動で再試行)<% } %> ・
+          <% if (notion.waitingRetry) { %> ・ 一時エラーの再試行待ち <b><%= notion.waitingRetry %></b> 件 (自動再試行はもうありません — 下の「今すぐ送る」か「再送」で手動)<% } %> ・
           直近24時間の送信 <b><%= notion.sentRecent %></b> 件<% if (notion.lastSyncedAt) { %> ・ 最終送信 <span data-jst="<%= notion.lastSyncedAt %>"></span><% } %>
           (DB …<%= notion.dbIdTail %>)</p>
         <div class="row">

@@ -13,7 +13,6 @@
  */
 import cron from 'node-cron';
 import { runScheduledFetch, runScheduledMasterFetch } from './drive-fetch.js';
-import { runNotionSweep, clearLeaseOnBoot } from './notion-sync.js';
 import { sweepPrintJobs, pendingAlerts, markAlerted, alertTextFor, listPrintAgents } from './print-queue.js';
 import { pingJobThrottled } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
@@ -54,14 +53,8 @@ export function startInboundCheckCron() {
     // ⭐入口を増やさないため専用の cron は作らない (CLAUDE.md の定期実行ルール)
     try { await runScheduledMasterFetch({ actor: 'cron' }); }
     catch (e) { console.warn(`[inbound-check] cron(商品マスタ): ${e.message}`); }
-    // Notion カードの「取消反映」と「一時エラーの再試行」だけ同じ巡回に相乗り (mode='retry')。
-    // 新規カードの送信は 17:30 の一括のみ (取消済みの作業指示を30分以内に消すため — Codex R1 #5 #6)。
-    // ⭐INBOUND_CHECK_NOTION_ENABLED=false は 17:30 だけでなくこの相乗り分も止める (R2 #4)。
-    //   逆に INBOUND_CHECK_SYNC_ENABLED=false はこの巡回ごと止まるので、相乗り分も一緒に止まる
-    if (!OFF.has(String(process.env.INBOUND_CHECK_NOTION_ENABLED ?? '').trim().toLowerCase())) {
-      try { await runNotionSweep({ actor: 'cron-retry', mode: 'retry' }); }
-      catch (e) { console.warn(`[inbound-check] cron(notion-retry): ${e.message}`); }
-    }
+    // (2026-09-05 廃止) ここに相乗りしていた Notion カードの取消反映・再試行 (runNotionSweep mode='retry') は無くなった。
+    // いろは行きの作業指示は「確認」と同じトランザクションで在庫化アプリ (f_iroha_tasks) に入り、取消も同じ経路で反映される
   }, { timezone: 'Asia/Tokyo' });
   console.log(`[inbound-check] cron 起動 (${use} JST)`);
   return task;
@@ -71,49 +64,12 @@ export function stopInboundCheckCron() {
   if (task) { task.stop(); task = null; }
 }
 
-// ─── Notion 作業カード (いろは行き) の一括送信 ───
-// 中原さん 2026-09-02: 都度ではなく「入庫が終わってから1日1回」。当日中のやり直し
-// (確認→取消→再確認) を送信前に収束させ、取消が Notion へ漏れるケースを最小化する。
-// それでも残る「送信後の取消」は runNotionSweep 自身が保険で反映する。
-// 台帳 = config/jobs-registry.mjs 'inbound-check-notion-cards'
-//
-// env:
-//   INBOUND_CHECK_NOTION_ENABLED … false/0/off/no で停止 (既定=有効)。非 Render では既定 OFF
-//   INBOUND_CHECK_NOTION_CRON    … cron 式を上書き (既定 '30 17 * * *' = 毎日 17:30 JST)
-//   NOTION_TOKEN / INBOUND_CHECK_NOTION_DB_ID … 送信先 (notion.js)
-const NOTION_DEFAULT_CRON = '30 17 * * *';
-
-let notionTask = null;
-
-export function startInboundCheckNotionCron() {
-  if (notionTask) return notionTask;
-  const raw = String(process.env.INBOUND_CHECK_NOTION_ENABLED ?? '').trim().toLowerCase();
-  if (OFF.has(raw)) {
-    console.log('[inbound-check] notion cron disabled (INBOUND_CHECK_NOTION_ENABLED)');
-    return null;
-  }
-  if (!isRender() && !FORCE_ON.has(raw)) {
-    console.log('[inbound-check] notion cron skipped (非Render環境。動かすなら INBOUND_CHECK_NOTION_ENABLED=true)');
-    return null;
-  }
-  // デプロイ再起動が sweep を直撃して残った lease を掃除 (単一インスタンス前提)
-  clearLeaseOnBoot();
-  const expr = (process.env.INBOUND_CHECK_NOTION_CRON || NOTION_DEFAULT_CRON).trim();
-  if (!cron.validate(expr)) {
-    console.error(`[inbound-check] notion cron 式が不正です: ${expr} (既定 ${NOTION_DEFAULT_CRON} を使います)`);
-  }
-  const use = cron.validate(expr) ? expr : NOTION_DEFAULT_CRON;
-  notionTask = cron.schedule(use, async () => {
-    try { await runNotionSweep({ actor: 'cron' }); }
-    catch (e) { console.warn(`[inbound-check] notion cron: ${e.message}`); }
-  }, { timezone: 'Asia/Tokyo' });
-  console.log(`[inbound-check] notion cron 起動 (${use} JST)`);
-  return notionTask;
-}
-
-export function stopInboundCheckNotionCron() {
-  if (notionTask) { notionTask.stop(); notionTask = null; }
-}
+// ─── (2026-09-05 廃止) Notion 作業カード (いろは行き) の 17:30 一括送信 ───
+// Notion「在庫化作業管理」は運用廃止になり、いろは行きの作業指示は「確認」と同じトランザクションで
+// 在庫化アプリ (f_iroha_tasks) の未着手に入る (task-intake.js)。17:30 の cron と台帳 'inbound-check-notion-cards' は
+// 外した。sweep 本体 (notion-sync.js) は、在庫化アプリの /admin/source で正本を Notion に戻した退路のときだけ
+// 管理画面・iPad の手動ボタンから動く (自動では動かない)。
+// env INBOUND_CHECK_NOTION_ENABLED / INBOUND_CHECK_NOTION_CRON はもう読まない (残っていても無害)
 
 // ─── 🏷 値札印刷キューの見張り (プロセス内 30 秒間隔) ───
 // packing の印刷キュー (miniPC のドライブポーラーに相乗り) と同じ役目を Render 内で担う:

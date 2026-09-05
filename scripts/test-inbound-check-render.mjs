@@ -103,10 +103,13 @@ const LINE = (over = {}) => ({
 
 // 🏷 値札印刷: 印刷できる倉庫PC (印刷エージェント)。無ければボタン自体を出さない
 let PRINT_AGENTS = [];
+// 🗂 いろはの作業指示の正本。'app' (通常。Notion は 2026-09-05 廃止) なら「Notionへ送る」は出さない
+let IROHA_SOURCE = 'app';
 
 const STATE = lines => ({
   ok: true,
   print_agents: PRINT_AGENTS,
+  iroha_source: IROHA_SOURCE,
   batch: { id: 7, csv_generated_at: '2026-09-02T00:28:00+09:00', imported_at: '2026-09-02T00:31:00.000Z', work_date: '2026-09-02', row_count: lines.length, slip_count: 1 },
   slips: [{ batch_id: 7, ar_no: 'AR1', planned_date: '2026-09-01', received_date: '2026-09-01', status: '受付済', line_count: lines.length, seq: 1, checked_count: lines.filter(l => l.check_status === 'checked').length, partial_count: lines.filter(l => l.check_status !== 'checked' && l.found_qty > 0).length }],
   lines,
@@ -311,6 +314,18 @@ console.log('\n[9] 🏷 値札 (BCシール) 発行 → 倉庫PCの QL-700 (2026
   r = await renderWith([{ ...SEAL, print_job: job('manual') }]);
   ok(/pjob s-manual/.test(r.html) && /手で刷ってください/.test(r.html), '印刷係が応答しない → 「手で刷ってください」');
   PRINT_AGENTS = [];
+}
+
+console.log('\n[10] 🗂 Notion は廃止 — 「Notionへ送る」は正本が Notion に戻されたときだけ出す (2026-09-05)');
+{
+  IROHA_SOURCE = 'app';
+  let r = await renderWith([LINE()]);
+  ok(r.q('#notionBtn').style.display === 'none', `正本がアプリ (通常) → ボタンを出さない (display=${JSON.stringify(r.q('#notionBtn').style.display)})`);
+  IROHA_SOURCE = 'notion';
+  r = await renderWith([LINE()]);
+  ok(r.q('#notionBtn').style.display === '', `正本が Notion (退路) → ボタンを出す (display=${JSON.stringify(r.q('#notionBtn').style.display)})`);
+  IROHA_SOURCE = 'app';
+  ok(/在庫化アプリの「未着手」に入ります/.test(HTML), '行き先ダイアログの「いろはへ」に、確認すると在庫化アプリの未着手に入ることを書いてある');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

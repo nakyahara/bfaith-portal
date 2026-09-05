@@ -22,9 +22,9 @@
  *   JOBS_DIGEST_TIME_JST     — サマリ時刻 'HH:MM' (既定 '08:50')
  */
 import cron from 'node-cron';
-import { JOBS_REGISTRY, validateRegistry } from '../../config/jobs-registry.mjs';
+import { JOBS_REGISTRY, RETIRED_JOBS, validateRegistry } from '../../config/jobs-registry.mjs';
 import {
-  getStates, ensureFirstSeen, getAlertState, setAlertState, clearAlertState, getMeta, setMeta,
+  getStates, ensureFirstSeen, getAlertState, setAlertState, clearAlertState, getMeta, setMeta, purgeJobStates,
 } from './store.js';
 import {
   evaluateAll, needsImmediateAlert, realertIntervalMs, buildDigest, todayJst,
@@ -32,6 +32,26 @@ import {
 import { sendGChatMessage } from '../profit-analysis/gchat-client.js';
 
 const REGISTERED = new Set(JOBS_REGISTRY.map((e) => e.id));
+// 退役した id は「台帳に無い id」として鳴らさない (記録は起動時に purgeRetiredJobStates で消す)
+const RETIRED = new Set(RETIRED_JOBS.map((e) => e.id));
+
+/**
+ * 退役したジョブ (RETIRED_JOBS) の記録を消す。起動時に呼ぶ。
+ * 残っていると毎朝の要対応サマリに「台帳に無い id から ping が来ています」として出続ける。
+ * 失敗しても監視本体は止めない (例外はログに残すだけ)。
+ * @returns {number} 消した job_state の行数 (-1 = 失敗)
+ */
+export function purgeRetiredJobStates() {
+  try {
+    const ids = RETIRED_JOBS.map((e) => e.id);
+    const purged = purgeJobStates(ids);
+    if (purged > 0) console.log(`[jobs-monitor] 退役ジョブの記録を消しました: ${purged} 件 (${ids.join(', ')})`);
+    return purged;
+  } catch (e) {
+    console.error('[jobs-monitor] 退役ジョブの記録の削除に失敗:', e.message);
+    return -1;
+  }
+}
 
 /** 送信できたかを返す。成功/失敗を meta に刻む (/health が通知経路の健全性を見るため) */
 async function notify(text, nowMs = Date.now()) {
@@ -106,7 +126,7 @@ export async function runEvaluation(nowMs = Date.now()) {
 
     // 毎朝のサマリ (時刻を過ぎた最初の評価で送る。送信成功時だけ日付を刻む = 失敗したら次の5分で再試行)
     if (digestDue(nowMs)) {
-      const unknown = Object.keys(states).filter((id) => !REGISTERED.has(id));
+      const unknown = Object.keys(states).filter((id) => !REGISTERED.has(id) && !RETIRED.has(id));
       const sent = await notify(buildDigest(results, unknown, nowMs), nowMs);
       if (sent) {
         setMeta('last_digest_date', todayJst(nowMs));
@@ -139,6 +159,7 @@ export function startJobsMonitor() {
     setMeta('registry_error', '');
   }
   if (!getMeta('monitoring_since')) setMeta('monitoring_since', Date.now());
+  purgeRetiredJobStates();
 
   cron.schedule('*/5 * * * *', () => {
     runEvaluation().catch((e) => console.error('[jobs-monitor] 評価失敗:', e.message));
