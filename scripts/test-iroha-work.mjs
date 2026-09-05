@@ -2096,6 +2096,31 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
             fields: { size_class: 'XL' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
           ok(badSize.status === 400 && badSize.json.error === 'bad_size', '知らない大きさは 400 (500 にしない)');
           ok(db.prepare("SELECT size_class FROM f_iroha_work_master WHERE code_key = 'size-a'").get().size_class === 'M', '断ったので値も変わらない');
+          // ── 期限シール (中原さん 2026-09-05: ありのときだけ赤で上に出す) ──
+          const sealOf = () => db.prepare("SELECT expiry_seal FROM f_iroha_work_master WHERE code_key = 'size-a'").get().expiry_seal;
+          const seal1 = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { expiry_seal: '1' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(seal1.status === 200 && sealOf() === 1, '「期限シールあり」を登録できる');
+          clearEnrichCache();
+          const withSeal = (await call('GET', '/api/task-previews/' + t6, { cookie })).json;
+          ok(withSeal.card.master.expiry_seal === 1, '一枚取りにも「あり」が乗る (画面はこれを見て赤で出す)');
+          const seal0 = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { expiry_seal: '0' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(seal0.status === 200 && sealOf() === 0, '「なし」も 0 として登録できる (未登録と区別する)');
+          const sealClear = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { expiry_seal: '' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(sealClear.status === 200 && sealOf() == null, '空を送ると「未登録」に戻せる (CHECK で 500 にならない)');
+          const badSeal = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { expiry_seal: 'yes' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(badSeal.status === 400 && badSeal.json.error === 'bad_seal', '知らない値は 400 (500 にしない)');
+          ok(sealOf() == null, '断ったので値も変わらない');
+          const sealStale = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { expiry_seal: '1' }, worker_id: staffP.id, pin: '4649', expect_version: mver() - 1 } });
+          ok(sealStale.status === 409, '古い版で送ったら断る (期限シールも他の項目と同じ楽観ロック)');
+          ok(sealOf() == null, '断ったので値も変わらない');
+          let sealErr = null;
+          try { db.prepare("UPDATE f_iroha_work_master SET expiry_seal = 2 WHERE code_key = 'size-a'").run(); } catch (e) { sealErr = e; }
+          ok(sealErr && /CHECK/.test(sealErr.message), '0/1 以外は DB にも入らない (CHECK)');
         }
         ok((await call('GET', '/api/history', { cookie })).status === 200, '履歴も開ける');
 
@@ -3101,7 +3126,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/どこが未定 ' \+ und \+ ' 件/.test(html), '拠点が未定の件数を警告に出す');
   ok(/data-plan-act=/.test(html) && /\$\('#planCand'\)\.addEventListener\('click'/.test(html),
     '計画画面のボタンも data-* + 委譲で受ける (onclick に値を埋めない)');
-  ok(/function pcardHtml\(c, actions\)/.test(html) && /大きさ 不明/.test(html),
+  ok(/function pcardHtml\(c, actions, grab\)/.test(html) && /大きさ 不明/.test(html),
     'カードに理由 (在庫・入荷・大きさ) を添える。大きさが分からなければそう出す');
   // ══ P4: 大きさのその場登録 ══
   ok(/<div class="mvf" data-f="size_class">/.test(html) && /const SIZE_OPTS = \[\['L', '大'\], \['M', '中'\], \['S', '小'\], \['', '未登録'\]\];/.test(html),
@@ -3117,19 +3142,52 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     'ボードには「明日の計画を立てる」の大きなボタンを出す (ゲージではなく)');
   ok(/明日の計画を見る/.test(html) && /見るだけ \(正本はまだ Notion\)/.test(html),
     '下見では「明日の計画を見る」(見るだけ) として開ける');
-  ok(/\$\('#planGauge'\)\.innerHTML = gaugeHtml\(\);/.test(html) && /<div id="planGauge"><\/div>/.test(html),
-    'ゲージ (合計時間と 4〜6 時間の目安) は計画画面に置く (ボードでは意味が薄い)');
+  ok(/\$\('#planGauge'\)\.innerHTML = gaugeHtml\(t, d\.target_hours\);/.test(html) && /<div id="planGauge"><\/div>/.test(html),
+    'ゲージ (合計時間と目安) は計画画面に置く (ボードでは意味が薄い)');
+  ok(/function gaugeHtml\(totals, target\)/.test(html) && /const p = totals \|\| \(\(boardState\(\) \|\| \{\}\)\.tomorrow_plan\)/.test(html)
+    && /const lo = \(target \|\| \{\}\)\.min \?\? 4;/.test(html),
+    'ゲージは見せる数字を受け取る (中で一覧を見ると、計画を変えた直後に画面の中で食い違う)');
   // ══ ドラッグ＆ドロップ (中原さん 2026-09-05) ══
   ok(/window\.addEventListener\('pointermove', dndMove/.test(html) && /window\.addEventListener\('pointerup', dndDrop\);/.test(html)
     && !/addEventListener\('dragstart'/.test(html),
     'ドラッグは pointer イベントで作る (HTML5 の dragstart は iPad の指で動かない)');
+  ok(/\.grip\{[^}]*touch-action:none/.test(html),
+    '掴み手には**はじめから** touch-action:none を付ける (後からクラスを付けても Safari は既にスクロールと決めている)');
+  ok(/function gripHtml\(\)/.test(html) && /function gripDown\(e, sel, kind\)/.test(html)
+    && /const g = e\.target\.closest\('\[data-grip\]'\);\r?\n\s+if \(!g\) return;/.test(html),
+    '掴めるのは掴み手の上だけ (カードの上を指でなぞれば今まで通りスクロールできる)');
+  ok(/const grab = isApp\(\) && !bulkIds && \(boardCols === 'fac' \? stateCan\('task\.facility\.assign'\) : stateCan\('task\.status\.change'\)\);/.test(html)
+    && /\(grab \? gripHtml\(\) : ''\)/.test(html),
+    '動かせないときは掴み手を描かない (無効にして見せない — 要件 §U-7)');
+  ok(/pcardHtml\(c, carryActs, !ro\)/.test(html) && /\], !ro\)\)\.join\(''\)/.test(html)
+    && /pcardHtml\(c, pileActs, !ro\)/.test(html),
+    '下見・許可なしの計画画面には掴み手を描かない');
+  ok(/\/\/ ⭐掴んでから落とすまでの間に正本や許可が変わることがある。\*\*落とす直前にもう一度見る\*\*/.test(html)
+    && /function dndAllowed\(drop\)[\s\S]{0,400}?if \(!isApp\(\)\) return false;/.test(html)
+    && /if \(planData && planData\.preview\) return false;/.test(html),
+    '落とす直前に正本 (isApp) と下見 (preview) と許可を見直す (掴んだ後に正本が戻ることがある)');
+  ok(/function dndGrab\(ev, card, kind\) \{\r?\n\s+if \(DND\.on\) return;/.test(html),
+    '二本目の指では掴まない (掴んだ覚えのないカードが動かないように)');
+  ok(/function dndMove\(ev\) \{\r?\n\s+if \(!DND\.on \|\| ev\.pointerId !== DND\.pointerId\) return;/.test(html)
+    && /async function dndDrop\(ev\) \{\r?\n\s+if \(!DND\.on \|\| ev\.pointerId !== DND\.pointerId\) return;/.test(html)
+    && /function dndCancel\(ev\) \{\r?\n\s+if \(ev && DND\.on && ev\.pointerId !== DND\.pointerId\) return;/.test(html),
+    '動かす・落とす・やめる は**掴んだ指のイベントだけ**見る (別の指で他のカードが飛ばない)');
+  ok(/dndEatClick = true;/.test(html) && /if \(!dndEatClick\) return;/.test(html)
+    && /ev\.stopPropagation\(\); ev\.preventDefault\(\);\r?\n\s*\}, true\);/.test(html),
+    '動かした後の click は 1 回捨てる (列を移したのに詳細まで開かないように)');
+  ok(/if \(e\.target\.closest\('\[data-grip\]'\)\) e\.stopPropagation\(\);/.test(html),
+    '掴み手のタップでは詳細を開かない');
+  ok(/window\.addEventListener\('lostpointercapture'/.test(html) && /window\.addEventListener\('blur', \(\) => dndCancel\(\)\);/.test(html),
+    '掴んだカードが消えても後始末する (ゴーストが残ると何も押せなくなる)');
+  ok(/function renderBoard\(\) \{\r?\n\s+if \(DND\.on\) dndCancel\(\);/.test(html)
+    && /function renderPlan\(\) \{\r?\n\s+if \(DND\.on\) dndCancel\(\);/.test(html),
+    '描き直すときは掴みを外す (掴んでいたカードが入れ替わらないように)');
+  ok(/if \(!stSaving && !reconnectTimer && !DND\.on\) loadState\(\);/.test(html),
+    'ドラッグの最中は自動の取り直しを待つ');
   ok(/const DRAG_START_PX = 8;/.test(html) && /if \(!moved\) return;\s*\/\/ 動いていない = ふつうのタップ/.test(html),
     '少し動かすまではタップとして扱う (札のタップの道を残す)');
-  ok(/if \(e\.target\.closest\('\[data-fac-of\],\[data-when-of\],input,button'\)\) return;/.test(html),
-    '札やボタンの上では掴まない (押したいのに動いてしまわない)');
-  ok(/if \(card && !bulkIds\) dndGrab\(e, card, 'board'\);/.test(html),
+  ok(/\$\('#board'\)\.addEventListener\('pointerdown', \(e\) => \{ if \(!bulkIds\) gripDown/.test(html),
     'まとめて選んでいる最中は掴まない');
-  ok(/if \(!isApp\(\)\) return;\s*\/\/ 下見は動かせない/.test(html), '下見では動かせない');
   ok(/function dndAllowed\(drop\)/.test(html) && /stateCan\('task\.plan\.assign'\)/.test(html)
     && /stateCan\('task\.facility\.assign'\)/.test(html) && /stateCan\('task\.status\.change'\)/.test(html),
     '落とせるかは許可リストで決める (許可が無ければ落とせない)');

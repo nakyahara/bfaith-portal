@@ -207,6 +207,13 @@
   .dropok{outline:3px dashed var(--accent);outline-offset:-4px;background:var(--accent-soft)}
   .dropng{outline:3px dashed var(--line);outline-offset:-4px}
   body.dnd{user-select:none;-webkit-user-select:none}
+  /* ⭐掴み手。**ここだけ** touch-action:none にする — カードの上を指でなぞれば今まで通りスクロールできる。
+     クラスを後から付けても Safari は既に始まったジェスチャーをスクロールと決めてしまう (pointercancel) ので、
+     はじめから付いている要素が要る (Codex R1 重大3) */
+  .grip{flex:none;touch-action:none;-webkit-user-select:none;user-select:none;cursor:grab;
+    align-self:stretch;display:flex;align-items:center;padding:0 10px;margin:-2px 0 -2px -4px;
+    color:var(--sub);font-size:1.15rem;line-height:1;opacity:.7}
+  .grip:active{cursor:grabbing;opacity:1;color:var(--accent)}
 
   /* ── 「明日の計画を立てる」— ボードから入る大きなボタン (中原さん 2026-09-05) ── */
   .planbtn{display:flex;align-items:center;gap:12px;width:100%;background:var(--accent);border:1px solid var(--accent);
@@ -279,6 +286,7 @@
   .nums .n .v{font-family:var(--num);font-weight:700;font-size:1.25rem;line-height:1.1;color:var(--ink)}
   .nums .n.big .v{font-size:1.9rem}
   .nums .n .u{font-size:.8rem;color:var(--sub);font-weight:600;margin-left:2px}
+  .nums .n.unk .v{color:var(--faint)}   /* 分からないものは薄い「—」で出す (消さない) */
   /* 参考・外部出し目安・取引先 — 読むだけの一行 */
   .facts{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
   .facts span{font-size:.8rem;background:var(--well);border:1px solid var(--line);border-radius:999px;padding:3px 10px;color:var(--sub)}
@@ -1168,7 +1176,7 @@ async function loadPreviewOnce() {
 const WHEN_LABEL = { today: '今日やる', tomorrow: '明日やる', over: 'やり残し', later: '先の予定' };
 const WHEN_CLASS = { today: 'todayp', tomorrow: 'tomorrow', over: 'over', later: '' };
 
-/** 明日やる分の合計 (上のゲージ)。職員はタップで「明日の計画」へ。利用者は見るだけ */
+/** ボードから「明日の計画」に入るところ。決められるのは職員だけ。下見・利用者は見るだけ */
 /**
  * ⭐ボードから「明日の計画」に入るボタン (中原さん 2026-09-05: 分かりやすいボタンにしてほしい)。
  * ゲージ (合計時間と目安) はボードでは意味が薄いので**計画画面のほうに置く**
@@ -1189,16 +1197,21 @@ function planButtonHtml() {
     '<span>明日の計画を立てる</span><span class="sub">' + esc(sub) + '</span><span class="chev">›</span></button>';
 }
 
-function gaugeHtml() {
-  // 下見 (正本が Notion) のときも出す。中身は下見のデータから (見るだけ)
-  const p = ((boardState() || {}).tomorrow_plan) || { hours: 0, count: 0, unknown_hours_count: 0 };
+/**
+ * 明日やる分の合計。⭐**見せる数字を受け取る** — 計画画面では計画の応答 (d.totals) を、
+ * それ以外は一覧の数字を使う。中で boardState() を見ると、計画を変えた直後に画面の中で食い違う (Codex R1 中6)
+ */
+function gaugeHtml(totals, target) {
+  const p = totals || ((boardState() || {}).tomorrow_plan) || { hours: 0, count: 0, unknown_hours_count: 0 };
+  const lo = (target || {}).min ?? 4;
+  const hi = (target || {}).max ?? 6;
   const h = Math.floor(p.hours);
   const m = Math.round((p.hours - h) * 60);
-  const pct = Math.min(100, (p.hours / 8) * 100);
-  const over = p.hours > 6;
-  const st = p.hours < 4 ? ['under', p.count + ' 件 · あと ' + fmtHours(4 - p.hours) + ' で目安']
-    : p.hours <= 6 ? ['ok', p.count + ' 件 · 目安内 (4〜6 時間)']
-    : ['over', p.count + ' 件 · 目安を ' + fmtHours(p.hours - 6) + ' 超えています'];
+  const pct = Math.min(100, (p.hours / (hi + 2)) * 100);
+  const over = p.hours > hi;
+  const st = p.hours < lo ? ['under', p.count + ' 件 · あと ' + fmtHours(lo - p.hours) + ' で目安']
+    : p.hours <= hi ? ['ok', p.count + ' 件 · 目安内 (' + lo + '〜' + hi + ' 時間)']
+    : ['over', p.count + ' 件 · 目安を ' + fmtHours(p.hours - hi) + ' 超えています'];
   const unknown = p.unknown_hours_count > 0 ? ' <span class="st under">時間不明 ' + esc(String(p.unknown_hours_count)) + ' 件</span>' : '';
   const inner = '<span class="lbl">明日やる分</span>' +
     '<span class="big">' + esc(String(h)) + '<small>時間</small>' + esc(String(m).padStart(2, '0')) + '<small>分</small></span>' +
@@ -1257,20 +1270,25 @@ $('#whenChips').addEventListener('click', (e) => {
   const b = e.target.closest('[data-when]');
   if (b) { curWhen = b.dataset.when; renderBoard(); }
 });
-$('#board').addEventListener('pointerdown', (e) => {
-  if (!isApp()) return;                                    // 下見は動かせない
-  if (e.target.closest('[data-fac-of],[data-when-of],input,button')) return;   // 札やボタンの上では掴まない
-  const card = e.target.closest('.bcard[data-id]');
-  if (card && !bulkIds) dndGrab(e, card, 'board');         // まとめて選ぶ最中は掴まない
-});
-$('#planCand').addEventListener('pointerdown', (e) => {
-  const card = e.target.closest('.pcard[data-id]');
-  if (card && !e.target.closest('button')) dndGrab(e, card, 'plan');
-});
-$('#planPile').addEventListener('pointerdown', (e) => {
-  const card = e.target.closest('.pcard[data-id]');
-  if (card && !e.target.closest('button')) dndGrab(e, card, 'plan');
-});
+/**
+ * ⭐掴むのは**掴み手 (⠿) の上だけ**。カードの上を指でなぞったときは今まで通り縦にスクロールする。
+ * カード全体を掴めるようにすると、Safari がスクロールと判断した時点で pointercancel になり、
+ * ドラッグがそもそも成立しない (Codex R1 重大3)
+ */
+function gripDown(e, sel, kind) {
+  const g = e.target.closest('[data-grip]');
+  if (!g) return;
+  const card = g.closest(sel + '[data-id]');
+  if (!card) return;
+  e.preventDefault();          // 掴み手の上では選択もスクロールもさせない
+  dndGrab(e, card, kind);
+}
+$('#board').addEventListener('pointerdown', (e) => { if (!bulkIds) gripDown(e, '.bcard', 'board'); });
+$('#planCand').addEventListener('pointerdown', (e) => gripDown(e, '.pcard', 'plan'));
+$('#planPile').addEventListener('pointerdown', (e) => gripDown(e, '.pcard', 'plan'));
+$('#planCarry').addEventListener('pointerdown', (e) => gripDown(e, '.pcard', 'plan'));
+// 掴み手のタップで詳細を開かない (掴むためのところなので)
+document.addEventListener('click', (e) => { if (e.target.closest('[data-grip]')) e.stopPropagation(); }, true);
 $('#board').addEventListener('click', (e) => {
   // ⭐札は「カードを開く」より先に受ける (札をタップしたのに詳細が開かないように)
   const facBtn = e.target.closest('[data-fac-of]');
@@ -1303,6 +1321,7 @@ function boardCards() {
   });
 }
 function renderBoard() {
+  if (DND.on) dndCancel();   // 描き直すと掴んでいたカードが消える。ゴーストを残さない (Codex R1 中5)
   const bs = boardState();
   if (!bs) { $('#board').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
   renderPreviewNote();
@@ -1330,8 +1349,12 @@ function renderBoard() {
   }).join('');
   $('#board').innerHTML = cols;
 }
+/** 掴み手。⭐動かせるときだけ描く (動かせないのに掴めるように見せない — 要件 §U-7) */
+function gripHtml() { return '<span class="grip" data-grip aria-hidden="true">⠿</span>'; }
 function bcardHtml(c, status) {
   const selectable = bulkIds && status === 'ready_for_stocking';
+  // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
+  const grab = isApp() && !bulkIds && (boardCols === 'fac' ? stateCan('task.facility.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
   const meta = [c.qty != null ? c.qty + ' 個' : null, c.boxes || null,
     c.plan_hours != null ? '⏱ ' + c.plan_hours + 'h' : null,
@@ -1339,6 +1362,7 @@ function bcardHtml(c, status) {
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
   return '<div class="bcard' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+    (grab ? gripHtml() : '') +
     '<div class="th">' + thumbHtml(c) + '</div>' +
     '<div class="bd">' +
     '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
@@ -1570,8 +1594,9 @@ async function askStaffUnlock() {
  *   - 明日の計画: 候補 ↔ 明日やる分
  *   - ボード: 列から列へ (進捗を変える / 拠点の列なら拠点を変える)
  */
-const DND = { on: false, id: null, ghost: null, from: null, over: null, sx: 0, sy: 0, moved: false, kind: null };
+const DND = { on: false, id: null, ghost: null, from: null, over: null, sx: 0, sy: 0, moved: false, kind: null, pointerId: null };
 const DRAG_START_PX = 8;      // これ以上動いたらドラッグ (タップと区別する)
+let dndEatClick = false;      // ドラッグが成立した後の click を 1 回だけ捨てる (中5)
 
 function dndFindDrop(x, y) {
   const el = document.elementFromPoint(x, y);
@@ -1580,23 +1605,32 @@ function dndFindDrop(x, y) {
 function dndClearOver() {
   if (DND.over) { DND.over.classList.remove('dropok', 'dropng'); DND.over = null; }
 }
-function dndCancel() {
+function dndCancel(ev) {
+  if (ev && DND.on && ev.pointerId !== DND.pointerId) return;   // 別の指のイベントでは終わらせない
   if (DND.ghost) { DND.ghost.remove(); DND.ghost = null; }
-  if (DND.from) DND.from.classList.remove('dragging');
+  if (DND.from) {
+    DND.from.classList.remove('dragging');
+    try { if (DND.pointerId != null && DND.from.hasPointerCapture && DND.from.hasPointerCapture(DND.pointerId)) DND.from.releasePointerCapture(DND.pointerId); } catch (e) {}
+  }
   dndClearOver();
   document.body.classList.remove('dnd');
-  DND.on = false; DND.id = null; DND.from = null; DND.moved = false; DND.kind = null;
+  DND.on = false; DND.id = null; DND.from = null; DND.moved = false; DND.kind = null; DND.pointerId = null;
 }
-/** 掴む。card = 掴んだ要素 (data-id を持つ)、kind = 'plan' | 'board' */
+/**
+ * 掴む。card = 動かす要素 (data-id を持つ)、kind = 'plan' | 'board'。
+ * ⭐**二本目の指は受けない** — 受けると、掴んだ覚えのないカードが動いてしまう (Codex R1 重大2)
+ */
 function dndGrab(ev, card, kind) {
+  if (DND.on) return;                                    // すでに掴んでいる (二本目の指)
   if (ev.button != null && ev.button !== 0) return;      // 右クリックは無視
+  if (!isApp()) return;                                  // 下見は動かせない
   DND.on = true; DND.id = card.dataset.id; DND.from = card; DND.kind = kind;
   DND.sx = ev.clientX; DND.sy = ev.clientY; DND.moved = false;
-  card.setPointerCapture && card.setPointerCapture(ev.pointerId);
   DND.pointerId = ev.pointerId;
+  try { card.setPointerCapture && card.setPointerCapture(ev.pointerId); } catch (e) {}
 }
 function dndMove(ev) {
-  if (!DND.on) return;
+  if (!DND.on || ev.pointerId !== DND.pointerId) return;   // 掴んだ指のイベントだけ見る
   const dx = ev.clientX - DND.sx;
   const dy = ev.clientY - DND.sy;
   if (!DND.moved) {
@@ -1636,7 +1670,10 @@ function dndMove(ev) {
 /** そこに落としてよいか (許可が無い・下見・同じ場所なら不可) */
 function dndAllowed(drop) {
   const to = drop.dataset.drop;
+  // ⭐掴んでから落とすまでの間に正本や許可が変わることがある。**落とす直前にもう一度見る** (Codex R1 重大1)
+  if (!isApp()) return false;
   if (DND.kind === 'plan') {
+    if (planData && planData.preview) return false;       // 下見の応答は読むだけ
     if (!stateCan('task.plan.assign')) return false;
     const c = planCard(DND.id);
     if (!c) return false;
@@ -1651,7 +1688,7 @@ function dndAllowed(drop) {
   return false;
 }
 async function dndDrop(ev) {
-  if (!DND.on) return;
+  if (!DND.on || ev.pointerId !== DND.pointerId) return;   // 掴んだ指のイベントだけ見る
   const moved = DND.moved;
   const id = DND.id;
   const kind = DND.kind;
@@ -1663,6 +1700,9 @@ async function dndDrop(ev) {
   const okDrop = drop && dndAllowed(drop) ? drop : null;
   dndCancel();
   if (!moved) return;            // 動いていない = ふつうのタップ (click が処理する)
+  // 動かした後の click は捨てる。でないと「列を移した」と同時に詳細が開いてしまう (Codex R1 中4)
+  dndEatClick = true;
+  setTimeout(() => { dndEatClick = false; }, 400);
   if (!okDrop) return;
   if (kind === 'plan') {
     const to = okDrop.dataset.drop;
@@ -1675,8 +1715,18 @@ async function dndDrop(ev) {
 window.addEventListener('pointermove', dndMove, { passive: false });
 window.addEventListener('pointerup', dndDrop);
 window.addEventListener('pointercancel', dndCancel);
+// 掴んだカードが消えた (再描画・画面切替) ときも必ず後始末する。ゴーストが残ると操作できなくなる (Codex R1 中5)
+window.addEventListener('lostpointercapture', (ev) => { if (DND.on && ev.pointerId === DND.pointerId) dndCancel(); });
+window.addEventListener('blur', () => dndCancel());
+document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible') dndCancel(); });
+// 動かした直後の click を 1 回だけ捨てる (捕まえる段階で止める)
+window.addEventListener('click', (ev) => {
+  if (!dndEatClick) return;
+  dndEatClick = false;
+  ev.stopPropagation(); ev.preventDefault();
+}, true);
 
-// ─── ⭐明日の計画 (職員だけ。ボードのゲージから開く。要件 §W-4) ───
+// ─── ⭐明日の計画 (決められるのは職員だけ。ボードの「明日の計画を立てる」から開く。要件 §W-4) ───
 let planData = null;
 let planInflight = null;
 let planGen = 0;        // 取得の世代。遅れて返った古い応答で新しい中身を上書きしない
@@ -1726,15 +1776,17 @@ function clearPlanDom() {
   const n2 = $('#planPileN'); if (n2) n2.textContent = '0';
 }
 function renderPlan() {
+  if (DND.on) dndCancel();   // 同上 (Codex R1 中5)
   const d = planData;
   if (!d) { $('#planCand').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
   $('#planTitle').textContent = '明日の計画 — ' + fmtYmd(d.tomorrow_ymd) + (d.preview ? ' (下見)' : '');
-  // ⭐ゲージ (合計時間と 4〜6 時間の目安) はこの画面に置く。ボードでは意味が薄い (中原さん 2026-09-05)
-  $('#planGauge').innerHTML = gaugeHtml();
   $('#planStaff').textContent = staffLeftText();
   const t = d.totals || { hours: 0, count: 0, unknown_hours_count: 0 };
   const lo = (d.target_hours || {}).min ?? 4;
   const hi = (d.target_hours || {}).max ?? 6;
+  // ⭐ゲージ (合計時間と目安) はこの画面に置く。ボードでは意味が薄い (中原さん 2026-09-05)。
+  //   数字は**この画面の応答から**渡す (一覧の古い数字と食い違わないように)
+  $('#planGauge').innerHTML = gaugeHtml(t, d.target_hours);
   // ⭐下見 (正本が Notion) では読むだけ。操作のボタンは描かない。
   //   応答の preview だけで決めず、**いまの正本と許可でも**見る —
   //   取ってから描くまでに正本が戻ることがある (Codex 下見 R1)
@@ -1753,12 +1805,12 @@ function renderPlan() {
   ];
   $('#planCarry').innerHTML = carry.length === 0 ? '' :
     '<div class="carry"><h3>やり残し ' + carry.length + ' 件' + (ro ? '' : ' — どうしますか (自動では動かしません)') + '</h3>' +
-    carry.map((c) => pcardHtml(c, carryActs)).join('') + '</div>';
+    carry.map((c) => pcardHtml(c, carryActs, !ro)).join('') + '</div>';
   // 候補 (優先順)
   const cand = d.candidates || [];
   $('#planCandN').textContent = cand.length;
   $('#planCand').innerHTML = cand.length === 0 ? '<div class="colempty">候補はありません</div>'
-    : cand.map((c) => pcardHtml(c, ro ? [] : [['＋ 明日やる', 'primary', 'tomorrow']])).join('');
+    : cand.map((c) => pcardHtml(c, ro ? [] : [['＋ 明日やる', 'primary', 'tomorrow']], !ro)).join('');
   // 明日やる分
   const pile = d.tomorrow || [];
   $('#planPileN').textContent = pile.length;
@@ -1771,11 +1823,11 @@ function renderPlan() {
     : stateCan('task.facility.assign') ? [['どこが', '', 'fac'], ['－ 外す', '', 'none']] : [['－ 外す', '', 'none']];
   $('#planPile').innerHTML = pile.length === 0
     ? '<div class="colempty">' + (ro ? '「明日やる」に入っているカードはありません' : '左の候補を「＋ 明日やる」で足してください') + '</div>'
-    : pile.map((c) => pcardHtml(c, pileActs)).join('');
+    : pile.map((c) => pcardHtml(c, pileActs, !ro)).join('');
 }
 
 /** 計画画面のカード。理由 (なぜ上に出るか) を必ず添える */
-function pcardHtml(c, actions) {
+function pcardHtml(c, actions, grab) {
   const why = [];
   if (c.priority) why.push('<span class="' + (c.priority.kind === 'urgent' ? 'urgent' : '') + '">' + esc(c.priority.label) + '</span>');
   if (c.arrival) why.push('<span>入荷 ' + esc(c.arrival) + '</span>');
@@ -1785,7 +1837,8 @@ function pcardHtml(c, actions) {
     c.facility_code ? facilityName(c.facility_code) : 'どこが 未定'].filter(Boolean).join(' ・ ');
   const acts = actions.map(([label, cls, act]) =>
     '<button class="pbtn ' + cls + '" data-plan-act="' + act + '" data-plan-id="' + esc(c.id) + '">' + esc(label) + '</button>').join('');
-  return '<div class="pcard" data-id="' + esc(c.id) + '"><div class="th">' + thumbHtml(c) + '</div><div class="bd">' +
+  return '<div class="pcard" data-id="' + esc(c.id) + '">' + (grab ? gripHtml() : '') +
+    '<div class="th">' + thumbHtml(c) + '</div><div class="bd">' +
     '<h4>' + esc(c.title) + '</h4><div class="m num">' + esc(meta) + '</div>' +
     '<div class="why">' + why.join('') + '</div></div><div class="act">' + acts + '</div></div>';
 }
@@ -2272,14 +2325,20 @@ $('#dbody').addEventListener('click', (e) => {
  * ⭐上部の数字 (中原さん 2026-09-05: つくる数の横に必要保管箱と想定作業時間)。
  * 作業をはじめる前にいちばん見るものを、いちばん上にまとめる
  */
+/**
+ * つくる数・必要保管箱・想定作業時間 (中原さん 2026-09-05: 作る数の横に出してほしい)。
+ * ⭐**分からないものは「—」と出す** — 項目ごと消すと「無い」のか「登録していない」のか分からない (要件 §U)
+ */
 function headNumsHtml(c) {
-  const n = (label, v, unit, cls) => v == null || v === '' ? '' :
-    '<div class="n' + (cls ? ' ' + cls : '') + '"><label>' + esc(label) + '</label>' +
-    '<div class="v">' + esc(v) + (unit ? '<span class="u">' + esc(unit) + '</span>' : '') + '</div></div>';
+  const n = (label, v, unit, cls) => {
+    const known = v != null && v !== '';
+    return '<div class="n' + (cls ? ' ' + cls : '') + (known ? '' : ' unk') + '"><label>' + esc(label) + '</label>' +
+      '<div class="v">' + (known ? esc(v) + (unit ? '<span class="u">' + esc(unit) + '</span>' : '') : '—') + '</div></div>';
+  };
   return '<div class="nums">' +
-    n('つくる数', c.qty != null ? c.qty : '—', '個', 'big') +
+    n('つくる数', c.qty, '個', 'big') +
     n('必要保管箱', c.boxes, '') +
-    n('想定作業時間', c.plan_hours != null ? c.plan_hours : null, '時間') +
+    n('想定作業時間', c.plan_hours, '時間') +
     '</div>';
 }
 /** 参考・外部出し目安・取引先 — 読むだけなので札で並べる */
@@ -3273,7 +3332,7 @@ async function doSetSt(choice) {
 // ─── 起動・巡回 ───
 restoreSnapshot();   // まず前回の一覧を出す (サーバーが再起動中でも画面は出る)。その後すぐ最新を取りにいく
 loadState();
-setInterval(() => { if (!stSaving && !reconnectTimer) loadState(); }, 60_000);   // 再接続の予約中は任せる (loadState は同時1本)
+setInterval(() => { if (!stSaving && !reconnectTimer && !DND.on) loadState(); }, 60_000);   // 再接続の予約中・ドラッグ中は待つ (loadState は同時1本)
 // iPad はバックグラウンドでタイマーが止まる → 前面に戻った・回線が戻った時は即つなぎ直す (Codex #7)
 const wake = () => { if (document.visibilityState === 'visible' && !stSaving) loadState(); };
 document.addEventListener('visibilitychange', wake);
