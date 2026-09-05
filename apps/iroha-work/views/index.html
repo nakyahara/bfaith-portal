@@ -876,7 +876,7 @@ async function loadStateOnce() {
   renderStaffBtn();
   // ⭐許可が変わったら計画の中身も作り直す。失ったら**描いたものを消す** —
   //   隠すだけだと、hidden の画面に押せるボタンが残る (Codex P3 R1 / R2)
-  if (!stateCan('task.plan.assign')) {
+  if (isApp() && !stateCan('task.plan.assign')) {
     planData = null;
     clearPlanDom();
     if (curView === 'plan') setView('board');
@@ -1053,7 +1053,7 @@ $('#list').addEventListener('click', (e) => {
 const PAGES = { list: '.listpage', board: '.boardpage', plan: '.planpage', label: '.labelpage', history: '.historypage' };
 const VIEW_BTN = { list: '#vList', board: '#vBoard', label: '#vLabel', history: '#vHistory' };
 function setView(v) {
-  if (v === 'plan' && !stateCan('task.plan.assign')) v = 'board';   // 計画は職員だけ (要件 §W-1)
+  if (v === 'plan' && isApp() && !stateCan('task.plan.assign')) v = 'board';   // 計画は職員だけ (下見は誰でも読むだけ)
   if (v !== 'board' && v !== 'list') exitBulk();
   curView = v;
   for (const [k, sel] of Object.entries(PAGES)) $(sel).hidden = k !== v;
@@ -1131,9 +1131,12 @@ function gaugeHtml() {
     '<span class="big">' + esc(String(h)) + '<small>時間</small>' + esc(String(m).padStart(2, '0')) + '<small>分</small></span>' +
     '<span class="bar"><span class="band"></span><span class="fill' + (over ? ' over' : '') + '" style="width:' + pct + '%"></span></span>' +
     '<span class="st ' + st[0] + '">' + esc(st[1]) + '</span>' + unknown;
-  // ⭐計画は職員だけ。許可が無ければボタンにせず、入口 (›) も描かない (要件 §W-4)。
-  //   下見のあいだは正本が Notion なので、誰であっても見るだけ
-  if (!isApp()) return '<div class="gauge">' + inner + '<span class="staff">見るだけ (正本はまだ Notion)</span></div>';
+  // ⭐下見 (正本が Notion) でも「明日の計画」は開ける — 読むだけ。切替の前に形を見せるため
+  if (!isApp()) {
+    return '<button class="gauge" onclick="openPlanPage()">' + inner +
+      '<span class="go">明日の計画 ›</span><span class="staff">見るだけ (正本はまだ Notion)</span></button>';
+  }
+  // 計画を決められるのは職員だけ。許可が無ければボタンにせず、入口 (›) も描かない (要件 §W-4)
   if (!stateCan('task.plan.assign')) {
     return '<div class="gauge">' + inner + '<span class="staff">明日の計画を決められるのは職員です</span></div>';
   }
@@ -1270,13 +1273,13 @@ function bcardHtml(c, status) {
  * 職員はタップして変えられる。利用者は**同じ札を span で描く** — ボタンを描いて無効にしない (§U-7)
  */
 function planTagsHtml(c) {
-  if (!isApp()) return '';                       // 下見 (Notion 正本) は計画そのものが無い
   const facTxt = c.facility_code ? facilityName(c.facility_code) : '未定';
   const whenTxt = c.when ? WHEN_LABEL[c.when] : '未定';
   const whenCls = c.when ? (WHEN_CLASS[c.when] || '') : 'none';
   const facCls = c.facility_code ? '' : 'none';
-  const canFac = stateCan('task.facility.assign');
-  const canWhen = stateCan('task.plan.assign');
+  // 下見 (正本が Notion) では見るだけ = 札は span。切替の前でも「どう見えるか」は分かる
+  const canFac = isApp() && stateCan('task.facility.assign');
+  const canWhen = isApp() && stateCan('task.plan.assign');
   const fac = canFac
     ? '<button class="tag ' + facCls + '" data-fac-of="' + esc(c.id) + '"><span class="k">どこが</span>' + esc(facTxt) + '</button>'
     : '<span class="tag ' + facCls + '"><span class="k">どこが</span>' + esc(facTxt) + '</span>';
@@ -1484,7 +1487,8 @@ let planInflight = null;
 let planGen = 0;        // 取得の世代。遅れて返った古い応答で新しい中身を上書きしない
 
 function openPlanPage() {
-  if (!stateCan('task.plan.assign')) return;   // 許可が無ければ開かない (入口も描いていない)
+  // 下見は誰でも読むだけで開ける。アプリ正本のときは職員だけ (書き変えられる画面なので)
+  if (isApp() && !stateCan('task.plan.assign')) return;
   setView('plan');
 }
 /**
@@ -1529,27 +1533,33 @@ function clearPlanDom() {
 function renderPlan() {
   const d = planData;
   if (!d) { $('#planCand').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
-  $('#planTitle').textContent = '明日の計画 — ' + fmtYmd(d.tomorrow_ymd);
+  $('#planTitle').textContent = '明日の計画 — ' + fmtYmd(d.tomorrow_ymd) + (d.preview ? ' (下見)' : '');
   $('#planStaff').textContent = staffLeftText();
   const t = d.totals || { hours: 0, count: 0, unknown_hours_count: 0 };
   const lo = (d.target_hours || {}).min ?? 4;
   const hi = (d.target_hours || {}).max ?? 6;
-  $('#planHint').textContent = '1 日にできるのは ' + lo + '〜' + hi + ' 時間ぶんです。左の候補を「＋ 明日やる」で右に足してください。'
-    + '選ぶたびに保存されます (確定ボタンはありません)。目安を超えても入れられます。';
+  // ⭐下見 (正本が Notion) では読むだけ。操作のボタンは描かない
+  const ro = !!d.preview;
+  $('#planHint').textContent = ro
+    ? '👀 見るだけの下見です (正本はまだ Notion)。1 日にできるのは ' + lo + '〜' + hi + ' 時間ぶんで、'
+      + 'この順に候補が並びます。「アプリを正本にする」と、ここで明日の分を決められるようになります。'
+    : '1 日にできるのは ' + lo + '〜' + hi + ' 時間ぶんです。左の候補を「＋ 明日やる」で右に足してください。'
+      + '選ぶたびに保存されます (確定ボタンはありません)。目安を超えても入れられます。';
   // やり残し (自動では動かさない。職員が決める)
   const carry = d.carry_over || [];
+  const carryActs = ro ? [] : [
+    ['明日やる', 'primary', 'tomorrow'],
+    ['今日やる', '', 'today'],
+    ['未定に戻す', 'warn', 'none'],
+  ];
   $('#planCarry').innerHTML = carry.length === 0 ? '' :
-    '<div class="carry"><h3>やり残し ' + carry.length + ' 件 — どうしますか (自動では動かしません)</h3>' +
-    carry.map((c) => pcardHtml(c, [
-      ['明日やる', 'primary', 'tomorrow'],
-      ['今日やる', '', 'today'],
-      ['未定に戻す', 'warn', 'none'],
-    ])).join('') + '</div>';
+    '<div class="carry"><h3>やり残し ' + carry.length + ' 件' + (ro ? '' : ' — どうしますか (自動では動かしません)') + '</h3>' +
+    carry.map((c) => pcardHtml(c, carryActs)).join('') + '</div>';
   // 候補 (優先順)
   const cand = d.candidates || [];
   $('#planCandN').textContent = cand.length;
   $('#planCand').innerHTML = cand.length === 0 ? '<div class="colempty">候補はありません</div>'
-    : cand.map((c) => pcardHtml(c, [['＋ 明日やる', 'primary', 'tomorrow']])).join('');
+    : cand.map((c) => pcardHtml(c, ro ? [] : [['＋ 明日やる', 'primary', 'tomorrow']])).join('');
   // 明日やる分
   const pile = d.tomorrow || [];
   $('#planPileN').textContent = pile.length;
@@ -1557,9 +1567,11 @@ function renderPlan() {
   const byFac = (d.by_facility || []).map((f) => '<span>' + esc(f.name) + ' ' + f.count + ' 件 · ' + esc(fmtHours(f.hours)) + '</span>').join('');
   const und = d.unassigned_count || 0;
   $('#planByFac').innerHTML = byFac + (und ? '<span class="warn">どこが未定 ' + und + ' 件</span>' : '');
-  // 「どこが」は許可があるときだけ描く (無効化して見せない — 要件 §U-7)
-  const pileActs = stateCan('task.facility.assign') ? [['どこが', '', 'fac'], ['－ 外す', '', 'none']] : [['－ 外す', '', 'none']];
-  $('#planPile').innerHTML = pile.length === 0 ? '<div class="colempty">左の候補を「＋ 明日やる」で足してください</div>'
+  // 「どこが」は許可があるときだけ描く (無効化して見せない — 要件 §U-7)。下見では操作そのものを描かない
+  const pileActs = ro ? []
+    : stateCan('task.facility.assign') ? [['どこが', '', 'fac'], ['－ 外す', '', 'none']] : [['－ 外す', '', 'none']];
+  $('#planPile').innerHTML = pile.length === 0
+    ? '<div class="colempty">' + (ro ? '「明日やる」に入っているカードはありません' : '左の候補を「＋ 明日やる」で足してください') + '</div>'
     : pile.map((c) => pcardHtml(c, pileActs)).join('');
 }
 

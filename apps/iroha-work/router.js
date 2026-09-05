@@ -602,12 +602,18 @@ router.post('/api/facility', checkOrigin, api((req, res) => {
 }));
 
 /** 「明日の計画」画面のデータ (職員だけ)。読むだけなので DB は変えない */
+/**
+ * 「明日の計画」画面のデータ。読むだけなので DB は変えない。
+ * ⭐正本が Notion のあいだ (下見) も返す — 切替の前に「どういう形か」を見せるため
+ * (ボード・ラベル待ち・履歴と同じ扱い。要件 v1.3 §P Q5)。書き変えは今までどおり 409
+ */
 router.get('/api/plan', api((req, res) => {
-  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
-  if (!staffModeOf(req).staff) {
+  const preview = !isAppMode();
+  // 下見は誰でも読むだけ。アプリ正本のときは職員だけ (書き変えられる画面なので)
+  if (!preview && !staffModeOf(req).staff) {
     return res.status(403).json({ ok: false, error: 'staff_required', message: '明日の計画を見られるのは職員だけです' });
   }
-  res.json({ ok: true, ...buildPlan(), staff_mode: staffModeOf(req), serverNow: new Date().toISOString() });
+  res.json({ ok: true, preview, ...buildPlan({ readOnly: preview }), staff_mode: staffModeOf(req), serverNow: new Date().toISOString() });
 }));
 
 /** 「外部施設に出す準備OK」の切り替え (アプリ正本のみ)。状態とは別のチェック */
