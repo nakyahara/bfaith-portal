@@ -1440,8 +1440,20 @@ export function buildItemPayload(db, draftId) {
   // 配送方法は生値で判定しない (複合選択肢 '1y5' は楽天の値ではないので、生値を楽天IDとして
   // 見ると「画面では指定済みなのに不正扱い」になる — #725 で作り込んだ不具合)
   const shippingResolved = toRakutenShippingGroup(rk.shipping_method_group);
+  // RMS へ実際に送る値。セットだけ NE へフォールバックする (§4.4 決⑥ / payloadShippingGroup)
+  const shippingGroup = payloadShippingGroup(draft, effectiveShip, shippingResolved);
   if (!shippingResolved.ok) {
     reasons.push('配送方法の指定が不正です');
+  } else if (!shippingGroup) {
+    // 🚨 **楽天へ送る配送方法が決まらないまま出品しない** (中原さん判断 2026-09-05)。
+    // 送らないと楽天は「店舗デフォルト」で登録する一方、商品ページの帯 (末尾バナー) は
+    // effectiveShippingForDraft = NE の配送方法で描かれる。つまり
+    // 「帯はネコポス / 楽天の設定は店舗デフォルト」という食い違いが、誰にも気づかれないまま出る。
+    // 黙って NE の値を送る手もあったが、いま出ている商品の設定が更新のたびに変わるので、
+    // **人に選ばせて揃える**方を採った (画面には NE の値が候補として出ている)
+    reasons.push(draft.parent_draft_id != null
+      ? '配送方法が決まりません (NE に本コードが載るのを待つか、楽天タブで選んでください)'
+      : '配送方法を選んでください (楽天タブ。NE の配送方法が候補に出ています)');
   }
   if (rk.normal_delivery_date_id != null && String(rk.normal_delivery_date_id).trim() !== ''
       && !/^\d+$/.test(String(rk.normal_delivery_date_id).trim())) {
@@ -1481,10 +1493,9 @@ export function buildItemPayload(db, draftId) {
     return list;
   };
 
-  // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる。
+  // 送料・配送方法 (variants[].shipping)。値は上のゲートで計算済み (shippingGroup)。
   // RMS へ出るのは**必ず楽天グループID** (複合選択肢は上で '1' 等に解決済み)。
-  // セットだけ NE へフォールバックする理由は payloadShippingGroup を見ること (§4.4 決⑥)
-  const shippingGroup = payloadShippingGroup(draft, effectiveShip, shippingResolved);
+  // 空のまま出ることは無い — 空なら上で reasons に積んで出品を止めている
   const shipping = {
     ...(shippingGroup ? { shippingMethodGroup: shippingGroup } : {}),
     ...(rk.postage_included != null ? { postageIncluded: rk.postage_included === 1 } : {}),

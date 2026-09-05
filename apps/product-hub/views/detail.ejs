@@ -776,11 +776,15 @@ th.attr-unknown { color: #dc2626; }
         <div style="flex:1; min-width:160px;">
           <label>配送方法 <span class="muted">(楽天の配送方法グループ)</span><span class="ftag ftag-m">手入力</span></label>
           <select id="rk-shipping-group" style="width:100%;">
-            <option value="">未設定 (店舗デフォルト)</option>
             <%
-              // 未設定なら NE 配送方法のマッピングをデフォルト選択 (保存で確定)
-              const shipDefault = String(shippingSelectValue || '') || (neShipping.group || '');
+              // 🚨 保存されている値だけを選択状態にする (2026-09-05)。
+              // 以前は未設定のとき NE の値を**選択済み**にしていたが、そうすると
+              // 配送方法に触れずジャンルだけ保存した人が「NE の値を選んだ」ことになってしまう
+              // (画面の全項目を collectRakutenFields がまとめて送るため)。
+              // 出品ゲートは「人が選んでいないと出品させない」ので、勝手に選ばせない (Codex high)
+              const shipDefault = String(shippingSelectValue || '');
             %>
+            <option value="" <%= shipDefault ? '' : 'selected' %>>— 選んでください</option>
             <% for (const [gid, gname] of Object.entries(shippingGroups)) { %>
               <option value="<%= gid %>" <%= shipDefault === gid ? 'selected' : '' %>><%= gname %></option>
             <% } %>
@@ -795,8 +799,31 @@ th.attr-unknown { color: #dc2626; }
               <option value="<%= gid %>" <%= shipDefault === gid ? 'selected' : '' %>><%= ov.label %></option>
             <% } %>
           </select>
-          <% if (!rakuten?.shipping_method_group && neShipping.group) { %>
-            <div class="muted" style="font-size:11px;">NEの配送方法「<%= neCost?.shippingMethod %>」から自動選択 (保存で確定)</div>
+          <%# 未選択のときの案内 (2026-09-05 中原さん判断: 単品は選んでいないと出品させない)。
+              🚨 セットは**親からコピーしない代わりに NE の値をそのまま使う** (§4.4 決⑥) ので、
+              選ばなくても出品できる。ここで単品と同じ「出品できません」を出すと嘘になる %>
+          <% if (!rakuten?.shipping_method_group) { %>
+            <% if (setInfo && neShipping.group) { %>
+              <div class="muted" style="font-size:11px; margin-top:4px;">
+                セットは NE の配送方法「<%= neCost?.shippingMethod %>」をそのまま使います（選ばなくても出品できます）。
+                違うものにするならここで選んでください。
+              </div>
+            <% } else if (setInfo) { %>
+              <div style="font-size:11px; margin-top:4px; color:#b45309;">
+                配送方法が決まりません（このままでは出品できません）。NE に本コードが載るのを待つか、ここで選んでください。
+              </div>
+            <% } else if (neShipping.group) { %>
+              <div style="font-size:11px; margin-top:4px;">
+                <span style="color:#b45309;">未選択です（このままでは出品できません）。</span>
+                NE は「<%= neCost?.shippingMethod %>」→
+                <button type="button" class="btn btn-sm" id="rk-ship-use-ne"
+                        data-group="<%= neShipping.group %>">これにする</button>
+              </div>
+            <% } else { %>
+              <div style="font-size:11px; margin-top:4px; color:#b45309;">
+                未選択です（このままでは出品できません）。NE にも配送方法が入っていないので、ここで選んでください。
+              </div>
+            <% } %>
           <% } %>
           <%# セットは配送方法をコピーしていない (§5.3)。個数で箱もサイズも変わるため。
               NE に本コードが載れば、単品と同じ「NEから自動選択」に乗る %>
@@ -4995,6 +5022,17 @@ th.attr-unknown { color: #dc2626; }
           alert('通信エラー: ' + e.message);
           setCodeBtn.disabled = false;
         }
+      });
+    }
+
+    // 配送方法: NE の候補を1クリックで入れる (2026-09-05)。押すまでは未選択のまま
+    const shipUseNe = document.getElementById('rk-ship-use-ne');
+    if (shipUseNe) {
+      shipUseNe.addEventListener('click', function () {
+        const sel = document.getElementById('rk-shipping-group');
+        if (!sel) return;
+        sel.value = shipUseNe.dataset.group || '';
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
       });
     }
 
