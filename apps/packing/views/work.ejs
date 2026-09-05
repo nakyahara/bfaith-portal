@@ -520,9 +520,10 @@
       // ピッキング欠品の配賦バッジ (欠品フローv2 PR2)。この伝票に入るはずの商品が足りない
       // 商品名で読む (SKU コードだけだと梱包者は商品を特定できない — 例外処理監査 U-23)
       const pname = (p) => p.name ? `${esc(p.name)} <small>${esc(p.sku)}</small>` : esc(p.sku);
+      const pqty = (p) => (Number.isFinite(Number(p.qty)) ? Number(p.qty) : 0);
       const pshort = (s.pickingShortages || []).map((p) => p.kind === 'none'
-        ? `<span class="warn-badge" style="background:#ffe3e3; border-color:#e03131; color:#c92a2a;">❌ ピッキング欠品: どのロケにもありません — ${pname(p)} × ${p.qty}</span>`
-        : `<span class="warn-badge" style="background:#fff3bf; border-color:#f08c00; color:#e8590c;">🕒 ピッキング欠品: 3階が後で取りに行きます — ${pname(p)} × ${p.qty}</span>`).join('');
+        ? `<span class="warn-badge" style="background:#ffe3e3; border-color:#e03131; color:#c92a2a;">❌ ピッキング欠品: どのロケにもありません — ${pname(p)} × ${pqty(p)}</span>`
+        : `<span class="warn-badge" style="background:#fff3bf; border-color:#f08c00; color:#e8590c;">🕒 ピッキング欠品: 3階が後で取りに行きます — ${pname(p)} × ${pqty(p)}</span>`).join('');
       // 明細数に応じた表示密度 (スクロールなしで全明細が見えるように)
       $('paper').dataset.density = s.lines.length <= 1 ? '1' : s.lines.length <= 3 ? '2' : '3';
       const lines = s.lines.map((l) => `
@@ -620,7 +621,9 @@
         $('stockoutWait').style.display = canAck ? 'none' : '';
       }
       $('receiveBtn').style.display = (!viewingHeld || (na.length && !ready)) ? 'none' : '';
-      $('foundBtn').style.display = viewingHeld ? '' : 'none';
+      // 「見つかった」: 保留中は依頼の取下げ / ❌ の未処理伝票は3階の欠品報告の取り消し (手元の山の下から出てきた — 退路)
+      $('foundBtn').style.display = (viewingHeld || na.length) ? '' : 'none';
+      $('foundBtn').textContent = viewingHeld ? '見つかった (依頼取下げ)' : '手元で見つかった (欠品報告を取り消す)';
       $('receiveBtn').disabled = !ready;
       $('receiveBtn').textContent = ready ? '📦 再ピック品を受け取った (再開)' : '⏳ 再ピック対応待ち…';
       $('prevBtn').disabled = viewSeq <= 1;
@@ -1538,8 +1541,19 @@
     });
     setInterval(() => { if (repickSet.size > 0 && !sending && loadQ().length === 0) resync(); }, 10000);
     $('foundBtn').addEventListener('click', () => {
-      if (!confirm('商品が見つかったため、再ピック依頼とミス候補を取り下げます。よろしいですか?')) return;
       const seq = viewSeq;
+      if (!heldSet.has(seq)) {
+        // ❌ の未処理伝票: 3階の「どこにもない」報告を取り消す (この受注の分だけ)。伝票はそのまま梱包できる
+        if (!confirm('この伝票の商品が手元で見つかったため、3階の「どこにもない」の報告を取り消します。よろしいですか?')) return;
+        enqueue('found', seq, {});
+        const s = bySeq.get(seq);
+        if (s) s.pickingShortages = (s.pickingShortages || []).filter((p) => p.kind !== 'none');
+        delete stockoutBySlip[seq]; stockoutAckSet.delete(seq);
+        showToast('欠品の報告を取り消しました。そのまま梱包して「次へ」を押してください');
+        render();
+        return;
+      }
+      if (!confirm('商品が見つかったため、再ピック依頼とミス候補を取り下げます。よろしいですか?')) return;
       enqueue('found', seq, {});
       heldSet.delete(seq); repickSet.delete(seq);
       incidents = incidents.filter((i) => i.slipSeq !== seq || i.kind === 'excess');

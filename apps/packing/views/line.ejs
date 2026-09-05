@@ -108,8 +108,8 @@
     const TASK_LABEL = { requested: '⏳ ピッカー対応待ち', claimed: '🏃 ピッカーが取りに行っています', fulfilled: '✅ 届きました' };
   %>
   <script>
-    // ブラウザ側でも時刻を JST の HH:MM にする (伝票情報の 🕒/❌ 行用)
-    function jstHm(iso) { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; }
+    // ブラウザ側の時刻表示 (伝票情報の 🕒/❌ 行用)。サーバー側 EJS の jstHm とは実行環境が別なので名前を分ける
+    function formatJstHm(iso) { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; }
   </script>
   <%
   %>
@@ -275,6 +275,7 @@
               <% if (ackSet.has(ns.seq)) { %>
                 <button type="button" class="danger" onclick="stockoutAck(<%= ns.seq %>)">🚫 在庫なしを確認 → 出荷保留にする (事務へ通知)</button>
               <% } %>
+              <button type="button" onclick="foundNone(<%= ns.seq %>)">手元で見つかった (報告を取り消す)</button>
             </div>
           <% } %>
         <% } %>
@@ -527,7 +528,7 @@
       const stockout = x.status === 'cancelled' && x.holdReason === 'stockout';
       info.innerHTML = `<div class="nm">${esc(slipLabel(x))}</div>`
         + `<div>配送方法: ${esc(x.deliveryMethod || '—')}${x.siteOrderNo ? ` / 受注番号: ${esc(x.siteOrderNo)}` : ''}${held ? ' / <b>⏳ 再ピック保留中</b>' : ''}${stockout ? ' / <b style="color:#c92a2a">🚫 出荷保留 (在庫なし)</b>' : ''}</div>`
-        + (x.pickingShortages || []).map((p) => `<div style="color:${p.kind === 'none' ? '#c92a2a' : '#e8590c'}; font-weight:700">${p.kind === 'none' ? '❌' : '🕒'} ピッキング欠品: ${esc(p.name || p.sku)} × ${p.qty} — ${p.kind === 'none' ? 'どのロケにもありません (再ピック依頼は不要・「在庫なしを確認」へ)' : '3階が後で取りに行きます'} (${esc(p.picker || '-')} ${jstHm(p.at)})</div>`).join('')
+        + (x.pickingShortages || []).map((p) => `<div style="color:${p.kind === 'none' ? '#c92a2a' : '#e8590c'}; font-weight:700">${p.kind === 'none' ? '❌' : '🕒'} ピッキング欠品: ${esc(p.name || p.sku)} × ${Number.isFinite(Number(p.qty)) ? Number(p.qty) : 0} — ${p.kind === 'none' ? 'どのロケにもありません (再ピック依頼は不要・「在庫なしを確認」へ)' : '3階が後で取りに行きます'} (${esc(p.picker || '-')} ${formatJstHm(p.at)})</div>`).join('')
         + x.lines.map((l) => `<div>・${esc(l.name)} <span class="sub">(${esc(l.sku)})</span> × <b>${l.qty}</b></div>`).join('');
       info.style.display = 'block';
       // 出荷保留 (在庫なし) で閉じた伝票には再ピック依頼を出さない (事務が NE で扱う)
@@ -597,6 +598,12 @@
         if (c && !c.ok && !(c.body.code === 'already_resolved' && c.body.status === want)) alert(c.body.error || `エラー (${c.status})`);
         location.reload();
       } finally { sending = false; }
+    }
+    // ❌ の未処理伝票で「手元で見つかった」: 3階の「どこにもない」報告を取り消す (退路。伝票はそのまま流せる)
+    function foundNone(seq) {
+      if (!workerSel.value) { alert('作業者を選択してください'); return; }
+      if (!confirm(`#${seq} の商品が手元で見つかったため、3階の「どこにもない」の報告を取り消します。よろしいですか?`)) return;
+      send('found', { slip_seq: seq });
     }
     // 🚫 在庫なしを確認 (Q1 決定 2026-09-05): 3階が「在庫なし」にした伝票を出荷保留にして閉じ、事務へ通知する
     function stockoutAck(seq) {

@@ -177,7 +177,7 @@ ev(pkB, 'start', {}, '西川カナコ');   // shortage と同じ作業者で開�
 applyEvent(pkB, { opId: `t${++op}`, event: 'shortage', lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' }, '西川カナコ');
 
 t('none: 配賦は kind=none・依頼なし・展開なし', () => {
-  const a = listShortageAllocations(pkB, 1);
+  const a = listShortageAllocations(pkB, 1).map(({ ne_slip_no, qty, kind }) => ({ ne_slip_no, qty, kind }));
   assert.deepEqual(a, [{ ne_slip_no: 'TB-B-NE1', qty: 1, kind: 'none' }]);
   assert.equal(db.prepare('SELECT COUNT(*) c FROM pk_later_requests WHERE batch_id=?').get(pkB).c, 0);
   assert.equal(bindPendingLaterRequests(), 0);
@@ -200,7 +200,7 @@ applyEvent(pkC, {
 }, '星立夏');
 
 t('配賦は残り (3不足−2確保=1個) だけ', () => {
-  const a = listShortageAllocations(pkC, 1);
+  const a = listShortageAllocations(pkC, 1).map(({ ne_slip_no, qty, kind }) => ({ ne_slip_no, qty, kind }));
   assert.deepEqual(a, [{ ne_slip_no: 'TB-C-NE1', qty: 1, kind: 'later' }]);
   assert.equal(db.prepare('SELECT qty FROM pk_later_requests WHERE batch_id=?').get(pkC).qty, 1);
 });
@@ -335,8 +335,9 @@ ev(pkJ, 'start');
 applyEvent(pkJ, { opId: `t${++op}`, event: 'shortage', lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' }, '星立夏');
 applyEvent(pkJ, { opId: `t${++op}`, event: 'shortage', lineSeq: 2, shortageQty: 1, altQty: 0, remaining: 'none' }, '星立夏');
 t('受注単位で集約して控除 (2個注文の受注に 1+1 で2個配賦できる)', () => {
-  assert.deepEqual(listShortageAllocations(pkJ, 1), [{ ne_slip_no: 'TB-J-NE1', qty: 1, kind: 'none' }]);
-  assert.deepEqual(listShortageAllocations(pkJ, 2), [{ ne_slip_no: 'TB-J-NE1', qty: 1, kind: 'none' }],
+  const core = (rows) => rows.map(({ ne_slip_no, qty, kind }) => ({ ne_slip_no, qty, kind }));
+  assert.deepEqual(core(listShortageAllocations(pkJ, 1)), [{ ne_slip_no: 'TB-J-NE1', qty: 1, kind: 'none' }]);
+  assert.deepEqual(core(listShortageAllocations(pkJ, 2)), [{ ne_slip_no: 'TB-J-NE1', qty: 1, kind: 'none' }],
     '2本目も同じ受注の残り1個へ (行ごとに控除が重複すると0になる)');
 });
 
