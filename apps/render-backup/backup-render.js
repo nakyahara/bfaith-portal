@@ -16,9 +16,15 @@
  * 対象:
  *   mirror-primary  = warehouse-mirror.db の非派生テーブル (論理エクスポート)
  *   inquiry-hub     = inquiry-hub.db (VACUUM INTO)
- *   小物 DB         = fba / profit / ranking-checker / rakuten-yahoo-sync / mercari-settings (存在すれば)
+ *   小物 DB         = fba / profit / ranking-checker / rakuten-yahoo-sync / mercari-settings / easy-ship / shohyo-links / staff
+ *                     / fba-box (FBA箱詰め記録) / postage (定形外送料) (存在すれば)
  *   users.json      = アカウント定義 (構造検証つき)
- *   対象外          = sessions.db (揮発)、warehouse.db (miniPC が正本)、mirror_ / mart_ / sync_ 系 (再構築可)
+ *   対象外          = sessions.db (揮発)、warehouse.db (miniPC が正本)、mirror_ / mart_ / sync_ 系 (再構築可)、
+ *                     picking.db (miniPC 移行済の残骸)、jobs-monitor.db (再構築可)
+ *
+ * 監視: 成功/失敗を jobs-monitor に ping する (台帳 id = render-backup、config/jobs-registry.mjs)。
+ *   2026-09-05 の実機確認で「Dark Launch のまま 7 週間・台帳未登録で無音」だったことが判明したため追加。
+ *   有効化 (RENDER_BACKUP_CRON_ENABLED) されていない間は ping が来ない = 締切超過として要対応に出る (それが狙い)。
  *
  * 欠落防止 (Codex R1 High#1): cron 定刻だけでなく、起動5分後の catch-up (当日分が無く定刻を
  *   過ぎていれば実行) + 6時間毎の staleness 監視 (最終成功から26h超で実行) を持つ。
@@ -49,6 +55,10 @@ import zlib from 'zlib';
 import crypto from 'crypto';
 import { pipeline } from 'stream/promises';
 import { Writable } from 'stream';
+// jobs-monitor への成否記録。監視側の失敗はヘルパー内で握り潰されるのでバックアップ本体を巻き添えにしない
+import { pingJob } from '../jobs-monitor/ping-local.js';
+
+const JOB_ID = 'render-backup'; // config/jobs-registry.mjs の id
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const BACKUP_DIR = process.env.BACKUP_DIR || path.join(DATA_DIR, 'backup-render');
@@ -94,6 +104,10 @@ const TARGETS = [
   { key: 'easy-ship', file: 'easy-ship.db', mode: 'vacuum', required: false, sentinels: ['es_package_size_master'] },
   { key: 'shohyo-links', file: 'shohyo-links.db', mode: 'vacuum', required: false, sentinels: ['vendor_links'] },
   { key: 'staff', file: 'staff.db', mode: 'vacuum', required: false, sentinels: ['staff'] },
+  // 2026-09-05 実機確認 (CompanyDB構想 R-2) で対象外だと判明した Render 正本 2 本。
+  // 両方まだ小さく (0.2MB / 4KB+WAL)、行が増える前の DB なので sentinel は置かない (0 件で失敗にしない)
+  { key: 'fba-box', file: 'fba-box.db', mode: 'vacuum', required: false, sentinels: [] },
+  { key: 'postage', file: 'postage.db', mode: 'vacuum', required: false, sentinels: [] },
   { key: 'users', file: 'users.json', mode: 'file', required: true, sentinels: [] },
 ];
 
@@ -582,9 +596,11 @@ async function runAndNotify(label) {
   try {
     const summary = await runRenderBackup();
     console.log(`[render-backup] 完了 (${label}): ${summary}`);
+    pingJob(JOB_ID, 'ok', `${label}: ${summary}`);
     await notify(`✅ *Renderバックアップ ${jstToday()}${label === 'cron' ? '' : ` (${label})`}*\n${summary}`);
   } catch (e) {
     console.error(`[render-backup] 失敗 (${label}):`, e.message);
+    pingJob(JOB_ID, 'fail', `${label}: ${e.message}`);
     await notify(`❌ *Renderバックアップ ${jstToday()} 失敗${label === 'cron' ? '' : ` (${label})`}*\n${e.message}`);
   }
 }
@@ -640,10 +656,13 @@ if (process.argv[2] === 'run') {
   runRenderBackup()
     .then(async (summary) => {
       console.log(`[render-backup] 完了: ${summary}`);
+      // 手動 run は別プロセスだが jobs-monitor.db は同じファイルなので、JOBS_MONITOR_ENABLED=1 の環境 (Render Shell) なら記録される
+      pingJob(JOB_ID, 'ok', `manual: ${summary}`);
       await notify(`✅ *Renderバックアップ ${jstToday()} (手動)*\n${summary}`);
     })
     .catch(async (e) => {
       console.error(`FATAL: ${e.message}`);
+      pingJob(JOB_ID, 'fail', `manual: ${e.message}`);
       await notify(`❌ *Renderバックアップ ${jstToday()} 失敗 (手動)*\n${e.message}`);
       process.exit(1);
     });
