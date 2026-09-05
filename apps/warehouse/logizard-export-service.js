@@ -252,7 +252,10 @@ router.post('/nyuka-refresh', (req, res) => {
       return {
         ok: true, output: r.output, waitedForLock: waited,
         csv: after,
-        csvChanged: !!after && (!before || after.mtime !== before.mtime || after.size !== before.size),
+        // 🚨 CSV が無い (終了コード0でも出力できていなかった) ときは **null = 分からない**。
+        //    false にすると呼び出し側が「前回と同じ = 増えていない」と誤読し、古いままの Drive を
+        //    「新しい受付なし」と表示してしまう
+        csvChanged: after ? (!before || after.mtime !== before.mtime || after.size !== before.size) : null,
       };
     } finally {
       // 🚨 連打防止は**終わった時刻**から数える (受付時刻からだと、60秒より長いジョブの直後に再実行できる)

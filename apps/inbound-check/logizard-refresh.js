@@ -139,11 +139,17 @@ async function runRefresh({ actor, fetchFn, drive, timing }) {
     setRun({ phase: 'importing', message: '取り込んでいます' });
     const driveUntil = Date.now() + T.driveWaitMs;
     let driveAdvanced = false;
+    // 🚨「違う値になった」ではなく「**進んだ**」で見る。古いファイルに差し替わった (時刻が戻った) ものを
+    //    「新しい世代が届いた」と読まない。読めない時刻は進んでいない扱い (fail-closed)
+    const advanced = (a, b) => {
+      const t1 = Date.parse(a || ''); const t2 = Date.parse(b || '');
+      return Number.isFinite(t1) && Number.isFinite(t2) && t1 > t2;
+    };
     if (before && before.modified_time) {
       for (;;) {
         let now2 = null;
         try { now2 = await drive.getDriveInfo({ force: true }); } catch { /* 次の周回で見る */ }
-        if (now2 && now2.modified_time && now2.modified_time !== before.modified_time) { driveAdvanced = true; break; }
+        if (now2 && advanced(now2.modified_time, before.modified_time)) { driveAdvanced = true; break; }
         if (Date.now() > driveUntil) break;
         await sleep(T.drivePollMs);
       }

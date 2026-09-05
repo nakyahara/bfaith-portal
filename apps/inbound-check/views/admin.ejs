@@ -509,8 +509,9 @@
               return;
             }
           } catch (e) { /* 次の周回で見る */ }
-          // Render 側の上限 (300秒) より後ろで打ち切る。先に諦めると、走っている取得を失敗と見せてしまう
-          if (Date.now() - started > 330000) {
+          // Render の全工程 (ジョブ待ち300秒 + Drive 反映30秒 + 取込 + ポーリングの間) より
+          // 十分後ろで打ち切る。先に諦めると、正常に走っている取得を失敗と見せてしまう
+          if (Date.now() - started > 420000) {
             msg($('#refreshMsg'), false, '時間内に終わりませんでした。miniPC のログを確認してください');
             refreshBtn.disabled = false;
             return;

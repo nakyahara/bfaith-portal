@@ -125,6 +125,16 @@ console.log('\n[2b] 出力CSVが書き変わったかを返す (呼び出し側�
   const j2 = await waitJob(r2.body.jobId);
   eq(j2.result.csvChanged, false, '2回目は書き変わっていない');
   eq(fs.statSync(OUT_CSV).mtimeMs, before, 'CSV は触っていない');
+
+  svc._resetForTest();
+  // 🚨 終了コード0でも CSV が無いときは「同じ」ではなく「分からない」(null)。
+  //    false にすると呼び出し側が古い一覧を「新しい受付なし」と誤って言い切る
+  fs.rmSync(OUT_CSV, { force: true });
+  writeScript(0, 'no csv written');
+  const r3 = await call('POST', '/service-api/logizard/nyuka-refresh');
+  const j3 = await waitJob(r3.body.jobId);
+  eq(j3.result.csvChanged, null, 'CSV が無ければ csvChanged=null (未検証)');
+  eq(j3.result.csv, null, 'csv も null');
 }
 
 console.log('\n[3] 連打と二重起動を止める');

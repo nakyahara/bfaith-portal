@@ -57,7 +57,7 @@ function makeFetch({ jobStates = ['completed'], startBody = { ok: true, jobId: '
 }
 
 /** Drive 層の差し替え (実際の Drive も SA 資格情報も使わない) */
-function makeDrive({ modifiedBefore = 'A', modifiedAfter = 'B', importResult = { ok: true, slipCount: 3, rowCount: 12, batch: { id: 9 } }, infoThrows = false } = {}) {
+function makeDrive({ modifiedBefore = '2026-09-05T10:00:00.000Z', modifiedAfter = '2026-09-05T10:05:00.000Z', importResult = { ok: true, slipCount: 3, rowCount: 12, batch: { id: 9 } }, infoThrows = false } = {}) {
   let n = 0;
   return {
     getDriveInfo: async () => {
@@ -160,6 +160,28 @@ console.log('\n[4] 増えていなかった = 失敗ではない (ただし届�
   });
   const s = await _waitIdleForTest();
   ok(s.state === 'done' && s.verified && /3伝票/.test(s.message), '取り込めたときは Drive の更新日時を待たずに成功');
+}
+{
+  _resetForTest();
+  // 🚨 終了コード0でも CSV を作れていない (csvChanged=null) ときは「新規なし」と言わない
+  startRefresh({
+    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvChanged: null } }),
+    drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A', importResult: { ok: false, error: 'duplicate_file' } }),
+    timing: FAST,
+  });
+  const s = await _waitIdleForTest();
+  ok(s.state === 'failed' && s.error === 'not_verified', 'csvChanged=null は未検証として扱う');
+}
+{
+  _resetForTest();
+  // 🚨 更新日時が**戻った** (古いファイルに差し替わった) のを「新しい世代が届いた」と読まない
+  startRefresh({
+    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvChanged: true } }),
+    drive: makeDrive({ modifiedBefore: '2026-09-05T10:00:00.000Z', modifiedAfter: '2026-09-05T09:00:00.000Z', importResult: { ok: false, error: 'duplicate_file' } }),
+    timing: FAST,
+  });
+  const s = await _waitIdleForTest();
+  ok(s.state === 'failed' && s.error === 'not_verified', '時刻が戻ったら verified にしない (進んだときだけ)');
 }
 
 console.log('\n[5] 失敗はそのまま画面に出す');
