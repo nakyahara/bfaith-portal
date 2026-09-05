@@ -27,7 +27,7 @@ import {
   workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, moveWorkOption, seedWorkOptionsFromMaster, BUILTIN_OPTION_IMAGES,
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
-  getCachePage, startSessions, stopSession, stopSessions, listSessionsForAdmin, searchSessions, SESSION_SEARCH_MAX, voidSession,
+  getCachePage, startSessions, stopSession, stopSessions, listSessionsForAdmin, searchSessions, SESSION_SEARCH_MAX, jstDayStartUtc, voidSession,
   getMeta, setMetaValue, sourceOfTruth,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
@@ -415,7 +415,10 @@ const MAX_CREW = 20;
  */
 function resolveWorkers(req, operator) {
   const raw = req.body?.worker_ids;
-  if (raw === undefined || raw === null) return { workers: [operator] };
+  // worker_ids を送ってこないのは、デプロイ直後にキャッシュされた古い画面だけのはず。
+  // 記録は残る (操作者ひとりで始めた扱い) が、⭐「選ばないと始められない」の保証にはならないので
+  // 通ったことをログに残す。ログが出なくなったらこの互換は外す (feedback: 互換は恒久仕様になりがち)
+  if (raw === undefined || raw === null) return { workers: [operator], legacy: true };
   if (!Array.isArray(raw)) return { error: '作業する人を選んでください' };
   const ids = [...new Set(raw.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
   if (!ids.length) return { error: '作業する人を選んでください (1人以上えらぶと始められます)' };
@@ -1368,6 +1371,10 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const crew = resolveWorkers(req, w.worker);
   if (crew.error) return res.status(400).json({ ok: false, error: 'worker_required', message: crew.error });
+  if (crew.legacy) {
+    console.warn('[iroha-work] worker_ids なしの開始要求 (古い画面のキャッシュ)。'
+      + `操作者 ${w.worker.display_name} ひとりで始めた扱いにしました / 端末=${deviceLabelOf(req) || '不明'}`);
+  }
   if (isAppMode()) return startSessionApp(req, res, w.worker, crew.workers);
   const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
@@ -1522,28 +1529,68 @@ router.post('/admin/sessions/:id(\\d+)/void', checkOrigin, requireAdmin, api((re
  * 「直近50件」だけでは、先月たなかさんが何をしたか・この商品を誰がやったかが分からない。
  * 期間は JST の日付で受け取る (画面の <input type="date"> がそのまま渡せる)
  */
-function searchQueryOf(req) {
-  return {
-    workerId: req.query.worker_id || null,
-    from: req.query.from || null,
-    to: req.query.to || null,
-    q: req.query.q || null,
-    includeVoided: req.query.voided === '1',
-  };
+/**
+ * 検索条件を確かめる。**おかしい値を黙って無視しない** — 絞ったつもりで全員・全期間が出るのが
+ * いちばん危ない (工賃の集計に使うため)。理由をつけて 400 で返す
+ */
+function parseSearchQuery(req) {
+  const out = { workerId: null, from: null, to: null, q: null, includeVoided: req.query.voided === '1' };
+  const wid = String(req.query.worker_id ?? '').trim();
+  if (wid) {
+    const w = getIrohaWorker(wid);
+    if (!w) return { error: '選んだ作業者が見つかりません (画面を更新してください)' };
+    out.workerId = w.id;
+  }
+  for (const [key, label] of [['from', 'いつから'], ['to', 'いつまで']]) {
+    const v = String(req.query[key] ?? '').trim();
+    if (!v) continue;
+    // 形だけでなく実在する日か確かめる (2026-02-30 は 3/2 に繰り上がってしまう)
+    if (!jstDayStartUtc(v)) return { error: `「${label}」の日付が正しくありません (${v})` };
+    out[key] = v;
+  }
+  if (out.from && out.to && out.from > out.to) return { error: '「いつから」が「いつまで」より後になっています' };
+  const kw = String(req.query.q ?? '').trim();
+  if (kw.length > 100) return { error: '探す文字が長すぎます (100文字まで)' };
+  out.q = kw || null;
+  return { query: out };
 }
 
 router.get('/admin/sessions/search', requireSession, api((req, res) => {
-  const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), SESSION_SEARCH_MAX);
-  const r = searchSessions({ ...searchQueryOf(req), limit, offset: Number(req.query.offset) || 0 });
+  const p = parseSearchQuery(req);
+  if (p.error) return res.status(400).json({ ok: false, error: 'bad_request', message: p.error });
+  const r = searchSessions({ ...p.query, limit: req.query.limit, offset: req.query.offset });
   res.json({ ok: true, ...r });
 }));
 
+/** CSV に入れられる上限。これを超えたら**欠けたCSVを渡さず**条件を絞ってもらう */
+const CSV_MAX_ROWS = 5000;
+
 /** 同じ条件を CSV で (工賃の計算・実績報告に使う)。Excel が文字化けしないよう BOM 付き UTF-8 */
 router.get('/admin/sessions/search.csv', requireSession, api((req, res) => {
-  const { rows } = searchSessions({ ...searchQueryOf(req), limit: SESSION_SEARCH_MAX });
+  const p = parseSearchQuery(req);
+  if (p.error) return res.status(400).json({ ok: false, error: 'bad_request', message: p.error });
+  // ⭐先頭 500 件だけを「正しいCSV」として渡さない。工賃の計算に使うので、
+  //   足りないことに気づけないまま使われるのがいちばん危ない (Codex 指摘)
+  const rows = [];
+  let over = false;
+  for (;;) {
+    const page = searchSessions({ ...p.query, limit: SESSION_SEARCH_MAX, offset: rows.length });
+    rows.push(...page.rows);
+    if (!page.truncated || !page.rows.length) break;
+    if (rows.length >= CSV_MAX_ROWS) { over = true; break; }
+  }
+  if (over) {
+    return res.status(422).json({ ok: false, error: 'too_many',
+      message: `${CSV_MAX_ROWS}件を超えました。期間や作業者をしぼってから出してください (足りないCSVは出しません)` });
+  }
+  safeLog({ action: 'sessions_csv', pageId: null, deviceLabel: deviceLabelOf(req),
+    to: `${rows.length}件 (${p.query.from || '指定なし'}〜${p.query.to || '指定なし'}${p.query.workerId ? ` 作業者${p.query.workerId}` : ''}${p.query.q ? ` "${p.query.q}"` : ''})`, ok: true });
   const jst = (iso) => (iso ? new Date(Date.parse(iso) + 9 * 3600000).toISOString().replace('T', ' ').slice(0, 19) : '');
   const cell = (v) => {
-    const s = v == null ? '' : String(v);
+    let s = v == null ? '' : String(v);
+    // ⭐Excel が数式として解釈しないようにする。商品名は外 (Notion・仕入先) から来るので
+    //   「=」「+」「-」「@」で始まる値がありえる (CSVインジェクション — Codex 指摘)
+    if (/^[\s]*[=+\-@]/.test(s)) s = `'${s}`;
     return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const head = ['開始 (JST)', '終了 (JST)', '作業した人', '商品名', '商品コード', '作業時間 (秒)', '作業時間 (分)', '終わり方', 'いっしょにやった人', '端末', '取り消し'];

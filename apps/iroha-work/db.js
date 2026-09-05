@@ -852,26 +852,37 @@ export function startSessions({ pageId = null, taskId = null, productCode = null
   const db = getDB();
   const now = utcNow();
   if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
-  const list = (Array.isArray(workers) ? workers : []).filter((w) => w && Number.isInteger(Number(w.id)));
+  // id は正の整数だけ (0・負数を DB 層でも通さない — 呼び元が router とは限らない)
+  const list = (Array.isArray(workers) ? workers : []).filter((w) => w && Number.isSafeInteger(Number(w.id)) && Number(w.id) > 0);
   if (!list.length) return { ok: false, error: 'worker_required', message: '作業する人を選んでください' };
   // 同じ人を2回選んでも1行にする (画面の重複・再送で二重に数えない)
   const uniq = [...new Map(list.map((w) => [Number(w.id), w])).values()];
   return db.transaction(() => {
     if (guard) { const g = guard(); if (g) return g; }
-    // 取り消し済み (voided_at) の記録は「作業中」に数えない — 終了の判定と揃える (Codex PR1 R15)
-    const openOf = db.prepare(`SELECT id, page_id, task_id, title_snapshot, started_at FROM f_iroha_work_sessions
-      WHERE worker_id = ? AND ended_at IS NULL AND voided_at IS NULL`);
+    // ⭐取りに行く条件は**部分ユニーク索引 (idx_iroha_sessions_open_uniq) と同じ ended_at IS NULL** にする。
+    //   索引は voided を除かないので、ここで voided を先に外すと「作業中ではない」と判断した直後に
+    //   INSERT が UNIQUE 違反で落ちる (Codex 指摘)。取り消し済みで開いたままの行は異常なので、
+    //   落とさずに理由を返して職員に直してもらう
+    const openOf = db.prepare(`SELECT id, page_id, task_id, title_snapshot, started_at, voided_at FROM f_iroha_work_sessions
+      WHERE worker_id = ? AND ended_at IS NULL`);
     const isSameCard = (open) => (taskId != null ? Number(open.task_id) === Number(taskId) : open.page_id === pageId);
     // ⭐先に全員ぶん調べてから入れる (何行か入れた後で断らない — 途中まで記録が残るのを防ぐ)
     const busy = [];
     const already = new Map();
+    const broken = [];
     for (const w of uniq) {
       const open = openOf.get(Number(w.id));
       if (!open) continue;
+      if (open.voided_at) { broken.push({ workerId: Number(w.id), workerName: w.display_name, open }); continue; }
       // 同じカードなら成功扱いで既存セッションを返す (応答が消えた再送で
       // 「実際は動いているのに開始できない」状態にしない — Codex PR2 #2)
       if (isSameCard(open)) already.set(Number(w.id), open);
       else busy.push({ workerId: Number(w.id), workerName: w.display_name, open });
+    }
+    if (broken.length) {
+      const who = broken.map((b) => b.workerName).join('、');
+      return { ok: false, error: 'stuck_session', busy: broken, open: broken[0].open,
+        message: `${who} さんに、取り消し済みなのに終わっていない記録が残っています。職員の方が管理画面から片づけてください` };
     }
     if (busy.length) {
       const who = busy.map((b) => `${b.workerName} さんは「${b.open.title_snapshot || '別のカード'}」`).join('、');
@@ -980,14 +991,17 @@ export function stopSessions({ pageId = null, taskId = null, sessionIds, reason,
     const stopped = [];
     for (const row of targets) {
       if (row.ended_at) {
+        // 既に閉じている = 再送。⭐**実際に記録されている終わり方**を返す —
+        // 先に pause で閉じたところへ done の再送が来たとき、呼び元が「done になった」と誤解しない (Codex 指摘)
         stopped.push({ id: row.id, workerId: row.worker_id, workerName: row.worker_name,
-          raw_seconds: row.raw_seconds, started_at: row.started_at, ended_at: row.ended_at, already: true });
+          raw_seconds: row.raw_seconds, started_at: row.started_at, ended_at: row.ended_at,
+          end_reason: row.end_reason, already: true });
         continue;
       }
       const raw = Math.max(0, Math.floor((Date.parse(now) - Date.parse(row.started_at)) / 1000));
       upd.run(now, reason, raw, row.id);
       stopped.push({ id: row.id, workerId: row.worker_id, workerName: row.worker_name,
-        raw_seconds: raw, started_at: row.started_at, ended_at: now, already: false });
+        raw_seconds: raw, started_at: row.started_at, ended_at: now, end_reason: reason, already: false });
     }
     const remainingActive = db.prepare(`SELECT COUNT(*) c FROM f_iroha_work_sessions
       WHERE ${byTask ? 'task_id = ?' : 'page_id = ?'} AND ended_at IS NULL AND voided_at IS NULL`)
@@ -1083,11 +1097,26 @@ export function listSessionsForAdmin(limit = 50) {
   return rows;
 }
 
-/** JST の日付 (YYYY-MM-DD) → その日の 00:00 JST を UTC ISO で。不正なら null */
-function jstDayStartUtc(ymd) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(ymd || '').trim())) return null;
-  const t = Date.parse(`${String(ymd).trim()}T00:00:00+09:00`);
-  return Number.isNaN(t) ? null : new Date(t).toISOString();
+/**
+ * JST の日付 (YYYY-MM-DD) → その日の 00:00 JST を UTC ISO で。不正なら null。
+ * ⭐形だけ見ても足りない: Date.parse('2026-02-30T00:00:00+09:00') は 3/2 に繰り上がって
+ *   「有効な日付」になってしまう (Codex 指摘・実測ずみ)。年月日で往復して実在日か確かめる
+ */
+export function jstDayStartUtc(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || '').trim());
+  if (!m) return null;
+  const [, y, mo, d] = m.map(Number);
+  const t = Date.parse(`${m[1]}-${m[2]}-${m[3]}T00:00:00+09:00`);
+  if (Number.isNaN(t)) return null;
+  const back = new Date(t + 9 * 3600000).toISOString().slice(0, 10);   // JST に戻して同じ日付か
+  return back === `${m[1]}-${m[2]}-${m[3]}` ? new Date(t).toISOString() : null;
+}
+
+/** LIMIT / OFFSET に渡せる整数だけ通す。1.5 や Infinity をそのまま渡すと SQLite が datatype mismatch で落ちる */
+function intInRange(v, fallback, min, max) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
 }
 
 /** 検索の上限。1回に返す最大件数 (画面のページ送り用) */
@@ -1121,10 +1150,12 @@ export function searchSessions({ workerId = null, from = null, to = null, q = nu
     args.push(like, like);
   }
   const sql = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const cap = Math.min(Math.max(Number(limit) || 200, 1), SESSION_SEARCH_MAX);
-  const skip = Math.max(Number(offset) || 0, 0);
+  const cap = intInRange(limit, 200, 1, SESSION_SEARCH_MAX);
+  const skip = intInRange(offset, 0, 0, 1_000_000);
 
-  // 合計は**絞り込んだ全件**で出す (画面に出ている 200 件ぶんだけの合計にしない)
+  // 合計は**絞り込んだ全件**で出す (画面に出ている 200 件ぶんだけの合計にしない)。
+  // ⭐totalSeconds は**終わったぶんだけ**。作業中はまだ確定していないので足さない
+  //   (工賃の計算に使う数字が、見るたびに増えていくことになる — 画面のラベルも「終わったぶん」と書く)
   const summary = db.prepare(`SELECT COUNT(*) AS count,
       COALESCE(SUM(s.raw_seconds), 0) AS totalSeconds,
       COUNT(DISTINCT s.worker_id) AS workers,
@@ -1154,17 +1185,28 @@ export function searchSessions({ workerId = null, from = null, to = null, q = nu
  * (同じカードでも別の日にやった人は一緒に働いていないので入れない)
  */
 function attachMates(db, rows) {
+  if (!rows.length) return;
   const tasks = [...new Set(rows.filter((r) => r.task_id != null).map((r) => Number(r.task_id)))];
   const pages = [...new Set(rows.filter((r) => r.task_id == null && r.page_id).map((r) => r.page_id))];
+  // ⭐同じカードを何年も使う運用があるので、**この検索結果の時間帯**に限って引く
+  //   (カード指定だけだと、1日ぶんの検索でもそのカードの全履歴を読むことになる — Codex 指摘)
+  const winFrom = rows.reduce((a, r) => (a && a < r.started_at ? a : r.started_at), null);
+  const open = rows.some((r) => !r.ended_at);
+  const winTo = open ? null : rows.reduce((a, r) => (a && a > r.ended_at ? a : r.ended_at), null);
+  // 重なりを見るので、相手は「この時間帯より後に始まっていない」かつ「この時間帯より前に終わっていない」もの
+  const bound = ' AND (ended_at IS NULL OR ended_at >= ?)' + (winTo ? ' AND started_at <= ?' : '');
+  const boundArgs = winTo ? [winFrom, winTo] : [winFrom];
   const all = [];
   const ph = (n) => new Array(n).fill('?').join(',');
   if (tasks.length) {
     all.push(...db.prepare(`SELECT id, task_id, NULL AS page_id, worker_id, worker_name, started_at, ended_at
-      FROM f_iroha_work_sessions WHERE voided_at IS NULL AND task_id IN (${ph(tasks.length)})`).all(...tasks));
+      FROM f_iroha_work_sessions WHERE voided_at IS NULL AND task_id IN (${ph(tasks.length)})${bound}`)
+      .all(...tasks, ...boundArgs));
   }
   if (pages.length) {
     all.push(...db.prepare(`SELECT id, NULL AS task_id, page_id, worker_id, worker_name, started_at, ended_at
-      FROM f_iroha_work_sessions WHERE voided_at IS NULL AND page_id IN (${ph(pages.length)})`).all(...pages));
+      FROM f_iroha_work_sessions WHERE voided_at IS NULL AND page_id IN (${ph(pages.length)})${bound}`)
+      .all(...pages, ...boundArgs));
   }
   const byCard = new Map();
   for (const s of all) {

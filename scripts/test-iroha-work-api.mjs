@@ -191,6 +191,63 @@ console.log('\n[5] 記録の検索');
   ok(lines.slice(1).some((l) => l.includes('あべ')), '作業した人が入っている');
 }
 
+console.log('\n[6] おかしい検索条件は黙って広げず、理由をつけて断る (Codex レビュー 2026-09-05)');
+{
+  const bad = async (qs) => (await get('/admin/sessions/search?' + qs));
+  const w1 = await bad('worker_id=99999');
+  ok(w1.status === 400 && /見つかりません/.test(w1.json.message), '知らない作業者IDは 400 (全員ぶんを返さない)');
+  ok((await bad('worker_id=abc')).status === 400, '数でない作業者IDも 400');
+  const d1 = await bad('from=2026-02-30');
+  ok(d1.status === 400 && /2026-02-30/.test(d1.json.message), '実在しない日 (2/30) は 400 — 3/2 に繰り上げて通さない');
+  ok((await bad('to=こわれた日付')).status === 400, '日付でない文字も 400');
+  const order = await bad('from=2026-09-05&to=2026-09-01');
+  ok(order.status === 400 && /いつから/.test(order.json.message), 'from > to は 400');
+  ok((await bad('q=' + 'あ'.repeat(101))).status === 400, '長すぎる検索文字は 400');
+  // 空文字は「指定なし」。画面が空欄のまま押しても通る
+  ok((await bad('worker_id=&from=&to=&q=')).status === 200, '空欄は「指定なし」として通る');
+  // LIMIT/OFFSET に整数でない値が来ても 500 にしない (SQLite は datatype mismatch を投げる)
+  for (const qs of ['limit=1.5', 'offset=Infinity', 'limit=-5', 'limit=1e9', 'offset=abc']) {
+    ok((await bad(qs)).status === 200, `${qs} でも 500 にならない`);
+  }
+}
+
+console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式にしない');
+{
+  // 商品名は Notion・仕入先から来るので「=」で始まることがある (CSVインジェクション)
+  const T3 = mkTask('=HYPERLINK("http://example.com","クリック")', 'API-003');
+  const st = await post('/api/sessions/start', { id: T3, worker_id: A, worker_ids: [A] });
+  ok(st.json.ok === true, '前提: 数式に見える商品名のカードで作業する');
+  await post('/api/sessions/stop', { id: T3, worker_id: A, session_ids: [st.json.sessions[0].sessionId], reason: 'done' });
+  const csv = await get('/admin/sessions/search.csv?q=' + encodeURIComponent('HYPERLINK'));
+  ok(csv.status === 200, 'CSV は出せる');
+  ok(/"'=HYPERLINK/.test(csv.text), '「=」で始まる値にはアポストロフィを前置する (Excel が数式として実行しない)');
+  ok(!/,=HYPERLINK/.test(csv.text), '生の =HYPERLINK は入っていない');
+
+  // 上限を超えたら「先頭だけのCSV」を渡さず断る (工賃計算に使うので、欠けたと気づけないのがいちばん危ない)
+  const { getDB: gdb } = await import('../apps/iroha-work/db.js');
+  const db = gdb();
+  const now = new Date().toISOString();
+  const ins = db.prepare(`INSERT INTO f_iroha_work_sessions
+    (page_id, product_code, title_snapshot, worker_id, worker_name, started_at, ended_at, end_reason, raw_seconds)
+    VALUES (?, 'BULK-001', 'かさ増しテスト商品', ?, 'あべ', ?, ?, 'done', 60)`);
+  // ⭐1ページ (500件) を超えても全部入る。ここが欠けると工賃の計算が静かに狂う
+  const ins2 = db.prepare(`INSERT INTO f_iroha_work_sessions
+    (page_id, product_code, title_snapshot, worker_id, worker_name, started_at, ended_at, end_reason, raw_seconds)
+    VALUES (?, 'PAGE-001', 'ページ送りテスト商品', ?, 'あべ', ?, ?, 'done', 60)`);
+  db.transaction(() => { for (let i = 0; i < 700; i++) ins2.run('page-' + i, A, now, now); })();
+  const paged = await get('/admin/sessions/search.csv?q=' + encodeURIComponent('ページ送り'));
+  ok(paged.status === 200, '700件でも CSV は出せる');
+  ok(paged.text.trim().split('\r\n').length === 701, '見出し + 700行 (500件で切れない)');
+  ok((await get('/admin/sessions/search?q=' + encodeURIComponent('ページ送り'))).json.summary.count === 700,
+    '画面の合計も 700 件 (表に出ている分だけの合計にしない)');
+
+  db.transaction(() => { for (let i = 0; i < 5100; i++) ins.run('bulk-' + i, A, now, now); })();
+  const over = await get('/admin/sessions/search.csv?q=' + encodeURIComponent('かさ増し'));
+  ok(over.status === 422 && /しぼって/.test(over.json.message), '5000件を超えたら 422 で断る (欠けたCSVを出さない)');
+  const okCsv = await get('/admin/sessions/search.csv?q=' + encodeURIComponent('みつろう'));
+  ok(okCsv.status === 200, '条件を絞れば出せる');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 // process.exit で落とすと、開いたままの接続を libuv が abort することがある
 // (feedback_notify_job_exit_libuv_crash)。閉じてから終了コードだけ置いて自然に終わらせる

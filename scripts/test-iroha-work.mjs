@@ -169,7 +169,7 @@ initMirrorDB();
 const { getDB, replaceCache, listCache, addIrohaWorker, setIrohaWorkerActive, getIrohaWorker, listIrohaWorkers,
   setWorkerPin, verifyWorkerPin, _clearPinFails,
   createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents,
-  startSession, startSessions, stopSession, stopSessions, searchSessions, activeSessionsByPage, activeSessionsByTask, estimateByProduct, getMeta, setMetaValue, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
+  startSession, startSessions, stopSession, stopSessions, searchSessions, jstDayStartUtc, activeSessionsByPage, activeSessionsByTask, estimateByProduct, getMeta, setMetaValue, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
 const { ensureFresh, refreshFromNotion, changeStatus, fetchCardLive, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
 const { buildList, priorityOf, clearEnrichCache, previousPhotosOf } = await import('../apps/iroha-work/service.js');
 
@@ -3631,7 +3631,37 @@ console.log('\n[24] 複数人での作業開始・まとめ終了・記録の検
   const tomorrow = new Date(Date.now() + 9 * 3600000 + 86400000).toISOString().slice(0, 10);
   ok(searchSessions({ q: 'みつろう', from: tomorrow }).summary.count === 0, '明日からにすると0件');
   ok(searchSessions({ q: 'みつろう', to: tomorrow }).summary.count === 4, '「いつまで」はその日を含む');
-  ok(searchSessions({ q: 'みつろう', from: 'こわれた日付' }).summary.count === 4, '壊れた日付は条件にしない (0件にして黙らせない)');
+  // DB 層は壊れた日付を条件にしない (無視して全件)。⭐**断るのは router の役目** —
+  // 画面には「日付が正しくありません」と出す (絞ったつもりで全件が出るのを防ぐ。test-iroha-work-api.mjs)
+  ok(searchSessions({ q: 'みつろう', from: 'こわれた日付' }).summary.count === 4, 'DB 層は壊れた日付を条件にしない (断るのは router)');
+  ok(jstDayStartUtc('2026-09-05') === '2026-09-04T15:00:00.000Z', 'JST の日付は 00:00 JST = 前日15:00 UTC');
+  ok(jstDayStartUtc('2026-02-30') === null, '実在しない日 (2/30) は弾く — Date.parse だと 3/2 に繰り上がってしまう');
+  ok(jstDayStartUtc('2026-13-01') === null && jstDayStartUtc('2026-9-5') === null && jstDayStartUtc('') === null,
+    '月13・桁足らず・空も弾く');
+  // LIMIT/OFFSET に整数でない値が来ても落とさない (SQLite は datatype mismatch を投げる)
+  ok(searchSessions({ q: 'みつろう', limit: 1.5 }).rows.length === 4, 'limit が小数なら既定値で動く');
+  ok(searchSessions({ q: 'みつろう', offset: Infinity }).rows.length === 4, 'offset が Infinity なら 0 として動く');
+  ok(searchSessions({ q: 'みつろう', limit: -5, offset: -1 }).rows.length === 1, '負数は最小・最大に丸める (落ちない)');
+  ok(searchSessions({ q: 'みつろう', limit: 1e9 }).rows.length === 4, '大きすぎる limit も上限で頭打ち');
+
+  // 終わり方の食い違い: 先に pause で閉じた行へ done の再送 → **実際に入っている pause** を返す
+  const px = mk('crew-P');
+  const pxS = startSessions({ pageId: 'crew-p', productCode: 'CREW-P', title: '中断テスト', workers: [px] }).sessions[0].sessionId;
+  stopSessions({ pageId: 'crew-p', sessionIds: [pxS], reason: 'pause' });
+  const late = stopSessions({ pageId: 'crew-p', sessionIds: [pxS], reason: 'done' });
+  ok(late.ok === true && late.stopped[0].already === true && late.stopped[0].end_reason === 'pause',
+    '再送の終わり方が違っても、実際に記録されている方 (pause) を返す');
+
+  // 取り消し済みなのに終わっていない行 (異常データ)。UNIQUE 索引は ended_at IS NULL だけを見るので、
+  // voided を「作業中ではない」と判断すると INSERT が UNIQUE 違反で落ちる → 落とさず理由を返す
+  const zx = mk('crew-Z');
+  const zxS = startSessions({ pageId: 'crew-z', workers: [zx] }).sessions[0].sessionId;
+  getDB().prepare('UPDATE f_iroha_work_sessions SET voided_at = ? WHERE id = ?').run(new Date().toISOString(), zxS);
+  const stuck = startSessions({ pageId: 'crew-z2', workers: [zx] });
+  ok(stuck.ok === false && stuck.error === 'stuck_session' && /crew-Z/.test(stuck.message),
+    '取り消し済みなのに開いたままの記録があれば、落とさず職員に片づけてもらう');
+  ok(startSessions({ pageId: 'crew-z3', workers: [{ id: 0, display_name: 'ゼロ' }] }).error === 'worker_required',
+    'DB 層でも id が 0・負数の作業者は通さない');
 
   // 取り消した記録は既定で出さない (実測から外すのと同じ扱い)
   voidSession(ids[0], 'test@example.com', '押し間違い');

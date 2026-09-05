@@ -438,9 +438,10 @@
       const j = await r.json().catch(() => ({}));
       if (!j.ok) { sum.textContent = '❌ ' + (j.message || 'さがせませんでした'); return; }
       const s = j.summary;
-      sum.innerHTML = '件数 <b>' + s.count + '</b> 件 ／ 合計時間 <b>' + findDur(s.totalSeconds) + '</b>'
+      // 合計時間は**終わったぶんだけ**。作業中はまだ確定していないので足さない (見るたびに増える数字を工賃に使わない)
+      sum.innerHTML = '件数 <b>' + s.count + '</b> 件 ／ 合計時間 (終わったぶん) <b>' + findDur(s.totalSeconds) + '</b>'
         + ' ／ 人数 <b>' + s.workers + '</b> 人 ／ 商品 <b>' + s.products + '</b> 種類 ／ カード <b>' + s.cards + '</b> 枚'
-        + (s.open ? ' ／ <span class="ng">いま作業中 ' + s.open + ' 件</span>' : '');
+        + (s.open ? ' ／ <span class="ng">いま作業中 ' + s.open + ' 件 (合計時間には入れていません)</span>' : '');
       const tbl = document.getElementById('fTbl');
       const head = '<tr><th>いつ</th><th>だれが</th><th>何を</th><th>時間</th><th>終わり方</th><th>いっしょにやった人</th></tr>';
       const rows = j.rows.map((x) => {
@@ -471,7 +472,24 @@
       document.getElementById('fMore').innerHTML = '';
       document.getElementById('fSum').textContent = '条件を入れて「さがす」を押してください。';
     }
-    function csvFind() { window.location.href = BASE + '/admin/sessions/search.csv?' + findParams().toString(); }
+    /** CSV は件数が多すぎると 422 で断られる (欠けたCSVを渡さないため)。理由を画面に出す */
+    async function csvFind() {
+      const url = BASE + '/admin/sessions/search.csv?' + findParams().toString();
+      const r = await fetch(url);
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        document.getElementById('fSum').textContent = '❌ ' + (j.message || 'CSVを出せませんでした');
+        return;
+      }
+      const blob = await r.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = (r.headers.get('content-disposition') || '').match(/filename="([^"]+)"/)?.[1] || 'iroha-work-sessions.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    }
 
     let migPlanId = null;   // 自分が見た調査結果の ID (本取込はこれと一致する結果にだけ)
     function migShow(obj) { const el = document.getElementById('migOut'); el.style.display = 'block'; el.textContent = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 1); }
