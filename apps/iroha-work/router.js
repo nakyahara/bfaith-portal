@@ -50,7 +50,8 @@ function issueUndoTicket(req, data) {
   const now = Date.now();
   for (const [k, v] of undoTickets) if (v.expiresAt <= now) undoTickets.delete(k);
   const token = crypto.randomBytes(18).toString('base64url');
-  const ticket = { ...data, deviceId: req.iwDevice ? req.iwDevice.id : null, sessionUser: req.iwUser || null, expiresAt: now + UNDO_TTL_MS };
+  // 端末 Cookie が無い (ポータルから) ときは、そのブラウザのセッション id に結び付ける — 同じアカウントの別端末では使えない (Codex R2 #3)
+  const ticket = { ...data, deviceId: req.iwDevice ? req.iwDevice.id : null, sessionKey: undoSessionKey(req), expiresAt: now + UNDO_TTL_MS };
   undoTickets.set(token, ticket);
   return { token, expires_in: UNDO_TTL_MS / 1000, ticket };
 }
@@ -59,9 +60,19 @@ function findUndoTicket(req, token, kind, taskId) {
   if (!t) return { error: 'too_late', message: '時間が経ったのでもどせません' };
   if (t.expiresAt <= Date.now()) { undoTickets.delete(token); return { error: 'too_late', message: '時間が経ったのでもどせません' }; }
   if (t.kind !== kind || Number(t.taskId) !== Number(taskId)) return { error: 'bad_request', message: 'この取り消しはこのカードのものではありません' };
-  const same = t.deviceId != null ? !!(req.iwDevice && req.iwDevice.id === t.deviceId) : !!(t.sessionUser && req.iwUser === t.sessionUser);
+  const same = t.deviceId != null ? !!(req.iwDevice && req.iwDevice.id === t.deviceId) : !!(t.sessionKey && undoSessionKey(req) === t.sessionKey);
   if (!same) return { error: 'forbidden', message: 'もどせるのは、止めた iPad からだけです' };
   return { ticket: t };
+}
+function undoSessionKey(req) {
+  if (req.iwDevice) return null;
+  return req.sessionID || (req.iwUser ? `user:${req.iwUser}` : null);
+}
+/** 資材不足の申告を職員に送ったあとで取り消されたとき、取り消しも知らせる (職員が資材を持って来てしまわないように — Codex R1 #11 / R2 #1) */
+function notifyBlockUndone(ticket, who) {
+  notifyStaff(`↩ *取り消し* — いろは在庫化\n「${ticket.title || ''}」の資材不足の申告は、まちがいとして取り消されました (${who.workerName})。資材の手配は不要です`)
+    .then((n) => safeLog({ action: 'notify_materials_shortage_undo', workerId: who.workerId, workerName: who.workerName, deviceLabel: who.deviceLabel, to: n.sent ? 'sent' : `skipped: ${n.reason}`, ok: n.sent }))
+    .catch(() => { /* notifyStaff は throw しない */ });
 }
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
@@ -804,12 +815,16 @@ router.post('/api/block', checkOrigin, api((req, res) => {
     stoppedIds: (r.stopped || []).map((s) => s.id), prev: r.before || null, notified: false, title: r.task.product_name });
   if (r.task.blocked_reason === 'materials_shortage') {
     const dl = deviceLabelOf(req);
+    undo.ticket.notifyPending = true;
     notifyStaff(materialsShortageText({ title: r.task.product_name, productCode: r.task.product_code, note: r.task.blocked_note,
       workerName: w.worker.display_name, deviceLabel: dl }))
       .then((n) => {
+        undo.ticket.notifyPending = false;
         undo.ticket.notified = !!n.sent;   // 取り消されたら「取り消し」も知らせるため (Codex R1 #11)
         safeLog({ action: 'notify_materials_shortage', workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: dl,
           to: n.sent ? 'sent' : `skipped: ${n.reason}`, ok: n.sent });
+        // 送っている間に取り消されていたら、ここで取り消しも知らせる (Codex R2 #1)
+        if (n.sent && undo.ticket.undone) notifyBlockUndone(undo.ticket, undo.ticket.undone);
       })
       .catch(() => { /* notifyStaff は throw しない */ });
   }
@@ -860,11 +875,10 @@ router.post('/api/undo', checkOrigin, api((req, res) => {
   // 切符は 1 回きり。「別の作業中」で断ったときだけ残す (その人の作業が止まれば、まだもどせる)
   if (r.ok || r.error !== 'busy') undoTickets.delete(req.body.token);
   if (!r.ok) return res.status(UNDO_HTTP[r.error] || taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
-  // 資材不足の申告を職員に送っていたなら、取り消しも知らせる (職員が資材を持って来てしまわないように — Codex R1 #11)
-  if (kind === 'block' && ticket.notified) {
-    notifyStaff(`↩ *取り消し* — いろは在庫化\n「${ticket.title || ''}」の資材不足の申告は、まちがいとして取り消されました (${w.worker.display_name})。資材の手配は不要です`)
-      .then((n) => safeLog({ action: 'notify_materials_shortage_undo', workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: dl, to: n.sent ? 'sent' : `skipped: ${n.reason}`, ok: n.sent }))
-      .catch(() => { /* notifyStaff は throw しない */ });
+  // 資材不足の申告を職員に送っていたなら、取り消しも知らせる。まだ送っている途中なら、送り終わった側 (block の then) が知らせる (Codex R1 #11 / R2 #1)
+  if (kind === 'block') {
+    ticket.undone = { workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: dl };
+    if (ticket.notified && !ticket.notifyPending) notifyBlockUndone(ticket, ticket.undone);
   }
   res.json({ ok: true, task: publicTask(getTask(taskId)), reopened: r.reopened || [], skipped: r.skipped || [], serverNow: new Date().toISOString() });
 }));
@@ -1035,17 +1049,21 @@ router.get('/api/daily-report', api((req, res) => {
   const dayEnd = Date.parse(page.endUtc);
   const isToday = nowMs >= dayStart && nowMs < dayEnd;
   const byWorker = new Map();
+  const seenCards = new Set();
   for (const s of page.rows) {
     // ⭐その日にかかっている分だけ数える。日をまたいだ記録・開きっぱなしの記録を、その日の外へ伸ばさない (Codex R1 #8)。
     //   「作業中」は今日だけ。過去の日に残った開きっぱなしは、その日の終わりまでとして確定ぶんに数える
     const st = Date.parse(s.started_at);
     const en = s.ended_at ? Date.parse(s.ended_at) : Math.min(nowMs, dayEnd);
-    const sec = Math.max(0, Math.floor((Math.min(en, dayEnd) - Math.max(st, dayStart)) / 1000));
+    const overlapMs = Math.min(en, dayEnd) - Math.max(st, dayStart);
+    if (!(overlapMs > 0)) continue;   // その日に 1 秒もかかっていない (未来の日・境界ちょうどに終わった記録) は数えない (Codex R2 #4)
+    const sec = Math.floor(overlapMs / 1000);
     const live = !s.ended_at && isToday;
     const key = Number(s.worker_id);
     if (!byWorker.has(key)) byWorker.set(key, { worker_id: key, worker_name: s.worker_name, total_seconds: 0, live_seconds: 0, active: 0, sessions: 0, items: new Map() });
     const wv = byWorker.get(key);
     const ck = s.task_id != null ? `t${s.task_id}` : `p${s.page_id}`;
+    seenCards.add(ck);
     if (!wv.items.has(ck)) wv.items.set(ck, { task_id: s.task_id, page_id: s.page_id, title: s.title_snapshot || '(名称なし)', product_code: s.product_code, seconds: 0, live_seconds: 0, sessions: 0, active: 0 });
     const it = wv.items.get(ck);
     it.sessions += 1; wv.sessions += 1;
@@ -1059,7 +1077,7 @@ router.get('/api/daily-report', api((req, res) => {
     ok: true, date, workers, truncated: !!page.truncated,
     totals: {
       seconds: workers.reduce((a, x) => a + x.total_seconds, 0), workers: workers.length,
-      cards: new Set(page.rows.map((s) => (s.task_id != null ? `t${s.task_id}` : `p${s.page_id}`))).size,
+      cards: seenCards.size,
       active: workers.reduce((a, x) => a + x.active, 0),
     },
     serverNow: new Date().toISOString(),

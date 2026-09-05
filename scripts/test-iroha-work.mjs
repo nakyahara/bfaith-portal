@@ -2907,16 +2907,33 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     const otherSid2 = db.prepare('SELECT id FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL').get(other).id;
     await call('POST', '/api/sessions/stop', { cookie, body: { id: other, worker_id: w2.id, session_ids: [otherSid2], reason: 'pause' } });
     ok((await undo({ kind: 'block', token: blkB.json.undo.token })).status === 200 && TD.getTask(uid).blocked_reason === null, '別の作業を止めたら、切符が生きている間はもどせる');
+    // 送っている途中で取り消されても、送り終わったあとに取り消しを知らせる (Codex R2 #1)
+    N.setNotifySender(async (hook, text) => { await new Promise((r) => setTimeout(r, 120)); sent.push({ hook, text }); });
+    const blkS = await call('POST', '/api/block', { cookie, body: { id: uid, worker_id: w2.id, reason: 'materials_shortage', note: 'すぐ取り消す', expect_version: v() } });
+    ok(blkS.status === 200 && (await undo({ kind: 'block', token: blkS.json.undo.token })).status === 200, '前提: 送信が終わる前に取り消す');
+    await new Promise((r) => setTimeout(r, 450));
+    ok(sent.length === 4 && /すぐ取り消す/.test(sent[2].text) && /取り消し/.test(sent[3].text), '送信が終わったあとに取り消しの知らせも届く');
+    N.setNotifySender(async (hook, text) => { sent.push({ hook, text }); });
+    // 切符に書いた記録が変えられていたら、札も外さない (Codex R2 #2)
+    const blkV = await call('POST', '/api/block', { cookie, body: { id: uid, worker_id: w2.id, reason: 'awaiting_instruction', expect_version: v() } });
+    ok(blkV.status === 200 && blkV.json.stopped.length === 1, '前提: 指示待ちで止める');
+    const stoppedId = blkV.json.stopped[0].id;
+    db.prepare("UPDATE f_iroha_work_sessions SET voided_at = ?, voided_by = 'test', void_reason = 'test' WHERE id = ?").run(new Date().toISOString(), stoppedId);
+    const ubV = await undo({ kind: 'block', token: blkV.json.undo.token });
+    ok(ubV.status === 409 && ubV.json.error === 'conflict' && TD.getTask(uid).blocked_reason === 'awaiting_instruction', '止めた記録が取り消されていたら札も外さない (409 conflict)');
+    ok((await undo({ kind: 'block', token: blkV.json.undo.token })).status === 409, 'conflict で切符は消える');
+    db.prepare('UPDATE f_iroha_work_sessions SET voided_at = NULL, voided_by = NULL, void_reason = NULL WHERE id = ?').run(stoppedId);
+    ok(TD.clearTaskBlock({ taskId: uid, via: 'test' }).ok, '後片づけ: 札を外す');
     // 通知先が未設定なら送らない (操作は成立)
     delete process.env.GCHAT_WEBHOOK_IROHA;
     const blk2 = await call('POST', '/api/block', { cookie, body: { id: uid, worker_id: w2.id, reason: 'materials_shortage', note: '20L が足りない', expect_version: v() } });
     await new Promise((r) => setTimeout(r, 40));
-    ok(blk2.status === 200 && sent.length === 2
+    ok(blk2.status === 200 && sent.length === 4
       && /skipped: no_webhook/.test(db.prepare("SELECT to_value FROM f_iroha_app_events WHERE action = 'notify_materials_shortage' ORDER BY id DESC LIMIT 1").get().to_value),
       '通知先 (GCHAT_WEBHOOK_IROHA) が未設定でも札は付き、送らなかったことだけ履歴に残る');
     await undo({ kind: 'block', token: blk2.json.undo.token });
     await new Promise((r) => setTimeout(r, 40));
-    ok(sent.length === 2, '送っていない申告の取り消しは知らせない');
+    ok(sent.length === 4, '送っていない申告の取り消しは知らせない');
     // 送信が失敗しても本体は成立
     process.env.GCHAT_WEBHOOK_IROHA = 'https://chat.example/hook';
     N.setNotifySender(async () => { throw new Error('chat down (test)'); });
@@ -2943,6 +2960,9 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     ok(repY.status === 200 && yRow && yRow.items.length === 1 && yRow.items[0].seconds === 1800 && yRow.active === 0, '日報: 前の日には前の日の分 30 分だけ (作業中としては数えない)');
     ok((await call('GET', '/api/daily-report?date=2026-02-30', { cookie })).status === 400 && (await call('GET', '/api/daily-report?date=abc', { cookie })).status === 400, '日報: 存在しない日付は 400');
     ok((await call('GET', '/api/daily-report', { cookie })).json.date === today, '日報: 日付を省くと今日');
+    const future = new Date(Date.now() + 9 * 3600 * 1000 + 3 * 86400000).toISOString().slice(0, 10);
+    const repF = await call('GET', '/api/daily-report?date=' + future, { cookie });
+    ok(repF.status === 200 && repF.json.workers.length === 0 && repF.json.totals.cards === 0, '日報: 未来の日には何も出ない (開きっぱなしの記録を 0 秒で並べない — Codex R2 #4)');
     N.setNotifySender(null);
     if (savedHook == null) delete process.env.GCHAT_WEBHOOK_IROHA; else process.env.GCHAT_WEBHOOK_IROHA = savedHook;
     setMetaValue('source_of_truth', src0);   // 元の正本に戻す (直前のテストが null = 既定 notion にしている)

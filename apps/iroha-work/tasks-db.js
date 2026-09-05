@@ -486,6 +486,8 @@ export function undoTaskBlock({ taskId, expectVersion = null, sessionIds = null,
         ? (ids.length ? db.prepare(`SELECT id, worker_id, worker_name, started_at FROM f_iroha_work_sessions
             WHERE task_id = ? AND end_reason = 'pause' AND ended_at = ? AND voided_at IS NULL AND id IN (${ids.map(() => '?').join(',')})`).all(t.id, t.blocked_at, ...ids) : [])
         : db.prepare("SELECT id, worker_id, worker_name, started_at FROM f_iroha_work_sessions WHERE task_id = ? AND end_reason = 'pause' AND ended_at = ? AND voided_at IS NULL").all(t.id, t.blocked_at);
+      // 切符に書いた記録が 1 つでも見つからない (取り消された・変えられた) なら戻さない (Codex R2 #2)
+      if (ids && stopped.length !== new Set(ids).size) return { ok: false, error: 'conflict', message: '止めた記録が変わったのでもどせません。最新の状態を表示します', current: t };
       // ⭐全員戻せるときだけ戻す — 札だけ外れて一部のタイマーが止まったまま、という状態を作らない (Codex R1 #5)
       const openOf = db.prepare('SELECT id FROM f_iroha_work_sessions WHERE worker_id = ? AND ended_at IS NULL LIMIT 1');
       for (const s of stopped) {
