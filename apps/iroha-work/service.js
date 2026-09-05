@@ -311,10 +311,10 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
  *   carry_over = やり残し (今日より前の予定で、まだ終わっていない)。**自動では動かさない**
  * 画面は 4〜6 時間を目安に選ぶ。超えても入れられる (ハードな上限にしない)
  */
-export function buildPlan() {
+export function buildPlan({ readOnly = false } = {}) {
   const today = jstToday();
   const tomorrow = jstTomorrow(today);
-  const { cards } = buildTaskCards(listOpenTasks({}));
+  const { cards } = buildTaskCards(listOpenTasks({}), { readOnly });
   const byWhen = (w) => cards.filter((c) => c.when === w).sort(comparePlanOrder);
   const tomorrowCards = byWhen('tomorrow');
   const facilities = listFacilities();

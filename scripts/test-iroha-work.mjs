@@ -2275,6 +2275,31 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         const optBefore = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c;
         const optRes = await call('POST', '/api/options', { cookie, body: { id: open.id, kind: 'material', code: 'PREVIEW-X', worker_id: staff2.id, pin: '4649' } });
         ok(optRes.status === 409 && optRes.json.error === 'notion_mode', '下見の id を添えた選択肢の登録は 409');
+        // ⭐下見でも「明日の計画」は読むだけで開ける (切替の前に形を見せる — 要件 §W-9b)
+        {
+          const pv = await call('GET', '/api/plan', { cookie });
+          ok(pv.status === 200 && pv.json.ok && pv.json.preview === true, '下見でも明日の計画が開ける (preview=true)');
+          ok(Array.isArray(pv.json.candidates) && Array.isArray(pv.json.tomorrow) && Array.isArray(pv.json.carry_over)
+            && pv.json.totals && pv.json.target_hours, '候補・明日やる分・やり残し・合計・目安が入っている');
+          ok(pv.json.candidates.every((c) => c.when == null && c.status === 'not_started'), '候補の条件は正本と同じ');
+          // 職員でなくても読める (下見は誰でも読むだけ = ボード・履歴と同じ)
+          // 職員モードでなくても読める (下見は誰でも読むだけ = ボード・履歴と同じ)。
+          // 端末 Cookie だけの利用者として叩く (直前と同じ状態で 2 回叩くだけにしない)
+          await call('POST', '/api/staff-lock', { cookie });
+          const asMemberPlan = await call('GET', '/api/plan', { cookie });
+          ok(asMemberPlan.status === 200 && asMemberPlan.json.preview === true, '職員モードでなくても読める');
+          // ⭐読むだけ = DB を 1 行も変えない (total_changes は全テーブルの書き込みを数える)
+          const ch0 = db.prepare('SELECT total_changes() AS n').get().n;
+          await call('GET', '/api/plan', { cookie });
+          await call('GET', '/api/preview-tasks', { cookie });
+          ok(db.prepare('SELECT total_changes() AS n').get().n === ch0, '下見の読み取りで DB は 1 行も変わらない');
+          // 書き変えは今までどおり断る
+          const openId = db.prepare("SELECT id FROM f_iroha_tasks WHERE status != 'closed' ORDER BY id LIMIT 1").get().id;
+          const w409 = await call('POST', '/api/plan', { cookie, body: { id: openId, when: 'tomorrow', expect_version: 1, worker_id: w1.id } });
+          ok(w409.status === 409 && w409.json.error === 'notion_mode', '下見のあいだは「いつ」を変えられない');
+          const f409 = await call('POST', '/api/facility', { cookie, body: { id: openId, facility_code: 'iroha', expect_version: 1, worker_id: w1.id } });
+          ok(f409.status === 409 && f409.json.error === 'notion_mode', '「どこが」も変えられない');
+        }
         ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_options').get().c === optBefore, '選択肢も増えていない');
         // ⭐読むだけの詳細は、写真の「実体が無い」印すら書かない (開くだけで DB が変わらない — Codex PR1 R8)
         {
@@ -3022,12 +3047,13 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v5'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v6'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
-  ok(/if \(v === 'plan' && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
-    '許可が無ければ計画の画面に入れない (古い画面からの復帰でも)');
-  ok(/function openPlanPage\(\) \{[\s\S]{0,80}if \(!stateCan\('task\.plan\.assign'\)\) return;/.test(html), 'ゲージからの入口でも許可を見る');
+  ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
+    'アプリ正本のときは職員しか計画の画面に入れない (下見は誰でも読むだけ)');
+  ok(/function openPlanPage\(\) \{[\s\S]{0,120}if \(isApp\(\) && !stateCan\('task\.plan\.assign'\)\) return;/.test(html),
+    'ゲージからの入口でも許可を見る (下見は誰でも読むだけ)');
   ok(/async function loadPlanOnce\(\)/.test(html) && /if \(await askStaffUnlock\(\)\) \{ await loadState\(\); planGen = gen - 1; return loadPlanOnce\(\); \}/.test(html),
     '職員モードが切れていたら PIN を聞いて開き直す');
   ok(/const gen = \+\+planGen;/.test(html) && /if \(gen !== planGen\) return;/.test(html),
@@ -3035,18 +3061,18 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const next = planInflight \? planInflight\.catch\(\(\) => \{\}\)\.then\(\(\) => loadPlanOnce\(\)\) : loadPlanOnce\(\);/.test(html),
     '変えた後の取り直しは、変える前に始まった取得を使い回さない');
   ok(/if \(!planData\) \$\('#planCand'\)\.innerHTML/.test(html), 'つながらないときは前回の中身を消さない');
-  ok(/やり残し ' \+ carry\.length \+ ' 件 — どうしますか \(自動では動かしません\)/.test(html)
-    && /\['明日やる', 'primary', 'tomorrow'\]/.test(html) && /\['未定に戻す', 'warn', 'none'\]/.test(html),
-    'やり残しは先頭に出して、職員が「明日やる / 今日やる / 未定に戻す」を選ぶ');
+  ok(/const carryActs = ro \? \[\] : \[/.test(html) && /\['明日やる', 'primary', 'tomorrow'\]/.test(html)
+    && /\['未定に戻す', 'warn', 'none'\]/.test(html),
+    'やり残しは先頭に出して、職員が「明日やる / 今日やる / 未定に戻す」を選ぶ (下見では操作を描かない)');
   ok(/選ぶたびに保存されます \(確定ボタンはありません\)/.test(html), '選ぶたびに保存 (確定ボタンを作らない)');
   ok(/if \(when === 'tomorrow' && planCard\(id\) && stateCan\('task\.facility\.assign'\)\)/.test(html),
     '「明日やる」に積むときは、拠点が決まっていても確認してから積む (いまの拠点を選んだ状態で出す)');
   ok(/'まだ決めない' : '未定にする'/.test(html), '積む流れでは「まだ決めない」も選べる (決まっていなくても積める)');
-  ok(/const pileActs = stateCan\('task\.facility\.assign'\) \? \[\['どこが'/.test(html),
-    '「どこが」のボタンは許可があるときだけ描く (無効化して見せない)');
-  ok(/if \(!stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+planData = null;\r?\n\s+clearPlanDom\(\);/.test(html)
+  ok(/const pileActs = ro \? \[\]\r?\n\s+: stateCan\('task\.facility\.assign'\) \? \[\['どこが'/.test(html),
+    '「どこが」のボタンは許可があるときだけ描く (下見では操作そのものを描かない)');
+  ok(/if \(isApp\(\) && !stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+planData = null;\r?\n\s+clearPlanDom\(\);/.test(html)
     && /function clearPlanDom\(\)/.test(html),
-    '計画の許可を失ったら、描いたものを消す (隠すだけにしない — hidden の画面に押せるボタンを残さない)');
+    '計画の許可を失ったら、描いたものを消す (隠すだけにしない)。下見では閉じない');
   ok(/\} else if \(planData\) \{\r?\n\s+renderPlan\(\);/.test(html),
     '許可が変わったら計画の中身を描き直す (「どこが」だけ失った場合もボタンが消える)');
   ok(/facPickCtx = \{ id, thenWhen: null, saving: false \};/.test(html),
@@ -3072,8 +3098,12 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // ══ P2: ボードに 3 軸を載せる (要件 §W-4) ══
   ok(/<div id="gaugeWrap"><\/div>/.test(html) && !/class="gauge"/.test(html.slice(0, html.indexOf('<script'))),
     '明日やる分のゲージは静的に置かない (職員のときだけボタンにする)');
-  ok(/if \(!isApp\(\)\) return '<div class="gauge">' \+ inner \+ '<span class="staff">見るだけ \(正本はまだ Notion\)<\/span><\/div>';/.test(html),
-    '下見のあいだもゲージは出す (見るだけと書く)');
+  ok(/if \(!isApp\(\)\) \{\r?\n\s+return '<button class="gauge" onclick="openPlanPage\(\)">' \+ inner \+\r?\n\s+'<span class="go">明日の計画 ›<\/span><span class="staff">見るだけ \(正本はまだ Notion\)<\/span><\/button>';/.test(html),
+    '下見のあいだもゲージから「明日の計画」を開ける (読むだけ・「見るだけ」と書く)');
+  ok(/const ro = !!d\.preview \|\| !isApp\(\) \|\| !stateCan\('task\.plan\.assign'\);/.test(html),
+    '計画画面の操作は、応答の preview だけでなく「いまの正本と許可」でも描き分ける (取ってから描くまでに戻ることがある)');
+  ok(/planData = null;\r?\n\s+planGen \+= 1;\r?\n\s+clearPlanDom\(\);/.test(html),
+    '正本が変わったら計画のデータを捨て、世代を進めて古い応答も捨てる');
   ok(/if \(!stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+return '<div class="gauge">' \+ inner \+ '<span class="staff">明日の計画を決められるのは職員です/.test(html),
     '許可が無ければゲージはただの表示 (「明日の計画 ›」の入口を描かない)');
   // ⭐職員モードに入る入口 (これが無いと、計画の操作が一生描かれない)
@@ -3095,9 +3125,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /dropPlanCaps\(\);\r?\n\s+toast\('職員モードを終わりました'\);/.test(html),
     '終わるときは取り直しの成功に頼らない (通信が失敗しても「終わったのにボタンが残る」を作らない)');
   ok(/renderStaffBtn\(\);   \/\/ 職員を選んだら/.test(html), '作業者を選び直したらボタンも出し直す');
-  ok(/function planTagsHtml\(c\)/.test(html) && /const canFac = stateCan\('task\.facility\.assign'\);/.test(html)
-    && /const canWhen = stateCan\('task\.plan\.assign'\);/.test(html),
-    'カードの「どこが」「いつ」の札は許可リストで出し分ける');
+  ok(/const canFac = isApp\(\) && stateCan\('task\.facility\.assign'\);/.test(html)
+    && /const canWhen = isApp\(\) && stateCan\('task\.plan\.assign'\);/.test(html),
+    'カードの「どこが」「いつ」の札は許可リストで出し分ける (下見では span = 見るだけ)');
   ok(/canFac\s*\r?\n?\s*\? '<button class="tag ' \+ facCls \+ '" data-fac-of=/.test(html) && /: '<span class="tag ' \+ facCls \+ '"/.test(html),
     '許可が無ければ札は span で描く (ボタンを描いて無効にしない)');
   ok(/function toggleTomorrow\(id, want\) \{\r?\n\s+if \(!stateCan\('task\.plan\.assign'\)\) return;/.test(html)
