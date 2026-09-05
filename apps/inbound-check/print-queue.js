@@ -198,6 +198,18 @@ export function enqueuePrintJob({ batchId, lineKey, copies, packQty = null, targ
     const target = resolvePrintTarget(targetDeviceId);
     if (!target.ok) return target;
     const now = utcNow();
+    if (acked != null) {
+      // 🚨 人が「出ていない」と確認して再発行する = 旧ジョブの結果はここで確定。以後、旧 lease の遅延報告
+      //    (unknown → completed) を受け付けると、新ジョブと合わせて2枚出る (Codex R2 High)。
+      //    lease_token を消して報告の照合を通らなくし、同じトランザクションで CAS (状態が動いていたらやり直し)
+      const fix = db.prepare(`UPDATE f_inbound_check_print_jobs SET lease_token = NULL, acknowledged_at = ?, updated_at = ?,
+        error = COALESCE(error, '') || ' / 実物を確認して再発行 (出ていない)' WHERE id = ? AND state = 'unknown' AND acknowledged_at IS NULL`)
+        .run(now, now, acked);
+      if (fix.changes !== 1) {
+        const cur = db.prepare('SELECT * FROM f_inbound_check_print_jobs WHERE id = ?').get(acked);
+        return { ok: false, error: 'confirm_unknown', message: '前回のジョブの状態が変わりました。画面を更新してもう一度確認してください', job: publicJob(cur) };
+      }
+    }
     const info = db.prepare(`INSERT INTO f_inbound_check_print_jobs
       (client_request_id, batch_id, line_key, code_key, product_code, product_name, barcode, barcode_type, pack_qty, copies,
        printer_name, target_device_id, requested_by, requested_device, acknowledged_job_id, state, created_at, updated_at)
@@ -218,6 +230,7 @@ export function publicJob(row) {
     barcode: row.barcode, barcode_type: row.barcode_type, pack_qty: row.pack_qty, copies: row.copies,
     printer_name: row.printer_name, target_device_id: row.target_device_id,
     requested_by: row.requested_by, error: row.error, acknowledged_job_id: row.acknowledged_job_id ?? null,
+    acknowledged_at: row.acknowledged_at ?? null,
     created_at: row.created_at, updated_at: row.updated_at, submitted_at: row.submitted_at, finished_at: row.finished_at,
   };
 }
@@ -314,7 +327,9 @@ export function markSubmitted(jobId, { deviceId, leaseToken, spoolJobId = null, 
  *   - ⭐期限切れで unknown に倒した後に**同じ lease の報告が遅れて届いた**ときは受け付けて上書きする
  *     (unknown → completed / failed)。エージェントが再起動後に台帳から報告してくる経路で、
  *     「実物を確認」より確かな情報なので捨てない。ただし一度でも投入済み (submitted_at あり) なら failed にはしない。
- *     completed / failed / manual からは動かさない
+ *     completed / failed / manual からは動かさない。
+ *     🚨 ただし人が実物を確認して再発行した後 (acknowledged_at あり = enqueue が lease_token を消している) は
+ *        旧 lease の遅延報告を受け付けない — 受けると新ジョブと合わせて2枚出る (Codex R2 High)
  * 🚨「刷れなかった」と「紙が出たか分からない」を混ぜない — failed は「もう一度押してよい」を意味する
  */
 export function markFinished(jobId, { deviceId, leaseToken, ok, error = null, uncertain = false, now = utcNow() }) {

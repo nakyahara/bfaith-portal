@@ -225,6 +225,13 @@ console.log('\n[6] 失敗 (failed) と結果不明 (unknown) を混ぜない');
   ok(!wrongAck.ok && wrongAck.error === 'confirm_unknown', '古いジョブIDの証跡では積めない (画面が古い)');
   const withAck = enqueuePrintJob({ batchId: batch.id, lineKey: L1, copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: j2c.id });
   ok(withAck.ok && withAck.job.acknowledged_job_id === j2c.id, '最新の unknown ジョブIDを証跡にすれば積める');
+  // 🚨 再発行した後に旧ジョブの遅延完了報告が届いても受け付けない (受けると新ジョブと合わせて2枚出る — Codex R2 High)
+  const lateOld = markFinished(j2c.id, { deviceId: agentRow.id, leaseToken: j2c.leaseToken, ok: true });
+  ok(!lateOld.ok && stateOf(j2c.id) === 'unknown', '実物確認して再発行した後は、旧 lease の遅延完了報告を拒否 (unknown のまま)');
+  const oldRow = db.prepare('SELECT lease_token, acknowledged_at, error FROM f_inbound_check_print_jobs WHERE id=?').get(j2c.id);
+  ok(oldRow.lease_token === null && oldRow.acknowledged_at && /実物を確認して再発行/.test(oldRow.error), '旧ジョブに確認時刻と理由が残り、lease は無効化される');
+  const twice = enqueuePrintJob({ batchId: batch.id, lineKey: L1, copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: j2c.id });
+  ok(!twice.ok && twice.error === 'in_progress', '同じ証跡で二重に積めない (新ジョブが進行中)');
   const j2d = leaseNextJob(agentRow);
   markFinished(j2d.id, { deviceId: agentRow.id, leaseToken: j2d.leaseToken, ok: false, error: 'template missing' });
   eq(stateOf(j2d.id), 'failed', 'leased からの ok:false (uncertain:false) は failed のまま');
