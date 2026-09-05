@@ -311,7 +311,11 @@
       <div class="iw-findbtns">
         <button class="btn-sm" onclick="findSessions(0)">さがす</button>
         <button class="btn-sm" onclick="clearFind()">条件をクリア</button>
-        <button class="btn-sm" onclick="csvFind()">📄 CSVでダウンロード</button>
+        <% if (isAdmin) { %>
+          <button class="btn-sm" onclick="csvFind()">📄 CSVでダウンロード</button>
+        <% } else { %>
+          <span class="hint" style="margin:0">CSV の書き出しは管理者のみです (まとめて持ち出せるため)。</span>
+        <% } %>
       </div>
       <div class="iw-sum" id="fSum">条件を入れて「さがす」を押してください。</div>
       <table class="iw-list" id="fTbl" style="display:none"></table>

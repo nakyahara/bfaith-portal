@@ -1570,8 +1570,13 @@ router.get('/admin/sessions/search', requireSession, api((req, res) => {
 /** CSV に入れられる上限。これを超えたら**欠けたCSVを渡さず**条件を絞ってもらう */
 const CSV_MAX_ROWS = 5000;
 
-/** 同じ条件を CSV で (工賃の計算・実績報告に使う)。Excel が文字化けしないよう BOM 付き UTF-8 */
-router.get('/admin/sessions/search.csv', requireSession, api((req, res) => {
+/**
+ * 同じ条件を CSV で (工賃の計算・実績報告に使う)。Excel が文字化けしないよう BOM 付き UTF-8。
+ * ⭐**管理者だけ** (中原さん 2026-09-05)。画面で1件ずつ見るのと違い、CSV は
+ * 利用者の作業時間・誰と作業したかを**まとめて持ち出せる**ため (Codex レビュー指摘)。
+ * 出したこと自体も操作履歴に残す (下の safeLog)
+ */
+router.get('/admin/sessions/search.csv', requireAdmin, api((req, res) => {
   const p = parseSearchQuery(req);
   if (p.error) return res.status(400).json({ ok: false, error: 'bad_request', message: p.error });
   // ⭐先頭 500 件だけを「正しいCSV」として渡さない。工賃の計算に使うので、

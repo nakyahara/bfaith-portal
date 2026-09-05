@@ -41,11 +41,13 @@ icCreateTables(getDB());
 // 正本をアプリにする (いまの本番と同じ経路を通す)
 setMetaValue('source_of_truth', 'app');
 
-// ポータルにログイン済みの職員として通す (認証そのものは別のテストの担当)
+// ポータルにログイン済みの職員として通す (認証そのものは別のテストの担当)。
+// role はテストの途中で切り替える — CSV は管理者だけなので、両方の立場で確かめる
+let sessionRole = 'admin';
 const app = express();
 app.use(express.json());
 app.use((req, _res, next) => {
-  req.session = { authenticated: true, email: 'test@b-faith.biz', displayName: 'テスト', allowedApps: '*' };
+  req.session = { authenticated: true, email: 'test@b-faith.biz', displayName: 'テスト', allowedApps: '*', role: sessionRole };
   next();
 });
 app.use('/apps/iroha-work', router);
@@ -249,6 +251,21 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
   ok(over.status === 422 && /しぼって/.test(over.json.message), '5000件を超えたら 422 で断る (欠けたCSVを出さない)');
   const okCsv = await get('/admin/sessions/search.csv?q=' + encodeURIComponent('みつろう'));
   ok(okCsv.status === 200, '条件を絞れば出せる');
+
+  // ⭐CSV は管理者だけ (中原さん 2026-09-05)。画面で見るのと違い、利用者の作業時間を
+  //   まとめて持ち出せるため。検索そのもの (画面) は職員も使える
+  sessionRole = 'user';
+  const denied = await get('/admin/sessions/search.csv?q=' + encodeURIComponent('みつろう'));
+  ok(denied.status === 403 && denied.json.error === 'forbidden', '管理者でなければ CSV は 403');
+  ok(!/みつろう/.test(denied.text), '断ったときに中身を漏らさない');
+  ok((await get('/admin/sessions/search?q=' + encodeURIComponent('みつろう'))).status === 200,
+    '画面の検索は管理者でなくても使える (いろはアプリを許可された職員)');
+  sessionRole = 'admin';
+  ok((await get('/admin/sessions/search.csv?q=' + encodeURIComponent('みつろう'))).status === 200, '管理者に戻せば出せる');
+
+  // CSV を出したことは操作履歴に残す (誰がいつ何件持ち出したか)
+  const logged = getDB().prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'sessions_csv'").get().c;
+  ok(logged >= 1, 'CSV の書き出しが操作履歴に残る');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
