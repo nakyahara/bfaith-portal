@@ -3086,7 +3086,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v7'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v8'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -3147,6 +3147,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function gaugeHtml\(totals, target\)/.test(html) && /const p = totals \|\| \(\(boardState\(\) \|\| \{\}\)\.tomorrow_plan\)/.test(html)
     && /const lo = \(target \|\| \{\}\)\.min \?\? 4;/.test(html),
     'ゲージは見せる数字を受け取る (中で一覧を見ると、計画を変えた直後に画面の中で食い違う)');
+  ok(/const band = 'left:' \+ \(lo \/ full \* 100\) \+ '%;width:' \+ \(\(hi - lo\) \/ full \* 100\) \+ '%';/.test(html)
+    && /<span class="band" style="' \+ band \+ '">/.test(html) && !/\.band\{[^}]*left:50%/.test(html),
+    '目安の帯も lo〜hi から描く (決め打ちだと、目安を変えたとき帯だけ元の位置に残る)');
   // ══ ドラッグ＆ドロップ (中原さん 2026-09-05) ══
   ok(/window\.addEventListener\('pointermove', dndMove/.test(html) && /window\.addEventListener\('pointerup', dndDrop\);/.test(html)
     && !/addEventListener\('dragstart'/.test(html),
@@ -3172,16 +3175,17 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /async function dndDrop\(ev\) \{\r?\n\s+if \(!DND\.on \|\| ev\.pointerId !== DND\.pointerId\) return;/.test(html)
     && /function dndCancel\(ev\) \{\r?\n\s+if \(ev && DND\.on && ev\.pointerId !== DND\.pointerId\) return;/.test(html),
     '動かす・落とす・やめる は**掴んだ指のイベントだけ**見る (別の指で他のカードが飛ばない)');
-  ok(/dndEatClick = true;/.test(html) && /if \(!dndEatClick\) return;/.test(html)
+  ok(/dndEatClick = \{ x: ev\.clientX, y: ev\.clientY, until: Date\.now\(\) \+ 400 \};/.test(html)
+    && /if \(Math\.abs\(ev\.clientX - e\.x\) > 12 \|\| Math\.abs\(ev\.clientY - e\.y\) > 12\) return;/.test(html)
     && /ev\.stopPropagation\(\); ev\.preventDefault\(\);\r?\n\s*\}, true\);/.test(html),
-    '動かした後の click は 1 回捨てる (列を移したのに詳細まで開かないように)');
+    '動かした後の click は 1 回捨てる。⭐落としたところ・その直後に限る (次の操作を飲まない)');
   ok(/if \(e\.target\.closest\('\[data-grip\]'\)\) e\.stopPropagation\(\);/.test(html),
     '掴み手のタップでは詳細を開かない');
   ok(/window\.addEventListener\('lostpointercapture'/.test(html) && /window\.addEventListener\('blur', \(\) => dndCancel\(\)\);/.test(html),
     '掴んだカードが消えても後始末する (ゴーストが残ると何も押せなくなる)');
-  ok(/function renderBoard\(\) \{\r?\n\s+if \(DND\.on\) dndCancel\(\);/.test(html)
-    && /function renderPlan\(\) \{\r?\n\s+if \(DND\.on\) dndCancel\(\);/.test(html),
-    '描き直すときは掴みを外す (掴んでいたカードが入れ替わらないように)');
+  ok(/if \(DND\.on && DND\.kind === 'board'\) dndCancel\(\);/.test(html)
+    && /if \(DND\.on && DND\.kind === 'plan'\) dndCancel\(\);/.test(html),
+    '描き直すときは掴みを外す。⭐その画面のドラッグだけ (計画で掴んでいる最中に一覧が返っても巻き込まない)');
   ok(/if \(!stSaving && !reconnectTimer && !DND\.on\) loadState\(\);/.test(html),
     'ドラッグの最中は自動の取り直しを待つ');
   ok(/const DRAG_START_PX = 8;/.test(html) && /if \(!moved\) return;\s*\/\/ 動いていない = ふつうのタップ/.test(html),

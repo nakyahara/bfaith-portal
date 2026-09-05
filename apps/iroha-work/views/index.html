@@ -157,7 +157,7 @@
   .gauge .big small{font-size:.78rem;color:var(--sub);margin:0 5px 0 2px;font-weight:600}
   .gauge .bar{position:relative;flex:1;min-width:80px;max-width:200px;height:12px;background:#fff;
     border:1px solid #C9D7FF;border-radius:999px;overflow:hidden}
-  .gauge .bar .band{position:absolute;top:0;bottom:0;left:50%;width:25%;background:var(--ok-soft);
+  .gauge .bar .band{position:absolute;top:0;bottom:0;background:var(--ok-soft);
     border-left:2px solid var(--ok);border-right:2px solid var(--ok)}
   .gauge .bar .fill{position:absolute;top:0;bottom:0;left:0;background:var(--accent);transition:width .25s}
   .gauge .bar .fill.over{background:var(--amber)}
@@ -1207,7 +1207,10 @@ function gaugeHtml(totals, target) {
   const hi = (target || {}).max ?? 6;
   const h = Math.floor(p.hours);
   const m = Math.round((p.hours - h) * 60);
-  const pct = Math.min(100, (p.hours / (hi + 2)) * 100);
+  const full = hi + 2;                                   // 目盛りいっぱい (目安より少し先まで見せる)
+  const pct = Math.min(100, (p.hours / full) * 100);
+  // ⭐目安の帯も lo〜hi から描く。ここを決め打ちにすると、目安を変えたとき帯だけ元の位置に残る (Codex R2 中1)
+  const band = 'left:' + (lo / full * 100) + '%;width:' + ((hi - lo) / full * 100) + '%';
   const over = p.hours > hi;
   const st = p.hours < lo ? ['under', p.count + ' 件 · あと ' + fmtHours(lo - p.hours) + ' で目安']
     : p.hours <= hi ? ['ok', p.count + ' 件 · 目安内 (' + lo + '〜' + hi + ' 時間)']
@@ -1215,7 +1218,7 @@ function gaugeHtml(totals, target) {
   const unknown = p.unknown_hours_count > 0 ? ' <span class="st under">時間不明 ' + esc(String(p.unknown_hours_count)) + ' 件</span>' : '';
   const inner = '<span class="lbl">明日やる分</span>' +
     '<span class="big">' + esc(String(h)) + '<small>時間</small>' + esc(String(m).padStart(2, '0')) + '<small>分</small></span>' +
-    '<span class="bar"><span class="band"></span><span class="fill' + (over ? ' over' : '') + '" style="width:' + pct + '%"></span></span>' +
+    '<span class="bar"><span class="band" style="' + band + '"></span><span class="fill' + (over ? ' over' : '') + '" style="width:' + pct + '%"></span></span>' +
     '<span class="st ' + st[0] + '">' + esc(st[1]) + '</span>' + unknown;
   // 計画画面の中に置く「今どれくらい入っているか」の表示。入口はボードの大きなボタン
   const left = isApp() ? staffLeftText() : '見るだけ (正本はまだ Notion)';
@@ -1321,7 +1324,9 @@ function boardCards() {
   });
 }
 function renderBoard() {
-  if (DND.on) dndCancel();   // 描き直すと掴んでいたカードが消える。ゴーストを残さない (Codex R1 中5)
+  // 描き直すと掴んでいたカードが消える。ただし**ボードのドラッグだけ**外す —
+  // 計画画面で掴んでいる最中に一覧の取得が返ってきても、そちらは巻き込まない (Codex R2 中2)
+  if (DND.on && DND.kind === 'board') dndCancel();
   const bs = boardState();
   if (!bs) { $('#board').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
   renderPreviewNote();
@@ -1596,7 +1601,9 @@ async function askStaffUnlock() {
  */
 const DND = { on: false, id: null, ghost: null, from: null, over: null, sx: 0, sy: 0, moved: false, kind: null, pointerId: null };
 const DRAG_START_PX = 8;      // これ以上動いたらドラッグ (タップと区別する)
-let dndEatClick = false;      // ドラッグが成立した後の click を 1 回だけ捨てる (中5)
+// ドラッグが成立した後に出る click を 1 回だけ捨てる。⭐**落としたところ・その直後**に限る —
+// ただの時間で切ると、click が出なかったときに次の操作を飲んでしまう (Codex R2 中3)
+let dndEatClick = null;       // { x, y, until }
 
 function dndFindDrop(x, y) {
   const el = document.elementFromPoint(x, y);
@@ -1701,8 +1708,7 @@ async function dndDrop(ev) {
   dndCancel();
   if (!moved) return;            // 動いていない = ふつうのタップ (click が処理する)
   // 動かした後の click は捨てる。でないと「列を移した」と同時に詳細が開いてしまう (Codex R1 中4)
-  dndEatClick = true;
-  setTimeout(() => { dndEatClick = false; }, 400);
+  dndEatClick = { x: ev.clientX, y: ev.clientY, until: Date.now() + 400 };
   if (!okDrop) return;
   if (kind === 'plan') {
     const to = okDrop.dataset.drop;
@@ -1721,8 +1727,12 @@ window.addEventListener('blur', () => dndCancel());
 document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible') dndCancel(); });
 // 動かした直後の click を 1 回だけ捨てる (捕まえる段階で止める)
 window.addEventListener('click', (ev) => {
-  if (!dndEatClick) return;
-  dndEatClick = false;
+  const e = dndEatClick;
+  if (!e) return;
+  if (Date.now() > e.until) { dndEatClick = null; return; }
+  // 落としたところとほぼ同じ場所で出た click だけ捨てる。別のところを押したのはそのまま通す
+  if (Math.abs(ev.clientX - e.x) > 12 || Math.abs(ev.clientY - e.y) > 12) return;
+  dndEatClick = null;
   ev.stopPropagation(); ev.preventDefault();
 }, true);
 
@@ -1776,7 +1786,7 @@ function clearPlanDom() {
   const n2 = $('#planPileN'); if (n2) n2.textContent = '0';
 }
 function renderPlan() {
-  if (DND.on) dndCancel();   // 同上 (Codex R1 中5)
+  if (DND.on && DND.kind === 'plan') dndCancel();   // 同上 (Codex R2 中2)
   const d = planData;
   if (!d) { $('#planCand').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
   $('#planTitle').textContent = '明日の計画 — ' + fmtYmd(d.tomorrow_ymd) + (d.preview ? ' (下見)' : '');
