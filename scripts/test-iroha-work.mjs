@@ -3612,8 +3612,11 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(c\.blocked\) h \+= '<span class="tag blocked">⛔ '/.test(html) && /curTab === 'blocked'/.test(html) && /\['blocked', '⛔ 止まっている'\]/.test(html),
     '一覧: 赤い札を先頭に。「⛔ 止まっている」の絞り込みは進捗のタブとは別 (1 件以上あるときだけ)');
   ok(/curWhen === 'blocked'/.test(html) && /<div class="bblk">⛔ ' \+ esc\(c\.blocked\.label\) \+ 'で止まっています<\/div>/.test(html), 'ボード: 保留列は無く、絞り込み「⛔ 止まっている」とカードの赤い 1 行で見せる');
-  ok(/\(c\.blocked \? ' blocked' : ''\)/.test(html) && /\.bcard\.blocked\{border:2px solid var\(--danger\)/.test(html) && /\.row\.blocked\{border-color:var\(--danger\)/.test(html),
+  ok(/'<div class="row' \+ \(sel \? ' sel' : ''\) \+ \(c\.blocked \? ' blocked' : ''\)/.test(html) && /'<div class="bcard' \+ \(sel \? ' sel' : ''\) \+ \(c\.blocked \? ' blocked' : ''\)/.test(html)
+    && /\.bcard\.blocked\{border:2px solid var\(--danger\)/.test(html) && /\.row\.blocked\{border-color:var\(--danger\)/.test(html),
     '止まっているカードは一覧・ボードともカードごと赤くする (資材不足を見落とさない — 中原さん 2026-09-05)');
+  ok(/<div class="overlay" id="facOv">/.test(html) && !/class="ov" id="facOv"/.test(html) && !/<div class="ov"/.test(html),
+    '「どこが」の拠点えらびは他と同じ overlay で開く (class="ov" には CSS が無く、押しても出なかった — 中原さん 2026-09-05)');
   ok(!/on_hold/.test(html) && !/holdReasons/.test(html) && !/hold_qty/.test(html), '画面から旧「保留」(on_hold / holdReasons / hold_qty) が消えている');
   ok(/function canEditProgress\(c\)/.test(html)
     && /c\.status !== 'closed' && c\.status !== 'ready_for_stocking'/.test(html)
@@ -4228,6 +4231,16 @@ console.log('\n[25] ⛔ 止まっている理由の札 — タイマー停止・
   ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'migration_on_hold'").get().c === migN && TD.getTaskByPageId('legacy-hold-2').version === 2,
     '2 回目の起動では何もしない (冪等)');
   ok(TD.countTasksByStatus().blocked >= 2, '管理画面の内訳に「止まっている」件数が出る');
+
+  // ── 拠点名の変更: リハス → パレット (中原さん 2026-09-05)。旧名の行だけ書き換える (手で変えた名前は触らない) ──
+  ok(db.prepare("SELECT name FROM f_iroha_facilities WHERE code = 'rehas'").get().name === 'パレット', '拠点 rehas の名前は「パレット」');
+  db.prepare("UPDATE f_iroha_facilities SET name = 'リハス' WHERE code = 'rehas'").run();
+  createTables(db);
+  ok(db.prepare("SELECT name FROM f_iroha_facilities WHERE code = 'rehas'").get().name === 'パレット', '旧名「リハス」が入っている DB を開くと「パレット」に直る');
+  db.prepare("UPDATE f_iroha_facilities SET name = '手で付けた名前' WHERE code = 'rehas'").run();
+  createTables(db);
+  ok(db.prepare("SELECT name FROM f_iroha_facilities WHERE code = 'rehas'").get().name === '手で付けた名前', '手で別の名前にした行は触らない');
+  db.prepare("UPDATE f_iroha_facilities SET name = 'パレット' WHERE code = 'rehas'").run();
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

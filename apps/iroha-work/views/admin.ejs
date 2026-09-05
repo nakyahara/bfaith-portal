@@ -113,7 +113,7 @@
         <tr><th>孤立 (task に紐づかない)</th><td>作業時間 <%= migration.orphans.sessions.length %> ページ / 写真 <%= migration.orphans.media.length %> ページ</td></tr>
         <tr><th><%= source === 'app' ? '名前・商品コードのないカード' : '名前のないカード' %></th><td>
           <% if (!migration.nameless || migration.nameless.length === 0) { %>0 件<% } else { %>
-            <b class="ng"><%= migration.nameless.length %> 件</b> — <%= source === 'app' ? '商品名か商品コードが無く、<b>入荷受付の行き先に紐づいていない</b>' : '商品名が無く、<b>Notion のカードにも入荷受付の行き先にも紐づいていない</b>' %>カードです
+            <b class="ng"><%= migration.nameless.length %> 件</b> — <% if (source === 'app') { %>商品名か商品コードが無く、<b>入荷受付の行き先に紐づいていない</b><% } else { %>商品名が無く、<b>Notion のカードにも入荷受付の行き先にも紐づいていない</b><% } %>カードです
             (この条件に当てはまるものだけが片づけられます)。作業時間・写真・ラベル待ちが付いていれば消さずに「終了 (在庫化対象外)」にします。
             作業中の人がいるカードは片づけられません。<%= source === 'app' ? 'Notion から取り込んだ名前のないカードも、正本がアプリになったので片づけられます (Notion はもう見ません)。' : 'Notion に紐づくカードは Notion 側で直してください (正本が Notion の間は片づけません)。' %>
             <% migration.nameless.forEach((t) => { %>

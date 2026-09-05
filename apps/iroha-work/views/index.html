@@ -972,7 +972,8 @@
   </div>
 
   <!-- ══ どこが作業するか (「どこが」の札から。職員だけ) ══ -->
-  <div class="ov" id="facOv" hidden>
+  <!-- ⚠ 以前は class="ov" hidden で、CSS が無く「どこが 未定」を押しても出なかった (中原さん 2026-09-05)。他のダイアログと同じ overlay に -->
+  <div class="overlay" id="facOv">
     <div class="modal">
       <h3 id="facTitle">どこが作業しますか?</h3>
       <div class="opts" id="facOpts"></div>

@@ -49,9 +49,11 @@ export const FACILITIES = [
   { code: 'rashinban', name: '羅針盤', external: 1, sort_order: 1 },
   { code: 'workcenter', name: 'ワークセンター', external: 1, sort_order: 2 },
   { code: 'jobsupport', name: 'ジョブサポ', external: 1, sort_order: 3 },
-  { code: 'rehas', name: 'リハス', external: 1, sort_order: 4 },
+  { code: 'rehas', name: 'パレット', external: 1, sort_order: 4 },   // 旧名「リハス」(2026-09-05 に変更)
 ];
 export const DEFAULT_FACILITY = 'iroha';
+/** 拠点名の変更 (旧名のときだけ書き換える。DB に入っている名前は INSERT OR IGNORE では変わらないため)。中原さん 2026-09-05: リハス → パレット */
+export const FACILITY_RENAMES = [{ code: 'rehas', from: 'リハス', to: 'パレット' }];
 
 /**
  * 許可遷移 (from → to)。自由な select にしない (要件 v1.1 §A・Codex R3)。
