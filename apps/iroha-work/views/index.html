@@ -333,6 +333,9 @@
   .kv.tap:active{border-color:var(--accent)}
   .kv .edit{position:absolute;right:8px;top:50%;transform:translateY(-50%);font-size:.72rem;font-weight:700;
     border:1px solid var(--line);background:var(--surface);color:var(--sub);border-radius:var(--r-sm);padding:3px 8px;white-space:nowrap}
+  /* 写真つき (資材・保管箱) は写真を広く使うため、変更ボタンを右上に寄せて右の余白を空けない */
+  .kv.tap.hasimg{padding-right:12px}
+  .kv.hasimg .edit{top:9px;transform:none}
   .kv.miss .edit{border-color:var(--amber);color:var(--amber)}
 
   /* ── 写真: 「前回の完成形」(同じ商品の見本) と「今回のできあがり」 ── */
@@ -382,10 +385,11 @@
   .opt .thumb{width:100%;aspect-ratio:1/1;flex:none;border-radius:4px;background:var(--well);display:grid;place-items:center;
     color:var(--faint);font-size:1.5rem;overflow:hidden}
   .opt .thumb img{width:100%;height:100%;object-fit:contain;background:#fff}
-  /* 作業情報の資材・保管箱にも同じ正方形サムネイル */
-  .kv .v.withimg{display:flex;align-items:center;gap:10px}
-  .kv .kvthumb{width:52px;aspect-ratio:1/1;flex:none;border-radius:6px;background:#fff;border:1px solid var(--line);
-    display:grid;place-items:center;overflow:hidden;font-size:1.1rem}
+  /* 作業情報の資材・保管箱の写真。手元で見て分かる大きさに (中原さん 2026-09-05: もっと大きく)。
+     横に小さく添えず、値の上に正方形で大きく置く */
+  .kv .v.withimg{display:flex;flex-direction:column;align-items:flex-start;gap:8px}
+  .kv .kvthumb{width:100%;max-width:180px;aspect-ratio:1/1;flex:none;border-radius:8px;background:#fff;border:1px solid var(--line);
+    display:grid;place-items:center;overflow:hidden;font-size:1.6rem}
   .kv .kvthumb img{width:100%;height:100%;object-fit:contain}
   .opt .nm{width:100%;text-align:center;line-height:1.25;word-break:break-all;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
@@ -2373,8 +2377,8 @@ function kv(label, value, opts) {
     (img ? '<span class="kvthumb"><img src="' + esc(img) + '" alt="" loading="lazy" onerror="optImgFail(this)"></span>' : '') +
     '<span>' + (empty ? (miss ? '未登録' : '—') : esc(value)) + '</span></div>';
   // 変更・登録が許されていなければ (下見・履歴) タップの印も data-reg も付けない
-  if (!reg || !can('task.master.edit')) return '<div class="kv' + (miss ? ' miss' : '') + '">' + inner + '</div>';
-  return '<div class="kv tap' + (miss ? ' miss' : '') + '" data-reg="' + esc(reg) + '">' + inner +
+  if (!reg || !can('task.master.edit')) return '<div class="kv' + (miss ? ' miss' : '') + (img ? ' hasimg' : '') + '">' + inner + '</div>';
+  return '<div class="kv tap' + (miss ? ' miss' : '') + (img ? ' hasimg' : '') + '" data-reg="' + esc(reg) + '">' + inner +
     '<span class="edit">' + (empty ? '＋ 登録' : '✎ 変更') + '</span></div>';
 }
 /** 直せる項目のタップ (中のリンクを押したときは開かない) */
