@@ -982,6 +982,16 @@
     </div>
   </div>
 
+  <!-- ══ いつ作業するか (「いつ」の札から。職員だけ。中原さん 2026-09-05: 未定からも「今日」を選べるように) ══ -->
+  <div class="overlay" id="whenOv">
+    <div class="modal">
+      <h3 id="whenTitle">いつ作業しますか?</h3>
+      <div class="opts chips" id="whenOpts"></div>
+      <p class="msg" id="whenMsg"></p>
+      <div class="mbtns"><button class="btn" onclick="closeWhenPick()">やめる</button></div>
+    </div>
+  </div>
+
   <!-- ══ 作業者選択 ══ -->
   <div class="gate" id="gate">
     <div class="gwrap">
@@ -1715,7 +1725,7 @@ $('#board').addEventListener('click', (e) => {
   const facBtn = e.target.closest('[data-fac-of]');
   if (facBtn) { e.stopPropagation(); openFacPick(facBtn.dataset.facOf); return; }
   const whenBtn = e.target.closest('[data-when-of]');
-  if (whenBtn) { e.stopPropagation(); toggleTomorrow(whenBtn.dataset.whenOf); return; }
+  if (whenBtn) { e.stopPropagation(); openWhenPick(whenBtn.dataset.whenOf); return; }   // 今日 / 明日 / 未定 から選ぶ
   const el = e.target.closest('[data-id]');
   if (!el) return;
   // 下見 (正本が Notion) でも詳細は読むだけで開ける (中原さん 2026-09-03「これで何がどう変わるのか想像できない」)
@@ -1827,6 +1837,34 @@ function planTagsHtml(c) {
 
 // ─── ⭐「いつ」「どこが」を変える (職員だけ。要件 §W-4) ───
 /** 「明日やる」↔「未定」を切り替える。今日やる分・やり残しは「明日の計画」で扱う */
+// ─── ⭐「いつ」の札 → 今日やる / 明日やる / 未定 を選ぶ (中原さん 2026-09-05: 未定から「今日」も選べるように。以前は 明日やる↔未定 の切替だけだった) ───
+let whenPickCtx = null;   // { id, saving }
+function openWhenPick(id) {
+  if (!stateCan('task.plan.assign')) return;          // 許可が無ければ開かない (札もボタンにしていない)
+  const c = findCard(id);
+  if (!c) return;
+  if (!worker) { openGate(); return; }
+  whenPickCtx = { id, saving: false };
+  $('#whenTitle').textContent = '「' + c.title + '」はいつ作業しますか?';
+  $('#whenMsg').textContent = '';
+  const opts = [['today', '📌 今日やる'], ['tomorrow', '明日やる'], ['', '未定にする']];
+  const cur = c.when === 'today' || c.when === 'tomorrow' ? c.when : '';
+  $('#whenOpts').innerHTML = opts.map(([v, l]) => '<button type="button" class="opt' + (v === cur ? ' on' : '') + '" data-pick-when="' + v + '">' + esc(l) + '</button>').join('');
+  openOverlay('#whenOv');
+}
+function closeWhenPick() { if (whenPickCtx && whenPickCtx.saving) return; closeOverlay('#whenOv'); whenPickCtx = null; }
+$('#whenOpts').addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-pick-when]');
+  if (!b || !whenPickCtx || whenPickCtx.saving) return;   // 送信中の連打は受けない
+  whenPickCtx.saving = true;
+  const { id } = whenPickCtx;
+  const want = b.dataset.pickWhen || null;
+  $('#whenMsg').textContent = '保存しています…';
+  try { await toggleTomorrow(id, want); }
+  finally { if (whenPickCtx) whenPickCtx.saving = false; closeWhenPick(); }
+});
+$('#whenOv').addEventListener('click', (e) => { if (e.target === $('#whenOv')) closeWhenPick(); });
+
 async function toggleTomorrow(id, want) {
   if (!stateCan('task.plan.assign')) return;          // 許可が無ければ動かない (札もボタンにしていない)
   const c = findCard(id);
@@ -1842,7 +1880,9 @@ async function toggleTomorrow(id, want) {
   applyTask(c, j.task);
   if (j.staff_mode) state.staff_mode = j.staff_mode;
   redrawAfterPlan();
-  toast(next ? '「' + c.title + '」を明日やる分に入れました' : '「' + c.title + '」を明日やる分から外しました');
+  toast(next === 'today' ? '「' + c.title + '」を今日やる分にしました (一覧の上に出ます)'
+    : next === 'tomorrow' ? '「' + c.title + '」を明日やる分に入れました'
+    : '「' + c.title + '」の予定を未定にしました');
 }
 
 /**
@@ -4681,7 +4721,7 @@ if ('serviceWorker' in navigator) {
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if ($('#askOv').classList.contains('on')) { askDone(false); return; }   // 確認ダイアログだけ閉じる (下のダイアログは残す)
-  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeFacPick(); closeDetail();
+  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeFacPick(); closeWhenPick(); closeDetail();
 });
 </script>
 </body>
