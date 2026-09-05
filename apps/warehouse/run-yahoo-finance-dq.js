@@ -66,11 +66,6 @@ if (!fs.existsSync(dbPath)) {
 
 const checkedAt = new Date().toISOString();
 
-// 当月判定 (PR #86 楽天と同方針)
-function isCurrentMonth(monthStr) {
-  const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1000);
-  return monthStr === nowJst.toISOString().slice(0, 7);
-}
 
 const THRESHOLDS_PAST_MONTH = {
   row_count_drift:           { warn: 0,    error: 0 },
