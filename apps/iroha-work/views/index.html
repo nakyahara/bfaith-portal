@@ -371,13 +371,22 @@
     border-radius:var(--r-sm);padding:5px 10px;font-weight:700;font-size:.82rem;cursor:pointer;font-family:var(--font)}
   /* ── 選択肢 (資材・保管箱): Excel 由来の候補からタップで選ぶ ── */
   /* 候補は正方形のタイル。上が画像 (あとから登録できる)、下が名前 — 中原さん 2026-09-03 */
-  .opts{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px;margin:2px 0 4px}
+  /* 候補タイル: 写真は必ず正方形で全部見えるように (object-fit:contain)。
+     行は内容の高さのまま (align-content:start / grid-auto-rows:max-content) — 候補が増えても縦に潰れない。
+     入りきらない分は .opts のスクロールで選ぶ (中原さん 2026-09-05) */
+  .opts{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px;margin:2px 0 4px;
+    align-content:start;grid-auto-rows:max-content}
   .opt{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);padding:6px;
     font-size:.88rem;font-weight:700;cursor:pointer;font-family:var(--font);
-    display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:6px;aspect-ratio:1/1;overflow:hidden}
-  .opt .thumb{width:100%;flex:1;min-height:0;border-radius:4px;background:var(--well);display:grid;place-items:center;
+    display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:6px;overflow:hidden}
+  .opt .thumb{width:100%;aspect-ratio:1/1;flex:none;border-radius:4px;background:var(--well);display:grid;place-items:center;
     color:var(--faint);font-size:1.5rem;overflow:hidden}
   .opt .thumb img{width:100%;height:100%;object-fit:contain;background:#fff}
+  /* 作業情報の資材・保管箱にも同じ正方形サムネイル */
+  .kv .v.withimg{display:flex;align-items:center;gap:10px}
+  .kv .kvthumb{width:52px;aspect-ratio:1/1;flex:none;border-radius:6px;background:#fff;border:1px solid var(--line);
+    display:grid;place-items:center;overflow:hidden;font-size:1.1rem}
+  .kv .kvthumb img{width:100%;height:100%;object-fit:contain}
   .opt .nm{width:100%;text-align:center;line-height:1.25;word-break:break-all;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .opt.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
@@ -414,8 +423,9 @@
   body.modal-open{position:fixed;left:0;right:0;width:100%;overflow:hidden}
   .modal{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);
     padding:20px;width:min(520px,100%);margin:auto 0;max-height:none}
-  /* 候補が多いときは、その枠だけスクロールする (ボタンが下に押し出されない) */
-  .opts{max-height:min(46vh,360px);overflow-y:auto;-webkit-overflow-scrolling:touch}
+  /* 候補が多いときは、その枠だけスクロールして選ぶ (ボタンが下に押し出されない・タイルは潰さない) */
+  .opts{max-height:min(52vh,420px);overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;
+    padding:2px;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--well)}
   .modal h3{margin:0 0 4px;font-size:1.1rem}
   .modal .mname{font-size:.88rem;color:var(--sub);margin-bottom:14px}
   .modal label{font-size:.8rem;color:var(--sub);font-weight:700}
@@ -2346,12 +2356,22 @@ function estText(c) {
  * 作業のやり方の 1 項目。reg (直せる項目) があれば、その項目をタップして変更・登録する。
  * 値が入っていれば「✎ 変更」、空なら「＋ 登録」。編集ボタンは置かない (中原さん 2026-09-03)
  */
+/** 資材・保管箱の値に対応する候補の画像 (中原さん 2026-09-05: 作業情報でも写真を出す) */
+function optionImageFor(kind, value) {
+  if (!value) return null;
+  const list = (state.options && state.options[kind]) || [];
+  const k = optKey(value);
+  const hit = list.find(o => optKey(o.code) === k);
+  return hit && hit.image_url ? hit.image_url : null;
+}
 function kv(label, value, opts) {
   const miss = opts && opts.miss;
   const reg = opts && opts.reg;
   const empty = value == null || value === '';
-  const inner = '<label>' + esc(label) + '</label><div class="v num">' +
-    (empty ? (miss ? '未登録' : '—') : esc(value)) + '</div>';
+  const img = !empty && opts && opts.optKind ? optionImageFor(opts.optKind, value) : null;
+  const inner = '<label>' + esc(label) + '</label><div class="v num' + (img ? ' withimg' : '') + '">' +
+    (img ? '<span class="kvthumb"><img src="' + esc(img) + '" alt="" loading="lazy" onerror="optImgFail(this)"></span>' : '') +
+    '<span>' + (empty ? (miss ? '未登録' : '—') : esc(value)) + '</span></div>';
   // 変更・登録が許されていなければ (下見・履歴) タップの印も data-reg も付けない
   if (!reg || !can('task.master.edit')) return '<div class="kv' + (miss ? ' miss' : '') + '">' + inner + '</div>';
   return '<div class="kv tap' + (miss ? ' miss' : '') + '" data-reg="' + esc(reg) + '">' + inner +
@@ -2485,8 +2505,8 @@ function renderDetail(c, opts) {
     prevCardHtml(c) +
 
     '<div class="dcard"><h3 class="sec">作業情報</h3><div class="kvs">' +
-      kv('資材', m.material_code, { miss: missSet.has('資材'), reg: 'material_code' }) +
-      kv('保管箱', m.storage_container, { miss: missSet.has('保管箱'), reg: 'storage_container' }) +
+      kv('資材', m.material_code, { miss: missSet.has('資材'), reg: 'material_code', optKind: 'material' }) +
+      kv('保管箱', m.storage_container, { miss: missSet.has('保管箱'), reg: 'storage_container', optKind: 'container' }) +
       kv('入数 (保管箱1つに入れる数)', m.units_per_container != null ? m.units_per_container + '個' : null,
         { miss: missSet.has('入数'), reg: 'units_per_container' }) +
       kv('工程', m.process_count != null ? m.process_count + '工程' : null, { miss: missSet.has('工程'), reg: 'process_count' }) +
