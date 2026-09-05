@@ -3284,8 +3284,18 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '写真で見分けるもの (資材・保管箱) だけ写真カード。工程・期限シール・大きさは行にする');
   ok(/1箱に <b class="num">' \+ esc\(String\(units\)\) \+ '<\/b> 個ずつ入れる/.test(html),
     '入数は保管箱とセットで読ませる (120 が総数か1箱ぶんか迷わない)');
-  ok(/miss \? '⚠ 未登録' : '<span class="none">未設定<\/span>'/.test(html) && /note \? esc\(note\) : '特になし'/.test(html),
+  ok(/miss \? '⚠ 未登録' : '<span class="none">未設定<\/span>'/.test(html) && /<div class="v">特になし<\/div>/.test(html),
     '空欄を「—」で済ませず、登録が要るもの (未登録) と なくてよいもの (未設定・特になし) を分ける');
+  // 監修 PR-A (2026-09-05)
+  ok(/上の黄色い枠に出しています/.test(html) && /const care = note \? '' : open\('wicare empty', 'note'\)/.test(html),
+    'B-9: 気をつけること は中身があるとき上の枠にだけ出す (作業情報の中は直す口の 1 行)');
+  ok(/if \(w\.worker_type !== 'staff' && deviceStaffMode\) \{\s*dropPlanCaps\(\);/.test(html) && /apiFetch\('\/api\/staff-lock'/.test(html)
+    && /renderStaffBtn\(\);\s*\}\s*function restoreWorker/.test(html),
+    'B-1/B-10: 名前を替えたら「職員モードに入る」をすぐ出し、利用者に替えたら職員の操作を落として端末の職員モードも終える');
+  ok(/<span class="fgroup"><span class="flabel">予定<\/span><span id="whenChips"><\/span><\/span>/.test(html) && /\.fgroup\{display:inline-flex/.test(html),
+    'B-4: 見出しとチップは 1 つの組で折り返す');
+  ok(/時間不明 ' \+ p\.unknown_hours_count \+ ' 件'/.test(html), 'B-5: 「明日の計画」バナーは時間不明を 0 分と足さない');
+  ok(/label class="cbrow"><input id="lwOrdered"/.test(html) && /\.mfields input\[type=checkbox\]\{width:24px/.test(html), 'B-3: チェックボックスは □ と文字を横並びに');
   ok(/<span class="ro">見るだけ<\/span>/.test(html) && /使えるのは ' \+ esc\(String\(c\.loc_free\)\)/.test(html),
     'Zロケ在庫は「見るだけ」の参考欄に下ろし、使える数を先に大きく出す');
 
