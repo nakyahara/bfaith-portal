@@ -1068,8 +1068,10 @@ const can = (name) => detailCaps.includes(name);
 const stateCan = (name) => (state.capabilities || []).includes(name);
 /** 正本が切り替わると状態の値も変わる (未着手 ↔ not_started)。無い値を選んだままだと一覧が空に見えるので「すべて」に戻す */
 function ensureTabValid() {
-  const valid = new Set(['all', 'blocked', 'today', ...statusTabs().map(([v]) => v)]);
+  const valid = new Set(['all', 'blocked', 'unblocked', 'today', ...statusTabs().map(([v]) => v)]);
   if (!valid.has(curTab)) curTab = 'all';
+  // 「止まっていない」は止まっているカードが 1 件以上あるときだけ出す → 0 件になったら「すべて」へ
+  if (curTab === 'unblocked' && !(state && (state.cards || []).some((c) => c.blocked))) curTab = 'all';
   // 「今日やる」のタブは 1 件以上あるときだけ出す → 0 件になったら「すべて」へ
   if (curTab === 'today' && !(state && (state.cards || []).some((c) => c.today))) curTab = 'all';
 }
@@ -1370,6 +1372,7 @@ function counts() {
     if (card.blocked) c.blocked++;   // ⛔ 止まっている (進捗とは別の札 — 案A)
     if (card.today) c.today++;       // 📌 今日やる (監修 F-6)
   }
+  c.unblocked = c.all - c.blocked;   // 止まっていない (⛔ を除く — 中原さん 2026-09-05)
   return c;
 }
 
@@ -1377,7 +1380,9 @@ function renderTabs() {
   const c = counts();
   // 「⛔ 止まっている」は進捗のタブではなく札の絞り込み。1 件以上あるときだけ出す
   // 「📌 今日やる」は進捗ではなく予定の絞り込み。朝いちばんに見るので先頭 (監修 F-6)。1 件以上あるときだけ
-  const tabs = [['all', 'すべて'], ...(c.today > 0 ? [['today', '📌 今日やる']] : []), ...statusTabs(), ...(c.blocked > 0 ? [['blocked', '⛔ 止まっている']] : [])];
+  // ⛔ が 1 件以上あるときだけ「止まっている」と、その除外「止まっていない」を出す (中原さん 2026-09-05)
+  const tabs = [['all', 'すべて'], ...(c.today > 0 ? [['today', '📌 今日やる']] : []), ...statusTabs(),
+    ...(c.blocked > 0 ? [['blocked', '⛔ 止まっている'], ['unblocked', '止まっていない']] : [])];
   $('#tabs').innerHTML = tabs.map(([key, label]) =>
     '<button class="chip' + (curTab === key ? ' on' : '') + '" onclick="pickTab(\'' + esc(key) + '\')">' +
     esc(label) + ' <span class="num">' + (c[key] ?? 0) + '</span></button>').join('');
@@ -1415,6 +1420,7 @@ function visibleCards() {
   const q = $('#q').value.trim().toLowerCase();
   return state.cards.filter(c => {
     if (curTab === 'blocked') { if (!c.blocked) return false; }
+    else if (curTab === 'unblocked') { if (c.blocked) return false; }
     else if (curTab === 'today') { if (!c.today) return false; }
     else if (curTab !== 'all' && c.status !== curTab) return false;
     if (!q) return true;
@@ -1662,12 +1668,15 @@ function colSegHtml() {
 function whenChips() {
   const cards = ((boardState() || {}).cards || []);
   const n = (v) => (v === 'all' ? cards.length : v === 'none' ? cards.filter(c => !c.when).length
-    : v === 'blocked' ? cards.filter(c => c.blocked).length : cards.filter(c => c.when === v).length);
+    : v === 'blocked' ? cards.filter(c => c.blocked).length : v === 'unblocked' ? cards.filter(c => !c.blocked).length
+    : cards.filter(c => c.when === v).length);
   // 札に出る「いつ」は絞り込みでも選べるようにする (やり残しだけ見たい、があるため — Codex P2 R1)。
   // 「⛔ 止まっている」は旧「保留」列の代わり (案A: 保留は進捗ではなく札なので、列ではなく絞り込み)。1 件以上あるときだけ
   const blockedN = cards.filter(c => c.blocked).length;
+  // 「止まっていない」= ⛔ を除く (中原さん 2026-09-05)。⛔ と同じく 1 件以上あるときだけ
+  const showBlk = blockedN > 0 || curWhen === 'blocked' || curWhen === 'unblocked';
   return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定'],
-    ...(blockedN > 0 || curWhen === 'blocked' ? [['blocked', '⛔ 止まっている']] : [])]
+    ...(showBlk ? [['blocked', '⛔ 止まっている'], ['unblocked', '止まっていない']] : [])]
     .map(([v, l]) => '<button class="chip' + (curWhen === v ? ' on' : '') + '" data-when="' + v + '">' + l +
       ' <span class="num">' + n(v) + '</span></button>').join('');
 }
@@ -1748,6 +1757,7 @@ function boardCards() {
     if (curFacility !== 'all' && (curFacility === 'none' ? !!c.facility_code : c.facility_code !== curFacility)) return false;
     // 「⛔ 止まっている」は予定の値ではなく札の絞り込み (案A)
     if (curWhen === 'blocked') { if (!c.blocked) return false; }
+    else if (curWhen === 'unblocked') { if (c.blocked) return false; }
     else if (curWhen !== 'all' && (curWhen === 'none' ? !!c.when : c.when !== curWhen)) return false;
     if (!q) return true;
     return String(c.title).toLowerCase().includes(q) || String(c.product_code || '').toLowerCase().includes(q);

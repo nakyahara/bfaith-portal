@@ -3621,6 +3621,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /\[\['today', '📌 今日やる'\], \['tomorrow', '明日やる'\], \['', '未定にする'\]\]/.test(html) && /if \(!stateCan\('task\.plan\.assign'\)\) return;          \/\/ 許可が無ければ開かない/.test(html),
     '「いつ」の札は 今日やる / 明日やる / 未定 から選ぶ (未定から今日も選べる — 中原さん 2026-09-05)。職員だけ');
   ok(/closeUnblock\(\); closeFacPick\(\); closeWhenPick\(\); closeDetail\(\);/.test(html), 'Esc で いつ・どこが の選択も閉じる');
+  ok((html.match(/\['unblocked', '止まっていない'\]/g) || []).length === 2 && /curTab === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html)
+    && /curWhen === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html) && /c\.unblocked = c\.all - c\.blocked;/.test(html),
+    '「止まっていない」(⛔ を除く) の絞り込みが一覧とボードの両方にある (中原さん 2026-09-05)');
   ok(!/on_hold/.test(html) && !/holdReasons/.test(html) && !/hold_qty/.test(html), '画面から旧「保留」(on_hold / holdReasons / hold_qty) が消えている');
   ok(/function canEditProgress\(c\)/.test(html)
     && /c\.status !== 'closed' && c\.status !== 'ready_for_stocking'/.test(html)
