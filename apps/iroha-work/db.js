@@ -36,6 +36,7 @@ const workOptionsDDL = (name) => `
 
 // 在庫化タスク / ラベル待ちの DDL (作成と作り直しで共用。列一覧は INSERT … SELECT にも使う)
 const TASKS_COLS = ['id', 'destination_id', 'notion_page_id', 'legacy_status', 'status', 'close_reason', 'facility_code', 'hold_reason_code', 'hold_reason_note',
+  'done_qty', 'hold_memo',
   'planned_date', 'priority_class', 'priority_note', 'product_code', 'product_name', 'qty', 'arrival_date', 'ar_no', 'barcode', 'expiry', 'supplier', 'handling',
   'master_snapshot', 'payload', 'started_at', 'ready_at', 'closed_at', 'closed_by', 'cancellation_requested_at', 'cancellation_source',
   'migration_review', 'migration_note', 'import_batch_id', 'external_ready', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
@@ -51,6 +52,11 @@ const tasksDDL = (name) => `
       facility_code    TEXT REFERENCES f_iroha_facilities(code),
       hold_reason_code TEXT CHECK (hold_reason_code IS NULL OR hold_reason_code IN ('materials_shortage','label_shortage','awaiting_instruction','other')),
       hold_reason_note TEXT,
+      -- ⭐途中まで何個できたか (要件 §Y)。NULL = まだ数えていない。0 (1 個もできていない) と区別する
+      done_qty         INTEGER CHECK (done_qty IS NULL OR done_qty >= 0),
+      -- ⭐中断メモ = 次にやる人への申し送り (要件 §Y-3)。「ラベルは貼り終わり、袋詰めの途中」など。
+      --   保留理由「その他」の備考 (hold_reason_note) とは別もの
+      hold_memo        TEXT,
       planned_date     TEXT,
       external_ready   INTEGER NOT NULL DEFAULT 0 CHECK (external_ready IN (0,1)),
       priority_class   TEXT,
@@ -244,6 +250,8 @@ const TASKS_REQUIRED_DDL = [
   /external_ready\s+INTEGER NOT NULL DEFAULT 0 CHECK \(external_ready IN \(0,1\)\)/,
   // 拠点は NULL (未定) を許す版か。古い版は NOT NULL DEFAULT 'iroha' なので作り直す (要件 §W-2)
   /facility_code\s+TEXT REFERENCES f_iroha_facilities\(code\)/,
+  // できた数 (要件 §Y)。列だけ足した版と区別するため CHECK まで見る
+  /done_qty\s+INTEGER CHECK \(done_qty IS NULL OR done_qty >= 0\)/,
 ];
 const LABEL_REQUIRED_DDL = [/REFERENCES f_iroha_tasks/, /label_ordered IN \(0,1\)/, /location IN \('Z','Y','none'\)/, /reattach IN \(0,1\)/, /done IN \(0,1\)/];
 const FK_CHECK_TABLES = ['f_iroha_tasks', 'f_iroha_label_waits', 'f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events'];
@@ -281,10 +289,17 @@ function migrateTasksSchema(db) {
   if (!needTasks && !needLabel) return false;
   const fkWasOn = db.pragma('foreign_keys', { simple: true }) === 1;
   if (fkWasOn) db.pragma('foreign_keys = OFF');
-  const fixed = { orphanLabelWaits: 0, unlinked: {} };
+  const fixed = { orphanLabelWaits: 0, unlinked: {}, badDoneQty: 0 };
   try {
     db.transaction(() => {
       if (needTasks) {
+        // ⭐CHECK の無い古い版に不正な done_qty (マイナス・小数) が残っていると、
+        //   新しい表へ写すところで CHECK に当たり**アプリが起動できなくなる**。
+        //   先に「数えていない」(NULL) に戻して、何件直したかをログに出す (Codex R2 中2)
+        if (db.prepare('PRAGMA table_info(f_iroha_tasks)').all().some((c) => c.name === 'done_qty')) {
+          fixed.badDoneQty = db.prepare(`UPDATE f_iroha_tasks SET done_qty = NULL
+            WHERE done_qty IS NOT NULL AND (typeof(done_qty) <> 'integer' OR done_qty < 0)`).run().changes;
+        }
         db.exec(tasksDDL('f_iroha_tasks__new'));
         const cols = copyCols(db, 'f_iroha_tasks', 'f_iroha_tasks__new', TASKS_COLS);
         db.exec(`INSERT INTO f_iroha_tasks__new (${cols.names.join(', ')}) SELECT ${cols.exprs.join(', ')} FROM f_iroha_tasks`);
@@ -322,7 +337,8 @@ function migrateTasksSchema(db) {
   }
   console.log(`[iroha-work] ${[needTasks && 'f_iroha_tasks', needLabel && 'f_iroha_label_waits'].filter(Boolean).join(' / ')} を CHECK・FK 付きに作り直しました`
     + (fixed.orphanLabelWaits ? ` (孤立ラベル待ち ${fixed.orphanLabelWaits} 件を __orphan へ退避)` : '')
-    + (Object.values(fixed.unlinked).some(Boolean) ? ` (宙ぶらりんの task_id を外した: ${JSON.stringify(fixed.unlinked)})` : ''));
+    + (Object.values(fixed.unlinked).some(Boolean) ? ` (宙ぶらりんの task_id を外した: ${JSON.stringify(fixed.unlinked)})` : '')
+    + (fixed.badDoneQty ? ` (不正なできた数 ${fixed.badDoneQty} 件を「数えていない」に戻した)` : ''));
   return true;
 }
 
@@ -537,6 +553,9 @@ export function createTables(db = getMirrorDB()) {
   // 「当時何を見て作業したか」を残す。JSON)
   // 外部施設に出す準備ができたか (状態とは別のチェック。Notion のチェックボックスの置き換え — 中原さん 2026-09-03)
   addCol('f_iroha_tasks', 'external_ready', 'INTEGER NOT NULL DEFAULT 0 CHECK (external_ready IN (0,1))');
+  // 途中まで何個できたか / 次にやる人への申し送り (要件 §Y。中原さん 2026-09-05)
+  addCol('f_iroha_tasks', 'done_qty', 'INTEGER CHECK (done_qty IS NULL OR done_qty >= 0)');
+  addCol('f_iroha_tasks', 'hold_memo', 'TEXT');
   addCol('f_iroha_work_sessions', 'master_snapshot', 'TEXT');
   // Drive 側で消えた写真の印 (配信で 404/410 を見たら付け、表示と「前回の完成形」候補から外す。
   // 管理画面の再実行で解除 — Codex R1 #5)

@@ -9,7 +9,7 @@
  * 初回表示は SW を通らないので、install 時と画面からの依頼 ('cache-shell') で今の画面を取りに行って保存する
  * (Codex R1 #2)。登録解除・失効時は画面 (作業画面の 401 処理・登録画面) から 'clear-shell' が来て消す (R1 #1 / R2 #1)。
  */
-const CACHE = 'iroha-work-shell-v8';   // v8: 詳細の並び替え・期限シール・明日の計画ボタン・ドラッグ&ドロップ (掴み手)
+const CACHE = 'iroha-work-shell-v9';   // v9: できた数・中断メモ
 const SCOPE = '/apps/iroha-work/';
 const NET_TIMEOUT_MS = 8000;   // キャッシュがある時だけ、この時間で諦めてキャッシュを出す (Codex R1 #5)
 

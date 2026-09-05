@@ -113,5 +113,7 @@ export function validateTaskInvariants(task) {
   if (task.status === 'on_hold' && !HOLD_REASONS.includes(task.hold_reason_code)) problems.push('on_hold には hold_reason_code が必要');
   if (task.status !== 'on_hold' && task.hold_reason_code) problems.push('on_hold 以外は hold_reason_code を持たない');
   if (task.hold_reason_code === 'other' && !String(task.hold_reason_note || '').trim()) problems.push('保留理由「その他」には備考が必要');
+  // ⭐できた数 (要件 §Y)。NULL = まだ数えていない。0 と区別するので「無い」を 0 に丸めない
+  if (task.done_qty != null && (!Number.isInteger(task.done_qty) || task.done_qty < 0)) problems.push('できた数は 0 以上の整数');
   return problems;
 }

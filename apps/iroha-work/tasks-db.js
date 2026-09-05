@@ -208,7 +208,7 @@ export function listOrphans(limit = 100) {
 // ─── 状態変更 ───
 
 const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, hold_reason_required: 400, close_reason_required: 400, not_found: 404, bad_request: 400,
-  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409,
+  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409, bad_done_qty: 400, bad_hold_memo: 400, ready_task: 409,
   notion_mode: 409 };   // 取得後に正本が切り替わった = 競合 (入力不正ではない — Codex PR1 R17)
 export function taskErrorStatus(error) { return HTTP_BY_ERROR[error] || 400; }
 
@@ -217,7 +217,35 @@ export function taskErrorStatus(error) { return HTTP_BY_ERROR[error] || 400; }
  * version 楽観ロック。遷移に伴う時刻 (started_at / ready_at / closed_at) をここで付ける。
  * @returns {ok:true, task} | {ok:false, error, message, current?}
  */
+/**
+ * できた数の受け取り (要件 §Y)。undefined = 触らない / null = 数えていないに戻す / 数値 = その数。
+ * ⭐「無い」を 0 に丸めない — 0 個 (何もできていない) と 未入力 は別のこと
+ */
+export function normalizeDoneQty(v) {
+  if (v === undefined) return { skip: true };
+  if (v === null) return { value: null };
+  // ⚠Number(' ') も Number(true) も Number([]) も数になる。**空白だけは「数えていない」**、
+  //   それ以外の型は受けない — でないと未入力が黙って 0 個になる (Codex R1 軽微4)
+  if (typeof v !== 'number' && typeof v !== 'string') return { error: 'bad_done_qty', message: 'できた数は数で入れてください' };
+  const t = typeof v === 'string' ? v.trim() : v;
+  if (t === '') return { value: null };
+  const n = Number(t);
+  if (!Number.isInteger(n) || n < 0) return { error: 'bad_done_qty', message: 'できた数は 0 以上の整数で入れてください' };
+  if (n > 1_000_000) return { error: 'bad_done_qty', message: 'できた数が大きすぎます' };
+  return { value: n };
+}
+/** 中断メモ。undefined = 触らない / 空 = 消す。長すぎる申し送りは切らずに断る (書いた人が気づけるように) */
+export function normalizeHoldMemo(v) {
+  if (v === undefined) return { skip: true };
+  if (v === null) return { value: null };
+  if (typeof v !== 'string') return { error: 'bad_hold_memo', message: '中断メモは文字で入れてください' };
+  const t = v.trim();
+  if (t.length > 500) return { error: 'bad_hold_memo', message: '中断メモは 500 文字までです' };
+  return { value: t === '' ? null : t };
+}
+
 export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null, holdReason = null, holdNote = null,
+  doneQty = undefined, holdMemo = undefined,
   actor = null, isStaff = false, workerId = null, workerName = null, deviceLabel = null, reason = null }) {
   const db = getDB();
   const t = getTask(taskId);
@@ -250,6 +278,21 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   if (to === 'ready_for_stocking') next.ready_at = now;
   if (to === 'closed' && closeReason === 'stocked' && !next.ready_at) next.ready_at = now;
   if (to === 'closed') next.cancellation_requested_at = null;
+  // ⭐できた数と中断メモ (要件 §Y)。送られたときだけ書き換える (送らない = 今の値のまま)
+  const dq = normalizeDoneQty(doneQty);
+  if (dq.error) return { ok: false, error: dq.error, message: dq.message };
+  if (!dq.skip) next.done_qty = dq.value;
+  const hm = normalizeHoldMemo(holdMemo);
+  if (hm.error) return { ok: false, error: hm.error, message: hm.message };
+  if (!hm.skip) next.hold_memo = hm.value;
+  // 棚入待ち・棚入完了は「全部そろってから」(中原さん 2026-09-05)。数えていなくても、そこまで来たら全部できたとみなす。
+  // 中断メモは申し送りなので、作業が終わったら消す (消した中身は履歴に残す)
+  if (to === 'ready_for_stocking' || (to === 'closed' && closeReason === 'stocked')) {
+    // ⭐つくる数が分からないカードは、できた数も「数えていない」に戻す。
+    //   途中の数 (5 個) をそのまま残すと、それが完成数なのか途中経過なのか分からなくなる (Codex R1 中2)
+    next.done_qty = t.qty ?? null;
+    next.hold_memo = null;
+  }
   const problems = validateTaskInvariants(next);
   if (problems.length > 0) {
     if (to === 'on_hold') return { ok: false, error: 'hold_reason_required', message: `保留の理由を選んでください (${HOLD_REASONS.join(' / ')})${holdReason === 'other' ? '。「その他」は備考も必要です' : ''}` };
@@ -272,13 +315,18 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
       if (active > 0) return { active };
     }
     const r = db.prepare(`UPDATE f_iroha_tasks SET status = ?, hold_reason_code = ?, hold_reason_note = ?, close_reason = ?, closed_at = ?, closed_by = ?,
-        started_at = ?, ready_at = ?, cancellation_requested_at = ?, version = ?, updated_at = ?, updated_by = ?
+        started_at = ?, ready_at = ?, cancellation_requested_at = ?, done_qty = ?, hold_memo = ?, version = ?, updated_at = ?, updated_by = ?
       WHERE id = ? AND version = ?`)
       .run(next.status, next.hold_reason_code, next.hold_reason_note, next.close_reason, next.closed_at, next.closed_by,
-        next.started_at, next.ready_at, next.cancellation_requested_at, next.version, next.updated_at, next.updated_by, t.id, t.version);
+        next.started_at, next.ready_at, next.cancellation_requested_at, next.done_qty ?? null, next.hold_memo ?? null,
+        next.version, next.updated_at, next.updated_by, t.id, t.version);
     if (r.changes === 0) return false;
     const cleared = (t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '';
-    const line = { taskId: t.id, action: 'task_status', from: t.status, to: `${to}${closeReason ? ':' + closeReason : ''}${holdReason ? ':' + holdReason : ''}${reason ? ' (' + reason + ')' : ''}${cleared}`,
+    // できた数と中断メモも履歴に残す。消えた申し送りを後から追えるように (ready_at と同じ考え方)
+    const dqTxt = (next.done_qty ?? null) !== (t.done_qty ?? null) ? ` できた${t.done_qty ?? '—'}→${next.done_qty ?? '—'}` : '';
+    const hmTxt = (next.hold_memo ?? null) !== (t.hold_memo ?? null)
+      ? (next.hold_memo ? ` メモ:${next.hold_memo}` : ` メモ消去(${t.hold_memo})`) : '';
+    const line = { taskId: t.id, action: 'task_status', from: t.status, to: `${to}${closeReason ? ':' + closeReason : ''}${holdReason ? ':' + holdReason : ''}${reason ? ' (' + reason + ')' : ''}${cleared}${dqTxt}${hmTxt}`,
       workerId, workerName, deviceLabel, ok: true };
     if (reopening) logTaskEvent(line); else safeLogTaskEvent(line);
     return true;
@@ -431,6 +479,47 @@ export function setFacility({ taskId, facilityCode, expectVersion, actor = null,
       .run(code, utcNow(), actor, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
     safeLogTaskEvent({ taskId: t.id, action: 'task_facility', from: t.facility_code, to: code, workerId, workerName, deviceLabel, ok: true });
+    return { ok: true, task: getTask(t.id) };
+  }).immediate();
+}
+
+/**
+ * ⭐できた数と中断メモを**あとから直す** (要件 §Y)。状態は変えない。
+ * 中断するときは /api/status に一緒に載せる (状態と数が食い違わないように 1 回で書く) が、
+ * 数え間違いは後から直せないと現場が困るので、こちらも要る。
+ * 確かめるところから書くところまで全部 1 つのトランザクション (要件 §U-2)
+ */
+export function setProgress({ taskId, doneQty = undefined, holdMemo = undefined, expectVersion,
+  actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
+  const db = getDB();
+  const dq = normalizeDoneQty(doneQty);
+  if (dq.error) return { ok: false, error: dq.error, message: dq.message };
+  const hm = normalizeHoldMemo(holdMemo);
+  if (hm.error) return { ok: false, error: hm.error, message: hm.message };
+  if (dq.skip && hm.skip) return { ok: false, error: 'bad_request', message: '直すものがありません' };
+  return db.transaction(() => {
+    if (guard) { const g0 = guard(); if (g0) return g0; }
+    const g = appModeGuard();
+    if (g) return g;
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'タスクが見つかりません' };
+    if (expectVersion == null || Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: t };
+    if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
+    // ⭐棚入待ち = 「全部そろった」。あとから数だけ書き換えられると、その意味が崩れる (Codex R1 重大1)。
+    //   数え間違いに気づいたら、職員が「やり直し」で作業中に戻してから直す
+    if (t.status === 'ready_for_stocking') {
+      return { ok: false, error: 'ready_task', message: '棚入待ちのカードは「全部そろった」扱いです。直すには職員が作業中に戻してください' };
+    }
+    const nextQty = dq.skip ? (t.done_qty ?? null) : dq.value;
+    const nextMemo = hm.skip ? (t.hold_memo ?? null) : hm.value;
+    if (nextQty === (t.done_qty ?? null) && nextMemo === (t.hold_memo ?? null)) return { ok: true, task: t, already: true };
+    const r = db.prepare('UPDATE f_iroha_tasks SET done_qty = ?, hold_memo = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+      .run(nextQty, nextMemo, utcNow(), actor, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_progress',
+      from: `できた${t.done_qty ?? '—'}${t.hold_memo ? ' メモあり' : ''}`,
+      to: `できた${nextQty ?? '—'}${nextMemo ? ' メモ:' + nextMemo : ''}`,
+      workerId, workerName, deviceLabel, ok: true });
     return { ok: true, task: getTask(t.id) };
   }).immediate();
 }

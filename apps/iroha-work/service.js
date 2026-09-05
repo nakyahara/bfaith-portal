@@ -256,6 +256,9 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       facility_code: r.facility_code,
       hold_reason_code: r.hold_reason_code,
       hold_reason_note: r.hold_reason_note,
+      // ⭐できた数と中断メモ (要件 §Y)。done_qty は NULL = まだ数えていない (0 と区別する)
+      done_qty: r.done_qty ?? null,
+      hold_memo: r.hold_memo || null,
       planned_date: r.planned_date,
       today: r.planned_date === today,
       // ⭐3 軸のうちの「いつ」。planned_date (実日付) から出す — today / tomorrow / over (やり残し) / later / null (未定)
