@@ -985,6 +985,10 @@ db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value) VALUES (?, 
 // (本番でも、詳細画面を開いてから画像を足した商品は人が画像トラックを進めるまで出せない = 意図どおり)
 db.prepare(`UPDATE draft_step_progress SET state = 'done', done_by = 'smoke'
             WHERE draft_id = ? AND step_code IN (SELECT code FROM ph_steps WHERE track = 'image')`).run(rkId);
+// 配送方法は出品の必須条件 (2026-09-05 中原さん判断: 選んでいないものは出せない)。
+// ここは「payload が組み立つか」を見るテストなので条件を満たしておく。
+// **バナーの無い配送方法 (4 = ゆうパック)** を選ぶ — 下の画像テストは共通3枚だけの並びを見ているため
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '4' WHERE draft_id = ?`).run(rkId);
 
 built = listing.buildItemPayload(db, rkId);
 check('payload: 組み立て成功', built.ok === true, JSON.stringify(built.reasons || null));
@@ -1106,7 +1110,7 @@ check('trailingBannerLocations: 対応バナーの無い配送方法/未設定�
 check('cabinetImageUrl: location → 公開URL',
   listing.cabinetImageUrl('/coupon/imgrc0122590661.jpg') === 'https://image.rakuten.co.jp/b-faith/cabinet/coupon/imgrc0122590661.jpg');
 
-check('payload: 画像は CABINET location + 共通バナー3枚が末尾 (配送方法未確定)',
+check('payload: 画像は CABINET location + 共通バナー3枚が末尾 (配送バナーの無い配送方法)',
   pl.images.length === 4 && pl.images[0].type === 'CABINET' && pl.images[0].location === '/app-newitems/rk-smoke-1-1.jpg'
   && pl.images[1].location === '/coupon/imgrc0122590661.jpg'
   && pl.images[3].location === '/11720388/refund.jpg',
@@ -1229,17 +1233,24 @@ db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id
 db.prepare(`INSERT OR REPLACE INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 原価, 送料, 配送方法, 消費税率, updated_at)
   VALUES (99401, 'rk-smoke-1', '出品smoke', '1', '取扱中', 'ok', 660, 120, '定形外', 0.1, '2026-08-03T00:00:00Z')`).run();
 let bNe = listing.buildItemPayload(db, rkId);
-check('payload: アプリ指定なしは NE配送方法から定形外バナーを選ぶ',
-  bNe.ok === true && bNe.payload.images.some((i) => i.location === '/07722747/08581403/teikeigai_soryomuryo.jpg')
-  && !bNe.payload.images.some((i) => i.location === '/07722747/09610094/imgrc0104897185.jpg'),
-  JSON.stringify(bNe.payload?.images || bNe.reasons));
-// 🚨 RMS へ送る配送方法は **セットだけ** NE へフォールバックする (§4.4 決⑥ / Codex high 2巡目)。
-// 単品まで NE に落とすと、いま店舗デフォルトで出ている商品の配送方法が黙って変わる = 決⑥の範囲外。
-// バナー (上のテスト) は従来どおり NE を見るので、単品では「バナー = 定形外 / RMS = 店舗デフォルト」
-// のままになる。これは既存の挙動で、変えるかどうかは中原さんの判断待ち
-check('payload: 単品はアプリ指定なしなら配送方法を送らない (従来どおり店舗デフォルトに任せる)',
-  bNe.payload?.variants?.['rk-smoke-1']?.shipping?.shippingMethodGroup === undefined,
-  JSON.stringify(bNe.payload?.variants?.['rk-smoke-1']?.shipping || bNe.reasons));
+// 🚨 RMS へ送る配送方法は **セットだけ** NE へフォールバックする (§4.4 決⑥)。
+// 単品まで NE に落とすと、いま店舗デフォルトで出ている商品の配送方法が黙って変わるため。
+// では単品はどうするか → **選んでいないなら出品を止める** (中原さん判断 2026-09-05)。
+// 送らないまま出すと、帯 (バナー) は NE の「定形外」なのに楽天の設定は店舗デフォルト、
+// という食い違いが誰にも気づかれないまま世に出る
+check('🚨 単品は配送方法を選んでいないと出品できない (帯と楽天の設定が食い違うのを防ぐ)',
+  bNe.ok === false
+  && (bNe.reasons || []).some((x) => /配送方法を選んでください/.test(x)),
+  JSON.stringify(bNe.reasons || []));
+// 止めるだけで、画面のプレビューは従来どおり NE の配送方法で帯を描く
+// (「NE ではこうなる」が見えないと、何を選べばよいか分からない)
+check('アプリ指定なしでも、帯は NE の配送方法 (定形外) から選ばれる',
+  listing.trailingBannerLocations(listing.effectiveShippingForDraft(db, 'rk-smoke-1', null).group)[0]
+    === '/07722747/08581403/teikeigai_soryomuryo.jpg',
+  JSON.stringify(listing.trailingBannerLocations(listing.effectiveShippingForDraft(db, 'rk-smoke-1', null).group)));
+// 配送方法を戻す。ここから下のテストは「配送方法は選んである」前提で payload の中身を見る
+// (2026-09-05 から未選択は出品ゲートで止まるので、戻さないと以降が全部止まる)
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
 check('🚨 payload の配送方法: セットだけ NE へフォールバックする (単品は従来どおり)',
   listing.payloadShippingGroup({ parent_draft_id: 7 }, { group: '1' }, { group: null }) === '1'
   && listing.payloadShippingGroup({ parent_draft_id: null }, { group: '1' }, { group: null }) === ''
@@ -1507,7 +1518,8 @@ b27 = listing.buildItemPayload(db, rkId);
 check('payload: 配送方法/納期の不正値を弾く',
   b27.ok === false && b27.reasons.some((r) => r.includes('配送方法')) && b27.reasons.some((r) => r.includes('納期')),
   JSON.stringify(b27.reasons));
-db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL, normal_delivery_date_id = NULL WHERE draft_id = ?`).run(rkId);
+// 後始末は NULL ではなく妥当な値に (2026-09-05 から未選択は出品ゲートで止まる)
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5', normal_delivery_date_id = NULL WHERE draft_id = ?`).run(rkId);
 
 // 税率の不正値は fail-closed (Codex R1 Medium-1)
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '9.6%' });
@@ -1535,7 +1547,7 @@ db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド�
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gstale', '/app-newitems/rk-smoke-1-stale.jpg')`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
 check('payload: 削除済み画像 (転送履歴のみ) は送らない',
-  b27.ok === true && b27.payload.images.every((i) => !i.location.includes('stale')), JSON.stringify(b27.payload?.images));
+  b27.ok === true && b27.payload.images.every((i) => !i.location.includes('stale')), JSON.stringify(b27.reasons || b27.payload?.images));
 
 // ─── 商品ページ表記の統合 (Codex R1 high: import だけで未統合だった回帰) ───
 db.prepare(`INSERT INTO draft_page_info (draft_id, product_type, content_volume) VALUES (?, 'cosmetics', '50ml')`).run(rkId);
@@ -1564,7 +1576,8 @@ check('payload: 仕様表とページ表記の同名ラベルはページ表記�
   && !b27.payload.productDescription.pc.includes('W10cm'),
   JSON.stringify(b27.reasons || null));
 db.prepare(`UPDATE draft_page_info SET size_text = NULL WHERE draft_id = ?`).run(rkId);
-db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id = ?`).run(rkId);
+// 発送方法の行を出さない状態を作る (バナーの付かない配送方法。NULL にすると出品ゲートで止まる)
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '4' WHERE draft_id = ?`).run(rkId);
 db.prepare(`DELETE FROM draft_page_info WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
 check('payload: page_info 未保存でも説明は表形式 (表記の行だけ載らない)',
@@ -1595,7 +1608,7 @@ db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'rk-smoke-1'`).run();
 insProd.run(9301, 'rkv-a', 'バリA', 'rkv');
 insProd.run(9302, 'rkv-b', 'バリB', 'rkv');
 const rkvId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price) VALUES ('rkv', 'バリエページ', 1000)`).run().lastInsertRowid);
-db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id) VALUES (?, '1')`).run(rkvId);
+db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, shipping_method_group) VALUES (?, '1', '4')`).run(rkvId);
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'g2')`).run(rkvId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'g2', '/x/y.jpg')`).run(rkvId);
 // 出品できる状態にする (TOP画像 sort=0 + 詳細画像は対象外) → 残る不足は項目選択肢だけ
@@ -1761,8 +1774,8 @@ check('genre: 未キャッシュは null', listing.getCachedGenreAttributes(db, 
 
 // ─── 辞書ありでの buildItemPayload 事前検証 ───
 const gdId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price, jan_code) VALUES ('gd-smoke-1', '辞書検証商品', 2980, '4999999999999')`).run().lastInsertRowid);
-db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json)
-  VALUES (?, '900001', '[{"name":"ブランド名","values":["テストブランド"]},{"name":"代表カラー","values":["ブラック"]}]')`).run(gdId);
+db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, shipping_method_group)
+  VALUES (?, '900001', '[{"name":"ブランド名","values":["テストブランド"]},{"name":"代表カラー","values":["ブラック"]}]', '4')`).run(gdId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gd1', '/x/gd1.jpg')`).run(gdId);
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gd1')`).run(gdId);
 // 画像トラック: 画像ありの初回推定で TOP は done、詳細は「対象外」にしてゲートを通す
@@ -1815,8 +1828,8 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   insProd.run(9312, 'gdv-b', 'バリB', 'gdv');
   const gdvId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price, jan_code) VALUES ('gdv', '辞書バリエ', 1500, '4999999999999')`).run().lastInsertRowid);
   db.prepare(`UPDATE product_drafts SET detail_images_excluded = 1 WHERE id = ?`).run(gdvId);
-  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, variant_selector_name)
-    VALUES (?, '900001', '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]}]', 'カラー')`).run(gdvId);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, variant_selector_name, shipping_method_group)
+    VALUES (?, '900001', '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]}]', 'カラー', '4')`).run(gdvId);
   db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'gdv1', 0)`).run(gdvId);
   db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gdv1', '/x/gdv1.jpg')`).run(gdvId);
   const insSelV = db.prepare('INSERT INTO draft_sku_selector_values (draft_id, sku_code, value) VALUES (?, ?, ?)');
@@ -1860,8 +1873,8 @@ check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラー�
   insProd.run(9322, 'gsa-b', 'バリB', 'gsa');
   const gsaId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price) VALUES ('gsa', '仕様バリエ', 1500)`).run().lastInsertRowid);
   db.prepare(`UPDATE product_drafts SET detail_images_excluded = 1 WHERE id = ?`).run(gsaId);
-  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number, variant_selector_name)
-    VALUES (?, '900001', '[{"name":"ブランド名","values":["共通ブランド"]}]', 'M-COMMON', 'カラー')`).run(gsaId);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number, variant_selector_name, shipping_method_group)
+    VALUES (?, '900001', '[{"name":"ブランド名","values":["共通ブランド"]}]', 'M-COMMON', 'カラー', '4')`).run(gsaId);
   db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'gsa1', 0)`).run(gsaId);
   db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gsa1', '/x/gsa1.jpg')`).run(gsaId);
   const insSelA = db.prepare('INSERT INTO draft_sku_selector_values (draft_id, sku_code, value) VALUES (?, ?, ?)');
@@ -3497,6 +3510,20 @@ let wfSetParentId = null;
   db.prepare(`DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_ne_register'`).run(parentId);
   check('確定後は出品ゲートが開く',
     !(listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /商品コード/.test(x)));
+
+  // 配送方法 (§4.4 決⑥ + 2026-09-05 中原さん判断)。
+  // セットは親からコピーしないので、**NE の配送方法が唯一の出どころ**。
+  // NE にも無ければ「決まらない」ので出品を止める — 送らないまま出すと、
+  // 商品ページの帯と楽天の設定が食い違ったまま世に出る
+  check('セット: NE に配送方法が無ければ出品を止める',
+    (listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /配送方法が決まりません/.test(x)),
+    JSON.stringify(listing.buildItemPayload(db, r.draftId).reasons || []));
+  db.prepare(`UPDATE mirror_products SET 配送方法 = 'ネコポス' WHERE 商品コード = 'WF-SET-REAL'`).run();
+  check('セット: NE に配送方法が載れば、選ばなくても出品できる (単品と違うのはここ)',
+    !(listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /配送方法/.test(x)),
+    JSON.stringify(listing.buildItemPayload(db, r.draftId).reasons || []));
+  // (送る値そのものは payloadShippingGroup の単体テストで見ている。
+  //  ここは画像が未登録なので payload まで組み上がらない = 出品ゲートの他の理由が先に立つ)
   check('確定後は Notion カードも作れる',
     dbmod.canWriteToNotion(db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId)) === true);
   db.prepare(`DELETE FROM mirror_products WHERE product_id = 99401`).run();
@@ -5250,6 +5277,80 @@ let wfSetParentId = null;
   check('整合化: 重要度=他社なのに own_brand=1 → 0 に直す', bfRow(bf2).own_brand === 0);
   check('整合化: own_brand=1 で重要度未設定 → 自社商品を入れる', bfRow(bf3).image_priority === '自社商品（重要度：高）');
   for (const id of [bf1, bf2, bf3]) db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+
+  // ─── 配送方法: 「選んでいない」が保存で勝手に埋まらないこと (2026-09-05 / Codex high) ───
+  // 画面は全項目をまとめて送る (collectRakutenFields) ので、未選択のとき NE の値を
+  // **選択済みで描く**と、配送方法に触れずジャンルだけ保存した人が「選んだ」ことになってしまう。
+  // 出品ゲートは「人が選んでいないと出せない」なので、そこが崩れる
+  {
+    const idSh = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('SHIP-PICK', '配送未選択テスト', 'smoke')
+    `).run().lastInsertRowid);
+    db.prepare(`
+      INSERT OR REPLACE INTO mirror_products
+        (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 配送方法, updated_at)
+      VALUES (99450, 'SHIP-PICK', '配送未選択テスト', '1', '取扱中', 'ok', 'ネコポス', '2026-09-05T00:00:00Z')
+    `).run();
+    const shipOf = () => db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(idSh);
+
+    // 検査は**配送方法の select の中だけ**に限定する (画面には他にも select があり、
+    // HTML 全体を正規表現で見ると別の select の状態で結果が変わる — Codex R2 medium)
+    const shipSelect = (html) => (html.match(/<select id="rk-shipping-group"[\s\S]*?<\/select>/) || [''])[0];
+
+    // ① NE には配送方法があるが、DB は未選択のまま
+    const html0 = await (await fetch(`${base}/detail/${idSh}`)).text();
+    const sel0 = shipSelect(html0);
+    check('配送: 未選択の商品は「選んでください」が選ばれた状態で描く (NEの値を勝手に選ばない)',
+      /<option value="" selected>— 選んでください<\/option>/.test(sel0)
+      && !/<option value="5"[^>]*selected/.test(sel0),
+      sel0.slice(0, 300));
+    check('配送: NE の値は「候補」として出し、押して初めて入る',
+      html0.includes('id="rk-ship-use-ne"') && html0.includes('未選択です') && html0.includes('ネコポス'),
+      '');
+
+    // ② 配送方法に触れずジャンルだけ保存 → 未選択のままであること
+    let r0 = await call('POST', `/api/drafts/${idSh}/rakuten`, { genre_id: '565004', shipping_method_group: '' });
+    check('配送: ジャンルだけ保存しても配送方法は未選択のまま (勝手に確定しない)',
+      r0.status === 200 && !shipOf()?.shipping_method_group, JSON.stringify(shipOf()));
+    check('配送: 未選択のままでは出品できない',
+      (listing.buildItemPayload(db, idSh).reasons || []).some((x) => /配送方法を選んでください/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, idSh).reasons || []));
+
+    // ③ 人が選んで保存すれば入る (「これにする」= NE の値でも、選んだのは人)
+    r0 = await call('POST', `/api/drafts/${idSh}/rakuten`, { genre_id: '565004', shipping_method_group: '5' });
+    check('配送: 人が選んで保存すれば入り、その値で描かれる',
+      r0.status === 200 && shipOf()?.shipping_method_group === '5', JSON.stringify(shipOf()));
+    const html1 = await (await fetch(`${base}/detail/${idSh}`)).text();
+    const sel1 = shipSelect(html1);
+    check('配送: 選んだあとは選んだ値が選択状態になる',
+      /<option value="5"[^>]*selected/.test(sel1)
+      && !/<option value="" selected>— 選んでください/.test(sel1), sel1.slice(0, 300));
+    check('配送: 選んだあとは未選択の警告を出さない', !html1.includes('未選択です'));
+
+    // ④ セットは NE の値をそのまま使うので、選ばなくても出品できる。
+    //    ここで単品と同じ「出品できません」を出すと嘘になる (Codex R2 medium)
+    const idShSet = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by, parent_draft_id, provisional_code)
+      VALUES ('SHIP-PICK-SET', '配送未選択のセット', 'smoke', ?, 0)
+    `).run(idSh).lastInsertRowid);
+    db.prepare(`
+      INSERT OR REPLACE INTO mirror_products
+        (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 配送方法, updated_at)
+      VALUES (99451, 'SHIP-PICK-SET', '配送未選択のセット', '1', '取扱中', 'ok', 'ネコポス', '2026-09-05T00:00:00Z')
+    `).run();
+    const htmlSet = await (await fetch(`${base}/detail/${idShSet}`)).text();
+    check('配送: セットは「NE の配送方法をそのまま使う」と案内する (出品できない扱いにしない)',
+      htmlSet.includes('セットは NE の配送方法') && !htmlSet.includes('未選択です（このままでは出品できません）'),
+      htmlSet.includes('未選択です（このままでは出品できません）') ? '単品と同じ警告が出ている' : '案内が出ていない');
+    check('配送: セットは選んでいなくても配送方法では止まらない',
+      !(listing.buildItemPayload(db, idShSet).reasons || []).some((x) => /配送方法/.test(x)),
+      JSON.stringify(listing.buildItemPayload(db, idShSet).reasons || []));
+    db.prepare('DELETE FROM mirror_products WHERE product_id = 99451').run();
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idShSet);
+
+    db.prepare('DELETE FROM mirror_products WHERE product_id = 99450').run();
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSh);
+  }
 
   server.close();
 }
