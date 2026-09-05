@@ -114,7 +114,8 @@ console.log('\n[2b] 出力CSVが書き変わったかを返す (呼び出し側�
   writeScript(0, 'first', { writesCsv: true, csvBody: 'a\n' });
   const r1 = await call('POST', '/service-api/logizard/nyuka-refresh');
   const j1 = await waitJob(r1.body.jobId);
-  eq(j1.result.csvChanged, true, '初回は書き変わった');
+  eq(j1.result.csvWritten, true, '初回は今回の実行が書いた');
+  eq(j1.result.csvSameContent, null, '前回が無ければ同じかどうかは言えない');
   ok(j1.result.csv && j1.result.csv.size > 0, `出力CSVの世代を返す (${JSON.stringify(j1.result.csv)})`);
 
   svc._resetForTest();
@@ -123,8 +124,24 @@ console.log('\n[2b] 出力CSVが書き変わったかを返す (呼び出し側�
   const before = fs.statSync(OUT_CSV).mtimeMs;
   const r2 = await call('POST', '/service-api/logizard/nyuka-refresh');
   const j2 = await waitJob(r2.body.jobId);
-  eq(j2.result.csvChanged, false, '2回目は書き変わっていない');
+  eq(j2.result.csvWritten, false, '古い CSV を残したまま終了コード0 → 今回は書いていないと分かる');
+  eq(j2.result.csvSameContent, null, '書いていないので「同じ」とは言わない');
   eq(fs.statSync(OUT_CSV).mtimeMs, before, 'CSV は触っていない');
+
+  svc._resetForTest();
+  // 今回の実行が同じ中身で書き直した → 「増えていない」と言い切ってよい
+  writeScript(0, 'same again', { writesCsv: true, csvBody: 'a\n' });
+  const r2b = await call('POST', '/service-api/logizard/nyuka-refresh');
+  const j2b = await waitJob(r2b.body.jobId);
+  eq(j2b.result.csvWritten, true, '今回の実行が書き直した');
+  eq(j2b.result.csvSameContent, true, '中身は前回と同じ');
+
+  svc._resetForTest();
+  // 中身が変わった
+  writeScript(0, 'changed', { writesCsv: true, csvBody: 'a\nb\n' });
+  const r2c = await call('POST', '/service-api/logizard/nyuka-refresh');
+  const j2c = await waitJob(r2c.body.jobId);
+  eq(j2c.result.csvSameContent, false, '中身が変わったら false');
 
   svc._resetForTest();
   // 🚨 終了コード0でも CSV が無いときは「同じ」ではなく「分からない」(null)。
@@ -133,7 +150,8 @@ console.log('\n[2b] 出力CSVが書き変わったかを返す (呼び出し側�
   writeScript(0, 'no csv written');
   const r3 = await call('POST', '/service-api/logizard/nyuka-refresh');
   const j3 = await waitJob(r3.body.jobId);
-  eq(j3.result.csvChanged, null, 'CSV が無ければ csvChanged=null (未検証)');
+  eq(j3.result.csvWritten, false, 'CSV が無ければ csvWritten=false (未検証)');
+  eq(j3.result.csvSameContent, null, 'csvSameContent も null');
   eq(j3.result.csv, null, 'csv も null');
 }
 

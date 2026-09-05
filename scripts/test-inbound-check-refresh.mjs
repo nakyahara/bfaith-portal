@@ -130,18 +130,18 @@ console.log('\n[4] 増えていなかった = 失敗ではない (ただし届�
   _resetForTest();
   // Drive は動かないが、miniPC が「出力CSVは前回と同じ」と言っている → 増えていないことは確か
   startRefresh({
-    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvChanged: false } }),
+    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvWritten: true, csvSameContent: true } }),
     drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A', importResult: { ok: false, error: 'duplicate_file' } }),
     timing: FAST,
   });
   const s = await _waitIdleForTest();
-  ok(s.state === 'done' && s.unchanged && s.verified, 'miniPC 側で中身が同じと分かっていれば「新規なし」と言ってよい');
+  ok(s.state === 'done' && s.unchanged && s.verified, '今回の実行が書き直して中身が同じなら「新規なし」と言ってよい');
 }
 {
   _resetForTest();
   // 🚨 取り直したのに新しい世代を確認できない (転送漏れ / Drive 障害) → 「新規なし」と言い切らない
   startRefresh({
-    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvChanged: true } }),
+    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvWritten: true, csvSameContent: false } }),
     drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A', importResult: { ok: false, error: 'duplicate_file' } }),
     timing: FAST,
   });
@@ -154,7 +154,7 @@ console.log('\n[4] 増えていなかった = 失敗ではない (ただし届�
   _resetForTest();
   // 新しいバッチができたなら裏取りは不要 (新しい世代が届いた証拠そのもの)
   startRefresh({
-    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvChanged: true } }),
+    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvWritten: true, csvSameContent: false } }),
     drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A' }),
     timing: FAST,
   });
@@ -163,20 +163,20 @@ console.log('\n[4] 増えていなかった = 失敗ではない (ただし届�
 }
 {
   _resetForTest();
-  // 🚨 終了コード0でも CSV を作れていない (csvChanged=null) ときは「新規なし」と言わない
+  // 🚨 終了コード0でも今回の実行が CSV を書いていない (csvWritten=false) ときは「新規なし」と言わない
   startRefresh({
-    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvChanged: null } }),
+    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvWritten: false, csvSameContent: null } }),
     drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A', importResult: { ok: false, error: 'duplicate_file' } }),
     timing: FAST,
   });
   const s = await _waitIdleForTest();
-  ok(s.state === 'failed' && s.error === 'not_verified', 'csvChanged=null は未検証として扱う');
+  ok(s.state === 'failed' && s.error === 'not_verified', '今回の実行が CSV を書いていなければ未検証として扱う');
 }
 {
   _resetForTest();
   // 🚨 更新日時が**戻った** (古いファイルに差し替わった) のを「新しい世代が届いた」と読まない
   startRefresh({
-    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvChanged: true } }),
+    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvWritten: true, csvSameContent: false } }),
     drive: makeDrive({ modifiedBefore: '2026-09-05T10:00:00.000Z', modifiedAfter: '2026-09-05T09:00:00.000Z', importResult: { ok: false, error: 'duplicate_file' } }),
     timing: FAST,
   });
@@ -255,7 +255,7 @@ console.log('\n[7] Drive の反映待ち');
   _resetForTest();
   // 更新日時が動かなくても上限まで待って取り込みには行く (判定は取込側 + 裏取りで決める)
   const calls = [];
-  startRefresh({ actor: 'test', fetchFn: makeFetch({ calls, jobResult: { ok: true, csvChanged: false } }), drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A', importResult: { ok: false, error: 'duplicate_file', message: '同じ' } }), timing: FAST });
+  startRefresh({ actor: 'test', fetchFn: makeFetch({ calls, jobResult: { ok: true, csvWritten: true, csvSameContent: true } }), drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A', importResult: { ok: false, error: 'duplicate_file', message: '同じ' } }), timing: FAST });
   const s = await _waitIdleForTest();
   ok(s.state === 'done' && s.unchanged, '待っても動かなければ取り込みに行き、裏取りできていれば変化なしとして返す');
 }

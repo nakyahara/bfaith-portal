@@ -159,12 +159,13 @@ async function runRefresh({ actor, fetchFn, drive, timing }) {
      *    「新しい入荷受付はありませんでした」と言ってはいけない。転送漏れ・Drive 障害・反映遅れでも
      *    同じ見た目になり、現場は「ロジザードに登録できていないのか」と誤解する。
      *  裏取りは2つ。どちらかが取れれば「確かめられた」とする:
-     *    - Drive の更新日時が動いた
-     *    - miniPC 側の出力 CSV が**前回と同じ中身だった** (= 増えていないことがこちらで確定している。
-     *      rclone は中身が同じなら転送を省くことがあるので、Drive が動かないのが正しい)
+     *    - Drive の更新日時が**進んだ**
+     *    - miniPC が**今回の実行で CSV を書き直し** (csvWritten)、その中身が**前回と同じ** (csvSameContent)
+     *      = 増えていないことが miniPC 側で確定している (rclone は中身が同じなら転送を省くので Drive が動かないのが正しい)。
+     *      🚨 「前後で同じ」だけでは足りない — 古い CSV を残したまま終了コード0で終わった場合と区別できない
      */
-    const csvChanged = job.result && typeof job.result.csvChanged === 'boolean' ? job.result.csvChanged : null;
-    const verified = driveAdvanced || csvChanged === false;
+    const res = job.result || {};
+    const verified = driveAdvanced || (res.csvWritten === true && res.csvSameContent === true);
 
     // ③ 取り込む (fail-closed の判定・確認状態の引き継ぎは既存のまま)
     const r = await drive.fetchAndImportFromDrive({ actor, source: 'drive_retry' });

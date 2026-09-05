@@ -19,6 +19,7 @@
  */
 import { Router } from 'express';
 import { spawn, execFile } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { createJob, getJob } from './job-manager.js';
@@ -167,11 +168,16 @@ function runScript(scriptPath) {
   });
 }
 
-/** 出力 CSV の世代 (取得できたことの裏取り。無くても取得自体は成立するので null を許す) */
+/**
+ * 出力 CSV の世代 (取得できたことの裏取り。無くても取得自体は成立するので null を許す)。
+ * 中身のハッシュまで取るのは、「今回の実行が書いたのか」「前回と同じ中身なのか」を
+ * 呼び出し側が区別できるようにするため (mtime だけでは前者を証明できない)。
+ */
 function outCsvStamp() {
   try {
     const st = fs.statSync(OUT_CSV);
-    return { path: OUT_CSV, size: st.size, mtime: new Date(st.mtimeMs).toISOString() };
+    const sha256 = crypto.createHash('sha256').update(fs.readFileSync(OUT_CSV)).digest('hex');
+    return { path: OUT_CSV, size: st.size, mtime: new Date(st.mtimeMs).toISOString(), mtimeMs: st.mtimeMs, sha256 };
   } catch { return null; }
 }
 
@@ -249,13 +255,19 @@ router.post('/nyuka-refresh', (req, res) => {
       // ③ 出力 CSV が実際に書き変わったかを返す。呼び出し側 (Render) は
       //    「取れていないのに『新しい入荷はありません』」と言わないための裏取りに使う
       const after = outCsvStamp();
+      // 🚨 呼び出し側が「増えていなかった」と言い切ってよいのは
+      //    **今回の実行が CSV を書き直し (csvWritten)、その中身が前回と同じ (csvSameContent)** ときだけ。
+      //    「前後で size/mtime が同じ」だけでは、古い CSV を残したまま終了コード0になった場合と区別できず、
+      //    取れていないのに「新しい受付なし」と表示してしまう
+      //    判定は**更新時刻が変わったか**で行う (同じ中身で書き直しても mtime は動く)。
+      //    「実行開始より新しいか」で見ると、直前の実行で書かれたばかりのファイルを
+      //    時刻分解能の許容ぶん「今回書いた」と誤判定する
+      const csvWritten = !!after && (!before || after.mtimeMs !== before.mtimeMs);
       return {
         ok: true, output: r.output, waitedForLock: waited,
-        csv: after,
-        // 🚨 CSV が無い (終了コード0でも出力できていなかった) ときは **null = 分からない**。
-        //    false にすると呼び出し側が「前回と同じ = 増えていない」と誤読し、古いままの Drive を
-        //    「新しい受付なし」と表示してしまう
-        csvChanged: after ? (!before || after.mtime !== before.mtime || after.size !== before.size) : null,
+        csv: after ? { size: after.size, mtime: after.mtime, sha256: after.sha256 } : null,
+        csvWritten,
+        csvSameContent: csvWritten && !!before ? after.sha256 === before.sha256 : null,
       };
     } finally {
       // 🚨 連打防止は**終わった時刻**から数える (受付時刻からだと、60秒より長いジョブの直後に再実行できる)
