@@ -585,6 +585,34 @@ export const JOBS_REGISTRY = [
       + 'env NOTION_TOKEN / INBOUND_CHECK_NOTION_DB_ID 必須 + Notion 側で対象DBのコネクトに既存インテグレーションを追加。'
       + '4xx で止まった行は同節の「再送」で解除してから送る。設計 = Downloads『在庫化カード置き換え_Codex設計相談R1_20260902.md』',
   },
+  {
+    id: 'render-backup',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'Render にしかないデータ (warehouse-mirror.db の Render 正本 = po_* 発注 / pd_* 出荷伝票 / draft_* 商品登録 / '
+      + 'f_iroha_* いろは作業 / f_inbound_* 入荷検品 / inv_snapshot 棚卸し / mgmt_* 会計確定値 / ai_*、'
+      + 'inquiry-hub.db 問い合わせ、staff.db 社員、fba.db、profit.db、rakuten-yahoo-sync.db、easy-ship.db、shohyo-links.db、'
+      + 'fba-box.db、postage.db、users.json) を毎晩 Google Drive (bfaith-backup/render) へ退避する唯一の手段。'
+      + 'Drive 世代 = 日次 14 日 + 月次 13 か月。止まると Render ディスク以外にデータの写しが無くなる。'
+      + '⭐2026-07-20 #590 で作ったが Dark Launch (env 未設定) のまま台帳にも載っておらず、'
+      + '2026-09-05 の Company DB 実機確認 (R-2) で「7 週間一度も動いていない」と判明 → 登録。'
+      + '有効化されるまでは ping が来ず「締切超過」に出続ける (= 有効化の催促。消すのではなく env を入れる)',
+    where: 'Render bfaith-portal 内 node-cron (apps/render-backup/backup-render.js startRenderBackupCron。'
+      + 'RENDER_BACKUP_CRON_ENABLED=1 のときだけ起動。miniPC では動かない)',
+    schedule: '毎日 03:30 JST (env RENDER_BACKUP_CRON、UTC 18:30) + 起動5分後の catch-up (当日分が無く定刻超過なら) '
+      + '+ 6時間毎 staleness (最終成功から 26h 超で再実行)。手動 = Render Shell で node apps/render-backup/backup-render.js run',
+    anchor_hour_jst: 3,
+    anchor_minute_jst: 30,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: '有効化 = Render dashboard → bfaith-portal → Environment に RENDER_BACKUP_CRON_ENABLED=1 / '
+      + 'BACKUP_RCLONE_REMOTE=gdrive:bfaith-backup/render / BACKUP_RCLONE_CONFIG=/etc/secrets/rclone.conf、'
+      + 'Secret Files に rclone.conf (miniPC C:\\tools\\rclone\\rclone.conf の中身) → 再デプロイ → 5 分後の catch-up で初回が走り '
+      + 'GChat に「✅ Renderバックアップ」。Render Logs は「render-backup」で検索。最終成功 = /data/backup-render/last-success.json。'
+      + '容量が心配なら BACKUP_REMOTE_DAILY_KEEP_DAYS=7。復元手順・設計の正本 = AI_reference『システム設計/Renderバックアップ_引き継ぎ_20260719.md』、'
+      + '実機確認 = 『CompanyDB構想/_実機確認/実機確認_20260905.md』§8.2',
+  },
   // ⭐2026-08-05 追加分 — 2026-08-01 の棚卸しは miniPC Task Scheduler だけが対象で、
   //   Render 内の node-cron / 常駐ワーカーはカテゴリごと台帳から漏れていた。
   //   同時に、これらが miniPC でも二重起動していたため Render 専用ガードを入れている
