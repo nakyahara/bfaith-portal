@@ -15,7 +15,7 @@
 import crypto from 'node:crypto';
 import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
 // 欠品フローv2 PR2: 再取込 (overwrite) 前に、ピッカーの「後で取りに行く」の展開を依頼へ戻す
-import { resetLaterBindingsForPackBatch, resolveFloorAlertsByTask, resolveFloorAlertsByRef, reconcileShortageAlerts } from '../picking/service.js';
+import { resetLaterBindingsForPackBatch, resolveFloorAlertsByTask, resolveFloorAlertsByRef, reconcileShortageAlerts, shortageAllocRefKey } from '../picking/service.js';
 import {
   getDB, getPackBatchByTbKey, utcNow, jstToday,
 } from './db.js';
@@ -348,9 +348,8 @@ export function importPackBatch(preview, { folderName, overwrite, matchAck, date
   const result = importPackBatchTx(preview, { folderName, overwrite, matchAck, dateAck }, actor);
   // 取込・再取込で伝票番号 (#seq) とリンクが決まる/変わる → ピッカーの欠品バナー (🕒/❌) を作り直す (Codex R1 High)。
   // picking 側の接続で書くので、梱包のトランザクションが閉じた後に呼ぶ (中で呼ぶと書き込みロック待ち)
-  if (!result.replayed) {
-    try { reconcileShortageAlerts({ tbNo: preview.tbKey }); } catch (e) { console.warn(`[packing] 欠品バナーの収束失敗: ${e.message}`); }
-  }
+  // replay (同一 CSV の再 confirm) でも呼ぶ — no_picking → ok の突合更新はその経路で起きる (Codex R2 Medium)。収束は冪等
+  try { reconcileShortageAlerts({ tbNo: preview.tbKey }); } catch (e) { console.warn(`[packing] 欠品バナーの収束失敗: ${e.message}`); }
   return result;
 }
 
@@ -1528,9 +1527,13 @@ function slipLineOf(db, batchId, slipSeq, sku) {
  * 配賦 (pk_shortage_allocations) の参照はこれで絞る — tb_no だけだと再取込・別日の同名バッチの配賦まで拾う (Codex R1)
  */
 function pickingBatchIdFor(db, batch) {
-  if (batch.pk_batch_id) return batch.pk_batch_id;
   try {
-    return db.prepare(`SELECT id FROM pk_batches WHERE tb_no=? AND validity='valid' AND origin != 'repick' ORDER BY id DESC LIMIT 1`)
+    // 明示の突合値が壊れている (不存在・無効・取消・repick) ときは tb_no へ黙って倒さず null (別バッチを掴まない — Codex R2)
+    if (batch.pk_batch_id != null) {
+      return db.prepare(`SELECT id FROM pk_batches WHERE id=? AND validity='valid' AND status != 'cancelled' AND origin != 'repick'`)
+        .get(batch.pk_batch_id)?.id ?? null;
+    }
+    return db.prepare(`SELECT id FROM pk_batches WHERE tb_no=? AND validity='valid' AND status != 'cancelled' AND origin != 'repick' ORDER BY id DESC LIMIT 1`)
       .get(batch.tb_key)?.id ?? null;
   } catch { return null; }
 }
@@ -1542,12 +1545,12 @@ function resolveAllocAlertsForSlip(db, batch, slip) {
   try {
     const pkId = pickingBatchIdFor(db, batch);
     if (!pkId) return 0;
-    rows = db.prepare(`SELECT DISTINCT batch_id, line_seq, ne_slip_no FROM pk_shortage_allocations WHERE batch_id=? AND ne_slip_no=?`)
+    rows = db.prepare(`SELECT id, batch_id, line_seq, ne_slip_no FROM pk_shortage_allocations WHERE batch_id=? AND ne_slip_no=?`)
       .all(pkId, slip.ne_slip_no);
   } catch { return 0; }
   let n = 0;
   for (const r of rows) {
-    n += resolveFloorAlertsByRef(`alloc:${r.batch_id}:${r.line_seq}:${r.ne_slip_no}`, { dbh: db, failSoft: true });
+    n += resolveFloorAlertsByRef(shortageAllocRefKey(r), { dbh: db, failSoft: true });
   }
   return n;
 }
@@ -1609,13 +1612,17 @@ function foundPickingStockout(db, batch, slip, sku, now) {
   const pkId = pickingBatchIdFor(db, batch);
   if (!pkId) throw new PackError(409, 'no_stockout', '取り消す欠品報告がありません');
   const skuN = sku ? normSku(sku) : null;
-  const allocs = db.prepare(`SELECT id, batch_id, line_seq, ne_slip_no, sku FROM pk_shortage_allocations
-    WHERE batch_id=? AND ne_slip_no=? AND kind='none'`).all(pkId, slip.ne_slip_no)
-    .filter((a) => !skuN || normSku(a.sku) === skuN);
+  const all = db.prepare(`SELECT id, batch_id, line_seq, ne_slip_no, sku FROM pk_shortage_allocations
+    WHERE batch_id=? AND ne_slip_no=? AND kind='none'`).all(pkId, slip.ne_slip_no);
+  // SKU 省略は ❌ が1種類のときだけ — 2品とも ❌ の伝票で「片方が見つかった」がもう片方の報告まで消さない (Codex R2 High)
+  if (!skuN && new Set(all.map((a) => normSku(a.sku))).size > 1) {
+    throw new PackError(409, 'sku_required', '複数の商品に欠品の報告があります。見つかった商品を指定してください');
+  }
+  const allocs = all.filter((a) => !skuN || normSku(a.sku) === skuN);
   if (allocs.length === 0) throw new PackError(409, 'no_stockout', '取り消す欠品報告がありません');
   for (const a of allocs) {
+    resolveFloorAlertsByRef(shortageAllocRefKey(a), { dbh: db, failSoft: true });
     db.prepare('DELETE FROM pk_shortage_allocations WHERE id=?').run(a.id);
-    resolveFloorAlertsByRef(`alloc:${a.batch_id}:${a.line_seq}:${a.ne_slip_no}`, { dbh: db });
   }
   void now;
   return {};
@@ -1864,13 +1871,18 @@ export function shortageSummaryFor(batch) {
     const live = status(null, 'requested', 'claimed', 'fulfilled', 'unavailable');
     const candidate = new Set(db.prepare(`SELECT DISTINCT slip_seq FROM pk_pack_incidents WHERE batch_id=? AND status='candidate'
       AND kind IN ('shortage','wrong_item') AND slip_seq IS NOT NULL`).all(batch.id).map((r) => r.slip_seq));
-    const pkId = pickingBatchIdFor(db, batch);
-    const noneSeqs = new Set(pkId ? db.prepare(`SELECT s.seq FROM pk_shortage_allocations a
+    // stockout_ack と同じ条件に揃える: ライン確定後は確認できない・❌ は配賦の SKU が伝票の明細に実在するものだけ (Codex R2 Medium)
+    const lineFinalized = !!lineKindOf(batchHikiateClass(db, batch))
+      && db.prepare("SELECT final_count FROM pk_pack_line_runs WHERE batch_id=? AND phase='run'").get(batch.id)?.final_count != null;
+    const pkId = lineFinalized ? null : pickingBatchIdFor(db, batch);
+    const noneSeqs = new Set(pkId ? db.prepare(`SELECT DISTINCT s.seq FROM pk_shortage_allocations a
       JOIN pk_pack_slips s ON s.batch_id = ? AND s.ne_slip_no = a.ne_slip_no
-      WHERE a.batch_id = ? AND a.kind = 'none' AND s.status = 'pending'`).all(batch.id, pkId).map((r) => r.seq) : []);
+      WHERE a.batch_id = ? AND a.kind = 'none' AND s.status = 'pending'
+        AND EXISTS (SELECT 1 FROM pk_pack_lines pl WHERE pl.slip_id = s.id AND LOWER(TRIM(pl.sku)) = LOWER(TRIM(a.sku)))`)
+      .all(batch.id, pkId).map((r) => r.seq) : []);
     for (const seq of noneSeqs) if (!live.has(seq) && !candidate.has(seq)) out.stockoutWait++;
     for (const s of db.prepare(`SELECT seq FROM pk_pack_slips WHERE batch_id=? AND status='held' AND hold_reason='repick'`).all(batch.id)) {
-      if (unavailable.has(s.seq) && !inProgress.has(s.seq) && !candidate.has(s.seq)) out.stockoutWait++;
+      if (!lineFinalized && unavailable.has(s.seq) && !inProgress.has(s.seq) && !candidate.has(s.seq)) out.stockoutWait++;
       else if (live.has(s.seq)) out.repickWait++;
       else if (candidate.has(s.seq)) out.candidateWait++;
     }

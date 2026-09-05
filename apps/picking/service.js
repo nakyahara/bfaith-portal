@@ -1252,9 +1252,18 @@ function recordShortageAllocations(db, batch, line, lineSeq, { remQty, rem, work
 /** 通知・画面用: その明細の配賦先 (受注×数量)。テーブル未作成環境では空。 */
 export function listShortageAllocations(batchId, lineSeq) {
   try {
-    return getDB().prepare(`SELECT ne_slip_no, qty, kind, created_at FROM pk_shortage_allocations
+    return getDB().prepare(`SELECT id, ne_slip_no, qty, kind, created_at FROM pk_shortage_allocations
       WHERE batch_id=? AND line_seq=? ORDER BY id`).all(batchId, lineSeq);
   } catch { return []; }
+}
+
+/**
+ * 欠品バナー (pk_floor_alerts.ref_key) のキー = 配賦 1 行。配賦 ID を含める = 戻る→再欠品で作り直された配賦は
+ * 別キーになり、1階が閉じた古いバナーと同一秒でも衝突しない (Codex R2 High)。packing 側の解決もこれを使う。
+ * @param {{batch_id:number, line_seq:number, ne_slip_no:string, id:number}} a 配賦行
+ */
+export function shortageAllocRefKey(a) {
+  return `alloc:${a.batch_id}:${a.line_seq}:${a.ne_slip_no}:${a.id}`;
 }
 
 /**
@@ -1605,22 +1614,21 @@ export function announceShortageToPacking(batchId, lineSeq, workerName = null) {
   let pb = null;
   try {
     // 突合済みの梱包バッチ (pk_batch_id) を優先。無ければ tb_key で
-    pb = db.prepare(`SELECT id FROM pk_pack_batches WHERE pk_batch_id=? AND status != 'cancelled' ORDER BY id DESC LIMIT 1`).get(batchId)
-      || db.prepare(`SELECT id FROM pk_pack_batches WHERE tb_key=? AND status != 'cancelled' ORDER BY id DESC LIMIT 1`).get(batch.tb_no)
+    // 突合済み (pk_batch_id = 自分) を優先。tb_key の代替は「未突合」の梱包バッチだけ — 別の picking バッチに突合済みの
+    // ものへリンクすると、梱包側 (pickingBatchIdFor) はその配賦を見せないので「バナーはあるが確認できない」になる (Codex R2)
+    pb = db.prepare(`SELECT id FROM pk_pack_batches WHERE pk_batch_id=? AND validity='valid' AND status != 'cancelled' ORDER BY id DESC LIMIT 1`).get(batchId)
+      || db.prepare(`SELECT id FROM pk_pack_batches WHERE tb_key=? AND pk_batch_id IS NULL AND validity='valid' AND status != 'cancelled' ORDER BY id DESC LIMIT 1`).get(batch.tb_no)
       || null;
   } catch { pb = null; }
   const jstHm = (iso) => { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; };
   // 1階が既に処理したバナー (× で閉じた / 在庫なし確認・受領で resolved) は収束で復活させない。
-  // 配賦より後に閉じられていれば「処理済み」。戻る→再欠品は配賦が作り直されるので新しいバナーが出る
+  // キーに配賦 ID が入っているので、戻る→再欠品で作り直された配賦は別キー = 新しいバナーが出る (同一秒でも — Codex R2)
   const handled = db.prepare(`SELECT 1 FROM pk_floor_alerts
-    WHERE kind='picking_shortage' AND ref_key=?
-      AND ((resolved_at IS NOT NULL AND datetime(resolved_at) >= datetime(?))
-        OR (acked_at IS NOT NULL AND datetime(acked_at) >= datetime(?)))
-    LIMIT 1`);
+    WHERE kind='picking_shortage' AND ref_key=? AND (resolved_at IS NOT NULL OR acked_at IS NOT NULL) LIMIT 1`);
   let made = 0;
   for (const a of listShortageAllocations(batchId, lineSeq)) {
-    const refKey = `alloc:${batchId}:${lineSeq}:${a.ne_slip_no}`;
-    try { if (a.created_at && handled.get(refKey, a.created_at, a.created_at)) continue; } catch { /* 旧DB (列なし) は素通し */ }
+    const refKey = shortageAllocRefKey({ batch_id: batchId, line_seq: lineSeq, ne_slip_no: a.ne_slip_no, id: a.id });
+    if (handled.get(refKey)) continue;
     let slip = null;
     if (pb) {
       try { slip = db.prepare('SELECT seq FROM pk_pack_slips WHERE batch_id=? AND ne_slip_no=?').get(pb.id, a.ne_slip_no) || null; } catch { slip = null; }

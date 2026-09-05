@@ -88,7 +88,7 @@ t('announceShortageToPacking: 配賦した伝票 #2 に ❌ バナー (商品名
   assert.match(a[0].message, /^❌ 出荷_99 #2 くるみサンド 800g ×1 — どのロケにもありません/);
   assert.match(a[0].message, /有國陽/);
   assert.equal(a[0].link, `/apps/packing/work/${pb1}?seq=2`);
-  assert.equal(a[0].ref_key, `alloc:${pk1}:1:V1-NE2`);
+  assert.ok(a[0].ref_key.startsWith(`alloc:${pk1}:1:V1-NE2:`), 'ref_key = alloc:<batch>:<seq>:<NE>:<配賦id>');
 });
 t('もう一度呼んでも増えない (冪等)', () => {
   assert.equal(announceShortageToPacking(pk1, 1, '有國陽'), 0);
@@ -211,7 +211,7 @@ console.log('── Codex R1: 梱包取込前の欠品 → 取込後に収束 (�
   ev(pk, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
   t('取込前: リンクなし・NE 番号表示', () => {
     assert.equal(announceShortageToPacking(pk, 1, '有國陽'), 1);
-    const a = alerts().find((x) => x.ref_key === `alloc:${pk}:1:V5-NE1`);
+    const a = alerts().find((x) => x.ref_key.startsWith(`alloc:${pk}:1:V5-NE1:`));
     assert.equal(a.link, null);
     assert.match(a.message, /\(NE V5-NE1\)/);
   });
@@ -220,16 +220,16 @@ console.log('── Codex R1: 梱包取込前の欠品 → 取込後に収束 (�
     db.prepare('UPDATE pk_pack_batches SET pk_batch_id=? WHERE id=?').run(pk, pb);
     const { reconcileShortageAlerts } = psvcPicking;
     assert.equal(reconcileShortageAlerts({ tbNo: 'V5' }), 1);
-    const mine = alerts().filter((x) => x.ref_key === `alloc:${pk}:1:V5-NE1`);
+    const mine = alerts().filter((x) => x.ref_key.startsWith(`alloc:${pk}:1:V5-NE1:`));
     assert.equal(mine.length, 1);
     assert.equal(mine[0].link, `/apps/packing/work/${pb}?seq=1`);
     assert.match(mine[0].message, /出荷_99 #1 あとから取込/);
     assert.equal(reconcileShortageAlerts({ tbNo: 'V5' }), 0, '変化なしなら何もしない');
   });
   t('担当者を省略しても欠品イベントの担当者で作れる (replay・収束用)', () => {
-    db.prepare("DELETE FROM pk_floor_alerts WHERE ref_key=?").run(`alloc:${pk}:1:V5-NE1`);
+    db.prepare("DELETE FROM pk_floor_alerts WHERE ref_key LIKE ?").run(`alloc:${pk}:1:V5-NE1:%`);
     assert.equal(announceShortageToPacking(pk, 1), 1);
-    assert.match(alerts().find((x) => x.ref_key === `alloc:${pk}:1:V5-NE1`).message, /有國陽/);
+    assert.match(alerts().find((x) => x.ref_key.startsWith(`alloc:${pk}:1:V5-NE1:`)).message, /有國陽/);
   });
 }
 
@@ -240,7 +240,7 @@ console.log('── 収束は1階が閉じたバナーを復活させない (× 
   db.prepare('UPDATE pk_pack_batches SET pk_batch_id=? WHERE id=?').run(pk, pb);
   ev(pk, 'start');
   ev(pk, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
-  const ref = `alloc:${pk}:1:V5B-NE1`;
+  const ref = `alloc:${pk}:1:V5B-NE1:${db.prepare('SELECT id FROM pk_shortage_allocations WHERE batch_id=?').get(pk).id}`;
   t('1階が × で閉じたバナーは reconcile で復活しない', () => {
     announceShortageToPacking(pk, 1, '有國陽');
     const a = alerts().find((x) => x.ref_key === ref);
@@ -264,16 +264,15 @@ console.log('── 収束は1階が閉じたバナーを復活させない (× 
   ev(pk, 'start');
   ev(pk, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
   const so = lastOp();
-  const ref = `alloc:${pk}:1:V5C-NE1`;
-  t('× で閉じた後に 戻る → 再度の欠品は新しい配賦なので、バナーは改めて出る', () => {
+  const ref = `alloc:${pk}:1:V5C-NE1:`;   // 配賦 ID を除いた前方一致
+  t('× で閉じた後に 戻る → 同一秒の再欠品でも新しい配賦 (別キー) なのでバナーは改めて出る', () => {
     announceShortageToPacking(pk, 1, '有國陽');
-    psvcPicking.ackFloorAlert(alerts().find((x) => x.ref_key === ref).id, '三宅晴菜', 'to_packing');
+    psvcPicking.ackFloorAlert(alerts().find((x) => x.ref_key.startsWith(ref)).id, '三宅晴菜', 'to_packing');
     ev(pk, 'back', { lineSeq: 1, undoOpId: so });
-    // 同一秒の比較を避ける (人の操作では数秒以上空く)
-    db.prepare("UPDATE pk_floor_alerts SET resolved_at=datetime(resolved_at, '-5 seconds'), acked_at=datetime(acked_at, '-5 seconds') WHERE ref_key=?").run(ref);
     ev(pk, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
     assert.equal(announceShortageToPacking(pk, 1, '有國陽'), 1);
-    assert.equal(alerts().filter((x) => x.ref_key === ref).length, 1);
+    assert.equal(alerts().filter((x) => x.ref_key.startsWith(ref)).length, 1);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM pk_floor_alerts WHERE ref_key LIKE ?').get(ref + '%').c, 2, '古い (閉じた) バナーと新しいバナーは別行');
   });
 }
 
@@ -292,11 +291,11 @@ console.log('── Codex R1: 解決は配賦の正確なキー (別バッチの
     announceShortageToPacking(pk, 1, '有國陽');
   }
   t('A の伝票を出荷保留にしても B のバナーは残る', () => {
-    assert.equal(alerts().filter((x) => x.ref_key.endsWith(':SAME-NE')).length, 2);
+    assert.equal(alerts().filter((x) => x.ref_key.includes(':SAME-NE:')).length, 2);
     pev(pbA, 'stockout_ack', { slipSeq: 1 });
-    const left = alerts().filter((x) => x.ref_key.endsWith(':SAME-NE'));
+    const left = alerts().filter((x) => x.ref_key.includes(':SAME-NE:'));
     assert.equal(left.length, 1);
-    assert.equal(left[0].ref_key, `alloc:${pkB}:1:SAME-NE`);
+    assert.ok(left[0].ref_key.startsWith(`alloc:${pkB}:1:SAME-NE:`));
   });
 }
 
@@ -331,7 +330,7 @@ console.log('── Codex R1: ❌ が誤りだった (1階で見つかった) �
     assert.equal(db.prepare('SELECT COUNT(*) c FROM pk_shortage_allocations WHERE batch_id=?').get(pk).c, 1);
     const left = alerts().filter((x) => x.ref_key.startsWith(`alloc:${pk}:`));
     assert.equal(left.length, 1);
-    assert.equal(left[0].ref_key, `alloc:${pk}:1:V8-NE1`);
+    assert.ok(left[0].ref_key.startsWith(`alloc:${pk}:1:V8-NE1:`));
     assert.equal(slipRow(pb, 2).status, 'pending');
     const st = psvc.getWorkState(pb);
     assert.equal(st.slips.find((s) => s.seq === 2).pickingShortages.length, 0);
@@ -362,6 +361,117 @@ console.log('── Codex R1: 一覧の件数は操作可能条件と同じ ─�
     assert.deepEqual(psvc.shortageSummaryFor(b), { stockoutWait: 1, repickWait: 1, candidateWait: 1, closed: 0 });
     assert.deepEqual(psvc.getWorkState(pb).stockoutAckSeqs, [2]);
   });
+}
+
+// ═══ Codex R2 ═══════════════════════════════════════════════════════════════
+console.log('── Codex R2: 突合値 (pk_batch_id) が別の picking バッチを指す梱包バッチへは、tb_no が同じでもリンクしない ──');
+{
+  // pk_batches.tb_no は UNIQUE なので「同じ tb_no の有効な2バッチ」は作れない。起き得るのは突合値が別バッチを指すケース
+  const pkA = mkPickBatch('V10', { sku: 'v-two', lineQty: 1, slipQtys: [1] });
+  const pkB = mkPickBatch('V10B', { sku: 'v-two', lineQty: 1, slipQtys: [1] });
+  db.prepare("UPDATE pk_slip_lines SET ne_slip_no='V10-NE1' WHERE batch_id IN (?, ?)").run(pkA, pkB);
+  const pb = mkPackBatch('V10', { sku: 'v-two', slipQtys: [1] });
+  db.prepare('UPDATE pk_pack_batches SET pk_batch_id=? WHERE id=?').run(pkB, pb);
+  ev(pkA, 'start');
+  ev(pkA, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
+  t('A (未突合) の ❌ は B に突合済みの梱包バッチへリンクしない (梱包側が見せない配賦なので「確認できないバナー」を作らない)', () => {
+    assert.equal(announceShortageToPacking(pkA, 1, '有國陽'), 1);
+    const a = alerts().find((x) => x.ref_key.startsWith(`alloc:${pkA}:1:`));
+    assert.equal(a.link, null);
+    assert.match(a.message, /\(NE V10-NE1\)/);
+    assert.deepEqual(psvc.getWorkState(pb).slips[0].pickingShortages, [], '梱包側も A の配賦は見せない');
+  });
+  t('突合済みの B の ❌ はリンク付き', () => {
+    ev(pkB, 'start');
+    ev(pkB, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
+    assert.equal(announceShortageToPacking(pkB, 1, '有國陽'), 1);
+    assert.equal(alerts().find((x) => x.ref_key.startsWith(`alloc:${pkB}:1:`)).link, `/apps/packing/work/${pb}?seq=1`);
+    assert.equal(psvc.getWorkState(pb).slips[0].pickingShortages.length, 1);
+  });
+}
+
+console.log('── Codex R2: 同じ伝票に ❌ が2品 → found は商品の指定が要る ──');
+{
+  const pk = mkPickBatch('V11', { sku: 'v-x1', lineQty: 1, slipQtys: [1], name: '商品X1' });
+  db.prepare(`INSERT INTO pk_lines (batch_id, seq, location, block, sku, product_name, barcode, qty)
+    VALUES (?, 2, '00100102', 'P3FA', 'v-x2', '商品X2', NULL, 1)`).run(pk);
+  db.prepare(`INSERT INTO pk_slip_lines (batch_id, slip_no, picking_no, ne_slip_no, sku, qty, location)
+    VALUES (?, 'SPV11-1', NULL, 'V11-NE1', 'v-x2', 1, '00100102')`).run(pk);
+  const pb = mkPackBatch('V11', { sku: 'v-x1', slipQtys: [1] });
+  const sid = db.prepare('SELECT id FROM pk_pack_slips WHERE batch_id=? AND seq=1').get(pb).id;
+  db.prepare("INSERT INTO pk_pack_lines (slip_id, sku, product_name, qty) VALUES (?, 'v-x2', '商品X2', 1)").run(sid);
+  db.prepare('UPDATE pk_pack_batches SET pk_batch_id=? WHERE id=?').run(pk, pb);
+  ev(pk, 'start');
+  ev(pk, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
+  ev(pk, 'shortage', { lineSeq: 2, shortageQty: 1, altQty: 0, remaining: 'none' });
+  announceShortageToPacking(pk, 1, '有國陽'); announceShortageToPacking(pk, 2, '有國陽');
+  t('画面には2品とも ❌ (赤い箱に商品ごとの「見つかった」)', () => {
+    const st = psvc.getWorkState(pb);
+    assert.deepEqual(st.slips[0].pickingShortages.map((p) => p.sku).sort(), ['v-x1', 'v-x2']);
+    assert.deepEqual((st.stockoutBySlip[1] || []).map((p) => p.sku).sort(), ['v-x1', 'v-x2']);
+  });
+  throwsCode(() => pev(pb, 'found', { slipSeq: 1 }), 'sku_required', 'SKU 省略は 409 (片方の操作でもう片方の報告を消さない)');
+  t('商品を指定した found はその1品だけ取り消す', () => {
+    pev(pb, 'found', { slipSeq: 1, sku: 'v-x2' });
+    assert.deepEqual(db.prepare('SELECT sku FROM pk_shortage_allocations WHERE batch_id=? ORDER BY id').all(pk).map((r) => r.sku), ['v-x1']);
+    assert.equal(alerts().filter((x) => x.ref_key.startsWith(`alloc:${pk}:`)).length, 1, 'X2 のバナーだけ閉じる');
+    const st = psvc.getWorkState(pb);
+    assert.deepEqual(st.slips[0].pickingShortages.map((p) => p.sku), ['v-x1']);
+    assert.deepEqual(st.stockoutAckSeqs, [1], 'X1 の ❌ は残るので確認できる');
+  });
+  t('残り1品なら SKU 省略でも取り消せる', () => {
+    pev(pb, 'found', { slipSeq: 1 });
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM pk_shortage_allocations WHERE batch_id=?').get(pk).c, 0);
+    assert.deepEqual(psvc.getWorkState(pb).stockoutAckSeqs, []);
+  });
+}
+
+console.log('── Codex R2: 一覧の件数は画面のボタンと同じ条件 (ライン確定後・伝票に無い SKU・壊れた突合値) ──');
+{
+  const pk = mkPickBatch('V12', { sku: 'v-fin', lineQty: 1, slipQtys: [1] });
+  const pb = mkPackBatch('V12', { sku: 'v-fin', slipQtys: [1] });
+  db.prepare(`UPDATE pk_batches SET hikiate_class='ネコポス【梱包機PAS-LINE《3つ折り》】単品' WHERE id=?`).run(pk);
+  db.prepare('UPDATE pk_pack_batches SET pk_batch_id=? WHERE id=?').run(pk, pb);
+  ev(pk, 'start');
+  ev(pk, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
+  const b = () => db.prepare('SELECT * FROM pk_pack_batches WHERE id=?').get(pb);
+  t('ライン確定前: 要確認 1', () => {
+    assert.equal(psvc.shortageSummaryFor(b()).stockoutWait, 1);
+    assert.deepEqual(psvc.getWorkState(pb).stockoutAckSeqs, [1]);
+  });
+  t('ライン確定後: 要確認 0 (画面にもボタンが出ない)', () => {
+    db.prepare(`INSERT INTO pk_pack_line_runs (batch_id, phase, started_at, finished_at, planned_count, final_count, manual_count, worker, updated_at)
+      VALUES (?, 'run', ?, ?, 1, 1, 0, '三宅晴菜', ?)`).run(pb, now, now, now);
+    assert.equal(psvc.shortageSummaryFor(b()).stockoutWait, 0);
+    assert.deepEqual(psvc.getWorkState(pb).stockoutAckSeqs, []);
+  });
+}
+{
+  const pk = mkPickBatch('V13', { sku: 'v-ghost', lineQty: 1, slipQtys: [1] });
+  const pb = mkPackBatch('V13', { sku: 'v-real', slipQtys: [1] });   // 再取込で伝票の中身が変わった想定 (旧 SKU の配賦だけ残る)
+  db.prepare('UPDATE pk_pack_batches SET pk_batch_id=? WHERE id=?').run(pk, pb);
+  ev(pk, 'start');
+  ev(pk, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
+  t('伝票の明細に無い SKU の ❌ は件数にも入らない (ボタンも出ない)', () => {
+    const b = db.prepare('SELECT * FROM pk_pack_batches WHERE id=?').get(pb);
+    assert.equal(psvc.shortageSummaryFor(b).stockoutWait, 0);
+    assert.deepEqual(psvc.getWorkState(pb).stockoutAckSeqs, []);
+  });
+}
+{
+  const pk = mkPickBatch('V14', { sku: 'v-bad', lineQty: 1, slipQtys: [1] });
+  const pb = mkPackBatch('V14', { sku: 'v-bad', slipQtys: [1] });
+  db.prepare('UPDATE pk_pack_batches SET pk_batch_id=999999 WHERE id=?').run(pb);   // 壊れた突合値
+  ev(pk, 'start');
+  ev(pk, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
+  t('壊れた pk_batch_id は tb_no へ黙って倒さず「配賦なし」扱い (別バッチを掴まない)', () => {
+    const b = db.prepare('SELECT * FROM pk_pack_batches WHERE id=?').get(pb);
+    assert.equal(psvc.shortageSummaryFor(b).stockoutWait, 0);
+    const st = psvc.getWorkState(pb);
+    assert.deepEqual(st.slips[0].pickingShortages, []);
+    assert.deepEqual(st.stockoutAckSeqs, []);
+  });
+  throwsCode(() => pev(pb, 'stockout_ack', { slipSeq: 1 }), 'no_picking_match', 'ack も 409');
 }
 
 console.log(`\n${passed} tests passed`);

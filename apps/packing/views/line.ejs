@@ -275,7 +275,10 @@
               <% if (ackSet.has(ns.seq)) { %>
                 <button type="button" class="danger" onclick="stockoutAck(<%= ns.seq %>)">🚫 在庫なしを確認 → 出荷保留にする (事務へ通知)</button>
               <% } %>
-              <button type="button" onclick="foundNone(<%= ns.seq %>)">手元で見つかった (報告を取り消す)</button>
+              <%# 退路は商品ごと (同じ伝票に ❌ が2品あるとき、片方だけ見つかった、が言える — Codex R2) %>
+              <% for (const p of ns.pickingShortages.filter((x) => x.kind === 'none')) { %>
+                <button type="button" onclick='foundNone(<%= ns.seq %>, <%- JSON.stringify(String(p.sku)).replace(/</g, '\\u003c') %>)'>「<%= p.name || p.sku %>」が手元で見つかった (報告を取り消す)</button>
+              <% } %>
             </div>
           <% } %>
         <% } %>
@@ -600,10 +603,10 @@
       } finally { sending = false; }
     }
     // ❌ の未処理伝票で「手元で見つかった」: 3階の「どこにもない」報告を取り消す (退路。伝票はそのまま流せる)
-    function foundNone(seq) {
+    function foundNone(seq, sku) {
       if (!workerSel.value) { alert('作業者を選択してください'); return; }
       if (!confirm(`#${seq} の商品が手元で見つかったため、3階の「どこにもない」の報告を取り消します。よろしいですか?`)) return;
-      send('found', { slip_seq: seq });
+      send('found', { slip_seq: seq, sku });
     }
     // 🚫 在庫なしを確認 (Q1 決定 2026-09-05): 3階が「在庫なし」にした伝票を出荷保留にして閉じ、事務へ通知する
     function stockoutAck(seq) {
@@ -613,7 +616,7 @@
     }
     function foundSlip(seq) {
       if (!confirm(`#${seq} の足りなかった商品が【全部】見つかったため、この伝票の再ピック依頼と不足の候補をすべて取り下げます。\n(1品目だけ見つかったときは、その商品の横の「見つかった」を押してください)\nよろしいですか?`)) return;
-      send('found', { slip_seq: seq });
+      send('found', { slip_seq: seq, sku });
     }
     // SKU 単位の「見つかった」: その商品の依頼/候補だけ取り下げる (他の商品の依頼が残れば保留のまま)。
     // SKU は data-* 属性から加工せずに渡す (onclick へ文字列埋め込みすると記号入り SKU が壊れる — Codex R3)
