@@ -276,8 +276,9 @@
                 <button type="button" class="danger" onclick="stockoutAck(<%= ns.seq %>)">🚫 在庫なしを確認 → 出荷保留にする (事務へ通知)</button>
               <% } %>
               <%# 退路は商品ごと (同じ伝票に ❌ が2品あるとき、片方だけ見つかった、が言える — Codex R2) %>
+              <%# SKU は CSV 由来 = 属性に生で埋めない (data-* + 委譲。onclick に JSON.stringify は ' を守れない — Codex R3) %>
               <% for (const p of ns.pickingShortages.filter((x) => x.kind === 'none')) { %>
-                <button type="button" onclick='foundNone(<%= ns.seq %>, <%- JSON.stringify(String(p.sku)).replace(/</g, '\\u003c') %>)'>「<%= p.name || p.sku %>」が手元で見つかった (報告を取り消す)</button>
+                <button type="button" class="found-none" data-seq="<%= ns.seq %>" data-sku="<%= p.sku %>">「<%= p.name || p.sku %>」が手元で見つかった (報告を取り消す)</button>
               <% } %>
             </div>
           <% } %>
@@ -616,7 +617,7 @@
     }
     function foundSlip(seq) {
       if (!confirm(`#${seq} の足りなかった商品が【全部】見つかったため、この伝票の再ピック依頼と不足の候補をすべて取り下げます。\n(1品目だけ見つかったときは、その商品の横の「見つかった」を押してください)\nよろしいですか?`)) return;
-      send('found', { slip_seq: seq, sku });
+      send('found', { slip_seq: seq });
     }
     // SKU 単位の「見つかった」: その商品の依頼/候補だけ取り下げる (他の商品の依頼が残れば保留のまま)。
     // SKU は data-* 属性から加工せずに渡す (onclick へ文字列埋め込みすると記号入り SKU が壊れる — Codex R3)
@@ -626,6 +627,8 @@
     }
     document.querySelectorAll('.found-sku').forEach((b) => b.addEventListener('click',
       () => foundSku(Number(b.dataset.seq), b.dataset.sku, b.dataset.name)));
+    document.querySelectorAll('.found-none').forEach((b) => b.addEventListener('click',
+      () => foundNone(Number(b.dataset.seq), b.dataset.sku)));
     // 📦 サイズ・配送方法の変更依頼 (梱包画面④と同じ: 提案する配送方法 → 理由 → 事務へ GChat 通知)
     function reqShip() {
       const x = selectedSlip();

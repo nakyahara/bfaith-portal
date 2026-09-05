@@ -696,6 +696,7 @@ export function getWorkState(batchId) {
       JOIN pk_pack_slips s ON s.batch_id = ? AND s.ne_slip_no = a.ne_slip_no
       LEFT JOIN pk_lines l ON l.batch_id = a.batch_id AND l.seq = a.line_seq
       WHERE a.batch_id = ?
+        AND EXISTS (SELECT 1 FROM pk_pack_lines pl WHERE pl.slip_id = s.id AND LOWER(TRIM(pl.sku)) = LOWER(TRIM(a.sku)))
       ORDER BY a.id
     `).all(batchId, pkIdForBadges) : [])) {
       if (!bySlip.has(a.seq)) bySlip.set(a.seq, []);

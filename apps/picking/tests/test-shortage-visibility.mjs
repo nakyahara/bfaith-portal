@@ -452,10 +452,12 @@ console.log('── Codex R2: 一覧の件数は画面のボタンと同じ条�
   db.prepare('UPDATE pk_pack_batches SET pk_batch_id=? WHERE id=?').run(pk, pb);
   ev(pk, 'start');
   ev(pk, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' });
-  t('伝票の明細に無い SKU の ❌ は件数にも入らない (ボタンも出ない)', () => {
+  t('伝票の明細に無い SKU の ❌ は件数にも入らない (バッジもボタンも出ない — 表示と操作可否を揃える)', () => {
     const b = db.prepare('SELECT * FROM pk_pack_batches WHERE id=?').get(pb);
     assert.equal(psvc.shortageSummaryFor(b).stockoutWait, 0);
-    assert.deepEqual(psvc.getWorkState(pb).stockoutAckSeqs, []);
+    const st = psvc.getWorkState(pb);
+    assert.deepEqual(st.stockoutAckSeqs, []);
+    assert.deepEqual(st.slips[0].pickingShortages, [], 'バッジも出さない (Codex R3)');
   });
 }
 {
