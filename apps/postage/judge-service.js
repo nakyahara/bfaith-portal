@@ -72,7 +72,8 @@ function validateSlipNos(v) {
   if (v.length > MAX_SLIPS_PER_CALL) throw new JudgeInputError(`一度に送れるのは ${MAX_SLIPS_PER_CALL} 件までです (${v.length} 件)`);
   const out = [];
   for (const raw of v) {
-    if (typeof raw !== 'string' && typeof raw !== 'number') throw new JudgeInputError('slip_nos は文字列の配列で送ってください');
+    // 数値は受けない: 先頭ゼロや 2^53 超の番号が JSON 化で別の番号に化け、実在すれば別伝票の料金を刷ってしまう
+    if (typeof raw !== 'string') throw new JudgeInputError('slip_nos は文字列の配列で送ってください (数値は不可)');
     const s = normalizeSlipNo(raw);
     if (!s || s.length > 40) throw new JudgeInputError(`伝票番号が不正です: ${JSON.stringify(raw)}`);
     out.push(s);

@@ -32,8 +32,19 @@ export const SOURCE_LABELS = {
   'packing-dispatch': 'packing-dispatch の出力履歴 (Render)',
 };
 
+// loadShipments / lookupProductName が使う列。あるだけのファイル (空・壊れている・別物) は「読めない」扱い
+const WAREHOUSE_PROBE = [
+  'SELECT 伝票番号, 出荷確定日, 配送方法名 FROM raw_ne_order_base LIMIT 0',
+  'SELECT 伝票番号, 商品コード, 商品名, 受注数, キャンセル区分 FROM raw_ne_orders LIMIT 0',
+];
 export function warehouseAvailable() {
-  return fs.existsSync(WAREHOUSE_DB);
+  if (!fs.existsSync(WAREHOUSE_DB)) return false;
+  try {
+    const wh = new Database(WAREHOUSE_DB, { readonly: true, fileMustExist: true });
+    try { for (const sql of WAREHOUSE_PROBE) wh.prepare(sql).all(); return true; } finally { wh.close(); }
+  } catch {
+    return false;   // 読めなければ packing-dispatch 側に切り替わる (resolveSource)
+  }
 }
 
 /** いま読める出どころ (優先順)。 */

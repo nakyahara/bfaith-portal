@@ -82,6 +82,13 @@ function defaultSince() {
   d.setUTCDate(d.getUTCDate() - 90);
   return d.toISOString().slice(0, 10);
 }
+// 実在する YYYY-MM-DD だけ受ける。壊れた値 (?since=xxxxxxxxxx) で日付計算が RangeError にならないように既定へ戻す
+function ymdOr(v, fallback) {
+  const s = String(v || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return fallback;
+  const t = Date.parse(`${s}T00:00:00Z`);
+  return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === s ? s : fallback;
+}
 
 // 出荷実績の出どころ。指定が無ければ自動 (warehouse があればそれ、無ければ packing-dispatch)
 function sourceOf(req) {
@@ -92,8 +99,8 @@ function sourceOf(req) {
 // ─────────────────────────── 画面 ───────────────────────────
 router.get('/', (req, res) => {
   const db = getDB();
-  const since = String(req.query.since || defaultSince()).slice(0, 10);
-  const until = req.query.until ? String(req.query.until).slice(0, 10) : null;
+  const since = ymdOr(req.query.since, defaultSince());
+  const until = ymdOr(req.query.until, null);
   const source = sourceOf(req);
 
   const report = coverageReport({ since, until, source });
@@ -124,7 +131,7 @@ router.get('/', (req, res) => {
 
 // 不足リストの CSV (現場に配って埋めてもらうため)
 router.get('/missing.csv', (req, res) => {
-  const since = String(req.query.since || defaultSince()).slice(0, 10);
+  const since = ymdOr(req.query.since, defaultSince());
   const report = coverageReport({ since, source: sourceOf(req) });
   if (!report.available) return res.status(503).send('出荷実績 (warehouse.db / packing-dispatch) が読めません');
   const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;

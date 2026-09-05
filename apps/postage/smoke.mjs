@@ -373,8 +373,22 @@ t('1 明細でも読めなければ構成全体を壊れている扱い (読め�
   eq(parseItems(JSON.stringify([{ product_code: ' SKU-A ', qty: 2 }])), { lines: [{ sku_code: 'sku-a', qty: 2, product_name: null }], broken: false });
   eq(parseItems('[]'), { lines: [], broken: false }, '空配列は壊れていない (明細なし → no_lines)');
 });
-t('存在しない出どころを指定したら available:false', () => {
-  eq(coverageReport({ since: '2026-06-01', source: 'nope' }).available, true, 'auto 扱い');
+t('存在しない出どころを指定したら auto 扱い', () => {
+  eq(coverageReport({ since: '2026-06-01', source: 'nope' }).available, true);
+});
+t('warehouse.db が壊れていれば (ファイルはある) packing-dispatch に自動で切り替わる', () => {
+  const whPath = process.env.POSTAGE_WAREHOUSE_DB;
+  const backup = fs.readFileSync(whPath);
+  fs.writeFileSync(whPath, 'this is not a sqlite file');
+  try {
+    eq(availableSources(), ['packing-dispatch']);
+    const r = coverageReport({ since: '2026-06-01' });
+    eq(r.available, true); eq(r.source, 'packing-dispatch');
+    eq(lookupProductName('sku-a'), 'ミラー商品A', '商品名も packing-dispatch から');
+  } finally {
+    fs.writeFileSync(whPath, backup);
+  }
+  eq(availableSources()[0], 'warehouse', '戻せば warehouse が先に戻る');
 });
 
 // 接続を閉じてから消す (Windows は開いたままだと WAL ファイルを消せない)。

@@ -34,8 +34,9 @@ function open() {
   return new Database(MIRROR_DB, { readonly: true, fileMustExist: true });
 }
 
-// 読むのに要る列。列が足りない旧スキーマ・別物のファイルは「読めない」扱いにする
-const PROBE_SQL = 'SELECT ne_uketsuke_no, shipping_method_code, product_items_json, exported_at FROM pd_shipment_tracking LIMIT 0';
+// 読むのに要る列 (readCompositions / loadMirrorShipments が SELECT する列と同じ)。
+// 列が足りない旧スキーマ・別物のファイルは「読めない」扱いにする
+const PROBE_SQL = 'SELECT ne_uketsuke_no, shipping_method_code, shop_name, product_items_json, exported_at FROM pd_shipment_tracking LIMIT 0';
 
 /** packing-dispatch の表が読める状態か (ファイルがあっても表・列が無い環境 = 未稼働では false)。 */
 export function mirrorAvailable() {

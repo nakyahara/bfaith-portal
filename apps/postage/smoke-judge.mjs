@@ -87,6 +87,9 @@ console.log('\n■ 入力の検証');
 await t('伝票番号が空なら 400', async () => { eq((await call({ slip_nos: [] })).status, 400); });
 await t('501 件は 400', async () => { eq((await call({ slip_nos: Array.from({ length: 501 }, (_, i) => `X${i}`) })).status, 400); });
 await t('文字列でない伝票番号は 400', async () => { eq((await call({ slip_nos: [{ a: 1 }] })).status, 400); });
+await t('数値の伝票番号も 400 (先頭ゼロ・巨大な番号が化けて別伝票を刷る経路を塞ぐ)', async () => {
+  eq((await call({ slip_nos: [1545500] })).status, 400);
+});
 await t('date の形式違いは 400', async () => { eq((await call({ slip_nos: ['S1'], date: '2026/09/05' })).status, 400); });
 await t('実在しない日付 (2026-02-31) は 400 (Date.parse の丸めで通さない)', async () => {
   const r = await call({ slip_nos: ['S1'], date: '2026-02-31' });
