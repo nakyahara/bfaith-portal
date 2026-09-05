@@ -3611,7 +3611,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /解消したら「▶ 作業をはじめる」で札が外れます/.test(html), '詳細の上部に「⛔ ○○で止まっています」の帯 (外し方も書く)');
   ok(/if \(c\.blocked\) h \+= '<span class="tag blocked">⛔ '/.test(html) && /curTab === 'blocked'/.test(html) && /\['blocked', '⛔ 止まっている'\]/.test(html),
     '一覧: 赤い札を先頭に。「⛔ 止まっている」の絞り込みは進捗のタブとは別 (1 件以上あるときだけ)');
-  ok(/curWhen === 'blocked'/.test(html) && /c\.blocked \? '⛔ ' \+ c\.blocked\.label : null/.test(html), 'ボード: 保留列は無く、絞り込み「⛔ 止まっている」とカードの札で見せる');
+  ok(/curWhen === 'blocked'/.test(html) && /<div class="bblk">⛔ ' \+ esc\(c\.blocked\.label\) \+ 'で止まっています<\/div>/.test(html), 'ボード: 保留列は無く、絞り込み「⛔ 止まっている」とカードの赤い 1 行で見せる');
+  ok(/\(c\.blocked \? ' blocked' : ''\)/.test(html) && /\.bcard\.blocked\{border:2px solid var\(--danger\)/.test(html) && /\.row\.blocked\{border-color:var\(--danger\)/.test(html),
+    '止まっているカードは一覧・ボードともカードごと赤くする (資材不足を見落とさない — 中原さん 2026-09-05)');
   ok(!/on_hold/.test(html) && !/holdReasons/.test(html) && !/hold_qty/.test(html), '画面から旧「保留」(on_hold / holdReasons / hold_qty) が消えている');
   ok(/function canEditProgress\(c\)/.test(html)
     && /c\.status !== 'closed' && c\.status !== 'ready_for_stocking'/.test(html)
