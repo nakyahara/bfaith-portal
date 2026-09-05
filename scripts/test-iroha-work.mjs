@@ -1280,8 +1280,10 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
     const anyId2 = db.prepare('SELECT MIN(id) id FROM f_iroha_tasks').get().id;
     db.prepare('UPDATE f_iroha_tasks SET done_qty = -3 WHERE id = ?').run(anyId2);   // CHECK が無いので入ってしまう
     ok(db.prepare('SELECT done_qty FROM f_iroha_tasks WHERE id = ?').get(anyId2).done_qty === -3, '前提: CHECK の無い版ではマイナスが入る');
-    db.prepare('UPDATE f_iroha_tasks SET done_qty = NULL WHERE id = ?').run(anyId2);
+    // ⭐不正値を**残したまま**起動する。ここで作り直しが止まるとアプリが上がらない (Codex R2 中2)
     createTables(db);
+    ok(db.prepare('SELECT done_qty FROM f_iroha_tasks WHERE id = ?').get(anyId2).done_qty == null,
+      'CHECK の無い版に残っていた不正なできた数は「数えていない」に戻して先へ進む (起動を止めない)');
     let negErr2 = null; try { db.prepare('UPDATE f_iroha_tasks SET done_qty = -3 WHERE id = ?').run(anyId2); } catch (e) { negErr2 = e; }
     ok(negErr2 && /CHECK/.test(negErr2.message) && db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === n,
       '列だけあって CHECK が無い版も作り直される (行はそのまま)');
@@ -3195,10 +3197,11 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /dqValues\('#stBtns'\)/.test(html) && /dqValues\('#dqBody'\)/.test(html),
     '同じ入力欄を 2 か所に描くので、入れ物を指定して読む (先にある方を掴まない)');
   ok(/if \(stStep === 'hold_qty'\)/.test(html) && /stBtn\('hold_go', 'この数で中断する', false\)/.test(html)
-    && /stBtn\('hold_skip', '数えずに中断する', false\)/.test(html),
-    '中断するとき「何個までできましたか」を 1 回聞く (数えずに進める道も残す)');
-  ok(/if \(choice === 'hold_go'\) \{/.test(html) && /holdMemo = v\.memo;\s*\/\/ メモは「数えずに中断」でも残す/.test(html),
-    '「数えずに中断」でも中断メモは残せる');
+    && /stBtn\('hold_skip', 'できた数は変えずに中断する', false\)/.test(html),
+    '中断するとき「何個までできましたか」を 1 回聞く (数を触らずに進める道も残す)');
+  ok(/if \(choice === 'hold_go'\) \{/.test(html) && /holdMemo = v\.memo;\s*\/\/ メモはどちらでも残す/.test(html)
+    && /前に数えた値をそのままにするなら/.test(html),
+    '数を触らずに中断するときも中断メモは残せる (前に数えた値は消さない。ボタンの名前もそう書く)');
   ok(/\.\.\.\(doneQty !== undefined \? \{ done_qty: doneQty \} : \{\}\)/.test(html)
     && /\.\.\.\(holdMemo !== undefined \? \{ hold_memo: holdMemo \} : \{\}\)/.test(html),
     '状態とできた数は 1 回の通信で送る (分けると「保留にはなったが数が入らない」が起きる)');

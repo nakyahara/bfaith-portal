@@ -3250,7 +3250,7 @@ function renderStBtns(c) {
   if (stStep === 'hold_qty') {
     $('#stBtns').innerHTML = dqPanelHtml(c,
       stBtn('hold_go', 'この数で中断する', false) +
-      stBtn('hold_skip', '数えずに中断する', false) +
+      stBtn('hold_skip', 'できた数は変えずに中断する', false) +
       stBtn('back', '← もどる', false));
     return;
   }
@@ -3279,7 +3279,8 @@ function dqPanelHtml(c, actions) {
     '<div class="quick">' + quick.map(([v, l]) =>
       '<button type="button" data-dq="' + esc(v) + '">' + esc(l) + '</button>').join('') +
       '<button type="button" data-dq="">数えていない</button></div>' +
-    '<p class="sub">数えていないときは空のままで構いません (0 個とは別のこととして残します)</p>' +
+    '<p class="sub">数えていないときは空のままで構いません (0 個とは別のこととして残します)。' +
+      '前に数えた値をそのままにするなら「できた数は変えずに中断する」を押してください</p>' +
     '<label style="margin-top:10px">中断メモ (任意) — 次にやる人が読みます</label>' +
     '<textarea class="dqMemo" maxlength="500" placeholder="例: ラベルは貼り終わり、袋詰めの途中です">' + esc(memo) + '</textarea>' +
     '</div>' + actions;
@@ -3332,14 +3333,17 @@ async function saveProgress() {
   dqSaving = true;
   for (const b of ['#dqSave', '#dqCancel']) { const el = $(b); if (el) el.disabled = true; }
   $('#dqMsg').textContent = '保存中…';
-  const j = await apiFetch('/api/progress', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: dqTarget, worker_id: worker.id, expect_version: c.version, done_qty: v.qty, hold_memo: v.memo }),
-  });
-  dqSaving = false;
-  const btnSave = $('#dqSave'), btnCancel = $('#dqCancel');
-  if (btnSave) btnSave.disabled = false;
-  if (btnCancel) btnCancel.disabled = false;
+  let j;
+  try {
+    j = await apiFetch('/api/progress', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: dqTarget, worker_id: worker.id, expect_version: c.version, done_qty: v.qty, hold_memo: v.memo }),
+    });
+  } finally {
+    // ⭐何があっても押せる状態に戻す。ここで止まるとダイアログを閉じることもできなくなる (Codex R2 軽微1)
+    dqSaving = false;
+    for (const b of ['#dqSave', '#dqCancel']) { const el = $(b); if (el) el.disabled = false; }
+  }
   if (j.ok) {
     applyTask(c, j.task);
     closeOverlay('#dqOv'); dqTarget = null; $('#dqBody').innerHTML = '';
@@ -3405,7 +3409,9 @@ async function doSetSt(choice) {
         if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#stMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
         doneQty = v.qty;                 // null なら「数えていない」に戻す
       }
-      holdMemo = v.memo;                 // メモは「数えずに中断」でも残す
+      // 「できた数は変えずに中断する」= done_qty を送らない (前に数えた値をそのまま残す)。
+      // 前の値を黙って消さないためで、ボタンの名前もそう書いてある (Codex R2 中1)
+      holdMemo = v.memo;                 // メモはどちらでも残す
       to = 'on_hold'; holdReason = stHold.reason; holdNote = stHold.note;
     } else if (choice.startsWith('hold:')) { to = 'on_hold'; holdReason = choice.slice(5); }
     else if (choice.startsWith('close:')) { to = 'closed'; closeReason = choice.slice(6); }
