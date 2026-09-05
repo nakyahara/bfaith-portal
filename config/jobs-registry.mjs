@@ -401,8 +401,9 @@ export const JOBS_REGISTRY = [
     purpose: 'ロジザード在庫スナップショットの毎時取込 (欠品LINE通知の他ロケ在庫表示 + Render mirror_logizard_stock)。'
       + '⭐2026-09-05 から step 2b で取込済 CSV を data\\logizard-history\\YYYY\\MM\\zaiko_YYYYMMDD_HHMM.csv.gz に圧縮保存 = '
       + '在庫の履歴 (それまで毎時全置換で時系列がどこにも無かった、Company DB構想 D-7)。毎時 90 日 + 日次 (その日の最後) 永久。'
-      + 'BACKUP_RCLONE_REMOTE があれば兄弟フォルダ logizard-history へ rclone copy (offsite)。'
-      + 'archive 失敗はジョブ結果を変えず ping の note に "archive failed" が付く',
+      + 'BACKUP_RCLONE_REMOTE があれば最終要素を logizard-history に置き換えた先へ履歴フォルダ全体を rclone copy (offsite、削除なし)。'
+      + 'archive の結果はジョブ結果 (ok/partial) を変えず ping の note に写す: "archive skipped (stale csv)" (CSV が古い/空 = その時間の履歴無し) / '
+      + '"archive offsite failed" (保存は済、rclone 失敗) / "archive failed" (gzip・検証・同名衝突)',
     where: 'miniPC TaskScheduler [LogizardZaikoHourly] (scripts/logizard-stock/run-hourly.ps1 → archive-snapshot.mjs)',
     schedule: '毎日 09:00-18:00 の毎時00分 (10回。どれか1回の成功で当日ok。日中の停止は欠品通知の「HH:MM時点」表示でも見える)',
     anchor_hour_jst: 9,

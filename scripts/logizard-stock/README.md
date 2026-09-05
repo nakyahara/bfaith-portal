@@ -24,11 +24,17 @@ C:\tools\logizard-automation\out\logizard_zaikosu.csv
   (DB は全置換、CSV も上書き)」と分かり、本命 (Company DB の追記表、Phase 3) までの 0 円対策として追加。
   - 保存先 `C:\Users\bfaith\bfaith-portal\data\logizard-history\YYYY\MM\zaiko_YYYYMMDD_HHMM.csv.gz`
     (時刻 = CSV の更新時刻 JST。2.7MB → 約 0.2〜0.3MB)。`manifest.jsonl` に 1 行/回 (snapshot_at, rows, sha256)
-  - 二重保存しない: 前回と sha256 + 更新時刻が同じ CSV、更新時刻が 3 時間より古い CSV (DL 失敗で残った旧ファイル) は skip
+  - 元 CSV は専用 work ファイルに固定してから hash / 行数 / gzip を取る (処理中に上書きされても manifest と gz が一致)。
+    gz は tmp → 展開 sha256 検証 → rename。同名 gz が既にあり中身も同一なら成功扱い (クラッシュ後の再実行・手動実行との
+    重なりで冪等)、別内容なら衝突エラー (上書きしない)
+  - 二重保存しない: 前回と sha256 + 更新時刻が同じ CSV は skip (正常)。更新時刻が 3 時間より古い CSV / 0 バイトの CSV
+    (DL 失敗で残った旧ファイル) は保存せず **exit 3** = 「この時間の履歴が無い」と呼び出し側に知らせる
   - 世代: 毎時ファイルは 90 日、それより古い日は「その日の最後の 1 本」だけ残す (= 日次スナップショット永久)
-  - offsite: `BACKUP_RCLONE_REMOTE` (例 gdrive:bfaith-backup/warehouse) があれば兄弟 `gdrive:bfaith-backup/logizard-history` へ
-    直近 2 日分を `rclone copy` (削除はしない)。`LOGIZARD_HISTORY_RCLONE_REMOTE` で明示も可。失敗しても取込結果は変えない
-  - 失敗時: ping は ok/partial のまま、note に `archive failed`。ログは同じ `logizard-stock-hourly.log`
+  - offsite: `BACKUP_RCLONE_REMOTE` (例 gdrive:bfaith-backup/warehouse) があれば最終要素を置き換えた
+    `gdrive:bfaith-backup/logizard-history` へ履歴フォルダ全体を `rclone copy` (既存同一は rclone が飛ばす。障害が何日
+    続いても復旧時に全部追いつく。削除はしない)。`LOGIZARD_HISTORY_RCLONE_REMOTE` で明示も可。失敗は **exit 4** (保存は完了)
+  - ping への写し方 (run-hourly.ps1 step 2b): ジョブ結果 ok/partial は変えず、note に `archive skipped (stale csv)` /
+    `archive offsite failed` / `archive failed` を付ける。ログは同じ `logizard-stock-hourly.log`、最終行 `RESULT action=... code=...`
   - 読み方 (例): `zcat 2026/09/zaiko_20260905_1800.csv.gz | iconv -f CP932 -t UTF-8 | head`。列は ①の CSV と同じ
     (在庫日, ブロック略称, ロケ, 商品ID, 在庫数(引当数を含む), 引当数 …)。Phase 3 でこの gz 群を Company DB へ初期ロードする
 - **鮮度は必ず表示**。通知に「HH:MM時点」(sync_meta.logizard_last_import 由来) を添え、

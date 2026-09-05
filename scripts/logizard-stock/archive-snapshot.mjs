@@ -8,22 +8,32 @@
  *   本命は Company DB の追記表 (Phase 3) だが、それまで 0 円で履歴を始めるのがこのスクリプト。
  *
  * 何をするか (run-hourly.ps1 の step 2b、取込成功のあとに呼ばれる):
- *   1. CSV を <dest>/YYYY/MM/zaiko_YYYYMMDD_HHMM.csv.gz に gzip 保存 (時刻 = CSV の更新時刻 JST)。
- *      tmp → gunzip 検証 (バイト数一致) → rename の原子的確定
- *   2. manifest.jsonl に 1 行追記 (snapshot_at / rows / bytes / sha256 / file)
- *   3. 同じ CSV (sha256 + 更新時刻が前回と同一) は保存しない (ダウンロード失敗で古いファイルが残った回を
- *      「新しい在庫」として二重保存しないため)。更新時刻が 3 時間より古い CSV も保存しない (同じ理由)
- *   4. 世代管理: 毎時ファイルは KEEP_HOURLY_DAYS (既定 90 日) 保持、それより古い日は「その日の最後の 1 本」だけ残す
- *      (= 日次スナップショットは永久)。削除は snapshot 日付で判定 (ファイル名から)
- *   5. offsite (任意): rclone があり LOGIZARD_HISTORY_RCLONE_REMOTE (または BACKUP_RCLONE_REMOTE の兄弟
- *      <bucket>/logizard-history) が決まるときだけ、直近 2 日分を rclone copy (削除はしない)。失敗しても exit 0
+ *   1. CSV を専用 tmp にコピーして固定し (途中で上書きされても manifest と gz が食い違わない)、
+ *      <dest>/YYYY/MM/zaiko_YYYYMMDD_HHMM.csv.gz に gzip 保存 (時刻 = CSV の更新時刻 JST)。
+ *      gz.tmp → gunzip して sha256 一致を検証 → rename の原子的確定。tmp は必ず片付ける
+ *   2. manifest.jsonl に 1 行追記 (snapshot_at / rows / bytes / gz_bytes / sha256 / file)
+ *   3. 二重保存しない: 前回と sha256 + 更新時刻が同一の CSV は skip (正常)。同名 gz が既にあり中身も同一なら
+ *      成功扱い (クラッシュ後の再実行・手動実行との重なりで冪等)。同名で中身が違うときだけ衝突エラー
+ *   4. 更新時刻が STALE_HOURS (既定 3h) より古い CSV、0 バイトの CSV は保存しない (ダウンロード失敗で残った
+ *      旧ファイルを「新しい在庫」にしない)。これは「この時間の履歴が無い」ので exit 3 で呼び出し側に知らせる
+ *   5. 世代管理: 毎時ファイルは KEEP_HOURLY_DAYS (既定 90 日) 保持、それより古い日は「その日の最後の 1 本」だけ残す
+ *      (= 日次スナップショットは永久)。削除は snapshot 日付 (ファイル名) で判定
+ *   6. offsite (任意): rclone があり LOGIZARD_HISTORY_RCLONE_REMOTE (または BACKUP_RCLONE_REMOTE の最終要素を
+ *      logizard-history に置き換えた先) が決まるときだけ、履歴フォルダ全体を rclone copy (既存と同一のファイルは
+ *      rclone が飛ばすので毎回全量でも軽い。障害が何日続いても復旧時に全部追いつく。削除はしない)。
+ *      失敗しても保存自体は成功なので exit 4 で知らせるだけ
  *
  * 使い方 (miniPC、repo ルートで。.env を読むため -r dotenv/config):
  *   node -r dotenv/config scripts/logizard-stock/archive-snapshot.mjs
  *   node scripts/logizard-stock/archive-snapshot.mjs --csv C:/tools/logizard-automation/out/logizard_zaikosu.csv --dest C:/Users/bfaith/bfaith-portal/data/logizard-history
  *   オプション: --dry-run / --no-offsite / --keep-hourly-days 90 / --stale-hours 3
  *
- * 終了コード: 0 = 保存した or 正当にスキップ / 1 = 保存に失敗 (ランナーは記録して続行) / 2 = 引数・パス不正
+ * 終了コード (run-hourly.ps1 が note に写す):
+ *   0 = 保存した / 前回と同一で skip / 同名同内容が既にあった
+ *   3 = 保存しなかった (CSV が古い・0 バイト) → 履歴にこの時間の穴がある
+ *   4 = 保存はしたが offsite (rclone) に失敗
+ *   1 = 保存に失敗 (gzip・検証・衝突) / 2 = 引数・パス不正
+ * 最終行に機械可読の `RESULT action=... code=... offsite=...` を出す。
  * サイズ感: CSV 2.7MB → gz 約 0.2〜0.3MB。1 日 10 本 → 約 3MB/日、90 日で約 270MB + 日次永久 (年 100MB 弱)
  */
 import fs from 'node:fs';
@@ -60,7 +70,17 @@ async function sha256File(p) {
   return h.digest('hex');
 }
 
-/** 行数 = 改行 (0x0A) の数 − ヘッダ 1 行。CP932 でも改行バイトは同じなので文字コードに依存しない */
+/** gz を展開しながら sha256 とバイト数を返す */
+async function sha256Gunzip(gzPath) {
+  const h = crypto.createHash('sha256'); let bytes = 0;
+  await pipeline(fs.createReadStream(gzPath), zlib.createGunzip(), new Writable({ write(c, _e, cb) { h.update(c); bytes += c.length; cb(); } }));
+  return { sha: h.digest('hex'), bytes };
+}
+
+/**
+ * 行数の目安 = 改行 (0x0A) の数 − ヘッダ 1 行。CP932 でも改行バイトは同じなので文字コードに依存しない。
+ * 引用フィールド内の改行は数えてしまうので「取込件数」の正は csv-import.js 側 (ここは manifest の参考値)
+ */
 async function countRows(p) {
   let n = 0; let last = 0;
   await pipeline(fs.createReadStream(p), new Writable({ write(c, _e, cb) { for (const b of c) if (b === 0x0a) n++; last = c[c.length - 1]; cb(); } }));
@@ -68,23 +88,35 @@ async function countRows(p) {
   return Math.max(0, n - 1);
 }
 
-async function gzipVerified(src, dest, level = 6) {
+/** src を gzip して dest に原子的に置く。展開 sha256 が expectedSha と一致しなければ失敗。tmp は必ず片付ける */
+async function gzipVerified(src, dest, expectedSha, level = 6) {
   const tmp = `${dest}.pid${process.pid}.tmp`;
-  await pipeline(fs.createReadStream(src), zlib.createGzip({ level }), fs.createWriteStream(tmp));
-  let total = 0;
-  await pipeline(fs.createReadStream(tmp), zlib.createGunzip(), new Writable({ write(c, _e, cb) { total += c.length; cb(); } }));
-  const expected = fs.statSync(src).size;
-  if (total !== expected) { try { fs.unlinkSync(tmp); } catch {} throw new Error(`gzip 検証NG: ${total} ≠ ${expected}`); }
-  fs.renameSync(tmp, dest);
-  return fs.statSync(dest).size;
+  let done = false;
+  try {
+    await pipeline(fs.createReadStream(src), zlib.createGzip({ level }), fs.createWriteStream(tmp));
+    const v = await sha256Gunzip(tmp);
+    if (v.sha !== expectedSha) throw new Error(`gzip 検証NG: 展開 sha256 が元と不一致 (${v.bytes} bytes)`);
+    fs.renameSync(tmp, dest);
+    done = true;
+    return fs.statSync(dest).size;
+  } finally {
+    if (!done) { try { fs.unlinkSync(tmp); } catch {} }
+  }
 }
 
 export function readLastManifest(dest) {
   const mf = path.join(dest, 'manifest.jsonl');
   if (!fs.existsSync(mf)) return null;
   const lines = fs.readFileSync(mf, 'utf-8').trim().split(/\r?\n/).filter(Boolean);
-  if (!lines.length) return null;
-  try { return JSON.parse(lines[lines.length - 1]); } catch { return null; }
+  // 末尾が壊れていても (書き込み途中でクラッシュ) 直前の正しい行を使う
+  for (let i = lines.length - 1; i >= 0; i--) { try { return JSON.parse(lines[i]); } catch {} }
+  return null;
+}
+
+function manifestHas(dest, relFile) {
+  const mf = path.join(dest, 'manifest.jsonl');
+  if (!fs.existsSync(mf)) return false;
+  return fs.readFileSync(mf, 'utf-8').split(/\r?\n/).some((l) => { try { return JSON.parse(l).file === relFile; } catch { return false; } });
 }
 
 /** dest 配下の zaiko_*.csv.gz を列挙 (snapshot 日付つき) */
@@ -132,33 +164,43 @@ export function pruneHourly(dest, { now = new Date(), keepHourlyDays = DEFAULTS.
   return removed;
 }
 
-/** offsite 先: 明示 env > BACKUP_RCLONE_REMOTE の兄弟 (<remote>:<bucket>/logizard-history) > なし */
+/**
+ * offsite 先: 明示 env > BACKUP_RCLONE_REMOTE の最終パス要素を logizard-history に置換 > なし
+ *   gdrive:bfaith-backup/warehouse          → gdrive:bfaith-backup/logizard-history
+ *   gdrive:company/bfaith-backup/warehouse  → gdrive:company/bfaith-backup/logizard-history
+ *   gdrive:bfaith-backup (サブディレクトリ無し) → null (勝手にバケット直下へ置かない)
+ */
 export function resolveOffsiteRemote(env = process.env) {
   const explicit = (env.LOGIZARD_HISTORY_RCLONE_REMOTE || '').trim();
   if (explicit) return explicit;
-  const base = (env.BACKUP_RCLONE_REMOTE || '').trim(); // 例 gdrive:bfaith-backup/warehouse
-  const m = /^([^:]+:[^/]+)\/.+$/.exec(base);
-  return m ? `${m[1]}/logizard-history` : null;
+  const base = (env.BACKUP_RCLONE_REMOTE || '').trim().replace(/\/+$/, '');
+  const m = /^([^:]+:)(.*)\/[^/]+$/.exec(base); // remote名: と 最終要素の手前まで
+  if (!m) return null;
+  return `${m[1]}${m[2]}/logizard-history`;
 }
 
+/** 履歴フォルダ全体を rclone copy (既存同一はスキップされる、削除はしない)。戻り値 'ok' | 'failed' */
 function offsiteCopy(dest, remote, { rcloneConfig, log }) {
   const args = [];
   if (rcloneConfig) args.push('--config', rcloneConfig);
-  // 直近 2 日に更新されたファイルだけを送る (既に同サイズ・同更新時刻で存在するものは rclone が飛ばす)。削除はしない
-  args.push('copy', dest, remote, '--max-age', '2d', '--include', '/*/*/zaiko_*.csv.gz', '--include', '/manifest.jsonl', '--transfers', '4', '--timeout', '60s', '--retries', '1', '--max-duration', '2m', '--cutoff-mode', 'hard');
+  args.push('copy', dest, remote, '--include', '/*/*/zaiko_*.csv.gz', '--include', '/manifest.jsonl',
+    '--transfers', '4', '--timeout', '60s', '--retries', '1', '--max-duration', '3m', '--cutoff-mode', 'hard');
   try {
-    execFileSync('rclone', args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: 150000, windowsHide: true });
+    execFileSync('rclone', args, { stdio: ['ignore', 'pipe', 'pipe'], timeout: 200000, windowsHide: true });
     log(`offsite ok: ${remote}`);
-    return true;
+    return 'ok';
   } catch (e) {
     const tail = (e.stderr ? e.stderr.toString() : e.message).trim().split('\n').slice(-2).join(' | ');
-    log(`offsite FAILED (続行): ${tail}`);
-    return false;
+    log(`offsite FAILED (保存は完了、次回に追いつく): ${tail}`);
+    return 'failed';
   }
 }
 
 /**
- * 本体。戻り値 { action: 'archived'|'skipped', reason?, file?, rows?, bytes?, gzBytes?, pruned, offsite }
+ * 本体。戻り値:
+ *   { action: 'archived'|'skipped', code: 'archived'|'exists_same'|'duplicate'|'stale'|'empty',
+ *     reason?, file?, rows?, bytes?, gzBytes?, pruned: string[], offsite: 'ok'|'failed'|'skipped'|null }
+ * 例外: ENOENT_CSV (CSV 無し) / COLLISION (同名 gz が別内容) / gzip・検証失敗
  */
 export async function archiveSnapshot(opts = {}) {
   const csv = opts.csv || DEFAULTS.csv;
@@ -167,46 +209,71 @@ export async function archiveSnapshot(opts = {}) {
   const keepHourlyDays = opts.keepHourlyDays ?? DEFAULTS.keepHourlyDays;
   const staleHours = opts.staleHours ?? DEFAULTS.staleHours;
   const dryRun = !!opts.dryRun;
+  const env = opts.env || process.env;
   const log = opts.log || ((m) => console.log(`[lz-archive] ${m}`));
 
   if (!fs.existsSync(csv)) throw Object.assign(new Error(`CSV が見つかりません: ${csv}`), { code: 'ENOENT_CSV' });
   const st = fs.statSync(csv);
-  if (st.size === 0) return { action: 'skipped', reason: 'CSV が 0 バイト', pruned: [], offsite: null };
+  if (st.size === 0) return { action: 'skipped', code: 'empty', reason: 'CSV が 0 バイト', pruned: [], offsite: null };
   const ageH = (now.getTime() - st.mtimeMs) / 3600000;
-  if (ageH > staleHours) return { action: 'skipped', reason: `CSV の更新時刻が ${ageH.toFixed(1)} 時間前 (>${staleHours}h) = 今回のダウンロード成果物ではない`, pruned: [], offsite: null };
+  if (ageH > staleHours) return { action: 'skipped', code: 'stale', reason: `CSV の更新時刻が ${ageH.toFixed(1)} 時間前 (>${staleHours}h) = 今回のダウンロード成果物ではない`, pruned: [], offsite: null };
 
-  const sha = await sha256File(csv);
-  const mtimeIso = new Date(st.mtimeMs).toISOString();
-  const last = readLastManifest(dest);
-  if (last && last.sha256 === sha && last.source_mtime === mtimeIso) {
-    return { action: 'skipped', reason: `前回と同一 (sha256 + 更新時刻) — ${last.file}`, pruned: [], offsite: null };
+  // 元 CSV を専用 tmp に固定してから hash / 行数 / gzip を取る (処理中に上書きされても manifest と gz が一致する)
+  fs.mkdirSync(dest, { recursive: true });
+  const work = path.join(dest, `.work-${process.pid}.csv`);
+  let result;
+  try {
+    fs.copyFileSync(csv, work);
+    const sha = await sha256File(work);
+    const bytes = fs.statSync(work).size;
+    const mtimeIso = new Date(st.mtimeMs).toISOString();
+    const last = readLastManifest(dest);
+    if (last && last.sha256 === sha && last.source_mtime === mtimeIso) {
+      return { action: 'skipped', code: 'duplicate', reason: `前回と同一 (sha256 + 更新時刻) — ${last.file}`, pruned: [], offsite: null };
+    }
+
+    const stamp = jstStamp(new Date(st.mtimeMs));
+    const dir = path.join(dest, stamp.year, stamp.month);
+    const name = `zaiko_${stamp.ymd}_${stamp.hm}.csv.gz`;
+    const outFile = path.join(dir, name);
+    const relFile = `${stamp.year}/${stamp.month}/${name}`;
+    const rows = await countRows(work);
+    if (dryRun) {
+      log(`dry-run: ${outFile} (rows=${rows}, bytes=${bytes})`);
+      return { action: 'archived', code: 'archived', dryRun: true, file: outFile, rows, bytes, gzBytes: 0, pruned: pruneHourly(dest, { now, keepHourlyDays, dryRun: true }), offsite: null };
+    }
+    fs.mkdirSync(dir, { recursive: true });
+
+    let gzBytes; let code = 'archived';
+    if (fs.existsSync(outFile)) {
+      // 同名が既にある = クラッシュ後の再実行 or 手動実行との重なり。中身が同じなら成功扱い、違えば衝突
+      const v = await sha256Gunzip(outFile);
+      if (v.sha !== sha) throw Object.assign(new Error(`同名の履歴 ${relFile} が別内容で存在 (既存 ${v.bytes} bytes)。手で確認して退避してから再実行`), { code: 'COLLISION' });
+      gzBytes = fs.statSync(outFile).size; code = 'exists_same';
+      log(`already archived (同名同内容): ${relFile}`);
+    } else {
+      gzBytes = await gzipVerified(work, outFile, sha);
+      log(`archived: ${relFile} (rows=${rows}, ${(bytes / 1048576).toFixed(2)}MB → ${(gzBytes / 1024).toFixed(0)}KB)`);
+    }
+    if (!manifestHas(dest, relFile)) {
+      const rec = { archived_at: now.toISOString(), snapshot_at: stamp.iso, file: relFile, rows, bytes, gz_bytes: gzBytes, sha256: sha, source_mtime: mtimeIso };
+      fs.appendFileSync(path.join(dest, 'manifest.jsonl'), JSON.stringify(rec) + '\n');
+    }
+
+    const pruned = pruneHourly(dest, { now, keepHourlyDays });
+    if (pruned.length) log(`pruned ${pruned.length} hourly file(s) older than ${keepHourlyDays}d (daily last kept)`);
+
+    let offsite = 'skipped';
+    if (!opts.noOffsite) {
+      const remote = resolveOffsiteRemote(env);
+      if (remote) offsite = offsiteCopy(dest, remote, { rcloneConfig: (env.BACKUP_RCLONE_CONFIG || '').trim(), log });
+      else log('offsite: remote 未設定のためローカル保存のみ (LOGIZARD_HISTORY_RCLONE_REMOTE か BACKUP_RCLONE_REMOTE)');
+    }
+    result = { action: 'archived', code, file: outFile, rows, bytes, gzBytes, pruned, offsite };
+  } finally {
+    try { fs.unlinkSync(work); } catch {}
   }
-
-  const stamp = jstStamp(new Date(st.mtimeMs));
-  const dir = path.join(dest, stamp.year, stamp.month);
-  const name = `zaiko_${stamp.ymd}_${stamp.hm}.csv.gz`;
-  const outFile = path.join(dir, name);
-  const rows = await countRows(csv);
-  if (dryRun) {
-    log(`dry-run: ${outFile} (rows=${rows}, bytes=${st.size})`);
-    return { action: 'archived', dryRun: true, file: outFile, rows, bytes: st.size, gzBytes: 0, pruned: pruneHourly(dest, { now, keepHourlyDays, dryRun: true }), offsite: null };
-  }
-  fs.mkdirSync(dir, { recursive: true });
-  const gzBytes = await gzipVerified(csv, outFile);
-  const rec = { archived_at: now.toISOString(), snapshot_at: stamp.iso, file: path.relative(dest, outFile).split(path.sep).join('/'), rows, bytes: st.size, gz_bytes: gzBytes, sha256: sha, source_mtime: mtimeIso };
-  fs.appendFileSync(path.join(dest, 'manifest.jsonl'), JSON.stringify(rec) + '\n');
-  log(`archived: ${rec.file} (rows=${rows}, ${(st.size / 1048576).toFixed(2)}MB → ${(gzBytes / 1024).toFixed(0)}KB)`);
-
-  const pruned = pruneHourly(dest, { now, keepHourlyDays });
-  if (pruned.length) log(`pruned ${pruned.length} hourly file(s) older than ${keepHourlyDays}d (daily last kept)`);
-
-  let offsite = null;
-  if (!opts.noOffsite) {
-    const remote = resolveOffsiteRemote(opts.env || process.env);
-    if (remote) offsite = offsiteCopy(dest, remote, { rcloneConfig: ((opts.env || process.env).BACKUP_RCLONE_CONFIG || '').trim(), log });
-    else log('offsite: remote 未設定のためローカル保存のみ (LOGIZARD_HISTORY_RCLONE_REMOTE か BACKUP_RCLONE_REMOTE)');
-  }
-  return { action: 'archived', file: outFile, rows, bytes: st.size, gzBytes, pruned, offsite };
+  return result;
 }
 
 // ─── CLI ───
@@ -223,11 +290,16 @@ if (isMain) {
     noOffsite: args.includes('--no-offsite'),
   };
   if (opts.keepHourlyDays !== undefined && !(opts.keepHourlyDays >= 1 && opts.keepHourlyDays <= 3650)) { console.error('--keep-hourly-days は 1〜3650'); process.exit(2); }
+  if (opts.staleHours !== undefined && !(opts.staleHours > 0 && opts.staleHours <= 240)) { console.error('--stale-hours は 0 より大きく 240 以下'); process.exit(2); }
   archiveSnapshot(opts).then((r) => {
     if (r.action === 'skipped') console.log(`[lz-archive] skipped: ${r.reason}`);
+    console.log(`RESULT action=${r.action} code=${r.code} offsite=${r.offsite ?? 'none'}${r.file ? ` file=${path.basename(r.file)}` : ''}`);
+    if (r.code === 'stale' || r.code === 'empty') process.exit(3);
+    if (r.offsite === 'failed') process.exit(4);
     process.exit(0);
   }).catch((e) => {
     console.error(`[lz-archive] FAILED: ${e.message}`);
+    console.log(`RESULT action=error code=${e.code || 'error'}`);
     process.exit(e.code === 'ENOENT_CSV' ? 2 : 1);
   });
 }
