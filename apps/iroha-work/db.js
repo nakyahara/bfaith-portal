@@ -270,6 +270,7 @@ const TASKS_REQUIRED_DDL = [
   // 止まっている理由 (案A 2026-09-05)。addCol で列だけ足した版は表レベルの CHECK が無いので作り直す
   /blocked_reason IS NULL OR status IN \('not_started','in_progress'\)/,
   /blocked_reason IS NOT NULL OR \(blocked_note IS NULL AND blocked_at IS NULL AND blocked_by IS NULL\)/,
+  /blocked_reason IS NULL OR blocked_at IS NOT NULL/,   // 理由があるなら「いつ止めたか」必須 (Codex PR #1193 R2)
 ];
 const LABEL_REQUIRED_DDL = [/REFERENCES f_iroha_tasks/, /label_ordered IN \(0,1\)/, /location IN \('Z','Y','none'\)/, /reattach IN \(0,1\)/, /done IN \(0,1\)/];
 const FK_CHECK_TABLES = ['f_iroha_tasks', 'f_iroha_label_waits', 'f_iroha_work_sessions', 'f_iroha_card_media', 'f_iroha_app_events'];
