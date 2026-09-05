@@ -4681,7 +4681,7 @@ if ('serviceWorker' in navigator) {
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if ($('#askOv').classList.contains('on')) { askDone(false); return; }   // 確認ダイアログだけ閉じる (下のダイアログは残す)
-  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeDetail();
+  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeFacPick(); closeDetail();
 });
 </script>
 </body>
