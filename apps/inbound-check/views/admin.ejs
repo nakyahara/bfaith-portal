@@ -509,7 +509,8 @@
               return;
             }
           } catch (e) { /* 次の周回で見る */ }
-          if (Date.now() - started > 200000) {
+          // Render 側の上限 (300秒) より後ろで打ち切る。先に諦めると、走っている取得を失敗と見せてしまう
+          if (Date.now() - started > 330000) {
             msg($('#refreshMsg'), false, '時間内に終わりませんでした。miniPC のログを確認してください');
             refreshBtn.disabled = false;
             return;

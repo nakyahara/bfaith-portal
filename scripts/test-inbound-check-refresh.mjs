@@ -34,7 +34,7 @@ const eq = (a, b, l) => ok(JSON.stringify(a) === JSON.stringify(b), `${l} (期�
 const FAST = { jobPollMs: 5, driveWaitMs: 60, drivePollMs: 5, cooldownMs: 60_000 };
 
 /** miniPC の service-api を模す。calls に呼ばれた順で記録する */
-function makeFetch({ jobStates = ['completed'], startBody = { ok: true, jobId: 'job-1', status: 'running' }, startStatus = 202, jobError = null, progress = null, calls = [] } = {}) {
+function makeFetch({ jobStates = ['completed'], startBody = { ok: true, jobId: 'job-1', status: 'running' }, startStatus = 202, jobError = null, progress = null, calls = [], jobResult = { ok: true } } = {}) {
   let i = 0;
   return async (url, opts = {}) => {
     calls.push(`${opts.method || 'GET'} ${String(url).replace('https://wh.example.test', '')}`);
@@ -49,7 +49,7 @@ function makeFetch({ jobStates = ['completed'], startBody = { ok: true, jobId: '
       const job = { jobId: 'job-1', type: 'logizard-nyuka-refresh', status: st };
       if (st === 'running' && progress) job.progress = progress;
       if (st === 'failed') job.error = jobError || { code: 'SCRIPT_FAILED', message: '取得に失敗しました' };
-      if (st === 'completed') job.result = { ok: true };
+      if (st === 'completed') job.result = jobResult;
       return json({ ok: true, job });
     }
     throw new Error(`想定外の呼び出し: ${url}`);
@@ -112,9 +112,10 @@ console.log('\n[3] 進み具合が画面に出る (ロック待ちも伝える)'
   eq(s.state, 'done', 'その後ちゃんと完了する');
 }
 
-console.log('\n[4] 増えていなかった = 失敗ではない');
+console.log('\n[4] 増えていなかった = 失敗ではない (ただし届いたことを確かめてから言う)');
 {
   _resetForTest();
+  // Drive の更新日時が動いた = 取り直した結果が確かに届いている → 中身が同じなら「新規なし」
   const s0 = startRefresh({
     actor: 'test', fetchFn: makeFetch(),
     drive: makeDrive({ importResult: { ok: false, error: 'duplicate_file', message: '同じファイルです' } }),
@@ -123,7 +124,42 @@ console.log('\n[4] 増えていなかった = 失敗ではない');
   ok(s0.ok, '走り出す');
   const s = await _waitIdleForTest();
   eq(s.state, 'done', 'done (failed にしない)');
-  ok(s.ok === true && s.unchanged === true && /新しい入荷受付はありません/.test(s.message), `文言で伝える (${s.message})`);
+  ok(s.ok === true && s.unchanged === true && /新しい受付はありませんでした/.test(s.message), `文言で伝える (${s.message})`);
+}
+{
+  _resetForTest();
+  // Drive は動かないが、miniPC が「出力CSVは前回と同じ」と言っている → 増えていないことは確か
+  startRefresh({
+    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvChanged: false } }),
+    drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A', importResult: { ok: false, error: 'duplicate_file' } }),
+    timing: FAST,
+  });
+  const s = await _waitIdleForTest();
+  ok(s.state === 'done' && s.unchanged && s.verified, 'miniPC 側で中身が同じと分かっていれば「新規なし」と言ってよい');
+}
+{
+  _resetForTest();
+  // 🚨 取り直したのに新しい世代を確認できない (転送漏れ / Drive 障害) → 「新規なし」と言い切らない
+  startRefresh({
+    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvChanged: true } }),
+    drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A', importResult: { ok: false, error: 'duplicate_file' } }),
+    timing: FAST,
+  });
+  const s = await _waitIdleForTest();
+  eq(s.state, 'failed', '確かめられないときは done にしない');
+  eq(s.error, 'not_verified', 'not_verified');
+  ok(/反映を確認できませんでした/.test(s.message), `そのまま伝える (${s.message})`);
+}
+{
+  _resetForTest();
+  // 新しいバッチができたなら裏取りは不要 (新しい世代が届いた証拠そのもの)
+  startRefresh({
+    actor: 'test', fetchFn: makeFetch({ jobResult: { ok: true, csvChanged: true } }),
+    drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A' }),
+    timing: FAST,
+  });
+  const s = await _waitIdleForTest();
+  ok(s.state === 'done' && s.verified && /3伝票/.test(s.message), '取り込めたときは Drive の更新日時を待たずに成功');
 }
 
 console.log('\n[5] 失敗はそのまま画面に出す');
@@ -195,10 +231,11 @@ console.log('\n[7] Drive の反映待ち');
 }
 {
   _resetForTest();
-  // 更新日時が動かない (中身が同じ) → 上限まで待って、取込側の判定に任せる
-  startRefresh({ actor: 'test', fetchFn: makeFetch(), drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A', importResult: { ok: false, error: 'duplicate_file', message: '同じ' } }), timing: FAST });
+  // 更新日時が動かなくても上限まで待って取り込みには行く (判定は取込側 + 裏取りで決める)
+  const calls = [];
+  startRefresh({ actor: 'test', fetchFn: makeFetch({ calls, jobResult: { ok: true, csvChanged: false } }), drive: makeDrive({ modifiedBefore: 'A', modifiedAfter: 'A', importResult: { ok: false, error: 'duplicate_file', message: '同じ' } }), timing: FAST });
   const s = await _waitIdleForTest();
-  ok(s.state === 'done' && s.unchanged, '待っても動かなければ取り込みに行き、変化なしとして返す');
+  ok(s.state === 'done' && s.unchanged, '待っても動かなければ取り込みに行き、裏取りできていれば変化なしとして返す');
 }
 {
   _resetForTest();

@@ -18,7 +18,7 @@
  *    掴めない間は待ち、それでも空かなければ「いま別の取得中」として返す (定時 bat の10分待ちは画面には長すぎる)
  */
 import { Router } from 'express';
-import { spawn } from 'child_process';
+import { spawn, execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { createJob, getJob } from './job-manager.js';
@@ -32,17 +32,27 @@ const AUTOMATION_DIR = process.env.LOGIZARD_AUTOMATION_DIR || 'C:\\tools\\logiza
 const SCRIPT = 'auto-nyuka-csv.js';
 /** ロジザードのセッションロック (在庫CSV・値札CSV と共有) */
 const LOCK_PATH = path.join(AUTOMATION_DIR, 'logs', 'logizard-session.lock');
-/** 連打防止。ロジザードへのログインを短時間に何度も行わない */
+/** 出力先 CSV (取得できたことの裏取りに使う。env は .env 側なので既定名で見る) */
+const OUT_CSV = path.join(AUTOMATION_DIR, 'out', 'nyuka_uketsuke.csv');
+/** 連打防止。**終わった時刻から**数える (受付時刻からだと長いジョブの直後に再実行できてしまう) */
 const COOLDOWN_MS = 60_000;
-/** ロックが空くのを待つ上限。超えたら「いま別の取得中」で諦める (画面を待たせ続けない) */
-const LOCK_WAIT_MS = 90_000;
+/**
+ * ロックが空くのを待つ上限 / 子プロセスの上限。
+ * 🚨 **合計は呼び出し側 (Render 300秒) より短くする**。長いと、正常に走り続けている取得を
+ *    呼び出し側が先に「失敗」と表示して再試行を誘う。60 + 180 = 最大240秒に収める
+ */
+const LOCK_WAIT_MS = 60_000;
 const LOCK_POLL_MS = 3_000;
-/** 子プロセスの上限。実測は約30秒 (2026-09-05: 11:45:01 開始 → 11:45:31 Drive 反映) */
-const RUN_TIMEOUT_MS = 5 * 60 * 1000;
+/** 実測は約30秒 (2026-09-05: 11:45:01 開始 → 11:45:31 Drive 反映) */
+const RUN_TIMEOUT_MS = 180_000;
+/** 強制終了してもプロセスが閉じないときに、ジョブだけは必ず終わらせる猶予 */
+const KILL_GRACE_MS = 15_000;
+/** ロックが「置き去り」と見なせる古さ。自動化側の stale 判定 (30分) と揃える */
+const LOCK_STALE_MS = 30 * 60 * 1000;
 /** ジョブに残す出力の上限 (エラーの手掛かりだけ。全文はスクリプト側のログにある) */
 const MAX_OUTPUT_CHARS = 4000;
 
-let _lastStartAt = 0;
+let _lastFinishedAt = 0;
 let _runningJobId = null;
 
 /** いま走っているジョブ (無ければ null)。プロセス再起動でジョブは消えるので getJob で確かめ直す */
@@ -53,9 +63,32 @@ function runningJob() {
   return j;
 }
 
-/** ロックが誰かに握られているか (ファイルの有無だけを見る。stale 判定はスクリプト側が持つ) */
-function lockHeld() {
-  try { return fs.existsSync(LOCK_PATH); } catch { return false; }
+/** その PID が生きているか (EPERM = 別ユーザーの生きているプロセス) */
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+/**
+ * ロックが「いま誰かが本当にログイン中」か。
+ *
+ * 🚨 単なる存在確認にすると、異常終了で残ったロックを永久に「実行中」と読み、以後ずっと待たされる。
+ *    自動化側と同じ基準 (持ち主の PID が死んでいて 30 分以上更新が無い) で置き去りと判断する。
+ * 🚨 **こちらでロックを消さない**。回収は取得スクリプト自身の acquireLock (隔離リネーム + 取り違え検査) に
+ *    任せる — 確認してから消すまでの間に別の実行が取り直すと、その新しいロックを消してしまう
+ *    ([[feedback_lock_no_auto_reclaim]])。ここは「待つのをやめてよいか」を決めるだけ
+ */
+function lockState() {
+  let st;
+  try { st = fs.statSync(LOCK_PATH); } catch { return { held: false }; }
+  let owner = null;
+  try { owner = JSON.parse(fs.readFileSync(LOCK_PATH, 'utf8')); } catch { /* 壊れたロック */ }
+  const ageMs = Date.now() - st.mtimeMs;
+  const alive = owner && pidAlive(Number(owner.pid));
+  if (alive) return { held: true, stale: false, ageMs, pid: owner.pid };
+  // 持ち主が死んでいても、若いロックは待つ (起動直後・心拍の谷を「置き去り」と決めつけない)
+  if (ageMs <= LOCK_STALE_MS) return { held: true, stale: false, ageMs, pid: owner ? owner.pid : null };
+  return { held: false, stale: true, ageMs, pid: owner ? owner.pid : null };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -67,8 +100,22 @@ function tail(s) {
 }
 
 /**
+ * プロセスツリーごと終わらせる。
+ * 🚨 `child.kill()` は起動した node しか殺さない。Playwright の Edge や rclone が孤児として残ると、
+ *    ロックも掴んだままになり以後の取得が全部止まる。Windows は taskkill /T /F で木ごと落とす
+ */
+function killTree(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  if (process.platform === 'win32') {
+    try { execFile('taskkill', ['/PID', String(pid), '/T', '/F'], () => { /* 既に終わっていてもよい */ }); }
+    catch { /* taskkill が無い環境は下の kill に任せる */ }
+  }
+  try { process.kill(pid, 'SIGKILL'); } catch { /* 既に終わっている */ }
+}
+
+/**
  * `node auto-nyuka-csv.js` を1回走らせる。
- * @returns {Promise<{code:number|null, output:string, timedOut:boolean}>}
+ * @returns {Promise<{code:number|null, output:string, timedOut:boolean, orphaned?:boolean}>}
  */
 function runScript(scriptPath) {
   return new Promise((resolve, reject) => {
@@ -93,13 +140,39 @@ function runScript(scriptPath) {
     child.stdout?.on('data', add);
     child.stderr?.on('data', add);
     let timedOut = false;
+    let settled = false;
+    let graceTimer = null;
+    const settle = (v) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
+      resolve(v);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      try { child.kill(); } catch { /* 既に終わっている */ }
+      killTree(child.pid);
+      // 木ごと殺しても close が来ないことがある。ジョブを永久に running のままにしない
+      graceTimer = setTimeout(() => settle({ code: null, output: tail(out), timedOut: true, orphaned: true }), KILL_GRACE_MS);
+      graceTimer.unref?.();
     }, RUN_TIMEOUT_MS);
-    child.on('error', (e) => { clearTimeout(timer); reject(new Error(`取得スクリプトの起動に失敗: ${e.message}`)); });
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code, output: tail(out), timedOut }); });
+    child.on('error', (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
+      reject(new Error(`取得スクリプトの起動に失敗: ${e.message}`));
+    });
+    child.on('close', (code) => settle({ code, output: tail(out), timedOut }));
   });
+}
+
+/** 出力 CSV の世代 (取得できたことの裏取り。無くても取得自体は成立するので null を許す) */
+function outCsvStamp() {
+  try {
+    const st = fs.statSync(OUT_CSV);
+    return { path: OUT_CSV, size: st.size, mtime: new Date(st.mtimeMs).toISOString() };
+  } catch { return null; }
 }
 
 /**
@@ -124,49 +197,67 @@ router.post('/nyuka-refresh', (req, res) => {
     });
   }
   const now = Date.now();
-  if (now - _lastStartAt < COOLDOWN_MS) {
-    const wait = Math.ceil((COOLDOWN_MS - (now - _lastStartAt)) / 1000);
+  if (now - _lastFinishedAt < COOLDOWN_MS) {
+    const wait = Math.ceil((COOLDOWN_MS - (now - _lastFinishedAt)) / 1000);
     return errorResponse(res, {
       status: 429, error: 'COOLDOWN', requestId: req.requestId,
       message: `さっき取得したばかりです。${wait}秒あけてからもう一度お試しください`,
     });
   }
-  _lastStartAt = now;
 
   const job = createJob('logizard-nyuka-refresh', async (updateProgress) => {
-    // ① ロジザードのセッションロックが空くのを待つ (在庫CSVは毎時00分に走る)
-    const until = Date.now() + LOCK_WAIT_MS;
-    let waited = false;
-    while (lockHeld()) {
-      if (Date.now() >= until) {
-        const e = new Error('ロジザードの別の取得 (在庫CSV等) が終わりませんでした。1〜2分おいてからもう一度お試しください');
-        e.code = 'LOCK_BUSY';
+    try {
+      // ① ロジザードのセッションロックが空くのを待つ (在庫CSVは毎時00分に走る)
+      const until = Date.now() + LOCK_WAIT_MS;
+      let waited = false;
+      let staleSeen = false;
+      for (;;) {
+        const lk = lockState();
+        if (!lk.held) { staleSeen = !!lk.stale; break; }
+        if (Date.now() >= until) {
+          const e = new Error('ロジザードの別の取得 (在庫CSV等) が終わりませんでした。1〜2分おいてからもう一度お試しください');
+          e.code = 'LOCK_BUSY';
+          throw e;
+        }
+        waited = true;
+        updateProgress({ phase: 'waiting_lock', message: 'ロジザードの別の取得が終わるのを待っています' });
+        await sleep(LOCK_POLL_MS);
+      }
+      // 置き去りのロックは自分では消さない。取得スクリプトの acquireLock が隔離して取り直す
+      if (staleSeen) console.warn('[logizard-export] 置き去りのロックを検出 (取得スクリプトの回収に任せます)');
+      updateProgress({ phase: 'running', message: 'ロジザードから入荷受付CSVを取得しています', waitedForLock: waited });
+
+      // ② 取得 (ログイン → 検索 → CSV出力 → Drive へ転送まで、定時と同じスクリプト)
+      const before = outCsvStamp();
+      const r = await runScript(scriptPath);
+      if (r.timedOut) {
+        const e = new Error(`取得が ${Math.round(RUN_TIMEOUT_MS / 1000)} 秒を超えたため中止しました`
+          + (r.orphaned ? ' (プロセスが応答しないため強制終了しました。ロジザードのロックが残っていないか確認してください)' : ''));
+        e.code = 'TIMEOUT';
         throw e;
       }
-      waited = true;
-      updateProgress({ phase: 'waiting_lock', message: 'ロジザードの別の取得が終わるのを待っています' });
-      await sleep(LOCK_POLL_MS);
+      if (r.code !== 0) {
+        // ロック待ちを抜けた直後に別プロセスが取った場合もここに来る (スクリプト側が即終了する)
+        const lockish = /ロック|lock/i.test(r.output);
+        const e = new Error(lockish
+          ? 'ロジザードの別の取得と重なりました。少しおいてからもう一度お試しください'
+          : `取得に失敗しました (終了コード ${r.code})`);
+        e.code = lockish ? 'LOCK_BUSY' : 'SCRIPT_FAILED';
+        e.output = r.output;
+        throw e;
+      }
+      // ③ 出力 CSV が実際に書き変わったかを返す。呼び出し側 (Render) は
+      //    「取れていないのに『新しい入荷はありません』」と言わないための裏取りに使う
+      const after = outCsvStamp();
+      return {
+        ok: true, output: r.output, waitedForLock: waited,
+        csv: after,
+        csvChanged: !!after && (!before || after.mtime !== before.mtime || after.size !== before.size),
+      };
+    } finally {
+      // 🚨 連打防止は**終わった時刻**から数える (受付時刻からだと、60秒より長いジョブの直後に再実行できる)
+      _lastFinishedAt = Date.now();
     }
-    updateProgress({ phase: 'running', message: 'ロジザードから入荷受付CSVを取得しています', waitedForLock: waited });
-
-    // ② 取得 (ログイン → 検索 → CSV出力 → Drive へ転送まで、定時と同じスクリプト)
-    const r = await runScript(scriptPath);
-    if (r.timedOut) {
-      const e = new Error(`取得が ${Math.round(RUN_TIMEOUT_MS / 1000)} 秒を超えたため中止しました`);
-      e.code = 'TIMEOUT';
-      throw e;
-    }
-    if (r.code !== 0) {
-      // ロック待ちを抜けた直後に別プロセスが取った場合もここに来る (スクリプト側が即終了する)
-      const lockish = /ロック|lock/i.test(r.output);
-      const e = new Error(lockish
-        ? 'ロジザードの別の取得と重なりました。少しおいてからもう一度お試しください'
-        : `取得に失敗しました (終了コード ${r.code})`);
-      e.code = lockish ? 'LOCK_BUSY' : 'SCRIPT_FAILED';
-      e.output = r.output;
-      throw e;
-    }
-    return { ok: true, output: r.output, waitedForLock: waited };
   });
   _runningJobId = job.jobId;
   okResponse(res, { jobId: job.jobId, status: 'running' }, 202);
@@ -175,18 +266,21 @@ router.post('/nyuka-refresh', (req, res) => {
 /** GET /service-api/logizard/status — 押す前に「いま取得中か」を見たいとき (画面の初期表示用) */
 router.get('/status', (req, res) => {
   const j = runningJob();
+  const lk = lockState();
   okResponse(res, {
     available: fs.existsSync(path.join(AUTOMATION_DIR, SCRIPT)),
     running: !!j,
     jobId: j ? j.jobId : null,
-    lockHeld: lockHeld(),
-    cooldownRemainSec: Math.max(0, Math.ceil((COOLDOWN_MS - (Date.now() - _lastStartAt)) / 1000)),
+    lockHeld: !!lk.held,
+    lockStale: !!lk.stale,
+    csv: outCsvStamp(),
+    cooldownRemainSec: Math.max(0, Math.ceil((COOLDOWN_MS - (Date.now() - _lastFinishedAt)) / 1000)),
   });
 });
 
 /** テスト用: 連打防止と実行中の記録を初期化する */
 export function _resetForTest() {
-  _lastStartAt = 0;
+  _lastFinishedAt = 0;
   _runningJobId = null;
 }
 

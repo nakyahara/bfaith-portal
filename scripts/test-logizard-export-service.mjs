@@ -51,9 +51,21 @@ const call = async (method, url, body = null) => {
 };
 const SCRIPT = path.join(DIR, 'auto-nyuka-csv.js');
 const LOCK = path.join(DIR, 'logs', 'logizard-session.lock');
-/** 取得スクリプトの代わり。exitCode と出力を指定できる */
-const writeScript = (exitCode = 0, out = 'ok') => fs.writeFileSync(SCRIPT,
-  `console.log(${JSON.stringify(out)}); console.log('cwd=' + process.cwd()); process.exitCode = ${exitCode};\n`);
+const OUT_CSV = path.join(DIR, 'out', 'nyuka_uketsuke.csv');
+/** 取得スクリプトの代わり。exitCode と出力を指定できる。writesCsv=true なら出力CSVも書く */
+const writeScript = (exitCode = 0, out = 'ok', { writesCsv = false, csvBody = null } = {}) => fs.writeFileSync(SCRIPT,
+  `console.log(${JSON.stringify(out)}); console.log('cwd=' + process.cwd());\n`
+  + (writesCsv
+    ? `const fs=require('fs');const p=require('path');fs.mkdirSync(p.join(process.cwd(),'out'),{recursive:true});`
+      + `fs.writeFileSync(p.join(process.cwd(),'out','nyuka_uketsuke.csv'), ${JSON.stringify(csvBody ?? 'row1\n')});\n`
+    : '')
+  + `process.exitCode = ${exitCode};\n`);
+/** 置き去りのロック (持ち主が死んでいて古い) を作る */
+function writeStaleLock() {
+  fs.writeFileSync(LOCK, JSON.stringify({ pid: 999999, token: 'x', startedAt: '2020-01-01T00:00:00.000Z' }));
+  const old = new Date(Date.now() - 60 * 60 * 1000);
+  fs.utimesSync(LOCK, old, old);
+}
 /** ジョブが終わるまで待つ */
 async function waitJob(jobId, timeoutMs = 15000) {
   const until = Date.now() + timeoutMs;
@@ -90,6 +102,29 @@ console.log('\n[2] 取得スクリプトを実際に起動して完了まで');
   ok(/nyuka ok/.test(job.result.output || ''), '取得スクリプトの出力を残す (失敗時の手掛かり)');
   ok(job.result.output.includes(`cwd=${DIR}`), `自動化フォルダで動かす (${DIR})`);
   eq(job.result.waitedForLock, false, 'ロック待ちはしていない');
+  // 連打防止は「終わった時刻」から数える (受付時刻からだと長いジョブの直後に再実行できてしまう)
+  const st = await call('GET', '/service-api/logizard/status');
+  ok(st.body.cooldownRemainSec >= 58, `完了直後は残り約60秒 (${st.body.cooldownRemainSec}秒) = 終了時刻から数えている`);
+}
+
+console.log('\n[2b] 出力CSVが書き変わったかを返す (呼び出し側の裏取り用)');
+{
+  svc._resetForTest();
+  try { fs.rmSync(OUT_CSV, { force: true }); } catch { /* 無ければよい */ }
+  writeScript(0, 'first', { writesCsv: true, csvBody: 'a\n' });
+  const r1 = await call('POST', '/service-api/logizard/nyuka-refresh');
+  const j1 = await waitJob(r1.body.jobId);
+  eq(j1.result.csvChanged, true, '初回は書き変わった');
+  ok(j1.result.csv && j1.result.csv.size > 0, `出力CSVの世代を返す (${JSON.stringify(j1.result.csv)})`);
+
+  svc._resetForTest();
+  // 中身も更新時刻も変わらない = 増えていない (rclone が転送を省いても呼び出し側が判断できる)
+  writeScript(0, 'again');
+  const before = fs.statSync(OUT_CSV).mtimeMs;
+  const r2 = await call('POST', '/service-api/logizard/nyuka-refresh');
+  const j2 = await waitJob(r2.body.jobId);
+  eq(j2.result.csvChanged, false, '2回目は書き変わっていない');
+  eq(fs.statSync(OUT_CSV).mtimeMs, before, 'CSV は触っていない');
 }
 
 console.log('\n[3] 連打と二重起動を止める');
@@ -130,6 +165,33 @@ console.log('\n[4] 他のロジザード取得中 (ロックあり) は割り込
   const job = await waitJob(r.body.jobId);
   eq(job.status, 'completed', 'ロックが空いたら取得が走る');
   eq(job.result.waitedForLock, true, '待ったことを記録する');
+}
+
+console.log('\n[4b] 置き去りのロックで永久に待たされない');
+{
+  svc._resetForTest();
+  writeScript(0, 'after stale lock');
+  writeStaleLock();   // 持ち主の PID が死んでいて 1時間前から放置
+  const st = await call('GET', '/service-api/logizard/status');
+  ok(st.body.lockHeld === false && st.body.lockStale === true, '置き去りと判定する (握られているとは読まない)');
+  const t0 = Date.now();
+  const r = await call('POST', '/service-api/logizard/nyuka-refresh');
+  const job = await waitJob(r.body.jobId);
+  eq(job.status, 'completed', '待たずに取得へ進む');
+  eq(job.result.waitedForLock, false, 'ロック待ちに入っていない');
+  ok(Date.now() - t0 < 3000, `90秒待ちに落ちない (${Date.now() - t0}ms)`);
+  // 🚨 置き去りロックを**こちらで消さない** (回収は取得スクリプトの acquireLock に任せる)
+  ok(fs.existsSync(LOCK), 'ロックファイルは消さない (取り違えて他人のロックを消さないため)');
+  fs.unlinkSync(LOCK);
+}
+{
+  svc._resetForTest();
+  // 持ち主が死んでいても「若い」ロックは待つ (起動直後・心拍の谷を置き去りと決めつけない)
+  fs.writeFileSync(LOCK, JSON.stringify({ pid: 999999, token: 'x', startedAt: new Date().toISOString() }));
+  const st = await call('GET', '/service-api/logizard/status');
+  eq(st.body.lockHeld, true, '若いロックは「実行中」として扱う');
+  eq(st.body.lockStale, false, 'stale ではない');
+  fs.unlinkSync(LOCK);
 }
 
 console.log('\n[5] 取得スクリプトが失敗したとき');

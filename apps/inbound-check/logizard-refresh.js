@@ -34,7 +34,9 @@ const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
  * テストからは短い値を渡す (待ち時間の実測ではなく、遷移を確かめたいので)
  */
 export const DEFAULT_TIMING = Object.freeze({
-  jobTimeoutMs: 180_000, jobPollMs: 2_000,
+  // 🚨 miniPC 側の上限 (ロック待ち60秒 + 取得180秒 = 最大240秒) より**長く**取る。
+  //    短いと、正常に走り続けている取得をこちらが先に「失敗」と表示して再試行を誘う
+  jobTimeoutMs: 300_000, jobPollMs: 2_000,
   driveWaitMs: 30_000, drivePollMs: 2_500,
   cooldownMs: 60_000,
 });
@@ -136,29 +138,50 @@ async function runRefresh({ actor, fetchFn, drive, timing }) {
     // ② Drive に反映されるのを待つ (rclone 転送の直後は Drive API にまだ見えないことがある)
     setRun({ phase: 'importing', message: '取り込んでいます' });
     const driveUntil = Date.now() + T.driveWaitMs;
+    let driveAdvanced = false;
     if (before && before.modified_time) {
       for (;;) {
         let now2 = null;
         try { now2 = await drive.getDriveInfo({ force: true }); } catch { /* 次の周回で見る */ }
-        if (now2 && now2.modified_time && now2.modified_time !== before.modified_time) break;
-        if (Date.now() > driveUntil) break;   // 中身が同じなら更新日時も動かないことがある → 取込側の判定に任せる
+        if (now2 && now2.modified_time && now2.modified_time !== before.modified_time) { driveAdvanced = true; break; }
+        if (Date.now() > driveUntil) break;
         await sleep(T.drivePollMs);
       }
     }
+    /**
+     * 🚨「取り直した結果が本当に届いたか」を確かめてからでないと、`duplicate_file` を
+     *    「新しい入荷受付はありませんでした」と言ってはいけない。転送漏れ・Drive 障害・反映遅れでも
+     *    同じ見た目になり、現場は「ロジザードに登録できていないのか」と誤解する。
+     *  裏取りは2つ。どちらかが取れれば「確かめられた」とする:
+     *    - Drive の更新日時が動いた
+     *    - miniPC 側の出力 CSV が**前回と同じ中身だった** (= 増えていないことがこちらで確定している。
+     *      rclone は中身が同じなら転送を省くことがあるので、Drive が動かないのが正しい)
+     */
+    const csvChanged = job.result && typeof job.result.csvChanged === 'boolean' ? job.result.csvChanged : null;
+    const verified = driveAdvanced || csvChanged === false;
 
     // ③ 取り込む (fail-closed の判定・確認状態の引き継ぎは既存のまま)
     const r = await drive.fetchAndImportFromDrive({ actor, source: 'drive_retry' });
     if (r.ok) {
+      // 新しいバッチができた = 新しい世代が確かに届いている (裏取りは不要)
       setRun({
-        state: 'done', phase: 'done', finishedAt: nowIso(), ok: true,
+        state: 'done', phase: 'done', finishedAt: nowIso(), ok: true, verified: true,
         message: `取り込みました (${r.slipCount}伝票 / ${r.rowCount}行)`,
         slipCount: r.slipCount, rowCount: r.rowCount, batchId: r.batch ? r.batch.id : null,
       });
-    } else if (r.error === 'duplicate_file') {
-      // ロジザード側に増えていなければこうなる。失敗ではないので、そう言う
+    } else if (r.error === 'duplicate_file' && verified) {
+      // ロジザード側に増えていなかった。失敗ではないので、そう言う
       setRun({
-        state: 'done', phase: 'done', finishedAt: nowIso(), ok: true, unchanged: true,
-        message: '新しい入荷受付はありませんでした (一覧は最新です)',
+        state: 'done', phase: 'done', finishedAt: nowIso(), ok: true, unchanged: true, verified: true,
+        message: '一覧に追加される新しい受付はありませんでした (一覧は最新です)',
+      });
+    } else if (r.error === 'duplicate_file') {
+      // 取り直したのに新しい世代を確認できない = 転送漏れ / Drive 障害 / 反映遅れ。
+      // 「新規なし」と言い切らず、確かめられなかったことをそのまま伝える
+      setRun({
+        state: 'failed', phase: 'done', finishedAt: nowIso(), ok: false, error: 'not_verified',
+        message: 'ロジザードからは取り直しましたが、共有ドライブへの反映を確認できませんでした。'
+          + '1〜2分おいてからもう一度押すか、管理画面の取込履歴を確認してください',
       });
     } else {
       setRun({
