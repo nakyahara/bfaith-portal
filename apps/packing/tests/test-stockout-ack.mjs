@@ -232,6 +232,14 @@ console.log('── 事務通知の outbox (claim / 再送対象 / 表示状態)
     assert.equal(claimStockoutNotify(id), true);
     assert.equal(claimStockoutNotify(id), false, '送信中は取れない');
     assert.ok(!listPendingStockoutNotifies(10).some((x) => x.id === id), '送信中は再送対象から外れる');
+    // 送信中に落ちた想定: 印が10分より古ければ失効して取り直せる (ISO の 'T' と datetime() の空白の比較罠 — Codex R3)
+    db.prepare("UPDATE pk_pack_stockouts SET claimed_at=? WHERE id=?")
+      .run(new Date(Date.now() - 20 * 60000).toISOString().slice(0, 19) + 'Z', id);
+    assert.ok(listPendingStockoutNotifies(10).some((x) => x.id === id), '古い印は失効 = 再送対象');
+    assert.equal(claimStockoutNotify(id), true, '失効した印は取り直せる');
+    db.prepare("UPDATE pk_pack_stockouts SET claimed_at=? WHERE id=?")
+      .run(new Date(Date.now() - 2 * 60000).toISOString().slice(0, 19) + 'Z', id);
+    assert.equal(claimStockoutNotify(id), false, '2分前の印は有効');
     markStockoutNotify(id, false, 'HTTP 500');
     assert.equal(db.prepare('SELECT notify_error, claimed_at FROM pk_pack_stockouts WHERE id=?').get(id).claimed_at, null);
     assert.ok(listPendingStockoutNotifies(10).some((x) => x.id === id), '失敗後は再送対象');

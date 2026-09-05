@@ -1797,10 +1797,14 @@ export function getTask(taskId) {
 // (Codex R2 Medium)。印は10分で失効 = 送信中に落ちても再送される。webhook に冪等キーが無いので
 // 「成功→印を付ける前に落ちた」だけは重複し得る (at-least-once)
 
-/** 送信権を取る。true = この呼び出し側が送ってよい / false = 未通知でない or 他方が送信中。 */
+/**
+ * 送信権を取る。true = この呼び出し側が送ってよい / false = 未通知でない or 他方が送信中。
+ * ⚠ 時刻列は ISO ('…T…Z') なので datetime() で正規化してから比較する — 文字列のままだと 'T' > ' ' で
+ *   同日中は失効判定が常に偽になり、送信中に落ちた行が翌日まで再送されない (Codex R3)
+ */
 export function claimStockoutNotify(id) {
   return getDB().prepare(`UPDATE pk_pack_stockouts SET claimed_at=?
-    WHERE id=? AND notified_at IS NULL AND (claimed_at IS NULL OR claimed_at < datetime('now', '-10 minutes'))`)
+    WHERE id=? AND notified_at IS NULL AND (claimed_at IS NULL OR datetime(claimed_at) < datetime('now', '-10 minutes'))`)
     .run(utcNow(), id).changes === 1;
 }
 
@@ -1818,14 +1822,14 @@ export function markStockoutNotify(id, sent, error = null) {
 /** 未通知の outbox 行 (送信中でないもの)。期間で切らない = 何日経っても送れたときに届く (Codex R2 High)。 */
 export function listPendingStockoutNotifies(limit = 3) {
   return getDB().prepare(`SELECT * FROM pk_pack_stockouts
-    WHERE notified_at IS NULL AND (claimed_at IS NULL OR claimed_at < datetime('now', '-10 minutes'))
+    WHERE notified_at IS NULL AND (claimed_at IS NULL OR datetime(claimed_at) < datetime('now', '-10 minutes'))
     ORDER BY id LIMIT ?`).all(limit);
 }
 
 /** 2日以上未通知のまま滞留している件数 (監視用ログ)。 */
 export function countStaleStockoutNotifies() {
   return getDB().prepare(`SELECT COUNT(*) c FROM pk_pack_stockouts
-    WHERE notified_at IS NULL AND created_at < datetime('now', '-2 days')`).get().c;
+    WHERE notified_at IS NULL AND datetime(created_at) < datetime('now', '-2 days')`).get().c;
 }
 
 // ─── ③ 候補の確定 / 取下げ (梱包完了サマリから) ───
