@@ -3329,6 +3329,12 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/: c\.loc_stock === 0\s*\r?\n?\s*\? '<div class="main none">在庫なし \(0 個\)<\/div>'/.test(html) && /まだ取れていません \(在庫の取り込みが無い\)/.test(html),
     'Zロケ「0 個」と「まだ取れていません」を分ける (監修 B-8)');
   ok(!/保留/.test(html.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')), '画面の文言に「保留」が残っていない (案A: 止まった／中断)');
+  // 監修 PR-E (R-1): window.prompt / confirm は iOS のホーム画面アプリで出ないことがある → 専用ダイアログ
+  ok(!/window\.prompt\(|window\.confirm\(|[^.\w]confirm\(|[^.\w]prompt\(/.test(html), 'window.prompt / confirm を使わない (監修 R-1)');
+  ok(/function ask\(o\)/.test(html) && /id="askOv"/.test(html) && /function askDone\(ok\)/.test(html), '確認・PIN・理由は専用ダイアログ ask() で受ける');
+  ok(/const pin = await ask\(\{ title: '🔑 職員モードに入る'/.test(html) && /input: 'pin'/.test(html), '職員PIN も ask (数字キーボード)');
+  ok(/reopenReason = await ask\(\{[^\n]*required: true/.test(html), '終了から戻す理由は必須のまま (空では通さない)');
+  ok(/if \(\$\('#askOv'\)\.classList\.contains\('on'\)\) \{ askDone\(false\); return; \}/.test(html), 'Esc は確認ダイアログだけ閉じる (下のダイアログは残す)');
   ok(!/onclick="openMaster/.test(html) && /data-reg="/.test(html), '作業のやり方は項目タップで変更 (編集ボタンなし)');
   ok(/\+ \(empty \? '＋ 登録' : '✎ 変更'\) \+/.test(html), '値があれば「変更」、無ければ「登録」と出す');
   ok(!/mvVideo/.test(html.replace(/\/\/.*$/gm, '')), '作り方どうがは画面から外した (コメントだけ残す)');

@@ -527,6 +527,11 @@
   .mfields input{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;
     font-size:1rem;background:var(--surface);color:var(--ink)}
   .mfields input:focus,.pin:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  /* 確認・PIN・理由の専用ダイアログ (window.prompt / confirm の置き換え — 監修 R-1)。他のダイアログの上に重なる */
+  .overlay.ask{z-index:25}
+  .ask .modal{max-width:520px}
+  .asktext{font-size:1.02rem;font-weight:600;white-space:pre-wrap;margin:6px 0 12px;color:var(--ink);line-height:1.5}
+  .ask .btn.warn{color:var(--danger);border-color:var(--danger)}
   .nlink{font-size:.8rem;color:var(--sub);margin:10px 0 0}
   .nlink a{color:var(--accent);font-weight:700}
   .pin{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;font-size:1.3rem;
@@ -796,6 +801,22 @@
         <button class="btn primary" id="unblockGo" onclick="confirmUnblock()">はい、解消した → はじめる</button>
       </div>
       <p class="hint">「はい」を押すと札が外れて、作業がはじまります。</p>
+    </div>
+  </div>
+
+  <!-- ══ 確認・入力の専用ダイアログ (監修 R-1)
+       window.prompt / confirm は iOS のホーム画面アプリ (display: standalone) で出ない・即 null が返る版がある。
+       職員PIN・理由・確認の全部をこの 1 つで受ける (ask() が Promise で返す) ══ -->
+  <div class="overlay ask" id="askOv">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="askTitle">
+      <h3 id="askTitle" tabindex="-1">確認</h3>
+      <p class="asktext" id="askText"></p>
+      <div id="askInRow" hidden><input id="askIn" class="pin" type="text" autocomplete="off"></div>
+      <div class="msaving" id="askMsg"></div>
+      <div class="mbtns">
+        <button class="btn" id="askCancel" onclick="askDone(false)">やめる</button>
+        <button class="btn primary" id="askOk" onclick="askDone(true)">はい</button>
+      </div>
     </div>
   </div>
 
@@ -1913,8 +1934,58 @@ function lockDeviceStaffMode() {
   return staffLockInflight;
 }
 
+// ─── 確認・入力の専用ダイアログ (window.prompt / confirm の置き換え — 監修 R-1) ───
+//   confirm 相当: ask({ title, text, ok, cancel }) → true / null
+//   prompt 相当:  ask({ title, text, input: 'pin' | 'text', placeholder, required }) → 文字列 / null (やめた)
+let askResolve = null;
+let askOpts = null;
+function ask(o) {
+  return new Promise((resolve) => {
+    if (askResolve) askResolve(null);   // 前のが開いたままなら「やめた」扱いで閉じる (2 つ重ねない)
+    askResolve = resolve;
+    askOpts = o || {};
+    $('#askTitle').textContent = askOpts.title || '確認';
+    const t = $('#askText');
+    t.textContent = askOpts.text || '';
+    t.hidden = !askOpts.text;
+    const inp = $('#askIn');
+    $('#askInRow').hidden = !askOpts.input;
+    if (askOpts.input) {
+      const pin = askOpts.input === 'pin';
+      inp.type = pin ? 'tel' : 'text';
+      inp.inputMode = pin ? 'numeric' : 'text';
+      inp.maxLength = pin ? 8 : 200;
+      inp.placeholder = askOpts.placeholder || '';
+      inp.value = '';
+    }
+    $('#askOk').textContent = askOpts.ok || 'はい';
+    $('#askCancel').textContent = askOpts.cancel || 'やめる';
+    $('#askOk').classList.toggle('warn', !!askOpts.danger);
+    $('#askMsg').textContent = '';
+    openOverlay('#askOv');
+    if (askOpts.input) setTimeout(() => { try { inp.focus(); } catch (e) { /* 出せなくてもよい */ } }, 60);
+  });
+}
+function askDone(ok) {
+  const r = askResolve;
+  if (!r) return;
+  if (ok && askOpts && askOpts.input) {
+    const v = $('#askIn').value;
+    if (askOpts.required && !v.trim()) { $('#askMsg').textContent = '❌ 入力してください'; return; }
+    askResolve = null; askOpts = null;
+    closeOverlay('#askOv');
+    r(v);
+    return;
+  }
+  askResolve = null; askOpts = null;
+  closeOverlay('#askOv');
+  r(ok ? true : null);
+}
+$('#askIn').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); askDone(true); } });
+$('#askOv').addEventListener('click', (e) => { if (e.target === $('#askOv')) askDone(false); });
+
 async function endStaffMode() {
-  if (!window.confirm('職員モードを終わりますか? (明日の計画は決められなくなります)')) return;
+  if (!(await ask({ title: '職員モードを終わりますか?', text: '明日の計画・どこが作業するか・外部出しは決められなくなります (もう一度入るには PIN)', ok: '終わる' }))) return;
   const j = await apiFetch('/api/staff-lock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
   if (!j.ok) { showErr(j.message || '職員モードを終われませんでした'); return; }
   // ⭐取り直しを待たずに、その場で許可を落とす。
@@ -1929,7 +2000,7 @@ async function askStaffUnlock() {
   const w = worker;
   if (!w) { openGate(); return false; }
   if (w.worker_type !== 'staff') { showErr('明日の計画を決められるのは職員だけです'); return false; }
-  const pin = window.prompt(w.display_name + 'さんの職員PIN (30分ぶん開きます)');
+  const pin = await ask({ title: '🔑 職員モードに入る', text: w.display_name + ' さんの職員PIN を入れてください (30 分ぶん開きます)', input: 'pin', ok: '入る' });
   if (pin == null) return false;
   const j = await apiFetch('/api/staff-unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ worker_id: w.id, pin }) });
@@ -2358,12 +2429,12 @@ async function doBulkStocked() {
   let pin = null;
   if (!state.me.session) {
     if (w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです'); return; }
-    pin = window.prompt(w.display_name + 'さんの職員PIN (' + ids.length + ' 件を棚入完了にします)');
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください (' + ids.length + ' 件を棚入完了にします)', input: 'pin', ok: 'つづける' });
     if (pin == null) return;
   }
   const names = ids.map(id => (findCard(id) || {}).title).filter(Boolean);
   const list = names.slice(0, 8).join('\n') + (names.length > 8 ? '\n…ほか ' + (names.length - 8) + ' 件' : '');
-  if (!window.confirm(ids.length + ' 件を棚入完了にします。よろしいですか?\n\n' + list)) return;
+  if (!(await ask({ title: ids.length + ' 件を棚入完了にします', text: list, ok: '棚入完了にする' }))) return;
   const j = await apiFetch('/api/bulk-stocked', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ids: ids.map((id) => ({ id, version: bulkIds.get(id) })), worker_id: w.id, pin }) });
   if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
@@ -3153,7 +3224,7 @@ async function dropPending(ev, opId) {
   if (!can('task.media.add')) return;   // 許可リストに無ければ動かない (他の写真操作と同じ)
   const p = pendingTiles.get(opId);
   if (!p) return;
-  if (!window.confirm('この写真をやめますか? (もう一度とり直せます)')) return;
+  if (!(await ask({ title: 'この写真をやめますか?', text: 'もう一度とり直せます', ok: 'やめる', cancel: 'のこす', danger: true }))) return;
   // ⭐通信が切れただけで、サーバーでは受け取れていることがある。先にサーバー側も取り消す
   //   (取り消せないまま画面から消すと、枠を使ったまま消せない写真が残る — Codex PR1 R15)
   const j = await apiFetch('/api/media/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -3168,7 +3239,7 @@ async function dropPending(ev, opId) {
 async function delMedia(ev, id) {
   ev.stopPropagation();
   if (!can('task.media.add')) return;   // 読むだけ (下見・履歴) では消さない (× も描いていない。二重の守り)
-  if (!confirm('この写真を削除しますか? (撮り直し用)')) return;
+  if (!(await ask({ title: 'この写真を削除しますか?', text: '撮り直すときに使います。削除すると戻せません', ok: '削除する', cancel: 'のこす', danger: true }))) return;
   const j = await apiFetch('/api/media/' + id + '/delete', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ delete_token: mediaTokens()[id] || null }),
@@ -4163,7 +4234,7 @@ async function doSetSt(choice) {
     // 「止まった」は進捗ではないので別のダイアログ (openBlock — 案A 2026-09-05)
     if (to === 'closed' && !closeReason) { stStep = 'closed'; $('#stMsg').textContent = '終了の理由を選んでください'; renderStBtns(c); return; }
     if (c.status === 'closed') {
-      reopenReason = window.prompt('終了したカードを戻します。理由を書いてください (例: 数え間違い)');
+      reopenReason = await ask({ title: '終了したカードを戻します', text: '理由を書いてください (履歴に残ります)', input: 'text', placeholder: '例: 数え間違い', required: true, ok: '作業中に戻す' });
       if (!reopenReason || !reopenReason.trim()) { $('#stMsg').textContent = '❌ 終了から戻すには理由が必要です'; return; }
     }
   }
@@ -4276,7 +4347,11 @@ if ('serviceWorker' in navigator) {
     .then(reg => { if (reg.active) reg.active.postMessage('cache-shell'); })
     .catch(() => { /* 非対応・失敗は無視 */ });
 }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeDetail(); } });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if ($('#askOv').classList.contains('on')) { askDone(false); return; }   // 確認ダイアログだけ閉じる (下のダイアログは残す)
+  closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeDetail();
+});
 </script>
 </body>
 </html>
