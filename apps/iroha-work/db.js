@@ -1214,18 +1214,52 @@ const IMAGE_HOST_ALLOW = ['drive.google.com', 'lh3.googleusercontent.com'];
 const PORTAL_ORIGIN = 'https://bfaith-portal.onrender.com';
 // ポータル内で画像として使えるのは、いろはアプリの配信エンドポイントそのものだけ (将来増えたらここに足す)
 const PORTAL_IMAGE_PATH = /^\/apps\/iroha-work\/api\/media\/\d+\/file$/;
+/** 同梱の資材・保管箱の画像 (public/app-images/iroha-work)。中原さんが 2026-09-05 に用意した袋・箱・コンテナ */
+const BUILTIN_IMAGE_PATH = /^\/app-images\/iroha-work\/[a-z0-9-]+\.png$/;
+
+/**
+ * 同梱画像と選択肢の対応。keys = 正規化して突き合わせる表記のゆれ (Excel の値がどう入っていても拾えるように)。
+ * 完全一致しなければ付けない (別の資材に間違った写真を出さない)
+ */
+export const BUILTIN_OPTION_IMAGES = [
+  { kind: 'material', path: '/app-images/iroha-work/vinyl-313.png', label: '313 ビニール袋 (260×380)', keys: ['313ビニール袋', 'ビニール袋313', 'ビニール袋 313', '313', 'NO.313', 'No.313'] },
+  { kind: 'material', path: '/app-images/iroha-work/vinyl-312.png', label: '312 ビニール袋 (230×340)', keys: ['312ビニール袋', 'ビニール袋312', 'ビニール袋 312', '312', 'NO.312', 'No.312'] },
+  { kind: 'material', path: '/app-images/iroha-work/vinyl-310.png', label: '310 ビニール袋 (180×270)', keys: ['310ビニール袋', 'ビニール袋310', 'ビニール袋 310', '310', 'NO.310', 'No.310'] },
+  { kind: 'material', path: '/app-images/iroha-work/vinyl-308.png', label: '308 ビニール袋 (130×250)', keys: ['308ビニール袋', 'ビニール袋308', 'ビニール袋 308', '308', 'NO.308', 'No.308'] },
+  { kind: 'container', path: '/app-images/iroha-work/carton-120.png', label: '120 段ボール', keys: ['120段ボール', '段ボール120', '120ダンボール', 'ダンボール120', '120'] },
+  { kind: 'container', path: '/app-images/iroha-work/container-20l.png', label: '20L コンテナ', keys: ['20Lコンテナ', 'コンテナ20L', '20L', '20リットルコンテナ'] },
+  { kind: 'container', path: '/app-images/iroha-work/container-9l.png', label: '9L コンテナ', keys: ['9Lコンテナ', 'コンテナ9L', '9L', '9リットルコンテナ'] },
+];
+
+/**
+ * まだ画像が付いていない選択肢に、同梱画像を割り当てる (seed の後に呼ぶ)。
+ * 既に画像がある行は触らない (本社が別の写真に差し替えたものを戻さない)
+ */
+export function applyBuiltinOptionImages(db = getDB()) {
+  const upd = db.prepare('UPDATE f_iroha_work_options SET image_url = ? WHERE kind = ? AND normalized_code = ? AND (image_url IS NULL OR image_url = ?)');
+  let n = 0;
+  db.transaction(() => {
+    for (const img of BUILTIN_OPTION_IMAGES) {
+      for (const k of img.keys) {
+        n += upd.run(img.path, img.kind, normalizeOptionCode(k), img.path).changes;
+      }
+    }
+  })();
+  return n;
+}
 /**
  * ポータル内のパスの検証。固定 origin で解析し、正規化後のパスが配信エンドポイントそのものであることを確かめる
  * (%2e%2e や混在エンコードで /apps/ の外へ出られない — Codex 選択肢 R2 #2)。percent-encoding 入り・クエリ・ハッシュは丸ごと不可。
  * 相対パスでも、同じポータルの絶対 URL でも同じ検証を通す (Codex 選択肢 R3: 絶対 URL で許可パスを迂回させない)
  */
 function validatePortalImagePath(p) {
-  const bad = { ok: false, message: 'ポータル内のリンクは /apps/iroha-work/api/media/<番号>/file だけ使えます' };
+  const bad = { ok: false, message: 'ポータル内のリンクは /apps/iroha-work/api/media/<番号>/file か /app-images/iroha-work/<名前>.png だけ使えます' };
   let url;
   try { url = new URL(p, PORTAL_ORIGIN); } catch { return bad; }
   let decoded;
   try { decoded = decodeURIComponent(url.pathname); } catch { return bad; }
-  if (url.origin !== PORTAL_ORIGIN || url.pathname !== decoded || decoded.includes('..') || !PORTAL_IMAGE_PATH.test(decoded) || url.search || url.hash) return bad;
+  if (url.origin !== PORTAL_ORIGIN || url.pathname !== decoded || decoded.includes('..') || url.search || url.hash) return bad;
+  if (!PORTAL_IMAGE_PATH.test(decoded) && !BUILTIN_IMAGE_PATH.test(decoded)) return bad;
   return { ok: true, value: decoded };
 }
 export function validateOptionImageUrl(raw) {
@@ -1287,6 +1321,8 @@ export function seedWorkOptionsFromMaster({ force = false } = {}) {
       }
     }
   })();
+  // 同梱の資材・保管箱の画像を、まだ画像が無い選択肢に割り当てる (新しく増えた候補にも自動で付く)
+  try { out.images = applyBuiltinOptionImages(db); } catch (e) { console.warn('[iroha-work] 同梱画像の割り当てに失敗', e.message); }
   seedFingerprint = key;
   return out;
 }

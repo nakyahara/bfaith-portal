@@ -174,7 +174,7 @@
           <% for (const o of list) { %>
             <tr class="<%= o.active ? '' : 'inactive' %>">
               <td><%= o.code %></td>
-              <td><% if (o.image_url) { %><a href="<%= o.image_url %>" target="_blank" rel="noopener">画像</a><% } else { %>-<% } %></td>
+              <td><% if (o.image_url) { %><a href="<%= o.image_url %>" target="_blank" rel="noopener"><img src="<%= o.image_url %>" alt="" referrerpolicy="no-referrer" style="width:36px;height:36px;object-fit:contain;vertical-align:middle"></a><% } else { %>-<% } %></td>
               <td><%= o.active ? '有効' : '無効' %></td>
               <% if (isAdmin) { %><td>
                 <button class="btn-sm" onclick="setOptionImage(<%= o.id %>)">画像リンク</button>
@@ -426,10 +426,16 @@
       if (json.ok) location.reload();
       else alert(json.message || '変更できませんでした');
     }
+    // 同梱画像 (public/app-images/iroha-work)。番号で選ぶか、Google Drive のリンクを貼る
+    const BUILTIN_IMAGES = <%- JSON.stringify((typeof builtinImages !== 'undefined' && builtinImages) || []) %>;
     async function setOptionImage(id) {
-      const url = prompt('画像のリンク (https://…)。空にすると外します');
-      if (url == null) return;
-      const { json } = await post('/admin/options/' + id + '/image', { image_url: url.trim() });
+      const list = BUILTIN_IMAGES.map((b, i) => `${i + 1}. ${b.label}`).join('\n');
+      const ans = prompt(`画像を選んでください。\n\n用意してある画像 (番号を入れる):\n${list}\n\nまたは Google Drive のリンク (https://…) を貼る。\n空にすると画像を外します`);
+      if (ans == null) return;
+      const s = ans.trim();
+      const n = Number(s);
+      const url = (Number.isInteger(n) && n >= 1 && n <= BUILTIN_IMAGES.length) ? BUILTIN_IMAGES[n - 1].path : s;
+      const { json } = await post('/admin/options/' + id + '/image', { image_url: url });
       if (json.ok) location.reload();
       else alert(json.message || '設定できませんでした');
     }

@@ -859,6 +859,24 @@ console.log('\n[16] 作業のやり方の選択肢 (資材・保管箱): Excel �
   ok(validateOptionImageUrl('https://drive.google.com/uc?id=abc').ok, '許可ホストの https は可');
   ok(setWorkOptionImage(a.option.id, 'https://evil.example.com/x.jpg').error === 'bad_url' && setWorkOptionImage(a.option.id, 'https://lh3.googleusercontent.com/d99.jpg').ok === true, 'setWorkOptionImage も同じ検証');
   ok(setWorkOptionImage(999999, 'https://drive.google.com/y.jpg').error === 'not_found', '無い id は not_found');
+
+  // 同梱画像 (public/app-images/iroha-work): パスが通り、seed で「画像が無い候補」に自動で付く (中原さん 2026-09-05)
+  {
+    const { BUILTIN_OPTION_IMAGES, applyBuiltinOptionImages } = await import('../apps/iroha-work/db.js');
+    const fsMod = await import('node:fs');
+    ok(BUILTIN_OPTION_IMAGES.length === 7 && BUILTIN_OPTION_IMAGES.every(b => fsMod.existsSync('public' + b.path)), '同梱画像 7 枚が public/app-images/iroha-work にある');
+    ok(validateOptionImageUrl('/app-images/iroha-work/vinyl-313.png').ok, '同梱画像のパスは使える');
+    ok(!validateOptionImageUrl('/app-images/iroha-work/../../server.js').ok && !validateOptionImageUrl('/app-images/other/x.png').ok, '同梱以外のパス・上位への脱出は不可');
+    // 20Lコンテナ (表記揺れ 2 行) は seed 済み → 画像が付く。付いた後は上書きしない
+    const cont = workOptionsByKind(true).container.find(o => normalizeOptionCode(o.code) === normalizeOptionCode('20Lコンテナ'));
+    ok(cont && cont.image_url === '/app-images/iroha-work/container-20l.png', '20Lコンテナに同梱画像が自動で付く');
+    setWorkOptionImage(cont.id, 'https://drive.google.com/manual.jpg');
+    applyBuiltinOptionImages();
+    ok(listWorkOptions('container', true).find(o => o.id === cont.id).image_url === 'https://drive.google.com/manual.jpg', '手で差し替えた画像は自動割り当てで戻さない');
+    setWorkOptionImage(cont.id, '');
+    applyBuiltinOptionImages();
+    ok(listWorkOptions('container', true).find(o => o.id === cont.id).image_url === '/app-images/iroha-work/container-20l.png', '画像を外すと次の割り当てで同梱画像が戻る');
+  }
   const by = workOptionsByKind();
   ok(Array.isArray(by.material) && Array.isArray(by.container) && by.material.find(o => o.id === a.option.id).image_url === 'https://lh3.googleusercontent.com/d99.jpg', 'kind ごとの一覧に画像が載る');
 
