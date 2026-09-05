@@ -37,6 +37,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
+import { monthMode, pickThresholds, modeLabel } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) {
@@ -65,11 +66,6 @@ if (!fs.existsSync(dbPath)) {
 
 const checkedAt = new Date().toISOString();
 
-// 当月判定 (PR #86 楽天と同方針)
-function isCurrentMonth(monthStr) {
-  const nowJst = new Date(Date.now() + 9 * 60 * 60 * 1000);
-  return monthStr === nowJst.toISOString().slice(0, 7);
-}
 
 const THRESHOLDS_PAST_MONTH = {
   row_count_drift:           { warn: 0,    error: 0 },
@@ -91,8 +87,11 @@ const THRESHOLDS_CURRENT_MONTH = {
   whitelist_coverage_pct: { warn: 80.0, error: 70.0 },
 };
 
-const isCurMonth = isCurrentMonth(monthStr);
-const THRESHOLDS = isCurMonth ? THRESHOLDS_CURRENT_MONTH : THRESHOLDS_PAST_MONTH;
+// 月の判定は共通ヘルパー (当月 / 前月+月初14日以内 / 過去)。前月の月初は出荷完了への遷移ラグで
+// coverage が構造的に低いので whitelist_coverage_pct だけ当月閾値を使う (Qoo10 2026-08 の再発防止と同型)
+const mode = monthMode(monthStr);
+const isCurMonth = mode === 'current';
+const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST_MONTH, THRESHOLDS_CURRENT_MONTH);
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -112,7 +111,7 @@ function recordResult(checkName, severity, actualValue, thresholdValue, details 
   }
 }
 
-console.log(`=== Yahoo DQ gate: ${runId} (month=${monthStr}, ${isCurMonth ? 'CURRENT' : 'PAST'} mode) ===`);
+console.log(`=== Yahoo DQ gate: ${runId} (month=${monthStr}, ${modeLabel(mode)} mode) ===`);
 if (isCurMonth) {
   console.log(`  ℹ️  当月モード: listing_diff_pct warn ${THRESHOLDS.listing_diff_pct.warn}%/error ${THRESHOLDS.listing_diff_pct.error}% に緩和`);
 }

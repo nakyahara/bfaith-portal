@@ -30,6 +30,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
+import { monthMode, pickThresholds, modeLabel } from './finance-dq-month-mode.js';
 
 const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
@@ -42,7 +43,6 @@ const dbPath = path.join(DATA_DIR, 'warehouse.db');
 if (!fs.existsSync(dbPath)) { console.error(`FATAL: warehouse.db not found at ${dbPath}`); process.exit(2); }
 
 const checkedAt = new Date().toISOString();
-function isCurrentMonth(ym) { const nowJst = new Date(Date.now() + 9 * 3600 * 1000); return ym === nowJst.toISOString().slice(0, 7); }
 
 // 重複期間: 既存 linegift_accounting CSV (受注日基準) と新 fact (受取日基準) が並走している月 → listing_diff_pct を informational に格下げ
 // (設計書 §8 #2、Codex #9: 受注日 vs 受取日で 1〜数日ずれて売上が流れるため、構造的に diff が出る)
@@ -78,9 +78,12 @@ const THRESHOLDS_CURRENT = {
   listing_diff_pct:       { warn: 5.0, error: 15.0 },
   whitelist_coverage_pct: { warn: 70.0, error: 60.0 },  // 当月 70% (received への遷移ラグ考慮)
 };
-const isCur = isCurrentMonth(monthStr);
+// 月の判定は共通ヘルパー (当月 / 前月+月初14日以内 / 過去)。前月の月初は received への遷移ラグで
+// coverage が構造的に低いので whitelist_coverage_pct だけ当月閾値を使う (Qoo10 2026-08 の再発防止と同型)
+const mode = monthMode(monthStr);
+const isCur = mode === 'current';
 const isDuplicatePeriod = DUPLICATE_PERIOD_MONTHS.has(monthStr);
-const THRESHOLDS = isCur ? THRESHOLDS_CURRENT : THRESHOLDS_PAST;
+const THRESHOLDS = pickThresholds(mode, THRESHOLDS_PAST, THRESHOLDS_CURRENT);
 
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -93,7 +96,7 @@ function recordResult(name, severity, actual, threshold, details = null) {
   if (severity !== 'info') issues.push({ name, severity, actual, threshold, details });
 }
 
-console.log(`=== LINEギフト DQ gate: ${runId} (month=${monthStr}, ${isCur ? 'CURRENT' : 'PAST'} mode${isDuplicatePeriod ? ', DUPLICATE_PERIOD' : ''}) ===`);
+console.log(`=== LINEギフト DQ gate: ${runId} (month=${monthStr}, ${modeLabel(mode)} mode${isDuplicatePeriod ? ', DUPLICATE_PERIOD' : ''}) ===`);
 db.prepare(`DELETE FROM dq_run_results WHERE run_id = ?`).run(runId);
 
 // Check 1: row_count_drift (rows=0 がエラー、当月のみ「直近日次 < 7日平均×0.5」も warn、Codex R1 #1 反映)
