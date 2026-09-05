@@ -86,7 +86,7 @@ function makeContext(stateJson) {
 
 const m = /<script>([\s\S]*?)<\/script>/.exec(HTML);
 if (!m) { console.log('  ✗ インラインJSが見つかりません'); process.exit(1); }
-const SCRIPT = m[1] + String.fromCharCode(10) + "globalThis.__t = { openMode, render, state, qhist, setFilter: v => { filter = v; } };";
+const SCRIPT = m[1] + String.fromCharCode(10) + "globalThis.__t = { openMode, render, state, qhist, setFilter: v => { filter = v; }, openPrintBox };";
 
 const LINE = (over = {}) => ({
   line_key: 'AR1|1|1', ar_no: 'AR1', product_id: 'asahilabo15g', code_key: 'asahilabo15g',
@@ -101,8 +101,12 @@ const LINE = (over = {}) => ({
   ...over,
 });
 
+// 🏷 値札印刷: 印刷できる倉庫PC (印刷エージェント)。無ければボタン自体を出さない
+let PRINT_AGENTS = [];
+
 const STATE = lines => ({
   ok: true,
+  print_agents: PRINT_AGENTS,
   batch: { id: 7, csv_generated_at: '2026-09-02T00:28:00+09:00', imported_at: '2026-09-02T00:31:00.000Z', work_date: '2026-09-02', row_count: lines.length, slip_count: 1 },
   slips: [{ batch_id: 7, ar_no: 'AR1', planned_date: '2026-09-01', received_date: '2026-09-01', status: '受付済', line_count: lines.length, seq: 1, checked_count: lines.filter(l => l.check_status === 'checked').length, partial_count: lines.filter(l => l.check_status !== 'checked' && l.found_qty > 0).length }],
   lines,
@@ -257,6 +261,56 @@ console.log('\n[8] 入庫情報はプルダウンで選ぶ (2026-09-02 中原さ
   // いろは=有り の行は下3項目を触らせない
   const r3 = await renderWith([LINE({ info: { ...LINE().info, iroha: '有り' } })], { open: 'AR1|1|1', mode: 'info' });
   ok(/data-f="入庫時BCシール貼りフラグ" data-sel="1" disabled/.test(r3.html), 'いろは=有り ならBCシールは選べない');
+}
+
+console.log('\n[9] 🏷 値札 (BCシール) 発行 → 倉庫PCの QL-700 (2026-09-05 中原さん)');
+{
+  const SEAL = LINE({ info: { ...LINE().info, bc_seal: 'BCシール貼付必要' } });
+  let r = await renderWith([SEAL]);
+  ok(!/data-act="print"/.test(r.html), '印刷できる倉庫PCが未登録ならボタンは出ない (押しても出ないボタンを見せない)');
+  PRINT_AGENTS = [{ id: 1, label: '倉庫PC', printer_name: 'Brother QL-700', online: true, bpac: true, paper_ok: true }];
+  r = await renderWith([SEAL]);
+  ok(/data-act="print"[^>]*>🏷 シール発行</.test(r.html), 'BCシール貼付必要 の行に [🏷 シール発行] が出る');
+  r = await renderWith([LINE()]);
+  ok(!/data-act="print"/.test(r.html), 'BCシール 不要 の行には出ない');
+  r = await renderWith([LINE({ info: { ...LINE().info, bc_seal: 'BCシール貼付必要' }, barcode: '' })]);
+  ok(!/data-act="print"/.test(r.html), 'バーコードが無い行には出ない (刷れない)');
+  r = await renderWith([LINE({ info: { ...LINE().info, bc_seal: 'BCシール貼付必要' }, check_status: 'checked', found_qty: 106, remaining_qty: 0, quantity_relation: 'exact', finalized_result: 'exact', version: 2, checked_by: '山田', checked_at: '2026-09-02T05:30:00.000Z' })], { filter: 'all' });
+  ok(/data-act="print"/.test(r.html), '確認済みの行にも出る (確認してから刷ることがある)');
+  const job = (state, over = {}) => ({ id: 5, state, label: { queued: '⏳ 印刷待ち', leased: '🖨 倉庫PCが印刷中', completed: '✅ 印刷しました', failed: '⚠ 印刷できませんでした', unknown: '❓ 結果不明 (実物を確認)', manual: '🙋 印刷係が応答しません (自動印刷は取り消し)' }[state], copies: 3, error: null, created_at: '2026-09-05T01:00:00.000Z', updated_at: '2026-09-05T01:00:05.000Z', finished_at: null, ...over });
+  r = await renderWith([{ ...SEAL, print_job: job('queued') }]);
+  ok(/class="btn-seal" disabled>🖨 印刷中…</.test(r.html) && /pjob s-queued/.test(r.html) && /⏳ 印刷待ち/.test(r.html), '印刷待ち → ボタンは押せず「⏳ 印刷待ち」が行に出る');
+  r = await renderWith([{ ...SEAL, print_job: job('leased') }]);
+  ok(/disabled>🖨 印刷中…</.test(r.html), '倉庫PCが印刷中 → 押せない');
+  r = await renderWith([{ ...SEAL, print_job: job('completed', { finished_at: '2026-09-05T01:00:20.000Z' }) }]);
+  ok(/pjob s-completed/.test(r.html) && /✅ 印刷しました <small>3枚/.test(r.html), '完了 → 「✅ 印刷しました 3枚」');
+  ok(/data-act="print"[^>]*>🏷 追加で発行</.test(r.html), '完了後は [🏷 追加で発行]');
+  r = await renderWith([{ ...SEAL, print_job: job('failed', { error: 'template file is missing on this PC' }) }]);
+  ok(/pjob s-failed/.test(r.html) && /template file is missing/.test(r.html) && /data-act="print"[^>]*>🏷 シール発行</.test(r.html), '失敗 → 理由が出て、もう一度押せる');
+  r = await renderWith([{ ...SEAL, print_job: job('unknown') }]);
+  ok(/pjob s-unknown/.test(r.html) && /もう1回押す前に実物を見る/.test(r.html), '結果不明 → 「もう1回押す前に実物を見る」');
+  ok(/data-act="print"[^>]*>🏷 もう一度発行</.test(r.html), '結果不明 → ボタンは [🏷 もう一度発行] (実物を見てから)');
+  // ダイアログ: 結果不明の直後は「実物を確認した」チェックが出る (サーバーもその証跡 = ジョブID を要求する)
+  {
+    const { ctx, q } = r;
+    ctx.__t.openPrintBox({ ...SEAL, print_job: job('unknown') });
+    const body = q('#printBody').innerHTML;
+    ok(/id="printAck"/.test(body) && /実物を見て/.test(body), '結果不明の直後にダイアログを開くと「実物を確認した」チェックが出る');
+    ok(/id="printCopies" value="11"/.test(body), '枚数の既定 = ceil(予定 106 ÷ 入数 10) = 11');
+    ok(/Brother QL-700/.test(body) && !/pwarn">⚠/.test(body), '出力先が online なら警告なし');
+  }
+  PRINT_AGENTS = [{ id: 1, label: '倉庫PC', printer_name: 'Brother QL-700', online: false, bpac: false, paper_ok: false }];
+  r = await renderWith([SEAL]);
+  {
+    const { ctx, q } = r;
+    ctx.__t.openPrintBox(SEAL);
+    const body = q('#printBody').innerHTML;
+    ok(/応答していません/.test(body) && /b-PAC/.test(body) && /値札 62x67/.test(body), '応答なし・b-PAC なし・用紙未登録 の警告が出る');
+    ok(!/id="printAck"/.test(body), '直前が結果不明でなければチェックは出ない');
+  }
+  r = await renderWith([{ ...SEAL, print_job: job('manual') }]);
+  ok(/pjob s-manual/.test(r.html) && /手で刷ってください/.test(r.html), '印刷係が応答しない → 「手で刷ってください」');
+  PRINT_AGENTS = [];
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

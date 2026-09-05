@@ -14,6 +14,8 @@
 import cron from 'node-cron';
 import { runScheduledFetch, runScheduledMasterFetch } from './drive-fetch.js';
 import { runNotionSweep, clearLeaseOnBoot } from './notion-sync.js';
+import { sweepPrintJobs, pendingAlerts, markAlerted, alertTextFor, listPrintAgents } from './print-queue.js';
+import { pingJobThrottled } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
 
 const OFF = new Set(['false', '0', 'off', 'no']);
@@ -111,4 +113,89 @@ export function startInboundCheckNotionCron() {
 
 export function stopInboundCheckNotionCron() {
   if (notionTask) { notionTask.stop(); notionTask = null; }
+}
+
+// ─── 🏷 値札印刷キューの見張り (プロセス内 30 秒間隔) ───
+// packing の印刷キュー (miniPC のドライブポーラーに相乗り) と同じ役目を Render 内で担う:
+//   ① 進まなくなったジョブを安全な状態へ (queued 3分 → manual / 報告なし5分 → unknown)
+//   ② その結果をチャットに知らせる (INBOUND_CHECK_PRINT_WEBHOOK を設定したときだけ。iPad の行には常に出る)
+//   ③ 倉庫PCの印刷エージェントの生存を jobs-monitor へ中継する (台帳 id=nefuda-print-agent)
+// ⭐ping を**エージェント自身に打たせない**のは、倉庫PCへ JOBS_MONITOR_TOKEN を配らずに済ませるため。
+//   一度も登録されていない間は ping しない (まだ導入していないものを「止まっている」と鳴らさない)。
+// 30分 cron に相乗りしないのは、3分/5分の期限を見るには粗すぎるため。台帳の対象は独立 cron ではなく
+// heartbeat エントリ (nefuda-print-agent) の中継役として記載する。
+//
+// env:
+//   INBOUND_CHECK_PRINT_ENABLED … false/0/off/no で停止 (既定=有効)。非 Render では既定 OFF
+//   INBOUND_CHECK_PRINT_WEBHOOK … 結果通知先の GChat webhook (未設定なら通知なし)
+export const PRINT_JOB_ID = 'nefuda-print-agent';
+const PRINT_TICK_MS = 30 * 1000;
+const AGENT_ALIVE_MS = 10 * 60 * 1000;   // heartbeat 45秒間隔の十数倍
+let printTimer = null;
+let printTicking = false;
+
+export async function postPrintAlert(text, fetchFn = fetch) {
+  const url = process.env.INBOUND_CHECK_PRINT_WEBHOOK;
+  if (!url) return false;
+  const res = await fetchFn(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }), signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
+  return true;
+}
+
+/** 1周期分。テストから直接呼べるよう export (fetchFn 差し替え可) */
+export async function printQueueTick({ fetchFn = fetch, now = new Date().toISOString() } = {}) {
+  const out = { swept: null, alerted: 0, pinged: false };
+  try { out.swept = sweepPrintJobs({ now }); }
+  catch (e) { console.warn(`[inbound-check print] キューの整理に失敗: ${e.message}`); }
+  // 通知は**送れたときだけ**「通知済み」にする (webhook が落ちていた分が永久に鳴らなくなるのを避ける)。
+  // webhook 未設定なら何もしない (iPad の行に出るのが主経路で、チャットは補助)
+  if (process.env.INBOUND_CHECK_PRINT_WEBHOOK) {
+    for (const job of pendingAlerts()) {
+      try {
+        const text = alertTextFor(job);
+        if (!text) continue;
+        if (await postPrintAlert(text, fetchFn)) { markAlerted(job.id, job.state); out.alerted++; }
+      } catch (e) {
+        console.warn(`[inbound-check print] 結果の通知に失敗 (job ${job.id}): ${e.message}`);
+      }
+    }
+  }
+  try {
+    const nowMs = Date.parse(now);
+    const alive = listPrintAgents({ now }).find(a => a.heartbeat_at && nowMs - Date.parse(a.heartbeat_at) <= AGENT_ALIVE_MS);
+    if (alive) out.pinged = pingJobThrottled(PRINT_JOB_ID, `${alive.label} / ${alive.printer_name || '-'} / ${alive.heartbeat_note || ''}`);
+  } catch (e) {
+    console.warn(`[inbound-check print] 生存 ping に失敗: ${e.message}`);
+  }
+  return out;
+}
+
+export function startInboundCheckPrintQueueWorker() {
+  if (printTimer) return printTimer;
+  const raw = String(process.env.INBOUND_CHECK_PRINT_ENABLED ?? '').trim().toLowerCase();
+  if (OFF.has(raw)) {
+    console.log('[inbound-check] print queue worker disabled (INBOUND_CHECK_PRINT_ENABLED)');
+    return null;
+  }
+  if (!isRender() && !FORCE_ON.has(raw)) {
+    console.log('[inbound-check] print queue worker skipped (非Render環境。動かすなら INBOUND_CHECK_PRINT_ENABLED=true)');
+    return null;
+  }
+  printTimer = setInterval(async () => {
+    if (printTicking) return;
+    printTicking = true;
+    try { await printQueueTick(); }
+    catch (e) { console.warn(`[inbound-check print] worker: ${e.message}`); }
+    finally { printTicking = false; }
+  }, PRINT_TICK_MS);
+  printTimer.unref?.();
+  console.log(`[inbound-check] print queue worker 起動 (${PRINT_TICK_MS / 1000}秒間隔)`);
+  return printTimer;
+}
+
+export function stopInboundCheckPrintQueueWorker() {
+  if (printTimer) { clearInterval(printTimer); printTimer = null; }
 }
