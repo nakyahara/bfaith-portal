@@ -169,7 +169,7 @@ initMirrorDB();
 const { getDB, replaceCache, listCache, addIrohaWorker, setIrohaWorkerActive, getIrohaWorker, listIrohaWorkers,
   setWorkerPin, verifyWorkerPin, _clearPinFails,
   createEnrollCode, redeemEnrollCode, verifyDevice, logEvent, listEvents,
-  startSession, stopSession, activeSessionsByPage, activeSessionsByTask, estimateByProduct, getMeta, setMetaValue, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
+  startSession, startSessions, stopSession, stopSessions, searchSessions, activeSessionsByPage, activeSessionsByTask, estimateByProduct, getMeta, setMetaValue, voidSession, listSessionsForAdmin } = await import('../apps/iroha-work/db.js');
 const { ensureFresh, refreshFromNotion, changeStatus, fetchCardLive, parsePage, STATUSES, cacheStatsForAdmin } = await import('../apps/iroha-work/notion-read.js');
 const { buildList, priorityOf, clearEnrichCache, previousPhotosOf } = await import('../apps/iroha-work/service.js');
 
@@ -3550,6 +3550,87 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   app.push('x'); pv.push('y');
   ok(!capabilitiesFor('app').includes('x') && capabilitiesFor('preview').length === 0, '返した配列を壊しても共有の定義は変わらない');
   ok(capabilitiesFor('unknown').length === 0 && capabilitiesFor(undefined).length === 0, '知らないモードは何も許さない (default-deny)');
+}
+
+console.log('\n[24] 複数人での作業開始・まとめ終了・記録の検索 (中原さん 9/5)');
+{
+  const mk = (name) => getIrohaWorker(addIrohaWorker({ displayName: name, workerType: 'member', actor: 'test' }).id);
+  const a = mk('crew-A'), b = mk('crew-B'), c = mk('crew-C');
+
+  // ── 1人も選ばないと始められない (中原さん 9/5「作業者を選んでないとスタートできない仕様に」) ──
+  ok(startSessions({ pageId: 'crew-1', workers: [] }).error === 'worker_required', '0人では開始できない');
+  ok(startSessions({ pageId: 'crew-1', workers: null }).error === 'worker_required', 'workers 未指定でも開始できない');
+  ok(startSessions({ workers: [a] }).error === 'bad_request', 'カード未指定は拒否');
+
+  // ── 3人まとめて開始 = 3行 ──
+  const s = startSessions({ pageId: 'crew-1', productCode: 'CREW-X', title: 'みつろうクリーム', workers: [a, b, c], deviceLabel: 'ipad-1' });
+  ok(s.ok === true && s.sessions.length === 3, '3人ぶんの行ができる');
+  ok(new Set(s.sessions.map((x) => x.sessionId)).size === 3, '3人それぞれ別の sessionId');
+  ok((activeSessionsByPage().get('crew-1') || []).length === 3, '活動中3名が一覧に出る');
+
+  // ── 同じ人を2回選んでも1行 (重複タップ・再送) ──
+  const dup = startSessions({ pageId: 'crew-2', workers: [mk('crew-D'), null].filter(Boolean) });
+  const d = getIrohaWorker(dup.sessions[0].workerId);
+  const dup2 = startSessions({ pageId: 'crew-2', workers: [d, d] });
+  ok(dup2.ok === true && dup2.sessions.length === 1 && dup2.sessions[0].already === true,
+    '同じ人を2回選んでも1行 (既存を返すだけ)');
+
+  // ── 途中から人を足せる (既に入っている人は already) ──
+  const e = mk('crew-E');
+  const add = startSessions({ pageId: 'crew-1', productCode: 'CREW-X', title: 'みつろうクリーム', workers: [a, e] });
+  ok(add.ok === true && add.sessions.find((x) => x.workerId === a.id).already === true
+    && add.sessions.find((x) => x.workerId === e.id).already === false, '途中で人を足せる (既存の人は already)');
+  ok((activeSessionsByPage().get('crew-1') || []).length === 4, '足した人を含めて4名');
+
+  // ── ⭐1人でも別カードで作業中なら**誰も**開始しない (一部だけ記録が残ると人数が狂う) ──
+  const f = mk('crew-F'), g = mk('crew-G');
+  const busy = startSessions({ pageId: 'crew-3', workers: [f, a, g] });
+  ok(busy.error === 'busy' && busy.busy.length === 1 && busy.busy[0].workerId === a.id, '別カードで作業中の人を名指しで返す');
+  ok(/crew-A/.test(busy.message) && /みつろうクリーム/.test(busy.message), 'メッセージに誰がどのカードかを出す');
+  ok(!activeSessionsByPage().get('crew-3'), '断られたときは1行も入っていない (途中まで入れない)');
+
+  // ── まとめ終了 ──
+  const ids = [...(activeSessionsByPage().get('crew-1') || [])].map((x) => x.id);
+  ok(stopSessions({ pageId: 'crew-1', sessionIds: ids, reason: 'bogus' }).error === 'bad_request', '不正な理由は拒否');
+  ok(stopSessions({ pageId: 'crew-1', sessionIds: [], reason: 'done' }).error === 'bad_request', 'session_ids が空なら拒否');
+  const other = startSessions({ pageId: 'crew-9', workers: [f] }).sessions[0].sessionId;
+  ok(stopSessions({ pageId: 'crew-1', sessionIds: [ids[0], other], reason: 'done' }).error === 'not_started',
+    '別カードの id が混ざったら**1件も**閉じない');
+  ok((activeSessionsByPage().get('crew-1') || []).length === 4, '断られた後も4名は作業中のまま');
+  const st = stopSessions({ pageId: 'crew-1', sessionIds: ids, reason: 'done' });
+  ok(st.ok === true && st.stopped.length === 4 && st.remainingActive === 0, '4人まとめて終了 (残り0名)');
+  ok(st.totalSeconds >= 0 && st.stopped.every((x) => x.raw_seconds >= 0), '人ごとに作業時間が入る');
+  const stAgain = stopSessions({ pageId: 'crew-1', sessionIds: ids, reason: 'done' });
+  ok(stAgain.ok === true && stAgain.stopped.every((x) => x.already === true), '同じ id の再送は冪等 (already)');
+
+  // ── 記録の検索 ──
+  const all = searchSessions({ q: 'みつろう' });
+  ok(all.summary.count === 4 && all.rows.length === 4, '商品名の部分一致で4件 (4人ぶん)');
+  ok(all.summary.workers === 4 && all.summary.cards === 1, '人数4・カード1');
+  const byWorker = searchSessions({ workerId: a.id, q: 'みつろう' });
+  ok(byWorker.summary.count === 1 && byWorker.rows[0].worker_name === 'crew-A', '人でしぼれる');
+  ok(byWorker.rows[0].mates.length === 3, 'いっしょにやった人 (時間が重なる他の3人) が出る');
+  ok(searchSessions({ q: 'CREW-X' }).summary.count === 4, '商品コードでも引ける');
+  ok(searchSessions({ q: 'そんな商品はない' }).summary.count === 0, '当たらなければ0件');
+  ok(searchSessions({ q: '%' }).summary.count === 0, 'LIKE のワイルドカードは文字として扱う (全件返さない)');
+
+  // 期間は JST の日付で受ける (UTC 前提で比較すると JST 9時前が前日に落ちる)
+  const jstToday_ = new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10);
+  ok(searchSessions({ q: 'みつろう', from: jstToday_, to: jstToday_ }).summary.count === 4, '今日 (JST) で引ける');
+  const tomorrow = new Date(Date.now() + 9 * 3600000 + 86400000).toISOString().slice(0, 10);
+  ok(searchSessions({ q: 'みつろう', from: tomorrow }).summary.count === 0, '明日からにすると0件');
+  ok(searchSessions({ q: 'みつろう', to: tomorrow }).summary.count === 4, '「いつまで」はその日を含む');
+  ok(searchSessions({ q: 'みつろう', from: 'こわれた日付' }).summary.count === 4, '壊れた日付は条件にしない (0件にして黙らせない)');
+
+  // 取り消した記録は既定で出さない (実測から外すのと同じ扱い)
+  voidSession(ids[0], 'test@example.com', '押し間違い');
+  ok(searchSessions({ q: 'みつろう' }).summary.count === 3, '取り消した分は出ない');
+  ok(searchSessions({ q: 'みつろう', includeVoided: true }).summary.count === 4, 'voided=1 なら取り消しも出せる');
+
+  // 上限を超えても「合計」は絞り込んだ全件で出す (画面に出た分だけの合計にしない)
+  const page1 = searchSessions({ q: 'みつろう', limit: 2 });
+  ok(page1.rows.length === 2 && page1.summary.count === 3 && page1.truncated === true, '件数制限しても合計は全件・続きがあると分かる');
+  ok(searchSessions({ q: 'みつろう', limit: 2, offset: 2 }).rows.length === 1, 'offset で続きが読める');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

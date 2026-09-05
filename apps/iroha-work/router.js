@@ -27,7 +27,7 @@ import {
   workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, moveWorkOption, seedWorkOptionsFromMaster, BUILTIN_OPTION_IMAGES,
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
-  getCachePage, startSession, stopSession, listSessionsForAdmin, voidSession,
+  getCachePage, startSessions, stopSession, stopSessions, listSessionsForAdmin, searchSessions, SESSION_SEARCH_MAX, voidSession,
   getMeta, setMetaValue, sourceOfTruth,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
@@ -388,6 +388,46 @@ function resolveWorker(req) {
   if (!w) return { error: '作業者を選んでください' };
   if (!w.active) return { error: 'この作業者は無効になっています (職員の方に確認してください)' };
   return { worker: w };
+}
+
+/** まとめ終了の対象 (session_ids)。無ければ null = 単数版で処理する (古い画面からの要求もそのまま動く) */
+function sessionIdsOf(req) {
+  const raw = req.body?.session_ids;
+  return Array.isArray(raw) && raw.length ? raw : null;
+}
+
+/** 終了ログの宛先。まとめ終了なら**実際に閉じた人ぶん**、単数版・失敗時は操作者ぶん */
+function stopLogTargets(r, operator) {
+  if (r.ok && Array.isArray(r.stopped)) {
+    return r.stopped.filter((s) => !s.already).map((s) => ({ workerId: s.workerId, workerName: s.workerName }));
+  }
+  return [{ workerId: operator.id, workerName: operator.display_name }];
+}
+
+/** 一度に選べる人数の上限 (いろはの実人数より十分多い。壊れた入力で大量INSERTさせないための蓋) */
+const MAX_CREW = 20;
+
+/**
+ * 作業する人たち (複数) を確かめる。iPad は共用なので「操作者 = 作業者」とは限らない
+ * (中原さん 9/5「一人で作業するわけではないから作業する人を選択できるようにしたい」)。
+ * ⭐**1人も選んでいなければ開始させない** (中原さん 9/5「作業者を選んでないとスタートできない仕様に」)。
+ * worker_ids が無い古い画面からの要求は、操作者ひとりで始めた扱いにする (デプロイ直後の互換)。
+ */
+function resolveWorkers(req, operator) {
+  const raw = req.body?.worker_ids;
+  if (raw === undefined || raw === null) return { workers: [operator] };
+  if (!Array.isArray(raw)) return { error: '作業する人を選んでください' };
+  const ids = [...new Set(raw.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (!ids.length) return { error: '作業する人を選んでください (1人以上えらぶと始められます)' };
+  if (ids.length > MAX_CREW) return { error: `一度に選べるのは ${MAX_CREW} 人までです` };
+  const workers = [];
+  for (const id of ids) {
+    const w = getIrohaWorker(id);
+    if (!w) return { error: '選んだ人の中に、名簿にない人がいます (画面を更新してください)' };
+    if (!w.active) return { error: `${w.display_name} さんは名簿で無効になっています (職員の方に確認してください)` };
+    workers.push(w);
+  }
+  return { workers };
 }
 
 const STATUS_HTTP = {
@@ -1326,7 +1366,9 @@ const isReadOnlyReject = (r) => !!r && r.ok === false && READ_ONLY_REJECTS.has(r
 router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  if (isAppMode()) return startSessionApp(req, res, w.worker);
+  const crew = resolveWorkers(req, w.worker);
+  if (crew.error) return res.status(400).json({ ok: false, error: 'worker_required', message: crew.error });
+  if (isAppMode()) return startSessionApp(req, res, w.worker, crew.workers);
   const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
   if (isPreviewIdInNotionMode(pageId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
@@ -1351,9 +1393,9 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
       .get(String(card.product_code).trim().toLowerCase());
     snapshot = masterOf(wm || null, props);
   }
-  const r = startSession({
+  const r = startSessions({
     pageId, productCode: card.product_code, title: card.title,
-    worker: w.worker, deviceLabel: deviceLabelOf(req), masterSnapshot: snapshot,
+    workers: crew.workers, deviceLabel: deviceLabelOf(req), masterSnapshot: snapshot,
     // ⭐Notion の実ページを取りに行っている間に正本が切り替わる・カードが消えることがある。
     //   記録を入れる直前に (同じトランザクションの中で) もう一度確かめる (Codex PR1 R14)
     guard: () => {
@@ -1363,8 +1405,13 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
     },
   });
   if (!r.already && !isReadOnlyReject(r)) {
-    safeLog({ action: 'session_start', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
-      deviceLabel: deviceLabelOf(req), to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    // 記録は**人ごと**に残す (誰の分が新しく始まったかが後で分かるように)
+    for (const cw of crew.workers) {
+      const s = r.ok ? r.sessions.find((x) => x.workerId === Number(cw.id)) : null;
+      if (s?.already) continue;
+      safeLog({ action: 'session_start', pageId, workerId: cw.id, workerName: cw.display_name,
+        deviceLabel: deviceLabelOf(req), to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    }
   }
   if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
 
@@ -1379,7 +1426,9 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
     else if (cs?.error === 'conflict' && cs.current) statusNow = cs.current;
     // タイムアウト/失敗は開始を成立させたまま、次の巡回・手動更新に任せる
   }
-  res.json({ ok: true, already: !!r.already, sessionId: r.sessionId, startedAt: r.startedAt, status: statusNow, serverNow: new Date().toISOString() });
+  const mine = r.sessions.find((s) => s.workerId === Number(w.worker.id)) || r.sessions[0];
+  res.json({ ok: true, already: !!r.already, sessions: r.sessions, sessionId: mine.sessionId,
+    startedAt: r.startedAt, status: statusNow, serverNow: new Date().toISOString() });
 }));
 
 /**
@@ -1387,7 +1436,7 @@ router.post('/api/sessions/start', checkOrigin, api(async (req, res) => {
  * 終了確認・セッション INSERT・未着手→作業中 は tasks-db.startTaskSession が 1 トランザクションで行う
  * (別端末の終了と競合しても「終了したカードに活動中セッション」を残さない — Codex A1b R1 #2)
  */
-function startSessionApp(req, res, worker) {
+function startSessionApp(req, res, worker, crew) {
   const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
   if (taskId == null) return res.status(400).json(BAD_TASK_ID);
   // スナップショット (§1.7 ④) = 画面に見えていた実効値 (マスタ + タスク作成時の値のフォールバック合成)
@@ -1398,12 +1447,12 @@ function startSessionApp(req, res, worker) {
     const wm = getDB().prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(String(t.product_code).trim().toLowerCase());
     return masterOfTask(wm || null, snap);
   };
-  const r = startTaskSession({ taskId, worker, deviceLabel: deviceLabelOf(req), snapshotOf });
+  const r = startTaskSession({ taskId, worker, workers: crew, deviceLabel: deviceLabelOf(req), snapshotOf });
   if (!r.ok) {
     const http = r.error === 'bad_request' ? 400 : r.error === 'not_found' ? 404 : 409;
     return res.status(http).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
   }
-  res.json({ ok: true, already: !!r.already, sessionId: r.sessionId, startedAt: r.startedAt,
+  res.json({ ok: true, already: !!r.already, sessions: r.sessions, sessionId: r.sessionId, startedAt: r.startedAt,
     status: r.task.status, task: publicTask(r.task), serverNow: new Date().toISOString() });
 }
 
@@ -1418,19 +1467,23 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
     // 終了カード (履歴) は読むだけ。記録も足さない (Codex PR1 R3)。
     // 「終了したのに作業中」が残っていたら、管理画面の取り消し (voidSession) で片づける
     if (isClosedCardId(taskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
-    const r = stopSession({ taskId, workerId: w.worker.id, sessionId: req.body?.session_id, reason,
-      // ⭐記録を書く直前に、正本とカードをもう一度確かめる (見てから書くまでに切り替わる — Codex PR1 R16)
-      guard: () => {
-        if (!isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
-        const t = getTask(taskId);
-        if (!t) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
-        if (t.status === 'closed') return CLOSED_WRITE_REJECTED;
-        return null;
-      },
-    });
+    // ⭐記録を書く直前に、正本とカードをもう一度確かめる (見てから書くまでに切り替わる — Codex PR1 R16)
+    const guard = () => {
+      if (!isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
+      const t = getTask(taskId);
+      if (!t) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+      if (t.status === 'closed') return CLOSED_WRITE_REJECTED;
+      return null;
+    };
+    const many = sessionIdsOf(req);
+    const r = many
+      ? stopSessions({ taskId, sessionIds: many, reason, guard })
+      : stopSession({ taskId, workerId: w.worker.id, sessionId: req.body?.session_id, reason, guard });
     if (!isReadOnlyReject(r)) {
-      safeLogTaskEvent({ taskId, action: 'session_stop', workerId: w.worker.id, workerName: w.worker.display_name,
-        deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+      for (const ev of stopLogTargets(r, w.worker)) {
+        safeLogTaskEvent({ taskId, action: 'session_stop', workerId: ev.workerId, workerName: ev.workerName,
+          deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+      }
     }
     if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
     return res.json({ ...r, task: publicTask(getTask(taskId)) });
@@ -1438,17 +1491,21 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
   const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
   if (isPreviewIdInNotionMode(pageId)) return res.status(409).json(PREVIEW_WRITE_REJECTED);
-  const r = stopSession({ pageId, workerId: w.worker.id, sessionId: req.body?.session_id, reason,
-    // ⭐記録を書く直前に、正本とカードをもう一度確かめる (開始と同じ — Codex PR1 R15)
-    guard: () => {
-      if (isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
-      if (!getCachePage(pageId)) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
-      return null;
-    },
-  });
+  // ⭐記録を書く直前に、正本とカードをもう一度確かめる (開始と同じ — Codex PR1 R15)
+  const guardPage = () => {
+    if (isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
+    if (!getCachePage(pageId)) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+    return null;
+  };
+  const manyPage = sessionIdsOf(req);
+  const r = manyPage
+    ? stopSessions({ pageId, sessionIds: manyPage, reason, guard: guardPage })
+    : stopSession({ pageId, workerId: w.worker.id, sessionId: req.body?.session_id, reason, guard: guardPage });
   if (!isReadOnlyReject(r)) {
-    safeLog({ action: 'session_stop', pageId, workerId: w.worker.id, workerName: w.worker.display_name,
-      deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    for (const ev of stopLogTargets(r, w.worker)) {
+      safeLog({ action: 'session_stop', pageId, workerId: ev.workerId, workerName: ev.workerName,
+        deviceLabel: deviceLabelOf(req), to: reason, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    }
   }
   if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
   res.json(r);
@@ -1458,6 +1515,47 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
 router.post('/admin/sessions/:id(\\d+)/void', checkOrigin, requireAdmin, api((req, res) => {
   const r = voidSession(Number(req.params.id), req.session.email, req.body?.reason);
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 409)).json(r);
+}));
+
+/**
+ * 作業の記録をさがす (中原さん 9/5「あとで誰がいつ何の作業をしたのかを検索できるように」)。
+ * 「直近50件」だけでは、先月たなかさんが何をしたか・この商品を誰がやったかが分からない。
+ * 期間は JST の日付で受け取る (画面の <input type="date"> がそのまま渡せる)
+ */
+function searchQueryOf(req) {
+  return {
+    workerId: req.query.worker_id || null,
+    from: req.query.from || null,
+    to: req.query.to || null,
+    q: req.query.q || null,
+    includeVoided: req.query.voided === '1',
+  };
+}
+
+router.get('/admin/sessions/search', requireSession, api((req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), SESSION_SEARCH_MAX);
+  const r = searchSessions({ ...searchQueryOf(req), limit, offset: Number(req.query.offset) || 0 });
+  res.json({ ok: true, ...r });
+}));
+
+/** 同じ条件を CSV で (工賃の計算・実績報告に使う)。Excel が文字化けしないよう BOM 付き UTF-8 */
+router.get('/admin/sessions/search.csv', requireSession, api((req, res) => {
+  const { rows } = searchSessions({ ...searchQueryOf(req), limit: SESSION_SEARCH_MAX });
+  const jst = (iso) => (iso ? new Date(Date.parse(iso) + 9 * 3600000).toISOString().replace('T', ' ').slice(0, 19) : '');
+  const cell = (v) => {
+    const s = v == null ? '' : String(v);
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const head = ['開始 (JST)', '終了 (JST)', '作業した人', '商品名', '商品コード', '作業時間 (秒)', '作業時間 (分)', '終わり方', 'いっしょにやった人', '端末', '取り消し'];
+  const body = rows.map((r) => [
+    jst(r.started_at), jst(r.ended_at), r.worker_name, r.title_snapshot, r.product_code,
+    r.ended_at ? r.raw_seconds : '', r.ended_at ? Math.round((r.raw_seconds / 60) * 10) / 10 : '',
+    r.ended_at ? ({ done: 'できあがり', pause: '中断', admin: '職員が終了' }[r.end_reason] || r.end_reason) : '作業中',
+    (r.mates || []).join(' / '), r.device_label, r.voided_at ? `取消 (${r.void_reason || ''})` : '',
+  ].map(cell).join(','));
+  res.set('Content-Type', 'text/csv; charset=utf-8');
+  res.set('Content-Disposition', `attachment; filename="iroha-work-sessions-${jstToday()}.csv"`);
+  res.send(`﻿${[head.join(','), ...body].join('\r\n')}\r\n`);
 }));
 
 // ─── 管理画面 ───
