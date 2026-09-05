@@ -89,12 +89,14 @@ function staffModeOf(req) {
 }
 /**
  * その人にとって職員モードか。ポータルの人は常に職員。端末の職員モードは PIN を入れた職員本人のときだけ
- * (職員 A の PIN のまま職員 B の名前で記録が付かないように)。記録が無い古い解除 (workerId 無し) は誰でも通す
+ * (職員 A の PIN のまま職員 B の名前で記録が付かないように)。
+ * 誰が開けたか記録の無い古い解除 (workerId 無し) は**職員モードとみなさない** (fail-closed — Codex PR-A R2)。
+ * 影響は「一度 PIN を入れ直す」だけ
  */
 function staffModeFor(req, worker) {
   const sm = staffModeOf(req);
   if (!sm.staff) return sm;
-  if (sm.via === 'device' && sm.workerId && worker && Number(worker.id) !== Number(sm.workerId)) return { staff: false, other: true };
+  if (sm.via === 'device' && (!sm.workerId || !worker || Number(worker.id) !== Number(sm.workerId))) return { staff: false, other: true };
   return sm;
 }
 

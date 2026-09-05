@@ -2279,6 +2279,12 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
           // 戻す (以降のテストは staffP の職員モード前提)
           const backPpin = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'today', expect_version: v(), worker_id: staffP.id, pin: '4649' } });
           ok(backPpin.status === 200 && (await call('GET', '/api/state', { cookie })).json.staff_mode.workerId === staffP.id, '前提の戻し: P の PIN で P の職員モードに');
+          // 誰が開けたか記録の無い古い解除 (workerId NULL) は職員モードとみなさない (fail-closed — Codex PR-A R2)
+          getDB().prepare('UPDATE f_iroha_app_devices SET staff_unlock_worker_id = NULL WHERE staff_unlock_until IS NOT NULL').run();
+          const nullUnlock = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'tomorrow', expect_version: v(), worker_id: staffP.id } });
+          ok(nullUnlock.status === 403, '持ち主の記録が無い解除では PIN なしで通らない');
+          const reunlock = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'today', expect_version: v(), worker_id: staffP.id, pin: '4649' } });
+          ok(reunlock.status === 200 && (await call('GET', '/api/state', { cookie })).json.staff_mode.workerId === staffP.id, 'PIN を入れ直せば持ち主つきで開く');
         }
         const p3 = await call('POST', '/api/plan', { cookie, body: { id: t1, when: null, expect_version: v(), worker_id: staffP.id } });
         ok(p3.status === 200 && p3.json.task.planned_date == null && p3.json.task.when == null, '「未定」に戻せる');

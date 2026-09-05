@@ -1823,8 +1823,8 @@ let staffLockInflight = null;
 function enforceWorkerCaps() {
   const sm = state.staff_mode || {};
   if (!sm.staff || sm.via === 'session' || !worker) return false;
-  // 利用者を選んでいる / PIN を入れたのとは別の職員を選んでいる → その人の職員モードではない
-  const mine = worker.worker_type === 'staff' && (!sm.workerId || Number(sm.workerId) === Number(worker.id));
+  // 利用者を選んでいる / PIN を入れたのとは別の職員を選んでいる / 誰が開けたか記録が無い → その人の職員モードではない (fail-closed)
+  const mine = worker.worker_type === 'staff' && !!sm.workerId && Number(sm.workerId) === Number(worker.id);
   if (mine) return false;
   lockDeviceStaffMode();
   return true;
