@@ -2158,6 +2158,24 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         const mine = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: openTask, worker_id: w1.id,
           expect_version: lw.row.version, fields: { note: '正しい持ち主から' } } });
         ok(mine.status === 200 && mine.json.ok, '正しいカードからは更新できる');
+        // ⭐職員だけの項目 (発注・本社連絡・入庫完了・完了・記録者) は利用者から変えられない (監修 F-5 / Codex PR-C R1 #1)
+        const sameVals = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: openTask, worker_id: w1.id,
+          expect_version: mine.json.row.version, fields: { note: '同じ値なら通る', done: false, label_ordered: false, line_notified_on: null } } });
+        ok(sameVals.status === 200 && sameVals.json.ok && sameVals.json.row.done === 0 && sameVals.json.row.note === '同じ値なら通る',
+          '隠れた項目を「いまの値のまま」送るのは通る (利用者の画面は読み込んだ値をそのまま送る)');
+        const tryDone = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: openTask, worker_id: w1.id,
+          expect_version: sameVals.json.row.version, fields: { done: true } } });
+        ok(tryDone.status === 403 && tryDone.json.error === 'staff_required' && db.prepare('SELECT done FROM f_iroha_label_waits WHERE id = ?').get(lw.row.id).done === 0,
+          '利用者が「完了」にしようとすると 403 (中身も変わらない)');
+        const fakeBy = await call('POST', '/api/label-waits', { cookie, body: { task_id: openTask, worker_id: w1.id,
+          fields: { occurred_on: '2026-09-05', qty: 2, recorded_by_name: '職員のふり' } } });
+        ok(fakeBy.status === 403, '新規でも記録者を別人にはできない');
+        const lwStaff = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+        const byStaff = await call('POST', '/api/label-waits', { cookie, body: { id: lw.row.id, task_id: openTask, worker_id: lwStaff.id,
+          expect_version: sameVals.json.row.version, fields: { done: true }, pin: '4649' } });
+        ok(byStaff.status === 200 && byStaff.json.ok && byStaff.json.row.done === 1 && byStaff.json.staff_mode && byStaff.json.staff_mode.staff === true,
+          '職員が PIN を添えれば「完了」にできる (そのまま職員モードに入る)');
+        ok((await call('POST', '/api/staff-lock', { cookie })).json.staff_mode.staff === false, '後片づけ: 職員モードを終える');
       }
     }
     // まとめて棚入完了 (PR-C): 棚入待ちのものだけ・職員だけ
@@ -3335,6 +3353,10 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const pin = await ask\(\{ title: '🔑 職員モードに入る'/.test(html) && /input: 'pin'/.test(html), '職員PIN も ask (数字キーボード)');
   ok(/reopenReason = await ask\(\{[^\n]*required: true/.test(html), '終了から戻す理由は必須のまま (空では通さない)');
   ok(/if \(\$\('#askOv'\)\.classList\.contains\('on'\)\) \{ askDone\(false\); return; \}/.test(html), 'Esc は確認ダイアログだけ閉じる (下のダイアログは残す)');
+  ok(/const ov = \$\('#askOv'\)\.classList\.contains\('on'\) \? \$\('#askOv'\) : document\.querySelector\('\.overlay\.on'\);/.test(html)
+    && /askOpts\._prevFocus = document\.activeElement;/.test(html), 'ask が別ダイアログの上でも Tab とフォーカスの戻り先が正しい (Codex R1 #5)');
+  ok(/\.tbl\.member th:nth-child\(7\),\.tbl\.member td:nth-child\(7\),/.test(html) && !/nth-child\(n\+7\)/.test(html), 'ラベル待ちの表: 貼り直し (8 列目) は利用者にも見せる (Codex R1 #3)');
+  ok(/if \(await askStaffUnlock\(\)\) \{ await loadState\(\); return saveLw\(\); \}/.test(html), 'ラベル待ちの保存で職員の門に断られたら PIN → 保存し直し');
   ok(!/onclick="openMaster/.test(html) && /data-reg="/.test(html), '作業のやり方は項目タップで変更 (編集ボタンなし)');
   ok(/\+ \(empty \? '＋ 登録' : '✎ 変更'\) \+/.test(html), '値があれば「変更」、無ければ「登録」と出す');
   ok(!/mvVideo/.test(html.replace(/\/\/.*$/gm, '')), '作り方どうがは画面から外した (コメントだけ残す)');
@@ -3681,7 +3703,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '残り時間は 30 秒ごとに見直す (通信が無くても固まらない)');
   ok(/if \(sm\.until && leftMs <= 0\) \{\r?\n\s+\/\/[^\r\n]*\r?\n\s+dropPlanCaps\(\);/.test(html),
     '期限が来たら画面の中の許可を落として取り直す (計画のボタンが残らない)');
-  ok(/function dropPlanCaps\(\)/.test(html) && /state\.capabilities = \(state\.capabilities \|\| \[\]\)\.filter\(\(c\) => c !== 'task\.plan\.assign' && c !== 'task\.facility\.assign'\);/.test(html),
+  ok(/function dropPlanCaps\(\)/.test(html) && /state\.capabilities = \(state\.capabilities \|\| \[\]\)\.filter\(\(c\) => c !== 'task\.plan\.assign' && c !== 'task\.facility\.assign' && c !== 'task\.external_ready'\);/.test(html),
     '職員モードを抜けたら、画面の中の許可もその場で落とす');
   ok(/if \(!j\.ok\) \{ showErr\(j\.message \|\| '職員モードを終われませんでした'\); return; \}/.test(html)
     && /dropPlanCaps\(\);\r?\n\s+toast\('職員モードを終わりました'\);/.test(html),

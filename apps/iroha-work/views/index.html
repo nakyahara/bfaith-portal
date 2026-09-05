@@ -126,8 +126,8 @@
   /* 列は画面幅で割る (4 列なら 25%)。列数は renderBoard() が grid-template-columns で入れる。狭いときだけ横スクロール (監修) */
   .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:10px;overflow-x:auto;padding-bottom:10px}
   .col{background:var(--well);border:1px solid var(--line);border-radius:var(--r);padding:8px;min-width:0}
-  .col h3{margin:0 0 8px;font-size:.86rem;font-weight:700;color:var(--sub);display:flex;align-items:center;gap:8px;white-space:nowrap}
-  .col h3 .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+  .col h3{margin:0 0 8px;font-size:.86rem;font-weight:700;color:var(--sub);display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;white-space:nowrap}
+  .col h3 .t{flex:1 1 auto;min-width:4em;overflow:hidden;text-overflow:ellipsis}   /* 見出しは消さない (「まとめて棚入完了」は次の行へ) */
   .col h3 .n{font-family:var(--num);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:0 8px;font-size:.8rem}
   .col h3 button{margin-left:auto;border:1px solid var(--line);background:var(--surface);color:var(--sub);
     border-radius:var(--r-sm);padding:3px 8px;font-size:.74rem;font-weight:700;cursor:pointer}
@@ -201,7 +201,7 @@
   .pcard .bd{min-width:0;flex:1}
   .pcard h4{margin:0;font-size:.92rem;font-weight:700;line-height:1.35}
   .pcard .m{font-size:.76rem;color:var(--sub);margin-top:2px}
-  .pcard .why{margin-top:5px;display:flex;flex-wrap:nowrap;gap:4px;overflow-x:auto;-webkit-overflow-scrolling:touch}   /* 「入荷／2026-09-／02」と折れていた (監修) */
+  .pcard .why{margin-top:5px;display:flex;flex-wrap:wrap;gap:4px}   /* チップの中では折らない (「入荷／2026-09-／02」と折れていた — 監修)。チップ単位で次の行へ */
   .pcard .why span{font-size:.72rem;border-radius:999px;padding:1px 8px;background:var(--well);color:var(--sub);border:1px solid var(--line);white-space:nowrap;flex:none}
   .pcard .why span.unk{background:var(--amber-soft);color:var(--amber);border-color:var(--amber)}
   .pcard .why span.urgent{background:var(--danger-soft);color:var(--danger);border-color:#F3C1C1;font-weight:700}
@@ -381,9 +381,9 @@
   .thing .tbody{padding:10px 12px 12px}
   .thing label{display:block;font-size:.72rem;color:var(--faint);letter-spacing:.08em;font-weight:700}
   .thing .nm{font-size:1.24rem;font-weight:700;line-height:1.3;margin-top:2px;word-break:break-all}
-  .thing.compact{display:flex;align-items:center;gap:8px;padding-right:10px}   /* 未登録: 空の写真枠を出さず 1 行に (監修) */
-  .thing.compact .tbody{flex:1;min-width:0}
-  .thing.compact .strip{flex:none}
+  /* 未登録: 空の写真枠を出さず、名前の行 (＋ 登録) と入数の帯だけ (監修)。帯は下に別の行 — 「＋ 登録」が 2 つ重ならないように */
+  .thing.compact .tbody{padding:8px 96px 8px 12px;min-height:44px}
+  .thing.compact .nm{font-size:1.1rem}
   .thing.miss{border-color:var(--amber);background:var(--amber-soft)}
   .thing.miss .nm{color:var(--amber)}
   .thing.miss .wiedit{color:var(--amber);border-color:var(--amber);background:transparent}
@@ -556,7 +556,8 @@
   .stbtns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
   .stbtns .btn small{display:block;font-size:.72rem;font-weight:600;opacity:.75;margin-top:2px}   /* 「棚入待ち」= 何を待つかの一言 (監修) */
   /* ラベル待ちの表: 職員の事務 (発注・LINE連絡・再連絡・入庫完了・記録者) は職員モードのときだけ (監修) */
-  .tbl.member th:nth-child(n+7):nth-child(-n+12),.tbl.member td:nth-child(n+7):nth-child(-n+12){display:none}
+  .tbl.member th:nth-child(7),.tbl.member td:nth-child(7),
+  .tbl.member th:nth-child(n+9):nth-child(-n+12),.tbl.member td:nth-child(n+9):nth-child(-n+12){display:none}   /* 貼り直し (8) は利用者も見る */
   .chip.ro{opacity:.6;cursor:default;pointer-events:none}
   .btn{min-height:56px;border-radius:var(--r);border:1px solid var(--line);
     background:var(--surface);color:var(--ink);font-size:1.02rem;font-weight:700;cursor:pointer;font-family:var(--font)}
@@ -1889,7 +1890,8 @@ setInterval(() => { if (state && state.staff_mode && state.staff_mode.staff) ren
 function dropPlanCaps() {
   if (!state) return;
   state.staff_mode = { staff: false };
-  state.capabilities = (state.capabilities || []).filter((c) => c !== 'task.plan.assign' && c !== 'task.facility.assign');
+  // 職員のときだけ入る許可 = capabilities.js の CAPS_STAFF と同じ集合 (外部出しも — Codex PR-C R1 #2)
+  state.capabilities = (state.capabilities || []).filter((c) => c !== 'task.plan.assign' && c !== 'task.facility.assign' && c !== 'task.external_ready');
   planData = null;
   clearPlanDom();
   if (curView === 'plan') setView('board');
@@ -1962,6 +1964,7 @@ function ask(o) {
     $('#askCancel').textContent = askOpts.cancel || 'やめる';
     $('#askOk').classList.toggle('warn', !!askOpts.danger);
     $('#askMsg').textContent = '';
+    askOpts._prevFocus = document.activeElement;   // 下のダイアログに戻すため (openOverlay の戻り先は 1 つしか持てない — Codex R1 #5)
     openOverlay('#askOv');
     if (askOpts.input) setTimeout(() => { try { inp.focus(); } catch (e) { /* 出せなくてもよい */ } }, 60);
   });
@@ -1969,17 +1972,18 @@ function ask(o) {
 function askDone(ok) {
   const r = askResolve;
   if (!r) return;
-  if (ok && askOpts && askOpts.input) {
+  const o = askOpts || {};
+  let value = ok ? true : null;
+  if (ok && o.input) {
     const v = $('#askIn').value;
-    if (askOpts.required && !v.trim()) { $('#askMsg').textContent = '❌ 入力してください'; return; }
-    askResolve = null; askOpts = null;
-    closeOverlay('#askOv');
-    r(v);
-    return;
+    if (o.required && !v.trim()) { $('#askMsg').textContent = '❌ 入力してください'; return; }
+    value = v;
   }
   askResolve = null; askOpts = null;
   closeOverlay('#askOv');
-  r(ok ? true : null);
+  // 下にダイアログが残っているときは closeOverlay が戻り先を戻さない → 開く前の要素へ自分で戻す
+  if (document.querySelectorAll('.overlay.on').length > 0) { try { if (o._prevFocus && o._prevFocus.focus) o._prevFocus.focus(); } catch (e) { /* 消えていれば何もしない */ } }
+  r(value);
 }
 $('#askIn').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); askDone(true); } });
 $('#askOv').addEventListener('click', (e) => { if (e.target === $('#askOv')) askDone(false); });
@@ -1999,7 +2003,7 @@ async function endStaffMode() {
 async function askStaffUnlock() {
   const w = worker;
   if (!w) { openGate(); return false; }
-  if (w.worker_type !== 'staff') { showErr('明日の計画を決められるのは職員だけです'); return false; }
+  if (w.worker_type !== 'staff') { showErr('これは職員だけができる操作です (右上の名前を職員に替えてください)'); return false; }
   const pin = await ask({ title: '🔑 職員モードに入る', text: w.display_name + ' さんの職員PIN を入れてください (30 分ぶん開きます)', input: 'pin', ok: '入る' });
   if (pin == null) return false;
   const j = await apiFetch('/api/staff-unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -2455,6 +2459,8 @@ async function loadLabelWaits() {
   renderPreviewNote();
   $('#lwOpenBtn').classList.toggle('on', lwOpenOnly);
   $('#lwAllBtn').classList.toggle('on', !lwOpenOnly);
+  // 職員の事務の列 (発注・LINE連絡・再連絡・入庫完了・記録者) は職員モードのときだけ (利用者には 8 列 — 監修)。0 件でも更新する (Codex R1 #4)
+  { const tbl = $('#lwTable'); if (tbl) tbl.classList.toggle('member', !isStaffUI()); }
   const j = await apiFetch('/api/label-waits' + (lwOpenOnly ? '' : '?all=1'));
   if (!j.ok) { $('#lwBody').innerHTML = '<tr><td colspan="13">' + esc(j.message || '読み込めませんでした') + '</td></tr>'; return; }
   const rows = j.rows || [];
@@ -2462,8 +2468,6 @@ async function loadLabelWaits() {
   if (rows.length === 0) { $('#lwBody').innerHTML = '<tr><td colspan="13">' + (lwOpenOnly ? 'ラベル待ちはありません' : '記録はありません') + '</td></tr>'; return; }
   const LOC = { Z: 'Z (一時保管)', Y: 'Y (出荷禁止)', none: 'なし' };
   const yn = v => v ? '✔' : '—';
-  // 職員の事務の列 (発注・LINE連絡・再連絡・入庫完了・記録者) は職員モードのときだけ (利用者には 7 列 — 監修)
-  const tbl = $('#lwTable'); if (tbl) tbl.classList.toggle('member', !isStaffUI());
   $('#lwBody').innerHTML = rows.map(r => '<tr data-id="' + Number(r.id) + '">' +
     '<td><span class="pill ' + (r.done ? 'ok' : 'wait') + '">' + (r.done ? '完了' : '待ち') + '</span></td>' +
     '<td class="num">' + esc(r.occurred_on || '—') + '</td>' +
@@ -2558,7 +2562,16 @@ async function saveLw() {
     const body = { task_id: lwEditing.task_id, fields, worker_id: w.id };
     if (lwEditing.id) { body.id = lwEditing.id; body.expect_version = lwEditing.version; }
     const j = await apiFetch('/api/label-waits', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (!j.ok) { $('#lwMsg').textContent = j.message || '保存できませんでした'; return; }
+    if (!j.ok) {
+      // 職員だけの項目 (発注・完了など) を変えようとして職員モードが切れていた → PIN を聞いて、そのまま保存し直す
+      if (j.error === 'staff_required' || j.error === 'pin_required' || j.error === 'pin_invalid') {
+        $('#lwMsg').textContent = '';
+        if (await askStaffUnlock()) { await loadState(); return saveLw(); }
+      }
+      $('#lwMsg').textContent = j.message || '保存できませんでした';
+      return;
+    }
+    if (j.staff_mode) state.staff_mode = j.staff_mode;
     closeLw();
     toast('ラベル待ちを保存しました');
     if (curView === 'label') loadLabelWaits();
@@ -2850,8 +2863,8 @@ function workInfoHtml(c, m, missSet) {
       (c.expiry ? wrow('この入荷の有効期限', esc(c.expiry), null) : '') +
       careRow +
     '</div>' + care +
-    // 在庫日数・売上・フリー在庫・外部出し目安・取引先 (職員向けの判断材料) は上部のチップから、ここへ下ろす (監修)
-    '<div class="wigroup">参考にするもの</div>' + ref + headFactsHtml(c);
+    // 在庫日数・売上・フリー在庫・外部出し目安・取引先 = 職員向けの判断材料。上部のチップからここへ下ろし、職員モードのときだけ (監修 F-5)
+    '<div class="wigroup">参考にするもの</div>' + ref + (isStaffUI() ? headFactsHtml(c) : '');
 }
 /** 未登録の数 (見出しの札に出す)。0 なら札を出さない */
 function missBadge(m) {
@@ -3414,7 +3427,8 @@ function closeOverlay(sel) {
 // Tab をダイアログの中だけで回す
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Tab') return;
-  const ov = document.querySelector('.overlay.on');
+  // 最前面 = ask (別のダイアログの上に重なる)。それ以外は開いているダイアログ (同時に 1 つ)
+  const ov = $('#askOv').classList.contains('on') ? $('#askOv') : document.querySelector('.overlay.on');
   if (!ov) return;
   const items = [...ov.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
     .filter(el => !el.disabled && el.offsetParent !== null);
