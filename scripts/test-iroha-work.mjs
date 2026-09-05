@@ -2096,6 +2096,31 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
             fields: { size_class: 'XL' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
           ok(badSize.status === 400 && badSize.json.error === 'bad_size', '知らない大きさは 400 (500 にしない)');
           ok(db.prepare("SELECT size_class FROM f_iroha_work_master WHERE code_key = 'size-a'").get().size_class === 'M', '断ったので値も変わらない');
+          // ── 期限シール (中原さん 2026-09-05: ありのときだけ赤で上に出す) ──
+          const sealOf = () => db.prepare("SELECT expiry_seal FROM f_iroha_work_master WHERE code_key = 'size-a'").get().expiry_seal;
+          const seal1 = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { expiry_seal: '1' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(seal1.status === 200 && sealOf() === 1, '「期限シールあり」を登録できる');
+          clearEnrichCache();
+          const withSeal = (await call('GET', '/api/task-previews/' + t6, { cookie })).json;
+          ok(withSeal.card.master.expiry_seal === 1, '一枚取りにも「あり」が乗る (画面はこれを見て赤で出す)');
+          const seal0 = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { expiry_seal: '0' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(seal0.status === 200 && sealOf() === 0, '「なし」も 0 として登録できる (未登録と区別する)');
+          const sealClear = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { expiry_seal: '' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(sealClear.status === 200 && sealOf() == null, '空を送ると「未登録」に戻せる (CHECK で 500 にならない)');
+          const badSeal = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { expiry_seal: 'yes' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+          ok(badSeal.status === 400 && badSeal.json.error === 'bad_seal', '知らない値は 400 (500 にしない)');
+          ok(sealOf() == null, '断ったので値も変わらない');
+          const sealStale = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { expiry_seal: '1' }, worker_id: staffP.id, pin: '4649', expect_version: mver() - 1 } });
+          ok(sealStale.status === 409, '古い版で送ったら断る (期限シールも他の項目と同じ楽観ロック)');
+          ok(sealOf() == null, '断ったので値も変わらない');
+          let sealErr = null;
+          try { db.prepare("UPDATE f_iroha_work_master SET expiry_seal = 2 WHERE code_key = 'size-a'").run(); } catch (e) { sealErr = e; }
+          ok(sealErr && /CHECK/.test(sealErr.message), '0/1 以外は DB にも入らない (CHECK)');
         }
         ok((await call('GET', '/api/history', { cookie })).status === 200, '履歴も開ける');
 
@@ -2956,7 +2981,21 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/\+ \(empty \? '＋ 登録' : '✎ 変更'\) \+/.test(html), '値があれば「変更」、無ければ「登録」と出す');
   ok(!/mvVideo/.test(html.replace(/\/\/.*$/gm, '')), '作り方どうがは画面から外した (コメントだけ残す)');
   ok(/const hours = mine\.reduce/.test(html), 'ボードの列に想定作業時間の合計を出す');
-  ok(/kv\('必要保管箱', c\.boxes\)/.test(html) && /kv\('想定作業時間'/.test(html), '詳細に必要保管箱と想定作業時間を出す');
+  ok(/function headNumsHtml\(c\)/.test(html) && /n\('つくる数'/.test(html)
+    && /n\('必要保管箱', c\.boxes/.test(html) && /n\('想定作業時間'/.test(html),
+    '必要保管箱と想定作業時間は「つくる数」の横に出す (作業情報の枠からは外す)');
+  ok(/function careHtml\(c\)/.test(html) && /class="care"/.test(html),
+    '気をつけることは上部に強調して出す (中身があるときだけ)');
+  ok(/function sealHtml\(c\)/.test(html) && /c\.master\.expiry_seal === 1/.test(html)
+    && /期限シールあり — 貼り忘れに注意してください/.test(html),
+    '期限シールは「あり」のときだけ赤で出す (なしは出さない)');
+  ok(/function headFactsHtml\(c\)/.test(html) && /c\.external_text/.test(html) && /c\.supplier/.test(html),
+    '参考・外部出し目安・取引先も上部に出す');
+  ok(/<h3 class="sec">作業情報<\/h3>/.test(html) && !/<h3 class="sec">作業のやり方<\/h3>/.test(html),
+    '「作業のやり方」を「作業情報」に変える');
+  ok(/kv\('大きさ', sizeClassText\(m\.size_class\), \{ reg: 'size_class' \}\)/.test(html),
+    '大きさもタイルから登録できる (P4 で項目だけ足して開けなくなっていた)');
+  ok(/kv\('期限シール'/.test(html) && /reg: 'expiry_seal'/.test(html), '期限シールもタイルから変えられる');
   ok(/reg: 'units_per_container'/.test(html) && /reg: 'storage_container'/.test(html), '保管箱と入数は別々にタップできる');
   // タップした項目だけ出す・ダイアログはスクロールできる・候補は正方形のタイル (中原さん 2026-09-03)
   ok(/class="mvf" data-f="material_code"/.test(html) && /class="mvf" data-f="storage_container"/.test(html)
@@ -3047,7 +3086,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v6'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v8'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -3087,7 +3126,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/どこが未定 ' \+ und \+ ' 件/.test(html), '拠点が未定の件数を警告に出す');
   ok(/data-plan-act=/.test(html) && /\$\('#planCand'\)\.addEventListener\('click'/.test(html),
     '計画画面のボタンも data-* + 委譲で受ける (onclick に値を埋めない)');
-  ok(/function pcardHtml\(c, actions\)/.test(html) && /大きさ 不明/.test(html),
+  ok(/function pcardHtml\(c, actions, grab\)/.test(html) && /大きさ 不明/.test(html),
     'カードに理由 (在庫・入荷・大きさ) を添える。大きさが分からなければそう出す');
   // ══ P4: 大きさのその場登録 ══
   ok(/<div class="mvf" data-f="size_class">/.test(html) && /const SIZE_OPTS = \[\['L', '大'\], \['M', '中'\], \['S', '小'\], \['', '未登録'\]\];/.test(html),
@@ -3098,14 +3137,80 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // ══ P2: ボードに 3 軸を載せる (要件 §W-4) ══
   ok(/<div id="gaugeWrap"><\/div>/.test(html) && !/class="gauge"/.test(html.slice(0, html.indexOf('<script'))),
     '明日やる分のゲージは静的に置かない (職員のときだけボタンにする)');
-  ok(/if \(!isApp\(\)\) \{\r?\n\s+return '<button class="gauge" onclick="openPlanPage\(\)">' \+ inner \+\r?\n\s+'<span class="go">明日の計画 ›<\/span><span class="staff">見るだけ \(正本はまだ Notion\)<\/span><\/button>';/.test(html),
-    '下見のあいだもゲージから「明日の計画」を開ける (読むだけ・「見るだけ」と書く)');
+  ok(/function planButtonHtml\(\)/.test(html) && /明日の計画を立てる/.test(html)
+    && /\$\('#gaugeWrap'\)\.innerHTML = planButtonHtml\(\);/.test(html),
+    'ボードには「明日の計画を立てる」の大きなボタンを出す (ゲージではなく)');
+  ok(/明日の計画を見る/.test(html) && /見るだけ \(正本はまだ Notion\)/.test(html),
+    '下見では「明日の計画を見る」(見るだけ) として開ける');
+  ok(/\$\('#planGauge'\)\.innerHTML = gaugeHtml\(t, d\.target_hours\);/.test(html) && /<div id="planGauge"><\/div>/.test(html),
+    'ゲージ (合計時間と目安) は計画画面に置く (ボードでは意味が薄い)');
+  ok(/function gaugeHtml\(totals, target\)/.test(html) && /const p = totals \|\| \(\(boardState\(\) \|\| \{\}\)\.tomorrow_plan\)/.test(html)
+    && /const lo = \(target \|\| \{\}\)\.min \?\? 4;/.test(html),
+    'ゲージは見せる数字を受け取る (中で一覧を見ると、計画を変えた直後に画面の中で食い違う)');
+  ok(/const band = 'left:' \+ \(lo \/ full \* 100\) \+ '%;width:' \+ \(\(hi - lo\) \/ full \* 100\) \+ '%';/.test(html)
+    && /<span class="band" style="' \+ band \+ '">/.test(html) && !/\.band\{[^}]*left:50%/.test(html),
+    '目安の帯も lo〜hi から描く (決め打ちだと、目安を変えたとき帯だけ元の位置に残る)');
+  // ══ ドラッグ＆ドロップ (中原さん 2026-09-05) ══
+  ok(/window\.addEventListener\('pointermove', dndMove/.test(html) && /window\.addEventListener\('pointerup', dndDrop\);/.test(html)
+    && !/addEventListener\('dragstart'/.test(html),
+    'ドラッグは pointer イベントで作る (HTML5 の dragstart は iPad の指で動かない)');
+  ok(/\.grip\{[^}]*touch-action:none/.test(html),
+    '掴み手には**はじめから** touch-action:none を付ける (後からクラスを付けても Safari は既にスクロールと決めている)');
+  ok(/function gripHtml\(\)/.test(html) && /function gripDown\(e, sel, kind\)/.test(html)
+    && /const g = e\.target\.closest\('\[data-grip\]'\);\r?\n\s+if \(!g\) return;/.test(html),
+    '掴めるのは掴み手の上だけ (カードの上を指でなぞれば今まで通りスクロールできる)');
+  ok(/const grab = isApp\(\) && !bulkIds && \(boardCols === 'fac' \? stateCan\('task\.facility\.assign'\) : stateCan\('task\.status\.change'\)\);/.test(html)
+    && /\(grab \? gripHtml\(\) : ''\)/.test(html),
+    '動かせないときは掴み手を描かない (無効にして見せない — 要件 §U-7)');
+  ok(/pcardHtml\(c, carryActs, !ro\)/.test(html) && /\], !ro\)\)\.join\(''\)/.test(html)
+    && /pcardHtml\(c, pileActs, !ro\)/.test(html),
+    '下見・許可なしの計画画面には掴み手を描かない');
+  ok(/\/\/ ⭐掴んでから落とすまでの間に正本や許可が変わることがある。\*\*落とす直前にもう一度見る\*\*/.test(html)
+    && /function dndAllowed\(drop\)[\s\S]{0,400}?if \(!isApp\(\)\) return false;/.test(html)
+    && /if \(planData && planData\.preview\) return false;/.test(html),
+    '落とす直前に正本 (isApp) と下見 (preview) と許可を見直す (掴んだ後に正本が戻ることがある)');
+  ok(/function dndGrab\(ev, card, kind\) \{\r?\n\s+if \(DND\.on\) return;/.test(html),
+    '二本目の指では掴まない (掴んだ覚えのないカードが動かないように)');
+  ok(/function dndMove\(ev\) \{\r?\n\s+if \(!DND\.on \|\| ev\.pointerId !== DND\.pointerId\) return;/.test(html)
+    && /async function dndDrop\(ev\) \{\r?\n\s+if \(!DND\.on \|\| ev\.pointerId !== DND\.pointerId\) return;/.test(html)
+    && /function dndCancel\(ev\) \{\r?\n\s+if \(ev && DND\.on && ev\.pointerId !== DND\.pointerId\) return;/.test(html),
+    '動かす・落とす・やめる は**掴んだ指のイベントだけ**見る (別の指で他のカードが飛ばない)');
+  ok(/dndEatClick = \{ x: ev\.clientX, y: ev\.clientY, until: Date\.now\(\) \+ 400 \};/.test(html)
+    && /if \(Math\.abs\(ev\.clientX - e\.x\) > 12 \|\| Math\.abs\(ev\.clientY - e\.y\) > 12\) return;/.test(html)
+    && /ev\.stopPropagation\(\); ev\.preventDefault\(\);\r?\n\s*\}, true\);/.test(html),
+    '動かした後の click は 1 回捨てる。⭐落としたところ・その直後に限る (次の操作を飲まない)');
+  ok(/if \(e\.target\.closest\('\[data-grip\]'\)\) e\.stopPropagation\(\);/.test(html),
+    '掴み手のタップでは詳細を開かない');
+  ok(/window\.addEventListener\('lostpointercapture'/.test(html) && /window\.addEventListener\('blur', \(\) => dndCancel\(\)\);/.test(html),
+    '掴んだカードが消えても後始末する (ゴーストが残ると何も押せなくなる)');
+  ok(/if \(DND\.on && DND\.kind === 'board'\) dndCancel\(\);/.test(html)
+    && /if \(DND\.on && DND\.kind === 'plan'\) dndCancel\(\);/.test(html),
+    '描き直すときは掴みを外す。⭐その画面のドラッグだけ (計画で掴んでいる最中に一覧が返っても巻き込まない)');
+  ok(/if \(!stSaving && !reconnectTimer && !DND\.on\) loadState\(\);/.test(html),
+    'ドラッグの最中は自動の取り直しを待つ');
+  ok(/const DRAG_START_PX = 8;/.test(html) && /if \(!moved\) return;\s*\/\/ 動いていない = ふつうのタップ/.test(html),
+    '少し動かすまではタップとして扱う (札のタップの道を残す)');
+  ok(/\$\('#board'\)\.addEventListener\('pointerdown', \(e\) => \{ if \(!bulkIds\) gripDown/.test(html),
+    'まとめて選んでいる最中は掴まない');
+  ok(/function dndAllowed\(drop\)/.test(html) && /stateCan\('task\.plan\.assign'\)/.test(html)
+    && /stateCan\('task\.facility\.assign'\)/.test(html) && /stateCan\('task\.status\.change'\)/.test(html),
+    '落とせるかは許可リストで決める (許可が無ければ落とせない)');
+  ok(/\(\(\(state \|\| \{\}\)\.transitions \|\| \{\}\)\[c\.status\] \|\| \[\]\)\.includes\(to\)/.test(html),
+    'ボードで落とせるのは、許された進み方だけ (サーバーと同じ遷移表を見る)');
+  ok(/dropok/.test(html) && /dropng/.test(html), '落とせる場所と落とせない場所を色で分ける');
+  ok(/function dropToStatus\(id, to\)/.test(html) && /openSt\(null, id\);/.test(html) && /doSetSt\(to\);/.test(html),
+    '落として状態を変えるときも、いつものダイアログを通す (理由・PIN の流れを二重に書かない)');
+  ok(/function planAddTomorrow\(id\)/.test(html) && /openPlanFacPick\(id, 'tomorrow'\)/.test(html),
+    '落として「明日やる」に積むときも、タップと同じで拠点を聞く');
+  ok(/data-drop="tomorrow"/.test(html) && /data-drop="none"/.test(html), '計画画面の 2 つのペインが落とし先になる');
+  ok(/g\.drop != null \? ' data-drop="'/.test(html) && /data-drop-kind="fac"/.test(html),
+    'ボードの列も落とし先になる (拠点の列なら拠点が変わる)');
   ok(/const ro = !!d\.preview \|\| !isApp\(\) \|\| !stateCan\('task\.plan\.assign'\);/.test(html),
     '計画画面の操作は、応答の preview だけでなく「いまの正本と許可」でも描き分ける (取ってから描くまでに戻ることがある)');
   ok(/planData = null;\r?\n\s+planGen \+= 1;\r?\n\s+clearPlanDom\(\);/.test(html),
     '正本が変わったら計画のデータを捨て、世代を進めて古い応答も捨てる');
-  ok(/if \(!stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+return '<div class="gauge">' \+ inner \+ '<span class="staff">明日の計画を決められるのは職員です/.test(html),
-    '許可が無ければゲージはただの表示 (「明日の計画 ›」の入口を描かない)');
+  ok(/if \(!stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+return '<div class="planbtn ro">/.test(html),
+    '許可が無ければボタンにしない (押せない表示にする)');
   // ⭐職員モードに入る入口 (これが無いと、計画の操作が一生描かれない)
   ok(/<button class="who" id="staffBtn" hidden><\/button>/.test(html) && /function renderStaffBtn\(\)/.test(html),
     'ヘッダに「職員モード」のボタンがある');

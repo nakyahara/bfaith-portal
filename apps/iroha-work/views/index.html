@@ -157,7 +157,7 @@
   .gauge .big small{font-size:.78rem;color:var(--sub);margin:0 5px 0 2px;font-weight:600}
   .gauge .bar{position:relative;flex:1;min-width:80px;max-width:200px;height:12px;background:#fff;
     border:1px solid #C9D7FF;border-radius:999px;overflow:hidden}
-  .gauge .bar .band{position:absolute;top:0;bottom:0;left:50%;width:25%;background:var(--ok-soft);
+  .gauge .bar .band{position:absolute;top:0;bottom:0;background:var(--ok-soft);
     border-left:2px solid var(--ok);border-right:2px solid var(--ok)}
   .gauge .bar .fill{position:absolute;top:0;bottom:0;left:0;background:var(--accent);transition:width .25s}
   .gauge .bar .fill.over{background:var(--amber)}
@@ -199,6 +199,32 @@
     padding:8px 12px;font-size:.88rem;font-weight:700;min-height:42px;cursor:pointer;font-family:var(--font)}
   .pbtn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
   .pbtn.warn{color:var(--amber);border-color:#F2D9AE}
+
+  /* ── ドラッグ＆ドロップ (中原さん 2026-09-05)。iPad の指でも動くよう pointer で拾う ── */
+  .drag{position:fixed;z-index:60;pointer-events:none;opacity:.9;transform:rotate(-1.5deg);
+    box-shadow:0 8px 24px rgba(15,23,40,.25);border-radius:var(--r-sm);overflow:hidden}
+  .dragging{opacity:.35}
+  .dropok{outline:3px dashed var(--accent);outline-offset:-4px;background:var(--accent-soft)}
+  .dropng{outline:3px dashed var(--line);outline-offset:-4px}
+  body.dnd{user-select:none;-webkit-user-select:none}
+  /* ⭐掴み手。**ここだけ** touch-action:none にする — カードの上を指でなぞれば今まで通りスクロールできる。
+     クラスを後から付けても Safari は既に始まったジェスチャーをスクロールと決めてしまう (pointercancel) ので、
+     はじめから付いている要素が要る (Codex R1 重大3) */
+  .grip{flex:none;touch-action:none;-webkit-user-select:none;user-select:none;cursor:grab;
+    align-self:stretch;display:flex;align-items:center;padding:0 10px;margin:-2px 0 -2px -4px;
+    color:var(--sub);font-size:1.15rem;line-height:1;opacity:.7}
+  .grip:active{cursor:grabbing;opacity:1;color:var(--accent)}
+
+  /* ── 「明日の計画を立てる」— ボードから入る大きなボタン (中原さん 2026-09-05) ── */
+  .planbtn{display:flex;align-items:center;gap:12px;width:100%;background:var(--accent);border:1px solid var(--accent);
+    color:#fff;border-radius:var(--r);padding:14px 18px;margin-bottom:10px;font-family:var(--font);
+    font-size:1.05rem;font-weight:700;cursor:pointer;min-height:60px;text-align:left}
+  .planbtn:active{filter:brightness(.94)}
+  .planbtn .ic{font-size:1.4rem;flex:none}
+  .planbtn .sub{margin-left:auto;font-size:.86rem;font-weight:600;opacity:.9;text-align:right}
+  .planbtn .chev{font-size:1.2rem;flex:none;opacity:.8}
+  .planbtn.ro{background:var(--surface);border-color:var(--line);color:var(--ink)}
+  .planbtn.ro .sub{color:var(--sub)}
 
   /* ── 列の分け方 ── */
   .seg{display:inline-flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden;background:var(--surface)}
@@ -252,6 +278,27 @@
   .qty{font-size:1rem;margin-top:8px;color:var(--sub)}
   .qty b{font-size:1.9em;font-family:var(--num);font-weight:700;color:var(--ink);line-height:1}
   .bcode{font-family:var(--num);background:var(--well);border-radius:var(--r-sm);padding:2px 8px;font-size:.95em;letter-spacing:.04em}
+
+  /* ── 上部にまとめる大事なもの (中原さん 2026-09-05: つくる数の横に必要保管箱と想定作業時間) ── */
+  .nums{display:flex;flex-wrap:wrap;align-items:flex-end;gap:18px;margin-top:10px}
+  .nums .n{display:flex;flex-direction:column;gap:1px}
+  .nums .n label{font-size:.72rem;color:var(--faint);letter-spacing:.08em;font-weight:700}
+  .nums .n .v{font-family:var(--num);font-weight:700;font-size:1.25rem;line-height:1.1;color:var(--ink)}
+  .nums .n.big .v{font-size:1.9rem}
+  .nums .n .u{font-size:.8rem;color:var(--sub);font-weight:600;margin-left:2px}
+  .nums .n.unk .v{color:var(--faint)}   /* 分からないものは薄い「—」で出す (消さない) */
+  /* 参考・外部出し目安・取引先 — 読むだけの一行 */
+  .facts{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
+  .facts span{font-size:.8rem;background:var(--well);border:1px solid var(--line);border-radius:999px;padding:3px 10px;color:var(--sub)}
+  .facts span.urgent{background:var(--danger-soft);border-color:#F3C1C1;color:var(--danger);font-weight:700}
+  /* 期限シールあり — 貼り忘れると出荷できないので赤で目立たせる。なしのときは出さない */
+  .seal{margin-top:10px;display:inline-flex;align-items:center;gap:6px;background:var(--danger-soft);
+    border:1px solid #F3C1C1;color:var(--danger);border-radius:var(--r-sm);padding:7px 12px;font-weight:700;font-size:1rem}
+  /* 気をつけること — 上部に強調して出す (作業前に必ず目に入るように) */
+  .care{margin-top:12px;background:var(--amber-soft);border:1px solid #F2D9AE;border-left:5px solid var(--amber);
+    border-radius:var(--r-sm);padding:10px 14px}
+  .care label{display:block;font-size:.72rem;color:var(--amber);letter-spacing:.08em;font-weight:700;margin-bottom:2px}
+  .care .v{font-weight:700;font-size:1.05rem;line-height:1.5;color:#7A4A05;white-space:pre-wrap}
 
   .kvs{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
   .kv{background:var(--well);border:1px solid var(--line);border-radius:var(--r-sm);padding:9px 12px}
@@ -442,13 +489,14 @@
       <span id="planStaff" class="flabel"></span>
     </div>
     <p class="hint" id="planHint"></p>
+    <div id="planGauge"></div>
     <div id="planCarry"></div>
     <div class="plan2">
-      <div class="pane">
+      <div class="pane" data-drop="none">
         <h3>候補 <span class="n" id="planCandN">0</span><span class="sum">在庫が少ない → 入荷が古い → 大きい</span></h3>
         <div id="planCand"></div>
       </div>
-      <div class="pane pile">
+      <div class="pane pile" data-drop="tomorrow">
         <h3>明日やる分 <span class="n" id="planPileN">0</span><span class="sum" id="planPileSum"></span></h3>
         <div class="byfac" id="planByFac"></div>
         <div id="planPile"></div>
@@ -554,6 +602,12 @@
           <label>大きさ (配送方法から分からないときだけ)</label>
           <div class="opts chips" id="mvSizeOpts" role="group" aria-label="大きさ"></div>
           <input id="mvSize" type="hidden">
+        </div>
+        <div class="mvf" data-f="expiry_seal">
+          <label>期限シール (貼る商品ですか)</label>
+          <div class="opts chips" id="mvSealOpts" role="group" aria-label="期限シール"></div>
+          <input id="mvSeal" type="hidden">
+          <p class="hint" style="margin:6px 0 0">「あり」にすると、この商品を開いたとき画面の上に赤で出ます。</p>
         </div>
       </div>
       <div id="mvPinRow" style="display:none;margin-top:12px">
@@ -1122,34 +1176,53 @@ async function loadPreviewOnce() {
 const WHEN_LABEL = { today: '今日やる', tomorrow: '明日やる', over: 'やり残し', later: '先の予定' };
 const WHEN_CLASS = { today: 'todayp', tomorrow: 'tomorrow', over: 'over', later: '' };
 
-/** 明日やる分の合計 (上のゲージ)。職員はタップで「明日の計画」へ。利用者は見るだけ */
-function gaugeHtml() {
-  // 下見 (正本が Notion) のときも出す。中身は下見のデータから (見るだけ)
-  const p = ((boardState() || {}).tomorrow_plan) || { hours: 0, count: 0, unknown_hours_count: 0 };
+/** ボードから「明日の計画」に入るところ。決められるのは職員だけ。下見・利用者は見るだけ */
+/**
+ * ⭐ボードから「明日の計画」に入るボタン (中原さん 2026-09-05: 分かりやすいボタンにしてほしい)。
+ * ゲージ (合計時間と目安) はボードでは意味が薄いので**計画画面のほうに置く**
+ */
+function planButtonHtml() {
+  const p = ((boardState() || {}).tomorrow_plan) || { hours: 0, count: 0 };
+  const sub = p.count > 0 ? p.count + ' 件 · ' + fmtHours(p.hours) + ' 入っています' : 'まだ何も入っていません';
+  if (!isApp()) {
+    return '<button class="planbtn ro" onclick="openPlanPage()"><span class="ic">📋</span>' +
+      '<span>明日の計画を見る<br><small style="font-weight:600;opacity:.75">見るだけ (正本はまだ Notion)</small></span>' +
+      '<span class="sub">' + esc(sub) + '</span><span class="chev">›</span></button>';
+  }
+  if (!stateCan('task.plan.assign')) {
+    return '<div class="planbtn ro"><span class="ic">📋</span><span>明日の計画</span>' +
+      '<span class="sub">' + esc(sub) + ' ・ 決められるのは職員です</span></div>';
+  }
+  return '<button class="planbtn" onclick="openPlanPage()"><span class="ic">📋</span>' +
+    '<span>明日の計画を立てる</span><span class="sub">' + esc(sub) + '</span><span class="chev">›</span></button>';
+}
+
+/**
+ * 明日やる分の合計。⭐**見せる数字を受け取る** — 計画画面では計画の応答 (d.totals) を、
+ * それ以外は一覧の数字を使う。中で boardState() を見ると、計画を変えた直後に画面の中で食い違う (Codex R1 中6)
+ */
+function gaugeHtml(totals, target) {
+  const p = totals || ((boardState() || {}).tomorrow_plan) || { hours: 0, count: 0, unknown_hours_count: 0 };
+  const lo = (target || {}).min ?? 4;
+  const hi = (target || {}).max ?? 6;
   const h = Math.floor(p.hours);
   const m = Math.round((p.hours - h) * 60);
-  const pct = Math.min(100, (p.hours / 8) * 100);
-  const over = p.hours > 6;
-  const st = p.hours < 4 ? ['under', p.count + ' 件 · あと ' + fmtHours(4 - p.hours) + ' で目安']
-    : p.hours <= 6 ? ['ok', p.count + ' 件 · 目安内 (4〜6 時間)']
-    : ['over', p.count + ' 件 · 目安を ' + fmtHours(p.hours - 6) + ' 超えています'];
+  const full = hi + 2;                                   // 目盛りいっぱい (目安より少し先まで見せる)
+  const pct = Math.min(100, (p.hours / full) * 100);
+  // ⭐目安の帯も lo〜hi から描く。ここを決め打ちにすると、目安を変えたとき帯だけ元の位置に残る (Codex R2 中1)
+  const band = 'left:' + (lo / full * 100) + '%;width:' + ((hi - lo) / full * 100) + '%';
+  const over = p.hours > hi;
+  const st = p.hours < lo ? ['under', p.count + ' 件 · あと ' + fmtHours(lo - p.hours) + ' で目安']
+    : p.hours <= hi ? ['ok', p.count + ' 件 · 目安内 (' + lo + '〜' + hi + ' 時間)']
+    : ['over', p.count + ' 件 · 目安を ' + fmtHours(p.hours - hi) + ' 超えています'];
   const unknown = p.unknown_hours_count > 0 ? ' <span class="st under">時間不明 ' + esc(String(p.unknown_hours_count)) + ' 件</span>' : '';
   const inner = '<span class="lbl">明日やる分</span>' +
     '<span class="big">' + esc(String(h)) + '<small>時間</small>' + esc(String(m).padStart(2, '0')) + '<small>分</small></span>' +
-    '<span class="bar"><span class="band"></span><span class="fill' + (over ? ' over' : '') + '" style="width:' + pct + '%"></span></span>' +
+    '<span class="bar"><span class="band" style="' + band + '"></span><span class="fill' + (over ? ' over' : '') + '" style="width:' + pct + '%"></span></span>' +
     '<span class="st ' + st[0] + '">' + esc(st[1]) + '</span>' + unknown;
-  // ⭐下見 (正本が Notion) でも「明日の計画」は開ける — 読むだけ。切替の前に形を見せるため
-  if (!isApp()) {
-    return '<button class="gauge" onclick="openPlanPage()">' + inner +
-      '<span class="go">明日の計画 ›</span><span class="staff">見るだけ (正本はまだ Notion)</span></button>';
-  }
-  // 計画を決められるのは職員だけ。許可が無ければボタンにせず、入口 (›) も描かない (要件 §W-4)
-  if (!stateCan('task.plan.assign')) {
-    return '<div class="gauge">' + inner + '<span class="staff">明日の計画を決められるのは職員です</span></div>';
-  }
-  const left = staffLeftText();
-  return '<button class="gauge" onclick="openPlanPage()">' + inner +
-    '<span class="go">明日の計画 ›</span>' + (left ? '<span class="staff">' + esc(left) + '</span>' : '') + '</button>';
+  // 計画画面の中に置く「今どれくらい入っているか」の表示。入口はボードの大きなボタン
+  const left = isApp() ? staffLeftText() : '見るだけ (正本はまだ Notion)';
+  return '<div class="gauge">' + inner + (left ? '<span class="staff">' + esc(left) + '</span>' : '') + '</div>';
 }
 /** 職員モードの残り時間 (切れる前に気づけるように) */
 function staffLeftText() {
@@ -1200,6 +1273,25 @@ $('#whenChips').addEventListener('click', (e) => {
   const b = e.target.closest('[data-when]');
   if (b) { curWhen = b.dataset.when; renderBoard(); }
 });
+/**
+ * ⭐掴むのは**掴み手 (⠿) の上だけ**。カードの上を指でなぞったときは今まで通り縦にスクロールする。
+ * カード全体を掴めるようにすると、Safari がスクロールと判断した時点で pointercancel になり、
+ * ドラッグがそもそも成立しない (Codex R1 重大3)
+ */
+function gripDown(e, sel, kind) {
+  const g = e.target.closest('[data-grip]');
+  if (!g) return;
+  const card = g.closest(sel + '[data-id]');
+  if (!card) return;
+  e.preventDefault();          // 掴み手の上では選択もスクロールもさせない
+  dndGrab(e, card, kind);
+}
+$('#board').addEventListener('pointerdown', (e) => { if (!bulkIds) gripDown(e, '.bcard', 'board'); });
+$('#planCand').addEventListener('pointerdown', (e) => gripDown(e, '.pcard', 'plan'));
+$('#planPile').addEventListener('pointerdown', (e) => gripDown(e, '.pcard', 'plan'));
+$('#planCarry').addEventListener('pointerdown', (e) => gripDown(e, '.pcard', 'plan'));
+// 掴み手のタップで詳細を開かない (掴むためのところなので)
+document.addEventListener('click', (e) => { if (e.target.closest('[data-grip]')) e.stopPropagation(); }, true);
 $('#board').addEventListener('click', (e) => {
   // ⭐札は「カードを開く」より先に受ける (札をタップしたのに詳細が開かないように)
   const facBtn = e.target.closest('[data-fac-of]');
@@ -1232,10 +1324,13 @@ function boardCards() {
   });
 }
 function renderBoard() {
+  // 描き直すと掴んでいたカードが消える。ただし**ボードのドラッグだけ**外す —
+  // 計画画面で掴んでいる最中に一覧の取得が返ってきても、そちらは巻き込まない (Codex R2 中2)
+  if (DND.on && DND.kind === 'board') dndCancel();
   const bs = boardState();
   if (!bs) { $('#board').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
   renderPreviewNote();
-  $('#gaugeWrap').innerHTML = gaugeHtml();
+  $('#gaugeWrap').innerHTML = planButtonHtml();
   $('#colSeg').innerHTML = colSegHtml();
   $('#facChips').innerHTML = facChips();
   $('#whenChips').innerHTML = whenChips();
@@ -1243,23 +1338,28 @@ function renderBoard() {
   if (isApp()) syncBulkSelection(cards);
   // 列の分け方 = 進捗 (既定) か 拠点。「予定」の列は作らない — また 1 列に 2 つの意味が混ざるため (要件 §W-4)
   const groups = boardCols === 'fac'
-    ? [{ label: '未定', pick: (c) => !c.facility_code, status: null },
-       ...(bs.facilities || []).map(f => ({ label: f.name, pick: (c) => c.facility_code === f.code, status: null }))]
-    : (bs.statuses || []).map(st => ({ label: st.label, pick: (c) => c.status === st.value, status: st.value }));
+    ? [{ label: '未定', pick: (c) => !c.facility_code, status: null, drop: '' },
+       ...(bs.facilities || []).map(f => ({ label: f.name, pick: (c) => c.facility_code === f.code, status: null, drop: f.code }))]
+    : (bs.statuses || []).map(st => ({ label: st.label, pick: (c) => c.status === st.value, status: st.value, drop: st.value }));
   const cols = groups.map(g => {
     const mine = cards.filter(g.pick);
     const canBulk = stateCan('tasks.bulk_stocked') && g.status === 'ready_for_stocking' && mine.length > 0;
     const body = mine.length === 0 ? '<div class="colempty">なし</div>' : mine.map(c => bcardHtml(c, c.status)).join('');
     // 想定作業時間の合計 (Notion のボードビューで見ていたもの)
     const hours = mine.reduce((a, c) => a + (Number(c.plan_hours) || 0), 0);
-    return '<div class="col"><h3>' + esc(g.label) + ' <span class="n">' + mine.length + '</span>' +
+    return '<div class="col"' + (g.drop != null ? ' data-drop="' + esc(g.drop) + '"' + (boardCols === 'fac' ? ' data-drop-kind="fac"' : '') : '') +
+      '><h3>' + esc(g.label) + ' <span class="n">' + mine.length + '</span>' +
       (hours > 0 ? '<span class="n">⏱ ' + (Math.round(hours * 10) / 10) + 'h</span>' : '') +
       (canBulk && !bulkIds ? '<button onclick="startBulk()">まとめて棚入完了</button>' : '') + '</h3>' + body + '</div>';
   }).join('');
   $('#board').innerHTML = cols;
 }
+/** 掴み手。⭐動かせるときだけ描く (動かせないのに掴めるように見せない — 要件 §U-7) */
+function gripHtml() { return '<span class="grip" data-grip aria-hidden="true">⠿</span>'; }
 function bcardHtml(c, status) {
   const selectable = bulkIds && status === 'ready_for_stocking';
+  // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
+  const grab = isApp() && !bulkIds && (boardCols === 'fac' ? stateCan('task.facility.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
   const meta = [c.qty != null ? c.qty + ' 個' : null, c.boxes || null,
     c.plan_hours != null ? '⏱ ' + c.plan_hours + 'h' : null,
@@ -1267,6 +1367,7 @@ function bcardHtml(c, status) {
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
   return '<div class="bcard' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+    (grab ? gripHtml() : '') +
     '<div class="th">' + thumbHtml(c) + '</div>' +
     '<div class="bd">' +
     '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
@@ -1488,7 +1589,154 @@ async function askStaffUnlock() {
   return true;
 }
 
-// ─── ⭐明日の計画 (職員だけ。ボードのゲージから開く。要件 §W-4) ───
+/**
+ * ⭐カードのドラッグ＆ドロップ (中原さん 2026-09-05)。
+ * iPad の指で動かせるよう HTML5 の dragstart ではなく **pointer イベント**で作る
+ * (HTML5 DnD は iOS の指では動かない)。⭐**タップの道は残す** —
+ * 利用者は指の操作が苦手なことがあるので、札のタップでも同じことができる (要件 §7)
+ *
+ * 使うところ:
+ *   - 明日の計画: 候補 ↔ 明日やる分
+ *   - ボード: 列から列へ (進捗を変える / 拠点の列なら拠点を変える)
+ */
+const DND = { on: false, id: null, ghost: null, from: null, over: null, sx: 0, sy: 0, moved: false, kind: null, pointerId: null };
+const DRAG_START_PX = 8;      // これ以上動いたらドラッグ (タップと区別する)
+// ドラッグが成立した後に出る click を 1 回だけ捨てる。⭐**落としたところ・その直後**に限る —
+// ただの時間で切ると、click が出なかったときに次の操作を飲んでしまう (Codex R2 中3)
+let dndEatClick = null;       // { x, y, until }
+
+function dndFindDrop(x, y) {
+  const el = document.elementFromPoint(x, y);
+  return el ? el.closest('[data-drop]') : null;
+}
+function dndClearOver() {
+  if (DND.over) { DND.over.classList.remove('dropok', 'dropng'); DND.over = null; }
+}
+function dndCancel(ev) {
+  if (ev && DND.on && ev.pointerId !== DND.pointerId) return;   // 別の指のイベントでは終わらせない
+  if (DND.ghost) { DND.ghost.remove(); DND.ghost = null; }
+  if (DND.from) {
+    DND.from.classList.remove('dragging');
+    try { if (DND.pointerId != null && DND.from.hasPointerCapture && DND.from.hasPointerCapture(DND.pointerId)) DND.from.releasePointerCapture(DND.pointerId); } catch (e) {}
+  }
+  dndClearOver();
+  document.body.classList.remove('dnd');
+  DND.on = false; DND.id = null; DND.from = null; DND.moved = false; DND.kind = null; DND.pointerId = null;
+}
+/**
+ * 掴む。card = 動かす要素 (data-id を持つ)、kind = 'plan' | 'board'。
+ * ⭐**二本目の指は受けない** — 受けると、掴んだ覚えのないカードが動いてしまう (Codex R1 重大2)
+ */
+function dndGrab(ev, card, kind) {
+  if (DND.on) return;                                    // すでに掴んでいる (二本目の指)
+  if (ev.button != null && ev.button !== 0) return;      // 右クリックは無視
+  if (!isApp()) return;                                  // 下見は動かせない
+  DND.on = true; DND.id = card.dataset.id; DND.from = card; DND.kind = kind;
+  DND.sx = ev.clientX; DND.sy = ev.clientY; DND.moved = false;
+  DND.pointerId = ev.pointerId;
+  try { card.setPointerCapture && card.setPointerCapture(ev.pointerId); } catch (e) {}
+}
+function dndMove(ev) {
+  if (!DND.on || ev.pointerId !== DND.pointerId) return;   // 掴んだ指のイベントだけ見る
+  const dx = ev.clientX - DND.sx;
+  const dy = ev.clientY - DND.sy;
+  if (!DND.moved) {
+    if (Math.abs(dx) < DRAG_START_PX && Math.abs(dy) < DRAG_START_PX) return;   // まだタップかもしれない
+    DND.moved = true;
+    document.body.classList.add('dnd');
+    // 掴んだカードの見た目をそのまま持ち上げる
+    const r = DND.from.getBoundingClientRect();
+    const g = DND.from.cloneNode(true);
+    g.className = 'drag ' + DND.from.className.replace('dragging', '');
+    g.style.width = r.width + 'px';
+    g.style.left = r.left + 'px';
+    g.style.top = r.top + 'px';
+    document.body.appendChild(g);
+    DND.ghost = g;
+    DND.gx = r.left - DND.sx; DND.gy = r.top - DND.sy;
+    DND.from.classList.add('dragging');
+  }
+  ev.preventDefault();
+  DND.ghost.style.left = (ev.clientX + DND.gx) + 'px';
+  DND.ghost.style.top = (ev.clientY + DND.gy) + 'px';
+  // 落とせる場所を光らせる
+  DND.ghost.style.visibility = 'hidden';
+  const drop = dndFindDrop(ev.clientX, ev.clientY);
+  DND.ghost.style.visibility = '';
+  if (drop !== DND.over) {
+    dndClearOver();
+    if (drop) { DND.over = drop; drop.classList.add(dndAllowed(drop) ? 'dropok' : 'dropng'); }
+  }
+  // 画面のふちに来たら少しずつ送る (列が横に長いので)
+  const pad = 60;
+  if (ev.clientX < pad) window.scrollBy(-14, 0);
+  else if (ev.clientX > window.innerWidth - pad) window.scrollBy(14, 0);
+  if (ev.clientY < pad) window.scrollBy(0, -14);
+  else if (ev.clientY > window.innerHeight - pad) window.scrollBy(0, 14);
+}
+/** そこに落としてよいか (許可が無い・下見・同じ場所なら不可) */
+function dndAllowed(drop) {
+  const to = drop.dataset.drop;
+  // ⭐掴んでから落とすまでの間に正本や許可が変わることがある。**落とす直前にもう一度見る** (Codex R1 重大1)
+  if (!isApp()) return false;
+  if (DND.kind === 'plan') {
+    if (planData && planData.preview) return false;       // 下見の応答は読むだけ
+    if (!stateCan('task.plan.assign')) return false;
+    const c = planCard(DND.id);
+    if (!c) return false;
+    return to === 'tomorrow' ? c.when !== 'tomorrow' : c.when === 'tomorrow' || c.when === 'over';
+  }
+  if (DND.kind === 'board') {
+    const c = findCard(DND.id);
+    if (!c) return false;
+    if (drop.dataset.dropKind === 'fac') return stateCan('task.facility.assign') && (drop.dataset.drop || null) !== (c.facility_code || null);
+    return stateCan('task.status.change') && to !== c.status && (((state || {}).transitions || {})[c.status] || []).includes(to);
+  }
+  return false;
+}
+async function dndDrop(ev) {
+  if (!DND.on || ev.pointerId !== DND.pointerId) return;   // 掴んだ指のイベントだけ見る
+  const moved = DND.moved;
+  const id = DND.id;
+  const kind = DND.kind;
+  let drop = null;
+  if (moved && DND.ghost) {
+    DND.ghost.style.visibility = 'hidden';
+    drop = dndFindDrop(ev.clientX, ev.clientY);
+  }
+  const okDrop = drop && dndAllowed(drop) ? drop : null;
+  dndCancel();
+  if (!moved) return;            // 動いていない = ふつうのタップ (click が処理する)
+  // 動かした後の click は捨てる。でないと「列を移した」と同時に詳細が開いてしまう (Codex R1 中4)
+  dndEatClick = { x: ev.clientX, y: ev.clientY, until: Date.now() + 400 };
+  if (!okDrop) return;
+  if (kind === 'plan') {
+    const to = okDrop.dataset.drop;
+    if (to === 'tomorrow') planAddTomorrow(id); else savePlanWhen(id, null);
+    return;
+  }
+  if (okDrop.dataset.dropKind === 'fac') { saveFacility(id, okDrop.dataset.drop || null, null); return; }
+  dropToStatus(id, okDrop.dataset.drop);
+}
+window.addEventListener('pointermove', dndMove, { passive: false });
+window.addEventListener('pointerup', dndDrop);
+window.addEventListener('pointercancel', dndCancel);
+// 掴んだカードが消えた (再描画・画面切替) ときも必ず後始末する。ゴーストが残ると操作できなくなる (Codex R1 中5)
+window.addEventListener('lostpointercapture', (ev) => { if (DND.on && ev.pointerId === DND.pointerId) dndCancel(); });
+window.addEventListener('blur', () => dndCancel());
+document.addEventListener('visibilitychange', () => { if (document.visibilityState !== 'visible') dndCancel(); });
+// 動かした直後の click を 1 回だけ捨てる (捕まえる段階で止める)
+window.addEventListener('click', (ev) => {
+  const e = dndEatClick;
+  if (!e) return;
+  if (Date.now() > e.until) { dndEatClick = null; return; }
+  // 落としたところとほぼ同じ場所で出た click だけ捨てる。別のところを押したのはそのまま通す
+  if (Math.abs(ev.clientX - e.x) > 12 || Math.abs(ev.clientY - e.y) > 12) return;
+  dndEatClick = null;
+  ev.stopPropagation(); ev.preventDefault();
+}, true);
+
+// ─── ⭐明日の計画 (決められるのは職員だけ。ボードの「明日の計画を立てる」から開く。要件 §W-4) ───
 let planData = null;
 let planInflight = null;
 let planGen = 0;        // 取得の世代。遅れて返った古い応答で新しい中身を上書きしない
@@ -1538,6 +1786,7 @@ function clearPlanDom() {
   const n2 = $('#planPileN'); if (n2) n2.textContent = '0';
 }
 function renderPlan() {
+  if (DND.on && DND.kind === 'plan') dndCancel();   // 同上 (Codex R2 中2)
   const d = planData;
   if (!d) { $('#planCand').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
   $('#planTitle').textContent = '明日の計画 — ' + fmtYmd(d.tomorrow_ymd) + (d.preview ? ' (下見)' : '');
@@ -1545,6 +1794,9 @@ function renderPlan() {
   const t = d.totals || { hours: 0, count: 0, unknown_hours_count: 0 };
   const lo = (d.target_hours || {}).min ?? 4;
   const hi = (d.target_hours || {}).max ?? 6;
+  // ⭐ゲージ (合計時間と目安) はこの画面に置く。ボードでは意味が薄い (中原さん 2026-09-05)。
+  //   数字は**この画面の応答から**渡す (一覧の古い数字と食い違わないように)
+  $('#planGauge').innerHTML = gaugeHtml(t, d.target_hours);
   // ⭐下見 (正本が Notion) では読むだけ。操作のボタンは描かない。
   //   応答の preview だけで決めず、**いまの正本と許可でも**見る —
   //   取ってから描くまでに正本が戻ることがある (Codex 下見 R1)
@@ -1563,12 +1815,12 @@ function renderPlan() {
   ];
   $('#planCarry').innerHTML = carry.length === 0 ? '' :
     '<div class="carry"><h3>やり残し ' + carry.length + ' 件' + (ro ? '' : ' — どうしますか (自動では動かしません)') + '</h3>' +
-    carry.map((c) => pcardHtml(c, carryActs)).join('') + '</div>';
+    carry.map((c) => pcardHtml(c, carryActs, !ro)).join('') + '</div>';
   // 候補 (優先順)
   const cand = d.candidates || [];
   $('#planCandN').textContent = cand.length;
   $('#planCand').innerHTML = cand.length === 0 ? '<div class="colempty">候補はありません</div>'
-    : cand.map((c) => pcardHtml(c, ro ? [] : [['＋ 明日やる', 'primary', 'tomorrow']])).join('');
+    : cand.map((c) => pcardHtml(c, ro ? [] : [['＋ 明日やる', 'primary', 'tomorrow']], !ro)).join('');
   // 明日やる分
   const pile = d.tomorrow || [];
   $('#planPileN').textContent = pile.length;
@@ -1581,11 +1833,11 @@ function renderPlan() {
     : stateCan('task.facility.assign') ? [['どこが', '', 'fac'], ['－ 外す', '', 'none']] : [['－ 外す', '', 'none']];
   $('#planPile').innerHTML = pile.length === 0
     ? '<div class="colempty">' + (ro ? '「明日やる」に入っているカードはありません' : '左の候補を「＋ 明日やる」で足してください') + '</div>'
-    : pile.map((c) => pcardHtml(c, pileActs)).join('');
+    : pile.map((c) => pcardHtml(c, pileActs, !ro)).join('');
 }
 
 /** 計画画面のカード。理由 (なぜ上に出るか) を必ず添える */
-function pcardHtml(c, actions) {
+function pcardHtml(c, actions, grab) {
   const why = [];
   if (c.priority) why.push('<span class="' + (c.priority.kind === 'urgent' ? 'urgent' : '') + '">' + esc(c.priority.label) + '</span>');
   if (c.arrival) why.push('<span>入荷 ' + esc(c.arrival) + '</span>');
@@ -1595,7 +1847,8 @@ function pcardHtml(c, actions) {
     c.facility_code ? facilityName(c.facility_code) : 'どこが 未定'].filter(Boolean).join(' ・ ');
   const acts = actions.map(([label, cls, act]) =>
     '<button class="pbtn ' + cls + '" data-plan-act="' + act + '" data-plan-id="' + esc(c.id) + '">' + esc(label) + '</button>').join('');
-  return '<div class="pcard"><div class="th">' + thumbHtml(c) + '</div><div class="bd">' +
+  return '<div class="pcard" data-id="' + esc(c.id) + '">' + (grab ? gripHtml() : '') +
+    '<div class="th">' + thumbHtml(c) + '</div><div class="bd">' +
     '<h4>' + esc(c.title) + '</h4><div class="m num">' + esc(meta) + '</div>' +
     '<div class="why">' + why.join('') + '</div></div><div class="act">' + acts + '</div></div>';
 }
@@ -1619,6 +1872,23 @@ function planAction(e) {
     return;
   }
   savePlanWhen(id, when);
+}
+
+/** ドラッグで列に落として状態を変える。理由が要る状態 (保留・終了) はいつものダイアログを開く */
+function dropToStatus(id, to) {
+  if (!stateCan('task.status.change')) return;
+  const c = findCard(id);
+  if (!c) return;
+  // ⭐いつもの状態変更ダイアログを開いて、落とした先を選んだことにする。
+  //   理由 (保留・終了) や職員PINの流れを二重に書かない — 1 本道にしておく
+  openSt(null, id);
+  if (stTarget == null) return;         // 開けなかった (許可なし・作業者未選択)
+  doSetSt(to);
+}
+/** ドラッグで「明日やる」に積む (タップと同じ流れ = 拠点も聞く) */
+function planAddTomorrow(id) {
+  if (planCard(id) && stateCan('task.facility.assign')) { openPlanFacPick(id, 'tomorrow'); return; }
+  savePlanWhen(id, 'tomorrow');
 }
 
 /** 計画画面から「いつ」を変える。⭐変えたら計画も一覧も取り直す */
@@ -2061,6 +2331,56 @@ $('#dbody').addEventListener('click', (e) => {
   if (el) openMaster(el.dataset.reg);
 });
 
+/**
+ * ⭐上部の数字 (中原さん 2026-09-05: つくる数の横に必要保管箱と想定作業時間)。
+ * 作業をはじめる前にいちばん見るものを、いちばん上にまとめる
+ */
+/**
+ * つくる数・必要保管箱・想定作業時間 (中原さん 2026-09-05: 作る数の横に出してほしい)。
+ * ⭐**分からないものは「—」と出す** — 項目ごと消すと「無い」のか「登録していない」のか分からない (要件 §U)
+ */
+function headNumsHtml(c) {
+  const n = (label, v, unit, cls) => {
+    const known = v != null && v !== '';
+    return '<div class="n' + (cls ? ' ' + cls : '') + (known ? '' : ' unk') + '"><label>' + esc(label) + '</label>' +
+      '<div class="v">' + (known ? esc(v) + (unit ? '<span class="u">' + esc(unit) + '</span>' : '') : '—') + '</div></div>';
+  };
+  return '<div class="nums">' +
+    n('つくる数', c.qty, '個', 'big') +
+    n('必要保管箱', c.boxes, '') +
+    n('想定作業時間', c.plan_hours, '時間') +
+    '</div>';
+}
+/** 参考・外部出し目安・取引先 — 読むだけなので札で並べる */
+function headFactsHtml(c) {
+  const live = [];
+  if (c.sales_text) live.push(c.sales_text);
+  if (c.live && c.live.free_stock != null) live.push('フリー在庫 ' + c.live.free_stock + '個');
+  const out = [];
+  if (c.priority) {
+    out.push('<span class="' + (c.priority.kind === 'urgent' ? 'urgent' : '') + '">' +
+      (c.priority.kind === 'urgent' ? '🔥 ' : '') + esc(c.priority.label) + '</span>');
+  }
+  for (const t of live) out.push('<span>' + esc(t) + '</span>');
+  if (c.external_text) out.push('<span>' + esc(c.external_text) + '</span>');
+  if (c.supplier) out.push('<span>' + esc(c.supplier) + '</span>');
+  return out.length ? '<div class="facts">' + out.join('') + '</div>' : '';
+}
+/** 期限シール — 「あり」のときだけ赤で出す。「なし」は出さない (中原さん 2026-09-05) */
+function sealHtml(c) {
+  return c.master && c.master.expiry_seal === 1
+    ? '<div class="seal">🏷 期限シールあり — 貼り忘れに注意してください</div>' : '';
+}
+/** 気をつけること — 上部に強調して出す (作業前に必ず目に入るように) */
+function careHtml(c) {
+  const note = c.master && c.master.note;
+  return note ? '<div class="care"><label>気をつけること</label><div class="v">' + esc(note) + '</div></div>' : '';
+}
+/** 大きさの表示名 */
+function sizeClassText(v) {
+  return v === 'L' ? '大' : v === 'M' ? '中' : v === 'S' ? '小' : null;
+}
+
 /** 下見・履歴で開いたときの注意書き。何が「いつ時点」かを項目ごとに分けて出す (Codex R4 Q5) */
 function detailNoteHtml(c) {
   if (detailSrc !== 'preview') return '';
@@ -2092,11 +2412,6 @@ function renderDetail(c, opts) {
 
   const m = c.master;
   const missSet = new Set(m.missing);
-  const live = [];
-  if (c.sales_text) live.push(c.sales_text);
-  if (c.live.free_stock != null) live.push('フリー在庫 ' + c.live.free_stock + '個');
-  const prio = (c.priority.kind === 'urgent' ? '🔥 ' : '') + c.priority.label;
-
   $('#dbody').innerHTML =
     detailNoteHtml(c) +
     '<div class="dcard"><div class="dhead">' +
@@ -2106,11 +2421,14 @@ function renderDetail(c, opts) {
         (c.barcode ? ' ・ JAN <span class="bcode">' + esc(c.barcode) + '</span>' : '') +
         (c.arrival ? ' ・ 入庫 ' + esc(c.arrival) : '') +
         (c.ar_no ? ' ・ ' + esc(c.ar_no) : '') + '</div>' +
-      '<div class="qty">つくる数: <b>' + esc(c.qty != null ? c.qty : '—') + '</b> 個</div>' +
-      '</div></div></div>' +
+      headNumsHtml(c) +
+      headFactsHtml(c) +
+      '</div></div>' +
+      sealHtml(c) + careHtml(c) +
+      '</div>' +
     prevCardHtml(c) +
 
-    '<div class="dcard"><h3 class="sec">作業のやり方</h3><div class="kvs">' +
+    '<div class="dcard"><h3 class="sec">作業情報</h3><div class="kvs">' +
       kv('資材', m.material_code, { miss: missSet.has('資材'), reg: 'material_code' }) +
       kv('保管箱', m.storage_container, { miss: missSet.has('保管箱'), reg: 'storage_container' }) +
       kv('入数 (保管箱1つに入れる数)', m.units_per_container != null ? m.units_per_container + '個' : null,
@@ -2120,13 +2438,10 @@ function renderDetail(c, opts) {
         c.loc_stock == null ? null
           : c.loc_stock + '個 (引当 ' + (c.loc_allocated || 0) + ' → 使えるのは ' + c.loc_free + '個)'
             + (c.loc_at ? ' ・ ' + fmtDate(c.loc_at) + ' ' + fmtTime(c.loc_at) + ' 時点' : '')) +
-      kv('必要保管箱', c.boxes) +
-      kv('想定作業時間', c.plan_hours != null ? c.plan_hours + ' 時間' : null) +
       kv('気をつけること', m.note, { reg: 'note' }) +
-      kv('期限', c.expiry ? c.expiry : '期限シールなし') +
-      kv('参考', [prio, ...live].join(' ・ ')) +
-      (c.external_text ? kv('外部出し目安', c.external_text) : '') +
-      (c.supplier ? kv('取引先', c.supplier) : '') +
+      kv('期限シール', m.expiry_seal == null ? null : (m.expiry_seal ? 'あり (赤で上に出します)' : 'なし'), { reg: 'expiry_seal' }) +
+      kv('大きさ', sizeClassText(m.size_class), { reg: 'size_class' }) +
+      (c.expiry ? kv('この入荷の有効期限', c.expiry) : '') +
     '</div>' +
       (can('task.master.edit')
         ? '<p class="nlink">直したい項目をタップしてください。空欄の登録はだれでもできます。入っている値の変更は職員PINが必要です。</p>' : '') +
@@ -2488,7 +2803,7 @@ let mvSaving = false;
 let mvCtx = null;   // { pageId, code, version, values }
 const MV_MAP = { material_code: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
   // 作り方動画のリンクは画面から外した (中原さん 2026-09-03)。DB の video_url と API は残してあるので、戻すときはここに足す
-  process_count: 'mvProcess', note: 'mvNote', size_class: 'mvSize' };
+  process_count: 'mvProcess', note: 'mvNote', size_class: 'mvSize', expiry_seal: 'mvSeal' };
 /** 大きさの選択肢 (明日どれをやるかの並びに使う。ふだんは配送方法から見なす — 要件 §W-2) */
 const SIZE_OPTS = [['L', '大'], ['M', '中'], ['S', '小'], ['', '未登録']];
 function renderSizeOpts() {
@@ -2501,6 +2816,21 @@ $('#mvSizeOpts').addEventListener('click', (e) => {
   if (!b) return;
   $('#mvSize').value = b.dataset.size;
   renderSizeOpts();
+});
+/** 期限シール: あり / なし / 未登録。貼り忘れると出荷できないので、あるときだけ上に赤で出す */
+const SEAL_OPTS = [['1', 'あり'], ['0', 'なし'], ['', '未登録']];
+function renderSealOpts() {
+  const el = $('#mvSealOpts');
+  if (!el) return;
+  const cur = $('#mvSeal').value || '';
+  el.innerHTML = SEAL_OPTS.map(([v, l]) =>
+    '<button type="button" class="opt' + (cur === v ? ' on' : '') + '" data-seal="' + v + '">' + l + '</button>').join('');
+}
+$('#mvSealOpts').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-seal]');
+  if (!b) return;
+  $('#mvSeal').value = b.dataset.seal;
+  renderSealOpts();
 });
 
 // ─── ダイアログの開け閉め (背景を止める・元の場所へフォーカスを戻す・Tab を中に閉じ込める) ───
@@ -2556,7 +2886,7 @@ function mvValues(m) {
 }
 
 const MV_TITLE = { material_code: '資材', storage_container: '保管箱', units_per_container: '入数',
-  process_count: '工程数', note: '気をつけること' };
+  process_count: '工程数', note: '気をつけること', size_class: '大きさ', expiry_seal: '期限シール' };
 /**
  * 作業のやり方の登録・変更。**タップした項目だけ**を出す (中原さん 2026-09-03:
  * 保管箱をタップしたら保管箱だけ)。field を指定しなければ全部出す
@@ -2571,6 +2901,7 @@ function openMaster(field) {
   mvCtx = { cardId: c.id, code: c.product_code, version: c.master.version, values: cur, field: MV_MAP[field] ? field : null };
   for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur[f];
   renderSizeOpts();
+  renderSealOpts();
   optNewKind = null; renderOpts('material'); renderOpts('container');
   // 出す項目を絞る (他は隠すだけ。保存は「開いた時点との差分」なので触っていない項目は送られない)
   for (const el of document.querySelectorAll('#mvOv .mvf')) {
@@ -3011,7 +3342,7 @@ async function doSetSt(choice) {
 // ─── 起動・巡回 ───
 restoreSnapshot();   // まず前回の一覧を出す (サーバーが再起動中でも画面は出る)。その後すぐ最新を取りにいく
 loadState();
-setInterval(() => { if (!stSaving && !reconnectTimer) loadState(); }, 60_000);   // 再接続の予約中は任せる (loadState は同時1本)
+setInterval(() => { if (!stSaving && !reconnectTimer && !DND.on) loadState(); }, 60_000);   // 再接続の予約中・ドラッグ中は待つ (loadState は同時1本)
 // iPad はバックグラウンドでタイマーが止まる → 前面に戻った・回線が戻った時は即つなぎ直す (Codex #7)
 const wake = () => { if (document.visibilityState === 'visible' && !stSaving) loadState(); };
 document.addEventListener('visibilitychange', wake);
