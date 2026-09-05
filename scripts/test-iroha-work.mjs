@@ -3624,7 +3624,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok((html.match(/\['unblocked', '止まっていない'\]/g) || []).length === 2 && /curTab === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html)
     && /curWhen === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html) && /c\.unblocked = c\.all - c\.blocked;/.test(html),
     '「止まっていない」(⛔ を除く) の絞り込みが一覧とボードの両方にある (中原さん 2026-09-05)');
-  ok(/async function completeStocked\(entries, \{ fromBulk = false \} = \{\}\)/.test(html) && /const okGo = await ask\(\{[\s\S]{0,700}\}\);\s*if \(!okGo\) return;\s*\/\/ ② 職員PIN/.test(html),
+  ok(/async function completeStocked\(entries, \{ fromBulk = false \} = \{\}\)/.test(html) && /const okGo = await ask\(\{[\s\S]{0,700}\}\);\s*if \(!okGo\) return;\s*\/\/ ② 職員PIN/.test(html)
+    && /if \(stockInflight\) return;\s*stockInflight = true;\s*try \{ await completeStockedInner\(entries, \{ fromBulk \}\); \}\s*finally \{ stockInflight = false; \}/.test(html)
+    && /if \(curWhen === 'unblocked' && !\(\(bs\.cards \|\| \[\]\)\.some\(\(c\) => c\.blocked\)\)\) curWhen = 'all';/.test(html),
     'まとめて棚入完了は「先に確認 (何を・戻せない) → 次に PIN」のワンクッション (中原さん 2026-09-05)');
   ok(/async function stockOne\(id\)/.test(html) && /function stockBtnHtml\(c\)/.test(html) && (html.match(/closest\('\[data-stock-of\]'\)/g) || []).length === 2
     && /c\.status !== 'ready_for_stocking' \|\| bulkIds \|\| !isApp\(\) \|\| !stateCan\('tasks\.bulk_stocked'\) \|\| !isStaffUI\(\)/.test(html),

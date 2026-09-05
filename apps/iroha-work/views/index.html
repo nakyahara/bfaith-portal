@@ -1680,7 +1680,7 @@ function whenChips() {
   // 「⛔ 止まっている」は旧「保留」列の代わり (案A: 保留は進捗ではなく札なので、列ではなく絞り込み)。1 件以上あるときだけ
   const blockedN = cards.filter(c => c.blocked).length;
   // 「止まっていない」= ⛔ を除く (中原さん 2026-09-05)。⛔ と同じく 1 件以上あるときだけ
-  const showBlk = blockedN > 0 || curWhen === 'blocked' || curWhen === 'unblocked';
+  const showBlk = blockedN > 0 || curWhen === 'blocked';
   return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定'],
     ...(showBlk ? [['blocked', '⛔ 止まっている'], ['unblocked', '止まっていない']] : [])]
     .map(([v, l]) => '<button class="chip' + (curWhen === v ? ' on' : '') + '" data-when="' + v + '">' + l +
@@ -1778,6 +1778,8 @@ function renderBoard() {
   const bs = boardState();
   if (!bs) { $('#board').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
   renderPreviewNote();
+  // 「止まっていない」は ⛔ が 0 件になったら「すべて」と同じ → 一覧と同じく「すべて」へ戻す (Codex PR #1209 R2)
+  if (curWhen === 'unblocked' && !((bs.cards || []).some((c) => c.blocked))) curWhen = 'all';
   $('#gaugeWrap').innerHTML = planButtonHtml();
   $('#colSeg').innerHTML = colSegHtml();
   $('#facChips').innerHTML = facChips();
@@ -2674,8 +2676,15 @@ function syncBulkSelection(visible) {
  * 何を終了にするかを一覧で見せて「はい」を押してもらい、そのあと PIN。終了にすると一覧から外れる (履歴には残る) ことも書く
  * @param entries [{ id, version }] 選んだときに見えていた版 (別の端末が変えていたら、その 1 枚は飛ばされる)
  */
+let stockInflight = false;   // 確認〜送信の間はもう一度押せない (同じカードを 2 回送って「0 件完了」と出さない — Codex PR #1209 R2)
 async function completeStocked(entries, { fromBulk = false } = {}) {
   if (!stateCan('tasks.bulk_stocked')) return;   // 許可リストに無ければ動かない (ボタンも描いていない。二重の守り)
+  if (stockInflight) return;
+  stockInflight = true;
+  try { await completeStockedInner(entries, { fromBulk }); }
+  finally { stockInflight = false; }
+}
+async function completeStockedInner(entries, { fromBulk = false } = {}) {
   const items = (entries || []).filter((x) => x && x.id != null);
   if (!items.length) { toast('カードを選んでください'); return; }
   const w = worker;
