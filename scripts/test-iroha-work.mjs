@@ -3617,6 +3617,20 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '止まっているカードは一覧・ボードともカードごと赤くする (資材不足を見落とさない — 中原さん 2026-09-05)');
   ok(/<div class="overlay" id="facOv">/.test(html) && !/class="ov" id="facOv"/.test(html) && !/<div class="ov"/.test(html),
     '「どこが」の拠点えらびは他と同じ overlay で開く (class="ov" には CSS が無く、押しても出なかった — 中原さん 2026-09-05)');
+  ok(/function openWhenPick\(id\)/.test(html) && /id="whenOv"/.test(html) && /openWhenPick\(whenBtn\.dataset\.whenOf\)/.test(html)
+    && /\[\['today', '📌 今日やる'\], \['tomorrow', '明日やる'\], \['', '未定にする'\]\]/.test(html) && /if \(!stateCan\('task\.plan\.assign'\)\) return;          \/\/ 許可が無ければ開かない/.test(html),
+    '「いつ」の札は 今日やる / 明日やる / 未定 から選ぶ (未定から今日も選べる — 中原さん 2026-09-05)。職員だけ');
+  ok(/closeUnblock\(\); closeFacPick\(\); closeWhenPick\(\); closeDetail\(\);/.test(html), 'Esc で いつ・どこが の選択も閉じる');
+  ok((html.match(/\['unblocked', '止まっていない'\]/g) || []).length === 2 && /curTab === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html)
+    && /curWhen === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html) && /c\.unblocked = c\.all - c\.blocked;/.test(html),
+    '「止まっていない」(⛔ を除く) の絞り込みが一覧とボードの両方にある (中原さん 2026-09-05)');
+  ok(/async function completeStocked\(entries, \{ fromBulk = false \} = \{\}\)/.test(html) && /const okGo = await ask\(\{[\s\S]{0,700}\}\);\s*if \(!okGo\) return;\s*\/\/ ② 職員PIN/.test(html)
+    && /if \(stockInflight\) return;\s*stockInflight = true;\s*try \{ await completeStockedInner\(entries, \{ fromBulk \}\); \}\s*finally \{ stockInflight = false; \}/.test(html)
+    && /if \(curWhen === 'unblocked' && !\(\(bs\.cards \|\| \[\]\)\.some\(\(c\) => c\.blocked\)\)\) curWhen = 'all';/.test(html),
+    'まとめて棚入完了は「先に確認 (何を・戻せない) → 次に PIN」のワンクッション (中原さん 2026-09-05)');
+  ok(/async function stockOne\(id\)/.test(html) && /function stockBtnHtml\(c\)/.test(html) && (html.match(/closest\('\[data-stock-of\]'\)/g) || []).length === 2
+    && /c\.status !== 'ready_for_stocking' \|\| bulkIds \|\| !isApp\(\) \|\| !stateCan\('tasks\.bulk_stocked'\) \|\| !isStaffUI\(\)/.test(html),
+    '棚入待ちのカードに ✅ 棚入完了 (1 枚ずつ。職員モードだけ・まとめて選択中は出さない) — 一覧とボードの両方');
   ok(!/on_hold/.test(html) && !/holdReasons/.test(html) && !/hold_qty/.test(html), '画面から旧「保留」(on_hold / holdReasons / hold_qty) が消えている');
   ok(/function canEditProgress\(c\)/.test(html)
     && /c\.status !== 'closed' && c\.status !== 'ready_for_stocking'/.test(html)

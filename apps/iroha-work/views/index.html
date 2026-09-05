@@ -279,6 +279,9 @@
   .bulkbar .cnt{font-family:var(--num);font-weight:700;font-size:1.05rem}
   .bulkbar button{border:0;border-radius:var(--r);padding:10px 16px;font-weight:700;font-size:.95rem;cursor:pointer}
   .bulkbar .go{background:var(--ok);color:#fff;margin-left:auto}
+  /* ✅ 棚入待ち → 棚入完了 (1 枚ずつ。職員モードだけ) — 中原さん 2026-09-05 */
+  .stockbtn{flex:none;border:1px solid var(--ok);background:var(--ok-soft);color:var(--ok);border-radius:var(--r-sm);padding:6px 10px;font-weight:700;font-size:.85rem;cursor:pointer;min-height:36px;margin-right:6px}
+  .bcard .stockbtn{margin:6px 0 0;display:inline-block}
   .bulkbar .cancel{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.45)}
 
   /* ── 表 (ラベル待ち・履歴) ── */
@@ -982,6 +985,16 @@
     </div>
   </div>
 
+  <!-- ══ いつ作業するか (「いつ」の札から。職員だけ。中原さん 2026-09-05: 未定からも「今日」を選べるように) ══ -->
+  <div class="overlay" id="whenOv">
+    <div class="modal">
+      <h3 id="whenTitle">いつ作業しますか?</h3>
+      <div class="opts chips" id="whenOpts"></div>
+      <p class="msg" id="whenMsg"></p>
+      <div class="mbtns"><button class="btn" onclick="closeWhenPick()">やめる</button></div>
+    </div>
+  </div>
+
   <!-- ══ 作業者選択 ══ -->
   <div class="gate" id="gate">
     <div class="gwrap">
@@ -1058,8 +1071,10 @@ const can = (name) => detailCaps.includes(name);
 const stateCan = (name) => (state.capabilities || []).includes(name);
 /** 正本が切り替わると状態の値も変わる (未着手 ↔ not_started)。無い値を選んだままだと一覧が空に見えるので「すべて」に戻す */
 function ensureTabValid() {
-  const valid = new Set(['all', 'blocked', 'today', ...statusTabs().map(([v]) => v)]);
+  const valid = new Set(['all', 'blocked', 'unblocked', 'today', ...statusTabs().map(([v]) => v)]);
   if (!valid.has(curTab)) curTab = 'all';
+  // 「止まっていない」は止まっているカードが 1 件以上あるときだけ出す → 0 件になったら「すべて」へ
+  if (curTab === 'unblocked' && !(state && (state.cards || []).some((c) => c.blocked))) curTab = 'all';
   // 「今日やる」のタブは 1 件以上あるときだけ出す → 0 件になったら「すべて」へ
   if (curTab === 'today' && !(state && (state.cards || []).some((c) => c.today))) curTab = 'all';
 }
@@ -1360,6 +1375,7 @@ function counts() {
     if (card.blocked) c.blocked++;   // ⛔ 止まっている (進捗とは別の札 — 案A)
     if (card.today) c.today++;       // 📌 今日やる (監修 F-6)
   }
+  c.unblocked = c.all - c.blocked;   // 止まっていない (⛔ を除く — 中原さん 2026-09-05)
   return c;
 }
 
@@ -1367,7 +1383,9 @@ function renderTabs() {
   const c = counts();
   // 「⛔ 止まっている」は進捗のタブではなく札の絞り込み。1 件以上あるときだけ出す
   // 「📌 今日やる」は進捗ではなく予定の絞り込み。朝いちばんに見るので先頭 (監修 F-6)。1 件以上あるときだけ
-  const tabs = [['all', 'すべて'], ...(c.today > 0 ? [['today', '📌 今日やる']] : []), ...statusTabs(), ...(c.blocked > 0 ? [['blocked', '⛔ 止まっている']] : [])];
+  // ⛔ が 1 件以上あるときだけ「止まっている」と、その除外「止まっていない」を出す (中原さん 2026-09-05)
+  const tabs = [['all', 'すべて'], ...(c.today > 0 ? [['today', '📌 今日やる']] : []), ...statusTabs(),
+    ...(c.blocked > 0 ? [['blocked', '⛔ 止まっている'], ['unblocked', '止まっていない']] : [])];
   $('#tabs').innerHTML = tabs.map(([key, label]) =>
     '<button class="chip' + (curTab === key ? ' on' : '') + '" onclick="pickTab(\'' + esc(key) + '\')">' +
     esc(label) + ' <span class="num">' + (c[key] ?? 0) + '</span></button>').join('');
@@ -1405,6 +1423,7 @@ function visibleCards() {
   const q = $('#q').value.trim().toLowerCase();
   return state.cards.filter(c => {
     if (curTab === 'blocked') { if (!c.blocked) return false; }
+    else if (curTab === 'unblocked') { if (c.blocked) return false; }
     else if (curTab === 'today') { if (!c.today) return false; }
     else if (curTab !== 'all' && c.status !== curTab) return false;
     if (!q) return true;
@@ -1465,6 +1484,7 @@ function renderList() {
       '<div class="meta num">' + meta + '</div>' +
       (meta2 ? '<div class="meta2 num">' + meta2 + '</div>' : '') + '</div>' +
       // 状態: 変更が許されていればタップできる札 (data-st)、許されていなければただの札
+      (selectable ? '' : stockBtnHtml(c)) +
       (selectable ? ''
         : stateCan('task.status.change')
           ? '<button class="st ' + stClass(c.status) + '" data-st="' + esc(c.id) + '">' + esc(stLabel(c)) + ' ▾</button>'
@@ -1477,6 +1497,8 @@ function renderList() {
 $('#q').addEventListener('input', renderList);
 // 一覧のクリックも委譲 (状態の札 / 選択 / 詳細)
 $('#list').addEventListener('click', (e) => {
+  const stockBtn = e.target.closest('[data-stock-of]');
+  if (stockBtn) { e.stopPropagation(); stockOne(stockBtn.dataset.stockOf); return; }   // ✅ 1 枚だけ棚入完了
   const st = e.target.closest('[data-st]');
   if (st) { e.stopPropagation(); openSt(e, st.dataset.st); return; }
   const row = e.target.closest('[data-id]');
@@ -1652,12 +1674,15 @@ function colSegHtml() {
 function whenChips() {
   const cards = ((boardState() || {}).cards || []);
   const n = (v) => (v === 'all' ? cards.length : v === 'none' ? cards.filter(c => !c.when).length
-    : v === 'blocked' ? cards.filter(c => c.blocked).length : cards.filter(c => c.when === v).length);
+    : v === 'blocked' ? cards.filter(c => c.blocked).length : v === 'unblocked' ? cards.filter(c => !c.blocked).length
+    : cards.filter(c => c.when === v).length);
   // 札に出る「いつ」は絞り込みでも選べるようにする (やり残しだけ見たい、があるため — Codex P2 R1)。
   // 「⛔ 止まっている」は旧「保留」列の代わり (案A: 保留は進捗ではなく札なので、列ではなく絞り込み)。1 件以上あるときだけ
   const blockedN = cards.filter(c => c.blocked).length;
+  // 「止まっていない」= ⛔ を除く (中原さん 2026-09-05)。⛔ と同じく 1 件以上あるときだけ
+  const showBlk = blockedN > 0 || curWhen === 'blocked';
   return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定'],
-    ...(blockedN > 0 || curWhen === 'blocked' ? [['blocked', '⛔ 止まっている']] : [])]
+    ...(showBlk ? [['blocked', '⛔ 止まっている'], ['unblocked', '止まっていない']] : [])]
     .map(([v, l]) => '<button class="chip' + (curWhen === v ? ' on' : '') + '" data-when="' + v + '">' + l +
       ' <span class="num">' + n(v) + '</span></button>').join('');
 }
@@ -1715,7 +1740,9 @@ $('#board').addEventListener('click', (e) => {
   const facBtn = e.target.closest('[data-fac-of]');
   if (facBtn) { e.stopPropagation(); openFacPick(facBtn.dataset.facOf); return; }
   const whenBtn = e.target.closest('[data-when-of]');
-  if (whenBtn) { e.stopPropagation(); toggleTomorrow(whenBtn.dataset.whenOf); return; }
+  if (whenBtn) { e.stopPropagation(); openWhenPick(whenBtn.dataset.whenOf); return; }   // 今日 / 明日 / 未定 から選ぶ
+  const stockBtn = e.target.closest('[data-stock-of]');
+  if (stockBtn) { e.stopPropagation(); stockOne(stockBtn.dataset.stockOf); return; }   // ✅ 1 枚だけ棚入完了
   const el = e.target.closest('[data-id]');
   if (!el) return;
   // 下見 (正本が Notion) でも詳細は読むだけで開ける (中原さん 2026-09-03「これで何がどう変わるのか想像できない」)
@@ -1738,6 +1765,7 @@ function boardCards() {
     if (curFacility !== 'all' && (curFacility === 'none' ? !!c.facility_code : c.facility_code !== curFacility)) return false;
     // 「⛔ 止まっている」は予定の値ではなく札の絞り込み (案A)
     if (curWhen === 'blocked') { if (!c.blocked) return false; }
+    else if (curWhen === 'unblocked') { if (c.blocked) return false; }
     else if (curWhen !== 'all' && (curWhen === 'none' ? !!c.when : c.when !== curWhen)) return false;
     if (!q) return true;
     return String(c.title).toLowerCase().includes(q) || String(c.product_code || '').toLowerCase().includes(q);
@@ -1750,6 +1778,8 @@ function renderBoard() {
   const bs = boardState();
   if (!bs) { $('#board').innerHTML = '<div class="colempty">読み込み中…</div>'; return; }
   renderPreviewNote();
+  // 「止まっていない」は ⛔ が 0 件になったら「すべて」と同じ → 一覧と同じく「すべて」へ戻す (Codex PR #1209 R2)
+  if (curWhen === 'unblocked' && !((bs.cards || []).some((c) => c.blocked))) curWhen = 'all';
   $('#gaugeWrap').innerHTML = planButtonHtml();
   $('#colSeg').innerHTML = colSegHtml();
   $('#facChips').innerHTML = facChips();
@@ -1778,6 +1808,11 @@ function renderBoard() {
 }
 /** 掴み手。⭐動かせるときだけ描く (動かせないのに掴めるように見せない — 要件 §U-7) */
 function gripHtml() { return '<span class="grip" data-grip aria-hidden="true">⠿</span>'; }
+/** 棚入待ちのカードに「✅ 棚入完了」(職員モードだけ。まとめて選んでいる間は出さない) — 中原さん 2026-09-05 */
+function stockBtnHtml(c) {
+  if (c.status !== 'ready_for_stocking' || bulkIds || !isApp() || !stateCan('tasks.bulk_stocked') || !isStaffUI()) return '';
+  return '<button class="stockbtn" data-stock-of="' + esc(c.id) + '">✅ 棚入完了</button>';
+}
 function bcardHtml(c, status) {
   const selectable = bulkIds && status === 'ready_for_stocking';
   // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
@@ -1800,7 +1835,7 @@ function bcardHtml(c, status) {
     // ⛔ 止まっている理由は赤い 1 行で (小さな文字に埋めない — 中原さん 2026-09-05)
     (c.blocked ? '<div class="bblk">⛔ ' + esc(c.blocked.label) + 'で止まっています</div>' : '') +
     (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') +
-    planTagsHtml(c) + '</div></div>';
+    planTagsHtml(c) + stockBtnHtml(c) + '</div></div>';
 }
 
 /**
@@ -1827,6 +1862,34 @@ function planTagsHtml(c) {
 
 // ─── ⭐「いつ」「どこが」を変える (職員だけ。要件 §W-4) ───
 /** 「明日やる」↔「未定」を切り替える。今日やる分・やり残しは「明日の計画」で扱う */
+// ─── ⭐「いつ」の札 → 今日やる / 明日やる / 未定 を選ぶ (中原さん 2026-09-05: 未定から「今日」も選べるように。以前は 明日やる↔未定 の切替だけだった) ───
+let whenPickCtx = null;   // { id, saving }
+function openWhenPick(id) {
+  if (!stateCan('task.plan.assign')) return;          // 許可が無ければ開かない (札もボタンにしていない)
+  const c = findCard(id);
+  if (!c) return;
+  if (!worker) { openGate(); return; }
+  whenPickCtx = { id, saving: false };
+  $('#whenTitle').textContent = '「' + c.title + '」はいつ作業しますか?';
+  $('#whenMsg').textContent = '';
+  const opts = [['today', '📌 今日やる'], ['tomorrow', '明日やる'], ['', '未定にする']];
+  const cur = c.when === 'today' || c.when === 'tomorrow' ? c.when : '';
+  $('#whenOpts').innerHTML = opts.map(([v, l]) => '<button type="button" class="opt' + (v === cur ? ' on' : '') + '" data-pick-when="' + v + '">' + esc(l) + '</button>').join('');
+  openOverlay('#whenOv');
+}
+function closeWhenPick() { if (whenPickCtx && whenPickCtx.saving) return; closeOverlay('#whenOv'); whenPickCtx = null; }
+$('#whenOpts').addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-pick-when]');
+  if (!b || !whenPickCtx || whenPickCtx.saving) return;   // 送信中の連打は受けない
+  whenPickCtx.saving = true;
+  const { id } = whenPickCtx;
+  const want = b.dataset.pickWhen || null;
+  $('#whenMsg').textContent = '保存しています…';
+  try { await toggleTomorrow(id, want); }
+  finally { if (whenPickCtx) whenPickCtx.saving = false; closeWhenPick(); }
+});
+$('#whenOv').addEventListener('click', (e) => { if (e.target === $('#whenOv')) closeWhenPick(); });
+
 async function toggleTomorrow(id, want) {
   if (!stateCan('task.plan.assign')) return;          // 許可が無ければ動かない (札もボタンにしていない)
   const c = findCard(id);
@@ -1842,7 +1905,9 @@ async function toggleTomorrow(id, want) {
   applyTask(c, j.task);
   if (j.staff_mode) state.staff_mode = j.staff_mode;
   redrawAfterPlan();
-  toast(next ? '「' + c.title + '」を明日やる分に入れました' : '「' + c.title + '」を明日やる分から外しました');
+  toast(next === 'today' ? '「' + c.title + '」を今日やる分にしました (一覧の上に出ます)'
+    : next === 'tomorrow' ? '「' + c.title + '」を明日やる分に入れました'
+    : '「' + c.title + '」の予定を未定にしました');
 }
 
 /**
@@ -2606,30 +2671,60 @@ function syncBulkSelection(visible) {
   if (dropped > 0) toast(dropped + ' 件は絞り込みで見えなくなったので選択から外しました');
   renderBulk();
 }
-async function doBulkStocked() {
+/**
+ * 棚入完了にする (まとめて・1 枚) — 職員だけ。⭐**先に確認、次に PIN** (中原さん 2026-09-05「ワンクッション入れて」):
+ * 何を終了にするかを一覧で見せて「はい」を押してもらい、そのあと PIN。終了にすると一覧から外れる (履歴には残る) ことも書く
+ * @param entries [{ id, version }] 選んだときに見えていた版 (別の端末が変えていたら、その 1 枚は飛ばされる)
+ */
+let stockInflight = false;   // 確認〜送信の間はもう一度押せない (同じカードを 2 回送って「0 件完了」と出さない — Codex PR #1209 R2)
+async function completeStocked(entries, { fromBulk = false } = {}) {
   if (!stateCan('tasks.bulk_stocked')) return;   // 許可リストに無ければ動かない (ボタンも描いていない。二重の守り)
-  if (!bulkIds || bulkIds.size === 0) { toast('カードを選んでください'); return; }
+  if (stockInflight) return;
+  stockInflight = true;
+  try { await completeStockedInner(entries, { fromBulk }); }
+  finally { stockInflight = false; }
+}
+async function completeStockedInner(entries, { fromBulk = false } = {}) {
+  const items = (entries || []).filter((x) => x && x.id != null);
+  if (!items.length) { toast('カードを選んでください'); return; }
   const w = worker;
   if (!w) { openGate(); return; }
-  const ids = [...bulkIds.keys()];
+  if (!state.me.session && w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです (右上の名前を職員に替えてください)'); return; }
+  const names = items.map((x) => (findCard(x.id) || {}).title).filter(Boolean);
+  const list = names.slice(0, 8).join('\n') + (names.length > 8 ? '\n…ほか ' + (names.length - 8) + ' 件' : '');
+  // ① 確認 (ワンクッション)。何を終了にするか・戻せない (一覧から外れる) ことを見せる
+  const okGo = await ask({
+    title: items.length === 1 ? '「' + (names[0] || '') + '」を棚入完了にしますか?' : '本当に ' + items.length + ' 件を棚入完了にしますか?',
+    text: (items.length === 1 ? '' : list + '\n\n') + '棚に入れ終わったものだけにしてください。終了にすると一覧から外れます (履歴には残ります)',
+    ok: items.length === 1 ? 'はい、棚入完了にする' : 'はい、' + items.length + ' 件を棚入完了にする', cancel: 'やめる', danger: true,
+  });
+  if (!okGo) return;
+  // ② 職員PIN (端末から。ポータルから入っている人は職員なので要らない)
   let pin = null;
   if (!state.me.session) {
-    if (w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです'); return; }
-    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください (' + ids.length + ' 件を棚入完了にします)', input: 'pin', ok: 'つづける' });
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '棚入完了にする' });
     if (pin == null) return;
   }
-  const names = ids.map(id => (findCard(id) || {}).title).filter(Boolean);
-  const list = names.slice(0, 8).join('\n') + (names.length > 8 ? '\n…ほか ' + (names.length - 8) + ' 件' : '');
-  if (!(await ask({ title: ids.length + ' 件を棚入完了にします', text: list, ok: '棚入完了にする' }))) return;
   const j = await apiFetch('/api/bulk-stocked', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids: ids.map((id) => ({ id, version: bulkIds.get(id) })), worker_id: w.id, pin }) });
+    body: JSON.stringify({ ids: items.map((x) => ({ id: x.id, version: x.version })), worker_id: w.id, pin }) });
   if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
   const skipped = (j.skipped || []).length;
   // 飛ばした理由は「状態が変わった」だけではない (作業中・見つからない・すでに完了) — 理由は下の警告に出す
   toast(j.done.length + ' 件を棚入完了にしました' + (skipped ? ' (' + skipped + ' 件は棚入完了にできませんでした)' : ''));
   if (skipped) showWarn((j.skipped || []).map(x => (x.title || '#' + x.id) + ': ' + bulkSkipLabel(x.reason)).join(' / '));
-  exitBulk();
+  if (fromBulk) exitBulk();
   await loadState();
+}
+async function doBulkStocked() {
+  if (!stateCan('tasks.bulk_stocked')) return;   // 許可リストに無ければ動かない (ボタンも描いていない。二重の守り)
+  if (!bulkIds || bulkIds.size === 0) { toast('カードを選んでください'); return; }
+  await completeStocked([...bulkIds.entries()].map(([id, version]) => ({ id, version })), { fromBulk: true });
+}
+/** 棚入待ちのカード 1 枚を棚入完了に (ボード・一覧の ✅ から — 中原さん 2026-09-05「個別に完了できるように」) */
+async function stockOne(id) {
+  const c = findCard(id);
+  if (!c || c.status !== 'ready_for_stocking') { showErr('棚入待ちのカードではありません。画面を更新します'); loadState(); return; }
+  await completeStocked([{ id: c.id, version: c.version }]);
 }
 const BULK_SKIP = { already: 'すでに棚入完了', not_ready: '棚入待ちではありません', not_found: '見つかりません',
   conflict: '同時に変更されました', active_sessions: '作業中の人がいます' };
@@ -4681,7 +4776,7 @@ if ('serviceWorker' in navigator) {
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if ($('#askOv').classList.contains('on')) { askDone(false); return; }   // 確認ダイアログだけ閉じる (下のダイアログは残す)
-  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeFacPick(); closeDetail();
+  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeFacPick(); closeWhenPick(); closeDetail();
 });
 </script>
 </body>
