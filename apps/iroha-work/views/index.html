@@ -3429,7 +3429,7 @@ function closeOverlay(sel) {
   // 自分のぶんをスタックから外す (順不同で閉じられても残りの戻り先を壊さない)
   const i = overlayStack.map((e) => e.sel).lastIndexOf(sel);
   const entry = i >= 0 ? overlayStack.splice(i, 1)[0] : null;
-  const focusBack = (el) => { try { if (el && el.focus && document.contains(el)) el.focus(); } catch (e) { /* 消えていれば何もしない */ } };
+  const focusBack = (el) => { try { if (el && el.focus && document.contains(el)) el.focus({ preventScroll: true }); } catch (e) { /* 消えていれば何もしない */ } };
   if (document.querySelectorAll('.overlay.on').length > 0) {
     // 下にダイアログが残っている (ask を閉じたときなど) → 開く前にいた要素 (下のダイアログの中) へ戻す。スクロールは触らない
     focusBack(entry && entry.ret);
