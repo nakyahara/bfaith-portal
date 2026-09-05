@@ -63,6 +63,7 @@ import rankcheckServiceRouter from './rankcheck-service.js';
 import crossSellServiceRouter from './cross-sell-service.js';
 import selectSetServiceRouter from './select-set-service.js';
 import logizardStockServiceRouter from './logizard-stock-service.js';
+import logizardExportServiceRouter from './logizard-export-service.js';
 import neProductsServiceRouter from './ne-products-service.js';
 router.use('/fba', fbaServiceRouter);
 router.use('/research', researchServiceRouter);
@@ -74,6 +75,9 @@ router.use('/rankcheck', rankcheckServiceRouter);
 router.use('/cross-sell', crossSellServiceRouter);
 router.use('/select-set', selectSetServiceRouter);
 router.use('/logizard-stock', logizardStockServiceRouter);
+// ★ロジザードCSVのオンデマンド取得 (入荷受付チェック iPad の「いま取りに行く」)。
+//   既に毎日動いている取得スクリプトを人の操作で1回走らせるだけ (新しい取得先は増やさない)
+router.use('/logizard', logizardExportServiceRouter);
 router.use('/ne-products', neProductsServiceRouter);
 
 // --- エラーハンドラー（最後） ---

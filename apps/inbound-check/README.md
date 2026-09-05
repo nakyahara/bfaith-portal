@@ -22,6 +22,7 @@
 | `/apps/inbound-check/api/product-flags` (POST) | 同上 | 期限管理 あり/なし を切り替える |
 | `/apps/inbound-check/api/lines/pending-expiry` (POST) | 同上 | 有効期限の先入力 (詳細パネル。入れてあれば確認時に聞かない) |
 | `/apps/inbound-check/api/notion-sync` (POST) | 同上 | Notion 作業カードを今すぐ送る (iPadのヘッダーボタン。冪等) |
+| `/apps/inbound-check/api/refresh-now` (POST) | 同上 | 🚚 **いま入荷を取りに行く** (miniPC にロジザードから CSV を出し直させて取り込む。予定外の納品用) |
 | `/apps/inbound-check/done` | 登録端末 or セッション | **完了一覧** (確認し終えた伝票の 商品・数量・期限。画像なし・印刷可) |
 | `/apps/inbound-check/api/done` `/done.csv` | 同上 | 完了一覧の JSON / CSV |
 | `/apps/inbound-check/admin/destinations(.csv)` | ポータルセッション | 行き先の台帳 (いろはへ送る商品の一覧) |
@@ -66,6 +67,36 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
     保管ロケの空いているところに入れてよい (中原さん 2026-09-01)。取得失敗ではなく正常な状態なので警告色にしない。
     実測では 16行中5行がこれに当たる (在庫ミラーには在庫0の商品の行が無いため)
 - 保持期間: superseded バッチとその子 = 365日、取込ログ = 90日 (取込時に掃除)
+
+## 🚚 いま入荷を取りに行く — 予定外の納品を定時を待たずに出す (2026-09-05)
+
+中原さん 2026-09-05:「予定してない納品が来たりした場合にこの iPad に入れたい」。
+通常の取込は miniPC の定時 (08:40 / 11:45) → Drive → Render 30分巡回なので、**ロジザードに入荷受付を入れた直後は
+次の定時まで iPad に出ない**。その1回分を人が起こせるようにしたもの。
+
+```
+iPad / 管理画面「🚚 いま取りに行く」
+  → POST /api/refresh-now (すぐ返る)
+  → Render → miniPC POST /service-api/logizard/nyuka-refresh (apps/warehouse/logizard-export-service.js)
+       └ ロジザードのセッションロックが空くのを待って `auto-nyuka-csv.js` を1回 spawn (実測 約30秒)
+  → Render が /service-api/jobs/:id で完了を待つ → Drive の更新日時が動くのを待って取り込む
+  → iPad は /api/state の `refresh` を5秒ポーリングで見て結果を出す
+```
+
+- **HTTP はすぐ返す**。全体で30〜60秒かかるので、進み具合は `/api/state` の `refresh` で見る
+  (iPad の送信は4秒で打ち切る作りなので、ここで待たせると必ず中断する)
+- **同時に1本だけ**。他の iPad が押しても相乗り (`already`)。終わった直後は 60 秒のクールダウン (Render 側と miniPC 側の両方)
+- 🚨 ロジザードのログインは**在庫CSV (毎時00分) / 値札CSV (8:30) と同じロックを取り合う**。miniPC 側は最大90秒待ち、
+  空かなければ `LOCK_BUSY` で「1〜2分おいてもう一度」を返す (定時 bat の10分待ちは画面には長すぎる)
+- 🚨 **オンデマンド実行は jobs-monitor へ ping しない**。台帳 `logizard-nyuka-csv` の dead-man は「定時が動いているか」を
+  見張るもので、人が押した成功で ok を打つと**朝の定時が壊れていても無音になる**
+- 🚨 miniPC の bat (`run-nyuka-csv-scheduled.bat`) は呼ばない。あれは商品マスタの取得と ping まで含む定時用
+- 「増えていなかった」(`duplicate_file`) は**失敗ではない** → 「新しい入荷受付はありませんでした」と出す
+- 取り込みは既存の `fetchAndImportFromDrive` をそのまま通るので、fail-closed の判定も**同じ日のうちは ✅ が消えない**引き継ぎも従来どおり
+- 押せるのは登録端末 (作業者の指定が必要) とポータル利用者。miniPC を呼べない環境ではボタンを出さず、API は 503 `not_configured`
+- env: `WAREHOUSE_URL` / `WAREHOUSE_SERVICE_TOKEN` / `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` (既存。発注管理の FBA 更新と同じもの)
+  / miniPC 側 `LOGIZARD_AUTOMATION_DIR` (既定 `C:\tools\logizard-automation`)
+- テスト: `node scripts/test-inbound-check-refresh.mjs` (Render 側) / `node scripts/test-logizard-export-service.mjs` (miniPC 側・偽スクリプトを実際に spawn)
 
 ## 🏷 値札 (BCシール) 発行 — 倉庫PCの Brother QL-700 から自動で出す (2026-09-05)
 

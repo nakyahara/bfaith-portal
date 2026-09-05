@@ -59,6 +59,18 @@
         <button id="fetchDriveBtn" type="button">☁️ Drive から今すぐ取り込む</button>
         <span id="fetchMsg" class="msg"></span>
       </div>
+      <p class="hint" style="margin-top:12px">
+        ⚠ 上のボタンは<b>共有ドライブに置いてあるファイルを読み直すだけ</b>です。
+        ロジザードに<b>いま入れた入荷受付</b>を出したいときは、下の「ロジザードから取りに行く」を押してください
+        (ロジザードから CSV を出し直すところからやり直します。30〜60秒かかります)。
+      </p>
+      <div class="row">
+        <button id="refreshNowBtn" type="button" <%= refreshAvailable ? '' : 'disabled' %>>🚚 ロジザードから取りに行く (予定外の納品)</button>
+        <span id="refreshMsg" class="msg"></span>
+      </div>
+      <% if (!refreshAvailable) { %>
+        <p class="ng">この環境から miniPC を呼べないため使えません (WAREHOUSE_SERVICE_TOKEN / CF_ACCESS_* が未設定)</p>
+      <% } %>
     </div>
 
     <div class="ic-box">
@@ -468,6 +480,46 @@
         msg($('#fetchMsg'), false, '通信できませんでした: ' + e.message);
       } finally {
         fetchBtn.disabled = false;
+      }
+    });
+
+    // 🚚 ロジザードから取りに行く。走らせるだけ返るので、進み具合は /api/state を見に行く
+    const refreshBtn = $('#refreshNowBtn');
+    if (refreshBtn) refreshBtn.addEventListener('click', async () => {
+      refreshBtn.disabled = true;
+      msg($('#refreshMsg'), true, 'ロジザードに取りに行っています… (30〜60秒)');
+      try {
+        const { status, j } = await postJson(BASE + '/api/refresh-now', {});
+        if (!j.ok) { msg($('#refreshMsg'), false, j.message || ('HTTP ' + status)); refreshBtn.disabled = false; return; }
+        const started = Date.now();
+        const tick = async () => {
+          try {
+            const r = await fetch(BASE + '/api/state', { cache: 'no-store' });
+            const s = await r.json().catch(() => ({}));
+            const rf = s && s.refresh;
+            if (rf && rf.state === 'running') {
+              msg($('#refreshMsg'), true, (rf.message || '取りに行っています') + '…');
+            } else if (rf && rf.state === 'done') {
+              msg($('#refreshMsg'), true, '✅ ' + (rf.message || '取り込みました'));
+              setTimeout(() => location.reload(), 1200);
+              return;
+            } else if (rf && rf.state === 'failed') {
+              msg($('#refreshMsg'), false, '⚠ ' + (rf.message || '取りに行けませんでした'));
+              refreshBtn.disabled = false;
+              return;
+            }
+          } catch (e) { /* 次の周回で見る */ }
+          if (Date.now() - started > 200000) {
+            msg($('#refreshMsg'), false, '時間内に終わりませんでした。miniPC のログを確認してください');
+            refreshBtn.disabled = false;
+            return;
+          }
+          setTimeout(tick, 3000);
+        };
+        setTimeout(tick, 3000);
+      } catch (e) {
+        msg($('#refreshMsg'), false, '通信できませんでした: ' + e.message);
+        refreshBtn.disabled = false;
       }
     });
 

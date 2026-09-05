@@ -347,6 +347,10 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: 'C:\tools\logizard-automation\logs\scheduled.log の [nyuka-csv] を確認 (手で試すなら node auto-nyuka-csv.js --dry)。'
       + '取込側の状態は /apps/inbound-check/admin (Drive の更新日時・取込履歴・失敗理由。「Drive から今すぐ取り込む」ボタンあり)。'
+      + '⭐予定外の納品は定時を待たず iPad / 管理画面の「🚚 いま取りに行く」で同じスクリプトを1回走らせられる '
+      + '(miniPC POST /service-api/logizard/nyuka-refresh → apps/warehouse/logizard-export-service.js)。'
+      + '**そのオンデマンド実行は jobs-monitor へ ping しない** — 人が押した成功でこの dead-man を黙らせると、'
+      + '朝の定時が壊れていても気づけなくなるため。ここが鳴ったら「定時が止まった」と読んでよい。'
       + 'env = LOGIZARD_NYUKA_CSV_OUT / LOGIZARD_NYUKA_CSV_RCLONE_DEST (miniPC の .env)。'
       + '⚠ロックは他のロジザード自動化と共有 (logizard-session.lock)。**時刻はどれとも重ならないように選んである**: '
       + '値札CSV 08:30 / 緊急補充 08:50 / 在庫CSV 毎時00分 → この処理は 08:40 と 11:45。'

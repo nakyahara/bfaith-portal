@@ -46,9 +46,13 @@ export function masterDriveConfig() {
   return { ...MASTER_CFG };
 }
 
-/** Drive 上のファイルの情報 (更新日時の表示用。60秒キャッシュ) */
-export async function getDriveInfo() {
-  return getDriveCsvInfo(CFG);
+/**
+ * Drive 上のファイルの情報 (更新日時の表示用。60秒キャッシュ)。
+ * force=true でキャッシュを読み飛ばす — miniPC に出し直させた直後は、自分が起こした更新を
+ * 60秒キャッシュ越しに見ると「まだ古い」と誤判定するため (logizard-refresh.js)
+ */
+export async function getDriveInfo({ force = false } = {}) {
+  return getDriveCsvInfo(CFG, { force });
 }
 
 /**
