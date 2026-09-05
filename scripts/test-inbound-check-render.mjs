@@ -86,7 +86,7 @@ function makeContext(stateJson) {
 
 const m = /<script>([\s\S]*?)<\/script>/.exec(HTML);
 if (!m) { console.log('  ✗ インラインJSが見つかりません'); process.exit(1); }
-const SCRIPT = m[1] + String.fromCharCode(10) + "globalThis.__t = { openMode, render, state, qhist, setFilter: v => { filter = v; } };";
+const SCRIPT = m[1] + String.fromCharCode(10) + "globalThis.__t = { openMode, render, state, qhist, setFilter: v => { filter = v; }, openPrintBox };";
 
 const LINE = (over = {}) => ({
   line_key: 'AR1|1|1', ar_no: 'AR1', product_id: 'asahilabo15g', code_key: 'asahilabo15g',
@@ -290,6 +290,24 @@ console.log('\n[9] 🏷 値札 (BCシール) 発行 → 倉庫PCの QL-700 (2026
   r = await renderWith([{ ...SEAL, print_job: job('unknown') }]);
   ok(/pjob s-unknown/.test(r.html) && /もう1回押す前に実物を見る/.test(r.html), '結果不明 → 「もう1回押す前に実物を見る」');
   ok(/data-act="print"[^>]*>🏷 もう一度発行</.test(r.html), '結果不明 → ボタンは [🏷 もう一度発行] (実物を見てから)');
+  // ダイアログ: 結果不明の直後は「実物を確認した」チェックが出る (サーバーもその証跡 = ジョブID を要求する)
+  {
+    const { ctx, q } = r;
+    ctx.__t.openPrintBox({ ...SEAL, print_job: job('unknown') });
+    const body = q('#printBody').innerHTML;
+    ok(/id="printAck"/.test(body) && /実物を見て/.test(body), '結果不明の直後にダイアログを開くと「実物を確認した」チェックが出る');
+    ok(/id="printCopies" value="11"/.test(body), '枚数の既定 = ceil(予定 106 ÷ 入数 10) = 11');
+    ok(/Brother QL-700/.test(body) && !/pwarn">⚠/.test(body), '出力先が online なら警告なし');
+  }
+  PRINT_AGENTS = [{ id: 1, label: '倉庫PC', printer_name: 'Brother QL-700', online: false, bpac: false, paper_ok: false }];
+  r = await renderWith([SEAL]);
+  {
+    const { ctx, q } = r;
+    ctx.__t.openPrintBox(SEAL);
+    const body = q('#printBody').innerHTML;
+    ok(/応答していません/.test(body) && /b-PAC/.test(body) && /値札 62x67/.test(body), '応答なし・b-PAC なし・用紙未登録 の警告が出る');
+    ok(!/id="printAck"/.test(body), '直前が結果不明でなければチェックは出ない');
+  }
   r = await renderWith([{ ...SEAL, print_job: job('manual') }]);
   ok(/pjob s-manual/.test(r.html) && /手で刷ってください/.test(r.html), '印刷係が応答しない → 「手で刷ってください」');
   PRINT_AGENTS = [];

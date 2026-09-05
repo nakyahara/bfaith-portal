@@ -1777,10 +1777,10 @@
       const copies = Math.min(50, Math.max(1, pack ? Math.ceil(line.planned_qty / pack) : 1));
       const first = agents.find(a => a.online) || agents[0];
       const opts = agents.map(a => '<option value="' + a.id + '"' + (a.id === first.id ? ' selected' : '') + '>' + esc(a.label) + ' — ' + esc(a.printer_name || '(プリンター未登録)') + (a.online ? '' : ' (応答なし)') + '</option>').join('');
-      const warn = [];
-      if (!first.online) warn.push('倉庫PCの印刷係がしばらく応答していません。押しても出ないときは倉庫PCの電源・スリープを確認してください');
-      if (first.bpac === false) warn.push('倉庫PCに b-PAC が入っていないため、いまは印刷できません');
-      if (first.paper_ok === false) warn.push('QL-700 に用紙「値札 62x67」が登録されていないため、印刷に失敗します');
+      // 🚨 直前が「❓ 結果不明」なら、実物を見たことをチェックさせてからしか送らない (サーバーも同じ証跡を要求する)
+      const prev = line.print_job && line.print_job.state === 'unknown' ? line.print_job : null;
+      const ack = prev ? '<div class="pwarn">❓ 前回 (' + prev.copies + '枚 ' + esc(fmtJst(prev.finished_at || prev.updated_at)) + ') の印刷結果が不明です。<b>QL-700 の実物を見て</b>、シールが出ていない場合だけ発行してください。<br>'
+        + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printAck"> 実物を確認した (シールは出ていない)</label></div>' : '';
       $('#printBody').innerHTML =
         '<div class="fld"><label>商品</label><div class="ro"><b>' + esc(line.product_name) + '</b><br><small>' + esc(line.product_id) + '</small></div></div>'
         + '<div class="fld"><label>バーコード</label><div class="ro">' + esc(line.barcode || '') + ' <small>(' + (type ? type.toUpperCase() : '不明') + ')</small></div></div>'
@@ -1788,11 +1788,27 @@
         + '<div class="fld"><label>枚数 (1〜50。目安 = 予定 ' + line.planned_qty + ' 個 ÷ 入数)</label><input type="number" inputmode="numeric" min="1" max="50" step="1" id="printCopies" value="' + copies + '"></div>'
         + '<div class="fld"><label>出力先 (倉庫PC)</label>' + (agents.length > 1 ? '<select id="printTarget">' + opts + '</select>'
           : '<div class="ro" data-target="' + first.id + '">' + esc(first.label) + ' — ' + esc(first.printer_name || '') + (first.online ? '' : ' <small>(応答なし)</small>') + '</div>') + '</div>'
-        + (warn.length ? '<div class="pwarn">⚠ ' + warn.map(esc).join('<br>⚠ ') + '</div>' : '');
+        + '<div id="printWarn">' + printWarnHtml(first) + '</div>'
+        + ack;
       $('#printMsg').textContent = '';
       $('#printOk').disabled = false;
       $('#printBox').classList.add('on');
     }
+    // 選んだ出力先の状態 (応答なし / b-PAC なし / 用紙未登録)。select を変えたら描き直す
+    function printWarnHtml(a) {
+      const warn = [];
+      if (!a) return '';
+      if (!a.online) warn.push('倉庫PCの印刷係がしばらく応答していません。押しても出ないときは倉庫PCの電源・スリープを確認してください');
+      if (a.bpac === false) warn.push('倉庫PCに b-PAC が入っていないため、いまは印刷できません');
+      if (a.paper_ok === false) warn.push('QL-700 に用紙「値札 62x67」が登録されていないため、印刷に失敗します');
+      return warn.length ? '<div class="pwarn">⚠ ' + warn.map(esc).join('<br>⚠ ') + '</div>' : '';
+    }
+    $('#printBody').addEventListener('change', (ev) => {
+      if (!ev.target || ev.target.id !== 'printTarget') return;
+      const a = printAgents().find(x => x.id === Number(ev.target.value));
+      const w = $('#printWarn');
+      if (w) w.innerHTML = printWarnHtml(a);
+    });
     function closePrintBox() { $('#printBox').classList.remove('on'); printLine = null; }
     $('#printCancel').addEventListener('click', closePrintBox);
     $('#printOk').addEventListener('click', async () => {
@@ -1806,12 +1822,16 @@
       if (!Number.isInteger(copies) || copies < 1 || copies > 50) { msgEl.textContent = '枚数は 1〜50 で入れてください'; return; }
       const tEl = $('#printBody') && $('#printBody').querySelector ? $('#printBody').querySelector('[data-target]') : null;
       const target = sel ? Number(sel.value) : (tEl ? Number(tEl.getAttribute('data-target')) : null);
+      const prev = line.print_job && line.print_job.state === 'unknown' ? line.print_job : null;
+      const ackEl = $('#printAck');
+      if (prev && !(ackEl && ackEl.checked)) { msgEl.textContent = 'QL-700 の実物を確認して、「実物を確認した」にチェックしてください (出ていたらそれを使います)'; return; }
       $('#printOk').disabled = true;
       msgEl.textContent = '送信しています…';
       try {
         const r = await postJson(API + '/print/jobs', {
           worker_code: workerCode() || undefined, batch_id: state.batch.id, line_key: line.line_key,
           copies, pack_qty: packRaw || null, target_device_id: target, client_request_id: printReqId,
+          acknowledge_unknown_job_id: prev ? prev.id : undefined,
         });
         const j = r.json || {};
         if (r.status === 401) { location.href = '/login'; return; }
@@ -1825,6 +1845,12 @@
         }
         if (j.error === 'worker_required') { closePrintBox(); openWorkerPick(); return; }
         if (j.error === 'in_progress' && j.job) { line.print_job = j.job; closePrintBox(); render(true); return; }
+        if (j.error === 'confirm_unknown' && j.job) {
+          // 画面が古かった (別の端末で発行されて結果不明になった等)。最新のジョブで開き直す
+          line.print_job = j.job; render(true); openPrintBox(line);
+          $('#printMsg').textContent = j.message || '前回の印刷結果が不明です。実物を確認してください';
+          return;
+        }
         if (j.error === 'stale_batch') { closePrintBox(); lastJson = ''; load(); return; }
         msgEl.textContent = j.message || j.error || ('HTTP ' + r.status);
         $('#printOk').disabled = false;

@@ -150,11 +150,11 @@ function requirePrintAgent(req, res, next) {
   req.printAgent = device;
   next();
 }
-// /print/ 配下は**この1行で**エージェント認証を必須にする (個々のルートに付け忘れてもここで止まる)
+// /print/ 配下は**この1行で**エージェント認証を必須にする (個々のルートには付けない — 二重に verifyDevice しない。Codex R1 Low)
 router.use('/print', requirePrintAgent);
 
 /** 次に刷るものを1件 lease して返す。無ければ 204 (エージェントは数秒後にまた聞きに来る)。 */
-router.get('/print/next', requirePrintAgent, api((req, res) => {
+router.get('/print/next', api((req, res) => {
   // 出力先プリンターが登録されていない端末には**lease する前に**断る (掴んでから断ると unknown に落ちる)
   if (!req.printAgent.printer_name) {
     return res.status(409).json({ ok: false, error: 'no_printer', message: 'この端末に出力先プリンターが登録されていません (管理画面で登録してください)' });
@@ -165,23 +165,23 @@ router.get('/print/next', requirePrintAgent, api((req, res) => {
 }));
 
 /** エージェントが再起動したとき、掴んでいたジョブがどうなったか確かめる照会 (自分の lease 分のみ) */
-router.get('/print/:id(\\d+)/status', requirePrintAgent, api((req, res) => {
+router.get('/print/:id(\\d+)/status', api((req, res) => {
   const row = getJobStatusFor(Number(req.params.id), req.printAgent.id);
   if (!row) return res.status(404).json({ ok: false, error: 'not_found', message: 'このジョブを保持していません' });
   res.json({ ok: true, job: row });
 }));
 
-router.post('/print/:id(\\d+)/submitted', requirePrintAgent, api((req, res) => {
+router.post('/print/:id(\\d+)/submitted', api((req, res) => {
   const r = markSubmitted(Number(req.params.id), {
     deviceId: req.printAgent.id, leaseToken: String(req.body?.lease || ''),
     spoolJobId: req.body?.spool_job_id ?? null,
   });
-  if (!r.ok) return res.status(409).json({ ok: false, error: 'not_leased', message: `報告を受け付けられません (${r.reason})` });
+  if (!r.ok) return res.status(409).json({ ok: false, error: r.reason === 'submission_conflict' ? 'submission_conflict' : 'not_leased', message: r.message || `報告を受け付けられません (${r.reason})` });
   // replayed = 応答が届かなかった前回と同じ報告。エージェントが「もう投入済み」と分かる
   res.json({ ok: true, replayed: !!r.replayed });
 }));
 
-router.post('/print/:id(\\d+)/completed', requirePrintAgent, api((req, res) => {
+router.post('/print/:id(\\d+)/completed', api((req, res) => {
   // 「刷れた/刷れなかった」は真偽値でしか受け取らない (未指定・"false" を成功扱いにしない)
   if (typeof req.body?.ok !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_ok', message: 'ok は true / false で送ってください' });
   const r = markFinished(Number(req.params.id), {
@@ -194,7 +194,7 @@ router.post('/print/:id(\\d+)/completed', requirePrintAgent, api((req, res) => {
   res.json({ ok: true, replayed: !!r.replayed, state: r.state });
 }));
 
-router.post('/print/heartbeat', requirePrintAgent, api((req, res) => {
+router.post('/print/heartbeat', api((req, res) => {
   const b = req.body || {};
   recordHeartbeat(req.printAgent.id, {
     note: b.note ?? null, version: b.version ?? null, bpac: b.bpac, host: b.host ?? null,
@@ -336,10 +336,12 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
     copies: intOrNull(b.copies), packQty: b.pack_qty == null || b.pack_qty === '' ? null : b.pack_qty,
     targetDeviceId: b.target_device_id == null || b.target_device_id === '' ? null : intOrNull(b.target_device_id),
     clientRequestId: b.client_request_id,
+    // 直前が「❓ 結果不明」のときの「実物を確認した」証跡 (そのジョブ ID)。無ければ confirm_unknown
+    acknowledgeUnknownJobId: b.acknowledge_unknown_job_id == null ? null : intOrNull(b.acknowledge_unknown_job_id),
     requestedBy: a.worker, requestedDevice: a.deviceLabel,
   });
   if (!r.ok) {
-    const status = r.error === 'in_progress' || r.error === 'stale_batch' ? 409 : r.error === 'not_found' ? 404 : 400;
+    const status = r.error === 'in_progress' || r.error === 'stale_batch' || r.error === 'confirm_unknown' ? 409 : r.error === 'not_found' ? 404 : 400;
     return res.status(status).json(r);
   }
   res.json(r);

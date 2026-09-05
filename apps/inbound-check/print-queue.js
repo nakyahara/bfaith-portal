@@ -139,10 +139,12 @@ export function recordHeartbeat(deviceId, { note = null, version = null, bpac = 
  *   packQty           … 入数 (null/'' = 空欄で刷る)。整数以外は拒否
  *   targetDeviceId    … 出力先エージェント (省略時は resolvePrintTarget の規則)
  *   clientRequestId   … 冪等ID。同じIDの再送は同じジョブを返す (二重タップ・応答消失で2枚出ない)
+ *   acknowledgeUnknownJobId … 🚨直前のジョブが unknown (実物を確認) のときは必須。そのジョブ ID を「実物を見て、出ていなかった」
+ *                             の証跡として受け取る。無ければ confirm_unknown で拒否 (誤タップ・古い画面・API直叩きで刷り直せない — Codex R1 High-2)
  *   requestedBy / requestedDevice … 記録用
  * @returns {{ok:true, job, created:boolean}|{ok:false, error, message, job?}}
  */
-export function enqueuePrintJob({ batchId, lineKey, copies, packQty = null, targetDeviceId = null, clientRequestId, requestedBy = null, requestedDevice = null }) {
+export function enqueuePrintJob({ batchId, lineKey, copies, packQty = null, targetDeviceId = null, clientRequestId, acknowledgeUnknownJobId = null, requestedBy = null, requestedDevice = null }) {
   const db = getDB();
   const crid = String(clientRequestId || '').trim();
   if (!/^[A-Za-z0-9._:-]{8,80}$/.test(crid)) return { ok: false, error: 'bad_request', message: 'client_request_id が必要です' };
@@ -179,19 +181,29 @@ export function enqueuePrintJob({ batchId, lineKey, copies, packQty = null, targ
 
     // 同じ明細のジョブがまだ終わっていなければ積まない (連打で2枚出ない)。
     // 終わっていれば (completed/failed/unknown/manual) 新しいジョブを積める = 人が判断して押し直す
-    const running = db.prepare(`SELECT * FROM f_inbound_check_print_jobs WHERE batch_id = ? AND line_key = ?
-      AND state IN (${ACTIVE_STATES.map(() => '?').join(',')}) ORDER BY id DESC LIMIT 1`).get(bid, key, ...ACTIVE_STATES);
-    if (running) return { ok: false, error: 'in_progress', message: 'この商品のシールは印刷中です (結果が出るまでお待ちください)', job: publicJob(running) };
+    const last = db.prepare(`SELECT * FROM f_inbound_check_print_jobs WHERE batch_id = ? AND line_key = ? ORDER BY id DESC LIMIT 1`).get(bid, key);
+    if (last && ACTIVE_STATES.includes(last.state)) {
+      return { ok: false, error: 'in_progress', message: 'この商品のシールは印刷中です (結果が出るまでお待ちください)', job: publicJob(last) };
+    }
+    // 🚨 直前が「❓ 結果不明」なら、そのジョブ ID を「実物を見て出ていなかった」の証跡として受け取ってからしか積まない。
+    //    紙が出ていたのに刷り直すと同じ商品のシールが2枚になり、別の箱に貼られると棚が狂う (気づけない)
+    let acked = null;
+    if (last && last.state === 'unknown') {
+      if (Number(acknowledgeUnknownJobId) !== last.id) {
+        return { ok: false, error: 'confirm_unknown', message: '前回の印刷結果が不明です。QL-700 の実物を確認し、シールが出ていない場合だけ「実物を確認した」にチェックしてもう一度発行してください', job: publicJob(last) };
+      }
+      acked = last.id;
+    }
 
     const target = resolvePrintTarget(targetDeviceId);
     if (!target.ok) return target;
     const now = utcNow();
     const info = db.prepare(`INSERT INTO f_inbound_check_print_jobs
       (client_request_id, batch_id, line_key, code_key, product_code, product_name, barcode, barcode_type, pack_qty, copies,
-       printer_name, target_device_id, requested_by, requested_device, state, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
+       printer_name, target_device_id, requested_by, requested_device, acknowledged_job_id, state, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
       .run(crid, bid, key, line.code_key, line.product_id, name, barcode, type, pack, n,
-        target.agent.printer_name, target.agent.id, requestedBy, requestedDevice, now, now);
+        target.agent.printer_name, target.agent.id, requestedBy, requestedDevice, acked, now, now);
     const job = db.prepare('SELECT * FROM f_inbound_check_print_jobs WHERE id = ?').get(Number(info.lastInsertRowid));
     return { ok: true, job: publicJob(job), created: true };
   }).immediate();
@@ -205,7 +217,7 @@ export function publicJob(row) {
     line_key: row.line_key, product_code: row.product_code, product_name: row.product_name,
     barcode: row.barcode, barcode_type: row.barcode_type, pack_qty: row.pack_qty, copies: row.copies,
     printer_name: row.printer_name, target_device_id: row.target_device_id,
-    requested_by: row.requested_by, error: row.error,
+    requested_by: row.requested_by, error: row.error, acknowledged_job_id: row.acknowledged_job_id ?? null,
     created_at: row.created_at, updated_at: row.updated_at, submitted_at: row.submitted_at, finished_at: row.finished_at,
   };
 }
@@ -271,42 +283,59 @@ function alreadyIn(jobId, state, deviceId, leaseToken) {
 }
 
 /**
- * スプーラーに投入した報告。leased からのみ進む。報告の受付期限も延ばす (投入から印刷完了までさらに時間がかかる)
+ * スプーラーに投入した報告。leased からのみ進む。報告の受付期限も延ばす (投入から印刷完了までさらに時間がかかる)。
+ * 同じ lease の再送は replayed:true — ただし **spool_job_id が前回と違えば 409** (台帳の破損・別スプールへの二重投入を
+ * 黙って成功にしない。Codex R1 Med)
  */
 export function markSubmitted(jobId, { deviceId, leaseToken, spoolJobId = null, now = utcNow() }) {
-  const upd = getDB().prepare(`UPDATE f_inbound_check_print_jobs SET state = 'submitted', spool_job_id = ?, submitted_at = ?,
-    updated_at = ?, lease_expires_at = ?
-    WHERE id = ? AND state = 'leased' AND lease_device_id = ? AND lease_token = ? AND lease_expires_at > ?`)
-    .run(spoolJobId == null ? null : String(spoolJobId).slice(0, 60), now, now, iso(ms(now) + REPORT_DEADLINE_SEC * 1000),
-      jobId, deviceId, leaseToken || '', now);
-  if (upd.changes === 1) return { ok: true };
-  if (alreadyIn(jobId, 'submitted', deviceId, leaseToken)) return { ok: true, replayed: true };
-  return { ok: false, reason: 'not_leased_or_wrong_state' };
+  const spool = spoolJobId == null || spoolJobId === '' ? null : String(spoolJobId).slice(0, 60);
+  const db = getDB();
+  return db.transaction(() => {
+    const upd = db.prepare(`UPDATE f_inbound_check_print_jobs SET state = 'submitted', spool_job_id = ?, submitted_at = ?,
+      updated_at = ?, lease_expires_at = ?
+      WHERE id = ? AND state = 'leased' AND lease_device_id = ? AND lease_token = ? AND lease_expires_at > ?`)
+      .run(spool, now, now, iso(ms(now) + REPORT_DEADLINE_SEC * 1000), jobId, deviceId, leaseToken || '', now);
+    if (upd.changes === 1) return { ok: true };
+    if (alreadyIn(jobId, 'submitted', deviceId, leaseToken)) {
+      const cur = db.prepare('SELECT spool_job_id FROM f_inbound_check_print_jobs WHERE id = ?').get(jobId);
+      if ((cur?.spool_job_id ?? null) === spool) return { ok: true, replayed: true };
+      return { ok: false, reason: 'submission_conflict', message: `前回の投入報告 (spool ${cur?.spool_job_id ?? '-'}) と違う spool_job_id (${spool ?? '-'}) です` };
+    }
+    return { ok: false, reason: 'not_leased_or_wrong_state' };
+  }).immediate();
 }
 
 /**
  * 完了/失敗の報告。
  *   - 成功 (ok:true) は submitted からのみ (スプーラーに入れずに「刷れた」は受け付けない)
- *   - 失敗 (ok:false) は leased / submitted から。uncertain=true なら unknown、false なら failed
+ *   - 失敗 (ok:false) は leased / submitted から。
+ *     🚨 **failed (= もう一度押してよい) にできるのは、まだスプーラーに入れていない leased からだけ**。
+ *        submitted (投入済み) からの失敗は uncertain の値にかかわらず unknown — 紙が出ているかもしれない (Codex R1 High-1)
  *   - ⭐期限切れで unknown に倒した後に**同じ lease の報告が遅れて届いた**ときは受け付けて上書きする
  *     (unknown → completed / failed)。エージェントが再起動後に台帳から報告してくる経路で、
- *     「実物を確認」より確かな情報なので捨てない。completed / failed / manual からは動かさない
+ *     「実物を確認」より確かな情報なので捨てない。ただし一度でも投入済み (submitted_at あり) なら failed にはしない。
+ *     completed / failed / manual からは動かさない
  * 🚨「刷れなかった」と「紙が出たか分からない」を混ぜない — failed は「もう一度押してよい」を意味する
  */
 export function markFinished(jobId, { deviceId, leaseToken, ok, error = null, uncertain = false, now = utcNow() }) {
   if (typeof ok !== 'boolean') return { ok: false, reason: 'bad_ok' };
-  const target = ok ? 'completed' : (uncertain ? 'unknown' : 'failed');
-  const from = ok ? ['submitted', 'unknown'] : ['leased', 'submitted', 'unknown'];
   const db = getDB();
-  const upd = db.prepare(`UPDATE f_inbound_check_print_jobs SET state = ?, error = ?, finished_at = ?, updated_at = ?, lease_expires_at = NULL
-    WHERE id = ? AND state IN (${from.map(() => '?').join(',')}) AND state <> ?
-      AND lease_device_id = ? AND lease_token = ?
-      AND (state = 'unknown' OR lease_expires_at > ?)`)
-    .run(target, ok ? null : (String(error || '').slice(0, 200) || '理由不明'), now, now,
-      jobId, ...from, target, deviceId, leaseToken || '', now);
-  if (upd.changes === 1) return { ok: true, state: target };
-  if (alreadyIn(jobId, target, deviceId, leaseToken)) return { ok: true, replayed: true, state: target };
-  return { ok: false, reason: 'not_leased_or_wrong_state' };
+  return db.transaction(() => {
+    const row = db.prepare('SELECT state, submitted_at, lease_device_id, lease_token FROM f_inbound_check_print_jobs WHERE id = ?').get(jobId);
+    if (!row) return { ok: false, reason: 'not_found' };
+    const everSubmitted = row.state === 'submitted' || !!row.submitted_at;
+    const target = ok ? 'completed' : ((uncertain || everSubmitted) ? 'unknown' : 'failed');
+    const from = ok ? ['submitted', 'unknown'] : ['leased', 'submitted', 'unknown'];
+    const upd = db.prepare(`UPDATE f_inbound_check_print_jobs SET state = ?, error = ?, finished_at = ?, updated_at = ?, lease_expires_at = NULL
+      WHERE id = ? AND state = ? AND state IN (${from.map(() => '?').join(',')}) AND state <> ?
+        AND lease_device_id = ? AND lease_token = ?
+        AND (state = 'unknown' OR lease_expires_at > ?)`)
+      .run(target, ok ? null : (String(error || '').slice(0, 200) || '理由不明'), now, now,
+        jobId, row.state, ...from, target, deviceId, leaseToken || '', now);
+    if (upd.changes === 1) return { ok: true, state: target };
+    if (alreadyIn(jobId, target, deviceId, leaseToken)) return { ok: true, replayed: true, state: target };
+    return { ok: false, reason: 'not_leased_or_wrong_state' };
+  }).immediate();
 }
 
 /** エージェントが再起動したとき、掴んでいたジョブの現在の状態を確かめる (自分が lease したジョブのみ) */

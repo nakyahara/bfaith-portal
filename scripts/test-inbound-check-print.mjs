@@ -181,6 +181,8 @@ console.log('\n[5] 報告 (submitted → completed) と冪等な再送');
   ok(s.ok && !s.replayed, '投入報告');
   const s2 = markSubmitted(job1.id, { deviceId: agentRow.id, leaseToken: lease1.leaseToken, spoolJobId: 'nefuda-1' });
   ok(s2.ok && s2.replayed, '同じ投入報告の再送は replayed:true で成功 (応答が消えても復旧できる)');
+  const s3 = markSubmitted(job1.id, { deviceId: agentRow.id, leaseToken: lease1.leaseToken, spoolJobId: 'nefuda-99' });
+  ok(!s3.ok && s3.reason === 'submission_conflict', '違う spool_job_id の再送は submission_conflict (別スプールへの二重投入を黙って成功にしない — Codex R1)');
   const st = getJobStatusFor(job1.id, agentRow.id);
   ok(st && st.state === 'submitted' && st.spool_job_id === 'nefuda-1' && st.submitted_at, '/status で submitted と spool_job_id が読める');
   ok(getJobStatusFor(job1.id, agentRow.id + 100) === null, '他の端末は /status を読めない');
@@ -209,6 +211,23 @@ console.log('\n[6] 失敗 (failed) と結果不明 (unknown) を混ぜない');
   const u = markFinished(j2.id, { deviceId: agentRow.id, leaseToken: j2.leaseToken, ok: false, error: 'printing did not complete (spooler error)', uncertain: true });
   ok(u.ok && u.state === 'unknown', 'uncertain=true は unknown');
   ok(/実物を確認/.test(alertTextFor(db.prepare('SELECT * FROM f_inbound_check_print_jobs WHERE id=?').get(j2.id))), 'unknown の通知は「実物を確認」(「もう1回」と言わない)');
+  // 🚨 投入済み (submitted) からの ok:false は uncertain が無くても unknown — 紙が出ているかもしれない (Codex R1 High-1)
+  const r2c = enqueuePrintJob({ batchId: batch.id, lineKey: L1, copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: j2.id });
+  ok(r2c.ok && r2c.job.acknowledged_job_id === j2.id, 'unknown の後は「実物を確認した」証跡 (そのジョブID) を付ければ積める');
+  const j2c = leaseNextJob(agentRow);
+  markSubmitted(j2c.id, { deviceId: agentRow.id, leaseToken: j2c.leaseToken, spoolJobId: 'nefuda-10' });
+  const notUncertain = markFinished(j2c.id, { deviceId: agentRow.id, leaseToken: j2c.leaseToken, ok: false, error: 'agent says failed', uncertain: false });
+  ok(notUncertain.ok && notUncertain.state === 'unknown' && stateOf(j2c.id) === 'unknown', 'submitted からの ok:false (uncertain:false) は failed ではなく unknown');
+  // unknown の後、証跡なし / 違うIDでは積めない
+  const noAck = enqueuePrintJob({ batchId: batch.id, lineKey: L1, copies: 1, clientRequestId: rid() });
+  ok(!noAck.ok && noAck.error === 'confirm_unknown' && noAck.job.id === j2c.id, 'unknown の直後は証跡なしでは積めない (confirm_unknown + そのジョブ)');
+  const wrongAck = enqueuePrintJob({ batchId: batch.id, lineKey: L1, copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: j2.id });
+  ok(!wrongAck.ok && wrongAck.error === 'confirm_unknown', '古いジョブIDの証跡では積めない (画面が古い)');
+  const withAck = enqueuePrintJob({ batchId: batch.id, lineKey: L1, copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: j2c.id });
+  ok(withAck.ok && withAck.job.acknowledged_job_id === j2c.id, '最新の unknown ジョブIDを証跡にすれば積める');
+  const j2d = leaseNextJob(agentRow);
+  markFinished(j2d.id, { deviceId: agentRow.id, leaseToken: j2d.leaseToken, ok: false, error: 'template missing' });
+  eq(stateOf(j2d.id), 'failed', 'leased からの ok:false (uncertain:false) は failed のまま');
   // 期限切れで unknown に倒した後、同じ lease の報告が遅れて届いたら上書き (より確かな情報)
   const r3 = enqueuePrintJob({ batchId: batch.id, lineKey: L5, copies: 1, clientRequestId: rid() });
   const j3 = leaseNextJob(agentRow);
@@ -227,7 +246,10 @@ console.log('\n[6] 失敗 (failed) と結果不明 (unknown) を混ぜない');
 
 console.log('\n[7] 滞留 (誰も取りに来ない) → manual、通知は送れるまで諦めない');
 {
-  const r = enqueuePrintJob({ batchId: batch.id, lineKey: L2, copies: 1, clientRequestId: rid() });
+  // L2 の直前 = [4] で lease したまま unknown になった job2 → 証跡が要る
+  const r0 = enqueuePrintJob({ batchId: batch.id, lineKey: L2, copies: 1, clientRequestId: rid() });
+  ok(!r0.ok && r0.error === 'confirm_unknown', '期限切れで unknown になった明細も、証跡なしでは積めない');
+  const r = enqueuePrintJob({ batchId: batch.id, lineKey: L2, copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: job2.id });
   ok(r.ok, '積む');
   const sw0 = sweepPrintJobs({ now: at(new Date().toISOString(), STALE_QUEUED_SEC - 5) });
   ok(sw0.manual === 0 && stateOf(r.job.id) === 'queued', '3分未満は queued のまま');
@@ -375,6 +397,8 @@ console.log('\n[10] HTTP — 誰が印刷ジョブを取れるか');
   ok(sub.status === 200 && sub.body.ok && sub.body.replayed === false, '投入報告 200');
   const sub2 = await call('POST', `/print/${nx.body.job.id}/submitted`, { token: httpAgent, body: { lease, spool_job_id: 'nefuda-http' } });
   ok(sub2.status === 200 && sub2.body.replayed === true, '再送は replayed:true');
+  const sub3 = await call('POST', `/print/${nx.body.job.id}/submitted`, { token: httpAgent, body: { lease, spool_job_id: 'other' } });
+  ok(sub3.status === 409 && sub3.body.error === 'submission_conflict', '違う spool_job_id は 409 submission_conflict');
   const stt = await call('GET', `/print/${nx.body.job.id}/status`, { token: httpAgent });
   ok(stt.status === 200 && stt.body.job.state === 'submitted', '/status');
   eq((await call('GET', `/print/${nx.body.job.id}/status`, { token: agent.token })).status, 404, '他のエージェントは /status を読めない');

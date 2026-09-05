@@ -87,6 +87,8 @@ iPad 行の「🏷 シール発行」(入庫時BCシール貼りフラグ = 貼�
 - **出力先は登録済みの印刷エージェント (`f_inbound_check_devices.kind='agent'` + `printer_name`)**。1台なら自動、2台以上なら iPad で選ぶ (勝手に選んで別の実機から出さない)。プリンター名は有効な端末同士で重複不可 (Windows のプリンター名は PC ごとのローカル名)
 - 🚨 **送り状の印刷キュー (apps/packing) との違い = PDF が無い。lease した時点でジョブ JSON を渡している = 紙が出たかもしれない**。だから lease の期限が切れても **queued へ戻さない** (二重印刷より欠落を選ぶ)。状態: `queued → leased → submitted → completed` / `failed` (刷る前の失敗。もう一度押してよい) / `unknown` (報告なし・スプーラー投入後の失敗。**実物を確認**) / `manual` (3分たっても誰も取りに来ない = 倉庫PCが寝ている。自動印刷は取り消し、手で刷る)
 - 冪等: `client_request_id` (UNIQUE) の再送は同じジョブ。同じ明細の進行中ジョブがあるうちは新しく積めない (409 `in_progress`)。終わった後は「追加で発行」できる
+- 🚨 直前が `unknown` の明細は、**そのジョブ ID を `acknowledge_unknown_job_id` (= 「実物を見て出ていなかった」の証跡) として付けないと積めない** (409 `confirm_unknown`)。iPad はチェックボックスで確認させる。証跡はジョブの `acknowledged_job_id` に残る
+- `failed` (= もう一度押してよい) になるのは **まだスプーラーに入れていない `leased` からの失敗だけ**。`submitted` (投入済み) からの失敗は `uncertain` の値にかかわらず `unknown`。投入報告の再送で `spool_job_id` が前回と違えば 409 `submission_conflict`
 - 遅れて届いた同じ lease の報告 (エージェント再起動後の台帳突合) は `unknown → completed/failed` に上書きする (「実物を確認」より確かな情報を捨てない)
 - 見張り = `sync-job.js startInboundCheckPrintQueueWorker` (Render 内 30秒間隔・`INBOUND_CHECK_PRINT_ENABLED`)。滞留→manual / 報告なし→unknown / `INBOUND_CHECK_PRINT_WEBHOOK` があれば結果を GChat へ (送れた分だけ通知済みにする) / エージェントの heartbeat が10分以内なら jobs-monitor の `nefuda-print-agent` へ ok を中継 (倉庫PCに JOBS_MONITOR_TOKEN を配らない)
 - エージェント側の契約 (JSON の形・状態コード) は `倉庫PC_値札印刷エージェント\README.md`「サーバー側に実装するもの」が正。ここを変えるときは `agent.ps1` も直す

@@ -294,6 +294,7 @@ export function createTables(db = getMirrorDB()) {
       target_device_id  INTEGER NOT NULL REFERENCES f_inbound_check_devices(id),
       requested_by      TEXT,
       requested_device  TEXT,
+      acknowledged_job_id INTEGER,                -- 直前の unknown ジョブを「実物を見て出ていなかった」と確認した証跡 (その ID)
       state             TEXT NOT NULL CHECK (state IN ('queued','leased','submitted','completed','failed','manual','unknown')),
       lease_device_id   INTEGER REFERENCES f_inbound_check_devices(id),
       lease_token       TEXT,                      -- 報告時の照合 (別の端末・古い lease の報告を弾く)
