@@ -860,11 +860,33 @@ console.log('\n[16] 作業のやり方の選択肢 (資材・保管箱): Excel �
   ok(setWorkOptionImage(a.option.id, 'https://evil.example.com/x.jpg').error === 'bad_url' && setWorkOptionImage(a.option.id, 'https://lh3.googleusercontent.com/d99.jpg').ok === true, 'setWorkOptionImage も同じ検証');
   ok(setWorkOptionImage(999999, 'https://drive.google.com/y.jpg').error === 'not_found', '無い id は not_found');
 
+  // 表示順を管理画面で決める (中原さん 2026-09-05)。決めるまでは「よく使う順」のまま
+  {
+    const { moveWorkOption } = await import('../apps/iroha-work/db.js');
+    const before = listWorkOptions('material', true).map(o => o.code);
+    ok(before.length >= 2, '資材の候補が 2 件以上ある (並べ替えの前提)');
+    ok(listWorkOptions('material', true).every(o => o.manual_sort == null), '初めは手動の並び順は無い (よく使う順)');
+    const last = listWorkOptions('material', true).at(-1);
+    const up = moveWorkOption(last.id, 'top');
+    ok(up.ok && up.position === 1, '「いちばん上へ」で先頭に来る');
+    ok(listWorkOptions('material', true)[0].code === last.code, '一覧の先頭が入れ替わっている');
+    ok(workOptionsByKind(true).material[0].code === last.code, 'iPad の候補 (workOptionsByKind) も同じ順');
+    const down = moveWorkOption(last.id, 'down');
+    ok(down.ok && down.position === 2 && listWorkOptions('material', true)[1].code === last.code, '「↓」で 1 つ下がる');
+    ok(moveWorkOption(last.id, 'up').position === 1, '「↑」で 1 つ上がる');
+    ok(moveWorkOption(999999, 'up').error === 'not_found' && moveWorkOption(last.id, 'sideways').error === 'bad_dir', '無い id・不正な向きは拒否');
+    // 手で並べた後に seed が走っても順序は保たれる (seed は sort_order しか触らない)
+    _resetSeedFingerprint(); seedWorkOptionsFromMaster({ force: true });
+    ok(listWorkOptions('material', true)[0].code === last.code, 'マスタ取り込み後も手で決めた順のまま');
+    ok(moveWorkOption(last.id, 'auto').reset === true && listWorkOptions('material', true).every(o => o.manual_sort == null),
+      '「よく使う順に戻す」で手動指定が消える');
+  }
+
   // 同梱画像 (public/app-images/iroha-work): パスが通り、seed で「画像が無い候補」に自動で付く (中原さん 2026-09-05)
   {
     const { BUILTIN_OPTION_IMAGES, applyBuiltinOptionImages } = await import('../apps/iroha-work/db.js');
     const fsMod = await import('node:fs');
-    ok(BUILTIN_OPTION_IMAGES.length === 22 && BUILTIN_OPTION_IMAGES.every(b => fsMod.existsSync('public' + b.path)), '同梱画像 22 種が public/app-images/iroha-work にある');
+    ok(BUILTIN_OPTION_IMAGES.length === 24 && BUILTIN_OPTION_IMAGES.every(b => fsMod.existsSync('public' + b.path)), '同梱画像 24 種が public/app-images/iroha-work にある');
     ok(new Set(BUILTIN_OPTION_IMAGES.flatMap(b => b.keys.map(k => b.kind + ':' + normalizeOptionCode(k)))).size
        === BUILTIN_OPTION_IMAGES.reduce((a, b) => a + b.keys.length, 0), '同じ kind で重複する key が無い (別の資材の写真が出ない)');
     ok(validateOptionImageUrl('/app-images/iroha-work/vinyl-313.png').ok, '同梱画像のパスは使える');

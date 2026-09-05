@@ -169,10 +169,22 @@
           <span class="msg" id="optMsg-<%= kind %>"></span>
         </div>
         <% } %>
+        <% const manual = list.some(o => o.manual_sort != null); %>
+        <% if (isAdmin && list.length > 1) { %>
+          <p class="iw-hint" style="margin:4px 0">
+            並び順: <b><%= manual ? '手で決めた順' : 'よく使う順 (自動)' %></b> — iPad の候補もこの順で出ます。
+            <% if (manual) { %><button class="btn-sm" onclick="sortOption(<%= list[0].id %>, 'auto')">よく使う順に戻す</button><% } %>
+          </p>
+        <% } %>
         <table class="iw-list">
-          <tr><th>値</th><th>画像</th><th>状態</th><% if (isAdmin) { %><th></th><% } %></tr>
-          <% for (const o of list) { %>
+          <tr><% if (isAdmin) { %><th>並び</th><% } %><th>値</th><th>画像</th><th>状態</th><% if (isAdmin) { %><th></th><% } %></tr>
+          <% for (const [i, o] of list.entries()) { %>
             <tr class="<%= o.active ? '' : 'inactive' %>">
+              <% if (isAdmin) { %><td style="white-space:nowrap">
+                <button class="btn-sm" onclick="sortOption(<%= o.id %>, 'up')" <%= i === 0 ? 'disabled' : '' %> title="ひとつ上へ">↑</button>
+                <button class="btn-sm" onclick="sortOption(<%= o.id %>, 'down')" <%= i === list.length - 1 ? 'disabled' : '' %> title="ひとつ下へ">↓</button>
+                <button class="btn-sm" onclick="sortOption(<%= o.id %>, 'top')" <%= i === 0 ? 'disabled' : '' %> title="いちばん上へ">⤒</button>
+              </td><% } %>
               <td><%= o.code %></td>
               <td><% if (o.image_url) { %><a href="<%= o.image_url %>" target="_blank" rel="noopener"><img src="<%= o.image_url %>" alt="" referrerpolicy="no-referrer" style="width:36px;height:36px;object-fit:contain;vertical-align:middle"></a><% } else { %>-<% } %></td>
               <td><%= o.active ? '有効' : '無効' %></td>
@@ -182,7 +194,7 @@
               </td><% } %>
             </tr>
           <% } %>
-          <% if (list.length === 0) { %><tr><td colspan="4">まだありません (作業仕様マスタを取り込むと自動で入ります)</td></tr><% } %>
+          <% if (list.length === 0) { %><tr><td colspan="5">まだありません (作業仕様マスタを取り込むと自動で入ります)</td></tr><% } %>
         </table>
       <% } %>
     </div>
@@ -425,6 +437,13 @@
       const { json } = await post('/admin/options/' + id + '/active', { active });
       if (json.ok) location.reload();
       else alert(json.message || '変更できませんでした');
+    }
+    // 表示順の入れ替え (↑ ↓ ⤒ / よく使う順に戻す)
+    async function sortOption(id, dir) {
+      if (dir === 'auto' && !confirm('手で決めた並び順をやめて、よく使う順 (自動) に戻しますか?')) return;
+      const { json } = await post('/admin/options/' + id + '/sort', { dir });
+      if (json.ok) location.reload();
+      else alert(json.message || '並べ替えできませんでした');
     }
     // 同梱画像 (public/app-images/iroha-work)。番号で選ぶか、Google Drive のリンクを貼る
     const BUILTIN_IMAGES = <%- JSON.stringify((typeof builtinImages !== 'undefined' && builtinImages) || []) %>;
