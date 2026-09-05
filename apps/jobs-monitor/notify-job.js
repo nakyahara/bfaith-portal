@@ -32,8 +32,26 @@ import {
 import { sendGChatMessage } from '../profit-analysis/gchat-client.js';
 
 const REGISTERED = new Set(JOBS_REGISTRY.map((e) => e.id));
-// 退役した id は「台帳に無い id」として鳴らさない (記録は起動時に purgeJobStates で消す)
+// 退役した id は「台帳に無い id」として鳴らさない (記録は起動時に purgeRetiredJobStates で消す)
 const RETIRED = new Set(RETIRED_JOBS.map((e) => e.id));
+
+/**
+ * 退役したジョブ (RETIRED_JOBS) の記録を消す。起動時に呼ぶ。
+ * 残っていると毎朝の要対応サマリに「台帳に無い id から ping が来ています」として出続ける。
+ * 失敗しても監視本体は止めない (例外はログに残すだけ)。
+ * @returns {number} 消した job_state の行数 (-1 = 失敗)
+ */
+export function purgeRetiredJobStates() {
+  try {
+    const ids = RETIRED_JOBS.map((e) => e.id);
+    const purged = purgeJobStates(ids);
+    if (purged > 0) console.log(`[jobs-monitor] 退役ジョブの記録を消しました: ${purged} 件 (${ids.join(', ')})`);
+    return purged;
+  } catch (e) {
+    console.error('[jobs-monitor] 退役ジョブの記録の削除に失敗:', e.message);
+    return -1;
+  }
+}
 
 /** 送信できたかを返す。成功/失敗を meta に刻む (/health が通知経路の健全性を見るため) */
 async function notify(text, nowMs = Date.now()) {
@@ -141,13 +159,7 @@ export function startJobsMonitor() {
     setMeta('registry_error', '');
   }
   if (!getMeta('monitoring_since')) setMeta('monitoring_since', Date.now());
-  // 退役したジョブの記録を消す (残っていると「台帳に無い id」として毎朝出る)
-  try {
-    const purged = purgeJobStates(RETIRED_JOBS.map((e) => e.id));
-    if (purged > 0) console.log(`[jobs-monitor] 退役ジョブの記録を消しました: ${purged} 件 (${RETIRED_JOBS.map((e) => e.id).join(', ')})`);
-  } catch (e) {
-    console.error('[jobs-monitor] 退役ジョブの記録の削除に失敗:', e.message);
-  }
+  purgeRetiredJobStates();
 
   cron.schedule('*/5 * * * *', () => {
     runEvaluation().catch((e) => console.error('[jobs-monitor] 評価失敗:', e.message));

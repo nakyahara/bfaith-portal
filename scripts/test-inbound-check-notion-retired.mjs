@@ -121,13 +121,35 @@ console.log('\n[5] jobs-monitor: 退役した id は「台帳に無い id」に�
   ok(j.unknownIds.includes('really-unknown-job'), '本当に台帳に無い id は今までどおり出る');
   ok(Array.isArray(j.retiredIds) && j.retiredIds.includes('inbound-check-notion-cards'), 'retiredIds として見える');
 
-  const n = purgeJobStates(['inbound-check-notion-cards']);
-  eq(n, 1, '起動時の purge で job_state が 1 行消える');
+  // 起動時に呼ばれる本物の関数で消す (RETIRED_JOBS 全部が対象)
+  const { purgeRetiredJobStates } = await import('../apps/jobs-monitor/notify-job.js');
+  const n = purgeRetiredJobStates();
+  eq(n, 1, '起動時の purgeRetiredJobStates で job_state が 1 行消える');
   ok(!getStates()['inbound-check-notion-cards'], '消えた後は状態に無い');
   ok(getAlertState('inbound-check-notion-cards') === null, 'alert_state も消える');
   ok(!!getStates()['really-unknown-job'], '他のジョブの記録は消さない');
   eq(purgeJobStates([]), 0, '空なら何もしない');
-  eq(purgeJobStates(['inbound-check-notion-cards']), 0, '二度目は 0 (冪等)');
+  eq(purgeRetiredJobStates(), 0, '二度目は 0 (冪等)');
+  const src = fs.readFileSync(new URL('../apps/jobs-monitor/notify-job.js', import.meta.url), 'utf8');
+  ok(/setMeta\('monitoring_since'[\s\S]{0,120}purgeRetiredJobStates\(\);/.test(src), '起動処理 (monitoring_since の直後) で purgeRetiredJobStates を呼んでいる');
+}
+
+// ─── 管理画面の節: 3 つの見え方 (アプリ正本 / 退路 / 状態不明) ───
+console.log('\n[6] 管理画面: 正本ごとの見え方');
+{
+  const ejs = (await import('ejs')).default;
+  const src = fs.readFileSync(new URL('../apps/inbound-check/views/admin.ejs', import.meta.url), 'utf8');
+  const base = { title: 't', username: 'u', displayName: 'd', isAdmin: true, base: '/apps/inbound-check', active: null, batches: [], importLog: [], devices: [], enrollCodes: [], workers: [], drive: { config: {} }, workMaster: { total: 0, filled: 0 }, printAgents: [], printJobs: [], PRINT_STATE_LABELS: {}, refreshAvailable: true };
+  const body = (html) => html.split('<script')[0];
+  const appMode = ejs.render(src, { ...base, notion: { configured: true, source: 'app', linkConflicts: [], linkConflictsTotal: 0, unsent: 3, waitingRetry: 2, blocked: [], attention: [] } });
+  ok(/いろはへの作業指示 \(在庫化アプリ\)/.test(appMode) && /2026-09-05 に運用廃止/.test(appMode), 'アプリ正本: 廃止と行き先 (在庫化アプリ) を書く');
+  ok(!/id="notionSyncBtn"/.test(body(appMode)) && !/送信待ち/.test(appMode) && !/再試行待ち/.test(appMode), 'アプリ正本: 送信ボタン・Notion 時代の件数を出さない');
+  const notionMode = ejs.render(src, { ...base, notion: { configured: true, source: 'notion', linkConflicts: [], linkConflictsTotal: 0, unsent: 3, waitingRetry: 2, cancelPending: 0, sentRecent: 0, dbIdTail: 'abc', blocked: [], attention: [] } });
+  ok(/退路モード/.test(notionMode) && /id="notionSyncBtn"/.test(body(notionMode)), '退路: 送信ボタンを出す');
+  ok(!/30分おきに自動で再試行/.test(notionMode) && /自動再試行はもうありません/.test(notionMode), '退路: 「30分おきに自動で再試行」とは言わない (巡回は削除済み)');
+  const unknownMode = ejs.render(src, { ...base, notion: { error: 'boom' } });
+  ok(/状態を取得できませんでした: boom/.test(unknownMode) && !/在庫化アプリ\)/.test(unknownMode.split('<h2>🏠 いろはへの作業指示</h2>')[1].slice(0, 40)), '状態不明: 断定せず理由を出す');
+  ok(!/id="notionSyncBtn"/.test(body(unknownMode)) && !/2026-09-05 に運用廃止になりました/.test(unknownMode), '状態不明: 送信ボタンも「廃止」の断定も出さない');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

@@ -152,8 +152,15 @@
     </div>
 
     <div class="ic-box">
-      <% const notionRetired = !(notion && !notion.error && notion.source === 'notion'); %>
-      <% if (notionRetired) { %>
+      <%# 正本 = 'app' (通常・Notion 廃止) / 'notion' (退路) / 'unknown' (状態を取れなかった — 断定しない) %>
+      <% const notionMode = (notion && !notion.error) ? (notion.source === 'notion' ? 'notion' : 'app') : 'unknown'; %>
+      <% const notionRetired = notionMode === 'app'; %>
+      <% if (notionMode === 'unknown') { %>
+      <h2>🏠 いろはへの作業指示</h2>
+      <p class="ng">⚠ 正本 (在庫化アプリ / Notion) の状態を取得できませんでした<%= notion && notion.error ? ': ' + notion.error : '' %>。
+        通常は在庫化アプリが正本で Notion は廃止 (2026-09-05) ですが、この画面からは断定できません。
+        <a href="/apps/iroha-work/admin" target="_blank" rel="noopener">在庫化アプリの管理画面</a>で正本を確認してください。</p>
+      <% } else if (notionRetired) { %>
       <h2>🏠 いろはへの作業指示 (在庫化アプリ)</h2>
       <p class="hint">
         「いろはで在庫化」と確定した明細は、<b>確定と同時に いろは在庫化アプリの「未着手」</b> に入ります (iPad の一覧に即時)。
@@ -174,8 +181,8 @@
           <a href="/apps/iroha-work/admin">在庫化アプリの管理画面</a>「Notion → アプリ正本化」の「紐付けの衝突」で統合してください —
           <% notion.linkConflicts.forEach((c) => { %><span>task#<%= c.task_id %> (<%= c.product_code %>) ↔ task#<%= c.other_task_id %></span> <% }) %><% if (notion.linkConflictsTotal > notion.linkConflicts.length) { %> …他 <%= notion.linkConflictsTotal - notion.linkConflicts.length %> 件<% } %></p>
       <% } %>
-      <% if (!notion || notion.error) { %>
-        <p class="ng">⚠ 状態を取得できません<%= notion && notion.error ? ': ' + notion.error : '' %></p>
+      <% if (notionMode === 'unknown') { %>
+        <%# 上で理由を出した。数字やボタンは出さない (正本が分からないまま送らせない) %>
       <% } else if (notionRetired) { %>
         <%# Notion 廃止: 送信待ち/再送/要確認 は Notion 時代の数字なので出さない %>
       <% } else if (!notion.configured) { %>
@@ -183,7 +190,7 @@
           Notion 側で「在庫化作業管理」DB のコネクトに既存インテグレーションを追加してください (NOTION_TOKEN は共用)。</p>
       <% } else { %>
         <p>送信待ち <b><%= notion.unsent %></b> 件 ・ 取消の反映待ち <b><%= notion.cancelPending %></b> 件
-          <% if (notion.waitingRetry) { %> ・ 一時エラーの再試行待ち <b><%= notion.waitingRetry %></b> 件 (30分おきに自動で再試行)<% } %> ・
+          <% if (notion.waitingRetry) { %> ・ 一時エラーの再試行待ち <b><%= notion.waitingRetry %></b> 件 (自動再試行はもうありません — 下の「今すぐ送る」か「再送」で手動)<% } %> ・
           直近24時間の送信 <b><%= notion.sentRecent %></b> 件<% if (notion.lastSyncedAt) { %> ・ 最終送信 <span data-jst="<%= notion.lastSyncedAt %>"></span><% } %>
           (DB …<%= notion.dbIdTail %>)</p>
         <div class="row">
