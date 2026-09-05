@@ -522,13 +522,13 @@ const LINE_EVENTS = ['line_sort_start', 'line_sort_done', 'line_start', 'line_st
 // 伝票単位のイベント (梱包機バッチでは不可 — 伝票状態とライン工程の矛盾を作らない。Codex high)。
 // undo はライン専用の段階的取消として別実装、takeover/pause/resume/cancel は両方で使える
 const SLIP_ONLY_EVENTS = ['start', 'next', 'jump', 'ship_change', 'reprint', 'label_missing',
-  'shortage', 'excess', 'wrong_item', 'found', 'receive'];
+  'shortage', 'excess', 'wrong_item', 'found', 'receive', 'stockout_ack'];
 // 紙で作業する梱包機ラインでも、伝票を選んでの「依頼」は出せる (2026-08-31 現場意見: MELT/PAS は
 // 再ピック依頼・サイズ変更依頼がかけられない)。伝票の完了 (next/jump) と余り/品違いは対象外 —
 // 伝票の完了状態はライン工程で管理しないため。保留 (repick) は伝票行に付くがライン工程とは独立
-export const LINE_SLIP_REQUEST_EVENTS = ['ship_change', 'reprint', 'label_missing', 'shortage', 'found', 'receive'];
+export const LINE_SLIP_REQUEST_EVENTS = ['ship_change', 'reprint', 'label_missing', 'shortage', 'found', 'receive', 'stockout_ack'];
 const WORK_EVENTS = ['start', 'next', 'takeover', 'pause', 'resume', 'cancel', 'undo', 'jump', 'ship_change',
-  'reprint', 'label_missing', 'shortage', 'excess', 'wrong_item', 'found', 'receive', ...LINE_EVENTS];
+  'reprint', 'label_missing', 'shortage', 'excess', 'wrong_item', 'found', 'receive', 'stockout_ack', ...LINE_EVENTS];
 
 /**
  * 梱包機ライン種別 (要件v7 — 中原さん指示 2026-08-18)。
@@ -693,6 +693,7 @@ export function getWorkState(batchId) {
   // ③ミス候補 (梱包完了サマリで確定/取下げする) と、保留伝票の未解決再ピックタスク状態
   let incidents = [];
   let repickBySlip = {};
+  let stockoutBySlip = {};   // 3階「在庫なし」(unavailable) の報告がある保留伝票: seq → [{sku, product_name, req_qty, claimed_by, updated_at}]
   try {
     incidents = db.prepare(
       "SELECT * FROM pk_pack_incidents WHERE batch_id=? AND status='candidate' ORDER BY id"
@@ -705,6 +706,18 @@ export function getWorkState(batchId) {
       const cur = repickBySlip[t.slip_seq];
       repickBySlip[t.slip_seq] = (cur == null || cur === 'fulfilled') ? t.status : cur;
     }
+    // 3階が「在庫なし」にした依頼 (例外処理監査 PR-1)。以前はどの画面も読まず、伝票が
+    // 「⏳再ピック対応待ち」のまま何日も残った。保留中の伝票だけ = 1階が「在庫なしを確認」する対象
+    const heldRepick = new Set(full.filter((s) => s.status === 'held' && s.hold_reason === 'repick').map((s) => s.seq));
+    for (const t of db.prepare(
+      "SELECT id, slip_seq, sku, product_name, req_qty, claimed_by, requested_by, updated_at FROM pk_pack_tasks WHERE batch_id=? AND kind='repick' AND status='unavailable' AND slip_seq IS NOT NULL ORDER BY id"
+    ).all(batchId)) {
+      if (!heldRepick.has(t.slip_seq)) continue;
+      (stockoutBySlip[t.slip_seq] ||= []).push({
+        id: t.id, sku: t.sku, product_name: t.product_name, req_qty: t.req_qty,
+        claimed_by: t.claimed_by, requested_by: t.requested_by, updated_at: t.updated_at,
+      });
+    }
   } catch { /* v4未適用環境 */ }
   return {
     batch,
@@ -713,6 +726,7 @@ export function getWorkState(batchId) {
     doneCount: full.filter((s) => s.status === 'done').length,
     incidents,
     repickBySlip,
+    stockoutBySlip,
   };
 }
 
@@ -742,6 +756,10 @@ function eventResult(batchId) {
     heldSeqs: s.slips.filter((x) => x.status === 'held').map((x) => x.seq),
     repickSeqs: s.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
     repickReadySeqs: Object.entries(s.repickBySlip).filter(([, st]) => st === 'fulfilled').map(([q]) => Number(q)),
+    // 3階「在庫なし」の報告がある保留伝票 / 1階が確認して閉じた伝票 (出荷保留・在庫なし)
+    repickUnavailableSeqs: Object.keys(s.stockoutBySlip || {}).map(Number),
+    stockoutBySlip: s.stockoutBySlip || {},
+    stockoutSeqs: s.slips.filter((x) => x.status === 'cancelled' && x.hold_reason === 'stockout').map((x) => x.seq),
     incidents: s.incidents,
     // 完了取消の対象 = 最後に完了した伝票 (完了順の正はイベント履歴 — done_at は秒精度)
     lastDoneSeq: lastDoneSeqOf(batchId),
@@ -1018,8 +1036,8 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       `).run(batchId, slipSeq, slip.ne_slip_no, slip.site_order_no || null, batch.folder_name,
         slip.recipient_name || null, worker, now, event);
       var reprintId = Number(info.lastInsertRowid);   // eventResult後にresultへ載せる (var=分岐外参照)
-    } else if (['shortage', 'excess', 'wrong_item', 'found', 'receive'].includes(event)) {
-      // ①不足→再ピック / ②余り→棚戻し / 品違い / 見つかった / 受領 (要件§5.4〜5.6)。
+    } else if (['shortage', 'excess', 'wrong_item', 'found', 'receive', 'stockout_ack'].includes(event)) {
+      // ①不足→再ピック / ②余り→棚戻し / 品違い / 見つかった / 受領 / 在庫なしを確認 (要件§5.4〜5.6)。
       // 完了済み伝票への不足/品違いも許可 (誤タップ後の気づき) — バッチ完了済みなら再オープン
       // (ラインバッチは再オープンしない: バッチの完了は件数記録 line_done で決まり、伝票の保留とは独立)
       requireSlipOp(['packing', 'done']);
@@ -1027,6 +1045,14 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       if (!lineKind && batch.status === 'done' && ['shortage', 'wrong_item'].includes(event)) {
         db.prepare("UPDATE pk_pack_batches SET status='packing', finished_at=NULL, updated_at=? WHERE id=?")
           .run(now, batchId);
+      }
+      // 「在庫なしを確認」で閉じた伝票が最後の1枚なら、そのままバッチ完了 (「次へ」を経ないため — Q1 決定 2026-09-05)。
+      // 完了条件は next と同じ = 未処理ゼロ + 保留ゼロ
+      if (!lineKind && event === 'stockout_ack' && batch.status === 'packing') {
+        const c = db.prepare(`SELECT SUM(status='pending') AS p, SUM(status='held') AS h FROM pk_pack_slips WHERE batch_id=?`).get(batchId);
+        if ((c.p || 0) === 0 && (c.h || 0) === 0) {
+          db.prepare("UPDATE pk_pack_batches SET status='done', finished_at=?, updated_at=? WHERE id=?").run(now, now, batchId);
+        }
       }
     } else if (LINE_EVENTS.includes(event)) {
       // 梱包機ライン工程 (PAS/MELT — 紙台帳の置き換え。要件v7)。伝票めくりの代わりに
@@ -1370,7 +1396,9 @@ export function getDailySummary(workDate) {
 //   例外: unavailable (在庫なし等 → エスカレーション) / cancelled (見つかった・取下げ)
 const TASK_TRANSITIONS = {
   claim: { from: ['requested'], to: 'claimed' },
-  fulfill: { from: ['claimed'], to: null },   // to は kind で決まる (下で解決)
+  // unavailable → fulfill も許す (例外処理監査 PR-1): 「在庫なし」にした後で他ロケで見つけた・届けた、を記録できる
+  // (以前は取り消せず、9/5 にピッカーが /tasks で在庫なし→直後にバッチで確保しても記録が在庫なしのままだった)
+  fulfill: { from: ['claimed', 'unavailable'], to: null },   // to は kind で決まる (下で解決)
   unavailable: { from: ['requested', 'claimed'], to: 'unavailable' },
   cancel: { from: ['requested', 'claimed'], to: 'cancelled' },
 };
@@ -1390,11 +1418,16 @@ function lookupLocation(pkBatchId, sku) {
 
 function insertTask(db, batch, { slipSeq, kind, sku, productName, qty, incidentId }, worker, now) {
   // 業務キー (伝票×SKU×種別) の重複依頼ガード (要件§5.4-6)
+  // 3階が「在庫なし」にした依頼 (unavailable) も生きている扱い — 以前は数えず、1階が同じ商品を再依頼して
+  // 🔴バッチがもう1本立った (9/5 出荷_55)。伝票の「在庫なしを確認」で閉じるまで再依頼させない
   const dup = db.prepare(`
-    SELECT id FROM pk_pack_tasks
+    SELECT id, status FROM pk_pack_tasks
     WHERE batch_id=? AND kind=? AND LOWER(TRIM(sku))=? AND (slip_seq IS ? OR slip_seq = ?)
-      AND status IN ('requested','claimed','fulfilled')
+      AND status IN ('requested','claimed','fulfilled','unavailable')
   `).get(batch.id, kind, normSku(sku), slipSeq ?? null, slipSeq ?? -1);
+  if (dup?.status === 'unavailable') {
+    throw new PackError(409, 'stockout_reported', `3階から「在庫なし」の報告があります (${sku})。伝票の「在庫なしを確認」で閉じてください`);
+  }
   if (dup) throw new PackError(409, 'dup_task', `同じ依頼が既にあります (${kind} ${sku})`);
   const loc = lookupLocation(batch.pk_batch_id, sku);
   return Number(db.prepare(`
@@ -1452,9 +1485,12 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
       const dupInc = db.prepare(`SELECT id FROM pk_pack_incidents
         WHERE batch_id=? AND slip_seq=? AND LOWER(TRIM(sku))=LOWER(TRIM(?)) AND kind IN ('shortage','wrong_item') AND status='candidate'`)
         .get(batchId, slipSeq, line.sku);
-      const dupTask = db.prepare(`SELECT id FROM pk_pack_tasks
-        WHERE batch_id=? AND slip_seq=? AND kind='repick' AND LOWER(TRIM(sku))=LOWER(TRIM(?)) AND status IN ('requested','claimed','fulfilled')`)
+      const dupTask = db.prepare(`SELECT id, status FROM pk_pack_tasks
+        WHERE batch_id=? AND slip_seq=? AND kind='repick' AND LOWER(TRIM(sku))=LOWER(TRIM(?)) AND status IN ('requested','claimed','fulfilled','unavailable')`)
         .get(batchId, slipSeq, line.sku);
+      if (dupTask?.status === 'unavailable') {
+        throw new PackError(409, 'stockout_reported', `伝票 ${slipSeq} の ${line.sku} は3階から「在庫なし」の報告があります。「在庫なしを確認」で閉じてください`);
+      }
       if (dupInc || dupTask) throw new PackError(409, 'dup_task', `伝票 ${slipSeq} の ${line.sku} は既に依頼済みです`);
     }
     // ⭐候補方式 (中原さん指示 2026-08-17): 記録時はタスクを発行しない。
@@ -1485,6 +1521,40 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
     return {};
   }
 
+  if (event === 'stockout_ack') {
+    // 🚫 在庫なしを確認 (Q1 決定 2026-09-05 = 案a): 3階が「在庫なし」と報告した保留伝票を、
+    // 1階の梱包者が確認して『出荷保留 (在庫なし)』として閉じる。事務へ通知し (router)、バッチは完了できる。
+    // 以前は unavailable を読む画面が無く、伝票が「⏳再ピック対応待ち」のまま何日も残った (出荷_01 8/30・出荷_21 9/1)
+    if (!Number.isInteger(slipSeq) || slipSeq < 1) throw new PackError(400, 'bad_slip_seq', 'slip_seq が不正です');
+    const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
+    if (!slip || slip.status !== 'held' || slip.hold_reason !== 'repick') {
+      throw new PackError(409, 'not_held', `伝票 ${slipSeq} は再ピック保留ではありません`);
+    }
+    const open = db.prepare(`SELECT COUNT(*) c FROM pk_pack_tasks WHERE batch_id=? AND slip_seq=? AND kind='repick'
+      AND status IN ('requested','claimed','fulfilled')`).get(batchId, slipSeq).c;
+    if (open > 0) {
+      throw new PackError(409, 'repick_in_progress',
+        'まだ再ピック中の商品があります (届いたら「受け取った」・手元で出てきたら「見つかった」)');
+    }
+    const cands = db.prepare(`SELECT COUNT(*) c FROM pk_pack_incidents
+      WHERE batch_id=? AND slip_seq=? AND status='candidate' AND kind IN ('shortage','wrong_item')`).get(batchId, slipSeq).c;
+    if (cands > 0) {
+      throw new PackError(409, 'candidates_remain', '未送信の不足候補があります。先に「ピッキングへ送信」するか、見つかったなら取り下げてください');
+    }
+    const na = db.prepare(`SELECT * FROM pk_pack_tasks WHERE batch_id=? AND slip_seq=? AND kind='repick' AND status='unavailable' ORDER BY id`)
+      .all(batchId, slipSeq);
+    if (na.length === 0) throw new PackError(409, 'no_stockout', '3階からの「在庫なし」の報告がありません');
+    // 伝票は 'cancelled' + hold_reason='stockout' (= この束では梱包しない。保留ではないのでバッチ完了を妨げない)
+    db.prepare("UPDATE pk_pack_slips SET status='cancelled', hold_reason='stockout', done_at=NULL WHERE id=?").run(slip.id);
+    return {
+      notify: {
+        kind: 'stockout', slipSeq, neSlipNo: slip.ne_slip_no, siteOrderNo: slip.site_order_no || null,
+        recipientName: slip.recipient_name || null, folder: batch.folder_name,
+        items: na.map((t) => ({ sku: t.sku, name: t.product_name, qty: t.req_qty, claimedBy: t.claimed_by || t.requested_by, at: t.updated_at })),
+      },
+    };
+  }
+
   if (event === 'found' || event === 'receive') {
     // 保留 (repick) の解除。found=後から出てきた (依頼取下げ+候補も取下げ) / receive=再ピック品を受領
     if (!Number.isInteger(slipSeq) || slipSeq < 1) throw new PackError(400, 'bad_slip_seq', 'slip_seq が不正です');
@@ -1511,6 +1581,15 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
         WHERE batch_id=? AND slip_seq=? AND status='candidate' AND kind IN ('shortage','wrong_item')
           AND (? IS NULL OR LOWER(TRIM(sku)) = ?)
       `).run(now, batchId, slipSeq, skuN, skuN);
+      // 送信済み (confirmed) も、いま取り消した依頼の分だけ取り下げる (Q5 決定 2026-09-05)。
+      // ラインは候補を経ず即送信するため「送ったあとに見つかった」が confirmed のまま残り、
+      // ピッカーのミス率に数えられていた。⭐対象は取り消したタスクに紐づく候補だけ —
+      // 既に受領済み (本当に足りなかった) の記録まで消さない
+      const incIds = targets.map((x) => x.incident_id).filter((x) => x != null);
+      if (incIds.length > 0) {
+        db.prepare(`UPDATE pk_pack_incidents SET status='withdrawn', updated_at=?
+          WHERE id IN (${incIds.map(() => '?').join(',')}) AND status='confirmed'`).run(now, ...incIds);
+      }
       if (skuN) {
         const remainCands = db.prepare(`SELECT COUNT(*) c FROM pk_pack_incidents
           WHERE batch_id=? AND slip_seq=? AND status='candidate' AND kind IN ('shortage','wrong_item')`).get(batchId, slipSeq).c;
@@ -1551,13 +1630,14 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
 
 // ─── タスクの実行側操作 (picking のキュー画面から呼ばれる更新API) ───
 
-export function listOpenTasks() {
+/** 未完了タスク。kind を指定するとその種別だけ (棚戻し専用キュー用 — 再ピックは 🔴バッチに一本化)。 */
+export function listOpenTasks({ kind = null } = {}) {
   return getDB().prepare(`
     SELECT t.*, b.folder_name AS batch_folder FROM pk_pack_tasks t
     JOIN pk_pack_batches b ON b.id = t.batch_id
-    WHERE t.status IN ('requested','claimed')
+    WHERE t.status IN ('requested','claimed') AND (? IS NULL OR t.kind = ?)
     ORDER BY t.id
-  `).all();
+  `).all(kind, kind);
 }
 
 /**
@@ -1591,11 +1671,11 @@ export function listRepickReady() {
   } catch { return []; }
 }
 
-export function countOpenTasks() {
+export function countOpenTasks({ kind = null } = {}) {
   try {
     return getDB().prepare(
-      "SELECT COUNT(*) c FROM pk_pack_tasks WHERE status IN ('requested','claimed')"
-    ).get().c;
+      "SELECT COUNT(*) c FROM pk_pack_tasks WHERE status IN ('requested','claimed') AND (? IS NULL OR kind = ?)"
+    ).get(kind, kind).c;
   } catch { return 0; }
 }
 

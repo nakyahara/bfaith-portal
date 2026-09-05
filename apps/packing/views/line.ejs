@@ -67,6 +67,7 @@
     .slip-info .nm { font-weight: 700; }
     .open-req { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 8px; margin-top: 8px; background: #fff3cd; font-size: .95rem; }
     .open-req.ready { background: #e6f4ea; }
+    .open-req.stockout { background: #ffe3e3; border: 2px solid #e03131; }
     .open-req .grow { flex: 1 1 200px; }
     .open-req button { padding: 10px 14px; font-size: 1rem; font-weight: 700; border-radius: 8px; border: 1px solid #ccc; background: #fff; }
     .open-req button.primary { background: #188038; color: #fff; border-color: #188038; }
@@ -99,6 +100,10 @@
     const repickMap = (typeof repickBySlip !== 'undefined' && repickBySlip) ? repickBySlip : {};
     const taskList = (typeof tasks !== 'undefined' && Array.isArray(tasks)) ? tasks : [];
     const heldSlips = slipList.filter((x) => x.status === 'held' && x.holdReason === 'repick');
+    // 🚫 3階「在庫なし」の報告 (seq → 商品) と、1階が確認して閉じた伝票 (出荷保留・在庫なし) — 例外処理監査 PR-1
+    const stockoutMap = (typeof stockoutBySlip !== 'undefined' && stockoutBySlip) ? stockoutBySlip : {};
+    const stockoutSlips = slipList.filter((x) => x.status === 'cancelled' && x.holdReason === 'stockout');
+    const jstHm = (iso) => { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; };
     const TASK_LABEL = { requested: '⏳ ピッカー対応待ち', claimed: '🏃 ピッカーが取りに行っています', fulfilled: '✅ 届きました' };
   %>
   <% if (liveRun) { %>
@@ -249,7 +254,7 @@
       <div class="phase-card" id="reqCard">
         <h2>📮 伝票ごとの依頼 <span class="sub">再ピック・サイズ変更・再印刷</span></h2>
         <div class="phase-meta" style="font-size:.9rem; color:#555">紙で作業していても、伝票を選べばここから依頼できます (梱包画面と同じ経路で届きます)。</div>
-        <% if (heldSlips.length > 0 || incList.length > 0) { %>
+        <% if (heldSlips.length > 0 || incList.length > 0 || stockoutSlips.length > 0) { %>
           <div style="margin-top:10px; font-weight:700">進行中の依頼</div>
           <% for (const hs of heldSlips) {
                // SKU 単位に状態を出す (同一伝票に複数の依頼があり得る — Codex R2)。
@@ -257,8 +262,11 @@
                const cands = incList.filter((i) => i.slipSeq === hs.seq);
                const tks = taskList.filter((t) => t.slipSeq === hs.seq);
                const ready = cands.length === 0 && tks.length > 0 && tks.every((t) => t.status === 'fulfilled');
+               // 3階が「在庫なし」にした商品。他の依頼が残っていなければ「在庫なしを確認」で伝票を閉じられる
+               const na = stockoutMap[hs.seq] || [];
+               const canAck = cands.length === 0 && tks.length === 0 && na.length > 0;
                const nameOf = (sku) => (hs.lines.find((l) => l.sku === sku) || {}).name || sku; %>
-            <div class="open-req <%= ready ? 'ready' : '' %>" data-seq="<%= hs.seq %>">
+            <div class="open-req <%= ready ? 'ready' : (na.length ? 'stockout' : '') %>" data-seq="<%= hs.seq %>">
               <div class="grow">#<%= hs.seq %> <%= hs.slipNo %> / <%= hs.recipientName || '' %> (NE <%= hs.neSlipNo %>)
                 <% for (const c of cands) { %>
                   <div>📝 <%= nameOf(c.sku) %> × <%= c.qty %> — <b>未送信</b>
@@ -269,12 +277,23 @@
                   <div>🔄 <%= nameOf(t.sku) %> × <%= t.qty %> — <%= TASK_LABEL[t.status] || t.status %>
                     <button type="button" class="found-sku" data-seq="<%= hs.seq %>" data-sku="<%= t.sku %>" data-name="<%= nameOf(t.sku) %>">見つかった</button></div>
                 <% } %>
-                <% if (cands.length === 0 && tks.length === 0) { %><div>⏳ 保留中</div><% } %>
+                <% for (const t of na) { %>
+                  <div style="color:#c92a2a; font-weight:700">🚫 <%= nameOf(t.sku) %> × <%= t.req_qty %> — 3階: 在庫なし (<%= t.claimed_by || t.requested_by || '-' %> <%= jstHm(t.updated_at) %>)</div>
+                <% } %>
+                <% if (cands.length === 0 && tks.length === 0 && na.length === 0) { %><div>⏳ 保留中</div><% } %>
               </div>
               <% if (ready) { %>
                 <button type="button" class="primary" onclick="send('receive', { slip_seq: <%= hs.seq %> })">📦 全部受け取った</button>
               <% } %>
+              <% if (canAck) { %>
+                <button type="button" class="danger" onclick="stockoutAck(<%= hs.seq %>)">🚫 在庫なしを確認 → 出荷保留にする (事務へ通知)</button>
+              <% } %>
               <button type="button" onclick="foundSlip(<%= hs.seq %>)">全部見つかった (取下げ)</button>
+            </div>
+          <% } %>
+          <% for (const ss of stockoutSlips) { %>
+            <div class="open-req" style="background:#f1f3f5; color:#868e96">
+              <div class="grow">#<%= ss.seq %> <%= ss.slipNo %> / <%= ss.recipientName || '' %> (NE <%= ss.neSlipNo %>) — 🚫 出荷保留 (在庫なし)・事務へ通知済み</div>
             </div>
           <% } %>
         <% } %>
@@ -379,6 +398,9 @@
           if (r.status === 409) location.reload();
           return;
         }
+        if (r.body && r.body.stockoutNotify === 'failed') {
+          alert('伝票を出荷保留 (在庫なし) にしましたが、事務への通知に失敗しました。口頭かチャットで伝えてください');
+        }
         location.reload();
       } finally {
         sending = false;
@@ -471,10 +493,13 @@
       for (const id of ['reqRepickBtn', 'reqShipBtn', 'reqReprintBtn']) document.getElementById(id).disabled = !x;
       if (!x) { info.style.display = 'none'; return; }
       const held = x.status === 'held' && x.holdReason === 'repick';
+      const stockout = x.status === 'cancelled' && x.holdReason === 'stockout';
       info.innerHTML = `<div class="nm">${esc(slipLabel(x))}</div>`
-        + `<div>配送方法: ${esc(x.deliveryMethod || '—')}${x.siteOrderNo ? ` / 受注番号: ${esc(x.siteOrderNo)}` : ''}${held ? ' / <b>⏳ 再ピック保留中</b>' : ''}</div>`
+        + `<div>配送方法: ${esc(x.deliveryMethod || '—')}${x.siteOrderNo ? ` / 受注番号: ${esc(x.siteOrderNo)}` : ''}${held ? ' / <b>⏳ 再ピック保留中</b>' : ''}${stockout ? ' / <b style="color:#c92a2a">🚫 出荷保留 (在庫なし)</b>' : ''}</div>`
         + x.lines.map((l) => `<div>・${esc(l.name)} <span class="sub">(${esc(l.sku)})</span> × <b>${l.qty}</b></div>`).join('');
       info.style.display = 'block';
+      // 出荷保留 (在庫なし) で閉じた伝票には再ピック依頼を出さない (事務が NE で扱う)
+      document.getElementById('reqRepickBtn').disabled = stockout;
       // 保留中でも別の商品の不足は追加で出せる (同じ伝票で2品目不足 — Codex R1)。同じ商品の二重依頼はサーバーが 409
     }
     if (slipPick) filterSlips();
@@ -540,6 +565,12 @@
         if (c && !c.ok && !(c.body.code === 'already_resolved' && c.body.status === want)) alert(c.body.error || `エラー (${c.status})`);
         location.reload();
       } finally { sending = false; }
+    }
+    // 🚫 在庫なしを確認 (Q1 決定 2026-09-05): 3階が「在庫なし」にした伝票を出荷保留にして閉じ、事務へ通知する
+    function stockoutAck(seq) {
+      if (!workerSel.value) { alert('作業者を選択してください'); return; }
+      if (!confirm(`#${seq} を「出荷保留 (在庫なし)」にして閉じます。事務へ通知し、NE で出荷保留にしてもらいます。\n商品と納品書は出荷保留の棚へ置いてください。よろしいですか?`)) return;
+      send('stockout_ack', { slip_seq: seq });
     }
     function foundSlip(seq) {
       if (!confirm(`#${seq} の足りなかった商品が【全部】見つかったため、この伝票の再ピック依頼と不足の候補をすべて取り下げます。\n(1品目だけ見つかったときは、その商品の横の「見つかった」を押してください)\nよろしいですか?`)) return;

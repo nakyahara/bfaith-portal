@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -316,6 +316,12 @@ const MIGRATIONS = {
   //   NULL = v13 より前に取り込んだ行 (出どころ不明) なので警告の対象にしない
   13: () => {
     db.exec('ALTER TABLE pk_batches ADD COLUMN class_source TEXT');   // 'txt' | 'suggested' | 'manual'
+  },
+  // v14: 現場間バナーに「対象伝票を開く」リンクを持たせる (例外処理監査 PR-1・2026-09-05)。
+  //   3階の「在庫なし」を1階の全端末に赤バナーで知らせ、その伝票へ直接飛べるようにする
+  //   (以前は在庫なしが1階のどの画面にも出ず、伝票が「⏳再ピック対応待ち」のまま何日も残った)
+  14: () => {
+    db.exec('ALTER TABLE pk_floor_alerts ADD COLUMN link TEXT');
   },
 };
 

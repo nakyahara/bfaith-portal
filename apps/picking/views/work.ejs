@@ -349,6 +349,7 @@
       totalQty: state.batch.total_qty, currentSeq: state.currentSeq,
       pauseReason: state.batch.pause_reason || null,
       folderName: state.batch.folder_name || null,
+      origin: state.batch.origin || 'import',   // 'repick' = 🔴再ピックバッチ (欠品シートに「後で取りに行く」を出さない)
       shortageOpenSeq: state.batch.shortage_open_seq ?? null,   // 欠品対応シートを開いたまま閉じた/リロードしたときの復帰用
     }).replace(/</g, '\\u003c') %>;
     const LINES = <%- JSON.stringify(state.lines.map((l) => ({
@@ -727,6 +728,11 @@
       shortAlt = null;
       $('shortInfo').textContent = `${shortTarget.loc}｜${splitName(shortTarget.name).main} (指示 ${shortTarget.qty}個)`;
       $('shortQty').textContent = shortVal;
+      // 🔴再ピックバッチでは「後で取りに行く」を出さない (受注明細が無く依頼が迷子になる — 9/1 に実発生)。
+      // 取れなければ「どこにもない」= 在庫なしとして1階へ伝わる
+      const repick = BATCH.origin === 'repick';
+      for (const id of ['shortLater', 'restLater']) $(id).style.display = repick ? 'none' : '';
+      for (const id of ['shortNone', 'restNone']) $(id).style.gridColumn = repick ? '1 / -1' : '';
       if (sendOpen) { BATCH.shortageOpenSeq = shortTarget.seq; enqueue('shortage_open', shortTarget.seq); }
       showShortStep(1);
     }
