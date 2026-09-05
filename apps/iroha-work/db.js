@@ -1119,33 +1119,66 @@ export function activeSessionsByPage() {
  * ⭐直後だけ (withinMs。既定 60 秒)。その人が別の作業を始めていたら戻せない (開いている記録は 1 人 1 本 — UNIQUE 索引)。
  * 1 件でも戻せなければ**何も戻さない** (部分的に戻して混乱させない。stopSessions と同じ考え)
  */
-export function undoStopSessions({ taskId, sessionIds, withinMs = 60000, guard = null }) {
+export function undoStopSessions({ taskId, sessionIds, withinMs = 60000, expectTaskVersion = null, guard = null }) {
   const ids = [...new Set((Array.isArray(sessionIds) ? sessionIds : []).map(Number))].filter((n) => Number.isInteger(n) && n > 0);
   if (!ids.length) return { ok: false, error: 'bad_request', message: 'session_id が必要です (画面を更新してください)' };
   const db = getDB();
   const nowMs = Date.now();
-  return db.transaction(() => {
-    if (guard) { const g = guard(); if (g) return g; }
-    const get = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?');
-    const openOf = db.prepare('SELECT id FROM f_iroha_work_sessions WHERE worker_id = ? AND ended_at IS NULL LIMIT 1');
-    const targets = [];
-    for (const id of ids) {
-      const row = get.get(id);
-      if (!row || Number(row.task_id) !== Number(taskId)) return { ok: false, error: 'not_found', message: '作業の記録が見つかりません (画面を更新してください)' };
-      if (row.voided_at) return { ok: false, error: 'voided', message: '取り消された記録はもどせません' };
-      if (!row.ended_at) { targets.push({ row, already: true }); continue; }   // まだ動いている = 二重押し。そのまま
-      if (nowMs - Date.parse(row.ended_at) > withinMs) return { ok: false, error: 'too_late', message: '時間が経ったのでもどせません。「▶ 作業をはじめる」でもう一度はじめてください' };
-      if (openOf.get(row.worker_id)) return { ok: false, error: 'busy', message: row.worker_name + ' さんは別の作業をはじめています' };
-      targets.push({ row, already: false });
-    }
-    const upd = db.prepare('UPDATE f_iroha_work_sessions SET ended_at = NULL, end_reason = NULL, raw_seconds = NULL WHERE id = ? AND ended_at IS NOT NULL');
-    const reopened = [];
-    for (const { row, already } of targets) {
-      if (!already) upd.run(row.id);
-      reopened.push({ id: row.id, worker_id: row.worker_id, worker_name: row.worker_name, started_at: row.started_at, already });
-    }
-    return { ok: true, reopened };
-  }).immediate();
+  try {
+    return db.transaction(() => {
+      if (guard) { const g = guard(); if (g) return g; }
+      // ⭐止めたあとにカードが変わっていたら (棚入待ちにした・できた数を直した等) 戻さない — タイマーだけ動き直すと意味が崩れる (Codex PR #1200 R1 #2)
+      if (expectTaskVersion != null) {
+        const tv = db.prepare('SELECT version FROM f_iroha_tasks WHERE id = ?').get(Number(taskId));
+        if (!tv || Number(tv.version) !== Number(expectTaskVersion)) return { ok: false, error: 'conflict', message: 'カードの状態が変わったのでもどせません (もう一度はじめるには「▶ 作業をはじめる」)' };
+      }
+      const get = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?');
+      const openOf = db.prepare('SELECT id FROM f_iroha_work_sessions WHERE worker_id = ? AND ended_at IS NULL LIMIT 1');
+      const targets = [];
+      const seenWorker = new Set();
+      for (const id of ids) {
+        const row = get.get(id);
+        if (!row || Number(row.task_id) !== Number(taskId)) return { ok: false, error: 'not_found', message: '作業の記録が見つかりません (画面を更新してください)' };
+        if (row.voided_at) return { ok: false, error: 'voided', message: '取り消された記録はもどせません' };
+        if (!row.ended_at) { targets.push({ row, already: true }); continue; }   // まだ動いている = 二重押し。そのまま
+        // 人が止めたもの (pause / done) だけ。職員が管理画面で閉じたもの (admin) は戻さない (Codex R1 #1)
+        if (row.end_reason !== 'pause' && row.end_reason !== 'done') return { ok: false, error: 'not_undoable', message: 'この記録はもどせません' };
+        const endedMs = Date.parse(row.ended_at);
+        if (!Number.isFinite(endedMs) || nowMs - endedMs < 0 || nowMs - endedMs > withinMs) return { ok: false, error: 'too_late', message: '時間が経ったのでもどせません。「▶ 作業をはじめる」でもう一度はじめてください' };
+        // 同じ人の記録を 2 本は戻せない (開いている記録は 1 人 1 本 — UNIQUE 索引に当ててから throw させない。Codex R1 #6)
+        if (seenWorker.has(row.worker_id)) return { ok: false, error: 'bad_request', message: '同じ人の記録が 2 つあります (画面を更新してください)' };
+        seenWorker.add(row.worker_id);
+        if (openOf.get(row.worker_id)) return { ok: false, error: 'busy', message: row.worker_name + ' さんは別の作業をはじめています' };
+        targets.push({ row, already: false });
+      }
+      const upd = db.prepare('UPDATE f_iroha_work_sessions SET ended_at = NULL, end_reason = NULL, raw_seconds = NULL WHERE id = ? AND ended_at IS NOT NULL');
+      const reopened = [];
+      for (const { row, already } of targets) {
+        if (!already) upd.run(row.id);
+        reopened.push({ id: row.id, worker_id: row.worker_id, worker_name: row.worker_name, started_at: row.started_at, already });
+      }
+      return { ok: true, reopened };
+    }).immediate();
+  } catch (e) {
+    // 直列化の隙間で同じ人の作業が別端末から始まっていた等で UNIQUE に当たったら、500 ではなく「別の作業中」として返す
+    if (e && /SQLITE_CONSTRAINT/.test(String(e.code || e.message))) return { ok: false, error: 'busy', message: '別の作業がはじまっているのでもどせません' };
+    throw e;
+  }
+}
+
+/**
+ * その日 (JST) に少しでもかかっている作業の記録 (日報用 — 監修 2026-09-05)。
+ * 開始日ではなく**重なり**で引く: 日をまたいだ記録は両日に、その日の分だけ数える (Codex PR #1200 R1 #8)。
+ * 上限 (cap) を超えたら truncated を立てる (黙って一部だけの合計を出さない — Codex R1 #9)
+ */
+export function sessionsOverlappingDay(ymd, { cap = 5000 } = {}) {
+  const startUtc = jstDayStartUtc(ymd);
+  if (!startUtc) return null;
+  const endUtc = new Date(Date.parse(startUtc) + 86400000).toISOString();
+  const rows = getDB().prepare(`SELECT id, task_id, page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, ended_at, end_reason, raw_seconds
+    FROM f_iroha_work_sessions WHERE voided_at IS NULL AND started_at < ? AND (ended_at IS NULL OR ended_at >= ?)
+    ORDER BY started_at, id LIMIT ?`).all(endUtc, startUtc, cap + 1);
+  return { rows: rows.slice(0, cap), truncated: rows.length > cap, startUtc, endUtc };
 }
 
 export function activeSessionsByTask() {

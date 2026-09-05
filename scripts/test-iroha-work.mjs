@@ -2829,74 +2829,118 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       master_snapshot: { material_code: 'D-8', storage_container: '20L' } }, { batchId: 'test-undo' }).id;
     const v = () => TD.getTask(uid).version;
     const openSid = () => db.prepare('SELECT id FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL ORDER BY id DESC').get(uid).id;
+    const sessRow = (id) => db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(id);
+    const start = () => call('POST', '/api/sessions/start', { cookie, body: { id: uid, worker_id: w2.id, worker_ids: [w2.id] } });
+    const stop = (sid, reason = 'pause') => call('POST', '/api/sessions/stop', { cookie, body: { id: uid, worker_id: w2.id, session_ids: [sid], reason } });
+    const undo = (body, opt = {}) => call('POST', '/api/undo', { cookie: opt.cookie || cookie, body: { id: uid, worker_id: w2.id, ...body } });
+    // 別の iPad (切符は止めた端末からだけ使える)
+    const code2 = createEnrollCode('別のiPad', 'test').code;
+    const redeem2 = await call('POST', '/enroll/redeem', { body: { code: code2 } });
+    const cookie2 = (redeem2.headers['set-cookie'] || []).map((c) => c.split(';')[0]).find((c) => c.startsWith('iw_device='));
+    ok(!!cookie2, '前提: 別の iPad を登録');
     // はじめる → ぬける → もどす
-    const st = await call('POST', '/api/sessions/start', { cookie, body: { id: uid, worker_id: w2.id, worker_ids: [w2.id] } });
-    ok(st.status === 200 && st.json.ok, '前提: 作業をはじめる');
+    ok((await start()).status === 200, '前提: 作業をはじめる');
     const sid = openSid();
-    const stop = await call('POST', '/api/sessions/stop', { cookie, body: { id: uid, worker_id: w2.id, session_ids: [sid], reason: 'pause' } });
-    ok(stop.status === 200 && stop.json.stopped[0].id === sid && db.prepare('SELECT ended_at FROM f_iroha_work_sessions WHERE id = ?').get(sid).ended_at, '前提: ぬける (pause)');
-    const und = await call('POST', '/api/undo', { cookie, body: { kind: 'stop', id: uid, worker_id: w2.id, session_ids: [sid] } });
-    const row = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(sid);
-    ok(und.status === 200 && und.json.ok && und.json.reopened.length === 1 && row.ended_at === null && row.end_reason === null && row.raw_seconds === null,
-      'もどす: ended_at を消して「止めなかったこと」にする (記録は 1 本のまま。時間は続けて数える)');
+    const st1 = await stop(sid);
+    ok(st1.status === 200 && st1.json.stopped[0].id === sid && sessRow(sid).ended_at && st1.json.undo && st1.json.undo.token && st1.json.undo.expires_in === 60,
+      'ぬける (pause) の応答に取り消しの切符が付く (60 秒)');
+    ok((await undo({ kind: 'stop' })).status === 409, '切符なしではもどせない (409)');
+    ok((await undo({ kind: 'stop', token: 'zzz' })).status === 409, '知らない切符ではもどせない');
+    ok((await undo({ kind: 'stop', token: st1.json.undo.token }, { cookie: cookie2 })).status === 403, '別の iPad からはもどせない (403)');
+    ok((await undo({ kind: 'stop', token: st1.json.undo.token, session_ids: [999999] })).status === 200, '画面が送った session_ids は無視 — 何を戻すかは切符が決める');
+    const row = sessRow(sid);
+    ok(row.ended_at === null && row.end_reason === null && row.raw_seconds === null, 'もどす: ended_at を消して「止めなかったこと」にする (記録は 1 本のまま。時間は続けて数える)');
     ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'session_undo_stop'").get().c >= 1, '取り消したことが操作履歴に残る');
     const stAfter = (await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === uid);
     ok(stAfter && stAfter.active.some((a) => a.id === sid && 'device_label' in a), '一覧の作業中に戻る (device_label つき = 作業中チップが「この iPad の作業」を見分ける)');
-    const twice = await call('POST', '/api/undo', { cookie, body: { kind: 'stop', id: uid, worker_id: w2.id, session_ids: [sid] } });
-    ok(twice.status === 200 && twice.json.reopened[0].already === true, '二重押しは何もしない (already)');
-    await call('POST', '/api/sessions/stop', { cookie, body: { id: uid, worker_id: w2.id, session_ids: [sid], reason: 'pause' } });
+    ok((await undo({ kind: 'stop', token: st1.json.undo.token })).status === 409, '切符は 1 回きり (二重押しは 409)');
+    // 時間が経ったらもどせない
+    const st2 = await stop(sid);
     db.prepare('UPDATE f_iroha_work_sessions SET ended_at = ? WHERE id = ?').run(new Date(Date.now() - 120000).toISOString(), sid);
-    const late = await call('POST', '/api/undo', { cookie, body: { kind: 'stop', id: uid, worker_id: w2.id, session_ids: [sid] } });
+    const late = await undo({ kind: 'stop', token: st2.json.undo.token });
     ok(late.status === 409 && late.json.error === 'too_late', '60 秒を過ぎたらもどせない (409 too_late)');
-    ok((await call('POST', '/api/undo', { cookie, body: { kind: 'stop', id: uid, worker_id: w2.id, session_ids: [999999] } })).status === 404, '知らない記録は 404');
-    ok((await call('POST', '/api/undo', { cookie, body: { kind: 'xx', id: uid, worker_id: w2.id } })).status === 400, 'kind が不正なら 400');
-    // 別の作業を始めた人の分はもどせない
+    ok((await undo({ kind: 'xx', token: 'x' })).status === 400, 'kind が不正なら 400');
+    // 別の作業を始めた人の分はもどせない (作業が止まれば、切符が生きている間はもどせる)
+    ok((await start()).status === 200, '前提: もう一度はじめる');
+    const sidB = openSid();
+    const st3 = await stop(sidB);
     const other = TD.upsertTaskFromImport({ notion_page_id: 'undo-2', status: 'not_started', destination_id: 9602, product_code: 'UNDO-B', product_name: '別のカード', qty: 5, facility_code: 'iroha' }, { batchId: 'test-undo' }).id;
-    db.prepare('UPDATE f_iroha_work_sessions SET ended_at = ? WHERE id = ?').run(new Date().toISOString(), sid);
     ok((await call('POST', '/api/sessions/start', { cookie, body: { id: other, worker_id: w2.id, worker_ids: [w2.id] } })).status === 200, '前提: 別のカードをはじめる');
-    const busy = await call('POST', '/api/undo', { cookie, body: { kind: 'stop', id: uid, worker_id: w2.id, session_ids: [sid] } });
+    const busy = await undo({ kind: 'stop', token: st3.json.undo.token });
     ok(busy.status === 409 && busy.json.error === 'busy', '別の作業を始めていたらもどせない (開いている記録は 1 人 1 本)');
     const otherSid = db.prepare('SELECT id FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL').get(other).id;
     await call('POST', '/api/sessions/stop', { cookie, body: { id: other, worker_id: w2.id, session_ids: [otherSid], reason: 'pause' } });
-    // ⛔ 止まった (資材が足りない) → 職員に通知 → もどす
-    ok((await call('POST', '/api/sessions/start', { cookie, body: { id: uid, worker_id: w2.id, worker_ids: [w2.id] } })).status === 200, '前提: もう一度はじめる');
+    ok((await undo({ kind: 'stop', token: st3.json.undo.token })).status === 200 && sessRow(sidB).ended_at === null, '別の作業を止めたら、切符が生きている間はもどせる (busy では切符を残す)');
+    // カードが変わったらもどせない (できあがり → できた数を直したあと、タイマーだけ動き直さない)
+    const st4 = await stop(sidB, 'done');
+    ok(st4.status === 200 && st4.json.undo, '前提: できあがりで止める (切符あり)');
+    const prog = await call('POST', '/api/progress', { cookie, body: { id: uid, worker_id: w2.id, expect_version: v(), done_qty: 10 } });
+    ok(prog.status === 200, '前提: できた数を 10 にする (版が進む)');
+    const stale = await undo({ kind: 'stop', token: st4.json.undo.token });
+    ok(stale.status === 409 && stale.json.error === 'conflict' && sessRow(sidB).ended_at, 'カードが変わったあとの切符は使えない (409 conflict。タイマーは止まったまま)');
+    // ⛔ 止まった (資材が足りない) → 職員に通知 → もどす (できた数も戻る)
+    ok((await start()).status === 200, '前提: もう一度はじめる');
     const sid2 = openSid();
-    const blk = await call('POST', '/api/block', { cookie, body: { id: uid, worker_id: w2.id, reason: 'materials_shortage', note: 'D-8 が 30 個足りない', expect_version: v() } });
-    ok(blk.status === 200 && blk.json.task.blocked && blk.json.task.blocked.reason === 'materials_shortage' && blk.json.stopped.length === 1, '資材が足りない → 札 + タイマー停止');
+    const dq0 = TD.getTask(uid).done_qty;
+    const blk = await call('POST', '/api/block', { cookie, body: { id: uid, worker_id: w2.id, reason: 'materials_shortage', note: 'D-8 が 30 個足りない', done_qty: 7, expect_version: v() } });
+    ok(blk.status === 200 && blk.json.task.blocked && blk.json.task.blocked.reason === 'materials_shortage' && blk.json.stopped.length === 1 && blk.json.undo && blk.json.undo.token && TD.getTask(uid).done_qty === 7,
+      '資材が足りない → 札 + タイマー停止 + できた数 7 (切符つき)');
     await new Promise((r) => setTimeout(r, 40));
     ok(sent.length === 1 && sent[0].hook === 'https://chat.example/hook' && /資材が足りません/.test(sent[0].text) && /取り消しテスト/.test(sent[0].text)
       && /D-8 が 30 個足りない/.test(sent[0].text) && /とりけし/.test(sent[0].text) && /作業をはじめる/.test(sent[0].text),
       '職員に GChat で知らせる (商品・足りないもの・止めた人・次にすること)');
     ok(db.prepare("SELECT to_value FROM f_iroha_app_events WHERE action = 'notify_materials_shortage' ORDER BY id DESC LIMIT 1").get().to_value === 'sent', '送れたことが操作履歴に残る');
-    const ub = await call('POST', '/api/undo', { cookie, body: { kind: 'block', id: uid, worker_id: w2.id, expect_version: v() } });
-    const row2 = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(sid2);
-    ok(ub.status === 200 && ub.json.ok && !ub.json.task.blocked && ub.json.reopened.length === 1 && row2.ended_at === null,
-      '「止まった」をもどす: 札が外れ、そのとき止めたタイマーが動き直す');
+    ok((await undo({ kind: 'block', token: blk.json.undo.token }, { cookie: cookie2 })).status === 403, '札のもどしも、止めた iPad からだけ');
+    const ub = await undo({ kind: 'block', token: blk.json.undo.token });
+    const row2 = sessRow(sid2);
+    ok(ub.status === 200 && ub.json.ok && !ub.json.task.blocked && ub.json.reopened.length === 1 && row2.ended_at === null && TD.getTask(uid).done_qty === dq0,
+      '「止まった」をもどす: 札が外れ、止めたタイマーが動き直し、できた数も付ける前の値に戻る');
+    await new Promise((r) => setTimeout(r, 40));
+    ok(sent.length === 2 && /取り消し/.test(sent[1].text) && /取り消しテスト/.test(sent[1].text), '通知を送っていたなら、取り消しも職員に知らせる (資材を持って来てしまわないように)');
     ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'task_block_undo'").get().c === 1, '札の取り消しが操作履歴に残る');
+    // 止めた人が別の作業を始めていたら、札も外さない (全員戻せるときだけ — 部分成功を作らない)
+    const blkB = await call('POST', '/api/block', { cookie, body: { id: uid, worker_id: w2.id, reason: 'awaiting_instruction', expect_version: v() } });
+    ok(blkB.status === 200 && blkB.json.stopped.length === 1, '前提: 指示待ちで止める (1 人止まる)');
+    ok((await call('POST', '/api/sessions/start', { cookie, body: { id: other, worker_id: w2.id, worker_ids: [w2.id] } })).status === 200, '前提: その人が別のカードをはじめる');
+    const ubBusy = await undo({ kind: 'block', token: blkB.json.undo.token });
+    ok(ubBusy.status === 409 && ubBusy.json.error === 'busy' && TD.getTask(uid).blocked_reason === 'awaiting_instruction', '戻せない人がいれば札も外さない (409 busy。札はそのまま)');
+    const otherSid2 = db.prepare('SELECT id FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL').get(other).id;
+    await call('POST', '/api/sessions/stop', { cookie, body: { id: other, worker_id: w2.id, session_ids: [otherSid2], reason: 'pause' } });
+    ok((await undo({ kind: 'block', token: blkB.json.undo.token })).status === 200 && TD.getTask(uid).blocked_reason === null, '別の作業を止めたら、切符が生きている間はもどせる');
     // 通知先が未設定なら送らない (操作は成立)
     delete process.env.GCHAT_WEBHOOK_IROHA;
     const blk2 = await call('POST', '/api/block', { cookie, body: { id: uid, worker_id: w2.id, reason: 'materials_shortage', note: '20L が足りない', expect_version: v() } });
     await new Promise((r) => setTimeout(r, 40));
-    ok(blk2.status === 200 && sent.length === 1
+    ok(blk2.status === 200 && sent.length === 2
       && /skipped: no_webhook/.test(db.prepare("SELECT to_value FROM f_iroha_app_events WHERE action = 'notify_materials_shortage' ORDER BY id DESC LIMIT 1").get().to_value),
       '通知先 (GCHAT_WEBHOOK_IROHA) が未設定でも札は付き、送らなかったことだけ履歴に残る');
+    await undo({ kind: 'block', token: blk2.json.undo.token });
+    await new Promise((r) => setTimeout(r, 40));
+    ok(sent.length === 2, '送っていない申告の取り消しは知らせない');
     // 送信が失敗しても本体は成立
     process.env.GCHAT_WEBHOOK_IROHA = 'https://chat.example/hook';
     N.setNotifySender(async () => { throw new Error('chat down (test)'); });
-    await call('POST', '/api/undo', { cookie, body: { kind: 'block', id: uid, worker_id: w2.id, expect_version: v() } });
     const blk3 = await call('POST', '/api/block', { cookie, body: { id: uid, worker_id: w2.id, reason: 'materials_shortage', note: 'テープが足りない', expect_version: v() } });
     await new Promise((r) => setTimeout(r, 40));
     ok(blk3.status === 200 && /skipped: chat down/.test(db.prepare("SELECT to_value FROM f_iroha_app_events WHERE action = 'notify_materials_shortage' ORDER BY id DESC LIMIT 1").get().to_value),
       '送信に失敗しても札は付く (失敗の理由が履歴に残る)');
     // 古い札はもどせない
     db.prepare('UPDATE f_iroha_tasks SET blocked_at = ? WHERE id = ?').run(new Date(Date.now() - 120000).toISOString(), uid);
-    ok((await call('POST', '/api/undo', { cookie, body: { kind: 'block', id: uid, worker_id: w2.id, expect_version: v() } })).json.error === 'too_late', '60 秒を過ぎた札はもどせない');
-    // 📅 日報
+    ok((await undo({ kind: 'block', token: blk3.json.undo.token })).json.error === 'too_late', '60 秒を過ぎた札はもどせない');
+    // 📅 日報: その日にかかっている分だけ (日をまたいだ記録は両日に、その日の分だけ)
     const today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    const dayStart = Date.parse(today + 'T00:00:00+09:00');
+    const yday = new Date(dayStart - 86400000 + 9 * 3600 * 1000).toISOString().slice(0, 10);
+    db.prepare(`INSERT INTO f_iroha_work_sessions (task_id, product_code, title_snapshot, worker_id, worker_name, started_at, ended_at, end_reason, raw_seconds)
+      VALUES (?, 'UNDO-A', '取り消しテスト', ?, 'とりけし', ?, ?, 'pause', 3600)`).run(uid, w2.id, new Date(dayStart - 1800000).toISOString(), new Date(dayStart + 1800000).toISOString());
     const rep1 = await call('GET', '/api/daily-report?date=' + today, { cookie });
     const meRow = rep1.status === 200 ? rep1.json.workers.find((x) => x.worker_id === w2.id) : null;
-    ok(rep1.status === 200 && rep1.json.date === today && meRow && meRow.items.some((it) => it.task_id === uid) && meRow.sessions >= 2 && typeof rep1.json.totals.seconds === 'number',
-      '日報: 人 × 商品 × 分 (今日の記録が人ごと・カードごとに出る)');
+    const meItem = meRow && meRow.items.find((it) => it.task_id === uid);
+    ok(rep1.status === 200 && rep1.json.date === today && meItem && meItem.seconds >= 1800 && meItem.seconds < 1800 + 600 && typeof rep1.json.totals.seconds === 'number' && rep1.json.truncated === false,
+      '日報: 人 × 商品 × 分 (日をまたいだ記録は今日の分 30 分だけ数える)');
+    const repY = await call('GET', '/api/daily-report?date=' + yday, { cookie });
+    const yRow = repY.status === 200 ? repY.json.workers.find((x) => x.worker_id === w2.id) : null;
+    ok(repY.status === 200 && yRow && yRow.items.length === 1 && yRow.items[0].seconds === 1800 && yRow.active === 0, '日報: 前の日には前の日の分 30 分だけ (作業中としては数えない)');
     ok((await call('GET', '/api/daily-report?date=2026-02-30', { cookie })).status === 400 && (await call('GET', '/api/daily-report?date=abc', { cookie })).status === 400, '日報: 存在しない日付は 400');
     ok((await call('GET', '/api/daily-report', { cookie })).json.date === today, '日報: 日付を省くと今日');
     N.setNotifySender(null);
@@ -3455,8 +3499,13 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     'ヘッダに「⏱ 作業中」チップ — 選んでいる人・この iPad の作業へどの画面からでも戻れる (F-2)');
   ok(/\['today', '📌 今日やる'\]/.test(html) && /if \(tabAuto\) \{ tabAuto = false;/.test(html) && /curTab === 'today'\) \{ if \(!c\.today\) return false; \}/.test(html),
     '一覧に「📌 今日やる」タブ。iPad を開いたときの既定 (0 件なら すべて — F-6)');
-  ok(/function toastUndo\(msg, label, fn, ms\)/.test(html) && /async function undoStop\(pid, ids\)/.test(html) && /async function undoBlock\(c\)/.test(html) && /id="doneUndo"/.test(html),
-    '誤タップの取り消し: ぬける・ひとやすみ・止まった はトーストの「もどす」、できあがりは「まちがえた」');
+  ok(/function toastUndo\(msg, label, fn, ms\)/.test(html) && /async function undoStop\(pid, token\)/.test(html) && /async function undoBlock\(c, token\)/.test(html) && /id="doneUndo"/.test(html)
+    && /if \(j\.undo && j\.undo\.token\) toastUndo\(msg, 'もどす', \(\) => undoBlock\(c, j\.undo\.token\)\); else toast\(msg\);/.test(html),
+    '誤タップの取り消し: サーバーの切符 (j.undo) があるときだけ「もどす」を出す。できあがりは「まちがえた」');
+  ok(!/session_ids: ids, worker_id/.test(html), '画面から session_id を送って戻さない (切符が決める)');
+  ok(/function renderHistTools\(\)/.test(html) && /stateCan\('report\.daily'\)/.test(html) && !/<button class="chip" id="hmDaily"/.test(html), '日報の入口は許可があるときだけ描く (default-deny)');
+  ok(/職員に知らせます/.test(html) && !/職員に知らせました/.test(html), '通知は「知らせます」(届いたかはその場では分からない)');
+  ok(/let workChipIdx = 0;/.test(html) && /cards\[workChipIdx % cards\.length\]/.test(html), '作業中チップは複数あると押すごとに次のカードへ');
   ok(/async function startScan\(\)/.test(html) && /id="scanBtn"/.test(html) && /new BarcodeDetector\(/.test(html) && /テキストをスキャン/.test(html) && /String\(c\.barcode \|\| ''\)\.replace/.test(html),
     '📷 バーコードで探す (非対応の iPad はキーボードの「テキストをスキャン」を案内。JAN でも検索できる)');
   ok(/function cycleFont\(\)/.test(html) && /html\[data-font="xl"\]\{font-size:125%\}/.test(html) && /localStorage\.setItem\('iw_font', next\)/.test(html), '文字の大きさ「あ⁺」(端末に残す)');
@@ -3879,8 +3928,9 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   ok(capabilitiesFor('notion', { staff: true }).length === notion.length, 'Notion 正本では職員でも計画は許さない (planned_date はアプリ正本の持ちもの)');
   ok(capabilitiesFor('preview', { staff: true }).length === 0, '下見・履歴は職員でも何も許さない');
   // 書き込み口が capability を持たないまま増えていないか (Codex PR1 R6)
-  ok(app.length === 9 && new Set(app).size === app.length, 'アプリ正本 (利用者) の許可は 9 個・重複なし (増やしたら画面の判定も足す)');
-  ok(staffCaps.length === 12 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 12 個・重複なし');
+  ok(app.length === 10 && new Set(app).size === app.length, 'アプリ正本 (利用者) の許可は 10 個・重複なし (増やしたら画面の判定も足す)');
+  ok(notion.includes(CAP.DAILY_REPORT) && app.includes(CAP.DAILY_REPORT) && !pv.includes(CAP.DAILY_REPORT), '日報 (report.daily) は読むだけだが許可の表に載せる。下見では許さない');
+  ok(staffCaps.length === 13 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 13 個・重複なし');
   app.push('x'); pv.push('y');
   ok(!capabilitiesFor('app').includes('x') && capabilitiesFor('preview').length === 0, '返した配列を壊しても共有の定義は変わらない');
   ok(capabilitiesFor('unknown').length === 0 && capabilitiesFor(undefined).length === 0, '知らないモードは何も許さない (default-deny)');

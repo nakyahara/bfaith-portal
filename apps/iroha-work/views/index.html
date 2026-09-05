@@ -713,8 +713,8 @@
     <div class="preview" id="prevHist" hidden></div>
     <div class="tools">
       <span class="flabel">見るもの</span>
-      <button class="chip" id="hmDaily" onclick="setHistMode('daily')">📅 きょうのみんなの作業</button>
-      <button class="chip on" id="hmClosed" onclick="setHistMode('closed')">📚 終了したカード</button>
+      <!-- 日報の入口は許可 (report.daily) があるときだけ描く (default-deny — Codex PR #1200 R1 #10)。中身は renderHistTools() -->
+      <span id="histModes"></span>
     </div>
     <!-- 📅 日報 (人 × 商品 × 分 — 監修「あった方がよい機能」)。利用者本人が「自分は今日これだけやった」を見られる -->
     <div class="daily" id="dailyWrap" hidden>
@@ -1272,6 +1272,7 @@ async function loadStateOnce() {
   renderSync();
   renderModeTexts();
   renderViews();
+  renderHistTools();   // 日報の入口は許可があるときだけ
   renderTabs();
   renderList();
   // ボードを開いている間は、正本が Notion なら下見も取り直す (切替直後・502 から戻ったときもここで回復する)
@@ -1493,7 +1494,7 @@ function setView(v) {
   if (v === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
   if (v === 'plan') loadPlan();
   if (v === 'label') loadLabelWaits();
-  if (v === 'history') { if (histMode === 'daily') loadDaily(); else loadHistory(); }
+  if (v === 'history') { renderHistTools(); if (histMode === 'daily') loadDaily(); else loadHistory(); }
 }
 function renderViews() { const el = $('#views'); if (el) el.hidden = false; }
 
@@ -1939,6 +1940,7 @@ async function planError(j, retry, { silent = false } = {}) {
  */
 // ─── ⏱ 作業中チップ (監修 F-2): 選んでいる人が入っている作業、またはこの iPad から始めた作業へ、どの画面からでも戻れる ───
 let workChipTick = null;
+let workChipIdx = 0;   // 複数あるとき、押すごとに次のカードへ (Codex R1 #13)
 function myWorkCards() {
   if (!state || !Array.isArray(state.cards)) return [];
   const dev = state.me && state.me.device ? state.me.device.label : null;
@@ -1948,21 +1950,24 @@ function myWorkCards() {
 function renderWorkChip() {
   const b = $('#workChip');
   if (!b) return;
-  const cards = myWorkCards().filter((c) => !(curDetail && sameId(curDetail, c.id)));   // その詳細を開いているときは出さない
+  const wid = worker ? Number(worker.id) : null;
+  // 自分が入っている作業を先に。同じ iPad から始めた他の人の作業はその後 (複数なら押すごとに次へ — Codex R1 #13)
+  const cards = myWorkCards().filter((c) => !(curDetail && sameId(curDetail, c.id)))   // その詳細を開いているときは出さない
+    .sort((a, b2) => Number((b2.active || []).some((x) => Number(x.worker_id) === wid)) - Number((a.active || []).some((x) => Number(x.worker_id) === wid)));
   clearInterval(workChipTick); workChipTick = null;
-  if (!cards.length) { b.hidden = true; b.textContent = ''; b.onclick = null; return; }
-  const c = cards[0];
+  if (!cards.length) { b.hidden = true; b.textContent = ''; b.onclick = null; workChipIdx = 0; return; }
+  const c = cards[workChipIdx % cards.length];
   const starts = c.active.map((a) => Date.parse(a.started_at)).filter((n) => Number.isFinite(n));
   const start = starts.length ? Math.min(...starts) : nowMs();
   const t = String(c.title);
   const title = t.length > 14 ? t.slice(0, 14) + '…' : t;
   const draw = () => {
     b.innerHTML = '⏱ 作業中: ' + esc(title) + '<span class="clk">' + esc(fmtClock((nowMs() - start) / 1000)) + '</span>' +
-      (cards.length > 1 ? ' +' + (cards.length - 1) : '') + ' ›';
+      (cards.length > 1 ? ' ' + ((workChipIdx % cards.length) + 1) + '/' + cards.length : '') + ' ›';
   };
   draw();
   b.hidden = false;
-  b.onclick = () => openDetail(c.id);
+  b.onclick = () => { workChipIdx = (workChipIdx + 1) % Math.max(1, cards.length); openDetail(c.id); };
   workChipTick = setInterval(draw, 1000);
 }
 
@@ -2754,13 +2759,21 @@ async function saveLw() {
 // ─── 📅 きょうのみんなの作業 (日報 — 監修「あった方がよい機能」)。人 × 商品 × 分。利用者本人が見る ───
 let histMode = 'closed';
 function jstYmd(offsetDays) { return new Date(Date.now() + 9 * 3600 * 1000 + (offsetDays || 0) * 86400000).toISOString().slice(0, 10); }
+/** 「見るもの」の切替チップ。日報は許可 (report.daily) があるときだけ描く — 描いてから隠さない (要件 §U-7 / Codex R1 #10) */
+function renderHistTools() {
+  const el = $('#histModes');
+  if (!el) return;
+  const canDaily = stateCan('report.daily');
+  if (!canDaily && histMode === 'daily') histMode = 'closed';
+  el.innerHTML = (canDaily ? '<button class="chip' + (histMode === 'daily' ? ' on' : '') + '" id="hmDaily" onclick="setHistMode(\'daily\')">📅 きょうのみんなの作業</button>' : '') +
+    '<button class="chip' + (histMode === 'closed' ? ' on' : '') + '" id="hmClosed" onclick="setHistMode(\'closed\')">📚 終了したカード</button>';
+  $('#dailyWrap').hidden = histMode !== 'daily';
+  $('#closedWrap').hidden = histMode !== 'closed';
+}
 function setHistMode(m) {
-  histMode = m;
-  $('#dailyWrap').hidden = m !== 'daily';
-  $('#closedWrap').hidden = m !== 'closed';
-  $('#hmDaily').classList.toggle('on', m === 'daily');
-  $('#hmClosed').classList.toggle('on', m === 'closed');
-  if (m === 'daily') { if (!$('#dailyDate').value) $('#dailyDate').value = jstYmd(0); loadDaily(); } else loadHistory();
+  histMode = m === 'daily' && stateCan('report.daily') ? 'daily' : 'closed';
+  renderHistTools();
+  if (histMode === 'daily') { if (!$('#dailyDate').value) $('#dailyDate').value = jstYmd(0); loadDaily(); } else loadHistory();
 }
 function setDailyDate(offset) { $('#dailyDate').value = jstYmd(offset); loadDaily(); }
 async function loadDaily() {
@@ -2769,7 +2782,9 @@ async function loadDaily() {
   const j = await apiFetch('/api/daily-report?date=' + encodeURIComponent(d));
   if (!j.ok) { $('#dailySum').textContent = ''; $('#dailyBody').innerHTML = '<div class="empty">' + esc(j.message || '読み込めませんでした') + '</div>'; return; }
   const t = j.totals || {};
-  $('#dailySum').textContent = (t.workers || 0) + ' 人 ・ ' + (t.cards || 0) + ' 枚 ・ 合計 ' + (t.seconds ? fmtDur(t.seconds) : '0分') + (t.active ? ' (' + t.active + ' 人が作業中)' : '');
+  // 記録が多すぎて一部しか集計できていないなら、合計をそのまま出さない (Codex R1 #9)
+  if (j.truncated) showWarn('記録が多すぎて一部しか集計できていません。職員の方は管理画面の「作業の記録をさがす」で確認してください');
+  $('#dailySum').textContent = (t.workers || 0) + ' 人 ・ ' + (t.cards || 0) + ' 枚 ・ 合計 ' + (t.seconds ? fmtDur(t.seconds) : '0分') + (t.active ? ' (' + t.active + ' 人が作業中)' : '') + (j.truncated ? ' ※一部' : '');
   if (!j.workers || !j.workers.length) { $('#dailyBody').innerHTML = '<div class="empty">' + esc(fmtYmd(d)) + ' の作業の記録はありません</div>'; return; }
   // 自分の分を先頭に (「自分は今日これだけやった」がすぐ見える)
   const meId = worker ? Number(worker.id) : null;
@@ -3912,10 +3927,11 @@ async function submitBlock() {
     renderTabs(); renderList();
     if (sameId(curDetail, c.id)) renderDetail(c);
     if (curView === 'board') renderBoard();
-    // 押しまちがい用の「もどす」(監修): 札を外してタイマーももどす。サーバーは 60 秒まで受ける
-    toastUndo('⛔ 「' + (j.task.blocked ? j.task.blocked.label : '') + 'で止まっています」にしました' +
+    // 押しまちがい用の「もどす」(監修): 札を外してタイマー・できた数ももどす。サーバーの切符 (j.undo) があるときだけ (60 秒・同じ iPad)
+    const msg = '⛔ 「' + (j.task.blocked ? j.task.blocked.label : '') + 'で止まっています」にしました' +
       (j.stopped && j.stopped.length ? ' (' + j.stopped.length + '人のタイマーを止めました)' : '') +
-      (reason === 'materials_shortage' ? '。職員に知らせました' : ''), 'もどす', () => undoBlock(c));
+      (reason === 'materials_shortage' ? '。職員に知らせます' : '');   // 通知は裏で送る (届いたかはここでは分からない — Codex R1 #11)
+    if (j.undo && j.undo.token) toastUndo(msg, 'もどす', () => undoBlock(c, j.undo.token)); else toast(msg);
     // ラベルが足りないなら、そのままラベル待ちの記録をつける (発生日・数量・ロケ・記録者は入れておく)
     if (reason === 'label_shortage' && stateCan('task.label_wait.edit')) setTimeout(() => openLwNew(c), 0);
     return;
@@ -4266,29 +4282,30 @@ async function startWork(ids, opts) {
  */
 // ─── 誤タップの取り消し (監修「あった方がよい機能」): 「ぬける」「ひとやすみ」「できあがり」「⛔ 止まった」の直後だけ ───
 let lastStop = null;   // { pid, ids, at } — できあがりダイアログの「まちがえた」用
-async function undoStop(pid, ids) {
-  if (!worker || !ids || !ids.length) return;
+async function undoStop(pid, token) {
+  if (!worker || !token) return;
+  // 何を戻すかはサーバーの切符に書いてある (session_id を画面から送らない — Codex PR #1200 R1 #1)
   const j = await apiFetch('/api/undo', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kind: 'stop', id: pid, session_ids: ids, worker_id: worker.id }) });
+    body: JSON.stringify({ kind: 'stop', id: pid, token, worker_id: worker.id }) });
   if (!j.ok) { showErr(j.message || 'もどせませんでした'); loadState(); return; }
   lastStop = null;
   await loadState();
   toast('もどしました (タイマーは止めなかったことになります)');
 }
-async function undoBlock(c) {
-  if (!worker || !c) return;
+async function undoBlock(c, token) {
+  if (!worker || !c || !token) return;
   const j = await apiFetch('/api/undo', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kind: 'block', id: c.id, expect_version: c.version, worker_id: worker.id }) });
+    body: JSON.stringify({ kind: 'block', id: c.id, token, worker_id: worker.id }) });
   if (!j.ok) { showErr(j.message || 'もどせませんでした'); loadState(); return; }
   await loadState();
-  toast('札を外して、タイマーをもどしました' + (j.skipped && j.skipped.length ? ' (' + j.skipped.map((s) => s.worker_name).join('・') + ' さんは別の作業中なのでそのまま)' : ''));
+  toast('札を外して、タイマーと「できた数」をもどしました');
 }
 /** できあがりダイアログの「まちがえた」: 止めたタイマーをもどして、ダイアログを閉じる */
 async function undoDoneStop() {
   const ls = lastStop;
   if (!ls || doneSaving) return;
   closeOverlay('#doneOv'); doneTarget = null; $('#doneBody').innerHTML = '';
-  await undoStop(ls.pid, ls.ids);
+  await undoStop(ls.pid, ls.token);
 }
 
 async function stopOne(sessionId) {
@@ -4332,15 +4349,16 @@ async function stopWork(reason, only, opts) {
   const n = (j.stopped || []).length;
   const durText = n > 1 ? n + '人ぶんの作業時間 (合計 ' + fmtDur(j.totalSeconds) + ')' : '作業時間 ' + fmtDur(j.session.raw_seconds);
   const rest = j.remainingActive > 0 ? ' (' + j.remainingActive + '名がまだ作業中)' : '';
-  // ⭐押しまちがい用の「もどす」(監修)。サーバーは 60 秒まで受ける。トーストは 6 秒
-  const undoIds = (j.stopped || []).filter((s) => !s.already).map((s) => s.id);
-  lastStop = undoIds.length ? { pid, ids: undoIds, at: Date.now() } : null;
+  // ⭐押しまちがい用の「もどす」(監修)。サーバーが付けた切符 (j.undo) があるときだけ — 60 秒・同じ iPad・1 回。トーストは 6 秒
+  const undoToken = j.undo && j.undo.token ? j.undo.token : null;
+  lastStop = undoToken ? { pid, token: undoToken, at: Date.now() } : null;
+  const say = (msg) => { if (undoToken) toastUndo(msg, 'もどす', () => undoStop(pid, undoToken)); else toast(msg); };
   if (opts && opts.leaving) {
-    toastUndo(opts.leaving + ' さんが抜けました (' + fmtDur(j.session.raw_seconds) + ')' + (j.remainingActive > 0 ? rest : '。止まる理由があれば「⛔ 止まった」を'), 'もどす', () => undoStop(pid, undoIds));
+    say(opts.leaving + ' さんが抜けました (' + fmtDur(j.session.raw_seconds) + ')' + (j.remainingActive > 0 ? rest : '。止まる理由があれば「⛔ 止まった」を'));
     return;
   }
   if (reason === 'pause') {
-    toastUndo('ひとやすみ。' + durText + ' を記録しました' + (j.remainingActive > 0 ? rest : '。もどったら「▶ 作業をはじめる」を'), 'もどす', () => undoStop(pid, undoIds));
+    say('ひとやすみ。' + durText + ' を記録しました' + (j.remainingActive > 0 ? rest : '。もどったら「▶ 作業をはじめる」を'));
     return;
   }
   // ✅ できあがり: ステータスとの連動は自動にしない (人が選んで変える)。促すのは**全員が離れたとき**だけ
