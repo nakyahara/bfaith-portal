@@ -40,8 +40,32 @@
   header.top h1{margin:0;display:flex;flex-direction:column;line-height:1.1}
   header.top h1 .logo{font-family:var(--logo);font-weight:700;font-size:1.15rem;letter-spacing:.1em;color:var(--accent)}
   header.top h1 .jp{font-size:.72rem;color:var(--sub);font-weight:400;letter-spacing:.06em}
-  .who{margin-left:auto;font-weight:700;background:var(--surface);border:1px solid var(--line);
+  .hright{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+  .who{font-weight:700;background:var(--surface);border:1px solid var(--line);
     border-radius:var(--r);padding:8px 14px;cursor:pointer;font-size:.95rem;color:var(--ink)}
+  /* ⏱ 作業中チップ: どの画面からでも自分の作業へ戻れる (監修 F-2) */
+  .who.work{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+  .who.work .clk{font-family:var(--num);margin-left:6px}
+  .who.font{padding:8px 10px;font-size:1rem}
+  /* 文字の大きさ (右上「あ⁺」。端末に残す — 監修) */
+  html[data-font="l"]{font-size:112.5%}
+  html[data-font="xl"]{font-size:125%}
+  /* トーストの「もどす」(誤タップの取り消し — 監修) */
+  .toast.act{pointer-events:auto;display:flex;gap:12px;align-items:center;text-align:left}
+  .toast .tbtn{border:1px solid rgba(255,255,255,.6);background:transparent;color:#fff;border-radius:var(--r-sm);padding:6px 14px;font-weight:700;font-size:1rem;cursor:pointer;min-height:40px;flex:none}
+  /* 📷 バーコードで探す */
+  .scan{border:1px solid var(--line);background:var(--surface);border-radius:var(--r);min-width:48px;min-height:44px;font-size:1.2rem;cursor:pointer}
+  #scanVideo{width:100%;max-height:60vh;background:#000;border-radius:var(--r-sm)}
+  /* 📅 きょうのみんなの作業 (日報) */
+  .daily .dcard{margin-bottom:10px}
+  .daily h3{display:flex;align-items:center;gap:10px;margin:0 0 6px;font-size:1.05rem}
+  .daily h3 .tot{margin-left:auto;font-family:var(--num);color:var(--accent);font-weight:700}
+  .daily ul{margin:0;padding-left:1.2em;font-size:.95rem;line-height:1.6}
+  .daily li.live{color:var(--ok);font-weight:700}
+  .daily .dcard.me{outline:2px solid var(--accent)}
+  /* 🧰 足りない資材 */
+  .dq .matName{flex:1;min-width:160px;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;font-size:1.05rem;font-family:var(--font)}
+  .dq .matQty{border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;font-size:1.1rem;font-family:var(--num);width:110px}
 
   /* ── バナー (エラーは押すまで消えない) ── */
   .banner{display:none;width:100%;border-radius:var(--r);padding:12px 16px;font-weight:700;margin-bottom:10px;cursor:pointer}
@@ -596,8 +620,12 @@
   <!-- ══ どの画面でも出す: 見出し・画面切替・エラーバナー ══ -->
   <header class="top">
     <h1><span class="logo">IROHA STOCK</span><span class="jp">いろは在庫化 作業画面</span></h1>
-    <button class="who" id="whoBtn" onclick="openGate()">👤 —</button>
-    <button class="who" id="staffBtn" hidden></button>
+    <div class="hright">
+      <button class="who work" id="workChip" hidden></button>
+      <button class="who font" id="fontBtn" onclick="cycleFont()" aria-label="文字の大きさを変える" title="文字を大きく">あ⁺</button>
+      <button class="who" id="whoBtn" onclick="openGate()">👤 —</button>
+      <button class="who" id="staffBtn" hidden></button>
+    </div>
   </header>
   <div class="views" id="views" hidden>
     <button id="vList" class="on" onclick="setView('list')">📋 作業</button>
@@ -612,7 +640,8 @@
   <div class="page listpage">
     <div class="filters">
       <span class="fgroup"><span class="flabel">状態</span><span id="tabs"></span></span>
-      <input class="search" id="q" placeholder="商品名・商品コードで検索">
+      <input class="search" id="q" placeholder="商品名・商品コード・JAN で検索">
+      <button class="scan" id="scanBtn" onclick="startScan()" aria-label="バーコードで探す" title="バーコードで探す">📷</button>
       <span class="sync">
         <span id="syncTxt">読み込み中…</span>
         <button id="refreshBtn" onclick="forceRefresh()">🔄 いま更新</button>
@@ -683,6 +712,23 @@
   <div class="page historypage" hidden>
     <div class="preview" id="prevHist" hidden></div>
     <div class="tools">
+      <span class="flabel">見るもの</span>
+      <!-- 日報の入口は許可 (report.daily) があるときだけ描く (default-deny — Codex PR #1200 R1 #10)。中身は renderHistTools() -->
+      <span id="histModes"></span>
+    </div>
+    <!-- 📅 日報 (人 × 商品 × 分 — 監修「あった方がよい機能」)。利用者本人が「自分は今日これだけやった」を見られる -->
+    <div class="daily" id="dailyWrap" hidden>
+      <div class="tools">
+        <span class="flabel">日付</span>
+        <button class="chip" onclick="setDailyDate(0)">きょう</button>
+        <button class="chip" onclick="setDailyDate(-1)">きのう</button>
+        <input class="date" type="date" id="dailyDate" onchange="loadDaily()">
+        <span class="sum" id="dailySum"></span>
+      </div>
+      <div id="dailyBody"></div>
+    </div>
+    <div id="closedWrap">
+    <div class="tools">
       <span class="flabel">期間</span>
       <button class="chip" onclick="setHistRange(7)">7日</button>
       <button class="chip" onclick="setHistRange(30)">30日</button>
@@ -698,6 +744,7 @@
       <thead><tr><th>終了日時</th><th>商品</th><th>数量</th><th>結果</th><th>拠点</th><th>作業時間</th><th>入庫日</th><th>だれが</th></tr></thead>
       <tbody id="histBody"><tr><td colspan="8">読み込み中…</td></tr></tbody>
     </table></div>
+    </div>
   </div>
 
   <!-- ══ 画面2: 詳細 ══ -->
@@ -782,6 +829,8 @@
       <div class="mname" id="doneName">—</div>
       <div class="msaving" id="doneMsg"></div>
       <div id="doneBody"></div>
+      <!-- 誤タップの取り消し (監修): 止めたタイマーをもどして、ダイアログを閉じる。直後だけ出す -->
+      <button class="btn warn" id="doneUndo" onclick="undoDoneStop()" hidden style="width:100%;margin-bottom:10px">← まちがえた (まだ作業中。タイマーをもどす)</button>
       <div class="mbtns">
         <button class="btn" id="doneLater" onclick="closeDone()">あとで決める</button>
         <button class="btn primary" id="doneGo" onclick="submitDone()">棚入待ちにする</button>
@@ -802,6 +851,16 @@
         <button class="btn primary" id="unblockGo" onclick="confirmUnblock()">はい、解消した → はじめる</button>
       </div>
       <p class="hint">「はい」を押すと札が外れて、作業がはじまります。</p>
+    </div>
+  </div>
+
+  <!-- ══ 📷 バーコードで探す (監修「あった方がよい機能」)。BarcodeDetector が使える端末だけ ══ -->
+  <div class="overlay" id="scanOv">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="scanTitle">
+      <h3 id="scanTitle" tabindex="-1">📷 バーコードを写してください</h3>
+      <video id="scanVideo" playsinline muted autoplay></video>
+      <div class="msaving" id="scanMsg">商品の JAN (13 桁) を枠に入れると、そのカードを開きます</div>
+      <div class="mbtns"><button class="btn" onclick="stopScan()">やめる</button></div>
     </div>
   </div>
 
@@ -970,6 +1029,7 @@ function stName(v) {
 
 let state = { mode: 'notion', cards: [], statuses: [], changeTargets: [], workers: [], refresh: {}, me: {} };
 let curTab = 'all';
+let tabAuto = true;   // 朝いちばんは「📌 今日やる」を既定にする (監修 F-6)。人がタブを押したら自動では変えない
 let curView = 'list';       // list | board | label | history (アプリ正本のときだけ切り替えられる)
 let boardCols = 'status';   // ボードの列の分け方: status (進捗) | fac (拠点)。「予定」の列は作らない (要件 §W-4)
 let curWhen = 'all';        // 予定の絞り込み: all | today | tomorrow | none
@@ -993,8 +1053,10 @@ const can = (name) => detailCaps.includes(name);
 const stateCan = (name) => (state.capabilities || []).includes(name);
 /** 正本が切り替わると状態の値も変わる (未着手 ↔ not_started)。無い値を選んだままだと一覧が空に見えるので「すべて」に戻す */
 function ensureTabValid() {
-  const valid = new Set(['all', 'blocked', ...statusTabs().map(([v]) => v)]);
+  const valid = new Set(['all', 'blocked', 'today', ...statusTabs().map(([v]) => v)]);
   if (!valid.has(curTab)) curTab = 'all';
+  // 「今日やる」のタブは 1 件以上あるときだけ出す → 0 件になったら「すべて」へ
+  if (curTab === 'today' && !(state && (state.cards || []).some((c) => c.today))) curTab = 'all';
 }
 let worker = null;         // { id, display_name, worker_type }
 // タイマーはサーバー時刻基準 (iPadの時計を信じない)。/api/state の serverNow とのオフセットで補正
@@ -1016,9 +1078,22 @@ function hideErr(kind) {
 function showWarn(msg) { const b = $('#warnBanner'); b.textContent = msg; b.classList.add('on'); }
 let toastTimer = null;
 function toast(msg) {
-  const t = $('#toast'); t.textContent = msg; t.classList.add('on');
+  const t = $('#toast'); t.classList.remove('act'); t.textContent = msg; t.classList.add('on');
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('on'), 2600);
 }
+/** 取り消しつきトースト (誤タップの取り消し — 監修)。ボタンを押すか ms (既定 6 秒) 経つまで出す。fn は 1 回だけ */
+function toastUndo(msg, label, fn, ms) {
+  const t = $('#toast');
+  t.textContent = '';
+  const span = document.createElement('span'); span.textContent = msg;
+  const b = document.createElement('button'); b.type = 'button'; b.className = 'tbtn'; b.textContent = label;
+  let used = false;
+  b.onclick = () => { if (used) return; used = true; hideToast(); fn(); };
+  t.append(span, b);
+  t.classList.add('on', 'act');
+  clearTimeout(toastTimer); toastTimer = setTimeout(hideToast, ms || 6000);
+}
+function hideToast() { const t = $('#toast'); t.classList.remove('on', 'act'); }
 
 // ─── 作業者選択 ───
 function openGate() {
@@ -1189,12 +1264,15 @@ async function loadStateOnce() {
     clearPlanDom();
     if (curView === 'plan') { if (stateCan('task.plan.assign') || !isApp()) loadPlan({ force: true }); else setView('board'); }
   }
+  // ⭐iPad を開いたときの既定は「📌 今日やる」(1 件以上あるとき)。人がタブを押したあとは触らない (監修 F-6)
+  if (tabAuto) { tabAuto = false; if (curTab === 'all' && isApp() && (state.cards || []).some((c) => c.today)) curTab = 'today'; }
   ensureTabValid();
   saveSnapshot(j);
   if (j.serverNow) clockOffset = Date.parse(j.serverNow) - Date.now();
   renderSync();
   renderModeTexts();
   renderViews();
+  renderHistTools();   // 日報の入口は許可があるときだけ
   renderTabs();
   renderList();
   // ボードを開いている間は、正本が Notion なら下見も取り直す (切替直後・502 から戻ったときもここで回復する)
@@ -1270,11 +1348,12 @@ function statusTabs() {
 }
 
 function counts() {
-  const c = { all: state.cards.length, blocked: 0 };
+  const c = { all: state.cards.length, blocked: 0, today: 0 };
   for (const [v] of statusTabs()) c[v] = 0;
   for (const card of state.cards) {
     if (c[card.status] != null) c[card.status]++;
     if (card.blocked) c.blocked++;   // ⛔ 止まっている (進捗とは別の札 — 案A)
+    if (card.today) c.today++;       // 📌 今日やる (監修 F-6)
   }
   return c;
 }
@@ -1282,12 +1361,13 @@ function counts() {
 function renderTabs() {
   const c = counts();
   // 「⛔ 止まっている」は進捗のタブではなく札の絞り込み。1 件以上あるときだけ出す
-  const tabs = [['all', 'すべて'], ...statusTabs(), ...(c.blocked > 0 ? [['blocked', '⛔ 止まっている']] : [])];
+  // 「📌 今日やる」は進捗ではなく予定の絞り込み。朝いちばんに見るので先頭 (監修 F-6)。1 件以上あるときだけ
+  const tabs = [['all', 'すべて'], ...(c.today > 0 ? [['today', '📌 今日やる']] : []), ...statusTabs(), ...(c.blocked > 0 ? [['blocked', '⛔ 止まっている']] : [])];
   $('#tabs').innerHTML = tabs.map(([key, label]) =>
     '<button class="chip' + (curTab === key ? ' on' : '') + '" onclick="pickTab(\'' + esc(key) + '\')">' +
     esc(label) + ' <span class="num">' + (c[key] ?? 0) + '</span></button>').join('');
 }
-function pickTab(key) { curTab = key; renderTabs(); renderList(); }
+function pickTab(key) { curTab = key; tabAuto = false; renderTabs(); renderList(); }
 
 function masterSummary(c) {
   const m = c.master;
@@ -1320,9 +1400,12 @@ function visibleCards() {
   const q = $('#q').value.trim().toLowerCase();
   return state.cards.filter(c => {
     if (curTab === 'blocked') { if (!c.blocked) return false; }
+    else if (curTab === 'today') { if (!c.today) return false; }
     else if (curTab !== 'all' && c.status !== curTab) return false;
     if (!q) return true;
-    return String(c.title).toLowerCase().includes(q) || String(c.product_code || '').toLowerCase().includes(q);
+    // JAN でも探せる (📷 で読んだ数字・キーボードの「テキストをスキャン」で入れた数字 — 監修)
+    return String(c.title).toLowerCase().includes(q) || String(c.product_code || '').toLowerCase().includes(q)
+      || String(c.barcode || '').replace(/\s/g, '').includes(q.replace(/\s/g, ''));
   });
 }
 
@@ -1345,6 +1428,7 @@ function renderList() {
   }
   if (cards.length === 0) {
     $('#list').innerHTML = '<div class="empty">' + ($('#q').value ? '見つかりませんでした' : 'このステータスのカードはありません') + '</div>';
+    renderWorkChip();
     return;
   }
   $('#list').innerHTML = cards.map(c => {
@@ -1382,6 +1466,7 @@ function renderList() {
           : '<span class="st ro ' + stClass(c.status) + '">' + esc(stLabel(c)) + '</span>') +
       '<span class="chev">' + (selectable ? '' : '›') + '</span></div>';
   }).join('');
+  renderWorkChip();   // 作業中の人が変わったら、ヘッダのチップも (監修 F-2)
 }
 
 $('#q').addEventListener('input', renderList);
@@ -1409,7 +1494,7 @@ function setView(v) {
   if (v === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
   if (v === 'plan') loadPlan();
   if (v === 'label') loadLabelWaits();
-  if (v === 'history') loadHistory();
+  if (v === 'history') { renderHistTools(); if (histMode === 'daily') loadDaily(); else loadHistory(); }
 }
 function renderViews() { const el = $('#views'); if (el) el.hidden = false; }
 
@@ -1853,6 +1938,100 @@ async function planError(j, retry, { silent = false } = {}) {
  * (計画の操作をしようとしたときにしか PIN を聞かないのに、その操作は職員モードでないと描かれない)。
  * 職員が選ばれているときだけ出す。入っていれば残り時間と「終わる」を出す
  */
+// ─── ⏱ 作業中チップ (監修 F-2): 選んでいる人が入っている作業、またはこの iPad から始めた作業へ、どの画面からでも戻れる ───
+let workChipTick = null;
+let workChipIdx = 0;   // 複数あるとき、押すごとに次のカードへ (Codex R1 #13)
+function myWorkCards() {
+  if (!state || !Array.isArray(state.cards)) return [];
+  const dev = state.me && state.me.device ? state.me.device.label : null;
+  const wid = worker ? Number(worker.id) : null;
+  return state.cards.filter((c) => (c.active || []).some((a) => (wid != null && Number(a.worker_id) === wid) || (dev && a.device_label === dev)));
+}
+function renderWorkChip() {
+  const b = $('#workChip');
+  if (!b) return;
+  const wid = worker ? Number(worker.id) : null;
+  // 自分が入っている作業を先に。同じ iPad から始めた他の人の作業はその後 (複数なら押すごとに次へ — Codex R1 #13)
+  const cards = myWorkCards().filter((c) => !(curDetail && sameId(curDetail, c.id)))   // その詳細を開いているときは出さない
+    .sort((a, b2) => Number((b2.active || []).some((x) => Number(x.worker_id) === wid)) - Number((a.active || []).some((x) => Number(x.worker_id) === wid)));
+  clearInterval(workChipTick); workChipTick = null;
+  if (!cards.length) { b.hidden = true; b.textContent = ''; b.onclick = null; workChipIdx = 0; return; }
+  const c = cards[workChipIdx % cards.length];
+  const starts = c.active.map((a) => Date.parse(a.started_at)).filter((n) => Number.isFinite(n));
+  const start = starts.length ? Math.min(...starts) : nowMs();
+  const t = String(c.title);
+  const title = t.length > 14 ? t.slice(0, 14) + '…' : t;
+  const draw = () => {
+    b.innerHTML = '⏱ 作業中: ' + esc(title) + '<span class="clk">' + esc(fmtClock((nowMs() - start) / 1000)) + '</span>' +
+      (cards.length > 1 ? ' ' + ((workChipIdx % cards.length) + 1) + '/' + cards.length : '') + ' ›';
+  };
+  draw();
+  b.hidden = false;
+  b.onclick = () => { workChipIdx = (workChipIdx + 1) % Math.max(1, cards.length); openDetail(c.id); };
+  workChipTick = setInterval(draw, 1000);
+}
+
+// ─── 文字の大きさ (監修: 利用者ごとに見やすさが違う。端末に残す) ───
+const FONT_STEPS = ['', 'l', 'xl'];
+const FONT_LABEL = { '': 'あ⁺', l: 'あ⁺⁺', xl: 'あ' };
+function applyFont(v) {
+  if (v) document.documentElement.dataset.font = v; else delete document.documentElement.dataset.font;
+  const b = $('#fontBtn');
+  if (b) { b.textContent = FONT_LABEL[v] || 'あ⁺'; b.title = v === 'xl' ? '文字をふつうの大きさに' : '文字を大きく'; }
+}
+function cycleFont() {
+  const cur = document.documentElement.dataset.font || '';
+  const next = FONT_STEPS[(FONT_STEPS.indexOf(cur) + 1) % FONT_STEPS.length];
+  applyFont(next);
+  try { localStorage.setItem('iw_font', next); } catch (e) { /* 残せなければ今回だけ */ }
+  toast(next === 'xl' ? '文字をいちばん大きくしました' : next === 'l' ? '文字を大きくしました' : '文字をふつうの大きさにしました');
+}
+try { applyFont(localStorage.getItem('iw_font') || ''); } catch (e) { /* 既定のまま */ }
+
+// ─── 📷 バーコードで探す (監修)。BarcodeDetector が無い版の iPad は、キーボードの「テキストをスキャン」を案内 ───
+let scanStream = null;
+let scanTimer = null;
+async function startScan() {
+  if (!('BarcodeDetector' in window) || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showWarn('この iPad はカメラ読み取りに対応していません。検索欄を長押し →「テキストをスキャン」で JAN の数字を読み取れます');
+    const q = $('#q'); if (q) q.focus();
+    return;
+  }
+  let detector;
+  try { detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'code_128'] }); }
+  catch (e) { showWarn('バーコードの読み取りを始められませんでした (' + e.message + ')'); return; }
+  try { scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }); }
+  catch (e) { showWarn('カメラを使えませんでした。設定でカメラを許可してください'); return; }
+  const v = $('#scanVideo');
+  v.srcObject = scanStream;
+  $('#scanMsg').textContent = '商品の JAN (13 桁) を枠に入れると、そのカードを開きます';
+  openOverlay('#scanOv');
+  const tick = async () => {
+    if (!scanStream) return;
+    try {
+      const codes = await detector.detect(v);
+      const hit = codes.find((x) => x.rawValue && /^\d{8,14}$/.test(x.rawValue));
+      if (hit) { onScanned(hit.rawValue); return; }
+    } catch (e) { /* まだ映っていない → 次の回 */ }
+    scanTimer = setTimeout(tick, 250);
+  };
+  scanTimer = setTimeout(tick, 400);
+}
+function stopScan() {
+  clearTimeout(scanTimer); scanTimer = null;
+  if (scanStream) { for (const tr of scanStream.getTracks()) { try { tr.stop(); } catch (e) { /* 止められなければ放す */ } } scanStream = null; }
+  const v = $('#scanVideo'); if (v) v.srcObject = null;
+  if ($('#scanOv').classList.contains('on')) closeOverlay('#scanOv');
+}
+function onScanned(code) {
+  stopScan();
+  const hits = (state.cards || []).filter((c) => String(c.barcode || '').replace(/\s/g, '') === code);
+  if (hits.length === 1) { toast('📷 ' + hits[0].title); if (curView !== 'list') setView('list'); openDetail(hits[0].id); return; }
+  $('#q').value = code; curTab = 'all'; tabAuto = false; renderTabs(); renderList();
+  toast(hits.length ? '📷 ' + hits.length + ' 件見つかりました' : '📷 この JAN のカードはありません (' + code + ')');
+}
+$('#scanOv').addEventListener('click', (e) => { if (e.target === $('#scanOv')) stopScan(); });
+
 function renderStaffBtn() {
   const b = $('#staffBtn');
   if (!b) return;
@@ -2577,6 +2756,49 @@ async function saveLw() {
   }
 }
 
+// ─── 📅 きょうのみんなの作業 (日報 — 監修「あった方がよい機能」)。人 × 商品 × 分。利用者本人が見る ───
+let histMode = 'closed';
+function jstYmd(offsetDays) { return new Date(Date.now() + 9 * 3600 * 1000 + (offsetDays || 0) * 86400000).toISOString().slice(0, 10); }
+/** 「見るもの」の切替チップ。日報は許可 (report.daily) があるときだけ描く — 描いてから隠さない (要件 §U-7 / Codex R1 #10) */
+function renderHistTools() {
+  const el = $('#histModes');
+  if (!el) return;
+  const canDaily = stateCan('report.daily');
+  if (!canDaily && histMode === 'daily') histMode = 'closed';
+  el.innerHTML = (canDaily ? '<button class="chip' + (histMode === 'daily' ? ' on' : '') + '" id="hmDaily" onclick="setHistMode(\'daily\')">📅 きょうのみんなの作業</button>' : '') +
+    '<button class="chip' + (histMode === 'closed' ? ' on' : '') + '" id="hmClosed" onclick="setHistMode(\'closed\')">📚 終了したカード</button>';
+  $('#dailyWrap').hidden = histMode !== 'daily';
+  $('#closedWrap').hidden = histMode !== 'closed';
+}
+function setHistMode(m) {
+  histMode = m === 'daily' && stateCan('report.daily') ? 'daily' : 'closed';
+  renderHistTools();
+  if (histMode === 'daily') { if (!$('#dailyDate').value) $('#dailyDate').value = jstYmd(0); loadDaily(); } else loadHistory();
+}
+function setDailyDate(offset) { $('#dailyDate').value = jstYmd(offset); loadDaily(); }
+async function loadDaily() {
+  const d = $('#dailyDate').value || jstYmd(0);
+  $('#dailySum').textContent = '読み込み中…';
+  const j = await apiFetch('/api/daily-report?date=' + encodeURIComponent(d));
+  if (!j.ok) { $('#dailySum').textContent = ''; $('#dailyBody').innerHTML = '<div class="empty">' + esc(j.message || '読み込めませんでした') + '</div>'; return; }
+  const t = j.totals || {};
+  // 記録が多すぎて一部しか集計できていないなら、合計をそのまま出さない (Codex R1 #9)
+  if (j.truncated) showWarn('記録が多すぎて一部しか集計できていません。職員の方は管理画面の「作業の記録をさがす」で確認してください');
+  $('#dailySum').textContent = (t.workers || 0) + ' 人 ・ ' + (t.cards || 0) + ' 枚 ・ 合計 ' + (t.seconds ? fmtDur(t.seconds) : '0分') + (t.active ? ' (' + t.active + ' 人が作業中)' : '') + (j.truncated ? ' ※一部' : '');
+  if (!j.workers || !j.workers.length) { $('#dailyBody').innerHTML = '<div class="empty">' + esc(fmtYmd(d)) + ' の作業の記録はありません</div>'; return; }
+  // 自分の分を先頭に (「自分は今日これだけやった」がすぐ見える)
+  const meId = worker ? Number(worker.id) : null;
+  const rows = [...j.workers].sort((a, b) => (Number(b.worker_id) === meId) - (Number(a.worker_id) === meId));
+  $('#dailyBody').innerHTML = rows.map((w) => {
+    const me = Number(w.worker_id) === meId;
+    return '<div class="dcard' + (me ? ' me' : '') + '"><h3>' + esc(w.worker_name) + ' さん' + (me ? ' (あなた)' : '') +
+      '<span class="tot">' + esc([w.total_seconds ? fmtDur(w.total_seconds) : null, w.live_seconds ? '作業中 ' + fmtDur(w.live_seconds) : null].filter(Boolean).join(' + ') || '0分') + '</span></h3>' +
+      '<ul>' + w.items.map((it) => '<li' + (it.active ? ' class="live"' : '') + '>' + esc(it.title) +
+        ' ・ ' + esc(it.active ? '作業中 (' + fmtDur(it.live_seconds) + '〜)' : fmtDur(it.seconds)) +
+        (it.sessions > 1 ? ' (' + it.sessions + '回)' : '') + '</li>').join('') + '</ul></div>';
+  }).join('');
+}
+
 // ─── 履歴 (終了したカード) ───
 function setHistRange(days) {
   const to = new Date(Date.now() + 9 * 3600 * 1000);
@@ -2709,6 +2931,7 @@ function closeDetail() {
   curDetail = null; detailSrc = null; detailCard = null; detailCaps = []; detailMeta = {};
   document.body.classList.remove('detail-open'); clearInterval(tickId);
   const bar = $('#dbar'); if (bar) { bar.hidden = true; bar.innerHTML = ''; }
+  renderWorkChip();   // 詳細を閉じたら、その作業へ戻るチップを出す (監修 F-2)
 }
 /**
  * 開いているダイアログごと詳細を閉じる (カードが消えた・正本が変わった)。
@@ -3013,6 +3236,7 @@ function renderDetail(c, opts) {
   bar.innerHTML = barH;
   bar.hidden = !barH;
   startTimerTick(c);
+  renderWorkChip();
   // 60 秒の取り直しでは、読んでいた位置に戻す (先頭へ飛ばさない — Codex PR1 R3)
   if (keepScroll) window.scrollTo(0, scrollY);
 }
@@ -3625,11 +3849,32 @@ function renderBlock(c) {
   $('#blockReasons').innerHTML = rs.map(r =>
     '<button type="button" class="btn' + (blockReason === r.value ? ' on' : '') + '" data-block-reason="' + esc(r.value) + '">' + esc(r.button || r.label) + '</button>').join('');
   // 理由を選んだら、何個までできたか (任意) + メモ。「その他」はメモ必須
+  // 🧰 資材が足りない: どの資材が何個足りないかを 1 タップで残し、職員に知らせる (監修「あった方がよい機能」)
+  const mat = blockReason === 'materials_shortage' ? materialsPanelHtml(c) : '';
   $('#blockBody').innerHTML = blockReason
-    ? dqPanelHtml(c, '', { memoLabel: blockReason === 'other' ? '何で止まりましたか (必須) — 次にやる人にも見えます' : '中断メモ (任意) — 次にやる人が読みます' })
+    ? mat + dqPanelHtml(c, '', { memoLabel: blockReason === 'other' ? '何で止まりましたか (必須) — 次にやる人にも見えます' : '中断メモ (任意) — 次にやる人が読みます' })
     : '<p class="hint">まず理由を 1 つ選んでください。</p>';
   $('#blockGo').disabled = !blockReason;
 }
+/** 足りない資材 (このカードの資材・保管箱を 1 タップ、その他は書く) と足りない数 (任意) */
+function materialsPanelHtml(c) {
+  const m = c.master || {};
+  const cands = [m.material_code ? { v: m.material_code, l: '資材 ' + m.material_code } : null,
+    m.storage_container ? { v: m.storage_container, l: '保管箱 ' + m.storage_container } : null].filter(Boolean);
+  return '<div class="dq matq"><label>足りない資材はどれですか</label>' +
+    '<div class="quick">' + cands.map((x) => '<button type="button" data-mat="' + esc(x.v) + '">' + esc(x.l) + '</button>').join('') +
+      '<button type="button" data-mat="">その他 (下に書く)</button></div>' +
+    '<div class="row"><input class="matName" maxlength="60" placeholder="資材の名前 (例: D-8 チャックポリ)">' +
+      '<input class="matQty" type="number" inputmode="numeric" min="1" step="1" placeholder="—"><span class="of">個 足りない</span></div>' +
+    '<p class="sub">職員に知らせます (Google Chat)。数が分からなければ空のままで構いません</p></div>';
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-mat]');
+  if (!b) return;
+  const panel = b.closest('.matq');
+  const input = panel && panel.querySelector('.matName');
+  if (input) { input.value = b.dataset.mat; if (!b.dataset.mat) input.focus(); }
+});
 $('#blockReasons').addEventListener('click', (e) => {
   const b = e.target.closest('[data-block-reason]');
   if (!b) return;
@@ -3646,6 +3891,15 @@ async function submitBlock() {
   const v = dqValues('#blockBody');
   if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#blockMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
   if (blockReason === 'other' && !v.memo) { $('#blockMsg').textContent = '❌ 「その他」は何で止まったかをメモに書いてください'; return; }
+  // 🧰 資材が足りない: 何が何個足りないかを止まった理由の札 (blocked_note) に残す → 職員に通知される
+  let matNote = null;
+  if (blockReason === 'materials_shortage') {
+    const nm = String(($('#blockBody .matName') || {}).value || '').trim();
+    const q = String(($('#blockBody .matQty') || {}).value || '').trim();
+    if (!nm) { $('#blockMsg').textContent = '❌ 足りない資材を選ぶか書いてください (職員に知らせます)'; return; }
+    if (q !== '' && (!Number.isInteger(Number(q)) || Number(q) < 1)) { $('#blockMsg').textContent = '❌ 足りない数は 1 以上の整数で入れてください'; return; }
+    matNote = nm + (q !== '' ? ' が ' + Number(q) + ' 個足りない' : ' が足りない');
+  }
   blockSaving = true;
   for (const id of ['blockGo', 'blockCancel']) document.getElementById(id).disabled = true;
   $('#blockMsg').textContent = '保存中…';
@@ -3657,7 +3911,9 @@ async function submitBlock() {
       // 「その他」のメモは止まった理由 (blocked_note) にだけ入れる — 申し送り (hold_memo) と二重に持たない (Codex PR #1193 R1 #7)
       body: JSON.stringify({ id: c.id, worker_id: worker.id, reason: blockReason, expect_version: c.version,
         ...(v.qty != null ? { done_qty: v.qty } : {}),
-        ...(blockReason === 'other' ? { note: v.memo } : (v.memo ? { hold_memo: v.memo } : {})) }),
+        ...(blockReason === 'other' ? { note: v.memo }
+          : matNote ? { note: matNote, ...(v.memo ? { hold_memo: v.memo } : {}) }
+          : (v.memo ? { hold_memo: v.memo } : {})) }),
     });
   } finally {
     blockSaving = false;
@@ -3671,8 +3927,11 @@ async function submitBlock() {
     renderTabs(); renderList();
     if (sameId(curDetail, c.id)) renderDetail(c);
     if (curView === 'board') renderBoard();
-    toast('⛔ 「' + (j.task.blocked ? j.task.blocked.label : '') + 'で止まっています」にしました' +
-      (j.stopped && j.stopped.length ? ' (' + j.stopped.length + '人のタイマーを止めました)' : ''));
+    // 押しまちがい用の「もどす」(監修): 札を外してタイマー・できた数ももどす。サーバーの切符 (j.undo) があるときだけ (60 秒・同じ iPad)
+    const msg = '⛔ 「' + (j.task.blocked ? j.task.blocked.label : '') + 'で止まっています」にしました' +
+      (j.stopped && j.stopped.length ? ' (' + j.stopped.length + '人のタイマーを止めました)' : '') +
+      (reason === 'materials_shortage' ? '。職員に知らせます' : '');   // 通知は裏で送る (届いたかはここでは分からない — Codex R1 #11)
+    if (j.undo && j.undo.token) toastUndo(msg, 'もどす', () => undoBlock(c, j.undo.token)); else toast(msg);
     // ラベルが足りないなら、そのままラベル待ちの記録をつける (発生日・数量・ロケ・記録者は入れておく)
     if (reason === 'label_shortage' && stateCan('task.label_wait.edit')) setTimeout(() => openLwNew(c), 0);
     return;
@@ -3737,6 +3996,8 @@ function openDone(c) {
   $('#doneName').textContent = c.title;
   $('#doneMsg').textContent = '';
   $('#doneBody').innerHTML = dqPanelHtml(c, '', { title: '何個できましたか', memo: false, defaultAll: true });
+  // 押しまちがい用 (監修): このカードのタイマーを止めた直後だけ「まちがえた」を出す (サーバーは 60 秒まで受ける)
+  $('#doneUndo').hidden = !(lastStop && sameId(lastStop.pid, c.id) && Date.now() - lastStop.at < 55000);
   openOverlay('#doneOv');
   $('#doneTitle').focus();
 }
@@ -4019,6 +4280,34 @@ async function startWork(ids, opts) {
  * 「ぬける」— その人だけタイマーを止める (複数人で始めて 1 人だけ帰る)。残りの人はそのまま続ける。
  * ⭐記録は pause (できあがりではない — 監修 B-6: 旧「終わった」は done で残っていて、最後の 1 人が押すと「できあがりです!」が出ていた)
  */
+// ─── 誤タップの取り消し (監修「あった方がよい機能」): 「ぬける」「ひとやすみ」「できあがり」「⛔ 止まった」の直後だけ ───
+let lastStop = null;   // { pid, ids, at } — できあがりダイアログの「まちがえた」用
+async function undoStop(pid, token) {
+  if (!worker || !token) return;
+  // 何を戻すかはサーバーの切符に書いてある (session_id を画面から送らない — Codex PR #1200 R1 #1)
+  const j = await apiFetch('/api/undo', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind: 'stop', id: pid, token, worker_id: worker.id }) });
+  if (!j.ok) { showErr(j.message || 'もどせませんでした'); loadState(); return; }
+  lastStop = null;
+  await loadState();
+  toast('もどしました (タイマーは止めなかったことになります)');
+}
+async function undoBlock(c, token) {
+  if (!worker || !c || !token) return;
+  const j = await apiFetch('/api/undo', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kind: 'block', id: c.id, token, worker_id: worker.id }) });
+  if (!j.ok) { showErr(j.message || 'もどせませんでした'); loadState(); return; }
+  await loadState();
+  toast('札を外して、タイマーと「できた数」をもどしました');
+}
+/** できあがりダイアログの「まちがえた」: 止めたタイマーをもどして、ダイアログを閉じる */
+async function undoDoneStop() {
+  const ls = lastStop;
+  if (!ls || doneSaving) return;
+  closeOverlay('#doneOv'); doneTarget = null; $('#doneBody').innerHTML = '';
+  await undoStop(ls.pid, ls.token);
+}
+
 async function stopOne(sessionId) {
   const c = findCard(curDetail);
   const a = c && c.active.find(x => x.id === sessionId);
@@ -4060,12 +4349,16 @@ async function stopWork(reason, only, opts) {
   const n = (j.stopped || []).length;
   const durText = n > 1 ? n + '人ぶんの作業時間 (合計 ' + fmtDur(j.totalSeconds) + ')' : '作業時間 ' + fmtDur(j.session.raw_seconds);
   const rest = j.remainingActive > 0 ? ' (' + j.remainingActive + '名がまだ作業中)' : '';
+  // ⭐押しまちがい用の「もどす」(監修)。サーバーが付けた切符 (j.undo) があるときだけ — 60 秒・同じ iPad・1 回。トーストは 6 秒
+  const undoToken = j.undo && j.undo.token ? j.undo.token : null;
+  lastStop = undoToken ? { pid, token: undoToken, at: Date.now() } : null;
+  const say = (msg) => { if (undoToken) toastUndo(msg, 'もどす', () => undoStop(pid, undoToken)); else toast(msg); };
   if (opts && opts.leaving) {
-    toast(opts.leaving + ' さんが抜けました (' + fmtDur(j.session.raw_seconds) + ')' + (j.remainingActive > 0 ? rest : '。止まる理由があれば「⛔ 止まった」を押してください'));
+    say(opts.leaving + ' さんが抜けました (' + fmtDur(j.session.raw_seconds) + ')' + (j.remainingActive > 0 ? rest : '。止まる理由があれば「⛔ 止まった」を'));
     return;
   }
   if (reason === 'pause') {
-    toast('ひとやすみ。' + durText + ' を記録しました' + (j.remainingActive > 0 ? rest : '。もどったら「▶ 作業をはじめる」を押してください'));
+    say('ひとやすみ。' + durText + ' を記録しました' + (j.remainingActive > 0 ? rest : '。もどったら「▶ 作業をはじめる」を'));
     return;
   }
   // ✅ できあがり: ステータスとの連動は自動にしない (人が選んで変える)。促すのは**全員が離れたとき**だけ
@@ -4382,7 +4675,7 @@ if ('serviceWorker' in navigator) {
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if ($('#askOv').classList.contains('on')) { askDone(false); return; }   // 確認ダイアログだけ閉じる (下のダイアログは残す)
-  closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeDetail();
+  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeDetail();
 });
 </script>
 </body>

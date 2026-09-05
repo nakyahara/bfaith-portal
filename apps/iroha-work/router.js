@@ -27,7 +27,7 @@ import {
   workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, moveWorkOption, seedWorkOptionsFromMaster, BUILTIN_OPTION_IMAGES,
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
-  getCachePage, startSessions, stopSession, stopSessions, listSessionsForAdmin, searchSessions, SESSION_SEARCH_MAX, jstDayStartUtc, voidSession,
+  getCachePage, startSessions, stopSession, stopSessions, undoStopSessions, sessionsOverlappingDay, listSessionsForAdmin, searchSessions, SESSION_SEARCH_MAX, jstDayStartUtc, voidSession,
   getMeta, setMetaValue, sourceOfTruth,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
@@ -37,7 +37,43 @@ import { OPEN_STATUSES } from './tasks.js';
 import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
-import { setTaskBlock, clearTaskBlock, blockedOf } from './tasks-db.js';
+import { setTaskBlock, clearTaskBlock, undoTaskBlock, blockedOf } from './tasks-db.js';
+import { notifyStaff, materialsShortageText } from './notify.js';
+
+// ─── 誤タップの取り消しの「切符」(監修 2026-09-05 / Codex PR #1200 R1 #1・#2・#7) ───
+//   止めた・札を付けた応答にだけ付ける。同じ端末 (ポータルなら同じ利用者) から 60 秒以内に 1 回だけ使える。
+//   何を戻すか (セッション id・版・付ける前の値) は切符に書いてあるものを使い、クライアントには選ばせない。
+//   メモリ上 (再起動で消える = 「時間が経った」と同じ扱い。Render は 1 インスタンス)
+const UNDO_TTL_MS = 60000;
+const undoTickets = new Map();
+function issueUndoTicket(req, data) {
+  const now = Date.now();
+  for (const [k, v] of undoTickets) if (v.expiresAt <= now) undoTickets.delete(k);
+  const token = crypto.randomBytes(18).toString('base64url');
+  // 端末 Cookie が無い (ポータルから) ときは、そのブラウザのセッション id に結び付ける — 同じアカウントの別端末では使えない (Codex R2 #3)
+  const ticket = { ...data, deviceId: req.iwDevice ? req.iwDevice.id : null, sessionKey: undoSessionKey(req), expiresAt: now + UNDO_TTL_MS };
+  undoTickets.set(token, ticket);
+  return { token, expires_in: UNDO_TTL_MS / 1000, ticket };
+}
+function findUndoTicket(req, token, kind, taskId) {
+  const t = typeof token === 'string' && token ? undoTickets.get(token) : null;
+  if (!t) return { error: 'too_late', message: '時間が経ったのでもどせません' };
+  if (t.expiresAt <= Date.now()) { undoTickets.delete(token); return { error: 'too_late', message: '時間が経ったのでもどせません' }; }
+  if (t.kind !== kind || Number(t.taskId) !== Number(taskId)) return { error: 'bad_request', message: 'この取り消しはこのカードのものではありません' };
+  const same = t.deviceId != null ? !!(req.iwDevice && req.iwDevice.id === t.deviceId) : !!(t.sessionKey && undoSessionKey(req) === t.sessionKey);
+  if (!same) return { error: 'forbidden', message: 'もどせるのは、止めた iPad からだけです' };
+  return { ticket: t };
+}
+function undoSessionKey(req) {
+  if (req.iwDevice) return null;
+  return req.sessionID || (req.iwUser ? `user:${req.iwUser}` : null);
+}
+/** 資材不足の申告を職員に送ったあとで取り消されたとき、取り消しも知らせる (職員が資材を持って来てしまわないように — Codex R1 #11 / R2 #1) */
+function notifyBlockUndone(ticket, who) {
+  notifyStaff(`↩ *取り消し* — いろは在庫化\n「${ticket.title || ''}」の資材不足の申告は、まちがいとして取り消されました (${who.workerName})。資材の手配は不要です`)
+    .then((n) => safeLog({ action: 'notify_materials_shortage_undo', workerId: who.workerId, workerName: who.workerName, deviceLabel: who.deviceLabel, to: n.sent ? 'sent' : `skipped: ${n.reason}`, ok: n.sent }))
+    .catch(() => { /* notifyStaff は throw しない */ });
+}
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
   listLabelWaits, upsertLabelWait, getLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
@@ -772,7 +808,79 @@ router.post('/api/block', checkOrigin, api((req, res) => {
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
-  res.json({ ok: true, task: publicTask(r.task), stopped: r.stopped, serverNow: new Date().toISOString() });
+  // 🧰 資材が足りない → 職員に知らせる (監修「あった方がよい機能」)。通知は付け足し — 送れなくても札とタイマー停止は成立している。
+  //   送れた/送れなかったは操作履歴に残す (無音で落とさない)
+  // 取り消しの切符 (60 秒・同じ端末・版がそのまま)。付ける前の「できた数」「申し送り」も切符に書いて戻せるようにする (Codex R1 #4)
+  const undo = issueUndoTicket(req, { kind: 'block', taskId: blockTaskId, taskVersion: r.task.version,
+    stoppedIds: (r.stopped || []).map((s) => s.id), prev: r.before || null, notified: false, title: r.task.product_name });
+  if (r.task.blocked_reason === 'materials_shortage') {
+    const dl = deviceLabelOf(req);
+    undo.ticket.notifyPending = true;
+    notifyStaff(materialsShortageText({ title: r.task.product_name, productCode: r.task.product_code, note: r.task.blocked_note,
+      workerName: w.worker.display_name, deviceLabel: dl }))
+      .then((n) => {
+        undo.ticket.notifyPending = false;
+        undo.ticket.notified = !!n.sent;   // 取り消されたら「取り消し」も知らせるため (Codex R1 #11)
+        safeLog({ action: 'notify_materials_shortage', workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: dl,
+          to: n.sent ? 'sent' : `skipped: ${n.reason}`, ok: n.sent });
+        // 送っている間に取り消されていたら、ここで取り消しも知らせる (Codex R2 #1)
+        if (n.sent && undo.ticket.undone) notifyBlockUndone(undo.ticket, undo.ticket.undone);
+      })
+      .catch(() => { /* notifyStaff は throw しない */ });
+  }
+  res.json({ ok: true, task: publicTask(r.task), stopped: r.stopped, undo: { token: undo.token, expires_in: undo.expires_in }, serverNow: new Date().toISOString() });
+}));
+
+/**
+ * 誤タップの取り消し (監修 2026-09-05「あった方がよい機能」)。「ぬける」「ひとやすみ」「できあがり」「⛔ 止まった」の直後だけ
+ * (サーバーは 60 秒まで受ける。画面のトーストは 6 秒)。
+ *   kind=stop  : 止めたセッションをもう一度動かす (ended_at を消す = 止めなかったことになる)
+ *   kind=block : 札を外し、札を付けたときに止めたセッションを動かし直す
+ * 権限は「作業をはじめられる人」と同じ (利用者本人の取り消し。職員の PIN は要らない)
+ */
+const UNDO_HTTP = { too_late: 409, busy: 409, voided: 409, not_undoable: 409, conflict: 409, not_found: 404, forbidden: 403, bad_request: 400 };
+router.post('/api/undo', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  if (isClosedCardId(taskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
+  const kind = String(req.body?.kind || '');
+  if (kind !== 'stop' && kind !== 'block') return res.status(400).json({ ok: false, error: 'bad_request', message: 'kind は stop / block のどちらかです' });
+  const guard = () => {
+    if (!isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+    if (t.status === 'closed') return CLOSED_WRITE_REJECTED;
+    return null;
+  };
+  const dl = deviceLabelOf(req);
+  // ⭐切符が要る (止めた・札を付けた応答に付いてくる)。何を戻すかは切符に書いてあるものだけ (Codex R1 #1・#7)
+  const tk = findUndoTicket(req, req.body?.token, kind, taskId);
+  if (tk.error) return res.status(UNDO_HTTP[tk.error] || 400).json({ ok: false, error: tk.error, message: tk.message });
+  const ticket = tk.ticket;
+  let r;
+  if (kind === 'stop') {
+    r = undoStopSessions({ taskId, sessionIds: ticket.sessionIds, expectTaskVersion: ticket.taskVersion, guard });
+    if (r.ok) {
+      for (const s of r.reopened) {
+        if (!s.already) safeLogTaskEvent({ taskId, action: 'session_undo_stop', workerId: s.worker_id, workerName: s.worker_name, deviceLabel: dl, to: `by ${w.worker.display_name}`, ok: true });
+      }
+    }
+  } else {
+    r = undoTaskBlock({ taskId, expectVersion: ticket.taskVersion, sessionIds: ticket.stoppedIds, restore: ticket.prev,
+      actor: `${w.worker.display_name} (いろはアプリ)`, workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: dl, guard });
+  }
+  // 切符は 1 回きり。「別の作業中」で断ったときだけ残す (その人の作業が止まれば、まだもどせる)
+  if (r.ok || r.error !== 'busy') undoTickets.delete(req.body.token);
+  if (!r.ok) return res.status(UNDO_HTTP[r.error] || taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  // 資材不足の申告を職員に送っていたなら、取り消しも知らせる。まだ送っている途中なら、送り終わった側 (block の then) が知らせる (Codex R1 #11 / R2 #1)
+  if (kind === 'block') {
+    ticket.undone = { workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: dl };
+    if (ticket.notified && !ticket.notifyPending) notifyBlockUndone(ticket, ticket.undone);
+  }
+  res.json({ ok: true, task: publicTask(getTask(taskId)), reopened: r.reopened || [], skipped: r.skipped || [], serverNow: new Date().toISOString() });
 }));
 
 /**
@@ -918,6 +1026,61 @@ router.get('/api/history', api((req, res) => {
     }),
     preview: !isAppMode(),
     fromDate: from || null, toDate: to || null,
+  });
+}));
+
+/**
+ * 📅 きょうのみんなの作業 (日報 — 監修 2026-09-05「あった方がよい機能」)。人 × 商品 × 分。
+ * 利用者本人が「自分は今日これだけやった」を見る。管理画面の検索 (searchSessions) と同じ元データ。
+ * 取り消した記録は数えない。作業中のぶんは確定していないので合計に足さず、「いま何分」で別に出す
+ */
+router.get('/api/daily-report', api((req, res) => {
+  const raw = String(req.query.date == null ? '' : req.query.date).trim();
+  const date = raw || jstToday();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || jstDay(new Date(`${date}T00:00:00+09:00`)) !== date) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '日付は YYYY-MM-DD (実在する日) で指定してください' });
+  }
+  // 読むだけだが default-deny の表 (capabilities) に載せる (Codex R1 #10)。画面も許可があるときだけ入口を描く
+  if (!capabilitiesFor(isAppMode() ? 'app' : 'notion').includes('report.daily')) return res.status(403).json({ ok: false, error: 'forbidden', message: '日報は見られません' });
+  const page = sessionsOverlappingDay(date);
+  if (!page) return res.status(400).json({ ok: false, error: 'bad_request', message: '日付は YYYY-MM-DD (実在する日) で指定してください' });
+  const nowMs = Date.now();
+  const dayStart = Date.parse(page.startUtc);
+  const dayEnd = Date.parse(page.endUtc);
+  const isToday = nowMs >= dayStart && nowMs < dayEnd;
+  const byWorker = new Map();
+  const seenCards = new Set();
+  for (const s of page.rows) {
+    // ⭐その日にかかっている分だけ数える。日をまたいだ記録・開きっぱなしの記録を、その日の外へ伸ばさない (Codex R1 #8)。
+    //   「作業中」は今日だけ。過去の日に残った開きっぱなしは、その日の終わりまでとして確定ぶんに数える
+    const st = Date.parse(s.started_at);
+    const en = s.ended_at ? Date.parse(s.ended_at) : Math.min(nowMs, dayEnd);
+    const overlapMs = Math.min(en, dayEnd) - Math.max(st, dayStart);
+    if (!(overlapMs > 0)) continue;   // その日に 1 秒もかかっていない (未来の日・境界ちょうどに終わった記録) は数えない (Codex R2 #4)
+    const sec = Math.floor(overlapMs / 1000);
+    const live = !s.ended_at && isToday;
+    const key = Number(s.worker_id);
+    if (!byWorker.has(key)) byWorker.set(key, { worker_id: key, worker_name: s.worker_name, total_seconds: 0, live_seconds: 0, active: 0, sessions: 0, items: new Map() });
+    const wv = byWorker.get(key);
+    const ck = s.task_id != null ? `t${s.task_id}` : `p${s.page_id}`;
+    seenCards.add(ck);
+    if (!wv.items.has(ck)) wv.items.set(ck, { task_id: s.task_id, page_id: s.page_id, title: s.title_snapshot || '(名称なし)', product_code: s.product_code, seconds: 0, live_seconds: 0, sessions: 0, active: 0 });
+    const it = wv.items.get(ck);
+    it.sessions += 1; wv.sessions += 1;
+    if (live) { it.live_seconds += sec; wv.live_seconds += sec; it.active += 1; wv.active += 1; }
+    else { it.seconds += sec; wv.total_seconds += sec; }
+  }
+  const workers = [...byWorker.values()]
+    .map((wv) => ({ ...wv, items: [...wv.items.values()].sort((a, b) => (b.seconds + b.live_seconds) - (a.seconds + a.live_seconds)) }))
+    .sort((a, b) => (b.total_seconds + b.live_seconds) - (a.total_seconds + a.live_seconds));
+  res.json({
+    ok: true, date, workers, truncated: !!page.truncated,
+    totals: {
+      seconds: workers.reduce((a, x) => a + x.total_seconds, 0), workers: workers.length,
+      cards: seenCards.size,
+      active: workers.reduce((a, x) => a + x.active, 0),
+    },
+    serverNow: new Date().toISOString(),
   });
 }));
 
@@ -1605,7 +1768,11 @@ router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
       }
     }
     if (!r.ok) return res.status(r.error === 'bad_request' ? 400 : 409).json(r);
-    return res.json({ ...r, task: publicTask(getTask(taskId)) });
+    // 取り消しの切符 (実際に止めた分があるときだけ。60 秒・同じ端末・カードの版がそのままなら使える)
+    const stoppedNow = (r.stopped || (r.session ? [{ id: r.session.id, already: !!r.already }] : [])).filter((s) => !s.already).map((s) => s.id);
+    const taskNow = getTask(taskId);
+    const undo = stoppedNow.length && taskNow ? issueUndoTicket(req, { kind: 'stop', taskId, sessionIds: stoppedNow, taskVersion: taskNow.version }) : null;
+    return res.json({ ...r, task: publicTask(taskNow), ...(undo ? { undo: { token: undo.token, expires_in: undo.expires_in } } : {}) });
   }
   const pageId = String(req.body?.page_id || req.body?.id || '').trim();
   if (!pageId) return res.status(400).json({ ok: false, error: 'bad_request', message: 'page_id が必要です' });
