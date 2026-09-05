@@ -193,6 +193,12 @@ export function enqueuePrintJob({ batchId, lineKey, copies, packQty = null, targ
         return { ok: false, error: 'confirm_unknown', message: '前回の印刷結果が不明です。QL-700 の実物を確認し、シールが出ていない場合だけ「実物を確認した」にチェックしてもう一度発行してください', job: publicJob(last) };
       }
       acked = last.id;
+    } else if (acknowledgeUnknownJobId != null) {
+      // 🚨 証跡を付けて送ってきたのに、直前のジョブがもう unknown ではない (送る直前に遅延報告で completed になった /
+      //    画面が古い)。「出ていない」という前提が崩れているので積まない — 旧印刷 + 新印刷の2枚になる (Codex R3 High)
+      return { ok: false, error: 'state_changed', message: last && last.state === 'completed'
+        ? '前回のジョブは「✅ 印刷しました」に変わりました (遅れて結果が届きました)。そのシールを使ってください'
+        : '前回のジョブの状態が変わりました。画面を更新して確認してください', job: publicJob(last) };
     }
 
     const target = resolvePrintTarget(targetDeviceId);

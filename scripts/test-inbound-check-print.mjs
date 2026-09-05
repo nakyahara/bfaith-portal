@@ -232,7 +232,18 @@ console.log('\n[6] 失敗 (failed) と結果不明 (unknown) を混ぜない');
   ok(oldRow.lease_token === null && oldRow.acknowledged_at && /実物を確認して再発行/.test(oldRow.error), '旧ジョブに確認時刻と理由が残り、lease は無効化される');
   const twice = enqueuePrintJob({ batchId: batch.id, lineKey: L1, copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: j2c.id });
   ok(!twice.ok && twice.error === 'in_progress', '同じ証跡で二重に積めない (新ジョブが進行中)');
-  const j2d = leaseNextJob(agentRow);
+  // 🚨 「出ていない」と確認して送る直前に、遅延報告で unknown → completed になっていたら積まない (Codex R3 High)
+  const jx = leaseNextJob(agentRow);                       // withAck の新ジョブ
+  markSubmitted(jx.id, { deviceId: agentRow.id, leaseToken: jx.leaseToken, spoolJobId: 'nefuda-11' });
+  sweepPrintJobs({ now: at(new Date().toISOString(), REPORT_DEADLINE_SEC * 2 + 1) });
+  eq(stateOf(jx.id), 'unknown', '報告なしで unknown');
+  const lateOk = markFinished(jx.id, { deviceId: agentRow.id, leaseToken: jx.leaseToken, ok: true });
+  ok(lateOk.ok && stateOf(jx.id) === 'completed', '(利用者が確認画面を開いている間に) 遅延完了報告で completed になった');
+  const raced = enqueuePrintJob({ batchId: batch.id, lineKey: L1, copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: jx.id });
+  ok(!raced.ok && raced.error === 'state_changed' && raced.job.state === 'completed' && /印刷しました/.test(raced.message), '証跡付きでも直前が unknown でなくなっていれば積まない (state_changed + 最新ジョブ)');
+  const plain = enqueuePrintJob({ batchId: batch.id, lineKey: L1, copies: 1, clientRequestId: rid() });
+  ok(plain.ok, '証跡なしの通常の「追加で発行」は completed の後なら積める');
+  const j2d = leaseNextJob(agentRow);   // = plain のジョブ
   markFinished(j2d.id, { deviceId: agentRow.id, leaseToken: j2d.leaseToken, ok: false, error: 'template missing' });
   eq(stateOf(j2d.id), 'failed', 'leased からの ok:false (uncertain:false) は failed のまま');
   // 期限切れで unknown に倒した後、同じ lease の報告が遅れて届いたら上書き (より確かな情報)
@@ -243,7 +254,7 @@ console.log('\n[6] 失敗 (failed) と結果不明 (unknown) を混ぜない');
   eq(stateOf(j3.id), 'unknown', '投入後に報告が来なければ unknown');
   // 🚨 [4] で lease したまま報告が無い job2 も、期限が切れたら queued へ戻さず unknown (ジョブを渡した = 紙が出たかもしれない)
   eq(stateOf(job2.id), 'unknown', '報告が来ないまま期限を過ぎた leased は unknown (再配布しない)');
-  ok(sw.unknown === 2 && leaseNextJob(agentRow) === null, 'unknown になったジョブは誰にも配られない');
+  ok(sw.unknown >= 1 && leaseNextJob(agentRow) === null, 'unknown になったジョブは誰にも配られない');
   const late = markFinished(j3.id, { deviceId: agentRow.id, leaseToken: j3.leaseToken, ok: true });
   ok(late.ok && late.state === 'completed' && stateOf(j3.id) === 'completed', '遅れて届いた完了報告で unknown → completed');
   const lateWrong = markFinished(j3.id, { deviceId: agentRow.id, leaseToken: 'other', ok: false, error: 'x' });

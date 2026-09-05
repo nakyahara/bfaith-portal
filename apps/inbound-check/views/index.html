@@ -1851,6 +1851,13 @@
           $('#printMsg').textContent = j.message || '前回の印刷結果が不明です。実物を確認してください';
           return;
         }
+        if (j.error === 'state_changed') {
+          // 「出ていない」と確認して送る直前に、前回の結果 (✅ など) が遅れて届いた。積まずに最新を見せる
+          if (j.job) line.print_job = j.job;
+          closePrintBox(); render(true);
+          banner('warn', '🏷 ' + esc(j.message || '前回のジョブの状態が変わりました'), { sticky: true });
+          return;
+        }
         if (j.error === 'stale_batch') { closePrintBox(); lastJson = ''; load(); return; }
         msgEl.textContent = j.message || j.error || ('HTTP ' + r.status);
         $('#printOk').disabled = false;

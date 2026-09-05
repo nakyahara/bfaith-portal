@@ -341,7 +341,7 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
     requestedBy: a.worker, requestedDevice: a.deviceLabel,
   });
   if (!r.ok) {
-    const status = r.error === 'in_progress' || r.error === 'stale_batch' || r.error === 'confirm_unknown' ? 409 : r.error === 'not_found' ? 404 : 400;
+    const status = ['in_progress', 'stale_batch', 'confirm_unknown', 'state_changed'].includes(r.error) ? 409 : r.error === 'not_found' ? 404 : 400;
     return res.status(status).json(r);
   }
   res.json(r);
