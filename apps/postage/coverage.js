@@ -6,15 +6,20 @@
  *   ・どこでやめていいか (もう伸びない)
  * が判断できる。
  *
- * 定形外の出荷実績は miniPC の warehouse.db (NE 受注) が正本。
- * Render 側には per-伝票の受注が無い (mirror は f_shipments_daily の集計のみ) ため、
- * warehouse.db が読めない環境では available:false を返して画面側で案内する。
+ * 出荷実績の出どころは 2 つ:
+ *   - warehouse         miniPC の warehouse.db (NE 受注)。出荷確定日つきで最も正確。miniPC でしか読めない
+ *   - packing-dispatch  warehouse-mirror.db の pd_shipment_tracking (NE → ロジザードの CSV 出力履歴)。
+ *                       Render で読める。2026-06-04 以降の定形外が全部ある (composition.js)
+ * 既定は warehouse があればそれ、無ければ packing-dispatch。両方無ければ available:false。
  */
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { judge, UNKNOWN_REASONS } from './engine.js';
 import { getDB, getTariffVersionFor, getBands, getMaterialsMap, getOverheadTotalG, getSetting, jstToday } from './db.js';
+import {
+  mirrorAvailable, mirrorPath, loadMirrorShipments, lookupProductNameFromMirror, normalizeSku,
+} from './composition.js';
 
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const WAREHOUSE_DB = process.env.POSTAGE_WAREHOUSE_DB || path.join(DATA_DIR, 'warehouse.db');
@@ -22,11 +27,35 @@ const WAREHOUSE_DB = process.env.POSTAGE_WAREHOUSE_DB || path.join(DATA_DIR, 'wa
 // NE の配送方法名。定形も「定形外郵便」で出るので、この 1 つで拾える (パターン名を真実として扱わない)
 const NE_DELIVERY_METHOD = '定形外郵便';
 
+export const SOURCE_LABELS = {
+  warehouse: 'NE受注 (miniPC の warehouse.db)',
+  'packing-dispatch': 'packing-dispatch の出力履歴 (Render)',
+};
+
+// loadShipments / lookupProductName が使う列。あるだけのファイル (空・壊れている・別物) は「読めない」扱い
+const WAREHOUSE_PROBE = [
+  'SELECT 伝票番号, 出荷確定日, 配送方法名 FROM raw_ne_order_base LIMIT 0',
+  'SELECT 伝票番号, 商品コード, 商品名, 受注数, キャンセル区分 FROM raw_ne_orders LIMIT 0',
+];
 export function warehouseAvailable() {
-  return fs.existsSync(WAREHOUSE_DB);
+  if (!fs.existsSync(WAREHOUSE_DB)) return false;
+  try {
+    const wh = new Database(WAREHOUSE_DB, { readonly: true, fileMustExist: true });
+    try { for (const sql of WAREHOUSE_PROBE) wh.prepare(sql).all(); return true; } finally { wh.close(); }
+  } catch {
+    return false;   // 読めなければ packing-dispatch 側に切り替わる (resolveSource)
+  }
 }
 
-/** 定形外の伝票と明細を期間で取り出す。読み取り専用で開く (本番DBに絶対書かない)。 */
+/** いま読める出どころ (優先順)。 */
+export function availableSources() {
+  const out = [];
+  if (warehouseAvailable()) out.push('warehouse');
+  if (mirrorAvailable()) out.push('packing-dispatch');
+  return out;
+}
+
+/** 定形外の伝票と明細を期間で取り出す (warehouse.db)。読み取り専用で開く (本番DBに絶対書かない)。 */
 export function loadShipments({ since, until } = {}) {
   if (!warehouseAvailable()) return null;
   const wh = new Database(WAREHOUSE_DB, { readonly: true, fileMustExist: true });
@@ -52,7 +81,7 @@ export function loadShipments({ since, until } = {}) {
     for (const r of rows) {
       if (!map.has(r.slip_no)) map.set(r.slip_no, { slip_no: r.slip_no, ship_date: r.ship_date, lines: [] });
       map.get(r.slip_no).lines.push({
-        sku_code: String(r.sku_code ?? '').normalize('NFKC').trim().toLowerCase(),
+        sku_code: normalizeSku(r.sku_code),
         qty: Number(r.qty),
         product_name: r.product_name,
       });
@@ -64,26 +93,28 @@ export function loadShipments({ since, until } = {}) {
 }
 
 /**
- * NE の受注明細から商品名を引く (手で登録するとき、名前を打ち直さなくて済むように)。
- * 出荷実績が無い新商品は見つからない — その場合は手で入れてもらう。
+ * 商品名を引く (手で登録するとき、名前を打ち直さなくて済むように)。
+ * NE の受注明細 → 無ければ packing-dispatch の出力履歴。出荷実績が無い新商品は見つからない。
  */
 export function lookupProductName(skuCode) {
-  if (!warehouseAvailable()) return null;
   const code = String(skuCode || '').trim();
   if (!code) return null;
-  const wh = new Database(WAREHOUSE_DB, { readonly: true, fileMustExist: true });
-  try {
-    const r = wh.prepare(`
-      SELECT 商品名 AS name FROM raw_ne_orders
-       WHERE 商品コード = ? AND 商品名 IS NOT NULL AND 商品名 <> ''
-       ORDER BY rowid DESC LIMIT 1
-    `).get(code);
-    return r?.name || null;
-  } catch {
-    return null;   // 期待した表が無い環境では黙って諦める (補完は「あれば便利」なだけ)
-  } finally {
-    wh.close();
+  if (warehouseAvailable()) {
+    const wh = new Database(WAREHOUSE_DB, { readonly: true, fileMustExist: true });
+    try {
+      const r = wh.prepare(`
+        SELECT 商品名 AS name FROM raw_ne_orders
+         WHERE 商品コード = ? AND 商品名 IS NOT NULL AND 商品名 <> ''
+         ORDER BY rowid DESC LIMIT 1
+      `).get(code);
+      if (r?.name) return r.name;
+    } catch {
+      /* 期待した表が無い環境では黙って次へ (補完は「あれば便利」なだけ) */
+    } finally {
+      wh.close();
+    }
   }
+  return lookupProductNameFromMirror(code);
 }
 
 /** 判定に必要なマスタをまとめて読む。 */
@@ -103,15 +134,23 @@ export function buildContext(forDate) {
   };
 }
 
+function resolveSource(source) {
+  if (source === 'warehouse') return warehouseAvailable() ? 'warehouse' : null;
+  if (source === 'packing-dispatch') return mirrorAvailable() ? 'packing-dispatch' : null;
+  return availableSources()[0] || null;
+}
+
 /**
  * 期間中の定形外を全部判定して集計する。
  * 料金表は **出荷日** に有効なものを使う (改定をまたいでも過去分が壊れない)。
+ * @param {{since?: string, until?: string, source?: 'auto'|'warehouse'|'packing-dispatch'}} opts
  */
-export function coverageReport({ since, until } = {}) {
-  if (!warehouseAvailable()) {
-    return { available: false, warehousePath: WAREHOUSE_DB };
+export function coverageReport({ since, until, source = 'auto' } = {}) {
+  const src = resolveSource(source);
+  if (!src) {
+    return { available: false, source: null, warehousePath: WAREHOUSE_DB, mirrorPath: mirrorPath() };
   }
-  const shipments = loadShipments({ since, until });
+  const shipments = src === 'warehouse' ? loadShipments({ since, until }) : loadMirrorShipments({ since, until });
   const ctxCache = new Map();
   const ctxFor = (date) => {
     if (!ctxCache.has(date)) ctxCache.set(date, buildContext(date));
@@ -122,12 +161,15 @@ export function coverageReport({ since, until } = {}) {
   const byReason = new Map();    // reason → count
   const missingSku = new Map();  // sku_code → {count, name, needs:Set}
   const byDate = new Map();      // ship_date → {total, confirmed}
-  const blockedByMaterial = new Map(); // material_code → 外寸未測定で止まっている通数
+  const blockedByMaterial = new Map(); // `${material_code}:${need}` → 資材側の未登録で止まっている通数
   let confirmed = 0, unknown = 0, totalAmount = 0;
 
   for (const s of shipments) {
     const ctx = ctxFor(s.ship_date);
-    const r = judge(s, ctx);
+    // packing-dispatch の記録が壊れている伝票は、読めた明細だけで判定しない (1 商品欠けたまま安い区分になる)
+    const r = s.broken
+      ? { status: 'unknown', reason: 'broken_composition' }
+      : judge(s, ctx);
     const d = byDate.get(s.ship_date) || { date: s.ship_date, total: 0, confirmed: 0 };
     d.total++;
     if (r.status === 'confirmed') {
@@ -138,9 +180,11 @@ export function coverageReport({ since, until } = {}) {
     } else {
       unknown++;
       byReason.set(r.reason, (byReason.get(r.reason) || 0) + 1);
-      // 「この資材を1個測れば何通が動くか」— 測る優先順位がそのまま出る
-      if (r.reason === 'missing_dims' && r.materialCode) {
-        blockedByMaterial.set(r.materialCode, (blockedByMaterial.get(r.materialCode) || 0) + 1);
+      // 「この資材を1つ直せば何通が動くか」— 直す優先順位がそのまま出る
+      const need = r.reason === 'missing_dims' ? '外寸' : r.reason === 'missing_material_thickness' ? '厚み' : null;
+      if (need && r.materialCode) {
+        const k = `${r.materialCode}:${need}`;
+        blockedByMaterial.set(k, (blockedByMaterial.get(k) || 0) + 1);
       }
       // 「何を測れば直るか」を SKU 単位で積む
       if (['missing_sku', 'missing_weight', 'missing_thickness'].includes(r.reason)) {
@@ -157,8 +201,11 @@ export function coverageReport({ since, until } = {}) {
   }
 
   const total = shipments.length;
+  const materials = getMaterialsMap();
   return {
     available: true,
+    source: src,
+    sourceLabel: SOURCE_LABELS[src],
     period: { since: since || null, until: until || null },
     total,
     confirmed,
@@ -171,9 +218,10 @@ export function coverageReport({ since, until } = {}) {
       .map(([reason, count]) => ({ reason, label: UNKNOWN_REASONS[reason] || reason, count }))
       .sort((a, b) => b.count - a.count),
     blockedMaterials: [...blockedByMaterial.entries()]
-      .map(([code, count]) => {
-        const m = getMaterialsMap().get(code);
-        return { material_code: code, display_name: m?.display_name || code, count };
+      .map(([key, count]) => {
+        const [code, need] = key.split(':');
+        const m = materials.get(code);
+        return { material_code: code, display_name: m?.display_name || code, need, count };
       })
       .sort((a, b) => b.count - a.count),
     missingSkus: [...missingSku.values()]

@@ -23,7 +23,12 @@ export const UNKNOWN_REASONS = {
   missing_material: '資材が決まらない',
   material_conflict: '明細ごとに資材が違う',
   missing_dims: '資材の外寸が未測定',
+  missing_material_thickness: '資材の厚み未登録',
   missing_thickness: '商品の厚み未登録',
+  missing_composition: '商品構成が見つからない',
+  broken_composition: '商品構成が壊れている (packing-dispatch の記録が読めない)',
+  unknown_method: '配送方法が判定できない',
+  not_teikeigai: '定形外の伝票ではない',
   near_weight_boundary: '重量が料金の境界に近い (要実測)',
   near_thickness_boundary: '厚みがサイズの境界に近い (要実測)',
   over_maximum: '定形外の上限を超える (郵便で出せない)',
@@ -37,7 +42,7 @@ export const UNKNOWN_REASONS = {
  * @param {{lines: Array<{sku_code: string, qty: number}>}} shipment
  * @param {{
  *   skus: Map<string, {unit_weight_g?: number, thickness_mm?: number, default_material_code?: string, display_name?: string}>,
- *   materials: Map<string, {tare_weight_g?: number, outer_length_mm?: number, outer_width_mm?: number, display_name?: string}>,
+ *   materials: Map<string, {tare_weight_g?: number, thickness_mm?: number, outer_length_mm?: number, outer_width_mm?: number, dims_verified?: number, display_name?: string}>,
  *   bands: Array<{mail_type: string, band_code: string, display_name: string, max_weight_g: number, amount_yen: number}>,
  *   overheadG: number,
  *   boundaryMarginG: number,
@@ -91,9 +96,16 @@ export function judge(shipment, ctx) {
 
   const weightG = round1(itemWeightG + material.tare_weight_g + overheadG);
 
+  // 資材そのものの厚み (封筒 1mm・プチ袋 2mm)。未登録を 0 とみなすと、定形 10mm の境界で
+  // 1〜2mm がそのまま 110円/140円 の差になるので、入るまで確定させない
+  const materialThicknessMm = material.thickness_mm;
+  if (!Number.isFinite(materialThicknessMm) || materialThicknessMm <= 0) {
+    return unknown('missing_material_thickness', `${material.display_name || materialCode} の厚みが未登録`, { weightG, materialCode });
+  }
+
   // ── 3. 厚み ────────────────────────────────────────────
   // 数量が複数なら重なるので合計する (薄いものを並べる場合もあるが、厚い側に倒したうえで
-  // 境界に近ければ「不明」に落とすので、黙って安い区分にはならない)。
+  // 境界に近ければ「不明」に落とすので、黙って安い区分にはならない)。資材の厚みも足す。
   const missingThickness = [];
   let thicknessMm = 0;
   for (const l of lines) {
@@ -101,8 +113,8 @@ export function judge(shipment, ctx) {
     if (!Number.isFinite(s.thickness_mm) || s.thickness_mm <= 0) { missingThickness.push(l.sku_code); continue; }
     thicknessMm += s.thickness_mm * Number(l.qty);
   }
-  if (missingThickness.length) return unknown('missing_thickness', missingThickness.join(', '));
-  thicknessMm = round1(thicknessMm);
+  if (missingThickness.length) return unknown('missing_thickness', missingThickness.join(', '), { weightG, materialCode });
+  thicknessMm = round1(thicknessMm + materialThicknessMm);
   // 数量が複数のときは重なり方が読めないぶん、厚みの安全幅を倍にする
   const effThicknessMargin = totalQty > 1 ? marginMm * 2 : marginMm;
 
@@ -156,6 +168,7 @@ export function judge(shipment, ctx) {
     materialTareG: material.tare_weight_g,
     overheadG,
     thicknessMm,
+    materialThicknessMm,
     materialCode,
     materialName: material.display_name || materialCode,
   };

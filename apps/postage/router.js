@@ -1,10 +1,11 @@
 /**
  * 郵便料金判定 (postage) — 画面 + API
  *
- * 役割は「マスタを育てる」こと。印字はまだしない (PR1b)。
- * 画面は2つ:
+ * 役割は「マスタを育てる」こと + 判定ログを見せること。判定 API 本体は judge-router.js。
+ * 画面は3つ:
  *   /            カバー率 — いま何割が確定できるか / 次に何を測れば効くか / 取り込んだ表のどこが壊れているか
  *   /skus        商品マスタ — 商品ごとに重さ・厚み・資材を登録する。入れたその場で判定を見せる
+ *   /decisions   判定ログ — ランチャーに返した印字文言。不明 (人が測るもの) を上に出す
  */
 import express from 'express';
 import multer from 'multer';
@@ -15,8 +16,12 @@ import {
   getDB, initPostageDB, getTariffVersionFor, getBands, jstToday,
 } from './db.js';
 import { importWeightFile } from './import.js';
-import { coverageReport, warehouseAvailable, buildContext, lookupProductName } from './coverage.js';
+import {
+  coverageReport, warehouseAvailable, availableSources, SOURCE_LABELS, buildContext, lookupProductName,
+} from './coverage.js';
 import { searchSkus, countByStatus, previewOne, skuStatus, STATUS_LABELS, FILTER_LABELS } from './skus.js';
+import { listDecisions, STATUS_LABELS as DECISION_STATUS_LABELS } from './judge-service.js';
+import { mirrorAvailable } from './composition.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
@@ -77,14 +82,28 @@ function defaultSince() {
   d.setUTCDate(d.getUTCDate() - 90);
   return d.toISOString().slice(0, 10);
 }
+// 実在する YYYY-MM-DD だけ受ける。壊れた値 (?since=xxxxxxxxxx) で日付計算が RangeError にならないように既定へ戻す
+function ymdOr(v, fallback) {
+  const s = String(v || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return fallback;
+  const t = Date.parse(`${s}T00:00:00Z`);
+  return Number.isFinite(t) && new Date(t).toISOString().slice(0, 10) === s ? s : fallback;
+}
+
+// 出荷実績の出どころ。指定が無ければ自動 (warehouse があればそれ、無ければ packing-dispatch)
+function sourceOf(req) {
+  const s = String(req.query.source || 'auto');
+  return Object.prototype.hasOwnProperty.call(SOURCE_LABELS, s) ? s : 'auto';
+}
 
 // ─────────────────────────── 画面 ───────────────────────────
 router.get('/', (req, res) => {
   const db = getDB();
-  const since = String(req.query.since || defaultSince()).slice(0, 10);
-  const until = req.query.until ? String(req.query.until).slice(0, 10) : null;
+  const since = ymdOr(req.query.since, defaultSince());
+  const until = ymdOr(req.query.until, null);
+  const source = sourceOf(req);
 
-  const report = coverageReport({ since, until });
+  const report = coverageReport({ since, until, source });
   const tariff = getTariffVersionFor(jstToday());
   const materials = db.prepare('SELECT * FROM pm_materials ORDER BY active DESC, material_code').all();
   const overheads = db.prepare('SELECT * FROM pm_overheads ORDER BY code').all();
@@ -104,16 +123,17 @@ router.get('/', (req, res) => {
   res.render(view('index.ejs'), {
     report, tariff, bands: tariff ? getBands(tariff.tariff_version_id) : [],
     materials, overheads, settings, skuStats, lastRun, issues,
-    since, until: until || '', warehouseOk: warehouseAvailable(),
+    since, until: until || '', source, sources: availableSources(), sourceLabels: SOURCE_LABELS,
+    warehouseOk: warehouseAvailable(), mirrorOk: mirrorAvailable(),
     username: req.session?.email, displayName: req.session?.displayName,
   });
 });
 
 // 不足リストの CSV (現場に配って埋めてもらうため)
 router.get('/missing.csv', (req, res) => {
-  const since = String(req.query.since || defaultSince()).slice(0, 10);
-  const report = coverageReport({ since });
-  if (!report.available) return res.status(503).send('warehouse.db が読めません');
+  const since = ymdOr(req.query.since, defaultSince());
+  const report = coverageReport({ since, source: sourceOf(req) });
+  if (!report.available) return res.status(503).send('出荷実績 (warehouse.db / packing-dispatch) が読めません');
   const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
   const lines = ['優先,出現通数,商品コード,商品名,足りないもの'];
   report.missingSkus.forEach((m, i) => {
@@ -155,7 +175,19 @@ router.get('/skus', (req, res) => {
         .map((m) => [m.material_code, { name: m.display_name, active: !!m.active }]),
     ),
     statusLabels: STATUS_LABELS, filterLabels: FILTER_LABELS,
-    warehouseOk: warehouseAvailable(),
+    warehouseOk: warehouseAvailable() || mirrorAvailable(),
+    username: req.session?.email, displayName: req.session?.displayName,
+  });
+});
+
+// 判定ログ — ランチャーが送ってきた伝票に何を返したか (印字した文言そのもの)。
+// 「不明」を上に出す: 集荷前に人が測って訂正する対象がこれ
+router.get('/decisions', (req, res) => {
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || '')) ? String(req.query.date) : jstToday();
+  const data = listDecisions({ date });
+  res.render(view('decisions.ejs'), {
+    ...data, statusLabels: DECISION_STATUS_LABELS,
+    judgeKeySet: !!process.env.POSTAGE_JUDGE_KEY, mirrorOk: mirrorAvailable(),
     username: req.session?.email, displayName: req.session?.displayName,
   });
 });
@@ -197,12 +229,14 @@ router.post('/api/materials/:code', (req, res) => {
     const tare = pick('tare_weight_g');
     const L = pick('outer_length_mm');
     const W = pick('outer_width_mm');
+    const T = pick('thickness_mm');
+    if (T !== null && T > 100) throw new Error('厚みが大きすぎます (mm で入れてください。封筒なら 1〜2)');
     // 外寸が両方入ったときだけ「測った」と見なす。片方だけでは判定に使えない
     const verified = (L !== null && W !== null) ? 1 : 0;
-    db.prepare(`UPDATE pm_materials SET tare_weight_g=?, outer_length_mm=?, outer_width_mm=?,
+    db.prepare(`UPDATE pm_materials SET tare_weight_g=?, outer_length_mm=?, outer_width_mm=?, thickness_mm=?,
       dims_verified=?, note=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'), updated_by=?
       WHERE material_code=?`)
-      .run(tare, L, W, verified, req.body.note ?? cur.note, actorOf(req), code);
+      .run(tare, L, W, T, verified, req.body.note ?? cur.note, actorOf(req), code);
     res.json({ ok: true });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
@@ -302,10 +336,11 @@ router.post('/api/materials', (req, res) => {
     const tare = num(req.body.tare_weight_g, '自重', 4000);          // 定形外の上限が 4kg
     const L = num(req.body.outer_length_mm, '長辺', 1000);           // 規格外の長辺上限が 600mm
     const W = num(req.body.outer_width_mm, '短辺', 1000);
+    const T = num(req.body.thickness_mm, '厚み', 100);               // 資材そのものの厚み (封筒 1〜2mm)
     db.prepare(`INSERT INTO pm_materials
-      (material_code, display_name, tare_weight_g, outer_length_mm, outer_width_mm, dims_verified, note, updated_at, updated_by)
-      VALUES (?,?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%SZ','now'), ?)`)
-      .run(code, name, tare, L, W, (L !== null && W !== null) ? 1 : 0,
+      (material_code, display_name, tare_weight_g, outer_length_mm, outer_width_mm, thickness_mm, dims_verified, note, updated_at, updated_by)
+      VALUES (?,?,?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%SZ','now'), ?)`)
+      .run(code, name, tare, L, W, T, (L !== null && W !== null) ? 1 : 0,
         str(req.body.note, 'メモ', 300) || null, actorOf(req));
     res.json({ ok: true });
   } catch (e) {
@@ -340,6 +375,25 @@ router.post('/api/settings', (req, res) => {
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
   }
+});
+
+/**
+ * 1通あたりの固定加算 (送り状シールなど) の重さ。
+ * 2026-08-30 実測 0.5g で種を入れたが、2026-09-05 に中原さんが 2g と確定 → 画面から直せるようにした。
+ * 0 は許す (加算しない、という明示)。50g を超える固定加算は入力ミス
+ */
+router.post('/api/overheads/:code', (req, res) => {
+  const db = getDB();
+  const cur = db.prepare('SELECT * FROM pm_overheads WHERE code=?').get(req.params.code);
+  if (!cur) return res.status(404).json({ ok: false, error: '固定加算が見つかりません' });
+  const v = req.body?.weight_g;
+  const n = Number(v);
+  if (v === '' || v === null || v === undefined || (typeof v !== 'string' && typeof v !== 'number') || !Number.isFinite(n) || n < 0 || n > 50) {
+    return res.status(400).json({ ok: false, error: '重さは 0〜50 g で入れてください' });
+  }
+  db.prepare(`UPDATE pm_overheads SET weight_g=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now'), updated_by=? WHERE code=?`)
+    .run(n, actorOf(req), req.params.code);
+  res.json({ ok: true, weight_g: n });
 });
 
 /** 単票の試算 (デバッグ・確認用)。印字はまだしない。 */

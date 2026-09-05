@@ -27,8 +27,11 @@ const { buildContext } = await import('./coverage.js');
 initPostageDB();
 const db = getDB();
 
-// 茶封筒だけ「実測済み」にする (未実測では何も確定しないため)
-db.prepare('UPDATE pm_materials SET dims_verified=1 WHERE material_code=?').run('chabuto');
+// 茶封筒だけ「実測済み」にする (未実測では何も確定しないため)。資材の厚みも入れる (無いと厚み未登録で止まる)
+db.prepare('UPDATE pm_materials SET dims_verified=1, thickness_mm=1 WHERE material_code=?').run('chabuto');
+db.prepare('UPDATE pm_materials SET thickness_mm=2 WHERE material_code=?').run('shiropuchi');
+db.prepare(`INSERT INTO pm_materials (material_code, display_name, tare_weight_g, outer_length_mm, outer_width_mm, dims_verified)
+  VALUES ('noth', '厚み未登録の封筒', 5, 235, 120, 1)`).run();
 
 const put = (sku, name, w, th, mat) => db.prepare(`
   INSERT INTO pm_skus (sku_code, display_name, unit_weight_g, thickness_mm, default_material_code, updated_at)
@@ -41,6 +44,7 @@ put('d-nomat', '資材未定の商品', 15, 1, null);
 put('e-dims', '外寸未測定の資材_梱機プ', 30, 20, 'shiropuchi');
 put('f_under', 'アンダースコアを含む_長3封', 15, 1, 'chabuto');
 put('g-allnull', '何も入っていない商品', null, null, null);
+put('h-noth', '資材の厚みが無い封筒に入れる商品', 15, 1, 'noth');
 
 console.log('■ 状態の判定');
 t('全部揃っていれば ready', () => eq(skuStatus({ default_material_code: 'chabuto', unit_weight_g: 1, thickness_mm: 1 }), 'ready'));
@@ -54,9 +58,9 @@ t('厚みが無ければ no_thickness', () =>
 console.log('\n■ 件数');
 t('状態ごとの件数が重複せず合計と合う', () => {
   const c = countByStatus();
-  eq(c.total, 7);
+  eq(c.total, 8);
   eq(c.no_material + c.no_weight + c.no_thickness + c.ready, c.total, '足すと総数');
-  eq(c.no_material, 2); eq(c.ready, 3);
+  eq(c.no_material, 2); eq(c.ready, 4);
   eq(c.incomplete, c.total - c.ready);
 });
 
@@ -78,9 +82,9 @@ t('未完了だけに絞れる', () => {
   eq(r.rows.some((x) => x.sku_code === 'a-ready'), false);
 });
 t('揃っているものだけに絞れる', () => {
-  // 商品側が揃っている、という意味。資材の外寸が未測定 (e-dims) はここに入る。
+  // 商品側が揃っている、という意味。資材の外寸が未測定 (e-dims)・資材の厚みが無い (h-noth) はここに入る。
   // その商品が実際に確定できるかは右端のプレビューが答える
-  eq(searchSkus({ filter: 'ready' }).total, 3);
+  eq(searchSkus({ filter: 'ready' }).total, 4);
 });
 t('商品側が揃っていても資材が未実測なら確定はしない (状態とプレビューは別物)', () => {
   eq(skuStatus(searchSkus({ q: 'e-dims' }).rows[0]), 'ready');
@@ -112,11 +116,15 @@ t('件数の上限を超える指定は丸められる', () => {
 
 console.log('\n■ その場の判定プレビュー');
 const ctx = buildContext();
-t('揃っていれば料金が出る (15 + 5 + 0.5 = 20.5g・厚さ1mm → 定形110円)', () => {
+t('揃っていれば料金が出る (15 + 5 + 0.5 = 20.5g・厚さ 1+封筒1 = 2mm → 定形110円)', () => {
   const p = previewOne('a-ready', ctx);
   eq(p.ok, true);
   eq(/定形 50g以内/.test(p.text) && /110円/.test(p.text), true, p.text);
-  eq(/20.5g/.test(p.sub), true, p.sub);
+  eq(/20.5g/.test(p.sub) && /厚さ2mm/.test(p.sub), true, p.sub);
+});
+t('資材の厚みが無ければ不明 (商品側が揃っていても)', () => {
+  const p = previewOne('h-noth', ctx);
+  eq(p.ok, false); eq(/資材の厚み未登録/.test(p.text), true, p.text);
 });
 t('重さが無ければ理由つきで不明', () => {
   const p = previewOne('b-noweight', ctx);

@@ -73,6 +73,7 @@ import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from
 import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
 import productLinksRouter from './apps/product-links/router.js';
 import postageRouter from './apps/postage/router.js';
+import postageJudgeRouter from './apps/postage/judge-router.js';
 import { startProductLinksCron } from './apps/product-links/cron.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import priceUpdateRouter from './apps/price-update/router.js';
@@ -321,6 +322,8 @@ app.use((req, res, next) => {
     // /apps/stock-bot は Chat Bearer 検証 (stockBotAuth) 後に専用 parser (256kb) が走る。
     // 認証前に body を読まない (未認可 DoS 面を閉じる)
     if (normalizedPath.startsWith('/apps/stock-bot')) return next();
+    // /apps/postage/judge-api は x-api-key 検証後に専用 parser (256kb) が走る (伝票出しPCのランチャー向け)
+    if (normalizedPath.startsWith('/apps/postage/judge-api')) return next();
     // mirror read API (GET専用、監査S-2で認証追加) への POST も認証前 body parse を避ける
     // (POST は router 側に route が無く 404 になるだけなので parse 不要)。
     if (/^\/apps\/mirror\/api\/(products|sales|status|download)(\/|$)/.test(normalizedPath)) return next();
@@ -1420,8 +1423,10 @@ app.use('/apps/site-contact/api', express.json({ limit: '64kb' }), siteContactRo
 // 仕入れ先向け 売れ筋共有 (社内管理): 仕入先名登録・共有URL発行・プレビュー
 app.use('/apps/supplier-sales', requireAppAccess('supplier-sales'), express.json({ limit: '256kb' }), supplierSalesRouter);
 // 郵便料金判定 (postage): 専用DB postage.db (DATA_DIR)。
-// カバー率は miniPC の warehouse.db (NE受注) を読み取り専用で参照する — Render では available:false になる。
+// カバー率は miniPC の warehouse.db (NE受注) か、Render では packing-dispatch の出力履歴 (warehouse-mirror.db) を読み取り専用で参照する。
+// judge-api は伝票出しPCのランチャーが叩く (x-api-key = POSTAGE_JUDGE_KEY、未設定なら 503)。requireAppAccess より先に mount
 // express.json はルータ側で持つ (取込だけ multipart のため)
+app.use('/apps/postage/judge-api', postageJudgeRouter);
 app.use('/apps/postage', requireAppAccess('postage'), postageRouter);
 app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トークン認証 (PH_SERVICE_TOKEN, fail-closed)
 app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
