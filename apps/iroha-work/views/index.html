@@ -287,6 +287,27 @@
   .nums .n.big .v{font-size:1.9rem}
   .nums .n .u{font-size:.8rem;color:var(--sub);font-weight:600;margin-left:2px}
   .nums .n.unk .v{color:var(--faint)}   /* 分からないものは薄い「—」で出す (消さない) */
+  .nums .n.done .v{color:var(--ok)}
+  .nums .n.rest .v{color:var(--amber)}
+  .nums .edit{margin-left:auto;align-self:center;background:var(--surface);border:1px solid var(--line);border-radius:999px;
+    padding:6px 14px;font-family:var(--font);font-size:.82rem;font-weight:700;color:var(--accent);cursor:pointer;min-height:36px}
+  /* ── 中断メモ = 次にやる人への申し送り (要件 §Y。中原さん 2026-09-05) ── */
+  .memo{margin-top:10px;background:var(--amber-soft);border:1px solid var(--amber);border-radius:var(--r-sm);padding:10px 12px}
+  .memo label{display:block;font-size:.72rem;font-weight:700;letter-spacing:.08em;color:var(--amber)}
+  .memo .v{margin-top:3px;font-size:.95rem;font-weight:600;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+  /* ── 「何個までできましたか」(中断するとき) ── */
+  .dq{margin-top:10px;text-align:left}
+  .dq label{display:block;font-size:.8rem;font-weight:700;color:var(--sub);margin-bottom:4px}
+  .dq .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .dq input[type=number]{font-family:var(--num);font-size:1.5rem;font-weight:700;width:130px;padding:8px 10px;
+    border:1px solid var(--line);border-radius:var(--r-sm);text-align:right;background:var(--surface);color:var(--ink)}
+  .dq .of{font-size:.9rem;color:var(--sub);font-weight:600}
+  .dq .quick{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+  .dq .quick button{background:var(--well);border:1px solid var(--line);border-radius:999px;padding:7px 14px;
+    font-family:var(--font);font-size:.85rem;font-weight:700;color:var(--ink);cursor:pointer;min-height:40px}
+  .dq textarea{width:100%;box-sizing:border-box;margin-top:8px;min-height:70px;padding:8px 10px;font-family:var(--font);
+    font-size:.95rem;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--surface);color:var(--ink);resize:vertical}
+  .dq .sub{font-size:.78rem;color:var(--sub);margin-top:4px}
   /* 参考・外部出し目安・取引先 — 読むだけの一行 */
   .facts{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
   .facts span{font-size:.8rem;background:var(--well);border:1px solid var(--line);border-radius:999px;padding:3px 10px;color:var(--sub)}
@@ -554,6 +575,17 @@
   </div>
 
   <!-- ══ ステータス変更ダイアログ ══ -->
+  <div class="overlay" id="dqOv">
+    <div class="modal">
+      <h3>できた数・中断メモ</h3>
+      <div class="mname" id="dqName">—</div>
+      <div class="msaving" id="dqMsg"></div>
+      <div id="dqBody"></div>
+      <div class="mbtns"><button class="btn" id="dqCancel" onclick="closeDq()">やめる</button>
+        <button class="btn primary" id="dqSave" onclick="saveProgress()">保存する</button></div>
+      <p class="hint">数え間違いはここで直せます。中断メモは次にやる人が読みます。</p>
+    </div>
+  </div>
   <div class="overlay" id="stOv">
     <div class="modal">
       <h3>ステータスを変える</h3>
@@ -1361,7 +1393,10 @@ function bcardHtml(c, status) {
   // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
   const grab = isApp() && !bulkIds && (boardCols === 'fac' ? stateCan('task.facility.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
-  const meta = [c.qty != null ? c.qty + ' 個' : null, c.boxes || null,
+  const meta = [c.qty != null ? c.qty + ' 個' : null,
+    c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
+    c.hold_memo ? '📝 メモ' : null,
+    c.boxes || null,
     c.plan_hours != null ? '⏱ ' + c.plan_hours + 'h' : null,
     c.external_ready ? '📦 外部に出せます' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
@@ -2345,11 +2380,28 @@ function headNumsHtml(c) {
     return '<div class="n' + (cls ? ' ' + cls : '') + (known ? '' : ' unk') + '"><label>' + esc(label) + '</label>' +
       '<div class="v">' + (known ? esc(v) + (unit ? '<span class="u">' + esc(unit) + '</span>' : '') : '—') + '</div></div>';
   };
+  // ⭐できた数 (要件 §Y)。**まだ数えていない (null) と 0 個は別のこと**なので、null は「—」のまま
+  const done = c.done_qty;
+  const rest = (c.qty != null && done != null) ? Math.max(0, c.qty - done) : null;
+  const over = (c.qty != null && done != null && done > c.qty) ? done - c.qty : 0;
   return '<div class="nums">' +
     n('つくる数', c.qty, '個', 'big') +
+    n('できた数', done, '個', 'done') +
+    (done == null ? '' : n('残り', rest, '個', 'rest')) +
     n('必要保管箱', c.boxes, '') +
     n('想定作業時間', c.plan_hours, '時間') +
+    (over > 0 ? '<div class="n unk"><label>つくる数より</label><div class="v">+' + esc(String(over)) + '<span class="u">個</span></div></div>' : '') +
+    (canEditProgress(c) ? '<button class="edit" onclick="openDq(null)">✎ できた数</button>' : '') +
     '</div>';
+}
+/** できた数・中断メモを直せるか。状態を変えられる人なら直せる (作業した本人が直せないと現場が止まる) */
+function canEditProgress(c) {
+  return isApp() && detailSrc !== 'preview' && c.status !== 'closed' && can('task.status.change');
+}
+/** 中断メモ — 次にやる人が読むもの。カードを開いたらすぐ見えるところに出す (要件 §Y-3) */
+function memoHtml(c) {
+  return c.hold_memo
+    ? '<div class="memo"><label>📝 中断メモ (前の人からの申し送り)</label><div class="v">' + esc(c.hold_memo) + '</div></div>' : '';
 }
 /** 参考・外部出し目安・取引先 — 読むだけなので札で並べる */
 function headFactsHtml(c) {
@@ -2424,7 +2476,7 @@ function renderDetail(c, opts) {
       headNumsHtml(c) +
       headFactsHtml(c) +
       '</div></div>' +
-      sealHtml(c) + careHtml(c) +
+      sealHtml(c) + careHtml(c) + memoHtml(c) +
       '</div>' +
     prevCardHtml(c) +
 
@@ -3160,7 +3212,8 @@ function openStFromDetail() { if (curDetail && can('task.status.change')) openSt
 // ─── ステータス変更 (Codex R2 ①: 保存中表示・処理中は全ボタン無効・失敗は大きく) ───
 let stTarget = null;   // カードの id
 let stSaving = false;
-let stStep = null;     // アプリ正本で理由を選んでいる途中 ('on_hold' | 'closed')
+let stStep = null;     // アプリ正本で理由を選んでいる途中 ('on_hold' | 'closed' | 'hold_qty')
+let stHold = null;     // 中断で選んだ理由 { reason, note } (数を聞いている間だけ持つ)
 
 /** アプリ正本で「その変更に職員の本人確認が要るか」(サーバー tasks.js transitionNeedsStaff と同じ規則) */
 const stNeedsStaff = (from, to) => to === 'closed' || from === 'closed' || (from === 'ready_for_stocking' && to === 'in_progress');
@@ -3188,9 +3241,108 @@ function renderStBtns(c) {
       + stBtn('back', '← もどる', false);
     return;
   }
+  // ⭐中断するとき「何個までできましたか」+ 中断メモ を 1 回だけ聞く (要件 §Y)。
+  //   数は任意 — 数えていないなら「数えずに中断する」で進める (0 個と混ぜない)
+  if (stStep === 'hold_qty') {
+    $('#stBtns').innerHTML = dqPanelHtml(c,
+      stBtn('hold_go', 'この数で中断する', false) +
+      stBtn('hold_skip', '数えずに中断する', false) +
+      stBtn('back', '← もどる', false));
+    return;
+  }
   const nexts = (state.transitions || {})[c.status] || [];
   $('#stBtns').innerHTML = nexts.map(v => stBtn(v, stName(v) + (stNeedsStaff(c.status, v) ? ' 🔑' : ''), false)).join('')
     || '<p class="hint">この状態から変えられる先がありません</p>';
+}
+
+/**
+ * ⭐「何個までできましたか」+「中断メモ」の入力 (要件 §Y)。
+ * 中断するときと、あとから直すときで同じ形を使う。**数は任意** — 数えていないなら空のままでよい
+ * (空 = まだ数えていない。0 個 = 1 個もできていない。この 2 つは別のこととして扱う)
+ */
+function dqPanelHtml(c, actions) {
+  const cur = c.done_qty == null ? '' : String(c.done_qty);
+  const memo = c.hold_memo || '';
+  const quick = [['0', 'まだ 0 個']];
+  if (c.qty != null) {
+    if (c.qty >= 2) quick.push([String(Math.floor(c.qty / 2)), '半分 (' + Math.floor(c.qty / 2) + ' 個)']);
+    quick.push([String(c.qty), '全部 (' + c.qty + ' 個)']);
+  }
+  return '<div class="dq">' +
+    '<label>何個までできましたか</label>' +
+    '<div class="row"><input class="dqIn" type="number" inputmode="numeric" min="0" step="1" value="' + esc(cur) + '" placeholder="—">' +
+      '<span class="of">' + (c.qty != null ? '／ つくる数 ' + esc(String(c.qty)) + ' 個' : '／ つくる数は不明') + '</span></div>' +
+    '<div class="quick">' + quick.map(([v, l]) =>
+      '<button type="button" data-dq="' + esc(v) + '">' + esc(l) + '</button>').join('') +
+      '<button type="button" data-dq="">数えていない</button></div>' +
+    '<p class="sub">数えていないときは空のままで構いません (0 個とは別のこととして残します)</p>' +
+    '<label style="margin-top:10px">中断メモ (任意) — 次にやる人が読みます</label>' +
+    '<textarea class="dqMemo" maxlength="500" placeholder="例: ラベルは貼り終わり、袋詰めの途中です">' + esc(memo) + '</textarea>' +
+    '</div>' + actions;
+}
+/**
+ * 入力欄の中身を読む。空文字は「数えていない」= null (0 に丸めない)。
+ * ⚠パネルは中断ダイアログと「あとから直す」ダイアログの両方に描かれるので、**入れ物を指定して**探す
+ */
+function dqValues(rootSel) {
+  const root = $(rootSel);
+  const el = root && root.querySelector('.dqIn');
+  const raw = el ? String(el.value).trim() : '';
+  const memoEl = root && root.querySelector('.dqMemo');
+  return { qty: raw === '' ? null : Number(raw), raw, memo: memoEl ? String(memoEl.value).trim() : '' };
+}
+/** クイックボタン (まだ0個 / 半分 / 全部 / 数えていない) — 値は data-dq から取る。同じパネルの中の欄だけ書き換える */
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-dq]');
+  if (!b) return;
+  const panel = b.closest('.dq');
+  const input = panel && panel.querySelector('.dqIn');
+  if (input) input.value = b.dataset.dq;
+});
+
+// ─── できた数・中断メモを**あとから直す** (状態は変えない) ───
+let dqTarget = null;
+let dqSaving = false;
+function openDq(id) {
+  const c = findCard(id == null ? curDetail : id);
+  if (!c || !canEditProgress(c)) return;
+  if (!worker) { openGate(); return; }
+  dqTarget = c.id;
+  $('#dqName').textContent = c.title;
+  $('#dqMsg').textContent = '';
+  $('#dqBody').innerHTML = dqPanelHtml(c, '');
+  openOverlay('#dqOv');
+}
+function closeDq() { if (dqSaving) return; closeOverlay('#dqOv'); dqTarget = null; $('#dqBody').innerHTML = ''; }
+$('#dqOv').addEventListener('click', e => { if (e.target === $('#dqOv')) closeDq(); });
+
+async function saveProgress() {
+  if (dqSaving || dqTarget == null || !worker) return;
+  const c = findCard(dqTarget);
+  if (!c || !canEditProgress(c)) { closeDq(); return; }
+  const v = dqValues('#dqBody');
+  if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#dqMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
+  dqSaving = true;
+  $('#dqSave').disabled = true; $('#dqCancel').disabled = true;
+  $('#dqMsg').textContent = '保存中…';
+  const j = await apiFetch('/api/progress', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: dqTarget, worker_id: worker.id, expect_version: c.version, done_qty: v.qty, hold_memo: v.memo }),
+  });
+  dqSaving = false;
+  $('#dqSave').disabled = false; $('#dqCancel').disabled = false;
+  if (j.ok) {
+    applyTask(c, j.task);
+    closeOverlay('#dqOv'); dqTarget = null; $('#dqBody').innerHTML = '';
+    renderList();
+    if (sameId(curDetail, c.id)) renderDetail(c);
+    toast(v.qty == null ? '「数えていない」にしました' : 'できた数を ' + v.qty + ' 個にしました');
+    return;
+  }
+  $('#dqMsg').textContent = '';
+  if (j.error === 'conflict' && j.current) { applyTask(c, j.current); if (sameId(curDetail, c.id)) renderDetail(c); }
+  showErr(j.message || '保存できませんでした');
+  if (j.error === 'conflict' || j.error === 'notion_mode') { closeOverlay('#dqOv'); dqTarget = null; loadState(); }
 }
 
 function openSt(ev, id) {
@@ -3201,6 +3353,7 @@ function openSt(ev, id) {
   if (!c) return;
   stTarget = c.id;
   stStep = null;
+  stHold = null;
   $('#stName').textContent = c.title + ' (いま: ' + stLabel(c) + ')';
   $('#stMsg').textContent = '';
   $('#pinRow').style.display = 'none';
@@ -3208,7 +3361,7 @@ function openSt(ev, id) {
   renderStBtns(c);
   openOverlay('#stOv');
 }
-function closeSt() { if (stSaving) return; closeOverlay('#stOv'); stTarget = null; stStep = null; }
+function closeSt() { if (stSaving) return; closeOverlay('#stOv'); stTarget = null; stStep = null; stHold = null; }
 $('#stOv').addEventListener('click', e => { if (e.target === $('#stOv')) closeSt(); });
 
 /** ボタンの値は data-v から取る (状態名を JS 文字列に埋め込まない) */
@@ -3218,6 +3371,7 @@ function doSetStEl(el) { doSetSt(el.dataset.v); }
 function applyTask(c, t) {
   if (!t || typeof t !== 'object') return;
   for (const k of ['status', 'status_label', 'version', 'facility_code', 'hold_reason_code', 'hold_reason_note',
+    'done_qty', 'hold_memo',
     'planned_date', 'when', 'cancellation_requested_at', 'migration_review', 'external_ready']) {
     if (k in t) c[k] = t[k];
   }
@@ -3231,16 +3385,35 @@ async function doSetSt(choice) {
   if (!c) { closeSt(); return; }
 
   let to = choice, holdReason = null, closeReason = null, holdNote = null, reopenReason = null;
+  let doneQty, holdMemo;   // undefined = 送らない (今の値のまま)
   if (isApp()) {
-    if (choice === 'back') { stStep = null; $('#stMsg').textContent = ''; renderStBtns(c); return; }
-    if (choice.startsWith('hold:')) { to = 'on_hold'; holdReason = choice.slice(5); }
+    if (choice === 'back') { stStep = null; stHold = null; $('#stMsg').textContent = ''; renderStBtns(c); return; }
+    // 数を聞いている段からの送信 (理由は stHold に持っている)
+    if (choice === 'hold_go' || choice === 'hold_skip') {
+      if (!stHold) { stStep = null; renderStBtns(c); return; }
+      const v = dqValues('#stBtns');
+      if (choice === 'hold_go') {
+        if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#stMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
+        doneQty = v.qty;                 // null なら「数えていない」に戻す
+      }
+      holdMemo = v.memo;                 // メモは「数えずに中断」でも残す
+      to = 'on_hold'; holdReason = stHold.reason; holdNote = stHold.note;
+    } else if (choice.startsWith('hold:')) { to = 'on_hold'; holdReason = choice.slice(5); }
     else if (choice.startsWith('close:')) { to = 'closed'; closeReason = choice.slice(6); }
     // 理由が要る変更は 2 段階 (どの理由かを選んでから送る)
-    if (to === 'on_hold' && !holdReason) { stStep = 'on_hold'; $('#stMsg').textContent = '保留の理由を選んでください'; renderStBtns(c); return; }
+    if (to === 'on_hold' && !holdReason) { stStep = 'on_hold'; stHold = null; $('#stMsg').textContent = '保留の理由を選んでください'; renderStBtns(c); return; }
     if (to === 'closed' && !closeReason) { stStep = 'closed'; $('#stMsg').textContent = '終了の理由を選んでください'; renderStBtns(c); return; }
-    if (holdReason === 'other') {
+    if (holdReason === 'other' && !holdNote) {
       holdNote = window.prompt('保留の理由 (その他) を書いてください');
       if (!holdNote || !holdNote.trim()) { $('#stMsg').textContent = '❌ 「その他」は理由の記入が必要です'; return; }
+    }
+    // 理由を選んだら、次は「何個までできましたか」(要件 §Y)
+    if (to === 'on_hold' && stStep !== 'hold_qty') {
+      stHold = { reason: holdReason, note: holdNote };
+      stStep = 'hold_qty';
+      $('#stMsg').textContent = '何個までできましたか (分からなければ数えずに進めます)';
+      renderStBtns(c);
+      return;
     }
     if (c.status === 'closed') {
       reopenReason = window.prompt('終了したカードを戻します。理由を書いてください (例: 数え間違い)');
@@ -3273,12 +3446,15 @@ async function doSetSt(choice) {
       id: stTarget, to, worker_id: worker.id,
       ...(isApp()
         ? { expect_version: c.version, hold_reason: holdReason || undefined, hold_note: holdNote || undefined,
+            ...(doneQty !== undefined ? { done_qty: doneQty } : {}),
+            ...(holdMemo !== undefined ? { hold_memo: holdMemo } : {}),
             close_reason: closeReason || undefined, reason: reopenReason || undefined }
         : { expect: c.status }),
       pin: $('#pinIn').value.trim() || undefined,
     }),
   });
   stStep = null;
+  stHold = null;
   stSaving = false;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
   settleForceClose();   // 通信中に「閉じる」が予約されていれば、ここで閉じる

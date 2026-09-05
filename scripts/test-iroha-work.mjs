@@ -1228,6 +1228,43 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
     createTables(db);
     ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_tasks%'").get().c === 1, '2 回目は何もしない (冪等)');
   }
+
+  // ⭐「できた数」「中断メモ」の列が無い本番同等の DB でも、起動時に足される (要件 §Y。中原さん 2026-09-05)。
+  //   CREATE TABLE IF NOT EXISTS は列を増やさないので、実際に列の無い表を作って確かめる
+  {
+    const db = getDB();
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    const n = db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c;
+    // いまの定義から 2 列だけ抜いた表 = 本番の DB (CHECK も FK もある。列だけ無い)
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql
+      .replace(/\s*done_qty\s+INTEGER CHECK \(done_qty IS NULL OR done_qty >= 0\),/, '')
+      .replace(/\s*hold_memo\s+TEXT,/, '')
+      .replace('f_iroha_tasks', 'f_iroha_tasks__pre');
+    const keep = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name).filter((c) => c !== 'done_qty' && c !== 'hold_memo');
+    db.pragma('foreign_keys = OFF');
+    db.exec(`${sql};
+      INSERT INTO f_iroha_tasks__pre (${keep.join(', ')}) SELECT ${keep.join(', ')} FROM f_iroha_tasks;
+      DROP TABLE f_iroha_tasks;
+      ALTER TABLE f_iroha_tasks__pre RENAME TO f_iroha_tasks;`);
+    db.pragma('foreign_keys = ON');
+    const had = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name);
+    ok(!had.includes('done_qty') && !had.includes('hold_memo') && /\(status = 'on_hold'\) = \(hold_reason_code IS NOT NULL\)/.test(
+      db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql),
+      '前提: 列だけ無い (CHECK は付いている) = 本番の DB と同じ形');
+    createTables(db);
+    const now = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name);
+    ok(now.includes('done_qty') && now.includes('hold_memo'), '起動時に「できた数」「中断メモ」の列が足される');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === n, '元からあった行はそのまま残る (作り直しでも消えない)');
+    const anyId = db.prepare('SELECT MIN(id) id FROM f_iroha_tasks').get().id;
+    let negErr = null; try { db.prepare('UPDATE f_iroha_tasks SET done_qty = -2 WHERE id = ?').run(anyId); } catch (e) { negErr = e; }
+    ok(negErr && /CHECK/.test(negErr.message), '足した列にも CHECK が効く (マイナスは入らない)');
+    db.prepare('UPDATE f_iroha_tasks SET done_qty = 0 WHERE id = ?').run(anyId);
+    ok(db.prepare('SELECT done_qty FROM f_iroha_tasks WHERE id = ?').get(anyId).done_qty === 0, '0 は入る (「数えていない」の NULL と区別する)');
+    db.prepare('UPDATE f_iroha_tasks SET done_qty = NULL WHERE id = ?').run(anyId);
+    createTables(db);
+    ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_tasks%'").get().c === 1
+      && db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === n, '2 回目は何もしない (冪等)');
+  }
 }
 
 console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧・作業時間・写真・作り直し');
@@ -1727,6 +1764,67 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     }
     ok((await call('POST', '/api/status', { cookie, body: { id: '1.5', worker_id: w1.id, to: 'in_progress', expect_version: 1 } })).status === 400, '不正な id (小数・負数・文字・0・空・2^53 超・指数表記) は 400');
     ok((await call('POST', '/api/planned', { ...admin, body: { id: 'x', worker_id: w1.id } })).status === 400 && (await call('GET', '/api/label-waits?task_id=abc', { cookie })).status === 400, '今日やる・ラベル待ちも id を検査する');
+
+    // ══ できた数・中断メモ (要件 §Y。中原さん 2026-09-05) ══
+    {
+      const T5 = TD.upsertTaskFromImport({ notion_page_id: 'dq-1', status: 'in_progress', facility_code: 'iroha',
+        destination_id: 9501, product_code: 'PROD-A', product_name: 'できた数のカード', qty: 200 }, { batchId: 'dq' }).id;
+      const v = () => TD.getTask(T5).version;
+      const row = () => TD.getTask(T5);
+      ok(row().done_qty == null && row().hold_memo == null, 'はじめは「まだ数えていない」(0 ではなく NULL)');
+      // ① 中断と同時に、できた数と中断メモを 1 回で書く
+      const h1 = await call('POST', '/api/status', { cookie, body: { id: T5, worker_id: w1.id, to: 'on_hold',
+        hold_reason: 'label_shortage', expect_version: v(), done_qty: 120, hold_memo: ' ラベルは貼り終わり、袋詰めの途中 ' } });
+      ok(h1.status === 200 && h1.json.ok && row().status === 'on_hold' && row().done_qty === 120, '中断と同時にできた数を書ける (1 回の書き込み)');
+      ok(row().hold_memo === 'ラベルは貼り終わり、袋詰めの途中', '中断メモは前後の空白を落として残す');
+      ok(h1.json.task.done_qty === 120 && h1.json.task.hold_memo === 'ラベルは貼り終わり、袋詰めの途中', '返事にも載る (一覧の取り直しを待たない)');
+      // ② 作業中に戻しても中断メモは残る (次にやる人が読むもの)
+      const back = await call('POST', '/api/status', { cookie, body: { id: T5, worker_id: w1.id, to: 'in_progress', expect_version: v() } });
+      ok(back.status === 200 && row().hold_memo === 'ラベルは貼り終わり、袋詰めの途中' && row().done_qty === 120,
+        '作業中に戻しても、できた数と中断メモは残る (次にやる人が読む)');
+      // ③ あとから直せる (数え間違い)
+      const fix = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v(), done_qty: 130 } });
+      ok(fix.status === 200 && fix.json.ok && row().done_qty === 130 && row().hold_memo === 'ラベルは貼り終わり、袋詰めの途中',
+        'できた数だけ直せる (送らなかった中断メモは触らない)');
+      const memoOnly = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v(), hold_memo: '袋詰めまで終わり' } });
+      ok(memoOnly.status === 200 && row().hold_memo === '袋詰めまで終わり' && row().done_qty === 130, '中断メモだけ直せる (できた数は触らない)');
+      // ④ 0 と「数えていない」は別のこと
+      const zero = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v(), done_qty: 0 } });
+      ok(zero.status === 200 && row().done_qty === 0, '0 個 (1 個もできていない) を入れられる');
+      const none = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v(), done_qty: null } });
+      ok(none.status === 200 && row().done_qty == null, 'null で「まだ数えていない」に戻せる (0 に丸めない)');
+      // ⑤ 不正な値は 400 で断る (500 にしない・値も変えない)
+      const before5 = row().done_qty;
+      for (const bad of [-1, 1.5, 'abc', 2000000]) {
+        const r = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v(), done_qty: bad } });
+        if (!(r.status === 400 && r.json.error === 'bad_done_qty')) ok(false, `できた数 ${bad} は 400 (実際 ${r.status} ${r.json?.error})`);
+      }
+      ok(row().done_qty === before5, '断ったので値も変わらない');
+      const longMemo = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v(), hold_memo: 'あ'.repeat(501) } });
+      ok(longMemo.status === 400 && longMemo.json.error === 'bad_hold_memo', '長すぎる中断メモは切らずに断る (書いた人が気づける)');
+      // ⑥ 版がずれていたら断る
+      const stale5 = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v() - 1, done_qty: 5 } });
+      ok(stale5.status === 409 && stale5.json.error === 'conflict', '古い版で送ったら断る (楽観ロック)');
+      // ⑦ 棚入待ちにしたら「全部そろった」= done_qty は つくる数。中断メモは役目を終えるので消える
+      await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v(), done_qty: 130, hold_memo: '残りは明日' } });
+      const ready = await call('POST', '/api/status', { cookie, body: { id: T5, worker_id: w1.id, to: 'ready_for_stocking', expect_version: v() } });
+      ok(ready.status === 200 && row().done_qty === 200 && row().hold_memo == null,
+        '棚入待ちにしたら できた数 = つくる数、中断メモは消える (全部そろってから棚入れするため)');
+      const ev = db.prepare("SELECT to_value FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_status' ORDER BY id DESC LIMIT 1").get(T5);
+      ok(/メモ消去\(残りは明日\)/.test(ev.to_value || ''), '消した中断メモは履歴に残す (あとから追える)');
+      // ⑧ 終了したカードは直せない
+      const closed5 = TD.upsertTaskFromImport({ notion_page_id: 'dq-2', status: 'closed', close_reason: 'stocked',
+        destination_id: 9502, product_name: '終わったカード', qty: 10 }, { batchId: 'dq' }).id;
+      const onClosed = await call('POST', '/api/progress', { cookie, body: { id: closed5, worker_id: w1.id, expect_version: TD.getTask(closed5).version, done_qty: 1 } });
+      ok(onClosed.status === 409 && onClosed.json.error === 'closed_task', '終了したカードは直せない (履歴として残す)');
+      // ⑨ 何も送らなければ断る (空の書き込みで版だけ上げない)
+      const empty5 = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v() } });
+      ok(empty5.status === 400 && empty5.json.error === 'bad_request', '直すものが無ければ断る (版だけ上がらない)');
+      // ⑩ DB でも守る
+      let dqErr = null;
+      try { db.prepare('UPDATE f_iroha_tasks SET done_qty = -1 WHERE id = ?').run(T5); } catch (e) { dqErr = e; }
+      ok(dqErr && /CHECK/.test(dqErr.message), 'マイナスは DB にも入らない (CHECK)');
+    }
     const jpeg = Buffer.concat([Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), Buffer.alloc(64, 1)]);
     const mp = multipart({ id: String(task.id), kind: 'photo', worker_id: String(w1.id), operation_id: 'op-http-00001' }, { name: 'a.jpg', mime: 'image/jpeg', data: jpeg });
     const up = await call('POST', '/api/media', { cookie, body: mp.body, headers: mp.headers });
@@ -2996,6 +3094,41 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/kv\('大きさ', sizeClassText\(m\.size_class\), \{ reg: 'size_class' \}\)/.test(html),
     '大きさもタイルから登録できる (P4 で項目だけ足して開けなくなっていた)');
   ok(/kv\('期限シール'/.test(html) && /reg: 'expiry_seal'/.test(html), '期限シールもタイルから変えられる');
+
+  // ══ できた数・中断メモ (要件 §Y。中原さん 2026-09-05) ══
+  ok(/n\('できた数', done, '個', 'done'\)/.test(html) && /const rest = \(c\.qty != null && done != null\) \? Math\.max\(0, c\.qty - done\) : null;/.test(html)
+    && /\(done == null \? '' : n\('残り', rest, '個', 'rest'\)\)/.test(html),
+    '「つくる数」の横に「できた数」と「残り」を出す');
+  ok(/const done = c\.done_qty;/.test(html) && !/c\.done_qty \|\| 0/.test(html),
+    'できた数は「まだ数えていない (null)」と「0 個」を混ぜない (0 で代用しない — 要件 §U)');
+  ok(/function memoHtml\(c\)/.test(html) && /📝 中断メモ \(前の人からの申し送り\)/.test(html)
+    && /sealHtml\(c\) \+ careHtml\(c\) \+ memoHtml\(c\)/.test(html),
+    '中断メモはカードを開いたらすぐ見えるところに出す (次にやる人が読む)');
+  ok(/function canEditProgress\(c\)/.test(html) && /isApp\(\) && detailSrc !== 'preview' && c\.status !== 'closed' && can\('task\.status\.change'\)/.test(html)
+    && /\(canEditProgress\(c\) \? '<button class="edit" onclick="openDq\(null\)">/.test(html),
+    '直せないとき (下見・終了・許可なし) は「✎ できた数」を描かない (要件 §U-7)');
+  ok(/function dqPanelHtml\(c, actions\)/.test(html) && /何個までできましたか/.test(html)
+    && /const quick = \[\['0', 'まだ 0 個'\]\];/.test(html) && /'半分 \(' \+ Math\.floor\(c\.qty \/ 2\)/.test(html)
+    && /'全部 \(' \+ c\.qty \+ ' 個\)'/.test(html) && /data-dq="">数えていない/.test(html),
+    '数はタップでも入れられる (まだ 0 個 / 半分 / 全部 / 数えていない)');
+  ok(/qty: raw === '' \? null : Number\(raw\)/.test(html) && /数えていないときは空のままで構いません/.test(html),
+    '空欄は「数えていない」= null で送る (0 にしない)');
+  ok(/function dqValues\(rootSel\)/.test(html) && /root\.querySelector\('\.dqIn'\)/.test(html)
+    && /dqValues\('#stBtns'\)/.test(html) && /dqValues\('#dqBody'\)/.test(html),
+    '同じ入力欄を 2 か所に描くので、入れ物を指定して読む (先にある方を掴まない)');
+  ok(/if \(stStep === 'hold_qty'\)/.test(html) && /stBtn\('hold_go', 'この数で中断する', false\)/.test(html)
+    && /stBtn\('hold_skip', '数えずに中断する', false\)/.test(html),
+    '中断するとき「何個までできましたか」を 1 回聞く (数えずに進める道も残す)');
+  ok(/if \(choice === 'hold_go'\) \{/.test(html) && /holdMemo = v\.memo;\s*\/\/ メモは「数えずに中断」でも残す/.test(html),
+    '「数えずに中断」でも中断メモは残せる');
+  ok(/\.\.\.\(doneQty !== undefined \? \{ done_qty: doneQty \} : \{\}\)/.test(html)
+    && /\.\.\.\(holdMemo !== undefined \? \{ hold_memo: holdMemo \} : \{\}\)/.test(html),
+    '状態とできた数は 1 回の通信で送る (分けると「保留にはなったが数が入らない」が起きる)');
+  ok(/'\/api\/progress'/.test(html) && /function saveProgress\(\)/.test(html) && /expect_version: c\.version/.test(html),
+    'あとから直すときは /api/progress へ (版つき)');
+  ok(/'done_qty', 'hold_memo',/.test(html), 'サーバーの返事のできた数・中断メモをカードに反映する (取り直しを待たない)');
+  ok(/c\.done_qty != null \? '✅ できた ' \+ c\.done_qty/.test(html) && /c\.hold_memo \? '📝 メモ' : null/.test(html),
+    'ボードのカードでも「途中まで進んでいる」が分かる');
   ok(/reg: 'units_per_container'/.test(html) && /reg: 'storage_container'/.test(html), '保管箱と入数は別々にタップできる');
   // タップした項目だけ出す・ダイアログはスクロールできる・候補は正方形のタイル (中原さん 2026-09-03)
   ok(/class="mvf" data-f="material_code"/.test(html) && /class="mvf" data-f="storage_container"/.test(html)
@@ -3086,7 +3219,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v8'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v9'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),

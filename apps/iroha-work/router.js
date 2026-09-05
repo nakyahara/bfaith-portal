@@ -40,7 +40,7 @@ import { transitionNeedsStaff, TASK_STATUSES, statusLabel } from './tasks.js';
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
   listLabelWaits, upsertLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
-  listNamelessTasks, removeStrayTask, setFacility,
+  listNamelessTasks, removeStrayTask, setFacility, setProgress,
   startTaskSession, countChangesSince, switchSourceOfTruth, bulkCloseReady,
 } from './tasks-db.js';
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
@@ -477,6 +477,10 @@ function changeStatusApp(req, res, worker) {
     closeReason: req.body?.close_reason || null,
     holdReason: req.body?.hold_reason || null,
     holdNote: req.body?.hold_note || null,
+    // ⭐できた数と中断メモ (要件 §Y)。送られたときだけ書き換える。
+    //   状態と同じ 1 回の書き込みに載せる — 分けると「保留にはなったが数は入らなかった」が起きる
+    doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+    holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
     reason: req.body?.reason || null,
     actor: hasSessionAccess(req) ? req.iwUser : `${worker.display_name} (いろはアプリ)`,
     isStaff, workerId: worker.id, workerName: worker.display_name, deviceLabel: deviceLabelOf(req),
@@ -492,6 +496,7 @@ function publicTask(t) {
   return {
     id: t.id, status: t.status, status_label: statusLabel(t), version: t.version,
     facility_code: t.facility_code, hold_reason_code: t.hold_reason_code, hold_reason_note: t.hold_reason_note,
+    done_qty: t.done_qty ?? null, hold_memo: t.hold_memo || null,
     planned_date: t.planned_date, when: t.status === 'closed' ? null : whenOf(t.planned_date), cancellation_requested_at: t.cancellation_requested_at, migration_review: !!t.migration_review,
     external_ready: !!t.external_ready,
   };
@@ -654,6 +659,30 @@ router.post('/api/cancellation', checkOrigin, api((req, res) => {
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
   res.json({ ok: true, task: publicTask(r.task) });
+}));
+
+/**
+ * ⭐できた数・中断メモを**あとから直す** (要件 §Y。アプリ正本のみ)。状態は変えない。
+ * 中断するときは /api/status に一緒に載せるので、こちらは数え間違いの直しと申し送りの追記用。
+ * 作業した本人が直せないと現場が止まるので、状態を変えられる人 (= 利用者も) なら直せる。職員限定にしない
+ */
+router.post('/api/progress', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const progressTaskId = parseTaskId(req.body?.id);
+  if (progressTaskId == null) return res.status(400).json(BAD_TASK_ID);
+  const r = setProgress({
+    taskId: progressTaskId, expectVersion: req.body?.expect_version,
+    doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+    holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
+    workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
+    // 正本の切替は version を変えないので、更新と同じトランザクションでもう一度見る (要件 §U-2)
+    guard: () => (isAppMode() ? null : { ok: false, error: 'notion_mode', message: '正本が Notion に戻りました (一覧を更新してください)' }),
+  });
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  res.json({ ok: true, already: !!r.already, task: publicTask(r.task) });
 }));
 
 /** 取込時に推定した状態を職員が「確認した」にする (アプリ正本のみ) */
