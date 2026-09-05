@@ -124,6 +124,10 @@
   .tag.ready{background:var(--ok-soft);color:var(--ok)}
   /* ⛔ 止まっている理由の札 (要件 §Y-2 = 案A)。進捗の札とは別に、赤で先頭に */
   .tag.blocked{background:var(--danger-soft);color:var(--danger);border:1px solid var(--danger)}
+  /* ⛔ 止まっているカードは一目で分かるように、カードごと赤く (中原さん 2026-09-05: 資材不足をもっと強調) */
+  .row.blocked{border-color:var(--danger);background:var(--danger-soft)}
+  .bcard.blocked{border:2px solid var(--danger);background:var(--danger-soft)}
+  .bblk{margin-top:4px;font-size:.84rem;font-weight:800;color:var(--danger);line-height:1.3}
   .st{flex:none;font-size:.8rem;font-weight:700;border-radius:var(--r-sm);padding:6px 10px;cursor:pointer;
     border:1px solid transparent;white-space:nowrap;font-family:var(--font)}
   .st.todo{background:var(--well);color:var(--sub);border-color:var(--line)}
@@ -968,7 +972,8 @@
   </div>
 
   <!-- ══ どこが作業するか (「どこが」の札から。職員だけ) ══ -->
-  <div class="ov" id="facOv" hidden>
+  <!-- ⚠ 以前は class="ov" hidden で、CSS が無く「どこが 未定」を押しても出なかった (中原さん 2026-09-05)。他のダイアログと同じ overlay に -->
+  <div class="overlay" id="facOv">
     <div class="modal">
       <h3 id="facTitle">どこが作業しますか?</h3>
       <div class="opts" id="facOpts"></div>
@@ -1453,7 +1458,7 @@ function renderList() {
     const tags = rowTags(c, { short: true });
     const selectable = bulkIds && c.status === 'ready_for_stocking';
     const sel = selectable && bulkIds.has(c.id);
-    return '<div class="row' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+    return '<div class="row' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
       (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
       '<div class="thumb">' + thumbHtml(c) + '</div>' +
       '<div class="bd"><h2>' + esc(c.title) + '</h2>' + (tags ? '<div class="rtags">' + tags + '</div>' : '') +
@@ -1778,8 +1783,7 @@ function bcardHtml(c, status) {
   // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
   const grab = isApp() && !bulkIds && (boardCols === 'fac' ? stateCan('task.facility.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
-  const meta = [c.blocked ? '⛔ ' + c.blocked.label : null,
-    c.qty != null ? c.qty + ' 個' : null,
+  const meta = [c.qty != null ? c.qty + ' 個' : null,
     c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
     c.hold_memo ? '📝 メモ' : null,
     boxesText(c) ? '📦 ' + boxesText(c, { short: true }) : null,
@@ -1787,12 +1791,14 @@ function bcardHtml(c, status) {
     c.external_ready ? '📦 外部に出せます' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
-  return '<div class="bcard' + (sel ? ' sel' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+  return '<div class="bcard' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
     (grab ? gripHtml() : '') +
     (c.image_url ? '<div class="th">' + thumbHtml(c) + '</div>' : '') +   // 📦 の空枠は幅を取るだけなので、写真があるカードだけ (監修)
     '<div class="bd">' +
     '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
     esc(c.title) + '</h4>' +
+    // ⛔ 止まっている理由は赤い 1 行で (小さな文字に埋めない — 中原さん 2026-09-05)
+    (c.blocked ? '<div class="bblk">⛔ ' + esc(c.blocked.label) + 'で止まっています</div>' : '') +
     (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') +
     planTagsHtml(c) + '</div></div>';
 }
@@ -4675,7 +4681,7 @@ if ('serviceWorker' in navigator) {
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if ($('#askOv').classList.contains('on')) { askDone(false); return; }   // 確認ダイアログだけ閉じる (下のダイアログは残す)
-  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeDetail();
+  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeFacPick(); closeDetail();
 });
 </script>
 </body>

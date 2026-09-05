@@ -3321,7 +3321,8 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
     // 片づけていいのは「名前が無い・Notion に紐づかない・入荷受付に紐づかない・終わっていない」だけ (Codex FB R3)
     {
       const named = Number(insStray.run('名前がある', utcNowT(), utcNowT()).lastInsertRowid);
-      ok(TD.removeStrayTask({ taskId: named }).error === 'not_stray', '名前があるカードは片づけられない');
+      db.prepare("UPDATE f_iroha_tasks SET product_code = 'NAMED-1' WHERE id = ?").run(named);
+      ok(TD.removeStrayTask({ taskId: named }).error === 'not_stray', '名前と商品コードがあるカードは片づけられない');
       ok(TD.getTask(named) !== null, '消えていない');
       const withPage = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
       db.prepare("UPDATE f_iroha_tasks SET notion_page_id = 'stray-has-page' WHERE id = ?").run(withPage);
@@ -3334,6 +3335,15 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
       ok(TD.listNamelessTasks().some(x => x.id === withPage), 'アプリが正本なら、名前の無い取込カードも一覧に出る');
       const rmPage = TD.removeStrayTask({ taskId: withPage, actor: 'admin@test' });
       ok(rmPage.ok && rmPage.action === 'deleted' && TD.getTask(withPage) === null, 'アプリが正本なら片づけられる (記録が無ければ消える)');
+      // ⭐名前があっても商品コードの無いカードは、アプリが正本なら片づけられる (作業のやり方も登録できず、在庫にも結べない — 中原さん 2026-09-05「木製スティック」)
+      const noCode = Number(insStray.run('木製スティック', utcNowT(), utcNowT()).lastInsertRowid);
+      setMetaValue('source_of_truth', 'notion');
+      ok(TD.removeStrayTask({ taskId: noCode }).error === 'not_stray' && !TD.listNamelessTasks().some(x => x.id === noCode), '正本が Notion の間は、名前があれば片づけられない (一覧にも出ない)');
+      setMetaValue('source_of_truth', 'app');
+      ok(TD.listNamelessTasks().some(x => x.id === noCode && x.product_name === '木製スティック'), 'アプリが正本なら、商品コードの無いカードも一覧に出る (名前つき)');
+      const rmCode = TD.removeStrayTask({ taskId: noCode, actor: 'admin@test' });
+      ok(rmCode.ok && rmCode.action === 'deleted' && TD.getTask(noCode) === null, 'アプリが正本なら片づけられる');
+      ok(!TD.listNamelessTasks().some(x => x.id === named), '名前と商品コードがあるカードは、アプリが正本でも一覧に出ない');
       setMetaValue('source_of_truth', srcBefore);
       const withDest = Number(insStray.run(null, utcNowT(), utcNowT()).lastInsertRowid);
       db.prepare('UPDATE f_iroha_tasks SET destination_id = 9499 WHERE id = ?').run(withDest);
@@ -3601,7 +3611,12 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /解消したら「▶ 作業をはじめる」で札が外れます/.test(html), '詳細の上部に「⛔ ○○で止まっています」の帯 (外し方も書く)');
   ok(/if \(c\.blocked\) h \+= '<span class="tag blocked">⛔ '/.test(html) && /curTab === 'blocked'/.test(html) && /\['blocked', '⛔ 止まっている'\]/.test(html),
     '一覧: 赤い札を先頭に。「⛔ 止まっている」の絞り込みは進捗のタブとは別 (1 件以上あるときだけ)');
-  ok(/curWhen === 'blocked'/.test(html) && /c\.blocked \? '⛔ ' \+ c\.blocked\.label : null/.test(html), 'ボード: 保留列は無く、絞り込み「⛔ 止まっている」とカードの札で見せる');
+  ok(/curWhen === 'blocked'/.test(html) && /<div class="bblk">⛔ ' \+ esc\(c\.blocked\.label\) \+ 'で止まっています<\/div>/.test(html), 'ボード: 保留列は無く、絞り込み「⛔ 止まっている」とカードの赤い 1 行で見せる');
+  ok(/'<div class="row' \+ \(sel \? ' sel' : ''\) \+ \(c\.blocked \? ' blocked' : ''\)/.test(html) && /'<div class="bcard' \+ \(sel \? ' sel' : ''\) \+ \(c\.blocked \? ' blocked' : ''\)/.test(html)
+    && /\.bcard\.blocked\{border:2px solid var\(--danger\)/.test(html) && /\.row\.blocked\{border-color:var\(--danger\)/.test(html),
+    '止まっているカードは一覧・ボードともカードごと赤くする (資材不足を見落とさない — 中原さん 2026-09-05)');
+  ok(/<div class="overlay" id="facOv">/.test(html) && !/class="ov" id="facOv"/.test(html) && !/<div class="ov"/.test(html),
+    '「どこが」の拠点えらびは他と同じ overlay で開く (class="ov" には CSS が無く、押しても出なかった — 中原さん 2026-09-05)');
   ok(!/on_hold/.test(html) && !/holdReasons/.test(html) && !/hold_qty/.test(html), '画面から旧「保留」(on_hold / holdReasons / hold_qty) が消えている');
   ok(/function canEditProgress\(c\)/.test(html)
     && /c\.status !== 'closed' && c\.status !== 'ready_for_stocking'/.test(html)
@@ -4216,6 +4231,16 @@ console.log('\n[25] ⛔ 止まっている理由の札 — タイマー停止・
   ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'migration_on_hold'").get().c === migN && TD.getTaskByPageId('legacy-hold-2').version === 2,
     '2 回目の起動では何もしない (冪等)');
   ok(TD.countTasksByStatus().blocked >= 2, '管理画面の内訳に「止まっている」件数が出る');
+
+  // ── 拠点名の変更: リハス → パレット (中原さん 2026-09-05)。旧名の行だけ書き換える (手で変えた名前は触らない) ──
+  ok(db.prepare("SELECT name FROM f_iroha_facilities WHERE code = 'rehas'").get().name === 'パレット', '拠点 rehas の名前は「パレット」');
+  db.prepare("UPDATE f_iroha_facilities SET name = 'リハス' WHERE code = 'rehas'").run();
+  createTables(db);
+  ok(db.prepare("SELECT name FROM f_iroha_facilities WHERE code = 'rehas'").get().name === 'パレット', '旧名「リハス」が入っている DB を開くと「パレット」に直る');
+  db.prepare("UPDATE f_iroha_facilities SET name = '手で付けた名前' WHERE code = 'rehas'").run();
+  createTables(db);
+  ok(db.prepare("SELECT name FROM f_iroha_facilities WHERE code = 'rehas'").get().name === '手で付けた名前', '手で別の名前にした行は触らない');
+  db.prepare("UPDATE f_iroha_facilities SET name = 'パレット' WHERE code = 'rehas'").run();
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

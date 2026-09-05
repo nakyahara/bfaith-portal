@@ -15,7 +15,7 @@
  */
 import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
-import { FACILITIES } from './tasks.js';
+import { FACILITIES, FACILITY_RENAMES } from './tasks.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -654,6 +654,9 @@ export function createTables(db = getMirrorDB()) {
   // タスク表の作り直し (facility_code の FK 検査) より前に入れておく
   const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, active, sort_order) VALUES (?, ?, ?, 1, ?)');
   for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.sort_order);
+  // 名前の変更 (既に入っている行は INSERT OR IGNORE では変わらない)。旧名のときだけ書き換えるので、手で別の名前にした行は触らない
+  const renFac = db.prepare('UPDATE f_iroha_facilities SET name = ? WHERE code = ? AND name = ?');
+  for (const r of FACILITY_RENAMES) renFac.run(r.to, r.code, r.from);
   // ⭐作り直し (INSERT … SELECT) の前に、旧「保留」の不整合行を CHECK に通る形へ直す。
   //   CHECK 無しの古い版には「on_hold なのに理由が無い」「on_hold でないのに理由がある」行が残りうる —
   //   そのまま新しい定義へ写すと CHECK 違反で作り直しごと失敗し、下の移行にも届かない (Codex PR #1193 R1 #1)

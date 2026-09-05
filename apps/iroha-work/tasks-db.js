@@ -548,15 +548,18 @@ export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = nul
  * どれか 1 つでも当てはまらなければ、消す対象ではない
  */
 /**
- * 片づけていいカード = 名前が無い・入荷受付の行き先に紐づかない・終わっていない。
- * ⭐Notion のカードに紐づくものは、正本が Notion の間は片づけない (直すのは Notion 側)。
- *   アプリが正本になったら Notion は見ないので、名前の無い取込カードも片づけられる (中原さん 2026-09-05 切替後「名称なしの空白が 2 件」)
+ * 片づけていいカード = 素性が分からない・入荷受付の行き先に紐づかない・終わっていない。
+ * ⭐正本が Notion の間: 名前が無く、Notion のカードにも紐づかないものだけ (Notion にあるものは Notion 側で直す)。
+ * ⭐正本がアプリ: Notion はもう見ないので、名前の無い取込カードに加えて**商品コードの無いカード**も片づけられる
+ *   (商品コードが無いと作業のやり方も登録できず、在庫にも結べない — 中原さん 2026-09-05「木製スティック」)。
+ *   入荷受付の行き先があるもの・終わっているものは今までどおり対象外
  */
 function strayWhere() {
-  return `t.status <> 'closed'
-      AND t.destination_id IS NULL
-      ${sourceOfTruth() === 'app' ? '' : 'AND t.notion_page_id IS NULL'}
-      AND (t.product_name IS NULL OR TRIM(t.product_name) = '' OR t.product_name = '(名称なし)')`;
+  const nameless = "(t.product_name IS NULL OR TRIM(t.product_name) = '' OR t.product_name = '(名称なし)')";
+  const codeless = "(t.product_code IS NULL OR TRIM(t.product_code) = '')";
+  return sourceOfTruth() === 'app'
+    ? `t.status <> 'closed' AND t.destination_id IS NULL AND (${nameless} OR ${codeless})`
+    : `t.status <> 'closed' AND t.destination_id IS NULL AND t.notion_page_id IS NULL AND ${nameless}`;
 }
 
 /** 名前のないカード (入荷受付由来でない行。Notion 由来は正本がアプリのときだけ)。管理画面で人が見て消すためだけの一覧 */
@@ -588,7 +591,7 @@ export function removeStrayTask({ taskId, actor = null, reason = null }) {
     if (!stray) {
       return { ok: false, error: 'not_stray',
         message: sourceOfTruth() === 'app'
-          ? 'このカードは片づけの対象ではありません (名前がある / 入荷受付の行き先がある / もう終わっている)'
+          ? 'このカードは片づけの対象ではありません (名前と商品コードがある / 入荷受付の行き先がある / もう終わっている)'
           : 'このカードは片づけの対象ではありません (名前がある / Notion のカードがある = Notion 側で直す / 入荷受付の行き先がある / もう終わっている)' };
     }
     const n = (sql) => db.prepare(sql).get(t.id).c;
