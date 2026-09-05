@@ -1233,6 +1233,23 @@ check('payload: アプリ指定なしは NE配送方法から定形外バナー�
   bNe.ok === true && bNe.payload.images.some((i) => i.location === '/07722747/08581403/teikeigai_soryomuryo.jpg')
   && !bNe.payload.images.some((i) => i.location === '/07722747/09610094/imgrc0104897185.jpg'),
   JSON.stringify(bNe.payload?.images || bNe.reasons));
+// 🚨 RMS へ送る配送方法は **セットだけ** NE へフォールバックする (§4.4 決⑥ / Codex high 2巡目)。
+// 単品まで NE に落とすと、いま店舗デフォルトで出ている商品の配送方法が黙って変わる = 決⑥の範囲外。
+// バナー (上のテスト) は従来どおり NE を見るので、単品では「バナー = 定形外 / RMS = 店舗デフォルト」
+// のままになる。これは既存の挙動で、変えるかどうかは中原さんの判断待ち
+check('payload: 単品はアプリ指定なしなら配送方法を送らない (従来どおり店舗デフォルトに任せる)',
+  bNe.payload?.variants?.['rk-smoke-1']?.shipping?.shippingMethodGroup === undefined,
+  JSON.stringify(bNe.payload?.variants?.['rk-smoke-1']?.shipping || bNe.reasons));
+check('🚨 payload の配送方法: セットだけ NE へフォールバックする (単品は従来どおり)',
+  listing.payloadShippingGroup({ parent_draft_id: 7 }, { group: '1' }, { group: null }) === '1'
+  && listing.payloadShippingGroup({ parent_draft_id: null }, { group: '1' }, { group: null }) === ''
+  // アプリで明示指定されていれば、セットでも単品でもその値 (effective も同じ値を返す)
+  && listing.payloadShippingGroup({ parent_draft_id: 7 }, { group: '9' }, { group: '9' }) === '9'
+  && listing.payloadShippingGroup({ parent_draft_id: null }, { group: '9' }, { group: '9' }) === '9',
+  JSON.stringify([
+    listing.payloadShippingGroup({ parent_draft_id: 7 }, { group: '1' }, { group: null }),
+    listing.payloadShippingGroup({ parent_draft_id: null }, { group: '1' }, { group: null }),
+  ]));
 check('effectiveShippingForDraft: アプリ指定(9)が NE(定形外=1) より優先 / 指定なしはNE',
   listing.effectiveShippingForDraft(db, 'rk-smoke-1', '9').group === '9'
   && listing.effectiveShippingForDraft(db, 'rk-smoke-1', null).group === '1');
@@ -3161,7 +3178,10 @@ let wfSetParentId = null;
   db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '素材', 'ステンレス', 1)`).run(parentId);
   db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '内容量', '50ml', 2)`).run(parentId);
   db.prepare(`INSERT INTO draft_reference_urls (draft_id, url, sort) VALUES (?, 'https://example.com/ref', 0)`).run(parentId);
-  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number) VALUES (?, '565004', '[]', 'parent-model-1')`).run(parentId);
+  // 配送方法は**セットにコピーされない**ことを見るために、親には入れておく (2026-09-04 §4.4 決⑥)
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number,
+      shipping_method_group, postage_included, normal_delivery_date_id)
+    VALUES (?, '565004', '[]', 'parent-model-1', '5', 1, '1000')`).run(parentId);
   db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '単品のタイトル')`).run(parentId);
   // 商品ページ表記: セットで変わるもの (内容量・サイズ・食品表示) が引き継がれないことを見る
   db.prepare(`
@@ -3191,7 +3211,23 @@ let wfSetParentId = null;
   check('商品名が自動で付く', /セット/.test(set1.name), set1.name);
 
   // コピーする/しないの切り分け (ここを間違えると直し忘れが一番危ない)
-  check('売価はコピーしない', set1.price == null);
+  // 売価は「コピー」ではなく**構成から計算した初期値**を入れる (2026-09-04 §4.4 決⑦)。
+  // 親の 1,980 円をそのまま入れると 2 個セットが単品と同じ値段で出る
+  check('売価は親の値をコピーせず「単品売価 × 個数」を初期値として入れる (1,980 × 2 = 3,960)',
+    set1.price === 3960, String(set1.price));
+  check('売価の初期値の由来をイベントに残す (人が「誰かが入れた値」に見えて触れなくならないように)',
+    /1,980円 × 2 = 3,960円/.test(db.prepare(
+      `SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'price_prefilled'`).get(r.draftId)?.detail || ''),
+    db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'price_prefilled'`).get(r.draftId)?.detail || '(イベントが無い)');
+  // 🚨 配送方法はコピーしない (決⑥)。セットは個数で重さも箱も変わる。
+  //    空なら effectiveShippingForDraft が NE の配送方法へ落ちるので、本コード確定後に自動で正しくなる
+  const setRk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(r.draftId);
+  check('配送方法は親からコピーしない (個数で変わるので NE 確定後に NE の値が入る)',
+    setRk != null && setRk.shipping_method_group == null && setRk.postage_included == null
+    && setRk.normal_delivery_date_id == null,
+    JSON.stringify({ g: setRk?.shipping_method_group, p: setRk?.postage_included, d: setRk?.normal_delivery_date_id }));
+  check('配送方法をコピーしていない理由をイベントに残す',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'shipping_not_copied'`).get(r.draftId).c === 1);
   check('JANはコピーしない', set1.jan_code == null);
   check('公式URLはコピーする', set1.official_url === 'https://example.com/p');
   check('自社商品フラグはコピーする', set1.own_brand === 1);
@@ -3231,6 +3267,141 @@ let wfSetParentId = null;
   check('親のイベントに記録が残る',
     db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'set_draft_created'`).get(parentId).c === 1);
 
+  // ─── 売価の初期値 (2026-09-04 §4.4 決⑦) ──────────────────────────────
+  // 「単品売価 × 個数」の和。単価は ①アプリのドラフト ②NE mirror の標準売価 の順で引く。
+  // 🚨 1 件でも引けなければ **合計を作らない** — 欠けた合計は「2個セットが1個ぶんの値段」になる
+  {
+    const sp = await import('../lib/set-price.js');
+    db.prepare(`INSERT OR REPLACE INTO mirror_products
+      (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 標準売価, 原価, 送料, 配送方法, 消費税率, updated_at)
+      VALUES (99710, 'setprice-ne', 'NEにだけある商品', '1', '取扱中', 'ok', 500, 200, 120, '定形外', 0.1, '2026-09-04T00:00:00Z')`).run();
+    check('売価の初期値: アプリのドラフトの売価を単価に使う',
+      sp.unitPriceOf(db, 'WF-SET-P')?.value === 1980 && sp.unitPriceOf(db, 'WF-SET-P')?.source === 'draft',
+      JSON.stringify(sp.unitPriceOf(db, 'WF-SET-P')));
+    check('売価の初期値: アプリに無ければ NE mirror の標準売価を使う',
+      sp.unitPriceOf(db, 'setprice-ne')?.value === 500 && sp.unitPriceOf(db, 'setprice-ne')?.source === 'ne',
+      JSON.stringify(sp.unitPriceOf(db, 'setprice-ne')));
+    check('売価の初期値: 商品コードの大小文字・前後空白は無視して引く',
+      sp.unitPriceOf(db, '  SETPRICE-NE ')?.value === 500);
+    check('売価の初期値: どこにも無い商品コードは null (0 円にしない)',
+      sp.unitPriceOf(db, 'setprice-nowhere') === null);
+    // 🚨 どの引き先でも「全行が一致するときだけ採用」(Codex high 2026-09-04)。
+    //    ふだんは正規化 UNIQUE index (idx_product_drafts_ne_norm) が `ABC` と ` abc ` の同居を防ぐが、
+    //    **既存データが衝突している DB ではこの index が張られない** (db.js: 事前検査して skip)。
+    //    その劣化状態を再現する。ORDER BY id LIMIT 1 だと、どちらの単価が出るかが**運**になる
+    db.exec('DROP INDEX IF EXISTS idx_product_drafts_ne_norm');
+    db.prepare(`INSERT INTO product_drafts (ne_code, name, status, price, created_by)
+      VALUES ('SETPRICE-DUP', '同じコードの別ドラフト1', 'draft', 700, 'smoke')`).run();
+    db.prepare(`INSERT INTO product_drafts (ne_code, name, status, price, created_by)
+      VALUES (' setprice-dup ', '同じコードの別ドラフト2', 'draft', 700, 'smoke')`).run();
+    check('売価の初期値: 同じ商品コードのドラフトが複数でも、売価が一致していれば使う',
+      sp.unitPriceOf(db, 'setprice-dup')?.value === 700, JSON.stringify(sp.unitPriceOf(db, 'setprice-dup')));
+    db.prepare(`UPDATE product_drafts SET price = 900 WHERE ne_code = ' setprice-dup '`).run();
+    check('🚨 売価の初期値: 同じ商品コードで売価が割れていたら採らない (どちらが正か分からない)',
+      sp.unitPriceOf(db, 'setprice-dup') === null, JSON.stringify(sp.unitPriceOf(db, 'setprice-dup')));
+    // 「有効値と未入力の混在」も割れている扱い (Codex medium 2巡目)。どちらのドラフトが正か
+    // 分からないまま値段を入れてしまわない
+    db.prepare(`UPDATE product_drafts SET price = NULL WHERE ne_code = ' setprice-dup '`).run();
+    check('🚨 売価の初期値: 片方が売価未入力なら「一致」とみなさない (どちらが正か分からない)',
+      sp.unitPriceOf(db, 'setprice-dup') === null, JSON.stringify(sp.unitPriceOf(db, 'setprice-dup')));
+    // 全部が未入力なら「その引き先には値が無い」= 次の引き先へ落ちてよい (止めない)
+    db.prepare(`UPDATE product_drafts SET price = NULL WHERE LOWER(TRIM(ne_code)) = 'setprice-dup'`).run();
+    db.prepare(`INSERT OR REPLACE INTO mirror_products
+      (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 標準売価, 原価, 送料, 配送方法, 消費税率, updated_at)
+      VALUES (99715, 'setprice-dup', 'NEにもある', '1', '取扱中', 'ok', 222, 50, 120, '定形外', 0.1, '2026-09-04T00:00:00Z')`).run();
+    check('売価の初期値: ドラフトが全部売価未入力なら NE の標準売価へ落ちてよい',
+      sp.unitPriceOf(db, 'setprice-dup')?.value === 222 && sp.unitPriceOf(db, 'setprice-dup')?.source === 'ne',
+      JSON.stringify(sp.unitPriceOf(db, 'setprice-dup')));
+    db.prepare(`DELETE FROM mirror_products WHERE product_id = 99715`).run();
+    db.prepare(`UPDATE product_drafts SET price = 700 WHERE ne_code = 'SETPRICE-DUP'`).run();
+    db.prepare(`UPDATE product_drafts SET price = 900 WHERE ne_code = ' setprice-dup '`).run();
+    check('🚨 売価の初期値: 売価が割れているとき NE の標準売価へ落ちない (人が入れた値を無視しない)',
+      (() => {
+        db.prepare(`INSERT OR REPLACE INTO mirror_products
+          (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 標準売価, 原価, 送料, 配送方法, 消費税率, updated_at)
+          VALUES (99711, 'setprice-dup', 'NEにもある', '1', '取扱中', 'ok', 111, 50, 120, '定形外', 0.1, '2026-09-04T00:00:00Z')`).run();
+        return sp.unitPriceOf(db, 'setprice-dup') === null;
+      })(), JSON.stringify(sp.unitPriceOf(db, 'setprice-dup')));
+    db.prepare(`DELETE FROM product_drafts WHERE LOWER(TRIM(ne_code)) = 'setprice-dup'`).run();
+    db.prepare(`DELETE FROM mirror_products WHERE 商品コード = 'setprice-dup'`).run();
+    // 劣化状態の再現はここまで。以降のテストのために正規化 UNIQUE を戻す
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_product_drafts_ne_norm ON product_drafts(LOWER(TRIM(ne_code)))');
+    // ①' バリエーションの子SKU に人が付けた売価 (draft_sku_prices) も「アプリの値」(Codex medium)
+    db.prepare(`INSERT OR REPLACE INTO mirror_products
+      (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 標準売価, 原価, 送料, 配送方法, 消費税率, updated_at)
+      VALUES (99712, 'setprice-sku', '子SKU', '1', '取扱中', 'ok', 300, 100, 120, '定形外', 0.1, '2026-09-04T00:00:00Z')`).run();
+    db.prepare('INSERT INTO draft_sku_prices (draft_id, sku_code, price) VALUES (?, ?, ?)')
+      .run(parentId, 'setprice-sku', 880);
+    check('売価の初期値: 子SKU に付けた売価は NE の標準売価より優先する',
+      sp.unitPriceOf(db, 'setprice-sku')?.value === 880 && sp.unitPriceOf(db, 'setprice-sku')?.source === 'sku',
+      JSON.stringify(sp.unitPriceOf(db, 'setprice-sku')));
+    db.prepare('INSERT INTO draft_sku_prices (draft_id, sku_code, price) VALUES (?, ?, ?)')
+      .run(r.draftId, 'setprice-sku', 990);
+    check('🚨 売価の初期値: 子SKU の売価が複数のドラフトで割れていたら採らない',
+      sp.unitPriceOf(db, 'setprice-sku') === null, JSON.stringify(sp.unitPriceOf(db, 'setprice-sku')));
+    db.prepare(`DELETE FROM draft_sku_prices WHERE sku_code = 'setprice-sku'`).run();
+    // NE mirror 側も同じ扱い: 正規化で複数行に当たって値が割れたら採らない / 0円・負数は「無い」
+    db.prepare(`INSERT OR REPLACE INTO mirror_products
+      (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 標準売価, 原価, 送料, 配送方法, 消費税率, updated_at)
+      VALUES (99713, ' SETPRICE-SKU ', '同じコードの別行', '1', '取扱中', 'ok', 400, 100, 120, '定形外', 0.1, '2026-09-04T00:00:00Z')`).run();
+    check('🚨 売価の初期値: NE の標準売価が正規化で割れていたら採らない',
+      sp.unitPriceOf(db, 'setprice-sku') === null, JSON.stringify(sp.unitPriceOf(db, 'setprice-sku')));
+    db.prepare(`DELETE FROM mirror_products WHERE product_id IN (99712, 99713)`).run();
+    db.prepare(`INSERT OR REPLACE INTO mirror_products
+      (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 標準売価, 原価, 送料, 配送方法, 消費税率, updated_at)
+      VALUES (99714, 'setprice-zero', '売価0円', '1', '取扱中', 'ok', 0, 100, 120, '定形外', 0.1, '2026-09-04T00:00:00Z')`).run();
+    check('売価の初期値: 標準売価 0 円は「無い」扱い (0 円のセットを作らない)',
+      sp.unitPriceOf(db, 'setprice-zero') === null);
+    db.prepare(`UPDATE mirror_products SET 標準売価 = -100 WHERE product_id = 99714`).run();
+    check('売価の初期値: マイナスの標準売価も「無い」扱い', sp.unitPriceOf(db, 'setprice-zero') === null);
+    db.prepare(`DELETE FROM mirror_products WHERE product_id = 99714`).run();
+    const mix = sp.setPriceFromMembers(db, [{ ne_code: 'WF-SET-P', qty: 2 }, { ne_code: 'setprice-ne', qty: 3 }]);
+    check('売価の初期値: 複数商品の混載は それぞれの単価×個数 の和 (1,980×2 + 500×3 = 5,460)',
+      mix.total === 5460, JSON.stringify(mix));
+    check('売価の初期値: 式を1行で説明できる (画面とイベントで同じ言葉)',
+      sp.describeSetPrice(mix) === 'WF-SET-P 1,980円 × 2 + setprice-ne 500円 × 3 = 5,460円',
+      sp.describeSetPrice(mix));
+    const gap = sp.setPriceFromMembers(db, [{ ne_code: 'WF-SET-P', qty: 2 }, { ne_code: 'setprice-nowhere', qty: 1 }]);
+    check('🚨 売価の初期値: 1件でも単価が引けなければ合計を作らない (欠けた合計を入れない)',
+      gap.total === null && gap.missing.includes('setprice-nowhere'), JSON.stringify(gap));
+    check('売価の初期値: 構成が空なら合計も無い', sp.setPriceFromMembers(db, []).total === null);
+    // セットの売価を単価に拾うと「セットのセット」の値段になる。単品 (parent_draft_id IS NULL) だけ見る
+    check('売価の初期値: セットのドラフトは単価に数えない (単品だけを見る)',
+      sp.unitPriceOf(db, r.neCode) === null, JSON.stringify(sp.unitPriceOf(db, r.neCode)));
+    // 実際に作ったセットにも入る (混載)
+    const rMix = sd.createSetDraft(parentId,
+      { mode: 'ai', members: [{ ne_code: 'WF-SET-P', qty: 2 }, { ne_code: 'setprice-ne', qty: 3 }], parent_step_version: setReviewVersion() },
+      'smoke', ADMIN);
+    check('売価の初期値: 混載セットを作ると和が入る',
+      db.prepare('SELECT price FROM product_drafts WHERE id = ?').get(rMix.draftId).price === 5460);
+    check('売価の初期値: 混載セットの構成が順番どおり保存される',
+      db.prepare('SELECT member_ne_code FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort')
+        .all(rMix.draftId).map((x) => x.member_ne_code).join(',') === 'WF-SET-P,setprice-ne');
+    const rGap = sd.createSetDraft(parentId,
+      { mode: 'ai', members: [{ ne_code: 'WF-SET-P', qty: 2 }, { ne_code: 'setprice-nowhere', qty: 1 }], parent_step_version: setReviewVersion() },
+      'smoke', ADMIN);
+    check('売価の初期値: 単価が引けない商品が混ざったら売価は空のまま (人が必ず気づく)',
+      db.prepare('SELECT price FROM product_drafts WHERE id = ?').get(rGap.draftId).price == null);
+    check('売価の初期値: 入れられなかったことと理由もイベントに残す',
+      /setprice-nowhere/.test(db.prepare(
+        `SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'price_prefilled'`).get(rGap.draftId)?.detail || ''),
+      db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'price_prefilled'`).get(rGap.draftId)?.detail || '');
+    // 画面に出す「由来」も同じ計算 (setInfoOf)。人が値付けした後は言い方が変わる
+    const oMix = sd.setInfoOf(db, rMix.draftId);
+    check('売価の由来: 画面に出す目安は作成時と同じ計算で作る',
+      oMix.priceOrigin?.total === 5460 && oMix.priceOrigin.priceEmpty === false, JSON.stringify(oMix.priceOrigin));
+    // 🚨 「初期値のまま」を今の売価と計算値の一致で判定しない (Codex medium)。偶然の一致・
+    //    作成後の単品値上げ・構成の変更、のどれでも嘘になる。売価が空かどうかだけを言う
+    db.prepare('UPDATE product_drafts SET price = NULL WHERE id = ?').run(rMix.draftId);
+    check('売価の由来: 売価が空なら「まだ入っていない」と分かる',
+      sd.setInfoOf(db, rMix.draftId).priceOrigin?.priceEmpty === true);
+    db.prepare('UPDATE product_drafts SET price = 5460 WHERE id = ?').run(rMix.draftId);
+    check('売価の由来: 人が偶然おなじ値を入れても「初期値のまま」とは言わない (言える根拠が無い)',
+      !('untouched' in (sd.setInfoOf(db, rMix.draftId).priceOrigin || {})),
+      JSON.stringify(sd.setInfoOf(db, rMix.draftId).priceOrigin));
+    db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(rMix.draftId, rGap.draftId);
+  }
+
   // copy モードは説明文を持って商品説明確認から
   const r2 = sd.createSetDraft(parentId, { mode: 'copy', members: [{ ne_code: 'WF-SET-P', qty: 3 }], parent_step_version: setReviewVersion() }, 'smoke', ADMIN);
   check('2件目は連番になる', r2.neCode === 'SET-WF-SET-P-02', r2.neCode);
@@ -3247,6 +3418,14 @@ let wfSetParentId = null;
   let qtyErr = null;
   try { sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'X', qty: 0 }] }, 'smoke'); } catch (e) { qtyErr = e; }
   check('個数を検証する', qtyErr?.status === 400);
+  // 🚨 未指定 (親×2 の既定) と「空を明示」を区別する。API だけ黙って別の構成に化けさせない
+  let emptyErr = null;
+  try { sd.createSetDraft(parentId, { mode: 'ai', members: [] }, 'smoke'); } catch (e) { emptyErr = e; }
+  check('構成に空配列を明示したら 400 (黙って「親×2」にしない)',
+    emptyErr?.status === 400 && /構成/.test(emptyErr.message), emptyErr?.message || '例外が出ていない');
+  let notArrErr = null;
+  try { sd.createSetDraft(parentId, { mode: 'ai', members: 'WF-SET-P' }, 'smoke'); } catch (e) { notArrErr = e; }
+  check('構成が配列でなければ 400', notArrErr?.status === 400, notArrErr?.message || '例外が出ていない');
   let fracErr = null;
   try { sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'X', qty: 1.5 }] }, 'smoke'); } catch (e) { fracErr = e; }
   check('小数の個数は黙って丸めず弾く', fracErr?.status === 400, fracErr?.message || '例外が出ていない');
@@ -6334,7 +6513,8 @@ renders.push(
         neState: 'needs_action', neError: '商品コード「plastic-set」は既に使われています',
         neRequestedAt: '2026-09-01T09:30:00.000Z', neRequestedBy: '中原 実紀',
         parentChanged: true,
-        priceOrigin: { unit: 1980, qty: 2, total: 3960 },
+        // 🚨 priceOrigin は**手で作らない** — setInfoOf が返す本物を使う (spread した値のまま)。
+        //    フィクスチャで作ると計算側を壊しても画面テストが通ってしまう (#1181 の教訓)
       },
     }]);
   }
@@ -7112,14 +7292,31 @@ for (const [name, file, data] of renders) {
     /ne-state-btn[^>]*data-state="requested"/.test(dhSet));
   check('セット詳細: 親が更新されていたら知らせ、確認するボタンを出す',
     dhSet.includes('派生したあとに親商品が更新されています') && dhSet.includes('id="parent-ack-btn"'));
-  check('セット詳細: 売価の由来を1行で出す (単品×個数)',
-    dhSet.includes('単品 1,980円 × 2個') && dhSet.includes('3,960円'), '');
+  check('セット詳細: 売価の由来を1行で出す (構成の単品売価 × 個数の和)',
+    dhSet.includes('WF-SET-P 1,980円 × 2 = 3,960円') && dhSet.includes('売価の目安'),
+    dhSet.slice(Math.max(0, dhSet.indexOf('売価の目安')), dhSet.indexOf('売価の目安') + 200));
   check('セット詳細: 配送方法は「NE確定待ち」と理由を出す (コピーしていないため)',
     dhSet.includes('NE確定待ち') && dhSet.includes('個数で箱もサイズも変わる'), '');
   // 単品の詳細にはセットの表示を出さない
-  const dhSingle = renderedHtml.get('detail.ejs') || '';
+  // 🚨 キーは**描画テストの名前**であってファイル名ではない。'detail.ejs' では常に undefined になり、
+  //    この下の否定形テスト (「出さない」) が空文字列に対して素通りしていた (2026-09-04 発見)
+  const dhSingle = renderedHtml.get('detail.ejs (セットの親・作成済み一覧)') || '';
+  check('単品の詳細を実際に描けている (この下の「出さない」テストが空文字で素通りしないこと)',
+    dhSingle.length > 500, String(dhSingle.length));
   check('単品の詳細には NE の進みを出さない',
     !/class="ne-stepper"/.test(dhSingle) && !dhSingle.includes('NE確定待ち'));
+  // セット作成フォーム (§5.6): 構成を**複数行**で指定できる。個数だけの1欄ではない
+  check('セット作成フォーム: 構成を複数行で指定できる (行を追加できる)',
+    dhSingle.includes('id="set-members"') && dhSingle.includes('id="set-member-add"'), '');
+  // 候補は「id があるか」ではなく**中身**を見る (空の datalist でも id は通ってしまう)
+  const dlHtml = (dhSingle.match(/<datalist id="set-member-codes">([\s\S]*?)<\/datalist>/) || [])[1] || '';
+  check('セット作成フォーム: 商品コードの候補に この商品 と バリエーションの子SKU が入る',
+    /<option value="rooms-/.test(dlHtml) && (dlHtml.match(/<option /g) || []).length >= 2,
+    dlHtml.replace(/\s+/g, ' ').slice(0, 300));
+  check('セット作成フォーム: 個数だけの旧フォーム (set-qty) は残っていない',
+    !dhSingle.includes('id="set-qty"'), '');
+  check('セット作成フォーム: 配送方法を引き継がないこと・売価の初期値を先に伝える',
+    dhSingle.includes('配送方法は引き継ぎません') && dhSingle.includes('単品売価 × 個数'), '');
   check('セット工程ビュー: タブは自分が選ばれた状態になる',
     /class="kb-tab on"[^>]*href="[^"]*view=set"/.test(bhSet)
     || /href="[^"]*view=set"[^>]*class="kb-tab on"/.test(bhSet)
@@ -7771,6 +7968,41 @@ for (const [name, file, data] of renders) {
       db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idDec);
     }
 
+    // ─── セット作成を実物のルートで通す (2026-09-04 §5.6 / Codex 2巡目) ──────
+    // 画面 → API → DB の往復。ここを通さないと「関数は正しいがルートが受け取れていない」が残る
+    {
+      sessionRole = 'admin';
+      const idSetHttp = mkDraft('SETHTTP-P', { atListing: false });
+      db.prepare('UPDATE product_drafts SET price = 1200 WHERE id = ?').run(idSetHttp);
+      db.prepare(`INSERT OR REPLACE INTO mirror_products
+        (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 標準売価, 原価, 送料, 配送方法, 消費税率, updated_at)
+        VALUES (99720, 'sethttp-mix', '混ぜる商品', '1', '取扱中', 'ok', 300, 100, 120, '定形外', 0.1, '2026-09-04T00:00:00Z')`).run();
+      const ver = () => wfp.progressOf(idSetHttp, { db }).main.find((x) => x.step_code === 'set_review').version;
+      let rs = await call(`/api/drafts/${idSetHttp}/set-drafts`,
+        { mode: 'ai', members: [], parent_step_version: ver() });
+      check('HTTP セット作成: 構成が空なら 400 (黙って「親×2」にしない)',
+        rs.status === 400 && /構成/.test(rs.json.error || ''), JSON.stringify(rs.json));
+      rs = await call(`/api/drafts/${idSetHttp}/set-drafts`,
+        { mode: 'ai', members: [{ ne_code: 'SETHTTP-P', qty: 2 }, { ne_code: 'sethttp-mix', qty: 1 }], parent_step_version: ver() });
+      check('HTTP セット作成: 複数行の構成をそのまま受け取る', rs.status === 200 && !!rs.json.draftId, JSON.stringify(rs.json));
+      const madeId = rs.json.draftId;
+      check('HTTP セット作成: 構成が順番どおり保存される',
+        db.prepare('SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort')
+          .all(madeId).map((x) => `${x.member_ne_code}x${x.qty}`).join(',') === 'SETHTTP-Px2,sethttp-mixx1',
+        JSON.stringify(db.prepare('SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = ? ORDER BY sort').all(madeId)));
+      check('HTTP セット作成: 売価は構成の和が入る (1,200×2 + 300×1 = 2,700)',
+        db.prepare('SELECT price FROM product_drafts WHERE id = ?').get(madeId).price === 2700,
+        String(db.prepare('SELECT price FROM product_drafts WHERE id = ?').get(madeId).price));
+      check('HTTP セット作成: 配送方法は入らない (NE 確定待ち)',
+        (db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(madeId) || {}).shipping_method_group == null);
+      rs = await call(`/api/drafts/${idSetHttp}/set-drafts`,
+        { mode: 'ai', members: [{ ne_code: 'SETHTTP-P', qty: 0 }], parent_step_version: ver() });
+      check('HTTP セット作成: 個数が不正なら 400', rs.status === 400, JSON.stringify(rs.json));
+      db.prepare('DELETE FROM mirror_products WHERE product_id = 99720').run();
+      db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(madeId, idSetHttp);
+      sessionRole = 'staff';
+    }
+
     // ─── 配送方法の保存の往復 (2026-09-03 #1152 / Codex R1 high) ───────────
     // 画面 → 保存 → 再表示 で状態が落ちないこと。DB には楽天IDだけを入れ、
     // 「ヤフーだけ別配送」は draft_yahoo.shipping_override が持つ
@@ -8326,6 +8558,79 @@ for (const [name, file, data] of renders) {
       const ok4 = await h.save();
       check('jan save: 成功で確定 → 以後は再送しない', ok3 === true && ok4 === true && h.posts.length === 3);
     }
+  }
+
+  // ─── セット作成フォームの構成の行 (detail.ejs addMemberRow / readSetMembers・§5.6) ───
+  // 「id が HTML にある」だけでは、行が増えない・空行が混ざる・最後の1行が消える、が全部素通りする
+  // (Codex low 2026-09-04)。実際に足して・消して・読み取るところまで動かす
+  {
+    const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+    const start = src.indexOf("const setMembersBox = document.getElementById('set-members');");
+    // 切り出し範囲は EJS の埋め込みを含まない (素の JS として vm で動かすため)。
+    // 実行 (initSetMembers(...)) だけがテンプレート側に残る
+    const end = src.indexOf('    <%# ここまでが smoke の切り出し範囲', start);
+    const chunk = start >= 0 && end > start ? src.slice(start, end) : '';
+    check('セット構成の行: detail.ejs から addMemberRow / readSetMembers を切り出せる',
+      chunk.includes('function addMemberRow') && chunk.includes('function readSetMembers')
+      && chunk.includes('function initSetMembers') && !chunk.includes('<%'), String(chunk.length));
+    check('セット構成の行: テンプレート側は商品コードを JSON で渡す (HTMLエスケープした値を JS 文字列にしない)',
+      /initSetMembers\(<%- JSON\.stringify\(draft\.ne_code/.test(src), '');
+
+    // 最小 DOM。querySelector(All) はクラス名だけを見る (このコードが使う範囲)
+    const mkEl = (tag) => {
+      const el = {
+        tagName: tag, className: '', value: '', type: '', placeholder: '', title: '', textContent: '',
+        maxLength: 0, min: '', max: '', style: { cssText: '' }, children: [], parent: null, _click: null,
+        setAttribute() {}, appendChild(c) { c.parent = el; el.children.push(c); return c; },
+        addEventListener(ev, fn) { if (ev === 'click') el._click = fn; },
+        remove() { if (el.parent) el.parent.children = el.parent.children.filter((c) => c !== el); },
+        querySelectorAll(sel) { return el.children.filter((c) => c.className === sel.replace('.', '')); },
+        querySelector(sel) { return el.querySelectorAll(sel)[0] || null; },
+      };
+      return el;
+    };
+    const box = mkEl('div');
+    const addBtn = mkEl('button');
+    const ctx = {
+      document: {
+        getElementById: (id) => (id === 'set-members' ? box : (id === 'set-member-add' ? addBtn : null)),
+        createElement: mkEl,
+      },
+      console,
+    };
+    vm.createContext(ctx);
+    const api = new vm.Script(`${chunk}\n({ add: addMemberRow, read: readSetMembers, init: initSetMembers })`,
+      { filename: 'setMembers' }).runInContext(ctx);
+    const rows = () => box.querySelectorAll('.set-member-row');
+    api.init("it's-a-code");
+    check('セット構成の行: 開いた時点で「この商品 × 2」の1行が入っている',
+      rows().length === 1 && rows()[0].querySelector('.set-member-qty').value === '2',
+      JSON.stringify(rows().map((r) => r.querySelector('.set-member-qty').value)));
+    check("セット構成の行: `'` を含む商品コードもそのまま入る (HTMLエスケープで別コードにならない)",
+      rows()[0].querySelector('.set-member-code').value === "it's-a-code",
+      rows()[0].querySelector('.set-member-code').value);
+    addBtn._click();
+    check('セット構成の行: 「行を追加」で行が増える (既定は 1 個)',
+      rows().length === 2 && rows()[1].querySelector('.set-member-qty').value === '1', String(rows().length));
+    check('セット構成の行: 空の商品コードの行は送らない (行を足して埋めなかった分)',
+      api.read().length === 1 && api.read()[0].ne_code === "it's-a-code", JSON.stringify(api.read()));
+    rows()[0].querySelector('.set-member-code').value = ' alpha ';
+    rows()[1].querySelector('.set-member-code').value = 'beta';
+    rows()[1].querySelector('.set-member-qty').value = '3';
+    check('セット構成の行: 商品コードの前後の空白は落として読む',
+      JSON.stringify(api.read()) === JSON.stringify([{ ne_code: 'alpha', qty: 2 }, { ne_code: 'beta', qty: 3 }]),
+      JSON.stringify(api.read()));
+    // 行の子は [商品コード, 個数, 「個」, ✕]。削除ボタンは 4 つ目
+    const delOf = (row) => row.children[3];
+    delOf(rows()[1])._click();
+    check('セット構成の行: ✕ でその行が消える', api.read().length === 1 && api.read()[0].ne_code === 'alpha');
+    delOf(rows()[0])._click();
+    check('🚨 セット構成の行: 最後の1行は消せない (構成が空のセットを作らせない)',
+      rows().length === 1, String(rows().length));
+    // 個数が壊れていたら「読める」ままにして、送信側 (createSet) とサーバーの両方で弾かせる
+    rows()[0].querySelector('.set-member-qty').value = '0';
+    check('セット構成の行: 個数が不正でも読み取りは値を隠さない (押した瞬間に理由を出せる)',
+      api.read()[0].qty === 0, JSON.stringify(api.read()));
   }
 }
 

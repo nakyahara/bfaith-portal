@@ -970,6 +970,26 @@ export function effectiveShippingForDraft(db, neCode, shippingMethodGroup) {
   return mapNeShippingToRakuten(db, getNeCost(db, neCode)?.shippingMethod);
 }
 
+/**
+ * RMS へ送る配送方法グループ (`variants[].shipping.shippingMethodGroup`)。
+ *
+ * 🚨 **セットだけ**が NE の配送方法へフォールバックする (2026-09-04 §4.4 決⑥)。
+ *   - セット: `shipping_method_group` を親からコピーしない設計なので、ここで NE に落とさないと
+ *     画面と末尾バナーは NE の「ネコポス」を出しているのに RMS へは何も送られず**店舗デフォルト**になる。
+ *     決⑥ の「本コード確定後は自動で NE の値になる」が成り立たない
+ *   - 単品: **従来どおり**「アプリ未指定なら送らない = 店舗デフォルトに任せる」。
+ *     単品まで NE に落とすと、いま店舗デフォルトで出ている商品の配送方法が黙って変わる。
+ *     それは決⑥の範囲外の運用変更なので、中原さんの判断を待つ (Codex high 2026-09-04 2巡目)
+ *
+ * @param {{parent_draft_id: number|null}} draft
+ * @param {{group: string|null}} effective  effectiveShippingForDraft の結果 (アプリ指定 > NE)
+ * @param {{group: string|null}} resolved   toRakutenShippingGroup の結果 (アプリ指定だけ)
+ */
+export function payloadShippingGroup(draft, effective, resolved) {
+  const isSet = draft?.parent_draft_id != null;
+  return (isSet ? effective?.group : resolved?.group) || '';
+}
+
 /** 配送方法グループ → 末尾に自動追加するバナー location 一覧 (配送バナー + 共通3枚) */
 export function trailingBannerLocations(shippingGroup) {
   const g = String(shippingGroup ?? '').trim();
@@ -1462,8 +1482,9 @@ export function buildItemPayload(db, draftId) {
   };
 
   // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる。
-  // RMS へ出るのは**必ず楽天グループID** (複合選択肢は上で '1' 等に解決済み)
-  const shippingGroup = shippingResolved.group || '';
+  // RMS へ出るのは**必ず楽天グループID** (複合選択肢は上で '1' 等に解決済み)。
+  // セットだけ NE へフォールバックする理由は payloadShippingGroup を見ること (§4.4 決⑥)
+  const shippingGroup = payloadShippingGroup(draft, effectiveShip, shippingResolved);
   const shipping = {
     ...(shippingGroup ? { shippingMethodGroup: shippingGroup } : {}),
     ...(rk.postage_included != null ? { postageIncluded: rk.postage_included === 1 } : {}),

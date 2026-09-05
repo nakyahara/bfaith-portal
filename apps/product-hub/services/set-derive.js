@@ -14,6 +14,8 @@ import { getDB, logEvent } from '../db.js';
 import { ensureProgress, setStepState } from '../lib/workflow-progress.js';
 import { SET_NE_STEP_CODE } from '../lib/set-decision.js';
 import { resolveVariationGroup } from '../lib/variation.js';
+// 売価の初期値 (§4.4 決⑦)。作成時に入れる値と画面に出す「由来」で同じ計算を使う
+import { setPriceFromMembers, describeSetPrice } from '../lib/set-price.js';
 // 判断の語彙・理由・表示名は lib 側が正 (カードを組み立てる workflow-progress.js も同じものを使う)
 import {
   SET_DECISIONS, SET_DECISIONS_CLOSING, SET_DECISION_REASONS, NE_STATE_LABELS, describeSetDecision,
@@ -89,10 +91,19 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
   if (!parent) throw badRequest('元の商品が見つかりません');
   if (parent.parent_draft_id) throw badRequest('セット商品からさらにセットは作れません');
 
-  // 構成 (何を何個)。未指定なら「親を 2 個」を初期値にする (もっとも多い形)
-  const rawMembers = Array.isArray(opts?.members) && opts.members.length > 0
-    ? opts.members
-    : [{ ne_code: parent.ne_code, qty: 2 }];
+  // 構成 (何を何個)。**未指定**のときだけ「親を 2 個」を初期値にする (もっとも多い形)。
+  // 🚨 明示的に空 (`members: []`) や配列でない値を「親×2」に化けさせない (Codex medium 2026-09-04):
+  //    画面は空構成を押させないのに API だけ黙って別の構成を作ると、送ったものと違うセットができる
+  let rawMembers;
+  if (opts?.members == null) {
+    rawMembers = [{ ne_code: parent.ne_code, qty: 2 }];
+  } else if (!Array.isArray(opts.members)) {
+    throw badRequest('構成の指定が不正です (配列で送ってください)');
+  } else if (opts.members.length === 0) {
+    throw badRequest('構成を1行以上入れてください');
+  } else {
+    rawMembers = opts.members;
+  }
   if (rawMembers.length > MAX_MEMBERS) throw badRequest(`セットの構成は ${MAX_MEMBERS} 件までです`);
   const members = [];
   const seen = new Set();
@@ -113,12 +124,15 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
 
   return db.transaction(() => {
     const neCode = nextProvisionalCode(db, parent.ne_code);
+    // 売価の初期値 = 構成の「単品売価 × 個数」の和 (§4.4 決⑦)。1 件でも単価が引けなければ
+    // null (空のまま) — 欠けた合計を入れると人が気づかずに出品する
+    const priceInit = setPriceFromMembers(db, members);
     const info = db.prepare(`
       INSERT INTO product_drafts (
         ne_code, name, status, official_url, amazon_url, own_brand, has_variation,
         memo, source, created_by, parent_draft_id, provisional_code,
-        ne_registration_state, parent_snapshot_at
-      ) VALUES (?, ?, 'draft', ?, ?, ?, 0, ?, 'portal', ?, ?, 1, 'not_requested', ?)
+        ne_registration_state, parent_snapshot_at, price
+      ) VALUES (?, ?, 'draft', ?, ?, ?, 0, ?, 'portal', ?, ?, 1, 'not_requested', ?, ?)
     `).run(
       neCode, name.slice(0, 300),
       parent.official_url, parent.amazon_url, parent.own_brand,
@@ -126,6 +140,7 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
       actor || null, parentId,
       // 派生した時点の親。親がこの後に変わったら「親が更新されています」を出す (§4.5)
       parent.updated_at || null,
+      priceInit.total,
     );
     const setId = Number(info.lastInsertRowid);
 
@@ -178,12 +193,17 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
     // 楽天のジャンル・属性はそのまま使える (画像と登録状態は引き継がない)。
     // article_number (メーカー型番) も引き継ぐ (2026-08-31 / Codex R1 high): 入口を
     // article_number に統一したので、ここを抜かすと派生したセット商品から型番が消える
-    const prk = db.prepare('SELECT genre_id, attributes_json, article_number, shipping_method_group, postage_included, normal_delivery_date_id FROM draft_rakuten WHERE draft_id = ?').get(parentId);
+    // 🚨 配送方法 (shipping_method_group / postage_included / normal_delivery_date_id) は
+    //    **コピーしない** (2026-09-04 §4.4 決⑥)。セットは重く・大きくなるので親と変わる。
+    //    空にしておけば effectiveShippingForDraft が NE の配送方法へフォールバックするので、
+    //    本コードが確定した時点で自動的に NE の値になる。誤った初期値を置いて後から直す方式は
+    //    「直し忘れ」が残り、親の配送方法のまま出品されるほうが危ない。親の値は画面に参考表示する
+    const prk = db.prepare('SELECT genre_id, attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(parentId);
     if (prk) {
       db.prepare(`
-        INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number, shipping_method_group, postage_included, normal_delivery_date_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(setId, prk.genre_id, prk.attributes_json, prk.article_number, prk.shipping_method_group, prk.postage_included, prk.normal_delivery_date_id);
+        INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
+        VALUES (?, ?, ?, ?)
+      `).run(setId, prk.genre_id, prk.attributes_json, prk.article_number);
     }
     db.prepare(`
       INSERT INTO draft_shop_categories (draft_id, shop_category_id, slot)
@@ -221,6 +241,17 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
     logEvent(db, setId, 'created_from_parent',
       `${parent.ne_code} から作成 (${memberText})`
       + (dropped > 0 ? ` ／ 仕様表 ${dropped} 行はセットで値が変わるため引き継いでいません (要入力)` : ''),
+      actor);
+    // 売価の初期値と配送方法は「なぜそうなっているか」が後から分かるように残す (§4.4)。
+    // どちらも人が直す前提なので、痕跡が無いと「誰かが入れた値」に見えて触りにくい
+    logEvent(db, setId, 'price_prefilled',
+      priceInit.total != null
+        ? `売価の初期値 ${describeSetPrice(priceInit)} を入れました (税込。送料・値引きは含みません)`
+        : `売価の初期値は入れていません (単価が引けない商品: ${priceInit.missing.filter(Boolean).join(', ') || '不明'})`,
+      actor);
+    logEvent(db, setId, 'shipping_not_copied',
+      '配送方法は親からコピーしていません (セットは個数で重さ・大きさが変わるため)。'
+      + 'NE の本コードが確定すると NE の配送方法が使われます',
       actor);
     return { draftId: setId, neCode };
   })();
@@ -314,10 +345,24 @@ export function setInfoOf(db, draftId) {
     neRequestedBy: row.ne_registration_requested_by || null,
     // 親が派生後に変わったか (自動追随はしない。人に知らせるだけ — §4.5)
     parentChanged: !!(parent?.updated_at && row.parent_snapshot_at && parent.updated_at > row.parent_snapshot_at),
-    // 売価の初期値がどこから来たか (§5.3)。単品×個数で入れているので、その式を1行で見せる
-    priceOrigin: (parent?.price != null && members.length === 1 && members[0].member_ne_code === parent.ne_code)
-      ? { unit: parent.price, qty: members[0].qty, total: parent.price * members[0].qty }
-      : null,
+    // 売価の由来 (§5.3/§4.4)。作成時に入れた初期値と**同じ計算**を今の構成でやり直して見せる。
+    // 「いま画面に入っている売価」と一致していれば初期値のまま、違えば人が値付けした後。
+    // 構成が複数商品でも各行が出る (単品×個数だけの特別扱いをしない)
+    priceOrigin: (() => {
+      const calc = setPriceFromMembers(db, members.map((m) => ({ ne_code: m.member_ne_code, qty: m.qty })));
+      if (calc.total == null) return null;
+      return {
+        total: calc.total,
+        lines: calc.lines,
+        text: describeSetPrice(calc),
+        // 🚨 「人がまだ触っていない」を **今の売価と計算値の一致**で判定してはいけない
+        //    (Codex medium 2026-09-04): 偶然同じ値を入れた / 作成後に単品の売価が変わった /
+        //    構成を後から変えた、のどれでも嘘になる。売価の変更はイベントに残していないので
+        //    「初期値のまま」は名乗れない。**作成時に何を入れたかは price_prefilled (append-only)
+        //    がイベント欄で見せる**。ここは「いまの構成での目安」だけを言う
+        priceEmpty: row.price == null,
+      };
+    })(),
   };
 }
 
