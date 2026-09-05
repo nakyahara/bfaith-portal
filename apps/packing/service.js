@@ -695,6 +695,7 @@ export function getWorkState(batchId) {
   let repickBySlip = {};
   let stockoutBySlip = {};   // 3階「在庫なし」(unavailable) の報告がある保留伝票: seq → [{sku, product_name, req_qty, claimed_by, updated_at}]
   let stockoutAckSeqs = [];  // そのうち「在庫なしを確認」できる伝票
+  let stockoutNotifyBySlip = {};   // 出荷保留 (在庫なし) で閉じた伝票の事務通知: seq → 'sent' | 'pending'
   try {
     incidents = db.prepare(
       "SELECT * FROM pk_pack_incidents WHERE batch_id=? AND status='candidate' ORDER BY id"
@@ -729,6 +730,11 @@ export function getWorkState(batchId) {
     const candSeqs = new Set(incidents.filter((i) => i.slip_seq != null && ['shortage', 'wrong_item'].includes(i.kind)).map((i) => i.slip_seq));
     stockoutAckSeqs = Object.keys(stockoutBySlip).map(Number)
       .filter((seq) => !lineFinalized && !candSeqs.has(seq) && (repickBySlip[seq] == null || repickBySlip[seq] === 'fulfilled'));
+    // 出荷保留 (在庫なし) で閉じた伝票の事務通知の状態 ('sent' | 'pending')。画面に「通知済み」を固定表示しない (Codex R2)
+    for (const r of db.prepare(`SELECT slip_seq, notified_at FROM pk_pack_stockouts
+      WHERE batch_id=? AND id IN (SELECT MAX(id) FROM pk_pack_stockouts WHERE batch_id=? GROUP BY slip_seq)`).all(batchId, batchId)) {
+      stockoutNotifyBySlip[r.slip_seq] = r.notified_at ? 'sent' : 'pending';
+    }
   } catch { /* v4未適用環境 */ }
   return {
     batch,
@@ -739,6 +745,7 @@ export function getWorkState(batchId) {
     repickBySlip,
     stockoutBySlip,
     stockoutAckSeqs,
+    stockoutNotifyBySlip,
   };
 }
 
@@ -773,6 +780,7 @@ function eventResult(batchId) {
     stockoutBySlip: s.stockoutBySlip || {},
     stockoutAckSeqs: s.stockoutAckSeqs || [],
     stockoutSeqs: s.slips.filter((x) => x.status === 'cancelled' && x.hold_reason === 'stockout').map((x) => x.seq),
+    stockoutNotifyBySlip: s.stockoutNotifyBySlip || {},
     incidents: s.incidents,
     // 完了取消の対象 = 最後に完了した伝票 (完了順の正はイベント履歴 — done_at は秒精度)
     lastDoneSeq: lastDoneSeqOf(batchId),
@@ -1782,6 +1790,42 @@ export function applyTaskAction(taskId, action, worker, { unavailableQty = null,
 /** タスク1行 (参照用。picking の同期・API の種別チェックで使う)。 */
 export function getTask(taskId) {
   return getDB().prepare('SELECT * FROM pk_pack_tasks WHERE id = ?').get(taskId) || null;
+}
+
+// ─── 🚫 出荷保留 (在庫なし) 通知の outbox (pk_pack_stockouts) ───
+// router (確認直後) とポーラー (再送) が同じ行を同時に送らないよう、送信前に claimed_at で「送信中」の印を付ける
+// (Codex R2 Medium)。印は10分で失効 = 送信中に落ちても再送される。webhook に冪等キーが無いので
+// 「成功→印を付ける前に落ちた」だけは重複し得る (at-least-once)
+
+/** 送信権を取る。true = この呼び出し側が送ってよい / false = 未通知でない or 他方が送信中。 */
+export function claimStockoutNotify(id) {
+  return getDB().prepare(`UPDATE pk_pack_stockouts SET claimed_at=?
+    WHERE id=? AND notified_at IS NULL AND (claimed_at IS NULL OR claimed_at < datetime('now', '-10 minutes'))`)
+    .run(utcNow(), id).changes === 1;
+}
+
+/** 送信結果を記録する。sent=true で通知済み。false は webhook 未設定、error は失敗理由。印 (claimed_at) は外す。 */
+export function markStockoutNotify(id, sent, error = null) {
+  const db = getDB();
+  if (sent) {
+    db.prepare('UPDATE pk_pack_stockouts SET notified_at=?, notify_error=NULL, claimed_at=NULL WHERE id=?').run(utcNow(), id);
+  } else {
+    db.prepare('UPDATE pk_pack_stockouts SET notify_error=?, claimed_at=NULL WHERE id=?')
+      .run(String(error || 'webhook未設定').slice(0, 200), id);
+  }
+}
+
+/** 未通知の outbox 行 (送信中でないもの)。期間で切らない = 何日経っても送れたときに届く (Codex R2 High)。 */
+export function listPendingStockoutNotifies(limit = 3) {
+  return getDB().prepare(`SELECT * FROM pk_pack_stockouts
+    WHERE notified_at IS NULL AND (claimed_at IS NULL OR claimed_at < datetime('now', '-10 minutes'))
+    ORDER BY id LIMIT ?`).all(limit);
+}
+
+/** 2日以上未通知のまま滞留している件数 (監視用ログ)。 */
+export function countStaleStockoutNotifies() {
+  return getDB().prepare(`SELECT COUNT(*) c FROM pk_pack_stockouts
+    WHERE notified_at IS NULL AND created_at < datetime('now', '-2 days')`).get().c;
 }
 
 // ─── ③ 候補の確定 / 取下げ (梱包完了サマリから) ───

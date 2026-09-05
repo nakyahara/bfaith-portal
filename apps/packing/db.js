@@ -579,6 +579,7 @@ const MIGRATIONS = {
       worker         TEXT NOT NULL,        -- 確認した梱包者
       notified_at    TEXT,
       notify_error   TEXT,
+      claimed_at     TEXT,                 -- 送信中の印 (router とポーラーが同じ行を同時に送らない。10分で失効)
       created_at     TEXT NOT NULL
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_stockouts_pending ON pk_pack_stockouts(notified_at)');

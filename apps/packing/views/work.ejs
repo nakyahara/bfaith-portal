@@ -379,6 +379,7 @@
       repickReadySeqs: Object.entries(state.repickBySlip || {}).filter(([, st]) => st === 'fulfilled').map(([q]) => Number(q)),
       stockoutBySlip: state.stockoutBySlip || {},   // 3階「在庫なし」の報告がある保留伝票 (seq → 商品)
       stockoutAckSeqs: state.stockoutAckSeqs || [],  // そのうち「在庫なしを確認」できる伝票 (サーバーと同じ条件)
+      stockoutNotifyBySlip: state.stockoutNotifyBySlip || {},   // 閉じた伝票の事務通知の状態 (sent / pending)
       stockoutSeqs: state.slips.filter((x) => x.status === 'cancelled' && x.hold_reason === 'stockout').map((x) => x.seq),
       incidents: (state.incidents || []).map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku, actualName: i.actual_name || null, qty: i.qty, slipSeq: i.slip_seq })),
       methodOptions: typeof methodOptions === 'undefined' ? [] : methodOptions,
@@ -452,10 +453,12 @@
     const stockoutSet = new Set(STATE.stockoutSeqs || []);   // 1階が「在庫なしを確認」して閉じた伝票 (出荷保留・在庫なし)
     let stockoutBySlip = STATE.stockoutBySlip || {};         // 3階「在庫なし」の報告 (保留伝票 seq → [{sku, product_name, req_qty, claimed_by, updated_at}])
     const stockoutAckSet = new Set(STATE.stockoutAckSeqs || []);   // 「在庫なしを確認」できる伝票 (他の再ピック・候補が残っていない)
+    let stockoutNotifyBySlip = STATE.stockoutNotifyBySlip || {};   // 閉じた伝票の事務通知の状態 (seq → 'sent' | 'pending')
     // 同期判定用: 在庫なし報告の中身 (件数・数量・時刻) まで含めた版 (キーだけだと2件目や数量変更で描き直されない — Codex R1)
     const stockoutVersion = () => Object.entries(stockoutBySlip)
       .flatMap(([seq, rows]) => (rows || []).map((t) => `${seq}:${t.id}:${t.sku}:${t.unavailable_qty ?? t.req_qty}:${t.updated_at}`))
-      .sort().join('|') + '#' + [...stockoutAckSet].sort().join(',');
+      .sort().join('|') + '#' + [...stockoutAckSet].sort().join(',')
+      + '#' + Object.entries(stockoutNotifyBySlip).map(([q, v]) => `${q}=${v}`).sort().join(',');
     const jstHm = (iso) => { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; };
     let incidents = STATE.incidents || [];   // 未確定のミス候補 (完了サマリで確定/取下げ)
     let currentSeq = STATE.currentSeq;  // 次に梱包する伝票 = 最小の未処理 (null=全完了)
@@ -509,7 +512,9 @@
       $('mall').textContent = s.mall || '';
       const stockoutView = stockoutSet.has(s.seq);
       $('doneTag').style.display = (doneSet.has(s.seq) || heldSet.has(s.seq) || stockoutView) ? 'inline-block' : 'none';
-      $('doneTag').textContent = stockoutView ? '🚫 出荷保留 (在庫なし)' : heldSet.has(s.seq) ? '⏳ 保留中 (再ピック待ち)' : '✔ 完了済み';
+      $('doneTag').textContent = stockoutView
+        ? (stockoutNotifyBySlip[s.seq] === 'sent' ? '🚫 出荷保留 (在庫なし・事務へ通知済み)' : '🚫 出荷保留 (在庫なし・事務への通知待ち)')
+        : heldSet.has(s.seq) ? '⏳ 保留中 (再ピック待ち)' : '✔ 完了済み';
 
       const warns = (s.warns || []).map((w) => `<span class="warn-badge">${esc(WARN_LABELS[w] || w)}</span>`).join('');
       // ピッキング欠品の配賦バッジ (欠品フローv2 PR2)。この伝票に入るはずの商品が足りない
@@ -823,6 +828,7 @@
         stockoutAckSet.clear();
         for (const q of body.stockoutAckSeqs) stockoutAckSet.add(q);
       }
+      if (body.stockoutNotifyBySlip && typeof body.stockoutNotifyBySlip === 'object') stockoutNotifyBySlip = body.stockoutNotifyBySlip;
       currentSeq = body.currentSeq;
       if (Array.isArray(body.doneSeqs)) {
         // ズレ回復 (順序外完了) があるため、doneSet はサーバーの一覧から再構築する

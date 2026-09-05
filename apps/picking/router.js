@@ -271,19 +271,12 @@ router.post('/api/tasks/:id(\\d+)/:action', checkOrigin, async (req, res) => {
     if (target.kind !== 'return') {
       return res.status(409).json({ error: '再ピックはバッチ一覧の 🔴バッチから操作してください', code: 'repick_batch_only' });
     }
-    const t = psvc.applyTaskAction(Number(req.params.id), String(req.params.action), worker.name);
-    if (t._notifyUnavailable) {
-      import('../packing/notify.js')
-        .then(({ notifyTaskUnavailable }) => notifyTaskUnavailable(t, worker.name))
-        .catch((e) => console.warn(`[picking] 在庫なし通知失敗: ${e.message}`));
-      // 1階の全端末にも赤バナー (例外処理監査 PR-1 — 事務スペースの GChat だけでは1階に届かない)
-      try {
-        const ref = `${t.folder_name || '-'}${t.slip_seq ? ` #${t.slip_seq}` : ''}`;
-        createFloorAlert('stockout', worker.name,
-          `🚫 在庫なし: ${ref} ${t.product_name || t.sku} ×${t.req_qty} — 3階 ${worker.name}`,
-          t.slip_seq ? `/apps/packing/work/${t.batch_id}?seq=${t.slip_seq}` : `/apps/packing/work/${t.batch_id}`);
-      } catch (e) { console.warn(`[picking] 在庫なしバナーの発報失敗: ${e.message}`); }
+    // 棚戻しの操作は 対応する / 棚に戻した / 取下げ だけ。「在庫なし」は再ピック (=🔴バッチの欠品シート) の概念で、
+    // 棚戻しに流すと伝票の出荷保留バナーを誤って作る (Codex R2 Medium)
+    if (!['claim', 'fulfill', 'cancel'].includes(String(req.params.action))) {
+      return res.status(400).json({ error: '棚戻しではこの操作はできません', code: 'bad_return_action' });
     }
+    const t = psvc.applyTaskAction(Number(req.params.id), String(req.params.action), worker.name);
     res.json({ ok: true, id: t.id, status: t.status });
   } catch (e) {
     // packing 側の業務エラー (PackError) も picking の PkError と同じ形で返す

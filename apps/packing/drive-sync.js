@@ -21,7 +21,10 @@ import { missWatchStep } from './miss-watch.js';
 import { sweepPrintJobs, pendingAlerts, markAlerted, alertTextFor } from './print-queue.js';
 import { materialNotifyStep, purgeOldViews } from './materials.js';
 import { cleanupReprintPdfs } from './reprint-pdf.js';
-import { parseCs03003, importPackBatch, checkPickingMatch, isStaleSagyoDate, PackError } from './service.js';
+import {
+  parseCs03003, importPackBatch, checkPickingMatch, isStaleSagyoDate, PackError,
+  listPendingStockoutNotifies, countStaleStockoutNotifies, claimStockoutNotify, markStockoutNotify,
+} from './service.js';
 import { getShippingFolders, listNouhinCsvFiles, downloadNouhinCsv } from './drive.js';
 
 /**
@@ -262,16 +265,14 @@ async function retryShipChangeNotify() {
  * 送信前に落ちても outbox 行 (pk_pack_stockouts) が残るのでここで追いつく
  */
 async function retryStockoutNotify() {
-  const db = getDB();
   let rows = [];
   try {
-    rows = db.prepare(`
-      SELECT * FROM pk_pack_stockouts
-      WHERE notified_at IS NULL AND created_at >= datetime('now', '-2 days')
-      ORDER BY id LIMIT 3
-    `).all();
+    rows = listPendingStockoutNotifies(3);   // 期間で切らない (2日で打ち切ると未通知が永久に残る — Codex R2 High)
+    const stale = countStaleStockoutNotifies();
+    if (stale > 0) console.error(`[packing-drive-poller] 出荷保留 (在庫なし) の未通知が2日以上滞留: ${stale}件 (webhook/ポーラーを確認)`);
   } catch { return; }   // v20未適用
   for (const row of rows) {
+    if (!claimStockoutNotify(row.id)) continue;   // router が送信中
     try {
       let items = [];
       try { items = JSON.parse(row.items_json) || []; } catch { items = []; }
@@ -280,12 +281,10 @@ async function retryStockoutNotify() {
         siteOrderNo: row.site_order_no, recipientName: row.recipient_name,
         worker: `${row.worker} (再送)`, items,
       });
-      if (sent) {
-        db.prepare('UPDATE pk_pack_stockouts SET notified_at=?, notify_error=NULL WHERE id=?').run(utcNow(), row.id);
-        console.log(`[packing-drive-poller] 出荷保留 (在庫なし) 通知を再送: ${row.ne_slip_no}`);
-      }
+      markStockoutNotify(row.id, sent, sent ? null : 'webhook未設定');
+      if (sent) console.log(`[packing-drive-poller] 出荷保留 (在庫なし) 通知を再送: ${row.ne_slip_no}`);
     } catch (e) {
-      db.prepare('UPDATE pk_pack_stockouts SET notify_error=? WHERE id=?').run(String(e.message).slice(0, 200), row.id);
+      markStockoutNotify(row.id, false, e.message);
     }
   }
 }

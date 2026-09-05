@@ -295,9 +295,10 @@
               <button type="button" onclick="foundSlip(<%= hs.seq %>)">全部見つかった (取下げ)</button>
             </div>
           <% } %>
-          <% for (const ss of stockoutSlips) { %>
+          <% for (const ss of stockoutSlips) {
+               const notifyState = ((typeof stockoutNotifyBySlip !== 'undefined' && stockoutNotifyBySlip) || {})[ss.seq]; %>
             <div class="open-req" style="background:#f1f3f5; color:#868e96">
-              <div class="grow">#<%= ss.seq %> <%= ss.slipNo %> / <%= ss.recipientName || '' %> (NE <%= ss.neSlipNo %>) — 🚫 出荷保留 (在庫なし)・事務へ通知済み</div>
+              <div class="grow">#<%= ss.seq %> <%= ss.slipNo %> / <%= ss.recipientName || '' %> (NE <%= ss.neSlipNo %>) — 🚫 出荷保留 (在庫なし)・<%= notifyState === 'sent' ? '事務へ通知済み' : '事務への通知待ち (自動で再送中)' %></div>
             </div>
           <% } %>
         <% } %>

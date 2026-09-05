@@ -22,7 +22,10 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'packing-stockout-t
 const { initPickingDB } = await import('../../picking/db.js');
 const { createFloorAlert, listFloorAlerts } = await import('../../picking/service.js');
 const { initPackingDB, getDB, utcNow, jstToday } = await import('../db.js');
-const { applyEvent, getWorkState, applyTaskAction, PackError } = await import('../service.js');
+const {
+  applyEvent, getWorkState, applyTaskAction, PackError,
+  claimStockoutNotify, markStockoutNotify, listPendingStockoutNotifies, countStaleStockoutNotifies,
+} = await import('../service.js');
 
 initPickingDB();
 initPackingDB();
@@ -210,6 +213,39 @@ console.log('── ライン: 再依頼ガード・見つかった・在庫な�
   t('PackError の形 (status/code) が router で JSON に変換できる', () => {
     try { ev(b, 'stockout_ack', { slipSeq: 2 }); assert.fail(); }
     catch (e) { assert.ok(e instanceof PackError); assert.equal(e.status, 409); }
+  });
+}
+
+console.log('── 事務通知の outbox (claim / 再送対象 / 表示状態) ──');
+{
+  const b = mkPackBatch('S4', [{ sku: 'a', status: 'held', holdReason: 'repick' }]);
+  mkTask(b, 1, 'a', 'unavailable');
+  const r = ev(b, 'stockout_ack', { slipSeq: 1 });
+  const id = r.taskNotify.stockoutId;
+  t('未通知の行は再送対象・古い行は期間で切られない', () => {
+    assert.ok(listPendingStockoutNotifies(10).some((x) => x.id === id));
+    db.prepare("UPDATE pk_pack_stockouts SET created_at=datetime('now','-5 days') WHERE id=?").run(id);
+    assert.ok(listPendingStockoutNotifies(10).some((x) => x.id === id), '5日前でも再送対象');
+    assert.ok(countStaleStockoutNotifies() >= 1, '2日以上の滞留として数える');
+  });
+  t('claim は1回だけ通る (router とポーラーの同時送信を防ぐ)。失敗を記録すると再送対象に戻る', () => {
+    assert.equal(claimStockoutNotify(id), true);
+    assert.equal(claimStockoutNotify(id), false, '送信中は取れない');
+    assert.ok(!listPendingStockoutNotifies(10).some((x) => x.id === id), '送信中は再送対象から外れる');
+    markStockoutNotify(id, false, 'HTTP 500');
+    assert.equal(db.prepare('SELECT notify_error, claimed_at FROM pk_pack_stockouts WHERE id=?').get(id).claimed_at, null);
+    assert.ok(listPendingStockoutNotifies(10).some((x) => x.id === id), '失敗後は再送対象');
+    assert.equal(getWorkState(b).stockoutNotifyBySlip[1], 'pending', '画面には通知待ちと出る');
+  });
+  t('送れたら notified_at が付き、再送対象から外れ、画面は通知済み', () => {
+    assert.equal(claimStockoutNotify(id), true);
+    markStockoutNotify(id, true);
+    const row = db.prepare('SELECT * FROM pk_pack_stockouts WHERE id=?').get(id);
+    assert.ok(row.notified_at);
+    assert.equal(row.notify_error, null);
+    assert.ok(!listPendingStockoutNotifies(10).some((x) => x.id === id));
+    assert.equal(claimStockoutNotify(id), false, '通知済みは claim できない');
+    assert.equal(getWorkState(b).stockoutNotifyBySlip[1], 'sent');
   });
 }
 
