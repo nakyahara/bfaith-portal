@@ -861,6 +861,12 @@ async function loadStateOnce() {
     preview = null; previewAt = null; previewDown = false;
     // 正本が変わると id も許される操作も変わる。開いている詳細は閉じる (古いボタンを残さない)
     if (curDetail) forceCloseDetail('正本が変わったので詳細を閉じました');
+    // ⭐計画も捨てて取り直す。捨てないと、アプリ正本のときに描いた「＋ 明日やる」「－ 外す」が
+    //   下見に戻った後も残る (Codex 下見 R1)。planGen を進めて古い応答も捨てる
+    planData = null;
+    planGen += 1;
+    clearPlanDom();
+    if (curView === 'plan') { if (stateCan('task.plan.assign') || !isApp()) loadPlan({ force: true }); else setView('board'); }
   }
   ensureTabValid();
   saveSnapshot(j);
@@ -876,6 +882,7 @@ async function loadStateOnce() {
   renderStaffBtn();
   // ⭐許可が変わったら計画の中身も作り直す。失ったら**描いたものを消す** —
   //   隠すだけだと、hidden の画面に押せるボタンが残る (Codex P3 R1 / R2)
+  // アプリ正本で許可が無いなら計画は閉じる。下見は誰でも読むだけなので開いたままでよい
   if (isApp() && !stateCan('task.plan.assign')) {
     planData = null;
     clearPlanDom();
@@ -1538,8 +1545,10 @@ function renderPlan() {
   const t = d.totals || { hours: 0, count: 0, unknown_hours_count: 0 };
   const lo = (d.target_hours || {}).min ?? 4;
   const hi = (d.target_hours || {}).max ?? 6;
-  // ⭐下見 (正本が Notion) では読むだけ。操作のボタンは描かない
-  const ro = !!d.preview;
+  // ⭐下見 (正本が Notion) では読むだけ。操作のボタンは描かない。
+  //   応答の preview だけで決めず、**いまの正本と許可でも**見る —
+  //   取ってから描くまでに正本が戻ることがある (Codex 下見 R1)
+  const ro = !!d.preview || !isApp() || !stateCan('task.plan.assign');
   $('#planHint').textContent = ro
     ? '👀 見るだけの下見です (正本はまだ Notion)。1 日にできるのは ' + lo + '〜' + hi + ' 時間ぶんで、'
       + 'この順に候補が並びます。「アプリを正本にする」と、ここで明日の分を決められるようになります。'

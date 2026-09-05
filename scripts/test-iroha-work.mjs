@@ -2283,7 +2283,16 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
             && pv.json.totals && pv.json.target_hours, '候補・明日やる分・やり残し・合計・目安が入っている');
           ok(pv.json.candidates.every((c) => c.when == null && c.status === 'not_started'), '候補の条件は正本と同じ');
           // 職員でなくても読める (下見は誰でも読むだけ = ボード・履歴と同じ)
-          ok((await call('GET', '/api/plan', { cookie })).status === 200, '職員モードでなくても読める');
+          // 職員モードでなくても読める (下見は誰でも読むだけ = ボード・履歴と同じ)。
+          // 端末 Cookie だけの利用者として叩く (直前と同じ状態で 2 回叩くだけにしない)
+          await call('POST', '/api/staff-lock', { cookie });
+          const asMemberPlan = await call('GET', '/api/plan', { cookie });
+          ok(asMemberPlan.status === 200 && asMemberPlan.json.preview === true, '職員モードでなくても読める');
+          // ⭐読むだけ = DB を 1 行も変えない (total_changes は全テーブルの書き込みを数える)
+          const ch0 = db.prepare('SELECT total_changes() AS n').get().n;
+          await call('GET', '/api/plan', { cookie });
+          await call('GET', '/api/preview-tasks', { cookie });
+          ok(db.prepare('SELECT total_changes() AS n').get().n === ch0, '下見の読み取りで DB は 1 行も変わらない');
           // 書き変えは今までどおり断る
           const openId = db.prepare("SELECT id FROM f_iroha_tasks WHERE status != 'closed' ORDER BY id LIMIT 1").get().id;
           const w409 = await call('POST', '/api/plan', { cookie, body: { id: openId, when: 'tomorrow', expect_version: 1, worker_id: w1.id } });
@@ -3091,6 +3100,10 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '明日やる分のゲージは静的に置かない (職員のときだけボタンにする)');
   ok(/if \(!isApp\(\)\) \{\r?\n\s+return '<button class="gauge" onclick="openPlanPage\(\)">' \+ inner \+\r?\n\s+'<span class="go">明日の計画 ›<\/span><span class="staff">見るだけ \(正本はまだ Notion\)<\/span><\/button>';/.test(html),
     '下見のあいだもゲージから「明日の計画」を開ける (読むだけ・「見るだけ」と書く)');
+  ok(/const ro = !!d\.preview \|\| !isApp\(\) \|\| !stateCan\('task\.plan\.assign'\);/.test(html),
+    '計画画面の操作は、応答の preview だけでなく「いまの正本と許可」でも描き分ける (取ってから描くまでに戻ることがある)');
+  ok(/planData = null;\r?\n\s+planGen \+= 1;\r?\n\s+clearPlanDom\(\);/.test(html),
+    '正本が変わったら計画のデータを捨て、世代を進めて古い応答も捨てる');
   ok(/if \(!stateCan\('task\.plan\.assign'\)\) \{\r?\n\s+return '<div class="gauge">' \+ inner \+ '<span class="staff">明日の計画を決められるのは職員です/.test(html),
     '許可が無ければゲージはただの表示 (「明日の計画 ›」の入口を描かない)');
   // ⭐職員モードに入る入口 (これが無いと、計画の操作が一生描かれない)
