@@ -105,9 +105,10 @@ const TARGETS = [
   { key: 'shohyo-links', file: 'shohyo-links.db', mode: 'vacuum', required: false, sentinels: ['vendor_links'] },
   { key: 'staff', file: 'staff.db', mode: 'vacuum', required: false, sentinels: ['staff'] },
   // 2026-09-05 実機確認 (CompanyDB構想 R-2) で対象外だと判明した Render 正本 2 本。
-  // 両方まだ小さく (0.2MB / 4KB+WAL)、行が増える前の DB なので sentinel は置かない (0 件で失敗にしない)
-  { key: 'fba-box', file: 'fba-box.db', mode: 'vacuum', required: false, sentinels: [] },
-  { key: 'postage', file: 'postage.db', mode: 'vacuum', required: false, sentinels: [] },
+  // 両方まだ小さく (0.2MB / 4KB+WAL)、行が増える前の DB なので sentinel (1件以上) は置かず、
+  // 中核テーブルの存在だけ expect_tables で検証する (スキーマ消失・別 DB を ok 扱いしない)
+  { key: 'fba-box', file: 'fba-box.db', mode: 'vacuum', required: false, sentinels: [], expect_tables: ['fbx_runs', 'fbx_placements', 'fbx_events'] },
+  { key: 'postage', file: 'postage.db', mode: 'vacuum', required: false, sentinels: [], expect_tables: ['pm_settings', 'pm_tariff_bands', 'pm_skus'] },
   { key: 'users', file: 'users.json', mode: 'file', required: true, sentinels: [] },
 ];
 
@@ -169,13 +170,21 @@ function rclone(args, timeoutMs) {
   }
 }
 
-function quickCheckAndSentinels(dbPath, label, sentinels) {
+// sentinels    = 1件以上あるはずの表 (0件なら空バックアップとして失敗)
+// expectTables = 存在だけを検証する表 (行数は問わない)。まだ行が増えていない新しい DB 向け —
+//                sentinel が置けない DB でも「スキーマを失った空 SQLite / 別 DB」を ok 扱いしないため (Codex R1 Medium)
+function quickCheckAndSentinels(dbPath, label, sentinels, expectTables = []) {
   const db = new Database(dbPath, { readonly: true });
   try {
     db.pragma('busy_timeout = 60000');
     const values = db.pragma('quick_check').map((r) => Object.values(r)[0]);
     if (values.length !== 1 || values[0] !== 'ok') {
       throw new Error(`${label} quick_check NG: ${values.slice(0, 3).join(' / ')}`);
+    }
+    for (const t of expectTables) {
+      if (!/^[A-Za-z0-9_]+$/.test(t)) throw new Error(`不正な expect_tables 名: ${t}`);
+      const hit = db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(t);
+      if (!hit) throw new Error(`${label} 期待テーブル ${t} が存在しません (スキーマ消失 / 別 DB の疑い)`);
     }
     const counts = {};
     for (const t of sentinels) {
@@ -425,10 +434,10 @@ export async function runRenderBackup() {
           if (target.mode === 'logical') {
             const n = logicalExport(srcPath, rawTmp);
             console.log(`[render-backup] ${target.key}: ${n} テーブルを論理エクスポート`);
-            sentinelCounts = quickCheckAndSentinels(rawTmp, target.key, target.sentinels);
+            sentinelCounts = quickCheckAndSentinels(rawTmp, target.key, target.sentinels, target.expect_tables || []);
           } else if (target.mode === 'vacuum') {
             vacuumInto(srcPath, rawTmp);
-            sentinelCounts = quickCheckAndSentinels(rawTmp, target.key, target.sentinels);
+            sentinelCounts = quickCheckAndSentinels(rawTmp, target.key, target.sentinels, target.expect_tables || []);
           } else {
             const content = fs.readFileSync(srcPath);
             const n = validateUsersJson(content);

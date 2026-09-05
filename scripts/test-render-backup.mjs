@@ -238,6 +238,31 @@ check('T1 小物DB欠如は警告扱い', summary.includes('🟡 fba なし'));
   check('T11 もう1本は「実行中」で拒否', refused === 1);
 }
 
+// ── T12: expect_tables (存在だけ検証) — 0件の正しい DB は成功 / スキーマを失った DB は失敗 (Codex R1 Medium) ──
+{
+  const postagePath = path.join(TEST_DIR, 'postage.db');
+  {
+    const db = new Database(postagePath);
+    db.exec(`CREATE TABLE pm_settings (k TEXT PRIMARY KEY, v TEXT);
+      CREATE TABLE pm_tariff_bands (id INTEGER PRIMARY KEY);
+      CREATE TABLE pm_skus (sku TEXT PRIMARY KEY);`); // 全部 0 件のまま
+    db.close();
+  }
+  let ok = true;
+  try { await runRenderBackup(); } catch (e) { ok = false; console.error('T12 unexpected:', e.message); }
+  check('T12 期待テーブルが揃った 0件 DB は成功 (sentinel なしでも ok)', ok);
+  fs.unlinkSync(postagePath);
+  {
+    const db = new Database(postagePath);
+    db.exec('CREATE TABLE something_else (id INTEGER PRIMARY KEY)'); // スキーマ消失 / 別 DB を模す
+    db.close();
+  }
+  let threw = false;
+  try { await runRenderBackup(); } catch (e) { threw = /postage 期待テーブル pm_settings が存在しません/.test(e.message); }
+  check('T12 期待テーブルが無い DB は失敗', threw);
+  fs.unlinkSync(postagePath);
+}
+
 fs.rmSync(TEST_DIR, { recursive: true, force: true });
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

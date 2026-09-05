@@ -53,7 +53,8 @@ const KNOWN = {
   'apps/rakuten-yahoo-sync/services/rys-cron.js': { count: 1, exempt: 'Dark Launch (RYS_FULL_SYNC_CRON_ENABLED)。点火時に要登録' },
   // 3箇所 = 受信同期 (inquiry-hub-sync: sync+deep) + 送信ワーカー (inquiry-hub-outbox)。台帳は2エントリ
   'apps/inquiry-hub/sync/cron.js': { count: 3, job: 'inquiry-hub-sync' },
-  'apps/render-backup/backup-render.js': { count: 2, exempt: 'Dark Launch (RENDER_BACKUP_CRON_ENABLED)。点火時に要登録' },
+  // 2箇所 = 定刻 cron + 6時間毎 staleness (catch-up は setTimeout)。2026-09-05 台帳登録 (7週間 Dark Launch のまま無音だった教訓)
+  'apps/render-backup/backup-render.js': { count: 2, job: 'render-backup' },
 
   // ── 業務ジョブではないもの ──
   'apps/observability/metrics.js': { count: 1, exempt: 'プロセス内観測 (event-loop lag / heap)。業務データを触らない' },
