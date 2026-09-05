@@ -56,6 +56,9 @@
 
   .filters{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center}
   .flabel{font-size:.72rem;color:var(--faint);font-weight:700;letter-spacing:.12em;font-family:var(--num)}
+  /* 見出し + チップの組。組ごとに折り返す (見出しだけ前の行に残さない — 監修 B-4) */
+  .fgroup{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .fgroup>span:not(.flabel):not(.seg){display:inline-flex;gap:8px;flex-wrap:wrap;align-items:center}   /* .seg (進捗|拠点) は連結ボタンなので隙間を入れない */
   .chip{border:1px solid var(--line);background:var(--surface);color:var(--sub);border-radius:var(--r);
     padding:8px 14px;font-weight:700;font-size:.92rem;cursor:pointer;display:inline-flex;gap:8px;align-items:center}
   .chip .num{color:var(--faint);font-weight:600}
@@ -508,6 +511,9 @@
   .opts .hint{grid-column:1/-1}
   .optnew input{flex:1;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 10px;font-size:1rem;background:var(--surface);color:var(--ink);min-height:46px}
   .mfields label{display:block;font-size:.78rem;color:var(--sub);font-weight:700;margin:10px 0 3px}
+  /* チェックボックスの行: □ と文字を横に並べる (.mfields input{width:100%} が □ にも効いて文字の上に浮いていた — 監修 B-3) */
+  .mfields label.cbrow{display:flex;align-items:center;gap:10px;font-size:1rem;color:var(--ink);min-height:44px;margin:6px 0 0}
+  .mfields input[type=checkbox]{width:24px;height:24px;flex:none;margin:0;padding:0;accent-color:var(--accent)}
   .mfields input{width:100%;border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;
     font-size:1rem;background:var(--surface);color:var(--ink)}
   .mfields input:focus,.pin:focus{outline:2px solid var(--accent);outline-offset:-1px}
@@ -585,8 +591,7 @@
   <!-- ══ 画面1: リスト ══ -->
   <div class="page listpage">
     <div class="filters">
-      <span class="flabel">STATUS</span>
-      <span id="tabs"></span>
+      <span class="fgroup"><span class="flabel">状態</span><span id="tabs"></span></span>
       <input class="search" id="q" placeholder="商品名・商品コードで検索">
       <span class="sync">
         <span id="syncTxt">読み込み中…</span>
@@ -603,13 +608,11 @@
     <div class="preview" id="prevBoard" hidden></div>
     <!-- 明日やる分の合計。職員はここから「明日の計画」を開く (要件 §W-4) -->
     <div id="gaugeWrap"></div>
+    <!-- 見出しとチップは 1 つの fgroup に包む。別々だと折り返しで「予定」の見出しだけが前の行の末尾に残る (監修 B-4) -->
     <div class="filters">
-      <span class="flabel">列の分け方</span>
-      <span class="seg" id="colSeg"></span>
-      <span class="flabel">拠点</span>
-      <span id="facChips"></span>
-      <span class="flabel">予定</span>
-      <span id="whenChips"></span>
+      <span class="fgroup"><span class="flabel">列の分け方</span><span class="seg" id="colSeg"></span></span>
+      <span class="fgroup"><span class="flabel">拠点</span><span id="facChips"></span></span>
+      <span class="fgroup"><span class="flabel">予定</span><span id="whenChips"></span></span>
       <input class="search" id="bq" placeholder="商品名・商品コードで検索">
     </div>
     <div class="board" id="board"></div>
@@ -849,12 +852,12 @@
         <label>ロケーション</label>
         <div class="opts chips" id="lwLoc"></div>
         <input type="hidden" id="lwLocation">
-        <label><input id="lwOrdered" type="checkbox" class="cb"> ラベルを発注した</label>
-        <label><input id="lwReattach" type="checkbox" class="cb"> 貼り直しが必要</label>
+        <label class="cbrow"><input id="lwOrdered" type="checkbox" class="cb"> ラベルを発注した</label>
+        <label class="cbrow"><input id="lwReattach" type="checkbox" class="cb"> 貼り直しが必要</label>
         <label>本社へのLINE連絡日</label><input id="lwLine" type="date">
         <label>再連絡日</label><input id="lwRe" type="date">
         <label>入庫完了日</label><input id="lwRestocked" type="date">
-        <label><input id="lwDone" type="checkbox" class="cb"> 完了 (一覧から外す)</label>
+        <label class="cbrow"><input id="lwDone" type="checkbox" class="cb"> 完了 (一覧から外す)</label>
         <label>備考</label><input id="lwNote" maxlength="300">
       </div>
       <div class="mbtns" style="margin-top:14px">
@@ -992,10 +995,22 @@ function openGate() {
 function pickWorker(id) {
   const w = state.workers.find(x => x.id === id);
   if (!w) return;
+  // 端末の職員モード (PIN で開けた 30 分) が生きているか。ポータルから入っている人 (via=session) は対象外
+  const deviceStaffMode = !!(state.staff_mode && state.staff_mode.staff && state.staff_mode.via !== 'session');
+  const prev = worker;
   worker = w;
   try { localStorage.setItem('iw_worker_id', String(id)); } catch (e) { /* プライベートモード等 */ }
   $('#whoBtn').textContent = '👤 ' + w.display_name + (w.worker_type === 'staff' ? ' (職員)' : '') + ' ▾';
   $('#gate').classList.remove('on');
+  // ⭐職員モードは端末に 30 分残るが、それは PIN を入れた**その人**のもの。名前が替わったら終える —
+  //   利用者に替えたのに「明日の計画を立てる」や押せる札が残る (監修 B-10)、職員 A の PIN のまま職員 B の名前で
+  //   記録が付く (Codex PR-A R1 #2) のどちらも防ぐ。「名前の切り替え = 職員モード終了」。続けるならもう一度 PIN
+  if (deviceStaffMode && (!prev || prev.id !== w.id)) {
+    dropPlanCaps();          // 先に画面から落とす (応答を待つ間も利用者に職員の操作を見せない)
+    lockDeviceStaffMode();   // 端末の職員モードを終える。失敗しても画面は落としたまま (fail-closed)
+  }
+  // 職員を選んだら「🔑 職員モードに入る」をすぐ出す (60 秒の取り直しを待たせない — 監修 B-1)
+  renderStaffBtn();
 }
 function restoreWorker() {
   let id = null;
@@ -1159,6 +1174,8 @@ async function loadStateOnce() {
   }
   if (!stateCan('task.facility.assign') && facPickCtx) closeFacPick();
   restoreWorker();
+  // ⭐選んでいるのが利用者なら、端末の職員モードが生きていても職員の許可は採用しない (Codex PR-A R1 #1)
+  if (enforceWorkerCaps()) dropPlanCaps();
   // 開いている詳細を追いかける。一覧・ボードのものは state から、下見・履歴のものは取り直す
   //   (取込や他の端末の操作で中身が変わる。「いまのアプリの記録」と書いている以上、古いまま置かない — Codex PR1 R2)
   if (curDetail && detailSrc === 'preview') {
@@ -1401,8 +1418,11 @@ const WHEN_CLASS = { today: 'todayp', tomorrow: 'tomorrow', over: 'over', later:
  * ゲージ (合計時間と目安) はボードでは意味が薄いので**計画画面のほうに置く**
  */
 function planButtonHtml() {
-  const p = ((boardState() || {}).tomorrow_plan) || { hours: 0, count: 0 };
-  const sub = p.count > 0 ? p.count + ' 件 · ' + fmtHours(p.hours) + ' 入っています' : 'まだ何も入っていません';
+  const p = ((boardState() || {}).tomorrow_plan) || { hours: 0, count: 0, unknown_hours_count: 0 };
+  // 想定時間が分からないカードを 0 分と足さない。「1 件 · 時間不明 1 件」と出す (監修 B-5。計画画面のゲージと同じ扱い)
+  const unk = p.unknown_hours_count ? '時間不明 ' + p.unknown_hours_count + ' 件' : '';
+  const hoursTxt = p.hours > 0 || !unk ? fmtHours(p.hours) : '';
+  const sub = p.count > 0 ? p.count + ' 件 · ' + [hoursTxt, unk].filter(Boolean).join(' + ') + ' 入っています' : 'まだ何も入っていません';
   if (!isApp()) {
     return '<button class="planbtn ro" onclick="openPlanPage()"><span class="ic">📋</span>' +
       '<span>明日の計画を見る<br><small style="font-weight:600;opacity:.75">見るだけ (正本はまだ Notion)</small></span>' +
@@ -1791,6 +1811,40 @@ function dropPlanCaps() {
   renderList();
   renderBoard();
   if (curDetail && detailCard) renderDetail(detailCard, { keepScroll: true });
+}
+
+/**
+ * ⭐端末の職員モードは「選んでいる人が職員のとき」だけ採用する (fail-closed — Codex PR-A R1 #1)。
+ * /api/state は端末の職員モードが生きていれば計画の許可を返すが、いま選んでいるのが利用者なら、
+ * その許可は画面に出さず、端末の職員モードを終える要求を (まだなら) 送る。
+ * @returns true = 許可を落とす必要があった (呼び元が dropPlanCaps() で描き直す)
+ */
+let staffLockInflight = null;
+function enforceWorkerCaps() {
+  const sm = state.staff_mode || {};
+  if (!sm.staff || sm.via === 'session' || !worker) return false;
+  // 利用者を選んでいる / PIN を入れたのとは別の職員を選んでいる / 誰が開けたか記録が無い → その人の職員モードではない (fail-closed)
+  const mine = worker.worker_type === 'staff' && !!sm.workerId && Number(sm.workerId) === Number(worker.id);
+  if (mine) return false;
+  lockDeviceStaffMode();
+  return true;
+}
+/** 端末の職員モードを終える (同時に 1 本)。成功・失敗を確かめ、失敗したら知らせる (黙って「終わりました」と言わない) */
+function lockDeviceStaffMode() {
+  if (staffLockInflight) return staffLockInflight;
+  staffLockInflight = apiFetch('/api/staff-lock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then((j) => {
+      if (j && j.ok) {
+        if (j.staff_mode) state.staff_mode = j.staff_mode;
+        hideErr('stafflock');
+        toast('職員モードを終わりました (名前を切り替えたため)');
+      } else {
+        // 画面の許可は落としたまま。次の取り直しでも enforceWorkerCaps が再び落とし、解除を再送する
+        showErr('端末の職員モードを終われませんでした', (j && j.message) || 'つながったら自動でやり直します。続くときは職員の方に知らせてください', 'stafflock');
+      }
+    })
+    .finally(() => { staffLockInflight = null; });
+  return staffLockInflight;
 }
 
 async function endStaffMode() {
@@ -2598,12 +2652,16 @@ function workInfoHtml(c, m, missSet) {
   };
   const big = (v, unit) => '<span class="big">' + esc(String(v)) + '</span><span class="unit">' + unit + '</span>';
 
-  // ③ 気をつけること — 中身があるときだけ目立たせる (無いのに黄色いと毎回びっくりする)
+  // ③ 気をつけること — 中身があるときは**上の黄色い枠 (careHtml) にだけ**出し、ここは直す口の 1 行にする
+  //   (同じ文が 2 回出ていた — 監修 B-9)。無いときは「特になし ＋登録」の帯
   const note = m.note;
-  const care = open('wicare' + (note ? '' : ' empty'), 'note') +
-    '<span class="ic" aria-hidden="true">' + (note ? '⚠' : '💬') + '</span>' +
-    '<div><label>気をつけること</label><div class="v">' + (note ? esc(note) : '特になし') + '</div></div>' +
-    chip(!note) + '</div>';
+  const careRow = note
+    ? open('wrow', 'note') + '<label>気をつけること</label><div class="v"><span class="none">上の黄色い枠に出しています</span></div>' + chip(false) + '</div>'
+    : '';
+  const care = note ? '' : open('wicare empty', 'note') +
+    '<span class="ic" aria-hidden="true">💬</span>' +
+    '<div><label>気をつけること</label><div class="v">特になし</div></div>' +
+    chip(true) + '</div>';
 
   // ④ 参考情報 (在庫) — 使える数を先に大きく、内訳は小さく下に
   const locLabel = c.loc_kind === 'Y' ? 'Yロケ在庫 (外に出している分)' : 'Zロケ在庫 (一時保管)';
@@ -2625,6 +2683,7 @@ function workInfoHtml(c, m, missSet) {
       wrow('期限シール', m.expiry_seal == null ? null : (m.expiry_seal ? 'あり (赤で上に出します)' : 'なし'), 'expiry_seal') +
       wrow('大きさ', sizeClassText(m.size_class), 'size_class') +
       (c.expiry ? wrow('この入荷の有効期限', esc(c.expiry), null) : '') +
+      careRow +
     '</div>' + care +
     '<div class="wigroup">参考にするもの</div>' + ref;
 }

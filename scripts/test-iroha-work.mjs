@@ -2270,6 +2270,32 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         ok(p1.json.task.when === 'tomorrow', '返ってくるカードの when が tomorrow');
         const p2 = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'today', expect_version: v(), worker_id: staffP.id } });
         ok(p2.status === 200 && p2.json.task.planned_date === today && p2.json.task.when === 'today', '「今日やる」にもできる');
+
+        // ③b 端末の職員モードは PIN を入れた職員**本人**のもの (Codex PR-A R1 #2)。別の職員の名前では使えない
+        {
+          const DBm = await import('../apps/iroha-work/db.js');
+          const staffQ = getIrohaWorker(addIrohaWorker({ displayName: '職員Q', workerType: 'staff', actor: 'test' }).id);
+          DBm.setWorkerPin(staffQ.id, '7777', 'test');
+          const stWho = await call('GET', '/api/state', { cookie });
+          ok(stWho.json.staff_mode.workerId === staffP.id, 'state の staff_mode に PIN を入れた職員の id が載る (画面が「自分のものか」を見る)');
+          const asQ = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'tomorrow', expect_version: v(), worker_id: staffQ.id } });
+          ok(asQ.status === 403 && /pin/.test(asQ.json.error || ''), '別の職員の名前で PIN なしは通らない (職員 A の PIN で職員 B の記録にならない)');
+          ok(TD.getTask(t1).when !== 'tomorrow' || TD.getTask(t1).planned_date === today, 'DB は変わらない');
+          const asQpin = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'tomorrow', expect_version: v(), worker_id: staffQ.id, pin: '7777' } });
+          ok(asQpin.status === 200 && asQpin.json.staff_mode.staff === true, '別の職員が自分の PIN を添えれば通り、端末の職員モードはその人に切り替わる');
+          ok((await call('GET', '/api/state', { cookie })).json.staff_mode.workerId === staffQ.id, '端末の職員モードの持ち主が Q になる');
+          const backP = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'today', expect_version: v(), worker_id: staffP.id } });
+          ok(backP.status === 403, '元の職員 P も、いまは Q の職員モードなので PIN なしでは通らない');
+          // 戻す (以降のテストは staffP の職員モード前提)
+          const backPpin = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'today', expect_version: v(), worker_id: staffP.id, pin: '4649' } });
+          ok(backPpin.status === 200 && (await call('GET', '/api/state', { cookie })).json.staff_mode.workerId === staffP.id, '前提の戻し: P の PIN で P の職員モードに');
+          // 誰が開けたか記録の無い古い解除 (workerId NULL) は職員モードとみなさない (fail-closed — Codex PR-A R2)
+          getDB().prepare('UPDATE f_iroha_app_devices SET staff_unlock_worker_id = NULL WHERE staff_unlock_until IS NOT NULL').run();
+          const nullUnlock = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'tomorrow', expect_version: v(), worker_id: staffP.id } });
+          ok(nullUnlock.status === 403, '持ち主の記録が無い解除では PIN なしで通らない');
+          const reunlock = await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'today', expect_version: v(), worker_id: staffP.id, pin: '4649' } });
+          ok(reunlock.status === 200 && (await call('GET', '/api/state', { cookie })).json.staff_mode.workerId === staffP.id, 'PIN を入れ直せば持ち主つきで開く');
+        }
         const p3 = await call('POST', '/api/plan', { cookie, body: { id: t1, when: null, expect_version: v(), worker_id: staffP.id } });
         ok(p3.status === 200 && p3.json.task.planned_date == null && p3.json.task.when == null, '「未定」に戻せる');
         ok((await call('POST', '/api/plan', { cookie, body: { id: t1, when: 'sometime', expect_version: v(), worker_id: staffP.id } })).status === 400, '知らない when は 400');
@@ -3294,8 +3320,24 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '写真で見分けるもの (資材・保管箱) だけ写真カード。工程・期限シール・大きさは行にする');
   ok(/1箱に <b class="num">' \+ esc\(String\(units\)\) \+ '<\/b> 個ずつ入れる/.test(html),
     '入数は保管箱とセットで読ませる (120 が総数か1箱ぶんか迷わない)');
-  ok(/miss \? '⚠ 未登録' : '<span class="none">未設定<\/span>'/.test(html) && /note \? esc\(note\) : '特になし'/.test(html),
+  ok(/miss \? '⚠ 未登録' : '<span class="none">未設定<\/span>'/.test(html) && /<div class="v">特になし<\/div>/.test(html),
     '空欄を「—」で済ませず、登録が要るもの (未登録) と なくてよいもの (未設定・特になし) を分ける');
+  // 監修 PR-A (2026-09-05)
+  ok(/上の黄色い枠に出しています/.test(html) && /const care = note \? '' : open\('wicare empty', 'note'\)/.test(html),
+    'B-9: 気をつけること は中身があるとき上の枠にだけ出す (作業情報の中は直す口の 1 行)');
+  ok(/if \(deviceStaffMode && \(!prev \|\| prev\.id !== w\.id\)\) \{\s*dropPlanCaps\(\);[^\n]*\n\s*lockDeviceStaffMode\(\);/.test(html)
+    && /renderStaffBtn\(\);\s*\}\s*function restoreWorker/.test(html),
+    'B-1/B-10: 名前を替えたら「職員モードに入る」をすぐ出し、別の人に替えたら (利用者でも別の職員でも) 職員の操作を落として端末の職員モードも終える');
+  ok(/function enforceWorkerCaps\(\)/.test(html) && /if \(enforceWorkerCaps\(\)\) dropPlanCaps\(\);/.test(html)
+    && /Number\(sm\.workerId\) === Number\(worker\.id\)/.test(html),
+    'fail-closed: 取り直しのたびに「選んでいる人の職員モードか」を見て、違えば許可を採用しない (解除が失敗しても復活しない)');
+  ok(/function lockDeviceStaffMode\(\)/.test(html) && /if \(staffLockInflight\) return staffLockInflight;/.test(html)
+    && /端末の職員モードを終われませんでした/.test(html) && /if \(j && j\.ok\) \{/.test(html),
+    '解除は同時 1 本・成功/失敗を確かめる (失敗を「終わりました」と言わない)');
+  ok(/<span class="fgroup"><span class="flabel">予定<\/span><span id="whenChips"><\/span><\/span>/.test(html) && /\.fgroup\{display:inline-flex/.test(html),
+    'B-4: 見出しとチップは 1 つの組で折り返す');
+  ok(/時間不明 ' \+ p\.unknown_hours_count \+ ' 件'/.test(html), 'B-5: 「明日の計画」バナーは時間不明を 0 分と足さない');
+  ok(/label class="cbrow"><input id="lwOrdered"/.test(html) && /\.mfields input\[type=checkbox\]\{width:24px/.test(html), 'B-3: チェックボックスは □ と文字を横並びに');
   ok(/<span class="ro">見るだけ<\/span>/.test(html) && /使えるのは ' \+ esc\(String\(c\.loc_free\)\)/.test(html),
     'Zロケ在庫は「見るだけ」の参考欄に下ろし、使える数を先に大きく出す');
 
