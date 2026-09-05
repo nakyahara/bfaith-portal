@@ -16,7 +16,7 @@ import { queueEnsureImages } from '../picking/images.js';
 import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask, finishedSessionsOfTask } from './db.js';
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
-import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, HOLD_REASONS, HOLD_LABEL, CLOSE_REASONS, CLOSE_LABEL, statusLabel } from './tasks.js';
+import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
 import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask } from './tasks-db.js';
 
 // 「急ぎ」の線引き: 在庫切れ、または残り在庫日数がこれ以下
@@ -252,10 +252,12 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       id: r.id,
       page_id: r.notion_page_id,          // Notion 時代の証跡 (詳細のリンク用。無ければ null)
       status: r.status,                   // 値 (not_started …)
-      status_label: statusLabel(r),       // 表示 (「保留 · ラベル待ち」など)
+      status_label: statusLabel(r),       // 表示 (「終了 · 棚入完了」など)
       facility_code: r.facility_code,
-      hold_reason_code: r.hold_reason_code,
-      hold_reason_note: r.hold_reason_note,
+      // ⭐止まっている理由の札 (要件 §Y-2 = 案A)。進捗とは別の軸。null = 止まっていない
+      blocked: r.blocked_reason ? { reason: r.blocked_reason, label: BLOCK_LABEL[r.blocked_reason] || r.blocked_reason,
+        note: r.blocked_note || null, at: r.blocked_at || null, by: r.blocked_by || null } : null,
+      blocked_label: blockLabel(r),
       // ⭐できた数と中断メモ (要件 §Y)。done_qty は NULL = まだ数えていない (0 と区別する)
       done_qty: r.done_qty ?? null,
       hold_memo: r.hold_memo || null,
@@ -329,8 +331,8 @@ export function buildPlan({ readOnly = false } = {}) {
   return {
     today_ymd: today,
     tomorrow_ymd: tomorrow,
-    // 予定の無い未着手だけを候補に出す。保留 (資材不足・ラベル待ち) は再開できるまで混ぜない (要件 §W)
-    candidates: cards.filter((c) => c.when == null && c.status === 'not_started').sort(comparePlanOrder),
+    // 予定の無い未着手だけを候補に出す。止まっているもの (資材不足・ラベル待ち) は札が外れるまで混ぜない (要件 §W)
+    candidates: cards.filter((c) => c.when == null && c.status === 'not_started' && !c.blocked).sort(comparePlanOrder),
     tomorrow: tomorrowCards,
     carry_over: byWhen('over'),
     totals: sumPlanHours(tomorrowCards),
@@ -401,7 +403,8 @@ export function buildTaskList({ facility = null, readOnly = false } = {}) {
     cards,
     statuses: OPEN_STATUSES.map(s => ({ value: s, label: STATUS_LABEL[s] })),
     transitions: TRANSITIONS,
-    holdReasons: HOLD_REASONS.map(v => ({ value: v, label: HOLD_LABEL[v] })),
+    // 止まっている理由 (案A)。button = 利用者が押すボタンの言い方 (「ラベルが足りない」)、label = 札の言い方 (「ラベル待ち」)
+    blockReasons: BLOCK_REASONS.map(v => ({ value: v, label: BLOCK_LABEL[v], button: BLOCK_BUTTON[v] })),
     closeReasons: CLOSE_REASONS.map(v => ({ value: v, label: CLOSE_LABEL[v] })),
     facilities: listFacilities(),
     today,

@@ -132,7 +132,7 @@ export function planImport(pages, { existingByDestination = null } = {}) {
     const props = p.props || {};
     rows.push({
       notion_page_id: p.pageId, title: p.title, legacy_status: legacy || null,
-      mapped_status: status, close_reason: m.close_reason || null, hold_reason_code: m.hold_reason || null,
+      mapped_status: status, close_reason: m.close_reason || null, blocked_reason: m.block_reason || null,   // 止まっている理由 (案A。旧 hold_reason)
       facility_code: m.facility || null,   // ⭐Notion のステータスに施設名が無ければ「未定」(要件 §W-2)
       destination_id: destinationId,
       product_code: p.productCode || null, product_name: p.title || null, qty: numOrNull(props['数量']),
@@ -155,14 +155,14 @@ export function planImport(pages, { existingByDestination = null } = {}) {
   for (const r of rows) {
     if (r.will_import) summary.willImport++; else summary.rejected++;
     if (r.migration_review) summary.needsReview++;
-    const k = r.mapped_status ? `${r.mapped_status}${r.close_reason ? ':' + r.close_reason : ''}${r.hold_reason_code ? ':' + r.hold_reason_code : ''}` : '(rejected)';
+    const k = r.mapped_status ? `${r.mapped_status}${r.close_reason ? ':' + r.close_reason : ''}${r.blocked_reason ? ' +止:' + r.blocked_reason : ''}` : '(rejected)';
     summary.byMapped[k] = (summary.byMapped[k] || 0) + 1;
     for (const w of r.warnings) { const key = w.split(':')[0]; summary.warnings[key] = (summary.warnings[key] || 0) + 1; }
   }
   return { rows, summary };
 }
 
-const CSV_COLS = ['notion_page_id', 'title', 'legacy_status', 'mapped_status', 'close_reason', 'hold_reason_code', 'facility_code', 'destination_id',
+const CSV_COLS = ['notion_page_id', 'title', 'legacy_status', 'mapped_status', 'close_reason', 'blocked_reason', 'facility_code', 'destination_id',
   'product_code', 'qty', 'arrival_date', 'mapping_confidence', 'migration_review', 'warnings', 'will_import', 'skip_reason', 'url'];
 export function planToCsv(rows) {
   const esc = (v) => { const s = v == null ? '' : (Array.isArray(v) ? v.join('|') : String(v)); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
@@ -184,7 +184,7 @@ export function applyImport(rows, { batchId = null, actor = null } = {}) {
       if (!r.will_import) { out.skipped++; continue; }
       const res = upsertTaskFromImport({
         notion_page_id: r.notion_page_id, legacy_status: r.legacy_status, status: r.mapped_status, close_reason: r.close_reason,
-        facility_code: r.facility_code, hold_reason_code: r.hold_reason_code, hold_reason_note: null,
+        facility_code: r.facility_code, blocked_reason: r.blocked_reason || null,
         destination_id: r.destination_id, product_code: r.product_code, product_name: r.product_name, qty: r.qty,
         arrival_date: r.arrival_date, ar_no: r.ar_no, barcode: r.barcode, expiry: r.expiry, supplier: r.supplier, handling: r.handling,
         master_snapshot: r.master_snapshot, payload: r.payload, started_at: r.started_at, ready_at: r.ready_at, closed_at: r.closed_at,

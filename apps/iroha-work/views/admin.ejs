@@ -92,7 +92,8 @@
         <tr><th>tasks の件数</th><td>
           <% const bs = migration.counts.byStatus || {}; %>
           合計 <%= migration.counts.total %>
-          (未着手 <%= bs.not_started || 0 %> / 作業中 <%= bs.in_progress || 0 %> / 保留 <%= bs.on_hold || 0 %> / 棚入待ち <%= bs.ready_for_stocking || 0 %> / 終了 <%= bs.closed || 0 %>)
+          (未着手 <%= bs.not_started || 0 %> / 作業中 <%= bs.in_progress || 0 %> / 棚入待ち <%= bs.ready_for_stocking || 0 %> / 終了 <%= bs.closed || 0 %>
+          ・ うち ⛔ 止まっている <%= migration.counts.blocked || 0 %>)
         </td></tr>
         <tr><th>要確認</th><td><%= migration.review %> 件 (取込時に状態を推定 / 取消の要確認)</td></tr>
         <tr><th>孤立 (task に紐づかない)</th><td>作業時間 <%= migration.orphans.sessions.length %> ページ / 写真 <%= migration.orphans.media.length %> ページ</td></tr>

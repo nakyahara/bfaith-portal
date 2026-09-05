@@ -28,11 +28,13 @@ export const CAP = Object.freeze({
   // ⭐計画は職員だけ (要件 §W-1)。「いつやるか」と「どこが作業するか」を決めるのは職員の仕事で、
   //   利用者はボードで見るだけ。許可が無ければ札もボタンにせず、明日の計画の入口も描かない
   FACILITY_ASSIGN: 'task.facility.assign',
+  /** ⛔ 止まった / 札を外す (案A 2026-09-05)。利用者が押す */
+  BLOCK: 'task.block',
 });
 
 const CAPS_NOTION = Object.freeze([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT]);
 const CAPS_APP = Object.freeze([...CAPS_NOTION, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR,
-  CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED]);
+  CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED, CAP.BLOCK]);
 /** ⭐職員のときだけ足す = 計画 (いつ / どこが)。利用者の画面には札のボタンも計画の入口も描かない */
 const CAPS_STAFF = Object.freeze([CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN]);
 const CAPS_PREVIEW = Object.freeze([]);
