@@ -84,7 +84,18 @@ function readCookie(req, name) {
 function staffModeOf(req) {
   if (hasSessionAccess(req)) return { staff: true, until: null, via: 'session' };
   const u = req.iwDevice ? staffUnlockOf(req.iwDevice.id) : null;
-  return u ? { staff: true, until: u.until, via: 'device' } : { staff: false };
+  // workerId = PIN を入れた職員。端末の職員モードは**その人**のもの (別の職員の名前では使わせない — Codex PR-A R1 #2)
+  return u ? { staff: true, until: u.until, via: 'device', workerId: u.workerId ?? null } : { staff: false };
+}
+/**
+ * その人にとって職員モードか。ポータルの人は常に職員。端末の職員モードは PIN を入れた職員本人のときだけ
+ * (職員 A の PIN のまま職員 B の名前で記録が付かないように)。記録が無い古い解除 (workerId 無し) は誰でも通す
+ */
+function staffModeFor(req, worker) {
+  const sm = staffModeOf(req);
+  if (!sm.staff) return sm;
+  if (sm.via === 'device' && sm.workerId && worker && Number(worker.id) !== Number(sm.workerId)) return { staff: false, other: true };
+  return sm;
 }
 
 /**
@@ -93,7 +104,7 @@ function staffModeOf(req) {
  */
 function planGuardOf(req, worker) {
   return () => {
-    if (!staffModeOf(req).staff) return { ok: false, error: 'staff_required', message: '職員モードが切れました (PINを入れ直してください)' };
+    if (!staffModeFor(req, worker).staff) return { ok: false, error: 'staff_required', message: '職員モードが切れました (PINを入れ直してください)' };
     if (hasSessionAccess(req)) return null;   // ポータルの人は名簿の状態に関係なく職員
     const now = getIrohaWorker(worker.id);
     if (!now || !now.active || now.worker_type !== 'staff') {
@@ -113,9 +124,10 @@ function planGuardOf(req, worker) {
 function requireStaffPlan(req) {
   const w = resolveWorker(req);
   if (w.error) return { ok: false, status: 400, body: { ok: false, error: 'worker_required', message: w.error } };
-  const mode = staffModeOf(req);
   // ⭐職員モード中でも、記録に残る「やった人」が職員でなければ通さない。
-  //   そうしないと、職員が開けた端末で利用者の名前を選び「利用者が計画を決めた」記録になる (Codex P1 R1)
+  //   そうしないと、職員が開けた端末で利用者の名前を選び「利用者が計画を決めた」記録になる (Codex P1 R1)。
+  //   端末の職員モードは PIN を入れた職員本人にだけ効く。別の職員なら、その人の PIN を受けて開け直す (Codex PR-A R1 #2)
+  const mode = staffModeFor(req, w.worker);
   if (mode.staff && (mode.via === 'session' || w.worker.worker_type === 'staff')) {
     return { ok: true, worker: w.worker, staffUntil: mode.until };
   }
@@ -768,7 +780,7 @@ router.post('/api/unblock', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  if (!staffModeOf(req).staff) {
+  if (!staffModeFor(req, w.worker).staff) {
     return res.status(403).json({ ok: false, error: 'staff_required', message: '札を手で外せるのは職員だけです (職員モードに入ってください)。作業を始めるなら「▶ 作業をはじめる」から外せます' });
   }
   const unblockTaskId = parseTaskId(req.body?.id ?? req.body?.task_id);

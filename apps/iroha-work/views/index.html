@@ -58,7 +58,7 @@
   .flabel{font-size:.72rem;color:var(--faint);font-weight:700;letter-spacing:.12em;font-family:var(--num)}
   /* 見出し + チップの組。組ごとに折り返す (見出しだけ前の行に残さない — 監修 B-4) */
   .fgroup{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
-  .fgroup>span:not(.flabel){display:inline-flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .fgroup>span:not(.flabel):not(.seg){display:inline-flex;gap:8px;flex-wrap:wrap;align-items:center}   /* .seg (進捗|拠点) は連結ボタンなので隙間を入れない */
   .chip{border:1px solid var(--line);background:var(--surface);color:var(--sub);border-radius:var(--r);
     padding:8px 14px;font-weight:700;font-size:.92rem;cursor:pointer;display:inline-flex;gap:8px;align-items:center}
   .chip .num{color:var(--faint);font-weight:600}
@@ -997,18 +997,17 @@ function pickWorker(id) {
   if (!w) return;
   // 端末の職員モード (PIN で開けた 30 分) が生きているか。ポータルから入っている人 (via=session) は対象外
   const deviceStaffMode = !!(state.staff_mode && state.staff_mode.staff && state.staff_mode.via !== 'session');
+  const prev = worker;
   worker = w;
   try { localStorage.setItem('iw_worker_id', String(id)); } catch (e) { /* プライベートモード等 */ }
   $('#whoBtn').textContent = '👤 ' + w.display_name + (w.worker_type === 'staff' ? ' (職員)' : '') + ' ▾';
   $('#gate').classList.remove('on');
-  // ⭐職員モードは端末に 30 分残る。名前を利用者に替えたら、その場で職員の操作 (計画・どこが/いつ) を画面から落とし、
-  //   端末の職員モードも終える — 利用者の画面に「明日の計画を立てる」や押せる札が残っていた (監修 B-10)。
-  //   「名前の切り替え = 職員モード終了」。職員に戻すときはもう一度 PIN
-  if (w.worker_type !== 'staff' && deviceStaffMode) {
-    dropPlanCaps();
-    apiFetch('/api/staff-lock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
-      .then(() => loadState()).catch(() => { /* 画面側は既に落としてある。次の取り直しで揃う */ });
-    toast('職員モードを終わりました (利用者に切り替えたため)');
+  // ⭐職員モードは端末に 30 分残るが、それは PIN を入れた**その人**のもの。名前が替わったら終える —
+  //   利用者に替えたのに「明日の計画を立てる」や押せる札が残る (監修 B-10)、職員 A の PIN のまま職員 B の名前で
+  //   記録が付く (Codex PR-A R1 #2) のどちらも防ぐ。「名前の切り替え = 職員モード終了」。続けるならもう一度 PIN
+  if (deviceStaffMode && (!prev || prev.id !== w.id)) {
+    dropPlanCaps();          // 先に画面から落とす (応答を待つ間も利用者に職員の操作を見せない)
+    lockDeviceStaffMode();   // 端末の職員モードを終える。失敗しても画面は落としたまま (fail-closed)
   }
   // 職員を選んだら「🔑 職員モードに入る」をすぐ出す (60 秒の取り直しを待たせない — 監修 B-1)
   renderStaffBtn();
@@ -1175,6 +1174,8 @@ async function loadStateOnce() {
   }
   if (!stateCan('task.facility.assign') && facPickCtx) closeFacPick();
   restoreWorker();
+  // ⭐選んでいるのが利用者なら、端末の職員モードが生きていても職員の許可は採用しない (Codex PR-A R1 #1)
+  if (enforceWorkerCaps()) dropPlanCaps();
   // 開いている詳細を追いかける。一覧・ボードのものは state から、下見・履歴のものは取り直す
   //   (取込や他の端末の操作で中身が変わる。「いまのアプリの記録」と書いている以上、古いまま置かない — Codex PR1 R2)
   if (curDetail && detailSrc === 'preview') {
@@ -1810,6 +1811,40 @@ function dropPlanCaps() {
   renderList();
   renderBoard();
   if (curDetail && detailCard) renderDetail(detailCard, { keepScroll: true });
+}
+
+/**
+ * ⭐端末の職員モードは「選んでいる人が職員のとき」だけ採用する (fail-closed — Codex PR-A R1 #1)。
+ * /api/state は端末の職員モードが生きていれば計画の許可を返すが、いま選んでいるのが利用者なら、
+ * その許可は画面に出さず、端末の職員モードを終える要求を (まだなら) 送る。
+ * @returns true = 許可を落とす必要があった (呼び元が dropPlanCaps() で描き直す)
+ */
+let staffLockInflight = null;
+function enforceWorkerCaps() {
+  const sm = state.staff_mode || {};
+  if (!sm.staff || sm.via === 'session' || !worker) return false;
+  // 利用者を選んでいる / PIN を入れたのとは別の職員を選んでいる → その人の職員モードではない
+  const mine = worker.worker_type === 'staff' && (!sm.workerId || Number(sm.workerId) === Number(worker.id));
+  if (mine) return false;
+  lockDeviceStaffMode();
+  return true;
+}
+/** 端末の職員モードを終える (同時に 1 本)。成功・失敗を確かめ、失敗したら知らせる (黙って「終わりました」と言わない) */
+function lockDeviceStaffMode() {
+  if (staffLockInflight) return staffLockInflight;
+  staffLockInflight = apiFetch('/api/staff-lock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then((j) => {
+      if (j && j.ok) {
+        if (j.staff_mode) state.staff_mode = j.staff_mode;
+        hideErr('stafflock');
+        toast('職員モードを終わりました (名前を切り替えたため)');
+      } else {
+        // 画面の許可は落としたまま。次の取り直しでも enforceWorkerCaps が再び落とし、解除を再送する
+        showErr('端末の職員モードを終われませんでした', (j && j.message) || 'つながったら自動でやり直します。続くときは職員の方に知らせてください', 'stafflock');
+      }
+    })
+    .finally(() => { staffLockInflight = null; });
+  return staffLockInflight;
 }
 
 async function endStaffMode() {
