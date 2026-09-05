@@ -91,20 +91,34 @@ check('T6 dry-run 後も work ファイルが残らない', noTmp());
   check('T7b 衝突後も work / tmp が残らない', noTmp());
 }
 
-// ── T8: manifest 末尾が壊れていても直前の正しい行を読む ──
+// ── T8: manifest 末尾が壊れていても直前の正しい行を読み、次の追記で壊れた末尾を切り詰める ──
 {
   const mfPath = path.join(dest, 'manifest.jsonl');
-  fs.appendFileSync(mfPath, '{"archived_at":"2026-09-05T11:0'); // 書き込み途中でクラッシュした行
+  const linesBefore = manifestLines();
+  fs.appendFileSync(mfPath, '{"archived_at":"2026-09-05T11:0'); // 書き込み途中でクラッシュした行 (改行なし)
   const last = readLastManifest(dest);
   check('T8 壊れた末尾行を飛ばして直前の行を返す', last && last.file === '2026/09/zaiko_20260905_2000.csv.gz', JSON.stringify(last));
-  const content = fs.readFileSync(mfPath, 'utf-8');
-  fs.writeFileSync(mfPath, content.slice(0, content.lastIndexOf('{')));
+  // 壊れた末尾のまま次のスナップショットを保存 → 新しい行が壊れた行に連結されず、全行が有効な JSON になる
+  writeCsv([11, 12], jst(2026, 9, 5, 21, 0));
+  const r8 = await archiveSnapshot({ csv, dest, now: jst(2026, 9, 5, 21, 5), noOffsite: true, log: quiet });
+  const all = fs.readFileSync(mfPath, 'utf-8').split('\n').filter(Boolean);
+  const allValid = all.every((l) => { try { JSON.parse(l); return true; } catch { return false; } });
+  check('T8 壊れた末尾の後の追記で全行が有効な JSON (壊れた行は捨てられる)', r8.code === 'archived' && allValid && all.length === linesBefore + 1, `lines=${all.length} before=${linesBefore} valid=${allValid}`);
+  check('T8 末尾行は新しいスナップショット', JSON.parse(all[all.length - 1]).file === '2026/09/zaiko_20260905_2100.csv.gz');
+  // 正しい末尾行に改行が無いだけのケース → 改行を足して追記 (行は失われない)
+  const cur = fs.readFileSync(mfPath, 'utf-8');
+  fs.writeFileSync(mfPath, cur.replace(/\n$/, ''));
+  writeCsv([13], jst(2026, 9, 5, 21, 30));
+  await archiveSnapshot({ csv, dest, now: jst(2026, 9, 5, 21, 35), noOffsite: true, log: quiet });
+  const all2 = fs.readFileSync(mfPath, 'utf-8').split('\n').filter(Boolean);
+  check('T8 改行無しの正しい末尾行は残して追記 (行数 +1)', all2.length === all.length + 1 && all2.every((l) => { try { JSON.parse(l); return true; } catch { return false; } }), `lines=${all2.length}`);
 }
 
 // ── T9: 世代管理 — 90 日より古い日は最後の 1 本だけ残す。境界日 (ちょうど 90 日前) は全部残す ──
 {
   const mk = (y, m, d, hm) => { const dir = path.join(dest, String(y), String(m).padStart(2, '0')); fs.mkdirSync(dir, { recursive: true }); const f = path.join(dir, `zaiko_${y}${String(m).padStart(2, '0')}${String(d).padStart(2, '0')}_${hm}.csv.gz`); fs.writeFileSync(f, 'x'); return f; };
-  const now = jst(2026, 9, 5, 20, 5);
+  const now = jst(2026, 9, 5, 22, 5);
+  const todayBefore = listSnapshots(dest).filter((s) => s.day === '20260905').length;
   const old = [mk(2026, 5, 1, '0900'), mk(2026, 5, 1, '1200'), mk(2026, 5, 1, '1800'), mk(2026, 5, 2, '0900'), mk(2026, 5, 2, '1000')];
   const boundaryDay = jstStamp(new Date(now.getTime() - 90 * 86400000)).ymd; // 2026-06-07
   const bY = boundaryDay.slice(0, 4), bM = boundaryDay.slice(4, 6), bD = boundaryDay.slice(6, 8);
@@ -113,7 +127,7 @@ check('T6 dry-run 後も work ファイルが残らない', noTmp());
   check('T9 5/1 は 0900・1200 が消え 1800 が残る', !fs.existsSync(old[0]) && !fs.existsSync(old[1]) && fs.existsSync(old[2]));
   check('T9 5/2 は 0900 が消え 1000 が残る', !fs.existsSync(old[3]) && fs.existsSync(old[4]));
   check('T9 境界日 (90 日前ちょうど) は両方残る', boundary.every((f) => fs.existsSync(f)));
-  check('T9 今日 (9/5) の毎時ファイルは全部残る', listSnapshots(dest).filter((s) => s.day === '20260905').length === 3);
+  check('T9 今日 (9/5) の毎時ファイルは全部残る', listSnapshots(dest).filter((s) => s.day === '20260905').length === todayBefore && todayBefore >= 3, String(todayBefore));
   check('T9 削除件数 = 3', removed.length === 3, String(removed.length));
   const again = pruneHourly(dest, { now, keepHourlyDays: 90 });
   check('T9 2 回目は何も消さない (冪等)', again.length === 0);

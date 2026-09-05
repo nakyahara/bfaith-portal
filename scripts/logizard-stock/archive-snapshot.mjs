@@ -119,6 +119,26 @@ function manifestHas(dest, relFile) {
   return fs.readFileSync(mf, 'utf-8').split(/\r?\n/).some((l) => { try { return JSON.parse(l).file === relFile; } catch { return false; } });
 }
 
+/**
+ * manifest に 1 行追記。末尾が壊れている (書き込み途中でクラッシュ = 改行無しの途中 JSON) ときは
+ * その壊れた末尾を切り詰めてから追記する (新しい行が壊れた行に連結されて無効になるのを防ぐ、Codex R2)
+ */
+function appendManifest(dest, rec) {
+  const mf = path.join(dest, 'manifest.jsonl');
+  if (fs.existsSync(mf)) {
+    const cur = fs.readFileSync(mf, 'utf-8');
+    if (cur.length && !cur.endsWith('\n')) {
+      const cut = cur.lastIndexOf('\n');
+      const tail = cur.slice(cut + 1);
+      let valid = false;
+      try { JSON.parse(tail); valid = true; } catch {}
+      // 末尾行が正しい JSON なら改行だけ足す、壊れていれば捨てる
+      fs.writeFileSync(mf, valid ? cur + '\n' : cur.slice(0, cut + 1));
+    }
+  }
+  fs.appendFileSync(mf, JSON.stringify(rec) + '\n');
+}
+
 /** dest 配下の zaiko_*.csv.gz を列挙 (snapshot 日付つき) */
 export function listSnapshots(dest) {
   const out = [];
@@ -252,12 +272,21 @@ export async function archiveSnapshot(opts = {}) {
       gzBytes = fs.statSync(outFile).size; code = 'exists_same';
       log(`already archived (同名同内容): ${relFile}`);
     } else {
-      gzBytes = await gzipVerified(work, outFile, sha);
-      log(`archived: ${relFile} (rows=${rows}, ${(bytes / 1048576).toFixed(2)}MB → ${(gzBytes / 1024).toFixed(0)}KB)`);
+      try {
+        gzBytes = await gzipVerified(work, outFile, sha);
+        log(`archived: ${relFile} (rows=${rows}, ${(bytes / 1048576).toFixed(2)}MB → ${(gzBytes / 1024).toFixed(0)}KB)`);
+      } catch (e) {
+        // 存在確認と rename の間に別プロセス (手動実行との重なり) が同名を作ったとき、Windows の rename は失敗する。
+        // 既存が同内容なら成功扱い、別内容なら衝突 (Codex R2)
+        if (!fs.existsSync(outFile)) throw e;
+        const v = await sha256Gunzip(outFile);
+        if (v.sha !== sha) throw Object.assign(new Error(`同名の履歴 ${relFile} が別内容で存在 (既存 ${v.bytes} bytes)。手で確認して退避してから再実行`), { code: 'COLLISION' });
+        gzBytes = fs.statSync(outFile).size; code = 'exists_same';
+        log(`already archived by another run (同名同内容): ${relFile}`);
+      }
     }
     if (!manifestHas(dest, relFile)) {
-      const rec = { archived_at: now.toISOString(), snapshot_at: stamp.iso, file: relFile, rows, bytes, gz_bytes: gzBytes, sha256: sha, source_mtime: mtimeIso };
-      fs.appendFileSync(path.join(dest, 'manifest.jsonl'), JSON.stringify(rec) + '\n');
+      appendManifest(dest, { archived_at: now.toISOString(), snapshot_at: stamp.iso, file: relFile, rows, bytes, gz_bytes: gzBytes, sha256: sha, source_mtime: mtimeIso });
     }
 
     const pruned = pruneHourly(dest, { now, keepHourlyDays });
