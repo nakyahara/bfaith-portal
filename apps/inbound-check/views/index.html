@@ -269,6 +269,8 @@
     </div>
     <div class="ctl">
       <button type="button" class="btn-reload" id="reloadBtn">🔄 更新</button>
+      <!-- 🚚 予定していない納品をロジザードに入れた直後に押す (定時 08:40/11:45 を待たない) -->
+      <button type="button" class="btn-reload" id="refreshBtn" style="display:none">🚚 いま取りに行く</button>
       <button type="button" class="btn-reload" id="notionBtn">🗂 Notionへ送る</button>
       <div class="seg">
         <button type="button" data-filter="todo" class="on">残りあり</button>
@@ -278,7 +280,7 @@
     </div>
   </div>
   <div class="banner" id="banner"></div>
-  <div class="legend">凡例: 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り<br><b>[数量を数える]</b> = 箱数やバラを入れる (＋1箱もここ) ／ <b>[全部あり]</b> = 予定数が全部そろった ／ <b>[🏷 シール発行]</b> = 倉庫PCの QL-700 から値札 (BCシール) を出す (貼付必要の商品だけ。❓結果不明のときは実物を見てから) ／ 商品名をタップすると入数やいろはの設定を直せます ／ <a href="/apps/inbound-check/guide">📖 くわしい使い方</a></div>
+  <div class="legend">凡例: <b>[🚚 いま取りに行く]</b> = 予定になかった納品をロジザードに入れた直後に押す (30〜60秒で一覧に出ます) / 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り<br><b>[数量を数える]</b> = 箱数やバラを入れる (＋1箱もここ) ／ <b>[全部あり]</b> = 予定数が全部そろった ／ <b>[🏷 シール発行]</b> = 倉庫PCの QL-700 から値札 (BCシール) を出す (貼付必要の商品だけ。❓結果不明のときは実物を見てから) ／ 商品名をタップすると入数やいろはの設定を直せます ／ <a href="/apps/inbound-check/guide">📖 くわしい使い方</a></div>
   <div class="wrap" id="list"></div>
   <div class="foot"><a href="/apps/inbound-check/done">📋 完了一覧</a> ・ <a href="/apps/inbound-check/guide">📖 使い方</a> ・ <a href="/apps/inbound-check/admin">管理画面 (取込・端末)</a> ・ <a href="/">ポータル</a></div>
 
@@ -401,6 +403,7 @@
           lastJson = s;
           state = j;
           render();
+          renderRefresh();   // 🚚「いま取りに行く」の進み具合 (他の iPad が押した分もここに出る)
         }
         // 最新の一覧を取得できた = 旧バッチ警告と通信エラーは解除
         if (stale) { stale = false; banner(null); }
@@ -1864,6 +1867,55 @@
       } catch (e) {
         msgEl.textContent = '送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2枚にはなりません)';
         $('#printOk').disabled = false;
+      }
+    });
+
+    // ─────────── 🚚 いま入荷を取りに行く (予定外の納品) ───────────
+    // 押すと miniPC がロジザードから入荷受付CSVを出し直し、それを取り込んで一覧が入れ替わる。
+    // 全体で30〜60秒かかるので**送信はすぐ返り**、進み具合は5秒ポーリングの /api/state で見る。
+    // 他の iPad が押した分も同じ表示になる (同時に何本も走らせない)
+    let refreshSeen = '';
+    function renderRefresh() {
+      const rf = state.refresh;
+      const btn = $('#refreshBtn');
+      if (!btn) return;
+      // miniPC を呼べない環境ではボタンを出さない (押しても出ないボタンを見せない)
+      if (!rf || !rf.configured) { btn.style.display = 'none'; return; }
+      btn.style.display = '';
+      const running = rf.state === 'running';
+      btn.disabled = running;
+      btn.textContent = running ? '🚚 取りに行っています…' : '🚚 いま取りに行く';
+      const key = (rf.startedAt || '') + ':' + (rf.state || '') + ':' + (rf.message || '');
+      if (key === refreshSeen) return;
+      refreshSeen = key;
+      if (running) { banner('warn', '🚚 ' + esc(rf.message || 'ロジザードに取りに行っています') + '…', { sticky: true }); return; }
+      // 終わった知らせは押した直後だけ出す (前に誰かが押した結果を毎回見せない)
+      const fresh = rf.finishedAt && (Date.now() - Date.parse(rf.finishedAt) < 120000);
+      if (!fresh) return;
+      if (rf.state === 'done') banner('ok', '🚚 ' + esc(rf.message || '取り込みました'), { sticky: true });
+      else if (rf.state === 'failed') banner('err', '🚚 ' + esc(rf.message || '取りに行けませんでした'), { sticky: true });
+    }
+
+    $('#refreshBtn').addEventListener('click', async () => {
+      const b = $('#refreshBtn');
+      b.disabled = true;
+      banner('warn', '🚚 ロジザードに取りに行っています… (30〜60秒かかります)', { sticky: true });
+      try {
+        const r = await postJson(API + '/refresh-now', { worker_code: workerCode() || undefined });
+        const j = r.json || {};
+        if (r.status === 401) { location.href = '/login'; return; }
+        if (!j.ok) {
+          if (j.error === 'worker_required') { openWorkerPick(); banner('warn', '作業者を選んでからもう一度押してください'); }
+          else banner('err', '🚚 ' + esc(j.message || j.error || ('HTTP ' + r.status)), { sticky: true });
+          b.disabled = false;
+          return;
+        }
+        // 走り出した。ここから先は /api/state の refresh を見て表示する
+        if (j.run) { state.refresh = { ...j.run, configured: true }; lastJson = ''; }
+        load();
+      } catch (e) {
+        banner('err', '🚚 送信できませんでした (' + esc(e.message) + ')', { sticky: true });
+        b.disabled = false;
       }
     });
 

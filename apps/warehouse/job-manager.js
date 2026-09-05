@@ -13,7 +13,7 @@ const CLEANUP_INTERVAL = 10 * 60 * 1000; // 10分ごと
 const MAX_AGE = 60 * 60 * 1000;          // 1時間
 
 bootNote('job-manager', `cleanup-interval 登録 (every ${CLEANUP_INTERVAL}ms)`);
-setInterval(() => {
+const _cleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs) {
     if (now - job.createdAt > MAX_AGE) {
@@ -21,6 +21,10 @@ setInterval(() => {
     }
   }
 }, CLEANUP_INTERVAL);
+// 掃除のタイマーだけでプロセスを生かし続けない。常駐サーバーは listen しているソケットが
+// イベントループを保つので動きは変わらず、CLI やテストからこのモジュールを読んだときに
+// 終わらなくなるのを防ぐ
+_cleanupTimer.unref?.();
 
 /**
  * ジョブを作成して非同期で実行する

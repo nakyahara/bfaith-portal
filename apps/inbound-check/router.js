@@ -28,6 +28,8 @@ import {
   listWorkers, getWorker,
 } from './db.js';
 import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProductMaster } from './drive-fetch.js';
+// 🚚 予定外の納品を今すぐ iPad に出す (miniPC にロジザードから CSV を出し直させて取り込む)
+import { startRefresh, refreshState, refreshConfigured } from './logizard-refresh.js';
 import { runNotionSweep, notionStatusForAdmin, resetNotionRow } from './notion-sync.js';
 import {
   parseWorkMasterXlsx, applyWorkMaster, logWorkMasterImport,
@@ -318,6 +320,8 @@ router.get('/api/state', api((req, res) => {
     ok: true,
     ...state,
     print_agents: agents.map(a => ({ id: a.id, label: a.label, printer_name: a.printer_name, online: a.online, bpac: a.bpac, paper_ok: a.paper_ok })),
+    // 🚚 「いま取りに行く」の進み具合 (押した後の表示はこれを5秒ポーリングで見る)
+    refresh: refreshState(),
     workers: listWorkers(false),
     me: { session: req.icUser || null, device: req.icDevice ? { id: req.icDevice.id, label: req.icDevice.label } : null, admin: isAdmin(req) },
   });
@@ -350,6 +354,26 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
 // 印刷できる倉庫PC (出力先) の一覧。2台以上あるときは iPad がここから選ぶ
 router.get('/api/print/targets', api((req, res) => {
   res.json({ ok: true, max_copies: MAX_COPIES, agents: listPrintAgents() });
+}));
+
+// ─── 🚚 いま入荷を取りに行く (予定外の納品をロジザードに入れた直後に押す) ───
+// 中原さん 2026-09-05:「予定してない納品が来たりした場合にこの iPad に入れたい」。
+// 定時 (08:40 / 11:45) を待たず、miniPC にロジザードから CSV を出し直させて取り込む。
+// ⭐**すぐ返す**。全体で30〜60秒かかるので、進み具合は /api/state の refresh を見てもらう
+//   (iPad の送信は4秒で打ち切る作りなので、ここで待たせると必ず中断する)
+router.post('/api/refresh-now', checkOrigin, api((req, res) => {
+  let actor;
+  if (req.icDevice) {
+    // 誰が押したかを残す (現場の端末は共用なので作業者を必須にする — Notion送信と同じ規約)
+    const w = resolveWorker(req);
+    if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+    actor = `device:${req.icDevice.label}/${w.worker}`;
+  } else {
+    actor = req.session?.email || 'portal';
+  }
+  const r = startRefresh({ actor });
+  const status = r.ok ? 200 : (r.error === 'cooldown' ? 429 : 503);
+  res.status(status).json(r);
 }));
 
 function resolveWorker(req) {
@@ -748,6 +772,8 @@ router.get('/admin', requireSession, api(async (req, res) => {
     drive,
     notion,
     workMaster,
+    // 🚚 「いま取りに行く」が使える環境か (miniPC を呼べる資格情報があるか)
+    refreshAvailable: refreshConfigured(),
   });
 }));
 
