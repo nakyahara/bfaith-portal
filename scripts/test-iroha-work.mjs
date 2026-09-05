@@ -3312,7 +3312,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // ダイアログ: 役割・見出しとの関連付け・背景固定・フォーカスの戻し (Codex R1)
   ok(/role="dialog" aria-modal="true" aria-labelledby="mvTitle"/.test(html), 'ダイアログとして扱われる (読み上げ)');
   ok(/body\.modal-open\{position:fixed/.test(html) && /document\.body\.classList\.add\('modal-open'\)/.test(html), '開いている間は背景を固定する');
-  ok(/window\.scrollTo\(0, overlayScrollY\)/.test(html) && /overlayReturn\.focus\(\)/.test(html), '閉じたら元の位置とフォーカスに戻す');
+  ok(/window\.scrollTo\(0, entry \? entry\.scrollY : overlayScrollY\)/.test(html) && /focusBack\(entry \? entry\.ret : overlayReturn\)/.test(html),
+    '閉じたら元の位置とフォーカスに戻す (重ねたダイアログでもダイアログごとの戻り先 — Codex PR #1197 R2)');
   ok(/if \(e\.key !== 'Tab'\) return;/.test(html), 'Tab はダイアログの中で回る');
   ok(/aria-pressed=/.test(html) && /role="group" aria-label="資材の候補"/.test(html), 'どれを選んでいるかが支援技術にも伝わる');
   ok(/\.optnew\{[^}]*grid-column:1\/-1/.test(html), '新しく登録の欄は横いっぱいに出る');
@@ -3353,8 +3354,12 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const pin = await ask\(\{ title: '🔑 職員モードに入る'/.test(html) && /input: 'pin'/.test(html), '職員PIN も ask (数字キーボード)');
   ok(/reopenReason = await ask\(\{[^\n]*required: true/.test(html), '終了から戻す理由は必須のまま (空では通さない)');
   ok(/if \(\$\('#askOv'\)\.classList\.contains\('on'\)\) \{ askDone\(false\); return; \}/.test(html), 'Esc は確認ダイアログだけ閉じる (下のダイアログは残す)');
-  ok(/const ov = \$\('#askOv'\)\.classList\.contains\('on'\) \? \$\('#askOv'\) : document\.querySelector\('\.overlay\.on'\);/.test(html)
-    && /askOpts\._prevFocus = document\.activeElement;/.test(html), 'ask が別ダイアログの上でも Tab とフォーカスの戻り先が正しい (Codex R1 #5)');
+  ok(/const ov = \$\('#askOv'\)\.classList\.contains\('on'\) \? \$\('#askOv'\) : document\.querySelector\('\.overlay\.on'\);/.test(html),
+    'Tab はいちばん上の ask の中で回す (Codex R1 #5)');
+  ok(/const overlayStack = \[\];/.test(html) && /overlayStack\.push\(\{ sel, ret: document\.activeElement, scrollY \}\);/.test(html)
+    && /const entry = i >= 0 \? overlayStack\.splice\(i, 1\)\[0\] : null;/.test(html) && /window\.scrollTo\(0, entry \? entry\.scrollY : overlayScrollY\);/.test(html),
+    'ダイアログの戻り先・スクロール位置はダイアログごとにスタックで持つ (重ねても全部閉じたあと元の場所へ戻る — Codex R2)');
+  ok(!/_prevFocus/.test(html), 'ask 側の自前の戻し (_prevFocus) は無い (二重管理しない)');
   ok(/\.tbl\.member th:nth-child\(7\),\.tbl\.member td:nth-child\(7\),/.test(html) && !/nth-child\(n\+7\)/.test(html), 'ラベル待ちの表: 貼り直し (8 列目) は利用者にも見せる (Codex R1 #3)');
   ok(/if \(await askStaffUnlock\(\)\) \{ await loadState\(\); return saveLw\(\); \}/.test(html), 'ラベル待ちの保存で職員の門に断られたら PIN → 保存し直し');
   ok(!/onclick="openMaster/.test(html) && /data-reg="/.test(html), '作業のやり方は項目タップで変更 (編集ボタンなし)');

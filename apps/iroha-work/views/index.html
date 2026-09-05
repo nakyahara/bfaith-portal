@@ -1964,8 +1964,7 @@ function ask(o) {
     $('#askCancel').textContent = askOpts.cancel || 'やめる';
     $('#askOk').classList.toggle('warn', !!askOpts.danger);
     $('#askMsg').textContent = '';
-    askOpts._prevFocus = document.activeElement;   // 下のダイアログに戻すため (openOverlay の戻り先は 1 つしか持てない — Codex R1 #5)
-    openOverlay('#askOv');
+    openOverlay('#askOv');   // 戻り先は openOverlay/closeOverlay のスタックが持つ (別のダイアログの上に重ねても壊れない)
     if (askOpts.input) setTimeout(() => { try { inp.focus(); } catch (e) { /* 出せなくてもよい */ } }, 60);
   });
 }
@@ -1980,9 +1979,7 @@ function askDone(ok) {
     value = v;
   }
   askResolve = null; askOpts = null;
-  closeOverlay('#askOv');
-  // 下にダイアログが残っているときは closeOverlay が戻り先を戻さない → 開く前の要素へ自分で戻す
-  if (document.querySelectorAll('.overlay.on').length > 0) { try { if (o._prevFocus && o._prevFocus.focus) o._prevFocus.focus(); } catch (e) { /* 消えていれば何もしない */ } }
+  closeOverlay('#askOv');   // 下にダイアログが残っていれば、その中の元の要素へ戻る (スタック)
   r(value);
 }
 $('#askIn').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); askDone(true); } });
@@ -3400,12 +3397,24 @@ $('#mvSealOpts').addEventListener('click', (e) => {
 // ─── ダイアログの開け閉め (背景を止める・元の場所へフォーカスを戻す・Tab を中に閉じ込める) ───
 let overlayReturn = null;      // 開く前にフォーカスしていた要素
 let overlayScrollY = 0;
+/**
+ * 開いているダイアログのスタック (下から順)。戻り先のフォーカスとスクロール位置をダイアログごとに持つ —
+ * ask を別のダイアログの上に重ねると 1 変数では上書きされ、全部閉じたあと「閉じたダイアログの中」へ戻ろうとし、
+ * スクロール位置も 0 (body を固定している間の値) に飛んでいた (Codex PR #1197 R2)
+ */
+const overlayStack = [];
 function openOverlay(sel) {
   const ov = $(sel);
+  const first = document.querySelectorAll('.overlay.on').length === 0;
+  // 2 つ目以降は body が固定されていて window.scrollY が 0 → 下のダイアログが覚えている位置を引き継ぐ
+  const scrollY = first ? window.scrollY : (overlayStack.length ? overlayStack[overlayStack.length - 1].scrollY : overlayScrollY);
+  overlayStack.push({ sel, ret: document.activeElement, scrollY });
   overlayReturn = document.activeElement;
-  overlayScrollY = window.scrollY;
-  document.body.style.top = (-overlayScrollY) + 'px';
-  document.body.classList.add('modal-open');
+  overlayScrollY = scrollY;
+  if (first) {
+    document.body.style.top = (-scrollY) + 'px';
+    document.body.classList.add('modal-open');
+  }
   ov.classList.add('on');
   ov.scrollTop = 0;
   // フォーカスがダイアログの外に残っていると最初の Tab で背景へ抜ける。中へ移しておく
@@ -3417,11 +3426,20 @@ function openOverlay(sel) {
 }
 function closeOverlay(sel) {
   $(sel).classList.remove('on');
-  if (document.querySelectorAll('.overlay.on').length > 0) return;   // 別のダイアログが開いていれば戻さない
+  // 自分のぶんをスタックから外す (順不同で閉じられても残りの戻り先を壊さない)
+  const i = overlayStack.map((e) => e.sel).lastIndexOf(sel);
+  const entry = i >= 0 ? overlayStack.splice(i, 1)[0] : null;
+  const focusBack = (el) => { try { if (el && el.focus && document.contains(el)) el.focus(); } catch (e) { /* 消えていれば何もしない */ } };
+  if (document.querySelectorAll('.overlay.on').length > 0) {
+    // 下にダイアログが残っている (ask を閉じたときなど) → 開く前にいた要素 (下のダイアログの中) へ戻す。スクロールは触らない
+    focusBack(entry && entry.ret);
+    return;
+  }
   document.body.classList.remove('modal-open');
   document.body.style.top = '';
-  window.scrollTo(0, overlayScrollY);
-  try { if (overlayReturn && overlayReturn.focus) overlayReturn.focus(); } catch (e) { /* 消えていれば何もしない */ }
+  window.scrollTo(0, entry ? entry.scrollY : overlayScrollY);
+  focusBack(entry ? entry.ret : overlayReturn);
+  overlayStack.length = 0;
   overlayReturn = null;
 }
 // Tab をダイアログの中だけで回す
