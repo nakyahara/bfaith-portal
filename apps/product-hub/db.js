@@ -17,6 +17,8 @@ import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { syncDraftLinks } from '../product-links/sync.js';
 import { fileViewUrl } from './lib/drive-link.js';
 import { YAHOO_OVERRIDE_SHIPPING_GROUPS } from './lib/shipping-groups.js';
+// セットの画像の引き継ぎ計画 (§4.7)。枠の数え方と行の作り方は lib が正 (services とも共用)
+import { backfillSetImagePlans } from './lib/set-image-plan.js';
 
 export const DRAFT_STATUSES = [
   'draft', 'ready_for_ai', 'review', 'approved', 'listed', 'expanded', 'on_hold', 'excluded',
@@ -934,6 +936,23 @@ export function initProductHubDB() {
       PRIMARY KEY (set_draft_id, member_ne_code)
     );
 
+    -- セットの画像の引き継ぎ計画 (2026-09-04 要件定義 §4.7)。
+    -- 中原さん: 「詳細画像の既定は『作らない』ではなく、単品の詳細画像の**何枚目を修正**みたいな形で
+    -- 指示を送れるように」。枠 (slot) ごとに そのまま使う/直して使う/作り直す/使わない を決める。
+    -- 🚨 slot は**楽天の画像スロット番号** (lib/folder-import.js と同じ: 1=TOP / 2=_01 / n=_(n-1))。
+    -- 白抜き (_00) は draft_images に入らないので 0 を当てる。draft_images.sort とは 1 ずれる
+    -- (slot = sort + 1)。変換は lib/set-image-plan.js の imageSortOfSlot / slotOfImageSort だけを使う。
+    -- 画像が届いて枠に入っても行は消さない (何をどうする計画だったかの実績として残す)
+    CREATE TABLE IF NOT EXISTS draft_set_image_plans (
+      set_draft_id         INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      slot                 INTEGER NOT NULL CHECK (slot BETWEEN 0 AND 20),
+      parent_drive_file_id TEXT,                       -- 派生した時点の親のその枠の画像 (無ければ NULL)
+      action               TEXT NOT NULL CHECK (action IN ('reuse', 'modify', 'recreate', 'drop')),
+      instruction          TEXT,                       -- 直して使う/作り直す の指示文 (直して使う は必須)
+      updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (set_draft_id, slot)
+    );
+
     -- 「セット展開判断」(工程 set_review) の結果 (2026-09-04 要件定義)。
     -- 派生を作ったときだけ工程が閉じる作りだと「まだ検討していない」と「検討して作らないと決めた」が
     -- 区別できない。判断そのものを残し、⑤はこの記録があるときだけ閉じられる。
@@ -1458,6 +1477,10 @@ export function initProductHubDB() {
     migrateImageKindSplit(db);
     migrateDetailTrackV2(db);
     migrateSetDraftsToSetTrack(db);
+    // 導入前に作られたセットにも画像の計画を作る (§4.7)。**初期化の中で同期的に**終える —
+    // 待たずに始めると、再起動直後の最初のリクエストが出品だったとき計画 0 件で
+    // 画像のゲートを素通りする (Codex R5 high)
+    backfillSetImagePlans(db, logEvent);
     retireTopImageSteps(db);
     syncOwnBrandImagePriority(db);
   })();

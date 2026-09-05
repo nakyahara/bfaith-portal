@@ -13,6 +13,12 @@
 import { getDB, logEvent } from '../db.js';
 import { ensureProgress, setStepState } from '../lib/workflow-progress.js';
 import { SET_NE_STEP_CODE } from '../lib/set-decision.js';
+// 画像の引き継ぎ計画 (§4.7)。枠の数え方・語彙・「制作が要るか」の判定は lib 側が正
+import {
+  WHITE_BG_SLOT, MAX_PLAN_SLOT, SET_IMAGE_ACTIONS,
+  imageSortOfSlot, slotLabel, instructionRequired, planNeedsProduction, needsProduction,
+  seedImagePlans, backfillSetImagePlans as backfillPlans,
+} from '../lib/set-image-plan.js';
 import { resolveVariationGroup } from '../lib/variation.js';
 // 売価の初期値 (§4.4 決⑦)。作成時に入れる値と画面に出す「由来」で同じ計算を使う
 import { setPriceFromMembers, describeSetPrice } from '../lib/set-price.js';
@@ -249,6 +255,17 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
         ? `売価の初期値 ${describeSetPrice(priceInit)} を入れました (税込。送料・値引きは含みません)`
         : `売価の初期値は入れていません (単価が引けない商品: ${priceInit.missing.filter(Boolean).join(', ') || '不明'})`,
       actor);
+    // 画像の引き継ぎ計画 (§4.7)。親の全枠を「そのまま使う」で作り、その画像をコピーする。
+    // 直したい枠は作成後に画像タブで変える (変えると制作工程が戻る)
+    const planned = seedImagePlans(db, setId, parentId);
+    const copiedImages = applyReuseImages(db, setId).copied;
+    applyImagePlanToTrack(db, setId, actor);
+    if (planned > 0) {
+      logEvent(db, setId, 'set_image_plan_seeded',
+        `画像の計画を作りました (親の ${planned} 枠。既定は「そのまま使う」で ${copiedImages} 枚コピー)。`
+        + '直したい枠は画像タブで「直して使う」に変えてください',
+        actor);
+    }
     logEvent(db, setId, 'shipping_not_copied',
       '配送方法は親からコピーしていません (セットは個数で重さ・大きさが変わるため)。'
       + 'NE の本コードが確定すると NE の配送方法が使われます',
@@ -424,6 +441,229 @@ export function ackParentSnapshot(db, draftId, actor) {
   db.prepare('UPDATE product_drafts SET parent_snapshot_at = ? WHERE id = ?').run(parent.updated_at, id);
   logEvent(db, id, 'parent_snapshot_ack', '親の更新を確認しました', actor);
   return true;
+}
+
+// ─── 画像の引き継ぎ計画 (2026-09-04 要件定義 §4.7) ──────────────────────────
+//
+// セットの画像は「作る/作らない」の 2 択ではない。単品の何枚目をそのまま使い、何枚目を
+// 「2個並べた写真に」直すか、を**枠ごとに**決める (中原さん 2026-09-04)。
+
+/** 導入前に作られたセットへのバックフィル (実体は lib。起動時に db.js からも呼ぶ) */
+export function backfillSetImagePlans(db) {
+  return backfillPlans(db, logEvent);
+}
+
+/** セットの計画を読む (枠の順) */
+export function setImagePlansOf(db, setDraftId) {
+  return db.prepare(`
+    SELECT slot, parent_drive_file_id, action, instruction, updated_at
+    FROM draft_set_image_plans WHERE set_draft_id = ? ORDER BY slot
+  `).all(Number(setDraftId)).map((r) => ({ ...r, label: slotLabel(r.slot) }));
+}
+
+/**
+ * 計画どおりに画像を並べ直す (§4.7)。
+ *   そのまま使う → 親の画像をコピー (枠が空のときだけ)
+ *   直して使う / 作り直す / 使わない → **枠を空にして待つ** (制作の成果物が入る)
+ *
+ * 🚨 空にするのは「**親からコピーしたままの画像**」だけ。人が入れ直した画像や制作の成果物は
+ * 触らない (計画を変えるたびに、届いた画像が消えるようでは使えない)。
+ * 🚨 何度呼んでも同じ結果になること — 計画を直すたびに呼ぶので、二重コピーは許されない。
+ * @returns {{copied: number, cleared: number}}
+ */
+export function applyReuseImages(db, setDraftId, changedSlots = null) {
+  const id = Number(setDraftId);
+  const plans = setImagePlansOf(db, id);
+  let copied = 0;
+  const insImg = db.prepare(`
+    INSERT INTO draft_images (draft_id, drive_file_id, drive_url, sort)
+    SELECT ?, drive_file_id, drive_url, ? FROM draft_images WHERE draft_id = ? AND drive_file_id = ?
+    ON CONFLICT(draft_id, drive_file_id) DO NOTHING
+  `);
+  let cleared = 0;
+  const parentId = db.prepare('SELECT parent_draft_id FROM product_drafts WHERE id = ?').get(id)?.parent_draft_id;
+  if (parentId == null) return { copied: 0, cleared: 0 };
+  for (const p of plans) {
+    // 🚨 **今回の変更で指定が変わった枠**は、指定が何であれ中身ごと一度空にする
+    // (Codex R2 high / R3 high)。前の指定で入った画像を残すと:
+    //   直して使う→直して使う (指示だけ変更): 古い成果物で「完了」に見え、未処理のまま出品できる
+    //   直して使う→使わない: 使わないはずの画像が出品に残る
+    //   直して使う→そのまま使う: 親の画像ではなく前の成果物が出る
+    // 空にしたあと「そのまま使う」なら、下で親の画像が入り直す。
+    // Drive のファイルは消えないので、間違えたら人が入れ直せる
+    const justChanged = changedSlots ? changedSlots.has(p.slot) : false;
+    if (justChanged) {
+      if (p.slot === WHITE_BG_SLOT) {
+        cleared += db.prepare(`
+          UPDATE draft_rakuten SET white_bg_drive_file_id = NULL, white_bg_drive_url = NULL WHERE draft_id = ?
+        `).run(id).changes;
+      } else {
+        cleared += db.prepare('DELETE FROM draft_images WHERE draft_id = ? AND sort = ?')
+          .run(id, imageSortOfSlot(p.slot)).changes;
+      }
+      // 「そのまま使う」に変えたなら、このあと親の画像を入れ直す (空になったので入る)
+      if (p.action !== 'reuse') continue;
+    }
+    // 「そのまま使う」を外した枠は空に戻す。ただし**親からコピーしたままのもの**だけ
+    // (人が別の枠へ移した画像を消さないよう、file id だけでなく枠も見る — Codex R1 medium)
+    if (p.action !== 'reuse' && p.parent_drive_file_id) {
+      if (p.slot === WHITE_BG_SLOT) {
+        cleared += db.prepare(`
+          UPDATE draft_rakuten SET white_bg_drive_file_id = NULL, white_bg_drive_url = NULL
+          WHERE draft_id = ? AND white_bg_drive_file_id = ?
+        `).run(id, p.parent_drive_file_id).changes;
+      } else {
+        cleared += db.prepare('DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = ? AND sort = ?')
+          .run(id, p.parent_drive_file_id, imageSortOfSlot(p.slot)).changes;
+      }
+      continue;
+    }
+    if (p.action !== 'reuse' || !p.parent_drive_file_id) continue;
+    if (p.slot === WHITE_BG_SLOT) {
+      // 白抜きは draft_images ではなく楽天の欄に入る。既に入っていれば触らない
+      const cur = db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(id);
+      if (cur?.white_bg_drive_file_id) continue;
+      const src = db.prepare(
+        'SELECT white_bg_drive_file_id, white_bg_drive_url FROM draft_rakuten WHERE draft_id = ?').get(parentId);
+      if (!src?.white_bg_drive_file_id) continue;
+      db.prepare(`
+        INSERT INTO draft_rakuten (draft_id, white_bg_drive_file_id, white_bg_drive_url) VALUES (?, ?, ?)
+        ON CONFLICT(draft_id) DO UPDATE SET
+          white_bg_drive_file_id = excluded.white_bg_drive_file_id,
+          white_bg_drive_url = excluded.white_bg_drive_url
+      `).run(id, src.white_bg_drive_file_id, src.white_bg_drive_url);
+      copied += 1;
+      continue;
+    }
+    const sort = imageSortOfSlot(p.slot);
+    // その枠が既に埋まっていれば触らない (制作の成果物・人が入れ直したものを上書きしない)
+    const taken = db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND sort = ?').get(id, sort);
+    if (taken) continue;
+    copied += insImg.run(id, sort, parentId, p.parent_drive_file_id).changes;
+  }
+  return { copied, cleared };
+}
+
+/**
+ * 計画で使うことにしたのに、まだ画像が入っていない枠 (§4.7)。
+ *
+ * 🚨 工程 (`draft_step_progress`) では出品を止めきれない。制作が全部 done になったあとに
+ * 1 枠を `reuse → modify` へ変えると、親の画像は枠から外れるのに工程は done のままで、
+ * **依頼が未処理なのに出品できてしまう** (Codex R1 high)。
+ * 工程は人の作業の記録なので巻き戻さず、出品ゲートは**実際に画像があるか**で判定する。
+ *
+ * 🚨 「そのまま使う」も対象にする (Codex R4 high)。同じ画像が別の枠へ移されていると
+ * `UNIQUE(draft_id, drive_file_id)` でコピーが入らず、**使うつもりの枠が空のまま出品**できてしまう。
+ * 空でよいのは「使わない」だけ。
+ */
+export function pendingImagePlanSlots(db, setDraftId) {
+  const id = Number(setDraftId);
+  return setImagePlansOf(db, id).filter((p) => {
+    if (p.action === 'drop') return false;
+    // 判定は「枠が空か」ただ1つ。**指示を変えた枠は空に戻す** (replaceSetImagePlans) ので、
+    // 画像があること = 今の依頼を満たしたこと、が成り立つ。
+    // 時刻の前後で判定するとミリ秒の解像度に左右されて壊れる (Codex R2 high の別解)
+    if (p.slot === WHITE_BG_SLOT) {
+      return !db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?')
+        .get(id)?.white_bg_drive_file_id;
+    }
+    return !db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND sort = ?')
+      .get(id, imageSortOfSlot(p.slot));
+  });
+}
+
+/**
+ * 計画を画像トラックに反映する (§4.7)。
+ * 直す/作り直す が 1 枠も無ければ制作は要らないので**詳細画像の工程を skip で決着**させる
+ * (親の画像をコピーしてあるので、出品ゲートの TOP 画像も満たせる)。
+ * 1 枠でもあれば skip を todo に戻して「依頼」から始める。
+ * 🚨 **done は触らない** — 人が進めた工程を巻き戻さない。動かすのは todo ⇄ skip だけ。
+ * @returns {{needsProduction: boolean, changed: number}}
+ */
+export function applyImagePlanToTrack(db, setDraftId, actor = 'system') {
+  const id = Number(setDraftId);
+  const plans = setImagePlansOf(db, id);
+  // 🚨 親に画像が 1 枚も無ければ計画も空になる。これを「直す枠が無い = 制作は要らない」と
+  // 読むと、**画像が 1 枚も無いセットが「対象外」で通ってしまう**。空なら普通に作る
+  const needs = plans.length === 0 ? true : planNeedsProduction(plans);
+  const rows = db.prepare(`
+    SELECT p.step_code, p.state FROM draft_step_progress p
+    JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+    WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail'
+  `).all(id);
+  const from = needs ? 'skip' : 'todo';
+  const to = needs ? 'todo' : 'skip';
+  const upd = db.prepare(`
+    UPDATE draft_step_progress
+    SET state = ?, version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE draft_id = ? AND step_code = ? AND state = ?
+  `);
+  let changed = 0;
+  for (const r of rows) changed += upd.run(to, id, r.step_code, from).changes;
+  if (changed > 0) {
+    logEvent(db, id, 'set_image_plan_track',
+      needs
+        ? '画像の計画に「直して使う/作り直す」が入ったので、画像の制作工程を戻しました'
+        : '画像はすべて親のものを使う計画なので、画像の制作工程を「対象外」にしました',
+      actor);
+  }
+  return { needsProduction: needs, changed };
+}
+
+/**
+ * 計画を置き換える (画面から。§6 の PUT /set-image-plan)。
+ * 親に無い枠は受けない (計画は親の枠に対して立てるもの)。
+ * @param {Array<{slot: number, action: string, instruction?: string}>} items
+ */
+export function replaceSetImagePlans(db, setDraftId, items, actor) {
+  const id = Number(setDraftId);
+  const d = db.prepare('SELECT parent_draft_id FROM product_drafts WHERE id = ?').get(id);
+  if (!d?.parent_draft_id) throw badRequest('セット商品ではありません');
+  const known = new Map(setImagePlansOf(db, id).map((p) => [p.slot, p]));
+  const list = Array.isArray(items) ? items : [];
+  if (list.length === 0) throw badRequest('計画が空です');
+  const seen = new Set();
+  const rows = [];
+  for (const raw of list) {
+    const slot = Number(raw?.slot);
+    if (!Number.isInteger(slot) || slot < 0 || slot > MAX_PLAN_SLOT) throw badRequest('枠の指定が不正です');
+    if (!known.has(slot)) throw badRequest(`${slotLabel(slot)} は親にありません`);
+    if (seen.has(slot)) throw badRequest(`${slotLabel(slot)} が重複しています`);
+    seen.add(slot);
+    const action = String(raw?.action || '').trim();
+    if (!SET_IMAGE_ACTIONS.includes(action)) throw badRequest(`${slotLabel(slot)} の指定が不正です`);
+    const instruction = String(raw?.instruction ?? '').trim().slice(0, 500);
+    // 「直して使う」で指示が無いと、依頼書が「直して」だけになって作れない (§4.7)
+    if (instructionRequired(action) && !instruction) {
+      throw badRequest(`${slotLabel(slot)} は「直して使う」なので、どう直すかを書いてください`);
+    }
+    rows.push({ slot, action, instruction: instruction || null });
+  }
+  const upd = db.prepare(`
+    UPDATE draft_set_image_plans SET action = ?, instruction = ?,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE set_draft_id = ? AND slot = ?
+  `);
+  return db.transaction(() => {
+    const before = new Map([...known].map(([k, v]) => [k, `${v.action}:${v.instruction || ''}`]));
+    let changed = 0;
+    const changedSlots = new Set();
+    for (const r of rows) {
+      if (before.get(r.slot) === `${r.action}:${r.instruction || ''}`) continue;
+      changed += upd.run(r.action, r.instruction, id, r.slot).changes;
+      changedSlots.add(r.slot);
+    }
+    if (changed > 0) {
+      logEvent(db, id, 'set_image_plan_changed',
+        rows.filter((r) => before.get(r.slot) !== `${r.action}:${r.instruction || ''}`)
+          .map((r) => `${slotLabel(r.slot)}=${r.action}${r.instruction ? ` (${r.instruction})` : ''}`).join(' / '),
+        actor);
+    }
+    // 計画に合わせて画像と工程を追従させる (コピーは冪等・工程は todo ⇄ skip だけ)
+    const images = applyReuseImages(db, id, changedSlots);
+    const track = applyImagePlanToTrack(db, id, actor);
+    return { changed, ...images, ...track };
+  })();
 }
 
 // ─── 「セット展開判断」の記録 (2026-09-04 要件定義 §4.2) ────────────────────

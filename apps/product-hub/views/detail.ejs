@@ -1132,6 +1132,64 @@ th.attr-unknown { color: #dc2626; }
 
   <!-- ═══ タブ2: 画像 ═══ -->
   <div class="tab-panel" id="tab-images">
+  <%# セットの画像は「作る/作らない」ではなく、**親の何枚目をどうするか**を枠ごとに決める
+      (2026-09-04 §4.7 中原さん: 「単品の詳細画像で何枚目を修正、みたいな形で指示を送れるように」)。
+      全部「そのまま使う」なら制作は要らないので、画像の工程は自動で「対象外」になる %>
+  <% if (setInfo && setImagePlans.length) { %>
+    <div class="card" style="margin-bottom:16px; background:#faf5ff; border-color:#ddd6fe;">
+      <h2>🎁 親の画像をどう使うか<span class="muted" style="font-weight:400; font-size:12px;">（枠ごとに決める）</span></h2>
+      <p class="muted" style="margin:0 0 8px; font-size:12px;">
+        「そのまま使う」枠は親の画像がここにコピーされています。1つでも「直して使う／作り直す」にすると、
+        画像の制作工程が動き出し、依頼にこの指示がそのまま載ります。
+      </p>
+      <table class="list" id="set-image-plan">
+        <thead><tr><th style="width:110px;">枠</th><th style="width:70px;">親の画像</th>
+          <th style="width:150px;">どうする</th><th>どう直すか（指示）</th></tr></thead>
+        <tbody>
+          <% for (const pl of setImagePlans) { %>
+            <tr data-slot="<%= pl.slot %>">
+              <td><%= pl.label %></td>
+              <td>
+                <% if (pl.parent_drive_file_id) { %>
+                  <a href="<%= fileViewUrl(pl.parent_drive_file_id) %>" target="_blank" rel="noopener">
+                    <img src="<%= thumbnailUrl(pl.parent_drive_file_id, 160) %>" alt="<%= pl.label %>"
+                         style="width:56px; height:56px; object-fit:contain; background:#fff; border:1px solid #e2e8f0; border-radius:4px;">
+                  </a>
+                <% } else { %><span class="muted">—</span><% } %>
+              </td>
+              <td>
+                <select class="sip-action" style="width:100%;">
+                  <% for (const a of setImageActions) { %>
+                    <option value="<%= a %>" <%= pl.action === a ? 'selected' : '' %>><%= setImageActionLabels[a] %></option>
+                  <% } %>
+                </select>
+              </td>
+              <td>
+                <input type="text" class="sip-instruction" style="width:100%;" maxlength="500"
+                       value="<%= pl.instruction || '' %>"
+                       placeholder="例: 2個並べた写真に / ×2 の表記を足す">
+              </td>
+            </tr>
+          <% } %>
+        </tbody>
+      </table>
+      <div style="display:flex; gap:8px; align-items:center; margin-top:10px;">
+        <button class="btn btn-primary btn-sm" id="sip-save">この計画で保存</button>
+        <span class="muted" id="sip-result"></span>
+      </div>
+    </div>
+  <% } %>
+  <%# 制作の依頼に載る指示 (§4.7)。依頼を受ける人がここだけ見れば何を作るか分かるようにする %>
+  <% if (setInfo && setImageInstructions.length) { %>
+    <div class="card" style="margin-bottom:16px; background:#fffbeb; border-color:#fcd34d;">
+      <h2>🎨 この画像を作ってください<span class="muted" style="font-weight:400; font-size:12px;">（制作の依頼に載る内容）</span></h2>
+      <ul style="margin:0; padding-left:18px; font-size:13px;">
+        <% for (const ins of setImageInstructions) { %>
+          <li><strong><%= ins.label %></strong>: <%= ins.actionLabel %><%= ins.instruction ? ` — ${ins.instruction}` : '' %></li>
+        <% } %>
+      </ul>
+    </div>
+  <% } %>
   <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start;">
   <div class="card">
     <h2>✏️ 商品画像 (Driveリンク)<span class="ftag ftag-m">手入力</span></h2>
@@ -5021,6 +5079,35 @@ th.attr-unknown { color: #dc2626; }
           out.textContent = '';
           alert('通信エラー: ' + e.message);
           setCodeBtn.disabled = false;
+        }
+      });
+    }
+
+    // 画像の引き継ぎ計画 (§4.7)。表の行をまとめて置き換える
+    const sipSave = document.getElementById('sip-save');
+    if (sipSave) {
+      sipSave.addEventListener('click', async function () {
+        const out = document.getElementById('sip-result');
+        const items = [...document.querySelectorAll('#set-image-plan tbody tr')].map(function (tr) {
+          return {
+            slot: Number(tr.dataset.slot),
+            action: tr.querySelector('.sip-action').value,
+            instruction: tr.querySelector('.sip-instruction').value.trim(),
+          };
+        });
+        sipSave.disabled = true;
+        out.textContent = '保存中…';
+        try {
+          const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/set-image-plan', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ items: items }),
+          });
+          const j = await res.json();
+          if (!j.ok) { out.textContent = ''; alert(j.error || '保存できませんでした'); sipSave.disabled = false; return; }
+          out.textContent = '保存しました';
+          setTimeout(function () { location.reload(); }, 600);
+        } catch (e) {
+          out.textContent = ''; alert('通信エラー: ' + e.message); sipSave.disabled = false;
         }
       });
     }
