@@ -1157,7 +1157,7 @@ export function searchSessions({ workerId = null, from = null, to = null, q = nu
   // ⭐totalSeconds は**終わったぶんだけ**。作業中はまだ確定していないので足さない
   //   (工賃の計算に使う数字が、見るたびに増えていくことになる — 画面のラベルも「終わったぶん」と書く)
   const summary = db.prepare(`SELECT COUNT(*) AS count,
-      COALESCE(SUM(s.raw_seconds), 0) AS totalSeconds,
+      COALESCE(SUM(CASE WHEN s.ended_at IS NOT NULL THEN s.raw_seconds ELSE 0 END), 0) AS totalSeconds,
       COUNT(DISTINCT s.worker_id) AS workers,
       COUNT(DISTINCT LOWER(TRIM(s.product_code))) AS products,
       COUNT(DISTINCT COALESCE('t' || s.task_id, s.page_id)) AS cards,

@@ -3617,6 +3617,15 @@ console.log('\n[24] 複数人での作業開始・まとめ終了・記録の検
   // ── 記録の検索 ──
   const all = searchSessions({ q: 'みつろう' });
   ok(all.summary.count === 4 && all.rows.length === 4, '商品名の部分一致で4件 (4人ぶん)');
+  // 合計時間は「終わったぶん」だけ。作業中の行に raw_seconds が入っていても足さない (異常データ前提にしない)
+  const openW = mk('crew-O');
+  const openS = startSessions({ pageId: 'crew-1', productCode: 'CREW-X', title: 'みつろうクリーム', workers: [openW] }).sessions[0].sessionId;
+  getDB().prepare('UPDATE f_iroha_work_sessions SET raw_seconds = 99999 WHERE id = ?').run(openS);
+  const withOpen = searchSessions({ q: 'みつろう' });
+  ok(withOpen.summary.count === 5 && withOpen.summary.open === 1, '作業中も件数には入る');
+  ok(withOpen.summary.totalSeconds === all.summary.totalSeconds, '合計時間には作業中の分を足さない (終わったぶんだけ)');
+  stopSessions({ pageId: 'crew-1', sessionIds: [openS], reason: 'done' });
+  getDB().prepare('DELETE FROM f_iroha_work_sessions WHERE id = ?').run(openS);
   ok(all.summary.workers === 4 && all.summary.cards === 1, '人数4・カード1');
   const byWorker = searchSessions({ workerId: a.id, q: 'みつろう' });
   ok(byWorker.summary.count === 1 && byWorker.rows[0].worker_name === 'crew-A', '人でしぼれる');

@@ -420,8 +420,13 @@ function resolveWorkers(req, operator) {
   // 通ったことをログに残す。ログが出なくなったらこの互換は外す (feedback: 互換は恒久仕様になりがち)
   if (raw === undefined || raw === null) return { workers: [operator], legacy: true };
   if (!Array.isArray(raw)) return { error: '作業する人を選んでください' };
-  const ids = [...new Set(raw.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
-  if (!ids.length) return { error: '作業する人を選んでください (1人以上えらぶと始められます)' };
+  if (!raw.length) return { error: '作業する人を選んでください (1人以上えらぶと始められます)' };
+  // ⭐壊れた値は黙って捨てない — [1, "こわれた値"] が「1人で開始」になると、
+  //   選んだつもりの人が記録から抜ける (検索条件と同じ方針)
+  if (raw.some((v) => !Number.isSafeInteger(Number(v)) || Number(v) <= 0)) {
+    return { error: '作業する人の指定がこわれています (画面を更新してください)' };
+  }
+  const ids = [...new Set(raw.map(Number))];
   if (ids.length > MAX_CREW) return { error: `一度に選べるのは ${MAX_CREW} 人までです` };
   const workers = [];
   for (const id of ids) {

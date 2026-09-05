@@ -95,6 +95,9 @@ console.log('\n[1] 作業する人を選ばないと開始できない (中原�
   ok(bad.status === 400 && bad.json.error === 'worker_required', '配列でない worker_ids も断る');
   const zeros = await post('/api/sessions/start', { id: T1, worker_id: A, worker_ids: [0, -1, 'x'] });
   ok(zeros.status === 400, '中身が全部おかしければ断る');
+  // 壊れた値を黙って捨てて「残った1人で開始」にしない (選んだつもりの人が記録から抜ける)
+  const partly = await post('/api/sessions/start', { id: T1, worker_id: A, worker_ids: [A, 'こわれた値'] });
+  ok(partly.status === 400 && /こわれ/.test(partly.json.message || ''), '一部が壊れていても断る (残りだけで開始しない)');
   const unknown = await post('/api/sessions/start', { id: T1, worker_id: A, worker_ids: [A, 99999] });
   ok(unknown.status === 400 && /名簿/.test(unknown.json.message || ''), '名簿にない人が混ざれば断る');
   const off = await post('/api/sessions/start', { id: T1, worker_id: A, worker_ids: [A, INACTIVE] });
