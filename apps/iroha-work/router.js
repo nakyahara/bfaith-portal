@@ -27,7 +27,7 @@ import {
   workOptionsByKind, addWorkOption, setWorkOptionActive, setWorkOptionImage, moveWorkOption, seedWorkOptionsFromMaster, BUILTIN_OPTION_IMAGES,
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
-  getCachePage, startSessions, stopSession, stopSessions, listSessionsForAdmin, searchSessions, SESSION_SEARCH_MAX, jstDayStartUtc, voidSession,
+  getCachePage, startSessions, stopSession, stopSessions, undoStopSessions, listSessionsForAdmin, searchSessions, SESSION_SEARCH_MAX, jstDayStartUtc, voidSession,
   getMeta, setMetaValue, sourceOfTruth,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
@@ -37,7 +37,8 @@ import { OPEN_STATUSES } from './tasks.js';
 import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
-import { setTaskBlock, clearTaskBlock, blockedOf } from './tasks-db.js';
+import { setTaskBlock, clearTaskBlock, undoTaskBlock, blockedOf } from './tasks-db.js';
+import { notifyStaff, materialsShortageText } from './notify.js';
 import {
   getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
   listLabelWaits, upsertLabelWait, getLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
@@ -772,7 +773,58 @@ router.post('/api/block', checkOrigin, api((req, res) => {
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
   });
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  // 🧰 資材が足りない → 職員に知らせる (監修「あった方がよい機能」)。通知は付け足し — 送れなくても札とタイマー停止は成立している。
+  //   送れた/送れなかったは操作履歴に残す (無音で落とさない)
+  if (r.task.blocked_reason === 'materials_shortage') {
+    const dl = deviceLabelOf(req);
+    notifyStaff(materialsShortageText({ title: r.task.product_name, productCode: r.task.product_code, note: r.task.blocked_note,
+      workerName: w.worker.display_name, deviceLabel: dl }))
+      .then((n) => safeLog({ action: 'notify_materials_shortage', workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: dl,
+        to: n.sent ? 'sent' : `skipped: ${n.reason}`, ok: n.sent }))
+      .catch(() => { /* notifyStaff は throw しない */ });
+  }
   res.json({ ok: true, task: publicTask(r.task), stopped: r.stopped, serverNow: new Date().toISOString() });
+}));
+
+/**
+ * 誤タップの取り消し (監修 2026-09-05「あった方がよい機能」)。「ぬける」「ひとやすみ」「できあがり」「⛔ 止まった」の直後だけ
+ * (サーバーは 60 秒まで受ける。画面のトーストは 6 秒)。
+ *   kind=stop  : 止めたセッションをもう一度動かす (ended_at を消す = 止めなかったことになる)
+ *   kind=block : 札を外し、札を付けたときに止めたセッションを動かし直す
+ * 権限は「作業をはじめられる人」と同じ (利用者本人の取り消し。職員の PIN は要らない)
+ */
+const UNDO_HTTP = { too_late: 409, busy: 409, voided: 409, not_found: 404 };
+router.post('/api/undo', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  if (isClosedCardId(taskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
+  const kind = String(req.body?.kind || '');
+  if (kind !== 'stop' && kind !== 'block') return res.status(400).json({ ok: false, error: 'bad_request', message: 'kind は stop / block のどちらかです' });
+  const guard = () => {
+    if (!isAppMode()) return { ok: false, error: 'notion_mode', message: '正本が変わりました (一覧を更新してください)' };
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'card_required', message: 'カードが見つかりません (一覧を更新してください)' };
+    if (t.status === 'closed') return CLOSED_WRITE_REJECTED;
+    return null;
+  };
+  const dl = deviceLabelOf(req);
+  let r;
+  if (kind === 'stop') {
+    r = undoStopSessions({ taskId, sessionIds: sessionIdsOf(req) || [], guard });
+    if (r.ok) {
+      for (const s of r.reopened) {
+        if (!s.already) safeLogTaskEvent({ taskId, action: 'session_undo_stop', workerId: s.worker_id, workerName: s.worker_name, deviceLabel: dl, to: `by ${w.worker.display_name}`, ok: true });
+      }
+    }
+  } else {
+    r = undoTaskBlock({ taskId, expectVersion: req.body?.expect_version, actor: `${w.worker.display_name} (いろはアプリ)`,
+      workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: dl, guard });
+  }
+  if (!r.ok) return res.status(UNDO_HTTP[r.error] || taskErrorStatus(r.error)).json({ ...r, current: r.current ? publicTask(r.current) : undefined });
+  res.json({ ok: true, task: publicTask(getTask(taskId)), reopened: r.reopened || [], skipped: r.skipped || [], serverNow: new Date().toISOString() });
 }));
 
 /**
@@ -918,6 +970,45 @@ router.get('/api/history', api((req, res) => {
     }),
     preview: !isAppMode(),
     fromDate: from || null, toDate: to || null,
+  });
+}));
+
+/**
+ * 📅 きょうのみんなの作業 (日報 — 監修 2026-09-05「あった方がよい機能」)。人 × 商品 × 分。
+ * 利用者本人が「自分は今日これだけやった」を見る。管理画面の検索 (searchSessions) と同じ元データ。
+ * 取り消した記録は数えない。作業中のぶんは確定していないので合計に足さず、「いま何分」で別に出す
+ */
+router.get('/api/daily-report', api((req, res) => {
+  const raw = String(req.query.date == null ? '' : req.query.date).trim();
+  const date = raw || jstToday();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || jstDay(new Date(`${date}T00:00:00+09:00`)) !== date) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '日付は YYYY-MM-DD (実在する日) で指定してください' });
+  }
+  const page = searchSessions({ from: date, to: date, includeVoided: false, limit: SESSION_SEARCH_MAX, offset: 0 });
+  const nowMs = Date.now();
+  const byWorker = new Map();
+  for (const s of page.rows) {
+    const key = Number(s.worker_id);
+    if (!byWorker.has(key)) byWorker.set(key, { worker_id: key, worker_name: s.worker_name, total_seconds: 0, live_seconds: 0, active: 0, sessions: 0, items: new Map() });
+    const wv = byWorker.get(key);
+    const ck = s.task_id != null ? `t${s.task_id}` : `p${s.page_id}`;
+    if (!wv.items.has(ck)) wv.items.set(ck, { task_id: s.task_id, page_id: s.page_id, title: s.title_snapshot || '(名称なし)', product_code: s.product_code, seconds: 0, live_seconds: 0, sessions: 0, active: 0 });
+    const it = wv.items.get(ck);
+    it.sessions += 1; wv.sessions += 1;
+    if (s.ended_at) { const sec = Number(s.raw_seconds) || 0; it.seconds += sec; wv.total_seconds += sec; }
+    else { const live = Math.max(0, Math.floor((nowMs - Date.parse(s.started_at)) / 1000)); it.live_seconds += live; wv.live_seconds += live; it.active += 1; wv.active += 1; }
+  }
+  const workers = [...byWorker.values()]
+    .map((wv) => ({ ...wv, items: [...wv.items.values()].sort((a, b) => (b.seconds + b.live_seconds) - (a.seconds + a.live_seconds)) }))
+    .sort((a, b) => (b.total_seconds + b.live_seconds) - (a.total_seconds + a.live_seconds));
+  res.json({
+    ok: true, date, workers, truncated: !!page.truncated,
+    totals: {
+      seconds: workers.reduce((a, x) => a + x.total_seconds, 0), workers: workers.length,
+      cards: new Set(page.rows.map((s) => (s.task_id != null ? `t${s.task_id}` : `p${s.page_id}`))).size,
+      active: workers.reduce((a, x) => a + x.active, 0),
+    },
+    serverNow: new Date().toISOString(),
   });
 }));
 

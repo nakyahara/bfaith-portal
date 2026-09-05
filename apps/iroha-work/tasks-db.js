@@ -457,6 +457,43 @@ function clearTaskBlockInTx(db, t, { via, actor = null, workerId = null, workerN
   return { ok: true, task: getTask(t.id) };
 }
 
+/**
+ * 「⛔ 止まった」の取り消し (誤タップ — 監修 2026-09-05)。直後 (withinMs、既定 60 秒) だけ。
+ * 札を外し、札を付けたときに止めたセッション (blocked_at と同時刻に pause で閉じたもの) をもう一度動かす。
+ * 別の作業を始めてしまった人の分は動かさず skipped に返す (札を外すのは成立させる)
+ */
+export function undoTaskBlock({ taskId, expectVersion = null, withinMs = 60000, actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
+  const db = getDB();
+  return db.transaction(() => {
+    if (guard) { const g0 = guard(); if (g0) return g0; }
+    const g = appModeGuard();
+    if (g) return g;
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
+    if (expectVersion != null && Number(expectVersion) !== t.version) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: t };
+    if (!t.blocked_reason) return { ok: true, task: t, already: true, reopened: [], skipped: [] };
+    if (!t.blocked_at || Date.now() - Date.parse(t.blocked_at) > withinMs) {
+      return { ok: false, error: 'too_late', message: '時間が経ったのでもどせません。「▶ 作業をはじめる」で札を外してください' };
+    }
+    const stopped = db.prepare("SELECT id, worker_id, worker_name, started_at FROM f_iroha_work_sessions WHERE task_id = ? AND end_reason = 'pause' AND ended_at = ? AND voided_at IS NULL").all(t.id, t.blocked_at);
+    const c = clearTaskBlockInTx(db, t, { via: 'undo', actor, workerId, workerName, deviceLabel });
+    if (!c.ok) return c;
+    const openOf = db.prepare('SELECT id FROM f_iroha_work_sessions WHERE worker_id = ? AND ended_at IS NULL LIMIT 1');
+    const upd = db.prepare('UPDATE f_iroha_work_sessions SET ended_at = NULL, end_reason = NULL, raw_seconds = NULL WHERE id = ? AND ended_at IS NOT NULL');
+    const reopened = [];
+    const skipped = [];
+    for (const s of stopped) {
+      if (openOf.get(s.worker_id)) { skipped.push({ id: s.id, worker_id: s.worker_id, worker_name: s.worker_name, reason: 'busy' }); continue; }
+      upd.run(s.id);
+      reopened.push({ id: s.id, worker_id: s.worker_id, worker_name: s.worker_name, started_at: s.started_at, already: false });
+      safeLogTaskEvent({ taskId: t.id, action: 'session_undo_stop', workerId: s.worker_id, workerName: s.worker_name, deviceLabel, to: 'undo block', ok: true });
+    }
+    safeLogTaskEvent({ taskId: t.id, action: 'task_block_undo', from: t.blocked_reason, to: `タイマー再開 ${reopened.length} 人${skipped.length ? ` (別の作業中 ${skipped.length} 人)` : ''}`,
+      workerId, workerName, deviceLabel, ok: true });
+    return { ok: true, task: getTask(t.id), reopened, skipped };
+  }).immediate();
+}
+
 /** 「今日やる」(planned_date = YYYY-MM-DD) / 後日 (null)。未着手・作業中のタスク */
 export function setPlannedDate({ taskId, plannedDate, expectVersion, actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
   const db = getDB();

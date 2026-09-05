@@ -1113,9 +1113,44 @@ export function activeSessionsByPage() {
 }
 
 /** 同上。アプリ正本のカード用に task_id で引く */
+/**
+ * 止めたセッションをもう一度動かす (誤タップの取り消し — 監修 2026-09-05)。
+ * ended_at を消すだけ = 「止めなかったこと」になる (時間は started_at から続けて数える。記録を 2 本に割らない)。
+ * ⭐直後だけ (withinMs。既定 60 秒)。その人が別の作業を始めていたら戻せない (開いている記録は 1 人 1 本 — UNIQUE 索引)。
+ * 1 件でも戻せなければ**何も戻さない** (部分的に戻して混乱させない。stopSessions と同じ考え)
+ */
+export function undoStopSessions({ taskId, sessionIds, withinMs = 60000, guard = null }) {
+  const ids = [...new Set((Array.isArray(sessionIds) ? sessionIds : []).map(Number))].filter((n) => Number.isInteger(n) && n > 0);
+  if (!ids.length) return { ok: false, error: 'bad_request', message: 'session_id が必要です (画面を更新してください)' };
+  const db = getDB();
+  const nowMs = Date.now();
+  return db.transaction(() => {
+    if (guard) { const g = guard(); if (g) return g; }
+    const get = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?');
+    const openOf = db.prepare('SELECT id FROM f_iroha_work_sessions WHERE worker_id = ? AND ended_at IS NULL LIMIT 1');
+    const targets = [];
+    for (const id of ids) {
+      const row = get.get(id);
+      if (!row || Number(row.task_id) !== Number(taskId)) return { ok: false, error: 'not_found', message: '作業の記録が見つかりません (画面を更新してください)' };
+      if (row.voided_at) return { ok: false, error: 'voided', message: '取り消された記録はもどせません' };
+      if (!row.ended_at) { targets.push({ row, already: true }); continue; }   // まだ動いている = 二重押し。そのまま
+      if (nowMs - Date.parse(row.ended_at) > withinMs) return { ok: false, error: 'too_late', message: '時間が経ったのでもどせません。「▶ 作業をはじめる」でもう一度はじめてください' };
+      if (openOf.get(row.worker_id)) return { ok: false, error: 'busy', message: row.worker_name + ' さんは別の作業をはじめています' };
+      targets.push({ row, already: false });
+    }
+    const upd = db.prepare('UPDATE f_iroha_work_sessions SET ended_at = NULL, end_reason = NULL, raw_seconds = NULL WHERE id = ? AND ended_at IS NOT NULL');
+    const reopened = [];
+    for (const { row, already } of targets) {
+      if (!already) upd.run(row.id);
+      reopened.push({ id: row.id, worker_id: row.worker_id, worker_name: row.worker_name, started_at: row.started_at, already });
+    }
+    return { ok: true, reopened };
+  }).immediate();
+}
+
 export function activeSessionsByTask() {
   const map = new Map();
-  for (const r of getDB().prepare(`SELECT id, task_id, worker_id, worker_name, started_at
+  for (const r of getDB().prepare(`SELECT id, task_id, worker_id, worker_name, started_at, device_label
     FROM f_iroha_work_sessions WHERE ended_at IS NULL AND task_id IS NOT NULL ORDER BY started_at`).all()) {
     if (!map.has(r.task_id)) map.set(r.task_id, []);
     map.get(r.task_id).push(r);
