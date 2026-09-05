@@ -375,6 +375,9 @@ function migrateQuantity(db) {
   // 大きさ (嵩)。ふだんは商品の配送方法から見なすが、分からない商品は職員がここで登録する
   // (S=小 / M=中 / L=大)。明日どれをやるかの並びにだけ使う — 要件 §W-2
   addCol(db, 'f_iroha_work_master', 'size_class', "TEXT CHECK (size_class IS NULL OR size_class IN ('S','M','L'))");
+  // 期限シールを貼る商品か (1=あり / 0=なし / NULL=未登録)。あるときだけ画面の上に赤で出す
+  // (貼り忘れると出荷できない — 中原さん 2026-09-05)
+  addCol(db, 'f_iroha_work_master', 'expiry_seal', 'INTEGER CHECK (expiry_seal IS NULL OR expiry_seal IN (0,1))');
 
   if (!added) return;   // ここから先は列を足した初回だけ
 

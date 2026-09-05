@@ -83,9 +83,10 @@ function mergeMaster(wm, card) {
         material_code: wm.material_code || card.material_code, storage_container: wm.storage_container || card.storage_container,
         units_per_container: wm.units_per_container ?? card.units_per_container,
         process_count: wm.process_count ?? card.process_count, note: wm.note || card.note,
-        // 大きさはマスタだけが持つ (カードには無い項目。ふだんは配送方法から見なす — 要件 §W-2)
-        video_url: wm.video_url || null, size_class: wm.size_class || null }
-    : { source: 'card', version: null, ...card, video_url: null, size_class: null };
+        // 大きさ・期限シールはマスタだけが持つ (カードには無い項目)
+        video_url: wm.video_url || null, size_class: wm.size_class || null,
+        expiry_seal: wm.expiry_seal == null ? null : Number(wm.expiry_seal) }
+    : { source: 'card', version: null, ...card, video_url: null, size_class: null, expiry_seal: null };
   const missing = [];
   if (!m.material_code) missing.push('資材');
   if (!m.storage_container) missing.push('保管箱');   // 画面の呼び名は「保管箱」(中原さん 2026-09-03。旧「入れもの」)

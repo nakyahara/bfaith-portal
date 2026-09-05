@@ -807,7 +807,7 @@ router.post('/api/label-waits', checkOrigin, api((req, res) => {
 
 // ─── 作業仕様のその場登録・修正 (f_iroha_work_master。中原さんFB③⑥) ───
 
-const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'size_class'];
+const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'size_class', 'expiry_seal'];
 
 /**
  * 権限 (要件 §7 と FB③の折衷):
