@@ -886,7 +886,17 @@ console.log('\n[16] 作業のやり方の選択肢 (資材・保管箱): Excel �
   {
     const { BUILTIN_OPTION_IMAGES, applyBuiltinOptionImages } = await import('../apps/iroha-work/db.js');
     const fsMod = await import('node:fs');
-    ok(BUILTIN_OPTION_IMAGES.length === 24 && BUILTIN_OPTION_IMAGES.every(b => fsMod.existsSync('public' + b.path)), '同梱画像 24 種が public/app-images/iroha-work にある');
+    ok(BUILTIN_OPTION_IMAGES.length === 27 && BUILTIN_OPTION_IMAGES.every(b => fsMod.existsSync('public' + b.path)), '同梱画像 27 種が public/app-images/iroha-work にある');
+    // 2026-09-05 追加の 3 種: 表記揺れ (全角・空白・括弧) を同じ画像に寄せる
+    {
+      const { normalizeOptionCode: norm } = await import('../apps/iroha-work/db.js');
+      const find = (code) => BUILTIN_OPTION_IMAGES.find((b) => b.kind === 'material' && b.keys.some((k) => norm(k) === norm(code)));
+      ok(find('D-8 チラシ入り') && find('Ｄ－８チラシ入り') && find('d-8(チラシ入り)') && find('D-8 チラシ入り').path.endsWith('zip-d-8-flyer.png'),
+        'D-8 チラシ入り は表記揺れ (全角・括弧) でも同じ画像。素の D-8 とは別');
+      ok(find('D-8').path.endsWith('zip-d-8.png'), '素の D-8 は今までの画像のまま');
+      ok(find('100mlプチプチ').path.endsWith('bubble-100ml.png') && find('プチプチ 200ml').path.endsWith('bubble-200ml.png') && find('１００ｍｌプチプチ').path.endsWith('bubble-100ml.png'),
+        'プチプチは 100ml 用と 200ml 用で別の画像 (全角の数字・ml も拾う)');
+    }
     ok(new Set(BUILTIN_OPTION_IMAGES.flatMap(b => b.keys.map(k => b.kind + ':' + normalizeOptionCode(k)))).size
        === BUILTIN_OPTION_IMAGES.reduce((a, b) => a + b.keys.length, 0), '同じ kind で重複する key が無い (別の資材の写真が出ない)');
     ok(validateOptionImageUrl('/app-images/iroha-work/vinyl-313.png').ok, '同梱画像のパスは使える');

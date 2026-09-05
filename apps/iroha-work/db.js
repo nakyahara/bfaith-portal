@@ -1572,6 +1572,10 @@ export const BUILTIN_OPTION_IMAGES = [
   { kind: 'material', path: '/app-images/iroha-work/t6-10.png', label: 'T6-10 (A8用 60×100)', keys: ['T6-10', 'T6-10(A8)', 'T6-10(A8用)'] },
   // チャックポリ (厚口)
   { kind: 'material', path: '/app-images/iroha-work/zip-d-8.png', label: 'D-8 チャックポリ (A7用 85×120)', keys: ['D-8', 'D8', 'D-8(A7)', 'D-8(A7用)'] },
+  // 中原さん 2026-09-05 追加 3 種: D-8 にチラシを同封する運用、プチプチ (エアキャップ) 袋の 100ml 用 / 200ml 用 (見た目は同じ。サイズ違い)
+  { kind: 'material', path: '/app-images/iroha-work/zip-d-8-flyer.png', label: 'D-8 チャックポリ チラシ入り', keys: ['D-8チラシ入り', 'D-8 チラシ入り', 'D-8(チラシ入り)', 'D8チラシ入り', 'チラシ入りD-8', 'チラシ入り D-8'] },   // 全角括弧は NFKC で同じ key になるので書かない
+  { kind: 'material', path: '/app-images/iroha-work/bubble-100ml.png', label: 'プチプチ袋 100ml用 (エアキャップ)', keys: ['100mlプチプチ', '100ml プチプチ', 'プチプチ100ml', 'プチプチ 100ml', '100mlエアキャップ', 'エアキャップ100ml', 'プチプチ(100ml)'] },
+  { kind: 'material', path: '/app-images/iroha-work/bubble-200ml.png', label: 'プチプチ袋 200ml用 (エアキャップ)', keys: ['200mlプチプチ', '200ml プチプチ', 'プチプチ200ml', 'プチプチ 200ml', '200mlエアキャップ', 'エアキャップ200ml', 'プチプチ(200ml)'] },
   { kind: 'material', path: '/app-images/iroha-work/zip-b-8.png', label: 'B-8 チャックポリ (A8用 60×85)', keys: ['B-8', 'B8', 'B-8(A8)', 'B-8(A8用)'] },
   { kind: 'material', path: '/app-images/iroha-work/warabanshi.png', label: 'わら半紙', keys: ['わら半紙', 'ワラ半紙', 'わらばんし'] },
   { kind: 'container', path: '/app-images/iroha-work/carton-120.png', label: '120 段ボール', keys: ['120段ボール', '段ボール120', '120ダンボール', 'ダンボール120', '120'] },
