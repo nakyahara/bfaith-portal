@@ -936,7 +936,7 @@ const ST_CLASS = {
   not_started: 'todo', in_progress: 'doing', ready_for_stocking: 'done', closed: 'done',
 };
 const stClass = s => ST_CLASS[s] || 'other';
-/** 画面に出す状態名 (アプリ正本は「保留 · ラベル待ち」のように理由つき) */
+/** 画面に出す状態名 (アプリ正本は status_label = 「終了 · 棚入完了」のように理由つき。旧「保留」は案A で札になった) */
 const stLabel = c => c.status_label || c.status || '—';
 const isApp = () => state.mode === 'app';
 /** 状態の値 → 表示名 (タブ・変更ダイアログ用) */
@@ -1328,7 +1328,7 @@ function renderList() {
   $('#list').innerHTML = cards.map(c => {
     const meta = [
       c.qty != null ? '<b>' + esc(c.qty) + '</b> 個' : null,
-      c.boxes ? esc(c.boxes) : null,
+      boxesText(c) ? '📦 ' + esc(boxesText(c, { short: true })) : null,
       c.plan_hours != null ? '⏱ ' + esc(approxHours(c.plan_hours)) : null,
       c.arrival ? '入庫 ' + esc(c.arrival) : null,
       masterSummary(c) || null,
@@ -1508,6 +1508,20 @@ function approxHours(h) {
   if (h == null || !Number.isFinite(Number(h))) return '';
   return '約 ' + fmtHours(Number(h));
 }
+/**
+ * 必要保管箱。Notion の式は「1箱+80」(いっぱいの箱 1 + 余り 80) だが、人が用意するのは 2 箱 (監修 PR-D。
+ * ⭐表記の変更は中原さんの判断待ち — 元の文字列は c.boxes に残してある)。
+ * boxes_calc が無い (入数なし・古い応答) ときは元の文字列のまま
+ */
+function boxesText(c, opts) {
+  const b = c.boxes_calc;
+  if (!b) return c.boxes || '';
+  if (b.base === 0) return '0 箱';
+  const detail = b.rest > 0
+    ? (b.full > 0 ? b.per + '×' + b.full + '＋' + b.rest : String(b.rest))
+    : b.per + '×' + b.full;
+  return (opts && opts.short) ? b.boxes + ' 箱' : b.boxes + ' 箱 (' + detail + ')';
+}
 /** 'YYYY-MM-DD' → 'M/D' (チップで折り返さないように)。日付でなければそのまま */
 function fmtMd(ymd) {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(ymd || ''));
@@ -1661,7 +1675,7 @@ function bcardHtml(c, status) {
     c.qty != null ? c.qty + ' 個' : null,
     c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
     c.hold_memo ? '📝 メモ' : null,
-    c.boxes || null,
+    boxesText(c) ? '📦 ' + boxesText(c, { short: true }) : null,
     c.plan_hours != null ? '⏱ ' + approxHours(c.plan_hours) : null,
     c.external_ready ? '📦 外部に出せます' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
@@ -2222,13 +2236,13 @@ function planAction(e) {
   savePlanWhen(id, when);
 }
 
-/** ドラッグで列に落として状態を変える。理由が要る状態 (保留・終了) はいつものダイアログを開く */
+/** ドラッグで列に落として状態を変える。理由が要る状態 (終了) はいつものダイアログを開く */
 function dropToStatus(id, to) {
   if (!stateCan('task.status.change')) return;
   const c = findCard(id);
   if (!c) return;
   // ⭐いつもの状態変更ダイアログを開いて、落とした先を選んだことにする。
-  //   理由 (保留・終了) や職員PINの流れを二重に書かない — 1 本道にしておく
+  //   理由 (終了) や職員PINの流れを二重に書かない — 1 本道にしておく
   openSt(null, id);
   if (stTarget == null) return;         // 開けなかった (許可なし・作業者未選択)
   doSetSt(to);
@@ -2742,7 +2756,11 @@ function workInfoHtml(c, m, missSet) {
   const locLabel = c.loc_kind === 'Y' ? 'Yロケ在庫 (外に出している分)' : 'Zロケ在庫 (一時保管)';
   const ref = '<div class="wiref"><div class="t">ⓘ ' + esc(locLabel) + '<span class="ro">見るだけ</span></div>' +
     (c.loc_stock == null
-      ? '<div class="main none">まだ取れていません</div>'
+      ? '<div class="main none">まだ取れていません (在庫の取り込みが無い)</div>'
+      // ⭐行が無い = Z に在庫 0。「取れていない」とは別 (0 なら P ロケから持ってくる — 監修 B-8)
+      : c.loc_stock === 0
+      ? '<div class="main none">在庫なし (0 個)</div>' +
+        '<div class="detail num">' + (c.loc_at ? fmtDate(c.loc_at) + ' ' + fmtTime(c.loc_at) + ' 時点' : '') + '</div>'
       : '<div class="main num">使えるのは ' + esc(String(c.loc_free)) + '<span class="unit">個</span></div>' +
         '<div class="detail num">在庫 ' + esc(String(c.loc_stock)) + '個 − 引当 ' + esc(String(c.loc_allocated || 0)) + '個' +
         (c.loc_at ? ' ・ ' + fmtDate(c.loc_at) + ' ' + fmtTime(c.loc_at) + ' 時点' : '') + '</div>') +
@@ -2798,8 +2816,8 @@ function headNumsHtml(c) {
     n('つくる数', c.qty, '個', 'big') +
     n('できた数', done, '個', 'done') +
     (done == null ? '' : n('残り', rest, '個', 'rest')) +
-    n('必要保管箱', c.boxes, '') +
-    n('想定作業時間', c.plan_hours, '時間') +
+    n('必要保管箱', boxesText(c) || null, '') +
+    n('想定作業時間', c.plan_hours != null ? approxHours(c.plan_hours) : null, '') +
     (over > 0 ? '<div class="n unk"><label>つくる数より</label><div class="v">+' + esc(String(over)) + '<span class="u">個</span></div></div>' : '') +
     (canEditProgress(c) ? '<button class="edit" onclick="openDq(null)">✎ できた数</button>' : '') +
     '</div>';

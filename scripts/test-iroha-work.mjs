@@ -2994,6 +2994,11 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   clearEnrichCache();
   const card = S2.buildTaskList().cards.find(c => c.id === t);
   ok(card && card.plan_hours === 0.3 && card.boxes === '10箱', '一覧のカードに想定作業時間と必要保管箱が乗る');
+  ok(card.boxes_calc && card.boxes_calc.boxes === 10 && card.boxes_calc.full === 10 && card.boxes_calc.rest === 0 && card.boxes_calc.per === 10,
+    '用意する箱の数 (boxes_calc) も乗る');
+  ok(S2.neededBoxesCalc(200, 120).boxes === 2 && S2.neededBoxesCalc(200, 120).rest === 80 && S2.neededBoxesCalc(180, 120).boxes === 2 && S2.neededBoxesCalc(180, 120).full === 1
+    && S2.neededBoxesCalc(0, 120).boxes === 0 && S2.neededBoxesCalc(5, 0) === null,
+    '「1箱+80」= 用意する箱は 2 (余りの箱も数える — 監修 PR-D)。入数なしは null');
   // Z ロケの在庫があれば、そちらで数える
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
   db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
@@ -3049,10 +3054,27 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   ok(cY.z_stock === 50, '必要保管箱は Notion の式のまま Z を使う (表示だけ Y に変える)');
   db.prepare("DELETE FROM mirror_logizard_stock WHERE ロケ LIKE 'Y%'").run();
   clearEnrichCache();
-  ok(S2.buildTaskList().cards.find(c => c.id === tY).loc_stock === null, 'Y に在庫が無ければ出さない (Z を代わりに出さない)');
+  {
+    // ⭐行が無い = その拠点のロケに 0 (ミラーが取れている限り)。Z を代わりに出さない (監修 B-8)
+    const cY2 = S2.buildTaskList().cards.find(c => c.id === tY);
+    const mirrorMax = db.prepare('SELECT MAX(captured_at) m FROM mirror_logizard_stock').get().m;
+    ok(cY2.loc_kind === 'Y' && cY2.loc_stock === 0 && cY2.loc_free === 0 && cY2.loc_at === mirrorMax,
+      'Y に行が無ければ「Y に在庫 0」(ミラーの最新時刻つき。Z を代わりに出さない)');
+  }
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
   clearEnrichCache();
-  ok(S2.buildTaskList().cards.find(c => c.id === t).z_stock === null, 'Z に在庫が無ければ null (数量で計算)');
+  {
+    const cZ2 = S2.buildTaskList().cards.find(c => c.id === t);
+    ok(cZ2.z_stock === 0 && cZ2.loc_stock === 0 && cZ2.boxes === '10箱', 'Z に行が無ければ 0 個 (必要保管箱は数量で計算 — 監修 B-8)');
+    // 本当に取れていない = ミラーが空 → null (「まだ取れていません」)。0 と取れていないは別のこと
+    db.exec('CREATE TABLE _mirror_bak AS SELECT * FROM mirror_logizard_stock');
+    db.exec('DELETE FROM mirror_logizard_stock');
+    clearEnrichCache();
+    const cZ3 = S2.buildTaskList().cards.find(c => c.id === t);
+    ok(cZ3.z_stock === null && cZ3.loc_stock === null && cZ3.loc_at === null && cZ3.boxes === '10箱', 'ミラーが空なら null (取れていない)。必要保管箱は数量で出る');
+    db.exec('INSERT INTO mirror_logizard_stock SELECT * FROM _mirror_bak; DROP TABLE _mirror_bak');
+    clearEnrichCache();
+  }
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'PLAN-A'");
   clearEnrichCache();
 
@@ -3301,12 +3323,18 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '保存後にボタンを無条件で戻さない (許可リストで判断する。正本だけを見ない)');
   // 実機FB (2026-09-03): ボードに写真・項目タップで変更・想定作業時間の合計
   ok(/\(c\.image_url \? '<div class="th">' \+ thumbHtml\(c\) \+ '<\/div>' : ''\)/.test(html), 'ボードのカードに写真を出す (写真が無いカードは空枠を出さない — 監修)');
+  // 監修 PR-D: 意味を正す
+  ok(/function boxesText\(c, opts\)/.test(html) && /boxesText\(c, \{ short: true \}\)/.test(html) && /n\('必要保管箱', boxesText\(c\) \|\| null, ''\)/.test(html),
+    '必要保管箱は「用意する箱の数」で出す (boxes_calc。元の式の文字列は c.boxes に残す)');
+  ok(/: c\.loc_stock === 0\s*\r?\n?\s*\? '<div class="main none">在庫なし \(0 個\)<\/div>'/.test(html) && /まだ取れていません \(在庫の取り込みが無い\)/.test(html),
+    'Zロケ「0 個」と「まだ取れていません」を分ける (監修 B-8)');
+  ok(!/保留/.test(html.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')), '画面の文言に「保留」が残っていない (案A: 止まった／中断)');
   ok(!/onclick="openMaster/.test(html) && /data-reg="/.test(html), '作業のやり方は項目タップで変更 (編集ボタンなし)');
   ok(/\+ \(empty \? '＋ 登録' : '✎ 変更'\) \+/.test(html), '値があれば「変更」、無ければ「登録」と出す');
   ok(!/mvVideo/.test(html.replace(/\/\/.*$/gm, '')), '作り方どうがは画面から外した (コメントだけ残す)');
   ok(/const hours = mine\.reduce/.test(html), 'ボードの列に想定作業時間の合計を出す');
   ok(/function headNumsHtml\(c\)/.test(html) && /n\('つくる数'/.test(html)
-    && /n\('必要保管箱', c\.boxes/.test(html) && /n\('想定作業時間'/.test(html),
+    && /n\('必要保管箱', boxesText\(c\) \|\| null, ''\)/.test(html) && /n\('想定作業時間', c\.plan_hours != null \? approxHours\(c\.plan_hours\) : null, ''\)/.test(html),
     '必要保管箱と想定作業時間は「つくる数」の横に出す (作業情報の枠からは外す)');
   ok(/function careHtml\(c\)/.test(html) && /class="care"/.test(html),
     '気をつけることは上部に強調して出す (中身があるときだけ)');
