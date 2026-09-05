@@ -419,6 +419,8 @@ export function setTaskBlock({ taskId, reason, note = null, doneQty = undefined,
     });
     const dqTxt = nextQty !== (t.done_qty ?? null) ? ` できた${t.done_qty ?? '—'}→${nextQty ?? '—'}` : '';
     const hmTxt = nextMemo !== (t.hold_memo ?? null) ? (nextMemo ? ` メモ:${nextMemo}` : ' メモ消去') : '';
+    // 履歴は safe (失敗しても札とタイマー停止は成立させる — 現場を止めない。他の操作と同じ方針)。
+    // 誰のタイマーを止めたかは f_iroha_work_sessions 自体 (ended_at / end_reason='pause') に残るので、履歴が欠けても追える
     safeLogTaskEvent({ taskId: t.id, action: 'task_blocked', from: t.blocked_reason || null,
       to: `${reason}${noteText ? ' (' + noteText + ')' : ''}${stopped.length ? ` タイマー停止 ${stopped.length} 人` : ''}${dqTxt}${hmTxt}`,
       workerId, workerName, deviceLabel, ok: true });
@@ -751,7 +753,14 @@ export function listLabelWaits({ taskId = null, openOnly = true, limit = 500 } =
  */
 export function upsertLabelWait({ id = null, taskId, fields = {}, expectVersion = null, actor = null }) {
   const db = getDB();
-  return db.transaction(() => appModeGuard() || upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor })).immediate();
+  // ⭐札を外せなかったときは例外で巻き戻す (値を return すると commit されるため — Codex PR #1193 R1 #4)。
+  //   「完了にしたのに札だけ残る」を作らない。呼び元には ok:false の結果として返す
+  try {
+    return db.transaction(() => appModeGuard() || upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor })).immediate();
+  } catch (e) {
+    if (e && e.rollbackResult) return e.rollbackResult;
+    throw e;
+  }
 }
 /** 持ち主の確認と書き込みを同じトランザクションで (終了直後に記録が入らないように — Codex PR1 R4) */
 function upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor }) {
@@ -801,7 +810,8 @@ function upsertLabelWaitInTx({ id, taskId, fields, expectVersion, actor }) {
     const stillOpen = db.prepare('SELECT COUNT(*) c FROM f_iroha_label_waits WHERE task_id = ? AND done = 0').get(cur.task_id).c;
     if (stillOpen === 0) {
       const u = clearTaskBlockInTx(db, owner, { via: 'label_wait_done', actor });
-      if (u.ok) unblocked = u.task;
+      if (!u.ok) throw Object.assign(new Error(u.message || '札を外せませんでした'), { rollbackResult: u });   // 記録の更新ごと巻き戻す
+      unblocked = u.task;
     }
   }
   // task = 札が外れたときだけ (画面がカードをその場で差し替える。外れなければ undefined)
@@ -886,7 +896,7 @@ export function _setStartTaskSessionHook(fn) { startTaskSessionHook = fn; }
  * @param worker 端末を操作している人 (状態変更の actor・ログに残る)
  * @param workers 実際に作業する人たち (複数可)。省略時は操作者ひとり
  */
-export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null, clearBlock = false }) {
+export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null }) {
   const db = getDB();
   const crew = (Array.isArray(workers) && workers.length) ? workers : [worker];
   const tx = db.transaction(() => {
@@ -904,6 +914,13 @@ export function startTaskSession({ taskId, worker, workers = null, deviceLabel =
         const b = blockedOf(t);
         return { ok: false, error: 'blocked', blocked: b, task: t,
           message: `まだ「${b.label}」で止まっています。解消していれば、確認してから始められます` };
+      }
+      // ⭐画面で確認した札 (版) と同じときだけ外す。確認している間に別の端末が理由を付け替えていたら、
+      //   その新しい札を黙って外さず、もう一度確認してもらう (Codex PR #1193 R1 #2)
+      if (expectVersion == null) return { ok: false, error: 'bad_request', message: '確認した版 (expect_version) が必要です (画面を更新してください)' };
+      if (Number(expectVersion) !== t.version) {
+        return { ok: false, error: 'conflict', current: t, blocked: blockedOf(t),
+          message: '止まっている理由が変わっています。もう一度確かめてください' };
       }
       const c = clearTaskBlockInTx(db, t, { via: 'start', actor: `${worker.display_name} (いろはアプリ)`, workerId: worker.id, workerName: worker.display_name, deviceLabel });
       if (!c.ok) return c;

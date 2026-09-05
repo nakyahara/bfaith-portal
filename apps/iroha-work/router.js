@@ -759,11 +759,18 @@ router.post('/api/block', checkOrigin, api((req, res) => {
   res.json({ ok: true, task: publicTask(r.task), stopped: r.stopped, serverNow: new Date().toISOString() });
 }));
 
-/** 札を外す (職員が手で外す / 届いたのを確認して外す)。進捗は変えない。開始と同時に外すのは /api/sessions/start の clear_block */
+/**
+ * 札を外す (作業は始めない)。⭐職員だけ — 画面でボタンを隠すだけでは権限にならない (Codex PR #1193 R1 #3)。
+ * ポータルのセッション、または端末の職員モード (PIN で開けた 30 分) のときだけ通す。
+ * 利用者が「解消した」と言って始めるのは /api/sessions/start の clear_block (開始と同時にだけ外せる)
+ */
 router.post('/api/unblock', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  if (!staffModeOf(req).staff) {
+    return res.status(403).json({ ok: false, error: 'staff_required', message: '札を手で外せるのは職員だけです (職員モードに入ってください)。作業を始めるなら「▶ 作業をはじめる」から外せます' });
+  }
   const unblockTaskId = parseTaskId(req.body?.id ?? req.body?.task_id);
   if (unblockTaskId == null) return res.status(400).json(BAD_TASK_ID);
   if (isClosedCardId(unblockTaskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
@@ -1503,7 +1510,7 @@ function startSessionApp(req, res, worker, crew) {
   };
   // ⭐止まっている札が付いたカードは、画面で「解消した」と確かめてから clear_block: true で送り直す (案A)
   const r = startTaskSession({ taskId, worker, workers: crew, deviceLabel: deviceLabelOf(req), snapshotOf,
-    clearBlock: req.body?.clear_block === true });
+    clearBlock: req.body?.clear_block === true, expectVersion: req.body?.expect_version ?? null });
   if (!r.ok) {
     const http = r.error === 'bad_request' ? 400 : r.error === 'not_found' ? 404 : 409;
     return res.status(http).json({ ...r, task: r.task ? publicTask(r.task) : undefined, current: r.current ? publicTask(r.current) : undefined });

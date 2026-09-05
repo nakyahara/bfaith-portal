@@ -1048,9 +1048,10 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   ok(T.validateTaskInvariants({ status: 'closed', close_reason: 'stocked', closed_at: 'x' }).length === 0
     && T.validateTaskInvariants({ status: 'closed' }).length === 2
     && T.validateTaskInvariants({ status: 'on_hold' }).length === 1
-    && T.validateTaskInvariants({ status: 'in_progress', blocked_reason: 'other' }).length === 1
-    && T.validateTaskInvariants({ status: 'in_progress', blocked_reason: 'label_shortage' }).length === 0
-    && T.validateTaskInvariants({ status: 'ready_for_stocking', blocked_reason: 'label_shortage' }).length === 1
+    && T.validateTaskInvariants({ status: 'in_progress', blocked_reason: 'other', blocked_at: 'x' }).length === 1
+    && T.validateTaskInvariants({ status: 'in_progress', blocked_reason: 'label_shortage', blocked_at: 'x' }).length === 0
+    && T.validateTaskInvariants({ status: 'in_progress', blocked_reason: 'label_shortage' }).length === 1
+    && T.validateTaskInvariants({ status: 'ready_for_stocking', blocked_reason: 'label_shortage', blocked_at: 'x' }).length === 1
     && T.validateTaskInvariants({ status: 'in_progress', hold_reason_code: 'label_shortage' }).length === 1
     && T.validateTaskInvariants({ status: 'in_progress', close_reason: 'stocked' }).length === 1,
     '不変条件 (closed の理由/時刻・on_hold は進捗でない・止まっている理由は未着手/作業中だけ・その他はメモ・旧列は使わない)');
@@ -1865,9 +1866,15 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
     const blockedStart = await call('POST', '/api/sessions/start', { cookie, body: { id: String(task.id), worker_id: w1.id, worker_ids: [w1.id] } });
     ok(blockedStart.status === 409 && blockedStart.json.error === 'blocked' && blockedStart.json.blocked?.reason === 'label_shortage' && /止まっています/.test(blockedStart.json.message),
       '止まっているカードの開始は 409 blocked (理由つき)');
-    const clearedStart = await call('POST', '/api/sessions/start', { cookie, body: { id: String(task.id), worker_id: w1.id, worker_ids: [w1.id], clear_block: true } });
+    // 外して始めるときは、確認した版を添える (確認している間に別の端末が理由を付け替えていたら断る — Codex PR #1193 R1 #2)
+    ok((await call('POST', '/api/sessions/start', { cookie, body: { id: String(task.id), worker_id: w1.id, worker_ids: [w1.id], clear_block: true } })).status === 400,
+      'clear_block に版 (expect_version) が無ければ 400');
+    const staleClear = await call('POST', '/api/sessions/start', { cookie, body: { id: String(task.id), worker_id: w1.id, worker_ids: [w1.id], clear_block: true, expect_version: 1 } });
+    ok(staleClear.status === 409 && staleClear.json.error === 'conflict' && staleClear.json.blocked?.reason === 'label_shortage' && TD.getTask(task.id).blocked_reason === 'label_shortage',
+      '古い版で外そうとしたら 409 (札はそのまま・いまの理由を返す)');
+    const clearedStart = await call('POST', '/api/sessions/start', { cookie, body: { id: String(task.id), worker_id: w1.id, worker_ids: [w1.id], clear_block: true, expect_version: TD.getTask(task.id).version } });
     ok(clearedStart.status === 200 && clearedStart.json.ok && clearedStart.json.task.blocked === null && TD.getTask(task.id).blocked_reason === null,
-      'clear_block: true なら札を外して始める (同じ書き込み)');
+      'clear_block: true + いまの版なら札を外して始める (同じ書き込み)');
     await call('POST', '/api/sessions/stop', { cookie, body: { id: task.id, worker_id: w1.id, session_ids: [clearedStart.json.sessionId], reason: 'pause' } });
     // 棚入待ちに進めると札は外れる
     const vb = TD.getTask(task.id).version;
@@ -1899,10 +1906,13 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok(row().hold_memo === 'ラベルは貼り終わり、袋詰めの途中', '中断メモは前後の空白を落として残す');
       ok(h1.json.task.done_qty === 120 && h1.json.task.hold_memo === 'ラベルは貼り終わり、袋詰めの途中', '返事にも載る (一覧の取り直しを待たない)');
       // ② 作業中に戻しても中断メモは残る (次にやる人が読むもの)
-      const back = await call('POST', '/api/unblock', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v() } });
+      // 札を手で外すのは職員だけ (画面で隠すだけでは権限にならない — Codex PR #1193 R1 #3)
+      const denied = await call('POST', '/api/unblock', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v() } });
+      ok(denied.status === 403 && denied.json.error === 'staff_required' && row().blocked_reason === 'label_shortage', '利用者 (端末) は /api/unblock を叩けない (403)');
+      const back = await call('POST', '/api/unblock', { ...admin, body: { id: T5, worker_id: w1.id, expect_version: v() } });
       ok(back.status === 200 && back.json.task.blocked === null && row().blocked_reason === null
         && row().hold_memo === 'ラベルは貼り終わり、袋詰めの途中' && row().done_qty === 120,
-        '札を外しても、できた数と中断メモは残る (次にやる人が読む)');
+        '職員 (ポータル) なら札を外せる。できた数と中断メモは残る (次にやる人が読む)');
       // ③ あとから直せる (数え間違い)
       const fix = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v(), done_qty: 130 } });
       ok(fix.status === 200 && fix.json.ok && row().done_qty === 130 && row().hold_memo === 'ラベルは貼り終わり、袋詰めの途中',
@@ -3316,9 +3326,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function openBlock\(\)/.test(html) && /id="blockOv"/.test(html) && /data-block-reason=/.test(html) && /'\/api\/block'/.test(html)
     && /reason: blockReason, expect_version: c\.version/.test(html),
     '「⛔ 止まった」は専用ダイアログで、理由を 1 タップ → 何個までできたか → メモ を /api/block に 1 回で送る (進捗は変えない)');
-  ok(/\.\.\.\(v\.qty != null \? \{ done_qty: v\.qty \} : \{\}\), \.\.\.\(v\.memo \? \{ hold_memo: v\.memo \} : \{\}\)/.test(html)
+  ok(/\.\.\.\(v\.qty != null \? \{ done_qty: v\.qty \} : \{\}\),\s*\.\.\.\(blockReason === 'other' \? \{ note: v\.memo \} : \(v\.memo \? \{ hold_memo: v\.memo \} : \{\}\)\)/.test(html)
     && /空のまま進めると、前に数えた値はそのまま残ります/.test(html),
-    '数を入れなければ送らない = 前に数えた値は消さない (メモも書いたときだけ)');
+    '数を入れなければ送らない = 前に数えた値は消さない。「その他」のメモは止まった理由にだけ (申し送りと二重にしない)');
   ok(/blockReason === 'other' && !v\.memo/.test(html) && /「その他」は何で止まったかをメモに書いてください/.test(html), '「その他」はメモが無いと送らない');
   ok(/c\.active = \[\];\s*\/\/ タイマーは全員止まった/.test(html), '止めたら作業中の人のタイマーは全員止まる (画面もそう描く)');
   // ✅ できあがり → 「何個できましたか → 棚入待ちにする」(監修 B-7 / F-3)。「終了」は出さない
@@ -3328,7 +3338,10 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(!/終了 → 棚入完了/.test(html), '「終了 → 棚入完了を (職員PIN)」の案内は出さない (利用者が押せるのは棚入待ち)');
   // 止まっているカードを始めるときの確認 → clear_block で外してから始める
   ok(/if \(j\.error === 'blocked'\)/.test(html) && /openUnblock\(/.test(html) && /startWork\(ids, \{ clearBlock: true \}\)/.test(html)
-    && /\{ clear_block: true \}/.test(html), '止まっているカードは「解消しましたか?」を聞いてから clear_block で始める');
+    && /clear_block: true, expect_version: cur \? cur\.version : undefined/.test(html)
+    && /j\.error === 'conflict' && opts && opts\.clearBlock/.test(html),
+    '止まっているカードは「解消しましたか?」を聞いてから clear_block + 確認した版で始める (理由が変わっていたらもう一度確認)');
+  ok(/let unblockSaving = false;/.test(html) && /if \(!unblockCtx \|\| unblockSaving\) return;/.test(html), '確認ダイアログも二重押し・処理中の閉じを防ぐ');
   // 「ぬける」= その人だけ pause。最後の 1 人でも「できあがり」の案内は出さない (監修 B-6)
   ok(/stopWork\('pause', \[sessionId\], \{ leaving: a\.worker_name \}\)/.test(html) && />ぬける<\/button>/.test(html) && !/>終わった<\/button>/.test(html),
     '「ぬける」はその人のタイマーだけ止める (pause)。旧「終わった」(done) は無い');
@@ -3336,7 +3349,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/id="dbar"/.test(html) && /function barHtml\(c\)/.test(html) && /bar\.hidden = !barH;/.test(html)
     && /class="btn stop" onclick="openBlock\(\)">⛔ 止まった/.test(html) && /⏸ ひとやすみ/.test(html),
     'はじめる / タイマー / ひとやすみ / できあがり / ⛔止まった は画面下の固定バー (許可が無ければ出さない)');
-  ok(/if \(!can\('task\.work\.start'\)\) return '';/.test(html), '固定バーは許可が無ければ描かない (下見・履歴)');
+  ok(/const canWork = can\('task\.work\.start'\);/.test(html) && /if \(!canWork && !stopBtn\) return '';/.test(html),
+    '固定バーは許可ごとに描く (はじめる等 = task.work.start / ⛔止まった = task.block)。どちらも無ければ出さない (下見・履歴)');
   ok(/\.\.\.\(doneQty !== undefined \? \{ done_qty: doneQty \} : \{\}\)/.test(html)
     && /\.\.\.\(holdMemo !== undefined \? \{ hold_memo: holdMemo \} : \{\}\)/.test(html),
     '状態とできた数は 1 回の通信で送る (分けると「保留にはなったが数が入らない」が起きる)');
@@ -3768,6 +3782,7 @@ console.log('\n[24] 複数人での作業開始・まとめ終了・記録の検
 console.log('\n[25] ⛔ 止まっている理由の札 — タイマー停止・ラベル待ち連動・開始ガード・旧「保留」の移行 (案A 2026-09-05)');
 {
   const TD = await import('../apps/iroha-work/tasks-db.js');
+  const T = await import('../apps/iroha-work/tasks.js');
   const { createTables } = await import('../apps/iroha-work/db.js');
   const db = getDB();
   setMetaValue('source_of_truth', 'app');   // 前の節で Notion に戻していることがある (アプリ正本でないと書けない)
@@ -3793,8 +3808,13 @@ console.log('\n[25] ⛔ 止まっている理由の札 — タイマー停止・
   ok(again.ok === false && again.error === 'blocked' && again.blocked.reason === 'label_shortage' && again.blocked.label === 'ラベル待ち',
     '止まっているカードの開始は blocked (理由つき)');
   ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL").get(tid).c === 0, '断られたときはセッションが増えない');
-  const go = TD.startTaskSession({ taskId: tid, worker: wA, workers: [wA], clearBlock: true });
-  ok(go.ok && go.task.blocked_reason === null && go.sessions.length === 1, 'clearBlock で札を外して開始 (1 トランザクション)');
+  ok(TD.startTaskSession({ taskId: tid, worker: wA, workers: [wA], clearBlock: true }).error === 'bad_request', 'clearBlock に版が無ければ断る');
+  const staleGo = TD.startTaskSession({ taskId: tid, worker: wA, workers: [wA], clearBlock: true, expectVersion: 1 });
+  ok(staleGo.error === 'conflict' && staleGo.blocked.reason === 'label_shortage' && TD.getTask(tid).blocked_reason === 'label_shortage',
+    '確認した版が古ければ外さない (別の端末が理由を付け替えていた場合)');
+  const go = TD.startTaskSession({ taskId: tid, worker: wA, workers: [wA], clearBlock: true, expectVersion: TD.getTask(tid).version });
+  ok(go.ok && go.task.blocked_reason === null && go.task.blocked_at === null && go.task.blocked_by === null && go.sessions.length === 1,
+    'clearBlock + いまの版で札 (4 列とも) を外して開始 (1 トランザクション)');
   ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_unblocked' AND to_value = 'start'").get(tid).c === 1,
     '外した経路 (start) が履歴に残る');
   TD.stopSession && 0;   // (単数版はここでは使わない)
@@ -3824,8 +3844,53 @@ console.log('\n[25] ⛔ 止まっている理由の札 — タイマー停止・
   ok(rd.ok && rd.task.blocked_reason === null && rd.task.blocked_at === null, '棚入待ちにすると札が外れる');
   ok(TD.setTaskBlock({ taskId: tid, reason: 'label_shortage', expectVersion: rd.task.version }).error === 'bad_block', '棚入待ちのカードは止められない');
   let ddlErr = null;
-  try { db.prepare("UPDATE f_iroha_tasks SET blocked_reason = 'label_shortage' WHERE id = ?").run(tid); } catch (e) { ddlErr = e; }
+  try { db.prepare("UPDATE f_iroha_tasks SET blocked_reason = 'label_shortage', blocked_at = '2026-09-05T00:00:00.000Z' WHERE id = ?").run(tid); } catch (e) { ddlErr = e; }
   ok(ddlErr && /CHECK/i.test(ddlErr.message), 'DB の CHECK でも「棚入待ちに札」は入らない (経路の検証漏れがあっても DB が止める)');
+  // 札の 4 列は一組 (Codex PR #1193 R1 #5)
+  let orphanErr = null;
+  try { db.prepare("UPDATE f_iroha_tasks SET blocked_note = 'のこりかす' WHERE id = ?").run(tid); } catch (e) { orphanErr = e; }
+  ok(orphanErr && /CHECK/i.test(orphanErr.message), '理由が無いのにメモだけ残す UPDATE は DB が断る');
+  ok(T.validateTaskInvariants({ status: 'in_progress', blocked_note: 'x' }).length === 1
+    && T.validateTaskInvariants({ status: 'in_progress', blocked_reason: 'label_shortage' }).length === 1
+    && T.validateTaskInvariants({ status: 'in_progress', blocked_reason: 'label_shortage', blocked_at: 'x' }).length === 0,
+    'サービス層も同じ規則: 理由なしの付随列は不正・理由があるなら blocked_at 必須');
+
+  // ── 作り直しの前に、旧「保留」の不整合行 (CHECK 無しの古い版にだけ残りうる) を直す (Codex PR #1193 R1 #1) ──
+  {
+    const beforeN = db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c;
+    // いまの定義から「保留の CHECK」と「札の CHECK」を抜いた表 = CHECK 無しの古い版
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql
+      .replace(/^\s*--.*$/gm, '')   // 説明のコメント行を落とす (CHECK の前にコメントが挟まると下の置換が当たらない)
+      .replace(/,\s*CHECK \(\(status = 'on_hold'\) = \(hold_reason_code IS NOT NULL\)\)/, '')
+      .replace(/,\s*CHECK \(blocked_reason IS NULL OR status IN \('not_started','in_progress'\)\)/, '')
+      .replace(/,\s*CHECK \(blocked_reason IS NOT NULL OR \(blocked_note IS NULL AND blocked_at IS NULL AND blocked_by IS NULL\)\)/, '')
+      .replace('f_iroha_tasks', 'f_iroha_tasks__old');
+    const cols = db.prepare('PRAGMA table_info(f_iroha_tasks)').all().map((c) => c.name);
+    db.pragma('foreign_keys = OFF');
+    db.exec(`${sql};
+      INSERT INTO f_iroha_tasks__old (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM f_iroha_tasks;
+      DROP TABLE f_iroha_tasks;
+      ALTER TABLE f_iroha_tasks__old RENAME TO f_iroha_tasks;`);
+    db.pragma('foreign_keys = ON');
+    // CHECK が無いので不整合行を入れられる: ①on_hold なのに理由なし ②未着手なのに理由あり
+    db.prepare(`INSERT INTO f_iroha_tasks (notion_page_id, status, product_code, product_name, qty, version, created_at, updated_at)
+      VALUES ('bad-hold-1', 'on_hold', 'BAD-1', '理由なしの保留', 1, 1, '2026-09-01T00:00:00.000Z', '2026-09-02T00:00:00.000Z')`).run();
+    db.prepare(`INSERT INTO f_iroha_tasks (notion_page_id, status, hold_reason_code, product_code, product_name, qty, version, created_at, updated_at)
+      VALUES ('bad-hold-2', 'not_started', 'label_shortage', 'BAD-2', '未着手なのに理由の残骸', 1, 1, '2026-09-01T00:00:00.000Z', '2026-09-02T00:00:00.000Z')`).run();
+    ok(!/blocked_reason IS NULL OR status IN/.test(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql), '前提: CHECK 無しの古い表になっている');
+    let rebuildErr = null;
+    try { createTables(db); } catch (e) { rebuildErr = e; }
+    ok(!rebuildErr, '不整合行があっても作り直しが失敗しない (先に直してから写す)' + (rebuildErr ? ' — ' + rebuildErr.message : ''));
+    const b1 = TD.getTaskByPageId('bad-hold-1');
+    const b2 = TD.getTaskByPageId('bad-hold-2');
+    ok(b1 && b1.status === 'not_started' && b1.blocked_reason === 'other' && /理由が記録されていません/.test(b1.blocked_note) && b1.hold_reason_code === null,
+      '理由なしの保留 → 未着手 + その他 (理由不明のメモ) の札');
+    ok(b2 && b2.status === 'not_started' && b2.hold_reason_code === null && b2.blocked_reason === null, '未着手に残っていた理由の残骸は消える (札にはしない)');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === beforeN + 2, '元の行は全部残る');
+    ok(/blocked_reason IS NOT NULL OR \(blocked_note IS NULL AND blocked_at IS NULL AND blocked_by IS NULL\)/.test(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'f_iroha_tasks'").get().sql),
+      '作り直した表には札の CHECK が付いている');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'migration_on_hold_fix'").get().c === 1, '補正したことが操作履歴に残る');
+  }
 
   // ── 旧「保留」(status='on_hold') が残った DB を開くと、進捗 + 札に写す ──
   db.prepare(`INSERT INTO f_iroha_tasks (notion_page_id, status, hold_reason_code, hold_reason_note, product_code, product_name, qty, started_at, version, created_at, updated_at)
@@ -3841,8 +3906,9 @@ console.log('\n[25] ⛔ 止まっている理由の札 — タイマー停止・
     '未着手の旧保留 → 未着手 + その他 (メモそのまま)。版も進む');
   ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_tasks WHERE status = 'on_hold'").get().c === 0, 'on_hold の行は残らない');
   ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'migration_on_hold'").get().c >= 1, '移行の件数が操作履歴に残る');
+  const migN = db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'migration_on_hold'").get().c;
   createTables(db);
-  ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'migration_on_hold'").get().c === 1 && TD.getTaskByPageId('legacy-hold-2').version === 2,
+  ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'migration_on_hold'").get().c === migN && TD.getTaskByPageId('legacy-hold-2').version === 2,
     '2 回目の起動では何もしない (冪等)');
   ok(TD.countTasksByStatus().blocked >= 2, '管理画面の内訳に「止まっている」件数が出る');
 }

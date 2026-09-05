@@ -142,6 +142,10 @@ export function validateTaskInvariants(task) {
     if (!BLOCK_REASONS.includes(task.blocked_reason)) problems.push(`blocked_reason が不正: ${task.blocked_reason}`);
     if (!BLOCKABLE_STATUSES.includes(task.status)) problems.push('棚入待ち・終了のカードは止まっている理由を持たない');
     if (task.blocked_reason === 'other' && !String(task.blocked_note || '').trim()) problems.push('止まっている理由「その他」にはメモが必要');
+    if (!task.blocked_at) problems.push('止まっている理由には blocked_at (いつ止めたか) が必要');
+  } else if (task.blocked_note != null || task.blocked_at != null || task.blocked_by != null) {
+    // 4 列は一組。理由が無いのにメモ・時刻・人だけ残さない (DB の CHECK と同じ規則)
+    problems.push('止まっていないのに blocked_note / blocked_at / blocked_by が残っている');
   }
   // ⭐できた数 (要件 §Y)。NULL = まだ数えていない。0 と区別するので「無い」を 0 に丸めない
   if (task.done_qty != null && (!Number.isInteger(task.done_qty) || task.done_qty < 0)) problems.push('できた数は 0 以上の整数');

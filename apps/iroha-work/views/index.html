@@ -3326,10 +3326,13 @@ function blockedHtml(c) {
 
 /** 画面下の固定バー。許可が無い (下見・履歴・Notion 正本の読むだけ) なら空 = 出さない */
 function barHtml(c) {
-  if (!can('task.work.start')) return '';
-  if (c.status === 'closed' || c.status === '棚入完了') return '';
-  if (c.status === 'ready_for_stocking') return '<div class="in"><span class="ro">✅ できあがり済み — 棚に入れたら職員が「終了」にします</span></div>';
+  // 許可ごとに描く: はじめる/ひとやすみ/できあがり = task.work.start、⛔止まった = task.block。どちらも無ければ出さない
+  const canWork = can('task.work.start');
   const stopBtn = isApp() && can('task.block') ? '<button class="btn stop" onclick="openBlock()">⛔ 止まった</button>' : '';
+  if (!canWork && !stopBtn) return '';
+  if (c.status === 'closed' || c.status === '棚入完了') return '';
+  if (c.status === 'ready_for_stocking') return canWork ? '<div class="in"><span class="ro">✅ できあがり済み — 棚に入れたら職員が「終了」にします</span></div>' : '';
+  if (!canWork) return '<div class="in">' + stopBtn + '</div>';
   if (c.active.length) {
     // 複数人で作業していることがある。タイマーは**いちばん早く始めた人**を基準にする
     const first = c.active.reduce((a, b) => (Date.parse(a.started_at) <= Date.parse(b.started_at) ? a : b));
@@ -3391,10 +3394,11 @@ async function submitBlock() {
   try {
     j = await apiFetch('/api/block', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      // できた数は入れたときだけ送る (空 = 前の値のまま)。メモも書いたときだけ
+      // できた数は入れたときだけ送る (空 = 前の値のまま)。メモも書いたときだけ。
+      // 「その他」のメモは止まった理由 (blocked_note) にだけ入れる — 申し送り (hold_memo) と二重に持たない (Codex PR #1193 R1 #7)
       body: JSON.stringify({ id: c.id, worker_id: worker.id, reason: blockReason, expect_version: c.version,
-        ...(blockReason === 'other' ? { note: v.memo } : {}),
-        ...(v.qty != null ? { done_qty: v.qty } : {}), ...(v.memo ? { hold_memo: v.memo } : {}) }),
+        ...(v.qty != null ? { done_qty: v.qty } : {}),
+        ...(blockReason === 'other' ? { note: v.memo } : (v.memo ? { hold_memo: v.memo } : {})) }),
     });
   } finally {
     blockSaving = false;
@@ -3420,6 +3424,7 @@ async function submitBlock() {
 
 // ── 止まっているカードを始める前の確認 ──
 let unblockCtx = null;   // { ids }
+let unblockSaving = false;
 function openUnblock(c, ids) {
   unblockCtx = { ids };
   $('#unblockName').textContent = c.title || '';
@@ -3431,15 +3436,20 @@ function openUnblock(c, ids) {
   openOverlay('#unblockOv');
   $('#unblockTitle').focus();
 }
-function closeUnblock() { closeOverlay('#unblockOv'); unblockCtx = null; }
+function closeUnblock() { if (unblockSaving) return; closeOverlay('#unblockOv'); unblockCtx = null; }
 async function confirmUnblock() {
-  if (!unblockCtx) return;
+  if (!unblockCtx || unblockSaving) return;
   const ids = unblockCtx.ids;
+  unblockSaving = true;
   $('#unblockGo').disabled = true;
   $('#unblockMsg').textContent = '保存中…';
-  const r = await startWork(ids, { clearBlock: true });
-  $('#unblockGo').disabled = false;
-  $('#unblockMsg').textContent = '';
+  let r;
+  try { r = await startWork(ids, { clearBlock: true }); }
+  finally {
+    unblockSaving = false;
+    $('#unblockGo').disabled = false;
+    $('#unblockMsg').textContent = '';
+  }
   if (r === true) { closeUnblock(); closeCrew(); }
 }
 /** 職員が手で札を外す (始めはしない) */
@@ -3699,17 +3709,26 @@ async function startWork(ids, opts) {
   if (!can('task.work.start')) return false;   // 読むだけ (下見・履歴) では始めない
   if (!worker) { openGate(); return false; }
   if (!curDetail || !ids || !ids.length) return false;
+  const cur = findCard(curDetail);
   const j = await apiFetch('/api/sessions/start', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: curDetail, worker_id: worker.id, worker_ids: ids, ...(opts && opts.clearBlock ? { clear_block: true } : {}) }),
+    // 札を外して始めるときは、確認した版 (expect_version) も送る — 確認している間に理由が付け替わっていたら断られる
+    body: JSON.stringify({ id: curDetail, worker_id: worker.id, worker_ids: ids,
+      ...(opts && opts.clearBlock ? { clear_block: true, expect_version: cur ? cur.version : undefined } : {}) }),
   });
   if (!j.ok) {
     // ⛔ 止まっている札が付いたまま → 「解消しましたか?」を聞いてから clear_block で送り直す (案A)
     if (j.error === 'blocked') {
-      const cb = findCard(curDetail);
-      if (cb && j.task) applyTask(cb, j.task);
-      openUnblock(cb || { title: '' , blocked: j.blocked }, ids);
+      if (cur && j.task) applyTask(cur, j.task);
+      openUnblock(cur || { title: '', blocked: j.blocked }, ids);
       return 'blocked';
+    }
+    // 確認している間に札が変わった (別の端末が理由を付け替えた / 外した) → 最新で描き直して、もう一度確認
+    if (j.error === 'conflict' && opts && opts.clearBlock && cur && j.current) {
+      applyTask(cur, j.current);
+      renderList(); if (sameId(curDetail, cur.id)) renderDetail(cur);
+      if (cur.blocked) { openUnblock(cur, ids); toast('止まっている理由が変わっていました。もう一度確かめてください'); return 'blocked'; }
+      return startWork(ids);   // もう外れていた → 普通に始める
     }
     showErr(j.message || '作業をはじめられませんでした');
     return false;
