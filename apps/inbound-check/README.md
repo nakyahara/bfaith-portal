@@ -68,6 +68,25 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
     実測では 16行中5行がこれに当たる (在庫ミラーには在庫0の商品の行が無いため)
 - 保持期間: superseded バッチとその子 = 365日、取込ログ = 90日 (取込時に掃除)
 
+## 🔍 商品から探す — 入荷受付伝票に無い商品の入庫情報・値札 (2026-09-06)
+
+中原さん 2026-09-06:「ロジザードの入荷リストになくても入荷受付伝票と同じフォーマットでシール印字できて、
+入庫情報管理の情報を編集＆参照できる機能が欲しい。仕入れが多くないところは入荷受付伝票に登録していないから。
+仕入先から商品を絞り込めるとありがたい」。
+
+- 画面 = `/apps/inbound-check/products` (`views/products.html`。端末Cookie / セッション、作業画面と同じ入口)。
+  仕入先 (`mirror_products.仕入先コード` → `po_suppliers.name`) のプルダウン + 商品名/コード/JAN の検索。単品のみ・既定は取扱中
+- API = `GET /api/products/suppliers` / `GET /api/products` (行に入庫情報・ピックロケ・期限管理・バーコード・直近の印刷ジョブ) /
+  `POST /api/products/barcode` (バーコードの手入力)。編集は既存 `/api/info` `/api/info/register` `/api/product-flags` をそのまま使う
+- 🚨 **Render に完全なバーコードマスタは無い** (ロジザード商品マスタ CSV にバーコード列は無く、在庫ミラーは在庫ゼロの商品の行が消え、
+  値札CSVは入荷予定7日分だけ)。→ `f_inbound_check_barcodes` (控え) を置き、`resolveBarcode()` が
+  控え → 取込行 → 在庫ミラー → 入荷予定 の順に探して**見つけたら控える**。無ければ人が入れる (`source='manual'`。JAN=数字のみ / FNSKU=英数字)
+- 値札は**同じ印刷キュー** (`enqueuePrintJob` の `source='product'`)。刷る内容は画面の値でなく商品マスタ+控えから取る。
+  進行中/結果不明の扱い (in_progress / confirm_unknown / state_changed) は伝票からの発行と同じ。商品ごとの最新ジョブ = `latestJobsForProducts`
+- スキーマ: `f_inbound_check_print_jobs` は `source` 列 + `batch_id`/`line_key` NULL 可 に**作り直し** (`ensurePrintJobsTable`。
+  CREATE IF NOT EXISTS では列も NOT NULL も変わらないため、旧版を検知して行を写す。進行中ジョブも id ごと引き継ぐ)
+- テスト: `node scripts/test-inbound-check-products.mjs`
+
 ## 🚚 いま入荷を取りに行く — 予定外の納品を定時を待たずに出す (2026-09-05)
 
 中原さん 2026-09-05:「予定してない納品が来たりした場合にこの iPad に入れたい」。

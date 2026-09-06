@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="商品を探す">
+  <title>商品を探す (入庫情報・値札) | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/app-icons/inbound-check-180.png">
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; background: #eceef1; color: #212529; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+    body { padding-bottom: 60px; }
+    .top { position: sticky; top: 0; z-index: 20; background: #fff; border-bottom: 1px solid #dee2e6; padding: 10px 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    .top-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .top h1 { font-size: 1.05em; margin: 0; white-space: nowrap; }
+    .spacer { flex: 1; }
+    .btn { display: inline-block; padding: 9px 14px; border: 1px solid #ced4da; border-radius: 8px; background: #fff; color: #343a40; text-decoration: none; cursor: pointer; font-size: 0.95em; }
+    .btn.primary { background: #1c7ed6; border-color: #1c7ed6; color: #fff; font-weight: 700; }
+    .btn.seal { background: #fff4e6; border-color: #d9480f; color: #d9480f; font-weight: 700; }
+    .btn:disabled { opacity: 0.5; cursor: default; }
+    .btn.worker { background: #e7f5ff; border-color: #a5d8ff; color: #1864ab; }
+    .btn.worker.none { background: #fff3bf; border-color: #ffd43b; color: #7a5c00; }
+    .filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+    .filters select, .filters input[type=search] { padding: 9px 10px; border: 1px solid #ced4da; border-radius: 8px; background: #fff; font-size: 0.95em; }
+    .filters input[type=search] { min-width: 220px; flex: 1 1 220px; }
+    .filters label.chk { font-size: 0.9em; color: #495057; display: inline-flex; align-items: center; gap: 4px; }
+    .hint { font-size: 0.85em; color: #495057; margin: 8px 14px 0; line-height: 1.5; }
+    .banner { display: none; margin: 10px 14px 0; padding: 10px 12px; border-radius: 8px; font-size: 0.92em; }
+    .banner.err { display: block; background: #ffe3e3; color: #a61e1e; }
+    .banner.ok { display: block; background: #d3f9d8; color: #2b8a3e; }
+    .banner.warn { display: block; background: #fff3bf; color: #7a5c00; }
+    .wrap { padding: 12px 14px; max-width: 1100px; margin: 0 auto; }
+    .count { font-size: 0.85em; color: #868e96; margin-bottom: 8px; }
+    .empty { text-align: center; color: #868e96; padding: 50px 10px; font-size: 1.05em; line-height: 1.8; }
+    .row { background: #fff; border-radius: 12px; margin-bottom: 10px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); overflow: hidden; }
+    .row.inactive { opacity: 0.75; }
+    .line { display: flex; gap: 12px; padding: 12px 14px; align-items: flex-start; }
+    .body { flex: 1; min-width: 0; }
+    .name { font-weight: 700; font-size: 1.02em; line-height: 1.4; }
+    .sub { font-size: 0.85em; color: #495057; margin-top: 2px; }
+    .sub .sup { color: #1864ab; }
+    .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+    .tag { font-size: 0.78em; padding: 2px 8px; border-radius: 999px; background: #f1f3f5; color: #495057; }
+    .tag.seal { background: #ffe8cc; color: #d9480f; }
+    .tag.iroha { background: #fff3bf; color: #7a5c00; }
+    .tag.direct { background: #e7f5ff; color: #1864ab; }
+    .tag.loc { background: #e6fcf5; color: #087f5b; }
+    .tag.warn { background: #fff3bf; color: #7a5c00; }
+    .tag.exp { background: #f3f0ff; color: #5f3dc4; }
+    .bc { font-family: ui-monospace, Menlo, monospace; font-size: 0.92em; margin-top: 6px; color: #343a40; }
+    .bc .none { color: #e8590c; font-family: inherit; }
+    .bc button { margin-left: 6px; font-size: 0.85em; padding: 3px 8px; border: 1px solid #ced4da; border-radius: 6px; background: #fff; }
+    .act { flex: 0 0 auto; display: flex; flex-direction: column; gap: 6px; align-items: stretch; min-width: 130px; }
+    .act .btn { text-align: center; }
+    .pjob { font-size: 0.78em; text-align: center; line-height: 1.4; padding: 4px 6px; border-radius: 8px; background: #f1f3f5; color: #495057; }
+    .pjob.s-completed { background: #d3f9d8; color: #2b8a3e; }
+    .pjob.s-failed { background: #ffe3e3; color: #c92a2a; font-weight: 700; }
+    .pjob.s-unknown, .pjob.s-manual { background: #fff3bf; color: #7a5c00; font-weight: 700; }
+    .pjob.s-queued, .pjob.s-leased, .pjob.s-submitted { background: #e7f5ff; color: #1864ab; }
+    .detail { display: none; padding: 4px 14px 14px; background: #fbfcfd; border-top: 1px dashed #dee2e6; }
+    .row.open .detail { display: block; }
+    .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+    .fld label { display: block; font-size: 0.8em; color: #495057; margin-bottom: 3px; }
+    .fld input, .fld select, .fld textarea { width: 100%; font-size: 1em; padding: 8px 10px; border: 1px solid #ced4da; border-radius: 8px; background: #fff; }
+    .fld textarea { min-height: 60px; }
+    .fld .note { font-size: 0.78em; color: #868e96; margin-top: 2px; }
+    .dact { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+    .dmsg { font-size: 0.9em; }
+    .dmsg.err { color: #c92a2a; } .dmsg.ok { color: #2b8a3e; }
+    .unreg { background: #fff3bf; color: #7a5c00; padding: 10px 12px; border-radius: 8px; font-size: 0.92em; line-height: 1.6; }
+    .more { text-align: center; margin: 14px 0; }
+    .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 50; align-items: center; justify-content: center; padding: 16px; }
+    .overlay.on { display: flex; }
+    .modal { background: #fff; border-radius: 14px; padding: 18px; width: 100%; max-width: 520px; max-height: 92vh; overflow: auto; }
+    .modal h2 { margin: 0 0 10px; font-size: 1.1em; }
+    .modal .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 14px; }
+    .modal .actions button { padding: 12px 18px; border-radius: 10px; border: 1px solid #ced4da; background: #fff; font-size: 1em; }
+    .modal .actions button.primary { background: #d9480f; border-color: #d9480f; color: #fff; font-weight: 700; }
+    .modal .fld { margin: 10px 0; }
+    .modal .fld .ro { font-size: 1.05em; padding: 6px 0; }
+    .modal .fld .ro small { color: #868e96; }
+    .modal .pmsg { font-size: 0.9em; color: #c92a2a; min-height: 1.2em; }
+    .modal .pwarn { font-size: 0.88em; color: #7a5c00; background: #fff3bf; padding: 8px 10px; border-radius: 8px; margin-top: 6px; }
+    .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+    .opts button { padding: 14px 8px; border-radius: 10px; border: 1px solid #ced4da; background: #fff; font-size: 1em; }
+    @media (max-width: 700px) { .line { flex-direction: column; } .act { flex-direction: row; flex-wrap: wrap; } }
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div class="top-row">
+      <h1>🔍 商品を探す</h1>
+      <span class="spacer"></span>
+      <button type="button" class="btn worker none" id="workerBtn">👤 作業者を選ぶ</button>
+      <a class="btn" href="/apps/inbound-check/">📦 入荷受付へ</a>
+    </div>
+    <div class="filters">
+      <select id="supplier"><option value="">仕入先: すべて</option></select>
+      <input type="search" id="q" placeholder="商品名・商品コード・JAN で検索" autocomplete="off">
+      <label class="chk"><input type="checkbox" id="all"> 取扱中止も</label>
+      <button type="button" class="btn primary" id="searchBtn">検索</button>
+    </div>
+  </div>
+  <div class="hint">入荷受付伝票に無い商品でも、ここから<b>入庫情報 (入数・BCシール・いろは・荷姿) の確認と編集</b>、<b>🏷 値札シールの発行</b> (倉庫PCの QL-700・伝票と同じ形式) ができます。仕入先で絞ってから探すと早いです。</div>
+  <div class="banner" id="banner"></div>
+  <div class="wrap">
+    <div class="count" id="count"></div>
+    <div id="list"><div class="empty">仕入先を選ぶか、商品名・コード・JAN を入れて「検索」を押してください</div></div>
+    <div class="more" id="more" style="display:none"><button type="button" class="btn" id="moreBtn">もっと見る</button></div>
+  </div>
+
+  <div class="overlay" id="workerPick"><div class="modal"><h2>作業者を選んでください</h2><div class="opts" id="workerOpts"></div>
+    <div class="hint" style="margin:8px 0 0">名前は入庫情報の変更履歴と印刷の記録に残ります</div>
+    <div class="actions"><button type="button" id="workerCancel">閉じる</button></div></div></div>
+
+  <div class="overlay" id="printBox"><div class="modal">
+    <h2>🏷 値札シールを出す</h2>
+    <div id="printBody"></div>
+    <div class="pmsg" id="printMsg"></div>
+    <div class="actions"><button type="button" id="printCancel">やめる</button><button type="button" class="primary" id="printOk">🏷 発行する</button></div>
+  </div></div>
+
+  <script>
+    const API = '/apps/inbound-check/api';
+    const LS_CODE = 'ic_worker_code', LS_NAME = 'ic_worker_name';   // 入荷受付の作業画面と同じ (同じ iPad なら選び直さなくてよい)
+    const $ = s => document.querySelector(s);
+    const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const IROHA_NA = '－';
+    let data = { rows: [], total: 0, field_options: {}, print_agents: [], workers: [], me: {} };
+    let offset = 0;
+    const openRows = new Set();
+    let pollTimer = null;
+
+    function workerCode() { try { return localStorage.getItem(LS_CODE) || ''; } catch { return ''; } }
+    function workerName() { try { return localStorage.getItem(LS_NAME) || ''; } catch { return ''; } }
+    function setWorker(code, name) { try { localStorage.setItem(LS_CODE, code); localStorage.setItem(LS_NAME, name); } catch {} renderWorker(); }
+    function hasWorker() { return (workerName() && data.workers.some(w => w.code === workerCode())) || (data.me && data.me.session); }
+    function renderWorker() {
+      const b = $('#workerBtn');
+      const n = workerName();
+      if (n && data.workers.some(w => w.code === workerCode())) { b.textContent = '👤 ' + n; b.classList.remove('none'); }
+      else if (data.me && data.me.session && !n) { b.textContent = '👤 ' + data.me.session; b.classList.remove('none'); }
+      else { b.textContent = '👤 作業者を選ぶ'; b.classList.add('none'); }
+    }
+    function openWorkerPick() {
+      $('#workerOpts').innerHTML = (data.workers || []).map(w => '<button type="button" data-code="' + esc(w.code) + '" data-name="' + esc(w.name) + '">' + esc(w.name) + '</button>').join('') || '<div class="empty">作業者が登録されていません (スタッフマスタ)</div>';
+      $('#workerPick').classList.add('on');
+    }
+    $('#workerBtn').addEventListener('click', openWorkerPick);
+    $('#workerCancel').addEventListener('click', () => $('#workerPick').classList.remove('on'));
+    $('#workerOpts').addEventListener('click', (ev) => {
+      const b = ev.target.closest('button[data-code]');
+      if (!b) return;
+      setWorker(b.dataset.code, b.dataset.name);
+      $('#workerPick').classList.remove('on');
+    });
+
+    let bannerTimer = null;
+    function banner(kind, html, { sticky = false } = {}) {
+      const b = $('#banner');
+      if (bannerTimer) { clearTimeout(bannerTimer); bannerTimer = null; }
+      if (!kind) { b.className = 'banner'; b.innerHTML = ''; return; }
+      b.className = 'banner ' + kind; b.innerHTML = html;
+      if (!sticky) bannerTimer = setTimeout(() => banner(null), 6000);
+    }
+    function fmtJst(iso) {
+      if (!iso) return '';
+      const d = new Date(iso); if (Number.isNaN(d.getTime())) return iso;
+      return new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(d);
+    }
+    function newId() {
+      const r = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(36).slice(2);
+      return 'icp-' + r;
+    }
+    async function postJson(url, body) {
+      const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const j = await r.json().catch(() => ({}));
+      return { status: r.status, json: j };
+    }
+
+    // ─── 仕入先 ───
+    async function loadSuppliers() {
+      try {
+        const r = await fetch(API + '/products/suppliers' + ($('#all').checked ? '?all=1' : ''), { cache: 'no-store' });
+        const j = await r.json();
+        if (r.status === 401) { location.href = '/apps/inbound-check/'; return; }
+        const cur = $('#supplier').value;
+        $('#supplier').innerHTML = '<option value="">仕入先: すべて</option>' + (j.suppliers || []).map(s =>
+          '<option value="' + esc(s.code) + '">' + esc(s.name || s.code) + ' (' + s.products + ')</option>').join('');
+        $('#supplier').value = cur;
+      } catch (e) { banner('err', '仕入先の一覧を取得できません (' + esc(e.message) + ')'); }
+    }
+
+    // ─── 検索 ───
+    function queryString() {
+      const q = new URLSearchParams();
+      if ($('#supplier').value) q.set('supplier', $('#supplier').value);
+      if ($('#q').value.trim()) q.set('q', $('#q').value.trim());
+      if ($('#all').checked) q.set('all', '1');
+      q.set('limit', '50');
+      q.set('offset', String(offset));
+      return q.toString();
+    }
+    async function search({ append = false, silent = false } = {}) {
+      if (!append) offset = 0;
+      if (!$('#supplier').value && !$('#q').value.trim()) {
+        if (!silent) { $('#list').innerHTML = '<div class="empty">仕入先を選ぶか、商品名・コード・JAN を入れてください<br><small>(全件は多すぎるので出しません)</small></div>'; $('#count').textContent = ''; $('#more').style.display = 'none'; }
+        return;
+      }
+      try {
+        const r = await fetch(API + '/products?' + queryString(), { cache: 'no-store' });
+        if (r.status === 401) { location.href = '/apps/inbound-check/'; return; }
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.message || j.error);
+        if (append) { data = { ...j, rows: data.rows.concat(j.rows) }; } else { data = j; }
+        renderWorker();
+        render();
+        schedulePoll();
+      } catch (e) { banner('err', '検索できませんでした (' + esc(e.message) + ')'); }
+    }
+    // 印刷中の商品があるあいだは 5 秒ごとに見直す (結果 ✅/⚠/❓ を出す)
+    function schedulePoll() {
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      const active = data.rows.some(r => r.print_job && ['queued', 'leased', 'submitted'].includes(r.print_job.state));
+      if (active) pollTimer = setTimeout(() => refreshRows(), 5000);
+    }
+    async function refreshRows() {
+      // 開いている編集パネルを壊さない: 印刷状況だけ取り直す
+      try {
+        const q = new URLSearchParams(queryString()); q.set('offset', '0'); q.set('limit', String(Math.max(50, data.rows.length)));
+        const r = await fetch(API + '/products?' + q.toString(), { cache: 'no-store' });
+        const j = await r.json();
+        if (!j.ok) return;
+        const byKey = new Map(j.rows.map(x => [x.code_key, x]));
+        for (const row of data.rows) { const n = byKey.get(row.code_key); if (n) row.print_job = n.print_job; }
+        data.print_agents = j.print_agents;
+        for (const row of data.rows) { const el = document.querySelector('.row[data-key="' + CSS.escape(row.code_key) + '"] .act'); if (el) el.innerHTML = actHtml(row); }
+      } catch { /* 次回 */ }
+      schedulePoll();
+    }
+    $('#searchBtn').addEventListener('click', () => search());
+    $('#q').addEventListener('keydown', (e) => { if (e.key === 'Enter') search(); });
+    $('#supplier').addEventListener('change', () => search());
+    $('#all').addEventListener('change', () => { loadSuppliers(); search({ silent: true }); });
+    $('#moreBtn').addEventListener('click', () => { offset += 50; search({ append: true }); });
+
+    // ─── 描画 ───
+    const SEAL_NO = /^(不要|無|無し|なし|－|-|ー|―)$/;
+    const SEAL_YES = /(必要|貼付|有|あり)/;
+    function sealNeeded(i) { const s = String(i && i.bc_seal ? i.bc_seal : '').trim(); return !!s && !SEAL_NO.test(s) && SEAL_YES.test(s); }
+    function tagsHtml(r) {
+      const t = [];
+      const i = r.info;
+      if (r.handling && r.handling !== '取扱中') t.push('<span class="tag warn">' + esc(r.handling) + '</span>');
+      if (r.loc_source === 'pick') t.push('<span class="tag loc">📍 ' + esc(r.pick_locs.map(x => x.loc).join(' / ')) + '</span>');
+      else if (r.loc_source === 'storage') t.push('<span class="tag loc">保管 ' + esc(r.other_locs[0].loc) + '</span>');
+      if (r.expiry_managed) t.push('<span class="tag exp">📅 期限管理</span>');
+      if (!i) { t.push('<span class="tag warn">入庫情報 未登録</span>'); return t.join(''); }
+      t.push('<span class="tag">入数: ' + (Number.isInteger(i.irisu) ? i.irisu : '未登録') + '</span>');
+      if (i.iroha && /有/.test(i.iroha)) t.push('<span class="tag iroha">🏠 いろは: ' + esc(i.iroha) + '</span>');
+      else if (i.iroha && i.iroha !== IROHA_NA && i.iroha !== '-') t.push('<span class="tag">いろは: ' + esc(i.iroha) + '</span>');
+      if (sealNeeded(i)) t.push('<span class="tag seal">シール: ' + esc(i.bc_seal) + '</span>');
+      else if (i.bc_seal && i.bc_seal !== IROHA_NA) t.push('<span class="tag">シール: ' + esc(i.bc_seal) + '</span>');
+      if (i.direct_pick && /有|直接/.test(i.direct_pick)) t.push('<span class="tag direct">直ピック</span>');
+      if (i.storage_form && i.storage_form !== IROHA_NA && i.storage_form !== '-') t.push('<span class="tag">荷姿: ' + esc(i.storage_form) + '</span>');
+      if (i.memo) t.push('<span class="tag">📝 ' + esc(i.memo) + '</span>');
+      return t.join('');
+    }
+    function bcHtml(r) {
+      if (r.barcode) {
+        const src = { line: '入荷受付伝票', stock: '在庫', schedule: '入荷予定', manual: '手入力' }[r.barcode_source] || '';
+        return '<div class="bc">' + esc(r.barcode) + ' <small>(' + esc(String(r.barcode_type || '').toUpperCase()) + (src ? '・' + src : '') + ')</small><button type="button" data-act="bc">直す</button></div>';
+      }
+      return '<div class="bc"><span class="none">バーコード未登録</span><button type="button" data-act="bc">JAN / FNSKU を入れる</button></div>';
+    }
+    function actHtml(r) {
+      const j = r.print_job;
+      const agents = data.print_agents || [];
+      let btn = '';
+      if (agents.length > 0) {
+        if (j && ['queued', 'leased', 'submitted'].includes(j.state)) btn = '<button type="button" class="btn seal" disabled>🖨 印刷中…</button>';
+        else btn = '<button type="button" class="btn seal" data-act="print">' + (j && j.state === 'unknown' ? '🏷 もう一度発行' : (j && j.state === 'completed' ? '🏷 追加で発行' : '🏷 シール発行')) + '</button>';
+      }
+      let pj = '';
+      if (j) {
+        let extra = '';
+        if (j.state === 'unknown') extra = '<br><b>もう1回押す前に実物を見る</b>';
+        else if (j.state === 'manual') extra = '<br>P-touch で手で刷ってください';
+        else if (j.state === 'failed' && j.error) extra = '<br>' + esc(String(j.error).slice(0, 60));
+        pj = '<div class="pjob s-' + esc(j.state) + '">' + esc(j.label || j.state) + ' <small>' + j.copies + '枚 ' + esc(fmtJst(j.finished_at || j.updated_at)) + '</small>' + extra + '</div>';
+      }
+      return '<button type="button" class="btn" data-act="detail">' + (openRows.has(r.code_key) ? '✎ 閉じる' : '✎ 入庫情報') + '</button>' + btn + pj;
+    }
+    function rowHtml(r) {
+      return '<div class="row' + (openRows.has(r.code_key) ? ' open' : '') + (r.handling && r.handling !== '取扱中' ? ' inactive' : '') + '" data-key="' + esc(r.code_key) + '">'
+        + '<div class="line"><div class="body"><div class="name">' + esc(r.product_name) + '</div>'
+        + '<div class="sub">' + esc(r.product_id) + (r.supplier_name || r.supplier_code ? ' ・ <span class="sup">' + esc(r.supplier_name || r.supplier_code) + '</span>' : '') + '</div>'
+        + '<div class="tags">' + tagsHtml(r) + '</div>' + bcHtml(r) + '</div>'
+        + '<div class="act">' + actHtml(r) + '</div></div>'
+        + '<div class="detail">' + (openRows.has(r.code_key) ? detailHtml(r) : '') + '</div></div>';
+    }
+    function selectHtml(field, value, opts) {
+      const list = (data.field_options && data.field_options[field]) || [];
+      const cur = value == null ? '' : String(value);
+      const seen = new Set(list);
+      const options = ['<option value="">(未設定)</option>'].concat(list.map(v => '<option value="' + esc(v) + '"' + (v === cur ? ' selected' : '') + '>' + esc(v) + '</option>'));
+      if (cur && !seen.has(cur)) options.push('<option value="' + esc(cur) + '" selected>' + esc(cur) + '</option>');
+      return '<select data-f="' + esc(field) + '"' + (opts && opts.disabled ? ' disabled' : '') + '>' + options.join('') + '</select>';
+    }
+    function detailHtml(r) {
+      const i = r.info;
+      if (!i) {
+        return '<div class="unreg">この商品は入庫情報に登録されていません。登録すると、入数・いろは・BCシールなどをここで入力できます。</div>'
+          + '<div class="dact"><button type="button" class="btn primary" data-act="register">入庫情報に登録する</button><span class="dmsg" data-msg></span></div>';
+      }
+      const locked = String(i.iroha || '').trim() === '有り';
+      return '<div class="fields">'
+        + '<div class="fld"><label>入数 (1箱あたりの個数)</label><input type="number" inputmode="numeric" min="1" step="1" data-f="入数" value="' + (Number.isInteger(i.irisu) ? i.irisu : '') + '" placeholder="未登録"><div class="note">空欄にすると「未登録」に戻ります</div></div>'
+        + '<div class="fld"><label>いろは在庫化作業有無</label>' + selectHtml('いろは在庫化作業有無', i.iroha) + '<div class="note">「有り」にすると下の3項目は自動で「' + IROHA_NA + '」になります</div></div>'
+        + '<div class="fld"><label>入庫時BCシール貼りフラグ</label>' + selectHtml('入庫時BCシール貼りフラグ', i.bc_seal, { disabled: locked }) + '</div>'
+        + '<div class="fld"><label>直接ピックロケ保管</label>' + selectHtml('直接ピックロケ保管', i.direct_pick, { disabled: locked }) + '</div>'
+        + '<div class="fld"><label>BF保管荷姿</label>' + selectHtml('BF保管荷姿', i.storage_form, { disabled: locked }) + '</div>'
+        + '<div class="fld"><label>メモ</label><textarea data-f="memo" placeholder="現場への申し送りなど">' + esc(i.memo) + '</textarea></div>'
+        + '<div class="fld"><label>期限管理</label><label class="chk" style="font-size:1em"><input type="checkbox" data-f="expiry_managed"' + (r.expiry_managed ? ' checked' : '') + '> 期限管理あり (' + esc(r.expiry_source === 'manual' ? '手動設定' : r.expiry_source === 'logizard' ? 'ロジザード商品マスタ' : r.expiry_source === 'stock' ? '在庫から推定' : '未設定') + ')</label></div>'
+        + '</div>'
+        + '<div class="dact"><button type="button" class="btn primary" data-act="save">保存</button><button type="button" class="btn" data-act="reset">元に戻す</button><span class="dmsg" data-msg></span></div>';
+    }
+    function render() {
+      $('#count').textContent = data.total ? (data.rows.length + ' / ' + data.total + ' 件') : '';
+      if (data.missing_master) { $('#list').innerHTML = '<div class="empty">商品マスタ (mirror_products) がまだ届いていません</div>'; $('#more').style.display = 'none'; return; }
+      $('#list').innerHTML = data.rows.length ? data.rows.map(rowHtml).join('') : '<div class="empty">該当する商品がありません</div>';
+      $('#more').style.display = data.rows.length < data.total ? '' : 'none';
+    }
+    function findRow(el) {
+      const rowEl = el.closest('.row');
+      if (!rowEl) return null;
+      const row = data.rows.find(r => r.code_key === rowEl.dataset.key);
+      return row ? { rowEl, row } : null;
+    }
+    function detailMsg(rowEl, kind, text) { const m = rowEl.querySelector('[data-msg]'); if (m) { m.className = 'dmsg ' + kind; m.textContent = text; } }
+
+    // ─── 操作 ───
+    $('#list').addEventListener('click', async (ev) => {
+      const a = ev.target.closest('[data-act]');
+      if (!a) return;
+      const f = findRow(a);
+      if (!f) return;
+      const { rowEl, row } = f;
+      const act = a.dataset.act;
+      if (act === 'detail') { if (openRows.has(row.code_key)) openRows.delete(row.code_key); else openRows.add(row.code_key); render(); return; }
+      if (act === 'reset') { render(); return; }
+      if (act === 'register') { await registerInfo(rowEl, row); return; }
+      if (act === 'save') { await saveInfo(rowEl, row); return; }
+      if (act === 'bc') { await editBarcode(rowEl, row); return; }
+      if (act === 'print') { openPrintBox(row); return; }
+    });
+    async function registerInfo(rowEl, row) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      detailMsg(rowEl, '', '登録中…');
+      const r = await postJson(API + '/info/register', { code: row.product_id, worker_code: workerCode() || undefined });
+      if (!r.json.ok) { detailMsg(rowEl, 'err', r.json.message || '登録できませんでした'); if (r.json.error === 'worker_required') openWorkerPick(); return; }
+      await search({ silent: true });
+      openRows.add(row.code_key); render();
+    }
+    async function saveInfo(rowEl, row) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      const fields = {};
+      rowEl.querySelectorAll('[data-f]').forEach(el => {
+        const k = el.getAttribute('data-f');
+        if (k === 'expiry_managed') return;
+        if (el.disabled) return;
+        if (k === '入数') { const v = String(el.value).trim(); fields[k] = v === '' ? null : Number(v); }
+        else fields[k] = el.value;
+      });
+      const expEl = rowEl.querySelector('[data-f="expiry_managed"]');
+      detailMsg(rowEl, '', '保存中…');
+      const r = await postJson(API + '/info', { code_key: row.code_key, fields, expect_version: row.info.version, worker_code: workerCode() || undefined });
+      if (!r.json.ok) { detailMsg(rowEl, 'err', r.json.message || '保存できませんでした'); if (r.json.error === 'worker_required') openWorkerPick(); if (r.json.error === 'conflict') search({ silent: true }); return; }
+      if (expEl && (!!expEl.checked) !== !!row.expiry_managed) {
+        const r2 = await postJson(API + '/product-flags', { code_key: row.code_key, expiry_managed: !!expEl.checked, worker_code: workerCode() || undefined });
+        if (!r2.json.ok) { detailMsg(rowEl, 'err', '入庫情報は保存しましたが、期限管理は変えられませんでした: ' + (r2.json.message || '')); await search({ silent: true }); return; }
+      }
+      await search({ silent: true });
+      banner('ok', '✅ ' + esc(row.product_name) + ' の入庫情報を保存しました');
+    }
+    async function editBarcode(rowEl, row) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      const v = window.prompt('バーコード (JAN は数字だけ / Amazon の FNSKU は英数字)。空にすると手入力分を消します', row.barcode || '');
+      if (v === null) return;
+      const r = await postJson(API + '/products/barcode', { code_key: row.code_key, barcode: v.trim(), worker_code: workerCode() || undefined });
+      if (!r.json.ok) { banner('err', r.json.message || 'バーコードを保存できませんでした', { sticky: true }); if (r.json.error === 'worker_required') openWorkerPick(); return; }
+      await search({ silent: true });
+      banner('ok', v.trim() ? '✅ バーコードを控えました: ' + esc(v.trim()) : '手入力のバーコードを消しました');
+    }
+
+    // ─── 🏷 値札 (入荷受付伝票と同じ形式・同じ印刷キュー) ───
+    let printRow = null, printReqId = null;
+    function barcodeType(bc) { const s = String(bc == null ? '' : bc).trim(); if (!s) return null; if (/^[0-9]+$/.test(s)) return 'jan'; if (/^[A-Za-z0-9]+$/.test(s) && /[A-Za-z]/.test(s)) return 'fnsku'; return null; }
+    function printWarnHtml(a) {
+      const w = [];
+      if (!a) return '';
+      if (!a.online) w.push('倉庫PCの印刷係がしばらく応答していません。押しても出ないときは倉庫PCの電源・スリープを確認してください');
+      if (a.bpac === false) w.push('倉庫PCに b-PAC が入っていないため、いまは印刷できません');
+      if (a.paper_ok === false) w.push('QL-700 に用紙「値札 62x67」が登録されていないため、印刷に失敗します');
+      return w.length ? '<div class="pwarn">⚠ ' + w.map(esc).join('<br>⚠ ') + '</div>' : '';
+    }
+    function openPrintBox(row) {
+      if (!hasWorker()) { openWorkerPick(); return; }
+      const agents = data.print_agents || [];
+      if (agents.length === 0) { banner('warn', '値札を印刷する倉庫PCが登録されていません'); return; }
+      printRow = row; printReqId = newId();
+      const first = agents.find(a => a.online) || agents[0];
+      const prev = row.print_job && row.print_job.state === 'unknown' ? row.print_job : null;
+      const type = barcodeType(row.barcode);
+      $('#printBody').innerHTML =
+        '<div class="fld"><label>商品</label><div class="ro"><b>' + esc(row.product_name) + '</b><br><small>' + esc(row.product_id) + '</small></div></div>'
+        + '<div class="fld"><label>バーコード' + (row.barcode ? '' : ' (登録が無いので入力してください)') + '</label>'
+        + (row.barcode ? '<div class="ro">' + esc(row.barcode) + ' <small>(' + (type ? type.toUpperCase() : '不明') + ')</small></div>'
+          : '<input type="text" id="printBarcode" inputmode="latin" placeholder="JAN (数字) または FNSKU (英数字)">') + '</div>'
+        + '<div class="fld"><label>入数 (シールに印字。空欄なら印字しない)</label><input type="number" inputmode="numeric" min="1" step="1" id="printPack" value="' + (row.pack_qty || '') + '" placeholder="未登録"></div>'
+        + '<div class="fld"><label>枚数 (1〜50)</label><input type="number" inputmode="numeric" min="1" max="50" step="1" id="printCopies" value="1"></div>'
+        + '<div class="fld"><label>出力先 (倉庫PC)</label>' + (agents.length > 1 ? '<select id="printTarget">' + agents.map(a => '<option value="' + a.id + '"' + (a.id === first.id ? ' selected' : '') + '>' + esc(a.label) + ' — ' + esc(a.printer_name || '') + (a.online ? '' : ' (応答なし)') + '</option>').join('') + '</select>'
+          : '<div class="ro" data-target="' + first.id + '">' + esc(first.label) + ' — ' + esc(first.printer_name || '') + (first.online ? '' : ' <small>(応答なし)</small>') + '</div>') + '</div>'
+        + '<div id="printWarn">' + printWarnHtml(first) + '</div>'
+        + (prev ? '<div class="pwarn">❓ 前回 (' + prev.copies + '枚 ' + esc(fmtJst(prev.finished_at || prev.updated_at)) + ') の印刷結果が不明です。<b>QL-700 の実物を見て</b>、出ていない場合だけ発行してください。<br><label style="display:block;margin-top:6px"><input type="checkbox" id="printAck"> 実物を確認した (シールは出ていない)</label></div>' : '');
+      $('#printMsg').textContent = '';
+      $('#printOk').disabled = false;
+      $('#printBox').classList.add('on');
+    }
+    $('#printBody').addEventListener('change', (ev) => {
+      if (!ev.target || ev.target.id !== 'printTarget') return;
+      const a = (data.print_agents || []).find(x => x.id === Number(ev.target.value));
+      $('#printWarn').innerHTML = printWarnHtml(a);
+    });
+    function closePrintBox() { $('#printBox').classList.remove('on'); printRow = null; }
+    $('#printCancel').addEventListener('click', closePrintBox);
+    $('#printOk').addEventListener('click', async () => {
+      const row = printRow;
+      if (!row) return;
+      const msgEl = $('#printMsg');
+      const packRaw = String(($('#printPack') || {}).value || '').trim();
+      const copies = Number(($('#printCopies') || {}).value);
+      const bcEl = $('#printBarcode');
+      const bcIn = bcEl ? String(bcEl.value || '').trim() : '';
+      if (bcEl && !barcodeType(bcIn)) { msgEl.textContent = 'バーコードは JAN (数字だけ) か FNSKU (英数字) で入れてください'; return; }
+      if (packRaw && (!/^\d+$/.test(packRaw) || Number(packRaw) < 1)) { msgEl.textContent = '入数は1以上の整数で入れてください (空欄なら印字しません)'; return; }
+      if (!Number.isInteger(copies) || copies < 1 || copies > 50) { msgEl.textContent = '枚数は 1〜50 で入れてください'; return; }
+      const sel = $('#printTarget');
+      const tEl = $('#printBody').querySelector('[data-target]');
+      const target = sel ? Number(sel.value) : (tEl ? Number(tEl.getAttribute('data-target')) : null);
+      const prev = row.print_job && row.print_job.state === 'unknown' ? row.print_job : null;
+      const ackEl = $('#printAck');
+      if (prev && !(ackEl && ackEl.checked)) { msgEl.textContent = 'QL-700 の実物を確認して「実物を確認した」にチェックしてください'; return; }
+      $('#printOk').disabled = true;
+      msgEl.textContent = '送信しています…';
+      try {
+        // 手入力したバーコードは控えにも残す (次からは入力不要)
+        if (bcEl && bcIn && bcIn !== row.barcode) {
+          const rb = await postJson(API + '/products/barcode', { code_key: row.code_key, barcode: bcIn, worker_code: workerCode() || undefined });
+          if (!rb.json.ok) { msgEl.textContent = rb.json.message || 'バーコードを保存できませんでした'; $('#printOk').disabled = false; return; }
+        }
+        const r = await postJson(API + '/print/jobs', {
+          worker_code: workerCode() || undefined, product_code: row.product_id, barcode: bcIn || undefined,
+          copies, pack_qty: packRaw || null, target_device_id: target, client_request_id: printReqId,
+          acknowledge_unknown_job_id: prev ? prev.id : undefined,
+        });
+        const j = r.json || {};
+        if (r.status === 401) { location.href = '/apps/inbound-check/'; return; }
+        if (j.ok) {
+          row.print_job = j.job; row.barcode = row.barcode || bcIn || row.barcode;
+          closePrintBox(); await search({ silent: true });
+          banner('ok', '🏷 ' + esc(row.product_name) + ' の値札 ' + j.job.copies + '枚 を倉庫PCに依頼しました。出たら ✅ が出ます');
+          return;
+        }
+        if (j.error === 'worker_required') { closePrintBox(); openWorkerPick(); return; }
+        if ((j.error === 'in_progress' || j.error === 'confirm_unknown' || j.error === 'state_changed') && j.job) { row.print_job = j.job; closePrintBox(); render(); banner('warn', '🏷 ' + esc(j.message || ''), { sticky: true }); return; }
+        msgEl.textContent = j.message || j.error || ('HTTP ' + r.status);
+        $('#printOk').disabled = false;
+      } catch (e) {
+        msgEl.textContent = '送信できませんでした (' + e.message + ')';
+        $('#printOk').disabled = false;
+      }
+    });
+
+    // ─── 起動 ───
+    (async () => {
+      await loadSuppliers();
+      // 作業者の一覧と印刷できる倉庫PCは検索結果と一緒に届く。最初は軽い検索を1回だけ (作業者ボタンのため)
+      try {
+        const r = await fetch(API + '/products?q=%00&limit=1', { cache: 'no-store' });
+        if (r.status === 401) { location.href = '/apps/inbound-check/'; return; }
+        const j = await r.json(); if (j.ok) { data.workers = j.workers || []; data.me = j.me || {}; data.print_agents = j.print_agents || []; data.field_options = j.field_options || {}; }
+      } catch { /* 検索時に取り直す */ }
+      renderWorker();
+      const params = new URLSearchParams(location.search);
+      if (params.get('supplier')) $('#supplier').value = params.get('supplier');
+      if (params.get('q')) $('#q').value = params.get('q');
+      if ($('#supplier').value || $('#q').value) search();
+    })();
+  </script>
+</body>
+</html>

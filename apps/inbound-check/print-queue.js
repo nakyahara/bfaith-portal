@@ -22,7 +22,7 @@
  * (SELECT してから UPDATE すると、期限切れ→unknown が挟まった古い報告が乗っ取れる)。
  */
 import crypto from 'crypto';
-import { getDB } from './db.js';
+import { getDB, getProductForPrint } from './db.js';
 
 const utcNow = () => new Date().toISOString();
 const ms = (v) => { const t = Date.parse(v || ''); return Number.isFinite(t) ? t : null; };
@@ -144,7 +144,7 @@ export function recordHeartbeat(deviceId, { note = null, version = null, bpac = 
  *   requestedBy / requestedDevice … 記録用
  * @returns {{ok:true, job, created:boolean}|{ok:false, error, message, job?}}
  */
-export function enqueuePrintJob({ batchId, lineKey, copies, packQty = null, targetDeviceId = null, clientRequestId, acknowledgeUnknownJobId = null, requestedBy = null, requestedDevice = null }) {
+export function enqueuePrintJob({ batchId, lineKey, productCode = null, barcodeOverride = null, copies, packQty = null, targetDeviceId = null, clientRequestId, acknowledgeUnknownJobId = null, requestedBy = null, requestedDevice = null }) {
   const db = getDB();
   const crid = String(clientRequestId || '').trim();
   if (!/^[A-Za-z0-9._:-]{8,80}$/.test(crid)) return { ok: false, error: 'bad_request', message: 'client_request_id が必要です' };
@@ -158,30 +158,50 @@ export function enqueuePrintJob({ batchId, lineKey, copies, packQty = null, targ
     if (!Number.isSafeInteger(q) || q < 1) return { ok: false, error: 'bad_pack_qty', message: '入数は1以上の整数で入力してください (空欄なら印字しません)' };
     pack = String(q);
   }
+  // 出どころは2つ: 入荷受付伝票の明細 (batch_id + line_key) か、🔍 商品を探して (product_code)
+  const source = productCode != null && String(productCode).trim() !== '' ? 'product' : 'line';
   const bid = Number(batchId);
   const key = String(lineKey || '').trim();
-  if (!Number.isInteger(bid) || !key) return { ok: false, error: 'bad_request', message: 'batch_id と line_key が必要です' };
+  if (source === 'line' && (!Number.isInteger(bid) || !key)) return { ok: false, error: 'bad_request', message: 'batch_id と line_key (または product_code) が必要です' };
 
   return db.transaction(() => {
     // 同じ冪等IDの再送は「もう積んである」を成功として返す
     const dup = db.prepare('SELECT * FROM f_inbound_check_print_jobs WHERE client_request_id = ?').get(crid);
     if (dup) return { ok: true, job: publicJob(dup), created: false, replayed: true };
 
-    const active = db.prepare('SELECT id FROM f_inbound_check_batches WHERE status = ? ORDER BY id DESC LIMIT 1').get('active');
-    if (!active || active.id !== bid) return { ok: false, error: 'stale_batch', message: '一覧が新しくなっています。画面を更新してからもう一度押してください' };
-    const line = db.prepare('SELECT * FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(bid, key);
-    if (!line) return { ok: false, error: 'not_found', message: 'この明細は一覧にありません' };
-    const barcode = String(line.barcode == null ? '' : line.barcode).trim();
+    // 刷る内容 (商品名・商品ID・バーコード) は**画面の値ではなく DB から**取る
+    let subject;
+    if (source === 'line') {
+      const active = db.prepare('SELECT id FROM f_inbound_check_batches WHERE status = ? ORDER BY id DESC LIMIT 1').get('active');
+      if (!active || active.id !== bid) return { ok: false, error: 'stale_batch', message: '一覧が新しくなっています。画面を更新してからもう一度押してください' };
+      const line = db.prepare('SELECT * FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(bid, key);
+      if (!line) return { ok: false, error: 'not_found', message: 'この明細は一覧にありません' };
+      subject = { codeKey: line.code_key, productCode: line.product_id, productName: line.product_name, barcode: line.barcode, batchId: bid, lineKey: key };
+    } else {
+      // 商品マスタから。バーコードは控え (f_inbound_check_barcodes) → 取込行 → 在庫ミラー → 入荷予定 の順に探し、
+      // 無ければ画面で入力されたもの (barcodeOverride) を使う。画面の入力は形式だけ検査する (刷れない形を積まない)
+      const p = getProductForPrint(productCode);
+      if (!p) return { ok: false, error: 'not_found', message: 'この商品は商品マスタにありません' };
+      const override = String(barcodeOverride == null ? '' : barcodeOverride).trim();
+      if (override && !barcodeTypeOf(override)) {
+        return { ok: false, error: 'bad_barcode', message: `バーコード「${override}」は JAN (数字のみ) でも FNSKU (英数字) でもないため印刷できません` };
+      }
+      subject = { codeKey: p.code_key, productCode: p.product_id, productName: p.product_name, barcode: override || p.barcode, batchId: null, lineKey: null };
+    }
+    const barcode = String(subject.barcode == null ? '' : subject.barcode).trim();
     const type = barcodeTypeOf(barcode);
     if (!type) {
-      return { ok: false, error: 'bad_barcode', message: barcode ? `バーコード「${barcode}」は JAN (数字のみ) でも FNSKU (英数字) でもないため印刷できません` : 'この商品はロジザードにバーコードが登録されていないため印刷できません' };
+      return { ok: false, error: 'bad_barcode', message: barcode ? `バーコード「${barcode}」は JAN (数字のみ) でも FNSKU (英数字) でもないため印刷できません`
+        : (source === 'line' ? 'この商品はロジザードにバーコードが登録されていないため印刷できません' : 'この商品のバーコードが分かりません。JAN か FNSKU を入力してください') };
     }
-    const name = String(line.product_name == null ? '' : line.product_name).trim();
+    const name = String(subject.productName == null ? '' : subject.productName).trim();
     if (!name) return { ok: false, error: 'bad_request', message: '商品名が空のため印刷できません' };
 
-    // 同じ明細のジョブがまだ終わっていなければ積まない (連打で2枚出ない)。
+    // 同じ明細 (商品モードなら同じ商品) のジョブがまだ終わっていなければ積まない (連打で2枚出ない)。
     // 終わっていれば (completed/failed/unknown/manual) 新しいジョブを積める = 人が判断して押し直す
-    const last = db.prepare(`SELECT * FROM f_inbound_check_print_jobs WHERE batch_id = ? AND line_key = ? ORDER BY id DESC LIMIT 1`).get(bid, key);
+    const last = source === 'line'
+      ? db.prepare(`SELECT * FROM f_inbound_check_print_jobs WHERE source = 'line' AND batch_id = ? AND line_key = ? ORDER BY id DESC LIMIT 1`).get(bid, key)
+      : db.prepare(`SELECT * FROM f_inbound_check_print_jobs WHERE source = 'product' AND code_key = ? ORDER BY id DESC LIMIT 1`).get(subject.codeKey);
     if (last && ACTIVE_STATES.includes(last.state)) {
       return { ok: false, error: 'in_progress', message: 'この商品のシールは印刷中です (結果が出るまでお待ちください)', job: publicJob(last) };
     }
@@ -217,10 +237,10 @@ export function enqueuePrintJob({ batchId, lineKey, copies, packQty = null, targ
       }
     }
     const info = db.prepare(`INSERT INTO f_inbound_check_print_jobs
-      (client_request_id, batch_id, line_key, code_key, product_code, product_name, barcode, barcode_type, pack_qty, copies,
+      (client_request_id, source, batch_id, line_key, code_key, product_code, product_name, barcode, barcode_type, pack_qty, copies,
        printer_name, target_device_id, requested_by, requested_device, acknowledged_job_id, state, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
-      .run(crid, bid, key, line.code_key, line.product_id, name, barcode, type, pack, n,
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
+      .run(crid, source, subject.batchId, subject.lineKey, subject.codeKey, subject.productCode, name, barcode, type, pack, n,
         target.agent.printer_name, target.agent.id, requestedBy, requestedDevice, acked, now, now);
     const job = db.prepare('SELECT * FROM f_inbound_check_print_jobs WHERE id = ?').get(Number(info.lastInsertRowid));
     return { ok: true, job: publicJob(job), created: true };
@@ -232,6 +252,7 @@ export function publicJob(row) {
   if (!row) return null;
   return {
     id: row.id, state: row.state, label: PRINT_STATE_LABELS[row.state] || row.state,
+    source: row.source || 'line', code_key: row.code_key,
     line_key: row.line_key, product_code: row.product_code, product_name: row.product_name,
     barcode: row.barcode, barcode_type: row.barcode_type, pack_qty: row.pack_qty, copies: row.copies,
     printer_name: row.printer_name, target_device_id: row.target_device_id,
@@ -244,10 +265,23 @@ export function publicJob(row) {
 /** バッチ内の明細ごとの最新ジョブ (line_key → publicJob)。/api/state で行に付ける */
 export function latestJobsForBatch(batchId) {
   const rows = getDB().prepare(`SELECT j.* FROM f_inbound_check_print_jobs j
-    JOIN (SELECT line_key, MAX(id) AS id FROM f_inbound_check_print_jobs WHERE batch_id = ? GROUP BY line_key) m ON m.id = j.id`)
+    JOIN (SELECT line_key, MAX(id) AS id FROM f_inbound_check_print_jobs WHERE source = 'line' AND batch_id = ? GROUP BY line_key) m ON m.id = j.id`)
     .all(batchId);
   const map = new Map();
   for (const r of rows) map.set(r.line_key, publicJob(r));
+  return map;
+}
+
+/** 🔍 商品モードのジョブの、商品ごとの最新 (code_key → publicJob)。商品を探す画面の行に付ける */
+export function latestJobsForProducts(codeKeys) {
+  const keys = [...new Set((codeKeys || []).map(k => String(k || '').trim().toLowerCase()).filter(Boolean))];
+  const map = new Map();
+  if (keys.length === 0) return map;
+  const ph = keys.map(() => '?').join(',');
+  const rows = getDB().prepare(`SELECT j.* FROM f_inbound_check_print_jobs j
+    JOIN (SELECT code_key, MAX(id) AS id FROM f_inbound_check_print_jobs WHERE source = 'product' AND code_key IN (${ph}) GROUP BY code_key) m ON m.id = j.id`)
+    .all(...keys);
+  for (const r of rows) map.set(r.code_key, publicJob(r));
   return map;
 }
 
@@ -288,7 +322,7 @@ export function leaseNextJob(device, { now = utcNow() } = {}) {
       barcodeType: job.barcode_type,
       packQty: job.pack_qty == null ? '' : String(job.pack_qty),
       copies: job.copies,
-      lineKey: job.line_key,
+      lineKey: job.line_key || '',   // 商品モードは明細が無い (エージェントは参考情報としてしか使わない)
       requestedBy: job.requested_by || '',
       leaseExpiresAt: deadline,
     };
