@@ -1579,16 +1579,18 @@ export function reconcileRepickBatches() {
                           WHEN t.incident_id IS NULL OR i.id IS NOT NULL THEN 'shortage' END AS reason
         FROM pk_batches b JOIN pk_pack_tasks t ON t.id = b.pack_task_id
         LEFT JOIN pk_pack_incidents i ON i.id = t.incident_id
-        WHERE b.origin = 'repick' AND b.repick_reason IS NULL AND b.status IN ('ready','picking','paused')` : `
+        WHERE b.origin = 'repick' AND b.repick_reason IS NULL AND b.status = 'ready'` : `
         SELECT b.id, CASE WHEN t.later_request_id IS NOT NULL THEN 'later' ELSE 'shortage' END AS reason
         FROM pk_batches b JOIN pk_pack_tasks t ON t.id = b.pack_task_id
-        WHERE b.origin = 'repick' AND b.repick_reason IS NULL AND b.status IN ('ready','picking','paused')`).all()
+        WHERE b.origin = 'repick' AND b.repick_reason IS NULL AND b.status = 'ready'`).all()
         .filter((r) => r.reason);
+      // 未着手 (ready) だけ書き換える — 着手後に名前・理由が変わると、開いたままの作業画面と DB が分裂する (Codex R2)。
+      // 着手後は作成時の暫定表示で固定 (理由は監査用に NULL のまま残る)
       if (legacy.length) {
-        const upd = db.prepare('UPDATE pk_batches SET repick_reason=?, hikiate_class=?, updated_at=? WHERE id=? AND repick_reason IS NULL');
+        const upd = db.prepare("UPDATE pk_batches SET repick_reason=?, hikiate_class=?, updated_at=? WHERE id=? AND repick_reason IS NULL AND status = 'ready'");
         db.transaction(() => { for (const r of legacy) upd.run(r.reason, REPICK_CLASS[r.reason], utcNow(), r.id); })();
       }
-    } catch { /* fail-soft */ }
+    } catch (e) { console.warn(`[picking] 再ピック理由の補完失敗: ${e.message}`); }
     return rows.length + missing.length;
   } catch {
     return 0;   // pk_pack_tasks が無い環境 (packing無効・テスト) では何もしない

@@ -122,7 +122,14 @@ t('PR-5: v16 以前のバッチ (repick_reason NULL) は reconcile で理由と�
   db.prepare("UPDATE pk_batches SET repick_reason=NULL, hikiate_class='ピッキング漏れ', status='done' WHERE pack_task_id=105").run();
   // 未確定 (候補 999 が無い) のバッチ 204 も対象。タスク行を用意し、候補が現れたら品違いに直る
   db.prepare("INSERT INTO pk_pack_tasks (id, status, kind, sku, incident_id) VALUES (204, 'requested', 'repick', 'kofunneil-0776', 999)").run();
+  // 着手済み (picking) の未確定は表示を固定 = reconcile は触らない (開いたままの作業画面と DB が分裂しない — Codex R2)
+  db.prepare("INSERT INTO pk_pack_tasks (id, status, kind, sku, incident_id) VALUES (205, 'claimed', 'repick', 'eee', 55)").run();
+  createRepickBatch({ ...task, id: 205, sku: 'eee', incident_id: 55 });
+  db.prepare("UPDATE pk_batches SET repick_reason=NULL, hikiate_class=?, status='picking' WHERE pack_task_id=205").run(REPICK_CLASS.shortage);
   reconcileRepickBatches();
+  const b205 = db.prepare('SELECT repick_reason, hikiate_class FROM pk_batches WHERE pack_task_id=205').get();
+  assert.equal(b205.repick_reason, null, '着手済みは触らない');
+  assert.equal(b205.hikiate_class, REPICK_CLASS.shortage, '着手済みの名前も固定');
   const b = db.prepare('SELECT * FROM pk_batches WHERE pack_task_id=104').get();
   assert.equal(b.repick_reason, 'later');
   assert.equal(b.hikiate_class, REPICK_CLASS.later);

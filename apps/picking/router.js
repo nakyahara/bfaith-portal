@@ -216,15 +216,15 @@ router.get('/', async (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   reconcileRepickBatches();   // 梱包側で取消されたピッキング漏れバッチを畳む (fail-soft)
   const batches = listBatches(workDate)
-    .filter((b) => b.status !== 'cancelled' || b.work_date === workDate)
-    // 🔴/🕒 再ピックバッチはカードに商品・数量・ロケ (取った場所 / 前回無かった場所) を出す (例外処理監査 PR-5・A-2)。
-    // 1タスク=1バッチ=1行なので、その日の分を一括で引く (N+1 にしない)
-    .map((b, _, arr) => {
-      if (b.origin !== 'repick') return b;
-      if (!arr._repickLines) arr._repickLines = listRepickFirstLines(workDate);
-      const line = arr._repickLines.get(b.id) || null;
-      return { ...b, repickLine: line ? { sku: line.sku, name: line.product_name || line.sku, qty: line.qty, locationLabel: line.location ? formatLocation(line.block, line.location) : null } : null };
-    });
+    .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
+  // 🔴/🕒 再ピックバッチはカードに商品・数量・ロケ (取った場所 / 前回無かった場所) を出す (例外処理監査 PR-5・A-2)。
+  // 1タスク=1バッチ=1行なので、その日の分を一括で引く (N+1 にしない)
+  const repickLines = batches.some((b) => b.origin === 'repick') ? listRepickFirstLines(workDate) : new Map();
+  for (const b of batches) {
+    if (b.origin !== 'repick') continue;
+    const line = repickLines.get(b.id) || null;
+    b.repickLine = line ? { sku: line.sku, name: line.product_name || line.sku, qty: line.qty, locationLabel: line.location ? formatLocation(line.block, line.location) : null } : null;
+  }
   // ↩ 棚戻し = 一覧の中に「バッチ」として並べる (例外処理監査 PR-4・指摘C)。pk_batches は作らない (計測・Notion・フロアボードに混ざらない)
   let returnTasks = [];
   const psvc = await packingSvc();
@@ -400,6 +400,10 @@ router.get('/work/:id(\\d+)', (req, res) => {
   let state;
   try {
     state = getWorkState(Number(req.params.id));
+    // 🔴/🕒 理由が未確定のバッチは開く直前に確定を試みる (未着手のみ。着手後は表示を固定 — Codex R2)
+    if (state.batch.origin === 'repick' && !state.batch.repick_reason && state.batch.status === 'ready') {
+      try { reconcileRepickBatches(); state = getWorkState(Number(req.params.id)); } catch { /* fail-soft */ }
+    }
   } catch (e) {
     if (e instanceof PkError) return res.status(e.status).send(e.message);
     throw e;
