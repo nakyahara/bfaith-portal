@@ -44,7 +44,7 @@
   .tag.red{background:var(--danger-soft);color:var(--danger);border:1px solid var(--danger)}
   .tag.blue{background:var(--accent-soft);color:var(--accent)}
   .tag.green{background:var(--ok-soft);color:var(--ok)}
-  .tag.amber{background:var(--amber-soft);color:var(--amber)}
+  .tag.amber{background:var(--amber-soft);color:#8A4B00}   /* 小さい文字でも読めるコントラスト (Codex) */
   kbd{display:inline-block;border:1px solid var(--line);border-bottom-width:2px;border-radius:8px;padding:2px 10px;background:var(--surface);font-family:var(--font);font-weight:700;font-size:.95em}
   .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:10px 14px;border-radius:8px;margin:10px 0;font-size:1rem}
   .callout.warn{border-color:var(--amber);background:var(--amber-soft)}
@@ -87,7 +87,7 @@
       <li><b>じぶんの名前</b>をおします。</li>
       <li>右上に名前が出ます。まちがえたら右上の名前をおして替えます。</li>
     </ol>
-    <figure><img src="/app-images/iroha-work/manual/m01-gate.png" alt="名前をえらぶ画面" loading="lazy"><figcaption>最初の画面。名前をおすだけ。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m01-gate.png" alt="名前をえらぶ画面: 利用者と職員の名前のボタンが並んでいる" loading="lazy"><figcaption>最初の画面。名前をおすだけ。</figcaption></figure>
     <div class="callout">作業する人は、はじめるときに<b>別にえらべます</b> (何人でも)。ここでえらぶのは「この iPad をさわっている人」です。</div>
   </section>
 
@@ -98,8 +98,8 @@
       <li>上のタブ: <kbd>📌 今日やる</kbd> (朝いちばんに見る) / <kbd>すべて</kbd> / <kbd>未着手</kbd> / <kbd>作業中</kbd> / <kbd>棚入待ち</kbd> / <kbd>⛔ 止まっている</kbd> / <kbd>止まっていない</kbd></li>
       <li>カードをおすと、くわしい画面が開きます。</li>
     </ol>
-    <figure><img src="/app-images/iroha-work/manual/m02-list.png" alt="一覧" loading="lazy"><figcaption>一覧。上のタブで絞れます。</figcaption></figure>
-    <figure><img src="/app-images/iroha-work/manual/m03-card.png" alt="カード 1 枚" loading="lazy"><figcaption>カード 1 枚の読みかた。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m02-list.png" alt="一覧: 上に すべて・今日やる・未着手・作業中・棚入待ち・止まっている のタブ、下にカードが並ぶ" loading="lazy"><figcaption>一覧。上のタブで絞れます。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m03-card.png" alt="カード 1 枚: 商品名、今日やる と はじめての商品 の札、48 個・2 箱・約 12 分、右に状態のボタン" loading="lazy"><figcaption>カード 1 枚の読みかた。</figcaption></figure>
     <ul class="notes">
       <li><b>48 個</b> = つくる数。<b>📦 2 箱</b> = 用意する保管箱の数。<b>⏱ 約 12 分</b> = かかる時間のめやす。</li>
       <li><span class="tag blue">📌 今日やる</span> 今日やる予定。<span class="tag green">🌱 はじめての商品</span> この商品ははじめて (前の写真がありません)。</li>
@@ -119,10 +119,10 @@
       <li><kbd>▶ N人で作業をはじめる</kbd> をおすと、タイマーが動きます。</li>
     </ol>
     <div class="two">
-      <figure><img src="/app-images/iroha-work/manual/m04-detail.png" alt="カードの中" loading="lazy"><figcaption>カードを開いたところ。</figcaption></figure>
-      <figure><img src="/app-images/iroha-work/manual/m06-crew.png" alt="作業する人をえらぶ" loading="lazy"><figcaption>作業する人をえらぶ。何人でも。</figcaption></figure>
+      <figure><img src="/app-images/iroha-work/manual/m04-detail.png" alt="カードの中: つくる数・必要保管箱・想定作業時間、気をつけること、使うもの (資材と保管箱の写真)、下に 作業をはじめる のバー" loading="lazy"><figcaption>カードを開いたところ。</figcaption></figure>
+      <figure><img src="/app-images/iroha-work/manual/m06-crew.png" alt="作業する人をえらぶダイアログ: 利用者と職員の名前にチェック、下に N人で作業をはじめる のボタン" loading="lazy"><figcaption>作業する人をえらぶ。何人でも。</figcaption></figure>
     </div>
-    <figure><img src="/app-images/iroha-work/manual/m05-bar.png" alt="下の固定バー" loading="lazy"><figcaption>いちばん下のバー。ここから「はじめる」「止まった」。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m05-bar.png" alt="下の固定バー: 青い 作業をはじめる と、赤い 止まった" loading="lazy"><figcaption>いちばん下のバー。ここから「はじめる」「止まった」。</figcaption></figure>
     <div class="callout warn">「⚠ 工程が未登録」のカードは、分かるなら先に「＋ 登録」してください (分からなければそのまま始めてもよいです)。</div>
   </section>
 
@@ -134,7 +134,7 @@
       <li>みんなで休けい: 下のバーの <kbd>⏸ ひとやすみ</kbd>。もどったら <kbd>▶ 作業をはじめる</kbd>。</li>
       <li>人がふえたら <kbd>＋ 人を追加</kbd>。</li>
     </ol>
-    <figure><img src="/app-images/iroha-work/manual/m07-working.png" alt="作業中の画面" loading="lazy"><figcaption>作業中。名前と時間が出ます。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m07-working.png" alt="作業中: 作業する人の名前と経過時間、ぬける のボタン、人を追加" loading="lazy"><figcaption>作業中。名前と時間が出ます。</figcaption></figure>
   </section>
 
   <section id="s5">
@@ -143,11 +143,11 @@
     <ol class="steps">
       <li>下のバーの赤い <kbd>⛔ 止まった</kbd> をおします。</li>
       <li>理由を 1 つえらびます: <b>ラベルが足りない</b> / <b>資材が足りない</b> / <b>指示待ち</b> / <b>その他</b>。</li>
-      <li><b>資材が足りない</b>のときは、どの資材が何個足りないかをおして (書いて) ください。<b>職員に自動で連絡が行きます</b>。</li>
+      <li><b>資材が足りない</b>のときは、どの資材が何個足りないかをおして (書いて) ください。職員への連絡を<b>自動で試みます</b> (届かないこともあるので、急ぐときは直接声をかけてください)。</li>
       <li>何個までできたか (分かれば) と、次にやる人へのメモを書いて <kbd>この理由で止める</kbd>。タイマーは止まります。</li>
       <li>解消したら、いつもどおり <kbd>▶ 作業をはじめる</kbd>。「解消しましたか?」に「はい」で札が外れます。</li>
     </ol>
-    <figure><img src="/app-images/iroha-work/manual/m08-block.png" alt="止まった理由をえらぶ" loading="lazy"><figcaption>「資材が足りない」をえらんだところ。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m08-block.png" alt="止まった理由のダイアログ: 資材が足りない を選び、足りない資材と数、何個までできたか、メモを入れる" loading="lazy"><figcaption>「資材が足りない」をえらんだところ。</figcaption></figure>
   </section>
 
   <section id="s6">
@@ -159,7 +159,7 @@
       <li>できあがった状態の<b>写真をとる</b> (次に同じ商品を作る人の見本になります。3 枚まで)。</li>
       <li>棚に入れ終わったら、<b>職員</b>が「棚入完了」にします。</li>
     </ol>
-    <figure><img src="/app-images/iroha-work/manual/m10-done.png" alt="できあがり" loading="lazy"><figcaption>できあがりのダイアログ。数を確かめて「棚入待ちにする」。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m10-done.png" alt="できあがりのダイアログ: 何個できましたか、まちがえた、棚入待ちにする" loading="lazy"><figcaption>できあがりのダイアログ。数を確かめて「棚入待ちにする」。</figcaption></figure>
   </section>
 
   <section id="s7">
@@ -170,7 +170,7 @@
       <li>「できあがり」をまちがえたら、ダイアログの <kbd>← まちがえた (まだ作業中)</kbd>。</li>
       <li>時間がたってしまったら、もう一度 <kbd>▶ 作業をはじめる</kbd> でつづきを始められます。</li>
     </ol>
-    <figure><img src="/app-images/iroha-work/manual/m09-undo.png" alt="もどす" loading="lazy"><figcaption>黒い帯の「もどす」。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m09-undo.png" alt="画面下の黒い帯: 〜さんが抜けました と もどす のボタン" loading="lazy"><figcaption>黒い帯の「もどす」。</figcaption></figure>
   </section>
 
   <section id="s8">
@@ -181,7 +181,7 @@
       <li><b>文字を大きく</b>: 右上の <kbd>あ⁺</kbd>。おすごとに 大 → 特大 → ふつう。この iPad におぼえます。</li>
       <li><b>ボード</b>: 未着手・作業中・棚入待ちを横に並べて見る画面。上の「予定」で 今日やる／止まっている などに絞れます。</li>
     </ol>
-    <figure><img src="/app-images/iroha-work/manual/m11-board.png" alt="ボード" loading="lazy"><figcaption>ボード。左から 未着手・作業中・棚入待ち。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m11-board.png" alt="ボード: 未着手・作業中・棚入待ち の 3 列にカードが並ぶ" loading="lazy"><figcaption>ボード。左から 未着手・作業中・棚入待ち。</figcaption></figure>
   </section>
 
   <section id="s9">
@@ -191,7 +191,7 @@
       <li>上の <kbd>📚 履歴</kbd> → <kbd>📅 きょうのみんなの作業</kbd>。</li>
       <li>人ごとに、商品と時間が出ます。じぶんの分がいちばん上。<kbd>きのう</kbd> や日付で前の日も見られます。</li>
     </ol>
-    <figure><img src="/app-images/iroha-work/manual/m17-daily.png" alt="きょうのみんなの作業" loading="lazy"><figcaption>人 × 商品 × 時間。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m17-daily.png" alt="きょうのみんなの作業: 人ごとに商品と時間が並ぶ" loading="lazy"><figcaption>人 × 商品 × 時間。</figcaption></figure>
   </section>
 
   <div class="staffnote">ここからは職員の方向けです。</div>
@@ -204,13 +204,13 @@
       <li>30 分たつか、右上の名前を<b>別の人に替えると終わります</b> (利用者に替えた瞬間に職員の操作は消えます)。</li>
       <li>PIN を入れた本人だけの職員モードです。別の職員はその人の PIN で入り直します。</li>
     </ol>
-    <figure><img src="/app-images/iroha-work/manual/m12-staff-pin.png" alt="職員PIN" loading="lazy"><figcaption>職員PIN のダイアログ。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m12-staff-pin.png" alt="職員PIN を入れるダイアログ" loading="lazy"><figcaption>職員PIN のダイアログ。</figcaption></figure>
     <div class="callout warn">共用 iPad ではポータル (PC 用の管理画面) にログインしないでください。ログインが残っていると、利用者に替えても職員の権限が残ります。</div>
   </section>
 
   <section id="s11" class="staff">
     <h2><span class="no">11</span>計画 (どこが・いつ)</h2>
-    <p class="why">なぜ: 「どこが (どの施設が) やるか」「いつやるか」を決めるのは職員の仕事。利用者の画面には決まったものだけ出ます。</p>
+    <p class="why">なぜ: 「どこが (どの施設が) やるか」「いつやるか」を決めるのは職員の仕事。利用者の画面では決まった予定を見られますが、変えられるのは職員だけです。</p>
     <ol class="steps">
       <li>ボードのカードの <kbd>どこが 未定</kbd> をおす → いろは／羅針盤／ワークセンター／ジョブサポ／パレット／未定にする。</li>
       <li><kbd>いつ 未定</kbd> をおす → <b>📌 今日やる</b>／明日やる／未定にする。</li>
@@ -218,10 +218,10 @@
       <li>カードの中の <kbd>📌 今日やる</kbd> でも今日の予定に入れられます。</li>
     </ol>
     <div class="two">
-      <figure><img src="/app-images/iroha-work/manual/m13-board-staff.png" alt="職員のボード" loading="lazy"><figcaption>職員モードのボード。札がボタンになります。</figcaption></figure>
-      <figure><img src="/app-images/iroha-work/manual/m14-when.png" alt="いつをえらぶ" loading="lazy"><figcaption>「いつ」をえらぶ。</figcaption></figure>
+      <figure><img src="/app-images/iroha-work/manual/m13-board-staff.png" alt="職員モードのボード: どこが・いつ の札がボタンになり、棚入待ちのカードに 棚入完了 のボタン" loading="lazy"><figcaption>職員モードのボード。札がボタンになります。</figcaption></figure>
+      <figure><img src="/app-images/iroha-work/manual/m14-when.png" alt="いつをえらぶダイアログ: 今日やる・明日やる・未定にする" loading="lazy"><figcaption>「いつ」をえらぶ。</figcaption></figure>
     </div>
-    <figure><img src="/app-images/iroha-work/manual/m15-plan.png" alt="明日の計画" loading="lazy"><figcaption>明日の計画。左の候補から右へ。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m15-plan.png" alt="明日の計画: 左に候補、右に明日やる分、上に時間のゲージ" loading="lazy"><figcaption>明日の計画。左の候補から右へ。</figcaption></figure>
   </section>
 
   <section id="s12" class="staff">
@@ -233,7 +233,7 @@
       <li><b>ラベル待ち</b>: 利用者が「ラベルが足りない」で止めると記録が自動で開きます。発注・本社連絡・入庫完了・完了は職員が <kbd>🏷 ラベル待ち</kbd> タブから記録します。「完了」にすると札が外れます。</li>
       <li><b>止まっているカード</b>: 資材が届いたら、そのカードで <kbd>▶ 作業をはじめる</kbd> → 「はい、解消した」で札が外れます。作業を始めずに札だけ外すときは、カードの上の赤い枠の <kbd>札を外す (職員)</kbd>。</li>
     </ol>
-    <figure><img src="/app-images/iroha-work/manual/m16-stock-confirm.png" alt="棚入完了の確認" loading="lazy"><figcaption>棚入完了の確認。このあと PIN。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m16-stock-confirm.png" alt="棚入完了の確認ダイアログ: はい、棚入完了にする" loading="lazy"><figcaption>棚入完了の確認。このあと PIN。</figcaption></figure>
   </section>
 
   <section id="s13" class="staff">
@@ -255,7 +255,8 @@
       <li><b>「サーバーにつながりません」</b>と出る: 前回の一覧を表示しています。少し待つと自動でつなぎ直します。数分たっても直らなければ職員へ。</li>
       <li><b>ボタンが出ない</b>: その人にはできない操作です (例: 計画・終了は職員だけ)。名前を替えるか、職員をよんでください。</li>
       <li><b>PIN を忘れた</b>: 管理画面の名簿で職員が設定し直します。</li>
-      <li><b>まちがって止めた・終わらせた</b>: 直後なら「もどす」。時間がたったら、もう一度「▶ 作業をはじめる」。職員は管理画面で記録を取り消せます。</li>
+      <li><b>まちがって止めた</b> (ぬける・ひとやすみ・⛔ 止まった・できあがり): 直後なら「もどす」か「← まちがえた」。時間がたったら、もう一度「▶ 作業をはじめる」でつづきを始められます。</li>
+      <li><b>まちがって棚入完了 (終了) にした</b>: カードは一覧から外れます。職員に伝えてください (職員がカードの状態を作業中に戻すか、管理画面で記録を取り消します)。</li>
       <li><b>カードが見つからない</b>: 一覧のタブが「今日やる」になっていないか確かめ、「すべて」にしてから検索。</li>
     </ul>
   </section>
