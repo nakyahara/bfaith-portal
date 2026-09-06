@@ -378,6 +378,7 @@
       currentSeq: state.currentSeq,
       heldSeqs: state.slips.filter((x) => x.status === 'held').map((x) => x.seq),
       repickSeqs: state.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
+      repickBySlip: state.repickBySlip || {},   // 伝票ごとの再ピック状態 (claimed = ピッカーが向かっている — 取下げ前の注意に使う)
       repickReadySeqs: Object.entries(state.repickBySlip || {}).filter(([, st]) => st === 'fulfilled').map(([q]) => Number(q)),
       stockoutBySlip: state.stockoutBySlip || {},   // 3階「在庫なし」の報告がある保留伝票 (seq → 商品)
       stockoutAckSeqs: state.stockoutAckSeqs || [],  // そのうち「在庫なしを確認」できる伝票 (サーバーと同じ条件)
@@ -1559,7 +1560,11 @@
     });
     $('foundBtn').addEventListener('click', () => {
       const seq = viewSeq;
-      if (!confirm('商品が見つかったため、再ピック依頼とミス候補を取り下げます。よろしいですか?')) return;
+      // ピッカーが既に取りに向かっている依頼を取り下げると、3階のバッチが取り消され3階の画面に知らせが出る (D-3)
+      const rs = (STATE.repickBySlip || {})[seq];
+      const note = rs === 'claimed' ? '⚠ ピッカーが既に取りに向かっています。取り下げると3階のバッチも取り消され、3階の画面に知らせが出ます。\n\n'
+        : rs === 'fulfilled' ? '⚠ 3階は既に取り終えて、届ける途中かもしれません。\n\n' : '';
+      if (!confirm(`${note}商品が見つかったため、再ピック依頼とミス候補を取り下げます。よろしいですか?`)) return;
       enqueue('found', seq, {});
       heldSet.delete(seq); repickSet.delete(seq);
       incidents = incidents.filter((i) => i.slipSeq !== seq || i.kind === 'excess');

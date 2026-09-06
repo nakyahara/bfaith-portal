@@ -1151,6 +1151,37 @@ export function getTodayProgress(workDate = jstToday()) {
  *    PkError 409 later_in_progress で**操作そのものを拒否**する — 黙って戻すと、取りに行った商品と
  *    取り消された記録がズレて二重ピックになる。呼び出し側のトランザクション内で使う (throw で巻き戻る)。
  */
+/**
+ * 梱包に結べていない「後で取りに行く」依頼 (pending_binding) の一覧 — 管理画面用 (例外処理監査 A-3・PR-6)。
+ * 再ピックバッチ内での「後で」(9/1 id=2) のように受注が無いと、どの画面にも出ずに迷子になる
+ */
+export function listLaterRequests({ status = 'pending_binding' } = {}) {
+  return getDB().prepare(`
+    SELECT lr.*, b.folder_name, b.tb_no, b.work_date, b.hikiate_class, b.origin AS batch_origin
+    FROM pk_later_requests lr JOIN pk_batches b ON b.id = lr.batch_id
+    WHERE lr.status = ? ORDER BY lr.id
+  `).all(status).map((r) => ({ ...r, locationLabel: r.from_location ? formatLocation(r.from_block, r.from_location) : null }));
+}
+
+/**
+ * 「後で取りに行く」依頼を管理者が取り下げる (PR-6)。配賦・未着手タスク・保留伝票・1階のバナーも一緒に戻す
+ * (back と同じ後始末)。ピッカーが既に対応を始めていれば 409 later_in_progress で拒否 (黙って消すと二重ピック)
+ */
+export function cancelLaterRequest(id, actor) {
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const lr = db.prepare('SELECT * FROM pk_later_requests WHERE id=?').get(id);
+    if (!lr) throw new PkError(404, 'not_found', '依頼が見つかりません');
+    if (lr.status === 'cancelled') return { id, status: 'cancelled', existed: true };
+    undoShortageSideEffects(db, lr.batch_id, lr.line_seq, now);
+    // undoShortageSideEffects は (batch, line) の最新の依頼を畳む。念のため対象 id も明示して閉じる
+    db.prepare("UPDATE pk_later_requests SET status='cancelled', updated_at=? WHERE id=? AND status != 'cancelled'").run(now, id);
+    console.log(`[picking] later 依頼 #${id} を取り下げ (${actor || '-'}): batch=${lr.batch_id} line=${lr.line_seq} ${lr.sku} ×${lr.qty}`);
+    return { id, status: 'cancelled', existed: false };
+  }).immediate();
+}
+
 function undoShortageSideEffects(db, batchId, lineSeq, now) {
   const lr = db.prepare(`SELECT * FROM pk_later_requests
     WHERE batch_id=? AND line_seq=? AND status IN ('pending_binding','requested')
@@ -1612,15 +1643,19 @@ export const FLOOR_ALERT_KINDS = {
   // ピッカーの欠品 (🕒 後で取りに行く / ❌ どこにもない) → 1階の全端末へ (例外処理監査 PR-2・Q2 決定 2026-09-05)。
   // 配賦した受注 (伝票) ごとに1本。ref_key='alloc:<batch>:<seq>:<ne_slip_no>' で back / 1階の処理と同時に閉じる
   picking_shortage: { direction: 'to_packing', message: null },
+  // 1階で「見つかった」→ ピッカーが既に取りに向かっている再ピックを取り下げたとき、3階の全端末へ (例外処理監査 PR-6・D-3)。
+  // task_id で集約。メッセージは依頼ごとに動的
+  repick_cancelled: { direction: 'to_picking', message: null },
 };
 
 /** アラート発報。同種の未確認が生きていれば重ねない (連打・二重依頼の集約)。 */
-export function createFloorAlert(kind, requestedBy, customMessage = null, link = null, taskId = null, refKey = null) {
+export function createFloorAlert(kind, requestedBy, customMessage = null, link = null, taskId = null, refKey = null, { dbh = null } = {}) {
   const def = FLOOR_ALERT_KINDS[kind];
   if (!def) throw new PkError(400, 'bad_kind', '不明なアラート種別です');
   const message = def.message || String(customMessage || '').slice(0, 160);
   if (!message) throw new PkError(400, 'no_message', 'メッセージが必要です');
-  const db = getDB();
+  // dbh = packing のトランザクション内から呼ぶときはその接続で (別接続だと書き込みロック待ちで詰まる)
+  const db = dbh || getDB();
   // 集約チェック+INSERTは同一トランザクション (Codex: 同時押下の重複防止)。
   // 集約キーは (kind, message) — repick_done は依頼ごとにメッセージが違うため別々に出る。
   // task_id 付き (在庫なし) は (kind, task_id)、ref_key 付き (欠品の配賦) は (kind, ref_key) で集約 = 未解決バナーは1本だけ

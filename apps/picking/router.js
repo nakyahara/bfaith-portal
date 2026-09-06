@@ -25,7 +25,7 @@ import {
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
   getPickingStats, getTodayProgress, getMissStats, statsRange, loadStatsLines, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
-import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask, announceShortageToPacking, returnCandidates, listRepickFirstLines } from './service.js';
+import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask, announceShortageToPacking, returnCandidates, listRepickFirstLines, listLaterRequests, cancelLaterRequest } from './service.js';
 import { notifyShortage, notifyShortageUndo } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
@@ -638,14 +638,24 @@ router.get('/manifest.json', (req, res) => {
 // ─── 本日サマリ (管理者) ───
 router.get('/admin/summary', requireAdmin, (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
+  // 🕒 梱包に結べていない「後で取りに行く」依頼 (迷子) — 管理者が取り下げる (例外処理監査 A-3・PR-6)
+  let laterPending = [];
+  try { laterPending = listLaterRequests(); } catch { laterPending = []; }
   res.render(path.join(__dirname, 'views/admin_summary'), {
     title: 'ピッキングサマリ',
     username: req.session.email,
     displayName: req.session.displayName,
     isAdmin: true,
     summary: getDailySummary(workDate),
+    laterPending,
   });
 });
+
+/** 迷子の「後で取りに行く」依頼を取り下げる (管理者)。着手済みなら 409 later_in_progress。 */
+router.post('/admin/later-requests/:id(\\d+)/cancel', checkOrigin, requireAdmin, api(async (req, res) => {
+  const r = cancelLaterRequest(Number(req.params.id), req.session.email);
+  res.json({ ok: true, ...r });
+}));
 
 // ─── 作業実績 (30日ローリング) ───
 //

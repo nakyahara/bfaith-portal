@@ -15,7 +15,7 @@
 import crypto from 'node:crypto';
 import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
 // 欠品フローv2 PR2: 再取込 (overwrite) 前に、ピッカーの「後で取りに行く」の展開を依頼へ戻す
-import { resetLaterBindingsForPackBatch, resolveFloorAlertsByTask, resolveFloorAlertsByRef, reconcileShortageAlerts, shortageAllocRefKey } from '../picking/service.js';
+import { resetLaterBindingsForPackBatch, resolveFloorAlertsByTask, resolveFloorAlertsByRef, reconcileShortageAlerts, shortageAllocRefKey, createFloorAlert } from '../picking/service.js';
 import {
   getDB, getPackBatchByTbKey, utcNow, jstToday,
 } from './db.js';
@@ -1818,6 +1818,14 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
       for (const t of targets) {
         db.prepare("UPDATE pk_pack_tasks SET status='cancelled', updated_at=? WHERE id=?").run(now, t.id);
         if (t.status === 'unavailable') resolveFloorAlertsByTask(t.id, 'stockout', db);
+        // ピッカーが既に取りに向かっている (claimed) / 届ける途中 (fulfilled) の依頼を取り下げた → 3階の全端末に知らせる
+        // (例外処理監査 PR-6・D-3: 🔴バッチは次のタップで 409 になるだけで、理由が伝わらなかった)。同一トランザクション・fail-soft
+        if (t.status === 'claimed' || t.status === 'fulfilled') {
+          try {
+            const msg = `🔴 ${batch.folder_name || '-'} #${slipSeq} の再ピック「${t.product_name || t.sku} ×${t.req_qty}」は1階で見つかったため取り下げ — 持って行かなくてOK (${worker})`;
+            createFloorAlert('repick_cancelled', worker, msg, '/apps/picking/', t.id, null, { dbh: db });
+          } catch (e) { console.warn(`[packing] 取下げバナーの発報失敗 (task=${t.id}): ${e.message}`); }
+        }
       }
       db.prepare(`
         UPDATE pk_pack_incidents SET status='withdrawn', updated_at=?
