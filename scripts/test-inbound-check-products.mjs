@@ -208,6 +208,9 @@ const agentRow = verifyDevice(agent.token);
   const hidOk = enqueuePrintJob({ productCode: 'apron-01', copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: 3 });
   ok(hidOk.ok && hidOk.job.acknowledged_job_id === 3, '証跡を付ければ積める');
   ok(!enqueuePrintJob({ productCode: 'apron-01', copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: 3 }).ok, '同じ証跡の使い回しは通らない (進行中)');
+  // 表示 (行に出すジョブ) と受付 (積めるか) の条件は同じ順: 進行中が先、無ければ未確認の unknown (Codex R3 Medium-1)
+  eq(latestJobsForProducts(['apron-01']).get('apron-01').id, hidOk.job.id, '古い未確認 unknown より、いまの進行中を見せる (受付も in_progress)');
+  eq(enqueuePrintJob({ productCode: 'apron-01', copies: 1, clientRequestId: rid() }).error, 'in_progress', '受付も同じ判断');
   const r4 = enqueuePrintJob({ productCode: 'PASHIMA ', copies: 1, clientRequestId: rid() });
   ok(r4.ok && r4.job.barcode === '4903357200047' && r4.job.code_key === 'pashima', '控えのバーコードで積める (商品コードは lower/trim で照合)');
   // エージェント側の契約は変わらない
@@ -236,6 +239,7 @@ const agentRow = verifyDevice(agent.token);
   ok(!cross0.ok && cross0.error === 'confirm_unknown' && cross0.job.id === pas.id && cross0.job.source === 'product', '商品画面からの発行が結果不明なら、伝票からも実物確認の証跡が要る (商品単位で見張る)');
   const line = enqueuePrintJob({ batchId: batch.id, lineKey: 'AR9|1|1', copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: pas.id });
   ok(line.ok && line.job.source === 'line' && line.job.line_key === 'AR9|1|1' && line.job.acknowledged_job_id === pas.id, '伝票からの発行は source=line (商品画面のジョブを証跡にできる)');
+  eq(line.job.barcode, '4903357200047', '伝票からの発行は その明細自身のバーコードで刷る');
   const lineDup = enqueuePrintJob({ batchId: batch.id, lineKey: 'AR9|1|1', copies: 1, clientRequestId: rid() });
   ok(!lineDup.ok && lineDup.error === 'in_progress', '伝票側の連打は進行中');
   const cross1 = enqueuePrintJob({ productCode: 'pashima', copies: 1, clientRequestId: rid() });

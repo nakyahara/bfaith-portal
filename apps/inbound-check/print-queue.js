@@ -176,12 +176,16 @@ export function enqueuePrintJob({ batchId, lineKey, productCode = null, barcodeO
       if (!active || active.id !== bid) return { ok: false, error: 'stale_batch', message: '一覧が新しくなっています。画面を更新してからもう一度押してください' };
       const line = db.prepare('SELECT * FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(bid, key);
       if (!line) return { ok: false, error: 'not_found', message: 'この明細は一覧にありません' };
-      // 刷る値は商品モードと同じ経路 (resolveBarcode: 取込行 → 在庫 → 入荷予定 → 控え)。取込行にバーコードが無い (ロジザード未登録) 商品でも、
-      // 🔍 商品画面で入れた控えがあれば伝票からも刷れる。取込行にあればそれが最優先 = 伝票と商品画面で同じ紙 (Codex R2 High-2)
-      const bc = resolveBarcode(line.code_key, db);
-      subject = { codeKey: line.code_key, productCode: line.product_id, productName: line.product_name, barcode: bc ? bc.barcode : (line.barcode || null), batchId: bid, lineKey: key };
+      // 刷る値は **その明細自身のバーコード** が最優先 (同じ商品が同じ伝票に複数行あって値が違うことがある。Codex R3 Medium-2)。
+      // 明細に値が無い (ロジザード未登録) ときだけ、商品モードと同じ経路 (resolveBarcode: 在庫 → 入荷予定 → 控え) に落ちる —
+      // 🔍 商品画面で入れた控えがあれば伝票からも刷れる (Codex R2 High-2)
+      // 明細に値があるのに刷れない形 (記号入りなど) のときは、その値のまま拒否する — 他所の値でこっそり刷らない。
+      // 明細が空のときだけ 在庫 → 入荷予定 → 控え に落ちる
+      const own = String(line.barcode == null ? '' : line.barcode).trim();
+      const bc = own ? { barcode: own } : resolveBarcode(line.code_key, db);
+      subject = { codeKey: line.code_key, productCode: line.product_id, productName: line.product_name, barcode: bc ? bc.barcode : null, batchId: bid, lineKey: key };
     } else {
-      // 商品マスタから。バーコードは控え (f_inbound_check_barcodes) → 取込行 → 在庫ミラー → 入荷予定 の順に探す。
+      // 商品マスタから。バーコードは取込行 → 在庫ミラー → 入荷予定 → 控え (f_inbound_check_barcodes) の順に探す。
       // 刷る値は **必ず DB (控え) の値**。画面から来た barcodeOverride は:
       //   - 控えが無い → 形式を検査して控えに保存し、その控えの値で刷る (次からは入力不要)
       //   - 控えがあって違う → 積まない (ダイアログを開いた後に別の人が入れた/直した = 古い入力で違うシールを出さない。Codex R1 High-2)
@@ -308,18 +312,28 @@ export function latestJobsForBatch(batchId) {
   return map;
 }
 
-/** 同じ商品の未確定ジョブ (進行中 / 未確認の結果不明) の最新 (code_key → row)。見張り (enqueuePrintJob) と同じ条件 */
+/**
+ * 同じ商品の未確定ジョブ (code_key → row)。**見張り (enqueuePrintJob) と同じ順で選ぶ**:
+ * まず進行中 (queued/leased/submitted)、無ければ未確認の結果不明 (unknown かつ acknowledged_at IS NULL)。
+ * まとめて MAX(id) にすると、古い進行中の後ろに新しい unknown が居るとき、画面は「実物を確認して再発行」を出すのに
+ * 受付は in_progress を返す — 表示と受付が食い違う (Codex R3 Medium-1)
+ */
 function pendingJobsByProduct(db, codeKeys) {
   const keys = [...new Set((codeKeys || []).map(k => String(k == null ? '' : k).trim().toLowerCase()).filter(Boolean))];
   const map = new Map();
-  for (let i = 0; i < keys.length; i += 500) {
-    const part = keys.slice(i, i + 500);
-    const ph = part.map(() => '?').join(',');
-    for (const r of db.prepare(`SELECT j.* FROM f_inbound_check_print_jobs j
-      JOIN (SELECT code_key, MAX(id) AS id FROM f_inbound_check_print_jobs
-            WHERE code_key IN (${ph}) AND (state IN ('queued','leased','submitted') OR (state = 'unknown' AND acknowledged_at IS NULL))
-            GROUP BY code_key) m ON m.id = j.id`).all(...part)) map.set(r.code_key, r);
-  }
+  const pick = (cond) => {
+    for (let i = 0; i < keys.length; i += 500) {
+      const part = keys.slice(i, i + 500);
+      const ph = part.map(() => '?').join(',');
+      for (const r of db.prepare(`SELECT j.* FROM f_inbound_check_print_jobs j
+        JOIN (SELECT code_key, MAX(id) AS id FROM f_inbound_check_print_jobs
+              WHERE code_key IN (${ph}) AND ${cond} GROUP BY code_key) m ON m.id = j.id`).all(...part)) {
+        if (!map.has(r.code_key)) map.set(r.code_key, r);
+      }
+    }
+  };
+  pick("state IN ('queued','leased','submitted')");
+  pick("state = 'unknown' AND acknowledged_at IS NULL");
   return map;
 }
 
