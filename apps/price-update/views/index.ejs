@@ -1,59 +1,142 @@
 <%- include('../../product-hub/views/_header') %>
 <style>
-  .topbar .app-title { display: none; }
-  .pu-title { font-weight: 700; font-size: 15px; }
-  .wrap { max-width: 1400px; }
-  .pu-input { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
-  .pu-input textarea { min-height: 76px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+  /* ★共通ヘッダは「商品登録ハブ」用のナビを持っている。この画面では別アプリの導線でしかなく、
+     押すと迷子になるので丸ごと隠して、下の自前のバーだけを見せる */
+  body > .topbar:first-of-type { display: none; }
+
+  .wrap { max-width: 1280px; }
   .pu-note { font-size: 12px; color: #64748b; }
-  /* 色が全部つられて変わる、のような「操作の効き方が見た目と違う」注意書き */
-  .pu-warn { font-size: 11px; color: #9a3412; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 4px; padding: 2px 4px; margin-top: 3px; line-height: 1.35; }
-  table.pu { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table.pu th { text-align: left; color: #64748b; font-size: 11px; font-weight: 600; border-bottom: 2px solid #e2e8f0; padding: 6px 8px; white-space: nowrap; }
-  table.pu td { border-bottom: 1px solid #f1f5f9; padding: 6px 8px; vertical-align: middle; }
-  table.pu tr.set-row td { background: #fffbeb; }
-  table.pu tr.blocked td { color: #64748b; }
+  .dim { color: #94a3b8; }
   .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* ── 見出し・手順 ───────────────────────────── */
+  .card h2 { display: flex; align-items: center; gap: 9px; font-size: 15px; }
+  .step { display: inline-flex; align-items: center; justify-content: center;
+          width: 22px; height: 22px; border-radius: 50%; background: #1e293b; color: #fff;
+          font-size: 12px; font-weight: 700; flex: 0 0 auto; }
+  .h2-sub { font-size: 12px; font-weight: 400; color: #64748b; }
+  .h2-right { margin-left: auto; font-size: 12px; font-weight: 400; }
+
+  /* ── 冒頭のひとこと ─────────────────────────── */
+  .lede { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 10px;
+          padding: 11px 14px; font-size: 13px; margin-bottom: 16px; }
+  .lede b { color: #1d4ed8; }
+  .lede details { margin-top: 7px; }
+  .lede summary { cursor: pointer; font-size: 12px; color: #1d4ed8; }
+  .lede .howto { margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: #334155; line-height: 1.8; }
+
+  /* ── 1. コード入力 ──────────────────────────── */
+  .pu-input { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+  .pu-input textarea { min-height: 72px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+
+  /* ── 2. 新原価 ─────────────────────────────── */
+  .cost-row { display: grid; grid-template-columns: 170px minmax(0, 1fr) 110px 120px; gap: 10px;
+              align-items: center; padding: 5px 0; border-bottom: 1px solid #f1f5f9; }
+  .cost-row:last-child { border-bottom: 0; }
+  .cost-row .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  input.cost-in { width: 120px; text-align: right; flex: 0 0 auto; }
+
+  /* ── 3. 表 ────────────────────────────────── */
+  table.pu { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.pu th { text-align: left; color: #64748b; font-size: 11px; font-weight: 600;
+                border-bottom: 2px solid #e2e8f0; padding: 7px 10px; white-space: nowrap; }
+  table.pu th.num { text-align: right; }
+  table.pu td { border-bottom: 1px solid #f1f5f9; padding: 9px 10px; vertical-align: middle; }
+  table.pu td.nw, table.pu th.nw { white-space: nowrap; }
+  /* 理由の文章は幅を決めておく。決めないと判定の列だけ伸びて、価格の列が潰れる */
+  td .bad, td .pu-warn { max-width: 280px; }
+  /* 詳しく表示のときは列が増える。潰し合うより少し詰めて、それでも足りなければ横スクロール */
+  body.show-detail table.pu { min-width: 1180px; }
+  body.show-detail table.pu td, body.show-detail table.pu th { padding-left: 7px; padding-right: 7px; }
+  table.pu tbody tr:hover td { background: #f8fafc; }
+  /* 商品のまとまり。同じ商品のモール違いが続けて並ぶので、境目をはっきりさせる */
+  tr.grp td { background: #f8fafc !important; border-top: 2px solid #e2e8f0; border-bottom: 0;
+              padding: 9px 10px 6px; }
+  .grp-name { font-weight: 700; font-size: 13px; }
+  .grp-meta { font-size: 12px; color: #64748b; margin-left: 8px; }
+  tr.blocked td:not(.keep) { opacity: .62; }
   /* ★セレクタは input.〜 にする: 共通ヘッダの `input[type=number] { width:100% }` は
      属性セレクタぶん詳細度が高く、`.price-in` だけだと負けて全幅になり、
      商品名の列が1文字幅まで潰れる (2026-08-30 の画面崩れ) */
-  input.price-in { width: 96px; text-align: right; }
-  input.cost-in { width: 110px; text-align: right; flex: 0 0 auto; }
-  .cost-row { display: grid; grid-template-columns: 150px minmax(0, 1fr) 110px 110px; gap: 10px;
-              align-items: center; margin-bottom: 6px; }
-  .cost-row .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .chip { font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
+  input.price-in { width: 100px; text-align: right; font-size: 14px; font-weight: 600; }
+  .cur { font-size: 14px; }
+
+  /* 詳しい列は既定で隠す。「一度に全部見せる」と、どこを見ればよいか分からなくなるため */
+  .col-detail { display: none; }
+  body.show-detail .col-detail { display: table-cell; }
+  /* セルの中の補足行 (取得元など)。列と同じトグルで出し入れする */
+  .detail-line { display: none; }
+  body.show-detail .detail-line { display: block; }
+  .tgl { display: inline-flex; align-items: center; gap: 6px; color: #475569; cursor: pointer; }
+  .tgl input { width: auto; }
+
+  /* ── しるし ───────────────────────────────── */
+  .chip { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+          font-weight: 600; white-space: nowrap; }
+  .c-go { background: #dcfce7; color: #166534; }
+  .c-caution { background: #fef3c7; color: #92400e; }
+  .c-stop { background: #fee2e2; color: #b91c1c; }
   .c-confirmed { background: #dcfce7; color: #166534; }
   .c-rule { background: #fef3c7; color: #92400e; }
   .c-sales { background: #e0f2fe; color: #0369a1; }
   .c-unresolved { background: #fee2e2; color: #b91c1c; }
-  .mall { font-weight: 600; font-size: 12px; }
-  .m-rakuten { color: #bf0000; } .m-yahoo { color: #ff0033; } .m-amazon { color: #ff9900; }
+  .c-set { background: #fef3c7; color: #92400e; }
+  .c-kind-recovery { background: #ede9fe; color: #5b21b6; }
+  .c-kind-normal { background: #f1f5f9; color: #475569; }
+  .tag { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px;
+         background: #f1f5f9; color: #64748b; }
+  .tag-warn { background: #fff7ed; color: #9a3412; }
+  .mall { font-weight: 700; font-size: 12px; white-space: nowrap; }
+  .m-rakuten { color: #bf0000; } .m-yahoo { color: #ff0033; } .m-amazon { color: #b45309; }
   .m-aupay { color: #eb5505; } .m-qoo10 { color: #e4002b; }
-  .bad { color: #b91c1c; font-size: 11px; }
-  .warn { color: #92400e; font-size: 11px; }
+  .up { color: #b91c1c; font-weight: 700; }     /* 値上げ (株価と同じ向き) */
+  .down { color: #1d4ed8; font-weight: 700; }   /* 値下げ */
+  .bad { color: #b91c1c; font-size: 11px; line-height: 1.5; }
   .ok { color: #166534; font-size: 11px; }
-  .sticky-actions { position: sticky; bottom: 0; background: #fff; border-top: 1px solid #e2e8f0; padding: 10px 0; display: flex; gap: 10px; align-items: center; }
+  /* 色が全部つられて変わる、のような「操作の効き方が見た目と違う」注意書き */
+  .pu-warn { font-size: 11px; color: #9a3412; background: #fff7ed; border: 1px solid #fed7aa;
+             border-radius: 4px; padding: 3px 6px; margin-top: 4px; line-height: 1.45; }
+
+  /* ── 記録ボタンの帯 ─────────────────────────── */
+  .sticky-actions { position: sticky; bottom: 0; background: #fff; border-top: 1px solid #e2e8f0;
+                    padding: 11px 0 2px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .sum { font-size: 13px; color: #334155; }
+  .sum b { font-variant-numeric: tabular-nums; }
+  .sum .s-stop { color: #b91c1c; }
   .hidden { display: none; }
 </style>
-<div class="topbar" style="margin-top:-1px">
-  <span class="pu-title">💴 価格一括改定</span>
-  <a href="/">ポータルへ</a>
+<div class="topbar">
+  <a href="/">← ポータル</a>
+  <span class="app-title">💴 価格一括改定</span>
   <span class="spacer"></span>
   <span class="user"><%= displayName %></span>
 </div>
 <div class="wrap">
-  <div class="banner-warn">
-    <span>📖 この画面では<strong>書き込みは起きません</strong>。出品の検索・現在価格・利益の確認をして、更新候補として<strong>記録する</strong>までです。実際にモールの価格を書き換えるのは、記録した履歴を開いてからになります (<strong>楽天・Yahoo・au PAY・Qoo10</strong> が対象。Amazon は手動更新のチェックリストとして記録します)。</span>
+  <div class="lede">
+    <b>この画面では価格は変わりません。</b>
+    いまの価格と粗利を見て、新しい売価を「記録」するところまでです。実際にモールへ送るのは、記録した履歴を開いてから。
+    <details>
+      <summary>使い方 (3ステップ) と、気をつけること</summary>
+      <ol class="howto">
+        <li><b>NE商品コードを入れて「出品を検索」</b> — 楽天・Yahoo・au PAY・Qoo10 の出品と、いまの価格を集めます (数十秒)。</li>
+        <li><b>新しい売価を入れる</b> — 原価が変わったなら先に「新原価」を入れて計算し直します。粗利はその場で出ます。</li>
+        <li><b>「この内容を記録する」</b> — 履歴ができます。送信はその履歴の画面から、確認欄に入力してはじめて実行されます。</li>
+      </ol>
+      <ul class="howto">
+        <li>Amazon はこのツールから更新しません (別ツールがあるため)。チェックリストとしてだけ記録します。</li>
+        <li>0円・小数・−30%超の値下げ・原価割れなどは、そもそも記録しても送れません (⛔ が付きます)。</li>
+        <li>送ったあとに元へ戻したいときは、履歴の画面の「元の価格に戻す」から。</li>
+      </ul>
+    </details>
   </div>
 
   <div class="card">
-    <h2>1. NE商品コードを入れる</h2>
+    <h2><span class="step">1</span>NE商品コードを入れる</h2>
     <div class="pu-input">
       <div style="flex:1; min-width:320px;">
         <textarea id="codes" placeholder="abc-001&#10;abc-002&#10;(改行・カンマ・空白区切り。最大 <%= limits.maxNeCodes %> コード)"></textarea>
-        <div class="pu-note">入力した単品と、それを構成に含むセット商品の出品をまとめて探します (セット行は初期状態では未選択)。</div>
+        <div class="pu-note">入れた単品と、それを含むセット商品もまとめて探します (セット行は初期状態では未選択)。</div>
       </div>
       <button class="btn btn-primary" id="resolve-btn" type="button">出品を検索</button>
     </div>
@@ -61,38 +144,46 @@
   </div>
 
   <div class="card hidden" id="cost-card">
-    <h2>2. 新しい原価 (税抜) — 値上げ連絡があった分だけ</h2>
+    <h2><span class="step">2</span>新しい原価 (税抜)<span class="h2-sub">値上げ連絡があった分だけ・空欄なら今の原価のまま</span></h2>
     <div id="cost-list"></div>
-    <div class="pu-note">入力すると、その商品を含むセットの原価も構成から再計算します。空欄なら現在の原価 (m_products.原価) を使います。</div>
-    <button class="btn btn-sm" id="recost-btn" type="button" style="margin-top:8px;">新原価で計算し直す</button>
+    <button class="btn btn-sm" id="recost-btn" type="button" style="margin-top:10px;">新原価で計算し直す</button>
+    <span class="pu-note" style="margin-left:8px;">セットの原価は構成から自動で計算し直します。</span>
   </div>
 
   <div class="card hidden" id="rows-card">
-    <h2>3. 新しい売価を入れる (楽天・Yahoo・au PAY・Qoo10)</h2>
+    <h2><span class="step">3</span>新しい売価を入れる
+      <span class="h2-right"><label class="tgl"><input type="checkbox" id="detail-tgl">詳しく表示 (出品コード・引き当て・原価・送料)</label></span>
+    </h2>
     <div style="overflow-x:auto;">
       <table class="pu" id="rows-table">
         <thead>
           <tr>
-            <th style="width:28px;"></th>
-            <th>モール</th><th>商品</th><th>出品コード / SKU</th><th>出品の確認</th>
-            <th class="num">現在価格</th><th>発送</th><th class="num">原価(税抜)</th>
-            <th class="num">新売価</th><th class="num">変更</th><th class="num">概算粗利</th>
-            <th>判定</th><th></th>
+            <th style="width:30px;"><input type="checkbox" id="sel-all" title="すべて選ぶ / 外す"></th>
+            <th>モール</th>
+            <th class="col-detail">出品コード / SKU</th>
+            <th class="col-detail">引き当て</th>
+            <th class="num">いまの価格</th>
+            <th class="num">新しい売価</th>
+            <th class="num">変更</th>
+            <th class="num">概算粗利</th>
+            <th class="col-detail">原価・送料</th>
+            <th>判定</th>
+            <th></th>
           </tr>
         </thead>
         <tbody></tbody>
       </table>
     </div>
     <div class="sticky-actions">
-      <input type="text" id="run-note" placeholder="メモ (値上げ連絡の出所など)" style="max-width:380px;">
+      <span class="sum" id="sum"></span>
+      <input type="text" id="run-note" placeholder="メモ (値上げ連絡の出所など)" style="max-width:320px;">
       <button class="btn btn-primary" id="save-btn" type="button">この内容を記録する</button>
       <span class="pu-note" id="save-msg"></span>
     </div>
   </div>
 
   <div class="card hidden" id="manual-card">
-    <h2>4. 手動更新リスト (Amazon)</h2>
-    <div class="pu-note">Amazon は本ツールから更新しません。記録すると履歴画面でチェックを付けられます。</div>
+    <h2><span class="step">4</span>Amazon は手で直す<span class="h2-sub">記録すると履歴画面でチェックを付けられます</span></h2>
     <div style="overflow-x:auto;">
       <table class="pu" id="manual-table">
         <thead><tr><th>モール</th><th>商品</th><th>出品コード</th><th class="num">参考価格</th><th>メモ</th><th></th></tr></thead>
@@ -107,16 +198,16 @@
       <div class="pu-note">まだ記録はありません。</div>
     <% } else { %>
       <table class="pu">
-        <thead><tr><th>日時 (JST)</th><th>実行者</th><th>種別</th><th class="num">行数</th><th>メモ</th><th></th></tr></thead>
+        <thead><tr><th>日時 (JST)</th><th>種別</th><th class="num">行数</th><th>メモ</th><th>実行者</th><th></th></tr></thead>
         <tbody>
           <% runs.forEach(function (r) { %>
             <tr>
               <td class="code"><%= toJst(r.created_at) %></td>
-              <td><%= r.created_by %></td>
-              <td><%= r.kind === 'recovery' ? '復旧' : '通常' %></td>
+              <td><span class="chip c-kind-<%= r.kind === 'recovery' ? 'recovery' : 'normal' %>"><%= r.kind === 'recovery' ? '↩︎ 復旧' : '通常' %></span></td>
               <td class="num"><%= r.op_count %></td>
               <td><%= r.note || '' %></td>
-              <td><a href="/apps/price-update/runs/<%= r.run_id %>">詳細</a></td>
+              <td class="pu-note"><%= r.created_by %></td>
+              <td><a href="/apps/price-update/runs/<%= r.run_id %>">開く →</a></td>
             </tr>
           <% }); %>
         </tbody>
@@ -192,15 +283,16 @@
       const row = rows.find((r) => r.neCode === c);
       return '<div class="cost-row">'
         + '<span class="code">' + esc(c) + '</span>'
-        + '<span class="pu-note nm" title="' + esc(row.productName || '') + '">' + esc(row.productName || '') + '</span>'
-        + '<span class="pu-note" style="text-align:right;">現 ' + yen(row.cost) + ' 円</span>'
+        + '<span class="nm" title="' + esc(row.productName || '') + '">' + esc(row.productName || '') + '</span>'
+        + '<span class="pu-note num">現 ' + yen(row.cost) + ' 円</span>'
         + '<input type="number" class="cost-in" data-code="' + esc(c) + '" min="0" step="1" placeholder="新原価">'
         + '</div>';
     }).join('');
   }
 
-  // 発送まわり: モール側の設定 (これが売価差の理由になる) と、NE側の配送方法 (概算粗利の送料の根拠)
-  function shippingCell(r) {
+  // 発送まわり: モール側の設定 (これが売価差の理由になる) と、NE側の配送方法 (概算粗利の送料の根拠)。
+  // 既定では隠す列に入れている — 毎回読む値ではないが、粗利が合わない時にここを見る
+  function shippingLines(r) {
     const parts = [];
     const s = r.mallShipping;
     if (r.mall === 'rakuten' && s) {
@@ -209,36 +301,85 @@
       if (s.postageIncluded === true) bits.push('送料込み');
       if (s.postageIncluded === false) bits.push('送料別');
       if (s.singleItemShipping === 1) bits.push('単品配送');
-      if (bits.length) parts.push('<div>' + bits.join(' / ') + '</div>');
+      if (bits.length) parts.push('<div class="pu-note">モール設定: ' + bits.join(' / ') + '</div>');
     } else if (r.mall === 'yahoo' && s) {
       // 送料設定 (PostageSet) が商品ごとに変わる = 実質の配送方法。Delivery は今のところ全商品 "1"
       const bits = [];
       if (s.postageSet) bits.push('送料設定 ' + esc(s.postageLabel || s.postageSet));
       if (s.delivery) bits.push('配送 ' + esc(s.delivery));
       if (s.shipWeight) bits.push(esc(s.shipWeight) + 'g');
-      if (bits.length) parts.push('<div>' + bits.join(' / ') + '</div>');
+      if (bits.length) parts.push('<div class="pu-note">モール設定: ' + bits.join(' / ') + '</div>');
     }
     // 粗利に使っている配送関係費。どこから引いた値かを必ず添える
     if (r.shipping != null) {
       const src = r.shippingSource === 'mall'
-        ? '<span class="ok">' + esc(r.shippingLabel || '') + ' ' + yen(r.shipping) + '円</span>'
+        ? '<span class="ok">送料 ' + esc(r.shippingLabel || '') + ' ' + yen(r.shipping) + '円</span>'
         : (r.shippingSource === 'unknown'
-          ? '<span class="warn">送料は不明 — 商品マスタの ' + yen(r.shipping) + '円で計算</span>'
-          : '<span class="pu-note">' + esc(r.shippingLabel || r.neDeliveryMethod || '') + ' ' + yen(r.shipping) + '円</span>');
+          ? '<span class="bad">送料は不明 — 商品マスタの ' + yen(r.shipping) + '円で計算</span>'
+          : '<span class="pu-note">送料 ' + esc(r.shippingLabel || r.neDeliveryMethod || '') + ' ' + yen(r.shipping) + '円</span>');
       parts.push('<div>' + src + '</div>');
     }
     if (r.neDeliveryMethod) {
       parts.push('<div class="pu-note">NE: ' + esc(r.neDeliveryMethod)
         + (r.productShipping != null ? ' ' + yen(r.productShipping) + '円' : '') + '</div>');
     }
-    return parts.length ? parts.join('') : '<span class="pu-note">—</span>';
+    return parts.join('');
   }
 
-  function evalCell(ev) {
-    if (!ev) return '<span class="pu-note">—</span>';
-    if (ev.blocks.length) return '<span class="bad">' + ev.blocks.map(esc).join('<br>') + '</span>';
-    if (ev.warns.length) return '<span class="warn">' + ev.warns.map(esc).join('<br>') + '</span>';
-    return '<span class="ok">更新できます (M2 で開放)</span>';
+  /** 変更幅。値上げ ▲ / 値下げ ▼ で、率と金額を1目盛りで読めるようにする */
+  function deltaCell(r, ev) {
+    if (!ev || ev.changeRatio == null) return '<span class="dim">—</span>';
+    const pct = ev.changeRatio * 100;
+    const up = pct >= 0;
+    const diff = (r.newPrice != null && r.price != null) ? Math.round(Number(r.newPrice) - Number(r.price)) : null;
+    return '<span class="' + (up ? 'up' : 'down') + '">' + (up ? '▲' : '▼') + ' '
+      + (up ? '+' : '') + pct.toFixed(1) + '%</span>'
+      + (diff != null ? '<div class="pu-note">' + (diff > 0 ? '+' : '') + yen(diff) + ' 円</div>' : '');
+  }
+
+  /** 概算粗利。★新売価が空の間は「今の価格での粗利」— どちらの値かを必ず添える */
+  function grossCell(r, ev) {
+    if (!ev || ev.estimate.gross == null) return '<span class="dim">—</span>';
+    const body = '<div>' + yen(Math.round(ev.estimate.gross)) + ' 円</div>'
+      + '<div class="pu-note">' + (ev.estimate.rate * 100).toFixed(1) + '%</div>';
+    const pre = r.newPrice == null ? '<div class="tag">いまの価格で</div>' : '';
+    // 送料が不明なままの粗利は当てにならない。隠す列ではなく、粗利のすぐ横で知らせる
+    const post = r.shippingSource === 'unknown' ? '<div class="tag tag-warn">送料不明</div>' : '';
+    return pre + body + post;
+  }
+
+  /** 判定。★止まった理由も注意書きも、どちらも消さずに出す (片方だけ出すと危ない) */
+  function evalCell(r, ev) {
+    const notes = [];
+    // ★同じ文言が guard の warns にも入っていることがある (記録時に混ぜているため)。二度出さない
+    if (r.sharedNote && !(ev && (ev.warns || []).includes(r.sharedNote))) {
+      notes.push('<div class="pu-warn">' + esc(r.sharedNote) + '</div>');
+    }
+    if (!ev) return (notes.join('') || '<span class="dim">—</span>');
+    const blocked = ev.blocks.length > 0;
+    const chip = blocked ? '<span class="chip c-stop">⛔ 送れません</span>'
+      : (ev.warns.length ? '<span class="chip c-caution">⚠️ 注意</span>'
+        : '<span class="chip c-go">✅ 更新できます</span>');
+    const detail = (ev.blocks.length ? '<div class="bad">' + ev.blocks.map(esc).join('<br>') + '</div>' : '')
+      + (ev.warns.length ? '<div class="pu-warn">' + ev.warns.map(esc).join('<br>') + '</div>' : '');
+    return chip + detail + notes.join('');
+  }
+
+  /** 同じ商品のモール違いを続けて並べる (横並びで比べられると、値付けのばらつきに気づける) */
+  function groupRows(list) {
+    const groups = [];
+    const byCode = new Map();
+    list.forEach((r) => {
+      let g = byCode.get(r.neCode);
+      if (!g) {
+        g = { neCode: r.neCode, rowKind: r.rowKind, name: r.productName, via: r.viaCode,
+              cost: r.cost, costSource: r.costSource, rows: [] };
+        byCode.set(r.neCode, g);
+        groups.push(g);
+      }
+      g.rows.push(r);
+    });
+    return groups;
   }
 
   function render() {
@@ -247,46 +388,54 @@
     $('rows-card').classList.toggle('hidden', updatable.length === 0);
     $('manual-card').classList.toggle('hidden', manual.length === 0);
 
-    $('rows-table').querySelector('tbody').innerHTML = updatable.map((r) => {
-      const ev = r.evaluation;
-      const ratio = ev && ev.changeRatio != null ? (ev.changeRatio * 100).toFixed(1) + '%' : '—';
-      // 新売価が未入力の間の概算は「今の価格での粗利」。新売価の隣にあると
-      // 「入れた後の粗利」と読めてしまうので、どちらの値かを必ず添える
-      const grossText = ev && ev.estimate.gross != null
-        ? yen(Math.round(ev.estimate.gross)) + ' 円 (' + (ev.estimate.rate * 100).toFixed(1) + '%)' : null;
-      const gross = grossText
-        ? (r.newPrice == null
-          ? '<span class="pu-note">現在価格で ' + grossText + '</span>'
-          : grossText)
-        : '—';
-      return '<tr class="' + (r.rowKind === 'set' ? 'set-row ' : '') + (ev && !ev.canUpdate ? 'blocked' : '') + '">'
-        + '<td><input type="checkbox" class="sel" data-key="' + r.key + '" ' + (r.selected ? 'checked' : '') + '></td>'
-        + '<td><span class="mall m-' + r.mall + '">' + esc(MALL_LABEL[r.mall] || r.mall) + '</span></td>'
-        + '<td><div class="code">' + esc(r.neCode) + (r.rowKind === 'set' ? ' <span class="chip c-rule">セット</span>' : '') + '</div>'
-        + '<div class="pu-note">' + esc(r.productName || '') + (r.viaCode ? ' ← ' + esc(r.viaCode) : '') + '</div></td>'
-        + '<td class="code">' + esc(r.listingCode || '')
-        // Yahoo のカラバリは「当たった色」と「送り先の商品コード」が別。両方見せる
-        + (r.matchedSubCode ? '<div class="pu-note">' + esc(r.matchedSubCode) + '</div>'
-          : (r.skuCode ? '<div class="pu-note">SKU ' + esc(r.skuCode) + '</div>' : ''))
-        + (r.sharedNote ? '<div class="pu-warn">' + esc(r.sharedNote) + '</div>' : '')
-        + '</td>'
-        + '<td><span class="chip c-' + r.confidence + '">' + esc(CONF_LABEL[r.confidence]) + '</span>'
-        + '<div class="pu-note">' + esc(r.resolveSource || '') + '</div></td>'
-        + '<td class="num">' + yen(r.price) + '<div class="pu-note">' + esc(r.priceSource || r.note || '取得できず') + '</div></td>'
-        + '<td>' + shippingCell(r) + '</td>'
-        + '<td class="num">' + yen(r.cost) + '<div class="pu-note">' + esc(r.costSource || '') + '</div></td>'
-        + '<td class="num"><input type="number" class="price-in" data-key="' + r.key + '" min="1" step="1" value="' + (r.newPrice == null ? '' : r.newPrice) + '"></td>'
-        + '<td class="num">' + ratio + '</td>'
-        + '<td class="num">' + gross + '</td>'
-        + '<td>' + evalCell(ev) + '</td>'
-        + '<td>' + (safeUrl(r.url) ? '<a href="' + esc(safeUrl(r.url)) + '" target="_blank" rel="noopener">開く</a>' : '') + '</td>'
-        + '</tr>';
+    const html = groupRows(updatable).map((g) => {
+      const head = '<tr class="grp"><td colspan="11">'
+        + '<span class="grp-name">' + esc(g.name || '(名称なし)') + '</span>'
+        + (g.rowKind === 'set' ? ' <span class="chip c-set">セット</span>' : '')
+        + '<span class="grp-meta code">' + esc(g.neCode) + '</span>'
+        + (g.via ? '<span class="grp-meta">← ' + esc(g.via) + ' から</span>' : '')
+        + '<span class="grp-meta">原価 ' + yen(g.cost) + ' 円'
+        + (g.costSource ? ' (' + esc(g.costSource) + ')' : '') + '</span>'
+        + '</td></tr>';
+
+      return head + g.rows.map((r) => {
+        const ev = r.evaluation;
+        return '<tr class="' + (ev && !ev.canUpdate ? 'blocked' : '') + '">'
+          + '<td><input type="checkbox" class="sel" data-key="' + r.key + '" ' + (r.selected ? 'checked' : '') + '></td>'
+          + '<td><span class="mall m-' + r.mall + '">' + esc(MALL_LABEL[r.mall] || r.mall) + '</span></td>'
+          + '<td class="col-detail code">' + esc(r.listingCode || '')
+          // Yahoo のカラバリは「当たった色」と「送り先の商品コード」が別。両方見せる
+          + (r.matchedSubCode ? '<div class="pu-note">' + esc(r.matchedSubCode) + '</div>'
+            : (r.skuCode ? '<div class="pu-note">SKU ' + esc(r.skuCode) + '</div>' : ''))
+          + '</td>'
+          + '<td class="col-detail"><span class="chip c-' + r.confidence + '">' + esc(CONF_LABEL[r.confidence]) + '</span>'
+          + '<div class="pu-note">' + esc(r.resolveSource || '') + '</div></td>'
+          + '<td class="num"><span class="cur">' + yen(r.price) + '</span>'
+          + '<div class="pu-note detail-line">' + esc(r.priceSource || r.note || '取得できず') + '</div></td>'
+          + '<td class="num keep"><input type="number" class="price-in" data-key="' + r.key + '" min="1" step="1" value="' + (r.newPrice == null ? '' : r.newPrice) + '"></td>'
+          + '<td class="num nw">' + deltaCell(r, ev) + '</td>'
+          + '<td class="num">' + grossCell(r, ev) + '</td>'
+          + '<td class="col-detail">' + (shippingLines(r) || '<span class="dim">—</span>') + '</td>'
+          + '<td class="keep">' + evalCell(r, ev) + '</td>'
+          + '<td class="nw">' + (safeUrl(r.url) ? '<a href="' + esc(safeUrl(r.url)) + '" target="_blank" rel="noopener">開く</a>' : '') + '</td>'
+          + '</tr>';
+      }).join('');
     }).join('');
+    $('rows-table').querySelector('tbody').innerHTML = html;
+
+    // 「いま何行を送ることになるのか」を記録ボタンのすぐ横に出す
+    const sel = updatable.filter((r) => r.selected);
+    const go = sel.filter((r) => r.evaluation && r.evaluation.canUpdate && r.newPrice != null);
+    const stop = sel.filter((r) => r.evaluation && !r.evaluation.canUpdate);
+    const empty = sel.filter((r) => r.newPrice == null);
+    $('sum').innerHTML = '選択 <b>' + sel.length + '</b> 行 / 送れる <b>' + go.length + '</b> 行'
+      + (stop.length ? ' / <span class="s-stop">⛔ <b>' + stop.length + '</b> 行</span>' : '')
+      + (empty.length ? ' / <span class="dim">売価が空 ' + empty.length + ' 行</span>' : '');
 
     $('manual-table').querySelector('tbody').innerHTML = manual.map((r) => (
       '<tr>'
       + '<td><span class="mall m-' + r.mall + '">' + esc(MALL_LABEL[r.mall] || r.mall) + '</span></td>'
-      + '<td><div class="code">' + esc(r.neCode) + '</div><div class="pu-note">' + esc(r.productName || '') + '</div></td>'
+      + '<td>' + esc(r.productName || '') + '<div class="pu-note code">' + esc(r.neCode) + '</div></td>'
       + '<td class="code">' + esc(r.listingCode || '') + '</td>'
       + '<td class="num">' + yen(r.price) + '<div class="pu-note">' + esc(r.priceSource || '') + '</div></td>'
       + '<td class="pu-note">' + esc(r.note || '') + '</td>'
@@ -296,7 +445,15 @@
 
     document.querySelectorAll('.price-in').forEach((el) => { el.onchange = onInputChange; });
     document.querySelectorAll('.sel').forEach((el) => { el.onchange = onInputChange; });
+    syncSelAll();
     if (saving) setInputsDisabled(true);   // 記録中に応答が来て描き直しても入力は止めたまま
+  }
+
+  function syncSelAll() {
+    const all = [...document.querySelectorAll('.sel')];
+    const on = all.filter((el) => el.checked).length;
+    $('sel-all').checked = all.length > 0 && on === all.length;
+    $('sel-all').indeterminate = on > 0 && on < all.length;
   }
 
   // 入力のたびにサーバへ送らないよう少しまとめる。
@@ -326,11 +483,12 @@
     return chain;
   }
   function onInputChange() {
+    syncSelAll();
     clearTimeout(timer);
     timer = setTimeout(function () { timer = null; enqueuePreview(); }, 250);
   }
   function setInputsDisabled(v) {
-    document.querySelectorAll('.price-in, .sel, .cost-in').forEach((el) => { el.disabled = v; });
+    document.querySelectorAll('.price-in, .sel, .cost-in, #sel-all').forEach((el) => { el.disabled = v; });
   }
   /**
    * 保存前: 入力を止めて、キューが完全に静止するまで待つ。失敗していれば例外を投げる。
@@ -383,4 +541,10 @@
   $('resolve-btn').onclick = doResolve;
   $('recost-btn').onclick = doResolve;
   $('save-btn').onclick = save;
+  $('detail-tgl').onchange = function () { document.body.classList.toggle('show-detail', this.checked); };
+  $('sel-all').onchange = function () {
+    const on = this.checked;
+    document.querySelectorAll('.sel').forEach((el) => { el.checked = on; });
+    onInputChange();   // 選び直しもふつうの入力と同じ道を通す (サーバ側の記録とずれないように)
+  };
 </script>
