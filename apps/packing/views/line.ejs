@@ -455,6 +455,12 @@
         const r = await post(`/apps/packing/api/batches/${BATCH_ID}/events`, eventPayload(event, extra));
         if (!r) return;
         if (!r.ok) {
+          // found: 向かっているピッカーの依頼をサーバーが検出 → 実状態の文言で確認してから確認済みとして再送 (PR-6)
+          if (r.status === 409 && r.body.code === 'confirmation_required') {
+            sending = false;
+            if (confirm(r.body.error)) return send(event, { ...extra, confirm_cancel: true });
+            return;
+          }
           alert(r.body.error || `エラー (${r.status})`);
           // 409 = 状態が進んでいる (別端末・応答喪失後の再タップ等) → 画面を実状態に同期
           if (r.status === 409) location.reload();

@@ -92,10 +92,12 @@ console.log('── ① 迷子の「後で取りに行く」依頼: 一覧と取
     assert.equal(db.prepare('SELECT COUNT(*) c FROM pk_shortage_allocations WHERE batch_id=?').get(b1).c, 1);
     assert.equal(alerts('to_packing').filter((a) => a.kind === 'picking_shortage').length, 1, '🕒 バナーが出ている');
   });
-  t('取り下げ → 依頼 cancelled・配賦も消える・1階のバナーも閉じる・一覧から消える', () => {
+  t('取り下げ → 依頼 cancelled (誰が・いつ)・配賦も消える・1階のバナーも閉じる・一覧から消える', () => {
     const r = pk.cancelLaterRequest(id, 'admin@test');
     assert.deepEqual([r.status, r.existed], ['cancelled', false]);
     assert.equal(lr(id).status, 'cancelled');
+    assert.equal(lr(id).cancelled_by, 'admin@test');
+    assert.ok(lr(id).cancelled_at);
     assert.equal(db.prepare('SELECT COUNT(*) c FROM pk_shortage_allocations WHERE batch_id=?').get(b1).c, 0);
     assert.equal(alerts('to_packing').filter((a) => a.kind === 'picking_shortage').length, 0);
     assert.equal(pk.listLaterRequests().length, 0);
@@ -105,6 +107,26 @@ console.log('── ① 迷子の「後で取りに行く」依頼: 一覧と取
     assert.deepEqual(pk.cancelLaterRequest(id, 'admin@test'), { id, status: 'cancelled', existed: true });
   });
   throwsCode(() => pk.cancelLaterRequest(99999, 'admin@test'), 'not_found', '無い id は 404');
+
+  // Codex R1 High: 古い id で最新の依頼を巻き込まない
+  const b4 = mkPickBatch('L4', { sku: 'l-four', lineQty: 1, slipQtys: [1] });
+  ev(b4, 'start');
+  ev(b4, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'later' });
+  const oldId = pk.listLaterRequests().find((r) => r.batch_id === b4).id;
+  // 履歴不整合を再現: 同じ明細に新しい依頼行がある (id が大きい = 最新)
+  const newId = Number(db.prepare(`INSERT INTO pk_later_requests (batch_id, line_seq, sku, product_name, qty, from_block, from_location, requested_by, status, created_at, updated_at)
+    VALUES (?, 1, 'l-four', 'x', 1, 'P3FA', '00100101', '有國陽', 'pending_binding', ?, ?)`).run(b4, now, now).lastInsertRowid);
+  throwsCode(() => pk.cancelLaterRequest(oldId, 'admin@test'), 'stale_later_request', '最新でない依頼 id の取り下げは 409 (別の依頼を巻き込まない)');
+  t('409 のとき最新の依頼・配賦は無傷', () => {
+    assert.equal(lr(newId).status, 'pending_binding');
+    assert.equal(lr(oldId).status, 'pending_binding');
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM pk_shortage_allocations WHERE batch_id=?').get(b4).c, 1);
+  });
+  t('最新の依頼は取り下げられる (古い方はそのまま = 別途)', () => {
+    pk.cancelLaterRequest(newId, 'admin@test');
+    assert.equal(lr(newId).status, 'cancelled');
+    assert.equal(lr(oldId).status, 'pending_binding');
+  });
 }
 
 // ═══ ② 展開済み (requested) の依頼 ════════════════════════════════════════
@@ -140,6 +162,18 @@ console.log('── ② 展開済みの依頼: 未着手なら取り下げ・着
     assert.equal(lr(req3[0].id).status, 'requested');
     assert.equal(db.prepare('SELECT status FROM pk_pack_tasks WHERE id=?').get(task3.id).status, 'claimed');
   });
+
+  // 合流先 (梱包の再ピック) が着手済みなら、自前タスクが未着手でも 409 (Codex R1)
+  const b5 = mkPickBatch('L5', { sku: 'l-five', lineQty: 1, slipQtys: [1] });
+  const pb5 = mkPackBatch('L5', { sku: 'l-five', slipQtys: [1], pkId: b5 });
+  ev(b5, 'start');
+  ev(b5, 'shortage', { lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'later' });
+  pk.bindPendingLaterRequests();
+  const req5 = pk.listLaterRequests({ status: 'requested' }).find((r) => r.batch_id === b5);
+  const mergedClaimed = Number(db.prepare(`INSERT INTO pk_pack_tasks (batch_id, slip_seq, kind, sku, product_name, req_qty, folder_name, status, requested_by, claimed_by, created_at, updated_at)
+    VALUES (?, 1, 'repick', 'l-five', 'x', 1, '出荷_99', 'claimed', '三宅晴菜', '田中美波', ?, ?)`).run(pb5, now, now).lastInsertRowid);
+  db.prepare('UPDATE pk_later_requests SET merged_task_ids=? WHERE id=?').run(String(mergedClaimed), req5.id);
+  throwsCode(() => pk.cancelLaterRequest(req5.id, 'admin@test'), 'later_in_progress', '合流先が着手済みなら取り下げできない');
 }
 
 // ═══ ③ 見つかった → 向かっているピッカーへ取下げバナー ══════════════════════
@@ -152,22 +186,40 @@ console.log('── ③ 1階の「見つかった」で claimed/fulfilled の依
   const t1 = mkTask(1, 'claimed');
   const t2 = mkTask(2, 'requested');
   const t3 = mkTask(3, 'fulfilled');
-  t('claimed の依頼を取り下げ → to_picking に repick_cancelled (task_id 付き・商品と伝票が分かる)', () => {
-    pev(pb, 'found', { slipSeq: 1 });
+  throwsCode(() => pev(pb, 'found', { slipSeq: 1 }), 'confirmation_required', 'claimed の依頼の取り下げは、サーバーが実状態で確認を要求する (409 confirmation_required)');
+  t('確認要求のときは何も変わらない', () => {
+    assert.equal(db.prepare('SELECT status FROM pk_pack_tasks WHERE id=?').get(t1).status, 'claimed');
+    assert.equal(alerts('to_picking').filter((x) => x.kind === 'repick_cancelled').length, 0);
+  });
+  t('バナーが作れないときは found 全体がロールバック (知らせ無しに取消だけ確定しない — Codex R1 High)', () => {
+    // INSERT を失敗させる (テーブル無し = picking 無効環境は素通しなので、それ以外の失敗で検証)
+    db.exec("CREATE TRIGGER trg_alert_fail BEFORE INSERT ON pk_floor_alerts BEGIN SELECT RAISE(ABORT, 'alert insert failed (test)'); END");
+    try {
+      assert.throws(() => pev(pb, 'found', { slipSeq: 1, confirmCancel: true }), /alert insert failed/);
+      assert.equal(db.prepare('SELECT status FROM pk_pack_tasks WHERE id=?').get(t1).status, 'claimed');
+      assert.equal(db.prepare('SELECT status FROM pk_pack_slips WHERE batch_id=? AND seq=1').get(pb).status, 'held');
+    } finally {
+      db.exec('DROP TRIGGER trg_alert_fail');
+    }
+  });
+  t('確認済み (confirmCancel) で取り下げ → to_picking に repick_cancelled (task_id 付き・商品と伝票が分かる)・close_reason=found', () => {
+    pev(pb, 'found', { slipSeq: 1, confirmCancel: true });
     const a = alerts('to_picking').filter((x) => x.kind === 'repick_cancelled');
     assert.equal(a.length, 1);
     assert.equal(a[0].task_id, t1);
     assert.match(a[0].message, /出荷_99 #1 の再ピック「商品F ×2」は1階で見つかったため取り下げ/);
     assert.equal(a[0].link, '/apps/picking/');
-    assert.equal(db.prepare('SELECT status FROM pk_pack_tasks WHERE id=?').get(t1).status, 'cancelled');
+    const row = db.prepare('SELECT status, close_reason FROM pk_pack_tasks WHERE id=?').get(t1);
+    assert.deepEqual([row.status, row.close_reason], ['cancelled', 'found']);
   });
-  t('requested (未着手) の取り下げにはバナーを出さない', () => {
+  t('requested (未着手) の取り下げは確認なしで通り、バナーも出さない', () => {
     pev(pb, 'found', { slipSeq: 2 });
     assert.equal(alerts('to_picking').filter((x) => x.kind === 'repick_cancelled').length, 1);
     assert.equal(db.prepare('SELECT status FROM pk_pack_tasks WHERE id=?').get(t2).status, 'cancelled');
   });
-  t('fulfilled (届ける途中) の取り下げにも出る', () => {
-    pev(pb, 'found', { slipSeq: 3 });
+  t('fulfilled (届ける途中) も確認要求 → 確認済みで取り下げるとバナー', () => {
+    assert.throws(() => pev(pb, 'found', { slipSeq: 3 }), (e) => e.code === 'confirmation_required' && /届ける途中/.test(e.message));
+    pev(pb, 'found', { slipSeq: 3, confirmCancel: true });
     const a = alerts('to_picking').filter((x) => x.kind === 'repick_cancelled');
     assert.equal(a.length, 2);
     assert.ok(a.some((x) => x.task_id === t3));

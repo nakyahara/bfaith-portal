@@ -855,6 +855,7 @@
         repickSet.clear();
         for (const q of body.repickSeqs) repickSet.add(q);
       }
+      if (body.repickBySlip && typeof body.repickBySlip === 'object') STATE.repickBySlip = body.repickBySlip;
       if (Array.isArray(body.repickReadySeqs)) {
         repickReadySet.clear();
         for (const q of body.repickReadySeqs) repickReadySet.add(q);
@@ -1558,14 +1559,16 @@
       showToast(rest.length ? '欠品の報告を1品取り消しました' : '欠品の報告を取り消しました。そのまま梱包して「次へ」を押してください');
       render();
     });
-    $('foundBtn').addEventListener('click', () => {
+    $('foundBtn').addEventListener('click', async () => {
       const seq = viewSeq;
-      // ピッカーが既に取りに向かっている依頼を取り下げると、3階のバッチが取り消され3階の画面に知らせが出る (D-3)
+      // ピッカーが既に取りに向かっている依頼を取り下げると、3階のバッチが取り消され3階の画面に知らせが出る (D-3)。
+      // 状態は描画時のスナップショットなので、確認の直前に最新化する (通信できなければ手元の状態で)
+      try { await resync(); } catch { /* 手元の状態で続行 */ }
       const rs = (STATE.repickBySlip || {})[seq];
       const note = rs === 'claimed' ? '⚠ ピッカーが既に取りに向かっています。取り下げると3階のバッチも取り消され、3階の画面に知らせが出ます。\n\n'
         : rs === 'fulfilled' ? '⚠ 3階は既に取り終えて、届ける途中かもしれません。\n\n' : '';
       if (!confirm(`${note}商品が見つかったため、再ピック依頼とミス候補を取り下げます。よろしいですか?`)) return;
-      enqueue('found', seq, {});
+      enqueue('found', seq, { confirm_cancel: true });   // 直前に確認した = サーバーの確認要求 (409) を通す
       heldSet.delete(seq); repickSet.delete(seq);
       incidents = incidents.filter((i) => i.slipSeq !== seq || i.kind === 'excess');
       currentSeq = minPending();

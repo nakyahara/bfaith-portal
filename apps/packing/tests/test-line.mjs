@@ -384,7 +384,7 @@ console.log('\n── ライン: 同じ伝票で複数SKUが不足 (Codex R1 Hig
   ev(31, 'shortage', { slipSeq: 1, sku: 'sku-b', qty: 1 });           // sku-b は候補のまま (送信失敗を想定)
   db.prepare("UPDATE pk_pack_tasks SET status='fulfilled' WHERE batch_id=31 AND status='requested'").run();
   throws(() => ev(31, 'receive', { slipSeq: 1 }), 'repick_not_ready', '未送信の候補 (sku-b) が残る間は受領できない');
-  ev(31, 'found', { slipSeq: 1, sku: 'sku-a' });                        // 届いた sku-a ではなく…でも取下げ可 (見つかった)
+  ev(31, 'found', { slipSeq: 1, sku: 'sku-a', confirmCancel: true });   // 届いた分の取り下げはサーバーが確認を要求 (PR-6) → 確認済みで                        // 届いた sku-a ではなく…でも取下げ可 (見つかった)
   eq(getWorkState(31).slips[0].status, 'held', 'SKU 単位の見つかった: 他の商品 (sku-b 候補) が残るので保留のまま');
   eq(db.prepare("SELECT status FROM pk_pack_tasks WHERE batch_id=31 AND sku='sku-a' ORDER BY id DESC LIMIT 1").get().status, 'cancelled', 'sku-a のタスクだけ取消');
   eq(getWorkState(31).incidents.map((i) => i.sku), ['sku-b'], 'sku-b の候補は残る');
