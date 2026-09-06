@@ -1277,7 +1277,11 @@ router.post('/api/label-waits', checkOrigin, api((req, res) => {
 
 // ─── 作業仕様のその場登録・修正 (f_iroha_work_master。中原さんFB③⑥) ───
 
-const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'size_class', 'expiry_seal'];
+// ⭐size_class (大きさ) は廃止 (中原さん 2026-09-06 — §AA)。大きさは配送方法から見なすので、手で登録する項目は要らない。
+//   DB の列と既存の値は残してあるが、もう読まないし書かない
+const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'expiry_seal'];
+// 廃止した項目。送られてきても書かないが、**エラーにもしない** (入れ替え途中の iPad が保存に失敗しない — Codex R1 #5)
+const DEPRECATED_MASTER_FIELDS = ['size_class'];
 
 /**
  * 権限 (要件 §7 と FB③の折衷):
@@ -1333,7 +1337,13 @@ router.post('/api/master', checkOrigin, api((req, res) => {
   }
   const fields = {};
   for (const f of MASTER_FIELDS) if (f in fieldsIn) fields[f] = fieldsIn[f];
-  if (Object.keys(fields).length === 0) return res.status(400).json({ ok: false, error: 'bad_request', message: '変更できる項目がありません' });
+  const ignoredFields = DEPRECATED_MASTER_FIELDS.filter((f) => f in fieldsIn);
+  if (Object.keys(fields).length === 0) {
+    // 廃止した項目しか送ってこない古い画面 (キャッシュの残った iPad) は「変えなかった」で返す。
+    // 400 にすると現場では「保存できません」に見えてしまう
+    if (ignoredFields.length > 0) return res.json({ ok: true, unchanged: true, ignored_fields: ignoredFields });
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '変更できる項目がありません' });
+  }
 
   const k = codeKeyOf(code);
   const db = getDB();

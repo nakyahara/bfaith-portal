@@ -128,6 +128,8 @@
   .row.blocked{border-color:var(--danger);background:var(--danger-soft)}
   .bcard.blocked{border:2px solid var(--danger);background:var(--danger-soft)}
   .bblk{margin-top:4px;font-size:.84rem;font-weight:800;color:var(--danger);line-height:1.3}
+  /* 🔥 急ぎ (ボードのカード)。⛔ と同じ強さで 1 行に出す (要件 §AA) */
+  .burg{margin-top:4px;font-size:.84rem;font-weight:800;color:var(--amber);line-height:1.3}
   .st{flex:none;font-size:.8rem;font-weight:700;border-radius:var(--r-sm);padding:6px 10px;cursor:pointer;
     border:1px solid transparent;white-space:nowrap;font-family:var(--font)}
   .st.todo{background:var(--well);color:var(--sub);border-color:var(--line)}
@@ -241,7 +243,13 @@
   .pcard .why span{font-size:.72rem;border-radius:999px;padding:1px 8px;background:var(--well);color:var(--sub);border:1px solid var(--line);white-space:nowrap;flex:none}
   .pcard .why span.unk{background:var(--amber-soft);color:var(--amber);border-color:var(--amber)}
   .pcard .why span.urgent{background:var(--danger-soft);color:var(--danger);border-color:#F3C1C1;font-weight:700}
-  .pcard .why span.size{background:#F1EAFB;color:#6B3FB5;border-color:#DCCDF5;font-weight:700}
+  .pcard .why span.new{background:var(--ok-soft);color:var(--ok);border-color:#BFE3CD;font-weight:700}
+  /* ⭐おすすめの順位 (1 が「まずこれ」)。番号だけで分かるように大きく */
+  .pcard .rank{flex:none;align-self:center;min-width:26px;height:26px;border-radius:999px;background:var(--accent);color:#fff;
+    font-size:.86rem;font-weight:800;display:grid;place-items:center;padding:0 6px}
+  /* 「ここまでで 1 日の目安」の区切り線 */
+  .pcut{display:flex;align-items:center;gap:8px;margin:8px 0 10px;font-size:.78rem;font-weight:700;color:var(--accent)}
+  .pcut::before,.pcut::after{content:'';flex:1;height:2px;background:#C9D7FF;border-radius:2px}
   .pcard .act{flex:none;align-self:center;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
   .pbtn{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);
     padding:8px 12px;font-size:.88rem;font-weight:700;min-height:42px;cursor:pointer;font-family:var(--font)}
@@ -719,7 +727,7 @@
     <div id="planCarry"></div>
     <div class="plan2">
       <div class="pane" data-drop="none">
-        <h3>候補 <span class="n" id="planCandN">0</span><span class="sum">在庫が少ない → 入荷が古い → 大きい</span></h3>
+        <h3>候補 <span class="n" id="planCandN">0</span><span class="sum">おすすめの順 (急ぎ → 在庫が少ない → 入荷が古い)</span></h3>
         <div id="planCand"></div>
       </div>
       <div class="pane pile" data-drop="tomorrow">
@@ -960,11 +968,6 @@
         </div>
         <div class="mvf" data-f="note">
           <label>気をつけること (備考)</label><input id="mvNote" maxlength="300">
-        </div>
-        <div class="mvf" data-f="size_class">
-          <label>大きさ (配送方法から分からないときだけ)</label>
-          <div class="opts chips" id="mvSizeOpts" role="group" aria-label="大きさ"></div>
-          <input id="mvSize" type="hidden">
         </div>
         <div class="mvf" data-f="expiry_seal">
           <label>期限シール (貼る商品ですか)</label>
@@ -1460,9 +1463,10 @@ function rowTags(c, opts) {
   if (c.external_ready) h += '<span class="tag ready">📦 外部に出せます</span>';
   if (c.facility_code && c.facility_code !== 'iroha') h += '<span class="tag ext">🏢 ' + esc(facilityName(c.facility_code)) + '</span>';
   if (c.priority.kind === 'urgent') h += '<span class="tag urgent">🔥 急ぎ・' + esc(c.priority.label) + '</span>';
-  // 🌱「はじめての商品」= この商品の作業実績がまだ無い (利用者に役立つ意味 — 監修)。
-  //   売上データの有無 (旧「新商品」) は職員向けの判断材料なので、職員モードの meta2 に出す
-  if (!c.estimate) h += '<span class="tag new">🌱 はじめての商品</span>';
+  // 🌱「はじめての商品」= **過去に入荷したことがない商品** (中原さん 2026-09-06 — 要件 §AA)。
+  //   作業実績 (実測時間) の有無ではない (それは「⏱ 実測なし」で出している)。
+  //   null = 判定材料が無い (入荷の記録がまだ 1 件も無い) → 札を出さない
+  if (c.first_time === true) h += '<span class="tag new">🌱 はじめての商品</span>';
   if (c.master.missing.length > 0) h += '<span class="tag miss">⚠ ' + (short ? '未登録 ' + c.master.missing.length : esc(c.master.missing.join('・')) + ' 未登録') + '</span>';
   return h;
 }
@@ -1925,6 +1929,9 @@ function bcardHtml(c, status) {
     esc(c.title) + '</h4>' +
     // ⛔ 止まっている理由は赤い 1 行で (小さな文字に埋めない — 中原さん 2026-09-05)
     (c.blocked ? '<div class="bblk">⛔ ' + esc(c.blocked.label) + 'で止まっています</div>' : '') +
+    // 🔥 急ぎ = 1 週間以内に Z ロケの在庫を使わないといけない商品 (要件 §AA)。
+    //   どの列 (進捗・拠点・いつ) で見ていても目に入るように、カードそのものに出す (中原さん 2026-09-06)
+    (c.priority && c.priority.kind === 'urgent' ? '<div class="burg">🔥 急ぎ・' + esc(c.priority.label) + '</div>' : '') +
     // 列が進捗以外なら、進捗の札を出す (拠点・いつ の列でも段階が分かるように — 中原さん 2026-09-06)
     (boardCols !== 'status' ? '<div class="bstat"><span class="st ro ' + stClass(c.status) + '">' + esc(stLabel(c)) + '</span></div>' : '') +
     (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') +
@@ -2803,11 +2810,17 @@ function renderPlan() {
   $('#planCarry').innerHTML = carry.length === 0 ? '' :
     '<div class="carry"><h3>やり残し ' + carry.length + ' 件' + (ro ? '' : ' — どうしますか (自動では動かしません)') + '</h3>' +
     carry.map((c) => pcardHtml(c, carryActs, !ro)).join('') + '</div>';
-  // 候補 (優先順)
+  // 候補 (おすすめ順。1 から順に番号が付く — 中原さん 2026-09-06)
   const cand = d.candidates || [];
+  const rec = d.recommend || { count: 0, hours: 0 };
   $('#planCandN').textContent = cand.length;
+  // ⭐「ここまで足すと 1 日の目安」の区切り線。すでに目安を超えていれば引かない (count = 0)
+  // 時間不明のカードは 0 時間で数えているので、混じっていれば件数を添える (0 時間を「目安」と言い切らない)
+  const cut = '<div class="pcut">ここまでで 1 日の目安 ' + esc(fmtHours(rec.hours))
+    + (rec.unknown_hours_count ? ' (時間不明 ' + rec.unknown_hours_count + ' 件)' : '') + '</div>';
   $('#planCand').innerHTML = cand.length === 0 ? '<div class="colempty">候補はありません</div>'
-    : cand.map((c) => pcardHtml(c, ro ? [] : [['＋ 明日やる', 'primary', 'tomorrow']], !ro)).join('');
+    : cand.map((c, i) => pcardHtml(c, ro ? [] : [['＋ 明日やる', 'primary', 'tomorrow']], !ro)
+        + (rec.count && i + 1 === rec.count && i + 1 < cand.length ? cut : '')).join('');
   // 明日やる分
   const pile = d.tomorrow || [];
   $('#planPileN').textContent = pile.length;
@@ -2831,24 +2844,34 @@ function planHintText(lo, hi) {
   return '1 日にできるのは ' + lo + '〜' + hi + ' 時間ぶんです。左の候補を「＋ 明日やる」で右に足してください。'
     + '選ぶたびに保存されます (確定ボタンはありません)。目安を超えても入れられます。';
 }
-/** 計画画面のカード。理由 (なぜ上に出るか) を必ず添える */
+/**
+ * 計画画面のカード。理由 (なぜ上に出るか) を必ず添える。
+ * ⭐候補には**おすすめの順位** (rank) を付ける (中原さん 2026-09-06「そのほうが作業しやすい」)。
+ *   大きさ (嵩) は並びの中だけで効かせ、**画面には出さない** (要件 §AA)
+ */
 function pcardHtml(c, actions, grab) {
   const why = [];
   if (c.blocked) why.push('<span class="urgent">⛔ ' + esc(c.blocked.label) + '</span>');
-  if (c.priority) why.push('<span class="' + (c.priority.kind === 'urgent' ? 'urgent' : '') + '">' + esc(c.priority.label) + '</span>');
+  if (c.priority) {
+    // ⭐なぜこの順番なのかを言い切る。新商品は「10 日分とみなして並べた」ことまで書く (§AA)
+    const plabel = c.priority.kind === 'new' && c.priority.sort_days
+      ? c.priority.label + ' (' + c.priority.sort_days + '日分とみなす)'
+      : c.priority.label;
+    why.push(c.priority.kind === 'urgent'
+      ? '<span class="urgent">🔥 急ぎ・' + esc(plabel) + '</span>'
+      : '<span>' + esc(plabel) + '</span>');
+  }
   if (c.arrival) why.push('<span>入荷 ' + esc(fmtMd(c.arrival)) + '</span>');
-  // 不明が 2 つ並ぶなら 1 つにまとめる (「見込 不明」「大きさ 不明」で札が 3 つ — 監修)
+  if (c.first_time === true) why.push('<span class="new">🌱 はじめての商品</span>');
   const noHours = c.plan_hours == null;
-  const noSize = !c.size_label;
-  if (noHours && noSize) why.push('<span class="unk">⚠ 見込・大きさ 不明</span>');
-  else if (noSize) why.push('<span class="unk">大きさ 不明</span>');
-  else why.push('<span class="size">' + esc(c.size_label) + '</span>');
+  if (noHours) why.push('<span class="unk">⚠ 見込 不明</span>');
   const meta = [c.qty != null ? c.qty + ' 個' : null,
-    noHours ? (noSize ? null : '見込 不明') : '見込 ' + approxHours(c.plan_hours),
+    noHours ? null : '見込 ' + approxHours(c.plan_hours),
     c.facility_code ? facilityName(c.facility_code) : 'どこが 未定'].filter(Boolean).join(' ・ ');
   const acts = actions.map(([label, cls, act]) =>
     '<button class="pbtn ' + cls + '" data-plan-act="' + act + '" data-plan-id="' + esc(c.id) + '">' + esc(label) + '</button>').join('');
   return '<div class="pcard" data-id="' + esc(c.id) + '">' + (grab ? gripHtml() : '') +
+    (c.rank ? '<span class="rank num" aria-label="おすすめ ' + esc(c.rank) + ' 番目">' + esc(c.rank) + '</span>' : '') +
     '<div class="th">' + thumbHtml(c) + '</div><div class="bd">' +
     '<h4>' + esc(c.title) + '</h4><div class="m num">' + esc(meta) + '</div>' +
     '<div class="why">' + why.join('') + '</div></div><div class="act">' + acts + '</div></div>';
@@ -3499,7 +3522,6 @@ function workInfoHtml(c, m, missSet) {
         'process_count', missSet.has('工程'), '作業前に登録してください') +
       // 「未設定」を「貼らない」と読まれると貼り忘れが起きる (監修)
       wrow('期限シール', m.expiry_seal == null ? null : (m.expiry_seal ? 'あり (赤で上に出します)' : 'なし'), 'expiry_seal', false, null, '未設定 (貼るかどうか職員に確認)') +
-      wrow('大きさ', sizeClassText(m.size_class), 'size_class') +
       (c.expiry ? wrow('この入荷の有効期限', esc(c.expiry), null) : '') +
       careRow +
     '</div>' + care +
@@ -3566,7 +3588,9 @@ function memoHtml(c) {
 function headFactsHtml(c) {
   const live = [];
   if (c.sales_text) live.push(c.sales_text);
-  if (c.live && c.live.free_stock != null) live.push('フリー在庫 ' + c.live.free_stock + '個');
+  // ⭐残り日数の根拠 = 出せる在庫 (Z ロケ・Y ロケの在庫化待ちを引いた分。要件 §AA)
+  if (c.live && c.live.shippable_free != null) live.push('出せる在庫 ' + c.live.shippable_free + '個');
+  if (c.live && c.live.pending_free) live.push('在庫化待ち ' + c.live.pending_free + '個');
   const out = [];
   if (c.priority) {
     out.push('<span class="' + (c.priority.kind === 'urgent' ? 'urgent' : '') + '">' +
@@ -3586,10 +3610,6 @@ function sealHtml(c) {
 function careHtml(c) {
   const note = c.master && c.master.note;
   return note ? '<div class="care"><label>気をつけること</label><div class="v">' + esc(note) + '</div></div>' : '';
-}
-/** 大きさの表示名 */
-function sizeClassText(v) {
-  return v === 'L' ? '大' : v === 'M' ? '中' : v === 'S' ? '小' : null;
 }
 
 /** 下見・履歴で開いたときの注意書き。何が「いつ時点」かを項目ごとに分けて出す (Codex R4 Q5) */
@@ -4009,20 +4029,8 @@ let mvSaving = false;
 let mvCtx = null;   // { pageId, code, version, values }
 const MV_MAP = { material_code: 'mvMaterial', storage_container: 'mvContainer', units_per_container: 'mvUnits',
   // 作り方動画のリンクは画面から外した (中原さん 2026-09-03)。DB の video_url と API は残してあるので、戻すときはここに足す
-  process_count: 'mvProcess', note: 'mvNote', size_class: 'mvSize', expiry_seal: 'mvSeal' };
-/** 大きさの選択肢 (明日どれをやるかの並びに使う。ふだんは配送方法から見なす — 要件 §W-2) */
-const SIZE_OPTS = [['L', '大'], ['M', '中'], ['S', '小'], ['', '未登録']];
-function renderSizeOpts() {
-  const cur = $('#mvSize').value || '';
-  $('#mvSizeOpts').innerHTML = SIZE_OPTS.map(([v, l]) =>
-    '<button type="button" class="opt' + (cur === v ? ' on' : '') + '" data-size="' + v + '">' + l + '</button>').join('');
-}
-$('#mvSizeOpts').addEventListener('click', (e) => {
-  const b = e.target.closest('[data-size]');
-  if (!b) return;
-  $('#mvSize').value = b.dataset.size;
-  renderSizeOpts();
-});
+  // ⭐「大きさ」は廃止 (中原さん 2026-09-06 — 要件 §AA)。大きさは配送方法から見なすので手で登録しない
+  process_count: 'mvProcess', note: 'mvNote', expiry_seal: 'mvSeal' };
 /** 期限シール: あり / なし / 未登録。貼り忘れると出荷できないので、あるときだけ上に赤で出す */
 const SEAL_OPTS = [['1', 'あり'], ['0', 'なし'], ['', '未登録']];
 function renderSealOpts() {
@@ -4104,17 +4112,23 @@ document.addEventListener('keydown', (e) => {
   else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 });
 
+/**
+ * ダイアログに入れる「開いた時点の値」。**MV_MAP の全項目**を返すこと —
+ * 抜けていると input.value に undefined が入り、触っていないのに 'undefined' を送ってしまう
+ * (期限シールで実際に起きていた。2026-09-06 修正)
+ */
 function mvValues(m) {
   return {
     material_code: m.material_code || '', storage_container: m.storage_container || '',
     units_per_container: m.units_per_container == null ? '' : String(m.units_per_container),
     process_count: m.process_count == null ? '' : String(m.process_count),
     note: m.note || '',
+    expiry_seal: m.expiry_seal == null ? '' : String(m.expiry_seal),
   };
 }
 
 const MV_TITLE = { material_code: '資材', storage_container: '保管箱', units_per_container: '入数',
-  process_count: '工程数', note: '気をつけること', size_class: '大きさ', expiry_seal: '期限シール' };
+  process_count: '工程数', note: '気をつけること', expiry_seal: '期限シール' };
 /**
  * 作業のやり方の登録・変更。**タップした項目だけ**を出す (中原さん 2026-09-03:
  * 保管箱をタップしたら保管箱だけ)。field を指定しなければ全部出す
@@ -4128,7 +4142,6 @@ function openMaster(field) {
   const cur = mvValues(c.master);
   mvCtx = { cardId: c.id, code: c.product_code, version: c.master.version, values: cur, field: MV_MAP[field] ? field : null };
   for (const [f, id] of Object.entries(MV_MAP)) document.getElementById(id).value = cur[f];
-  renderSizeOpts();
   renderSealOpts();
   optNewKind = null; renderOpts('material'); renderOpts('container');
   // 出す項目を絞る (他は隠すだけ。保存は「開いた時点との差分」なので触っていない項目は送られない)

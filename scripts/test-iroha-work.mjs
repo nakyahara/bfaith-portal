@@ -287,13 +287,33 @@ console.log('\n[7] buildList: 作業仕様・優先度・並び');
   ok(cards.indexOf(n) < cards.indexOf(b), '新商品は通常より上');
 }
 
-console.log('\n[8] priorityOf: 欠損をゼロ代用しない');
+console.log('\n[8] priorityOf: 欠損をゼロ代用しない / 急ぎは 1 週間 / 新商品は 10 日 (§AA)');
 {
+  const S8 = await import('../apps/iroha-work/service.js');
   ok(priorityOf(null, null).kind === 'new', '両方なし = 新商品');
   ok(priorityOf(30, null).kind === 'unknown' && priorityOf(30, null).label === '在庫データなし', '在庫欠損は「在庫データなし」');
   ok(priorityOf(0, 100).kind === 'calm' && priorityOf(null, 100).kind === 'calm', '販売なしは calm (在庫だけあっても急がない)');
-  ok(priorityOf(30, 0).kind === 'urgent' && priorityOf(30, 0).label === '在庫切れ', '在庫0×販売あり = 在庫切れ');
+  ok(priorityOf(30, 0).kind === 'urgent' && priorityOf(30, 0).label === '在庫切れ', '出せる在庫0×販売あり = 在庫切れ');
   ok(priorityOf(30, 300).kind === 'normal', '300日分は normal');
+  // ⭐急ぎの線引き = 1 週間以内に Z ロケ (在庫化ロケ) の在庫を使わないといけない (中原さん 2026-09-06)
+  ok(S8.URGENT_DAYS === 7, '急ぎは「残り 7 日分以下」');
+  ok(priorityOf(30, 7).kind === 'urgent' && priorityOf(30, 7).days === 7, 'ちょうど 7 日分は急ぎ (1 週間以内に使う)');
+  ok(priorityOf(30, 8).kind === 'normal', '8 日分は急ぎではない');
+  ok(priorityOf(30, 4).kind === 'urgent' && /残り4\.0日分/.test(priorityOf(30, 4).label), '理由 (残り日数) は必ず付く');
+  // ⭐新商品は「10 日で在庫がなくなる商品」とみなして並べる (中原さん 2026-09-06)
+  ok(S8.NEW_PRODUCT_DAYS === 10 && priorityOf(null, null).sort_days === 10 && priorityOf(null, null).days === null,
+    '新商品は並びだけ 10 日扱い (表示は「新商品」のまま・日数は作らない)');
+  const P = (s30, free) => ({ priority: priorityOf(s30, free) });
+  ok(S8.comparePriority(P(30, 5), P(null, null)) < 0, '残り 5 日分は新商品より先');
+  ok(S8.comparePriority(P(30, 20), P(null, null)) > 0, '残り 20 日分は新商品より後 (新商品 = 10 日)');
+  ok(S8.comparePriority(P(null, null), P(30, null)) < 0 && S8.comparePriority(P(30, null), P(0, 100)) < 0,
+    '日数の出ないもの (データなし → 販売なし) は最後');
+  // 出荷できる在庫 = 全ロケのフリー在庫 − Z ロケ − Y ロケ (まだ売り物になっていない分)
+  const loc = (stock, allocated) => ({ stock, allocated });
+  ok(S8.shippableFreeOf(100, loc(30, 5), loc(10, 0)) === 65, 'Z (30−5) と Y (10) を引く');
+  ok(S8.shippableFreeOf(100, null, null) === 100, 'Z も Y も無ければそのまま');
+  ok(S8.shippableFreeOf(null, loc(30, 0), null) === null, 'ミラーが取れていなければ null (0 で代用しない)');
+  ok(S8.pendingFreeOf(loc(30, 5), loc(10, 2)) === 33, '在庫化待ち = Z と Y のフリー在庫の合計');
 }
 
 console.log('\n[9] changeStatus');
@@ -2364,7 +2384,8 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         const stG = await call('GET', '/api/state', { cookie });
         ok(stG.json.tomorrow_plan && stG.json.tomorrow_plan.count >= 1 && stG.json.today_ymd === today, 'ボードのゲージ用に「明日やる分」の件数と合計が出る');
         ok(stG.json.cards.find((c) => c.id === t1).when === 'tomorrow', 'カードに when が付く');
-        ok('size_label' in stG.json.cards[0] && 'size_rank' in stG.json.cards[0], 'カードに大きさ (配送方法) が付く');
+        ok('size_rank' in stG.json.cards[0] && !('size_label' in stG.json.cards[0]),
+          '大きさは並びに使うだけ (size_rank は乗るが、名前は画面に出さない — §AA)');
 
         // ⑦ やり残し = 今日より前の予定で、まだ終わっていない。**自動では動かさない**
         const t2 = mk(9402, 'やり残しテスト', 'in_progress');
@@ -2402,7 +2423,7 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         ok(stN.status === 200 && cN && cN.facility_code == null, '拠点が未定でも一覧に出る');
         ok((await call('GET', '/api/plan', { cookie })).status === 200, '拠点が未定のカードがあっても明日の計画が開ける');
         ok((await call('GET', '/api/task-previews/' + t3, { cookie })).status === 200, '拠点が未定でも詳細が開ける');
-        // ⑪b 大きさ: 配送方法で分からない商品は、職員が「作業のやり方」で登録できる (要件 §W-2)
+        // ⑪b 大きさ: **配送方法だけ**で見なす。並びに使うだけで画面には出さない (中原さん 2026-09-06 — 要件 §AA)
         {
           // 商品マスタ (mirror_products) に無い商品は「作業のやり方」を作れないので、
           // 配送方法が空の商品を 1 つ足してから試す
@@ -2412,43 +2433,35 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
           db.prepare("UPDATE f_iroha_tasks SET product_code = 'SIZE-A' WHERE id = ?").run(t6);
           clearEnrichCache();
           const before = (await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === t6);
-          ok(before.size_label == null && before.size_rank == null, '配送方法が分からなければ「大きさ 不明」');
+          ok(before.size_rank == null, '配送方法が分からなければ大きさは不明 (並びは最後)');
+          ok(!('size_label' in before), '大きさの名前はカードに出さない (画面に出さない — §AA)');
+          // 職員がその場で登録する「大きさ」は廃止 (2026-09-06)。送っても受け取らない
           const mv = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
-            fields: { size_class: 'L' }, worker_id: staffP.id, pin: '4649', expect_version: 1 } });
-          ok(mv.status === 200 && mv.json.ok, '職員が大きさを登録できる');
-          clearEnrichCache();
-          const after = (await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === t6);
-          ok(after.size_rank === 5 && after.size_label === '大', '登録した大きさが一覧に出る');
-          // 配送方法が分かる商品では、そちらを優先する (登録より配送方法が先)
+            fields: { size_class: 'L' }, worker_id: staffP.id, pin: '4649' } });
+          ok(mv.status === 200 && mv.json.ok === true && mv.json.unchanged === true
+            && String(mv.json.ignored_fields) === 'size_class',
+            '「大きさ」だけ送ってきた古い画面はエラーにせず「変えなかった」で返す (Codex R1 #5)');
+          ok(!db.prepare("SELECT 1 FROM f_iroha_work_master WHERE code_key = 'size-a'").get(), '書かないのでマスタの行も作らない');
+          const mvBoth = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { size_class: 'L', process_count: '3' }, worker_id: staffP.id, pin: '4649' } });
+          ok(mvBoth.status === 200 && db.prepare("SELECT size_class, process_count FROM f_iroha_work_master WHERE code_key = 'size-a'").get().size_class == null,
+            '他の項目と一緒に送っても「大きさ」だけは書かない');
+          db.prepare("DELETE FROM f_iroha_work_master WHERE code_key = 'size-a'").run();
+          // 配送方法が分かれば、その大きさが並びに効く
           db.prepare("UPDATE mirror_products SET 配送方法 = '定形外郵便' WHERE 商品コード = 'SIZE-A'").run();
           clearEnrichCache();
-          const both = (await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === t6);
-          ok(both.size_rank === 1 && both.size_label === '定形外', '配送方法が分かればそちらを使う (登録は受け皿)');
+          const after = (await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === t6);
+          ok(after.size_rank === 1 && !('size_label' in after), '配送方法から大きさが決まる (定形外 = 1)。名前は出さない');
           db.prepare("UPDATE mirror_products SET 配送方法 = NULL WHERE 商品コード = 'SIZE-A'").run();
-          // 知らない大きさは DB の CHECK で入らない
-          let sizeErr = null;
-          try { db.prepare("UPDATE f_iroha_work_master SET size_class = 'XL' WHERE code_key = 'size-a'").run(); } catch (e) { sizeErr = e; }
-          ok(sizeErr && /CHECK/.test(sizeErr.message), '知らない大きさは入らない (DB の CHECK)');
-          // HTTP 経由でも: 未登録に戻せる / 小文字で送れる / 知らない値は断る (Codex P4 R1)
-          const mver = () => db.prepare("SELECT version FROM f_iroha_work_master WHERE code_key = 'size-a'").get().version;
-          const clear = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
-            fields: { size_class: '' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
-          ok(clear.status === 200 && clear.json.ok, '空を送ると「未登録」に戻せる (500 にならない)');
-          ok(db.prepare("SELECT size_class FROM f_iroha_work_master WHERE code_key = 'size-a'").get().size_class == null, 'DB からも消える');
           clearEnrichCache();
-          ok((await call('GET', '/api/state', { cookie })).json.cards.find((c) => c.id === t6).size_label == null, '一覧でも「大きさ 不明」に戻る');
-          const lower = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
-            fields: { size_class: ' m ' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
-          ok(lower.status === 200 && db.prepare("SELECT size_class FROM f_iroha_work_master WHERE code_key = 'size-a'").get().size_class === 'M',
-            '小文字・前後の空白でも受け取って M として入る');
-          const badSize = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
-            fields: { size_class: 'XL' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
-          ok(badSize.status === 400 && badSize.json.error === 'bad_size', '知らない大きさは 400 (500 にしない)');
-          ok(db.prepare("SELECT size_class FROM f_iroha_work_master WHERE code_key = 'size-a'").get().size_class === 'M', '断ったので値も変わらない');
+
           // ── 期限シール (中原さん 2026-09-05: ありのときだけ赤で上に出す) ──
-          const sealOf = () => db.prepare("SELECT expiry_seal FROM f_iroha_work_master WHERE code_key = 'size-a'").get().expiry_seal;
+          const sealRow = () => db.prepare("SELECT expiry_seal, version FROM f_iroha_work_master WHERE code_key = 'size-a'").get() || {};
+          const sealOf = () => sealRow().expiry_seal;
+          const mver = () => sealRow().version;
+          // マスタの行がまだ無い = 新規作成なので expect_version は要らない (空欄埋めは誰でもできる)
           const seal1 = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
-            fields: { expiry_seal: '1' }, worker_id: staffP.id, pin: '4649', expect_version: mver() } });
+            fields: { expiry_seal: '1' }, worker_id: staffP.id, pin: '4649' } });
           ok(seal1.status === 200 && sealOf() === 1, '「期限シールあり」を登録できる');
           clearEnrichCache();
           const withSeal = (await call('GET', '/api/task-previews/' + t6, { cookie })).json;
@@ -3151,18 +3164,14 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
     && S2.whenOf(null, '2026-09-04') === null, '今日 / 明日 / やり残し / 先 / 未定 を日付で分ける');
   ok(S2.whenOf('2026-08-31', '2026-09-01') === 'over' && S2.whenOf('2026-09-01', '2026-08-31') === 'tomorrow',
     '月をまたいでも「昨日」「明日」を取り違えない');
-  // 大きさ (配送方法で見なす)。大きいほど先にやる
+  // 大きさ (配送方法で見なす)。大きいほど先にやる。並びの中だけで効かせ、画面には出さない (§AA)
   ok(S2.sizeOfShipping('定形外郵便').rank === 1 && S2.sizeOfShipping('ヤマト(ネコポス)').rank === 2
     && S2.sizeOfShipping('ゆうパケットパフ').rank === 3 && S2.sizeOfShipping('ヤマト宅急便【50サイズ専用】').rank === 4
     && S2.sizeOfShipping('ヤマト(発払い)B2v6').rank === 5, '配送方法から大きさの順が出る (定形外<ネコポス<ゆうパケット<50<発払い)');
   ok(S2.sizeOfShipping('') === null && S2.sizeOfShipping(null) === null && S2.sizeOfShipping('AES') === null,
-    '分からない配送方法は null (並びは最後・画面は「大きさ 不明」)');
+    '分からない配送方法は null (並びは最後)');
   ok(S2.sizeOfShipping('宅急便50サイズ以下').rank === 4, '「50サイズ」は 60 の規則に吸われない (上から大きい順に見る)');
-  // 職員がその場で登録する大きさ (配送方法で分からない商品の受け皿 — 要件 §W-2)
-  ok(S2.sizeOfClass('L').rank === 5 && S2.sizeOfClass('M').rank === 3 && S2.sizeOfClass('S').rank === 1,
-    '大 / 中 / 小 も並びの順を持つ');
-  ok(S2.sizeOfClass('l').rank === 5, '小文字でも読む');
-  ok(S2.sizeOfClass('') === null && S2.sizeOfClass(null) === null && S2.sizeOfClass('XL') === null, '知らない値は null');
+  ok(S2.sizeOfClass === undefined, '職員がその場で登録する「大きさ」は廃止 (中原さん 2026-09-06 — §AA)');
 
   // 一覧のカードに乗る
   const t = TD.upsertTaskFromImport({ notion_page_id: 'plan-1', status: 'not_started', destination_id: 9301,
@@ -3458,6 +3467,178 @@ console.log('\n[23] 想定作業時間・必要保管箱 (Notion の計算式を
   }
 }
 
+console.log(String.fromCharCode(10) + '[23b] 急ぎ (出せる在庫で数える) ・はじめての商品 (入荷実績) ・おすすめ順 (中原さん 2026-09-06 — §AA)');
+{
+  const S3 = await import('../apps/iroha-work/service.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const db = getDB();
+  const now = new Date().toISOString();
+  const today = S3.jstToday();
+  const sale = (code, qty) => db.prepare(`INSERT OR REPLACE INTO mirror_sales_daily (日付, 商品コード, モール, 数量, データ種別, チャネル, updated_at)
+    VALUES (?, ?, 'rakuten', ?, 'by_product', '', ?)`).run(today, code, qty, now);
+  const stock = (code, loc, qty, arrivalDate) => db.prepare(`INSERT INTO mirror_logizard_stock
+    (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, 入荷日, captured_at, synced_at)
+    VALUES (?, ?, ?, ?, '良品', ?, 0, ?, ?, ?)`).run(code, code, loc + '-001-001-01', loc, qty, arrivalDate || null, now, now);
+  let seq = (db.prepare('SELECT MAX(destination_id) m FROM f_iroha_tasks').get().m || 9000) + 100;   // 他の節と番号がぶつからないように
+  const task = (code, name, extra) => TD.upsertTaskFromImport({ notion_page_id: 'aa-' + (++seq), status: 'not_started',
+    destination_id: seq, product_code: code, product_name: name, qty: 100, facility_code: 'iroha',
+    master_snapshot: { units_per_container: 10, process_count: 2 }, ...extra }, { batchId: 'test-aa' }).id;
+
+  // ① 急ぎ = 1 週間以内に Z ロケの在庫を使わないといけない。**Z ロケは出せる在庫に数えない**
+  //    URG-A: 日販 1 個 (30日で30個)。棚に 2 個 + Z ロケに 18 個 → 出せるのは 2 個 = 残り 2 日分 → 急ぎ
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID IN ('URG-A','CALM-A','STK-A')");
+  sale('URG-A', 30); stock('URG-A', 'P3F', 2); stock('URG-A', 'Z01', 18);
+  const tUrg = task('URG-A', '急ぎになる商品');
+  sale('CALM-A', 30); stock('CALM-A', 'P3F', 300);
+  const tCalm = task('CALM-A', '在庫たっぷりの商品');
+  clearEnrichCache();
+  const cards1 = S3.buildTaskList().cards;
+  const cUrg = cards1.find((c) => c.id === tUrg);
+  ok(cUrg.live.free_stock === 20 && cUrg.live.pending_free === 18 && cUrg.live.shippable_free === 2,
+    '出せる在庫 = 全ロケ 20 個 − 在庫化待ち (Z) 18 個 = 2 個');
+  ok(cUrg.priority.kind === 'urgent' && cUrg.priority.days === 2,
+    '残り 2 日分なので急ぎ (Z を数えていたら 20 日分になり急ぎにならない)');
+  const cCalm = cards1.find((c) => c.id === tCalm);
+  ok(cCalm.priority.kind === 'normal' && cCalm.priority.days === 300, '出せる在庫が多い商品は急ぎにしない');
+  ok(cards1.indexOf(cUrg) < cards1.indexOf(cCalm), '一覧でも急ぎが先');
+  // ⭐全ロケの合計も Z/Y も**同じ 1 回の読み取り**から出す。参照マップの 5 分キャッシュを混ぜない —
+  //   片方だけ新しいと、その間だけ在庫日数が大きく狂う (clearEnrichCache せずに在庫を動かして確かめる)
+  stock('URG-A', 'P3F', 100);
+  const cFresh = S3.buildTaskList().cards.find((c) => c.id === tUrg);
+  ok(cFresh.live.free_stock === 120 && cFresh.live.shippable_free === 102 && cFresh.priority.kind === 'normal',
+    '在庫が動いたら次の読み込みで反映される (キャッシュ済みの合計と Z が食い違わない)');
+  // Z と Y の両方に当たる行 (ロケ Z・ブロック略称 Y) は Z として 1 回だけ数える (二重に引かない)
+  db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('URG-A', 'URG-A', 'Z09-001-001-01', 'Y09', '良品', 10, 0, ?, ?)`).run(now, now);
+  const cBoth = S3.buildTaskList().cards.find((c) => c.id === tUrg);
+  ok(cBoth.live.free_stock === 130 && cBoth.live.pending_free === 28 && cBoth.live.shippable_free === 102,
+    'Z にも Y にも見える行は 1 回だけ在庫化待ちに数える (出せる在庫は変わらない)');
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'URG-A' AND ロケ = 'Z09-001-001-01'");
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'URG-A' AND ロケ = 'P3F-001-001-01' AND 在庫数 = 100");
+
+  // ② 🌱 はじめての商品 = 過去に入荷したことがない (作業実績の有無ではない)
+  const tFirst = task('FIRST-A', 'はじめて入荷する商品', { arrival_date: '2026-09-05' });
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tFirst).first_time === true,
+    'この商品の入荷の記録が今回だけなら「はじめての商品」');
+  const tOld = task('FIRST-A', '前に入荷していた分', { arrival_date: '2026-08-01' });
+  clearEnrichCache();
+  const cards2 = S3.buildTaskList().cards;
+  ok(cards2.find((c) => c.id === tFirst).first_time === false, '前の入荷 (8/1) が見つかれば「はじめて」ではない');
+  ok(cards2.find((c) => c.id === tOld).first_time === true, 'いちばん古い入荷のカードは「はじめて」のまま');
+  // 作業実績 (実測時間) は関係ない — 実績が無くても入荷実績があれば札を出さない
+  ok(cards2.find((c) => c.id === tFirst).estimate == null, '前提: どちらも作業実績はまだ無い');
+  // 取消 (入荷そのものが取り下げ) のカードは実績に数えない。「在庫化対象外」は荷物が届いているので数える
+  const tCancel = task('CXL-A', '取消になった入荷',
+    { arrival_date: '2026-07-01', status: 'closed', close_reason: 'cancelled', closed_at: now });
+  const tCancelNew = task('CXL-A', '取消のあとの入荷', { arrival_date: today });
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tCancelNew).first_time === true,
+    '取消のカードしか無ければ「はじめての商品」のまま (入荷は取り下げられている)');
+  db.prepare("UPDATE f_iroha_tasks SET close_reason = 'out_of_scope' WHERE id = ?").run(tCancel);
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tCancelNew).first_time === false,
+    '「在庫化対象外」で終わったカードは入荷実績に数える (荷物は届いている)');
+  // ロジザードの入荷日でも過去の入荷を拾う (カードが残っていない古い入荷)
+  sale('STK-A', 30); stock('STK-A', 'P3F', 50, '2025-01-15');
+  const tStk = task('STK-A', '在庫に古い入荷日がある商品', { arrival_date: today });
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tStk).first_time === false,
+    'カードが無くても、在庫の入荷日が今回より古ければ「はじめて」ではない');
+  // 商品コードの無いカードは判定できない → null (札を出さない)
+  const tNoCode = task(null, '商品コードなし', { arrival_date: today });
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tNoCode).first_time === null, '判定できないときは null (0 件を「はじめて」と読み替えない)');
+
+  // ③ おすすめの区切り (1 日の目安に届くまで)
+  const h = (x) => ({ plan_hours: x });
+  ok(S3.recommendCut([h(2), h(3), h(2)], 0, 6).count === 2 && S3.recommendCut([h(2), h(3), h(2)], 0, 6).hours === 5,
+    '上から足して目安 (6h) に収まるところまで = 2 件 5 時間');
+  ok(S3.recommendCut([h(2), h(3)], 4, 6).count === 1, 'すでに明日やる分が 4h あれば残りは 2h ぶんだけ勧める');
+  ok(S3.recommendCut([h(2), h(3)], 6.5, 6).count === 0, '目安を超えていれば区切りを引かない');
+  ok(S3.recommendCut([h(9)], 0, 6).count === 1, '1 件目は目安を超えていても勧める (何も勧めないと画面が無言になる)');
+  ok(S3.recommendCut([h(null), h(2)], 0, 6).count === 2, '見込の分からないカードは 0 時間として数える');
+
+  // ④ 明日の計画の候補に 1 から順のおすすめ順位が付く
+  const plan = S3.buildPlan();
+  ok(plan.candidates.length > 0 && plan.candidates.every((c, i) => c.rank === i + 1), '候補に 1 から順の推奨順位が付く');
+  const rUrg = plan.candidates.find((c) => c.id === tUrg);
+  const rCalm = plan.candidates.find((c) => c.id === tCalm);
+  ok(rUrg && rCalm && rUrg.rank < rCalm.rank, '急ぎのカードのほうが小さい番号 (先にやる)');
+  ok(plan.recommend && plan.recommend.count >= 1 && plan.recommend.count <= plan.candidates.length,
+    'おすすめの区切りも一緒に返す');
+
+  // ⑤ 判定材料は「商品ごと」に見る — よその商品の実績でこの商品を「はじめて」にしない (Codex R1 #1)
+  const tNoArr = task('NOARR-A', '入庫日の分からないカード', { arrival_date: null });
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tNoArr).first_time === null,
+    'この商品の材料が 0 件なら null (よその商品に入荷実績があっても「はじめて」にしない)');
+  sale('BADD-A', 10); stock('BADD-A', 'P3F', 50, '不明');
+  const tBadDate = task('BADD-A', '在庫の入荷日が読めない商品', { arrival_date: null });
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tBadDate).first_time === null,
+    '入荷日が読めない行しか無い商品も「はじめて」と決めつけない (読めない ≠ 入荷が無い)');
+
+  // ⑥ 一覧・ボードと明日の計画で並びのものさしが同じ (Codex R1 #2)
+  const listCards = S3.buildTaskList().cards;
+  const notToday = listCards.filter((c) => !c.today);
+  ok(notToday.length > 1 && notToday.every((c, i) => i === 0 || S3.comparePlanOrder(notToday[i - 1], c) <= 0),
+    '一覧 (「今日やる」の下) は明日の計画とまったく同じ並びになっている');
+  ok(S3.comparePlanOrder({ id: 2 }, { id: 10 }) < 0 && S3.comparePlanOrder({ id: 'aa-2' }, { id: 'aa-10' }) > 0,
+    '最後の決着は数の id なら数として、Notion の page_id なら文字列として付く');
+  const nanCard = { priority: { sort_days: NaN, kind: 'normal' } };
+  const okCard = { priority: { sort_days: 5, kind: 'normal' } };
+  ok(S3.comparePriority(nanCard, okCard) > 0 && S3.comparePriority(okCard, nanCard) < 0,
+    '日数が NaN のカードは最後に回る (比較結果が NaN にならない — Codex R1 #3)');
+
+  // ⑦ 出せる在庫は負にしない (Codex R1 #6) ・区切りの「時間不明」件数 (Codex R1 #4)
+  ok(S3.shippableFreeOf(5, { stock: 10, allocated: 0 }, null) === 0, '在庫化待ちのほうが多くても「出せる在庫」は 0 止まり (負を画面に出さない)');
+  ok(S3.shippableFreeOf(null, null, null) === null, 'ミラーが取れていなければ null のまま (0 で代用しない)');
+  ok(S3.recommendCut([h(null), h(2)], 0, 6).unknown_hours_count === 1, '0 時間で数えた「時間不明」の件数も返す');
+  ok(S3.recommendCut([h(2), h(3)], 0, 6).unknown_hours_count === 0, '全部分かっていれば 0 件');
+  ok(S3.recommendCut([h(2)], 9, 6).unknown_hours_count === 0, '目安を超えていて区切りを引かないときも件数は 0');
+
+
+  // ⑧ Notion 正本のカードは f_iroha_tasks に居ない。カード自身の入庫日を材料にする (Codex R2)
+  const { upsertCachePage: upCache } = await import('../apps/iroha-work/db.js');
+  const nPage = (id, code, ymd, title) => upCache({ pageId: id, status: '未着手', title, productCode: code,
+    dedupeKey: id, url: null, lastEditedTime: now, props: { '入庫日': ymd } });
+  nPage('aa-ntn-1', 'NTN-A', today, 'Notion だけにある新商品');
+  clearEnrichCache();
+  ok(S3.buildList().cards.find((c) => c.page_id === 'aa-ntn-1').first_time === true,
+    'Notion 正本でも、そのカードだけが材料なら「はじめての商品」(材料 0 件 = 分からない にしない)');
+  nPage('aa-ntn-2', 'NTN-A', '2026-08-01', '前に入荷していた分');
+  clearEnrichCache();
+  ok(S3.buildList().cards.find((c) => c.page_id === 'aa-ntn-1').first_time === false,
+    '同じ商品の古いカードが一覧にあれば「はじめて」ではない');
+  db.prepare("DELETE FROM f_iroha_app_notion_cache WHERE page_id LIKE 'aa-ntn-%'").run();
+
+  // ⑨ 同じ日に 2 枚届いても「同日は古い入荷ではない」(境界)
+  const tSame1 = task('SAME-A', '同じ日の入荷 1 枚目', { arrival_date: today });
+  const tSame2 = task('SAME-A', '同じ日の入荷 2 枚目', { arrival_date: today });
+  clearEnrichCache();
+  const sameCards = S3.buildTaskList().cards;
+  ok(sameCards.find((c) => c.id === tSame1).first_time === true && sameCards.find((c) => c.id === tSame2).first_time === true,
+    '同じ日の入荷が 2 枚あってもどちらも「はじめて」のまま');
+
+  // ⑩ id の比べ方が相手によって変わらない = 順序が循環しない (Codex R2)
+  const idCards = [{ id: 10 }, { id: '2' }, { id: '11x' }, { id: null }, { id: 3 }];
+  ok(idCards.every((a) => idCards.every((b) => idCards.every((c) => {
+    const ab = S3.comparePlanOrder(a, b); const bc = S3.comparePlanOrder(b, c);
+    return !(ab <= 0 && bc <= 0) || S3.comparePlanOrder(a, c) <= 0;   // a≦b かつ b≦c なら a≦c
+  }))), '数の id と文字列の page_id が混ざっても順序が循環しない (推移性)');
+  ok(idCards.every((a) => idCards.every((b) =>
+    Math.sign(S3.comparePlanOrder(a, b)) === -Math.sign(S3.comparePlanOrder(b, a)))),
+    '入れ替えて比べれば符号が逆になる (反対称)');
+  ok(S3.comparePlanOrder({ id: '2' }, { id: '02' }) !== 0, "数として同じ '2' と '02' も元の文字列で決着する");
+  ok(S3.comparePriority({ priority: { sort_days: null, kind: 'normal' } }, { priority: { sort_days: 3, kind: 'normal' } }) > 0
+    && S3.comparePriority({ priority: {} }, { priority: { sort_days: 3, kind: 'normal' } }) > 0,
+    'null・未設定の日数も最後に回る (Number(null) = 0 で先頭に来ない)');
+
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID IN ('URG-A','CALM-A','STK-A','BADD-A')");
+  clearEnrichCache();
+}
+
 setMetaValue('source_of_truth', null);   // [21]〜[23] で立てた正本を既定 (Notion) に戻す
 console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリックは委譲する)');
 {
@@ -3576,8 +3757,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '参考・外部出し目安・取引先も上部に出す');
   ok(/<h3 class="sec">作業情報' \+ missBadge\(m\)/.test(html) && !/<h3 class="sec">作業のやり方</.test(html),
     '「作業のやり方」を「作業情報」に変える (未登録の数も見出しに出す)');
-  ok(/wrow\('大きさ', sizeClassText\(m\.size_class\), 'size_class'\)/.test(html),
-    '大きさは行から登録できる (P4 で項目だけ足して開けなくなっていた)');
+  ok(!/wrow\('大きさ'/.test(html) && !/sizeClassText/.test(html),
+    '「大きさ」の行は廃止 (配送方法から見なすので手で登録しない — 中原さん 2026-09-06 §AA)');
   ok(/wrow\('期限シール'/.test(html) && /'expiry_seal', false, null, '未設定 \(貼るかどうか職員に確認\)'\)/.test(html),
     '期限シールも行から変えられる。未設定は「貼らない」と読まれないよう一言添える (監修)');
   // 作業情報の作り (中原さん 2026-09-05:「写真がないやつはカードみたいな表示にしなくていい。Zロケ在庫も工程も見にくい」)
@@ -3879,14 +4060,16 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/どこが未定 ' \+ und \+ ' 件/.test(html), '拠点が未定の件数を警告に出す');
   ok(/data-plan-act=/.test(html) && /\$\('#planCand'\)\.addEventListener\('click'/.test(html),
     '計画画面のボタンも data-* + 委譲で受ける (onclick に値を埋めない)');
-  ok(/function pcardHtml\(c, actions, grab\)/.test(html) && /大きさ 不明/.test(html),
-    'カードに理由 (在庫・入荷・大きさ) を添える。大きさが分からなければそう出す');
-  // ══ P4: 大きさのその場登録 ══
-  ok(/<div class="mvf" data-f="size_class">/.test(html) && /const SIZE_OPTS = \[\['L', '大'\], \['M', '中'\], \['S', '小'\], \['', '未登録'\]\];/.test(html),
-    '「作業のやり方」で大きさを大/中/小から選べる (未登録にも戻せる)');
-  ok(/size_class: 'mvSize'/.test(html), '大きさも他の項目と同じ仕組みで保存する');
-  ok(/data-size=/.test(html) && /\$\('#mvSizeOpts'\)\.addEventListener\('click'/.test(html),
-    '大きさの選択も data-* + 委譲で受ける');
+  ok(/function pcardHtml\(c, actions, grab\)/.test(html) && !/大きさ 不明/.test(html)
+    && /🔥 急ぎ・/.test(html) && /c\.rank \? '<span class="rank num"/.test(html),
+    'カードに理由 (🔥急ぎ・在庫・入荷) と**おすすめの順位**を添える。大きさは画面に出さない (§AA)');
+  ok(/class="pcut">ここまでで 1 日の目安/.test(html) && /rec\.count && i \+ 1 === rec\.count/.test(html),
+    '候補の途中に「ここまでで 1 日の目安」の区切り線を引く (§AA)');
+  // ══ 大きさの手動登録は廃止 (中原さん 2026-09-06 — §AA) ══
+  ok(!/data-f="size_class"/.test(html) && !/SIZE_OPTS/.test(html) && !/mvSizeOpts/.test(html) && !/size_class/.test(html),
+    '「作業のやり方」から大きさの項目・選択肢・保存の口をすべて外した');
+  ok(/expiry_seal: m\.expiry_seal == null \? '' : String\(m\.expiry_seal\)/.test(html),
+    'mvValues は MV_MAP の全項目を返す (期限シールが抜けていて undefined を送っていたのを修正)');
   // ══ P2: ボードに 3 軸を載せる (要件 §W-4) ══
   ok(/<div id="gaugeWrap"><\/div>/.test(html) && !/class="gauge"/.test(html.slice(0, html.indexOf('<script'))),
     '明日やる分のゲージは静的に置かない (職員のときだけボタンにする)');
@@ -3915,7 +4098,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const grab = isApp\(\) && !bulkIds && \(boardCols === 'fac' \? stateCan\('task\.facility\.assign'\) : boardCols === 'when' \? stateCan\('task\.plan\.assign'\) : stateCan\('task\.status\.change'\)\);/.test(html)
     && /\(grab \? gripHtml\(\) : ''\)/.test(html),
     '動かせないときは掴み手を描かない (無効にして見せない — 要件 §U-7)。いつ の列は計画の許可で掴める');
-  ok(/pcardHtml\(c, carryActs, !ro\)/.test(html) && /\], !ro\)\)\.join\(''\)/.test(html)
+  ok(/pcardHtml\(c, carryActs, !ro\)/.test(html)
+    && /pcardHtml\(c, ro \? \[\] : \[\['＋ 明日やる', 'primary', 'tomorrow'\]\], !ro\)/.test(html)
     && /pcardHtml\(c, pileActs, !ro\)/.test(html),
     '下見・許可なしの計画画面には掴み手を描かない');
   ok(/\/\/ ⭐掴んでから落とすまでの間に正本や許可が変わることがある。\*\*落とす直前にもう一度見る\*\*/.test(html)
