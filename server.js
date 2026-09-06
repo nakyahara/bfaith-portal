@@ -57,6 +57,7 @@ import inboundCheckRouter from './apps/inbound-check/router.js';
 import irohaWorkRouter from './apps/iroha-work/router.js';
 import fbaBoxRouter from './apps/fba-box/router.js';
 import { startMediaWorker as startIrohaMediaWorker } from './apps/iroha-work/media.js';
+import { startIrohaPrintQueueWorker } from './apps/iroha-work/print-worker.js';
 import staffRouter from './apps/staff/router.js';
 import { startInboundCheckCron, startInboundCheckPrintQueueWorker } from './apps/inbound-check/sync-job.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
@@ -1676,6 +1677,8 @@ app.listen(PORT, () => {
   // いろは作業アプリ: 完成写真・動画の Drive/Notion 送信キュー (プロセス内2分間隔の再試行。
   // picking の画像キューと同じ扱いで、台帳対象の独立 cron ではない)
   startIrohaMediaWorker();
+  // 🏷 いろは作業アプリ: 保管箱ラベル印刷キューの見張り (30秒間隔。滞留→manual / 報告なし→unknown / いろはPC エージェントの生存を台帳 iroha-label-print-agent へ中継)
+  startIrohaPrintQueueWorker();
   startProductHubIntakeCron();
   // 商品リンク台帳: 夜間照合 (09:45 JST) + 台帳が空なら起動時バックフィル。既定 ON (PRODUCT_LINKS_RECONCILE_ENABLED=false で停止)
   startProductLinksCron();

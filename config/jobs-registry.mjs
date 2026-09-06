@@ -121,6 +121,31 @@ export const JOBS_REGISTRY = [
       + '手順と切り分け表 = AI_reference システム設計\\_tools\\倉庫PC_値札印刷エージェント\\README.md。'
       + '⚠ 未導入のうちは ping しない設計なので、この項目が出たら「導入済みなのに止まった」',
   },
+  {
+    id: 'iroha-label-print-agent',
+    type: 'heartbeat',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'いろは在庫化作業アプリ (iPad) の「🏷 箱ラベル」を押したら いろはPC の Brother QL-800 から保管箱ラベルを'
+      + '自動で出す常駐エージェント (2026-09-06)。倉庫PCの値札印刷エージェント (nefuda-print-agent) と同じ作りで、'
+      + 'テンプレは 共有ドライブ『入荷バーコード発行\\バーコード印字.lbx』(商品名・1箱に何個・期限・CODE128)。'
+      + 'いろはPC のタスクスケジューラで SYSTEM 実行。Render の印刷キュー (/apps/iroha-work/print/*) へ 4秒ごとに pull で聞きに行く'
+      + '一方向通信で、Render から いろはPC へは繋がない。止まると iPad の依頼が3分で「印刷係が応答しません」になり、'
+      + 'ラベルは今までどおり P-touch Editor で手で刷る (P2)',
+    where: 'いろはPC C:\\tools\\iroha-label-agent\\agent.ps1 (タスク名 BFaith-IrohaLabelAgent)。'
+      + '設置キット = 共有ドライブ 入荷バーコード発行\\箱ラベル印刷係\\ (いろはPC から見えるのはこのフォルダだけ)。'
+      + 'Render 側の見張り = apps/iroha-work/print-worker.js startIrohaPrintQueueWorker (30秒間隔・IROHA_WORK_PRINT_ENABLED)',
+    schedule: '常駐 (4秒間隔で /print/next・45秒ごとに heartbeat。生存 ping は1時間に1回へ間引き)',
+    // ⭐ping は nefuda-print-agent と同じく**エージェント自身ではなく Render が中継する** (いろはPC へ JOBS_MONITOR_TOKEN を配らない)。
+    //   Render が f_iroha_app_devices.heartbeat_at を見て、10分以内なら ok を打つ = エージェントが死ねば ping も止まる
+    max_age_hours: 3,
+    lifecycle: 'permanent',
+    runbook: 'いろはPC で Get-Content C:\\tools\\iroha-label-agent\\work\\agent.log -Tail 30 -Encoding UTF8 / '
+      + '2_状態を見る.bat (RESULT_status.txt)。401 = トークン失効 → /apps/iroha-work/admin の 🏷 節で登録し直して 1_設置する.bat。'
+      + '409 = 出力先プリンター未登録 → 管理画面で Brother QL-800 を登録。b-PAC 未導入 / 用紙「箱ラベル 62x67」未登録は管理画面の印刷係一覧に出る。'
+      + '手順と切り分け表 = 共有ドライブ 入荷バーコード発行\\箱ラベル印刷係\\README.md。'
+      + '⚠ 未導入のうちは ping しない設計なので、この項目が出たら「導入済みなのに止まった」',
+  },
   // ─────────────── heartbeat (Render 常駐: inquiry-hub) ───────────────
   {
     id: 'inquiry-hub-sync',

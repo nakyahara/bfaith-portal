@@ -690,6 +690,51 @@ export function createTables(db = getMirrorDB()) {
       actor        TEXT,
       created_at   TEXT NOT NULL
     );`);
+  // 🏷 印刷係 (いろはPC の QL-800 エージェント) も同じ端末表で扱う (kind で区別)。inbound-check の値札印刷と同じ方式 (中原さん 2026-09-06)。
+  //   printer_name は**サーバー側が端末に紐づけて持つ** (エージェント側の設定ミスで別のプリンターに出さない)
+  addCol('f_iroha_app_devices', 'kind', "TEXT NOT NULL DEFAULT 'ipad'");
+  addCol('f_iroha_app_devices', 'printer_name', 'TEXT');
+  addCol('f_iroha_app_devices', 'heartbeat_at', 'TEXT');
+  addCol('f_iroha_app_devices', 'heartbeat_note', 'TEXT');
+  addCol('f_iroha_app_devices', 'heartbeat_json', 'TEXT');
+  // 🏷 保管箱ラベルの印刷ジョブ (print-queue.js)。値札 (f_inbound_check_print_jobs) と同じ状態遷移。
+  //   PDF が無くジョブ JSON そのものがデータ = lease した時点で紙が出たかもしれない → 期限切れでも queued へ戻さない
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_iroha_print_jobs (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_request_id TEXT NOT NULL UNIQUE,      -- iPad の冪等ID (二重タップ・応答消失の再送で2枚出ない)
+      task_id           INTEGER NOT NULL REFERENCES f_iroha_tasks(id),
+      product_code      TEXT,
+      product_name      TEXT NOT NULL,
+      barcode           TEXT NOT NULL,
+      barcode_type      TEXT NOT NULL CHECK (barcode_type IN ('jan','fnsku')),
+      pack_qty          TEXT NOT NULL DEFAULT '',  -- 1 箱に何個 (空 = 印字しない)
+      expiry_text       TEXT NOT NULL DEFAULT '',  -- 期限の文字 (空 = 印字しない)
+      copies            INTEGER NOT NULL CHECK (copies BETWEEN 1 AND 50),
+      printer_name      TEXT NOT NULL,             -- 積んだ時点の出力先。エージェントはこの名前にだけ出す
+      target_device_id  INTEGER NOT NULL REFERENCES f_iroha_app_devices(id),
+      requested_by      TEXT,
+      requested_device  TEXT,
+      acknowledged_job_id INTEGER,                -- 直前の unknown ジョブを「実物を見て出ていなかった」と確認した証跡 (その ID)
+      acknowledged_at   TEXT,                     -- (unknown 側) 人が実物を確認して再発行した時刻。以後この lease の遅延報告は受け付けない
+      state             TEXT NOT NULL CHECK (state IN ('queued','leased','submitted','completed','failed','manual','unknown')),
+      lease_device_id   INTEGER REFERENCES f_iroha_app_devices(id),
+      lease_token       TEXT,
+      lease_expires_at  TEXT,
+      spool_job_id      TEXT,
+      error             TEXT,
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL,
+      leased_at         TEXT,
+      submitted_at      TEXT,
+      finished_at       TEXT,
+      alerted_state     TEXT,                      -- 通知し終えた状態 (送信成功後にだけ入れる)
+      CHECK (state NOT IN ('leased','submitted')
+             OR (lease_device_id IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL))
+    );
+    CREATE INDEX IF NOT EXISTS idx_iroha_print_jobs_state ON f_iroha_print_jobs(state, id);
+    CREATE INDEX IF NOT EXISTS idx_iroha_print_jobs_task ON f_iroha_print_jobs(task_id, id);
+  `);
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}
@@ -1413,13 +1458,53 @@ export function voidSession(id, actor, reason) {
 /** 職員モードの長さ。30 分 (要件 §W-3) */
 export const STAFF_UNLOCK_MS = 30 * 60 * 1000;
 
-export function createDevice(label, actor) {
+/**
+ * 端末の発行。kind='agent' は 🏷 印刷係 (いろはPC)。iPad と同じ表・同じ失効の導線に乗せるが、
+ *   - トークンは Cookie ではなく**平文で 1 回だけ**呼び元に返す (エージェントの config.json に貼る)
+ *   - 出力先プリンター名を必ず持つ (無効なエージェント同士で同名は不可 — Windows のプリンター名は PC ごとのローカル名)
+ */
+export function createDevice(label, actor, { kind = 'ipad', printerName = null } = {}) {
   const l = String(label || '').trim();
   if (!l || l.length > 40) throw new Error('端末名は1〜40文字');
+  if (kind !== 'ipad' && kind !== 'agent') throw new Error('端末の種別が不正です');
+  const db = getDB();
+  let printer = null;
+  if (kind === 'agent') {
+    const chk = validatePrinterName(db, printerName, null);
+    if (!chk.ok) throw new Error(chk.message);
+    printer = chk.name;
+  }
   const token = crypto.randomBytes(32).toString('base64url');
-  const info = getDB().prepare('INSERT INTO f_iroha_app_devices (token_hash, label, created_by, created_at) VALUES (?, ?, ?, ?)')
-    .run(hashToken(token), l, actor, utcNow());
+  const info = db.prepare('INSERT INTO f_iroha_app_devices (token_hash, label, created_by, created_at, kind, printer_name) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(hashToken(token), l, actor, utcNow(), kind, printer);
   return { token, id: Number(info.lastInsertRowid) };
+}
+
+/** プリンター名の検査。有効なエージェント同士で同名は許さない (どちらの実機から出るか決められない) */
+function validatePrinterName(db, printerName, selfId) {
+  const name = String(printerName == null ? '' : printerName).trim();
+  if (!name || name.length > 120) return { ok: false, error: 'bad_printer', message: 'プリンター名を1〜120文字で入力してください (「プリンターとスキャナー」の表記どおり)' };
+  const other = db.prepare(`SELECT id, label FROM f_iroha_app_devices WHERE kind = 'agent' AND revoked_at IS NULL AND printer_name = ? AND id <> ?`)
+    .get(name, selfId == null ? -1 : selfId);
+  if (other) return { ok: false, error: 'duplicate_printer', message: `「${name}」は別の端末「${other.label}」に登録済みです。プリンター名は PC ごとのローカル名なので、同じ名前だとどちらの実機か決められません` };
+  return { ok: true, name };
+}
+
+/** 🏷 印刷係の出力先プリンターを付け替える。名前が変わったら、その端末宛ての queued は manual に倒す (別のプリンターから出さない) */
+export function setAgentPrinter(deviceId, printerName) {
+  const db = getDB();
+  return db.transaction(() => {
+    const dev = db.prepare(`SELECT id, printer_name FROM f_iroha_app_devices WHERE id = ? AND kind = 'agent' AND revoked_at IS NULL`).get(deviceId);
+    if (!dev) return { ok: false, error: 'not_agent', message: '有効な印刷係 (エージェント) の端末ではありません' };
+    const chk = validatePrinterName(db, printerName, deviceId);
+    if (!chk.ok) return chk;
+    const now = utcNow();
+    db.prepare('UPDATE f_iroha_app_devices SET printer_name = ? WHERE id = ?').run(chk.name, deviceId);
+    const dropped = dev.printer_name === chk.name ? 0 : db.prepare(`UPDATE f_iroha_print_jobs SET state = 'manual', error = ?, finished_at = ?, updated_at = ?
+      WHERE target_device_id = ? AND state = 'queued' AND printer_name <> ?`)
+      .run(`出力先プリンター名が変わったため自動印刷を取り消しました (${dev.printer_name} → ${chk.name})`, now, now, deviceId, chk.name).changes;
+    return { ok: true, printer_name: chk.name, cancelled: dropped };
+  }).immediate();
 }
 
 export function verifyDevice(token) {
@@ -1462,7 +1547,7 @@ export function revokeDevice(id) {
 }
 
 export function listDevices() {
-  return getDB().prepare('SELECT id, label, created_by, created_at, last_seen_at, revoked_at FROM f_iroha_app_devices ORDER BY id').all();
+  return getDB().prepare('SELECT id, label, kind, printer_name, heartbeat_at, created_by, created_at, last_seen_at, revoked_at FROM f_iroha_app_devices ORDER BY id').all();
 }
 
 // ── 登録コード (6桁・10分・1回。総当たり対策も inbound-check と同じ) ──
