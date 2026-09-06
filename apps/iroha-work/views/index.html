@@ -153,6 +153,10 @@
   /* ── ボード (状態 4 列。iPad 縦では横スクロール) ── */
   /* 列は画面幅で割る (4 列なら 25%)。列数は renderBoard() が grid-template-columns で入れる。狭いときだけ横スクロール (監修) */
   .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:10px;overflow-x:auto;padding-bottom:10px}
+  /* 列が多い (拠点 = 6 列) とき: 写真枠を消して文字の幅を確保 (170px の列では 1 文字ずつ折れていた — 中原さん 2026-09-06) */
+  .board.narrow .bcard .th{display:none}
+  .board.narrow .bcard{padding:8px}
+  .boardhint{margin:-4px 0 8px;font-size:.84rem;color:var(--sub);font-weight:700}
   .col{background:var(--well);border:1px solid var(--line);border-radius:var(--r);padding:8px;min-width:0}
   .col h3{margin:0 0 8px;font-size:.86rem;font-weight:700;color:var(--sub);display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;white-space:nowrap}
   .col h3 .t{flex:1 1 auto;min-width:4em;overflow:hidden;text-overflow:ellipsis}   /* 見出しは消さない (「まとめて棚入完了」は次の行へ) */
@@ -673,6 +677,7 @@
       <input class="search" id="bq" placeholder="商品名・商品コードで検索">
     </div>
     <div class="board" id="board"></div>
+    <p class="boardhint" id="boardHint" hidden>→ 横にスクロールすると残りの列が見えます</p>
   </div>
 
   <!-- ══ 画面1d: 明日の計画 (職員だけ。ボードのゲージから開く) ══ -->
@@ -1804,9 +1809,16 @@ function renderBoard() {
       (hours > 0 ? '<span class="n">⏱ ' + esc(approxHours(hours)) + '</span>' : '') +
       (canBulk && !bulkIds ? '<button onclick="startBulk()">まとめて棚入完了</button>' : '') + '</h3>' + body + '</div>';
   }).join('');
-  $('#board').innerHTML = cols;
-  // 列は画面幅で割る (4 列なら 25%)。狭くて 170px を切るときだけ横スクロール (右端が切れて気づけなかった — 監修)
-  $('#board').style.gridTemplateColumns = 'repeat(' + groups.length + ', minmax(170px, 1fr))';
+  const board = $('#board');
+  board.innerHTML = cols;
+  // 列は画面幅で割る (4 列なら 25%)。狭くて最小幅を切るときだけ横スクロール (右端が切れて気づけなかった — 監修)。
+  // ⭐列が多い (拠点 = 6 列) ときは最小幅を広げ、写真枠を消す — 170px の列では商品名が 1 文字ずつ折れていた (中原さん 2026-09-06)
+  const many = groups.length > 4;
+  board.classList.toggle('narrow', many);
+  board.style.gridTemplateColumns = 'repeat(' + groups.length + ', minmax(' + (many ? 220 : 170) + 'px, 1fr))';
+  // 横にスクロールできるときは、そう書く (気づけないと右の列が無いように見える)
+  const hint = $('#boardHint');
+  if (hint) hint.hidden = !(board.scrollWidth > board.clientWidth + 4);
 }
 /** 掴み手。⭐動かせるときだけ描く (動かせないのに掴めるように見せない — 要件 §U-7) */
 function gripHtml() { return '<span class="grip" data-grip aria-hidden="true">⠿</span>'; }
@@ -2139,15 +2151,28 @@ setInterval(() => { if (state && state.staff_mode && state.staff_mode.staff) ren
  * 画面の中の「計画の許可」をその場で落とす。
  * サーバーに頼まなくても、職員モードを終えた瞬間・期限が来た瞬間にボタンを消すため
  */
+/** 職員の許可が落ちたあとの状態ダイアログ: 理由の段・PIN を消して、いま許される変更先だけ描き直す */
+function refreshStAfterCapsDrop() {
+  const c0 = findCard(stTarget);
+  if (c0) { stStep = null; $('#pinRow').style.display = 'none'; $('#pinIn').value = ''; $('#stMsg').textContent = ''; renderStBtns(c0); }
+  else closeSt();
+}
 function dropPlanCaps() {
   if (!state) return;
   state.staff_mode = { staff: false };
   // 職員のときだけ入る許可 = capabilities.js の CAPS_STAFF と同じ集合 (外部出しも — Codex PR-C R1 #2)
-  state.capabilities = (state.capabilities || []).filter((c) => c !== 'task.plan.assign' && c !== 'task.facility.assign' && c !== 'task.external_ready');
+  state.capabilities = (state.capabilities || []).filter((c) => c !== 'task.plan.assign' && c !== 'task.facility.assign' && c !== 'task.external_ready' && c !== 'tasks.bulk_stocked');
   planData = null;
   clearPlanDom();
   if (curView === 'plan') setView('board');
   if (facPickCtx) closeFacPick();
+  if (whenPickCtx) closeWhenPick();
+  // 開いている状態ダイアログも描き直す — 職員だけのボタンと PIN 行を残さない (Codex PR #1217 R1)。
+  // 保存中は触らず、終わったら描き直す (失敗して戻ってきたボタンが職員のままにならないように — Codex R2)
+  if (stTarget != null && $('#stOv').classList.contains('on')) {
+    if (stSaving) stRefreshPending = true;
+    else refreshStAfterCapsDrop();
+  }
   renderStaffBtn();
   renderList();
   renderBoard();
@@ -2942,6 +2967,8 @@ function fmtDur(sec) {
 }
 
 $('#bq').addEventListener('input', renderBoard);
+// 横スクロールの案内は、画面の向きや幅が変わったら判定し直す (Codex PR #1217 R2)
+window.addEventListener('resize', () => { const b = $('#board'); const h = $('#boardHint'); if (b && h && curView === 'board') h.hidden = !(b.scrollWidth > b.clientWidth + 4); });
 $('#histQ').addEventListener('input', () => { clearTimeout(histTimer); histTimer = setTimeout(loadHistory, 350); });
 
 // ─── 手動更新 ───
@@ -4481,6 +4508,7 @@ function openStFromDetail() { if (curDetail && can('task.status.change')) openSt
 // ─── ステータス変更 (Codex R2 ①: 保存中表示・処理中は全ボタン無効・失敗は大きく) ───
 let stTarget = null;   // カードの id
 let stSaving = false;
+let stRefreshPending = false;   // 保存中に職員モードが切れた → 保存が終わったら描き直す (Codex PR #1217 R2)
 let stStep = null;     // アプリ正本で終了の理由を選んでいる途中 ('closed')。「止まった」は別ダイアログ (openBlock)
 
 /** アプリ正本で「その変更に職員の本人確認が要るか」(サーバー tasks.js transitionNeedsStaff と同じ規則) */
@@ -4507,12 +4535,18 @@ function renderStBtns(c) {
     return;
   }
   const nexts = (state.transitions || {})[c.status] || [];
+  // ⭐職員だけの変更 (終了 = 棚入完了・終了からの戻し・棚入待ち→作業中) は、職員モード (またはポータル) のときだけ描く —
+  //   利用者に押せないボタンを見せない (要件 §U-7 / 中原さん 2026-09-06「棚入完了は職員のアカウントのみ」)。サーバー側も職員 PIN 必須
+  const staffOk = isStaffUI() || !!(state.me && state.me.session);
+  const shown = nexts.filter((v) => staffOk || !stNeedsStaff(c.status, v));
   // 🔑 の意味が分からない → 「(職員)」と書く (監修)
-  $('#stBtns').innerHTML = nexts.map(v => stBtn(v, stName(v) + (stNeedsStaff(c.status, v) ? ' (職員)' : ''), false, ST_DESC[v])).join('')
-    || '<p class="hint">この状態から変えられる先がありません</p>';
+  $('#stBtns').innerHTML = shown.map(v => stBtn(v, stName(v) + (stNeedsStaff(c.status, v) ? ' (職員)' : ''), false, ST_DESC[v])).join('')
+    || '<p class="hint">' + (nexts.length ? 'ここから変えられるのは職員だけです (職員の名前を選び、🔑 職員モードに入ってください)' : 'この状態から変えられる先がありません') + '</p>';
   // その段に関係する注記だけ出す (監修)
   const hint = document.getElementById('stHint');
-  if (hint) hint.innerHTML = '「終了」は職員が棚に入れてから (職員PINが必要)。終了にすると一覧から外れます (履歴には残ります)。';
+  if (hint) hint.innerHTML = staffOk
+    ? '「終了」は棚に入れてから (職員PINが必要)。終了にすると一覧から外れます (履歴には残ります)。'
+    : '「終了 (棚入完了)」にできるのは職員だけです。棚に入れたら職員に伝えてください。';
 }
 
 /**
@@ -4703,6 +4737,8 @@ async function doSetSt(choice) {
   stSaving = false;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
   settleForceClose();   // 通信中に「閉じる」が予約されていれば、ここで閉じる
+  // 保存中に職員モードが切れていたら、ここで描き直す (職員だけのボタンが有効に戻らないように — Codex PR #1217 R2)
+  if (stRefreshPending) { stRefreshPending = false; if (stTarget != null && $('#stOv').classList.contains('on')) refreshStAfterCapsDrop(); }
 
   // 一覧に残らないステータス (棚入完了) になったら、その場で行を外す (次の取得でも入ってこない)
   const dropCard = () => {
