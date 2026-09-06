@@ -340,6 +340,8 @@ const MIGRATIONS = {
   //   既存行は reconcileRepickBatches が pk_pack_tasks から埋める
   16: () => {
     db.exec('ALTER TABLE pk_batches ADD COLUMN repick_reason TEXT');
+    // 再ピックバッチ ↔ タスクの結合 (reconcile・同期) 用
+    db.exec("CREATE INDEX IF NOT EXISTS idx_pk_batches_repick_task ON pk_batches(pack_task_id) WHERE origin = 'repick'");
   },
 };
 

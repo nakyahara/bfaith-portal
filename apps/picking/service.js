@@ -1476,13 +1476,27 @@ async function fetchStockLocationsSafe(sl, sku, fetchFn) {
  */
 export function repickReasonOf(task) {
   if (task?.later_request_id) return 'later';
-  if (task?.incident_id) {
-    try {
-      const kind = getDB().prepare('SELECT kind FROM pk_pack_incidents WHERE id = ?').get(task.incident_id)?.kind;
-      if (kind === 'wrong_item') return 'wrong_item';
-    } catch { /* packing 無効環境 */ }
+  if (!task?.incident_id) return 'shortage';
+  try {
+    const row = getDB().prepare('SELECT kind FROM pk_pack_incidents WHERE id = ?').get(task.incident_id);
+    if (!row) return null;   // 候補が引けない = 未確定 (次回の reconcile で再判定。「不足」に固定しない — Codex R1)
+    return row.kind === 'wrong_item' ? 'wrong_item' : 'shortage';
+  } catch (e) {
+    if (/no such table: pk_pack_incidents/.test(String(e.message))) return 'shortage';   // packing 無効環境
+    console.warn(`[picking] 再ピック理由の参照失敗 (incident=${task.incident_id}): ${e.message}`);
+    return null;   // 一時障害 (BUSY 等) → 未確定のまま (次回 reconcile で再試行)
   }
-  return 'shortage';
+}
+
+/** 一覧のカード用: その日の再ピックバッチの明細 (1タスク=1バッチ=1行) を一括で引く (N+1 にしない)。 */
+export function listRepickFirstLines(workDate) {
+  try {
+    return new Map(getDB().prepare(`
+      SELECT l.batch_id, l.sku, l.product_name, l.qty, l.block, l.location FROM pk_lines l
+      JOIN pk_batches b ON b.id = l.batch_id
+      WHERE b.work_date = ? AND b.origin = 'repick' AND l.seq = 1
+    `).all(workDate).map((l) => [l.batch_id, l]));
+  } catch { return new Map(); }
 }
 export const REPICK_CLASS = {
   later: '🕒 後で取りに行く (自分の欠品)',
@@ -1499,7 +1513,9 @@ export function createRepickBatch(task) {
     const existing = db.prepare('SELECT id FROM pk_batches WHERE tb_no = ?').get(tbNo);
     if (existing) return { batchId: existing.id, existed: true };
     const originRef = `${task.folder_name || '-'}${task.slip_seq ? ` #${task.slip_seq}` : ''}`;
+    // 理由が未確定 (候補の参照失敗) なら表示は暫定「不足」、DB は NULL のまま = reconcile が再判定して名前も直す
     const reason = repickReasonOf(task);
+    const shown = reason || 'shortage';
     // folder_name は入れない (Notionカード・shipping-log 突合を誤爆させない)。依頼元は origin_ref。
     // 名前は理由で分ける — 自分の欠品を「漏れ」と呼ばない (例外処理監査 A-1/U-1)
     const info = db.prepare(`
@@ -1508,7 +1524,7 @@ export function createRepickBatch(task) {
         csv_sha256, imported_by, created_at, updated_at, origin, origin_ref, requested_by, pack_task_id, repick_reason)
       VALUES (?, ?, NULL, ?, NULL, '単品', NULL, NULL, 1, 1, ?, 'ready', 'valid',
         ?, ?, ?, ?, 'repick', ?, ?, ?, ?)
-    `).run(tbNo, REPICK_CLASS[reason], jstToday(), task.req_qty, `repick-task-${task.id}`,
+    `).run(tbNo, REPICK_CLASS[shown], jstToday(), task.req_qty, `repick-task-${task.id}`,
       task.requested_by || 'packing', now, now, originRef, task.requested_by || null, task.id, reason);
     const batchId = Number(info.lastInsertRowid);
     db.prepare(`
@@ -1553,15 +1569,24 @@ export function reconcileRepickBatches() {
     for (const t of missing) {
       try { createRepickBatch(t); } catch (e) { console.warn(`[picking] 漏れバッチ再生成失敗 (task=${t.id}): ${e.message}`); }
     }
-    // ③ v16 以前に作られた再ピックバッチに理由と表示名を埋める (一度だけ。未完了のものだけで十分)
+    // ③ 理由が未確定の再ピックバッチ (v16 以前のもの・作成時に候補を引けなかったもの) に理由と表示名を埋める。
+    //    JOIN 一発で判定し、1トランザクションで更新 (Codex R1 Low)。候補が引けない行は NULL のまま次回へ
     try {
-      const legacy = db.prepare(`
-        SELECT b.id, t.later_request_id, t.incident_id FROM pk_batches b JOIN pk_pack_tasks t ON t.id = b.pack_task_id
-        WHERE b.origin = 'repick' AND b.repick_reason IS NULL AND b.status IN ('ready','picking','paused')
-      `).all();
-      for (const r of legacy) {
-        const reason = repickReasonOf(r);
-        db.prepare('UPDATE pk_batches SET repick_reason=?, hikiate_class=?, updated_at=? WHERE id=?').run(reason, REPICK_CLASS[reason], utcNow(), r.id);
+      const hasInc = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pk_pack_incidents'").get();
+      const legacy = db.prepare(hasInc ? `
+        SELECT b.id, CASE WHEN t.later_request_id IS NOT NULL THEN 'later'
+                          WHEN i.kind = 'wrong_item' THEN 'wrong_item'
+                          WHEN t.incident_id IS NULL OR i.id IS NOT NULL THEN 'shortage' END AS reason
+        FROM pk_batches b JOIN pk_pack_tasks t ON t.id = b.pack_task_id
+        LEFT JOIN pk_pack_incidents i ON i.id = t.incident_id
+        WHERE b.origin = 'repick' AND b.repick_reason IS NULL AND b.status IN ('ready','picking','paused')` : `
+        SELECT b.id, CASE WHEN t.later_request_id IS NOT NULL THEN 'later' ELSE 'shortage' END AS reason
+        FROM pk_batches b JOIN pk_pack_tasks t ON t.id = b.pack_task_id
+        WHERE b.origin = 'repick' AND b.repick_reason IS NULL AND b.status IN ('ready','picking','paused')`).all()
+        .filter((r) => r.reason);
+      if (legacy.length) {
+        const upd = db.prepare('UPDATE pk_batches SET repick_reason=?, hikiate_class=?, updated_at=? WHERE id=? AND repick_reason IS NULL');
+        db.transaction(() => { for (const r of legacy) upd.run(r.reason, REPICK_CLASS[r.reason], utcNow(), r.id); })();
       }
     } catch { /* fail-soft */ }
     return rows.length + missing.length;

@@ -565,20 +565,24 @@
 
     // ── 🔴/🕒 再ピックの案内 (例外処理監査 PR-5): 元ロケの意味・届け先・他ロケ候補 ──
     // 他ロケ候補は開始画面を開いた時点で1回取得 (在庫スナップショット)。欠品ボタンを押さなくても行き先が分かる (A-2)
-    let repickCands = null;   // { fetched, rows:[{label, free, expiry}] } | null
+    let repickCands = null;   // { configured, fetched, rows:[{label, free, expiry}] } | null
+    let repickCandsError = false;   // 通信・JSON 失敗 = 「候補なし」と区別して出す (Codex R1)
     async function loadRepickCands() {
       if (BATCH.origin !== 'repick' || !LINES.length) return;
+      repickCandsError = false;
       try {
         const r = await fetch(`/apps/picking/api/batches/${BATCH.id}/stock-locations?seq=${LINES[0].seq}`, { cache: 'no-store' });
-        const b = await r.json();
-        repickCands = r.ok ? b : null;
-      } catch { repickCands = null; }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        repickCands = await r.json();
+        if (!Array.isArray(repickCands.rows)) repickCands.rows = [];
+      } catch { repickCands = null; repickCandsError = true; }
       const el = $('repickCands');
       if (el) {
-        if (!repickCands || !repickCands.configured) el.textContent = '';
-        else if (!repickCands.fetched) el.textContent = '他ロケ候補: 在庫データを取得できませんでした';
+        if (repickCandsError) el.textContent = '他ロケ候補: 在庫データを取得できませんでした (欠品ボタンからも探せます)';
+        else if (!repickCands || !repickCands.configured) el.textContent = '';
+        else if (!repickCands.fetched) el.textContent = '他ロケ候補: 在庫データを取得できませんでした (欠品ボタンからも探せます)';
         else if (!repickCands.rows.length) el.textContent = '他ロケ候補: フリー在庫のあるロケはありません (この商品は在庫なしの可能性)';
-        else el.innerHTML = `他ロケ候補 (在庫の多い順): ${repickCands.rows.slice(0, 4).map((x) => `<b>${esc(x.label)}</b> (${x.free})`).join(' / ')}${repickCands.stale ? ' <small>⚠ 在庫データが古い可能性</small>' : ''}`;
+        else el.innerHTML = `他ロケ候補 (在庫の多い順): ${repickCands.rows.slice(0, 4).map((x) => `<b>${esc(x.label)}</b> (${esc(x.free)})`).join(' / ')}${repickCands.stale ? ' <small>⚠ 在庫データが古い可能性</small>' : ''}`;
       }
       renderRepickBanner();
     }
@@ -587,7 +591,7 @@
       if (!el) return;
       if (BATCH.origin !== 'repick') { el.style.display = 'none'; return; }
       const later = BATCH.repickReason === 'later';
-      const cands = repickCands && repickCands.fetched ? repickCands.rows.slice(0, 3).map((x) => `${esc(x.label)} (${x.free})`).join(' / ') : '';
+      const cands = repickCands && repickCands.fetched ? (repickCands.rows || []).slice(0, 3).map((x) => `${esc(x.label)} (${esc(x.free)})`).join(' / ') : '';
       el.style.background = later ? '#e8590c' : '#c92a2a';
       el.style.color = '#fff';
       el.innerHTML = `${later ? '🕒 自分の欠品 — 下は前回無かった場所' : (BATCH.repickReason === 'wrong_item' ? '🔴 品違い → 正しい商品を取る' : '🔴 梱包で足りなかった分')}`

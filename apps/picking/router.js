@@ -25,7 +25,7 @@ import {
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
   getPickingStats, getTodayProgress, getMissStats, statsRange, loadStatsLines, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
-import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask, announceShortageToPacking, returnCandidates } from './service.js';
+import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask, announceShortageToPacking, returnCandidates, listRepickFirstLines } from './service.js';
 import { notifyShortage, notifyShortageUndo } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
@@ -218,11 +218,11 @@ router.get('/', async (req, res) => {
   const batches = listBatches(workDate)
     .filter((b) => b.status !== 'cancelled' || b.work_date === workDate)
     // 🔴/🕒 再ピックバッチはカードに商品・数量・ロケ (取った場所 / 前回無かった場所) を出す (例外処理監査 PR-5・A-2)。
-    // 1行バッチなので明細を1件だけ引く
-    .map((b) => {
+    // 1タスク=1バッチ=1行なので、その日の分を一括で引く (N+1 にしない)
+    .map((b, _, arr) => {
       if (b.origin !== 'repick') return b;
-      let line = null;
-      try { line = listLines(b.id)[0] || null; } catch { line = null; }
+      if (!arr._repickLines) arr._repickLines = listRepickFirstLines(workDate);
+      const line = arr._repickLines.get(b.id) || null;
       return { ...b, repickLine: line ? { sku: line.sku, name: line.product_name || line.sku, qty: line.qty, locationLabel: line.location ? formatLocation(line.block, line.location) : null } : null };
     });
   // ↩ 棚戻し = 一覧の中に「バッチ」として並べる (例外処理監査 PR-4・指摘C)。pk_batches は作らない (計測・Notion・フロアボードに混ざらない)
