@@ -579,7 +579,8 @@
   .pfld label{display:block;font-size:12px;color:#6B7280;margin-bottom:4px}
   .pfld .ro{font-size:15px;line-height:1.4}
   .pfld input,.pfld select{width:100%;font-size:18px;padding:8px 10px;border:1px solid #C9D1E0;border-radius:8px;box-sizing:border-box;background:#fff}
-  .psum{margin-top:10px;padding:8px 10px;border-radius:8px;background:#E3EEFF;color:#1F4FBF;font-weight:700;font-size:15px}
+  .psum{margin-top:10px;padding:8px 10px;border-radius:8px;background:var(--accent-soft);color:var(--accent);font-weight:700;font-size:15px}
+  .psum.over{background:var(--danger-soft);color:var(--danger)}
   /* 詳細の「🖨 箱ラベルを印字する」— 小さなチップではなく、押すところだと分かる大きさで (中原さん 2026-09-06) */
   .printbig{display:block;width:100%;box-sizing:border-box;margin:12px 0 0;padding:14px 16px;border:2px solid var(--accent);
     background:#fff;color:var(--accent);border-radius:var(--r-sm);font-weight:800;font-size:1.05rem;min-height:56px;cursor:pointer}
@@ -2374,7 +2375,9 @@ function openPrintBox(id) {
     else if (bc.rest > 0) { copies = 1; units = String(bc.rest); }   // 端数だけ = 1 箱。その数で 1 枚
     else { copies = bc.full; units = String(bc.per); }
   }
-  copies = Math.min(50, Math.max(1, copies));
+  // ⭐上限で黙って切り詰めない — 必要な箱の数と違うラベルを出さないため (Codex PR #1224 R1)。
+  //   多すぎるときはそのまま出して、合計の案内と発行時の検査で止める
+  copies = Math.max(1, copies);
   // 期限の既定: この入荷の有効期限 → 無ければ「期限シールあり」の商品だけ印を入れる (無い商品は空欄)
   const expiry = c.expiry ? String(c.expiry) : (m.expiry_seal === 1 ? '期限シールあり' : '');
   const first = agents.find(a => a.online) || agents[0];
@@ -2415,7 +2418,10 @@ function renderPrintSum() {
   if (Number.isInteger(n) && n > 0) parts.push((pack ? pack + ' 個' : '数量なし') + ' × ' + n + ' 枚');
   if (extra) parts.push(extra + ' 個 × 1 枚');
   const total = (Number.isInteger(n) && n > 0 ? n : 0) + (extra ? 1 : 0);
-  el.textContent = parts.length ? '🏷 ' + parts.join(' ＋ ') + ' = 合計 ' + total + ' 枚' : '🏷 枚数を入れてください';
+  const over = total > 50;
+  el.classList.toggle('over', over);
+  el.textContent = !parts.length ? '🏷 枚数を入れてください'
+    : '🏷 ' + parts.join(' ＋ ') + ' = 合計 ' + total + ' 枚' + (over ? ' ⚠ 1 回に出せるのは 50 枚までです。2 回に分けてください' : '');
 }
 $('#printBody').addEventListener('input', renderPrintSum);
 // 選んだ出力先の状態 (応答なし / b-PAC なし / 用紙未登録)。select を変えたら描き直す
@@ -2445,6 +2451,8 @@ async function submitPrint() {
   if (packRaw && (!/^[0-9]+$/.test(packRaw) || Number(packRaw) < 1)) { msgEl.textContent = '❌ 1 箱に入れる数は 1 以上の整数で入れてください (空欄なら印字しません)'; return; }
   if (extraRaw && (!/^[0-9]+$/.test(extraRaw) || Number(extraRaw) < 1)) { msgEl.textContent = '❌ 端数の箱の数は 1 以上の整数で入れてください (空欄なら端数のラベルは出しません)'; return; }
   if (!Number.isInteger(copies) || copies < 1 || copies > 50) { msgEl.textContent = '❌ 枚数は 1〜50 で入れてください'; return; }
+  // 端数の 1 枚も数える (サーバーも同じ数で断る — Codex PR #1224 R1)
+  if (copies + (extraRaw ? 1 : 0) > 50) { msgEl.textContent = '❌ 端数を入れると合計 ' + (copies + 1) + ' 枚になります。1 回に出せるのは 50 枚までなので、2 回に分けてください'; return; }
   if (expiry.length > 40) { msgEl.textContent = '❌ 期限は 40 字までで入れてください'; return; }
   const sel = $('#printTarget');
   const tEl = $('#printBody').querySelector('[data-target]');

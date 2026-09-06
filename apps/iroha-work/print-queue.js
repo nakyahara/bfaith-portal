@@ -168,6 +168,10 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty =
     if (!Number.isSafeInteger(q) || q < 1) return { ok: false, error: 'bad_extra_qty', message: '端数の箱の数は 1 以上の整数で入力してください (空欄なら端数のラベルは出しません)' };
     extra = String(q);
   }
+  // 🚨 上限は**実際に出る枚数**で見る。端数の 1 枚を数えないと MAX_COPIES + 1 枚出せてしまう (Codex PR #1224 R1 重要)
+  if (n + (extra ? 1 : 0) > MAX_COPIES) {
+    return { ok: false, error: 'bad_copies', message: `端数の 1 枚を入れると ${n + 1} 枚になります。1 回に出せるのは ${MAX_COPIES} 枚までなので、2 回に分けてください` };
+  }
   const exp = expiry == null ? '' : String(expiry).trim();
   if (exp.length > MAX_EXPIRY_LEN || /[\r\n]/.test(exp)) return { ok: false, error: 'bad_expiry', message: `期限は ${MAX_EXPIRY_LEN} 字まで (改行なし) で入力してください` };
   const tid = Number(taskId);

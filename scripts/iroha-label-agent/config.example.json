@@ -1,0 +1,29 @@
+{
+  "_comment": "config.json にコピーして token を埋めてください (1_設置する.bat が自動でやります)。config.json は G ドライブや git に置かない (トークンが入る)。objects = テンプレ『バーコード印字.lbx』のオブジェクト名: productName=商品名 (テキスト6) / packQty=1箱に何個 (テキスト13、「数量」の右) / expiry=期限 (テキスト10) / jan・fnsku=バーコード (バーコード2。CODE128 が 1 本なので両方同じ)。label.mediaName = QL-800 ドライバーの「長尺テープフォーマット」で登録する用紙名。⚠ QL-800 では b-PAC からこの名前を選べない (SetMediaByName が ErrorCode 17367041) ので、label.fallbackMediaName = ドライバー標準の「62mm」(長尺・既定 89.8mm) に落ちる。描画のキャンバスが長くなるだけで、印刷は必ず lengthMm (67.2mm) の紙に出すため余りは切り落とされる。label.paperRawKind = 印刷 (GDI) で使うドライバー用紙番号 259 = 「62mm」長尺。widthMm/lengthMm = 箱ラベルの寸法 (62 × 67.2 = 値札と同じ)。カット設定はドライバー既定に従う",
+  "baseUrl": "https://bfaith-portal.onrender.com/apps/iroha-work",
+  "token": "PASTE_DEVICE_TOKEN_HERE",
+  "pollSec": 4,
+  "heartbeatSec": 45,
+  "workDir": "C:\\tools\\iroha-label-agent\\work",
+  "templates": {
+    "jan": "C:\\tools\\iroha-label-agent\\templates\\hakolabel_auto_JAN.lbx",
+    "fnsku": "C:\\tools\\iroha-label-agent\\templates\\hakolabel_auto_FNSKU.lbx"
+  },
+  "objects": {
+    "productName": "テキスト6",
+    "packQty": "テキスト13",
+    "expiry": "テキスト10",
+    "jan": "バーコード2",
+    "fnsku": "バーコード2"
+  },
+  "label": {
+    "mediaName": "箱ラベル 62x67",
+    "fallbackMediaName": "62mm",
+    "widthMm": 62,
+    "lengthMm": 67.2,
+    "toleranceMm": 1.0,
+    "paperRawKind": 259
+  },
+  "maxCopies": 50,
+  "printerName": "Brother QL-800"
+}

@@ -104,6 +104,8 @@ let J1;
   const bad = [
     [{ taskId: T1, copies: 0, clientRequestId: crid() }, 'bad_copies'],
     [{ taskId: T1, copies: MAX_COPIES + 1, clientRequestId: crid() }, 'bad_copies'],
+    // 🚨 端数の 1 枚を数えないと MAX_COPIES + 1 枚出せてしまう (Codex PR #1224 R1 重要)
+    [{ taskId: T1, copies: MAX_COPIES, extraPackQty: '10', clientRequestId: crid() }, 'bad_copies'],
     [{ taskId: T1, copies: 2, packQty: '1.5', clientRequestId: crid() }, 'bad_pack_qty'],
     [{ taskId: T1, copies: 2, packQty: 0, clientRequestId: crid() }, 'bad_pack_qty'],
     [{ taskId: T1, copies: 2, expiry: 'x'.repeat(MAX_EXPIRY_LEN + 1), clientRequestId: crid() }, 'bad_expiry'],
@@ -145,6 +147,14 @@ let J1;
   ok(busy.ok === false && busy.error === 'in_progress' && busy.job.id === J1, '進行中は同じカードに積めない');
   ok(latestJobsByTask().get(T1)?.id === J1 && !latestJobsByTask().has(T2), 'カードごとの最新ジョブ');
   ok(r.job.extra_pack_qty === '' && r.job.total_copies === 2, '端数なしなら total_copies = copies');
+  const edge = enqueuePrintJob({ taskId: T2, copies: MAX_COPIES - 1, packQty: '1', extraPackQty: '1', clientRequestId: crid() });
+  ok(edge.ok && edge.job.total_copies === MAX_COPIES, `端数を入れてちょうど ${MAX_COPIES} 枚なら通る`);
+  const over = enqueuePrintJob({ taskId: T2, copies: MAX_COPIES, extraPackQty: '1', clientRequestId: crid() });
+  ok(over.ok === false && over.error === 'bad_copies' && /2 回に分けて/.test(over.message || ''),
+    `満杯 ${MAX_COPIES} 枚 + 端数 1 枚 は断る (実際に出る枚数で上限を見る — Codex PR #1224 R1 重要)`);
+  // 断った分は積まれていない
+  ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_print_jobs WHERE task_id = ?').get(T2).c === 1, '断ったジョブは残らない');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE id = ?').run(edge.job.id);   // 以降のテストのため片づける
 }
 
 

@@ -3655,6 +3655,11 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '端数の箱は 1 以上の整数だけ送る (空欄なら端数のラベルは出さない)');
   ok(/function renderPrintSum\(\)/.test(html) && /' = 合計 ' \+ total \+ ' 枚'/.test(html) && /\$\('#printBody'\)\.addEventListener\('input', renderPrintSum\);/.test(html),
     '「70 個 × 5 枚 ＋ 10 個 × 1 枚 = 合計 6 枚」を出して、入力を変えたら数え直す');
+  // 上限 50 枚は「実際に出る枚数」で見る。既定値を黙って 50 に切り詰めない (Codex PR #1224 R1 重要)
+  ok(/copies = Math\.max\(1, copies\);/.test(html) && !/copies = Math\.min\(50, Math\.max\(1, copies\)\);/.test(html),
+    '必要な箱の数が 50 を超えても黙って切り詰めない (違う枚数のラベルを出さない)');
+  ok(/if \(copies \+ \(extraRaw \? 1 : 0\) > 50\)/.test(html) && /const over = total > 50;/.test(html) && /\.psum\.over\{/.test(html),
+    '端数の 1 枚も数えて 50 枚を超えたら止める (案内も赤くする)');
   ok(/const n = j\.total_copies != null \? j\.total_copies : j\.copies;/.test(html), '札の枚数は端数の 1 枚を含めた実際の枚数');
 
   // 🏷 ボードのカードからも出せる (中原さん 2026-09-06)
