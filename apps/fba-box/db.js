@@ -457,6 +457,10 @@ export function createTables(d = getDB()) {
   addColumn('fbx_exports', 'sta_uploaded_by', 'TEXT');
   // 不足の内訳 (理由別 [{reason, qty}])。作業完了時の自動確定で既存の不足 (例: 破損 2) と混ざるときに理由を失わない (Codex R13 #2)
   addColumn('fbx_row_work', 'shortage_detail', 'TEXT');
+  // PR2.6-R1: 「確認した人」の由来。auto = 投入から自動で入った / manual = 人が選んだ (自動では動かさない)。
+  // 移行前からある値は source NULL = manual 扱い (勝手に消さない)
+  addColumn('fbx_row_work', 'check_worker_source', 'TEXT');
+  addColumn('fbx_row_work', 'check_worker_placement_id', 'INTEGER');
   addColumn('fbx_product_images', 'error_message', 'TEXT');   // 画像が出ない理由 (管理画面の診断)
   // 箱の中身が変わるたびに +1。読み合わせ画面が持っている版と違えばクローズを拒否する (Codex R18 #1)
   addColumn('fbx_boxes', 'content_version', 'INTEGER NOT NULL DEFAULT 0');
@@ -1251,7 +1255,7 @@ export function getRunState(runId) {
   const groups = d.prepare('SELECT * FROM fbx_pack_groups WHERE run_id = ? ORDER BY id').all(run.id);
   const rows = d.prepare(`SELECT w.*,
       COALESCE((SELECT SUM(p.qty) FROM fbx_placements p WHERE p.row_id = w.id AND p.revoked_at IS NULL), 0) AS placed,
-      rw.label_worker, rw.check_worker, rw.shortage_qty, rw.shortage_reason, rw.shortage_detail, rw.shortage_by,
+      rw.label_worker, rw.check_worker, rw.check_worker_source, rw.shortage_qty, rw.shortage_reason, rw.shortage_detail, rw.shortage_by,
       (SELECT i.image_url FROM fbx_product_images i WHERE i.fnsku = w.fnsku AND i.status = 'ok') AS image_url
     FROM fbx_rows w LEFT JOIN fbx_row_work rw ON rw.row_id = w.id
     WHERE w.run_id = ? ORDER BY w.pack_group_id, w.excel_row, w.picking_row_no, w.id`).all(run.id);
@@ -1500,8 +1504,10 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
       if (prev.request_hash !== requestHash) {
         return { ok: false, error: 'idempotency_conflict', message: '同じ操作IDで内容の違う記録が既にあります (画面を更新してやり直してください)' };
       }
+      // 再送 (応答喪失) でも新規成功と同じ形で返す — 画面が「誰が確認した人になったか」を
+      // 通信断のときだけ知らせられない、を防ぐ (Codex PR2.6-R4 medium#1)
       return { ok: true, already: true, placementId: prev.id, boxSeq: prev.box_seq,
-        placed: placedOf(d, prev.row_id) };
+        placed: placedOf(d, prev.row_id), ...currentCheckWorker(d, prev.row_id) };
     }
     const row = d.prepare('SELECT w.*, r.status AS run_status FROM fbx_rows w JOIN fbx_runs r ON r.id = w.run_id WHERE w.id = ?')
       .get(Number(rowId));
@@ -1548,15 +1554,64 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
     const placementId = Number(info.lastInsertRowid);
     d.prepare('UPDATE fbx_boxes SET content_version = content_version + 1 WHERE id = ?').run(box.id);
     bumpRunVersion(d, row.run_id);
+    // 確認した人がまだ空なら、入れた人を同じトランザクションで記録する (別POSTにしない)
+    const autoCheck = syncAutoCheckWorker(d, row.id, { runId: row.run_id, worker, deviceLabel });
     logEvent({ runId: row.run_id, action: 'placement_add', targetType: 'placement', targetId: placementId,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { rowId: row.id, boxId: box.id, boxNo: box.box_no, qty: q, expiry: exp, layer: lay, boxSeq: seq } }, d);
-    return { ok: true, placementId, boxSeq: seq, placed: placed + q, plannedQty: row.planned_qty, expiry: exp };
+    // 応答契約は冪等応答 (already) と同じ関数から作る — 移行前データ (source NULL) で
+    // 新規成功だけ 'manual' に化けていた (Codex PR2.6-R5 low#1)
+    return { ok: true, placementId, boxSeq: seq, placed: placed + q, plannedQty: row.planned_qty, expiry: exp,
+      ...currentCheckWorker(d, row.id) };
   }).immediate();
 }
 
 function placedOf(d, rowId) {
   return d.prepare('SELECT COALESCE(SUM(qty),0) q FROM fbx_placements WHERE row_id = ? AND revoked_at IS NULL').get(rowId).q;
+}
+
+/**
+ * 「確認した人」の自動記録 (Codex PR2.6-R1 high#1・#2 / medium#1)。
+ * 自動で入る値 = **その行に残っている一番古い有効な投入をした人**。投入・取消・数の修正と同じ
+ * トランザクションで呼ぶので (a) 他端末と競合して別の人の名前を上書きすることがなく、
+ * (b) 通信断で「入れた記録はあるのに確認した人が空」になることもない。
+ * 人が選んだ名前 (source='manual'。移行前からある値 = source NULL も含む) には触らない。
+ * 取消・数0への修正で有効な投入が 0 件になれば、自動で入れた分だけ消す。
+ */
+/** いまの「確認した人」と由来 (応答契約: 新規成功でも冪等再送でも同じ形を返すため) */
+function currentCheckWorker(d, rowId) {
+  const rw = d.prepare('SELECT check_worker, check_worker_source FROM fbx_row_work WHERE row_id = ?').get(rowId) || {};
+  return { checkWorker: rw.check_worker ?? null, checkWorkerSource: rw.check_worker_source ?? null };
+}
+
+function syncAutoCheckWorker(d, rowId, { runId, worker, deviceLabel } = {}) {
+  const rw = d.prepare('SELECT check_worker, check_worker_source, check_worker_placement_id FROM fbx_row_work WHERE row_id = ?').get(rowId);
+  const same = (checkWorker, source) => ({ checkWorker, source, changed: false });
+  if (rw?.check_worker && rw.check_worker_source !== 'auto') {
+    return same(rw.check_worker, rw.check_worker_source ?? 'manual');   // 人が選んだ名前は動かさない
+  }
+  const p = d.prepare(`SELECT id, worker_name FROM fbx_placements
+    WHERE row_id = ? AND revoked_at IS NULL AND worker_name IS NOT NULL AND worker_name != ''
+    ORDER BY id LIMIT 1`).get(rowId);
+  const name = p ? String(p.worker_name).slice(0, 30) : null;
+  const pid = p ? p.id : null;
+  if (!rw && name == null) return same(null, null);                                       // 記録も無く、消すものも無い
+  if (rw && (rw.check_worker ?? null) === name
+    && (rw.check_worker_placement_id ?? null) === pid) {
+    return same(name, name ? 'auto' : null);                                              // 変化なし (updated_at も動かさない)
+  }
+  d.prepare(`INSERT INTO fbx_row_work (row_id, check_worker, check_worker_source, check_worker_placement_id, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(row_id) DO UPDATE SET check_worker = excluded.check_worker,
+      check_worker_source = excluded.check_worker_source,
+      check_worker_placement_id = excluded.check_worker_placement_id,
+      updated_at = excluded.updated_at`)
+    .run(rowId, name, name ? 'auto' : null, pid, utcNow());
+  logEvent({ runId, action: 'row_check_worker_auto', targetType: 'row', targetId: rowId,
+    workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+    payload: { from: rw?.check_worker ?? null, to: name,
+      fromPlacementId: rw?.check_worker_placement_id ?? null, toPlacementId: pid } }, d);
+  return { checkWorker: name, source: name ? 'auto' : null, changed: true };
 }
 
 /**
@@ -1603,6 +1658,8 @@ export function revokePlacement({ placementId, byStaff = false, reason, worker, 
       .run(utcNow(), worker?.display_name || null, reason ? String(reason).slice(0, 200) : null, p.id);
     d.prepare('UPDATE fbx_boxes SET content_version = content_version + 1 WHERE id = ?').run(p.box_id);
     bumpRunVersion(d, p.run_id);
+    // 自動で入った確認担当は、取消のあとに残っている投入に合わせ直す (0件なら消す)。人が選んだ名前は残す
+    syncAutoCheckWorker(d, p.row_id, { runId: p.run_id, worker, deviceLabel });
     // 監査: 誰が (worker) どの端末から (deviceLabel) 誰の記録を (originDevice) 取り消したか (Codex R17 #3)
     logEvent({ runId: p.run_id, action: 'placement_revoke', targetType: 'placement', targetId: p.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
@@ -1700,13 +1757,20 @@ export function setRowWorkers({ rowId, labelWorker, checkWorker, worker, deviceL
     if (excluded) return excluded;
     const label = labelWorker === undefined ? undefined : (labelWorker ? String(labelWorker).slice(0, 30) : null);
     const check = checkWorker === undefined ? undefined : (checkWorker ? String(checkWorker).slice(0, 30) : null);
-    d.prepare(`INSERT INTO fbx_row_work (row_id, label_worker, check_worker, updated_at) VALUES (?, ?, ?, ?)
+    // 人が選んだ名前は source='manual' = 以後 syncAutoCheckWorker が動かさない。「— 消す —」で
+    // 空にしたときは source も消す (次に入れた人が自動で入るようになる)
+    const checkSource = check === undefined ? null : (check ? 'manual' : null);
+    const setCheck = check === undefined ? 0 : 1;
+    d.prepare(`INSERT INTO fbx_row_work (row_id, label_worker, check_worker, check_worker_source, check_worker_placement_id, updated_at)
+      VALUES (?, ?, ?, ?, NULL, ?)
       ON CONFLICT(row_id) DO UPDATE SET
         label_worker = CASE WHEN ? THEN excluded.label_worker ELSE fbx_row_work.label_worker END,
         check_worker = CASE WHEN ? THEN excluded.check_worker ELSE fbx_row_work.check_worker END,
+        check_worker_source = CASE WHEN ? THEN excluded.check_worker_source ELSE fbx_row_work.check_worker_source END,
+        check_worker_placement_id = CASE WHEN ? THEN NULL ELSE fbx_row_work.check_worker_placement_id END,
         updated_at = excluded.updated_at`)
-      .run(row.id, label === undefined ? null : label, check === undefined ? null : check, utcNow(),
-        label === undefined ? 0 : 1, check === undefined ? 0 : 1);
+      .run(row.id, label === undefined ? null : label, check === undefined ? null : check, checkSource, utcNow(),
+        label === undefined ? 0 : 1, setCheck, setCheck, setCheck);
     logEvent({ runId: row.run_id, action: 'row_workers', targetType: 'row', targetId: row.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { labelWorker: label, checkWorker: check } }, d);
@@ -2140,7 +2204,9 @@ export function exportReadiness(runId) {
     }
   }
 
-  const unchecked = rows.filter((r) => !r.check_worker);
+  // 除外行 (Excel 差し替えで retired / Excel に無い picking_only) は iPad に出ず担当も付けられない →
+  // 解消できない警告を出さない (Codex PR2.6-R2 medium#1)
+  const unchecked = rows.filter((r) => !EXCLUDED_ROW_STATES.includes(r.match_state) && !r.check_worker);
   if (unchecked.length > 0) warnings.push({ code: 'unchecked_rows', message: `確認担当が未記録の商品が ${unchecked.length} 行あります`, rows: unchecked.map(rowBrief) });
   const shortages = rows.filter((r) => r.shortage_qty > 0);
   if (shortages.length > 0) warnings.push({ code: 'shortage_rows', message: `送る数を予定から修正した商品が ${shortages.length} 行あります (修正前 → 修正後と理由を確認。Excel の数量は入れた分だけ。STA 側の予定数量との差は Amazon 側で調整)`, rows: shortages.map(rowBrief) });
