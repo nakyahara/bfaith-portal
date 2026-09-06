@@ -90,7 +90,7 @@
                 <button class="btn-sm run-activate" data-id="<%= r.id %>">✅ 有効化 (iPadに出す)</button>
               <% } %>
               <% if (r.status === 'active' || r.status === 'done') { %>
-                <button class="btn-sm run-images" data-id="<%= r.id %>">🖼 画像</button>
+                <button class="btn-sm run-images" data-id="<%= r.id %>">🖼 画像・⚖ 重さ</button>
                 <button class="btn-sm run-excel" data-id="<%= r.id %>">📎 Excel添付</button>
                 <button class="btn-sm run-export" data-id="<%= r.id %>">📤 Excel出力</button>
                 <a class="btn-sm" href="<%= base %>/print/boxes?run=<%= r.id %>" target="_blank">🖨 箱札</a>
@@ -183,6 +183,20 @@
     </div>
 
     <div class="fbx-box">
+      <h2>⚖ 1箱の重さのルール</h2>
+      <p class="hint">
+        目標を超えると iPad が黄色で知らせます (閉じられます)。上限を超えると<b>作業者だけでは閉じられません</b> (職員の PIN で承認すれば閉じられる)。
+        変更は<b>これから始める納品回</b>から効きます — 作業中の回は開始時のルールのまま (途中で判定が変わらないように)。
+      </p>
+      <div class="row">
+        <label>目標 (黄警告) <input type="number" id="wr-target" value="<%= Math.round(weightRules.target_g / 1000 * 10) / 10 %>" step="0.1" style="width:80px"> kg</label>
+        <label>上限 (ブロック) <input type="number" id="wr-limit" value="<%= Math.round(weightRules.limit_g / 1000 * 10) / 10 %>" step="0.1" style="width:80px"> kg</label>
+        <button id="wr-save">保存</button>
+      </div>
+      <div class="msg" id="wr-msg"></div>
+    </div>
+
+    <div class="fbx-box">
       <h2>📱 iPad の登録</h2>
       <p class="hint">
         「登録コードを発行」→ iPad で <code><%= base %>/enroll</code> を開いて6桁を入力。コードは<b>10分・1回</b>だけ有効。
@@ -271,7 +285,7 @@
       setTimeout(() => location.reload(), j.issues.length > 0 ? 8000 : 1500);
     });
 
-    // 商品画像の状態 (なぜ出ないか) と取り直し
+    // 商品画像・参考単重の状態 (なぜ出ないか) と取り直し (どちらも miniPC の同じ呼び出しで取れる)
     document.querySelectorAll('.run-images').forEach(b => b.addEventListener('click', async () => {
       const runId = Number(b.dataset.id);
       const out = $('#run-detail-out');
@@ -280,20 +294,26 @@
       const j = await r.json().catch(() => ({ ok: false }));
       if (!j.ok) { out.innerHTML = `<p class="msg err">${escH(j.message || '読み込めませんでした')}</p>`; return; }
       const lr = j.lastRun;
-      out.innerHTML = `<h3 style="margin:14px 0 6px">🖼 商品画像 — 回 #${runId}</h3>
+      out.innerHTML = `<h3 style="margin:14px 0 6px">🖼 商品画像・⚖ 単重 — 回 #${runId}</h3>
         <p class="hint">
           設定: ${j.configured ? '✅ miniPC 接続 (WAREHOUSE_SERVICE_TOKEN あり)' : '<b class="ng">⛔ WAREHOUSE_SERVICE_TOKEN が未設定 — Render の環境変数を確認してください</b>'} / ${escH(j.warehouseUrl)}<br>
           SKU属性 (FNSKU→ASIN): ${j.attrs.error ? `<b class="ng">読めません: ${escH(j.attrs.error)}</b>` : `${j.attrs.count} 件`}<br>
           画像あり <b>${j.counts.withImage}</b> / ${j.counts.total} 商品 ${j.counts.noAsin ? `<b class="ng">(ASIN 不明 ${j.counts.noAsin})</b>` : ''}<br>
-          ${lr ? `直近の取得 (${escH((lr.at || '').slice(11, 16))}): ${lr.skipped ? `skip=${escH(lr.skipped)} ${escH(lr.message || lr.error || '')}` : `取得${lr.fetched} / 画像なし${lr.none} / 失敗${lr.failed}${lr.noAsin ? ` (ASIN不明 ${lr.noAsin})` : ''}`}${(lr.errors || []).length ? '<br>' + lr.errors.map(escH).join('<br>') : ''}` : '(まだ取得していません)'}
+          単重あり <b>${j.counts.withWeight}</b> / ${j.counts.total} 商品 (うち実測 ${j.counts.measured})
+            ${j.counts.withWeight < j.counts.total ? `<b class="ng">— 残り ${j.counts.total - j.counts.withWeight} 商品は箱の推定重量に入りません</b>` : ''}<br>
+          ${lr ? `直近の取得 (${escH((lr.at || '').slice(11, 16))}): ${lr.skipped ? `skip=${escH(lr.skipped)} ${escH(lr.message || lr.error || '')}` : `取得${lr.fetched} / 画像なし${lr.none} / 失敗${lr.failed}${lr.noAsin ? ` (ASIN不明 ${lr.noAsin})` : ''} / 単重${lr.weighed ?? '-'}`}${(lr.errors || []).length ? '<br>' + lr.errors.map(escH).join('<br>') : ''}` : '(まだ取得していません)'}
         </p>
-        ${j.counts.withImage < j.counts.total - j.counts.noAsin ? '<p class="hint">未取得の商品は裏で取りに行っています (1商品 0.6 秒)。しばらくして「🖼 画像」をもう一度開くと増えます。急ぐときは下のボタン。</p>' : ''}
+        <p class="hint">単重 = 実測 (現場が iPad で「何個で何g」を量った値) が最優先。無ければ Amazon の梱包重量 (0.01kg 単位なので軽い商品では粗い)。どちらも無い商品は推定から外れ、iPad に「重量不明 N点を除く」と出ます。</p>
+        ${j.counts.withImage < j.counts.total - j.counts.noAsin ? '<p class="hint">未取得の商品は裏で取りに行っています (1商品 0.6 秒)。しばらくして「🖼 画像・⚖ 重さ」をもう一度開くと増えます。急ぐときは下のボタン。</p>' : ''}
         <div class="row"><button id="img-refresh">🔄 今すぐ取り直す</button></div>
-        <table class="fbx-list" style="margin-top:8px"><tr><th>画像</th><th>FNSKU</th><th>SKU</th><th>ASIN</th><th>状態</th></tr>
+        <table class="fbx-list" style="margin-top:8px"><tr><th>画像</th><th>FNSKU</th><th>SKU</th><th>ASIN</th><th>1個の重さ</th><th>状態</th></tr>
         ${j.items.map(x => `<tr>
           <td>${x.imageUrl ? `<img src="${escH(x.imageUrl)}" referrerpolicy="no-referrer" style="width:40px;height:40px;object-fit:contain">` : '—'}</td>
           <td><code>${escH(x.fnsku)}</code></td><td>${escH(x.sku || '')}</td>
           <td>${x.asin ? `${escH(x.asin)} <small>(${escH(x.asinFrom)})</small>` : '<b class="ng">不明</b>'}</td>
+          <td>${x.unitG > 0
+            ? `${x.unitG} g <small>${x.weightSource === 'measured' ? `(実測${x.measCount > 1 ? ` ${x.measCount}件` : ''})` : '(参考)'}</small>`
+            : `<b class="ng">未登録</b>${x.refError ? ` <small>${escH(x.refError)}</small>` : ''}`}</td>
           <td>${x.cache ? `${escH(x.cache.status)}${x.cache.error_message ? ' — ' + escH(x.cache.error_message) : ''}` : '未取得'}</td></tr>`).join('')}
         </table>`;
       $('#img-refresh').addEventListener('click', async () => {
@@ -303,7 +323,7 @@
         const skipJa = { in_flight: 'いま取得中です', not_configured: 'miniPC への接続が未設定です', throttled: '少し前に取得したばかりです', error: 'エラー' };
         alert(jj.ok
           ? (jj.result.skipped ? `${skipJa[jj.result.skipped] || jj.result.skipped}${jj.result.message ? '\n' + jj.result.message : ''}${jj.result.error ? '\n' + jj.result.error : ''}`
-            : `取得: ${jj.result.fetched} / 画像なし: ${jj.result.none} / 失敗: ${jj.result.failed}${jj.result.noAsin ? ` (ASIN不明 ${jj.result.noAsin})` : ''}${jj.result.remaining ? `\nまだ ${jj.result.remaining} 件残っています。もう一度押してください` : ''}`)
+            : `画像: ${jj.result.fetched} / 画像なし: ${jj.result.none} / 単重: ${jj.result.weighed} / 単重なし: ${jj.result.noWeight} / 失敗: ${jj.result.failed}${jj.result.noAsin ? ` (ASIN不明 ${jj.result.noAsin})` : ''}${jj.result.remaining ? `\nまだ ${jj.result.remaining} 件残っています。もう一度押してください` : ''}`)
           : (jj.message || '失敗'));
         b.click();
       });
@@ -480,6 +500,14 @@
       setMsg($('#m-msg'), j.ok ? 'ok' : 'err', j.ok ? '保存しました' : j.message);
       if (j.ok) setTimeout(() => location.reload(), 600);
     }));
+
+    // 1箱の重さのルール (kg で入力 → g で保存)
+    $('#wr-save')?.addEventListener('click', async () => {
+      const target = parseFloat($('#wr-target').value), limit = parseFloat($('#wr-limit').value);
+      if (!(target > 0) || !(limit > 0)) return setMsg($('#wr-msg'), 'err', '目標・上限を kg で入れてください');
+      const j = await post('/admin/weight-rules', { target_g: Math.round(target * 1000), limit_g: Math.round(limit * 1000) });
+      setMsg($('#wr-msg'), j.ok ? 'ok' : 'err', j.ok ? `保存しました (目標 ${target}kg / 上限 ${limit}kg)。これから始める納品回に効きます` : j.message);
+    });
 
     // 作業者
     $('#w-add')?.addEventListener('click', async () => {

@@ -1092,18 +1092,22 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
   });
   // 商品画像: キャッシュ + images.js (fetcher / 属性源を差し替え)
   const img = await import('../apps/fba-box/images.js');
-  t('listRowsNeedingImages / upsertProductImage / getRunState の image_url / URL 検証', () => {
-    const need = db.listRowsNeedingImages(c.runId);
+  t('listRowsNeedingCatalog / upsertProductImage / getRunState の image_url / URL 検証', () => {
+    const need = db.listRowsNeedingCatalog(c.runId);
     assert.deepEqual(need.map((x) => x.fnsku).sort(), ['X0FIN00001', 'X0FIN00002']);
     db.upsertProductImage({ fnsku: 'X0FIN00001', asin: 'B0TEST0001', url: 'https://m.media-amazon.com/images/I/test.jpg', status: 'ok' });
-    assert.deepEqual(db.listRowsNeedingImages(c.runId).map((x) => x.fnsku), ['X0FIN00002']);
+    // PR3: 画像が入っても参考単重がまだなら、その商品はまだ取得対象 (1回の呼び出しで両方埋める)
+    assert.deepEqual(db.listRowsNeedingCatalog(c.runId).map((x) => x.fnsku).sort(), ['X0FIN00001', 'X0FIN00002']);
+    db.upsertWeightRef({ fnsku: 'X0FIN00001', asin: 'B0TEST0001', weightG: 250, raw: '0.25', status: 'ok' });
+    assert.deepEqual(db.listRowsNeedingCatalog(c.runId).map((x) => x.fnsku), ['X0FIN00002']);
     assert.equal(db.getRunState(c.runId).rows.find((r) => r.fnsku === 'X0FIN00001').image_url, 'https://m.media-amazon.com/images/I/test.jpg');
     db.upsertProductImage({ fnsku: 'X0FIN00002', asin: null, url: null, status: 'error' });
-    assert.deepEqual(db.listRowsNeedingImages(c.runId), [], 'error は翌日まで再試行しない');
-    assert.deepEqual(db.listRowsNeedingImages(c.runId, { retryAfterMs: 0 }).map((x) => x.fnsku), ['X0FIN00002']);
+    db.upsertWeightRef({ fnsku: 'X0FIN00002', asin: null, weightG: null, status: 'error' });
+    assert.deepEqual(db.listRowsNeedingCatalog(c.runId), [], 'error は翌日まで再試行しない');
+    assert.deepEqual(db.listRowsNeedingCatalog(c.runId, { retryAfterMs: 0 }).map((x) => x.fnsku), ['X0FIN00002']);
     // 行の asin がキャッシュの asin と違えば (Excel 差し替えで別商品) 取り直す
     db.getDB().prepare('UPDATE fbx_rows SET asin = ? WHERE fnsku = ?').run('B0OTHER001', 'X0FIN00001');
-    assert.deepEqual(db.listRowsNeedingImages(c.runId).map((x) => x.fnsku), ['X0FIN00001']);
+    assert.deepEqual(db.listRowsNeedingCatalog(c.runId).map((x) => x.fnsku), ['X0FIN00001']);
     db.getDB().prepare('UPDATE fbx_rows SET asin = NULL WHERE fnsku = ?').run('X0FIN00001');
     // miniPC の実物の応答は { ok, result: { image } }。包み方とキー名の取り違えで全商品「画像なし」になった 2026-09-03 の再発防止
     assert.equal(img.pickImageUrl({ ok: true, result: { asin: 'B0', image: 'https://m.media-amazon.com/images/I/r.jpg' } }), 'https://m.media-amazon.com/images/I/r.jpg');
@@ -1119,28 +1123,39 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
   });
   const calls = [];
   img._setAttrsSource(async () => [{ amazon_sku: 'sku-f2', asin: 'B0TEST0002', fnsku: 'X0FIN00002' }, { amazon_sku: 'sku-x', asin: 'B0TEST0003', fnsku: 'X0FIN00003' }]);
-  img._setFetcher(async (asin) => { calls.push(asin); if (asin === 'B0TEST0003') throw new Error('boom'); return asin === 'B0TEST0002' ? 'https://m.media-amazon.com/images/I/2.jpg' : null; });
+  // 応答は miniPC の実物と同じ形 { ok, result: { image, dimensions: { weight: kg文字列 } } }
+  img._setFetcher(async (asin) => {
+    calls.push(asin);
+    if (asin === 'B0TEST0003') throw new Error('boom');
+    return asin === 'B0TEST0002'
+      ? { ok: true, result: { image: 'https://m.media-amazon.com/images/I/2.jpg', dimensions: { weight: '0.03' } } }
+      : { ok: true, result: { image: null, dimensions: { weight: '-' } } };
+  });
   db.upsertProductImage({ fnsku: 'X0FIN00002', asin: null, url: null, status: 'error' });
   db.getDB().prepare(`UPDATE fbx_product_images SET fetched_at = '2020-01-01T00:00:00.000Z' WHERE fnsku = 'X0FIN00002'`).run();
   process.env.WAREHOUSE_SERVICE_TOKEN = 'test-token';   // configured 扱い (fetcher は差し替え済みなので外には出ない)
   const notConf0 = process.env.WAREHOUSE_SERVICE_TOKEN;
-  const res1 = await img.ensureRunImages(c.runId, { force: true });
-  const again = await img.ensureRunImages(c.runId);
-  t('ensureRunImages: FNSKU/SKU → ASIN を引いて取得し ok/none/error をキャッシュ。スロットルで連続実行は skip', () => {
+  const res1 = await img.ensureRunCatalog(c.runId, { force: true });
+  const again = await img.ensureRunCatalog(c.runId);
+  t('ensureRunCatalog: FNSKU/SKU → ASIN を引いて画像と参考単重を1回で取得。スロットルで連続実行は skip', () => {
     assert.ok(notConf0);
     assert.equal(res1.total, 1, JSON.stringify(res1));
     assert.equal(res1.fetched, 1);
-    assert.deepEqual(calls, ['B0TEST0002']);
+    assert.equal(res1.weighed, 1, '同じ応答から単重も取る');
+    assert.equal(db.getRunState(c.runId).weights.X0FIN00002.unitG, 30, '0.03kg → 30g');
+    assert.equal(db.getRunState(c.runId).weights.X0FIN00002.source, 'catalog');
+    assert.deepEqual(calls, ['B0TEST0002'], '画像と単重で2回叩かない');
     assert.equal(db.getRunState(c.runId).rows.find((r) => r.fnsku === 'X0FIN00002').image_url, 'https://m.media-amazon.com/images/I/2.jpg');
     assert.equal(again.skipped, 'throttled');
   });
   const c3 = db.getRunBySource(401);
-  const res3 = await img.ensureRunImages(c3.id, { force: true });
+  const res3 = await img.ensureRunCatalog(c3.id, { force: true });
   delete process.env.WAREHOUSE_SERVICE_TOKEN;
-  const notConf = await img.ensureRunImages(c3.id);
-  t('ensureRunImages: 取得失敗は error として記録 (作業は止めない)。未設定なら skip', () => {
+  const notConf = await img.ensureRunCatalog(c3.id);
+  t('ensureRunCatalog: 取得失敗は error として記録 (作業は止めない)。未設定なら skip', () => {
     assert.equal(res3.failed, 1, JSON.stringify(res3));
     assert.equal(db.getDB().prepare(`SELECT status FROM fbx_product_images WHERE fnsku = 'X0FIN00003'`).get().status, 'error');
+    assert.equal(db.getDB().prepare(`SELECT status FROM fbx_weight_refs WHERE fnsku = 'X0FIN00003'`).get().status, 'error');
     assert.equal(notConf.skipped, 'not_configured');
   });
   // 「今すぐ取り直す」を取得中に押しても in_flight で弾かれず、終わるのを待ってから実行する (9/3 実機で in_flight 表示)
@@ -1149,10 +1164,10 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
   db.getDB().prepare(`DELETE FROM fbx_product_images WHERE fnsku IN ('X0FIN00001','X0FIN00002')`).run();
   img._setAttrsSource(async () => [{ amazon_sku: 'sku-f1', asin: 'B0SLOW0001', fnsku: 'X0FIN00001' }, { amazon_sku: 'sku-f2', asin: 'B0SLOW0002', fnsku: 'X0FIN00002' }]);
   let slowCalls = 0;
-  img._setFetcher(async () => { slowCalls++; await new Promise((r) => setTimeout(r, 200)); return 'https://m.media-amazon.com/images/I/slow.jpg'; });
-  const [r1, r2] = await Promise.all([img.ensureRunImages(c.runId, { force: true }), img.ensureRunImages(c.runId, { force: true })]);
+  img._setFetcher(async () => { slowCalls++; await new Promise((r) => setTimeout(r, 200)); return { ok: true, result: { image: 'https://m.media-amazon.com/images/I/slow.jpg', dimensions: { weight: '0.10' } } }; });
+  const [r1, r2] = await Promise.all([img.ensureRunCatalog(c.runId, { force: true }), img.ensureRunCatalog(c.runId, { force: true })]);
   delete process.env.WAREHOUSE_SERVICE_TOKEN;
-  t('ensureRunImages: 取得中に「今すぐ取り直す」を押しても in_flight で弾かず、待ってから実行する', () => {
+  t('ensureRunCatalog: 取得中に「今すぐ取り直す」を押しても in_flight で弾かず、待ってから実行する', () => {
     assert.equal(r1.skipped, undefined, JSON.stringify(r1));
     assert.equal(r2.skipped, undefined, JSON.stringify(r2));
     assert.equal(r1.fetched + r2.fetched, 2, '2 商品を取得 (二重取得しない)');
@@ -1160,6 +1175,150 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     assert.equal(db.getRunState(c.runId).rows.filter((x) => x.image_url).length >= 1, true);
   });
   img._resetImageState();
+}
+
+console.log('■ PR3: 重量補助 (参考単重・実測・推定・上限)');
+{
+  const imgW = await import('../apps/fba-box/images.js');
+  t('pickPackageWeightG: miniPC の kg 文字列 → 1個あたり g。"-"・0・大きすぎる値は「単重なし」', () => {
+    // 実物の応答 (2026-09-06 miniPC で確認): dimensions.weight はポンド由来の kg 文字列 (小数2桁)
+    assert.equal(imgW.pickPackageWeightG({ ok: true, result: { dimensions: { weight: '0.02' } } }).g, 20);
+    assert.equal(imgW.pickPackageWeightG({ ok: true, result: { dimensions: { weight: '1.5' } } }).g, 1500);
+    assert.equal(imgW.pickPackageWeightG({ dimensions: { weight: '0.25' } }).g, 250, 'result の入れ子でなくても読む');
+    assert.equal(imgW.pickPackageWeightG({ result: { dimensions: { weight: '-' } } }).g, null);
+    assert.equal(imgW.pickPackageWeightG({ result: { dimensions: { weight: '0' } } }).g, null);
+    assert.equal(imgW.pickPackageWeightG({ result: { dimensions: { weight: '250' } } }).g, null, '1個250kg = 単位取り違えの保険');
+    assert.equal(imgW.pickPackageWeightG({ result: {} }).g, null);
+    assert.equal(imgW.pickPackageWeightG(null).g, null);
+  });
+
+  const mkSheets = (rows) => [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows }];
+  const c = db.createRunFromPicking({ pickingRun: { id: 500, delivery_date: '2026-10-01' }, planSheets: mkSheets([
+    { no: 1, sku: 'sku-w1', fnsku: 'X0WGT00001', productName: '重さのわかる商品', qty: '25' },
+    { no: 2, sku: 'sku-w2', fnsku: 'X0WGT00002', productName: '重さ不明の商品', qty: '4' },
+  ]), createdBy: 't' });
+  const st0 = db.getRunState(c.runId);
+  const gid = st0.groups[0].id;
+  const rA = st0.rows.find((r) => r.fnsku === 'X0WGT00001'), rB = st0.rows.find((r) => r.fnsku === 'X0WGT00002');
+  const estOf = (boxId) => db.getRunState(c.runId).boxes.find((b) => b.id === boxId).est;
+
+  t('納品回の開始時に重量ルールを焼き付ける (目標28kg / 上限30kg)', () => {
+    const run = db.getRun(c.runId);
+    assert.equal(run.weight_target_g, 28000);
+    assert.equal(run.weight_limit_g, 30000);
+    assert.deepEqual(db.getRunState(c.runId).weightLimits, { targetG: 28000, limitG: 30000, snapshotted: true });
+  });
+
+  t('参考単重 → 採用値 (catalog)。実測「10個で2050g」を入れると実測が勝ち、取り消すと参考値に戻る', () => {
+    db.upsertWeightRef({ fnsku: 'X0WGT00001', asin: 'B0W1', weightG: 200, raw: '0.20', status: 'ok' });
+    assert.equal(db.getRunState(c.runId).weights.X0WGT00001.unitG, 200);
+    assert.equal(db.getRunState(c.runId).weights.X0WGT00001.source, 'catalog');
+    const m = db.addWeightMeasurement({ fnsku: 'X0WGT00001', sampleQty: 10, totalG: 2050, worker: member, deviceLabel: 'iPad', runId: c.runId });
+    assert.equal(m.ok, true);
+    assert.equal(m.unitG, 205, 'まとめて量って個数で割る');
+    let cur = db.getRunState(c.runId).weights.X0WGT00001;
+    assert.equal(cur.unitG, 205);
+    assert.equal(cur.source, 'measured');
+    assert.equal(cur.sampleQty, 10);
+    assert.equal(db.revokeWeightMeasurement({ id: m.id, worker: staff }).ok, true);
+    assert.equal(db.getRunState(c.runId).weights.X0WGT00001.unitG, 200, '取り消したら参考値に戻る');
+    assert.equal(db.revokeWeightMeasurement({ id: m.id, worker: staff }).error, 'already_revoked');
+    assert.equal(db.listWeightMeasurements('X0WGT00001').length, 1, '取消も履歴には残す (逆算分析の生データ)');
+    assert.equal(db.addWeightMeasurement({ fnsku: 'X0WGT00001', sampleQty: 0, totalG: 100, worker: member }).error, 'bad_qty');
+    assert.equal(db.addWeightMeasurement({ fnsku: 'X0WGT00001', sampleQty: 5, totalG: -1, worker: member }).error, 'bad_weight');
+    assert.equal(db.addWeightMeasurement({ fnsku: '', sampleQty: 5, totalG: 100, worker: member }).error, 'bad_fnsku');
+  });
+
+  const bx = db.createBox({ packGroupId: gid, materialCode: 'box140', worker: member });   // 自重 900g
+  db.addPlacement({ runId: c.runId, rowId: rA.id, boxId: bx.boxId, qty: 10, worker: member, deviceKey: 'dev:w', requestId: 'w1' });
+
+  t('箱の推定 = Σ(数量×採用単重) + 資材の自重。単重不明の商品は足さず欠損数で返す', () => {
+    let e = estOf(bx.boxId);
+    assert.equal(e.estG, 2900, '10個×200g + 箱900g');
+    assert.equal(e.unknownQty, 0);
+    assert.equal(e.tareKnown, true);
+    assert.equal(e.complete, true, '「あと約N個」を出してよい状態');
+    db.addPlacement({ runId: c.runId, rowId: rB.id, boxId: bx.boxId, qty: 4, worker: member, deviceKey: 'dev:w', requestId: 'w2' });
+    e = estOf(bx.boxId);
+    assert.equal(e.estG, 2900, '単重不明の商品は推定に足さない');
+    assert.equal(e.unknownQty, 4, '欠損数を必ずセットで返す');
+    assert.equal(e.complete, false);
+    assert.equal(e.unknownItems[0].fnsku, 'X0WGT00002');
+  });
+
+  t('資材の自重が未登録の箱は tareKnown=false (推定を鵜呑みにさせない)', () => {
+    const bx2 = db.createBox({ packGroupId: gid, materialCode: 'other', worker: member });   // tare_g NULL
+    db.addPlacement({ runId: c.runId, rowId: rA.id, boxId: bx2.boxId, qty: 5, worker: member, deviceKey: 'dev:w', requestId: 'w3' });
+    const e = estOf(bx2.boxId);
+    assert.equal(e.estG, 1000, '中身だけ (5個×200g)');
+    assert.equal(e.tareKnown, false);
+    assert.equal(e.complete, false);
+  });
+
+  t('上限30kg超えは作業者だけでは閉じられない → 職員の承認で閉じられる。閉じた時点の推定を残す', () => {
+    const ng = db.closeBox({ boxId: bx.boxId, measuredKg: 31.2, worker: member, deviceLabel: 'iPad' });
+    assert.equal(ng.error, 'over_limit');
+    assert.equal(ng.limitKg, 30);
+    assert.equal(db.getBox(bx.boxId).status, 'open', '断ったときは閉じない');
+    const ok = db.closeBox({ boxId: bx.boxId, measuredKg: 31.2, worker: member, deviceLabel: 'iPad', staffApproved: true, approvedBy: '職員A' });
+    assert.equal(ok.ok, true);
+    assert.equal(ok.overLimit, true);
+    assert.equal(ok.overTarget, true);
+    assert.equal(ok.hint, null, '単重不明があるうちは乖離ヒントを出さない');
+    const b = db.getBox(bx.boxId);
+    assert.equal(b.est_weight_g_at_close, 2900);
+    assert.equal(b.est_unknown_qty_at_close, 4);
+    assert.equal(b.tare_g_at_close, 900);
+    const ev = db.listEvents(30, c.runId).find((e) => e.action === 'box_close');
+    assert.equal(JSON.parse(ev.payload).overLimit.approvedBy, '職員A');
+  });
+
+  t('実測が推定と大きく違うと乖離ヒント (500g以上 かつ 5%以上)。近ければ黙る', () => {
+    const bxOk = db.createBox({ packGroupId: gid, materialCode: 'box140', worker: member });
+    db.addPlacement({ runId: c.runId, rowId: rA.id, boxId: bxOk.boxId, qty: 5, worker: member, deviceKey: 'dev:w', requestId: 'w4' });
+    assert.equal(estOf(bxOk.boxId).estG, 1900);
+    const near = db.closeBox({ boxId: bxOk.boxId, measuredKg: 2.0, worker: member });   // 差 100g
+    assert.equal(near.ok, true);
+    assert.equal(near.hint, null);
+    const bxNg = db.createBox({ packGroupId: gid, materialCode: 'box140', worker: member });
+    db.addPlacement({ runId: c.runId, rowId: rA.id, boxId: bxNg.boxId, qty: 5, worker: member, deviceKey: 'dev:w', requestId: 'w5' });
+    const far = db.closeBox({ boxId: bxNg.boxId, measuredKg: 5, worker: member });      // 差 3100g
+    assert.equal(far.ok, true);
+    assert.ok(far.hint, '数量か単重が怪しいと知らせる');
+    assert.equal(far.hint.estG, 1900);
+    assert.ok(far.hint.message.includes('3.1kg'));
+  });
+
+  t('出荷前チェック: 上限を超えて閉じた箱は警告に出る (Amazon 側で受入不可・追加料金の可能性)', () => {
+    const rd = db.exportReadiness(c.runId);
+    const w = rd.warnings.find((x) => x.code === 'over_weight_limit');
+    assert.ok(w, JSON.stringify(rd.warnings.map((x) => x.code)));
+    assert.equal(w.boxes.length, 1);
+    assert.equal(w.boxes[0].weightKg, 31.2);
+  });
+
+  t('ルールの変更は作業中の回には効かない (開始時のスナップショット)。目標>上限は拒否', () => {
+    assert.equal(db.setWeightRules({ targetG: 30000, limitG: 20000, actor: 'admin' }).error, 'bad_value');
+    assert.equal(db.setWeightRules({ targetG: 20000, limitG: 22000, actor: 'admin' }).ok, true);
+    assert.equal(db.getRun(c.runId).weight_limit_g, 30000, '作業中の回は動かない');
+    assert.equal(db.closeBox({ boxId: db.createBox({ packGroupId: gid, materialCode: 'box140', worker: member }).boxId, measuredKg: 25, worker: member }).error, 'empty_box');
+    const c2 = db.createRunFromPicking({ pickingRun: { id: 501, delivery_date: '2026-10-02' }, planSheets: mkSheets([
+      { no: 1, sku: 'sku-w9', fnsku: 'X0WGT00009', productName: '新しい回の商品', qty: '2' },
+    ]), createdBy: 't' });
+    assert.equal(db.getRun(c2.runId).weight_limit_g, 22000, 'これから始める回は新しいルール');
+    db.setWeightRules({ targetG: 28000, limitG: 30000, actor: 'admin' });
+    assert.equal(db.getWeightRules().limit_g, 30000);
+  });
+
+  t('listRunWeights: 商品ごとの採用値・参考値・実測件数 (本社が「不明が何点か」を見る)', () => {
+    const list = db.listRunWeights(c.runId);
+    const a = list.find((x) => x.fnsku === 'X0WGT00001'), b = list.find((x) => x.fnsku === 'X0WGT00002');
+    assert.equal(a.unit_g, 200);
+    assert.equal(a.source, 'catalog');
+    assert.equal(a.ref_g, 200);
+    assert.equal(a.meas_count, 0, '取り消した実測は数えない');
+    assert.equal(b.unit_g, null, '単重不明');
+  });
 }
 
 console.log('■ PR2: fbx_boxes の void 移行');

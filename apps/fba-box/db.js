@@ -363,6 +363,64 @@ export function createTables(d = getDB()) {
       fetched_at TEXT NOT NULL
     );
 
+    -- ── 重量補助 (PR3・要件 §7)。商品キーは FNSKU (fbx_product_images と同じ。§7 の内部 product_id は、
+    --    このアプリが箱の中身を FNSKU でしか参照しないため見送り = 実装補足に記載) ──
+
+    -- 参考単重: Amazon カタログの梱包重量 (miniPC の SP-API 経由・画像と同じ 1 回の呼び出しで取る)。
+    -- weight_g は 1 個あたり g。応答は kg 小数2桁なので精度は 10g 単位 = 参考値 (実測が入れば実測が勝つ)
+    CREATE TABLE IF NOT EXISTS fbx_weight_refs (
+      fnsku         TEXT PRIMARY KEY,
+      asin          TEXT,
+      weight_g      REAL CHECK (weight_g IS NULL OR weight_g > 0),
+      raw_value     TEXT,
+      source        TEXT NOT NULL DEFAULT 'sp_api_package',
+      status        TEXT NOT NULL CHECK (status IN ('ok','none','error')),
+      error_message TEXT,
+      fetched_at    TEXT NOT NULL
+    );
+
+    -- 実測単重: 現場のはかりで「N個で M g」。1個あたりは unit_g (= total_g / sample_qty)。
+    -- 取消は revoked_at で論理化 (行は消さない = 逆算分析の生データ)
+    CREATE TABLE IF NOT EXISTS fbx_weight_measurements (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      fnsku        TEXT NOT NULL,
+      sample_qty   INTEGER NOT NULL CHECK (sample_qty >= 1),
+      total_g      REAL NOT NULL CHECK (total_g > 0),
+      unit_g       REAL NOT NULL CHECK (unit_g > 0),
+      method       TEXT NOT NULL DEFAULT 'scale' CHECK (method IN ('scale','manual')),
+      note         TEXT,
+      run_id       INTEGER REFERENCES fbx_runs(id),
+      worker_id    INTEGER,
+      worker_name  TEXT,
+      device_label TEXT,
+      measured_at  TEXT NOT NULL,
+      revoked_at   TEXT,
+      revoked_by   TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_fbx_wmeas_fnsku ON fbx_weight_measurements(fnsku);
+
+    -- 採用単重 (projection): 実測 (有効な最新) 優先 → 参考値。source = 採用根拠
+    CREATE TABLE IF NOT EXISTS fbx_weight_current (
+      fnsku      TEXT PRIMARY KEY,
+      unit_g     REAL NOT NULL CHECK (unit_g > 0),
+      source     TEXT NOT NULL CHECK (source IN ('measured','catalog')),
+      basis_id   INTEGER,
+      sample_qty INTEGER,
+      updated_at TEXT NOT NULL
+    );
+
+    -- 重量ルール (業務ルール = 資材マスタの物理情報とは分ける。要件 §7)。
+    -- target_g = 黄警告 (目標28kg) / limit_g = クローズをブロック (絶対上限30kg・職員PIN例外のみ)。
+    -- 納品回の開始時に fbx_runs へスナップショットするので、後でルールを変えても過去の回の判定は動かない
+    CREATE TABLE IF NOT EXISTS fbx_weight_rules (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_g       INTEGER NOT NULL CHECK (target_g > 0),
+      limit_g        INTEGER NOT NULL CHECK (limit_g > 0),
+      effective_from TEXT NOT NULL,
+      updated_by     TEXT,
+      updated_at     TEXT NOT NULL
+    );
+
     -- Excel 出力の版 (要件 F-7)。data_version = 出力時点の fbx_runs.data_version。
     -- snapshot_json = 書いたセルと箱↔Amazon箱番号の対応 (出力後の変更は run.data_version が進むので「旧版」と分かる)
     CREATE TABLE IF NOT EXISTS fbx_exports (
@@ -402,6 +460,13 @@ export function createTables(d = getDB()) {
   addColumn('fbx_product_images', 'error_message', 'TEXT');   // 画像が出ない理由 (管理画面の診断)
   // 箱の中身が変わるたびに +1。読み合わせ画面が持っている版と違えばクローズを拒否する (Codex R18 #1)
   addColumn('fbx_boxes', 'content_version', 'INTEGER NOT NULL DEFAULT 0');
+  // PR3 重量補助: 納品回ごとのルールのスナップショット (開始後にルールを変えても判定は動かさない)
+  addColumn('fbx_runs', 'weight_target_g', 'INTEGER');
+  addColumn('fbx_runs', 'weight_limit_g', 'INTEGER');
+  // PR3: クローズ時点の推定の生データ (実測との乖離ヒント + 後日の逆算分析。要件 §7 末尾)
+  addColumn('fbx_boxes', 'est_weight_g_at_close', 'REAL');
+  addColumn('fbx_boxes', 'est_unknown_qty_at_close', 'INTEGER');
+  addColumn('fbx_boxes', 'tare_g_at_close', 'INTEGER');
   // 2026-09-03: miniPC の応答キーを取り違えて (mainImage ← 実際は image) 全商品が「画像なし」になったキャッシュを捨てる。
   // 現行コードは none/error に必ず理由を書くので、理由が空の none = 旧バグの結果だけが消える (以後は 0 件)
   d.exec(`DELETE FROM fbx_product_images WHERE status = 'none' AND error_message IS NULL`);
@@ -422,6 +487,12 @@ export function createTables(d = getDB()) {
     ins.run('box140', '140サイズ段ボール', 900, 1);
     ins.run('box160', '160サイズ段ボール', 1200, 2);
     ins.run('other', 'その他', null, 9);
+  }
+
+  // 重量ルールの初期値 (要件 §7: 目標28kg = 黄警告 / 絶対上限30kg = クローズをブロック)
+  if (d.prepare('SELECT COUNT(*) c FROM fbx_weight_rules').get().c === 0) {
+    d.prepare(`INSERT INTO fbx_weight_rules (target_g, limit_g, effective_from, updated_by, updated_at)
+      VALUES (?, ?, ?, ?, ?)`).run(28000, 30000, utcNow(), 'system', utcNow());
   }
 }
 
@@ -445,6 +516,16 @@ export function safeLogEvent(entry, d) {
  */
 function bumpRunVersion(d, runId) {
   d.prepare('UPDATE fbx_runs SET data_version = data_version + 1 WHERE id = ?').run(Number(runId));
+}
+
+/**
+ * 納品回に重量ルール (目標・上限) を焼き付ける (要件 §7「run開始時に適用値をスナップショット」)。
+ * 既に入っている回は触らない = 作業中にルールを変えても判定は動かない
+ */
+function snapshotWeightRules(d, runId) {
+  const r = getWeightRules(d);
+  d.prepare(`UPDATE fbx_runs SET weight_target_g = COALESCE(weight_target_g, ?), weight_limit_g = COALESCE(weight_limit_g, ?) WHERE id = ?`)
+    .run(r.target_g, r.limit_g, Number(runId));
 }
 
 const safeJson = (s, def = null) => { try { return s == null ? def : JSON.parse(s); } catch { return def; } };
@@ -521,6 +602,7 @@ export function createRunFromPicking({ pickingRun, planSheets, createdBy, activa
       VALUES (?, ?, ?, ?, ?, ?, ?)`)
       .run(sourceRunId, pickingRun.delivery_date || null, title, activate ? 'active' : 'setup', createdBy || null, now, activate ? now : null);
     const runId = Number(run.lastInsertRowid);
+    if (activate) snapshotWeightRules(d, runId);
     const insGroup = d.prepare(`INSERT INTO fbx_pack_groups (run_id, sheet_name, display_name, source_slot_id, source_label) VALUES (?, ?, ?, ?, ?)`);
     const insRow = d.prepare(`INSERT INTO fbx_rows (run_id, pack_group_id, origin, seller_sku, fnsku, product_name, planned_qty, plan_no, source_slot_id, picking_row_no, picking_qty, match_state)
       VALUES (?, ?, 'picking', ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`);
@@ -736,6 +818,7 @@ export function activateRun(runId, actor) {
     if (run.status !== 'setup') return { ok: false, error: 'bad_status', message: `この納品回は ${run.status} のため有効化できません` };
     d.prepare(`UPDATE fbx_runs SET status = 'active', activated_at = ?, data_version = data_version + 1 WHERE id = ?`)
       .run(utcNow(), run.id);
+    snapshotWeightRules(d, run.id);
     logEvent({ runId: run.id, action: 'run_activate', targetType: 'run', targetId: run.id, deviceLabel: actor, ok: true }, d);
     return { ok: true };
   }).immediate();
@@ -843,15 +926,19 @@ export function finishRun({ runId, acknowledge = false, worker, deviceLabel }) {
 // ───────────────────────── 商品画像キャッシュ (images.js から使う) ─────────────────────────
 
 /** 納品回の行のうち画像が未取得 (または none/error で retryAfterMs 以上前) の FNSKU */
-export function listRowsNeedingImages(runId, { retryAfterMs = 24 * 3600 * 1000, limit = 80 } = {}) {
+export function listRowsNeedingCatalog(runId, { retryAfterMs = 24 * 3600 * 1000, limit = 80 } = {}) {
   const cutoff = new Date(Date.now() - retryAfterMs).toISOString();
+  // 画像と参考単重は miniPC の同じ 1 回の呼び出しで取れる (PR3) ので、どちらかが要る商品を1つの集合で返す。
   // 行の asin (Excel 添付で入る) とキャッシュの asin が違えば取り直す (Excel 差し替えで別商品になった — Codex R13 #4)
   return getDB().prepare(`SELECT w.fnsku, MAX(w.asin) AS asin, MAX(w.seller_sku) AS seller_sku FROM fbx_rows w
       LEFT JOIN fbx_product_images i ON i.fnsku = w.fnsku
+      LEFT JOIN fbx_weight_refs g ON g.fnsku = w.fnsku
       WHERE w.run_id = ? AND w.fnsku != '' AND w.match_state != 'retired'
         AND (i.fnsku IS NULL OR (i.status != 'ok' AND i.fetched_at <= ?)
-             OR (w.asin IS NOT NULL AND w.asin != '' AND i.asin IS NOT NULL AND UPPER(w.asin) != UPPER(i.asin)))
-      GROUP BY w.fnsku LIMIT ?`).all(Number(runId), cutoff, Number(limit));
+             OR (w.asin IS NOT NULL AND w.asin != '' AND i.asin IS NOT NULL AND UPPER(w.asin) != UPPER(i.asin))
+             OR g.fnsku IS NULL OR (g.status != 'ok' AND g.fetched_at <= ?)
+             OR (w.asin IS NOT NULL AND w.asin != '' AND g.asin IS NOT NULL AND UPPER(w.asin) != UPPER(g.asin)))
+      GROUP BY w.fnsku LIMIT ?`).all(Number(runId), cutoff, cutoff, Number(limit));
 }
 
 export function upsertProductImage({ fnsku, asin, url, status, error = null }) {
@@ -870,6 +957,213 @@ export function listProductImages(fnskus) {
   const stmt = getDB().prepare('SELECT * FROM fbx_product_images WHERE fnsku = ?');
   for (const f of list) { const r = stmt.get(f); if (r) out.push(r); }
   return out;
+}
+
+// ───────────────────────── 重量補助 (PR3・要件 §7) ─────────────────────────
+
+const round1 = (v) => Math.round(Number(v) * 10) / 10;
+const DEFAULT_RULES = { target_g: 28000, limit_g: 30000 };
+
+/** 現行の重量ルール (適用開始が今以前で最新のもの) */
+export function getWeightRules(d = getDB()) {
+  const r = d.prepare(`SELECT * FROM fbx_weight_rules WHERE effective_from <= ? ORDER BY effective_from DESC, id DESC LIMIT 1`).get(utcNow())
+    || d.prepare('SELECT * FROM fbx_weight_rules ORDER BY id DESC LIMIT 1').get();
+  return r || { ...DEFAULT_RULES, effective_from: null, updated_by: null, updated_at: null };
+}
+
+/** ルールの変更 (本社の管理画面)。履歴として1行足す (過去の回はスナップショットを見るので影響しない) */
+export function setWeightRules({ targetG, limitG, actor }) {
+  const t = Math.round(Number(targetG));
+  const l = Math.round(Number(limitG));
+  if (!Number.isFinite(t) || t <= 0 || !Number.isFinite(l) || l <= 0) {
+    return { ok: false, error: 'bad_value', message: '目標・上限は正の数 (g) で入れてください' };
+  }
+  if (t > l) return { ok: false, error: 'bad_value', message: '目標 (黄警告) は上限以下にしてください' };
+  if (l > 100000) return { ok: false, error: 'bad_value', message: '上限が大きすぎます (100kg まで)' };
+  const d = getDB();
+  d.prepare(`INSERT INTO fbx_weight_rules (target_g, limit_g, effective_from, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)`)
+    .run(t, l, utcNow(), actor || null, utcNow());
+  safeLogEvent({ action: 'weight_rules_set', targetType: 'rules', deviceLabel: actor || null, ok: true, payload: { targetG: t, limitG: l } });
+  return { ok: true, targetG: t, limitG: l };
+}
+
+/**
+ * 納品回に適用する重量ルール。開始時にスナップショットした値を使い、無ければ現行ルール
+ * (要件 §7「run開始時に適用値をスナップショット」)
+ */
+export function runWeightLimits(run) {
+  const cur = getWeightRules();
+  return {
+    targetG: Number(run?.weight_target_g) > 0 ? Number(run.weight_target_g) : cur.target_g,
+    limitG: Number(run?.weight_limit_g) > 0 ? Number(run.weight_limit_g) : cur.limit_g,
+    snapshotted: Number(run?.weight_target_g) > 0 && Number(run?.weight_limit_g) > 0,
+  };
+}
+
+/** 参考単重のキャッシュ更新 (weights は images と同じ取得ループから呼ばれる) */
+export function upsertWeightRef({ fnsku, asin, weightG, raw = null, status, error = null }) {
+  const g = Number(weightG) > 0 ? round1(weightG) : null;
+  const st = ['ok', 'none', 'error'].includes(status) ? status : (g ? 'ok' : 'none');
+  const key = String(fnsku).trim().toUpperCase();
+  getDB().prepare(`INSERT INTO fbx_weight_refs (fnsku, asin, weight_g, raw_value, source, status, error_message, fetched_at)
+    VALUES (?, ?, ?, ?, 'sp_api_package', ?, ?, ?)
+    ON CONFLICT(fnsku) DO UPDATE SET asin = COALESCE(excluded.asin, fbx_weight_refs.asin), weight_g = excluded.weight_g,
+      raw_value = excluded.raw_value, status = excluded.status, error_message = excluded.error_message, fetched_at = excluded.fetched_at`)
+    .run(key, asin || null, g, raw == null ? null : String(raw).slice(0, 60), st, error ? String(error).slice(0, 300) : null, utcNow());
+  recomputeWeightCurrent(key);
+}
+
+/**
+ * 採用単重の作り直し (projection)。実測 (有効な最新) → 参考値 の順。どちらも無ければ行を消す
+ * = 「単重不明」。実測値への自動昇格はしない (要件 §7: 逆算は保証しない)
+ */
+export function recomputeWeightCurrent(fnsku, d = getDB()) {
+  const key = String(fnsku).trim().toUpperCase();
+  if (!key) return null;
+  const m = d.prepare(`SELECT * FROM fbx_weight_measurements WHERE fnsku = ? AND revoked_at IS NULL
+    ORDER BY measured_at DESC, id DESC LIMIT 1`).get(key);
+  const ref = d.prepare(`SELECT * FROM fbx_weight_refs WHERE fnsku = ? AND status = 'ok' AND weight_g > 0`).get(key);
+  const chosen = m ? { unitG: m.unit_g, source: 'measured', basisId: m.id, sampleQty: m.sample_qty }
+    : (ref ? { unitG: ref.weight_g, source: 'catalog', basisId: null, sampleQty: null } : null);
+  if (!chosen) { d.prepare('DELETE FROM fbx_weight_current WHERE fnsku = ?').run(key); return null; }
+  d.prepare(`INSERT INTO fbx_weight_current (fnsku, unit_g, source, basis_id, sample_qty, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(fnsku) DO UPDATE SET unit_g = excluded.unit_g, source = excluded.source,
+      basis_id = excluded.basis_id, sample_qty = excluded.sample_qty, updated_at = excluded.updated_at`)
+    .run(key, chosen.unitG, chosen.source, chosen.basisId, chosen.sampleQty, utcNow());
+  return chosen;
+}
+
+/**
+ * 実測単重の登録 (中原さん要望「何個で何g」)。1個ずつ量ると軽い商品で誤差が大きいので、
+ * まとめて量って個数で割る。作業者の操作でよい (PIN 不要 — 数の訂正と同じ 9/3 の判断)
+ */
+export function addWeightMeasurement({ fnsku, sampleQty, totalG, method = 'scale', note = null, runId = null, worker, deviceLabel }) {
+  const key = String(fnsku || '').trim().toUpperCase();
+  if (!key) return { ok: false, error: 'bad_fnsku', message: '商品 (FNSKU) が分かりません' };
+  const n = Math.round(Number(sampleQty));
+  const total = Math.round(Number(totalG) * 10) / 10;
+  if (!Number.isInteger(n) || n < 1 || n > 9999) return { ok: false, error: 'bad_qty', message: '量った個数を正しく入れてください' };
+  if (!Number.isFinite(total) || total <= 0 || total > 200000) return { ok: false, error: 'bad_weight', message: '量った重さ (g) を正しく入れてください' };
+  const unit = round1(total / n);
+  if (unit <= 0) return { ok: false, error: 'bad_weight', message: '1個あたりが 0g になります。単位 (g) を確かめてください' };
+  const d = getDB();
+  const info = d.prepare(`INSERT INTO fbx_weight_measurements
+      (fnsku, sample_qty, total_g, unit_g, method, note, run_id, worker_id, worker_name, device_label, measured_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(key, n, total, unit, ['scale', 'manual'].includes(method) ? method : 'scale',
+      note ? String(note).slice(0, 200) : null, runId ? Number(runId) : null,
+      worker?.id || null, worker?.display_name || null, deviceLabel || null, utcNow());
+  recomputeWeightCurrent(key, d);
+  safeLogEvent({ runId: runId ? Number(runId) : null, action: 'weight_measure', targetType: 'product', targetId: null,
+    workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+    payload: { fnsku: key, sampleQty: n, totalG: total, unitG: unit, method } }, d);
+  return { ok: true, id: Number(info.lastInsertRowid), unitG: unit, sampleQty: n, totalG: total };
+}
+
+/** 実測の取消 (打ち間違い)。行は消さず revoked_at を立てて採用値を作り直す */
+export function revokeWeightMeasurement({ id, worker, deviceLabel }) {
+  const d = getDB();
+  const m = d.prepare('SELECT * FROM fbx_weight_measurements WHERE id = ?').get(Number(id));
+  if (!m) return { ok: false, error: 'not_found', message: '記録が見つかりません' };
+  if (m.revoked_at) return { ok: false, error: 'already_revoked', message: 'この記録は取消済みです' };
+  d.prepare('UPDATE fbx_weight_measurements SET revoked_at = ?, revoked_by = ? WHERE id = ?')
+    .run(utcNow(), worker?.display_name || deviceLabel || null, m.id);
+  const after = recomputeWeightCurrent(m.fnsku, d);
+  safeLogEvent({ runId: m.run_id, action: 'weight_measure_revoke', targetType: 'product', targetId: m.id,
+    workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
+    payload: { fnsku: m.fnsku, unitG: m.unit_g } }, d);
+  return { ok: true, current: after };
+}
+
+/** ある商品の実測履歴 (取消も含む。iPad・管理画面の「重さの記録」) */
+export function listWeightMeasurements(fnsku, limit = 20) {
+  return getDB().prepare(`SELECT * FROM fbx_weight_measurements WHERE fnsku = ? ORDER BY id DESC LIMIT ?`)
+    .all(String(fnsku || '').trim().toUpperCase(), Number(limit));
+}
+
+/** 納品回の商品ごとの単重 (採用値・参考値・実測件数)。管理画面の一覧と iPad の表示に使う */
+export function listRunWeights(runId) {
+  return getDB().prepare(`SELECT w.fnsku, MAX(w.product_name) AS product_name, MAX(w.plan_no) AS plan_no,
+      MAX(w.planned_qty) AS planned_qty,
+      c.unit_g, c.source, c.sample_qty, c.updated_at,
+      g.weight_g AS ref_g, g.status AS ref_status, g.error_message AS ref_error, g.fetched_at AS ref_at,
+      (SELECT COUNT(*) FROM fbx_weight_measurements m WHERE m.fnsku = w.fnsku AND m.revoked_at IS NULL) AS meas_count
+    FROM fbx_rows w
+    LEFT JOIN fbx_weight_current c ON c.fnsku = w.fnsku
+    LEFT JOIN fbx_weight_refs g ON g.fnsku = w.fnsku
+    WHERE w.run_id = ? AND w.fnsku != '' AND w.match_state != 'retired'
+    GROUP BY w.fnsku ORDER BY MAX(w.pack_group_id), MAX(w.excel_row), MAX(w.picking_row_no)`).all(Number(runId));
+}
+
+/**
+ * 箱の推定重量 = Σ(数量 × 採用単重) + 資材の自重。
+ * 単重不明の商品がある箱は「推定 21.4kg (重量不明 12点を除く)」と欠損数をセットで出す (要件 §7)
+ */
+export function boxWeightEstimates(runId, d = getDB()) {
+  const boxes = d.prepare(`SELECT b.id, b.material_code, m.tare_g FROM fbx_boxes b
+      JOIN fbx_pack_groups g ON g.id = b.pack_group_id
+      LEFT JOIN fbx_box_materials m ON m.code = b.material_code
+      WHERE g.run_id = ? AND b.status != 'void'`).all(Number(runId));
+  const items = d.prepare(`SELECT p.box_id, w.fnsku, MAX(w.product_name) AS product_name, SUM(p.qty) AS qty,
+      MAX(c.unit_g) AS unit_g, MAX(c.source) AS source
+    FROM fbx_placements p JOIN fbx_rows w ON w.id = p.row_id
+    LEFT JOIN fbx_weight_current c ON c.fnsku = w.fnsku
+    WHERE p.run_id = ? AND p.revoked_at IS NULL GROUP BY p.box_id, w.fnsku`).all(Number(runId));
+  const byBox = new Map();
+  for (const b of boxes) {
+    const tareG = Number.isFinite(Number(b.tare_g)) && b.tare_g != null ? Number(b.tare_g) : null;
+    byBox.set(b.id, { boxId: b.id, contentG: 0, tareG, tareKnown: tareG != null, estG: tareG || 0, unknownQty: 0, unknownItems: [] });
+  }
+  for (const it of items) {
+    const e = byBox.get(it.box_id);
+    if (!e) continue;
+    if (Number(it.unit_g) > 0) { e.contentG += Number(it.unit_g) * Number(it.qty); e.estG += Number(it.unit_g) * Number(it.qty); }
+    else { e.unknownQty += Number(it.qty); e.unknownItems.push({ fnsku: it.fnsku, productName: it.product_name, qty: Number(it.qty) }); }
+  }
+  for (const e of byBox.values()) {
+    e.contentG = round1(e.contentG);
+    e.estG = round1(e.estG);
+    e.complete = e.unknownQty === 0 && e.tareKnown;   // 「あと約N個」を出してよいのはこのときだけ
+  }
+  return byBox;
+}
+
+/** 1箱分の推定 (クローズ時の判定に使う。同じトランザクションの接続で読む) */
+export function estimateBoxWeight(boxId, d = getDB()) {
+  const b = d.prepare(`SELECT b.id, b.material_code, m.tare_g, g.run_id FROM fbx_boxes b
+      JOIN fbx_pack_groups g ON g.id = b.pack_group_id
+      LEFT JOIN fbx_box_materials m ON m.code = b.material_code WHERE b.id = ?`).get(Number(boxId));
+  if (!b) return null;
+  const items = d.prepare(`SELECT w.fnsku, MAX(w.product_name) AS product_name, SUM(p.qty) AS qty, MAX(c.unit_g) AS unit_g
+    FROM fbx_placements p JOIN fbx_rows w ON w.id = p.row_id
+    LEFT JOIN fbx_weight_current c ON c.fnsku = w.fnsku
+    WHERE p.box_id = ? AND p.revoked_at IS NULL GROUP BY w.fnsku`).all(b.id);
+  const tareG = Number.isFinite(Number(b.tare_g)) && b.tare_g != null ? Number(b.tare_g) : null;
+  let contentG = 0, unknownQty = 0;
+  const unknownItems = [];
+  for (const it of items) {
+    if (Number(it.unit_g) > 0) contentG += Number(it.unit_g) * Number(it.qty);
+    else { unknownQty += Number(it.qty); unknownItems.push({ fnsku: it.fnsku, productName: it.product_name, qty: Number(it.qty) }); }
+  }
+  return {
+    boxId: b.id, contentG: round1(contentG), tareG, tareKnown: tareG != null,
+    estG: round1(contentG + (tareG || 0)), unknownQty, unknownItems, complete: unknownQty === 0 && tareG != null,
+  };
+}
+
+/**
+ * 実測と推定の乖離ヒント (要件 §7)。絶対 500g 以上 かつ 相対 5% 以上のときだけ出す。
+ * 単重不明の商品や自重未登録の資材があるときは、そもそも推定が当てにならないので黙る
+ */
+export function weightMismatchHint(measuredG, est) {
+  if (!est || !est.complete || !(est.estG > 0)) return null;
+  const diff = Number(measuredG) - est.estG;
+  const abs = Math.abs(diff);
+  if (abs < 500 || abs / est.estG < 0.05) return null;
+  return {
+    diffG: round1(diff), estG: est.estG, measuredG: round1(measuredG),
+    message: `はかりの ${round1(measuredG / 1000)}kg と推定 ${round1(est.estG / 1000)}kg が ${round1(abs / 1000)}kg 違います。数量か単重のどちらかが怪しいので、中身をもう一度確かめてください`,
+  };
 }
 
 export function listRuns(limit = 30) {
@@ -906,6 +1200,15 @@ export function getRunState(runId) {
     WHERE p.run_id = ? AND p.revoked_at IS NULL ORDER BY p.box_id, p.box_seq`).all(run.id);
   const excelFiles = d.prepare(`SELECT id, original_name, sha256, fingerprint, uploaded_by, uploaded_at FROM fbx_excel_files WHERE run_id = ? ORDER BY id`).all(run.id);
   assignAmazonBoxNumbers(groups, boxes);
+  // PR3 重量補助: 箱ごとの推定 (Σ数量×採用単重 + 資材自重) と、商品ごとの採用単重・この回のルール
+  const estimates = boxWeightEstimates(run.id, d);
+  for (const b of boxes) b.est = estimates.get(b.id) || null;
+  const weights = {};
+  for (const w of d.prepare(`SELECT c.fnsku, c.unit_g, c.source, c.sample_qty FROM fbx_weight_current c
+      WHERE c.fnsku IN (SELECT fnsku FROM fbx_rows WHERE run_id = ?)`).all(run.id)) {
+    weights[w.fnsku] = { unitG: w.unit_g, source: w.source, sampleQty: w.sample_qty };
+  }
+  const weightLimits = runWeightLimits(run);
   const latest = d.prepare(`SELECT id, data_version, file_name, sha256, created_by, created_at
     FROM fbx_exports WHERE run_id = ? ORDER BY id DESC LIMIT 1`).get(run.id) || null;
   const exportState = {
@@ -914,7 +1217,7 @@ export function getRunState(runId) {
     staUploadedAt: run.sta_uploaded_at || null,
     staExportId: run.sta_export_id || null,
   };
-  return { run, groups, rows, boxes, placements, exportState, excelFiles };
+  return { run, groups, rows, boxes, placements, exportState, excelFiles, weights, weightLimits };
 }
 
 /**
@@ -968,8 +1271,13 @@ export function createBox({ packGroupId, materialCode, worker, deviceLabel }) {
   }).immediate();
 }
 
-/** 箱クローズ。実測重量kg必須 (Amazon Excel の箱重量欄になる)。読み合わせは画面側の責務 */
-export function closeBox({ boxId, measuredKg, closedReason, cushionLevel, worker, deviceLabel, expectedContentVersion = null }) {
+/**
+ * 箱クローズ。実測重量kg必須 (Amazon Excel の箱重量欄になる)。読み合わせは画面側の責務。
+ * PR3: 上限 (既定30kg) 超えは職員の承認 (staffApproved) が無いとブロック。閉じた時点の推定を
+ * 生データとして残し、推定と大きく違うときはヒントを返す (閉じること自体は止めない)
+ */
+export function closeBox({ boxId, measuredKg, closedReason, cushionLevel, worker, deviceLabel, expectedContentVersion = null,
+  staffApproved = false, approvedBy = null }) {
   // 桁は 1g (小数3桁) まで。Excel へはこの値をそのまま書く (書き込み側で丸めない — Codex PR2 #5)
   const kg = Math.round(Number(measuredKg) * 1000) / 1000;
   if (!Number.isFinite(kg) || kg <= 0 || kg > 200) {
@@ -982,7 +1290,7 @@ export function closeBox({ boxId, measuredKg, closedReason, cushionLevel, worker
   if (cushion && !['none', 'little', 'much'].includes(cushion)) return { ok: false, error: 'bad_cushion', message: '緩衝材の量が不正です' };
   const d = getDB();
   return d.transaction(() => {
-    const b = d.prepare(`SELECT b.*, g.run_id, r.status AS run_status FROM fbx_boxes b
+    const b = d.prepare(`SELECT b.*, g.run_id, r.status AS run_status, r.weight_target_g, r.weight_limit_g FROM fbx_boxes b
       JOIN fbx_pack_groups g ON g.id = b.pack_group_id JOIN fbx_runs r ON r.id = g.run_id WHERE b.id = ?`)
       .get(Number(boxId));
     if (!b) return { ok: false, error: 'not_found', message: '箱が見つかりません' };
@@ -996,13 +1304,31 @@ export function closeBox({ boxId, measuredKg, closedReason, cushionLevel, worker
     }
     const qty = d.prepare('SELECT COALESCE(SUM(qty),0) q FROM fbx_placements WHERE box_id = ? AND revoked_at IS NULL').get(b.id).q;
     if (qty === 0) return { ok: false, error: 'empty_box', message: '空の箱は閉じられません (使わない箱は職員が「箱を取消」してください)' };
-    d.prepare(`UPDATE fbx_boxes SET status = 'closed', measured_weight_kg = ?, closed_at = ?, closed_by = ?, closed_reason = ?, cushion_level = ? WHERE id = ?`)
-      .run(kg, utcNow(), worker?.display_name || null, reason, cushion, b.id);
+    // 絶対上限 (既定30kg) は Amazon の受入条件。実測で判定する — 推定は単重不明があると当てにならない
+    const limits = runWeightLimits(b);
+    const measuredG = Math.round(kg * 1000);
+    if (measuredG > limits.limitG && !staffApproved) {
+      return { ok: false, error: 'over_limit', limitKg: limits.limitG / 1000, measuredKg: kg,
+        message: `${kg}kg は 1箱の上限 ${limits.limitG / 1000}kg を超えています。中身を分けてください (どうしてもこのまま閉じるなら職員の承認が要ります)` };
+    }
+    const est = estimateBoxWeight(b.id, d);
+    d.prepare(`UPDATE fbx_boxes SET status = 'closed', measured_weight_kg = ?, closed_at = ?, closed_by = ?, closed_reason = ?, cushion_level = ?,
+        est_weight_g_at_close = ?, est_unknown_qty_at_close = ?, tare_g_at_close = ? WHERE id = ?`)
+      .run(kg, utcNow(), worker?.display_name || null, reason, cushion,
+        est ? est.estG : null, est ? est.unknownQty : null, est ? est.tareG : null, b.id);
     bumpRunVersion(d, b.run_id);
     logEvent({ runId: b.run_id, action: 'box_close', targetType: 'box', targetId: b.id,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
-      payload: { measuredKg: kg, closedReason: reason, cushionLevel: cushion, totalQty: qty } }, d);
-    return { ok: true };
+      payload: { measuredKg: kg, closedReason: reason, cushionLevel: cushion, totalQty: qty,
+        estG: est?.estG ?? null, estUnknownQty: est?.unknownQty ?? null, tareG: est?.tareG ?? null,
+        overLimit: measuredG > limits.limitG ? { limitG: limits.limitG, approvedBy } : undefined } }, d);
+    return {
+      ok: true,
+      overTarget: measuredG > limits.targetG,
+      overLimit: measuredG > limits.limitG,
+      targetKg: limits.targetG / 1000, limitKg: limits.limitG / 1000,
+      hint: weightMismatchHint(measuredG, est),
+    };
   }).immediate();
 }
 
@@ -1752,6 +2078,13 @@ export function exportReadiness(runId) {
   const mats = new Map(listMaterials(true).map((m) => [m.code, m]));
   const noDims = live.filter((b) => { const m = mats.get(b.material_code); return !(m && m.width_cm > 0 && m.length_cm > 0 && m.height_cm > 0); });
   if (noDims.length > 0) warnings.push({ code: 'no_dims', message: `外寸が未設定の資材の箱が ${noDims.length} 箱あります (Excel の幅・長さ・高さは空欄 → STA 画面で入力。管理画面の資材で外寸を登録すると次回から自動)`, boxes: noDims.map(boxBrief) });
+  // PR3: 上限超えは職員の承認でしか閉じられないが、通ってしまった箱は本社にも見えるようにする
+  const wl = runWeightLimits(run);
+  const overLimit = live.filter((b) => b.status === 'closed' && Number(b.measured_weight_kg) * 1000 > wl.limitG);
+  if (overLimit.length > 0) {
+    warnings.push({ code: 'over_weight_limit', message: `1箱の上限 ${wl.limitG / 1000}kg を超えた箱が ${overLimit.length} 箱あります (職員の承認で閉じた箱)。Amazon 側で受入不可・追加料金になることがあります`,
+      boxes: overLimit.map((b) => ({ ...boxBrief(b), weightKg: b.measured_weight_kg })) });
+  }
   if (exportState.latest) {
     warnings.push(exportState.stale
       ? { code: 'stale_export', message: `前回の出力 (#${exportState.latest.id}, ${exportState.latest.created_at.slice(0, 16).replace('T', ' ')}) の後にデータが変わっています。再出力してください` }

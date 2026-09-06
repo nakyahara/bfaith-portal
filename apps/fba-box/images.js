@@ -1,14 +1,17 @@
 /**
- * FBA納品 箱詰め記録 — 商品画像 (Amazon カタログの MAIN 画像 URL)
+ * FBA納品 箱詰め記録 — Amazon カタログの取得 (商品画像 + 参考単重)
  *
  * 取得元 = miniPC の /service-api/research/product/:asin (SP-API Catalog Items。応答のキーは image)。
  * SP-API の鍵は miniPC にしか無い ([[feedback_render_vs_minipc_api_placement]]) ので Render からは
- * サービス API 経由。結果は fbx_product_images に FNSKU 単位でキャッシュ (ok は恒久、none/error は翌日再試行)。
- * 画像は補助なので best-effort: 取れなくても作業は続く。
+ * サービス API 経由。結果は fbx_product_images / fbx_weight_refs に FNSKU 単位でキャッシュ
+ * (ok は恒久、none/error は翌日再試行)。どちらも補助なので best-effort: 取れなくても作業は続く。
+ *
+ * ⭐PR3: 画像と参考単重は同じ応答に入っている (dimensions.weight) ので、呼び出しは 1 商品 1 回のまま。
+ * SP-API のレート制限を増やさずに重量補助を足せる = miniPC 側の改修も不要
  *
  * FNSKU → ASIN は 行の asin (Excel 添付後) → fba-replenishment の fba_sku_attrs (FNSKU / SKU) の順で引く
  */
-import { listRowsNeedingImages, upsertProductImage } from './db.js';
+import { listRowsNeedingCatalog, upsertProductImage, upsertWeightRef, listRunWeights } from './db.js';
 
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
 const THROTTLE_MS = 5 * 60 * 1000;   // 同じ納品回の再取得は 5 分に 1 回まで (/api/state のたびに走らせない)
@@ -95,7 +98,27 @@ export function pickImageUrl(payload) {
   return p?.image || p?.mainImage || p?.imageUrl || null;
 }
 
-/** ASIN → MAIN 画像 URL (null = 画像なし)。テストで差し替え可 */
+/**
+ * 応答から 1個あたりの梱包重量 (g) を取り出す。
+ * miniPC は SP-API カタログの dimensions[0].package.weight (ポンド) を kg 小数2桁の文字列にして返す。
+ * ⭐実物で確認済み (2026-09-06, miniPC で直接 getCatalogItem):
+ *   {"unit":"pounds","value":0.0440924524} → "0.02" (元は attributes.item_package_weight の 0.02kg)。
+ *   単位はポンドで、既存の kg 換算は正しい。ただし Amazon 側のデータ自体が 0.01kg 刻み = 10g 単位なので
+ *   軽い商品では粗い → あくまで参考値で、実測 (何個で何g) が入ればそちらが勝つ
+ * 重量が無い商品は "-" が来る
+ */
+export function pickPackageWeightG(payload) {
+  const p = payload?.result ?? payload;
+  const raw = p?.dimensions?.weight;
+  if (raw == null || raw === '-' || raw === '') return { g: null, raw: null };
+  const kg = Number(raw);
+  if (!Number.isFinite(kg) || kg <= 0) return { g: null, raw: String(raw) };
+  // 単位を取り違えた応答を推定に流し込まないための保険 (1個 100kg は箱詰めの対象外)
+  if (kg > 100) return { g: null, raw: String(raw), error: `1個あたり ${kg}kg は大きすぎます (単位が想定と違う可能性)` };
+  return { g: Math.round(kg * 1000 * 10) / 10, raw: String(raw) };
+}
+
+/** ASIN → miniPC の応答 (そのまま)。画像と単重を 1 回の呼び出しで取る。テストで差し替え可 */
 let fetcher = async (asin) => {
   const res = await fetch(`${WAREHOUSE_URL}/service-api/research/product/${encodeURIComponent(asin)}`, {
     headers: serviceHeaders(), redirect: 'manual', signal: AbortSignal.timeout(20_000),
@@ -103,7 +126,7 @@ let fetcher = async (asin) => {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const j = await res.json();
   if (!j.ok) throw new Error(j.message || j.error || 'ng');
-  return pickImageUrl(j);
+  return j;
 };
 export function _setFetcher(fn) { fetcher = fn; }
 
@@ -114,10 +137,11 @@ const lastRunAt = new Map();
 const WAIT_FOR_RUNNING_MS = 45_000;
 
 /**
- * 納品回の行のうち画像が無いものを取りに行く (直列・間隔付き)。fire-and-forget 前提で例外は投げない。
- * @returns { skipped } | { fetched, failed, none, total }
+ * 納品回の行のうち画像または参考単重が無いものを取りに行く (直列・間隔付き)。
+ * fire-and-forget 前提で例外は投げない。
+ * @returns { skipped } | { fetched, failed, none, weighed, noWeight, total }
  */
-export async function ensureRunImages(runId, { force = false } = {}) {
+export async function ensureRunCatalog(runId, { force = false } = {}) {
   const id = Number(runId);
   const remember = (r) => { lastRun.set(id, { at: new Date().toISOString(), ...r }); return r; };
   // 設定チェックは force でも省かない (空トークンで miniPC を叩かない — Codex R17 #5)。force が無視するのは
@@ -138,38 +162,46 @@ export async function ensureRunImages(runId, { force = false } = {}) {
   inFlight.set(id, new Promise((resolve) => { done = resolve; }));
   try {
     const opts = force ? { retryAfterMs: 0 } : {};
-    const rows = listRowsNeedingImages(id, opts);
-    if (rows.length === 0) return remember({ fetched: 0, failed: 0, none: 0, total: 0, remaining: 0 });
+    const rows = listRowsNeedingCatalog(id, opts);
+    if (rows.length === 0) return remember({ fetched: 0, failed: 0, none: 0, weighed: 0, noWeight: 0, total: 0, remaining: 0 });
     const index = await buildAsinIndex();
-    if (index.error) console.warn('[fba-box] SKU属性 (ASIN) を読めません — 行の asin だけで画像を取ります:', index.error);
-    let fetched = 0, failed = 0, none = 0, noAsin = 0;
+    if (index.error) console.warn('[fba-box] SKU属性 (ASIN) を読めません — 行の asin だけでカタログを取ります:', index.error);
+    let fetched = 0, failed = 0, none = 0, noAsin = 0, weighed = 0, noWeight = 0;
     const errors = [];
     for (const r of rows) {
       const { asin } = resolveAsin(r, index.map);
       if (!asin) {
-        upsertProductImage({ fnsku: r.fnsku, asin: null, url: null, status: 'none', error: 'ASIN が分かりません (Excel を添付するか SKU マスタを確認)' });
-        none++; noAsin++;
+        const why = 'ASIN が分かりません (Excel を添付するか SKU マスタを確認)';
+        upsertProductImage({ fnsku: r.fnsku, asin: null, url: null, status: 'none', error: why });
+        upsertWeightRef({ fnsku: r.fnsku, asin: null, weightG: null, status: 'none', error: why });
+        none++; noAsin++; noWeight++;
         continue;
       }
       try {
-        const raw = await fetcher(asin);
-        const url = sanitizeImageUrl(raw);
-        upsertProductImage({ fnsku: r.fnsku, asin, url, status: url ? 'ok' : 'none', error: url ? null : (raw ? `画像URLが対象外: ${String(raw).slice(0, 80)}` : 'Amazon に画像がありません') });
+        const payload = await fetcher(asin);
+        const url = sanitizeImageUrl(pickImageUrl(payload));
+        upsertProductImage({ fnsku: r.fnsku, asin, url, status: url ? 'ok' : 'none', error: url ? null : 'Amazon に画像がありません' });
         if (url) fetched++; else none++;
+        // 参考単重 (同じ応答から。画像が無くても重量はあることがある = 別々に記録する)
+        const w = pickPackageWeightG(payload);
+        upsertWeightRef({ fnsku: r.fnsku, asin, weightG: w.g, raw: w.raw, status: w.g ? 'ok' : 'none',
+          error: w.g ? null : (w.error || 'Amazon に梱包重量の登録がありません (現場で「何個で何g」を量ってください)') });
+        if (w.g) weighed++; else noWeight++;
       } catch (e) {
-        failed++;
+        failed++; noWeight++;
         upsertProductImage({ fnsku: r.fnsku, asin, url: null, status: 'error', error: e.message });
+        upsertWeightRef({ fnsku: r.fnsku, asin, weightG: null, status: 'error', error: e.message });
         if (errors.length < 5) errors.push(`${asin}: ${e.message}`);
-        console.warn(`[fba-box] 画像取得失敗 ${asin}: ${e.message}`);
+        console.warn(`[fba-box] カタログ取得失敗 ${asin}: ${e.message}`);
       }
       await new Promise((resolve) => setTimeout(resolve, INTERVAL_MS));
     }
-    // 1 回の上限 (listRowsNeedingImages の limit) を超えて未取得の分だけを残件として数える。
+    // 1 回の上限 (listRowsNeedingCatalog の limit) を超えて未取得の分だけを残件として数える。
     // 今回 none/error にしたものは通常の再試行待ち (24h) に入るので数えない (Codex R18 #2)
-    const remaining = listRowsNeedingImages(id).length;
-    return remember({ fetched, failed, none, noAsin, total: rows.length, remaining, attrsCount: index.count, attrsError: index.error, errors });
+    const remaining = listRowsNeedingCatalog(id).length;
+    return remember({ fetched, failed, none, noAsin, weighed, noWeight, total: rows.length, remaining, attrsCount: index.count, attrsError: index.error, errors });
   } catch (e) {
-    console.error('[fba-box] ensureRunImages', e);
+    console.error('[fba-box] ensureRunCatalog', e);
     return remember({ skipped: 'error', error: e.message });
   } finally {
     inFlight.delete(id);
@@ -178,16 +210,21 @@ export async function ensureRunImages(runId, { force = false } = {}) {
 }
 
 /**
- * 画像が出ない原因の切り分け (管理画面から)。取得はせず、いまの状態だけを返す
+ * 画像・単重が出ない原因の切り分け (管理画面から)。取得はせず、いまの状態だけを返す
  */
-export async function diagnoseRunImages(runId, rows) {
+export async function diagnoseRunCatalog(runId, rows) {
   const index = await buildAsinIndex();
+  const weights = new Map(listRunWeights(runId).map((w) => [norm(w.fnsku), w]));
   const byFnsku = new Map();
   for (const r of rows) {
     const key = norm(r.fnsku);
     if (!key || byFnsku.has(key)) continue;
     const { asin, from } = resolveAsin(r, index.map);
-    byFnsku.set(key, { fnsku: r.fnsku, sku: r.seller_sku || null, rowAsin: r.asin || null, asin, asinFrom: from, imageUrl: r.image_url || null });
+    const w = weights.get(key);
+    byFnsku.set(key, { fnsku: r.fnsku, sku: r.seller_sku || null, rowAsin: r.asin || null, asin, asinFrom: from,
+      imageUrl: r.image_url || null,
+      unitG: w?.unit_g ?? null, weightSource: w?.source ?? null, measCount: w?.meas_count ?? 0,
+      refG: w?.ref_g ?? null, refStatus: w?.ref_status ?? null, refError: w?.ref_error ?? null });
   }
   const items = [...byFnsku.values()];
   return {
@@ -198,6 +235,8 @@ export async function diagnoseRunImages(runId, rows) {
       total: items.length,
       withImage: items.filter((x) => x.imageUrl).length,
       noAsin: items.filter((x) => !x.asin).length,
+      withWeight: items.filter((x) => x.unitG > 0).length,
+      measured: items.filter((x) => x.weightSource === 'measured').length,
     },
     items,
     lastRun: getLastRunResult(runId),

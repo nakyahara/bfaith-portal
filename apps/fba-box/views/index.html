@@ -149,6 +149,7 @@
     <div class="boxbar">
       <div class="curbox" id="curbox" title="いま詰めている箱">
         <small>いまの箱</small><span id="curbox-code">未選択</span>
+        <small id="curbox-est"></small>
       </div>
       <div id="boxbtns" style="display:flex; gap:8px;"></div>
       <button class="boxbtn newbox" id="btn-newbox">＋ 新しい箱</button>
@@ -243,6 +244,55 @@
   }
   function thumbHtml(row, big) {
     return `<div class="thumb ${big ? 'big' : ''}">${row.image_url ? `<img src="${esc(row.image_url)}" loading="lazy" referrerpolicy="no-referrer" alt="">` : '📦'}</div>`;
+  }
+
+  // ─── 重量補助 (PR3) ───
+  /** 商品1個の採用単重 (g)。実測 > Amazon の参考値。不明なら null */
+  function unitOf(fnsku) {
+    const w = (S && S.weights) ? S.weights[String(fnsku || '').toUpperCase()] : null;
+    return w && w.unitG > 0 ? w : null;
+  }
+  const limits = () => (S && S.weightLimits) || { targetG: 28000, limitG: 30000 };
+  /** 箱の推定 kg (小数1桁の文字列)。推定できないときは空文字 */
+  function estKg(b) { return b && b.est && b.est.estG > 0 ? (b.est.estG / 1000).toFixed(1) : ''; }
+  /**
+   * 推定の見せ方。単重不明の商品がある箱は「(重量不明 N点を除く)」を必ずセットで出す (要件 §7) —
+   * 数字だけ見て「まだ入る」と誤解させない
+   */
+  function estLabel(b) {
+    const e = b && b.est;
+    if (!e || !(e.estG > 0)) return '';
+    const L = limits();
+    const color = e.estG > L.limitG ? '#C92A2A' : (e.estG > L.targetG ? '#B5651D' : '#A0742E');
+    const miss = e.unknownQty > 0 ? ` (重量不明 ${e.unknownQty}点を除く)` : (e.tareKnown ? '' : ' (箱の自重が未登録)');
+    return `<span style="color:${color}">⚖ 推定 ${(e.estG / 1000).toFixed(1)}kg${miss}</span>`;
+  }
+  /** この箱にあと約何個入るか。単重不明・自重未登録があるうちは出さない (要件 §7) */
+  function roomLeft(b, unitG) {
+    const e = b && b.est;
+    if (!e || !e.complete || !(unitG > 0)) return null;
+    return Math.floor((limits().targetG - e.estG) / unitG);
+  }
+  function weighChipLabel(fnsku) {
+    const w = unitOf(fnsku);
+    if (!w) return '⚖ 重さを登録';
+    return `⚖ 1個 ${fmtG(w.unitG)}${w.source === 'measured' ? ' (実測)' : ' (参考)'}`;
+  }
+  const fmtG = (g) => (g >= 1000 ? (g / 1000).toFixed(2) + 'kg' : Math.round(g * 10) / 10 + 'g');
+  /** 投入画面の「あと約N個」。推定が信用できる箱のときだけ (単重不明ゼロ + 資材の自重あり) */
+  function roomHint(box, row) {
+    const w = unitOf(row.fnsku);
+    const e = box.est;
+    if (!e) return '';
+    if (!w) return `<div style="color:#B5651D">⚖ この商品の重さが未登録です (${estKg(box) ? '推定 ' + estKg(box) + 'kg には入っていません' : '推定は出せません'})</div>`;
+    const n = roomLeft(box, w.unitG);
+    const L = limits();
+    if (n === null) {
+      return `<div style="color:#B5651D">⚖ 推定 ${estKg(box)}kg${e.unknownQty > 0 ? ` (重量不明 ${e.unknownQty}点を除く)` : ''} — 「あと何個」は重さが全部そろってから出ます</div>`;
+    }
+    if (e.estG > L.limitG) return `<div style="color:#C92A2A; font-weight:700">🚨 推定 ${estKg(box)}kg — 上限 ${L.limitG / 1000}kg を超えています。この箱は閉じて新しい箱にしてください</div>`;
+    if (n <= 0) return `<div style="color:#C92A2A; font-weight:700">⚠ 推定 ${estKg(box)}kg — 目標 ${L.targetG / 1000}kg に達しています。新しい箱にしましょう</div>`;
+    return `<div style="color:#2B8A3E">⚖ 推定 ${estKg(box)}kg — この商品なら<b>あと約 ${n} 個</b>で ${L.targetG / 1000}kg です</div>`;
   }
 
   // ─── 納品回一覧 ───
@@ -340,9 +390,10 @@
     const boxes = S.boxes.filter(b => b.pack_group_id === curGroupId && b.status !== 'void');
     const cur = boxes.find(b => b.id === curBoxId);
     $('#curbox-code').textContent = cur ? `${cur.box_code} (${cur.total_qty}個)` : '未選択';
+    $('#curbox-est').innerHTML = cur ? estLabel(cur) : '';
     $('#boxbtns').innerHTML = boxes.map(b => `
       <button class="boxbtn ${b.status === 'closed' ? 'closed' : ''}" data-id="${b.id}">
-        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
+        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個${estKg(b) ? ' / 約' + estKg(b) + 'kg' : ''}${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
       </button>`).join('');
     $('#boxbtns').querySelectorAll('.boxbtn').forEach(b => b.addEventListener('click', () => openBoxDialog(Number(b.dataset.id))));
     // 行リスト (retired = 差し替えで消えた行は出さない)
@@ -559,6 +610,7 @@
           <div style="display:flex; gap:8px; flex-wrap:wrap">
             <button class="chip" style="background:#B5651D" id="d-digits">🔊 下4桁を読む</button>
             <button class="chip" style="background:#E9ECEF;color:#495057" id="d-tts">🔊 商品名</button>
+            <button class="chip" style="background:${unitOf(r.fnsku) ? '#E9ECEF' : '#FFF4E6'};color:#495057" id="d-weigh">${weighChipLabel(r.fnsku)}</button>
           </div>
         </div>
       </div>
@@ -569,6 +621,7 @@
       ${excluded ? `<div class="msg err">この商品は納品プラン (Excel) に無いので箱に入れません。${r.placed > 0 ? `すでに ${r.placed} 個入っています — 職員が取り消してください。` : ''}本社に確認してください</div>` : ''}
       ${rem > 0 && !excluded ? `
         <div class="lbl">📦 入れる箱 ${cur ? `= <b>${esc(cur.box_code)}</b>` : '(「いまの箱」が未選択です)'}</div>
+        ${cur ? roomHint(cur, r) : ''}
         ${cur ? '' : `<div class="grid3">${boxes.map(b => `<button class="selbtn boxpick" data-id="${b.id}">${esc(b.box_code)}</button>`).join('')}
           <button class="selbtn boxnew">＋新しい箱</button></div>`}
         <div class="lbl">個数</div>
@@ -626,6 +679,7 @@
     dlg.querySelector('.boxnew')?.addEventListener('click', () => { closeDialog(); newBoxDialog(() => openRowDialog(rowId)); });
     dlg.querySelector('#d-tts').addEventListener('click', () => speak(`${shortName(r.product_name)}。${Math.max(0, rem)}個`, true));
     dlg.querySelector('#d-digits').addEventListener('click', () => speakDigits(r));
+    dlg.querySelector('#d-weigh').addEventListener('click', () => { closeDialog(); weighDialog(r, () => openRowDialog(rowId)); });
     dlg.querySelector('#d-close').addEventListener('click', closeDialog);
     dlg.querySelector('#d-lw').addEventListener('click', () => pickRowWorker(r, 'label_worker'));
     dlg.querySelector('#d-cw').addEventListener('click', () => pickRowWorker(r, 'check_worker'));
@@ -757,6 +811,79 @@
   function setCurBox(id) { curBoxId = id; LS.set('curbox_' + curRunId, id); }
 
   // ─── 箱 ───
+  /**
+   * ⚖ 商品の重さ (中原さん要望「何個で何g」)。軽い商品を1個ずつ量ると誤差が大きいので、
+   * まとめて量って個数で割る。登録すると、その商品を含む箱の推定重量が実測で計算し直される
+   */
+  async function weighDialog(r, after) {
+    const w0 = unitOf(r.fnsku);
+    const dlg = openDialog(`
+      <h2>⚖ 重さを量る</h2>
+      <div style="display:flex; gap:12px; align-items:flex-start">
+        ${thumbHtml(r, false)}
+        <div style="flex:1; min-width:0">
+          <div class="pname">${esc(r.product_name || r.seller_sku)}</div>
+          <div class="fn" style="font-size:1em">${esc(r.fnsku).slice(0, -4)}<b>${esc(fn4(r.fnsku))}</b></div>
+        </div>
+      </div>
+      <div style="margin:10px 0; background:#F8F9FA; border-radius:10px; padding:10px">
+        いま使っている1個あたり: <b style="font-size:1.2em">${w0 ? fmtG(w0.unitG) : '未登録'}</b>
+        <small style="color:#868E96; display:block">${w0
+          ? (w0.source === 'measured' ? `実測 (${w0.sampleQty}個をまとめて量った値)` : 'Amazon の参考値 — 10g 単位なので粗いです。量ると精度が上がります')
+          : 'Amazon に重さの登録がありません。量ってもらえると箱の推定重量が出せます'}</small>
+      </div>
+      <div class="lbl">① はかりに のせた個数</div>
+      <input class="qtyin" id="w-n" type="tel" inputmode="numeric" value="10">
+      <div class="lbl">② はかりの数字 (g) — 商品だけをのせる (トレーを使うなら 0 合わせ)</div>
+      <input class="qtyin" id="w-g" type="text" inputmode="decimal" placeholder="例: 205">
+      <div style="text-align:center; margin:12px 0; font-size:1.15em; min-height:1.4em" id="w-calc"></div>
+      <button class="bigbtn green" id="w-go">この重さで登録</button>
+      <div class="msg" id="w-msg"></div>
+      <div class="lbl">📝 これまでの記録</div>
+      <div id="w-hist" style="color:#868E96">読み込み中…</div>`);
+    const nIn = dlg.querySelector('#w-n'), gIn = dlg.querySelector('#w-g'), calc = dlg.querySelector('#w-calc');
+    const unit = () => {
+      const n = parseInt(nIn.value, 10), g = parseFloat(gIn.value);
+      return (Number.isInteger(n) && n >= 1 && Number.isFinite(g) && g > 0) ? g / n : null;
+    };
+    const showCalc = () => { const u = unit(); calc.innerHTML = u ? `→ 1個あたり <b>${fmtG(Math.round(u * 10) / 10)}</b>` : ''; };
+    nIn.addEventListener('input', showCalc); gIn.addEventListener('input', showCalc);
+    showCalc();
+    const loadHist = async () => {
+      const j = await apiGet('/api/weights?fnsku=' + encodeURIComponent(r.fnsku));
+      const box = dlg.querySelector('#w-hist');
+      if (!j.ok) { box.textContent = '読み込めませんでした'; return; }
+      if (!j.measurements.length) { box.textContent = 'まだありません'; return; }
+      box.innerHTML = j.measurements.map(m => `
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #E9ECEF; ${m.revoked_at ? 'opacity:0.5; text-decoration:line-through' : ''}">
+          <span>${m.sample_qty}個で ${fmtG(m.total_g)} → <b>1個 ${fmtG(m.unit_g)}</b>
+            <small style="color:#868E96">${esc(String(m.measured_at || '').slice(5, 16).replace('T', ' '))} ${esc(m.worker_name || '')}</small></span>
+          ${m.revoked_at ? '' : `<button class="selbtn wrvk" data-id="${m.id}" style="padding:6px 10px">取消</button>`}
+        </div>`).join('');
+      box.querySelectorAll('.wrvk').forEach(btn => btn.addEventListener('click', async () => {
+        if (!worker) { pickWorker(); return; }
+        if (!confirm('この重さの記録を取り消しますか?')) return;
+        const j2 = await apiPost(`/api/weights/${btn.dataset.id}/revoke`, { worker_id: worker.id });
+        if (!j2.ok) { alert(j2.message); return; }
+        await refresh(true);
+        loadHist();
+      }));
+    };
+    loadHist();
+    dlg.querySelector('#w-go').addEventListener('click', async () => {
+      if (!worker) { pickWorker(); return; }
+      const msg = dlg.querySelector('#w-msg');
+      const n = parseInt(nIn.value, 10), g = parseFloat(gIn.value);
+      if (!Number.isInteger(n) || n < 1) { msg.className = 'msg err'; msg.textContent = 'のせた個数を入れてください'; return; }
+      if (!Number.isFinite(g) || g <= 0) { msg.className = 'msg err'; msg.textContent = 'はかりの数字 (g) を入れてください'; return; }
+      const j = await apiPost('/api/weights', { fnsku: r.fnsku, sample_qty: n, total_g: g, run_id: curRunId, worker_id: worker.id });
+      if (!j.ok) { msg.className = 'msg err'; msg.textContent = j.message; return; }
+      await refresh(true);
+      closeDialog();
+      if (after) after();
+    });
+  }
+
   function newBoxDialog(after) {
     const dlg = openDialog(`
       <h2>＋ 新しい箱</h2>
@@ -791,6 +918,7 @@
       <h2>📦 ${esc(b.box_code)} ${b.status === 'closed' ? '(閉じた箱)' : ''}
         <a class="chip" style="background:#E9ECEF; color:#495057; text-decoration:none; float:right" href="${BASE}/print/boxes?run=${curRunId}&box=${b.id}" target="_blank">🖨 箱札</a></h2>
       <div style="color:#868E96; font-size:0.9em">${b.total_qty}個 / ${b.sku_count}種類${b.measured_weight_kg ? ` / 実測 ${b.measured_weight_kg}kg` : ''}
+        ${estLabel(b) ? `<div>${estLabel(b)}</div>` : ''}
         ${b.amazon_box_no !== b.box_no ? `<div style="color:#C92A2A; font-weight:700">⚠ Amazon では ${esc(b.amazon_name)} になります (取消した箱があるため番号がずれています)</div>` : ''}</div>
       <div style="margin:12px 0; max-height:40vh; overflow-y:auto">
         ${contents.length === 0 ? 'まだ空です' : contents.map(p => `
@@ -844,8 +972,10 @@
         ${contents.map(p => `<div style="padding:4px 0">・${esc(shortName(p.product_name, 20))} <b>${p.qty}個</b>${p.expiry ? ` (期限 ${esc(p.expiry)})` : ''}</div>`).join('')}
         <div style="border-top:1px solid #DEE2E6; margin-top:6px; padding-top:6px"><b>合計 ${b.total_qty}個 / ${b.sku_count}種類</b></div>
       </div>
+      ${estLabel(b) ? `<div style="margin:8px 0; text-align:center">${estLabel(b)}${b.est && b.est.complete ? ' — はかりの数字と大きく違ったら数え直しのサインです' : ''}</div>` : ''}
       <div class="lbl">⚖ はかりの重さ (kg) — 必須</div>
       <input class="qtyin" id="c-kg" type="text" inputmode="decimal" placeholder="例: 12.4">
+      <div id="c-wmsg" style="text-align:center; min-height:1.3em; margin-top:6px"></div>
       <div class="lbl">箱を閉じる理由</div>
       <div class="grid3">
         <button class="selbtn crsn" data-v="weight_limit">重さがいっぱい</button>
@@ -870,14 +1000,27 @@
     }));
     pick('.crsn', v => reason = v);
     pick('.cshn', v => cushion = v);
-    dlg.querySelector('#c-go').addEventListener('click', async () => {
-      if (!worker) { pickWorker(); return; }
+    // 入力しながら目標・上限に当てて知らせる (閉じる前に気づけるように)
+    const kgIn = dlg.querySelector('#c-kg'), wmsg = dlg.querySelector('#c-wmsg');
+    kgIn.addEventListener('input', () => {
+      const kg = parseFloat(kgIn.value), L = limits();
+      if (!Number.isFinite(kg) || kg <= 0) { wmsg.textContent = ''; return; }
+      const g = kg * 1000;
+      if (g > L.limitG) { wmsg.style.color = '#C92A2A'; wmsg.innerHTML = `🚨 上限 ${L.limitG / 1000}kg 超え — 中身を分けてください (このまま閉じるには職員の承認が要ります)`; }
+      else if (g > L.targetG) { wmsg.style.color = '#B5651D'; wmsg.innerHTML = `⚠ 目標 ${L.targetG / 1000}kg を超えています (上限 ${L.limitG / 1000}kg まではこのまま閉じられます)`; }
+      else { wmsg.style.color = '#2B8A3E'; wmsg.textContent = '✓ 重さは問題ありません'; }
+    });
+    /** 送信。上限超えは職員の承認 (auth_worker_id + PIN) を添えて送り直す */
+    const send = async (auth) => {
       const msg = dlg.querySelector('#c-msg');
-      const kg = parseFloat(dlg.querySelector('#c-kg').value);
-      if (!Number.isFinite(kg) || kg <= 0) { msg.className = 'msg err'; msg.textContent = 'はかりの重さ (kg) を入れてください'; return; }
+      // 職員PINの画面を出すとこのダイアログは閉じられている → 承認後のエラーは alert で見せる
+      const showErr = (m) => { if (auth) alert(m); else { msg.className = 'msg err'; msg.textContent = m; } };
+      const kg = parseFloat(kgIn.value);
+      if (!Number.isFinite(kg) || kg <= 0) { showErr('はかりの重さ (kg) を入れてください'); return; }
       const j = await apiPost(`/api/boxes/${b.id}/close`, {
         worker_id: worker.id, measured_kg: kg, closed_reason: reason, cushion_level: cushion,
         content_version: contentVersion,
+        ...(auth ? { override: true, auth_worker_id: auth.staff.id, auth_pin: auth.pin } : {}),
       });
       if (!j.ok) {
         if (j.error === 'box_changed') {   // 他の iPad で中身が直された → 読み合わせからやり直す
@@ -886,10 +1029,23 @@
           openBoxDialog(b.id);
           return;
         }
-        msg.className = 'msg err'; msg.textContent = j.message; return;
+        if (j.error === 'over_limit') {    // 上限超え = 作業者だけでは閉じられない (要件 §7)
+          showErr(j.message);
+          if (confirm(`${j.message}\n\n職員の承認を入れて、このまま閉じますか?`)) {
+            staffPinPrompt((staff, pin) => send({ staff, pin }));
+          }
+          return;
+        }
+        showErr(j.message); return;
       }
       if (curBoxId === b.id) { curBoxId = null; LS.set('curbox_' + curRunId, null); }
       closeDialog();
+      // 推定と大きく違うときだけ知らせる (閉じるのは止めない — 判断は現場)
+      if (j.hint) alert(`⚖ ${j.hint.message}`);
+    };
+    dlg.querySelector('#c-go').addEventListener('click', () => {
+      if (!worker) { pickWorker(); return; }
+      send(null);
     });
   }
 

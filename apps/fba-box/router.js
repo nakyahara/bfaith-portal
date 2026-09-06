@@ -28,13 +28,18 @@ import {
   setRowWorkers, setRowShortage, clearRowShortage, setRowSendQty,
   exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
   listProductImages,
+  addWeightMeasurement, revokeWeightMeasurement, listWeightMeasurements, listRunWeights,
+  getWeightRules, setWeightRules,
 } from './db.js';
 import { ingestPacklist, writePacklist, MAX_XLSX_BYTES } from './excel.js';
 import { matchWorkbook, summarizeMatch } from './service.js';
-import { ensureRunImages, diagnoseRunImages } from './images.js';
+import { ensureRunCatalog, diagnoseRunCatalog } from './images.js';
 
 /** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
-const kickImages = (runId) => { ensureRunImages(runId).catch((e) => console.warn('[fba-box] images', e.message)); };
+const kickCatalog = (runId) => { ensureRunCatalog(runId).catch((e) => console.warn('[fba-box] catalog', e.message)); };
+/** 画像か参考単重が欠けている商品があるか (どちらも miniPC の同じ 1 回の呼び出しで埋まる) */
+const needsCatalog = (state) => state.rows.some((r) => r.match_state !== 'retired'
+  && (!r.image_url || !state.weights[String(r.fnsku || '').toUpperCase()]));
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -82,7 +87,7 @@ async function createFromPicking(sourceRunId, createdBy, { fromDevice = false } 
   try { planSheets = JSON.parse(pickingRun.result || '{}').planSheets || []; }
   catch { return { status: 422, body: { ok: false, error: 'bad_picking_data', message: 'ピッキング実行のデータを解釈できませんでした' } }; }
   const r = createRunFromPicking({ pickingRun, planSheets, createdBy, activate: true });
-  if (r.ok) kickImages(r.runId);
+  if (r.ok) kickCatalog(r.runId);
   return { status: r.ok ? 200 : 400, body: r };
 }
 
@@ -182,6 +187,22 @@ function requireStaff(req, worker) {
     return { ok: false, status: st, body: { ok: false, ...pinCheck } };
   }
   return { ok: true, via: 'pin' };
+}
+
+/**
+ * 「作業者だけでは決められないこと」の職員承認 (PR3: 上限超えの箱を閉じる)。
+ * requireStaff と違い、承認者は箱を閉じる作業者とは別に選ぶ (auth_worker_id) —
+ * 現場の帰属 (誰が詰めたか) を書き換えずに、承認だけを職員に紐づける
+ */
+function staffApproval(req) {
+  if (hasSessionAccess(req)) return { ok: true, via: 'session', approvedBy: `session:${req.fbxUser}` };
+  const w = getWorker(req.body?.auth_worker_id);
+  if (!w || !w.active || w.worker_type !== 'staff') {
+    return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: '職員の承認が必要です (職員を選んで PIN を入れてください)' } };
+  }
+  const pinCheck = verifyWorkerPin(w.id, req.body?.auth_pin);
+  if (!pinCheck.ok) return { ok: false, status: pinCheck.error === 'pin_locked' ? 429 : 403, body: { ok: false, ...pinCheck } };
+  return { ok: true, via: 'pin', approvedBy: w.display_name };
 }
 
 /**
@@ -290,7 +311,7 @@ router.get('/api/state', api((req, res) => {
   if (!Number.isInteger(runId) || runId <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: 'run が必要です' });
   const state = getRunState(runId);
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
-  if (state.run.status === 'active' && state.rows.some((r) => !r.image_url)) kickImages(runId);
+  if (state.run.status === 'active' && needsCatalog(state)) kickCatalog(runId);
   res.json({
     ok: true, ...state,
     workers: listWorkers(),
@@ -459,20 +480,61 @@ router.get('/api/boxes/:id(\\d+)', api((req, res) => {
   res.json({ ok: true, contents: listBoxContents(box.id), box: { id: box.id, status: box.status, contentVersion: box.content_version } });
 }));
 
-/** 箱クローズ (読み合わせ後・実測kg必須) */
+/**
+ * 箱クローズ (読み合わせ後・実測kg必須)。
+ * PR3: 上限 (既定30kg) 超えは over_limit で断る → 画面が職員の承認 (override + PIN) を取って再送する
+ */
 router.post('/api/boxes/:id(\\d+)/close', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  let staffApproved = false, approvedBy = null;
+  if (req.body?.override === true) {
+    const gate = staffApproval(req);
+    if (!gate.ok) return res.status(gate.status).json(gate.body);
+    staffApproved = true; approvedBy = gate.approvedBy;
+  }
   const r = closeBox({
     boxId: Number(req.params.id), measuredKg: req.body?.measured_kg,
     closedReason: req.body?.closed_reason, cushionLevel: req.body?.cushion_level,
     worker: w.worker, deviceLabel: deviceLabelOf(req),
     expectedContentVersion: req.body?.content_version ?? null,
+    staffApproved, approvedBy,
   });
   if (!r.ok) {
-    const st = { not_found: 404, already_closed: 409, run_not_active: 409, empty_box: 409, box_changed: 409, box_void: 409 }[r.error] || 400;
+    const st = { not_found: 404, already_closed: 409, run_not_active: 409, empty_box: 409, box_changed: 409, box_void: 409, over_limit: 409 }[r.error] || 400;
     return res.status(st).json(r);
   }
+  res.json(r);
+}));
+
+// ─── 重量補助 (PR3・要件 §7): 実測単重「N個で M g」 ───
+
+/** ある商品の重さの記録 (採用値・実測履歴)。iPad と管理画面の両方から */
+router.get('/api/weights', api((req, res) => {
+  const fnsku = String(req.query.fnsku || '').trim().toUpperCase();
+  if (!fnsku) return res.status(400).json({ ok: false, error: 'bad_request', message: 'fnsku が必要です' });
+  res.json({ ok: true, fnsku, measurements: listWeightMeasurements(fnsku), rules: getWeightRules() });
+}));
+
+/** 実測単重の登録。まとめて量って個数で割る (軽い商品を1個ずつ量ると誤差が大きい) */
+router.post('/api/weights', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const r = addWeightMeasurement({
+    fnsku: req.body?.fnsku, sampleQty: req.body?.sample_qty, totalG: req.body?.total_g,
+    method: req.body?.method, note: req.body?.note, runId: req.body?.run_id,
+    worker: w.worker, deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) return res.status(400).json(r);
+  res.json(r);
+}));
+
+/** 実測の取消 (打ち間違い)。数の訂正と同じく PIN は要らない (中原さん 9/3) */
+router.post('/api/weights/:id(\\d+)/revoke', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const r = revokeWeightMeasurement({ id: Number(req.params.id), worker: w.worker, deviceLabel: deviceLabelOf(req) });
+  if (!r.ok) return res.status({ not_found: 404, already_revoked: 409 }[r.error] || 400).json(r);
   res.json(r);
 }));
 
@@ -579,6 +641,7 @@ router.get('/admin', requireSession, api(async (req, res) => {
     pickingRuns, pickingError,
     workers: listWorkers(true),
     materials: listMaterials(true),
+    weightRules: getWeightRules(),
     devices: isAdmin(req) ? listDevices() : [],
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     events: listEvents(50),
@@ -698,8 +761,8 @@ router.get('/admin/runs/:id(\\d+)', requireSession, api((req, res) => {
 router.get('/admin/runs/:id(\\d+)/images', requireSession, api(async (req, res) => {
   const state = getRunState(Number(req.params.id));
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
-  if (state.rows.some((r) => !r.image_url && r.match_state !== 'retired')) kickImages(Number(req.params.id));
-  const diag = await diagnoseRunImages(Number(req.params.id), state.rows.filter((r) => r.match_state !== 'retired'));
+  if (needsCatalog(state)) kickCatalog(Number(req.params.id));
+  const diag = await diagnoseRunCatalog(Number(req.params.id), state.rows.filter((r) => r.match_state !== 'retired'));
   const cache = new Map(listProductImages(diag.items.map((x) => x.fnsku)).map((c) => [c.fnsku, c]));
   res.json({ ok: true, ...diag, items: diag.items.map((x) => ({ ...x, cache: cache.get(String(x.fnsku).toUpperCase()) || null })) });
 }));
@@ -708,7 +771,7 @@ router.get('/admin/runs/:id(\\d+)/images', requireSession, api(async (req, res) 
 router.post('/admin/runs/:id(\\d+)/images/refresh', checkOrigin, requireAdmin, api(async (req, res) => {
   const state = getRunState(Number(req.params.id));
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
-  const r = await ensureRunImages(Number(req.params.id), { force: true });
+  const r = await ensureRunCatalog(Number(req.params.id), { force: true });
   res.json({ ok: true, result: r });
 }));
 
@@ -784,6 +847,19 @@ router.post('/admin/runs/:id(\\d+)/sta-uploaded', requireSession, checkOrigin, a
 router.post('/admin/materials', checkOrigin, requireAdmin, api((req, res) => {
   const b = req.body || {};
   const r = upsertMaterial({ code: b.code, name: b.name, tareG: b.tare_g, widthCm: b.width_cm, lengthCm: b.length_cm, heightCm: b.height_cm, sort: b.sort, active: b.active !== false, actor: req.session.email });
+  res.status(r.ok ? 200 : 400).json(r);
+}));
+
+/** 納品回の商品ごとの単重 (採用値・参考値・実測件数)。本社が「不明が何点あるか」を見る */
+router.get('/admin/runs/:id(\\d+)/weights', requireSession, api((req, res) => {
+  const run = getRun(Number(req.params.id));
+  if (!run) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
+  res.json({ ok: true, weights: listRunWeights(run.id), rules: getWeightRules(), runLimits: { targetG: run.weight_target_g, limitG: run.weight_limit_g } });
+}));
+
+/** 重量ルール (目標=黄警告 / 上限=クローズをブロック) の変更。作業中の回には効かない (開始時のスナップショットを使う) */
+router.post('/admin/weight-rules', checkOrigin, requireAdmin, api((req, res) => {
+  const r = setWeightRules({ targetG: req.body?.target_g, limitG: req.body?.limit_g, actor: req.session.email });
   res.status(r.ok ? 200 : 400).json(r);
 }));
 
