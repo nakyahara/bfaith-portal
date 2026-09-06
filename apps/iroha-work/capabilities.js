@@ -32,11 +32,13 @@ export const CAP = Object.freeze({
   BLOCK: 'task.block',
   /** 📅 きょうのみんなの作業 (日報) を読む (監修 2026-09-05)。読むだけだが default-deny の表に載せる (Codex PR #1200 R1 #10) */
   DAILY_REPORT: 'report.daily',
+  /** 🏷 保管箱ラベルを いろはPC の QL-800 から出す (中原さん 2026-09-06)。カード (f_iroha_tasks) が正本のときだけ = アプリ正本のみ */
+  LABEL_PRINT: 'task.label.print',
 });
 
 const CAPS_NOTION = Object.freeze([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT, CAP.DAILY_REPORT]);
 const CAPS_APP = Object.freeze([...CAPS_NOTION, CAP.CANCELLATION, CAP.REVIEW_CLEAR,
-  CAP.LABEL_WAIT_EDIT, CAP.BLOCK]);
+  CAP.LABEL_WAIT_EDIT, CAP.BLOCK, CAP.LABEL_PRINT]);
 /**
  * ⭐職員のときだけ足す = 計画 (いつ / どこが) と 外部出し (どこに預けるかの判断)。
  * 利用者の画面には札のボタンも計画の入口も外部出しのボタンも描かない (要件 §W-1 / 監修 F-5 2026-09-05)

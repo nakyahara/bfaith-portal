@@ -3631,7 +3631,23 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function openWhenPick\(id\)/.test(html) && /id="whenOv"/.test(html) && /openWhenPick\(whenBtn\.dataset\.whenOf\)/.test(html)
     && /\[\['today', '📌 今日やる'\], \['tomorrow', '明日やる'\], \['', '未定にする'\]\]/.test(html) && /if \(!stateCan\('task\.plan\.assign'\)\) return;          \/\/ 許可が無ければ開かない/.test(html),
     '「いつ」の札は 今日やる / 明日やる / 未定 から選ぶ (未定から今日も選べる — 中原さん 2026-09-05)。職員だけ');
-  ok(/closeUnblock\(\); closeFacPick\(\); closeWhenPick\(\); closeDetail\(\);/.test(html), 'Esc で いつ・どこが の選択も閉じる');
+  ok(/closeUnblock\(\); closeFacPick\(\); closeWhenPick\(\); closePrintBox\(\); closeDetail\(\);/.test(html), 'Esc で いつ・どこが の選択・箱ラベルのダイアログも閉じる');
+
+  // 🏷 保管箱ラベル (いろはPC の QL-800) — 中原さん 2026-09-06
+  ok(/id="printOv"/.test(html) && /id="printBody"/.test(html) && /onclick="submitPrint\(\)"/.test(html), '箱ラベルのダイアログ (#printOv) がある');
+  ok(/if \(!can\('task\.label\.print'\) \|\| printAgents\(\)\.length === 0 \|\| !barcodeTypeOf\(c\.barcode\)\) return '';/.test(html),
+    '🏷 ボタンは 許可あり・印刷係あり・バーコードあり のときだけ描く (押しても出ないボタンを見せない)');
+  ok(/printBtnHtml\(c\) \+\s*printJobHtml\(c\) \+/.test(html), '詳細の数字の段に 🏷 ボタンと最新の印刷結果の札');
+  ok(/const expiry = c\.expiry \? String\(c\.expiry\) : \(m\.expiry_seal === 1 \? '期限シールあり' : ''\);/.test(html)
+    && /const boxes = c\.boxes_calc && c\.boxes_calc\.boxes \? c\.boxes_calc\.boxes : 1;/.test(html)
+    && /const units = m\.units_per_container != null \? String\(m\.units_per_container\) : '';/.test(html),
+    '既定値: 1 箱に何個=入数 / 期限=この入荷の有効期限 (無ければ期限シールありの印) / 枚数=必要保管箱の数');
+  ok(/if \(prev && !\(ackEl && ackEl\.checked\)\)/.test(html) && /acknowledge_unknown_job_id: prev \? prev\.id : undefined/.test(html),
+    '❓ のあとは「実物を確認した」にチェックしないと送らない (サーバーも同じ証跡を要求)');
+  ok(/client_request_id: ctx\.reqId/.test(html) && /reqId: 'p' \+ Date\.now\(\)\.toString\(36\) \+ Math\.random\(\)\.toString\(36\)\.slice\(2, 10\)/.test(html),
+    '冪等 ID はダイアログを開くたびに 1 つ (再送で 2 枚出ない)');
+  ok(/function closePrintBox\(\) \{ if \(printCtx && printCtx\.saving\) return; closeOverlay\('#printOv'\); printCtx = null; \}/.test(html),
+    '送信中は閉じない (二重送信・迷子を防ぐ)');
   ok((html.match(/\['unblocked', '止まっていない'\]/g) || []).length === 2 && /curTab === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html)
     && /curWhen === 'unblocked'\) \{ if \(c\.blocked\) return false; \}/.test(html) && /c\.unblocked = c\.all - c\.blocked;/.test(html),
     '「止まっていない」(⛔ を除く) の絞り込みが一覧とボードの両方にある (中原さん 2026-09-05)');
@@ -4022,9 +4038,11 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   ok(capabilitiesFor('notion', { staff: true }).length === notion.length, 'Notion 正本では職員でも計画は許さない (planned_date はアプリ正本の持ちもの)');
   ok(capabilitiesFor('preview', { staff: true }).length === 0, '下見・履歴は職員でも何も許さない');
   // 書き込み口が capability を持たないまま増えていないか (Codex PR1 R6)
-  ok(app.length === 9 && new Set(app).size === app.length, 'アプリ正本 (利用者) の許可は 9 個・重複なし (増やしたら画面の判定も足す)');
+  ok(app.length === 10 && new Set(app).size === app.length, 'アプリ正本 (利用者) の許可は 10 個・重複なし (増やしたら画面の判定も足す)');
+  ok(app.includes(CAP.LABEL_PRINT) && !notion.includes(CAP.LABEL_PRINT) && !pv.includes(CAP.LABEL_PRINT),
+    '🏷 箱ラベルの印刷はアプリ正本の利用者にも許す (箱に貼るのは作業した人)。Notion 正本・下見では許さない (中原さん 2026-09-06)');
   ok(notion.includes(CAP.DAILY_REPORT) && app.includes(CAP.DAILY_REPORT) && !pv.includes(CAP.DAILY_REPORT), '日報 (report.daily) は読むだけだが許可の表に載せる。下見では許さない');
-  ok(staffCaps.length === 13 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 13 個・重複なし');
+  ok(staffCaps.length === 14 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 14 個・重複なし');
   app.push('x'); pv.push('y');
   ok(!capabilitiesFor('app').includes('x') && capabilitiesFor('preview').length === 0, '返した配列を壊しても共有の定義は変わらない');
   ok(capabilitiesFor('unknown').length === 0 && capabilitiesFor(undefined).length === 0, '知らないモードは何も許さない (default-deny)');

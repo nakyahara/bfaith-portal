@@ -67,7 +67,7 @@
       <span class="lbl">よく使う</span>
       <a href="#sec-workers">👤 名簿</a><a href="#sec-options">🧰 選択肢</a><a href="#sec-find">🔎 記録をさがす</a>
       <span class="lbl">設定・確認</span>
-      <a href="#sec-devices">📱 iPad</a><a href="#sec-notion">🗂 Notion</a><a href="#sec-migrate">🚚 移行</a>
+      <a href="#sec-devices">📱 iPad</a><a href="#sec-print">🏷 箱ラベル</a><a href="#sec-notion">🗂 Notion</a><a href="#sec-migrate">🚚 移行</a>
       <a href="#sec-sessions">⏱ セッション</a><a href="#sec-media">📷 写真</a><a href="#sec-log">📋 操作履歴</a>
     </nav>
 
@@ -291,7 +291,7 @@
         <tr><th>端末</th><th>登録</th><th>最終利用</th><th></th></tr>
         <% for (const d of devices) { %>
           <tr class="<%= d.revoked_at ? 'revoked' : '' %>">
-            <td><%= d.label %></td>
+            <td><%= d.kind === 'agent' ? '🏷 ' : '📱 ' %><%= d.label %><% if (d.kind === 'agent') { %><br><small>印刷係 / <%= d.printer_name || '-' %></small><% } %></td>
             <td><%= new Date(d.created_at).toLocaleDateString('ja-JP') %> (<%= d.created_by || '-' %>)</td>
             <td><%= d.last_seen_at ? new Date(d.last_seen_at).toLocaleString('ja-JP') : '-' %></td>
             <td><% if (!d.revoked_at) { %><button class="btn-sm" onclick="revokeDevice(<%= d.id %>)">解除</button><% } %></td>
@@ -300,6 +300,59 @@
         <% if (devices.length === 0) { %><tr><td colspan="4">登録された端末はありません</td></tr><% } %>
       </table>
     </div>
+
+    <div class="iw-box">
+      <h2 id="sec-print">🏷 保管箱ラベル (いろはPC の Brother QL-800)</h2>
+      <p class="hint">
+        iPad の詳細画面「🏷 箱ラベル」を押すと、いろはPC に住まわせた<b>印刷係</b>が QL-800 から保管箱ラベル
+        (『バーコード印字.lbx』のレイアウト: 商品名・1 箱に何個・期限・バーコード) を出します。
+        設置キット = 共有ドライブ <code>入荷バーコード発行\箱ラベル印刷係\</code> (手順は同じフォルダの「やること.md」)。
+        ここで印刷係を登録するとトークンが 1 回だけ表示されるので、いろはPC の <code>1_設置する.bat</code> に貼ります。
+      </p>
+      <div class="row">
+        <input type="text" id="agentLabel" placeholder="端末名 (例: いろはPC)" maxlength="40">
+        <input type="text" id="agentPrinter" placeholder="プリンター名 (例: Brother QL-800)" maxlength="120">
+        <button onclick="registerAgent()">🏷 印刷係を登録してトークンを発行</button>
+        <span class="msg" id="agentMsg"></span>
+      </div>
+      <div id="agentOut" style="display:none;margin-top:10px">
+        <p class="hint">このトークンは<b>1 回しか表示されません</b>。いろはPC で <code>1_設置する.bat</code> を管理者として実行し、貼り付けてください。</p>
+        <code id="agentToken" style="display:block;font-size:14px;word-break:break-all;padding:8px;background:#f1f3f5;border-radius:6px"></code>
+      </div>
+      <table class="iw-list" style="margin-top:10px">
+        <tr><th>印刷係</th><th>プリンター</th><th>生存</th><th>状態</th><th></th></tr>
+        <% for (const a of printAgents) { %>
+          <tr>
+            <td><%= a.label %><% if (a.host) { %><br><small><%= a.host %> <%= a.version || '' %></small><% } %></td>
+            <td><input type="text" class="dev-printer" data-id="<%= a.id %>" value="<%= a.printer_name || '' %>" maxlength="120" style="width:170px"> <button class="btn-sm" onclick="savePrinter(<%= a.id %>)">保存</button></td>
+            <td><%= a.online ? '🟢 応答あり' : '⚪ 応答なし' %><br><small><%= a.heartbeat_at ? new Date(a.heartbeat_at).toLocaleString('ja-JP') : '-' %></small></td>
+            <td><%= a.bpac === false ? '⚠ b-PAC 未導入' : (a.paper_ok === false ? '⚠ 用紙「箱ラベル 62x67」未登録' : (a.online ? 'OK' : '-')) %><br><small><%= a.heartbeat_note || '' %></small></td>
+            <td><button class="btn-sm" onclick="revokeDevice(<%= a.id %>)">解除</button></td>
+          </tr>
+        <% } %>
+        <% if (printAgents.length === 0) { %><tr><td colspan="5">印刷係はまだ登録されていません</td></tr><% } %>
+      </table>
+      <h3 style="margin-top:14px">直近の印刷ジョブ</h3>
+      <p class="hint">
+        <b>❓ 結果不明</b> は紙が出たかもしれない状態。二重印刷を避けるため自動では刷り直しません (iPad で「実物を確認した」にチェックして再発行)。
+        <b>🙋 印刷係が応答しません</b> は いろはPC が寝ている / 印刷係が動いていないときで、自動印刷は取り消してあります (P-touch Editor で手で刷る)。
+      </p>
+      <table class="iw-list">
+        <tr><th>日時</th><th>商品</th><th>枚数</th><th>数量 / 期限</th><th>状態</th><th>依頼</th></tr>
+        <% for (const j of printJobs) { %>
+          <tr>
+            <td><%= new Date(j.created_at).toLocaleString('ja-JP') %></td>
+            <td><%= j.product_name %><br><small><%= j.product_code || '' %> <%= j.barcode %></small></td>
+            <td><%= j.copies %></td>
+            <td><%= j.pack_qty || '-' %> / <%= j.expiry_text || '-' %></td>
+            <td><%= j.label %><% if (j.error) { %><br><small><%= j.error %></small><% } %></td>
+            <td><%= j.requested_by || '' %><br><small><%= j.device_label || '' %></small></td>
+          </tr>
+        <% } %>
+        <% if (printJobs.length === 0) { %><tr><td colspan="6">まだ印刷ジョブはありません</td></tr><% } %>
+      </table>
+    </div>
+
     <% } %>
 
     <!-- 中原さん 2026-09-05:「あとで誰がいつ何の作業をしたのかを検索できるようになっているといい」 -->
@@ -656,6 +709,24 @@
       const { json } = await post('/admin/sessions/' + id + '/void', { reason });
       if (json.ok) location.reload();
       else alert(json.message || '取り消しできませんでした');
+    }
+    // 🏷 印刷係 (いろはPC の QL-800) の登録 → トークンを 1 回だけ表示
+    async function registerAgent() {
+      const label = document.getElementById('agentLabel').value.trim();
+      const printer = document.getElementById('agentPrinter').value.trim();
+      if (!label || !printer) { setMsg('agentMsg', 'err', '端末名とプリンター名を入れてください'); return; }
+      if (!confirm('印刷係として「' + label + '」を登録します。出力先プリンター: ' + printer + ' — よろしいですか?')) return;
+      const { json } = await post('/admin/devices', { label, kind: 'agent', printer_name: printer });
+      if (!json.ok) { setMsg('agentMsg', 'err', json.message || '登録できませんでした'); return; }
+      setMsg('agentMsg', 'ok', '登録しました (トークンは下に 1 回だけ出ます)');
+      document.getElementById('agentOut').style.display = 'block';
+      document.getElementById('agentToken').textContent = json.token;
+    }
+    async function savePrinter(id) {
+      const box = document.querySelector('.dev-printer[data-id="' + id + '"]');
+      const { json } = await post('/admin/devices/' + id + '/printer', { printer_name: box ? box.value.trim() : '' });
+      if (json.ok) { alert('保存しました' + (json.cancelled ? ' (印刷待ちだった ' + json.cancelled + ' 件は取り消し)' : '')); location.reload(); }
+      else alert(json.message || '保存できませんでした');
     }
     async function revokeDevice(id) {
       if (!confirm('この端末の登録を解除しますか? (その iPad は使えなくなります)')) return;

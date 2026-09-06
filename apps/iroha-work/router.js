@@ -20,7 +20,7 @@ import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
   getDB,
-  createDevice, verifyDevice, revokeDevice, listDevices,
+  createDevice, verifyDevice, revokeDevice, listDevices, setAgentPrinter,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
   listIrohaWorkers, getIrohaWorker, addIrohaWorker, setIrohaWorkerActive,
@@ -39,6 +39,7 @@ import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
 import { setTaskBlock, clearTaskBlock, undoTaskBlock, blockedOf } from './tasks-db.js';
 import { notifyStaff, materialsShortageText } from './notify.js';
+import { enqueuePrintJob, leaseNextJob, markSubmitted, markFinished, getJobStatusFor, recordHeartbeat, listPrintAgents, latestJobsByTask, listPrintJobs, publicJob, MAX_COPIES, LEASE_SEC } from './print-queue.js';
 
 // ─── 誤タップの取り消しの「切符」(監修 2026-09-05 / Codex PR #1200 R1 #1・#2・#7) ───
 //   止めた・札を付けた応答にだけ付ける。同じ端末 (ポータルなら同じ利用者) から 60 秒以内に 1 回だけ使える。
@@ -204,9 +205,13 @@ function checkOrigin(req, res, next) {
 function access(req, res, next) {
   if (req.path === '/manifest.json' || req.path === '/sw.js') return next();   // 静的 (中身に秘密なし)
   if (req.path === '/enroll' || req.path === '/enroll/redeem') return next();
+  // 🏷 印刷係 (いろはPC) は Cookie ではなく Authorization ヘッダーで名乗る。/print/ 配下はここでは素通しし、
+  //   router.use('/print', requirePrintAgent) が kind='agent' の端末だけを通す (iPad の端末Cookieでは絶対に印刷ジョブを取れない)
+  if (req.path === '/print' || req.path.startsWith('/print/')) return next();
   if (hasSessionAccess(req)) { req.iwUser = req.session.email; return next(); }
   const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
-  if (device) { req.iwDevice = device; return next(); }
+  // エージェントのトークンを Cookie に入れても作業画面には入れない (端末の種別ごとに入口を分ける)
+  if (device && device.kind !== 'agent') { req.iwDevice = device; return next(); }
   if (req.path.startsWith('/api/')) return res.status(401).json({ ok: false, error: 'unauthorized', message: 'ログインまたは端末登録が必要です' });
   if (req.session) req.session.returnTo = req.originalUrl;
   return res.redirect(`${BASE}/enroll`);
@@ -306,12 +311,83 @@ const api = fn => async (req, res) => {
 
 // 選択肢 (資材・保管箱) は作業仕様マスタの値から補充してから返す (Excel 再取込後も候補に出る)。
 // seed 自体がマスタの変化を見て (件数+最終更新) 変わった時だけ走る。失敗しても候補は前回のまま返し、次回また試す
+/** 🏷 カードごとの最新の印刷ジョブ (無ければ null) を付ける */
+function attachPrintJobs(cards) {
+  const jobs = latestJobsByTask();
+  for (const c of cards || []) c.print_job = jobs.get(Number(c.id)) || null;
+}
+
 function workOptionsForState(includeInactive = false) {
   try { seedWorkOptionsFromMaster(); } catch (e) { console.warn('[iroha-work] 選択肢の補充に失敗 (候補は前回のまま)', e.message); }
   return workOptionsByKind(includeInactive);
 }
 
 router.use(access);
+
+// ─── 🏷 保管箱ラベル印刷キュー: いろはPC の印刷係 (エージェント) が pull で取りに来る ───
+// 契約 = 共有ドライブ『入荷バーコード発行\箱ラベル印刷係\README.md』「サーバー側の契約」(agent.ps1 が前提にしている API 形状。
+// inbound-check の値札印刷 (/apps/inbound-check/print/*) と同じ形 + expiry)。ここを変えるときはエージェント側も直す
+/** エージェント認証。**Authorization ヘッダーのみ**で、iPad の端末Cookieは受け付けない */
+function requirePrintAgent(req, res, next) {
+  const m = /^Bearer\s+(\S+)$/.exec(req.headers.authorization || '');
+  const device = m ? verifyDevice(m[1]) : null;
+  if (!device || device.kind !== 'agent') {
+    return res.status(401).json({ ok: false, error: 'unauthorized', message: '印刷係 (エージェント) として認証されていません' });
+  }
+  req.printAgent = device;
+  next();
+}
+// /print/ 配下は**この1行で**エージェント認証を必須にする (個々のルートには付けない — 二重に verifyDevice しない)
+router.use('/print', requirePrintAgent);
+
+/** 次に刷るものを1件 lease して返す。無ければ 204 (エージェントは数秒後にまた聞きに来る) */
+router.get('/print/next', api((req, res) => {
+  // 出力先プリンターが登録されていない端末には**lease する前に**断る (掴んでから断ると unknown に落ちる)
+  if (!req.printAgent.printer_name) {
+    return res.status(409).json({ ok: false, error: 'no_printer', message: 'この端末に出力先プリンターが登録されていません (管理画面で登録してください)' });
+  }
+  const job = leaseNextJob(req.printAgent);
+  if (!job) return res.status(204).end();
+  res.json({ ok: true, job });
+}));
+
+/** エージェントが再起動したとき、掴んでいたジョブがどうなったか確かめる照会 (自分の lease 分のみ) */
+router.get('/print/:id(\\d+)/status', api((req, res) => {
+  const row = getJobStatusFor(Number(req.params.id), req.printAgent.id);
+  if (!row) return res.status(404).json({ ok: false, error: 'not_found', message: 'このジョブを保持していません' });
+  res.json({ ok: true, job: row });
+}));
+
+router.post('/print/:id(\\d+)/submitted', api((req, res) => {
+  const r = markSubmitted(Number(req.params.id), {
+    deviceId: req.printAgent.id, leaseToken: String(req.body?.lease || ''),
+    spoolJobId: req.body?.spool_job_id ?? null,
+  });
+  if (!r.ok) return res.status(409).json({ ok: false, error: r.reason === 'submission_conflict' ? 'submission_conflict' : 'not_leased', message: r.message || `報告を受け付けられません (${r.reason})` });
+  res.json({ ok: true, replayed: !!r.replayed });
+}));
+
+router.post('/print/:id(\\d+)/completed', api((req, res) => {
+  // 「刷れた/刷れなかった」は真偽値でしか受け取らない (未指定・"false" を成功扱いにしない)
+  if (typeof req.body?.ok !== 'boolean') return res.status(400).json({ ok: false, error: 'bad_ok', message: 'ok は true / false で送ってください' });
+  const r = markFinished(Number(req.params.id), {
+    deviceId: req.printAgent.id, leaseToken: String(req.body.lease || ''),
+    ok: req.body.ok, error: req.body.error ?? null,
+    uncertain: req.body.uncertain === true,   // 「刷れなかった」と言い切れない → unknown (実物を確認)
+  });
+  if (!r.ok) return res.status(409).json({ ok: false, error: 'not_leased', message: `報告を受け付けられません (${r.reason})` });
+  res.json({ ok: true, replayed: !!r.replayed, state: r.state });
+}));
+
+router.post('/print/heartbeat', api((req, res) => {
+  const b = req.body || {};
+  recordHeartbeat(req.printAgent.id, {
+    note: b.note ?? null, version: b.version ?? null, bpac: b.bpac, host: b.host ?? null,
+    paperFormat: b.paperFormat ?? null, paperFormatOk: b.paperFormatOk, printerReports: b.printerReports ?? null,
+  });
+  res.json({ ok: true, lease_sec: LEASE_SEC });
+}));
+
 
 // ─── Service Worker (Render 再起動中でも画面が真っ白にならないための、画面 HTML のフォールバック) ───
 // 認証の外だが中身は静的。no-cache で更新をすぐ拾わせる
@@ -402,12 +478,15 @@ router.get('/api/state', api(async (req, res) => {
     ? { fresh: true, lastRefreshAt: new Date().toISOString(), error: null, truncated: false }
     : await ensureFresh();
   const list = appMode ? buildTaskList() : buildList();
+  if (appMode) attachPrintJobs(list.cards);   // 🏷 箱ラベルの最新ジョブをカードに付ける (アプリ正本のみ)
   const staffMode = staffModeOf(req);   // 1 回だけ読む (許可リストと staff_mode が食い違わない — Codex P1 R2)
   res.json({
     ok: true,
     ...list,
     workers: listIrohaWorkers(),
     options: workOptionsForState(),
+    // 🏷 印刷できる いろはPC (出力先)。空なら画面はボタンを描かない (押しても出ないボタンを見せない)
+    print_agents: appMode ? listPrintAgents() : [],
     refresh,
     // 画面に許す操作。画面はこのリストにある操作だけ描く (default-deny — 要件 v1.3 §P Q5)。
     // 計画 (いつ / どこが) は職員モードのときだけ入る (要件 §W-1)
@@ -418,6 +497,45 @@ router.get('/api/state', api(async (req, res) => {
     me: { session: req.iwUser || null, device: req.iwDevice ? { id: req.iwDevice.id, label: req.iwDevice.label } : null, admin: isAdmin(req) },
   });
 }));
+
+// ─── 🏷 保管箱ラベルを いろはPC の QL-800 から出す (中原さん 2026-09-06) ───
+// 商品名・商品コード・バーコードは**カードの行から**取る (画面の値を信じない)。1 箱に何個・期限・枚数は人が決めた値。
+// 二重印刷の防ぎ方 (冪等ID / 進行中は積めない / ❓のあとは実物確認の証跡必須) は print-queue.js
+const numOrNull = (v) => (v == null || v === '' ? null : Number(v));
+router.post('/api/print/jobs', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: '箱ラベルの印刷はアプリ正本のときだけです' });
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  const b = req.body || {};
+  const tid = parseTaskId(b.task_id);
+  if (tid == null) return res.status(400).json(BAD_TASK_ID);
+  const deviceLabel = req.iwDevice ? req.iwDevice.label : (req.iwUser || null);
+  const r = enqueuePrintJob({
+    taskId: tid, copies: numOrNull(b.copies),
+    packQty: b.pack_qty == null || b.pack_qty === '' ? null : b.pack_qty,
+    expiry: b.expiry == null ? null : String(b.expiry),
+    targetDeviceId: numOrNull(b.target_device_id),
+    clientRequestId: b.client_request_id,
+    acknowledgeUnknownJobId: numOrNull(b.acknowledge_unknown_job_id),
+    requestedBy: w.worker.display_name, requestedDevice: deviceLabel,
+  });
+  // 記録 (だれが・どの端末で・何枚)。再送 (replayed) は積んでいないので書かない
+  if (!r.replayed) {
+    logEvent({ action: 'label_print', workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel,
+      to: r.ok ? `task#${tid} ${r.job.copies}枚 → ${r.job.printer_name}` : `task#${tid}`, ok: r.ok, error: r.ok ? null : (r.message || r.error) });
+  }
+  if (!r.ok) {
+    const status = ['in_progress', 'confirm_unknown', 'confirm_manual', 'state_changed', 'idempotency_conflict', 'closed_task'].includes(r.error) ? 409 : r.error === 'not_found' ? 404 : 400;
+    return res.status(status).json(r);
+  }
+  res.json(r);
+}));
+
+// 印刷できる いろはPC (出力先) の一覧。2台以上あるときは iPad がここから選ぶ
+router.get('/api/print/targets', api((req, res) => {
+  res.json({ ok: true, max_copies: MAX_COPIES, agents: listPrintAgents() });
+}));
+
 
 // 手動の「いま更新」。連打で Notion を叩かないよう 15 秒のクールダウン
 let refreshLastAt = 0;
@@ -1910,6 +2028,8 @@ router.get('/admin', requireSession, api((req, res) => {
     migration: migrationStatus(),
     source: sourceOfTruth(),
     devices: isAdmin(req) ? listDevices() : [],
+    printAgents: listPrintAgents(),
+    printJobs: listPrintJobs(30).map(j => ({ ...publicJob(j), device_label: j.device_label })),
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
     events: listEvents(50),
     sessions: listSessionsForAdmin(50),
@@ -1932,6 +2052,19 @@ router.post('/admin/enroll-codes', checkOrigin, requireAdmin, api((req, res) => 
 router.post('/admin/devices', checkOrigin, requireAdmin, api((req, res) => {
   const label = String(req.body?.label || '').trim();
   if (!label || label.length > 40) return res.status(400).json({ ok: false, error: 'bad_label', message: '端末名を1〜40文字で入力してください' });
+  // 🏷 印刷係 (いろはPC) は iPad と発行導線は同じだが扱いが逆:
+  //   - Cookie ではなく**平文トークンをこの1回だけ画面に表示**する (エージェントの config.json に貼る)
+  //   - 管理者セッションは破棄しない (登録しているのは中原さんの PC で、共用端末ではない)
+  //   - 出力先プリンター名をサーバー側で紐づける (エージェントの設定ミスで別プリンターに出さない)
+  if (String(req.body?.kind || '') === 'agent') {
+    let created;
+    try {
+      created = createDevice(label, req.session.email, { kind: 'agent', printerName: req.body?.printer_name });
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: 'bad_printer', message: e.message });
+    }
+    return res.json({ ok: true, kind: 'agent', id: created.id, token: created.token });
+  }
   const { token, id: deviceId } = createDevice(label, req.session.email);
   req.session.destroy((err) => {
     if (err) {
@@ -1954,6 +2087,18 @@ router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, requireAdmin, api((r
   if (!revokeDevice(Number(req.params.id))) return res.status(404).json({ ok: false, error: 'not_found', message: '端末が見つかりません' });
   res.json({ ok: true });
 }));
+
+// 🏷 印刷係の出力先プリンターを付け替える (登録し直さずに直せるように)
+router.post('/admin/devices/:id(\\d+)/printer', checkOrigin, requireAdmin, api((req, res) => {
+  const r = setAgentPrinter(Number(req.params.id), req.body?.printer_name);
+  res.status(r.ok ? 200 : (r.error === 'not_agent' ? 404 : 400)).json(r);
+}));
+
+// 管理画面の「直近の印刷ジョブ」を更新なしで見るための JSON (管理者)
+router.get('/admin/print-jobs', requireAdmin, api((req, res) => {
+  res.json({ ok: true, jobs: listPrintJobs(50).map(j => ({ ...publicJob(j), device_label: j.device_label })), agents: listPrintAgents() });
+}));
+
 
 // ─── 作業者 (いろは名簿) の管理 ───
 router.post('/admin/workers', checkOrigin, requireAdmin, api((req, res) => {

@@ -568,6 +568,18 @@
   .mfields input:focus,.pin:focus{outline:2px solid var(--accent);outline-offset:-1px}
   /* 確認・PIN・理由の専用ダイアログ (window.prompt / confirm の置き換え — 監修 R-1)。他のダイアログの上に重なる */
   .overlay.ask{z-index:25}
+  /* 🏷 保管箱ラベル (いろはPC の QL-800) — 印刷の状態札とダイアログ (中原さん 2026-09-06) */
+  .pjob{display:inline-block;font-size:13px;line-height:1.4;padding:6px 10px;border-radius:8px;background:#EEF1F6;color:#4B5563;margin:6px 0 0;max-width:100%}
+  .pjob.s-completed{background:#DCF7E3;color:#1B7A3D}
+  .pjob.s-failed{background:#FDE2E2;color:#B42323;font-weight:700}
+  .pjob.s-unknown,.pjob.s-manual{background:#FFF1BF;color:#7A5C00;font-weight:700}
+  .pjob.s-queued,.pjob.s-leased,.pjob.s-submitted{background:#E3EEFF;color:#1F4FBF}
+  .pwarn{font-size:13px;line-height:1.5;color:#7A5C00;background:#FFF1BF;padding:8px 10px;border-radius:8px;margin-top:8px}
+  .pfld{margin:10px 0}
+  .pfld label{display:block;font-size:12px;color:#6B7280;margin-bottom:4px}
+  .pfld .ro{font-size:15px;line-height:1.4}
+  .pfld input,.pfld select{width:100%;font-size:18px;padding:8px 10px;border:1px solid #C9D1E0;border-radius:8px;box-sizing:border-box;background:#fff}
+
   .ask .modal{max-width:520px}
   .asktext{font-size:1.02rem;font-weight:600;white-space:pre-wrap;margin:6px 0 12px;color:var(--ink);line-height:1.5}
   .ask .btn.warn{color:var(--danger);border-color:var(--danger)}
@@ -894,6 +906,19 @@
       <div class="mbtns">
         <button class="btn" id="askCancel" onclick="askDone(false)">やめる</button>
         <button class="btn primary" id="askOk" onclick="askDone(true)">はい</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 🏷 保管箱のラベルを出す (いろはPC の Brother QL-800。入荷受付チェックの値札発行と同じ流れ) ══ -->
+  <div class="overlay" id="printOv">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="printTitle">
+      <h3 id="printTitle" tabindex="-1">🏷 保管箱のラベルを出す</h3>
+      <div id="printBody"></div>
+      <div class="msaving" id="printMsg"></div>
+      <div class="mbtns">
+        <button class="btn" id="printCancel" onclick="closePrintBox()">やめる</button>
+        <button class="btn primary" id="printOk" onclick="submitPrint()">🏷 発行する</button>
       </div>
     </div>
   </div>
@@ -2260,6 +2285,157 @@ function lockDeviceStaffMode() {
 //   prompt 相当:  ask({ title, text, input: 'pin' | 'text', placeholder, required }) → 文字列 / null (やめた)
 let askResolve = null;
 let askOpts = null;
+// ═══ 🏷 保管箱ラベル (いろはPC の QL-800) — 入荷受付チェックの値札発行と同じ流れ (中原さん 2026-09-06) ═══
+// ラベル = 『バーコード印字.lbx』(商品名・1 箱に何個・期限・バーコード)。商品名・バーコードはサーバーがカードの行から取る。
+// 1 箱に何個 (既定 = 作業のやり方の入数)・期限 (既定 = この入荷の有効期限)・枚数 (既定 = 必要保管箱の数) は人が確かめて送る
+const PRINT_ACTIVE = ['queued', 'leased', 'submitted'];
+function printAgents() { return state.print_agents || []; }
+// JAN = 数字だけ / FNSKU = 英字を含む英数字 (サーバー・エージェントと同じ規則)
+function barcodeTypeOf(bc) {
+  const s = String(bc == null ? '' : bc).trim();
+  if (!s) return null;
+  if (/^[0-9]+$/.test(s)) return 'jan';
+  if (/^[A-Za-z0-9]+$/.test(s) && /[A-Za-z]/.test(s)) return 'fnsku';
+  return null;
+}
+/** 詳細の「🏷 箱ラベル」ボタン。許可が無い / 印刷係が 1 台も無い / バーコードが無いカードには描かない (押しても出ないボタンを見せない) */
+function printBtnHtml(c) {
+  if (!can('task.label.print') || printAgents().length === 0 || !barcodeTypeOf(c.barcode)) return '';
+  const j = c.print_job;
+  if (j && PRINT_ACTIVE.includes(j.state)) return '<button class="edit" disabled>🖨 印刷中…</button>';
+  const label = j && (j.state === 'unknown' || j.state === 'manual') ? '🏷 もう一度出す' : (j && j.state === 'completed' ? '🏷 追加で出す' : '🏷 箱ラベル');
+  return '<button class="edit" data-id="' + esc(String(c.id)) + '" onclick="openPrintBox(this.dataset.id)">' + label + '</button>';
+}
+/** 最新の印刷結果の札 (✅ / ⚠ / ❓ / 🙋)。60 秒ごとの取り直しで新しくなる */
+function printJobHtml(c) {
+  const j = c.print_job;
+  if (!j) return '';
+  let extra = '';
+  if (j.state === 'unknown') extra = '<br><b>もう 1 回押す前に QL-800 の実物を見る</b>';
+  else if (j.state === 'manual') extra = '<br>P-touch Editor で手で刷ってください';
+  else if (j.state === 'failed' && j.error) extra = '<br>' + esc(String(j.error).slice(0, 80));
+  return '<div class="pjob s-' + esc(j.state) + '">' + esc(j.label || j.state) + ' <span class="num">' + esc(String(j.copies)) + '枚 ' + esc(fmtTime(j.finished_at || j.updated_at)) + '</span>' + extra + '</div>';
+}
+let printCtx = null;   // { id, reqId, saving }。reqId = 冪等 ID (同じ依頼の再送は同じ ID → 2 枚出ない)
+function printWarnHtml(a) {
+  const warn = [];
+  if (!a) return '';
+  if (!a.online) warn.push('いろはPC の印刷係がしばらく応答していません。押しても出ないときは いろはPC の電源・スリープを確認してください');
+  if (a.bpac === false) warn.push('いろはPC に b-PAC が入っていないため、いまは印刷できません');
+  if (a.paper_ok === false) warn.push('QL-800 に用紙「箱ラベル 62x67」が登録されていないため、印刷に失敗します');
+  return warn.length ? '<div class="pwarn">⚠ ' + warn.map(esc).join('<br>⚠ ') + '</div>' : '';
+}
+function openPrintBox(id) {
+  const c = findCard(id);
+  if (!c) return;
+  if (!worker) { openGate(); return; }
+  const agents = printAgents();
+  if (agents.length === 0) { showErr('ラベルを印刷する いろはPC が登録されていません (管理画面で印刷係を登録)'); return; }
+  printCtx = { id: c.id, reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), saving: false };
+  const m = c.master || {};
+  const type = barcodeTypeOf(c.barcode);
+  const units = m.units_per_container != null ? String(m.units_per_container) : '';
+  const boxes = c.boxes_calc && c.boxes_calc.boxes ? c.boxes_calc.boxes : 1;
+  const copies = Math.min(50, Math.max(1, boxes));
+  // 期限の既定: この入荷の有効期限 → 無ければ「期限シールあり」の商品だけ印を入れる (無い商品は空欄)
+  const expiry = c.expiry ? String(c.expiry) : (m.expiry_seal === 1 ? '期限シールあり' : '');
+  const first = agents.find(a => a.online) || agents[0];
+  const opts = agents.map(a => '<option value="' + a.id + '"' + (a.id === first.id ? ' selected' : '') + '>' + esc(a.label) + ' — ' + esc(a.printer_name || '(プリンター未登録)') + (a.online ? '' : ' (応答なし)') + '</option>').join('');
+  // 🚨 直前が「❓ 結果不明」「🙋 手で刷る扱い」なら、実物を見た / 手で刷っていない ことをチェックさせてからしか送らない
+  //    (サーバーも同じ証跡を要求する。manual を素通しすると職員の手刷りと競合して 2 枚 — Codex PR #1220 R1)
+  const prev = c.print_job && (c.print_job.state === 'unknown' || c.print_job.state === 'manual') ? c.print_job : null;
+  const prevAt = prev ? esc(String(prev.copies)) + '枚 ' + esc(fmtTime(prev.finished_at || prev.updated_at)) : '';
+  const ack = !prev ? '' : prev.state === 'unknown'
+    ? '<div class="pwarn">❓ 前回 (' + prevAt + ') の印刷結果が不明です。<b>QL-800 の実物を見て</b>、ラベルが出ていない場合だけ発行してください。<br>'
+      + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printAck"> 実物を確認した (ラベルは出ていない)</label></div>'
+    : '<div class="pwarn">🙋 前回 (' + prevAt + ') は印刷係が応答せず、<b>手で刷る</b>扱いになっています。まだ手で刷っていない場合だけ発行してください (刷ってあれば 2 枚になります)。<br>'
+      + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printAck"> 手で刷っていない (P-touch Editor で出していない)</label></div>';
+  $('#printBody').innerHTML =
+    '<div class="pfld"><label>商品</label><div class="ro"><b>' + esc(c.title) + '</b><br><span class="num">' + esc(c.product_code || '') + '</span></div></div>' +
+    '<div class="pfld"><label>バーコード</label><div class="ro num">' + esc(c.barcode || '') + ' <small>(' + (type ? type.toUpperCase() : '不明') + ')</small></div></div>' +
+    '<div class="pfld"><label>1 箱に何個 (ラベルの「数量」。空欄なら印字しない)</label><input type="number" inputmode="numeric" min="1" step="1" id="printPack" value="' + esc(units) + '" placeholder="未登録"></div>' +
+    '<div class="pfld"><label>期限 (空欄なら印字しない)</label><input type="text" id="printExpiry" maxlength="40" value="' + esc(expiry) + '" placeholder="例: 2027-03"></div>' +
+    '<div class="pfld"><label>枚数 (1〜50。目安 = 必要保管箱 ' + esc(String(boxes)) + ' 箱)</label><input type="number" inputmode="numeric" min="1" max="50" step="1" id="printCopies" value="' + copies + '"></div>' +
+    '<div class="pfld"><label>出力先 (いろはPC)</label>' + (agents.length > 1 ? '<select id="printTarget">' + opts + '</select>'
+      : '<div class="ro" data-target="' + first.id + '">' + esc(first.label) + ' — ' + esc(first.printer_name || '') + (first.online ? '' : ' <small>(応答なし)</small>') + '</div>') + '</div>' +
+    '<div id="printWarn">' + printWarnHtml(first) + '</div>' + ack;
+  $('#printMsg').textContent = '';
+  $('#printOk').disabled = false;
+  openOverlay('#printOv');
+}
+// 選んだ出力先の状態 (応答なし / b-PAC なし / 用紙未登録)。select を変えたら描き直す
+$('#printBody').addEventListener('change', (ev) => {
+  if (!ev.target || ev.target.id !== 'printTarget') return;
+  const a = printAgents().find(x => x.id === Number(ev.target.value));
+  const w = $('#printWarn');
+  if (w) w.innerHTML = printWarnHtml(a);
+});
+function closePrintBox() { if (printCtx && printCtx.saving) return; closeOverlay('#printOv'); printCtx = null; }
+$('#printOv').addEventListener('click', (e) => { if (e.target === $('#printOv')) closePrintBox(); });
+async function submitPrint() {
+  const ctx = printCtx;
+  if (!ctx || ctx.saving) return;
+  const c = findCard(ctx.id);
+  if (!c) { closePrintBox(); return; }
+  const packRaw = ($('#printPack').value || '').trim();
+  const expiry = ($('#printExpiry').value || '').trim();
+  const copies = Number($('#printCopies').value);
+  const msgEl = $('#printMsg');
+  if (packRaw && (!/^[0-9]+$/.test(packRaw) || Number(packRaw) < 1)) { msgEl.textContent = '❌ 1 箱に入れる数は 1 以上の整数で入れてください (空欄なら印字しません)'; return; }
+  if (!Number.isInteger(copies) || copies < 1 || copies > 50) { msgEl.textContent = '❌ 枚数は 1〜50 で入れてください'; return; }
+  if (expiry.length > 40) { msgEl.textContent = '❌ 期限は 40 字までで入れてください'; return; }
+  const sel = $('#printTarget');
+  const tEl = $('#printBody').querySelector('[data-target]');
+  const target = sel ? Number(sel.value) : (tEl ? Number(tEl.getAttribute('data-target')) : null);
+  const prev = c.print_job && (c.print_job.state === 'unknown' || c.print_job.state === 'manual') ? c.print_job : null;
+  const ackEl = $('#printAck');
+  if (prev && !(ackEl && ackEl.checked)) {
+    msgEl.textContent = prev.state === 'unknown'
+      ? '❌ QL-800 の実物を確認して、「実物を確認した」にチェックしてください (出ていたらそれを使います)'
+      : '❌ 手で刷っていないことを確かめて、「手で刷っていない」にチェックしてください (刷ってあればそれを使います)';
+    return;
+  }
+  ctx.saving = true;
+  $('#printOk').disabled = true;
+  msgEl.textContent = '送信しています…';
+  let j;
+  try {
+    j = await apiFetch('/api/print/jobs', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        task_id: c.id, worker_id: worker.id, copies, pack_qty: packRaw || null, expiry: expiry || null,
+        target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
+      }),
+    });
+  } catch (e) {
+    ctx.saving = false;
+    msgEl.textContent = '❌ 送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2 枚にはなりません)';
+    $('#printOk').disabled = false;
+    return;
+  }
+  ctx.saving = false;
+  if (j.ok) {
+    c.print_job = j.job;
+    closePrintBox();
+    renderDetail(c);
+    toast('🏷 ' + c.title + ' の箱ラベル ' + j.job.copies + '枚 を いろはPC に依頼しました。出たら ✅ が出ます');
+    return;
+  }
+  if (j.job) c.print_job = j.job;
+  if (j.error === 'in_progress') { closePrintBox(); renderDetail(c); return; }
+  if (j.error === 'confirm_unknown' || j.error === 'confirm_manual') {
+    // 画面が古かった (別の iPad で発行されて結果不明になった等)。最新のジョブで開き直す
+    renderDetail(c); openPrintBox(c.id);
+    $('#printMsg').textContent = j.message || '前回の印刷結果が不明です。実物を確認してください';
+    return;
+  }
+  if (j.error === 'idempotency_conflict') { closePrintBox(); renderDetail(c); showErr(j.message || '同じ依頼 ID で違う内容が送られました。画面を更新してください'); return; }
+  if (j.error === 'state_changed') { closePrintBox(); renderDetail(c); showErr(j.message || '前回のジョブの状態が変わりました'); return; }
+  if (j.error === 'worker_required') { closePrintBox(); openGate(); return; }
+  msgEl.textContent = '❌ ' + (j.message || j.error || '送れませんでした');
+  $('#printOk').disabled = false;
+}
+
 function ask(o) {
   return new Promise((resolve) => {
     if (askResolve) askResolve(null);   // 前のが開いたままなら「やめた」扱いで閉じる (2 つ重ねない)
@@ -3298,6 +3474,8 @@ function headNumsHtml(c) {
     n('想定作業時間', c.plan_hours != null ? approxHours(c.plan_hours) : null, '') +
     (over > 0 ? '<div class="n unk"><label>つくる数より</label><div class="v">+' + esc(String(over)) + '<span class="u">個</span></div></div>' : '') +
     (canEditProgress(c) ? '<button class="edit" onclick="openDq(null)">✎ できた数</button>' : '') +
+    printBtnHtml(c) +
+    printJobHtml(c) +
     '</div>';
 }
 /**
@@ -4860,7 +5038,7 @@ if ('serviceWorker' in navigator) {
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if ($('#askOv').classList.contains('on')) { askDone(false); return; }   // 確認ダイアログだけ閉じる (下のダイアログは残す)
-  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeFacPick(); closeWhenPick(); closeDetail();
+  stopScan(); closeLb(); closeSt(); closeMaster(); closeBlock(); closeDone(); closeUnblock(); closeFacPick(); closeWhenPick(); closePrintBox(); closeDetail();
 });
 </script>
 </body>
