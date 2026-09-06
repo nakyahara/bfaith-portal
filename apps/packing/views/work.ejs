@@ -1559,16 +1559,23 @@
       showToast(rest.length ? '欠品の報告を1品取り消しました' : '欠品の報告を取り消しました。そのまま梱包して「次へ」を押してください');
       render();
     });
+    let foundBusy = false;
     $('foundBtn').addEventListener('click', async () => {
+      if (foundBusy) return;
       const seq = viewSeq;
-      // ピッカーが既に取りに向かっている依頼を取り下げると、3階のバッチが取り消され3階の画面に知らせが出る (D-3)。
-      // 状態は描画時のスナップショットなので、確認の直前に最新化する (通信できなければ手元の状態で)
-      try { await resync(); } catch { /* 手元の状態で続行 */ }
-      const rs = (STATE.repickBySlip || {})[seq];
-      const note = rs === 'claimed' ? '⚠ ピッカーが既に取りに向かっています。取り下げると3階のバッチも取り消され、3階の画面に知らせが出ます。\n\n'
-        : rs === 'fulfilled' ? '⚠ 3階は既に取り終えて、届ける途中かもしれません。\n\n' : '';
-      if (!confirm(`${note}商品が見つかったため、再ピック依頼とミス候補を取り下げます。よろしいですか?`)) return;
-      enqueue('found', seq, { confirm_cancel: true });   // 直前に確認した = サーバーの確認要求 (409) を通す
+      if (!confirm('商品が見つかったため、再ピック依頼とミス候補を取り下げます。よろしいですか?')) return;
+      // ピッカーが既に取りに向かっている (claimed) / 届ける途中 (fulfilled) の依頼は、サーバーが実状態を見て
+      // 409 confirmation_required を返す → その文言で確認してから、確認済みとして送り直す (D-3・Codex PR-6 R2:
+      // 「確認済み」をキューに固定で積むとサーバーの確認を迂回する)。結果が返るまで画面は変えない
+      foundBusy = true;
+      try {
+        let r = await enqueueAndWait('found', seq, {});
+        if (r && !r.ok && r.status === 409 && r.body && r.body.code === 'confirmation_required') {
+          if (!confirm(r.body.error)) return;
+          r = await enqueueAndWait('found', seq, { confirm_cancel: true });
+        }
+        if (!r || !r.ok) { showToast((r && r.body && r.body.error) || '取り下げできませんでした。画面を更新してください'); return; }
+      } finally { foundBusy = false; }
       heldSet.delete(seq); repickSet.delete(seq);
       incidents = incidents.filter((i) => i.slipSeq !== seq || i.kind === 'excess');
       currentSeq = minPending();

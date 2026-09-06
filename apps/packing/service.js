@@ -1820,12 +1820,10 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
       const moving = targets.filter((t) => t.status === 'claimed' || t.status === 'fulfilled');
       if (moving.length > 0 && !confirmCancel) {
         const who = [...new Set(moving.map((t) => t.claimed_by).filter(Boolean))].join('・') || 'ピッカー';
-        const e = new PackError(409, 'confirmation_required',
+        throw new PackError(409, 'confirmation_required',
           moving.some((t) => t.status === 'claimed')
             ? `⚠ ${who} が既に取りに向かっています。取り下げると3階のバッチも取り消され、3階の画面に知らせが出ます。それでも取り下げますか?`
             : `⚠ 3階 (${who}) は既に取り終えて、届ける途中かもしれません。それでも取り下げますか?`);
-        e.body = { code: 'confirmation_required' };
-        throw e;
       }
       for (const t of targets) {
         // close_reason='found' = 1階で見つかった取下げ (3階の 409 文言・監査用)

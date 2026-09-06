@@ -1224,7 +1224,11 @@ function undoLaterRequest(db, lr, now, { actor = null } = {}) {
         WHERE id IN (${mergedIds.map(() => '?').join(',')}) AND status NOT IN ('requested','cancelled')`)
         .get(...mergedIds) != null;
     }
-  } catch { /* packing無効環境 */ }
+  } catch (e) {
+    // packing 無効環境 (pk_pack_tasks が無い) だけ「タスク無し」として続行。それ以外 (BUSY・スキーマ不整合) は伝播 =
+    // 着手済みかどうか確認できないまま依頼と配賦だけ消さない (Codex PR-6 R2)
+    if (!/no such table: pk_pack_tasks/.test(String(e.message))) throw e;
+  }
   if (mergedBusy || tasks.some((t) => t.status !== 'requested')) {
     throw new PkError(409, 'later_in_progress',
       '「後で取りに行く」分は既に対応が始まっているため取り消せません');
@@ -1246,8 +1250,9 @@ function undoLaterRequest(db, lr, now, { actor = null } = {}) {
       }
     }
   }
-  db.prepare(`UPDATE pk_later_requests SET status='cancelled', cancelled_by=?, cancelled_at=?, updated_at=?
-    WHERE id=? AND status IN ('pending_binding','requested')`).run(actor, now, now, lr.id);
+  const changes = db.prepare(`UPDATE pk_later_requests SET status='cancelled', cancelled_by=?, cancelled_at=?, updated_at=?
+    WHERE id=? AND status IN ('pending_binding','requested')`).run(actor, now, now, lr.id).changes;
+  if (changes !== 1) throw new PkError(409, 'stale_later_request', '依頼の状態が更新されています。画面を再読み込みしてください');
   // タスクは依頼と1対1なので、兄弟依頼 (別ロケ明細由来) のタスクには触らない
 }
 
