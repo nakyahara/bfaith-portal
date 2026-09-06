@@ -167,6 +167,34 @@ await t('端末: 箱を作って割当 (worker 必須・request_id 冪等)', asy
 /** 確認した人の3列 (placement_id は API に出さないので DB を直接見る) */
 const cwCols = (rowId) => db.getDB().prepare(
   'SELECT check_worker, check_worker_source, check_worker_placement_id FROM fbx_row_work WHERE row_id = ?').get(rowId) || {};
+await t('応答喪失後の送り直しは、作業者が無効になっていても前回の結果を返す (PQ-R2 high#2)', async () => {
+  const r0 = rows[0];
+  // 残数を1つ空けてから、一時的な作業者で1個入れる (箱は既存の box1 を使う = 後始末を増やさない)
+  const st = await call('GET', `/api/state?run=${runId}`);
+  const mine = st.j.placements.find((x) => x.row_id === r0.id);
+  assert.equal((await call('POST', `/api/placements/${mine.id}/revoke`, { body: { worker_id: memberId } })).j.ok, true);
+  const tmp = await call('POST', '/api/workers', { body: { display_name: 'いちじ', worker_type: 'member', auth_worker_id: staffId, auth_pin: '2468' } });
+  assert.equal(tmp.j.ok, true, JSON.stringify(tmp.j));
+  const p = { run_id: runId, row_id: r0.id, box_id: box1.boxId, qty: 1, worker_id: tmp.j.id, request_id: 'lost-1' };
+  const first = await call('POST', '/api/placements', { body: p });
+  assert.equal(first.j.ok, true, JSON.stringify(first.j));
+  // ここで応答が失われた体。その間に職員がこの作業者を無効にした
+  assert.equal((await call('POST', `/api/workers/${tmp.j.id}/active`, { body: { active: false, auth_worker_id: staffId, auth_pin: '2468' } })).j.ok, true);
+  assert.equal((await call('POST', '/api/placements', { body: Object.assign({}, p, { request_id: 'new-1' }) })).j.error, 'worker_required', '新規は今までどおり止める');
+  const again = await call('POST', '/api/placements', { body: p });   // 同じ request_id で送り直す
+  assert.equal(again.status, 200, JSON.stringify(again.j));
+  assert.equal(again.j.already, true, '登録済みなので前回の結果を返す (入れ直しを促さない)');
+  assert.equal(again.j.placementId, first.j.placementId);
+  assert.equal(again.j.checkWorker, first.j.checkWorker);
+  const conflict = await call('POST', '/api/placements', { body: Object.assign({}, p, { qty: 2 }) });
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.j.error, 'idempotency_conflict', '内容が違う同じ操作IDは今までどおり弾く');
+  // 後始末: 一時の投入を消して、元の投入を戻す
+  assert.equal((await call('POST', `/api/placements/${first.j.placementId}/revoke`, { body: { worker_id: memberId } })).j.ok, true);
+  const back = await call('POST', '/api/placements', { body: { run_id: runId, row_id: r0.id, box_id: mine.box_id, qty: mine.qty, worker_id: memberId, request_id: 'restore-1' } });
+  assert.equal(back.j.ok, true, JSON.stringify(back.j));
+});
+
 await t('確認した人: 投入で自動記録され、intent なしの更新 (旧画面の自動POST) は client_outdated', async () => {
   const st = await call('GET', `/api/state?run=${runId}`);
   const r = st.j.rows.find((x) => x.id === rows[0].id);

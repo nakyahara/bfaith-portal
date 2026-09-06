@@ -358,7 +358,8 @@
     if (!S) return;
     $('#screen-runs').classList.add('hidden');
     $('#screen-work').classList.remove('hidden');
-    if (!worker) pickWorker();
+    // refresh が未確認の記録を出していたら、それを上書きしない (閉じたあとに出す — PQ-R2 high#4)
+    if (!worker && !dialogOpen) pickWorker();
     startPolling();
   }
   function backToRuns() {
@@ -764,12 +765,15 @@
       const j2 = await apiPost(`/api/placements/${btn.dataset.id}/revoke`, { worker_id: worker.id });
       if (!j2.ok) alert(j2.message);
       else if (j2.boxReopened) alert('閉じていた箱の中身を直したので、箱をあけました。もう一度読み合わせて、重さを量って閉じてください');
-      await refresh(true); openRowDialog(rowId);
+      await refresh(true);
+      if (!dialogOpen) openRowDialog(rowId);   // refresh が未確認の記録を出していたら上書きしない
     }));
     dlg.querySelector('#d-add')?.addEventListener('click', async () => {
       const msg = dlg.querySelector('#d-msg');
       if (!worker) { msg.className = 'msg err'; msg.textContent = '先に作業者を選んでください'; pickWorker(); return; }
-      if (!online) { msg.className = 'msg err'; msg.textContent = '通信できないため入力できません'; return; }
+      // 通信断のときは新規入力を止める (要件 §5-7)。ただし送れていない記録が残っているときは、
+      // 押し直し = 再送なので通す (online イベントが来ない障害から抜けられなくなる — PQ-R2 medium#1)
+      if (!online && !placeQueue.peek()) { msg.className = 'msg err'; msg.textContent = '通信できないため入力できません'; return; }
       const qty = Number(dlg.querySelector('#d-qty').value);
       let expiry = knownExpiry ? null : readExpiry(dlg);
       if (expiry === false) { msg.className = 'msg err'; msg.textContent = '期限は 年・月 まで選んでください (日は任意)'; return; }
@@ -805,19 +809,19 @@
         refresh(true);
         return err('別の画面で操作されました。画面を更新してからもう一度押してください');
       case 'broken':
-        return err('前の記録が読めない形で残っています。職員を呼んでください (再読み込みしてから、箱の中身と画面の数を見くらべてください)');
+        reenable();
+        return showBrokenPending(out.record);
       case 'previousFailed':
         // 前の分は登録できていない = 今回の分を自動で送ると何が入ったか分からなくなる。
         // まず失敗を見せて、押し直してもらう
         reenable();
         return showLeftoverPlacement(out.prev);
       case 'showFirst':
-        // 別の商品の見せそびれ。見せて ack してから、いま押した分を送り直す
+        // 別の商品の見せそびれ。見せてから、ack と今回分の保存を**1回の操作で**やる
+        // (間で落ちると今回の現物投入がどこにも残らない — PQ-R2 high#5)
         reenable();
-        return showLeftoverPlacement(out.prev, async () => {
-          const again = await withSaving(() => placeQueue.send({ body: out.body, meta: out.meta }));
-          await handlePlaceOutcome(again, { row: ctx && ctx.row });
-        });
+        return showLeftoverPlacement(out.prev, { body: out.body, meta: out.meta },
+          async (again) => { await handlePlaceOutcome(again, { row: ctx && ctx.row }); });
       case 'confirm':
         return askPlacedAgain(out);
       default:
@@ -830,9 +834,10 @@
     }
     const j = rec.result;
     if (!j.ok) {
+      err(j.message || '登録できませんでした');   // 見せてから消す (消したあとに落ちると伝わらない)
       await placeQueue.ack(rec.requestId);
       if (j._status === 409) refresh(true);
-      return err(j.message || '登録できませんでした');
+      return;
     }
     // 確認した人はサーバーが同じトランザクションで入れている (まだ空の行だけ・入れた人)。
     // 画面から別POSTしないので、通信断で「入れた記録はあるのに確認した人が空」にならない
@@ -842,6 +847,31 @@
     showUndoToast(j.placementId, { product_name: rec.meta && rec.meta.productName }, rec.body.qty, checkWorkerNoteOf(rec, j));
   }
   async function withSaving(fn) { showSaving(true); try { return await fn(); } finally { showSaving(false); } }
+
+  /**
+   * 端末に読めない1件が残っている (壊れた・知らない形)。中身が分からないので勝手に消さず、
+   * **職員が箱とサーバーの記録を見くらべたうえで**捨ててもらう (Codex PQ-R2 high#3)
+   */
+  function showBrokenPending(rec) {
+    const dlg = openDialog(`
+      <h2>⚠ 送れていない記録が読めません</h2>
+      <div class="msg err">この端末に、送れていない記録が残っていますが、中身を読めませんでした${
+        rec && rec.reason ? ` (${esc(rec.reason)})` : ''}。<br>
+        <b>箱に入れた分が記録に入っていないかもしれません。</b></div>
+      <div class="lbl">職員の方へ</div>
+      <div class="msg" style="color:#495057">本社の画面 (または「📋 まとめ」) で、この商品の記録が入っているかを確かめてください。
+        入っていなければ、捨てたあとに現物どおり入れ直してください</div>
+      <div style="margin-top:12px"><button class="bigbtn sub" id="bk-discard">職員が確認しました。この記録を捨てる</button></div>
+      <div class="msg" id="bk-msg"></div>`, { sticky: true });
+    dlg.querySelector('#bk-discard').addEventListener('click', () => {
+      staffPinPrompt(async () => {
+        const okDrop = await placeQueue.discardBroken();
+        closeDialog();
+        if (!okDrop) alert('捨てられませんでした。画面を再読み込みしてください');
+        refresh(true);
+      });
+    });
+  }
 
   /**
    * 「前の分は登録できています。そのあと、さらに入れましたか?」
@@ -863,14 +893,34 @@
       <div style="margin-top:10px"><button class="bigbtn" id="pa-no">いいえ (入れていない)</button></div>
       <div style="margin-top:10px"><button class="selbtn" id="pa-yes" style="width:100%">はい、さらに ${out.body.qty}個 入れた</button></div>
       <div class="msg" style="color:#868E96">迷ったら「いいえ」を押して、箱の中身と画面の数を見くらべてください${
-        prevBox !== nowBox ? '<br>前と違う箱です。入れ直したのなら「いいえ」を押して、職員に記録を直してもらってください' : ''}</div>`,
+        prevBox !== nowBox ? '<br>前と違う箱です。入れ直したのなら「いいえ」を押して、職員に記録を直してもらってください' : ''}</div>
+      <div class="msg" id="pa-msg"></div>`,
       { sticky: true });
+    const paMsg = dlg.querySelector('#pa-msg');
+    const busy = (v) => dlg.querySelectorAll('button').forEach(b => { b.disabled = v; });
     dlg.querySelector('#pa-no').addEventListener('click', async () => {
-      await placeQueue.ack(out.prev.requestId);
+      busy(true);
+      const a = await placeQueue.ack(out.prev.requestId);
+      busy(false);
+      if (!a.ok && a.reason === 'storage_failed') {
+        paMsg.className = 'msg err';
+        paMsg.textContent = 'この端末に保存できませんでした。職員を呼んでください';
+        return;
+      }
       closeDialog();
     });
     dlg.querySelector('#pa-yes').addEventListener('click', async () => {
+      busy(true);
       const again = await withSaving(() => placeQueue.ackAndSend({ ackRequestId: out.prev.requestId, body: out.body, meta: out.meta }));
+      busy(false);
+      // 現物はもう箱に入っている。ここで閉じると記録が漏れるので、送れるまで閉じない (PQ-R2 high#6)
+      if (again.kind === 'conflict' || again.kind === 'broken' || again.kind === 'storage_failed') {
+        paMsg.className = 'msg err';
+        paMsg.textContent = again.kind === 'storage_failed'
+          ? 'この端末に保存できませんでした。職員を呼んでください (箱には追加しないでください)'
+          : '別の画面で操作されたため、いま記録できませんでした。少し待ってもう一度「はい」を押してください (箱には追加しないでください)';
+        return;
+      }
       closeDialog();
       await handlePlaceOutcome(again, {});
     });
@@ -925,7 +975,12 @@
   const placeQueue = createPlaceQueue({
     post: postPlacementDefinitive,
     storage: {
-      get: () => LS.get('pending_place', null),
+      // ⚠ 例外を握り潰さない (LS.get は握り潰す)。読めない・壊れているものを「空」と扱うと、
+      // まだ送れていない記録を新しい記録で上書きしてしまう (Codex PQ-R2 high#3)
+      get: () => {
+        const raw = localStorage.getItem('fbx_pending_place');
+        return raw == null ? null : JSON.parse(raw);
+      },
       set: (v) => { localStorage.setItem('fbx_pending_place', JSON.stringify(v)); },
     },
   });
@@ -934,11 +989,10 @@
    * 8秒で消えるトーストだと、裏で確定した分を見落として押し直し → 二重登録になる
    * (Codex PQ-R1 high#5)。ack は人がボタンを押したあと (Codex PQ-R1 high#2)
    */
-  function showLeftoverPlacement(rec, after) {
+  function showLeftoverPlacement(rec, next, after) {
     const j = rec.result || {}, ok = j.ok === true;
     const name = rec.meta && rec.meta.productName ? rec.meta.productName : 'この商品';
-    const boxCode = (S && S.boxes || []).find(b => b.id === rec.body.box_id);
-    const done = async () => { await placeQueue.ack(rec.requestId); closeDialog(); if (after) await after(); };
+    const boxCode = ((S && S.boxes) || []).find(b => b.id === rec.body.box_id);
     const dlg = openDialog(`
       <h2>${ok ? '✅ さっきの分は記録できています' : '⚠ さっきの分は記録できませんでした'}</h2>
       <div class="pname" style="margin:10px 0">${esc(shortName(name))}
@@ -948,12 +1002,46 @@
         : `<div class="msg err">${esc(j.message || '登録できませんでした')}
             <small style="display:block; font-weight:600">箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)</small></div>`}
       <div style="margin-top:12px"><button class="bigbtn" id="lo-ok">わかりました</button></div>
-      ${ok && j.placementId ? '<div style="margin-top:10px"><button class="selbtn" id="lo-undo" style="width:100%">この記録を取り消す</button></div>' : ''}`,
+      ${ok && j.placementId ? '<div style="margin-top:10px"><button class="selbtn" id="lo-undo" style="width:100%">この記録を取り消す</button></div>' : ''}
+      <div class="msg" id="lo-msg"></div>`,
       { sticky: true });
+    const loMsg = dlg.querySelector('#lo-msg');
+    const busy = (v) => dlg.querySelectorAll('button').forEach(b => { b.disabled = v; });
+    // next があるときは、ack と「いま押した分の保存」を1回の操作で行う (PQ-R2 high#5)
+    const done = async () => {
+      busy(true);
+      try {
+        if (next) {
+          const again = await withSaving(() => placeQueue.ackAndSend({ ackRequestId: rec.requestId, body: next.body, meta: next.meta }));
+          closeDialog();
+          if (after) await after(again);
+          return;
+        }
+        const a = await placeQueue.ack(rec.requestId);
+        if (!a.ok && a.reason === 'storage_failed') {
+          loMsg.className = 'msg err';
+          loMsg.textContent = 'この端末に保存できませんでした。職員を呼んでください (画面を再読み込みすると、この記録がもう一度出ます)';
+          return;
+        }
+        closeDialog();
+        if (after) await after();
+      } finally { busy(false); }
+    };
     dlg.querySelector('#lo-ok').addEventListener('click', done);
     dlg.querySelector('#lo-undo')?.addEventListener('click', async () => {
-      const j2 = await apiPost(`/api/placements/${j.placementId}/revoke`, { worker_id: worker?.id });
-      if (!j2.ok) { alert(j2.message || '戻せませんでした (職員を呼んでください)'); return; }
+      busy(true);
+      try {
+        const j2 = await apiPost(`/api/placements/${j.placementId}/revoke`, { worker_id: worker && worker.id });
+        if (!j2.ok) {
+          loMsg.className = 'msg err';
+          loMsg.textContent = j2.message || '戻せませんでした (通信を確かめて、もう一度押してください)';
+          return;
+        }
+      } catch (e) {
+        loMsg.className = 'msg err';
+        loMsg.textContent = '通信できませんでした。電波を確かめて、もう一度押してください';
+        return;
+      } finally { busy(false); }
       await done();
     });
   }

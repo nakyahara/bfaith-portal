@@ -24,7 +24,7 @@ import {
   createRun, activateRun, setRunStatus, listRuns, getRun, getRunState, finishRun,
   createRunFromPicking, getRunBySource, attachExcelToRun,
   createBox, closeBox, reopenBox, voidBox, listBoxContents, getBox,
-  addPlacement, revokePlacement, adjustPlacement, setPlacementLayer,
+  addPlacement, replayPlacement, revokePlacement, adjustPlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage, setRowSendQty,
   exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
   listProductImages, listRowsNeedingCatalog,
@@ -402,6 +402,15 @@ router.post('/api/workers/:id(\\d+)/active', checkOrigin, api((req, res) => {
 
 /** 割当の追加 (F-2: 原子的残数検証+冪等性) */
 router.post('/api/placements', checkOrigin, api((req, res) => {
+  // 応答喪失後の送り直しは、**作業者の検証より先に**前回の結果を返す (Codex PQ-R2 high#2)。
+  // 登録済みなのに「この作業者は無効になっています」を返すと、画面は「記録できませんでした」と
+  // 出して入れ直しを促し、現物と記録が二重になる。新規のときだけ作業者が要る
+  const replay = replayPlacement({
+    deviceKey: deviceKeyOf(req), requestId: String(req.body?.request_id || ''),
+    runId: Number(req.body?.run_id), rowId: Number(req.body?.row_id), boxId: Number(req.body?.box_id),
+    qty: req.body?.qty, expiry: req.body?.expiry, layer: req.body?.layer,
+  });
+  if (replay) return res.status(replay.ok ? 200 : 409).json(replay);
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const r = addPlacement({

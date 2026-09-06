@@ -1615,6 +1615,31 @@ function syncAutoCheckWorker(d, rowId, { runId, worker, deviceLabel } = {}) {
 }
 
 /**
+ * 冪等の再送 (応答喪失後の送り直し) を、**作業者の検証より先に**返すための引き当て
+ * (Codex PQ-R2 high#2)。登録済みの投入なのに「作業者が無効になっています」を返すと、
+ * 画面は「記録できませんでした」と出して入れ直しを促し、現物と記録が二重になる。
+ * 見つからなければ null。内容が違う同じ操作IDは idempotency_conflict
+ */
+export function replayPlacement({ deviceKey, requestId, runId, rowId, boxId, qty, expiry, layer }) {
+  if (!deviceKey || !requestId) return null;
+  const d = getDB();
+  const prev = d.prepare('SELECT * FROM fbx_placements WHERE device_key = ? AND request_id = ?')
+    .get(String(deviceKey), String(requestId));
+  if (!prev) return null;
+  const q = Number(qty);
+  const exp = expiry ? String(expiry) : null;
+  const lay = layer == null || layer === '' ? null : String(layer);
+  const hash = crypto.createHash('sha256')
+    .update(JSON.stringify([Number(runId), Number(rowId), Number(boxId), q, exp, lay]))
+    .digest('hex');
+  if (prev.request_hash !== hash) {
+    return { ok: false, error: 'idempotency_conflict', message: '同じ操作IDで内容の違う記録が既にあります (画面を更新してやり直してください)' };
+  }
+  return { ok: true, already: true, placementId: prev.id, boxSeq: prev.box_seq,
+    placed: placedOf(d, prev.row_id), expiry: prev.expiry, ...currentCheckWorker(d, prev.row_id) };
+}
+
+/**
  * Excel の差し替えで対象外になった行 (retired) / 添付した Excel に無い行 (picking_only) への更新は拒否
  * (Codex PR2.5 R2: 古い画面からの投入が成功すると、完了判定・出力から外れた「幽霊の投入」になる)
  */

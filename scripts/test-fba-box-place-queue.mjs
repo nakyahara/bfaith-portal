@@ -210,7 +210,7 @@ await t('別の画面が書いた1件は上書きしない (CAS)。ackAndSend �
   const out = await q.send({ body: bodyOf() });
   const mine = out.record.requestId;
   storage.force({ requestId: 'other-tab', body: bodyOf({ row_id: 99 }), status: 'sending' });
-  assert.equal(await q.ack(mine), false, '自分の1件でなければ消さない');
+  assert.equal((await q.ack(mine)).ok, false, '自分の1件でなければ消さない');
   assert.equal(storage.raw().requestId, 'other-tab');
   const conflict = await q.ackAndSend({ ackRequestId: mine, body: bodyOf(), meta: null });
   assert.equal(conflict.kind, 'conflict');
@@ -240,6 +240,48 @@ await t('読めない形が残っていたら上書きせず broken を返す', 
   assert.deepEqual(storage.raw(), { junk: true }, '消さない (中身が分からないので職員が判断する)');
   assert.equal(await q.discardBroken(), true);
   assert.equal(storage.raw(), null);
+});
+
+await t('同じ端末の2画面 (別インスタンス) が同じ storage を使っても二重登録しない (PQ-R2 high#1)', async () => {
+  const server = makeServer(['commit_lost', 'lost']), storage = makeStorage();   // send は2回試す
+  const tabA = mk(server, storage), tabB = mk(server, storage);
+  const a = await tabA.send({ body: bodyOf(), meta: { productName: 'ロジン' } });
+  assert.equal(a.record.status, 'sending');
+  // もう一方の画面が同じ商品を押す → A の未確定分を確定させてから聞く (勝手に新規送信しない)
+  const b2 = await tabB.send({ body: bodyOf(), meta: { productName: 'ロジン' } });
+  assert.equal(b2.kind, 'confirm');
+  assert.equal(server.registered.size, 1, '2画面あっても2件目を作らない');
+  // A が先に ack すると、B の ack は自分の1件でないので効かない
+  assert.equal((await tabA.ack(b2.prev.requestId)).ok, true);
+  assert.equal((await tabB.ack(b2.prev.requestId)).ok, false);
+  assert.equal(storage.raw(), null);
+});
+
+await t('CAS に失敗しても結果は捨てず stored:false で返す', async () => {
+  const server = makeServer(), storage = makeStorage();
+  const q = createPlaceQueue({
+    post: async (body) => { storage.force({ requestId: 'other', body: bodyOf(), status: 'sending' }); return server.post(body); },
+    storage, newId: () => `req-${++seq}`, wait: async () => {}, retryWaitMs: 0,
+  });
+  const out = await q.send({ body: bodyOf() });
+  assert.equal(out.record.status, 'resolved');
+  assert.equal(out.record.result.ok, true, '結果は返す (捨てると人に伝わらない)');
+  assert.equal(out.record.stored, false, '端末には残せなかったことを示す');
+  assert.equal(storage.raw().requestId, 'other', '別の画面の1件を壊していない');
+});
+
+await t('読み取り・JSON が壊れているときは空扱いにせず broken (PQ-R2 high#3)', async () => {
+  for (const bad of ['read', 'parse']) {
+    const server = makeServer();
+    const storage = { get: () => { throw new Error(bad); }, set: () => {}, raw: () => null, force: () => {} };
+    const q = mk(server, storage);
+    assert.equal(q.peek().broken, true, bad);
+    assert.equal(q.peek().reason, 'read_failed', bad);
+    const out = await q.send({ body: bodyOf() });
+    assert.equal(out.kind, 'broken', bad);
+    assert.equal(server.posts.length, 0, bad);
+    assert.equal(await q.flush(), null, bad);
+  }
 });
 
 await t('送信と送り直しが並行しても、古いほうが新しい1件を消さない (R5 high#3)', async () => {

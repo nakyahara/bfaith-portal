@@ -66,10 +66,14 @@
   function createPlaceQueue({ post, storage, newId = defaultNewId, wait, retryWaitMs = 1200 }) {
     const sleep = wait || ((ms) => new Promise((r) => setTimeout(r, ms)));
     // 送信・送り直し・確認後の送信をすべて1本に並べる。並行して走らせると、
-    // 遅れて終わったほうが新しい1件を消してしまう (Codex R5 high#3)
+    // 遅れて終わったほうが新しい1件を消してしまう (Codex R5 high#3)。
+    // localStorage の読み書きは別タブ・PWA との間では原子的にならないので、Web Locks が
+    // あれば**画面をまたいで**直列化する。無い端末では同じ画面の中だけ (Codex PQ-R2 high#1)
+    const webLocks = global.navigator && global.navigator.locks;
     let chain = Promise.resolve();
     function serial(fn) {
-      const run = chain.then(fn, fn);
+      const guarded = webLocks ? () => webLocks.request('fbx-place-queue', fn) : fn;
+      const run = chain.then(guarded, guarded);
       chain = run.then(() => {}, () => {});
       return run;
     }
@@ -186,9 +190,19 @@
         });
       },
 
-      /** 人が結果を見た → 端末から消す。自分の1件でなければ何もしない (CAS) */
+      /**
+       * 人が結果を見た → 端末から消す。自分の1件でなければ何もしない (CAS)。
+       * 戻り値 {ok, reason, current} — 消せなかったら呼び出し側が人に伝える (PQ-R2 medium#2)
+       */
       ack(requestId) {
-        return serial(async () => casSet(requestId, null));
+        return serial(async () => {
+          const cur = peek();
+          if (!cur || cur.broken || cur.requestId !== requestId) return { ok: false, reason: 'not_mine', current: cur };
+          try { storage.set(null); } catch (e) { return { ok: false, reason: 'storage_failed', current: cur }; }
+          const back = peek();
+          if (back) return { ok: false, reason: 'storage_failed', current: back };
+          return { ok: true };
+        });
       },
 
       /** 読めない1件を捨てる (職員が「この記録を捨てる」を選んだときだけ) */
