@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>つかいかた — いろは在庫化 作業画面</title>
+<!--
+  つかいかた (画像つきマニュアル)。iPad で開く (中原さん 2026-09-06)。
+  画像は本番と同じ画面をダミーデータで撮ったもの (public/app-images/iroha-work/manual/、scripts/_ux/ux-manual-shots.mjs)。
+  人名は架空。前半 = 利用者 (作業する人) 向け、後半 = 職員向け。
+  文体: 短く・ひらがな多め・「なぜ」を一言 (マニュアルは「なぜ」から)。
+-->
+<style>
+  :root{--ink:#0F1728;--sub:#5B6472;--faint:#98A1B0;--ground:#F3F5F9;--surface:#FFFFFF;--line:#D9DEE8;--well:#EEF1F7;
+    --accent:#1F5EFF;--accent-soft:#E6EDFF;--danger:#D63B3B;--danger-soft:#FBE5E5;--ok:#0F9D6B;--ok-soft:#DDF5EA;--amber:#C97A12;--amber-soft:#FDF0DC;
+    --font:"Meiryo","メイリオ",-apple-system,BlinkMacSystemFont,"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic UI","Noto Sans JP",sans-serif}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--font);font-size:18px;line-height:1.75}
+  .top{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--line);padding:10px 16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .top a.back{font-weight:700;color:var(--accent);text-decoration:none;border:1px solid var(--accent);border-radius:10px;padding:8px 14px}
+  .top h1{margin:0;font-size:1.15rem}
+  .top .sub{color:var(--sub);font-size:.9rem}
+  main{max-width:900px;margin:0 auto;padding:16px 16px 80px}
+  .toc{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 18px;margin-bottom:18px}
+  .toc h2{margin:0 0 8px;font-size:1rem;color:var(--sub)}
+  .toc ol{margin:0;padding-left:1.4em;columns:2;column-gap:24px}
+  .toc li{margin:2px 0}
+  .toc a{color:var(--accent);text-decoration:none;font-weight:700}
+  section{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:18px;scroll-margin-top:70px}
+  section.staff{border-color:#C9B7F5;background:#FBF9FF}
+  h2{margin:0 0 6px;font-size:1.35rem;display:flex;align-items:center;gap:10px}
+  h2 .no{display:inline-grid;place-items:center;width:34px;height:34px;border-radius:50%;background:var(--accent);color:#fff;font-size:1rem;flex:none}
+  section.staff h2 .no{background:#6B3FB5}
+  .why{color:var(--sub);font-size:.95rem;margin:0 0 12px;padding-left:44px}
+  ol.steps{margin:0 0 12px;padding-left:1.6em;font-size:1.05rem}
+  ol.steps li{margin:6px 0}
+  ul.notes{margin:8px 0 0;padding-left:1.4em;color:var(--sub);font-size:.98rem}
+  figure{margin:14px 0 6px}
+  figure img{display:block;max-width:100%;border:1px solid var(--line);border-radius:10px;background:#fff}
+  figcaption{color:var(--sub);font-size:.9rem;margin-top:6px}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:720px){.two{grid-template-columns:1fr}.toc ol{columns:1}}
+  .tag{display:inline-block;font-size:.85rem;font-weight:700;border-radius:8px;padding:2px 8px;vertical-align:1px}
+  .tag.red{background:var(--danger-soft);color:var(--danger);border:1px solid var(--danger)}
+  .tag.blue{background:var(--accent-soft);color:var(--accent)}
+  .tag.green{background:var(--ok-soft);color:var(--ok)}
+  .tag.amber{background:var(--amber-soft);color:var(--amber)}
+  kbd{display:inline-block;border:1px solid var(--line);border-bottom-width:2px;border-radius:8px;padding:2px 10px;background:var(--surface);font-family:var(--font);font-weight:700;font-size:.95em}
+  .callout{border-left:4px solid var(--accent);background:var(--accent-soft);padding:10px 14px;border-radius:8px;margin:10px 0;font-size:1rem}
+  .callout.warn{border-color:var(--amber);background:var(--amber-soft)}
+  .staffnote{background:#EFE7FB;color:#4A2A8A;border-radius:10px;padding:10px 14px;font-weight:700;margin-bottom:14px}
+  footer{color:var(--faint);font-size:.85rem;text-align:center;margin-top:20px}
+</style>
+</head>
+<body>
+<header class="top">
+  <a class="back" href="./">‹ 作業画面にもどる</a>
+  <h1>📖 つかいかた</h1>
+  <span class="sub">いろは在庫化 作業画面 (iPad)</span>
+</header>
+<main>
+  <nav class="toc">
+    <h2>もくじ</h2>
+    <ol>
+      <li><a href="#s1">名前をえらぶ</a></li>
+      <li><a href="#s2">一覧の見かた</a></li>
+      <li><a href="#s3">作業をはじめる</a></li>
+      <li><a href="#s4">とちゅうで止める・ぬける</a></li>
+      <li><a href="#s5">⛔ 止まった (ラベル・資材が足りない)</a></li>
+      <li><a href="#s6">できあがり → 棚入待ち</a></li>
+      <li><a href="#s7">まちがえたとき (もどす)</a></li>
+      <li><a href="#s8">さがす・もどる・文字を大きく</a></li>
+      <li><a href="#s9">きょうのみんなの作業</a></li>
+      <li><a href="#s10">職員: 職員モード</a></li>
+      <li><a href="#s11">職員: 計画 (どこが・いつ)</a></li>
+      <li><a href="#s12">職員: 棚入完了・外部出し・ラベル待ち</a></li>
+      <li><a href="#s13">職員: 管理画面 (PC)</a></li>
+      <li><a href="#s14">こまったとき</a></li>
+    </ol>
+  </nav>
+
+  <section id="s1">
+    <h2><span class="no">1</span>名前をえらぶ</h2>
+    <p class="why">なぜ: だれがやったかを記録に残すため。名前は右上でいつでも替えられます。</p>
+    <ol class="steps">
+      <li>iPad で作業画面を開くと「この iPad をつかう人をおしてください」と出ます。</li>
+      <li><b>じぶんの名前</b>をおします。</li>
+      <li>右上に名前が出ます。まちがえたら右上の名前をおして替えます。</li>
+    </ol>
+    <figure><img src="/app-images/iroha-work/manual/m01-gate.png" alt="名前をえらぶ画面" loading="lazy"><figcaption>最初の画面。名前をおすだけ。</figcaption></figure>
+    <div class="callout">作業する人は、はじめるときに<b>別にえらべます</b> (何人でも)。ここでえらぶのは「この iPad をさわっている人」です。</div>
+  </section>
+
+  <section id="s2">
+    <h2><span class="no">2</span>一覧の見かた</h2>
+    <p class="why">なぜ: 今日やるものと、止まっているものが、すぐ分かるように。</p>
+    <ol class="steps">
+      <li>上のタブ: <kbd>📌 今日やる</kbd> (朝いちばんに見る) / <kbd>すべて</kbd> / <kbd>未着手</kbd> / <kbd>作業中</kbd> / <kbd>棚入待ち</kbd> / <kbd>⛔ 止まっている</kbd> / <kbd>止まっていない</kbd></li>
+      <li>カードをおすと、くわしい画面が開きます。</li>
+    </ol>
+    <figure><img src="/app-images/iroha-work/manual/m02-list.png" alt="一覧" loading="lazy"><figcaption>一覧。上のタブで絞れます。</figcaption></figure>
+    <figure><img src="/app-images/iroha-work/manual/m03-card.png" alt="カード 1 枚" loading="lazy"><figcaption>カード 1 枚の読みかた。</figcaption></figure>
+    <ul class="notes">
+      <li><b>48 個</b> = つくる数。<b>📦 2 箱</b> = 用意する保管箱の数。<b>⏱ 約 12 分</b> = かかる時間のめやす。</li>
+      <li><span class="tag blue">📌 今日やる</span> 今日やる予定。<span class="tag green">🌱 はじめての商品</span> この商品ははじめて (前の写真がありません)。</li>
+      <li><span class="tag amber">⚠ 未登録 4</span> 資材・保管箱などが登録されていません。カードを開いて「＋ 登録」できます。</li>
+      <li><span class="tag red">⛔ 資材不足で止まっています</span> <b>カード全体が赤い</b>ものは止まっています。理由がカードに書いてあります。</li>
+      <li>右の「未着手 ▾」は状態。おすと状態を変えられます。</li>
+    </ul>
+  </section>
+
+  <section id="s3">
+    <h2><span class="no">3</span>作業をはじめる</h2>
+    <p class="why">なぜ: だれが・どのくらい作業したかが自動で記録され、次回のめやすになります。</p>
+    <ol class="steps">
+      <li>カードを開きます。上に「使うもの」(資材・保管箱の写真)、「作業のしかた」(工程・期限シール)、「気をつけること」が出ます。</li>
+      <li>いちばん下の青い <kbd>▶ 作業をはじめる</kbd> をおします (下に固定されているので、スクロールしなくても押せます)。</li>
+      <li><b>作業する人</b>を全員えらびます (1 人でも 4 人でも)。じぶんは最初からチェックされています。</li>
+      <li><kbd>▶ N人で作業をはじめる</kbd> をおすと、タイマーが動きます。</li>
+    </ol>
+    <div class="two">
+      <figure><img src="/app-images/iroha-work/manual/m04-detail.png" alt="カードの中" loading="lazy"><figcaption>カードを開いたところ。</figcaption></figure>
+      <figure><img src="/app-images/iroha-work/manual/m06-crew.png" alt="作業する人をえらぶ" loading="lazy"><figcaption>作業する人をえらぶ。何人でも。</figcaption></figure>
+    </div>
+    <figure><img src="/app-images/iroha-work/manual/m05-bar.png" alt="下の固定バー" loading="lazy"><figcaption>いちばん下のバー。ここから「はじめる」「止まった」。</figcaption></figure>
+    <div class="callout warn">「⚠ 工程が未登録」のカードは、分かるなら先に「＋ 登録」してください (分からなければそのまま始めてもよいです)。</div>
+  </section>
+
+  <section id="s4">
+    <h2><span class="no">4</span>とちゅうで止める・ぬける</h2>
+    <p class="why">なぜ: 休けいや帰る時間も、時間の記録を正しく残すため。</p>
+    <ol class="steps">
+      <li>じぶんだけ先に上がるとき: 「作業する人・時間」の じぶんの名前のよこの <kbd>ぬける</kbd>。</li>
+      <li>みんなで休けい: 下のバーの <kbd>⏸ ひとやすみ</kbd>。もどったら <kbd>▶ 作業をはじめる</kbd>。</li>
+      <li>人がふえたら <kbd>＋ 人を追加</kbd>。</li>
+    </ol>
+    <figure><img src="/app-images/iroha-work/manual/m07-working.png" alt="作業中の画面" loading="lazy"><figcaption>作業中。名前と時間が出ます。</figcaption></figure>
+  </section>
+
+  <section id="s5">
+    <h2><span class="no">5</span>⛔ 止まった (ラベル・資材が足りない)</h2>
+    <p class="why">なぜ: 「なぜ止まっているか」が札で見えると、職員がすぐ手を打てます。カードは赤くなります。</p>
+    <ol class="steps">
+      <li>下のバーの赤い <kbd>⛔ 止まった</kbd> をおします。</li>
+      <li>理由を 1 つえらびます: <b>ラベルが足りない</b> / <b>資材が足りない</b> / <b>指示待ち</b> / <b>その他</b>。</li>
+      <li><b>資材が足りない</b>のときは、どの資材が何個足りないかをおして (書いて) ください。<b>職員に自動で連絡が行きます</b>。</li>
+      <li>何個までできたか (分かれば) と、次にやる人へのメモを書いて <kbd>この理由で止める</kbd>。タイマーは止まります。</li>
+      <li>解消したら、いつもどおり <kbd>▶ 作業をはじめる</kbd>。「解消しましたか?」に「はい」で札が外れます。</li>
+    </ol>
+    <figure><img src="/app-images/iroha-work/manual/m08-block.png" alt="止まった理由をえらぶ" loading="lazy"><figcaption>「資材が足りない」をえらんだところ。</figcaption></figure>
+  </section>
+
+  <section id="s6">
+    <h2><span class="no">6</span>できあがり → 棚入待ち</h2>
+    <p class="why">なぜ: 「できあがった」と「棚に入れた」は別の人がやるので、いちど「棚入待ち」でとめます。</p>
+    <ol class="steps">
+      <li>下のバーの <kbd>✅ できあがり</kbd> (みんなで作業していれば「みんなできあがり」)。</li>
+      <li>何個できたか (ふつうは全部) を確かめて <kbd>棚入待ちにする</kbd>。</li>
+      <li>できあがった状態の<b>写真をとる</b> (次に同じ商品を作る人の見本になります。3 枚まで)。</li>
+      <li>棚に入れ終わったら、<b>職員</b>が「棚入完了」にします。</li>
+    </ol>
+    <figure><img src="/app-images/iroha-work/manual/m10-done.png" alt="できあがり" loading="lazy"><figcaption>できあがりのダイアログ。数を確かめて「棚入待ちにする」。</figcaption></figure>
+  </section>
+
+  <section id="s7">
+    <h2><span class="no">7</span>まちがえたとき (もどす)</h2>
+    <p class="why">なぜ: 押しまちがいは起きるもの。直後ならその場でもどせます。</p>
+    <ol class="steps">
+      <li>「ぬける」「ひとやすみ」「⛔ 止まった」をおしたあと、下に黒い帯が出ます。<kbd>もどす</kbd> をおすと止めなかったことになります (6 秒間)。</li>
+      <li>「できあがり」をまちがえたら、ダイアログの <kbd>← まちがえた (まだ作業中)</kbd>。</li>
+      <li>時間がたってしまったら、もう一度 <kbd>▶ 作業をはじめる</kbd> でつづきを始められます。</li>
+    </ol>
+    <figure><img src="/app-images/iroha-work/manual/m09-undo.png" alt="もどす" loading="lazy"><figcaption>黒い帯の「もどす」。</figcaption></figure>
+  </section>
+
+  <section id="s8">
+    <h2><span class="no">8</span>さがす・もどる・文字を大きく</h2>
+    <ol class="steps">
+      <li><b>さがす</b>: 上の検索らんに商品名・商品コード・JAN (バーコードの数字) を入れます。<kbd>📷</kbd> でカメラから読める iPad もあります (読めない iPad は、検索らんを長押し →「テキストをスキャン」)。</li>
+      <li><b>作業中にもどる</b>: 別の画面を見ていても、上の青い <kbd>⏱ 作業中: 商品名 12:34 ›</kbd> をおすと、じぶんの作業にもどれます。</li>
+      <li><b>文字を大きく</b>: 右上の <kbd>あ⁺</kbd>。おすごとに 大 → 特大 → ふつう。この iPad におぼえます。</li>
+      <li><b>ボード</b>: 未着手・作業中・棚入待ちを横に並べて見る画面。上の「予定」で 今日やる／止まっている などに絞れます。</li>
+    </ol>
+    <figure><img src="/app-images/iroha-work/manual/m11-board.png" alt="ボード" loading="lazy"><figcaption>ボード。左から 未着手・作業中・棚入待ち。</figcaption></figure>
+  </section>
+
+  <section id="s9">
+    <h2><span class="no">9</span>きょうのみんなの作業</h2>
+    <p class="why">なぜ: じぶんが今日どれだけやったか、自分で見られるように。</p>
+    <ol class="steps">
+      <li>上の <kbd>📚 履歴</kbd> → <kbd>📅 きょうのみんなの作業</kbd>。</li>
+      <li>人ごとに、商品と時間が出ます。じぶんの分がいちばん上。<kbd>きのう</kbd> や日付で前の日も見られます。</li>
+    </ol>
+    <figure><img src="/app-images/iroha-work/manual/m17-daily.png" alt="きょうのみんなの作業" loading="lazy"><figcaption>人 × 商品 × 時間。</figcaption></figure>
+  </section>
+
+  <div class="staffnote">ここからは職員の方向けです。</div>
+
+  <section id="s10" class="staff">
+    <h2><span class="no">10</span>職員モード</h2>
+    <p class="why">なぜ: 計画・外部出し・終了などは職員だけの操作。PIN で 30 分だけ開きます。</p>
+    <ol class="steps">
+      <li>右上の名前を<b>職員</b>にすると <kbd>🔑 職員モードに入る</kbd> が出ます。おして<b>職員PIN</b>を入れます。</li>
+      <li>30 分たつか、右上の名前を<b>別の人に替えると終わります</b> (利用者に替えた瞬間に職員の操作は消えます)。</li>
+      <li>PIN を入れた本人だけの職員モードです。別の職員はその人の PIN で入り直します。</li>
+    </ol>
+    <figure><img src="/app-images/iroha-work/manual/m12-staff-pin.png" alt="職員PIN" loading="lazy"><figcaption>職員PIN のダイアログ。</figcaption></figure>
+    <div class="callout warn">共用 iPad ではポータル (PC 用の管理画面) にログインしないでください。ログインが残っていると、利用者に替えても職員の権限が残ります。</div>
+  </section>
+
+  <section id="s11" class="staff">
+    <h2><span class="no">11</span>計画 (どこが・いつ)</h2>
+    <p class="why">なぜ: 「どこが (どの施設が) やるか」「いつやるか」を決めるのは職員の仕事。利用者の画面には決まったものだけ出ます。</p>
+    <ol class="steps">
+      <li>ボードのカードの <kbd>どこが 未定</kbd> をおす → いろは／羅針盤／ワークセンター／ジョブサポ／パレット／未定にする。</li>
+      <li><kbd>いつ 未定</kbd> をおす → <b>📌 今日やる</b>／明日やる／未定にする。</li>
+      <li>ボード上の <kbd>📋 明日の計画を立てる</kbd> で、候補 (在庫が少ない → 入荷が古い → 大きい の順) から「＋ 明日やる」で積みます。1 日のめやすは 4〜6 時間。</li>
+      <li>カードの中の <kbd>📌 今日やる</kbd> でも今日の予定に入れられます。</li>
+    </ol>
+    <div class="two">
+      <figure><img src="/app-images/iroha-work/manual/m13-board-staff.png" alt="職員のボード" loading="lazy"><figcaption>職員モードのボード。札がボタンになります。</figcaption></figure>
+      <figure><img src="/app-images/iroha-work/manual/m14-when.png" alt="いつをえらぶ" loading="lazy"><figcaption>「いつ」をえらぶ。</figcaption></figure>
+    </div>
+    <figure><img src="/app-images/iroha-work/manual/m15-plan.png" alt="明日の計画" loading="lazy"><figcaption>明日の計画。左の候補から右へ。</figcaption></figure>
+  </section>
+
+  <section id="s12" class="staff">
+    <h2><span class="no">12</span>棚入完了・外部出し・ラベル待ち</h2>
+    <ol class="steps">
+      <li><b>棚入完了 (1 枚ずつ)</b>: 棚入待ちのカードに出る <kbd>✅ 棚入完了</kbd> → 確認 → PIN。終了になり一覧から外れます (履歴に残ります)。</li>
+      <li><b>まとめて</b>: 棚入待ちの列の <kbd>まとめて棚入完了</kbd> → カードをおして選ぶ → 下の <kbd>まとめて棚入完了にする</kbd> → 確認 (一覧が出ます) → PIN。</li>
+      <li><b>外部出し</b>: カードの中の <kbd>📦 外部に出す準備OK にする</kbd> (職員モードのときだけ出ます)。</li>
+      <li><b>ラベル待ち</b>: 利用者が「ラベルが足りない」で止めると記録が自動で開きます。発注・本社連絡・入庫完了・完了は職員が <kbd>🏷 ラベル待ち</kbd> タブから記録します。「完了」にすると札が外れます。</li>
+      <li><b>止まっているカード</b>: 資材が届いたら、そのカードで <kbd>▶ 作業をはじめる</kbd> → 「はい、解消した」で札が外れます。作業を始めずに札だけ外すときは、カードの上の赤い枠の <kbd>札を外す (職員)</kbd>。</li>
+    </ol>
+    <figure><img src="/app-images/iroha-work/manual/m16-stock-confirm.png" alt="棚入完了の確認" loading="lazy"><figcaption>棚入完了の確認。このあと PIN。</figcaption></figure>
+  </section>
+
+  <section id="s13" class="staff">
+    <h2><span class="no">13</span>管理画面 (PC)</h2>
+    <p class="why">ポータル → いろは在庫化 作業アプリ 管理。よく使うのは上の 3 つ。</p>
+    <ul class="notes">
+      <li><b>👤 名簿</b>: 利用者・職員の追加、職員PIN の設定、並び順。</li>
+      <li><b>🧰 選択肢</b>: 資材セット・保管箱の候補と画像 (iPad の「＋ 登録」で選べるもの)。</li>
+      <li><b>🔎 記録をさがす</b>: だれが・いつ・どの商品を何分。CSV (管理者のみ)。</li>
+      <li><b>📱 iPad</b>: 新しい iPad の登録コード。</li>
+      <li><b>🚚 移行</b>: 名前や商品コードの無いカードの片づけ。正本の切替 (もう「アプリ」です)。</li>
+      <li><b>⏱ セッション</b>: 開きっぱなしの作業時間の取り消し。</li>
+    </ul>
+  </section>
+
+  <section id="s14">
+    <h2><span class="no">14</span>こまったとき</h2>
+    <ul class="notes">
+      <li><b>「サーバーにつながりません」</b>と出る: 前回の一覧を表示しています。少し待つと自動でつなぎ直します。数分たっても直らなければ職員へ。</li>
+      <li><b>ボタンが出ない</b>: その人にはできない操作です (例: 計画・終了は職員だけ)。名前を替えるか、職員をよんでください。</li>
+      <li><b>PIN を忘れた</b>: 管理画面の名簿で職員が設定し直します。</li>
+      <li><b>まちがって止めた・終わらせた</b>: 直後なら「もどす」。時間がたったら、もう一度「▶ 作業をはじめる」。職員は管理画面で記録を取り消せます。</li>
+      <li><b>カードが見つからない</b>: 一覧のタブが「今日やる」になっていないか確かめ、「すべて」にしてから検索。</li>
+    </ul>
+  </section>
+
+  <footer>いろは在庫化 作業画面 — つかいかた (2026-09-06)。人名は架空です。</footer>
+</main>
+</body>
+</html>

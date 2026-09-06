@@ -1826,6 +1826,13 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
   const redeem = await call('POST', '/enroll/redeem', { body: { code } });
   const cookie = (redeem.headers['set-cookie'] || []).map((c) => c.split(';')[0]).find((c) => c.startsWith('iw_device='));
   ok(redeem.status === 200 && redeem.json.ok && cookie, '登録コードで端末 Cookie が出る');
+  // 📖 つかいかた (マニュアル): 登録済みの端末 (またはポータル) だけ。中身は静的 HTML (画像は public/app-images 側)
+  {
+    const man = await call('GET', '/manual', { cookie });
+    ok(man.status === 200 && /つかいかた/.test(man.text) && /\/app-images\/iroha-work\/manual\/m01-gate\.png/.test(man.text), 'つかいかた (マニュアル) は登録済みの端末で開ける (画像つき)');
+    const noDev = await call('GET', '/manual');
+    ok(noDev.status === 302 && /\/apps\/iroha-work\/enroll$/.test(noDev.headers.location || ''), 'つかいかたも未登録の端末では開けない (他の画面と同じく端末登録へ)');
+  }
 
   // 正本の切替は管理者だけ・CSRF あり・未完了タスクがあれば app へ (HTTP で通す — Codex A1b R2 Low)
   const admin = { headers: { 'x-test-admin': '1' } };
@@ -3547,6 +3554,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/async function startScan\(\)/.test(html) && /id="scanBtn"/.test(html) && /new BarcodeDetector\(/.test(html) && /テキストをスキャン/.test(html) && /String\(c\.barcode \|\| ''\)\.replace/.test(html),
     '📷 バーコードで探す (非対応の iPad はキーボードの「テキストをスキャン」を案内。JAN でも検索できる)');
   ok(/function cycleFont\(\)/.test(html) && /html\[data-font="xl"\]\{font-size:125%\}/.test(html) && /localStorage\.setItem\('iw_font', next\)/.test(html), '文字の大きさ「あ⁺」(端末に残す)');
+  ok(/id="helpBtn" onclick="location\.href = BASE \+ '\/manual'"/.test(html) && /href="\.\/manual"/.test(html), 'ヘッダの 📖 とゲートのリンクから「つかいかた」を開ける');
   ok(/async function loadDaily\(\)/.test(html) && /\/api\/daily-report\?date=/.test(html) && /id="hmDaily"/.test(html), '履歴に「📅 きょうのみんなの作業」(人 × 商品 × 分)');
   ok(/function materialsPanelHtml\(c\)/.test(html) && /matNote \? \{ note: matNote/.test(html), '資材が足りない: どの資材が何個足りないかを札に残す (職員に通知)');
   ok(!/onclick="openMaster/.test(html) && /data-reg="/.test(html), '作業のやり方は項目タップで変更 (編集ボタンなし)');

@@ -378,6 +378,11 @@ router.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'views', 'index.html'));
 });
 
+// ─── 📖 つかいかた (画像つきマニュアル。iPad で開く — 中原さん 2026-09-06)。画像は public/app-images/iroha-work/manual/ ───
+router.get('/manual', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'manual.html'));
+});
+
 // ─── 作業 API ───
 
 /**
