@@ -299,7 +299,7 @@
                // SKU 単位に状態を出す (同一伝票に複数の依頼があり得る — Codex R2)。
                // 受け取れるのは「候補が残っておらず、タスクが全部 届いた (fulfilled)」ときだけ
                const cands = incList.filter((i) => i.slipSeq === hs.seq);
-               const tks = taskList.filter((t) => t.slipSeq === hs.seq);
+               const tks = taskList.filter((t) => t.slipSeq === hs.seq && t.status !== 'unavailable');   // 在庫なしは 🚫 行 (na) で出す
                const ready = cands.length === 0 && tks.length > 0 && tks.every((t) => t.status === 'fulfilled');
                // 3階が「在庫なし」にした商品。他の依頼が残っていなければ「在庫なしを確認」で伝票を閉じられる
                const na = stockoutMap[hs.seq] || [];
@@ -335,7 +335,8 @@
               <% } %>
               <button type="button" onclick="foundSlip(<%= hs.seq %>)">全部見つかった (取下げ)</button>
               <%# ＋ 別の商品も足りない (PR-3・E-2): 依頼していない明細が残っていれば、伝票を選び直さずに追加で送れる %>
-              <% const reqSkus = new Set([...cands.map((c) => c.sku), ...tks.map((t) => t.sku), ...na.map((t) => t.sku)].map((v) => String(v || '').trim().toLowerCase()));
+              <% const reqSkus = new Set([...cands.map((c) => c.sku), ...tks.map((t) => t.sku), ...na.map((t) => t.sku),
+                   ...(hs.pickingShortages || []).filter((p) => p.kind === 'none').map((p) => p.sku)].map((v) => String(v || '').trim().toLowerCase()));
                  const hasFree = (hs.lines || []).some((l) => !reqSkus.has(String(l.sku || '').trim().toLowerCase())); %>
               <% if (hasFree) { %><button type="button" onclick="reqRepick(<%= hs.seq %>)">＋ 別の商品も足りない</button><% } %>
             </div>
@@ -645,6 +646,7 @@
         rpPick.set(i, v); renderRepickBox(); return;
       }
       if (e.target.closest('#rpSend') && x) {
+        if (!commitQtyInputs(x)) return;   // 数値入力欄 (10以上) の未確定値を送信前に取り込む (Codex R1)
         const items = [...rpPick.entries()].map(([i, qty]) => ({ sku: x.lines[i].sku, name: x.lines[i].name, qty }));
         if (!items.length) return;
         const list = items.map((it) => `・${it.name} × ${it.qty}`).join('\n');
@@ -653,24 +655,52 @@
         sendRepickMany(x.seq, items);
       }
     });
+    // 数値入力欄 (10以上) の値を rpPick に取り込む。不正なら知らせて false (送信しない)
+    function commitQtyInputs(x) {
+      for (const inp of document.querySelectorAll('.rp-qin')) {
+        const i = Number(inp.dataset.i);
+        const raw = String(inp.value || '').trim();
+        if (!raw) continue;
+        const v = Number(raw);
+        const max = x.lines[i] ? x.lines[i].qty : 0;
+        if (!Number.isInteger(v) || v < 1 || v > max) { alert(`数量は 1〜${max} で入力してください`); inp.focus(); return false; }
+        rpPick.set(i, v);
+      }
+      return true;
+    }
+    document.getElementById('reqBoxBody').addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || !e.target.matches('.rp-qin')) return;
+      e.preventDefault();
+      const x = bySeq.get(rpSeq);
+      if (x && commitQtyInputs(x)) renderRepickBox();
+    });
     async function sendRepickMany(seq, items) {
       if (sending) return;
       sending = true;
-      const failed = [];
+      // 「拒否された (サーバーが 4xx)」と「結果不明 (応答が3回とも届かない = サーバーでは成功しているかもしれない)」を分ける (Codex R1)。
+      // どちらも再読込後の「進行中の依頼」= DB の状態が正
+      const rejected = [];
+      const unknown = [];
       try {
         for (const it of items) {
           const r = await post(`/apps/packing/api/batches/${BATCH_ID}/events`, eventPayload('shortage', { slip_seq: seq, sku: it.sku, qty: it.qty }));
-          if (!r) { failed.push(`${it.name}: 通信エラー`); continue; }
-          if (!r.ok) { failed.push(`${it.name}: ${r.body.error || `エラー (${r.status})`}`); continue; }
+          if (!r) { unknown.push(`${it.name}: 不足の記録の結果を確認できません`); continue; }
+          if (!r.ok) { rejected.push(`${it.name}: ${r.body.error || `エラー (${r.status})`}`); continue; }
           // 直前に記録した候補 (この伝票・このSKU) を送信
           const inc = (r.body.incidents || []).filter((i) => i.slip_seq === seq && normSku(i.sku) === normSku(it.sku) && i.status === 'candidate').pop();
-          if (!inc) { failed.push(`${it.name}: 候補は記録しましたが送信対象が見つかりません`); continue; }
+          if (!inc) { rejected.push(`${it.name}: 候補は記録しましたが送信対象が見つかりません`); continue; }
           const c = await post(`/apps/packing/api/batches/${BATCH_ID}/incidents/${inc.id}/resolve`, { decision: 'confirm', worker_name: workerSel.value });
           // already_resolved かつ confirmed = 先の送信が届いていて応答だけ落ちた (post は同内容を再送する) → 成功扱い (Codex R4/R5)
-          const sent = c && (c.ok || (c.body.code === 'already_resolved' && c.body.status === 'confirmed'));
-          if (!sent) failed.push(`${it.name}: 送信に失敗${c ? ` (${c.body.error || c.status})` : ''}`);
+          if (!c) unknown.push(`${it.name}: 送信の結果を確認できません`);
+          else if (!c.ok && !(c.body.code === 'already_resolved' && c.body.status === 'confirmed')) rejected.push(`${it.name}: ${c.body.error || `エラー (${c.status})`}`);
         }
-        if (failed.length) alert(`送れなかった商品があります:\n${failed.join('\n')}\n「進行中の依頼」で状態を確認してください`);
+        if (rejected.length || unknown.length) {
+          alert([
+            rejected.length ? `送信できませんでした:\n${rejected.join('\n')}` : '',
+            unknown.length ? `通信状況により結果を確認できません (届いている場合があります):\n${unknown.join('\n')}` : '',
+            '画面更新後の「進行中の依頼」で状態を確認してください。',
+          ].filter(Boolean).join('\n\n'));
+        }
         reloadKeeping(seq);
       } finally { sending = false; }
     }

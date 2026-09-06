@@ -497,8 +497,10 @@ router.get('/line/:id(\\d+)', (req, res) => {
     stockoutAckSeqs = st.stockoutAckSeqs || [];
     stockoutNotifyBySlip = st.stockoutNotifyBySlip || {};
     // 未完了の再ピックタスク (SKU 単位の状態表示・SKU 単位の「見つかった」用)
+    // unavailable も含める = 画面の「依頼済み」判定をサーバーの 409 条件 (生きたタスク) と同じにする (PR-3 Codex R1)。
+    // カードの 🔄 行は line.ejs 側で unavailable を除く (🚫 行として stockoutBySlip から出す)
     tasks = getDB().prepare(`SELECT id, slip_seq AS slipSeq, sku, req_qty AS qty, status FROM pk_pack_tasks
-      WHERE batch_id=? AND kind='repick' AND status IN ('requested','claimed','fulfilled') ORDER BY id`).all(batch.id);
+      WHERE batch_id=? AND kind='repick' AND status IN ('requested','claimed','fulfilled','unavailable') ORDER BY id`).all(batch.id);
   } catch (e) { console.warn(`[packing] ライン画面の伝票取得失敗 (batch=${batch.id}): ${e.message}`); }
   res.render(path.join(__dirname, 'views/line'), {
     slips,
