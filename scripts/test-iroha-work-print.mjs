@@ -194,8 +194,10 @@ let JU;
   ok(no.ok === false && no.error === 'confirm_unknown' && no.job.id === JU, '❓ のまま証跡なしでは積めない');
   const wrongAck = enqueuePrintJob({ taskId: T2, copies: 1, clientRequestId: crid(), acknowledgeUnknownJobId: JU + 1000 });
   ok(wrongAck.ok === false && wrongAck.error === 'confirm_unknown', '別のジョブ ID の証跡は通らない');
+  ok(pendingAlerts().some(j => j.id === JU), '確認前の ❓ は通知待ちに入っている');
   const yes = enqueuePrintJob({ taskId: T2, copies: 1, clientRequestId: crid(), acknowledgeUnknownJobId: JU });
   ok(yes.ok && yes.created && yes.job.acknowledged_job_id === JU, '「実物を見て出ていなかった」の証跡付きなら積める');
+  ok(!pendingAlerts().some(j => j.id === JU) && rowOf(JU).alerted_state === 'unknown', '確認して再発行した旧ジョブは通知待ちから外れる (古い「実物を確認」を今さら送らない — Codex R2)');
   const old = rowOf(JU);
   ok(old.lease_token === null && old.acknowledged_at, '旧ジョブの lease は消え、確認時刻が残る');
   const late = markFinished(JU, { deviceId: agentId, leaseToken: job.leaseToken, ok: true });
@@ -222,9 +224,12 @@ let JM;
   ok(/自動印刷は取り消した/.test(alertTextFor(rowOf(r.job.id))), '🙋 の文は「自動印刷は取り消した」');
   const no = enqueuePrintJob({ taskId: T1, copies: 1, clientRequestId: crid() });
   ok(no.ok === false && no.error === 'confirm_manual' && no.job.id === r.job.id, '🙋 のまま証跡なしでは積めない (職員の手刷りと押し直しが競合して 2 枚になる — Codex PR #1220 R1 重要)');
+  ok(pendingAlerts().some(j => j.id === r.job.id), '確認前の 🙋 は通知待ちに入っている');
   const yes = enqueuePrintJob({ taskId: T1, copies: 1, clientRequestId: crid(), acknowledgeUnknownJobId: r.job.id });
   ok(yes.ok && yes.created && yes.job.acknowledged_job_id === r.job.id && !!rowOf(r.job.id).acknowledged_at && /手で刷っていない/.test(rowOf(r.job.id).error || ''),
     '「手で刷っていない」の証跡付きなら積める (旧ジョブに確認時刻と理由が残る)');
+  ok(!pendingAlerts().some(j => j.id === r.job.id) && rowOf(r.job.id).alerted_state === 'manual',
+    '確認して再発行した 🙋 の旧ジョブは通知待ちから外れる (遅れて「手で刷って」が届いて手刷り + 自動印刷の 2 枚にならない — Codex R2 重要)');
   const ren = setAgentPrinter(agentId, 'Brother QL-800 (2)');
   ok(ren.ok && ren.cancelled === 1 && stateOf(yes.job.id) === 'manual', 'プリンター名を変えたら、その端末宛ての queued は manual に倒す (別のプリンターから出さない)');
   JM = yes.job.id;
@@ -241,7 +246,7 @@ console.log('\n[7] 見張り (通知は送れたときだけ通知済み・生�
   process.env.GCHAT_WEBHOOK_IROHA = 'https://example.invalid/hook';
   const sent = [];
   const before = pendingAlerts().length;
-  ok(before >= 3, `通知待ちがある (${before} 件)`);
+  ok(before >= 2 && !pendingAlerts().some(j => j.acknowledged_at), `通知待ちがある (${before} 件)。確認済みの旧ジョブは含まない`);
   const t1 = await printQueueTick({ notify: async (text) => { sent.push(text); return { sent: false, reason: 'down' }; }, ping: () => true });
   ok(t1.alerted === 0 && pendingAlerts().length === before, '送れなかった分は通知済みにしない (次の周期にまた送る)');
   const pings = [];

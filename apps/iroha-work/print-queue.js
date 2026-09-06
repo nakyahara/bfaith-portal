@@ -217,7 +217,9 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, expiry = null,
       // 🚨 人が「出ていない / 手で刷っていない」と確認して再発行する = 旧ジョブの結果はここで確定。
       //    以後、旧 lease の遅延報告を受け付けない (2 枚出る)。同じトランザクションで CAS (状態が動いていたらやり直し)
       const note = last.state === 'unknown' ? ' / 実物を確認して再発行 (出ていない)' : ' / 手で刷っていないことを確認して再発行';
-      const fix = db.prepare(`UPDATE f_iroha_print_jobs SET lease_token = NULL, acknowledged_at = ?, updated_at = ?,
+      // ⭐同じ CAS で旧ジョブを「通知済み」にする — webhook の遅延・失敗で旧ジョブの「手で刷ってください」が
+      //   再発行のあとに職員へ届くと、手刷り + 自動印刷で 2 枚になる (Codex PR #1220 R2 重要)
+      const fix = db.prepare(`UPDATE f_iroha_print_jobs SET lease_token = NULL, acknowledged_at = ?, updated_at = ?, alerted_state = state,
         error = COALESCE(error, '') || ? WHERE id = ? AND state IN ('unknown', 'manual') AND acknowledged_at IS NULL`)
         .run(now, now, note, acked);
       if (fix.changes !== 1) {
@@ -385,10 +387,14 @@ export function sweepPrintJobs({ now = utcNow() } = {}) {
   }).immediate();
 }
 
-/** まだ人に伝えられていない結果 (送信に成功したら markAlerted を呼ぶ) */
+/**
+ * まだ人に伝えられていない結果 (送信に成功したら markAlerted を呼ぶ)。
+ * 人が確認して再発行した旧ジョブ (acknowledged_at あり) は出さない — 古い「実物を確認 / 手で刷って」を今さら送らない (Codex PR #1220 R2)
+ */
 export function pendingAlerts(limit = 20) {
   return getDB().prepare(`SELECT * FROM f_iroha_print_jobs
     WHERE state IN (${ALERT_STATES.map(() => '?').join(',')}) AND (alerted_state IS NULL OR alerted_state <> state)
+      AND acknowledged_at IS NULL
     ORDER BY id LIMIT ?`).all(...ALERT_STATES, limit);
 }
 
