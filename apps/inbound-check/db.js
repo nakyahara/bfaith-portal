@@ -275,46 +275,24 @@ export function createTables(db = getMirrorDB()) {
       revoked_at   TEXT
     );
 
-    -- 🏷 値札 (BCシール) の印刷ジョブ (print-queue.js)。iPad が積み、倉庫PCの印刷エージェントが pull で取る。
-    -- 🚨 lease した時点でジョブ JSON を渡している (= 紙が出たかもしれない) ので、期限切れでも queued へ戻さない。
-    --    状態は安全の要なので CHECK で DB 側にも書く (未知の状態が入ると監視から外れて「気づかないまま出ない」になる)
-    CREATE TABLE IF NOT EXISTS f_inbound_check_print_jobs (
-      id                INTEGER PRIMARY KEY AUTOINCREMENT,
-      client_request_id TEXT NOT NULL UNIQUE,      -- iPad の冪等ID (二重タップ・応答消失の再送で2枚出ない)
-      batch_id          INTEGER NOT NULL,
-      line_key          TEXT NOT NULL,
-      code_key          TEXT NOT NULL,
-      product_code      TEXT NOT NULL,
-      product_name      TEXT NOT NULL,
-      barcode           TEXT NOT NULL,
-      barcode_type      TEXT NOT NULL CHECK (barcode_type IN ('jan','fnsku')),
-      pack_qty          TEXT NOT NULL DEFAULT '',  -- 入数 (空 = 印字しない)
-      copies            INTEGER NOT NULL CHECK (copies BETWEEN 1 AND 50),
-      printer_name      TEXT NOT NULL,             -- 積んだ時点の出力先。エージェントはこの名前にだけ出す
-      target_device_id  INTEGER NOT NULL REFERENCES f_inbound_check_devices(id),
-      requested_by      TEXT,
-      requested_device  TEXT,
-      acknowledged_job_id INTEGER,                -- 直前の unknown ジョブを「実物を見て出ていなかった」と確認した証跡 (その ID)
-      acknowledged_at   TEXT,                     -- (unknown 側) 人が実物を確認して再発行した時刻。以後この lease の遅延報告は受け付けない
-      state             TEXT NOT NULL CHECK (state IN ('queued','leased','submitted','completed','failed','manual','unknown')),
-      lease_device_id   INTEGER REFERENCES f_inbound_check_devices(id),
-      lease_token       TEXT,                      -- 報告時の照合 (別の端末・古い lease の報告を弾く)
-      lease_expires_at  TEXT,                      -- 報告の受付期限 (過ぎたら unknown)
-      spool_job_id      TEXT,
-      error             TEXT,
-      created_at        TEXT NOT NULL,
-      updated_at        TEXT NOT NULL,
-      leased_at         TEXT,
-      submitted_at      TEXT,
-      finished_at       TEXT,
-      alerted_state     TEXT,                      -- 通知し終えた状態 (送信成功後にだけ入れる)
-      CHECK (state NOT IN ('leased','submitted')
-             OR (lease_device_id IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL))
+    -- 🏷 値札 (BCシール) の印刷ジョブ f_inbound_check_print_jobs は下の ensurePrintJobsTable() で作る
+    --    (列の追加・NOT NULL の緩和は CREATE IF NOT EXISTS では効かないため、作り直しの経路を持つ)
+
+    -- 🔍 商品のバーコード (JAN / FNSKU) の控え。入荷受付伝票に無い商品の値札を出すために要る。
+    --    Render には完全なバーコードマスタが無い (ロジザードの商品マスタ CSV にバーコード列は無く、
+    --    在庫ミラーは在庫ゼロの商品の行が消え、値札CSVは入荷予定7日分だけ)。
+    --    見つけたとき (取込行・在庫ミラー・入荷予定) に控え、無ければ人が入れる。source で出どころを残す
+    CREATE TABLE IF NOT EXISTS f_inbound_check_barcodes (
+      code_key     TEXT PRIMARY KEY,
+      barcode      TEXT NOT NULL,
+      barcode_type TEXT NOT NULL CHECK (barcode_type IN ('jan','fnsku')),
+      source       TEXT NOT NULL CHECK (source IN ('line','stock','schedule','manual')),
+      updated_at   TEXT NOT NULL,
+      updated_by   TEXT
     );
-    CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_state ON f_inbound_check_print_jobs(state, id);
-    CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_line ON f_inbound_check_print_jobs(batch_id, line_key, id);
 
   `);
+  ensurePrintJobsTable(db);
   // 🏷 印刷エージェント (倉庫PC) も同じ端末表で扱う (kind で区別)。iPad と同じ発行・失効の導線に乗せる。
   //   printer_name は**サーバー側が端末に紐づけて持つ** (エージェント側の設定ミスで別のプリンターに出さない)
   addCol(db, 'f_inbound_check_devices', 'kind', "TEXT NOT NULL DEFAULT 'ipad'");
@@ -346,6 +324,93 @@ export function createTables(db = getMirrorDB()) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_ic_batches_work_date ON f_inbound_check_batches(work_date, id)');
 
   migrateQuantity(db);
+}
+
+/**
+ * 🏷 値札 (BCシール) の印刷ジョブ (print-queue.js)。iPad が積み、倉庫PCの印刷エージェントが pull で取る。
+ * 🚨 lease した時点でジョブ JSON を渡している (= 紙が出たかもしれない) ので、期限切れでも queued へ戻さない。
+ *    状態は安全の要なので CHECK で DB 側にも書く (未知の状態が入ると監視から外れて「気づかないまま出ない」になる)
+ * source = 'line' (入荷受付伝票の明細から) / 'product' (商品を探して出す = 伝票に無い商品)。
+ *   product のとき batch_id / line_key は NULL
+ */
+const PRINT_JOBS_COLUMNS = `
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      client_request_id TEXT NOT NULL UNIQUE,      -- iPad の冪等ID (二重タップ・応答消失の再送で2枚出ない)
+      source            TEXT NOT NULL DEFAULT 'line' CHECK (source IN ('line','product')),
+      batch_id          INTEGER,                   -- source='line' のとき必須
+      line_key          TEXT,
+      code_key          TEXT NOT NULL,
+      product_code      TEXT NOT NULL,
+      product_name      TEXT NOT NULL,
+      barcode           TEXT NOT NULL,
+      barcode_type      TEXT NOT NULL CHECK (barcode_type IN ('jan','fnsku')),
+      pack_qty          TEXT NOT NULL DEFAULT '',  -- 入数 (空 = 印字しない)
+      copies            INTEGER NOT NULL CHECK (copies BETWEEN 1 AND 50),
+      printer_name      TEXT NOT NULL,             -- 積んだ時点の出力先。エージェントはこの名前にだけ出す
+      target_device_id  INTEGER NOT NULL REFERENCES f_inbound_check_devices(id),
+      requested_by      TEXT,
+      requested_device  TEXT,
+      acknowledged_job_id INTEGER,                -- 直前の unknown ジョブを「実物を見て出ていなかった」と確認した証跡 (その ID)
+      acknowledged_at   TEXT,                     -- (unknown 側) 人が実物を確認して再発行した時刻。以後この lease の遅延報告は受け付けない
+      state             TEXT NOT NULL CHECK (state IN ('queued','leased','submitted','completed','failed','manual','unknown')),
+      lease_device_id   INTEGER REFERENCES f_inbound_check_devices(id),
+      lease_token       TEXT,                      -- 報告時の照合 (別の端末・古い lease の報告を弾く)
+      lease_expires_at  TEXT,                      -- 報告の受付期限 (過ぎたら unknown)
+      spool_job_id      TEXT,
+      error             TEXT,
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL,
+      leased_at         TEXT,
+      submitted_at      TEXT,
+      finished_at       TEXT,
+      alerted_state     TEXT,                      -- 通知し終えた状態 (送信成功後にだけ入れる)
+      CHECK (state NOT IN ('leased','submitted')
+             OR (lease_device_id IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)),
+      CHECK (source <> 'line' OR (batch_id IS NOT NULL AND line_key IS NOT NULL))
+`;
+const PRINT_JOBS_INDEXES = (name) => `
+    CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_state ON ${name}(state, id);
+    CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_line ON ${name}(batch_id, line_key, id);
+    CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_product ON ${name}(source, code_key, id);
+    CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_code ON ${name}(code_key, id);
+`;
+
+/**
+ * 印刷ジョブ表を作る。既に旧版 (batch_id NOT NULL・source 列なし = 2026-09-05 の初版) があれば
+ * **1回だけ作り直して行を写す** — CREATE IF NOT EXISTS は列も NOT NULL も変えないので ([[feedback_schema_change_needs_migration_and_real_test]])。
+ * 進行中のジョブ (leased/submitted) も写すので、エージェントの報告は作り直しをまたいで通る (id は保つ)
+ */
+function ensurePrintJobsTable(db) {
+  // 🚨 存在確認 → 列の検査 → 作り直し を **1つの書込みトランザクション (BEGIN IMMEDIATE) の中で**やる。
+  //    2プロセスが同時に起動して、片方が作り直した後にもう片方が古い列一覧のまま写すと、その間に積まれた
+  //    source='product' の行が line に化ける / batch_id NULL で失敗する (Codex R1 High-3)
+  const run = db.transaction(() => {
+    const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_inbound_check_print_jobs'").get();
+    if (!exists) {
+      db.exec(`CREATE TABLE f_inbound_check_print_jobs (${PRINT_JOBS_COLUMNS});` + PRINT_JOBS_INDEXES('f_inbound_check_print_jobs'));
+      return { created: true };
+    }
+    const cols = db.prepare('PRAGMA table_info(f_inbound_check_print_jobs)').all();
+    const byName = Object.fromEntries(cols.map(c => [c.name, c]));
+    const needsRebuild = !byName.source || (byName.batch_id && byName.batch_id.notnull === 1) || (byName.line_key && byName.line_key.notnull === 1);
+    if (!needsRebuild) {
+      db.exec(PRINT_JOBS_INDEXES('f_inbound_check_print_jobs'));
+      return { created: false, rebuilt: false };
+    }
+    // 旧版 → 新版へ写す。旧版に無い列 (source) は既定値 'line' で埋まる。列名は両方にあるものだけ並べる
+    const newCols = PRINT_JOBS_COLUMNS.split('\n').map(l => l.trim()).filter(l => /^[a-z_]+\s/.test(l)).map(l => l.split(/\s+/)[0]);
+    const common = newCols.filter(c => byName[c]);
+    db.exec('DROP TABLE IF EXISTS f_inbound_check_print_jobs__new');
+    db.exec(`CREATE TABLE f_inbound_check_print_jobs__new (${PRINT_JOBS_COLUMNS})`);
+    const rows = db.prepare(`INSERT INTO f_inbound_check_print_jobs__new (${common.join(', ')}) SELECT ${common.join(', ')} FROM f_inbound_check_print_jobs`).run().changes;
+    db.exec('DROP TABLE f_inbound_check_print_jobs');
+    db.exec('ALTER TABLE f_inbound_check_print_jobs__new RENAME TO f_inbound_check_print_jobs');
+    db.exec(PRINT_JOBS_INDEXES('f_inbound_check_print_jobs'));
+    return { created: false, rebuilt: true, rows };
+  });
+  const r = run.immediate();
+  if (r.rebuilt) console.log(`[inbound-check] f_inbound_check_print_jobs を作り直しました (source 列 / batch_id NULL 可。${r.rows} 行を引き継ぎ)`);
+  return r;
 }
 
 /** 列がなければ足す (SQLite の ALTER TABLE ADD COLUMN は冪等でないので自前で見る) */
@@ -924,6 +989,188 @@ export function productInfoMap(codeKeys) {
     m.loc_source = m.pick_locs.length ? 'pick' : (m.other_locs.length ? 'storage' : 'none');
   }
   return map;
+}
+
+// ─────────────────── 🔍 商品を探す (入荷受付伝票に無い商品の入庫情報・値札) ───────────────────
+// 中原さん 2026-09-06:「ロジザードの入荷リストになくても入荷受付伝票と同じフォーマットでシール印字できて、
+// 入庫情報管理の情報を編集＆参照できる機能が欲しい。仕入れが多くないところは入荷受付伝票に登録していないから。
+// 仕入先から商品を絞り込めるとありがたい」
+
+/** 商品コードのキー (取込・入庫情報と同じ規則 = lower(trim)) */
+const codeKeyOf = (s) => String(s == null ? '' : s).trim().toLowerCase();
+
+/**
+ * 商品のバーコード (JAN/FNSKU) を探す。Render に完全なマスタは無いので、見つかる場所を順に見る。
+ *   ① f_inbound_check_lines (入荷受付伝票の明細。新しい取込ほど後)   ┐ ロジザード側の値 = 正
+ *   ② mirror_logizard_stock (在庫ミラー。在庫がある間だけ行がある)    │ (値札はロジザードの検品でスキャンされる)
+ *   ③ f_inbound_schedule (値札CSV = 入荷予定 7日分)                  ┘
+ *   ④ f_inbound_check_barcodes (控え: 前に①〜③で見つけた値 / 人が入れた値 'manual')
+ * ①〜③ で見つけたら控えに写す (上書き = 在庫が消えても次から引ける。手入力よりロジザード側が勝つので、
+ * 伝票から刷っても 🔍 商品画面から刷っても同じ紙。Codex R2 High-2)。数字だけ = JAN / 英字を含む英数字 = FNSKU、
+ * それ以外の値は使わない (値札に刷れない)
+ * @returns {{barcode:string, barcode_type:'jan'|'fnsku', source:string, live:boolean}|null}  live = ①〜③ にいま値がある (人は変えられない)
+ */
+export function resolveBarcode(codeKey, db = getDB()) {
+  const k = codeKeyOf(codeKey);
+  if (!k) return null;
+  const typeOf = (bc) => {
+    const s = String(bc == null ? '' : bc).trim();
+    if (!s) return null;
+    if (/^[0-9]+$/.test(s)) return 'jan';
+    if (/^[A-Za-z0-9]+$/.test(s) && /[A-Za-z]/.test(s)) return 'fnsku';
+    return null;
+  };
+  const candidates = [];
+  if (tableExists(db, 'f_inbound_check_lines')) {
+    candidates.push(['line', db.prepare(`SELECT barcode FROM f_inbound_check_lines WHERE code_key = ? AND barcode IS NOT NULL AND trim(barcode) <> ''
+      ORDER BY batch_id DESC, seq DESC LIMIT 1`).get(k)?.barcode]);
+  }
+  if (tableExists(db, 'mirror_logizard_stock')) {
+    candidates.push(['stock', db.prepare(`SELECT バーコード AS bc FROM mirror_logizard_stock WHERE LOWER(TRIM(商品ID)) = ? AND バーコード IS NOT NULL AND trim(バーコード) <> '' LIMIT 1`).get(k)?.bc]);
+  }
+  if (tableExists(db, 'f_inbound_schedule')) {
+    candidates.push(['schedule', db.prepare(`SELECT バーコード AS bc FROM f_inbound_schedule WHERE code_key = ? AND バーコード IS NOT NULL AND trim(バーコード) <> '' LIMIT 1`).get(k)?.bc]);
+  }
+  for (const [source, bc] of candidates) {
+    const t = typeOf(bc);
+    if (!t) continue;
+    const barcode = String(bc).trim();
+    // 控えに写す (値か出どころが変わったときだけ書く = 検索のたびに updated_at を動かさない)
+    db.prepare(`INSERT INTO f_inbound_check_barcodes (code_key, barcode, barcode_type, source, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(code_key) DO UPDATE SET barcode = excluded.barcode, barcode_type = excluded.barcode_type, source = excluded.source,
+        updated_at = excluded.updated_at, updated_by = NULL
+      WHERE barcode <> excluded.barcode OR source <> excluded.source`).run(k, barcode, t, source, utcNow());
+    return { barcode, barcode_type: t, source, live: true };
+  }
+  const cached = db.prepare('SELECT barcode, barcode_type, source FROM f_inbound_check_barcodes WHERE code_key = ?').get(k);
+  return cached ? { ...cached, live: false } : null;
+}
+
+/**
+ * 人がバーコードを入れる / 直す (控えを上書き。source='manual')。
+ * 数字だけ = JAN、英字を含む英数字 = FNSKU。それ以外は拒否 (値札に刷れない形を残さない)
+ */
+export function setProductBarcode(codeKey, barcode, actor = null, { expected } = {}) {
+  const db = getDB();
+  const k = codeKeyOf(codeKey);
+  const s = String(barcode == null ? '' : barcode).trim();
+  if (!k) return { ok: false, error: 'bad_request', message: '商品が指定されていません' };
+  const type = !s ? null : /^[0-9]+$/.test(s) ? 'jan' : (/^[A-Za-z0-9]+$/.test(s) && /[A-Za-z]/.test(s) ? 'fnsku' : null);
+  if (s && !type) return { ok: false, error: 'bad_barcode', message: 'バーコードは数字だけ (JAN) か 英数字 (FNSKU) で入れてください' };
+  if (s.length > 40) return { ok: false, error: 'bad_barcode', message: 'バーコードが長すぎます' };
+  // 🚨 存在確認 → 今の値 → expected 比較 → 書込 を1つの書込みトランザクション (BEGIN IMMEDIATE) で。
+  //    2プロセスが同じ旧値を読んでから両方書く「後勝ち」を防ぐ (Codex R2 High-3)
+  return db.transaction(() => {
+    // 商品マスタに居る商品だけ (任意のキーに控えを作らせない — 後で同じコードが登録されたとき、その古い値が最優先で使われる。Codex R1 Medium)
+    if (!tableExists(db, 'mirror_products') || !db.prepare('SELECT 1 FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ? LIMIT 1').get(k)) {
+      return { ok: false, error: 'not_found', message: 'この商品は商品マスタにありません' };
+    }
+    const cur = resolveBarcode(k, db);
+    const curBc = cur ? cur.barcode : null;
+    // ロジザード側 (取込行 / 在庫 / 入荷予定) に値がある商品は人が変えられない — 値札はロジザードの検品でスキャンされるので、
+    // そちらが正 (違う値を刷ると検品で通らない)。同じ値なら何もしない
+    if (cur && cur.live) {
+      if (s === curBc) return { ok: true, barcode: curBc, barcode_type: cur.barcode_type, unchanged: true };
+      const from = { line: '入荷受付伝票', stock: '在庫', schedule: '入荷予定' }[cur.source] || cur.source;
+      return { ok: false, error: 'readonly_barcode', current: cur,
+        message: 'このバーコードはロジザード側 (' + from + ') の値「' + curBc + '」なので、ここでは変えられません。違っていればロジザードの商品マスタを直してください' };
+    }
+    // 画面が見ていた値 (expected: 未登録なら null) と今の値が違えば書かない — ダイアログを開いた後に別の人が
+    // 入れた/直した値を、古い入力で上書きして違うシールを刷らせない (Codex R1 High-2)。expected 省略 = 見張らない (内部呼び出し用)
+    if (expected !== undefined) {
+      const exp = expected == null || String(expected).trim() === '' ? null : String(expected).trim();
+      if (curBc !== exp) {
+        return { ok: false, error: 'state_changed', current: cur, message: curBc
+          ? 'このバーコードは別の人が「' + curBc + '」に入れました/直しました。画面を更新して確認してください'
+          : 'このバーコードは別の人が消しました。画面を更新して確認してください' };
+      }
+    }
+    if (!s) {
+      db.prepare("DELETE FROM f_inbound_check_barcodes WHERE code_key = ? AND source = 'manual'").run(k);
+      return { ok: true, cleared: true };
+    }
+    db.prepare(`INSERT INTO f_inbound_check_barcodes (code_key, barcode, barcode_type, source, updated_at, updated_by)
+      VALUES (?, ?, ?, 'manual', ?, ?)
+      ON CONFLICT(code_key) DO UPDATE SET barcode = excluded.barcode, barcode_type = excluded.barcode_type,
+        source = 'manual', updated_at = excluded.updated_at, updated_by = excluded.updated_by`)
+      .run(k, s, type, utcNow(), actor);
+    return { ok: true, barcode: s, barcode_type: type };
+  }).immediate();
+}
+
+/** 仕入先の一覧 (商品マスタに紐づくものだけ・商品数つき)。絞り込みのプルダウン用 */
+export function listProductSuppliers({ includeInactive = false } = {}) {
+  const db = getDB();
+  if (!tableExists(db, 'mirror_products')) return [];
+  const hasSup = tableExists(db, 'po_suppliers');
+  const where = includeInactive ? '' : "AND p.取扱区分 = '取扱中'";
+  return db.prepare(`SELECT p.仕入先コード AS code, ${hasSup ? 's.name' : 'NULL'} AS name, COUNT(*) AS products
+    FROM mirror_products p ${hasSup ? 'LEFT JOIN po_suppliers s ON s.supplier_code = p.仕入先コード' : ''}
+    WHERE p.仕入先コード IS NOT NULL AND trim(p.仕入先コード) <> '' AND p.商品区分 = '単品' ${where}
+    GROUP BY p.仕入先コード ORDER BY products DESC, code`).all();
+}
+
+/**
+ * 商品を探す (商品マスタ mirror_products が元)。単品だけ (セットは値札を貼らない)。既定は取扱中のみ。
+ * @param {object} o { supplier, q, includeInactive, limit, offset }
+ *   q = 商品名 / 商品コード / バーコード (控えにあるもの) の部分一致
+ * @returns {{rows: Array, total: number}}  rows には入庫情報 (info)・ピックロケ・期限管理・バーコードを付ける
+ */
+export function searchProducts({ supplier = null, q = '', includeInactive = false, limit = 50, offset = 0 } = {}) {
+  const db = getDB();
+  if (!tableExists(db, 'mirror_products')) return { rows: [], total: 0, missing_master: true };
+  const hasSup = tableExists(db, 'po_suppliers');
+  const conds = ["p.商品区分 = '単品'"];
+  const args = [];
+  if (!includeInactive) conds.push("p.取扱区分 = '取扱中'");
+  if (supplier) { conds.push('p.仕入先コード = ?'); args.push(String(supplier)); }
+  const term = String(q || '').trim();
+  if (term) {
+    // \ (ESCAPE 文字そのもの) も含めて逃がす (Codex R1 Medium)
+    const like = `%${term.replace(/[\\%_]/g, (c) => '\\' + c)}%`;
+    conds.push(`(p.商品名 LIKE ? ESCAPE '\\' OR p.商品コード LIKE ? ESCAPE '\\' OR LOWER(TRIM(p.商品コード)) IN (SELECT code_key FROM f_inbound_check_barcodes WHERE barcode LIKE ? ESCAPE '\\'))`);
+    args.push(like, like, like);
+  }
+  // limit / offset は整数だけ (小数・Infinity・巨大値は SQLite の LIMIT で型エラー → 500 になる。Codex R1 Low)
+  const limN = Number(limit), offN = Number(offset);
+  const lim = Number.isSafeInteger(limN) ? Math.min(200, Math.max(1, limN)) : 50;
+  const off = Number.isSafeInteger(offN) ? Math.min(100000, Math.max(0, offN)) : 0;
+  const whereSql = conds.join(' AND ');
+  const total = db.prepare(`SELECT COUNT(*) AS n FROM mirror_products p WHERE ${whereSql}`).get(...args).n;
+  const rows = db.prepare(`SELECT p.商品コード AS product_id, p.商品名 AS product_name, p.取扱区分 AS handling,
+      p.仕入先コード AS supplier_code, ${hasSup ? 's.name' : 'NULL'} AS supplier_name
+    FROM mirror_products p ${hasSup ? 'LEFT JOIN po_suppliers s ON s.supplier_code = p.仕入先コード' : ''}
+    WHERE ${whereSql} ORDER BY p.商品名 LIMIT ? OFFSET ?`).all(...args, lim, off);
+  const keys = rows.map(r => codeKeyOf(r.product_id));
+  const info = productInfoMap(keys);
+  for (const r of rows) {
+    r.code_key = codeKeyOf(r.product_id);
+    const x = info.get(r.code_key) || { info: null, pick_locs: [], other_locs: [], loc_source: 'none', expiry_managed: false, expiry_source: 'none' };
+    r.info = x.info;
+    r.pick_locs = x.pick_locs;
+    r.other_locs = x.other_locs;
+    r.loc_source = x.loc_source;
+    r.expiry_managed = !!x.expiry_managed;
+    r.expiry_source = x.expiry_source || 'none';
+    const bc = resolveBarcode(r.code_key, db);
+    r.barcode = bc ? bc.barcode : null;
+    r.barcode_type = bc ? bc.barcode_type : null;
+    r.barcode_source = bc ? bc.source : null;
+    r.barcode_live = bc ? !!bc.live : false;   // ロジザード側に値がある = 画面では直せない
+    r.pack_qty = r.info && Number.isInteger(r.info.irisu) && r.info.irisu > 0 ? r.info.irisu : null;
+  }
+  return { rows, total };
+}
+
+/** 商品1件 (印刷キューが商品モードで積むときの元。画面の値を信じない) */
+export function getProductForPrint(productCode) {
+  const db = getDB();
+  const k = codeKeyOf(productCode);
+  if (!k || !tableExists(db, 'mirror_products')) return null;
+  const p = db.prepare('SELECT 商品コード AS product_id, 商品名 AS product_name FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ? LIMIT 1').get(k);
+  if (!p) return null;
+  const bc = resolveBarcode(k, db);
+  return { product_id: p.product_id, code_key: k, product_name: p.product_name, barcode: bc ? bc.barcode : null, barcode_type: bc ? bc.barcode_type : null };
 }
 
 /**

@@ -23,6 +23,7 @@ import {
   resolveDestination, infoForLine, setExpiryManaged, setPendingExpiry, pendingExpiryFor,
   listDestinations, destinationsCsv, IROHA_YES, IROHA_NO,
   listCompletedSlips, completedSlipsCsv,
+  searchProducts, listProductSuppliers, setProductBarcode, fieldOptions,
   createEnrollCode, redeemEnrollCode, countEnrollAttempt, listActiveEnrollCodes, ENROLL_TTL_MS,
   checkEnrollRate, recordEnrollAttempt,
   listWorkers, getWorker,
@@ -45,7 +46,7 @@ import { queueEnsureImages } from '../picking/images.js';
 // 🏷 値札 (BCシール) 印刷キュー: iPad が積み、倉庫PCの印刷エージェントが /print/* を pull で取りに来る
 import {
   enqueuePrintJob, leaseNextJob, markSubmitted, markFinished, getJobStatusFor, recordHeartbeat,
-  latestJobsForBatch, listPrintAgents, listPrintJobs, publicJob, PRINT_STATE_LABELS, LEASE_SEC, MAX_COPIES,
+  latestJobsForBatch, latestJobsForProducts, listPrintAgents, listPrintJobs, publicJob, PRINT_STATE_LABELS, LEASE_SEC, MAX_COPIES,
 } from './print-queue.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -313,7 +314,7 @@ router.get('/', (req, res) => {
 // ─── 作業 API ───
 router.get('/api/state', api((req, res) => {
   const state = getState();
-  // 🏷 明細ごとの最新の値札印刷ジョブ (結果は5秒ポーリングで行に出る) + 印刷できる倉庫PCがいるか
+  // 🏷 明細ごとの値札印刷ジョブ (同じ商品に未確定のジョブがあればそれ、無ければ明細の最新。結果は5秒ポーリングで行に出る) + 印刷できる倉庫PCがいるか
   if (state.batch) {
     const jobs = latestJobsForBatch(state.batch.id);
     for (const l of state.lines) l.print_job = jobs.get(l.line_key) || null;
@@ -341,7 +342,10 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
   if (!a) return;
   const b = req.body || {};
   const r = enqueuePrintJob({
+    // 入荷受付伝票の明細から (batch_id + line_key) か、🔍 商品から (product_code) のどちらか
     batchId: intOrNull(b.batch_id), lineKey: String(b.line_key || ''),
+    productCode: b.product_code == null ? null : String(b.product_code),
+    barcodeOverride: b.barcode == null || b.barcode === '' ? null : String(b.barcode),
     copies: intOrNull(b.copies), packQty: b.pack_qty == null || b.pack_qty === '' ? null : b.pack_qty,
     targetDeviceId: b.target_device_id == null || b.target_device_id === '' ? null : intOrNull(b.target_device_id),
     clientRequestId: b.client_request_id,
@@ -359,6 +363,63 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
 // 印刷できる倉庫PC (出力先) の一覧。2台以上あるときは iPad がここから選ぶ
 router.get('/api/print/targets', api((req, res) => {
   res.json({ ok: true, max_copies: MAX_COPIES, agents: listPrintAgents() });
+}));
+
+// ─── 🔍 商品を探す (入荷受付伝票に無い商品の 入庫情報の参照・編集 と 値札印字) ───
+// 中原さん 2026-09-06:「ロジザードの入荷リストになくても入荷受付伝票と同じフォーマットでシール印字できて、
+// 入庫情報管理の情報を編集＆参照できる機能が欲しい。仕入れが多くないところは入荷受付伝票に登録していないから。
+// 仕入先から商品を絞り込めるとありがたい」。元 = 商品マスタ (mirror_products) + 入庫情報 (f_inbound_info)。
+// 編集は既存の /api/info・/api/info/register・/api/product-flags をそのまま使う (規則を二重管理しない)
+router.get('/products', (req, res) => {
+  const qIdx = req.originalUrl.indexOf('?');
+  const pathname = qIdx === -1 ? req.originalUrl : req.originalUrl.slice(0, qIdx);
+  if (pathname.endsWith('/')) return res.redirect(308, pathname.slice(0, -1) + (qIdx === -1 ? '' : req.originalUrl.slice(qIdx)));
+  res.sendFile(path.join(__dirname, 'views', 'products.html'));
+});
+
+router.get('/api/products/suppliers', api((req, res) => {
+  res.json({ ok: true, suppliers: listProductSuppliers({ includeInactive: String(req.query?.all || '') === '1' }) });
+}));
+
+router.get('/api/products', api((req, res) => {
+  const r = searchProducts({
+    supplier: req.query?.supplier ? String(req.query.supplier) : null,
+    q: req.query?.q ? String(req.query.q) : '',
+    includeInactive: String(req.query?.all || '') === '1',
+    limit: Number(req.query?.limit) || 50,
+    offset: Number(req.query?.offset) || 0,
+  });
+  // 直近の値札印刷ジョブ (伝票からの発行も含む・商品単位) を行に付ける — 結果は5秒ポーリング (/api/products/print-status) で見る
+  const jobs = latestJobsForProducts(r.rows.map(x => x.code_key));
+  for (const row of r.rows) row.print_job = jobs.get(row.code_key) || null;
+  res.json({
+    ok: true, ...r,
+    field_options: fieldOptions(),
+    print_agents: listPrintAgents().map(a => ({ id: a.id, label: a.label, printer_name: a.printer_name, online: a.online, bpac: a.bpac, paper_ok: a.paper_ok })),
+    workers: listWorkers(false),
+    me: { session: req.icUser || null, device: req.icDevice ? { id: req.icDevice.id, label: req.icDevice.label } : null },
+  });
+}));
+
+// バーコードを人が入れる/直す (控え。値札に刷る JAN/FNSKU)。作業者必須 = 誰が入れたか残す
+router.post('/api/products/barcode', checkOrigin, api((req, res) => {
+  const w = resolveWorker(req);
+  if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  // expected = 画面が見ていた値 (未登録なら null) は**必須**。別の人が先に入れて/直していれば state_changed (409) で書かない。
+  // 省略を許すと古いクライアント / API 直叩きが競合検知を素通りする (Codex R2 Medium)
+  if (!req.body || !Object.prototype.hasOwnProperty.call(req.body, 'expected')) {
+    return res.status(400).json({ ok: false, error: 'expected_required', message: 'expected (画面が見ていたバーコード。未登録なら null) が必要です' });
+  }
+  const r = setProductBarcode(req.body.code_key, req.body.barcode, editorName(req, w.worker), { expected: req.body.expected });
+  res.status(r.ok ? 200 : (r.error === 'state_changed' || r.error === 'readonly_barcode') ? 409 : r.error === 'not_found' ? 404 : 400).json(r);
+}));
+
+// 表示中の商品の印刷状況だけ取り直す (5秒ポーリング用。検索を回し直さない・200件を超えて表示していても全部見る)
+router.post('/api/products/print-status', checkOrigin, api((req, res) => {
+  const keys = Array.isArray(req.body?.code_keys) ? req.body.code_keys.slice(0, 1000).map(k => String(k == null ? '' : k).trim().toLowerCase()).filter(Boolean) : [];
+  const jobs = {};
+  for (const [k, j] of latestJobsForProducts(keys)) jobs[k] = j;
+  res.json({ ok: true, jobs, print_agents: listPrintAgents().map(a => ({ id: a.id, label: a.label, printer_name: a.printer_name, online: a.online, bpac: a.bpac, paper_ok: a.paper_ok })) });
 }));
 
 // ─── 🚚 いま入荷を取りに行く (予定外の納品をロジザードに入れた直後に押す) ───

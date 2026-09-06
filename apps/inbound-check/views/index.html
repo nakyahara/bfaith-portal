@@ -269,6 +269,8 @@
     </div>
     <div class="ctl">
       <button type="button" class="btn-reload" id="reloadBtn">🔄 更新</button>
+      <!-- 🔍 入荷受付伝票に無い商品の 入庫情報・値札 (仕入先で絞れる) -->
+      <a class="btn-reload" href="/apps/inbound-check/products" style="text-decoration:none;color:inherit">🔍 商品から探す</a>
       <!-- 🚚 予定していない納品をロジザードに入れた直後に押す (定時 08:40/11:45 を待たない) -->
       <button type="button" class="btn-reload" id="refreshBtn" style="display:none">🚚 いま取りに行く</button>
       <!-- 🗂 Notion は 2026-09-05 に廃止。正本が Notion に戻されたとき (退路) だけ出す -->
@@ -283,7 +285,7 @@
   <div class="banner" id="banner"></div>
   <div class="legend">凡例: <b>[🚚 いま取りに行く]</b> = 予定になかった納品をロジザードに入れた直後に押す (30〜60秒で一覧に出ます) / 📍=ピックロケが登録されている商品 (現在庫のロケ) / 「空きロケへ」=ピックロケの登録なし → 保管ロケの空いているところでOK / 🏠いろは=いろは在庫化作業あり / 直ピック=直接ピックロケ保管 / シール=入庫時BCシール貼り<br><b>[数量を数える]</b> = 箱数やバラを入れる (＋1箱もここ) ／ <b>[全部あり]</b> = 予定数が全部そろった ／ <b>[🏷 シール発行]</b> = 倉庫PCの QL-700 から値札 (BCシール) を出す (貼付必要の商品だけ。❓結果不明のときは実物を見てから) ／ 商品名をタップすると入数やいろはの設定を直せます ／ <a href="/apps/inbound-check/guide">📖 くわしい使い方</a></div>
   <div class="wrap" id="list"></div>
-  <div class="foot"><a href="/apps/inbound-check/done">📋 完了一覧</a> ・ <a href="/apps/inbound-check/guide">📖 使い方</a> ・ <a href="/apps/inbound-check/admin">管理画面 (取込・端末)</a> ・ <a href="/">ポータル</a></div>
+  <div class="foot"><a href="/apps/inbound-check/done">📋 完了一覧</a> ・ <a href="/apps/inbound-check/products">🔍 商品から探す</a> ・ <a href="/apps/inbound-check/guide">📖 使い方</a> ・ <a href="/apps/inbound-check/admin">管理画面 (取込・端末)</a> ・ <a href="/">ポータル</a></div>
 
   <datalist id="dl-bc"><option value="BCシール貼付必要"><option value="不要"></datalist>
   <datalist id="dl-pick"><option value="直接ピックロケ"></datalist>
