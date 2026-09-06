@@ -431,7 +431,7 @@ console.log('\n── line.ejs の描画 + インラインJSの構文 (2026-08-2
     ['PAS stopped', { kind: 'pas', batch: { id: 1, status: 'packing', slip_count: 3 }, runs: [{ phase: 'run', started_at: now, finished_at: now, paused_total_sec: 0, planned_count: 3 }] }],
     ['MELT sorting (2026-08-31: PAS振替入力+依頼カード)', { kind: 'melt', batch: { id: 1, status: 'packing', slip_count: 3 }, runs: [{ phase: 'sort', started_at: now, paused_total_sec: 0, planned_count: 3 }],
       slips: [
-        { seq: 1, neSlipNo: '1', slipNo: 'SP1', siteOrderNo: 'SO1', recipientName: '山田 <太郎>', deliveryMethod: 'ネコポス', status: 'held', holdReason: 'repick', lines: [{ sku: 'a', name: '商品"A"', qty: 2 }] },
+        { seq: 1, neSlipNo: '1', slipNo: 'SP1', siteOrderNo: 'SO1', recipientName: '山田 <太郎>', deliveryMethod: 'ネコポス', status: 'held', holdReason: 'repick', lines: [{ sku: 'a', name: '商品"A"', qty: 2 }, { sku: 'c', name: '商品C (未依頼)', qty: 3 }] },
         { seq: 2, neSlipNo: '2', slipNo: 'SP2', siteOrderNo: null, recipientName: "O'Brien", deliveryMethod: null, status: 'pending', holdReason: null, lines: [] },
       ],
       incidents: [{ id: 9, slipSeq: 1, kind: 'shortage', sku: 'a', qty: 1 }], repickBySlip: { 1: 'fulfilled' },
@@ -456,6 +456,11 @@ console.log('\n── line.ejs の描画 + インラインJSの構文 (2026-08-2
       ok(!html.includes('foundSku(1,'), `${label}: SKU を onclick に文字列埋め込みしない`);
       ok(html.includes('data-sku="b&#39;x"'), `${label}: SKU は data 属性でエスケープして渡す (記号入りも加工しない)`);
       ok(!html.includes('<太郎>') && html.includes('\\u003c太郎>'), `${label}: 埋め込み JSON の < がエスケープされる`);
+      // PR-3: 複数SKU一括依頼
+      ok(!html.includes('prompt('), `${label}: 数量入力に prompt() を使わない (iPad PWA で出ない版がある)`);
+      ok(html.includes('＋ 別の商品も足りない') && html.includes('reqRepick(1)'), `${label}: 進行中カードに「＋ 別の商品も足りない」(依頼していない明細が残る伝票)`);
+      ok(html.includes('const TASKS = ') && html.includes('const INCS = ') && html.includes('const STOCKOUT_MAP = '), `${label}: 依頼済み判定用の JSON が埋め込まれる`);
+      ok(html.includes('複数の商品を一度に選べます'), `${label}: 依頼ボタンが複数選べることを先に言う`);
     }
     if (label.startsWith('PAS with transferredIn')) {
       ok(html.includes('MELT-LINE から移した分'), `${label}: 累計に MELT からの振替が表示される`);
@@ -466,6 +471,42 @@ console.log('\n── line.ejs の描画 + インラインJSの構文 (2026-08-2
     if (label === 'PAS stopped') ok(!html.includes('⏱ 計測中'), `${label}: 停止後は計測中バーが出ない`);
     ok(html.includes('一覧へ戻る'), `${label}: 一覧へ戻るボタンがある`);
   }
+}
+
+console.log('\n── PR-3 (例外処理監査): 同じ伝票で複数 SKU を続けて依頼 — 2品目が数量2・3品目は後から追加・1品だけ見つかった ──');
+{
+  mkBatch(320, 1, 1);
+  const sid = Number(db.prepare(`INSERT INTO pk_pack_slips
+    (batch_id, seq, ne_slip_no, slip_no, recipient_name, site_order_no, status, delivery_method)
+    VALUES (320, 1, 'NE-320-1', 'SP32-1', '客1', 'SO-1', 'pending', 'ネコポス')`).run().lastInsertRowid);
+  const insLine = db.prepare('INSERT INTO pk_pack_lines (slip_id, sku, product_name, qty) VALUES (?, ?, ?, ?)');
+  insLine.run(sid, 'fr10', 'フランキンセンス 10ml', 1);
+  insLine.run(sid, 'sw10', 'サンダルウッド 10ml', 2);
+  insLine.run(sid, 'bg20', 'ベルガモット 20ml', 1);
+  ev(320, 'line_start', {}, '流し担当');
+  // 画面 (sendRepickMany) と同じ順序: SKU ごとに shortage → confirm を直列に
+  const sendOne = (sku, qty) => {
+    ev(320, 'shortage', { slipSeq: 1, sku, qty }, '仕分け担当');
+    const inc = getWorkState(320).incidents.filter((i) => i.slip_seq === 1 && i.sku === sku && (i.status ?? 'candidate') === 'candidate').pop();
+    ok(!!inc, `${sku}: 候補が記録される`);
+    return resolveIncident(inc.id, 'confirm', '仕分け担当', 320);
+  };
+  const r1 = sendOne('fr10', 1);
+  eq(r1.dispatchedTasks.map((t) => t.kind), ['repick'], '1品目: 再ピックタスク');
+  const r2 = sendOne('sw10', 2);
+  eq(r2.dispatchedTasks.map((t) => t.kind), ['repick'], '2品目 (数量2): 保留中の伝票でも続けて依頼できる');
+  const tasks = () => db.prepare("SELECT sku, req_qty, status FROM pk_pack_tasks WHERE batch_id=320 AND slip_seq=1 ORDER BY id").all();
+  eq(tasks(), [{ sku: 'fr10', req_qty: 1, status: 'requested' }, { sku: 'sw10', req_qty: 2, status: 'requested' }], '伝票1に SKU ごとのタスク (数量つき)');
+  const s1 = getWorkState(320).slips[0];
+  eq([s1.status, s1.hold_reason], ['held', 'repick'], '伝票は保留 (repick) のまま');
+  throws(() => ev(320, 'shortage', { slipSeq: 1, sku: 'fr10', qty: 1 }, '仕分け担当'), 'dup_task', '同じ商品の二重依頼は 409 (画面は依頼済みとして選べなくする)');
+  // 3品目は後から「＋ 別の商品も足りない」で追加
+  const r3 = sendOne('bg20', 1);
+  eq(r3.dispatchedTasks.length, 1, '3品目も後から追加できる');
+  // 1品だけ見つかった → その商品のタスクだけ取消・他は残る
+  ev(320, 'found', { slipSeq: 1, sku: 'sw10' }, '仕分け担当');
+  eq(tasks().map((t) => [t.sku, t.status]), [['fr10', 'requested'], ['sw10', 'cancelled'], ['bg20', 'requested']], '見つかった商品のタスクだけ取消');
+  eq(getWorkState(320).slips[0].status, 'held', '他の依頼が残るので保留のまま');
 }
 
 db.close();

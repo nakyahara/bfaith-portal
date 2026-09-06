@@ -73,6 +73,16 @@
     .open-req button.primary { background: #188038; color: #fff; border-color: #188038; }
     .open-req button.danger { background: #e03131; color: #fff; border-color: #e03131; }
     .sub { font-size: .85rem; color: #868e96; font-weight: 400; }
+    /* 再ピック依頼の複数選択 (例外処理監査 PR-3): 明細ごとにトグル + 数量ボタン (prompt 廃止) */
+    .rp-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; max-height: 48vh; overflow-y: auto; }
+    .rp-row { border: 1px solid #ccc; border-radius: 10px; background: #fff; }
+    .rp-row.on { border-color: #1a73e8; background: #e8f0fe; }
+    .rp-row.locked { background: #f1f3f5; color: #868e96; }
+    .rp-toggle { width: 100%; text-align: left; padding: 12px 10px; font-size: 1.05rem; font-weight: 700; border: none; background: none; color: inherit; }
+    .rp-qty { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 10px 10px; align-items: center; }
+    .rp-qty button { min-width: 48px; padding: 10px 8px; font-size: 1.05rem; border: 1px solid #ccc; border-radius: 8px; background: #fff; }
+    .rp-qty button.sel { background: #1a73e8; color: #fff; border-color: #1a73e8; }
+    .rp-qty input { width: 110px; padding: 10px; font-size: 1.05rem; border: 1px solid #ccc; border-radius: 8px; }
   </style>
 </head>
 <body>
@@ -324,6 +334,10 @@
                 <button type="button" class="danger" onclick="stockoutAck(<%= hs.seq %>)">🚫 在庫なしを確認 → 出荷保留にする (事務へ通知)</button>
               <% } %>
               <button type="button" onclick="foundSlip(<%= hs.seq %>)">全部見つかった (取下げ)</button>
+              <%# ＋ 別の商品も足りない (PR-3・E-2): 依頼していない明細が残っていれば、伝票を選び直さずに追加で送れる %>
+              <% const reqSkus = new Set([...cands.map((c) => c.sku), ...tks.map((t) => t.sku), ...na.map((t) => t.sku)].map((v) => String(v || '').trim().toLowerCase()));
+                 const hasFree = (hs.lines || []).some((l) => !reqSkus.has(String(l.sku || '').trim().toLowerCase())); %>
+              <% if (hasFree) { %><button type="button" onclick="reqRepick(<%= hs.seq %>)">＋ 別の商品も足りない</button><% } %>
             </div>
           <% } %>
           <% for (const ss of stockoutSlips) {
@@ -342,7 +356,7 @@
         </div>
         <div class="slip-info" id="slipInfo" style="display:none"></div>
         <div class="req-grid">
-          <button type="button" id="reqRepickBtn" onclick="reqRepick()" disabled>🔄 商品が足りない → 再ピック依頼 (ピッキングへ送信)</button>
+          <button type="button" id="reqRepickBtn" onclick="reqRepick()" disabled>🔄 商品が足りない → 再ピック依頼 (複数の商品を一度に選べます)</button>
           <button type="button" id="reqShipBtn" onclick="reqShip()" disabled>📦 サイズ・配送方法の変更依頼 (事務へ通知)</button>
           <button type="button" id="reqReprintBtn" onclick="reqReprint()" disabled>🖨 伝票の再印刷依頼 (事務へ通知)</button>
         </div>
@@ -377,6 +391,10 @@
   <script>
     const BATCH_ID = <%= batch.id %>;
     const SLIPS = <%- JSON.stringify(slipList).replace(/</g, '\\u003c') %>;
+    // 依頼済み判定用 (PR-3): 進行中タスク / 未送信候補 / 3階の在庫なし報告
+    const TASKS = <%- JSON.stringify(taskList).replace(/</g, '\\u003c') %>;
+    const INCS = <%- JSON.stringify(incList).replace(/</g, '\\u003c') %>;
+    const STOCKOUT_MAP = <%- JSON.stringify(stockoutMap).replace(/</g, '\\u003c') %>;
     const METHOD_OPTIONS = <%- JSON.stringify((typeof methodOptions !== 'undefined' && methodOptions) || []).replace(/</g, '\\u003c') %>;
     const TWO_LABELS_OPTION = <%- JSON.stringify((typeof twoLabelsOption !== 'undefined' && twoLabelsOption) || null).replace(/</g, '\\u003c') %>;
     const SHIP_REASONS = <%- JSON.stringify((typeof shipChangeReasons !== 'undefined' && shipChangeReasons) || []).replace(/</g, '\\u003c') %>;
@@ -437,7 +455,7 @@
         if (r.body && r.body.stockoutNotify && r.body.stockoutNotify !== 'sent') {
           alert('伝票を出荷保留 (在庫なし) にしました。事務への通知はまだ届いていません (自動で再送します)。急ぐなら口頭かチャットで伝えてください');
         }
-        location.reload();
+        reloadKeeping(selectedSlip() ? selectedSlip().seq : 0);
       } finally {
         sending = false;
       }
@@ -540,6 +558,16 @@
       // 保留中でも別の商品の不足は追加で出せる (同じ伝票で2品目不足 — Codex R1)。同じ商品の二重依頼はサーバーが 409
     }
     if (slipPick) filterSlips();
+    // ?seq= があればその伝票を選んだ状態で開く (送信後の再読込・バナー「対象伝票を開く」から) — 選び直しを無くす (E-2)
+    {
+      const initSeq = Number(new URLSearchParams(location.search).get('seq'));
+      if (slipPick && initSeq > 0 && bySeq.has(initSeq)) {
+        slipPick.value = String(initSeq);
+        showSlip();
+        const card = document.getElementById('reqCard');
+        if (card) setTimeout(() => card.scrollIntoView({ block: 'start' }), 50);
+      }
+    }
     function openReqBox(title, html) {
       document.getElementById('reqBoxTitle').textContent = title;
       document.getElementById('reqBoxBody').innerHTML = html;
@@ -548,48 +576,109 @@
     function closeReqBox() { document.getElementById('reqBox').style.display = 'none'; }
     const cancelBtn = '<button type="button" class="cancel" onclick="closeReqBox()">やめる</button>';
 
-    // 🔄 不足 → 再ピック依頼: 候補の記録 (shortage) と送信 (confirm) を続けて行う。
+    // 🔄 不足 → 再ピック依頼 (例外処理監査 PR-3・E-2/E-3): 1回の操作で複数の商品を選び、数量はボタン (prompt 廃止)。
+    //    候補の記録 (shortage) と送信 (confirm) を商品ごとに続けて行い、最後に1回だけ再読込 (同じ伝票を選んだまま)。
     //    ラインは終了画面が無いので、その場で送る (送信に失敗したら候補として残り「進行中の依頼」から送れる)
-    function reqRepick() {
-      const x = selectedSlip();
+    const TASK_LABEL_JS = { requested: '依頼中', claimed: 'ピッカーが取りに行っています', fulfilled: '届きました', unavailable: '在庫なし' };
+    const normSku = (v) => String(v || '').trim().toLowerCase();
+    const rpPick = new Map();   // 選択中: 明細 index → 数量
+    let rpSeq = 0;
+    // 選べない明細の理由 (依頼済み / 未送信候補 / 3階の在庫なし / ❌ どこにもない)。null なら選べる
+    function repickLock(x, l) {
+      const k = normSku(l.sku);
+      const t = TASKS.find((t) => t.slipSeq === x.seq && normSku(t.sku) === k);
+      if (t) return `依頼済み — ${TASK_LABEL_JS[t.status] || t.status}`;
+      if (INCS.some((i) => i.slipSeq === x.seq && normSku(i.sku) === k)) return '未送信の候補あり (「進行中の依頼」から送信)';
+      if ((STOCKOUT_MAP[x.seq] || []).some((t) => normSku(t.sku) === k)) return '🚫 3階: 在庫なし (「在庫なしを確認」へ)';
+      if ((x.pickingShortages || []).some((p) => p.kind === 'none' && normSku(p.sku) === k)) return '❌ 3階に無い商品 (再ピック依頼は不要・「在庫なしを確認」へ)';
+      return null;
+    }
+    function reqRepick(seqArg) {
+      const x = seqArg ? bySeq.get(Number(seqArg)) : selectedSlip();
       if (!x) return;
       if (!workerSel.value) { alert('作業者を選択してください'); return; }
-      const rows = x.lines.map((l, i) =>
-        `<button type="button" class="wide" onclick="reqRepickQty(${x.seq}, ${i})">${esc(l.name)} <span class="sub">(${esc(l.sku)})</span> × ${l.qty}</button>`).join('');
-      const hint = x.lines.length > 1 ? '<div class="sub" style="grid-column:1/-1">2品目以上足りないときは、送ったあとにもう一度この伝票を選んで次の商品を送ってください</div>' : '';
-      openReqBox(`#${x.seq} 足りない商品は?`, `<div class="reason-grid">${rows}${hint}${cancelBtn}</div>`);
+      if (seqArg && slipPick && [...slipPick.options].some((o) => o.value === String(x.seq))) { slipPick.value = String(x.seq); showSlip(); }
+      rpSeq = x.seq; rpPick.clear();
+      // 選べる明細が1つで数量1なら、選ぶ手間を省いて送信ボタンだけにする
+      const free = x.lines.map((l, i) => [l, i]).filter(([l]) => !repickLock(x, l));
+      if (free.length === 1 && free[0][0].qty === 1) rpPick.set(free[0][1], 1);
+      renderRepickBox();
     }
-    function reqRepickQty(seq, idx) {
-      const x = bySeq.get(seq);
-      const l = x.lines[idx];
-      let qty = l.qty;
-      if (l.qty > 1) {
-        const raw = prompt(`足りない数量 (1〜${l.qty})`, String(l.qty));
-        if (raw == null) return;
-        qty = Number(raw);
-        if (!Number.isInteger(qty) || qty < 1 || qty > l.qty) { alert('数量が不正です'); return; }
+    // 数量: 1〜9 はワンタップ、10以上は数値入力 (work.ejs の qtyButtons と同じ考え方)
+    function qtyPadHtml(i, max, cur) {
+      const cnt = Math.min(max, 9);
+      const btns = Array.from({ length: cnt }, (_, k) => `<button type="button" class="rp-q ${cur === k + 1 ? 'sel' : ''}" data-i="${i}" data-q="${k + 1}">${k + 1}</button>`).join('');
+      const more = max > 9 ? `<input type="number" inputmode="numeric" class="rp-qin" data-i="${i}" min="1" max="${max}" placeholder="10〜${max}" value="${cur > 9 ? cur : ''}"><button type="button" class="rp-qok" data-i="${i}">決定</button>` : '';
+      return `<div class="rp-qty"><span class="sub">足りない数:</span>${btns}${more}</div>`;
+    }
+    function renderRepickBox() {
+      const x = bySeq.get(rpSeq);
+      if (!x) return;
+      const rows = x.lines.map((l, i) => {
+        const lock = repickLock(x, l);
+        const label = `${esc(l.name)} <span class="sub">(${esc(l.sku)})</span> × ${l.qty}`;
+        if (lock) return `<div class="rp-row locked"><div style="padding:8px 10px">${label}<div class="sub">${esc(lock)}</div></div></div>`;
+        const q = rpPick.get(i);
+        const on = q != null;
+        return `<div class="rp-row ${on ? 'on' : ''}"><button type="button" class="rp-toggle" data-i="${i}">${on ? '☑' : '☐'} ${label}${on ? ` → <b>${q} 個</b>` : ''}</button>${on && l.qty > 1 ? qtyPadHtml(i, l.qty, q) : ''}</div>`;
+      }).join('');
+      const cnt = rpPick.size;
+      const allLocked = x.lines.length > 0 && x.lines.every((l) => repickLock(x, l));
+      const hint = allLocked ? '<div class="sub" style="grid-column:1/-1">この伝票の商品はすべて依頼済み・報告済みです</div>' : '';
+      openReqBox(`#${x.seq} 足りない商品を選ぶ (複数可)`,
+        `<div class="rp-list">${rows}</div><div class="reason-grid">${hint}<button type="button" class="wide" id="rpSend" style="background:#e03131; color:#fff; border-color:#e03131" ${cnt ? '' : 'disabled'}>🔄 選んだ ${cnt} 品をピッキングへ送信</button>${cancelBtn}</div>`);
+    }
+    // 選択箱の操作は委譲で受ける (再描画してもリスナーが消えない・SKU を属性に埋めない)
+    document.getElementById('reqBoxBody').addEventListener('click', (e) => {
+      const x = bySeq.get(rpSeq);
+      const tg = e.target.closest('.rp-toggle');
+      if (tg && x) { const i = Number(tg.dataset.i); if (rpPick.has(i)) rpPick.delete(i); else rpPick.set(i, x.lines[i].qty); renderRepickBox(); return; }
+      const qb = e.target.closest('.rp-q');
+      if (qb) { rpPick.set(Number(qb.dataset.i), Number(qb.dataset.q)); renderRepickBox(); return; }
+      const ok = e.target.closest('.rp-qok');
+      if (ok && x) {
+        const i = Number(ok.dataset.i);
+        const inp = document.querySelector(`.rp-qin[data-i="${i}"]`);
+        const v = Number(inp && inp.value);
+        const max = x.lines[i].qty;
+        if (!Number.isInteger(v) || v < 1 || v > max) { alert(`数量は 1〜${max} で入力してください`); return; }
+        rpPick.set(i, v); renderRepickBox(); return;
       }
-      closeReqBox();
-      if (!confirm(`#${seq} ${l.name} × ${qty} が足りないとしてピッキングへ再ピックを依頼します。よろしいですか?`)) return;
-      sendRepick(seq, l.sku, qty);
-    }
-    async function sendRepick(seq, sku, qty) {
+      if (e.target.closest('#rpSend') && x) {
+        const items = [...rpPick.entries()].map(([i, qty]) => ({ sku: x.lines[i].sku, name: x.lines[i].name, qty }));
+        if (!items.length) return;
+        const list = items.map((it) => `・${it.name} × ${it.qty}`).join('\n');
+        if (!confirm(`#${x.seq} の次の商品が足りないとして、ピッキングへ再ピックを依頼します。\n${list}\nよろしいですか?`)) return;
+        closeReqBox();
+        sendRepickMany(x.seq, items);
+      }
+    });
+    async function sendRepickMany(seq, items) {
       if (sending) return;
       sending = true;
+      const failed = [];
       try {
-        const r = await post(`/apps/packing/api/batches/${BATCH_ID}/events`, eventPayload('shortage', { slip_seq: seq, sku, qty }));
-        if (!r) return;
-        if (!r.ok) { alert(r.body.error || `エラー (${r.status})`); location.reload(); return; }
-        // 直前に記録した候補 (この伝票・このSKU) を送信
-        const inc = (r.body.incidents || []).filter((i) => i.slip_seq === seq && i.sku === sku && i.status === 'candidate').pop();
-        if (!inc) { alert('候補は記録しましたが送信対象が見つかりません。画面を更新して「ピッキングへ送信」を押してください'); location.reload(); return; }
-        const c = await post(`/apps/packing/api/batches/${BATCH_ID}/incidents/${inc.id}/resolve`, { decision: 'confirm', worker_name: workerSel.value });
-        // already_resolved かつ status が confirmed = 先の送信が届いていて応答だけ落ちた (post は同内容を再送する)
-        // → 成功扱い。取下げ済み (withdrawn) なら別操作との競合なので失敗として知らせる (Codex R4/R5)
-        const sent = c && (c.ok || (c.body.code === 'already_resolved' && c.body.status === 'confirmed'));
-        if (!sent) alert(`候補は記録しましたが送信に失敗しました${c ? ` (${c.body.error || c.status})` : ''}。「進行中の依頼」から「ピッキングへ送信」を押してください`);
-        location.reload();
+        for (const it of items) {
+          const r = await post(`/apps/packing/api/batches/${BATCH_ID}/events`, eventPayload('shortage', { slip_seq: seq, sku: it.sku, qty: it.qty }));
+          if (!r) { failed.push(`${it.name}: 通信エラー`); continue; }
+          if (!r.ok) { failed.push(`${it.name}: ${r.body.error || `エラー (${r.status})`}`); continue; }
+          // 直前に記録した候補 (この伝票・このSKU) を送信
+          const inc = (r.body.incidents || []).filter((i) => i.slip_seq === seq && normSku(i.sku) === normSku(it.sku) && i.status === 'candidate').pop();
+          if (!inc) { failed.push(`${it.name}: 候補は記録しましたが送信対象が見つかりません`); continue; }
+          const c = await post(`/apps/packing/api/batches/${BATCH_ID}/incidents/${inc.id}/resolve`, { decision: 'confirm', worker_name: workerSel.value });
+          // already_resolved かつ confirmed = 先の送信が届いていて応答だけ落ちた (post は同内容を再送する) → 成功扱い (Codex R4/R5)
+          const sent = c && (c.ok || (c.body.code === 'already_resolved' && c.body.status === 'confirmed'));
+          if (!sent) failed.push(`${it.name}: 送信に失敗${c ? ` (${c.body.error || c.status})` : ''}`);
+        }
+        if (failed.length) alert(`送れなかった商品があります:\n${failed.join('\n')}\n「進行中の依頼」で状態を確認してください`);
+        reloadKeeping(seq);
       } finally { sending = false; }
+    }
+    // 再読込しても同じ伝票を選んだままにする (?seq=)
+    function reloadKeeping(seq) {
+      const u = new URL(location.href);
+      if (seq) u.searchParams.set('seq', String(seq)); else u.searchParams.delete('seq');
+      location.replace(u.toString());
     }
     async function resolveInc(id, decision) {
       if (sending) return;
