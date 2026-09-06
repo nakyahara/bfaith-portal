@@ -3494,6 +3494,20 @@ console.log(String.fromCharCode(10) + '[23b] 急ぎ (出せる在庫で数える
   const cCalm = cards1.find((c) => c.id === tCalm);
   ok(cCalm.priority.kind === 'normal' && cCalm.priority.days === 300, '出せる在庫が多い商品は急ぎにしない');
   ok(cards1.indexOf(cUrg) < cards1.indexOf(cCalm), '一覧でも急ぎが先');
+  // ⭐全ロケの合計も Z/Y も**同じ 1 回の読み取り**から出す。参照マップの 5 分キャッシュを混ぜない —
+  //   片方だけ新しいと、その間だけ在庫日数が大きく狂う (clearEnrichCache せずに在庫を動かして確かめる)
+  stock('URG-A', 'P3F', 100);
+  const cFresh = S3.buildTaskList().cards.find((c) => c.id === tUrg);
+  ok(cFresh.live.free_stock === 120 && cFresh.live.shippable_free === 102 && cFresh.priority.kind === 'normal',
+    '在庫が動いたら次の読み込みで反映される (キャッシュ済みの合計と Z が食い違わない)');
+  // Z と Y の両方に当たる行 (ロケ Z・ブロック略称 Y) は Z として 1 回だけ数える (二重に引かない)
+  db.prepare(`INSERT INTO mirror_logizard_stock (商品ID, 商品名, ロケ, ブロック略称, 品質区分名, 在庫数, 引当数, captured_at, synced_at)
+    VALUES ('URG-A', 'URG-A', 'Z09-001-001-01', 'Y09', '良品', 10, 0, ?, ?)`).run(now, now);
+  const cBoth = S3.buildTaskList().cards.find((c) => c.id === tUrg);
+  ok(cBoth.live.free_stock === 130 && cBoth.live.pending_free === 28 && cBoth.live.shippable_free === 102,
+    'Z にも Y にも見える行は 1 回だけ在庫化待ちに数える (出せる在庫は変わらない)');
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'URG-A' AND ロケ = 'Z09-001-001-01'");
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID = 'URG-A' AND ロケ = 'P3F-001-001-01' AND 在庫数 = 100");
 
   // ② 🌱 はじめての商品 = 過去に入荷したことがない (作業実績の有無ではない)
   const tFirst = task('FIRST-A', 'はじめて入荷する商品', { arrival_date: '2026-09-05' });
