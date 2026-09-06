@@ -223,6 +223,8 @@ export function searchWorkMaster(q, limit = 50) {
 
 // size_class (大きさ) は廃止 (中原さん 2026-09-06)。列と既存の値は残すが、どの画面からも書き換えない
 const EDIT_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'expiry_seal'];
+// 廃止した項目。書かないがエラーにもしない (古い画面からの保存を失敗させない — Codex R1 #5)
+const DEPRECATED_FIELDS = ['size_class'];
 
 export function updateWorkMasterRow(key, fields, user, expectVersion) {
   const db = getDB();
@@ -254,7 +256,11 @@ export function updateWorkMasterRow(key, fields, user, expectVersion) {
     sets.push(`${f} = ?`);
     params.push(v);
   }
-  if (sets.length === 0) return { ok: false, error: 'no_fields', message: '更新する項目がありません' };
+  if (sets.length === 0) {
+    const ignored = DEPRECATED_FIELDS.filter((f) => f in fields);
+    if (ignored.length > 0) return { ok: true, unchanged: true, ignored_fields: ignored };
+    return { ok: false, error: 'no_fields', message: '更新する項目がありません' };
+  }
   const r = db.prepare(`UPDATE f_iroha_work_master
     SET ${sets.join(', ')}, version = version + 1, updated_at = ?, updated_by = ?
     WHERE code_key = ? AND version = ?`).run(...params, utcNow(), user || null, k, ver);

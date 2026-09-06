@@ -2815,7 +2815,9 @@ function renderPlan() {
   const rec = d.recommend || { count: 0, hours: 0 };
   $('#planCandN').textContent = cand.length;
   // ⭐「ここまで足すと 1 日の目安」の区切り線。すでに目安を超えていれば引かない (count = 0)
-  const cut = '<div class="pcut">ここまでで 1 日の目安 ' + esc(fmtHours(rec.hours)) + '</div>';
+  // 時間不明のカードは 0 時間で数えているので、混じっていれば件数を添える (0 時間を「目安」と言い切らない)
+  const cut = '<div class="pcut">ここまでで 1 日の目安 ' + esc(fmtHours(rec.hours))
+    + (rec.unknown_hours_count ? ' (時間不明 ' + rec.unknown_hours_count + ' 件)' : '') + '</div>';
   $('#planCand').innerHTML = cand.length === 0 ? '<div class="colempty">候補はありません</div>'
     : cand.map((c, i) => pcardHtml(c, ro ? [] : [['＋ 明日やる', 'primary', 'tomorrow']], !ro)
         + (rec.count && i + 1 === rec.count && i + 1 < cand.length ? cut : '')).join('');

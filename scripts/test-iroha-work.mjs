@@ -2438,8 +2438,15 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
           // 職員がその場で登録する「大きさ」は廃止 (2026-09-06)。送っても受け取らない
           const mv = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
             fields: { size_class: 'L' }, worker_id: staffP.id, pin: '4649' } });
-          ok(mv.status === 400 && mv.json.error === 'bad_request', '「大きさ」は登録できる項目から外した (送っても 400)');
-          ok(!db.prepare("SELECT 1 FROM f_iroha_work_master WHERE code_key = 'size-a'").get(), '断ったのでマスタの行も作らない');
+          ok(mv.status === 200 && mv.json.ok === true && mv.json.unchanged === true
+            && String(mv.json.ignored_fields) === 'size_class',
+            '「大きさ」だけ送ってきた古い画面はエラーにせず「変えなかった」で返す (Codex R1 #5)');
+          ok(!db.prepare("SELECT 1 FROM f_iroha_work_master WHERE code_key = 'size-a'").get(), '書かないのでマスタの行も作らない');
+          const mvBoth = await call('POST', '/api/master', { cookie, body: { id: t6, code: 'SIZE-A',
+            fields: { size_class: 'L', process_count: '3' }, worker_id: staffP.id, pin: '4649' } });
+          ok(mvBoth.status === 200 && db.prepare("SELECT size_class, process_count FROM f_iroha_work_master WHERE code_key = 'size-a'").get().size_class == null,
+            '他の項目と一緒に送っても「大きさ」だけは書かない');
+          db.prepare("DELETE FROM f_iroha_work_master WHERE code_key = 'size-a'").run();
           // 配送方法が分かれば、その大きさが並びに効く
           db.prepare("UPDATE mirror_products SET 配送方法 = '定形外郵便' WHERE 商品コード = 'SIZE-A'").run();
           clearEnrichCache();
@@ -3560,7 +3567,38 @@ console.log(String.fromCharCode(10) + '[23b] 急ぎ (出せる在庫で数える
   ok(rUrg && rCalm && rUrg.rank < rCalm.rank, '急ぎのカードのほうが小さい番号 (先にやる)');
   ok(plan.recommend && plan.recommend.count >= 1 && plan.recommend.count <= plan.candidates.length,
     'おすすめの区切りも一緒に返す');
-  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID IN ('URG-A','CALM-A','STK-A')");
+
+  // ⑤ 判定材料は「商品ごと」に見る — よその商品の実績でこの商品を「はじめて」にしない (Codex R1 #1)
+  const tNoArr = task('NOARR-A', '入庫日の分からないカード', { arrival_date: null });
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tNoArr).first_time === null,
+    'この商品の材料が 0 件なら null (よその商品に入荷実績があっても「はじめて」にしない)');
+  sale('BADD-A', 10); stock('BADD-A', 'P3F', 50, '不明');
+  const tBadDate = task('BADD-A', '在庫の入荷日が読めない商品', { arrival_date: null });
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tBadDate).first_time === null,
+    '入荷日が読めない行しか無い商品も「はじめて」と決めつけない (読めない ≠ 入荷が無い)');
+
+  // ⑥ 一覧・ボードと明日の計画で並びのものさしが同じ (Codex R1 #2)
+  const listCards = S3.buildTaskList().cards;
+  const notToday = listCards.filter((c) => !c.today);
+  ok(notToday.length > 1 && notToday.every((c, i) => i === 0 || S3.comparePlanOrder(notToday[i - 1], c) <= 0),
+    '一覧 (「今日やる」の下) は明日の計画とまったく同じ並びになっている');
+  ok(S3.comparePlanOrder({ id: 2 }, { id: 10 }) < 0 && S3.comparePlanOrder({ id: 'aa-2' }, { id: 'aa-10' }) > 0,
+    '最後の決着は数の id なら数として、Notion の page_id なら文字列として付く');
+  const nanCard = { priority: { sort_days: NaN, kind: 'normal' } };
+  const okCard = { priority: { sort_days: 5, kind: 'normal' } };
+  ok(S3.comparePriority(nanCard, okCard) > 0 && S3.comparePriority(okCard, nanCard) < 0,
+    '日数が NaN のカードは最後に回る (比較結果が NaN にならない — Codex R1 #3)');
+
+  // ⑦ 出せる在庫は負にしない (Codex R1 #6) ・区切りの「時間不明」件数 (Codex R1 #4)
+  ok(S3.shippableFreeOf(5, { stock: 10, allocated: 0 }, null) === 0, '在庫化待ちのほうが多くても「出せる在庫」は 0 止まり (負を画面に出さない)');
+  ok(S3.shippableFreeOf(null, null, null) === null, 'ミラーが取れていなければ null のまま (0 で代用しない)');
+  ok(S3.recommendCut([h(null), h(2)], 0, 6).unknown_hours_count === 1, '0 時間で数えた「時間不明」の件数も返す');
+  ok(S3.recommendCut([h(2), h(3)], 0, 6).unknown_hours_count === 0, '全部分かっていれば 0 件');
+  ok(S3.recommendCut([h(2)], 9, 6).unknown_hours_count === 0, '目安を超えていて区切りを引かないときも件数は 0');
+
+  db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID IN ('URG-A','CALM-A','STK-A','BADD-A')");
   clearEnrichCache();
 }
 

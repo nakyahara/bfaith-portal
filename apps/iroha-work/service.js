@@ -78,7 +78,10 @@ export function priorityOf(sales30, shippableFree) {
  */
 export function shippableFreeOf(totalFree, z, y) {
   if (totalFree == null) return null;
-  return Number(totalFree) - pendingFreeOf(z, y);
+  const n = Number(totalFree);
+  if (!Number.isFinite(n)) return null;      // 数にならない在庫は「分からない」(0 で代用しない)
+  // ミラーの一時的なずれ (他ロケの引当超過など) で負にしない。「出せる在庫 -5個」を画面に出さない (Codex R1 #6)
+  return Math.max(0, n - pendingFreeOf(z, y));
 }
 /** 在庫化待ち (Z + Y) のフリー在庫 */
 export function pendingFreeOf(z, y) {
@@ -94,9 +97,17 @@ const PRIORITY_RANK = { urgent: 0, new: 1, normal: 2, unknown: 3, calm: 4 };
  * 在庫が少ない順 = sort_days の昇順。新商品は 10 日 (§AA)、日数の出ないものは最後。
  * 同じ日数なら kind の順 (急ぎ → 新商品 → 通常 → データなし → 販売なし)
  */
+/** 並びに使う在庫日数。数にならないもの (null・NaN) は最後に回す — 比較結果を NaN にしない (Codex R1 #3) */
+const sortDaysOf = (c) => {
+  const v = c?.priority?.sort_days;
+  if (v == null) return Infinity;          // 日数が出ないもの (Number(null) は 0 なので先に弾く)
+  const n = Number(v);
+  return Number.isFinite(n) ? n : Infinity;
+};
+
 export function comparePriority(a, b) {
-  const da = a.priority?.sort_days ?? Infinity;
-  const db_ = b.priority?.sort_days ?? Infinity;
+  const da = sortDaysOf(a);
+  const db_ = sortDaysOf(b);
   if (da !== db_) return da - db_;
   const ra = PRIORITY_RANK[a.priority?.kind] ?? 9;
   const rb = PRIORITY_RANK[b.priority?.kind] ?? 9;
@@ -249,14 +260,7 @@ export function buildList() {
     };
   });
 
-  cards.sort((a, b) => {
-    const p = comparePriority(a, b);
-    if (p !== 0) return p;
-    const aa = a.arrival || '9999-99-99';
-    const ab = b.arrival || '9999-99-99';
-    if (aa !== ab) return aa < ab ? -1 : 1;
-    return String(a.title).localeCompare(String(b.title), 'ja');
-  });
+  cards.sort(comparePlanOrder);   // アプリ正本の一覧・ボード・明日の計画と同じ並び (§AA・Codex R1 #2)
 
   // 画像がまだ無い商品は裏で解決を仕掛けておく (次に開いたとき出る)
   const missingImg = [...new Set(cards.filter(c => c.product_code && !c.image_url).map(c => c.product_code))];
@@ -413,20 +417,25 @@ export function buildPlan({ readOnly = false } = {}) {
 /**
  * おすすめの区切り = 候補を上から足していって、1 日の目安 (max) に届くまでの件数。
  * すでに目安を超えていれば 0 件 (区切り線を引かない)。想定時間の分からないカードは 0 時間として数える
- * (足しても目安を超えないので、区切りより上に残る)
+ * (足しても目安を超えないので、区切りより上に残る)。
+ * ⭐その「時間不明」が何件混じったかも返す。0 時間で数えた分を「1 日の目安」と言い切らない (Codex R1 #4)
  */
 export function recommendCut(candidates, plannedHours = 0, maxHours = 6) {
   const room = Math.round((maxHours - (Number(plannedHours) || 0)) * 10) / 10;
-  if (!(room > 0)) return { count: 0, hours: 0, room: 0 };
+  if (!(room > 0)) return { count: 0, hours: 0, room: 0, unknown_hours_count: 0 };
   let count = 0;
   let hours = 0;
+  let unknown = 0;
   for (const c of candidates) {
-    const h = Number(c.plan_hours) || 0;
+    const n = Number(c.plan_hours);
+    const isKnown = c.plan_hours != null && Number.isFinite(n);
+    const h = isKnown ? n : 0;
     if (count > 0 && hours + h > room) break;    // 1 件目は目安を超えていても入れる (何も勧めないと画面が無言になる)
     hours += h;
     count += 1;
+    if (!isKnown) unknown += 1;
   }
-  return { count, hours: Math.round(hours * 10) / 10, room };
+  return { count, hours: Math.round(hours * 10) / 10, room, unknown_hours_count: unknown };
 }
 
 /** 商品画像がまだ無いカードの取り寄せを頼む (一覧・単票の共通処理。失敗しても表示は続ける) */
@@ -460,15 +469,11 @@ export function buildTaskList({ facility = null, readOnly = false } = {}) {
   const rows = listOpenTasks({ facility });
   const { cards, today } = buildTaskCards(rows, { readOnly });
 
-  // 並び: 今日やる → 在庫が少ない順 (急ぎが先頭。新商品は 10 日とみなす — §AA) → 入庫が古い順
+  // 並び: 「今日やる」だけ一覧の先頭に来て、そこから先は明日の計画・ボードとまったく同じ並び。
+  // 画面ごとにものさしを変えない (§AA。以前は一覧だけ大きさと id を見ておらず順が食い違っていた — Codex R1 #2)
   cards.sort((a, b) => {
     if (a.today !== b.today) return a.today ? -1 : 1;
-    const p = comparePriority(a, b);
-    if (p !== 0) return p;
-    const aa = a.arrival || '9999-99-99';
-    const ab = b.arrival || '9999-99-99';
-    if (aa !== ab) return aa < ab ? -1 : 1;
-    return String(a.title).localeCompare(String(b.title), 'ja');
+    return comparePlanOrder(a, b);
   });
 
   // 読むだけ (下見) では画像の取り寄せも起こさない — 開くだけで DB が変わらない (Codex PR1 R7 / R8)
@@ -616,15 +621,16 @@ function sizeMapByCode(codeKeys) {
  * 実績の証拠は 2 つ。どちらかに今回より古い入荷があれば「はじめて」ではない:
  *   ① 過去のカード (f_iroha_tasks。取り込んだ Notion の分と、アプリで作った分。終了したカードも数える)
  *   ② ロジザード在庫の入荷日 (カードが残っていない古い入荷を拾う)
- * どちらの材料も無ければ null = **分からない** (札を出さない)。0 件を「はじめて」と読み替えない
+ * どちらの材料も無ければ null = **分からない** (札を出さない)。0 件を「はじめて」と読み替えない。
+ * ⭐材料の有無は**商品ごと**に見る。よその商品に実績があっても、この商品の材料が 0 件なら分からない
+ *   (日付が読めない行しか無い場合も材料なし扱い。読めない = 入荷が無かった証拠にはならない — Codex R1 #1)
  */
 function arrivalHistory(codeKeys) {
   const db = getDB();
   const first = new Map();       // 商品コード → いちばん古い入荷日 (YYYY-MM-DD)
-  let known = false;             // 判定材料が 1 件でもあるか
   const put = (k, d) => {
     const ymd = normalizeYmd(d);
-    if (!k || !ymd) return;
+    if (!k || !ymd) return;      // 日付が読めない行は材料に数えない
     const cur = first.get(k);
     if (!cur || ymd < cur) first.set(k, ymd);
   };
@@ -638,7 +644,6 @@ function arrivalHistory(codeKeys) {
       WHERE product_code IS NOT NULL AND arrival_date IS NOT NULL AND TRIM(arrival_date) <> ''
         AND (close_reason IS NULL OR close_reason <> 'cancelled') GROUP BY 1`).all();
     for (const r of rows) put(r.k, r.a);
-    if (rows.length > 0) known = true;
   }
   if (keys.length > 0 && has('mirror_logizard_stock')
       && db.prepare('PRAGMA table_info(mirror_logizard_stock)').all().some((c) => c.name === '入荷日')) {
@@ -649,15 +654,14 @@ function arrivalHistory(codeKeys) {
         WHERE LOWER(TRIM(商品ID)) IN (${chunk.map(() => '?').join(',')})
           AND 入荷日 IS NOT NULL AND TRIM(入荷日) <> '' GROUP BY 1`).all(...chunk);
       for (const r of rows) put(r.k, r.a);
-      if (rows.length > 0) known = true;
     }
   }
   return {
     /** @returns true = はじめての商品 / false = 入荷実績あり / null = 分からない (札を出さない) */
     firstTime(codeKey, arrival) {
-      if (!codeKey || !known) return null;
+      if (!codeKey) return null;
       const f = first.get(codeKey);
-      if (!f) return true;                       // この商品の入荷の記録が 1 件も無い
+      if (!f) return null;                       // この商品の判定材料が 0 件 = 分からない (札を出さない)
       const mine = normalizeYmd(arrival);
       if (!mine) return false;                   // 今回の入庫日が分からない: 記録がある以上「はじめて」とは言えない
       return !(f < mine);                        // 今回より古い入荷があれば「はじめて」ではない
@@ -704,7 +708,22 @@ export function comparePlanOrder(a, b) {
   const sa = a.size_rank ?? -1;
   const sb = b.size_rank ?? -1;
   if (sa !== sb) return sb - sa;       // 大きいほど先
-  return (a.id || 0) - (b.id || 0);
+  return compareId(a.id, b.id);
+}
+
+/**
+ * 最後の決着に使う id。アプリ正本は数値 (task.id)、Notion 正本は page_id の文字列なので
+ * 両方を同じ規則で比べる (数どうしは数として、そうでなければ文字列として)。Codex R1 #2
+ */
+function compareId(x, y) {
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v
+    : (typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v) : null));
+  const nx = num(x);
+  const ny = num(y);
+  if (nx != null && ny != null) return nx - ny;
+  const sx = String(x ?? '');
+  const sy = String(y ?? '');
+  return sx < sy ? -1 : sx > sy ? 1 : 0;
 }
 
 /** 明日やる分の合計 (ゲージ用)。工程数の無いカードは 0 で足さず「時間不明」として数える */
