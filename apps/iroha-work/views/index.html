@@ -127,9 +127,9 @@
   /* ⛔ 止まっているカードは一目で分かるように、カードごと赤く (中原さん 2026-09-05: 資材不足をもっと強調) */
   .row.blocked{border-color:var(--danger);background:var(--danger-soft)}
   .bcard.blocked{border:2px solid var(--danger);background:var(--danger-soft)}
-  .bblk{margin-top:4px;font-size:.84rem;font-weight:800;color:var(--danger);line-height:1.3}
+  .bblk{margin-top:3px;font-size:.84rem;font-weight:800;color:var(--danger);line-height:1.3}
   /* 🔥 急ぎ (ボードのカード)。⛔ と同じ強さで 1 行に出す (要件 §AA) */
-  .burg{margin-top:4px;font-size:.84rem;font-weight:800;color:var(--amber);line-height:1.3}
+  .burg{margin-top:3px;font-size:.84rem;font-weight:800;color:var(--amber);line-height:1.3}
   .st{flex:none;font-size:.8rem;font-weight:700;border-radius:var(--r-sm);padding:6px 10px;cursor:pointer;
     border:1px solid transparent;white-space:nowrap;font-family:var(--font)}
   .st.todo{background:var(--well);color:var(--sub);border-color:var(--line)}
@@ -167,23 +167,28 @@
     border-radius:var(--r-sm);padding:3px 8px;font-size:.74rem;font-weight:700;cursor:pointer}
   .bcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;margin-bottom:6px;cursor:pointer}
   .bcard.sel{outline:2px solid var(--accent);outline-offset:-2px}
-  .bcard{display:flex;gap:8px;align-items:flex-start}
+  /* ⭐上の段 = 画像と文字。下の段 = 札とボタン。
+     以前はぜんぶ画像の右に入れていたので、札もボタンも 1 つずつ行を使ってカードが縦に伸び、
+     画像の下は空いたままだった (中原さん 2026-09-07)。下の段はカードの幅いっぱいを使う */
+  .btop{display:flex;gap:8px;align-items:flex-start}
+  .bfoot{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:6px}
+  .bfoot:empty{display:none}
   .bcard .th{width:44px;height:44px;flex:none;border-radius:var(--r-sm);background:var(--well);border:1px solid var(--line);
     display:grid;place-items:center;font-size:1.1rem;overflow:hidden}
   .bcard .th img{width:100%;height:100%;object-fit:contain;background:#fff}
   .bcard .bd{min-width:0;flex:1}
   .bcard h4{margin:0;font-size:.92rem;font-weight:700;line-height:1.35;
     display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}   /* 2 行で省略 (タップで詳細に飛ぶ) */
-  .bcard .m{font-size:.76rem;color:var(--sub);margin-top:2px}
+  .bcard .m{font-size:.76rem;color:var(--sub);margin-top:3px}
   .bcard .cb{width:20px;height:20px;vertical-align:-4px;margin-right:6px;accent-color:var(--accent)}
   .colempty{color:var(--faint);font-size:.8rem;padding:8px 4px}
-  /* 拠点・いつ の列では、カードに進捗の札を出す (どの段階か分かるように — 中原さん 2026-09-06) */
-  .bstat{margin-top:4px}
-  .bcard .st.ro{display:inline-block;font-size:.74rem;padding:3px 8px;cursor:default}
+  /* 拠点・いつ の列では、カードに進捗の札を出す (どの段階か分かるように — 中原さん 2026-09-06)。
+     どこが・いつ と同じ行に並べる (3 軸がひと目で読める・行が増えない) */
+  .bcard .st.ro{display:inline-block;font-size:.74rem;padding:2px 8px;cursor:default;margin-right:6px;vertical-align:-1px}
   .fgroup[hidden]{display:none}
 
-  /* ── 「どこが」「いつ」の札 (3 軸のうち 2 つ。職員だけボタンになる — 要件 §W-4) ── */
-  .tags{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
+  /* ── 「どこが」「いつ」の札 (3 軸のうち 2 つ。職員だけボタンになる — 要件 §W-4)。
+     並べるのは .bfoot の役目 (札だけの入れ物を作ると、そのぶん行が増える) ── */
   .tag{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);
     padding:4px 9px;font-size:.8rem;font-weight:700;display:inline-flex;align-items:center;gap:5px;line-height:1.3;white-space:nowrap}
   button.tag{min-height:36px;cursor:pointer}
@@ -297,7 +302,7 @@
   .bulkbar .go{background:var(--ok);color:#fff;margin-left:auto}
   /* ✅ 棚入待ち → 棚入完了 (1 枚ずつ。職員モードだけ) — 中原さん 2026-09-05 */
   .stockbtn{flex:none;border:1px solid var(--ok);background:var(--ok-soft);color:var(--ok);border-radius:var(--r-sm);padding:6px 10px;font-weight:700;font-size:.85rem;cursor:pointer;min-height:36px;margin-right:6px}
-  .bcard .stockbtn{margin:6px 0 0;display:inline-block}
+  .bcard .stockbtn{margin:0}
   .bulkbar .cancel{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.45)}
 
   /* ── 表 (ラベル待ち・履歴) ── */
@@ -595,8 +600,8 @@
   .printbig[disabled]{opacity:.55;cursor:default}
   .printbtn{flex:none;border:1px solid var(--line);background:var(--surface);color:var(--accent);border-radius:var(--r-sm);padding:6px 10px;font-weight:700;font-size:.85rem;cursor:pointer;min-height:36px}
   .printbtn[disabled]{opacity:.55;cursor:default}
-  .bcard .printbtn{margin:6px 6px 0 0;display:inline-block}
-  .bcard .pjob{font-size:12px;padding:4px 8px;margin-top:6px}
+  .bcard .printbtn{margin:0}
+  .bcard .pjob{font-size:12px;padding:4px 8px;margin:0}
 
   .ask .modal{max-width:520px}
   .asktext{font-size:1.02rem;font-weight:600;white-space:pre-wrap;margin:6px 0 12px;color:var(--ink);line-height:1.5}
@@ -1921,21 +1926,33 @@ function bcardHtml(c, status) {
     c.external_ready ? '📦 外部に出せます' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
+  // ⭐2 段に分ける。上 = 画像と文字、下 = 札とボタン。
+  //   下の段は**カードの幅いっぱい**を使う (画像の右に押し込むと 1 つずつ行を使ってカードが縦に伸び、
+  //   画像の下は空いたままになる — 中原さん 2026-09-07「表示する情報は変えずに縦を短く」)
   return '<div class="bcard' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+    '<div class="btop">' +
     (grab ? gripHtml() : '') +
     (c.image_url ? '<div class="th">' + thumbHtml(c) + '</div>' : '') +   // 📦 の空枠は幅を取るだけなので、写真があるカードだけ (監修)
     '<div class="bd">' +
     '<h4>' + (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
     esc(c.title) + '</h4>' +
+    '</div></div>' +
+    // ⭐ここから下はカードの幅いっぱい。画像の右に置くと、どれも折り返して 1 つにつき 2 行使う
     // ⛔ 止まっている理由は赤い 1 行で (小さな文字に埋めない — 中原さん 2026-09-05)
     (c.blocked ? '<div class="bblk">⛔ ' + esc(c.blocked.label) + 'で止まっています</div>' : '') +
     // 🔥 急ぎ = 1 週間以内に Z ロケの在庫を使わないといけない商品 (要件 §AA)。
     //   どの列 (進捗・拠点・いつ) で見ていても目に入るように、カードそのものに出す (中原さん 2026-09-06)
     (c.priority && c.priority.kind === 'urgent' ? '<div class="burg">🔥 急ぎ・' + esc(c.priority.label) + '</div>' : '') +
-    // 列が進捗以外なら、進捗の札を出す (拠点・いつ の列でも段階が分かるように — 中原さん 2026-09-06)
-    (boardCols !== 'status' ? '<div class="bstat"><span class="st ro ' + stClass(c.status) + '">' + esc(stLabel(c)) + '</span></div>' : '') +
-    (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') +
-    planTagsHtml(c) + stockBtnHtml(c) + printBtnBoardHtml(c) + printJobHtml(c, { compact: true }) + '</div></div>';
+    // 個数・箱・時間の行。列が進捗以外ならその先頭に進捗の札を置く (拠点・いつ の列でも段階が分かる —
+    //   中原さん 2026-09-06)。小さな文字どうしで 1 行にまとまり、札のために行が増えない
+    (boardCols !== 'status' || meta
+      ? '<div class="m num">'
+        + (boardCols !== 'status' ? '<span class="st ro ' + stClass(c.status) + '">' + esc(stLabel(c)) + '</span>' : '')
+        + esc(meta) + '</div>'
+      : '') +
+    '<div class="bfoot">' +
+    planTagsHtml(c) + stockBtnHtml(c) + printBtnBoardHtml(c) + printJobHtml(c, { compact: true }) +
+    '</div></div>';
 }
 
 /**
@@ -1957,7 +1974,7 @@ function planTagsHtml(c) {
     ? '<button class="tag ' + whenCls + '" data-when-of="' + esc(c.id) + '"><span class="k">いつ</span>' + esc(whenTxt) + '</button>'
     : '<span class="tag ' + whenCls + '"><span class="k">いつ</span>' + esc(whenTxt) + '</span>';
   // ⭐「どこが」は変えられない人 (利用者) には決まっているものだけ (監修 F-5)。「いつ」は未定でも出す (中原さん 2026-09-06: いつやるかの情報は両方の列で見たい)
-  return '<div class="tags">' + fac + when + '</div>';
+  return fac + when;      // 並べるのは .bfoot (札だけの入れ物を作ると、そのぶん行が増える)
 }
 
 // ─── ⭐「いつ」「どこが」を変える (職員だけ。要件 §W-4) ───

@@ -4188,8 +4188,25 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   }
   ok(/function statusChips\(\)/.test(html) && /if \(curStatus !== 'all' && c\.status !== curStatus\) return false;/.test(html) && /\$\('#stGroup'\)\.hidden = boardCols === 'status';/.test(html),
     'ボードに進捗の絞り込み (未着手・作業中・棚入待ち)。列が進捗のときは出さない');
-  ok(/\(boardCols !== 'status' \? '<div class="bstat"><span class="st ro ' \+ stClass\(c\.status\) \+ '">' \+ esc\(stLabel\(c\)\) \+ '<\/span><\/div>' : ''\)/.test(html),
-    '拠点・いつ の列ではカードに進捗の札を出す');
+  ok(/\(boardCols !== 'status' \? '<span class="st ro ' \+ stClass\(c\.status\) \+ '">' \+ esc\(stLabel\(c\)\) \+ '<\/span>' : ''\)/.test(html),
+    '拠点・いつ の列ではカードに進捗の札を出す (個数の行の先頭に置く = 札のために行を増やさない)');
+  // ⭐カードを縦に短くする (中原さん 2026-09-07)。情報は減らさず、札とボタンを幅いっぱいに詰める
+  ok(/'<div class="btop">'/.test(html) && /'<div class="bfoot">'/.test(html)
+    && /\.bfoot\{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:6px\}/.test(html)
+    && /\.bfoot:empty\{display:none\}/.test(html),
+    'ボードのカードは 上 = 画像と文字 / 下 = 札とボタン の 2 段。下の段はカードの幅いっぱいを使う');
+  ok(/return fac \+ when;/.test(html) && !/class="tags"/.test(html) && !/class="bstat"/.test(html),
+    '札だけの入れ物 (tags・bstat) は作らない (入れ物 1 つにつき 1 行ぶん縦に伸びる)');
+  // 止まっている・急ぎ・個数の行は画像の右に置くと折り返して 1 つにつき 2 行使う。btop の外に出す
+  const bcardSrc = html.slice(html.indexOf("function bcardHtml("), html.indexOf("function planTagsHtml("));
+  const at = (t) => bcardSrc.indexOf(t);
+  ok(at("btop") >= 0 && at("bfoot") > 0
+    && at("</div></div>") > at("<h4>") && at("</div></div>") < at("bblk")
+    && at("bblk") < at("burg") && at("burg") < at("m num") && at("m num") < at("bfoot"),
+    "⛔ 止まっている・🔥 急ぎ・個数の行は btop の外 = カードの幅いっぱい (画像の右で折り返させない)");
+  ok(/\.bcard \.stockbtn\{margin:0\}/.test(html) && /\.bcard \.printbtn\{margin:0\}/.test(html)
+    && /\.bcard \.pjob\{font-size:12px;padding:4px 8px;margin:0\}/.test(html),
+    'ボタンと印刷の知らせは行間を持たない (すき間は .bfoot の gap にまとめる)');
   ok(/const WHEN_SHORT = \{ today: '今日', tomorrow: '明日', over: 'やり残し', later: '先の予定' \};/.test(html) && /WHEN_SHORT\[c\.when\]/.test(html),
     'カードの札は短い言葉 (「い／つ／今日や／る」と折れない)');
   ok(/function toggleTomorrow\(id, want\) \{\r?\n\s+if \(!stateCan\('task\.plan\.assign'\)\) return;/.test(html)
