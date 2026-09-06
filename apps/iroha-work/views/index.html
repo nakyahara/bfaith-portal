@@ -2151,6 +2151,12 @@ setInterval(() => { if (state && state.staff_mode && state.staff_mode.staff) ren
  * 画面の中の「計画の許可」をその場で落とす。
  * サーバーに頼まなくても、職員モードを終えた瞬間・期限が来た瞬間にボタンを消すため
  */
+/** 職員の許可が落ちたあとの状態ダイアログ: 理由の段・PIN を消して、いま許される変更先だけ描き直す */
+function refreshStAfterCapsDrop() {
+  const c0 = findCard(stTarget);
+  if (c0) { stStep = null; $('#pinRow').style.display = 'none'; $('#pinIn').value = ''; $('#stMsg').textContent = ''; renderStBtns(c0); }
+  else closeSt();
+}
 function dropPlanCaps() {
   if (!state) return;
   state.staff_mode = { staff: false };
@@ -2161,11 +2167,11 @@ function dropPlanCaps() {
   if (curView === 'plan') setView('board');
   if (facPickCtx) closeFacPick();
   if (whenPickCtx) closeWhenPick();
-  // 開いている状態ダイアログも描き直す — 職員だけのボタンと PIN 行を残さない (Codex PR #1217 R1)
-  if (stTarget != null && $('#stOv').classList.contains('on') && !stSaving) {
-    const c0 = findCard(stTarget);
-    if (c0) { stStep = null; $('#pinRow').style.display = 'none'; $('#pinIn').value = ''; $('#stMsg').textContent = ''; renderStBtns(c0); }
-    else closeSt();
+  // 開いている状態ダイアログも描き直す — 職員だけのボタンと PIN 行を残さない (Codex PR #1217 R1)。
+  // 保存中は触らず、終わったら描き直す (失敗して戻ってきたボタンが職員のままにならないように — Codex R2)
+  if (stTarget != null && $('#stOv').classList.contains('on')) {
+    if (stSaving) stRefreshPending = true;
+    else refreshStAfterCapsDrop();
   }
   renderStaffBtn();
   renderList();
@@ -2961,6 +2967,8 @@ function fmtDur(sec) {
 }
 
 $('#bq').addEventListener('input', renderBoard);
+// 横スクロールの案内は、画面の向きや幅が変わったら判定し直す (Codex PR #1217 R2)
+window.addEventListener('resize', () => { const b = $('#board'); const h = $('#boardHint'); if (b && h && curView === 'board') h.hidden = !(b.scrollWidth > b.clientWidth + 4); });
 $('#histQ').addEventListener('input', () => { clearTimeout(histTimer); histTimer = setTimeout(loadHistory, 350); });
 
 // ─── 手動更新 ───
@@ -4500,6 +4508,7 @@ function openStFromDetail() { if (curDetail && can('task.status.change')) openSt
 // ─── ステータス変更 (Codex R2 ①: 保存中表示・処理中は全ボタン無効・失敗は大きく) ───
 let stTarget = null;   // カードの id
 let stSaving = false;
+let stRefreshPending = false;   // 保存中に職員モードが切れた → 保存が終わったら描き直す (Codex PR #1217 R2)
 let stStep = null;     // アプリ正本で終了の理由を選んでいる途中 ('closed')。「止まった」は別ダイアログ (openBlock)
 
 /** アプリ正本で「その変更に職員の本人確認が要るか」(サーバー tasks.js transitionNeedsStaff と同じ規則) */
@@ -4728,6 +4737,8 @@ async function doSetSt(choice) {
   stSaving = false;
   for (const b of document.querySelectorAll('#stBtns .btn, #stCancel')) b.disabled = false;
   settleForceClose();   // 通信中に「閉じる」が予約されていれば、ここで閉じる
+  // 保存中に職員モードが切れていたら、ここで描き直す (職員だけのボタンが有効に戻らないように — Codex PR #1217 R2)
+  if (stRefreshPending) { stRefreshPending = false; if (stTarget != null && $('#stOv').classList.contains('on')) refreshStAfterCapsDrop(); }
 
   // 一覧に残らないステータス (棚入完了) になったら、その場で行を外す (次の取得でも入ってこない)
   const dropCard = () => {

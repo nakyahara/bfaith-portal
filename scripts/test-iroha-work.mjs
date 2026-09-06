@@ -3642,8 +3642,10 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const staffOk = isStaffUI\(\) \|\| !!\(state\.me && state\.me\.session\);\s*const shown = nexts\.filter\(\(v\) => staffOk \|\| !stNeedsStaff\(c\.status, v\)\);/.test(html)
     && /ここから変えられるのは職員だけです/.test(html),
     '状態ダイアログ: 終了 (棚入完了) など職員だけの変更は、職員モードのときだけ描く (利用者に押せないボタンを見せない — 中原さん 2026-09-06)');
-  ok(/if \(stTarget != null && \$\('#stOv'\)\.classList\.contains\('on'\) && !stSaving\) \{\s*const c0 = findCard\(stTarget\);\s*if \(c0\) \{ stStep = null; \$\('#pinRow'\)\.style\.display = 'none'; \$\('#pinIn'\)\.value = ''; \$\('#stMsg'\)\.textContent = ''; renderStBtns\(c0\); \}/.test(html),
-    '職員モードが切れたら、開いている状態ダイアログも描き直す (職員だけのボタン・PIN 行を残さない — Codex PR #1217 R1)');
+  ok(/function refreshStAfterCapsDrop\(\)/.test(html) && /if \(stSaving\) stRefreshPending = true;\s*else refreshStAfterCapsDrop\(\);/.test(html)
+    && /if \(stRefreshPending\) \{ stRefreshPending = false; if \(stTarget != null && \$\('#stOv'\)\.classList\.contains\('on'\)\) refreshStAfterCapsDrop\(\); \}/.test(html),
+    '職員モードが切れたら、開いている状態ダイアログも描き直す。保存中なら保存後に (職員だけのボタン・PIN 行を残さない — Codex PR #1217 R1/R2)');
+  ok(/window\.addEventListener\('resize', \(\) => \{ const b = \$\('#board'\); const h = \$\('#boardHint'\);/.test(html), '横スクロールの案内は画面の幅が変わっても判定し直す (Codex R2)');
   ok(/async function stockOne\(id\)/.test(html) && /function stockBtnHtml\(c\)/.test(html) && (html.match(/closest\('\[data-stock-of\]'\)/g) || []).length === 2
     && /c\.status !== 'ready_for_stocking' \|\| bulkIds \|\| !isApp\(\) \|\| !stateCan\('tasks\.bulk_stocked'\) \|\| !isStaffUI\(\)/.test(html),
     '棚入待ちのカードに ✅ 棚入完了 (1 枚ずつ。職員モードだけ・まとめて選択中は出さない) — 一覧とボードの両方');
