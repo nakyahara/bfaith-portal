@@ -320,8 +320,10 @@ await t('端末: 実測「10個で2050g」を登録 → 採用値が実測にな
   const hist = await call('GET', '/api/weights?fnsku=X0RTW00001');
   assert.equal(hist.j.measurements.length, 1);
   assert.equal(hist.j.rules.limit_g, 30000);
-  assert.equal((await call('POST', `/api/weights/${ok.j.id}/revoke`, { body: { worker_id: memberId } })).status, 200);
-  assert.equal((await call('POST', `/api/weights/${ok.j.id}/revoke`, { body: { worker_id: memberId } })).status, 409);
+  // 別の回を名乗る取消は職員へ回す (単重は全回共通のマスタ)
+  assert.equal((await call('POST', `/api/weights/${ok.j.id}/revoke`, { body: { worker_id: memberId } })).status, 403);
+  assert.equal((await call('POST', `/api/weights/${ok.j.id}/revoke`, { body: { worker_id: memberId, run_id: wRun.runId } })).status, 200);
+  assert.equal((await call('POST', `/api/weights/${ok.j.id}/revoke`, { body: { worker_id: memberId, run_id: wRun.runId } })).status, 409);
   // 取り消したので単重は未登録に戻る = 推定から外れる
   const st2 = await call('GET', `/api/state?run=${wRun.runId}`);
   assert.equal(st2.j.weights.X0RTW00001, undefined);

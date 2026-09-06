@@ -170,11 +170,15 @@ export async function ensureRunCatalog(runId, { force = false } = {}) {
     const errors = [];
     for (const r of rows) {
       const { asin } = resolveAsin(r, index.map);
+      // 取れているキャッシュは壊さない (Codex PR3 R2 #1): 画像と単重は片方だけ欠けていることがあり、
+      // その再取得の巻き添えで、もう片方の ok を none/error に落としてはいけない
+      const keepImage = r.image_status === 'ok';
+      const keepWeight = r.weight_status === 'ok';
       if (!asin) {
         const why = 'ASIN が分かりません (Excel を添付するか SKU マスタを確認)';
-        upsertProductImage({ fnsku: r.fnsku, asin: null, url: null, status: 'none', error: why });
-        upsertWeightRef({ fnsku: r.fnsku, asin: null, weightG: null, status: 'none', error: why });
-        none++; noAsin++; noWeight++;
+        if (!keepImage) { upsertProductImage({ fnsku: r.fnsku, asin: null, url: null, status: 'none', error: why }); none++; }
+        if (!keepWeight) { upsertWeightRef({ fnsku: r.fnsku, asin: null, weightG: null, status: 'none', error: why }); noWeight++; }
+        noAsin++;
         continue;
       }
       try {
@@ -188,9 +192,10 @@ export async function ensureRunCatalog(runId, { force = false } = {}) {
           error: w.g ? null : (w.error || 'Amazon に梱包重量の登録がありません (現場で「何個で何g」を量ってください)') });
         if (w.g) weighed++; else noWeight++;
       } catch (e) {
-        failed++; noWeight++;
-        upsertProductImage({ fnsku: r.fnsku, asin, url: null, status: 'error', error: e.message });
-        upsertWeightRef({ fnsku: r.fnsku, asin, weightG: null, status: 'error', error: e.message });
+        failed++;
+        // 通信失敗で、既に取れている画像・単重まで消さない (Codex PR3 R2 #1)
+        if (!keepImage) upsertProductImage({ fnsku: r.fnsku, asin, url: null, status: 'error', error: e.message });
+        if (!keepWeight) { upsertWeightRef({ fnsku: r.fnsku, asin, weightG: null, status: 'error', error: e.message }); noWeight++; }
         if (errors.length < 5) errors.push(`${asin}: ${e.message}`);
         console.warn(`[fba-box] カタログ取得失敗 ${asin}: ${e.message}`);
       }

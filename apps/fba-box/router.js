@@ -539,12 +539,24 @@ router.post('/api/weights', checkOrigin, api((req, res) => {
   res.json(r);
 }));
 
-/** 実測の取消 (打ち間違い)。数の訂正と同じく PIN は要らない (中原さん 9/3) */
+/**
+ * 実測の取消 (打ち間違い)。いま作業している回で登録した記録なら PIN は要らない (数の訂正と同じ 9/3)。
+ * 過去回・別回の記録は全回共通のマスタを動かすので職員のみ (as_staff + PIN)
+ */
 router.post('/api/weights/:id(\\d+)/revoke', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  const r = revokeWeightMeasurement({ id: Number(req.params.id), worker: w.worker, deviceLabel: deviceLabelOf(req) });
-  if (!r.ok) return res.status({ not_found: 404, already_revoked: 409 }[r.error] || 400).json(r);
+  let byStaff = false;
+  if (req.body?.as_staff) {
+    const gate = requireStaff(req, w.worker);
+    if (!gate.ok) return res.status(gate.status).json(gate.body);
+    byStaff = true;
+  }
+  const r = revokeWeightMeasurement({
+    id: Number(req.params.id), runId: req.body?.run_id, byStaff,
+    worker: w.worker, deviceLabel: deviceLabelOf(req),
+  });
+  if (!r.ok) return res.status({ not_found: 404, already_revoked: 409, staff_required: 403 }[r.error] || 400).json(r);
   res.json(r);
 }));
 

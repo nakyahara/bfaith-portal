@@ -1174,6 +1174,27 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
     assert.equal(slowCalls, 2);
     assert.equal(db.getRunState(c.runId).rows.filter((x) => x.image_url).length >= 1, true);
   });
+
+  // 片方だけの再取得で、取れている側を巻き添えにしない (Codex PR3 R2#1)
+  img._resetImageState();
+  process.env.WAREHOUSE_SERVICE_TOKEN = 'test-token';
+  db.upsertProductImage({ fnsku: 'X0FIN00001', asin: 'B0KEEP0001', url: 'https://m.media-amazon.com/images/I/keep.jpg', status: 'ok' });
+  db.upsertWeightRef({ fnsku: 'X0FIN00001', asin: 'B0KEEP0001', weightG: null, status: 'none', error: 'Amazon に梱包重量の登録がありません' });
+  db.getDB().prepare(`UPDATE fbx_weight_refs SET fetched_at = '2020-01-01T00:00:00.000Z' WHERE fnsku = 'X0FIN00001'`).run();
+  db.upsertProductImage({ fnsku: 'X0FIN00002', asin: 'B0KEEP0002', url: 'https://m.media-amazon.com/images/I/keep2.jpg', status: 'ok' });
+  db.upsertWeightRef({ fnsku: 'X0FIN00002', asin: 'B0KEEP0002', weightG: 30, raw: '0.03', status: 'ok' });
+  img._setAttrsSource(async () => [{ amazon_sku: 'sku-f1', asin: 'B0KEEP0001', fnsku: 'X0FIN00001' }]);
+  img._setFetcher(async () => { throw new Error('timeout'); });
+  const keep = await img.ensureRunCatalog(c.runId, { force: true });
+  delete process.env.WAREHOUSE_SERVICE_TOKEN;
+  t('単重の再取得が失敗しても、取れている画像は壊さない (Codex PR3 R2#1)', () => {
+    assert.equal(keep.total, 1, '単重だけが欠けている 1 商品が対象 (両方 ok の商品は対象外)');
+    assert.equal(keep.failed, 1, JSON.stringify(keep));
+    assert.equal(db.getDB().prepare(`SELECT status FROM fbx_product_images WHERE fnsku = 'X0FIN00001'`).get().status, 'ok', '画像は ok のまま');
+    assert.equal(db.getDB().prepare(`SELECT image_url FROM fbx_product_images WHERE fnsku = 'X0FIN00001'`).get().image_url,
+      'https://m.media-amazon.com/images/I/keep.jpg');
+    assert.equal(db.getDB().prepare(`SELECT status FROM fbx_weight_refs WHERE fnsku = 'X0FIN00001'`).get().status, 'error');
+  });
   img._resetImageState();
 }
 
@@ -1194,7 +1215,7 @@ console.log('■ PR3: 重量補助 (参考単重・実測・推定・上限)');
 
   const mkSheets = (rows) => [{ slotId: 'p1_normal', sheet: 'P1_通常', label: '通常', rows }];
   const c = db.createRunFromPicking({ pickingRun: { id: 500, delivery_date: '2026-10-01' }, planSheets: mkSheets([
-    { no: 1, sku: 'sku-w1', fnsku: 'X0WGT00001', productName: '重さのわかる商品', qty: '25' },
+    { no: 1, sku: 'sku-w1', fnsku: 'X0WGT00001', productName: '重さのわかる商品', qty: '30' },
     { no: 2, sku: 'sku-w2', fnsku: 'X0WGT00002', productName: '重さ不明の商品', qty: '4' },
   ]), createdBy: 't' });
   const st0 = db.getRunState(c.runId);
@@ -1220,9 +1241,9 @@ console.log('■ PR3: 重量補助 (参考単重・実測・推定・上限)');
     assert.equal(cur.unitG, 205);
     assert.equal(cur.source, 'measured');
     assert.equal(cur.sampleQty, 10);
-    assert.equal(db.revokeWeightMeasurement({ id: m.id, worker: staff }).ok, true);
+    assert.equal(db.revokeWeightMeasurement({ id: m.id, runId: c.runId, worker: member }).ok, true, '同じ回で登録した記録は作業者が取り消せる');
     assert.equal(db.getRunState(c.runId).weights.X0WGT00001.unitG, 200, '取り消したら参考値に戻る');
-    assert.equal(db.revokeWeightMeasurement({ id: m.id, worker: staff }).error, 'already_revoked');
+    assert.equal(db.revokeWeightMeasurement({ id: m.id, runId: c.runId, worker: member }).error, 'already_revoked');
     assert.equal(db.listWeightMeasurements('X0WGT00001').length, 1, '取消も履歴には残す (逆算分析の生データ)');
     assert.equal(db.addWeightMeasurement({ fnsku: 'X0WGT00001', sampleQty: 0, totalG: 100, worker: member }).error, 'bad_qty');
     assert.equal(db.addWeightMeasurement({ fnsku: 'X0WGT00001', sampleQty: 5, totalG: -1, worker: member }).error, 'bad_weight');
@@ -1347,16 +1368,44 @@ console.log('■ PR3: 重量補助 (参考単重・実測・推定・上限)');
     assert.equal(db.getRunState(c.runId).weights.X0WGT00002.unitG, 50);
     assert.ok(db.listRowsNeedingCatalog(c.runId).some((x) => x.fnsku === 'X0WGT00002'),
       '画像あり + 実測あり でも参考値が無ければ取りに行く');
-    db.revokeWeightMeasurement({ id: m.id, worker: staff });
+    db.revokeWeightMeasurement({ id: m.id, runId: c.runId, worker: member });
   });
 
-  t('rebuildWeightCurrent: 採用値が壊れていても起動時に作り直す (Codex PR3 #5)', () => {
+  t('rebuildWeightCurrent: 壊れた値・孤児行のどちらも起動時に直す (Codex PR3 R1#5 / R2#2)', () => {
     db.getDB().prepare(`UPDATE fbx_weight_current SET unit_g = 99999, source = 'catalog' WHERE fnsku = 'X0WGT00001'`).run();
     db.getDB().prepare(`DELETE FROM fbx_weight_current WHERE fnsku = 'X0WGT00002'`).run();
+    // 元データがどこにも無い孤児行 (projection にだけ残ってしまったもの)
+    db.getDB().prepare(`INSERT INTO fbx_weight_current (fnsku, unit_g, source, updated_at) VALUES ('X0ORPHAN01', 123, 'catalog', ?)`).run(new Date().toISOString());
     const n = db.rebuildWeightCurrent();
-    assert.ok(n >= 2);
+    assert.ok(n >= 3);
     assert.equal(db.getRunState(c.runId).weights.X0WGT00001.unitG, 200, '参考値から作り直す');
     assert.equal(db.getRunState(c.runId).weights.X0WGT00002, undefined, '元データが無い商品は採用値も持たない');
+    assert.equal(db.getDB().prepare(`SELECT COUNT(*) c FROM fbx_weight_current WHERE fnsku = 'X0ORPHAN01'`).get().c, 0, '孤児行は消える');
+  });
+
+  t('実測の取消: 別の回・終わった回の記録は職員のみ (単重は全回共通のマスタ — Codex PR3 R2#4)', () => {
+    const mine = db.addWeightMeasurement({ fnsku: 'X0WGT00001', sampleQty: 4, totalG: 800, runId: c.runId, worker: member });
+    assert.equal(mine.ok, true);
+    const doneRun = db.getRunBySource(400);
+    const old = db.getDB().prepare(`INSERT INTO fbx_weight_measurements (fnsku, sample_qty, total_g, unit_g, method, run_id, measured_at)
+      VALUES ('X0WGT00001', 1, 111, 111, 'scale', ?, ?)`).run(doneRun.id, new Date().toISOString());
+    const oldId = Number(old.lastInsertRowid);
+    assert.equal(db.revokeWeightMeasurement({ id: oldId, runId: c.runId, worker: member }).error, 'staff_required');
+    assert.equal(db.revokeWeightMeasurement({ id: mine.id, runId: 999999, worker: member }).error, 'staff_required', '別の回を名乗っても通さない');
+    assert.equal(db.revokeWeightMeasurement({ id: oldId, byStaff: true, worker: staff }).ok, true, '職員なら過去回も取り消せる');
+    assert.equal(db.revokeWeightMeasurement({ id: mine.id, runId: c.runId, worker: member }).ok, true);
+  });
+
+  t('箱を開け直すと上限超えの承認も消える (Codex PR3 R2#3)', () => {
+    const bxR = db.createBox({ packGroupId: gid, materialCode: 'box140', worker: member });
+    db.addPlacement({ runId: c.runId, rowId: rA.id, boxId: bxR.boxId, qty: 1, worker: member, deviceKey: 'dev:w', requestId: 'w9' });
+    assert.equal(db.closeBox({ boxId: bxR.boxId, measuredKg: 31, worker: member, staffApproved: true, approvedBy: '職員B' }).ok, true);
+    assert.equal(db.getBox(bxR.boxId).limit_override_by, '職員B');
+    assert.equal(db.reopenBox({ boxId: bxR.boxId, reason: '詰め直し', worker: staff }).ok, true);
+    const after = db.getBox(bxR.boxId);
+    assert.equal(after.limit_override_by, null);
+    assert.equal(after.limit_override_at, null);
+    assert.equal(after.est_weight_g_at_close, null);
   });
 }
 

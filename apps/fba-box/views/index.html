@@ -879,8 +879,23 @@
       box.querySelectorAll('.wrvk').forEach(btn => btn.addEventListener('click', async () => {
         if (!worker) { pickWorker(); return; }
         if (!confirm('この重さの記録を取り消しますか?')) return;
-        const j2 = await apiPost(`/api/weights/${btn.dataset.id}/revoke`, { worker_id: worker.id });
-        if (!j2.ok) { alert(j2.message); return; }
+        const send = (auth) => apiPost(`/api/weights/${btn.dataset.id}/revoke`,
+          { worker_id: (auth ? auth.staff.id : worker.id), run_id: curRunId, ...(auth ? { as_staff: true, pin: auth.pin } : {}) });
+        const j2 = await send(null);
+        if (!j2.ok) {
+          // 前の納品回で登録した重さ = 全部の回に効くので職員の確認が要る
+          if (j2.error === 'staff_required') {
+            alert(j2.message);
+            staffPinPrompt(async (staff, pin) => {
+              const j3 = await send({ staff, pin });
+              if (!j3.ok) { alert(j3.message); return; }
+              await refresh(true);
+              weighDialog(r, after);
+            });
+            return;
+          }
+          alert(j2.message); return;
+        }
         await refresh(true);
         loadHist();
       }));
