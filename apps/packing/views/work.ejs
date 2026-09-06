@@ -1350,7 +1350,7 @@
       res.innerHTML = '';
       // 検索で出ないとき (未設定・障害・検索漏れ) の逃げ道: SKUをそのまま使う (形式はサーバーでも検証。名前は付けない)
       const directHtml = (q) => `<button type="button" class="reason-opt issue-direct" data-sku="${esc(q)}" style="text-align:left; border-style:dashed">
-          検索に出ない → 入力した「${esc(q)}」をSKUとして使う<br><small>バーコード/商品コードを正確に入力した場合のみ</small></button>`;
+          検索に出ない → 入力した「${esc(q)}」をSKUとして使う<br><small>商品コードを正確に入力した場合のみ (このバッチの商品か、在庫データに実在するものだけ通ります)</small></button>`;
       const bindDirect = () => res.querySelectorAll('.issue-direct').forEach((b) => b.addEventListener('click', () => {
         const sku = String(b.dataset.sku || '').trim().toLowerCase();
         if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(sku)) { showToast('SKUの形式が不正です (英数字・-_.)'); return; }

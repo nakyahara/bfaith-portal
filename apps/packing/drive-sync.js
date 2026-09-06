@@ -25,6 +25,8 @@ import {
   parseCs03003, importPackBatch, checkPickingMatch, isStaleSagyoDate, PackError,
   listPendingStockoutNotifies, countStaleStockoutNotifies, claimStockoutNotify, markStockoutNotify,
 } from './service.js';
+import { listPendingReturnedNotifies, claimReturnedNotify, markReturnedNotify, countStaleReturnedNotifies } from './service.js';
+import { notifyReturned } from './notify.js';
 import { getShippingFolders, listNouhinCsvFiles, downloadNouhinCsv } from './drive.js';
 
 /**
@@ -289,6 +291,29 @@ async function retryStockoutNotify() {
   }
 }
 
+/**
+ * ↩ 棚戻し完了 (戻したロケ) 通知の再送 — outbox は pk_pack_tasks.returned_notified_at (例外処理監査 PR-4・Q3)。
+ * 3階の「ここへ戻した」の直後に picking router が送るが、落ちればここで追いつく (期間で切らない)
+ */
+async function retryReturnedNotify() {
+  let rows = [];
+  try {
+    rows = listPendingReturnedNotifies(3);
+    const stale = countStaleReturnedNotifies();
+    if (stale > 0) console.error(`[packing-drive-poller] 棚戻し完了の未通知が2日以上滞留: ${stale}件 (webhook/ポーラーを確認)`);
+  } catch { return; }   // v21 未適用
+  for (const row of rows) {
+    if (!claimReturnedNotify(row.id)) continue;
+    try {
+      const sent = await notifyReturned({ ...row, returned_by: `${row.returned_by || '-'} (再送)` }, null);
+      markReturnedNotify(row.id, sent, sent ? null : 'webhook未設定');
+      if (sent) console.log(`[packing-drive-poller] 棚戻し完了の通知を再送: task=${row.id} ${row.sku} → ${row.returned_location}`);
+    } catch (e) {
+      markReturnedNotify(row.id, false, e.message);
+    }
+  }
+}
+
 /** 🖨再印刷通知の再送 (直近2日・未通知のみ・1周期3件まで — ④と同型)。 */
 async function retryReprintNotify() {
   const db = getDB();
@@ -366,6 +391,7 @@ export function startPackingDrivePoller() {
         await retryShipChangeNotify();
         await retryReprintNotify();
         await retryStockoutNotify();
+        await retryReturnedNotify();
         // 資材変更の通知 outbox (undo 猶予後に送信・at-least-once — 要件『梱包資材表示』§5.3)。
         // webhook 未設定時は claim しない (管理画面に構成エラー表示)
         await materialNotifyStep(materialWebhookConfigured() ? postMaterialText : null);

@@ -115,7 +115,7 @@ export async function notifyReturned(task, worker) {
     '↩ *棚戻し完了* — 戻したロケを記録しました (ロジザードのロケ在庫と違えば調整してください)',
     `商品: *${task.sku}*${task.product_name ? ` (${task.product_name})` : ''} × ${task.req_qty}個`,
     `戻したロケ: *${returned}*${hint && hint !== returned ? ` (候補は ${hint} でした)` : ''}`,
-    `理由: ${reason} / 依頼元: ${task.folder_name || task.batch_folder || '-'}${task.slip_seq ? ` #${task.slip_seq}` : ''} (依頼: ${task.requested_by || '-'}) / 戻した: ${worker}`,
+    `理由: ${reason} / 依頼元: ${task.folder_name || task.batch_folder || '-'}${task.slip_seq ? ` #${task.slip_seq}` : ''} (依頼: ${task.requested_by || '-'}) / 戻した: ${task.returned_by || worker || '-'}`,
   ];
   return postTask(lines.join('\n'));
 }

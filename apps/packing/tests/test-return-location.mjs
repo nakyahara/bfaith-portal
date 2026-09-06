@@ -18,7 +18,10 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'packing-return-tes
 
 const { initPickingDB } = await import('../../picking/db.js');
 const { initPackingDB, getDB, utcNow, jstToday } = await import('../db.js');
-const { applyEvent, applyTaskAction, resolveIncident, setTaskLocationHint, getTaskDetail, getWorkState } = await import('../service.js');
+const {
+  applyEvent, applyTaskAction, resolveIncident, setTaskLocationHint, getTaskDetail, getWorkState,
+  fulfillReturnTask, claimReturnedNotify, markReturnedNotify, listPendingReturnedNotifies, countStaleReturnedNotifies,
+} = await import('../service.js');
 
 initPickingDB();
 initPackingDB();
@@ -136,6 +139,81 @@ console.log('── ③ 棚戻しの完了は「戻したロケ」が必須 ─�
     assert.equal(u._notifyReturned, undefined);
     assert.equal(u.returned_location, null);
     assert.equal(getWorkState(pb2).repickBySlip[1], 'fulfilled');
+  });
+}
+
+console.log('── Codex R1: 棚戻しの完了は1トランザクション (fulfillReturnTask) ──');
+{
+  const pb3 = mkPackBatch('R3', [{ sku: 'c-1', status: 'done' }]);
+  const mkReturn = (sku) => {
+    ev(pb3, 'excess', { sku, qty: 2, actualName: `名前${sku}` });
+    const inc = db.prepare("SELECT id FROM pk_pack_incidents WHERE batch_id=? AND kind='excess' AND sku=?").get(pb3, sku);
+    resolveIncident(inc.id, 'confirm', '三宅晴菜', pb3);
+    return db.prepare("SELECT id FROM pk_pack_tasks WHERE batch_id=? AND sku=?").get(pb3, sku).id;
+  };
+  const id1 = mkReturn('ret-a');
+  throwsCode(() => fulfillReturnTask(id1, '田中美波', { returnedLocation: '' }), 'returned_location_required', 'ロケ無しは 400');
+  throwsCode(() => fulfillReturnTask(id1, '田中美波', { returnedLocation: '002 013' }), 'bad_location', 'ロケ不正は 400');
+  t('ロケ不正のときは requested のまま (対応中だけ残らない)', () => {
+    assert.equal(taskRow(id1).status, 'requested');
+    assert.equal(taskRow(id1).claimed_by, null);
+  });
+  t('requested から1回で returned (担当も入る)。通知 outbox は未送信', () => {
+    const u = fulfillReturnTask(id1, '田中美波', { returnedBlock: 'P3FA', returnedLocation: '002-013-03', returnedSource: 'stock' });
+    assert.equal(u.status, 'returned');
+    assert.equal(u._notifyReturned, true);
+    const row = taskRow(id1);
+    assert.deepEqual([row.claimed_by, row.returned_by, row.returned_source, row.returned_notified_at], ['田中美波', '田中美波', 'stock', null]);
+    // 先に applyTaskAction で戻した分 (上のテスト) も未通知なので一緒に拾われる = ポーラーが追いつく対象
+    assert.ok(listPendingReturnedNotifies(10).map((r) => r.id).includes(id1), '未通知として拾える');
+  });
+  t('同じ作業者・同じロケの再送は冪等成功 (replayed)。別人・別ロケは 409', () => {
+    const r = fulfillReturnTask(id1, '田中美波', { returnedBlock: 'P3FA', returnedLocation: '002-013-03' });
+    assert.equal(r._replayed, true);
+    assert.equal(r._notifyReturned, undefined, '再送では通知フラグを立てない');
+  });
+  throwsCode(() => fulfillReturnTask(id1, '有國陽', { returnedBlock: 'P3FA', returnedLocation: '002-013-03' }), 'already_returned', '別の人の再完了は 409');
+  throwsCode(() => fulfillReturnTask(id1, '田中美波', { returnedBlock: 'P3FB', returnedLocation: '001-001-01' }), 'already_returned', '別ロケへの再完了は 409');
+  t('通知 outbox: claim は1回だけ通る → mark sent で未通知から消える', () => {
+    assert.equal(claimReturnedNotify(id1), true);
+    assert.equal(claimReturnedNotify(id1), false, '送信中は他が取れない');
+    markReturnedNotify(id1, false, 'HTTP 500');
+    assert.equal(taskRow(id1).returned_notify_error, 'HTTP 500');
+    assert.equal(claimReturnedNotify(id1), true, '失敗後は再送のために取り直せる');
+    markReturnedNotify(id1, true);
+    assert.ok(taskRow(id1).returned_notified_at);
+    assert.ok(!listPendingReturnedNotifies(10).map((r) => r.id).includes(id1), '通知済みは未通知から消える');
+    assert.equal(countStaleReturnedNotifies(), 0);
+  });
+  const id2 = mkReturn('ret-b');
+  t('取下げ (cancel) 後の完了は 409', () => {
+    applyTaskAction(id2, 'cancel', '三宅晴菜');
+    assert.throws(() => fulfillReturnTask(id2, '田中美波', { returnedLocation: '002-013-03' }), (e) => e.code === 'bad_transition');
+  });
+  t('claimed からも1回で returned (source 未指定は manual)', () => {
+    const id3 = mkReturn('ret-c');
+    applyTaskAction(id3, 'claim', '有國陽');
+    const u = fulfillReturnTask(id3, '田中美波', { returnedLocation: 'ZZZ-ZZZ-ZZ' });
+    assert.deepEqual([u.status, u.claimed_by, u.returned_by, u.returned_source], ['returned', '有國陽', '田中美波', 'manual']);
+  });
+}
+
+console.log('── Codex R1: デプロイ前の自由入力の余り候補は確定できない ──');
+{
+  const pb4 = mkPackBatch('R4', [{ sku: 'd-1', status: 'done' }]);
+  // 旧データを再現: 検証を通らない SKU (商品名の断片) の候補が直接 DB にある
+  const incId = Number(db.prepare(`INSERT INTO pk_pack_incidents (batch_id, slip_seq, kind, sku, qty, status, detected_by, created_at, updated_at)
+    VALUES (?, NULL, 'excess', '耳かき', 9, 'candidate', '三宅晴菜', ?, ?)`).run(pb4, now, now).lastInsertRowid);
+  throwsCode(() => resolveIncident(incId, 'confirm', '三宅晴菜', pb4), 'bad_sku', '「耳かき」のままの確定は 400 (取り下げて選び直す)');
+  t('router が在庫検索で確定した SKU/名前を渡せば、候補を直してから棚戻しにする', () => {
+    const r = resolveIncident(incId, 'confirm', '三宅晴菜', pb4, { excessSku: 'mimikaki-9', excessName: '耳かき 9本セット' });
+    assert.deepEqual(r.dispatchedTasks.map((x) => [x.sku, x.name]), [['mimikaki-9', '耳かき 9本セット']]);
+    assert.equal(db.prepare('SELECT sku FROM pk_pack_incidents WHERE id=?').get(incId).sku, 'mimikaki-9');
+  });
+  t('取下げ (withdraw) は旧データでもできる', () => {
+    const id2 = Number(db.prepare(`INSERT INTO pk_pack_incidents (batch_id, slip_seq, kind, sku, qty, status, detected_by, created_at, updated_at)
+      VALUES (?, NULL, 'excess', 'レギュラー', 1, 'candidate', '三宅晴菜', ?, ?)`).run(pb4, now, now).lastInsertRowid);
+    assert.equal(resolveIncident(id2, 'withdraw', '三宅晴菜', pb4).status, 'withdrawn');
   });
 }
 

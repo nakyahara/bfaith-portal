@@ -2021,6 +2021,74 @@ export function getTask(taskId) {
   return getDB().prepare('SELECT * FROM pk_pack_tasks WHERE id = ?').get(taskId) || null;
 }
 
+/**
+ * ↩ 棚戻しの完了 = 1トランザクション (Codex R1 High: claim と fulfill を別々に確定すると、ロケ不正・障害・競合で
+ * 「対応中」だけ残る)。requested/claimed から直接 returned へ。WHERE status IN (…) で 2台同時の勝者は1人。
+ * 通信断後の再タップ = 同じ作業者・同じロケで既に returned なら冪等成功 (replayed=true・通知は再送しない)。
+ * @returns 更新後の行 (+ _notifyReturned / _replayed)
+ */
+export function fulfillReturnTask(taskId, worker, { returnedBlock = null, returnedLocation = null, returnedSource = null } = {}) {
+  if (!worker) throw new PackError(400, 'no_worker', '作業者を選択してください');
+  const loc = normalizeReturnedLocation(returnedBlock, returnedLocation);
+  const source = ['picked', 'stock', 'manual'].includes(String(returnedSource || '')) ? String(returnedSource) : 'manual';
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const task = db.prepare('SELECT * FROM pk_pack_tasks WHERE id = ?').get(taskId);
+    if (!task || task.kind !== 'return') throw new PackError(404, 'not_found', '棚戻しの依頼が見つかりません');
+    if (task.status === 'returned') {
+      if (task.returned_by === worker && task.returned_location === loc.location && (task.returned_block || null) === loc.block) {
+        return { ...task, _replayed: true };
+      }
+      throw new PackError(409, 'already_returned', `既に ${task.returned_by || '-'} が ${task.returned_location || '-'} へ戻した記録があります`);
+    }
+    if (!['requested', 'claimed'].includes(task.status)) {
+      throw new PackError(409, 'bad_transition', `${task.status} から完了はできません`);
+    }
+    const changes = db.prepare(`
+      UPDATE pk_pack_tasks
+      SET status='returned', claimed_by=COALESCE(claimed_by, ?), fulfilled_qty=req_qty, unavailable_qty=NULL,
+          returned_block=?, returned_location=?, returned_source=?, returned_at=?, returned_by=?,
+          returned_notified_at=NULL, returned_notify_error=NULL, returned_notify_claimed_at=NULL, updated_at=?
+      WHERE id=? AND status IN ('requested','claimed')
+    `).run(worker, loc.block, loc.location, source, now, worker, now, taskId).changes;
+    if (changes !== 1) throw new PackError(409, 'conflict', '別の端末で先に操作されました。画面を更新してください');
+    const updated = db.prepare('SELECT * FROM pk_pack_tasks WHERE id = ?').get(taskId);
+    updated._notifyReturned = true;
+    return updated;
+  })();
+}
+
+// ─── ↩ 棚戻し完了の事務通知 outbox (pk_pack_tasks.returned_notified_at — stockout と同じ方式) ───
+/** 送信権を取る (10分で失効)。取れなければ他 (ポーラー) が送信中。 */
+export function claimReturnedNotify(taskId) {
+  return getDB().prepare(`UPDATE pk_pack_tasks SET returned_notify_claimed_at=?
+    WHERE id=? AND status='returned' AND returned_notified_at IS NULL
+      AND (returned_notify_claimed_at IS NULL OR datetime(returned_notify_claimed_at) < datetime('now', '-10 minutes'))`)
+    .run(utcNow(), taskId).changes > 0;
+}
+export function markReturnedNotify(taskId, sent, error = null) {
+  const db = getDB();
+  if (sent) db.prepare('UPDATE pk_pack_tasks SET returned_notified_at=?, returned_notify_error=NULL, returned_notify_claimed_at=NULL WHERE id=?').run(utcNow(), taskId);
+  else db.prepare('UPDATE pk_pack_tasks SET returned_notify_error=?, returned_notify_claimed_at=NULL WHERE id=?').run(String(error || 'webhook未設定').slice(0, 200), taskId);
+}
+/** 未通知の棚戻し完了 (送信中でないもの)。期間で切らない。 */
+export function listPendingReturnedNotifies(limit = 3) {
+  try {
+    return getDB().prepare(`SELECT id FROM pk_pack_tasks
+      WHERE kind='return' AND status='returned' AND returned_at IS NOT NULL AND returned_notified_at IS NULL
+        AND (returned_notify_claimed_at IS NULL OR datetime(returned_notify_claimed_at) < datetime('now', '-10 minutes'))
+      ORDER BY id LIMIT ?`).all(limit).map((r) => getTaskDetail(r.id)).filter(Boolean);
+  } catch { return []; }   // v21 未適用
+}
+export function countStaleReturnedNotifies() {
+  try {
+    return getDB().prepare(`SELECT COUNT(*) c FROM pk_pack_tasks
+      WHERE kind='return' AND status='returned' AND returned_at IS NOT NULL AND returned_notified_at IS NULL
+        AND datetime(returned_at) < datetime('now', '-2 days')`).get().c;
+  } catch { return 0; }
+}
+
 /** タスク + 依頼の理由 (ミス候補の種別: excess=余り / wrong_item=品違い) + 依頼元バッチのフォルダ名 (棚戻し画面・通知用)。 */
 export function getTaskDetail(taskId) {
   return getDB().prepare(`
@@ -2105,7 +2173,7 @@ function logizardNameOf(db, sku) {
   }
 }
 
-export function resolveIncident(incidentId, decision, actor, expectBatchId = null, { actualSku = null, actualName = null } = {}) {
+export function resolveIncident(incidentId, decision, actor, expectBatchId = null, { actualSku = null, actualName = null, excessSku = null, excessName = null } = {}) {
   if (!['confirm', 'withdraw'].includes(decision)) {
     throw new PackError(400, 'bad_decision', 'decision が不正です');
   }
@@ -2146,6 +2214,20 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
       }
       // 品違いは「実際に入っていた商品」を特定してから送信 (終了画面の商品検索で指定 —
       // 中原さん指示 2026-08-21)。特定作業はバッチ完了打刻の後のため梱包計測には入らない
+      // 余り: 確定時にも SKU が検証済み (形式) であることを要求 — デプロイ前の自由入力 (「耳かき」) の候補が
+      // そのまま棚戻しタスクになる迂回を塞ぐ (Codex R1 High)。router は在庫実在まで再検証して excessSku/excessName を渡す
+      if (inc.kind === 'excess') {
+        const sku = normSku(excessSku ?? inc.sku);
+        if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(sku)) {
+          throw new PackError(400, 'bad_sku', `余りの商品「${String(inc.sku).slice(0, 40)}」は検索で確定していません。取り下げて、候補か在庫検索から選び直してください`);
+        }
+        if (sku !== inc.sku || (excessName && excessName !== inc.actual_name)) {
+          db.prepare('UPDATE pk_pack_incidents SET sku=?, actual_name=COALESCE(?, actual_name), updated_at=? WHERE id=?')
+            .run(sku, excessName ? String(excessName).slice(0, 120) : null, now, incidentId);
+          inc.sku = sku;
+          if (excessName) inc.actual_name = String(excessName).slice(0, 120);
+        }
+      }
       if (inc.kind === 'wrong_item') {
         const sku = String(actualSku ?? inc.actual_sku ?? '').trim();
         if (!sku) throw new PackError(400, 'actual_sku_required', '間違って入っていた商品を検索で特定してから送信してください');

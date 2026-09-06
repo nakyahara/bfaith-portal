@@ -549,10 +549,10 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   // 終了画面で再入力させない代わりに、ここで確定させる
   let actualSku = req.body.actual_sku || null;
   let actualName = null;
-  if (req.body.event === 'wrong_item') ({ sku: actualSku, name: actualName } = await verifyActualSku(actualSku));
+  if (req.body.event === 'wrong_item') ({ sku: actualSku, name: actualName } = await verifyActualSku(actualSku, { batchId: Number(req.params.id) }));
   // 余りの SKU も同じ検証 (自由入力の商品名断片を棚戻しに流さない — 例外処理監査 D-1・PR-4)。名前は actualName に載せる
   let excessSku = null;
-  if (req.body.event === 'excess') ({ sku: excessSku, name: actualName } = await verifyActualSku(req.body.sku, { label: '余った商品' }));
+  if (req.body.event === 'excess') ({ sku: excessSku, name: actualName } = await verifyActualSku(req.body.sku, { label: '余った商品', batchId: Number(req.params.id) }));
   const result = applyEvent(Number(req.params.id), {
     opId: req.body.op_id,
     event: req.body.event,
@@ -734,9 +734,16 @@ router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, 
       actualSku = String(incRow.actual_sku).trim().toLowerCase();
     }
   }
-  if (actualSku) ({ sku: actualSku, name: actualName } = await verifyActualSku(actualSku));
+  if (actualSku) ({ sku: actualSku, name: actualName } = await verifyActualSku(actualSku, { batchId: Number(req.params.id) }));
+  // 余りも確定時に再検証 (デプロイ前の自由入力の候補が未検証のまま棚戻しにならない — Codex R1 High)
+  let excessSku = null;
+  let excessName = null;
+  if (decision === 'confirm') {
+    const exRow = getDB().prepare("SELECT kind, sku FROM pk_pack_incidents WHERE id=? AND kind='excess'").get(Number(req.params.iid));
+    if (exRow) ({ sku: excessSku, name: excessName } = await verifyActualSku(exRow.sku, { label: '余った商品', batchId: Number(req.params.id) }));
+  }
   const inc = resolveIncident(Number(req.params.iid), decision, actor, Number(req.params.id), {
-    actualSku, actualName,
+    actualSku, actualName, excessSku, excessName,
   });
   // 送信 (confirm) したタスクの後処理 (fail-soft・DBの行が正本):
   //   再ピック → 🔴ピッキング漏れバッチを生成 (picking所有の書き込みは picking service 経由) + ロケつき通知
@@ -797,25 +804,30 @@ router.get('/api/stock-search', api(async (req, res) => {
  * 記録時 (wrong_item イベント) と確定時 (incidents/resolve) の両方で使う。
  * @returns {{sku: string, name: string|null}}
  */
-async function verifyActualSku(raw, { label = '間違って入っていた商品' } = {}) {
+async function verifyActualSku(raw, { label = '間違って入っていた商品', batchId = null } = {}) {
   const sku = String(raw ?? '').trim().toLowerCase();
   if (!sku) throw new PackError(400, 'actual_sku_required', `${label}を検索で特定してください`);
   if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(sku)) {
     throw new PackError(400, 'bad_sku', 'SKUの形式が不正です。検索から選んでください');
   }
-  let name = null;
-  try {
-    const { fetchStockSearch, stockLookupConfigured } = await import('../picking/stock-locations.js');
-    if (stockLookupConfigured()) {
-      const hit = (await fetchStockSearch(sku))?.items?.find((it) => String(it.sku).toLowerCase() === sku);
-      if (!hit) throw new PackError(400, 'unknown_sku', 'そのSKUは在庫データに見つかりません。検索から選び直してください');
-      name = hit.name || null;
-    }
-  } catch (e) {
-    if (e instanceof PackError) throw e;
-    console.warn(`[packing] 実物SKUの在庫照会失敗 (形式チェックのみで続行): ${e.message}`);
+  // ① このバッチの納品書明細に実在する SKU は信頼済み (在庫参照が無くても通す — 候補ボタンの経路)
+  if (batchId) {
+    try {
+      const row = getDB().prepare(`SELECT l.product_name FROM pk_pack_lines l JOIN pk_pack_slips s ON s.id = l.slip_id
+        WHERE s.batch_id = ? AND LOWER(TRIM(l.sku)) = ? LIMIT 1`).get(batchId, sku);
+      if (row) return { sku, name: row.product_name || null };
+    } catch { /* 下の在庫照会へ */ }
   }
-  return { sku, name };
+  // ② 在庫データ (warehouse service-api) に完全一致すれば通す。③ 照会が落ちているときは未知 SKU を通さない (503) —
+  //    形式だけで通すと「検索から選んだ」保証にならず、任意の abc-123 が棚戻しに流れる (Codex R1 High: fail-open)。
+  //    未設定環境 (Render 等・導入前) だけは形式チェックのみで通す (運用上そこでは記録されない)
+  const { fetchStockSearch, stockLookupConfigured } = await import('../picking/stock-locations.js');
+  if (!stockLookupConfigured()) return { sku, name: null };
+  const data = await fetchStockSearch(sku);   // 失敗は null (fail-soft)
+  if (!data) throw new PackError(503, 'sku_lookup_unavailable', '在庫検索に接続できません。少し待って再試行するか、バッチ内の候補から選んでください');
+  const hit = (data.items || []).find((it) => String(it.sku).toLowerCase() === sku);
+  if (!hit) throw new PackError(400, 'unknown_sku', 'そのSKUは在庫データに見つかりません。検索から選び直してください');
+  return { sku, name: hit.name || null };
 }
 
 // ─── 📦 梱包資材 (表示・現場登録 — 要件『梱包資材表示_要件定義_20260823.md』v1.7) ───

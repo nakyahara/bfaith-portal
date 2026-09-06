@@ -68,7 +68,8 @@
       <div class="muted">依頼元: <%= t.folder_name || t.batch_folder || '-' %><%= t.slip_seq ? ` #${t.slip_seq}` : '' %> / 依頼: <%= t.requested_by || '-' %> (計測対象外)
         <% if (t.status === 'claimed') { %><span class="claimed-tag">対応中: <%= t.claimed_by %></span><% } %></div>
       <div class="prow">
-        <div class="timg" style="<%= t.imageUrl ? `background-image:url('${t.imageUrl}')` : '' %>"><%= t.imageUrl ? '' : '📦' %></div>
+        <%# 画像は img[src] (CSS 属性への埋め込みはエスケープ文脈が違う — Codex R1)。URL は router で http(s)/同一オリジンに制限済み %>
+        <div class="timg"><% if (t.imageUrl) { %><img src="<%= t.imageUrl %>" alt="" referrerpolicy="no-referrer" style="max-width:100%; max-height:100%; object-fit:contain"><% } else { %>📦<% } %></div>
         <div class="pinfo">
           <div class="qty"><span class="x">×</span><%= t.req_qty %>個</div>
           <div class="pname"><%= t.product_name || t.sku %></div>
@@ -85,7 +86,7 @@
     <% } else { %>
       <h2>どこへ戻しますか？ — 戻した棚をタップ (記録して事務へ伝えます)</h2>
       <% if (t.locationLabel) { %>
-        <div class="loc-row picked" data-block="<%= t.block || '' %>" data-location="<%= t.location %>">
+        <div class="loc-row picked" data-block="<%= t.block || '' %>" data-location="<%= t.location %>" data-source="<%= t.location_source === 'stock' ? 'stock' : 'picked' %>">
           <div class="loc"><%= t.locationLabel %><div class="sub"><%= t.location_source === 'stock' ? '在庫ロケの候補 (ロジザード)' : '取った場所 (このバッチのピックロケ)' %></div></div>
           <button type="button" class="here">ここへ戻した</button>
         </div>
@@ -136,9 +137,10 @@
         const b = await res.json().catch(() => ({}));
         if (!res.ok) { alert(b.error || `エラー (${res.status})`); if (res.status === 409) location.reload(); return; }
         if (act === 'fulfill') {
-          // 記録できた → 一覧へ (次の棚戻し・通常バッチへ)
+          // 記録できた → 一覧へ (次の棚戻し・通常バッチへ)。通知は DB の outbox が正本 (送れなければポーラーが再送)
+          const note = b.notify === 'sent' ? '事務へ通知しました' : b.replayed ? '記録済みです (再送)' : '事務への通知は自動で再送します';
           document.querySelector('.pk-wrap').insertAdjacentHTML('afterbegin',
-            `<div class="done-box">✅ 戻しました → ${esc([b.returnedBlock, b.returnedLocation].filter(Boolean).join('-'))}<br><small>事務へ通知しました。一覧に戻ります</small></div>`);
+            `<div class="done-box">✅ 戻しました → ${esc([b.returnedBlock, b.returnedLocation].filter(Boolean).join('-'))}<br><small>${note}。一覧に戻ります</small></div>`);
           setTimeout(() => { location.href = '/apps/picking/'; }, 1500);
           return;
         }
@@ -156,16 +158,16 @@
     }));
     $('#wpCancel').addEventListener('click', () => { $('#workerPick').style.display = 'none'; pending = null; });
 
-    function hereClicked(block, location, label) {
+    function hereClicked(block, location, label, source) {
       if (!confirm(`${label} へ戻したとして記録します。よろしいですか?`)) return;
-      withWorker('fulfill', { returned_block: block || null, returned_location: location });
+      withWorker('fulfill', { returned_block: block || null, returned_location: location, returned_source: source || 'manual' });
     }
     // 取った場所 (サーバー描画) と 在庫ロケ候補 (fetch) の「ここへ戻した」— 委譲 (SKU/ロケは data 属性から)
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('.loc-row .here');
       if (!btn) return;
       const row = btn.closest('.loc-row');
-      hereClicked(row.dataset.block, row.dataset.location, row.querySelector('.loc').firstChild.textContent.trim());
+      hereClicked(row.dataset.block, row.dataset.location, row.querySelector('.loc').firstChild.textContent.trim(), row.dataset.source || 'stock');
     });
     if ($('#manualBtn')) {
       $('#manualBtn').addEventListener('click', () => { $('#manual').style.display = 'flex'; $('#mLoc').focus(); });
@@ -174,7 +176,7 @@
         const loc = $('#mLoc').value.trim();
         if (!loc) { alert('ロケを入力してください (例: 002-013-03)'); return; }
         if (!/^[A-Za-z0-9][A-Za-z0-9_\-.]*$/.test(loc) || (block && !/^[A-Za-z0-9][A-Za-z0-9_\-.]*$/.test(block))) { alert('ロケの形式が不正です (英数字と - のみ)'); return; }
-        hereClicked(block, loc, block ? `${block}-${loc}` : loc);
+        hereClicked(block, loc, block ? `${block}-${loc}` : loc, 'manual');
       });
     }
     if ($('#claimBtn')) $('#claimBtn').addEventListener('click', () => withWorker('claim', {}));
@@ -199,7 +201,7 @@
           return;
         }
         box.innerHTML = head + c.rows.map((row) => `
-          <div class="loc-row" data-block="${esc(row.block)}" data-location="${esc(row.location)}">
+          <div class="loc-row" data-block="${esc(row.block)}" data-location="${esc(row.location)}" data-source="stock">
             <div class="loc">${esc(row.label)}<div class="sub">フリー ${esc(row.free)}${row.expiry ? ` / 期限 ${esc(row.expiry)}` : ''}</div></div>
             <button type="button" class="here">ここへ戻した</button>
           </div>`).join('') + (c.truncated ? `<div class="muted">他 ${esc(c.truncated)} ロケは省略</div>` : '');

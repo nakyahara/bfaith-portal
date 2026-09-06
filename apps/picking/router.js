@@ -256,22 +256,30 @@ router.get('/tasks', (req, res) => res.redirect('/apps/picking/'));
  * 戻したロケは pk_pack_tasks に記録し、事務へ通知する (Q3 決定 2026-09-05)
  */
 router.get('/return/:id(\\d+)', async (req, res) => {
-  const psvc = await packingSvc();
-  if (!psvc) return res.status(404).send('梱包連携は無効です');
-  const t = psvc.getTaskDetail(Number(req.params.id));
-  if (!t || t.kind !== 'return') return res.status(404).send('棚戻しの依頼が見つかりません');
-  const images = getImageMap([t.sku]);
-  res.render(path.join(__dirname, 'views/return'), {
-    title: '棚戻し',
-    workers: listWorkers(),
-    deviceMode: !req.session?.email,
-    task: {
-      ...t,
-      locationLabel: t.location ? formatLocation(t.block, t.location) : null,
-      returnedLabel: t.returned_location ? formatLocation(t.returned_block, t.returned_location) : null,
-      imageUrl: images.get(String(t.sku ?? '').trim().toLowerCase())?.url || null,
-    },
-  });
+  try {
+    const psvc = await packingSvc();
+    if (!psvc) return res.status(503).send('梱包連携は現在利用できません');
+    const t = psvc.getTaskDetail(Number(req.params.id));
+    if (!t || t.kind !== 'return') return res.status(404).send('棚戻しの依頼が見つかりません');
+    let imageUrl = null;
+    try { imageUrl = getImageMap([t.sku]).get(String(t.sku ?? '').trim().toLowerCase())?.url || null; } catch { imageUrl = null; }
+    // 画像 URL は http(s) か同一オリジンのパスだけ (img[src] に出す。DB 由来の値を無条件に信じない — Codex R1)
+    if (imageUrl && !/^(https?:\/\/|\/(?!\/))/i.test(String(imageUrl))) imageUrl = null;
+    res.render(path.join(__dirname, 'views/return'), {
+      title: '棚戻し',
+      workers: listWorkers(),
+      deviceMode: !req.session?.email,
+      task: {
+        ...t,
+        locationLabel: t.location ? formatLocation(t.block, t.location) : null,
+        returnedLabel: t.returned_location ? formatLocation(t.returned_block, t.returned_location) : null,
+        imageUrl,
+      },
+    });
+  } catch (e) {
+    console.error('[picking-return]', e);
+    res.status(503).send('棚戻しの情報を取得できません。バッチ一覧へ戻って、もう一度お試しください');
+  }
 });
 
 /** 棚戻しの戻し先候補 (取った場所 + ロジザードの在庫ロケ)。fail-soft: 在庫参照が無くても取った場所だけ返す。 */
@@ -312,20 +320,36 @@ router.post('/api/tasks/:id(\\d+)/:action', checkOrigin, async (req, res) => {
       return res.status(400).json({ error: '棚戻しではこの操作はできません', code: 'bad_return_action' });
     }
     const action = String(req.params.action);
-    // 棚戻し画面は「ここへ戻した」1タップで完了 = 未着手なら担当に入ってから完了 (対応する→戻した の2タップにしない)
-    if (action === 'fulfill' && target.status === 'requested') psvc.applyTaskAction(target.id, 'claim', worker.name);
-    const t = psvc.applyTaskAction(target.id, action, worker.name, {
+    if (action !== 'fulfill') {
+      const t = psvc.applyTaskAction(target.id, action, worker.name);
+      return res.json({ ok: true, id: t.id, status: t.status });
+    }
+    // 棚戻しの完了 = 「ここへ戻した」1タップで requested/claimed → returned を1トランザクションで (Codex R1 High)。
+    // デプロイ前の旧 /tasks 画面 (ロケ無し) からの完了は 409 で再読込を促す
+    if (!req.body.returned_location) {
+      return res.status(409).json({ error: '画面が古いです。バッチ一覧から「↩ 棚戻し」を開き直してください (戻したロケの記録が必要です)', code: 'legacy_client' });
+    }
+    const t = psvc.fulfillReturnTask(target.id, worker.name, {
       returnedBlock: req.body.returned_block ?? null,
       returnedLocation: req.body.returned_location ?? null,
+      returnedSource: req.body.returned_source ?? null,
     });
-    // 戻したロケを事務へ (Q3 決定 2026-09-05)。fail-soft: DB の returned_* が正本
-    if (t._notifyReturned) {
+    // 戻したロケを事務へ (Q3 決定 2026-09-05)。outbox (returned_notified_at) が正本 — 送れたときだけ印、失敗はポーラーが再送
+    let notify = t._replayed ? 'replayed' : 'pending';
+    if (t._notifyReturned && psvc.claimReturnedNotify(t.id)) {
       try {
-        const [pn, detail] = [await import('../packing/notify.js'), psvc.getTaskDetail(t.id)];
-        pn.notifyReturned(detail || t, worker.name).catch((e) => console.warn(`[picking-return] 棚戻し通知失敗 (task=${t.id}): ${e.message}`));
-      } catch (e) { console.warn(`[picking-return] 棚戻し通知の準備失敗: ${e.message}`); }
+        const pn = await import('../packing/notify.js');
+        const sent = await pn.notifyReturned(psvc.getTaskDetail(t.id) || t, worker.name);
+        psvc.markReturnedNotify(t.id, sent, sent ? null : 'webhook未設定');
+        notify = sent ? 'sent' : 'failed';
+      } catch (e) {
+        console.warn(`[picking-return] 棚戻し通知失敗 (task=${t.id}): ${e.message}`);
+        psvc.markReturnedNotify(t.id, false, e.message);
+        notify = 'failed';
+      }
     }
-    res.json({ ok: true, id: t.id, status: t.status, returnedLocation: t.returned_location || null, returnedBlock: t.returned_block || null });
+    res.json({ ok: true, id: t.id, status: t.status, replayed: !!t._replayed, notify,
+      returnedLocation: t.returned_location || null, returnedBlock: t.returned_block || null });
   } catch (e) {
     // packing 側の業務エラー (PackError) も picking の PkError と同じ形で返す
     if (e && Number.isInteger(e.status) && e.code) {

@@ -592,9 +592,17 @@ const MIGRATIONS = {
     const hasTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pk_pack_tasks'").get();
     if (!hasTable) return;
     const cols = db.prepare('PRAGMA table_info(pk_pack_tasks)').all().map((c) => c.name);
-    for (const [name, type] of [['returned_block', 'TEXT'], ['returned_location', 'TEXT'], ['returned_at', 'TEXT'], ['returned_by', 'TEXT'], ['location_source', 'TEXT']]) {
+    //   returned_source = 戻したロケの出どころ (picked=取った場所 / stock=ロジザード候補 / manual=手入力 — 監査用)
+    //   returned_notified_at / returned_notify_error / returned_notify_claimed_at = 事務通知の outbox (stockout と同じ方式。
+    //   送れたときだけ notified_at、失敗はポーラーが再送、claimed_at は送信中の印 10分)
+    for (const [name, type] of [
+      ['returned_block', 'TEXT'], ['returned_location', 'TEXT'], ['returned_at', 'TEXT'], ['returned_by', 'TEXT'], ['returned_source', 'TEXT'],
+      ['returned_notified_at', 'TEXT'], ['returned_notify_error', 'TEXT'], ['returned_notify_claimed_at', 'TEXT'],
+      ['location_source', 'TEXT'],
+    ]) {
       if (!cols.includes(name)) db.exec(`ALTER TABLE pk_pack_tasks ADD COLUMN ${name} ${type}`);
     }
+    db.exec("CREATE INDEX IF NOT EXISTS idx_pk_pack_tasks_returned_notify ON pk_pack_tasks(status, returned_notified_at)");
   },
 };
 
