@@ -525,7 +525,7 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
       to: r.ok ? `task#${tid} ${r.job.copies}枚 → ${r.job.printer_name}` : `task#${tid}`, ok: r.ok, error: r.ok ? null : (r.message || r.error) });
   }
   if (!r.ok) {
-    const status = ['in_progress', 'confirm_unknown', 'state_changed', 'closed_task'].includes(r.error) ? 409 : r.error === 'not_found' ? 404 : 400;
+    const status = ['in_progress', 'confirm_unknown', 'confirm_manual', 'state_changed', 'idempotency_conflict', 'closed_task'].includes(r.error) ? 409 : r.error === 'not_found' ? 404 : 400;
     return res.status(status).json(r);
   }
   res.json(r);

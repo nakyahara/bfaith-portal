@@ -130,6 +130,12 @@ let J1;
   ok(!('lease_token' in r.job), '画面に返す形に lease token は含めない');
   const again = enqueuePrintJob({ taskId: T1, copies: 2, packQty: '120', expiry: '2027-03', clientRequestId: id });
   ok(again.ok && again.replayed && again.job.id === J1, '同じ冪等 ID の再送は同じジョブ (2 枚出ない)');
+  const clash = enqueuePrintJob({ taskId: T2, copies: 2, packQty: '120', expiry: '2027-03', clientRequestId: id });
+  ok(clash.ok === false && clash.error === 'idempotency_conflict' && clash.job.id === J1, '同じ冪等 ID で違う内容 (別カード) は 409 相当 — 別のジョブを「積めた」と返さない (Codex PR #1220 R1 中)');
+  const clash2 = enqueuePrintJob({ taskId: T1, copies: 3, packQty: '120', expiry: '2027-03', clientRequestId: id });
+  const clash3 = enqueuePrintJob({ taskId: T1, copies: 2, packQty: '120', expiry: '2027-04', clientRequestId: id });
+  ok(clash2.error === 'idempotency_conflict' && clash3.error === 'idempotency_conflict', '枚数・期限が違っても同じ');
+  ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_print_jobs').get().c === 1, '衝突しても新しいジョブは増えていない');
   const busy = enqueuePrintJob({ taskId: T1, copies: 1, clientRequestId: crid() });
   ok(busy.ok === false && busy.error === 'in_progress' && busy.job.id === J1, '進行中は同じカードに積めない');
   ok(latestJobsByTask().get(T1)?.id === J1 && !latestJobsByTask().has(T2), 'カードごとの最新ジョブ');
@@ -207,15 +213,21 @@ let JU;
   ok(lateOk.ok && lateOk.state === 'completed', '同じ lease の遅延報告 (再起動後の台帳突合) は unknown → completed に上書き');
 }
 
-console.log('\n[6] 誰も取りに来ない → manual / プリンター名の付け替え');
+console.log('\n[6] 誰も取りに来ない → manual (手で刷る)。🙋 のあとの再発行も証跡が要る / プリンター名の付け替え');
+let JM;
 {
   const r = enqueuePrintJob({ taskId: T1, copies: 1, clientRequestId: crid() });
   const sw = sweepPrintJobs({ now: at(new Date().toISOString(), STALE_QUEUED_SEC + 5) });
   ok(sw.manual === 1 && stateOf(r.job.id) === 'manual', `queued のまま ${STALE_QUEUED_SEC} 秒 → manual (手で刷る)`);
   ok(/自動印刷は取り消した/.test(alertTextFor(rowOf(r.job.id))), '🙋 の文は「自動印刷は取り消した」');
-  const r2 = enqueuePrintJob({ taskId: T1, copies: 1, clientRequestId: crid() });
+  const no = enqueuePrintJob({ taskId: T1, copies: 1, clientRequestId: crid() });
+  ok(no.ok === false && no.error === 'confirm_manual' && no.job.id === r.job.id, '🙋 のまま証跡なしでは積めない (職員の手刷りと押し直しが競合して 2 枚になる — Codex PR #1220 R1 重要)');
+  const yes = enqueuePrintJob({ taskId: T1, copies: 1, clientRequestId: crid(), acknowledgeUnknownJobId: r.job.id });
+  ok(yes.ok && yes.created && yes.job.acknowledged_job_id === r.job.id && !!rowOf(r.job.id).acknowledged_at && /手で刷っていない/.test(rowOf(r.job.id).error || ''),
+    '「手で刷っていない」の証跡付きなら積める (旧ジョブに確認時刻と理由が残る)');
   const ren = setAgentPrinter(agentId, 'Brother QL-800 (2)');
-  ok(ren.ok && ren.cancelled === 1 && stateOf(r2.id) === 'manual' || stateOf(r2.job.id) === 'manual', 'プリンター名を変えたら、その端末宛ての queued は manual に倒す (別のプリンターから出さない)');
+  ok(ren.ok && ren.cancelled === 1 && stateOf(yes.job.id) === 'manual', 'プリンター名を変えたら、その端末宛ての queued は manual に倒す (別のプリンターから出さない)');
+  JM = yes.job.id;
   const back = setAgentPrinter(agentId, 'Brother QL-800');
   ok(back.ok && back.cancelled === 0, '名前を戻す (取り消す queued は無い)');
   const notAgent = setAgentPrinter(999999, 'X');
@@ -237,7 +249,7 @@ console.log('\n[7] 見張り (通知は送れたときだけ通知済み・生�
   ok(t2.alerted === before && pendingAlerts().length === 0, '送れたら通知済み');
   ok(t2.pinged === true && pings[0][0] === PRINT_JOB_ID && /いろはPC/.test(pings[0][1]), `heartbeat が新しければ台帳 ${PRINT_JOB_ID} へ ok を中継`);
   delete process.env.GCHAT_WEBHOOK_IROHA;
-  const r = enqueuePrintJob({ taskId: T1, copies: 1, clientRequestId: crid() });
+  const r = enqueuePrintJob({ taskId: T1, copies: 1, clientRequestId: crid(), acknowledgeUnknownJobId: JM });   // 直前が 🙋 なので証跡付き
   const t3 = await printQueueTick({ notify: async () => { throw new Error('must not be called'); }, ping: () => false });
   ok(t3.alerted === 0, 'webhook 未設定なら通知しない (iPad の詳細に出るのが主経路)');
   markFinished(r.job.id, { deviceId: agentId, leaseToken: leaseNextJob(verifyDevice(agentTok)).leaseToken, ok: false, error: 'x' });
@@ -324,6 +336,8 @@ console.log('\n[8] HTTP: 誰が刷れるか (Bearer の kind=agent だけ) / iPa
   ok(replay.status === 200 && replay.json.replayed && replay.json.job.id === en.json.job.id, '同じ冪等 ID の再送は同じジョブ');
   const busy = await call('POST', '/api/print/jobs', { body: { task_id: T2, worker_id: W, copies: 1, client_request_id: crid(), target_device_id: id2 }, cookie: ck });
   ok(busy.status === 409 && busy.json.error === 'in_progress', '進行中は 409');
+  const clashHttp = await call('POST', '/api/print/jobs', { body: { task_id: T2, worker_id: W, copies: 3, pack_qty: '24', expiry: '2027-03', client_request_id: okReq, target_device_id: id2 }, cookie: ck });
+  ok(clashHttp.status === 409 && clashHttp.json.error === 'idempotency_conflict', '同じ冪等 ID で違う枚数は 409 idempotency_conflict');
   const noOrigin = await fetch(BASE + '/api/print/jobs', { method: 'POST', headers: { Host: HOST, 'Content-Type': 'application/json', Cookie: ck }, body: JSON.stringify({ task_id: T2, worker_id: W, copies: 1, client_request_id: crid(), target_device_id: id2 }) });
   ok(noOrigin.status === 403, 'Origin 無しの POST は 403 (checkOrigin)');
 

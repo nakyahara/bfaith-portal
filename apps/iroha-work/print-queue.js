@@ -168,7 +168,13 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, expiry = null,
   return db.transaction(() => {
     // 同じ冪等 ID の再送は「もう積んである」を成功として返す
     const dup = db.prepare('SELECT * FROM f_iroha_print_jobs WHERE client_request_id = ?').get(crid);
-    if (dup) return { ok: true, job: publicJob(dup), created: false, replayed: true };
+    if (dup) {
+      // 同じ ID で中身が違う = 画面の不具合か ID の衝突。別のカードのジョブを「積めた」と返さない (Codex PR #1220 R1 中)
+      const same = dup.task_id === tid && dup.copies === n && dup.pack_qty === pack && dup.expiry_text === exp
+        && (targetDeviceId == null || dup.target_device_id === Number(targetDeviceId));
+      if (!same) return { ok: false, error: 'idempotency_conflict', message: '同じ依頼 ID で違う内容が送られました。画面を更新してもう一度発行してください', job: publicJob(dup) };
+      return { ok: true, job: publicJob(dup), created: false, replayed: true };
+    }
 
     const task = getTask(tid);
     if (!task) return { ok: false, error: 'not_found', message: 'このカードは見つかりません (一覧を更新してください)' };
@@ -186,11 +192,15 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, expiry = null,
     if (last && ACTIVE_STATES.includes(last.state)) {
       return { ok: false, error: 'in_progress', message: 'このカードのラベルは印刷中です (結果が出るまでお待ちください)', job: publicJob(last) };
     }
-    // 🚨 直前が「❓ 結果不明」なら、そのジョブ ID を「実物を見て出ていなかった」の証跡として受け取ってからしか積まない
+    // 🚨 直前が「❓ 結果不明」または「🙋 印刷係が応答しない (手で刷る扱い)」なら、そのジョブ ID を
+    //    「実物を見て出ていなかった / まだ手で刷っていない」の証跡として受け取ってからしか積まない。
+    //    manual を素通しすると、職員が P-touch Editor で手で刷るのと利用者の押し直しが競合して 2 枚になる (Codex PR #1220 R1 重要)
     let acked = null;
-    if (last && last.state === 'unknown') {
+    if (last && (last.state === 'unknown' || last.state === 'manual')) {
       if (Number(acknowledgeUnknownJobId) !== last.id) {
-        return { ok: false, error: 'confirm_unknown', message: '前回の印刷結果が不明です。QL-800 の実物を確認し、ラベルが出ていない場合だけ「実物を確認した」にチェックしてもう一度発行してください', job: publicJob(last) };
+        return last.state === 'unknown'
+          ? { ok: false, error: 'confirm_unknown', message: '前回の印刷結果が不明です。QL-800 の実物を確認し、ラベルが出ていない場合だけ「実物を確認した」にチェックしてもう一度発行してください', job: publicJob(last) }
+          : { ok: false, error: 'confirm_manual', message: '前回は印刷係が応答せず、手で刷る扱いになっています。まだ手で刷っていない (P-touch Editor で出していない) ことを確かめて、「手で刷っていない」にチェックしてもう一度発行してください', job: publicJob(last) };
       }
       acked = last.id;
     } else if (acknowledgeUnknownJobId != null) {
@@ -204,10 +214,12 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, expiry = null,
     if (!target.ok) return target;
     const now = utcNow();
     if (acked != null) {
-      // 🚨 人が「出ていない」と確認して再発行する = 旧ジョブの結果はここで確定。以後、旧 lease の遅延報告を受け付けない (2 枚出る)
+      // 🚨 人が「出ていない / 手で刷っていない」と確認して再発行する = 旧ジョブの結果はここで確定。
+      //    以後、旧 lease の遅延報告を受け付けない (2 枚出る)。同じトランザクションで CAS (状態が動いていたらやり直し)
+      const note = last.state === 'unknown' ? ' / 実物を確認して再発行 (出ていない)' : ' / 手で刷っていないことを確認して再発行';
       const fix = db.prepare(`UPDATE f_iroha_print_jobs SET lease_token = NULL, acknowledged_at = ?, updated_at = ?,
-        error = COALESCE(error, '') || ' / 実物を確認して再発行 (出ていない)' WHERE id = ? AND state = 'unknown' AND acknowledged_at IS NULL`)
-        .run(now, now, acked);
+        error = COALESCE(error, '') || ? WHERE id = ? AND state IN ('unknown', 'manual') AND acknowledged_at IS NULL`)
+        .run(now, now, note, acked);
       if (fix.changes !== 1) {
         const cur = db.prepare('SELECT * FROM f_iroha_print_jobs WHERE id = ?').get(acked);
         return { ok: false, error: 'confirm_unknown', message: '前回のジョブの状態が変わりました。画面を更新してもう一度確認してください', job: publicJob(cur) };

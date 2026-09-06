@@ -2303,7 +2303,7 @@ function printBtnHtml(c) {
   if (!can('task.label.print') || printAgents().length === 0 || !barcodeTypeOf(c.barcode)) return '';
   const j = c.print_job;
   if (j && PRINT_ACTIVE.includes(j.state)) return '<button class="edit" disabled>🖨 印刷中…</button>';
-  const label = j && j.state === 'unknown' ? '🏷 もう一度出す' : (j && j.state === 'completed' ? '🏷 追加で出す' : '🏷 箱ラベル');
+  const label = j && (j.state === 'unknown' || j.state === 'manual') ? '🏷 もう一度出す' : (j && j.state === 'completed' ? '🏷 追加で出す' : '🏷 箱ラベル');
   return '<button class="edit" data-id="' + esc(String(c.id)) + '" onclick="openPrintBox(this.dataset.id)">' + label + '</button>';
 }
 /** 最新の印刷結果の札 (✅ / ⚠ / ❓ / 🙋)。60 秒ごとの取り直しで新しくなる */
@@ -2341,10 +2341,15 @@ function openPrintBox(id) {
   const expiry = c.expiry ? String(c.expiry) : (m.expiry_seal === 1 ? '期限シールあり' : '');
   const first = agents.find(a => a.online) || agents[0];
   const opts = agents.map(a => '<option value="' + a.id + '"' + (a.id === first.id ? ' selected' : '') + '>' + esc(a.label) + ' — ' + esc(a.printer_name || '(プリンター未登録)') + (a.online ? '' : ' (応答なし)') + '</option>').join('');
-  // 🚨 直前が「❓ 結果不明」なら、実物を見たことをチェックさせてからしか送らない (サーバーも同じ証跡を要求する)
-  const prev = c.print_job && c.print_job.state === 'unknown' ? c.print_job : null;
-  const ack = prev ? '<div class="pwarn">❓ 前回 (' + esc(String(prev.copies)) + '枚 ' + esc(fmtTime(prev.finished_at || prev.updated_at)) + ') の印刷結果が不明です。<b>QL-800 の実物を見て</b>、ラベルが出ていない場合だけ発行してください。<br>'
-    + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printAck"> 実物を確認した (ラベルは出ていない)</label></div>' : '';
+  // 🚨 直前が「❓ 結果不明」「🙋 手で刷る扱い」なら、実物を見た / 手で刷っていない ことをチェックさせてからしか送らない
+  //    (サーバーも同じ証跡を要求する。manual を素通しすると職員の手刷りと競合して 2 枚 — Codex PR #1220 R1)
+  const prev = c.print_job && (c.print_job.state === 'unknown' || c.print_job.state === 'manual') ? c.print_job : null;
+  const prevAt = prev ? esc(String(prev.copies)) + '枚 ' + esc(fmtTime(prev.finished_at || prev.updated_at)) : '';
+  const ack = !prev ? '' : prev.state === 'unknown'
+    ? '<div class="pwarn">❓ 前回 (' + prevAt + ') の印刷結果が不明です。<b>QL-800 の実物を見て</b>、ラベルが出ていない場合だけ発行してください。<br>'
+      + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printAck"> 実物を確認した (ラベルは出ていない)</label></div>'
+    : '<div class="pwarn">🙋 前回 (' + prevAt + ') は印刷係が応答せず、<b>手で刷る</b>扱いになっています。まだ手で刷っていない場合だけ発行してください (刷ってあれば 2 枚になります)。<br>'
+      + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printAck"> 手で刷っていない (P-touch Editor で出していない)</label></div>';
   $('#printBody').innerHTML =
     '<div class="pfld"><label>商品</label><div class="ro"><b>' + esc(c.title) + '</b><br><span class="num">' + esc(c.product_code || '') + '</span></div></div>' +
     '<div class="pfld"><label>バーコード</label><div class="ro num">' + esc(c.barcode || '') + ' <small>(' + (type ? type.toUpperCase() : '不明') + ')</small></div></div>' +
@@ -2382,9 +2387,14 @@ async function submitPrint() {
   const sel = $('#printTarget');
   const tEl = $('#printBody').querySelector('[data-target]');
   const target = sel ? Number(sel.value) : (tEl ? Number(tEl.getAttribute('data-target')) : null);
-  const prev = c.print_job && c.print_job.state === 'unknown' ? c.print_job : null;
+  const prev = c.print_job && (c.print_job.state === 'unknown' || c.print_job.state === 'manual') ? c.print_job : null;
   const ackEl = $('#printAck');
-  if (prev && !(ackEl && ackEl.checked)) { msgEl.textContent = '❌ QL-800 の実物を確認して、「実物を確認した」にチェックしてください (出ていたらそれを使います)'; return; }
+  if (prev && !(ackEl && ackEl.checked)) {
+    msgEl.textContent = prev.state === 'unknown'
+      ? '❌ QL-800 の実物を確認して、「実物を確認した」にチェックしてください (出ていたらそれを使います)'
+      : '❌ 手で刷っていないことを確かめて、「手で刷っていない」にチェックしてください (刷ってあればそれを使います)';
+    return;
+  }
   ctx.saving = true;
   $('#printOk').disabled = true;
   msgEl.textContent = '送信しています…';
@@ -2413,12 +2423,13 @@ async function submitPrint() {
   }
   if (j.job) c.print_job = j.job;
   if (j.error === 'in_progress') { closePrintBox(); renderDetail(c); return; }
-  if (j.error === 'confirm_unknown') {
+  if (j.error === 'confirm_unknown' || j.error === 'confirm_manual') {
     // 画面が古かった (別の iPad で発行されて結果不明になった等)。最新のジョブで開き直す
     renderDetail(c); openPrintBox(c.id);
     $('#printMsg').textContent = j.message || '前回の印刷結果が不明です。実物を確認してください';
     return;
   }
+  if (j.error === 'idempotency_conflict') { closePrintBox(); renderDetail(c); showErr(j.message || '同じ依頼 ID で違う内容が送られました。画面を更新してください'); return; }
   if (j.error === 'state_changed') { closePrintBox(); renderDetail(c); showErr(j.message || '前回のジョブの状態が変わりました'); return; }
   if (j.error === 'worker_required') { closePrintBox(); openGate(); return; }
   msgEl.textContent = '❌ ' + (j.message || j.error || '送れませんでした');
