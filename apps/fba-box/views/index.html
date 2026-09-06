@@ -623,7 +623,10 @@
     // 確認担当の既定 = いまの作業者。実際に書き込むのはサーバー側 (投入と同じトランザクション。
     // 別POSTだと通信断で欠落し、他端末と競合して上書きし合う — Codex PR2.6-R1)。画面は予告だけ
     const checkDefault = worker ? worker.display_name : '';
-    const willAutoCheck = rem > 0 && !excluded && !!checkDefault;   // 「この箱に入れた」がある行だけ自動で入る
+    // サーバーが入れるのは「この行に残っている一番古い投入をした人」= まだ1個も入っていない行のときだけ
+    // いまの作業者と一致する。既に誰かが入れている行で名前を約束すると嘘になる (Codex PR2.6-R2 medium#2)
+    const canAutoCheck = rem > 0 && !excluded;                   // 「この箱に入れた」がある = 自動で入る行
+    const willAutoCheck = canAutoCheck && r.placed === 0 && !!checkDefault;
     const pp = planParts(r.plan_no);
     const dlg = openDialog(`
       <div style="display:flex; gap:14px; align-items:flex-start">
@@ -687,9 +690,11 @@
         ? `✅ ${esc(r.check_worker)}`
         : (willAutoCheck
           ? `${esc(checkDefault)} <small style="font-weight:600; color:#868E96">(「この箱に入れた」を押すと、この人で記録します・タップで変更)</small>`
-          : `— <small style="font-weight:600; color:#C92A2A">${checkDefault
-            ? 'まだ記録されていません。タップして選んでください'
-            : '上の「👤 作業者を選ぶ」から選んでください'}</small>`)}</button>
+          : (canAutoCheck && checkDefault
+            ? `— <small style="font-weight:600; color:#868E96">(「この箱に入れた」を押すと、最初に入れた人で記録します・タップで指名)</small>`
+            : `— <small style="font-weight:600; color:#C92A2A">${checkDefault
+              ? 'まだ記録されていません。タップして選んでください'
+              : '上の「👤 作業者を選ぶ」から選んでください'}</small>`))}</button>
       <div class="lbl">⚠ 困ったとき (職員)</div>
       <div class="grid3">
         <button class="selbtn" id="d-sendqty">${r.shortage_qty ? `送る数 ${r.planned_qty - r.shortage_qty} を直す` : '送る数を直す'}</button>
@@ -1161,7 +1166,8 @@
       </div>`);
     dlg.querySelectorAll('.rw').forEach(b => b.addEventListener('click', async () => {
       if (!worker) { pickWorker(); return; }
-      const j = await apiPost(`/api/rows/${row.id}/workers`, { worker_id: worker.id, check_worker: b.dataset.name || null });
+      // intent=manual = 「人が画面で選んだ」印。これが無い更新はサーバーが弾く (旧画面の自動POST対策)
+      const j = await apiPost(`/api/rows/${row.id}/workers`, { worker_id: worker.id, check_worker: b.dataset.name || null, check_worker_intent: 'manual' });
       if (!j.ok) { alert(j.message); return; }
       closeDialog();
       await refresh(true);

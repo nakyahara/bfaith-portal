@@ -1599,7 +1599,8 @@ function syncAutoCheckWorker(d, rowId, { runId, worker, deviceLabel } = {}) {
     .run(rowId, name, name ? 'auto' : null, pid, utcNow());
   logEvent({ runId, action: 'row_check_worker_auto', targetType: 'row', targetId: rowId,
     workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
-    payload: { from: rw?.check_worker ?? null, to: name, placementId: pid } }, d);
+    payload: { from: rw?.check_worker ?? null, to: name,
+      fromPlacementId: rw?.check_worker_placement_id ?? null, toPlacementId: pid } }, d);
   return { checkWorker: name, source: name ? 'auto' : null, changed: true };
 }
 
@@ -2193,7 +2194,9 @@ export function exportReadiness(runId) {
     }
   }
 
-  const unchecked = rows.filter((r) => !r.check_worker);
+  // 除外行 (Excel 差し替えで retired / Excel に無い picking_only) は iPad に出ず担当も付けられない →
+  // 解消できない警告を出さない (Codex PR2.6-R2 medium#1)
+  const unchecked = rows.filter((r) => !EXCLUDED_ROW_STATES.includes(r.match_state) && !r.check_worker);
   if (unchecked.length > 0) warnings.push({ code: 'unchecked_rows', message: `確認担当が未記録の商品が ${unchecked.length} 行あります`, rows: unchecked.map(rowBrief) });
   const shortages = rows.filter((r) => r.shortage_qty > 0);
   if (shortages.length > 0) warnings.push({ code: 'shortage_rows', message: `送る数を予定から修正した商品が ${shortages.length} 行あります (修正前 → 修正後と理由を確認。Excel の数量は入れた分だけ。STA 側の予定数量との差は Amazon 側で調整)`, rows: shortages.map(rowBrief) });

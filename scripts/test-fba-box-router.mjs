@@ -159,6 +159,25 @@ await t('端末: 箱を作って割当 (worker 必須・request_id 冪等)', asy
   const again = await call('POST', '/api/placements', { body: { run_id: runId, row_id: rows[0].id, box_id: box1.boxId, qty: rows[0].planned_qty, worker_id: memberId, request_id: 'rq0' } });
   assert.equal(again.j.already, true);
 });
+await t('確認した人: 投入で自動記録され、intent なしの更新 (旧画面の自動POST) は client_outdated', async () => {
+  const st = await call('GET', `/api/state?run=${runId}`);
+  const r = st.j.rows.find((x) => x.id === rows[0].id);
+  assert.equal(r.check_worker, 'りようしゃ');          // 投入と同じトランザクションで入っている
+  assert.equal(r.check_worker_source, 'auto');
+  // 旧画面が投入後に送ってくる形 (intent なし) → 拒否。これを通すと自動で決めた担当を上書きしてしまう
+  const stale = await call('POST', `/api/rows/${r.id}/workers`, { body: { worker_id: staffId, check_worker: 'しょくいん' } });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.j.error, 'client_outdated');
+  assert.equal((await call('GET', `/api/state?run=${runId}`)).j.rows.find((x) => x.id === r.id).check_worker, 'りようしゃ');
+  // 新画面が人の選択として送る形 (intent=manual) は通る → 以後は自動で動かない
+  const pick = await call('POST', `/api/rows/${r.id}/workers`, { body: { worker_id: staffId, check_worker: 'しょくいん', check_worker_intent: 'manual' } });
+  assert.equal(pick.j.ok, true, JSON.stringify(pick.j));
+  const after = (await call('GET', `/api/state?run=${runId}`)).j.rows.find((x) => x.id === r.id);
+  assert.equal(after.check_worker, 'しょくいん');
+  assert.equal(after.check_worker_source, 'manual');
+  // ラベル貼り担当だけの更新は intent なしでも通る (旧画面は送らない・本社の互換のため)
+  assert.equal((await call('POST', `/api/rows/${r.id}/workers`, { body: { worker_id: staffId, label_worker: 'たなか' } })).j.ok, true);
+});
 await t('数を直す: POST /api/placements/:id/adjust (自端末の直近は利用者でも可)。直した後に元の数で入れ直せる', async () => {
   const st = await call('GET', `/api/state?run=${runId}`);
   const p = st.j.placements.find((x) => x.row_id === rows[0].id);

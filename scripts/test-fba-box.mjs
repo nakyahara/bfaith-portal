@@ -328,69 +328,100 @@ t('reopenBox: 理由必須・実測がクリアされ再クローズ要', () => 
   assert.equal(b.measured_weight_kg, null);
   assert.equal(b.reopen_count, before + 1);
 });
-// ─── 確認した人 (Codex PR2.6-R1: high#1 上書き / high#2 取消後に残る / medium#1 通信断で欠落) ───
+// ─── 確認した人 (R1: high#1 上書き / high#2 取消後に残る / medium#1 通信断で欠落) ───
 const cwBox = db.createBox({ packGroupId: groupId, materialCode: 'box140', worker: member });
 const wOther = db.getWorker(db.addWorker({ displayName: 'べつのひと', workerType: 'member', actor: 't' }).id);
+/**
+ * 不変条件 (Codex R2 medium#3): source='auto' の確認した人 = その行に残っている
+ * 一番古い有効な (名前つき) 投入をした人。名前・由来・由来の投入の3列をまとめて照合する
+ */
+function assertAutoCheck(rowId, label) {
+  const d = db.getDB();
+  const rw = d.prepare('SELECT check_worker, check_worker_source, check_worker_placement_id FROM fbx_row_work WHERE row_id = ?').get(rowId) || {};
+  if (rw.check_worker && rw.check_worker_source !== 'auto') return rw;   // 人が選んだ名前は自動の対象外
+  const p = d.prepare(`SELECT id, worker_name FROM fbx_placements
+    WHERE row_id = ? AND revoked_at IS NULL AND worker_name IS NOT NULL AND worker_name != ''
+    ORDER BY id LIMIT 1`).get(rowId);
+  assert.equal(rw.check_worker ?? null, p ? p.worker_name : null, `${label}: 確認した人`);
+  assert.equal(rw.check_worker_source ?? null, p ? 'auto' : null, `${label}: 由来`);
+  assert.equal(rw.check_worker_placement_id ?? null, p ? p.id : null, `${label}: 由来の投入`);
+  return rw;
+}
+const cwRow = () => db.getRunState(runId).rows.find(x => x.id === rowB.id);
+const cwPlacements = () => db.getRunState(runId).placements.filter(x => x.row_id === rowB.id).sort((a, b) => a.id - b.id);
+
 t('確認した人: 投入と同じトランザクションで自動で入る (画面からの別POSTではない)', () => {
-  const r = db.getRunState(runId).rows.find(x => x.id === rowB.id);
-  assert.equal(r.check_worker, 'りようしゃ');        // 最初の投入で自動記録された
-  assert.equal(r.check_worker_source, 'auto');
+  assert.equal(cwRow().check_worker, 'りようしゃ');       // 最初の投入で自動記録された
+  assert.equal(cwRow().check_worker_source, 'auto');
+  assertAutoCheck(rowB.id, '初期状態');
 });
 t('確認した人: あとから別の端末・別の人が入れても、先に入れた人を上書きしない (high#1)', () => {
   const add = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-1' });
   assert.equal(add.ok, true, JSON.stringify(add));
   assert.equal(add.checkWorker, 'りようしゃ');
-  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, 'りようしゃ');
+  assertAutoCheck(rowB.id, '別の人が追加投入');
 });
-t('確認した人: 投入を全部取り消すと自動分は消え、入れ直した人が入る (high#2)', () => {
-  for (const p of db.getRunState(runId).placements.filter(x => x.row_id === rowB.id)) {
+t('確認した人: 一番古い投入が消えると、残った投入をした人へ入れ替わる (high#2)', () => {
+  for (const p of cwPlacements().filter(x => x.worker_name === 'りようしゃ')) {
+    assert.equal(db.revokePlacement({ placementId: p.id, worker: member, deviceKey: 'dev:1' }).ok, true);
+    assertAutoCheck(rowB.id, '取消の途中');
+  }
+  assert.equal(cwRow().check_worker, 'べつのひと');       // 残ったのは wOther の投入だけ
+  assertAutoCheck(rowB.id, 'りようしゃの投入を全部取消');
+});
+t('確認した人: 投入を全部取り消すと消える。入れ直せば入れた人が入る (high#2)', () => {
+  for (const p of cwPlacements()) {
     assert.equal(db.revokePlacement({ placementId: p.id, worker: member, deviceKey: 'dev:1' }).ok, true);
   }
-  const cleared = db.getRunState(runId).rows.find(x => x.id === rowB.id);
-  assert.equal(cleared.check_worker, null);
-  assert.equal(cleared.check_worker_source, null);
-  const re = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-2' });
+  assert.equal(cwRow().check_worker, null);
+  assert.equal(cwRow().check_worker_source, null);
+  assertAutoCheck(rowB.id, '全部取消');
+  const re = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 2, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-2' });
   assert.equal(re.ok, true, JSON.stringify(re));
-  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, 'べつのひと');
+  assert.equal(re.checkWorker, 'べつのひと');
+  assertAutoCheck(rowB.id, '入れ直し');
+});
+t('確認した人: 数を直す (取消+入れ直しを1トランザクション) でも由来が追随する', () => {
+  const p0 = cwPlacements()[0];
+  const adj = db.adjustPlacement({ placementId: p0.id, qty: 1, worker: member, deviceKey: 'dev:1', requestId: 'cw-adj' });
+  assert.equal(adj.ok, true, JSON.stringify(adj));
+  assert.equal(cwRow().check_worker, 'りようしゃ');       // 入れ直したのは member
+  assertAutoCheck(rowB.id, '数を直したあと');
+  assert.equal(db.adjustPlacement({ placementId: cwPlacements()[0].id, qty: 0, worker: member, deviceKey: 'dev:1', requestId: 'cw-adj0' }).ok, true);
+  assert.equal(cwRow().check_worker, null);              // 0 に直す = 取消だけ → 有効な投入が無い
+  assertAutoCheck(rowB.id, '0 に直したあと');
 });
 t('確認した人: 人が選んだ名前は投入でも取消でも動かない。消せば自動に戻る', () => {
   assert.equal(db.setRowWorkers({ rowId: rowB.id, checkWorker: 'さとう', worker: staff }).ok, true);
   assert.equal(db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: member, deviceKey: 'dev:1', requestId: 'cw-3' }).ok, true);
-  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, 'さとう');
-  for (const p of db.getRunState(runId).placements.filter(x => x.row_id === rowB.id)) {
+  assert.equal(cwRow().check_worker, 'さとう');
+  for (const p of cwPlacements()) {
     assert.equal(db.revokePlacement({ placementId: p.id, worker: member, deviceKey: 'dev:1' }).ok, true);
   }
-  const kept = db.getRunState(runId).rows.find(x => x.id === rowB.id);
-  assert.equal(kept.check_worker, 'さとう');          // 全部取り消しても人が選んだ名前は残る
-  assert.equal(kept.check_worker_source, 'manual');
+  assert.equal(cwRow().check_worker, 'さとう');           // 全部取り消しても人が選んだ名前は残る
+  assert.equal(cwRow().check_worker_source, 'manual');
   assert.equal(db.setRowWorkers({ rowId: rowB.id, checkWorker: null, worker: staff }).ok, true);
-  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, null);
-  // 戻す (以降のテストの前提 = rowB は りようしゃ が期限 2028-06-24 で 10個 box1 に入れた状態)
-  assert.equal(db.addPlacement({ runId, rowId: rowB.id, boxId: box1.boxId, qty: 5, expiry: '2028-06-24', worker: member, deviceKey: 'dev:1', requestId: 'cw-restore-1' }).ok, true);
-  assert.equal(db.addPlacement({ runId, rowId: rowB.id, boxId: box1.boxId, qty: 5, worker: member, deviceKey: 'dev:1', requestId: 'cw-restore-2' }).ok, true);
-  const back = db.getRunState(runId).rows.find(x => x.id === rowB.id);
-  assert.equal(back.placed, 10);
-  assert.equal(back.check_worker, 'りようしゃ');
-  assert.equal(db.voidBox({ boxId: cwBox.boxId, reason: 'テストの後始末', worker: staff }).ok, true);
+  assert.equal(cwRow().check_worker, null);
 });
-
 t('確認した人: 移行前からある値 (source なし) は自動では消さない・書き換えない', () => {
   // 本番には、この変更より前に画面から書き込まれた check_worker が source NULL で残っている。
   // 人が選んだのか自動なのか区別できない → 触らない側に倒す (勝手に消えるほうが事故)
-  const d = db.getDB();
-  d.prepare(`INSERT INTO fbx_row_work (row_id, check_worker, updated_at) VALUES (?, ?, ?)
-    ON CONFLICT(row_id) DO UPDATE SET check_worker = excluded.check_worker,
-      check_worker_source = NULL, check_worker_placement_id = NULL`).run(rowB.id, 'きゅうデータ', '2026-09-01T00:00:00Z');
-  const box = db.createBox({ packGroupId: groupId, materialCode: 'box140', worker: member });
-  const add = db.addPlacement({ runId, rowId: rowB.id, boxId: box.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-legacy' });
+  db.getDB().prepare('UPDATE fbx_row_work SET check_worker = ?, check_worker_source = NULL, check_worker_placement_id = NULL WHERE row_id = ?')
+    .run('きゅうデータ', rowB.id);
+  const add = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-legacy' });
   assert.equal(add.ok, true, JSON.stringify(add));
-  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, 'きゅうデータ');
+  assert.equal(cwRow().check_worker, 'きゅうデータ');
   assert.equal(db.revokePlacement({ placementId: add.placementId, worker: member, deviceKey: 'dev:1' }).ok, true);
-  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, 'きゅうデータ');
-  // 戻す
-  assert.equal(db.voidBox({ boxId: box.boxId, reason: 'テストの後始末', worker: staff }).ok, true);
-  d.prepare('UPDATE fbx_row_work SET check_worker = ?, check_worker_source = ?, check_worker_placement_id = NULL WHERE row_id = ?')
-    .run('りようしゃ', 'auto', rowB.id);
+  assert.equal(cwRow().check_worker, 'きゅうデータ');
+  // 戻す (以降のテストの前提 = rowB は りようしゃ が期限 2028-06-24 で 10個 box1 に入れた状態)。
+  // 公開APIだけで戻す — 3列を手で書くと不変条件を壊した状態を後続テストへ渡してしまう
+  assert.equal(db.setRowWorkers({ rowId: rowB.id, checkWorker: null, worker: staff }).ok, true);
+  assert.equal(db.addPlacement({ runId, rowId: rowB.id, boxId: box1.boxId, qty: 5, expiry: '2028-06-24', worker: member, deviceKey: 'dev:1', requestId: 'cw-restore-1' }).ok, true);
+  assert.equal(db.addPlacement({ runId, rowId: rowB.id, boxId: box1.boxId, qty: 5, worker: member, deviceKey: 'dev:1', requestId: 'cw-restore-2' }).ok, true);
+  assert.equal(cwRow().placed, 10);
+  assert.equal(cwRow().check_worker, 'りようしゃ');
+  assertAutoCheck(rowB.id, '後始末のあと');
+  assert.equal(db.voidBox({ boxId: cwBox.boxId, reason: 'テストの後始末', worker: staff }).ok, true);
 });
 
 t('空箱はクローズできない', () => {
@@ -1583,6 +1614,42 @@ t('PR2 スキーマの pack_groups / rows を再構築: NULL 許容・pending/pi
   assert.equal(mdb2.prepare('SELECT COUNT(*) c FROM fbx_rows').get().c, 2);
 });
 mdb2.close();
+
+// ───────── PR2.6: fbx_row_work に確認担当の由来を足す移行 (Codex R2 medium#3) ─────────
+console.log('■ PR2.6: fbx_row_work の由来列 ALTER 移行');
+const mdb3 = new Database(path.join(tmp, 'migrate-rowwork.db'));
+mdb3.pragma('journal_mode = WAL'); mdb3.pragma('foreign_keys = ON');
+db.createTables(mdb3);
+// この変更より前の fbx_row_work (由来の2列が無い) に戻して、稼働中の回のデータを入れる
+mdb3.pragma('foreign_keys = OFF');
+mdb3.exec(`DROP TABLE fbx_row_work;
+  CREATE TABLE fbx_row_work (
+    row_id INTEGER PRIMARY KEY REFERENCES fbx_rows(id),
+    label_worker TEXT, check_worker TEXT,
+    shortage_qty INTEGER CHECK (shortage_qty IS NULL OR shortage_qty > 0),
+    shortage_reason TEXT, shortage_by TEXT, shortage_detail TEXT, updated_at TEXT);`);
+mdb3.pragma('foreign_keys = ON');
+mdb3.exec(`INSERT INTO fbx_runs (id, source_run_id, title, status, created_at) VALUES (1, 1, 'r', 'active', 'now');
+  INSERT INTO fbx_excel_files (id, run_id, stored_path, sha256, fingerprint, uploaded_at) VALUES (1, 1, '/x', 'h', 'f', 'now');
+  INSERT INTO fbx_pack_groups (id, run_id, excel_file_id, sheet_name, packing_group_id, display_name) VALUES (1, 1, 1, 's', 'pg1', 'G1');
+  INSERT INTO fbx_rows (id, run_id, pack_group_id, excel_row, seller_sku, fnsku, planned_qty) VALUES (1, 1, 1, 6, 'sku', 'X1', 5);
+  INSERT INTO fbx_row_work (row_id, label_worker, check_worker, shortage_qty, updated_at) VALUES (1, 'たなか', 'さとう', 2, 'then');`);
+t('稼働中の回のある DB に由来の2列を足す: 既存値は保持され source は NULL (= 触らない印)', () => {
+  assert.equal(new Set(mdb3.prepare('PRAGMA table_info(fbx_row_work)').all().map((c) => c.name)).has('check_worker_source'), false);
+  db.createTables(mdb3);
+  const cols = new Set(mdb3.prepare('PRAGMA table_info(fbx_row_work)').all().map((c) => c.name));
+  assert.ok(cols.has('check_worker_source')); assert.ok(cols.has('check_worker_placement_id'));
+  const rw = mdb3.prepare('SELECT * FROM fbx_row_work WHERE row_id = 1').get();
+  assert.equal(rw.check_worker, 'さとう');        // 稼働中の回の記録は消えない
+  assert.equal(rw.label_worker, 'たなか');
+  assert.equal(rw.shortage_qty, 2);
+  assert.equal(rw.check_worker_source, null);     // NULL = 由来不明 → 自動では動かさない
+  assert.equal(rw.updated_at, 'then');            // ALTER だけ = 既存行を書き直さない
+  assert.deepEqual(mdb3.prepare('PRAGMA foreign_key_check').all(), []);
+  db.createTables(mdb3);                          // 2回目は何もしない (冪等)
+  assert.equal(mdb3.prepare('SELECT COUNT(*) c FROM fbx_row_work').get().c, 1);
+});
+mdb3.close();
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed === 0 ? 0 : 1);
