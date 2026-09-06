@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 20;
+const SCHEMA_VERSION = 21;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -583,6 +583,18 @@ const MIGRATIONS = {
       created_at     TEXT NOT NULL
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_stockouts_pending ON pk_pack_stockouts(notified_at)');
+  },
+  // v21 (例外処理監査 PR-4・Q3 決定 2026-09-05「戻したロケを記録する」):
+  //   棚戻しタスクに「どこへ戻したか」(returned_block/returned_location/returned_at/returned_by) と、
+  //   参考ロケの出どころ (location_source: picked=そのバッチのピックロケ / stock=ロジザードの在庫ロケ候補) を持つ。
+  //   列は存在確認してから足す (v19/v20 と同じ作法)
+  21: () => {
+    const hasTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pk_pack_tasks'").get();
+    if (!hasTable) return;
+    const cols = db.prepare('PRAGMA table_info(pk_pack_tasks)').all().map((c) => c.name);
+    for (const [name, type] of [['returned_block', 'TEXT'], ['returned_location', 'TEXT'], ['returned_at', 'TEXT'], ['returned_by', 'TEXT'], ['location_source', 'TEXT']]) {
+      if (!cols.includes(name)) db.exec(`ALTER TABLE pk_pack_tasks ADD COLUMN ${name} ${type}`);
+    }
   },
 };
 

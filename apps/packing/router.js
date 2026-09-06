@@ -30,7 +30,7 @@ import {
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, SHIP_CHANGE_TWO_LABELS, lastDoneSeqOf, getDailySummary,
   resolveIncident, lineKindOf, batchHikiateClass, batchClassInfo, listLineRuns, lineDailyTotal, listRepickReady,
-  claimStockoutNotify, markStockoutNotify, shortageSummaryFor,
+  claimStockoutNotify, markStockoutNotify, shortageSummaryFor, setTaskLocationHint,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText, notifyStockout } from './notify.js';
 import {
@@ -550,6 +550,9 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   let actualSku = req.body.actual_sku || null;
   let actualName = null;
   if (req.body.event === 'wrong_item') ({ sku: actualSku, name: actualName } = await verifyActualSku(actualSku));
+  // 余りの SKU も同じ検証 (自由入力の商品名断片を棚戻しに流さない — 例外処理監査 D-1・PR-4)。名前は actualName に載せる
+  let excessSku = null;
+  if (req.body.event === 'excess') ({ sku: excessSku, name: actualName } = await verifyActualSku(req.body.sku, { label: '余った商品' }));
   const result = applyEvent(Number(req.params.id), {
     opId: req.body.op_id,
     event: req.body.event,
@@ -558,7 +561,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     reason: req.body.reason || null,
     jumped: !!req.body.jumped,
     proposedMethod: req.body.proposed_method || null,
-    sku: req.body.sku || null,
+    sku: excessSku ?? (req.body.sku || null),
     actualSku,
     actualName,
     qty: req.body.qty == null ? null : Number(req.body.qty),
@@ -757,8 +760,14 @@ router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, 
       const info = { kind: t.kind, sku: t.sku, name: t.product_name, qty: t.req_qty, folder: t.folder_name, slipSeq: t.slip_seq };
       if (stock?.stockLookupConfigured?.()) {
         try {
-          info.stockText = stock.buildStockLocationsText(
-            await stock.fetchStockLocations(t.sku), { title: '在庫ロケーション (戻し先の参考)' });
+          const data = await stock.fetchStockLocations(t.sku);
+          info.stockText = stock.buildStockLocationsText(data, { title: '在庫ロケーション (戻し先の参考)' });
+          // 取った場所が分からない棚戻し (余り・バッチ外の品違い = pk_lines に無い) は、ロジザードの在庫ロケ
+          // (良品・フリー在庫の多い順) の先頭を参考ロケとして持たせる (例外処理監査 D-2・PR-4)。画面は候補を全部出す
+          if (!t.location) {
+            const top = stock.listStockCandidates(data, { groupByLocation: true, maxRows: 1 }).rows[0];
+            if (top) setTaskLocationHint(t.id, { block: top.block, location: top.location, source: 'stock' });
+          }
         } catch { /* fail-soft */ }
       }
       notifyTask(info, actor).catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${t.sku}): ${e.message}`));
@@ -788,9 +797,9 @@ router.get('/api/stock-search', api(async (req, res) => {
  * 記録時 (wrong_item イベント) と確定時 (incidents/resolve) の両方で使う。
  * @returns {{sku: string, name: string|null}}
  */
-async function verifyActualSku(raw) {
+async function verifyActualSku(raw, { label = '間違って入っていた商品' } = {}) {
   const sku = String(raw ?? '').trim().toLowerCase();
-  if (!sku) throw new PackError(400, 'actual_sku_required', '間違って入っていた商品を検索で特定してください');
+  if (!sku) throw new PackError(400, 'actual_sku_required', `${label}を検索で特定してください`);
   if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(sku)) {
     throw new PackError(400, 'bad_sku', 'SKUの形式が不正です。検索から選んでください');
   }

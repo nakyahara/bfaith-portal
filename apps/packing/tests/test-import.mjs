@@ -844,10 +844,12 @@ t('品違いの送信 = 再ピック+棚戻しの2タスク / 余りの送信 = 
   const exDone = resolveIncident(ex.id, 'confirm', '星');
   assert.deepEqual(exDone.dispatchedTasks.map((t) => t.kind), ['return']);
   assert.equal(exDone.dispatchedTasks[0].sku, 'zaiko-y');
-  // return タスクは claim→fulfill で returned 終端
+  // return タスクは claim→fulfill で returned 終端。fulfill は「戻したロケ」が必須 (PR-4・Q3 決定)
   const ret = listOpenTasks().find((t) => t.batch_id === gr.batchId && t.kind === 'return' && t.sku === 'zaiko-y');
   applyTaskAction(ret.id, 'claim', '月');
-  assert.equal(applyTaskAction(ret.id, 'fulfill', '月').status, 'returned');
+  const done = applyTaskAction(ret.id, 'fulfill', '月', { returnedBlock: 'P3FA', returnedLocation: '001-001-01' });
+  assert.equal(done.status, 'returned');
+  assert.equal(done.returned_location, '001-001-01');
 });
 
 t('countOpenTasks が picking バッジ用の件数を返す', () => {

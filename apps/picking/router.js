@@ -25,7 +25,7 @@ import {
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
   getPickingStats, getTodayProgress, getMissStats, statsRange, loadStatsLines, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
-import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask, announceShortageToPacking } from './service.js';
+import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests, syncRepickTask, announceShortageToPacking, returnCandidates } from './service.js';
 import { notifyShortage, notifyShortageUndo } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
@@ -217,11 +217,23 @@ router.get('/', async (req, res) => {
   reconcileRepickBatches();   // 梱包側で取消されたピッキング漏れバッチを畳む (fail-soft)
   const batches = listBatches(workDate)
     .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
-  let openTasks = 0;
+  // ↩ 棚戻し = 一覧の中に「バッチ」として並べる (例外処理監査 PR-4・指摘C)。pk_batches は作らない (計測・Notion・フロアボードに混ざらない)
+  let returnTasks = [];
   const psvc = await packingSvc();
-  if (psvc) { try { openTasks = psvc.countOpenTasks({ kind: 'return' }); } catch { openTasks = 0; } }   // 棚戻しのみ (再ピックは 🔴バッチ)
+  if (psvc) {
+    try {
+      const rows = psvc.listOpenTasks({ kind: 'return' });
+      const images = getImageMap(rows.map((t) => t.sku));
+      returnTasks = rows.map((t) => ({
+        ...t,
+        locationLabel: t.location ? formatLocation(t.block, t.location) : null,
+        imageUrl: images.get(String(t.sku ?? '').trim().toLowerCase())?.url || null,
+      }));
+    } catch { returnTasks = []; }
+  }
   res.render(path.join(__dirname, 'views/batches'), {
-    openTasks,
+    openTasks: returnTasks.length,
+    returnTasks,
     title: 'ピッキング支援',
     username: req.session?.email || req.pickingDevice?.label || '端末',
     displayName: req.session?.displayName,
@@ -235,23 +247,46 @@ router.get('/', async (req, res) => {
 });
 
 // ─── 再ピック・棚戻しキュー (梱包からの依頼を消化する画面) ───
-router.get('/tasks', async (req, res) => {
+// 旧 /tasks (棚戻しキュー) は一覧へ転送 — 棚戻しは一覧の「↩ 棚戻し」カード → 専用画面 (戻し先ロケを記録) に一本化 (例外処理監査 PR-4)
+router.get('/tasks', (req, res) => res.redirect('/apps/picking/'));
+
+/**
+ * ↩ 棚戻しの作業画面 (例外処理監査 PR-4・指摘C「3階の人はどこのピックロケに戻せばいいか分かるように」)。
+ * 商品 (画像・数量・名前) → 戻し先 = 取った場所 + ロジザードの在庫ロケ候補 (タップ = ここへ戻した) + 手入力。
+ * 戻したロケは pk_pack_tasks に記録し、事務へ通知する (Q3 決定 2026-09-05)
+ */
+router.get('/return/:id(\\d+)', async (req, res) => {
   const psvc = await packingSvc();
   if (!psvc) return res.status(404).send('梱包連携は無効です');
-  // 再ピックは 🔴バッチに一本化 (Q4 決定 2026-09-05)。このキューは棚戻し専用 —
-  // 同じ依頼に入口が2つあると、片方で「在庫なし」・片方で他ロケ確保、と記録が割れる (9/5 に実発生)
-  let tasks = [];
-  try { tasks = psvc.listOpenTasks({ kind: 'return' }); } catch { tasks = []; }
-  const images = getImageMap(tasks.map((t) => t.sku));
-  res.render(path.join(__dirname, 'views/tasks'), {
+  const t = psvc.getTaskDetail(Number(req.params.id));
+  if (!t || t.kind !== 'return') return res.status(404).send('棚戻しの依頼が見つかりません');
+  const images = getImageMap([t.sku]);
+  res.render(path.join(__dirname, 'views/return'), {
     title: '棚戻し',
     workers: listWorkers(),
-    tasks: tasks.map((t) => ({
+    deviceMode: !req.session?.email,
+    task: {
       ...t,
       locationLabel: t.location ? formatLocation(t.block, t.location) : null,
+      returnedLabel: t.returned_location ? formatLocation(t.returned_block, t.returned_location) : null,
       imageUrl: images.get(String(t.sku ?? '').trim().toLowerCase())?.url || null,
-    })),
+    },
   });
+});
+
+/** 棚戻しの戻し先候補 (取った場所 + ロジザードの在庫ロケ)。fail-soft: 在庫参照が無くても取った場所だけ返す。 */
+router.get('/api/return-tasks/:id(\\d+)/candidates', async (req, res) => {
+  try {
+    const psvc = await packingSvc();
+    if (!psvc) return res.status(404).json({ error: '梱包連携は無効です', code: 'packing_disabled' });
+    const t = psvc.getTask(Number(req.params.id));
+    if (!t || t.kind !== 'return') return res.status(404).json({ error: '棚戻しの依頼が見つかりません', code: 'not_found' });
+    res.set('Cache-Control', 'no-store');
+    res.json(await returnCandidates(t));
+  } catch (e) {
+    console.error('[picking-return]', e);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
 });
 
 // 不足分ピッキング完了の梱包側バナーは、旧「通知 (OK=既読のみ)」をやめてタスク状態
@@ -276,8 +311,21 @@ router.post('/api/tasks/:id(\\d+)/:action', checkOrigin, async (req, res) => {
     if (!['claim', 'fulfill', 'cancel'].includes(String(req.params.action))) {
       return res.status(400).json({ error: '棚戻しではこの操作はできません', code: 'bad_return_action' });
     }
-    const t = psvc.applyTaskAction(Number(req.params.id), String(req.params.action), worker.name);
-    res.json({ ok: true, id: t.id, status: t.status });
+    const action = String(req.params.action);
+    // 棚戻し画面は「ここへ戻した」1タップで完了 = 未着手なら担当に入ってから完了 (対応する→戻した の2タップにしない)
+    if (action === 'fulfill' && target.status === 'requested') psvc.applyTaskAction(target.id, 'claim', worker.name);
+    const t = psvc.applyTaskAction(target.id, action, worker.name, {
+      returnedBlock: req.body.returned_block ?? null,
+      returnedLocation: req.body.returned_location ?? null,
+    });
+    // 戻したロケを事務へ (Q3 決定 2026-09-05)。fail-soft: DB の returned_* が正本
+    if (t._notifyReturned) {
+      try {
+        const [pn, detail] = [await import('../packing/notify.js'), psvc.getTaskDetail(t.id)];
+        pn.notifyReturned(detail || t, worker.name).catch((e) => console.warn(`[picking-return] 棚戻し通知失敗 (task=${t.id}): ${e.message}`));
+      } catch (e) { console.warn(`[picking-return] 棚戻し通知の準備失敗: ${e.message}`); }
+    }
+    res.json({ ok: true, id: t.id, status: t.status, returnedLocation: t.returned_location || null, returnedBlock: t.returned_block || null });
   } catch (e) {
     // packing 側の業務エラー (PackError) も picking の PkError と同じ形で返す
     if (e && Number.isInteger(e.status) && e.code) {
