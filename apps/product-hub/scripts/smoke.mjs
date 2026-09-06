@@ -6948,6 +6948,19 @@ renders.push(
       { ...d0[2], setDrafts: sd.setDraftsOf(db, wfSetParentId), setInfo: null }]);
     renders.push(['detail.ejs (セット商品・仮コード警告)', 'detail.ejs',
       { ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId) }]);
+    // 判断済みの見え方 (2026-09-06)。札に理由まで出て、ボタンは「見直す」に変わる。
+    // 🚨 create / existing / hold も描く — none だけだと「判断済みなのに『作らない』と
+    //    書いてあるボタン」のような分岐漏れを検出できない (Codex R1)
+    for (const [tag, row] of [
+      ['作らない', { decision: 'none', reason_code: 'shipping_loss' }],
+      ['既存あり', { decision: 'existing', linked_set_draft_id: wfSetDraftId }],
+      ['保留', { decision: 'hold', reason_text: '売れ行きを見てから' }],
+      ['作成済み', { decision: 'create', linked_set_draft_id: wfSetDraftId }],
+    ]) {
+      renders.push([`detail.ejs (セットの親・判断=${tag})`, 'detail.ejs',
+        { ...d0[2], setDrafts: [], setInfo: null,
+          setDecision: row, setDecisionText: sd.describeSetDecision(row) }]);
+    }
     // 画像の引き継ぎ計画 (§4.7): 枠ごとの表と、依頼に載る指示
     renders.push(['detail.ejs (セット商品・画像の計画)', 'detail.ejs', {
       ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId),
@@ -7270,6 +7283,9 @@ for (const [name, file, data] of renders) {
         checkingReasons: dbmod.CHECKING_REASONS,
         checkingNoteMax: dbmod.CHECKING_NOTE_MAX,
         checkingDays: null,
+        // セット展開判断のいまの値 (2026-09-06)。既定 = まだ決めていない。
+        // 判断済みの見え方は「セットの親」の fixture 側で上書きする
+        setDecision: null, setDecisionText: '',
         // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
         modelAttrName: listing.MODEL_ATTR_NAME,
         // 画像制作の管理項目を使える商品か (自社商品 / 取扱先限定商品)。
@@ -7599,7 +7615,8 @@ for (const [name, file, data] of renders) {
     modal.includes('id="setdec-reason"') && modal.includes('送料負け') && modal.includes('需要が見込めない'),
     modal.slice(modal.indexOf('setdec-reason'), modal.indexOf('setdec-reason') + 300));
   check('セット判断の画面: 新規作成はここでは選ばせない (作成の入口へ案内する)',
-    !/name="setdec" value="create"/.test(modal) && modal.includes('セット商品を作る'));
+    !/name="setdec" value="create"/.test(modal) && modal.includes('id="setdec-goto-create"')
+    && modal.includes('セットを作る'));
   check('セット判断の画面: ⑤で「完了」を選んだらダイアログを開く (そのままでは閉じられない)',
     /tr\.dataset\.step === 'set_review' && state\.value === 'done'/.test(src) && /openSetDecision\(tr\)/.test(src));
   check('セット判断の画面: 記録は工程の版数を添えて送り、409 なら読み直す',
@@ -7795,6 +7812,95 @@ for (const [name, file, data] of renders) {
     !dhSingle.includes('id="set-qty"'), '');
   check('セット作成フォーム: 配送方法を引き継がないこと・売価の初期値を先に伝える',
     dhSingle.includes('配送方法は引き継ぎません') && dhSingle.includes('単品売価 × 個数'), '');
+  // ─── 「作る／作らない」の入口 (2026-09-06 中原さん) ───
+  // 以前は「作らない」の入口が工程パネルのプルダウンの中にしか無く、現場から見つけられなかった。
+  // 両方を**同じ場所の押せるボタン**として出していることを HTML で確かめる
+  check('セット判断の入口: 「作る」「作らない/保留」が両方ボタンとして出ている',
+    dhSingle.includes('id="set-create-open"') && dhSingle.includes('id="set-decision-open"'), '');
+  check('セット判断の入口: 作成フォームの入口は details の summary ではなくボタン',
+    !/<summary[^>]*>セット商品を作る<\/summary>/.test(dhSingle)
+    && /id="set-create-box" hidden/.test(dhSingle), '');
+  check('セット判断の入口: まだ決めていないことが札で分かる',
+    dhSingle.includes('まだ決めていません'), '');
+  {
+    // 未判断のときは「作る」が青 (下の判断済みループと合わせて「未判断と保留だけ青」を固定する)
+    const ca = dhSingle.indexOf('id="set-create-open"');
+    check('セット判断の入口: 未判断の「作る」ボタンは青 (いちばん進めたい操作)',
+      ca > 0 && dhSingle.slice(Math.max(0, ca - 80), ca).includes('btn-primary'),
+      dhSingle.slice(Math.max(0, ca - 80), ca));
+  }
+  {
+    // 担当外の一般ユーザーは押せない (サーバー側 assertStepOperable と同じ物差し)。
+    // 押せてしまうと 403 で弾かれてから理由を知ることになる
+    const dhOther = renderedHtml.get('detail.ejs (一般ユーザー・担当外)') || '';
+    const createBtn = dhOther.slice(dhOther.indexOf('id="set-create-open"'),
+      dhOther.indexOf('>', dhOther.indexOf('id="set-create-open"')));
+    const decBtn = dhOther.slice(dhOther.indexOf('id="set-decision-open"'),
+      dhOther.indexOf('>', dhOther.indexOf('id="set-decision-open"')));
+    check('セット判断の入口: 担当外の人にはどちらのボタンも押させない (理由も出す)',
+      dhOther.includes('id="set-create-open"') && createBtn.includes('disabled')
+      && decBtn.includes('disabled') && dhOther.includes('工程「セット商品作成検討」の担当者'),
+      createBtn.slice(0, 120) + ' | ' + decBtn.slice(0, 120));
+    // 判断済みなら理由まで札に出し、ボタンは「見直す」に変わる
+    const dhNone = renderedHtml.get('detail.ejs (セットの親・判断=作らない)') || '';
+    check('セット判断の入口: 判断済みなら理由つきで札に出る',
+      dhNone.includes('作らない (送料負け (単価が低い))') && !dhNone.includes('まだ決めていません'),
+      dhNone.slice(Math.max(0, dhNone.indexOf('セット商品にする')), dhNone.indexOf('セット商品にする') + 400));
+    // 🚨 「見直す」は判断の種類ごとに確かめる。none だけ見ていると、既存あり・作成済みで
+    //    「札=既存のセットあり / ボタン=作らない」の食い違いが残る (Codex R1)
+    for (const tag of ['作らない', '既存あり', '保留', '作成済み']) {
+      const dh = renderedHtml.get(`detail.ejs (セットの親・判断=${tag})`) || '';
+      // 判定は**ボタンの中身**で行う。ページ全体を見ると、同じ言葉を使った
+      // 画面下の JS のコメントを拾って素通り/誤検知する
+      const at = dh.indexOf('id="set-decision-open"');
+      const btn = at > 0 ? dh.slice(at, dh.indexOf('</button>', at)) : '';
+      check(`セット判断の入口: 判断済み (${tag}) のボタンは「見直す」`,
+        dh.length > 500 && btn.includes('この判断を見直す') && !btn.includes('セットは作らない')
+        && !dh.includes('まだ決めていません'), btn.slice(0, 220));
+      // 決めた後に作成を推さない (青を外す)。「保留」はまだ決めていないのと同じなので青のまま
+      const ca = dh.indexOf('id="set-create-open"');
+      const cls = ca > 0 ? dh.slice(Math.max(0, ca - 80), ca) : ''; // このボタンの開きタグ (class を含む)
+      check(`セット判断の入口: ${tag} の「作る」ボタンの色 (保留だけ青のまま)`,
+        ca > 0 && cls.includes('btn-primary') === (tag === '保留'), cls);
+    }
+  }
+  // ─── セット欄の開閉を実際に押す (2026-09-06 Codex R1) ───
+  // 「id がある・hidden がある」だけでは、配線が消えても開閉の向きが逆になっても素通りする
+  {
+    const vm = await import('node:vm');
+    const src = fs.readFileSync(path.join(views, 'detail.ejs'), 'utf8');
+    const start = src.indexOf('    function setCreateBoxOpen(box, open, onOpen) {');
+    const end = src.indexOf('    <%# ここまでがセット欄の開閉の切り出し範囲', start);
+    const chunk = start >= 0 && end > start ? src.slice(start, end) : '';
+    check('セット欄の開閉: detail.ejs から切り出せる (EJS の埋め込みを含まない)',
+      chunk.includes('function wireSetCreateToggle') && !chunk.includes('<%'), String(chunk.length));
+    const mk = () => ({
+      hidden: true, handlers: {}, scrolled: 0,
+      addEventListener(type, fn) { (this.handlers[type] = this.handlers[type] || []).push(fn); },
+      click() { (this.handlers.click || []).forEach((fn) => fn()); },
+    });
+    const els = { 'set-create-box': mk(), 'set-create-open': mk(), 'set-create-cancel': mk() };
+    const doc = { getElementById: (id) => els[id] || null };
+    const api = new vm.Script(`${chunk}\n({ wire: wireSetCreateToggle, open: setCreateBoxOpen })`,
+      { filename: 'set-create-toggle.js' }).runInNewContext({});
+    let opened = 0;
+    const box = api.wire(doc, () => { opened++; });
+    check('セット欄の開閉: 既定は閉じている', box === els['set-create-box'] && box.hidden === true, String(box && box.hidden));
+    els['set-create-open'].click();
+    check('セット欄の開閉: 「セットを作る」で開く', box.hidden === false && opened === 1, `hidden=${box.hidden} opened=${opened}`);
+    els['set-create-open'].click();
+    check('セット欄の開閉: もう一度押すと閉じる', box.hidden === true && opened === 1, `hidden=${box.hidden} opened=${opened}`);
+    els['set-create-open'].click();
+    els['set-create-cancel'].click();
+    check('セット欄の開閉: 「閉じる」で閉じる (開くときのコールバックは呼ばない)',
+      box.hidden === true && opened === 2, `hidden=${box.hidden} opened=${opened}`);
+    // 判断ダイアログの「🎁 セットを作る」= 開くだけ (すでに開いていてもトグルで閉じない)
+    api.open(box, true);
+    api.open(box, true);
+    check('セット判断ダイアログ: 「セットを作る」は常に開く (押すたび閉じない)', box.hidden === false, String(box.hidden));
+    check('セット判断ダイアログ: 作成欄を開く配線が入っている',
+      /setCreateBoxOpen\(document\.getElementById\('set-create-box'\), true/.test(src), '');
+  }
   check('セット工程ビュー: タブは自分が選ばれた状態になる',
     /class="kb-tab on"[^>]*href="[^"]*view=set"/.test(bhSet)
     || /href="[^"]*view=set"[^>]*class="kb-tab on"/.test(bhSet)
