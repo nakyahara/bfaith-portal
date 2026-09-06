@@ -509,7 +509,11 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
       let task = null;
       try {
         task = db.prepare('SELECT status, close_reason, updated_at FROM pk_pack_tasks WHERE id = ?').get(batch.pack_task_id) || null;
-      } catch { task = null; }   // pk_pack_tasks が無い環境は無視
+      } catch (e) {
+        // pk_pack_tasks が無い環境 (packing 無効) だけ無視。DB 障害・スキーマ不整合で「取下げ済みかどうか」を
+        // 確認できないまま操作を通さない (Codex PR-6 R3)
+        if (!/no such table: pk_pack_tasks/.test(String(e.message))) throw e;
+      }
       if (task?.status === 'cancelled') {
         // ここで UPDATE しても throw でトランザクションごとロールバックされる (Codex 2巡目)。
         // 操作は409で拒否し、実際の取消は一覧表示時の reconcileRepickBatches が行う。

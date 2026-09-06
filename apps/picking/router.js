@@ -638,9 +638,9 @@ router.get('/manifest.json', (req, res) => {
 // ─── 本日サマリ (管理者) ───
 router.get('/admin/summary', requireAdmin, (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
-  // 🕒 梱包に結べていない「後で取りに行く」依頼 (迷子) — 管理者が取り下げる (例外処理監査 A-3・PR-6)
-  let laterPending = [];
-  try { laterPending = listLaterRequests(); } catch { laterPending = []; }
+  // 🕒 梱包に結べていない「後で取りに行く」依頼 (迷子) — 管理者が取り下げる (例外処理監査 A-3・PR-6)。
+  // DB 異常を「依頼なし」に見せない (例外はそのまま 500 へ — Codex R3)
+  const laterPending = listLaterRequests();
   res.render(path.join(__dirname, 'views/admin_summary'), {
     title: 'ピッキングサマリ',
     username: req.session.email,

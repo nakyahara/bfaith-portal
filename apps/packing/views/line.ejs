@@ -751,22 +751,16 @@
       if (!confirm(`#${seq} を「出荷保留 (在庫なし)」にして閉じます。事務へ通知し、NE で出荷保留にしてもらいます。\n商品と納品書は出荷保留の棚へ置いてください。よろしいですか?`)) return;
       send('stockout_ack', { slip_seq: seq });
     }
-    // 取り下げの前に、ピッカーが既に取りに向かっているかを伝える (例外処理監査 PR-6・D-3)。取り下げると3階の画面に知らせが出る
-    function claimedNote(seq, sku) {
-      const k = sku ? String(sku).trim().toLowerCase() : null;
-      const hit = TASKS.find((t) => t.slipSeq === seq && (!k || String(t.sku).trim().toLowerCase() === k) && (t.status === 'claimed' || t.status === 'fulfilled'));
-      if (!hit) return '';
-      return hit.status === 'claimed' ? '⚠ ピッカーが既に取りに向かっています。取り下げると3階のバッチも取り消され、3階の画面に知らせが出ます。\n\n'
-        : '⚠ 3階は既に取り終えて、届ける途中かもしれません。\n\n';
-    }
+    // 取り下げ前の注意 (ピッカーが向かっている/届ける途中) は、サーバーが実状態で 409 confirmation_required を返し
+    // send() がその文言で確認する (例外処理監査 PR-6・D-3)。描画時の TASKS で先読みしない (古い状態で警告しない — Codex R3)
     function foundSlip(seq) {
-      if (!confirm(`${claimedNote(seq)}#${seq} の足りなかった商品が【全部】見つかったため、この伝票の再ピック依頼と不足の候補をすべて取り下げます。\n(1品目だけ見つかったときは、その商品の横の「見つかった」を押してください)\nよろしいですか?`)) return;
+      if (!confirm(`#${seq} の足りなかった商品が【全部】見つかったため、この伝票の再ピック依頼と不足の候補をすべて取り下げます。\n(1品目だけ見つかったときは、その商品の横の「見つかった」を押してください)\nよろしいですか?`)) return;
       send('found', { slip_seq: seq });
     }
     // SKU 単位の「見つかった」: その商品の依頼/候補だけ取り下げる (他の商品の依頼が残れば保留のまま)。
     // SKU は data-* 属性から加工せずに渡す (onclick へ文字列埋め込みすると記号入り SKU が壊れる — Codex R3)
     function foundSku(seq, sku, name) {
-      if (!confirm(`${claimedNote(seq, sku)}#${seq} の「${name}」が見つかったため、この商品の依頼だけ取り下げます。よろしいですか?`)) return;
+      if (!confirm(`#${seq} の「${name}」が見つかったため、この商品の依頼だけ取り下げます。よろしいですか?`)) return;
       send('found', { slip_seq: seq, sku });
     }
     document.querySelectorAll('.found-sku').forEach((b) => b.addEventListener('click',
