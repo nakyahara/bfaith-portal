@@ -1559,8 +1559,10 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
     logEvent({ runId: row.run_id, action: 'placement_add', targetType: 'placement', targetId: placementId,
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { rowId: row.id, boxId: box.id, boxNo: box.box_no, qty: q, expiry: exp, layer: lay, boxSeq: seq } }, d);
+    // 応答契約は冪等応答 (already) と同じ関数から作る — 移行前データ (source NULL) で
+    // 新規成功だけ 'manual' に化けていた (Codex PR2.6-R5 low#1)
     return { ok: true, placementId, boxSeq: seq, placed: placed + q, plannedQty: row.planned_qty, expiry: exp,
-      checkWorker: autoCheck?.checkWorker ?? null, checkWorkerSource: autoCheck?.source ?? null };
+      ...currentCheckWorker(d, row.id) };
   }).immediate();
 }
 

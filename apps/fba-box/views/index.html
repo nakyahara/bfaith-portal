@@ -851,24 +851,31 @@ ${j.message || ''}
 
 箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)`);
   }
-  const PLACE_KEYS = ['run_id', 'row_id', 'box_id', 'qty', 'layer', 'expiry', 'worker_id'];
-  const samePlacement = (a, b) => PLACE_KEYS.every(k => a[k] === b[k]);
+  /**
+   * ⚠ 既知の未解決 (PR1 からある。Codex PR2.6-R4 high#1 / R5 high#1〜4 — **別PRで作り直す**):
+   * サーバーでは成功したのに応答だけ失われたあと、利用者がもう一度押すと、pending を確定した
+   * 直後に新しい request_id でもう一度投入して**二重に記録される**ことがある。
+   * R4 で「同じ内容なら押し直しとみなして前回の結果を返す」を入れたが、
+   *   - 期限・配置を入れた投入は開き直すと値が変わるので一致せず、結局二重になる (R5 high#1)
+   *   - 逆に「同じ商品を同じ箱へ同じ個数、もう一度入れた」本物の2回目を飲み込む (R5 high#4)
+   * で、直しきれないうえ**取りこぼし**という新しい事故を作るため取り下げた。
+   * 正しくは pending → 確定・未確認 → 確認済み の状態を持ち、削除は自分の requestId と
+   * 一致するときだけ (CAS)、送信と flush を1本のキューに直列化し、
+   * 曖昧なときは「さらに N 個入れましたか?」と人に聞く必要がある = 送信部の作り直し。
+   */
   async function sendPlacement({ rowId, boxId, qty, layer, expiry }) {
-    const body = {
-      run_id: curRunId, row_id: rowId, box_id: boxId, qty, layer: layer || null,
-      expiry: expiry || null, worker_id: worker.id, request_id: null,
-    };
-    const pend = LS.get('pending_place', null);
     const flushed = await flushPendingPlacement();   // 前回の未確定分を先に片付ける
-    // それが「いま押したのと同じ操作」= 通信断のあとにもう一度押しただけ なら、その結果がこの操作の結果。
-    // ここで新しい request_id を発行すると、サーバーには同じ投入が2件入る (Codex PR2.6-R4 high#1)
-    if (flushed && pend && samePlacement(pend.body, body)) return flushed;
+    // 確定して「登録できなかった」なら必ず知らせる (現物は箱に入っているのに記録が無いのを見逃さない)
+    if (flushed && !flushed.ok) notePendingFailed(flushed);
     if (LS.get('pending_place', null)) {
       return { ok: false, message: '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください' };
     }
-    if (flushed && !flushed.ok) notePendingFailed(flushed);   // 別の操作だった & 登録できていない
-    body.request_id = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
-    LS.set('pending_place', { requestId: body.request_id, body });
+    const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+    const body = {
+      run_id: curRunId, row_id: rowId, box_id: boxId, qty, layer: layer || null,
+      expiry: expiry || null, worker_id: worker.id, request_id: requestId,
+    };
+    LS.set('pending_place', { requestId, body });
     showSaving(true);
     try {
       for (let attempt = 0; attempt < 2; attempt++) {

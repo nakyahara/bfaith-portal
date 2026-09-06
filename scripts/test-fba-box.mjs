@@ -435,6 +435,13 @@ t('確認した人: 移行前からある値 (source なし) は自動では消�
     .run('きゅうデータ', rowB.id);
   const add = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-legacy' });
   assert.equal(add.ok, true, JSON.stringify(add));
+  // 応答契約: 移行前データでも新規成功と冪等再送で同じ形 (source は NULL のまま。Codex R5 low#1)
+  assert.equal(add.checkWorker, 'きゅうデータ');
+  assert.equal(add.checkWorkerSource, null);
+  const addAgain = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-legacy' });
+  assert.equal(addAgain.already, true);
+  assert.equal(addAgain.checkWorker, 'きゅうデータ');
+  assert.equal(addAgain.checkWorkerSource, null);
   assertPinnedCheck(rowB.id, 'きゅうデータ', null, '移行前の値がある行に投入');
   assert.equal(db.revokePlacement({ placementId: add.placementId, worker: member, deviceKey: 'dev:1' }).ok, true);
   assertPinnedCheck(rowB.id, 'きゅうデータ', null, '移行前の値がある行の投入を取消');
