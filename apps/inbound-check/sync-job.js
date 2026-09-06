@@ -12,7 +12,7 @@
  *   INBOUND_CHECK_MASTER_FILE    … 商品マスタのファイル名 (既定 shohin_master.csv)
  */
 import cron from 'node-cron';
-import { runScheduledFetch, runScheduledMasterFetch } from './drive-fetch.js';
+import { runScheduledFetch, runScheduledMasterFetch, runScheduledBarcodeFetch } from './drive-fetch.js';
 import { sweepPrintJobs, pendingAlerts, markAlerted, alertTextFor, listPrintAgents } from './print-queue.js';
 import { pingJobThrottled } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
@@ -53,6 +53,10 @@ export function startInboundCheckCron() {
     // ⭐入口を増やさないため専用の cron は作らない (CLAUDE.md の定期実行ルール)
     try { await runScheduledMasterFetch({ actor: 'cron' }); }
     catch (e) { console.warn(`[inbound-check] cron(商品マスタ): ${e.message}`); }
+    // 🚨 バーコードマスタ (値札に刷る JAN/FNSKU の正本)。これも同じ巡回に相乗りさせる (入口を増やさない)。
+    // 中原さん 2026-09-06:「バーコードマスタ.csv は常に最新のバーコード情報を入れている」
+    try { await runScheduledBarcodeFetch({ actor: 'cron' }); }
+    catch (e) { console.warn(`[inbound-check] cron(バーコードマスタ): ${e.message}`); }
     // (2026-09-05 廃止) ここに相乗りしていた Notion カードの取消反映・再試行 (runNotionSweep mode='retry') は無くなった。
     // いろは行きの作業指示は「確認」と同じトランザクションで在庫化アプリ (f_iroha_tasks) に入り、取消も同じ経路で反映される
   }, { timezone: 'Asia/Tokyo' });

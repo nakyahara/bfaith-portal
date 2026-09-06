@@ -101,6 +101,7 @@
     <div class="filters">
       <select id="supplier"><option value="">仕入先: すべて</option></select>
       <input type="search" id="q" placeholder="商品名・商品コード・JAN で検索" autocomplete="off">
+      <button type="button" class="btn" id="scanBtn" title="カメラでバーコードを読む">📷 カメラ</button>
       <label class="chk"><input type="checkbox" id="all"> 取扱中止も</label>
       <button type="button" class="btn primary" id="searchBtn">検索</button>
     </div>
@@ -116,6 +117,13 @@
   <div class="overlay" id="workerPick"><div class="modal"><h2>作業者を選んでください</h2><div class="opts" id="workerOpts"></div>
     <div class="hint" style="margin:8px 0 0">名前は入庫情報の変更履歴と印刷の記録に残ります</div>
     <div class="actions"><button type="button" id="workerCancel">閉じる</button></div></div></div>
+
+  <div class="overlay" id="scanBox"><div class="modal">
+    <h2>📷 バーコードを読む</h2>
+    <video id="scanVideo" playsinline muted autoplay style="width:100%;border-radius:10px;background:#000;aspect-ratio:4/3;object-fit:cover"></video>
+    <div class="pmsg" id="scanMsg" style="margin-top:8px"></div>
+    <div class="actions"><button type="button" id="scanCancel">やめる</button></div>
+  </div></div>
 
   <div class="overlay" id="printBox"><div class="modal">
     <h2>🏷 値札シールを出す</h2>
@@ -246,6 +254,88 @@
     $('#all').addEventListener('change', () => { loadSuppliers(); search({ silent: true }); });
     $('#moreBtn').addEventListener('click', () => { offset += 50; search({ append: true }); });
 
+    // ─── 📷 カメラでバーコードを読む ───
+    // 読んだ値をそのまま検索欄に入れて検索する (バーコードマスタは1商品に複数行あるので、
+    // JAN でも FNSKU でも、どれを読んでもその商品に行き着く)。
+    // BarcodeDetector が無い iPad (iPadOS 16 以前など) は、キーボードの「テキストをスキャン」を案内する
+    let scanStream = null, scanTimer = null, scanStarting = false, scanGen = 0;
+    async function startScan() {
+      if (scanStarting || scanStream) return;      // 連打で getUserMedia が二重に走ると、先の stream を止められなくなる
+      const gen = ++scanGen;                       // カメラが返ってくる前に画面を離れたかを見分ける
+      if (!('BarcodeDetector' in window) || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        banner('warn', 'この iPad はカメラ読み取りに対応していません。検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+        $('#q').focus();
+        return;
+      }
+      let detector;
+      try { detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'] }); }
+      catch (e) { banner('err', 'バーコードの読み取りを始められませんでした (' + esc(e.message) + ')', { sticky: true }); return; }
+      scanStarting = true;
+      $('#scanBtn').disabled = true;
+      let stream = null;
+      try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }); }
+      catch (e) {
+        // 何が起きたかで打つ手が違う。「許可してください」だけだと、カメラが無い/塞がっているときに現場が設定をいじり続ける
+        const msg = e && e.name === 'NotAllowedError' ? 'カメラの使用が許可されていません。iPad の設定 → Safari → カメラ でこのサイトを「許可」にしてください'
+          : e && e.name === 'NotFoundError' ? 'この端末にカメラが見つかりません。検索欄を長押し →「テキストをスキャン」を使ってください'
+          : e && e.name === 'NotReadableError' ? 'カメラを他のアプリが使っています。そのアプリを閉じてからもう一度押してください'
+          : location.protocol !== 'https:' && location.hostname !== 'localhost' ? 'この画面は https でないため、カメラを使えません'
+          : 'カメラを使えませんでした (' + esc((e && e.name) || '') + ')';
+        banner('err', msg, { sticky: true });
+        return;
+      } finally {
+        scanStarting = false;
+        $('#scanBtn').disabled = false;
+      }
+      // カメラが返ってくるまでに 画面を離れた / 止めた / もう一度押した なら、受け取った stream をその場で止める
+      // (返る前は scanStream が null なので、pagehide の stopScan() では止められない)
+      if (gen !== scanGen || document.hidden || !$('#scanBox')) {
+        for (const tr of stream.getTracks()) { try { tr.stop(); } catch (e) { /* 放す */ } }
+        return;
+      }
+      scanStream = stream;
+      const v = $('#scanVideo');
+      v.srcObject = scanStream;
+      $('#scanMsg').textContent = '商品の JAN (13桁) か FNSKU を枠に入れてください';
+      $('#scanBox').classList.add('on');
+      const tick = async () => {
+        if (!scanStream || gen !== scanGen) return;
+        try {
+          const codes = await detector.detect(v);
+          // 読み取りを待っている間に閉じられたら、返ってきた結果は使わない (閉じた後に検索が走らないように)
+          if (!scanStream || gen !== scanGen) return;
+          const hit = codes.find((x) => x.rawValue && /^[A-Za-z0-9]{6,}$/.test(String(x.rawValue).trim()));
+          if (hit) { onScanned(String(hit.rawValue).trim()); return; }
+        } catch (e) { /* まだ映っていない → 次の回 */ }
+        if (gen !== scanGen) return;
+        scanTimer = setTimeout(tick, 250);
+      };
+      scanTimer = setTimeout(tick, 400);
+    }
+    function stopScan() {
+      scanGen++;                                   // 起動待ちの getUserMedia が返ってきても使わせない
+      clearTimeout(scanTimer); scanTimer = null;
+      if (scanStream) { for (const tr of scanStream.getTracks()) { try { tr.stop(); } catch (e) { /* 止められなければ放す */ } } scanStream = null; }
+      const v = $('#scanVideo'); if (v) v.srcObject = null;
+      $('#scanBox').classList.remove('on');
+    }
+    async function onScanned(code) {
+      stopScan();
+      $('#q').value = code;
+      $('#supplier').value = '';        // 絞り込みが残っていると「読んだのに出ない」になる
+      await search();
+      const n = data.rows.length;
+      banner(n ? 'ok' : 'warn', '📷 ' + esc(code) + (n === 1 ? ' の商品です' : n ? ' … ' + n + ' 件見つかりました'
+        : ' の商品は見つかりません (バーコードマスタに無いか、取扱中止かもしれません)'), { sticky: !n });
+    }
+    $('#scanBtn').addEventListener('click', startScan);
+    $('#scanCancel').addEventListener('click', stopScan);
+    $('#scanBox').addEventListener('click', (e) => { if (e.target === $('#scanBox')) stopScan(); });
+    // 画面を離れる・別のタブに移る・戻るボタンで抜ける — どれでもカメラを必ず止める
+    // (止め忘れるとレンズのランプが点いたままになり、現場が不安になる)
+    window.addEventListener('pagehide', stopScan);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) stopScan(); });
+
     // ─── 描画 ───
     const SEAL_NO = /^(不要|無|無し|なし|－|-|ー|―)$/;
     const SEAL_YES = /(必要|貼付|有|あり)/;
@@ -270,7 +360,7 @@
     }
     function bcHtml(r) {
       if (r.barcode) {
-        const src = { line: '入荷受付伝票', stock: '在庫', schedule: '入荷予定', manual: '手入力' }[r.barcode_source] || '';
+        const src = { master: 'マスタ', line: '入荷受付伝票', stock: '在庫', schedule: '入荷予定', manual: '手入力' }[r.barcode_source] || '';
         return '<div class="bc">' + esc(r.barcode) + ' <small>(' + esc(String(r.barcode_type || '').toUpperCase()) + (src ? '・' + src : '') + ')</small>' + (r.barcode_live ? '' : '<button type="button" data-act="bc">直す</button>') + '</div>';
       }
       return '<div class="bc"><span class="none">バーコード未登録</span><button type="button" data-act="bc">JAN / FNSKU を入れる</button></div>';

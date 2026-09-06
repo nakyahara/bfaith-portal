@@ -107,6 +107,36 @@
     </div>
 
     <div class="ic-box">
+      <h2>🔢 バーコードマスタ (値札に刷る JAN / FNSKU の正本)</h2>
+      <p class="hint">
+        共有ドライブの <b>バーコードマスタ.csv</b> (ロジザード エクスポート[FM08_01] → 種類=バーコード) を取り込みます。
+        値札を刷るときの JAN / FNSKU と、<b>🔍 商品から探す</b>・<b>📷 カメラ読み取り</b>の照合はこれが正本です。
+        <br>1商品に複数のバーコードが載っていても全部持ちます (どれで読んでも商品が引けます)。
+        値札に刷るのは <b>JAN を優先した1つ</b>です。取り込めていない商品は、入荷受付伝票の明細・在庫・入荷予定・手入力の順に探します。
+      </p>
+      <% if (drive && drive.barcodeStatus && drive.barcodeStatus.total > 0) { %>
+        <p>バーコードマスタから <b><%= drive.barcodeStatus.total %></b> 件
+          (<b><%= drive.barcodeStatus.products %></b> 商品) ・ 最終取込
+          <span data-jst="<%= drive.barcodeStatus.updatedAt %>"></span></p>
+      <% } else { %>
+        <p class="ng">まだバーコードマスタを取り込めていません (伝票・在庫・入荷予定・手入力で動いています)</p>
+      <% } %>
+      <% if (drive && drive.barcode) { %>
+        <p>Drive のファイル: <code><%= drive.barcode.name || drive.barcode.filename %></code> ・ 更新
+          <span data-jst="<%= drive.barcode.modified_time || drive.barcode.modifiedTime %>"></span>
+          <% if (drive.barcode.size != null) { %>・ <%= Math.round(drive.barcode.size / 1024) %> KB<% } %></p>
+      <% } else if (drive && drive.barcodeError) { %>
+        <p class="ng">⚠ Drive を見に行けません: <%= drive.barcodeError %></p>
+      <% } else { %>
+        <p class="ng">Drive に <code><%= drive && drive.barcodeConfig ? drive.barcodeConfig.filename : "バーコードマスタ.csv" %></code> がまだありません</p>
+      <% } %>
+      <div class="row">
+        <button id="fetchBarcodeBtn" type="button">🔢 バーコードマスタを今すぐ取り込む</button>
+        <span id="fetchBarcodeMsg" class="msg"></span>
+      </div>
+    </div>
+
+    <div class="ic-box">
       <h2>📥 入荷受付 CSV を取り込む (手動アップロード・自動が止まったとき用)</h2>
       <p class="hint">
         ロジザード <b>入荷状況照会 [FA04_01]</b> で「検索範囲: 当日から7日前まで / 対象データ: 受付済」で検索 → CSV エクスポートしたファイル
@@ -690,6 +720,50 @@
         masterBtn.disabled = false;
       }
     });
+
+    // ── バーコードマスタを今すぐ取り込む ──
+    const bcBtn = $('#fetchBarcodeBtn');
+    const runBarcodeFetch = async () => {
+      bcBtn.disabled = true;
+      msg($('#fetchBarcodeMsg'), true, '取り込んでいます…');
+      // 承認つきのやり直しは**ループで**行う (再帰にすると外側の finally が先にボタンを戻し、二度押しできてしまう)
+      let approve = null;
+      try {
+        for (;;) {
+        const { status, j } = await postJson(BASE + '/admin/fetch-barcode-master', approve || {});
+        // 件数が大きく減っていて止めた → 中身を見せて、そのとおりで良いか人に決めてもらう
+        if (status === 409 && j.error === 'shrink_guard') {
+          const yes = confirm(j.message + '\n\nこのまま取り込みますか？ (' + j.before + ' 件 → ' + j.after + ' 件)');
+          if (!yes) { msg($('#fetchBarcodeMsg'), false, '取り込みませんでした (前の内容のままです)'); return; }
+          // 承認して1回だけやり直す。ボタンは押せないまま (finally より前に return しない = 再帰にしない)
+          approve = { allow_shrink: true, confirm_before: j.before, confirm_after: j.after };
+          continue;
+        }
+        if (status === 409 && j.error === 'confirm_mismatch') { msg($('#fetchBarcodeMsg'), false, '❌ ' + j.message); return; }
+        if (status === 409 && j.error === 'stale_source') { msg($('#fetchBarcodeMsg'), false, '❌ ' + j.message); return; }
+        if (status === 200 && j.ok) {
+          // ⭐区分の内訳を出す: ロジザード側の表記が想定と違っていたらここで気付ける
+          const naiyaku = j.kubunCounts ? Object.entries(j.kubunCounts).map(([k, n]) => k + '=' + n).join(' / ') : '';
+          msg($('#fetchBarcodeMsg'), true, j.unchanged ? '前回と同じ内容でした'
+            : '✅ ' + j.total + ' 件 / ' + j.products + ' 商品'
+              + (j.added ? ' (追加 ' + j.added + ')' : '')
+              + (j.removed ? ' (消滅 ' + j.removed + ')' : '')
+              + (j.invalidBarcodes ? ' ・ 刷れない形を ' + j.invalidBarcodes + ' 件 除外' : '')
+              + (j.blankRows ? ' ・ 空欄の行 ' + j.blankRows + ' 件' : '')
+              + (naiyaku ? ' ・ 有効区分: ' + naiyaku : ''));
+          setTimeout(() => location.reload(), 2500);
+        } else {
+          msg($('#fetchBarcodeMsg'), false, '❌ ' + (j.message || j.error || ('HTTP ' + status)));
+        }
+        return;
+        }
+      } catch (e) {
+        msg($('#fetchBarcodeMsg'), false, '❌ ' + e.message);
+      } finally {
+        bcBtn.disabled = false;
+      }
+    };
+    if (bcBtn) bcBtn.addEventListener('click', () => runBarcodeFetch());
 
     // ── Notion 作業カード: 今すぐ送る / エラー行の再送 ──
     const notionBtn = $('#notionSyncBtn');

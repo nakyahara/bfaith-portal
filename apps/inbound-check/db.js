@@ -20,6 +20,8 @@ import { parseInboundCsv } from './csv.js';
 // 取消 (やり直し・再取込) も同じ tx でタスク側へ伝える。同じ warehouse-mirror.db の同じ接続
 import { createTaskForDestination } from '../iroha-work/task-intake.js';
 import { requestCancellation } from '../iroha-work/tasks-db.js';
+// 仕入先コードの正規形 (先頭ゼロ除去) — 発注管理と同じ規則で突き合わせる。純粋関数なので副作用は無い
+import { normSupplierCode } from '../purchase-orders/db.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -291,6 +293,22 @@ export function createTables(db = getMirrorDB()) {
       updated_by   TEXT
     );
 
+    -- 🚨 バーコードの正本 (共有ドライブの バーコードマスタ.csv = ロジザード エクスポート[FM08_01] 種類=バーコード)。
+    --    1商品に複数のバーコードが載る (JAN と FNSKU が別行など) ので**バーコードが主キー**。
+    --    rank=0 が値札に刷る代表 (JAN 優先)。検索・📷カメラはどの行からでも商品を引ける。
+    --    barcode-master.js が全量置換する (ロジザードで消したものを刷り続けない)
+    CREATE TABLE IF NOT EXISTS f_inbound_check_barcode_master (
+      barcode      TEXT PRIMARY KEY,
+      code_key     TEXT NOT NULL,
+      product_id   TEXT NOT NULL,
+      product_name TEXT,
+      barcode_type TEXT NOT NULL CHECK (barcode_type IN ('jan','fnsku')),
+      kubun        TEXT,
+      rank         INTEGER NOT NULL DEFAULT 0,
+      updated_at   TEXT NOT NULL,
+      updated_by   TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_ic_bcmaster_code ON f_inbound_check_barcode_master(code_key, rank);
   `);
   ensurePrintJobsTable(db);
   // 🏷 印刷エージェント (倉庫PC) も同じ端末表で扱う (kind で区別)。iPad と同じ発行・失効の導線に乗せる。
@@ -1000,15 +1018,16 @@ export function productInfoMap(codeKeys) {
 const codeKeyOf = (s) => String(s == null ? '' : s).trim().toLowerCase();
 
 /**
- * 商品のバーコード (JAN/FNSKU) を探す。Render に完全なマスタは無いので、見つかる場所を順に見る。
+ * 商品のバーコード (JAN/FNSKU) を探す。見つかる場所を順に見る。
+ *   ⓪ f_inbound_check_barcode_master (共有ドライブの バーコードマスタ.csv = **正本**。常に最新)
  *   ① f_inbound_check_lines (入荷受付伝票の明細。新しい取込ほど後)   ┐ ロジザード側の値 = 正
  *   ② mirror_logizard_stock (在庫ミラー。在庫がある間だけ行がある)    │ (値札はロジザードの検品でスキャンされる)
  *   ③ f_inbound_schedule (値札CSV = 入荷予定 7日分)                  ┘
  *   ④ f_inbound_check_barcodes (控え: 前に①〜③で見つけた値 / 人が入れた値 'manual')
  * ①〜③ で見つけたら控えに写す (上書き = 在庫が消えても次から引ける。手入力よりロジザード側が勝つので、
  * 伝票から刷っても 🔍 商品画面から刷っても同じ紙。Codex R2 High-2)。数字だけ = JAN / 英字を含む英数字 = FNSKU、
- * それ以外の値は使わない (値札に刷れない)
- * @returns {{barcode:string, barcode_type:'jan'|'fnsku', source:string, live:boolean}|null}  live = ①〜③ にいま値がある (人は変えられない)
+ * それ以外の値は使わない (値札に刷れない)。⓪ は控えに写さない (いつでも引けるため)
+ * @returns {{barcode:string, barcode_type:'jan'|'fnsku', source:string, live:boolean}|null}  live = ⓪〜③ にいま値がある (人は変えられない)
  */
 export function resolveBarcode(codeKey, db = getDB()) {
   const k = codeKeyOf(codeKey);
@@ -1020,6 +1039,11 @@ export function resolveBarcode(codeKey, db = getDB()) {
     if (/^[A-Za-z0-9]+$/.test(s) && /[A-Za-z]/.test(s)) return 'fnsku';
     return null;
   };
+  // ⓪ バーコードマスタ (正本)。商品ごとの代表 = rank 0 (JAN 優先)
+  if (tableExists(db, 'f_inbound_check_barcode_master')) {
+    const m = db.prepare('SELECT barcode, barcode_type FROM f_inbound_check_barcode_master WHERE code_key = ? ORDER BY rank, barcode LIMIT 1').get(k);
+    if (m) return { barcode: m.barcode, barcode_type: m.barcode_type, source: 'master', live: true };
+  }
   const candidates = [];
   if (tableExists(db, 'f_inbound_check_lines')) {
     candidates.push(['line', db.prepare(`SELECT barcode FROM f_inbound_check_lines WHERE code_key = ? AND barcode IS NOT NULL AND trim(barcode) <> ''
@@ -1071,7 +1095,7 @@ export function setProductBarcode(codeKey, barcode, actor = null, { expected } =
     // そちらが正 (違う値を刷ると検品で通らない)。同じ値なら何もしない
     if (cur && cur.live) {
       if (s === curBc) return { ok: true, barcode: curBc, barcode_type: cur.barcode_type, unchanged: true };
-      const from = { line: '入荷受付伝票', stock: '在庫', schedule: '入荷予定' }[cur.source] || cur.source;
+      const from = { master: 'バーコードマスタ', line: '入荷受付伝票', stock: '在庫', schedule: '入荷予定' }[cur.source] || cur.source;
       return { ok: false, error: 'readonly_barcode', current: cur,
         message: 'このバーコードはロジザード側 (' + from + ') の値「' + curBc + '」なので、ここでは変えられません。違っていればロジザードの商品マスタを直してください' };
     }
@@ -1098,16 +1122,84 @@ export function setProductBarcode(codeKey, barcode, actor = null, { expected } =
   }).immediate();
 }
 
+/**
+ * 仕入先コード → 名前 (Map)。
+ *
+ * 🚨 **コードの持ち方が2系統ある**ので SQL の素の結合では引けない (中原さん 2026-09-06:「仕入先コードは
+ *    入っていたが仕入先名が入っていなかった」の原因):
+ *      mirror_products.仕入先コード … ネクストエンジンの生のコード (ゼロ埋め '0001' がある)
+ *      po_suppliers.supplier_code   … 発注管理の**正規形** (先頭ゼロを外した '1')
+ *    そこで normSupplierCode (発注管理と同じ関数) を通して突き合わせる。
+ *    発注管理に無い仕入先は、仕入先向け売れ筋共有の表示名 (supplier_share_master) を使う。
+ */
+function supplierNameMap(db, codes) {
+  const want = new Set();
+  for (const c of codes || []) {
+    const s = String(c == null ? '' : c).trim();
+    if (s) want.add(s);
+  }
+  const out = new Map();
+  if (want.size === 0) return out;
+  // ① 仕入先向け売れ筋共有の表示名。**mirror_products.仕入先コード と同じ体系**で持っている
+  //    (apps/supplier-sales/share-db.js が `m.仕入先コード = p.仕入先コード` と素で結合している) ので、
+  //    ここが最も確かな出どころ。ただし共有相手の仕入先しか登録されていない
+  if (tableExists(db, 'supplier_share_master')) {
+    for (const r of db.prepare('SELECT 仕入先コード AS code, 表示名 AS name FROM supplier_share_master').all()) {
+      const c = String(r.code == null ? '' : r.code).trim();
+      if (c && r.name && want.has(c) && !out.has(c)) out.set(c, r.name);
+    }
+  }
+  // ② 発注管理の仕入先マスタ。①で埋まらなかったものだけ。
+  //    ⚠こちらはロジザード由来のコードなので、NE のコードと体系が違えば別の会社の名前が出る余地がある。
+  //    **生コードの完全一致を先に**見て、当たらなければ正規形 (先頭ゼロ違い) で見る。
+  //    同じ正規形に別名が2つ以上ぶら下がっていたら、どちらか分からないので**名前を出さない** (Codex R1 Medium)
+  if (tableExists(db, 'po_suppliers')) {
+    // 正規化は parseInt を通るので、桁が大きすぎる数字コードは丸められて別のコードと同じ形になりうる。
+    // そういうコードは完全一致だけで見る
+    const normSafe = (v) => {
+      const s = String(v == null ? '' : v).trim();
+      if (/^\d+$/.test(s) && !Number.isSafeInteger(Number(s))) return null;
+      return normSupplierCode(s) || null;
+    };
+    const exact = new Map();
+    const byNorm = new Map();
+    for (const r of db.prepare('SELECT supplier_code, name FROM po_suppliers').all()) {
+      const raw = String(r.supplier_code == null ? '' : r.supplier_code).trim();
+      if (!raw || !r.name) continue;
+      if (!exact.has(raw)) exact.set(raw, r.name);
+      const key = normSafe(raw);
+      if (!key) continue;
+      const cur = byNorm.get(key);
+      if (cur === undefined) byNorm.set(key, r.name);
+      else if (cur !== null && cur !== r.name) byNorm.set(key, null);   // 別名が2つ = 決められない
+    }
+    for (const c of want) {
+      if (out.has(c)) continue;
+      const key = normSafe(c);
+      const hit = exact.get(c) ?? (key ? byNorm.get(key) : null);
+      if (hit) out.set(c, hit);
+    }
+  }
+  return out;
+}
+
 /** 仕入先の一覧 (商品マスタに紐づくものだけ・商品数つき)。絞り込みのプルダウン用 */
 export function listProductSuppliers({ includeInactive = false } = {}) {
   const db = getDB();
   if (!tableExists(db, 'mirror_products')) return [];
-  const hasSup = tableExists(db, 'po_suppliers');
   const where = includeInactive ? '' : "AND p.取扱区分 = '取扱中'";
-  return db.prepare(`SELECT p.仕入先コード AS code, ${hasSup ? 's.name' : 'NULL'} AS name, COUNT(*) AS products
-    FROM mirror_products p ${hasSup ? 'LEFT JOIN po_suppliers s ON s.supplier_code = p.仕入先コード' : ''}
+  const rows = db.prepare(`SELECT p.仕入先コード AS code, COUNT(*) AS products
+    FROM mirror_products p
     WHERE p.仕入先コード IS NOT NULL AND trim(p.仕入先コード) <> '' AND p.商品区分 = '単品' ${where}
-    GROUP BY p.仕入先コード ORDER BY products DESC, code`).all();
+    GROUP BY p.仕入先コード`).all();
+  const names = supplierNameMap(db, rows.map(r => r.code));
+  for (const r of rows) r.name = names.get(String(r.code || '').trim()) || null;
+  // 名前が分かるものを先に (現場は名前で探すため)。同じなら商品数の多い順
+  rows.sort((a, b) => (a.name ? 0 : 1) - (b.name ? 0 : 1)
+    || (a.name && b.name ? a.name.localeCompare(b.name, 'ja') : 0)
+    || b.products - a.products
+    || String(a.code).localeCompare(String(b.code)));
+  return rows;
 }
 
 /**
@@ -1119,7 +1211,6 @@ export function listProductSuppliers({ includeInactive = false } = {}) {
 export function searchProducts({ supplier = null, q = '', includeInactive = false, limit = 50, offset = 0 } = {}) {
   const db = getDB();
   if (!tableExists(db, 'mirror_products')) return { rows: [], total: 0, missing_master: true };
-  const hasSup = tableExists(db, 'po_suppliers');
   const conds = ["p.商品区分 = '単品'"];
   const args = [];
   if (!includeInactive) conds.push("p.取扱区分 = '取扱中'");
@@ -1128,8 +1219,16 @@ export function searchProducts({ supplier = null, q = '', includeInactive = fals
   if (term) {
     // \ (ESCAPE 文字そのもの) も含めて逃がす (Codex R1 Medium)
     const like = `%${term.replace(/[\\%_]/g, (c) => '\\' + c)}%`;
-    conds.push(`(p.商品名 LIKE ? ESCAPE '\\' OR p.商品コード LIKE ? ESCAPE '\\' OR LOWER(TRIM(p.商品コード)) IN (SELECT code_key FROM f_inbound_check_barcodes WHERE barcode LIKE ? ESCAPE '\\'))`);
+    // バーコードは**マスタと控えの両方**を見る。📷 カメラで読んだ JAN はここに完全一致で当たる
+    // (マスタは1商品に複数行あるので、どのバーコードから読んでも同じ商品に行き着く)
+    const hasBcMaster = tableExists(db, 'f_inbound_check_barcode_master');
+    const bcSub = hasBcMaster
+      ? `SELECT code_key FROM f_inbound_check_barcodes WHERE barcode LIKE ? ESCAPE '\\'
+         UNION SELECT code_key FROM f_inbound_check_barcode_master WHERE barcode LIKE ? ESCAPE '\\'`
+      : `SELECT code_key FROM f_inbound_check_barcodes WHERE barcode LIKE ? ESCAPE '\\'`;
+    conds.push(`(p.商品名 LIKE ? ESCAPE '\\' OR p.商品コード LIKE ? ESCAPE '\\' OR LOWER(TRIM(p.商品コード)) IN (${bcSub}))`);
     args.push(like, like, like);
+    if (hasBcMaster) args.push(like);
   }
   // limit / offset は整数だけ (小数・Infinity・巨大値は SQLite の LIMIT で型エラー → 500 になる。Codex R1 Low)
   const limN = Number(limit), offN = Number(offset);
@@ -1138,9 +1237,11 @@ export function searchProducts({ supplier = null, q = '', includeInactive = fals
   const whereSql = conds.join(' AND ');
   const total = db.prepare(`SELECT COUNT(*) AS n FROM mirror_products p WHERE ${whereSql}`).get(...args).n;
   const rows = db.prepare(`SELECT p.商品コード AS product_id, p.商品名 AS product_name, p.取扱区分 AS handling,
-      p.仕入先コード AS supplier_code, ${hasSup ? 's.name' : 'NULL'} AS supplier_name
-    FROM mirror_products p ${hasSup ? 'LEFT JOIN po_suppliers s ON s.supplier_code = p.仕入先コード' : ''}
+      p.仕入先コード AS supplier_code
+    FROM mirror_products p
     WHERE ${whereSql} ORDER BY p.商品名 LIMIT ? OFFSET ?`).all(...args, lim, off);
+  const supNames = supplierNameMap(db, rows.map(r => r.supplier_code));
+  for (const r of rows) r.supplier_name = supNames.get(String(r.supplier_code || '').trim()) || null;
   const keys = rows.map(r => codeKeyOf(r.product_id));
   const info = productInfoMap(keys);
   for (const r of rows) {

@@ -27,6 +27,7 @@
 | `/apps/inbound-check/api/done` `/done.csv` | 同上 | 完了一覧の JSON / CSV |
 | `/apps/inbound-check/admin/destinations(.csv)` | ポータルセッション | 行き先の台帳 (いろはへ送る商品の一覧) |
 | `/apps/inbound-check/admin/fetch-product-master` (POST) | ポータルセッション | ロジザード商品マスタを今すぐ取り込む |
+| `/apps/inbound-check/admin/fetch-barcode-master` (POST) | ポータルセッション | バーコードマスタ (バーコードマスタ.csv) を今すぐ取り込む |
 | `/apps/inbound-check/admin` | ポータルセッション (アプリ権限) | 管理画面。CSV 取込はアプリ利用者全員 |
 | `/apps/inbound-check/admin/devices` `/workers` `/history(.csv)` | admin のみ | 端末登録・作業者・履歴 |
 | `/apps/inbound-check/device/exit` (POST) | 端末 | 端末Cookie を外す |
@@ -75,18 +76,39 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
 仕入先から商品を絞り込めるとありがたい」。
 
 - 画面 = `/apps/inbound-check/products` (`views/products.html`。端末Cookie / セッション、作業画面と同じ入口)。
-  仕入先 (`mirror_products.仕入先コード` → `po_suppliers.name`) のプルダウン + 商品名/コード/JAN の検索。単品のみ・既定は取扱中
+  仕入先のプルダウン + 商品名/コード/JAN の検索 + 📷 カメラ読み取り。単品のみ・既定は取扱中
+- 🚨 **仕入先名はコードの持ち方が2系統ある**ので SQL の素の結合では引けない (2026-09-06 修正):
+  `mirror_products.仕入先コード` は NE の生コード (ゼロ埋め `0007` がある) / `po_suppliers.supplier_code` は発注管理の**正規形** (`7`)。
+  `supplierNameMap()` が `normSupplierCode` (発注管理と同じ関数) を通して突き合わせ、発注管理に無ければ
+  `supplier_share_master.表示名` (売れ筋共有・NE の生コード) を使う。どちらにも無ければコードだけ出す
 - API = `GET /api/products/suppliers` / `GET /api/products` (行に入庫情報・ピックロケ・期限管理・バーコード・直近の印刷ジョブ) /
-  `POST /api/products/barcode` (バーコードの手入力)。編集は既存 `/api/info` `/api/info/register` `/api/product-flags` をそのまま使う
-- 🚨 **Render に完全なバーコードマスタは無い** (ロジザード商品マスタ CSV にバーコード列は無く、在庫ミラーは在庫ゼロの商品の行が消え、
-  値札CSVは入荷予定7日分だけ)。→ `f_inbound_check_barcodes` (控え) を置き、`resolveBarcode()` が
-  取込行 → 在庫ミラー → 入荷予定 → 控え の順に探して**見つけたら控える**。無ければ人が入れる (`source='manual'`。JAN=数字のみ / FNSKU=英数字)
+  `POST /api/products/barcode` (バーコードの手入力) / `POST /api/products/print-status` (表示中の商品の印刷状況)。
+  編集は既存 `/api/info` `/api/info/register` `/api/product-flags` をそのまま使う
+- 🔢 **バーコードの正本 = 共有ドライブの `バーコードマスタ.csv`** (`f_inbound_check_barcode_master`。2026-09-06 追加)。
+  ロジザード エクスポート[FM08_01] 種類=バーコード の出力 (列 = 商品ID / 商品名 / 検索名称 / バーコード / 有効区分) を
+  `barcode-master.js` が**全量置換**で取り込む。30分の巡回に相乗り (`runScheduledBarcodeFetch`。中身が同じならスキップ) +
+  管理画面「🔢 バーコードマスタを今すぐ取り込む」。取得先 = env `INBOUND_CHECK_BARCODE_FOLDER_ID` / `INBOUND_CHECK_BARCODE_FILE`
+  (既定 `0AN1RrVoXZhRqUk9PVA` / `バーコードマスタ.csv`。**値札CSVとは別の共有ドライブ**なので、そのフォルダを
+  Render のサービスアカウント `bfaith-portal@balmy-coral-488521-v4.iam.gserviceaccount.com` に閲覧者以上で共有しておく必要がある。
+  共有できない場合は、CSV を値札CSVと同じ共有ドライブに置いて `INBOUND_CHECK_BARCODE_FOLDER_ID=0AOG4tof0TAHFUk9PVA` にしてもよい)
+  - **1商品に複数のバーコードが載る** (JAN と FNSKU が別行) ので barcode が主キー。全部持つ = 📷 でどれを読んでも商品が引ける。
+    値札に刷るのは `rank=0` の代表 = **チェックデジットまで正しい GTIN** (JAN-8/UPC-A/JAN-13/GTIN-14) → FNSKU → その他の数字列 の順。
+    有効区分は**値で判断しない** (内訳を管理画面に出して人が見る)
+  - 全量置換ゆえの安全弁: 同じバーコードが**別の商品**に付いていたら取込ごと拒否 / 前回より **2割以上減っていたら拒否** (CSV が途中で切れた疑い。
+    人が「件数が減っても取り込む」を選べば通る) / 取り込んだ **Drive の更新時刻**を覚えていて、それより古い CSV は後から来てもコミットしない。
+    取込は cron でも管理画面でも1本の列に並べる (先に落とした古い内容で新しいマスタを巻き戻さない)
+- `resolveBarcode()` の順 = **マスタ** → 取込行 → 在庫ミラー → 入荷予定 → 控え (`f_inbound_check_barcodes`)。
+  伝票からの発行も同じ: マスタにあればマスタ、無ければ**その明細自身の値**、それも無ければ在庫→予定→控え
+  取込行〜入荷予定で見つけたら控えに写す (在庫が消えても引ける)。どこにも無ければ人が入れる (`source='manual'`)。
+  ロジザード側 (マスタ含む) に値がある商品は画面で直せない (`readonly_barcode` 409)
+- 📷 カメラ = `BarcodeDetector` (iPadOS 17+)。読んだ値を検索欄に入れて検索するだけ。
+  使えない端末には「検索欄を長押し →『テキストをスキャン』」を案内する (いろは作業アプリと同じ作り)
 - 値札は**同じ印刷キュー** (`enqueuePrintJob` の `source='product'`)。刷る内容は画面の値でなく商品マスタ+控えから取る。
   進行中/結果不明の扱い (in_progress / confirm_unknown / state_changed) は伝票からの発行と同じ。**見張りは商品単位 (code_key)**: 伝票から刷っても商品画面から刷っても紙は同じ1枚なので、片方が進行中/結果不明ならもう片方からも積まない (伝票の作り直しをまたいでも同じ)。商品ごとの最新ジョブ (どちらの発行でも) = `latestJobsForProducts`
   刷るバーコードは伝票からでも商品画面からでも **resolveBarcode の値** (ロジザード側 → 控え)。ロジザード側に値がある商品は画面で直せない (readonly_barcode 409)。画面から来た値は 控えが無ければ保存してから刷り、控えと違えば `state_changed` で積まない (別の人が直した後の古い入力で違うシールを出さない)。控えの保存 `POST /api/products/barcode` も `expected` (画面が見ていた値) が今と違えば 409
 - スキーマ: `f_inbound_check_print_jobs` は `source` 列 + `batch_id`/`line_key` NULL 可 に**作り直し** (`ensurePrintJobsTable`。
   CREATE IF NOT EXISTS では列も NOT NULL も変わらないため、旧版を検知して行を写す。進行中ジョブも id ごと引き継ぐ)
-- テスト: `node scripts/test-inbound-check-products.mjs`
+- テスト: `node scripts/test-inbound-check-products.mjs` / `node scripts/test-inbound-check-barcode-master.mjs` (仕入先名・バーコードマスタ・読んだ値での検索)
 
 ## 🚚 いま入荷を取りに行く — 予定外の納品を定時を待たずに出す (2026-09-05)
 

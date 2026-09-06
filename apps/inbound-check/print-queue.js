@@ -179,10 +179,15 @@ export function enqueuePrintJob({ batchId, lineKey, productCode = null, barcodeO
       // 刷る値は **その明細自身のバーコード** が最優先 (同じ商品が同じ伝票に複数行あって値が違うことがある。Codex R3 Medium-2)。
       // 明細に値が無い (ロジザード未登録) ときだけ、商品モードと同じ経路 (resolveBarcode: 在庫 → 入荷予定 → 控え) に落ちる —
       // 🔍 商品画面で入れた控えがあれば伝票からも刷れる (Codex R2 High-2)
-      // 明細に値があるのに刷れない形 (記号入りなど) のときは、その値のまま拒否する — 他所の値でこっそり刷らない。
-      // 明細が空のときだけ 在庫 → 入荷予定 → 控え に落ちる
+      // 刷る値の決め方 (伝票からの発行):
+      //   ① バーコードマスタにあればそれ (正本。ロジザードで直したら伝票の取込値より新しい。Codex R1 High-1)
+      //   ② 無ければ**その明細自身の値** (同じ商品が同じ伝票に複数行あって値が違うことがある。Codex R3 Medium-2)。
+      //      明細に値があるのに刷れない形 (記号入りなど) のときは、その値のまま拒否する — 他所の値でこっそり刷らない
+      //   ③ 明細も空なら 在庫 → 入荷予定 → 控え
       const own = String(line.barcode == null ? '' : line.barcode).trim();
-      const bc = own ? { barcode: own } : resolveBarcode(line.code_key, db);
+      const resolved = resolveBarcode(line.code_key, db);
+      const bc = (resolved && resolved.source === 'master') ? resolved
+        : own ? { barcode: own } : resolved;
       subject = { codeKey: line.code_key, productCode: line.product_id, productName: line.product_name, barcode: bc ? bc.barcode : null, batchId: bid, lineKey: key };
     } else {
       // 商品マスタから。バーコードは取込行 → 在庫ミラー → 入荷予定 → 控え (f_inbound_check_barcodes) の順に探す。
