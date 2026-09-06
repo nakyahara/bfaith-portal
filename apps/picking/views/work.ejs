@@ -204,6 +204,8 @@
   </div>
   <div id="offline">オフライン — 操作は保存され、復帰後に自動送信されます</div>
   <div id="syncerr"></div>
+  <%# 欠品の判断を確定したあとの一言 (例外処理監査 U-10: 「後で」を押しても何も出ずに次へ進んでいた) %>
+  <div id="pkToast" style="display:none; position:fixed; left:50%; bottom:130px; transform:translateX(-50%); max-width:92%; background:#2b8a3e; color:#fff; padding:10px 16px; border-radius:12px; font-weight:800; font-size:15px; text-align:center; z-index:60; box-shadow:0 4px 16px rgba(0,0,0,.4)"></div>
 
   <!-- 開始画面 -->
   <div class="screen" id="scr-start">
@@ -819,7 +821,20 @@
         remaining: remaining || null,
       });
       if (navigator.vibrate) navigator.vibrate([30, 50, 30]);
+      // 何を誰に伝えたかを一言 (次の明細に進んでも「どこだったっけ」にならないように)
+      pkToast(remaining === 'later'
+        ? '🕒 1階に伝えました。一覧に「後で取りに行く」のバッチが出ます'
+        : remaining === 'none'
+          ? '❌ 1階に「どこにもない」を伝えました (その伝票は1階が出荷保留にします)'
+          : '📦 他のロケで確保: 事務に在庫の修正を伝えました');
       render();
+    }
+    function pkToast(msg) {
+      const el = $('pkToast');
+      el.textContent = msg;
+      el.style.display = 'block';
+      clearTimeout(pkToast._t);
+      pkToast._t = setTimeout(() => { el.style.display = 'none'; }, 4500);
     }
 
     // ── 中断 / 再開 / 取消 ──

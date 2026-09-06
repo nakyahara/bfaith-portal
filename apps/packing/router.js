@@ -30,7 +30,7 @@ import {
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, SHIP_CHANGE_TWO_LABELS, lastDoneSeqOf, getDailySummary,
   resolveIncident, lineKindOf, batchHikiateClass, batchClassInfo, listLineRuns, lineDailyTotal, listRepickReady,
-  claimStockoutNotify, markStockoutNotify,
+  claimStockoutNotify, markStockoutNotify, shortageSummaryFor,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText, notifyStockout } from './notify.js';
 import {
@@ -331,6 +331,7 @@ router.get('/', (req, res) => {
     b.hikiateClass = cls.name;
     b.classSource = cls.source;   // 'suggested' なら画面で「推定」と分かるようにする
     b.lineKind = lineKindOf(b.hikiateClass);
+    b.shortage = shortageSummaryFor(b);   // 🚫在庫なし待ち / ⏳再ピック待ち / 出荷保留 の件数 (PR-2)
   }
   res.render(path.join(__dirname, 'views/batches'), {
     title: '梱包支援',
@@ -487,6 +488,7 @@ router.get('/line/:id(\\d+)', (req, res) => {
       seq: x.seq, neSlipNo: x.ne_slip_no, slipNo: x.slip_no, siteOrderNo: x.site_order_no || null,
       recipientName: x.recipient_name || null, deliveryMethod: x.delivery_method || null,
       status: x.status, holdReason: x.hold_reason || null,
+      pickingShortages: x.pickingShortages || [],   // 🕒/❌ (PR-2: ライン画面にも出す)
       lines: x.lines.map((l) => ({ sku: l.sku, name: l.print_name || l.product_name || l.sku, qty: l.qty })),
     }));
     incidents = st.incidents.map((i) => ({ id: i.id, slipSeq: i.slip_seq, kind: i.kind, sku: i.sku, qty: i.qty }));

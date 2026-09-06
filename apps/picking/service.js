@@ -1199,6 +1199,8 @@ function undoShortageSideEffects(db, batchId, lineSeq, now) {
   }
   db.prepare('DELETE FROM pk_shortage_allocations WHERE batch_id=? AND line_seq=?')
     .run(batchId, lineSeq);
+  // 1階へ出した欠品バナー (🕒/❌) も閉じる (取り消した欠品が1階に残らない)。同一トランザクション・失敗は伝播
+  resolveFloorAlertsByRef(`alloc:${batchId}:${lineSeq}:`, { prefix: true, dbh: db });
 }
 
 /**
@@ -1250,9 +1252,18 @@ function recordShortageAllocations(db, batch, line, lineSeq, { remQty, rem, work
 /** 通知・画面用: その明細の配賦先 (受注×数量)。テーブル未作成環境では空。 */
 export function listShortageAllocations(batchId, lineSeq) {
   try {
-    return getDB().prepare(`SELECT ne_slip_no, qty, kind FROM pk_shortage_allocations
+    return getDB().prepare(`SELECT id, ne_slip_no, qty, kind, created_at FROM pk_shortage_allocations
       WHERE batch_id=? AND line_seq=? ORDER BY id`).all(batchId, lineSeq);
   } catch { return []; }
+}
+
+/**
+ * 欠品バナー (pk_floor_alerts.ref_key) のキー = 配賦 1 行。配賦 ID を含める = 戻る→再欠品で作り直された配賦は
+ * 別キーになり、1階が閉じた古いバナーと同一秒でも衝突しない (Codex R2 High)。packing 側の解決もこれを使う。
+ * @param {{batch_id:number, line_seq:number, ne_slip_no:string, id:number}} a 配賦行
+ */
+export function shortageAllocRefKey(a) {
+  return `alloc:${a.batch_id}:${a.line_seq}:${a.ne_slip_no}:${a.id}`;
 }
 
 /**
@@ -1468,6 +1479,8 @@ export function reconcileRepickBatches() {
   // 「後で取りに行く」依頼の展開 (欠品時に梱包が未取込だった分の追いつき)。
   // 展開されたタスクは直後の②で「🕒後で取りに行く」1行バッチになる
   try { bindPendingLaterRequests(); } catch { /* fail-soft */ }
+  // 1階の欠品バナー (🕒/❌) も収束させる (取込前の欠品・障害で作れなかった分の追いつき)
+  try { reconcileShortageAlerts(); } catch { /* fail-soft */ }
   try {
     // ①梱包側で取消されたタスクのバッチを畳む
     const rows = db.prepare(`
@@ -1508,10 +1521,13 @@ export const FLOOR_ALERT_KINDS = {
   repick_done: { direction: 'to_packing', message: null },   // 不足分ピッキング完了 (メッセージは依頼ごとに動的)
   // 3階「在庫なし」→ 1階の全端末へ (例外処理監査 PR-1)。メッセージは依頼ごとに動的・link で対象伝票へ飛ぶ
   stockout: { direction: 'to_packing', message: null },
+  // ピッカーの欠品 (🕒 後で取りに行く / ❌ どこにもない) → 1階の全端末へ (例外処理監査 PR-2・Q2 決定 2026-09-05)。
+  // 配賦した受注 (伝票) ごとに1本。ref_key='alloc:<batch>:<seq>:<ne_slip_no>' で back / 1階の処理と同時に閉じる
+  picking_shortage: { direction: 'to_packing', message: null },
 };
 
 /** アラート発報。同種の未確認が生きていれば重ねない (連打・二重依頼の集約)。 */
-export function createFloorAlert(kind, requestedBy, customMessage = null, link = null, taskId = null) {
+export function createFloorAlert(kind, requestedBy, customMessage = null, link = null, taskId = null, refKey = null) {
   const def = FLOOR_ALERT_KINDS[kind];
   if (!def) throw new PkError(400, 'bad_kind', '不明なアラート種別です');
   const message = def.message || String(customMessage || '').slice(0, 160);
@@ -1519,18 +1535,29 @@ export function createFloorAlert(kind, requestedBy, customMessage = null, link =
   const db = getDB();
   // 集約チェック+INSERTは同一トランザクション (Codex: 同時押下の重複防止)。
   // 集約キーは (kind, message) — repick_done は依頼ごとにメッセージが違うため別々に出る。
-  // task_id 付き (在庫なし) は (kind, task_id) で集約 = 同じタスクの未解決バナーは1本だけ
+  // task_id 付き (在庫なし) は (kind, task_id)、ref_key 付き (欠品の配賦) は (kind, ref_key) で集約 = 未解決バナーは1本だけ
   return db.transaction(() => {
     const dup = taskId != null
-      ? db.prepare(`SELECT id FROM pk_floor_alerts
+      ? db.prepare(`SELECT id, message, link FROM pk_floor_alerts
           WHERE kind = ? AND task_id = ? AND acked_at IS NULL AND resolved_at IS NULL`).get(kind, taskId)
-      : db.prepare(`SELECT id FROM pk_floor_alerts
+      : refKey
+        ? db.prepare(`SELECT id, message, link FROM pk_floor_alerts
+          WHERE kind = ? AND ref_key = ? AND acked_at IS NULL AND resolved_at IS NULL`).get(kind, refKey)
+        : db.prepare(`SELECT id, message, link FROM pk_floor_alerts
           WHERE kind = ? AND message = ? AND acked_at IS NULL AND resolved_at IS NULL AND created_at >= datetime('now', '-4 hours')`).get(kind, message);
-    if (dup) return { id: dup.id, existed: true };
+    if (dup) {
+      // ref_key 付きは内容を更新する (梱包バッチの取込・再取込で伝票番号やリンクが変わる — Codex R1 High)
+      const newLink = link ? String(link).slice(0, 200) : null;
+      if (refKey && (dup.message !== message || (dup.link || null) !== newLink)) {
+        db.prepare('UPDATE pk_floor_alerts SET message=?, link=? WHERE id=?').run(message, newLink, dup.id);
+        return { id: dup.id, existed: true, updated: true };
+      }
+      return { id: dup.id, existed: true };
+    }
     const info = db.prepare(`
-      INSERT INTO pk_floor_alerts (direction, kind, message, requested_by, created_at, link, task_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(def.direction, kind, message, requestedBy || null, utcNow(), link ? String(link).slice(0, 200) : null, taskId);
+      INSERT INTO pk_floor_alerts (direction, kind, message, requested_by, created_at, link, task_id, ref_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(def.direction, kind, message, requestedBy || null, utcNow(), link ? String(link).slice(0, 200) : null, taskId, refKey);
     return { id: Number(info.lastInsertRowid), existed: false };
   }).immediate();
 }
@@ -1538,10 +1565,110 @@ export function createFloorAlert(kind, requestedBy, customMessage = null, link =
 /** 表示対象 (未確認・未解決・4時間以内 — 古いバナーを翌日まで残さない)。 */
 export function listFloorAlerts(direction) {
   return getDB().prepare(`
-    SELECT id, kind, message, requested_by, created_at, link, task_id FROM pk_floor_alerts
+    SELECT id, kind, message, requested_by, created_at, link, task_id, ref_key FROM pk_floor_alerts
     WHERE direction = ? AND acked_at IS NULL AND resolved_at IS NULL AND created_at >= datetime('now', '-4 hours')
     ORDER BY id
   `).all(direction);
+}
+
+/**
+ * ref_key で紐づくバナーを閉じる (ピッカーの欠品バナー)。prefix=true なら前方一致 (back で明細ぶん全部、
+ * 1階の処理で受注ぶん全部)。packing のトランザクション内からは同じ接続 (dbh) で呼ぶ
+ */
+export function resolveFloorAlertsByRef(refKey, { prefix = false, dbh = null, failSoft = false } = {}) {
+  // 業務トランザクションの中 (stockout_ack / receive / back) では例外を伝播させる — 握りつぶすと
+  // 業務更新だけ commit されてバナーが残る (Codex R2 Low)。旧環境の表示補助だけ failSoft
+  const run = () => {
+    const d = dbh || getDB();
+    if (prefix) {
+      // LIKE のメタ文字 (% _) をエスケープして前方一致だけにする
+      const esc = String(refKey).replace(/[\\%_]/g, (c) => `\\${c}`);
+      return d.prepare(`UPDATE pk_floor_alerts SET resolved_at=? WHERE ref_key LIKE ? ESCAPE '\\' AND resolved_at IS NULL`)
+        .run(utcNow(), `${esc}%`).changes;
+    }
+    return d.prepare(`UPDATE pk_floor_alerts SET resolved_at=? WHERE ref_key = ? AND resolved_at IS NULL`).run(utcNow(), refKey).changes;
+  };
+  if (!failSoft) return run();
+  try { return run(); } catch { return 0; }
+}
+
+/**
+ * ピッカーの欠品 (🕒 後で取りに行く / ❌ どこにもない) を1階の全端末へ知らせる (例外処理監査 PR-2)。
+ * 配賦した受注 (伝票) ごとに1本。梱包バッチが取込済みなら対象伝票へのリンクを付ける。
+ * 他ロケで全量確保した欠品 (remaining なし) は1階に関係ないので出さない。
+ * 正本は pk_shortage_allocations。冪等 (ref_key で集約・内容が変われば更新) なので、shortage 直後だけでなく
+ * replay・ピッキング一覧の表示・梱包バッチの取込/再取込からも呼んで収束させる (Codex R1 High: 一度きりだと恒久的に漏れる)。
+ * @param workerName 省略時はその明細の欠品イベントの担当者
+ * @returns 作った/更新したバナーの数
+ */
+export function announceShortageToPacking(batchId, lineSeq, workerName = null) {
+  const db = getDB();
+  const line = db.prepare('SELECT * FROM pk_lines WHERE batch_id=? AND seq=?').get(batchId, lineSeq);
+  if (!line || line.status !== 'shortage' || !line.remaining) return 0;
+  const batch = getBatch(batchId);
+  if (!batch || batch.origin === 'repick') return 0;
+  const ev = db.prepare(`SELECT worker, at FROM pk_events WHERE batch_id=? AND line_seq=? AND event='shortage' ORDER BY id DESC LIMIT 1`)
+    .get(batchId, lineSeq);
+  const who = workerName || ev?.worker || batch.worker || '-';
+  const when = ev?.at || utcNow();
+  let pb = null;
+  try {
+    // 突合済みの梱包バッチ (pk_batch_id) を優先。無ければ tb_key で
+    // 突合済み (pk_batch_id = 自分) を優先。tb_key の代替は「未突合」の梱包バッチだけ — 別の picking バッチに突合済みの
+    // ものへリンクすると、梱包側 (pickingBatchIdFor) はその配賦を見せないので「バナーはあるが確認できない」になる (Codex R2)
+    pb = db.prepare(`SELECT id FROM pk_pack_batches WHERE pk_batch_id=? AND validity='valid' AND status != 'cancelled' ORDER BY id DESC LIMIT 1`).get(batchId)
+      || db.prepare(`SELECT id FROM pk_pack_batches WHERE tb_key=? AND pk_batch_id IS NULL AND validity='valid' AND status != 'cancelled' ORDER BY id DESC LIMIT 1`).get(batch.tb_no)
+      || null;
+  } catch { pb = null; }
+  const jstHm = (iso) => { const t = Date.parse(iso || ''); return Number.isFinite(t) ? new Date(t + 9 * 3600e3).toISOString().slice(11, 16) : ''; };
+  // 1階が既に処理したバナー (× で閉じた / 在庫なし確認・受領で resolved) は収束で復活させない。
+  // キーに配賦 ID が入っているので、戻る→再欠品で作り直された配賦は別キー = 新しいバナーが出る (同一秒でも — Codex R2)
+  const handled = db.prepare(`SELECT 1 FROM pk_floor_alerts
+    WHERE kind='picking_shortage' AND ref_key=? AND (resolved_at IS NOT NULL OR acked_at IS NOT NULL) LIMIT 1`);
+  let made = 0;
+  for (const a of listShortageAllocations(batchId, lineSeq)) {
+    const refKey = shortageAllocRefKey({ batch_id: batchId, line_seq: lineSeq, ne_slip_no: a.ne_slip_no, id: a.id });
+    if (handled.get(refKey)) continue;
+    let slip = null;
+    if (pb) {
+      try { slip = db.prepare('SELECT seq FROM pk_pack_slips WHERE batch_id=? AND ne_slip_no=?').get(pb.id, a.ne_slip_no) || null; } catch { slip = null; }
+    }
+    const ref = `${batch.folder_name || '-'}${slip ? ` #${slip.seq}` : ` (NE ${a.ne_slip_no})`}`;
+    const name = line.product_name || line.sku;
+    const msg = a.kind === 'none'
+      ? `❌ ${ref} ${name} ×${a.qty} — どのロケにもありません (在庫なし) — 3階 ${who} ${jstHm(when)}`
+      : `🕒 ${ref} ${name} ×${a.qty} — 後で取りに行きます (届いたら受け取り) — 3階 ${who} ${jstHm(when)}`;
+    const link = pb ? `/apps/packing/work/${pb.id}${slip ? `?seq=${slip.seq}` : ''}` : null;
+    try {
+      const r = createFloorAlert('picking_shortage', who, msg, link, null, refKey);
+      if (!r.existed || r.updated) made++;
+    } catch (e) { console.warn(`[picking] 欠品バナーの発報失敗: ${e.message}`); }
+  }
+  return made;
+}
+
+/**
+ * 欠品バナーの収束 (Codex R1 High): 配賦が残っている明細すべてについて announce を呼び直す。
+ * 呼び出し = ピッキング一覧の表示 (reconcileRepickBatches) / 梱包バッチの取込・再取込 (importPackBatch の後)。
+ * @param {{tbNo?: string, batchId?: number, sinceDays?: number}} opts 絞り込み (省略時は直近2日のバッチ)
+ */
+export function reconcileShortageAlerts({ tbNo = null, batchId = null, sinceDays = 2 } = {}) {
+  const db = getDB();
+  let rows = [];
+  try {
+    rows = db.prepare(`
+      SELECT DISTINCT a.batch_id, a.line_seq FROM pk_shortage_allocations a
+      JOIN pk_batches b ON b.id = a.batch_id
+      WHERE b.validity = 'valid' AND b.status != 'cancelled'
+        AND (? IS NULL OR b.tb_no = ?) AND (? IS NULL OR b.id = ?)
+        AND (? IS NOT NULL OR ? IS NOT NULL OR b.work_date >= date('now', ?))
+    `).all(tbNo, tbNo, batchId, batchId, tbNo, batchId, `-${Math.max(0, sinceDays)} days`);
+  } catch { return 0; }
+  let n = 0;
+  for (const r of rows) {
+    try { n += announceShortageToPacking(r.batch_id, r.line_seq); } catch (e) { console.warn(`[picking] 欠品バナーの収束失敗: ${e.message}`); }
+  }
+  return n;
 }
 
 /**

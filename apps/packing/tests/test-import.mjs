@@ -22,7 +22,7 @@ const {
   listPackLinesBySlip, jstToday,
 } = await import('../db.js');
 // picking 側 (突合相手)。同じ picking.db に同居する
-const { parseCs03002, importBatch: importPickingBatch } = await import('../../picking/service.js');
+const { parseCs03002, importBatch: importPickingBatch, applyEvent: pkApplyEvent, listFloorAlerts } = await import('../../picking/service.js');
 const { initPickingDB } = await import('../../picking/db.js');
 
 initPickingDB();
@@ -415,6 +415,21 @@ t('replayで突合結果が最新化される (no_picking承認後にCS03002が�
   const b = getPackBatch(r.batchId);
   assert.equal(b.match_status, 'ok');
   assert.ok(b.pk_batch_id > 0);
+});
+
+t('replay の突合更新でも欠品バナーが収束する (伝票 #seq とリンクが付く — Codex R2 Medium)', () => {
+  const pk = getDB().prepare("SELECT id FROM pk_batches WHERE tb_no='TB88888888888' AND validity='valid'").get().id;
+  pkApplyEvent(pk, { opId: 'imp-sv-1', event: 'start' }, '有國陽');
+  pkApplyEvent(pk, { opId: 'imp-sv-2', event: 'shortage', lineSeq: 1, shortageQty: 1, altQty: 0, remaining: 'none' }, '有國陽');
+  const p = parseCs03003(makeCsv([
+    row({ slip: '0050', sku: 'x', tb: 'TB88888888888' }),
+  ]));
+  const r = importPackBatch(p, {}, 'test');
+  assert.equal(r.replayed, true);
+  const a = listFloorAlerts('to_packing').find((x) => x.kind === 'picking_shortage' && x.ref_key.startsWith(`alloc:${pk}:1:`));
+  assert.ok(a, '❌ バナーがある');
+  assert.equal(a.link, `/apps/packing/work/${r.batchId}?seq=1`);
+  assert.match(a.message, /#1 /);
 });
 
 t('replayで突合が悪化する場合 (ok→no_picking) は matchAck が必要 (勝手に承認済みにしない)', () => {

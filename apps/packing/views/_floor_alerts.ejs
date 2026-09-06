@@ -14,12 +14,14 @@
   }
   function render(alerts, ready) {
     var html = alerts.map(function (a) {
-      return '<div style="background:#e03131; color:#fff; padding:14px 16px; display:flex; align-items:center; gap:12px; font-size:18px; font-weight:800; border-bottom:2px solid #fff">'
-        + '<span style="flex:1">' + esc(a.message) + (a.requested_by ? '<small style="font-weight:400">（依頼: ' + esc(a.requested_by) + '）</small>' : '') + '</span>'
+      // 色 = 次の行動: 赤 = 1階が動く (在庫なし・カート等) / 橙 = 3階が後で持ってくる (🕒 待つだけ)
+      var bg = (a.kind === 'picking_shortage' && String(a.message).indexOf('🕒') === 0) ? '#e8590c' : '#e03131';
+      return '<div style="background:' + bg + '; color:#fff; padding:14px 16px; display:flex; align-items:center; gap:12px; font-size:18px; font-weight:800; border-bottom:2px solid #fff">'
+        + '<span style="flex:1">' + esc(a.message) + (a.requested_by && a.kind !== 'picking_shortage' && a.kind !== 'stockout' ? '<small style="font-weight:400">（依頼: ' + esc(a.requested_by) + '）</small>' : '') + '</span>'
         // 対象伝票へのリンク (在庫なしバナー等)。同一サイトの /apps/ 配下だけ通す
         + (a.link && /^\/apps\/[A-Za-z0-9_\-\/?=&.#]*$/.test(String(a.link))
-          ? '<a href="' + esc(a.link) + '" style="padding:10px 20px; border-radius:10px; background:#fff; color:#e03131; font-weight:800; font-size:16px; text-decoration:none; white-space:nowrap">対象伝票を開く</a>' : '')
-        + btn('data-ack="' + a.id + '"', '確認して閉じる', '#e03131', '#fff')
+          ? '<a href="' + esc(a.link) + '" style="padding:10px 20px; border-radius:10px; background:#fff; color:' + bg + '; font-weight:800; font-size:16px; text-decoration:none; white-space:nowrap">対象伝票を開く</a>' : '')
+        + btn('data-ack="' + a.id + '"', '確認して閉じる', bg, '#fff')
         + '</div>';
     }).join('');
     // ready は伝票単位 (その伝票の再ピックが全部完了したものだけ = 受領処理の条件と同じ)
