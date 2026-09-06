@@ -774,7 +774,10 @@
         // 確認した人はサーバーが同じトランザクションで入れている (まだ空の行だけ・入れた人)。
         // 画面から別POSTしないので、通信断で「入れた記録はあるのに確認した人が空」にならない
         closeDialog();
-        showUndoToast(j.placementId, r, qty);
+        // 予告した名前と実際に入った名前がずれることがある (ダイアログを開いている間に別の端末が
+        // 先に入れると、確認した人は「最初に入れた人」= 向こうになる)。黙って違う名前を残さない
+        const noted = !r.check_worker && j.checkWorker && j.checkWorker !== checkDefault ? j.checkWorker : null;
+        showUndoToast(j.placementId, r, qty, noted);
       } else {
         msg.className = 'msg err'; msg.textContent = j.message || '登録できませんでした';
         dlg.querySelector('#d-add').disabled = false;
@@ -862,9 +865,10 @@
   }
   function showSaving(v) { $('#savebar').classList.toggle('hidden', !v); }
 
-  function showUndoToast(placementId, row, qty) {
+  function showUndoToast(placementId, row, qty, checkWorkerNote) {
     $('#toast-root').innerHTML = `<div class="toast">
-      <span>✅ ${esc(shortName(row.product_name, 14))} を ${qty}個 記録しました</span>
+      <span>✅ ${esc(shortName(row.product_name, 14))} を ${qty}個 記録しました${checkWorkerNote
+        ? `<br><small>👤 確認した人は先に入れた <b>${esc(checkWorkerNote)}</b> さんのままです</small>` : ''}</span>
       <button id="undo">元に戻す</button></div>`;
     const t = setTimeout(() => { $('#toast-root').innerHTML = ''; }, 8000);
     $('#undo').addEventListener('click', async () => {
