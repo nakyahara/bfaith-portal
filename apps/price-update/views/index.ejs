@@ -160,8 +160,8 @@
         <thead>
           <tr>
             <th style="width:30px;"><input type="checkbox" id="sel-all"
-              aria-label="送れる単品の行をすべて選ぶ (セットと止まっている行は選ばれません)"
-              title="送れる単品の行をすべて選ぶ / すべて外す。セットと ⛔ の行は選ばれません"></th>
+              aria-label="単品の行をすべて選ぶ (セットの行と ⛔ の行は選ばれません)"
+              title="単品の行をすべて選ぶ / すべて外す。セットの行と ⛔ の行は選ばれません (売価がまだ空の行は選ばれます)"></th>
             <th>モール</th>
             <th class="col-detail">出品コード / SKU</th>
             <th class="col-detail">引き当て</th>
@@ -234,7 +234,8 @@
   let rows = [];
   let inputCodes = [];
   // 「すべて選ぶ」で選んでよい行のキー。★セット行と、止まっている行は入れない
-  // (セットが初期状態で未選択なのは安全のためで、1操作で外してよいものではない)
+  // (セットが初期状態で未選択なのは安全のためで、1操作で外してよいものではない)。
+  // 売価がまだ空の行は入れる — これから入れる行を選べないと「すべて選ぶ」の意味が無い
   let selectableKeys = new Set();
   /** 売価が空なだけの行は「まだ対象でない」。それ以外の理由で止まっている行と区別する */
   const isSendable = (ev) => !!ev && ev.blocks.filter((b) => b !== EMPTY_PRICE_BLOCK).length === 0;
@@ -265,7 +266,9 @@
   let resolving = false;
 
   async function doResolve() {
-    if (resolving) return;                       // 二度押し・検索と再計算の同時押しを止める
+    // 二度押し・検索と再計算の同時押しを止める。★記録中も受け付けない
+    // (待っている間に検索し直されると、確かめたのと違うプレビューを記録してしまう)
+    if (resolving || saving) return;
     const codes = $('codes').value;
     const costOverrides = costOverridesFromForm();   // ★入力を止める前に読む
     resolving = true;
@@ -541,6 +544,11 @@
   async function flushPreview() {
     saving = true;
     setInputsDisabled(true);
+    await settlePreview();
+  }
+
+  /** 待っている入力を送りきって、キューが静止するまで待つ (失敗していれば例外) */
+  async function settlePreview() {
     if (timer) { clearTimeout(timer); timer = null; enqueuePreview(); }
     let last;
     do { last = chain; await chain; } while (last !== chain);
@@ -565,12 +573,19 @@
   }
 
   async function save() {
-    if (!previewId) return;
+    if (!previewId || saving || resolving) return;
+    // ★記録するプレビューをここで固定する。await の後に読むと、
+    //   待っている間に検索し直されたプレビューを記録しかねない
+    const savingPreviewId = previewId;
+    saving = true;
     $('save-btn').disabled = true;
+    $('resolve-btn').disabled = true;
+    $('recost-btn').disabled = true;
     $('save-msg').textContent = '記録中…';
     try {
       await flushPreview();   // 直前の入力を確実にサーバへ反映してから記録する
-      const r = await api('/apps/price-update/api/runs', { previewId, note: $('run-note').value });
+      if (savingPreviewId !== previewId) throw new Error('検索し直されました。表を確かめてからもう一度記録してください');
+      const r = await api('/apps/price-update/api/runs', { previewId: savingPreviewId, note: $('run-note').value });
       location.href = '/apps/price-update/runs/' + r.runId;
     } catch (e) {
       // 失敗した時だけ入力を戻す (成功時は画面遷移するまで止めたまま)
@@ -578,6 +593,8 @@
       setInputsDisabled(false);
       $('save-msg').textContent = 'エラー: ' + e.message;
       $('save-btn').disabled = false;
+      $('resolve-btn').disabled = false;
+      $('recost-btn').disabled = false;
     }
   }
 
@@ -585,10 +602,17 @@
   $('recost-btn').onclick = doResolve;
   $('save-btn').onclick = save;
   $('detail-tgl').onchange = function () { document.body.classList.toggle('show-detail', this.checked); };
-  $('sel-all').onchange = function () {
+  $('sel-all').onchange = async function () {
     const on = this.checked;
+    // ★直前に売価を直していると、その評価がまだ返っていない (250ms まとめ + 往復)。
+    //   古い判定のまま選ぶと、⛔ になったばかりの行を選んでしまう
+    this.disabled = true;
+    try { await settlePreview(); } catch { /* 失敗は save-msg に出ている */ }
+    this.disabled = false;
+    if (saving) return;                 // 待っている間に記録が始まっていたら触らない
+    this.checked = on;                  // 再描画で戻っているので、押した通りに直す
     document.querySelectorAll('.sel').forEach((el) => {
-      // 選ぶのは「送れる単品」だけ。外すときは全部外す (危ない向きには効かせない)
+      // 選ぶのは単品だけ。⛔ の行とセットの行は選ばない。外すときは全部外す (危ない向きには効かせない)
       if (on) { if (selectableKeys.has(el.dataset.key)) el.checked = true; } else { el.checked = false; }
     });
     onInputChange();   // 選び直しもふつうの入力と同じ道を通す (サーバ側の記録とずれないように)
