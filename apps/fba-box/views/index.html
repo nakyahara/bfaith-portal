@@ -373,7 +373,7 @@
     if (!curRunId) return;
     if (dialogOpen && !force) return;   // 入力中に画面を差し替えない
     const resolved = await placeQueue.flush();   // 未確定の割当を同じ request_id で送り直す
-    if (resolved) await showResolvedPlacement(resolved);   // 確定した分は必ず人に見せてから消す
+    if (resolved) showLeftoverPlacement(resolved);   // 確定した分は必ず人に見せてから消す
     try {
       const j = await apiGet('/api/state?run=' + curRunId);
       setOnline(!!j.ok || j._status === 404);
@@ -506,10 +506,14 @@
   }
 
   // ─── ダイアログ部品 ───
-  function openDialog(html) {
+  function openDialog(html, opts) {
     dialogOpen = true;
     $('#ovl-root').innerHTML = `<div class="ovl"><div class="dlg">${html}</div></div>`;
-    $('#ovl-root .ovl').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeDialog(); });
+    // sticky = 背景タップで閉じない。「さらに入れましたか?」の答えを取りこぼすと
+    // 実際に入れた分が記録されない (Codex PQ-R1 high#4)
+    if (!(opts && opts.sticky)) {
+      $('#ovl-root .ovl').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeDialog(); });
+    }
     return $('#ovl-root .dlg');
   }
   function closeDialog() { dialogOpen = false; $('#ovl-root').innerHTML = ''; refresh(true); }
@@ -774,76 +778,101 @@
       // meta = あとで結果を見せるときに要る情報 (裏で送り直して確定したときはダイアログが無い)
       const meta = { productName: r.product_name || r.seller_sku, checkDefault, hadCheckWorker: !!r.check_worker };
       const out = await sendPlacement({ rowId: r.id, boxId: curBoxId, qty, layer, expiry, meta });
-      handlePlaceOutcome(out, { dlg, msg, row: r });
+      await handlePlaceOutcome(out, { dlg, msg, row: r });
     });
   }
 
   /**
    * 投入の結果をさばく。
-   * confirm = 前の1件が確定済みで同じ商品・同じ箱 → 押し直しか本当の2回目か決められないので人に聞く
-   * (Codex PR2.6-R5 high#1・#4。内容の比較で自動判定すると、期限・配置がある投入は二重に入り、
-   *  逆に本物の2回目を飲み込む)
+   * confirm = 前の1件が確定・成功していて同じ商品 → 押し直しか本当の2回目か決められないので人に聞く
+   * (Codex PR2.6-R5 high#1・#4 / PQ-R1 high#1・medium#2)。
+   * showFirst / previousFailed = 先に前の結果を見せてから続ける (見せる前に消さない — PQ-R1 high#2)
    */
-  async function handlePlaceOutcome(out, { dlg, msg, row }) {
-    const reenable = () => { const b = dlg?.querySelector('#d-add'); if (b) b.disabled = false; };
-    if (out.kind === 'blocked') {
-      msg.className = 'msg err';
-      msg.textContent = '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください';
-      setOnline(false); reenable(); return;
+  async function handlePlaceOutcome(out, ctx) {
+    const dlg = ctx && ctx.dlg, msg = ctx && ctx.msg;
+    const reenable = () => { const b = dlg && dlg.querySelector('#d-add'); if (b) b.disabled = false; };
+    const err = (t) => {
+      if (msg) { msg.className = 'msg err'; msg.textContent = t; } else { alert(t); }
+      reenable();
+    };
+    switch (out.kind) {
+      case 'blocked':
+        setOnline(false);
+        return err('前回の記録がまだ送れていません。電波が戻ってからもう一度押してください');
+      case 'storage_failed':
+        return err('この端末では記録を安全に保存できません (プライベートモードになっていませんか)。職員を呼んでください');
+      case 'conflict':
+        refresh(true);
+        return err('別の画面で操作されました。画面を更新してからもう一度押してください');
+      case 'broken':
+        return err('前の記録が読めない形で残っています。職員を呼んでください (再読み込みしてから、箱の中身と画面の数を見くらべてください)');
+      case 'previousFailed':
+        // 前の分は登録できていない = 今回の分を自動で送ると何が入ったか分からなくなる。
+        // まず失敗を見せて、押し直してもらう
+        reenable();
+        return showLeftoverPlacement(out.prev);
+      case 'showFirst':
+        // 別の商品の見せそびれ。見せて ack してから、いま押した分を送り直す
+        reenable();
+        return showLeftoverPlacement(out.prev, async () => {
+          const again = await withSaving(() => placeQueue.send({ body: out.body, meta: out.meta }));
+          await handlePlaceOutcome(again, { row: ctx && ctx.row });
+        });
+      case 'confirm':
+        return askPlacedAgain(out);
+      default:
+        break;
     }
-    if (out.kind === 'confirm') { closeDialog(); askPlacedAgain(out); return; }
-    if (out.alsoResolved) await showResolvedPlacement(out.alsoResolved);   // 別の商品・箱の見せそびれ
     const rec = out.record;
     if (rec.status !== 'resolved') {   // 未確定 — 電波が戻れば同じ request_id で送り直す
-      msg.className = 'msg err';
-      msg.textContent = '通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)';
-      setOnline(false); reenable(); return;
+      setOnline(false);
+      return err('通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)');
     }
     const j = rec.result;
     if (!j.ok) {
       await placeQueue.ack(rec.requestId);
-      msg.className = 'msg err'; msg.textContent = j.message || '登録できませんでした';
-      reenable();
       if (j._status === 409) refresh(true);
-      return;
+      return err(j.message || '登録できませんでした');
     }
     // 確認した人はサーバーが同じトランザクションで入れている (まだ空の行だけ・入れた人)。
     // 画面から別POSTしないので、通信断で「入れた記録はあるのに確認した人が空」にならない
+    setOnline(true);
+    await placeQueue.ack(rec.requestId);   // 押した本人が見ている場面なのでトーストでよい
     closeDialog();
-    await showResolvedPlacement(rec);
+    showUndoToast(j.placementId, { product_name: rec.meta && rec.meta.productName }, rec.body.qty, checkWorkerNoteOf(rec, j));
   }
+  async function withSaving(fn) { showSaving(true); try { return await fn(); } finally { showSaving(false); } }
 
   /**
    * 「前の分は登録できています。そのあと、さらに入れましたか?」
    * 既定 = 入れていない (押し直しだった)。誤って「はい」を押すと二重に記録されるので、
-   * 「いいえ」を大きく上に置く
+   * 「いいえ」を大きく上に置く。**背景タップでは閉じない** (答えを取りこぼすと
+   * 実際に入れた分が記録されない — Codex PQ-R1 high#4)
    */
   function askPlacedAgain(out) {
-    const prevQty = out.prev.body.qty, name = out.prev.meta?.productName || 'この商品';
+    const prevQty = out.prev.body.qty;
+    const name = (out.prev.meta && out.prev.meta.productName) || 'この商品';
+    const boxOf = (id) => (((S && S.boxes) || []).find(b => b.id === id) || {}).box_code || '?';
+    const prevBox = boxOf(out.prev.body.box_id), nowBox = boxOf(out.body.box_id);
     const dlg = openDialog(`
       <h2>⚠ さっきの分は記録できています</h2>
       <div class="pname" style="margin:10px 0">${esc(shortName(name))}</div>
-      <div class="msg" style="color:#2B8A3E; font-weight:700">前に押した <b style="font-size:1.2em">${prevQty}</b>個 は登録できていました
+      <div class="msg" style="color:#2B8A3E; font-weight:700">前に押した <b style="font-size:1.2em">${prevQty}</b>個 (${esc(prevBox)}) は登録できていました
         <small style="display:block; color:#868E96; font-weight:600">通信が切れて画面に出ていませんでした</small></div>
-      <div class="lbl">そのあと、<b>さらに ${out.body.qty}個</b> 箱に入れましたか?</div>
+      <div class="lbl">そのあと、<b>さらに ${out.body.qty}個</b> を ${esc(nowBox)} に入れましたか?</div>
       <div style="margin-top:10px"><button class="bigbtn" id="pa-no">いいえ (入れていない)</button></div>
       <div style="margin-top:10px"><button class="selbtn" id="pa-yes" style="width:100%">はい、さらに ${out.body.qty}個 入れた</button></div>
-      <div class="msg" style="color:#868E96">迷ったら「いいえ」を押して、箱の中身と画面の数を見くらべてください</div>`);
+      <div class="msg" style="color:#868E96">迷ったら「いいえ」を押して、箱の中身と画面の数を見くらべてください${
+        prevBox !== nowBox ? '<br>前と違う箱です。入れ直したのなら「いいえ」を押して、職員に記録を直してもらってください' : ''}</div>`,
+      { sticky: true });
     dlg.querySelector('#pa-no').addEventListener('click', async () => {
+      await placeQueue.ack(out.prev.requestId);
       closeDialog();
-      await showResolvedPlacement(out.prev);
     });
     dlg.querySelector('#pa-yes').addEventListener('click', async () => {
+      const again = await withSaving(() => placeQueue.ackAndSend({ ackRequestId: out.prev.requestId, body: out.body, meta: out.meta }));
       closeDialog();
-      await showResolvedPlacement(out.prev);
-      showSaving(true);
-      let again;
-      try {
-        again = await placeQueue.confirmAndSend({ ackRequestId: out.prev.requestId, body: out.body, meta: out.meta });
-      } finally { showSaving(false); }
-      if (again.record.status !== 'resolved') { setOnline(false); alert('通信できませんでした。この記録は電波が戻ると自動で送り直します'); return; }
-      if (!again.record.result.ok) { await placeQueue.ack(again.record.requestId); alert(again.record.result.message || '登録できませんでした'); refresh(true); return; }
-      await showResolvedPlacement(again.record);
+      await handlePlaceOutcome(again, {});
     });
   }
 
@@ -885,22 +914,48 @@
     return j;
   }
   // 送信キュー (place-queue.js)。状態は sending → resolved (人に見せる) → 消す。
-  // 端末に残す1件は今までどおり localStorage の 'fbx_pending_place'
+  // 端末に残す1件は今までどおり localStorage の 'fbx_pending_place' (旧形式はキュー側で吸収)。
+  // ⚠ storage.set は例外を投げてよい (握り潰さない) — 保存できない端末では送らせない
+  if (typeof createPlaceQueue !== 'function') {
+    document.body.innerHTML = '<div style="padding:24px; font-size:1.3em; line-height:1.8">'
+      + '⚠ 画面の部品を読み込めませんでした。<br>ページを再読み込み (更新) してください。<br>'
+      + '<small>直らないときは職員を呼んでください</small></div>';
+    throw new Error('place-queue.js を読み込めませんでした');
+  }
   const placeQueue = createPlaceQueue({
     post: postPlacementDefinitive,
-    storage: { get: () => LS.get('pending_place', null), set: (v) => LS.set('pending_place', v) },
+    storage: {
+      get: () => LS.get('pending_place', null),
+      set: (v) => { localStorage.setItem('fbx_pending_place', JSON.stringify(v)); },
+    },
   });
   /**
-   * 確定したのに人にまだ見せていない1件を、必ず見せてから消す。
-   * 裏で送り直して成功した分も見せる — 見せないと利用者が「失敗した」と思って
-   * もう一度押し、二重に記録される (Codex PR2.6-R5 high#2)
+   * 確定したのに人にまだ見せていない1件を、**閉じられないダイアログ**で見せてから消す。
+   * 8秒で消えるトーストだと、裏で確定した分を見落として押し直し → 二重登録になる
+   * (Codex PQ-R1 high#5)。ack は人がボタンを押したあと (Codex PQ-R1 high#2)
    */
-  async function showResolvedPlacement(rec) {
-    const j = rec.result;
-    await placeQueue.ack(rec.requestId);
-    if (!j.ok) { notePendingFailed(j); return; }
-    setOnline(true);
-    showUndoToast(j.placementId, { product_name: rec.meta?.productName }, rec.body.qty, checkWorkerNoteOf(rec, j));
+  function showLeftoverPlacement(rec, after) {
+    const j = rec.result || {}, ok = j.ok === true;
+    const name = rec.meta && rec.meta.productName ? rec.meta.productName : 'この商品';
+    const boxCode = (S && S.boxes || []).find(b => b.id === rec.body.box_id);
+    const done = async () => { await placeQueue.ack(rec.requestId); closeDialog(); if (after) await after(); };
+    const dlg = openDialog(`
+      <h2>${ok ? '✅ さっきの分は記録できています' : '⚠ さっきの分は記録できませんでした'}</h2>
+      <div class="pname" style="margin:10px 0">${esc(shortName(name))}
+        <b style="font-size:1.2em">${rec.body.qty}</b>個${boxCode ? ' → ' + esc(boxCode.box_code) : ''}</div>
+      ${ok
+        ? '<div class="msg" style="color:#2B8A3E; font-weight:700">通信が切れていて、画面に出せていませんでした</div>'
+        : `<div class="msg err">${esc(j.message || '登録できませんでした')}
+            <small style="display:block; font-weight:600">箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)</small></div>`}
+      <div style="margin-top:12px"><button class="bigbtn" id="lo-ok">わかりました</button></div>
+      ${ok && j.placementId ? '<div style="margin-top:10px"><button class="selbtn" id="lo-undo" style="width:100%">この記録を取り消す</button></div>' : ''}`,
+      { sticky: true });
+    dlg.querySelector('#lo-ok').addEventListener('click', done);
+    dlg.querySelector('#lo-undo')?.addEventListener('click', async () => {
+      const j2 = await apiPost(`/api/placements/${j.placementId}/revoke`, { worker_id: worker?.id });
+      if (!j2.ok) { alert(j2.message || '戻せませんでした (職員を呼んでください)'); return; }
+      await done();
+    });
   }
   /** 予告した名前と実際に入った名前がずれたときだけ知らせる (R3 medium#1 / R4 medium#2) */
   function checkWorkerNoteOf(rec, j) {
