@@ -620,8 +620,10 @@
     const boxCodeOf = (id) => (S.boxes.find(b => b.id === id) || {}).box_code || '?';
     const boxClosed = (id) => (S.boxes.find(b => b.id === id) || {}).status === 'closed';
     const unit = unitOf(r.fnsku);                  // 1個の重さ (実測 > 参考)。未登録なら null
-    // 確認担当は「いまの作業者」を既定にする。タップで変えられる (中原さん 9/6)
-    const checkDefault = r.check_worker || (worker ? worker.display_name : '');
+    // 確認担当の既定 = いまの作業者。実際に書き込むのはサーバー側 (投入と同じトランザクション。
+    // 別POSTだと通信断で欠落し、他端末と競合して上書きし合う — Codex PR2.6-R1)。画面は予告だけ
+    const checkDefault = worker ? worker.display_name : '';
+    const willAutoCheck = rem > 0 && !excluded && !!checkDefault;   // 「この箱に入れた」がある行だけ自動で入る
     const pp = planParts(r.plan_no);
     const dlg = openDialog(`
       <div style="display:flex; gap:14px; align-items:flex-start">
@@ -683,9 +685,11 @@
       <div class="lbl">👤 確認した人</div>
       <button class="selbtn ${r.check_worker ? 'on' : ''}" id="d-cw" style="width:100%">${r.check_worker
         ? `✅ ${esc(r.check_worker)}`
-        : (checkDefault
-          ? `${esc(checkDefault)} <small style="font-weight:600; color:#868E96">(この人で記録します・タップで変更)</small>`
-          : `— <small style="font-weight:600; color:#868E96">(上の「👤 作業者を選ぶ」から選んでください)</small>`)}</button>
+        : (willAutoCheck
+          ? `${esc(checkDefault)} <small style="font-weight:600; color:#868E96">(「この箱に入れた」を押すと、この人で記録します・タップで変更)</small>`
+          : `— <small style="font-weight:600; color:#C92A2A">${checkDefault
+            ? 'まだ記録されていません。タップして選んでください'
+            : '上の「👤 作業者を選ぶ」から選んでください'}</small>`)}</button>
       <div class="lbl">⚠ 困ったとき (職員)</div>
       <div class="grid3">
         <button class="selbtn" id="d-sendqty">${r.shortage_qty ? `送る数 ${r.planned_qty - r.shortage_qty} を直す` : '送る数を直す'}</button>
@@ -762,11 +766,8 @@
       msg.className = 'msg'; msg.textContent = '送信中…';
       const j = await sendPlacement({ rowId: r.id, boxId: curBoxId, qty, layer, expiry });
       if (j.ok) {
-        // 確認担当がまだ空の行だけ、既定 (いまの作業者) を記録する。
-        // 誰かが選んだ名前は上書きしない。失敗しても入れた記録は消さない (出荷前チェックの警告で拾える)
-        if (!r.check_worker && checkDefault) {
-          await apiPost(`/api/rows/${r.id}/workers`, { worker_id: worker.id, check_worker: checkDefault }).catch(() => ({ ok: false }));
-        }
+        // 確認した人はサーバーが同じトランザクションで入れている (まだ空の行だけ・入れた人)。
+        // 画面から別POSTしないので、通信断で「入れた記録はあるのに確認した人が空」にならない
         closeDialog();
         showUndoToast(j.placementId, r, qty);
       } else {

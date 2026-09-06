@@ -328,6 +328,71 @@ t('reopenBox: 理由必須・実測がクリアされ再クローズ要', () => 
   assert.equal(b.measured_weight_kg, null);
   assert.equal(b.reopen_count, before + 1);
 });
+// ─── 確認した人 (Codex PR2.6-R1: high#1 上書き / high#2 取消後に残る / medium#1 通信断で欠落) ───
+const cwBox = db.createBox({ packGroupId: groupId, materialCode: 'box140', worker: member });
+const wOther = db.getWorker(db.addWorker({ displayName: 'べつのひと', workerType: 'member', actor: 't' }).id);
+t('確認した人: 投入と同じトランザクションで自動で入る (画面からの別POSTではない)', () => {
+  const r = db.getRunState(runId).rows.find(x => x.id === rowB.id);
+  assert.equal(r.check_worker, 'りようしゃ');        // 最初の投入で自動記録された
+  assert.equal(r.check_worker_source, 'auto');
+});
+t('確認した人: あとから別の端末・別の人が入れても、先に入れた人を上書きしない (high#1)', () => {
+  const add = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-1' });
+  assert.equal(add.ok, true, JSON.stringify(add));
+  assert.equal(add.checkWorker, 'りようしゃ');
+  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, 'りようしゃ');
+});
+t('確認した人: 投入を全部取り消すと自動分は消え、入れ直した人が入る (high#2)', () => {
+  for (const p of db.getRunState(runId).placements.filter(x => x.row_id === rowB.id)) {
+    assert.equal(db.revokePlacement({ placementId: p.id, worker: member, deviceKey: 'dev:1' }).ok, true);
+  }
+  const cleared = db.getRunState(runId).rows.find(x => x.id === rowB.id);
+  assert.equal(cleared.check_worker, null);
+  assert.equal(cleared.check_worker_source, null);
+  const re = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-2' });
+  assert.equal(re.ok, true, JSON.stringify(re));
+  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, 'べつのひと');
+});
+t('確認した人: 人が選んだ名前は投入でも取消でも動かない。消せば自動に戻る', () => {
+  assert.equal(db.setRowWorkers({ rowId: rowB.id, checkWorker: 'さとう', worker: staff }).ok, true);
+  assert.equal(db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: member, deviceKey: 'dev:1', requestId: 'cw-3' }).ok, true);
+  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, 'さとう');
+  for (const p of db.getRunState(runId).placements.filter(x => x.row_id === rowB.id)) {
+    assert.equal(db.revokePlacement({ placementId: p.id, worker: member, deviceKey: 'dev:1' }).ok, true);
+  }
+  const kept = db.getRunState(runId).rows.find(x => x.id === rowB.id);
+  assert.equal(kept.check_worker, 'さとう');          // 全部取り消しても人が選んだ名前は残る
+  assert.equal(kept.check_worker_source, 'manual');
+  assert.equal(db.setRowWorkers({ rowId: rowB.id, checkWorker: null, worker: staff }).ok, true);
+  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, null);
+  // 戻す (以降のテストの前提 = rowB は りようしゃ が期限 2028-06-24 で 10個 box1 に入れた状態)
+  assert.equal(db.addPlacement({ runId, rowId: rowB.id, boxId: box1.boxId, qty: 5, expiry: '2028-06-24', worker: member, deviceKey: 'dev:1', requestId: 'cw-restore-1' }).ok, true);
+  assert.equal(db.addPlacement({ runId, rowId: rowB.id, boxId: box1.boxId, qty: 5, worker: member, deviceKey: 'dev:1', requestId: 'cw-restore-2' }).ok, true);
+  const back = db.getRunState(runId).rows.find(x => x.id === rowB.id);
+  assert.equal(back.placed, 10);
+  assert.equal(back.check_worker, 'りようしゃ');
+  assert.equal(db.voidBox({ boxId: cwBox.boxId, reason: 'テストの後始末', worker: staff }).ok, true);
+});
+
+t('確認した人: 移行前からある値 (source なし) は自動では消さない・書き換えない', () => {
+  // 本番には、この変更より前に画面から書き込まれた check_worker が source NULL で残っている。
+  // 人が選んだのか自動なのか区別できない → 触らない側に倒す (勝手に消えるほうが事故)
+  const d = db.getDB();
+  d.prepare(`INSERT INTO fbx_row_work (row_id, check_worker, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(row_id) DO UPDATE SET check_worker = excluded.check_worker,
+      check_worker_source = NULL, check_worker_placement_id = NULL`).run(rowB.id, 'きゅうデータ', '2026-09-01T00:00:00Z');
+  const box = db.createBox({ packGroupId: groupId, materialCode: 'box140', worker: member });
+  const add = db.addPlacement({ runId, rowId: rowB.id, boxId: box.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-legacy' });
+  assert.equal(add.ok, true, JSON.stringify(add));
+  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, 'きゅうデータ');
+  assert.equal(db.revokePlacement({ placementId: add.placementId, worker: member, deviceKey: 'dev:1' }).ok, true);
+  assert.equal(db.getRunState(runId).rows.find(x => x.id === rowB.id).check_worker, 'きゅうデータ');
+  // 戻す
+  assert.equal(db.voidBox({ boxId: box.boxId, reason: 'テストの後始末', worker: staff }).ok, true);
+  d.prepare('UPDATE fbx_row_work SET check_worker = ?, check_worker_source = ?, check_worker_placement_id = NULL WHERE row_id = ?')
+    .run('りようしゃ', 'auto', rowB.id);
+});
+
 t('空箱はクローズできない', () => {
   const b2 = db.createBox({ packGroupId: groupId, materialCode: 'box160', worker: member });
   assert.equal(db.closeBox({ boxId: b2.boxId, measuredKg: 3, worker: staff }).error, 'empty_box');
@@ -534,7 +599,7 @@ t('createBox: 取消後も box_no は再利用しない', () => {
   assert.equal(b5.boxNo, 5);
   assert.equal(db.voidBox({ boxId: b5.boxId, reason: '試験', worker: staff }).ok, true);
 });
-t('closeBox 3箱 → readiness ok。警告 = 欠番 / 外寸なし (box160) / 確認担当なし', () => {
+t('closeBox 3箱 → readiness ok。警告 = 欠番 / 外寸なし (box160)。確認担当は自動で入るので警告なし', () => {
   assert.equal(db.closeBox({ boxId: b1.boxId, measuredKg: 12.4, closedReason: 'items_done', worker: staff }).ok, true);
   assert.equal(db.closeBox({ boxId: b2.boxId, measuredKg: 8, worker: staff }).ok, true);
   assert.equal(db.closeBox({ boxId: b4.boxId, measuredKg: 20.25, worker: staff }).ok, true);
@@ -543,7 +608,9 @@ t('closeBox 3箱 → readiness ok。警告 = 欠番 / 外寸なし (box160) / �
   const w = r.warnings.map((x) => x.code);
   assert.ok(w.includes('box_gap'), w.join());
   assert.ok(w.includes('no_dims'), w.join());
-  assert.ok(w.includes('unchecked_rows'), w.join());
+  // 入れた行の確認した人は投入と同じトランザクションで自動で入る (Codex PR2.6-R1) →
+  // unchecked_rows は「1個も入れていない行」にだけ残る警告になった
+  assert.ok(!w.includes('unchecked_rows'), w.join());
   assert.equal(r.groups[0].boxes.length, 3);
   assert.equal(r.groups[0].boxes[2].amazonName, 'P1 - B3');
   assert.equal(r.expiries.length, 0);
