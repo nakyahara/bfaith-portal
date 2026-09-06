@@ -624,17 +624,20 @@ th.attr-unknown { color: #dc2626; }
         </div>
         <p class="muted" style="margin:6px 0 0; font-size:12px;">
           まとめ買い用のセットを作るか決めます（決めても<strong>単品の出品は止まりません</strong>）。
-          <strong>作らない・保留も記録します</strong> — どれかを選ぶまで工程「セット商品作成検討」は閉じません。
+          <strong>作らない・保留も記録します</strong> — 作る・作らない・既存ありのどれかを決めるまで
+          工程「セット商品作成検討」は閉じません（<strong>保留のままでは閉じません</strong>）。
         </p>
         <div style="display:flex; gap:10px; margin-top:10px; flex-wrap:wrap;">
-          <%# 「作らない／既存あり」と決めた後は作成を推さない (色を戻す)。決まっていない間と
-              「保留」の間は、いちばん進めたい操作 = 作成なので青のままにする %>
-          <button type="button" class="btn <%= (setDec === 'none' || setDec === 'existing') ? '' : 'btn-primary' %>" id="set-create-open"
+          <%# 決まった後は作成を推さない (色を戻す)。まだ決めていない間と「保留」の間だけ、
+              いちばん進めたい操作 = 作成なので青のままにする %>
+          <button type="button" class="btn <%= (setDec && setDec !== 'hold') ? '' : 'btn-primary' %>" id="set-create-open"
                   style="font-size:14px; font-weight:700; padding:10px 18px;"
                   <%= setStepEditable ? '' : 'disabled' %>>🎁 <%= setDrafts.length ? 'もう1つセットを作る' : 'セットを作る' %></button>
           <button type="button" class="btn" id="set-decision-open"
                   style="font-size:14px; font-weight:700; padding:10px 18px;"
-                  <%= setStepEditable ? '' : 'disabled' %>><%= (setDec === 'none' || setDec === 'hold') ? '✏️ この判断を見直す' : '🚫 セットは作らない／保留にする' %></button>
+                  <%# 何かしら判断済みなら「見直す」。create / existing を数え忘れると、
+                      札が「既存のセットあり」なのにボタンは「作らない」という食い違いになる (Codex R1) %>
+                  <%= setStepEditable ? '' : 'disabled' %>><%= setDec ? '✏️ この判断を見直す' : '🚫 セットは作らない／保留にする' %></button>
         </div>
         <% if (!setStepEditable) { %>
           <p class="muted" style="margin:8px 0 0; font-size:12px;">
@@ -4842,11 +4845,10 @@ th.attr-unknown { color: #dc2626; }
       if (decGotoCreate) {
         decGotoCreate.addEventListener('click', function () {
           closeSetDecision();
-          const box = document.getElementById('set-create-box');
-          if (box) {
-            box.hidden = false;
+          // 開き方は setCreateBoxOpen に集約 (関数宣言なので、この配線が走る時点で定義済み)
+          setCreateBoxOpen(document.getElementById('set-create-box'), true, function (box) {
             box.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          }
+          });
         });
       }
       document.getElementById('setdec-apply').addEventListener('click', async () => {
@@ -5105,20 +5107,31 @@ th.attr-unknown { color: #dc2626; }
     const setCopyBtn = document.getElementById('set-copy-btn');
     if (setCopyBtn) setCopyBtn.addEventListener('click', function () { createSet('copy'); });
 
+    <%# ここから smoke の切り出し範囲 (セット欄の開閉)。EJS の埋め込みを混ぜない
+        — 素の JS として vm で動かし、開く・閉じる・ダイアログから開くを実際に押して確かめる %>
     // 「🎁 セットを作る」= 中身の入力欄を開く (2026-09-06)。details の summary では
-    // 「作らない」ボタンと大きさが揃わず、押せる場所に見えなかったので開閉ボタンにした
-    const setCreateBox = document.getElementById('set-create-box');
-    const setCreateOpen = document.getElementById('set-create-open');
-    if (setCreateBox && setCreateOpen) {
-      setCreateOpen.addEventListener('click', function () {
-        setCreateBox.hidden = !setCreateBox.hidden;
-        if (!setCreateBox.hidden) setCreateBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      });
+    // 「作らない」ボタンと大きさが揃わず、押せる場所に見えなかったので開閉ボタンにした。
+    // 開き方は 3 経路 (ボタン・閉じる・判断ダイアログ) あるので 1 か所に集める
+    function setCreateBoxOpen(box, open, onOpen) {
+      if (!box) return;
+      box.hidden = !open;
+      if (open && typeof onOpen === 'function') onOpen(box);
     }
-    const setCreateCancel = document.getElementById('set-create-cancel');
-    if (setCreateCancel && setCreateBox) {
-      setCreateCancel.addEventListener('click', function () { setCreateBox.hidden = true; });
+    function wireSetCreateToggle(doc, onOpen) {
+      const box = doc.getElementById('set-create-box');
+      const openBtn = doc.getElementById('set-create-open');
+      const cancelBtn = doc.getElementById('set-create-cancel');
+      if (!box) return null;
+      if (openBtn) {
+        openBtn.addEventListener('click', function () { setCreateBoxOpen(box, box.hidden, onOpen); });
+      }
+      if (cancelBtn) cancelBtn.addEventListener('click', function () { setCreateBoxOpen(box, false); });
+      return box;
     }
+    <%# ここまでがセット欄の開閉の切り出し範囲 %>
+    wireSetCreateToggle(document, function (box) {
+      box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
 
     // 仮コード → 本コードの差し替え
     const setCodeBtn = document.getElementById('set-code-btn');
