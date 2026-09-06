@@ -171,6 +171,7 @@
   <div id="ovl-root"></div>
   <div id="toast-root"></div>
 
+  <script src="/apps/fba-box/place-queue.js"></script>
   <script>
   'use strict';
   const BASE = '/apps/fba-box';
@@ -371,8 +372,8 @@
   async function refresh(force) {
     if (!curRunId) return;
     if (dialogOpen && !force) return;   // 入力中に画面を差し替えない
-    const flushed = await flushPendingPlacement();   // 未確定の割当があれば先に確定させる (同じ request_id)
-    if (flushed && !flushed.ok) notePendingFailed(flushed);
+    const resolved = await placeQueue.flush();   // 未確定の割当を同じ request_id で送り直す
+    if (resolved) await showResolvedPlacement(resolved);   // 確定した分は必ず人に見せてから消す
     try {
       const j = await apiGet('/api/state?run=' + curRunId);
       setOnline(!!j.ok || j._status === 404);
@@ -770,21 +771,79 @@
       if (expiry === false) { msg.className = 'msg err'; msg.textContent = '期限は 年・月 まで選んでください (日は任意)'; return; }
       dlg.querySelector('#d-add').disabled = true;
       msg.className = 'msg'; msg.textContent = '送信中…';
-      const j = await sendPlacement({ rowId: r.id, boxId: curBoxId, qty, layer, expiry });
-      if (j.ok) {
-        // 確認した人はサーバーが同じトランザクションで入れている (まだ空の行だけ・入れた人)。
-        // 画面から別POSTしないので、通信断で「入れた記録はあるのに確認した人が空」にならない
-        closeDialog();
-        // 予告した名前と実際に入った名前がずれることがある (ダイアログを開いている間に別の端末が
-        // 先に入れると、確認した人は「最初に入れた人」= 向こうになる)。黙って違う名前を残さない
-        const noted = !r.check_worker && j.checkWorker && j.checkWorker !== checkDefault
-          ? { name: j.checkWorker, auto: j.checkWorkerSource === 'auto' } : null;
-        showUndoToast(j.placementId, r, qty, noted);
-      } else {
-        msg.className = 'msg err'; msg.textContent = j.message || '登録できませんでした';
-        dlg.querySelector('#d-add').disabled = false;
-        if (j._status === 409) refresh(true);
-      }
+      // meta = あとで結果を見せるときに要る情報 (裏で送り直して確定したときはダイアログが無い)
+      const meta = { productName: r.product_name || r.seller_sku, checkDefault, hadCheckWorker: !!r.check_worker };
+      const out = await sendPlacement({ rowId: r.id, boxId: curBoxId, qty, layer, expiry, meta });
+      handlePlaceOutcome(out, { dlg, msg, row: r });
+    });
+  }
+
+  /**
+   * 投入の結果をさばく。
+   * confirm = 前の1件が確定済みで同じ商品・同じ箱 → 押し直しか本当の2回目か決められないので人に聞く
+   * (Codex PR2.6-R5 high#1・#4。内容の比較で自動判定すると、期限・配置がある投入は二重に入り、
+   *  逆に本物の2回目を飲み込む)
+   */
+  async function handlePlaceOutcome(out, { dlg, msg, row }) {
+    const reenable = () => { const b = dlg?.querySelector('#d-add'); if (b) b.disabled = false; };
+    if (out.kind === 'blocked') {
+      msg.className = 'msg err';
+      msg.textContent = '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください';
+      setOnline(false); reenable(); return;
+    }
+    if (out.kind === 'confirm') { closeDialog(); askPlacedAgain(out); return; }
+    if (out.alsoResolved) await showResolvedPlacement(out.alsoResolved);   // 別の商品・箱の見せそびれ
+    const rec = out.record;
+    if (rec.status !== 'resolved') {   // 未確定 — 電波が戻れば同じ request_id で送り直す
+      msg.className = 'msg err';
+      msg.textContent = '通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)';
+      setOnline(false); reenable(); return;
+    }
+    const j = rec.result;
+    if (!j.ok) {
+      await placeQueue.ack(rec.requestId);
+      msg.className = 'msg err'; msg.textContent = j.message || '登録できませんでした';
+      reenable();
+      if (j._status === 409) refresh(true);
+      return;
+    }
+    // 確認した人はサーバーが同じトランザクションで入れている (まだ空の行だけ・入れた人)。
+    // 画面から別POSTしないので、通信断で「入れた記録はあるのに確認した人が空」にならない
+    closeDialog();
+    await showResolvedPlacement(rec);
+  }
+
+  /**
+   * 「前の分は登録できています。そのあと、さらに入れましたか?」
+   * 既定 = 入れていない (押し直しだった)。誤って「はい」を押すと二重に記録されるので、
+   * 「いいえ」を大きく上に置く
+   */
+  function askPlacedAgain(out) {
+    const prevQty = out.prev.body.qty, name = out.prev.meta?.productName || 'この商品';
+    const dlg = openDialog(`
+      <h2>⚠ さっきの分は記録できています</h2>
+      <div class="pname" style="margin:10px 0">${esc(shortName(name))}</div>
+      <div class="msg" style="color:#2B8A3E; font-weight:700">前に押した <b style="font-size:1.2em">${prevQty}</b>個 は登録できていました
+        <small style="display:block; color:#868E96; font-weight:600">通信が切れて画面に出ていませんでした</small></div>
+      <div class="lbl">そのあと、<b>さらに ${out.body.qty}個</b> 箱に入れましたか?</div>
+      <div style="margin-top:10px"><button class="bigbtn" id="pa-no">いいえ (入れていない)</button></div>
+      <div style="margin-top:10px"><button class="selbtn" id="pa-yes" style="width:100%">はい、さらに ${out.body.qty}個 入れた</button></div>
+      <div class="msg" style="color:#868E96">迷ったら「いいえ」を押して、箱の中身と画面の数を見くらべてください</div>`);
+    dlg.querySelector('#pa-no').addEventListener('click', async () => {
+      closeDialog();
+      await showResolvedPlacement(out.prev);
+    });
+    dlg.querySelector('#pa-yes').addEventListener('click', async () => {
+      closeDialog();
+      await showResolvedPlacement(out.prev);
+      showSaving(true);
+      let again;
+      try {
+        again = await placeQueue.confirmAndSend({ ackRequestId: out.prev.requestId, body: out.body, meta: out.meta });
+      } finally { showSaving(false); }
+      if (again.record.status !== 'resolved') { setOnline(false); alert('通信できませんでした。この記録は電波が戻ると自動で送り直します'); return; }
+      if (!again.record.result.ok) { await placeQueue.ack(again.record.requestId); alert(again.record.result.message || '登録できませんでした'); refresh(true); return; }
+      await showResolvedPlacement(again.record);
     });
   }
 
@@ -825,23 +884,29 @@
     j._status = r.status;
     return j;
   }
-  let flushing = false;
+  // 送信キュー (place-queue.js)。状態は sending → resolved (人に見せる) → 消す。
+  // 端末に残す1件は今までどおり localStorage の 'fbx_pending_place'
+  const placeQueue = createPlaceQueue({
+    post: postPlacementDefinitive,
+    storage: { get: () => LS.get('pending_place', null), set: (v) => LS.set('pending_place', v) },
+  });
   /**
-   * 未確定のまま残った割当を、同じ request_id で送り直す。
-   * 戻り値 = 確定応答 (成功でも業務エラーでも) / まだ確定していなければ null。
-   * ⚠ 呼び出し側は必ず戻り値を見る。捨てると「現物は箱に入れたのに記録が無い」を見逃す
-   * (Codex PR2.6-R4 high#1)
+   * 確定したのに人にまだ見せていない1件を、必ず見せてから消す。
+   * 裏で送り直して成功した分も見せる — 見せないと利用者が「失敗した」と思って
+   * もう一度押し、二重に記録される (Codex PR2.6-R5 high#2)
    */
-  async function flushPendingPlacement() {
-    const pend = LS.get('pending_place', null);
-    if (!pend || flushing) return null;
-    flushing = true;
-    try {
-      const j = await postPlacementDefinitive(pend.body);   // 確定応答が返ったときだけ消す
-      LS.set('pending_place', null);
-      setOnline(true);
-      return j;
-    } catch { return null; /* 未確定 — pending は残す */ } finally { flushing = false; }
+  async function showResolvedPlacement(rec) {
+    const j = rec.result;
+    await placeQueue.ack(rec.requestId);
+    if (!j.ok) { notePendingFailed(j); return; }
+    setOnline(true);
+    showUndoToast(j.placementId, { product_name: rec.meta?.productName }, rec.body.qty, checkWorkerNoteOf(rec, j));
+  }
+  /** 予告した名前と実際に入った名前がずれたときだけ知らせる (R3 medium#1 / R4 medium#2) */
+  function checkWorkerNoteOf(rec, j) {
+    const expected = rec.meta?.checkDefault;
+    if (rec.meta?.hadCheckWorker || !j.checkWorker || j.checkWorker === expected) return null;
+    return { name: j.checkWorker, auto: j.checkWorkerSource === 'auto' };
   }
   /** 送れていなかった記録が「登録できなかった」と確定した = 現物と記録がずれている。必ず人に見せる */
   function notePendingFailed(j) {
@@ -851,48 +916,14 @@ ${j.message || ''}
 
 箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)`);
   }
-  /**
-   * ⚠ 既知の未解決 (PR1 からある。Codex PR2.6-R4 high#1 / R5 high#1〜4 — **別PRで作り直す**):
-   * サーバーでは成功したのに応答だけ失われたあと、利用者がもう一度押すと、pending を確定した
-   * 直後に新しい request_id でもう一度投入して**二重に記録される**ことがある。
-   * R4 で「同じ内容なら押し直しとみなして前回の結果を返す」を入れたが、
-   *   - 期限・配置を入れた投入は開き直すと値が変わるので一致せず、結局二重になる (R5 high#1)
-   *   - 逆に「同じ商品を同じ箱へ同じ個数、もう一度入れた」本物の2回目を飲み込む (R5 high#4)
-   * で、直しきれないうえ**取りこぼし**という新しい事故を作るため取り下げた。
-   * 正しくは pending → 確定・未確認 → 確認済み の状態を持ち、削除は自分の requestId と
-   * 一致するときだけ (CAS)、送信と flush を1本のキューに直列化し、
-   * 曖昧なときは「さらに N 個入れましたか?」と人に聞く必要がある = 送信部の作り直し。
-   */
-  async function sendPlacement({ rowId, boxId, qty, layer, expiry }) {
-    const flushed = await flushPendingPlacement();   // 前回の未確定分を先に片付ける
-    // 確定して「登録できなかった」なら必ず知らせる (現物は箱に入っているのに記録が無いのを見逃さない)
-    if (flushed && !flushed.ok) notePendingFailed(flushed);
-    if (LS.get('pending_place', null)) {
-      return { ok: false, message: '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください' };
-    }
-    const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+  /** 投入を送る。戻り値は place-queue の outcome (done / blocked / confirm) をそのまま返す */
+  async function sendPlacement({ rowId, boxId, qty, layer, expiry, meta }) {
     const body = {
       run_id: curRunId, row_id: rowId, box_id: boxId, qty, layer: layer || null,
-      expiry: expiry || null, worker_id: worker.id, request_id: requestId,
+      expiry: expiry || null, worker_id: worker.id,
     };
-    LS.set('pending_place', { requestId, body });
     showSaving(true);
-    try {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        try {
-          const j = await postPlacementDefinitive(body);
-          LS.set('pending_place', null);
-          setOnline(true);
-          return j;
-        } catch (e) {
-          if (attempt === 0) { await new Promise(r => setTimeout(r, 1200)); continue; }
-          setOnline(false);
-          return { ok: false, message: '通信できませんでした。この記録は電波が戻ると自動で送り直します (二重には登録されません)' };
-        }
-      }
-    } finally {
-      showSaving(false);
-    }
+    try { return await placeQueue.send({ body, meta }); } finally { showSaving(false); }
   }
   function showSaving(v) { $('#savebar').classList.toggle('hidden', !v); }
 

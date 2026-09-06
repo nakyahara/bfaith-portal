@@ -282,6 +282,12 @@ router.post('/device/exit', checkOrigin, api((req, res) => {
   res.json({ ok: true, revoked: !!req.fbxDevice });
 }));
 
+// 投入の送信キュー (作業画面が読む素の JS。テストは node:vm で同じファイルを評価する)
+router.get('/place-queue.js', (req, res) => {
+  res.type('application/javascript; charset=utf-8');
+  res.sendFile(path.join(__dirname, 'views', 'place-queue.js'));
+});
+
 // ─── 作業画面 (iPad) ───
 router.get('/', (req, res) => {
   const qIdx = req.originalUrl.indexOf('?');

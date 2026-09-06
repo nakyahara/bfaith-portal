@@ -253,6 +253,20 @@ await t('資材の編集は管理者のみ (user は 403)', async () => {
   const r = await call('POST', '/admin/materials', { body: { code: 'box120', name: '120サイズ', width_cm: 40, length_cm: 30, height_cm: 25 }, session: 'admin', device: false });
   assert.equal(r.j.ok, true, JSON.stringify(r.j));
 });
+await t('投入の送信キュー (place-queue.js) が作業画面と同じゲートの内側で配信される', async () => {
+  const r = await call('GET', '/place-queue.js', { raw: true });
+  assert.equal(r.status, 200);
+  assert.ok((r.headers.get('content-type') || '').includes('javascript'), r.headers.get('content-type'));
+  const js = await r.text();
+  assert.ok(js.includes('createPlaceQueue'), 'window.createPlaceQueue を出している');
+  // 作業画面が実際にこの URL を読んでいる (パスを変えたら気づけるように)
+  const page = await (await call('GET', '/', { raw: true })).text();
+  assert.ok(page.includes('/apps/fba-box/place-queue.js'), '作業画面が読み込んでいる');
+  // 端末未登録なら画面と同じく /enroll へ (JS だけ素通しにしない)
+  const anon = await fetch(`${BASE}/place-queue.js`, { redirect: 'manual' });
+  assert.equal(anon.status, 302);
+});
+
 await t('管理画面 (admin.ejs) が描画できる', async () => {
   const r = await fetch(`${BASE}/admin`, { headers: { 'x-test-session': 'admin' } });
   assert.equal(r.status, 200);
