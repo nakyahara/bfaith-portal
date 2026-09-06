@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -334,6 +334,14 @@ const MIGRATIONS = {
   15: () => {
     db.exec('ALTER TABLE pk_floor_alerts ADD COLUMN ref_key TEXT');
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_floor_alerts_ref ON pk_floor_alerts(ref_key)');
+  },
+  // v16 (例外処理監査 PR-5): 再ピックバッチの理由。'later' = ピッカー自身の「後で取りに行く」/ 'shortage' = 梱包の不足 /
+  //   'wrong_item' = 梱包の品違い。名前 (hikiate_class) と作業画面の案内 (元ロケの意味・届け先) を分けるため。
+  //   既存行は reconcileRepickBatches が pk_pack_tasks から埋める
+  16: () => {
+    db.exec('ALTER TABLE pk_batches ADD COLUMN repick_reason TEXT');
+    // 再ピックバッチ ↔ タスクの結合 (reconcile・同期) 用
+    db.exec("CREATE INDEX IF NOT EXISTS idx_pk_batches_repick_task ON pk_batches(pack_task_id) WHERE origin = 'repick'");
   },
 };
 

@@ -139,15 +139,22 @@
     <% for (const b of batches) { %>
       <div class="card <%= b.status === 'done' ? 'done' : '' %>">
         <div class="card-main">
-          <div class="card-title"><%= b.origin === 'repick' ? '🔴' : '' %><%= b.folder_name || '' %> <%= b.hikiate_class %></div>
+          <%# 再ピックバッチの名前は理由で分かれる (🕒 自分の欠品 / 🔴 梱包から — 例外処理監査 PR-5・A-1)。hikiate_class に絵文字込み %>
+          <div class="card-title" <%= b.origin === 'repick' ? `style="color:${b.repick_reason === 'later' ? '#e8590c' : '#c5221f'}"` : '' %>><%= b.folder_name || '' %> <%= b.hikiate_class %></div>
           <% if (b.class_source === 'suggested') { %>
             <%# Driveの引当パターンtxtが取れず推定した分類 = 現物と違うことがある (2026-09-04) %>
             <div style="font-size:.85rem; color:#c5221f; font-weight:600;">⚠ この引当分類は推定です (現物を確認してください)</div>
           <% } %>
           <% if (b.origin === 'repick') { %>
-            <div style="font-size:.85rem; color:#c5221f; font-weight:600;">
-              依頼元 <%= b.origin_ref || '-' %> / 依頼: <%= b.requested_by || '-' %> (計測対象外)
+            <% const later = b.repick_reason === 'later'; const rl = b.repickLine; %>
+            <div style="font-size:.85rem; color:<%= later ? '#e8590c' : '#c5221f' %>; font-weight:600;">
+              <%= later ? `${b.requested_by || '-'} の欠品 → 届け先 1階 ${b.origin_ref || '-'}` : `依頼元 1階 ${b.origin_ref || '-'} / 依頼: ${b.requested_by || '-'}` %> (計測対象外)
             </div>
+            <% if (rl) { %>
+              <div style="font-size:.9rem; margin-top:2px;"><b><%= rl.name %></b> × <b><%= rl.qty %></b>
+                <% if (rl.locationLabel) { %><span style="color:#495057"> — <%= later ? '前回無かった場所' : '取った場所' %> <%= rl.locationLabel %></span><% } %>
+              </div>
+            <% } %>
           <% } %>
           <div class="card-meta">
             <span>明細 <b><%= b.line_count %></b></span>
