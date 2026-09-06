@@ -201,14 +201,21 @@ export function buildList() {
   const mediaMap = mediaByPage();
   const prevPhotos = photosByCodeKey();
   const codeKeys = rows.map((r) => keyOf(r.product_code));
+  const propsByPage = new Map();
+  for (const r of rows) {
+    let p = {};
+    try { p = JSON.parse(r.payload || '{}'); } catch { /* 壊れた payload は素の表示になるだけ */ }
+    propsByPage.set(r.page_id, p);
+  }
   // ⭐Z (在庫化待ち)・Y (外部施設)・全ロケ を 1 回で数える — 在庫日数は「出荷できる在庫」で出す (§AA)
   const stocks = stockByCode(codeKeys);
-  const arrivals = arrivalHistory(codeKeys);
+  // Notion 正本のカードは f_iroha_tasks に居ないので、カード自身の入庫日を材料として渡す (Codex R2)
+  const arrivals = arrivalHistory(codeKeys,
+    rows.map((r) => ({ k: keyOf(r.product_code), ymd: (propsByPage.get(r.page_id) || {})['入庫日'] || null })));
   const mirrorAt = mirrorCapturedAt();
 
   const cards = rows.map((r) => {
-    let props = {};
-    try { props = JSON.parse(r.payload || '{}'); } catch { /* 壊れた payload は素の表示になるだけ */ }
+    const props = propsByPage.get(r.page_id) || {};
     const k = keyOf(r.product_code);
     const sales30 = k ? (ctx.sales30.get(k) ?? null) : null;
     const st = (k && stocks.get(k)) || NO_STOCK;
@@ -624,8 +631,10 @@ function sizeMapByCode(codeKeys) {
  * どちらの材料も無ければ null = **分からない** (札を出さない)。0 件を「はじめて」と読み替えない。
  * ⭐材料の有無は**商品ごと**に見る。よその商品に実績があっても、この商品の材料が 0 件なら分からない
  *   (日付が読めない行しか無い場合も材料なし扱い。読めない = 入荷が無かった証拠にはならない — Codex R1 #1)
+ * seed = いま画面に出すカード自身の入庫日。Notion 正本ではカードが f_iroha_tasks に無いので、
+ *   これが無いと「はじめての商品」が判定材料 0 件 = 分からない になってしまう (Codex R2)
  */
-function arrivalHistory(codeKeys) {
+function arrivalHistory(codeKeys, seed = []) {
   const db = getDB();
   const first = new Map();       // 商品コード → いちばん古い入荷日 (YYYY-MM-DD)
   const put = (k, d) => {
@@ -635,6 +644,7 @@ function arrivalHistory(codeKeys) {
     if (!cur || ymd < cur) first.set(k, ymd);
   };
   const keys = [...new Set((codeKeys || []).filter(Boolean))];
+  for (const s of seed || []) put(s.k, s.ymd);     // 画面に出すカード自身の入荷 (アプリ正本では f_iroha_tasks から重ねて入る)
   const has = (t) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
   if (keys.length > 0 && has('f_iroha_tasks')) {
     // カードは多くて数千行なので商品コードで絞らずまとめて集計する (1 回の GROUP BY)。
@@ -716,13 +726,19 @@ export function comparePlanOrder(a, b) {
  * 両方を同じ規則で比べる (数どうしは数として、そうでなければ文字列として)。Codex R1 #2
  */
 function compareId(x, y) {
+  // ⭐比べ方が相手によって変わると順序が循環する (10 > '2' > '11x' > 10)。まず**種類**で分けてから、
+  //   同じ種類どうしだけ比べる。0 = 数として読める / 1 = それ以外の文字列 / 2 = 無い (Codex R2)
   const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v
     : (typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v) : null));
   const nx = num(x);
   const ny = num(y);
-  if (nx != null && ny != null) return nx - ny;
-  const sx = String(x ?? '');
-  const sy = String(y ?? '');
+  const gx = x == null ? 2 : (nx != null ? 0 : 1);
+  const gy = y == null ? 2 : (ny != null ? 0 : 1);
+  if (gx !== gy) return gx - gy;
+  if (gx === 2) return 0;
+  if (gx === 0 && nx !== ny) return nx - ny;
+  const sx = String(x);                        // '2' と '02' のように数が同じでも元の文字列で決着させる
+  const sy = String(y);
   return sx < sy ? -1 : sx > sy ? 1 : 0;
 }
 

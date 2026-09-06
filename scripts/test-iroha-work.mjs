@@ -3598,6 +3598,43 @@ console.log(String.fromCharCode(10) + '[23b] 急ぎ (出せる在庫で数える
   ok(S3.recommendCut([h(2), h(3)], 0, 6).unknown_hours_count === 0, '全部分かっていれば 0 件');
   ok(S3.recommendCut([h(2)], 9, 6).unknown_hours_count === 0, '目安を超えていて区切りを引かないときも件数は 0');
 
+
+  // ⑧ Notion 正本のカードは f_iroha_tasks に居ない。カード自身の入庫日を材料にする (Codex R2)
+  const { upsertCachePage: upCache } = await import('../apps/iroha-work/db.js');
+  const nPage = (id, code, ymd, title) => upCache({ pageId: id, status: '未着手', title, productCode: code,
+    dedupeKey: id, url: null, lastEditedTime: now, props: { '入庫日': ymd } });
+  nPage('aa-ntn-1', 'NTN-A', today, 'Notion だけにある新商品');
+  clearEnrichCache();
+  ok(S3.buildList().cards.find((c) => c.page_id === 'aa-ntn-1').first_time === true,
+    'Notion 正本でも、そのカードだけが材料なら「はじめての商品」(材料 0 件 = 分からない にしない)');
+  nPage('aa-ntn-2', 'NTN-A', '2026-08-01', '前に入荷していた分');
+  clearEnrichCache();
+  ok(S3.buildList().cards.find((c) => c.page_id === 'aa-ntn-1').first_time === false,
+    '同じ商品の古いカードが一覧にあれば「はじめて」ではない');
+  db.prepare("DELETE FROM f_iroha_app_notion_cache WHERE page_id LIKE 'aa-ntn-%'").run();
+
+  // ⑨ 同じ日に 2 枚届いても「同日は古い入荷ではない」(境界)
+  const tSame1 = task('SAME-A', '同じ日の入荷 1 枚目', { arrival_date: today });
+  const tSame2 = task('SAME-A', '同じ日の入荷 2 枚目', { arrival_date: today });
+  clearEnrichCache();
+  const sameCards = S3.buildTaskList().cards;
+  ok(sameCards.find((c) => c.id === tSame1).first_time === true && sameCards.find((c) => c.id === tSame2).first_time === true,
+    '同じ日の入荷が 2 枚あってもどちらも「はじめて」のまま');
+
+  // ⑩ id の比べ方が相手によって変わらない = 順序が循環しない (Codex R2)
+  const idCards = [{ id: 10 }, { id: '2' }, { id: '11x' }, { id: null }, { id: 3 }];
+  ok(idCards.every((a) => idCards.every((b) => idCards.every((c) => {
+    const ab = S3.comparePlanOrder(a, b); const bc = S3.comparePlanOrder(b, c);
+    return !(ab <= 0 && bc <= 0) || S3.comparePlanOrder(a, c) <= 0;   // a≦b かつ b≦c なら a≦c
+  }))), '数の id と文字列の page_id が混ざっても順序が循環しない (推移性)');
+  ok(idCards.every((a) => idCards.every((b) =>
+    Math.sign(S3.comparePlanOrder(a, b)) === -Math.sign(S3.comparePlanOrder(b, a)))),
+    '入れ替えて比べれば符号が逆になる (反対称)');
+  ok(S3.comparePlanOrder({ id: '2' }, { id: '02' }) !== 0, "数として同じ '2' と '02' も元の文字列で決着する");
+  ok(S3.comparePriority({ priority: { sort_days: null, kind: 'normal' } }, { priority: { sort_days: 3, kind: 'normal' } }) > 0
+    && S3.comparePriority({ priority: {} }, { priority: { sort_days: 3, kind: 'normal' } }) > 0,
+    'null・未設定の日数も最後に回る (Number(null) = 0 で先頭に来ない)');
+
   db.exec("DELETE FROM mirror_logizard_stock WHERE 商品ID IN ('URG-A','CALM-A','STK-A','BADD-A')");
   clearEnrichCache();
 }
