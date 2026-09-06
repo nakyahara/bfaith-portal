@@ -402,7 +402,7 @@ router.get('/work/:id(\\d+)', (req, res) => {
     state = getWorkState(Number(req.params.id));
     // 🔴/🕒 理由が未確定のバッチは開く直前に確定を試みる (未着手のみ。着手後は表示を固定 — Codex R2)
     if (state.batch.origin === 'repick' && !state.batch.repick_reason && state.batch.status === 'ready') {
-      try { reconcileRepickBatches(); state = getWorkState(Number(req.params.id)); } catch { /* fail-soft */ }
+      try { reconcileRepickBatches(); state = getWorkState(Number(req.params.id)); } catch (e) { console.warn(`[picking] 再ピック理由の確定失敗 (batch=${req.params.id}): ${e.message}`); }
     }
   } catch (e) {
     if (e instanceof PkError) return res.status(e.status).send(e.message);
