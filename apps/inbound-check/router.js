@@ -28,7 +28,7 @@ import {
   checkEnrollRate, recordEnrollAttempt,
   listWorkers, getWorker,
 } from './db.js';
-import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProductMaster } from './drive-fetch.js';
+import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProductMaster, fetchAndImportBarcodeMaster } from './drive-fetch.js';
 // 🚚 予定外の納品を今すぐ iPad に出す (miniPC にロジザードから CSV を出し直させて取り込む)
 import { startRefresh, refreshState, refreshConfigured } from './logizard-refresh.js';
 import { runNotionSweep, notionStatusForAdmin, resetNotionRow } from './notion-sync.js';
@@ -722,6 +722,17 @@ router.post('/api/info/register', checkOrigin, api((req, res) => {
 router.post('/admin/fetch-product-master', requireSession, checkOrigin, api(async (req, res) => {
   try {
     res.json(await fetchAndImportProductMaster({ actor: req.session.email, force: true }));
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.code || 'drive_error', message: e.message });
+  }
+}));
+
+// ─── バーコードマスタを今すぐ取り込む (値札に刷る JAN/FNSKU の正本) ───
+// 中原さん 2026-09-06:「バーコードマスタ.csv は常に最新のバーコード情報を入れている」。
+// 30分の巡回でも取り込むが、CSV を置き直した直後に押せるようにする
+router.post('/admin/fetch-barcode-master', requireSession, checkOrigin, api(async (req, res) => {
+  try {
+    res.json(await fetchAndImportBarcodeMaster({ actor: req.session.email, force: true }));
   } catch (e) {
     res.status(400).json({ ok: false, error: e.code || 'drive_error', message: e.message });
   }

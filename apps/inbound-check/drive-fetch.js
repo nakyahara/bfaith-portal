@@ -17,6 +17,7 @@
 import { getDriveCsvInfo, downloadDriveCsv, vErr } from '../../lib/drive-csv.js';
 import { importCsv, getActiveBatch } from './db.js';
 import { importProductMaster, productMasterStatus } from './product-master.js';
+import { importBarcodeMaster, barcodeMasterStatus } from './barcode-master.js';
 import crypto from 'crypto';
 
 const CFG = {
@@ -38,8 +39,25 @@ const MASTER_CFG = {
     + '(ロジザード エクスポート[FM08_01] → 種類=商品 / パターン=デフォルト)。',
 };
 
+// 🚨 バーコードマスタ (ロジザード エクスポート[FM08_01] 種類=バーコード)。**バーコードの正本**。
+//    中原さん 2026-09-06:「バーコードマスタ.csv は常に最新のバーコード情報を入れているから、ここを参照して」。
+//    値札CSV とは**別の共有ドライブ**にあるので folderId が違う (env で差し替え可)。
+//    サービスアカウントがこの共有ドライブのメンバーでないと読めない — その場合は管理画面に
+//    「フォルダをサービスアカウントに共有してください」と出る (lib/drive-csv.js のメッセージ)
+const BARCODE_CFG = {
+  label: 'バーコードマスタ (バーコードマスタ.csv)',
+  folderId: process.env.INBOUND_CHECK_BARCODE_FOLDER_ID || '0AN1RrVoXZhRqUk9PVA',
+  filename: process.env.INBOUND_CHECK_BARCODE_FILE || 'バーコードマスタ.csv',
+  notFoundHint: '共有ドライブに バーコードマスタ.csv があるか、そのフォルダを Render のサービスアカウントに'
+    + '閲覧者以上で共有しているか確認してください。',
+};
+
 export function driveConfig() {
   return { ...CFG };
+}
+
+export function barcodeDriveConfig() {
+  return { ...BARCODE_CFG };
 }
 
 export function masterDriveConfig() {
@@ -135,6 +153,57 @@ export async function runScheduledMasterFetch({ actor = 'cron' } = {}) {
 
 export function lastMasterFetchAt() { return _lastMasterOk; }
 
+// ─── バーコードマスタ (値札に刷る JAN / FNSKU の正本) ───
+let _lastBarcodeHash = null;
+let _lastBarcodeOk = null;
+let _lastBarcodeError = null;
+
+/**
+ * Drive のバーコードマスタを取り込む。
+ * @param {object} o { actor, force }  force=true で同じ内容でも取り込み直す (管理画面の「今すぐ」)
+ */
+export async function fetchAndImportBarcodeMaster({ actor = 'cron', force = false } = {}) {
+  const info = await getDriveCsvInfo(BARCODE_CFG);
+  if (!info || !info.file_id) {
+    throw vErr(`${BARCODE_CFG.filename} が Drive に見つかりません。${BARCODE_CFG.notFoundHint}`);
+  }
+  const dl = await downloadDriveCsv(BARCODE_CFG);
+  const hash = crypto.createHash('sha256').update(dl.buffer).digest('hex');
+  const modified = dl.modified_time || dl.modifiedTime || null;
+  if (!force && hash === _lastBarcodeHash) {
+    return { ok: true, skipped: true, message: 'バーコードマスタは前回と同じ内容でした', driveModifiedTime: modified };
+  }
+  const r = importBarcodeMaster(dl.buffer, { actor });
+  _lastBarcodeHash = hash;
+  _lastBarcodeOk = new Date().toISOString();
+  _lastBarcodeError = null;
+  return { ...r, driveModifiedTime: modified, fileName: dl.name || BARCODE_CFG.filename };
+}
+
+/** 定期取込 (cron から)。例外は投げず結果を返す — 入荷CSVの巡回を止めないため */
+let _fetchingBarcode = null;
+export async function runScheduledBarcodeFetch({ actor = 'cron' } = {}) {
+  if (_fetchingBarcode) return _fetchingBarcode;
+  _fetchingBarcode = (async () => {
+    try {
+      const r = await fetchAndImportBarcodeMaster({ actor });
+      if (r.skipped) return r;
+      console.log(`[inbound-check] バーコードマスタ取込: ${r.total}件 / ${r.products}商品`
+        + ` (追加 ${r.added} / 消滅 ${r.removed}${r.skipped ? ` / 刷れない形を ${r.skipped}件 除外` : ''})`);
+      return r;
+    } catch (e) {
+      // バーコードマスタが取れなくても、伝票・在庫・入荷予定・手入力で動き続ける (作業は止めない)
+      _lastBarcodeError = { at: new Date().toISOString(), message: e.message };
+      console.warn(`[inbound-check] バーコードマスタの取得に失敗: ${e.message}`);
+      return { ok: false, error: 'drive_error', message: e.message };
+    }
+  })();
+  try { return await _fetchingBarcode; } finally { _fetchingBarcode = null; }
+}
+
+export function lastBarcodeFetchAt() { return _lastBarcodeOk; }
+export function lastBarcodeFetchError() { return _lastBarcodeError; }
+
 // プロセス内の実行中フラグ。cron の周期より処理が長引いても重ねない (Codex R6 High-3/Med-6)。
 // ⚠ Render が複数インスタンスになった場合の重複は、DB 側の UNIQUE(file_hash) と immediate tx が受け止める
 //    (同じファイルは duplicate_file になり、active の切替も単一トランザクション)
@@ -186,9 +255,17 @@ export async function statusForView() {
   } catch (e) {
     masterError = e.message;
   }
+  let barcode = null, barcodeError = null;
+  try {
+    barcode = await getDriveCsvInfo(BARCODE_CFG);
+  } catch (e) {
+    barcodeError = e.message;
+  }
   return {
     active, drive, driveError, config: driveConfig(), lastFetchOkAt: _lastOk,
     master, masterError, masterConfig: masterDriveConfig(),
     masterStatus: productMasterStatus(), lastMasterOkAt: _lastMasterOk,
+    barcode, barcodeError: barcodeError || (_lastBarcodeError ? _lastBarcodeError.message : null),
+    barcodeConfig: barcodeDriveConfig(), barcodeStatus: barcodeMasterStatus(), lastBarcodeOkAt: _lastBarcodeOk,
   };
 }
