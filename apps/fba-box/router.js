@@ -607,13 +607,27 @@ router.get('/print/boxes', api((req, res) => {
   });
 }));
 
-/** 行のラベル貼り担当 / 確認担当 */
+/**
+ * 行のラベル貼り担当 / 確認担当。
+ * ⚠ 確認担当の更新は **人が画面で選んだとき (intent=manual) だけ** 受ける (Codex PR2.6-R2 high#1)。
+ * デプロイ前から開きっぱなしの iPad は旧 JS を実行し続け、投入の成功後に確認担当を自動POSTする。
+ * それを受けてしまうと (a) サーバーが原子的に決めた担当を別の人で上書きし、(b) manual 扱いになって
+ * 取消でも直らない = R1 で直した high#1・#2 がそのまま再発する。
+ * 旧画面の自動POSTは応答を捨てるので、拒否しても現場は止まらない (投入自体は成功している)。
+ * 旧画面で人が選んだときだけ alert が出るので、そこで再読込に気づける。
+ */
 router.post('/api/rows/:id(\\d+)/workers', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const body = {};
   if ('label_worker' in (req.body || {})) body.labelWorker = req.body.label_worker;
-  if ('check_worker' in (req.body || {})) body.checkWorker = req.body.check_worker;
+  if ('check_worker' in (req.body || {})) {
+    if (req.body.check_worker_intent !== 'manual') {
+      return res.status(409).json({ ok: false, error: 'client_outdated',
+        message: '画面が古いままです。ページを再読み込み (更新) してから操作してください' });
+    }
+    body.checkWorker = req.body.check_worker;
+  }
   const r = setRowWorkers({ rowId: Number(req.params.id), ...body, worker: w.worker, deviceLabel: deviceLabelOf(req) });
   if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 409).json(r);
   res.json(r);

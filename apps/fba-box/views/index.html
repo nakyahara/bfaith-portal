@@ -91,6 +91,17 @@
     .selbtn.on { border-color: #B5651D; background: #FFF4E6; color: #B5651D; }
     .qtyin { width: 100%; font-size: 2em; font-weight: 800; text-align: center; padding: 10px;
       border: 2px solid #DEE2E6; border-radius: 12px; }
+    /* 個数 = [− 1個へらす] [数] [＋ 1個ふやす] — 手袋でも押せる大きさ */
+    .qtyrow { display: flex; align-items: stretch; gap: 10px; }
+    .qtyrow .qtyin { flex: 1; min-width: 0; }
+    .stepbtn { flex: none; width: 78px; font-size: 2em; font-weight: 800; line-height: 1;
+      border: 2px solid #DEE2E6; border-radius: 12px; background: #F8F9FA; color: #495057; cursor: pointer; }
+    .stepbtn:disabled { color: #CED4DA; background: #F1F3F5; }
+    .qtyw { margin-top: 6px; min-height: 1.4em; font-size: 0.95em; color: #495057; }
+    /* 箱が選ばれていない = このままでは記録できない。目立たせる (中原さん 9/6) */
+    .warnbox { background: #FFF5F5; border: 2px solid #FF8787; border-radius: 12px; padding: 12px 14px;
+      color: #C92A2A; font-weight: 800; font-size: 1.1em; }
+    .warnbox small { display: block; margin-top: 4px; font-size: 0.78em; font-weight: 600; color: #E03131; }
     .lbl { font-size: 0.85em; color: #868E96; font-weight: 700; margin: 14px 0 6px; }
     .msg { min-height: 1.4em; margin-top: 10px; font-size: 0.95em; }
     .msg.err { color: #C92A2A; font-weight: 700; }
@@ -143,7 +154,6 @@
       <span class="sp"></span>
       <button class="chip" id="btn-summary">📋 まとめ</button>
       <button class="chip" id="btn-worker">👤 作業者を選ぶ</button>
-      <button class="chip" id="btn-tts">🔊 読み上げ ON</button>
     </div>
     <div id="savebar" class="savebar hidden">送信中…</div>
     <div class="boxbar">
@@ -174,7 +184,6 @@
   let curGroupId = null;
   let curBoxId = null;       // 端末ローカル (localStorage) — 「いまの箱」は端末ごと
   let worker = null;         // {id, display_name, worker_type}
-  let ttsOn = true;
   let online = true;
   let pollTimer = null;
   let dialogOpen = false;
@@ -218,8 +227,9 @@
   function fn4(fnsku) { return String(fnsku || '').slice(-4).toUpperCase(); }
   const REASON_JA = { missing: '現物がない', damaged: '破損', bad_label: 'ラベル不良', wrong_item: '商品違い', expiry_issue: '期限が合わない',
     hq_order: '本社指示', stock_short: '在庫が少ない', not_shipped: '今回は納品しない', other: 'その他' };
-  function speak(text, force) {
-    if ((!ttsOn && !force) || !('speechSynthesis' in window)) return;
+  /** 読み上げは 🔊 ボタンを押したときだけ (商品を開いたときの自動読み上げは廃止 — 中原さん 9/6) */
+  function speak(text) {
+    if (!('speechSynthesis' in window)) return;
     try {
       speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
@@ -227,14 +237,9 @@
       speechSynthesis.speak(u);
     } catch { /* 読み上げは補助 — 失敗しても操作は続行 */ }
   }
-  /** 商品を開いたときの読み上げ: 商品名 + 残数 */
-  function speakRow(row) {
-    speak(`${shortName(row.product_name)}。${Math.max(0, row.planned_qty - row.placed - (row.shortage_qty || 0))}個`);
-  }
-  /** 「下4桁を読む」ボタン: FNSKU の下4桁を 1 文字ずつ (中原さん 9/3 の指定文言) */
+  /** 「下4桁を読む」ボタン: FNSKU の下4桁を 1 文字ずつ。前置きは読まない (聞きたいのは 4 文字だけ — 中原さん 9/6) */
   function speakDigits(row) {
-    const last4 = fn4(row.fnsku).split('').map(c => CHAR_READ[c] || c).join('、');
-    speak(`FNSKUの下4桁を読み上げます。${last4}`, true);
+    speak(fn4(row.fnsku).split('').map(c => CHAR_READ[c] || c).join('、'));
   }
   /** 納品プランNo「通常_22」→ ラベル部と番号部 (番号を大きく出す) */
   function planParts(planNo) {
@@ -366,7 +371,8 @@
   async function refresh(force) {
     if (!curRunId) return;
     if (dialogOpen && !force) return;   // 入力中に画面を差し替えない
-    await flushPendingPlacement();      // 未確定の割当があれば先に確定させる (同じ request_id)
+    const flushed = await flushPendingPlacement();   // 未確定の割当があれば先に確定させる (同じ request_id)
+    if (flushed && !flushed.ok) notePendingFailed(flushed);
     try {
       const j = await apiGet('/api/state?run=' + curRunId);
       setOnline(!!j.ok || j._status === 404);
@@ -428,7 +434,7 @@
             ${r.match_state === 'picking_only' ? '<span class="badge short">Excelに無い (入れない)</span>' : ''}
             ${r.shortage_qty ? `<span class="badge short">送る数 ${r.planned_qty - r.shortage_qty} (予定 ${r.planned_qty}${r.shortage_reason ? '・' + esc(REASON_JA[r.shortage_reason] || r.shortage_reason) : ''})</span>` : ''}
             ${expiryOf(r.id) ? `<span class="badge exp">期限 ${esc(expiryOf(r.id))}</span>` : ''}
-            ${r.label_worker ? `👤${esc(r.label_worker)}` : ''}${r.check_worker ? ` ✅${esc(r.check_worker)}` : ''}
+            ${r.check_worker ? `✅${esc(r.check_worker)}` : ''}
           </div>
         </div>
         <div class="qty"><span class="rem">${done ? '✓' : rem}</span><div class="of">${r.placed}/${r.planned_qty}</div></div>
@@ -614,7 +620,14 @@
     const mine = (S.placements || []).filter(p => p.row_id === r.id).sort((a, b) => b.id - a.id);   // この商品の記録 (新しい順)
     const boxCodeOf = (id) => (S.boxes.find(b => b.id === id) || {}).box_code || '?';
     const boxClosed = (id) => (S.boxes.find(b => b.id === id) || {}).status === 'closed';
-    speakRow(r);
+    const unit = unitOf(r.fnsku);                  // 1個の重さ (実測 > 参考)。未登録なら null
+    // 確認担当の既定 = いまの作業者。実際に書き込むのはサーバー側 (投入と同じトランザクション。
+    // 別POSTだと通信断で欠落し、他端末と競合して上書きし合う — Codex PR2.6-R1)。画面は予告だけ
+    const checkDefault = worker ? worker.display_name : '';
+    // サーバーが入れるのは「この行に残っている一番古い投入をした人」= まだ1個も入っていない行のときだけ
+    // いまの作業者と一致する。既に誰かが入れている行で名前を約束すると嘘になる (Codex PR2.6-R2 medium#2)
+    const canAutoCheck = rem > 0 && !excluded;                   // 「この箱に入れた」がある = 自動で入る行
+    const willAutoCheck = canAutoCheck && r.placed === 0 && !!checkDefault;
     const pp = planParts(r.plan_no);
     const dlg = openDialog(`
       <div style="display:flex; gap:14px; align-items:flex-start">
@@ -636,12 +649,19 @@
       </div>
       ${excluded ? `<div class="msg err">この商品は納品プラン (Excel) に無いので箱に入れません。${r.placed > 0 ? `すでに ${r.placed} 個入っています — 職員が取り消してください。` : ''}本社に確認してください</div>` : ''}
       ${rem > 0 && !excluded ? `
-        <div class="lbl">📦 入れる箱 ${cur ? `= <b>${esc(cur.box_code)}</b>` : '(「いまの箱」が未選択です)'}</div>
-        ${cur ? roomHint(cur, r) : ''}
-        ${cur ? '' : `<div class="grid3">${boxes.map(b => `<button class="selbtn boxpick" data-id="${b.id}">${esc(b.box_code)}</button>`).join('')}
-          <button class="selbtn boxnew">＋新しい箱</button></div>`}
+        <div class="lbl">📦 入れる箱 ${cur ? `= <b>${esc(cur.box_code)}</b>` : ''}</div>
+        ${cur ? roomHint(cur, r) : `
+          <div class="warnbox">⚠ 「いまの箱」が選ばれていません
+            <small>下から箱を選ぶか「＋新しい箱」を作るまで、この商品は記録できません</small></div>
+          <div class="grid3" style="margin-top:8px">${boxes.map(b => `<button class="selbtn boxpick" data-id="${b.id}">${esc(b.box_code)}</button>`).join('')}
+            <button class="selbtn boxnew">＋新しい箱</button></div>`}
         <div class="lbl">個数</div>
-        <input class="qtyin" id="d-qty" type="tel" inputmode="numeric" value="${rem}">
+        <div class="qtyrow">
+          <button class="stepbtn" id="d-minus" aria-label="1個へらす">−</button>
+          <input class="qtyin" id="d-qty" type="tel" inputmode="numeric" value="${rem}">
+          <button class="stepbtn" id="d-plus" aria-label="1個ふやす">＋</button>
+        </div>
+        <div class="qtyw" id="d-weight"></div>
         <div class="lbl">置いた場所 (わかれば)</div>
         <div class="grid3">
           <button class="selbtn layer" data-v="bottom">⬇ 下</button>
@@ -656,7 +676,6 @@
               <select class="dsel" id="d-em"><option value="">月</option>${range(1, 12).map(m => `<option>${String(m).padStart(2, '0')}</option>`).join('')}</select>
               <select class="dsel" id="d-ed"><option value="">日</option>${range(1, 31).map(m => `<option>${String(m).padStart(2, '0')}</option>`).join('')}</select>
             </div>`}
-        <div style="margin-top:16px"><button class="bigbtn" id="d-add" ${cur ? '' : 'disabled'}>この箱に入れた</button></div>
       ` : (excluded ? '' : `<div class="msg" style="color:#2B8A3E; font-weight:700">この商品は入力が終わっています</div>`)}
       ${mine.length > 0 ? `
         <div class="lbl">📝 この商品の記録 (間違えたら「数を直す」)</div>
@@ -667,11 +686,16 @@
               <button class="selbtn rvk" data-id="${p.id}" style="padding:6px 10px">取消</button></span>
           </div>`).join('')}
         </div>` : ''}
-      <div class="lbl">👤 担当者の記録</div>
-      <div class="grid2">
-        <button class="selbtn" id="d-lw">ラベル貼り: ${esc(r.label_worker || '—')}</button>
-        <button class="selbtn" id="d-cw">確認: ${esc(r.check_worker || '—')}</button>
-      </div>
+      <div class="lbl">👤 確認した人</div>
+      <button class="selbtn ${r.check_worker ? 'on' : ''}" id="d-cw" style="width:100%">${r.check_worker
+        ? `✅ ${esc(r.check_worker)}`
+        : (willAutoCheck
+          ? `${esc(checkDefault)} <small style="font-weight:600; color:#868E96">(「この箱に入れた」を押すと、この人で記録します・タップで変更)</small>`
+          : (canAutoCheck && checkDefault
+            ? `— <small style="font-weight:600; color:#868E96">(「この箱に入れた」を押すと、最初に入れた人で記録します・タップで指名)</small>`
+            : `— <small style="font-weight:600; color:#C92A2A">${checkDefault
+              ? 'まだ記録されていません。タップして選んでください'
+              : '上の「👤 作業者を選ぶ」から選んでください'}</small>`))}</button>
       <div class="lbl">⚠ 困ったとき (職員)</div>
       <div class="grid3">
         <button class="selbtn" id="d-sendqty">${r.shortage_qty ? `送る数 ${r.planned_qty - r.shortage_qty} を直す` : '送る数を直す'}</button>
@@ -679,7 +703,9 @@
         <button class="selbtn" id="d-close">閉じる</button>
       </div>
       ${r.shortage_qty ? `<div class="msg" style="color:#C92A2A">予定 ${r.planned_qty} → 送る数 ${r.planned_qty - r.shortage_qty}${r.shortage_reason ? ' (' + esc(REASON_JA[r.shortage_reason] || r.shortage_reason) + ')' : ''}</div>` : ''}
-      <div class="msg" id="d-msg"></div>`);
+      <div class="msg" id="d-msg"></div>
+      ${rem > 0 && !excluded ? `<div style="margin-top:4px"><button class="bigbtn" id="d-add" ${cur ? '' : 'disabled'}>${
+        cur ? 'この箱に入れた' : '先に「入れる箱」を選んでください'}</button></div>` : ''}`);
 
     let layer = null;
     dlg.querySelectorAll('.layer').forEach(b => b.addEventListener('click', () => {
@@ -693,14 +719,38 @@
       closeDialog(); openRowDialog(rowId);
     }));
     dlg.querySelector('.boxnew')?.addEventListener('click', () => { closeDialog(); newBoxDialog(() => openRowDialog(rowId)); });
-    dlg.querySelector('#d-tts').addEventListener('click', () => speak(`${shortName(r.product_name)}。${Math.max(0, rem)}個`, true));
+    dlg.querySelector('#d-tts').addEventListener('click', () => speak(`${shortName(r.product_name)}。${Math.max(0, rem)}個`));
     dlg.querySelector('#d-digits').addEventListener('click', () => speakDigits(r));
     dlg.querySelector('#d-weigh').addEventListener('click', () => { closeDialog(); weighDialog(r, () => openRowDialog(rowId)); });
     dlg.querySelector('#d-close').addEventListener('click', closeDialog);
-    dlg.querySelector('#d-lw').addEventListener('click', () => pickRowWorker(r, 'label_worker'));
-    dlg.querySelector('#d-cw').addEventListener('click', () => pickRowWorker(r, 'check_worker'));
+    dlg.querySelector('#d-cw').addEventListener('click', () => pickCheckWorker(r, () => openRowDialog(rowId)));
     dlg.querySelector('#d-short').addEventListener('click', () => shortageDialog(r));
     dlg.querySelector('#d-sendqty').addEventListener('click', () => sendQtyDialog(r));
+    // 個数の ＋ / − (1個ずつ) と「1個の重さ × 個数」。残り数を超えては増やせない
+    const qtyIn = dlg.querySelector('#d-qty');
+    const unitTxt = unit ? `1個 ${fmtG(unit.unitG)}${unit.source === 'measured' ? ' (実測)' : ' (参考)'}` : '';
+    function syncQty() {
+      const n = Number(qtyIn.value);
+      dlg.querySelector('#d-minus').disabled = !(n > 1);
+      dlg.querySelector('#d-plus').disabled = !(n < rem);
+      dlg.querySelector('#d-weight').innerHTML = !unit
+        // 箱を選んでいるときは roomHint が同じことを言うので、ここでは繰り返さない
+        ? (cur ? '' : '<span style="color:#B5651D">⚖ 1個の重さが未登録です — 上の「⚖ 重さを登録」から登録できます</span>')
+        : (Number.isFinite(n) && n > 0
+          ? `⚖ ${unitTxt} × ${n}個 = <b style="font-size:1.15em">${fmtG(unit.unitG * n)}</b>`
+          : `⚖ ${unitTxt}`);
+    }
+    if (qtyIn) {
+      const step = (d) => {
+        const n = Math.round(Number(qtyIn.value) || 0);
+        qtyIn.value = String(Math.min(rem, Math.max(1, n + d)));
+        syncQty();
+      };
+      dlg.querySelector('#d-minus').addEventListener('click', () => step(-1));
+      dlg.querySelector('#d-plus').addEventListener('click', () => step(1));
+      qtyIn.addEventListener('input', syncQty);
+      syncQty();
+    }
     // 記録の修正・取消 = 入力ミスの訂正なので PIN は要らない (中原さん 9/3)。閉じた箱のときだけ量り直しを案内
     dlg.querySelectorAll('.adj').forEach(btn => btn.addEventListener('click', () => adjustDialog(r, Number(btn.dataset.id), Number(btn.dataset.qty))));
     dlg.querySelectorAll('.rvk').forEach(btn => btn.addEventListener('click', async () => {
@@ -722,8 +772,14 @@
       msg.className = 'msg'; msg.textContent = '送信中…';
       const j = await sendPlacement({ rowId: r.id, boxId: curBoxId, qty, layer, expiry });
       if (j.ok) {
+        // 確認した人はサーバーが同じトランザクションで入れている (まだ空の行だけ・入れた人)。
+        // 画面から別POSTしないので、通信断で「入れた記録はあるのに確認した人が空」にならない
         closeDialog();
-        showUndoToast(j.placementId, r, qty);
+        // 予告した名前と実際に入った名前がずれることがある (ダイアログを開いている間に別の端末が
+        // 先に入れると、確認した人は「最初に入れた人」= 向こうになる)。黙って違う名前を残さない
+        const noted = !r.check_worker && j.checkWorker && j.checkWorker !== checkDefault
+          ? { name: j.checkWorker, auto: j.checkWorkerSource === 'auto' } : null;
+        showUndoToast(j.placementId, r, qty, noted);
       } else {
         msg.className = 'msg err'; msg.textContent = j.message || '登録できませんでした';
         dlg.querySelector('#d-add').disabled = false;
@@ -770,18 +826,47 @@
     return j;
   }
   let flushing = false;
+  /**
+   * 未確定のまま残った割当を、同じ request_id で送り直す。
+   * 戻り値 = 確定応答 (成功でも業務エラーでも) / まだ確定していなければ null。
+   * ⚠ 呼び出し側は必ず戻り値を見る。捨てると「現物は箱に入れたのに記録が無い」を見逃す
+   * (Codex PR2.6-R4 high#1)
+   */
   async function flushPendingPlacement() {
     const pend = LS.get('pending_place', null);
-    if (!pend || flushing) return;
+    if (!pend || flushing) return null;
     flushing = true;
     try {
-      await postPlacementDefinitive(pend.body);   // 確定応答 (成功/業務エラー) が返ったときだけ消す
+      const j = await postPlacementDefinitive(pend.body);   // 確定応答が返ったときだけ消す
       LS.set('pending_place', null);
       setOnline(true);
-    } catch { /* 未確定 — pending は残す */ } finally { flushing = false; }
+      return j;
+    } catch { return null; /* 未確定 — pending は残す */ } finally { flushing = false; }
   }
+  /** 送れていなかった記録が「登録できなかった」と確定した = 現物と記録がずれている。必ず人に見せる */
+  function notePendingFailed(j) {
+    alert(`⚠ 前に送れていなかった記録が、登録できませんでした。
+
+${j.message || ''}
+
+箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)`);
+  }
+  /**
+   * ⚠ 既知の未解決 (PR1 からある。Codex PR2.6-R4 high#1 / R5 high#1〜4 — **別PRで作り直す**):
+   * サーバーでは成功したのに応答だけ失われたあと、利用者がもう一度押すと、pending を確定した
+   * 直後に新しい request_id でもう一度投入して**二重に記録される**ことがある。
+   * R4 で「同じ内容なら押し直しとみなして前回の結果を返す」を入れたが、
+   *   - 期限・配置を入れた投入は開き直すと値が変わるので一致せず、結局二重になる (R5 high#1)
+   *   - 逆に「同じ商品を同じ箱へ同じ個数、もう一度入れた」本物の2回目を飲み込む (R5 high#4)
+   * で、直しきれないうえ**取りこぼし**という新しい事故を作るため取り下げた。
+   * 正しくは pending → 確定・未確認 → 確認済み の状態を持ち、削除は自分の requestId と
+   * 一致するときだけ (CAS)、送信と flush を1本のキューに直列化し、
+   * 曖昧なときは「さらに N 個入れましたか?」と人に聞く必要がある = 送信部の作り直し。
+   */
   async function sendPlacement({ rowId, boxId, qty, layer, expiry }) {
-    await flushPendingPlacement();   // 前回の未確定分を先に片付ける
+    const flushed = await flushPendingPlacement();   // 前回の未確定分を先に片付ける
+    // 確定して「登録できなかった」なら必ず知らせる (現物は箱に入っているのに記録が無いのを見逃さない)
+    if (flushed && !flushed.ok) notePendingFailed(flushed);
     if (LS.get('pending_place', null)) {
       return { ok: false, message: '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください' };
     }
@@ -811,9 +896,10 @@
   }
   function showSaving(v) { $('#savebar').classList.toggle('hidden', !v); }
 
-  function showUndoToast(placementId, row, qty) {
+  function showUndoToast(placementId, row, qty, checkWorkerNote) {
     $('#toast-root').innerHTML = `<div class="toast">
-      <span>✅ ${esc(shortName(row.product_name, 14))} を ${qty}個 記録しました</span>
+      <span>✅ ${esc(shortName(row.product_name, 14))} を ${qty}個 記録しました${checkWorkerNote
+        ? `<br><small>👤 確認した人は${checkWorkerNote.auto ? '先に入れた ' : ''}<b>${esc(checkWorkerNote.name)}</b> さんで記録されています</small>` : ''}</span>
       <button id="undo">元に戻す</button></div>`;
     const t = setTimeout(() => { $('#toast-root').innerHTML = ''; }, 8000);
     $('#undo').addEventListener('click', async () => {
@@ -1105,21 +1191,22 @@
     });
   }
 
-  // ─── 担当者 (行) ───
-  function pickRowWorker(row, field) {
+  // ─── 確認した人 (行) ─── ※ラベル貼り担当の記録は廃止 (中原さん 9/6)。既定はいまの作業者
+  function pickCheckWorker(row, onDone) {
     const dlg = openDialog(`
-      <h2>👤 ${field === 'label_worker' ? 'ラベル貼り担当' : '確認担当'}</h2>
+      <h2>👤 確認した人</h2>
       <div class="grid3" style="margin-top:12px">
         ${workers.map(w => `<button class="wbtn rw" data-name="${esc(w.display_name)}">${esc(w.display_name)}</button>`).join('')}
         <button class="wbtn rw" data-name="">— 消す —</button>
       </div>`);
     dlg.querySelectorAll('.rw').forEach(b => b.addEventListener('click', async () => {
       if (!worker) { pickWorker(); return; }
-      const body = { worker_id: worker.id };
-      body[field] = b.dataset.name || null;
-      const j = await apiPost(`/api/rows/${row.id}/workers`, body);
-      if (!j.ok) alert(j.message);
+      // intent=manual = 「人が画面で選んだ」印。これが無い更新はサーバーが弾く (旧画面の自動POST対策)
+      const j = await apiPost(`/api/rows/${row.id}/workers`, { worker_id: worker.id, check_worker: b.dataset.name || null, check_worker_intent: 'manual' });
+      if (!j.ok) { alert(j.message); return; }
       closeDialog();
+      await refresh(true);
+      if (onDone) onDone();
     }));
   }
 
@@ -1235,14 +1322,6 @@
   $('#btn-roster').addEventListener('click', () => rosterDialog());
   $('#btn-summary').addEventListener('click', () => summaryDialog());
   $('#btn-newbox').addEventListener('click', () => newBoxDialog());
-  $('#btn-tts').addEventListener('click', () => {
-    ttsOn = !ttsOn;
-    LS.set('tts', ttsOn);
-    $('#btn-tts').textContent = ttsOn ? '🔊 読み上げ ON' : '🔇 読み上げ OFF';
-    if (!ttsOn) try { speechSynthesis.cancel(); } catch { /* noop */ }
-  });
-  ttsOn = LS.get('tts', true);
-  $('#btn-tts').textContent = ttsOn ? '🔊 読み上げ ON' : '🔇 読み上げ OFF';
   window.addEventListener('online', () => setOnline(true));
   window.addEventListener('offline', () => setOnline(false));
 
