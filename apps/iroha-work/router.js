@@ -1277,7 +1277,9 @@ router.post('/api/label-waits', checkOrigin, api((req, res) => {
 
 // ─── 作業仕様のその場登録・修正 (f_iroha_work_master。中原さんFB③⑥) ───
 
-const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'size_class', 'expiry_seal'];
+// ⭐size_class (大きさ) は廃止 (中原さん 2026-09-06 — §AA)。大きさは配送方法から見なすので、手で登録する項目は要らない。
+//   DB の列と既存の値は残してあるが、もう読まないし書かない
+const MASTER_FIELDS = ['material_code', 'storage_container', 'units_per_container', 'process_count', 'note', 'video_url', 'expiry_seal'];
 
 /**
  * 権限 (要件 §7 と FB③の折衷):
