@@ -1269,6 +1269,8 @@ console.log('■ PR3: 重量補助 (参考単重・実測・推定・上限)');
     assert.equal(b.est_weight_g_at_close, 2900);
     assert.equal(b.est_unknown_qty_at_close, 4);
     assert.equal(b.tare_g_at_close, 900);
+    assert.equal(b.limit_override_by, '職員A', '承認者は箱そのものにも残す (出荷前チェックで探せるように)');
+    assert.ok(b.limit_override_at);
     const ev = db.listEvents(30, c.runId).find((e) => e.action === 'box_close');
     assert.equal(JSON.parse(ev.payload).overLimit.approvedBy, '職員A');
   });
@@ -1295,6 +1297,7 @@ console.log('■ PR3: 重量補助 (参考単重・実測・推定・上限)');
     assert.ok(w, JSON.stringify(rd.warnings.map((x) => x.code)));
     assert.equal(w.boxes.length, 1);
     assert.equal(w.boxes[0].weightKg, 31.2);
+    assert.equal(w.boxes[0].approvedBy, '職員A');
   });
 
   t('ルールの変更は作業中の回には効かない (開始時のスナップショット)。目標>上限は拒否', () => {
@@ -1310,6 +1313,23 @@ console.log('■ PR3: 重量補助 (参考単重・実測・推定・上限)');
     assert.equal(db.getWeightRules().limit_g, 30000);
   });
 
+  t('実測の登録は「作業中の納品回に実在する商品」だけ受ける (Codex PR3 #6: 打ち間違いを全回のマスタに入れない)', () => {
+    assert.equal(db.addWeightMeasurement({ fnsku: 'X0WGT00001', sampleQty: 1, totalG: 10, worker: member }).error, 'run_required');
+    assert.equal(db.addWeightMeasurement({ fnsku: 'X0WGT00001', sampleQty: 1, totalG: 10, runId: 999999, worker: member }).error, 'run_required');
+    assert.equal(db.addWeightMeasurement({ fnsku: 'X0NOTHERE1', sampleQty: 1, totalG: 10, runId: c.runId, worker: member }).error, 'not_in_run');
+    const doneRun = db.getRunBySource(400);
+    assert.equal(db.addWeightMeasurement({ fnsku: 'X0FIN00001', sampleQty: 1, totalG: 10, runId: doneRun.id, worker: member }).error, 'run_not_active');
+  });
+
+  t('既に始まっている納品回にも、デプロイ時のマイグレーションでルールを焼き付ける (Codex PR3 #2)', () => {
+    db.getDB().prepare('UPDATE fbx_runs SET weight_target_g = NULL, weight_limit_g = NULL WHERE id = ?').run(c.runId);
+    assert.equal(db.getRun(c.runId).weight_limit_g, null);
+    db.createTables();   // = デプロイ後の起動
+    const run = db.getRun(c.runId);
+    assert.equal(run.weight_target_g, 28000);
+    assert.equal(run.weight_limit_g, 30000);
+  });
+
   t('listRunWeights: 商品ごとの採用値・参考値・実測件数 (本社が「不明が何点か」を見る)', () => {
     const list = db.listRunWeights(c.runId);
     const a = list.find((x) => x.fnsku === 'X0WGT00001'), b = list.find((x) => x.fnsku === 'X0WGT00002');
@@ -1318,6 +1338,25 @@ console.log('■ PR3: 重量補助 (参考単重・実測・推定・上限)');
     assert.equal(a.ref_g, 200);
     assert.equal(a.meas_count, 0, '取り消した実測は数えない');
     assert.equal(b.unit_g, null, '単重不明');
+  });
+
+  t('参考値が未取得なら、実測があってもカタログ取得の対象に残す (Codex PR3 #4: 実測を取り消したとき単重不明に落とさない)', () => {
+    db.upsertProductImage({ fnsku: 'X0WGT00002', asin: 'B0W2', url: 'https://m.media-amazon.com/images/I/w2.jpg', status: 'ok' });
+    const m = db.addWeightMeasurement({ fnsku: 'X0WGT00002', sampleQty: 2, totalG: 100, runId: c.runId, worker: member });
+    assert.equal(m.ok, true);
+    assert.equal(db.getRunState(c.runId).weights.X0WGT00002.unitG, 50);
+    assert.ok(db.listRowsNeedingCatalog(c.runId).some((x) => x.fnsku === 'X0WGT00002'),
+      '画像あり + 実測あり でも参考値が無ければ取りに行く');
+    db.revokeWeightMeasurement({ id: m.id, worker: staff });
+  });
+
+  t('rebuildWeightCurrent: 採用値が壊れていても起動時に作り直す (Codex PR3 #5)', () => {
+    db.getDB().prepare(`UPDATE fbx_weight_current SET unit_g = 99999, source = 'catalog' WHERE fnsku = 'X0WGT00001'`).run();
+    db.getDB().prepare(`DELETE FROM fbx_weight_current WHERE fnsku = 'X0WGT00002'`).run();
+    const n = db.rebuildWeightCurrent();
+    assert.ok(n >= 2);
+    assert.equal(db.getRunState(c.runId).weights.X0WGT00001.unitG, 200, '参考値から作り直す');
+    assert.equal(db.getRunState(c.runId).weights.X0WGT00002, undefined, '元データが無い商品は採用値も持たない');
   });
 }
 

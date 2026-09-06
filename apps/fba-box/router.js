@@ -27,7 +27,7 @@ import {
   addPlacement, revokePlacement, adjustPlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage, setRowSendQty,
   exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
-  listProductImages,
+  listProductImages, listRowsNeedingCatalog,
   addWeightMeasurement, revokeWeightMeasurement, listWeightMeasurements, listRunWeights,
   getWeightRules, setWeightRules,
 } from './db.js';
@@ -37,9 +37,13 @@ import { ensureRunCatalog, diagnoseRunCatalog } from './images.js';
 
 /** 商品画像の取得を裏で走らせる (best-effort・スロットル付き。応答は待たない) */
 const kickCatalog = (runId) => { ensureRunCatalog(runId).catch((e) => console.warn('[fba-box] catalog', e.message)); };
-/** 画像か参考単重が欠けている商品があるか (どちらも miniPC の同じ 1 回の呼び出しで埋まる) */
-const needsCatalog = (state) => state.rows.some((r) => r.match_state !== 'retired'
-  && (!r.image_url || !state.weights[String(r.fnsku || '').toUpperCase()]));
+/**
+ * 画像か参考単重が欠けている商品があるか (どちらも miniPC の同じ 1 回の呼び出しで埋まる)。
+ * 取得ループと同じ述語 (listRowsNeedingCatalog) をそのまま使う — 採用単重で判定すると
+ * 「実測はあるが Amazon の参考値は未取得」の商品を取りに行かず、実測を取り消したときに
+ * 単重不明へ落ちてしまう (Codex PR3 #4)
+ */
+const needsCatalog = (runId) => listRowsNeedingCatalog(runId, { limit: 1 }).length > 0;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -195,7 +199,10 @@ function requireStaff(req, worker) {
  * 現場の帰属 (誰が詰めたか) を書き換えずに、承認だけを職員に紐づける
  */
 function staffApproval(req) {
-  if (hasSessionAccess(req)) return { ok: true, via: 'session', approvedBy: `session:${req.fbxUser}` };
+  // ⚠ 他の職員操作 (requireStaff) と違い、ポータルセッションだけでは通さない (Codex PR3 #1):
+  //   hasSessionAccess は「fba-box を使えるポータル利用者」でしかなく、職員である保証がない。
+  //   30kg 超えは Amazon の受入条件を破る例外なので、管理者セッション か 職員PIN のどちらかを要る
+  if (isAdmin(req)) return { ok: true, via: 'admin', approvedBy: `admin:${req.fbxUser || req.session?.email}` };
   const w = getWorker(req.body?.auth_worker_id);
   if (!w || !w.active || w.worker_type !== 'staff') {
     return { ok: false, status: 403, body: { ok: false, error: 'staff_required', message: '職員の承認が必要です (職員を選んで PIN を入れてください)' } };
@@ -311,7 +318,7 @@ router.get('/api/state', api((req, res) => {
   if (!Number.isInteger(runId) || runId <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: 'run が必要です' });
   const state = getRunState(runId);
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
-  if (state.run.status === 'active' && needsCatalog(state)) kickCatalog(runId);
+  if (state.run.status === 'active' && needsCatalog(runId)) kickCatalog(runId);
   res.json({
     ok: true, ...state,
     workers: listWorkers(),
@@ -525,7 +532,10 @@ router.post('/api/weights', checkOrigin, api((req, res) => {
     method: req.body?.method, note: req.body?.note, runId: req.body?.run_id,
     worker: w.worker, deviceLabel: deviceLabelOf(req),
   });
-  if (!r.ok) return res.status(400).json(r);
+  if (!r.ok) {
+    const st = { run_required: 400, run_not_active: 409, not_in_run: 409 }[r.error] || 400;
+    return res.status(st).json(r);
+  }
   res.json(r);
 }));
 
@@ -761,7 +771,7 @@ router.get('/admin/runs/:id(\\d+)', requireSession, api((req, res) => {
 router.get('/admin/runs/:id(\\d+)/images', requireSession, api(async (req, res) => {
   const state = getRunState(Number(req.params.id));
   if (!state) return res.status(404).json({ ok: false, error: 'not_found', message: '納品回が見つかりません' });
-  if (needsCatalog(state)) kickCatalog(Number(req.params.id));
+  if (needsCatalog(Number(req.params.id))) kickCatalog(Number(req.params.id));
   const diag = await diagnoseRunCatalog(Number(req.params.id), state.rows.filter((r) => r.match_state !== 'retired'));
   const cache = new Map(listProductImages(diag.items.map((x) => x.fnsku)).map((c) => [c.fnsku, c]));
   res.json({ ok: true, ...diag, items: diag.items.map((x) => ({ ...x, cache: cache.get(String(x.fnsku).toUpperCase()) || null })) });

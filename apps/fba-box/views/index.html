@@ -256,6 +256,18 @@
   /** 箱の推定 kg (小数1桁の文字列)。推定できないときは空文字 */
   function estKg(b) { return b && b.est && b.est.estG > 0 ? (b.est.estG / 1000).toFixed(1) : ''; }
   /**
+   * 箱ボタンの短い重さ表示。推定が当てにならない箱で「約N kg」とだけ書くと
+   * 「まだ入る」と誤解させるので、欠損は必ず添える (Codex PR3 #3 / 要件 §7)
+   */
+  function estChip(b) {
+    const e = b && b.est;
+    if (!e || !(e.estG > 0)) return '';
+    const kg = (e.estG / 1000).toFixed(1);
+    if (e.complete) return ` / 約${kg}kg`;
+    if (e.unknownQty > 0) return ` / ${kg}kg+不明${e.unknownQty}点`;
+    return ` / ${kg}kg(自重なし)`;
+  }
+  /**
    * 推定の見せ方。単重不明の商品がある箱は「(重量不明 N点を除く)」を必ずセットで出す (要件 §7) —
    * 数字だけ見て「まだ入る」と誤解させない
    */
@@ -284,7 +296,11 @@
     const w = unitOf(row.fnsku);
     const e = box.est;
     if (!e) return '';
-    if (!w) return `<div style="color:#B5651D">⚖ この商品の重さが未登録です (${estKg(box) ? '推定 ' + estKg(box) + 'kg には入っていません' : '推定は出せません'})</div>`;
+    if (!w) {
+      return `<div style="color:#B5651D">⚖ この商品の重さが未登録です — ${e.estG > 0
+        ? `この箱の推定 ${(e.estG / 1000).toFixed(1)}kg (重量不明 ${e.unknownQty}点を除く) には入っていません`
+        : 'この箱の推定は出せません'}</div>`;
+    }
     const n = roomLeft(box, w.unitG);
     const L = limits();
     if (n === null) {
@@ -393,7 +409,7 @@
     $('#curbox-est').innerHTML = cur ? estLabel(cur) : '';
     $('#boxbtns').innerHTML = boxes.map(b => `
       <button class="boxbtn ${b.status === 'closed' ? 'closed' : ''}" data-id="${b.id}">
-        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個${estKg(b) ? ' / 約' + estKg(b) + 'kg' : ''}${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
+        ${esc(b.box_code)}${b.status === 'closed' ? ' ✓' : ''} <small>${b.total_qty}個${estChip(b)}${b.amazon_box_no !== b.box_no ? ' →' + esc(b.amazon_name) : ''}</small>
       </button>`).join('');
     $('#boxbtns').querySelectorAll('.boxbtn').forEach(b => b.addEventListener('click', () => openBoxDialog(Number(b.dataset.id))));
     // 行リスト (retired = 差し替えで消えた行は出さない)
