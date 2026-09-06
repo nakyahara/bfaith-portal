@@ -631,9 +631,12 @@ function arrivalHistory(codeKeys) {
   const keys = [...new Set((codeKeys || []).filter(Boolean))];
   const has = (t) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
   if (keys.length > 0 && has('f_iroha_tasks')) {
-    // カードは多くて数千行なので商品コードで絞らずまとめて集計する (1 回の GROUP BY)
+    // カードは多くて数千行なので商品コードで絞らずまとめて集計する (1 回の GROUP BY)。
+    // ⭐取消 (close_reason = 'cancelled') は入荷そのものが取り下げられたカードなので実績に数えない。
+    //   「在庫化対象外」は**荷物は届いている**ので数える
     const rows = db.prepare(`SELECT LOWER(TRIM(product_code)) AS k, MIN(arrival_date) AS a FROM f_iroha_tasks
-      WHERE product_code IS NOT NULL AND arrival_date IS NOT NULL AND TRIM(arrival_date) <> '' GROUP BY 1`).all();
+      WHERE product_code IS NOT NULL AND arrival_date IS NOT NULL AND TRIM(arrival_date) <> ''
+        AND (close_reason IS NULL OR close_reason <> 'cancelled') GROUP BY 1`).all();
     for (const r of rows) put(r.k, r.a);
     if (rows.length > 0) known = true;
   }

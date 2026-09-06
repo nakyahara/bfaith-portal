@@ -3521,6 +3521,17 @@ console.log(String.fromCharCode(10) + '[23b] 急ぎ (出せる在庫で数える
   ok(cards2.find((c) => c.id === tOld).first_time === true, 'いちばん古い入荷のカードは「はじめて」のまま');
   // 作業実績 (実測時間) は関係ない — 実績が無くても入荷実績があれば札を出さない
   ok(cards2.find((c) => c.id === tFirst).estimate == null, '前提: どちらも作業実績はまだ無い');
+  // 取消 (入荷そのものが取り下げ) のカードは実績に数えない。「在庫化対象外」は荷物が届いているので数える
+  const tCancel = task('CXL-A', '取消になった入荷',
+    { arrival_date: '2026-07-01', status: 'closed', close_reason: 'cancelled', closed_at: now });
+  const tCancelNew = task('CXL-A', '取消のあとの入荷', { arrival_date: today });
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tCancelNew).first_time === true,
+    '取消のカードしか無ければ「はじめての商品」のまま (入荷は取り下げられている)');
+  db.prepare("UPDATE f_iroha_tasks SET close_reason = 'out_of_scope' WHERE id = ?").run(tCancel);
+  clearEnrichCache();
+  ok(S3.buildTaskList().cards.find((c) => c.id === tCancelNew).first_time === false,
+    '「在庫化対象外」で終わったカードは入荷実績に数える (荷物は届いている)');
   // ロジザードの入荷日でも過去の入荷を拾う (カードが残っていない古い入荷)
   sale('STK-A', 30); stock('STK-A', 'P3F', 50, '2025-01-15');
   const tStk = task('STK-A', '在庫に古い入荷日がある商品', { arrival_date: today });
