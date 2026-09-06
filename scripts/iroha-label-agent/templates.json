@@ -1,0 +1,9 @@
+{
+  "_comment": "日本語を含むパスはここに置く (.ps1 は ASCII のみ)。source = 現場が手で使っている箱ラベルのテンプレ (触らない) / outDir = 自動印刷用コピーの出力先 (このフォルダからの相対) / textObjects = エージェントが文字を差し込むテキストのオブジェクト名 (テンプレに無ければ変換を止める): テキスト6=商品名 / テキスト13=1箱に何個 (数量) / テキスト10=期限 / barcodeObjects = バーコードの種類ごとに残すバーコードのオブジェクト名 (箱ラベルは CODE128 が 1 本なので JAN も FNSKU も同じ) / outNames = 生成するコピーの名前 / sampleCsv = テスト印刷 (test-print.ps1) が本物の商品データを 1 行拾う元 (商品ID, 商品名, 検索名称, バーコード, 有効期限区分)",
+  "source": "G:\\共有ドライブ\\入荷バーコード発行\\バーコード印字.lbx",
+  "outDir": "templates",
+  "textObjects": ["テキスト6", "テキスト13", "テキスト10"],
+  "barcodeObjects": { "jan": "バーコード2", "fnsku": "バーコード2" },
+  "outNames": { "jan": "hakolabel_auto_JAN.lbx", "fnsku": "hakolabel_auto_FNSKU.lbx" },
+  "sampleCsv": "G:\\共有ドライブ\\入荷バーコード発行\\バーコードマスタ.csv"
+}

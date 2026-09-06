@@ -513,6 +513,7 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
   const r = enqueuePrintJob({
     taskId: tid, copies: numOrNull(b.copies),
     packQty: b.pack_qty == null || b.pack_qty === '' ? null : b.pack_qty,
+    extraPackQty: b.extra_pack_qty == null || b.extra_pack_qty === '' ? null : b.extra_pack_qty,
     expiry: b.expiry == null ? null : String(b.expiry),
     targetDeviceId: numOrNull(b.target_device_id),
     clientRequestId: b.client_request_id,
@@ -522,10 +523,11 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
   // 記録 (だれが・どの端末で・何枚)。再送 (replayed) は積んでいないので書かない
   if (!r.replayed) {
     logEvent({ action: 'label_print', workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel,
-      to: r.ok ? `task#${tid} ${r.job.copies}枚 → ${r.job.printer_name}` : `task#${tid}`, ok: r.ok, error: r.ok ? null : (r.message || r.error) });
+      to: r.ok ? `task#${tid} ${r.job.total_copies}枚 → ${r.job.printer_name}` : `task#${tid}`, ok: r.ok, error: r.ok ? null : (r.message || r.error) });
   }
   if (!r.ok) {
     const status = ['in_progress', 'confirm_unknown', 'confirm_manual', 'state_changed', 'idempotency_conflict', 'closed_task'].includes(r.error) ? 409 : r.error === 'not_found' ? 404 : 400;
+    // (bad_extra_qty など入力の誤りは 400)
     return res.status(status).json(r);
   }
   res.json(r);

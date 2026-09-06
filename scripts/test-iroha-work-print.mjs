@@ -33,7 +33,7 @@ const pq = await import('../apps/iroha-work/print-queue.js');
 const {
   enqueuePrintJob, leaseNextJob, markSubmitted, markFinished, getJobStatusFor, recordHeartbeat, sweepPrintJobs,
   pendingAlerts, markAlerted, alertTextFor, listPrintAgents, resolvePrintTarget, latestJobsByTask, listPrintJobs,
-  barcodeTypeOf, publicJob, REPORT_DEADLINE_SEC, STALE_QUEUED_SEC, MAX_COPIES, MAX_EXPIRY_LEN,
+  barcodeTypeOf, publicJob, totalCopiesOf, REPORT_DEADLINE_SEC, STALE_QUEUED_SEC, MAX_COPIES, MAX_EXPIRY_LEN,
 } = pq;
 const { printQueueTick, PRINT_JOB_ID } = await import('../apps/iroha-work/print-worker.js');
 const { CAP, capabilitiesFor } = await import('../apps/iroha-work/capabilities.js');
@@ -104,10 +104,15 @@ let J1;
   const bad = [
     [{ taskId: T1, copies: 0, clientRequestId: crid() }, 'bad_copies'],
     [{ taskId: T1, copies: MAX_COPIES + 1, clientRequestId: crid() }, 'bad_copies'],
+    // 🚨 端数の 1 枚を数えないと MAX_COPIES + 1 枚出せてしまう (Codex PR #1224 R1 重要)
+    [{ taskId: T1, copies: MAX_COPIES, extraPackQty: '10', clientRequestId: crid() }, 'bad_copies'],
     [{ taskId: T1, copies: 2, packQty: '1.5', clientRequestId: crid() }, 'bad_pack_qty'],
     [{ taskId: T1, copies: 2, packQty: 0, clientRequestId: crid() }, 'bad_pack_qty'],
     [{ taskId: T1, copies: 2, expiry: 'x'.repeat(MAX_EXPIRY_LEN + 1), clientRequestId: crid() }, 'bad_expiry'],
     [{ taskId: T1, copies: 2, expiry: '2027\n03', clientRequestId: crid() }, 'bad_expiry'],
+    [{ taskId: T1, copies: 2, extraPackQty: '0', clientRequestId: crid() }, 'bad_extra_qty'],
+    [{ taskId: T1, copies: 2, extraPackQty: '1.5', clientRequestId: crid() }, 'bad_extra_qty'],
+    [{ taskId: T1, copies: 2, extraPackQty: 'x', clientRequestId: crid() }, 'bad_extra_qty'],
     [{ taskId: T1, copies: 2, clientRequestId: 'short' }, 'bad_request'],
     [{ taskId: 999999, copies: 2, clientRequestId: crid() }, 'not_found'],
     [{ taskId: T_NOBC, copies: 2, clientRequestId: crid() }, 'bad_barcode'],
@@ -134,12 +139,24 @@ let J1;
   ok(clash.ok === false && clash.error === 'idempotency_conflict' && clash.job.id === J1, '同じ冪等 ID で違う内容 (別カード) は 409 相当 — 別のジョブを「積めた」と返さない (Codex PR #1220 R1 中)');
   const clash2 = enqueuePrintJob({ taskId: T1, copies: 3, packQty: '120', expiry: '2027-03', clientRequestId: id });
   const clash3 = enqueuePrintJob({ taskId: T1, copies: 2, packQty: '120', expiry: '2027-04', clientRequestId: id });
-  ok(clash2.error === 'idempotency_conflict' && clash3.error === 'idempotency_conflict', '枚数・期限が違っても同じ');
+  const clash4 = enqueuePrintJob({ taskId: T1, copies: 2, packQty: '120', expiry: '2027-03', extraPackQty: '40', clientRequestId: id });
+  ok(clash2.error === 'idempotency_conflict' && clash3.error === 'idempotency_conflict' && clash4.error === 'idempotency_conflict',
+    '枚数・期限・端数のどれが違っても同じ');
   ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_print_jobs').get().c === 1, '衝突しても新しいジョブは増えていない');
   const busy = enqueuePrintJob({ taskId: T1, copies: 1, clientRequestId: crid() });
   ok(busy.ok === false && busy.error === 'in_progress' && busy.job.id === J1, '進行中は同じカードに積めない');
   ok(latestJobsByTask().get(T1)?.id === J1 && !latestJobsByTask().has(T2), 'カードごとの最新ジョブ');
+  ok(r.job.extra_pack_qty === '' && r.job.total_copies === 2, '端数なしなら total_copies = copies');
+  const edge = enqueuePrintJob({ taskId: T2, copies: MAX_COPIES - 1, packQty: '1', extraPackQty: '1', clientRequestId: crid() });
+  ok(edge.ok && edge.job.total_copies === MAX_COPIES, `端数を入れてちょうど ${MAX_COPIES} 枚なら通る`);
+  const over = enqueuePrintJob({ taskId: T2, copies: MAX_COPIES, extraPackQty: '1', clientRequestId: crid() });
+  ok(over.ok === false && over.error === 'bad_copies' && /2 回に分けて/.test(over.message || ''),
+    `満杯 ${MAX_COPIES} 枚 + 端数 1 枚 は断る (実際に出る枚数で上限を見る — Codex PR #1224 R1 重要)`);
+  // 断った分は積まれていない
+  ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_print_jobs WHERE task_id = ?').get(T2).c === 1, '断ったジョブは残らない');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE id = ?').run(edge.job.id);   // 以降のテストのため片づける
 }
+
 
 console.log('\n[4] lease → 投入 → 完了 (エージェント側の 1 本道)');
 {
@@ -260,6 +277,28 @@ console.log('\n[7] 見張り (通知は送れたときだけ通知済み・生�
   markFinished(r.job.id, { deviceId: agentId, leaseToken: leaseNextJob(verifyDevice(agentTok)).leaseToken, ok: false, error: 'x' });
 }
 
+console.log('\n[7b] 端数の箱 — 必要保管箱 6 箱 (70×5＋10) = 70 個 5 枚 ＋ 10 個 1 枚 (中原さん 2026-09-06)');
+{
+  const agent = verifyDevice(agentTok);
+  const r = enqueuePrintJob({ taskId: T1, copies: 5, packQty: '70', extraPackQty: '10', clientRequestId: crid() });
+  ok(r.ok && r.job.pack_qty === '70' && r.job.extra_pack_qty === '10' && r.job.copies === 5, '満杯 5 枚ぶんと端数 10 個を持つ');
+  ok(r.job.total_copies === 6 && totalCopiesOf({ copies: 5, extra_pack_qty: '10' }) === 6, '実際に出る枚数は 6 枚 (端数の 1 枚を足す)');
+  const job = leaseNextJob(agent);
+  ok(job && job.id === r.job.id && job.packQty === '70' && job.extraPackQty === '10' && job.copies === 5,
+    'エージェントには 70 を 5 枚 + 端数 10 を 1 枚 として渡す (agent.ps1 が最後の 1 枚だけ別の数量で刷る)');
+  markSubmitted(job.id, { deviceId: agentId, leaseToken: job.leaseToken, spoolJobId: '21' });
+  markFinished(job.id, { deviceId: agentId, leaseToken: job.leaseToken, ok: true });
+  ok(/保管箱ラベル 6枚 を印刷しました/.test(alertTextFor(rowOf(r.job.id))), '通知の枚数も 6 枚 (端数を含めた実際の枚数)');
+  markAlerted(job.id, 'completed');
+  // 端数なしのジョブは今までどおり (端数を知らない古いエージェントでもそのまま動く形)
+  const plain = enqueuePrintJob({ taskId: T1, copies: 3, packQty: '70', clientRequestId: crid() });
+  const pj = leaseNextJob(agent);
+  ok(plain.job.total_copies === 3 && pj.extraPackQty === '', '端数が無ければ extraPackQty は空 (今までと同じ)');
+  markSubmitted(pj.id, { deviceId: agentId, leaseToken: pj.leaseToken, spoolJobId: '22' });
+  markFinished(pj.id, { deviceId: agentId, leaseToken: pj.leaseToken, ok: true });
+  markAlerted(pj.id, 'completed');
+}
+
 console.log('\n[8] HTTP: 誰が刷れるか (Bearer の kind=agent だけ) / iPad の積む口 / 管理画面');
 {
   let sessionOn = true;
@@ -333,11 +372,14 @@ console.log('\n[8] HTTP: 誰が刷れるか (Bearer の kind=agent だけ) / iPa
   const needTarget = await call('POST', '/api/print/jobs', { body: { task_id: T2, worker_id: W, copies: 1, client_request_id: crid() }, cookie: ck });
   ok(needTarget.status === 400 && needTarget.json.error === 'target_required', '印刷係が 2 台あるときは出力先を選ばないと積めない');
   const okReq = crid();
-  const en = await call('POST', '/api/print/jobs', { body: { task_id: T2, worker_id: W, copies: 2, pack_qty: '24', expiry: '2027-03', client_request_id: okReq, target_device_id: id2 }, cookie: ck });
+  const badExtra = await call('POST', '/api/print/jobs', { body: { task_id: T2, worker_id: W, copies: 2, extra_pack_qty: '0', client_request_id: crid(), target_device_id: id2 }, cookie: ck });
+  ok(badExtra.status === 400 && badExtra.json.error === 'bad_extra_qty', '端数が 0 なら 400');
+  const en = await call('POST', '/api/print/jobs', { body: { task_id: T2, worker_id: W, copies: 2, pack_qty: '24', extra_pack_qty: '9', expiry: '2027-03', client_request_id: okReq, target_device_id: id2 }, cookie: ck });
   ok(en.status === 200 && en.json.ok && en.json.job.state === 'queued' && en.json.job.printer_name === 'Brother QL-800 #3' && en.json.job.requested_by === 'たなか', 'iPad から積めた (出力先 2 号機・依頼者=作業者)');
+  ok(en.json.job.extra_pack_qty === '9' && en.json.job.total_copies === 3, 'HTTP でも端数が通り、合計 3 枚になる');
   const ev = db.prepare("SELECT * FROM f_iroha_app_events WHERE action = 'label_print' ORDER BY id DESC LIMIT 1").get();
-  ok(ev && ev.ok === 1 && /2枚/.test(ev.to_value || '') && ev.device_label === 'テストiPad' && ev.worker_name === 'たなか', '記録 (だれが・どの端末で・何枚)');
-  const replay = await call('POST', '/api/print/jobs', { body: { task_id: T2, worker_id: W, copies: 2, pack_qty: '24', expiry: '2027-03', client_request_id: okReq, target_device_id: id2 }, cookie: ck });
+  ok(ev && ev.ok === 1 && /3枚/.test(ev.to_value || '') && ev.device_label === 'テストiPad' && ev.worker_name === 'たなか', '記録 (だれが・どの端末で・何枚。端数を含めた実際の枚数)');
+  const replay = await call('POST', '/api/print/jobs', { body: { task_id: T2, worker_id: W, copies: 2, pack_qty: '24', extra_pack_qty: '9', expiry: '2027-03', client_request_id: okReq, target_device_id: id2 }, cookie: ck });
   ok(replay.status === 200 && replay.json.replayed && replay.json.job.id === en.json.job.id, '同じ冪等 ID の再送は同じジョブ');
   const busy = await call('POST', '/api/print/jobs', { body: { task_id: T2, worker_id: W, copies: 1, client_request_id: crid(), target_device_id: id2 }, cookie: ck });
   ok(busy.status === 409 && busy.json.error === 'in_progress', '進行中は 409');
@@ -348,7 +390,8 @@ console.log('\n[8] HTTP: 誰が刷れるか (Bearer の kind=agent だけ) / iPa
 
   // 印刷係が取りに来る → 投入 → 完了 → iPad の state に ✅
   const nx = await call('GET', '/print/next', { headers: H2 });
-  ok(nx.status === 200 && nx.json.job.id === en.json.job.id && nx.json.job.expiry === '2027-03' && nx.json.job.packQty === '24', '2 号機宛てのジョブを lease (expiry 付き)');
+  ok(nx.status === 200 && nx.json.job.id === en.json.job.id && nx.json.job.expiry === '2027-03' && nx.json.job.packQty === '24' && nx.json.job.extraPackQty === '9',
+    '2 号機宛てのジョブを lease (expiry・端数つき)');
   const other = await call('GET', '/print/next', { headers: { Authorization: `Bearer ${agentTok}` } });
   ok(other.status === 204, '1 号機には配らない (宛先が違う)');
   const lease = nx.json.job.leaseToken;

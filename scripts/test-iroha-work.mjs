@@ -3637,11 +3637,40 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/id="printOv"/.test(html) && /id="printBody"/.test(html) && /onclick="submitPrint\(\)"/.test(html), '箱ラベルのダイアログ (#printOv) がある');
   ok(/if \(!can\('task\.label\.print'\) \|\| printAgents\(\)\.length === 0 \|\| !barcodeTypeOf\(c\.barcode\)\) return '';/.test(html),
     '🏷 ボタンは 許可あり・印刷係あり・バーコードあり のときだけ描く (押しても出ないボタンを見せない)');
-  ok(/printBtnHtml\(c\) \+\s*printJobHtml\(c\) \+/.test(html), '詳細の数字の段に 🏷 ボタンと最新の印刷結果の札');
+  ok(/'<\/div>' \+\s*printBtnHtml\(c\) \+ printJobHtml\(c\);/.test(html)
+    && /return '<button class="printbig" data-id="' \+ esc\(String\(c\.id\)\) \+ '" onclick="openPrintBox\(this\.dataset\.id\)">' \+ label \+ '<\/button>';/.test(html)
+    && /'🖨 箱ラベルを印字する'/.test(html) && /\.printbig\{display:block;width:100%/.test(html),
+    '詳細は「🖨 箱ラベルを印字する」の大きなボタン (小さなチップにしない — 中原さん 2026-09-06)');
   ok(/const expiry = c\.expiry \? String\(c\.expiry\) : \(m\.expiry_seal === 1 \? '期限シールあり' : ''\);/.test(html)
-    && /const boxes = c\.boxes_calc && c\.boxes_calc\.boxes \? c\.boxes_calc\.boxes : 1;/.test(html)
-    && /const units = m\.units_per_container != null \? String\(m\.units_per_container\) : '';/.test(html),
-    '既定値: 1 箱に何個=入数 / 期限=この入荷の有効期限 (無ければ期限シールありの印) / 枚数=必要保管箱の数');
+    && /let units = m\.units_per_container != null \? String\(m\.units_per_container\) : '';/.test(html),
+    '既定値: 1 箱に何個=入数 / 期限=この入荷の有効期限 (無ければ期限シールありの印)');
+
+  // 🏷 端数の箱 — 必要保管箱 6 箱 (70×5＋10) なら 70 個 5 枚 ＋ 10 個 1 枚 (中原さん 2026-09-06)
+  ok(/if \(bc\.rest > 0 && bc\.full > 0\) \{ copies = bc\.full; extraQty = String\(bc\.rest\); units = String\(bc\.per\); \}/.test(html)
+    && /else if \(bc\.rest > 0\) \{ copies = 1; units = String\(bc\.rest\); \}/.test(html)
+    && /else \{ copies = bc\.full; units = String\(bc\.per\); \}/.test(html),
+    '必要保管箱の内訳から枚数と端数を決める (端数だけ 1 箱のときは その数で 1 枚。端数の 2 枚目を作らない)');
+  ok(/id="printExtra"/.test(html) && /extra_pack_qty: extraRaw \|\| null/.test(html)
+    && /if \(extraRaw && \(!\/\^\[0-9\]\+\$\/\.test\(extraRaw\) \|\| Number\(extraRaw\) < 1\)\)/.test(html),
+    '端数の箱は 1 以上の整数だけ送る (空欄なら端数のラベルは出さない)');
+  ok(/function renderPrintSum\(\)/.test(html) && /' = 合計 ' \+ total \+ ' 枚'/.test(html) && /\$\('#printBody'\)\.addEventListener\('input', renderPrintSum\);/.test(html),
+    '「70 個 × 5 枚 ＋ 10 個 × 1 枚 = 合計 6 枚」を出して、入力を変えたら数え直す');
+  // 上限 50 枚は「実際に出る枚数」で見る。既定値を黙って 50 に切り詰めない (Codex PR #1224 R1 重要)
+  ok(/copies = Math\.max\(1, copies\);/.test(html) && !/copies = Math\.min\(50, Math\.max\(1, copies\)\);/.test(html),
+    '必要な箱の数が 50 を超えても黙って切り詰めない (違う枚数のラベルを出さない)');
+  ok(/if \(copies \+ \(extraRaw \? 1 : 0\) > 50\)/.test(html) && /const over = total > 50;/.test(html) && /\.psum\.over\{/.test(html),
+    '端数の 1 枚も数えて 50 枚を超えたら止める (案内も赤くする)');
+  ok(/const n = j\.total_copies != null \? j\.total_copies : j\.copies;/.test(html), '札の枚数は端数の 1 枚を含めた実際の枚数');
+
+  // 🏷 ボードのカードからも出せる (中原さん 2026-09-06)
+  ok(/function printBtnBoardHtml\(c\) \{/.test(html)
+    && /if \(!isApp\(\) \|\| bulkIds \|\| !stateCan\('task\.label\.print'\) \|\| printAgents\(\)\.length === 0 \|\| !barcodeTypeOf\(c\.barcode\)\) return '';/.test(html),
+    'ボードの 🏷 ボタンは state の許可で判定する (カードは詳細を開いていないので detailCaps が無い)');
+  ok(/printBtnBoardHtml\(c\) \+ printJobHtml\(c, \{ compact: true \}\)/.test(html)
+    && /if \(printBtn\) \{ e\.stopPropagation\(\); openPrintBox\(printBtn\.dataset\.printOf\); return; \}/.test(html),
+    'ボードのカードに 🏷 ボタンと札。タップで詳細を開かない');
+  ok(/function repaintAfterPrint\(c\) \{\s*if \(curView === 'board'\) renderBoard\(\); else renderList\(\);/.test(html),
+    '発行のあとは いま見ている画面を描き直す (ボードから押しても札が出る)');
   ok(/if \(prev && !\(ackEl && ackEl\.checked\)\)/.test(html) && /acknowledge_unknown_job_id: prev \? prev\.id : undefined/.test(html),
     '❓ のあとは「実物を確認した」にチェックしないと送らない (サーバーも同じ証跡を要求)');
   ok(/client_request_id: ctx\.reqId/.test(html) && /reqId: 'p' \+ Date\.now\(\)\.toString\(36\) \+ Math\.random\(\)\.toString\(36\)\.slice\(2, 10\)/.test(html),
@@ -3961,11 +3990,18 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '許可が無ければ札は span で描く (ボタンを描いて無効にしない)');
   ok(/: \(c\.facility_code \? '<span class="tag ' \+ facCls \+ '"/.test(html) && /: '<span class="tag ' \+ whenCls \+ '"><span class="k">いつ<\/span>' \+ esc\(whenTxt\) \+ '<\/span>';/.test(html),
     '利用者には「どこが」は決まっているものだけ (監修 F-5)。「いつ」は未定でも出す (中原さん 2026-09-06)');
-  ok(/\[\['status', '進捗'\], \['fac', '拠点'\], \['when', 'いつ'\]\]/.test(html) && /: boardCols === 'when'\s*\? \[\{ label: '📌 今日やる', pick: \(c\) => c\.when === 'today', status: null, drop: 'today' \}/.test(html)
+  ok(/\[\['status', '進捗'\], \['fac', '拠点'\], \['when', 'いつ'\]\]/.test(html) && /: boardCols === 'when'\s*\? \[\{ label: '未定', pick: \(c\) => !c\.when, status: null, drop: '' \}/.test(html)
     && /\{ label: 'やり残し', pick: \(c\) => c\.when === 'over', status: null, drop: null \}/.test(html) && /data-drop-kind="when"/.test(html)
     && /if \(okDrop\.dataset\.dropKind === 'when'\) \{ toggleTomorrow\(id, okDrop\.dataset\.drop \|\| null\); return; \}/.test(html)
     && /if \(drop\.dataset\.dropKind === 'when'\) return stateCan\('task\.plan\.assign'\)/.test(html),
-    'ボードの列の分け方に「いつ」(今日やる・明日やる・やり残し・先の予定・未定。落とせるのは 今日/明日/未定 — 中原さん 2026-09-06)');
+    'ボードの列の分け方に「いつ」(未定・今日やる・明日やる・やり残し・先の予定。落とせるのは 今日/明日/未定 — 中原さん 2026-09-06)');
+  // 「未定」を一番左に (いまはほとんどが未定なので、まずそこを見る — 中原さん 2026-09-06)
+  {
+    const m = /: boardCols === 'when'\s*\?\s*\[([\s\S]*?)\]\s*:\s*\(bs\.statuses/.exec(html);
+    const labels = m ? (m[1].match(/label: '([^']+)'/g) || []).map(s => s.slice(8, -1)) : [];
+    ok(JSON.stringify(labels) === JSON.stringify(['未定', '📌 今日やる', '明日やる', 'やり残し', '先の予定']),
+      `「いつ」の列は 未定 が一番左 (実際: ${labels.join(' / ')})`);
+  }
   ok(/function statusChips\(\)/.test(html) && /if \(curStatus !== 'all' && c\.status !== curStatus\) return false;/.test(html) && /\$\('#stGroup'\)\.hidden = boardCols === 'status';/.test(html),
     'ボードに進捗の絞り込み (未着手・作業中・棚入待ち)。列が進捗のときは出さない');
   ok(/\(boardCols !== 'status' \? '<div class="bstat"><span class="st ro ' \+ stClass\(c\.status\) \+ '">' \+ esc\(stLabel\(c\)\) \+ '<\/span><\/div>' : ''\)/.test(html),
