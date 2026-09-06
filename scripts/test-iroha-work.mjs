@@ -3636,6 +3636,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /if \(stockInflight\) return;\s*stockInflight = true;\s*try \{ await completeStockedInner\(entries, \{ fromBulk \}\); \}\s*finally \{ stockInflight = false; \}/.test(html)
     && /if \(curWhen === 'unblocked' && !\(\(bs\.cards \|\| \[\]\)\.some\(\(c\) => c\.blocked\)\)\) curWhen = 'all';/.test(html),
     'まとめて棚入完了は「先に確認 (何を・戻せない) → 次に PIN」のワンクッション (中原さん 2026-09-05)');
+  ok(/const staffOk = isStaffUI\(\) \|\| !!\(state\.me && state\.me\.session\);\s*const shown = nexts\.filter\(\(v\) => staffOk \|\| !stNeedsStaff\(c\.status, v\)\);/.test(html)
+    && /ここから変えられるのは職員だけです/.test(html),
+    '状態ダイアログ: 終了 (棚入完了) など職員だけの変更は、職員モードのときだけ描く (利用者に押せないボタンを見せない — 中原さん 2026-09-06)');
   ok(/async function stockOne\(id\)/.test(html) && /function stockBtnHtml\(c\)/.test(html) && (html.match(/closest\('\[data-stock-of\]'\)/g) || []).length === 2
     && /c\.status !== 'ready_for_stocking' \|\| bulkIds \|\| !isApp\(\) \|\| !stateCan\('tasks\.bulk_stocked'\) \|\| !isStaffUI\(\)/.test(html),
     '棚入待ちのカードに ✅ 棚入完了 (1 枚ずつ。職員モードだけ・まとめて選択中は出さない) — 一覧とボードの両方');
@@ -3922,7 +3925,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '残り時間は 30 秒ごとに見直す (通信が無くても固まらない)');
   ok(/if \(sm\.until && leftMs <= 0\) \{\r?\n\s+\/\/[^\r\n]*\r?\n\s+dropPlanCaps\(\);/.test(html),
     '期限が来たら画面の中の許可を落として取り直す (計画のボタンが残らない)');
-  ok(/function dropPlanCaps\(\)/.test(html) && /state\.capabilities = \(state\.capabilities \|\| \[\]\)\.filter\(\(c\) => c !== 'task\.plan\.assign' && c !== 'task\.facility\.assign' && c !== 'task\.external_ready'\);/.test(html),
+  ok(/function dropPlanCaps\(\)/.test(html) && /state\.capabilities = \(state\.capabilities \|\| \[\]\)\.filter\(\(c\) => c !== 'task\.plan\.assign' && c !== 'task\.facility\.assign' && c !== 'task\.external_ready' && c !== 'tasks\.bulk_stocked'\);/.test(html),
     '職員モードを抜けたら、画面の中の許可もその場で落とす');
   ok(/if \(!j\.ok\) \{ showErr\(j\.message \|\| '職員モードを終われませんでした'\); return; \}/.test(html)
     && /dropPlanCaps\(\);\r?\n\s+toast\('職員モードを終わりました'\);/.test(html),
@@ -3981,8 +3984,10 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   ok([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT].every(c => notion.includes(c))
     && ![CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN, CAP.EXTERNAL_READY, CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED, CAP.BLOCK].some(c => notion.includes(c)),
     'Notion 正本 = 状態変更・作業開始・写真・作業のやり方 (今日やる・止まった等は許さない)');
-  ok(notion.every(c => app.includes(c)) && [CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BULK_STOCKED, CAP.BLOCK].every(c => app.includes(c)),
-    'アプリ正本 = Notion 正本の全部 + 取消の判断・確認ずみ・ラベル待ち・まとめて棚入完了・⛔止まった');
+  ok(notion.every(c => app.includes(c)) && [CAP.CANCELLATION, CAP.REVIEW_CLEAR, CAP.LABEL_WAIT_EDIT, CAP.BLOCK].every(c => app.includes(c)),
+    'アプリ正本 = Notion 正本の全部 + 取消の判断・確認ずみ・ラベル待ち・⛔止まった');
+  ok(!app.includes(CAP.BULK_STOCKED) && capabilitiesFor('app', { staff: true }).includes(CAP.BULK_STOCKED),
+    'まとめて棚入完了 (終了) は職員だけ — 利用者の画面にはボタンを描かない (中原さん 2026-09-06)');
   ok(!app.includes(CAP.EXTERNAL_READY) && capabilitiesFor('app', { staff: true }).includes(CAP.EXTERNAL_READY),
     '外部に出す準備OK は職員だけ (どこに預けるかの判断 — 監修 F-5)');
   // ⭐計画 (いつ / どこが) は職員のときだけ (要件 §W-1)
@@ -3993,7 +3998,7 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   ok(capabilitiesFor('notion', { staff: true }).length === notion.length, 'Notion 正本では職員でも計画は許さない (planned_date はアプリ正本の持ちもの)');
   ok(capabilitiesFor('preview', { staff: true }).length === 0, '下見・履歴は職員でも何も許さない');
   // 書き込み口が capability を持たないまま増えていないか (Codex PR1 R6)
-  ok(app.length === 10 && new Set(app).size === app.length, 'アプリ正本 (利用者) の許可は 10 個・重複なし (増やしたら画面の判定も足す)');
+  ok(app.length === 9 && new Set(app).size === app.length, 'アプリ正本 (利用者) の許可は 9 個・重複なし (増やしたら画面の判定も足す)');
   ok(notion.includes(CAP.DAILY_REPORT) && app.includes(CAP.DAILY_REPORT) && !pv.includes(CAP.DAILY_REPORT), '日報 (report.daily) は読むだけだが許可の表に載せる。下見では許さない');
   ok(staffCaps.length === 13 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 13 個・重複なし');
   app.push('x'); pv.push('y');

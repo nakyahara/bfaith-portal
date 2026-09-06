@@ -2143,7 +2143,7 @@ function dropPlanCaps() {
   if (!state) return;
   state.staff_mode = { staff: false };
   // 職員のときだけ入る許可 = capabilities.js の CAPS_STAFF と同じ集合 (外部出しも — Codex PR-C R1 #2)
-  state.capabilities = (state.capabilities || []).filter((c) => c !== 'task.plan.assign' && c !== 'task.facility.assign' && c !== 'task.external_ready');
+  state.capabilities = (state.capabilities || []).filter((c) => c !== 'task.plan.assign' && c !== 'task.facility.assign' && c !== 'task.external_ready' && c !== 'tasks.bulk_stocked');
   planData = null;
   clearPlanDom();
   if (curView === 'plan') setView('board');
@@ -4507,12 +4507,18 @@ function renderStBtns(c) {
     return;
   }
   const nexts = (state.transitions || {})[c.status] || [];
+  // ⭐職員だけの変更 (終了 = 棚入完了・終了からの戻し・棚入待ち→作業中) は、職員モード (またはポータル) のときだけ描く —
+  //   利用者に押せないボタンを見せない (要件 §U-7 / 中原さん 2026-09-06「棚入完了は職員のアカウントのみ」)。サーバー側も職員 PIN 必須
+  const staffOk = isStaffUI() || !!(state.me && state.me.session);
+  const shown = nexts.filter((v) => staffOk || !stNeedsStaff(c.status, v));
   // 🔑 の意味が分からない → 「(職員)」と書く (監修)
-  $('#stBtns').innerHTML = nexts.map(v => stBtn(v, stName(v) + (stNeedsStaff(c.status, v) ? ' (職員)' : ''), false, ST_DESC[v])).join('')
-    || '<p class="hint">この状態から変えられる先がありません</p>';
+  $('#stBtns').innerHTML = shown.map(v => stBtn(v, stName(v) + (stNeedsStaff(c.status, v) ? ' (職員)' : ''), false, ST_DESC[v])).join('')
+    || '<p class="hint">' + (nexts.length ? 'ここから変えられるのは職員だけです (職員の名前を選び、🔑 職員モードに入ってください)' : 'この状態から変えられる先がありません') + '</p>';
   // その段に関係する注記だけ出す (監修)
   const hint = document.getElementById('stHint');
-  if (hint) hint.innerHTML = '「終了」は職員が棚に入れてから (職員PINが必要)。終了にすると一覧から外れます (履歴には残ります)。';
+  if (hint) hint.innerHTML = staffOk
+    ? '「終了」は棚に入れてから (職員PINが必要)。終了にすると一覧から外れます (履歴には残ります)。'
+    : '「終了 (棚入完了)」にできるのは職員だけです。棚に入れたら職員に伝えてください。';
 }
 
 /**
