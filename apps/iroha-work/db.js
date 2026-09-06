@@ -709,6 +709,7 @@ export function createTables(db = getMirrorDB()) {
       barcode           TEXT NOT NULL,
       barcode_type      TEXT NOT NULL CHECK (barcode_type IN ('jan','fnsku')),
       pack_qty          TEXT NOT NULL DEFAULT '',  -- 1 箱に何個 (空 = 印字しない)
+      extra_pack_qty    TEXT NOT NULL DEFAULT '',  -- 端数の箱の数 (空 = 端数なし)。あれば copies 枚のあとに 1 枚だけこの数で刷る
       expiry_text       TEXT NOT NULL DEFAULT '',  -- 期限の文字 (空 = 印字しない)
       copies            INTEGER NOT NULL CHECK (copies BETWEEN 1 AND 50),
       printer_name      TEXT NOT NULL,             -- 積んだ時点の出力先。エージェントはこの名前にだけ出す
@@ -735,6 +736,8 @@ export function createTables(db = getMirrorDB()) {
     CREATE INDEX IF NOT EXISTS idx_iroha_print_jobs_state ON f_iroha_print_jobs(state, id);
     CREATE INDEX IF NOT EXISTS idx_iroha_print_jobs_task ON f_iroha_print_jobs(task_id, id);
   `);
+  // 端数の箱 (最後の 1 箱だけ入数が違う) は後から足した列。すでにある DB にも入れる (中原さん 2026-09-06)
+  addCol('f_iroha_print_jobs', 'extra_pack_qty', "TEXT NOT NULL DEFAULT ''");
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}

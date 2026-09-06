@@ -139,6 +139,8 @@ export function recordHeartbeat(deviceId, { note = null, version = null, bpac = 
  *   taskId            … カード (商品名・商品コード・バーコードはカードの行から取る。画面の値を信じない)。終了したカードには積まない
  *   copies            … 枚数 (1..MAX_COPIES)
  *   packQty           … 1 箱に何個 (null/'' = 空欄で刷る)。整数以外は拒否
+ *   extraPackQty      … 端数の箱の数 (null/'' = 端数なし)。あれば copies 枚のあとに **1 枚だけ**この数で刷る
+ *                       (必要保管箱 6 箱 = 70×5＋10 → 70 個のラベル 5 枚 + 10 個のラベル 1 枚。中原さん 2026-09-06)
  *   expiry            … 期限の文字 (null/'' = 空欄で刷る)。MAX_EXPIRY_LEN 字まで・改行不可
  *   targetDeviceId    … 出力先エージェント (省略時は resolvePrintTarget の規則)
  *   clientRequestId   … 冪等 ID。同じ ID の再送は同じジョブを返す (二重タップ・応答消失で 2 枚出ない)
@@ -146,7 +148,7 @@ export function recordHeartbeat(deviceId, { note = null, version = null, bpac = 
  *   requestedBy / requestedDevice … 記録用
  * @returns {{ok:true, job, created:boolean}|{ok:false, error, message, job?}}
  */
-export function enqueuePrintJob({ taskId, copies, packQty = null, expiry = null, targetDeviceId = null, clientRequestId, acknowledgeUnknownJobId = null, requestedBy = null, requestedDevice = null }) {
+export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty = null, expiry = null, targetDeviceId = null, clientRequestId, acknowledgeUnknownJobId = null, requestedBy = null, requestedDevice = null }) {
   const db = getDB();
   const crid = String(clientRequestId || '').trim();
   if (!/^[A-Za-z0-9._:-]{8,80}$/.test(crid)) return { ok: false, error: 'bad_request', message: 'client_request_id が必要です' };
@@ -160,6 +162,12 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, expiry = null,
     if (!Number.isSafeInteger(q) || q < 1) return { ok: false, error: 'bad_pack_qty', message: '1 箱に入れる数は 1 以上の整数で入力してください (空欄なら印字しません)' };
     pack = String(q);
   }
+  let extra = '';
+  if (extraPackQty != null && String(extraPackQty).trim() !== '') {
+    const q = Number(extraPackQty);
+    if (!Number.isSafeInteger(q) || q < 1) return { ok: false, error: 'bad_extra_qty', message: '端数の箱の数は 1 以上の整数で入力してください (空欄なら端数のラベルは出しません)' };
+    extra = String(q);
+  }
   const exp = expiry == null ? '' : String(expiry).trim();
   if (exp.length > MAX_EXPIRY_LEN || /[\r\n]/.test(exp)) return { ok: false, error: 'bad_expiry', message: `期限は ${MAX_EXPIRY_LEN} 字まで (改行なし) で入力してください` };
   const tid = Number(taskId);
@@ -170,7 +178,7 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, expiry = null,
     const dup = db.prepare('SELECT * FROM f_iroha_print_jobs WHERE client_request_id = ?').get(crid);
     if (dup) {
       // 同じ ID で中身が違う = 画面の不具合か ID の衝突。別のカードのジョブを「積めた」と返さない (Codex PR #1220 R1 中)
-      const same = dup.task_id === tid && dup.copies === n && dup.pack_qty === pack && dup.expiry_text === exp
+      const same = dup.task_id === tid && dup.copies === n && dup.pack_qty === pack && dup.extra_pack_qty === extra && dup.expiry_text === exp
         && (targetDeviceId == null || dup.target_device_id === Number(targetDeviceId));
       if (!same) return { ok: false, error: 'idempotency_conflict', message: '同じ依頼 ID で違う内容が送られました。画面を更新してもう一度発行してください', job: publicJob(dup) };
       return { ok: true, job: publicJob(dup), created: false, replayed: true };
@@ -228,14 +236,19 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, expiry = null,
       }
     }
     const info = db.prepare(`INSERT INTO f_iroha_print_jobs
-      (client_request_id, task_id, product_code, product_name, barcode, barcode_type, pack_qty, expiry_text, copies,
+      (client_request_id, task_id, product_code, product_name, barcode, barcode_type, pack_qty, extra_pack_qty, expiry_text, copies,
        printer_name, target_device_id, requested_by, requested_device, acknowledged_job_id, state, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
-      .run(crid, tid, task.product_code || null, name, barcode, type, pack, exp, n,
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
+      .run(crid, tid, task.product_code || null, name, barcode, type, pack, extra, exp, n,
         target.agent.printer_name, target.agent.id, requestedBy, requestedDevice, acked, now, now);
     const job = db.prepare('SELECT * FROM f_iroha_print_jobs WHERE id = ?').get(Number(info.lastInsertRowid));
     return { ok: true, job: publicJob(job), created: true };
   }).immediate();
+}
+
+/** 実際に出る枚数 = 満杯の箱の枚数 + 端数の箱 (あれば 1 枚) */
+export function totalCopiesOf(row) {
+  return Number(row.copies || 0) + (String(row.extra_pack_qty || '').trim() ? 1 : 0);
 }
 
 /** iPad / 管理画面に返す形 (lease token は絶対に含めない) */
@@ -244,7 +257,9 @@ export function publicJob(row) {
   return {
     id: row.id, state: row.state, label: PRINT_STATE_LABELS[row.state] || row.state,
     task_id: row.task_id, product_code: row.product_code, product_name: row.product_name,
-    barcode: row.barcode, barcode_type: row.barcode_type, pack_qty: row.pack_qty, expiry_text: row.expiry_text, copies: row.copies,
+    barcode: row.barcode, barcode_type: row.barcode_type, pack_qty: row.pack_qty,
+    extra_pack_qty: row.extra_pack_qty || '', total_copies: totalCopiesOf(row),
+    expiry_text: row.expiry_text, copies: row.copies,
     printer_name: row.printer_name, target_device_id: row.target_device_id,
     requested_by: row.requested_by, error: row.error, acknowledged_job_id: row.acknowledged_job_id ?? null,
     acknowledged_at: row.acknowledged_at ?? null,
@@ -296,6 +311,8 @@ export function leaseNextJob(device, { now = utcNow() } = {}) {
       barcode: job.barcode,
       barcodeType: job.barcode_type,
       packQty: job.pack_qty == null ? '' : String(job.pack_qty),
+      // 端数の箱: copies 枚のあとに 1 枚だけこの数で刷る (空なら刷らない)
+      extraPackQty: job.extra_pack_qty == null ? '' : String(job.extra_pack_qty),
       expiry: job.expiry_text == null ? '' : String(job.expiry_text),
       copies: job.copies,
       taskId: job.task_id,
@@ -404,7 +421,7 @@ export function markAlerted(jobId, state) {
 
 /** 状態に応じた通知文 (何が起きて何をすればよいかだけ) */
 export function alertTextFor(job) {
-  const who = `${job.product_name}${job.product_code ? ` (${job.product_code})` : ''} の保管箱ラベル ${job.copies}枚`;
+  const who = `${job.product_name}${job.product_code ? ` (${job.product_code})` : ''} の保管箱ラベル ${totalCopiesOf(job)}枚`;
   const printer = job.printer_name || 'プリンター';
   switch (job.state) {
     case 'completed':
