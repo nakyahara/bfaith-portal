@@ -1,17 +1,50 @@
 <%- include('../../product-hub/views/_header') %>
 <style>
-  .topbar .app-title { display: none; }
-  .pu-title { font-weight: 700; font-size: 15px; }
-  .wrap { max-width: 1400px; }
+  /* ★共通ヘッダは「商品登録ハブ」用のナビを持っている。この画面では別アプリの導線でしかないので隠す */
+  body > .topbar:first-of-type { display: none; }
+
+  .wrap { max-width: 1280px; }
   .pu-note { font-size: 12px; color: #64748b; }
-  /* 「操作の効き方が見た目と違う」注意書き (例: Yahoo のカラバリは全色つられて変わる) */
-  .pu-warn { font-size: 11px; color: #9a3412; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 4px; padding: 3px 6px; margin-top: 3px; line-height: 1.4; }
-  table.pu { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table.pu th { text-align: left; color: #64748b; font-size: 11px; font-weight: 600; border-bottom: 2px solid #e2e8f0; padding: 6px 8px; white-space: nowrap; }
-  table.pu td { border-bottom: 1px solid #f1f5f9; padding: 6px 8px; vertical-align: middle; }
+  .dim { color: #94a3b8; }
   .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
-  .chip { font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
+
+  /* ── 見出しカード ───────────────────────────── */
+  .run-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .run-id { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 17px; font-weight: 700; }
+  .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px 18px; margin-top: 12px; }
+  .meta dt { font-size: 11px; color: #64748b; }
+  .meta dd { margin: 2px 0 0; font-size: 13px; word-break: break-all; }
+  .tally { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .tally .chip b { font-variant-numeric: tabular-nums; }
+
+  /* ── 表 ────────────────────────────────────── */
+  table.pu { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.pu th { text-align: left; color: #64748b; font-size: 11px; font-weight: 600;
+                border-bottom: 2px solid #e2e8f0; padding: 7px 10px; white-space: nowrap; }
+  table.pu th.num { text-align: right; }
+  table.pu td { border-bottom: 1px solid #f1f5f9; padding: 9px 10px; vertical-align: middle; }
+  table.pu td.nw { white-space: nowrap; }
+  td .bad, td .pu-warn { max-width: 300px; }
+  body.show-detail table.pu { min-width: 1120px; }
+  tr.grp td { background: #f8fafc; border-top: 2px solid #e2e8f0; border-bottom: 0; padding: 9px 10px 6px; }
+  .grp-name { font-weight: 700; font-size: 13px; }
+  .grp-meta { font-size: 12px; color: #64748b; margin-left: 8px; }
+  .col-detail { display: none; }
+  body.show-detail .col-detail { display: table-cell; }
+  .tgl { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 400;
+         color: #475569; cursor: pointer; margin-left: auto; }
+  .tgl input { width: auto; }
+  .card h2 { display: flex; align-items: center; gap: 9px; font-size: 15px; }
+  .price-move { white-space: nowrap; }
+  .price-move .from { color: #64748b; }
+  .price-move .to { font-weight: 700; font-size: 14px; }
+  .up { color: #b91c1c; font-weight: 700; }     /* 値上げ (株価と同じ向き) */
+  .down { color: #1d4ed8; font-weight: 700; }   /* 値下げ */
+
+  /* ── しるし ───────────────────────────────── */
+  .chip { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+          font-weight: 600; white-space: nowrap; }
   .s-previewed { background: #e0f2fe; color: #0369a1; }
   .s-blocked_preview, .s-blocked { background: #fee2e2; color: #991b1b; }
   .s-manual_required { background: #fef3c7; color: #92400e; }
@@ -23,23 +56,35 @@
   .s-failed { background: #fee2e2; color: #991b1b; }
   .s-unknown { background: #fde68a; color: #7c2d12; }
   .s-skipped { background: #f1f5f9; color: #64748b; }
-  .mall { font-weight: 600; font-size: 12px; }
-  .m-rakuten { color: #bf0000; } .m-yahoo { color: #ff0033; } .m-amazon { color: #ff9900; }
+  .kind-recovery { background: #ede9fe; color: #5b21b6; }
+  .mall { font-weight: 700; font-size: 12px; white-space: nowrap; }
+  .m-rakuten { color: #bf0000; } .m-yahoo { color: #ff0033; } .m-amazon { color: #b45309; }
   .m-aupay { color: #eb5505; } .m-qoo10 { color: #e4002b; }
-  .exec-box { border: 2px solid #fecaca; background: #fff7f7; border-radius: 8px; padding: 12px 14px; }
-  .exec-box h3 { margin: 0 0 6px; font-size: 14px; color: #991b1b; }
-  .exec-gate { font-size: 12px; margin: 2px 0; }
-  .exec-gate.ng { color: #991b1b; }
-  .exec-gate.ok { color: #166534; }
-  .exec-confirm { font-family: inherit; font-size: 13px; padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 6px; width: 160px; }
+  .bad { color: #b91c1c; font-size: 11px; line-height: 1.5; }
+  /* 「操作の効き方が見た目と違う」注意書き (例: Yahoo のカラバリは全色つられて変わる) */
+  .pu-warn { font-size: 11px; color: #9a3412; background: #fff7ed; border: 1px solid #fed7aa;
+             border-radius: 4px; padding: 3px 6px; margin-top: 4px; line-height: 1.45; }
+
+  /* ── 実行・復旧 ────────────────────────────── */
+  .exec-box { border: 2px solid #fecaca; background: #fff7f7; border-radius: 10px; padding: 14px 16px; }
+  .exec-box h3 { margin: 0 0 8px; font-size: 15px; color: #991b1b; }
+  .exec-gates { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  .exec-gate { font-size: 12px; border-radius: 999px; padding: 3px 10px; border: 1px solid; }
+  .exec-gate.ng { color: #64748b; border-color: #e2e8f0; background: #f8fafc; }
+  .exec-gate.ok { color: #166534; border-color: #86efac; background: #f0fdf4; font-weight: 600; }
+  .exec-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  .exec-confirm { font-family: inherit; font-size: 13px; padding: 6px 10px; border: 1px solid #cbd5e1;
+                  border-radius: 7px; width: 150px; }
   .btn-danger { background: #b91c1c; color: #fff; border-color: #b91c1c; }
-  .btn-danger:disabled { opacity: .5; }
+  .btn-danger:disabled { opacity: .45; }
   .exec-result { margin-top: 10px; font-size: 13px; }
   .exec-result b { font-variant-numeric: tabular-nums; }
-  .rec-box { border: 1px solid #cbd5e1; background: #f8fafc; border-radius: 8px; padding: 12px 14px; }
-  .rec-box h3 { margin: 0 0 6px; font-size: 14px; color: #334155; }
+  .rec-box { border: 1px solid #cbd5e1; background: #f8fafc; border-radius: 10px; padding: 14px 16px; }
+  .rec-box h3 { margin: 0 0 8px; font-size: 15px; color: #334155; }
   .btn-rec { background: #fff; color: #b91c1c; border: 1px solid #fca5a5; }
-  .kind-recovery { background: #ede9fe; color: #5b21b6; }
+  /* 監査用の記録。ふだんは畳んでおく */
+  details.audit summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+  details.audit table { margin-top: 10px; }
 </style>
 <%
   // 復旧 run で戻せなかった行 (作成時に引き当て直せなかった行)。追記イベントから読む
@@ -56,30 +101,61 @@
     blocked: 'ガードで停止', skipped: '送っていない',
   };
   var CONF_LABEL = { confirmed: '確定', rule: '規則推定', sales: '実績のみ', unresolved: '未解決' };
+  // ★モール名は画面のどこでも日本語で揃える (表だけ英語のままだと別物に見える)
+  var MALL_LABEL = { rakuten: '楽天', yahoo: 'Yahoo', amazon: 'Amazon', aupay: 'au PAY', qoo10: 'Qoo10' };
   // ★href に入れてよいのは http(s) だけ (javascript: を踏ませない)
   var safeUrl = function (u) {
     var v = String(u == null ? '' : u).trim();
     var lower = v.toLowerCase();
     return (lower.indexOf('https://') === 0 || lower.indexOf('http://') === 0) ? v : null;
   };
+  // 状態の内訳 (この履歴がいまどうなっているのかを、行を数えなくても分かるように)
+  var tally = [];
+  var tallyIdx = {};
+  (run.operations || []).forEach(function (o) {
+    if (tallyIdx[o.state] == null) { tallyIdx[o.state] = tally.length; tally.push({ state: o.state, n: 0 }); }
+    tally[tallyIdx[o.state]].n++;
+  });
+  // 商品ごとのまとまり (同じ商品のモール違いを続けて並べる)
+  var groups = [];
+  var groupIdx = {};
+  (run.operations || []).forEach(function (o) {
+    var k = JSON.stringify([o.ne_code, o.row_kind || '']);
+    if (groupIdx[k] == null) {
+      groupIdx[k] = groups.length;
+      groups.push({ neCode: o.ne_code, rowKind: o.row_kind, name: o.product_name, ops: [] });
+    }
+    groups[groupIdx[k]].ops.push(o);
+  });
 %>
-<div class="topbar" style="margin-top:-1px">
-  <span class="pu-title">💴 価格一括改定 — 履歴</span>
-  <a href="/apps/price-update">戻る</a>
+<div class="topbar">
+  <a href="/apps/price-update">← 価格一括改定</a>
+  <span class="app-title">💴 記録の詳細</span>
   <span class="spacer"></span>
   <span class="user"><%= displayName %></span>
 </div>
 <div class="wrap" data-run-id="<%= run.run_id %>">
   <div class="card">
-    <h2><%= run.run_id %></h2>
-    <div class="pu-note">
-      <%= toJst(run.created_at, { seconds: true }) %> (JST) / 実行者 <%= run.created_by %> /
-      <% if (run.kind === 'recovery') { %><span class="chip kind-recovery">復旧 run</span>
-        <% if (run.source_run_id) { %>(元: <a href="/apps/price-update/runs/<%= run.source_run_id %>"><%= run.source_run_id %></a>)<% } %>
-      <% } else { %>通常 run<% } %> /
-      対象コード <%= run.neCodes.join(', ') %>
+    <div class="run-head">
+      <span class="run-id"><%= run.run_id %></span>
+      <% if (run.kind === 'recovery') { %>
+        <span class="chip kind-recovery">↩︎ 復旧 run</span>
+        <% if (run.source_run_id) { %>
+          <span class="pu-note">元: <a href="/apps/price-update/runs/<%= run.source_run_id %>"><%= run.source_run_id %></a></span>
+        <% } %>
+      <% } %>
     </div>
-    <% if (run.note) { %><div style="margin-top:6px;"><%= run.note %></div><% } %>
+    <dl class="meta">
+      <div><dt>記録した日時 (JST)</dt><dd class="code"><%= toJst(run.created_at, { seconds: true }) %></dd></div>
+      <div><dt>実行者</dt><dd><%= run.created_by %></dd></div>
+      <div><dt>対象コード</dt><dd class="code"><%= run.neCodes.join(', ') %></dd></div>
+      <div><dt>メモ</dt><dd><%= run.note || '—' %></dd></div>
+    </dl>
+    <div class="tally">
+      <% tally.forEach(function (t) { %>
+        <span class="chip s-<%= t.state %>"><%= STATE_LABEL[t.state] || t.state %> <b><%= t.n %></b></span>
+      <% }); %>
+    </div>
   </div>
 
   <% if (notRestored.length > 0) { %>
@@ -87,12 +163,12 @@
       <div class="exec-box">
         <h3>⚠️ 戻せなかった行が <%= notRestored.length %> 行あります</h3>
         <div class="pu-note">この復旧では下の行を戻せていません。モールの画面で実際の価格を確認してください。</div>
-        <table class="pu" style="margin-top:6px;">
+        <table class="pu" style="margin-top:8px;">
           <thead><tr><th>モール</th><th>NEコード</th><th>出品コード / SKU</th><th>理由</th></tr></thead>
           <tbody>
             <% notRestored.forEach(function (x) { %>
               <tr>
-                <td><span class="mall m-<%= x.mall %>"><%= x.mall %></span></td>
+                <td><span class="mall m-<%= x.mall %>"><%= MALL_LABEL[x.mall] || x.mall %></span></td>
                 <td class="code"><%= x.neCode %></td>
                 <td class="code"><%= x.listingCode || '' %><% if (x.skuCode) { %> / <%= x.skuCode %><% } %></td>
                 <td class="pu-note"><%= x.reason %></td>
@@ -106,19 +182,22 @@
 
   <div class="card">
     <div class="exec-box" id="exec-box">
-      <h3>⚠️ モールの価格を実際に書き換えます</h3>
+      <h3>モールの価格を実際に書き換えます</h3>
       <div id="exec-status" class="pu-note">確認中…</div>
-      <div id="exec-gates"></div>
-      <div id="exec-form" style="display:none; margin-top:10px;">
-        <div class="pu-note" style="margin-bottom:6px;">
-          押し間違いで走らないよう、確認欄に <b>実行する</b> と入力してからボタンを押してください。<br>
-          1件目は試運転です。送ったあとに価格を取り直して、その通りになっているか確かめます。
+      <div id="exec-gates" class="exec-gates"></div>
+      <div id="exec-form" style="display:none;">
+        <div id="exec-warn"></div>
+        <div class="exec-row">
+          <input class="exec-confirm" id="exec-confirm" placeholder="実行する" autocomplete="off"
+               aria-label="確認欄: 実行する と入力してください">
+          <button class="btn btn-danger" id="exec-btn" type="button" disabled>送る</button>
+          <span class="pu-note" id="exec-count"></span>
+        </div>
+        <div class="pu-note" style="margin-top:8px;">
+          押し間違いで走らないよう、確認欄に <b>実行する</b> と入力してからボタンを押してください。
+          1件目は試運転です — 送ったあとに価格を取り直し、その通りになっているか確かめます。
           確かめられなかった時・想定していない応答が返った時は、そこで止めて残りは送りません。
         </div>
-        <div id="exec-warn"></div>
-        <input class="exec-confirm" id="exec-confirm" placeholder="実行する" autocomplete="off">
-        <button class="btn btn-danger" id="exec-btn" type="button" disabled>送る</button>
-        <span class="pu-note" id="exec-count"></span>
       </div>
       <div class="exec-result" id="exec-result"></div>
     </div>
@@ -128,58 +207,76 @@
     <div class="rec-box">
       <h3>↩︎ 元の価格に戻す</h3>
       <div class="pu-note" id="rec-status"></div>
-      <div id="rec-form" style="display:none; margin-top:8px;">
-        <div class="pu-note" style="margin-bottom:6px;">
-          戻す先の価格は<b>この履歴の記録から取ります</b> — 打ち間違えようがありません。<br>
-          押すと「戻すための履歴」ができるだけで、まだ何も送りません。中身を確かめてから実行してください。
-        </div>
+      <div id="rec-form" style="display:none; margin-top:10px;">
         <button class="btn btn-rec" id="rec-btn" type="button">戻すための履歴を作る</button>
+        <div class="pu-note" style="margin-top:6px;">
+          戻す先の価格は<b>この履歴の記録から取ります</b> — 打ち間違えようがありません。
+          押すと「戻すための履歴」ができるだけで、まだ何も送りません。
+        </div>
       </div>
       <div class="pu-note" id="rec-result" style="margin-top:8px;"></div>
     </div>
   </div>
 
   <div class="card">
-    <h2>行 (<%= run.operations.length %>)</h2>
+    <h2>行 (<%= run.operations.length %>)
+      <label class="tgl"><input type="checkbox" id="detail-tgl">詳しく表示 (出品コード・引き当て)</label>
+    </h2>
     <div style="overflow-x:auto;">
       <table class="pu">
         <thead>
           <tr>
-            <th>状態</th><th>モール</th><th>商品</th><th>出品コード / SKU</th><th>出品の確認</th>
-            <th class="num">記録時の価格</th><th class="num">新売価</th><th>判定</th><th></th>
+            <th>状態</th><th>モール</th>
+            <th class="col-detail">出品コード / SKU</th>
+            <th class="col-detail">引き当て</th>
+            <th class="num">価格 (記録時 → 新売価)</th>
+            <th class="num">変更</th>
+            <th>判定</th><th></th>
           </tr>
         </thead>
         <tbody>
-          <% run.operations.forEach(function (o) { %>
-            <% var guard = o.guard_json ? JSON.parse(o.guard_json) : null; %>
-            <tr data-op="<%= o.operation_id %>">
-              <td>
-                <span class="chip s-<%= o.state %>" data-state-cell><%= STATE_LABEL[o.state] || o.state %></span>
-              </td>
-              <td><span class="mall m-<%= o.mall %>"><%= o.mall %></span></td>
-              <td>
-                <div class="code"><%= o.ne_code %><%= o.row_kind === 'set' ? ' (セット)' : '' %></div>
-                <div class="pu-note"><%= o.product_name || '' %></div>
-              </td>
-              <td class="code"><%= o.listing_code || '' %><% if (o.sku_code) { %><div class="pu-note">SKU <%= o.sku_code %></div><% } %></td>
-              <td><%= CONF_LABEL[o.confidence] || o.confidence %><div class="pu-note"><%= o.price_source || '' %></div></td>
-              <td class="num"><%= o.expected_current_price == null ? '—' : o.expected_current_price.toLocaleString() %></td>
-              <td class="num"><%= o.new_price == null ? '—' : o.new_price.toLocaleString() %></td>
-              <td class="pu-note">
-                <% if (guard && guard.blocks && guard.blocks.length) { %><%= guard.blocks.join(' / ') %><% } %>
-                <%# ★注意書きはブロック理由があっても消さない。「1色のつもりが全色」は隠すと危ない %>
-                <% if (guard && guard.warns && guard.warns.length) { %><div class="pu-warn"><%= guard.warns.join(' / ') %></div><% } %>
-                <% if (!(guard && (((guard.blocks || []).length) || ((guard.warns || []).length)))) { %>—<% } %>
-              </td>
-              <td>
-                <% if (o.initial_state === 'manual_required') { %>
-                  <button class="btn btn-sm manual-btn" data-op="<%= o.operation_id %>" data-done="<%= o.state === 'manual_done' ? '0' : '1' %>">
-                    <%= o.state === 'manual_done' ? '取り消す' : '手動更新した' %>
-                  </button>
-                <% } %>
-                <% var href = safeUrl(o.product_url); if (href) { %><a href="<%= href %>" target="_blank" rel="noopener">開く</a><% } %>
-              </td>
-            </tr>
+          <% groups.forEach(function (g) { %>
+            <tr class="grp"><td colspan="8">
+              <span class="grp-name"><%= g.name || '(名称なし)' %></span>
+              <% if (g.rowKind === 'set') { %><span class="chip s-manual_required">セット</span><% } %>
+              <span class="grp-meta code"><%= g.neCode %></span>
+            </td></tr>
+            <% g.ops.forEach(function (o) { %>
+              <% var guard = o.guard_json ? JSON.parse(o.guard_json) : null; %>
+              <% var ratio = (o.expected_current_price && o.new_price)
+                   ? ((o.new_price - o.expected_current_price) / o.expected_current_price) * 100 : null; %>
+              <tr data-op="<%= o.operation_id %>">
+                <td>
+                  <span class="chip s-<%= o.state %>" data-state-cell><%= STATE_LABEL[o.state] || o.state %></span>
+                </td>
+                <td><span class="mall m-<%= o.mall %>"><%= MALL_LABEL[o.mall] || o.mall %></span></td>
+                <td class="col-detail code"><%= o.listing_code || '' %><% if (o.sku_code) { %><div class="pu-note">SKU <%= o.sku_code %></div><% } %></td>
+                <td class="col-detail"><%= CONF_LABEL[o.confidence] || o.confidence %><div class="pu-note"><%= o.price_source || '' %></div></td>
+                <td class="num price-move">
+                  <span class="from"><%= o.expected_current_price == null ? '—' : o.expected_current_price.toLocaleString() %></span>
+                  <span class="dim">→</span>
+                  <span class="to"><%= o.new_price == null ? '—' : o.new_price.toLocaleString() %></span>
+                </td>
+                <td class="num nw">
+                  <% if (ratio == null) { %><span class="dim">—</span>
+                  <% } else { %><span class="<%= ratio >= 0 ? 'up' : 'down' %>"><%= ratio >= 0 ? '▲ +' : '▼ ' %><%= ratio.toFixed(1) %>%</span><% } %>
+                </td>
+                <td>
+                  <% if (guard && guard.blocks && guard.blocks.length) { %><div class="bad"><%= guard.blocks.join(' / ') %></div><% } %>
+                  <%# ★注意書きはブロック理由があっても消さない。「1色のつもりが全色」は隠すと危ない %>
+                  <% if (guard && guard.warns && guard.warns.length) { %><div class="pu-warn"><%= guard.warns.join(' / ') %></div><% } %>
+                  <% if (!(guard && (((guard.blocks || []).length) || ((guard.warns || []).length)))) { %><span class="dim">—</span><% } %>
+                </td>
+                <td>
+                  <% if (o.initial_state === 'manual_required') { %>
+                    <button class="btn btn-sm manual-btn" data-op="<%= o.operation_id %>" data-done="<%= o.state === 'manual_done' ? '0' : '1' %>">
+                      <%= o.state === 'manual_done' ? '取り消す' : '手動更新した' %>
+                    </button>
+                  <% } %>
+                  <% var href = safeUrl(o.product_url); if (href) { %><a href="<%= href %>" target="_blank" rel="noopener">開く</a><% } %>
+                </td>
+              </tr>
+            <% }); %>
           <% }); %>
         </tbody>
       </table>
@@ -188,21 +285,23 @@
   </div>
 
   <div class="card">
-    <h2>イベント (追記のみ)</h2>
-    <table class="pu">
-      <thead><tr><th>日時 (JST)</th><th>操作者</th><th>イベント</th><th>対象</th><th>詳細</th></tr></thead>
-      <tbody>
-        <% run.events.forEach(function (e) { %>
-          <tr>
-            <td class="code"><%= toJst(e.at, { seconds: true }) %></td>
-            <td><%= e.actor %></td>
-            <td><%= STATE_LABEL[e.event] || e.event %></td>
-            <td class="code"><%= e.operation_id || '(run)' %></td>
-            <td class="pu-note"><%= e.detail_json || '' %></td>
-          </tr>
-        <% }); %>
-      </tbody>
-    </table>
+    <details class="audit">
+      <summary>イベント (追記のみ・<%= run.events.length %> 件)</summary>
+      <table class="pu">
+        <thead><tr><th>日時 (JST)</th><th>操作者</th><th>イベント</th><th>対象</th><th>詳細</th></tr></thead>
+        <tbody>
+          <% run.events.forEach(function (e) { %>
+            <tr>
+              <td class="code"><%= toJst(e.at, { seconds: true }) %></td>
+              <td class="pu-note"><%= e.actor %></td>
+              <td><%= STATE_LABEL[e.event] || e.event %></td>
+              <td class="code"><%= e.operation_id || '(run)' %></td>
+              <td class="pu-note code"><%= e.detail_json || '' %></td>
+            </tr>
+          <% }); %>
+        </tbody>
+      </table>
+    </details>
   </div>
 </div>
 
@@ -218,6 +317,8 @@
   // ★日時は DB に UTC で入っている。サーバ側 (format.js) と同じ関数をここでも使い、
   //   画面の表示を JST に揃える (2つの実装がずれると run を取り違える)
   <%- toJstClientSrc %>
+
+  $('detail-tgl').onchange = function () { document.body.classList.toggle('show-detail', this.checked); };
 
   document.querySelectorAll('.manual-btn').forEach(function (btn) {
     btn.addEventListener('click', async function () {
@@ -255,9 +356,9 @@
 
     const gates = Object.entries(info.gates || {});
     $('exec-gates').innerHTML = gates.map(([mall, g]) =>
-      '<div class="exec-gate ' + (g.enabled ? 'ok' : 'ng') + '">'
-      + (g.enabled ? '● ' : '○ ') + esc(MALL_LABEL[mall] || mall) + ': '
-      + esc(g.enabled ? '送信できます' : g.reason) + '</div>').join('');
+      '<span class="exec-gate ' + (g.enabled ? 'ok' : 'ng') + '" title="' + esc(g.enabled ? '' : g.reason) + '">'
+      + (g.enabled ? '● ' : '○ ') + esc(MALL_LABEL[mall] || mall) + ' '
+      + esc(g.enabled ? '送れます' : '止まっています') + '</span>').join('');
 
     if (info.claim) {
       // ★claim は「実行を始めた」印であって「終わった」印ではない。
@@ -265,7 +366,7 @@
       $('exec-status').innerHTML = 'この履歴は <b>' + esc(toJst(info.claim.claimed_at, true))
         + '</b> に <b>' + esc(info.claim.claimed_by) + '</b> が実行を開始しています。'
         + '同じ内容をもう一度送ることはしません。'
-        + '<b>まだ途中の場合もあります</b> — 下の行とイベントで1行ずつ状態を確認してください'
+        + '<b>まだ途中の場合もあります</b> — 上の内訳と下の行で1行ずつ状態を確認してください'
         + ' (「送信中」のまま残っている行は、モールの画面で実際の価格を確かめてください)。';
       return;
     }
@@ -278,8 +379,8 @@
       return;
     }
 
-    $('exec-status').innerHTML = '送る対象は <b>' + n(info.targets) + ' 行</b> です。'
-      + '<b>送った価格は自動では戻せません</b> — 新売価が正しいか、上の表でもう一度確かめてください。';
+    $('exec-status').innerHTML = '送る対象は <b>' + n(info.targets) + ' 行</b>。'
+      + '<b>送った価格は自動では戻せません</b> — 新売価が正しいか、下の表でもう一度確かめてください。';
     $('exec-count').textContent = '(' + n(info.targets) + ' 行)';
     // ★ボタンの文言はこの履歴で実際に送るモールから作る。
     //   「楽天へ送る」と決め打ちにしていたので、Yahoo の履歴でも楽天と書いてあった (中原さん 9/1)
