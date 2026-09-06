@@ -271,7 +271,7 @@
     function bcHtml(r) {
       if (r.barcode) {
         const src = { line: '入荷受付伝票', stock: '在庫', schedule: '入荷予定', manual: '手入力' }[r.barcode_source] || '';
-        return '<div class="bc">' + esc(r.barcode) + ' <small>(' + esc(String(r.barcode_type || '').toUpperCase()) + (src ? '・' + src : '') + ')</small><button type="button" data-act="bc">直す</button></div>';
+        return '<div class="bc">' + esc(r.barcode) + ' <small>(' + esc(String(r.barcode_type || '').toUpperCase()) + (src ? '・' + src : '') + ')</small>' + (r.barcode_live ? '' : '<button type="button" data-act="bc">直す</button>') + '</div>';
       }
       return '<div class="bc"><span class="none">バーコード未登録</span><button type="button" data-act="bc">JAN / FNSKU を入れる</button></div>';
     }
@@ -392,7 +392,7 @@
       // expected = この画面が見ていた値。別の人が先に入れて/直していれば書かず、最新を見せる
       const r = await postJson(API + '/products/barcode', { code_key: row.code_key, barcode: v.trim(), expected: row.barcode || null, worker_code: workerCode() || undefined });
       if (!r.json.ok) {
-        if (r.json.error === 'state_changed') { await search({ silent: true }); banner('warn', esc(r.json.message || 'バーコードが変わりました。確認してください'), { sticky: true }); return; }
+        if (r.json.error === 'state_changed' || r.json.error === 'readonly_barcode') { await search({ silent: true }); banner('warn', esc(r.json.message || 'バーコードが変わりました。確認してください'), { sticky: true }); return; }
         banner('err', r.json.message || 'バーコードを保存できませんでした', { sticky: true }); if (r.json.error === 'worker_required') openWorkerPick(); return;
       }
       await search({ silent: true });
@@ -465,7 +465,7 @@
           // expected = この画面が見ていた値 (未登録なら null)。別の人が先に入れていれば保存も印刷もせず、最新を見せる
           const rb = await postJson(API + '/products/barcode', { code_key: row.code_key, barcode: bcIn, expected: row.barcode || null, worker_code: workerCode() || undefined });
           if (!rb.json.ok) {
-            if (rb.json.error === 'state_changed') { closePrintBox(); await search({ silent: true }); banner('warn', '🏷 ' + esc(rb.json.message || 'バーコードが変わりました。確認してください'), { sticky: true }); return; }
+            if (rb.json.error === 'state_changed' || rb.json.error === 'readonly_barcode') { closePrintBox(); await search({ silent: true }); banner('warn', '🏷 ' + esc(rb.json.message || 'バーコードが変わりました。確認してください'), { sticky: true }); return; }
             msgEl.textContent = rb.json.message || 'バーコードを保存できませんでした'; $('#printOk').disabled = false; return;
           }
         }

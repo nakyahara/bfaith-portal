@@ -1000,14 +1000,15 @@ export function productInfoMap(codeKeys) {
 const codeKeyOf = (s) => String(s == null ? '' : s).trim().toLowerCase();
 
 /**
- * 商品のバーコード (JAN/FNSKU) を探す。Render に完全なマスタは無いので、控え → 見つかる場所を順に見る。
- *   ① f_inbound_check_barcodes (人が入れた / 前に見つけて控えた)
- *   ② f_inbound_check_lines (入荷受付伝票の明細。新しい取込ほど後)
- *   ③ mirror_logizard_stock (在庫ミラー。在庫がある間だけ行がある)
- *   ④ f_inbound_schedule (値札CSV = 入荷予定 7日分)
- * ②〜④ で見つけたら控えに写す (在庫が消えても次から引ける)。数字だけ = JAN / 英字を含む英数字 = FNSKU、
+ * 商品のバーコード (JAN/FNSKU) を探す。Render に完全なマスタは無いので、見つかる場所を順に見る。
+ *   ① f_inbound_check_lines (入荷受付伝票の明細。新しい取込ほど後)   ┐ ロジザード側の値 = 正
+ *   ② mirror_logizard_stock (在庫ミラー。在庫がある間だけ行がある)    │ (値札はロジザードの検品でスキャンされる)
+ *   ③ f_inbound_schedule (値札CSV = 入荷予定 7日分)                  ┘
+ *   ④ f_inbound_check_barcodes (控え: 前に①〜③で見つけた値 / 人が入れた値 'manual')
+ * ①〜③ で見つけたら控えに写す (上書き = 在庫が消えても次から引ける。手入力よりロジザード側が勝つので、
+ * 伝票から刷っても 🔍 商品画面から刷っても同じ紙。Codex R2 High-2)。数字だけ = JAN / 英字を含む英数字 = FNSKU、
  * それ以外の値は使わない (値札に刷れない)
- * @returns {{barcode:string, barcode_type:'jan'|'fnsku', source:string}|null}
+ * @returns {{barcode:string, barcode_type:'jan'|'fnsku', source:string, live:boolean}|null}  live = ①〜③ にいま値がある (人は変えられない)
  */
 export function resolveBarcode(codeKey, db = getDB()) {
   const k = codeKeyOf(codeKey);
@@ -1019,8 +1020,6 @@ export function resolveBarcode(codeKey, db = getDB()) {
     if (/^[A-Za-z0-9]+$/.test(s) && /[A-Za-z]/.test(s)) return 'fnsku';
     return null;
   };
-  const cached = db.prepare('SELECT barcode, barcode_type, source FROM f_inbound_check_barcodes WHERE code_key = ?').get(k);
-  if (cached) return cached;
   const candidates = [];
   if (tableExists(db, 'f_inbound_check_lines')) {
     candidates.push(['line', db.prepare(`SELECT barcode FROM f_inbound_check_lines WHERE code_key = ? AND barcode IS NOT NULL AND trim(barcode) <> ''
@@ -1036,11 +1035,15 @@ export function resolveBarcode(codeKey, db = getDB()) {
     const t = typeOf(bc);
     if (!t) continue;
     const barcode = String(bc).trim();
-    db.prepare(`INSERT INTO f_inbound_check_barcodes (code_key, barcode, barcode_type, source, updated_at) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(code_key) DO NOTHING`).run(k, barcode, t, source, utcNow());
-    return { barcode, barcode_type: t, source };
+    // 控えに写す (値か出どころが変わったときだけ書く = 検索のたびに updated_at を動かさない)
+    db.prepare(`INSERT INTO f_inbound_check_barcodes (code_key, barcode, barcode_type, source, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(code_key) DO UPDATE SET barcode = excluded.barcode, barcode_type = excluded.barcode_type, source = excluded.source,
+        updated_at = excluded.updated_at, updated_by = NULL
+      WHERE barcode <> excluded.barcode OR source <> excluded.source`).run(k, barcode, t, source, utcNow());
+    return { barcode, barcode_type: t, source, live: true };
   }
-  return null;
+  const cached = db.prepare('SELECT barcode, barcode_type, source FROM f_inbound_check_barcodes WHERE code_key = ?').get(k);
+  return cached ? { ...cached, live: false } : null;
 }
 
 /**
@@ -1052,35 +1055,47 @@ export function setProductBarcode(codeKey, barcode, actor = null, { expected } =
   const k = codeKeyOf(codeKey);
   const s = String(barcode == null ? '' : barcode).trim();
   if (!k) return { ok: false, error: 'bad_request', message: '商品が指定されていません' };
-  // 商品マスタに居る商品だけ (任意のキーに控えを作らせない — 後で同じコードが登録されたとき、その古い値が最優先で使われる。Codex R1 Medium)
-  if (!tableExists(db, 'mirror_products') || !db.prepare('SELECT 1 FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ? LIMIT 1').get(k)) {
-    return { ok: false, error: 'not_found', message: 'この商品は商品マスタにありません' };
-  }
-  // 画面が見ていた値 (expected: 未登録なら null) と今の値が違えば書かない — ダイアログを開いた後に別の人が
-  // 入れた/直した値を、古い入力で上書きして違うシールを刷らせない (Codex R1 High-2)。expected 省略 = 見張らない
-  if (expected !== undefined) {
+  const type = !s ? null : /^[0-9]+$/.test(s) ? 'jan' : (/^[A-Za-z0-9]+$/.test(s) && /[A-Za-z]/.test(s) ? 'fnsku' : null);
+  if (s && !type) return { ok: false, error: 'bad_barcode', message: 'バーコードは数字だけ (JAN) か 英数字 (FNSKU) で入れてください' };
+  if (s.length > 40) return { ok: false, error: 'bad_barcode', message: 'バーコードが長すぎます' };
+  // 🚨 存在確認 → 今の値 → expected 比較 → 書込 を1つの書込みトランザクション (BEGIN IMMEDIATE) で。
+  //    2プロセスが同じ旧値を読んでから両方書く「後勝ち」を防ぐ (Codex R2 High-3)
+  return db.transaction(() => {
+    // 商品マスタに居る商品だけ (任意のキーに控えを作らせない — 後で同じコードが登録されたとき、その古い値が最優先で使われる。Codex R1 Medium)
+    if (!tableExists(db, 'mirror_products') || !db.prepare('SELECT 1 FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ? LIMIT 1').get(k)) {
+      return { ok: false, error: 'not_found', message: 'この商品は商品マスタにありません' };
+    }
     const cur = resolveBarcode(k, db);
     const curBc = cur ? cur.barcode : null;
-    const exp = expected == null || String(expected).trim() === '' ? null : String(expected).trim();
-    if (curBc !== exp) {
-      return { ok: false, error: 'state_changed', current: cur, message: curBc
-        ? 'このバーコードは別の人が「' + curBc + '」に入れました/直しました。画面を更新して確認してください'
-        : 'このバーコードは別の人が消しました。画面を更新して確認してください' };
+    // ロジザード側 (取込行 / 在庫 / 入荷予定) に値がある商品は人が変えられない — 値札はロジザードの検品でスキャンされるので、
+    // そちらが正 (違う値を刷ると検品で通らない)。同じ値なら何もしない
+    if (cur && cur.live) {
+      if (s === curBc) return { ok: true, barcode: curBc, barcode_type: cur.barcode_type, unchanged: true };
+      const from = { line: '入荷受付伝票', stock: '在庫', schedule: '入荷予定' }[cur.source] || cur.source;
+      return { ok: false, error: 'readonly_barcode', current: cur,
+        message: 'このバーコードはロジザード側 (' + from + ') の値「' + curBc + '」なので、ここでは変えられません。違っていればロジザードの商品マスタを直してください' };
     }
-  }
-  if (!s) {
-    getDB().prepare("DELETE FROM f_inbound_check_barcodes WHERE code_key = ? AND source = 'manual'").run(k);
-    return { ok: true, cleared: true };
-  }
-  const type = /^[0-9]+$/.test(s) ? 'jan' : (/^[A-Za-z0-9]+$/.test(s) && /[A-Za-z]/.test(s) ? 'fnsku' : null);
-  if (!type) return { ok: false, error: 'bad_barcode', message: 'バーコードは数字だけ (JAN) か 英数字 (FNSKU) で入れてください' };
-  if (s.length > 40) return { ok: false, error: 'bad_barcode', message: 'バーコードが長すぎます' };
-  getDB().prepare(`INSERT INTO f_inbound_check_barcodes (code_key, barcode, barcode_type, source, updated_at, updated_by)
-    VALUES (?, ?, ?, 'manual', ?, ?)
-    ON CONFLICT(code_key) DO UPDATE SET barcode = excluded.barcode, barcode_type = excluded.barcode_type,
-      source = 'manual', updated_at = excluded.updated_at, updated_by = excluded.updated_by`)
-    .run(k, s, type, utcNow(), actor);
-  return { ok: true, barcode: s, barcode_type: type };
+    // 画面が見ていた値 (expected: 未登録なら null) と今の値が違えば書かない — ダイアログを開いた後に別の人が
+    // 入れた/直した値を、古い入力で上書きして違うシールを刷らせない (Codex R1 High-2)。expected 省略 = 見張らない (内部呼び出し用)
+    if (expected !== undefined) {
+      const exp = expected == null || String(expected).trim() === '' ? null : String(expected).trim();
+      if (curBc !== exp) {
+        return { ok: false, error: 'state_changed', current: cur, message: curBc
+          ? 'このバーコードは別の人が「' + curBc + '」に入れました/直しました。画面を更新して確認してください'
+          : 'このバーコードは別の人が消しました。画面を更新して確認してください' };
+      }
+    }
+    if (!s) {
+      db.prepare("DELETE FROM f_inbound_check_barcodes WHERE code_key = ? AND source = 'manual'").run(k);
+      return { ok: true, cleared: true };
+    }
+    db.prepare(`INSERT INTO f_inbound_check_barcodes (code_key, barcode, barcode_type, source, updated_at, updated_by)
+      VALUES (?, ?, ?, 'manual', ?, ?)
+      ON CONFLICT(code_key) DO UPDATE SET barcode = excluded.barcode, barcode_type = excluded.barcode_type,
+        source = 'manual', updated_at = excluded.updated_at, updated_by = excluded.updated_by`)
+      .run(k, s, type, utcNow(), actor);
+    return { ok: true, barcode: s, barcode_type: type };
+  }).immediate();
 }
 
 /** 仕入先の一覧 (商品マスタに紐づくものだけ・商品数つき)。絞り込みのプルダウン用 */
@@ -1141,6 +1156,7 @@ export function searchProducts({ supplier = null, q = '', includeInactive = fals
     r.barcode = bc ? bc.barcode : null;
     r.barcode_type = bc ? bc.barcode_type : null;
     r.barcode_source = bc ? bc.source : null;
+    r.barcode_live = bc ? !!bc.live : false;   // ロジザード側に値がある = 画面では直せない
     r.pack_qty = r.info && Number.isInteger(r.info.irisu) && r.info.irisu > 0 ? r.info.irisu : null;
   }
   return { rows, total };

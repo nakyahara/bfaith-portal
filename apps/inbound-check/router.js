@@ -314,7 +314,7 @@ router.get('/', (req, res) => {
 // ─── 作業 API ───
 router.get('/api/state', api((req, res) => {
   const state = getState();
-  // 🏷 明細ごとの最新の値札印刷ジョブ (結果は5秒ポーリングで行に出る) + 印刷できる倉庫PCがいるか
+  // 🏷 明細ごとの値札印刷ジョブ (同じ商品に未確定のジョブがあればそれ、無ければ明細の最新。結果は5秒ポーリングで行に出る) + 印刷できる倉庫PCがいるか
   if (state.batch) {
     const jobs = latestJobsForBatch(state.batch.id);
     for (const l of state.lines) l.print_job = jobs.get(l.line_key) || null;
@@ -405,10 +405,13 @@ router.get('/api/products', api((req, res) => {
 router.post('/api/products/barcode', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  // expected = 画面が見ていた値 (未登録なら null)。別の人が先に入れて/直していれば state_changed (409) で書かない
-  const opts = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expected') ? { expected: req.body.expected } : {};
-  const r = setProductBarcode(req.body?.code_key, req.body?.barcode, editorName(req, w.worker), opts);
-  res.status(r.ok ? 200 : r.error === 'state_changed' ? 409 : r.error === 'not_found' ? 404 : 400).json(r);
+  // expected = 画面が見ていた値 (未登録なら null) は**必須**。別の人が先に入れて/直していれば state_changed (409) で書かない。
+  // 省略を許すと古いクライアント / API 直叩きが競合検知を素通りする (Codex R2 Medium)
+  if (!req.body || !Object.prototype.hasOwnProperty.call(req.body, 'expected')) {
+    return res.status(400).json({ ok: false, error: 'expected_required', message: 'expected (画面が見ていたバーコード。未登録なら null) が必要です' });
+  }
+  const r = setProductBarcode(req.body.code_key, req.body.barcode, editorName(req, w.worker), { expected: req.body.expected });
+  res.status(r.ok ? 200 : (r.error === 'state_changed' || r.error === 'readonly_barcode') ? 409 : r.error === 'not_found' ? 404 : 400).json(r);
 }));
 
 // 表示中の商品の印刷状況だけ取り直す (5秒ポーリング用。検索を回し直さない・200件を超えて表示していても全部見る)

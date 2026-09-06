@@ -22,7 +22,7 @@
  * (SELECT してから UPDATE すると、期限切れ→unknown が挟まった古い報告が乗っ取れる)。
  */
 import crypto from 'crypto';
-import { getDB, getProductForPrint, setProductBarcode } from './db.js';
+import { getDB, getProductForPrint, setProductBarcode, resolveBarcode } from './db.js';
 
 const utcNow = () => new Date().toISOString();
 const ms = (v) => { const t = Date.parse(v || ''); return Number.isFinite(t) ? t : null; };
@@ -176,7 +176,10 @@ export function enqueuePrintJob({ batchId, lineKey, productCode = null, barcodeO
       if (!active || active.id !== bid) return { ok: false, error: 'stale_batch', message: '一覧が新しくなっています。画面を更新してからもう一度押してください' };
       const line = db.prepare('SELECT * FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(bid, key);
       if (!line) return { ok: false, error: 'not_found', message: 'この明細は一覧にありません' };
-      subject = { codeKey: line.code_key, productCode: line.product_id, productName: line.product_name, barcode: line.barcode, batchId: bid, lineKey: key };
+      // 刷る値は商品モードと同じ経路 (resolveBarcode: 取込行 → 在庫 → 入荷予定 → 控え)。取込行にバーコードが無い (ロジザード未登録) 商品でも、
+      // 🔍 商品画面で入れた控えがあれば伝票からも刷れる。取込行にあればそれが最優先 = 伝票と商品画面で同じ紙 (Codex R2 High-2)
+      const bc = resolveBarcode(line.code_key, db);
+      subject = { codeKey: line.code_key, productCode: line.product_id, productName: line.product_name, barcode: bc ? bc.barcode : (line.barcode || null), batchId: bid, lineKey: key };
     } else {
       // 商品マスタから。バーコードは控え (f_inbound_check_barcodes) → 取込行 → 在庫ミラー → 入荷予定 の順に探す。
       // 刷る値は **必ず DB (控え) の値**。画面から来た barcodeOverride は:
@@ -202,7 +205,7 @@ export function enqueuePrintJob({ batchId, lineKey, productCode = null, barcodeO
     const type = barcodeTypeOf(barcode);
     if (!type) {
       return { ok: false, error: 'bad_barcode', message: barcode ? `バーコード「${barcode}」は JAN (数字のみ) でも FNSKU (英数字) でもないため印刷できません`
-        : (source === 'line' ? 'この商品はロジザードにバーコードが登録されていないため印刷できません' : 'この商品のバーコードが分かりません。JAN か FNSKU を入力してください') };
+        : (source === 'line' ? 'この商品はロジザードにバーコードが登録されていないため印刷できません (🔍 商品から探す で JAN / FNSKU を入れると刷れます)' : 'この商品のバーコードが分かりません。JAN か FNSKU を入力してください') };
     }
     const name = String(subject.productName == null ? '' : subject.productName).trim();
     if (!name) return { ok: false, error: 'bad_request', message: '商品名が空のため印刷できません' };
@@ -210,28 +213,36 @@ export function enqueuePrintJob({ batchId, lineKey, productCode = null, barcodeO
     // 🚨 二重印刷の見張りは **商品単位** (code_key)。伝票から刷っても 🔍 商品画面から刷っても紙は同じ1枚なので、
     //    片方が進行中 / 結果不明なら、もう片方からも積まない (Codex R1 High-1)。伝票の作り直し (superseded) を
     //    またいでも同じ: 朝の伝票で結果不明のまま、午後の伝票から証跡なしに刷り直させない。
+    //    「最新1件」ではなく **同じ商品の全ジョブ** を見る — 旧版は明細ごとに並行して積めたので、古い未確定 (leased/unknown) の
+    //    後ろに別明細の completed が居ることがあり、最新1件だけ見ると隠れる (Codex R2 High-1)。
     //    終わっていれば (completed/failed/manual、unknown は証跡つき) 新しいジョブを積める = 人が判断して押し直す
     const ck = String(subject.codeKey == null ? '' : subject.codeKey).trim().toLowerCase();
-    const last = ck
-      ? db.prepare('SELECT * FROM f_inbound_check_print_jobs WHERE code_key = ? ORDER BY id DESC LIMIT 1').get(ck)
-      : db.prepare('SELECT * FROM f_inbound_check_print_jobs WHERE source = ? AND batch_id = ? AND line_key = ? ORDER BY id DESC LIMIT 1').get('line', bid, key);
-    if (last && ACTIVE_STATES.includes(last.state)) {
-      return { ok: false, error: 'in_progress', message: 'この商品のシールは印刷中です (結果が出るまでお待ちください)', job: publicJob(last) };
+    const scope = ck ? ['code_key = ?', [ck]] : ["source = 'line' AND batch_id = ? AND line_key = ?", [bid, key]];
+    const active = db.prepare(`SELECT * FROM f_inbound_check_print_jobs WHERE ${scope[0]} AND state IN ('queued','leased','submitted') ORDER BY id DESC LIMIT 1`).get(...scope[1]);
+    if (active) {
+      return { ok: false, error: 'in_progress', message: 'この商品のシールは印刷中です (結果が出るまでお待ちください)', job: publicJob(active) };
     }
-    // 🚨 直前が「❓ 結果不明」なら、そのジョブ ID を「実物を見て出ていなかった」の証跡として受け取ってからしか積まない。
-    //    紙が出ていたのに刷り直すと同じ商品のシールが2枚になり、別の箱に貼られると棚が狂う (気づけない)
+    // 🚨 未確認 (acknowledged_at IS NULL) の「❓ 結果不明」が1件でもあれば、そのジョブ ID を「実物を見て出ていなかった」の
+    //    証跡として受け取ってからしか積まない。紙が出ていたのに刷り直すと同じ商品のシールが2枚になり、別の箱に貼られると棚が狂う (気づけない)
+    const pending = db.prepare(`SELECT * FROM f_inbound_check_print_jobs WHERE ${scope[0]} AND state = 'unknown' AND acknowledged_at IS NULL ORDER BY id DESC LIMIT 1`).get(...scope[1]);
     let acked = null;
-    if (last && last.state === 'unknown') {
-      if (Number(acknowledgeUnknownJobId) !== last.id) {
-        return { ok: false, error: 'confirm_unknown', message: '前回の印刷結果が不明です。QL-700 の実物を確認し、シールが出ていない場合だけ「実物を確認した」にチェックしてもう一度発行してください', job: publicJob(last) };
+    if (pending) {
+      if (Number(acknowledgeUnknownJobId) !== pending.id) {
+        return { ok: false, error: 'confirm_unknown', message: '前回の印刷結果が不明です。QL-700 の実物を確認し、シールが出ていない場合だけ「実物を確認した」にチェックしてもう一度発行してください', job: publicJob(pending) };
       }
-      acked = last.id;
+      acked = pending.id;
     } else if (acknowledgeUnknownJobId != null) {
-      // 🚨 証跡を付けて送ってきたのに、直前のジョブがもう unknown ではない (送る直前に遅延報告で completed になった /
-      //    画面が古い)。「出ていない」という前提が崩れているので積まない — 旧印刷 + 新印刷の2枚になる (Codex R3 High)
-      return { ok: false, error: 'state_changed', message: last && last.state === 'completed'
+      // 🚨 証跡を付けて送ってきたのに、もう未確認の unknown が無い (送る直前に遅延報告で completed になった / 別の画面で
+      //    確認済み / 画面が古い)。「出ていない」という前提が崩れているので積まない — 旧印刷 + 新印刷の2枚になる (Codex R3 High)
+      const ackRow = db.prepare('SELECT * FROM f_inbound_check_print_jobs WHERE id = ?').get(Number(acknowledgeUnknownJobId));
+      const last = db.prepare(`SELECT * FROM f_inbound_check_print_jobs WHERE ${scope[0]} ORDER BY id DESC LIMIT 1`).get(...scope[1]);
+      const other = last && (!ackRow || last.id !== ackRow.id);
+      const shown = ackRow || last;
+      return { ok: false, error: 'state_changed', message: ackRow && ackRow.state === 'completed'
         ? '前回のジョブは「✅ 印刷しました」に変わりました (遅れて結果が届きました)。そのシールを使ってください'
-        : '前回のジョブの状態が変わりました。画面を更新して確認してください', job: publicJob(last) };
+        : other
+          ? 'この商品の値札はその後に別の画面から発行され「' + (PRINT_STATE_LABELS[last.state] || last.state) + '」です。画面を更新して確認してください'
+          : '前回のジョブの状態が変わりました。画面を更新して確認してください', job: shown ? publicJob(shown) : null };
     }
 
     const target = resolvePrintTarget(targetDeviceId);
@@ -276,25 +287,57 @@ export function publicJob(row) {
 }
 
 /** バッチ内の明細ごとの最新ジョブ (line_key → publicJob)。/api/state で行に付ける */
+/**
+ * 伝票の各明細に出す値札ジョブ (line_key → publicJob)。
+ * 見張りは商品単位なので、見せる状態も商品単位: 同じ商品に **未確定 (進行中 / 未確認の結果不明)** のジョブがあれば
+ * それを (別の明細・作り直す前の伝票・🔍 商品画面からのものでも) 出し、無ければその明細自身の最新を出す (Codex R2 Medium-2)
+ */
 export function latestJobsForBatch(batchId) {
-  const rows = getDB().prepare(`SELECT j.* FROM f_inbound_check_print_jobs j
-    JOIN (SELECT line_key, MAX(id) AS id FROM f_inbound_check_print_jobs WHERE source = 'line' AND batch_id = ? GROUP BY line_key) m ON m.id = j.id`)
-    .all(batchId);
+  const db = getDB();
+  const lines = db.prepare('SELECT line_key, code_key FROM f_inbound_check_lines WHERE batch_id = ?').all(batchId);
   const map = new Map();
-  for (const r of rows) map.set(r.line_key, publicJob(r));
+  if (lines.length === 0) return map;
+  const own = new Map();
+  for (const r of db.prepare(`SELECT j.* FROM f_inbound_check_print_jobs j
+    JOIN (SELECT line_key, MAX(id) AS id FROM f_inbound_check_print_jobs WHERE source = 'line' AND batch_id = ? GROUP BY line_key) m ON m.id = j.id`).all(batchId)) own.set(r.line_key, r);
+  const pending = pendingJobsByProduct(db, lines.map(l => l.code_key));
+  for (const l of lines) {
+    const j = pending.get(String(l.code_key == null ? '' : l.code_key).trim().toLowerCase()) || own.get(l.line_key);
+    if (j) map.set(l.line_key, publicJob(j));
+  }
   return map;
 }
 
-/** 商品ごとの最新ジョブ (code_key → publicJob)。伝票からの発行も含む (見張りが商品単位なので、行に出す状況も商品単位)。商品を探す画面の行に付ける */
+/** 同じ商品の未確定ジョブ (進行中 / 未確認の結果不明) の最新 (code_key → row)。見張り (enqueuePrintJob) と同じ条件 */
+function pendingJobsByProduct(db, codeKeys) {
+  const keys = [...new Set((codeKeys || []).map(k => String(k == null ? '' : k).trim().toLowerCase()).filter(Boolean))];
+  const map = new Map();
+  for (let i = 0; i < keys.length; i += 500) {
+    const part = keys.slice(i, i + 500);
+    const ph = part.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT j.* FROM f_inbound_check_print_jobs j
+      JOIN (SELECT code_key, MAX(id) AS id FROM f_inbound_check_print_jobs
+            WHERE code_key IN (${ph}) AND (state IN ('queued','leased','submitted') OR (state = 'unknown' AND acknowledged_at IS NULL))
+            GROUP BY code_key) m ON m.id = j.id`).all(...part)) map.set(r.code_key, r);
+  }
+  return map;
+}
+
+/** 商品ごとに見せるジョブ (code_key → publicJob): 未確定があればそれ、無ければ最新 (伝票からの発行も含む)。🔍 商品を探す画面の行に付ける */
 export function latestJobsForProducts(codeKeys) {
-  const keys = [...new Set((codeKeys || []).map(k => String(k || '').trim().toLowerCase()).filter(Boolean))];
+  const db = getDB();
+  const keys = [...new Set((codeKeys || []).map(k => String(k == null ? '' : k).trim().toLowerCase()).filter(Boolean))];
   const map = new Map();
   if (keys.length === 0) return map;
-  const ph = keys.map(() => '?').join(',');
-  const rows = getDB().prepare(`SELECT j.* FROM f_inbound_check_print_jobs j
-    JOIN (SELECT code_key, MAX(id) AS id FROM f_inbound_check_print_jobs WHERE code_key IN (${ph}) GROUP BY code_key) m ON m.id = j.id`)
-    .all(...keys);
-  for (const r of rows) map.set(r.code_key, publicJob(r));
+  const pending = pendingJobsByProduct(db, keys);
+  for (let i = 0; i < keys.length; i += 500) {
+    const part = keys.slice(i, i + 500);
+    const ph = part.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT j.* FROM f_inbound_check_print_jobs j
+      JOIN (SELECT code_key, MAX(id) AS id FROM f_inbound_check_print_jobs WHERE code_key IN (${ph}) GROUP BY code_key) m ON m.id = j.id`).all(...part)) {
+      map.set(r.code_key, publicJob(pending.get(r.code_key) || r));
+    }
+  }
   return map;
 }
 
