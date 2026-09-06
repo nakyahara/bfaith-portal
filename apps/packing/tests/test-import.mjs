@@ -847,7 +847,7 @@ t('品違いの送信 = 再ピック+棚戻しの2タスク / 余りの送信 = 
   // return タスクは claim→fulfill で returned 終端。fulfill は「戻したロケ」が必須 (PR-4・Q3 決定)
   const ret = listOpenTasks().find((t) => t.batch_id === gr.batchId && t.kind === 'return' && t.sku === 'zaiko-y');
   applyTaskAction(ret.id, 'claim', '月');
-  const done = applyTaskAction(ret.id, 'fulfill', '月', { returnedBlock: 'P3FA', returnedLocation: '001-001-01' });
+  const done = svc.fulfillReturnTask(ret.id, '月', { returnedBlock: 'P3FA', returnedLocation: '001-001-01' });
   assert.equal(done.status, 'returned');
   assert.equal(done.returned_location, '001-001-01');
 });

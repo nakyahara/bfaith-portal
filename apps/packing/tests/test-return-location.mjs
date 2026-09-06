@@ -15,6 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'packing-return-test-'));
+process.env.PACKING_WEBHOOK_TIMEOUT_MS = '200';   // 末尾のタイムアウト検証用 (notify.js が起動時に読む)
 
 const { initPickingDB } = await import('../../picking/db.js');
 const { initPackingDB, getDB, utcNow, jstToday } = await import('../db.js');
@@ -101,19 +102,20 @@ t('setTaskLocationHint: 参考ロケが無ければ入る (source=stock)。も�
   assert.equal(setTaskLocationHint(returnTaskId, { location: '' }), false, '空は何もしない');
 });
 
-console.log('── ③ 棚戻しの完了は「戻したロケ」が必須 ──');
+console.log('── ③ 棚戻しの完了は「戻したロケ」が必須 (fulfillReturnTask に一本化) ──');
 {
-  throwsCode(() => applyTaskAction(returnTaskId, 'fulfill', '田中美波', { returnedLocation: '002-013-03' }), 'bad_transition', '未着手 (requested) から直接は完了できない (router が claim を先に入れる)');
+  throwsCode(() => applyTaskAction(returnTaskId, 'fulfill', '田中美波'), 'bad_transition', '未着手 (requested) から applyTaskAction では完了できない');
   applyTaskAction(returnTaskId, 'claim', '田中美波');
-  throwsCode(() => applyTaskAction(returnTaskId, 'fulfill', '田中美波'), 'returned_location_required', 'ロケ無しでは完了できない');
-  throwsCode(() => applyTaskAction(returnTaskId, 'fulfill', '田中美波', { returnedLocation: '002 013' }), 'bad_location', '形式不正 (空白) は 400');
-  throwsCode(() => applyTaskAction(returnTaskId, 'fulfill', '田中美波', { returnedBlock: 'P3 FA', returnedLocation: '002-013-03' }), 'bad_location', 'ブロックの形式不正も 400');
-  t('候補と違う場所へ戻した → 戻したロケ・時刻・人を記録。通知フラグ', () => {
-    const u = applyTaskAction(returnTaskId, 'fulfill', '田中美波', { returnedBlock: 'P3FB', returnedLocation: '001-002-03' });
+  throwsCode(() => applyTaskAction(returnTaskId, 'fulfill', '田中美波'), 'return_fulfill_requires_location_flow', '棚戻しは applyTaskAction(fulfill) を拒否 (二経路を残さない — Codex R2)');
+  throwsCode(() => fulfillReturnTask(returnTaskId, '田中美波'), 'returned_location_required', 'ロケ無しでは完了できない');
+  throwsCode(() => fulfillReturnTask(returnTaskId, '田中美波', { returnedLocation: '002 013' }), 'bad_location', '形式不正 (空白) は 400');
+  throwsCode(() => fulfillReturnTask(returnTaskId, '田中美波', { returnedBlock: 'P3 FA', returnedLocation: '002-013-03' }), 'bad_location', 'ブロックの形式不正も 400');
+  t('候補と違う場所へ戻した → 戻したロケ・時刻・人・出どころを記録。通知フラグ', () => {
+    const u = fulfillReturnTask(returnTaskId, '田中美波', { returnedBlock: 'P3FB', returnedLocation: '001-002-03', returnedSource: 'manual' });
     assert.equal(u.status, 'returned');
     assert.equal(u._notifyReturned, true);
     const task = taskRow(returnTaskId);
-    assert.deepEqual([task.returned_block, task.returned_location, task.returned_by], ['P3FB', '001-002-03', '田中美波']);
+    assert.deepEqual([task.returned_block, task.returned_location, task.returned_by, task.returned_source], ['P3FB', '001-002-03', '田中美波', 'manual']);
     assert.ok(task.returned_at, 'returned_at');
     assert.equal(task.location, '002-013-03', '参考ロケ (候補) はそのまま残る = 通知で「候補は…でした」と出せる');
     assert.equal(task.fulfilled_qty, 9);
@@ -123,8 +125,7 @@ console.log('── ③ 棚戻しの完了は「戻したロケ」が必須 ─�
     const inc = db.prepare("SELECT id FROM pk_pack_incidents WHERE batch_id=? AND kind='excess' AND sku='zzz-item'").get(pb);
     resolveIncident(inc.id, 'confirm', '三宅晴菜', pb);
     const id = db.prepare("SELECT id FROM pk_pack_tasks WHERE batch_id=? AND sku='zzz-item'").get(pb).id;
-    applyTaskAction(id, 'claim', '田中美波');
-    const u = applyTaskAction(id, 'fulfill', '田中美波', { returnedBlock: 'ZZZ', returnedLocation: 'ZZZ-ZZZ-ZZ' });
+    const u = fulfillReturnTask(id, '田中美波', { returnedBlock: 'ZZZ', returnedLocation: 'ZZZ-ZZZ-ZZ' });
     assert.deepEqual([u.returned_block, u.returned_location], ['ZZZ', 'ZZZ-ZZZ-ZZ']);
   });
   t('再ピック (repick) の fulfill はロケ無しで従来どおり fulfilled', () => {
@@ -215,6 +216,29 @@ console.log('── Codex R1: デプロイ前の自由入力の余り候補は�
       VALUES (?, NULL, 'excess', 'レギュラー', 1, 'candidate', '三宅晴菜', ?, ?)`).run(pb4, now, now).lastInsertRowid);
     assert.equal(resolveIncident(id2, 'withdraw', '三宅晴菜', pb4).status, 'withdrawn');
   });
+}
+
+console.log('── Codex R2: webhook が応答しなくてもタイムアウトで戻る (ポーラーを止めない) ──');
+{
+  const { notifyReturned } = await import('../notify.js');
+  process.env.PACKING_TASK_WEBHOOK = 'http://webhook.test/x';
+  const origFetch = globalThis.fetch;
+  // 応答しない webhook: abort されるまで永遠に待つ
+  globalThis.fetch = (url, opts) => new Promise((_, reject) => {
+    opts.signal.addEventListener('abort', () => reject(opts.signal.reason || new Error('aborted')));
+  });
+  const t0 = Date.now();
+  // AbortSignal.timeout のタイマーは unref なので、テストでは event loop を生かしておく (本番はサーバーが生きている)
+  const keepAlive = setInterval(() => {}, 50);
+  try {
+    await assert.rejects(notifyReturned({ id: 1, sku: 'x', req_qty: 1, returned_location: '001-001-01', returned_by: 'A' }, 'A'));
+  } finally { clearInterval(keepAlive); }
+  assert.ok(Date.now() - t0 < 5000, `タイムアウトで戻る (${Date.now() - t0}ms)`);
+  passed++; console.log('  ok: 応答しない webhook はタイムアウトで reject (再送はポーラーが markReturnedNotify(false) で拾う)');
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({}) });
+  assert.equal(await notifyReturned({ id: 1, sku: 'x', req_qty: 1, returned_location: '001-001-01', returned_by: 'A' }, null, { retry: true }), true);
+  passed++; console.log('  ok: 再送 (retry) も送れる');
+  globalThis.fetch = origFetch;
 }
 
 console.log(`\n${passed} tests passed`);

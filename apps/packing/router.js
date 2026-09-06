@@ -807,7 +807,8 @@ router.get('/api/stock-search', api(async (req, res) => {
 async function verifyActualSku(raw, { label = '間違って入っていた商品', batchId = null } = {}) {
   const sku = String(raw ?? '').trim().toLowerCase();
   if (!sku) throw new PackError(400, 'actual_sku_required', `${label}を検索で特定してください`);
-  if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(sku)) {
+  // 2文字以上 (在庫検索 API が2文字未満を受けないため。1文字 SKU は実在しない — Codex R2 Low)
+  if (!/^[a-z0-9][a-z0-9_\-.]{1,79}$/.test(sku)) {
     throw new PackError(400, 'bad_sku', 'SKUの形式が不正です。検索から選んでください');
   }
   // ① このバッチの納品書明細に実在する SKU は信頼済み (在庫参照が無くても通す — 候補ボタンの経路)

@@ -305,7 +305,7 @@ async function retryReturnedNotify() {
   for (const row of rows) {
     if (!claimReturnedNotify(row.id)) continue;
     try {
-      const sent = await notifyReturned({ ...row, returned_by: `${row.returned_by || '-'} (再送)` }, null);
+      const sent = await notifyReturned(row, null, { retry: true });   // 作業者名は改変しない (再送は通知の属性 — Codex R2)
       markReturnedNotify(row.id, sent, sent ? null : 'webhook未設定');
       if (sent) console.log(`[packing-drive-poller] 棚戻し完了の通知を再送: task=${row.id} ${row.sku} → ${row.returned_location}`);
     } catch (e) {

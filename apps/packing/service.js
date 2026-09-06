@@ -1731,7 +1731,7 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
     const s = normSku(sku);
     const q = Number(qty);
     if (!s) throw new PackError(400, 'bad_sku', '余った商品を検索から選んでください');
-    if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(s)) throw new PackError(400, 'bad_sku', 'SKUの形式が不正です。検索から選んでください');
+    if (!/^[a-z0-9][a-z0-9_\-.]{1,79}$/.test(s)) throw new PackError(400, 'bad_sku', 'SKUの形式が不正です。検索から選んでください');
     if (!Number.isInteger(q) || q < 1 || q > 999) throw new PackError(400, 'bad_qty', '数量が不正です');
     const aName = actualName ? String(actualName).trim().slice(0, 120) || null : null;
     insertIncident(db, batch, { slipSeq: slipSeq ?? null, kind: 'excess', sku: s, actualName: aName, qty: q }, worker, now);
@@ -1974,7 +1974,7 @@ export function countOpenTasks({ kind = null } = {}) {
  * fulfill は kind で終端が変わる: repick→fulfilled (梱包者の受領待ち) / return→returned (完了)
  * @returns 更新後のタスク行 (+ unavailable 時は _notifyUnavailable)
  */
-export function applyTaskAction(taskId, action, worker, { unavailableQty = null, fulfilledQty = null, returnedBlock = null, returnedLocation = null } = {}) {
+export function applyTaskAction(taskId, action, worker, { unavailableQty = null, fulfilledQty = null } = {}) {
   const t = TASK_TRANSITIONS[action];
   if (!t) throw new PackError(400, 'bad_action', `不明な操作: ${action}`);
   if (!worker) throw new PackError(400, 'no_worker', '作業者を選択してください');
@@ -1986,7 +1986,11 @@ export function applyTaskAction(taskId, action, worker, { unavailableQty = null,
     if (!t.from.includes(task.status)) {
       throw new PackError(409, 'bad_transition', `${task.status} から ${action} はできません`);
     }
-    const to = action === 'fulfill' ? (task.kind === 'repick' ? 'fulfilled' : 'returned') : t.to;
+    // 棚戻しの完了は fulfillReturnTask に一本化 (戻したロケ必須・1トランザクション・冪等 — Codex R2 Medium: 二経路を残さない)
+    if (action === 'fulfill' && task.kind === 'return') {
+      throw new PackError(409, 'return_fulfill_requires_location_flow', '棚戻しの完了は「ここへ戻した」(戻したロケの記録) から行ってください');
+    }
+    const to = action === 'fulfill' ? 'fulfilled' : t.to;
     const sets = ['status=?', 'claimed_by=COALESCE(claimed_by, ?)', 'updated_at=?'];
     const params = [to, worker, now];
     // 部分確保の内訳 (5個中2個は他ロケで確保・3個は在庫なし) を保存する (Codex R1 High: 通知と現物が食い違う)
@@ -1998,12 +2002,6 @@ export function applyTaskAction(taskId, action, worker, { unavailableQty = null,
     } else if (action === 'fulfill') {
       sets.push('unavailable_qty=NULL', 'fulfilled_qty=?');
       params.push(task.req_qty);
-      if (task.kind === 'return') {
-        // 棚戻しは「どこへ戻したか」を必ず記録する (Q3 決定 2026-09-05・例外処理監査 F-2)。事務がロジザードのロケ在庫と突き合わせる
-        const loc = normalizeReturnedLocation(returnedBlock, returnedLocation);
-        sets.push('returned_block=?', 'returned_location=?', 'returned_at=?', 'returned_by=?');
-        params.push(loc.block, loc.location, now, worker);
-      }
     }
     db.prepare(`UPDATE pk_pack_tasks SET ${sets.join(', ')} WHERE id=?`).run(...params, taskId);
     const updated = db.prepare('SELECT * FROM pk_pack_tasks WHERE id = ?').get(taskId);
@@ -2011,7 +2009,6 @@ export function applyTaskAction(taskId, action, worker, { unavailableQty = null,
       // 在庫なし → 1階が「在庫なしを確認」して閉じる (Q1 決定)。GChat は呼び出し側 (router) が送る
       updated._notifyUnavailable = true;
     }
-    if (action === 'fulfill' && task.kind === 'return') updated._notifyReturned = true;   // 戻したロケを事務へ (router が送る)
     return updated;
   })();
 }
@@ -2218,7 +2215,7 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
       // そのまま棚戻しタスクになる迂回を塞ぐ (Codex R1 High)。router は在庫実在まで再検証して excessSku/excessName を渡す
       if (inc.kind === 'excess') {
         const sku = normSku(excessSku ?? inc.sku);
-        if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(sku)) {
+        if (!/^[a-z0-9][a-z0-9_\-.]{1,79}$/.test(sku)) {
           throw new PackError(400, 'bad_sku', `余りの商品「${String(inc.sku).slice(0, 40)}」は検索で確定していません。取り下げて、候補か在庫検索から選び直してください`);
         }
         if (sku !== inc.sku || (excessName && excessName !== inc.actual_name)) {
