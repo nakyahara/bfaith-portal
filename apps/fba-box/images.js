@@ -181,21 +181,30 @@ export async function ensureRunCatalog(runId, { force = false } = {}) {
         noAsin++;
         continue;
       }
+      // 件数の意味 (管理画面の診断に出る): fetched/none = 今回更新した画像側の結果 /
+      // weighed/noWeight = 今回更新した単重側の結果 / failed = 呼び出しに失敗した商品数
       try {
         const payload = await fetcher(asin);
-        const url = sanitizeImageUrl(pickImageUrl(payload));
-        upsertProductImage({ fnsku: r.fnsku, asin, url, status: url ? 'ok' : 'none', error: url ? null : 'Amazon に画像がありません' });
-        if (url) fetched++; else none++;
+        // 更新するのは「今回欠けていた側」だけ (Codex PR3 R3 #1): 応答から片方が一時的に落ちていても、
+        // もう片方の ok を巻き添えで none にしない。ok の側はそもそも再取得の対象になっていない
+        if (!keepImage) {
+          const url = sanitizeImageUrl(pickImageUrl(payload));
+          upsertProductImage({ fnsku: r.fnsku, asin, url, status: url ? 'ok' : 'none', error: url ? null : 'Amazon に画像がありません' });
+          if (url) fetched++; else none++;
+        }
         // 参考単重 (同じ応答から。画像が無くても重量はあることがある = 別々に記録する)
-        const w = pickPackageWeightG(payload);
-        upsertWeightRef({ fnsku: r.fnsku, asin, weightG: w.g, raw: w.raw, status: w.g ? 'ok' : 'none',
-          error: w.g ? null : (w.error || 'Amazon に梱包重量の登録がありません (現場で「何個で何g」を量ってください)') });
-        if (w.g) weighed++; else noWeight++;
+        if (!keepWeight) {
+          const w = pickPackageWeightG(payload);
+          upsertWeightRef({ fnsku: r.fnsku, asin, weightG: w.g, raw: w.raw, status: w.g ? 'ok' : 'none',
+            error: w.g ? null : (w.error || 'Amazon に梱包重量の登録がありません (現場で「何個で何g」を量ってください)') });
+          if (w.g) weighed++; else noWeight++;
+        }
       } catch (e) {
+        // 呼び出しに失敗した商品数。none / noWeight (= Amazon に無い) とは混ぜない (Codex PR3 R3 #3)
         failed++;
         // 通信失敗で、既に取れている画像・単重まで消さない (Codex PR3 R2 #1)
         if (!keepImage) upsertProductImage({ fnsku: r.fnsku, asin, url: null, status: 'error', error: e.message });
-        if (!keepWeight) { upsertWeightRef({ fnsku: r.fnsku, asin, weightG: null, status: 'error', error: e.message }); noWeight++; }
+        if (!keepWeight) upsertWeightRef({ fnsku: r.fnsku, asin, weightG: null, status: 'error', error: e.message });
         if (errors.length < 5) errors.push(`${asin}: ${e.message}`);
         console.warn(`[fba-box] カタログ取得失敗 ${asin}: ${e.message}`);
       }

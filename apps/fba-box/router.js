@@ -546,9 +546,11 @@ router.post('/api/weights', checkOrigin, api((req, res) => {
 router.post('/api/weights/:id(\\d+)/revoke', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
+  // 過去回・別回の取消は全回共通のマスタを動かす → 上限超えの承認と同じ強さのゲート
+  // (管理者セッション or 職員PIN。requireStaff は一般セッションを通してしまう — Codex PR3 R3 #2)
   let byStaff = false;
   if (req.body?.as_staff) {
-    const gate = requireStaff(req, w.worker);
+    const gate = staffApproval(req);
     if (!gate.ok) return res.status(gate.status).json(gate.body);
     byStaff = true;
   }

@@ -359,6 +359,18 @@ await t('実測の登録は納品回と商品の対応を検証する (別の回
   assert.equal(bad.j.error, 'not_in_run');
 });
 
+await t('過去回・別回の重さの取消は、一般のポータルセッションだけでは通らない (管理者 or 職員PIN)', async () => {
+  const m = await call('POST', '/api/weights', { body: { fnsku: 'X0RTW00001', sample_qty: 5, total_g: 500, run_id: wRun.runId, worker_id: memberId } });
+  assert.equal(m.status, 200, JSON.stringify(m.j));
+  assert.equal((await call('POST', `/api/weights/${m.j.id}/revoke`, { body: { worker_id: memberId, run_id: 999999 } })).status, 403, '別の回を名乗る取消');
+  assert.equal((await call('POST', `/api/weights/${m.j.id}/revoke`,
+    { body: { worker_id: memberId, run_id: 999999, as_staff: true }, session: 'user', device: false })).status, 403, '一般セッション + as_staff だけでは通らない');
+  db._clearPinFails();
+  const ok = await call('POST', `/api/weights/${m.j.id}/revoke`,
+    { body: { worker_id: memberId, run_id: 999999, as_staff: true, auth_worker_id: staffId, auth_pin: '2468' } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.j));
+});
+
 await t('本社: 商品ごとの単重一覧 / ルール変更は管理者のみ・目標>上限は 400', async () => {
   const wl = await call('GET', `/admin/runs/${wRun.runId}/weights`, { session: 'user', device: false });
   assert.equal(wl.status, 200);

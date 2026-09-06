@@ -1195,6 +1195,21 @@ console.log('■ 作業を終える (全部入らなくても完了) / 商品画
       'https://m.media-amazon.com/images/I/keep.jpg');
     assert.equal(db.getDB().prepare(`SELECT status FROM fbx_weight_refs WHERE fnsku = 'X0FIN00001'`).get().status, 'error');
   });
+
+  // 呼び出しが成功しても、更新するのは欠けている側だけ (Codex PR3 R3#1)
+  img._resetImageState();
+  process.env.WAREHOUSE_SERVICE_TOKEN = 'test-token';
+  img._setFetcher(async () => ({ ok: true, result: { image: null, dimensions: { weight: '0.05' } } }));
+  const partial = await img.ensureRunCatalog(c.runId, { force: true });
+  delete process.env.WAREHOUSE_SERVICE_TOKEN;
+  t('成功した応答に画像が無くても、既に取れている画像は消さない (Codex PR3 R3#1)', () => {
+    assert.equal(partial.total, 1, '単重だけが欠けている 1 商品が対象');
+    assert.equal(partial.weighed, 1);
+    assert.equal(partial.none, 0, '画像側は今回の更新対象ではないので数えない');
+    assert.equal(db.getDB().prepare(`SELECT image_url FROM fbx_product_images WHERE fnsku = 'X0FIN00001'`).get().image_url,
+      'https://m.media-amazon.com/images/I/keep.jpg');
+    assert.equal(db.getRunState(c.runId).weights.X0FIN00001.unitG, 50, '単重側は更新される (0.05kg → 50g)');
+  });
   img._resetImageState();
 }
 

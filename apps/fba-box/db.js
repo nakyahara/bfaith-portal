@@ -1036,12 +1036,17 @@ export function upsertWeightRef({ fnsku, asin, weightG, raw = null, status, erro
  * (Codex PR3 #5)。件数 = これまでに重さが分かった商品の数なので軽い
  */
 export function rebuildWeightCurrent(d = getDB()) {
-  // 採用値にだけ残っている孤児行も対象にする (元データが消えていれば recomputeWeightCurrent が消す)
-  const keys = d.prepare(`SELECT fnsku FROM fbx_weight_refs
-    UNION SELECT fnsku FROM fbx_weight_measurements
-    UNION SELECT fnsku FROM fbx_weight_current`).all();
-  d.transaction(() => { for (const k of keys) recomputeWeightCurrent(k.fnsku, d); })();
-  return keys.length;
+  // 採用値にだけ残っている孤児行も対象にする (元データが消えていれば recomputeWeightCurrent が消す)。
+  // キーの取得も同じトランザクションの中で行う
+  let n = 0;
+  d.transaction(() => {
+    const keys = d.prepare(`SELECT fnsku FROM fbx_weight_refs
+      UNION SELECT fnsku FROM fbx_weight_measurements
+      UNION SELECT fnsku FROM fbx_weight_current`).all();
+    for (const k of keys) recomputeWeightCurrent(k.fnsku, d);
+    n = keys.length;
+  })();
+  return n;
 }
 
 /**
@@ -1057,6 +1062,12 @@ export function recomputeWeightCurrent(fnsku, d = getDB()) {
   const chosen = m ? { unitG: m.unit_g, source: 'measured', basisId: m.id, sampleQty: m.sample_qty }
     : (ref ? { unitG: ref.weight_g, source: 'catalog', basisId: null, sampleQty: null } : null);
   if (!chosen) { d.prepare('DELETE FROM fbx_weight_current WHERE fnsku = ?').run(key); return null; }
+  // 中身が変わらないときは書かない (updated_at = 採用値が変わった時刻。起動時の作り直しで全件が今の時刻にならないように)
+  const now = d.prepare('SELECT unit_g, source, basis_id, sample_qty FROM fbx_weight_current WHERE fnsku = ?').get(key);
+  if (now && now.unit_g === chosen.unitG && now.source === chosen.source
+      && (now.basis_id ?? null) === (chosen.basisId ?? null) && (now.sample_qty ?? null) === (chosen.sampleQty ?? null)) {
+    return chosen;
+  }
   d.prepare(`INSERT INTO fbx_weight_current (fnsku, unit_g, source, basis_id, sample_qty, updated_at) VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(fnsku) DO UPDATE SET unit_g = excluded.unit_g, source = excluded.source,
       basis_id = excluded.basis_id, sample_qty = excluded.sample_qty, updated_at = excluded.updated_at`)
