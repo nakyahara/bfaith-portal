@@ -12,7 +12,7 @@ const suites = ['test-import.mjs', 'test-stats.mjs', 'test-ne-names.mjs', 'test-
   'test-reprint.mjs', 'test-reprint-manifest.mjs', 'test-print-queue.mjs', 'test-print-api.mjs',
   'test-views.mjs', 'test-print-agent.mjs', 'test-work-nav.mjs',
   'test-notify-shipchange.mjs', 'test-line.mjs', 'test-miss-watch.mjs', 'test-migration.mjs',
-  'test-stockout-ack.mjs'];
+  'test-stockout-ack.mjs', 'test-return-location.mjs'];
 
 let failed = 0;
 for (const f of suites) {

@@ -7,6 +7,9 @@
 
 let _warnedNoWebhook = false;
 
+// webhook 送信のタイムアウト (ms)。ポーラー (drive-sync) が直列で待つため、応答しない相手で全体を止めない。テストで短縮可
+const WEBHOOK_TIMEOUT_MS = Number(process.env.PACKING_WEBHOOK_TIMEOUT_MS) || 8000;
+
 export async function notifyShipChange({
   folderName, neSlipNo, slipNo = null, currentMethod, proposedMethod, reason, worker, lines = [],
 }) {
@@ -47,6 +50,7 @@ export async function notifyShipChange({
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),   // 応答しない webhook でポーラー全体を止めない (Codex R2 High)
   });
   if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
   return true;
@@ -68,6 +72,7 @@ async function postTask(text) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),   // 応答しない webhook でポーラー全体を止めない (Codex R2 High)
   });
   if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
   return true;
@@ -89,9 +94,34 @@ export async function notifyTask(info, worker) {
   if (info.kind === 'repick' && info.repickBatchId) {
     lines.push('📦 ピッキング一覧に「🔴ピッキング漏れ」バッチを作成しました (計測対象外): https://picking.bfaith-wh.uk/apps/picking/');
   } else {
-    lines.push('ピッキングのタスク画面: https://picking.bfaith-wh.uk/apps/picking/tasks');
+    // 棚戻しはピッキング一覧の「↩ 棚戻し」カードから (例外処理監査 PR-4)。/tasks は一覧へ転送
+    lines.push('↩ ピッキング一覧に「棚戻し」として出ます (戻したロケを記録して事務へ通知): https://picking.bfaith-wh.uk/apps/picking/');
   }
   if (info.stockText) lines.push(info.stockText);   // 棚戻し: 在庫ロケーション (戻し先の参考)
+  return postTask(lines.join('\n'));
+}
+
+/**
+ * ↩ 棚戻し完了 — 3階が「ここへ戻した」を押したとき (Q3 決定 2026-09-05: 戻したロケを記録して事務へ流す)。
+ * 余り・品違いの棚戻しは在庫差異の兆候 — 事務はロジザードのロケ在庫と実物のずれをここで直す (例外処理監査 F-2)
+ * @param task getTaskDetail の行 (returned_block/returned_location/incident_kind …)
+ */
+export async function notifyReturned(task, worker, { retry = false } = {}) {
+  const reason = task.incident_kind === 'excess' ? '余り (バッチに多く入っていた)'
+    : task.incident_kind === 'wrong_item' ? '品違い (間違って入っていた商品)' : '棚戻し';
+  const join = (block, loc) => {
+    const b = String(block || ''); const l = String(loc || '');
+    if (!l) return b || '-';
+    return (b && l !== b && !l.startsWith(`${b}-`)) ? `${b}-${l}` : l;
+  };
+  const returned = join(task.returned_block, task.returned_location);
+  const hint = task.location ? join(task.block, task.location) : null;
+  const lines = [
+    `↩ *棚戻し完了${retry ? ' (通知の再送)' : ''}* — 戻したロケを記録しました (ロジザードのロケ在庫と違えば調整してください)`,
+    `商品: *${task.sku}*${task.product_name ? ` (${task.product_name})` : ''} × ${task.req_qty}個`,
+    `戻したロケ: *${returned}*${hint && hint !== returned ? ` (候補は ${hint} でした)` : ''}`,
+    `理由: ${reason} / 依頼元: ${task.folder_name || task.batch_folder || '-'}${task.slip_seq ? ` #${task.slip_seq}` : ''} (依頼: ${task.requested_by || '-'}) / 戻した: ${task.returned_by || worker || '-'}`,
+  ];
   return postTask(lines.join('\n'));
 }
 

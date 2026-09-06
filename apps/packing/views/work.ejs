@@ -1333,9 +1333,10 @@
     // 品違いの「実際に入っていた商品」の特定 (記録時・2026-08-23)。
     // 手に持っている瞬間が一番特定しやすく、終了画面での再入力をなくす (Codex/中原さん)。
     // バッチ内の他商品を候補ボタン + 在庫検索 (サーバーで形式+実在を検証)。自由入力文字列は送らない
-    function pickActualItem(expected, onPick) {
-      $('issueTitle').textContent = '実際に入っていた商品は？ (候補をタップ or 検索)';
-      const cands = allBatchSkus().filter(([sku]) => sku !== expected.sku);
+    // 余り (PR-4・D-1) も同じ部品: 余りは「バッチ内の全商品が候補」+ 在庫検索。自由入力は廃止
+    function pickActualItem(expected, onPick, { title = '実際に入っていた商品は？ (候補をタップ or 検索)' } = {}) {
+      $('issueTitle').textContent = title;
+      const cands = allBatchSkus().filter(([sku]) => !expected || sku !== expected.sku);
       $('issueSkuGrid').innerHTML = cands.slice(0, 8).map(([sku, name], i) =>
         `<button class="reason-opt issue-cand" data-i="${i}" style="grid-column:1/-1; text-align:left">${esc(name)}<br><small>${esc(sku)}</small></button>`).join('');
       document.querySelectorAll('.issue-cand').forEach((btn) => {
@@ -1349,10 +1350,10 @@
       res.innerHTML = '';
       // 検索で出ないとき (未設定・障害・検索漏れ) の逃げ道: SKUをそのまま使う (形式はサーバーでも検証。名前は付けない)
       const directHtml = (q) => `<button type="button" class="reason-opt issue-direct" data-sku="${esc(q)}" style="text-align:left; border-style:dashed">
-          検索に出ない → 入力した「${esc(q)}」をSKUとして使う<br><small>バーコード/商品コードを正確に入力した場合のみ</small></button>`;
+          検索に出ない → 入力した「${esc(q)}」をSKUとして使う<br><small>商品コードを正確に入力した場合のみ (このバッチの商品か、在庫データに実在するものだけ通ります)</small></button>`;
       const bindDirect = () => res.querySelectorAll('.issue-direct').forEach((b) => b.addEventListener('click', () => {
         const sku = String(b.dataset.sku || '').trim().toLowerCase();
-        if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(sku)) { showToast('SKUの形式が不正です (英数字・-_.)'); return; }
+        if (!/^[a-z0-9][a-z0-9_\-.]{1,79}$/.test(sku)) { showToast('SKUの形式が不正です (英数字・-_. で2文字以上)'); return; }
         onPick({ sku, name: null });
       }));
       let timer = null;
@@ -1410,24 +1411,16 @@
         $('issueStep1').style.display = 'none';
         $('issueStep2').style.display = 'block';
         if (type === 'excess') {
-          // バッチ内SKUから検索 (要件§5.5)。候補+自由入力
-          $('issueTitle').textContent = '余った商品は？';
-          $('issueSkuGrid').innerHTML = '';
-          $('issueSearchRes').innerHTML = '';
-          $('issueSkuInput').style.display = 'block';
-          $('issueSkuInput').value = '';
-          $('issueSkuInput').setAttribute('list', 'batchSkus');   // 品違いの検索UIで外した属性を戻す
-          $('issueSkuInput').placeholder = 'SKU or 商品名で検索';
-          $('issueSkuInput').oninput = null;
-          fillSkuDatalist();
-          $('issueSkuInput').onchange = () => {
-            const v = $('issueSkuInput').value.trim();
-            if (!v) return;
-            issue.sku = v;
+          // 余った商品 = バッチ内の候補ボタン + 在庫検索で1件選ぶ (品違いと同じ部品)。自由入力は廃止 —
+          // 商品名の断片 (「耳かき」) が SKU として棚戻しに流れ、3階に画像もロケも出なかった (例外処理監査 D-1・PR-4)
+          pickActualItem(null, ({ sku, name }) => {
+            issue.sku = sku;
+            issue.actualName = name || null;
             $('issueStep2').style.display = 'none';
             $('issueStep3').style.display = 'block';
+            $('issueQtyLabel').textContent = `余った数量は? (${name || sku})`;
             qtyButtons(999, (q) => { sendIssue({ ...issue, qty: q }); });   // 余りはサーバー上限 (999) まで
-          };
+          }, { title: '余った商品は？ (候補をタップ or 検索)' });
         } else {
           $('issueTitle').textContent = type === 'shortage' ? '足りない商品は？' : '本来入るはずの商品は？';
           $('issueSkuInput').style.display = 'none';
@@ -1458,9 +1451,10 @@
       $('issueQtyLabel').textContent = '数量は?';
       const seq = viewSeq;
       if (type === 'excess') {
-        enqueue('excess', seq, { sku, qty });
-        incidents.push({ id: `tmp-${Date.now()}`, kind: 'excess', sku, qty, slipSeq: null });
-        showToast(`余り候補に追加: ${sku} × ${qty} (最後にまとめて送信します)`);
+        // 名前はサーバー検証の結果 (在庫検索由来) — 棚戻しの表示用。サーバーでも再検証する
+        enqueue('excess', seq, { sku, qty, actual_name: actualName || null });
+        incidents.push({ id: `tmp-${Date.now()}`, kind: 'excess', sku, actualName: actualName || null, qty, slipSeq: null });
+        showToast(`余り候補に追加: ${actualName || sku} × ${qty} (最後にまとめて送信します)`);
         return;
       }
       enqueue(type, seq, type === 'wrong_item' ? { sku, actual_sku: actualSku, actual_name: actualName || null, qty } : { sku, qty });

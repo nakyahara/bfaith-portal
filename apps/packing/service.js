@@ -1493,11 +1493,36 @@ function insertTask(db, batch, { slipSeq, kind, sku, productName, qty, incidentI
   const loc = lookupLocation(batch.pk_batch_id, sku);
   return Number(db.prepare(`
     INSERT INTO pk_pack_tasks
-      (batch_id, slip_seq, kind, sku, product_name, req_qty, location, block, folder_name,
+      (batch_id, slip_seq, kind, sku, product_name, req_qty, location, block, location_source, folder_name,
        status, requested_by, incident_id, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, ?)
   `).run(batch.id, slipSeq ?? null, kind, sku, productName ?? null, qty,
-    loc.location, loc.block, batch.folder_name, worker, incidentId ?? null, now, now).lastInsertRowid);
+    loc.location, loc.block, loc.location ? 'picked' : null, batch.folder_name, worker, incidentId ?? null, now, now).lastInsertRowid);
+}
+
+/**
+ * 参考ロケが無いタスク (余り・バッチ外の品違い = pk_lines に無い) に、ロジザードの在庫ロケ候補を後から入れる
+ * (例外処理監査 D-2・PR-4)。router が確定直後に非同期で呼ぶ (fail-soft)。既に入っていれば触らない
+ * @returns {boolean} 入れたか
+ */
+export function setTaskLocationHint(taskId, { block = null, location = null, source = 'stock' } = {}) {
+  const loc = String(location || '').trim();
+  if (!loc) return false;
+  return getDB().prepare(`UPDATE pk_pack_tasks SET location=?, block=?, location_source=?, updated_at=?
+    WHERE id=? AND (location IS NULL OR location = '')`).run(loc, block ? String(block).trim() : null, source, utcNow(), taskId).changes > 0;
+}
+
+/**
+ * 棚戻しの「戻したロケ」の検証 (Q3 決定 2026-09-05)。ロケは必須 (未入力で完了させない)。
+ * 形式はロジザードのロケ名 (棚ロケ 002-013-03 / 特殊ロケ ZZZ-ZZZ-ZZ 等) をそのまま受ける — 英数字・-・_・. のみ
+ */
+function normalizeReturnedLocation(block, location) {
+  const loc = String(location || '').trim();
+  const blk = String(block || '').trim();
+  if (!loc) throw new PackError(400, 'returned_location_required', '戻したロケを選んでください (候補をタップ、または入力)');
+  if (loc.length > 40 || !/^[A-Za-z0-9][A-Za-z0-9_\-.]*$/.test(loc)) throw new PackError(400, 'bad_location', 'ロケの形式が不正です (例: 002-013-03)');
+  if (blk && (blk.length > 20 || !/^[A-Za-z0-9][A-Za-z0-9_\-.]*$/.test(blk))) throw new PackError(400, 'bad_location', 'ブロックの形式が不正です (例: P3FA)');
+  return { block: blk || null, location: loc };
 }
 
 function insertIncident(db, batch, { slipSeq, kind, sku, actualSku, actualName, qty }, worker, now) {
@@ -1701,11 +1726,15 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
   }
 
   if (event === 'excess') {
-    const s = String(sku || '').trim();
+    // 余りの SKU は品違いと同じくサーバーで検証済みのもの (router verifyActualSku: 形式 + 在庫実在・名前はサーバー由来)。
+    // 自由入力 (商品名の断片「耳かき」等) を受けない = 棚戻しに画像もロケも出ない状態を作らない (例外処理監査 D-1・PR-4)
+    const s = normSku(sku);
     const q = Number(qty);
-    if (!s) throw new PackError(400, 'bad_sku', 'SKUを指定してください');
+    if (!s) throw new PackError(400, 'bad_sku', '余った商品を検索から選んでください');
+    if (!/^[a-z0-9][a-z0-9_\-.]{1,79}$/.test(s)) throw new PackError(400, 'bad_sku', 'SKUの形式が不正です。検索から選んでください');
     if (!Number.isInteger(q) || q < 1 || q > 999) throw new PackError(400, 'bad_qty', '数量が不正です');
-    insertIncident(db, batch, { slipSeq: slipSeq ?? null, kind: 'excess', sku: s, qty: q }, worker, now);
+    const aName = actualName ? String(actualName).trim().slice(0, 120) || null : null;
+    insertIncident(db, batch, { slipSeq: slipSeq ?? null, kind: 'excess', sku: s, actualName: aName, qty: q }, worker, now);
     return {};
   }
 
@@ -1957,7 +1986,11 @@ export function applyTaskAction(taskId, action, worker, { unavailableQty = null,
     if (!t.from.includes(task.status)) {
       throw new PackError(409, 'bad_transition', `${task.status} から ${action} はできません`);
     }
-    const to = action === 'fulfill' ? (task.kind === 'repick' ? 'fulfilled' : 'returned') : t.to;
+    // 棚戻しの完了は fulfillReturnTask に一本化 (戻したロケ必須・1トランザクション・冪等 — Codex R2 Medium: 二経路を残さない)
+    if (action === 'fulfill' && task.kind === 'return') {
+      throw new PackError(409, 'return_fulfill_requires_location_flow', '棚戻しの完了は「ここへ戻した」(戻したロケの記録) から行ってください');
+    }
+    const to = action === 'fulfill' ? 'fulfilled' : t.to;
     const sets = ['status=?', 'claimed_by=COALESCE(claimed_by, ?)', 'updated_at=?'];
     const params = [to, worker, now];
     // 部分確保の内訳 (5個中2個は他ロケで確保・3個は在庫なし) を保存する (Codex R1 High: 通知と現物が食い違う)
@@ -1983,6 +2016,85 @@ export function applyTaskAction(taskId, action, worker, { unavailableQty = null,
 /** タスク1行 (参照用。picking の同期・API の種別チェックで使う)。 */
 export function getTask(taskId) {
   return getDB().prepare('SELECT * FROM pk_pack_tasks WHERE id = ?').get(taskId) || null;
+}
+
+/**
+ * ↩ 棚戻しの完了 = 1トランザクション (Codex R1 High: claim と fulfill を別々に確定すると、ロケ不正・障害・競合で
+ * 「対応中」だけ残る)。requested/claimed から直接 returned へ。WHERE status IN (…) で 2台同時の勝者は1人。
+ * 通信断後の再タップ = 同じ作業者・同じロケで既に returned なら冪等成功 (replayed=true・通知は再送しない)。
+ * @returns 更新後の行 (+ _notifyReturned / _replayed)
+ */
+export function fulfillReturnTask(taskId, worker, { returnedBlock = null, returnedLocation = null, returnedSource = null } = {}) {
+  if (!worker) throw new PackError(400, 'no_worker', '作業者を選択してください');
+  const loc = normalizeReturnedLocation(returnedBlock, returnedLocation);
+  const source = ['picked', 'stock', 'manual'].includes(String(returnedSource || '')) ? String(returnedSource) : 'manual';
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const task = db.prepare('SELECT * FROM pk_pack_tasks WHERE id = ?').get(taskId);
+    if (!task || task.kind !== 'return') throw new PackError(404, 'not_found', '棚戻しの依頼が見つかりません');
+    if (task.status === 'returned') {
+      if (task.returned_by === worker && task.returned_location === loc.location && (task.returned_block || null) === loc.block) {
+        return { ...task, _replayed: true };
+      }
+      throw new PackError(409, 'already_returned', `既に ${task.returned_by || '-'} が ${task.returned_location || '-'} へ戻した記録があります`);
+    }
+    if (!['requested', 'claimed'].includes(task.status)) {
+      throw new PackError(409, 'bad_transition', `${task.status} から完了はできません`);
+    }
+    const changes = db.prepare(`
+      UPDATE pk_pack_tasks
+      SET status='returned', claimed_by=COALESCE(claimed_by, ?), fulfilled_qty=req_qty, unavailable_qty=NULL,
+          returned_block=?, returned_location=?, returned_source=?, returned_at=?, returned_by=?,
+          returned_notified_at=NULL, returned_notify_error=NULL, returned_notify_claimed_at=NULL, updated_at=?
+      WHERE id=? AND status IN ('requested','claimed')
+    `).run(worker, loc.block, loc.location, source, now, worker, now, taskId).changes;
+    if (changes !== 1) throw new PackError(409, 'conflict', '別の端末で先に操作されました。画面を更新してください');
+    const updated = db.prepare('SELECT * FROM pk_pack_tasks WHERE id = ?').get(taskId);
+    updated._notifyReturned = true;
+    return updated;
+  })();
+}
+
+// ─── ↩ 棚戻し完了の事務通知 outbox (pk_pack_tasks.returned_notified_at — stockout と同じ方式) ───
+/** 送信権を取る (10分で失効)。取れなければ他 (ポーラー) が送信中。 */
+export function claimReturnedNotify(taskId) {
+  return getDB().prepare(`UPDATE pk_pack_tasks SET returned_notify_claimed_at=?
+    WHERE id=? AND status='returned' AND returned_notified_at IS NULL
+      AND (returned_notify_claimed_at IS NULL OR datetime(returned_notify_claimed_at) < datetime('now', '-10 minutes'))`)
+    .run(utcNow(), taskId).changes > 0;
+}
+export function markReturnedNotify(taskId, sent, error = null) {
+  const db = getDB();
+  if (sent) db.prepare('UPDATE pk_pack_tasks SET returned_notified_at=?, returned_notify_error=NULL, returned_notify_claimed_at=NULL WHERE id=?').run(utcNow(), taskId);
+  else db.prepare('UPDATE pk_pack_tasks SET returned_notify_error=?, returned_notify_claimed_at=NULL WHERE id=?').run(String(error || 'webhook未設定').slice(0, 200), taskId);
+}
+/** 未通知の棚戻し完了 (送信中でないもの)。期間で切らない。 */
+export function listPendingReturnedNotifies(limit = 3) {
+  try {
+    return getDB().prepare(`SELECT id FROM pk_pack_tasks
+      WHERE kind='return' AND status='returned' AND returned_at IS NOT NULL AND returned_notified_at IS NULL
+        AND (returned_notify_claimed_at IS NULL OR datetime(returned_notify_claimed_at) < datetime('now', '-10 minutes'))
+      ORDER BY id LIMIT ?`).all(limit).map((r) => getTaskDetail(r.id)).filter(Boolean);
+  } catch { return []; }   // v21 未適用
+}
+export function countStaleReturnedNotifies() {
+  try {
+    return getDB().prepare(`SELECT COUNT(*) c FROM pk_pack_tasks
+      WHERE kind='return' AND status='returned' AND returned_at IS NOT NULL AND returned_notified_at IS NULL
+        AND datetime(returned_at) < datetime('now', '-2 days')`).get().c;
+  } catch { return 0; }
+}
+
+/** タスク + 依頼の理由 (ミス候補の種別: excess=余り / wrong_item=品違い) + 依頼元バッチのフォルダ名 (棚戻し画面・通知用)。 */
+export function getTaskDetail(taskId) {
+  return getDB().prepare(`
+    SELECT t.*, i.kind AS incident_kind, i.sku AS incident_sku, b.folder_name AS batch_folder
+    FROM pk_pack_tasks t
+    JOIN pk_pack_batches b ON b.id = t.batch_id
+    LEFT JOIN pk_pack_incidents i ON i.id = t.incident_id
+    WHERE t.id = ?
+  `).get(taskId) || null;
 }
 
 // ─── 🚫 出荷保留 (在庫なし) 通知の outbox (pk_pack_stockouts) ───
@@ -2058,7 +2170,7 @@ function logizardNameOf(db, sku) {
   }
 }
 
-export function resolveIncident(incidentId, decision, actor, expectBatchId = null, { actualSku = null, actualName = null } = {}) {
+export function resolveIncident(incidentId, decision, actor, expectBatchId = null, { actualSku = null, actualName = null, excessSku = null, excessName = null } = {}) {
   if (!['confirm', 'withdraw'].includes(decision)) {
     throw new PackError(400, 'bad_decision', 'decision が不正です');
   }
@@ -2099,6 +2211,20 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
       }
       // 品違いは「実際に入っていた商品」を特定してから送信 (終了画面の商品検索で指定 —
       // 中原さん指示 2026-08-21)。特定作業はバッチ完了打刻の後のため梱包計測には入らない
+      // 余り: 確定時にも SKU が検証済み (形式) であることを要求 — デプロイ前の自由入力 (「耳かき」) の候補が
+      // そのまま棚戻しタスクになる迂回を塞ぐ (Codex R1 High)。router は在庫実在まで再検証して excessSku/excessName を渡す
+      if (inc.kind === 'excess') {
+        const sku = normSku(excessSku ?? inc.sku);
+        if (!/^[a-z0-9][a-z0-9_\-.]{1,79}$/.test(sku)) {
+          throw new PackError(400, 'bad_sku', `余りの商品「${String(inc.sku).slice(0, 40)}」は検索で確定していません。取り下げて、候補か在庫検索から選び直してください`);
+        }
+        if (sku !== inc.sku || (excessName && excessName !== inc.actual_name)) {
+          db.prepare('UPDATE pk_pack_incidents SET sku=?, actual_name=COALESCE(?, actual_name), updated_at=? WHERE id=?')
+            .run(sku, excessName ? String(excessName).slice(0, 120) : null, now, incidentId);
+          inc.sku = sku;
+          if (excessName) inc.actual_name = String(excessName).slice(0, 120);
+        }
+      }
       if (inc.kind === 'wrong_item') {
         const sku = String(actualSku ?? inc.actual_sku ?? '').trim();
         if (!sku) throw new PackError(400, 'actual_sku_required', '間違って入っていた商品を検索で特定してから送信してください');
@@ -2135,8 +2261,10 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
         dispatchedTasks.push({ kind: 'return', sku: inc.actual_sku, name: aName, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
       }
       if (inc.kind === 'excess') {
-        insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'return', sku: inc.sku, productName: null, qty: inc.qty, incidentId: inc.id }, actor, now);
-        dispatchedTasks.push({ kind: 'return', sku: inc.sku, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
+        // 商品名 = ロジザード名 (pk_lines) → 記録時に在庫検索で確定した名前 (actual_name)。以前は null で棚戻しに名前が出なかった (D-1)
+        const eName = logizardNameOf(db, inc.sku) ?? inc.actual_name ?? null;
+        insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'return', sku: inc.sku, productName: eName, qty: inc.qty, incidentId: inc.id }, actor, now);
+        dispatchedTasks.push({ kind: 'return', sku: inc.sku, name: eName, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
       }
     }
     db.prepare(`

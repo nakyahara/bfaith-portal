@@ -1443,6 +1443,30 @@ export function resetLaterBindingsForPackBatch(db, packBatchId) {
   return lrs.length;
 }
 
+/**
+ * ↩ 棚戻しの戻し先候補 (例外処理監査 PR-4・D-2)。
+ *   picked = 取った場所 (依頼元バッチのピックロケ。無ければ確定時に入れたロジザード候補 = location_source 'stock')
+ *   rows   = ロジザードの在庫ロケ (良品・フリー在庫の多い順・同一ロケはまとめる)。picked と同じロケは除く
+ * 在庫参照が未設定・障害のときは rows=[] で fetched=false (画面は「取った場所」と手入力だけ出す — fail-soft)
+ * @param task pk_pack_tasks の行 (sku/location/block/location_source)
+ */
+export async function returnCandidates(task, { fetchFn = fetch, now = new Date(), maxRows = 8 } = {}) {
+  const sl = await import('./stock-locations.js');
+  const picked = task?.location
+    ? { block: task.block || null, location: task.location, label: formatLocation(task.block, task.location), source: task.location_source || 'picked' }
+    : null;
+  const base = { ok: true, picked, rows: [], fetched: false, stale: true, stamp: null, truncated: 0, configured: sl.stockLookupConfigured() };
+  if (!base.configured || !task?.sku) return base;
+  const data = await fetchStockLocationsSafe(sl, task.sku, fetchFn);
+  const c = sl.listStockCandidates(data, { groupByLocation: true, maxRows, now });
+  const same = (r) => picked && String(r.block || '') === String(picked.block || '')
+    && sl.normalizeLocationDigits(r.location) === sl.normalizeLocationDigits(picked.location);
+  return { ...base, rows: c.rows.filter((r) => !same(r)), fetched: c.fetched, stale: c.stale, stamp: c.stamp, truncated: c.truncated || 0 };
+}
+async function fetchStockLocationsSafe(sl, sku, fetchFn) {
+  try { return await sl.fetchStockLocations(sku, fetchFn); } catch { return null; }
+}
+
 export function createRepickBatch(task) {
   const db = getDB();
   const now = utcNow();
