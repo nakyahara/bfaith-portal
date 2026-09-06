@@ -299,12 +299,15 @@
       $('#scanMsg').textContent = '商品の JAN (13桁) か FNSKU を枠に入れてください';
       $('#scanBox').classList.add('on');
       const tick = async () => {
-        if (!scanStream) return;
+        if (!scanStream || gen !== scanGen) return;
         try {
           const codes = await detector.detect(v);
+          // 読み取りを待っている間に閉じられたら、返ってきた結果は使わない (閉じた後に検索が走らないように)
+          if (!scanStream || gen !== scanGen) return;
           const hit = codes.find((x) => x.rawValue && /^[A-Za-z0-9]{6,}$/.test(String(x.rawValue).trim()));
           if (hit) { onScanned(String(hit.rawValue).trim()); return; }
         } catch (e) { /* まだ映っていない → 次の回 */ }
+        if (gen !== scanGen) return;
         scanTimer = setTimeout(tick, 250);
       };
       scanTimer = setTimeout(tick, 400);

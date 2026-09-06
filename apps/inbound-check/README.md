@@ -89,7 +89,8 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
   `barcode-master.js` が**全量置換**で取り込む。30分の巡回に相乗り (`runScheduledBarcodeFetch`。中身が同じならスキップ) +
   管理画面「🔢 バーコードマスタを今すぐ取り込む」。取得先 = env `INBOUND_CHECK_BARCODE_FOLDER_ID` / `INBOUND_CHECK_BARCODE_FILE`
   (既定 `0AN1RrVoXZhRqUk9PVA` / `バーコードマスタ.csv`。**値札CSVとは別の共有ドライブ**なので、そのフォルダを
-  Render のサービスアカウントに閲覧者以上で共有しておく必要がある)
+  Render のサービスアカウント `bfaith-portal@balmy-coral-488521-v4.iam.gserviceaccount.com` に閲覧者以上で共有しておく必要がある。
+  共有できない場合は、CSV を値札CSVと同じ共有ドライブに置いて `INBOUND_CHECK_BARCODE_FOLDER_ID=0AOG4tof0TAHFUk9PVA` にしてもよい)
   - **1商品に複数のバーコードが載る** (JAN と FNSKU が別行) ので barcode が主キー。全部持つ = 📷 でどれを読んでも商品が引ける。
     値札に刷るのは `rank=0` の代表 = **チェックデジットまで正しい GTIN** (JAN-8/UPC-A/JAN-13/GTIN-14) → FNSKU → その他の数字列 の順。
     有効区分は**値で判断しない** (内訳を管理画面に出して人が見る)

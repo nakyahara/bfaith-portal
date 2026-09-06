@@ -723,16 +723,21 @@
 
     // ── バーコードマスタを今すぐ取り込む ──
     const bcBtn = $('#fetchBarcodeBtn');
-    const runBarcodeFetch = async (approve) => {
+    const runBarcodeFetch = async () => {
       bcBtn.disabled = true;
       msg($('#fetchBarcodeMsg'), true, '取り込んでいます…');
+      // 承認つきのやり直しは**ループで**行う (再帰にすると外側の finally が先にボタンを戻し、二度押しできてしまう)
+      let approve = null;
       try {
+        for (;;) {
         const { status, j } = await postJson(BASE + '/admin/fetch-barcode-master', approve || {});
         // 件数が大きく減っていて止めた → 中身を見せて、そのとおりで良いか人に決めてもらう
         if (status === 409 && j.error === 'shrink_guard') {
           const yes = confirm(j.message + '\n\nこのまま取り込みますか？ (' + j.before + ' 件 → ' + j.after + ' 件)');
           if (!yes) { msg($('#fetchBarcodeMsg'), false, '取り込みませんでした (前の内容のままです)'); return; }
-          return runBarcodeFetch({ allow_shrink: true, confirm_before: j.before, confirm_after: j.after });
+          // 承認して1回だけやり直す。ボタンは押せないまま (finally より前に return しない = 再帰にしない)
+          approve = { allow_shrink: true, confirm_before: j.before, confirm_after: j.after };
+          continue;
         }
         if (status === 409 && j.error === 'confirm_mismatch') { msg($('#fetchBarcodeMsg'), false, '❌ ' + j.message); return; }
         if (status === 409 && j.error === 'stale_source') { msg($('#fetchBarcodeMsg'), false, '❌ ' + j.message); return; }
@@ -750,13 +755,15 @@
         } else {
           msg($('#fetchBarcodeMsg'), false, '❌ ' + (j.message || j.error || ('HTTP ' + status)));
         }
+        return;
+        }
       } catch (e) {
         msg($('#fetchBarcodeMsg'), false, '❌ ' + e.message);
       } finally {
         bcBtn.disabled = false;
       }
     };
-    if (bcBtn) bcBtn.addEventListener('click', () => runBarcodeFetch(null));
+    if (bcBtn) bcBtn.addEventListener('click', () => runBarcodeFetch());
 
     // ── Notion 作業カード: 今すぐ送る / エラー行の再送 ──
     const notionBtn = $('#notionSyncBtn');
