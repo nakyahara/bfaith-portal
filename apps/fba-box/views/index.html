@@ -371,7 +371,8 @@
   async function refresh(force) {
     if (!curRunId) return;
     if (dialogOpen && !force) return;   // 入力中に画面を差し替えない
-    await flushPendingPlacement();      // 未確定の割当があれば先に確定させる (同じ request_id)
+    const flushed = await flushPendingPlacement();   // 未確定の割当があれば先に確定させる (同じ request_id)
+    if (flushed && !flushed.ok) notePendingFailed(flushed);
     try {
       const j = await apiGet('/api/state?run=' + curRunId);
       setOnline(!!j.ok || j._status === 404);
@@ -776,7 +777,8 @@
         closeDialog();
         // 予告した名前と実際に入った名前がずれることがある (ダイアログを開いている間に別の端末が
         // 先に入れると、確認した人は「最初に入れた人」= 向こうになる)。黙って違う名前を残さない
-        const noted = !r.check_worker && j.checkWorker && j.checkWorker !== checkDefault ? j.checkWorker : null;
+        const noted = !r.check_worker && j.checkWorker && j.checkWorker !== checkDefault
+          ? { name: j.checkWorker, auto: j.checkWorkerSource === 'auto' } : null;
         showUndoToast(j.placementId, r, qty, noted);
       } else {
         msg.className = 'msg err'; msg.textContent = j.message || '登録できませんでした';
@@ -824,27 +826,49 @@
     return j;
   }
   let flushing = false;
+  /**
+   * 未確定のまま残った割当を、同じ request_id で送り直す。
+   * 戻り値 = 確定応答 (成功でも業務エラーでも) / まだ確定していなければ null。
+   * ⚠ 呼び出し側は必ず戻り値を見る。捨てると「現物は箱に入れたのに記録が無い」を見逃す
+   * (Codex PR2.6-R4 high#1)
+   */
   async function flushPendingPlacement() {
     const pend = LS.get('pending_place', null);
-    if (!pend || flushing) return;
+    if (!pend || flushing) return null;
     flushing = true;
     try {
-      await postPlacementDefinitive(pend.body);   // 確定応答 (成功/業務エラー) が返ったときだけ消す
+      const j = await postPlacementDefinitive(pend.body);   // 確定応答が返ったときだけ消す
       LS.set('pending_place', null);
       setOnline(true);
-    } catch { /* 未確定 — pending は残す */ } finally { flushing = false; }
+      return j;
+    } catch { return null; /* 未確定 — pending は残す */ } finally { flushing = false; }
   }
+  /** 送れていなかった記録が「登録できなかった」と確定した = 現物と記録がずれている。必ず人に見せる */
+  function notePendingFailed(j) {
+    alert(`⚠ 前に送れていなかった記録が、登録できませんでした。
+
+${j.message || ''}
+
+箱の中身と画面の数を見くらべて、足りなければ入れ直してください (職員を呼んでください)`);
+  }
+  const PLACE_KEYS = ['run_id', 'row_id', 'box_id', 'qty', 'layer', 'expiry', 'worker_id'];
+  const samePlacement = (a, b) => PLACE_KEYS.every(k => a[k] === b[k]);
   async function sendPlacement({ rowId, boxId, qty, layer, expiry }) {
-    await flushPendingPlacement();   // 前回の未確定分を先に片付ける
+    const body = {
+      run_id: curRunId, row_id: rowId, box_id: boxId, qty, layer: layer || null,
+      expiry: expiry || null, worker_id: worker.id, request_id: null,
+    };
+    const pend = LS.get('pending_place', null);
+    const flushed = await flushPendingPlacement();   // 前回の未確定分を先に片付ける
+    // それが「いま押したのと同じ操作」= 通信断のあとにもう一度押しただけ なら、その結果がこの操作の結果。
+    // ここで新しい request_id を発行すると、サーバーには同じ投入が2件入る (Codex PR2.6-R4 high#1)
+    if (flushed && pend && samePlacement(pend.body, body)) return flushed;
     if (LS.get('pending_place', null)) {
       return { ok: false, message: '前回の記録がまだ送れていません。電波が戻ってからもう一度押してください' };
     }
-    const requestId = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
-    const body = {
-      run_id: curRunId, row_id: rowId, box_id: boxId, qty, layer: layer || null,
-      expiry: expiry || null, worker_id: worker.id, request_id: requestId,
-    };
-    LS.set('pending_place', { requestId, body });
+    if (flushed && !flushed.ok) notePendingFailed(flushed);   // 別の操作だった & 登録できていない
+    body.request_id = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+    LS.set('pending_place', { requestId: body.request_id, body });
     showSaving(true);
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -868,7 +892,7 @@
   function showUndoToast(placementId, row, qty, checkWorkerNote) {
     $('#toast-root').innerHTML = `<div class="toast">
       <span>✅ ${esc(shortName(row.product_name, 14))} を ${qty}個 記録しました${checkWorkerNote
-        ? `<br><small>👤 確認した人は先に入れた <b>${esc(checkWorkerNote)}</b> さんのままです</small>` : ''}</span>
+        ? `<br><small>👤 確認した人は${checkWorkerNote.auto ? '先に入れた ' : ''}<b>${esc(checkWorkerNote.name)}</b> さんで記録されています</small>` : ''}</span>
       <button id="undo">元に戻す</button></div>`;
     const t = setTimeout(() => { $('#toast-root').innerHTML = ''; }, 8000);
     $('#undo').addEventListener('click', async () => {

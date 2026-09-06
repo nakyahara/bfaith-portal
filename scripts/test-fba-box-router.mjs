@@ -158,6 +158,11 @@ await t('端末: 箱を作って割当 (worker 必須・request_id 冪等)', asy
   }
   const again = await call('POST', '/api/placements', { body: { run_id: runId, row_id: rows[0].id, box_id: box1.boxId, qty: rows[0].planned_qty, worker_id: memberId, request_id: 'rq0' } });
   assert.equal(again.j.already, true);
+  // 応答喪失後の再送でも、新規成功と同じ形 (確認した人と由来) を返す — 画面が通信断のときだけ
+  // 「誰が確認した人になったか」を知らせられない、を防ぐ (Codex R4 medium#1)
+  assert.equal(again.j.checkWorker, 'りようしゃ');
+  assert.equal(again.j.checkWorkerSource, 'auto');
+  assert.equal(again.j.placementId > 0, true);
 });
 /** 確認した人の3列 (placement_id は API に出さないので DB を直接見る) */
 const cwCols = (rowId) => db.getDB().prepare(

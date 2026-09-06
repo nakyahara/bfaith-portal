@@ -1504,8 +1504,10 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
       if (prev.request_hash !== requestHash) {
         return { ok: false, error: 'idempotency_conflict', message: '同じ操作IDで内容の違う記録が既にあります (画面を更新してやり直してください)' };
       }
+      // 再送 (応答喪失) でも新規成功と同じ形で返す — 画面が「誰が確認した人になったか」を
+      // 通信断のときだけ知らせられない、を防ぐ (Codex PR2.6-R4 medium#1)
       return { ok: true, already: true, placementId: prev.id, boxSeq: prev.box_seq,
-        placed: placedOf(d, prev.row_id) };
+        placed: placedOf(d, prev.row_id), ...currentCheckWorker(d, prev.row_id) };
     }
     const row = d.prepare('SELECT w.*, r.status AS run_status FROM fbx_rows w JOIN fbx_runs r ON r.id = w.run_id WHERE w.id = ?')
       .get(Number(rowId));
@@ -1558,7 +1560,7 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
       workerId: worker?.id, workerName: worker?.display_name, deviceLabel, ok: true,
       payload: { rowId: row.id, boxId: box.id, boxNo: box.box_no, qty: q, expiry: exp, layer: lay, boxSeq: seq } }, d);
     return { ok: true, placementId, boxSeq: seq, placed: placed + q, plannedQty: row.planned_qty, expiry: exp,
-      checkWorker: autoCheck?.checkWorker ?? null };
+      checkWorker: autoCheck?.checkWorker ?? null, checkWorkerSource: autoCheck?.source ?? null };
   }).immediate();
 }
 
@@ -1574,6 +1576,12 @@ function placedOf(d, rowId) {
  * 人が選んだ名前 (source='manual'。移行前からある値 = source NULL も含む) には触らない。
  * 取消・数0への修正で有効な投入が 0 件になれば、自動で入れた分だけ消す。
  */
+/** いまの「確認した人」と由来 (応答契約: 新規成功でも冪等再送でも同じ形を返すため) */
+function currentCheckWorker(d, rowId) {
+  const rw = d.prepare('SELECT check_worker, check_worker_source FROM fbx_row_work WHERE row_id = ?').get(rowId) || {};
+  return { checkWorker: rw.check_worker ?? null, checkWorkerSource: rw.check_worker_source ?? null };
+}
+
 function syncAutoCheckWorker(d, rowId, { runId, worker, deviceLabel } = {}) {
   const rw = d.prepare('SELECT check_worker, check_worker_source, check_worker_placement_id FROM fbx_row_work WHERE row_id = ?').get(rowId);
   const same = (checkWorker, source) => ({ checkWorker, source, changed: false });

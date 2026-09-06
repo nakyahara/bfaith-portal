@@ -399,6 +399,24 @@ t('確認した人: 数を直す (取消+入れ直しを1トランザクショ�
   assert.equal(cwRow().check_worker, null);              // 0 に直す = 取消だけ → 有効な投入が無い
   assertAutoCheck(rowB.id, '0 に直したあと');
 });
+t('確認した人: 再送 (応答喪失) の冪等応答も、新規成功と同じ形で確認した人と由来を返す', () => {
+  const first = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-idem' });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const again = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-idem' });
+  assert.equal(again.already, true);
+  assert.equal(again.placementId, first.placementId);          // 二重登録しない
+  assert.equal(again.checkWorker, first.checkWorker);
+  assert.equal(again.checkWorkerSource, 'auto');
+  // 人が指名したあとの再送は、その名前と由来 manual を返す (画面が「先に入れた」と断定しないため)
+  assert.equal(db.setRowWorkers({ rowId: rowB.id, checkWorker: 'さとう', worker: staff }).ok, true);
+  const again2 = db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: wOther, deviceKey: 'dev:9', requestId: 'cw-idem' });
+  assert.equal(again2.checkWorker, 'さとう');
+  assert.equal(again2.checkWorkerSource, 'manual');
+  // 後始末
+  assert.equal(db.setRowWorkers({ rowId: rowB.id, checkWorker: null, worker: staff }).ok, true);
+  assert.equal(db.revokePlacement({ placementId: first.placementId, worker: member, deviceKey: 'dev:1' }).ok, true);
+  assertAutoCheck(rowB.id, '冪等応答のテストのあと');
+});
 t('確認した人: 人が選んだ名前は投入でも取消でも動かない。消せば自動に戻る', () => {
   assert.equal(db.setRowWorkers({ rowId: rowB.id, checkWorker: 'さとう', worker: staff }).ok, true);
   assert.equal(db.addPlacement({ runId, rowId: rowB.id, boxId: cwBox.boxId, qty: 1, worker: member, deviceKey: 'dev:1', requestId: 'cw-3' }).ok, true);
