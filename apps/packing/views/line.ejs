@@ -300,7 +300,8 @@
                // 受け取れるのは「候補が残っておらず、タスクが全部 届いた (fulfilled)」ときだけ
                const cands = incList.filter((i) => i.slipSeq === hs.seq);
                const tks = taskList.filter((t) => t.slipSeq === hs.seq && t.status !== 'unavailable');   // 在庫なしは 🚫 行 (na) で出す
-               const ready = cands.length === 0 && tks.length > 0 && tks.every((t) => t.status === 'fulfilled');
+               // 在庫なし (na) が残る伝票は「全部受け取った」でなく「在庫なしを確認」へ (サーバーの receive も 409 — Codex R2)
+               const ready = (stockoutMap[hs.seq] || []).length === 0 && cands.length === 0 && tks.length > 0 && tks.every((t) => t.status === 'fulfilled');
                // 3階が「在庫なし」にした商品。他の依頼が残っていなければ「在庫なしを確認」で伝票を閉じられる
                const na = stockoutMap[hs.seq] || [];
                const canAck = na.length > 0 && ackSet.has(hs.seq);
@@ -320,7 +321,9 @@
                     <button type="button" class="found-sku" data-seq="<%= hs.seq %>" data-sku="<%= t.sku %>" data-name="<%= nameOf(t.sku) %>">見つかった</button></div>
                 <% } %>
                 <% for (const t of na) { %>
-                  <div style="color:#c92a2a; font-weight:700">🚫 <%= nameOf(t.sku) %> × <%= t.unavailable_qty ?? t.req_qty %><%= (t.fulfilled_qty || 0) > 0 ? ` (${t.fulfilled_qty}個は他ロケから届きます)` : '' %> — 3階: 在庫なし (<%= t.claimed_by || t.requested_by || '-' %> <%= jstHm(t.updated_at) %>)</div>
+                  <div style="color:#c92a2a; font-weight:700">🚫 <%= nameOf(t.sku) %> × <%= t.unavailable_qty ?? t.req_qty %><%= (t.fulfilled_qty || 0) > 0 ? ` (${t.fulfilled_qty}個は他ロケから届きます)` : '' %> — 3階: 在庫なし (<%= t.claimed_by || t.requested_by || '-' %> <%= jstHm(t.updated_at) %>)
+                    <%# 在庫なしの商品だけ手元で見つかった → その SKU の依頼だけ取下げ (他の依頼は残す — Codex R2) %>
+                    <button type="button" class="found-sku" data-seq="<%= hs.seq %>" data-sku="<%= t.sku %>" data-name="<%= nameOf(t.sku) %>">手元で見つかった</button></div>
                 <% } %>
                 <% if (na.length > 0 && !canAck) { %>
                   <div class="sub" style="color:#c92a2a">他の商品の再ピック・未送信の候補が片付くと「在庫なしを確認」で出荷保留にできます</div>
@@ -415,14 +418,18 @@
 
     let sending = false;
     // 1操作 = 1 op_id で最大3回まで同一内容を再送 (通信失敗時)。戻り値 { ok, status, body } / 通信断は null
-    async function post(url, payloadObj) {
+    async function post(url, payloadObj, { alertNetworkError = true } = {}) {
       const payload = JSON.stringify(payloadObj);
       for (let attempt = 1; ; attempt++) {
         let res;
         try {
           res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload });
         } catch (e) {
-          if (attempt >= 3) { alert(`通信エラー: ${e.message}\n電波の良い場所でもう一度お試しください。`); return null; }
+          if (attempt >= 3) {
+            // 一括送信 (sendRepickMany) は自分でまとめて知らせるので、ここでは出さない (alert 二重・「もう一度」の誘導を避ける — Codex R2)
+            if (alertNetworkError) alert(`通信エラー: ${e.message}\n操作が届いている場合があります。画面更新後に状態を確認してください。`);
+            return null;
+          }
           await new Promise((r) => setTimeout(r, 1500));
           continue;   // 同一 op_id で再送 (サーバー側は replay として同じ結果を返す)
         }
@@ -659,10 +666,14 @@
     function commitQtyInputs(x) {
       for (const inp of document.querySelectorAll('.rp-qin')) {
         const i = Number(inp.dataset.i);
-        const raw = String(inp.value || '').trim();
-        if (!raw) continue;
-        const v = Number(raw);
         const max = x.lines[i] ? x.lines[i].qty : 0;
+        const raw = String(inp.value || '').trim();
+        if (!raw) {
+          // 1〜9 ボタンで選んでいれば空欄で正常。10以上が選択中なのに欄を消したら未確定 = 止める (見えない旧数量を送らない — Codex R2)
+          if ((rpPick.get(i) || 0) > 9) { alert(`数量は 1〜${max} で入力してください`); inp.focus(); return false; }
+          continue;
+        }
+        const v = Number(raw);
         if (!Number.isInteger(v) || v < 1 || v > max) { alert(`数量は 1〜${max} で入力してください`); inp.focus(); return false; }
         rpPick.set(i, v);
       }
@@ -683,13 +694,13 @@
       const unknown = [];
       try {
         for (const it of items) {
-          const r = await post(`/apps/packing/api/batches/${BATCH_ID}/events`, eventPayload('shortage', { slip_seq: seq, sku: it.sku, qty: it.qty }));
+          const r = await post(`/apps/packing/api/batches/${BATCH_ID}/events`, eventPayload('shortage', { slip_seq: seq, sku: it.sku, qty: it.qty }), { alertNetworkError: false });
           if (!r) { unknown.push(`${it.name}: 不足の記録の結果を確認できません`); continue; }
           if (!r.ok) { rejected.push(`${it.name}: ${r.body.error || `エラー (${r.status})`}`); continue; }
           // 直前に記録した候補 (この伝票・このSKU) を送信
           const inc = (r.body.incidents || []).filter((i) => i.slip_seq === seq && normSku(i.sku) === normSku(it.sku) && i.status === 'candidate').pop();
           if (!inc) { rejected.push(`${it.name}: 候補は記録しましたが送信対象が見つかりません`); continue; }
-          const c = await post(`/apps/packing/api/batches/${BATCH_ID}/incidents/${inc.id}/resolve`, { decision: 'confirm', worker_name: workerSel.value });
+          const c = await post(`/apps/packing/api/batches/${BATCH_ID}/incidents/${inc.id}/resolve`, { decision: 'confirm', worker_name: workerSel.value }, { alertNetworkError: false });
           // already_resolved かつ confirmed = 先の送信が届いていて応答だけ落ちた (post は同内容を再送する) → 成功扱い (Codex R4/R5)
           if (!c) unknown.push(`${it.name}: 送信の結果を確認できません`);
           else if (!c.ok && !(c.body.code === 'already_resolved' && c.body.status === 'confirmed')) rejected.push(`${it.name}: ${c.body.error || `エラー (${c.status})`}`);

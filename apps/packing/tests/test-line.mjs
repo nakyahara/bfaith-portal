@@ -437,6 +437,14 @@ console.log('\n── line.ejs の描画 + インラインJSの構文 (2026-08-2
       incidents: [{ id: 9, slipSeq: 1, kind: 'shortage', sku: 'a', qty: 1 }], repickBySlip: { 1: 'fulfilled' },
       tasks: [{ id: 5, slipSeq: 1, sku: 'a', qty: 1, status: 'fulfilled' }, { id: 6, slipSeq: 1, sku: "b'x", qty: 1, status: 'requested' }],
       methodOptions: ['定形外', 'ネコポス'], shipChangeReasons: ['入らない', 'その他'] }],
+    ['MELT held stockout (PR-3 Codex R2: 届いた + 在庫なし)', { kind: 'melt', batch: { id: 1, status: 'packing', slip_count: 3 }, runs: [{ phase: 'sort', started_at: now, paused_total_sec: 0, planned_count: 3 }],
+      slips: [
+        { seq: 1, neSlipNo: '1', slipNo: 'SP1', siteOrderNo: 'SO1', recipientName: '客', deliveryMethod: 'ネコポス', status: 'held', holdReason: 'repick', lines: [{ sku: 'a', name: '商品A', qty: 1 }, { sku: 'b', name: '商品B', qty: 1 }] },
+      ],
+      incidents: [], repickBySlip: { 1: 'fulfilled' },
+      tasks: [{ id: 5, slipSeq: 1, sku: 'a', qty: 1, status: 'fulfilled' }, { id: 6, slipSeq: 1, sku: 'b', qty: 1, status: 'unavailable' }],
+      stockoutBySlip: { 1: [{ id: 6, sku: 'b', product_name: '商品B', req_qty: 1, unavailable_qty: 1, fulfilled_qty: 0, claimed_by: 'P', updated_at: now }] },
+      stockoutAckSeqs: [1], methodOptions: ['ネコポス'], shipChangeReasons: ['その他'] }],
     ['PAS with transferredIn', { kind: 'pas', batch: { id: 1, status: 'packing', slip_count: 3 }, runs: [{ phase: 'run', started_at: now, finished_at: now, paused_total_sec: 0, planned_count: 3 }],
       dailyTotal: { total: 165, machine: 165, transferredIn: 1 }, slips: [] }],
   ];
@@ -465,6 +473,13 @@ console.log('\n── line.ejs の描画 + インラインJSの構文 (2026-08-2
     if (label.startsWith('PAS with transferredIn')) {
       ok(html.includes('MELT-LINE から移した分'), `${label}: 累計に MELT からの振替が表示される`);
       ok(html.includes('計測中') === false || html.includes('live'), `${label}: 描画OK`);
+    }
+    if (label.startsWith('MELT held stockout')) {
+      ok(!html.includes('全部受け取った'), `${label}: 在庫なしが残る伝票に「全部受け取った」を出さない (サーバーの receive は 409)`);
+      ok(html.includes('在庫なしを確認'), `${label}: 「在庫なしを確認」が出る`);
+      ok(/data-sku="b"[^>]*>手元で見つかった/.test(html), `${label}: 在庫なしの SKU だけ「手元で見つかった」で取り下げられる`);
+      ok(!html.includes('＋ 別の商品も足りない'), `${label}: 全明細が依頼済み・在庫なしなら「＋ 別の商品も足りない」は出ない`);
+      ok(!/🔄 商品B/.test(html), `${label}: 在庫なしの SKU は 🔄 行に重複して出ない`);
     }
     if (label === 'PAS running') ok(html.includes('計測中'), `${label}: 計測中の表示がある`);
     if (label === 'PAS paused') ok(html.includes('計測停止中'), `${label}: 中断中は計測停止中の表示`);
