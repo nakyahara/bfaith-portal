@@ -36,7 +36,7 @@ import { createPickingCard, notionConfigured } from './notion-attach.js';
 // import { createInboundPlan, checkInboundEligibility, findErrorSkusByBinarySearch, listShipments, listShipmentItems, fetchActiveInboundQuantities } from './inbound-plans.js';
 // 箱詰め記録 (apps/fba-box): picking-prep 実行完了で納品回を自動作成する (専用 fba-box.db。読み書きは fba-box 側の関数のみ)
 import { createRunFromPicking as createBoxRunFromPicking } from '../fba-box/db.js';
-import { ensureRunImages as ensureBoxRunImages } from '../fba-box/images.js';
+import { ensureRunCatalog as ensureBoxRunCatalog } from '../fba-box/images.js';
 import { syncSkuMappings, syncDodaiMaster } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
 import { normalizePlanningRow } from './sp-api-reports.js';
@@ -1818,7 +1818,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     let boxRun = { attempted: true, ok: false };
     try {
       boxRun = { attempted: true, ...createBoxRunFromPicking({ pickingRun: { id: runId, delivery_date: deliveryDate, run_at: null }, planSheets, createdBy: req.session?.email, activate: true }) };
-      if (boxRun.ok) ensureBoxRunImages(boxRun.runId).catch((e) => console.warn('[Picking] 箱詰め記録の商品画像取得 (best-effort):', e.message));
+      if (boxRun.ok) ensureBoxRunCatalog(boxRun.runId).catch((e) => console.warn('[Picking] 箱詰め記録のカタログ取得 (画像・参考単重, best-effort):', e.message));
     } catch (e) {
       console.error('[Picking] 箱詰め記録の納品回作成に失敗 (best-effort):', e);
       boxRun = { attempted: true, ok: false, error: e.message };

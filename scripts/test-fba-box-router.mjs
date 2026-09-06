@@ -301,6 +301,89 @@ await t('本社: POST /admin/runs/:id/excel (multipart) で Excel を添付 → 
   assert.equal((await call('POST', `/admin/runs/${pkRunId}/excel`, { session: 'user', device: false })).status, 400);   // ファイルなし
 });
 
+console.log('■ PR3: 重量補助 (実測の登録・上限は職員の承認)');
+const wRun = db.createRunFromPicking({ pickingRun: { id: 700, delivery_date: '2026-10-05' }, planSheets: [
+  { slotId: 'p1', sheet: 'P1_通常', label: '通常', rows: [{ no: 1, fnsku: 'X0RTW00001', productName: '重さテスト商品', qty: '10' }] },
+], createdBy: 'test' });
+const wState = db.getRunState(wRun.runId);
+const wGid = wState.groups[0].id, wRowId = wState.rows[0].id;
+
+await t('端末: 実測「10個で2050g」を登録 → 採用値が実測になる。履歴が読めて、取り消すと戻る', async () => {
+  assert.equal((await call('POST', '/api/weights', { body: { fnsku: 'X0RTW00001', sample_qty: 0, total_g: 100, worker_id: memberId } })).status, 400);
+  const ok = await call('POST', '/api/weights', { body: { fnsku: 'X0RTW00001', sample_qty: 10, total_g: 2050, worker_id: memberId, run_id: wRun.runId } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.j));
+  assert.equal(ok.j.unitG, 205);
+  const st = await call('GET', `/api/state?run=${wRun.runId}`);
+  assert.equal(st.j.weights.X0RTW00001.unitG, 205);
+  assert.equal(st.j.weights.X0RTW00001.source, 'measured');
+  assert.deepEqual(st.j.weightLimits, { targetG: 28000, limitG: 30000, snapshotted: true });
+  const hist = await call('GET', '/api/weights?fnsku=X0RTW00001');
+  assert.equal(hist.j.measurements.length, 1);
+  assert.equal(hist.j.rules.limit_g, 30000);
+  // 別の回を名乗る取消は職員へ回す (単重は全回共通のマスタ)
+  assert.equal((await call('POST', `/api/weights/${ok.j.id}/revoke`, { body: { worker_id: memberId } })).status, 403);
+  assert.equal((await call('POST', `/api/weights/${ok.j.id}/revoke`, { body: { worker_id: memberId, run_id: wRun.runId } })).status, 200);
+  assert.equal((await call('POST', `/api/weights/${ok.j.id}/revoke`, { body: { worker_id: memberId, run_id: wRun.runId } })).status, 409);
+  // 取り消したので単重は未登録に戻る = 推定から外れる
+  const st2 = await call('GET', `/api/state?run=${wRun.runId}`);
+  assert.equal(st2.j.weights.X0RTW00001, undefined);
+});
+
+await t('箱クローズ: 上限超えは 409 over_limit → 職員PINの承認 (override) を添えれば閉じられる', async () => {
+  const bx = await call('POST', '/api/boxes', { body: { pack_group_id: wGid, material_code: 'box140', worker_id: memberId } });
+  assert.equal(bx.status, 200, JSON.stringify(bx.j));
+  const pl = await call('POST', '/api/placements', { body: { run_id: wRun.runId, row_id: wRowId, box_id: bx.j.boxId, qty: 10, worker_id: memberId, request_id: 'rw1' } });
+  assert.equal(pl.status, 200, JSON.stringify(pl.j));
+  const ng = await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31 } });
+  assert.equal(ng.status, 409);
+  assert.equal(ng.j.error, 'over_limit');
+  assert.equal(db.getBox(bx.j.boxId).status, 'open');
+  // override は職員PINが要る (利用者が自分で押しても通らない)
+  assert.equal((await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31, override: true } })).status, 403);
+  // 一般のポータルセッションでも承認にはならない (Codex PR3 #1: hasSessionAccess は職員である保証がない)
+  assert.equal((await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31, override: true }, session: 'user', device: false })).status, 403);
+  assert.equal((await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31, override: true, auth_worker_id: staffId, auth_pin: '0000' } })).status, 403);
+  db._clearPinFails();
+  const ok = await call('POST', `/api/boxes/${bx.j.boxId}/close`, { body: { worker_id: memberId, measured_kg: 31, override: true, auth_worker_id: staffId, auth_pin: '2468' } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.j));
+  assert.equal(ok.j.overLimit, true);
+  assert.equal(ok.j.overTarget, true);
+  assert.equal(db.getBox(bx.j.boxId).measured_weight_kg, 31);
+  assert.equal(db.getBox(bx.j.boxId).limit_override_by, 'しょくいん');
+});
+
+await t('実測の登録は納品回と商品の対応を検証する (別の回の商品・存在しない FNSKU は 409)', async () => {
+  assert.equal((await call('POST', '/api/weights', { body: { fnsku: 'X0RTW00001', sample_qty: 1, total_g: 10, worker_id: memberId } })).status, 400, 'run_id なし');
+  const bad = await call('POST', '/api/weights', { body: { fnsku: 'X0NOSUCH01', sample_qty: 1, total_g: 10, run_id: wRun.runId, worker_id: memberId } });
+  assert.equal(bad.status, 409);
+  assert.equal(bad.j.error, 'not_in_run');
+});
+
+await t('過去回・別回の重さの取消は、一般のポータルセッションだけでは通らない (管理者 or 職員PIN)', async () => {
+  const m = await call('POST', '/api/weights', { body: { fnsku: 'X0RTW00001', sample_qty: 5, total_g: 500, run_id: wRun.runId, worker_id: memberId } });
+  assert.equal(m.status, 200, JSON.stringify(m.j));
+  assert.equal((await call('POST', `/api/weights/${m.j.id}/revoke`, { body: { worker_id: memberId, run_id: 999999 } })).status, 403, '別の回を名乗る取消');
+  assert.equal((await call('POST', `/api/weights/${m.j.id}/revoke`,
+    { body: { worker_id: memberId, run_id: 999999, as_staff: true }, session: 'user', device: false })).status, 403, '一般セッション + as_staff だけでは通らない');
+  db._clearPinFails();
+  const ok = await call('POST', `/api/weights/${m.j.id}/revoke`,
+    { body: { worker_id: memberId, run_id: 999999, as_staff: true, auth_worker_id: staffId, auth_pin: '2468' } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.j));
+});
+
+await t('本社: 商品ごとの単重一覧 / ルール変更は管理者のみ・目標>上限は 400', async () => {
+  const wl = await call('GET', `/admin/runs/${wRun.runId}/weights`, { session: 'user', device: false });
+  assert.equal(wl.status, 200);
+  assert.equal(wl.j.weights.length, 1);
+  assert.equal(wl.j.weights[0].fnsku, 'X0RTW00001');
+  assert.equal(wl.j.runLimits.limitG, 30000);
+  assert.equal((await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000 }, session: 'user', device: false })).status, 403);
+  assert.equal((await call('POST', '/admin/weight-rules', { body: { target_g: 31000, limit_g: 30000 }, session: 'admin', device: false })).status, 400);
+  assert.equal((await call('POST', '/admin/weight-rules', { body: { target_g: 27000, limit_g: 29000 }, session: 'admin', device: false })).status, 200);
+  assert.equal(db.getWeightRules().limit_g, 29000);
+  await call('POST', '/admin/weight-rules', { body: { target_g: 28000, limit_g: 30000 }, session: 'admin', device: false });
+});
+
 server.close();
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed === 0 ? 0 : 1);
