@@ -314,6 +314,8 @@ router.get('/detail/:id', (req, res) => {
   // ジャンル属性辞書 (取得済みならUIに必須件数と自動フォームの材料を渡す)
   const genreDict = rakuten?.genre_id ? getCachedGenreAttributes(db, rakuten.genre_id) : null;
   const cabinetImages = db.prepare('SELECT * FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draft.id);
+  // セット展開判断のいまの値 (2026-09-06)。札とボタンの文言の両方で使うので 1 回だけ引く
+  const setDecisionRow = latestSetDecision(db, draft.id);
 
   res.render(view('detail.ejs'), {
     title: `商品ドラフト #${draft.id}`,
@@ -330,6 +332,10 @@ router.get('/detail/:id', (req, res) => {
       ? productionInstructions(setImagePlansOf(db, draft.id)) : [],
     // ⑤「セット展開判断」の「作らない」理由の選択肢 (§5.4)。ボードと同じ辞書を使う
     setDecisionReasons: SET_DECISION_REASONS,
+    // いまの判断 (2026-09-06 中原さん: 決めたのか決めていないのかが画面から分からない)。
+    // 表示文は describeSetDecision — カード・ボードと同じ言葉にする
+    setDecision: setDecisionRow,
+    setDecisionText: describeSetDecision(setDecisionRow),
     draft, refs, images, specs, aiOutputs, events, yahoo, imageProduction,
     rakutenItemUrl: rakutenItemPageUrl(draft.ne_code),
     // RMS の商品編集ページ (2026-09-04 中原さん要望)。店舗ID+商品管理番号だけで開ける

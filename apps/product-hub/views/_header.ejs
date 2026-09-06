@@ -20,6 +20,9 @@
   .btn-primary { background: #2563eb; border-color: #2563eb; color: #fff; }
   .btn-primary:hover { background: #1d4ed8; }
   .btn-danger { color: #b91c1c; border-color: #fecaca; }
+  /* 押せないボタンは色を落とす (2026-09-06)。btn-primary は背景色を自前で塗るので、
+     指定しないと「押せそうな青」のまま無反応になる */
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
   .btn-sm { padding: 3px 9px; font-size: 12px; }
   .badge { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
   .badge-draft { background: #e2e8f0; color: #475569; }

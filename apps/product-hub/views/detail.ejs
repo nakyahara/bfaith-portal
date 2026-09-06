@@ -599,17 +599,50 @@ th.attr-unknown { color: #dc2626; }
         <% } %>
       </div>
     <% } else { %>
-      <div style="margin-top:10px; padding:10px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;">
+      <%# セット展開判断の入口 (§5.4)。以前は「作らない・保留」の入口が工程パネルの状態プルダウン
+          の中にしか無く、畳まれた details の二段奥で現場から見つけられなかった
+          (2026-09-06 中原さん「作る・作らないのボタンをもっと分かりやすく」)。
+          作る／作らない を同じ大きさのボタンで横に並べ、いまの判断を札で常時出す %>
+      <%
+        // 判断を動かせるのは⑤の担当者本人か admin (サーバー側 assertStepOperable と同じ条件)。
+        // 押せないボタンを出すと 403 で弾かれてから理由を知ることになるので、ここで出し分ける。
+        // canEditStep は上の工程パネルで定義済み
+        const setStep = (workflow.main || []).find((s) => s.step_code === 'set_review') || null;
+        const setStepEditable = !!setStep && canEditStep(setStep);
+        const setDec = setDecision && setDecision.decision ? setDecision.decision : null;
+        // 未判断も色を付ける — 「まだ決めていない」が一目で分かるのがこの札の目的
+        const setChip = (setDec === 'create' || setDec === 'existing') ? { bg: '#dcfce7', fg: '#166534' }
+          : setDec === 'none' ? { bg: '#e2e8f0', fg: '#475569' }
+          : setDec === 'hold' ? { bg: '#fef3c7', fg: '#92400e' }
+          : { bg: '#fee2e2', fg: '#b91c1c' };
+      %>
+      <div style="margin-top:10px; padding:12px 14px; background:#fff; border:2px solid #cbd5e1; border-radius:10px;">
         <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-          <span style="font-size:13px; font-weight:600;">🎁 セット商品</span>
-          <% if (setDrafts.length) { %>
-            <span class="muted"><%= setDrafts.length %> 件作成済み</span>
-          <% } else { %>
-            <span class="muted">この商品からセットを作れます（単品の出品は止まりません）</span>
-          <% } %>
+          <span style="font-size:14px; font-weight:700;">🎁 セット商品にする？</span>
+          <span class="badge" style="background:<%= setChip.bg %>; color:<%= setChip.fg %>;"><%= setDecisionText || 'まだ決めていません' %></span>
+          <% if (setDrafts.length) { %><span class="muted"><%= setDrafts.length %> 件作成済み</span><% } %>
         </div>
+        <p class="muted" style="margin:6px 0 0; font-size:12px;">
+          まとめ買い用のセットを作るか決めます（決めても<strong>単品の出品は止まりません</strong>）。
+          <strong>作らない・保留も記録します</strong> — どれかを選ぶまで工程「セット商品作成検討」は閉じません。
+        </p>
+        <div style="display:flex; gap:10px; margin-top:10px; flex-wrap:wrap;">
+          <%# 「作らない／既存あり」と決めた後は作成を推さない (色を戻す)。決まっていない間と
+              「保留」の間は、いちばん進めたい操作 = 作成なので青のままにする %>
+          <button type="button" class="btn <%= (setDec === 'none' || setDec === 'existing') ? '' : 'btn-primary' %>" id="set-create-open"
+                  style="font-size:14px; font-weight:700; padding:10px 18px;"
+                  <%= setStepEditable ? '' : 'disabled' %>>🎁 <%= setDrafts.length ? 'もう1つセットを作る' : 'セットを作る' %></button>
+          <button type="button" class="btn" id="set-decision-open"
+                  style="font-size:14px; font-weight:700; padding:10px 18px;"
+                  <%= setStepEditable ? '' : 'disabled' %>><%= (setDec === 'none' || setDec === 'hold') ? '✏️ この判断を見直す' : '🚫 セットは作らない／保留にする' %></button>
+        </div>
+        <% if (!setStepEditable) { %>
+          <p class="muted" style="margin:8px 0 0; font-size:12px;">
+            決められるのは<strong>工程「セット商品作成検討」の担当者</strong>か管理者です<% if (setStep && setStep.assignee_name) { %>（いまの担当: <%= setStep.assignee_name %> さん）<% } else { %>（いまは未割り当て。上の「工程を進める / 担当者を変える」で自分が担当にできます）<% } %>。
+          </p>
+        <% } %>
         <% if (setDrafts.length) { %>
-          <table class="list" style="margin-top:8px;">
+          <table class="list" style="margin-top:10px;">
             <tbody>
               <% for (const s of setDrafts) { %>
                 <tr>
@@ -623,46 +656,47 @@ th.attr-unknown { color: #dc2626; }
             </tbody>
           </table>
         <% } %>
-        <details style="margin-top:8px;">
-          <summary style="cursor:pointer; font-size:13px; color:#1d4ed8;">セット商品を作る</summary>
-          <div style="margin-top:8px;">
-            <%# 構成は複数行で指定できる (§5.6)。既定は「この商品 × 2」= いちばん多い形。
-                候補はこの商品と、バリエーションがあればその子SKU (混載セットの入口) %>
-            <label>構成 <span class="muted">(何を何個入れるか)</span></label>
-            <datalist id="set-member-codes">
-              <option value="<%= draft.ne_code %>"><%= draft.name %></option>
-              <% if (variation.kind === 'variation') { %>
-                <% for (const m of variation.members) { %>
-                  <option value="<%= m.商品コード %>"><%= m.商品名 || '' %></option>
-                <% } %>
+        <%# 作成フォームは既定で畳んでおく (押してから中身を決める)。details の summary だと
+            「作らない」ボタンと大きさが揃わないので、button + hidden の開閉にした %>
+        <div id="set-create-box" hidden style="margin-top:12px; padding-top:12px; border-top:1px dashed #cbd5e1;">
+          <div style="font-size:13px; font-weight:600; margin-bottom:6px;">セットの中身を決める</div>
+          <%# 構成は複数行で指定できる (§5.6)。既定は「この商品 × 2」= いちばん多い形。
+              候補はこの商品と、バリエーションがあればその子SKU (混載セットの入口) %>
+          <label>構成 <span class="muted">(何を何個入れるか)</span></label>
+          <datalist id="set-member-codes">
+            <option value="<%= draft.ne_code %>"><%= draft.name %></option>
+            <% if (variation.kind === 'variation') { %>
+              <% for (const m of variation.members) { %>
+                <option value="<%= m.商品コード %>"><%= m.商品名 || '' %></option>
               <% } %>
-            </datalist>
-            <div id="set-members" style="display:grid; gap:6px; margin:4px 0 6px;"></div>
-            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
-              <button type="button" class="btn btn-sm" id="set-member-add">＋ 行を追加</button>
-              <span class="muted" style="font-size:11.5px;">同じ商品の複数個も、別商品を混ぜたセットもここで指定します</span>
-            </div>
-            <div style="flex:1; min-width:220px;">
-              <label>セット商品名 <span class="muted">(空なら自動)</span></label>
-              <input type="text" id="set-name" placeholder="<%= draft.name %> 2個セット" maxlength="300">
-            </div>
-            <p class="muted" style="margin:8px 0; font-size:12px;">
-              商品コードは <code>SET-<%= draft.ne_code %>-01</code> のような<strong>仮コード</strong>で作ります。
-              ネクストエンジンに登録したら本コードへ差し替えてください（差し替えるまで楽天出品はできません）。
-              <br>売価は<strong>構成の「単品売価 × 個数」の合計</strong>を初期値として入れます（そこから値付けしてください）。
-              <strong>配送方法は引き継ぎません</strong>（個数で箱もサイズも変わるため。NEに本コードが載ると自動で選ばれます）。
-              画像・JANはセット用に作り直しになるので引き継ぎません。
-            </p>
-            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-              <button class="btn btn-primary btn-sm" id="set-ai-btn">AIに書き換えてもらう</button>
-              <button class="btn btn-sm" id="set-copy-btn">コピーしてすぐ直す</button>
-              <span class="muted" id="set-create-result"></span>
-            </div>
-            <p class="muted" style="margin:6px 0 0; font-size:11px;">
-              「AIに書き換えてもらう」＝ AI情報入力待ちから／「コピーしてすぐ直す」＝ 説明文をコピーして商品説明確認から始まります。
-            </p>
+            <% } %>
+          </datalist>
+          <div id="set-members" style="display:grid; gap:6px; margin:4px 0 6px;"></div>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+            <button type="button" class="btn btn-sm" id="set-member-add">＋ 行を追加</button>
+            <span class="muted" style="font-size:11.5px;">同じ商品の複数個も、別商品を混ぜたセットもここで指定します</span>
           </div>
-        </details>
+          <div style="flex:1; min-width:220px;">
+            <label>セット商品名 <span class="muted">(空なら自動)</span></label>
+            <input type="text" id="set-name" placeholder="<%= draft.name %> 2個セット" maxlength="300">
+          </div>
+          <p class="muted" style="margin:8px 0; font-size:12px;">
+            商品コードは <code>SET-<%= draft.ne_code %>-01</code> のような<strong>仮コード</strong>で作ります。
+            ネクストエンジンに登録したら本コードへ差し替えてください（差し替えるまで楽天出品はできません）。
+            <br>売価は<strong>構成の「単品売価 × 個数」の合計</strong>を初期値として入れます（そこから値付けしてください）。
+            <strong>配送方法は引き継ぎません</strong>（個数で箱もサイズも変わるため。NEに本コードが載ると自動で選ばれます）。
+            画像・JANはセット用に作り直しになるので引き継ぎません。
+          </p>
+          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+            <button class="btn btn-primary btn-sm" id="set-ai-btn">AIに書き換えてもらう</button>
+            <button class="btn btn-sm" id="set-copy-btn">コピーしてすぐ直す</button>
+            <button type="button" class="btn btn-sm" id="set-create-cancel">閉じる</button>
+            <span class="muted" id="set-create-result"></span>
+          </div>
+          <p class="muted" style="margin:6px 0 0; font-size:11px;">
+            「AIに書き換えてもらう」＝ AI情報入力待ちから／「コピーしてすぐ直す」＝ 説明文をコピーして商品説明確認から始まります。
+          </p>
+        </div>
       </div>
     <% } %>
   </div>
@@ -2073,8 +2107,9 @@ th.attr-unknown { color: #dc2626; }
         <input type="text" id="setdec-hold-note" maxlength="200" placeholder="メモ (例: 売れ行きを見てから)" style="width:100%;">
       </div>
       <p class="muted" style="margin:0; font-size:11.5px;">
-        セットを新しく作る場合は、このまま閉じて画面上部の「🎁 セット商品を作る」から作成してください
-        (作成すると判断も一緒に記録され、この工程が閉じます)。
+        セットを新しく作る場合はここでは選びません。
+        <button type="button" class="btn btn-sm" id="setdec-goto-create">🎁 セットを作る</button>
+        を押すと、上のセット欄の入力に切り替わります (作成すると判断も一緒に記録され、この工程が閉じます)。
       </p>
       <div style="display:flex; gap:8px; align-items:center;">
         <button type="button" class="btn btn-primary btn-sm" id="setdec-apply">この判断で記録</button>
@@ -4792,6 +4827,28 @@ th.attr-unknown { color: #dc2626; }
       document.getElementById('setdec-close').addEventListener('click', closeSetDecision);
       document.getElementById('setdec-cancel').addEventListener('click', closeSetDecision);
       decModal.addEventListener('click', (ev) => { if (ev.target === decModal) closeSetDecision(); });
+      // セット欄の「セットは作らない／保留にする」ボタンからも開く (2026-09-06)。
+      // 判断は⑤に対する操作なので版数が要る = 工程行が無ければ開かせない
+      const decOpenBtn = document.getElementById('set-decision-open');
+      if (decOpenBtn) {
+        decOpenBtn.addEventListener('click', function () {
+          const tr = document.querySelector('tr[data-step="set_review"]');
+          if (!tr) { alert('工程「セット商品作成検討」が見つかりません。画面を読み直してください'); return; }
+          openSetDecision(tr);
+        });
+      }
+      // ダイアログから「作る」へ戻る導線 (ここでは create を選ばせないため)
+      const decGotoCreate = document.getElementById('setdec-goto-create');
+      if (decGotoCreate) {
+        decGotoCreate.addEventListener('click', function () {
+          closeSetDecision();
+          const box = document.getElementById('set-create-box');
+          if (box) {
+            box.hidden = false;
+            box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+        });
+      }
       document.getElementById('setdec-apply').addEventListener('click', async () => {
         if (!decRow) return;
         const btn = document.getElementById('setdec-apply');
@@ -5047,6 +5104,21 @@ th.attr-unknown { color: #dc2626; }
     if (setAiBtn) setAiBtn.addEventListener('click', function () { createSet('ai'); });
     const setCopyBtn = document.getElementById('set-copy-btn');
     if (setCopyBtn) setCopyBtn.addEventListener('click', function () { createSet('copy'); });
+
+    // 「🎁 セットを作る」= 中身の入力欄を開く (2026-09-06)。details の summary では
+    // 「作らない」ボタンと大きさが揃わず、押せる場所に見えなかったので開閉ボタンにした
+    const setCreateBox = document.getElementById('set-create-box');
+    const setCreateOpen = document.getElementById('set-create-open');
+    if (setCreateBox && setCreateOpen) {
+      setCreateOpen.addEventListener('click', function () {
+        setCreateBox.hidden = !setCreateBox.hidden;
+        if (!setCreateBox.hidden) setCreateBox.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    }
+    const setCreateCancel = document.getElementById('set-create-cancel');
+    if (setCreateCancel && setCreateBox) {
+      setCreateCancel.addEventListener('click', function () { setCreateBox.hidden = true; });
+    }
 
     // 仮コード → 本コードの差し替え
     const setCodeBtn = document.getElementById('set-code-btn');

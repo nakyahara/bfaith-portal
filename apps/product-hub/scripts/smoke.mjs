@@ -6948,6 +6948,11 @@ renders.push(
       { ...d0[2], setDrafts: sd.setDraftsOf(db, wfSetParentId), setInfo: null }]);
     renders.push(['detail.ejs (セット商品・仮コード警告)', 'detail.ejs',
       { ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId) }]);
+    // 判断済み (作らない) の見え方 (2026-09-06)。札に理由まで出て、ボタンは「見直す」に変わる
+    renders.push(['detail.ejs (セットの親・判断=作らない)', 'detail.ejs',
+      { ...d0[2], setDrafts: [], setInfo: null,
+        setDecision: { decision: 'none', reason_code: 'shipping_loss' },
+        setDecisionText: sd.describeSetDecision({ decision: 'none', reason_code: 'shipping_loss' }) }]);
     // 画像の引き継ぎ計画 (§4.7): 枠ごとの表と、依頼に載る指示
     renders.push(['detail.ejs (セット商品・画像の計画)', 'detail.ejs', {
       ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId),
@@ -7270,6 +7275,9 @@ for (const [name, file, data] of renders) {
         checkingReasons: dbmod.CHECKING_REASONS,
         checkingNoteMax: dbmod.CHECKING_NOTE_MAX,
         checkingDays: null,
+        // セット展開判断のいまの値 (2026-09-06)。既定 = まだ決めていない。
+        // 判断済みの見え方は「セットの親」の fixture 側で上書きする
+        setDecision: null, setDecisionText: '',
         // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
         modelAttrName: listing.MODEL_ATTR_NAME,
         // 画像制作の管理項目を使える商品か (自社商品 / 取扱先限定商品)。
@@ -7599,7 +7607,8 @@ for (const [name, file, data] of renders) {
     modal.includes('id="setdec-reason"') && modal.includes('送料負け') && modal.includes('需要が見込めない'),
     modal.slice(modal.indexOf('setdec-reason'), modal.indexOf('setdec-reason') + 300));
   check('セット判断の画面: 新規作成はここでは選ばせない (作成の入口へ案内する)',
-    !/name="setdec" value="create"/.test(modal) && modal.includes('セット商品を作る'));
+    !/name="setdec" value="create"/.test(modal) && modal.includes('id="setdec-goto-create"')
+    && modal.includes('セットを作る'));
   check('セット判断の画面: ⑤で「完了」を選んだらダイアログを開く (そのままでは閉じられない)',
     /tr\.dataset\.step === 'set_review' && state\.value === 'done'/.test(src) && /openSetDecision\(tr\)/.test(src));
   check('セット判断の画面: 記録は工程の版数を添えて送り、409 なら読み直す',
@@ -7795,6 +7804,36 @@ for (const [name, file, data] of renders) {
     !dhSingle.includes('id="set-qty"'), '');
   check('セット作成フォーム: 配送方法を引き継がないこと・売価の初期値を先に伝える',
     dhSingle.includes('配送方法は引き継ぎません') && dhSingle.includes('単品売価 × 個数'), '');
+  // ─── 「作る／作らない」の入口 (2026-09-06 中原さん) ───
+  // 以前は「作らない」の入口が工程パネルのプルダウンの中にしか無く、現場から見つけられなかった。
+  // 両方を**同じ場所の押せるボタン**として出していることを HTML で確かめる
+  check('セット判断の入口: 「作る」「作らない/保留」が両方ボタンとして出ている',
+    dhSingle.includes('id="set-create-open"') && dhSingle.includes('id="set-decision-open"'), '');
+  check('セット判断の入口: 作成フォームの入口は details の summary ではなくボタン',
+    !/<summary[^>]*>セット商品を作る<\/summary>/.test(dhSingle)
+    && /id="set-create-box" hidden/.test(dhSingle), '');
+  check('セット判断の入口: まだ決めていないことが札で分かる',
+    dhSingle.includes('まだ決めていません'), '');
+  {
+    // 担当外の一般ユーザーは押せない (サーバー側 assertStepOperable と同じ物差し)。
+    // 押せてしまうと 403 で弾かれてから理由を知ることになる
+    const dhOther = renderedHtml.get('detail.ejs (一般ユーザー・担当外)') || '';
+    const createBtn = dhOther.slice(dhOther.indexOf('id="set-create-open"'),
+      dhOther.indexOf('>', dhOther.indexOf('id="set-create-open"')));
+    const decBtn = dhOther.slice(dhOther.indexOf('id="set-decision-open"'),
+      dhOther.indexOf('>', dhOther.indexOf('id="set-decision-open"')));
+    check('セット判断の入口: 担当外の人にはどちらのボタンも押させない (理由も出す)',
+      dhOther.includes('id="set-create-open"') && createBtn.includes('disabled')
+      && decBtn.includes('disabled') && dhOther.includes('工程「セット商品作成検討」の担当者'),
+      createBtn.slice(0, 120) + ' | ' + decBtn.slice(0, 120));
+    // 判断済みなら理由まで札に出し、ボタンは「見直す」に変わる
+    const dhNone = renderedHtml.get('detail.ejs (セットの親・判断=作らない)') || '';
+    check('セット判断の入口: 判断済みなら理由つきで札に出る',
+      dhNone.includes('作らない (送料負け (単価が低い))') && !dhNone.includes('まだ決めていません'),
+      dhNone.slice(Math.max(0, dhNone.indexOf('セット商品にする')), dhNone.indexOf('セット商品にする') + 400));
+    check('セット判断の入口: 判断済みのボタンは「見直す」',
+      dhNone.includes('この判断を見直す'), '');
+  }
   check('セット工程ビュー: タブは自分が選ばれた状態になる',
     /class="kb-tab on"[^>]*href="[^"]*view=set"/.test(bhSet)
     || /href="[^"]*view=set"[^>]*class="kb-tab on"/.test(bhSet)
