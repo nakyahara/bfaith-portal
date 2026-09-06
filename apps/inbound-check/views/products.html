@@ -258,9 +258,10 @@
     // 読んだ値をそのまま検索欄に入れて検索する (バーコードマスタは1商品に複数行あるので、
     // JAN でも FNSKU でも、どれを読んでもその商品に行き着く)。
     // BarcodeDetector が無い iPad (iPadOS 16 以前など) は、キーボードの「テキストをスキャン」を案内する
-    let scanStream = null, scanTimer = null, scanStarting = false;
+    let scanStream = null, scanTimer = null, scanStarting = false, scanGen = 0;
     async function startScan() {
       if (scanStarting || scanStream) return;      // 連打で getUserMedia が二重に走ると、先の stream を止められなくなる
+      const gen = ++scanGen;                       // カメラが返ってくる前に画面を離れたかを見分ける
       if (!('BarcodeDetector' in window) || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         banner('warn', 'この iPad はカメラ読み取りに対応していません。検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
         $('#q').focus();
@@ -286,7 +287,12 @@
         scanStarting = false;
         $('#scanBtn').disabled = false;
       }
-      if (!$('#scanBox')) { for (const tr of stream.getTracks()) { try { tr.stop(); } catch (e) { /* 放す */ } } return; }
+      // カメラが返ってくるまでに 画面を離れた / 止めた / もう一度押した なら、受け取った stream をその場で止める
+      // (返る前は scanStream が null なので、pagehide の stopScan() では止められない)
+      if (gen !== scanGen || document.hidden || !$('#scanBox')) {
+        for (const tr of stream.getTracks()) { try { tr.stop(); } catch (e) { /* 放す */ } }
+        return;
+      }
       scanStream = stream;
       const v = $('#scanVideo');
       v.srcObject = scanStream;
@@ -304,6 +310,7 @@
       scanTimer = setTimeout(tick, 400);
     }
     function stopScan() {
+      scanGen++;                                   // 起動待ちの getUserMedia が返ってきても使わせない
       clearTimeout(scanTimer); scanTimer = null;
       if (scanStream) { for (const tr of scanStream.getTracks()) { try { tr.stop(); } catch (e) { /* 止められなければ放す */ } } scanStream = null; }
       const v = $('#scanVideo'); if (v) v.srcObject = null;

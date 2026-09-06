@@ -141,9 +141,17 @@ const csvOf = (rows, header = ['商品ID', '商品名', '検索名称', 'バー�
   const cut = importBarcodeMaster(csvOf(many.slice(0, 100)), { actor: 'test' });
   ok(!cut.ok && cut.error === 'shrink_guard' && /50%/.test(cut.message), '半分に減った CSV は取り込まない (途中で切れた疑い)');
   eq(barcodeMasterStatus().total, 200, '拒否したので前の中身のまま');
-  ok(importBarcodeMaster(csvOf(many.slice(0, 100)), { actor: 'test', allowShrink: true }).ok, '人が承認すれば取り込める');
+  // 境界: ちょうど2割減 (200→160) は拒否、2割未満 (200→161) は通る
+  eq(importBarcodeMaster(csvOf(many.slice(0, 160)), { actor: 'test' }).error, 'shrink_guard', 'ちょうど2割減も拒否する');
+  ok(importBarcodeMaster(csvOf(many.slice(0, 161)), { actor: 'test' }).ok, '2割未満の減少は通る');
+  ok(importBarcodeMaster(csvOf(many), { actor: 'test' }).ok, '戻す');
+  // 承認は「画面が見せた件数と同じとき」だけ通す (誤タップ・古い画面で気づかず全部消さない)
+  const mism = importBarcodeMaster(csvOf(many.slice(0, 100)), { actor: 'test', allowShrink: true, confirm: { before: 999, after: 100 } });
+  ok(!mism.ok && mism.error === 'confirm_mismatch', '確認したときと件数が違えば承認でも取り込まない');
+  eq(barcodeMasterStatus().total, 200, '拒否したので前の中身のまま');
+  ok(importBarcodeMaster(csvOf(many.slice(0, 100)), { actor: 'test', allowShrink: true, confirm: { before: 200, after: 100 } }).ok, '画面の件数と合っていれば取り込める');
   eq(barcodeMasterStatus().total, 100, '承認後は入れ替わる');
-  ok(importBarcodeMaster(csvOf(many.slice(0, 190)), { actor: 'test' }).ok, '1割の増減なら通る');
+  ok(importBarcodeMaster(csvOf(many.slice(0, 95)), { actor: 'test' }).ok, '1割未満の減少なら承認なしで通る');
   // 🚨 世代の追い越し: 遅れて着いた古い CSV で新しいマスタを巻き戻さない
   ok(importBarcodeMaster(csvOf(many), { actor: 'test', sourceModifiedAt: '2026-09-06T05:00:00.000Z' }).ok, '新しい世代を取り込む');
   const old = importBarcodeMaster(csvOf(many.slice(0, 195)), { actor: 'test', sourceModifiedAt: '2026-09-06T04:00:00.000Z' });
@@ -243,6 +251,9 @@ console.log('\n[6] HTTP — 管理画面の取込ボタンの入口');
     return { status: res.status, body: ct.includes('json') ? await res.json().catch(() => ({})) : await res.text() };
   };
   eq((await call('POST', '/admin/fetch-barcode-master', { body: {} })).status, 302, 'セッション無しは入れない');
+  // 承認つきの再送は「画面に出ていた件数」を一緒に送らないと受け付けない
+  const noConfirm = await call('POST', '/admin/fetch-barcode-master', { session: 'user', body: { allow_shrink: true } });
+  ok(noConfirm.status === 400 && noConfirm.body.error === 'bad_request', '減っても取り込む場合は件数の確認が要る');
   const r = await call('POST', '/admin/fetch-barcode-master', { session: 'user', body: {} });
   ok(r.status === 400 && /バーコードマスタ|Drive|GOOGLE_SERVICE_ACCOUNT_KEY/.test(r.body.message || ''),
     'Drive を見に行けない環境では理由つきで 400 (取り込み済みのデータは壊さない)');

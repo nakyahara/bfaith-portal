@@ -730,9 +730,17 @@ router.post('/admin/fetch-product-master', requireSession, checkOrigin, api(asyn
 // ─── バーコードマスタを今すぐ取り込む (値札に刷る JAN/FNSKU の正本) ───
 // 中原さん 2026-09-06:「バーコードマスタ.csv は常に最新のバーコード情報を入れている」。
 // 30分の巡回でも取り込むが、CSV を置き直した直後に押せるようにする
+// allow_shrink = 件数が大きく減っていても取り込む。**画面が見せた件数 (confirm_before/confirm_after) と
+// 一致しているときだけ**受け付ける — 誤タップや古い画面から「気づかないうちに全部消す」を防ぐ
 router.post('/admin/fetch-barcode-master', requireSession, checkOrigin, api(async (req, res) => {
+  const allowShrink = req.body?.allow_shrink === true;
+  const confirm = allowShrink ? { before: Number(req.body?.confirm_before), after: Number(req.body?.confirm_after) } : null;
+  if (allowShrink && (!Number.isInteger(confirm.before) || !Number.isInteger(confirm.after))) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '減っても取り込む場合は、画面に出ていた件数をそのまま送ってください' });
+  }
   try {
-    res.json(await fetchAndImportBarcodeMaster({ actor: req.session.email, force: true }));
+    const r = await fetchAndImportBarcodeMaster({ actor: req.session.email, force: true, allowShrink, confirm });
+    res.status(r.ok ? 200 : 409).json(r);
   } catch (e) {
     res.status(400).json({ ok: false, error: e.code || 'drive_error', message: e.message });
   }

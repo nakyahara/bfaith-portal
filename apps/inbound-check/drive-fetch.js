@@ -164,7 +164,7 @@ let _fetchingBarcode = null;
  * Drive のバーコードマスタを取り込む。
  * @param {object} o { actor, force }  force=true で同じ内容でも取り込み直す (管理画面の「今すぐ」)
  */
-export async function fetchAndImportBarcodeMaster({ actor = 'cron', force = false, allowShrink = false } = {}) {
+export async function fetchAndImportBarcodeMaster({ actor = 'cron', force = false, allowShrink = false, confirm = null } = {}) {
   // 🚨 cron と管理画面の「今すぐ」を**同じ列に並べる**。別々に走らせると、先に落としてきた古い CSV が
   //    後からコミットして新しいマスタを巻き戻す (Codex R1 High-3)。
   //    複数インスタンスをまたぐ追い越しは importBarcodeMaster 側が世代 (Drive の更新時刻) で弾く
@@ -180,7 +180,7 @@ export async function fetchAndImportBarcodeMaster({ actor = 'cron', force = fals
     if (!force && hash === _lastBarcodeHash) {
       return { ok: true, unchanged: true, message: 'バーコードマスタは前回と同じ内容でした', driveModifiedTime: modified };
     }
-    const r = importBarcodeMaster(dl.buffer, { actor, sourceModifiedAt: modified, allowShrink });
+    const r = importBarcodeMaster(dl.buffer, { actor, sourceModifiedAt: modified, allowShrink, confirm });
     if (r.ok) {
       _lastBarcodeHash = hash;
       _lastBarcodeOk = new Date().toISOString();

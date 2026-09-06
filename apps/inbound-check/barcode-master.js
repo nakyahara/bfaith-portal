@@ -176,7 +176,7 @@ export function parseBarcodeMasterCsv(buffer) {
  *     (cron と手動が並んだとき、遅れて着いた古い世代でマスタを巻き戻さないため)
  *   - allowShrink: 前回より大きく減っていても取り込む (人が承認したとき)
  */
-export function importBarcodeMaster(buffer, { actor = null, sourceModifiedAt = null, allowShrink = false } = {}) {
+export function importBarcodeMaster(buffer, { actor = null, sourceModifiedAt = null, allowShrink = false, confirm = null } = {}) {
   const parsed = parseBarcodeMasterCsv(buffer);
   const db = getDB();
   const now = new Date().toISOString();
@@ -196,7 +196,15 @@ export function importBarcodeMaster(buffer, { actor = null, sourceModifiedAt = n
       return { ok: false, error: 'stale_source', message: `もっと新しいバーコードマスタ (${prevAt}) が取り込み済みのため、この ${sourceModifiedAt} の内容は使いません` };
     }
     // 🚨 急に減っていたら取り込まない (出力が途中で切れた CSV の全量置換で正常なマスタが消える)
-    if (!allowShrink && before.size >= SHRINK_MIN_ROWS && parsed.rows.length < before.size * (1 - SHRINK_LIMIT)) {
+    // 承認つきの取込は、**画面が見せた件数と同じとき**だけ通す (誤タップ・古い画面で気づかず全部消さない)
+    if (allowShrink && confirm && (confirm.before !== before.size || confirm.after !== parsed.rows.length)) {
+      return {
+        ok: false, error: 'confirm_mismatch', before: before.size, after: parsed.rows.length,
+        message: `確認したときと件数が変わっています (${confirm.before}→${confirm.after} と見せていましたが、いまは ${before.size}→${parsed.rows.length} です)。もう一度確認してください`,
+      };
+    }
+    // 「2割以上減ったら拒否」= ちょうど2割減 (100→80) も止める
+    if (!allowShrink && before.size >= SHRINK_MIN_ROWS && parsed.rows.length <= before.size * (1 - SHRINK_LIMIT)) {
       return {
         ok: false, error: 'shrink_guard', before: before.size, after: parsed.rows.length, blankRows: parsed.blankRows,
         message: `バーコードが ${before.size} 件 → ${parsed.rows.length} 件 と ${Math.round((1 - parsed.rows.length / before.size) * 100)}% 減っています`
