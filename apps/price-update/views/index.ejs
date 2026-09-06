@@ -77,6 +77,7 @@
   .c-go { background: #dcfce7; color: #166534; }
   .c-caution { background: #fef3c7; color: #92400e; }
   .c-stop { background: #fee2e2; color: #b91c1c; }
+  .c-none { background: #f1f5f9; color: #64748b; }
   .c-confirmed { background: #dcfce7; color: #166534; }
   .c-rule { background: #fef3c7; color: #92400e; }
   .c-sales { background: #e0f2fe; color: #0369a1; }
@@ -158,7 +159,9 @@
       <table class="pu" id="rows-table">
         <thead>
           <tr>
-            <th style="width:30px;"><input type="checkbox" id="sel-all" title="すべて選ぶ / 外す"></th>
+            <th style="width:30px;"><input type="checkbox" id="sel-all"
+              aria-label="送れる単品の行をすべて選ぶ (セットと止まっている行は選ばれません)"
+              title="送れる単品の行をすべて選ぶ / すべて外す。セットと ⛔ の行は選ばれません"></th>
             <th>モール</th>
             <th class="col-detail">出品コード / SKU</th>
             <th class="col-detail">引き当て</th>
@@ -219,6 +222,8 @@
 <script>
   const MALL_LABEL = { rakuten: '楽天', yahoo: 'Yahoo', amazon: 'Amazon', aupay: 'au PAY', qoo10: 'Qoo10' };
   const CONF_LABEL = { confirmed: '確定', rule: '規則推定', sales: '実績のみ', unresolved: '未解決' };
+  // ★サーバ側 (pricing.js) が積むブロック理由の文言。ここだけ扱いを変えるので突き合わせている
+  const EMPTY_PRICE_BLOCK = '新売価が未入力です';
   // ★href に入れてよいのは http(s) だけ (javascript: を踏ませない)
   const safeUrl = (u) => {
     const v = String(u == null ? '' : u).trim();
@@ -228,6 +233,11 @@
   let previewId = null;
   let rows = [];
   let inputCodes = [];
+  // 「すべて選ぶ」で選んでよい行のキー。★セット行と、止まっている行は入れない
+  // (セットが初期状態で未選択なのは安全のためで、1操作で外してよいものではない)
+  let selectableKeys = new Set();
+  /** 売価が空なだけの行は「まだ対象でない」。それ以外の理由で止まっている行と区別する */
+  const isSendable = (ev) => !!ev && ev.blocks.filter((b) => b !== EMPTY_PRICE_BLOCK).length === 0;
 
   const $ = (id) => document.getElementById(id);
   const yen = (v) => (v == null ? '—' : Number(v).toLocaleString());
@@ -252,12 +262,24 @@
     return out;
   }
 
+  let resolving = false;
+
   async function doResolve() {
+    if (resolving) return;                       // 二度押し・検索と再計算の同時押しを止める
     const codes = $('codes').value;
+    const costOverrides = costOverridesFromForm();   // ★入力を止める前に読む
+    resolving = true;
+    // ★進行中/未送信の preview を無効にしてから検索する。
+    //   そうしないと、古い応答が後から届いて新しい検索結果を上書きする (Codex R1 High)
+    clearTimeout(timer); timer = null;
+    enqueueSeq++;
+    previewId = null;
+    setInputsDisabled(true);
     $('resolve-msg').textContent = '検索中… (モールAPIに問い合わせるので数十秒かかることがあります)';
     $('resolve-btn').disabled = true;
+    $('recost-btn').disabled = true;
     try {
-      const r = await api('/apps/price-update/api/resolve', { codes, costOverrides: costOverridesFromForm() });
+      const r = await api('/apps/price-update/api/resolve', { codes, costOverrides });
       previewId = r.previewId;
       rows = r.rows;
       inputCodes = codes.split(/[\s,、\r\n\t]+/).map((s) => s.trim()).filter(Boolean);
@@ -271,7 +293,10 @@
     } catch (e) {
       $('resolve-msg').textContent = 'エラー: ' + e.message;
     } finally {
+      resolving = false;
       $('resolve-btn').disabled = false;
+      $('recost-btn').disabled = false;
+      if (!saving) setInputsDisabled(false);
     }
   }
 
@@ -285,7 +310,8 @@
         + '<span class="code">' + esc(c) + '</span>'
         + '<span class="nm" title="' + esc(row.productName || '') + '">' + esc(row.productName || '') + '</span>'
         + '<span class="pu-note num">現 ' + yen(row.cost) + ' 円</span>'
-        + '<input type="number" class="cost-in" data-code="' + esc(c) + '" min="0" step="1" placeholder="新原価">'
+        + '<input type="number" class="cost-in" data-code="' + esc(c) + '" min="0" step="1"'
+        + ' aria-label="' + esc((row.productName || c)) + ' の新しい原価 (税抜)" placeholder="新原価">'
         + '</div>';
     }).join('');
   }
@@ -356,11 +382,15 @@
       notes.push('<div class="pu-warn">' + esc(r.sharedNote) + '</div>');
     }
     if (!ev) return (notes.join('') || '<span class="dim">—</span>');
-    const blocked = ev.blocks.length > 0;
-    const chip = blocked ? '<span class="chip c-stop">⛔ 送れません</span>'
-      : (ev.warns.length ? '<span class="chip c-caution">⚠️ 注意</span>'
-        : '<span class="chip c-go">✅ 更新できます</span>');
-    const detail = (ev.blocks.length ? '<div class="bad">' + ev.blocks.map(esc).join('<br>') + '</div>' : '')
+    // 「まだ売価を入れていない」だけの行を赤にすると、画面が ⛔ だらけになって
+    // 本当に止まっている行が埋もれる。理由がそれ1つのときは灰色にする
+    const onlyEmpty = ev.blocks.length === 1 && ev.blocks[0] === EMPTY_PRICE_BLOCK;
+    const chip = onlyEmpty ? '<span class="chip c-none">売価が未入力</span>'
+      : (ev.blocks.length ? '<span class="chip c-stop">⛔ 送れません</span>'
+        : (ev.warns.length ? '<span class="chip c-caution">⚠️ 注意</span>'
+          : '<span class="chip c-go">✅ 更新できます</span>'));
+    const detail = (onlyEmpty ? ''
+      : (ev.blocks.length ? '<div class="bad">' + ev.blocks.map(esc).join('<br>') + '</div>' : ''))
       + (ev.warns.length ? '<div class="pu-warn">' + ev.warns.map(esc).join('<br>') + '</div>' : '');
     return chip + detail + notes.join('');
   }
@@ -400,8 +430,10 @@
 
       return head + g.rows.map((r) => {
         const ev = r.evaluation;
+        const who = esc((MALL_LABEL[r.mall] || r.mall) + ' ' + (r.productName || r.neCode));
         return '<tr class="' + (ev && !ev.canUpdate ? 'blocked' : '') + '">'
-          + '<td><input type="checkbox" class="sel" data-key="' + r.key + '" ' + (r.selected ? 'checked' : '') + '></td>'
+          + '<td><input type="checkbox" class="sel" data-key="' + r.key + '"'
+          + ' aria-label="' + who + ' を選ぶ" ' + (r.selected ? 'checked' : '') + '></td>'
           + '<td><span class="mall m-' + r.mall + '">' + esc(MALL_LABEL[r.mall] || r.mall) + '</span></td>'
           + '<td class="col-detail code">' + esc(r.listingCode || '')
           // Yahoo のカラバリは「当たった色」と「送り先の商品コード」が別。両方見せる
@@ -412,7 +444,8 @@
           + '<div class="pu-note">' + esc(r.resolveSource || '') + '</div></td>'
           + '<td class="num"><span class="cur">' + yen(r.price) + '</span>'
           + '<div class="pu-note detail-line">' + esc(r.priceSource || r.note || '取得できず') + '</div></td>'
-          + '<td class="num keep"><input type="number" class="price-in" data-key="' + r.key + '" min="1" step="1" value="' + (r.newPrice == null ? '' : r.newPrice) + '"></td>'
+          + '<td class="num keep"><input type="number" class="price-in" data-key="' + r.key + '"'
+          + ' aria-label="' + who + ' の新しい売価" min="1" step="1" value="' + (r.newPrice == null ? '' : r.newPrice) + '"></td>'
           + '<td class="num nw">' + deltaCell(r, ev) + '</td>'
           + '<td class="num">' + grossCell(r, ev) + '</td>'
           + '<td class="col-detail">' + (shippingLines(r) || '<span class="dim">—</span>') + '</td>'
@@ -422,15 +455,22 @@
       }).join('');
     }).join('');
     $('rows-table').querySelector('tbody').innerHTML = html;
+    selectableKeys = new Set(updatable
+      .filter((r) => r.rowKind !== 'set' && isSendable(r.evaluation))
+      .map((r) => String(r.key)));
 
-    // 「いま何行を送ることになるのか」を記録ボタンのすぐ横に出す
+    // 「記録すると何行になるのか」を、記録API と同じ数え方で出す。
+    // ★Amazon の行は選ばなくても記録される (手動更新のチェックリストとして足される)
     const sel = updatable.filter((r) => r.selected);
-    const go = sel.filter((r) => r.evaluation && r.evaluation.canUpdate && r.newPrice != null);
-    const stop = sel.filter((r) => r.evaluation && !r.evaluation.canUpdate);
+    const amazon = manual.filter((r) => r.confidence !== 'unresolved' && r.listingCode);
+    const go = sel.filter((r) => r.evaluation && r.evaluation.canUpdate);
     const empty = sel.filter((r) => r.newPrice == null);
-    $('sum').innerHTML = '選択 <b>' + sel.length + '</b> 行 / 送れる <b>' + go.length + '</b> 行'
-      + (stop.length ? ' / <span class="s-stop">⛔ <b>' + stop.length + '</b> 行</span>' : '')
-      + (empty.length ? ' / <span class="dim">売価が空 ' + empty.length + ' 行</span>' : '');
+    const stop = sel.filter((r) => r.evaluation && !r.evaluation.canUpdate && r.newPrice != null);
+    $('sum').innerHTML = '記録すると <b>' + (sel.length + amazon.length) + '</b> 行'
+      + ' — 送れる <b>' + go.length + '</b>'
+      + (stop.length ? ' / <span class="s-stop">⛔ <b>' + stop.length + '</b></span>' : '')
+      + (empty.length ? ' / <span class="dim">売価が未入力 ' + empty.length + '</span>' : '')
+      + (amazon.length ? ' / <span class="dim">Amazon 手動 ' + amazon.length + '</span>' : '');
 
     $('manual-table').querySelector('tbody').innerHTML = manual.map((r) => (
       '<tr>'
@@ -450,10 +490,10 @@
   }
 
   function syncSelAll() {
-    const all = [...document.querySelectorAll('.sel')];
-    const on = all.filter((el) => el.checked).length;
-    $('sel-all').checked = all.length > 0 && on === all.length;
-    $('sel-all').indeterminate = on > 0 && on < all.length;
+    const target = [...document.querySelectorAll('.sel')].filter((el) => selectableKeys.has(el.dataset.key));
+    const on = target.filter((el) => el.checked).length;
+    $('sel-all').checked = target.length > 0 && on === target.length;
+    $('sel-all').indeterminate = on > 0 && on < target.length;
   }
 
   // 入力のたびにサーバへ送らないよう少しまとめる。
@@ -478,7 +518,10 @@
   function enqueuePreview() {
     const mySeq = ++enqueueSeq;
     const payload = snapshotPayload();
-    const run = () => sendPreview(payload, mySeq);
+    // ★どのプレビューに対する入力かを固定する。実行時に読むと、
+    //   検索し直した後の新しいプレビューへ古い画面の入力を送ってしまう
+    const forPreviewId = previewId;
+    const run = () => sendPreview(payload, mySeq, forPreviewId);
     chain = chain.then(run, run);   // 前回が失敗していても最新入力を送り直す
     return chain;
   }
@@ -503,13 +546,13 @@
     do { last = chain; await chain; } while (last !== chain);
   }
 
-  async function sendPreview(payload, mySeq) {
-    if (!previewId) return;
+  async function sendPreview(payload, mySeq, forPreviewId) {
+    if (!forPreviewId || forPreviewId !== previewId) return;   // 別のプレビューになっていたら捨てる
     try {
-      const r = await api('/apps/price-update/api/preview', { previewId, rows: payload });
+      const r = await api('/apps/price-update/api/preview', { previewId: forPreviewId, rows: payload });
       // 自分より新しい入力が既にキューに入っているなら描き直さない
       // (古い応答で表を作り直すと、入力中の値が前の値へ巻き戻る)
-      if (mySeq === enqueueSeq) {
+      if (mySeq === enqueueSeq && forPreviewId === previewId) {
         rows = r.rows;
         render();
         $('save-msg').textContent = '';
@@ -544,7 +587,10 @@
   $('detail-tgl').onchange = function () { document.body.classList.toggle('show-detail', this.checked); };
   $('sel-all').onchange = function () {
     const on = this.checked;
-    document.querySelectorAll('.sel').forEach((el) => { el.checked = on; });
+    document.querySelectorAll('.sel').forEach((el) => {
+      // 選ぶのは「送れる単品」だけ。外すときは全部外す (危ない向きには効かせない)
+      if (on) { if (selectableKeys.has(el.dataset.key)) el.checked = true; } else { el.checked = false; }
+    });
     onInputChange();   // 選び直しもふつうの入力と同じ道を通す (サーバ側の記録とずれないように)
   };
 </script>
