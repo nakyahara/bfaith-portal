@@ -153,6 +153,10 @@
   /* ── ボード (状態 4 列。iPad 縦では横スクロール) ── */
   /* 列は画面幅で割る (4 列なら 25%)。列数は renderBoard() が grid-template-columns で入れる。狭いときだけ横スクロール (監修) */
   .board{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(170px,1fr);gap:10px;overflow-x:auto;padding-bottom:10px}
+  /* 列が多い (拠点 = 6 列) とき: 写真枠を消して文字の幅を確保 (170px の列では 1 文字ずつ折れていた — 中原さん 2026-09-06) */
+  .board.narrow .bcard .th{display:none}
+  .board.narrow .bcard{padding:8px}
+  .boardhint{margin:-4px 0 8px;font-size:.84rem;color:var(--sub);font-weight:700}
   .col{background:var(--well);border:1px solid var(--line);border-radius:var(--r);padding:8px;min-width:0}
   .col h3{margin:0 0 8px;font-size:.86rem;font-weight:700;color:var(--sub);display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;white-space:nowrap}
   .col h3 .t{flex:1 1 auto;min-width:4em;overflow:hidden;text-overflow:ellipsis}   /* 見出しは消さない (「まとめて棚入完了」は次の行へ) */
@@ -673,6 +677,7 @@
       <input class="search" id="bq" placeholder="商品名・商品コードで検索">
     </div>
     <div class="board" id="board"></div>
+    <p class="boardhint" id="boardHint" hidden>→ 横にスクロールすると残りの列が見えます</p>
   </div>
 
   <!-- ══ 画面1d: 明日の計画 (職員だけ。ボードのゲージから開く) ══ -->
@@ -1804,9 +1809,16 @@ function renderBoard() {
       (hours > 0 ? '<span class="n">⏱ ' + esc(approxHours(hours)) + '</span>' : '') +
       (canBulk && !bulkIds ? '<button onclick="startBulk()">まとめて棚入完了</button>' : '') + '</h3>' + body + '</div>';
   }).join('');
-  $('#board').innerHTML = cols;
-  // 列は画面幅で割る (4 列なら 25%)。狭くて 170px を切るときだけ横スクロール (右端が切れて気づけなかった — 監修)
-  $('#board').style.gridTemplateColumns = 'repeat(' + groups.length + ', minmax(170px, 1fr))';
+  const board = $('#board');
+  board.innerHTML = cols;
+  // 列は画面幅で割る (4 列なら 25%)。狭くて最小幅を切るときだけ横スクロール (右端が切れて気づけなかった — 監修)。
+  // ⭐列が多い (拠点 = 6 列) ときは最小幅を広げ、写真枠を消す — 170px の列では商品名が 1 文字ずつ折れていた (中原さん 2026-09-06)
+  const many = groups.length > 4;
+  board.classList.toggle('narrow', many);
+  board.style.gridTemplateColumns = 'repeat(' + groups.length + ', minmax(' + (many ? 220 : 170) + 'px, 1fr))';
+  // 横にスクロールできるときは、そう書く (気づけないと右の列が無いように見える)
+  const hint = $('#boardHint');
+  if (hint) hint.hidden = !(board.scrollWidth > board.clientWidth + 4);
 }
 /** 掴み手。⭐動かせるときだけ描く (動かせないのに掴めるように見せない — 要件 §U-7) */
 function gripHtml() { return '<span class="grip" data-grip aria-hidden="true">⠿</span>'; }
@@ -2148,6 +2160,13 @@ function dropPlanCaps() {
   clearPlanDom();
   if (curView === 'plan') setView('board');
   if (facPickCtx) closeFacPick();
+  if (whenPickCtx) closeWhenPick();
+  // 開いている状態ダイアログも描き直す — 職員だけのボタンと PIN 行を残さない (Codex PR #1217 R1)
+  if (stTarget != null && $('#stOv').classList.contains('on') && !stSaving) {
+    const c0 = findCard(stTarget);
+    if (c0) { stStep = null; $('#pinRow').style.display = 'none'; $('#pinIn').value = ''; $('#stMsg').textContent = ''; renderStBtns(c0); }
+    else closeSt();
+  }
   renderStaffBtn();
   renderList();
   renderBoard();

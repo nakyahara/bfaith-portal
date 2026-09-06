@@ -3519,6 +3519,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '保存後にボタンを無条件で戻さない (許可リストで判断する。正本だけを見ない)');
   // 実機FB (2026-09-03): ボードに写真・項目タップで変更・想定作業時間の合計
   ok(/\(c\.image_url \? '<div class="th">' \+ thumbHtml\(c\) \+ '<\/div>' : ''\)/.test(html), 'ボードのカードに写真を出す (写真が無いカードは空枠を出さない — 監修)');
+  ok(/const many = groups\.length > 4;\s*board\.classList\.toggle\('narrow', many\);/.test(html) && /\.board\.narrow \.bcard \.th\{display:none\}/.test(html)
+    && /hint\.hidden = !\(board\.scrollWidth > board\.clientWidth \+ 4\);/.test(html),
+    '拠点ボード (6 列) は最小幅を広げ・写真枠を消し・横にスクロールできることを書く (1 文字ずつ折れていた — 中原さん 2026-09-06)');
   // 監修 PR-D: 意味を正す
   ok(/function boxesText\(c, opts\)/.test(html) && /boxesText\(c, \{ short: true \}\)/.test(html) && /n\('必要保管箱', boxesText\(c\) \|\| null, ''\)/.test(html),
     '必要保管箱は「用意する箱の数」で出す (boxes_calc。元の式の文字列は c.boxes に残す)');
@@ -3639,6 +3642,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const staffOk = isStaffUI\(\) \|\| !!\(state\.me && state\.me\.session\);\s*const shown = nexts\.filter\(\(v\) => staffOk \|\| !stNeedsStaff\(c\.status, v\)\);/.test(html)
     && /ここから変えられるのは職員だけです/.test(html),
     '状態ダイアログ: 終了 (棚入完了) など職員だけの変更は、職員モードのときだけ描く (利用者に押せないボタンを見せない — 中原さん 2026-09-06)');
+  ok(/if \(stTarget != null && \$\('#stOv'\)\.classList\.contains\('on'\) && !stSaving\) \{\s*const c0 = findCard\(stTarget\);\s*if \(c0\) \{ stStep = null; \$\('#pinRow'\)\.style\.display = 'none'; \$\('#pinIn'\)\.value = ''; \$\('#stMsg'\)\.textContent = ''; renderStBtns\(c0\); \}/.test(html),
+    '職員モードが切れたら、開いている状態ダイアログも描き直す (職員だけのボタン・PIN 行を残さない — Codex PR #1217 R1)');
   ok(/async function stockOne\(id\)/.test(html) && /function stockBtnHtml\(c\)/.test(html) && (html.match(/closest\('\[data-stock-of\]'\)/g) || []).length === 2
     && /c\.status !== 'ready_for_stocking' \|\| bulkIds \|\| !isApp\(\) \|\| !stateCan\('tasks\.bulk_stocked'\) \|\| !isStaffUI\(\)/.test(html),
     '棚入待ちのカードに ✅ 棚入完了 (1 枚ずつ。職員モードだけ・まとめて選択中は出さない) — 一覧とボードの両方');
