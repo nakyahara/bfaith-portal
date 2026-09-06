@@ -284,6 +284,67 @@ await t('読み取り・JSON が壊れているときは空扱いにせず broke
   }
 });
 
+await t('ackAndSend は1回の書き込みで置き換える — 保存できなければ前の1件が残る (PQ-R3 high#1)', async () => {
+  const server = makeServer(['commit_lost']), storage = makeStorage();
+  const q = mk(server, storage);
+  await q.send({ body: bodyOf() });
+  const out = await q.send({ body: bodyOf() });
+  assert.equal(out.kind, 'confirm');
+  const origSet = storage.set;
+  storage.set = () => { throw new Error('QuotaExceeded'); };      // 置換の書き込みが失敗する
+  const again = await q.ackAndSend({ ackRequestId: out.prev.requestId, body: out.body, meta: out.meta });
+  storage.set = origSet;
+  assert.equal(again.kind, 'storage_failed');
+  assert.ok(storage.raw(), '前の1件が消えていない (消えると今回分の行き場が無くなる)');
+  assert.equal(storage.raw().requestId, out.prev.requestId);
+  assert.equal(server.registered.size, 1, '送っていない');
+  // もう一度押せば、今度は置き換わる
+  const retry = await q.ackAndSend({ ackRequestId: out.prev.requestId, body: out.body, meta: out.meta });
+  assert.equal(retry.kind, 'done');
+  assert.equal(server.registered.size, 2);
+});
+
+await t('broken のときは「いま押した分」も返す (職員が照合できるように — PQ-R3 high#3)', async () => {
+  const server = makeServer(), storage = makeStorage({ seed: { junk: true } });
+  const q = mk(server, storage);
+  const out = await q.send({ body: bodyOf({ qty: 7 }), meta: { productName: 'ロジン' } });
+  assert.equal(out.kind, 'broken');
+  assert.equal(out.body.qty, 7);
+  assert.equal(out.meta.productName, 'ロジン');
+});
+
+await t('Web Locks があれば、2画面の同時送信でも1件しか作らない (PQ-R3 medium#5)', async () => {
+  // 本物の LockManager 相当 (名前ごとに直列化する)
+  const chains = new Map();
+  const locks = { request: (name, fn) => {
+    const prev = chains.get(name) || Promise.resolve();
+    const run = prev.then(fn, fn);
+    chains.set(name, run.then(() => {}, () => {}));
+    return run;
+  } };
+  const server = makeServer(), storage = makeStorage();
+  const withLocks = (st) => createPlaceQueue({
+    post: server.post, storage: st, newId: () => `req-${++seq}`, wait: async () => {}, retryWaitMs: 0,
+    // sandbox の global に navigator を差し込む代わりに、同じ仕組みを直接渡せないので
+    // ここでは locks 付きの global を作った VM を使う (下の runInContext 参照)
+  });
+  void withLocks;
+  const vm2 = await import('node:vm');
+  const sb = { window: {}, navigator: { locks } };
+  sb.global = sb;
+  vm2.createContext(sb);
+  vm2.runInContext(src, sb, { filename: 'place-queue.js' });
+  const make = () => sb.window.createPlaceQueue({ post: server.post, storage, newId: () => `req-${++seq}`, wait: async () => {}, retryWaitMs: 0 });
+  const tabA = make(), tabB = make();
+  const [a, b2] = await Promise.all([
+    tabA.send({ body: bodyOf(), meta: { productName: 'ロジン' } }),
+    tabB.send({ body: bodyOf(), meta: { productName: 'ロジン' } }),
+  ]);
+  const kinds = [a.kind, b2.kind].sort().join(',');
+  assert.equal(kinds, 'confirm,done', `同時でも片方は確認になる (${kinds})`);
+  assert.equal(server.registered.size, 1, '同時に押しても2件は作らない');
+});
+
 await t('送信と送り直しが並行しても、古いほうが新しい1件を消さない (R5 high#3)', async () => {
   const storage = makeStorage();
   let release;

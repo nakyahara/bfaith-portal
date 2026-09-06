@@ -189,10 +189,31 @@ await t('応答喪失後の送り直しは、作業者が無効になってい�
   const conflict = await call('POST', '/api/placements', { body: Object.assign({}, p, { qty: 2 }) });
   assert.equal(conflict.status, 409);
   assert.equal(conflict.j.error, 'idempotency_conflict', '内容が違う同じ操作IDは今までどおり弾く');
+  // 期限を空文字で送っても、同じ内容の再送は conflict にならない (PQ-R3 medium#1)
+  const e1 = await call('POST', '/api/placements', { body: Object.assign({}, p, { request_id: 'exp-1', expiry: '', worker_id: memberId }) });
+  assert.equal(e1.j.ok, true, JSON.stringify(e1.j));
+  const e2 = await call('POST', '/api/placements', { body: Object.assign({}, p, { request_id: 'exp-1', expiry: '', worker_id: memberId }) });
+  assert.equal(e2.j.already, true, JSON.stringify(e2.j));
+  const e3 = await call('POST', '/api/placements', { body: Object.assign({}, p, { request_id: 'exp-1', worker_id: memberId }) });   // expiry 省略
+  assert.equal(e3.j.already, true, '空文字と未指定は同じ内容として扱う');
+  // 取消済みの再送は「記録できています」と返さない (PQ-R3 high#5)
+  assert.equal((await call('POST', `/api/placements/${e1.j.placementId}/revoke`, { body: { worker_id: memberId } })).j.ok, true);
+  const afterRevoke = await call('POST', '/api/placements', { body: Object.assign({}, p, { request_id: 'exp-1', expiry: '', worker_id: memberId }) });
+  assert.equal(afterRevoke.status, 409);
+  assert.equal(afterRevoke.j.error, 'placement_revoked', JSON.stringify(afterRevoke.j));
   // 後始末: 一時の投入を消して、元の投入を戻す
   assert.equal((await call('POST', `/api/placements/${first.j.placementId}/revoke`, { body: { worker_id: memberId } })).j.ok, true);
   const back = await call('POST', '/api/placements', { body: { run_id: runId, row_id: r0.id, box_id: mine.box_id, qty: mine.qty, worker_id: memberId, request_id: 'restore-1' } });
   assert.equal(back.j.ok, true, JSON.stringify(back.j));
+});
+
+await t('職員の本人確認だけの API: PIN が違えば通らない・通れば監査に残る (PQ-R3 high#4)', async () => {
+  assert.equal((await call('POST', '/api/staff/verify', { body: { auth_worker_id: staffId, auth_pin: '0000', purpose: 'discard_broken_pending' } })).status, 403);
+  assert.equal((await call('POST', '/api/staff/verify', { body: { auth_worker_id: memberId, auth_pin: '2468', purpose: 'x' } })).status, 403, '利用者は通さない');
+  const okv = await call('POST', '/api/staff/verify', { body: { auth_worker_id: staffId, auth_pin: '2468', purpose: 'discard_broken_pending', detail: '{"reason":"unknown_shape"}' } });
+  assert.equal(okv.j.ok, true, JSON.stringify(okv.j));
+  assert.equal(okv.j.approvedBy, 'しょくいん');
+  assert.ok(db.listEvents(5).some((e) => e.action === 'staff_verify' && JSON.parse(e.payload || '{}').purpose === 'discard_broken_pending'), '監査に残る');
 });
 
 await t('確認した人: 投入で自動記録され、intent なしの更新 (旧画面の自動POST) は client_outdated', async () => {

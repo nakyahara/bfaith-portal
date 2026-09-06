@@ -400,6 +400,20 @@ router.post('/api/workers/:id(\\d+)/active', checkOrigin, api((req, res) => {
   res.json({ ok: true });
 }));
 
+/**
+ * 職員の本人確認だけを行う (端末に残った「読めない記録」を捨てる前など、サーバーの状態は
+ * 変えないが職員の判断が要る操作)。画面だけの PIN 入力は検証になっていない (Codex PQ-R3 high#4)。
+ * 誰がいつ何のために通したかを監査に残す
+ */
+router.post('/api/staff/verify', checkOrigin, api((req, res) => {
+  const gate = staffApproval(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  safeLogEvent({ action: 'staff_verify', deviceLabel: deviceLabelOf(req), ok: true,
+    payload: { purpose: String(req.body?.purpose || '').slice(0, 60), via: gate.via, approvedBy: gate.approvedBy,
+      detail: String(req.body?.detail || '').slice(0, 500) } });
+  res.json({ ok: true, approvedBy: gate.approvedBy });
+}));
+
 /** 割当の追加 (F-2: 原子的残数検証+冪等性) */
 router.post('/api/placements', checkOrigin, api((req, res) => {
   // 応答喪失後の送り直しは、**作業者の検証より先に**前回の結果を返す (Codex PQ-R2 high#2)。

@@ -162,7 +162,9 @@
       send({ body, meta }) {
         return serial(async () => {
           let prev = peek();
-          if (prev && prev.broken) return { kind: 'broken', record: prev };
+          // 今回の body/meta も返す — 職員が「いま何を入れたか」を照合できないと、
+          // broken を捨てたあとに今回分が記録されないまま終わる (Codex PQ-R3 high#3)
+          if (prev && prev.broken) return { kind: 'broken', record: prev, body, meta };
           if (prev && prev.status === 'sending') {
             const settled = await settle(prev, 1);      // まず前の1件を確定させる
             if (!settled) return { kind: 'blocked', record: prev };
@@ -181,12 +183,22 @@
 
       /**
        * 前の1件を人が確認したうえで、新しい1件として送る。
-       * confirm の「はい、さらに入れた」/ showFirst の「わかりました」から呼ぶ
+       * confirm の「はい、さらに入れた」/ showFirst の「わかりました」から呼ぶ。
+       * ⚠ 消す→作る の2回の書き込みにしない (Codex PQ-R3 high#1): 間で落ちると、
+       * いま箱に入れた分がどこにも残らない。**1回の set で置き換える** ので、
+       * 書き込み前に落ちれば前の1件が、後なら今回の1件が残る
        */
       ackAndSend({ ackRequestId, body, meta }) {
         return serial(async () => {
-          if (!casSet(ackRequestId, null)) return { kind: 'conflict', record: peek() };
-          return await postNew(body, meta);
+          const cur = peek();
+          if (!cur || cur.broken || cur.requestId !== ackRequestId) return { kind: 'conflict', record: cur };
+          const requestId = newId();
+          const rec = {
+            requestId, meta: meta || null, status: 'sending',
+            body: Object.assign({}, body, { request_id: requestId }),
+          };
+          if (!saveNew(rec)) return { kind: 'storage_failed', record: peek() };   // 置換できず前の1件が残る
+          return { kind: 'done', record: (await settle(rec, 2)) || rec };
         });
       },
 

@@ -1264,8 +1264,10 @@ export function getRunState(runId) {
       (SELECT COUNT(DISTINCT p.row_id) FROM fbx_placements p WHERE p.box_id = b.id AND p.revoked_at IS NULL) AS sku_count
     FROM fbx_boxes b JOIN fbx_pack_groups g ON g.id = b.pack_group_id
     WHERE g.run_id = ? ORDER BY b.pack_group_id, b.box_no`).all(run.id);
-  const placements = d.prepare(`SELECT p.* FROM fbx_placements p
-    WHERE p.run_id = ? AND p.revoked_at IS NULL ORDER BY p.box_id, p.box_seq`).all(run.id);
+  // 画面に要る列だけ (device_key / request_id / request_hash = 冪等キーの内部情報は返さない — PQ-R3 low#1)
+  const placements = d.prepare(`SELECT p.id, p.run_id, p.row_id, p.box_id, p.qty, p.expiry, p.box_seq,
+      p.placement_layer, p.layer_source, p.worker_id, p.worker_name, p.created_at, p.revoked_at
+    FROM fbx_placements p WHERE p.run_id = ? AND p.revoked_at IS NULL ORDER BY p.box_id, p.box_seq`).all(run.id);
   const excelFiles = d.prepare(`SELECT id, original_name, sha256, fingerprint, uploaded_by, uploaded_at FROM fbx_excel_files WHERE run_id = ? ORDER BY id`).all(run.id);
   assignAmazonBoxNumbers(groups, boxes);
   // PR3 重量補助: 箱ごとの推定 (Σ数量×採用単重 + 資材自重) と、商品ごとの採用単重・この回のルール
@@ -1476,6 +1478,15 @@ export function getBox(boxId) {
  *   冪等性 → 行/箱/回の状態 → 残数 → 期限制約 → box_seq 採番 → 挿入 → 監査
  * layer は任意 (manual のみ。自動推定は保存しない — Codex R2 S2)
  */
+/** 冪等キーの内容ハッシュ。addPlacement と replayPlacement で必ず同じ正規化を使う */
+function placementRequestHash({ runId, rowId, boxId, qty, expiry, layer }) {
+  const exp = expiry == null || expiry === '' ? null : String(expiry);
+  const lay = layer == null || layer === '' ? null : String(layer);
+  return crypto.createHash('sha256')
+    .update(JSON.stringify([Number(runId), Number(rowId), Number(boxId), Number(qty), exp, lay]))
+    .digest('hex');
+}
+
 export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, deviceKey, deviceLabel, requestId }) {
   const q = Number(qty);
   if (!Number.isInteger(q) || q <= 0 || q > 100000) return { ok: false, error: 'bad_qty', message: '個数は1以上の整数で入力してください' };
@@ -1491,23 +1502,22 @@ export function addPlacement({ runId, rowId, boxId, qty, expiry, layer, worker, 
     if (t < Date.now()) return { ok: false, error: 'past_expiry', message: '過去の期限は入力できません (現物を確認してください)' };
   }
   // 冪等キーはリクエスト内容に結び付ける (Codex PR1 #5): 同キーで内容が違えば 409。
-  // hash はクライアントが送った生の値で計算する (期限の引き継ぎ等のサーバー側補完より前 —
-  // 再送は同じ生値で来るので一致する)
-  const requestHash = crypto.createHash('sha256')
-    .update(JSON.stringify([Number(runId), Number(rowId), Number(boxId), q, expiry ?? null, lay]))
-    .digest('hex');
+  const requestHash = placementRequestHash({ runId, rowId, boxId, qty: q, expiry, layer: lay });
   const d = getDB();
   return d.transaction(() => {
     // 冪等性: 同じ端末×request_id は前回結果を返す (再送で二重登録しない)
     const prev = d.prepare('SELECT * FROM fbx_placements WHERE device_key = ? AND request_id = ?').get(String(deviceKey), String(requestId));
     if (prev) {
+      const row0 = d.prepare('SELECT planned_qty FROM fbx_rows WHERE id = ?').get(prev.row_id);
       if (prev.request_hash !== requestHash) {
         return { ok: false, error: 'idempotency_conflict', message: '同じ操作IDで内容の違う記録が既にあります (画面を更新してやり直してください)' };
       }
       // 再送 (応答喪失) でも新規成功と同じ形で返す — 画面が「誰が確認した人になったか」を
       // 通信断のときだけ知らせられない、を防ぐ (Codex PR2.6-R4 medium#1)
+      if (prev.revoked_at) return revokedReplayError(prev);
       return { ok: true, already: true, placementId: prev.id, boxSeq: prev.box_seq,
-        placed: placedOf(d, prev.row_id), ...currentCheckWorker(d, prev.row_id) };
+        placed: placedOf(d, prev.row_id), plannedQty: row0 ? row0.planned_qty : null, expiry: prev.expiry,
+        ...currentCheckWorker(d, prev.row_id) };
     }
     const row = d.prepare('SELECT w.*, r.status AS run_status FROM fbx_rows w JOIN fbx_runs r ON r.id = w.run_id WHERE w.id = ?')
       .get(Number(rowId));
@@ -1626,17 +1636,24 @@ export function replayPlacement({ deviceKey, requestId, runId, rowId, boxId, qty
   const prev = d.prepare('SELECT * FROM fbx_placements WHERE device_key = ? AND request_id = ?')
     .get(String(deviceKey), String(requestId));
   if (!prev) return null;
-  const q = Number(qty);
-  const exp = expiry ? String(expiry) : null;
-  const lay = layer == null || layer === '' ? null : String(layer);
-  const hash = crypto.createHash('sha256')
-    .update(JSON.stringify([Number(runId), Number(rowId), Number(boxId), q, exp, lay]))
-    .digest('hex');
-  if (prev.request_hash !== hash) {
+  if (prev.request_hash !== placementRequestHash({ runId, rowId, boxId, qty, expiry, layer })) {
     return { ok: false, error: 'idempotency_conflict', message: '同じ操作IDで内容の違う記録が既にあります (画面を更新してやり直してください)' };
   }
+  if (prev.revoked_at) return revokedReplayError(prev);
+  const row0 = d.prepare('SELECT planned_qty FROM fbx_rows WHERE id = ?').get(prev.row_id);
   return { ok: true, already: true, placementId: prev.id, boxSeq: prev.box_seq,
-    placed: placedOf(d, prev.row_id), expiry: prev.expiry, ...currentCheckWorker(d, prev.row_id) };
+    placed: placedOf(d, prev.row_id), plannedQty: row0 ? row0.planned_qty : null, expiry: prev.expiry,
+    ...currentCheckWorker(d, prev.row_id) };
+}
+
+/**
+ * 応答喪失のあとに送り直したら、その記録は既に取り消されていた (Codex PQ-R3 high#5)。
+ * 「記録できています」と返すと、集計に無いものを「入っている」と見せてしまう。
+ * 勝手に入れ直しもしない — 現物と見くらべる必要がある
+ */
+function revokedReplayError(prev) {
+  return { ok: false, error: 'placement_revoked', placementId: prev.id,
+    message: 'この記録は取り消されています。箱の中身と画面の数を見くらべてください (足りなければ入れ直してください)' };
 }
 
 /**
