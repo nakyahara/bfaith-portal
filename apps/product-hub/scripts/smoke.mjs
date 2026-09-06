@@ -7823,6 +7823,13 @@ for (const [name, file, data] of renders) {
   check('セット判断の入口: まだ決めていないことが札で分かる',
     dhSingle.includes('まだ決めていません'), '');
   {
+    // 未判断のときは「作る」が青 (下の判断済みループと合わせて「未判断と保留だけ青」を固定する)
+    const ca = dhSingle.indexOf('id="set-create-open"');
+    check('セット判断の入口: 未判断の「作る」ボタンは青 (いちばん進めたい操作)',
+      ca > 0 && dhSingle.slice(Math.max(0, ca - 80), ca).includes('btn-primary'),
+      dhSingle.slice(Math.max(0, ca - 80), ca));
+  }
+  {
     // 担当外の一般ユーザーは押せない (サーバー側 assertStepOperable と同じ物差し)。
     // 押せてしまうと 403 で弾かれてから理由を知ることになる
     const dhOther = renderedHtml.get('detail.ejs (一般ユーザー・担当外)') || '';
