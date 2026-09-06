@@ -269,6 +269,7 @@ router.get('/return/:id(\\d+)', async (req, res) => {
       title: '棚戻し',
       workers: listWorkers(),
       deviceMode: !req.session?.email,
+      isAdmin: req.session?.role === 'admin',
       task: {
         ...t,
         locationLabel: t.location ? formatLocation(t.block, t.location) : null,
@@ -320,6 +321,10 @@ router.post('/api/tasks/:id(\\d+)/:action', checkOrigin, async (req, res) => {
       return res.status(400).json({ error: '棚戻しではこの操作はできません', code: 'bad_return_action' });
     }
     const action = String(req.params.action);
+    // 取り下げ (棚に戻さない) は管理者判断 — 端末の作業者コードだけでは依頼を消せない (誤操作で一覧から消える — Codex R3)
+    if (action === 'cancel' && req.session?.role !== 'admin') {
+      return res.status(403).json({ error: '棚戻しの取り下げは管理者がログインして行います', code: 'admin_required' });
+    }
     if (action !== 'fulfill') {
       const t = psvc.applyTaskAction(target.id, action, worker.name);
       return res.json({ ok: true, id: t.id, status: t.status });

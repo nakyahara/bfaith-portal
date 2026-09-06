@@ -1353,7 +1353,7 @@
           検索に出ない → 入力した「${esc(q)}」をSKUとして使う<br><small>商品コードを正確に入力した場合のみ (このバッチの商品か、在庫データに実在するものだけ通ります)</small></button>`;
       const bindDirect = () => res.querySelectorAll('.issue-direct').forEach((b) => b.addEventListener('click', () => {
         const sku = String(b.dataset.sku || '').trim().toLowerCase();
-        if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(sku)) { showToast('SKUの形式が不正です (英数字・-_.)'); return; }
+        if (!/^[a-z0-9][a-z0-9_\-.]{1,79}$/.test(sku)) { showToast('SKUの形式が不正です (英数字・-_. で2文字以上)'); return; }
         onPick({ sku, name: null });
       }));
       let timer = null;

@@ -104,7 +104,11 @@
       <% if (t.status === 'requested') { %>
         <button type="button" class="b-claim" id="claimBtn">対応する (自分が担当になる — まだ戻していない)</button>
       <% } %>
-      <button type="button" class="cancel-link" id="cancelBtn">取り下げる (棚に戻さない・管理者判断)</button>
+      <% if (typeof isAdmin !== 'undefined' && isAdmin) { %>
+        <button type="button" class="cancel-link" id="cancelBtn">取り下げる (棚に戻さない・管理者)</button>
+      <% } else { %>
+        <div class="muted" style="text-align:center; margin-top:18px">戻せないときは管理者に伝えてください (取り下げは管理者がログインして行います)</div>
+      <% } %>
     <% } %>
   </div>
 
