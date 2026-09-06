@@ -607,9 +607,14 @@
     // ★直前に売価を直していると、その評価がまだ返っていない (250ms まとめ + 往復)。
     //   古い判定のまま選ぶと、⛔ になったばかりの行を選んでしまう
     this.disabled = true;
-    try { await settlePreview(); } catch { /* 失敗は save-msg に出ている */ }
+    let evaluated = true;
+    try { await settlePreview(); } catch { evaluated = false; }
+    // ★待っている間に記録や再検索が始まっていたら、この操作は捨てる。
+    //   有効化もしない (そのときは画面全体が止まっているべき)
+    if (saving || resolving) return;
     this.disabled = false;
-    if (saving) return;                 // 待っている間に記録が始まっていたら触らない
+    // 評価を更新できなかったら選ばない (古い判定のまま選ぶ方が危ない)。失敗は save-msg に出ている
+    if (!evaluated) { syncSelAll(); return; }
     this.checked = on;                  // 再描画で戻っているので、押した通りに直す
     document.querySelectorAll('.sel').forEach((el) => {
       // 選ぶのは単品だけ。⛔ の行とセットの行は選ばない。外すときは全部外す (危ない向きには効かせない)
