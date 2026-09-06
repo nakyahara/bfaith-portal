@@ -470,6 +470,10 @@ function Test-JobData {
   $copies = 0
   if (-not [int]::TryParse([string]$Job.copies, [ref]$copies)) { return "copies is not a number ('$($Job.copies)')" }
   if ($copies -lt 1 -or $copies -gt $MaxCopies) { return "copies out of range: $copies (allowed 1..$MaxCopies)" }
+  # The odd label counts towards the limit too. The server checks the same total, but a job
+  # queued before that check existed must not slip 51 labels past us (Codex PR #1224 R2 Med).
+  $total = $copies + $(if ($extra) { 1 } else { 0 })
+  if ($total -gt $MaxCopies) { return "total labels out of range: $total = $copies + 1 odd (allowed 1..$MaxCopies)" }
   return $null
 }
 
@@ -528,15 +532,28 @@ function Invoke-Job {
   Set-Ledger $id @{ stage = 'submitting'; docName = $docName }
   $extraNote = if ($extraQty) { " +1 label of $extraQty" } else { '' }
   Write-Log 'INFO' "printing $code ($type $bc x$copies$extraNote, job $id) on '$printer'"
+  # Set as soon as the FIRST hand-off returns: from then on paper may already be out, so every
+  # later failure must be reported as uncertain - never as a clean "nothing printed", which
+  # would invite a re-press and a duplicate label (Codex PR #1224 R2 High-1).
+  $handedOff = $false
+  $outcome2 = $null
   try {
     [void](Invoke-BpacPrint -TemplatePath $template -Fields $fields -PrinterName $printer `
       -Copies $copies -DocName $docName -RenderDir $RenderDir @LabelArgs)
-    # The odd carton: one more label with its own quantity. SAME document name, so the spool
-    # tracking below follows both jobs as ours; only the BMP kept as evidence gets its own name.
+    $handedOff = $true
+    # Follow THIS hand-off before starting the next one. Watching only once at the end would let
+    # a fast first job leave the queue unseen and the odd label's success stand in for both
+    # (Codex PR #1224 R2 High-2).
+    $outcome = Wait-PrintResult $printer $before $docName
+    # The odd carton: one more label with its own quantity. Same document name (the tracking
+    # rules stay as they are); only the BMP kept as evidence gets its own name.
     if ($extraQty) {
+      $before2 = Get-SpoolJobIds $printer
+      if ($null -eq $before2) { throw '[printing] the print queue could not be read before the odd label' }
       $fields2 = New-LabelFields $cfg $type $bc ([string]$Job.productName) $extraQty ([string]$Job.expiry)
       [void](Invoke-BpacPrint -TemplatePath $template -Fields $fields2 -PrinterName $printer `
         -Copies 1 -DocName $docName -BmpName "$docName-r" -RenderDir $RenderDir @LabelArgs)
+      $outcome2 = Wait-PrintResult $printer $before2 $docName
     }
   } catch {
     $msg = $_.Exception.Message
@@ -545,15 +562,25 @@ function Invoke-Job {
     # wrong size / "[filling]") nothing has been handed to the spooler, so that is a clean
     # failure. From "[printing]" on, labels may already be coming out - report uncertain,
     # never "print again".
-    $uncertain = ($msg -like '`[printing`]*')
+    $uncertain = $handedOff -or ($msg -like '`[printing`]*')
     Report-NotPrinted $id $lease "b-PAC failed: $msg" $uncertain
     return
   }
+  # Both hand-offs are done. Say "printed" only when BOTH left the queue cleanly; otherwise keep
+  # the unhappy one, because part of the job may already be on paper.
+  if ($outcome2) {
+    $detail = "full: $($outcome.Detail) / odd: $($outcome2.Detail)"
+    if ($outcome.Result -eq 'printed' -and $outcome2.Result -eq 'printed') {
+      $outcome = @{ Result = 'printed'; Detail = $detail; JobId = $outcome.JobId }
+    } else {
+      $bad = if ($outcome.Result -ne 'printed') { $outcome } else { $outcome2 }
+      $outcome = @{ Result = $bad.Result; Detail = $detail; JobId = $outcome.JobId }
+    }
+  }
 
-  # 4. tell the server it is in the spooler, then FOLLOW THE ACTUAL SPOOL JOB.
-  #    A clean return from b-PAC only proves the hand-off - a pulled USB cable or an empty
-  #    roll would otherwise be announced as "printed" and nobody would notice.
-  $outcome = Wait-PrintResult $printer $before $docName
+  # 4. tell the server it is in the spooler. The spool jobs were followed above, right after
+  #    each hand-off: a clean return from b-PAC only proves the hand-off, and a pulled USB cable
+  #    or an empty roll would otherwise be announced as "printed" and nobody would notice.
   $spool = $outcome.JobId
   # Record WHAT HAPPENED, not just "we got as far as submitting". If the report below fails
   # and we restart, the recovery path must resend this same result - otherwise a job that
