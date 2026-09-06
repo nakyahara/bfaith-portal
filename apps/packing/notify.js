@@ -92,7 +92,7 @@ export async function notifyTask(info, worker) {
   if (info.locationLabel) lines.push(`ロケ: ${info.locationLabel}`);
   lines.push(`依頼元: ${info.folder || '-'}${info.slipSeq ? ` #${info.slipSeq}` : ''} / 依頼: ${worker}`);
   if (info.kind === 'repick' && info.repickBatchId) {
-    lines.push('📦 ピッキング一覧に「🔴ピッキング漏れ」バッチを作成しました (計測対象外): https://picking.bfaith-wh.uk/apps/picking/');
+    lines.push('📦 ピッキング一覧に「🔴 ピッキング漏れ (梱包から)」バッチを作成しました (計測対象外): https://picking.bfaith-wh.uk/apps/picking/');
   } else {
     // 棚戻しはピッキング一覧の「↩ 棚戻し」カードから (例外処理監査 PR-4)。/tasks は一覧へ転送
     lines.push('↩ ピッキング一覧に「棚戻し」として出ます (戻したロケを記録して事務へ通知): https://picking.bfaith-wh.uk/apps/picking/');

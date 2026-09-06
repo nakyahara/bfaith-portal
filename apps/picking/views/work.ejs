@@ -215,6 +215,17 @@
         明細 <%= state.lines.length %> / 数量 <%= state.batch.total_qty %><br>
         <%= state.batch.folder_name || '' %> <%= state.batch.composition %>
       </div>
+      <% if (state.batch.origin === 'repick') { %>
+        <%# 🔴/🕒 再ピック: 何を・どこへ・なぜ を開始画面に出す (例外処理監査 PR-5・B-2/U-5)。他ロケ候補は開いた時点で取りに行く %>
+        <% const later = state.batch.repick_reason === 'later'; const l0 = state.lines[0]; %>
+        <div id="repickStart" style="text-align:left; max-width:560px; margin:0 auto 14px; background:#fff; color:#212529; border-radius:12px; padding:12px 14px; border-left:6px solid <%= later ? '#e8590c' : '#e03131' %>; font-size:1rem; line-height:1.6">
+          <div style="font-weight:800; color:<%= later ? '#e8590c' : '#c92a2a' %>"><%= later ? '🕒 自分の欠品 — 後で取りに行く分' : (state.batch.repick_reason === 'wrong_item' ? '🔴 梱包で品違いだった → 正しい商品を取る' : '🔴 梱包で足りなかった → 取ってくる') %></div>
+          <% if (l0) { %><div><b><%= l0.product_name || l0.sku %></b> × <b style="font-size:1.2em"><%= l0.qty %></b> <span style="color:#868e96"><%= l0.sku %></span></div><% } %>
+          <% if (l0 && l0.locationLabel) { %><div><%= later ? '前回無かった場所' : '取った場所' %>: <b><%= l0.locationLabel %></b><%= later ? ' (他のロケも見て)' : '' %></div><% } %>
+          <div>届け先: <b>1階 <%= state.batch.origin_ref || '-' %></b><%= later ? '' : ` (依頼: ${state.batch.requested_by || '-'})` %></div>
+          <div id="repickCands" style="margin-top:6px; color:#495057; font-size:.95rem">他ロケ候補を取得中…</div>
+        </div>
+      <% } %>
       <button class="bigbtn" id="startBtn">ピッキング開始</button>
     </div>
   </div>
@@ -222,6 +233,8 @@
   <!-- ピック画面 -->
   <div class="screen" id="scr-pick">
     <div id="band" class="signbox" aria-live="polite"></div>
+    <%# 再ピック: 元ロケの意味 (前回無かった / 取った場所) と届け先を、ロケの上に一行で (U-6/U-7)。他ロケ候補は開始画面と同じ取得結果 %>
+    <div id="repickBanner" style="display:none; margin:0 12px 6px; padding:8px 12px; border-radius:10px; font-size:15px; line-height:1.45; font-weight:700"></div>
     <div id="loc"></div>
     <div id="imgbox"><span class="noimg">画像なし</span></div>
     <div id="details">
@@ -351,7 +364,10 @@
       totalQty: state.batch.total_qty, currentSeq: state.currentSeq,
       pauseReason: state.batch.pause_reason || null,
       folderName: state.batch.folder_name || null,
-      origin: state.batch.origin || 'import',   // 'repick' = 🔴再ピックバッチ (欠品シートに「後で取りに行く」を出さない)
+      origin: state.batch.origin || 'import',   // 'repick' = 🔴/🕒 再ピックバッチ (欠品シートに「後で取りに行く」を出さない)
+      repickReason: state.batch.repick_reason || null,   // later / shortage / wrong_item (PR-5)
+      originRef: state.batch.origin_ref || null,
+      requestedBy: state.batch.requested_by || null,
       shortageOpenSeq: state.batch.shortage_open_seq ?? null,   // 欠品対応シートを開いたまま閉じた/リロードしたときの復帰用
     }).replace(/</g, '\\u003c') %>;
     const LINES = <%- JSON.stringify(state.lines.map((l) => ({
@@ -529,6 +545,7 @@
       paintLoc($('loc'), l.loc);
       speakLine(l);
       fitText($('loc'));
+      renderRepickBanner();
       const next = LINES.slice(idx + 1).find((x) => x.status === 'pending');
       // 帯 = 「直前に取った場所」から今の場所への動き (ルート順で手前の完了済み明細)
       let prev = null;
@@ -545,6 +562,40 @@
       show('scr-pick');
       fitText($('loc'));   // 表示後 (幅確定後) にもう一度フィットさせる
     }
+
+    // ── 🔴/🕒 再ピックの案内 (例外処理監査 PR-5): 元ロケの意味・届け先・他ロケ候補 ──
+    // 他ロケ候補は開始画面を開いた時点で1回取得 (在庫スナップショット)。欠品ボタンを押さなくても行き先が分かる (A-2)
+    let repickCands = null;   // { fetched, rows:[{label, free, expiry}] } | null
+    async function loadRepickCands() {
+      if (BATCH.origin !== 'repick' || !LINES.length) return;
+      try {
+        const r = await fetch(`/apps/picking/api/batches/${BATCH.id}/stock-locations?seq=${LINES[0].seq}`, { cache: 'no-store' });
+        const b = await r.json();
+        repickCands = r.ok ? b : null;
+      } catch { repickCands = null; }
+      const el = $('repickCands');
+      if (el) {
+        if (!repickCands || !repickCands.configured) el.textContent = '';
+        else if (!repickCands.fetched) el.textContent = '他ロケ候補: 在庫データを取得できませんでした';
+        else if (!repickCands.rows.length) el.textContent = '他ロケ候補: フリー在庫のあるロケはありません (この商品は在庫なしの可能性)';
+        else el.innerHTML = `他ロケ候補 (在庫の多い順): ${repickCands.rows.slice(0, 4).map((x) => `<b>${esc(x.label)}</b> (${x.free})`).join(' / ')}${repickCands.stale ? ' <small>⚠ 在庫データが古い可能性</small>' : ''}`;
+      }
+      renderRepickBanner();
+    }
+    function renderRepickBanner() {
+      const el = $('repickBanner');
+      if (!el) return;
+      if (BATCH.origin !== 'repick') { el.style.display = 'none'; return; }
+      const later = BATCH.repickReason === 'later';
+      const cands = repickCands && repickCands.fetched ? repickCands.rows.slice(0, 3).map((x) => `${esc(x.label)} (${x.free})`).join(' / ') : '';
+      el.style.background = later ? '#e8590c' : '#c92a2a';
+      el.style.color = '#fff';
+      el.innerHTML = `${later ? '🕒 自分の欠品 — 下は前回無かった場所' : (BATCH.repickReason === 'wrong_item' ? '🔴 品違い → 正しい商品を取る' : '🔴 梱包で足りなかった分')}`
+        + ` → 届け先 1階 ${esc(BATCH.originRef || '-')}`
+        + (cands ? `<br><small style="font-weight:600">他ロケ候補: ${cands}</small>` : '');
+      el.style.display = 'block';
+    }
+    loadRepickCands();
 
     // ── NEXTサイン描画 ──
     // 矢印 (SVG)。高さは CSS の --icon-h、幅は viewBox 比

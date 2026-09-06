@@ -216,7 +216,15 @@ router.get('/', async (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   reconcileRepickBatches();   // 梱包側で取消されたピッキング漏れバッチを畳む (fail-soft)
   const batches = listBatches(workDate)
-    .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
+    .filter((b) => b.status !== 'cancelled' || b.work_date === workDate)
+    // 🔴/🕒 再ピックバッチはカードに商品・数量・ロケ (取った場所 / 前回無かった場所) を出す (例外処理監査 PR-5・A-2)。
+    // 1行バッチなので明細を1件だけ引く
+    .map((b) => {
+      if (b.origin !== 'repick') return b;
+      let line = null;
+      try { line = listLines(b.id)[0] || null; } catch { line = null; }
+      return { ...b, repickLine: line ? { sku: line.sku, name: line.product_name || line.sku, qty: line.qty, locationLabel: line.location ? formatLocation(line.block, line.location) : null } : null };
+    });
   // ↩ 棚戻し = 一覧の中に「バッチ」として並べる (例外処理監査 PR-4・指摘C)。pk_batches は作らない (計測・Notion・フロアボードに混ざらない)
   let returnTasks = [];
   const psvc = await packingSvc();
