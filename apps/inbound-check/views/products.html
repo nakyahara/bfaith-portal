@@ -229,15 +229,13 @@
       if (active) pollTimer = setTimeout(() => refreshRows(), 5000);
     }
     async function refreshRows() {
-      // 開いている編集パネルを壊さない: 印刷状況だけ取り直す
+      // 開いている編集パネルを壊さない: 表示中の商品の印刷状況だけ取り直す (検索は回し直さない。「もっと見る」で 200 件を超えていても全部)
       try {
-        const q = new URLSearchParams(queryString()); q.set('offset', '0'); q.set('limit', String(Math.max(50, data.rows.length)));
-        const r = await fetch(API + '/products?' + q.toString(), { cache: 'no-store' });
-        const j = await r.json();
+        const r = await postJson(API + '/products/print-status', { code_keys: data.rows.map(x => x.code_key) });
+        const j = r.json || {};
         if (!j.ok) return;
-        const byKey = new Map(j.rows.map(x => [x.code_key, x]));
-        for (const row of data.rows) { const n = byKey.get(row.code_key); if (n) row.print_job = n.print_job; }
-        data.print_agents = j.print_agents;
+        for (const row of data.rows) row.print_job = j.jobs[row.code_key] || null;
+        if (j.print_agents) data.print_agents = j.print_agents;
         for (const row of data.rows) { const el = document.querySelector('.row[data-key="' + CSS.escape(row.code_key) + '"] .act'); if (el) el.innerHTML = actHtml(row); }
       } catch { /* 次回 */ }
       schedulePoll();
@@ -391,8 +389,12 @@
       if (!hasWorker()) { openWorkerPick(); return; }
       const v = window.prompt('バーコード (JAN は数字だけ / Amazon の FNSKU は英数字)。空にすると手入力分を消します', row.barcode || '');
       if (v === null) return;
-      const r = await postJson(API + '/products/barcode', { code_key: row.code_key, barcode: v.trim(), worker_code: workerCode() || undefined });
-      if (!r.json.ok) { banner('err', r.json.message || 'バーコードを保存できませんでした', { sticky: true }); if (r.json.error === 'worker_required') openWorkerPick(); return; }
+      // expected = この画面が見ていた値。別の人が先に入れて/直していれば書かず、最新を見せる
+      const r = await postJson(API + '/products/barcode', { code_key: row.code_key, barcode: v.trim(), expected: row.barcode || null, worker_code: workerCode() || undefined });
+      if (!r.json.ok) {
+        if (r.json.error === 'state_changed') { await search({ silent: true }); banner('warn', esc(r.json.message || 'バーコードが変わりました。確認してください'), { sticky: true }); return; }
+        banner('err', r.json.message || 'バーコードを保存できませんでした', { sticky: true }); if (r.json.error === 'worker_required') openWorkerPick(); return;
+      }
       await search({ silent: true });
       banner('ok', v.trim() ? '✅ バーコードを控えました: ' + esc(v.trim()) : '手入力のバーコードを消しました');
     }
@@ -460,8 +462,12 @@
       try {
         // 手入力したバーコードは控えにも残す (次からは入力不要)
         if (bcEl && bcIn && bcIn !== row.barcode) {
-          const rb = await postJson(API + '/products/barcode', { code_key: row.code_key, barcode: bcIn, worker_code: workerCode() || undefined });
-          if (!rb.json.ok) { msgEl.textContent = rb.json.message || 'バーコードを保存できませんでした'; $('#printOk').disabled = false; return; }
+          // expected = この画面が見ていた値 (未登録なら null)。別の人が先に入れていれば保存も印刷もせず、最新を見せる
+          const rb = await postJson(API + '/products/barcode', { code_key: row.code_key, barcode: bcIn, expected: row.barcode || null, worker_code: workerCode() || undefined });
+          if (!rb.json.ok) {
+            if (rb.json.error === 'state_changed') { closePrintBox(); await search({ silent: true }); banner('warn', '🏷 ' + esc(rb.json.message || 'バーコードが変わりました。確認してください'), { sticky: true }); return; }
+            msgEl.textContent = rb.json.message || 'バーコードを保存できませんでした'; $('#printOk').disabled = false; return;
+          }
         }
         const r = await postJson(API + '/print/jobs', {
           worker_code: workerCode() || undefined, product_code: row.product_id, barcode: bcIn || undefined,
@@ -478,6 +484,7 @@
         }
         if (j.error === 'worker_required') { closePrintBox(); openWorkerPick(); return; }
         if ((j.error === 'in_progress' || j.error === 'confirm_unknown' || j.error === 'state_changed') && j.job) { row.print_job = j.job; closePrintBox(); render(); banner('warn', '🏷 ' + esc(j.message || ''), { sticky: true }); return; }
+        if (j.error === 'state_changed') { closePrintBox(); await search({ silent: true }); banner('warn', '🏷 ' + esc(j.message || 'バーコードが変わりました。確認してください'), { sticky: true }); return; }
         msgEl.textContent = j.message || j.error || ('HTTP ' + r.status);
         $('#printOk').disabled = false;
       } catch (e) {

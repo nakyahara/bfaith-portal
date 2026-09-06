@@ -389,7 +389,7 @@ router.get('/api/products', api((req, res) => {
     limit: Number(req.query?.limit) || 50,
     offset: Number(req.query?.offset) || 0,
   });
-  // 直近の値札印刷ジョブ (商品モードのもの) を行に付ける — 結果は5秒ポーリングで見る
+  // 直近の値札印刷ジョブ (伝票からの発行も含む・商品単位) を行に付ける — 結果は5秒ポーリング (/api/products/print-status) で見る
   const jobs = latestJobsForProducts(r.rows.map(x => x.code_key));
   for (const row of r.rows) row.print_job = jobs.get(row.code_key) || null;
   res.json({
@@ -405,8 +405,18 @@ router.get('/api/products', api((req, res) => {
 router.post('/api/products/barcode', checkOrigin, api((req, res) => {
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-  const r = setProductBarcode(req.body?.code_key, req.body?.barcode, editorName(req, w.worker));
-  res.status(r.ok ? 200 : 400).json(r);
+  // expected = 画面が見ていた値 (未登録なら null)。別の人が先に入れて/直していれば state_changed (409) で書かない
+  const opts = req.body && Object.prototype.hasOwnProperty.call(req.body, 'expected') ? { expected: req.body.expected } : {};
+  const r = setProductBarcode(req.body?.code_key, req.body?.barcode, editorName(req, w.worker), opts);
+  res.status(r.ok ? 200 : r.error === 'state_changed' ? 409 : r.error === 'not_found' ? 404 : 400).json(r);
+}));
+
+// 表示中の商品の印刷状況だけ取り直す (5秒ポーリング用。検索を回し直さない・200件を超えて表示していても全部見る)
+router.post('/api/products/print-status', checkOrigin, api((req, res) => {
+  const keys = Array.isArray(req.body?.code_keys) ? req.body.code_keys.slice(0, 1000).map(k => String(k == null ? '' : k).trim().toLowerCase()).filter(Boolean) : [];
+  const jobs = {};
+  for (const [k, j] of latestJobsForProducts(keys)) jobs[k] = j;
+  res.json({ ok: true, jobs, print_agents: listPrintAgents().map(a => ({ id: a.id, label: a.label, printer_name: a.printer_name, online: a.online, bpac: a.bpac, paper_ok: a.paper_ok })) });
 }));
 
 // ─── 🚚 いま入荷を取りに行く (予定外の納品をロジザードに入れた直後に押す) ───

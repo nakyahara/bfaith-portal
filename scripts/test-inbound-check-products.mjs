@@ -146,6 +146,17 @@ console.log('\n[3] バーコードは 控え → 取込行 → 在庫 → 入荷
   ok(clr.ok && clr.cleared && resolveBarcode('toretate') === null, '空にすると手入力分を消す');
   ok(searchProducts({ q: '490000000000' }).rows.some(r => r.product_id === 'apron-01'), '控えたバーコードで検索できる');
   ok(!setProductBarcode('', '123').ok, '商品なしは拒否');
+  eq(setProductBarcode('no-such-code', '4900000000009').error, 'not_found', '商品マスタに無いコードには控えを作らない');
+  // 画面が見ていた値 (expected) と今の値が違えば書かない (別の人が先に入れた/直した)
+  ok(setProductBarcode('toretate', 'X002ABCD1F', '山田').ok, '手入力');
+  const stale = setProductBarcode('toretate', 'X002ZZZZ9Z', '佐藤', { expected: null });
+  ok(!stale.ok && stale.error === 'state_changed' && /X002ABCD1F/.test(stale.message), '画面が「未登録」のまま送った入力は、先に別の人が入れていれば書かない (state_changed)');
+  ok(setProductBarcode('toretate', 'X002ZZZZ9Z', '佐藤', { expected: 'X002ABCD1F' }).ok, '見ていた値が今の値と同じなら直せる');
+  ok(setProductBarcode('toretate', '', '佐藤', { expected: 'X002ZZZZ9Z' }).ok, '消すときも expected で見張る');
+  eq(resolveBarcode('toretate'), null, '消えた');
+  // LIKE: ESCAPE 文字そのもの (\\) を含む検索語でも落ちない・全件に化けない
+  eq(searchProducts({ q: 'a\\b' }).total, 0, 'バックスラッシュを含む検索語は文字として扱う');
+  for (const bad of [Infinity, 1.5, 1e12, -1, 'x']) ok(Array.isArray(searchProducts({ supplier: 'S001', limit: bad, offset: bad }).rows), 'limit/offset に ' + String(bad) + ' が来ても落ちない');
 }
 
 console.log('\n[4] 値札の印刷キュー (商品モード) — 伝票からの発行と同じ規則');
@@ -167,10 +178,14 @@ const agentRow = verifyDevice(agent.token);
   const dup = enqueuePrintJob({ productCode: 'toretate', barcodeOverride: 'X002ABCD1F', copies: 1, clientRequestId: rid() });
   ok(!dup.ok && dup.error === 'in_progress' && dup.job.id === r3.job.id, '同じ商品の進行中ジョブがあれば積めない');
   const m = latestJobsForProducts(['toretate', 'pashima']);
-  ok(m.get('toretate')?.id === r3.job.id && !m.has('pashima'), '商品ごとの最新ジョブ');
+  ok(m.get('toretate')?.id === r3.job.id && m.get('pashima')?.id === 1, '商品ごとの最新ジョブ (旧伝票からのジョブも商品単位で出る)');
   eq(latestJobsForBatch(999).size, 0, '伝票側の一覧には商品モードのジョブが混ざらない');
   // 控え (manual) があるときは override 不要
   setProductBarcode('pashima', '4903357200047', '山田');
+  // 🚨 旧伝票 (作り直す前) の進行中ジョブが同じ商品なら、商品画面からも積めない (紙は同じ1枚)。終われば積める
+  const oldBlock = enqueuePrintJob({ productCode: 'pashima', copies: 1, clientRequestId: rid() });
+  ok(!oldBlock.ok && oldBlock.error === 'in_progress' && oldBlock.job.id === 1 && oldBlock.job.source === 'line', '旧伝票の進行中ジョブ (leased) が同じ商品なら商品画面からも in_progress');
+  ok(markSubmitted(1, { deviceId: 1, leaseToken: 'tok-old', spoolJobId: 'old-spool-1' }).ok && markFinished(1, { deviceId: 1, leaseToken: 'tok-old', ok: true }).ok, '旧ジョブの投入・完了報告は作り直しをまたいで通る (id・lease を保っている)');
   const r4 = enqueuePrintJob({ productCode: 'PASHIMA ', copies: 1, clientRequestId: rid() });
   ok(r4.ok && r4.job.barcode === '4903357200047' && r4.job.code_key === 'pashima', '控えのバーコードで積める (商品コードは lower/trim で照合)');
   // エージェント側の契約は変わらない
@@ -191,12 +206,22 @@ const agentRow = verifyDevice(agent.token);
   ok(!noAck.ok && noAck.error === 'confirm_unknown' && noAck.job.id === tor.id, 'unknown の後は実物確認の証跡が要る');
   const withAck = enqueuePrintJob({ productCode: 'toretate', barcodeOverride: 'X002ABCD1F', copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: tor.id });
   ok(withAck.ok && withAck.job.acknowledged_job_id === tor.id, '証跡を付ければ積める');
-  // 伝票からの発行 (line) はこれまでどおり
+  // 🚨 二重印刷の見張りは商品単位: 商品画面で結果不明のまま → 伝票からも証跡なしでは積めない (Codex R1 High-1)
   const batch = db.prepare("SELECT id FROM f_inbound_check_batches WHERE status = 'active'").get();
-  const line = enqueuePrintJob({ batchId: batch.id, lineKey: 'AR9|1|1', copies: 1, clientRequestId: rid() });
-  ok(line.ok && line.job.source === 'line' && line.job.line_key === 'AR9|1|1', '伝票からの発行は source=line のまま');
+  const cross0 = enqueuePrintJob({ batchId: batch.id, lineKey: 'AR9|1|1', copies: 1, clientRequestId: rid() });
+  ok(!cross0.ok && cross0.error === 'confirm_unknown' && cross0.job.id === j2.id && cross0.job.source === 'product', '商品画面からの発行が結果不明なら、伝票からも実物確認の証跡が要る (商品単位で見張る)');
+  const line = enqueuePrintJob({ batchId: batch.id, lineKey: 'AR9|1|1', copies: 1, clientRequestId: rid(), acknowledgeUnknownJobId: j2.id });
+  ok(line.ok && line.job.source === 'line' && line.job.line_key === 'AR9|1|1' && line.job.acknowledged_job_id === j2.id, '伝票からの発行は source=line (商品画面のジョブを証跡にできる)');
   const lineDup = enqueuePrintJob({ batchId: batch.id, lineKey: 'AR9|1|1', copies: 1, clientRequestId: rid() });
-  ok(!lineDup.ok && lineDup.error === 'in_progress', '伝票側の進行中判定は伝票側だけを見る');
+  ok(!lineDup.ok && lineDup.error === 'in_progress', '伝票側の連打は進行中');
+  const cross1 = enqueuePrintJob({ productCode: 'pashima', copies: 1, clientRequestId: rid() });
+  ok(!cross1.ok && cross1.error === 'in_progress' && cross1.job.id === line.job.id && cross1.job.source === 'line', '伝票から印刷中なら商品画面からも積めない');
+  eq(latestJobsForProducts(['pashima']).get('pashima').id, line.job.id, '商品画面の行には伝票からのジョブも出る (最新はどちらでも)');
+  eq(latestJobsForBatch(batch.id).get('AR9|1|1').id, line.job.id, '伝票側の行には伝票のジョブ');
+  // 画面が見ていたバーコードと控えが違えば刷らない (別の人が直した後の古い入力で違うシールを出さない。Codex R1 High-2)
+  const staleBc = enqueuePrintJob({ productCode: 'toretate', barcodeOverride: 'X002OLD00A', copies: 1, clientRequestId: rid() });
+  ok(!staleBc.ok && staleBc.error === 'state_changed' && /X002ABCD1F/.test(staleBc.message), '控えと違うバーコードを送ってきたら state_changed (刷る値は必ず控えの値)');
+  eq(db.prepare('SELECT barcode FROM f_inbound_check_barcodes WHERE code_key = ?').get('toretate').barcode, 'X002ABCD1F', '控えは上書きされない');
   ok(getProductForPrint('nosup') && getProductForPrint('nosup').barcode === null, 'getProductForPrint: バーコード無しは null');
 }
 
@@ -235,6 +260,11 @@ console.log('\n[5] HTTP — 画面と API の入口');
   const list = await call('GET', '/api/products?supplier=S001', { cookie: `ic_device=${ipad.token}` });
   ok(list.status === 200 && list.body.rows.length === 2 && list.body.rows.every(r => 'print_job' in r) && Array.isArray(list.body.workers) && list.body.field_options['BF保管荷姿'], '検索結果に印刷ジョブ・作業者・選択肢が付く');
   ok(list.body.rows.find(r => r.product_id === 'toretate').print_job.state === 'queued', '商品ごとの直近ジョブが行に付く');
+  const ps = await call('POST', '/api/products/print-status', { cookie: `ic_device=${ipad.token}`, body: { code_keys: ['toretate', 'PASHIMA', 'zzz'] } });
+  ok(ps.status === 200 && ps.body.jobs.toretate && ps.body.jobs.toretate.state === 'queued' && ps.body.jobs.pashima && ps.body.jobs.pashima.source === 'line' && !('zzz' in ps.body.jobs) && Array.isArray(ps.body.print_agents), '表示中の商品の印刷状況だけ取り直せる (伝票からのジョブも・200件超でも)');
+  const bcStale = await call('POST', '/api/products/barcode', { session: 'user', body: { code_key: 'toretate', barcode: 'X002NEW00B', expected: null } });
+  ok(bcStale.status === 409 && bcStale.body.error === 'state_changed', 'HTTP: 先に別の人が入れていれば 409');
+  eq((await call('POST', '/api/products/barcode', { session: 'user', body: { code_key: 'no-such-code', barcode: '4900000000009' } })).status, 404, 'HTTP: 商品マスタに無ければ 404');
   const bc0 = await call('POST', '/api/products/barcode', { cookie: `ic_device=${ipad.token}`, body: { code_key: 'nosup', barcode: '4900000000002' } });
   ok(bc0.status === 400 && bc0.body.error === 'worker_required', '端末からのバーコード入力は作業者が要る');
   const bc1 = await call('POST', '/api/products/barcode', { session: 'user', body: { code_key: 'nosup', barcode: '4900000000002' } });

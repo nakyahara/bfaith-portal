@@ -22,7 +22,7 @@
  * (SELECT してから UPDATE すると、期限切れ→unknown が挟まった古い報告が乗っ取れる)。
  */
 import crypto from 'crypto';
-import { getDB, getProductForPrint } from './db.js';
+import { getDB, getProductForPrint, setProductBarcode } from './db.js';
 
 const utcNow = () => new Date().toISOString();
 const ms = (v) => { const t = Date.parse(v || ''); return Number.isFinite(t) ? t : null; };
@@ -178,15 +178,25 @@ export function enqueuePrintJob({ batchId, lineKey, productCode = null, barcodeO
       if (!line) return { ok: false, error: 'not_found', message: 'この明細は一覧にありません' };
       subject = { codeKey: line.code_key, productCode: line.product_id, productName: line.product_name, barcode: line.barcode, batchId: bid, lineKey: key };
     } else {
-      // 商品マスタから。バーコードは控え (f_inbound_check_barcodes) → 取込行 → 在庫ミラー → 入荷予定 の順に探し、
-      // 無ければ画面で入力されたもの (barcodeOverride) を使う。画面の入力は形式だけ検査する (刷れない形を積まない)
+      // 商品マスタから。バーコードは控え (f_inbound_check_barcodes) → 取込行 → 在庫ミラー → 入荷予定 の順に探す。
+      // 刷る値は **必ず DB (控え) の値**。画面から来た barcodeOverride は:
+      //   - 控えが無い → 形式を検査して控えに保存し、その控えの値で刷る (次からは入力不要)
+      //   - 控えがあって違う → 積まない (ダイアログを開いた後に別の人が入れた/直した = 古い入力で違うシールを出さない。Codex R1 High-2)
       const p = getProductForPrint(productCode);
       if (!p) return { ok: false, error: 'not_found', message: 'この商品は商品マスタにありません' };
       const override = String(barcodeOverride == null ? '' : barcodeOverride).trim();
       if (override && !barcodeTypeOf(override)) {
         return { ok: false, error: 'bad_barcode', message: `バーコード「${override}」は JAN (数字のみ) でも FNSKU (英数字) でもないため印刷できません` };
       }
-      subject = { codeKey: p.code_key, productCode: p.product_id, productName: p.product_name, barcode: override || p.barcode, batchId: null, lineKey: null };
+      if (override && p.barcode && override !== p.barcode) {
+        return { ok: false, error: 'state_changed', message: `この商品のバーコードは「${p.barcode}」で登録されています (画面を開いた後に別の人が入れた/直した)。画面を更新して確認してください` };
+      }
+      if (override && !p.barcode) {
+        const saved = setProductBarcode(p.product_id, override, requestedDevice ? `${requestedDevice}/${requestedBy || ''}` : (requestedBy || null), { expected: null });
+        if (!saved.ok) return saved;
+        p.barcode = saved.barcode;
+      }
+      subject = { codeKey: p.code_key, productCode: p.product_id, productName: p.product_name, barcode: p.barcode, batchId: null, lineKey: null };
     }
     const barcode = String(subject.barcode == null ? '' : subject.barcode).trim();
     const type = barcodeTypeOf(barcode);
@@ -197,11 +207,14 @@ export function enqueuePrintJob({ batchId, lineKey, productCode = null, barcodeO
     const name = String(subject.productName == null ? '' : subject.productName).trim();
     if (!name) return { ok: false, error: 'bad_request', message: '商品名が空のため印刷できません' };
 
-    // 同じ明細 (商品モードなら同じ商品) のジョブがまだ終わっていなければ積まない (連打で2枚出ない)。
-    // 終わっていれば (completed/failed/unknown/manual) 新しいジョブを積める = 人が判断して押し直す
-    const last = source === 'line'
-      ? db.prepare(`SELECT * FROM f_inbound_check_print_jobs WHERE source = 'line' AND batch_id = ? AND line_key = ? ORDER BY id DESC LIMIT 1`).get(bid, key)
-      : db.prepare(`SELECT * FROM f_inbound_check_print_jobs WHERE source = 'product' AND code_key = ? ORDER BY id DESC LIMIT 1`).get(subject.codeKey);
+    // 🚨 二重印刷の見張りは **商品単位** (code_key)。伝票から刷っても 🔍 商品画面から刷っても紙は同じ1枚なので、
+    //    片方が進行中 / 結果不明なら、もう片方からも積まない (Codex R1 High-1)。伝票の作り直し (superseded) を
+    //    またいでも同じ: 朝の伝票で結果不明のまま、午後の伝票から証跡なしに刷り直させない。
+    //    終わっていれば (completed/failed/manual、unknown は証跡つき) 新しいジョブを積める = 人が判断して押し直す
+    const ck = String(subject.codeKey == null ? '' : subject.codeKey).trim().toLowerCase();
+    const last = ck
+      ? db.prepare('SELECT * FROM f_inbound_check_print_jobs WHERE code_key = ? ORDER BY id DESC LIMIT 1').get(ck)
+      : db.prepare('SELECT * FROM f_inbound_check_print_jobs WHERE source = ? AND batch_id = ? AND line_key = ? ORDER BY id DESC LIMIT 1').get('line', bid, key);
     if (last && ACTIVE_STATES.includes(last.state)) {
       return { ok: false, error: 'in_progress', message: 'この商品のシールは印刷中です (結果が出るまでお待ちください)', job: publicJob(last) };
     }
@@ -272,14 +285,14 @@ export function latestJobsForBatch(batchId) {
   return map;
 }
 
-/** 🔍 商品モードのジョブの、商品ごとの最新 (code_key → publicJob)。商品を探す画面の行に付ける */
+/** 商品ごとの最新ジョブ (code_key → publicJob)。伝票からの発行も含む (見張りが商品単位なので、行に出す状況も商品単位)。商品を探す画面の行に付ける */
 export function latestJobsForProducts(codeKeys) {
   const keys = [...new Set((codeKeys || []).map(k => String(k || '').trim().toLowerCase()).filter(Boolean))];
   const map = new Map();
   if (keys.length === 0) return map;
   const ph = keys.map(() => '?').join(',');
   const rows = getDB().prepare(`SELECT j.* FROM f_inbound_check_print_jobs j
-    JOIN (SELECT code_key, MAX(id) AS id FROM f_inbound_check_print_jobs WHERE source = 'product' AND code_key IN (${ph}) GROUP BY code_key) m ON m.id = j.id`)
+    JOIN (SELECT code_key, MAX(id) AS id FROM f_inbound_check_print_jobs WHERE code_key IN (${ph}) GROUP BY code_key) m ON m.id = j.id`)
     .all(...keys);
   for (const r of rows) map.set(r.code_key, publicJob(r));
   return map;

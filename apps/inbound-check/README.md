@@ -82,7 +82,8 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
   値札CSVは入荷予定7日分だけ)。→ `f_inbound_check_barcodes` (控え) を置き、`resolveBarcode()` が
   控え → 取込行 → 在庫ミラー → 入荷予定 の順に探して**見つけたら控える**。無ければ人が入れる (`source='manual'`。JAN=数字のみ / FNSKU=英数字)
 - 値札は**同じ印刷キュー** (`enqueuePrintJob` の `source='product'`)。刷る内容は画面の値でなく商品マスタ+控えから取る。
-  進行中/結果不明の扱い (in_progress / confirm_unknown / state_changed) は伝票からの発行と同じ。商品ごとの最新ジョブ = `latestJobsForProducts`
+  進行中/結果不明の扱い (in_progress / confirm_unknown / state_changed) は伝票からの発行と同じ。**見張りは商品単位 (code_key)**: 伝票から刷っても商品画面から刷っても紙は同じ1枚なので、片方が進行中/結果不明ならもう片方からも積まない (伝票の作り直しをまたいでも同じ)。商品ごとの最新ジョブ (どちらの発行でも) = `latestJobsForProducts`
+  刷るバーコードは**必ず控えの値**。画面から来た値は 控えが無ければ保存してから刷り、控えと違えば `state_changed` で積まない (別の人が直した後の古い入力で違うシールを出さない)。控えの保存 `POST /api/products/barcode` も `expected` (画面が見ていた値) が今と違えば 409
 - スキーマ: `f_inbound_check_print_jobs` は `source` 列 + `batch_id`/`line_key` NULL 可 に**作り直し** (`ensurePrintJobsTable`。
   CREATE IF NOT EXISTS では列も NOT NULL も変わらないため、旧版を検知して行を写す。進行中ジョブも id ごと引き継ぐ)
 - テスト: `node scripts/test-inbound-check-products.mjs`

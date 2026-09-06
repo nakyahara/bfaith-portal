@@ -372,6 +372,7 @@ const PRINT_JOBS_INDEXES = (name) => `
     CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_state ON ${name}(state, id);
     CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_line ON ${name}(batch_id, line_key, id);
     CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_product ON ${name}(source, code_key, id);
+    CREATE INDEX IF NOT EXISTS idx_ic_print_jobs_code ON ${name}(code_key, id);
 `;
 
 /**
@@ -380,32 +381,36 @@ const PRINT_JOBS_INDEXES = (name) => `
  * 進行中のジョブ (leased/submitted) も写すので、エージェントの報告は作り直しをまたいで通る (id は保つ)
  */
 function ensurePrintJobsTable(db) {
-  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_inbound_check_print_jobs'").get();
-  if (!exists) {
-    db.exec(`CREATE TABLE f_inbound_check_print_jobs (${PRINT_JOBS_COLUMNS});` + PRINT_JOBS_INDEXES('f_inbound_check_print_jobs'));
-    return { created: true };
-  }
-  const cols = db.prepare('PRAGMA table_info(f_inbound_check_print_jobs)').all();
-  const byName = Object.fromEntries(cols.map(c => [c.name, c]));
-  const needsRebuild = !byName.source || (byName.batch_id && byName.batch_id.notnull === 1) || (byName.line_key && byName.line_key.notnull === 1);
-  if (!needsRebuild) {
-    db.exec(PRINT_JOBS_INDEXES('f_inbound_check_print_jobs'));
-    return { created: false, rebuilt: false };
-  }
-  // 旧版 → 新版へ写す。旧版に無い列 (source) は既定値 'line' で埋まる。列名は両方にあるものだけ並べる
-  const newCols = PRINT_JOBS_COLUMNS.split('\n').map(l => l.trim()).filter(l => /^[a-z_]+\s/.test(l)).map(l => l.split(/\s+/)[0]);
-  const common = newCols.filter(c => byName[c]);
-  let rows = 0;
-  db.transaction(() => {
+  // 🚨 存在確認 → 列の検査 → 作り直し を **1つの書込みトランザクション (BEGIN IMMEDIATE) の中で**やる。
+  //    2プロセスが同時に起動して、片方が作り直した後にもう片方が古い列一覧のまま写すと、その間に積まれた
+  //    source='product' の行が line に化ける / batch_id NULL で失敗する (Codex R1 High-3)
+  const run = db.transaction(() => {
+    const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_inbound_check_print_jobs'").get();
+    if (!exists) {
+      db.exec(`CREATE TABLE f_inbound_check_print_jobs (${PRINT_JOBS_COLUMNS});` + PRINT_JOBS_INDEXES('f_inbound_check_print_jobs'));
+      return { created: true };
+    }
+    const cols = db.prepare('PRAGMA table_info(f_inbound_check_print_jobs)').all();
+    const byName = Object.fromEntries(cols.map(c => [c.name, c]));
+    const needsRebuild = !byName.source || (byName.batch_id && byName.batch_id.notnull === 1) || (byName.line_key && byName.line_key.notnull === 1);
+    if (!needsRebuild) {
+      db.exec(PRINT_JOBS_INDEXES('f_inbound_check_print_jobs'));
+      return { created: false, rebuilt: false };
+    }
+    // 旧版 → 新版へ写す。旧版に無い列 (source) は既定値 'line' で埋まる。列名は両方にあるものだけ並べる
+    const newCols = PRINT_JOBS_COLUMNS.split('\n').map(l => l.trim()).filter(l => /^[a-z_]+\s/.test(l)).map(l => l.split(/\s+/)[0]);
+    const common = newCols.filter(c => byName[c]);
     db.exec('DROP TABLE IF EXISTS f_inbound_check_print_jobs__new');
     db.exec(`CREATE TABLE f_inbound_check_print_jobs__new (${PRINT_JOBS_COLUMNS})`);
-    rows = db.prepare(`INSERT INTO f_inbound_check_print_jobs__new (${common.join(', ')}) SELECT ${common.join(', ')} FROM f_inbound_check_print_jobs`).run().changes;
+    const rows = db.prepare(`INSERT INTO f_inbound_check_print_jobs__new (${common.join(', ')}) SELECT ${common.join(', ')} FROM f_inbound_check_print_jobs`).run().changes;
     db.exec('DROP TABLE f_inbound_check_print_jobs');
     db.exec('ALTER TABLE f_inbound_check_print_jobs__new RENAME TO f_inbound_check_print_jobs');
     db.exec(PRINT_JOBS_INDEXES('f_inbound_check_print_jobs'));
-  })();
-  console.log(`[inbound-check] f_inbound_check_print_jobs を作り直しました (source 列 / batch_id NULL 可。${rows} 行を引き継ぎ)`);
-  return { created: false, rebuilt: true, rows };
+    return { created: false, rebuilt: true, rows };
+  });
+  const r = run.immediate();
+  if (r.rebuilt) console.log(`[inbound-check] f_inbound_check_print_jobs を作り直しました (source 列 / batch_id NULL 可。${r.rows} 行を引き継ぎ)`);
+  return r;
 }
 
 /** 列がなければ足す (SQLite の ALTER TABLE ADD COLUMN は冪等でないので自前で見る) */
@@ -1042,10 +1047,27 @@ export function resolveBarcode(codeKey, db = getDB()) {
  * 人がバーコードを入れる / 直す (控えを上書き。source='manual')。
  * 数字だけ = JAN、英字を含む英数字 = FNSKU。それ以外は拒否 (値札に刷れない形を残さない)
  */
-export function setProductBarcode(codeKey, barcode, actor = null) {
+export function setProductBarcode(codeKey, barcode, actor = null, { expected } = {}) {
+  const db = getDB();
   const k = codeKeyOf(codeKey);
   const s = String(barcode == null ? '' : barcode).trim();
   if (!k) return { ok: false, error: 'bad_request', message: '商品が指定されていません' };
+  // 商品マスタに居る商品だけ (任意のキーに控えを作らせない — 後で同じコードが登録されたとき、その古い値が最優先で使われる。Codex R1 Medium)
+  if (!tableExists(db, 'mirror_products') || !db.prepare('SELECT 1 FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ? LIMIT 1').get(k)) {
+    return { ok: false, error: 'not_found', message: 'この商品は商品マスタにありません' };
+  }
+  // 画面が見ていた値 (expected: 未登録なら null) と今の値が違えば書かない — ダイアログを開いた後に別の人が
+  // 入れた/直した値を、古い入力で上書きして違うシールを刷らせない (Codex R1 High-2)。expected 省略 = 見張らない
+  if (expected !== undefined) {
+    const cur = resolveBarcode(k, db);
+    const curBc = cur ? cur.barcode : null;
+    const exp = expected == null || String(expected).trim() === '' ? null : String(expected).trim();
+    if (curBc !== exp) {
+      return { ok: false, error: 'state_changed', current: cur, message: curBc
+        ? 'このバーコードは別の人が「' + curBc + '」に入れました/直しました。画面を更新して確認してください'
+        : 'このバーコードは別の人が消しました。画面を更新して確認してください' };
+    }
+  }
   if (!s) {
     getDB().prepare("DELETE FROM f_inbound_check_barcodes WHERE code_key = ? AND source = 'manual'").run(k);
     return { ok: true, cleared: true };
@@ -1089,12 +1111,15 @@ export function searchProducts({ supplier = null, q = '', includeInactive = fals
   if (supplier) { conds.push('p.仕入先コード = ?'); args.push(String(supplier)); }
   const term = String(q || '').trim();
   if (term) {
-    const like = `%${term.replace(/[%_]/g, (c) => '\\' + c)}%`;
+    // \ (ESCAPE 文字そのもの) も含めて逃がす (Codex R1 Medium)
+    const like = `%${term.replace(/[\\%_]/g, (c) => '\\' + c)}%`;
     conds.push(`(p.商品名 LIKE ? ESCAPE '\\' OR p.商品コード LIKE ? ESCAPE '\\' OR LOWER(TRIM(p.商品コード)) IN (SELECT code_key FROM f_inbound_check_barcodes WHERE barcode LIKE ? ESCAPE '\\'))`);
     args.push(like, like, like);
   }
-  const lim = Math.min(200, Math.max(1, Number(limit) || 50));
-  const off = Math.max(0, Number(offset) || 0);
+  // limit / offset は整数だけ (小数・Infinity・巨大値は SQLite の LIMIT で型エラー → 500 になる。Codex R1 Low)
+  const limN = Number(limit), offN = Number(offset);
+  const lim = Number.isSafeInteger(limN) ? Math.min(200, Math.max(1, limN)) : 50;
+  const off = Number.isSafeInteger(offN) ? Math.min(100000, Math.max(0, offN)) : 0;
   const whereSql = conds.join(' AND ');
   const total = db.prepare(`SELECT COUNT(*) AS n FROM mirror_products p WHERE ${whereSql}`).get(...args).n;
   const rows = db.prepare(`SELECT p.商品コード AS product_id, p.商品名 AS product_name, p.取扱区分 AS handling,
