@@ -676,9 +676,9 @@
     <!-- 見出しとチップは 1 つの fgroup に包む。別々だと折り返しで「予定」の見出しだけが前の行の末尾に残る (監修 B-4) -->
     <div class="filters">
       <span class="fgroup"><span class="flabel">列の分け方</span><span class="seg" id="colSeg"></span></span>
-      <span class="fgroup"><span class="flabel">拠点</span><span id="facChips"></span></span>
+      <span class="fgroup" id="facGroup"><span class="flabel">拠点</span><span id="facChips"></span></span>
       <span class="fgroup" id="stGroup" hidden><span class="flabel">進捗</span><span id="stChips"></span></span>
-      <span class="fgroup"><span class="flabel">予定</span><span id="whenChips"></span></span>
+      <span class="fgroup" id="whenGroup"><span class="flabel" id="whenLabel">予定</span><span id="whenChips"></span></span>
       <input class="search" id="bq" placeholder="商品名・商品コードで検索">
     </div>
     <div class="board" id="board"></div>
@@ -1707,7 +1707,10 @@ function whenChips() {
   const blockedN = cards.filter(c => c.blocked).length;
   // 「止まっていない」= ⛔ を除く (中原さん 2026-09-05)。⛔ と同じく 1 件以上あるときだけ
   const showBlk = blockedN > 0 || curWhen === 'blocked';
-  return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定'],
+  // 列が「いつ」のときは列そのものが絞り込みなので、いつ の値は出さない。⛔ だけ残す (⛔ が無ければ段ごと消す — Codex PR #1218 R1)
+  if (boardCols === 'when' && !showBlk) return '';
+  return [['all', 'すべて'],
+    ...(boardCols === 'when' ? [] : [['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定']]),
     ...(showBlk ? [['blocked', '⛔ 止まっている'], ['unblocked', '止まっていない']] : [])]
     .map(([v, l]) => '<button class="chip' + (curWhen === v ? ' on' : '') + '" data-when="' + v + '">' + l +
       ' <span class="num">' + n(v) + '</span></button>').join('');
@@ -1807,12 +1810,18 @@ function renderBoard() {
   renderPreviewNote();
   // 「止まっていない」は ⛔ が 0 件になったら「すべて」と同じ → 一覧と同じく「すべて」へ戻す (Codex PR #1209 R2)
   if (curWhen === 'unblocked' && !((bs.cards || []).some((c) => c.blocked))) curWhen = 'all';
+  // 列と同じ軸の絞り込みは解いて隠す (列そのものが絞り込み)。残すと列を切り替えたとき他の列が空になる (Codex PR #1218 R1)
+  if (boardCols === 'status') curStatus = 'all';
+  if (boardCols === 'fac') curFacility = 'all';
+  if (boardCols === 'when' && !['all', 'blocked', 'unblocked'].includes(curWhen)) curWhen = 'all';
   $('#gaugeWrap').innerHTML = planButtonHtml();
   $('#colSeg').innerHTML = colSegHtml();
+  $('#facGroup').hidden = boardCols === 'fac';
   $('#facChips').innerHTML = facChips();
-  $('#whenChips').innerHTML = whenChips();
-  // 進捗の絞り込みは、列が進捗以外のときだけ (進捗の列なら列そのものが絞り込み)
-  if (boardCols === 'status') curStatus = 'all';
+  const wc = whenChips();   // 列が「いつ」のときは ⛔ の絞り込みだけ (無ければ空 → 段ごと隠す)
+  $('#whenGroup').hidden = !wc;
+  $('#whenLabel').textContent = boardCols === 'when' ? '⛔' : '予定';
+  $('#whenChips').innerHTML = wc;
   $('#stGroup').hidden = boardCols === 'status';
   $('#stChips').innerHTML = statusChips();
   const cards = boardCards();
@@ -4776,10 +4785,12 @@ async function doSetSt(choice) {
   if (stRefreshPending) { stRefreshPending = false; if (stTarget != null && $('#stOv').classList.contains('on')) refreshStAfterCapsDrop(); }
 
   // 一覧に残らないステータス (棚入完了) になったら、その場で行を外す (次の取得でも入ってこない)
+  // 一覧もボードも描き直す (ボードで落としたカードが元の列・古い進捗札のまま残らないように — Codex PR #1218 R1)
+  const repaint = () => { renderTabs(); renderList(); if (curView === 'board') renderBoard(); };
   const dropCard = () => {
     state.cards = state.cards.filter(x => x.id !== c.id);
     if (sameId(curDetail, c.id)) closeDetail();
-    renderTabs(); renderList();
+    repaint();
   };
   const suffix = isApp() ? '' : ' (Notionにも反映済み)';
   if (j.ok) {
@@ -4793,7 +4804,7 @@ async function doSetSt(choice) {
     applyTask(c, j.task);
     c.status = j.status;
     if (j.status_label) c.status_label = j.status_label;
-    renderTabs(); renderList();
+    repaint();
     if (sameId(curDetail, c.id)) renderDetail(c);
     toast('「' + label + '」に変えました' + suffix);
     return;
@@ -4805,7 +4816,7 @@ async function doSetSt(choice) {
     else if (j.current) {
       if (typeof j.current === 'object') { applyTask(c, j.current); c.status = j.current.status; c.status_label = j.current.status_label; }
       else c.status = j.current;
-      renderTabs(); renderList(); if (sameId(curDetail, c.id)) renderDetail(c);
+      repaint(); if (sameId(curDetail, c.id)) renderDetail(c);
     }
     loadState();
     return;

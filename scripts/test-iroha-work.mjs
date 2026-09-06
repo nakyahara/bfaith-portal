@@ -3601,7 +3601,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function lockDeviceStaffMode\(\)/.test(html) && /if \(staffLockInflight\) return staffLockInflight;/.test(html)
     && /端末の職員モードを終われませんでした/.test(html) && /if \(j && j\.ok\) \{/.test(html),
     '解除は同時 1 本・成功/失敗を確かめる (失敗を「終わりました」と言わない)');
-  ok(/<span class="fgroup"><span class="flabel">予定<\/span><span id="whenChips"><\/span><\/span>/.test(html) && /\.fgroup\{display:inline-flex/.test(html),
+  ok(/<span class="fgroup" id="whenGroup"><span class="flabel" id="whenLabel">予定<\/span><span id="whenChips"><\/span><\/span>/.test(html) && /\.fgroup\{display:inline-flex/.test(html),
     'B-4: 見出しとチップは 1 つの組で折り返す');
   ok(/時間不明 ' \+ p\.unknown_hours_count \+ ' 件'/.test(html), 'B-5: 「明日の計画」バナーは時間不明を 0 分と足さない');
   ok(/label class="cbrow"><input id="lwOrdered"/.test(html) && /\.mfields input\[type=checkbox\]\{width:24px/.test(html), 'B-3: チェックボックスは □ と文字を横並びに');
@@ -3963,6 +3963,14 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '札のタップはカードを開くより先に受ける (札を押したのに詳細が開かない)');
   ok(/boardCols = 'status'/.test(html) && /\[\['status', '進捗'\], \['fac', '拠点'\], \['when', 'いつ'\]\]/.test(html) && !/\['when', '予定'\]/.test(html),
     '列の分け方は 進捗 / 拠点 / いつ (どの列も 1 つの軸だけ — 1 列に 2 つの意味を混ぜない。中原さん 2026-09-06)');
+  // Codex PR #1218 R1: 列と同じ軸の絞り込みが残ると、列を切り替えたとき他の列が空になる
+  ok(/if \(boardCols === 'status'\) curStatus = 'all';\s*if \(boardCols === 'fac'\) curFacility = 'all';\s*if \(boardCols === 'when' && !\['all', 'blocked', 'unblocked'\]\.includes\(curWhen\)\) curWhen = 'all';/.test(html)
+    && /\$\('#facGroup'\)\.hidden = boardCols === 'fac';/.test(html) && /\$\('#whenGroup'\)\.hidden = !wc;/.test(html)
+    && /if \(boardCols === 'when' && !showBlk\) return '';/.test(html) && /\.\.\.\(boardCols === 'when' \? \[\] : \[\['today', '今日やる'\]/.test(html),
+    '列と同じ軸の絞り込みは解いて隠す: 拠点の列 → 拠点の段なし / いつ の列 → いつ の値なし (⛔ だけ) (Codex PR #1218 R1)');
+  ok(/const repaint = \(\) => \{ renderTabs\(\); renderList\(\); if \(curView === 'board'\) renderBoard\(\); \};/.test(html)
+    && (html.match(/\brepaint\(\);/g) || []).length >= 3,
+    '状態変更のあとはボードも描き直す (ボードで落としたカードが元の列に残らない — Codex PR #1218 R1)');
   ok(/curWhen !== 'all' && \(curWhen === 'none' \? !!c\.when : c\.when !== curWhen\)/.test(html),
     '「予定」は列ではなく絞り込み (すべて/今日やる/明日やる/未定)');
   ok(/one\('all', 'すべて'\) \+ one\('none', '未定'\)/.test(html), '拠点の絞り込みに「未定」がある');
