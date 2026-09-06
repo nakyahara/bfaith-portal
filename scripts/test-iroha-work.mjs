@@ -3601,7 +3601,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function lockDeviceStaffMode\(\)/.test(html) && /if \(staffLockInflight\) return staffLockInflight;/.test(html)
     && /端末の職員モードを終われませんでした/.test(html) && /if \(j && j\.ok\) \{/.test(html),
     '解除は同時 1 本・成功/失敗を確かめる (失敗を「終わりました」と言わない)');
-  ok(/<span class="fgroup"><span class="flabel">予定<\/span><span id="whenChips"><\/span><\/span>/.test(html) && /\.fgroup\{display:inline-flex/.test(html),
+  ok(/<span class="fgroup" id="whenGroup"><span class="flabel" id="whenLabel">予定<\/span><span id="whenChips"><\/span><\/span>/.test(html) && /\.fgroup\{display:inline-flex/.test(html),
     'B-4: 見出しとチップは 1 つの組で折り返す');
   ok(/時間不明 ' \+ p\.unknown_hours_count \+ ' 件'/.test(html), 'B-5: 「明日の計画」バナーは時間不明を 0 分と足さない');
   ok(/label class="cbrow"><input id="lwOrdered"/.test(html) && /\.mfields input\[type=checkbox\]\{width:24px/.test(html), 'B-3: チェックボックスは □ と文字を横並びに');
@@ -3867,9 +3867,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function gripHtml\(\)/.test(html) && /function gripDown\(e, sel, kind\)/.test(html)
     && /const g = e\.target\.closest\('\[data-grip\]'\);\r?\n\s+if \(!g\) return;/.test(html),
     '掴めるのは掴み手の上だけ (カードの上を指でなぞれば今まで通りスクロールできる)');
-  ok(/const grab = isApp\(\) && !bulkIds && \(boardCols === 'fac' \? stateCan\('task\.facility\.assign'\) : stateCan\('task\.status\.change'\)\);/.test(html)
+  ok(/const grab = isApp\(\) && !bulkIds && \(boardCols === 'fac' \? stateCan\('task\.facility\.assign'\) : boardCols === 'when' \? stateCan\('task\.plan\.assign'\) : stateCan\('task\.status\.change'\)\);/.test(html)
     && /\(grab \? gripHtml\(\) : ''\)/.test(html),
-    '動かせないときは掴み手を描かない (無効にして見せない — 要件 §U-7)');
+    '動かせないときは掴み手を描かない (無効にして見せない — 要件 §U-7)。いつ の列は計画の許可で掴める');
   ok(/pcardHtml\(c, carryActs, !ro\)/.test(html) && /\], !ro\)\)\.join\(''\)/.test(html)
     && /pcardHtml\(c, pileActs, !ro\)/.test(html),
     '下見・許可なしの計画画面には掴み手を描かない');
@@ -3943,8 +3943,17 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     'カードの「どこが」「いつ」の札は許可リストで出し分ける (下見では span = 見るだけ)');
   ok(/canFac\s*\r?\n?\s*\? '<button class="tag ' \+ facCls \+ '" data-fac-of=/.test(html) && /: \(c\.facility_code \? '<span class="tag ' \+ facCls \+ '"/.test(html),
     '許可が無ければ札は span で描く (ボタンを描いて無効にしない)');
-  ok(/: \(c\.when \? '<span class="tag ' \+ whenCls \+ '"/.test(html) && /return \(fac \|\| when\) \? '<div class="tags">' \+ fac \+ when \+ '<\/div>' : '';/.test(html),
-    '利用者には「未定」の札を出さない — 決まっている「どこが」「いつ」だけ (監修 F-5)');
+  ok(/: \(c\.facility_code \? '<span class="tag ' \+ facCls \+ '"/.test(html) && /: '<span class="tag ' \+ whenCls \+ '"><span class="k">いつ<\/span>' \+ esc\(whenTxt\) \+ '<\/span>';/.test(html),
+    '利用者には「どこが」は決まっているものだけ (監修 F-5)。「いつ」は未定でも出す (中原さん 2026-09-06)');
+  ok(/\[\['status', '進捗'\], \['fac', '拠点'\], \['when', 'いつ'\]\]/.test(html) && /: boardCols === 'when'\s*\? \[\{ label: '📌 今日やる', pick: \(c\) => c\.when === 'today', status: null, drop: 'today' \}/.test(html)
+    && /\{ label: 'やり残し', pick: \(c\) => c\.when === 'over', status: null, drop: null \}/.test(html) && /data-drop-kind="when"/.test(html)
+    && /if \(okDrop\.dataset\.dropKind === 'when'\) \{ toggleTomorrow\(id, okDrop\.dataset\.drop \|\| null\); return; \}/.test(html)
+    && /if \(drop\.dataset\.dropKind === 'when'\) return stateCan\('task\.plan\.assign'\)/.test(html),
+    'ボードの列の分け方に「いつ」(今日やる・明日やる・やり残し・先の予定・未定。落とせるのは 今日/明日/未定 — 中原さん 2026-09-06)');
+  ok(/function statusChips\(\)/.test(html) && /if \(curStatus !== 'all' && c\.status !== curStatus\) return false;/.test(html) && /\$\('#stGroup'\)\.hidden = boardCols === 'status';/.test(html),
+    'ボードに進捗の絞り込み (未着手・作業中・棚入待ち)。列が進捗のときは出さない');
+  ok(/\(boardCols !== 'status' \? '<div class="bstat"><span class="st ro ' \+ stClass\(c\.status\) \+ '">' \+ esc\(stLabel\(c\)\) \+ '<\/span><\/div>' : ''\)/.test(html),
+    '拠点・いつ の列ではカードに進捗の札を出す');
   ok(/const WHEN_SHORT = \{ today: '今日', tomorrow: '明日', over: 'やり残し', later: '先の予定' \};/.test(html) && /WHEN_SHORT\[c\.when\]/.test(html),
     'カードの札は短い言葉 (「い／つ／今日や／る」と折れない)');
   ok(/function toggleTomorrow\(id, want\) \{\r?\n\s+if \(!stateCan\('task\.plan\.assign'\)\) return;/.test(html)
@@ -3952,8 +3961,16 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '札の入口でも許可リストを見る (二重の守り)');
   ok(/const facBtn = e\.target\.closest\('\[data-fac-of\]'\);/.test(html) && /e\.stopPropagation\(\); openFacPick/.test(html),
     '札のタップはカードを開くより先に受ける (札を押したのに詳細が開かない)');
-  ok(/boardCols = 'status'/.test(html) && /\[\['status', '進捗'\], \['fac', '拠点'\]\]/.test(html) && !/\['when', '予定'\]/.test(html),
-    '列の分け方は 進捗 / 拠点 だけ (「予定」の列は作らない = また 1 列に 2 つの意味が混ざる)');
+  ok(/boardCols = 'status'/.test(html) && /\[\['status', '進捗'\], \['fac', '拠点'\], \['when', 'いつ'\]\]/.test(html) && !/\['when', '予定'\]/.test(html),
+    '列の分け方は 進捗 / 拠点 / いつ (どの列も 1 つの軸だけ — 1 列に 2 つの意味を混ぜない。中原さん 2026-09-06)');
+  // Codex PR #1218 R1: 列と同じ軸の絞り込みが残ると、列を切り替えたとき他の列が空になる
+  ok(/if \(boardCols === 'status'\) curStatus = 'all';\s*if \(boardCols === 'fac'\) curFacility = 'all';\s*if \(boardCols === 'when' && !\['all', 'blocked', 'unblocked'\]\.includes\(curWhen\)\) curWhen = 'all';/.test(html)
+    && /\$\('#facGroup'\)\.hidden = boardCols === 'fac';/.test(html) && /\$\('#whenGroup'\)\.hidden = !wc;/.test(html)
+    && /if \(boardCols === 'when' && !showBlk\) return '';/.test(html) && /\.\.\.\(boardCols === 'when' \? \[\] : \[\['today', '今日やる'\]/.test(html),
+    '列と同じ軸の絞り込みは解いて隠す: 拠点の列 → 拠点の段なし / いつ の列 → いつ の値なし (⛔ だけ) (Codex PR #1218 R1)');
+  ok(/const repaint = \(\) => \{ renderTabs\(\); renderList\(\); if \(curView === 'board'\) renderBoard\(\); \};/.test(html)
+    && (html.match(/\brepaint\(\);/g) || []).length >= 3,
+    '状態変更のあとはボードも描き直す (ボードで落としたカードが元の列に残らない — Codex PR #1218 R1)');
   ok(/curWhen !== 'all' && \(curWhen === 'none' \? !!c\.when : c\.when !== curWhen\)/.test(html),
     '「予定」は列ではなく絞り込み (すべて/今日やる/明日やる/未定)');
   ok(/one\('all', 'すべて'\) \+ one\('none', '未定'\)/.test(html), '拠点の絞り込みに「未定」がある');

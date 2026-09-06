@@ -175,6 +175,10 @@
   .bcard .m{font-size:.76rem;color:var(--sub);margin-top:2px}
   .bcard .cb{width:20px;height:20px;vertical-align:-4px;margin-right:6px;accent-color:var(--accent)}
   .colempty{color:var(--faint);font-size:.8rem;padding:8px 4px}
+  /* 拠点・いつ の列では、カードに進捗の札を出す (どの段階か分かるように — 中原さん 2026-09-06) */
+  .bstat{margin-top:4px}
+  .bcard .st.ro{display:inline-block;font-size:.74rem;padding:3px 8px;cursor:default}
+  .fgroup[hidden]{display:none}
 
   /* ── 「どこが」「いつ」の札 (3 軸のうち 2 つ。職員だけボタンになる — 要件 §W-4) ── */
   .tags{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
@@ -672,8 +676,9 @@
     <!-- 見出しとチップは 1 つの fgroup に包む。別々だと折り返しで「予定」の見出しだけが前の行の末尾に残る (監修 B-4) -->
     <div class="filters">
       <span class="fgroup"><span class="flabel">列の分け方</span><span class="seg" id="colSeg"></span></span>
-      <span class="fgroup"><span class="flabel">拠点</span><span id="facChips"></span></span>
-      <span class="fgroup"><span class="flabel">予定</span><span id="whenChips"></span></span>
+      <span class="fgroup" id="facGroup"><span class="flabel">拠点</span><span id="facChips"></span></span>
+      <span class="fgroup" id="stGroup" hidden><span class="flabel">進捗</span><span id="stChips"></span></span>
+      <span class="fgroup" id="whenGroup"><span class="flabel" id="whenLabel">予定</span><span id="whenChips"></span></span>
       <input class="search" id="bq" placeholder="商品名・商品コードで検索">
     </div>
     <div class="board" id="board"></div>
@@ -1056,7 +1061,8 @@ let state = { mode: 'notion', cards: [], statuses: [], changeTargets: [], worker
 let curTab = 'all';
 let tabAuto = true;   // 朝いちばんは「📌 今日やる」を既定にする (監修 F-6)。人がタブを押したら自動では変えない
 let curView = 'list';       // list | board | label | history (アプリ正本のときだけ切り替えられる)
-let boardCols = 'status';   // ボードの列の分け方: status (進捗) | fac (拠点)。「予定」の列は作らない (要件 §W-4)
+let boardCols = 'status';   // ボードの列の分け方: status (進捗) | fac (拠点) | when (いつ — 中原さん 2026-09-06)
+let curStatus = 'all';      // ボードの進捗の絞り込み (列が進捗以外のとき)
 let curWhen = 'all';        // 予定の絞り込み: all | today | tomorrow | none
 let curFacility = 'all';    // ボードの拠点しぼりこみ
 let bulkIds = null;         // まとめて棚入完了で選んでいる id → 選んだときの版 の Map (null = 選択モードではない)
@@ -1675,9 +1681,22 @@ function fmtMd(ymd) {
  */
 function isStaffUI() { return stateCan('task.plan.assign'); }
 function colSegHtml() {
-  return [['status', '進捗'], ['fac', '拠点']]
+  return [['status', '進捗'], ['fac', '拠点'], ['when', 'いつ']]
     .map(([v, l]) => '<button class="' + (boardCols === v ? 'on' : '') + '" data-col="' + v + '">' + l + '</button>').join('');
 }
+/** 進捗の絞り込み (列が 拠点・いつ のとき)。未着手 / 作業中 / 棚入待ち */
+function statusChips() {
+  const st = boardState() || { cards: [], statuses: [] };
+  const n = (v) => (v === 'all' ? st.cards.length : st.cards.filter(c => c.status === v).length);
+  return [['all', 'すべて'], ...(st.statuses || []).map(s => [s.value, s.label])]
+    .map(([v, l]) => '<button class="chip' + (curStatus === v ? ' on' : '') + '" data-st-filter="' + esc(v) + '">' + esc(l) + ' <span class="num">' + n(v) + '</span></button>').join('');
+}
+$('#stChips').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-st-filter]');
+  if (!b) return;
+  curStatus = b.dataset.stFilter;
+  renderBoard();
+});
 function whenChips() {
   const cards = ((boardState() || {}).cards || []);
   const n = (v) => (v === 'all' ? cards.length : v === 'none' ? cards.filter(c => !c.when).length
@@ -1688,7 +1707,10 @@ function whenChips() {
   const blockedN = cards.filter(c => c.blocked).length;
   // 「止まっていない」= ⛔ を除く (中原さん 2026-09-05)。⛔ と同じく 1 件以上あるときだけ
   const showBlk = blockedN > 0 || curWhen === 'blocked';
-  return [['all', 'すべて'], ['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定'],
+  // 列が「いつ」のときは列そのものが絞り込みなので、いつ の値は出さない。⛔ だけ残す (⛔ が無ければ段ごと消す — Codex PR #1218 R1)
+  if (boardCols === 'when' && !showBlk) return '';
+  return [['all', 'すべて'],
+    ...(boardCols === 'when' ? [] : [['today', '今日やる'], ['tomorrow', '明日やる'], ['over', 'やり残し'], ['later', '先の予定'], ['none', '未定']]),
     ...(showBlk ? [['blocked', '⛔ 止まっている'], ['unblocked', '止まっていない']] : [])]
     .map(([v, l]) => '<button class="chip' + (curWhen === v ? ' on' : '') + '" data-when="' + v + '">' + l +
       ' <span class="num">' + n(v) + '</span></button>').join('');
@@ -1770,6 +1792,7 @@ function boardCards() {
   const q = ($('#bq').value || '').trim().toLowerCase();
   return ((boardState() || {}).cards || []).filter(c => {
     if (curFacility !== 'all' && (curFacility === 'none' ? !!c.facility_code : c.facility_code !== curFacility)) return false;
+    if (curStatus !== 'all' && c.status !== curStatus) return false;   // 進捗の絞り込み (列が進捗以外のとき — 中原さん 2026-09-06)
     // 「⛔ 止まっている」は予定の値ではなく札の絞り込み (案A)
     if (curWhen === 'blocked') { if (!c.blocked) return false; }
     else if (curWhen === 'unblocked') { if (c.blocked) return false; }
@@ -1787,16 +1810,33 @@ function renderBoard() {
   renderPreviewNote();
   // 「止まっていない」は ⛔ が 0 件になったら「すべて」と同じ → 一覧と同じく「すべて」へ戻す (Codex PR #1209 R2)
   if (curWhen === 'unblocked' && !((bs.cards || []).some((c) => c.blocked))) curWhen = 'all';
+  // 列と同じ軸の絞り込みは解いて隠す (列そのものが絞り込み)。残すと列を切り替えたとき他の列が空になる (Codex PR #1218 R1)
+  if (boardCols === 'status') curStatus = 'all';
+  if (boardCols === 'fac') curFacility = 'all';
+  if (boardCols === 'when' && !['all', 'blocked', 'unblocked'].includes(curWhen)) curWhen = 'all';
   $('#gaugeWrap').innerHTML = planButtonHtml();
   $('#colSeg').innerHTML = colSegHtml();
+  $('#facGroup').hidden = boardCols === 'fac';
   $('#facChips').innerHTML = facChips();
-  $('#whenChips').innerHTML = whenChips();
+  const wc = whenChips();   // 列が「いつ」のときは ⛔ の絞り込みだけ (無ければ空 → 段ごと隠す)
+  $('#whenGroup').hidden = !wc;
+  $('#whenLabel').textContent = boardCols === 'when' ? '⛔' : '予定';
+  $('#whenChips').innerHTML = wc;
+  $('#stGroup').hidden = boardCols === 'status';
+  $('#stChips').innerHTML = statusChips();
   const cards = boardCards();
   if (isApp()) syncBulkSelection(cards);
-  // 列の分け方 = 進捗 (既定) か 拠点。「予定」の列は作らない — また 1 列に 2 つの意味が混ざるため (要件 §W-4)
+  // 列の分け方 = 進捗 (既定) / 拠点 / いつ (中原さん 2026-09-06)。1 列に 2 つの意味を混ぜない (要件 §W-4) — 列は 1 つの軸だけ
+  //   「いつ」の列: 今日やる・明日やる・未定 には落とせる (/api/plan)。やり残し・先の予定 は日付の結果なので落とせない
   const groups = boardCols === 'fac'
     ? [{ label: '未定', pick: (c) => !c.facility_code, status: null, drop: '' },
        ...(bs.facilities || []).map(f => ({ label: f.name, pick: (c) => c.facility_code === f.code, status: null, drop: f.code }))]
+    : boardCols === 'when'
+    ? [{ label: '📌 今日やる', pick: (c) => c.when === 'today', status: null, drop: 'today' },
+       { label: '明日やる', pick: (c) => c.when === 'tomorrow', status: null, drop: 'tomorrow' },
+       { label: 'やり残し', pick: (c) => c.when === 'over', status: null, drop: null },
+       { label: '先の予定', pick: (c) => c.when === 'later', status: null, drop: null },
+       { label: '未定', pick: (c) => !c.when, status: null, drop: '' }]
     : (bs.statuses || []).map(st => ({ label: st.label, pick: (c) => c.status === st.value, status: st.value, drop: st.value }));
   const cols = groups.map(g => {
     const mine = cards.filter(g.pick);
@@ -1804,7 +1844,7 @@ function renderBoard() {
     const body = mine.length === 0 ? '<div class="colempty">なし</div>' : mine.map(c => bcardHtml(c, c.status)).join('');
     // 想定作業時間の合計 (Notion のボードビューで見ていたもの)
     const hours = mine.reduce((a, c) => a + (Number(c.plan_hours) || 0), 0);
-    return '<div class="col"' + (g.drop != null ? ' data-drop="' + esc(g.drop) + '"' + (boardCols === 'fac' ? ' data-drop-kind="fac"' : '') : '') +
+    return '<div class="col"' + (g.drop != null ? ' data-drop="' + esc(g.drop) + '"' + (boardCols === 'fac' ? ' data-drop-kind="fac"' : boardCols === 'when' ? ' data-drop-kind="when"' : '') : '') +
       '><h3><span class="t">' + esc(g.label) + '</span><span class="n">' + mine.length + '</span>' +
       (hours > 0 ? '<span class="n">⏱ ' + esc(approxHours(hours)) + '</span>' : '') +
       (canBulk && !bulkIds ? '<button onclick="startBulk()">まとめて棚入完了</button>' : '') + '</h3>' + body + '</div>';
@@ -1830,7 +1870,7 @@ function stockBtnHtml(c) {
 function bcardHtml(c, status) {
   const selectable = bulkIds && status === 'ready_for_stocking';
   // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
-  const grab = isApp() && !bulkIds && (boardCols === 'fac' ? stateCan('task.facility.assign') : stateCan('task.status.change'));
+  const grab = isApp() && !bulkIds && (boardCols === 'fac' ? stateCan('task.facility.assign') : boardCols === 'when' ? stateCan('task.plan.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
   const meta = [c.qty != null ? c.qty + ' 個' : null,
     c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
@@ -1848,6 +1888,8 @@ function bcardHtml(c, status) {
     esc(c.title) + '</h4>' +
     // ⛔ 止まっている理由は赤い 1 行で (小さな文字に埋めない — 中原さん 2026-09-05)
     (c.blocked ? '<div class="bblk">⛔ ' + esc(c.blocked.label) + 'で止まっています</div>' : '') +
+    // 列が進捗以外なら、進捗の札を出す (拠点・いつ の列でも段階が分かるように — 中原さん 2026-09-06)
+    (boardCols !== 'status' ? '<div class="bstat"><span class="st ro ' + stClass(c.status) + '">' + esc(stLabel(c)) + '</span></div>' : '') +
     (meta ? '<div class="m num">' + esc(meta) + '</div>' : '') +
     planTagsHtml(c) + stockBtnHtml(c) + '</div></div>';
 }
@@ -1869,9 +1911,9 @@ function planTagsHtml(c) {
     : (c.facility_code ? '<span class="tag ' + facCls + '"><span class="k">どこが</span>' + esc(facTxt) + '</span>' : '');
   const when = canWhen
     ? '<button class="tag ' + whenCls + '" data-when-of="' + esc(c.id) + '"><span class="k">いつ</span>' + esc(whenTxt) + '</button>'
-    : (c.when ? '<span class="tag ' + whenCls + '"><span class="k">いつ</span>' + esc(whenTxt) + '</span>' : '');
-  // ⭐変えられない人 (利用者) には「未定」の札を出さない — 決まっているものだけ見せる (監修 F-5)
-  return (fac || when) ? '<div class="tags">' + fac + when + '</div>' : '';
+    : '<span class="tag ' + whenCls + '"><span class="k">いつ</span>' + esc(whenTxt) + '</span>';
+  // ⭐「どこが」は変えられない人 (利用者) には決まっているものだけ (監修 F-5)。「いつ」は未定でも出す (中原さん 2026-09-06: いつやるかの情報は両方の列で見たい)
+  return '<div class="tags">' + fac + when + '</div>';
 }
 
 // ─── ⭐「いつ」「どこが」を変える (職員だけ。要件 §W-4) ───
@@ -2388,6 +2430,7 @@ function dndAllowed(drop) {
     const c = findCard(DND.id);
     if (!c) return false;
     if (drop.dataset.dropKind === 'fac') return stateCan('task.facility.assign') && (drop.dataset.drop || null) !== (c.facility_code || null);
+    if (drop.dataset.dropKind === 'when') return stateCan('task.plan.assign') && (drop.dataset.drop || null) !== (c.when || null);
     return stateCan('task.status.change') && to !== c.status && (((state || {}).transitions || {})[c.status] || []).includes(to);
   }
   return false;
@@ -2414,6 +2457,7 @@ async function dndDrop(ev) {
     return;
   }
   if (okDrop.dataset.dropKind === 'fac') { saveFacility(id, okDrop.dataset.drop || null, null); return; }
+  if (okDrop.dataset.dropKind === 'when') { toggleTomorrow(id, okDrop.dataset.drop || null); return; }   // 今日 / 明日 / 未定
   dropToStatus(id, okDrop.dataset.drop);
 }
 window.addEventListener('pointermove', dndMove, { passive: false });
@@ -4741,10 +4785,12 @@ async function doSetSt(choice) {
   if (stRefreshPending) { stRefreshPending = false; if (stTarget != null && $('#stOv').classList.contains('on')) refreshStAfterCapsDrop(); }
 
   // 一覧に残らないステータス (棚入完了) になったら、その場で行を外す (次の取得でも入ってこない)
+  // 一覧もボードも描き直す (ボードで落としたカードが元の列・古い進捗札のまま残らないように — Codex PR #1218 R1)
+  const repaint = () => { renderTabs(); renderList(); if (curView === 'board') renderBoard(); };
   const dropCard = () => {
     state.cards = state.cards.filter(x => x.id !== c.id);
     if (sameId(curDetail, c.id)) closeDetail();
-    renderTabs(); renderList();
+    repaint();
   };
   const suffix = isApp() ? '' : ' (Notionにも反映済み)';
   if (j.ok) {
@@ -4758,7 +4804,7 @@ async function doSetSt(choice) {
     applyTask(c, j.task);
     c.status = j.status;
     if (j.status_label) c.status_label = j.status_label;
-    renderTabs(); renderList();
+    repaint();
     if (sameId(curDetail, c.id)) renderDetail(c);
     toast('「' + label + '」に変えました' + suffix);
     return;
@@ -4770,7 +4816,7 @@ async function doSetSt(choice) {
     else if (j.current) {
       if (typeof j.current === 'object') { applyTask(c, j.current); c.status = j.current.status; c.status_label = j.current.status_label; }
       else c.status = j.current;
-      renderTabs(); renderList(); if (sameId(curDetail, c.id)) renderDetail(c);
+      repaint(); if (sameId(curDetail, c.id)) renderDetail(c);
     }
     loadState();
     return;
