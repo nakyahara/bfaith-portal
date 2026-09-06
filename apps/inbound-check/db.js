@@ -1140,23 +1140,44 @@ function supplierNameMap(db, codes) {
   }
   const out = new Map();
   if (want.size === 0) return out;
-  // ① 発注管理の仕入先マスタ (正規形コード)
-  if (tableExists(db, 'po_suppliers')) {
-    const byNorm = new Map();
-    for (const r of db.prepare('SELECT supplier_code, name FROM po_suppliers').all()) {
-      const key = normSupplierCode(r.supplier_code);
-      if (key && r.name && !byNorm.has(key)) byNorm.set(key, r.name);
-    }
-    for (const c of want) {
-      const hit = byNorm.get(normSupplierCode(c));
-      if (hit) out.set(c, hit);
-    }
-  }
-  // ② 仕入先向け売れ筋共有の表示名 (NE の生コード)。①で埋まらなかったものだけ
+  // ① 仕入先向け売れ筋共有の表示名。**mirror_products.仕入先コード と同じ体系**で持っている
+  //    (apps/supplier-sales/share-db.js が `m.仕入先コード = p.仕入先コード` と素で結合している) ので、
+  //    ここが最も確かな出どころ。ただし共有相手の仕入先しか登録されていない
   if (tableExists(db, 'supplier_share_master')) {
     for (const r of db.prepare('SELECT 仕入先コード AS code, 表示名 AS name FROM supplier_share_master').all()) {
       const c = String(r.code == null ? '' : r.code).trim();
       if (c && r.name && want.has(c) && !out.has(c)) out.set(c, r.name);
+    }
+  }
+  // ② 発注管理の仕入先マスタ。①で埋まらなかったものだけ。
+  //    ⚠こちらはロジザード由来のコードなので、NE のコードと体系が違えば別の会社の名前が出る余地がある。
+  //    **生コードの完全一致を先に**見て、当たらなければ正規形 (先頭ゼロ違い) で見る。
+  //    同じ正規形に別名が2つ以上ぶら下がっていたら、どちらか分からないので**名前を出さない** (Codex R1 Medium)
+  if (tableExists(db, 'po_suppliers')) {
+    // 正規化は parseInt を通るので、桁が大きすぎる数字コードは丸められて別のコードと同じ形になりうる。
+    // そういうコードは完全一致だけで見る
+    const normSafe = (v) => {
+      const s = String(v == null ? '' : v).trim();
+      if (/^\d+$/.test(s) && !Number.isSafeInteger(Number(s))) return null;
+      return normSupplierCode(s) || null;
+    };
+    const exact = new Map();
+    const byNorm = new Map();
+    for (const r of db.prepare('SELECT supplier_code, name FROM po_suppliers').all()) {
+      const raw = String(r.supplier_code == null ? '' : r.supplier_code).trim();
+      if (!raw || !r.name) continue;
+      if (!exact.has(raw)) exact.set(raw, r.name);
+      const key = normSafe(raw);
+      if (!key) continue;
+      const cur = byNorm.get(key);
+      if (cur === undefined) byNorm.set(key, r.name);
+      else if (cur !== null && cur !== r.name) byNorm.set(key, null);   // 別名が2つ = 決められない
+    }
+    for (const c of want) {
+      if (out.has(c)) continue;
+      const key = normSafe(c);
+      const hit = exact.get(c) ?? (key ? byNorm.get(key) : null);
+      if (hit) out.set(c, hit);
     }
   }
   return out;

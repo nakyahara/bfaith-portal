@@ -38,6 +38,8 @@ mirror.exec(`
 mirror.prepare('INSERT INTO po_suppliers VALUES (?,?,?,?,?)').run('7', 'エーエムシー', null, now, now);
 mirror.prepare('INSERT INTO po_suppliers VALUES (?,?,?,?,?)').run('AWA', '粟国の塩', null, now, now);
 mirror.prepare('INSERT INTO supplier_share_master VALUES (?,?,?,?,?)').run('0099', 'サロンジェ', null, now, now);
+// 両方にある仕入先: 売れ筋共有 (NE と同じ体系) が勝つ
+mirror.prepare('INSERT INTO po_suppliers VALUES (?,?,?,?,?)').run('0099', '発注管理の名前 (別体系かもしれない)', null, now, now);
 const insP = mirror.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 仕入先コード, updated_at)
   VALUES (?, ?, ?, '単品', '取扱中', 'unknown', ?, ?)`);
 insP.run(1, 'awa-shio-250', '粟国の塩 250g_その他', 'AWA', now);
@@ -51,12 +53,19 @@ console.log('[1] ① 仕入先名 — コードの持ち方が2系統あって�
   const byCode = Object.fromEntries(sups.map(s => [s.code, s.name]));
   eq(byCode['0007'], 'エーエムシー', 'ゼロ埋めコード 0007 → 発注管理の正規形 7 と突き合わせて名前が出る');
   eq(byCode['AWA'], '粟国の塩', '数字でないコードはそのまま突き合わせる');
-  eq(byCode['0099'], 'サロンジェ', '発注管理に無ければ 売れ筋共有の表示名 (NE の生コード) を使う');
+  eq(byCode['0099'], 'サロンジェ', '売れ筋共有の表示名 (mirror_products と同じ体系) を優先する');
   ok(sups.length === 3 && !sups.some(s => s.code == null), '仕入先コードが無い商品は一覧に出ない');
   ok(sups[0].name && sups[sups.length - 1].name, '名前が分かるものを先に並べる');
   const rows = searchProducts({ supplier: '0007' }).rows;
   ok(rows.length === 1 && rows[0].supplier_name === 'エーエムシー', '検索結果の行にも仕入先名が付く');
   eq(searchProducts({ q: '仕入先なし' }).rows[0].supplier_name, null, '仕入先が無い商品は null (名前をでっち上げない)');
+  // 正規形が同じコードに別の名前が2つぶら下がっていたら、どちらか分からないので名前を出さない
+  mirror.prepare('INSERT INTO po_suppliers VALUES (?,?,?,?,?)').run('0012', 'A社', null, now, now);
+  mirror.prepare('INSERT INTO po_suppliers VALUES (?,?,?,?,?)').run('12', 'B社', null, now, now);
+  insP.run(5, 'amb-01', 'あいまいな仕入先の商品_その他', '00012', now);
+  eq(searchProducts({ q: 'あいまい' }).rows[0].supplier_name, null, '正規形が衝突したら名前を出さない (別の会社の名前を出さない)');
+  insP.run(6, 'exact-01', '生コードが一致する商品_その他', '0012', now);
+  eq(searchProducts({ q: '生コード' }).rows[0].supplier_name, 'A社', '生コードが完全一致すればそれを使う');
 }
 
 console.log('\n[2] ② バーコードマスタの取込 (CSV の検証)');
@@ -74,6 +83,8 @@ const csvOf = (rows, header = ['商品ID', '商品名', '検索名称', 'バー�
   };
   bad(Buffer.alloc(0), '空ファイルは拒否');
   bad(csvOf([['a', 'b', 'c']], ['商品ID', '商品名', '検索名称']), '必須列 バーコード が無ければ拒否');
+  bad(csvOf([['awa-shio-250', '粟国の塩', '粟国の塩', '4936695001014']], ['商品ID', '商品名', '検索名称', 'バーコード']), '有効区分の列が消えたら拒否 (区分不明のまま本番で使わない)');
+  bad(csvOf([['a1', 'A', 'A', '4936695001014', '01'], ['a2', 'B', 'B', '4936695001014', '01']]), '同じバーコードが別の商品に付いていたら取込ごと拒否');
   bad(csvOf([['awa-shio-250', '粟国の塩', '粟国の塩', '4936695001014', '01'], ['x', 'y']]), '列数が違う行は拒否');
   bad(csvOf([]), '中身が無ければ拒否 (マスタが空になることは無い)');
   bad(csvOf([['awa-shio-250', '粟国の塩', '粟国の塩', '49-366-95', '01']]), '刷れる形のバーコードが1件も無ければ拒否');
@@ -83,16 +94,28 @@ const csvOf = (rows, header = ['商品ID', '商品名', '検索名称', 'バー�
     ['pashima-single-KI', 'パシーマ', 'パシーマ', 'X002ABCD1F', '01'],      // FNSKU が先
     ['pashima-single-KI', 'パシーマ', 'パシーマ', '4903357200047', '01'],   // JAN が後 → 代表は JAN
     ['01520-01', 'エプロン', 'エプロン', '4975953878050', '02'],
-    ['01520-01', 'エプロン', 'エプロン', '4975953878050', '02'],            // 同じバーコードの重複
+    ['01520-01', 'エプロン', 'エプロン', '4975953878050', '02'],            // 同じ商品の同じバーコード = 無害
     ['bad-code', 'ダメ', 'ダメ', '4903-357', '01'],                          // 記号入り = 刷れない
     ['', '商品IDなし', '', '4900000000001', '01'],
   ]));
   eq(parsed.rows.length, 4, '刷れる形のバーコードだけ積む (重複と記号入りと ID なしを除く)');
   eq(parsed.products, 3, '商品数');
-  eq(parsed.skipped, 1, '刷れない形の件数を数える');
+  eq(parsed.invalidBarcodes, 1, '刷れない形の件数を数える');
+  eq(parsed.blankRows, 1, '商品IDかバーコードが空の行も数える (出力が途中で切れたのを見つける)');
   eq(parsed.kubunCounts, { '01': 3, '02': 1 }, '有効区分の内訳を返す (実データで判断できるように)');
   const pas = parsed.rows.filter(r => r.code_key === 'pashima-single-ki');
   eq(pas.find(r => r.rank === 0).barcode, '4903357200047', '商品ごとの代表は JAN (後から出てきても JAN が勝つ)');
+  // 代表はチェックデジットまで正しい GTIN を優先 (社内の数字コードや桁数違いを刷らない)
+  const mixed = parseBarcodeMasterCsv(csvOf([
+    ['mix-1', 'まぜ', 'まぜ', '12345', '01'],                 // 数字だが GTIN でない
+    ['mix-1', 'まぜ', 'まぜ', 'X002ABCD1F', '01'],            // FNSKU
+    ['mix-1', 'まぜ', 'まぜ', '4903357200047', '01'],         // 正しい JAN
+    ['mix-2', 'まぜ2', 'まぜ2', '4903357200041', '01'],       // チェックデジットが違う
+    ['mix-2', 'まぜ2', 'まぜ2', 'X002ZZZZ9Z', '01'],
+  ]));
+  eq(mixed.rows.filter(r => r.code_key === 'mix-1' && r.rank === 0)[0].barcode, '4903357200047', '正しい GTIN が代表');
+  eq(mixed.rows.filter(r => r.code_key === 'mix-2' && r.rank === 0)[0].barcode, 'X002ZZZZ9Z', 'チェックデジットが合わない数字より FNSKU を代表にする');
+  ok(bcm.isValidGtin('4903357200047') && bcm.isValidGtin('4936695001014') && !bcm.isValidGtin('4903357200041') && !bcm.isValidGtin('12345'), 'GTIN のチェックデジット判定');
   ok(pas.find(r => r.rank === 1).barcode === 'X002ABCD1F', 'FNSKU も残る (どちらで読んでも引ける)');
 
   const r = importBarcodeMaster(csvOf([
@@ -110,6 +133,28 @@ const csvOf = (rows, header = ['商品ID', '商品名', '検索名称', 'バー�
   ]), { actor: 'test' });
   ok(r2.ok && r2.removed === 1 && r2.added === 0, 'マスタから消えたバーコードは消す (刷り続けない)');
   eq(db.prepare("SELECT COUNT(*) n FROM f_inbound_check_barcode_master WHERE barcode = 'X002ABCD1F'").get().n, 0, '消えている');
+
+  // 🚨 全量置換の安全弁: CSV が途中で切れて件数が激減したら取り込まない
+  const many = [];
+  for (let i = 0; i < 200; i++) many.push(['bulk-' + i, '大量' + i, '大量' + i, 'X00BULK' + String(i).padStart(3, '0'), '01']);
+  ok(importBarcodeMaster(csvOf(many), { actor: 'test' }).ok, '200件を取り込む');
+  const cut = importBarcodeMaster(csvOf(many.slice(0, 100)), { actor: 'test' });
+  ok(!cut.ok && cut.error === 'shrink_guard' && /50%/.test(cut.message), '半分に減った CSV は取り込まない (途中で切れた疑い)');
+  eq(barcodeMasterStatus().total, 200, '拒否したので前の中身のまま');
+  ok(importBarcodeMaster(csvOf(many.slice(0, 100)), { actor: 'test', allowShrink: true }).ok, '人が承認すれば取り込める');
+  eq(barcodeMasterStatus().total, 100, '承認後は入れ替わる');
+  ok(importBarcodeMaster(csvOf(many.slice(0, 190)), { actor: 'test' }).ok, '1割の増減なら通る');
+  // 🚨 世代の追い越し: 遅れて着いた古い CSV で新しいマスタを巻き戻さない
+  ok(importBarcodeMaster(csvOf(many), { actor: 'test', sourceModifiedAt: '2026-09-06T05:00:00.000Z' }).ok, '新しい世代を取り込む');
+  const old = importBarcodeMaster(csvOf(many.slice(0, 195)), { actor: 'test', sourceModifiedAt: '2026-09-06T04:00:00.000Z' });
+  ok(!old.ok && old.error === 'stale_source', '古い世代の CSV は後から来てもコミットしない');
+  eq(barcodeMasterStatus().total, 200, '巻き戻らない');
+  eq(barcodeMasterStatus().sourceModifiedAt, '2026-09-06T05:00:00.000Z', '取り込んだ世代を覚えている');
+  // 元に戻す (以降のテスト用)
+  ok(importBarcodeMaster(csvOf([
+    ['awa-shio-250', '粟国の塩 250g', '粟国の塩', '4936695001014', '01'],
+    ['pashima-single-KI', 'パシーマ', 'パシーマ', '4903357200047', '01'],
+  ]), { actor: 'test', allowShrink: true, sourceModifiedAt: '2026-09-06T06:00:00.000Z' }).ok, '整え直す');
 }
 
 console.log('\n[3] ② バーコードの解決 — マスタが最優先 (粟国の塩が刷れるようになる)');
@@ -150,7 +195,31 @@ console.log('\n[4] ③ 読んだバーコードで商品を引ける (カメラ 
   eq(searchProducts({ q: 'a\\b' }).total, 0, 'バックスラッシュを含む検索語でも落ちない');
 }
 
-console.log('\n[5] HTTP — 管理画面の取込ボタンの入口');
+console.log('\n[5] ② 伝票からの発行でも マスタ → 明細 の順で刷る');
+{
+  const { importCsv } = dbMod;
+  const HEADER = ['入荷管理番号', '入荷管理行番号', '入荷管理詳細行番号', 'ステータス', '荷主入荷NO', '入荷予定日', '入荷受付日', '入荷確定日', '取引先ID', '取引先名', '業務区分名', '商品ID', '商品名', '品質区分名', 'ロケーション', '予定数', '受付数', '検品数', '作成日時', '更新日時', 'バーコード', '備考'];
+  const rowCsv = (pid, bc, line) => ['AR9', line, 1, '受付済', '', '20260906', '20260906', '', '0002', 'BF', '通常入荷', pid, '商品 ' + pid, '良品', '', 5, 5, '', '20260906080000', '20260906080000', bc, ''];
+  // 伝票には古い (マスタと違う) バーコードが入っている状況を作る
+  const csv = iconv.encode([
+    HEADER.map(q).join(','),
+    rowCsv('awa-shio-250', '4900000000011', 1).map(q).join(','),
+    rowCsv('nosup-01', '4900000000222', 2).map(q).join(','),
+  ].join('\r\n') + '\r\n', 'cp932');
+  ok(importCsv(csv, { fileName: 'CA04001_t.csv', source: 'manual_upload', actor: 'test' }).ok, '伝票を取り込む');
+  const pq = await import('../apps/inbound-check/print-queue.js');
+  const agent = dbMod.createDevice('倉庫PC', 'admin', { kind: 'agent', printerName: 'Brother QL-700' });
+  pq.recordHeartbeat(agent.id, { note: 'ready', bpac: true, paperFormatOk: true, version: 'test' });
+  const batch = db.prepare("SELECT id FROM f_inbound_check_batches WHERE status = 'active'").get();
+  let n = 0; const rid = () => 'req-' + Date.now() + '-' + (++n);
+  const a = pq.enqueuePrintJob({ batchId: batch.id, lineKey: 'AR9|1|1', copies: 1, clientRequestId: rid() });
+  ok(a.ok && a.job.barcode === '4936695001014',
+    '伝票の古い値ではなく マスタの値で刷る (ロジザードで直したらマスタの方が新しい)');
+  const b = pq.enqueuePrintJob({ batchId: batch.id, lineKey: 'AR9|2|1', copies: 1, clientRequestId: rid() });
+  ok(b.ok && b.job.barcode === '4900000000222', 'マスタに無い商品は その明細自身の値で刷る');
+}
+
+console.log('\n[6] HTTP — 管理画面の取込ボタンの入口');
 {
   const express = (await import('express')).default;
   const router = (await import('../apps/inbound-check/router.js')).default;

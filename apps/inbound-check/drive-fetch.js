@@ -157,48 +157,66 @@ export function lastMasterFetchAt() { return _lastMasterOk; }
 let _lastBarcodeHash = null;
 let _lastBarcodeOk = null;
 let _lastBarcodeError = null;
+// 取込は cron でも管理画面でも1本の列に並べる (下の fetchAndImportBarcodeMaster を参照)
+let _fetchingBarcode = null;
 
 /**
  * Drive のバーコードマスタを取り込む。
  * @param {object} o { actor, force }  force=true で同じ内容でも取り込み直す (管理画面の「今すぐ」)
  */
-export async function fetchAndImportBarcodeMaster({ actor = 'cron', force = false } = {}) {
-  const info = await getDriveCsvInfo(BARCODE_CFG);
-  if (!info || !info.file_id) {
-    throw vErr(`${BARCODE_CFG.filename} が Drive に見つかりません。${BARCODE_CFG.notFoundHint}`);
-  }
-  const dl = await downloadDriveCsv(BARCODE_CFG);
-  const hash = crypto.createHash('sha256').update(dl.buffer).digest('hex');
-  const modified = dl.modified_time || dl.modifiedTime || null;
-  if (!force && hash === _lastBarcodeHash) {
-    return { ok: true, skipped: true, message: 'バーコードマスタは前回と同じ内容でした', driveModifiedTime: modified };
-  }
-  const r = importBarcodeMaster(dl.buffer, { actor });
-  _lastBarcodeHash = hash;
-  _lastBarcodeOk = new Date().toISOString();
-  _lastBarcodeError = null;
-  return { ...r, driveModifiedTime: modified, fileName: dl.name || BARCODE_CFG.filename };
+export async function fetchAndImportBarcodeMaster({ actor = 'cron', force = false, allowShrink = false } = {}) {
+  // 🚨 cron と管理画面の「今すぐ」を**同じ列に並べる**。別々に走らせると、先に落としてきた古い CSV が
+  //    後からコミットして新しいマスタを巻き戻す (Codex R1 High-3)。
+  //    複数インスタンスをまたぐ追い越しは importBarcodeMaster 側が世代 (Drive の更新時刻) で弾く
+  while (_fetchingBarcode) await _fetchingBarcode.catch(() => {});
+  const run = (async () => {
+    const info = await getDriveCsvInfo(BARCODE_CFG);
+    if (!info || !info.file_id) {
+      throw vErr(`${BARCODE_CFG.filename} が Drive に見つかりません。${BARCODE_CFG.notFoundHint}`);
+    }
+    const dl = await downloadDriveCsv(BARCODE_CFG);
+    const hash = crypto.createHash('sha256').update(dl.buffer).digest('hex');
+    const modified = dl.modified_time || dl.modifiedTime || null;
+    if (!force && hash === _lastBarcodeHash) {
+      return { ok: true, unchanged: true, message: 'バーコードマスタは前回と同じ内容でした', driveModifiedTime: modified };
+    }
+    const r = importBarcodeMaster(dl.buffer, { actor, sourceModifiedAt: modified, allowShrink });
+    if (r.ok) {
+      _lastBarcodeHash = hash;
+      _lastBarcodeOk = new Date().toISOString();
+      _lastBarcodeError = null;
+    } else {
+      // 取り込めなかった内容を「前回と同じ」として覚えない (次の巡回でもう一度試す)
+      _lastBarcodeHash = null;
+      _lastBarcodeError = { at: new Date().toISOString(), message: r.message };
+    }
+    return { ...r, driveModifiedTime: modified, fileName: dl.name || BARCODE_CFG.filename };
+  })();
+  _fetchingBarcode = run;
+  try { return await run; } finally { if (_fetchingBarcode === run) _fetchingBarcode = null; }
 }
 
 /** 定期取込 (cron から)。例外は投げず結果を返す — 入荷CSVの巡回を止めないため */
-let _fetchingBarcode = null;
 export async function runScheduledBarcodeFetch({ actor = 'cron' } = {}) {
-  if (_fetchingBarcode) return _fetchingBarcode;
-  _fetchingBarcode = (async () => {
-    try {
-      const r = await fetchAndImportBarcodeMaster({ actor });
-      if (r.skipped) return r;
-      console.log(`[inbound-check] バーコードマスタ取込: ${r.total}件 / ${r.products}商品`
-        + ` (追加 ${r.added} / 消滅 ${r.removed}${r.skipped ? ` / 刷れない形を ${r.skipped}件 除外` : ''})`);
+  try {
+    const r = await fetchAndImportBarcodeMaster({ actor });
+    if (r.unchanged) return r;
+    if (!r.ok) {
+      // 安全弁 (急減・世代の追い越し) で止めた。次の巡回でもう一度見る。人が承認すれば通る
+      console.warn(`[inbound-check] バーコードマスタを取り込みませんでした: ${r.message}`);
       return r;
-    } catch (e) {
-      // バーコードマスタが取れなくても、伝票・在庫・入荷予定・手入力で動き続ける (作業は止めない)
-      _lastBarcodeError = { at: new Date().toISOString(), message: e.message };
-      console.warn(`[inbound-check] バーコードマスタの取得に失敗: ${e.message}`);
-      return { ok: false, error: 'drive_error', message: e.message };
     }
-  })();
-  try { return await _fetchingBarcode; } finally { _fetchingBarcode = null; }
+    console.log(`[inbound-check] バーコードマスタ取込: ${r.total}件 / ${r.products}商品`
+      + ` (追加 ${r.added} / 消滅 ${r.removed}`
+      + `${r.invalidBarcodes ? ` / 刷れない形を ${r.invalidBarcodes}件 除外` : ''}`
+      + `${r.blankRows ? ` / 空欄の行 ${r.blankRows}件` : ''})`);
+    return r;
+  } catch (e) {
+    // バーコードマスタが取れなくても、伝票・在庫・入荷予定・手入力で動き続ける (作業は止めない)
+    _lastBarcodeError = { at: new Date().toISOString(), message: e.message };
+    console.warn(`[inbound-check] バーコードマスタの取得に失敗: ${e.message}`);
+    return { ok: false, error: 'drive_error', message: e.message };
+  }
 }
 
 export function lastBarcodeFetchAt() { return _lastBarcodeOk; }

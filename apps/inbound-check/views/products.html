@@ -258,8 +258,9 @@
     // 読んだ値をそのまま検索欄に入れて検索する (バーコードマスタは1商品に複数行あるので、
     // JAN でも FNSKU でも、どれを読んでもその商品に行き着く)。
     // BarcodeDetector が無い iPad (iPadOS 16 以前など) は、キーボードの「テキストをスキャン」を案内する
-    let scanStream = null, scanTimer = null;
+    let scanStream = null, scanTimer = null, scanStarting = false;
     async function startScan() {
+      if (scanStarting || scanStream) return;      // 連打で getUserMedia が二重に走ると、先の stream を止められなくなる
       if (!('BarcodeDetector' in window) || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         banner('warn', 'この iPad はカメラ読み取りに対応していません。検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
         $('#q').focus();
@@ -268,8 +269,25 @@
       let detector;
       try { detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'] }); }
       catch (e) { banner('err', 'バーコードの読み取りを始められませんでした (' + esc(e.message) + ')', { sticky: true }); return; }
-      try { scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }); }
-      catch (e) { banner('err', 'カメラを使えませんでした。iPad の設定でこのサイトのカメラを許可してください', { sticky: true }); return; }
+      scanStarting = true;
+      $('#scanBtn').disabled = true;
+      let stream = null;
+      try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }); }
+      catch (e) {
+        // 何が起きたかで打つ手が違う。「許可してください」だけだと、カメラが無い/塞がっているときに現場が設定をいじり続ける
+        const msg = e && e.name === 'NotAllowedError' ? 'カメラの使用が許可されていません。iPad の設定 → Safari → カメラ でこのサイトを「許可」にしてください'
+          : e && e.name === 'NotFoundError' ? 'この端末にカメラが見つかりません。検索欄を長押し →「テキストをスキャン」を使ってください'
+          : e && e.name === 'NotReadableError' ? 'カメラを他のアプリが使っています。そのアプリを閉じてからもう一度押してください'
+          : location.protocol !== 'https:' && location.hostname !== 'localhost' ? 'この画面は https でないため、カメラを使えません'
+          : 'カメラを使えませんでした (' + esc((e && e.name) || '') + ')';
+        banner('err', msg, { sticky: true });
+        return;
+      } finally {
+        scanStarting = false;
+        $('#scanBtn').disabled = false;
+      }
+      if (!$('#scanBox')) { for (const tr of stream.getTracks()) { try { tr.stop(); } catch (e) { /* 放す */ } } return; }
+      scanStream = stream;
       const v = $('#scanVideo');
       v.srcObject = scanStream;
       $('#scanMsg').textContent = '商品の JAN (13桁) か FNSKU を枠に入れてください';
@@ -303,6 +321,10 @@
     $('#scanBtn').addEventListener('click', startScan);
     $('#scanCancel').addEventListener('click', stopScan);
     $('#scanBox').addEventListener('click', (e) => { if (e.target === $('#scanBox')) stopScan(); });
+    // 画面を離れる・別のタブに移る・戻るボタンで抜ける — どれでもカメラを必ず止める
+    // (止め忘れるとレンズのランプが点いたままになり、現場が不安になる)
+    window.addEventListener('pagehide', stopScan);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) stopScan(); });
 
     // ─── 描画 ───
     const SEAL_NO = /^(不要|無|無し|なし|－|-|ー|―)$/;

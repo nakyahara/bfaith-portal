@@ -731,11 +731,12 @@
         if (status === 200 && j.ok) {
           // ⭐区分の内訳を出す: ロジザード側の表記が想定と違っていたらここで気付ける
           const naiyaku = j.kubunCounts ? Object.entries(j.kubunCounts).map(([k, n]) => k + '=' + n).join(' / ') : '';
-          msg($('#fetchBarcodeMsg'), true, j.skipped ? '前回と同じ内容でした'
+          msg($('#fetchBarcodeMsg'), true, j.unchanged ? '前回と同じ内容でした'
             : '✅ ' + j.total + ' 件 / ' + j.products + ' 商品'
               + (j.added ? ' (追加 ' + j.added + ')' : '')
               + (j.removed ? ' (消滅 ' + j.removed + ')' : '')
-              + (j.skipped ? ' ・ 刷れない形を ' + j.skipped + ' 件 除外' : '')
+              + (j.invalidBarcodes ? ' ・ 刷れない形を ' + j.invalidBarcodes + ' 件 除外' : '')
+              + (j.blankRows ? ' ・ 空欄の行 ' + j.blankRows + ' 件' : '')
               + (naiyaku ? ' ・ 有効区分: ' + naiyaku : ''));
           setTimeout(() => location.reload(), 2500);
         } else {
