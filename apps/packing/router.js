@@ -560,6 +560,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     clientAt: req.body.client_at || null,
     reason: req.body.reason || null,
     jumped: !!req.body.jumped,
+    confirmCancel: !!req.body.confirm_cancel,   // found: 向かっているピッカーの依頼を取り下げる確認済み (PR-6)
     proposedMethod: req.body.proposed_method || null,
     sku: excessSku ?? (req.body.sku || null),
     actualSku,
@@ -959,6 +960,7 @@ router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
     repickUnavailableSeqs: Object.keys(s.stockoutBySlip || {}).map(Number),
     stockoutBySlip: s.stockoutBySlip || {},
     stockoutAckSeqs: s.stockoutAckSeqs || [],
+    repickBySlip: s.repickBySlip || {},   // 取下げ前の注意 (ピッカーが向かっているか) を最新状態で出す (PR-6)
     stockoutSeqs: s.slips.filter((x) => x.status === 'cancelled' && x.hold_reason === 'stockout').map((x) => x.seq),
     stockoutNotifyBySlip: s.stockoutNotifyBySlip || {},
     incidents: s.incidents,

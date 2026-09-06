@@ -455,6 +455,12 @@
         const r = await post(`/apps/packing/api/batches/${BATCH_ID}/events`, eventPayload(event, extra));
         if (!r) return;
         if (!r.ok) {
+          // found: 向かっているピッカーの依頼をサーバーが検出 → 実状態の文言で確認してから確認済みとして再送 (PR-6)
+          if (r.status === 409 && r.body.code === 'confirmation_required') {
+            sending = false;
+            if (confirm(r.body.error)) return send(event, { ...extra, confirm_cancel: true });
+            return;
+          }
           alert(r.body.error || `エラー (${r.status})`);
           // 409 = 状態が進んでいる (別端末・応答喪失後の再タップ等) → 画面を実状態に同期
           if (r.status === 409) location.reload();
@@ -745,6 +751,8 @@
       if (!confirm(`#${seq} を「出荷保留 (在庫なし)」にして閉じます。事務へ通知し、NE で出荷保留にしてもらいます。\n商品と納品書は出荷保留の棚へ置いてください。よろしいですか?`)) return;
       send('stockout_ack', { slip_seq: seq });
     }
+    // 取り下げ前の注意 (ピッカーが向かっている/届ける途中) は、サーバーが実状態で 409 confirmation_required を返し
+    // send() がその文言で確認する (例外処理監査 PR-6・D-3)。描画時の TASKS で先読みしない (古い状態で警告しない — Codex R3)
     function foundSlip(seq) {
       if (!confirm(`#${seq} の足りなかった商品が【全部】見つかったため、この伝票の再ピック依頼と不足の候補をすべて取り下げます。\n(1品目だけ見つかったときは、その商品の横の「見つかった」を押してください)\nよろしいですか?`)) return;
       send('found', { slip_seq: seq });

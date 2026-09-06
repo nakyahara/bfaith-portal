@@ -506,14 +506,22 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
     // 🔴ピッキング漏れバッチ: 梱包側でタスクが取下げられていたら操作させず、その場で畳む
     // (一覧のreconcileを経ずに /work を直接開いている端末への即時ガード — Codexレビュー)
     if (batch.origin === 'repick' && batch.pack_task_id && batch.status !== 'done') {
-      let ts = null;
+      let task = null;
       try {
-        ts = db.prepare('SELECT status FROM pk_pack_tasks WHERE id = ?').get(batch.pack_task_id)?.status ?? null;
-      } catch { ts = null; }   // pk_pack_tasks が無い環境は無視
-      if (ts === 'cancelled') {
+        task = db.prepare('SELECT status, close_reason, updated_at FROM pk_pack_tasks WHERE id = ?').get(batch.pack_task_id) || null;
+      } catch (e) {
+        // pk_pack_tasks が無い環境 (packing 無効) だけ無視。DB 障害・スキーマ不整合で「取下げ済みかどうか」を
+        // 確認できないまま操作を通さない (Codex PR-6 R3)
+        if (!/no such table: pk_pack_tasks/.test(String(e.message))) throw e;
+      }
+      if (task?.status === 'cancelled') {
         // ここで UPDATE しても throw でトランザクションごとロールバックされる (Codex 2巡目)。
-        // 操作は409で拒否し、実際の取消は一覧表示時の reconcileRepickBatches が行う
-        throw new PkError(409, 'repick_cancelled', 'この再ピック依頼は梱包側で取下げられました (一覧に戻ると整理されます)');
+        // 操作は409で拒否し、実際の取消は一覧表示時の reconcileRepickBatches が行う。
+        // 理由 (1階で見つかった) はバナーだけに頼らず、ここにも出す (バナーは他の端末の OK で消える — Codex PR-6 R1)
+        const why = task.close_reason === 'found'
+          ? 'この再ピック依頼は1階で商品が見つかったため取り下げられました — 持って行かなくてOK'
+          : 'この再ピック依頼は梱包側で取下げられました';
+        throw new PkError(409, 'repick_cancelled', `${why} (一覧に戻ると整理されます)`);
       }
     }
     // 🔴再ピックバッチの back/cancel: 1階が受け取り済みなら戻せない (タスクは終端・現物は1階にある)
@@ -1151,55 +1159,110 @@ export function getTodayProgress(workDate = jstToday()) {
  *    PkError 409 later_in_progress で**操作そのものを拒否**する — 黙って戻すと、取りに行った商品と
  *    取り消された記録がズレて二重ピックになる。呼び出し側のトランザクション内で使う (throw で巻き戻る)。
  */
+/**
+ * 梱包に結べていない「後で取りに行く」依頼 (pending_binding) の一覧 — 管理画面用 (例外処理監査 A-3・PR-6)。
+ * 再ピックバッチ内での「後で」(9/1 id=2) のように受注が無いと、どの画面にも出ずに迷子になる
+ */
+export function listLaterRequests({ status = 'pending_binding' } = {}) {
+  return getDB().prepare(`
+    SELECT lr.*, b.folder_name, b.tb_no, b.work_date, b.hikiate_class, b.origin AS batch_origin
+    FROM pk_later_requests lr JOIN pk_batches b ON b.id = lr.batch_id
+    WHERE lr.status = ? ORDER BY lr.id
+  `).all(status).map((r) => ({ ...r, locationLabel: r.from_location ? formatLocation(r.from_block, r.from_location) : null }));
+}
+
+/**
+ * 「後で取りに行く」依頼を管理者が取り下げる (PR-6)。配賦・未着手タスク・保留伝票・1階のバナーも一緒に戻す
+ * (back と同じ後始末)。ピッカーが既に対応を始めていれば 409 later_in_progress で拒否 (黙って消すと二重ピック)
+ */
+export function cancelLaterRequest(id, actor) {
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const lr = db.prepare('SELECT * FROM pk_later_requests WHERE id=?').get(id);
+    if (!lr) throw new PkError(404, 'not_found', '依頼が見つかりません');
+    if (lr.status === 'cancelled') return { id, status: 'cancelled', existed: true };
+    if (!['pending_binding', 'requested'].includes(lr.status)) {
+      throw new PkError(409, 'later_not_cancellable', 'この依頼は現在の状態では取り下げられません');
+    }
+    // 明細の配賦・バナーは明細単位なので、その明細の「最新の生きた依頼」であることを要求する
+    // (古い id を指定されて別の依頼を巻き込まない — Codex PR-6 R1 High)
+    const latest = db.prepare(`SELECT id FROM pk_later_requests
+      WHERE batch_id=? AND line_seq=? AND status IN ('pending_binding','requested') ORDER BY id DESC LIMIT 1`).get(lr.batch_id, lr.line_seq);
+    if (!latest || latest.id !== lr.id) {
+      throw new PkError(409, 'stale_later_request', '依頼の状態が更新されています。画面を再読み込みしてください');
+    }
+    undoLaterRequest(db, lr, now, { actor: actor || null });   // 指定した依頼だけ (着手済みなら 409)
+    undoShortageAllocations(db, lr.batch_id, lr.line_seq);
+    console.log(`[picking] later 依頼 #${id} を取り下げ (${actor || '-'}): batch=${lr.batch_id} line=${lr.line_seq} ${lr.sku} ×${lr.qty}`);
+    return { id, status: 'cancelled', existed: false };
+  }).immediate();
+}
+
 function undoShortageSideEffects(db, batchId, lineSeq, now) {
   const lr = db.prepare(`SELECT * FROM pk_later_requests
     WHERE batch_id=? AND line_seq=? AND status IN ('pending_binding','requested')
     ORDER BY id DESC LIMIT 1`).get(batchId, lineSeq);
-  if (lr) {
-    let tasks = [];
-    let mergedBusy = false;
-    try {
-      // cancelled 以外は全部見る — received (梱包者が受け取った後) や unavailable も
-      // 「対応が始まった」に含める (Codex High: 受領後に欠品記録だけ消せていた)
-      tasks = db.prepare(`SELECT * FROM pk_pack_tasks
-        WHERE later_request_id=? AND status != 'cancelled'`).all(lr.id);
-      // 梱包側の再ピックへ合流していた分も、その合流先が着手済みなら同じ扱い
-      // (全量合流だと自前のタスクが無く、ここを見ないと着手後に back できてしまう — Codex R7)
-      const mergedIds = String(lr.merged_task_ids || '').split(',').map((x) => Number(x)).filter((x) => x > 0);
-      if (mergedIds.length > 0) {
-        mergedBusy = db.prepare(`SELECT 1 FROM pk_pack_tasks
-          WHERE id IN (${mergedIds.map(() => '?').join(',')}) AND status NOT IN ('requested','cancelled')`)
-          .get(...mergedIds) != null;
-      }
-    } catch { /* packing無効環境 */ }
-    if (mergedBusy || tasks.some((t) => t.status !== 'requested')) {
-      throw new PkError(409, 'later_in_progress',
-        '「後で取りに行く」分は既に対応が始まっているため取り消せません');
+  if (lr) undoLaterRequest(db, lr, now);
+  undoShortageAllocations(db, batchId, lineSeq);
+}
+
+/**
+ * 「後で取りに行く」依頼 1件の後始末 (指定した依頼だけ — 同一明細の別の依頼を巻き込まない: Codex PR-6 R1 High)。
+ * その依頼のために作った未着手タスクを取消し、そのために保留にした梱包伝票を (他に生きた repick が無ければ) 戻す。
+ * 🚨 ピッカーが既に対応を始めている (自前タスクまたは合流先が requested/cancelled 以外) なら 409 later_in_progress で拒否
+ */
+function undoLaterRequest(db, lr, now, { actor = null } = {}) {
+  let tasks = [];
+  let mergedBusy = false;
+  try {
+    // cancelled 以外は全部見る — received (梱包者が受け取った後) や unavailable も
+    // 「対応が始まった」に含める (Codex High: 受領後に欠品記録だけ消せていた)
+    tasks = db.prepare(`SELECT * FROM pk_pack_tasks
+      WHERE later_request_id=? AND status != 'cancelled'`).all(lr.id);
+    // 梱包側の再ピックへ合流していた分も、その合流先が着手済みなら同じ扱い
+    // (全量合流だと自前のタスクが無く、ここを見ないと着手後に back できてしまう — Codex R7)
+    const mergedIds = String(lr.merged_task_ids || '').split(',').map((x) => Number(x)).filter((x) => x > 0);
+    if (mergedIds.length > 0) {
+      mergedBusy = db.prepare(`SELECT 1 FROM pk_pack_tasks
+        WHERE id IN (${mergedIds.map(() => '?').join(',')}) AND status NOT IN ('requested','cancelled')`)
+        .get(...mergedIds) != null;
     }
-    for (const t of tasks) {
-      // 未着手のみ取消 (CAS)。pk_pack_tasks は packing 所有だが、
-      // 未着手の依頼の取り下げは依頼者 (ピッカー) の操作として許す
-      db.prepare("UPDATE pk_pack_tasks SET status='cancelled', updated_at=? WHERE id=? AND status='requested'")
-        .run(now, t.id);
-      if (t.slip_seq != null) {
-        // この依頼のために保留にした梱包伝票は、他に生きた repick が無ければ戻す
-        const other = db.prepare(`SELECT 1 FROM pk_pack_tasks
-          WHERE batch_id=? AND slip_seq=? AND kind='repick'
-            AND status IN ('requested','claimed','fulfilled')`).get(t.batch_id, t.slip_seq);
-        if (!other) {
-          db.prepare(`UPDATE pk_pack_slips SET status='pending', hold_reason=NULL
-            WHERE batch_id=? AND seq=? AND status='held' AND hold_reason='repick'`)
-            .run(t.batch_id, t.slip_seq);
-        }
-      }
-    }
-    db.prepare("UPDATE pk_later_requests SET status='cancelled', updated_at=? WHERE id=?")
-      .run(now, lr.id);
-    // タスクは依頼と1対1なので、兄弟依頼 (別ロケ明細由来) のタスクには触らない
+  } catch (e) {
+    // packing 無効環境 (pk_pack_tasks が無い) だけ「タスク無し」として続行。それ以外 (BUSY・スキーマ不整合) は伝播 =
+    // 着手済みかどうか確認できないまま依頼と配賦だけ消さない (Codex PR-6 R2)
+    if (!/no such table: pk_pack_tasks/.test(String(e.message))) throw e;
   }
-  db.prepare('DELETE FROM pk_shortage_allocations WHERE batch_id=? AND line_seq=?')
-    .run(batchId, lineSeq);
-  // 1階へ出した欠品バナー (🕒/❌) も閉じる (取り消した欠品が1階に残らない)。同一トランザクション・失敗は伝播
+  if (mergedBusy || tasks.some((t) => t.status !== 'requested')) {
+    throw new PkError(409, 'later_in_progress',
+      '「後で取りに行く」分は既に対応が始まっているため取り消せません');
+  }
+  for (const t of tasks) {
+    // 未着手のみ取消 (CAS)。pk_pack_tasks は packing 所有だが、
+    // 未着手の依頼の取り下げは依頼者 (ピッカー) の操作として許す
+    db.prepare("UPDATE pk_pack_tasks SET status='cancelled', updated_at=? WHERE id=? AND status='requested'")
+      .run(now, t.id);
+    if (t.slip_seq != null) {
+      // この依頼のために保留にした梱包伝票は、他に生きた repick が無ければ戻す
+      const other = db.prepare(`SELECT 1 FROM pk_pack_tasks
+        WHERE batch_id=? AND slip_seq=? AND kind='repick'
+          AND status IN ('requested','claimed','fulfilled')`).get(t.batch_id, t.slip_seq);
+      if (!other) {
+        db.prepare(`UPDATE pk_pack_slips SET status='pending', hold_reason=NULL
+          WHERE batch_id=? AND seq=? AND status='held' AND hold_reason='repick'`)
+          .run(t.batch_id, t.slip_seq);
+      }
+    }
+  }
+  const changes = db.prepare(`UPDATE pk_later_requests SET status='cancelled', cancelled_by=?, cancelled_at=?, updated_at=?
+    WHERE id=? AND status IN ('pending_binding','requested')`).run(actor, now, now, lr.id).changes;
+  if (changes !== 1) throw new PkError(409, 'stale_later_request', '依頼の状態が更新されています。画面を再読み込みしてください');
+  // タスクは依頼と1対1なので、兄弟依頼 (別ロケ明細由来) のタスクには触らない
+}
+
+/** 明細の配賦を消し、1階へ出した欠品バナー (🕒/❌) も閉じる (取り消した欠品が1階に残らない)。同一トランザクション・失敗は伝播 */
+function undoShortageAllocations(db, batchId, lineSeq) {
+  db.prepare('DELETE FROM pk_shortage_allocations WHERE batch_id=? AND line_seq=?').run(batchId, lineSeq);
   resolveFloorAlertsByRef(`alloc:${batchId}:${lineSeq}:`, { prefix: true, dbh: db });
 }
 
@@ -1612,19 +1675,24 @@ export const FLOOR_ALERT_KINDS = {
   // ピッカーの欠品 (🕒 後で取りに行く / ❌ どこにもない) → 1階の全端末へ (例外処理監査 PR-2・Q2 決定 2026-09-05)。
   // 配賦した受注 (伝票) ごとに1本。ref_key='alloc:<batch>:<seq>:<ne_slip_no>' で back / 1階の処理と同時に閉じる
   picking_shortage: { direction: 'to_packing', message: null },
+  // 1階で「見つかった」→ ピッカーが既に取りに向かっている再ピックを取り下げたとき、3階の全端末へ (例外処理監査 PR-6・D-3)。
+  // task_id で集約。メッセージは依頼ごとに動的
+  repick_cancelled: { direction: 'to_picking', message: null },
 };
 
 /** アラート発報。同種の未確認が生きていれば重ねない (連打・二重依頼の集約)。 */
-export function createFloorAlert(kind, requestedBy, customMessage = null, link = null, taskId = null, refKey = null) {
+export function createFloorAlert(kind, requestedBy, customMessage = null, link = null, taskId = null, refKey = null, { dbh = null } = {}) {
   const def = FLOOR_ALERT_KINDS[kind];
   if (!def) throw new PkError(400, 'bad_kind', '不明なアラート種別です');
   const message = def.message || String(customMessage || '').slice(0, 160);
   if (!message) throw new PkError(400, 'no_message', 'メッセージが必要です');
-  const db = getDB();
+  // dbh = packing のトランザクション内から呼ぶときはその接続で (別接続だと書き込みロック待ちで詰まる)。
+  // 外側のトランザクションに参加中 (inTransaction) ならそのまま実行 = 外側の rollback に従う。単独なら自前で直列化 (Codex PR-6 R1)
+  const db = dbh || getDB();
   // 集約チェック+INSERTは同一トランザクション (Codex: 同時押下の重複防止)。
   // 集約キーは (kind, message) — repick_done は依頼ごとにメッセージが違うため別々に出る。
   // task_id 付き (在庫なし) は (kind, task_id)、ref_key 付き (欠品の配賦) は (kind, ref_key) で集約 = 未解決バナーは1本だけ
-  return db.transaction(() => {
+  const run = () => {
     const dup = taskId != null
       ? db.prepare(`SELECT id, message, link FROM pk_floor_alerts
           WHERE kind = ? AND task_id = ? AND acked_at IS NULL AND resolved_at IS NULL`).get(kind, taskId)
@@ -1647,7 +1715,9 @@ export function createFloorAlert(kind, requestedBy, customMessage = null, link =
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(def.direction, kind, message, requestedBy || null, utcNow(), link ? String(link).slice(0, 200) : null, taskId, refKey);
     return { id: Number(info.lastInsertRowid), existed: false };
-  }).immediate();
+  };
+  if (db.inTransaction) return run();
+  return db.transaction(run).immediate();
 }
 
 /** 表示対象 (未確認・未解決・4時間以内 — 古いバナーを翌日まで残さない)。 */

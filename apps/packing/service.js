@@ -15,7 +15,7 @@
 import crypto from 'node:crypto';
 import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
 // 欠品フローv2 PR2: 再取込 (overwrite) 前に、ピッカーの「後で取りに行く」の展開を依頼へ戻す
-import { resetLaterBindingsForPackBatch, resolveFloorAlertsByTask, resolveFloorAlertsByRef, reconcileShortageAlerts, shortageAllocRefKey } from '../picking/service.js';
+import { resetLaterBindingsForPackBatch, resolveFloorAlertsByTask, resolveFloorAlertsByRef, reconcileShortageAlerts, shortageAllocRefKey, createFloorAlert } from '../picking/service.js';
 import {
   getDB, getPackBatchByTbKey, utcNow, jstToday,
 } from './db.js';
@@ -824,7 +824,7 @@ function eventResult(batchId) {
  * 作業イベントの適用。1イベント = 1トランザクション。
  * @returns {{replayed?: boolean, ...eventResult}}
  */
-export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped, proposedMethod, sku, actualSku, actualName, qty, finalCount, manualCount, excludedCount, toPasCount, note }, worker) {
+export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped, proposedMethod, sku, actualSku, actualName, qty, finalCount, manualCount, excludedCount, toPasCount, note, confirmCancel = false }, worker) {
   if (!opId || typeof opId !== 'string' || opId.length > 64) {
     throw new PackError(400, 'bad_op_id', 'op_id が不正です');
   }
@@ -1098,7 +1098,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       // 完了済み伝票への不足/品違いも許可 (誤タップ後の気づき) — バッチ完了済みなら再オープン
       // (ラインバッチは再オープンしない: バッチの完了は件数記録 line_done で決まり、伝票の保留とは独立)
       requireSlipOp(['packing', 'done']);
-      taskNotify = applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actualName, qty }, worker, now).notify || null;
+      taskNotify = applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actualName, qty, confirmCancel }, worker, now).notify || null;
       if (!lineKind && batch.status === 'done' && ['shortage', 'wrong_item'].includes(event)) {
         db.prepare("UPDATE pk_pack_batches SET status='packing', finished_at=NULL, updated_at=? WHERE id=?")
           .run(now, batchId);
@@ -1659,7 +1659,7 @@ function foundPickingStockout(db, batch, slip, sku, now) {
  * applyEvent から呼ばれる (op_id 冪等・トランザクションは呼び出し側)。
  * @returns {{notify?: object}} router が fail-soft でGChat通知に使う情報
  */
-export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actualName, qty }, worker, now) {
+export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actualName, qty, confirmCancel = false }, worker, now) {
   const batchId = batch.id;
   if (event === 'shortage' || event === 'wrong_item') {
     if (!Number.isInteger(slipSeq) || slipSeq < 1) throw new PackError(400, 'bad_slip_seq', 'slip_seq が不正です');
@@ -1815,9 +1815,32 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
       const actionable = [...open, ...unavailable];
       const skuN = sku ? normSku(sku) : null;
       const targets = skuN ? actionable.filter((t) => normSku(t.sku) === skuN) : actionable;
+      // ピッカーが既に取りに向かっている (claimed) / 届ける途中 (fulfilled) の依頼は、画面の確認を経てから取り下げる
+      // (confirm_cancel)。画面の状態は描画時のスナップショットなので、サーバーが実状態で確認を要求する (Codex PR-6 R1 Medium)
+      const moving = targets.filter((t) => t.status === 'claimed' || t.status === 'fulfilled');
+      if (moving.length > 0 && !confirmCancel) {
+        const who = [...new Set(moving.map((t) => t.claimed_by).filter(Boolean))].join('・') || 'ピッカー';
+        throw new PackError(409, 'confirmation_required',
+          moving.some((t) => t.status === 'claimed')
+            ? `⚠ ${who} が既に取りに向かっています。取り下げると3階のバッチも取り消され、3階の画面に知らせが出ます。それでも取り下げますか?`
+            : `⚠ 3階 (${who}) は既に取り終えて、届ける途中かもしれません。それでも取り下げますか?`);
+      }
       for (const t of targets) {
-        db.prepare("UPDATE pk_pack_tasks SET status='cancelled', updated_at=? WHERE id=?").run(now, t.id);
+        // close_reason='found' = 1階で見つかった取下げ (3階の 409 文言・監査用)
+        db.prepare("UPDATE pk_pack_tasks SET status='cancelled', close_reason='found', updated_at=? WHERE id=?").run(now, t.id);
         if (t.status === 'unavailable') resolveFloorAlertsByTask(t.id, 'stockout', db);
+        // 向かっている/届ける途中の依頼を取り下げた → 3階の全端末に知らせる (例外処理監査 PR-6・D-3)。
+        // 同一トランザクション。失敗は伝播 = 知らせ無しに取消だけ確定させない (Codex PR-6 R1 High)
+        if (t.status === 'claimed' || t.status === 'fulfilled') {
+          const msg = `🔴 ${batch.folder_name || '-'} #${slipSeq} の再ピック「${t.product_name || t.sku} ×${t.req_qty}」は1階で見つかったため取り下げ — 持って行かなくてOK (${worker})`;
+          try {
+            createFloorAlert('repick_cancelled', worker, msg, '/apps/picking/', t.id, null, { dbh: db });
+          } catch (e) {
+            // picking のテーブルが無い環境 (梱包単体のテスト・picking 無効) だけ素通し。それ以外の失敗は伝播 = 取消だけ確定させない
+            if (!/no such table: pk_floor_alerts/.test(String(e.message))) throw e;
+            console.warn(`[packing] 取下げバナー: picking 無効環境のため出せません (task=${t.id})`);
+          }
+        }
       }
       db.prepare(`
         UPDATE pk_pack_incidents SET status='withdrawn', updated_at=?

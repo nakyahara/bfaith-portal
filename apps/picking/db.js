@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -342,6 +342,11 @@ const MIGRATIONS = {
     db.exec('ALTER TABLE pk_batches ADD COLUMN repick_reason TEXT');
     // 再ピックバッチ ↔ タスクの結合 (reconcile・同期) 用
     db.exec("CREATE INDEX IF NOT EXISTS idx_pk_batches_repick_task ON pk_batches(pack_task_id) WHERE origin = 'repick'");
+  },
+  // v17 (例外処理監査 PR-6): 「後で取りに行く」依頼を誰がいつ取り下げたか (管理画面からの取り下げ・back)
+  17: () => {
+    db.exec('ALTER TABLE pk_later_requests ADD COLUMN cancelled_by TEXT');
+    db.exec('ALTER TABLE pk_later_requests ADD COLUMN cancelled_at TEXT');
   },
 };
 
