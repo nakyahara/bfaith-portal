@@ -630,6 +630,7 @@
     <div class="hright">
       <button class="who work" id="workChip" hidden></button>
       <button class="who font" id="fontBtn" onclick="cycleFont()" aria-label="文字の大きさを変える" title="文字を大きく">あ⁺</button>
+      <button class="who font" id="helpBtn" onclick="location.href = BASE + '/manual'" aria-label="つかいかた" title="つかいかた (マニュアル)">📖</button>
       <button class="who" id="whoBtn" onclick="openGate()">👤 —</button>
       <button class="who" id="staffBtn" hidden></button>
     </div>
@@ -1001,7 +1002,8 @@
       <h2>👤 この iPad をつかう人をおしてください</h2>
       <p style="color:var(--sub);font-size:.9rem">記録に「だれがやったか」として残ります。作業する人は、はじめるときに別にえらべます (何人でも)。</p>
       <div id="gateNames"></div>
-      <p class="gnote">名前がないときは、職員の方が管理画面 (パソコン) から追加できます。</p>
+      <p class="gnote">名前がないときは、職員の方が管理画面 (パソコン) から追加できます。<br>
+        <a href="./manual" style="color:var(--accent);font-weight:700">📖 つかいかた (画像つきのマニュアル)</a></p>
     </div>
   </div>
 
