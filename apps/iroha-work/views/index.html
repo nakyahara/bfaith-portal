@@ -5119,6 +5119,8 @@ function openConsignAct(action, consignmentId) {
             '<span class="of">／ 残り ' + esc(String(left)) + ' 個</span></div>' +
           '<label style="margin-top:12px">そのうち使えるのは何個ですか（分からなければ空のまま）</label>' +
           '<div class="row"><input class="cgGood" type="number" inputmode="numeric" min="0" step="1" placeholder="—"><span class="of">個</span></div>' +
+          '<label style="margin-top:12px">ひとこと（任意。渡した数より多く返ってきたときは、その理由）</label>' +
+          '<input class="cgNote" type="text" maxlength="300" placeholder="例: 向こうで数え直したら 10 個多かった">' +
           '<p class="sub">一度に全部返ってこなくて構いません。残りは「あずけ中」に残ります。</p>'
   ) + '</div>' +
     '<div class="mbtns"><button class="btn" onclick="closeConsign()">やめる</button>' +
@@ -5150,6 +5152,9 @@ async function submitConsignAct() {
       if (!Number.isInteger(gv) || gv < 0) { $('#cgMsg').textContent = '❌ 使える数は 0 以上の整数で入れてください'; return; }
       body.good_qty = gv;
     }
+    // 渡した数より多く返ってきたときは理由が要る (サーバーが理由なしの超過を断る)
+    const noteEl = $('#cgBody').querySelector('.cgNote');
+    if (noteEl && String(noteEl.value).trim()) body.note = String(noteEl.value).trim();
     body.idempotency_key = cgTarget.key;   // 操作の最初に作った鍵。送り直しても同じ
   }
   cgSaving = true;

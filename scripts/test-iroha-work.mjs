@@ -5675,8 +5675,102 @@ console.log('\n[29] 外部施設にあずける — まとまりを割る・渡�
     ok(made.length === 1 && made[0].facility_code === 'rehas' && made[0].planned_qty === 30, '⭐新しいまとまりの担当もパレット (未定にしない)');
   }
 
+  // ⑦i ⭐分割 → 返却 → 「作り終えた」のあと、残りを再び預けられない (Codex R4 重大1)
+  {
+    const t = mk29('cg-11', 9973, 1000);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 400, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    let c = C.getConsignment(r.consignment.id);
+    C.recordReturn({ consignmentId: c.id, returnedQty: 400, goodQty: 400, expectVersion: c.version, idempotencyKey: 'ret-11-1' });
+    TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v29(t) });
+    const ready = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: v29(t), doneQty: 598, batchId: b0.id });
+    ok(ready.ok, '前提: 手元 598 個で作り終えた (カードは棚入待ち・手元のまとまりは作業中のまま)');
+    const again = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'rashinban', qty: 2, expectVersion: v29(t) });
+    ok(!again.ok && again.error === 'batch_closed', '⭐カードが棚入待ちなら、まとまりの状態に関わらず残り 2 個は預けられない');
+    const m = C.consignableByBatch(db, [b0.id]).get(b0.id);
+    ok(m.max === 0 && /棚入待ち/.test(m.why), '一覧の「渡せる数」も 0 で理由が出る');
+  }
+
+  // ⑦j ⭐取消・中止で終了しようとしても、外にあるぶんが残っていれば断る / 終了ずみカードの預けは進めない (Codex R4 重大2)
+  {
+    const t = mk29('cg-12', 9974, 300);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    const closed = TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'cancelled', expectVersion: v29(t), isStaff: true, actor: 'たにがわ' });
+    ok(!closed.ok && closed.error === 'consign_open', '⭐外に 100 個あるうちは「取消」で終了にもできない (親 closed・外 handed を作らない)');
+    // 終了ずみカードの預けを「渡した」へ進める経路も断る (DB を直に終了にして試す)
+    const t2 = mk29('cg-12b', 9975, 50);
+    const r2 = C.startConsignment({ taskId: t2, batchId: sole(t2)[0].id, facilityCode: 'workcenter', qty: 20, expectVersion: v29(t2) });
+    db.prepare("UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = '2026-09-07T00:00:00.000Z', version = version + 1 WHERE id = ?").run(t2);
+    const h = C.markHanded({ consignmentId: r2.consignment.id, expectVersion: r2.consignment.version });
+    ok(!h.ok && h.error === 'closed_task', '⭐終了したカードの預けは「渡した」へ進められない');
+    const cc = C.getConsignment(r2.consignment.id);
+    ok(C.cancelConsignment({ consignmentId: cc.id, expectVersion: cc.version }).ok, 'やめる (外にある数を減らす側) は通る');
+  }
+
+  // ⑦k ⭐精算で「返らなかった 2 個」は、渡せる数として復活しない (Codex R4 重大3)
+  {
+    const t = mk29('cg-13', 9976, 100);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    let c = C.getConsignment(r.consignment.id);
+    C.recordReturn({ consignmentId: c.id, returnedQty: 98, goodQty: 98, expectVersion: c.version, idempotencyKey: 'ret-13-1' });
+    c = C.getConsignment(c.id);
+    ok(C.settleConsignment({ consignmentId: c.id, missingQty: 2, expectVersion: c.version }).ok, '前提: 2 個は返らなかったとして精算');
+    // 職員が作業中に戻した (数はそのまま)
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'in_progress' WHERE id = ?").run(b0.id);
+    const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(b0.id);
+    ok(C.splittableMax(db, b) === 0, '⭐100 − 98 (できた) − 2 (返らなかった) = 0。存在しない 2 個を切り出せない');
+    ok(C.consignableByBatch(db, [b0.id]).get(b0.id).max === 0, '一覧の計算も同じ');
+  }
+
+  // ⑦l ⭐渡した数より多く返ってきたときは、理由を書けば受け取れる (Codex R4 中4)
+  {
+    const t = mk29('cg-14', 9977, 1000);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 1000, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    let c = C.getConsignment(r.consignment.id);
+    const no = C.recordReturn({ consignmentId: c.id, returnedQty: 1010, goodQty: 1010, expectVersion: c.version, idempotencyKey: 'ret-14-0' });
+    ok(!no.ok && no.error === 'too_many', '理由なしの 1010 個は断る (数え間違いの可能性が高い)');
+    const yes = C.recordReturn({ consignmentId: c.id, returnedQty: 1010, goodQty: 1010, note: '向こうで数え直したら 10 個多かった',
+      expectVersion: c.version, idempotencyKey: 'ret-14-1' });
+    ok(yes.ok && yes.settled, '⭐理由つきなら 1010 個を受け取れて、精算ずみになる');
+    ok(db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE id = ?').get(b0.id).good_qty === 1010, 'できた数は現物の 1010');
+    c = C.getConsignment(c.id);
+    ok(c.state === 'settled' && c.returned_total === 1010, '返ってきた合計 1010 が残る');
+    // 多く返ったあとの精算は「返らなかった数 0」だけ
+    const t2 = mk29('cg-14b', 9978, 100);
+    const r2 = C.startConsignment({ taskId: t2, batchId: sole(t2)[0].id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t2) });
+    C.markHanded({ consignmentId: r2.consignment.id, expectVersion: r2.consignment.version });
+    let c2 = C.getConsignment(r2.consignment.id);
+    C.recordReturn({ consignmentId: c2.id, returnedQty: 60, expectVersion: c2.version, idempotencyKey: 'ret-14-2' });
+    c2 = C.getConsignment(c2.id);
+    C.recordReturn({ consignmentId: c2.id, returnedQty: 45, note: '数え直し', expectVersion: c2.version, idempotencyKey: 'ret-14-3' });
+    c2 = C.getConsignment(c2.id);
+    ok(c2.state === 'settled' && c2.returned_total === 105, '分けて返ってきて合計が渡した数を超えても、理由があれば精算ずみ');
+  }
+
+  // ⑦m ⭐丸ごと預けて少なく渡したとき、手元に残るぶんの担当は元の拠点 (Codex R4 中5)
+  {
+    const t = TD.upsertTaskFromImport({ notion_page_id: 'cg-15', status: 'not_started', facility_code: 'rehas',
+      destination_id: 9979, product_name: 'パレット担当・丸ごと', qty: 100 }, { batchId: 'cg' }).id;
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    ok(sole(t).length === 1 && sole(t)[0].facility_code === 'workcenter', '前提: 丸ごとなので割らず担当が変わる');
+    C.markHanded({ consignmentId: r.consignment.id, qty: 98, expectVersion: r.consignment.version });
+    const left = sole(t).filter((b) => b.id !== b0.id);
+    ok(left.length === 1 && left[0].planned_qty === 2 && left[0].facility_code === 'rehas',
+      '⭐渡さなかった 2 個は「パレット」担当のまとまりとして手元に残る (未定にしない)');
+  }
+
   // ── 画面 ──
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(/class="cgNote"/.test(html) && /if \(noteEl && String\(noteEl\.value\)\.trim\(\)\) body\.note = /.test(html),
+    '返却に「ひとこと」を添えられる (渡した数より多く返ってきた理由)');
   ok(/function consignBtnHtml\(c\)/.test(html) && /if \(!can\('task\.consign'\)\) return '';/.test(html)
     && /🚚 外部にあずける/.test(html),
     '⭐「🚚 外部にあずける」は許可が無ければ描かない (利用者の画面には出さない — 要件 §U-7)');

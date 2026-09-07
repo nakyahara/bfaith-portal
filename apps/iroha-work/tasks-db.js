@@ -71,7 +71,7 @@ function rejectWhileConsignedOut(db, taskId) {
   const n = openConsignmentCount(db, taskId);
   if (n === 0) return null;
   return { ok: false, error: 'consign_open',
-    message: '外にあずけているぶんがまだ返ってきていません。返却を受け取る (または預けをやめる) までは、全部そろったことにできません' };
+    message: '外にあずけているぶんがまだ返ってきていません。返却を受け取る (または預けをやめる) までは、全部そろったことにも終了にもできません' };
 }
 
 /**
@@ -420,8 +420,9 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     // ⭐まとまりが 2 つ以上のカードで数を書き換えようとしたら、**書く前に**断る (Codex R1 重大)
     const split = rejectCountsOnSplitCard(db, t.id, !dq.skip || !lq.skip || !vn.skip, batchId ?? null);
     if (split) return { reject: split };
-    // ⭐外にあずけたぶんが残っているうちは「全部そろった」(棚入待ち) にも棚入完了にもしない (自己レビュー A)
-    if (to === 'ready_for_stocking' || (to === 'closed' && closeReason === 'stocked')) {
+    // ⭐外にあずけたぶんが残っているうちは「全部そろった」(棚入待ち) にも、**理由を問わず終了**にもしない (自己レビュー A / Codex R4 重大2)。
+    //   取消や中止で閉じると、親は closed なのに外に 100 個ある、という状態になる。先に預けをやめる・返却を受け取る
+    if (to === 'ready_for_stocking' || to === 'closed') {
       const out = rejectWhileConsignedOut(db, t.id);
       if (out) return { reject: out };
     }
