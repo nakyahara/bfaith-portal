@@ -23,6 +23,20 @@ router.use('/api/inventory', inventoryDecisionRouter);
 
 // ─── モール別手数料率 (監査PR-11: ハードコード→dim_mall.fee_rate_approx に集約。値は従来と同一) ───
 
+// ─── 消費税率 → 税込換算の係数 ───
+// 🚨 mirror_products.消費税率 は「小数」で入っている (0.1 = 10%, 0.08 = 8%)。
+//    NE が返す整数 (10 / 8) は rebuild-m-products.js の TAX_RATES で小数へ変換され、
+//    mirror へは変換せずそのまま送られる (sync-to-render.js は SELECT p.*)。
+//    2026-09-07 まで `1 + (消費税率 || 10) / 100` と書いていたため 1 + 0.1/100 = 1.001 にしかならず、
+//    税込原価がほぼ税抜のままだった (= 粗利が原価の約10%分 過大に出ていた)。
+//    整数を渡してはいけないので、整数が来たら未知の単位として fallback する。
+export const TAX_RATE_FALLBACK = 0.1;
+export function taxMultiplier(rate) {
+  // null / 0 (NE 未登録) と、想定外の単位 (1 以上 = 整数表記の疑い) は fallback
+  if (rate == null || rate <= 0 || rate >= 1) return 1 + TAX_RATE_FALLBACK;
+  return 1 + rate;
+}
+
 // ─── メイン画面 ───
 router.get('/', (req, res) => {
   // Codex PR3 R1 High 1 反映: feature flag OFF 時は EJS レンダリング時点でタブBを出さない
@@ -150,7 +164,9 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
             const prod = productMap.get(entry.ne_code);
             if (prod) {
               if (prod.原価) totalCost += prod.原価 * entry.qty;
-              taxRates.push(prod.消費税率 || 10);
+              // NE 未登録 (null/0) は従来どおり 10% 扱い。ここで fallback しないと
+              // 「税率が分かる構成品」と混在して hard fail になり、挙動が変わる
+              taxRates.push(prod.消費税率 || TAX_RATE_FALLBACK);
               if (prod.送料) totalShip += prod.送料 * entry.qty;
               if (productName === listingCode && prod.商品名) productName = prod.商品名;
             } else {
@@ -169,7 +185,7 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
             if (channel !== 'FBA') {
               shipping = totalShip * qty;
             }
-            taxRate = uniqueTaxRates.length === 1 ? 1 + uniqueTaxRates[0] / 100 : 1.1;
+            taxRate = taxMultiplier(uniqueTaxRates[0]);
             costSource = 'SKU→NE';
           }
         }
@@ -187,7 +203,7 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
 
       if (prod) {
         costExTax = (prod.原価 || 0) * qty;
-        taxRate = 1 + (prod.消費税率 || 10) / 100;
+        taxRate = taxMultiplier(prod.消費税率);
         shipping = (prod.送料 || 0) * qty;
         productName = prod.商品名 || listingCode;
         if (costSource === '不明') costSource = prod.原価ソース || 'NE';
