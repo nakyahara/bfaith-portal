@@ -5967,6 +5967,43 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
     ok(!closed.ok && closed.error === 'closed_task', '終了したカードのまとまりは変えられない');
   }
 
+  // ⑥ ⭐「作業をはじめる」で手元のまとまりも作業中に (外部に預けたぶんは触らない)
+  {
+    const t = mk('bp-6', 9986, 500);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 200, expectVersion: v(t) });
+    const away = bs(t).find((b) => b.facility_code === 'workcenter');
+    ok(ws(b0.id) === 'not_started' && ws(away.id) === 'not_started', '前提: どちらもまだ未着手 (渡す前)');
+    ok(TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v(t) }).ok, '作業をはじめる');
+    ok(ws(b0.id) === 'in_progress', '⭐手元 (いろは) のまとまりも作業中になる');
+    ok(ws(away.id) === 'not_started', '⭐これから渡すぶんは触らない (「渡した」ときに作業中になる)');
+    // パレット担当 (物を持ち帰らない) も手元あつかい
+    const t2 = TD.upsertTaskFromImport({ notion_page_id: 'bp-6b', status: 'not_started', facility_code: 'rehas',
+      destination_id: 9987, product_name: 'パレット担当', qty: 100 }, { batchId: 'bp' }).id;
+    TD.changeTaskStatus({ taskId: t2, to: 'in_progress', expectVersion: v(t2) });
+    ok(ws(bs(t2)[0].id) === 'in_progress', 'パレットのぶんも手元 (offsite でない) なので作業中になる');
+  }
+
+  // ⑦ ⭐止まっている札が付いているうちは、返却で自動的に棚入待ちにしない (札が消えた理由を残せないため)
+  {
+    const t = mk('bp-7', 9988, 400);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 400, expectVersion: v(t) });
+    ok(bs(t).length === 1 && bs(t)[0].facility_code === 'workcenter', '前提: 丸ごと預けたのでまとまりは 1 つ');
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    const blocked = TD.setTaskBlock({ taskId: t, reason: 'label_shortage', expectVersion: v(t), actor: 'たにがわ' });
+    ok(blocked.ok && TD.getTask(t).blocked_reason === 'label_shortage', '前提: ラベル待ちの札を付けた');
+    let c1 = C.getConsignment(cg.consignment.id);
+    C.recordReturn({ consignmentId: c1.id, returnedQty: 400, goodQty: 398, expectVersion: c1.version, idempotencyKey: 'bp7-1' });
+    ok(ws(bs(t)[0].id) === 'ready_for_stocking', 'まとまりは棚入待ちになる');
+    ok(TD.getTask(t).status === 'in_progress', '⭐カードは作業中のまま (札が付いているので繰り上げない)');
+    ok(TD.getTask(t).blocked_reason === 'label_shortage', '⭐札も黙って消さない');
+    const cleared = TD.clearTaskBlock({ taskId: t, expectVersion: v(t), via: 'manual', actor: 'たにがわ' });
+    ok(cleared.ok, '札を外す');
+    ok(TD.getTask(t).status === 'ready_for_stocking', '⭐札を外したら、止めていた繰り上がりが反映される');
+    ok(TD.getTask(t).ready_at, '棚入待ちになった時刻も入る');
+  }
+
   // ── 画面 ──
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
   ok(/function batchesCardHtml\(c\)/.test(html) && /if \(bs\.length <= 1\) return '';/.test(html),

@@ -12,7 +12,8 @@ import {
 } from './tasks.js';
 import { ensureBatchForTask, syncSingleBatchStatus, recordBatchCounts, recomputeTaskDoneQty, soleBatchOfTask,
   recordStockingForTask, openConsignmentCount, deriveTaskStatus, batchConsignedOutCount, recordStocking,
-  listBatchesOfTask, syncAllBatchesStatus, canBatchTransition, batchTransitionNeedsStaff } from './batches.js';
+  listBatchesOfTask, syncAllBatchesStatus, canBatchTransition, batchTransitionNeedsStaff,
+  applyDerivedTaskStatus, startHomeBatches } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -455,6 +456,8 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     //   まとまりが 2 つ以上でも合わせる。合わせないと「カードは終了・まとまりは棚入待ち」が残る
     if (to === 'closed' || (t.status === 'closed' && to === 'in_progress')) syncAllBatchesStatus(db, t.id, next);
     else syncSingleBatchStatus(db, t.id, next);
+    // ⭐「作業をはじめる」= 手元のまとまりも作業中に (外部に預けたぶんは「渡した」ときに変わる)
+    if (to === 'in_progress' && t.status === 'not_started') startHomeBatches(db, t.id, now);
     // ⭐数はまとまりが正本。カードの done_qty はその合計に直す (要件 §AB-3)
     applyCountsToSoleBatch(db, t.id, { goodQty: dq.skip ? undefined : dq.value, lossQty: lq.skip ? undefined : lq.value, note: vn.skip ? undefined : vn.value },
       batchId ?? null);
@@ -690,6 +693,8 @@ function clearTaskBlockInTx(db, t, { via, actor = null, workerId = null, workerN
   if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
   safeLogTaskEvent({ taskId: t.id, action: 'task_unblocked', from: `${t.blocked_reason}${t.blocked_note ? ' (' + t.blocked_note + ')' : ''}`, to: via,
     workerId, workerName, deviceLabel, ok: true });
+  // ⭐札のせいで止めていた繰り上がりを反映する (札が付いている間は棚入待ちへ進めていない — §AB-1)
+  applyDerivedTaskStatus(db, t.id, now, actor);
   return { ok: true, task: getTask(t.id) };
 }
 
