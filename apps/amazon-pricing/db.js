@@ -110,6 +110,7 @@ export function createTables(db) {
     trigger           TEXT NOT NULL CHECK(trigger IN ('manual','page_open','test')),
     actor_id          TEXT NOT NULL,
     snapshot_date_jst TEXT,
+    input_fingerprint TEXT NOT NULL,
     rule_version      TEXT NOT NULL,
     status            TEXT NOT NULL CHECK(status IN ('running','success','failed')),
     listings_total    INTEGER,
@@ -117,6 +118,7 @@ export function createTables(db) {
     error             TEXT
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_ap_runs_snap ON ap_evaluation_runs(snapshot_date_jst, rule_version, status)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ap_runs_fp ON ap_evaluation_runs(input_fingerprint, rule_version, status)');
 
   db.exec(`CREATE TABLE IF NOT EXISTS ap_evaluations (
     decision_id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -179,7 +181,7 @@ export function createTables(db) {
       OLD.status = 'running' AND NEW.status IN ('success', 'failed')
       AND NEW.run_id IS OLD.run_id AND NEW.started_at IS OLD.started_at AND NEW.trigger IS OLD.trigger
       AND NEW.actor_id IS OLD.actor_id AND NEW.rule_version IS OLD.rule_version
-      AND NEW.snapshot_date_jst IS OLD.snapshot_date_jst
+      AND NEW.snapshot_date_jst IS OLD.snapshot_date_jst AND NEW.input_fingerprint IS OLD.input_fingerprint
     )
     BEGIN SELECT RAISE(ABORT, 'ap_evaluation_runs は running → success/failed の終了記録 (finished_at / listings_total / summary_json / error) 以外は書き換えられません'); END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS ap_evaluation_runs_no_delete BEFORE DELETE ON ap_evaluation_runs
@@ -369,10 +371,10 @@ export function countPolicyEvents(db) {
 
 // ─── 判定 (evaluations) ──────────────────────────────────
 
-export function insertRun(db, { trigger, actorId, snapshotDate, ruleVersion }) {
+export function insertRun(db, { trigger, actorId, snapshotDate, fingerprint, ruleVersion }) {
   const runId = newId('apr');
-  db.prepare(`INSERT INTO ap_evaluation_runs (run_id, started_at, trigger, actor_id, snapshot_date_jst, rule_version, status)
-    VALUES (?,?,?,?,?,?,'running')`).run(runId, nowIso(), trigger, actorId, snapshotDate ?? null, ruleVersion);
+  db.prepare(`INSERT INTO ap_evaluation_runs (run_id, started_at, trigger, actor_id, snapshot_date_jst, input_fingerprint, rule_version, status)
+    VALUES (?,?,?,?,?,?,?,'running')`).run(runId, nowIso(), trigger, actorId, snapshotDate ?? null, fingerprint ?? '-', ruleVersion);
   return runId;
 }
 
@@ -388,7 +390,15 @@ export function getRun(db, runId) {
   return { ...r, summary: r.summary_json ? JSON.parse(r.summary_json) : null };
 }
 
-/** その日のスナップショット・そのルール版で成功した run (あれば)。null 日付は IS で比較する */
+/** 同じ入力 (指紋)・そのルール版で成功した run (あれば) */
+export function runForInputs(db, fingerprint, ruleVersion) {
+  const r = db.prepare(`SELECT * FROM ap_evaluation_runs
+    WHERE input_fingerprint = ? AND rule_version = ? AND status = 'success'
+    ORDER BY started_at DESC LIMIT 1`).get(fingerprint, ruleVersion);
+  return r ? { ...r, summary: r.summary_json ? JSON.parse(r.summary_json) : null } : null;
+}
+
+/** その日のスナップショット・そのルール版で最後に成功した run (画面の表示用) */
 export function runForSnapshot(db, snapshotDate, ruleVersion) {
   const r = db.prepare(`SELECT * FROM ap_evaluation_runs
     WHERE snapshot_date_jst IS ? AND rule_version = ? AND status = 'success'

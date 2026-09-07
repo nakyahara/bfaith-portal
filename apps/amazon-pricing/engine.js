@@ -81,7 +81,7 @@ export const FLAGS = {
   COST_UNKNOWN: '原価が未登録 (NE商品マスタ)',
   INPUT_INVALID: '入力に異常値がある (負の原価・範囲外の手数料率など。データ側を確認)',
   CHANNEL_UNKNOWN: '発送区分が FBA / 自己発送のどちらか分からない',
-  FEE_RATE_ASSUMED: '販売手数料率が取れていない・範囲外なので 15% と仮定',
+  FEE_RATE_ASSUMED: '販売手数料率が取れていない・範囲外 (概算粗利は 15% で仮計算。下限は出さない = 値下げしない)',
   FBA_FEE_UNKNOWN: 'FBA配送代行手数料が取れていない',
   SHIP_UNKNOWN: '自己発送の送料が未登録',
   FLOOR_CLAMP: '下限で止めた',
@@ -159,16 +159,16 @@ export function computeCosts(p) {
   if (!costKnown) flags.push('COST_UNKNOWN');
   if (cost.state === 'invalid') flags.push('INPUT_INVALID');
 
-  // 販売手数料率: **無い** なら保守値 15% で計算する (旗 FEE_RATE_ASSUMED)。
-  // **あるのに範囲外** (0・負・50% 超) はデータ異常 → 下限を出さない (Codex R3 High: 置き換えて計算すると値下げが出る)
+  // 販売手数料率: 無い・範囲外 (0・負・50% 超) のどちらも **下限は出さない** (= 値下げしない)。
+  // 15% の仮定は概算粗利の**表示**にだけ使う (Codex R5 High: 15% は安全側とは限らない。20% の商品なら下限が 133 円低く出る)
   let feeRate = num(p.referral_fee_rate);
   let feeRateAssumed = false;
   let feeRateValid = true;
   if (feeRate == null) {
-    feeRate = FALLBACK_REFERRAL_RATE; feeRateAssumed = true; flags.push('FEE_RATE_ASSUMED');
+    feeRateValid = false; feeRate = FALLBACK_REFERRAL_RATE; feeRateAssumed = true; flags.push('FEE_RATE_ASSUMED');
   } else if (feeRate < REFERRAL_RATE_MIN || feeRate > REFERRAL_RATE_MAX) {
     feeRateValid = false; flags.push('INPUT_INVALID');
-    feeRate = FALLBACK_REFERRAL_RATE; feeRateAssumed = true; flags.push('FEE_RATE_ASSUMED'); // 概算粗利の表示用にだけ使う
+    feeRate = FALLBACK_REFERRAL_RATE; feeRateAssumed = true; flags.push('FEE_RATE_ASSUMED');
   }
 
   // 固定費。不明・異常なものがあれば「下限は計算できない」に倒す (0 で埋めると下限が低く出て、値下げを通してしまう)

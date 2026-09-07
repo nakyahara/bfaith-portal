@@ -12,8 +12,8 @@
  * (2 人が同時に開いても、後の方は前の run を見て skip する)。
  */
 import { RULE_VERSION, evaluateListing, describeInputs } from './engine.js';
-import { loadListings, mirrorTablesAvailable } from './read-model.js';
-import { insertRun, finishRun, getRun, runForSnapshot, insertEvaluations } from './db.js';
+import { loadListings, mirrorTablesAvailable, inputFingerprint } from './read-model.js';
+import { insertRun, finishRun, getRun, runForInputs, insertEvaluations } from './db.js';
 
 /** 360 行 → エンジン入力 */
 export function inputOf(row) {
@@ -50,12 +50,13 @@ export function runEvaluation(db, { trigger, actorId, force = false }) {
   }
   const tx = db.transaction(() => {
     const rows = loadListings(db);
-    const snapshotDate = rows.find((r) => r.snapshot_date_jst)?.snapshot_date_jst ?? null;
+    const { snapshotDate, fingerprint } = inputFingerprint(db);
     if (!force) {
-      const existing = runForSnapshot(db, snapshotDate, RULE_VERSION);
+      // 同じ入力 (日付 + 行数 + 同期時刻) に対する成功 run があれば作らない。同期の途中と後は別の入力として扱う
+      const existing = runForInputs(db, fingerprint, RULE_VERSION);
       if (existing) return { skipped: true, run: existing };
     }
-    const runId = insertRun(db, { trigger, actorId, snapshotDate, ruleVersion: RULE_VERSION });
+    const runId = insertRun(db, { trigger, actorId, snapshotDate, fingerprint, ruleVersion: RULE_VERSION });
     // ★判定の保存は内側の savepoint に分ける。失敗したらそこだけ巻き戻し、run 自体は failed として**残す**
     //   (外側で throw すると run の INSERT ごとロールバックされ、失敗した事実が消える — Codex R1 Medium)
     const inner = db.transaction(() => {

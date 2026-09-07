@@ -107,6 +107,25 @@ export function priceHistory(db, sku, days = 90) {
      ORDER BY date_jst DESC`).all(sku, `-${days} days`);
 }
 
+/**
+ * 判定の入力がどの状態だったかを表す指紋。同じ日でも同期の途中で開いた run と、同期が終わったあとの run を区別する
+ * (Codex R5 Medium: 日付だけを鍵にすると、途中の状態で作った run が「今日はもう作った」として残り続ける)。
+ * 材料: 最新日の価格行数と最終同期時刻、手数料の行数と最終取得時刻、原価突合の行数と最終同期時刻
+ */
+export function inputFingerprint(db) {
+  const snap = db.prepare(`SELECT MAX(date_jst) AS d,
+      (SELECT COUNT(*) FROM mirror_amazon_price_snapshot_daily WHERE date_jst = (SELECT MAX(date_jst) FROM mirror_amazon_price_snapshot_daily)) AS n,
+      (SELECT MAX(synced_at) FROM mirror_amazon_price_snapshot_daily WHERE date_jst = (SELECT MAX(date_jst) FROM mirror_amazon_price_snapshot_daily)) AS t
+    FROM mirror_amazon_price_snapshot_daily`).get();
+  const fees = db.prepare('SELECT COUNT(*) AS n, MAX(fetched_at) AS t FROM mirror_amazon_sku_fees').get();
+  const res = db.prepare('SELECT COUNT(*) AS n, MAX(synced_at) AS t FROM mirror_sku_resolved').get();
+  const prod = db.prepare('SELECT COUNT(*) AS n, MAX(updated_at) AS t FROM mirror_products').get();
+  return {
+    snapshotDate: snap?.d ?? null,
+    fingerprint: [snap?.d ?? '-', snap?.n ?? 0, snap?.t ?? '-', fees?.n ?? 0, fees?.t ?? '-', res?.n ?? 0, res?.t ?? '-', prod?.n ?? 0, prod?.t ?? '-'].join('|'),
+  };
+}
+
 /** データの鮮度 (画面の「今日のデータ」欄) */
 export function dataFreshness(db) {
   const snap = db.prepare('SELECT MAX(date_jst) AS d, COUNT(*) AS n FROM mirror_amazon_price_snapshot_daily WHERE date_jst = (SELECT MAX(date_jst) FROM mirror_amazon_price_snapshot_daily)').get();

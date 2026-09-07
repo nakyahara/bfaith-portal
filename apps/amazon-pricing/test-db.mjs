@@ -194,11 +194,17 @@ console.log('\n── 判定 run (シャドー) ──');
   ok(r.summary.by_action.keep === 2 && r.summary.by_action.hold === 1 && r.summary.by_action.lower === 1 && r.summary.no_policy === 2, `  summary: ${JSON.stringify(r.summary.by_action)} / 方針なし ${r.summary.no_policy}`);
 
   const again = runEvaluation(db, { trigger: 'test', actorId: 't' });
-  ok(again.skipped && again.run.run_id === r.run.run_id, '同じ日のスナップショットには 2 本目を作らない (skip)');
+  ok(again.skipped && again.run.run_id === r.run.run_id, '同じ入力 (同じ日・同じ同期状態) には 2 本目を作らない (skip)');
+  // Codex R5 Medium: 同じ日でも同期が進んで入力が変わったら (行が増えた・同期時刻が進んだ) 作り直す
+  db.prepare(`UPDATE mirror_amazon_price_snapshot_daily SET my_price = 2050, synced_at = '2026-09-07T05:00:00.000Z' WHERE date_jst = '2026-09-07' AND seller_sku = 'PR_FBA1 '`).run();
+  const afterSync = runEvaluation(db, { trigger: 'test', actorId: 't' });
+  ok(!afterSync.skipped && afterSync.run.run_id !== r.run.run_id, '同じ日でも同期が進めば (synced_at が変わる) 新しい run を作る');
+  ok(afterSync.run.input_fingerprint !== r.run.input_fingerprint && afterSync.run.snapshot_date_jst === '2026-09-07', '  指紋が違い、日付は同じ');
+  ok(evaluationsOfRun(db, afterSync.run.run_id).find((e) => e.seller_sku === 'PR_FBA1 ').current_price === 2050, '  新しい価格で判定している');
   const forced = runEvaluation(db, { trigger: 'test', actorId: 't', force: true });
   ok(!forced.skipped && forced.run.run_id !== r.run.run_id, 'force なら作り直す');
   ok(runForSnapshot(db, '2026-09-07', RULE_VERSION).run_id === forced.run.run_id, '  最新の成功 run が返る');
-  ok(listRuns(db).length === 2, '  run は 2 本');
+  ok(listRuns(db).length === 3, '  run は 3 本 (最初・同期後・force)');
 
   // autonomy_level は 0 以外を入れられない (実行段階が無いことを表で示す)
   throws(() => db.prepare(`INSERT INTO ap_evaluations (run_id, seller_sku, evaluated_at, rule_version, autonomy_level, action, reason_code, reason_text, inputs_json)
@@ -215,10 +221,10 @@ console.log('\n── 判定 run (シャドー) ──');
   throws(() => db.prepare(`DELETE FROM ap_evaluation_runs WHERE run_id = ?`).run(r.run.run_id), '削除できません', 'run の DELETE は落ちる');
   throws(() => db.prepare(`UPDATE ap_evaluation_runs SET trigger = 'manual' WHERE run_id = ?`).run(r.run.run_id), '終了記録', '終わった run の書き換えは落ちる');
   // Codex R1 Medium: running の run でも「終了の記録」以外は書き換えられない
-  db.prepare(`INSERT INTO ap_evaluation_runs (run_id, started_at, trigger, actor_id, snapshot_date_jst, rule_version, status) VALUES ('apr-running', ?, 'test', 't', '2026-09-07', ?, 'running')`).run(T, RULE_VERSION);
+  db.prepare(`INSERT INTO ap_evaluation_runs (run_id, started_at, trigger, actor_id, snapshot_date_jst, input_fingerprint, rule_version, status) VALUES ('apr-running', ?, 'test', 't', '2026-09-07', 'fp', ?, 'running')`).run(T, RULE_VERSION);
   throws(() => db.prepare(`UPDATE ap_evaluation_runs SET snapshot_date_jst = '2099-01-01' WHERE run_id = 'apr-running'`).run(), '終了記録', 'running の run の snapshot を変える UPDATE は落ちる');
   throws(() => db.prepare(`UPDATE ap_evaluation_runs SET status = 'running', listings_total = 999 WHERE run_id = 'apr-running'`).run(), '終了記録', 'running → running は落ちる');
-  throws(() => db.prepare(`INSERT OR REPLACE INTO ap_evaluation_runs (run_id, started_at, trigger, actor_id, rule_version, status) VALUES ('apr-running', ?, 'manual', 'x', ?, 'success')`).run(T, RULE_VERSION), '置き換え禁止', 'run の INSERT OR REPLACE は落ちる');
+  throws(() => db.prepare(`INSERT OR REPLACE INTO ap_evaluation_runs (run_id, started_at, trigger, actor_id, input_fingerprint, rule_version, status) VALUES ('apr-running', ?, 'manual', 'x', 'fp', ?, 'success')`).run(T, RULE_VERSION), '置き換え禁止', 'run の INSERT OR REPLACE は落ちる');
   db.prepare(`UPDATE ap_evaluation_runs SET status = 'failed', finished_at = ?, error = 'test' WHERE run_id = 'apr-running'`).run(T);
   ok(db.prepare(`SELECT status FROM ap_evaluation_runs WHERE run_id = 'apr-running'`).get().status === 'failed', '  running → failed (終了の記録) は通る');
 
@@ -249,7 +255,7 @@ console.log('\n── 採点 (人のフィードバック) ──');
   throws(() => addReview(db, { decisionId: target.decision_id, reviewerId: 'x', verdict: 'agree', comment: 'あ'.repeat(501) }), '500 文字', 'ひとこと 501 文字は拒否 (黙って切らない)');
   throws(() => db.prepare(`DELETE FROM ap_evaluation_reviews`).run(), 'DELETE 禁止', '採点の DELETE は落ちる');
   const forSku = evaluationsForSku(db, 'PR_FBA1 ');
-  ok(forSku.length === 2 && forSku[0].decision_id > forSku[1].decision_id, 'SKU 別の判定履歴 (新しい順)');
+  ok(forSku.length === 3 && forSku[0].decision_id > forSku[1].decision_id, 'SKU 別の判定履歴 (新しい順・3 run ぶん)');
 }
 
 db.close();
