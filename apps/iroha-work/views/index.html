@@ -1988,7 +1988,8 @@ function bcardHtml(c, status) {
     c.plan_hours != null ? '⏱ ' + approxHours(c.plan_hours) : null,
     c.external_ready ? '📦 外部に出せます' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
-    c.split && c.away ? '🚚 あずけ中 ' + c.away.qty + ' 個' + (c.away.due ? ' ' + fmtMd(c.away.due) + 'まで' : '') : null,
+    c.split && c.away ? '🚚 ' + (c.away.handed ? 'あずけ中 ' : '渡す予定 ') + c.away.qty + ' 個'
+      + (c.away.due ? ' ' + fmtMd(c.away.due) + 'まで' : '') : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
   // ⭐2 段に分ける。上 = 画像と文字、下 = 札とボタン。
   //   下の段は**カードの幅いっぱい**を使う (画像の右に押し込むと 1 つずつ行を使ってカードが縦に伸び、

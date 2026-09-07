@@ -322,6 +322,10 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       COUNT(*) n, MIN(due_date) due
     FROM f_iroha_consignments WHERE state IN ('planned','prepared','handed') GROUP BY batch_id`)
     .all().map((r) => [r.batch_id, r]));
+  // ⭐**もう物が手を離れたか** (handed)。明日の計画から外すのはこちらで決める (Codex R2 中1)。
+  //   渡す予定・用意ずみのうちは物は いろはにあり、やめることもできるので計画に残す
+  const handedOut = new Set(getDB().prepare("SELECT DISTINCT batch_id FROM f_iroha_consignments WHERE state = 'handed'")
+    .all().map((r) => r.batch_id));
   const today = jstToday();
   const tomorrow = jstTomorrow(today);
 
@@ -370,8 +374,10 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
           counted: b.good_qty_source === 'counted',
           // ⭐まだ外にあるぶんは、人が「作り終えた」を押せない (返却を受け取ると棚入待ちになる)
           consigned_out: outByBatch.has(b.id),
+          handed_out: handedOut.has(b.id),
           away: outByBatch.has(b.id)
-            ? { qty: outByBatch.get(b.id).qty, count: outByBatch.get(b.id).n, due: outByBatch.get(b.id).due || null } : null,
+            ? { qty: outByBatch.get(b.id).qty, count: outByBatch.get(b.id).n, due: outByBatch.get(b.id).due || null,
+                handed: handedOut.has(b.id) } : null,
           consignable_max: cg.max, consignable_why: cg.why };
       }),
       hold_memo: r.hold_memo || null,
@@ -433,9 +439,10 @@ const BATCH_STATUS_LABEL = { not_started: '未着手', in_progress: '作業中',
  * ⭐id はカードのまま。詳細を開く・写真・作業時間はカード単位なので、行が分かれても同じカードを指す。
  *   行を見分けるのは row_key。
  *
- * ⭐**明日の計画に出すか** (plannable) は「拠点が外部か」ではなく**もう外に渡したか**で決める
- * (Codex R1 中1)。カードごと ワークセンター担当のカードは、いつ出すかを決めるために計画に出る
- * (今までどおり)。すでに渡したぶんは、いろはが明日やる作業ではないので出さない。
+ * ⭐**明日の計画に出すか** (plannable) は「拠点が外部か」ではなく**もう物が手を離れたか (handed)**
+ * で決める (Codex R1 中1 / R2 中1)。カードごと ワークセンター担当のカードは、いつ出すかを決めるために
+ * 計画に出る (今までどおり)。**渡す予定・箱とラベルを用意ずみ のうちは物は いろはにある**ので計画に残り、
+ * 渡した時点で外れる。
  * ⭐棚に入れ終わったまとまりも出さない (もう終わっているぶん — Codex R1 中2)。
  *
  * @param {boolean} forPlan 明日の計画・上のゲージ用 (渡したぶん・棚に入れたぶんを外す)
@@ -446,7 +453,7 @@ export function expandBatchRows(cards, { forPlan = false } = {}) {
     const bs = (c.batches || []).filter((b) => b.work_status !== 'cancelled');
     if (bs.length <= 1) {
       const only = bs[0] || null;
-      const plannable = !(only && (only.consigned_out || only.work_status === 'done'));
+      const plannable = !(only && (only.handed_out || only.work_status === 'done'));
       if (forPlan && !plannable) continue;
       rows.push({ ...c, row_key: String(c.id), batch_id: only ? only.id : null, split: false, plannable });
       continue;
@@ -456,7 +463,7 @@ export function expandBatchRows(cards, { forPlan = false } = {}) {
       // ⭐棚に入れ終わったぶんは一覧・ボードにも出さない (そのぶんの作業は終わっている)。
       //   カードは他の行で見えるし、全部終われば カードごと一覧から外れる
       if (b.work_status === 'done') continue;
-      const plannable = !b.consigned_out;
+      const plannable = !b.handed_out;
       if (forPlan && !plannable) continue;
       // ⭐数・箱・時間は**そのまとまりのぶん**。カード合計を出すと、400 個のぶんに 1000 個の箱数が出る。
       //   箱数は Z ロケの実在庫で代用しない (どちらのまとまりのぶんか分けられないため)
