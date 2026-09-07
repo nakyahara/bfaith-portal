@@ -73,12 +73,21 @@ const EXPIRED_QUOTA_RATIO = 0.25;
  * 🚨 同じ優先度のなかは**古い順** (前の晩に回されたものが先) にする。
  *    入力順のままだと、先頭側が毎晩変わるときに末尾側が永久に進まない。
  */
-export function allocateFetchBudget(need, maxFetch, { expiredRatio = EXPIRED_QUOTA_RATIO } = {}) {
+export function allocateFetchBudget(need, maxFetch, { expiredRatio = EXPIRED_QUOTA_RATIO, queuedAt } = {}) {
   const isExpired = (n) => n.reason === 'expired';
-  // 古い順 = 前回の見積が古いもの / 見積が無いものを先に (待たされた順)
+  /**
+   * 並べ替えの鍵 = **いつから待っているか**。
+   *
+   * 🚨 見積が無いものを一律 -Infinity にすると、それらは全部同順位になり、
+   *    結局は入力順のままになる。新規が先頭に積まれ続けると、前の晩に
+   *    溢れた対象が毎晩選ばれない (Codex R10)。
+   *    待ち行列に入った時刻 → 無ければ前回取得時刻 の順で見る。
+   */
   const age = (n) => {
+    const q = Date.parse(queuedAt?.get(feeCacheKey(n.target)) ?? '');
+    if (Number.isFinite(q)) return q;
     const t = Date.parse(n.cached?.fetched_at ?? '');
-    return Number.isFinite(t) ? t : -Infinity;      // 見積が無いものが最優先
+    return Number.isFinite(t) ? t : 0;
   };
   const fresh = need.filter(n => !isExpired(n)).sort((a, b) => age(a) - age(b));
   const expired = need.filter(isExpired).sort((a, b) => age(a) - age(b));
@@ -169,6 +178,63 @@ export function retryAfterOf(failedAtIso, days) {
   const JST = 9 * 60 * 60 * 1000;
   const jstMidnight = Math.floor((t + JST) / 86400000) * 86400000 - JST;   // その日の 00:00 JST (UTC 表記)
   return new Date(jstMidnight + days * 86400000).toISOString();
+}
+
+/**
+ * 「いつから取得待ちか」を記録して返す (キー → ISO 時刻)。
+ *
+ * 🚨 見積が1件も無い対象は `fetched_at` を持たないので、そのままでは
+ *    どれが長く待っているか分からず、毎晩あとから来た新規に押しのけられる (Codex R10)。
+ *    初めて「取得が要る」と判定した時刻を残し、以後はそれを使う。
+ *    取れたら消すので、溜まり続けることはない。
+ */
+export function markQueued(db, need, now = new Date()) {
+  const queued = new Map();
+  const iso = now.toISOString();
+  const insert = db.prepare(`INSERT INTO amazon_fee_queue (fee_key, seller_sku, queued_at)
+                             VALUES (?, ?, ?) ON CONFLICT(fee_key) DO NOTHING`);
+  const existing = new Map();
+  try {
+    for (const r of db.prepare('SELECT fee_key, queued_at FROM amazon_fee_queue').all()) {
+      existing.set(r.fee_key, r.queued_at);
+    }
+  } catch { return queued; }
+  const tx = db.transaction((rows) => {
+    for (const n of rows) {
+      const key = feeCacheKey(n.target);
+      queued.set(key, existing.get(key) ?? iso);
+      if (!existing.has(key)) insert.run(key, n.target.seller_sku, iso);
+    }
+  });
+  tx(need);
+  return queued;
+}
+
+/** 取れた (あるいは対象から外れた) キーを待ち行列から消す */
+export function clearQueued(db, target) {
+  try { db.prepare('DELETE FROM amazon_fee_queue WHERE fee_key = ?').run(feeCacheKey(target)); }
+  catch { /* テーブルが無い環境 */ }
+}
+
+/**
+ * もう取得が要らなくなったキーを待ち行列から落とす。
+ *
+ * 🚨 これが無いと行が溜まり続ける。価格が変わるたびにキーが変わるので、
+ *    消さないと月単位で増え続ける。
+ *    「今夜キャッシュに当たらなかったキー」に無いものは、
+ *    取れた / 出品が消えた / 入力が変わった のどれかなので落としてよい。
+ *    失敗待ちのものは need に残っているので消えない (待ち位置を失わない)。
+ */
+export function pruneQueue(db, need) {
+  try {
+    const keep = new Set(need.map(n => feeCacheKey(n.target)));
+    const rows = db.prepare('SELECT fee_key FROM amazon_fee_queue').all();
+    const del = db.prepare('DELETE FROM amazon_fee_queue WHERE fee_key = ?');
+    const tx = db.transaction((keys) => { for (const k of keys) del.run(k); });
+    const gone = rows.map(r => r.fee_key).filter(k => !keep.has(k));
+    if (gone.length) tx(gone);
+    return gone.length;
+  } catch { return 0; }
 }
 
 /** 待ちの残っている失敗記録 (キー → 記録) */
@@ -413,7 +479,10 @@ export async function refreshFees(db, targets, deps = {}) {
     else attemptable.push(n);
   }
   const maxFetch = deps.maxFetch ?? FEE_MAX_FETCH_PER_RUN;
-  const need = allocateFetchBudget(attemptable, maxFetch);
+  // 「いつから待っているか」を残してから枠を配る (古い順に取るため)
+  pruneQueue(db, planned.need);   // もう要らないキーを落とす (溜め続けない)
+  const queuedAt = markQueued(db, attemptable, now());
+  const need = allocateFetchBudget(attemptable, maxFetch, { queuedAt });
   const deferred = attemptable.length - need.length;   // 上限で翌晩に回した数
 
   const callApi = deps.callFeesApi || defaultCallFeesApi;
@@ -480,7 +549,10 @@ export async function refreshFees(db, targets, deps = {}) {
       //    (FBA なのに FBAFees が無い等)。そのまま通すと 取得 → 使えない → 翌晩また取得
       //    を毎晩繰り返す (Codex R9-2)。使えないものは失敗と同じく待たせる
       const normalized = normalizeFeeEstimate(r.FeesEstimate, { fulfillment: chunk[j].in_fulfillment });
-      if (normalized.status === 'ok') clearFailure(db, chunk[j]);   // 直ったら記録を消す
+      if (normalized.status === 'ok') {
+        clearFailure(db, chunk[j]);    // 直ったら記録を消す
+        clearQueued(db, chunk[j]);     // 取れたので待ち行列から外す
+      }
       else unusable.push({ sku: chunk[j].seller_sku, status: normalized.status,
         attempts: recordFailure(db, chunk[j], `unusable:${normalized.status}`, now()) });
       const sellerIdFromResponse = r?.FeesEstimateIdentifier?.SellerId || null;

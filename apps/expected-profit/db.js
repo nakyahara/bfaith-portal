@@ -264,6 +264,16 @@ function createTables(db) {
     retry_after  TEXT NOT NULL
   )`);
 
+  // ─── 10. 取得待ちに入った時刻 (§16-10) ───
+  // 🚨 見積が1件も無い対象どうしでは「どれが長く待っているか」が分からない。
+  //    1晩の上限で溢れたときに、毎晩あとから来た新規に押しのけられ続ける
+  //    (Codex R10)。最初に待ちに入った時刻を残して、古い順に取る
+  db.exec(`CREATE TABLE IF NOT EXISTS amazon_fee_queue (
+    fee_key      TEXT PRIMARY KEY,     -- feeCacheKey() と同じキー
+    seller_sku   TEXT,
+    queued_at    TEXT NOT NULL         -- 最初に「取得が要る」と判定された時刻
+  )`);
+
   migrate(db);
 }
 

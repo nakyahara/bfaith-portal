@@ -18,7 +18,7 @@ const { planRefresh, buildFeeRequest, toEstimateRow, saveEstimates, loadCache, r
   validityOffsetDays, feeValidDays,
   BATCH_SIZE, BATCH_SLEEP_MS, SP_API_FEES_RATE_PER_SEC, SP_API_FEES_MAX_BATCH,
   looksLikeAsin, feeIdentifierOf, backoffDays, recordFailure, clearFailure, loadFailures,
-  allocateFetchBudget, retryAfterOf } = await import('./refresh-fees.js');
+  allocateFetchBudget, retryAfterOf, markQueued, clearQueued, pruneQueue } = await import('./refresh-fees.js');
 const { getSetting, setSetting, SETTING_AMAZON_SELLER_ID } = await import('./db.js');
 const forgetSeller = () => setSetting(db, SETTING_AMAZON_SELLER_ID, null);
 
@@ -831,18 +831,29 @@ await ta('[!] Success でも FBA なのに FBAFees が無ければ、待たせ�
   db.exec('DELETE FROM amazon_fee_failure');
 });
 
-await ta('ちゃんと使える見積が返れば待ち記録は消える', async () => {
+await ta('[!] 一度失敗したキーでも、使える見積が返れば待ち記録が消える', async () => {
+  // 🚨 記録が無い状態から始めると、clearFailure を外しても通ってしまう (Codex R10)。
+  //    同じキーで失敗させ、待ちが明けてから成功させて、記録が消えることを見る
   forgetSeller();
   db.exec('DELETE FROM amazon_fee_estimate');
   db.exec('DELETE FROM amazon_fee_failure');
   const t1 = target({ seller_sku: 'okFba', in_fulfillment: 'FBA' });
-  const r = await refreshFees(db, [t1], {
+
+  // 1晩目: FBAFees が無い = 使えない見積 → 待ち記録ができる
+  await refreshFees(db, [t1], {
     sleepMs: 0, now: () => new Date('2026-09-08T00:00:00Z'),
+    callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { sellerId: 'S1' }),
+  });
+  assert.equal(loadFailures(db).size, 1, '前提: 待ち記録ができている');
+
+  // 待ちが明けてから、ちゃんとした見積が返る
+  const r = await refreshFees(db, [t1], {
+    sleepMs: 0, now: () => new Date('2026-09-20T00:00:00Z'),
     callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { sellerId: 'S1', fba: 462 }),
   });
   assert.equal(r.unusable, 0);
   assert.equal(r.refreshed, 1);
-  assert.equal(loadFailures(db).size, 0);
+  assert.equal(loadFailures(db).size, 0, '直ったのに待ち記録が残っている (次の失敗で試行回数を引き継ぐ)');
 });
 
 console.log('');
@@ -894,6 +905,154 @@ await ta('[!] リトライのあとも次のバッチまで間隔をあける', 
     const gap = callTimes[i] - callTimes[i - 1];
     assert.ok(gap >= minGap, `${i}回目の間隔 ${gap}ms が ${minGap}ms を下回っている`);
   }
+});
+
+
+console.log('');
+console.log('待たされた順に取る (Codex R10-1: 見積が無いものどうしの飢餓)');
+
+t('[!] 見積が無いものどうしは「待ち行列に入った時刻」で並ぶ (入力順にしない)', () => {
+  // 🚨 一律 -Infinity にすると全部同順位 → 結局は入力順のまま。
+  //    新規が先頭に積まれ続けると、前の晩に溢れた対象が毎晩選ばれない
+  const waiting = nd('missing', 'waitingSince1日前');
+  const brandNew = nd('missing', 'brandNew');
+  const q = new Map([
+    [cacheKey(waiting.target), '2026-09-01T00:00:00Z'],
+    [cacheKey(brandNew.target), '2026-09-08T00:00:00Z'],
+  ]);
+  // 入力は「新規が先頭」の並び
+  const picked = allocateFetchBudget([brandNew, waiting], 1, { queuedAt: q });
+  assert.equal(picked[0].target.seller_sku, 'waitingSince1日前', '前から待っている方を先に取る');
+});
+
+t('待ち行列に無ければ前回取得時刻を使う', () => {
+  const a = nd('expired', 'old', '2026-01-01T00:00:00Z');
+  const b = nd('expired', 'new', '2026-09-01T00:00:00Z');
+  assert.equal(allocateFetchBudget([b, a], 1, { queuedAt: new Map() })[0].target.seller_sku, 'old');
+});
+
+await ta('[!] markQueued は最初の時刻を保ち、あとから来た新規に上書きされない', async () => {
+  db.exec('DELETE FROM amazon_fee_queue');
+  const t1 = nd('missing', 'q1');
+  const first = markQueued(db, [t1], new Date('2026-09-01T00:00:00Z'));
+  assert.equal(first.get(cacheKey(t1.target)), '2026-09-01T00:00:00.000Z');
+  // 翌晩も同じ対象が待ち続けている
+  const second = markQueued(db, [t1, nd('missing', 'q2')], new Date('2026-09-08T00:00:00Z'));
+  assert.equal(second.get(cacheKey(t1.target)), '2026-09-01T00:00:00.000Z', '待ち始めた時刻が上書きされている');
+  assert.equal(second.get(cacheKey(nd('missing', 'q2').target)), '2026-09-08T00:00:00.000Z');
+  db.exec('DELETE FROM amazon_fee_queue');
+});
+
+const queueSize = () => db.prepare('SELECT COUNT(*) c FROM amazon_fee_queue').get().c;
+
+await ta('[!] 取れたら待ち行列から消える (行を溜め続けない)', async () => {
+  // 🚨 価格が変わるたびにキーが変わるので、消さないと月単位で行が増え続ける
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  db.exec('DELETE FROM amazon_fee_queue');
+  const t1 = target({ seller_sku: 'queued1' });
+  await refreshFees(db, [t1], {
+    sleepMs: 0, now: () => new Date('2026-09-08T00:00:00Z'),
+    callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { sellerId: 'S1' }),
+  });
+  assert.equal(queueSize(), 0, '取れたのに待ち行列に残っている');
+});
+
+await ta('[!] 対象から外れたキーも落ちる (価格が変わった・出品が消えた)', async () => {
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  db.exec('DELETE FROM amazon_fee_queue');
+  // 1晩目: 上限0 なので取れず、待ち行列にだけ入る
+  const oldPrice = target({ seller_sku: 'moved', in_listing_price: 1000 });
+  await refreshFees(db, [oldPrice], {
+    sleepMs: 0, maxFetch: 0, now: () => new Date('2026-09-08T00:00:00Z'),
+    callFeesApi: async () => { throw new Error('叩かせない'); },
+  });
+  assert.equal(queueSize(), 1);
+  // 2晩目: 値段が変わった = 別キー。古いキーはもう要らない
+  const newPrice = target({ seller_sku: 'moved', in_listing_price: 1200 });
+  await refreshFees(db, [newPrice], {
+    sleepMs: 0, maxFetch: 0, now: () => new Date('2026-09-09T00:00:00Z'),
+    callFeesApi: async () => { throw new Error('叩かせない'); },
+  });
+  assert.equal(queueSize(), 1, '古いキーが落ちて、新しいキーだけになるはず');
+  assert.equal(db.prepare('SELECT queued_at FROM amazon_fee_queue').get().queued_at,
+    '2026-09-09T00:00:00.000Z', '新しいキーの待ち開始時刻');
+});
+
+await ta('[!] 失敗待ちのものは待ち行列から落とさない (待ち位置を失わない)', async () => {
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  db.exec('DELETE FROM amazon_fee_queue');
+  const t1 = target({ seller_sku: 'failWaiting' });
+  const failApi = async (body) => body.map(b => ({
+    Status: 'ClientError',
+    FeesEstimateIdentifier: { SellerInputIdentifier: b.FeesEstimateRequest.Identifier },
+    Error: { Message: 'bad' },
+  }));
+  await refreshFees(db, [t1], { sleepMs: 0, now: () => new Date('2026-09-08T00:00:00Z'), callFeesApi: failApi });
+  const queuedAt = db.prepare('SELECT queued_at FROM amazon_fee_queue').get()?.queued_at;
+  assert.ok(queuedAt, '失敗しても待ち行列には残る');
+  // 翌日: まだ待ち中
+  await refreshFees(db, [t1], {
+    sleepMs: 0, now: () => new Date('2026-09-08T02:00:00Z'),
+    callFeesApi: async () => { throw new Error('叩かせない'); },
+  });
+  assert.equal(db.prepare('SELECT queued_at FROM amazon_fee_queue').get()?.queued_at, queuedAt,
+    '失敗待ちの間に待ち開始時刻を失ってはいけない');
+  db.exec('DELETE FROM amazon_fee_failure');
+  db.exec('DELETE FROM amazon_fee_queue');
+});
+
+t('pruneQueue は残すキーを1つも消さない', () => {
+  db.exec('DELETE FROM amazon_fee_queue');
+  const a = nd('missing', 'keepA');
+  const b = nd('missing', 'keepB');
+  markQueued(db, [a, b], new Date('2026-09-08T00:00:00Z'));
+  assert.equal(queueSize(), 2);
+  assert.equal(pruneQueue(db, [a, b]), 0);
+  assert.equal(queueSize(), 2);
+  assert.equal(pruneQueue(db, [a]), 1);
+  assert.equal(queueSize(), 1);
+  db.exec('DELETE FROM amazon_fee_queue');
+});
+
+await ta('[!] 複数晩まわしても、前の晩に溢れた対象が必ず進む (飢餓しない)', async () => {
+  // 🚨 これが本命。毎晩「新規が先頭に積まれる」状況を再現して、
+  //    最初に待ちに入った対象が置き去りにならないことを見る
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  db.exec('DELETE FROM amazon_fee_queue');
+
+  const fetched = new Set();
+  const runNight = async (targets, iso) => {
+    await refreshFees(db, targets, {
+      sleepMs: 0, maxFetch: 20, now: () => new Date(iso),
+      callFeesApi: async (body) => body.map(b => {
+        fetched.add(String(b.FeesEstimateRequest.Identifier).split('|')[0]);
+        return feeResponse(b.FeesEstimateRequest.Identifier, { sellerId: 'S1' })[0];
+      }),
+    });
+  };
+
+  // 1晩目: 古い対象 40 件 (20件しか取れない)
+  const oldOnes = Array.from({ length: 40 }, (_, i) => target({ seller_sku: 'old' + i }));
+  await runNight(oldOnes, '2026-09-01T00:00:00Z');
+  const doneAfterNight1 = oldOnes.filter(t => fetched.has(t.seller_sku)).length;
+  assert.equal(doneAfterNight1, 20, '1晩目は上限どおり20件');
+
+  // 2〜4晩目: 毎晩 40 件の新規が**先頭に**積まれる
+  for (let night = 2; night <= 4; night++) {
+    const fresh = Array.from({ length: 40 }, (_, i) => target({ seller_sku: `new${night}_${i}` }));
+    await runNight([...fresh, ...oldOnes], `2026-09-0${night}T00:00:00Z`);
+  }
+  const doneAfterNight4 = oldOnes.filter(t => fetched.has(t.seller_sku)).length;
+  assert.equal(doneAfterNight4, 40,
+    `4晩まわせば古い40件は全部取れているはず (実際 ${doneAfterNight4})。新規に押しのけられている`);
 });
 
 db.close();
