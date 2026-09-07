@@ -5,7 +5,7 @@
  * 不変条件 (closed には close_reason/closed_at、止まっている理由 blocked_reason は未着手・作業中だけ …) は書く前に validateTaskInvariants で守る。
  * 状態変更は version の楽観ロック (2 台の iPad が同時に触っても後勝ちで壊さない) + 履歴 (f_iroha_app_events.task_id)。
  */
-import { getDB, startSessions, setMetaValue, logEvent, sourceOfTruth } from './db.js';
+import { getDB, startSessions, startCrewSession, setMetaValue, logEvent, sourceOfTruth } from './db.js';
 import {
   OPEN_STATUSES, CLOSE_REASONS, BLOCK_REASONS, BLOCK_LABEL, BLOCKABLE_STATUSES, LEGACY_ON_HOLD,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
@@ -1276,6 +1276,71 @@ export function _setStartTaskSessionHook(fn) { startTaskSessionHook = fn; }
  * @param worker 端末を操作している人 (状態変更の actor・ログに残る)
  * @param workers 実際に作業する人たち (複数可)。省略時は操作者ひとり
  */
+/**
+ * ⭐人数だけの作業をはじめる (要件 §AB-10)。パレット・ジョブサポ用。
+ *
+ * 個人の開始 (startTaskSession) と**同じ手順**を踏む — 止まっている札の確認、
+ * 未着手 → 作業中、手元のまとまりを作業中にする。違うのは記録の作り方だけ
+ * (個人名を持たず、拠点と人数で 1 行)。
+ *
+ * @param staff 操作した職員 (記録の「誰が押したか」。作業した人ではない)
+ */
+export function startTaskCrewSession({ taskId, staff, facilityCode, crewSize, batchId = null,
+  deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null }) {
+  const db = getDB();
+  const tx = db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    let t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
+    if (t.status === 'closed') {
+      return { ok: false, error: 'done_card', message: 'このカードは終了しています (やり直すなら職員が状態を戻してください)' };
+    }
+    if (t.blocked_reason) {
+      if (!clearBlock) {
+        const b = blockedOf(t);
+        return { ok: false, error: 'blocked', blocked: b, task: t,
+          message: `まだ「${b.label}」で止まっています。解消していれば、確認してから始められます` };
+      }
+      if (expectVersion == null) return { ok: false, error: 'bad_request', message: '確認した版 (expect_version) が必要です (画面を更新してください)' };
+      if (Number(expectVersion) !== t.version) {
+        return { ok: false, error: 'conflict', current: t, blocked: blockedOf(t),
+          message: '止まっている理由が変わっています。もう一度確かめてください' };
+      }
+      const c = clearTaskBlockInTx(db, t, { via: 'start', actor: `${staff.display_name} (いろはアプリ)`,
+        workerId: staff.id, workerName: staff.display_name, deviceLabel });
+      if (!c.ok) return c;
+      t = c.task;
+    }
+    const r = startCrewSession({ taskId: t.id, facilityCode, crewSize, batchId,
+      productCode: t.product_code, title: t.product_name, deviceLabel,
+      masterSnapshot: snapshotOf ? snapshotOf(t) : undefined });
+    // ⭐記録には**押した職員**と「どの拠点の何人か」を残す。作業した人の名前は持たない
+    if (!r.already) {
+      safeLogTaskEvent({ taskId: t.id, action: 'session_start', workerId: staff.id, workerName: staff.display_name,
+        deviceLabel, to: `crew ${facilityCode} ${crewSize}人`, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    }
+    if (!r.ok) return r;
+    if (startTaskSessionHook) startTaskSessionHook(t);
+    startHomeBatches(db, t.id, utcNow());
+    let task = t;
+    if (t.status === 'not_started') {
+      const cs = changeTaskStatus({ taskId: t.id, to: 'in_progress', expectVersion: t.version,
+        actor: `${staff.display_name} (いろはアプリ)`, workerId: staff.id, workerName: staff.display_name, deviceLabel });
+      if (!cs.ok) throw Object.assign(new Error(cs.message || '状態を変更できませんでした'), { taskResult: cs });
+      task = cs.task;
+    }
+    return { ok: true, already: !!r.already, session: r.session, sessionId: r.session.id,
+      startedAt: r.session.startedAt, task: getTask(task.id) };
+  });
+  try {
+    return tx.immediate();
+  } catch (e) {
+    if (e && e.taskResult) return e.taskResult;
+    throw e;
+  }
+}
+
 export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null }) {
   const db = getDB();
   const crew = (Array.isArray(workers) && workers.length) ? workers : [worker];

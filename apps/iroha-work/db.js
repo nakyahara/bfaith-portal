@@ -147,8 +147,18 @@ const sessionsDDL = (name) => `
       task_id        INTEGER REFERENCES f_iroha_tasks(id),
       product_code   TEXT,
       title_snapshot TEXT,
-      worker_id      INTEGER NOT NULL,
-      worker_name    TEXT NOT NULL,
+      -- ⭐個人の記録は worker_id + worker_name。**人数だけの記録では両方 NULL** (要件 §AB-10)。
+      --   パレット・ジョブサポは いろは の中で作業するが、こちらは個人名を持たない
+      worker_id      INTEGER,
+      worker_name    TEXT,
+      -- ⭐人数だけの記録の「誰が」= 拠点。「パレット 3 人ではじめる」= 1 行 (crew_size = 3)
+      facility_code  TEXT REFERENCES f_iroha_facilities(code),
+      -- ⭐実測は **秒 × 人数 = 人時**に統一する。個人の記録は必ず 1 なので、いまの集計と辻褄が合う
+      --   (いまも 3 人なら 3 行 = 3 人時)
+      crew_size      INTEGER NOT NULL DEFAULT 1 CHECK (crew_size >= 1 AND crew_size <= 50),
+      -- ⭐どのまとまりの作業か (要件 §AB-10)。まとまりが 1 つなら画面が自動で選ぶ。
+      --   決められないときは NULL のまま (カードには残る。分からないものを当てずっぽうで結びつけない)
+      batch_id       INTEGER REFERENCES f_iroha_task_batches(id),
       device_label   TEXT,
       started_at     TEXT NOT NULL,
       ended_at       TEXT,
@@ -158,7 +168,13 @@ const sessionsDDL = (name) => `
       voided_by      TEXT,
       void_reason    TEXT,
       master_snapshot TEXT,
-      CHECK (page_id IS NOT NULL OR task_id IS NOT NULL)
+      CHECK (page_id IS NOT NULL OR task_id IS NOT NULL),
+      -- 個人の記録は id と名前がセット (名前だけ・id だけの行を作らせない)
+      CHECK ((worker_id IS NULL) = (worker_name IS NULL)),
+      -- 個人でないなら「どの拠点の何人か」が要る (誰の作業か分からない記録を残さない)
+      CHECK (worker_id IS NOT NULL OR facility_code IS NOT NULL),
+      -- ⭐個人の記録は必ず 1 人。ここが崩れると 人時 (秒 × 人数) が今までの集計と食い違う
+      CHECK (worker_id IS NULL OR crew_size = 1)
     );`;
 /**
  * ⭐作業の「まとまり」(要件 §AB)。1 枚のカードの下に、**独立して作業・完成・棚入れできる単位**を持つ。
@@ -311,7 +327,11 @@ const BATCHES_INDEX_DDL = `
 
 const SESSIONS_INDEX_DDL = `
     CREATE INDEX IF NOT EXISTS idx_iroha_sessions_page ON f_iroha_work_sessions(page_id, id);
-    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_task ON f_iroha_work_sessions(task_id, id);`;
+    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_task ON f_iroha_work_sessions(task_id, id);
+    -- ⭐人数だけの記録は「拠点 × カード」で 1 本 (要件 §AB-10)。拠点は同時に複数のカードを持てる。
+    --   個人の 1 人 1 本 (idx_iroha_sessions_open_uniq) とは別の索引にする
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_sessions_crew_uniq
+      ON f_iroha_work_sessions(facility_code, task_id) WHERE ended_at IS NULL AND worker_id IS NULL;`;
 const mediaDDL = (name) => `
     CREATE TABLE IF NOT EXISTS ${name} (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -360,13 +380,19 @@ const MEDIA_INDEX_DDL = `
  */
 // 表ごとに「新しい定義に必要なもの」(列の有無だけでなく UNIQUE・CHECK も。欠けた途中版を見逃さない — Codex A1b R2 #2)
 const SESSION_MEDIA_COMMON_DDL = [/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/, /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/];
-const SESSIONS_REQUIRED_DDL = [...SESSION_MEDIA_COMMON_DDL, /end_reason IS NULL OR end_reason IN \('done','pause','admin'\)/];
+const SESSIONS_REQUIRED_DDL = [...SESSION_MEDIA_COMMON_DDL, /end_reason IS NULL OR end_reason IN \('done','pause','admin'\)/,
+  // ⭐人数だけの作業 (要件 §AB-10)。列だけ足した途中版と区別するため、表レベルの CHECK まで見る
+  /CHECK \(\(worker_id IS NULL\) = \(worker_name IS NULL\)\)/,
+  /CHECK \(worker_id IS NOT NULL OR facility_code IS NOT NULL\)/,
+  /CHECK \(worker_id IS NULL OR crew_size = 1\)/];
 const MEDIA_REQUIRED_DDL = [...SESSION_MEDIA_COMMON_DDL, /operation_id\s+TEXT NOT NULL UNIQUE/, /kind IN \('photo','video'\)/, /status IN \('stored','uploaded','synced'\)/];
 function sessionMediaNeedsRebuild(db, table, ddl, required) {
   const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)?.sql;
   if (!sql) return false;   // 無ければ CREATE IF NOT EXISTS が新定義で作る
   const info = db.prepare(`PRAGMA table_info(${table})`).all();
   if (info.some((c) => c.name === 'page_id' && c.notnull === 1)) return true;
+  // ⭐人数だけの記録は worker_id が NULL になる。古い版は NOT NULL なので作り直す (要件 §AB-10)
+  if (info.some((c) => (c.name === 'worker_id' || c.name === 'worker_name') && c.notnull === 1)) return true;
   if (required.some((re) => !re.test(sql))) return true;
   const have = new Set(info.map((c) => c.name));
   const want = [...ddl('x').matchAll(/^\s+([a-z_]+)\s+(?:INTEGER|TEXT)/gm)].map((m) => m[1]);
@@ -957,14 +983,26 @@ export function createTables(db = getMirrorDB()) {
   // アプリ側のトランザクション検査だけだと、将来の別経路・移行コードから重複を作れる)。
   // 部分ユニークを張る前に、万一の既存重複 (最新以外) を admin 終了で閉じておく
   db.exec('DROP INDEX IF EXISTS idx_iroha_sessions_open');
+  // ⭐**個人の行だけ**を見る。人数だけの記録 (worker_id IS NULL) を混ぜると、
+  //   GROUP BY worker_id が NULL をひとかたまりにして、拠点をまたいだ作業中の記録を
+  //   最新 1 本を残して全部閉じてしまう (要件 §AB-10)
   db.prepare(`UPDATE f_iroha_work_sessions
     SET ended_at = ?, end_reason = 'admin',
         raw_seconds = MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER))
-    WHERE ended_at IS NULL AND id NOT IN (
-      SELECT MAX(id) FROM f_iroha_work_sessions WHERE ended_at IS NULL GROUP BY worker_id)`)
+    WHERE ended_at IS NULL AND worker_id IS NOT NULL AND id NOT IN (
+      SELECT MAX(id) FROM f_iroha_work_sessions WHERE ended_at IS NULL AND worker_id IS NOT NULL GROUP BY worker_id)`)
     .run(utcNow(), utcNow());
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_sessions_open_uniq
     ON f_iroha_work_sessions(worker_id) WHERE ended_at IS NULL`);
+  // 人数だけの記録も同じ手当て (拠点 × カードで 1 本)
+  db.prepare(`UPDATE f_iroha_work_sessions
+    SET ended_at = ?, end_reason = 'admin',
+        raw_seconds = MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER))
+    WHERE ended_at IS NULL AND worker_id IS NULL AND id NOT IN (
+      SELECT MAX(id) FROM f_iroha_work_sessions WHERE ended_at IS NULL AND worker_id IS NULL
+      GROUP BY facility_code, task_id)`)
+    .run(utcNow(), utcNow());
+  db.exec(SESSIONS_INDEX_DDL);
 }
 
 // ───────────────────────── Notion キャッシュ ─────────────────────────
@@ -1043,7 +1081,12 @@ export function workSecondsByTask(taskIds) {
   const db = getDB();
   for (let i = 0; i < ids.length; i += 400) {
     const chunk = ids.slice(i, i + 400);
-    const rows = db.prepare(`SELECT task_id, SUM(COALESCE(raw_seconds, 0)) AS secs, COUNT(DISTINCT worker_id) AS people
+    // ⭐実測は **人時 = 秒 × 人数**。個人の記録は crew_size = 1 なので、今までの数字と変わらない (要件 §AB-10)。
+    //   人数は「個人の記録の人数」+「人数だけの記録のいちばん多かった人数」— 同じ拠点が
+    //   2 回に分けて作業しても 2 倍に数えない (延べ人数ではなく「何人でやったか」)
+    const rows = db.prepare(`SELECT task_id,
+        SUM(COALESCE(raw_seconds, 0) * crew_size) AS secs,
+        COUNT(DISTINCT worker_id) + COALESCE(MAX(CASE WHEN worker_id IS NULL THEN crew_size END), 0) AS people
       FROM f_iroha_work_sessions WHERE voided_at IS NULL AND ended_at IS NOT NULL AND task_id IN (${chunk.map(() => '?').join(',')})
       GROUP BY task_id`).all(...chunk);
     for (const r of rows) out.set(r.task_id, { seconds: Number(r.secs) || 0, people: r.people });
@@ -1231,18 +1274,95 @@ export function startSessions({ pageId = null, taskId = null, productCode = null
         message: `${who} の作業がまだ終わっていません。先にそちらを終了・中断するか、その人を外してください` };
     }
     const snapshot = startSnapshotJson(db, productCode, masterSnapshot);
+    // ⭐どのまとまりの作業か (要件 §AB-10)。まとまりが 1 つなら自動で結びつく。
+    //   決められないときは NULL のまま — カードには残るので記録は失われない
+    const bp = taskId == null ? { value: null } : pickSessionBatch(db, Number(taskId), null);
     const ins = db.prepare(`INSERT INTO f_iroha_work_sessions
-      (page_id, task_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, master_snapshot)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      (page_id, task_id, product_code, title_snapshot, worker_id, worker_name, batch_id, device_label, started_at, master_snapshot)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const sessions = uniq.map((w) => {
       const open = already.get(Number(w.id));
       if (open) return { sessionId: open.id, workerId: Number(w.id), workerName: w.display_name, startedAt: open.started_at, already: true };
       const info = ins.run(pageId, taskId == null ? null : Number(taskId), productCode, title,
-        Number(w.id), w.display_name, deviceLabel, now, snapshot);
+        Number(w.id), w.display_name, bp.value ?? null, deviceLabel, now, snapshot);
       return { sessionId: Number(info.lastInsertRowid), workerId: Number(w.id), workerName: w.display_name, startedAt: now, already: false };
     });
     return { ok: true, sessions, startedAt: now, already: sessions.every((s) => s.already) };
   }).immediate();
+}
+
+/**
+ * ⭐人数だけの作業をはじめる (要件 §AB-10)。パレット・ジョブサポは いろは の中で作業するが、
+ * 個人名は持たない。「パレット 3 人ではじめる」= **1 行** (crew_size = 3)。
+ *
+ * ⭐擬似作業者を 1 人つくる手は使えない — 個人は「1 人につき同時 1 件」なので、
+ *   その拠点が同時に 1 カードしか持てなくなる。だから拠点は別の軸として持つ。
+ * ⭐同時に開ける記録は **拠点 × カードで 1 本** (索引 idx_iroha_sessions_crew_uniq)。
+ *   拠点は同時に複数のカードを持てる。
+ * ⭐同じカードでもう一度押されたら**成功扱いで今の記録を返す** (再送で二重に数えない)。
+ */
+export function startCrewSession({ taskId, facilityCode, crewSize, batchId = null,
+  productCode = null, title = null, masterSnapshot, deviceLabel = null, now = utcNow(), guard = null }) {
+  const db = getDB();
+  const tid = Number(taskId);
+  if (!Number.isSafeInteger(tid) || tid <= 0) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
+  const n = Number(crewSize);
+  if (!Number.isSafeInteger(n) || n < 1 || n > 50) {
+    return { ok: false, error: 'bad_request', message: '人数は 1〜50 の整数で入れてください' };
+  }
+  return db.transaction(() => {
+    if (guard) { const g = guard(); if (g) return g; }
+    const fac = db.prepare('SELECT code, name, external, offsite FROM f_iroha_facilities WHERE code = ? AND active = 1')
+      .get(String(facilityCode || ''));
+    if (!fac) return { ok: false, error: 'bad_facility', message: 'その拠点は選べません' };
+    // ⭐人数だけで記録できるのは「いろはの中で作業する外部の事業者」だけ (要件 §AB-10)。
+    //   物を持ち帰る拠点 (offsite) は向こうで作業するので、こちらでは時間を測らない。
+    //   いろは 自身は工賃の計算に個人の記録が要るので、名前で記録する
+    if (!fac.external || fac.offsite) {
+      return { ok: false, error: 'bad_facility',
+        message: '人数だけで記録できるのは、いろはの中で作業する外部の事業者だけです' };
+    }
+    const t = db.prepare('SELECT * FROM f_iroha_tasks WHERE id = ?').get(tid);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません' };
+    if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードでは作業をはじめられません' };
+    // ⭐どのまとまりの作業か。決められないときは NULL のまま — カードには残るので記録は失われない
+    const open = db.prepare(`SELECT id, started_at, crew_size, batch_id FROM f_iroha_work_sessions
+      WHERE facility_code = ? AND task_id = ? AND worker_id IS NULL AND ended_at IS NULL`).get(fac.code, tid);
+    if (open) {
+      return { ok: true, already: true,
+        session: { id: open.id, facilityCode: fac.code, facilityName: fac.name,
+          crewSize: open.crew_size, batchId: open.batch_id, startedAt: open.started_at } };
+    }
+    const bid = pickSessionBatch(db, tid, batchId);
+    if (bid && bid.error) return bid;
+    const snapshot = startSnapshotJson(db, productCode, masterSnapshot);
+    const info = db.prepare(`INSERT INTO f_iroha_work_sessions
+      (page_id, task_id, product_code, title_snapshot, worker_id, worker_name, facility_code, crew_size, batch_id,
+       device_label, started_at, master_snapshot)
+      VALUES (NULL, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)`)
+      .run(tid, productCode, title, fac.code, n, bid ? bid.value : null, deviceLabel, now, snapshot);
+    return { ok: true, already: false,
+      session: { id: Number(info.lastInsertRowid), facilityCode: fac.code, facilityName: fac.name,
+        crewSize: n, batchId: bid ? bid.value : null, startedAt: now } };
+  }).immediate();
+}
+
+/**
+ * どのまとまりの作業かを決める (要件 §AB-10)。
+ * ⭐指定があれば**そのカードのものか**を確かめる。無ければ、手元に残っているまとまりが
+ *   1 つだけのときに限って自動で選ぶ。2 つ以上あって決められないときは **NULL のまま**にする —
+ *   当てずっぽうで結びつけると、あとから見た人が「このぶんの実測」と読んでしまう。
+ */
+function pickSessionBatch(db, taskId, batchId) {
+  if (batchId != null) {
+    const b = db.prepare('SELECT id FROM f_iroha_task_batches WHERE id = ? AND task_id = ? AND work_status <> ?')
+      .get(Number(batchId), taskId, 'cancelled');
+    if (!b) return { error: 'bad_batch', ok: false, message: 'そのぶんはこのカードにありません' };
+    return { value: b.id };
+  }
+  const rows = db.prepare(`SELECT id FROM f_iroha_task_batches
+    WHERE task_id = ? AND work_status <> 'cancelled'`).all(taskId);
+  return { value: rows.length === 1 ? rows[0].id : null };
 }
 
 /**
@@ -1283,7 +1403,10 @@ export function stopSession({ pageId = null, taskId = null, workerId, sessionId,
       .get(byTask ? Number(taskId) : pageId).c;
     const row = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(sid);
     const sameCard = row && (byTask ? Number(row.task_id) === Number(taskId) : row.page_id === pageId);
-    if (!row || !sameCard || row.worker_id !== Number(workerId)) {
+    // ⭐人数だけの記録 (要件 §AB-10) には「その人の記録」という持ち主がいない。
+    //   個人名を持たないので worker_id で照合できず、終わらせるのは職員 (router が確かめている)
+    const crew = !!row && row.worker_id == null;
+    if (!row || !sameCard || (!crew && row.worker_id !== Number(workerId))) {
       return { ok: false, error: 'not_started', message: 'このカードで作業をはじめた記録がありません (画面を更新してください)' };
     }
     if (row.ended_at) {
@@ -1394,6 +1517,12 @@ export function undoStopSessions({ taskId, sessionIds, withinMs = 60000, expectT
         const row = get.get(id);
         if (!row || Number(row.task_id) !== Number(taskId)) return { ok: false, error: 'not_found', message: '作業の記録が見つかりません (画面を更新してください)' };
         if (row.voided_at) return { ok: false, error: 'voided', message: '取り消された記録はもどせません' };
+        // ⭐人数だけの記録はもどさない (要件 §AB-10)。持ち主がいないので「同じ人の記録を 2 本戻さない」
+        //   という見張りが効かず、拠点 × カードの一意制約に当てて落ちる。もう一度はじめてもらう
+        if (row.worker_id == null) {
+          return { ok: false, error: 'not_undoable',
+            message: '人数だけの記録はもどせません。もう一度「はじめる」を押してください' };
+        }
         if (!row.ended_at) { targets.push({ row, already: true }); continue; }   // まだ動いている = 二重押し。そのまま
         // 人が止めたもの (pause / done) だけ。職員が管理画面で閉じたもの (admin) は戻さない (Codex R1 #1)
         if (row.end_reason !== 'pause' && row.end_reason !== 'done') return { ok: false, error: 'not_undoable', message: 'この記録はもどせません' };
@@ -1429,7 +1558,8 @@ export function sessionsOverlappingDay(ymd, { cap = 5000 } = {}) {
   const startUtc = jstDayStartUtc(ymd);
   if (!startUtc) return null;
   const endUtc = new Date(Date.parse(startUtc) + 86400000).toISOString();
-  const rows = getDB().prepare(`SELECT id, task_id, page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, ended_at, end_reason, raw_seconds
+  const rows = getDB().prepare(`SELECT id, task_id, page_id, product_code, title_snapshot, worker_id, worker_name,
+      facility_code, crew_size, batch_id, device_label, started_at, ended_at, end_reason, raw_seconds
     FROM f_iroha_work_sessions WHERE voided_at IS NULL AND started_at < ? AND (ended_at IS NULL OR ended_at >= ?)
     ORDER BY started_at, id LIMIT ?`).all(endUtc, startUtc, cap + 1);
   return { rows: rows.slice(0, cap), truncated: rows.length > cap, startUtc, endUtc };
@@ -1437,7 +1567,7 @@ export function sessionsOverlappingDay(ymd, { cap = 5000 } = {}) {
 
 export function activeSessionsByTask() {
   const map = new Map();
-  for (const r of getDB().prepare(`SELECT id, task_id, worker_id, worker_name, started_at, device_label
+  for (const r of getDB().prepare(`SELECT id, task_id, worker_id, worker_name, facility_code, crew_size, batch_id, started_at, device_label
     FROM f_iroha_work_sessions WHERE ended_at IS NULL AND task_id IS NOT NULL ORDER BY started_at`).all()) {
     if (!map.has(r.task_id)) map.set(r.task_id, []);
     map.get(r.task_id).push(r);
@@ -1453,7 +1583,7 @@ export function activeSessionsByTask() {
 export function finishedSessionsOfTask(taskId) {
   const n = Number(taskId);
   if (!Number.isInteger(n) || n <= 0) return [];
-  return getDB().prepare(`SELECT id, worker_name, started_at, ended_at, end_reason, raw_seconds
+  return getDB().prepare(`SELECT id, worker_name, facility_code, crew_size, batch_id, started_at, ended_at, end_reason, raw_seconds
     FROM f_iroha_work_sessions
     WHERE task_id = ? AND ended_at IS NOT NULL AND voided_at IS NULL
     ORDER BY started_at, id`).all(n);
@@ -1465,7 +1595,7 @@ export function finishedSessionsOfTask(taskId) {
  */
 export function estimateByProduct() {
   // カード単位 = task_id (アプリ正本) か page_id (Notion 時代)。同じカードの複数人・複数回を 1 件にまとめる
-  const rows = getDB().prepare(`SELECT LOWER(TRIM(product_code)) AS k, COALESCE('t' || task_id, page_id) AS card, SUM(raw_seconds) AS total, MAX(ended_at) AS last_end
+  const rows = getDB().prepare(`SELECT LOWER(TRIM(product_code)) AS k, COALESCE('t' || task_id, page_id) AS card, SUM(raw_seconds * crew_size) AS total, MAX(ended_at) AS last_end
     FROM f_iroha_work_sessions
     WHERE ended_at IS NOT NULL AND voided_at IS NULL AND product_code IS NOT NULL AND raw_seconds > 0
     GROUP BY LOWER(TRIM(product_code)), COALESCE('t' || task_id, page_id)`).all();
@@ -1566,15 +1696,16 @@ export function searchSessions({ workerId = null, from = null, to = null, q = nu
   // ⭐totalSeconds は**終わったぶんだけ**。作業中はまだ確定していないので足さない
   //   (工賃の計算に使う数字が、見るたびに増えていくことになる — 画面のラベルも「終わったぶん」と書く)
   const summary = db.prepare(`SELECT COUNT(*) AS count,
-      COALESCE(SUM(CASE WHEN s.ended_at IS NOT NULL THEN s.raw_seconds ELSE 0 END), 0) AS totalSeconds,
-      COUNT(DISTINCT s.worker_id) AS workers,
+      COALESCE(SUM(CASE WHEN s.ended_at IS NOT NULL THEN s.raw_seconds * s.crew_size ELSE 0 END), 0) AS totalSeconds,
+      COUNT(DISTINCT s.worker_id) + COALESCE(MAX(CASE WHEN s.worker_id IS NULL THEN s.crew_size END), 0) AS workers,
       COUNT(DISTINCT LOWER(TRIM(s.product_code))) AS products,
       COUNT(DISTINCT COALESCE('t' || s.task_id, s.page_id)) AS cards,
       SUM(CASE WHEN s.ended_at IS NULL THEN 1 ELSE 0 END) AS open
     FROM f_iroha_work_sessions s ${sql}`).get(...args);
 
   const rows = db.prepare(`SELECT s.id, s.task_id, s.page_id, s.product_code, s.title_snapshot,
-      s.worker_id, s.worker_name, s.device_label, s.started_at, s.ended_at, s.end_reason,
+      s.worker_id, s.worker_name, s.facility_code, s.crew_size, s.batch_id,
+      s.device_label, s.started_at, s.ended_at, s.end_reason,
       s.raw_seconds, s.voided_at, s.void_reason
     FROM f_iroha_work_sessions s ${sql}
     ORDER BY s.started_at DESC, s.id DESC LIMIT ? OFFSET ?`).all(...args, cap, skip);

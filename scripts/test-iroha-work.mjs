@@ -27,7 +27,7 @@ if (!process.env.DATA_DIR) {
 }
 
 // ⭐画面のキャッシュの版。画面を直した PR ではここだけ直す（以前は同じ文字列を 3 か所に書いていて、毎回 3 か所直していた）
-const SW_CACHE = 'iroha-work-shell-v17';
+const SW_CACHE = 'iroha-work-shell-v18';
 
 let pass = 0, fail = 0;
 function ok(cond, label) {
@@ -1726,7 +1726,11 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       && !/page_id\s+TEXT NOT NULL/.test(newS), '作業時間: 新しい定義 (task_id FK・CHECK・page_id NULL 可) で作り直す');
     ok(/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/.test(newM) && /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/.test(newM)
       && /operation_id\s+TEXT NOT NULL UNIQUE/.test(newM), '写真: 同上 (UNIQUE も残る)');
-    const strip = (j) => JSON.stringify(JSON.parse(j).map((r) => { const { task_id, staged_at, staged_claim, delete_token_hash_prev, delete_token_hashes, ...rest } = r; return rest; }));
+    // ⭐**その版に無かった列だけ**を外して比べる。ぜんぶ外すと「行がそのまま残る」を検査できない
+    const stripNew = (j) => JSON.stringify(JSON.parse(j).map((r) => { const { facility_code, crew_size, batch_id, ...rest } = r; return rest; }));
+    // 新しい定義で足した列は、その版には無かったもの。既定値で埋まるので比べる前に外す
+    const strip = (j) => JSON.stringify(JSON.parse(j).map((r) => { const { task_id, facility_code, crew_size, batch_id,
+      staged_at, staged_claim, delete_token_hash_prev, delete_token_hashes, ...rest } = r; return rest; }));
     ok(strip(rowsOf('f_iroha_work_sessions')) === pageRowsS && strip(rowsOf('f_iroha_card_media')) === pageRowsM, '行 (id・全列) はそのまま。task_id は NULL');
     ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE type='index' AND name IN ('idx_iroha_sessions_task','idx_iroha_media_task','idx_iroha_sessions_page','idx_iroha_media_page')").get().c === 4, '索引 4 本が作り直される');
     let bothNull = null;
@@ -1750,13 +1754,15 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     const allS = rowsOf('f_iroha_work_sessions'), allM = rowsOf('f_iroha_card_media');
     const MID_SESSIONS = OLD_SESSIONS.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER');
     const MID_MEDIA = OLD_MEDIA.replace('page_id TEXT NOT NULL', 'page_id TEXT, task_id INTEGER').replace('unavailable_at TEXT)', 'unavailable_at TEXT, staged_at TEXT, staged_claim TEXT, delete_token_hash_prev TEXT, delete_token_hashes TEXT)');
-    const allColsS = db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().map((c) => c.name).join(', ');
-    const allColsM = db.prepare('PRAGMA table_info(f_iroha_card_media)').all().map((c) => c.name).join(', ');
     db.pragma('foreign_keys = OFF');
     db.exec(`CREATE TEMP TABLE mid_s AS SELECT * FROM f_iroha_work_sessions; CREATE TEMP TABLE mid_m AS SELECT * FROM f_iroha_card_media;
-      DROP TABLE f_iroha_work_sessions; DROP TABLE f_iroha_card_media; ${MID_SESSIONS}; ${MID_MEDIA};
-      INSERT INTO f_iroha_work_sessions (${allColsS}) SELECT ${allColsS} FROM mid_s;
-      INSERT INTO f_iroha_card_media (${allColsM}) SELECT ${allColsM} FROM mid_m; DROP TABLE mid_s; DROP TABLE mid_m;`);
+      DROP TABLE f_iroha_work_sessions; DROP TABLE f_iroha_card_media; ${MID_SESSIONS}; ${MID_MEDIA};`);
+    // ⭐写すのは**途中の版にもある列**だけ。新しい定義で足した列 (人数だけの作業など) は、その版には無い
+    const colsOf = (t) => db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+    const midColsS = colsOf('f_iroha_work_sessions').filter((c) => colsOf('mid_s').includes(c)).join(', ');
+    const midColsM = colsOf('f_iroha_card_media').filter((c) => colsOf('mid_m').includes(c)).join(', ');
+    db.exec(`INSERT INTO f_iroha_work_sessions (${midColsS}) SELECT ${midColsS} FROM mid_s;
+      INSERT INTO f_iroha_card_media (${midColsM}) SELECT ${midColsM} FROM mid_m; DROP TABLE mid_s; DROP TABLE mid_m;`);
     db.pragma('foreign_keys = ON');
     ok(!/CHECK/.test(sqlOf('f_iroha_work_sessions')) && !/REFERENCES/.test(sqlOf('f_iroha_card_media')), '前提: 途中の版 (page_id NULL 可だが CHECK/FK 無し)');
     // (c) まず FK 違反を仕込む → 全部戻ること
@@ -1770,9 +1776,12 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     db.prepare("DELETE FROM f_iroha_work_sessions WHERE worker_name = 'orphan'").run();
     createTables(db);
     ok(/CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/.test(sqlOf('f_iroha_work_sessions')) && /REFERENCES f_iroha_tasks/.test(sqlOf('f_iroha_card_media')), '途中の版も新しい定義に作り直す');
-    ok(rowsOf('f_iroha_work_sessions') === allS && rowsOf('f_iroha_card_media') === allM, '全行 (task の行・id 含む) がそのまま残る');
+    // 途中の版に無かった列 (人数だけの作業) は落ちて既定値に戻る。それ以外は id ごとそのまま
+    ok(stripNew(rowsOf('f_iroha_work_sessions')) === stripNew(allS) && rowsOf('f_iroha_card_media') === allM,
+      '全行 (task の行・id 含む) がそのまま残る');
     createTables(db);
-    ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_work_sessions%'").get().c === 1 && rowsOf('f_iroha_work_sessions') === allS, '2 回目は何もしない (冪等)');
+    ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_work_sessions%'").get().c === 1
+      && stripNew(rowsOf('f_iroha_work_sessions')) === stripNew(allS), '2 回目は何もしない (冪等)');
 
     // (d) task_id FK と紐付け CHECK はあるが、既存の UNIQUE / CHECK だけ欠ける版 (Codex A1b R2 #2)
     const LATE_SESSIONS = sqlOf('f_iroha_work_sessions').replace("end_reason     TEXT CHECK (end_reason IS NULL OR end_reason IN ('done','pause','admin'))", 'end_reason TEXT');
@@ -1780,16 +1789,22 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       .replace("status        TEXT NOT NULL CHECK (status IN ('stored','uploaded','synced'))", 'status TEXT NOT NULL')
       .replace("kind          TEXT NOT NULL CHECK (kind IN ('photo','video'))", 'kind TEXT NOT NULL');
     ok(!/end_reason IN/.test(LATE_SESSIONS) && !/UNIQUE/.test(LATE_MEDIA) && !/status IN/.test(LATE_MEDIA) && !/kind IN/.test(LATE_MEDIA) && /task_id\s+INTEGER REFERENCES/.test(LATE_MEDIA), '前提: 制約だけ欠けた版を用意');
+    // ⭐この版は列がそろっているので、直前の中身をそのまま比べる (1 列でも落ちたら気づく)
+    const lateS = rowsOf('f_iroha_work_sessions'), lateM = rowsOf('f_iroha_card_media');
     db.pragma('foreign_keys = OFF');
     db.exec(`CREATE TEMP TABLE late_s AS SELECT * FROM f_iroha_work_sessions; CREATE TEMP TABLE late_m AS SELECT * FROM f_iroha_card_media;
-      DROP TABLE f_iroha_work_sessions; DROP TABLE f_iroha_card_media; ${LATE_SESSIONS}; ${LATE_MEDIA};
-      INSERT INTO f_iroha_work_sessions (${allColsS}) SELECT ${allColsS} FROM late_s;
-      INSERT INTO f_iroha_card_media (${allColsM}) SELECT ${allColsM} FROM late_m; DROP TABLE late_s; DROP TABLE late_m;`);
+      DROP TABLE f_iroha_work_sessions; DROP TABLE f_iroha_card_media; ${LATE_SESSIONS}; ${LATE_MEDIA};`);
+    // この版は列は同じで制約だけ欠けている。それでも両方にある列だけを写す (列が増えたときに壊れない)
+    const lateColsS = colsOf('f_iroha_work_sessions').filter((c) => colsOf('late_s').includes(c)).join(', ');
+    const lateColsM = colsOf('f_iroha_card_media').filter((c) => colsOf('late_m').includes(c)).join(', ');
+    db.exec(`INSERT INTO f_iroha_work_sessions (${lateColsS}) SELECT ${lateColsS} FROM late_s;
+      INSERT INTO f_iroha_card_media (${lateColsM}) SELECT ${lateColsM} FROM late_m; DROP TABLE late_s; DROP TABLE late_m;`);
     db.pragma('foreign_keys = ON');
     createTables(db);
     ok(/end_reason IN \('done','pause','admin'\)/.test(sqlOf('f_iroha_work_sessions')) && /operation_id\s+TEXT NOT NULL UNIQUE/.test(sqlOf('f_iroha_card_media'))
       && /status IN \('stored','uploaded','synced'\)/.test(sqlOf('f_iroha_card_media')) && /kind IN \('photo','video'\)/.test(sqlOf('f_iroha_card_media')), 'UNIQUE / CHECK (end_reason・status・kind) だけ欠けた版も作り直す');
-    ok(rowsOf('f_iroha_work_sessions') === allS && rowsOf('f_iroha_card_media') === allM, '行はそのまま');
+    ok(rowsOf('f_iroha_work_sessions') === lateS && rowsOf('f_iroha_card_media') === lateM,
+      '行はそのまま (列がそろっている版なので 1 列も落ちない)');
   }
 }
 
@@ -4289,7 +4304,7 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   ok(app.includes(CAP.LABEL_PRINT) && !notion.includes(CAP.LABEL_PRINT) && !pv.includes(CAP.LABEL_PRINT),
     '🏷 箱ラベルの印刷はアプリ正本の利用者にも許す (箱に貼るのは作業した人)。Notion 正本・下見では許さない (中原さん 2026-09-06)');
   ok(notion.includes(CAP.DAILY_REPORT) && app.includes(CAP.DAILY_REPORT) && !pv.includes(CAP.DAILY_REPORT), '日報 (report.daily) は読むだけだが許可の表に載せる。下見では許さない');
-  ok(staffCaps.length === 15 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 15 個・重複なし');
+  ok(staffCaps.length === 16 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 16 個・重複なし (👥 人数だけの作業を追加)');
   ok(staffCaps.includes(CAP.CONSIGN) && !app.includes(CAP.CONSIGN),
     '🚚 外部にあずける (task.consign) は職員だけ — 利用者の画面には描かない (要件 §AB-7)');
   app.push('x'); pv.push('y');
@@ -7142,6 +7157,153 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
   // ⭐職員だけ、は**実際に HTTP で叩く**テスト (test-iroha-work-api.mjs) で確かめている。
   //   「ルート宣言と staff_required がファイルのどこかにある」という検査は、
   //   その口の職員チェックを外しても緑のままになる (Codex R1 軽微1)
+}
+
+console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
+{
+  const db = getDB();
+  const D = await import('../apps/iroha-work/db.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const B = await import('../apps/iroha-work/batches.js');
+  const staffW = { id: D.addIrohaWorker({ displayName: 'crew職員', workerType: 'staff', actor: 'test' }).id, display_name: 'crew職員' };
+  const memberW = { id: D.addIrohaWorker({ displayName: 'crew利用者', workerType: 'member', actor: 'test' }).id, display_name: 'crew利用者' };
+  const mk = (page, dest, qty = 100) => TD.upsertTaskFromImport({ notion_page_id: page, status: 'not_started',
+    facility_code: 'rehas', destination_id: dest, product_name: '人数の検査 ' + page, qty,
+    master_snapshot: JSON.stringify({ units_per_container: 10, process_count: 2 }) }, { batchId: 'crew' }).id;
+  const sess = (id) => db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(id);
+
+  // ① ⭐表の作り
+  {
+    const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='f_iroha_work_sessions'").get().sql;
+    ok(/worker_id      INTEGER,/.test(sql) && /worker_name    TEXT,/.test(sql),
+      '⭐個人の名前は NULL 可になる (人数だけの記録のため)');
+    ok(sql.includes('CHECK ((worker_id IS NULL) = (worker_name IS NULL))'), '名前だけ・id だけの行は作らせない');
+    ok(sql.includes('CHECK (worker_id IS NOT NULL OR facility_code IS NOT NULL)'),
+      '⭐誰の作業か分からない記録を残さない (個人でないなら拠点が要る)');
+    ok(sql.includes('CHECK (worker_id IS NULL OR crew_size = 1)'),
+      '⭐個人の記録は必ず 1 人 (人時 = 秒 × 人数 が今までの集計と食い違わない)');
+    const idx = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='f_iroha_work_sessions'").all().map((r) => r.name);
+    ok(idx.includes('idx_iroha_sessions_open_uniq') && idx.includes('idx_iroha_sessions_crew_uniq'),
+      '個人 (1 人 1 本) と 人数だけ (拠点 × カードで 1 本) の索引が別々にある');
+  }
+
+  // ② ⭐はじめる
+  {
+    const t = mk('crew-1', 9006);
+    const r = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 3 });
+    ok(r.ok && !r.already, 'パレット 3 人ではじめられる');
+    const row = sess(r.sessionId);
+    ok(row.worker_id === null && row.worker_name === null, '⭐個人名を持たない');
+    ok(row.facility_code === 'rehas' && row.crew_size === 3, '拠点と人数で 1 行');
+    ok(row.batch_id === B.listBatchesOfTask(db, t)[0].id, '⭐まとまりが 1 つなら自動で結びつく');
+    ok(TD.getTask(t).status === 'in_progress', '未着手のカードは作業中になる');
+    // 再送は成功扱いで同じ記録を返す
+    const again = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 5 });
+    ok(again.ok && again.already && again.sessionId === r.sessionId,
+      '⭐同じ拠点でもう一度押しても二重に数えない (今の記録を返す)');
+    ok(sess(r.sessionId).crew_size === 3, '人数も書き換えない');
+    // 別の拠点は同じカードで同時に持てる
+    const j = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'jobsupport', crewSize: 2 });
+    ok(j.ok && !j.already, '別の拠点は同じカードでも同時にはじめられる');
+    // 拠点は同時に複数のカードを持てる
+    const t2 = mk('crew-2', 9007);
+    const r2 = TD.startTaskCrewSession({ taskId: t2, staff: staffW, facilityCode: 'rehas', crewSize: 4 });
+    ok(r2.ok && !r2.already, '⭐拠点は同時に複数のカードを持てる (擬似作業者ではこれができない)');
+  }
+
+  // ③ ⭐どの拠点で使えるか
+  {
+    const t = mk('crew-3', 9008);
+    ok(!TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'iroha', crewSize: 2 }).ok,
+      '⭐いろは自身は人数だけにしない (工賃の計算に個人の記録が要る)');
+    ok(!TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'workcenter', crewSize: 2 }).ok,
+      '⭐物を持ち帰る拠点 (ワークセンター) は向こうで作業するので、こちらで測らない');
+    ok(!TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'nosuch', crewSize: 2 }).ok, '知らない拠点は断る');
+    for (const n of [0, -1, 51, 1.5, null, 'さん']) {
+      ok(!TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: n }).ok,
+        '人数 ' + JSON.stringify(n) + ' は断る');
+    }
+    ok(TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 50 }).ok, '50 人までは通る');
+  }
+
+  // ④ ⭐実測は 人時 (秒 × 人数)
+  {
+    const t = mk('crew-4', 9009);
+    const r = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 3 });
+    // 60 秒はたらいたことにする
+    db.prepare("UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = 'done', raw_seconds = 60 WHERE id = ?")
+      .run(new Date().toISOString(), r.sessionId);
+    const w = D.workSecondsByTask([t]).get(t);
+    ok(w.seconds === 180, '⭐60 秒 × 3 人 = 180 人秒 (人時にそろえる)');
+    ok(w.people === 3, '人数も 3 人と出る (1 行でも 3 人)');
+    // 個人の記録は今までどおり
+    const t2 = mk('crew-5', 9010);
+    const p = TD.startTaskSession({ taskId: t2, worker: memberW, workers: [memberW] });
+    db.prepare("UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = 'done', raw_seconds = 60 WHERE id = ?")
+      .run(new Date().toISOString(), p.sessionId);
+    const w2 = D.workSecondsByTask([t2]).get(t2);
+    ok(w2.seconds === 60 && w2.people === 1, '⭐個人の記録は crew_size = 1 なので今までと同じ数字');
+    ok(sess(p.sessionId).crew_size === 1 && sess(p.sessionId).facility_code === null, '個人の行に拠点は入らない');
+    ok(sess(p.sessionId).batch_id === B.listBatchesOfTask(db, t2)[0].id, '個人の記録もまとまりに結びつく');
+  }
+
+  // ⑤ ⭐終わらせる・もどせない
+  {
+    const t = mk('crew-6', 9011);
+    const r = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 2 });
+    const st = D.stopSession({ taskId: t, workerId: staffW.id, sessionId: r.sessionId, reason: 'done' });
+    ok(st.ok, '⭐人数だけの記録は、押した職員の id と一致しなくても終わらせられる (持ち主がいない)');
+    ok(sess(r.sessionId).ended_at, '終わっている');
+    const un = D.undoStopSessions({ taskId: t, sessionIds: [r.sessionId] });
+    ok(!un.ok && un.error === 'not_undoable', '⭐人数だけの記録はもどせない (もう一度はじめてもらう)');
+    ok(/もう一度/.test(un.message), 'どうすればよいかを言う');
+  }
+
+  // ⑥ ⭐一意制約は DB でも守る
+  {
+    const t = mk('crew-7', 9012);
+    TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 2 });
+    let dup = null;
+    try {
+      db.prepare(`INSERT INTO f_iroha_work_sessions (task_id, facility_code, crew_size, started_at)
+        VALUES (?, 'rehas', 2, ?)`).run(t, new Date().toISOString());
+    } catch (e) { dup = e; }
+    ok(dup && /UNIQUE/.test(dup.message), '⭐同じ拠点・同じカードで 2 本目は DB が断る');
+    let bad = null;
+    try {
+      db.prepare(`INSERT INTO f_iroha_work_sessions (task_id, worker_id, worker_name, crew_size, started_at)
+        VALUES (?, 1, 'x', 3, ?)`).run(t, new Date().toISOString());
+    } catch (e) { bad = e; }
+    ok(bad && /CHECK/.test(bad.message), '⭐個人の記録に 2 人以上を入れさせない');
+    let noone = null;
+    try {
+      db.prepare('INSERT INTO f_iroha_work_sessions (task_id, crew_size, started_at) VALUES (?, 2, ?)')
+        .run(t, new Date().toISOString());
+    } catch (e) { noone = e; }
+    ok(noone && /CHECK/.test(noone.message), '⭐誰の作業か分からない行は入らない');
+  }
+
+  // ── 画面 ──
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(html.includes('function sessionWho(a)') && html.includes("a.worker_name ? a.worker_name + 'さん' : facilityName(a.facility_code)"),
+    '⭐「誰が作業中か」の言い方をひとつにする (名前が無い記録で「さんが作業中」だけ出さない)');
+  ok(!html.includes("c.active.map(a => a.worker_name).join('・')"), '名前を直接つなぐ書き方を残さない');
+  ok(html.includes('function activeHeads(list)') && html.includes("(a.worker_name ? 1 : (a.crew_size || 1))"),
+    '⭐人数は行数ではなく人数で数える (1 行で 3 人のことがある)');
+  ok(html.includes("if (!stateCan('task.work.crew') || !isApp()) return '';"),
+    '⭐許可の無い人には入口を描かない');
+  ok(html.includes("filter((f) => f.external && !f.offsite)"),
+    '⭐出すのは「いろはの中で作業する外部の事業者」だけ');
+  ok(html.includes('function startHeadcount(facilityCode, opts)') && html.includes("'/api/sessions/start-crew'"),
+    '人数だけの開始は専用の口へ送る');
+  ok(html.includes('opts && opts.crewSize != null ? Number(opts.crewSize)'),
+    '⭐止まっている札の確認から戻るときは、そのとき入れた人数を使う (入力欄を読み直さない)');
+  ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
+  const rt3 = fs.readFileSync(new URL('../apps/iroha-work/router.js', import.meta.url), 'utf8');
+  ok(rt3.includes("router.post('/api/sessions/start-crew'") && rt3.includes('requireStaffPlan(req)'),
+    '人数だけの開始は職員だけ');
+  const sw5 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
+  ok(new RegExp(`const CACHE = '${SW_CACHE}'`).test(sw5), '画面キャッシュの版を上げる');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

@@ -356,6 +356,14 @@
   .reasons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
   .reasons .btn.on{outline:2px solid var(--danger);outline-offset:1px;background:var(--danger-soft);border-color:var(--danger);color:var(--danger)}
   .dcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:12px}
+  /* 👥 人数だけの作業 (§AB-10) */
+  .hcnt{display:flex;flex-direction:column;gap:8px}
+  .hrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--well);border:1px solid var(--line);
+    border-radius:var(--r-sm);padding:8px 10px}
+  .hrow b{min-width:6em}
+  .hrow input{width:88px;font-family:var(--num);font-size:1rem;padding:8px;border:1px solid var(--line);border-radius:var(--r-sm)}
+  .hrow .btn{margin-left:auto;min-height:40px;padding:8px 12px;font-size:.9rem}
+  .hrow.ro{color:var(--sub)}
   /* 施設の受け入れ枠 (預けるダイアログ) */
   .cap{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg);font-size:.95rem}
   .cap b{font-variant-numeric:tabular-nums}
@@ -1508,6 +1516,19 @@ function fmtTime(iso) {
 }
 
 const facilityName = (code) => ((state.facilities || []).find(f => f.code === code) || {}).name || code;
+/**
+ * ⭐作業中の記録の「誰が」(要件 §AB-10)。
+ * 個人なら名前、**人数だけの記録なら「パレット 3人」**。worker_name は NULL になりうるので、
+ * ここを通さずに名前を直接つなぐと「さんが作業中」だけが出る
+ */
+function sessionWho(a) {
+  if (!a) return '';
+  return a.worker_name ? a.worker_name + 'さん' : facilityName(a.facility_code) + ' ' + (a.crew_size || 1) + '人';
+}
+/** 何人で作業しているか。人数だけの記録は 1 行で何人ぶんにもなる (要件 §AB-10) */
+function activeHeads(list) {
+  return (list || []).reduce((n, a) => n + (a.worker_name ? 1 : (a.crew_size || 1)), 0);
+}
 
 function renderSync() {
   const rf = state.refresh || {};
@@ -1628,7 +1649,7 @@ function renderList() {
     const staffUI = isStaffUI();
     const meta2 = [
       estText(c, { short: true }),
-      c.active.length > 0 ? '👤 ' + esc(c.active.map(a => a.worker_name).join('・')) + 'さんが作業中' : null,
+      c.active.length > 0 ? '👤 ' + esc(c.active.map(sessionWho).join('・')) + 'が作業中' : null,
       // 「作業中」なのにだれも作業していない = 中断し忘れ・止まった札の付け忘れの発見に (監修)
       c.status === 'in_progress' && c.active.length === 0 && !c.blocked ? '⏸ いまはだれも作業していません' : null,
       staffUI && c.priority.kind !== 'urgent' ? esc(c.priority.kind === 'new' ? '売上データなし' : c.priority.label) : null,
@@ -2056,7 +2077,7 @@ function bcardHtml(c, status) {
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
     c.split && c.away ? '🚚 ' + (c.away.handed ? 'あずけ中 ' : '渡す予定 ') + c.away.qty + ' 個'
       + (c.away.due ? ' ' + fmtMd(c.away.due) + 'まで' : '') : null,
-    c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
+    c.active.length > 0 ? '👤 ' + activeHeads(c.active) + '人' : null].filter(Boolean).join(' ・ ');
   // ⭐2 段に分ける。上 = 画像と文字、下 = 札とボタン。
   //   下の段は**カードの幅いっぱい**を使う (画像の右に押し込むと 1 つずつ行を使ってカードが縦に伸び、
   //   画像の下は空いたままになる — 中原さん 2026-09-07「表示する情報は変えずに縦を短く」)
@@ -4611,9 +4632,9 @@ function barHtml(c) {
     const first = c.active.reduce((a, b) => (Date.parse(a.started_at) <= Date.parse(b.started_at) ? a : b));
     return '<div class="in">' +
       '<div class="tm"><div class="t num" id="wt" data-start="' + esc(first.started_at) + '">--:--</div><small>' +
-        (c.active.length > 1 ? c.active.length + '人で作業中' : '作業中') + '</small></div>' +
+        (activeHeads(c.active) > 1 ? esc(c.active.map(sessionWho).join('・')) + 'が作業中' : '作業中') + '</small></div>' +
       '<button class="btn warn" id="pauseBtn" onclick="stopWork(\'pause\')">⏸ ひとやすみ</button>' +
-      '<button class="btn primary" id="doneBtn" onclick="stopWork(\'done\')">✅ ' + (c.active.length > 1 ? 'みんなできあがり' : 'できあがり') + '</button>' +
+      '<button class="btn primary" id="doneBtn" onclick="stopWork(\'done\')">✅ ' + (activeHeads(c.active) > 1 ? 'みんなできあがり' : 'できあがり') + '</button>' +
       stopBtn + '</div>';
   }
   return '<div class="in"><button class="btn primary" id="startBtn" onclick="openCrew()">▶ 作業をはじめる</button>' + stopBtn + '</div>';
@@ -4734,8 +4755,9 @@ async function submitBlock() {
 // ── 止まっているカードを始める前の確認 ──
 let unblockCtx = null;   // { ids }
 let unblockSaving = false;
-function openUnblock(c, ids) {
-  unblockCtx = { ids };
+/** @param headcount 人数だけではじめようとしていたとき { facilityCode, crewSize } (要件 §AB-10) */
+function openUnblock(c, ids, headcount) {
+  unblockCtx = { ids, headcount };
   $('#unblockName').textContent = c.title || '';
   const b = c.blocked;
   $('#unblockText').textContent = b
@@ -4752,8 +4774,10 @@ async function confirmUnblock() {
   unblockSaving = true;
   $('#unblockGo').disabled = true;
   $('#unblockMsg').textContent = '保存中…';
+  const hc = unblockCtx.headcount;
   let r;
-  try { r = await startWork(ids, { clearBlock: true }); }
+  // ⭐どちらの入口から来たかで戻り先を変える。人数だけの開始も同じ確認を通す
+  try { r = hc ? await startHeadcount(hc.facilityCode, { clearBlock: true, crewSize: hc.crewSize }) : await startWork(ids, { clearBlock: true }); }
   finally {
     unblockSaving = false;
     $('#unblockGo').disabled = false;
@@ -5018,7 +5042,7 @@ function renderCrew() {
   const chunk = (label, ws) => (ws.length ? '<div class="gsec">' + label + '</div><div class="crew">' + ws.map(person).join('') + '</div>' : '');
   const members = state.workers.filter(w => w.worker_type === 'member');
   const staff = state.workers.filter(w => w.worker_type === 'staff');
-  $('#crewBody').innerHTML = (chunk('利用者', members) + chunk('職員', staff)) ||
+  $('#crewBody').innerHTML = (chunk('利用者', members) + chunk('職員', staff) + headcountHtml(c)) ||
     '<p style="color:var(--faint)">作業者がまだ登録されていません。職員の方が管理画面から追加してください。</p>';
   const names = [...crewSel].map(id => (state.workers.find(w => w.id === id) || {}).display_name).filter(Boolean);
   $('#crewSum').innerHTML = names.length
@@ -5031,6 +5055,85 @@ function renderCrew() {
     ? (names.length ? '＋ ' + names.length + '人を追加する' : '＋ 人を追加する')
     : (names.length ? '▶ ' + names.length + '人で作業をはじめる' : '▶ 作業をはじめる');
 }
+/**
+ * 👥 人数だけではじめる (要件 §AB-10)。パレット・ジョブサポは いろは の中で作業するが、
+ * 個人名は持たないので「拠点 × 何人」で 1 行にする。
+ *
+ * ⭐**職員だけ**。許可が無ければ描かない (要件 §U-7)。
+ * ⭐出すのは「いろはの中で作業する外部の事業者」だけ — 物を持ち帰る拠点 (羅針盤・ワークセンター) は
+ *   向こうで作業するので、こちらで時間を測らない。いろは 自身は工賃の計算に個人の記録が要る
+ */
+function headcountFacilities() {
+  return ((boardState() || {}).facilities || []).filter((f) => f.external && !f.offsite);
+}
+function headcountHtml(c) {
+  if (!stateCan('task.work.crew') || !isApp()) return '';
+  const facs = headcountFacilities();
+  if (!facs.length) return '';
+  // すでに人数だけの記録がある拠点は、もう一度はじめられない (拠点 × カードで 1 本)
+  const busy = new Set((c.active || []).filter((a) => !a.worker_name).map((a) => a.facility_code));
+  const able = facs.filter((f) => !busy.has(f.code));
+  const done = facs.filter((f) => busy.has(f.code));
+  return '<div class="gsec">人数だけで記録する（名前を出さない）</div>' +
+    '<div class="hcnt">' +
+      done.map((f) => '<div class="hrow ro">' + esc(f.name) + ' はいま作業中です</div>').join('') +
+      able.map((f) =>
+        '<div class="hrow"><b>' + esc(f.name) + '</b>' +
+          '<input type="number" inputmode="numeric" min="1" max="50" step="1" placeholder="人数" ' +
+            'id="hc-' + esc(f.code) + '" aria-label="' + esc(f.name) + ' の人数">' +
+          '<span>人</span>' +
+          '<button type="button" class="btn" data-hcgo="' + esc(f.code) + '">▶ この人数ではじめる</button>' +
+        '</div>').join('') +
+    '</div>' +
+    '<p class="hint">パレット・ジョブサポは いろは の中で作業しますが、個人の名前は記録しません。' +
+      '実測は「時間 × 人数」で数えます。</p>';
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-hcgo]');
+  if (b) startHeadcount(b.dataset.hcgo);
+});
+/** @returns true = はじめられた / 'blocked' = 止まっているので確認を出した / false = 断られた */
+async function startHeadcount(facilityCode, opts) {
+  if (!stateCan('task.work.crew') || !isApp()) return false;
+  if (!worker) { openGate(); return false; }
+  const c = findCard(crewCard);
+  if (!c) return false;
+  // ⭐確認ダイアログから戻ってきたときは、そのとき入れた人数をそのまま使う。
+  //   画面の入力欄を読み直すと、確認している間に触られた値で始めてしまう
+  const el = document.getElementById('hc-' + facilityCode);
+  const n = opts && opts.crewSize != null ? Number(opts.crewSize) : (el ? Number(String(el.value).trim()) : NaN);
+  if (!Number.isInteger(n) || n < 1 || n > 50) {
+    $('#crewMsg').textContent = '❌ 人数を 1〜50 の整数で入れてください';
+    if (el) el.focus();
+    return false;
+  }
+  $('#crewMsg').textContent = '保存中…';
+  const j = await apiFetch('/api/sessions/start-crew', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, worker_id: worker.id, facility_code: facilityCode, crew_size: n,
+      // ⭐まとまりが 1 つなら選ばせない (操作は今までどおり)。2 つ以上なら決めずに送る
+      batch_id: homeBatchId(c) ?? undefined,
+      ...(opts && opts.clearBlock ? { clear_block: true, expect_version: c.version } : {}) }),
+  });
+  if (!j.ok) {
+    if (j.error === 'blocked') {
+      if (j.task) applyTask(c, j.task);
+      $('#crewMsg').textContent = '';
+      openUnblock(c, null, { facilityCode, crewSize: n });   // 人数はここで固定する
+      return 'blocked';
+    }
+    $('#crewMsg').textContent = '❌ ' + (j.message || 'はじめられませんでした');
+    return planError(j, () => startHeadcount(facilityCode, opts), { silent: true });
+  }
+  if (j.staff_mode) state.staff_mode = j.staff_mode;
+  if (j.task) applyTask(c, j.task);
+  $('#crewMsg').textContent = '';
+  closeCrew();
+  toast(facilityName(facilityCode) + ' ' + n + '人ではじめました');
+  openDetail(c.id);
+  return true;
+}
+
 async function crewStart() {
   const ids = [...crewSel];
   if (!ids.length) return;             // ボタンは disabled だが、二重に守る
