@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>カメラの確認 — 入荷受付チェック</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; margin: 0; padding: 14px; background: #f8f9fa; color: #212529; }
+  h1 { font-size: 1.15em; margin: 0 0 4px; }
+  p.lead { margin: 0 0 14px; color: #495057; font-size: 0.92em; line-height: 1.6; }
+  button { font-size: 1.05em; padding: 12px 20px; border-radius: 10px; border: 1px solid #adb5bd; background: #fff; cursor: pointer; }
+  button.go { background: #1971c2; color: #fff; border-color: #1971c2; }
+  video { width: 100%; max-width: 520px; background: #000; border-radius: 10px; display: block; margin: 12px 0; aspect-ratio: 4/3; object-fit: contain; }
+  #log { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 10px; font-family: ui-monospace, Menlo, monospace;
+         font-size: 0.82em; line-height: 1.55; white-space: pre-wrap; word-break: break-all; max-width: 640px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .verdict { border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 0.95em; line-height: 1.6; max-width: 640px; display: none; }
+  .verdict.ok { display: block; background: #d3f9d8; color: #2b8a3e; }
+  .verdict.ng { display: block; background: #ffe3e3; color: #a61e1e; }
+</style>
+</head>
+<body>
+<h1>📷 カメラの確認</h1>
+<p class="lead">
+  入荷受付チェックの読み取り機能とは<b>切り離した、いちばん単純な確認</b>です。
+  カメラを1回だけ開いて、10秒ぶんの様子をそのまま出します。
+  <br>この画面で映れば端末は問題なし、映らなければ端末側の問題、と切り分けられます。
+</p>
+<div class="row">
+  <button class="go" id="start">カメラを開く</button>
+  <button id="stop">止める</button>
+  <button id="copy">結果をコピー</button>
+</div>
+<div class="verdict" id="verdict"></div>
+<video id="v" playsinline muted autoplay></video>
+<div id="log">「カメラを開く」を押してください。</div>
+
+<script>
+(function () {
+  'use strict';
+  var lines = [];
+  var logEl = document.getElementById('log');
+  var v = document.getElementById('v');
+  var verdict = document.getElementById('verdict');
+  var t0 = 0, timer = null, stream = null, frames = 0, lastTime = -1, endedAt = null;
+  var now = function () { return (window.performance && performance.now) ? performance.now() : Date.now(); };
+  var ms = function () { return Math.round(now() - t0) + 'ms'; };
+  function log(s) { lines.push(s); logEl.textContent = lines.join('\n'); }
+  function say(kind, html) { verdict.className = 'verdict ' + kind; verdict.innerHTML = html; }
+
+  function env() {
+    var ua = navigator.userAgent || '';
+    var isIpad = /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+    var kind = isIpad ? 'iPad' : /iPhone/.test(ua) ? 'iPhone' : 'その他';
+    var m = ua.match(/OS (\d+)[_.](\d+)/);
+    var standalone = !!(window.navigator.standalone
+      || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+    log('端末: ' + kind + (m ? ' UA' + m[1] + '.' + m[2] : '') + ' / ' + (standalone ? 'ホーム画面から起動' : 'ブラウザで起動'));
+    log('画面: 窓 ' + window.innerWidth + 'x' + window.innerHeight
+      + ' / 画面 ' + ((window.screen && window.screen.width) || '?') + 'x' + ((window.screen && window.screen.height) || '?'));
+    log('接続: ' + location.protocol + ' / secureContext=' + (window.isSecureContext ? 'はい' : 'いいえ'));
+    log('API: getUserMedia=' + (navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? 'あり' : 'なし'));
+  }
+
+  function stopAll(why) {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (stream) { stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} }); stream = null; }
+    v.srcObject = null;
+    if (why) log(why);
+  }
+
+  document.getElementById('stop').addEventListener('click', function () { stopAll('— 手で止めました —'); });
+  document.getElementById('copy').addEventListener('click', function () {
+    try { navigator.clipboard.writeText(lines.join('\n')); alert('コピーしました'); }
+    catch (e) { alert('コピーできませんでした。画面を撮って送ってください'); }
+  });
+
+  document.getElementById('start').addEventListener('click', async function () {
+    stopAll(null);
+    lines = []; frames = 0; lastTime = -1; endedAt = null;
+    verdict.className = 'verdict';
+    t0 = now();
+    env();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      log('→ この端末では getUserMedia が使えません');
+      say('ng', 'この端末のブラウザはカメラに対応していません。');
+      return;
+    }
+    // ⭐いちばん緩い条件だけ。条件のせいで落ちる可能性を消す
+    log(ms() + ' getUserMedia({video:true}) を呼びます');
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    } catch (e) {
+      log(ms() + ' ✗ 失敗: ' + (e && e.name ? e.name : '不明'));
+      say('ng', '<b>カメラを開けませんでした (' + (e && e.name ? e.name : '不明') + ')</b>'
+        + '<br>NotAllowedError なら許可の問題、NotReadableError なら他が使っている、'
+        + 'NotFoundError ならカメラが見つかっていません。');
+      return;
+    }
+    log(ms() + ' ✓ 開けました');
+    var track = stream.getVideoTracks()[0] || null;
+    if (track) {
+      var st = {};
+      try { st = track.getSettings ? track.getSettings() : {}; } catch (e) {}
+      log('  カメラ: ' + (st.facingMode || '不明') + ' ' + (st.width || '?') + 'x' + (st.height || '?')
+        + ' / 状態=' + track.readyState + (track.muted ? ' (muted)' : ''));
+      track.addEventListener('ended', function () { endedAt = Math.round(now() - t0); log(ms() + ' ✗ カメラが終了しました (ended)'); });
+      track.addEventListener('mute', function () { log(ms() + ' ⚠ 映像が止まりました (mute)'); });
+      track.addEventListener('unmute', function () { log(ms() + ' ✓ 映像が戻りました (unmute)'); });
+    } else {
+      log('  ⚠ 映像トラックがありません');
+    }
+    v.srcObject = stream;
+    v.muted = true; v.playsInline = true;
+    v.play().then(function () { log(ms() + ' ✓ play() 成功'); },
+                  function (e) { log(ms() + ' ✗ play() 失敗: ' + (e && e.name ? e.name : '不明')); });
+
+    // 10秒ぶん、0.5秒ごとに様子を出す
+    var ticks = 0;
+    timer = setInterval(function () {
+      ticks++;
+      if (v.readyState >= 2 && v.videoWidth && v.currentTime !== lastTime) { lastTime = v.currentTime; frames++; }
+      if (ticks % 2 === 0 || ticks <= 2) {
+        log(ms() + ' 映像=' + v.readyState + ' サイズ=' + v.videoWidth + 'x' + v.videoHeight
+          + ' コマ=' + frames + (track ? ' 状態=' + track.readyState + (track.muted ? '/muted' : '') : ''));
+      }
+      if (ticks >= 20) {
+        clearInterval(timer); timer = null;
+        log('— 10秒たちました —');
+        if (frames >= 3) {
+          say('ok', '<b>カメラは正常に使えています</b> (コマが ' + frames + ' 回進みました)。'
+            + 'この端末とブラウザの組み合わせでは問題ありません。');
+        } else if (endedAt !== null) {
+          say('ng', '<b>カメラを開いた ' + endedAt + 'ms 後に終了しました。</b>'
+            + 'アプリの作りではなく、端末がカメラを手放しています。'
+            + '<br>アプリを完全に終了して開き直す / 端末を再起動する / 他にカメラを使うアプリや'
+            + '別のウィンドウが無いか、を確かめてください。');
+        } else {
+          say('ng', '<b>カメラは開けましたが、映像が1コマも届きませんでした。</b>'
+            + '画面を2分割していないか、ページを拡大していないか、'
+            + '他のアプリがカメラを使っていないかを確かめてください。');
+        }
+        stopAll(null);
+      }
+    }, 500);
+  });
+})();
+</script>
+</body>
+</html>
