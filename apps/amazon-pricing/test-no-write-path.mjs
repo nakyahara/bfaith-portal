@@ -70,8 +70,8 @@ const REGEX_AFTER_KEYWORDS = new Set(['return', 'throw', 'case', 'yield', 'typeo
 /** この語に続く ( ... ) の後の / も正規表現の始まり (if (x) /re/.test(y)) */
 const CONTROL_KEYWORDS = new Set(['if', 'while', 'for', 'with', 'catch']);
 
-/** 文字列・テンプレート・正規表現リテラルを壊さずにコメントだけ取り除く */
-export function stripComments(src) {
+/** 文字列・テンプレート・正規表現リテラルを壊さずにコメントだけ取り除く (blankRegex: 正規表現の中身も潰す) */
+export function stripComments(src, { blankRegex = false } = {}) {
   let out = '';
   let i = 0;
   const n = src.length;
@@ -99,7 +99,17 @@ export function stripComments(src) {
     if (c === "'" || c === '"' || c === '`') { quote = c; out += c; lastSignificant = c; i += 1; continue; }
     if (c === '/' && next === '/') { while (i < n && src[i] !== '\n') i += 1; continue; }
     if (c === '/' && next === '*') { const end = src.indexOf('*/', i + 2); i = end < 0 ? n : end + 2; out += ' '; continue; }
-    if (c === '(') { parenStack.push(CONTROL_KEYWORDS.has(wordBefore())); }
+    if (c === '(') {
+      // for await ( ... ) は直前の語が await なので、その前の語 (for) も見る (Codex R6)
+      const w1 = wordBefore();
+      let isControl = CONTROL_KEYWORDS.has(w1);
+      if (!isControl && w1 === 'await') {
+        const trimmed = out.replace(/\s+$/, '');
+        const before = trimmed.slice(0, trimmed.length - 'await'.length).replace(/\s+$/, '');
+        isControl = /(?:^|[^\w$])for$/.test(before);
+      }
+      parenStack.push(isControl);
+    }
     if (c === ')') { lastCloseWasControl = parenStack.pop() === true; }
     // 正規表現リテラル: 値が来る位置 (演算子・( , = : [ ! & | ? { } ; の後、return/throw 等のキーワードの後、
     // if (...) など制御構文の ) の後、または行頭) の / から、エスケープと [...] を飛ばして次の / まで。
@@ -119,7 +129,7 @@ export function stripComments(src) {
         if (ch === '/') { k += 1; break; }
         k += 1;
       }
-      out += body;
+      out += blankRegex ? '/RE/' : body;
       lastSignificant = '/';
       i = k;
       continue;
@@ -250,7 +260,7 @@ function checkViewFetch(code) {
  * @param {string} src
  * @param {{isView?:boolean, checkImports?:boolean}} opts
  */
-export function scanSource(src, { isView = false, checkImports = true, external = false } = {}) {
+export function scanSource(src, { isView = false, checkImports = true, external = false, fragment = false } = {}) {
   const problems = [];
   // 外部モジュール (warehouse-mirror/db.js 等) は URL の文字列や "request" という語を持つが、それ自体は通信ではない。
   // 通信の実体 (fetch / require / import( / node: / net / tls …) の禁止はそのまま効く
@@ -275,7 +285,7 @@ export function scanSource(src, { isView = false, checkImports = true, external 
     // EJS タグ (<% %> / <%= %> / <%- %>) の中身はサーバで実行される JS。サーバ側の規則で検査する (Codex R3 High)
     const serverSnippets = [...src.matchAll(/<%[-=_#]?([^]*?)[-_]?%>/g)].map((m) => m[1]).filter((s) => !/^\s*#/.test(s));
     for (const s of serverSnippets) {
-      for (const p of scanSource(s, { isView: false, checkImports: false })) problems.push(`EJS タグの中: ${p}`);
+      for (const p of scanSource(s, { isView: false, checkImports: false, fragment: true })) problems.push(`EJS タグの中: ${p}`);
     }
     // 生の HTML を出す <%- %> は、include と「< を < に変えた JSON」の 2 形だけ (Codex R4: 文字列連結で script src を生成できる)。
     // include の先は**このアプリの views の中**だけ (Codex R5: 商品登録ハブの共通ヘッダは script と <link> を持ち、検査の外だった)
@@ -299,12 +309,25 @@ export function scanSource(src, { isView = false, checkImports = true, external 
     }
     // JS 側: <script> の中身と on*= 属性
     const scripts = [...src.matchAll(/<script\b[^>]*>([^]*?)<\/script>/gi)].map((m) => m[1]);
-    const handlers = [...src.matchAll(/\son\w+=["']([^"']*)["']/gi)].map((m) => m[1]);
-    if (handlers.length) problems.push(`インライン イベントハンドラ (on*=) は使わない: ${handlers[0].slice(0, 40)}`);
+    // インライン イベントハンドラは中身を見ずに**存在だけで**拒否 (引用符なし・実体参照 &#40; 等で書かれても関係ない — Codex R6)
+    const htmlNoScript = html.replace(/<script\b[^>]*>[^]*?<\/script>/gi, ' ');
+    const handlers = [...htmlNoScript.matchAll(/\son\w+\s*=/gi)];
+    if (handlers.length) problems.push(`インライン イベントハンドラ (on*=) は使わない (${handlers.length} 箇所)`);
+    if (/&#x?[0-9a-f]+;/i.test(htmlNoScript)) problems.push('HTML の数値文字参照 (&#..;) は使わない (属性の中身を隠せる)');
     for (const s of scripts) {
       const code = normalize(s);
+      const blankedCode = blankStrings(code);
       for (const w of BANNED_WORDS_VIEW) if (new RegExp(`(?<![\\w$])${w}(?![\\w$])`).test(code)) problems.push(`禁止語 "${w}"`);
       for (const f of BANNED_FRAGMENTS_VIEW) if (code.includes(f)) problems.push(`禁止 "${f}"`);
+      // fetch は「その場で呼ぶ」形だけ。別名に代入する (const send = fetch) と URL の検査をすり抜ける (Codex R6)
+      if (/(?<![\w$])fetch(?![\w$(])/.test(blankedCode)) problems.push('fetch を呼ばずに参照している (別名化)');
+      // form の送り先・送信方法・HTML をスクリプトから書き換える経路 (.action / ['action'] / setAttribute / innerHTML …) は禁止
+      if (/\.(action|method|submit|formAction|formMethod|setAttribute|setAttributeNS|attributes|innerHTML|outerHTML|insertAdjacentHTML|forms|write|writeln|enctype)(?![\w$])/.test(blankedCode)) {
+        problems.push('form の送り先・送信方法・HTML を書き換える API (.action / .method / .submit / setAttribute / innerHTML …) は使わない');
+      }
+      if (/\[\s*['"](action|method|submit|formAction|formMethod|forms|setAttribute|innerHTML)['"]\s*\]/.test(code)) {
+        problems.push('form の送り先・送信方法を計算プロパティで書き換えている');
+      }
       // ブラウザ側は計算プロパティを原則禁止 (数値か単純な文字列リテラルだけ許す)。
       // 文字コードから名前を組み立てる経路 (defaultView[String.fromCharCode(...)]) を塞ぐ (Codex R5)
       for (const h of findComputedNonLiteral(code)) problems.push(`計算プロパティ (ブラウザ側では数値・単純な文字列以外は禁止): ${h.slice(0, 40)}`);
@@ -313,6 +336,16 @@ export function scanSource(src, { isView = false, checkImports = true, external 
     return problems;
   }
   let code = normalize(src);
+  // 正規化 (コメント・正規表現の扱い) が壊れてコードが消えていたら、検査に掛かる前に気づく:
+  // 文字列と正規表現の中身を潰した上で ( ) { } [ ] の数が釣り合わなければ落とす (Codex R6)。EJS タグの断片は対象外
+  if (!fragment) {
+    const skeleton = blankStrings(decodeEscapes(stripComments(src, { blankRegex: true })));
+    for (const [open, close] of [['(', ')'], ['{', '}'], ['[', ']']]) {
+      const o = skeleton.split(open).length - 1;
+      const cl = skeleton.split(close).length - 1;
+      if (o !== cl) problems.push(`正規化後に ${open} と ${close} の数が合わない (${o} / ${cl}) — コメント・正規表現の扱いが壊れているか、コードが壊れている`);
+    }
+  }
   // process.env.X の読み取りと process.cwd() だけは許す (設定の読み取り。ネットワークではない)
   code = code.replace(/\bprocess\.env\.[\w$]+/g, 'ENV_READ').replace(/\bprocess\.cwd\(\)/g, 'CWD_READ');
   for (const w of bannedWords) if (new RegExp(`(?<![\\w$])${w}(?![\\w$])`).test(code)) problems.push(`禁止語 "${w}"`);
@@ -463,6 +496,8 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
     ['Codex R3: \\x 形式', `${j('ev', 'a')}\\x6c(source);`],
     ['Codex R4: return 直後の正規表現の // でコメント誤認', `function marker() { return /[//]/; } ${j('fet', 'ch')}(url);`],
     ['Codex R5: if (...) 直後の正規表現の // でコメント誤認', `if (ok) /[//]/.test(x); ${j('fet', 'ch')}(url);`],
+    ['Codex R6: for await (...) 直後の正規表現の // でコメント誤認', `async function w(xs) { for await (const x of xs) /[//]/.test(x); ${j('fet', 'ch')}(u, o); }`],
+    ['正規化でコードが消えたら括弧の数で気づく', `function f() { const r = a /[//]/ 2; ${j('fet', 'ch')}(u); }`],
     ['Codex R5: 文字コードから名前 (サーバ側)', `const n = String.${j('from', 'CharCode')}(102, 101, 116, 99, 104);`],
     ['Buffer で名前を復号', `const n = ${j('Buf', 'fer')}.from('ZmV0Y2g=', 'base64').toString();`],
     ['Codex R4: global[name] を配列 join で組み立て', `const n = ['fe', 'tch'].join(''); ${j('glob', 'al')}[n](u, { method: 'POST' });`],
@@ -506,6 +541,11 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
     ['setTimeout に文字列', `<script>${j('set', 'Timeout')}('fe' + 'tch(u)', 1);</script>`],
     ['form.submit() で送信', `<script>document.forms[0].${j('sub', 'mit')}();</script>`],
     ['requestSubmit', `<script>f.${j('request', 'Submit')}();</script>`],
+    ['Codex R6: fetch の別名', `<script>const send = ${j('fet', 'ch')}; send('/apps/profit-calculator/api/amazon/manual-list', { method: 'POST', body: '{}' });</script>`],
+    ['Codex R6: form の送り先を計算プロパティで書き換え', `<form method="get" action="/apps/amazon-pricing/"></form><script>const f = document.${j('for', 'ms')}[0]; f['${j('met', 'hod')}'] = 'POST'; f['${j('act', 'ion')}'] = '/apps/profit-calculator/api/amazon/manual-list'; f['${j('sub', 'mit')}']();</script>`],
+    ['Codex R6: 引用符なし + 実体参照の onclick', `<button ${j('on', 'click')}=${j('fet', 'ch')}&#40;&#39;/apps/profit-calculator/api/amazon/manual-list&#39;,&#123;method:&#39;POST&#39;&#125;&#41;>x</button>`],
+    ['setAttribute で action を書き換え', `<script>f.${j('set', 'Attribute')}('action', '/x');</script>`],
+    ['innerHTML で form を生成', `<script>d.${j('inner', 'HTML')} = s;</script>`],
   ];
   for (const [label, code] of VIEW_EVASIONS) {
     const problems = scanSource(code, { isView: true });
@@ -523,7 +563,9 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
   ok(scanSource(`<%- include('_top', { nav: 'index' }) %><%- include('_policy_dialog') %>`, { isView: true }).length === 0, '通る (画面): 同じフォルダの include');
   ok(scanSource(`<form class="filters" method="get" action="/apps/amazon-pricing/"><input type="text" name="q"></form><form method="dialog"><button>x</button></form>`, { isView: true }).length === 0, '通る (画面): GET form と dialog form');
   ok(scanSource(`<script>var t = document.getElementById('toast'); t.style.display = 'block'; var arr = [1, 2]; var first = arr[0]; var v = obj['a-b']; var b = ev.target.closest('button[data-policy]'); setTimeout(function () { location.reload(); }, 600); form.addEventListener('submit', onSubmit);</script>`, { isView: true }).length === 0, '通る (画面): 数値・単純文字列の添字、CSS セレクタの [ ]、関数を渡す setTimeout、submit イベント');
-  ok(scanSource(`if (ok) /[//]/.test(x); const y = (a + b) / 2; while (z) /x/.exec(s);`).length === 0, '通る: 制御構文直後の正規表現と割り算');
+  ok(scanSource(`if (ok) /[//]/.test(x); const y = (a + b) / 2; while (z) /x/.exec(s); async function w(xs) { for await (const x of xs) /[//]/.test(x); }`).length === 0, '通る: 制御構文 (for await 含む) 直後の正規表現と割り算');
+  ok(scanSource(`<script>fetch('/apps/amazon-pricing/api/x', { method: 'POST', headers: { 'Content-Type': 'application/json' } }).then(function (r) { return r.json(); }); form.mode.value = 'x'; dlg.showModal(); tr.getAttribute('data-decision');</script>`, { isView: true }).length === 0, '通る (画面): その場で呼ぶ fetch と { method: } のキー、getAttribute');
+  ok(scanSource(`const re = /\\(/; const s = x.replace(/\\)/g, '');`).length === 0, '通る: 正規表現の中の括弧は数えない');
   ok(scanSource(`<%- include('_top', { nav: 'index' }) %><% for (const r of rows) { %><td><%= yen(r.my_price) %></td><% } %>`, { isView: true }).length === 0, '通る (画面): 普通の EJS タグ');
   ok(scanSource(`<script>openPolicyDialog(<%- JSON.stringify(x).replace(/</g, '\\\\u003c') %>);</script>`, { isView: true }).length === 0, '通る (画面): XSS 対策の \\u003c 置換 (文字列の中)');
 }
