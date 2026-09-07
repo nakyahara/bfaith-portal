@@ -6948,6 +6948,13 @@ renders.push(
       { ...d0[2], setDrafts: sd.setDraftsOf(db, wfSetParentId), setInfo: null }]);
     renders.push(['detail.ejs (セット商品・仮コード警告)', 'detail.ejs',
       { ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId) }]);
+    // 🚨 セット商品は**自分の工程 (set トラック)** で描く。親の workflow を使い回していたため、
+    //    「main に set_review が無い」という本番の形が smoke に一度も現れず、
+    //    画面の JS を丸ごと殺す埋め込み事故 (parent_step_version) を通していた (2026-09-07)
+    renders.push(['detail.ejs (セット商品・セット工程の実データ)', 'detail.ejs',
+      { ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId),
+        draft: { ...d0[2].draft, id: wfSetDraftId, parent_draft_id: wfSetParentId },
+        workflow: wfp.progressOf(wfSetDraftId, { db }) }]);
     // 判断済みの見え方 (2026-09-06)。札に理由まで出て、ボタンは「見直す」に変わる。
     // 🚨 create / existing / hold も描く — none だけだと「判断済みなのに『作らない』と
     //    書いてあるボタン」のような分岐漏れを検出できない (Codex R1)
@@ -8915,6 +8922,17 @@ for (const [name, file, data] of renders) {
 
       pr = await getHtml(`/detail/${idSet}`);
       check('HTTP 画面: セットの詳細が 200 で描ける', pr.status === 200, `${pr.status} ${pr.html.slice(0, 400)}`);
+      {
+        // 🚨 200 で返ってきても、画面の JS が構文エラーなら**ボタンが 1 つも効かない**。
+        //    セット商品では set_review が無く、埋め込みが空文字になって実際にそうなっていた
+        //    (2026-09-07)。実ルートの HTML でも構文を見る
+        const vmMod = await import('node:vm');
+        const js = [...pr.html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).join('\n');
+        let syntaxErr = null;
+        try { new vmMod.Script(js, { filename: 'detail(set).html' }); } catch (e) { syntaxErr = e; }
+        check('HTTP 画面: セットの詳細の JS が構文として通る (ボタンが全部死んでいないこと)',
+          js.length > 500 && syntaxErr === null, syntaxErr?.message || `js=${js.length}`);
+      }
 
       for (const [label, p] of [
         ['一覧', '/list'],
@@ -9031,6 +9049,22 @@ for (const [name, file, data] of renders) {
       check(`client-js syntax ${f}`, true);
     } catch (e) {
       check(`client-js syntax ${f}`, false, e.message);
+    }
+  }
+
+  // 🚨 上のチェックは `<% %>` を `0` に**置き換えて**見るので、埋め込みが空文字になる事故を
+  //    一切検出できない。`parent_step_version: <%= undefined %>` が
+  //    `parent_step_version: ,` になり、セット商品の画面の JS が丸ごと死んでいた (2026-09-07)。
+  //    ここでは**描画済みの HTML** から素の JS を取り出して構文を見る = 埋め込みの結果を見る
+  for (const [name, html] of renderedHtml) {
+    // 属性なしの <script> だけ = ページの JS (type="application/json" のデータ塊は除く)
+    const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    if (blocks.length === 0) continue;
+    try {
+      new vm.Script(blocks.join('\n'), { filename: name });
+      check(`描画後の JS が構文として通る: ${name}`, true);
+    } catch (e) {
+      check(`描画後の JS が構文として通る: ${name}`, false, e.message);
     }
   }
 
