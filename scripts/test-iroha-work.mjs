@@ -4910,6 +4910,35 @@ console.log('\n[27] できた数 — 実績を予定で上書きしない');
       '⭐触らなければ migrated のまま (無操作で「人が数えた値」に格上げしない)');
   }
 
+  // ⑫ ⭐「同じ数だから何もしない」で関門と出どころの直しを素通りさせない (Codex R2 中1)
+  {
+    // (a) 移行値と同じ数を人が入れ直したら、出どころは counted に変わる
+    const t = mk27('dc-13', 9713, 500);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.prepare("UPDATE f_iroha_task_batches SET good_qty = 500, good_qty_source = 'migrated' WHERE id = ?").run(bid);
+    db.transaction(() => { B.recomputeTaskDoneQty(db, t); }).immediate();
+    ok(TD.getTask(t).done_qty === 500, '前提: 移行で 500 が入っている');
+    const r = TD.setProgress({ taskId: t, expectVersion: TD.getTask(t).version, doneQty: 500 });
+    ok(r.ok && !r.already, '数は同じでも「もう終わっている」で返さない');
+    ok(db.prepare('SELECT good_qty_source FROM f_iroha_task_batches WHERE id = ?').get(bid).good_qty_source === 'counted',
+      '⭐移行値と同じ 500 を人が入れ直したら、出どころが counted に変わる (数だけ見て素通りさせない)');
+    // 本当に何も変わらないときは already で返す (版を無駄に上げない)
+    const again = TD.setProgress({ taskId: t, expectVersion: TD.getTask(t).version, doneQty: 500 });
+    ok(again.ok && again.already, '2 回目は「もう終わっている」(版を無駄に上げない)');
+
+    // (b) 分かれたカードでは、合計と同じ数を送っても断る
+    const t2 = mk27('dc-14', 9714, 200);
+    const now14 = new Date().toISOString();
+    db.prepare(`UPDATE f_iroha_task_batches SET good_qty = 120, good_qty_source = 'counted' WHERE task_id = ?`).run(t2);
+    db.prepare(`INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, good_qty, good_qty_source, created_at, updated_at)
+      VALUES (?, 2, 80, 'not_started', 80, 'counted', ?, ?)`).run(t2, now14, now14);
+    db.transaction(() => { B.recomputeTaskDoneQty(db, t2); }).immediate();
+    ok(TD.getTask(t2).done_qty === 200, '前提: まとまり 2 つで合計 200');
+    const same = TD.setProgress({ taskId: t2, expectVersion: TD.getTask(t2).version, doneQty: 200 });
+    ok(!same.ok && same.error === 'split_card',
+      '⭐分かれたカードは、いまの合計と同じ数を送っても断る (関門を素通りさせない)');
+  }
+
   // ── 画面 ──
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
   ok(!/defaultAll/.test(html) && /const cur = \(c\.done_qty == null \|\| migrated\) \? '' : String\(c\.done_qty\);/.test(html),
@@ -4926,11 +4955,15 @@ console.log('\n[27] できた数 — 実績を予定で上書きしない');
     '⭐作れなかった数は「ありません / あります」を選んでもらう (空欄を 0 と読まない)');
   ok(/const loss = !lossPicked \? undefined\s*\r?\n\s*: lossPicked\.dataset\.loss === '0' \? 0/.test(html),
     '何も選んでいなければ「数えていない」として送らない。「ありません」を選んだら 0');
+  ok(/const noteEl = lossPicked && lossPicked\.dataset\.loss === 'ask' \? \(root && root\.querySelector\('\.dqNote'\)\) : null;/.test(html),
+    '⭐ひとことを読むのは「あります」を選んで欄が見えているときだけ (何も触っていないのに空文字を送らない)');
+  ok(/if \(input\) \{ input\.value = b\.dataset\.dq; dqDiff\(input\); \}/.test(html),
+    '⭐タップで数を変えたときも、差の表示と確認をやり直す');
   ok(/Math\.abs\(v\.qty - c\.qty\) > 5 \|\| Math\.abs\(v\.qty - c\.qty\) > c\.qty \* 0\.1/.test(html)
     && /if \(far && doneConfirmed !== v\.qty\)/.test(html),
     '⭐「5 個より多い か 1 割より多い」ずれで、止めずにもう一度だけ確かめる (max だと両方超えたときになる)');
-  ok(/doneConfirmed = null;\s*\r?\n\}/.test(html) && /doneConfirmed = v\.qty;/.test(html),
-    '⭐数を変えたら確認はやり直し (800 で確認を出したあと 80 に直して押す、を通さない)');
+  ok(/doneConfirmed = null;\s*\r?\n\s*const qty = p\.dataset\.qty/.test(html) && /doneConfirmed = v\.qty;/.test(html),
+    '⭐数を変えたら確認はやり直し。早く return する前に戻す (空欄にしたときも解除される)');
   ok(/\.\.\.\(v\.loss !== undefined \? \{ loss_qty: v\.loss \} : \{\}\)/.test(html)
     && /\.\.\.\(v\.note !== undefined \? \{ variance_note: v\.note \} : \{\}\)/.test(html),
     '作れなかった数とひとことは、状態変更と同じ 1 回の通信で送る (空文字も送る = 消せる)');

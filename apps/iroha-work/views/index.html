@@ -4941,6 +4941,8 @@ function dqDiff(el) {
   const panel = el.closest('.dq');
   const p = panel && panel.querySelector('.dqdiff');
   if (!p) return;
+  // ⭐数が変わったら確認はやり直し。**早く return する前に**戻す (空欄にしたときも解除する — Codex R2 軽微)
+  doneConfirmed = null;
   const qty = p.dataset.qty === '' ? null : Number(p.dataset.qty);
   const v = String(el.value).trim();
   if (v === '' || qty == null) {
@@ -4950,8 +4952,6 @@ function dqDiff(el) {
   const d = Number(v) - qty;
   p.textContent = d === 0 ? '予定どおりです' : d > 0 ? '予定より ' + d + ' 個 多いです' : '予定より ' + (-d) + ' 個 少ないです';
   p.classList.toggle('warn', d !== 0);
-  // ⭐数を変えたら確認はやり直し。800 で確認を出したあと 80 に直して押す、を通さない (Codex R1 中)
-  doneConfirmed = null;
 }
 /**
  * 入力欄の中身を読む。空文字は「数えていない」= null (0 に丸めない)。
@@ -4970,9 +4970,11 @@ function dqValues(rootSel) {
   const loss = !lossPicked ? undefined
     : lossPicked.dataset.loss === '0' ? 0
     : (lossRaw === '' ? undefined : Number(lossRaw));
-  // ひとことは「ありません」のときは送らない (隠れた欄の中身を持っていかない)。
-  // ⭐空にしたら消せるよう、**空文字も送る** (undefined = 触らない、'' = 消す — Codex R1 中)
-  const noteEl = lossPicked && lossPicked.dataset.loss === '0' ? null : (root && root.querySelector('.dqNote'));
+  // ⭐ひとことを読むのは「**あります**」を選んで欄が見えているときだけ。
+  //   何も選んでいないのに空文字を送ると、数を触っていないのに「数の書き換え」と見なされ、
+  //   分かれたカードで断られてしまう (Codex R2 中2)。
+  //   空にしたら消せるよう、選んでいるときは**空文字も送る** (undefined = 触らない、'' = 消す)
+  const noteEl = lossPicked && lossPicked.dataset.loss === 'ask' ? (root && root.querySelector('.dqNote')) : null;
   return { qty: raw === '' ? null : Number(raw), raw, memo: memoEl ? String(memoEl.value).trim() : '',
     loss, note: noteEl ? String(noteEl.value).trim() : undefined };
 }
@@ -4994,7 +4996,7 @@ document.addEventListener('click', (e) => {
   if (!b) return;
   const panel = b.closest('.dq');
   const input = panel && panel.querySelector('.dqIn');
-  if (input) input.value = b.dataset.dq;
+  if (input) { input.value = b.dataset.dq; dqDiff(input); }   // ⭐タップで変えたときも差の表示と確認をやり直す
 });
 
 // ─── できた数・中断メモを**あとから直す** (状態は変えない) ───

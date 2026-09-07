@@ -787,9 +787,19 @@ export function setProgress({ taskId, doneQty = undefined, lossQty = undefined, 
     }
     const nextQty = dq.skip ? (t.done_qty ?? null) : dq.value;
     const nextMemo = hm.skip ? (t.hold_memo ?? null) : hm.value;
-    if (nextQty === (t.done_qty ?? null) && nextMemo === (t.hold_memo ?? null) && lq2.skip && vn2.skip) return { ok: true, task: t, already: true };
+    // ⭐関門が先。「同じ数だから何もしない」で素通りさせない (Codex R2 中1)
     const split2 = rejectCountsOnSplitCard(db, t.id, !dq.skip || !lq2.skip || !vn2.skip);
     if (split2) return split2;
+    // ⭐「変わっていない」の判定は**まとまり側の値と出どころ**まで見る。
+    //   移行で持ってきた 500 を人が数え直して 500 と入れたとき、数は同じでも
+    //   「人が数えた (counted)」に変える必要がある (Codex R2 中1)
+    const sole2 = soleBatchOfTask(db, t.id);
+    const sameCounts = sole2
+      ? (dq.skip || (dq.value === (sole2.good_qty ?? null) && sole2.good_qty_source !== 'migrated'))
+        && (lq2.skip || lq2.value === (sole2.loss_qty ?? null))
+        && (vn2.skip || vn2.value === (sole2.variance_note ?? null))
+      : (dq.skip && lq2.skip && vn2.skip);
+    if (nextQty === (t.done_qty ?? null) && nextMemo === (t.hold_memo ?? null) && sameCounts) return { ok: true, task: t, already: true };
     const r = db.prepare('UPDATE f_iroha_tasks SET done_qty = ?, hold_memo = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
       .run(nextQty, nextMemo, utcNow(), actor, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
