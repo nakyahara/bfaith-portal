@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<meta name="referrer" content="no-referrer">
+<title>おあずかりしている商品</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --surface:#fff; --line:#dfe3e8; --text:#1b2733; --muted:#5b6b7c;
+    --accent:#1f6feb; --warn:#b45309; --over:#c0392b; --ok:#137a4d; --r:12px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:system-ui,-apple-system,"Hiragino Kaku Gothic ProN","Noto Sans JP",sans-serif;
+    font-size:16px;line-height:1.75;-webkit-text-size-adjust:100%}
+  header{background:var(--surface);border-bottom:1px solid var(--line);padding:14px 16px;position:sticky;top:0;z-index:2}
+  header h1{margin:0;font-size:1.15rem}
+  header .sub{color:var(--muted);font-size:.9rem;margin-top:2px}
+  main{max-width:760px;margin:0 auto;padding:16px}
+  .sum{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+  .sum .box{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:10px 14px;flex:1 1 150px}
+  .sum .box label{display:block;color:var(--muted);font-size:.85rem}
+  .sum .box .v{font-size:1.5rem;font-weight:700;font-variant-numeric:tabular-nums}
+  .sum .box.over .v{color:var(--over)}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:14px;margin-bottom:12px}
+  .card.settled{opacity:.72}
+  .card h2{margin:0 0 4px;font-size:1.05rem;line-height:1.5}
+  .code{color:var(--muted);font-size:.88rem;font-variant-numeric:tabular-nums}
+  .st{display:inline-block;border-radius:999px;padding:3px 10px;font-size:.85rem;border:1px solid var(--line);background:#eef2f6}
+  .st.handed{background:#e7f0ff;border-color:#c3d9ff;color:#12489e}
+  .st.settled{background:#e8f6ee;border-color:#c3e6d3;color:var(--ok)}
+  .st.over{background:#fdecea;border-color:#f5c6c2;color:var(--over)}
+  .nums{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 0;padding:0;list-style:none}
+  .nums li{font-variant-numeric:tabular-nums}
+  .nums li span{display:block;color:var(--muted);font-size:.82rem}
+  .nums li b{font-size:1.15rem}
+  .work{margin-top:10px;border-top:1px dashed var(--line);padding-top:10px}
+  .work h3{margin:0 0 4px;font-size:.92rem;color:var(--muted);font-weight:600}
+  .work dl{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;margin:0}
+  .work dt{color:var(--muted);font-size:.88rem}
+  .work dd{margin:0;font-size:.95rem}
+  .work .note{margin-top:6px;background:#fffbeb;border:1px solid #fde9a9;border-radius:8px;padding:8px 10px;font-size:.95rem}
+  .rets{margin:10px 0 0;padding:0 0 0 18px;font-size:.92rem;color:var(--muted)}
+  .empty{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:24px;text-align:center;color:var(--muted)}
+  .note-ro{margin:18px 0 0;color:var(--muted);font-size:.88rem}
+  .err{background:#fdecea;border:1px solid #f5c6c2;color:var(--over);border-radius:var(--r);padding:12px 14px}
+  @media (prefers-color-scheme: dark){
+    :root{--bg:#11161c;--surface:#182029;--line:#2b3947;--text:#e6edf3;--muted:#9db0c2}
+    .st{background:#232f3c}
+    .work .note{background:#2a2616;border-color:#5c4f1e}
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="facName">おあずかりしている商品</h1>
+  <div class="sub" id="sub">読み込み中…</div>
+</header>
+<main>
+  <div id="body"><div class="empty">読み込み中…</div></div>
+  <p class="note-ro">この画面は<b>見るだけ</b>です。数や状態を変えることはできません。<br>
+    できあがって持っていくときは、いろは にお声がけください。受け取った記録は いろは 側で付けます。</p>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const STATE_LABEL = { planned: 'これから渡します', prepared: '用意ができています', handed: 'おあずかり中', settled: '受け取りずみ' };
+const fmtMd = (ymd) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(ymd || ''));
+  return m ? Number(m[2]) + '月' + Number(m[3]) + '日' : String(ymd || '');
+};
+
+function numsHtml(it) {
+  const n = (label, v) => (v == null ? '' : '<li><span>' + esc(label) + '</span><b>' + esc(String(v)) + '</b> 個</li>');
+  return '<ul class="nums">'
+    + n('お渡しする数', it.state === 'planned' || it.state === 'prepared' ? it.planned_qty : null)
+    + n('お渡しした数', it.handed_qty)
+    + n('お持ちいただいた数', it.returned_qty > 0 ? it.returned_qty : null)
+    + n('残り', it.state === 'handed' ? it.remaining : null)
+    + '</ul>';
+}
+
+function workHtml(w) {
+  if (!w) return '';
+  const rows = [
+    ['保管箱', w.storage_container],
+    ['1 箱に入れる数', w.units_per_container == null ? null : w.units_per_container + ' 個'],
+    ['資材セット', w.material_code],
+  ].filter(([, v]) => v != null && v !== '');
+  if (rows.length === 0 && !w.note) return '';
+  return '<div class="work"><h3>作業のしかた</h3>'
+    + (rows.length ? '<dl>' + rows.map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>').join('') + '</dl>' : '')
+    + (w.note ? '<div class="note">⚠ ' + esc(w.note) + '</div>' : '')
+    + '</div>';
+}
+
+function cardHtml(it) {
+  const stCls = it.overdue ? 'over' : it.state === 'settled' ? 'settled' : it.state === 'handed' ? 'handed' : '';
+  const due = it.due_date
+    ? (it.overdue ? '<span class="st over">' + esc(fmtMd(it.due_date)) + ' までのお約束でした</span>'
+      : '<span class="st">' + esc(fmtMd(it.due_date)) + ' までにお願いします</span>')
+    : '';
+  const rets = (it.returns || []).length
+    ? '<ul class="rets">' + it.returns.map((r) =>
+      '<li>' + esc(fmtMd(r.at)) + ' に ' + esc(String(r.qty)) + ' 個お持ちいただきました'
+      + (r.note ? '（' + esc(r.note) + '）' : '') + '</li>').join('') + '</ul>'
+    : '';
+  return '<article class="card' + (it.state === 'settled' ? ' settled' : '') + '">'
+    + '<h2>' + esc(it.product_name) + '</h2>'
+    + (it.product_code ? '<div class="code">' + esc(it.product_code) + '</div>' : '')
+    + '<div style="margin-top:6px"><span class="st ' + stCls + '">' + esc(STATE_LABEL[it.state] || it.state) + '</span> ' + due + '</div>'
+    + numsHtml(it)
+    + (it.expiry ? '<div class="code" style="margin-top:6px">賞味期限 ' + esc(it.expiry) + '</div>' : '')
+    + workHtml(it.work)
+    + rets
+    + '</article>';
+}
+
+async function load() {
+  let j;
+  try {
+    const r = await fetch(location.pathname.replace(/\/$/, '') + '/api/view', { headers: { Accept: 'application/json' } });
+    j = await r.json();
+  } catch (e) {
+    $('#body').innerHTML = '<div class="err">読み込めませんでした。通信を確かめて、画面を更新してください。</div>';
+    $('#sub').textContent = '';
+    return;
+  }
+  if (!j || !j.ok) {
+    $('#body').innerHTML = '<div class="err">' + esc((j && j.message) || 'いまは見られません') + '</div>';
+    $('#sub').textContent = '';
+    return;
+  }
+  document.title = j.facility.name + ' さんにおあずかりいただいている商品';
+  $('#facName').textContent = j.facility.name + ' さん';
+  const s = j.summary;
+  $('#sub').textContent = 'おあずかり中 ' + s.open_count + ' 件'
+    + (s.overdue_count > 0 ? '（お約束の日を過ぎているもの ' + s.overdue_count + ' 件）' : '');
+  if (!j.items.length) {
+    $('#body').innerHTML = '<div class="empty">いまおあずかりしている商品はありません。</div>';
+    return;
+  }
+  $('#body').innerHTML =
+    '<div class="sum">'
+    + '<div class="box"><label>おあずかり中</label><div class="v">' + esc(String(s.open_count)) + '<span style="font-size:.9rem"> 件</span></div></div>'
+    + '<div class="box"><label>合計</label><div class="v">' + esc(String(s.open_qty)) + '<span style="font-size:.9rem"> 個</span></div></div>'
+    + (s.overdue_count > 0
+      ? '<div class="box over"><label>お約束の日を過ぎています</label><div class="v">' + esc(String(s.overdue_count)) + '<span style="font-size:.9rem"> 件</span></div></div>'
+      : '')
+    + '</div>'
+    + j.items.map(cardHtml).join('');
+}
+load();
+</script>
+</body>
+</html>

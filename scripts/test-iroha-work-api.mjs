@@ -268,6 +268,64 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
   ok(logged >= 1, 'CSV の書き出しが操作履歴に残る');
 }
 
+// ─── 外部施設の専用 URL (HTTP で通す。§AB-11 の 6) ───
+{
+  console.log('\n[F] 外部施設の専用 URL');
+  const D = await import('../apps/iroha-work/db.js');
+  const CG = await import('../apps/iroha-work/consign.js');
+  const B2 = await import('../apps/iroha-work/batches.js');
+  const TD2 = await import('../apps/iroha-work/tasks-db.js');
+
+  // 発行は管理者だけ
+  sessionRole = 'user';
+  const denied = await post('/admin/facility-links', { facility_code: 'workcenter', label: 'だめ' });
+  ok(denied.status === 403, '⭐管理者でなければ発行できない');
+  sessionRole = 'admin';
+  const made = await post('/admin/facility-links', { facility_code: 'workcenter', label: 'ワークセンター 事務所' });
+  ok(made.status === 200 && /^\/apps\/iroha-work\/f\//.test(made.json.url), '管理者は発行できる');
+  const token = made.json.url.split('/f/')[1];
+
+  // ⭐ログインも端末登録もなしで開ける (Host だけ付けて素の GET)
+  const raw = await fetch(`http://${HOST}${made.json.url}`, { headers: { Host: HOST } });
+  const html = await raw.text();
+  ok(raw.status === 200 && /おあずかりしている商品/.test(html), '⭐URL だけで画面が開く');
+  ok((raw.headers.get('x-robots-tag') || '').includes('noindex'), '⭐検索よけのヘッダーが付く');
+  ok((raw.headers.get('cache-control') || '').includes('no-store'), '⭐キャッシュさせない');
+  ok((raw.headers.get('referrer-policy') || '') === 'no-referrer', '⭐リファラを送らない');
+
+  // 中身 (その施設のぶんだけ)
+  const t = upsertTaskFromImport({ notion_page_id: 'flapi-1', status: 'not_started', facility_code: 'iroha',
+    destination_id: 8801, product_name: '専用URL の商品', qty: 400 }, { batchId: 'flapi' }).id;
+  const b0 = B2.listBatchesOfTask(getDB(), t)[0];
+  const cg = CG.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 400,
+    expectVersion: TD2.getTask(t).version });
+  CG.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+  const api = await fetch(`http://${HOST}${made.json.url}/api/view`, { headers: { Host: HOST } });
+  const view = await api.json();
+  ok(api.status === 200 && view.ok && view.facility.code === 'workcenter', '⭐中身も URL だけで読める');
+  ok(view.items.some((x) => x.product_name === '専用URL の商品' && x.handed_qty === 400), '預けたぶんが出る');
+
+  // ⭐書き込みは受け付けない
+  const wr = await fetch(`http://${HOST}${made.json.url}/api/view`, {
+    method: 'POST', headers: { Host: HOST, Origin: `http://${HOST}`, 'Content-Type': 'application/json' }, body: '{}' });
+  ok(wr.status === 404 || wr.status === 405, '⭐POST は受け付けない (見るだけ)');
+
+  // でたらめ・失効したトークン
+  const bad = await fetch(`http://${HOST}/apps/iroha-work/f/${'x'.repeat(43)}`, { headers: { Host: HOST } });
+  ok(bad.status === 404, 'でたらめなトークンは 404');
+  const badBody = await bad.text();
+  ok(!/おあずかりしている商品/.test(badBody) && /見られません/.test(badBody), '⭐理由は分けて教えない (総当たりの手がかりにしない)');
+  const links = D.listFacilityLinks(true);
+  const mine = links.find((l) => l.label === 'ワークセンター 事務所');
+  const rev = await post('/admin/facility-links/' + mine.id + '/revoke');
+  ok(rev.status === 200, '失効させられる');
+  ok((await fetch(`http://${HOST}${made.json.url}`, { headers: { Host: HOST } })).status === 404,
+    '⭐失効させたら開けない');
+  sessionRole = 'user';
+  ok((await post('/admin/facility-links/' + mine.id + '/revoke')).status === 403, '⭐失効も管理者だけ');
+  sessionRole = 'admin';
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 // process.exit で落とすと、開いたままの接続を libuv が abort することがある
 // (feedback_notify_job_exit_libuv_crash)。閉じてから終了コードだけ置いて自然に終わらせる

@@ -28,13 +28,14 @@ import {
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
   getCachePage, startSessions, stopSession, stopSessions, undoStopSessions, sessionsOverlappingDay, listSessionsForAdmin, searchSessions, SESSION_SEARCH_MAX, jstDayStartUtc, voidSession,
+  createFacilityLink, verifyFacilityLink, listFacilityLinks, revokeFacilityLink,
   getMeta, setMetaValue, sourceOfTruth,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
-import { countTasksByStatus, listTasksNeedingReview, listOrphans } from './tasks-db.js';
+import { countTasksByStatus, listTasksNeedingReview, listOrphans, listFacilities } from './tasks-db.js';
 import { OPEN_STATUSES } from './tasks.js';
-import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
+import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, buildFacilityView, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
 import { batchTransitionNeedsStaff } from './batches.js';
@@ -207,6 +208,9 @@ function checkOrigin(req, res, next) {
 function access(req, res, next) {
   if (req.path === '/manifest.json' || req.path === '/sw.js') return next();   // 静的 (中身に秘密なし)
   if (req.path === '/enroll' || req.path === '/enroll/redeem') return next();
+  // ⭐外部施設の専用 URL (要件 §AB-11 の 6)。ログインも端末登録もせず、**URL のトークンだけ**で入る。
+  //   中身は router.use('/f', ...) がトークンを確かめてから決める (ここは素通しするだけ)
+  if (req.path === '/f' || req.path.startsWith('/f/')) return next();
   // 🏷 印刷係 (いろはPC) は Cookie ではなく Authorization ヘッダーで名乗る。/print/ 配下はここでは素通しし、
   //   router.use('/print', requirePrintAgent) が kind='agent' の端末だけを通す (iPad の端末Cookieでは絶対に印刷ジョブを取れない)
   if (req.path === '/print' || req.path.startsWith('/print/')) return next();
@@ -2139,6 +2143,61 @@ router.get('/admin/sessions/search.csv', requireAdmin, api((req, res) => {
 }));
 
 // ─── 管理画面 ───
+// ─── 外部施設の専用 URL (読むだけ。要件 §AB-11 の 6) ───
+
+/**
+ * ⭐この配下は**ログインも端末登録もいらない**。URL に入っているトークンだけが鍵なので、
+ *   ここでの約束を厳しくする:
+ *   - 検索よけ (noindex) と **リファラを送らない** (URL が他所のログに残らないように)
+ *   - キャッシュさせない (共用 PC のブラウザに中身が残らないように)
+ *   - **書き込みの口を作らない** (GET だけ。返却の確定はいろは側 — 要件 §AB-7)
+ *   - 中身はその施設に預けたぶんだけ・個人情報なし (buildFacilityView)
+ */
+function facilityLinkGate(req, res, next) {
+  res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('Cache-Control', 'no-store');
+  const link = verifyFacilityLink(req.params.token);
+  if (!link) {
+    // ⭐当たらなかった理由 (無い / 失効した / 期限切れ) を分けて教えない (総当たりの手がかりにしない)
+    res.status(404);
+    return res.type('html').send('<!doctype html><meta charset="utf-8"><meta name="robots" content="noindex">'
+      + '<title>見られません</title><body style="font-family:system-ui;padding:24px;line-height:1.8">'
+      + '<h1 style="font-size:1.2rem">この URL は見られません</h1>'
+      + '<p>期限が切れているか、使えなくなっています。いろは にお問い合わせください。</p></body>');
+  }
+  req.iwFacilityLink = link;
+  next();
+}
+
+router.get('/f/:token', facilityLinkGate, (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'facility.html'));
+});
+router.get('/f/:token/api/view', facilityLinkGate, api((req, res) => {
+  const view = buildFacilityView(req.iwFacilityLink.facility_code);
+  if (!view) return res.status(404).json({ ok: false, error: 'not_found', message: 'この拠点は見られません' });
+  res.json({ ok: true, ...view });
+}));
+
+// ─── 施設リンクの発行・失効 (管理者だけ) ───
+
+router.post('/admin/facility-links', checkOrigin, requireAdmin, api((req, res) => {
+  try {
+    // ⭐平文のトークンを返すのはこの 1 回だけ (DB にはハッシュしか残らない)
+    const r = createFacilityLink(req.body?.facility_code, req.body?.label, req.session.email,
+      { expiresAt: req.body?.expires_at || null });
+    res.json({ ok: true, id: r.id, url: `${BASE}/f/${r.token}` });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: 'bad_request', message: e.message });
+  }
+}));
+router.post('/admin/facility-links/:id(\\d+)/revoke', checkOrigin, requireAdmin, api((req, res) => {
+  if (!revokeFacilityLink(Number(req.params.id))) {
+    return res.status(404).json({ ok: false, error: 'not_found', message: 'そのリンクは見つかりません (もう失効しています)' });
+  }
+  res.json({ ok: true });
+}));
+
 router.get('/admin', requireSession, api((req, res) => {
   res.render(path.join(__dirname, 'views/admin'), {
     title: 'いろは在庫化 作業アプリ 管理',
@@ -2157,6 +2216,8 @@ router.get('/admin', requireSession, api((req, res) => {
     printAgents: listPrintAgents(),
     printJobs: listPrintJobs(30).map(j => ({ ...publicJob(j), device_label: j.device_label })),
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
+    facilityLinks: isAdmin(req) ? listFacilityLinks(true) : [],
+    externalFacilities: listFacilities().filter((f) => f.external),
     events: listEvents(50),
     sessions: listSessionsForAdmin(50),
     media: listMediaForAdmin(50),

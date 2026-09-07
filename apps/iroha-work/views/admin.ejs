@@ -67,7 +67,7 @@
       <span class="lbl">よく使う</span>
       <a href="#sec-workers">👤 名簿</a><a href="#sec-options">🧰 選択肢</a><a href="#sec-find">🔎 記録をさがす</a>
       <span class="lbl">設定・確認</span>
-      <a href="#sec-devices">📱 iPad</a><a href="#sec-print">🏷 箱ラベル</a><a href="#sec-notion">🗂 Notion</a><a href="#sec-migrate">🚚 移行</a>
+      <a href="#sec-devices">📱 iPad</a><a href="#sec-flinks">🚚 外部施設の URL</a><a href="#sec-print">🏷 箱ラベル</a><a href="#sec-notion">🗂 Notion</a><a href="#sec-migrate">🚚 移行</a>
       <a href="#sec-sessions">⏱ セッション</a><a href="#sec-media">📷 写真</a><a href="#sec-log">📋 操作履歴</a>
     </nav>
 
@@ -298,6 +298,43 @@
           </tr>
         <% } %>
         <% if (devices.length === 0) { %><tr><td colspan="4">登録された端末はありません</td></tr><% } %>
+      </table>
+    </div>
+
+    <div class="iw-box">
+      <h2 id="sec-flinks">🚚 外部施設に渡す URL (見るだけ)</h2>
+      <p class="hint">
+        羅針盤・ワークセンターに渡す<b>読むだけの URL</b> です。おあずかりしている商品・数・返す期限・作業のしかたが見えます。
+        <b>数や状態は変えられません</b> (返却の記録は いろは 側で付けます)。
+        ⚠<b>URL そのものが鍵</b>です。人・部署ごとに分けて発行し、渡した相手が変わったら失効させてください。
+        <b>発行したときの 1 回だけ</b>画面に出ます (あとから見返せません)。
+      </p>
+      <div class="row">
+        <select id="flFac">
+          <% for (const f of externalFacilities) { %><option value="<%= f.code %>"><%= f.name %></option><% } %>
+        </select>
+        <input type="text" id="flLabel" placeholder="渡す相手 (例: ワークセンター 事務所)" maxlength="60">
+        <input type="date" id="flExp" title="期限 (空なら期限なし)">
+        <button onclick="issueFacilityLink()">🚚 URL を発行</button>
+        <span class="msg" id="flMsg"></span>
+      </div>
+      <div id="flOut" style="display:none;margin-top:10px">
+        <input type="text" id="flUrl" readonly style="width:100%;font-family:monospace" onclick="this.select()">
+        <p class="hint">この URL をコピーして渡してください。<b>この画面を閉じると二度と見られません。</b></p>
+      </div>
+      <table class="iw-list" style="margin-top:10px">
+        <tr><th>拠点</th><th>渡した相手</th><th>発行</th><th>期限</th><th>最後に見た</th><th></th></tr>
+        <% for (const l of facilityLinks) { %>
+          <tr class="<%= l.revoked_at ? 'revoked' : '' %>">
+            <td><%= l.facility_name || l.facility_code %></td>
+            <td><%= l.label %></td>
+            <td><%= new Date(l.created_at).toLocaleDateString('ja-JP') %> (<%= l.created_by || '-' %>)</td>
+            <td><%= l.expires_at || 'なし' %></td>
+            <td><%= l.last_seen_at ? new Date(l.last_seen_at).toLocaleString('ja-JP') : 'まだ見ていません' %></td>
+            <td><% if (!l.revoked_at) { %><button class="btn-sm" onclick="revokeFacilityLink(<%= l.id %>)">失効</button><% } else { %>失効ずみ<% } %></td>
+          </tr>
+        <% } %>
+        <% if (facilityLinks.length === 0) { %><tr><td colspan="6">まだ発行していません</td></tr><% } %>
       </table>
     </div>
 
@@ -692,6 +729,25 @@
       document.getElementById('ecOut').style.display = 'block';
       document.getElementById('ecCode').textContent = json.code;
       document.getElementById('ecNote').textContent = '「' + json.label + '」用 ・ ' + json.ttlMinutes + '分間有効 ・ 1回だけ使えます';
+    }
+    async function issueFacilityLink() {
+      const facility_code = document.getElementById('flFac').value;
+      const label = document.getElementById('flLabel').value.trim();
+      const expires_at = document.getElementById('flExp').value || null;
+      if (!label) { setMsg('flMsg', 'err', '渡す相手を入れてください'); return; }
+      const { json } = await post('/admin/facility-links', { facility_code, label, expires_at });
+      if (!json.ok) { setMsg('flMsg', 'err', json.message || '発行できませんでした'); return; }
+      setMsg('flMsg', 'ok', '発行しました (この 1 回だけ表示されます)');
+      document.getElementById('flOut').style.display = 'block';
+      const box = document.getElementById('flUrl');
+      box.value = location.origin + json.url;
+      box.select();
+    }
+    async function revokeFacilityLink(id) {
+      if (!confirm('この URL を失効させます。渡した相手は見られなくなります。よろしいですか?')) return;
+      const { json } = await post('/admin/facility-links/' + id + '/revoke');
+      if (json.ok) location.reload();
+      else alert(json.message || '失効できませんでした');
     }
     async function retryMedia(id) {
       const { json } = await post('/admin/media/' + id + '/retry');

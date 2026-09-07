@@ -759,6 +759,24 @@ export function createTables(db = getMirrorDB()) {
       revoked_at   TEXT
     );
 
+    -- ⭐外部施設に渡す「読むだけの専用 URL」(要件 §AB-11 の 6)。
+    -- 羅針盤・ワークセンターは このアプリを触らないので、預けた物の状態だけを見られる窓口を別に用意する。
+    -- ⚠**個人情報は出さない**・**書き換えはできない** (要件 §AB-13)。
+    --   トークンは 32 バイトの乱数を base64url にしたもの。**ハッシュだけ保存**し、平文は発行時に 1 回だけ見せる。
+    --   施設ごとに何本でも出せて (人・部署ごとに分けられる)、1 本ずつ失効できる
+    CREATE TABLE IF NOT EXISTS f_iroha_facility_links (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      facility_code TEXT NOT NULL REFERENCES f_iroha_facilities(code),
+      token_hash    TEXT NOT NULL UNIQUE,
+      label         TEXT NOT NULL,                -- 誰に渡したか (例: ワークセンター 事務所)
+      created_by    TEXT,
+      created_at    TEXT NOT NULL,
+      expires_at    TEXT,                         -- 期限 (NULL = 期限なし)
+      last_seen_at  TEXT,
+      revoked_at    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_iw_flink_fac ON f_iroha_facility_links(facility_code);
+
     CREATE TABLE IF NOT EXISTS f_iroha_app_enroll_codes (
       id             INTEGER PRIMARY KEY AUTOINCREMENT,
       code_hash      TEXT NOT NULL UNIQUE,
@@ -1694,6 +1712,60 @@ export function verifyDevice(token) {
     db.prepare('UPDATE f_iroha_app_devices SET last_seen_at = ? WHERE id = ?').run(now, row.id);
   }
   return row;
+}
+
+// ─── 外部施設の専用 URL (読むだけ。要件 §AB-11 の 6) ───
+
+/**
+ * 施設用のリンクを 1 本発行する。⭐**平文のトークンはここで 1 回返すだけ**で、DB にはハッシュしか残らない。
+ * @returns {{ id, token }}
+ */
+export function createFacilityLink(facilityCode, label, actor = null, { expiresAt = null } = {}) {
+  const code = String(facilityCode || '').trim();
+  const fac = getDB().prepare('SELECT code, external FROM f_iroha_facilities WHERE code = ? AND active = 1').get(code);
+  if (!fac) throw new Error('その拠点は選べません');
+  if (!fac.external) throw new Error('専用 URL を渡すのは、いろは以外の事業者だけです');
+  const l = String(label || '').trim();
+  if (!l || l.length > 60) throw new Error('渡す相手の名前を 1〜60 文字で入れてください');
+  if (expiresAt != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(expiresAt))) throw new Error('期限は YYYY-MM-DD で入れてください');
+  const token = crypto.randomBytes(32).toString('base64url');
+  const info = getDB().prepare(`INSERT INTO f_iroha_facility_links
+      (facility_code, token_hash, label, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(code, hashToken(token), l, actor, utcNow(), expiresAt || null);
+  return { id: Number(info.lastInsertRowid), token };
+}
+
+/**
+ * トークンから施設リンクを引く。失効・期限切れは null。
+ * ⭐**当たったときだけ** last_seen_at を更新する (1 時間に 1 回へ間引く — 端末トークンと同じ流儀)。
+ *   読むだけの画面だが「いつ見に来たか」は監査に要る (誰に渡した URL が生きているかを職員が判断する材料)
+ */
+export function verifyFacilityLink(token) {
+  if (!token || typeof token !== 'string' || token.length > 200) return null;
+  const db = getDB();
+  const row = db.prepare('SELECT * FROM f_iroha_facility_links WHERE token_hash = ? AND revoked_at IS NULL').get(hashToken(token));
+  if (!row) return null;
+  // 期限は「その日いっぱい」(YYYY-MM-DD の 23:59 JST まで) — 渡した相手が当日に見られないのを避ける
+  if (row.expires_at && new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10) > row.expires_at) return null;
+  const now = utcNow();
+  if (!row.last_seen_at || Date.parse(now) - Date.parse(row.last_seen_at) > 3600_000) {
+    db.prepare('UPDATE f_iroha_facility_links SET last_seen_at = ? WHERE id = ?').run(now, row.id);
+  }
+  return row;
+}
+
+/** 発行ずみのリンク (管理画面用)。⭐トークンそのものは出せない (ハッシュしか無い) */
+export function listFacilityLinks(includeRevoked = false) {
+  return getDB().prepare(`SELECT l.id, l.facility_code, f.name AS facility_name, l.label, l.created_by, l.created_at,
+      l.expires_at, l.last_seen_at, l.revoked_at
+    FROM f_iroha_facility_links l LEFT JOIN f_iroha_facilities f ON f.code = l.facility_code
+    ${includeRevoked ? '' : 'WHERE l.revoked_at IS NULL'} ORDER BY l.revoked_at IS NOT NULL, l.id DESC`).all();
+}
+
+/** 1 本だけ失効させる (渡した相手が変わった・漏れたとき)。@returns 直したか */
+export function revokeFacilityLink(id) {
+  return getDB().prepare('UPDATE f_iroha_facility_links SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL')
+    .run(utcNow(), Number(id)).changes > 0;
 }
 
 /** 端末の職員モード。PIN を確かめた側が呼ぶ。@returns 期限 (ISO) */

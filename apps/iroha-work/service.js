@@ -494,6 +494,82 @@ export function expandBatchRows(cards, { forPlan = false } = {}) {
 }
 
 /**
+ * ⭐外部施設に見せる内容 (要件 §AB-11 の 6)。**読むだけ・その施設に預けたぶんだけ**。
+ *
+ * 中原さん 2026-09-07:
+ * > 外部の施設からは専用の URL で、何を預けたか・どう作業するかの情報は見れるようにしたい
+ *
+ * ⚠**出さないもの** (要件 §AB-13「個人情報を出さない」):
+ *   作業した人の名前・写真・いろは内部のメモ (申し送り・止まっている理由)・在庫や売上の数字・
+ *   他の施設のぶん・いろはが自分で作業しているぶん。
+ * ⚠**返却の確定はいろは側** (§AB-7)。ここからは何も書き換えられない。
+ */
+export function buildFacilityView(facilityCode) {
+  const db = getDB();
+  const fac = db.prepare('SELECT code, name FROM f_iroha_facilities WHERE code = ?').get(facilityCode);
+  if (!fac) return null;
+  // その施設あての預けだけ。取消したものは出さない (無かったことになったぶん)
+  const rows = db.prepare(`SELECT c.id, c.state, c.planned_qty, c.prepared_qty, c.handed_qty, c.missing_qty,
+      c.due_date, c.planned_at, c.prepared_at, c.handed_at, c.settled_at,
+      b.id AS batch_id, b.expiry,
+      t.id AS task_id, t.product_name, t.product_code, t.master_snapshot
+    FROM f_iroha_consignments c
+    JOIN f_iroha_task_batches b ON b.id = c.batch_id
+    JOIN f_iroha_tasks t ON t.id = b.task_id
+    WHERE c.facility_code = ? AND c.state <> 'cancelled'
+    ORDER BY (c.state = 'settled'), c.due_date IS NULL, c.due_date, c.id DESC`).all(facilityCode);
+  const returnsOf = db.prepare(`SELECT returned_qty, good_qty, loss_qty, returned_at, note
+    FROM f_iroha_consignment_returns WHERE consignment_id = ? ORDER BY id`);
+  const today = jstToday();
+  const items = rows.map((r) => {
+    // 作業のしかた = 作業仕様。カード作成時のスナップショットを使う (渡した時点の指示 — §AB-13)
+    let snap = null;
+    try { snap = r.master_snapshot ? JSON.parse(r.master_snapshot) : null; } catch { /* 壊れていれば出さないだけ */ }
+    const back = returnsOf.all(r.id);
+    const returned = back.reduce((a, x) => a + Number(x.returned_qty), 0);
+    const qty = r.handed_qty ?? r.planned_qty;
+    return {
+      id: r.id,
+      product_name: r.product_name || '(名称なし)',
+      product_code: r.product_code || null,
+      expiry: r.expiry || null,
+      state: r.state,
+      // 数は「渡す予定 → 用意ずみ → 渡した」を別々に見せる (1 つにまとめない — §AB-7)
+      planned_qty: r.planned_qty, prepared_qty: r.prepared_qty ?? null, handed_qty: r.handed_qty ?? null,
+      returned_qty: returned || 0,
+      remaining: r.handed_qty == null ? null : Math.max(0, r.handed_qty - returned - (r.missing_qty ?? 0)),
+      due_date: r.due_date || null,
+      overdue: !!(r.due_date && r.state === 'handed' && r.due_date < today),
+      handed_at: r.handed_at || null,
+      settled_at: r.settled_at || null,
+      // ⭐作業のしかた (どう作業するか)。作業仕様マスタの項目そのもので、個人名やいろは内部のメモは入っていない
+      work: snap ? {
+        material_code: snap.material_code || null,          // 資材セットID
+        storage_container: snap.storage_container || null,  // 保管箱
+        units_per_container: snap.units_per_container ?? null,
+        process_count: snap.process_count ?? null,
+        note: snap.note || null,                            // 気をつけること
+      } : null,
+      // 返却の記録 (いつ何個持ってきたか)。記録した人の名前は出さない
+      returns: back.map((x) => ({ qty: x.returned_qty, good_qty: x.good_qty ?? null, loss_qty: x.loss_qty ?? null,
+        at: x.returned_at, note: x.note || null })),
+      qty,
+    };
+  });
+  const open = items.filter((x) => x.state !== 'settled');
+  return {
+    facility: { code: fac.code, name: fac.name },
+    today,
+    items,
+    summary: {
+      open_count: open.length,
+      open_qty: open.reduce((a, x) => a + (x.handed_qty ?? x.planned_qty ?? 0), 0),
+      overdue_count: open.filter((x) => x.overdue).length,
+    },
+  };
+}
+
+/**
  * ⭐**明日の計画のための行** (要件 §AB-11 の 5b / Codex R3 中1)。
  *
  * この画面が決めるのは「**いつ**やるか」で、いつ は**カードの軸** (要件 §W-4)。
