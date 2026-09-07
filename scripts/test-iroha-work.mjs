@@ -4022,7 +4022,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v11'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v13'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -4281,7 +4281,9 @@ console.log('\n[23] 画面に許す操作 (capabilities) — 正本ごとの許�
   ok(app.includes(CAP.LABEL_PRINT) && !notion.includes(CAP.LABEL_PRINT) && !pv.includes(CAP.LABEL_PRINT),
     '🏷 箱ラベルの印刷はアプリ正本の利用者にも許す (箱に貼るのは作業した人)。Notion 正本・下見では許さない (中原さん 2026-09-06)');
   ok(notion.includes(CAP.DAILY_REPORT) && app.includes(CAP.DAILY_REPORT) && !pv.includes(CAP.DAILY_REPORT), '日報 (report.daily) は読むだけだが許可の表に載せる。下見では許さない');
-  ok(staffCaps.length === 14 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 14 個・重複なし');
+  ok(staffCaps.length === 15 && new Set(staffCaps).size === staffCaps.length, 'アプリ正本 (職員) の許可は 15 個・重複なし');
+  ok(staffCaps.includes(CAP.CONSIGN) && !app.includes(CAP.CONSIGN),
+    '🚚 外部にあずける (task.consign) は職員だけ — 利用者の画面には描かない (要件 §AB-7)');
   app.push('x'); pv.push('y');
   ok(!capabilitiesFor('app').includes('x') && capabilitiesFor('preview').length === 0, '返した配列を壊しても共有の定義は変わらない');
   ok(capabilitiesFor('unknown').length === 0 && capabilitiesFor(undefined).length === 0, '知らないモードは何も許さない (default-deny)');
@@ -5205,6 +5207,616 @@ console.log('\n[28] 棚に入れた記録 — 作業のまとまりを割って�
 
     const escaped = render({ stocking: [{ qty: 1, stocked_at: 'x', stocked_by: '<script>' }] });
     ok(/&lt;script&gt;/.test(escaped) && !/<script>/.test(escaped), '画面に出す文字は esc を通す');
+  }
+}
+
+// ═══════ 🚚 外部施設にあずける (要件 §AB-5 / §AB-7) ═══════
+console.log('\n[29] 外部施設にあずける — まとまりを割る・渡す・返却');
+{
+  const db = getDB();
+  const B = await import('../apps/iroha-work/batches.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const C = await import('../apps/iroha-work/consign.js');
+  const mk29 = (page, dest, qty) => TD.upsertTaskFromImport({ notion_page_id: page, status: 'not_started',
+    facility_code: 'iroha', destination_id: dest, product_name: 'あずけの検査', qty }, { batchId: 'cg' }).id;
+  const v29 = (id) => TD.getTask(id).version;
+  const sole = (id) => B.listBatchesOfTask(db, id).filter((b) => b.work_status !== 'cancelled');
+
+  // ① 一部を預ける → まとまりが 2 つに割れる
+  {
+    const t = mk29('cg-1', 9931, 1000);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 600,
+      dueDate: '2026-09-21', expectVersion: v29(t), actor: 'やまだ' });
+    ok(r.ok, '⭐600 個をワークセンターに預けられる');
+    const bs = sole(t);
+    ok(bs.length === 2, 'まとまりが 2 つになる');
+    const mine = bs.find((b) => b.facility_code === 'iroha' || !b.facility_code);
+    const away = bs.find((b) => b.facility_code === 'workcenter');
+    ok(mine.planned_qty === 400 && away.planned_qty === 600,
+      '⭐元のまとまりは予定数が減るだけ (1000 → 400)。切り出したぶんが 600');
+    ok(away.split_from_batch_id === mine.id && away.split_qty === 600 && away.split_by === 'やまだ',
+      '⭐どこから切り出したかが残る (履歴を監査ログだけに頼らない)');
+    ok(away.expiry === mine.expiry, '期限は元からコピーする');
+    ok(r.consignment.state === 'planned' && r.consignment.planned_qty === 600 && r.consignment.due_date === '2026-09-21',
+      '預けの記録ができる (まだ渡していない)');
+    ok(r.consignment.handed_qty == null, '⭐渡す前は「渡した数」を持たない');
+
+    // ② 渡した — 当日 78 個しかなかった、が普通に起きる
+    const h = C.markHanded({ consignmentId: r.consignment.id, qty: 590, expectVersion: r.consignment.version, actor: 'やまだ' });
+    ok(h.ok && h.consignment.state === 'handed' && h.consignment.handed_qty === 590 && h.consignment.planned_qty === 600,
+      '⭐渡した数 (590) は別に持つ。予定 (600) を書き換えない — 600 枚ぶん用意した履歴が消えるので');
+    ok(db.prepare('SELECT work_status FROM f_iroha_task_batches WHERE id = ?').get(away.id).work_status === 'in_progress',
+      '渡したら、そのぶんは作業中 (外部が作業している)');
+
+    // ③ 返却は何回でも
+    const c1 = C.getConsignment(r.consignment.id);
+    const r1 = C.recordReturn({ consignmentId: c1.id, returnedQty: 300, goodQty: 298, lossQty: 2,
+      expectVersion: c1.version, actor: 'やまだ', idempotencyKey: 'ret-a' });
+    ok(r1.ok && !r1.settled && r1.consignment.state === 'handed', '⭐一度で全部returnらなくてよい (300 個だけ返ってきた)');
+    const dup = C.recordReturn({ consignmentId: c1.id, returnedQty: 300, expectVersion: r1.consignment.version, idempotencyKey: 'ret-a' });
+    ok(dup.ok && dup.replayed, '同じ鍵の再送は二度受け取らない');
+    const r2 = C.recordReturn({ consignmentId: c1.id, returnedQty: 290, goodQty: 285,
+      expectVersion: r1.consignment.version, actor: 'やまだ', idempotencyKey: 'ret-b' });
+    ok(r2.ok && r2.settled && r2.consignment.state === 'settled', '⭐全部returnったら精算ずみ (settled)');
+    ok(db.prepare('SELECT good_qty, good_qty_source FROM f_iroha_task_batches WHERE id = ?').get(away.id).good_qty === 583,
+      '返ってきた良品 (298 + 285) が、そのまとまりのできた数になる');
+    ok(db.prepare('SELECT work_status FROM f_iroha_task_batches WHERE id = ?').get(away.id).work_status === 'ready_for_stocking',
+      '全部returnったら棚入待ちに');
+    ok(TD.getTask(t).done_qty === 583, 'カードのできた数も合計から出る (いろは分はまだ数えていない)');
+
+    const over = C.recordReturn({ consignmentId: c1.id, returnedQty: 10, expectVersion: r2.consignment.version, idempotencyKey: 'ret-c' });
+    ok(!over.ok && over.error === 'bad_state', '精算ずみのあとは受け取らない');
+  }
+
+  // ③b ⭐渡した数を超える返却は断る (まだ精算ずみでない状態で試す — Codex R1)
+  {
+    const t = mk29('cg-1b', 9936, 100);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 60, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, qty: 60, expectVersion: r.consignment.version });
+    const c = C.getConsignment(r.consignment.id);
+    const before = db.prepare('SELECT COUNT(*) n FROM f_iroha_consignment_returns WHERE consignment_id = ?').get(c.id).n;
+    const over = C.recordReturn({ consignmentId: c.id, returnedQty: 61, expectVersion: c.version, idempotencyKey: 'ret-over-1' });
+    ok(!over.ok && over.error === 'too_many', '⭐渡した 60 個より多い返却は断る (handed のまま)');
+    ok(db.prepare('SELECT COUNT(*) n FROM f_iroha_consignment_returns WHERE consignment_id = ?').get(c.id).n === before
+      && C.getConsignment(c.id).state === 'handed', '断ったので行も状態も変わらない');
+    // 使える数は 0 も入れられる / 返ってきた数を超えられない
+    const bad = C.recordReturn({ consignmentId: c.id, returnedQty: 10, goodQty: 11, expectVersion: c.version, idempotencyKey: 'ret-bad-1' });
+    ok(!bad.ok && bad.error === 'bad_qty', '⭐返ってきた数より多い「使える数」は断る (完成数を水増しさせない)');
+    const zero = C.recordReturn({ consignmentId: c.id, returnedQty: 10, goodQty: 0, lossQty: 10, expectVersion: c.version, idempotencyKey: 'ret-zero-1' });
+    ok(zero.ok, '⭐「10 個返ってきたが 1 個も使えなかった」を記録できる (0 を断らない)');
+  }
+
+  // ③c ⭐確保した数より多くは渡せない (Codex R1 重大1)
+  {
+    const t = mk29('cg-1c', 9937, 100);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 40, expectVersion: v29(t) });
+    const over = C.markHanded({ consignmentId: r.consignment.id, qty: 100, expectVersion: r.consignment.version });
+    ok(!over.ok && over.error === 'too_many', '⭐40 個の予定で 100 個は渡せない (元の数を超えて実績が積み上がる)');
+    ok(C.getConsignment(r.consignment.id).state === 'planned', '断ったので状態も変わらない');
+  }
+
+  // ③d ⭐予定より少なく渡したら、残りは手元に戻る (Codex R1 重大2)
+  {
+    const t = mk29('cg-1d', 9938, 200);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 80, expectVersion: v29(t) });
+    const away0 = sole(t).find((b) => b.facility_code === 'workcenter');
+    C.markHanded({ consignmentId: r.consignment.id, qty: 78, expectVersion: r.consignment.version });
+    const bs = sole(t);
+    const away = bs.find((b) => b.id === away0.id);
+    ok(away.planned_qty === 78, '外部のまとまりは実際に渡した 78 個になる');
+    const hand = bs.filter((b) => b.id !== away.id).reduce((a, b) => a + (b.planned_qty ?? 0), 0);
+    ok(hand === 122, '⭐渡さなかった 2 個は手元に戻る (120 + 2 = 122。外部のまとまりに取り残さない)');
+  }
+
+  // ④ 実績のあるまとまりは割らない
+  {
+    const t = mk29('cg-2', 9932, 500);
+    const b0 = sole(t)[0];
+    // 棚に入れたぶんは割れない
+    db.transaction(() => {
+      db.prepare("INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, created_at) VALUES (?, 10, ?, ?)")
+        .run(b0.id, new Date().toISOString(), new Date().toISOString());
+    }).immediate();
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    ok(!r.ok && r.error === 'already_stocked', '⭐もう棚に入れたぶんは割らない (実績の帰属が決められなくなる)');
+    db.prepare('DELETE FROM f_iroha_stocking_records WHERE batch_id = ?').run(b0.id);
+    // 箱ラベルを刷ったぶんも割れない
+    db.prepare(`INSERT INTO f_iroha_print_jobs (client_request_id, task_id, batch_id, product_name, barcode, barcode_type,
+      copies, printer_name, target_device_id, state, created_at, updated_at)
+      VALUES ('cg-print-1', ?, ?, 'x', 'y', 'jan', 1, 'p', (SELECT id FROM f_iroha_app_devices LIMIT 1), 'queued', ?, ?)`)
+      .run(t, b0.id, new Date().toISOString(), new Date().toISOString());
+    const r2 = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    ok(!r2.ok && r2.error === 'already_printed', '⭐箱ラベルを刷ったぶんも割らない (古いラベルが残る)');
+    db.prepare("DELETE FROM f_iroha_print_jobs WHERE client_request_id = 'cg-print-1'").run();
+  }
+
+  // ⑤ 数の検査・拠点の検査
+  {
+    const t = mk29('cg-3', 9933, 200);
+    const b0 = sole(t)[0];
+    const tooMany = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 300, expectVersion: v29(t) });
+    ok(!tooMany.ok && tooMany.error === 'too_many' && tooMany.max === 200, '⭐残っているぶんより多くは渡せない');
+    for (const bad of [0, -1, 1.5, 'abc', true]) {
+      const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: bad, expectVersion: v29(t) });
+      if (!(!r.ok && r.error === 'bad_qty')) ok(false, `預ける数 ${JSON.stringify(bad)} は断る (実際 ${r.error})`);
+    }
+    ok(true, '0 個・マイナス・小数・文字・真偽値は断る');
+    const inHouse = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'iroha', qty: 50, expectVersion: v29(t) });
+    ok(!inHouse.ok && inHouse.error === 'not_external',
+      '⭐いろはの中で作業する拠点は「あずける」で選べない (パレット・ジョブサポも同じ)');
+    const stale = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 50, expectVersion: v29(t) - 1 });
+    ok(!stale.ok && stale.error === 'conflict', '古い版で送ったら断る (親カードの版を見る)');
+  }
+
+  // ⑥ 渡す前ならやめられる。数は元に戻る
+  {
+    const t = mk29('cg-4', 9934, 300);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'rashinban', qty: 120, expectVersion: v29(t) });
+    ok(r.ok && sole(t).length === 2, '前提: 120 個を切り出した');
+    const cancel = C.cancelConsignment({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    ok(cancel.ok, '渡す前ならやめられる');
+    const left = sole(t);
+    ok(left.length === 1 && left[0].planned_qty === 300, '⭐やめたら数が元に戻る (300 個)');
+    // 渡したあとは取り消せない
+    const r2 = C.startConsignment({ taskId: t, batchId: left[0].id, facilityCode: 'rashinban', qty: 100, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r2.consignment.id, expectVersion: r2.consignment.version });
+    const c2 = C.getConsignment(r2.consignment.id);
+    const no = C.cancelConsignment({ consignmentId: c2.id, expectVersion: c2.version });
+    ok(!no.ok && no.error === 'bad_state', '⭐渡したあとは取り消せない (返却で受け取る)');
+  }
+
+  // ⑥b ⭐取消で戻す先が「よそへ渡したあと」なら、そこに足さない (Codex R1 重大5)
+  {
+    const t = mk29('cg-4b', 9939, 100);
+    const b0 = sole(t)[0];
+    const a = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 40, expectVersion: v29(t) });
+    // 元に残った 60 個を、別の施設へ丸ごと渡す
+    const rest = sole(t).find((b) => b.id === b0.id);
+    const bqty = rest.planned_qty;
+    const b2 = C.startConsignment({ taskId: t, batchId: rest.id, facilityCode: 'rashinban', qty: bqty, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: b2.consignment.id, expectVersion: b2.consignment.version });
+    const beforeRashinban = db.prepare('SELECT planned_qty FROM f_iroha_task_batches WHERE id = ?').get(rest.id).planned_qty;
+    // ここで 40 個の預けをやめる
+    const c = C.getConsignment(a.consignment.id);
+    const cancel = C.cancelConsignment({ consignmentId: c.id, expectVersion: c.version });
+    ok(cancel.ok, '前提: 渡す前の 40 個はやめられる');
+    ok(db.prepare('SELECT planned_qty FROM f_iroha_task_batches WHERE id = ?').get(rest.id).planned_qty === beforeRashinban,
+      '⭐もう羅針盤へ渡したまとまりの数は増えない (勝手に相手の数を足さない)');
+    const back = sole(t).filter((b) => (!b.facility_code || b.facility_code === 'iroha'));
+    ok(back.length === 1 && back[0].planned_qty === 40,
+      '⭐戻せないときは、手元の新しいまとまり (40 個) として戻す');
+  }
+
+  // ⑥c ⭐丸ごと預けたのをやめたら、担当拠点も元に戻る (Codex R1 中6)
+  {
+    const t = mk29('cg-4c', 9940, 50);
+    const b0 = sole(t)[0];
+    ok(b0.facility_code === 'iroha', '前提: いろは担当');
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 50, expectVersion: v29(t) });
+    ok(sole(t).length === 1 && sole(t)[0].facility_code === 'workcenter', '丸ごとならまとまりは割らず、拠点が変わる');
+    const c = C.getConsignment(r.consignment.id);
+    C.cancelConsignment({ consignmentId: c.id, expectVersion: c.version });
+    ok(sole(t)[0].facility_code === 'iroha', '⭐やめたら担当拠点も いろは に戻る');
+  }
+
+  // ⑥d ⭐返ってこないぶんの精算 (Codex R1 中10)
+  {
+    const t = mk29('cg-4d', 9941, 100);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    let c = C.getConsignment(r.consignment.id);
+    C.recordReturn({ consignmentId: c.id, returnedQty: 98, goodQty: 98, expectVersion: c.version, idempotencyKey: 'ret-m-1' });
+    c = C.getConsignment(c.id);
+    ok(c.state === 'handed', '前提: 98 個返ってきたがまだ 2 個ある');
+    const wrong = C.settleConsignment({ consignmentId: c.id, missingQty: 5, expectVersion: c.version });
+    ok(!wrong.ok && wrong.error === 'bad_qty', '数が合わない精算は断る (98 + 5 ≠ 100)');
+    const okS = C.settleConsignment({ consignmentId: c.id, missingQty: 2, note: '向こうで割れた', expectVersion: c.version });
+    ok(okS.ok && okS.consignment.state === 'settled' && okS.consignment.missing_qty === 2,
+      '⭐返ってこない 2 個を確かめて精算できる (永久に handed のままにしない)');
+    ok(db.prepare('SELECT work_status FROM f_iroha_task_batches WHERE id = ?').get(sole(t)[0].id).work_status === 'ready_for_stocking',
+      '精算したら、そのまとまりは棚入待ちに');
+  }
+
+  // ⑥e ⭐取消でも親カードの版が進む (Codex R1 重大4)
+  {
+    const t = mk29('cg-4e', 9942, 80);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 30, expectVersion: v29(t) });
+    const vBefore = v29(t);
+    const c = C.getConsignment(r.consignment.id);
+    C.cancelConsignment({ consignmentId: c.id, expectVersion: c.version });
+    ok(v29(t) > vBefore, '⭐やめたときも親カードの版が進む (前のカードを見ている端末の要求を通さない)');
+  }
+
+  // ⑥f 日付は実在するものだけ
+  {
+    const t = mk29('cg-4f', 9943, 20);
+    const b0 = sole(t)[0];
+    const bad = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 5, dueDate: '2026-99-99', expectVersion: v29(t) });
+    ok(!bad.ok && bad.error === 'bad_request', '⭐2026-99-99 のような日付は断る (形だけ見ない)');
+  }
+
+  // ⑥g ⭐戻し先が受け取れないときは、新しいまとまりにする (Codex R2 重大1・重大2)
+  {
+    // (a) 予定数が分からない元には戻さない (「不明」が数に化ける)
+    const t = TD.upsertTaskFromImport({ notion_page_id: 'cg-4g', status: 'not_started', facility_code: 'iroha',
+      destination_id: 9944, product_name: '数不明のカード', qty: null }, { batchId: 'cg' }).id;
+    const b0 = sole(t)[0];
+    ok(b0.planned_qty == null, '前提: 予定数が分からない');
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 40, expectVersion: v29(t) });
+    ok(r.ok, '数不明でも渡す数は人が決められる');
+    ok(db.prepare('SELECT planned_qty FROM f_iroha_task_batches WHERE id = ?').get(b0.id).planned_qty == null,
+      '切り出しても、元の「数不明」は数不明のまま');
+    const c = C.getConsignment(r.consignment.id);
+    C.cancelConsignment({ consignmentId: c.id, expectVersion: c.version });
+    ok(db.prepare('SELECT planned_qty FROM f_iroha_task_batches WHERE id = ?').get(b0.id).planned_qty == null,
+      '⭐やめても「数不明」のまま (NULL に 40 を足して「40 個」に化けさせない)');
+    const made = sole(t).filter((b) => b.id !== b0.id);
+    ok(made.length === 1 && made[0].planned_qty === 40, '戻せないぶんは、新しいまとまり 40 個として手元に置く');
+
+    // (b) 元が棚入待ちなら戻さない
+    const t2 = mk29('cg-4h', 9945, 200);
+    const o = sole(t2)[0];
+    const r2 = C.startConsignment({ taskId: t2, batchId: o.id, facilityCode: 'workcenter', qty: 80, expectVersion: v29(t2) });
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'ready_for_stocking' WHERE id = ?").run(o.id);
+    const away2 = sole(t2).find((b) => b.facility_code === 'workcenter');
+    C.markHanded({ consignmentId: r2.consignment.id, qty: 78, expectVersion: r2.consignment.version });
+    ok(db.prepare('SELECT planned_qty FROM f_iroha_task_batches WHERE id = ?').get(o.id).planned_qty === 120,
+      '⭐棚入待ちの元には足さない (未着手の 2 個まで棚入待ちにしてしまう)');
+    const extra = sole(t2).filter((b) => b.id !== o.id && b.id !== away2.id);
+    ok(extra.length === 1 && extra[0].planned_qty === 2 && extra[0].work_status === 'not_started',
+      '渡さなかった 2 個は、新しい未着手のまとまりになる');
+  }
+
+  // ⑥h ⭐作れなかった数だけを入れても、返ってきた数を超えられない / まとまりに反映される (Codex R2 重大3)
+  {
+    const t = mk29('cg-4i', 9946, 100);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 50, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    let c = C.getConsignment(r.consignment.id);
+    const bad = C.recordReturn({ consignmentId: c.id, returnedQty: 10, lossQty: 100, expectVersion: c.version, idempotencyKey: 'ret-l1' });
+    ok(!bad.ok && bad.error === 'bad_qty', '⭐使える数を入れなくても、作れなかった数が返却数を超えたら断る');
+    const okR = C.recordReturn({ consignmentId: c.id, returnedQty: 10, lossQty: 3, expectVersion: c.version, idempotencyKey: 'ret-l2' });
+    ok(okR.ok, '前提: 使える数を入れずに「10 個returnって 3 個だめ」を記録');
+    const away = sole(t).find((b) => b.facility_code === 'workcenter');
+    ok(db.prepare('SELECT loss_qty FROM f_iroha_task_batches WHERE id = ?').get(away.id).loss_qty === 3,
+      '⭐使える数が空でも、作れなかった数はまとまりに残る (一緒に捨てない)');
+    ok(db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE id = ?').get(away.id).good_qty == null,
+      '使える数は入れていないので「数えていない」のまま');
+  }
+
+  // ⑥i ⭐何も変えない取消は、親カードの版を上げない (Codex R2 中4)
+  {
+    const t = mk29('cg-4j', 9947, 60);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 20, expectVersion: v29(t) });
+    let c = C.getConsignment(r.consignment.id);
+    C.cancelConsignment({ consignmentId: c.id, expectVersion: c.version });
+    c = C.getConsignment(c.id);
+    const vAfter = v29(t);
+    const again = C.cancelConsignment({ consignmentId: c.id, expectVersion: c.version });
+    ok(again.ok && again.already, 'もう取消ずみなら「変わっていない」で返す');
+    ok(v29(t) === vAfter, '⭐何も変えていないので親カードの版も上がらない (無用な競合を作らない)');
+  }
+
+  // ⑥j 空文字を 0 と読まない (Codex R2 中5)
+  {
+    const t = mk29('cg-4k', 9948, 40);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 10, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    const c = C.getConsignment(r.consignment.id);
+    const blank = C.recordReturn({ consignmentId: c.id, returnedQty: 5, goodQty: '  ', expectVersion: c.version, idempotencyKey: 'ret-b1' });
+    ok(!blank.ok && blank.error === 'bad_qty', '⭐空文字を「使える数 0」と読まない (未入力と 0 は別)');
+  }
+
+  // ⑥k 一覧の「渡せる数」はまとめて引く (2000 枚で 1 まとまりずつ問い合わせない)
+  {
+    const B2 = await import('../apps/iroha-work/consign.js');
+    const all = db.prepare('SELECT id FROM f_iroha_task_batches LIMIT 50').all().map((r) => r.id);
+    const m = B2.consignableByBatch(db, all);
+    ok(m.size === all.length, 'まとめて引いた結果が、渡した数だけ返る');
+    const one = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(all[0]);
+    const single = { max: B2.whyCannotSplit(db, one) ? 0 : (B2.splittableMax(db, one) ?? null),
+      why: (B2.whyCannotSplit(db, one) || {}).message || null };
+    ok(m.get(all[0]).max === single.max && m.get(all[0]).why === single.why,
+      '⭐まとめて引いた結果と、1 件ずつ調べた結果が同じ');
+  }
+
+  // ⑦ 数を書き換える口は、分かれたカードでは断られる (前の PR の関門が効く)
+  {
+    const t = mk29('cg-5', 9935, 400);
+    const b0 = sole(t)[0];
+    C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 150, expectVersion: v29(t) });
+    const r = TD.setProgress({ taskId: t, expectVersion: v29(t), doneQty: 250 });
+    ok(!r.ok && r.error === 'split_card',
+      '⭐分かれたカードに「できた数」をまとめて送るのは断る (どちらのぶんか決まらない — 要件 §AB-1)');
+    // ⑦b ⭐どのぶんかを添えれば、預けたあとも いろは のできた数が入る (自己レビュー B)
+    const home = sole(t).find((b) => b.id === b0.id);
+    const away = sole(t).find((b) => b.facility_code === 'workcenter');
+    TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v29(t) });
+    const r2 = TD.setProgress({ taskId: t, expectVersion: v29(t), doneQty: 248, lossQty: 2, batchId: home.id });
+    ok(r2.ok, '⭐batch_id を添えた「できた数」は通る (預けたあとに いろは の数が入らない、を直した)');
+    const hb = db.prepare('SELECT good_qty, loss_qty, good_qty_source FROM f_iroha_task_batches WHERE id = ?').get(home.id);
+    ok(hb.good_qty === 248 && hb.loss_qty === 2 && hb.good_qty_source === 'counted', 'いろは のまとまりに 248 / 2 が入る');
+    ok(TD.getTask(t).done_qty === 248, 'カードの控えも 248 (外のぶんはまだ数えていない)');
+    const wrong = TD.setProgress({ taskId: t, expectVersion: v29(t), doneQty: 100, batchId: away.id });
+    ok(!wrong.ok && wrong.error === 'bad_batch', '⭐外にあずけているぶんには入れられない (その数は返却で入る)');
+    const other = mk29('cg-5x', 9949, 10);
+    const stranger = TD.setProgress({ taskId: t, expectVersion: v29(t), doneQty: 1, batchId: sole(other)[0].id });
+    ok(!stranger.ok && stranger.error === 'bad_batch', '別のカードのまとまりは指せない');
+    ok(TD.taskErrorStatus('bad_batch') === 400 && TD.taskErrorStatus('consign_open') === 409, 'HTTP: bad_batch=400 / consign_open=409');
+  }
+
+  // ⑦c ⭐外にあずけたぶんが返ってこないうちは「全部そろった」にも棚入完了にもしない (自己レビュー A)
+  {
+    const t = mk29('cg-6', 9956, 300);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v29(t) });
+    const ready = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: v29(t), doneQty: 200, batchId: b0.id });
+    ok(!ready.ok && ready.error === 'consign_open', '⭐外に 100 個あるうちは「作り終えた」(棚入待ち) にできない');
+    ok(TD.getTask(t).status === 'in_progress', '状態も変わっていない');
+    ok(db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE id = ?').get(b0.id).good_qty == null, '断ったので数も書いていない (途中で止めない = 1 回の書き込み)');
+    // 返却がそろえば通る
+    let c = C.getConsignment(r.consignment.id);
+    C.recordReturn({ consignmentId: c.id, returnedQty: 100, goodQty: 99, lossQty: 1, expectVersion: c.version, idempotencyKey: 'ret-6-1' });
+    const ready2 = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: v29(t), doneQty: 200, batchId: b0.id });
+    ok(ready2.ok, '全部返ってきたら「作り終えた」にできる');
+    ok(TD.getTask(t).done_qty === 299, 'カードの控え = いろは 200 + 外 99');
+    const closed = TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'stocked', expectVersion: v29(t), isStaff: true, actor: 'たにがわ' });
+    ok(closed.ok, '棚入完了にできる');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_stocking_records s JOIN f_iroha_task_batches b ON b.id = s.batch_id WHERE b.task_id = ?').get(t).c === 2,
+      '棚入れの実績は 2 つのまとまりぶん');
+  }
+
+  // ⑦d ⭐まとめて棚入完了も同じ関門 / 棚入れの実績は外にあるまとまりを飛ばす
+  {
+    const t = mk29('cg-6b', 9957, 300);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'rashinban', qty: 100, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    // 関門を迂回して棚入待ちにしておく (画面からは来ないが、DB を直に触られたとき)
+    db.prepare("UPDATE f_iroha_tasks SET status = 'ready_for_stocking', version = version + 1 WHERE id = ?").run(t);
+    const bulk = TD.bulkCloseReady({ taskIds: [{ id: t, version: v29(t) }], actor: 'たにがわ' });
+    ok(bulk.ok && bulk.done.length === 0 && bulk.skipped[0] && bulk.skipped[0].reason === 'consign_open',
+      '⭐まとめて棚入完了は「外にあずけたぶんが返っていません」で飛ばす');
+    const n = B.recordStockingForTask(db, t, { at: '2026-09-07T00:00:00.000Z', by: 'test' });
+    const stockedAway = db.prepare("SELECT COUNT(*) c FROM f_iroha_stocking_records s JOIN f_iroha_task_batches b ON b.id = s.batch_id WHERE b.task_id = ? AND b.facility_code = 'rashinban'").get(t).c;
+    ok(n === 1 && stockedAway === 0, '⭐棚入れの実績は、外にあるまとまりには作らない (二重の関門)');
+  }
+
+  // ⑦e ⭐棚入待ちのまとまりからは切り出せない (Codex R3 重大1)
+  {
+    const t = mk29('cg-7', 9958, 100);
+    const b0 = sole(t)[0];
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'ready_for_stocking' WHERE id = ?").run(b0.id);
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 10, expectVersion: v29(t) });
+    ok(!r.ok && r.error === 'batch_closed', '⭐できあがったぶん (棚入待ち) は渡せない (完成品は外に出さない)');
+    const m = C.consignableByBatch(db, [b0.id]).get(b0.id);
+    ok(m.max === 0 && /棚入待ち/.test(m.why), '一覧にも「渡せない理由」として出る');
+  }
+
+  // ⑦f ⭐返却の 1 行でも「使える数が分からない」があれば、できた数を確定しない (Codex R3 重大2)
+  {
+    const t = mk29('cg-8', 9959, 100);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    let c = C.getConsignment(r.consignment.id);
+    C.recordReturn({ consignmentId: c.id, returnedQty: 60, goodQty: 60, expectVersion: c.version, idempotencyKey: 'ret-8-1' });
+    ok(db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE id = ?').get(b0.id).good_qty === 60, '前提: 60 個 (使える 60) で 60');
+    c = C.getConsignment(c.id);
+    C.recordReturn({ consignmentId: c.id, returnedQty: 40, expectVersion: c.version, idempotencyKey: 'ret-8-2' });
+    const b = db.prepare('SELECT good_qty, good_qty_source, work_status FROM f_iroha_task_batches WHERE id = ?').get(b0.id);
+    ok(b.good_qty == null && b.good_qty_source == null,
+      '⭐40 個が「分からない」で返ったら、できた数は「数えていない」に戻す (60 を確定にすると 100 個中 60 個と読める)');
+    ok(b.work_status === 'ready_for_stocking', '全部返ったので棚入待ち');
+    ok(TD.getTask(t).done_qty == null, 'カードの控えも「数えていない」');
+  }
+
+  // ⑦g ⭐「この預けで切り出したか」は預けの行で決める (Codex R3 中4)
+  {
+    const t = mk29('cg-9', 9970, 100);
+    const b0 = sole(t)[0];
+    const a = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 40, expectVersion: v29(t) });
+    ok(C.getConsignment(a.consignment.id).split_created === 1, '一部を預ける = 切り出した (split_created=1)');
+    const ca = C.getConsignment(a.consignment.id);
+    C.cancelConsignment({ consignmentId: ca.id, expectVersion: ca.version });   // 40 個は元へ戻る
+    const b0b = sole(t).find((b) => b.id === b0.id);
+    ok(b0b.planned_qty === 100 && sole(t).length === 1, '前提: 40 個は元に戻り 100 個');
+    // 切り出して渡し、返ってきたまとまり (split_from_batch_id あり) を、職員が作業中に戻して丸ごと別の施設へ
+    const cut = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 30, expectVersion: v29(t) });
+    const cutBatch = sole(t).find((b) => b.facility_code === 'workcenter');
+    C.markHanded({ consignmentId: cut.consignment.id, expectVersion: cut.consignment.version });
+    const cc = C.getConsignment(cut.consignment.id);
+    C.recordReturn({ consignmentId: cc.id, returnedQty: 30, goodQty: 30, expectVersion: cc.version, idempotencyKey: 'ret-9-1' });
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'in_progress', good_qty = NULL, good_qty_source = NULL WHERE id = ?").run(cutBatch.id);
+    const whole = C.startConsignment({ taskId: t, batchId: cutBatch.id, facilityCode: 'rashinban', qty: 30, expectVersion: v29(t) });
+    ok(whole.ok && C.getConsignment(whole.consignment.id).split_created === 0, '丸ごと預ける = 切り出していない (split_created=0)');
+    const cw = C.getConsignment(whole.consignment.id);
+    C.cancelConsignment({ consignmentId: cw.id, expectVersion: cw.version });
+    const after = db.prepare('SELECT work_status, facility_code, planned_qty FROM f_iroha_task_batches WHERE id = ?').get(cutBatch.id);
+    ok(after.work_status !== 'cancelled' && after.facility_code === 'workcenter' && after.planned_qty === 30,
+      '⭐やめても、前の分割で生まれたまとまりは消えない (担当が元に戻るだけ)');
+  }
+
+  // ⑦h ⭐戻し先は「いろは」に限らない — パレット担当のカードは、やめた数がパレットへ戻る (自己レビュー D)
+  {
+    const facs = TD.listFacilities();
+    ok(facs.filter((f) => f.offsite).map((f) => f.code).sort().join(',') === 'rashinban,workcenter',
+      '⭐物を持ち帰る拠点は羅針盤・ワークセンターだけ (パレット・ジョブサポは いろは の中で作業する)');
+    const t0 = mk29('cg-10a', 9972, 50);
+    const r0 = C.startConsignment({ taskId: t0, batchId: sole(t0)[0].id, facilityCode: 'rehas', qty: 10, expectVersion: v29(t0) });
+    ok(!r0.ok && r0.error === 'not_external', '⭐パレットには預けられない (担当を変えるだけ)');
+    const t = TD.upsertTaskFromImport({ notion_page_id: 'cg-10', status: 'not_started', facility_code: 'rehas',
+      destination_id: 9971, product_name: 'パレット担当', qty: 100 }, { batchId: 'cg' }).id;
+    const b0 = sole(t)[0];
+    ok(b0.facility_code === 'rehas', '前提: パレット担当');
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 40, expectVersion: v29(t) });
+    const c = C.getConsignment(r.consignment.id);
+    C.cancelConsignment({ consignmentId: c.id, expectVersion: c.version });
+    const back = sole(t).find((b) => b.id === b0.id);
+    ok(back.planned_qty === 100 && sole(t).length === 1, '⭐やめた 40 個はパレットのまとまりへ戻る (新しいまとまりを作らない)');
+    // 元が棚入待ちなら、新しいまとまりの担当もパレットを継ぐ
+    const r2 = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 30, expectVersion: v29(t) });
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'ready_for_stocking' WHERE id = ?").run(b0.id);
+    const c2 = C.getConsignment(r2.consignment.id);
+    C.cancelConsignment({ consignmentId: c2.id, expectVersion: c2.version });
+    const made = sole(t).filter((b) => b.id !== b0.id);
+    ok(made.length === 1 && made[0].facility_code === 'rehas' && made[0].planned_qty === 30, '⭐新しいまとまりの担当もパレット (未定にしない)');
+  }
+
+  // ⑦i ⭐分割 → 返却 → 「作り終えた」のあと、残りを再び預けられない (Codex R4 重大1)
+  {
+    const t = mk29('cg-11', 9973, 1000);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 400, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    let c = C.getConsignment(r.consignment.id);
+    C.recordReturn({ consignmentId: c.id, returnedQty: 400, goodQty: 400, expectVersion: c.version, idempotencyKey: 'ret-11-1' });
+    TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v29(t) });
+    const ready = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: v29(t), doneQty: 598, batchId: b0.id });
+    ok(ready.ok, '前提: 手元 598 個で作り終えた (カードは棚入待ち・手元のまとまりは作業中のまま)');
+    const again = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'rashinban', qty: 2, expectVersion: v29(t) });
+    ok(!again.ok && again.error === 'batch_closed', '⭐カードが棚入待ちなら、まとまりの状態に関わらず残り 2 個は預けられない');
+    const m = C.consignableByBatch(db, [b0.id]).get(b0.id);
+    ok(m.max === 0 && /棚入待ち/.test(m.why), '一覧の「渡せる数」も 0 で理由が出る');
+  }
+
+  // ⑦j ⭐取消・中止で終了しようとしても、外にあるぶんが残っていれば断る / 終了ずみカードの預けは進めない (Codex R4 重大2)
+  {
+    const t = mk29('cg-12', 9974, 300);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    const closed = TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'cancelled', expectVersion: v29(t), isStaff: true, actor: 'たにがわ' });
+    ok(!closed.ok && closed.error === 'consign_open', '⭐外に 100 個あるうちは「取消」で終了にもできない (親 closed・外 handed を作らない)');
+    // 終了ずみカードの預けを「渡した」へ進める経路も断る (DB を直に終了にして試す)
+    const t2 = mk29('cg-12b', 9975, 50);
+    const r2 = C.startConsignment({ taskId: t2, batchId: sole(t2)[0].id, facilityCode: 'workcenter', qty: 20, expectVersion: v29(t2) });
+    db.prepare("UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = '2026-09-07T00:00:00.000Z', version = version + 1 WHERE id = ?").run(t2);
+    const h = C.markHanded({ consignmentId: r2.consignment.id, expectVersion: r2.consignment.version });
+    ok(!h.ok && h.error === 'closed_task', '⭐終了したカードの預けは「渡した」へ進められない');
+    const cc = C.getConsignment(r2.consignment.id);
+    ok(C.cancelConsignment({ consignmentId: cc.id, expectVersion: cc.version }).ok, 'やめる (外にある数を減らす側) は通る');
+  }
+
+  // ⑦k ⭐精算で「返らなかった 2 個」は、渡せる数として復活しない (Codex R4 重大3)
+  {
+    const t = mk29('cg-13', 9976, 100);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    let c = C.getConsignment(r.consignment.id);
+    C.recordReturn({ consignmentId: c.id, returnedQty: 98, goodQty: 98, expectVersion: c.version, idempotencyKey: 'ret-13-1' });
+    c = C.getConsignment(c.id);
+    ok(C.settleConsignment({ consignmentId: c.id, missingQty: 2, expectVersion: c.version }).ok, '前提: 2 個は返らなかったとして精算');
+    // 職員が作業中に戻した (数はそのまま)
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'in_progress' WHERE id = ?").run(b0.id);
+    const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(b0.id);
+    ok(C.splittableMax(db, b) === 0, '⭐100 − 98 (できた) − 2 (返らなかった) = 0。存在しない 2 個を切り出せない');
+    ok(C.consignableByBatch(db, [b0.id]).get(b0.id).max === 0, '一覧の計算も同じ');
+  }
+
+  // ⑦l ⭐渡した数より多く返ってきたときは、理由を書けば受け取れる (Codex R4 中4)
+  {
+    const t = mk29('cg-14', 9977, 1000);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 1000, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    let c = C.getConsignment(r.consignment.id);
+    const no = C.recordReturn({ consignmentId: c.id, returnedQty: 1010, goodQty: 1010, expectVersion: c.version, idempotencyKey: 'ret-14-0' });
+    ok(!no.ok && no.error === 'too_many', '理由なしの 1010 個は断る (数え間違いの可能性が高い)');
+    const yes = C.recordReturn({ consignmentId: c.id, returnedQty: 1010, goodQty: 1010, note: '向こうで数え直したら 10 個多かった',
+      expectVersion: c.version, idempotencyKey: 'ret-14-1' });
+    ok(yes.ok && yes.settled, '⭐理由つきなら 1010 個を受け取れて、精算ずみになる');
+    ok(db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE id = ?').get(b0.id).good_qty === 1010, 'できた数は現物の 1010');
+    c = C.getConsignment(c.id);
+    ok(c.state === 'settled' && c.returned_total === 1010, '返ってきた合計 1010 が残る');
+    // 多く返ったあとの精算は「返らなかった数 0」だけ
+    const t2 = mk29('cg-14b', 9978, 100);
+    const r2 = C.startConsignment({ taskId: t2, batchId: sole(t2)[0].id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t2) });
+    C.markHanded({ consignmentId: r2.consignment.id, expectVersion: r2.consignment.version });
+    let c2 = C.getConsignment(r2.consignment.id);
+    C.recordReturn({ consignmentId: c2.id, returnedQty: 60, expectVersion: c2.version, idempotencyKey: 'ret-14-2' });
+    c2 = C.getConsignment(c2.id);
+    C.recordReturn({ consignmentId: c2.id, returnedQty: 45, note: '数え直し', expectVersion: c2.version, idempotencyKey: 'ret-14-3' });
+    c2 = C.getConsignment(c2.id);
+    ok(c2.state === 'settled' && c2.returned_total === 105, '分けて返ってきて合計が渡した数を超えても、理由があれば精算ずみ');
+  }
+
+  // ⑦m ⭐丸ごと預けて少なく渡したとき、手元に残るぶんの担当は元の拠点 (Codex R4 中5)
+  {
+    const t = TD.upsertTaskFromImport({ notion_page_id: 'cg-15', status: 'not_started', facility_code: 'rehas',
+      destination_id: 9979, product_name: 'パレット担当・丸ごと', qty: 100 }, { batchId: 'cg' }).id;
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    ok(sole(t).length === 1 && sole(t)[0].facility_code === 'workcenter', '前提: 丸ごとなので割らず担当が変わる');
+    C.markHanded({ consignmentId: r.consignment.id, qty: 98, expectVersion: r.consignment.version });
+    const left = sole(t).filter((b) => b.id !== b0.id);
+    ok(left.length === 1 && left[0].planned_qty === 2 && left[0].facility_code === 'rehas',
+      '⭐渡さなかった 2 個は「パレット」担当のまとまりとして手元に残る (未定にしない)');
+  }
+
+  // ── 画面 ──
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(/class="cgNote"/.test(html) && /if \(noteEl && String\(noteEl\.value\)\.trim\(\)\) body\.note = /.test(html),
+    '返却に「ひとこと」を添えられる (渡した数より多く返ってきた理由)');
+  ok(/function consignBtnHtml\(c\)/.test(html) && /if \(!can\('task\.consign'\)\) return '';/.test(html)
+    && /🚚 外部にあずける/.test(html),
+    '⭐「🚚 外部にあずける」は許可が無ければ描かない (利用者の画面には出さない — 要件 §U-7)');
+  ok(/function externalFacilities\(\)/.test(html) && /\.filter\(\(f\) => f\.offsite\)/.test(html) && !/\.filter\(\(f\) => f\.external\)/.test(html),
+    '⭐選べるのは物を持ち帰る拠点 (offsite) だけ。external で見るとパレット・ジョブサポが預け先に出てしまう');
+  ok(/function roundToPack\(n, per\)/.test(html) && /Math\.floor\(n \/ per\) \* per/.test(html),
+    '⭐半分は箱の入数で丸める (70 個入りなら 500 ではなく 490 — 要件 §AB-9)');
+  ok(/c\.first_time && half/.test(html) && /はじめての商品です。まず半分の/.test(html)
+    && !/value="' \+ half/.test(html),
+    '⭐はじめての商品は「半分をおすすめ」と出すだけ。数は勝手に入れない (押し付けない)');
+  ok(/data-cg="return"/.test(html) && /data-cg="handed"/.test(html) && /data-cg="cancel"/.test(html),
+    '渡した / やめる / 返却を受け取る が出せる');
+  ok(/期限を過ぎています/.test(html) && /over \? ' over' : ''/.test(html), '返す期限を過ぎたら赤く出す');
+  ok(/return planError\(j, \(\) => submitConsign\(\), \{ silent: true \}\);/.test(html),
+    '職員モードが切れていたら PIN を聞いて、同じ内容をもう一度送る (計画の操作と同じ流儀)');
+  ok(/cgTarget = \{ taskId: c\.id, batchId: b\.id, max: b\.consignable_max \};/.test(html)
+    && /const able = \(c\.batches \|\| \[\]\)\.filter\(\(x\) => !x\.consignable_why/.test(html),
+    '⭐渡せるぶん・渡せる数はサーバーが決めた値を使う (画面が自分で出すと「押したら断られる」)');
+  ok(/key: 'ret-' \+ consignmentId \+ '-' \+ Date\.now\(\)/.test(html)
+    && /body\.idempotency_key = cgTarget\.key;/.test(html),
+    '⭐冪等の鍵は操作を始めるときに 1 回だけ作る (送り直すたびに変えない)');
+  ok(/data-cg="prepared"/.test(html) && /data-cg="settle"/.test(html),
+    '「箱とラベルを用意した」「返ってこないぶんを精算」の入口がある');
+  ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
+  ok(/able\.length > 1 \? '<label>どのぶんを渡しますか<\/label>/.test(html) && /data-cgbatch=/.test(html),
+    '⭐渡せるぶんが 2 つ以上あるときは選べる (渡さなかったぶんが手元に戻ると起きる)');
+  ok(/function homeBatchId\(c\)/.test(html) && (html.match(/\.\.\.\(homeBatchId\(c\) \? \{ batch_id: homeBatchId\(c\) \} : \{\}\)/g) || []).length === 3,
+    '⭐作り終えた・止まった・あとから直す の 3 か所で、いろは のぶん (batch_id) を添える (預けたあとも数が入る)');
+  ok(/cgKeep = cgReadInputs\(\); cgPickedBatch = Number\(bb\.dataset\.cgbatch\); openConsign\(\);/.test(html)
+    && /if \(cgKeep\) \{/.test(html),
+    '⭐どのぶんかを選び直しても、入れかけの拠点・数・期限は消えない (Codex R3 中3)');
+  ok(/consign_open: '外にあずけたぶんが返っていません'/.test(html), 'まとめて棚入完了で飛ばした理由が読める');
+  // homeBatchId を実際に動かす
+  {
+    const src = html.match(/function homeBatchId\(c\) \{[\s\S]*?\r?\n\}/)[0];
+    const fn = new Function('boardState', src + '; return homeBatchId;')(() => ({ facilities: [
+      { code: 'iroha', offsite: 0 }, { code: 'rehas', offsite: 0 }, { code: 'workcenter', offsite: 1 }] }));
+    ok(fn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'in_progress' }] }) === null, 'まとまりが 1 つならサーバーに任せる');
+    ok(fn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'in_progress' }, { id: 2, facility_code: 'workcenter', work_status: 'in_progress' }] }) === 1,
+      '⭐いろは + ワークセンター → いろは のぶん');
+    ok(fn({ batches: [{ id: 1, facility_code: 'rehas', work_status: 'not_started' }, { id: 2, facility_code: 'workcenter', work_status: 'in_progress' }] }) === 1,
+      'パレットも「手元」');
+    ok(fn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'in_progress' }, { id: 3, facility_code: null, work_status: 'not_started' },
+      { id: 2, facility_code: 'workcenter', work_status: 'in_progress' }] }) === 1, '手元が 2 つなら作業中のほう');
+    ok(fn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'not_started' }, { id: 3, facility_code: null, work_status: 'not_started' },
+      { id: 2, facility_code: 'workcenter', work_status: 'in_progress' }] }) === null, '決められなければ null (サーバーが「選んで」と断る)');
   }
 }
 

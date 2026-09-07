@@ -231,6 +231,76 @@ const stockingDDL = (name) => `
       version    INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL
     );`;
+/**
+ * ⭐外部施設への預け (要件 §AB-7)。羅針盤・ワークセンターに**物を持ち帰ってもらう**ときの台帳。
+ *
+ * 外部施設はこのアプリを触らない (作業時間も完成写真も記録しない)。知りたいのは
+ * 「何を預けて、いま どの状態か」と返却だけ。
+ *
+ * ⭐**数量を 1 つで通さない**。「80 予定・80 準備・当日 78 しかなかった」が普通に起きる。
+ *   渡したあとに予定数を書き換えると、80 枚ぶん箱とラベルを用意した履歴が消える。
+ * ⭐最後の状態は returned ではなく **settled (精算ずみ)**。外部で壊れて返らない物があっても、
+ *   職員が確かめれば預け残高からは落とせる。
+ */
+const consignDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id      INTEGER NOT NULL REFERENCES f_iroha_task_batches(id),
+      facility_code TEXT NOT NULL REFERENCES f_iroha_facilities(code),
+      planned_qty   INTEGER NOT NULL CHECK (planned_qty > 0),   -- 預ける予定の数
+      prepared_qty  INTEGER CHECK (prepared_qty IS NULL OR prepared_qty >= 0),  -- 箱とラベルを用意した数
+      handed_qty    INTEGER CHECK (handed_qty IS NULL OR handed_qty >= 0),      -- 実際に渡した数
+      -- planned = 決めた / prepared = 箱とラベルを用意した / handed = 渡した / settled = 精算ずみ /
+      -- cancelled = 渡す前にやめた
+      state         TEXT NOT NULL CHECK (state IN ('planned','prepared','handed','settled','cancelled')),
+      due_date      TEXT,                                        -- いつまでに返してほしいか (任意)
+      -- ⭐渡す前にやめたときに戻す担当拠点。まとまりを割らずに丸ごと預けたときだけ入る (Codex R1 中6)
+      prev_facility_code TEXT,
+      -- ⭐この預けのためにまとまりを切り出したか (1 = やめたらそのまとまりを取消にして数を戻す)。
+      --   まとまり側の split_from_batch_id は過去の分割の履歴なので、それで決めない (Codex R3 中4)
+      split_created INTEGER NOT NULL DEFAULT 0 CHECK (split_created IN (0,1)),
+      -- ⭐外部で壊れる等で**物として返ってこない数**。職員が確かめて精算するときに入れる (Codex R1 中10)。
+      --   返却行の good/loss (返ってきた物の内訳) とは別のもの
+      missing_qty   INTEGER CHECK (missing_qty IS NULL OR missing_qty >= 0),
+      planned_at    TEXT NOT NULL,
+      planned_by    TEXT,
+      prepared_at   TEXT,
+      prepared_by   TEXT,
+      handed_at     TEXT,
+      handed_by     TEXT,
+      settled_at    TEXT,
+      settled_by    TEXT,
+      note          TEXT,
+      version       INTEGER NOT NULL DEFAULT 1,
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL,
+      -- 渡す前は渡した数を持たない / 渡したあとは必ず持つ
+      CHECK ((state IN ('planned','prepared','cancelled')) = (handed_qty IS NULL))
+    );`;
+/**
+ * 返却 (要件 §AB-7)。⭐**一度で全部返るとは限らない**ので子テーブル。
+ * returned_qty = 物として返ってきた数 / good_qty = そのうち使える良品 / loss_qty = 外部で作れなかった数。⭐**返却の確定はいろは側**
+ * (物が戻ったのを確かめられるのは いろは。外部の専用 URL からは申告だけ)。
+ */
+const consignReturnDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      consignment_id  INTEGER NOT NULL REFERENCES f_iroha_consignments(id),
+      returned_qty    INTEGER NOT NULL CHECK (returned_qty >= 0),
+      -- ⭐返ってきた物の内訳。good + loss <= returned_qty (サービス層でも守る)
+      good_qty        INTEGER CHECK (good_qty IS NULL OR good_qty >= 0),
+      loss_qty        INTEGER CHECK (loss_qty IS NULL OR loss_qty >= 0),
+      returned_at     TEXT NOT NULL,
+      returned_by     TEXT,
+      note            TEXT,
+      idempotency_key TEXT UNIQUE,     -- 二重タップ・通信の再送で 2 回受け取らない
+      created_at      TEXT NOT NULL
+    );`;
+const CONSIGN_INDEX_DDL = `
+    CREATE INDEX IF NOT EXISTS idx_iroha_consign_batch ON f_iroha_consignments(batch_id, id);
+    CREATE INDEX IF NOT EXISTS idx_iroha_consign_fac ON f_iroha_consignments(facility_code, state);
+    CREATE INDEX IF NOT EXISTS idx_iroha_consign_ret ON f_iroha_consignment_returns(consignment_id, id);`;
+
 const STOCKING_INDEX_DDL = `
     CREATE INDEX IF NOT EXISTS idx_iroha_stocking_batch ON f_iroha_stocking_records(batch_id, id);`;
 
@@ -611,6 +681,7 @@ export function createTables(db = getMirrorDB()) {
       code       TEXT NOT NULL UNIQUE,
       name       TEXT NOT NULL,
       external   INTEGER NOT NULL DEFAULT 0 CHECK (external IN (0,1)),
+      offsite    INTEGER NOT NULL DEFAULT 0 CHECK (offsite IN (0,1)),   -- 物を持ち帰って向こうで作業する (羅針盤・ワークセンター)
       active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
       sort_order INTEGER NOT NULL DEFAULT 0
     );
@@ -653,6 +724,9 @@ export function createTables(db = getMirrorDB()) {
     ${BATCHES_INDEX_DDL}
     ${stockingDDL('f_iroha_stocking_records')}
     ${STOCKING_INDEX_DDL}
+    ${consignDDL('f_iroha_consignments')}
+    ${consignReturnDDL('f_iroha_consignment_returns')}
+    ${CONSIGN_INDEX_DDL}
     ${sessionsDDL('f_iroha_work_sessions')}
 
     -- 完成写真・動画 (要件定義 §6 / §1.7 ②outbox)。
@@ -736,8 +810,12 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_work_options', 'manual_sort', 'INTEGER');
   // 拠点の初期値 (無ければ足す。名前の変更は管理画面から — 今は無いので tasks.js を正とする)。
   // タスク表の作り直し (facility_code の FK 検査) より前に入れておく
-  const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, active, sort_order) VALUES (?, ?, ?, 1, ?)');
-  for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.sort_order);
+  addCol('f_iroha_facilities', 'offsite', 'INTEGER NOT NULL DEFAULT 0 CHECK (offsite IN (0,1))');
+  const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, offsite, active, sort_order) VALUES (?, ?, ?, ?, 1, ?)');
+  for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.offsite ? 1 : 0, f.sort_order);
+  // 「物を持ち帰るか」は拠点の性質なので tasks.js を正として揃える (既に入っている行も)
+  const offFac = db.prepare('UPDATE f_iroha_facilities SET offsite = ? WHERE code = ? AND offsite <> ?');
+  for (const f of FACILITIES) offFac.run(f.offsite ? 1 : 0, f.code, f.offsite ? 1 : 0);
   // 名前の変更 (既に入っている行は INSERT OR IGNORE では変わらない)。旧名のときだけ書き換えるので、手で別の名前にした行は触らない
   const renFac = db.prepare('UPDATE f_iroha_facilities SET name = ? WHERE code = ? AND name = ?');
   for (const r of FACILITY_RENAMES) renFac.run(r.to, r.code, r.from);
@@ -831,6 +909,8 @@ export function createTables(db = getMirrorDB()) {
   //   刷った中身 (商品名・バーコード・入数・期限・枚数) は元から列で持っているので、
   //   あとでまとまりの期限や数を直しても、**刷った記録は変わらない**
   addCol('f_iroha_print_jobs', 'batch_id', 'INTEGER REFERENCES f_iroha_task_batches(id)');
+  // 預けの行に「この預けで切り出したか」(Codex R3 中4)。マージ前の DB にも足す
+  addCol('f_iroha_consignments', 'split_created', 'INTEGER NOT NULL DEFAULT 0 CHECK (split_created IN (0,1))');
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}

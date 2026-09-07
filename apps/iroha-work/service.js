@@ -21,7 +21,8 @@ import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
 import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask } from './tasks-db.js';
-import { countsByTask, stockingOfTask } from './batches.js';
+import { countsByTask, stockingOfTask, batchesByTask } from './batches.js';
+import { consignmentsOfTask, consignableByBatch } from './consign.js';
 
 /**
  * ⭐「急ぎ」の線引き (中原さん 2026-09-06)。
@@ -303,6 +304,17 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
   const arrivals = arrivalHistory(codeKeys);
   // できた数・作れなかった数は「まとまり」から (要件 §AB-1)
   const counts = countsByTask(getDB(), rows.map((r) => r.id));
+  // まとまり (ふだんは 1 つ)。⭐一覧では「あずけ中が何個あるか」を出すのに使う (要件 §AB-7)
+  const batches = batchesByTask(getDB(), rows.map((r) => r.id));
+  // ⭐「あと何個渡せるか」は**まとめて**引く。1 まとまりずつ呼ぶと 2000 枚 × 4 クエリになる (Codex R2 中6)
+  const consignable = consignableByBatch(getDB(), [...batches.values()].flat().map((b) => b.id));
+  // ⭐いま外にあるのは「渡した数 − 返ってきた数」。100 個渡して 90 個返っても 100 と出さない (Codex R1 中9)
+  const awayByTask = new Map(getDB().prepare(`SELECT b.task_id,
+      SUM(COALESCE(c.handed_qty, c.planned_qty)
+        - COALESCE((SELECT SUM(r.returned_qty) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id), 0)) qty,
+      COUNT(*) n, MIN(c.due_date) due
+    FROM f_iroha_consignments c JOIN f_iroha_task_batches b ON b.id = c.batch_id
+    WHERE c.state IN ('planned','prepared','handed') GROUP BY b.task_id`).all().map((r) => [r.task_id, r]));
   const today = jstToday();
   const tomorrow = jstTomorrow(today);
 
@@ -339,6 +351,17 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       loss_qty: (counts.get(r.id) || {}).loss_qty ?? null,
       variance_note: (counts.get(r.id) || {}).variance_note ?? null,
       counted: !!(counts.get(r.id) || {}).counted,
+      // ⭐外部にあずけているぶん (要件 §AB-7)。無ければ null (0 で代用しない)
+      away: awayByTask.get(r.id) ? { qty: awayByTask.get(r.id).qty, count: awayByTask.get(r.id).n, due: awayByTask.get(r.id).due || null } : null,
+      // ⭐「あと何個渡せるか」「なぜ渡せないか」はサーバーが決める。
+      //   画面が自分で予定数から出すと、サーバーの判定とずれて「押したら断られる」ことになる (Codex R1 中7)
+      batches: (batches.get(r.id) || []).map((b) => {
+        const cg = consignable.get(b.id) || { max: null, why: null };
+        return { id: b.id, seq: b.seq, planned_qty: b.planned_qty,
+          facility_code: b.facility_code, expiry: b.expiry, work_status: b.work_status,
+          good_qty: b.good_qty, loss_qty: b.loss_qty,
+          consignable_max: cg.max, consignable_why: cg.why };
+      }),
       hold_memo: r.hold_memo || null,
       planned_date: r.planned_date,
       today: r.planned_date === today,
@@ -471,6 +494,8 @@ export function buildTaskCard(id, { queueImages = true, readOnly = false } = {})
   card.work_history = finishedSessionsOfTask(t.id);
   // ⭐棚に入れた実績 (要件 §AB-2)。いつ・誰が・何個 入れたか。詳細でだけ出す
   card.stocking = stockingOfTask(getDB(), t.id);
+  // ⭐預けの記録 (要件 §AB-7)。詳細でだけ出す
+  card.consignments = consignmentsOfTask(getDB(), t.id);
   // ⭐下見・履歴 (読むだけ) では取り寄せない。開くだけで画像キューの DB が変わると
   //   「読むだけの画面では何も書かない」という境界が崩れる (Codex PR1 R7)
   if (queueImages) queueMissingImages([card]);

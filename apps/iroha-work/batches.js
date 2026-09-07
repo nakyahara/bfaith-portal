@@ -276,10 +276,20 @@ export function stockingOfTask(db, taskId) {
  * @returns {number} 足した行数
  */
 export function recordStockingForTask(db, taskId, opts = {}) {
-  const rows = db.prepare("SELECT id FROM f_iroha_task_batches WHERE task_id = ? AND work_status <> 'cancelled'").all(taskId);
+  // ⭐外部にあずけたまま (渡す予定・用意ずみ・渡した) のまとまりは**棚に入れていない**ので飛ばす。
+  //   ここで作ってしまうと、まだ外にある物が「棚に入れた」記録になる (自己レビュー A)。
+  //   ふつうは手前 (changeTaskStatus / bulkCloseReady) で consign_open として断るので、ここは念のための二重の関門
+  const rows = db.prepare(`SELECT id FROM f_iroha_task_batches b WHERE task_id = ? AND work_status <> 'cancelled'
+    AND NOT EXISTS (SELECT 1 FROM f_iroha_consignments c WHERE c.batch_id = b.id AND c.state IN ('planned','prepared','handed'))`).all(taskId);
   let n = 0;
   for (const b of rows) n += recordStocking(db, b.id, opts);
   return n;
+}
+
+/** そのカードで、まだ外にある (返ってきていない) 預けの数。0 なら棚入待ち・棚入完了にしてよい */
+export function openConsignmentCount(db, taskId) {
+  return db.prepare(`SELECT COUNT(*) c FROM f_iroha_consignments c JOIN f_iroha_task_batches b ON b.id = c.batch_id
+    WHERE b.task_id = ? AND c.state IN ('planned','prepared','handed')`).get(taskId).c;
 }
 
 /**

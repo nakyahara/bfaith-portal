@@ -84,6 +84,7 @@ import {
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
+import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment } from './consign.js';
 import { startStaffUnlock, staffUnlockOf, endStaffUnlock, STAFF_UNLOCK_MS } from './db.js';
 import {
   addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
@@ -706,6 +707,8 @@ function changeStatusApp(req, res, worker) {
     lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
     varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    // ⭐どのまとまりの数か (預けたあと、いろは のぶんに入れる — 自己レビュー B)。送られたときだけ
+    batchId: 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined,
     reason: req.body?.reason || null,
     actor: hasSessionAccess(req) ? req.iwUser : `${worker.display_name} (いろはアプリ)`,
     isStaff, workerId: worker.id, workerName: worker.display_name, deviceLabel: deviceLabelOf(req),
@@ -833,6 +836,75 @@ router.post('/api/facility', checkOrigin, api((req, res) => {
   res.json({ ok: true, task: publicTask(r.task), staff_mode: staffModeOf(req) });
 }));
 
+/**
+ * 🚚 外部施設にあずける (要件 §AB-7)。**職員だけ**。
+ * 押した結果として、そのカードの「まとまり」から未着手分が切り出される
+ * (「まとまりを分割する」という操作は現場に見せない — 要件 §AB-5)。
+ */
+router.post('/api/consign', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  // ⭐中身を先に見る (不正な要求で職員モードだけ開いてしまわないように — Codex P1 R2)
+  const taskId = parseTaskId(req.body?.id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  const batchId = Number(req.body?.batch_id);
+  if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: 'どのぶんを預けるか (batch_id) が要ります' });
+  if (typeof req.body?.facility_code !== 'string' || !req.body.facility_code) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: 'どこへ渡すかを選んでください' });
+  }
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const r = startConsignment({
+    taskId, batchId, facilityCode: req.body.facility_code, qty: req.body?.qty,
+    dueDate: req.body?.due_date ?? null, expectVersion: req.body?.expect_version,
+    actor: `${gate.worker.display_name} (いろはアプリ)`,
+    guard: planGuardOf(req, gate.worker),
+  });
+  if (!r.ok) return res.status(consignErrorStatus(r.error)).json(r);
+  safeLogTaskEvent({ taskId, action: 'task_consign', to: `${req.body.facility_code} ${r.consignment.planned_qty}個`,
+    workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req), ok: true });
+  res.json({ ok: true, consignment: r.consignment, task: publicTask(getTask(taskId)), staff_mode: staffModeOf(req) });
+}));
+
+/** 🚚 渡した / やめた / 返却を受け取った (要件 §AB-7)。**職員だけ**。返却の確定は いろは 側 */
+router.post('/api/consign/update', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const id = Number(req.body?.consignment_id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: '預けの記録が指定されていません' });
+  const action = String(req.body?.action || '');
+  if (!['prepared', 'handed', 'cancel', 'return', 'settle'].includes(action)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '何をするか (用意した / 渡した / やめる / 返却 / 精算) が要ります' });
+  }
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const common = { consignmentId: id, expectVersion: req.body?.expect_version,
+    actor: `${gate.worker.display_name} (いろはアプリ)`, guard: planGuardOf(req, gate.worker) };
+  const r = action === 'prepared' ? markPrepared({ ...common, qty: req.body?.qty ?? null })
+    : action === 'handed' ? markHanded({ ...common, qty: req.body?.qty ?? null })
+    : action === 'cancel' ? cancelConsignment(common)
+    : action === 'settle' ? settleConsignment({ ...common, missingQty: req.body?.missing_qty ?? 0, note: req.body?.note ?? null })
+    : recordReturn({ ...common, returnedQty: req.body?.returned_qty,
+        goodQty: 'good_qty' in (req.body || {}) ? req.body.good_qty : undefined,
+        lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+        note: req.body?.note ?? null, idempotencyKey: req.body?.idempotency_key ?? null });
+  if (!r.ok) return res.status(consignErrorStatus(r.error)).json(r);
+  const c = r.consignment || getConsignment(id);
+  const b = c ? getDB().prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id) : null;
+  if (b) {
+    safeLogTaskEvent({ taskId: b.task_id, action: 'task_consign', to: `${action} ${c.state}`,
+      workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req), ok: true });
+  }
+  res.json({ ok: true, replayed: !!r.replayed, consignment: c,
+    task: b ? publicTask(getTask(b.task_id)) : undefined, staff_mode: staffModeOf(req) });
+}));
+
+/** 預けの断り方 → HTTP。数の入れ違いは 400、状態や版のずれは 409 */
+function consignErrorStatus(e) {
+  if (e === 'not_found') return 404;
+  if (['conflict', 'closed_task', 'bad_state', 'active_sessions', 'already_stocked', 'already_printed', 'batch_closed', 'notion_mode'].includes(e)) return 409;
+  if (e === 'too_many') return 409;
+  return 400;
+}
+
 /** 「明日の計画」画面のデータ (職員だけ)。読むだけなので DB は変えない */
 /**
  * 「明日の計画」画面のデータ。読むだけなので DB は変えない。
@@ -907,6 +979,7 @@ router.post('/api/progress', checkOrigin, api((req, res) => {
     lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
     varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    batchId: 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined,
     actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
     // 正本の切替は version を変えないので、更新と同じトランザクションでもう一度見る (要件 §U-2)
@@ -937,6 +1010,7 @@ router.post('/api/block', checkOrigin, api((req, res) => {
     lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
     varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    batchId: 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined,
     actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
   });

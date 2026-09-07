@@ -34,6 +34,11 @@ export const CAP = Object.freeze({
   DAILY_REPORT: 'report.daily',
   /** 🏷 保管箱ラベルを いろはPC の QL-800 から出す (中原さん 2026-09-06)。カード (f_iroha_tasks) が正本のときだけ = アプリ正本のみ */
   LABEL_PRINT: 'task.label.print',
+  /**
+   * 🚚 外部施設 (羅針盤・ワークセンター) に一部を預ける / 渡す / 返却を受け取る (要件 §AB-7)。
+   * ⭐**職員だけ**。どこに何個預けるかは職員の判断で、利用者はボードで見るだけ
+   */
+  CONSIGN: 'task.consign',
 });
 
 const CAPS_NOTION = Object.freeze([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT, CAP.DAILY_REPORT]);
@@ -44,7 +49,7 @@ const CAPS_APP = Object.freeze([...CAPS_NOTION, CAP.CANCELLATION, CAP.REVIEW_CLE
  * 利用者の画面には札のボタンも計画の入口も外部出しのボタンも描かない (要件 §W-1 / 監修 F-5 2026-09-05)
  */
 /** まとめて棚入完了 (終了) も職員だけ — 利用者の画面にはボタンを描かない (中原さん 2026-09-06「棚入完了は職員のアカウントのみ」) */
-const CAPS_STAFF = Object.freeze([CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN, CAP.EXTERNAL_READY, CAP.BULK_STOCKED]);
+const CAPS_STAFF = Object.freeze([CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN, CAP.EXTERNAL_READY, CAP.BULK_STOCKED, CAP.CONSIGN]);
 const CAPS_PREVIEW = Object.freeze([]);
 
 /**
