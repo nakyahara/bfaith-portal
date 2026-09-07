@@ -54,6 +54,12 @@ const BANNED_WORDS_VIEW = [
   'parent', 'frames', 'opener', 'Worker', 'Reflect', 'http', 'https', 'open', 'postMessage', 'importScripts', 'srcdoc', 'constructor', '__proto__', 'prototype', 'Proxy',
   'defaultView', 'fromCharCode', 'fromCodePoint', 'atob', 'btoa', 'unescape', 'decodeURI', 'decodeURIComponent', 'requestSubmit',
 ];
+/** 画面で「コードとして」禁止する名前 (文字列の中は見ない: addEventListener('click') のイベント名は許す — Codex R7)
+ *  Window / 属性へ回り道で届く口: MouseEvent.view, iframe.contentWindow, Object.assign(form, {...}), with (form) {...}, 属性ノード, 定義書き換え, click() */
+const BANNED_CODE_WORDS_VIEW = [
+  'view', 'contentWindow', 'contentDocument', 'ownerDocument', 'Object', 'assign', 'with', 'getAttributeNode', 'setAttributeNode',
+  'defineProperty', 'defineProperties', 'dispatchEvent', 'click',
+];
 // setTimeout / setInterval は「文字列を渡す」形だけ禁止 (eval と同じ)。関数を渡す普通の使い方 (トースト・遅延リロード) は許す
 const BANNED_FRAGMENTS_VIEW = [j('?.', '('), j('?.', '['), '.call(', '.apply(', '.bind(', 'createElement(', '.src', '.action', '//', 'javascript:', 'data:',
   j('setTimeout', "('"), j('setTimeout', '("'), j('setTimeout', '(`'), j('setInterval', "('"), j('setInterval', '("'), j('setInterval', '(`'), '.submit(', 'form.submit'];
@@ -276,12 +282,14 @@ export function scanSource(src, { isView = false, checkImports = true, external 
       [/<embed/i, 'embed'], [/<link/i, 'link'], [/<base/i, 'base'], [/<meta[^>]*http-equiv/i, 'meta http-equiv'], [/\bformaction=/i, 'formaction'],
       [/\bsrcdoc=/i, 'srcdoc'], [/javascript:/i, 'javascript: URL'], [/<img/i, 'img (外部画像は読み込ませない)'],
     ]) if (re.test(html)) problems.push(`HTML に ${label}`);
-    for (const m of src.matchAll(/\bhref=["']([^"']*)["']/g)) {
-      const v = m[1];
-      if (!(v.startsWith('/') || v.startsWith('?') || v.startsWith('#') || v.startsWith('https://www.amazon.co.jp/dp/') || v.startsWith('<%= qs(') || v.startsWith('<%= new URLSearchParams'))) {
-        problems.push(`href が許可外: ${v.slice(0, 60)}`);
-      }
+    // href は引用符の有無に関係なく取り出す。/ から始まる相対パスでもバックスラッシュは拒否 (Codex R7)
+    for (const m of src.matchAll(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)) {
+      const v = m[1] ?? m[2] ?? m[3] ?? '';
+      const okPrefix = v.startsWith('/') || v.startsWith('?') || v.startsWith('#') || v.startsWith('https://www.amazon.co.jp/dp/') || v.startsWith('<%= qs(') || v.startsWith('<%= new URLSearchParams');
+      if (!okPrefix || v.includes('\\')) problems.push(`href が許可外: ${v.slice(0, 60)}`);
     }
+    // CSS 経由の外向き通信 (<style> や style= の url() / @import) も禁止 (Codex R7)
+    if (/url\s*\(/i.test(html) || /@import/i.test(html)) problems.push('CSS の url() / @import は使わない (外部へ通信できる)');
     // EJS タグ (<% %> / <%= %> / <%- %>) の中身はサーバで実行される JS。サーバ側の規則で検査する (Codex R3 High)
     const serverSnippets = [...src.matchAll(/<%[-=_#]?([^]*?)[-_]?%>/g)].map((m) => m[1]).filter((s) => !/^\s*#/.test(s));
     for (const s of serverSnippets) {
@@ -318,9 +326,13 @@ export function scanSource(src, { isView = false, checkImports = true, external 
       const code = normalize(s);
       const blankedCode = blankStrings(code);
       for (const w of BANNED_WORDS_VIEW) if (new RegExp(`(?<![\\w$])${w}(?![\\w$])`).test(code)) problems.push(`禁止語 "${w}"`);
+      for (const w of BANNED_CODE_WORDS_VIEW) if (new RegExp(`(?<![\\w$])${w}(?![\\w$])`).test(blankedCode)) problems.push(`禁止語 (コード) "${w}"`);
       for (const f of BANNED_FRAGMENTS_VIEW) if (code.includes(f)) problems.push(`禁止 "${f}"`);
-      // fetch は「その場で呼ぶ」形だけ。別名に代入する (const send = fetch) と URL の検査をすり抜ける (Codex R6)
-      if (/(?<![\w$])fetch(?![\w$(])/.test(blankedCode)) problems.push('fetch を呼ばずに参照している (別名化)');
+      // fetch は「裸で、その場で呼ぶ」形 (fetch(...)) だけ。別名 (const send = fetch)・メンバー (x.fetch)・
+      // 文字列キー (ev.view['fetch']) は全部拒否する (Codex R6/R7)。文字列の中も見る (潰さない)
+      const bareCalls = (code.match(/(?<![\w$.'"`])fetch\(/g) || []).length;
+      const allFetch = (code.match(/fetch/g) || []).length;
+      if (allFetch !== bareCalls) problems.push('fetch を裸の呼び出し以外の形で参照している (別名・メンバー・文字列キー)');
       // form の送り先・送信方法・HTML をスクリプトから書き換える経路 (.action / ['action'] / setAttribute / innerHTML …) は禁止
       if (/\.(action|method|submit|formAction|formMethod|setAttribute|setAttributeNS|attributes|innerHTML|outerHTML|insertAdjacentHTML|forms|write|writeln|enctype)(?![\w$])/.test(blankedCode)) {
         problems.push('form の送り先・送信方法・HTML を書き換える API (.action / .method / .submit / setAttribute / innerHTML …) は使わない');
@@ -546,6 +558,14 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
     ['Codex R6: 引用符なし + 実体参照の onclick', `<button ${j('on', 'click')}=${j('fet', 'ch')}&#40;&#39;/apps/profit-calculator/api/amazon/manual-list&#39;,&#123;method:&#39;POST&#39;&#125;&#41;>x</button>`],
     ['setAttribute で action を書き換え', `<script>f.${j('set', 'Attribute')}('action', '/x');</script>`],
     ['innerHTML で form を生成', `<script>d.${j('inner', 'HTML')} = s;</script>`],
+    ['Codex R7: MouseEvent.view から fetch を文字列キーで', `<script>document.addEventListener('click', function (ev) { ev.${j('vi', 'ew')}['${j('fet', 'ch')}']('/apps/profit-calculator/api/amazon/manual-list', { method: 'POST' }); });</script>`],
+    ['メンバー呼び出しの fetch', `<script>ev.${j('vi', 'ew')}.${j('fet', 'ch')}('/x');</script>`],
+    ['Codex R7: Object.assign で form の送り先を書き換え', `<form id="f" method="dialog"></form><script>${j('Obj', 'ect')}.assign(document.getElementById('f'), { method: 'POST', action: '/apps/profit-calculator/api/amazon/manual-list' }); document.getElementById('b').${j('cli', 'ck')}();</script>`],
+    ['Codex R7: with で form の送り先を書き換え', `<script>${j('wi', 'th')} (f) { method = 'POST'; action = '/x'; }</script>`],
+    ['Codex R7: CSS url() で外部へ', `<style>body{background:url(https://evil.example/x)}</style>`],
+    ['CSS @import', `<style>@import 'https://evil.example/x.css';</style>`],
+    ['引用符なしの href', `<a href=https://evil.example/>x</a>`],
+    ['href にバックスラッシュ', `<a href="/\\evil.example/">x</a>`],
   ];
   for (const [label, code] of VIEW_EVASIONS) {
     const problems = scanSource(code, { isView: true });
@@ -566,6 +586,7 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
   ok(scanSource(`if (ok) /[//]/.test(x); const y = (a + b) / 2; while (z) /x/.exec(s); async function w(xs) { for await (const x of xs) /[//]/.test(x); }`).length === 0, '通る: 制御構文 (for await 含む) 直後の正規表現と割り算');
   ok(scanSource(`<script>fetch('/apps/amazon-pricing/api/x', { method: 'POST', headers: { 'Content-Type': 'application/json' } }).then(function (r) { return r.json(); }); form.mode.value = 'x'; dlg.showModal(); tr.getAttribute('data-decision');</script>`, { isView: true }).length === 0, '通る (画面): その場で呼ぶ fetch と { method: } のキー、getAttribute');
   ok(scanSource(`const re = /\\(/; const s = x.replace(/\\)/g, '');`).length === 0, '通る: 正規表現の中の括弧は数えない');
+  ok(scanSource(`<a href="/apps/amazon-pricing/">x</a><a href="https://www.amazon.co.jp/dp/B0X">y</a><style>.a { color: red; }</style>`, { isView: true }).length === 0, '通る (画面): 相対 href・Amazon の商品ページ・url() の無い CSS');
   ok(scanSource(`<%- include('_top', { nav: 'index' }) %><% for (const r of rows) { %><td><%= yen(r.my_price) %></td><% } %>`, { isView: true }).length === 0, '通る (画面): 普通の EJS タグ');
   ok(scanSource(`<script>openPolicyDialog(<%- JSON.stringify(x).replace(/</g, '\\\\u003c') %>);</script>`, { isView: true }).length === 0, '通る (画面): XSS 対策の \\u003c 置換 (文字列の中)');
 }

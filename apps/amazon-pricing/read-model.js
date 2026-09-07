@@ -120,9 +120,12 @@ export function inputFingerprint(db) {
   const fees = db.prepare('SELECT COUNT(*) AS n, MAX(fetched_at) AS t FROM mirror_amazon_sku_fees').get();
   const res = db.prepare('SELECT COUNT(*) AS n, MAX(synced_at) AS t FROM mirror_sku_resolved').get();
   const prod = db.prepare('SELECT COUNT(*) AS n, MAX(updated_at) AS t FROM mirror_products').get();
+  // 販売実績 (units_30d と NO_SALES_30D の旗の材料) も入力なので指紋に含める (Codex R7)
+  const fin = db.prepare('SELECT COUNT(*) AS n, MAX(date_jst) AS d, MAX(synced_at) AS t FROM mirror_amazon_finance_sku_daily').get();
   return {
     snapshotDate: snap?.d ?? null,
-    fingerprint: [snap?.d ?? '-', snap?.n ?? 0, snap?.t ?? '-', fees?.n ?? 0, fees?.t ?? '-', res?.n ?? 0, res?.t ?? '-', prod?.n ?? 0, prod?.t ?? '-'].join('|'),
+    fingerprint: [snap?.d ?? '-', snap?.n ?? 0, snap?.t ?? '-', fees?.n ?? 0, fees?.t ?? '-', res?.n ?? 0, res?.t ?? '-', prod?.n ?? 0, prod?.t ?? '-',
+      fin?.n ?? 0, fin?.d ?? '-', fin?.t ?? '-'].join('|'),
   };
 }
 
