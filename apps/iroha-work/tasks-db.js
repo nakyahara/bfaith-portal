@@ -10,9 +10,20 @@ import {
   OPEN_STATUSES, CLOSE_REASONS, BLOCK_REASONS, BLOCK_LABEL, BLOCKABLE_STATUSES, LEGACY_ON_HOLD,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
 } from './tasks.js';
-import { ensureBatchForTask, syncSingleBatchStatus } from './batches.js';
+import { ensureBatchForTask, syncSingleBatchStatus, recordBatchCounts, recomputeTaskDoneQty, soleBatchOfTask } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
+
+/**
+ * ⭐できた数・作れなかった数は**まとまりに書く**。カードの done_qty はその合計から出す (要件 §AB-1/§AB-3)。
+ * まとまりが 1 つのうち (＝いまの全カード) は、これで今までと同じ数がカードにも載る。
+ * ⚠必ず呼び出し側の書き込みトランザクションの中で。
+ */
+function applyCountsToSoleBatch(db, taskId, counts) {
+  const b = soleBatchOfTask(db, taskId);
+  if (!b) return false;
+  return recordBatchCounts(db, b.id, counts);
+}
 
 /**
  * ⭐アプリ正本のときだけ書ける操作の関門 (Codex PR1 R15)。
@@ -232,7 +243,7 @@ export function listOrphans(limit = 100) {
 // ─── 状態変更 ───
 
 const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, close_reason_required: 400, not_found: 404, bad_request: 400,
-  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409, bad_done_qty: 400, bad_hold_memo: 400, ready_task: 409,
+  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409, bad_done_qty: 400, bad_hold_memo: 400, bad_loss_qty: 400, ready_task: 409,
   // 止まっている理由 (案A): 理由が無い/不正 = 400、止められない状態 = 409、止まっているので始められない = 409
   block_reason_required: 400, bad_block: 409, blocked: 409,
   notion_mode: 409 };   // 取得後に正本が切り替わった = 競合 (入力不正ではない — Codex PR1 R17)
@@ -261,6 +272,13 @@ export function normalizeDoneQty(v) {
   return { value: n };
 }
 /** 中断メモ。undefined = 触らない / 空 = 消す。長すぎる申し送りは切らずに断る (書いた人が気づけるように) */
+/** 作れなかった数 (袋を破いた等)。⭐空欄を 0 と読まない — 「無い」と「数えていない」は別 (要件 §AB-3) */
+export function normalizeLossQty(v) {
+  const r = normalizeDoneQty(v);
+  if (r.error) return { error: 'bad_loss_qty', message: r.message.replace('できた数', '作れなかった数') };
+  return r;
+}
+
 export function normalizeHoldMemo(v) {
   if (v === undefined) return { skip: true };
   if (v === null) return { value: null };
@@ -271,7 +289,7 @@ export function normalizeHoldMemo(v) {
 }
 
 export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null,
-  doneQty = undefined, holdMemo = undefined,
+  doneQty = undefined, lossQty = undefined, varianceNote = undefined, holdMemo = undefined,
   actor = null, isStaff = false, workerId = null, workerName = null, deviceLabel = null, reason = null }) {
   const db = getDB();
   const t = getTask(taskId);
@@ -310,15 +328,17 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   const dq = normalizeDoneQty(doneQty);
   if (dq.error) return { ok: false, error: dq.error, message: dq.message };
   if (!dq.skip) next.done_qty = dq.value;
+  const lq = normalizeLossQty(lossQty);
+  if (lq.error) return { ok: false, error: lq.error, message: lq.message };
   const hm = normalizeHoldMemo(holdMemo);
   if (hm.error) return { ok: false, error: hm.error, message: hm.message };
   if (!hm.skip) next.hold_memo = hm.value;
   // 棚入待ち・棚入完了は「全部そろってから」(中原さん 2026-09-05)。数えていなくても、そこまで来たら全部できたとみなす。
   // 中断メモは申し送りなので、作業が終わったら消す (消した中身は履歴に残す)
   if (to === 'ready_for_stocking' || (to === 'closed' && closeReason === 'stocked')) {
-    // ⭐つくる数が分からないカードは、できた数も「数えていない」に戻す。
-    //   途中の数 (5 個) をそのまま残すと、それが完成数なのか途中経過なのか分からなくなる (Codex R1 中2)
-    next.done_qty = t.qty ?? null;
+    // 🚨**できた数を予定で上書きしない** (要件 §AB-3。2026-09-07 まではここで done_qty = qty にしていた)。
+    //   1000 個の予定で 998 個しかできなくても、記録が 1000 個になってしまっていた。
+    //   実際にできた数は、作業を終えるときに人が入れる。数えていなければ NULL のまま (0 でも予定でもない)
     next.hold_memo = null;
   }
   const problems = validateTaskInvariants(next);
@@ -352,6 +372,8 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     if (r.changes === 0) return false;
     // まとまりが 1 つだけなら作業状態も合わせる (移行のあいだの橋渡し — 要件 §AB-1)
     syncSingleBatchStatus(db, t.id, next);
+    // ⭐数はまとまりが正本。カードの done_qty はその合計に直す (要件 §AB-3)
+    applyCountsToSoleBatch(db, t.id, { goodQty: dq.skip ? undefined : dq.value, lossQty: lq.skip ? undefined : lq.value, note: varianceNote });
     const cleared = ((t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '')
       + ((t.blocked_reason && !next.blocked_reason) ? ` 札解除(${t.blocked_reason})` : '');
     // できた数と中断メモも履歴に残す。消えた申し送りを後から追えるように (ready_at と同じ考え方)
@@ -419,6 +441,8 @@ export function setTaskBlock({ taskId, reason, note = null, doneQty = undefined,
         done_qty = ?, hold_memo = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?`)
       .run(reason, noteText, now, actor, nextQty, nextMemo, now, actor, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
+    // ⭐数はまとまりが正本 (要件 §AB-3)
+    applyCountsToSoleBatch(db, t.id, { goodQty: dq.skip ? undefined : dq.value });
     // 止まっている間は作業時間を数えない → このカードで作業中の人を全員止める (pause)
     const active = db.prepare('SELECT id, worker_id, worker_name, started_at FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL AND voided_at IS NULL').all(t.id);
     const upd = db.prepare("UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = 'pause', raw_seconds = ? WHERE id = ?");
@@ -696,14 +720,16 @@ export function setFacility({ taskId, facilityCode, expectVersion, actor = null,
  * 数え間違いは後から直せないと現場が困るので、こちらも要る。
  * 確かめるところから書くところまで全部 1 つのトランザクション (要件 §U-2)
  */
-export function setProgress({ taskId, doneQty = undefined, holdMemo = undefined, expectVersion,
+export function setProgress({ taskId, doneQty = undefined, lossQty = undefined, varianceNote = undefined, holdMemo = undefined, expectVersion,
   actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
   const db = getDB();
   const dq = normalizeDoneQty(doneQty);
   if (dq.error) return { ok: false, error: dq.error, message: dq.message };
+  const lq2 = normalizeLossQty(lossQty);
+  if (lq2.error) return { ok: false, error: lq2.error, message: lq2.message };
   const hm = normalizeHoldMemo(holdMemo);
   if (hm.error) return { ok: false, error: hm.error, message: hm.message };
-  if (dq.skip && hm.skip) return { ok: false, error: 'bad_request', message: '直すものがありません' };
+  if (dq.skip && hm.skip && lq2.skip && varianceNote === undefined) return { ok: false, error: 'bad_request', message: '直すものがありません' };
   return db.transaction(() => {
     if (guard) { const g0 = guard(); if (g0) return g0; }
     const g = appModeGuard();
@@ -719,10 +745,12 @@ export function setProgress({ taskId, doneQty = undefined, holdMemo = undefined,
     }
     const nextQty = dq.skip ? (t.done_qty ?? null) : dq.value;
     const nextMemo = hm.skip ? (t.hold_memo ?? null) : hm.value;
-    if (nextQty === (t.done_qty ?? null) && nextMemo === (t.hold_memo ?? null)) return { ok: true, task: t, already: true };
+    if (nextQty === (t.done_qty ?? null) && nextMemo === (t.hold_memo ?? null) && lq2.skip && varianceNote === undefined) return { ok: true, task: t, already: true };
     const r = db.prepare('UPDATE f_iroha_tasks SET done_qty = ?, hold_memo = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
       .run(nextQty, nextMemo, utcNow(), actor, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    // ⭐数はまとまりが正本 (要件 §AB-3)
+    applyCountsToSoleBatch(db, t.id, { goodQty: dq.skip ? undefined : dq.value, lossQty: lq2.skip ? undefined : lq2.value, note: varianceNote });
     safeLogTaskEvent({ taskId: t.id, action: 'task_progress',
       from: `できた${t.done_qty ?? '—'}${t.hold_memo ? ' メモあり' : ''}`,
       to: `できた${nextQty ?? '—'}${nextMemo ? ' メモ:' + nextMemo : ''}`,

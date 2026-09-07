@@ -1973,11 +1973,13 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       // ⑥ 版がずれていたら断る
       const stale5 = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v() - 1, done_qty: 5 } });
       ok(stale5.status === 409 && stale5.json.error === 'conflict', '古い版で送ったら断る (楽観ロック)');
-      // ⑦ 棚入待ちにしたら「全部そろった」= done_qty は つくる数。中断メモは役目を終えるので消える
+      // ⑦ 🚨棚入待ちにしても**できた数を予定で上書きしない** (要件 §AB-3。2026-09-07 に直した)。
+      //    1000 個の予定で 998 個しかできなくても、記録が 1000 個になってしまっていた
       await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v(), done_qty: 130, hold_memo: '残りは明日' } });
       const ready = await call('POST', '/api/status', { cookie, body: { id: T5, worker_id: w1.id, to: 'ready_for_stocking', expect_version: v() } });
-      ok(ready.status === 200 && row().done_qty === 200 && row().hold_memo == null,
-        '棚入待ちにしたら できた数 = つくる数、中断メモは消える (全部そろってから棚入れするため)');
+      ok(ready.status === 200 && row().done_qty === 130,
+        '⭐棚入待ちにしても、できた数は人が入れた 130 のまま (つくる数 200 で上書きしない)');
+      ok(row().hold_memo == null, '中断メモは役目を終えるので消える');
       const ev = db.prepare("SELECT to_value FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_status' ORDER BY id DESC LIMIT 1").get(T5);
       ok(/メモ消去\(残りは明日\)/.test(ev.to_value || ''), '消した中断メモは履歴に残す (あとから追える)');
       // ⑧ 終了したカードは直せない
@@ -1997,7 +1999,7 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok(TD.getTask(T5).status === 'ready_for_stocking', '前提: いま棚入待ち');
       const afterReady = await call('POST', '/api/progress', { cookie, body: { id: T5, worker_id: w1.id, expect_version: v(), done_qty: 130, hold_memo: '残りは明日' } });
       ok(afterReady.status === 409 && afterReady.json.error === 'ready_task', '棚入待ちのカードは直せない (職員がやり直しで作業中に戻してから)');
-      ok(row().done_qty === 200 && row().hold_memo == null, '断ったので値も変わらない');
+      ok(row().done_qty === 130 && row().hold_memo == null, '断ったので値も変わらない (130 のまま)');
 
       // ⑫ 型を偽った値は数にしない (空白だけ・真偽値・配列は 400。未入力が黙って 0 個にならない)
       const dqStaff = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
@@ -2020,14 +2022,14 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok(okFirst.status === 200 && race.status === 409 && race.json.error === 'conflict' && row().done_qty === 7 && row().blocked_reason === null,
         '同じ版で 2 つの口を叩いたら片方だけ通る (もう片方は競合。数も札も混ざらない)');
 
-      // ⑭ つくる数が分からないカード: 棚入待ちで「途中の数」を残さない (Codex R1 中2)
+      // ⑭ つくる数が分からないカードでも、人が入れた数はそのまま残る (要件 §AB-3)
       const T6 = TD.upsertTaskFromImport({ notion_page_id: 'dq-3', status: 'in_progress', facility_code: 'iroha',
         destination_id: 9503, product_name: 'つくる数不明', qty: null }, { batchId: 'dq' }).id;
       const v6 = () => TD.getTask(T6).version;
       await call('POST', '/api/progress', { cookie, body: { id: T6, worker_id: w1.id, expect_version: v6(), done_qty: 5, hold_memo: '途中' } });
       await call('POST', '/api/status', { cookie, body: { id: T6, worker_id: w1.id, to: 'ready_for_stocking', expect_version: v6() } });
-      ok(TD.getTask(T6).done_qty == null && TD.getTask(T6).hold_memo == null,
-        'つくる数が不明なら、棚入待ちでできた数も「数えていない」に戻す (途中の 5 個を完成数に見せない)');
+      ok(TD.getTask(T6).done_qty === 5, 'つくる数が分からなくても、人が入れた 5 個はそのまま残る');
+      ok(TD.getTask(T6).hold_memo == null, '中断メモは消える');
 
       // ⑮ 取消・対象外の終了では、できた数と中断メモを残す (どこまでやったかの記録)
       const T7 = TD.upsertTaskFromImport({ notion_page_id: 'dq-4', status: 'in_progress', facility_code: 'iroha',
@@ -3886,8 +3888,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '保存ボタンも許可を見てから描く (静的に置かない — 要件 §U-7)');
   ok(/function dqPanelHtml\(c, actions, opts\)/.test(html) && /何個までできましたか/.test(html)
     && /const quick = \[\['0', 'まだ 0 個'\]\];/.test(html) && /'半分 \(' \+ Math\.floor\(c\.qty \/ 2\)/.test(html)
-    && /'全部 \(' \+ c\.qty \+ ' 個\)'/.test(html) && /data-dq="">数えていない/.test(html),
-    '数はタップでも入れられる (まだ 0 個 / 半分 / 全部 / 数えていない)');
+    && /'予定どおり \(' \+ c\.qty \+ ' 個\)'/.test(html) && /data-dq="">数えていない/.test(html),
+    '数はタップでも入れられる (まだ 0 個 / 半分 / 予定どおり / 数えていない)');
   ok(/qty: raw === '' \? null : Number\(raw\)/.test(html) && /数えていないときは空のままで構いません/.test(html),
     '空欄は「数えていない」= null で送る (0 にしない)');
   ok(/function dqValues\(rootSel\)/.test(html) && /root\.querySelector\('\.dqIn'\)/.test(html)
@@ -3898,14 +3900,14 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /reason: blockReason, expect_version: c\.version/.test(html),
     '「⛔ 止まった」は専用ダイアログで、理由を 1 タップ → 何個までできたか → メモ を /api/block に 1 回で送る (進捗は変えない)');
   ok(/\.\.\.\(v\.qty != null \? \{ done_qty: v\.qty \} : \{\}\),\s*\.\.\.\(blockReason === 'other' \? \{ note: v\.memo \}\s*: matNote \? \{ note: matNote, \.\.\.\(v\.memo \? \{ hold_memo: v\.memo \} : \{\}\) \}\s*: \(v\.memo \? \{ hold_memo: v\.memo \} : \{\}\)\)/.test(html)
-    && /空のまま進めると、前に数えた値はそのまま残ります/.test(html),
+    && /0 個とは別のこととして残します/.test(html),
     '数を入れなければ送らない = 前に数えた値は消さない。「その他」のメモは止まった理由にだけ (申し送りと二重にしない)');
   ok(/blockReason === 'other' && !v\.memo/.test(html) && /「その他」は何で止まったかをメモに書いてください/.test(html), '「その他」はメモが無いと送らない');
   ok(/c\.active = \[\];\s*\/\/ タイマーは全員止まった/.test(html), '止めたら作業中の人のタイマーは全員止まる (画面もそう描く)');
   // ✅ できあがり → 「何個できましたか → 棚入待ちにする」(監修 B-7 / F-3)。「終了」は出さない
   ok(/function openDone\(c\)/.test(html) && /id="doneOv"/.test(html) && /to: 'ready_for_stocking', worker_id: worker\.id, expect_version: c\.version/.test(html)
-    && /title: '何個できましたか', memo: false, defaultAll: true/.test(html) && /if \(isApp\(\) && c\) openDone\(c\);/.test(html),
-    'できあがりで全員止まったら「何個できましたか (既定 = 全部) → 棚入待ちにする」を出す');
+    && /title: '何個できましたか', memo: false, loss: true/.test(html) && /if \(isApp\(\) && c\) openDone\(c\);/.test(html),
+    'できあがりで全員止まったら「何個できましたか + 作れなかった数 → 棚入待ちにする」を出す (⭐予定で埋めない)');
   ok(!/終了 → 棚入完了/.test(html), '「終了 → 棚入完了を (職員PIN)」の案内は出さない (利用者が押せるのは棚入待ち)');
   // 止まっているカードを始めるときの確認 → clear_block で外してから始める
   ok(/if \(j\.error === 'blocked'\)/.test(html) && /openUnblock\(/.test(html) && /startWork\(ids, \{ clearBlock: true \}\)/.test(html)
@@ -4020,7 +4022,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v9'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v10'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -4764,6 +4766,107 @@ console.log('\n[26] 作業のまとまり — カードの下に独立して作�
     WHERE NOT EXISTS (SELECT 1 FROM f_iroha_task_batches b WHERE b.task_id = t.id)`).get().c;
   ok(after === 0 && db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches').get().c === db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c,
     '⭐まとまりの表が無い DB を開くと、全部のカードに 1 つずつ用意される');
+}
+
+// ═══════ できた数は作り終えたときに聞く / 予定で上書きしない (要件 §AB-3 / §AB-4) ═══════
+console.log('\n[27] できた数 — 実績を予定で上書きしない');
+{
+  const db = getDB();
+  const B = await import('../apps/iroha-work/batches.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const staff27 = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+  const mk27 = (page, dest, qty, status = 'in_progress') => TD.upsertTaskFromImport({ notion_page_id: page, status,
+    facility_code: 'iroha', destination_id: dest, product_name: 'できた数の検査', qty }, { batchId: 'dc' }).id;
+
+  // ① 🚨棚入待ちにしても予定で上書きしない (2026-09-07 まではここで done_qty = qty にしていた)
+  {
+    const t = mk27('dc-1', 9701, 1000);
+    TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: TD.getTask(t).version, doneQty: 998 });
+    ok(TD.getTask(t).done_qty === 998, '⭐1000 個の予定で 998 個できたら、記録は 998 (予定で塗りつぶさない)');
+    ok(B.listBatchesOfTask(db, t)[0].good_qty === 998, 'まとまりにも 998 が入る');
+  }
+  {
+    const t = mk27('dc-2', 9702, 1000);
+    TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: TD.getTask(t).version });
+    ok(TD.getTask(t).done_qty == null && B.listBatchesOfTask(db, t)[0].good_qty == null,
+      '⭐数えずに棚入待ちにしたら「まだ数えていない」のまま (予定を入れない・0 にもしない)');
+  }
+  // ② 予定より多くてもそのまま入る
+  {
+    const t = mk27('dc-3', 9703, 1000);
+    TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: TD.getTask(t).version, doneQty: 1010 });
+    ok(TD.getTask(t).done_qty === 1010, '⭐予定より多い 1010 個も入る (実際に起きる)');
+  }
+  // ③ 作れなかった数とひとこと
+  {
+    const t = mk27('dc-4', 9704, 200);
+    TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: TD.getTask(t).version,
+      doneQty: 198, lossQty: 2, varianceNote: '袋を2つ破いてしまいました' });
+    const b = B.listBatchesOfTask(db, t)[0];
+    ok(b.good_qty === 198 && b.loss_qty === 2 && b.variance_note === '袋を2つ破いてしまいました',
+      'できた数・作れなかった数・ひとこと が まとまりに残る');
+    ok(b.good_qty_source === 'counted', '人が入れた数には counted の印が付く (移行で持ってきた値と区別する)');
+  }
+  // ④ 0 と「数えていない」は別
+  {
+    const t = mk27('dc-5', 9705, 50);
+    TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: TD.getTask(t).version, doneQty: 0, lossQty: 50 });
+    const b = B.listBatchesOfTask(db, t)[0];
+    ok(b.good_qty === 0 && b.loss_qty === 50, '⭐0 個できた + 50 個作れなかった、を記録できる (NULL と区別)');
+    ok(TD.getTask(t).done_qty === 0, 'カードにも 0 が載る');
+  }
+  // ⑤ 作れなかった数の値の検査
+  {
+    const t = mk27('dc-6', 9706, 50);
+    const bad = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: TD.getTask(t).version, lossQty: -1 });
+    ok(!bad.ok && bad.error === 'bad_loss_qty', '作れなかった数にマイナスは入らない');
+    ok(TD.getTask(t).status === 'in_progress', '断ったので状態も変わらない');
+    const bad2 = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: TD.getTask(t).version, lossQty: true });
+    ok(!bad2.ok && bad2.error === 'bad_loss_qty', '真偽値も数として受けない');
+  }
+  // ⑥ カードの done_qty は まとまりの合計から出す (手で書き換える正本にしない)
+  {
+    const t = mk27('dc-7', 9707, 300);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 120 }); }).immediate();
+    ok(TD.getTask(t).done_qty === 120, 'まとまりに書くと、カードの合計も直る');
+    const now7 = new Date().toISOString();
+    db.prepare(`INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, good_qty, good_qty_source, created_at, updated_at)
+      VALUES (?, 2, 100, 'not_started', 80, 'counted', ?, ?)`).run(t, now7, now7);
+    db.transaction(() => { B.recomputeTaskDoneQty(db, t); }).immediate();
+    ok(TD.getTask(t).done_qty === 200, '⭐まとまりが 2 つになったら合計 (120 + 80) がカードに載る');
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'cancelled' WHERE task_id = ? AND seq = 2").run(t);
+    db.transaction(() => { B.recomputeTaskDoneQty(db, t); }).immediate();
+    ok(TD.getTask(t).done_qty === 120, '取消したまとまりは合計に入れない');
+  }
+  // ⑦ 取消・対象外の終了では数を残す (棚入完了とは違う)
+  {
+    const t = mk27('dc-8', 9708, 60);
+    TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: TD.getTask(t).version, doneQty: 55 });
+    TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'stocked', expectVersion: TD.getTask(t).version,
+      isStaff: true, workerId: staff27.id, workerName: staff27.display_name });
+    ok(TD.getTask(t).done_qty === 55, '棚入完了にしても 55 のまま (つくる数 60 で上書きしない)');
+  }
+
+  // ── 画面 ──
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(!/defaultAll/.test(html) && /const cur = c\.done_qty == null \? '' : String\(c\.done_qty\);/.test(html),
+    '⭐できあがりの数を「つくる数」で初期表示しない (そのまま押されて 予定 = 実績 になってしまう)');
+  ok(/'予定どおり \(' \+ c\.qty \+ ' 個\)'/.test(html),
+    'タップで入れる選択肢は「全部」ではなく「予定どおり」(数えた結果として選ぶもの)');
+  ok(/function dqDiff\(el\)/.test(html) && /'予定より ' \+ d \+ ' 個 多いです'/.test(html)
+    && /'予定より ' \+ \(-d\) \+ ' 個 少ないです'/.test(html),
+    '入れた数と予定の差をその場で出す (止めはしない — 差があるのは普通のこと)');
+  ok(/data-loss="0"/.test(html) && />ありません</.test(html) && /data-loss="ask"/.test(html) && />あります</.test(html),
+    '⭐作れなかった数は「ありません / あります」を選んでもらう (空欄を 0 と読まない)');
+  ok(/const loss = !lossPicked \? undefined : \(lossRaw === '' \? undefined : Number\(lossRaw\)\);/.test(html),
+    '何も選んでいなければ「数えていない」として送らない');
+  ok(/if \(v\.qty != null && c\.qty != null && Math\.abs\(v\.qty - c\.qty\) > Math\.max\(5, c\.qty \* 0\.1\) && !doneConfirmed\)/.test(html),
+    '予定と大きく違うときは、止めずにもう一度だけ確かめる');
+  ok(/\.\.\.\(v\.loss !== undefined \? \{ loss_qty: v\.loss \} : \{\}\)/.test(html)
+    && /\.\.\.\(v\.note \? \{ variance_note: v\.note \} : \{\}\)/.test(html),
+    '作れなかった数とひとことは、状態変更と同じ 1 回の通信で送る');
+  ok(/数が予定と違っていても、そのまま入れてください/.test(html), '「差があってよい」と画面に書く');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
