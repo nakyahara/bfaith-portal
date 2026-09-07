@@ -99,6 +99,14 @@ console.log('\n── 読み取りモデル (1 出品 1 行) ──');
   ok(hist.length === 2 && hist[0].date_jst === '2026-09-07', '価格の推移 (新しい順)');
   const viaView = db.prepare(`SELECT COUNT(*) c FROM v_ap_listing_360`).get().c;
   ok(viaView === 4, 'view からも同じ 4 行が読める (AI はこれを読む)');
+  // Codex R4 Medium: 小数の原価でも view (AI が読む) と loadListings (画面・判定) が同じ値になる (SQL 側で ROUND 2 桁)
+  prod.run('ne-frac', 'F商品', '単品', 1000.01, 'COMPLETE', 200, 0.10, T);   // 1000.01 × 1.10 = 1100.011 → 1100.01
+  res.run('pr_frac', 'ne-frac', 1, 'master', 'F商品', T);
+  fees.run('pr_frac', 'B000FRAC', 'FBA', 0.10, 400, 0, 0, T);
+  const fromJs = loadListing(db, 'pr_frac').cost_incl_tax;
+  const fromView = db.prepare(`SELECT cost_incl_tax FROM v_ap_listing_360 WHERE seller_sku = 'pr_frac'`).get().cost_incl_tax;
+  ok(fromJs === 1100.01 && fromView === 1100.01, `小数の原価: 画面/判定 ${fromJs} = view ${fromView} = 1100.01`);
+  db.prepare(`DELETE FROM mirror_amazon_sku_fees WHERE seller_sku = 'pr_frac'`).run();
 }
 
 console.log('\n── 方針の保存と履歴 ──');

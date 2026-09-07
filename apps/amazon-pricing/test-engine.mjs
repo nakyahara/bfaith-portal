@@ -129,10 +129,22 @@ console.log('\n── ★事故ルール 2: 下限が分からない行は値下
   eq(r.proposedPrice, null, '  提案価格は出さない');
   const up = evaluateListing({ ...base, cost_incl_tax: null, buybox_price: 2300 });
   eq(up.action, 'raise', '原価不明でも値上げは出す');
+  // Codex R4 High: 人のストッパーがあっても、計算した下限が無ければ値下げしない (旧ツールは人の入力だけで下げた)
   const withStopper = evaluateListing({ ...base, cost_incl_tax: null, buybox_price: 1500, floor_price: 1700 });
-  eq(withStopper.proposedPrice, 1700, '原価不明でも人のストッパーがあればそこまでは下げる');
+  eq(withStopper.action, 'hold', '★原価不明 + 人のストッパー 1700 + カートが安い → それでも保留');
+  eq(withStopper.reasonCode, 'NO_FLOOR', '  理由 NO_FLOOR');
+  for (const [label, patch] of [['原価不明', { cost_incl_tax: null }], ['FBA 手数料不明', { fba_fee: null }], ['FBA 手数料 0 (取得元の穴埋め)', { fba_fee: 0 }],
+    ['送料不明 (自己発送)', { channel: 'FBM', ship_cost: null }], ['分母不正', { referral_fee_rate: 0.45, min_margin_rate: 0.6 }], ['発送区分不明', { channel: null }]]) {
+    const r = evaluateListing({ ...base, ...patch, buybox_price: 1500, floor_price: 1700 });
+    ok(r.action !== 'lower', `  ${label} + 人のストッパー → 値下げしない (${r.action} / ${r.reasonCode})`);
+  }
   const fbaFeeUnknown = evaluateListing({ ...base, fba_fee: null, buybox_price: 1500 });
   eq(fbaFeeUnknown.action, 'hold', 'FBA 手数料不明でも同じく保留');
+  // Codex R4 High 2: 取得元が FBAFees 欠落を 0 にする → FBA 手数料 0 は異常 (下限 1250 → 1500 への値下げを出さない)
+  const fbaZero = evaluateListing({ ...base, fba_fee: 0, buybox_price: 1500 });
+  eq(fbaZero.action, 'hold', 'FBA 手数料 0 + カートが安い → 保留');
+  ok(computeCosts({ ...base, fba_fee: 0 }).flags.includes('INPUT_INVALID'), '  FBA 手数料 0 は INPUT_INVALID');
+  eq(computeCosts({ ...base, channel: 'FBM', ship_cost: 0 }).floorPrice, 1250, '自己発送の送料 0 (同梱・無料) は正常');
 }
 
 console.log('\n── ★事故ルール 3: カート価格が半分未満は別物を疑う ──');
@@ -179,7 +191,7 @@ console.log('\n── Codex R1 High 1: 上限が下限より低い方針は矛�
           for (const my of [1500, 2000]) {
             total += 1;
             const x = evaluateListing({ ...base, my_price: my, buybox_price: bb, ceiling_price: ceiling, floor_price: floor, buybox_is_mine: owner });
-            if (x.action === 'lower' && (x.effectiveFloor == null || x.proposedPrice < x.effectiveFloor)) cases.push({ my, bb, ceiling, floor, owner, x: x.proposedPrice, f: x.effectiveFloor });
+            if (x.action === 'lower' && (x.computedFloor == null || x.effectiveFloor == null || x.proposedPrice < x.effectiveFloor)) cases.push({ my, bb, ceiling, floor, owner, x: x.proposedPrice, f: x.effectiveFloor });
             if (x.action === 'lower' && owner === null) unknownLower.push({ my, bb, ceiling, floor, x: x.proposedPrice, code: x.reasonCode });
           }
         }

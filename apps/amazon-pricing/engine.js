@@ -9,7 +9,7 @@
  *      **高い方**を使う。人の入力が空でも原価割れの提案は出ない
  *      (旧ツールは loss_stopper の既定が 0 = 「下限なし」で、競合の最安値まで無条件に下げられた)
  *   2. 下限を計算できない行 (原価不明・FBA手数料不明・自己発送の送料不明・入力が異常) では**値下げを提案しない** (hold)。
- *      値上げは上限まで許す
+ *      人の赤字ストッパーがあっても免除しない (原価を知らずに下げてよい値は決められない)。値上げは上限まで許す
  *   3. カート価格が自分の価格の半分未満なら「別コンディション / セット崩れ / 取得ミス」を疑って止める
  *   4. 変更幅は −30% 〜 +100%、+10万円まで (価格一括改定ツールと同じ数字)
  *   5. 判定には必ず reason_code と、人が読める reason_text と、参照した入力 (inputs) を付ける。
@@ -174,7 +174,8 @@ export function computeCosts(p) {
   // 固定費。不明・異常なものがあれば「下限は計算できない」に倒す (0 で埋めると下限が低く出て、値下げを通してしまう)
   let fixedFees = 0;
   let fixedKnown = channelKnown;
-  const main = isFba ? amountState(p.fba_fee, MAX_FEE) : amountState(p.ship_cost, MAX_FEE);
+  // FBA 配送代行手数料が 0 になることは無い (取得元が「不明」を 0 で埋める — Codex R4)。0 は異常として扱う
+  const main = isFba ? amountState(p.fba_fee, MAX_FEE, { allowZero: false }) : amountState(p.ship_cost, MAX_FEE);
   if (!channelKnown) {
     // 発送区分が分からなければ、どの固定費を足すべきかも分からない
   } else if (main.state !== 'ok') {
@@ -314,8 +315,9 @@ export function evaluateListing(input) {
   if (effectiveFloor != null && target < effectiveFloor) {
     target = effectiveFloor; code = 'FLOOR_CLAMP'; flags.push('FLOOR_CLAMP');
   }
-  if (effectiveFloor == null && target < current) {
-    // 下限が分からない行の値下げは出さない (事故ルール 2)
+  if (costs.floorPrice == null && target < current) {
+    // ★下限を**計算できない**行の値下げは出さない (事故ルール 2)。人のストッパーがあっても免除しない —
+    //   原価・手数料を知らずに「ここまでなら下げてよい」とは言えない (Codex R4 High。旧ツールは人の入力だけで下げた)
     return hold('NO_FLOOR', ` (カートは ${bb == null ? '無し' : bb.toLocaleString() + ' 円'})`);
   }
   if (ceiling != null && target > ceiling) {
@@ -332,9 +334,9 @@ export function evaluateListing(input) {
   }
 
   const action = target > current ? 'raise' : 'lower';
-  // ★最終の不変条件 (どの経路でも): 値下げの提案は必ず実効下限以上。ここに来たらルールの不具合なので出さずに止める
-  if (action === 'lower' && (effectiveFloor == null || target < effectiveFloor)) {
-    return { ...hold('FLOOR_INVARIANT', ` (${target} / 下限 ${effectiveFloor})`), targetPrice: target, changeRatio };
+  // ★最終の不変条件 (どの経路でも): 値下げの提案は「計算した下限がある」かつ「実効下限以上」。ここに来たらルールの不具合なので出さずに止める
+  if (action === 'lower' && (costs.floorPrice == null || effectiveFloor == null || target < effectiveFloor)) {
+    return { ...hold('FLOOR_INVARIANT', ` (${target} / 下限 ${effectiveFloor} / 計算 ${costs.floorPrice})`), targetPrice: target, changeRatio };
   }
   // ★最終の不変条件 (Codex R2 High): 持ち主不明のカートでは値下げしない。上限クランプで値上げが値下げに反転する経路も含む
   if (action === 'lower' && owner === 'unknown') {

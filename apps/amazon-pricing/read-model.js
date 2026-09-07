@@ -32,7 +32,7 @@ cost AS (
   SELECT LOWER(TRIM(r.seller_sku)) AS sku_norm,
          CASE WHEN SUM(CASE WHEN p.原価 IS NULL OR p.原価状態 NOT IN ('COMPLETE','OVERRIDDEN') THEN 1 ELSE 0 END) > 0
               THEN NULL
-              ELSE SUM(r.quantity * p.原価 * (1 + COALESCE(p.消費税率, 0.10))) END AS cost_incl_tax,
+              ELSE ROUND(SUM(r.quantity * p.原価 * (1 + COALESCE(p.消費税率, 0.10))), 2) END AS cost_incl_tax,
          SUM(CASE WHEN p.原価 IS NULL OR p.原価状態 NOT IN ('COMPLETE','OVERRIDDEN') THEN 1 ELSE 0 END) AS cost_missing_parts,
          COUNT(*) AS parts,
          MAX(p.送料) AS ship_cost,
@@ -82,6 +82,7 @@ export function mirrorTablesAvailable(db) {
  */
 const shapeRow = (r) => ({
   ...r,
+  // SQL 側で ROUND(…, 2) 済み (view と同じ値)。JS 側は浮動小数の表現ゆれを整えるだけ
   cost_incl_tax: r.cost_incl_tax == null ? null : Math.round(r.cost_incl_tax * 100) / 100,
   mode: r.mode || 'off',
   offset_jpy: r.offset_jpy ?? 0,
