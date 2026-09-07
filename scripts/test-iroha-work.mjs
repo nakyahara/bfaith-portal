@@ -6688,5 +6688,120 @@ console.log('\n[32] 外部施設の専用 URL (見るだけ。§AB-11 の 6)');
     '⭐発行・失効は管理者だけ');
 }
 
+console.log('\n[33] 外部施設の受け入れ枠 (§AB-8)');
+{
+  const db = getDB();
+  const B = await import('../apps/iroha-work/batches.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const C = await import('../apps/iroha-work/consign.js');
+  const SV = await import('../apps/iroha-work/service.js');
+  const D = await import('../apps/iroha-work/db.js');
+  const v = (id) => TD.getTask(id).version;
+  // 入数 70・工程数 2 の商品を作る (時間と箱を数えられるように)
+  const mk = (page, dest, qty) => TD.upsertTaskFromImport({ notion_page_id: page, status: 'not_started',
+    facility_code: 'iroha', destination_id: dest, product_name: '枠の検査', qty,
+    master_snapshot: JSON.stringify({ units_per_container: 70, process_count: 2 }) }, { batchId: 'cap' }).id;
+
+  // ① 枠の決め方
+  {
+    ok(D.setFacilityCapacity('workcenter', { hours: 16, boxes: 8 }).ok, '枠を決められる');
+    const f = TD.listFacilities().find((x) => x.code === 'workcenter');
+    ok(f.capacity_hours === 16 && f.capacity_boxes === 8, '決めた値が入る');
+    ok(D.setFacilityCapacity('workcenter', { hours: null }).ok, '空にできる');
+    ok(TD.listFacilities().find((x) => x.code === 'workcenter').capacity_hours === null,
+      '⭐空にしたら「未設定」に戻る (0 にしない)');
+    D.setFacilityCapacity('workcenter', { hours: 16 });
+    ok(!D.setFacilityCapacity('iroha', { hours: 5 }).ok, '⭐いろは (物を持ち帰らない) には枠を持たせない');
+    ok(!D.setFacilityCapacity('rehas', { hours: 5 }).ok, 'パレットも同じ (中で作業するので預けない)');
+    ok(!D.setFacilityCapacity('workcenter', { hours: -1 }).ok, '0 以下は断る');
+    ok(!D.setFacilityCapacity('nosuch', { hours: 1 }).ok, '知らない拠点は断る');
+  }
+
+  // ② ⭐いま外にあるぶんを 時間・箱・件数・個数 で数える
+  {
+    // ほかのテストで作った預けも混ざるので、**前後の差**で見る
+    const b0 = SV.facilityLoads().get('workcenter') || { hours: 0, boxes: 0, count: 0, qty: 0 };
+    const t = mk('cap-1', 9280, 700);
+    const cg = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+      facilityCode: 'workcenter', qty: 700, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    const l = SV.facilityLoads().get('workcenter');
+    ok(l.qty - b0.qty === 700 && l.count - b0.count === 1, '件数と個数が出る');
+    ok(l.boxes - b0.boxes === 10, '⭐箱数は入数 70 で割って 10 箱');
+    ok(l.hours > b0.hours, '想定作業時間も出る (工程数から)');
+    ok(l.capacity_hours === 16, '目安も一緒に返す');
+    // 返ってきたぶんは減る
+    const c1 = C.getConsignment(cg.consignment.id);
+    C.recordReturn({ consignmentId: c1.id, returnedQty: 350, expectVersion: c1.version, idempotencyKey: 'cap-r1' });
+    const l2 = SV.facilityLoads().get('workcenter');
+    ok(l2.qty - b0.qty === 350 && l2.boxes - b0.boxes === 5, '⭐返ってきたぶんは残高から減る (350 個・5 箱)');
+  }
+
+  // ③ ⭐分からないものを 0 で数えない
+  {
+    const t = TD.upsertTaskFromImport({ notion_page_id: 'cap-2', status: 'not_started', facility_code: 'iroha',
+      destination_id: 9281, product_name: '入数も工程数も未登録', qty: 100 }, { batchId: 'cap' }).id;
+    const before = SV.facilityLoads().get('rashinban') || { hours: 0, boxes: 0, hours_unknown: 0, boxes_unknown: 0 };
+    const cg = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+      facilityCode: 'rashinban', qty: 100, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    const l = SV.facilityLoads().get('rashinban');
+    ok(l.hours === before.hours && l.boxes === before.boxes,
+      '⭐入数・工程数が分からないものを 0 として足さない');
+    ok(l.hours_unknown > before.hours_unknown && l.boxes_unknown > before.boxes_unknown,
+      '⭐そのかわり「分からない件数」を数える (黙って落とさない)');
+    ok(l.capacity_hours === null, '⭐枠を決めていない拠点は「未設定」(null。0 ではない)');
+  }
+
+  // ④ ⭐超えても止めない。箱数を守らせる拠点だけ断る
+  {
+    // いまの残高より少ない目安・多い目安を置いて、超過の出方を確かめる
+    const now = SV.facilityLoads().get('workcenter');
+    D.setFacilityCapacity('workcenter', { hours: 0.1, boxes: now.boxes + 5, boxesHard: false });
+    const l = SV.facilityLoads().get('workcenter');
+    ok(l.over_hours === true && l.over_boxes === false,
+      '⭐目安を超えたかが分かる (時間は超えている・箱はまだ余裕がある)');
+    D.setFacilityCapacity('workcenter', { boxes: Math.max(1, now.boxes - 1) });
+    ok(SV.facilityLoads().get('workcenter').over_boxes === true, '箱も、目安を下回れば超過と分かる');
+    const t = mk('cap-3', 9282, 700);
+    const r = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+      facilityCode: 'workcenter', qty: 700, expectVersion: v(t) });
+    ok(r.ok, '⭐目安を超えていても、預けること自体は止めない (要件 §AB-8)');
+    const c3 = C.getConsignment(r.consignment.id);
+    C.cancelConsignment({ consignmentId: c3.id, expectVersion: c3.version });
+
+    // 箱数を守らせる拠点では断る (置き場・車両の都合)。いまの残高 +2 箱までにする
+    const cur = SV.facilityLoads().get('workcenter');
+    const limit = cur.boxes + 2;
+    D.setFacilityCapacity('workcenter', { boxes: limit, boxesHard: true });
+    const load = SV.facilityLoads().get('workcenter');
+    const capacityOf = () => ({ ...load, name: 'ワークセンター', units_per_container: 70 });
+    const t2 = mk('cap-4', 9283, 700);
+    const over = C.startConsignment({ taskId: t2, batchId: B.listBatchesOfTask(db, t2)[0].id,
+      facilityCode: 'workcenter', qty: 700, expectVersion: v(t2), capacityOf });   // 10 箱ぶん = あふれる
+    ok(!over.ok && over.error === 'over_capacity', '⭐箱数を守らせる拠点では、あふれる預けを断る');
+    ok(over.message.includes(String(limit) + ' 箱まで'), 'いくつまでかを言う');
+    const small = C.startConsignment({ taskId: t2, batchId: B.listBatchesOfTask(db, t2)[0].id,
+      facilityCode: 'workcenter', qty: 70, expectVersion: v(t2), capacityOf });    // 1 箱ぶん = 収まる
+    ok(small.ok, '収まるぶんは通る');
+    D.setFacilityCapacity('workcenter', { boxes: null, boxesHard: false, hours: 16 });
+  }
+
+  // ── 画面 ──
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(/function capacityHtml\(code\)/.test(html) && /'<div id="cgCap">' \+ capacityHtml\(facs\[0\]\.code\)/.test(html),
+    '⭐預けるダイアログに「いま何時間ぶん・何箱あるか」を出す');
+  ok(/if \(cap\) cap\.innerHTML = capacityHtml\(f\.dataset\.cgfac\);/.test(html),
+    '拠点を選び直したら、その拠点の残高に入れ替える');
+  ok(/\(目安 未設定\)/.test(html), '⭐枠を決めていなければ「未設定」と出す (0 と書かない)');
+  ok(/目安を超えています。渡してよいか職員で確かめてください（止めはしません）/.test(html),
+    '⭐超えても止めない (注意するだけ)');
+  ok(/工程数が登録されていない/.test(html) && /入数が登録されていない/.test(html),
+    '数に入れられなかった件数も出す (黙って落とさない)');
+  const adm = fs.readFileSync(new URL('../apps/iroha-work/views/admin.ejs', import.meta.url), 'utf8');
+  ok(/sec-capacity/.test(adm) && /async function saveCapacity\(code\)/.test(adm), '管理画面で枠を決められる');
+  ok(/空にすれば「未設定」に戻ります/.test(adm), '空にすると未設定に戻ることを書く');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exit(fail > 0 ? 1 : 0);

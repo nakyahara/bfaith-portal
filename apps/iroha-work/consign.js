@@ -178,7 +178,7 @@ export function whyCannotSplit(db, batch) {
  * 別々の新規行が同時に入って合計が予定数を超える (要件 §AB-7)。
  */
 export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate = null, expectVersion,
-  actor = null, guard = null }) {
+  actor = null, guard = null, capacityOf = null }) {
   const db = getDB();
   const q = normQty(qty, '預ける数');
   if (q.error) return { ok: false, error: q.error, message: q.message };
@@ -210,6 +210,20 @@ export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate =
     const max = splittableMax(db, b);
     if (max != null && q.value > max) {
       return { ok: false, error: 'too_many', message: `渡せるのは ${max} 個までです (残っているぶん)`, max };
+    }
+    // ⭐受け入れ枠 (要件 §AB-8)。**止めるのは箱数だけ**、しかも「置き場の都合で本当に上限がある」と
+    //   決めた拠点だけ。想定時間は概算 (外部は進捗を入れないので残りが分からない) なので、
+    //   超えても止めず、画面で注意するだけにする
+    if (capacityOf) {
+      const cap = capacityOf(facilityCode);
+      if (cap && cap.boxes_hard && cap.capacity_boxes != null) {
+        const per = cap.units_per_container;
+        const add = per ? Math.ceil(q.value / per) : null;
+        if (add != null && cap.boxes + add > cap.capacity_boxes) {
+          return { ok: false, error: 'over_capacity',
+            message: `${cap.name} の置ける箱は ${cap.capacity_boxes} 箱までです (いま ${cap.boxes} 箱・今回 ${add} 箱)` };
+        }
+      }
     }
     const now = utcNow();
     // ⭐予定数を丸ごと預けるときだけ、まとまりを割らない (行を増やす意味が無い)。

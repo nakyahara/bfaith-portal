@@ -499,6 +499,71 @@ export function expandBatchRows(cards, { forPlan = false } = {}) {
 }
 
 /**
+ * ⭐施設ごとの「いま外にあるぶん」と受け入れ枠 (要件 §AB-8)。
+ *
+ * 中原さん 2026-09-07:
+ * > 何個預けるかを決める。それは外部施設に何個まで預けてオッケーみたいなことを見てから決める。
+ *
+ * 主に見るのは**想定作業時間**。個数は商品ごとに入数も工程数も違うので、施設どうしで比べにくい。
+ * 副で箱数 (置き場・車両の都合)。件数・個数は参考。
+ *
+ * ⭐**ハード上限にしない** (§AB-8)。想定時間はそもそも概算で、外部は進捗を入れないので
+ *   残りの作業時間は正確には分からない。残高と目安を見せて、超えたら注意するだけ。
+ *   置き場の都合で本当に上限がある施設だけ、**箱数**を守らせる (capacity_boxes_hard)。
+ * ⭐枠が未登録なら **0 ではなく「未設定」** (null) を返す。
+ *
+ * @returns Map<facility_code, { hours, boxes, count, qty, capacity_hours, capacity_boxes, boxes_hard, over_hours, over_boxes }>
+ */
+export function facilityLoads(db = getDB()) {
+  const ctx = enrichContext();
+  // いま外にあるぶん = 渡す予定・用意ずみ・渡した。渡したぶんからは返ってきた数と返らなかった数を引く
+  const rows = db.prepare(`SELECT c.facility_code, c.state, c.planned_qty, c.handed_qty, c.missing_qty,
+      COALESCE((SELECT SUM(r.returned_qty) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id), 0) AS returned,
+      t.product_code, t.master_snapshot
+    FROM f_iroha_consignments c
+    JOIN f_iroha_task_batches b ON b.id = c.batch_id
+    JOIN f_iroha_tasks t ON t.id = b.task_id
+    WHERE c.state IN ('planned','prepared','handed')`).all();
+  const out = new Map();
+  const get = (code) => {
+    if (!out.has(code)) out.set(code, { hours: 0, boxes: 0, count: 0, qty: 0, hours_unknown: 0, boxes_unknown: 0 });
+    return out.get(code);
+  };
+  for (const r of rows) {
+    const qty = r.state === 'handed'
+      ? Math.max(0, (r.handed_qty ?? 0) - (r.returned || 0) - (r.missing_qty ?? 0))
+      : (r.planned_qty ?? 0);
+    if (qty <= 0) continue;
+    let snap = null;
+    try { snap = r.master_snapshot ? JSON.parse(r.master_snapshot) : null; } catch { /* 壊れていれば「分からない」に数える */ }
+    const k = keyOf(r.product_code);
+    const m = masterOfTask(k ? ctx.workMaster.get(k) : null, snap);
+    const e = get(r.facility_code);
+    e.count += 1;
+    e.qty += qty;
+    // ⭐分からないものを 0 で数えない (要件: 欠損値を 0 で代用しない)。別に「分からない件数」を持つ
+    const h = planHours(qty, m.process_count);
+    if (h == null) e.hours_unknown += 1; else e.hours += h;
+    const bx = neededBoxesCalc(qty, m.units_per_container);
+    if (!bx) e.boxes_unknown += 1; else e.boxes += bx.boxes;
+  }
+  // 枠と突き合わせる
+  for (const f of listFacilities(true)) {
+    if (!f.offsite) continue;
+    const e = get(f.code);
+    e.hours = Math.round(e.hours * 10) / 10;
+    e.capacity_hours = f.capacity_hours ?? null;      // ⭐未登録は null (「未設定」と出す。0 にしない)
+    e.capacity_boxes = f.capacity_boxes ?? null;
+    e.boxes_hard = !!f.capacity_boxes_hard;
+    e.over_hours = e.capacity_hours != null && e.hours > e.capacity_hours;
+    e.over_boxes = e.capacity_boxes != null && e.boxes > e.capacity_boxes;
+  }
+  // 物を持ち帰らない拠点は枠を持たない (預けないので)
+  for (const code of [...out.keys()]) if (!('capacity_hours' in out.get(code))) out.delete(code);
+  return out;
+}
+
+/**
  * ⭐外部施設に見せる内容 (要件 §AB-11 の 6)。**読むだけ・その施設に預けたぶんだけ**。
  *
  * 中原さん 2026-09-07:
@@ -786,6 +851,8 @@ export function buildTaskList({ facility = null, readOnly = false } = {}) {
     blockReasons: BLOCK_REASONS.map(v => ({ value: v, label: BLOCK_LABEL[v], button: BLOCK_BUTTON[v] })),
     closeReasons: CLOSE_REASONS.map(v => ({ value: v, label: CLOSE_LABEL[v] })),
     facilities: listFacilities(),
+    // ⭐施設ごとの「いま外にあるぶん」と受け入れ枠 (要件 §AB-8)。預けるときに、何個まで大丈夫かを見て決める
+    facility_loads: Object.fromEntries(facilityLoads()),
     today,
   };
 }

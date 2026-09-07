@@ -356,6 +356,14 @@
   .reasons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
   .reasons .btn.on{outline:2px solid var(--danger);outline-offset:1px;background:var(--danger-soft);border-color:var(--danger);color:var(--danger)}
   .dcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:12px}
+  /* 施設の受け入れ枠 (預けるダイアログ) */
+  .cap{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg);font-size:.95rem}
+  .cap b{font-variant-numeric:tabular-nums}
+  .cap .bar{height:8px;border-radius:999px;background:var(--line);overflow:hidden;margin:6px 0 4px}
+  .cap .bar>i{display:block;height:100%;background:var(--accent)}
+  .cap.over .bar>i{background:var(--danger,#c0392b)}
+  .cap .warn{color:var(--danger,#c0392b)}
+  .cap .unset{color:var(--muted)}
   /* 作業のまとまり (2 つ以上のときだけ出る) */
   .brow{border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:10px;background:var(--bg)}
   .brow .bh{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
@@ -5143,6 +5151,33 @@ function cgReadInputs() {
 function externalFacilities() {
   return ((boardState() || {}).facilities || []).filter((f) => f.offsite);
 }
+/**
+ * ⭐施設の受け入れ枠 (要件 §AB-8)。**止めるための表示ではない** — 何個まで預けてよさそうかを
+ * 決める材料。主に見るのは想定作業時間 (個数は商品ごとに入数も工程数も違うので比べにくい)。
+ * ⭐枠が決まっていなければ「目安 未設定」と出す (0 と書かない)
+ */
+function capacityHtml(code) {
+  const l = ((boardState() || {}).facility_loads || {})[code];
+  if (!l) return '';
+  const num = (v) => esc(String(Math.round(v * 10) / 10));
+  const hoursTxt = l.capacity_hours != null
+    ? '<b>' + num(l.hours) + '</b> / 目安 <b>' + num(l.capacity_hours) + '</b> 時間'
+    : '<b>' + num(l.hours) + '</b> 時間 <span class="unset">(目安 未設定)</span>';
+  const pct = l.capacity_hours ? Math.min(100, Math.round((l.hours / l.capacity_hours) * 100)) : 0;
+  const boxesTxt = l.capacity_boxes != null
+    ? '<b>' + esc(String(l.boxes)) + '</b> / ' + esc(String(l.capacity_boxes)) + ' 箱'
+      + (l.boxes_hard ? '（ここまで）' : '')
+    : '<b>' + esc(String(l.boxes)) + '</b> 箱 <span class="unset">(目安 未設定)</span>';
+  const over = l.over_hours || l.over_boxes;
+  return '<div class="cap' + (over ? ' over' : '') + '">' +
+    'いま ' + facilityName(code) + ' にあるぶん: ' + hoursTxt + ' ・ ' + boxesTxt +
+    ' ・ ' + esc(String(l.count)) + ' 件 ・ ' + esc(String(l.qty)) + ' 個' +
+    (l.capacity_hours != null ? '<div class="bar"><i style="width:' + pct + '%"></i></div>' : '') +
+    (l.hours_unknown > 0 ? '<div class="unset">※ 工程数が登録されていない ' + esc(String(l.hours_unknown)) + ' 件は時間に入れていません</div>' : '') +
+    (l.boxes_unknown > 0 ? '<div class="unset">※ 入数が登録されていない ' + esc(String(l.boxes_unknown)) + ' 件は箱数に入れていません</div>' : '') +
+    (over ? '<div class="warn">⚠ 目安を超えています。渡してよいか職員で確かめてください（止めはしません）</div>' : '') +
+    '</div>';
+}
 /** 入数で丸める。70 個入りなら 500 ではなく 490 (要件 §AB-9) */
 function roundToPack(n, per) {
   if (!per || per <= 0 || n <= per) return n;
@@ -5185,6 +5220,8 @@ function openConsign() {
     '<label' + (able.length > 1 ? ' style="margin-top:12px"' : '') + '>どこへ渡しますか</label>' +
     '<div class="chips" id="cgFacs">' + facs.map((f, i) =>
       '<button type="button" class="chip' + (i === 0 ? ' on' : '') + '" data-cgfac="' + esc(f.code) + '">' + esc(f.name) + '</button>').join('') + '</div>' +
+    // ⭐その施設に「いま何時間ぶん・何箱あるか」。何個まで預けてよさそうかを、これを見て決める (要件 §AB-8)
+    '<div id="cgCap">' + capacityHtml(facs[0].code) + '</div>' +
     '<label style="margin-top:12px">何個わたしますか</label>' +
     '<div class="row"><input class="cgQty" type="number" inputmode="numeric" min="1" step="1" placeholder="—">' +
       '<span class="of">／ 渡せるのは ' + (room == null ? '—' : room) + ' 個まで</span></div>' +
@@ -5216,7 +5253,12 @@ $('#cgOv').addEventListener('click', (e) => { if (e.target === $('#cgOv')) close
 // 選択肢 (拠点・数・期限)
 document.addEventListener('click', (e) => {
   const f = e.target.closest('[data-cgfac]');
-  if (f) { for (const x of $('#cgFacs').querySelectorAll('.chip')) x.classList.toggle('on', x === f); return; }
+  if (f) {
+    for (const x of $('#cgFacs').querySelectorAll('.chip')) x.classList.toggle('on', x === f);
+    const cap = $('#cgCap');                      // 選んだ拠点の残高に入れ替える
+    if (cap) cap.innerHTML = capacityHtml(f.dataset.cgfac);
+    return;
+  }
   const d = e.target.closest('[data-cgdue]');
   if (d) { for (const x of $('#cgDue').querySelectorAll('.chip')) x.classList.toggle('on', x === d); return; }
   const q = e.target.closest('[data-cgq]');

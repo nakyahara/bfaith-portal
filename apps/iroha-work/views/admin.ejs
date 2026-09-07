@@ -67,7 +67,7 @@
       <span class="lbl">よく使う</span>
       <a href="#sec-workers">👤 名簿</a><a href="#sec-options">🧰 選択肢</a><a href="#sec-find">🔎 記録をさがす</a>
       <span class="lbl">設定・確認</span>
-      <a href="#sec-devices">📱 iPad</a><a href="#sec-flinks">🚚 外部施設の URL</a><a href="#sec-print">🏷 箱ラベル</a><a href="#sec-notion">🗂 Notion</a><a href="#sec-migrate">🚚 移行</a>
+      <a href="#sec-devices">📱 iPad</a><a href="#sec-capacity">🚚 受け入れ枠</a><a href="#sec-flinks">🚚 外部施設の URL</a><a href="#sec-print">🏷 箱ラベル</a><a href="#sec-notion">🗂 Notion</a><a href="#sec-migrate">🚚 移行</a>
       <a href="#sec-sessions">⏱ セッション</a><a href="#sec-media">📷 写真</a><a href="#sec-log">📋 操作履歴</a>
     </nav>
 
@@ -298,6 +298,32 @@
           </tr>
         <% } %>
         <% if (devices.length === 0) { %><tr><td colspan="4">登録された端末はありません</td></tr><% } %>
+      </table>
+    </div>
+
+    <div class="iw-box">
+      <h2 id="sec-capacity">🚚 外部施設の受け入れ枠</h2>
+      <p class="hint">
+        「あと何個くらい預けてよいか」を職員が決めるための<b>目安</b>です。主に見るのは<b>想定作業時間</b>
+        (個数は商品ごとに入数も工程数も違うので、施設どうしで比べにくいため)。
+        <b>空にすれば「未設定」に戻ります</b> (0 とは違います)。
+        ⚠<b>目安を超えても止めません</b> — 想定時間は概算で、外部は進捗を入れないので残りは正確には分からないためです。
+        置き場や車両の都合で<b>本当に上限がある施設だけ</b>「箱数を守らせる」に印を付けてください (そのときだけ断ります)。
+      </p>
+      <table class="iw-list">
+        <tr><th>拠点</th><th>目安の時間</th><th>箱数の目安</th><th>箱数を守らせる</th><th></th></tr>
+        <% for (const f of externalFacilities.filter(x => x.offsite)) { %>
+          <tr>
+            <td><%= f.name %></td>
+            <td><input type="number" step="0.5" min="0" style="width:90px" id="caph-<%= f.code %>"
+                 value="<%= f.capacity_hours == null ? '' : f.capacity_hours %>" placeholder="未設定"> 時間</td>
+            <td><input type="number" step="1" min="0" style="width:90px" id="capb-<%= f.code %>"
+                 value="<%= f.capacity_boxes == null ? '' : f.capacity_boxes %>" placeholder="未設定"> 箱</td>
+            <td><input type="checkbox" id="caphard-<%= f.code %>" <%= f.capacity_boxes_hard ? 'checked' : '' %>></td>
+            <td><button class="btn-sm" onclick="saveCapacity('<%= f.code %>')">保存</button>
+                <span class="msg" id="capmsg-<%= f.code %>"></span></td>
+          </tr>
+        <% } %>
       </table>
     </div>
 
@@ -729,6 +755,15 @@
       document.getElementById('ecOut').style.display = 'block';
       document.getElementById('ecCode').textContent = json.code;
       document.getElementById('ecNote').textContent = '「' + json.label + '」用 ・ ' + json.ttlMinutes + '分間有効 ・ 1回だけ使えます';
+    }
+    async function saveCapacity(code) {
+      const h = document.getElementById('caph-' + code).value.trim();
+      const b = document.getElementById('capb-' + code).value.trim();
+      const hard = document.getElementById('caphard-' + code).checked;
+      const { json } = await post('/admin/facility-capacity', {
+        code, capacity_hours: h === '' ? null : h, capacity_boxes: b === '' ? null : b, capacity_boxes_hard: hard });
+      if (json.ok) setMsg('capmsg-' + code, 'ok', '保存しました');
+      else setMsg('capmsg-' + code, 'err', json.message || '保存できませんでした');
     }
     async function issueFacilityLink() {
       const facility_code = document.getElementById('flFac').value;
