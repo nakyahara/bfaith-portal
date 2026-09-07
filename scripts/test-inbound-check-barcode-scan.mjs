@@ -265,10 +265,32 @@ console.log('\n[7] 採否の判断 (public/js/barcode-scan-decide.js)');
   ok(run([codes('4901234567894'), codes(), codes('4901234567894')]).join() === 'continue,continue,continue',
     '読めないフレームを挟んでも連続が切れる');
 
+  // 🚨 映像が1コマも来ないまま黒い画面で回り続けない (2026-09-07 実機)
+  const idles = Array.from({ length: D.MAX_IDLE_STREAK }, () => ({ kind: 'idle' }));
+  const ia = run(idles);
+  ok(ia[ia.length - 1] === 'abort' && ia.slice(0, -1).every((x) => x === 'continue'),
+    `映像が ${D.MAX_IDLE_STREAK} コマ (約8秒) 来なければ打ち切る`);
+  {
+    let st = D.initialState();
+    let last = null;
+    for (const e of idles) { last = D.step(st, e); st = last.state; }
+    ok(last.reason === 'no_video', '打ち切りの理由が no_video (映像が出ない案内を出せる)');
+  }
+  ok(run([...idles.slice(0, D.MAX_IDLE_STREAK - 1), codes('4901234567894'), ...idles.slice(0, D.MAX_IDLE_STREAK - 1)])
+    .every((x) => x === 'continue'), '1コマでも映像が来たら数え直し (起動直後の待ちで止めない)');
+
   const errs = Array.from({ length: D.MAX_FAIL_STREAK }, () => ({ kind: 'error' }));
   const a = run(errs);
   ok(a[a.length - 1] === 'abort' && a.slice(0, -1).every((x) => x === 'continue'),
     `例外が ${D.MAX_FAIL_STREAK} 回続いたら打ち切る (それまでは続ける)`);
+  {
+    let st = D.initialState();
+    let last = null;
+    for (const e of errs) { last = D.step(st, e); st = last.state; }
+    ok(last.reason === 'decode', '打ち切りの理由が decode (映像が出ない case と言い分けられる)');
+  }
+  ok(D.MAX_FAIL_STREAK < D.MAX_IDLE_STREAK,
+    '解析の失敗のほうが先に鳴る (映像は出ているのに読めない、を先に知らせる)');
   ok(run([...errs.slice(0, D.MAX_FAIL_STREAK - 1), codes('4901234567894'), ...errs.slice(0, D.MAX_FAIL_STREAK - 1)])
     .every((x) => x === 'continue'), '途中で1回でも解析できたら失敗の数え直し (たまの失敗で止めない)');
 
@@ -287,7 +309,7 @@ console.log('\n[8] 画面が安全弁を通している (退行防止)');
 {
   const html = fs.readFileSync(path.join(ROOT, 'apps/inbound-check/views/products.html'), 'utf8');
   ok(/fireImmediately:\s*true/.test(html),
-    'prepareZXingModule を fireImmediately で待つ (wasm の取得・コンパイルまで済ませてからカメラを開く)');
+    'prepareZXingModule を fireImmediately で待つ (取得・コンパイルの失敗をフレーム解析まで持ち越さない)');
   ok(/\/js\/barcode-scan-decide\.js/.test(html) && /BarcodeScanDecide\.step\(/.test(html),
     '採否の判断を画面に埋め直していない (切り出したものを使っている)');
   ok(/const GUIDE = \{/.test(html) && /GUIDE\.x \* vw/.test(html) && /GUIDE\.x \* 100/.test(html),
@@ -296,6 +318,19 @@ console.log('\n[8] 画面が安全弁を通している (退行防止)');
     '映像全体ではなく枠の中だけを解析している (棚の別ラベルを読まない)');
   ok(/object-fit:\s*contain/.test(html) && /style\.aspectRatio/.test(html),
     '映像を切り取らずに出している (枠の % と映像の % がずれない)');
+
+  // 🚨 2026-09-07 実機: カメラは開いたのに映像が黒いままだった。原因は下の3つ
+  const openAt = html.indexOf('getUserMedia({ video:');
+  const loadAt = html.indexOf('await loadDecoder()');
+  ok(openAt > 0 && loadAt > openAt,
+    '🚨 カメラを先に開けてからデコーダを読む (先に wasm を落とすと iOS の「押した」扱いが切れて再生されない)');
+  const onAt = html.indexOf("$('#scanBox').classList.add('on')");
+  const srcAt = html.indexOf('v.srcObject = scanStream');
+  ok(onAt > 0 && srcAt > onAt,
+    '🚨 画面に出してから stream をつなぐ (display:none のまま挿すと iOS は再生を始めない)');
+  ok(/await v\.play\(\)/.test(html) && /v\.muted = true/.test(html) && /v\.playsInline = true/.test(html),
+    '🚨 autoplay 属性に頼らず play() を呼ぶ + muted / playsInline をプロパティでも立てる');
+  ok(/no_video/.test(html), '映像が来ないときの案内を出し分けている');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
