@@ -37,6 +37,8 @@ import { countTasksByStatus, listTasksNeedingReview, listOrphans, listFacilities
 import { OPEN_STATUSES } from './tasks.js';
 import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, buildConsignPlan, buildFacilityView, facilityCapacityGuard, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
+// 🚨 2026-09-08 の事故の復旧 (空の入荷CSVで一斉取消)。片づいたら消してよい
+import { surveyCancelled, restoreCancelled } from './restore-cancelled.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
 import { batchTransitionNeedsStaff } from './batches.js';
 import { bumpWindow } from './rate-window.js';
@@ -2320,6 +2322,29 @@ facilityRouter.all(/.*/, (req, res) => {
 router.use('/f', facilityRouter);
 
 // ─── 施設リンクの発行・失効 (管理者だけ) ───
+
+/**
+ * 🚨 2026-09-08 の事故の復旧 — 空の入荷CSVで一斉に取り消されたカードを戻す。**管理者だけ**。
+ *
+ * ⭐GET は**調べるだけ** (書き込まない)。何件・どれが対象かを見てから POST で戻す。
+ * ⭐POST は調べた件数と合っているときだけ書き込む。調べたあとに別の取消が起きていたら断る。
+ */
+router.get('/admin/restore-cancelled', requireAdmin, api((req, res) => {
+  const r = surveyCancelled({ from: req.query.from, to: req.query.to });
+  if (!r.ok) return res.status(400).json(r);
+  res.json(r);
+}));
+router.post('/admin/restore-cancelled', checkOrigin, requireAdmin, api((req, res) => {
+  const b = req.body || {};
+  const r = restoreCancelled({ from: b.from, to: b.to,
+    expectTasks: b.expect_tasks, expectDestinations: b.expect_destinations,
+    actor: (req.iwUser || 'admin') + ' (復旧)' });
+  if (!r.ok) return res.status(r.error === 'count_mismatch' ? 409 : 400).json(r);
+  logEvent({ action: 'restore_cancelled', workerName: req.iwUser || 'admin',
+    to: `カード ${r.restored.tasks} 件・まとまり ${r.restored.batches} 件・行き先 ${r.restored.dests} 件を戻した (${r.from}〜${r.to})`,
+    ok: true });
+  res.json(r);
+}));
 
 /** ⭐施設の受け入れ枠を決める (要件 §AB-8)。管理者だけ */
 router.post('/admin/facility-capacity', checkOrigin, requireAdmin, api((req, res) => {
