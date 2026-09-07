@@ -209,3 +209,99 @@ export function countsByTask(db, taskIds) {
   }
   return out;
 }
+
+/**
+ * ⭐棚に入れた実績を 1 行足す (要件 §AB-2)。**まとまりごと**。
+ *
+ * いまは「棚入れする」で**まだ棚に入れていない残り全部**を 1 行にする。
+ * 数えていない (good_qty が NULL) まとまりは `qty` も NULL = **数えずに棚に入れた** (0 と区別)。
+ * ⚠必ず呼び出し側の書き込みトランザクションの中で。
+ *
+ * @returns {number} 足した行数 (0 = 残りが無い)
+ */
+export function recordStocking(db, batchId, { at = undefined, by = null, note = null } = {}) {
+  const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(batchId);
+  if (!b) return 0;
+  const done = stockedQtyOf(db, batchId);
+  // ⭐**数の分からない実績が 1 つでもあれば、残りを自分で決めない** (要件: 欠損値を 0 で代用しない)。
+  //   「数えずに入れた」あとに できた数 を 100 と入れても、既に何個運んだか分からないので
+  //   残りが 100 とは言えない (Codex R1 中1)。この場合も「数は分からない」1 行として足す
+  let qty = null;
+  if (b.good_qty != null && done.unknown === 0) {
+    qty = b.good_qty - (done.qty ?? 0);
+    if (qty <= 0) return 0;                      // もう全部入れてある
+  } else if (b.good_qty == null && done.unknown > 0) {
+    // 数えていないまとまりに「数は分からない」で入れた記録が既にある = もう運んである。二度書かない。
+    // ⚠**数ありの記録があるかどうかでは判定しない** — 200 個入れたあと できた数 を「分からない」に
+    //   直して残りを入れるとき、残量は不明なのに「残りなし」と同じ扱いになってしまう (Codex R2 中)
+    return 0;
+  } else if (done.unknown > 0 && b.good_qty != null) {
+    // 数の分からない実績があるところに、あとから できた数 が入った。
+    // 何個ぶん残っているか決められないので、数を書かずに 1 行だけ足す (人が見て直せる)
+    qty = null;
+  }
+  const now = new Date().toISOString();
+  // ⭐`at` を渡さなければ「いま」。**`at: null` を渡したときだけ空のまま** (= いつ入れたか分からない)。
+  //   `created_at` には記録した時刻が残るので、あとから追える
+  db.prepare(`INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, stocked_by, note, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)`).run(batchId, qty, at === undefined ? now : at, by, note, now);
+  return 1;
+}
+
+/**
+ * そのまとまりを棚に入れた合計。
+ * @returns {{ qty: number|null, rows: number, unknown: number }}
+ *   qty = **数が分かっているぶんの合計** (NULL = 1 つも数えていない) /
+ *   rows = 実績の件数 / unknown = 数の分からない実績の件数。
+ *   ⭐unknown > 0 なら、全部で何個入れたかは**決められない**。qty を全体の合計として使わないこと
+ */
+export function stockedQtyOf(db, batchId) {
+  const r = db.prepare(`SELECT COUNT(*) rows, COUNT(qty) n, SUM(qty) s
+    FROM f_iroha_stocking_records WHERE batch_id = ?`).get(batchId);
+  const rows = r ? r.rows : 0;
+  const n = r ? r.n : 0;
+  return { qty: n > 0 ? r.s : null, rows, unknown: rows - n };
+}
+
+/** カードの棚入れ実績をまとめて (履歴・詳細に出す用)。まとまりを問わず新しい順 */
+export function stockingOfTask(db, taskId) {
+  return db.prepare(`SELECT s.*, b.seq FROM f_iroha_stocking_records s
+    JOIN f_iroha_task_batches b ON b.id = s.batch_id
+    WHERE b.task_id = ? ORDER BY s.id DESC`).all(taskId);
+}
+
+/**
+ * カードを棚入完了にしたとき、そのカードのまとまり全部に実績を足す。
+ * ⚠必ず呼び出し側の書き込みトランザクションの中で。
+ * @returns {number} 足した行数
+ */
+export function recordStockingForTask(db, taskId, opts = {}) {
+  const rows = db.prepare("SELECT id FROM f_iroha_task_batches WHERE task_id = ? AND work_status <> 'cancelled'").all(taskId);
+  let n = 0;
+  for (const b of rows) n += recordStocking(db, b.id, opts);
+  return n;
+}
+
+/**
+ * 既に棚入完了になっているカードに、実績が無ければ足す (起動時。冪等)。
+ * この機能より前に棚に入れたぶんは、いつ・誰が入れたかをカードの closed_at / closed_by から持ってくる。
+ * @returns {number} 足した行数
+ */
+export function backfillStocking(db) {
+  const made = db.transaction(() => {
+    const rows = db.prepare(`SELECT b.id, t.closed_at, t.closed_by FROM f_iroha_task_batches b
+      JOIN f_iroha_tasks t ON t.id = b.task_id
+      WHERE b.work_status = 'done'
+        AND NOT EXISTS (SELECT 1 FROM f_iroha_stocking_records s WHERE s.batch_id = b.id)`).all();
+    let n = 0;
+    for (const r of rows) {
+      // ⭐いつ入れたか分からないカードは `stocked_at` を**空のまま**にする。
+      //   移行した日を入れると「その日に棚入れした」と嘘の記録になり、以後直る機会も無い (Codex R1 中2)
+      n += recordStocking(db, r.id, { at: r.closed_at || null, by: r.closed_by || null,
+        note: '(この機能より前に棚に入れたぶん' + (r.closed_at ? '' : '・いつ入れたかは記録がありません') + ')' });
+    }
+    return n;
+  }).immediate();
+  if (made > 0) console.log(`[iroha-work] 棚入れの実績を ${made} 件ぶん用意しました (この機能より前のぶん)`);
+  return made;
+}

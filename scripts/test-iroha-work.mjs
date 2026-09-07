@@ -4022,7 +4022,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v10'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v11'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -4968,6 +4968,244 @@ console.log('\n[27] できた数 — 実績を予定で上書きしない');
     && /\.\.\.\(v\.note !== undefined \? \{ variance_note: v\.note \} : \{\}\)/.test(html),
     '作れなかった数とひとことは、状態変更と同じ 1 回の通信で送る (空文字も送る = 消せる)');
   ok(/数が予定と違っていても、そのまま入れてください/.test(html), '「差があってよい」と画面に書く');
+}
+
+// ═══════ 棚に入れた記録 — まとまりごと・別の表 (要件 §AB-2) ═══════
+console.log('\n[28] 棚に入れた記録 — 作業のまとまりを割って表さない');
+{
+  const db = getDB();
+  const B = await import('../apps/iroha-work/batches.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const { createTables } = await import('../apps/iroha-work/db.js');
+  const staff28 = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+  const mk28 = (page, dest, qty) => TD.upsertTaskFromImport({ notion_page_id: page, status: 'ready_for_stocking',
+    facility_code: 'iroha', destination_id: dest, product_name: '棚入れの検査', qty }, { batchId: 'st' }).id;
+  const close28 = (id) => TD.changeTaskStatus({ taskId: id, to: 'closed', closeReason: 'stocked',
+    expectVersion: TD.getTask(id).version, isStaff: true, workerId: staff28.id, workerName: staff28.display_name,
+    actor: staff28.display_name });
+
+  // ── 表の形 ──
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_stocking_records'").get()?.sql || '';
+  ok(/REFERENCES f_iroha_task_batches\(id\)/.test(sql) && /qty\s+INTEGER CHECK \(qty IS NULL OR qty >= 0\)/.test(sql),
+    '棚入れの実績は まとまり にぶら下がる。数は 0 以上、NULL 可 (数えずに入れた)');
+
+  // ── 棚入完了で 1 行できる ──
+  {
+    const t = mk28('st-1', 9851, 200);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 198 }); }).immediate();
+    ok(B.stockedQtyOf(db, bid).rows === 0, '前提: まだ棚に入れていない');
+    const r = close28(t);
+    ok(r.ok, '前提: 棚入完了にした');
+    const recs = B.stockingOfTask(db, t);
+    ok(recs.length === 1 && recs[0].qty === 198, '⭐棚入完了にしたら「198 個 入れた」が 1 行残る (できた数ぶん)');
+    ok(recs[0].stocked_by === staff28.display_name && recs[0].stocked_at, 'いつ・誰が が残る');
+    ok(B.stockedQtyOf(db, bid).qty === 198, '合計は実績から出す');
+  }
+  // ── 数えずに棚に入れた ──
+  {
+    const t = mk28('st-2', 9852, 100);
+    close28(t);
+    const recs = B.stockingOfTask(db, t);
+    ok(recs.length === 1 && recs[0].qty == null,
+      '⭐数えていないまとまりは「数は残していない」で 1 行 (0 個と混ぜない)');
+    ok(B.stockedQtyOf(db, t) && B.stockedQtyOf(db, B.listBatchesOfTask(db, t)[0].id).qty == null,
+      '合計も「分からない」(0 にしない)');
+  }
+  // ── ⭐部分棚入れは、まとまりを割らずに実績を足す ──
+  {
+    const t = mk28('st-3', 9853, 400);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 398 }); }).immediate();
+    // 200 個だけ先に入れる (画面にはまだ無いが、仕組みとしてできる)
+    db.transaction(() => { db.prepare(`INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, stocked_by, created_at)
+      VALUES (?, 200, ?, 'さきに200', ?)`).run(bid, new Date().toISOString(), new Date().toISOString()); }).immediate();
+    ok(B.stockedQtyOf(db, bid).qty === 200, '前提: 200 個だけ入れてある');
+    close28(t);
+    const recs = B.stockingOfTask(db, t);
+    ok(recs.length === 2 && B.stockedQtyOf(db, bid).qty === 398,
+      '⭐残り 198 個ぶんが足されて合計 398 (まとまりは 1 つのまま — 割らない)');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ?').get(t).c === 1,
+      '⭐まとまりは割れていない (398 個ぶんの作業時間・メモの帰属が壊れない — Codex R3 の差し戻し)');
+  }
+  // ── 全部入れてあれば足さない (二重に記録しない) ──
+  {
+    const t = mk28('st-4', 9854, 50);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 50 }); }).immediate();
+    close28(t);
+    ok(B.stockingOfTask(db, t).length === 1, '前提: 1 回で全部入れた');
+    db.transaction(() => { ok(B.recordStocking(db, bid) === 0, '⭐もう全部入れてあれば足さない (二重に記録しない)'); }).immediate();
+  }
+  // ── まとめて棚入完了でも残る ──
+  {
+    const t = mk28('st-5', 9855, 30);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 30 }); }).immediate();
+    TD.bulkCloseReady({ taskIds: [{ id: t, version: TD.getTask(t).version }], actor: 'まとめて',
+      workerId: staff28.id, workerName: staff28.display_name });
+    ok(B.stockingOfTask(db, t).length === 1 && B.stockingOfTask(db, t)[0].qty === 30,
+      'まとめて棚入完了でも実績が残る');
+  }
+  // ── 取消で終わったカードには残らない ──
+  {
+    const t = TD.upsertTaskFromImport({ notion_page_id: 'st-6', status: 'not_started', facility_code: 'iroha',
+      destination_id: 9856, product_name: '取消して終わる', qty: 10 }, { batchId: 'st' }).id;
+    TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'cancelled', expectVersion: TD.getTask(t).version,
+      isStaff: true, workerId: staff28.id, workerName: staff28.display_name });
+    ok(B.stockingOfTask(db, t).length === 0, '取消で終わったカードは棚に入れていないので実績も無い');
+  }
+  // ── この機能より前に棚入完了したカードにも、起動時に用意される ──
+  {
+    const t = mk28('st-7', 9857, 70);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 70 }); }).immediate();
+    close28(t);
+    db.prepare('DELETE FROM f_iroha_stocking_records WHERE batch_id = ?').run(bid);   // 昔の DB の形にする
+    ok(B.stockingOfTask(db, t).length === 0, '前提: 実績が無い');
+    createTables(db);
+    const recs = B.stockingOfTask(db, t);
+    ok(recs.length === 1 && recs[0].qty === 70 && /この機能より前/.test(recs[0].note || ''),
+      '⭐起動時に、棚入完了ずみのカードへ実績を用意する (いつ・誰が はカードの終了記録から)');
+    ok(B.backfillStocking(db) === 0, '2 回目は何もしない (冪等)');
+  }
+
+  // ── ⭐数の分からない実績があるときは、残りを自分で決めない (Codex R1 中1) ──
+  {
+    const t = mk28('st-8', 9858, 100);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    close28(t);                                          // 数えずに棚入れ → qty NULL の実績 1 行
+    ok(B.stockedQtyOf(db, bid).unknown === 1, '前提: 数の分からない実績が 1 件');
+    // あとから できた数 を入れる → 何個ぶん残っているかは決められない
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 100 }); }).immediate();
+    db.transaction(() => { B.recordStocking(db, bid, { at: new Date().toISOString(), by: 'あとから' }); }).immediate();
+    const recs = B.stockingOfTask(db, t);
+    ok(recs.length === 2 && recs[0].qty == null,
+      '⭐数の分からない実績があるところに あとから 100 個 と入れても、「残り 100 個」とは書かない (0 個運んだ扱いにしない)');
+    const sum = B.stockedQtyOf(db, bid);
+    ok(sum.qty == null && sum.unknown === 2, '合計も「決められない」(数の分からない件数を数える)');
+  }
+  // ── ⭐数ありの実績のあとで「できた数」が分からなくなったとき (Codex R2 中) ──
+  {
+    const t = mk28('st-13', 9863, 300);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 300 }); }).immediate();
+    const at13 = new Date().toISOString();
+    db.transaction(() => {
+      db.prepare('INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, created_at) VALUES (?, 200, ?, ?)').run(bid, at13, at13);
+    }).immediate();
+    // 数え直したら分からなくなった (できた数を消した)
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: null }); }).immediate();
+    ok(B.stockedQtyOf(db, bid).unknown === 0 && B.stockedQtyOf(db, bid).rows === 1, '前提: 数ありの実績が 1 件だけ');
+    db.transaction(() => {
+      ok(B.recordStocking(db, bid, { at: at13 }) === 1,
+        '⭐200 個入れたあと できた数 が分からなくなっても、残りを入れた記録は残せる (「残りなし」にしない)');
+    }).immediate();
+    ok(B.stockingOfTask(db, t)[0].qty == null, 'その記録は「数は分からない」で入る');
+    // 数の分からない記録が既にあるときは、二度書かない
+    db.transaction(() => { ok(B.recordStocking(db, bid, { at: at13 }) === 0, '数の分からない記録が既にあれば二度書かない'); }).immediate();
+  }
+
+  // ── 数が分かる実績と分からない実績が混ざるとき ──
+  {
+    const t = mk28('st-9', 9859, 300);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    const at9 = new Date().toISOString();
+    db.transaction(() => {
+      db.prepare(`INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, created_at) VALUES (?, 200, ?, ?)`).run(bid, at9, at9);
+      db.prepare(`INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, created_at) VALUES (?, NULL, ?, ?)`).run(bid, at9, at9);
+    }).immediate();
+    const sum = B.stockedQtyOf(db, bid);
+    ok(sum.qty === 200 && sum.unknown === 1 && sum.rows === 2,
+      '⭐数が分かるぶんの合計 (200) と、分からない件数 (1) を別に返す — 200 を全体の合計として使わせない');
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 300 }); }).immediate();
+    db.transaction(() => { B.recordStocking(db, bid, { at: at9 }); }).immediate();
+    ok(B.stockingOfTask(db, t)[0].qty == null, '混ざっているときも「残り 100 個」と決めつけない');
+  }
+  // ── できた数を後から減らしたとき ──
+  {
+    const t = mk28('st-10', 9860, 400);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 400 }); }).immediate();
+    close28(t);
+    ok(B.stockedQtyOf(db, bid).qty === 400, '前提: 400 個入れた');
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 380 }); }).immediate();   // 数え直したら 380 だった
+    db.transaction(() => { ok(B.recordStocking(db, bid, { at: new Date().toISOString() }) === 0,
+      '⭐できた数を減らしても、過去の実績は書き換えない・マイナスの行も足さない'); }).immediate();
+    ok(B.stockedQtyOf(db, bid).qty === 400, '入れた記録は 400 のまま (実際に運んだのは 400 なので)');
+  }
+  // ── 終了時刻が無い古いカードの移行 ──
+  {
+    const t = mk28('st-11', 9861, 60);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 60 }); }).immediate();
+    close28(t);
+    db.prepare('DELETE FROM f_iroha_stocking_records WHERE batch_id = ?').run(bid);
+    // ⚠カードの CHECK が「終了なら終了時刻あり」を守っているので、終了時刻の無い終了カードは作れない。
+    //   そこで、いつ入れたか分からないぶんを直接足して、**移行した日を入れない**ことを確かめる
+    db.transaction(() => { B.recordStocking(db, bid, { at: null, note: '(いつ入れたかは記録がありません)' }); }).immediate();
+    const r = B.stockingOfTask(db, t)[0];
+    ok(r && r.stocked_at == null && r.created_at,
+      '⭐いつ入れたか分からないぶんは、その日の日付を入れない (空のまま。記録した時刻は created_at に残る)');
+    ok(/いつ入れたかは記録がありません/.test(r.note || ''), 'その旨をメモに残す');
+    // 終了時刻があるカードは、その時刻がそのまま入る
+    const t2 = mk28('st-12', 9862, 60);
+    const bid2 = B.listBatchesOfTask(db, t2)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid2, { goodQty: 60 }); }).immediate();
+    close28(t2);
+    const kept = TD.getTask(t2).closed_at;
+    db.prepare('DELETE FROM f_iroha_stocking_records WHERE batch_id = ?').run(bid2);
+    B.backfillStocking(db);
+    const r2 = B.stockingOfTask(db, t2)[0];
+    ok(r2.stocked_at === kept && r2.stocked_by === TD.getTask(t2).closed_by,
+      '終了の記録があるカードは、その日時と人がそのまま入る');
+  }
+
+  // ── 箱ラベルは「どのまとまりのぶんを刷ったか」を残す ──
+  const pj = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_print_jobs'").get().sql;
+  ok(/batch_id/.test(pj), '箱ラベルの印刷ジョブに まとまり の列がある (要件 §AB-12)');
+  ok(/product_name/.test(pj) && /expiry_text/.test(pj) && /pack_qty/.test(pj) && /copies/.test(pj),
+    '刷った中身 (商品名・期限・入数・枚数) は列に残る = あとでまとまりを直しても刷った記録は変わらない');
+
+  // ── 画面 ──
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(/function stockingCardHtml\(c\)/.test(html) && /棚に入れた記録/.test(html)
+    && /stockingCardHtml\(c\) \+/.test(html),
+    '詳細に「棚に入れた記録」を出す');
+  ok(/r\.qty == null \? '数は残していません'/.test(html)
+    && /'いつ入れたかの記録なし'/.test(html),
+    '数えずに入れたぶんは「数は残していません」、日時が無いぶんは「記録なし」と出す (0 や今日と混ぜない)');
+  // ⭐画面の関数を**実際に動かして**確かめる (正規表現では中身が守れない — Codex R2 軽微)。
+  //   HTML から関数だけ取り出し、esc / 日付の整形だけ差し替えて呼ぶ
+  {
+    const src = html.match(/function stockingCardHtml\(c\) \{[\s\S]*?\n\}/)[0];
+    const escStub = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const render = new Function('esc', 'fmtDate', 'fmtTime',
+      src + '; return stockingCardHtml;')(escStub, () => '9/7', () => '10:00');
+
+    ok(render({ stocking: [] }) === '', '記録が無ければ何も出さない');
+
+    const allKnown = render({ stocking: [{ qty: 200, stocked_at: 'x' }, { qty: 198, stocked_at: 'x' }] });
+    ok(/合計 398 個 \(2回\)/.test(allKnown), '全部数が分かるときだけ「合計」と書く');
+
+    const mixed = render({ stocking: [{ qty: 200, stocked_at: 'x' }, { qty: null, stocked_at: 'x' }] });
+    ok(/数が分かるぶん 200 個 ・ 数の記録がないもの 1回 \(ぜんぶで 2回\)/.test(mixed) && !/合計/.test(mixed),
+      '⭐混ざっているときは「合計」と言い切らない (200 個 + 数不明 を「合計 200 個」と書かない)');
+    ok(/数は残していません/.test(mixed), '数の無い行は「数は残していません」と出す');
+
+    const noneKnown = render({ stocking: [{ qty: null, stocked_at: 'x' }] });
+    ok(/数の記録はありません \(1回\)/.test(noneKnown) && !/合計/.test(noneKnown), '1 件も数が無ければ「数の記録はありません」');
+
+    const zero = render({ stocking: [{ qty: 0, stocked_at: 'x' }] });
+    ok(/<b>0 個<\/b>/.test(zero) && /合計 0 個/.test(zero) && !/数は残していません/.test(zero),
+      '⭐0 個は「数えた結果 0」として出す (「数は残していません」と混ぜない)');
+
+    const noDate = render({ stocking: [{ qty: 5, stocked_at: null }] });
+    ok(/いつ入れたかの記録なし/.test(noDate), '日時が無い行は「いつ入れたかの記録なし」(今日の日付を出さない)');
+
+    const escaped = render({ stocking: [{ qty: 1, stocked_at: 'x', stocked_by: '<script>' }] });
+    ok(/&lt;script&gt;/.test(escaped) && !/<script>/.test(escaped), '画面に出す文字は esc を通す');
+  }
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
