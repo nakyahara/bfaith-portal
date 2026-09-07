@@ -17,6 +17,8 @@ import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { FACILITIES, FACILITY_RENAMES } from './tasks.js';
 import { backfillBatches, backfillStocking } from './batches.js';
+// 🚨2026-09-08 の事故の復旧 (空の入荷CSVで一斉取消)。片づいたら消してよい
+import { runIncidentRestoreOnce } from './restore-cancelled.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -940,6 +942,9 @@ export function createTables(db = getMirrorDB()) {
   backfillBatches(db);
   // ⭐既に棚入完了のカードに、棚入れの実績が無ければ足す (要件 §AB-2)。まとまりが揃ったあと
   backfillStocking(db);
+  // 🚨2026-09-08 の事故の復旧 — 空の入荷CSVで一斉に取り消されたカードを一度だけ戻す。
+  //   片づいたらこの 1 行と restore-cancelled.js ごと消してよい
+  runIncidentRestoreOnce(db, { getMeta, setMetaValue });
   // v1.1 正本化: 作業時間・写真・履歴を task に紐づける (page_id は Notion 時代の証跡として残す — Codex 設計相談 R3)。
   // REFERENCES は宣言する (mirror DB は foreign_keys=ON。存在確認はサービス層でも行う)
   addCol('f_iroha_work_sessions', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
