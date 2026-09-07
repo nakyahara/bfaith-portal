@@ -381,7 +381,12 @@ const MEDIA_INDEX_DDL = `
 // 表ごとに「新しい定義に必要なもの」(列の有無だけでなく UNIQUE・CHECK も。欠けた途中版を見逃さない — Codex A1b R2 #2)
 const SESSION_MEDIA_COMMON_DDL = [/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/, /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/];
 const SESSIONS_REQUIRED_DDL = [...SESSION_MEDIA_COMMON_DDL, /end_reason IS NULL OR end_reason IN \('done','pause','admin'\)/,
-  // ⭐人数だけの作業 (要件 §AB-10)。列だけ足した途中版と区別するため、表レベルの CHECK まで見る
+  // ⭐人数だけの作業 (要件 §AB-10)。列だけ足した途中版と区別するため、表レベルの CHECK まで見る。
+  //   ⭐crew_size は**列の定義まで**見る (Codex #1258 R1 中3) — NULL 可の途中版だと
+  //   raw_seconds × crew_size が NULL になり、その行の実測が合計から静かに消える
+  /crew_size      INTEGER NOT NULL DEFAULT 1 CHECK \(crew_size >= 1 AND crew_size <= 50\)/,
+  /facility_code  TEXT REFERENCES f_iroha_facilities\(code\)/,
+  /batch_id       INTEGER REFERENCES f_iroha_task_batches\(id\)/,
   /CHECK \(\(worker_id IS NULL\) = \(worker_name IS NULL\)\)/,
   /CHECK \(worker_id IS NOT NULL OR facility_code IS NOT NULL\)/,
   /CHECK \(worker_id IS NULL OR crew_size = 1\)/];
@@ -393,6 +398,10 @@ function sessionMediaNeedsRebuild(db, table, ddl, required) {
   if (info.some((c) => c.name === 'page_id' && c.notnull === 1)) return true;
   // ⭐人数だけの記録は worker_id が NULL になる。古い版は NOT NULL なので作り直す (要件 §AB-10)
   if (info.some((c) => (c.name === 'worker_id' || c.name === 'worker_name') && c.notnull === 1)) return true;
+  // ⭐crew_size は「NOT NULL・既定値 1」でなければ作り直す (Codex #1258 R1 中3)。
+  //   DDL の文字列だけを見ると、書き方が少し違う途中版を見逃す
+  const crew = info.find((c) => c.name === 'crew_size');
+  if (crew && (crew.notnull !== 1 || String(crew.dflt_value) !== '1')) return true;
   if (required.some((re) => !re.test(sql))) return true;
   const have = new Set(info.map((c) => c.name));
   const want = [...ddl('x').matchAll(/^\s+([a-z_]+)\s+(?:INTEGER|TEXT)/gm)].map((m) => m[1]);
@@ -1082,12 +1091,17 @@ export function workSecondsByTask(taskIds) {
   for (let i = 0; i < ids.length; i += 400) {
     const chunk = ids.slice(i, i + 400);
     // ⭐実測は **人時 = 秒 × 人数**。個人の記録は crew_size = 1 なので、今までの数字と変わらない (要件 §AB-10)。
-    //   人数は「個人の記録の人数」+「人数だけの記録のいちばん多かった人数」— 同じ拠点が
-    //   2 回に分けて作業しても 2 倍に数えない (延べ人数ではなく「何人でやったか」)
-    const rows = db.prepare(`SELECT task_id,
-        SUM(COALESCE(raw_seconds, 0) * crew_size) AS secs,
-        COUNT(DISTINCT worker_id) + COALESCE(MAX(CASE WHEN worker_id IS NULL THEN crew_size END), 0) AS people
-      FROM f_iroha_work_sessions WHERE voided_at IS NULL AND ended_at IS NOT NULL AND task_id IN (${chunk.map(() => '?').join(',')})
+    //   人数は「個人の人数」+「拠点ごとのいちばん多かった人数の合計」。
+    //   ⭐拠点ごとに数えるのがだいじ — まとめて MAX を取ると、パレット 3 人 + ジョブサポ 2 人が 3 人になる
+    //   (Codex #1258 R1 中2)。同じ拠点が 2 回に分けて作業したときは 2 倍にしない (延べ人数にしない)
+    const rows = db.prepare(`SELECT task_id, SUM(secs) AS secs, SUM(ind) + COALESCE(SUM(crew), 0) AS people FROM (
+        SELECT task_id, facility_code,
+          SUM(COALESCE(raw_seconds, 0) * crew_size) AS secs,
+          COUNT(DISTINCT worker_id) AS ind,
+          MAX(CASE WHEN worker_id IS NULL THEN crew_size END) AS crew
+        FROM f_iroha_work_sessions
+        WHERE voided_at IS NULL AND ended_at IS NOT NULL AND task_id IN (${chunk.map(() => '?').join(',')})
+        GROUP BY task_id, facility_code)
       GROUP BY task_id`).all(...chunk);
     for (const r of rows) out.set(r.task_id, { seconds: Number(r.secs) || 0, people: r.people });
   }
@@ -1695,13 +1709,20 @@ export function searchSessions({ workerId = null, from = null, to = null, q = nu
   // 合計は**絞り込んだ全件**で出す (画面に出ている 200 件ぶんだけの合計にしない)。
   // ⭐totalSeconds は**終わったぶんだけ**。作業中はまだ確定していないので足さない
   //   (工賃の計算に使う数字が、見るたびに増えていくことになる — 画面のラベルも「終わったぶん」と書く)
-  const summary = db.prepare(`SELECT COUNT(*) AS count,
+  const base = db.prepare(`SELECT COUNT(*) AS count,
       COALESCE(SUM(CASE WHEN s.ended_at IS NOT NULL THEN s.raw_seconds * s.crew_size ELSE 0 END), 0) AS totalSeconds,
-      COUNT(DISTINCT s.worker_id) + COALESCE(MAX(CASE WHEN s.worker_id IS NULL THEN s.crew_size END), 0) AS workers,
+      COUNT(DISTINCT s.worker_id) AS workers,
       COUNT(DISTINCT LOWER(TRIM(s.product_code))) AS products,
       COUNT(DISTINCT COALESCE('t' || s.task_id, s.page_id)) AS cards,
       SUM(CASE WHEN s.ended_at IS NULL THEN 1 ELSE 0 END) AS open
     FROM f_iroha_work_sessions s ${sql}`).get(...args);
+  // ⭐人数だけの記録は**拠点ごと**に「いちばん多かった人数」を足す。
+  //   まとめて MAX を取ると、パレット 3 人 + ジョブサポ 2 人が 3 人になる (Codex #1258 R1 中2)。
+  //   個人の数え方 (DISTINCT) には触らない — 同じ人が何枚のカードにいても 1 人
+  const crewSql = sql ? `${sql} AND s.worker_id IS NULL` : 'WHERE s.worker_id IS NULL';
+  const crew = db.prepare(`SELECT COALESCE(SUM(mx), 0) AS crew FROM (
+      SELECT MAX(s.crew_size) AS mx FROM f_iroha_work_sessions s ${crewSql} GROUP BY s.facility_code)`).get(...args);
+  const summary = { ...base, workers: (base.workers || 0) + (crew.crew || 0) };
 
   const rows = db.prepare(`SELECT s.id, s.task_id, s.page_id, s.product_code, s.title_snapshot,
       s.worker_id, s.worker_name, s.facility_code, s.crew_size, s.batch_id,

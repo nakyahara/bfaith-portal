@@ -1779,9 +1779,20 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
     // 途中の版に無かった列 (人数だけの作業) は落ちて既定値に戻る。それ以外は id ごとそのまま
     ok(stripNew(rowsOf('f_iroha_work_sessions')) === stripNew(allS) && rowsOf('f_iroha_card_media') === allM,
       '全行 (task の行・id 含む) がそのまま残る');
+    // ⭐外して比べた列そのものも確かめる (外しっぱなしだと、初期値が壊れていても緑になる — Codex R1 軽微1)
+    const news = db.prepare('SELECT crew_size, facility_code, batch_id FROM f_iroha_work_sessions').all();
+    ok(news.length > 0 && news.every((r) => r.crew_size === 1),
+      '⭐古い行の人数は 1 になる (人時が今までの数字と変わらない)');
+    ok(news.every((r) => r.facility_code === null && r.batch_id === null),
+      '古い行に拠点・まとまりは入らない (分からないものを埋めない)');
+    createTables(db);
+    // ⭐2 回目は**全列そのまま**。人数だけの行も置いてから確かめる (新しい列を触っていないか)
+    db.prepare("INSERT INTO f_iroha_work_sessions (task_id, facility_code, crew_size, started_at, ended_at, raw_seconds, end_reason)"
+      + " VALUES (?, 'rehas', 3, ?, ?, 60, 'done')").run(tOpen, new Date().toISOString(), new Date().toISOString());
+    const before2 = rowsOf('f_iroha_work_sessions');
     createTables(db);
     ok(db.prepare("SELECT COUNT(*) c FROM sqlite_master WHERE name LIKE 'f_iroha_work_sessions%'").get().c === 1
-      && stripNew(rowsOf('f_iroha_work_sessions')) === stripNew(allS), '2 回目は何もしない (冪等)');
+      && rowsOf('f_iroha_work_sessions') === before2, '2 回目は何もしない (冪等。人数だけの行も 1 列も変わらない)');
 
     // (d) task_id FK と紐付け CHECK はあるが、既存の UNIQUE / CHECK だけ欠ける版 (Codex A1b R2 #2)
     const LATE_SESSIONS = sqlOf('f_iroha_work_sessions').replace("end_reason     TEXT CHECK (end_reason IS NULL OR end_reason IN ('done','pause','admin'))", 'end_reason TEXT');
@@ -2738,7 +2749,8 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
         if (withWork) {
           const dw = await call('GET', '/api/task-previews/' + withWork.task_id, { cookie });
           ok(dw.status === 200 && Array.isArray(dw.json.card.work_history) && dw.json.card.work_history.length > 0
-            && dw.json.card.work_history.every((s) => s.worker_name && s.started_at && s.ended_at), 'そのカードの終わった作業が時系列で返る');
+            && dw.json.card.work_history.every((s) => (s.worker_name || s.facility_code) && s.started_at && s.ended_at),
+            'そのカードの終わった作業が時系列で返る (人数だけの記録は名前でなく拠点を持つ)');
           ok(pv.json.cards.every((c) => c.work_history === undefined), '一覧・ボードのカードには付けない (件数ぶん引かない)');
         } else ok(false, '終わった作業がテストデータに無い');
       }
@@ -7283,6 +7295,89 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
     ok(noone && /CHECK/.test(noone.message), '⭐誰の作業か分からない行は入らない');
   }
 
+  // ⑦ ⭐はじめられなかったら、止まっている札の解除ごと戻す (Codex R1 中1)
+  {
+    const t = mk('crew-8', 9014);
+    const bk = TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: TD.getTask(t).version, actor: 'test' });
+    ok(bk.ok, '(前提) 作業中にできる');
+    const bl = TD.setTaskBlock({ taskId: t, reason: 'materials_shortage', note: null,
+      expectVersion: TD.getTask(t).version, actor: 'test' });
+    ok(bl.ok && TD.getTask(t).blocked_reason === 'materials_shortage', '(前提) 止まっている札を付ける');
+    const v0 = TD.getTask(t).version;
+    // 札を外す指示つきで、人数だけおかしい要求を送る
+    const bad = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 0,
+      clearBlock: true, expectVersion: v0 });
+    ok(!bad.ok, 'はじめられない');
+    ok(TD.getTask(t).blocked_reason === 'materials_shortage',
+      '⭐はじめられなかったのに札だけ消える、が起きない');
+    ok(TD.getTask(t).version === v0, 'カードの版も進まない');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(t).c === 0, '記録も残らない');
+
+    // ⭐**札を外したあとで**失敗する経路も試す。上の「人数がおかしい」は札より先に断るので、
+    //   巻き戻しそのものは通らない。別のカードのまとまりを指すと、札を外した後で断られる
+    const other = mk('crew-8b', 9016);
+    const otherBatch = B.listBatchesOfTask(db, other)[0].id;
+    const v1 = TD.getTask(t).version;
+    const late = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 2,
+      batchId: otherBatch, clearBlock: true, expectVersion: v1 });
+    ok(!late.ok && late.error === 'bad_batch', '(前提) 札を外したあとで断られる要求');
+    ok(TD.getTask(t).blocked_reason === 'materials_shortage',
+      '⭐札を外したあとで失敗しても、外したことごと戻る (トランザクションを確定させない)');
+    ok(TD.getTask(t).version === v1, 'カードの版も進まない');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(t).c === 0, '記録も残らない');
+
+    // 正しい要求なら、札が外れて始まる
+    const good = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 2,
+      clearBlock: true, expectVersion: TD.getTask(t).version });
+    ok(good.ok && TD.getTask(t).blocked_reason === null, '正しい要求なら札が外れてはじまる');
+  }
+
+  // ⑧ ⭐人数は拠点ごとに数える (Codex R1 中2)
+  {
+    const t = mk('crew-9', 9015);
+    const a = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 3 });
+    const b = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'jobsupport', crewSize: 2 });
+    const p = TD.startTaskSession({ taskId: t, worker: memberW, workers: [memberW] });
+    const end = new Date().toISOString();
+    for (const id of [a.sessionId, b.sessionId, p.sessionId]) {
+      db.prepare("UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = 'done', raw_seconds = 60 WHERE id = ?").run(end, id);
+    }
+    const w = D.workSecondsByTask([t]).get(t);
+    ok(w.seconds === 60 * 3 + 60 * 2 + 60, '⭐人時は 180 + 120 + 60 = 360 人秒');
+    ok(w.people === 6, '⭐人数は パレット 3 + ジョブサポ 2 + 個人 1 = 6 人 (拠点ごとに数える)');
+    // 同じ拠点が 2 回に分けて作業しても、延べにはしない
+    const a2 = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 2 });
+    db.prepare("UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = 'done', raw_seconds = 60 WHERE id = ?").run(end, a2.sessionId);
+    const w2 = D.workSecondsByTask([t]).get(t);
+    ok(w2.people === 6, '⭐同じ拠点の 2 回目は延べで足さない (いちばん多かった人数のまま)');
+    ok(w2.seconds === 360 + 120, '時間はちゃんと足す (2 回目の 60 秒 × 2 人)');
+    // 記録の検索でも同じ数え方
+    const found = D.searchSessions({ q: '人数の検査 crew-9' });
+    ok(found.summary.workers === 6, '⭐記録の検索でも人数は 6 人 (拠点ごとに数える)');
+    ok(found.summary.totalSeconds === 480, '検索の合計も人時');
+  }
+
+  // ⑨ ⭐crew_size が NULL 可の途中版は作り直す (Codex R1 中3)
+  {
+    const probe = new (await import('better-sqlite3')).default(':memory:');
+    const cur = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='f_iroha_work_sessions'").get().sql;
+    // 「列も CHECK もあるが crew_size が NULL 可」の版を作る
+    const weak = cur.replace('crew_size      INTEGER NOT NULL DEFAULT 1 CHECK (crew_size >= 1 AND crew_size <= 50)', 'crew_size INTEGER')
+      .replace('REFERENCES f_iroha_tasks(id)', '').replace('REFERENCES f_iroha_facilities(code)', '')
+      .replace('REFERENCES f_iroha_task_batches(id)', '');
+    ok(!/crew_size      INTEGER NOT NULL/.test(weak), '(前提) crew_size が NULL 可の版を用意');
+    probe.exec(weak);
+    const info = probe.prepare('PRAGMA table_info(f_iroha_work_sessions)').all();
+    const c = info.find((x) => x.name === 'crew_size');
+    ok(c && (c.notnull !== 1 || String(c.dflt_value) !== '1'),
+      '⭐この版は「NOT NULL・既定値 1」ではない = 作り直しの対象と分かる');
+    // 実害: crew_size が NULL だと、その行の実測が合計から静かに消える
+    probe.exec("INSERT INTO f_iroha_work_sessions (task_id, worker_id, worker_name, started_at, ended_at, raw_seconds) VALUES (1, 1, 'x', 'a', 'b', 3600)");
+    const lost = probe.prepare('SELECT SUM(COALESCE(raw_seconds, 0) * crew_size) AS s FROM f_iroha_work_sessions').get().s;
+    ok(lost === null, '⭐crew_size が NULL だと 3600 秒が合計から消える (だから作り直しが要る)');
+    probe.close();
+  }
+
   // ── 画面 ──
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
   ok(html.includes('function sessionWho(a)') && html.includes("a.worker_name ? a.worker_name + 'さん' : facilityName(a.facility_code)"),
@@ -7299,9 +7394,36 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
   ok(html.includes('opts && opts.crewSize != null ? Number(opts.crewSize)'),
     '⭐止まっている札の確認から戻るときは、そのとき入れた人数を使う (入力欄を読み直さない)');
   ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
+  // ⭐これまでの作業も 人時 で出す (Codex R1 の「日報・履歴の整合は未確認」への答え)。
+  //   関数を実際に動かして、出てくる文言を見る
+  {
+    const src = html.match(/function historyCardHtml\(c\) \{[\s\S]*?\r?\n\}/)[0];
+    const render = (rows) => new Function('esc', 'fmtDate', 'fmtTime', 'fmtDurHist', 'fmtDur', 'sessionWho', 'END_REASON',
+      src + '; return historyCardHtml;')(
+      (x) => String(x == null ? '' : x), () => '9/7', () => '10:00',
+      (n) => n + '秒', (n) => n + '秒',
+      (a) => (a.worker_name ? a.worker_name + 'さん' : 'パレット ' + (a.crew_size || 1) + '人'),
+      { done: 'できあがり' })({ work_history: rows });
+    const one = render([{ worker_name: 'やまだ', crew_size: 1, raw_seconds: 60, started_at: 'a', ended_at: 'b', end_reason: 'done' }]);
+    ok(one.includes('やまださん') && one.includes('合計 60秒'), '個人の記録は今までどおり');
+    ok(!one.includes('×'), '1 人のときに「× 1人」と書かない');
+    const crew = render([{ worker_name: null, facility_code: 'rehas', crew_size: 3, raw_seconds: 60, started_at: 'a', ended_at: 'b', end_reason: 'done' }]);
+    ok(crew.includes('パレット 3人') && !crew.includes('— さん'),
+      '⭐人数だけの記録は「パレット 3人」と出す (「— さん」にしない)');
+    ok(crew.includes('60秒 × 3人 = 180秒'), '⭐かかった時間と人時のどちらも隠さない');
+    ok(crew.includes('合計 180秒'), '⭐合計は人時 (60 × 3)');
+  }
   const rt3 = fs.readFileSync(new URL('../apps/iroha-work/router.js', import.meta.url), 'utf8');
   ok(rt3.includes("router.post('/api/sessions/start-crew'") && rt3.includes('requireStaffPlan(req)'),
     '人数だけの開始は職員だけ');
+  // ⭐日報 (きょうのみんなの作業) も人時・拠点ごとにする
+  ok(rt3.includes('const heads = s.worker_id == null ? (s.crew_size || 1) : 1;')
+    && rt3.includes('const sec = Math.floor(overlapMs / 1000) * heads;'),
+    '⭐日報も 人時 で数える');
+  ok(rt3.includes("const key = s.worker_id == null ? 'f:' + s.facility_code : 'w:' + Number(s.worker_id);"),
+    '⭐日報は拠点ごとに分ける (Number(null) = 0 で 1 人ぶんに潰さない)');
+  ok(rt3.includes('workers: workers.reduce((a, x) => a + (x.heads || 1), 0),'),
+    '⭐日報の人数も行数ではなく人数で数える');
   const sw5 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
   ok(new RegExp(`const CACHE = '${SW_CACHE}'`).test(sw5), '画面キャッシュの版を上げる');
 }

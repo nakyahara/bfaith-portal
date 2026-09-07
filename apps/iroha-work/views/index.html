@@ -3911,11 +3911,19 @@ const END_REASON = { done: 'できあがり', pause: '中断', admin: '職員が
 function historyCardHtml(c) {
   const rows = c.work_history || [];
   if (rows.length === 0) return '';
-  const total = rows.reduce((a, r) => a + (Number(r.raw_seconds) || 0), 0);
-  const items = rows.map(r =>
-    '<li><b>' + esc(r.worker_name || '—') + '</b> さん ・ ' + esc(fmtDate(r.started_at) + ' ' + fmtTime(r.started_at)) +
-    ' 〜 ' + esc(fmtTime(r.ended_at)) + ' ・ ' + esc(fmtDurHist(Number(r.raw_seconds) || 0)) +
-    ' ・ ' + esc(END_REASON[r.end_reason] || r.end_reason || '—') + '</li>').join('');
+  // ⭐合計は **人時** (秒 × 人数)。個人は 1 人なので今までと同じ数字 (要件 §AB-10)
+  const total = rows.reduce((a, r) => a + (Number(r.raw_seconds) || 0) * (r.crew_size || 1), 0);
+  const items = rows.map(r => {
+    const raw = Number(r.raw_seconds) || 0;
+    const heads = r.worker_name ? 1 : (r.crew_size || 1);
+    // 人数だけの記録は「1時間 × 3人 = 3時間」と書く。かかった時間と人時のどちらも隠さない
+    const dur = heads > 1
+      ? fmtDurHist(raw) + ' × ' + heads + '人 = ' + fmtDurHist(raw * heads)
+      : fmtDurHist(raw);
+    return '<li><b>' + esc(sessionWho(r) || '—') + '</b> ・ ' + esc(fmtDate(r.started_at) + ' ' + fmtTime(r.started_at)) +
+      ' 〜 ' + esc(fmtTime(r.ended_at)) + ' ・ ' + esc(dur) +
+      ' ・ ' + esc(END_REASON[r.end_reason] || r.end_reason || '—') + '</li>';
+  }).join('');
   return '<div class="dcard"><h3 class="sec">これまでの作業 — このカード</h3>' +
     '<ul class="whist">' + items + '</ul>' +
     '<p class="est num">合計 ' + esc(fmtDur(total)) + ' (' + rows.length + '回)</p></div>';
