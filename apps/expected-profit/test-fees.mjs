@@ -911,6 +911,17 @@ await ta('[!] リトライのあとも次のバッチまで間隔をあける', 
 console.log('');
 console.log('待たされた順に取る (Codex R10-1: 見積が無いものどうしの飢餓)');
 
+t('[!] 同時刻のものは入力順に左右されない (実行をまたいで同じ順番)', () => {
+  // 🚨 前夜 [A,B] / 翌夜 [B,A] の入力で順番が入れ替わると、待ち行列として意味を持たない
+  const a = nd('missing', 'skuA');
+  const b = nd('missing', 'skuB');
+  const same = '2026-09-08T00:00:00Z';
+  const q = new Map([[cacheKey(a.target), same], [cacheKey(b.target), same]]);
+  const first = allocateFetchBudget([a, b], 1, { queuedAt: q })[0].target.seller_sku;
+  const second = allocateFetchBudget([b, a], 1, { queuedAt: q })[0].target.seller_sku;
+  assert.equal(first, second, `入力順で結果が変わる (${first} / ${second})`);
+});
+
 t('[!] 見積が無いものどうしは「待ち行列に入った時刻」で並ぶ (入力順にしない)', () => {
   // 🚨 一律 -Infinity にすると全部同順位 → 結局は入力順のまま。
   //    新規が先頭に積まれ続けると、前の晩に溢れた対象が毎晩選ばれない
@@ -1020,9 +1031,9 @@ t('pruneQueue は残すキーを1つも消さない', () => {
   db.exec('DELETE FROM amazon_fee_queue');
 });
 
-await ta('[!] 複数晩まわしても、前の晩に溢れた対象が必ず進む (飢餓しない)', async () => {
-  // 🚨 これが本命。毎晩「新規が先頭に積まれる」状況を再現して、
-  //    最初に待ちに入った対象が置き去りにならないことを見る
+await ta('[!] 新規が毎晩積み上がっても、古い対象が必ず進む (飢餓しない)', async () => {
+  // 🚨 これが本命。毎晩「新規が先頭に積まれ、しかも前の晩の新規も残る」状況を再現する。
+  //    前の晩の新規を入力から消してしまうと、負荷が積み上がらず検証にならない (Codex R11-2)
   forgetSeller();
   db.exec('DELETE FROM amazon_fee_estimate');
   db.exec('DELETE FROM amazon_fee_failure');
@@ -1038,21 +1049,38 @@ await ta('[!] 複数晩まわしても、前の晩に溢れた対象が必ず進
       }),
     });
   };
+  const doneOf = (list) => list.filter(t => fetched.has(t.seller_sku)).length;
 
-  // 1晩目: 古い対象 40 件 (20件しか取れない)
+  // 1晩目: 古い対象 40 件 (上限20なので半分しか取れない)
   const oldOnes = Array.from({ length: 40 }, (_, i) => target({ seller_sku: 'old' + i }));
-  await runNight(oldOnes, '2026-09-01T00:00:00Z');
-  const doneAfterNight1 = oldOnes.filter(t => fetched.has(t.seller_sku)).length;
-  assert.equal(doneAfterNight1, 20, '1晩目は上限どおり20件');
+  let all = [...oldOnes];
+  await runNight(all, '2026-09-01T00:00:00Z');
+  assert.equal(doneOf(oldOnes), 20, '1晩目は上限どおり20件');
 
-  // 2〜4晩目: 毎晩 40 件の新規が**先頭に**積まれる
-  for (let night = 2; night <= 4; night++) {
-    const fresh = Array.from({ length: 40 }, (_, i) => target({ seller_sku: `new${night}_${i}` }));
-    await runNight([...fresh, ...oldOnes], `2026-09-0${night}T00:00:00Z`);
+  // 2〜5晩目: 毎晩 30 件の新規が**先頭に積まれ、前の晩の分も残る** (需要が供給を上回る)
+  const nights = [];
+  for (let night = 2; night <= 5; night++) {
+    const fresh = Array.from({ length: 30 }, (_, i) => target({ seller_sku: `new${night}_${i}` }));
+    nights.push(fresh);
+    all = [...fresh, ...all];                      // 新規を先頭に積み、前の分は消さない
+    await runNight(all, `2026-09-0${night}T00:00:00Z`);
   }
-  const doneAfterNight4 = oldOnes.filter(t => fetched.has(t.seller_sku)).length;
-  assert.equal(doneAfterNight4, 40,
-    `4晩まわせば古い40件は全部取れているはず (実際 ${doneAfterNight4})。新規に押しのけられている`);
+
+  // 古い40件は「いちばん長く待っている」ので、真っ先に片づいていること
+  assert.equal(doneOf(oldOnes), 40,
+    `いちばん古い40件が終わっていない (実際 ${doneOf(oldOnes)})。新規に押しのけられている`);
+  // あとから来たものほど残っている = 待たされた順に処理されている
+  assert.ok(doneOf(nights[0]) >= doneOf(nights[3]),
+    `古い晩の新規より、新しい晩の新規が先に取られている: ${nights.map(doneOf).join(',')}`);
+});
+
+await ta('[!] 未取得のまま残った対象は、待ち行列から消えない', () => {
+  // 🚨 pruneQueue は「今夜キャッシュに当たらなかったキー」を残す。
+  //    上限で溢れただけの対象を消してしまうと、翌晩また最後尾に並び直す
+  const size = db.prepare('SELECT COUNT(*) c FROM amazon_fee_queue').get().c;
+  assert.ok(size > 0, `上限で溢れた対象が待ち行列に残っていない (${size})`);
+  db.exec('DELETE FROM amazon_fee_queue');
+  db.exec('DELETE FROM amazon_fee_estimate');
 });
 
 db.close();

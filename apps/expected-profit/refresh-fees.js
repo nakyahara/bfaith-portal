@@ -64,6 +64,17 @@ const FEE_MAX_FETCH_PER_RUN = 4000;
  * 🚨 これが無いと、毎晩 4,000 件以上の「新規 / 入力変更」が出続けたときに
  *    期限切れへ永久に枠が回らない (Codex R9-1)。
  *    枠を分けたうえで、余った枠は相手側に回す (無駄にしない)。
+ *
+ * 🚨 **「どの出品も必ずいつかは取れる」とまでは言えない** (Codex R11)。
+ *    次の3つは、この仕組みだけでは救えない:
+ *      1. 同じキーが永久に失敗する (カタログ側の問題)
+ *         → 最長14日で必ずやり直すが、成功はしない。夜間ログの「失敗待ちN」で人が見る
+ *      2. 取れないまま毎晩 価格が変わる → キーが変わるたびに待ち位置がリセットされる
+ *         → 1晩の上限に届くほど対象が多いときだけ問題になる。今は 0/7,390 なので届いていない
+ *      3. 古い失敗の再試行が枠を占め続ける
+ *         → 失敗は待ち日数が伸びるので、時間とともに薄まる
+ *    いずれも「上限に毎晩ぶつかっている」状態が前提。そうなったら
+ *    夜間ログの「翌晩に回したN」が続くので、そこで気づける。
  */
 const EXPIRED_QUOTA_RATIO = 0.25;
 
@@ -89,8 +100,11 @@ export function allocateFetchBudget(need, maxFetch, { expiredRatio = EXPIRED_QUO
     const t = Date.parse(n.cached?.fetched_at ?? '');
     return Number.isFinite(t) ? t : 0;
   };
-  const fresh = need.filter(n => !isExpired(n)).sort((a, b) => age(a) - age(b));
-  const expired = need.filter(isExpired).sort((a, b) => age(a) - age(b));
+  // 🚨 同時刻のものは、その回の入力順に左右されないよう **キーで固定する** (Codex R11)。
+  //    前夜 [A,B] / 翌夜 [B,A] の入力でも、同じ順番で取りに行く
+  const byAgeThenKey = (a, b) => (age(a) - age(b)) || feeCacheKey(a.target).localeCompare(feeCacheKey(b.target));
+  const fresh = need.filter(n => !isExpired(n)).sort(byAgeThenKey);
+  const expired = need.filter(isExpired).sort(byAgeThenKey);
   if (maxFetch >= need.length) return [...fresh, ...expired];
 
   const expiredQuota = Math.min(expired.length, Math.floor(maxFetch * expiredRatio));
