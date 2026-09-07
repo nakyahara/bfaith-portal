@@ -116,7 +116,7 @@ ok('再取り込みしても判断履歴は消えない');
 // ⭐同一ミリ秒に判断が2件入っても、一覧が重複しないこと。
 //   MAX(decided_at) で最新を選んでいた頃は、二重送信や別タブの同時操作で
 //   2行とも「最新」になり、テーマが重複表示され件数まで水増しされた。
-const dupTarget = listConcepts({ snapshotId: snap.snapshot_id, gate: 'pass', status: 'undecided', limit: 1 }, db)[0];
+const dupTarget = listConcepts({ snapshotId: snap.snapshot_id, gate: 'pass', status: 'all', limit: 1 }, db)[0];
 const sameMs = '2026-09-20T00:00:00.000Z';
 const rawInsert = db.prepare(
   'INSERT INTO scout_decisions (decision_id, concept_id, decision, decided_by, decided_at, metrics_json)'
@@ -167,17 +167,18 @@ ok('DB制約でも不採用理由なしは弾かれる');
 //   「自社で販売中」「前に出して撤退した」を判断材料として出せるようにする。
 const sample = listConcepts({ snapshotId: snap.snapshot_id, gate: 'all', status: 'all', limit: 2 }, db);
 const ownPayload = {
+  generatedAt: new Date().toISOString(), sourceGeneratedAt: new Date().toISOString(),
   families: [
     // 候補テーマと同じ (categoryPath, form) にすると concept_id が一致して紐づく
     { familyKey: '既に売っている商品', categoryPath: sample[0].category_path, form: sample[0].form,
-      amcCapable: true, skuCount: 3, asinCount: 3, launchedOn: '2023-04-01', lastSoldOn: '2026-08-01',
+      salesClass: 1, amcCapable: true, skuCount: 3, asinCount: 3, launchedOn: '2023-04-01', lastSoldOn: '2026-08-01',
       qty180: 1200, qtyAll: 9000, activeSkus: 3, discontinuedSkus: 0, medianPrice: 880, outcome: 'active' },
     { familyKey: '撤退した商品', categoryPath: sample[0].category_path, form: sample[0].form,
-      amcCapable: true, skuCount: 2, asinCount: 1, launchedOn: '2020-03-05', lastSoldOn: '2021-06-01',
+      salesClass: 1, amcCapable: true, skuCount: 2, asinCount: 1, launchedOn: '2020-03-05', lastSoldOn: '2021-06-01',
       qty180: 40, qtyAll: 120, activeSkus: 0, discontinuedSkus: 2, medianPrice: 700, outcome: 'withdrawn' },
     // カテゴリが取れなかったファミリーも捨てずに持つ (後でカテゴリが付くかもしれない)
     { familyKey: 'カテゴリ不明の商品', categoryPath: null, form: 'その他 (要判定)',
-      amcCapable: null, skuCount: 1, asinCount: 0, launchedOn: '2024-01-01', lastSoldOn: null,
+      salesClass: 1, amcCapable: null, skuCount: 1, asinCount: 0, launchedOn: '2024-01-01', lastSoldOn: null,
       qty180: null, qtyAll: 0, activeSkus: 1, discontinuedSkus: 0, medianPrice: 500, outcome: 'active' },
   ],
 };

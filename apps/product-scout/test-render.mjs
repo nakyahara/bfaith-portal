@@ -40,11 +40,11 @@ ingestSnapshot(payload, db);
 const snap = getLatestSnapshot(db);
 const categories = listCategories(snap.snapshot_id, db);
 const sample = listConcepts({ snapshotId: snap.snapshot_id, gate: 'all', status: 'all', limit: 1 }, db)[0];
-ingestOwnFamilies({ families: [
-  { familyKey: '自社の既存商品', categoryPath: sample.category_path, form: sample.form, amcCapable: true,
+ingestOwnFamilies({ generatedAt: new Date().toISOString(), sourceGeneratedAt: new Date().toISOString(), families: [
+  { familyKey: '自社の既存商品', categoryPath: sample.category_path, form: sample.form, salesClass: 1, amcCapable: true,
     skuCount: 3, asinCount: 2, launchedOn: '2023-04-01', lastSoldOn: '2026-08-01', qty180: 1200,
     qtyAll: 9000, activeSkus: 3, discontinuedSkus: 0, medianPrice: 880, outcome: 'active' },
-  { familyKey: '撤退した商品', categoryPath: sample.category_path, form: sample.form, amcCapable: true,
+  { familyKey: '撤退した商品', categoryPath: sample.category_path, form: sample.form, salesClass: 1, amcCapable: true,
     skuCount: 2, asinCount: 1, launchedOn: '2020-03-05', lastSoldOn: '2021-06-01', qty180: 40,
     qtyAll: 120, activeSkus: 0, discontinuedSkus: 2, medianPrice: 700, outcome: 'withdrawn' },
 ] }, db);
@@ -101,9 +101,10 @@ const withOwn = ejs.render(template, {
   gate: 'all', status: 'all', page: 1, pageSize: 40, total: 1, totalPages: 1,
   reasonCodes: REASON_CODES, signal: { level: 'green', title: 'x', detail: 'y' },
 }, { filename: path.join(__dirname, 'views/index.ejs') });
-assert.ok(withOwn.includes('自社で販売中') || withOwn.includes('過去に出して撤退した'),
+assert.ok(withOwn.includes('同カテゴリ・工程の自社商品（取扱中）') || withOwn.includes('同カテゴリ・工程の自社商品に終売あり'),
   '自社実績が画面に出ていない');
-assert.ok(withOwn.includes('下限'), '不完全な分母が「下限」と表示されていない');
+assert.ok(withOwn.includes('抽出済み対象内'), '不完全な分母で母集団全体の進捗と誤認させない');
+assert.ok(!withOwn.includes('総月販(下限)'), 'ASIN購入表示を市場の下限と呼ばない');
 console.log('  ✓ 自社実績と「下限%」が画面に出る');
 passed++;
 

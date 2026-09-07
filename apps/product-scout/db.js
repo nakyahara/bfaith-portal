@@ -13,6 +13,7 @@
  *   不採用理由の蓄積こそが資産なので、履歴を消せない構造にしてある (DBトリガーで UPDATE/DELETE 禁止)。
  */
 import crypto from 'node:crypto';
+import { validateSnapshot, validateOwnPayload } from './validation.js';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 
 // テストと本番で同じコードを通すため、DBハンドルを差し替えられるようにしておく。
@@ -46,14 +47,13 @@ export function jstDate(d = new Date()) {
  * 途中で落ちたら丸ごと無かったことにする — 半分だけ新しい画面を人に見せない。
  */
 export function ingestSnapshot(payload, handle) {
+  validateSnapshot(payload);
   const db = resolveDb(handle);
   const now = utcIsoNow();
   // ⭐IDは中身から決める。`now` を混ぜると同じファイルを送り直すたび別スナップショットになり、
   //   「バッチは何度でも再実行してよい」が成り立たなくなる (画面に同じ内容が二重に積もる)。
-  const snapshotId = payload.snapshotId
-    || crypto.createHash('sha1')
-      .update(`${payload.generatedAt}|${payload.algorithmVersion ?? 1}|${(payload.concepts || []).length}`)
-      .digest('hex').slice(0, 16);
+  const snapshotId = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex').slice(0, 32);
+
 
   const insSnap = db.prepare(`
     INSERT INTO scout_snapshots (snapshot_id, generated_at, ingested_at, algorithm_version,
@@ -80,13 +80,13 @@ export function ingestSnapshot(payload, handle) {
       amc_capable, hard_gate, gate_fail_reason, commodity, big_brand,
       product_count, total_monthly_sold, brand_count, top1_brand, top1_share_pct, top3_share_pct,
       median_price, median_fee_pct, small_size_rate_pct, ascii_brand_rate_pct, median_review_count,
-      source_complete, source_fetched_at, examples_json, rank_in_snapshot, first_seen_at, updated_at)
+      source_complete, source_fetched_at, examples_json, rank_in_snapshot, first_seen_at, updated_at, quality_json)
     VALUES (
       @conceptId, @snapshotId, @concept, @categoryPath, @rootCategoryName, @form,
       @amcCapable, @hardGate, @gateFailReason, @commodity, @bigBrand,
       @productCount, @totalMonthlySold, @brandCount, @top1Brand, @top1SharePct, @top3SharePct,
       @medianPrice, @medianFeePct, @smallSizeRatePct, @asciiBrandRatePct, @medianReviewCount,
-      @sourceComplete, @sourceFetchedAt, @examplesJson, @rank, @now, @now)
+      @sourceComplete, @sourceFetchedAt, @examplesJson, @rank, @now, @now, @qualityJson)
     ON CONFLICT(concept_id) DO UPDATE SET
       snapshot_id = excluded.snapshot_id, concept = excluded.concept,
       root_category_name = excluded.root_category_name, form = excluded.form,
@@ -101,11 +101,17 @@ export function ingestSnapshot(payload, handle) {
       median_review_count = excluded.median_review_count,
       source_complete = excluded.source_complete, source_fetched_at = excluded.source_fetched_at,
       examples_json = excluded.examples_json, rank_in_snapshot = excluded.rank_in_snapshot,
-      updated_at = excluded.updated_at
+      updated_at = excluded.updated_at, quality_json = excluded.quality_json
       -- first_seen_at は更新しない (そのテーマを初めて見た日を残す)
   `);
 
   const run = db.transaction(() => {
+    const latest = getLatestSnapshot(db);
+    if (latest && (Date.parse(payload.generatedAt) < Date.parse(latest.generated_at)
+        || (latest.algorithm_version >= 2 && (payload.algorithmVersion || 1) < 2))) {
+      throw Object.assign(new Error('古いスナップショットで最新データを上書きできません'), { status: 409 });
+    }
+    if (db.prepare('SELECT 1 FROM scout_snapshots WHERE snapshot_id=?').get(snapshotId)) return;
     insSnap.run(snapshotId, payload.generatedAt, now, payload.algorithmVersion ?? 1,
       payload.sourceProducts ?? null, payload.afterBaseFilter ?? null,
       (payload.concepts || []).length, payload.lastProgressAt ?? null, payload.remainingTotal ?? null);
@@ -153,12 +159,13 @@ export function ingestSnapshot(payload, handle) {
           ? null : (c.sourceComplete ? 1 : 0),
         sourceFetchedAt: c.sourceFetchedAt ?? null,
         examplesJson: JSON.stringify(c.examples || []),
+        qualityJson: JSON.stringify(c.quality || null),
         rank: c.rank ?? null,
         now,
       });
     }
   });
-  run();
+  run.immediate();
   return { snapshotId, concepts: (payload.concepts || []).length, categories: (payload.collection || []).length };
 }
 
@@ -170,15 +177,16 @@ export function ingestSnapshot(payload, handle) {
  *   同じテーマが候補に出てきたときに「前に出して撤退した」と言えるようになる。
  */
 export function ingestOwnFamilies(payload, handle) {
+  validateOwnPayload(payload);
   const db = resolveDb(handle);
   const now = utcIsoNow();
   const ins = db.prepare(`
     INSERT INTO scout_own_families (family_key, snapshot_id, concept_id, category_path, form,
       amc_capable, sku_count, asin_count, launched_on, last_sold_on, qty180, qty_all,
-      active_skus, discontinued_skus, median_price, outcome, updated_at)
+      active_skus, discontinued_skus, median_price, outcome, updated_at, sales_class, products_json, source_generated_at, own_batch_id)
     VALUES (@familyKey, @snapshotId, @conceptId, @categoryPath, @form,
       @amcCapable, @skuCount, @asinCount, @launchedOn, @lastSoldOn, @qty180, @qtyAll,
-      @activeSkus, @discontinuedSkus, @medianPrice, @outcome, @now)
+      @activeSkus, @discontinuedSkus, @medianPrice, @outcome, @now, @salesClass, @productsJson, @sourceGeneratedAt, @ownBatchId)
     ON CONFLICT(family_key) DO UPDATE SET
       snapshot_id = excluded.snapshot_id, concept_id = excluded.concept_id,
       category_path = excluded.category_path, form = excluded.form,
@@ -186,13 +194,27 @@ export function ingestOwnFamilies(payload, handle) {
       asin_count = excluded.asin_count, launched_on = excluded.launched_on,
       last_sold_on = excluded.last_sold_on, qty180 = excluded.qty180, qty_all = excluded.qty_all,
       active_skus = excluded.active_skus, discontinued_skus = excluded.discontinued_skus,
-      median_price = excluded.median_price, outcome = excluded.outcome, updated_at = excluded.updated_at
+      median_price = excluded.median_price, outcome = excluded.outcome, updated_at = excluded.updated_at,
+      sales_class = excluded.sales_class, products_json = excluded.products_json,
+      source_generated_at = excluded.source_generated_at, own_batch_id = excluded.own_batch_id
   `);
   const latest = getLatestSnapshot(handle);
+  const sourceTime = payload.algorithmVersion >= 2 ? (payload.sourceUpdatedAt || null) : (payload.sourceGeneratedAt || null);
+  const ownBatchId = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
   const run = db.transaction(() => {
+    const previous = getOwnImport(db);
+    if (previous && (!payload.generatedAt || Date.parse(payload.generatedAt) < Date.parse(previous.generated_at))) {
+      throw Object.assign(new Error('古い自社商品データで上書きできません'), { status: 409 });
+    }
+    if (db.prepare('SELECT 1 FROM scout_own_imports WHERE batch_id=?').get(ownBatchId)) return;
+    db.prepare('INSERT INTO scout_own_imports VALUES (?, ?, ?, ?, ?)').run(
+      ownBatchId, payload.generatedAt || now, sourceTime, payload.families.length, now);
     for (const f of payload.families || []) {
       ins.run({
         familyKey: f.familyKey,
+        salesClass: [1, 2].includes(f.salesClass) ? f.salesClass : null,
+        productsJson: JSON.stringify(f.products || []),
+        sourceGeneratedAt: sourceTime, ownBatchId,
         snapshotId: latest ? latest.snapshot_id : null,
         // カテゴリが取れなかったファミリーは concept_id を持たない (テーマに載せられない)
         conceptId: f.categoryPath ? conceptIdOf(f.categoryPath, f.form) : null,
@@ -213,7 +235,7 @@ export function ingestOwnFamilies(payload, handle) {
       });
     }
   });
-  run();
+  run.immediate();
   const placed = (payload.families || []).filter((f) => f.categoryPath).length;
   return { families: (payload.families || []).length, placed };
 }
@@ -225,7 +247,7 @@ export function ingestOwnFamilies(payload, handle) {
 /** 最新スナップショット (無ければ null) */
 export function getLatestSnapshot(handle) {
   const db = resolveDb(handle);
-  return db.prepare('SELECT * FROM scout_snapshots ORDER BY ingested_at DESC LIMIT 1').get() || null;
+  return db.prepare('SELECT * FROM scout_snapshots ORDER BY julianday(generated_at) DESC, rowid DESC LIMIT 1').get() || null;
 }
 
 /** 収集の工程表。⭐complete=0 のカテゴリは「下限」としてしか読めないので、そのまま返して画面で明示する */
@@ -278,18 +300,21 @@ export function listConcepts({ snapshotId, gate = 'pass', status = 'undecided', 
     LEFT JOIN (
       SELECT concept_id,
              COUNT(*)                                        AS own_count,
-             SUM(CASE WHEN outcome = 'active' THEN 1 ELSE 0 END)    AS own_active,
+             SUM(CASE WHEN outcome IN ('active', 'shrinking') THEN 1 ELSE 0 END)    AS own_active,
              SUM(CASE WHEN outcome = 'withdrawn' THEN 1 ELSE 0 END) AS own_withdrawn,
-             SUM(COALESCE(qty180, 0))                        AS own_qty180,
+             CASE WHEN COUNT(qty180) = COUNT(*) THEN SUM(qty180) END AS own_qty180,
              GROUP_CONCAT(family_key, ' / ')                 AS own_names
-      FROM scout_own_families WHERE concept_id IS NOT NULL GROUP BY concept_id
+      FROM scout_own_families WHERE concept_id IS NOT NULL AND sales_class = 1
+        AND own_batch_id = (SELECT batch_id FROM scout_own_imports ORDER BY julianday(generated_at) DESC, rowid DESC LIMIT 1)
+        AND julianday(source_generated_at) BETWEEN julianday('now', '-2 days') AND julianday('now', '+5 minutes')
+      GROUP BY concept_id
     ) o ON o.concept_id = c.concept_id
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY c.rank_in_snapshot
     LIMIT @limit OFFSET @offset
   `;
   const rows = db.prepare(sql).all({ ...params, limit, offset });
-  return rows.map((r) => ({ ...r, examples: safeJson(r.examples_json) }));
+  return rows.map((r) => ({ ...r, examples: safeJson(r.examples_json), quality: safeJson(r.quality_json) }));
 }
 
 /** listConcepts と同じ条件での総件数 (ページ送りに必要) */
@@ -334,7 +359,7 @@ export function getConcept(conceptId, handle) {
   const history = db.prepare(
     'SELECT * FROM scout_decisions WHERE concept_id = ? ORDER BY decided_at DESC'
   ).all(conceptId);
-  return { ...c, examples: safeJson(c.examples_json), history };
+  return { ...c, examples: safeJson(c.examples_json), quality: safeJson(c.quality_json), history };
 }
 
 function safeJson(s) {
@@ -391,7 +416,7 @@ export function recordDecision({ conceptId, decision, reasonCode, comment, reche
     // ⭐数字だけでなく、判断したときに画面に出ていた文言と代表商品も固定する。
     //   取り込みでテーマ名やカテゴリが更新されると、過去の判断が「何を見て決めたか」を失う
     concept: concept.concept, categoryPath: concept.category_path, form: concept.form,
-    examples: safeJson(concept.examples_json),
+    examples: safeJson(concept.examples_json), quality: safeJson(concept.quality_json),
     productCount: concept.product_count, totalMonthlySold: concept.total_monthly_sold,
     brandCount: concept.brand_count, top1Brand: concept.top1_brand,
     top1SharePct: concept.top1_share_pct, medianPrice: concept.median_price,
@@ -420,4 +445,20 @@ export function recordDecision({ conceptId, decision, reasonCode, comment, reche
   }).immediate();
 
   return { decisionId };
+}
+
+export function getOwnImport(handle) {
+  return resolveDb(handle).prepare('SELECT * FROM scout_own_imports ORDER BY julianday(generated_at) DESC, rowid DESC LIMIT 1').get() || null;
+}
+
+/** 既存の取り込み認証で確認する、商品明細を含まない反映状態。 */
+export function getIngestStatus(handle) {
+  const db=resolveDb(handle);
+  const snapshot=getLatestSnapshot(db);
+  const ownImport=getOwnImport(db);
+  return { qualityVersion: 2, snapshot, ownImport,
+    concepts: snapshot ? countConcepts(snapshot.snapshot_id,db) : null,
+    ownCounts: ownImport ? db.prepare('SELECT sales_class, COUNT(*) AS families, SUM(sku_count) AS skus FROM scout_own_families WHERE own_batch_id=? GROUP BY sales_class').all(ownImport.batch_id) : [],
+    decisionCount: db.prepare('SELECT COUNT(*) AS n FROM scout_decisions').get().n,
+  };
 }

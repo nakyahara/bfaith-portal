@@ -26,8 +26,8 @@ ok('DDL が通る / 冪等');
 const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'scout_%'")
   .all().map((r) => r.name).sort();
 assert.deepStrictEqual(tables,
-  ['scout_categories', 'scout_concepts', 'scout_decisions', 'scout_own_families', 'scout_snapshots']);
-ok('5テーブルが作られる');
+  ['scout_categories', 'scout_concepts', 'scout_decisions', 'scout_own_families', 'scout_own_imports', 'scout_snapshots']);
+ok('6テーブルが作られる');
 
 // 下ごしらえ
 db.prepare(`INSERT INTO scout_snapshots (snapshot_id, generated_at, ingested_at, algorithm_version,

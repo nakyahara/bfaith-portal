@@ -20,7 +20,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'url';
 import {
   ingestSnapshot, ingestOwnFamilies, getLatestSnapshot, listCategories, listConcepts, countConcepts,
-  getConcept, recordDecision, countMatching, REASON_CODES,
+  getConcept, recordDecision, countMatching, REASON_CODES, getOwnImport, getIngestStatus,
 } from './db.js';
 import { productScoutInitError } from '../warehouse-mirror/db.js';
 
@@ -47,6 +47,16 @@ function guardTables(req, res, next) {
 // ─────────────────────────────────────────────────────────────
 // ⚠️セッションを持てないバッチからの呼び出しなので、共有鍵で認証する。
 //   鍵が未設定なら通さない (fail-closed)。素通りさせると誰でも画面の中身を差し替えられる。
+// 読み取り確認も既存の取り込み鍵で保護する。商品明細・認証情報は返さない。
+ingestRouter.get('/status', guardTables, (req, res) => {
+  const key = process.env.MIRROR_SYNC_KEY;
+  if (!key) return res.status(503).json({ error: 'MIRROR_SYNC_KEY 未設定' });
+  const a = Buffer.from(String(req.headers['x-sync-key'] || ''));
+  const b = Buffer.from(key);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'unauthorized' });
+  return res.json(getIngestStatus());
+});
+
 ingestRouter.post('/', express.json({ limit: '32mb' }), guardTables, (req, res) => {
   const key = process.env.MIRROR_SYNC_KEY;
   if (!key) return res.status(503).json({ error: 'MIRROR_SYNC_KEY 未設定' });
@@ -78,7 +88,7 @@ ingestRouter.post('/', express.json({ limit: '32mb' }), guardTables, (req, res) 
     // 画面の信号がこの値で判定するので、読めない値を黙って入れさせない
     return res.status(400).json({ error: 'lastProgressAt が日時として読めません' });
   }
-  const badConcept = payload.concepts.find((c) => !c || typeof c.categoryPath !== 'string'
+  const badConcept = payload.concepts.some((c) => !c || typeof c.categoryPath !== 'string'
     || typeof c.form !== 'string' || !c.categoryPath || !c.form);
   if (badConcept) {
     return res.status(400).json({ error: 'categoryPath と form は必須です (テーマの安定キーに使うため)' });
@@ -91,7 +101,7 @@ ingestRouter.post('/', express.json({ limit: '32mb' }), guardTables, (req, res) 
     // 未認証でも到達しうる経路なので、内部の詳細は返さず追跡IDだけ返す
     const traceId = crypto.randomBytes(4).toString('hex');
     console.error('[product-scout] 取り込み失敗 (' + traceId + '):', e.message);
-    res.status(500).json({ error: '取り込みに失敗しました', traceId });
+    res.status(e.status || 500).json({ error: e.status ? e.message : '取り込みに失敗しました', traceId });
   }
 });
 
@@ -115,7 +125,7 @@ ingestRouter.post('/own', express.json({ limit: '8mb' }), guardTables, (req, res
   if (payload.families.length > 20000) {
     return res.status(413).json({ error: 'ファミリーが多すぎます' });
   }
-  const bad = payload.families.find((f) => !f || !f.familyKey
+  const bad = payload.families.some((f) => !f || !f.familyKey
     || !['active', 'withdrawn', 'shrinking'].includes(f.outcome));
   if (bad) {
     return res.status(400).json({ error: 'familyKey と outcome (active|withdrawn|shrinking) は必須です' });
@@ -127,7 +137,7 @@ ingestRouter.post('/own', express.json({ limit: '8mb' }), guardTables, (req, res
   } catch (e) {
     const traceId = crypto.randomBytes(4).toString('hex');
     console.error('[product-scout] 自社商品の取り込み失敗 (' + traceId + '):', e.message);
-    res.status(500).json({ error: '取り込みに失敗しました', traceId });
+    res.status(e.status || 500).json({ error: e.status ? e.message : '取り込みに失敗しました', traceId });
   }
 });
 
@@ -141,7 +151,7 @@ ingestRouter.post('/own', express.json({ limit: '8mb' }), guardTables, (req, res
  *   正常終了しているのに仕事が無い (= 次のカテゴリが未投入) を緑にしたせいで、
  *   2026-08-07〜27 の20日間、誰も止まっていることに気づかなかった。
  */
-function buildSignal(snapshot, categories, counts) {
+export function buildSignal(snapshot, categories, counts) {
   if (!snapshot) {
     return { level: 'gray', title: 'まだ取り込みがありません',
       detail: 'miniPC で node concepts.js → node push.js を実行すると、ここに出ます' };
@@ -149,7 +159,7 @@ function buildSignal(snapshot, categories, counts) {
   const notStarted = categories.filter((c) => c.state === 'not_started');
   const incomplete = categories.filter((c) => c.complete === 0);
   const remaining = categories.reduce((n, c) => n + (c.remaining || 0), 0);
-  const ageH = (Date.now() - Date.parse(snapshot.ingested_at)) / 3600000;
+  const ageH = (Date.now() - Date.parse(snapshot.generated_at)) / 3600000;
   // ⚠️「残件があるか」だけで動いていると判断してはいけない。
   //   Keepa が返さない数件はいつまでも残るので、それを「収集中」と呼ぶと
   //   止まっていても永久に緑になる (直したはずの空回りが別の形で戻る)。
@@ -157,9 +167,12 @@ function buildSignal(snapshot, categories, counts) {
   const progressMs = snapshot.last_progress_at ? Date.parse(snapshot.last_progress_at) : NaN;
   const progressH = Number.isFinite(progressMs) ? (Date.now() - progressMs) / 3600000 : null;
 
+  if (!Number.isFinite(ageH) || ageH < -5 / 60 || (progressH != null && progressH < -5 / 60)) {
+    return { level: 'yellow', title: '更新日時を確認できません', detail: '生成日時と商品観測の記録を確認してください' };
+  }
   if (ageH > 48) {
     return { level: 'red', title: 'データが更新されていません',
-      detail: `最後の取り込みは ${Math.floor(ageH / 24)}日前。miniPC の毎日14:00タスクが動いているか確認してください` };
+      detail: `最後の集計は ${Math.floor(ageH / 24)}日前。miniPC の毎日14:00タスクが動いているか確認してください` };
   }
   // ⚠️前進時刻が無い・読めないときに緑へ抜けさせない。
   //   「判定できない」を「問題なし」にするのは、まさに20日間の空回りを隠した思考なので、
@@ -196,7 +209,7 @@ router.get('/', guardTables, (req, res) => {
   const status = ['undecided', 'adopt', 'reject', 'hold', 'all'].includes(req.query.status)
     ? req.query.status : 'undecided';
   // 約2,000テーマあるので、上位だけ見て終わりにできない。ページで送れるようにする
-  const page = Math.max(1, Math.min(500, Number(req.query.page) || 1));
+  const page = Math.max(1, Math.min(500, Math.floor(Number(req.query.page)) || 1));
   const offset = (page - 1) * PAGE_SIZE;
   const total = countMatching({ snapshotId, gate, status });
   const concepts = listConcepts({ snapshotId, gate, status, limit: PAGE_SIZE, offset });
@@ -204,7 +217,7 @@ router.get('/', guardTables, (req, res) => {
   res.render(path.join(__dirname, 'views/index'), {
     username: req.session?.email,
     displayName: req.session?.displayName,
-    snapshot, categories, counts, concepts, gate, status,
+    snapshot, categories, counts, concepts, gate, status, ownImport: getOwnImport(),
     page, pageSize: PAGE_SIZE, total, totalPages: Math.max(1, Math.ceil(total / PAGE_SIZE)),
     reasonCodes: REASON_CODES,
     signal: buildSignal(snapshot, categories, counts),
