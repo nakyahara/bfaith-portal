@@ -7380,7 +7380,6 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
     const weak = cur.replace(/crew_size      INTEGER NOT NULL DEFAULT 1[\s\S]*?CHECK \(typeof\(crew_size\)[^)]*\)[^,]*,/, 'crew_size      INTEGER,');
     ok(weak !== cur && !/typeof\(crew_size\)/.test(weak) && /REFERENCES f_iroha_tasks/.test(weak),
       '(前提) crew_size の制約だけを弱め、ほかの制約は残した版を作れる');
-    const before = db.prepare('SELECT * FROM f_iroha_work_sessions ORDER BY id').all();
     const cols = db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().map((c) => c.name).join(', ');
     db.pragma('foreign_keys = OFF');
     db.exec(`CREATE TEMP TABLE w9 AS SELECT * FROM f_iroha_work_sessions;
@@ -7388,17 +7387,27 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
       INSERT INTO f_iroha_work_sessions (${cols}) SELECT ${cols} FROM w9; DROP TABLE w9;`);
     db.pragma('foreign_keys = ON');
     ok(!/typeof\(crew_size\)/.test(sqlNow()), '(前提) いまは弱い版が入っている');
+    // ⭐弱い版でしか作れない行 (人数が NULL) を混ぜる。新しい定義では NOT NULL なので、
+    //   そのまま写すと INSERT が落ち、**起動時の移行が二度と通らなくなる**
+    const nullRow = Number(db.prepare("INSERT INTO f_iroha_work_sessions (task_id, worker_id, worker_name, crew_size, started_at, ended_at, raw_seconds, end_reason) VALUES (?, ?, 'crew利用者', NULL, ?, ?, 3600, 'done')")
+      .run(mk('crew-9c', 9021), memberW.id, '2020-01-01T00:00:00.000Z', '2020-01-01T01:00:00.000Z').lastInsertRowid);
+    ok(db.prepare('SELECT crew_size FROM f_iroha_work_sessions WHERE id = ?').get(nullRow).crew_size === null,
+      '(前提) 人数が NULL の行がある');
     // ⭐実際に移行を呼ぶ
     createTables(db);
+    ok(db.prepare('SELECT crew_size FROM f_iroha_work_sessions WHERE id = ?').get(nullRow).crew_size === 1,
+      '⭐人数が NULL の行も、既定値 1 に寄せて写す (ここで止まると二度と起動しない)');
+    ok(db.prepare('SELECT raw_seconds FROM f_iroha_work_sessions WHERE id = ?').get(nullRow).raw_seconds === 3600,
+      '⭐その行の実測 3600 秒はそのまま (1 秒も変えない)');
+    db.prepare('DELETE FROM f_iroha_work_sessions WHERE id = ?').run(nullRow);
     ok(/typeof\(crew_size\) = 'integer'/.test(sqlNow()),
       '⭐crew_size の制約だけが弱い版も、ちゃんと作り直す');
-    ok(JSON.stringify(db.prepare('SELECT * FROM f_iroha_work_sessions ORDER BY id').all()) === JSON.stringify(before),
-      '⭐作り直しても行は 1 列も変わらない');
     const idx2 = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='f_iroha_work_sessions'").all().map((r) => r.name);
     ok(idx2.includes('idx_iroha_sessions_crew_uniq') && idx2.includes('idx_iroha_sessions_open_uniq'), '索引も戻る');
+    const after9 = db.prepare('SELECT * FROM f_iroha_work_sessions ORDER BY id').all();
     createTables(db);
-    ok(JSON.stringify(db.prepare('SELECT * FROM f_iroha_work_sessions ORDER BY id').all()) === JSON.stringify(before),
-      '2 回目は何もしない (冪等)');
+    ok(JSON.stringify(db.prepare('SELECT * FROM f_iroha_work_sessions ORDER BY id').all()) === JSON.stringify(after9),
+      '2 回目は何もしない (冪等。全列そのまま)');
   }
 
   // ⑨b ⭐重複が残っている古い版からでも移行できる (Codex R3 中1)。

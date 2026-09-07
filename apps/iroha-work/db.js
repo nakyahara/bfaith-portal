@@ -424,10 +424,13 @@ function migrateSessionMediaSchema(db) {
         db.exec(`DROP TABLE IF EXISTS ${tmp}`);   // 中断で残った作業表があれば捨てる (行は元の表にある)
         db.exec(ddl(tmp));
         const newCols = db.prepare(`PRAGMA table_info(${tmp})`).all().map((c) => c.name);
-        const oldCols = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
-        const cols = newCols.filter((c) => oldCols.has(c));
+        // ⭐写し方は カード・ラベル待ち の作り直しと同じ copyCols を使う。
+        //   新しい定義で「NOT NULL だが既定値がある」列 (人数 crew_size など) に古い行の NULL が
+        //   あっても、既定値に寄せて写す。ここで止まると**起動時の移行が二度と通らず、
+        //   アプリが起動しなくなる** (自分で見つけた穴。#1258 4 巡目の前)
+        const cc = copyCols(db, table, tmp, newCols);
         const before = db.prepare(`SELECT COUNT(*) c FROM ${table}`).get().c;
-        db.exec(`INSERT INTO ${tmp} (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM ${table}`);
+        db.exec(`INSERT INTO ${tmp} (${cc.names.join(', ')}) SELECT ${cc.exprs.join(', ')} FROM ${table}`);
         const after = db.prepare(`SELECT COUNT(*) c FROM ${tmp}`).get().c;
         if (before !== after) throw new Error(`${table} の作り直しを中止しました (件数不一致 ${before} → ${after})`);
         db.exec(`DROP TABLE ${table}`);
