@@ -238,11 +238,59 @@ console.log('── PR-7: 同じ伝票の複数タスクは1つの 🔴 バッ�
     assert.equal(listLines(b304).length, 2, '行はそのまま');
     assert.equal(db.prepare('SELECT status FROM pk_batches WHERE id=?').get(b304).status, 'picking');
   });
+  t('Codex R1: 行のタスクが一部読めないうちは畳まない (fail-closed)', () => {
+    const r1 = createRepickBatch({ ...slip, batch_id: 52, slip_seq: 1, id: 321, sku: 'x-a' });
+    createRepickBatch({ ...slip, batch_id: 52, slip_seq: 1, id: 322, sku: 'x-b' });
+    ins(321, 'x-a', 'cancelled');   // 322 の行は pk_pack_tasks に無い
+    db.prepare('UPDATE pk_pack_tasks SET batch_id=52, slip_seq=1 WHERE id=321').run();
+    assert.equal(reconcileRepickBatches(), 0);
+    const b = db.prepare('SELECT status, line_count FROM pk_batches WHERE id=?').get(r1.batchId);
+    assert.equal(b.status, 'ready', '畳まない');
+    assert.equal(b.line_count, 2, '行も外さない');
+  });
   t('reconcile ①: 全部取下げ → バッチごと取消', () => {
     db.prepare("UPDATE pk_pack_tasks SET status='cancelled' WHERE id=302").run();
     assert.equal(reconcileRepickBatches(), 1);
     const b = db.prepare('SELECT status, validity FROM pk_batches WHERE id=?').get(gid);
     assert.deepEqual([b.status, b.validity], ['cancelled', 'invalid']);
+  });
+}
+
+console.log('── v18 マイグレーション (v17 形式の DB から) ──');
+{
+  // v17 形式に戻す: 追加列と索引を落とし、旧形式の1行バッチを置いてから初期化し直す (initPickingDB は再実行で migrate)
+  db.exec('DROP INDEX IF EXISTS idx_pk_lines_pack_task');
+  db.exec('DROP INDEX IF EXISTS idx_pk_batches_repick_slip');
+  db.exec('ALTER TABLE pk_lines DROP COLUMN pack_task_id');
+  db.exec('ALTER TABLE pk_batches DROP COLUMN pack_batch_id');
+  db.exec('ALTER TABLE pk_batches DROP COLUMN pack_slip_seq');
+  db.pragma('user_version = 17');
+  db.prepare(`INSERT INTO pk_pack_tasks (id, status, kind, sku, batch_id, slip_seq) VALUES (401, 'requested', 'repick', 'mig-a', 60, 4)`).run();
+  db.prepare(`INSERT INTO pk_batches (tb_no, hikiate_class, work_date, composition, line_count, slip_count, total_qty, status, validity,
+    csv_sha256, imported_by, created_at, updated_at, origin, pack_task_id)
+    VALUES ('REPICK-401', 'x', '2026-09-07', '単品', 1, 1, 1, 'ready', 'valid', 's401', 't', 'a', 'a', 'repick', 401)`).run();
+  const mb = Number(db.prepare("SELECT id FROM pk_batches WHERE tb_no='REPICK-401'").get().id);
+  db.prepare("INSERT INTO pk_lines (batch_id, seq, location, sku, qty) VALUES (?, 1, '00100101', 'mig-a', 1)").run(mb);
+  const db2 = initPickingDB();
+  t('v17 → v18: 既存の1行バッチは行に pack_task_id、バッチに合流キーが入る', () => {
+    assert.equal(db2.pragma('user_version', { simple: true }), 18);
+    assert.equal(db2.prepare('SELECT pack_task_id FROM pk_lines WHERE batch_id=?').get(mb).pack_task_id, 401);
+    const b = db2.prepare('SELECT pack_batch_id, pack_slip_seq FROM pk_batches WHERE id=?').get(mb);
+    assert.deepEqual([b.pack_batch_id, b.pack_slip_seq], [60, 4]);
+    assert.equal(db2.prepare('SELECT COUNT(*) AS c FROM pk_lines WHERE pack_task_id IS NOT NULL').get().c > 1, true, '他の再ピック行も埋まる');
+  });
+  t('v17 → v18 (pk_pack_tasks が無い環境): 合流キーは NULL のまま通る', () => {
+    db2.exec('DROP INDEX IF EXISTS idx_pk_lines_pack_task');
+    db2.exec('DROP INDEX IF EXISTS idx_pk_batches_repick_slip');
+    db2.exec('ALTER TABLE pk_lines DROP COLUMN pack_task_id');
+    db2.exec('ALTER TABLE pk_batches DROP COLUMN pack_batch_id');
+    db2.exec('ALTER TABLE pk_batches DROP COLUMN pack_slip_seq');
+    db2.exec('ALTER TABLE pk_pack_tasks RENAME TO pk_pack_tasks_hidden');
+    db2.pragma('user_version = 17');
+    const db3 = initPickingDB();
+    assert.equal(db3.pragma('user_version', { simple: true }), 18);
+    assert.equal(db3.prepare('SELECT pack_task_id FROM pk_lines WHERE batch_id=?').get(mb).pack_task_id, 401);
+    assert.equal(db3.prepare('SELECT pack_batch_id FROM pk_batches WHERE id=?').get(mb).pack_batch_id, null);
   });
 }
 

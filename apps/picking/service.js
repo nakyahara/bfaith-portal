@@ -508,15 +508,19 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
     // 同じ伝票の複数タスクが1バッチに入る (PR-7) ので、行に紐づくタスクを全部見る: 全部取下げなら 409、一部なら続行
     if (batch.origin === 'repick' && batch.pack_task_id && batch.status !== 'done') {
       let tasks = [];
+      let ids = [];
       try {
-        const ids = repickTaskIdsOf(db, batchId, batch);
+        ids = [...new Set(repickTaskIdsOf(db, batchId, batch))];
         tasks = ids.length ? db.prepare(`SELECT id, status, close_reason FROM pk_pack_tasks WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids) : [];
       } catch (e) {
         // pk_pack_tasks が無い環境 (packing 無効) だけ無視。DB 障害・スキーマ不整合で「取下げ済みかどうか」を
         // 確認できないまま操作を通さない (Codex PR-6 R3)
         if (!/no such table: pk_pack_tasks/.test(String(e.message))) throw e;
       }
-      if (tasks.length > 0 && tasks.every((t) => t.status === 'cancelled')) {
+      // 行に紐づくタスクを全部読めたときだけ「全部取下げ」と判定する (読めない行があるのに畳まない — Codex PR-7 R1)
+      if (tasks.length > 0 && tasks.length !== ids.length) {
+        console.warn(`[picking] 再ピックバッチ ${batchId} のタスクが一部見つかりません (期待 ${ids.join(',')} / 実際 ${tasks.map((t) => t.id).join(',')})`);
+      } else if (tasks.length > 0 && tasks.every((t) => t.status === 'cancelled')) {
         // ここで UPDATE しても throw でトランザクションごとロールバックされる (Codex 2巡目)。
         // 操作は409で拒否し、実際の取消は一覧表示時の reconcileRepickBatches が行う。
         // 理由 (1階で見つかった) はバナーだけに頼らず、ここにも出す (バナーは他の端末の OK で消える — Codex PR-6 R1)
@@ -1599,6 +1603,7 @@ export function createRepickBatch(task) {
   const db = getDB();
   const now = utcNow();
   const tbNo = `REPICK-${task.id}`;
+  // BEGIN IMMEDIATE: 「未着手か」の確認と行の追加を他接続の start と直列化する (Codex PR-7 R1 High)
   return db.transaction(() => {
     // 冪等: このタスクの行が既にあれば (単独バッチでも、同じ伝票のバッチに合流済みでも) 作らない
     const existing = db.prepare('SELECT id FROM pk_batches WHERE tb_no = ?').get(tbNo)
@@ -1612,13 +1617,14 @@ export function createRepickBatch(task) {
       const group = db.prepare(`SELECT id, repick_reason FROM pk_batches WHERE origin = 'repick' AND validity = 'valid' AND status = 'ready'
         AND pack_batch_id = ? AND pack_slip_seq = ? AND (repick_reason IS NULL OR repick_reason != 'later') ORDER BY id DESC LIMIT 1`)
         .get(task.batch_id, task.slip_seq);
-      if (group) {
+      // 件数の更新は「まだ未着手」を条件にし、通らなければ (直前に start された) 合流せず新規バッチへ
+      const joined = group && db.prepare(`UPDATE pk_batches SET line_count = line_count + 1, total_qty = total_qty + ?, composition = '複数SKU', updated_at = ?
+        WHERE id = ? AND status = 'ready' AND validity = 'valid'`).run(task.req_qty, now, group.id).changes === 1;
+      if (joined) {
         const seq = (db.prepare('SELECT MAX(seq) AS m FROM pk_lines WHERE batch_id=?').get(group.id).m || 0) + 1;
         db.prepare(`INSERT INTO pk_lines (batch_id, seq, location, block, sku, product_name, barcode, qty, pack_task_id)
           VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)`)
           .run(group.id, seq, task.location || '', task.block || null, task.sku, task.product_name || null, task.req_qty, task.id);
-        db.prepare(`UPDATE pk_batches SET line_count = line_count + 1, total_qty = total_qty + ?, composition = '複数SKU', updated_at = ? WHERE id = ?`)
-          .run(task.req_qty, now, group.id);
         // 不足と品違いが混ざったら、バッチの名前は汎用の「不足」に (取る動作は同じ = 表示の SKU を取って届ける)。
         // 未確定 (NULL) の方は触らない = reconcile ③ が最初のタスクから埋める
         if (group.repick_reason && reason && group.repick_reason !== reason && group.repick_reason !== 'shortage') {
@@ -1645,7 +1651,7 @@ export function createRepickBatch(task) {
       VALUES (?, 1, ?, ?, ?, ?, NULL, ?, ?)
     `).run(batchId, task.location || '', task.block || null, task.sku, task.product_name || null, task.req_qty, task.id);
     return { batchId, existed: false };
-  })();
+  }).immediate();
 }
 
 /**
@@ -1671,11 +1677,16 @@ export function reconcileRepickBatches() {
     const rows = [];
     for (const b of openBatches) {
       const lines = db.prepare('SELECT seq, qty, pack_task_id FROM pk_lines WHERE batch_id=? ORDER BY seq').all(b.id);
-      const ids = lines.map((l) => l.pack_task_id).filter(Boolean);
+      const ids = [...new Set(lines.map((l) => l.pack_task_id).filter(Boolean))];
       if (ids.length === 0 && b.pack_task_id) ids.push(b.pack_task_id);
       if (ids.length === 0) continue;
       const tasks = db.prepare(`SELECT id, status FROM pk_pack_tasks WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
       if (tasks.length === 0) continue;
+      if (tasks.length !== ids.length) {
+        // 読めない行があるうちは畳まない・外さない (fail-closed — Codex PR-7 R1)
+        console.warn(`[picking] 再ピックバッチ ${b.id} のタスクが一部見つかりません (期待 ${ids.join(',')} / 実際 ${tasks.map((t) => t.id).join(',')}) — 整理を見送り`);
+        continue;
+      }
       const cancelled = new Set(tasks.filter((t) => t.status === 'cancelled').map((t) => t.id));
       if (cancelled.size === 0) continue;
       if (cancelled.size >= tasks.length) {
@@ -1687,13 +1698,16 @@ export function reconcileRepickBatches() {
       const drop = lines.filter((l) => l.pack_task_id && cancelled.has(l.pack_task_id));
       if (drop.length === 0) continue;
       db.transaction(() => {
+        // ロックを取ってから「まだ未着手か」を読み直す (別接続の start と競合させない — Codex PR-7 R1 High)
+        const cur = db.prepare('SELECT status, validity FROM pk_batches WHERE id=?').get(b.id);
+        if (!cur || cur.status !== 'ready' || cur.validity !== 'valid') return;
         for (const l of drop) db.prepare('DELETE FROM pk_lines WHERE batch_id=? AND seq=?').run(b.id, l.seq);
         const left = db.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(qty), 0) AS q, MIN(pack_task_id) AS t FROM pk_lines WHERE batch_id=?').get(b.id);
         // 同期キー (pack_task_id) が取下げ済みなら残った行のタスクへ付け替える
         const key = cancelled.has(b.pack_task_id) ? (left.t || b.pack_task_id) : b.pack_task_id;
         db.prepare(`UPDATE pk_batches SET line_count=?, total_qty=?, composition=?, pack_task_id=?, updated_at=? WHERE id=?`)
           .run(left.c, left.q, left.c > 1 ? '複数SKU' : '単品', key, now, b.id);
-      })();
+      }).immediate();
     }
     // ②バッチ未生成の再ピックタスクを拾って生成 (Codexレビュー: resolve時の生成が
     // 一時障害で失敗しても、一覧を開くたびにここで必ず収束する。tb_no / pk_lines.pack_task_id で冪等)

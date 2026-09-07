@@ -362,6 +362,15 @@ console.log('── 複数タスクのバッチ: 一部が1階で取下げ ─�
     assert.equal(taskStatus(tA), 'claimed');
     assert.equal(taskStatus(tB), 'cancelled', '取下げ済みは触らない');
   });
+  t('Codex R1: 行のタスクが一部読めないときは「全部取下げ」と見なさない (操作は通る)', () => {
+    // 行 → 存在しない task id を指す (障害・不整合の再現)
+    db.prepare('UPDATE pk_lines SET pack_task_id=999999 WHERE batch_id=? AND pack_task_id=?').run(rb.id, tA);
+    db.prepare("UPDATE pk_pack_tasks SET status='cancelled' WHERE id=?").run(tA);
+    ev(rb.id, 'pause', {}, '田中美波');   // 例外にならない
+    ev(rb.id, 'resume', {}, '田中美波');
+    db.prepare('UPDATE pk_lines SET pack_task_id=? WHERE batch_id=? AND pack_task_id=999999').run(tA, rb.id);
+    db.prepare("UPDATE pk_pack_tasks SET status='claimed' WHERE id=?").run(tA);
+  });
   t('全部取下げなら 409 repick_cancelled', () => {
     db.prepare("UPDATE pk_pack_tasks SET status='cancelled', close_reason='found' WHERE id=?").run(tA);
     throwsCode(() => ev(rb.id, 'next', { lineSeq: 1 }, '田中美波'), 'repick_cancelled', '全部取下げ → 409');
