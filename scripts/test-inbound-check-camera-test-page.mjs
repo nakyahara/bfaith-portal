@@ -83,6 +83,8 @@ ok(/endedAt = Math\.round\(now\(\) - grantedAt\)/.test(html),
 ok(/document\.visibilityState/.test(html), '表示状態も残す (裏に回った瞬間に切れていないか)');
 ok(/isSecureContext/.test(html), 'https かどうかも出す (http だとカメラは使えない)');
 ok(/window\.navigator\.standalone/.test(html), 'ホーム画面から開いたかを出す');
+ok(/id="where"/.test(html) && /ホーム画面のアプリの中<\/b>で開いています/.test(html),
+  '🚨 押す前に、どちらで開いているかを大きく出す (読み取り画面と同じ開き方でないと比べられない)');
 ok(/進み=/.test(html) && !/コマ=/.test(html),
   '「進み」と呼ぶ (実際のコマ数ではなく 0.5 秒ごとの更新検出回数なので)');
 
@@ -132,7 +134,7 @@ console.log('\n[7] 取得は1試行1回 (保留中に別のボタンを押して
     play() { return Promise.resolve(); },
   });
   const nodes = {};
-  for (const id of ['log', 'v', 'verdict', 'start', 'startBack', 'stop', 'copy']) nodes[id] = el();
+  for (const id of ['log', 'v', 'verdict', 'start', 'startBack', 'stop', 'copy', 'where']) nodes[id] = el();
 
   let calls = 0;
   let settle = null;
@@ -160,6 +162,12 @@ console.log('\n[7] 取得は1試行1回 (保留中に別のボタンを押して
 
   vm.createContext(ctx);
   vm.runInContext(script, ctx, { timeout: 5000 });
+
+  // 🚨 押す前に「どちらで開いているか」が出ている (2回続けて Safari で測ってしまった件)
+  ok(/ブラウザ \(Safari\) で開いています/.test(nodes.where.innerHTML)
+    && /比べる相手になりません/.test(nodes.where.innerHTML),
+    '🚨 ブラウザで開いていることが、押す前に分かる');
+  ok(nodes.where.className.includes('browser'), '色でも分かる (ブラウザ = 注意色)');
 
   nodes.start.click();                       // 1回目 — 取得は保留のまま
   await new Promise((r) => setImmediate(r));

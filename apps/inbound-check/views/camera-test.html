@@ -19,6 +19,11 @@
   .verdict.ok { display: block; background: #d3f9d8; color: #2b8a3e; }
   .verdict.ng { display: block; background: #ffe3e3; color: #a61e1e; }
   .note { font-size: 0.85em; color: #868e96; max-width: 640px; margin-top: 10px; line-height: 1.6; }
+  /* 🚨 どちらで開いているかを**押す前に**はっきり出す。2026-09-07 に、ホーム画面アプリで
+     試したつもりが2回続けて Safari で計測されていたため */
+  .where { border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; font-size: 0.95em; line-height: 1.6; max-width: 640px; }
+  .where.app { background: #d0ebff; color: #1864ab; }
+  .where.browser { background: #fff3bf; color: #7a5c00; }
 </style>
 </head>
 <body>
@@ -28,6 +33,7 @@
   カメラを1回だけ開いて、10秒ぶんの様子をそのまま出します。
   <br><b>映像はこの画面に表示するだけで、保存も送信もしません。</b>
 </p>
+<div class="where" id="where"></div>
 <div class="row">
   <button class="go" id="start">カメラを開く</button>
   <button id="startBack">背面カメラで試す</button>
@@ -53,6 +59,18 @@
   var v = document.getElementById('v');
   var verdict = document.getElementById('verdict');
   var startBtn = document.getElementById('start');
+  // 🚨 押す前に「いまどちらで開いているか」を出す。読み取り画面と同じ開き方で測らないと比べられない
+  (function () {
+    var w = document.getElementById('where');
+    var standalone = !!(window.navigator.standalone
+      || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+    w.className = 'where ' + (standalone ? 'app' : 'browser');
+    w.innerHTML = standalone
+      ? '✅ <b>ホーム画面のアプリの中</b>で開いています。読み取り画面と同じ条件です。'
+      : '⚠ <b>ブラウザ (Safari) で開いています。</b>読み取り画面をホーム画面のアイコンから使っているなら、'
+        + '<b>この結果は比べる相手になりません</b>。'
+        + '<br>ホーム画面のアイコンからアプリを開き →「商品を探す」→ 説明の下の「カメラの動作確認」から入り直してください。';
+  })();
   var backBtn = document.getElementById('startBack');
   // 🚨 1回の試行につき取得は1回だけ。連打や「取得待ち中に止める」で複数の取得が並走すると、
   //    先のストリームを止められなくなり、切り分けそのものが汚れる
