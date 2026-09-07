@@ -319,6 +319,7 @@
     }
 
     let scanStream = null, scanTimer = null, scanStarting = false, scanGen = 0, scanCanvas = null, scanWatchTimer = null;
+    let scanRetryTimer = null;   // 取り直しの予約。**停止したら必ず解除する** (Codex #1239 R1 P1)
     // 🚨 実機で「カメラが切れました」が出たとき、**何がいつ起きたか**を現場から聞けるようにする
     //    (2026-09-07。getUserMedia は成功したのにトラックが即 ended になる = 端末側が手放している)。
     //    ホーム画面アイコン (standalone) から開いた iPad で起きやすい
@@ -355,12 +356,16 @@
       const tryIndex = Math.min(cameraTry, CAMERA_TRIES.length - 1);
       try { stream = await navigator.mediaDevices.getUserMedia(CAMERA_TRIES[tryIndex]); }
       catch (e) {
-        // 条件が強すぎて掴めないだけなら、緩めてもう一度 (画面には出さない)
-        if (cameraTry < CAMERA_TRIES.length - 1
+        // 🚨 **古い要求が遅れて失敗しても、いまの起動には触らない** (Codex #1239 R1 P1)。
+        //    条件を飛ばしたり、閉じたあとにエラーを出したりしないため
+        if (gen !== scanGen) return;
+        // 条件が強すぎて掴めないだけなら、緩めてもう一度 (画面には出さない)。
+        // 次の条件は **この試行の tryIndex + 1**。共有値を足すと、別の起動と取り合って条件が飛ぶ
+        if (tryIndex < CAMERA_TRIES.length - 1
             && e && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError' || e.name === 'NotReadableError')) {
-          cameraTry++;
+          cameraTry = tryIndex + 1;
           endStarting();
-          setTimeout(() => { startScan(); }, 200);
+          scheduleRescan(200);
           return;
         }
         // 何が起きたかで打つ手が違う。「許可してください」だけだと、カメラが無い/塞がっているときに現場が設定をいじり続ける
@@ -425,13 +430,17 @@
         if (endedAt !== null) bits.push('ended@' + endedAt + 'ms');
         if (track) bits.push('track=' + track.readyState + (track.muted ? '/muted' : ''));
         bits.push('video=' + v.readyState);
-        if (playError) bits.push('play=' + (playError.name || playError.message || 'NG'));
+        // 🚨 自由文字列は出さない (カメラ名やエラー本文に何が入るか保証できない — Codex #1239 R1)。
+        //    出すのは **決まった語彙だけ**: エラーは name / カメラは facingMode と解像度
+        if (playError) bits.push('play=' + (playError.name || 'NG'));
         bits.push('条件' + (tryIndex + 1) + '/' + CAMERA_TRIES.length);
         if (track) {
-          if (track.label) bits.push(String(track.label).slice(0, 24));
           try {
             const st = track.getSettings ? track.getSettings() : null;
-            if (st && st.width) bits.push(st.width + 'x' + st.height);
+            if (st) {
+              if (st.facingMode) bits.push(String(st.facingMode));
+              if (st.width) bits.push(st.width + 'x' + st.height);
+            }
           } catch (e) { /* 取れなくてよい */ }
         }
         bits.push(isStandalone() ? 'ホーム画面' : 'ブラウザ');
@@ -467,18 +476,16 @@
         // カメラが切れた (他アプリに取られた / 端末が閉じた) — 待つ意味がないので即やめる
         if (track && track.readyState === 'ended') {
           const heldMs = endedAt !== null ? endedAt : Math.round(now() - startedAt);
+          // 🚨 **診断は止める前に取る**。stopScan() が track.stop() を呼ぶと readyState が
+          //    ended に変わり、直前まで live だったのか muted だったのか分からなくなる (R1 P2)
+          const snapshot = diag();
           clearInterval(scanWatchTimer); scanWatchTimer = null;
           stopScan();
-          // 🚨 **すぐ落ちたときは1回だけ取り直す**。iOS は最初のストリームだけ即死して、
-          //    取り直すと通ることがある (許可ダイアログの直後など)
           // 🚨 つないだ直後に切れたら、**次の (より緩い) 条件**で取り直す。同じ条件を繰り返さない
-          if (heldMs < 3000 && cameraTry < CAMERA_TRIES.length - 1) {
-            cameraTry++;
-            // 取り直しに入れるように「起動中」の札を先に外す (stopScan は札を触らない)
-            scanStarting = false;
-            const b = $('#scanBtn'); if (b) b.disabled = false;
+          if (heldMs < 3000 && tryIndex < CAMERA_TRIES.length - 1) {
+            cameraTry = tryIndex + 1;
             banner('warn', 'カメラをつなぎ直しています… (' + (cameraTry + 1) + '/' + CAMERA_TRIES.length + ')');
-            setTimeout(() => { startScan(); }, 400);
+            scheduleRescan(400);
             return;
           }
           banner('err', 'カメラが切れました' + (heldMs < 3000 ? ' (つないだ直後に切れています)' : '')
@@ -489,18 +496,19 @@
                 + '全画面にしてからもう一度押してください。</b>')
             + '他のアプリがカメラを使っていないかも確かめてください。'
             + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます'
-            + '<br><small>' + esc(diag()) + '</small>', { sticky: true });
+            + '<br><small>' + esc(snapshot) + '</small>', { sticky: true });
           return;
         }
         if (!BarcodeScanDecide.videoStalled(videoWatch, now())) return;
+        const snapshot = diag();   // 止める前に取る (stop() が track の状態を書き換えるため)
         stopScan();
         banner('err', 'カメラの映像が出ませんでした'
-          + (playError ? ' (' + esc(playError.name || playError.message || '') + ')' : (track && track.muted ? ' (映像が届いていません)' : ''))
+          + (playError ? ' (' + esc(playError.name || 'NG') + ')' : (track && track.muted ? ' (映像が届いていません)' : ''))
           + '。' + (isStandalone()
             ? 'ホーム画面のアイコンから開いた状態ではカメラを使えないことがあります。Safari で開いて試してみてください。'
             : '他のアプリがカメラを使っていないか確かめてください。')
           + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます'
-          + '<br><small>' + esc(diag()) + '</small>', { sticky: true });
+          + '<br><small>' + esc(snapshot) + '</small>', { sticky: true });
       }, 500);
 
       // 🚨 autoplay 属性だけに頼らない。**明示的に play() する**。
@@ -582,13 +590,31 @@
       };
       scanTimer = setTimeout(tick, 400);
     }
+    /**
+     * 取り直しの予約。🚨**予約した時点の世代を覚えておき、途中で止められていたら走らせない**
+     * (Codex #1239 R1 P1)。予約だけ生き残ると、閉じたあとにカメラが勝手に開く
+     */
+    function scheduleRescan(ms) {
+      clearTimeout(scanRetryTimer);
+      const at = scanGen;
+      scanRetryTimer = setTimeout(() => {
+        scanRetryTimer = null;
+        if (at !== scanGen) return;                // 予約後に止められた / 別の起動が始まった
+        startScan();
+      }, ms);
+    }
     function stopScan() {
       scanGen++;                                   // 起動待ちの getUserMedia が返ってきても使わせない
+      clearTimeout(scanRetryTimer); scanRetryTimer = null;    // 予約済みの取り直しも取り消す
       clearTimeout(scanTimer); scanTimer = null;
       clearInterval(scanWatchTimer); scanWatchTimer = null;   // 映像の見張りも必ず止める
       if (scanStream) { for (const tr of scanStream.getTracks()) { try { tr.stop(); } catch (e) { /* 止められなければ放す */ } } scanStream = null; }
       const v = $('#scanVideo'); if (v) v.srcObject = null;
       $('#scanBox').classList.remove('on');
+      // 🚨 世代が変わると古い endStarting() は何もしないので、**停止側で必ず戻す**。
+      //    でないと「起動中」の札が掛かったままボタンが押せなくなる (Codex #1239 R1)
+      scanStarting = false;
+      const b = $('#scanBtn'); if (b) b.disabled = false;
     }
     async function onScanned(code) {
       stopScan();

@@ -453,22 +453,42 @@ console.log('\n[9] 画面が安全弁を通している (退行防止)');
 
   // 🚨 2026-09-07 実機2回目: getUserMedia は成功するのにトラックが即 ended になった。
   //    原因を現場から聞き取れる形にしておく (経過ms / track / video / play / どこから開いたか)
-  ok(/const diag = \(\) =>/.test(html) && /esc\(diag\(\)\)/.test(html),
+  ok(/const diag = \(\) =>/.test(html) && /esc\(snapshot\)/.test(html),
     '🚨 打ち切りの案内に診断 (経過ms・track・video・play・起動元) を添える');
+  // 🚨 stop() は readyState を ended に変えるので、止める前に取らないと状態が失われる
+  ok(html.indexOf('const snapshot = diag();') < html.indexOf('stopScan();\n          // 🚨 つないだ直後'),
+    '🚨 診断は止める前に取る (stop() が track の状態を書き換える)');
+  ok(!/track\.label/.test(html) && !/playError\.message/.test(html),
+    '🚨 診断に自由文字列 (カメラ名・エラー本文) を出さない');
+  ok(/st\.facingMode/.test(html), 'カメラは facingMode と解像度だけ出す');
   ok(/track\.addEventListener\('ended'/.test(html),
     'ended を直接拾って「いつ切れたか」を残す (500ms の見張りより早い)');
   ok(/isStandalone/.test(html) && /window\.navigator\.standalone/.test(html),
     'ホーム画面 (standalone) から開いたかを見て案内を変える');
   ok(/const CAMERA_TRIES = \[/.test(html) && /video: true/.test(html),
     '🚨 カメラの条件を段階的に緩める (iPad は条件が強いと掴めても即切れることがある)');
-  ok(/heldMs < 3000 && cameraTry < CAMERA_TRIES\.length - 1/.test(html),
+  ok(/heldMs < 3000 && tryIndex < CAMERA_TRIES\.length - 1/.test(html),
     'つないだ直後に切れたら、次の (より緩い) 条件で取り直す');
-  ok(/OverconstrainedError/.test(html) && /cameraTry\+\+/.test(html),
+  ok(/OverconstrainedError/.test(html) && /cameraTry = tryIndex \+ 1/.test(html),
     '条件が強すぎて掴めないときも、緩めて取り直す');
+  // 🚨 共有値を足すと、別の起動と取り合って条件が飛ぶ
+  ok(!/cameraTry\+\+/.test(html), '🚨 次の条件は共有値の加算ではなく、その試行の tryIndex + 1 から決める');
   ok(/cameraTry = 0; startScan\(\)/.test(html), 'ボタンを押し直したら条件を最初から');
   ok(/Split View/.test(html), 'iPad で画面を2分割していると使えないことを案内する');
-  ok(html.indexOf("scanStarting = false;") < html.indexOf("setTimeout(() => { startScan(); }"),
-    '取り直しの前に「起動中」の札を外す (外さないと取り直しが素通りする)');
+  // 🚨 予約だけ生き残ると、閉じたあとにカメラが勝手に開く (Codex #1239 R1 P1)
+  ok(/function scheduleRescan\(ms\)/.test(html) && /const at = scanGen;/.test(html)
+    && /if \(at !== scanGen\) return;/.test(html),
+    '🚨 取り直しの予約は、予約した時点の世代を見てから走る (止められていたら開かない)');
+  ok(!/setTimeout\(\(\) => \{ startScan\(\); \}/.test(html),
+    '取り直しを裸の setTimeout で予約していない (必ず scheduleRescan を通す)');
+  ok(/clearTimeout\(scanRetryTimer\)/.test(stopFn),
+    'stopScan が取り直しの予約も取り消す');
+  ok(/scanStarting = false;/.test(stopFn) && /b\.disabled = false/.test(stopFn),
+    '🚨 stopScan 自身が「起動中」の札とボタンを戻す (世代が変わると古い endStarting は何もしない)');
+  // 🚨 古い getUserMedia が遅れて失敗しても、いまの起動には触らない
+  const catchAt2 = html.indexOf('catch (e) {', html.indexOf('getUserMedia(CAMERA_TRIES['));
+  ok(html.slice(catchAt2, catchAt2 + 200).includes('if (gen !== scanGen) return;'),
+    '🚨 getUserMedia の catch の先頭で世代を見る (古い失敗が条件やエラー表示に干渉しない)');
   ok(/const endStarting = \(\) => \{ if \(gen === scanGen\)/.test(html),
     '古い起動が遅れて戻っても、新しい起動の札を外さない (世代を見る)');
 }
