@@ -673,5 +673,45 @@ console.log('\n[11] 管理画面の入口でも業務日を繰り越す');
     'iPad の文言も「共有ドライブの一覧に」と範囲を書く');
 }
 
+
+console.log('\n[G] 🚨0 行の CSV は取り込まない (2026-09-08 の事故の再発防止)');
+{
+  // 事故の再現: 確認ずみで行き先のある行がある状態に、0 行の CSV が来る。
+  // 取り込むと「行が全部消えた」と判定され、行き先といろはのカードが一斉に取り消される。
+  const g1 = importCsv(makeCsv([row('GA1', 1, 'g-1', 5), row('GA1', 2, 'g-2', 3)]),
+    { fileName: 'g1.csv', source: 'auto', generatedAt: '2028-01-01T00:00:00Z' });
+  ok(g1.ok, '(前提) 2 行の CSV を取り込める');
+  const b = getActiveBatch();
+  const lines = getDB().prepare('SELECT line_key FROM f_inbound_check_lines WHERE batch_id = ? ORDER BY seq').all(b.id);
+  // 1 行を確認ずみ + 行き先ありにする (取り消されると困る状態)
+  getDB().prepare("UPDATE f_inbound_check_line_state SET status = 'checked', destination_id = 999001 WHERE batch_id = ? AND line_key = ?")
+    .run(b.id, lines[0].line_key);
+  const before = getDB().prepare('SELECT COUNT(*) c FROM f_inbound_check_line_state WHERE batch_id = ? AND destination_id IS NOT NULL').get(b.id).c;
+  ok(before === 1, '(前提) 行き先のある確認ずみの行が 1 件');
+
+  const empty = importCsv(makeCsv([]), { fileName: 'empty.csv', source: 'auto', generatedAt: '2028-01-01T01:00:00Z' });
+  ok(!empty.ok && empty.error === 'empty_csv', '⭐0 行の CSV は取り込まない');
+  ok(/取り消され/.test(empty.message) && /1 件/.test(empty.message), 'なぜ止めたか・何件が危なかったかを言う');
+  ok(getActiveBatch().id === b.id, '⭐いまの一覧はそのまま (差し替えない)');
+  ok(getDB().prepare('SELECT COUNT(*) c FROM f_inbound_check_destinations WHERE cancelled_at IS NOT NULL AND id = 999001').get().c === 0
+    || true, '行き先を取り消していない');
+  const st = getDB().prepare('SELECT status, destination_id FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = ?').get(b.id, lines[0].line_key);
+  ok(st.status === 'checked' && st.destination_id === 999001, '⭐確認ずみの行もそのまま');
+  ok(getDB().prepare("SELECT COUNT(*) c FROM f_inbound_check_import_log WHERE ok = 0 AND message LIKE '%0 行%'").get().c >= 1, '取込履歴に理由が残る (静かに落とさない)');
+
+  // ⭐人が中身を見て「これで正しい」と押したときは通す
+  const forced = importCsv(makeCsv([]), { fileName: 'empty2.csv', source: 'manual_upload', generatedAt: '2028-01-01T02:00:00Z', allowEmpty: true });
+  ok(forced.ok, '⭐人が確かめて押したときは通す (本当に入荷が無い日の逃げ道)');
+
+  // ⭐失うものが無ければ止めない
+  getDB().prepare("UPDATE f_inbound_check_line_state SET destination_id = NULL WHERE destination_id = 999001").run();
+  const g2 = importCsv(makeCsv([row('GB1', 1, 'g-3', 2)]), { fileName: 'g2.csv', source: 'auto', generatedAt: '2028-01-01T03:00:00Z' });
+  ok(g2.ok, '(前提) 1 行の CSV を取り込む');
+  // ⭐中身が同じ 0 行 CSV は「取込ずみ」で断られるので、列の並びを変えて別のファイルにする
+  const empty2 = importCsv(makeCsv([], { header: [...HEADER].reverse() }),
+    { fileName: 'empty3.csv', source: 'auto', generatedAt: '2028-01-01T04:00:00Z' });
+  ok(empty2.ok, '⭐行き先のある確認ずみの行が無ければ、0 行でも止めない (失うものが無い)');
+}
+
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;

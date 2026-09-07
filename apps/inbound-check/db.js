@@ -860,7 +860,39 @@ export function rollOverWorkDate(db = getDB(), now = new Date()) {
  * @returns {ok:true, batch, rowCount, slipCount} | {ok:false, error, message, batch?}
  *   error: bad_csv | duplicate_file | older_file
  */
-export function importCsv(buffer, { fileName = null, source = 'manual_upload', actor = null, generatedAt = null } = {}) {
+/**
+ * 🚨**0 行の CSV は取り込まない** (2026-09-08 の事故の再発防止)。
+ *
+ * ## 何が起きたか
+ * 9/7 に足した 00:20 の取得が初回に 0 行の CSV を作り、良いファイルを上書きした。
+ * 取込には「新しい CSV から消えた確認済みの行は行き先を取り消す」規則があるため、
+ * **全行が「消えた」と判定**され、いろはの在庫化カードが全部取り消されて一覧から消えた。
+ *
+ * ## なぜ 0 行を断るのが正しいか
+ * 取得が 0 行なのは「入荷の作業が全部片づいた」証拠ではなく、たいてい**取りに行けなかった**証拠。
+ * 分からないものを「全部消えた」と読み替えるのが事故のもとだった (欠損値を 0 で代用しない、と同じ考え)。
+ * ⭐本当に入荷が無い日でも、**取り込まずに今の一覧を残す**のが正しい振る舞い —
+ *   その日は「新しい受付が無い」だけで、確認ずみの行き先を消してよい理由にはならない。
+ *
+ * ⭐**確認ずみで行き先のある行が 1 つも無ければ止めない**。失うものが無く、
+ *   初回の取込 (まだ何も無い) まで断ると使い始められない。
+ *
+ * @returns {null} 取り込んでよい / {ok:false,...} 断る理由
+ */
+function guardEmptyCsv(db, parsed, prevActive, { allowEmpty = false } = {}) {
+  if (allowEmpty) return null;                 // 人が中身を見て「これで正しい」と押したとき
+  if (parsed.rows.length > 0) return null;
+  if (!prevActive) return null;                // まだ一覧が無い (失うものが無い)
+  const atRisk = db.prepare(`SELECT COUNT(*) c FROM f_inbound_check_line_state
+    WHERE batch_id = ? AND status = 'checked' AND destination_id IS NOT NULL`).get(prevActive.id).c;
+  if (atRisk === 0) return null;
+  return { ok: false, error: 'empty_csv',
+    message: `CSV の明細が 0 行でした。取り込むと確認ずみの行き先 ${atRisk} 件が取り消され、`
+      + 'いろはの在庫化カードも消えるため、取り込みませんでした。'
+      + 'ロジザードから取り直してください (本当に入荷が無い日なら、今の一覧のままで問題ありません)' };
+}
+
+export function importCsv(buffer, { fileName = null, source = 'manual_upload', actor = null, generatedAt = null, allowEmpty = false } = {}) {
   if (!BATCH_SOURCES.includes(source)) throw new Error(`不正な source: ${source}`);
   const db = getDB();
   const fileHash = crypto.createHash('sha256').update(buffer).digest('hex');
@@ -925,6 +957,13 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     }
     // ⭐同日中の再取込は確認状態を引き継ぐ。旧 active を superseded にする前に掴んでおく
     const prevActive = active;
+    // 🚨0 行の CSV はここで止める。この先へ進めると、確認ずみの行が「消えた」と判定され、
+    //   行き先といろはのカードが一斉に取り消される (2026-09-08 の事故)
+    const empty = guardEmptyCsv(db, parsed, prevActive, { allowEmpty });
+    if (empty) {
+      logImport(db, { actor, source, fileName, ok: false, batchId: prevActive ? prevActive.id : null, message: empty.message });
+      return { ...empty, batch: prevActive || null };
+    }
     // 旧 active を先に superseded にする (active の部分ユニーク索引があるため)
     db.prepare("UPDATE f_inbound_check_batches SET status = 'superseded' WHERE status = 'active'").run();
     const slipsMap = new Map();
