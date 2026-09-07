@@ -55,21 +55,21 @@
   </form>
 </dialog>
 <script>
-  (function () {
+  // ★グローバル (window.xxx) を経由せず、トップレベルの関数宣言で画面内から呼べるようにする
+  //   (静的検査が window / globalThis の使用を禁止している — 通信の別名づけに使われるため)
+  function showToast(msg) {
+    var t = document.getElementById('toast');
+    if (!t) return;
+    t.textContent = msg; t.style.display = 'block';
+    clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, 2500);
+  }
+  var policyDialogState = { sku: null };
+  // row: { seller_sku, ne_name, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, computed_floor }
+  function openPolicyDialog(row) {
     var dlg = document.getElementById('policy-dlg');
     var form = document.getElementById('policy-form');
     var err = document.getElementById('pd-err');
-    var currentSku = null;
-    function showToast(msg) {
-      var t = document.getElementById('toast');
-      if (!t) return;
-      t.textContent = msg; t.style.display = 'block';
-      clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, 2500);
-    }
-    window.showToast = showToast;
-    // row: { seller_sku, ne_name, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, computed_floor }
-    window.openPolicyDialog = function (row) {
-      currentSku = row.seller_sku;
+    policyDialogState.sku = row.seller_sku;
       document.getElementById('pd-sub').textContent = (row.ne_name || '') + ' / ' + row.seller_sku
         + (row.computed_floor != null ? ' — 計算した下限 ' + Number(row.computed_floor).toLocaleString() + ' 円' : ' — 下限は計算できていません (原価・手数料・送料のどれかが不明)');
       form.mode.value = row.mode || 'off';
@@ -82,7 +82,11 @@
       form.reason_text.value = '';
       err.textContent = '';
       dlg.showModal();
-    };
+  }
+  (function () {
+    var dlg = document.getElementById('policy-dlg');
+    var form = document.getElementById('policy-form');
+    var err = document.getElementById('pd-err');
     document.getElementById('pd-cancel').addEventListener('click', function () { dlg.close(); });
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
@@ -99,7 +103,7 @@
       };
       var btn = document.getElementById('pd-save');
       btn.disabled = true;
-      fetch('/apps/amazon-pricing/api/policies/' + encodeURIComponent(currentSku), {
+      fetch('/apps/amazon-pricing/api/policies/' + encodeURIComponent(policyDialogState.sku), {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
       }).then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
         .then(function (res) {

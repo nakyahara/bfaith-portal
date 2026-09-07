@@ -158,17 +158,39 @@ console.log('\n── Codex R1 High 1: 上限が下限より低い方針は矛�
   eq(r2.reasonCode, 'INVALID_POLICY_BOUNDS', '人のストッパー 1800 > 上限 1700 でも同じ (値上げ方向でも出さない)');
   // 不変条件: どの経路でも「値下げの提案 ≥ 実効下限」
   const cases = [];
-  for (const bb of [500, 1000, 1500, 1749, 1750, 1751, 1900, 2000, 2500, 4000]) {
-    for (const ceiling of [null, 1600, 1750, 1800, 2200]) {
+  const unknownLower = [];
+  let total = 0;
+  for (const bb of [500, 1000, 1500, 1749, 1750, 1751, 1900, 2000, 2300, 2500, 4000]) {
+    for (const ceiling of [null, 1600, 1750, 1800, 1900, 2200]) {
       for (const floor of [null, 0, 1600, 1800, 2100]) {
         for (const owner of [0, 1, null]) {
-          const x = evaluateListing({ ...base, buybox_price: bb, ceiling_price: ceiling, floor_price: floor, buybox_is_mine: owner });
-          if (x.action === 'lower' && (x.effectiveFloor == null || x.proposedPrice < x.effectiveFloor)) cases.push({ bb, ceiling, floor, owner, x: x.proposedPrice, f: x.effectiveFloor });
+          for (const my of [1500, 2000]) {
+            total += 1;
+            const x = evaluateListing({ ...base, my_price: my, buybox_price: bb, ceiling_price: ceiling, floor_price: floor, buybox_is_mine: owner });
+            if (x.action === 'lower' && (x.effectiveFloor == null || x.proposedPrice < x.effectiveFloor)) cases.push({ my, bb, ceiling, floor, owner, x: x.proposedPrice, f: x.effectiveFloor });
+            if (x.action === 'lower' && owner === null) unknownLower.push({ my, bb, ceiling, floor, x: x.proposedPrice, code: x.reasonCode });
+          }
         }
       }
     }
   }
-  ok(cases.length === 0, `★総当たり 750 通りで「値下げの提案が実効下限を割る」が 0 件 (実際 ${cases.length}: ${JSON.stringify(cases.slice(0, 3))})`);
+  ok(cases.length === 0, `★総当たり ${total} 通りで「値下げの提案が実効下限を割る」が 0 件 (実際 ${cases.length}: ${JSON.stringify(cases.slice(0, 3))})`);
+  ok(unknownLower.length === 0, `★総当たり ${total} 通りで「持ち主不明のカートで値下げ」が 0 件 (実際 ${unknownLower.length}: ${JSON.stringify(unknownLower.slice(0, 3))})`);
+  // Codex R2 High 1 の再現: 持ち主不明 + カート 2300 (値上げ方向) + 上限 1900 → 以前は lower 1900 に反転していた
+  const flip = evaluateListing({ ...base, buybox_price: 2300, buybox_is_mine: null, ceiling_price: 1900 });
+  eq(flip.action, 'hold', '持ち主不明 + 上限で値上げが値下げに反転 → 保留');
+  eq(flip.reasonCode, 'BUYBOX_OWNER_UNKNOWN', '  理由 BUYBOX_OWNER_UNKNOWN');
+  const flipOther = evaluateListing({ ...base, buybox_price: 2300, buybox_is_mine: 0, ceiling_price: 1900 });
+  eq(flipOther.action, 'lower', '持ち主が他社なら同じ形は上限 1900 への値下げ (1900 ≥ 下限 1750)');
+}
+
+console.log('\n── Codex R2 Medium 2: 小数の価格は丸めずに異常として扱う ──');
+{
+  eq(evaluateListing({ ...base, my_price: 0.6 }).reasonCode, 'NO_MY_PRICE', '自分の価格 0.6 は 1 円に丸めない → 保留');
+  eq(evaluateListing({ ...base, my_price: 1999.5 }).reasonCode, 'NO_MY_PRICE', '自分の価格 1999.5 → 保留');
+  eq(evaluateListing({ ...base, my_price: 9_999_999.4 }).reasonCode, 'NO_MY_PRICE', '上限直上の小数 → 保留');
+  eq(evaluateListing({ ...base, buybox_price: 1899.5 }).reasonCode, 'NO_BUYBOX', 'カート 1899.5 → 保留');
+  eq(evaluateListing({ ...base, my_price: 2000.0 }).action, 'lower', '2000.0 (整数値の REAL) は整数として通る');
 }
 
 console.log('\n── Codex R1 High 2: カートの持ち主が不明なら値下げしない ──');

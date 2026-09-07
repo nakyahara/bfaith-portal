@@ -146,7 +146,20 @@ console.log('\n── 追記のみ (トリガ) ──');
   throws(() => other.prepare(`UPDATE ap_policies SET floor_price = 1 WHERE seller_sku = 'PR_FBA1 '`).run(), '変更履歴', '履歴を伴わない ap_policies の直接 UPDATE は落ちる');
   throws(() => other.prepare(`INSERT INTO ap_policies (seller_sku, mode, updated_at, updated_by) VALUES ('ghost', 'buybox', 'now', 'x')`).run(), '変更履歴', '履歴を伴わない ap_policies の直接 INSERT は落ちる');
   throws(() => other.prepare(`DELETE FROM ap_policies WHERE seller_sku = 'PR_FBA1 '`).run(), '削除できません', 'ap_policies の DELETE は落ちる');
+  // Codex R2 High 2: 既存イベントと同じ時刻を指定した INSERT OR REPLACE (別接続) も落ちる
+  const cur = other.prepare(`SELECT * FROM ap_policies WHERE seller_sku = 'PR_FBA1 '`).get();
+  throws(() => other.prepare(`INSERT OR REPLACE INTO ap_policies (seller_sku, mode, floor_price, updated_at, updated_by) VALUES ('PR_FBA1 ', 'off', 1, ?, ?)`).run(cur.updated_at, cur.updated_by), '置き換えも不可', '既存 SKU への INSERT OR REPLACE (同じ時刻) は落ちる');
+  ok(other.prepare(`SELECT floor_price FROM ap_policies WHERE seller_sku = 'PR_FBA1 '`).get().floor_price === cur.floor_price, '  行は元のまま');
+  // Codex R2 Medium 1: 「同時刻に何か 1 件」では足りない。note の履歴だけ書いて mode を直接変える経路は落ちる
+  const at2 = new Date(Date.parse(cur.updated_at) + 5000).toISOString();
+  other.prepare(`INSERT INTO ap_policy_events (seller_sku, at, actor_type, actor_id, field, old_value, new_value, reason_code, change_group) VALUES ('PR_FBA1 ', ?, 'human', ?, 'note', NULL, 'x', 'other', 'g2')`).run(at2, cur.updated_by);
+  throws(() => other.prepare(`UPDATE ap_policies SET mode = 'off', note = 'x', updated_at = ? WHERE seller_sku = 'PR_FBA1 '`).run(at2), '変更内容', 'note の履歴だけで mode も変える UPDATE は落ちる');
+  other.prepare(`UPDATE ap_policies SET note = 'x', updated_at = ? WHERE seller_sku = 'PR_FBA1 '`).run(at2);
+  ok(other.prepare(`SELECT note FROM ap_policies WHERE seller_sku = 'PR_FBA1 '`).get().note === 'x', '  履歴どおりの UPDATE (note だけ) は通る');
   other.close();
+  // 上の直接 UPDATE のあとでも savePolicy は正しく動く (updated_at が前より進む)
+  const r4 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { note: null }, actorId: 'a@example.com', reasonCode: 'mistake' });
+  ok(r4.changed.length === 1 && r4.changed[0] === 'note' && getPolicy(db, 'PR_FBA1 ').note === null, 'savePolicy で note を消す (履歴 1 行)');
   throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'off' }, actorId: 'x', reasonCode: 'stop', reasonText: 'あ'.repeat(301) }), '300 文字', '理由のメモ 301 文字は拒否 (サーバ側でも上限)');
 }
 
@@ -180,6 +193,14 @@ console.log('\n── 判定 run (シャドー) ──');
   throws(() => db.prepare(`INSERT INTO ap_evaluations (run_id, seller_sku, evaluated_at, rule_version, autonomy_level, action, reason_code, reason_text, inputs_json)
     VALUES (?, 'x', ?, ?, 1, 'keep', 'OFF', 'x', '{}')`).run(forced.run.run_id, T, RULE_VERSION), 'CHECK', '★autonomy_level = 1 (人承認後に実行) は CHECK で拒否');
   throws(() => db.prepare(`UPDATE ap_evaluations SET proposed_price = 1 WHERE decision_id = ?`).run(fba.decision_id), 'UPDATE 禁止', '判定の UPDATE は落ちる');
+  // Codex R2 High 2: UNIQUE(run_id, seller_sku) 経由の INSERT OR REPLACE (主キー省略・別接続) も落ちる
+  {
+    const other2 = new Database(path.join(tmp, 'mirror.db'));
+    throws(() => other2.prepare(`INSERT OR REPLACE INTO ap_evaluations (run_id, seller_sku, evaluated_at, rule_version, action, reason_code, reason_text, inputs_json)
+      VALUES (?, 'PR_FBA1 ', ?, ?, 'keep', 'OFF', 'replaced', '{}')`).run(r.run.run_id, T, RULE_VERSION), '置き換え禁止', 'UNIQUE 経由の INSERT OR REPLACE は落ちる');
+    ok(other2.prepare(`SELECT reason_text FROM ap_evaluations WHERE decision_id = ?`).get(fba.decision_id).reason_text !== 'replaced', '  行は元のまま');
+    other2.close();
+  }
   throws(() => db.prepare(`DELETE FROM ap_evaluation_runs WHERE run_id = ?`).run(r.run.run_id), '削除できません', 'run の DELETE は落ちる');
   throws(() => db.prepare(`UPDATE ap_evaluation_runs SET trigger = 'manual' WHERE run_id = ?`).run(r.run.run_id), '終了記録', '終わった run の書き換えは落ちる');
   // Codex R1 Medium: running の run でも「終了の記録」以外は書き換えられない

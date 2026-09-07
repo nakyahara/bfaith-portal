@@ -167,8 +167,8 @@
   document.addEventListener('click', function (ev) {
     var b = ev.target.closest ? ev.target.closest('button[data-policy]') : null;
     if (!b) return;
-    try { window.openPolicyDialog(JSON.parse(b.getAttribute('data-policy'))); }
-    catch (e) { window.showToast && window.showToast('開けませんでした: ' + e.message); }
+    try { openPolicyDialog(JSON.parse(b.getAttribute('data-policy'))); }
+    catch (e) { showToast('開けませんでした: ' + e.message); }
   });
 </script>
 <% } %>

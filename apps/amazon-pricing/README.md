@@ -23,15 +23,20 @@ Amazon の出品ごとに「いまの価格・カート・原価・手数料・�
 
 ## 書き込み経路が無いことの保証
 
-1. `apps/amazon-pricing/` に SP-API の書き込み関数・miniPC の書き込み口・`fetch(`・**動的実行 (dynamic import / eval / Function / require)** が無い。
-   静的 import は許可リスト内だけ、許可した外部モジュール (format.js / warehouse-mirror/db.js) も同じ検査を通す
-   (`test-no-write-path.mjs`。回避コードの見本 12 種を検査に掛けて**必ず落ちる**ことも同じテストで確かめる)
+1. `apps/amazon-pricing/` に SP-API の書き込み関数・miniPC の書き込み口・通信・**動的実行** が無い (`test-no-write-path.mjs`)。
+   検査は部分文字列ではなく、コメントを除いて正規化したソースに対して **危険な名前そのもの** (fetch / eval / Function /
+   globalThis / window / self / Reflect / process / require / http …) を語として禁止する。名前の組み立て (計算プロパティに
+   引用符・+・${})・optional call・.call/.apply/.bind も禁止。静的 import は許可リストだけで、**アプリから到達できる相対
+   import を再帰的にたどり外部モジュール (warehouse-mirror/db.js 等) も同じ検査**。画面は `<script>` と `on*=` を取り出して
+   同様に検査し、HTML の外部読み込み (script src / iframe / form action / img …) も禁止。自分の API への fetch だけを、
+   文字列リテラルの連結 (`..` や `//` を含まない) に限って許す。**回避コードの見本 42 種を検査に掛けて必ず落ちる**ことも同じテストで確かめる
 2. `ap_evaluations.autonomy_level` は `CHECK(autonomy_level = 0)` — 「人承認後に実行」「自動実行」の段階を表す値を表に入れられない
 3. 実行要求の表 (`ai.actions` 相当) は**作っていない**。実行段階 (M3) で、設計書の関所を全部つけて別 PR で足す
 4. 旧ツールの書き込み口は削除済み (`test-no-write-path.mjs` §3 で監視)。miniPC 側の価格更新ルート
    (apps/warehouse/research-service.js) は残っているが、Render から呼ぶコードはもう無い
 
-**限界 (脅威モデル)**: 1 は静的検査であり、実行環境の外向き通信を遮断するものではない。DB のトリガ・CHECK が防ぐのは
+**限界 (脅威モデル)**: 1 は構文木ではなく正規化した文字列に対する静的検査で (リポジトリに JS パーサが無いため)、実行環境の
+外向き通信を遮断するものではない。DB のトリガ・CHECK が防ぐのは
 普通のアプリ接続からの DML (UPDATE / DELETE / INSERT OR REPLACE / 履歴を伴わない方針の書き換え) で、DB ファイルの
 DDL 権限を持つ人 (DROP TRIGGER・表の作り直し) からは防げない。それは render-backup の日次退避と、Company DB (Postgres)
 移行後のロール分離で扱う。

@@ -82,7 +82,7 @@
           <% for (const [k, label] of [['agree', '👍 妥当'], ['disagree', '👎 違う'], ['unsure', '❓']]) { %>
             <button type="button" class="rv-btn <%= e.review_verdict === k ? 'on' : '' %>" data-verdict="<%= k %>"><%= label %></button>
           <% } %>
-          <input type="text" class="rv-comment" placeholder="ひとこと (任意)" maxlength="300" value="<%= e.review_comment || '' %>">
+          <input type="text" class="rv-comment" placeholder="ひとこと (任意)" maxlength="500" value="<%= e.review_comment || '' %>">
           <div class="small rv-state"><% if (e.review_verdict) { %><%= e.review_by %> <%= toJst(e.review_at) %><% } %></div>
         </td>
       </tr>
@@ -113,13 +113,13 @@
 </div>
 
 <script>
+  function toast(msg) {
+    var t = document.getElementById('toast');
+    if (!t) { alert(msg); return; }
+    t.textContent = msg; t.style.display = 'block';
+    clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, 2500);
+  }
   (function () {
-    function toast(msg) { if (window.showToast) window.showToast(msg); else alert(msg); }
-    window.showToast = function (msg) {
-      var t = document.getElementById('toast');
-      t.textContent = msg; t.style.display = 'block';
-      clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, 2500);
-    };
     document.addEventListener('click', function (ev) {
       var b = ev.target.closest ? ev.target.closest('button.rv-btn') : null;
       if (!b) return;

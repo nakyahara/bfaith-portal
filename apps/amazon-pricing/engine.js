@@ -222,8 +222,10 @@ export function evaluateListing(input) {
   const mode = MODE_KEYS.includes(input.mode) ? input.mode : 'off';
   const costs = computeCosts(input);
   const flags = [...costs.flags];
+  // ★丸めてから検査しない (0.6 → 1 円、1899.5 → 1900 円が「妥当」になる — Codex R2)。JPY に小数は無い。
+  //   小数で来た価格はデータ異常として扱う (isValidPrice が整数を要求する)
   const currentRaw = num(input.my_price);
-  const current = currentRaw == null ? null : Math.round(currentRaw);
+  const current = isValidPrice(currentRaw) ? currentRaw : (currentRaw == null ? null : currentRaw);
   const grossNow = grossAt(current, costs, input.cost_incl_tax);
   // 人のストッパーは正の整数円だけ信用する (0・負・小数・巨大値は無いのと同じ)
   const userFloorRaw = num(input.floor_price);
@@ -272,8 +274,8 @@ export function evaluateListing(input) {
 
   // ── mode === 'buybox' ──
   const bbRaw = num(input.buybox_price);
-  const bb = bbRaw == null ? null : Math.round(bbRaw);
-  if (bbRaw != null && !isValidPrice(bb)) return hold('NO_BUYBOX', ` (${bbRaw})`);
+  if (bbRaw != null && !isValidPrice(bbRaw)) return hold('NO_BUYBOX', ` (${bbRaw})`);
+  const bb = bbRaw;
   const owner = input.buybox_is_mine === 1 ? 'mine' : input.buybox_is_mine === 0 ? 'other' : 'unknown';
   let target;
   let code;
@@ -318,9 +320,13 @@ export function evaluateListing(input) {
   }
 
   const action = target > current ? 'raise' : 'lower';
-  // ★最終の不変条件: 値下げの提案は必ず実効下限以上。ここに来たらルールの不具合なので出さずに止める
+  // ★最終の不変条件 (どの経路でも): 値下げの提案は必ず実効下限以上。ここに来たらルールの不具合なので出さずに止める
   if (action === 'lower' && (effectiveFloor == null || target < effectiveFloor)) {
     return { ...hold('FLOOR_INVARIANT', ` (${target} / 下限 ${effectiveFloor})`), targetPrice: target, changeRatio };
+  }
+  // ★最終の不変条件 (Codex R2 High): 持ち主不明のカートでは値下げしない。上限クランプで値上げが値下げに反転する経路も含む
+  if (action === 'lower' && owner === 'unknown') {
+    return { ...hold('BUYBOX_OWNER_UNKNOWN', ` (カート ${bb == null ? '無し' : bb.toLocaleString() + ' 円'}、上限で反転)`), targetPrice: target, changeRatio };
   }
 
   const confidence = code === 'RAISE_TO_FLOOR' ? 0.9

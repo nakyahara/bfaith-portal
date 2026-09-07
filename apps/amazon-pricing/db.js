@@ -167,6 +167,10 @@ export function createTables(db) {
       WHEN EXISTS (SELECT 1 FROM ${t} WHERE ${pk} = NEW.${pk})
       BEGIN SELECT RAISE(ABORT, '${t} は追記のみ (既にある行の置き換え禁止)'); END`);
   }
+  // ap_evaluations は UNIQUE(run_id, seller_sku) 経由の REPLACE もある (Codex R2 High)。主キー以外の一意制約も同じく止める
+  db.exec(`CREATE TRIGGER IF NOT EXISTS ap_evaluations_no_replace_unique BEFORE INSERT ON ap_evaluations
+    WHEN EXISTS (SELECT 1 FROM ap_evaluations WHERE run_id = NEW.run_id AND seller_sku = NEW.seller_sku)
+    BEGIN SELECT RAISE(ABORT, 'ap_evaluations は追記のみ (同じ run の同じ SKU の置き換え禁止)'); END`);
   // run は running → success/failed の 1 回だけ状態が変わる。変えてよい列も終了の記録だけ (ホワイトリスト)。
   // 定義を変えたので古いトリガは作り直す (CREATE IF NOT EXISTS は既存を更新しない)
   db.exec('DROP TRIGGER IF EXISTS ap_evaluation_runs_finish_once');
@@ -183,16 +187,31 @@ export function createTables(db) {
   db.exec(`CREATE TRIGGER IF NOT EXISTS ap_evaluation_runs_no_replace BEFORE INSERT ON ap_evaluation_runs
     WHEN EXISTS (SELECT 1 FROM ap_evaluation_runs WHERE run_id = NEW.run_id)
     BEGIN SELECT RAISE(ABORT, 'ap_evaluation_runs は既にある run の置き換え禁止'); END`);
-  // 方針の現在値は「同じ時刻の履歴行」が無いと書けない (履歴を残さない直接 UPDATE を構造で止める)。
-  // UPDATE は updated_at を必ず進めること (進めない UPDATE は古い履歴行で条件を満たしてしまう)
-  db.exec(`CREATE TRIGGER IF NOT EXISTS ap_policies_requires_event_insert BEFORE INSERT ON ap_policies
-    WHEN NOT EXISTS (SELECT 1 FROM ap_policy_events e WHERE e.seller_sku = NEW.seller_sku AND e.at = NEW.updated_at)
-    BEGIN SELECT RAISE(ABORT, 'ap_policies は変更履歴 (ap_policy_events) を先に書いてからでないと書き換えられません'); END`);
+  // 方針の現在値は「その変更を説明する履歴行」が無いと書けない (履歴を残さない直接 UPDATE を構造で止める)。
+  //   ・列ごとに「同じ SKU・同じ時刻・同じ列・前の値・後の値・同じ actor」の履歴行を要求する (Codex R2 Medium:
+  //     「同時刻に何か 1 件」では、note の履歴だけ書いて mode を直接変えられた)
+  //   ・UPDATE は updated_at を必ず進めること (進めない UPDATE は古い履歴行で条件を満たしてしまう)
+  //   ・既にある seller_sku への INSERT (= INSERT OR REPLACE) は拒否。savePolicy は初回 INSERT / 2 回目以降 UPDATE に分ける
+  // 定義を変えたので古いトリガは作り直す
+  const castOld = (f) => (f === 'mode' || f === 'note' ? `OLD.${f}` : `CAST(OLD.${f} AS TEXT)`);
+  const castNew = (f) => (f === 'mode' || f === 'note' ? `NEW.${f}` : `CAST(NEW.${f} AS TEXT)`);
+  const eventFor = (f, oldExpr) => `EXISTS (SELECT 1 FROM ap_policy_events e WHERE e.seller_sku = NEW.seller_sku AND e.at = NEW.updated_at
+        AND e.actor_id = NEW.updated_by AND e.field = '${f}' AND e.old_value IS ${oldExpr} AND e.new_value IS ${castNew(f)})`;
+  const defaultOf = (f) => (f === 'mode' ? "'off'" : f === 'offset_jpy' ? "'0'" : 'NULL');
+  const insertNeeds = POLICY_FIELDS.map((f) => `(${castNew(f)} IS NOT ${defaultOf(f)} AND NOT ${eventFor(f, 'NULL')})`).join('\n      OR ');
+  const updateNeeds = POLICY_FIELDS.map((f) => `(${castNew(f)} IS NOT ${castOld(f)} AND NOT ${eventFor(f, castOld(f))})`).join('\n      OR ');
+  db.exec('DROP TRIGGER IF EXISTS ap_policies_requires_event_insert');
+  db.exec(`CREATE TRIGGER ap_policies_requires_event_insert BEFORE INSERT ON ap_policies
+    WHEN EXISTS (SELECT 1 FROM ap_policies WHERE seller_sku = NEW.seller_sku)
+      OR NOT EXISTS (SELECT 1 FROM ap_policy_events e WHERE e.seller_sku = NEW.seller_sku AND e.at = NEW.updated_at AND e.actor_id = NEW.updated_by)
+      OR ${insertNeeds}
+    BEGIN SELECT RAISE(ABORT, 'ap_policies は変更履歴 (ap_policy_events) に変更内容を先に書いてからでないと作れません (既にある SKU の置き換えも不可)'); END`);
   db.exec('DROP TRIGGER IF EXISTS ap_policies_requires_event_update');
   db.exec(`CREATE TRIGGER ap_policies_requires_event_update BEFORE UPDATE ON ap_policies
-    WHEN NEW.updated_at IS OLD.updated_at OR NEW.updated_at < OLD.updated_at
-      OR NOT EXISTS (SELECT 1 FROM ap_policy_events e WHERE e.seller_sku = NEW.seller_sku AND e.at = NEW.updated_at)
-    BEGIN SELECT RAISE(ABORT, 'ap_policies は変更履歴 (ap_policy_events) を先に書き、updated_at を進めてからでないと書き換えられません'); END`);
+    WHEN NEW.seller_sku IS NOT OLD.seller_sku OR NEW.updated_at IS OLD.updated_at OR NEW.updated_at < OLD.updated_at
+      OR NOT EXISTS (SELECT 1 FROM ap_policy_events e WHERE e.seller_sku = NEW.seller_sku AND e.at = NEW.updated_at AND e.actor_id = NEW.updated_by)
+      OR ${updateNeeds}
+    BEGIN SELECT RAISE(ABORT, 'ap_policies は変更履歴 (ap_policy_events) に変更内容 (列・前後の値・誰が) を先に書き、updated_at を進めてからでないと書き換えられません'); END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS ap_policies_no_delete BEFORE DELETE ON ap_policies
     BEGIN SELECT RAISE(ABORT, 'ap_policies は削除できません (追従を止めるなら mode を off に)'); END`);
 
@@ -324,13 +343,16 @@ export function savePolicy(db, { sku, patch, actorId, actorType = 'human', reaso
       ins.run(sku, at, actorType, actorId, f, before ? asText(before[f]) : null, asText(next[f]),
         reasonCode, reason || null, source, changeGroup);
     }
-    db.prepare(`INSERT INTO ap_policies (seller_sku, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, updated_at, updated_by)
-      VALUES (@seller_sku, @mode, @floor_price, @ceiling_price, @offset_jpy, @min_margin_rate, @note, @updated_at, @updated_by)
-      ON CONFLICT(seller_sku) DO UPDATE SET
-        mode = excluded.mode, floor_price = excluded.floor_price, ceiling_price = excluded.ceiling_price,
-        offset_jpy = excluded.offset_jpy, min_margin_rate = excluded.min_margin_rate, note = excluded.note,
-        updated_at = excluded.updated_at, updated_by = excluded.updated_by`)
-      .run({ seller_sku: sku, ...pick(next, POLICY_FIELDS), updated_at: at, updated_by: actorId });
+    // 初回は INSERT、2 回目以降は UPDATE (UPSERT にしない: 既にある SKU への INSERT はトリガで拒否している)
+    const values = { seller_sku: sku, ...pick(next, POLICY_FIELDS), updated_at: at, updated_by: actorId };
+    if (before) {
+      db.prepare(`UPDATE ap_policies SET mode = @mode, floor_price = @floor_price, ceiling_price = @ceiling_price,
+        offset_jpy = @offset_jpy, min_margin_rate = @min_margin_rate, note = @note, updated_at = @updated_at, updated_by = @updated_by
+        WHERE seller_sku = @seller_sku`).run(values);
+    } else {
+      db.prepare(`INSERT INTO ap_policies (seller_sku, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, updated_at, updated_by)
+        VALUES (@seller_sku, @mode, @floor_price, @ceiling_price, @offset_jpy, @min_margin_rate, @note, @updated_at, @updated_by)`).run(values);
+    }
     return { changed: fields, changeGroup, policy: getPolicy(db, sku) };
   });
   return tx.immediate();

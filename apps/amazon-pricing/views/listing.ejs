@@ -109,7 +109,7 @@
 <%- include('_policy_dialog') %>
 <script>
   document.getElementById('edit-policy').addEventListener('click', function () {
-    window.openPolicyDialog(<%- JSON.stringify({ seller_sku: row.seller_sku, ne_name: row.ne_name, mode: row.mode, floor_price: row.floor_price, ceiling_price: row.ceiling_price, offset_jpy: row.offset_jpy, min_margin_rate: row.min_margin_rate, note: row.policy_note, computed_floor: row.computed_floor, has_policy: row.has_policy }).replace(/</g, '\\u003c') %>);
+    openPolicyDialog(<%- JSON.stringify({ seller_sku: row.seller_sku, ne_name: row.ne_name, mode: row.mode, floor_price: row.floor_price, ceiling_price: row.ceiling_price, offset_jpy: row.offset_jpy, min_margin_rate: row.min_margin_rate, note: row.policy_note, computed_floor: row.computed_floor, has_policy: row.has_policy }).replace(/</g, '\\u003c') %>);
   });
 </script>
 <% } %>
