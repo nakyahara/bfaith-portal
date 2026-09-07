@@ -192,6 +192,11 @@ export function upsertTaskFromImport(row, { batchId, now = utcNow() }) {
   const sets = cols.map((c) => `${c} = ?`).join(', ');
   db.prepare(`UPDATE f_iroha_tasks SET ${sets}, import_batch_id = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?`)
     .run(...cols.map((c) => rec[c]), batchId, now, touchedByApp ? existing.updated_by : actor, existing.id);
+  // ⭐取込は既存カードの進捗 (IMPORT_STATE_COLS) も書き換えることがある。
+  //   まとまりが 1 つのうちは一緒に動かす。まとまりが無い古い行はここで用意する (Codex R1 重大2)
+  const fresh = getTask(existing.id);
+  ensureBatchForTask(db, fresh);
+  syncSingleBatchStatus(db, existing.id, fresh);
   return { action: 'updated', id: existing.id };
 }
 
@@ -612,11 +617,13 @@ export function removeStrayTask({ taskId, actor = null, reason = null }) {
     }
     if (used > 0) {
       if (t.status === 'closed') return { ok: true, action: 'closed', id: t.id, already: true };
-      db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'out_of_scope', closed_at = ?, closed_by = ?,
+      const rOut = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'out_of_scope', closed_at = ?, closed_by = ?,
           hold_reason_code = NULL, hold_reason_note = NULL, blocked_reason = NULL, blocked_note = NULL, blocked_at = NULL, blocked_by = NULL, cancellation_requested_at = NULL,
           migration_note = COALESCE(migration_note || ' / ', '') || ?, version = version + 1, updated_at = ?, updated_by = ?
         WHERE id = ? AND version = ?`)
         .run(utcNow(), actor, note, utcNow(), actor, t.id, t.version);
+      // ⭐版がずれていたら**何も起きていない**。まとまりも履歴も触らず、成功として返さない (Codex R1 中4)
+      if (rOut.changes !== 1) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
       syncSingleBatchStatus(db, t.id, { status: 'closed', close_reason: 'out_of_scope' });
       logTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: `closed:out_of_scope (${note})`, ok: true });
       return { ok: true, action: 'closed', id: t.id };

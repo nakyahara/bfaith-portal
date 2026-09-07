@@ -4550,7 +4550,7 @@ console.log('\n[25] ⛔ 止まっている理由の札 — タイマー停止・
 }
 
 // ═══════════════════════ 作業の「まとまり」の土台 (要件 §AB-1) ═══════════════════════
-console.log('\n[24] 作業のまとまり — カードの下に独立して作業・棚入れできる単位を持つ');
+console.log('\n[26] 作業のまとまり — カードの下に独立して作業・棚入れできる単位を持つ');
 {
   const db = getDB();
   const { createTables } = await import('../apps/iroha-work/db.js');
@@ -4590,11 +4590,6 @@ console.log('\n[24] 作業のまとまり — カードの下に独立して作�
       '⭐期限は作成時にコピーする (「NULL ならカードから継承」にしない — 後でカードを直しても外に出した分が変わらない)');
   }
   // 終了したカードは理由で分かれる
-  const stocked = db.prepare("SELECT * FROM f_iroha_tasks WHERE status = 'closed' AND close_reason = 'stocked' LIMIT 1").get();
-  if (stocked) {
-    ok(db.prepare('SELECT work_status FROM f_iroha_task_batches WHERE task_id = ?').get(stocked.id).work_status === 'done',
-      '棚入完了したカードのまとまりは done');
-  }
   {
     const tc = TD.upsertTaskFromImport({ notion_page_id: 'batch-cancel-1', status: 'not_started',
       destination_id: 9613, product_name: '取消するカード', qty: 40 }, { batchId: 'bt' }).id;
@@ -4674,6 +4669,88 @@ console.log('\n[24] 作業のまとまり — カードの下に独立して作�
   ok(db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE task_id = ? AND seq = 1').get(made.id).good_qty === 510,
     '⭐予定 (500) より多い 510 も入る (実際に起きる — 要件 §AB-3)');
   db.prepare('UPDATE f_iroha_task_batches SET good_qty = NULL, good_qty_source = NULL WHERE task_id = ?').run(made.id);
+
+  // ── ⭐カードとまとまりは同じ書き込みで作られる (途中で失敗したら両方無かったことに) ──
+  {
+    const before = db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c;
+    let boom = null;
+    try {
+      db.transaction(() => {
+        const t = TD.upsertTaskFromImport({ notion_page_id: 'batch-atomic-1', status: 'not_started',
+          destination_id: 9615, product_name: '巻き戻すカード', qty: 10 }, { batchId: 'bt' });
+        ok(B.listBatchesOfTask(db, t.id).length === 1, 'トランザクションの中ではカードもまとまりもある');
+        throw new Error('わざと失敗させる');
+      }).immediate();
+    } catch (e) { boom = e; }
+    ok(boom && /わざと/.test(boom.message), '前提: 途中で失敗させた');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === before
+      && !db.prepare("SELECT 1 FROM f_iroha_tasks WHERE notion_page_id = 'batch-atomic-1'").get(),
+      '⭐失敗したらカードもまとまりも残らない (カードだけある瞬間を作らない)');
+  }
+
+  // ── 取込で既存カードの進捗が変わったら、まとまりも合わせる ──
+  {
+    const t8 = TD.upsertTaskFromImport({ notion_page_id: 'batch-imp-1', status: 'not_started',
+      destination_id: 9616, product_name: '取込で進むカード', qty: 60 }, { batchId: 'bt' }).id;
+    ok(B.listBatchesOfTask(db, t8)[0].work_status === 'not_started', '前提: 未着手で入った');
+    TD.upsertTaskFromImport({ notion_page_id: 'batch-imp-1', status: 'ready_for_stocking',
+      destination_id: 9616, product_name: '取込で進むカード', qty: 60 }, { batchId: 'bt2' });
+    ok(TD.getTask(t8).status === 'ready_for_stocking' && B.listBatchesOfTask(db, t8)[0].work_status === 'ready_for_stocking',
+      '⭐取込で既存カードの進捗が変わったら、まとまりも一緒に動く (カードだけ進まない)');
+    // まとまりが無い古い行でも、取込のときに用意される
+    db.prepare('DELETE FROM f_iroha_task_batches WHERE task_id = ?').run(t8);
+    TD.upsertTaskFromImport({ notion_page_id: 'batch-imp-1', status: 'in_progress',
+      destination_id: 9616, product_name: '取込で進むカード', qty: 60 }, { batchId: 'bt3' });
+    ok(B.listBatchesOfTask(db, t8).length === 1 && B.listBatchesOfTask(db, t8)[0].work_status === 'in_progress',
+      'まとまりが無い古い行は、取込のときに用意される');
+  }
+
+  // ── まとまりが 2 つ以上あるカードは、カードから動かさない (まとまり側が正本) ──
+  {
+    const t7 = TD.upsertTaskFromImport({ notion_page_id: 'batch-two-1', status: 'not_started',
+      destination_id: 9617, product_name: 'まとまり 2 つ', qty: 200 }, { batchId: 'bt' }).id;
+    const now7 = new Date().toISOString();
+    db.prepare(`INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, created_at, updated_at)
+      VALUES (?, 2, 80, 'not_started', ?, ?)`).run(t7, now7, now7);
+    ok(B.syncSingleBatchStatus(db, t7, { status: 'closed', close_reason: 'stocked' }) === 0,
+      '⭐まとまりが 2 つ以上あるカードは、カードの進捗から動かさない (まとまり側が正本 — 要件 §AB-1)');
+    ok(B.listBatchesOfTask(db, t7).every((b) => b.work_status === 'not_started'), '2 つとも未着手のまま');
+  }
+
+  // ── まとめて棚入完了・自動取消の経路でも動く ──
+  {
+    const staffB = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+    const tb = TD.upsertTaskFromImport({ notion_page_id: 'batch-bulk-1', status: 'ready_for_stocking',
+      destination_id: 9618, product_name: 'まとめて棚入れ', qty: 30 }, { batchId: 'bt' }).id;
+    TD.bulkCloseReady({ taskIds: [{ id: tb, version: TD.getTask(tb).version }], actor: 'test',
+      workerId: staffB.id, workerName: staffB.display_name });
+    ok(B.listBatchesOfTask(db, tb)[0].work_status === 'done', 'まとめて棚入完了でも、まとまりが done になる');
+    const tr = TD.upsertTaskFromImport({ notion_page_id: 'batch-auto-1', status: 'not_started',
+      destination_id: 9619, product_name: '自動取消', qty: 30 }, { batchId: 'bt' }).id;
+    TD.requestCancellation({ taskId: tr, source: 'inbound_check', actor: 'test' });
+    if (TD.getTask(tr).status === 'closed') {
+      ok(B.listBatchesOfTask(db, tr)[0].work_status === 'cancelled', '自動取消でも、まとまりが cancelled になる');
+    }
+  }
+
+  // ── できた数と出どころは必ず対 (片方だけの行を作らせない) ──
+  {
+    const tv = TD.upsertTaskFromImport({ notion_page_id: 'batch-pair-1', status: 'not_started',
+      destination_id: 9620, product_name: '数と出どころ', qty: 10 }, { batchId: 'bt' }).id;
+    const bid = B.listBatchesOfTask(db, tv)[0].id;
+    let e1 = null, e2 = null;
+    try { db.prepare('UPDATE f_iroha_task_batches SET good_qty = 5 WHERE id = ?').run(bid); } catch (e) { e1 = e; }
+    ok(e1 && /CHECK/.test(e1.message), '⭐数だけ入れて出どころが無い行は作れない (信用してよい数か判断できなくなる)');
+    try { db.prepare("UPDATE f_iroha_task_batches SET good_qty_source = 'counted' WHERE id = ?").run(bid); } catch (e) { e2 = e; }
+    ok(e2 && /CHECK/.test(e2.message), '出どころだけの行も作れない');
+    db.prepare("UPDATE f_iroha_task_batches SET good_qty = 5, good_qty_source = 'counted' WHERE id = ?").run(bid);
+    ok(db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE id = ?').get(bid).good_qty === 5, '対で入れれば通る');
+  }
+
+  // ── 探すところから作るところまで同じトランザクション ──
+  ok(/const made = db\.transaction\(\(\) => \{[\s\S]{0,220}?SELECT t\.\* FROM f_iroha_tasks t/.test(
+    fs.readFileSync(new URL('../apps/iroha-work/batches.js', import.meta.url), 'utf8')),
+    '⭐まとまりを用意するとき、探すのも作るのも同じトランザクションの中 (間に進捗が変わっても古い状態を写さない)');
 
   // ── 列が無い古い DB から起動しても、全カードに用意される ──
   db.pragma('foreign_keys = OFF');

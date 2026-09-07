@@ -33,7 +33,10 @@ export function batchStatusOfTask(task) {
 
 /**
  * そのカードに「まとまり」が 1 つも無ければ 1 つ作る (冪等)。
- * ⭐必ず**呼び出し側のトランザクションの中で**呼ぶこと。カードだけできて まとまり が無い瞬間を作らない。
+ * ⭐必ず**呼び出し側の書き込みトランザクション (BEGIN IMMEDIATE) の中で**呼ぶこと。
+ *   カードだけできて まとまり が無い瞬間を作らないため。
+ *   ⚠「あるか見る → 無ければ入れる」の間に別の接続が入れる隙間を、索引にも守らせている
+ *   (ON CONFLICT DO NOTHING)。呼び出し側がトランザクションを忘れても行が重複しない (Codex R1 中6)。
  *
  * 移行で入れる できた数 (`good_qty`) には `good_qty_source = 'migrated'` を付ける。
  * 移行前は棚入待ちにした瞬間に予定数で上書きしていたので、**実績として信用できない**ため
@@ -47,12 +50,13 @@ export function ensureBatchForTask(db, task) {
   if (has) return 0;
   const now = utcNow();
   const done = task.done_qty ?? null;
-  db.prepare(`INSERT INTO f_iroha_task_batches
+  const info = db.prepare(`INSERT INTO f_iroha_task_batches
       (task_id, seq, planned_qty, facility_code, expiry, work_status, good_qty, good_qty_source, created_at, updated_at)
-    VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(task_id, seq) DO NOTHING`)
     .run(task.id, task.qty ?? null, task.facility_code ?? null, task.expiry ?? null,
       batchStatusOfTask(task), done, done == null ? null : 'migrated', now, now);
-  return 1;
+  return info.changes;
 }
 
 /**
@@ -62,15 +66,16 @@ export function ensureBatchForTask(db, task) {
  * @returns {number} 作った行数
  */
 export function backfillBatches(db) {
-  const rows = db.prepare(`SELECT t.* FROM f_iroha_tasks t
-    WHERE NOT EXISTS (SELECT 1 FROM f_iroha_task_batches b WHERE b.task_id = t.id)`).all();
-  if (rows.length === 0) return 0;
-  const run = db.transaction(() => {
+  // ⭐**探すところから作るところまで同じトランザクション**の中で。
+  //   外で読んでから書くと、その間に別のプロセスが進捗を変えたとき**古い状態を写して固定してしまう**
+  //   (まとまりができた後は探す対象から外れるので、ずれが残り続ける — Codex R1 重大1)
+  const made = db.transaction(() => {
+    const rows = db.prepare(`SELECT t.* FROM f_iroha_tasks t
+      WHERE NOT EXISTS (SELECT 1 FROM f_iroha_task_batches b WHERE b.task_id = t.id)`).all();
     let n = 0;
     for (const t of rows) n += ensureBatchForTask(db, t);
     return n;
-  });
-  const made = run.immediate();
+  }).immediate();
   if (made > 0) console.log(`[iroha-work] 作業のまとまりを ${made} 件のカードに用意しました`);
   return made;
 }

@@ -201,7 +201,11 @@ const batchesDDL = (name) => `
       split_by       TEXT,
       version        INTEGER NOT NULL DEFAULT 1,
       created_at     TEXT NOT NULL,
-      updated_at     TEXT NOT NULL
+      updated_at     TEXT NOT NULL,
+      -- ⭐できた数と、その出どころは必ず対。片方だけある行を作らせない (Codex R1 中5)。
+      --   「数が入っているのに出どころが分からない」= 実績として信用してよいか判断できない
+      CHECK ((good_qty IS NULL AND good_qty_source IS NULL)
+          OR (good_qty IS NOT NULL AND good_qty_source IS NOT NULL))
     );`;
 const BATCHES_INDEX_DDL = `
     CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_batches_seq ON f_iroha_task_batches(task_id, seq);
