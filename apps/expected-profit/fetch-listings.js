@@ -120,16 +120,23 @@ export function rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt,
   if (!v0 || typeof v0 !== 'object' || Array.isArray(v0)) return { rows: [], unparsable: 1 };
   const variants = v0;
   let unparsable = 0;
+  // 🚨 payment は **item レベル** にある (variant には無い)。
+  //    実データで確認: item のキー = manageNumber, ..., payment, ..., variants
+  //    ここを variant から読むと、全出品が「税区分が不明」になって1件も計算できない
+  const payment = item?.payment && typeof item.payment === 'object' ? item.payment : null;
+  const itemTaxIncluded = payment?.taxIncluded;
+  const itemTaxRate = payment?.taxRate != null ? Number(payment.taxRate) : null;
   const hideItem = item?.hideItem === true;
   const out = [];
   for (const [variantKey, v] of Object.entries(variants)) {
     // 要素が object でない / キーが空 は解析不能 (行を作らない = 呼び出し側が unparsable に数える)
     if (!variantKey || !v || typeof v !== 'object' || Array.isArray(v)) { unparsable++; continue; }
     const price = toIntPrice(v?.standardPrice);            // 🚨 文字列で返る ("1080")
-    const taxRate = v?.payment?.taxRate != null ? Number(v.payment.taxRate) : null;
+    // 税区分は item レベル。variant 側にあれば (details-bulk 等) そちらを優先する
+    const taxRate = v?.payment?.taxRate != null ? Number(v.payment.taxRate) : itemTaxRate;
     // 🚨 standardPrice が税込とは限らない (Codex R1-5)。taxIncluded を確認し、
     //    税抜登録や不明な区分は「価格が読めなかった」扱いにして、後段で税を二重に割り戻さない
-    const taxIncluded = v?.payment?.taxIncluded;
+    const taxIncluded = v?.payment?.taxIncluded ?? itemTaxIncluded;
     const postageIncluded = typeof v?.shipping?.postageIncluded === 'boolean' ? v.shipping.postageIncluded : null;
     const singleItemShipping = toIntPrice(v?.shipping?.singleItemShipping);
     const hidden = hideItem || v?.hidden === true;

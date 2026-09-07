@@ -201,6 +201,43 @@ t('ポイントが読めない値なら null', () => {
   assert.equal(r.points, null);
 });
 
+t('[!] payment は item レベルにある (実データの形)', () => {
+  // 🚨 実データ確認 (2026-09-07): items/search の variant に payment は無く、item にある。
+  //    ここを variant から読むと全出品が tax_included_unknown になり、1件も計算できない
+  const rows = rakutenItemToSnapshots({
+    manageNumber: 'real',
+    payment: { taxIncluded: true, taxRate: '0.1', cashOnDeliveryFeeIncluded: false },
+    variants: {
+      sku: { standardPrice: '798', merchantDefinedSkuId: 'meimeishi3',
+        shipping: { shippingMethodGroup: '5', postageIncluded: true, singleItemShipping: 0 } },
+    },
+  }, meta);
+  assert.equal(rows[0].price_incl_tax, 798);
+  assert.equal(rows[0].price_tax_included, 1);
+  assert.equal(rows[0].mall_tax_rate, 0.1);
+  assert.equal(rows[0].fetch_status, 'ok');
+});
+
+t('item に taxRate が無い商品でも税込なら採用する (非課税など)', () => {
+  const rows = rakutenItemToSnapshots({
+    manageNumber: 'notax',
+    payment: { taxIncluded: true, cashOnDeliveryFeeIncluded: false },
+    variants: { sku: { standardPrice: '500', shipping: { postageIncluded: true } } },
+  }, meta);
+  assert.equal(rows[0].price_incl_tax, 500);
+  assert.equal(rows[0].mall_tax_rate, null);   // 税率は商品マスタ側を使う
+  assert.equal(rows[0].fetch_status, 'ok');
+});
+
+t('variant 側に payment があればそちらを優先する (details-bulk 互換)', () => {
+  const rows = rakutenItemToSnapshots({
+    manageNumber: 'both',
+    payment: { taxIncluded: true, taxRate: '0.1' },
+    variants: { sku: { standardPrice: '1080', payment: { taxIncluded: true, taxRate: '0.08' } } },
+  }, meta);
+  assert.equal(rows[0].mall_tax_rate, 0.08);
+});
+
 t('[!] 楽天 taxIncluded=false の価格を税込として保存しない', () => {
   const rows = rakutenItemToSnapshots({
     manageNumber: 'x', variants: { v: { standardPrice: '1000', payment: { taxIncluded: false, taxRate: '0.1' } } },
@@ -211,7 +248,7 @@ t('[!] 楽天 taxIncluded=false の価格を税込として保存しない', () 
   assert.equal(rows[0].fetch_status, 'tax_included_unknown');
 });
 
-t('[!] 楽天 taxIncluded が無い場合も税込と決めつけない', () => {
+t('[!] item にも variant にも payment が無ければ税込と決めつけない', () => {
   const rows = rakutenItemToSnapshots({ manageNumber: 'x', variants: { v: { standardPrice: '1000' } } }, meta);
   assert.equal(rows[0].price_incl_tax, null);
   assert.equal(rows[0].fetch_status, 'tax_included_unknown');
