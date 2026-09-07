@@ -280,4 +280,94 @@ console.log('── /tasks は棚戻し専用 ──');
   });
 }
 
+
+// ═══ ⑧ PR-7: 同じ伝票の複数タスク = 1バッチ (行ごとに同期) ═════════════════════
+console.log('── 同じ伝票の複数タスクを1バッチで運ぶ ──');
+{
+  const pk = mkPickBatch('U8', { sku: 'sku-u8a', lineQty: 1, slipQtys: [1] });
+  const pb = mkPackBatch('U8', { sku: 'sku-u8a', slipQtys: [1] });
+  db.prepare('UPDATE pk_pack_batches SET pk_batch_id=? WHERE id=?').run(pk, pb);
+  const mk = (sku, qty) => Number(db.prepare(`INSERT INTO pk_pack_tasks (batch_id, slip_seq, kind, sku, product_name, req_qty, location, block, status, requested_by, created_at, updated_at)
+    VALUES (?, 1, 'repick', ?, ?, ?, '00100101', 'P3FA', 'requested', '三宅晴菜', ?, ?)`).run(pb, sku, `商品${sku}`, qty, now, now).lastInsertRowid);
+  const tA = mk('sku-u8a', 1), tB = mk('sku-u8b', 2), tC = mk('sku-u8c', 1);
+  db.prepare("UPDATE pk_pack_slips SET status='held', hold_reason='repick' WHERE batch_id=? AND seq=1").run(pb);
+  reconcileRepickBatches();
+  const rb = db.prepare('SELECT * FROM pk_batches WHERE pack_task_id=?').get(tA);
+  t('3タスク → 1バッチ 3行 (pack_task_id は行ごと)', () => {
+    assert.ok(rb);
+    const lines = db.prepare('SELECT seq, sku, qty, pack_task_id FROM pk_lines WHERE batch_id=? ORDER BY seq').all(rb.id);
+    assert.deepEqual(lines, [{ seq: 1, sku: 'sku-u8a', qty: 1, pack_task_id: tA }, { seq: 2, sku: 'sku-u8b', qty: 2, pack_task_id: tB }, { seq: 3, sku: 'sku-u8c', qty: 1, pack_task_id: tC }]);
+    assert.equal(db.prepare('SELECT COUNT(*) AS c FROM pk_batches WHERE origin=? AND pack_batch_id=?').get('repick', pb).c, 1, 'バッチは1本だけ');
+  });
+  t('start → 3タスクとも claimed', () => {
+    ev(rb.id, 'start', {}, '田中美波');
+    const r = sync(rb.id, 'start');
+    assert.deepEqual(r.actions, ['claim', 'claim', 'claim']);
+    assert.deepEqual([tA, tB, tC].map(taskStatus), ['claimed', 'claimed', 'claimed']);
+    assert.deepEqual(r.perTask, { [tA]: 'claimed', [tB]: 'claimed', [tC]: 'claimed' });
+  });
+  t('途中 (1行目だけ完了) では何も変わらない', () => {
+    ev(rb.id, 'next', { lineSeq: 1 }, '田中美波');
+    const r = sync(rb.id, 'next');
+    assert.deepEqual(r.actions, []);
+    assert.equal(batchStatus(rb.id), 'picking');
+  });
+  t('2行目 = 在庫なし (2個中1個は他ロケ)・3行目 = 通常完了 → A/C fulfilled・B unavailable、通知は B だけ', () => {
+    ev(rb.id, 'shortage', { lineSeq: 2, shortageQty: 2, altQty: 1, altBlock: 'P3FB', altLocation: '002-013-03', remaining: 'none' }, '田中美波');
+    ev(rb.id, 'next', { lineSeq: 3 }, '田中美波');
+    assert.equal(batchStatus(rb.id), 'done');
+    const r = sync(rb.id, 'next');
+    assert.deepEqual([tA, tB, tC].map(taskStatus), ['fulfilled', 'unavailable', 'fulfilled']);
+    assert.equal(r.unavailables.length, 1);
+    assert.equal(r.unavailables[0].task.id, tB);
+    assert.equal(r.unavailables[0].remaining, 1);
+    assert.equal(r.unavailables[0].altQty, 1);
+    assert.equal(r.unavailable.task.id, tB, '互換フィールド');
+    assert.equal(taskRow(tB).unavailable_qty, 1);
+    assert.equal(taskRow(tB).fulfilled_qty, 1);
+    assert.equal(stockoutAlerts(tB).length, 1, 'B だけ赤バナー');
+    assert.equal(stockoutAlerts(tA).length + stockoutAlerts(tC).length, 0);
+    assert.equal(r.status, 'fulfilled', 'status は同期キー (A) のもの');
+  });
+  t('同期を再実行しても変わらない (replay: unavailables は空)', () => {
+    const r = sync(rb.id, 'next');
+    assert.deepEqual(r.actions, []);
+    assert.deepEqual(r.unavailables, []);
+    assert.equal(r.unavailable, null);
+  });
+  t('back (done → picking) → 3タスクとも claimed に戻り、赤バナーは閉じる', () => {
+    ev(rb.id, 'back', { lineSeq: 3, undoOpId: lastOp() }, '田中美波');
+    const r = sync(rb.id, 'back');
+    assert.deepEqual(r.actions.sort(), ['resume', 'resume', 'resume']);
+    assert.deepEqual([tA, tB, tC].map(taskStatus), ['claimed', 'claimed', 'claimed']);
+    assert.equal(stockoutAlerts(tB).length, 0);
+  });
+}
+
+console.log('── 複数タスクのバッチ: 一部が1階で取下げ ──');
+{
+  const pk = mkPickBatch('U9', { sku: 'sku-u9a', lineQty: 1, slipQtys: [1] });
+  const pb = mkPackBatch('U9', { sku: 'sku-u9a', slipQtys: [1] });
+  db.prepare('UPDATE pk_pack_batches SET pk_batch_id=? WHERE id=?').run(pk, pb);
+  const mk = (sku) => Number(db.prepare(`INSERT INTO pk_pack_tasks (batch_id, slip_seq, kind, sku, req_qty, status, requested_by, created_at, updated_at)
+    VALUES (?, 1, 'repick', ?, 1, 'requested', '三宅晴菜', ?, ?)`).run(pb, sku, now, now).lastInsertRowid);
+  const tA = mk('sku-u9a'), tB = mk('sku-u9b');
+  reconcileRepickBatches();
+  const rb = db.prepare('SELECT * FROM pk_batches WHERE pack_task_id=?').get(tA);
+  t('片方が取下げでも start できる (残りの行は運ぶ)', () => {
+    db.prepare("UPDATE pk_pack_tasks SET status='cancelled', close_reason='found' WHERE id=?").run(tB);
+    ev(rb.id, 'start', {}, '田中美波');
+    const r = sync(rb.id, 'start');
+    assert.deepEqual(r.actions, ['claim']);
+    assert.equal(taskStatus(tA), 'claimed');
+    assert.equal(taskStatus(tB), 'cancelled', '取下げ済みは触らない');
+  });
+  t('全部取下げなら 409 repick_cancelled', () => {
+    db.prepare("UPDATE pk_pack_tasks SET status='cancelled', close_reason='found' WHERE id=?").run(tA);
+    throwsCode(() => ev(rb.id, 'next', { lineSeq: 1 }, '田中美波'), 'repick_cancelled', '全部取下げ → 409');
+    assert.equal(reconcileRepickBatches(), 1, '一覧を開くと畳まれる');
+    assert.equal(batchStatus(rb.id), 'cancelled');
+  });
+}
+
 console.log(`\n${passed} tests passed`);

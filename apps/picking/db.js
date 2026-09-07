@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -347,6 +347,23 @@ const MIGRATIONS = {
   17: () => {
     db.exec('ALTER TABLE pk_later_requests ADD COLUMN cancelled_by TEXT');
     db.exec('ALTER TABLE pk_later_requests ADD COLUMN cancelled_at TEXT');
+  },
+  // v18 (例外処理監査 PR-7): 同じ伝票の複数の再ピックタスクを1つの 🔴 バッチにまとめる。
+  //   pk_lines.pack_task_id = 行ごとの梱包タスク (状態同期は行単位に) / pk_batches.pack_batch_id + pack_slip_seq = まとめるキー。
+  //   既存の1行バッチは pk_batches.pack_task_id を行に写す。まとめるキーは pk_pack_tasks があれば埋める (無い環境は NULL のまま)
+  18: () => {
+    db.exec('ALTER TABLE pk_lines ADD COLUMN pack_task_id INTEGER');
+    db.exec('ALTER TABLE pk_batches ADD COLUMN pack_batch_id INTEGER');
+    db.exec('ALTER TABLE pk_batches ADD COLUMN pack_slip_seq INTEGER');
+    db.exec(`UPDATE pk_lines SET pack_task_id = (SELECT b.pack_task_id FROM pk_batches b WHERE b.id = pk_lines.batch_id)
+      WHERE pack_task_id IS NULL AND EXISTS (SELECT 1 FROM pk_batches b WHERE b.id = pk_lines.batch_id AND b.origin = 'repick' AND b.pack_task_id IS NOT NULL)`);
+    try {
+      db.exec(`UPDATE pk_batches SET pack_batch_id = (SELECT t.batch_id FROM pk_pack_tasks t WHERE t.id = pk_batches.pack_task_id),
+          pack_slip_seq = (SELECT t.slip_seq FROM pk_pack_tasks t WHERE t.id = pk_batches.pack_task_id)
+        WHERE origin = 'repick' AND pack_task_id IS NOT NULL`);
+    } catch { /* packing 無効環境 (pk_pack_tasks が無い) */ }
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_lines_pack_task ON pk_lines(pack_task_id) WHERE pack_task_id IS NOT NULL');
+    db.exec("CREATE INDEX IF NOT EXISTS idx_pk_batches_repick_slip ON pk_batches(pack_batch_id, pack_slip_seq) WHERE origin = 'repick'");
   },
 };
 
