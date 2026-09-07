@@ -749,6 +749,13 @@ function setDraftTouchedReason(db, set) {
 }
 
 /**
+ * 取り消した記録 (JSON) の区切り。draft_events.detail は人が読む画面にそのまま出るので、
+ * 「人が読む文 + この区切り + JSON」という形にしている。
+ * 復元する側は `detail.split(UNDO_RECORD_MARKER)[1]` を JSON.parse する
+ */
+export const UNDO_RECORD_MARKER = ' ／ 取り消した記録 #json:';
+
+/**
  * 直前の「セット展開判断」を取り消す (2026-09-07 中原さん:「間違って選択したときに戻せるように」)。
  *
  * 履歴は append-only にしていたが、ボードのカードから 1 クリックで判断できるようにすると
@@ -797,14 +804,17 @@ export function undoSetDecision(db, draftId, actor) {
 
   db.prepare('DELETE FROM draft_set_decisions WHERE id = ?').run(last.id);
   const prev = latestSetDecision(db, id);
-  // 🚨 消した行の中身をそのまま履歴に残す (2026-09-07 Codex R1)。
+  // 🚨 消した行の中身をそのまま履歴に残す (2026-09-07 Codex R1/R2)。
   //    append-only の表から 1 行消す以上、あとから「何を取り消したか」を構造化して
-  //    たどれないと監査にならない。文言だけだと理由コードや紐づけ先が復元できない
+  //    たどれないと監査にならない。文言だけだと理由コードや紐づけ先が復元できない。
+  //    操作履歴は detail をそのまま人に見せる画面なので、**前半は人が読む文・後半は
+  //    区切り (UNDO_RECORD_MARKER) の後ろに JSON** という形にした。
+  //    復元するときは detail.split(UNDO_RECORD_MARKER)[1] をそのまま JSON.parse できる
   logEvent(db, id, 'set_decision_undone',
     `判断「${describeSetDecision(last)}」を取り消しました`
     + (withdrawn ? ` ／ セット ${withdrawn.neCode} を取り下げ` : '')
     + (prev ? ` (ひとつ前の判断「${describeSetDecision(prev)}」に戻ります)` : ' (未判断に戻ります)')
-    + ` ／ 取り消した記録: ${JSON.stringify(removed)}`,
+    + UNDO_RECORD_MARKER + JSON.stringify({ removed, previous: prev, withdrawn }),
     actor);
   return {
     undone: describeSetDecision(last),

@@ -7686,6 +7686,17 @@ for (const [name, file, data] of renders) {
     && u1.r.closing === false, JSON.stringify(u1));
   check('判断の取り消し: 何を取り消したかは履歴に残る (記録が消えるわけではない)',
     db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(d1).c === 1);
+  // 🚨 append-only の表から 1 行消す以上、消した行を**そのまま復元できる**ところまで残す。
+  //    人が読む画面に出る detail なので「文 + 区切り + JSON」。区切りの後ろは素で JSON.parse できる
+  check('判断の取り消し: 消した行は JSON で復元できる (理由コードや紐づけ先まで)',
+    (() => {
+      const ev = db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(d1);
+      const parsed = JSON.parse(String(ev.detail).split(sd.UNDO_RECORD_MARKER)[1]);
+      return parsed.removed.decision === 'none' && parsed.removed.reason_code === 'low_demand'
+        && parsed.removed.decided_by === 'smoke' && !!parsed.removed.decided_at
+        && parsed.previous === null && parsed.withdrawn === null;
+    })(),
+    db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(d1)?.detail);
 
   // ③ 判断が 2 件あるときは**ひとつ前**に戻る (必ず未判断に戻すと辻褄が合わなくなる)
   const d2 = newDraft('SETUNDO-2');
