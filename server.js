@@ -6,6 +6,7 @@ import bcrypt from 'bcryptjs';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import linegiftRouter from './apps/linegift-sync/router.js';
 import mercariRouter from './apps/mercari-sync/router.js';
@@ -349,6 +350,20 @@ app.use((req, res, next) => {
   return globalJsonParser(req, res, next);
 });
 app.use(express.static(path.join(__dirname, 'public')));
+// 📷 入荷受付チェック「商品から探す」のカメラ読み取りに使うデコーダ (zxing-wasm)。
+// 🚨 **Safari は BarcodeDetector (Shape Detection API) を実装していない** ので、iPad でカメラから
+//    バーコードを読むにはデコーダを自前で配る必要がある (2026-09-07。最初の実装はこれを知らずに
+//    BarcodeDetector を使い、iPad では一度もカメラが起動しなかった)。
+// ⭐node_modules から直接配る = **JS と wasm の版が必ず揃う**。public/ に写すと片方だけ古くなる。
+//   Cache-Control は付けない (既定 = 毎回 ETag 検証 → 304)。版が変わったときに
+//   JS だけ新しく wasm が古い、という組み合わせを作らないため。読むのはボタンを押したときだけ
+// 🚨 解決に失敗してもポータル全体を落とさない (カメラが使えないだけで、検索も値札も動く)
+try {
+  const zxingWasm = createRequire(import.meta.url).resolve('zxing-wasm/reader/zxing_reader.wasm');
+  app.use('/vendor/zxing-wasm', express.static(path.dirname(path.dirname(zxingWasm))));
+} catch (e) {
+  console.warn('[server] zxing-wasm を配れません (📷 カメラ読み取りは使えません):', e.message);
+}
 
 // セッションストア(connect-sqlite3)は全リクエストで sessions.db を読み書きする。Render の
 // network-attached disk では rollback-journal モードの fsync が遅く、どのページでも TTFB を
