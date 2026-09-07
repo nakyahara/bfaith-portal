@@ -26,7 +26,6 @@
  * ここを変えるときは agent.ps1 も直す。
  */
 import crypto from 'crypto';
-import { soleBatchOfTask } from './batches.js';
 import { getDB } from './db.js';
 import { getTask } from './tasks-db.js';
 
@@ -149,7 +148,29 @@ export function recordHeartbeat(deviceId, { note = null, version = null, bpac = 
  *   requestedBy / requestedDevice … 記録用
  * @returns {{ok:true, job, created:boolean}|{ok:false, error, message, job?}}
  */
-export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty = null, expiry = null, targetDeviceId = null, clientRequestId, acknowledgeUnknownJobId = null, requestedBy = null, requestedDevice = null }) {
+/**
+ * ⭐どのまとまりのぶんを刷るかを決める (要件 §AB-12)。
+ *
+ * ⭐**まとまりが 2 つ以上あるのに指定が無ければ断る**。カードに期限が違うぶんが混ざっていることが
+ *   あり (§AB-12 の前提 7)、どのぶんか決めずに刷ると**違う期限のラベルを箱に貼る**。
+ *   貼ってしまうと現物からは分からない。だから「どちらか選んで」と返す。
+ * ⭐指定があれば、そのカードのもので・取り消していないことを確かめる。
+ */
+function pickPrintBatch(db, taskId, batchId) {
+  const rows = db.prepare("SELECT * FROM f_iroha_task_batches WHERE task_id = ? AND work_status <> 'cancelled' ORDER BY seq").all(taskId);
+  if (batchId != null) {
+    const b = rows.find((r) => r.id === Number(batchId));
+    if (!b) return { error: 'bad_batch', ok: false, message: 'そのぶんはこのカードにありません (画面を更新してください)' };
+    return { batch: b };
+  }
+  if (rows.length === 0) return { batch: null };            // まとまりが無い古いカード (今までどおり)
+  if (rows.length === 1) return { batch: rows[0] };
+  return { error: 'pick_batch', ok: false,
+    message: 'このカードは分かれています。どのぶんのラベルを出すか選んでください',
+    batches: rows.map((r) => ({ id: r.id, seq: r.seq, planned_qty: r.planned_qty, expiry: r.expiry, facility_code: r.facility_code })) };
+}
+
+export function enqueuePrintJob({ taskId, batchId = null, copies, packQty = null, extraPackQty = null, expiry = null, targetDeviceId = null, clientRequestId, acknowledgeUnknownJobId = null, requestedBy = null, requestedDevice = null }) {
   const db = getDB();
   const crid = String(clientRequestId || '').trim();
   if (!/^[A-Za-z0-9._:-]{8,80}$/.test(crid)) return { ok: false, error: 'bad_request', message: 'client_request_id が必要です' };
@@ -184,6 +205,8 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty =
     if (dup) {
       // 同じ ID で中身が違う = 画面の不具合か ID の衝突。別のカードのジョブを「積めた」と返さない (Codex PR #1220 R1 中)
       const same = dup.task_id === tid && dup.copies === n && dup.pack_qty === pack && dup.extra_pack_qty === extra && dup.expiry_text === exp
+        // ⭐どのまとまりのぶんかも「同じ内容」の一部。違えば別のラベルなので、積めたことにしない
+        && (batchId == null || dup.batch_id === Number(batchId))
         && (targetDeviceId == null || dup.target_device_id === Number(targetDeviceId));
       if (!same) return { ok: false, error: 'idempotency_conflict', message: '同じ依頼 ID で違う内容が送られました。画面を更新してもう一度発行してください', job: publicJob(dup) };
       return { ok: true, job: publicJob(dup), created: false, replayed: true };
@@ -240,9 +263,11 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty =
         return { ok: false, error: 'confirm_unknown', message: '前回のジョブの状態が変わりました。画面を更新してもう一度確認してください', job: publicJob(cur) };
       }
     }
-    // ⭐どのまとまりのぶんを刷ったか (要件 §AB-12)。まとまりが 1 つのうちはそれ。
-    //   刷った中身は下の列にそのまま残るので、あとで期限や数を直しても記録は変わらない
-    const sole = soleBatchOfTask(db, tid);
+    // ⭐どのまとまりのぶんを刷ったか (要件 §AB-12)。刷った中身は下の列にそのまま残るので、
+    //   あとで期限や数を直しても記録は変わらない
+    const pick = pickPrintBatch(db, tid, batchId);
+    if (pick.error) return pick;
+    const sole = pick.batch;
     const info = db.prepare(`INSERT INTO f_iroha_print_jobs
       (client_request_id, task_id, batch_id, product_code, product_name, barcode, barcode_type, pack_qty, extra_pack_qty, expiry_text, copies,
        printer_name, target_device_id, requested_by, requested_device, acknowledged_job_id, state, created_at, updated_at)

@@ -27,7 +27,7 @@ if (!process.env.DATA_DIR) {
 }
 
 // ⭐画面のキャッシュの版。画面を直した PR ではここだけ直す（以前は同じ文字列を 3 か所に書いていて、毎回 3 か所直していた）
-const SW_CACHE = 'iroha-work-shell-v18';
+const SW_CACHE = 'iroha-work-shell-v19';
 
 let pass = 0, fail = 0;
 function ok(cond, label) {
@@ -3867,9 +3867,29 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /return '<button class="printbig" data-id="' \+ esc\(String\(c\.id\)\) \+ '" onclick="openPrintBox\(this\.dataset\.id\)">' \+ label \+ '<\/button>';/.test(html)
     && /'🖨 箱ラベルを印字する'/.test(html) && /\.printbig\{display:block;width:100%/.test(html),
     '詳細は「🖨 箱ラベルを印字する」の大きなボタン (小さなチップにしない — 中原さん 2026-09-06)');
-  ok(/const expiry = c\.expiry \? String\(c\.expiry\) : \(m\.expiry_seal === 1 \? '期限シールあり' : ''\);/.test(html)
-    && /let units = m\.units_per_container != null \? String\(m\.units_per_container\) : '';/.test(html),
+  ok(html.includes("const expiry = expSrc ? String(expSrc) : (m.expiry_seal === 1 ? '期限シールあり' : '');")
+    && html.includes("let units = m.units_per_container != null ? String(m.units_per_container) : '';"),
     '既定値: 1 箱に何個=入数 / 期限=この入荷の有効期限 (無ければ期限シールありの印)');
+  // ⭐箱ラベルはまとまり単位 (要件 §AB-12)
+  ok(html.includes('const expSrc = (batch && batch.expiry) || c.expiry;'),
+    '⭐期限は**そのまとまりのもの**を既定にする (1 つの入荷に期限が混ざる)');
+  ok(html.includes('const bc = batch && bs.length > 1 ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;'),
+    '⭐箱の数も**そのまとまりの数**で数える (400 個のぶんに 1000 個ぶんのラベルを出さない)');
+  ok(html.includes('if (bs.length > 1 && batchId == null) { openPrintBatchPick(c, bs); return; }'),
+    '⭐分かれているカードは、どのぶんか選んでから出す');
+  ok(html.includes('function openPrintBatchPick(c, bs)') && html.includes("$('#printOk').disabled = true;"),
+    '選ぶまでは発行させない');
+  ok(html.includes('batch_id: ctx.batchId == null ? undefined : ctx.batchId,'), 'どのぶんかをサーバーにも送る');
+  // 箱の数え方を実際に動かす
+  {
+    const src = html.match(/function boxesOf\(qty, per\) \{[\s\S]*?\r?\n\}/)[0];
+    const fn = new Function(src + '; return boxesOf;')();
+    const b = fn(360, 70);
+    ok(b.full === 5 && b.rest === 10 && b.boxes === 6, '360 個 / 70 個入り → 満杯 5 箱 + 端数 10 個で 6 箱');
+    ok(fn(140, 70).rest === 0 && fn(140, 70).boxes === 2, '割り切れれば端数なし');
+    ok(fn(100, null) === null && fn(100, 0) === null,
+      '⭐入数が分からなければ null (0 箱として「ラベル 0 枚」にしない)');
+  }
 
   // 🏷 端数の箱 — 必要保管箱 6 箱 (70×5＋10) なら 70 個 5 枚 ＋ 10 個 1 枚 (中原さん 2026-09-06)
   ok(/if \(bc\.rest > 0 && bc\.full > 0\) \{ copies = bc\.full; extraQty = String\(bc\.rest\); units = String\(bc\.per\); \}/.test(html)

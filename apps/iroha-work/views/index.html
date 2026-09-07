@@ -356,6 +356,10 @@
   .reasons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
   .reasons .btn.on{outline:2px solid var(--danger);outline-offset:1px;background:var(--danger-soft);border-color:var(--danger);color:var(--danger)}
   .dcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:12px}
+  /* 🏷 どのぶんのラベルかを選ぶ (§AB-12) */
+  .pbatches{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+  .pbatches .btn{text-align:left;justify-content:flex-start;font-weight:600}
+  .pbatches .btn b{font-weight:800;margin-right:4px}
   /* 👥 人数だけの作業 (§AB-10) */
   .hcnt{display:flex;flex-direction:column;gap:8px}
   .hrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--well);border:1px solid var(--line);
@@ -2539,18 +2543,47 @@ function printWarnHtml(a) {
   if (a.paper_ok === false) warn.push('QL-800 に用紙「箱ラベル 62x67」が登録されていないため、印刷に失敗します');
   return warn.length ? '<div class="pwarn">⚠ ' + warn.map(esc).join('<br>⚠ ') + '</div>' : '';
 }
-function openPrintBox(id) {
+/**
+ * 箱の数え方 (サーバーの neededBoxesCalc と同じ)。⭐入数が分からなければ null —
+ * 0 箱として扱うと「ラベル 0 枚」になり、必要な枚数と違うものを出す
+ */
+function boxesOf(qty, per) {
+  const p = Number(per);
+  const n = Number(qty);
+  if (!Number.isSafeInteger(p) || p <= 0 || !Number.isSafeInteger(n) || n < 0) return null;
+  const full = Math.floor(n / p);
+  const rest = n % p;
+  return { full, rest, per: p, boxes: full + (rest > 0 ? 1 : 0) };
+}
+/**
+ * ⭐箱ラベルは**まとまり単位**で出す (要件 §AB-12)。
+ * 1 つのカードに期限の違うぶんが混ざることがあるので、分かれているカードでは
+ * どのぶんかを先に選ばせる。決めずに刷ると、**違う期限のラベルを箱に貼る** —
+ * 貼ってしまうと現物からは分からない。
+ */
+function printableBatches(c) {
+  return (c.batches || []).filter((b) => b.work_status !== 'cancelled');
+}
+function openPrintBox(id, batchId) {
   const c = findCard(id);
   if (!c) return;
   if (!worker) { openGate(); return; }
   const agents = printAgents();
   if (agents.length === 0) { showErr('ラベルを印刷する いろはPC が登録されていません (管理画面で印刷係を登録)'); return; }
-  printCtx = { id: c.id, reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), saving: false };
+  const bs = printableBatches(c);
+  // 分かれているのに選んでいなければ、まず選んでもらう
+  if (bs.length > 1 && batchId == null) { openPrintBatchPick(c, bs); return; }
+  const batch = batchId != null ? bs.find((b) => b.id === Number(batchId)) : (bs.length === 1 ? bs[0] : null);
+  if (batchId != null && !batch) { showErr('そのぶんが見つかりません (画面を更新してください)'); return; }
+  printCtx = { id: c.id, batchId: batch ? batch.id : null,
+    reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), saving: false };
   const m = c.master || {};
   const type = barcodeTypeOf(c.barcode);
   // ⭐必要保管箱の内訳から分ける: 満杯の箱 (per 個) が full 箱、端数が rest 個で 1 箱。
   //   例 360 個 / 1 箱 70 個 → 70 個のラベル 5 枚 ＋ 10 個のラベル 1 枚 (中原さん 2026-09-06)
-  const bc = c.boxes_calc;
+  // ⭐分かれているときは**そのまとまりの数**で箱を数える。カード全体の数で数えると、
+  //   400 個のぶんに 1000 個ぶんのラベルを出してしまう (§AB-11 の 5a と同じ落とし穴)
+  const bc = batch && bs.length > 1 ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;
   let units = m.units_per_container != null ? String(m.units_per_container) : '';
   let copies = 1;
   let extraQty = '';
@@ -2563,7 +2596,9 @@ function openPrintBox(id) {
   //   多すぎるときはそのまま出して、合計の案内と発行時の検査で止める
   copies = Math.max(1, copies);
   // 期限の既定: この入荷の有効期限 → 無ければ「期限シールあり」の商品だけ印を入れる (無い商品は空欄)
-  const expiry = c.expiry ? String(c.expiry) : (m.expiry_seal === 1 ? '期限シールあり' : '');
+  // ⭐期限も**そのまとまりのもの**を既定にする (§AB-12 の前提 7: 1 つの入荷に期限が混ざる)
+  const expSrc = (batch && batch.expiry) || c.expiry;
+  const expiry = expSrc ? String(expSrc) : (m.expiry_seal === 1 ? '期限シールあり' : '');
   const first = agents.find(a => a.online) || agents[0];
   const opts = agents.map(a => '<option value="' + a.id + '"' + (a.id === first.id ? ' selected' : '') + '>' + esc(a.label) + ' — ' + esc(a.printer_name || '(プリンター未登録)') + (a.online ? '' : ' (応答なし)') + '</option>').join('');
   // 🚨 直前が「❓ 結果不明」「🙋 手で刷る扱い」なら、実物を見た / 手で刷っていない ことをチェックさせてからしか送らない
@@ -2577,6 +2612,13 @@ function openPrintBox(id) {
       + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printAck"> 手で刷っていない (P-touch Editor で出していない)</label></div>';
   $('#printBody').innerHTML =
     '<div class="pfld"><label>商品</label><div class="ro"><b>' + esc(c.title) + '</b><br><span class="num">' + esc(c.product_code || '') + '</span></div></div>' +
+    (bs.length > 1 && batch
+      ? '<div class="pfld"><label>どのぶんのラベルか</label><div class="ro"><b>まとまり #' + esc(String(batch.seq)) + '</b>'
+        + ' ・ ' + esc(String(batch.planned_qty)) + ' 個'
+        + (batch.expiry ? ' ・ 期限 ' + esc(batch.expiry) : '')
+        + ' ・ ' + esc(facilityName(batch.facility_code || c.facility_code) || '未定')
+        + ' <button type="button" class="btn-sm" onclick="closeOverlay(\'#printOv\'); openPrintBox(' + c.id + ')">選び直す</button></div></div>'
+      : '') +
     '<div class="pfld"><label>バーコード</label><div class="ro num">' + esc(c.barcode || '') + ' <small>(' + (type ? type.toUpperCase() : '不明') + ')</small></div></div>' +
     '<div class="pfld"><label>1 箱に何個 (ラベルの「数量」。空欄なら印字しない)</label><input type="number" inputmode="numeric" min="1" step="1" id="printPack" value="' + esc(units) + '" placeholder="未登録"></div>' +
     '<div class="pfld"><label>期限 (空欄なら印字しない)</label><input type="text" id="printExpiry" maxlength="40" value="' + esc(expiry) + '" placeholder="例: 2027-03"></div>' +
@@ -2591,6 +2633,33 @@ function openPrintBox(id) {
   renderPrintSum();
   openOverlay('#printOv');
 }
+/**
+ * ⭐どのぶんのラベルかを選ぶ (要件 §AB-12)。期限・数がまとまりごとに違いうるので、
+ * それを見て選べるようにする。⚠window.prompt は iOS のホーム画面アプリで出ないことがある (監修 R-1)
+ */
+function openPrintBatchPick(c, bs) {
+  $('#printBody').innerHTML =
+    '<div class="pfld"><label>商品</label><div class="ro"><b>' + esc(c.title) + '</b></div></div>' +
+    '<p class="hint">このカードは ' + bs.length + ' つに分かれています。<b>どのぶんのラベルを出しますか。</b>' +
+      '期限や数がぶんごとに違うことがあります。</p>' +
+    '<div class="pbatches">' + bs.map((b) =>
+      '<button type="button" class="btn wide" data-prbatch="' + esc(String(b.id)) + '">' +
+        '<b>まとまり #' + esc(String(b.seq)) + '</b> ・ ' + esc(String(b.planned_qty)) + ' 個' +
+        (b.expiry ? ' ・ 期限 ' + esc(b.expiry) : ' ・ 期限なし') +
+        ' ・ ' + esc(facilityName(b.facility_code || c.facility_code) || '未定') +
+      '</button>').join('') + '</div>';
+  $('#printMsg').textContent = '';
+  $('#printOk').disabled = true;   // 選ぶまでは発行させない
+  openOverlay('#printOv');
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-prbatch]');
+  if (!b) return;
+  const c = findCard(printCtx ? printCtx.id : curDetail) || findCard(curDetail);
+  closeOverlay('#printOv');
+  if (c) openPrintBox(c.id, Number(b.dataset.prbatch));
+});
+
 /** 「70 個 × 5 枚 ＋ 10 個 × 1 枚 = 6 枚」— 何枚出るかを人が読める形で出す */
 function renderPrintSum() {
   const el = $('#printSum');
@@ -2658,6 +2727,7 @@ async function submitPrint() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         task_id: c.id, worker_id: worker.id, copies, pack_qty: packRaw || null, extra_pack_qty: extraRaw || null, expiry: expiry || null,
+        batch_id: ctx.batchId == null ? undefined : ctx.batchId,
         target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
       }),
     });

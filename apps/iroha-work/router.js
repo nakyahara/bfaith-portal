@@ -518,7 +518,11 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
   if (tid == null) return res.status(400).json(BAD_TASK_ID);
   const deviceLabel = req.iwDevice ? req.iwDevice.label : (req.iwUser || null);
   const r = enqueuePrintJob({
-    taskId: tid, copies: numOrNull(b.copies),
+    taskId: tid,
+    // ⭐どのぶんのラベルか (要件 §AB-12)。分かれたカードで決めずに刷ると、
+    //   期限の違うぶんに同じラベルを貼ってしまう
+    batchId: numOrNull(b.batch_id),
+    copies: numOrNull(b.copies),
     packQty: b.pack_qty == null || b.pack_qty === '' ? null : b.pack_qty,
     extraPackQty: b.extra_pack_qty == null || b.extra_pack_qty === '' ? null : b.extra_pack_qty,
     expiry: b.expiry == null ? null : String(b.expiry),
@@ -534,6 +538,7 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
   }
   if (!r.ok) {
     const status = ['in_progress', 'confirm_unknown', 'confirm_manual', 'state_changed', 'idempotency_conflict', 'closed_task'].includes(r.error) ? 409 : r.error === 'not_found' ? 404 : 400;
+    // pick_batch = 「どのぶんか選んで」。入力の不足なので 400 (画面は選ばせて出し直す)
     // (bad_extra_qty など入力の誤りは 400)
     return res.status(status).json(r);
   }
