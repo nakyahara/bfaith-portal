@@ -163,15 +163,18 @@
         <% if (typeof carry !== 'undefined' && carry) { %>
           <p class="hint carried<%= carry.checkedToday ? '' : ' ng-carried' %>">📅 <b><%= carry.from %> に取り込んだ一覧を引き継いで作業中</b>です
             (本日 = <%= active.work_date %>。前日の ✅ と数えた数は残っています)。
-            <% if (carry.checkedToday) { %>
-              本日 <span data-jst="<%= carry.checkedAt %>"></span> に共有ドライブの CSV を読みましたが、<b>中身が変わっていません</b>
-              = ロジザードに新しい入荷受付が1件も増えていない日です。
-              <% if (!carry.sourceToday) { %>
-                <br>※ 共有ドライブの CSV 自体は <span data-jst="<%= carry.sourceAt %>"></span> のままです。
-                rclone は中身が同じなら転送しないため<b>これ自体は異常ではありません</b>が、
-                miniPC の定時取得 (08:40 / 11:45) が動いているかは jobs-monitor の <code>logizard-nyuka-csv</code> で確認してください
-                (Render 側からは「ロジザードから出し直したか」までは分かりません)
-              <% } %>
+            <% if (carry.checkedToday && carry.sourceToday) { %>
+              本日 <span data-jst="<%= carry.checkedAt %>"></span> に共有ドライブの<b>新しい CSV</b>
+              (<span data-jst="<%= carry.sourceAt %>"></span> 更新) を読みましたが中身が変わっていません
+              = ロジザードに新しい入荷受付が1件も増えていない日です
+            <% } else if (carry.checkedToday) { %>
+              本日 <span data-jst="<%= carry.checkedAt %>"></span> に共有ドライブの CSV を読みましたが、
+              <b>共有ドライブ上の一覧には新しい入荷受付は増えていません</b>。
+              <br>※ ただし CSV 自体は <span data-jst="<%= carry.sourceAt %>"></span> のままなので、
+              <b>ロジザード側で増えていないとまでは言い切れません</b>。rclone は中身が同じなら転送しないため
+              更新時刻が動かないこと自体は異常ではありませんが、miniPC の定時取得 (08:40 / 11:45) が動いているかは
+              jobs-monitor の <code>logizard-nyuka-csv</code> で確認してください
+              (Render 側からは「ロジザードから出し直したか」までは分かりません)
             <% } else { %>
               <b>⚠本日はまだ共有ドライブから一覧を取りに行けていません</b><% if (!carry.checkedAt) { %> (確認できた記録がありません)<% } else { %> (最後に確認できたのは <span data-jst="<%= carry.checkedAt %>"></span>)<% } %>。
               miniPC の定時取得 (08:40 / 11:45) と rclone 転送、下の取込履歴に失敗が並んでいないかを確認してください

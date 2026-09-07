@@ -635,6 +635,13 @@ console.log('\n[11] 管理画面の入口でも業務日を繰り越す');
     '管理画面が「読めた日」と「取りに行けていない日」を言い分ける');
   ok(/rclone は中身が同じなら転送しない/.test(ejsSrc),
     'Drive の更新時刻が古いだけでは異常でないことを書いてある (誤った切り分けを誘導しない)');
+  // 🚨 Render が確かめられるのは「共有ドライブまで」。CSV 自体が古い日に
+  //    「ロジザードに増えていない」と断定しない (Codex #1231 R3 高)
+  ok(/言い切れません/.test(ejsSrc) && /共有ドライブ上の一覧には新しい入荷受付は増えていません/.test(ejsSrc),
+    'CSV 自体が古い日は「ロジザード側で増えていないとまでは言い切れない」と書く');
+  const idxSrc = fs.readFileSync(new URL('../apps/inbound-check/views/index.html', import.meta.url), 'utf8');
+  ok(/共有ドライブの一覧に新しい入荷受付は増えていません/.test(idxSrc),
+    'iPad の文言も「共有ドライブの一覧に」と範囲を書く');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

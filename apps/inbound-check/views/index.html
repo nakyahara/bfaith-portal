@@ -571,7 +571,7 @@
       if (state.day_stale) banner('warn', '一覧の業務日を今日に更新できませんでした (表示中は ' + esc(b.work_date || '') + ' の一覧です)。「🚚 いま取りに行く」を押してください');
       else if (state.carried_from && state.import_checked_today) {
         banner('info', '<b>' + esc(fmtDate(state.carried_from)) + ' の一覧を引き継いで</b>作業中です (前日の ✅ と数えた数は残っています)。'
-          + '本日 ' + esc(fmtJst(state.import_checked_at)) + ' 時点で <b>新しい入荷受付は増えていません</b>。'
+          + '本日 ' + esc(fmtJst(state.import_checked_at)) + ' 時点で <b>共有ドライブの一覧に新しい入荷受付は増えていません</b>。'
           + 'いま登録したぶんを出すには「🚚 いま取りに行く」を押してください');
       } else if (state.carried_from) {
         banner('warn', '<b>' + esc(fmtDate(state.carried_from)) + ' の一覧を引き継いで</b>作業できます (前日の ✅ と数えた数は残っています)。'
