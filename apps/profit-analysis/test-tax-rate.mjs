@@ -8,7 +8,7 @@
  * 実行: node apps/profit-analysis/test-tax-rate.mjs
  */
 import assert from 'node:assert/strict';
-import { taxMultiplier, TAX_RATE_FALLBACK } from './router.js';
+import { taxMultiplier, resolveSetTax, TAX_RATE_FALLBACK } from './router.js';
 
 let passed = 0;
 function t(name, fn) {
@@ -82,55 +82,71 @@ t('Infinity → fallback', () => {
   assert.equal(taxMultiplier(Infinity), 1 + TAX_RATE_FALLBACK);
 });
 
-// ─── セット構成品の税率混在 (呼び出し側の挙動を固定する) ───
-// router.js の実装:
-//   taxRates.push(prod.消費税率 || TAX_RATE_FALLBACK)
-//   const uniqueTaxRates = [...new Set(taxRates)]
-//   if (!allFound || uniqueTaxRates.length > 1) -> hard fail (原価不確定)
-//   else -> taxMultiplier(uniqueTaxRates[0])
-function setResolution(rawRates, allFound = true) {
-  const taxRates = rawRates.map(r => r || TAX_RATE_FALLBACK);
-  const unique = [...new Set(taxRates)];
-  if (!allFound || unique.length > 1) return { hardFail: true };
-  return { hardFail: false, multiplier: taxMultiplier(unique[0]) };
-}
-
-console.log('\nセット構成品の税率混在 (呼び出し側)');
+// ─── セット構成品の税率解決 ───
+// 🚨 本番と同じ関数 (router.js の resolveSetTax) を呼ぶ。
+//    ここでロジックを書き写すと、本番のガードを消してもテストが PASS してしまう (Codex R2)
+console.log('\nresolveSetTax (本番と同じ関数を呼ぶ)');
 
 t('[0.1, 0.1] → 1.1 (混在なし)', () => {
-  const r = setResolution([0.1, 0.1]);
-  assert.equal(r.hardFail, false);
+  const r = resolveSetTax([0.1, 0.1], true);
+  assert.equal(r.ok, true);
   assert.equal(r.multiplier, 1.1);
 });
 
+t('[0.08, 0.08] → 1.08', () => {
+  const r = resolveSetTax([0.08, 0.08], true);
+  assert.equal(r.ok, true);
+  assert.ok(Math.abs(r.multiplier - 1.08) < 1e-9);
+});
+
 t('[0.08, 0.1] は hard fail (混在)', () => {
-  assert.equal(setResolution([0.08, 0.1]).hardFail, true);
+  const r = resolveSetTax([0.08, 0.1], true);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'mixed_tax_rate');
 });
 
 t('[0.1, 0.08] も hard fail (順序に依存しない)', () => {
-  assert.equal(setResolution([0.1, 0.08]).hardFail, true);
+  const r = resolveSetTax([0.1, 0.08], true);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'mixed_tax_rate');
 });
 
 t('🚨 [0.1, null] は成功する (旧実装では [0.1, 10] で hard fail していた)', () => {
   // 挙動変更を意図として固定する。旧実装は単位の取り違えで偶然 hard fail していただけで、
   // どちらも 10% 扱いなのだから成功が正しい
-  const r = setResolution([0.1, null]);
-  assert.equal(r.hardFail, false);
+  const r = resolveSetTax([0.1, null], true);
+  assert.equal(r.ok, true);
   assert.equal(r.multiplier, 1.1);
 });
 
 t('[0.08, null] は hard fail のまま (8% と 10% は本当に混在)', () => {
-  assert.equal(setResolution([0.08, null]).hardFail, true);
+  const r = resolveSetTax([0.08, null], true);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'mixed_tax_rate');
 });
 
 t('全件未登録 [null, null] → 1.1', () => {
-  const r = setResolution([null, null]);
-  assert.equal(r.hardFail, false);
+  const r = resolveSetTax([null, null], true);
+  assert.equal(r.ok, true);
   assert.equal(r.multiplier, 1.1);
 });
 
 t('構成品の一部が見つからない (allFound=false) → hard fail', () => {
-  assert.equal(setResolution([0.1], false).hardFail, true);
+  const r = resolveSetTax([0.1], false);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'missing_component');
+});
+
+t('欠損は混在より先に判定される (両方成立しても missing_component)', () => {
+  const r = resolveSetTax([0.08, 0.1], false);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'missing_component');
+});
+
+t('構成品1つ [0.08] → 1.08', () => {
+  const r = resolveSetTax([0.08], true);
+  assert.equal(r.ok, true);
+  assert.ok(Math.abs(r.multiplier - 1.08) < 1e-9);
 });
 
 console.log(`\n${passed} 件 PASS`);

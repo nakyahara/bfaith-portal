@@ -39,6 +39,26 @@ export function taxMultiplier(rate) {
   return 1 + rate;
 }
 
+/**
+ * セット構成品の税率を1つに解決する (Amazon SKU→NE 展開で使う)。
+ *
+ * 税率混在・構成品の欠損は「正常値っぽい粗利を出さない」ため hard fail にする。
+ * 🚨 テストと本番が同じ関数を通るように、ここから export している
+ *    (テスト側でロジックを書き写すと、本番のガードを消しても PASS してしまう — Codex R2)
+ *
+ * @param {Array<number|null>} rates 構成品の消費税率 (mirror_products.消費税率 の生値)
+ * @param {boolean} allFound 全構成品が商品マスタで見つかったか
+ * @returns {{ok: true, multiplier: number} | {ok: false, reason: 'missing_component'|'mixed_tax_rate'}}
+ */
+export function resolveSetTax(rates, allFound) {
+  if (!allFound) return { ok: false, reason: 'missing_component' };
+  // NE 未登録 (null/0) は 10% 扱いに寄せてから混在を判定する。
+  // ここで寄せないと「税率が分かる構成品」と混在扱いになり、hard fail が増える
+  const unique = [...new Set(rates.map(r => r || TAX_RATE_FALLBACK))];
+  if (unique.length > 1) return { ok: false, reason: 'mixed_tax_rate' };
+  return { ok: true, multiplier: taxMultiplier(unique[0]) };
+}
+
 // ─── メイン画面 ───
 router.get('/', (req, res) => {
   // Codex PR3 R1 High 1 反映: feature flag OFF 時は EJS レンダリング時点でタブBを出さない
@@ -166,9 +186,8 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
             const prod = productMap.get(entry.ne_code);
             if (prod) {
               if (prod.原価) totalCost += prod.原価 * entry.qty;
-              // NE 未登録 (null/0) は従来どおり 10% 扱い。ここで fallback しないと
-              // 「税率が分かる構成品」と混在して hard fail になり、挙動が変わる
-              taxRates.push(prod.消費税率 || TAX_RATE_FALLBACK);
+              // 生値のまま集める (fallback と混在判定は resolveSetTax が行う)
+              taxRates.push(prod.消費税率);
               if (prod.送料) totalShip += prod.送料 * entry.qty;
               if (productName === listingCode && prod.商品名) productName = prod.商品名;
             } else {
@@ -176,18 +195,20 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
             }
           }
           // 税率混在/部分欠損は hard fail (Codex指摘: 正常値っぽい粗利を出さない)
-          const uniqueTaxRates = [...new Set(taxRates)];
-          if (!allFound || uniqueTaxRates.length > 1) {
+          const setTax = resolveSetTax(taxRates, allFound);
+          if (!setTax.ok) {
             costExTax = 0;
-            taxRate = 1.1;
-            costSource = !allFound ? 'SKU→NE(部分欠損・原価不確定)' : 'SKU→NE(税率混在・原価不確定)';
+            taxRate = 1 + TAX_RATE_FALLBACK;
+            costSource = setTax.reason === 'missing_component'
+              ? 'SKU→NE(部分欠損・原価不確定)'
+              : 'SKU→NE(税率混在・原価不確定)';
           } else {
             costExTax = totalCost * qty;
             // FBMは商品マスタの送料、FBAは後でfba_feeを送料欄に入れる
             if (channel !== 'FBA') {
               shipping = totalShip * qty;
             }
-            taxRate = taxMultiplier(uniqueTaxRates[0]);
+            taxRate = setTax.multiplier;
             costSource = 'SKU→NE';
           }
         }
