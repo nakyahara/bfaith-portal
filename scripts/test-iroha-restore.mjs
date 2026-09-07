@@ -116,5 +116,33 @@ console.log('\n[4] ⭐窓の指定を必ず求める');
   ok(!surveyCancelled({ from: 'きのう', to: TO }).ok, '日付でない文字は断る');
 }
 
+console.log('\n[5] ⭐起動のときに一度だけ戻る');
+{
+  const D = await import('../apps/iroha-work/db.js');
+  const { runIncidentRestoreOnce } = await import('../apps/iroha-work/restore-cancelled.js');
+  const meta = { getMeta: D.getMeta, setMetaValue: D.setMetaValue };
+  // 印を消して、事故のカードを 1 枚つくる
+  D.setMetaValue('restore_20260908_empty_csv', null);
+  const t8 = mk('r-8', 91008, '空 CSV で消えた');
+  cancelLikeIncident(t8, AT);
+  const r1 = runIncidentRestoreOnce(db, meta);
+  ok(r1.ok && r1.restored && r1.restored.tasks === 1, '⭐起動で自動に戻る (人が押さなくてもよい)');
+  ok(TD.getTask(t8).status === 'not_started', '未着手にもどる');
+  ok(D.getMeta('restore_20260908_empty_csv'), '実行した印が付く');
+  // 2 回目は走らない
+  const t9 = mk('r-9', 91009, 'あとから人が取り消した');
+  cancelLikeIncident(t9, AT);
+  const r2 = runIncidentRestoreOnce(db, meta);
+  ok(r2.ok && r2.skipped, '⭐二度目は走らない');
+  ok(TD.getTask(t9).status === 'closed',
+    '⭐後から取り消されたものを、再起動で勝手に戻さない');
+  // 戻すものが無ければ何もしない
+  D.setMetaValue('restore_20260908_empty_csv', null);
+  db.prepare("UPDATE f_iroha_tasks SET cancellation_source = 'staff' WHERE id = ?").run(t9);
+  const r3 = runIncidentRestoreOnce(db, meta);
+  ok(r3.ok && r3.skipped, '戻すものが無ければ何もしない');
+  ok(D.getMeta('restore_20260908_empty_csv'), 'それでも印は付ける (毎回調べない)');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail > 0 ? 1 : 0;
