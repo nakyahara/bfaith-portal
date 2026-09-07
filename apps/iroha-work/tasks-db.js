@@ -430,6 +430,12 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
       return { reject: { ok: false, error: 'split_card',
         message: 'このカードは作業が分かれています。どのぶんを作り終えたかを選んでください' } };
     }
+    // ⭐「棚入待ち → 作業中」(やり直し) も同じ。カードごと戻すと、どのぶんを戻すのか決まらないまま
+    //   カードだけ作業中・まとまりは棚入待ち、という食い違いが残る (Codex R3 中1)
+    if (bn > 1 && to === 'in_progress' && t.status === 'ready_for_stocking') {
+      return { reject: { ok: false, error: 'split_card',
+        message: 'このカードは作業が分かれています。どのぶんをやり直すかを選んでください' } };
+    }
     // ⭐外にあずけたぶんが残っているうちは「全部そろった」(棚入待ち) にも、**理由を問わず終了**にもしない (自己レビュー A / Codex R4 重大2)。
     //   取消や中止で閉じると、親は closed なのに外に 100 個ある、という状態になる。先に預けをやめる・返却を受け取る
     if (to === 'ready_for_stocking' || to === 'closed') {
@@ -578,7 +584,11 @@ export function changeBatchStatus({ taskId, batchId, to, closeReason = null, exp
     if (want === 'done') recordStocking(db, b.id, { at: now, by: actor });
     // ⭐カードの進捗はまとまりから導く。全部が棚に入って初めてカードが終了になる
     const derived = deriveTaskStatus(db, t.id);
-    const nextStatus = derived === 'done' ? 'closed' : derived;
+    let nextStatus = derived === 'done' ? 'closed' : derived;
+    // ⭐**止まっている札が付いているうちは棚入待ちへ繰り上げない** (自動経路と同じ扱い — Codex R3 中2)。
+    //   札は他のぶんのことかもしれないし、棚入待ちのカードは札を持てない決まりなので、
+    //   繰り上げると札を黙って消すことになる。札を外したときに繰り上がる (clearTaskBlock)
+    if (nextStatus === 'ready_for_stocking' && t.blocked_reason) nextStatus = 'in_progress';
     const next = { ...t, status: nextStatus, version: t.version + 1, updated_at: now, updated_by: actor };
     next.hold_reason_code = null;
     next.hold_reason_note = null;
@@ -587,8 +597,9 @@ export function changeBatchStatus({ taskId, batchId, to, closeReason = null, exp
     next.closed_at = nextStatus === 'closed' ? now : null;
     next.closed_by = nextStatus === 'closed' ? actor : null;
     if (nextStatus === 'in_progress') { if (!t.started_at) next.started_at = now; next.ready_at = null; }
-    // 棚入待ち・終了へ来たら申し送りは役目を終える (カードと同じ約束)
-    if (nextStatus === 'ready_for_stocking' || nextStatus === 'closed') { next.ready_at = t.ready_at || now; next.hold_memo = null; }
+    if (nextStatus === 'ready_for_stocking') next.ready_at = t.ready_at || now;
+    // ⭐終了まで来たら申し送りは役目を終える (カードと同じ約束)。消した中身は下の履歴に残す
+    if (nextStatus === 'closed') { next.ready_at = t.ready_at || now; next.hold_memo = null; }
     const problems = validateTaskInvariants(next);
     if (problems.length > 0) return { ok: false, error: 'bad_request', message: problems.join(' / ') };
     const r = db.prepare(`UPDATE f_iroha_tasks SET status = ?, hold_reason_code = NULL, hold_reason_note = NULL,
@@ -601,9 +612,13 @@ export function changeBatchStatus({ taskId, batchId, to, closeReason = null, exp
         next.version, next.updated_at, next.updated_by, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
     recomputeTaskDoneQty(db, t.id);   // カードの done_qty はまとまりの合計 (手で書く正本にしない)
+    // ⭐消した札・申し送りの中身も履歴に残す (あとから追えるように — カードと同じ考え方。Codex R3 中2)
+    const clearedTxt = ((t.blocked_reason && !next.blocked_reason)
+      ? ` 札解除(${t.blocked_reason}${t.blocked_note ? ':' + t.blocked_note : ''})` : '')
+      + (((next.hold_memo ?? null) !== (t.hold_memo ?? null) && !next.hold_memo) ? ` メモ消去(${t.hold_memo})` : '');
     // ⭐終了からのやり直しは理由が残らないなら失敗させる (カードと同じ — logTaskEvent は投げる)
     const line = { taskId: t.id, action: 'task_batch_status', from: `#${b.seq} ${b.work_status} (カード ${t.status})`,
-      to: `#${b.seq} ${want}${want === 'done' ? ' 棚入れ' : ''}${reason ? ' (' + reason + ')' : ''} → カード ${next.status}`,
+      to: `#${b.seq} ${want}${want === 'done' ? ' 棚入れ' : ''}${reason ? ' (' + reason + ')' : ''} → カード ${next.status}${clearedTxt}`,
       workerId, workerName, deviceLabel, ok: true };
     if (t.status === 'closed') logTaskEvent(line); else safeLogTaskEvent(line);
     return { ok: true, task: getTask(t.id), batch: db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(b.id) };
