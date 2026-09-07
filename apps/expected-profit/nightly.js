@@ -117,7 +117,9 @@ export async function runNightly(opts = {}) {
       const r = await refreshFees(db, targets, { deadline, now: () => new Date(), ...(opts.feeDeps || {}) });
       result.steps.push({ step: 'fees', ok: true, ...r });
       log(`[expected-profit] 手数料: 再取得${r.refreshed} 再利用${r.reused} 失敗${r.failedTargets} 未処理${r.pendingTargets}`
-        + (r.deferred ? ` 翌晩に回した${r.deferred}` : ''));
+        + (r.deferred ? ` 翌晩に回した${r.deferred}` : '')
+        // 🚨 取り直した理由を必ず出す。これが無いと「なぜ再利用が効かなかったか」を後から追えない
+        + (r.plannedRefetch ? ` 理由=${JSON.stringify(r.refetchReasons)}` : ''));
       // 🚨 キャッシュが効いていないなら必ず出す。SP-API は 0.5 req/s なので、
       //    全件取り直しは 13 分かかり、静かに毎晩やると枠を食い潰す
       if (r.refetchAnomaly) {

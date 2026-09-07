@@ -255,6 +255,63 @@ await ta('[!] 転送の途中で期限を跨いだら、そこで止めて公開
   assert.equal(sent, 0);
 });
 
+
+// Amazon の出品レポート1行 (実物と同じ日本語ヘッダ)
+const amazonListing = () => ({
+  '出品者SKU': 'sku-log', '商品ID': 'B001', '価格': '1980',
+  'フルフィルメント・チャンネル': 'AMAZON_JP', 'ステータス': 'Active', 'ポイント': '0',
+});
+
+console.log('');
+console.log('手数料の再利用が見えるか (SP-API は 0.5 req/s。静かに全件取り直させない)');
+
+await ta('[!] 取り直したら理由の内訳を必ずログに出す', () => {
+  // 🚨 これが無いと「なぜ再利用が効かなかったか」を翌朝に追えない
+  const logs = [];
+  return runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
+    malls: ['amazon'], skipPublish: true,
+    fetchDeps: { amazon: { getActiveListingsReport: async () => ({ listings: [amazonListing()] }) } },
+    feeDeps: {
+      sleepMs: 0,
+      callFeesApi: async (body) => body.map(b => ({
+        Status: 'Success',
+        FeesEstimateIdentifier: { SellerInputIdentifier: b.FeesEstimateRequest.Identifier, SellerId: 'S1' },
+        FeesEstimate: {
+          TotalFeesEstimate: { CurrencyCode: 'JPY', Amount: 546 },
+          // 🚨 FBA の出品なので FBAFees を返す。無いと missing_fba_fee になり再利用されない (正しい挙動)
+          FeeDetailList: [
+            { FeeType: 'ReferralFee', FeeAmount: { Amount: 84 }, FinalFee: { Amount: 84 }, FeePromotion: { Amount: 0 } },
+            { FeeType: 'FBAFees', FeeAmount: { Amount: 462 }, FinalFee: { Amount: 462 }, FeePromotion: { Amount: 0 } },
+          ],
+        },
+      })),
+    },
+    log: (m) => logs.push(String(m)),
+  }).then(() => {
+    const line = logs.find(l => l.includes('手数料:'));
+    assert.ok(line, '手数料の行が無い');
+    assert.match(line, /理由=/, `理由の内訳が出ていない: ${line}`);
+    assert.match(line, /missing/, `初回は「見積が無い」のはず: ${line}`);
+  });
+});
+
+await ta('[!] 取り直しが 0 件なら理由は出さない (毎晩ノイズにしない)', () => {
+  const logs = [];
+  return runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
+    malls: ['amazon'], skipPublish: true,
+    fetchDeps: { amazon: { getActiveListingsReport: async () => ({ listings: [amazonListing()] }) } },
+    feeDeps: { sleepMs: 0, callFeesApi: async () => { throw new Error('叩かせない'); } },
+    log: (m) => logs.push(String(m)),
+  }).then(() => {
+    const line = logs.find(l => l.includes('手数料:'));
+    assert.ok(line);
+    assert.ok(line.includes('再利用1'), `再利用されていない: ${line}`);
+    assert.ok(!line.includes('理由='), `取り直し0なのに理由が出ている: ${line}`);
+  });
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);
