@@ -608,6 +608,115 @@ export function facilityCapacityGuard(facilityCode, taskId, qty) {
 }
 
 /**
+ * ⭐預ける計画の件数だけ (ボードの入口に出す小さな数字。要件 §AB-11 の 7b)。
+ * 画面を開かなくても「用意するものが残っているか」が分かるようにする。
+ */
+export function consignPlanCounts(db = getDB()) {
+  const r = db.prepare(`SELECT
+      SUM(CASE WHEN c.state = 'planned'  THEN 1 ELSE 0 END) AS to_prepare,
+      SUM(CASE WHEN c.state = 'prepared' THEN 1 ELSE 0 END) AS to_hand,
+      SUM(CASE WHEN c.state = 'handed'   THEN 1 ELSE 0 END) AS out_now,
+      SUM(CASE WHEN c.state = 'handed' AND c.due_date IS NOT NULL AND c.due_date < ? THEN 1 ELSE 0 END) AS overdue,
+      -- ⭐その段の実績が記録されていない件数。予定の数で埋めずに、別に数える (要件: 欠損値を 0 で代用しない)
+      SUM(CASE WHEN (c.state = 'handed' AND c.handed_qty IS NULL)
+                 OR (c.state = 'prepared' AND c.prepared_qty IS NULL) THEN 1 ELSE 0 END) AS unknown_qty
+    FROM f_iroha_consignments c WHERE c.state IN ('planned','prepared','handed')`).get(jstToday());
+  return { to_prepare: r.to_prepare || 0, to_hand: r.to_hand || 0, out: r.out_now || 0,
+    overdue: r.overdue || 0, unknown_qty: r.unknown_qty || 0 };
+}
+
+/**
+ * ⭐預ける計画の画面 (要件 §AB-11 の 7b / §AB-0 の 4)。**職員だけ**。
+ *
+ * 中原さん: 「渡すときに保管箱とラベルを必要数そろえてから渡す」。
+ * カードを 1 枚ずつ開いて回るのではなく、**拠点ごとに、渡すものをまとめて用意できる**ようにする。
+ *
+ * 3 つの段に分ける (§AB-7 の state をそのまま使う):
+ *   ① 用意する (planned)  — 箱とラベルをそろえる。**何箱要るか**を出す
+ *   ② 渡す   (prepared)  — そろったもの。当日「渡しました」を押す
+ *   ③ 外にある (handed)   — 返ってくるのを待っているもの。期限を過ぎたら目立たせる
+ *
+ * ⭐**入数が分からないものを 0 箱と書かない** (要件: 欠損値を 0 で代用しない)。
+ *   箱数は null にして、画面が「入数が未登録」と出す。
+ * ⭐数は**その段で意味のある数**を出す — 用意する = 渡す予定、渡す = 用意した数、
+ *   外にある = 渡した数から返ってきたぶんを引いた残り。1 つの数で通すと現場と食い違う (§AB-7)。
+ */
+/** 画面にそのまま出してよい文字列だけ通す (入れ子の JSON・数値は「無い」扱い) */
+const textOf = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+
+export function buildConsignPlan(db = getDB()) {
+  const ctx = enrichContext();
+  const today = jstToday();
+  const rows = db.prepare(`SELECT c.id, c.batch_id, c.facility_code, c.state, c.version,
+      c.planned_qty, c.prepared_qty, c.handed_qty, c.due_date, c.handed_at, c.prepared_at, c.missing_qty,
+      c.planned_at,
+      b.task_id, b.seq, b.expiry AS batch_expiry,
+      t.product_name, t.product_code, t.master_snapshot, t.ar_no,
+      COALESCE((SELECT SUM(r.returned_qty) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id), 0) AS returned_total
+    FROM f_iroha_consignments c
+    JOIN f_iroha_task_batches b ON b.id = c.batch_id
+    JOIN f_iroha_tasks t ON t.id = b.task_id
+    WHERE c.state IN ('planned','prepared','handed')`).all();
+  const images = productImageMap(rows.map((r) => r.product_code));
+  const out = [];
+  for (const r of rows) {
+    let snap = null;
+    try { snap = r.master_snapshot ? JSON.parse(r.master_snapshot) : null; } catch { /* 未登録として扱う */ }
+    const k = keyOf(r.product_code);
+    const m = masterOfTask(k ? ctx.workMaster.get(k) : null, snap);
+    // その段で意味のある数。⭐**記録されていなければ予定の数で埋めない** (要件 §AB-3 / Codex R1 中1)。
+    //   「80 個用意できている」「外に 0 個」と読めてしまうと、現場の判断がそのまま狂う。
+    //   (渡した数の欠損は f_iroha_consignments の CHECK が禁じているが、用意した数は禁じていない)
+    const raw = r.state === 'handed' ? r.handed_qty
+      : r.state === 'prepared' ? r.prepared_qty : r.planned_qty;
+    // 返らなかった数 (missing_qty) の NULL は「まだ精算していない = 0 個」なので、これは 0 でよい
+    const qty = raw == null ? null
+      : r.state === 'handed' ? Math.max(0, raw - (r.returned_total || 0) - (r.missing_qty ?? 0))
+      : raw;
+    const bx = qty == null ? null : neededBoxesCalc(qty, m.units_per_container);
+    out.push({
+      id: r.id, version: r.version, state: r.state,
+      facility_code: r.facility_code, task_id: r.task_id, batch_id: r.batch_id, seq: r.seq,
+      title: r.product_name, image_url: (k ? images.get(k) : null) || null,
+      // ⭐同じカードから同じ拠点へ 2 回預けると、商品名・拠点・数・期限がそろって同じ行になる。
+      //   別のぶんを渡した・返した にしないよう、**まとまりの番号と入荷番号**を添える (Codex R1 中2)
+      ar_no: textOf(r.ar_no),
+      planned_at: r.planned_at || null,
+      qty,
+      planned_qty: r.planned_qty, prepared_qty: r.prepared_qty, handed_qty: r.handed_qty,
+      returned_total: r.returned_total || 0,
+      due_date: r.due_date || null,
+      overdue: !!(r.due_date && r.due_date < today),
+      handed_at: r.handed_at || null,
+      expiry: r.batch_expiry || null,
+      // 用意するもの。⭐分からないものは null のまま返す (0 と書かせない)
+      boxes: bx ? bx.boxes : null,
+      units_per_container: bx ? bx.per : null,
+      // ⭐文字列のときだけ出す。作業仕様のスナップショットには {code, note} のような入れ子が入ることがあり、
+      //   そのまま渡すと画面に [object Object] と出る (§AB-11 の 6 で外部向けに確かめたのと同じ用心)
+      storage_container: textOf(m.storage_container),
+      material_code: textOf(m.material_code),
+      hours: qty == null ? null : planHours(qty, m.process_count),
+      missing: m.missing,
+    });
+  }
+  // 並び: 期限の近いものから。期限なしは後ろ。同じなら古い預けから (先に決めたものを先に用意する)
+  out.sort((a, b) => {
+    if (!!a.due_date !== !!b.due_date) return a.due_date ? -1 : 1;
+    if (a.due_date && b.due_date && a.due_date !== b.due_date) return a.due_date < b.due_date ? -1 : 1;
+    return a.id - b.id;
+  });
+  return {
+    today_ymd: today,
+    // ⭐預けられるのは物を持ち帰る拠点だけ (要件 §AB-11 の 4)
+    facilities: listFacilities().filter((f) => f.offsite),
+    facility_loads: Object.fromEntries(facilityLoads(db)),
+    counts: consignPlanCounts(db),
+    rows: out,
+  };
+}
+
+/**
  * ⭐外部施設に見せる内容 (要件 §AB-11 の 6)。**読むだけ・その施設に預けたぶんだけ**。
  *
  * 中原さん 2026-09-07:
@@ -886,6 +995,8 @@ export function buildTaskList({ facility = null, readOnly = false } = {}) {
   return {
     mode: 'app',
     tomorrow_plan: tomorrowPlan,
+    // ⭐預ける計画の入口に出す件数 (要件 §AB-11 の 7b)。画面を開かなくても残りが分かる
+    consign_plan: consignPlanCounts(),
     today_ymd: today,
     cards,
     rows: batchRows,

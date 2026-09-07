@@ -35,7 +35,7 @@ import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES 
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
 import { countTasksByStatus, listTasksNeedingReview, listOrphans, listFacilities } from './tasks-db.js';
 import { OPEN_STATUSES } from './tasks.js';
-import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, buildFacilityView, facilityCapacityGuard, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
+import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, buildConsignPlan, buildFacilityView, facilityCapacityGuard, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
 import { batchTransitionNeedsStaff } from './batches.js';
@@ -902,6 +902,20 @@ router.post('/api/consign', checkOrigin, api((req, res) => {
   safeLogTaskEvent({ taskId, action: 'task_consign', to: `${req.body.facility_code} ${r.consignment.planned_qty}個`,
     workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req), ok: true });
   res.json({ ok: true, consignment: r.consignment, task: publicTask(getTask(taskId)), staff_mode: staffModeOf(req) });
+}));
+
+/**
+ * 🚚 預ける計画 (要件 §AB-11 の 7b)。**読むだけ**。
+ *
+ * ⭐職員だけ。預けは職員の仕事で、この画面から用意・受け渡しを進める (§W-5 と同じ線引き)。
+ * ⭐Notion が正本のうちは預け自体が使えないので、下見も出さない (空の画面を見せない)。
+ */
+router.get('/api/consign-plan', api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  if (!staffModeOf(req).staff) {
+    return res.status(403).json({ ok: false, error: 'staff_required', message: '預ける計画を見られるのは職員だけです' });
+  }
+  res.json({ ok: true, ...buildConsignPlan(), staff_mode: staffModeOf(req), serverNow: new Date().toISOString() });
 }));
 
 /** 🚚 渡した / やめた / 返却を受け取った (要件 §AB-7)。**職員だけ**。返却の確定は いろは 側 */

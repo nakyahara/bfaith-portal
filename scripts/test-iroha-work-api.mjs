@@ -31,7 +31,7 @@ function ok(cond, label) {
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 initMirrorDB();
 const { default: router } = await import('../apps/iroha-work/router.js');
-const { getDB, addIrohaWorker, setMetaValue } = await import('../apps/iroha-work/db.js');
+const { getDB, addIrohaWorker, setMetaValue, createDevice } = await import('../apps/iroha-work/db.js');
 const { upsertTaskFromImport } = await import('../apps/iroha-work/tasks-db.js');
 
 // 参照テーブルは本物の init で作る (列名を想像しない)
@@ -72,8 +72,8 @@ async function post(pathname, body) {
   });
   return { status: r.status, json: await r.json().catch(() => ({})) };
 }
-async function get(pathname) {
-  const r = await fetch(BASE + pathname, { headers: { Host: HOST } });
+async function get(pathname, cookie) {
+  const r = await fetch(BASE + pathname, { headers: cookie ? { Host: HOST, Cookie: cookie } : { Host: HOST } });
   const buf = Buffer.from(await r.arrayBuffer());
   const text = buf.toString('utf8');
   let json = null;
@@ -495,6 +495,49 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
   sessionRole = 'user';
   ok((await post('/admin/facility-links/' + mine.id + '/revoke')).status === 403, '⭐失効も管理者だけ');
   sessionRole = 'admin';
+}
+
+console.log('\n[預ける計画] GET /api/consign-plan (§AB-11 の 7b)');
+{
+  // ⭐実際に HTTP で叩く。service を直接呼ぶテストでは、router が値を渡し忘れていても気づけない
+  const t = upsertTaskFromImport({ notion_page_id: 'api-cplan', status: 'not_started', facility_code: 'iroha',
+    destination_id: null, product_code: 'API-CPLAN', product_name: '預け計画の検査', qty: 700,
+    arrival_date: '2026-09-01', master_snapshot: { units_per_container: 70, process_count: 2 },
+  }, { batchId: 'test-api' }).id;
+  const batch = getDB().prepare('SELECT id FROM f_iroha_task_batches WHERE task_id = ?').get(t);
+  const ver = getDB().prepare('SELECT version FROM f_iroha_tasks WHERE id = ?').get(t).version;
+  const made = await post('/api/consign', { id: t, batch_id: batch.id, facility_code: 'workcenter',
+    qty: 700, worker_id: S, expect_version: ver, due_date: '2026-10-01' });
+  ok(made.status === 200 && made.json.ok, '(前提) 預けを 1 件つくれる');
+
+  const r = await get('/api/consign-plan');
+  ok(r.status === 200 && r.json && r.json.ok, '職員なら 200 で返る');
+  const row = (r.json.rows || []).find((x) => x.id === made.json.consignment.id);
+  ok(!!row, '作った預けが行に出る');
+  ok(row.state === 'planned' && row.qty === 700 && row.boxes === 10,
+    '⭐状態・数・箱数がそろって返る (router が渡し忘れていない)');
+  ok(row.due_date === '2026-10-01', '返却の期限も返る');
+  ok(Array.isArray(r.json.facilities) && r.json.facilities.every((f) => f.offsite),
+    '拠点は物を持ち帰るところだけ');
+  ok(r.json.counts && r.json.counts.to_prepare >= 1, '入口に出す件数も返る');
+  ok(r.json.facility_loads && typeof r.json.facility_loads === 'object', '受け入れ枠も返る (画面がそのまま描ける)');
+
+  // ⭐ログインしていない人には出さない
+  sessionRole = null;
+  const anon = await get('/api/consign-plan');
+  ok(anon.status === 401 || anon.status === 403, '⭐ログインしていなければ出さない (' + anon.status + ')');
+  // ⭐**登録ずみの iPad から、職員モードに入らずに**叩いたら 403。
+  //   ログインの有無だけを見ていると、この口の職員チェックを外しても気づけない (Codex R1 軽微1)
+  const dev = createDevice('検査用 iPad (預ける計画)', 'test');
+  const asDevice = await get('/api/consign-plan', 'iw_device=' + dev.token);
+  ok(asDevice.status === 403 && asDevice.json && asDevice.json.error === 'staff_required',
+    '⭐端末で入っただけ (職員モードなし) では 403 staff_required');
+  ok(/職員/.test((asDevice.json || {}).message || ''), '断る理由が読める');
+  sessionRole = 'admin';
+
+  // ⭐書き込みの口ではない
+  const w = await post('/api/consign-plan', {});
+  ok(w.status === 404 || w.status === 405, '⭐POST は受けない (読むだけの画面)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

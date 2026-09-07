@@ -365,6 +365,22 @@
   .cap .warn{color:var(--danger,#c0392b)}
   .cap .stop{margin-top:4px;color:var(--danger,#c0392b);font-weight:700}
   .cap .unset{color:var(--muted)}
+  /* 🚚 預ける計画 (要件 §AB-11 の 7b) */
+  .cplan3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;align-items:start}
+  @media (max-width:980px){ .cplan3{grid-template-columns:1fr} }
+  .crow{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;margin-bottom:8px}
+  .crow.over{border-color:var(--danger);border-left-width:4px}
+  .crow .t{font-weight:700;line-height:1.35}
+  .crow .facts{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px;font-size:.86rem;color:var(--sub)}
+  .crow .facts b{font-family:var(--num);color:var(--ink)}
+  .crow .facts .miss{color:var(--amber);font-weight:700}
+  .crow .facts .late{color:var(--danger);font-weight:700}
+  .crow .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:9px}
+  .crow .acts button{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);
+    padding:8px 12px;font-weight:700;font-size:.88rem;min-height:40px;cursor:pointer;font-family:var(--font)}
+  .crow .acts .go{background:var(--accent);border-color:var(--accent);color:#fff}
+  .cplanempty{color:var(--sub);font-size:.9rem;padding:10px 2px}
+  .planbtn.cg{background:var(--amber);border-color:var(--amber)}
   /* 作業のまとまり (2 つ以上のときだけ出る) */
   .brow{border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:10px;background:var(--bg)}
   .brow .bh{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
@@ -770,6 +786,36 @@
         <h3>明日やる分 <span class="n" id="planPileN">0</span><span class="sum" id="planPileSum"></span></h3>
         <div class="byfac" id="planByFac"></div>
         <div id="planPile"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 画面1e: 預ける計画 (職員だけ。ボードの入口から開く。要件 §AB-11 の 7b) ══ -->
+  <div class="page cplanpage" hidden>
+    <div class="planhead">
+      <button class="btn" onclick="setView('board')">‹ ボードへ戻る</button>
+      <h2>🚚 預ける計画</h2>
+      <span id="cplanStaff" class="flabel"></span>
+    </div>
+    <p class="hint">外部の施設に渡すものを、拠点ごとにまとめて用意する画面です。
+      箱とラベルをそろえてから「用意できた」を、渡す日に「渡しました」を押してください。
+      返ってきたぶんの受け取りもここからできます。</p>
+    <div class="filters">
+      <span class="fgroup"><span class="flabel">拠点</span><span id="cplanFacs"></span></span>
+    </div>
+    <div id="cplanCap"></div>
+    <div class="cplan3">
+      <div class="pane">
+        <h3>① 用意する <span class="n" id="cplanN1">0</span><span class="sum">箱とラベルをそろえる</span></h3>
+        <div id="cplanCol1"></div>
+      </div>
+      <div class="pane">
+        <h3>② 渡す <span class="n" id="cplanN2">0</span><span class="sum">用意ずみ</span></h3>
+        <div id="cplanCol2"></div>
+      </div>
+      <div class="pane">
+        <h3>③ 外にある <span class="n" id="cplanN3">0</span><span class="sum">返ってくるのを待つ</span></h3>
+        <div id="cplanCol3"></div>
       </div>
     </div>
   </div>
@@ -1414,6 +1460,14 @@ async function loadStateOnce() {
   } else if (planData) {
     renderPlan();   // 「どこが」の許可だけ失った場合も、ここでボタンが消える
   }
+  // ⭐預ける計画も同じ。許可を失ったら描いたものを消す (明日の計画と同じ扱い — Codex R2 中1)
+  if (!isApp() || !stateCan('task.consign')) {
+    cplan = null;
+    clearConsignPlanDom();
+    if (curView === 'cplan') setView('board');
+  } else if (cplan) {
+    renderConsignPlan();
+  }
   if (!stateCan('task.facility.assign') && facPickCtx) closeFacPick();
   restoreWorker();
   // ⭐選んでいるのが利用者なら、端末の職員モードが生きていても職員の許可は採用しない (Codex PR-A R1 #1)
@@ -1622,10 +1676,12 @@ $('#list').addEventListener('click', (e) => {
 });
 
 // ─── 画面の切替 (作業 / ボード / ラベル待ち / 履歴) ───
-const PAGES = { list: '.listpage', board: '.boardpage', plan: '.planpage', label: '.labelpage', history: '.historypage' };
+const PAGES = { list: '.listpage', board: '.boardpage', plan: '.planpage', cplan: '.cplanpage', label: '.labelpage', history: '.historypage' };
 const VIEW_BTN = { list: '#vList', board: '#vBoard', label: '#vLabel', history: '#vHistory' };
 function setView(v) {
   if (v === 'plan' && isApp() && !stateCan('task.plan.assign')) v = 'board';   // 計画は職員だけ (下見は誰でも読むだけ)
+  // ⭐預ける計画は職員だけ。Notion が正本のうちは預けそのものが使えないので開かない
+  if (v === 'cplan' && (!isApp() || !stateCan('task.consign'))) v = 'board';
   if (v !== 'board' && v !== 'list') exitBulk();
   curView = v;
   for (const [k, sel] of Object.entries(PAGES)) $(sel).hidden = k !== v;
@@ -1635,6 +1691,7 @@ function setView(v) {
   if (v === 'list') renderList();
   if (v === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
   if (v === 'plan') loadPlan();
+  if (v === 'cplan') loadConsignPlan();
   if (v === 'label') loadLabelWaits();
   if (v === 'history') { renderHistTools(); if (histMode === 'daily') loadDaily(); else loadHistory(); }
 }
@@ -1925,7 +1982,7 @@ function renderBoard() {
   if (boardCols === 'status') curStatus = 'all';
   if (boardCols === 'fac') curFacility = 'all';
   if (boardCols === 'when' && !['all', 'blocked', 'unblocked'].includes(curWhen)) curWhen = 'all';
-  $('#gaugeWrap').innerHTML = planButtonHtml();
+  $('#gaugeWrap').innerHTML = planButtonHtml() + consignPlanButtonHtml();
   $('#colSeg').innerHTML = colSegHtml();
   $('#facGroup').hidden = boardCols === 'fac';
   $('#facChips').innerHTML = facChips();
@@ -5162,8 +5219,9 @@ function externalFacilities() {
  *   箱数を守らせる拠点 = サーバーが本当に断る → 「これ以上は渡せません」。
  *   説明と実際の結果が逆になると、職員は画面を信じなくなる。
  */
-function capacityHtml(code) {
-  const l = ((boardState() || {}).facility_loads || {})[code];
+function capacityHtml(code, loads) {
+  // ⭐残高は**その画面が取ってきたもの**を使う。省くとボードの分 (最大 60 秒古い) を見る
+  const l = (loads || (boardState() || {}).facility_loads || {})[code];
   if (!l) return '';
   const num = (v) => esc(String(Math.round(v * 10) / 10));
   const hoursTxt = l.capacity_hours != null
@@ -5206,6 +5264,24 @@ function capacityHtml(code) {
     (hardMsg ? '<div class="stop">' + hardMsg + '</div>' : '') +
     '</div>';
 }
+/**
+ * 🚚 預ける計画への入口 (要件 §AB-11 の 7b)。
+ * ⭐**許可の無い人には入口を描かない** (要件 §U-7)。ボタンを出して押したら断る、はしない。
+ * ⭐預けが 1 つも無いうちは出さない (使わないボタンを画面に置かない)。
+ */
+function consignPlanButtonHtml() {
+  if (!isApp() || !stateCan('task.consign')) return '';
+  const p = (boardState() || {}).consign_plan;
+  if (!p || (!p.to_prepare && !p.to_hand && !p.out)) return '';
+  const parts = [];
+  if (p.to_prepare) parts.push('用意する ' + p.to_prepare + ' 件');
+  if (p.to_hand) parts.push('渡す ' + p.to_hand + ' 件');
+  if (p.out) parts.push('外に ' + p.out + ' 件');
+  const sub = parts.join(' ・ ') + (p.overdue ? ' ・ ⚠ 期限ごえ ' + p.overdue + ' 件' : '');
+  return '<button class="planbtn cg" onclick="setView(\'cplan\')"><span class="ic">🚚</span>' +
+    '<span>預ける計画</span><span class="sub">' + esc(sub) + '</span><span class="chev">›</span></button>';
+}
+
 /** 入数で丸める。70 個入りなら 500 ではなく 490 (要件 §AB-9) */
 function roundToPack(n, per) {
   if (!per || per <= 0 || n <= per) return n;
@@ -5334,6 +5410,123 @@ async function submitConsign() {
   return planError(j, () => submitConsign(), { silent: true });
 }
 
+// ══════════ 🚚 預ける計画 (要件 §AB-11 の 7b) ══════════
+let cplan = null;          // サーバーから取った預ける計画
+let cplanFac = 'all';      // 見ている拠点
+
+async function loadConsignPlan() {
+  $('#cplanCol1').innerHTML = '<div class="cplanempty">読み込み中…</div>';
+  $('#cplanCol2').innerHTML = '';
+  $('#cplanCol3').innerHTML = '';
+  const j = await apiFetch('/api/consign-plan');
+  if (!j.ok) {
+    cplan = null;
+    $('#cplanCol1').innerHTML = '<div class="cplanempty">' + esc(j.message || '読み込めませんでした') + '</div>';
+    // 職員モードが切れていたら PIN を聞いて取り直す (明日の計画と同じ流儀)
+    return planError(j, () => loadConsignPlan(), { silent: true });
+  }
+  cplan = j;
+  if (j.staff_mode) state.staff_mode = j.staff_mode;
+  // ⭐ボードの入口の数もここで合わせる (戻ったときに古い数を見せない)
+  if (state) state.consign_plan = j.counts;
+  renderConsignPlan();
+}
+
+/**
+ * ⭐描いたものを消す (許可を失ったとき)。**隠すだけにしない** — hidden の画面に
+ * 押せるボタンが残っていると、職員モードが切れたあとに利用者が押せてしまう
+ * (明日の計画の clearPlanDom と同じ理由)
+ */
+function clearConsignPlanDom() {
+  for (const sel of ['#cplanFacs', '#cplanCap', '#cplanCol1', '#cplanCol2', '#cplanCol3']) {
+    const el = $(sel); if (el) el.innerHTML = '';
+  }
+  for (const sel of ['#cplanN1', '#cplanN2', '#cplanN3']) { const el = $(sel); if (el) el.textContent = '0'; }
+}
+function renderConsignPlan() {
+  if (!cplan) return;
+  // ⭐描き直すたびに許可を見る。取ってきたデータが手元にあるからといって、
+  //   許可を失ったあとに拠点を選び直してボタンを描き直さない (Codex R2 中1)
+  if (!isApp() || !stateCan('task.consign')) {
+    cplan = null;
+    clearConsignPlanDom();
+    if (curView === 'cplan') setView('board');
+    return;
+  }
+  const facs = cplan.facilities || [];
+  if (cplanFac !== 'all' && !facs.some((f) => f.code === cplanFac)) cplanFac = 'all';
+  $('#cplanFacs').innerHTML = ['all', ...facs.map((f) => f.code)].map((code) =>
+    '<button type="button" class="chip' + (code === cplanFac ? ' on' : '') + '" data-cplanfac="' + esc(code) + '">' +
+      esc(code === 'all' ? 'すべて' : facilityName(code)) + '</button>').join('');
+  // 拠点を 1 つ選んでいるときだけ受け入れ枠を出す (すべてだと どこの枠か分からない)
+  $('#cplanCap').innerHTML = cplanFac === 'all' ? '' : capacityHtml(cplanFac, cplan.facility_loads);
+  const rows = (cplan.rows || []).filter((r) => cplanFac === 'all' || r.facility_code === cplanFac);
+  const cols = [['planned', '#cplanCol1', '#cplanN1', 'いま用意するものはありません'],
+                ['prepared', '#cplanCol2', '#cplanN2', '用意ずみのものはありません'],
+                ['handed', '#cplanCol3', '#cplanN3', '外に出ているものはありません']];
+  for (const [st, colSel, nSel, empty] of cols) {
+    const list = rows.filter((r) => r.state === st);
+    $(nSel).textContent = String(list.length);
+    $(colSel).innerHTML = list.length
+      ? list.map(cplanRowHtml).join('')
+      : '<div class="cplanempty">' + empty + '</div>';
+  }
+}
+
+/**
+ * 預けの 1 行。
+ * ⭐**入数が分からないものを 0 箱と書かない** (要件: 欠損値を 0 で代用しない)。
+ *   箱を用意する画面なので、分からないなら「分からない」と出して職員に登録してもらう。
+ */
+function cplanRowHtml(r) {
+  // ⭐その段の数が記録されていなければ、予定の数で埋めずに「分からない」と書く (要件 §AB-3)
+  const facts = [r.qty == null
+    ? '<span class="miss">数が記録されていません — カードで確かめてください</span>'
+    : '<span><b>' + esc(String(r.qty)) + '</b> 個</span>'];
+  if (r.qty != null) {
+    facts.push(r.boxes != null
+      ? '<span>箱 <b>' + esc(String(r.boxes)) + '</b> つ（' + esc(String(r.units_per_container)) + ' 個入り）</span>'
+      : '<span class="miss">入数が未登録 — 何箱いるか出せません</span>');
+  }
+  // ⭐同じカードから同じ拠点へ 2 回預けると行の中身がそろって同じになる。
+  //   現物と照らし合わせられる目印を必ず出す (Codex R1 中2)
+  facts.push('<span>まとまり #' + esc(String(r.seq)) + '</span>');
+  if (r.ar_no) facts.push('<span>入荷 ' + esc(r.ar_no) + '</span>');
+  if (r.storage_container) facts.push('<span>保管箱 ' + esc(r.storage_container) + '</span>');
+  if (r.material_code) facts.push('<span>資材 ' + esc(r.material_code) + '</span>');
+  if (r.expiry) facts.push('<span>期限 ' + esc(r.expiry) + '</span>');
+  if (cplanFac === 'all') facts.push('<span>🏢 ' + esc(facilityName(r.facility_code)) + '</span>');
+  if (r.state === 'handed') {
+    facts.push('<span>' + (r.handed_at ? esc(fmtDate(r.handed_at)) + ' にわたした' : 'わたした日は記録なし') + '</span>');
+    if (r.returned_total > 0) facts.push('<span>' + esc(String(r.returned_total)) + ' 個は返却ずみ</span>');
+  }
+  if (r.due_date) {
+    facts.push('<span' + (r.overdue ? ' class="late"' : '') + '>' + esc(r.due_date) + ' までに返却' +
+      (r.overdue ? '（期限を過ぎています）' : '') + '</span>');
+  }
+  // ⭐押せるものだけ描く (要件 §U-7)。ここでも見るのは、描き直しの入口が複数あるため
+  const acts = !stateCan('task.consign') ? ''
+    : r.state === 'handed'
+    ? '<button class="go" data-cg="return" data-cg-id="' + r.id + '">返却を受け取る</button>' +
+      '<button data-cg="settle" data-cg-id="' + r.id + '">返ってこないぶんを精算</button>'
+    : (r.state === 'planned' ? '<button class="go" data-cg="prepared" data-cg-id="' + r.id + '">用意できた</button>' : '') +
+      '<button class="' + (r.state === 'prepared' ? 'go' : '') + '" data-cg="handed" data-cg-id="' + r.id + '">渡しました</button>' +
+      '<button data-cg="cancel" data-cg-id="' + r.id + '">やめる</button>';
+  const open = findCard(r.task_id) ? '<button data-cplanopen="' + r.task_id + '">カードを開く</button>' : '';
+  return '<div class="crow' + (r.overdue ? ' over' : '') + '">' +
+    '<div class="t">' + esc(r.title || '(名称なし)') + '</div>' +
+    '<div class="facts">' + facts.join('') + '</div>' +
+    (acts || open ? '<div class="acts">' + acts + open + '</div>' : '') +
+    '</div>';
+}
+
+document.addEventListener('click', (e) => {
+  const f = e.target.closest('[data-cplanfac]');
+  if (f) { cplanFac = f.dataset.cplanfac; renderConsignPlan(); return; }
+  const o = e.target.closest('[data-cplanopen]');
+  if (o) openDetail(Number(o.dataset.cplanopen));
+});
+
 /**
  * 渡した / やめる / 返却を受け取る。
  * ⚠window.prompt / confirm は iOS のホーム画面アプリで出ないことがある (監修 R-1) ので、同じダイアログを使う
@@ -5343,20 +5536,41 @@ document.addEventListener('click', (e) => {
   if (!b) return;
   openConsignAct(b.dataset.cg, Number(b.dataset.cgId));
 });
+/**
+ * ⭐預けの記録は 2 か所から開ける — カードの詳細と、預ける計画の画面。
+ * どちらから開いても**同じダイアログ・同じ言い方**にする (画面ごとに言い方を変えない)。
+ * いま見ている画面のものを先に探す — 詳細を開いたままボードへ戻っていることがあるため。
+ */
+function cgSourceOf(consignmentId) {
+  const fromPlan = () => {
+    const r = cplan && (cplan.rows || []).find((x) => x.id === consignmentId);
+    return r ? { cg: r, title: r.title, taskId: r.task_id, from: 'cplan' } : null;
+  };
+  const fromCard = () => {
+    const c = findCard(curDetail);
+    const x = c && (c.consignments || []).find((y) => y.id === consignmentId);
+    return x ? { cg: x, title: c.title, taskId: c.id, from: 'detail' } : null;
+  };
+  // 詳細が開いていれば、いま見ているのはそちら (預ける計画の上から開くこともできる)
+  return document.body.classList.contains('detail-open') ? (fromCard() || fromPlan()) : (fromPlan() || fromCard());
+}
 function openConsignAct(action, consignmentId) {
-  const c = findCard(curDetail);
-  if (!c || !can('task.consign')) return;
+  const src = cgSourceOf(consignmentId);
+  if (!src) return;
+  // 許可は開いた画面のもので見る (詳細はカードの許可、預ける計画は一覧の許可)
+  if (!(src.from === 'detail' ? can('task.consign') : stateCan('task.consign'))) return;
   if (!worker) { openGate(); return; }
-  const cg = (c.consignments || []).find((x) => x.id === consignmentId);
-  if (!cg) return;
+  const cg = src.cg;
   const left = (cg.handed_qty != null ? cg.handed_qty : cg.planned_qty) - (cg.returned_total || 0);
   // ⭐冪等の鍵は**操作を始めるときに 1 回だけ**作る。送り直すたびに変えると、
   //   届いていた分をもう一度受け取ってしまう (Codex R1 中11)
-  cgTarget = { act: action, id: consignmentId, version: cg.version, taskId: c.id,
+  cgTarget = { act: action, id: consignmentId, version: cg.version, taskId: src.taskId, from: src.from,
     key: 'ret-' + consignmentId + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) };
   $('#cgTitle').textContent = action === 'handed' ? '🚚 わたしました' : action === 'cancel' ? '🚚 この預けをやめます'
     : action === 'prepared' ? '🚚 箱とラベルを用意しました' : action === 'settle' ? '🚚 返ってこないぶんを精算' : '🚚 返却を受け取る';
-  $('#cgName').textContent = c.title + '（' + facilityName(cg.facility_code) + '）';
+  // ⭐どのまとまりを動かすのかを必ず出す。同じ商品・同じ拠点の預けが 2 つ並ぶことがある (Codex R1 中2)
+  $('#cgName').textContent = src.title + '（' + facilityName(cg.facility_code)
+    + (cg.seq != null ? ' ・ まとまり #' + cg.seq : '') + '）';
   $('#cgMsg').textContent = '';
   $('#cgBody').innerHTML = '<div class="dq">' + (
     action === 'cancel'
@@ -5394,8 +5608,9 @@ function openConsignAct(action, consignmentId) {
 }
 async function submitConsignAct() {
   if (cgSaving || !cgTarget || !cgTarget.act || !worker) return;
+  // 預ける計画から開いたときはカードを持っていない (画面ごと取り直す)
   const c = findCard(cgTarget.taskId);
-  if (!c) { closeConsign(); return; }
+  if (!c && cgTarget.from === 'detail') { closeConsign(); return; }
   const body = { consignment_id: cgTarget.id, action: cgTarget.act, worker_id: worker.id, expect_version: cgTarget.version };
   const qtyEl = $('#cgBody').querySelector('.cgQty');
   if (cgTarget.act !== 'cancel') {
@@ -5431,13 +5646,16 @@ async function submitConsignAct() {
     return planError(j, () => submitConsignAct(), { silent: true });
   }
   if (j.staff_mode) state.staff_mode = j.staff_mode;
-  if (j.task) applyTask(c, j.task);
+  if (j.task && c) applyTask(c, j.task);
   const act = cgTarget.act;
+  const from = cgTarget.from;
   closeOverlay('#cgOv'); cgTarget = null; $('#cgBody').innerHTML = '';
   toast(act === 'handed' ? 'わたしました' : act === 'cancel' ? '預けをやめました'
     : act === 'prepared' ? '箱とラベルを用意しました' : act === 'settle' ? '精算しました'
     : j.consignment && j.consignment.state === 'settled' ? '全部返ってきました' : '返却を記録しました');
-  openDetail(c.id);   // 預けの記録を取り直す
+  // 預けの記録を取り直す。開いていた画面のほうを更新する
+  if (from === 'cplan') loadConsignPlan();
+  else if (c) { openDetail(c.id); if (curView === 'cplan') loadConsignPlan(); }
 }
 
 function openStFromDetail() { if (curDetail && can('task.status.change')) openSt(null, curDetail); }
