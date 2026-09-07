@@ -719,6 +719,7 @@ function changeStatusApp(req, res, worker) {
       doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
       lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
       varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
+      reason: req.body?.reason || null,
       actor: hasSessionAccess(req) ? req.iwUser : `${worker.display_name} (いろはアプリ)`,
       isStaff, workerId: worker.id, workerName: worker.display_name, deviceLabel: deviceLabelOf(req),
     });

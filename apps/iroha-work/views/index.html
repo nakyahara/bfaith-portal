@@ -3861,13 +3861,20 @@ async function redoBatch(batchId) {
     ok: 'はい、作業中に戻す', cancel: 'やめる',
   });
   if (!okGo) return;
+  // ⭐終了したカードのぶんを戻すときは理由を残す (なぜ戻したかが消えるくらいなら失敗させる — カードと同じ約束)
+  let reason = null;
+  if (c.status === 'closed') {
+    reason = await ask({ title: 'なぜ戻しますか', text: 'あとから見て分かるように、ひとこと残してください',
+      input: 'text', placeholder: '例: 2 個だけ貼り直す', required: true, ok: '続ける' });
+    if (reason == null) return;
+  }
   let pin = null;
   if (!state.me.session) {
     pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '作業中に戻す' });
     if (pin == null) return;
   }
   const j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: c.id, to: 'in_progress', batch_id: b.id, worker_id: w.id, pin, expect_version: c.version }) });
+    body: JSON.stringify({ id: c.id, to: 'in_progress', batch_id: b.id, worker_id: w.id, pin, reason, expect_version: c.version }) });
   if (!j.ok) { showErr(j.message || '戻せませんでした'); return; }
   applyTask(c, j.task);
   c.status = j.status;
@@ -4524,7 +4531,7 @@ function renderBlock(c) {
   // 🧰 資材が足りない: どの資材が何個足りないかを 1 タップで残し、職員に知らせる (監修「あった方がよい機能」)
   const mat = blockReason === 'materials_shortage' ? materialsPanelHtml(c) : '';
   $('#blockBody').innerHTML = blockReason
-    ? mat + dqPanelHtml(c, '', { memoLabel: blockReason === 'other' ? '何で止まりましたか (必須) — 次にやる人にも見えます' : '中断メモ (任意) — 次にやる人が読みます' })
+    ? mat + dqPanelHtml(dqSubject(c, homeBatchId(c)), '', { memoLabel: blockReason === 'other' ? '何で止まりましたか (必須) — 次にやる人にも見えます' : '中断メモ (任意) — 次にやる人が読みます' })
     : '<p class="hint">まず理由を 1 つ選んでください。</p>';
   $('#blockGo').disabled = !blockReason;
 }
@@ -4676,7 +4683,7 @@ function openDone(c, batchId = null) {
     ? '（' + facilityName(fb.facility_code || c.facility_code) + ' の '
       + (fb.planned_qty == null ? '' : fb.planned_qty + ' 個ぶん') + '）' : '');
   $('#doneMsg').textContent = '';
-  $('#doneBody').innerHTML = dqPanelHtml(c, '', { title: '何個できましたか', memo: false, loss: true });
+  $('#doneBody').innerHTML = dqPanelHtml(dqSubject(c, doneBatch), '', { title: '何個できましたか', memo: false, loss: true });
   // 押しまちがい用 (監修): このカードのタイマーを止めた直後だけ「まちがえた」を出す (サーバーは 60 秒まで受ける)
   $('#doneUndo').hidden = !(lastStop && sameId(lastStop.pid, c.id) && Date.now() - lastStop.at < 55000);
   openOverlay('#doneOv');
@@ -4694,11 +4701,13 @@ async function submitDone() {
   // ⭐予定と大きく違うときは、止めずにもう一度だけ確かめる (Codex R3: 差が大きい場合は止めずに確認)
   // ⭐「5 個より多い **か** 1 割より多い」ずれで確かめる。max だと「両方超えたとき」になり、
   //   1000 個の予定で 1010 個 (10 個ちがい) が素通りしていた (Codex R1 中)
-  const far = v.qty != null && c.qty != null && (Math.abs(v.qty - c.qty) > 5 || Math.abs(v.qty - c.qty) > c.qty * 0.1);
+  // ⭐比べる相手は**選んだまとまりの予定数** (カード合計ではない — Codex R2 重大1)
+  const subj = dqSubject(c, doneBatch);
+  const far = v.qty != null && subj.qty != null && (Math.abs(v.qty - subj.qty) > 5 || Math.abs(v.qty - subj.qty) > subj.qty * 0.1);
   if (far && doneConfirmed !== v.qty) {
     doneConfirmed = v.qty;
-    const d = v.qty - c.qty;
-    $('#doneMsg').textContent = '⚠ つくる数 ' + c.qty + ' 個に対して ' + v.qty + ' 個 ('
+    const d = v.qty - subj.qty;
+    $('#doneMsg').textContent = '⚠ つくる数 ' + subj.qty + ' 個に対して ' + v.qty + ' 個 ('
       + (d > 0 ? '+' : '') + d + ' 個) です。これでよければ、もう一度押してください';
     return;
   }
@@ -5367,6 +5376,19 @@ function renderStBtns(c) {
  * 中断するときと、あとから直すときで同じ形を使う。**数は任意** — 数えていないなら空のままでよい
  * (空 = まだ数えていない。0 個 = 1 個もできていない。この 2 つは別のこととして扱う)
  */
+/**
+ * ⭐**数を入れる対象**。まとまりを選んでいるならそのまとまりの数、選んでいなければカードの数。
+ *
+ * これが無いと、いろは 400・ワークセンター 600 に分けたカードで「このぶんを作り終えた」を押したとき、
+ * フォームは**カード合計の 1000 個**を「つくる数」として出し、「予定どおり (1000 個)」を押すと
+ * 400 個のまとまりに 1000 が入ってしまう (Codex R2 重大1)。
+ */
+function dqSubject(c, batchId) {
+  const b = batchId == null ? null : (c.batches || []).find((x) => sameId(x.id, batchId));
+  if (!b) return c;
+  return { qty: b.planned_qty, done_qty: b.good_qty, counted: b.counted !== false,
+    loss_qty: b.loss_qty, variance_note: b.variance_note, hold_memo: c.hold_memo };
+}
 function dqPanelHtml(c, actions, opts) {
   const o = Object.assign({ title: '何個までできましたか', memo: true, memoLabel: '中断メモ (任意) — 次にやる人が読みます',
     loss: false, note: false }, opts || {});
@@ -5495,7 +5517,7 @@ function openDq(id) {
   $('#dqName').textContent = c.title;
   $('#dqMsg').textContent = '';
   // ⭐操作のボタンも許可を見てから描く。静的に置いておくと「許可の無い操作を DOM に描かない」が崩れる (Codex R1 中3)
-  $('#dqBody').innerHTML = dqPanelHtml(c, '') +
+  $('#dqBody').innerHTML = dqPanelHtml(dqSubject(c, homeBatchId(c)), '') +
     '<div class="mbtns"><button class="btn" id="dqCancel" onclick="closeDq()">やめる</button>' +
     '<button class="btn primary" id="dqSave" onclick="saveProgress()">保存する</button></div>';
   openOverlay('#dqOv');

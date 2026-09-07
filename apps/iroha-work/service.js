@@ -363,6 +363,7 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
         return { id: b.id, seq: b.seq, planned_qty: b.planned_qty,
           facility_code: b.facility_code, expiry: b.expiry, work_status: b.work_status,
           good_qty: b.good_qty, loss_qty: b.loss_qty, variance_note: b.variance_note || null,
+          counted: b.good_qty_source === 'counted',
           // ⭐まだ外にあるぶんは、人が「作り終えた」を押せない (返却を受け取ると棚入待ちになる)
           consigned_out: outByBatch.has(b.id),
           consignable_max: cg.max, consignable_why: cg.why };

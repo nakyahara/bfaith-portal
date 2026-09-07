@@ -456,8 +456,9 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     //   まとまりが 2 つ以上でも合わせる。合わせないと「カードは終了・まとまりは棚入待ち」が残る
     if (to === 'closed' || (t.status === 'closed' && to === 'in_progress')) syncAllBatchesStatus(db, t.id, next);
     else syncSingleBatchStatus(db, t.id, next);
-    // ⭐「作業をはじめる」= 手元のまとまりも作業中に (外部に預けたぶんは「渡した」ときに変わる)
-    if (to === 'in_progress' && t.status === 'not_started') startHomeBatches(db, t.id, now);
+    // ⭐カードを作業中にしたら、手元 (物を持ち帰らない拠点) のまとまりも作業中に。
+    //   これから渡すぶん・外部のぶんは触らない。作業開始 (startTaskWork) でも同じことをする (Codex R2 中2)
+    if (to === 'in_progress') startHomeBatches(db, t.id, now);
     // ⭐数はまとまりが正本。カードの done_qty はその合計に直す (要件 §AB-3)
     applyCountsToSoleBatch(db, t.id, { goodQty: dq.skip ? undefined : dq.value, lossQty: lq.skip ? undefined : lq.value, note: vn.skip ? undefined : vn.value },
       batchId ?? null);
@@ -507,7 +508,7 @@ export function batchesOfTask(taskId) {
  * まとまりが 1 つのカード (ふだんの全部) は今までどおり `changeTaskStatus` を通る — 見え方は変わらない。
  */
 export function changeBatchStatus({ taskId, batchId, to, closeReason = null, expectVersion,
-  doneQty = undefined, lossQty = undefined, varianceNote = undefined,
+  doneQty = undefined, lossQty = undefined, varianceNote = undefined, reason = null,
   actor = null, isStaff = false, workerId = null, workerName = null, deviceLabel = null }) {
   const db = getDB();
   // まとまり単位で受けるのは「作業中に戻す / 作り終えた / 棚入完了」の 3 つだけ。
@@ -533,7 +534,17 @@ export function changeBatchStatus({ taskId, batchId, to, closeReason = null, exp
     if (expectVersion == null || Number(expectVersion) !== t.version) {
       return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: t };
     }
-    if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
+    // ⭐棚入完了で閉じたカードは、**そのぶんだけ**やり直せる (Codex R2 中3)。
+    //   カードごと戻すと、問題の無い他のぶんまで作業中に戻ってしまう。
+    //   終了からのやり直しは理由を残す約束 (カードと同じ — 例外的な操作なので、なぜ戻したかが消えるくらいなら失敗させる)
+    if (t.status === 'closed') {
+      if (!(t.close_reason === 'stocked' && want === 'in_progress')) {
+        return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
+      }
+      if (!String(reason || '').trim()) {
+        return { ok: false, error: 'bad_request', message: '棚入完了にしたぶんをやり直すには理由が必要です' };
+      }
+    }
     const b = db.prepare("SELECT * FROM f_iroha_task_batches WHERE id = ? AND task_id = ? AND work_status <> 'cancelled'")
       .get(Number(batchId), t.id);
     if (!b) return { ok: false, error: 'bad_batch', message: 'そのぶんはこのカードにありません。一覧を更新してください' };
@@ -590,9 +601,11 @@ export function changeBatchStatus({ taskId, batchId, to, closeReason = null, exp
         next.version, next.updated_at, next.updated_by, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
     recomputeTaskDoneQty(db, t.id);   // カードの done_qty はまとまりの合計 (手で書く正本にしない)
-    safeLogTaskEvent({ taskId: t.id, action: 'task_batch_status', from: `#${b.seq} ${b.work_status} (カード ${t.status})`,
-      to: `#${b.seq} ${want}${want === 'done' ? ' 棚入れ' : ''} → カード ${next.status}`,
-      workerId, workerName, deviceLabel, ok: true });
+    // ⭐終了からのやり直しは理由が残らないなら失敗させる (カードと同じ — logTaskEvent は投げる)
+    const line = { taskId: t.id, action: 'task_batch_status', from: `#${b.seq} ${b.work_status} (カード ${t.status})`,
+      to: `#${b.seq} ${want}${want === 'done' ? ' 棚入れ' : ''}${reason ? ' (' + reason + ')' : ''} → カード ${next.status}`,
+      workerId, workerName, deviceLabel, ok: true };
+    if (t.status === 'closed') logTaskEvent(line); else safeLogTaskEvent(line);
     return { ok: true, task: getTask(t.id), batch: db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(b.id) };
   }).immediate();
 }
@@ -1290,6 +1303,10 @@ export function startTaskSession({ taskId, worker, workers = null, deviceLabel =
     }
     if (!r.ok) return r;
     if (startTaskSessionHook) startTaskSessionHook(t);
+    // ⭐「作業をはじめる」= 手元 (物を持ち帰らない拠点) のまとまりも作業中にする。
+    //   カードが既に作業中でも通す — 外部に渡した時点でカードだけ先に作業中になっているため (Codex R2 中2)。
+    //   これから渡すぶん・外部のぶんは触らない
+    startHomeBatches(db, t.id, utcNow());
     let task = t;
     if (t.status === 'not_started') {
       const cs = changeTaskStatus({ taskId: t.id, to: 'in_progress', expectVersion: t.version,
