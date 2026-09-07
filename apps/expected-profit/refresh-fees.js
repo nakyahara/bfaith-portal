@@ -28,6 +28,27 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
  * 見積が要る対象を洗い出す。
  * 🚨 「キャッシュが無い」だけでなく「入力が変わった」も対象にする
  */
+/**
+ * 保存済みの見積が使っている seller_id。
+ *
+ * 🚨 env (SP_API_SELLER_ID) より **API が返した値**が正 (§15-3)。
+ *    実データ検証で miniPC の env に SP_API_SELLER_ID が無く、
+ *    キーが `null` で作られて見積を1件も引けなかった。
+ *    単一セラー運用なので保存済みの値は1つに決まる。
+ */
+export function storedSellerId(db) {
+  try {
+    const rows = db.prepare('SELECT DISTINCT seller_id FROM amazon_fee_estimate LIMIT 2').all();
+    return rows.length === 1 ? rows[0].seller_id : null;   // 複数いるなら決め打ちしない
+  } catch { return null; }
+}
+
+/** 見積入力の seller_id を、保存済みの値で埋める (env が空でもキーが一致するように) */
+export function withResolvedSeller(targets, knownSellerId) {
+  if (!knownSellerId) return targets;
+  return targets.map(t => (t?.seller_id === knownSellerId ? t : { ...t, seller_id: knownSellerId }));
+}
+
 export function planRefresh(targets, cachedByKey, now = new Date()) {
   const need = [];
   const reuse = [];
@@ -48,7 +69,8 @@ export function planRefresh(targets, cachedByKey, now = new Date()) {
  */
 export function validateFeeTarget(t) {
   const missing = [];
-  if (!t?.seller_id) missing.push('seller_id');
+  // 🚨 seller_id はリクエストに含まれない (レスポンスの FeesEstimateIdentifier.SellerId が正)。
+  //    ここで必須にすると、env に SP_API_SELLER_ID が無いだけで全件弾かれる (実データで判明)
   if (!t?.marketplace_id) missing.push('marketplace_id');
   if (!t?.seller_sku) missing.push('seller_sku');
   if (!t?.asin) missing.push('asin');
@@ -97,11 +119,12 @@ export function buildFeeRequest(targets) {
 }
 
 /** レスポンスを保存形へ (純関数) */
-export function toEstimateRow(target, feesEstimate, fetchedAt) {
+export function toEstimateRow(target, feesEstimate, fetchedAt, sellerIdFromResponse = null) {
   // 🚨 fulfillment を渡さないと「FBA なのに FBAFees が無い」を検出できない
   const n = normalizeFeeEstimate(feesEstimate, { fulfillment: target.in_fulfillment });
   return {
-    seller_id: target.seller_id,
+    // 🚨 実際に見積を返したセラーを保存する (env より API の応答が正)
+    seller_id: sellerIdFromResponse || target.seller_id || null,
     marketplace_id: target.marketplace_id,
     seller_sku: target.seller_sku,
     asin: target.asin,
@@ -164,8 +187,12 @@ export async function refreshFees(db, targets, deps = {}) {
       `marketplace_id が環境設定 (${envMarketplace}) と違う対象が ${mismatched.length} 件あります: `
       + `${[...new Set(mismatched.map(t => t.marketplace_id))].join(', ')}`);
   }
+  // 🚨 キャッシュ照合の前に seller_id を揃える。
+  //    env が空 / env と API の値が違うと feeCacheKey が一致せず、毎晩 7,597 件を取り直す
+  const knownSellerId = storedSellerId(db);
+  const resolved = withResolvedSeller(valid, knownSellerId);
   const cached = loadCache(db);
-  const { need, reuse } = planRefresh(valid, cached, now());
+  const { need, reuse } = planRefresh(resolved, cached, now());
 
   const callApi = deps.callFeesApi || defaultCallFeesApi;
   const sleepMs = deps.sleepMs ?? BATCH_SLEEP_MS;
@@ -174,6 +201,7 @@ export async function refreshFees(db, targets, deps = {}) {
   const batchErrors = [];     // バッチ単位の失敗 (API 呼び出しそのものが通らなかった)
   let stoppedByDeadline = false;
   let processedTargets = 0;
+  let observedSellerId = knownSellerId;   // レスポンスが教えてくれる実際のセラー
 
   for (let i = 0; i < need.length; i += BATCH_SIZE) {
     // 全体終了期限 (§8.4)。超えたら残りは翌日に回す (途中で止めても行は消えない)
@@ -217,27 +245,40 @@ export async function refreshFees(db, targets, deps = {}) {
         errors.push({ sku: chunk[j].seller_sku, error: r?.Error?.Message || r?.Status || 'no estimate' });
         continue;
       }
-      saved.push(toEstimateRow(chunk[j], r.FeesEstimate, fetchedAt));
+      const sellerIdFromResponse = r?.FeesEstimateIdentifier?.SellerId || null;
+      if (sellerIdFromResponse) observedSellerId = sellerIdFromResponse;
+      saved.push(toEstimateRow(chunk[j], r.FeesEstimate, fetchedAt, sellerIdFromResponse));
     }
     if (i + BATCH_SIZE < need.length) await sleep(sleepMs);
   }
 
-  if (saved.length > 0) saveEstimates(db, saved);
-  const unknownTypes = saved.filter(r => r.fee_status === 'unknown_fee_type').length;
-  const inconsistent = saved.filter(r => r.fee_status === 'inconsistent').length;
-  const badStatus = saved.filter(r => r.fee_status !== 'ok').length;
+  // レスポンスから分かったセラーで、まだ埋まっていない行を補う
+  if (observedSellerId) {
+    for (const row of saved) if (!row.seller_id) row.seller_id = observedSellerId;
+  }
+  const unresolvedSeller = saved.filter(r => !r.seller_id);
+  if (unresolvedSeller.length > 0) {
+    // セラーが分からない見積は保存しない (キーが作れない)
+    for (const r of unresolvedSeller) errors.push({ sku: r.seller_sku, error: 'seller_id_unresolved' });
+  }
+  const savable = saved.filter(r => r.seller_id);
+  if (savable.length > 0) saveEstimates(db, savable);
+  const unknownTypes = savable.filter(r => r.fee_status === 'unknown_fee_type').length;
+  const inconsistent = savable.filter(r => r.fee_status === 'inconsistent').length;
+  const badStatus = savable.filter(r => r.fee_status !== 'ok').length;
   const failedTargets = errors.length + batchErrors.reduce((a, b) => a + b.targets, 0);
   return {
     targets: targets.length,
+    sellerId: observedSellerId,
     invalidTargets: invalid.length,
     invalid: invalid.slice(0, 20),
     reused: reuse.length,
-    refreshed: saved.length,
+    refreshed: savable.length,
     // 🚨 SKU 単位とバッチ単位を混ぜない (取得率の判断に使えなくなる)
     failedTargets,
     failedBatches: batchErrors.length,
     pendingTargets: need.length - processedTargets,   // 期限で止めた分
-    okEstimates: saved.length - badStatus,
+    okEstimates: savable.length - badStatus,
     unknownTypes,
     inconsistent,
     stoppedByDeadline,

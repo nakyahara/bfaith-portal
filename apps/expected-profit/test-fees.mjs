@@ -13,7 +13,8 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-fee-'));
 process.env.SP_API_MARKETPLACE_ID = 'A1VC38T7YXB528';
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { planRefresh, buildFeeRequest, toEstimateRow, saveEstimates, loadCache, refreshFees, cacheKey } = await import('./refresh-fees.js');
+const { planRefresh, buildFeeRequest, toEstimateRow, saveEstimates, loadCache, refreshFees, cacheKey,
+  storedSellerId, withResolvedSeller } = await import('./refresh-fees.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -32,9 +33,9 @@ const target = (over = {}) => ({
   ...over,
 });
 
-const feeResponse = (identifier, { referral = 84, fba = null, total = null } = {}) => ([{
+const feeResponse = (identifier, { referral = 84, fba = null, total = null, sellerId } = {}) => ([{
   Status: 'Success',
-  FeesEstimateIdentifier: { SellerInputIdentifier: identifier },
+  FeesEstimateIdentifier: { SellerInputIdentifier: identifier, ...(sellerId ? { SellerId: sellerId } : {}) },
   FeesEstimate: {
     TotalFeesEstimate: { CurrencyCode: 'JPY', Amount: total ?? (referral + (fba ?? 0)) },
     FeeDetailList: [
@@ -347,6 +348,74 @@ await ta('通貨が欠けた対象も弾く (JPY で埋めない)', async () => 
   assert.deepEqual(r.invalid[0].missing, ['in_currency']);
 });
 
+
+console.log('');
+console.log('セラーID の解決 (実データで判明: miniPC の env に SP_API_SELLER_ID が無い)');
+
+// 🚨 ここから先は保存済みの見積を消してから試す。
+//    storedSellerId が前のテストで入った 'S1' を拾うと、何を見ているのか分からなくなる
+db.exec('DELETE FROM amazon_fee_estimate');
+
+t('保存済みが1セラーならそれを返す', () => {
+  db.exec('DELETE FROM amazon_fee_estimate');
+  saveEstimates(db, [toEstimateRow(target({ seller_id: 'A6HMLHKUUJC27', seller_sku: 'x1' }),
+    { TotalFeesEstimate: { Amount: 84 }, FeeDetailList: [{ FeeType: 'ReferralFee', FinalFee: { Amount: 84 } }] }, new Date().toISOString())]);
+  assert.equal(storedSellerId(db), 'A6HMLHKUUJC27');
+});
+
+t('[!] 保存済みが複数セラーなら決め打ちしない (null を返す)', () => {
+  saveEstimates(db, [toEstimateRow(target({ seller_id: 'OTHER', seller_sku: 'x2' }),
+    { TotalFeesEstimate: { Amount: 84 }, FeeDetailList: [{ FeeType: 'ReferralFee', FinalFee: { Amount: 84 } }] }, new Date().toISOString())]);
+  assert.equal(storedSellerId(db), null);
+});
+
+t('withResolvedSeller は分かっている値で上書きする / 分からなければ触らない', () => {
+  assert.equal(withResolvedSeller([target({ seller_id: null })], 'A6')[0].seller_id, 'A6');
+  assert.equal(withResolvedSeller([target({ seller_id: 'WRONG' })], 'A6')[0].seller_id, 'A6');
+  assert.equal(withResolvedSeller([target({ seller_id: 'S1' })], null)[0].seller_id, 'S1');
+});
+
+await ta('[!] env に seller_id が無くても見積を取り、レスポンスの SellerId で保存する', async () => {
+  db.exec('DELETE FROM amazon_fee_estimate');
+  const r = await refreshFees(db, [target({ seller_id: null, seller_sku: 'noSeller' })], {
+    sleepMs: 0,
+    callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { sellerId: 'A6HMLHKUUJC27' }),
+  });
+  assert.equal(r.invalidTargets, 0, 'seller_id が無いだけで弾いてはいけない');
+  assert.equal(r.refreshed, 1);
+  assert.equal(r.sellerId, 'A6HMLHKUUJC27');
+  assert.equal(db.prepare("SELECT seller_id FROM amazon_fee_estimate WHERE seller_sku = 'noSeller'").get().seller_id,
+    'A6HMLHKUUJC27');
+});
+
+await ta('[!] env の seller_id が保存済みと違っても、保存済みの値でキーを作る (取り直さない)', async () => {
+  let called = 0;
+  const r = await refreshFees(db, [target({ seller_id: 'WRONG_FROM_ENV', seller_sku: 'noSeller' })], {
+    sleepMs: 0, callFeesApi: async (body) => { called++; return feeResponse(body[0].FeesEstimateRequest.Identifier); },
+  });
+  assert.equal(called, 0, '保存済みキーと一致するので API を叩かない');
+  assert.equal(r.reused, 1);
+});
+
+await ta('[!] レスポンスにも保存済みにもセラーが無い見積は保存しない (キーが作れない)', async () => {
+  db.exec('DELETE FROM amazon_fee_estimate');
+  const r = await refreshFees(db, [target({ seller_id: null, seller_sku: 'unknownSeller' })], {
+    sleepMs: 0, callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier),   // SellerId 無し
+  });
+  assert.equal(r.refreshed, 0);
+  assert.equal(r.errors[0].error, 'seller_id_unresolved');
+  assert.equal(db.prepare("SELECT COUNT(*) c FROM amazon_fee_estimate WHERE seller_sku = 'unknownSeller'").get().c, 0);
+});
+
+await ta('marketplace_id は引き続き必須 (これが無いとキーが作れない)', async () => {
+  let called = 0;
+  const r = await refreshFees(db, [target({ marketplace_id: null, seller_sku: 'noMk' })], {
+    sleepMs: 0, callFeesApi: async () => { called++; return []; },
+  });
+  assert.equal(called, 0);
+  assert.equal(r.invalidTargets, 1);
+  assert.deepEqual(r.invalid[0].missing, ['marketplace_id']);
+});
 
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });

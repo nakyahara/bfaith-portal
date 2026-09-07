@@ -11,6 +11,7 @@
 import { getExpectedProfitDB } from './db.js';
 import { buildRow } from './build-row.js';
 import { feeCacheKey } from './calc.js';
+import { storedSellerId } from './refresh-fees.js';
 import { newGenerationId, nowIso } from './util.js';
 import { hashRows } from './generation-hash.js';
 import { nextSeq } from './db.js';
@@ -104,7 +105,11 @@ export function buildGeneration(db, deps = {}) {
       generationId,
       now,
       codeVersion: deps.codeVersion || 'unknown',
-      sellerId: deps.sellerId,
+      // 🚨 見積を引くキーに使う seller_id は、**DB に保存されている値**を使う。
+      //    env と食い違うとキーが一致せず、見積を1件も引けない (実データで判明)
+      // 🚨 見積を引くキーの seller_id は **保存済みの値が優先**。
+      //    env と食い違うとキーが一致せず、見積を1件も引けない (実データで判明)
+      sellerId: storedSellerId(db) || deps.sellerId,
       marketplaceId: deps.marketplaceId,
       products,
       shippingRates,
