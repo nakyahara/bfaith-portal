@@ -257,23 +257,67 @@
     // ─── 📷 カメラでバーコードを読む ───
     // 読んだ値をそのまま検索欄に入れて検索する (バーコードマスタは1商品に複数行あるので、
     // JAN でも FNSKU でも、どれを読んでもその商品に行き着く)。
-    // BarcodeDetector が無い iPad (iPadOS 16 以前など) は、キーボードの「テキストをスキャン」を案内する
-    let scanStream = null, scanTimer = null, scanStarting = false, scanGen = 0;
+    //
+    // 🚨**デコードは zxing-wasm で自前でやる**。最初の実装は BarcodeDetector (Shape Detection API) を
+    //   使っていたが、**Safari は今も未実装**なので iPad では「対応していません」に必ず落ちて
+    //   カメラが一度も起動しなかった (2026-09-07 中原さんの実機で発覚)。
+    //   デコーダは /vendor/zxing-wasm (server.js が node_modules から配る)。**押したときだけ読み込む**
+    //   (wasm が約1MB あるので、画面を開くたびに落とさない)。
+    const ZXING_JS = '/vendor/zxing-wasm/iife/reader/index.js';
+    const ZXING_WASM = '/vendor/zxing-wasm/reader/zxing_reader.wasm';
+    // 画面に出るバーコードの種類。scripts/test-inbound-check-barcode-scan.mjs と同じ並びにすること
+    const READER_OPTIONS = {
+      formats: ['EAN13', 'EAN8', 'UPCA', 'UPCE', 'Code128', 'Code39', 'ITF'],
+      tryHarder: true,
+      maxNumberOfSymbols: 1,
+    };
+    let zxingPromise = null;
+    function loadDecoder() {
+      if (zxingPromise) return zxingPromise;
+      zxingPromise = new Promise((resolve, reject) => {
+        const sc = document.createElement('script');
+        sc.src = ZXING_JS;
+        sc.onload = () => {
+          if (!window.ZXingWASM || !window.ZXingWASM.readBarcodesFromImageData) {
+            reject(new Error('読み取りプログラムの形が違います')); return;
+          }
+          try {
+            // 🚨 locateFile を渡さないと wasm を外部 CDN から取りに行く。社内ポータルから外へ出さない
+            window.ZXingWASM.prepareZXingModule({
+              overrides: { locateFile: (p2, prefix) => (String(p2).endsWith('.wasm') ? ZXING_WASM : prefix + p2) },
+            });
+            resolve(window.ZXingWASM);
+          } catch (e2) { reject(e2); }
+        };
+        sc.onerror = () => reject(new Error('読み取りプログラムを読み込めませんでした'));
+        document.head.appendChild(sc);
+      }).catch((e) => { zxingPromise = null; throw e; });   // 失敗を覚えたままにしない (もう一度押せば再試行)
+      return zxingPromise;
+    }
+
+    let scanStream = null, scanTimer = null, scanStarting = false, scanGen = 0, scanCanvas = null;
     async function startScan() {
       if (scanStarting || scanStream) return;      // 連打で getUserMedia が二重に走ると、先の stream を止められなくなる
       const gen = ++scanGen;                       // カメラが返ってくる前に画面を離れたかを見分ける
-      if (!('BarcodeDetector' in window) || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        banner('warn', 'この iPad はカメラ読み取りに対応していません。検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        banner('warn', 'この端末ではカメラを使えません。検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
         $('#q').focus();
         return;
       }
-      let detector;
-      try { detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'] }); }
-      catch (e) { banner('err', 'バーコードの読み取りを始められませんでした (' + esc(e.message) + ')', { sticky: true }); return; }
       scanStarting = true;
       $('#scanBtn').disabled = true;
+      // デコーダ (約1MB) を先に落とす。回線が細いと数秒かかるので、カメラを開ける前に知らせる
+      let zx = null;
+      try { zx = await loadDecoder(); }
+      catch (e) {
+        banner('err', 'バーコードの読み取りを始められませんでした (' + esc(e.message) + ')。'
+          + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+        scanStarting = false; $('#scanBtn').disabled = false;
+        return;
+      }
+      if (gen !== scanGen) { scanStarting = false; $('#scanBtn').disabled = false; return; }
       let stream = null;
-      try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }); }
+      try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false }); }
       catch (e) {
         // 何が起きたかで打つ手が違う。「許可してください」だけだと、カメラが無い/塞がっているときに現場が設定をいじり続ける
         const msg = e && e.name === 'NotAllowedError' ? 'カメラの使用が許可されていません。iPad の設定 → Safari → カメラ でこのサイトを「許可」にしてください'
@@ -298,15 +342,27 @@
       v.srcObject = scanStream;
       $('#scanMsg').textContent = '商品の JAN (13桁) か FNSKU を枠に入れてください';
       $('#scanBox').classList.add('on');
+      // 映像を canvas に落として wasm に渡す。**横 640px に縮める** —
+      // 1280px のまま毎フレーム解析すると iPad が重くなり、JAN はこの解像度で十分読める
+      if (!scanCanvas) scanCanvas = document.createElement('canvas');
       const tick = async () => {
         if (!scanStream || gen !== scanGen) return;
         try {
-          const codes = await detector.detect(v);
-          // 読み取りを待っている間に閉じられたら、返ってきた結果は使わない (閉じた後に検索が走らないように)
-          if (!scanStream || gen !== scanGen) return;
-          const hit = codes.find((x) => x.rawValue && /^[A-Za-z0-9]{6,}$/.test(String(x.rawValue).trim()));
-          if (hit) { onScanned(String(hit.rawValue).trim()); return; }
-        } catch (e) { /* まだ映っていない → 次の回 */ }
+          const vw = v.videoWidth, vh = v.videoHeight;
+          if (vw && vh) {
+            const w = Math.min(640, vw);
+            const h = Math.round((vh / vw) * w);
+            if (scanCanvas.width !== w || scanCanvas.height !== h) { scanCanvas.width = w; scanCanvas.height = h; }
+            const ctx = scanCanvas.getContext('2d', { willReadFrequently: true });
+            ctx.drawImage(v, 0, 0, w, h);
+            const img = ctx.getImageData(0, 0, w, h);
+            const codes = await zx.readBarcodesFromImageData(img, READER_OPTIONS);
+            // 読み取りを待っている間に閉じられたら、返ってきた結果は使わない (閉じた後に検索が走らないように)
+            if (!scanStream || gen !== scanGen) return;
+            const hit = codes.find((x) => x.text && /^[A-Za-z0-9]{6,}$/.test(String(x.text).trim()));
+            if (hit) { onScanned(String(hit.text).trim()); return; }
+          }
+        } catch (e) { /* まだ映っていない / 一時的な失敗 → 次の回 */ }
         if (gen !== scanGen) return;
         scanTimer = setTimeout(tick, 250);
       };
