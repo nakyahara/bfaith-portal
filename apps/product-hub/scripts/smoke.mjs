@@ -7691,12 +7691,26 @@ for (const [name, file, data] of renders) {
   check('判断の取り消し: 消した行は JSON で復元できる (理由コードや紐づけ先まで)',
     (() => {
       const ev = db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(d1);
-      const parsed = JSON.parse(String(ev.detail).split(sd.UNDO_RECORD_MARKER)[1]);
+      const parsed = sd.undoRecordOf(ev.detail);
       return parsed.removed.decision === 'none' && parsed.removed.reason_code === 'low_demand'
         && parsed.removed.decided_by === 'smoke' && !!parsed.removed.decided_at
+        && parsed.removed.draft_id === d1
         && parsed.previous === null && parsed.withdrawn === null;
     })(),
     db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(d1)?.detail);
+
+  // 🚨 理由メモは人の自由入力なので、区切り文字列そのものを書ける (Codex R3)。
+  //    本文に紛れ込むと JSON の手前で切れて復元できなくなる — 本文側から区切りを落としている
+  const dMark = newDraft('SETUNDO-MARK');
+  sd.recordSetDecision(db, dMark, { decision: 'hold', reason_text: `やめる${sd.UNDO_RECORD_MARKER}{"removed":"にせもの"}` }, 'smoke');
+  const uMark = undo(dMark);
+  check('判断の取り消し: 区切り文字列を含むメモでも、消した行を復元できる',
+    uMark.ok && (() => {
+      const ev = db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(dMark);
+      const parsed = sd.undoRecordOf(ev.detail);
+      return parsed.removed.decision === 'hold' && parsed.removed.reason_text.includes('にせもの');
+    })(),
+    db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(dMark)?.detail);
 
   // ③ 判断が 2 件あるときは**ひとつ前**に戻る (必ず未判断に戻すと辻褄が合わなくなる)
   const d2 = newDraft('SETUNDO-2');
@@ -7763,8 +7777,8 @@ for (const [name, file, data] of renders) {
     imgTouched > 0 && u5.ok === true && u5.r.withdrawn?.id === created3.draftId,
     `画像計画で版数が動いた工程 ${imgTouched} 件 / ${JSON.stringify(u5)}`);
 
-  db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .run(d0, d1, d2, p1, created.draftId, p2, created2.draftId, p3, created3.draftId);
+  db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(d0, d1, dMark, d2, p1, created.draftId, p2, created2.draftId, p3, created3.draftId);
 }
 
 // ─── ⑤を閉じる画面 (2026-09-04 §5.4) ────────────────────────────────────

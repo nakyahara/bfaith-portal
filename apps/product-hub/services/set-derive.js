@@ -751,9 +751,35 @@ function setDraftTouchedReason(db, set) {
 /**
  * 取り消した記録 (JSON) の区切り。draft_events.detail は人が読む画面にそのまま出るので、
  * 「人が読む文 + この区切り + JSON」という形にしている。
- * 復元する側は `detail.split(UNDO_RECORD_MARKER)[1]` を JSON.parse する
+ * 🚨 復元は **最初の区切りより後ろ全部** を取る:
+ *      const at = detail.indexOf(UNDO_RECORD_MARKER);
+ *      JSON.parse(detail.slice(at + UNDO_RECORD_MARKER.length));
+ *    `split(marker)[1]` は使えない — JSON の文字列値の中に区切りが入っていると
+ *    そこで切れて JSON が途中で終わる (Codex R3)
  */
 export const UNDO_RECORD_MARKER = ' ／ 取り消した記録 #json:';
+
+/**
+ * 区切りより前 (人が読む文) に区切りそのものが現れないようにする。
+ * 🚨 reason_text は人が打つ自由入力なので、区切り文字列をそのまま書ける (Codex R3)。
+ *    本文に紛れ込むと detail.split(UNDO_RECORD_MARKER)[1] が JSON の手前で切れて復元できない。
+ *    JSON 側の文字列に区切りが入っても、**最初の区切りより後ろ全部**が JSON なので問題ない
+ */
+function stripUndoMarker(text) {
+  return String(text).split(UNDO_RECORD_MARKER).join(' ');
+}
+
+/**
+ * set_decision_undone のイベント本文から、消した判断の記録を取り出す (無ければ null)。
+ * 復元の手順をここ 1 箇所に置く — 呼ぶ側で split したり slice したりすると必ずズレる
+ * @returns {{removed: object, previous: object|null, withdrawn: object|null}|null}
+ */
+export function undoRecordOf(detail) {
+  const text = String(detail == null ? '' : detail);
+  const at = text.indexOf(UNDO_RECORD_MARKER);
+  if (at < 0) return null;
+  try { return JSON.parse(text.slice(at + UNDO_RECORD_MARKER.length)); } catch (e) { return null; }
+}
 
 /**
  * 直前の「セット展開判断」を取り消す (2026-09-07 中原さん:「間違って選択したときに戻せるように」)。
@@ -772,8 +798,9 @@ export const UNDO_RECORD_MARKER = ' ／ 取り消した記録 #json:';
  */
 export function undoSetDecision(db, draftId, actor) {
   const id = Number(draftId);
+  // draft_id も含めて**行の全列**を退避する (復元するときに元の行をそのまま組み立てられるように)
   const last = db.prepare(`
-    SELECT id, decision, reason_code, reason_text, linked_set_draft_id, decided_by, decided_at
+    SELECT id, draft_id, decision, reason_code, reason_text, linked_set_draft_id, decided_by, decided_at
     FROM draft_set_decisions WHERE draft_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1
   `).get(id);
   if (!last) throw badRequest('取り消せる判断がありません (まだ何も決めていません)');
@@ -809,12 +836,13 @@ export function undoSetDecision(db, draftId, actor) {
   //    たどれないと監査にならない。文言だけだと理由コードや紐づけ先が復元できない。
   //    操作履歴は detail をそのまま人に見せる画面なので、**前半は人が読む文・後半は
   //    区切り (UNDO_RECORD_MARKER) の後ろに JSON** という形にした。
-  //    復元するときは detail.split(UNDO_RECORD_MARKER)[1] をそのまま JSON.parse できる
-  logEvent(db, id, 'set_decision_undone',
+  //    復元は「最初の区切りより後ろ全部」を JSON.parse する (undoRecordOf を使う)
+  const human = stripUndoMarker(
     `判断「${describeSetDecision(last)}」を取り消しました`
     + (withdrawn ? ` ／ セット ${withdrawn.neCode} を取り下げ` : '')
-    + (prev ? ` (ひとつ前の判断「${describeSetDecision(prev)}」に戻ります)` : ' (未判断に戻ります)')
-    + UNDO_RECORD_MARKER + JSON.stringify({ removed, previous: prev, withdrawn }),
+    + (prev ? ` (ひとつ前の判断「${describeSetDecision(prev)}」に戻ります)` : ' (未判断に戻ります)'));
+  logEvent(db, id, 'set_decision_undone',
+    human + UNDO_RECORD_MARKER + JSON.stringify({ removed, previous: prev, withdrawn }),
     actor);
   return {
     undone: describeSetDecision(last),
