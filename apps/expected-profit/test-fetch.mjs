@@ -17,6 +17,7 @@ const {
   evaluateEnumeration, loadLastCompleteKeys, fetchAmazonListings, fetchRakutenListings,
   enumStatusWithParseFailures, amazonFulfillment, rakutenItemToSnapshotsDetailed,
 } = await import('./fetch-listings.js');
+const { reportWaitUntil, getActiveListingsReport } = await import('../profit-calculator/sp-api.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -484,6 +485,137 @@ t('[!] チャンネル欠損の行は fulfillment が null のまま保存され
   assert.equal(r.fulfillment, null);
 });
 
+
+
+console.log('');
+console.log('出品レポートを待てる時間 (実データ: Amazon 側が混んでいて5分で諦めた)');
+
+t('既定は5分 (既存の呼び出し元の挙動を変えない)', () => {
+  const now = new Date('2026-09-07T15:00:00Z');
+  assert.equal(reportWaitUntil({ now }).toISOString(), '2026-09-07T15:05:00.000Z');
+});
+
+t('[!] 期限が渡されたら期限まで待つ (夜間バッチは7時間の余裕がある)', () => {
+  const now = new Date('2026-09-07T15:00:00Z');
+  const until = reportWaitUntil({ now, deadline: new Date('2026-09-07T15:20:00Z') });
+  assert.equal(until.toISOString(), '2026-09-07T15:20:00.000Z');
+});
+
+t('[!] 期限が遠すぎても上限30分で止める (無限に待たない)', () => {
+  const now = new Date('2026-09-07T15:00:00Z');
+  const until = reportWaitUntil({ now, deadline: new Date('2026-09-08T06:00:00Z') });
+  assert.equal(until.toISOString(), '2026-09-07T15:30:00.000Z');
+});
+
+t('[!] 期限が既に過ぎていたら待たない (すぐ諦める)', () => {
+  const now = new Date('2026-09-07T15:00:00Z');
+  const until = reportWaitUntil({ now, deadline: new Date('2026-09-07T14:00:00Z') });
+  assert.ok(until <= now);
+});
+
+t('[!] 期限が読めない値なら既定に戻す (NaN で即諦めない)', () => {
+  const now = new Date('2026-09-07T15:00:00Z');
+  assert.equal(reportWaitUntil({ now, deadline: 'ごみ' }).toISOString(), '2026-09-07T15:05:00.000Z');
+  assert.equal(reportWaitUntil({ now, deadline: null }).toISOString(), '2026-09-07T15:05:00.000Z');
+});
+
+t('maxWaitMs を渡せば従う (上限は超えない)', () => {
+  const now = new Date('2026-09-07T15:00:00Z');
+  assert.equal(reportWaitUntil({ now, maxWaitMs: 60000 }).toISOString(), '2026-09-07T15:01:00.000Z');
+  assert.equal(reportWaitUntil({ now, maxWaitMs: 99 * 60 * 1000 }).toISOString(), '2026-09-07T15:30:00.000Z');
+});
+
+await ta('[!] fetchAmazonListings は期限をレポート取得まで渡す (渡し忘れると5分で諦める)', async () => {
+  let seen = null;
+  const deadline = new Date('2026-09-08T06:00:00Z');
+  await fetchAmazonListings(db, {
+    deadline,
+    getActiveListingsReport: async (o) => { seen = o; return { listings: [] }; },
+  });
+  assert.ok(seen, 'オプションが渡っていない');
+  assert.equal(new Date(seen.deadline).toISOString(), deadline.toISOString());
+});
+
+
+// 本番の待ちループそのものを通す (時計と sleep を差し替える)
+function fakeSp(statuses) {
+  let i = 0;
+  return {
+    polls: 0,
+    async callAPI(req) {
+      if (req.operation === 'createReport') return { reportId: 'R1' };
+      if (req.operation === 'getReport') {
+        this.polls++;
+        return { processingStatus: statuses[Math.min(i++, statuses.length - 1)] };
+      }
+      throw new Error('想定外の operation: ' + req.operation);
+    },
+  };
+}
+
+await ta('[!] 待ちループが期限を使う (期限なしの5分では諦める回数だけ回る)', async () => {
+  let t = new Date('2026-09-07T15:00:00Z').getTime();
+  const client = fakeSp(['IN_PROGRESS']);
+  await assert.rejects(
+    () => getActiveListingsReport({
+      client, marketplaceId: 'M1',
+      now: () => new Date(t), log: () => {},
+      sleep: async (ms) => { t += ms; },     // 時計を進めるだけ
+    }),
+    /レポート取得タイムアウト/);
+  assert.equal(client.polls, 60, `5分 / 5秒 = 60回のはず (実際 ${client.polls})`);
+});
+
+await ta('[!] 期限を渡すとその分だけ長く待つ (実データ: 5分では足りなかった)', async () => {
+  let t = new Date('2026-09-07T15:00:00Z').getTime();
+  const client = fakeSp(['IN_PROGRESS']);
+  await assert.rejects(
+    () => getActiveListingsReport({
+      client, marketplaceId: 'M1',
+      deadline: new Date('2026-09-07T15:20:00Z'),
+      now: () => new Date(t), log: () => {},
+      sleep: async (ms) => { t += ms; },
+    }),
+    /レポート取得タイムアウト/);
+  assert.equal(client.polls, 240, `20分 / 5秒 = 240回のはず (実際 ${client.polls})`);
+});
+
+await ta('DONE になったらそこで待つのをやめる', async () => {
+  let t = new Date('2026-09-07T15:00:00Z').getTime();
+  const client = fakeSp(['IN_QUEUE', 'IN_PROGRESS', 'DONE']);
+  // DONE の後は本物の getReportDocument に進むので、そこで落ちるのが正しい
+  await assert.rejects(
+    () => getActiveListingsReport({
+      client, marketplaceId: 'M1',
+      deadline: new Date('2026-09-07T15:20:00Z'),
+      now: () => new Date(t), log: () => {}, sleep: async (ms) => { t += ms; },
+    }),
+    /想定外の operation: getReportDocument/);
+  assert.equal(client.polls, 3);
+});
+
+await ta('[!] FATAL は待たずに失敗させる (期限まで粘らない)', async () => {
+  let t = new Date('2026-09-07T15:00:00Z').getTime();
+  const client = fakeSp(['FATAL']);
+  await assert.rejects(
+    () => getActiveListingsReport({
+      client, marketplaceId: 'M1',
+      deadline: new Date('2026-09-07T15:20:00Z'),
+      now: () => new Date(t), log: () => {}, sleep: async (ms) => { t += ms; },
+    }),
+    /レポート処理失敗: FATAL/);
+  assert.equal(client.polls, 1);
+});
+
+await ta('タイムアウトの文言に、どれだけ待って最後がどの状態だったかを残す', async () => {
+  let t = new Date('2026-09-07T15:00:00Z').getTime();
+  await assert.rejects(
+    () => getActiveListingsReport({
+      client: fakeSp(['IN_PROGRESS']), marketplaceId: 'M1',
+      now: () => new Date(t), log: () => {}, sleep: async (ms) => { t += ms; },
+    }),
+    /300秒待った \/ 最後の状態=IN_PROGRESS/);
+});
 
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });

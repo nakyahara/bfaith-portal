@@ -608,9 +608,39 @@ export async function updatePrice({ sku, price }) {
  * 出品中の全商品レポートを取得（SKU数の確認用）
  * GET_MERCHANT_LISTINGS_DATA レポート
  */
-export async function getActiveListingsReport() {
-  const sp = getClient();
-  const marketplaceId = MARKETPLACE_ID();
+/**
+ * 出品レポートを待てる上限を決める。
+ *
+ * 🚨 既定は従来どおり5分 (既存の呼び出し元の挙動を変えない)。
+ *    夜間バッチだけは期限まで待てるようにする — 実データで、Amazon 側の待ち行列が
+ *    混んでいて5分では DONE にならず、7時間の余裕があるのに諦めていた
+ *    (2026-09-07 実測: IN_PROGRESS のまま5分でタイムアウト)。
+ *    無限に待たないよう上限 (30分) は残す。
+ */
+export const REPORT_DEFAULT_MAX_WAIT_MS = 5 * 60 * 1000;
+export const REPORT_MAX_WAIT_CAP_MS = 30 * 60 * 1000;
+export const REPORT_POLL_INTERVAL_MS = 5000;
+
+export function reportWaitUntil({ now = new Date(), deadline = null, maxWaitMs = null } = {}) {
+  const t = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  const cap = t + REPORT_MAX_WAIT_CAP_MS;
+  if (deadline) {
+    const d = new Date(deadline).getTime();
+    // 期限が読めないときは既定にフォールバックする (NaN で「すぐ諦める」にしない)
+    if (Number.isFinite(d)) return new Date(Math.min(d, cap));
+  }
+  const wait = Number.isFinite(Number(maxWaitMs)) && Number(maxWaitMs) > 0
+    ? Number(maxWaitMs) : REPORT_DEFAULT_MAX_WAIT_MS;
+  return new Date(Math.min(t + wait, cap));
+}
+
+export async function getActiveListingsReport(opts = {}) {
+  // 差し替え可能にしておく。ここは実データで壊れた経路 (5分で諦めた) なので、
+  // 本番の待ちループそのものをテストから通せるようにする
+  const sp = opts.client || getClient();
+  const wait = opts.sleep || sleep;
+  const log = opts.log || console.log;
+  const marketplaceId = opts.marketplaceId || MARKETPLACE_ID();
 
   // レポート作成リクエスト
   const createResult = await sp.callAPI({
@@ -623,28 +653,33 @@ export async function getActiveListingsReport() {
     options: { version: '2021-06-30' },
   });
 
-  const reportId = createResult.reportId;
-  console.log(`[SP-API] レポート作成: reportId=${reportId}`);
+  const reportId = createResult.reportId;
+  log(`[SP-API] レポート作成: reportId=${reportId}`);
+  const startedWaitingAt = (opts.now || (() => new Date()))();
 
-  // レポート完了を待機（最大5分）
+  // レポート完了を待つ。既定5分、夜間バッチは期限まで (上限30分)
+  const nowFn = opts.now || (() => new Date());
+  const waitUntil = reportWaitUntil({ now: nowFn(), deadline: opts.deadline, maxWaitMs: opts.maxWaitMs });
   let report;
-  for (let i = 0; i < 60; i++) {
-    await sleep(5000);
+  while (nowFn() < waitUntil) {
+    await wait(REPORT_POLL_INTERVAL_MS);
     report = await sp.callAPI({
       operation: 'getReport',
       endpoint: 'reports',
       path: { reportId },
       options: { version: '2021-06-30' },
     });
-    console.log(`[SP-API] レポートステータス: ${report.processingStatus}`);
+    log(`[SP-API] レポートステータス: ${report.processingStatus}`);
     if (report.processingStatus === 'DONE') break;
     if (report.processingStatus === 'FATAL' || report.processingStatus === 'CANCELLED') {
       throw new Error(`レポート処理失敗: ${report.processingStatus}`);
     }
   }
 
-  if (report.processingStatus !== 'DONE') {
-    throw new Error('レポート取得タイムアウト');
+  if (report?.processingStatus !== 'DONE') {
+    // 諦めた理由を残す。どこまで待ったかが分からないと運用で判断できない
+    const waited = Math.round((waitUntil.getTime() - new Date(startedWaitingAt).getTime()) / 1000);
+    throw new Error(`レポート取得タイムアウト (${waited}秒待った / 最後の状態=${report?.processingStatus || '応答なし'})`);
   }
 
   // レポートドキュメント取得
