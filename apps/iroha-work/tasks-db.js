@@ -10,6 +10,7 @@ import {
   OPEN_STATUSES, CLOSE_REASONS, BLOCK_REASONS, BLOCK_LABEL, BLOCKABLE_STATUSES, LEGACY_ON_HOLD,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
 } from './tasks.js';
+import { ensureBatchForTask, syncSingleBatchStatus } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -178,7 +179,10 @@ export function upsertTaskFromImport(row, { batchId, now = utcNow() }) {
       return rec[c];
     });
     const info = db.prepare(`INSERT INTO f_iroha_tasks (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`).run(...vals);
-    return { action: 'inserted', id: Number(info.lastInsertRowid) };
+    const newId = Number(info.lastInsertRowid);
+    // ⭐カードができたら「まとまり」も 1 つ用意する (要件 §AB-1)。カードだけある瞬間を作らない
+    ensureBatchForTask(db, getTask(newId));
+    return { action: 'inserted', id: newId };
   }
   const touchedByApp = !String(existing.updated_by || '').startsWith(IMPORT_ACTOR_PREFIX);
   const cols = touchedByApp ? IMPORT_INFO_COLS : [...IMPORT_INFO_COLS, ...IMPORT_STATE_COLS];
@@ -341,6 +345,8 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
         next.started_at, next.ready_at, next.cancellation_requested_at, next.done_qty ?? null, next.hold_memo ?? null,
         next.version, next.updated_at, next.updated_by, t.id, t.version);
     if (r.changes === 0) return false;
+    // まとまりが 1 つだけなら作業状態も合わせる (移行のあいだの橋渡し — 要件 §AB-1)
+    syncSingleBatchStatus(db, t.id, next);
     const cleared = ((t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '')
       + ((t.blocked_reason && !next.blocked_reason) ? ` 札解除(${t.blocked_reason})` : '');
     // できた数と中断メモも履歴に残す。消えた申し送りを後から追えるように (ready_at と同じ考え方)
@@ -611,6 +617,7 @@ export function removeStrayTask({ taskId, actor = null, reason = null }) {
           migration_note = COALESCE(migration_note || ' / ', '') || ?, version = version + 1, updated_at = ?, updated_by = ?
         WHERE id = ? AND version = ?`)
         .run(utcNow(), actor, note, utcNow(), actor, t.id, t.version);
+      syncSingleBatchStatus(db, t.id, { status: 'closed', close_reason: 'out_of_scope' });
       logTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: `closed:out_of_scope (${note})`, ok: true });
       return { ok: true, action: 'closed', id: t.id };
     }
@@ -766,6 +773,7 @@ export function requestCancellation({ destinationId, source = 'inbound_reversal'
         WHERE id = ? AND status = 'not_started' AND version = ?`)
         .run(now, actor || source, source, now, actor || source, t.id, t.version);
       if (r.changes === 1) {
+        syncSingleBatchStatus(db, t.id, { status: 'closed', close_reason: 'cancelled' });
         safeLogTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: 'closed:cancelled (auto)', ok: true });
         return { ok: true, action: 'closed', task: getTask(t.id) };
       }
@@ -953,6 +961,7 @@ export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerN
         skipped.push({ id, reason: 'active_sessions', title }); continue;   // 作業中のまま終了にしない (Codex PR1 R3)
       }
       if (updVer.run(now, actor, now, now, actor, id, version).changes !== 1) { skipped.push({ id, reason: 'conflict', title }); continue; }
+      syncSingleBatchStatus(db, id, { status: 'closed', close_reason: 'stocked' });
       // 履歴は握り潰さない (権限のいる操作。記録できないなら全部やり直す — Codex PR-C R1)
       logTaskEvent({ taskId: id, action: 'task_status', from: 'ready_for_stocking', to: 'closed:stocked (まとめて棚入完了)',
         workerId, workerName, deviceLabel, ok: true });

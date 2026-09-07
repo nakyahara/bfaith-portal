@@ -4549,5 +4549,144 @@ console.log('\n[25] ⛔ 止まっている理由の札 — タイマー停止・
   db.prepare("UPDATE f_iroha_facilities SET name = 'パレット' WHERE code = 'rehas'").run();
 }
 
+// ═══════════════════════ 作業の「まとまり」の土台 (要件 §AB-1) ═══════════════════════
+console.log('\n[24] 作業のまとまり — カードの下に独立して作業・棚入れできる単位を持つ');
+{
+  const db = getDB();
+  const { createTables } = await import('../apps/iroha-work/db.js');
+  const B = await import('../apps/iroha-work/batches.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+
+  // ── 表の形 ──
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_task_batches'").get()?.sql || '';
+  ok(/REFERENCES f_iroha_tasks\(id\)/.test(sql) && /REFERENCES f_iroha_facilities\(code\)/.test(sql),
+    'まとまりはカードと拠点を参照する (宙ぶらりんにならない)');
+  ok(/good_qty\s+INTEGER CHECK \(good_qty IS NULL OR good_qty >= 0\)/.test(sql)
+    && /loss_qty\s+INTEGER CHECK \(loss_qty IS NULL OR loss_qty >= 0\)/.test(sql)
+    && !/good_qty[^,]*<=/.test(sql),
+    'できた数・作れなかった数は 0 以上。⭐上限は付けない (1010 個できることがある — 要件 §AB-3)');
+  ok(/good_qty_source TEXT CHECK \(good_qty_source IS NULL OR good_qty_source IN \('counted','migrated'\)\)/.test(sql),
+    'その数を人が数えたのか、移行で持ってきたのかを残す (移行前の値は実績として信用できない)');
+  ok(db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_iroha_batches_seq'").get(),
+    '同じカードに同じ番号のまとまりを 2 つ作れない');
+
+  // ── ぜんぶのカードにまとまりが 1 つある ──
+  const noBatch = db.prepare(`SELECT COUNT(*) c FROM f_iroha_tasks t
+    WHERE NOT EXISTS (SELECT 1 FROM f_iroha_task_batches b WHERE b.task_id = t.id)`).get().c;
+  ok(noBatch === 0, 'まとまりを持たないカードは 1 枚も無い (起動時に用意される)');
+  const nTasks = db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c;
+  const nBatch = db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches').get().c;
+  ok(nBatch === nTasks, `まとまりは 1 枚に 1 つだけ (カード ${nTasks} / まとまり ${nBatch})`);
+  ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches WHERE seq <> 1').get().c === 0,
+    'まだ割っていないので、番号はすべて 1');
+
+  // ── 中身がカードから正しく写っている ──
+  const someTask = db.prepare("SELECT * FROM f_iroha_tasks WHERE qty IS NOT NULL AND status = 'not_started' LIMIT 1").get();
+  if (someTask) {
+    const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE task_id = ?').get(someTask.id);
+    ok(b.planned_qty === someTask.qty && b.work_status === 'not_started',
+      '予定数と進捗はカードから写す');
+    ok(b.expiry === (someTask.expiry ?? null),
+      '⭐期限は作成時にコピーする (「NULL ならカードから継承」にしない — 後でカードを直しても外に出した分が変わらない)');
+  }
+  // 終了したカードは理由で分かれる
+  const stocked = db.prepare("SELECT * FROM f_iroha_tasks WHERE status = 'closed' AND close_reason = 'stocked' LIMIT 1").get();
+  if (stocked) {
+    ok(db.prepare('SELECT work_status FROM f_iroha_task_batches WHERE task_id = ?').get(stocked.id).work_status === 'done',
+      '棚入完了したカードのまとまりは done');
+  }
+  {
+    const tc = TD.upsertTaskFromImport({ notion_page_id: 'batch-cancel-1', status: 'not_started',
+      destination_id: 9613, product_name: '取消するカード', qty: 40 }, { batchId: 'bt' }).id;
+    ok(B.listBatchesOfTask(db, tc)[0].work_status === 'not_started', '作ったときは未着手');
+    const staffC = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+    TD.changeTaskStatus({ taskId: tc, to: 'closed', closeReason: 'cancelled', expectVersion: TD.getTask(tc).version,
+      isStaff: true, workerId: staffC.id, workerName: staffC.display_name });
+    ok(B.listBatchesOfTask(db, tc)[0].work_status === 'cancelled',
+      '⭐取消で終わったカードのまとまりは cancelled (棚入完了 done と混ぜない)');
+    const ts = TD.upsertTaskFromImport({ notion_page_id: 'batch-stock-1', status: 'ready_for_stocking',
+      destination_id: 9614, product_name: '棚入するカード', qty: 40 }, { batchId: 'bt' }).id;
+    TD.changeTaskStatus({ taskId: ts, to: 'closed', closeReason: 'stocked', expectVersion: TD.getTask(ts).version,
+      isStaff: true, workerId: staffC.id, workerName: staffC.display_name });
+    ok(B.listBatchesOfTask(db, ts)[0].work_status === 'done',
+      '棚入完了したカードのまとまりは done。⭐進捗を変えると、まとまりが 1 つのうちは一緒に動く');
+  }
+  ok(B.batchStatusOfTask({ status: 'closed', close_reason: 'stocked' }) === 'done'
+    && B.batchStatusOfTask({ status: 'closed', close_reason: 'cancelled' }) === 'cancelled'
+    && B.batchStatusOfTask({ status: 'on_hold' }) === 'in_progress'
+    && B.batchStatusOfTask({ status: 'in_progress' }) === 'in_progress',
+    '進捗の写し方 (旧「保留」は作業中として移す)');
+
+  // ── 移行で入れた数は「人が数えた」と区別する ──
+  {
+    const t9 = TD.upsertTaskFromImport({ notion_page_id: 'batch-mig-1', status: 'in_progress',
+      destination_id: 9612, product_name: '移行の印', qty: 300 }, { batchId: 'bt' }).id;
+    db.prepare('UPDATE f_iroha_tasks SET done_qty = 120 WHERE id = ?').run(t9);
+    db.prepare('DELETE FROM f_iroha_task_batches WHERE task_id = ?').run(t9);
+    B.backfillBatches(db);
+    const mb = B.listBatchesOfTask(db, t9)[0];
+    ok(mb.good_qty === 120 && mb.good_qty_source === 'migrated',
+      '⭐移行で持ってきた できた数 には migrated の印が付く (予定数で上書きされていた可能性があるので実績として信用しない)');
+  }
+  ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_task_batches WHERE good_qty IS NULL AND good_qty_source IS NOT NULL").get().c === 0,
+    '数が入っていないのに出どころだけある行は無い');
+
+  // ── 新しいカードを作ったら、まとまりも一緒にできる ──
+  const made = TD.upsertTaskFromImport({ notion_page_id: 'batch-new-1', status: 'not_started',
+    destination_id: 9611, product_code: 'PROD-A', product_name: 'まとまりの新規', qty: 500, expiry: '2026-12-31' }, { batchId: 'bt' });
+  const nb = B.listBatchesOfTask(db, made.id);
+  ok(nb.length === 1 && nb[0].planned_qty === 500 && nb[0].expiry === '2026-12-31' && nb[0].seq === 1,
+    'カードを作ると、まとまりも同じ書き込みで 1 つできる');
+  ok(nb[0].good_qty == null && nb[0].good_qty_source == null, '新しいまとまりは「まだ数えていない」(0 にしない)');
+
+  // ── 冪等 ──
+  ok(B.ensureBatchForTask(db, TD.getTask(made.id)) === 0, '同じカードに 2 つ目を作らない');
+  ok(B.backfillBatches(db) === 0, '2 回目の起動では何もしない (冪等)');
+  createTables(db);
+  ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ?').get(made.id).c === 1,
+    'createTables を何度呼んでも増えない');
+
+  // ── 番号は再利用しない ──
+  const now2 = new Date().toISOString();
+  db.prepare(`INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, created_at, updated_at)
+    VALUES (?, ?, 100, 'not_started', ?, ?)`).run(made.id, B.nextSeq(db, made.id), now2, now2);
+  ok(B.nextSeq(db, made.id) === 3, '次の番号は 3 (2 を使ったので)');
+  const seq2 = db.prepare('SELECT id FROM f_iroha_task_batches WHERE task_id = ? AND seq = 2').get(made.id).id;
+  db.prepare("UPDATE f_iroha_task_batches SET work_status = 'cancelled' WHERE id = ?").run(seq2);
+  ok(B.nextSeq(db, made.id) === 3 && db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ?').get(made.id).c === 2,
+    '⭐要らなくなったまとまりは消さずに取消にする (消さないので番号も使い回されない)');
+  const nid = (() => { const t2 = new Date().toISOString();
+    const r = db.prepare(`INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, created_at, updated_at)
+      VALUES (?, ?, 1, 'not_started', ?, ?)`).run(made.id, B.nextSeq(db, made.id), t2, t2); return Number(r.lastInsertRowid); })();
+  ok(nid > seq2, '⭐履歴やラベルが指すのは id (表ぜんぶで通し番号・使い回されない)。seq は並び順だけ');
+  let dupErr = null;
+  try {
+    db.prepare(`INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, created_at, updated_at)
+      VALUES (?, 1, 1, 'not_started', ?, ?)`).run(made.id, now2, now2);
+  } catch (e) { dupErr = e; }
+  ok(dupErr && /UNIQUE/.test(dupErr.message), '同じ番号は二度使えない (DB の索引)');
+
+  // ── 数の約束 ──
+  let negErr = null;
+  try { db.prepare('UPDATE f_iroha_task_batches SET good_qty = -1 WHERE task_id = ?').run(made.id); } catch (e) { negErr = e; }
+  ok(negErr && /CHECK/.test(negErr.message), 'できた数にマイナスは入らない');
+  db.prepare('UPDATE f_iroha_task_batches SET good_qty = 510, good_qty_source = \'counted\' WHERE task_id = ? AND seq = 1').run(made.id);
+  ok(db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE task_id = ? AND seq = 1').get(made.id).good_qty === 510,
+    '⭐予定 (500) より多い 510 も入る (実際に起きる — 要件 §AB-3)');
+  db.prepare('UPDATE f_iroha_task_batches SET good_qty = NULL, good_qty_source = NULL WHERE task_id = ?').run(made.id);
+
+  // ── 列が無い古い DB から起動しても、全カードに用意される ──
+  db.pragma('foreign_keys = OFF');
+  db.exec('DROP TABLE IF EXISTS f_iroha_task_batches');
+  db.pragma('foreign_keys = ON');
+  ok(!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_task_batches'").get(),
+    '前提: まとまりの表が無い (この機能より前の DB)');
+  createTables(db);
+  const after = db.prepare(`SELECT COUNT(*) c FROM f_iroha_tasks t
+    WHERE NOT EXISTS (SELECT 1 FROM f_iroha_task_batches b WHERE b.task_id = t.id)`).get().c;
+  ok(after === 0 && db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches').get().c === db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c,
+    '⭐まとまりの表が無い DB を開くと、全部のカードに 1 つずつ用意される');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exit(fail > 0 ? 1 : 0);
