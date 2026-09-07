@@ -455,43 +455,9 @@
               <% } %>
             </a>
             <%# セットを「作る／作らない」をカードから決める (2026-09-07 中原さん要望)。
-                これまでは詳細画面を開かないと決められず、⑤の列を流すのに 1 件ずつ往復していた。
-                🚨 出すのは**単品のカードだけ** (セット自身に⑤は無い)。
-                🚨 ⑤の列だけでなく**判断済みのカードにも**出す — 判断するとカードは次の列へ動くので、
-                   ⑤の列にしか置かないと「押し間違いを直す」入口がボードから消える %>
-            <% if (boardView !== 'image' && !c.isSet && (c.setDecision || (c.setReview && col.code === 'set_review'))) { %>
-              <%
-                const sr = c.setReview;
-                // 押せるのは admin / ⑤の担当者本人 / 未割り当て (押した人が引き受ける = D&D と同じ)。
-                // 他人の担当のときはボタンを出さず誰の担当かを書く (403 で弾いてから理由を知らせない)
-                const myStaffId = me ? me.id : null;
-                const setClaim = !!sr && !isAdmin && sr.assigneeId == null;
-                const setEditable = !!sr && (isAdmin
-                  || (sr.assigneeId != null && sr.assigneeId === myStaffId)
-                  || (setClaim && !!sr.roleCode && myStaffId != null));
-              %>
-              <div class="kb-set" data-draft="<%= c.id %>" data-version="<%= sr ? sr.version : '' %>"
-                   data-claim="<%= setClaim ? '1' : '' %>" data-name="<%= c.name || '' %>"
-                   data-decision="<%= c.setDecision ? c.setDecision.label : '' %>">
-                <%# 🚨 札の文言に「🎁 セット…」を使わない — セット商品そのものの印 (🎁 セット) と
-                    読み分けられなくなる。単品のカードに付くのは**判断**の札 %>
-                <span class="kb-set-chip <%= c.setDecision ? c.setDecision.decision : 'none-yet' %>">
-                  🎁 <%= c.setDecision ? `判断: ${c.setDecision.label}` : 'まだ決めていません' %>
-                </span>
-                <% if (setEditable) { %>
-                  <% if (col.code === 'set_review') { %>
-                    <button type="button" class="kb-set-btn make" data-act="create">🎁 作る</button>
-                    <button type="button" class="kb-set-btn" data-act="none">🚫 作らない</button>
-                    <button type="button" class="kb-set-btn" data-act="hold">⏸ 保留</button>
-                  <% } %>
-                  <% if (c.setDecision) { %>
-                    <button type="button" class="kb-set-btn undo" data-act="undo">↩ 取り消す</button>
-                  <% } %>
-                <% } else { %>
-                  <span class="kb-set-note"><%= sr.assigneeName ? `${sr.assigneeName} さんの担当です` : '担当者の紐づけが要ります' %></span>
-                <% } %>
-              </div>
-            <% } %>
+                中身は _card-set-decision.ejs (完了列のカードからも同じものを include している —
+                判断が済むとカードは列を移るので、片方にしか置かないと取り消せなくなる) %>
+            <% if (boardView !== 'image') { %><%- include('_card-set-decision', { c, colCode: col.code || col.key || '', me, isAdmin }) %><% } %>
             <% if (boardView !== 'image' && c.malls && col.code === 'listing') { %>
               <%# 楽天への出品 (2026-09-01 中原さん要望)。リンクの外に置く (押して詳細に飛ばない)。
                   出品済み = 商品ページへのリンク / 失敗 = 理由 + やり直し / 未出品 = 出品ボタン。
@@ -616,6 +582,10 @@
               <% } %>
             </div>
           </a>
+          <%# 完了列のカードでも判断を取り消せるようにする (2026-09-07 Codex R1)。
+              判断が済むとカードは列を移り、やがてここに来る — 通常の列にしか置かないと
+              「どの列でも取り消せる」がここで途切れる。列コードは 'done' なので判断ボタンは出ない %>
+          <% if (boardView !== 'image') { %><%- include('_card-set-decision', { c, colCode: 'done', me, isAdmin }) %><% } %>
           <% if (boardView === 'image') { %>
             <% const prd = imagePriorities.find((p) => p.value === c.image_priority) || null; %>
             <select class="kb-priority" data-draft="<%= c.id %>"
@@ -824,10 +794,14 @@
     // いま開いているダイアログの対象 (カードの .kb-set と、none / hold のどちらか)
     let target = null;
 
+    // 🚨 通信エラーも「失敗」として返す (2026-09-07 Codex R1)。reject を投げると
+    //    未処理例外になり、ボタンが disabled・「記録しています…」のまま操作不能になる
     function post(url, body) {
       return fetch(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-      }).then((res) => res.json().catch(() => ({ ok: false, error: 'HTTP ' + res.status })));
+      })
+        .then((res) => res.json().catch(() => ({ ok: false, error: 'HTTP ' + res.status + ' (応答が読めませんでした)' })))
+        .catch((err) => ({ ok: false, error: '通信エラー: ' + err.message }));
     }
     // カードが持っている「⑤の版数」と「未割り当てなら引き受ける」フラグ
     function ctxOf(box) {
@@ -845,6 +819,12 @@
       $('kb-setdec-hold').hidden = mode !== 'hold';
       $('kb-setdec-result').textContent = '';
       $('kb-setdec-apply').disabled = false;
+      // 🚨 1 枚を使い回すので、開くたびに入力を白紙に戻す (2026-09-07 Codex R1)。
+      //    残したままだと、別のカードに書いたメモ・理由がそのまま次のカードに記録される
+      $('kb-setdec-reason').selectedIndex = 0;
+      $('kb-setdec-reason-text').value = '';
+      $('kb-setdec-reason-text').hidden = $('kb-setdec-reason').value !== 'other';
+      $('kb-setdec-hold-note').value = '';
       modal.style.display = 'block';
     }
     function closeModal() { modal.style.display = 'none'; target = null; }

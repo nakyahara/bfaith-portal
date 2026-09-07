@@ -1521,9 +1521,11 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       (SELECT ne_code FROM product_drafts p WHERE p.id = d.parent_draft_id) AS parent_ne_code,
       (SELECT updated_at FROM product_drafts p WHERE p.id = d.parent_draft_id) AS parent_updated_at,
       ${/* 取り下げたセット (判断の取り消しで excluded にしたもの) は数えない — 2026-09-07。
-            数えるとカードに「派生セット 1件」が残り、取り消したのに作ったままに見える */''}
+            数えるとカードに「派生セット 1件」が残り、取り消したのに作ったままに見える。
+            🚨 on_hold は数える (Codex R1): 保留は「あとで進める」なので、派生が無いことにすると
+               既に作ったセットを忘れて二重に作る */''}
       (SELECT COUNT(*) FROM product_drafts c WHERE c.parent_draft_id = d.id
-         AND c.status NOT IN ('on_hold', 'excluded')) AS set_children_count,
+         AND c.status <> 'excluded') AS set_children_count,
       (SELECT GROUP_CONCAT(member_ne_code || ' × ' || qty, ' + ')
          FROM (SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = d.id ORDER BY sort)) AS set_members,
       (SELECT decision FROM draft_set_decisions sd WHERE sd.draft_id = d.id ORDER BY sd.decided_at DESC, sd.id DESC LIMIT 1) AS set_decision,

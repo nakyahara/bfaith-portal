@@ -1,0 +1,48 @@
+<%#
+  ボードのカードに載せる「セットを作る／作らない」(2026-09-07 中原さん要望)。
+  これまでは詳細画面を開かないと決められず、⑤の列を流すのに 1 件ずつ往復していた。
+
+  🚨 カードのリンク (<a class="kb-card-link">) の**外**に置くこと。中に入れると入れ子リンクになり、
+     ボタンを押しただけで詳細画面に飛ぶ。
+  🚨 ⑤の列だけでなく**判断済みのカードすべて**に出す。判断するとカードは次の列 (完了列も含む) へ
+     動くので、⑤の列にしか置くと「押し間違いを直す」入口がボードから消える。
+     だから通常の列と完了列の両方からこの partial を include している。
+
+  locals:
+    c        … カード (workflow-progress.boardData が組み立てたもの)
+    colCode  … その列の工程コード。'set_review' のときだけ 作る/作らない/保留 を出す
+    me / isAdmin … 押せるかの出し分けに使う (サーバー側 assertStepOperable と同じ物差し)
+-%>
+<% if (!c.isSet && (c.setDecision || (c.setReview && colCode === 'set_review'))) { %>
+  <%
+    const sr = c.setReview;
+    // 押せるのは admin / ⑤の担当者本人 / 未割り当て (押した人が引き受ける = D&D と同じ)。
+    // 他人の担当のときはボタンを出さず誰の担当かを書く — 403 で弾いてから理由を知らせない
+    const myStaffId = me ? me.id : null;
+    const setClaim = !!sr && !isAdmin && sr.assigneeId == null;
+    const setEditable = !!sr && (isAdmin
+      || (sr.assigneeId != null && sr.assigneeId === myStaffId)
+      || (setClaim && !!sr.roleCode && myStaffId != null));
+  %>
+  <div class="kb-set" data-draft="<%= c.id %>" data-version="<%= sr ? sr.version : '' %>"
+       data-claim="<%= setClaim ? '1' : '' %>" data-name="<%= c.name || '' %>"
+       data-decision="<%= c.setDecision ? c.setDecision.label : '' %>">
+    <%# 🚨 札の文言に「🎁 セット…」を使わない — セット商品そのものの印 (🎁 セット) と
+        読み分けられなくなる。単品のカードに付くのは**判断**の札 %>
+    <span class="kb-set-chip <%= c.setDecision ? c.setDecision.decision : 'none-yet' %>">
+      🎁 <%= c.setDecision ? `判断: ${c.setDecision.label}` : 'まだ決めていません' %>
+    </span>
+    <% if (setEditable) { %>
+      <% if (colCode === 'set_review') { %>
+        <button type="button" class="kb-set-btn make" data-act="create">🎁 作る</button>
+        <button type="button" class="kb-set-btn" data-act="none">🚫 作らない</button>
+        <button type="button" class="kb-set-btn" data-act="hold">⏸ 保留</button>
+      <% } %>
+      <% if (c.setDecision) { %>
+        <button type="button" class="kb-set-btn undo" data-act="undo">↩ 取り消す</button>
+      <% } %>
+    <% } else { %>
+      <span class="kb-set-note"><%= sr && sr.assigneeName ? `${sr.assigneeName} さんの担当です` : '担当者の紐づけが要ります' %></span>
+    <% } %>
+  </div>
+<% } %>

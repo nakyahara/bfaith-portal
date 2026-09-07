@@ -7227,6 +7227,12 @@ renders.push(
           }
           return { ...c, cards: [] };
         }),
+        // 完了列のカードでも取り消せる (判断が済むとカードはやがてここに来る)
+        doneCards: [mk(96005, {
+          setReview: { version: 9, state: 'done', assigneeId: 1, assigneeName: '中原 大輔', roleCode: 'planner' },
+          setDecision: { decision: 'create', label: sd.describeSetDecision({ decision: 'create' }) },
+        })],
+        doneTotal: 1,
       },
     };
   })()],
@@ -7723,13 +7729,31 @@ for (const [name, file, data] of renders) {
   wfp.setStepState(created2.draftId, 'set_compose', { state: 'doing', expected_version: composeStep.version }, 'smoke', { isAdmin: true });
   const u4 = undo(p2);
   check('判断の取り消し: 誰かが進めたセットがあるときは取り消しごと断る',
-    u4.ok === false && u4.status === 400 && /工程が動かされている/.test(u4.msg || '')
+    u4.ok === false && u4.status === 400 && /作成のあとに操作されている/.test(u4.msg || '')
     && sd.latestSetDecision(db, p2)?.decision === 'create'
     && db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(created2.draftId).status !== 'excluded',
     JSON.stringify(u4));
 
-  db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?, ?, ?, ?, ?)')
-    .run(d0, d1, d2, p1, created.draftId, p2, created2.draftId);
+  // ⑥ 🚨 親に画像がある商品でも、作った直後なら取り消せる (2026-09-07 Codex R1)。
+  //    作成時に applyImagePlanToTrack が画像工程を todo → skip にして版数を上げるので、
+  //    「工程の版数が動いたか」で見ると**実データでは常に取り消せなくなる**
+  const p3 = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, price, created_by) VALUES ('setundo-img', '取消テスト 画像あり', 'approved', 1980, 'smoke')`
+  ).run().lastInsertRowid);
+  {
+    const insImg = db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)');
+    for (let i = 0; i < 4; i++) insImg.run(p3, `undo-img-${i}`, i);
+  }
+  const pv3 = wfp.progressOf(p3, { db }).main.find((x) => x.step_code === 'set_review').version;
+  const created3 = sd.createSetDraft(p3, { mode: 'copy', parent_step_version: pv3 }, 'smoke', { isAdmin: true, actorStaffId: null });
+  const imgTouched = db.prepare(`SELECT COUNT(*) c FROM draft_step_progress WHERE draft_id = ? AND version > 0`).get(created3.draftId).c;
+  const u5 = undo(p3);
+  check('判断の取り消し: 親に画像がある商品でも、作った直後なら取り消せる',
+    imgTouched > 0 && u5.ok === true && u5.r.withdrawn?.id === created3.draftId,
+    `画像計画で版数が動いた工程 ${imgTouched} 件 / ${JSON.stringify(u5)}`);
+
+  db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(d0, d1, d2, p1, created.draftId, p2, created2.draftId, p3, created3.draftId);
 }
 
 // ─── ⑤を閉じる画面 (2026-09-04 §5.4) ────────────────────────────────────
@@ -7876,9 +7900,10 @@ for (const [name, file, data] of renders) {
   // ─── セットの判断をカードから決める (2026-09-07 中原さん要望) ───
   {
     const bhBtn = renderedHtml.get('board.ejs (セット判断のボタン)') || '';
+    // 完了列のカードは class="kb-card" (末尾の空白なし) なので、区切りは正規表現で取る
     const cardB = (id) => {
-      const seg = bhBtn.split('<div class="kb-card ').find((x) => x.includes(`data-draft="${id}"`)) || '';
-      return seg.split(/<div class="kb-card[" ]/)[0].split('<script>')[0];
+      const seg = bhBtn.split(/<div class="kb-card[" ]/).find((x) => x.includes(`data-draft="${id}"`)) || '';
+      return seg.split('<script>')[0];
     };
     const fresh = cardB(96001), held = cardB(96002), others = cardB(96003), later = cardB(96004);
     check('ボード判断: ⑤の列の未判断カードに 作る/作らない/保留 が並ぶ',
@@ -7903,6 +7928,11 @@ for (const [name, file, data] of renders) {
     // ボタンはカードのリンク (<a class="kb-card-link">) の外 = 押しても詳細画面へ飛ばない
     check('ボード判断: ボタンはカードのリンクの外にある (入れ子リンクにしない)',
       fresh.indexOf('</a>') !== -1 && fresh.indexOf('kb-set-btn') > fresh.indexOf('</a>'), fresh.slice(0, 800));
+    // 判断が済むとカードは列を移り、やがて完了列に来る。片方にしか置かないと取り消せなくなる
+    const doneCard = cardB(96005);
+    check('ボード判断: 完了列のカードでも「取り消す」が出る',
+      doneCard.includes('判断: セットを作成') && doneCard.includes('↩ 取り消す')
+      && !doneCard.includes('🎁 作る'), doneCard.slice(0, 600));
     check('ボード判断: 理由を聞くダイアログは 1 枚を使い回す (カードごとに入力欄を置かない)',
       (bhBtn.match(/id="kb-setdec"/g) || []).length === 1
       && bhBtn.includes('送料負け (単価が低い)'), '');
