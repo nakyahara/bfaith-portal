@@ -10,7 +10,8 @@ import {
   OPEN_STATUSES, CLOSE_REASONS, BLOCK_REASONS, BLOCK_LABEL, BLOCKABLE_STATUSES, LEGACY_ON_HOLD,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
 } from './tasks.js';
-import { ensureBatchForTask, syncSingleBatchStatus, recordBatchCounts, recomputeTaskDoneQty, soleBatchOfTask } from './batches.js';
+import { ensureBatchForTask, syncSingleBatchStatus, recordBatchCounts, recomputeTaskDoneQty, soleBatchOfTask,
+  recordStockingForTask } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -406,6 +407,8 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     syncSingleBatchStatus(db, t.id, next);
     // ⭐数はまとまりが正本。カードの done_qty はその合計に直す (要件 §AB-3)
     applyCountsToSoleBatch(db, t.id, { goodQty: dq.skip ? undefined : dq.value, lossQty: lq.skip ? undefined : lq.value, note: vn.skip ? undefined : vn.value });
+    // ⭐棚に入れたら、その実績を残す (要件 §AB-2)。まとまりごと・まだ入れていない残り全部
+    if (to === 'closed' && closeReason === 'stocked') recordStockingForTask(db, t.id, { at: now, by: actor });
     const cleared = ((t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '')
       + ((t.blocked_reason && !next.blocked_reason) ? ` 札解除(${t.blocked_reason})` : '');
     // できた数と中断メモも履歴に残す。消えた申し送りを後から追えるように (ready_at と同じ考え方)
@@ -1051,6 +1054,7 @@ export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerN
       }
       if (updVer.run(now, actor, now, now, actor, id, version).changes !== 1) { skipped.push({ id, reason: 'conflict', title }); continue; }
       syncSingleBatchStatus(db, id, { status: 'closed', close_reason: 'stocked' });
+      recordStockingForTask(db, id, { at: now, by: actor });
       // 履歴は握り潰さない (権限のいる操作。記録できないなら全部やり直す — Codex PR-C R1)
       logTaskEvent({ taskId: id, action: 'task_status', from: 'ready_for_stocking', to: 'closed:stocked (まとめて棚入完了)',
         workerId, workerName, deviceLabel, ok: true });

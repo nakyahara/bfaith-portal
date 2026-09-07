@@ -4022,7 +4022,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v10'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v11'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -4968,6 +4968,121 @@ console.log('\n[27] できた数 — 実績を予定で上書きしない');
     && /\.\.\.\(v\.note !== undefined \? \{ variance_note: v\.note \} : \{\}\)/.test(html),
     '作れなかった数とひとことは、状態変更と同じ 1 回の通信で送る (空文字も送る = 消せる)');
   ok(/数が予定と違っていても、そのまま入れてください/.test(html), '「差があってよい」と画面に書く');
+}
+
+// ═══════ 棚に入れた記録 — まとまりごと・別の表 (要件 §AB-2) ═══════
+console.log('\n[28] 棚に入れた記録 — 作業のまとまりを割って表さない');
+{
+  const db = getDB();
+  const B = await import('../apps/iroha-work/batches.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const { createTables } = await import('../apps/iroha-work/db.js');
+  const staff28 = listIrohaWorkers(true).find((x) => x.worker_type === 'staff');
+  const mk28 = (page, dest, qty) => TD.upsertTaskFromImport({ notion_page_id: page, status: 'ready_for_stocking',
+    facility_code: 'iroha', destination_id: dest, product_name: '棚入れの検査', qty }, { batchId: 'st' }).id;
+  const close28 = (id) => TD.changeTaskStatus({ taskId: id, to: 'closed', closeReason: 'stocked',
+    expectVersion: TD.getTask(id).version, isStaff: true, workerId: staff28.id, workerName: staff28.display_name,
+    actor: staff28.display_name });
+
+  // ── 表の形 ──
+  const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_stocking_records'").get()?.sql || '';
+  ok(/REFERENCES f_iroha_task_batches\(id\)/.test(sql) && /qty\s+INTEGER CHECK \(qty IS NULL OR qty >= 0\)/.test(sql),
+    '棚入れの実績は まとまり にぶら下がる。数は 0 以上、NULL 可 (数えずに入れた)');
+
+  // ── 棚入完了で 1 行できる ──
+  {
+    const t = mk28('st-1', 9851, 200);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 198 }); }).immediate();
+    ok(B.stockedQtyOf(db, bid).rows === 0, '前提: まだ棚に入れていない');
+    const r = close28(t);
+    ok(r.ok, '前提: 棚入完了にした');
+    const recs = B.stockingOfTask(db, t);
+    ok(recs.length === 1 && recs[0].qty === 198, '⭐棚入完了にしたら「198 個 入れた」が 1 行残る (できた数ぶん)');
+    ok(recs[0].stocked_by === staff28.display_name && recs[0].stocked_at, 'いつ・誰が が残る');
+    ok(B.stockedQtyOf(db, bid).qty === 198, '合計は実績から出す');
+  }
+  // ── 数えずに棚に入れた ──
+  {
+    const t = mk28('st-2', 9852, 100);
+    close28(t);
+    const recs = B.stockingOfTask(db, t);
+    ok(recs.length === 1 && recs[0].qty == null,
+      '⭐数えていないまとまりは「数は残していない」で 1 行 (0 個と混ぜない)');
+    ok(B.stockedQtyOf(db, t) && B.stockedQtyOf(db, B.listBatchesOfTask(db, t)[0].id).qty == null,
+      '合計も「分からない」(0 にしない)');
+  }
+  // ── ⭐部分棚入れは、まとまりを割らずに実績を足す ──
+  {
+    const t = mk28('st-3', 9853, 400);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 398 }); }).immediate();
+    // 200 個だけ先に入れる (画面にはまだ無いが、仕組みとしてできる)
+    db.transaction(() => { db.prepare(`INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, stocked_by, created_at)
+      VALUES (?, 200, ?, 'さきに200', ?)`).run(bid, new Date().toISOString(), new Date().toISOString()); }).immediate();
+    ok(B.stockedQtyOf(db, bid).qty === 200, '前提: 200 個だけ入れてある');
+    close28(t);
+    const recs = B.stockingOfTask(db, t);
+    ok(recs.length === 2 && B.stockedQtyOf(db, bid).qty === 398,
+      '⭐残り 198 個ぶんが足されて合計 398 (まとまりは 1 つのまま — 割らない)');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ?').get(t).c === 1,
+      '⭐まとまりは割れていない (398 個ぶんの作業時間・メモの帰属が壊れない — Codex R3 の差し戻し)');
+  }
+  // ── 全部入れてあれば足さない (二重に記録しない) ──
+  {
+    const t = mk28('st-4', 9854, 50);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 50 }); }).immediate();
+    close28(t);
+    ok(B.stockingOfTask(db, t).length === 1, '前提: 1 回で全部入れた');
+    db.transaction(() => { ok(B.recordStocking(db, bid) === 0, '⭐もう全部入れてあれば足さない (二重に記録しない)'); }).immediate();
+  }
+  // ── まとめて棚入完了でも残る ──
+  {
+    const t = mk28('st-5', 9855, 30);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 30 }); }).immediate();
+    TD.bulkCloseReady({ taskIds: [{ id: t, version: TD.getTask(t).version }], actor: 'まとめて',
+      workerId: staff28.id, workerName: staff28.display_name });
+    ok(B.stockingOfTask(db, t).length === 1 && B.stockingOfTask(db, t)[0].qty === 30,
+      'まとめて棚入完了でも実績が残る');
+  }
+  // ── 取消で終わったカードには残らない ──
+  {
+    const t = TD.upsertTaskFromImport({ notion_page_id: 'st-6', status: 'not_started', facility_code: 'iroha',
+      destination_id: 9856, product_name: '取消して終わる', qty: 10 }, { batchId: 'st' }).id;
+    TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'cancelled', expectVersion: TD.getTask(t).version,
+      isStaff: true, workerId: staff28.id, workerName: staff28.display_name });
+    ok(B.stockingOfTask(db, t).length === 0, '取消で終わったカードは棚に入れていないので実績も無い');
+  }
+  // ── この機能より前に棚入完了したカードにも、起動時に用意される ──
+  {
+    const t = mk28('st-7', 9857, 70);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 70 }); }).immediate();
+    close28(t);
+    db.prepare('DELETE FROM f_iroha_stocking_records WHERE batch_id = ?').run(bid);   // 昔の DB の形にする
+    ok(B.stockingOfTask(db, t).length === 0, '前提: 実績が無い');
+    createTables(db);
+    const recs = B.stockingOfTask(db, t);
+    ok(recs.length === 1 && recs[0].qty === 70 && /この機能より前/.test(recs[0].note || ''),
+      '⭐起動時に、棚入完了ずみのカードへ実績を用意する (いつ・誰が はカードの終了記録から)');
+    ok(B.backfillStocking(db) === 0, '2 回目は何もしない (冪等)');
+  }
+
+  // ── 箱ラベルは「どのまとまりのぶんを刷ったか」を残す ──
+  const pj = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_print_jobs'").get().sql;
+  ok(/batch_id/.test(pj), '箱ラベルの印刷ジョブに まとまり の列がある (要件 §AB-12)');
+  ok(/product_name/.test(pj) && /expiry_text/.test(pj) && /pack_qty/.test(pj) && /copies/.test(pj),
+    '刷った中身 (商品名・期限・入数・枚数) は列に残る = あとでまとまりを直しても刷った記録は変わらない');
+
+  // ── 画面 ──
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(/function stockingCardHtml\(c\)/.test(html) && /棚に入れた記録/.test(html)
+    && /stockingCardHtml\(c\) \+/.test(html),
+    '詳細に「棚に入れた記録」を出す');
+  ok(/r\.qty == null \? '数は残していません'/.test(html),
+    '数えずに入れたぶんは「数は残していません」と出す (0 と混ぜない)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

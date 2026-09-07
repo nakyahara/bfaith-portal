@@ -209,3 +209,76 @@ export function countsByTask(db, taskIds) {
   }
   return out;
 }
+
+/**
+ * ⭐棚に入れた実績を 1 行足す (要件 §AB-2)。**まとまりごと**。
+ *
+ * いまは「棚入れする」で**まだ棚に入れていない残り全部**を 1 行にする。
+ * 数えていない (good_qty が NULL) まとまりは `qty` も NULL = **数えずに棚に入れた** (0 と区別)。
+ * ⚠必ず呼び出し側の書き込みトランザクションの中で。
+ *
+ * @returns {number} 足した行数 (0 = 残りが無い)
+ */
+export function recordStocking(db, batchId, { at = null, by = null, note = null } = {}) {
+  const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(batchId);
+  if (!b) return 0;
+  const done = stockedQtyOf(db, batchId);
+  // 数えていれば「できた数 − すでに棚へ入れた数」。数えていなければ数量なしで 1 行だけ
+  let qty = null;
+  if (b.good_qty != null) {
+    qty = b.good_qty - (done.qty ?? 0);
+    if (qty <= 0) return 0;                      // もう全部入れてある
+  } else if (done.rows > 0) {
+    return 0;                                    // 数えていないまとまりは 1 回だけ
+  }
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, stocked_by, note, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)`).run(batchId, qty, at || now, by, note, now);
+  return 1;
+}
+
+/** そのまとまりを棚に入れた合計。{ qty: 数えた合計 (NULL = 1 度も数えていない), rows: 実績の件数 } */
+export function stockedQtyOf(db, batchId) {
+  const r = db.prepare('SELECT COUNT(*) rows, COUNT(qty) n, SUM(qty) s FROM f_iroha_stocking_records WHERE batch_id = ?').get(batchId);
+  return { qty: r && r.n > 0 ? r.s : null, rows: r ? r.rows : 0 };
+}
+
+/** カードの棚入れ実績をまとめて (履歴・詳細に出す用)。まとまりを問わず新しい順 */
+export function stockingOfTask(db, taskId) {
+  return db.prepare(`SELECT s.*, b.seq FROM f_iroha_stocking_records s
+    JOIN f_iroha_task_batches b ON b.id = s.batch_id
+    WHERE b.task_id = ? ORDER BY s.id DESC`).all(taskId);
+}
+
+/**
+ * カードを棚入完了にしたとき、そのカードのまとまり全部に実績を足す。
+ * ⚠必ず呼び出し側の書き込みトランザクションの中で。
+ * @returns {number} 足した行数
+ */
+export function recordStockingForTask(db, taskId, opts = {}) {
+  const rows = db.prepare("SELECT id FROM f_iroha_task_batches WHERE task_id = ? AND work_status <> 'cancelled'").all(taskId);
+  let n = 0;
+  for (const b of rows) n += recordStocking(db, b.id, opts);
+  return n;
+}
+
+/**
+ * 既に棚入完了になっているカードに、実績が無ければ足す (起動時。冪等)。
+ * この機能より前に棚に入れたぶんは、いつ・誰が入れたかをカードの closed_at / closed_by から持ってくる。
+ * @returns {number} 足した行数
+ */
+export function backfillStocking(db) {
+  const made = db.transaction(() => {
+    const rows = db.prepare(`SELECT b.id, t.closed_at, t.closed_by FROM f_iroha_task_batches b
+      JOIN f_iroha_tasks t ON t.id = b.task_id
+      WHERE b.work_status = 'done'
+        AND NOT EXISTS (SELECT 1 FROM f_iroha_stocking_records s WHERE s.batch_id = b.id)`).all();
+    let n = 0;
+    for (const r of rows) {
+      n += recordStocking(db, r.id, { at: r.closed_at || null, by: r.closed_by || null, note: '(この機能より前に棚に入れたぶん)' });
+    }
+    return n;
+  }).immediate();
+  if (made > 0) console.log(`[iroha-work] 棚入れの実績を ${made} 件ぶん用意しました (この機能より前のぶん)`);
+  return made;
+}

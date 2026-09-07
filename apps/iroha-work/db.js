@@ -16,7 +16,7 @@
 import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { FACILITIES, FACILITY_RENAMES } from './tasks.js';
-import { backfillBatches } from './batches.js';
+import { backfillBatches, backfillStocking } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -207,6 +207,31 @@ const batchesDDL = (name) => `
       CHECK ((good_qty IS NULL AND good_qty_source IS NULL)
           OR (good_qty IS NOT NULL AND good_qty_source IS NOT NULL))
     );`;
+/**
+ * ⭐棚に入れた実績 (要件 §AB-2)。**まとまり 1 つにつき、棚入れは何回でも記録できる**。
+ *
+ * 「398 個のうち 200 個だけ先に棚に入れる」が必要になったとき、
+ * **まとまりを割って表そうとしてはいけない** — 398 個ぶんの作業時間・作れなかった数・メモを
+ * 200 個側と 198 個側のどちらに付けるか決められなくなる (Codex R3 で差し戻されて分けた)。
+ * 作業を分ける単位 (まとまり) と、物を棚へ移した記録 (これ) は別のできごと。
+ *
+ * いまの画面は「棚入れする」で**残り全部を 1 行**作るだけ。数量を選ぶ入力は必要になってから。
+ * `qty` は NULL 可 = **数えずに棚に入れた** (0 と区別する)。
+ */
+const stockingDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id   INTEGER NOT NULL REFERENCES f_iroha_task_batches(id),
+      qty        INTEGER CHECK (qty IS NULL OR qty >= 0),
+      stocked_at TEXT NOT NULL,
+      stocked_by TEXT,
+      note       TEXT,
+      version    INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL
+    );`;
+const STOCKING_INDEX_DDL = `
+    CREATE INDEX IF NOT EXISTS idx_iroha_stocking_batch ON f_iroha_stocking_records(batch_id, id);`;
+
 const BATCHES_INDEX_DDL = `
     CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_batches_seq ON f_iroha_task_batches(task_id, seq);
     CREATE INDEX IF NOT EXISTS idx_iroha_batches_task ON f_iroha_task_batches(task_id, id);
@@ -624,6 +649,8 @@ export function createTables(db = getMirrorDB()) {
     --   紐づけ先: Notion 正本の間は page_id、アプリ正本のカードは task_id (v1.1)
     ${batchesDDL('f_iroha_task_batches')}
     ${BATCHES_INDEX_DDL}
+    ${stockingDDL('f_iroha_stocking_records')}
+    ${STOCKING_INDEX_DDL}
     ${sessionsDDL('f_iroha_work_sessions')}
 
     -- 完成写真・動画 (要件定義 §6 / §1.7 ②outbox)。
@@ -723,6 +750,8 @@ export function createTables(db = getMirrorDB()) {
   // ⭐まとまりを持っていないカードに 1 つずつ用意する (要件 §AB-1)。冪等。
   //   進捗の移行 (上) が終わってから — まとまりの状態はカードの進捗から決めるため
   backfillBatches(db);
+  // ⭐既に棚入完了のカードに、棚入れの実績が無ければ足す (要件 §AB-2)。まとまりが揃ったあと
+  backfillStocking(db);
   // v1.1 正本化: 作業時間・写真・履歴を task に紐づける (page_id は Notion 時代の証跡として残す — Codex 設計相談 R3)。
   // REFERENCES は宣言する (mirror DB は foreign_keys=ON。存在確認はサービス層でも行う)
   addCol('f_iroha_work_sessions', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
@@ -796,6 +825,10 @@ export function createTables(db = getMirrorDB()) {
   `);
   // 端数の箱 (最後の 1 箱だけ入数が違う) は後から足した列。すでにある DB にも入れる (中原さん 2026-09-06)
   addCol('f_iroha_print_jobs', 'extra_pack_qty', "TEXT NOT NULL DEFAULT ''");
+  // ⭐箱ラベルは「どのまとまりのぶんを刷ったか」を残す (要件 §AB-12)。
+  //   刷った中身 (商品名・バーコード・入数・期限・枚数) は元から列で持っているので、
+  //   あとでまとまりの期限や数を直しても、**刷った記録は変わらない**
+  addCol('f_iroha_print_jobs', 'batch_id', 'INTEGER REFERENCES f_iroha_task_batches(id)');
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}

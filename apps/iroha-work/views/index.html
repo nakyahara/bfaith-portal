@@ -3692,6 +3692,7 @@ function renderDetail(c, opts) {
 
     mediaCardHtml(c) +
     historyCardHtml(c) +
+    stockingCardHtml(c) +
     workCardHtml(c);
   // 画面下の固定バー (はじめる / タイマー / ひとやすみ / できあがり / ⛔止まった — 監修 F-1)。許可が無ければ出さない
   const bar = $('#dbar');
@@ -3720,6 +3721,25 @@ function historyCardHtml(c) {
   return '<div class="dcard"><h3 class="sec">これまでの作業 — このカード</h3>' +
     '<ul class="whist">' + items + '</ul>' +
     '<p class="est num">合計 ' + esc(fmtDur(total)) + ' (' + rows.length + '回)</p></div>';
+}
+
+/**
+ * ⭐棚に入れた実績 (要件 §AB-2)。いつ・誰が・何個 入れたか。
+ * 数えずに入れたぶんは「数は残していません」と出す (0 と混ぜない)
+ */
+function stockingCardHtml(c) {
+  const rows = c.stocking || [];
+  if (rows.length === 0) return '';
+  const items = rows.map(r =>
+    '<li>' + esc(fmtDate(r.stocked_at) + ' ' + fmtTime(r.stocked_at)) + ' ・ ' +
+    (r.qty == null ? '数は残していません' : '<b>' + esc(String(r.qty)) + ' 個</b>') +
+    (r.stocked_by ? ' ・ ' + esc(r.stocked_by) : '') +
+    (r.note ? ' ・ ' + esc(r.note) : '') + '</li>').join('');
+  const n = rows.reduce((a, r) => a + (r.qty == null ? 0 : Number(r.qty)), 0);
+  const counted = rows.some((r) => r.qty != null);
+  return '<div class="dcard"><h3 class="sec">棚に入れた記録</h3>' +
+    '<ul class="whist">' + items + '</ul>' +
+    (counted ? '<p class="est num">合計 ' + esc(String(n)) + ' 個 (' + rows.length + '回)</p>' : '') + '</div>';
 }
 
 // ── 写真・動画: 「前回の完成形」(同じ商品の見本) と「今回のできあがり」 ──
