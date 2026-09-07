@@ -11,6 +11,19 @@ import { getMirrorDB } from '../warehouse-mirror/db.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 
+// 🚨 mirror_products.消費税率 は「小数」で入っている (0.1 = 10%, 0.08 = 8%)。
+//    この画面 (view / 原価登録モーダル) は「%」で扱うので、境界でここに揃える。
+//    2026-09-07 まで `prod.消費税率 ?? 10` とそのまま返していたため、view の
+//    `1 + taxRate/100` が 1 + 0.1/100 = 1.001 にしかならず、税込原価がほぼ税抜のままだった。
+//    (税率が未登録の商品だけ 10 が入って正しく計算される、という逆転が起きていた)
+export const TAX_PERCENT_FALLBACK = 10;
+export function toPercent(rate) {
+  // 数値でない (null / undefined / NaN / 文字列) と、想定外の単位 (1 以上 = 既に % の疑い)、
+  // 0 以下 (未登録) は fallback
+  if (!Number.isFinite(rate) || rate <= 0 || rate >= 1) return TAX_PERCENT_FALLBACK;
+  return rate * 100;
+}
+
 // --- ミニPC接続（SP-API実行用） ---
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
 
@@ -315,7 +328,9 @@ router.post('/api/listings', async (req, res) => {
             const prod = productMap.get(entry.ne_code?.toLowerCase());
             if (prod && prod.原価 != null) {
               totalCost += prod.原価 * entry.qty;
-              taxRate = prod.消費税率 ?? 10;
+              // mirror_products.消費税率 は小数 (0.1 = 10%)。画面は % で扱うので変換する
+              // (変換しないと view の `1 + taxRate/100` が 1.001 になり、原価に税が乗らない)
+              taxRate = toPercent(prod.消費税率);
               costSource = prod.原価ソース || '';
             } else {
               allFound = false;
@@ -337,7 +352,7 @@ router.post('/api/listings', async (req, res) => {
           if (prod && prod.原価 != null) {
             costMap.set(sku.toLowerCase(), {
               cost: prod.原価,
-              taxRate: prod.消費税率 ?? 10,
+              taxRate: toPercent(prod.消費税率),
               costSource: prod.原価ソース || '',
               neCode: sku,
             });
