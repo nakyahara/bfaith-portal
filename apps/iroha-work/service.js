@@ -315,6 +315,9 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       COUNT(*) n, MIN(c.due_date) due
     FROM f_iroha_consignments c JOIN f_iroha_task_batches b ON b.id = c.batch_id
     WHERE c.state IN ('planned','prepared','handed') GROUP BY b.task_id`).all().map((r) => [r.task_id, r]));
+  // ⭐まとまりごとの「まだ外にあるか」。外にあるぶんは人が先へ進められない (返却で棚入待ちになる — 要件 §AB-11 の 5)
+  const outByBatch = new Set(getDB().prepare(`SELECT DISTINCT batch_id FROM f_iroha_consignments
+    WHERE state IN ('planned','prepared','handed')`).all().map((r) => r.batch_id));
   const today = jstToday();
   const tomorrow = jstTomorrow(today);
 
@@ -359,7 +362,10 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
         const cg = consignable.get(b.id) || { max: null, why: null };
         return { id: b.id, seq: b.seq, planned_qty: b.planned_qty,
           facility_code: b.facility_code, expiry: b.expiry, work_status: b.work_status,
-          good_qty: b.good_qty, loss_qty: b.loss_qty,
+          good_qty: b.good_qty, loss_qty: b.loss_qty, variance_note: b.variance_note || null,
+          counted: b.good_qty_source === 'counted',
+          // ⭐まだ外にあるぶんは、人が「作り終えた」を押せない (返却を受け取ると棚入待ちになる)
+          consigned_out: outByBatch.has(b.id),
           consignable_max: cg.max, consignable_why: cg.why };
       }),
       hold_memo: r.hold_memo || null,

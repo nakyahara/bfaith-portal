@@ -3884,7 +3884,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /\(canEditProgress\(c\) \? '<button class="edit" onclick="openDq\(null\)">/.test(html),
     '直せないとき (下見・棚入待ち・終了・許可なし) は「✎ できた数」を描かない (要件 §U-7)');
   ok(!/id="dqSave" onclick="saveProgress\(\)">保存する<\/button><\/div>\s*<\/div>/.test(html)
-    && /\$\('#dqBody'\)\.innerHTML = dqPanelHtml\(c, ''\) \+\r?\n\s*'<div class="mbtns">/.test(html),
+    && /\$\('#dqBody'\)\.innerHTML = dqPanelHtml\(dqSubject\(c, homeBatchId\(c\)\), ''\) \+\r?\n\s*'<div class="mbtns">/.test(html),
     '保存ボタンも許可を見てから描く (静的に置かない — 要件 §U-7)');
   ok(/function dqPanelHtml\(c, actions, opts\)/.test(html) && /何個までできましたか/.test(html)
     && /const quick = \[\['0', 'まだ 0 個'\]\];/.test(html) && /'半分 \(' \+ Math\.floor\(c\.qty \/ 2\)/.test(html)
@@ -3905,7 +3905,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/blockReason === 'other' && !v\.memo/.test(html) && /「その他」は何で止まったかをメモに書いてください/.test(html), '「その他」はメモが無いと送らない');
   ok(/c\.active = \[\];\s*\/\/ タイマーは全員止まった/.test(html), '止めたら作業中の人のタイマーは全員止まる (画面もそう描く)');
   // ✅ できあがり → 「何個できましたか → 棚入待ちにする」(監修 B-7 / F-3)。「終了」は出さない
-  ok(/function openDone\(c\)/.test(html) && /id="doneOv"/.test(html) && /to: 'ready_for_stocking', worker_id: worker\.id, expect_version: c\.version/.test(html)
+  ok(/function openDone\(c, batchId = null\)/.test(html) && /id="doneOv"/.test(html) && /to: 'ready_for_stocking', worker_id: worker\.id, expect_version: c\.version/.test(html)
     && /title: '何個できましたか', memo: false, loss: true/.test(html) && /if \(isApp\(\) && c\) openDone\(c\);/.test(html),
     'できあがりで全員止まったら「何個できましたか + 作れなかった数 → 棚入待ちにする」を出す (⭐予定で埋めない)');
   ok(!/終了 → 棚入完了/.test(html), '「終了 → 棚入完了を (職員PIN)」の案内は出さない (利用者が押せるのは棚入待ち)');
@@ -4022,7 +4022,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v13'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v14'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -4870,9 +4870,14 @@ console.log('\n[27] できた数 — 実績を予定で上書きしない');
     ok(!r3.ok && r3.error === 'split_card', '⭐「⛔ 止まった」の口でも断る');
     ok(TD.getTask(t).blocked_reason == null, '断ったので札も付かない');
 
-    // 数を送らなければ、状態や札はふつうに変えられる
+    // ⭐分かれたカードは「カードごと作り終えた」も断る (どのぶんが終わったのか決まらない — §AB-11 の 5)。
+    //   数を送らなくても同じ。まとまりを選んで送るのが正しい道
     const r4 = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: before.ver });
-    ok(r4.ok && TD.getTask(t).status === 'ready_for_stocking', '数を送らなければ、分かれたカードでも状態は変えられる');
+    ok(!r4.ok && r4.error === 'split_card' && TD.getTask(t).status !== 'ready_for_stocking',
+      '⭐分かれたカードは、カードごと「作り終えた」にできない (どのぶんかを選ばせる)');
+    const home4 = B.listBatchesOfTask(db, t).find((b) => !b.facility_code || b.facility_code === 'iroha');
+    const r4b = TD.changeBatchStatus({ taskId: t, batchId: home4.id, to: 'ready_for_stocking', expectVersion: TD.getTask(t).version });
+    ok(r4b.ok, 'どのぶんかを選べば通る');
     db.prepare('DELETE FROM f_iroha_task_batches WHERE task_id = ? AND seq = 2').run(t);
   }
   // ⑨ ⛔止まった でも作れなかった数・ひとことが残る (以前は捨てていた)
@@ -4961,7 +4966,7 @@ console.log('\n[27] できた数 — 実績を予定で上書きしない');
     '⭐ひとことを読むのは「あります」を選んで欄が見えているときだけ (何も触っていないのに空文字を送らない)');
   ok(/if \(input\) \{ input\.value = b\.dataset\.dq; dqDiff\(input\); \}/.test(html),
     '⭐タップで数を変えたときも、差の表示と確認をやり直す');
-  ok(/Math\.abs\(v\.qty - c\.qty\) > 5 \|\| Math\.abs\(v\.qty - c\.qty\) > c\.qty \* 0\.1/.test(html)
+  ok(/Math\.abs\(v\.qty - subj\.qty\) > 5 \|\| Math\.abs\(v\.qty - subj\.qty\) > subj\.qty \* 0\.1/.test(html)
     && /if \(far && doneConfirmed !== v\.qty\)/.test(html),
     '⭐「5 個より多い か 1 割より多い」ずれで、止めずにもう一度だけ確かめる (max だと両方超えたときになる)');
   ok(/doneConfirmed = null;\s*\r?\n\s*const qty = p\.dataset\.qty/.test(html) && /doneConfirmed = v\.qty;/.test(html),
@@ -5561,18 +5566,24 @@ console.log('\n[29] 外部施設にあずける — まとまりを割る・渡�
     const b0 = sole(t)[0];
     const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
     C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
-    TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v29(t) });
-    const ready = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: v29(t), doneQty: 200, batchId: b0.id });
-    ok(!ready.ok && ready.error === 'consign_open', '⭐外に 100 個あるうちは「作り終えた」(棚入待ち) にできない');
+    // ⭐カードごと「作り終えた」は、分かれたカードでは断る (どのぶんかを選ばせる — §AB-11 の 5)
+    const whole6 = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: v29(t) });
+    ok(!whole6.ok && whole6.error === 'split_card', 'カードごと「作り終えた」は断る');
+    // ⭐外にあるぶんは、そのぶんを選んでも「作り終えた」にできない (返却で棚入待ちになる)
+    const away6a = B.listBatchesOfTask(db, t).find((x) => x.facility_code === 'workcenter');
+    const ready = TD.changeBatchStatus({ taskId: t, batchId: away6a.id, to: 'ready_for_stocking', expectVersion: v29(t), doneQty: 200 });
+    ok(!ready.ok && ready.error === 'consign_open', '⭐外に 100 個あるうちは、そのぶんを「作り終えた」にできない');
     ok(TD.getTask(t).status === 'in_progress', '状態も変わっていない');
-    ok(db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE id = ?').get(b0.id).good_qty == null, '断ったので数も書いていない (途中で止めない = 1 回の書き込み)');
+    ok(db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE id = ?').get(away6a.id).good_qty == null, '断ったので数も書いていない (途中で止めない = 1 回の書き込み)');
     // 返却がそろえば通る
     let c = C.getConsignment(r.consignment.id);
     C.recordReturn({ consignmentId: c.id, returnedQty: 100, goodQty: 99, lossQty: 1, expectVersion: c.version, idempotencyKey: 'ret-6-1' });
-    const ready2 = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: v29(t), doneQty: 200, batchId: b0.id });
+    const ready2 = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'ready_for_stocking', expectVersion: v29(t), doneQty: 200 });
     ok(ready2.ok, '全部返ってきたら「作り終えた」にできる');
     ok(TD.getTask(t).done_qty === 299, 'カードの控え = いろは 200 + 外 99');
-    const closed = TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'stocked', expectVersion: v29(t), isStaff: true, actor: 'たにがわ' });
+    const away6 = B.listBatchesOfTask(db, t).find((b) => b.facility_code === 'workcenter');
+    TD.changeBatchStatus({ taskId: t, batchId: away6.id, to: 'closed', closeReason: 'stocked', expectVersion: v29(t), isStaff: true, actor: 'たにがわ' });
+    const closed = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'closed', closeReason: 'stocked', expectVersion: v29(t), isStaff: true, actor: 'たにがわ' });
     ok(closed.ok, '棚入完了にできる');
     ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_stocking_records s JOIN f_iroha_task_batches b ON b.id = s.batch_id WHERE b.task_id = ?').get(t).c === 2,
       '棚入れの実績は 2 つのまとまりぶん');
@@ -5683,9 +5694,9 @@ console.log('\n[29] 外部施設にあずける — まとまりを割る・渡�
     C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
     let c = C.getConsignment(r.consignment.id);
     C.recordReturn({ consignmentId: c.id, returnedQty: 400, goodQty: 400, expectVersion: c.version, idempotencyKey: 'ret-11-1' });
-    TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v29(t) });
-    const ready = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: v29(t), doneQty: 598, batchId: b0.id });
-    ok(ready.ok, '前提: 手元 598 個で作り終えた (カードは棚入待ち・手元のまとまりは作業中のまま)');
+    const ready = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'ready_for_stocking', expectVersion: v29(t), doneQty: 598 });
+    ok(ready.ok && TD.getTask(t).status === 'ready_for_stocking',
+      '前提: 手元 598 個で作り終えた (外部のぶんは返却ずみなので、カードも棚入待ちになる)');
     const again = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'rashinban', qty: 2, expectVersion: v29(t) });
     ok(!again.ok && again.error === 'batch_closed', '⭐カードが棚入待ちなら、まとまりの状態に関わらず残り 2 個は預けられない');
     const m = C.consignableByBatch(db, [b0.id]).get(b0.id);
@@ -5797,7 +5808,8 @@ console.log('\n[29] 外部施設にあずける — まとまりを割る・渡�
   ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
   ok(/able\.length > 1 \? '<label>どのぶんを渡しますか<\/label>/.test(html) && /data-cgbatch=/.test(html),
     '⭐渡せるぶんが 2 つ以上あるときは選べる (渡さなかったぶんが手元に戻ると起きる)');
-  ok(/function homeBatchId\(c\)/.test(html) && (html.match(/\.\.\.\(homeBatchId\(c\) \? \{ batch_id: homeBatchId\(c\) \} : \{\}\)/g) || []).length === 3,
+  ok(/function homeBatchId\(c\)/.test(html) && (html.match(/\.\.\.\(homeBatchId\(c\) \? \{ batch_id: homeBatchId\(c\) \} : \{\}\)/g) || []).length === 2
+    && /doneBatch = batchId != null \? batchId : homeBatchId\(c\);/.test(html),
     '⭐作り終えた・止まった・あとから直す の 3 か所で、いろは のぶん (batch_id) を添える (預けたあとも数が入る)');
   ok(/cgKeep = cgReadInputs\(\); cgPickedBatch = Number\(bb\.dataset\.cgbatch\); openConsign\(\);/.test(html)
     && /if \(cgKeep\) \{/.test(html),
@@ -5818,6 +5830,334 @@ console.log('\n[29] 外部施設にあずける — まとまりを割る・渡�
     ok(fn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'not_started' }, { id: 3, facility_code: null, work_status: 'not_started' },
       { id: 2, facility_code: 'workcenter', work_status: 'in_progress' }] }) === null, '決められなければ null (サーバーが「選んで」と断る)');
   }
+}
+
+console.log('\n[30] まとまりごとに作り終える・先に棚入れする (§AB-11 の 5)');
+{
+  const db = getDB();
+  const B = await import('../apps/iroha-work/batches.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const C = await import('../apps/iroha-work/consign.js');
+  const mk = (page, dest, qty) => TD.upsertTaskFromImport({ notion_page_id: page, status: 'not_started',
+    facility_code: 'iroha', destination_id: dest, product_name: 'まとまり進捗の検査', qty }, { batchId: 'bp' }).id;
+  const v = (id) => TD.getTask(id).version;
+  const bs = (id) => B.listBatchesOfTask(db, id).filter((b) => b.work_status !== 'cancelled');
+  const ws = (bid) => db.prepare('SELECT work_status FROM f_iroha_task_batches WHERE id = ?').get(bid).work_status;
+
+  // ① まとまりが 1 つのカードは今までどおり (見え方を変えない)
+  {
+    const t = mk('bp-1', 9980, 100);
+    const b0 = bs(t)[0];
+    ok(TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v(t) }).ok, '作業をはじめる');
+    const r = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: v(t), doneQty: 98 });
+    ok(r.ok && TD.getTask(t).status === 'ready_for_stocking', 'まとまりが 1 つなら、カード単位の「作り終えた」がそのまま通る');
+    ok(ws(b0.id) === 'ready_for_stocking', 'まとまりの状態も合う');
+    const cl = TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'stocked', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(cl.ok && ws(b0.id) === 'done', '棚入完了でまとまりも done');
+  }
+
+  // ② ⭐分けたあと、いろはのぶんだけ先に進められる (中原さん「2 週間寝かせる理由がない」)
+  {
+    const t = mk('bp-2', 9981, 1000);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 600, expectVersion: v(t) });
+    ok(cg.ok, '前提: 600 個をワークセンターへ');
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    const away = bs(t).find((b) => b.facility_code === 'workcenter');
+    ok(bs(t).length === 2, '前提: まとまりが 2 つ');
+    ok(B.deriveTaskStatus(db, t) === 'in_progress', '外に渡したので、カードの進捗は「作業中」');
+
+    // カード単位の「作り終えた」は断る (どちらのぶんか決まらない)
+    const whole = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: v(t) });
+    ok(!whole.ok && whole.error === 'split_card', '⭐カードごと「作り終えた」は断る (どのぶんかを選ばせる)');
+
+    // 外にあるぶんは押せない
+    const outR = TD.changeBatchStatus({ taskId: t, batchId: away.id, to: 'ready_for_stocking', expectVersion: v(t) });
+    ok(!outR.ok && outR.error === 'consign_open', '⭐外にあずけているぶんは、人が「作り終えた」にできない (返却で棚入待ちになる)');
+
+    // いろはのぶんだけ作り終える
+    const home = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'ready_for_stocking', expectVersion: v(t), doneQty: 398, lossQty: 2 });
+    ok(home.ok, '⭐いろはのぶんだけ「作り終えた」にできる');
+    ok(ws(b0.id) === 'ready_for_stocking' && ws(away.id) === 'in_progress', 'いろはのぶんだけ棚入待ち。外部のぶんは作業中のまま');
+    ok(TD.getTask(t).status === 'in_progress', '⭐カードは「作業中」のまま (全部そろっていないので)');
+    ok(TD.getTask(t).done_qty === 398, 'カードのできた数はまとまりの合計 (外部はまだ数えていない)');
+
+    // 棚入完了も そのぶんだけ
+    const notStaff = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'closed', closeReason: 'stocked', expectVersion: v(t) });
+    ok(!notStaff.ok && notStaff.error === 'staff_required', '棚入完了は職員だけ (カードと同じ約束)');
+    const st = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'closed', closeReason: 'stocked', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(st.ok && ws(b0.id) === 'done', '⭐いろはの 398 個だけ先に棚へ入れられる');
+    ok(TD.getTask(t).status === 'in_progress', '⭐カードはまだ終了しない (外に 600 個ある)');
+    const rec = db.prepare('SELECT qty FROM f_iroha_stocking_records WHERE batch_id = ?').all(b0.id);
+    ok(rec.length === 1 && rec[0].qty === 398, '棚入れの実績は 398 個で 1 行');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_stocking_records WHERE batch_id = ?').get(away.id).c === 0,
+      '⭐外にあるぶんの棚入れ実績は作らない');
+
+    // 返ってきたら外部のぶんも棚入待ち → 棚入完了でカードが終了
+    let c1 = C.getConsignment(cg.consignment.id);
+    C.recordReturn({ consignmentId: c1.id, returnedQty: 600, goodQty: 595, lossQty: 5, expectVersion: c1.version, idempotencyKey: 'bp-ret-1' });
+    ok(ws(away.id) === 'ready_for_stocking', '返却がそろったら、外部のぶんは棚入待ちになる');
+    const st2 = TD.changeBatchStatus({ taskId: t, batchId: away.id, to: 'closed', closeReason: 'stocked', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(st2.ok, '外部のぶんも棚入完了にできる');
+    const after = TD.getTask(t);
+    ok(after.status === 'closed' && after.close_reason === 'stocked', '⭐全部そろったので、カードが棚入完了になる');
+    ok(after.done_qty === 993, 'カードのできた数 = 398 + 595');
+    ok(after.closed_at && after.ready_at, '終了の時刻も入る (不変条件)');
+  }
+
+  // ③ 進捗の写像 (deriveTaskStatus)
+  {
+    const t = mk('bp-3', 9982, 200);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'rashinban', qty: 50, expectVersion: v(t) });
+    const away = bs(t).find((b) => b.facility_code === 'rashinban');
+    ok(B.deriveTaskStatus(db, t) === 'not_started', '両方まだ未着手ならカードも未着手');
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'ready_for_stocking' WHERE id = ?").run(b0.id);
+    ok(B.deriveTaskStatus(db, t) === 'in_progress', '⭐片方だけ棚入待ちなら、カードは作業中 (いちばん進んでいない側に合わせる)');
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'ready_for_stocking' WHERE id = ?").run(away.id);
+    ok(B.deriveTaskStatus(db, t) === 'ready_for_stocking', '両方そろったら棚入待ち');
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'done' WHERE id = ?").run(b0.id);
+    ok(B.deriveTaskStatus(db, t) === 'ready_for_stocking', '片方だけ棚に入っても、まだ棚入待ち');
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'done' WHERE id = ?").run(away.id);
+    ok(B.deriveTaskStatus(db, t) === 'done', '全部棚に入ったら done (カードは終了へ)');
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'cancelled' WHERE id = ?").run(away.id);
+    ok(B.deriveTaskStatus(db, t) === 'done', '取消したまとまりは数えない');
+  }
+
+  // ④ カードごと終了・やり直しは、まとまりが 2 つ以上でも合わせる
+  {
+    const t = mk('bp-4', 9983, 300);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v(t) });
+    const away = bs(t).find((b) => b.facility_code === 'workcenter');
+    const c0 = C.getConsignment(cg.consignment.id);
+    C.cancelConsignment({ consignmentId: c0.id, expectVersion: c0.version });   // 外に出さずにやめる
+    const left = bs(t);
+    ok(left.length >= 1, '前提: 預けをやめた');
+    // 2 つ以上にするため、もう一度切り出して渡す前の状態にする
+    const cg2 = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 80, expectVersion: v(t) });
+    const away2 = bs(t).find((b) => b.facility_code === 'workcenter');
+    ok(bs(t).length === 2, '前提: まとまりが 2 つ');
+    const c2 = C.getConsignment(cg2.consignment.id);
+    C.cancelConsignment({ consignmentId: c2.id, expectVersion: c2.version });
+    // 取消で away2 は cancelled になり、数が戻る
+    const cancel = TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'cancelled', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(cancel.ok, 'カードごと取消にできる');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ? AND work_status = 'cancelled'").get(t).c >= 1,
+      '⭐カードを取消にしたら、まとまりも取消になる (カードだけ閉じて中身が残らない)');
+    const back = TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v(t), isStaff: true, reason: '数え直す', actor: 'たにがわ' });
+    ok(back.ok, 'やり直しできる');
+    ok(bs(t).length >= 1, '⭐やり直したら、作業できるまとまりが戻る (0 個になると数も入れられない — Codex R1 重大1)');
+    ok(B.deriveTaskStatus(db, t) === 'in_progress', 'まとまりから導いた進捗も作業中');
+    // ⭐預けをやめて数を元に戻したまとまりは、戻さない (数が二重になる)
+    const revived = B.listBatchesOfTask(db, t).filter((b) => b.work_status === 'in_progress');
+    const total = revived.reduce((a, b) => a + (b.planned_qty ?? 0), 0);
+    ok(total === 300, '⭐戻ったのは 300 個ぶん (預けをやめて数を戻したまとまりは復活させない)');
+  }
+
+  // ④b ⭐まとまりが 1 つのカードも、取消 → やり直しでまとまりが戻る (本番の全カードがこの形)
+  {
+    const t = mk('bp-4b', 9989, 120);
+    const b0 = bs(t)[0];
+    TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'cancelled', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(ws(b0.id) === 'cancelled', '取消でまとまりも取消に');
+    TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v(t), isStaff: true, reason: 'やっぱりやる', actor: 'たにがわ' });
+    ok(ws(b0.id) === 'in_progress' && bs(t).length === 1, '⭐やり直しでまとまりも戻る');
+    ok(TD.setProgress({ taskId: t, expectVersion: v(t), doneQty: 100 }).ok, '戻ったので数も入れられる');
+    ok(TD.getTask(t).done_qty === 100, 'まとまりに入った数がカードにも出る');
+  }
+
+  // ④c ⭐一度はじめたカードを、預けをやめた拍子に「未着手」へ戻さない (Codex R1 中2)
+  {
+    const t = mk('bp-4c', 9990, 200);
+    const b0 = bs(t)[0];
+    TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v(t) });
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 50, expectVersion: v(t) });
+    const c0 = C.getConsignment(cg.consignment.id);
+    C.cancelConsignment({ consignmentId: c0.id, expectVersion: c0.version });
+    ok(TD.getTask(t).status === 'in_progress', '⭐預けをやめても、作業中のカードが未着手に戻らない');
+  }
+
+  // ⑤ 終了したカードのまとまりは動かせない / 知らないまとまりは指せない
+  {
+    const t = mk('bp-5', 9984, 50);
+    const b0 = bs(t)[0];
+    const other = mk('bp-5b', 9985, 20);
+    const bad = TD.changeBatchStatus({ taskId: t, batchId: bs(other)[0].id, to: 'ready_for_stocking', expectVersion: v(t) });
+    ok(!bad.ok && bad.error === 'bad_batch', '別のカードのまとまりは指せない');
+    const wrongTo = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'not_started', expectVersion: v(t) });
+    ok(!wrongTo.ok && wrongTo.error === 'bad_transition', 'まとまり単位で受けるのは 作業中 / 作り終えた / 棚入完了 だけ');
+    const wrongReason = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'closed', closeReason: 'cancelled', expectVersion: v(t), isStaff: true });
+    ok(!wrongReason.ok && wrongReason.error === 'bad_request', '⭐取消はカードごとの操作 (そのぶんだけでは閉じない)');
+    const conflict = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'ready_for_stocking', expectVersion: 0 });
+    ok(!conflict.ok && conflict.error === 'conflict', '版が違えば断る');
+    TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'out_of_scope', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    const closed = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'ready_for_stocking', expectVersion: v(t) });
+    ok(!closed.ok && closed.error === 'closed_task', '終了したカードのまとまりは変えられない');
+  }
+
+  // ⑥ ⭐「作業をはじめる」で手元のまとまりも作業中に (外部に預けたぶんは触らない)
+  {
+    const t = mk('bp-6', 9986, 500);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 200, expectVersion: v(t) });
+    const away = bs(t).find((b) => b.facility_code === 'workcenter');
+    ok(ws(b0.id) === 'not_started' && ws(away.id) === 'not_started', '前提: どちらもまだ未着手 (渡す前)');
+    ok(TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v(t) }).ok, '作業をはじめる');
+    ok(ws(b0.id) === 'in_progress', '⭐手元 (いろは) のまとまりも作業中になる');
+    ok(ws(away.id) === 'not_started', '⭐これから渡すぶんは触らない (「渡した」ときに作業中になる)');
+    // パレット担当 (物を持ち帰らない) も手元あつかい
+    const t2 = TD.upsertTaskFromImport({ notion_page_id: 'bp-6b', status: 'not_started', facility_code: 'rehas',
+      destination_id: 9987, product_name: 'パレット担当', qty: 100 }, { batchId: 'bp' }).id;
+    TD.changeTaskStatus({ taskId: t2, to: 'in_progress', expectVersion: v(t2) });
+    ok(ws(bs(t2)[0].id) === 'in_progress', 'パレットのぶんも手元 (offsite でない) なので作業中になる');
+  }
+
+  // ⑦ ⭐止まっている札が付いているうちは、返却で自動的に棚入待ちにしない (札が消えた理由を残せないため)
+  {
+    const t = mk('bp-7', 9988, 400);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 400, expectVersion: v(t) });
+    ok(bs(t).length === 1 && bs(t)[0].facility_code === 'workcenter', '前提: 丸ごと預けたのでまとまりは 1 つ');
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    const blocked = TD.setTaskBlock({ taskId: t, reason: 'label_shortage', expectVersion: v(t), actor: 'たにがわ' });
+    ok(blocked.ok && TD.getTask(t).blocked_reason === 'label_shortage', '前提: ラベル待ちの札を付けた');
+    let c1 = C.getConsignment(cg.consignment.id);
+    C.recordReturn({ consignmentId: c1.id, returnedQty: 400, goodQty: 398, expectVersion: c1.version, idempotencyKey: 'bp7-1' });
+    ok(ws(bs(t)[0].id) === 'ready_for_stocking', 'まとまりは棚入待ちになる');
+    ok(TD.getTask(t).status === 'in_progress', '⭐カードは作業中のまま (札が付いているので繰り上げない)');
+    ok(TD.getTask(t).blocked_reason === 'label_shortage', '⭐札も黙って消さない');
+    const cleared = TD.clearTaskBlock({ taskId: t, expectVersion: v(t), via: 'manual', actor: 'たにがわ' });
+    ok(cleared.ok, '札を外す');
+    ok(TD.getTask(t).status === 'ready_for_stocking', '⭐札を外したら、止めていた繰り上がりが反映される');
+    ok(TD.getTask(t).ready_at, '棚入待ちになった時刻も入る');
+  }
+
+  // ⑧ ⭐外へ渡してから手元の作業をはじめても、手元のまとまりが作業中になる (Codex R2 中2)
+  {
+    const t = mk('bp-8', 9991, 1000);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 600, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    ok(TD.getTask(t).status === 'in_progress', '前提: 渡したのでカードは作業中 (まとまりから導いた)');
+    ok(ws(b0.id) === 'not_started', '前提: 手元のぶんはまだ未着手');
+    // ここで いろは が作業をはじめる (カードは既に作業中なので、カード側の遷移は起きない)
+    const w8 = listIrohaWorkers(true).find((w) => w.display_name === 'やまだ');
+    const st = TD.startTaskSession({ taskId: t, worker: w8, deviceLabel: 'test' });
+    ok(st.ok, '作業をはじめる');
+    ok(ws(b0.id) === 'in_progress', '⭐カードが既に作業中でも、手元のまとまりが作業中になる');
+    ok(ws(bs(t).find((b) => b.facility_code === 'workcenter').id) === 'in_progress', '外部のぶんは渡した時点で作業中のまま');
+    stopSessions({ taskId: t, endReason: 'pause' });
+  }
+
+  // ⑨ ⭐棚入完了で閉じたカードも、そのぶんだけやり直せる (Codex R2 中3)
+  {
+    const t = mk('bp-9', 9992, 500);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    const away = bs(t).find((b) => b.facility_code === 'workcenter');
+    let c9 = C.getConsignment(cg.consignment.id);
+    C.recordReturn({ consignmentId: c9.id, returnedQty: 100, goodQty: 100, expectVersion: c9.version, idempotencyKey: 'bp9-1' });
+    TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'ready_for_stocking', expectVersion: v(t), doneQty: 398 });
+    TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'closed', closeReason: 'stocked', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    TD.changeBatchStatus({ taskId: t, batchId: away.id, to: 'closed', closeReason: 'stocked', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(TD.getTask(t).status === 'closed', '前提: 両方棚に入れたのでカードは終了');
+    const noReason = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'in_progress', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(!noReason.ok && noReason.error === 'bad_request', '終了したぶんを戻すには理由が要る (カードと同じ約束)');
+    const notStaff = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'in_progress', expectVersion: v(t), reason: '2 個貼り直す' });
+    ok(!notStaff.ok && notStaff.error === 'staff_required', '戻せるのは職員だけ');
+    const redo = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'in_progress', expectVersion: v(t),
+      isStaff: true, reason: '2 個貼り直す', actor: 'たにがわ' });
+    ok(redo.ok, '⭐棚入完了で閉じたカードでも、そのぶんだけ戻せる');
+    ok(ws(b0.id) === 'in_progress' && ws(away.id) === 'done', '⭐戻ったのは いろは のぶんだけ。外部のぶんは棚入完了のまま');
+    const t9 = TD.getTask(t);
+    ok(t9.status === 'in_progress' && t9.close_reason == null && t9.closed_at == null, 'カードも作業中に戻る (終了の跡は残さない)');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_stocking_records WHERE batch_id = ?').get(b0.id).c === 1,
+      '⭐棚に入れた記録は残る (履歴を消さない)');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_batch_status' AND to_value LIKE '%2 個貼り直す%'").get(t).c === 1,
+      'なぜ戻したかが履歴に残る');
+  }
+
+  // ⑩ ⭐分かれたカードは「やり直し」もカードごとには受けない (Codex R3 中1)
+  {
+    const t = mk('bp-10', 9993, 1000);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 600, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    const away = bs(t).find((b) => b.facility_code === 'workcenter');
+    let c10 = C.getConsignment(cg.consignment.id);
+    C.recordReturn({ consignmentId: c10.id, returnedQty: 600, goodQty: 600, expectVersion: c10.version, idempotencyKey: 'bp10-1' });
+    TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'ready_for_stocking', expectVersion: v(t), doneQty: 400 });
+    ok(TD.getTask(t).status === 'ready_for_stocking', '前提: 両方そろってカードは棚入待ち');
+    const redoAll = TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(!redoAll.ok && redoAll.error === 'split_card',
+      '⭐カードごと「やり直し」は断る (カードだけ作業中・まとまりは棚入待ち、の食い違いを作らない)');
+    ok(TD.getTask(t).status === 'ready_for_stocking' && ws(b0.id) === 'ready_for_stocking', '断ったので何も変わっていない');
+    // まとまりを選べば戻せて、数も直せる
+    const redo = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'in_progress', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(redo.ok && ws(b0.id) === 'in_progress' && ws(away.id) === 'ready_for_stocking', 'そのぶんだけ戻る');
+    const fix = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'ready_for_stocking', expectVersion: v(t), doneQty: 398 });
+    ok(fix.ok && db.prepare('SELECT good_qty FROM f_iroha_task_batches WHERE id = ?').get(b0.id).good_qty === 398,
+      '⭐戻したぶんの数を直せる (already で素通りしない)');
+  }
+
+  // ⑪ ⭐止まっている札が付いているうちは、まとまりを作り終えてもカードを棚入待ちにしない (Codex R3 中2)
+  {
+    const t = mk('bp-11', 9994, 300);
+    const b0 = bs(t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    const away = bs(t).find((b) => b.facility_code === 'workcenter');
+    let c11 = C.getConsignment(cg.consignment.id);
+    C.recordReturn({ consignmentId: c11.id, returnedQty: 100, goodQty: 100, expectVersion: c11.version, idempotencyKey: 'bp11-1' });
+    TD.setTaskBlock({ taskId: t, reason: 'label_shortage', expectVersion: v(t), holdMemo: '2 個は貼り直し確認待ち', actor: 'たにがわ' });
+    ok(TD.getTask(t).blocked_reason === 'label_shortage' && TD.getTask(t).hold_memo === '2 個は貼り直し確認待ち', '前提: 札と申し送りが付いている');
+    const done = TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'ready_for_stocking', expectVersion: v(t), doneQty: 200 });
+    ok(done.ok && ws(b0.id) === 'ready_for_stocking', 'そのぶんは棚入待ちになる');
+    const t11 = TD.getTask(t);
+    ok(t11.status === 'in_progress', '⭐カードは作業中のまま (札が付いているので繰り上げない)');
+    ok(t11.blocked_reason === 'label_shortage' && t11.hold_memo === '2 個は貼り直し確認待ち', '⭐札も申し送りも黙って消さない');
+    TD.clearTaskBlock({ taskId: t, expectVersion: v(t), via: 'manual', actor: 'たにがわ' });
+    ok(TD.getTask(t).status === 'ready_for_stocking', '札を外したら繰り上がる');
+    // 棚入完了まで来たら申し送りは消えるが、消した中身は履歴に残る
+    TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'closed', closeReason: 'stocked', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    TD.changeBatchStatus({ taskId: t, batchId: away.id, to: 'closed', closeReason: 'stocked', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(TD.getTask(t).status === 'closed' && TD.getTask(t).hold_memo == null, '全部棚に入ったらカードは終了・申し送りは消える');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_batch_status' AND to_value LIKE '%メモ消去(2 個は貼り直し確認待ち)%'").get(t).c === 1,
+      '⭐消した申し送りの中身が履歴に残る');
+  }
+
+  // ── 画面 ──
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(/function dqSubject\(c, batchId\)/.test(html)
+    && /dqPanelHtml\(dqSubject\(c, doneBatch\), ''/.test(html)
+    && /const subj = dqSubject\(c, doneBatch\);/.test(html),
+    '⭐数のフォームは**選んだまとまりの数**で描き、確かめる (カード合計を入れさせない — Codex R2 重大1)');
+  ok(/return \{ qty: b\.planned_qty, done_qty: b\.good_qty, counted: b\.counted !== false,/.test(html),
+    'まとまりの予定数・できた数・作れなかった数・ひとことを使う');
+  ok(/if \(c\.status === 'closed'\) \{\s*\r?\n\s*reason = await ask\(/.test(html),
+    '終了したカードのぶんを戻すときは、理由を聞く');
+  ok(/function batchesCardHtml\(c\)/.test(html) && /if \(bs\.length <= 1\) return '';/.test(html),
+    '⭐まとまりが 1 つなら「作業のまとまり」は出さない (ふだんの見え方を変えない)');
+  ok(/data-bdone="/.test(html) && /data-bstock="/.test(html),
+    'まとまりごとに「このぶんを作り終えた」「このぶんを棚入完了」が出せる');
+  ok(/if \(b\.consigned_out\) \{\s*\r?\n\s*btn = '';/.test(html),
+    '⭐外にあずけているぶんには、押せるボタンを描かない (要件 §U-7)');
+  ok(/b\.work_status === 'ready_for_stocking' && stateCan\('tasks\.bulk_stocked'\) && isStaffUI\(\)/.test(html),
+    '棚入完了のボタンは職員モードのときだけ');
+  ok(/doneBatch = batchId != null \? batchId : homeBatchId\(c\);/.test(html)
+    && /\.\.\.\(doneBatch \? \{ batch_id: doneBatch \} : \{\}\)/.test(html),
+    '⭐「作り終えた」はどのまとまりかを添えて送る');
+  ok(/close_reason: 'stocked', batch_id: b\.id/.test(html), 'まとまりの棚入完了は batch_id つきで送る');
+  ok(/data-bredo="/.test(html) && /async function redoBatch\(batchId\)/.test(html)
+    && /to: 'in_progress', batch_id: b\.id/.test(html),
+    '⭐そのぶんだけ「やり直す」入口がある (カードごと戻すと他のぶんまで巻き込む — Codex R1 中3)');
+  ok(/\(b\.work_status === 'ready_for_stocking' \|\| b\.work_status === 'done'\) && !b\.consigned_out\s*\r?\n\s*&& stateCan\('tasks\.bulk_stocked'\) && isStaffUI\(\)/.test(html),
+    'やり直しは職員モードのときだけ・外にあるぶんには出さない');
+  ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
+  const sw2 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
+  ok(/const CACHE = 'iroha-work-shell-v14'/.test(sw2), '画面キャッシュの版を上げる');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

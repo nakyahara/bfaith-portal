@@ -11,7 +11,7 @@
  *   ⭐完成した商品を外部に渡すことは絶対にない (中原さん 2026-09-07) ので、これで全部表せる。
  */
 import { getDB } from './db.js';
-import { nextSeq, recomputeTaskDoneQty } from './batches.js';
+import { nextSeq, recomputeTaskDoneQty, applyDerivedTaskStatus } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -104,8 +104,13 @@ function parentClosed(db, batchId) {
   return null;
 }
 
-/** 親カードの版を進める。⭐預けの追加・数量の変更・取消は必ずここを通す (要件 §AB-7) */
+/**
+ * 親カードの版を進める。⭐預けの追加・数量の変更・取消は必ずここを通す (要件 §AB-7)。
+ * ⭐ついでに**カードの進捗をまとまりから導き直す** — 渡したら「作業中」、返ってきたら「棚入待ち」に
+ *   なるので、カードの見え方も一緒に合わせる (要件 §AB-1)
+ */
 function bumpTask(db, taskId, now, actor) {
+  applyDerivedTaskStatus(db, taskId, now, actor);
   db.prepare('UPDATE f_iroha_tasks SET version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?')
     .run(now, actor, taskId);
 }
