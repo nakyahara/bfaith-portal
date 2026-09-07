@@ -324,6 +324,52 @@ console.log('\n[8] 映像が届いているかの見張り');
   const after = D.step(D.initialState(), { kind: 'codes', codes: [] });
   ok(after.action === 'continue' && !('idleStreak' in after.state),
     '🚨 デコード結果の空配列は見張りに影響しない (黒い映像を正常扱いしない)');
+
+  // ⑤ 🚨 トラックが muted のあいだは「届いた」に数えない (Codex #1235 R2 P1)。
+  //    カメラが映像を出せなくても video は黒いコマを再生し続け、currentTime も進むため
+  let c = D.newFrameCursor();
+  c = D.markArrived(c, 'p1', true);
+  const cMuted = D.markArrived(c, 'p2', false);
+  ok(cMuted === c, 'muted のあいだは新しいコマとして数えない');
+  let wm = D.noteFrame(D.newVideoWatch(0), 1000);
+  for (let t = 1250; t <= 1000 + T; t += 250) { /* muted なので noteFrame しない */ }
+  ok(D.videoStalled(wm, 1000 + T) === true,
+    'muted が続けば「映像が来ていない」として打ち切れる (黒いコマで誤魔化されない)');
+}
+
+// ─── 8b. 見張りと解析で印を分ける (映像は正常なのに読めない、を防ぐ) ────────
+// 🚨 1つの印を共有すると、見張りが先に新しいコマを観測した瞬間に解析側が「新しくない」と
+//    判断して飛ばし、映像は出ているのにいつまでも読み取れなくなる (Codex #1235 R2 P2)
+console.log('\n[8b] フレームの受け渡し (見張り / 解析)');
+{
+  const src = fs.readFileSync(path.join(ROOT, 'public/js/barcode-scan-decide.js'), 'utf8');
+  const sandbox = {};
+  new Function('globalThis', 'with (globalThis) { ' + src + ' }')(sandbox);
+  const D = sandbox.BarcodeScanDecide;
+
+  let c = D.newFrameCursor();
+  ok(D.nextDecode(c).decode === false, 'コマが届く前は解析しない');
+  c = D.markArrived(c, 'p1', true);
+  const r1 = D.nextDecode(c);
+  ok(r1.decode === true, '届いたコマは解析する');
+  c = r1.cursor;
+  ok(D.nextDecode(c).decode === false, '🚨 同じコマは2回解析しない (「2回続けて一致」が実質1回にならない)');
+
+  // 見張りが先に何度も観測しても、解析は最新の1コマを1回だけ読む
+  c = D.markArrived(c, 'p2', true);
+  c = D.markArrived(c, 'p3', true);
+  const r2 = D.nextDecode(c);
+  ok(r2.decode === true && r2.cursor.decoded === 'p3',
+    '🚨 見張りが先に進んでも解析は止まらない (最新のコマを読む)');
+  ok(D.nextDecode(r2.cursor).decode === false, '読んだあとは次のコマが来るまで解析しない');
+
+  // 待機 (新しいコマなし) では一致回数を消さない = 2コマで確定できる
+  let st = D.initialState();
+  const hit = { text: '4901234567894' };
+  st = D.step(st, { kind: 'codes', codes: [hit] }).state;         // 1コマ目
+  const res = D.step(st, { kind: 'codes', codes: [hit] });        // 待機を挟んで2コマ目
+  ok(res.action === 'accept' && res.value === '4901234567894',
+    '🚨 待機を挟んでも2コマ目で確定できる (待つだけで一致回数を消さない)');
 }
 
 // ─── 9. 画面が安全弁を使っているか (退行防止) ──────────────────────────────
@@ -350,19 +396,34 @@ console.log('\n[9] 画面が安全弁を通している (退行防止)');
   const srcAt = html.indexOf('v.srcObject = scanStream');
   ok(onAt > 0 && srcAt > onAt,
     '🚨 画面に出してから stream をつなぐ (display:none のまま挿すと iOS は再生を始めない)');
-  ok(/await v\.play\(\)/.test(html) && /v\.muted = true/.test(html) && /v\.playsInline = true/.test(html),
+  ok(/v\.play\(\)\.catch\(/.test(html) && /v\.muted = true/.test(html) && /v\.playsInline = true/.test(html),
     '🚨 autoplay 属性に頼らず play() を呼ぶ + muted / playsInline をプロパティでも立てる');
+  // 🚨 play() は「再生が始まるまで」返らない。await の後ろに見張りを置くと、始まらない端末で
+  //    Promise が pending のままになり 8 秒たってもカメラを解放できない (Codex #1235 R2 P1)
+  ok(!/await v\.play\(\)/.test(html), '🚨 play() を await しない (返ってこない端末で見張りごと止まる)');
   ok(/カメラの映像が出ませんでした/.test(html), '映像が来ないときの案内を出している');
 
   // 🚨 Codex #1235 R1: 見張りは「デコーダの読み込みより前」に始まっていないと、
   //    wasm の取得が固まったときにカメラを掴んだまま無期限に止まる
   const watchAt = html.indexOf('scanWatchTimer = setInterval(');
+  // onloadedmetadata の中にも同じ呼び出しがあるので、**単独で呼んでいる後ろの方**を見る
+  const playAt = html.lastIndexOf('v.play().catch(');
   ok(watchAt > 0 && watchAt < loadAt,
     '🚨 映像の見張りをデコーダ読み込みより前に始めている (wasm が固まってもカメラを掴んだままにしない)');
-  ok(/BarcodeScanDecide\.videoStalled\(/.test(html) && /v\.currentTime !== lastVideoTime/.test(html),
+  ok(playAt > 0 && watchAt < playAt,
+    '🚨 映像の見張りを play() より前に始めている (再生が始まらない端末でも8秒で解放できる)');
+  ok(/BarcodeScanDecide\.videoStalled\(/.test(html) && /BarcodeScanDecide\.markArrived\(/.test(html),
     '🚨 新しいコマが届いたかで判定している (解析できたかで見ない)');
-  ok(/if \(vw && vh && noteFrameIfNew\(\)\)/.test(html),
-    '新しいコマのときだけ解析する (同じコマを2回読んで「2回一致」にしない)');
+  ok(/track\.readyState === 'live' && !track\.muted/.test(html),
+    '🚨 トラックが muted / ended のあいだは「届いた」に数えない (黒いコマで誤魔化されない)');
+  ok(/track\.readyState === 'ended'/.test(html) && /カメラが切れました/.test(html),
+    'カメラが切れたら待たずにやめる (他アプリに取られた等)');
+  ok(/requestVideoFrameCallback/.test(html) && /presentedFrames/.test(html),
+    'コマ固有の識別子 (presentedFrames) を使う。使えない端末は currentTime で代用');
+  ok(/BarcodeScanDecide\.nextDecode\(frames\)/.test(html) && /plan\.decode/.test(html),
+    '🚨 見張りとは別の印で「まだ解析していないコマ」だけを読む');
+  ok(/let ev = null;/.test(html) && /if \(!ev\) \{/.test(html),
+    '🚨 新しいコマが無いだけの待機では状態を触らない (連続一致を消さない)');
   const stopFn = html.slice(html.indexOf('function stopScan()'), html.indexOf('async function onScanned'));
   ok(/clearInterval\(scanWatchTimer\)/.test(stopFn), 'stopScan が見張りを止める (閉じた後に鳴らない)');
   // 閉じた直後にデコーダ読み込みが失敗しても、後からエラーを残さない

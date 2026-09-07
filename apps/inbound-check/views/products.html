@@ -374,35 +374,62 @@
       v.muted = true;
       v.playsInline = true;
       v.srcObject = scanStream;
-      // 🚨 autoplay 属性だけに頼らない。**明示的に play() する**
-      try { await v.play(); } catch (e) { playError = playError || e; }   // 失敗しても続ける (下の見張りが拾う)
-      if (!scanStream || gen !== scanGen) { endStarting(); return; }
-
-      // 🚨🚨 **映像の見張りは、デコーダの読み込みを待たずにここで始める** (Codex #1235 R1 P1)。
-      //   フレームループの中で見ていると、wasm の取得が遅い/固まったときに
-      //   「読み取りの準備をしています…」のままカメラを掴んで無期限に止まる。
-      //   判定は **新しいコマが届いたか** (currentTime が進んだか)。解析できたかで見てはいけない —
-      //   映像が黒一色でも止まっていても、デコード結果は「見つからない (空配列)」で返ってくるため
+      // 🚨🚨 **映像の見張りは play() を待つ前にここで始める** (Codex #1235 R2 P1)。
+      //   play() は「再生が始まるまで」返らない API なので、始まらない端末では Promise が
+      //   pending のままになり、await の後ろに置くと 8 秒たってもカメラを解放できない。
+      //   デコーダの読み込みとも並行 (wasm が固まってもカメラを掴んだままにしない — R1 P1)。
+      //
+      //   🚨 判定は **新しいコマが届いたか**。「解析できたか」で見てはいけない —
+      //      映像が黒一色でも、デコード結果は「見つからない (空配列)」で返ってくる。
+      //   🚨 さらに **トラックが muted の間は「届いた」に数えない** (R2 P1)。
+      //      カメラが映像を出せなくても video は黒いコマを再生し続け、currentTime は進むため。
+      const track = (scanStream.getVideoTracks && scanStream.getVideoTracks()[0]) || null;
+      const sourceLive = () => !track || (track.readyState === 'live' && !track.muted);
       let videoWatch = BarcodeScanDecide.newVideoWatch(now());
-      let lastVideoTime = -1;
-      const noteFrameIfNew = () => {
-        if (v.readyState >= 2 && v.videoWidth && v.videoHeight && v.currentTime !== lastVideoTime) {
-          lastVideoTime = v.currentTime;
-          videoWatch = BarcodeScanDecide.noteFrame(videoWatch, now());
-          return true;
-        }
-        return false;
+      let frames = BarcodeScanDecide.newFrameCursor();
+      const markFrame = (id) => {
+        const next = BarcodeScanDecide.markArrived(frames, id, sourceLive());
+        if (next === frames) return;                  // muted / 同じコマ → 届いていない扱い
+        frames = next;
+        videoWatch = BarcodeScanDecide.noteFrame(videoWatch, now());
+      };
+      // フレームの識別子は requestVideoFrameCallback の presentedFrames が正 (コマ固有)。
+      // 使えない端末は currentTime で代用する (コマ固有ではないが、進まないことは検知できる)
+      const rvfc = typeof v.requestVideoFrameCallback === 'function';
+      if (rvfc) {
+        const onFrame = (_t, meta) => {
+          if (!scanStream || gen !== scanGen) return;
+          markFrame('p' + (meta && meta.presentedFrames != null ? meta.presentedFrames : _t));
+          v.requestVideoFrameCallback(onFrame);
+        };
+        v.requestVideoFrameCallback(onFrame);
+      }
+      const pollFrame = () => {
+        if (rvfc) return;
+        if (v.readyState >= 2 && v.videoWidth && v.videoHeight) markFrame('t' + v.currentTime);
       };
       clearInterval(scanWatchTimer);
       scanWatchTimer = setInterval(() => {
         if (!scanStream || gen !== scanGen) { clearInterval(scanWatchTimer); scanWatchTimer = null; return; }
-        noteFrameIfNew();
+        pollFrame();
+        // カメラが切れた (他アプリに取られた / 端末が閉じた) — 待つ意味がないので即やめる
+        if (track && track.readyState === 'ended') {
+          stopScan();
+          banner('err', 'カメラが切れました。他のアプリがカメラを使っていないか確かめて、もう一度押してください', { sticky: true });
+          return;
+        }
         if (!BarcodeScanDecide.videoStalled(videoWatch, now())) return;
         stopScan();
-        banner('err', 'カメラの映像が出ませんでした' + (playError ? ' (' + esc(playError.name || playError.message || '') + ')' : '')
+        banner('err', 'カメラの映像が出ませんでした'
+          + (playError ? ' (' + esc(playError.name || playError.message || '') + ')' : (track && track.muted ? ' (映像が届いていません)' : ''))
           + '。ホーム画面のアイコンから開き直すか、他のアプリがカメラを使っていないか確かめてください。'
           + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
       }, 500);
+
+      // 🚨 autoplay 属性だけに頼らない。**明示的に play() する**。
+      //    始まらない端末では返ってこないことがあるので、**待たない** (上の見張りが拾う)
+      v.play().catch((e) => { playError = playError || e; });
+      if (!scanStream || gen !== scanGen) { endStarting(); return; }
 
       // デコーダ (wasm 約1MB) は、映像が出ている間に落とす
       let zx = null;
@@ -428,12 +455,15 @@
       let lastError = null;
       const tick = async () => {
         if (!scanStream || gen !== scanGen) return;
-        let ev = { kind: 'idle' };
+        let ev = null;   // 🚨 新しいコマが無いだけの待機では**状態を触らない** (連続一致を消さない — R2 P2)
+        pollFrame();
+        const plan = BarcodeScanDecide.nextDecode(frames);
         try {
-          // 🚨 **新しいコマが来たときだけ解析する**。同じコマを2回読むと「2回続けて一致」の
-          //    条件が実質1回になってしまい、誤読の歯止めが効かなくなる
+          // 🚨 **見張りとは別の印**で「まだ解析していないコマ」だけを読む。
+          //    同じコマを2回読むと「2回続けて一致」の条件が実質1回になり、誤読の歯止めが効かない
           const vw = v.videoWidth, vh = v.videoHeight;
-          if (vw && vh && noteFrameIfNew()) {
+          if (vw && vh && plan.decode) {
+            frames = plan.cursor;
             // 🚨 **枠の中だけを切り出す**。映像全体を解析すると、棚に並んだ別ラベルを
             //    2フレーム続けて読んでしまい「別の商品」で確定する (Codex #1233 R2)。
             //    切り出す範囲は画面に描いている枠 (GUIDE) と同じ数字から作る
@@ -451,9 +481,14 @@
             ev = { kind: 'codes', codes };
           }
         } catch (e) {
-          // 映像がまだ来ていないだけなら次の回で直る。**続けて失敗するのは読み取り側の異常**
+          // 一時的な失敗は次の回で直る。**続けて失敗するのは読み取り側の異常**
           lastError = e;
           ev = { kind: 'error' };
+        }
+        if (!ev) {                                   // 待機 = 何も判断しない
+          if (gen !== scanGen) return;
+          scanTimer = setTimeout(tick, 250);
+          return;
         }
         const r = BarcodeScanDecide.step(decide, ev);
         decide = r.state;

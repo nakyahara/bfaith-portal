@@ -91,6 +91,32 @@
 
   function newVideoWatch(nowMs) { return { startedAt: nowMs, lastFrameAt: null }; }
 
+  // ─── フレームの受け渡し ───────────────────────────────────────────────────
+  // 🚨 **見張りと解析で印を分ける** (Codex #1235 R2 P2)。1つの印を共有すると、見張りが先に
+  //    新しいコマを観測した瞬間に解析側が「新しくない」と判断して飛ばし、映像は正常なのに
+  //    いつまでも読み取れなくなる。
+  //    arrived = 届いた最新のコマ / decoded = 解析し終えたコマ。
+  //    こうしておくと **同じコマを2回解析しない** = 「2回続けて一致」が実質1回にならない。
+
+  function newFrameCursor() { return { arrived: null, decoded: null }; }
+
+  /**
+   * コマが届いた印を付ける。
+   * 🚨 `sourceLive` が false のあいだは**進めない** (Codex #1235 R2 P1)。
+   *    MediaStreamTrack が muted になると、カメラが映像を出せなくても video は黒いコマを
+   *    再生し続ける (currentTime も進む)。それを「届いた」と数えると見張りが永久に鳴らない。
+   */
+  function markArrived(cursor, id, sourceLive) {
+    if (!sourceLive || id === null || id === undefined) return cursor;
+    return { arrived: id, decoded: cursor.decoded };
+  }
+
+  /** 解析すべき新しいコマがあるか。あれば decoded を進めた cursor を返す */
+  function nextDecode(cursor) {
+    if (cursor.arrived === null || cursor.arrived === cursor.decoded) return { decode: false, cursor: cursor };
+    return { decode: true, cursor: { arrived: cursor.arrived, decoded: cursor.arrived } };
+  }
+
   /** 新しいコマが届いた */
   function noteFrame(watch, nowMs) { return { startedAt: watch.startedAt, lastFrameAt: nowMs }; }
 
@@ -111,6 +137,9 @@
     pickValue: pickValue,
     newVideoWatch: newVideoWatch,
     noteFrame: noteFrame,
+    newFrameCursor: newFrameCursor,
+    markArrived: markArrived,
+    nextDecode: nextDecode,
     videoStalled: videoStalled,
     MAX_FAIL_STREAK: MAX_FAIL_STREAK,
     NO_VIDEO_TIMEOUT_MS: NO_VIDEO_TIMEOUT_MS,
