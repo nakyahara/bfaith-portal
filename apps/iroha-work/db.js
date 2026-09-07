@@ -328,13 +328,12 @@ const BATCHES_INDEX_DDL = `
     CREATE INDEX IF NOT EXISTS idx_iroha_batches_task ON f_iroha_task_batches(task_id, id);
     CREATE INDEX IF NOT EXISTS idx_iroha_batches_fac ON f_iroha_task_batches(facility_code, work_status);`;
 
+// ⚠**一意索引はここに置かない**。作り直し (migrateSessionMediaSchema) の中で張られるが、
+//   重複を片づけるのはそのあと。古い版に重複が残っていると索引作りで落ち、作り直しごと巻き戻って
+//   アプリが起動しなくなる (Codex #1258 R3 中1)。一意索引は下の「片づけ → 索引」の順で作る
 const SESSIONS_INDEX_DDL = `
     CREATE INDEX IF NOT EXISTS idx_iroha_sessions_page ON f_iroha_work_sessions(page_id, id);
-    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_task ON f_iroha_work_sessions(task_id, id);
-    -- ⭐人数だけの記録は「拠点 × カード」で 1 本 (要件 §AB-10)。拠点は同時に複数のカードを持てる。
-    --   個人の 1 人 1 本 (idx_iroha_sessions_open_uniq) とは別の索引にする
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_sessions_crew_uniq
-      ON f_iroha_work_sessions(facility_code, task_id) WHERE ended_at IS NULL AND worker_id IS NULL;`;
+    CREATE INDEX IF NOT EXISTS idx_iroha_sessions_task ON f_iroha_work_sessions(task_id, id);`;
 const mediaDDL = (name) => `
     CREATE TABLE IF NOT EXISTS ${name} (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -437,7 +436,10 @@ function migrateSessionMediaSchema(db) {
       }
       // ⭐見るのは**作り直した表だけ**。DB 全体を見ると、無関係な表に古い孤立行が 1 つあるだけで
       //   作り直しが永久に止まり、アプリが起動しなくなる (この PR で本番の DB も 1 回作り直すので、
-      //   そこで初めて踏む。自分の作った行の始末は自分でつける、が筋)
+      //   そこで初めて踏む。自分の作った行の始末は自分でつける、が筋)。
+      // ⚠foreign_key_check(表) は「その表が**持つ** FK」だけを見る。この 2 表を**参照している**表が
+      //   あれば、そちら側の違反は見えない — いまはどの表も参照していないので見逃しは無い
+      //   (grep: REFERENCES f_iroha_work_sessions / f_iroha_card_media は 0 件)
       const bad = targets.flatMap(({ table }) => db.pragma(`foreign_key_check(${table})`));
       if (bad.length > 0) throw new Error(`作業時間・写真の作り直しを中止しました (FK 違反): ${JSON.stringify(bad.slice(0, 5))}`);
     })();
@@ -1009,7 +1011,9 @@ export function createTables(db = getMirrorDB()) {
     .run(utcNow(), utcNow());
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_sessions_open_uniq
     ON f_iroha_work_sessions(worker_id) WHERE ended_at IS NULL`);
-  // 人数だけの記録も同じ手当て (拠点 × カードで 1 本)
+  // ⭐人数だけの記録も同じ手当て (拠点 × カードで 1 本)。**片づけてから索引**の順を守る。
+  //   閉じ方は個人と同じ — 始めた時刻から今までを実測として残す (勝手に 0 にしない)。
+  //   人時にすると 秒 × 人数 になるので、3 人の記録は 3 倍で残る
   db.prepare(`UPDATE f_iroha_work_sessions
     SET ended_at = ?, end_reason = 'admin',
         raw_seconds = MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER))
@@ -1017,7 +1021,8 @@ export function createTables(db = getMirrorDB()) {
       SELECT MAX(id) FROM f_iroha_work_sessions WHERE ended_at IS NULL AND worker_id IS NULL
       GROUP BY facility_code, task_id)`)
     .run(utcNow(), utcNow());
-  db.exec(SESSIONS_INDEX_DDL);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_sessions_crew_uniq
+    ON f_iroha_work_sessions(facility_code, task_id) WHERE ended_at IS NULL AND worker_id IS NULL`);
 }
 
 // ───────────────────────── Notion キャッシュ ─────────────────────────

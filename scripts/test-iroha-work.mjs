@@ -7401,6 +7401,31 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
       '2 回目は何もしない (冪等)');
   }
 
+  // ⑨b ⭐重複が残っている古い版からでも移行できる (Codex R3 中1)。
+  //   一意索引を先に張ると、そこで落ちて作り直しごと巻き戻り、アプリが起動しなくなる
+  {
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    const t = mk('crew-9b', 9020);
+    const idxOf = () => db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='f_iroha_work_sessions'").all().map((r) => r.name);
+    // 索引を落として、同じ拠点・同じカードで作業中の行を 2 本つくる (古い版で起きうる形)
+    db.exec('DROP INDEX IF EXISTS idx_iroha_sessions_crew_uniq');
+    const mkOpen = () => Number(db.prepare("INSERT INTO f_iroha_work_sessions (task_id, facility_code, crew_size, started_at) VALUES (?, 'rehas', 3, ?)")
+      .run(t, '2020-01-01T00:00:00.000Z').lastInsertRowid);
+    const s1 = mkOpen(), s2 = mkOpen();
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL").get(t).c === 2,
+      '(前提) 重複した作業中の行が 2 本ある');
+    let boom = null;
+    try { createTables(db); } catch (e) { boom = e; }
+    ok(!boom, '⭐重複があっても移行は止まらない (止まるとアプリが起動しなくなる)');
+    ok(idxOf().includes('idx_iroha_sessions_crew_uniq'), '一意索引はちゃんと張られる');
+    const rows2 = db.prepare('SELECT id, ended_at, end_reason, raw_seconds FROM f_iroha_work_sessions WHERE id IN (?, ?) ORDER BY id').all(s1, s2);
+    ok(rows2[0].ended_at && rows2[0].end_reason === 'admin', '⭐古いほうは職員が閉じた扱いで閉じる');
+    ok(rows2[0].raw_seconds > 0, '⭐時間は 0 にせず、始めた時刻から今までを残す (実測を捨てない)');
+    ok(!rows2[1].ended_at, '新しいほうは作業中のまま');
+    // 片づけ
+    D.stopSessions({ taskId: t, sessionIds: [s2], reason: 'done' });
+  }
+
   // ⑩ ⭐人数は整数だけ (Codex R2 中1)
   {
     const t = mk('crew-10', 9017);
@@ -7435,11 +7460,21 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
     ok(r.ok, 'はじめられる');
     ok(sess(r.sessionId).batch_id === home,
       '⭐外に出したぶんは数えない。手元が 1 つに決まるなら、そこに結びつく');
-    // 外に出したぶんを名指ししても断る
+    // ⭐**同じカードの**外に出したぶんを名指ししても断る。
+    //   よそのカードの id を渡すと、カード違いだけで断られて「外に出したか」を検査できない (Codex R3 軽微1)。
+    //   拠点は rehas 以外にする — rehas はもう作業中で、再送扱い (already) の早期 return に入ってしまう
     const away = B.listBatchesOfTask(db, t).find((b) => b.id !== home && b.work_status !== 'cancelled');
+    const sameCard = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'jobsupport', crewSize: 2, batchId: away.id });
+    ok(!sameCard.ok && sameCard.error === 'bad_batch',
+      '⭐同じカードでも、外に出したぶんは名指しできない (いろはで測った時間を外のぶんに付けない)');
+    ok(/手元/.test(sameCard.message || ''), 'なぜ断るかを言う');
+    // 手元のぶんを名指しすれば通る (上の断りが「名指しは全部だめ」になっていないことの確認)
+    const okNamed = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'jobsupport', crewSize: 2, batchId: home });
+    ok(okNamed.ok && sess(okNamed.sessionId).batch_id === home, '手元のぶんは名指しできる');
+    // よそのカードのぶんも断る (別の理由。独立して残す)
     const t2 = mk('crew-12', 9019, 200);
-    const bad = TD.startTaskCrewSession({ taskId: t2, staff: staffW, facilityCode: 'rehas', crewSize: 2, batchId: away.id });
-    ok(!bad.ok && bad.error === 'bad_batch', '⭐よそのカードのぶんも、外に出したぶんも名指しできない');
+    const other = TD.startTaskCrewSession({ taskId: t2, staff: staffW, facilityCode: 'rehas', crewSize: 2, batchId: home });
+    ok(!other.ok && other.error === 'bad_batch', 'よそのカードのぶんも名指しできない');
   }
 
   // ── 画面 ──
@@ -7457,6 +7492,10 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
     '人数だけの開始は専用の口へ送る');
   ok(html.includes('opts && opts.crewSize != null ? Number(opts.crewSize)'),
     '⭐止まっている札の確認から戻るときは、そのとき入れた人数を使う (入力欄を読み直さない)');
+  ok(html.includes('const saved = (j.session && j.session.crewSize) || n;')
+    && html.includes("j.already"),
+    '⭐知らせるのは**保存された人数**。別の端末が先に 3 人で始めていたら「5人ではじめました」と出さない');
+  ok(html.includes('はすでに ') && html.includes('人で作業中です'), 'すでに始まっていたことも伝える');
   ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
   // ⭐これまでの作業も 人時 で出す (Codex R1 の「日報・履歴の整合は未確認」への答え)。
   //   関数を実際に動かして、出てくる文言を見る

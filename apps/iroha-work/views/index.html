@@ -5137,7 +5137,13 @@ async function startHeadcount(facilityCode, opts) {
   if (j.task) applyTask(c, j.task);
   $('#crewMsg').textContent = '';
   closeCrew();
-  toast(facilityName(facilityCode) + ' ' + n + '人ではじめました');
+  // ⭐**保存された人数**で知らせる。別の端末が先に 3 人ではじめていたら、こちらが 5 人と入れても
+  //   記録は 3 人のまま (拠点 × カードで 1 本)。入れた数をそのまま出すと、工賃のもとになる
+  //   数字と職員の思っている数がずれる (Codex R3 中2)
+  const saved = (j.session && j.session.crewSize) || n;
+  toast(j.already
+    ? facilityName(facilityCode) + ' はすでに ' + saved + '人で作業中です'
+    : facilityName(facilityCode) + ' ' + saved + '人ではじめました');
   openDetail(c.id);
   return true;
 }
