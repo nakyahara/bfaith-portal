@@ -38,7 +38,9 @@ const baseCtx = (over = {}) => ({
     原価状態: 'COMPLETE', 消費税率: 0.1, 送料コード: '501', 配送方法: 'ネコポス', 売上分類: 3,
   }]]),
   shippingRates: new Map([['501', NEKOPOSU]]),
-  skuMap: new Map([['sku1', [{ ne_code: 'ne001' }]]]),
+  // 本番と同じ形にする: Amazon の対応表は数量を持つ (v_sku_resolved.数量)。
+  // 楽天は数量列が無いので、楽天の試験は qty: null の Map を明示的に渡す
+  skuMap: new Map([['sku1', [{ ne_code: 'ne001', qty: 1 }]]]),
   feeEstimates: new Map(),
   masterFreshness: { costValidUntil: FUTURE, shippingMasterValidUntil: FUTURE },
   runInfo: { listingEnumStatus: 'ok', listingEnumValidUntil: FUTURE, priceRunId: 'r1' },
@@ -362,7 +364,7 @@ t('数量1 なら原価はそのまま', () => {
 
 t('[!] 数量が分からない (楽天) ときは単品として計算する', () => {
   // 楽天の対応表には数量列が無い。まとめ買いは価格の開きで別途外す
-  const r = buildRow(rakutenListing(), baseCtx());
+  const r = buildRow(rakutenListing(), baseCtx({ skuMap: new Map([['sku1', [{ ne_code: 'ne001', qty: null }]]]) }));
   assert.equal(r.unit_quantity, null);
   assert.ok(near(r.cost_ex_tax, 600));
 });

@@ -107,9 +107,9 @@ export function buildGeneration(db, deps = {}) {
       codeVersion: deps.codeVersion || 'unknown',
       // 🚨 見積を引くキーに使う seller_id は、**DB に保存されている値**を使う。
       //    env と食い違うとキーが一致せず、見積を1件も引けない (実データで判明)
-      // 🚨 見積を引くキーの seller_id は **保存済みの値が優先**。
-      //    env と食い違うとキーが一致せず、見積を1件も引けない (実データで判明)
-      sellerId: storedSellerId(db) || deps.sellerId,
+      // 🚨 見積を引くキーの seller_id は **覚え書き → env** の順 (Codex R7-3)。
+      //    見積テーブルの DISTINCT から推測すると、旧セラーの行が残っただけで引けなくなる
+      sellerId: storedSellerId(db, deps.sellerId),
       marketplaceId: deps.marketplaceId,
       products,
       shippingRates,
@@ -210,6 +210,9 @@ export function markQuantityVariationSuspects(rows, limit = PRICE_SPREAD_LIMIT) 
   const groups = new Map();
   for (const r of rows) {
     if (!r.ne_code || !Number.isFinite(r.price_incl_tax)) continue;
+    // 🚨 数量が分かっている出品は対象外 (Codex R7-2)。原価は既に数量倍してあるので、
+    //    価格がひらいていても正しい。ここで外すと「数量2以上の FBA は載せる」に反する
+    if (r.unit_quantity != null) continue;
     const key = `${r.mall}${r.ne_code}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(r);
@@ -221,7 +224,8 @@ export function markQuantityVariationSuspects(rows, limit = PRICE_SPREAD_LIMIT) 
     if (prices.length < 2) continue;
     const min = Math.min(...prices);
     const max = Math.max(...prices);
-    if (max <= min * limit) continue;      // 色違いなど、価格が近いものは正常
+    // 「1.5倍以上ひらいたら疑う」なので、ちょうど 1.5 倍も対象に含める (Codex R7-5)
+    if (max < min * limit) continue;       // 色違いなど、価格が近いものは正常
     for (const r of group) {
       // 計算結果は残す (参考値として見える) が、ランキングには載せない
       r.rank_eligible = 0;

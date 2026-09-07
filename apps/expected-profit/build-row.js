@@ -18,6 +18,7 @@ import {
   FORMULA_VERSION, SCENARIO_VERSION, FEE_RATE_VERSION,
 } from './calc.js';
 import { isExpired } from './util.js';
+import { skuMapHasQuantity } from './load-inputs.js';
 
 /** 出品 → NE商品コード。1対多は「原価構成が一意に決まらない」= ambiguous (§7.2) */
 export function resolveNeCode(listing, skuMap) {
@@ -165,6 +166,14 @@ export function buildRow(listing, ctx) {
   //    Amazon の対応表 (v_sku_resolved) にだけ数量がある。楽天は qty = null
   const qty = resolved.qty;
   row.unit_quantity = qty ?? null;
+  // 🚨 数量列を持つモール (Amazon) で数量が読めないなら、原価が決まらない。
+  //    単品として計算すると、まとめ買いSKU が過大利益のままランキングに載る (Codex R7-1)。
+  //    内訳と利益は一致してしまうので、公開前検証でも捕まえられない
+  if (skuMapHasQuantity(mall) && qty == null) {
+    row.cost_status = 'missing';
+    row.incomplete_reason = 'quantity_unknown';
+    return finish(row, 'incomplete', listing);
+  }
   // 🚨 以降は必ず costExTax (数量を掛けた後) を使う。cost.costExTax を直接使うと
   //    「表示は数量倍だが利益は単品原価」というズレが出る (実データで実際に出た)
   const costExTax = cost.costExTax * (qty ?? 1);

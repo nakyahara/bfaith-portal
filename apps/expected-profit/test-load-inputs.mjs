@@ -14,7 +14,8 @@ import path from 'path';
 import os from 'os';
 import Database from 'better-sqlite3';
 
-const { loadSkuMap, normalizeQty, loadProducts, loadShippingRates } = await import('./load-inputs.js');
+const { loadSkuMap, normalizeQty, loadProducts, loadShippingRates, skuMapHasQuantity } = await import('./load-inputs.js');
+const { buildRow } = await import('./build-row.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -115,6 +116,41 @@ t('商品マスタと配送マスタが実 DB から読める (列名のズレ�
   assert.equal(products.get('opbs454').原価, 1001);
   const rates = loadShippingRates(wdb);
   assert.equal(rates.get('501').送料, 198);
+});
+
+console.log('');
+console.log('読み出し → 行の組み立て を通す (Codex R7-1)');
+
+t('[!] Amazon で数量が読めない SKU は計算不成立にする (単品原価に戻さない)', () => {
+  // 🚨 数量列を持つモールで数量が null = 原価が決まらない。
+  //    単品として計算すると、まとめ買いSKU が過大利益のままランキングに載る。
+  //    内訳と利益は一致するので、公開前検証でも捕まえられない
+  const map = loadSkuMap(wdb, 'amazon');           // 本番の SQL を通したマップ
+  const row = buildRow({
+    mall: 'amazon', shop_id: 'S1@M1', mall_item_key: 'bad', mall_item_ref: 'B001',
+    fulfillment: 'FBA', price_incl_tax: 1980, price_tax_included: 1, mall_tax_rate: null,
+    postage_included: 1, postage_revenue_incl_tax: 0, points: 0,
+    listing_status: 'active', fetch_status: 'ok',
+    valid_until: '2099-01-01T00:00:00Z', fetched_at: '2026-09-07T00:00:00Z',
+  }, {
+    generationId: 'g1', now: new Date('2026-09-07T12:00:00Z'), codeVersion: 'test',
+    sellerId: 'S1', marketplaceId: 'M1',
+    products: new Map([['x1', {
+      商品コード: 'x1', 商品名: 'ダメな数量の商品', 原価: 600, 原価ソース: 'NE',
+      原価状態: 'COMPLETE', 消費税率: 0.1, 送料コード: null, 配送方法: null, 売上分類: 3,
+    }]]),
+    shippingRates: new Map(), skuMap: map, feeEstimates: new Map(),
+    masterFreshness: { costValidUntil: '2099-01-01T00:00:00Z', shippingMasterValidUntil: '2099-01-01T00:00:00Z' },
+    runInfo: { listingEnumStatus: 'ok', listingEnumValidUntil: '2099-01-01T00:00:00Z', priceRunId: 'r1' },
+  });
+  assert.equal(row.calculation_status, 'incomplete');
+  assert.equal(row.incomplete_reason, 'quantity_unknown');
+  assert.equal(row.rank_eligible, 0);
+});
+
+t('楽天は数量列が無いので、同じ状況でも単品として計算する', () => {
+  assert.equal(skuMapHasQuantity('rakuten'), false);
+  assert.equal(skuMapHasQuantity('amazon'), true);
 });
 
 wdb.close();

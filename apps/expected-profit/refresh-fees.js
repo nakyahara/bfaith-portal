@@ -13,7 +13,7 @@
  * 🚨 送料も販売手数料の算定基礎に入る (実測: 1,198円の FBM で Shipping 0 → 101、230 → 120)。
  *    送料別途の出品は in_shipping = 標準送料 で見積もる (§15-13)。
  */
-import { getExpectedProfitDB } from './db.js';
+import { getExpectedProfitDB, getSetting, setSetting, SETTING_AMAZON_SELLER_ID } from './db.js';
 import { canReuseFeeEstimate, normalizeFeeEstimate, feeCacheKey } from './calc.js';
 import { nowIso, addDays } from './util.js';
 
@@ -29,18 +29,28 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
  * 🚨 「キャッシュが無い」だけでなく「入力が変わった」も対象にする
  */
 /**
- * 保存済みの見積が使っている seller_id。
+ * いま見積に使っている seller_id。
  *
  * 🚨 env (SP_API_SELLER_ID) より **API が返した値**が正 (§15-3)。
  *    実データ検証で miniPC の env に SP_API_SELLER_ID が無く、
  *    キーが `null` で作られて見積を1件も引けなかった。
- *    単一セラー運用なので保存済みの値は1つに決まる。
+ *
+ * 🚨 見積テーブルの DISTINCT から推測しない (Codex R7-3)。
+ *    旧セラーの行が1つ残っただけで「決められない」に落ち、
+ *    env が空の環境では二度とキーを作れなくなる。
+ *    覚え書き → env の順で見て、どちらも無ければ null (レスポンスが教えてくれる)。
  */
-export function storedSellerId(db) {
-  try {
-    const rows = db.prepare('SELECT DISTINCT seller_id FROM amazon_fee_estimate LIMIT 2').all();
-    return rows.length === 1 ? rows[0].seller_id : null;   // 複数いるなら決め打ちしない
-  } catch { return null; }
+export function storedSellerId(db, env = process.env.SP_API_SELLER_ID) {
+  return getSetting(db, SETTING_AMAZON_SELLER_ID) || env || null;
+}
+
+/** レスポンスで分かったセラーを覚える。変わったら記録して呼び出し側に返す */
+export function rememberSellerId(db, sellerId, now) {
+  if (!sellerId) return { changed: false, previous: null };
+  const previous = getSetting(db, SETTING_AMAZON_SELLER_ID);
+  if (previous === sellerId) return { changed: false, previous };
+  setSetting(db, SETTING_AMAZON_SELLER_ID, sellerId, now || new Date().toISOString());
+  return { changed: true, previous };
 }
 
 /** 見積入力の seller_id を、保存済みの値で埋める (env が空でもキーが一致するように) */
@@ -202,6 +212,7 @@ export async function refreshFees(db, targets, deps = {}) {
   let stoppedByDeadline = false;
   let processedTargets = 0;
   let observedSellerId = knownSellerId;   // レスポンスが教えてくれる実際のセラー
+  let sellerConflict = false;            // 1回の実行で複数のセラーが返ってきた
 
   for (let i = 0; i < need.length; i += BATCH_SIZE) {
     // 全体終了期限 (§8.4)。超えたら残りは翌日に回す (途中で止めても行は消えない)
@@ -246,15 +257,22 @@ export async function refreshFees(db, targets, deps = {}) {
         continue;
       }
       const sellerIdFromResponse = r?.FeesEstimateIdentifier?.SellerId || null;
-      if (sellerIdFromResponse) observedSellerId = sellerIdFromResponse;
+      if (sellerIdFromResponse) {
+        // 🚨 1回の実行で複数のセラーが返ってきたら、どれで補完してよいか決められない (Codex R7-3)
+        if (observedSellerId && observedSellerId !== sellerIdFromResponse) sellerConflict = true;
+        observedSellerId = sellerIdFromResponse;
+      }
       saved.push(toEstimateRow(chunk[j], r.FeesEstimate, fetchedAt, sellerIdFromResponse));
     }
     if (i + BATCH_SIZE < need.length) await sleep(sleepMs);
   }
 
-  // レスポンスから分かったセラーで、まだ埋まっていない行を補う
-  if (observedSellerId) {
+  // レスポンスから分かったセラーで、まだ埋まっていない行を補う。
+  // 🚨 複数のセラーが混ざった実行では補完しない (どれが正か決められない)
+  if (observedSellerId && !sellerConflict) {
     for (const row of saved) if (!row.seller_id) row.seller_id = observedSellerId;
+    // 次回の照合に使えるよう覚えておく (env に無くてもキーが作れる)
+    rememberSellerId(db, observedSellerId, nowIso());
   }
   const unresolvedSeller = saved.filter(r => !r.seller_id);
   if (unresolvedSeller.length > 0) {
@@ -269,7 +287,8 @@ export async function refreshFees(db, targets, deps = {}) {
   const failedTargets = errors.length + batchErrors.reduce((a, b) => a + b.targets, 0);
   return {
     targets: targets.length,
-    sellerId: observedSellerId,
+    sellerId: sellerConflict ? null : observedSellerId,
+    sellerConflict,
     invalidTargets: invalid.length,
     invalid: invalid.slice(0, 20),
     reused: reuse.length,

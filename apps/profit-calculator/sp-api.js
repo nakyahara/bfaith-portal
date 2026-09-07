@@ -662,7 +662,12 @@ export async function getActiveListingsReport(opts = {}) {
   const waitUntil = reportWaitUntil({ now: nowFn(), deadline: opts.deadline, maxWaitMs: opts.maxWaitMs });
   let report;
   while (nowFn() < waitUntil) {
-    await wait(REPORT_POLL_INTERVAL_MS);
+    // 🚨 残り時間より長く眠らない。5秒固定だと、期限の1秒前に入ったループが
+    //    期限を4秒過ぎてから API を呼ぶ (Codex R7-4)
+    const remaining = waitUntil.getTime() - nowFn().getTime();
+    await wait(Math.min(REPORT_POLL_INTERVAL_MS, Math.max(0, remaining)));
+    // 🚨 眠ったあとにも期限を見る (眠っている間に越えることがある)
+    if (nowFn() >= waitUntil) break;
     report = await sp.callAPI({
       operation: 'getReport',
       endpoint: 'reports',
@@ -680,6 +685,12 @@ export async function getActiveListingsReport(opts = {}) {
     // 諦めた理由を残す。どこまで待ったかが分からないと運用で判断できない
     const waited = Math.round((waitUntil.getTime() - new Date(startedWaitingAt).getTime()) / 1000);
     throw new Error(`レポート取得タイムアウト (${waited}秒待った / 最後の状態=${report?.processingStatus || '応答なし'})`);
+  }
+
+  // 🚨 DONE でも、ここから先 (本体のダウンロード) に入る前に期限を見る。
+  //    レポートは数MB あるので、期限を越えていたら始めない (Codex R7-4)
+  if (nowFn() >= waitUntil) {
+    throw new Error('レポートは完成したが期限を過ぎたので取得しない (翌日に回す)');
   }
 
   // レポートドキュメント取得

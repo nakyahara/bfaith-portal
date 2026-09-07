@@ -14,7 +14,9 @@ process.env.SP_API_MARKETPLACE_ID = 'A1VC38T7YXB528';
 
 const { initExpectedProfitDB } = await import('./db.js');
 const { planRefresh, buildFeeRequest, toEstimateRow, saveEstimates, loadCache, refreshFees, cacheKey,
-  storedSellerId, withResolvedSeller } = await import('./refresh-fees.js');
+  storedSellerId, withResolvedSeller, rememberSellerId } = await import('./refresh-fees.js');
+const { getSetting, setSetting, SETTING_AMAZON_SELLER_ID } = await import('./db.js');
+const forgetSeller = () => setSetting(db, SETTING_AMAZON_SELLER_ID, null);
 
 let passed = 0;
 function t(name, fn) {
@@ -356,17 +358,33 @@ console.log('セラーID の解決 (実データで判明: miniPC の env に SP
 //    storedSellerId が前のテストで入った 'S1' を拾うと、何を見ているのか分からなくなる
 db.exec('DELETE FROM amazon_fee_estimate');
 
-t('保存済みが1セラーならそれを返す', () => {
-  db.exec('DELETE FROM amazon_fee_estimate');
-  saveEstimates(db, [toEstimateRow(target({ seller_id: 'A6HMLHKUUJC27', seller_sku: 'x1' }),
-    { TotalFeesEstimate: { Amount: 84 }, FeeDetailList: [{ FeeType: 'ReferralFee', FinalFee: { Amount: 84 } }] }, new Date().toISOString())]);
-  assert.equal(storedSellerId(db), 'A6HMLHKUUJC27');
+t('覚えたセラーを返す', () => {
+  forgetSeller();
+  rememberSellerId(db, 'A6HMLHKUUJC27');
+  assert.equal(storedSellerId(db, undefined), 'A6HMLHKUUJC27');
 });
 
-t('[!] 保存済みが複数セラーなら決め打ちしない (null を返す)', () => {
-  saveEstimates(db, [toEstimateRow(target({ seller_id: 'OTHER', seller_sku: 'x2' }),
+t('[!] 見積テーブルに別セラーの行が残っていても、覚え書きが勝つ', () => {
+  // 🚨 DISTINCT から推測する作りだと、旧セラーの行が1つ残っただけで
+  //    「決められない」に落ち、env が空の環境では二度とキーを作れない (Codex R7-3)
+  saveEstimates(db, [toEstimateRow(target({ seller_id: 'OLD_SELLER', seller_sku: 'x2' }),
     { TotalFeesEstimate: { Amount: 84 }, FeeDetailList: [{ FeeType: 'ReferralFee', FinalFee: { Amount: 84 } }] }, new Date().toISOString())]);
-  assert.equal(storedSellerId(db), null);
+  assert.equal(storedSellerId(db, undefined), 'A6HMLHKUUJC27');
+});
+
+t('覚え書きが無ければ env を使う / どちらも無ければ null', () => {
+  forgetSeller();
+  assert.equal(storedSellerId(db, 'FROM_ENV'), 'FROM_ENV');
+  assert.equal(storedSellerId(db, undefined), null);
+});
+
+t('[!] セラーが変わったら覚え直す (認証アカウントの切り替え)', () => {
+  forgetSeller();
+  assert.deepEqual(rememberSellerId(db, 'S_A'), { changed: true, previous: null });
+  assert.deepEqual(rememberSellerId(db, 'S_A'), { changed: false, previous: 'S_A' });
+  assert.deepEqual(rememberSellerId(db, 'S_B'), { changed: true, previous: 'S_A' });
+  assert.equal(storedSellerId(db, undefined), 'S_B');
+  forgetSeller();
 });
 
 t('withResolvedSeller は分かっている値で上書きする / 分からなければ触らない', () => {
@@ -377,6 +395,7 @@ t('withResolvedSeller は分かっている値で上書きする / 分からな�
 
 await ta('[!] env に seller_id が無くても見積を取り、レスポンスの SellerId で保存する', async () => {
   db.exec('DELETE FROM amazon_fee_estimate');
+  forgetSeller();
   const r = await refreshFees(db, [target({ seller_id: null, seller_sku: 'noSeller' })], {
     sleepMs: 0,
     callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { sellerId: 'A6HMLHKUUJC27' }),
@@ -386,6 +405,8 @@ await ta('[!] env に seller_id が無くても見積を取り、レスポンス
   assert.equal(r.sellerId, 'A6HMLHKUUJC27');
   assert.equal(db.prepare("SELECT seller_id FROM amazon_fee_estimate WHERE seller_sku = 'noSeller'").get().seller_id,
     'A6HMLHKUUJC27');
+  // 次回の照合に使えるよう覚えている
+  assert.equal(getSetting(db, SETTING_AMAZON_SELLER_ID), 'A6HMLHKUUJC27');
 });
 
 await ta('[!] env の seller_id が保存済みと違っても、保存済みの値でキーを作る (取り直さない)', async () => {
@@ -399,12 +420,38 @@ await ta('[!] env の seller_id が保存済みと違っても、保存済みの
 
 await ta('[!] レスポンスにも保存済みにもセラーが無い見積は保存しない (キーが作れない)', async () => {
   db.exec('DELETE FROM amazon_fee_estimate');
+  forgetSeller();
   const r = await refreshFees(db, [target({ seller_id: null, seller_sku: 'unknownSeller' })], {
     sleepMs: 0, callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier),   // SellerId 無し
   });
   assert.equal(r.refreshed, 0);
   assert.equal(r.errors[0].error, 'seller_id_unresolved');
   assert.equal(db.prepare("SELECT COUNT(*) c FROM amazon_fee_estimate WHERE seller_sku = 'unknownSeller'").get().c, 0);
+});
+
+await ta('[!] 1回の実行で複数のセラーが返ってきたら補完も記憶もしない', async () => {
+  // 🚨 どれが正か決められない状態で最後の1件に揃えると、誤ったキーで保存してしまう (Codex R7-3)
+  db.exec('DELETE FROM amazon_fee_estimate');
+  forgetSeller();
+  const r = await refreshFees(db, [
+    target({ seller_id: null, seller_sku: 'multiA' }),
+    target({ seller_id: null, seller_sku: 'multiB' }),
+  ], {
+    sleepMs: 0,
+    callFeesApi: async (body) => body.map((b, i) => ({
+      Status: 'Success',
+      FeesEstimateIdentifier: { SellerInputIdentifier: b.FeesEstimateRequest.Identifier, SellerId: i === 0 ? 'S_A' : 'S_B' },
+      FeesEstimate: {
+        TotalFeesEstimate: { CurrencyCode: 'JPY', Amount: 84 },
+        FeeDetailList: [{ FeeType: 'ReferralFee', FeeAmount: { Amount: 84 }, FinalFee: { Amount: 84 }, FeePromotion: { Amount: 0 } }],
+      },
+    })),
+  });
+  assert.equal(r.sellerConflict, true);
+  assert.equal(r.sellerId, null);
+  assert.equal(getSetting(db, SETTING_AMAZON_SELLER_ID), null, '食い違ったまま覚えてはいけない');
+  // 応答が自分で名乗った行は保存される (補完しないだけ)
+  assert.equal(r.refreshed, 2);
 });
 
 await ta('marketplace_id は引き続き必須 (これが無いとキーが作れない)', async () => {

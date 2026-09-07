@@ -58,6 +58,17 @@ export function normalizeQty(v) {
   return Number.isInteger(n) && n >= 1 ? n : null;
 }
 
+/**
+ * そのモールの対応表が「数量」を持っているか。
+ *
+ * 🚨 「数量が null」の意味がモールで違う (Codex R7-1)。
+ *    Amazon = 列があるのに読めなかった → 原価が決まらない
+ *    楽天   = そもそも列が無い → 単品として計算し、価格の開きで別途疑う
+ */
+export function skuMapHasQuantity(mall) {
+  return mall === 'amazon';
+}
+
 export function loadSkuMap(wdb, mall) {
   const map = new Map();
   if (mall === 'amazon') {

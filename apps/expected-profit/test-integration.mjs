@@ -60,8 +60,9 @@ const warehouseInputs = {
   ]),
   shippingRates: new Map([['501', { 送料: 198, 出荷作業料: 20, 想定梱包資材費: 10, 想定人件費: 9 }]]),
   skuMaps: {
-    amazon: new Map([['sku1', [{ ne_code: 'ne-fba' }]]]),
-    rakuten: new Map([['rsku1', [{ ne_code: 'ne-rak' }]]]),
+    // 本番と同じ形: Amazon は数量を持つ (v_sku_resolved.数量)、楽天は列が無い
+    amazon: new Map([['sku1', [{ ne_code: 'ne-fba', qty: 1 }]]]),
+    rakuten: new Map([['rsku1', [{ ne_code: 'ne-rak', qty: null }]]]),
   },
   masterFreshness: { costValidUntil: FUTURE, shippingMasterValidUntil: FUTURE },
 };

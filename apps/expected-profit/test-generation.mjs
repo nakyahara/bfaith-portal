@@ -80,6 +80,35 @@ const qrow = (ne, price, over = {}) => ({
   rank_eligible: 1, rank_exclusion_reason: null, ...over,
 });
 
+t('[!] 数量が分かっている出品は価格差で外さない (原価が既に数量倍なので正しい)', () => {
+  // 🚨 Codex R7-2: 全モールを対象にすると、数量を正しく計算できる Amazon FBA の
+  //    「数量1・1,000円」と「数量12・10,000円」まで両方外れてしまう
+  const rows = [qrow('f', 1000, { mall: 'amazon', unit_quantity: 1 }),
+    qrow('f', 10000, { mall: 'amazon', unit_quantity: 12 })];
+  assert.equal(markQuantityVariationSuspects(rows), 0);
+  assert.ok(rows.every(r => r.rank_eligible === 1));
+});
+
+t('[!] 数量が分かっている出品と分からない出品が混ざっても、分かっている側は外さない', () => {
+  const known = qrow('g', 10000, { unit_quantity: 12 });
+  const unknown1 = qrow('g', 1000);
+  const unknown2 = qrow('g', 9000);
+  markQuantityVariationSuspects([known, unknown1, unknown2]);
+  assert.equal(known.rank_eligible, 1);
+  assert.equal(unknown1.rank_eligible, 0);
+  assert.equal(unknown2.rank_eligible, 0);
+});
+
+t('[!] ちょうど1.5倍も「1.5倍以上」に含める (境界)', () => {
+  const rows = [qrow('h', 1000), qrow('h', 1500)];
+  assert.equal(markQuantityVariationSuspects(rows), 2);
+});
+
+t('1.5倍に届かなければ外さない', () => {
+  const rows = [qrow('i', 1000), qrow('i', 1499)];
+  assert.equal(markQuantityVariationSuspects(rows), 0);
+});
+
 t('[!] 同じNE商品で価格が大きくひらく出品はランキングから外す', () => {
   // 実データ: 0726-001644 が 1,780円〜41,800円 で6出品。原価は全部750円だった
   const rows = [qrow('a', 1780), qrow('a', 5280), qrow('a', 41800)];

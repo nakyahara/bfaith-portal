@@ -563,7 +563,8 @@ await ta('[!] 待ちループが期限を使う (期限なしの5分では諦め
       sleep: async (ms) => { t += ms; },     // 時計を進めるだけ
     }),
     /レポート取得タイムアウト/);
-  assert.equal(client.polls, 60, `5分 / 5秒 = 60回のはず (実際 ${client.polls})`);
+  // 5分 / 5秒 = 60回ぶん眠るが、**期限ちょうどでは API を呼ばない** ので 59 回 (Codex R7-4)
+  assert.equal(client.polls, 59, `59回のはず (実際 ${client.polls})`);
 });
 
 await ta('[!] 期限を渡すとその分だけ長く待つ (実データ: 5分では足りなかった)', async () => {
@@ -577,7 +578,42 @@ await ta('[!] 期限を渡すとその分だけ長く待つ (実データ: 5分�
       sleep: async (ms) => { t += ms; },
     }),
     /レポート取得タイムアウト/);
-  assert.equal(client.polls, 240, `20分 / 5秒 = 240回のはず (実際 ${client.polls})`);
+  assert.equal(client.polls, 239, `20分ぶん (期限ちょうどは呼ばない) = 239回のはず (実際 ${client.polls})`);
+});
+
+await ta('[!] 残り時間より長く眠らない (期限の1秒前に入ったら1秒だけ眠って終わる)', async () => {
+  let t = new Date('2026-09-07T15:00:00Z').getTime();
+  const slept = [];
+  const client = fakeSp(['IN_PROGRESS']);
+  await assert.rejects(
+    () => getActiveListingsReport({
+      client, marketplaceId: 'M1',
+      deadline: new Date('2026-09-07T15:00:01Z'),
+      now: () => new Date(t),
+      sleep: async (ms) => { slept.push(ms); t += ms; }, log: () => {},
+    }),
+    /レポート取得タイムアウト/);
+  assert.deepEqual(slept, [1000], '5秒眠ると期限を4秒過ぎてから API を呼ぶ');
+  assert.equal(client.polls, 0);
+});
+
+await ta('[!] DONE でも期限を過ぎていたら本体を取りに行かない (数MBある)', async () => {
+  let t = new Date('2026-09-07T15:00:00Z').getTime();
+  await assert.rejects(
+    () => getActiveListingsReport({
+      client: {
+        async callAPI(req) {
+          if (req.operation === 'createReport') return { reportId: 'R1' };
+          if (req.operation === 'getReport') { t += 10 * 60 * 1000; return { processingStatus: 'DONE' }; }
+          throw new Error('本体を取りに行ってしまった: ' + req.operation);
+        },
+      },
+      marketplaceId: 'M1',
+      deadline: new Date('2026-09-07T15:05:00Z'),
+      now: () => new Date(t),
+      sleep: async (ms) => { t += ms; }, log: () => {},
+    }),
+    /期限を過ぎたので取得しない/);
 });
 
 await ta('DONE になったらそこで待つのをやめる', async () => {

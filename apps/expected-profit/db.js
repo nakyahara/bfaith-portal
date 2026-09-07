@@ -241,7 +241,30 @@ function createTables(db) {
     published_at   TEXT NOT NULL
   )`);
 
+  // ─── 8. アプリの覚え書き (§15-3) ───
+  // 🚨 「今どのセラーで見積もっているか」を明示して持つ。
+  //    amazon_fee_estimate の DISTINCT から推測すると、旧セラーの行が1つ残っただけで
+  //    「決められない」に落ち、env が空の環境ではキーを作れなくなる (Codex R7-3)
+  db.exec(`CREATE TABLE IF NOT EXISTS expected_profit_setting (
+    key         TEXT PRIMARY KEY,
+    value       TEXT,
+    updated_at  TEXT NOT NULL
+  )`);
+
   migrate(db);
+}
+
+export const SETTING_AMAZON_SELLER_ID = 'amazon_seller_id';
+
+export function getSetting(db, key) {
+  try { return db.prepare('SELECT value FROM expected_profit_setting WHERE key = ?').get(key)?.value ?? null; }
+  catch { return null; }
+}
+
+export function setSetting(db, key, value, now = new Date().toISOString()) {
+  db.prepare(`INSERT INTO expected_profit_setting (key, value, updated_at) VALUES (?, ?, ?)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+    .run(key, value == null ? null : String(value), now);
 }
 
 /**
