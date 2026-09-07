@@ -60,13 +60,15 @@ function giveBackToHand(db, awayBatch, qty, now, actor) {
     ? db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(awayBatch.split_from_batch_id) : null;
   // ⭐戻してよい元の条件。ここを緩めると、直したはずの問題が戻し先で再発する (Codex R2 重大1・重大2)
   //   - まだ手元で作業できる状態か (棚入待ち・終了・取消のまとまりに未着手分を足さない)
+  //   - ⭐「手元」= 物を持ち帰らない拠点 (いろは・パレット・ジョブサポ = offsite 0)。
+  //     「いろは」だけに限ると、パレットが担当のカードの戻り先が無くなる (自己レビュー D)
   //   - よそへ預けていないか (相手の数が勝手に増えないように)
   //   - 棚に入れた記録・箱ラベルを刷った記録が無いか (数が動くと記録と合わなくなる)
   //   - ⭐予定数が分かっているか。NULL (数不明) に足すと「不明」が「40 個」に化ける
-  const originOk = origin
+  const originHome = !!origin && !isOffsiteFacility(db, origin.facility_code);
+  const originOk = origin && originHome
     && (origin.work_status === 'not_started' || origin.work_status === 'in_progress')
     && origin.planned_qty != null
-    && (!origin.facility_code || origin.facility_code === 'iroha')
     && db.prepare("SELECT COUNT(*) c FROM f_iroha_consignments WHERE batch_id = ? AND state <> 'cancelled'").get(origin.id).c === 0
     && db.prepare('SELECT COUNT(*) c FROM f_iroha_stocking_records WHERE batch_id = ?').get(origin.id).c === 0
     && db.prepare('SELECT COUNT(*) c FROM f_iroha_print_jobs WHERE batch_id = ?').get(origin.id).c === 0;
@@ -75,12 +77,21 @@ function giveBackToHand(db, awayBatch, qty, now, actor) {
       .run(qty, now, origin.id);
     return origin.id;
   }
+  // 新しいまとまりの担当は、元が手元の拠点ならそれを継ぐ (パレットのカードはパレットへ)。元が外部なら未定 (NULL)
+  const homeFac = originHome ? (origin.facility_code ?? null) : null;
   const seq = nextSeq(db, awayBatch.task_id);
   const info = db.prepare(`INSERT INTO f_iroha_task_batches
       (task_id, seq, planned_qty, facility_code, expiry, work_status, split_from_batch_id, split_qty, split_at, split_by, created_at, updated_at)
-    VALUES (?, ?, ?, NULL, ?, 'not_started', ?, ?, ?, ?, ?, ?)`)
-    .run(awayBatch.task_id, seq, qty, awayBatch.expiry ?? null, awayBatch.id, qty, now, actor, now, now);
+    VALUES (?, ?, ?, ?, ?, 'not_started', ?, ?, ?, ?, ?, ?)`)
+    .run(awayBatch.task_id, seq, qty, homeFac, awayBatch.expiry ?? null, awayBatch.id, qty, now, actor, now, now);
   return Number(info.lastInsertRowid);
+}
+
+/** 物を持ち帰る拠点か (NULL = 未定 は手元扱い)。拠点マスタの offsite で見る — コードの決め打ちにしない */
+function isOffsiteFacility(db, code) {
+  if (!code) return false;
+  const f = db.prepare('SELECT offsite FROM f_iroha_facilities WHERE code = ?').get(code);
+  return !!(f && f.offsite);
 }
 
 /** 親カードの版を進める。⭐預けの追加・数量の変更・取消は必ずここを通す (要件 §AB-7) */
@@ -99,8 +110,9 @@ function bumpTask(db, taskId, now, actor) {
  */
 export function splittableMax(db, batch) {
   const done = (batch.good_qty ?? 0) + (batch.loss_qty ?? 0);
+  // ⭐差し引くのは**まだ外にある (返ってきていない) 預け**だけ。精算ずみは物が戻っていて、そのぶんは good/loss に表れる
   const consigned = db.prepare(`SELECT COALESCE(SUM(planned_qty), 0) n FROM f_iroha_consignments
-    WHERE batch_id = ? AND state <> 'cancelled'`).get(batch.id).n;
+    WHERE batch_id = ? AND state IN ('planned','prepared','handed')`).get(batch.id).n;
   if (batch.planned_qty == null) return null;             // つくる数が分からないなら上限も分からない
   return Math.max(0, batch.planned_qty - done - consigned);
 }
@@ -113,6 +125,11 @@ export function whyCannotSplit(db, batch) {
   if (!batch) return { error: 'not_found', message: 'まとまりが見つかりません' };
   if (batch.work_status === 'done' || batch.work_status === 'cancelled') {
     return { error: 'batch_closed', message: 'このぶんはもう終わっています' };
+  }
+  // ⭐棚入待ち = 「全部そろった」。ここから未着手分を切り出すと「そろった」が嘘になる (Codex R3 重大1)。
+  //   完成した商品を外部に渡すことは絶対にない (中原さん 2026-09-07)
+  if (batch.work_status === 'ready_for_stocking') {
+    return { error: 'batch_closed', message: 'このぶんはできあがっています (棚入待ち)。渡すなら職員が作業中に戻してください' };
   }
   // ⚠作業時間の記録はまだ**カード単位** (まとまりに紐づけるのは要件 §AB-10 の PR)。
   //   だから「このカードで作業中の人がいるか」で見る。分けるより厳しい側に倒れるので安全
@@ -158,7 +175,8 @@ export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate =
     if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードは預けられません' };
     const fac = db.prepare('SELECT * FROM f_iroha_facilities WHERE code = ? AND active = 1').get(facilityCode);
     if (!fac) return { ok: false, error: 'bad_facility', message: 'その拠点は選べません' };
-    if (!fac.external) {
+    // ⭐預けられるのは**物を持ち帰る**拠点だけ。パレット・ジョブサポは別の事業者でも いろは の中で作業する
+    if (!fac.offsite) {
       return { ok: false, error: 'not_external', message: 'その拠点は物を持ち帰らないので、預けるのではなく「どこが」で選んでください' };
     }
     const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ? AND task_id = ?').get(batchId, taskId);
@@ -173,7 +191,9 @@ export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate =
     //   完成分や別の預けが残っているなら、上限まででも割る
     let target = b;
     let prevFac;
+    let splitCreated = 0;
     if (max == null || q.value < max || b.planned_qty !== q.value) {
+      splitCreated = 1;
       const seq = nextSeq(db, taskId);
       const info = db.prepare(`INSERT INTO f_iroha_task_batches
           (task_id, seq, planned_qty, facility_code, expiry, work_status, split_from_batch_id, split_qty, split_at, split_by, created_at, updated_at)
@@ -192,10 +212,13 @@ export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate =
         .run(facilityCode, now, b.id);
       target = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(b.id);
     }
+    // ⭐この預けのためにまとまりを切り出したかは**預けの行に**残す (split_created)。
+    //   まとまりの split_from_batch_id は過去の分割の履歴なので、それで「取消のとき戻すか」を決めると
+    //   前に切り出したまとまりを丸ごと預けてやめたときに、そのまとまりごと取消にしてしまう (Codex R3 中4)
     const ci = db.prepare(`INSERT INTO f_iroha_consignments
-        (batch_id, facility_code, planned_qty, state, due_date, prev_facility_code, planned_at, planned_by, created_at, updated_at)
-      VALUES (?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?)`)
-      .run(target.id, facilityCode, q.value, due, prevFac === undefined ? null : prevFac, now, actor, now, now);
+        (batch_id, facility_code, planned_qty, state, due_date, prev_facility_code, split_created, planned_at, planned_by, created_at, updated_at)
+      VALUES (?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?)`)
+      .run(target.id, facilityCode, q.value, due, prevFac === undefined ? null : prevFac, splitCreated, now, actor, now, now);
     bumpTask(db, t.id, now, actor);
     recomputeTaskDoneQty(db, t.id);
     return { ok: true, consignment: getConsignment(Number(ci.lastInsertRowid), db), batch: target };
@@ -262,14 +285,15 @@ export function cancelConsignment({ consignmentId, expectVersion, actor = null, 
     if (c.state === 'cancelled') return { ok: true, already: true };
     db.prepare(`UPDATE f_iroha_consignments SET state = 'cancelled', version = version + 1, updated_at = ? WHERE id = ?`).run(now, c.id);
     const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
-    if (b && b.split_from_batch_id) {
-      // 切り出して作ったまとまり → 取消にして、数を手元に戻す。
+    if (b && c.split_created) {
+      // この預けのために切り出したまとまり → 取消にして、数を手元に戻す。
       // ⭐戻し先が今も手元にあるかを見る。よそへ渡した相手に足してしまわない (Codex R1 重大5)
       db.prepare("UPDATE f_iroha_task_batches SET work_status = 'cancelled', version = version + 1, updated_at = ? WHERE id = ?")
         .run(now, b.id);
       giveBackToHand(db, b, b.planned_qty ?? 0, now, actorIn);
     } else if (b) {
-      // 割らずに丸ごと預けたまとまり → 担当拠点を元に戻す (Codex R1 中6)
+      // 割らずに丸ごと預けたまとまり → 担当拠点を元に戻す (Codex R1 中6)。
+      // ⭐前の分割で生まれたまとまりでも、この預けで切り出したのでなければ消さない (Codex R3 中4)
       db.prepare('UPDATE f_iroha_task_batches SET facility_code = ?, version = version + 1, updated_at = ? WHERE id = ?')
         .run(c.prev_facility_code ?? null, now, b.id);
     }
@@ -363,17 +387,22 @@ export function recordReturn({ consignmentId, returnedQty, goodQty = undefined, 
     // 返ってきた良品は、そのまとまりの「できた数」になる
     // ⭐使える数と作れなかった数は**別々に**集計して反映する。
     //   以前は「使える数が 1 件も無ければ、入れた作れなかった数も捨てる」ことになっていた (Codex R2 重大3)
-    const agg = db.prepare(`SELECT COUNT(good_qty) gn, SUM(good_qty) gs, COUNT(loss_qty) ln, SUM(loss_qty) ls
+    // ⭐**返却の行に 1 つでも「分からない」があれば、数を確定 (counted) にしない** (Codex R3 重大2)。
+    //   60 個 (使える 60) → 40 個 (分からない) と返ってきたのに 60 を確定にすると、
+    //   100 個のうち 60 個しかできなかったと読める。分からないものは「数えていない」(NULL) のまま
+    const agg = db.prepare(`SELECT COUNT(*) rows, COUNT(good_qty) gn, SUM(good_qty) gs, COUNT(loss_qty) ln, SUM(loss_qty) ls
       FROM f_iroha_consignment_returns WHERE consignment_id = ?`).get(c.id);
-    if (agg.gn > 0 || agg.ln > 0) {
+    {
       const cur = db.prepare('SELECT good_qty, good_qty_source, loss_qty FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
-      const nextGood = agg.gn > 0 ? agg.gs : (cur.good_qty ?? null);
-      const nextLoss = agg.ln > 0 ? agg.ls : (cur.loss_qty ?? null);
-      db.prepare(`UPDATE f_iroha_task_batches SET good_qty = ?, good_qty_source = ?, loss_qty = ?,
-          version = version + 1, updated_at = ? WHERE id = ?`)
-        .run(nextGood, nextGood == null ? null : 'counted', nextLoss, now, c.batch_id);
-      const b = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
-      if (b) recomputeTaskDoneQty(db, b.task_id);
+      const nextGood = agg.gn === agg.rows ? agg.gs : null;
+      const nextLoss = agg.ln === agg.rows ? agg.ls : null;
+      if (nextGood !== (cur.good_qty ?? null) || nextLoss !== (cur.loss_qty ?? null) || (nextGood != null && cur.good_qty_source !== 'counted')) {
+        db.prepare(`UPDATE f_iroha_task_batches SET good_qty = ?, good_qty_source = ?, loss_qty = ?,
+            version = version + 1, updated_at = ? WHERE id = ?`)
+          .run(nextGood, nextGood == null ? null : 'counted', nextLoss, now, c.batch_id);
+        const b = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
+        if (b) recomputeTaskDoneQty(db, b.task_id);
+      }
     }
     if (settled) closeBatchIfSettled(db, c.batch_id, now);
     const bt = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
@@ -460,10 +489,11 @@ export function consignableByBatch(db, batchIds) {
   const printed = new Map(db.prepare(`SELECT batch_id, COUNT(*) c FROM f_iroha_print_jobs
     WHERE batch_id IN (${inq}) GROUP BY batch_id`).all(...ids).map((r) => [r.batch_id, r.c]));
   const consigned = new Map(db.prepare(`SELECT batch_id, COALESCE(SUM(planned_qty), 0) n FROM f_iroha_consignments
-    WHERE batch_id IN (${inq}) AND state <> 'cancelled' GROUP BY batch_id`).all(...ids).map((r) => [r.batch_id, r.n]));
+    WHERE batch_id IN (${inq}) AND state IN ('planned','prepared','handed') GROUP BY batch_id`).all(...ids).map((r) => [r.batch_id, r.n]));
   for (const b of rows) {
     let why = null;
     if (b.work_status === 'done' || b.work_status === 'cancelled') why = 'このぶんはもう終わっています';
+    else if (b.work_status === 'ready_for_stocking') why = 'このぶんはできあがっています (棚入待ち)。渡すなら職員が作業中に戻してください';
     else if ((active.get(b.task_id) || 0) > 0) why = 'いま作業している人がいます。作業を終えてからにしてください';
     else if ((stocked.get(b.id) || 0) > 0) why = 'もう棚に入れたぶんです';
     else if ((printed.get(b.id) || 0) > 0) why = 'このぶんの箱ラベルはもう出しています。分けるなら先にラベルを整理してください';

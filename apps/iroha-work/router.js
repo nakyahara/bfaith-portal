@@ -707,6 +707,8 @@ function changeStatusApp(req, res, worker) {
     lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
     varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    // ⭐どのまとまりの数か (預けたあと、いろは のぶんに入れる — 自己レビュー B)。送られたときだけ
+    batchId: 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined,
     reason: req.body?.reason || null,
     actor: hasSessionAccess(req) ? req.iwUser : `${worker.display_name} (いろはアプリ)`,
     isStaff, workerId: worker.id, workerName: worker.display_name, deviceLabel: deviceLabelOf(req),
@@ -977,6 +979,7 @@ router.post('/api/progress', checkOrigin, api((req, res) => {
     lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
     varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    batchId: 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined,
     actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
     // 正本の切替は version を変えないので、更新と同じトランザクションでもう一度見る (要件 §U-2)
@@ -1007,6 +1010,7 @@ router.post('/api/block', checkOrigin, api((req, res) => {
     lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
     varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    batchId: 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined,
     actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
   });

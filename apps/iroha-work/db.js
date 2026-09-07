@@ -256,6 +256,9 @@ const consignDDL = (name) => `
       due_date      TEXT,                                        -- いつまでに返してほしいか (任意)
       -- ⭐渡す前にやめたときに戻す担当拠点。まとまりを割らずに丸ごと預けたときだけ入る (Codex R1 中6)
       prev_facility_code TEXT,
+      -- ⭐この預けのためにまとまりを切り出したか (1 = やめたらそのまとまりを取消にして数を戻す)。
+      --   まとまり側の split_from_batch_id は過去の分割の履歴なので、それで決めない (Codex R3 中4)
+      split_created INTEGER NOT NULL DEFAULT 0 CHECK (split_created IN (0,1)),
       -- ⭐外部で壊れる等で**物として返ってこない数**。職員が確かめて精算するときに入れる (Codex R1 中10)。
       --   返却行の good/loss (返ってきた物の内訳) とは別のもの
       missing_qty   INTEGER CHECK (missing_qty IS NULL OR missing_qty >= 0),
@@ -678,6 +681,7 @@ export function createTables(db = getMirrorDB()) {
       code       TEXT NOT NULL UNIQUE,
       name       TEXT NOT NULL,
       external   INTEGER NOT NULL DEFAULT 0 CHECK (external IN (0,1)),
+      offsite    INTEGER NOT NULL DEFAULT 0 CHECK (offsite IN (0,1)),   -- 物を持ち帰って向こうで作業する (羅針盤・ワークセンター)
       active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
       sort_order INTEGER NOT NULL DEFAULT 0
     );
@@ -806,8 +810,12 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_work_options', 'manual_sort', 'INTEGER');
   // 拠点の初期値 (無ければ足す。名前の変更は管理画面から — 今は無いので tasks.js を正とする)。
   // タスク表の作り直し (facility_code の FK 検査) より前に入れておく
-  const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, active, sort_order) VALUES (?, ?, ?, 1, ?)');
-  for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.sort_order);
+  addCol('f_iroha_facilities', 'offsite', 'INTEGER NOT NULL DEFAULT 0 CHECK (offsite IN (0,1))');
+  const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, offsite, active, sort_order) VALUES (?, ?, ?, ?, 1, ?)');
+  for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.offsite ? 1 : 0, f.sort_order);
+  // 「物を持ち帰るか」は拠点の性質なので tasks.js を正として揃える (既に入っている行も)
+  const offFac = db.prepare('UPDATE f_iroha_facilities SET offsite = ? WHERE code = ? AND offsite <> ?');
+  for (const f of FACILITIES) offFac.run(f.offsite ? 1 : 0, f.code, f.offsite ? 1 : 0);
   // 名前の変更 (既に入っている行は INSERT OR IGNORE では変わらない)。旧名のときだけ書き換えるので、手で別の名前にした行は触らない
   const renFac = db.prepare('UPDATE f_iroha_facilities SET name = ? WHERE code = ? AND name = ?');
   for (const r of FACILITY_RENAMES) renFac.run(r.to, r.code, r.from);
@@ -901,6 +909,8 @@ export function createTables(db = getMirrorDB()) {
   //   刷った中身 (商品名・バーコード・入数・期限・枚数) は元から列で持っているので、
   //   あとでまとまりの期限や数を直しても、**刷った記録は変わらない**
   addCol('f_iroha_print_jobs', 'batch_id', 'INTEGER REFERENCES f_iroha_task_batches(id)');
+  // 預けの行に「この預けで切り出したか」(Codex R3 中4)。マージ前の DB にも足す
+  addCol('f_iroha_consignments', 'split_created', 'INTEGER NOT NULL DEFAULT 0 CHECK (split_created IN (0,1))');
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}

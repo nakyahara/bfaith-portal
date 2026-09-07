@@ -3109,7 +3109,7 @@ async function stockOne(id) {
   await completeStocked([{ id: c.id, version: c.version }]);
 }
 const BULK_SKIP = { already: 'すでに棚入完了', not_ready: '棚入待ちではありません', not_found: '見つかりません',
-  conflict: '同時に変更されました', active_sessions: '作業中の人がいます' };
+  conflict: '同時に変更されました', active_sessions: '作業中の人がいます', consign_open: '外にあずけたぶんが返っていません' };
 const bulkSkipLabel = (reason) => BULK_SKIP[reason] || '棚入完了にできませんでした';
 
 // ─── ラベル待ち ───
@@ -4453,6 +4453,7 @@ async function submitBlock() {
       // できた数は入れたときだけ送る (空 = 前の値のまま)。メモも書いたときだけ。
       // 「その他」のメモは止まった理由 (blocked_note) にだけ入れる — 申し送り (hold_memo) と二重に持たない (Codex PR #1193 R1 #7)
       body: JSON.stringify({ id: c.id, worker_id: worker.id, reason: blockReason, expect_version: c.version,
+        ...(homeBatchId(c) ? { batch_id: homeBatchId(c) } : {}),
         ...(v.qty != null ? { done_qty: v.qty } : {}),
         ...(blockReason === 'other' ? { note: v.memo }
           : matNote ? { note: matNote, ...(v.memo ? { hold_memo: v.memo } : {}) }
@@ -4573,6 +4574,7 @@ async function submitDone() {
   try {
     j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: c.id, to: 'ready_for_stocking', worker_id: worker.id, expect_version: c.version,
+        ...(homeBatchId(c) ? { batch_id: homeBatchId(c) } : {}),
         ...(v.qty != null ? { done_qty: v.qty } : {}),
         ...(v.loss !== undefined ? { loss_qty: v.loss } : {}),
         ...(v.note !== undefined ? { variance_note: v.note } : {}) }) });
@@ -4936,10 +4938,18 @@ async function stopWork(reason, only, opts) {
 let cgTarget = null;      // { taskId, batchId } または { consignmentId, action }
 let cgSaving = false;
 let cgPickedBatch = null; // 渡せるぶんが 2 つ以上あるとき、選んだもの
+let cgKeep = null;        // ⭐どのぶんかを選び直したときに、入れかけの拠点・数・期限を持ち越す (Codex R3 中3)
+/** いま入っている拠点・数・期限を読む (選び直しで消さないため) */
+function cgReadInputs() {
+  const fac = $('#cgFacs') && $('#cgFacs').querySelector('.chip.on');
+  const due = $('#cgDue') && $('#cgDue').querySelector('.chip.on');
+  const q = $('#cgBody').querySelector('.cgQty');
+  return { fac: fac ? fac.dataset.cgfac : null, due: due ? due.dataset.cgdue : null, qty: q ? String(q.value) : '' };
+}
 
-/** 預けられる拠点 = 物を持ち帰るところ (羅針盤・ワークセンター) だけ */
+/** 預けられる拠点 = 物を持ち帰るところ (羅針盤・ワークセンター) だけ。パレット・ジョブサポは いろは の中で作業する */
 function externalFacilities() {
-  return ((boardState() || {}).facilities || []).filter((f) => f.external);
+  return ((boardState() || {}).facilities || []).filter((f) => f.offsite);
 }
 /** 入数で丸める。70 個入りなら 500 ではなく 490 (要件 §AB-9) */
 function roundToPack(n, per) {
@@ -4999,10 +5009,17 @@ function openConsign() {
     '</div>' +
     '<div class="mbtns"><button class="btn" onclick="closeConsign()">やめる</button>' +
     '<button class="btn primary" id="cgGo" onclick="submitConsign()">この内容で渡す</button></div>';
+  // ⭐選び直す前に入れていた拠点・期限・数を戻す (描き直しで消さない — Codex R3 中3)。数は上限を超えていても入れたまま (送るときに断る)
+  if (cgKeep) {
+    const k = cgKeep; cgKeep = null;
+    if (k.fac) for (const x of $('#cgFacs').querySelectorAll('.chip')) x.classList.toggle('on', x.dataset.cgfac === k.fac);
+    if (k.due != null) for (const x of $('#cgDue').querySelectorAll('.chip')) x.classList.toggle('on', x.dataset.cgdue === k.due);
+    const q = $('#cgBody').querySelector('.cgQty'); if (q && k.qty !== '') q.value = k.qty;
+  }
   openOverlay('#cgOv');
   $('#cgTitle').focus();
 }
-function closeConsign() { if (cgSaving) return; closeOverlay('#cgOv'); cgTarget = null; cgPickedBatch = null; $('#cgBody').innerHTML = ''; }
+function closeConsign() { if (cgSaving) return; closeOverlay('#cgOv'); cgTarget = null; cgPickedBatch = null; cgKeep = null; $('#cgBody').innerHTML = ''; }
 $('#cgOv').addEventListener('click', (e) => { if (e.target === $('#cgOv')) closeConsign(); });
 // 選択肢 (拠点・数・期限)
 document.addEventListener('click', (e) => {
@@ -5013,7 +5030,7 @@ document.addEventListener('click', (e) => {
   const q = e.target.closest('[data-cgq]');
   if (q) { const el = $('#cgBody').querySelector('.cgQty'); if (el) el.value = q.dataset.cgq; return; }
   const bb = e.target.closest('[data-cgbatch]');
-  if (bb) { cgPickedBatch = Number(bb.dataset.cgbatch); openConsign(); }   // 選び直して描き直す
+  if (bb) { cgKeep = cgReadInputs(); cgPickedBatch = Number(bb.dataset.cgbatch); openConsign(); }   // 選び直して描き直す (入力は持ち越す)
 });
 /** 「いつまでに」= 今日から N 日後 (JST)。サーバーには YYYY-MM-DD で渡す */
 function dueYmd(days) {
@@ -5268,6 +5285,20 @@ function dqDiff(el) {
  * 入力欄の中身を読む。空文字は「数えていない」= null (0 に丸めない)。
  * ⚠パネルは中断ダイアログと「あとから直す」ダイアログの両方に描かれるので、**入れ物を指定して**探す
  */
+/**
+ * ⭐数を入れる先のまとまり (預けたあとの「いろは のぶん」)。
+ * まとまりが 1 つならサーバーに任せる (null)。2 つ以上なら**手元の拠点**(物を持ち帰らない = offsite でない)
+ * で、まだ作業できる (未着手・作業中) ものを選ぶ。作業中が 1 つならそれ。決まらなければ null (サーバーが「選んで」と断る)
+ */
+function homeBatchId(c) {
+  const all = (c && c.batches || []).filter((x) => x.work_status !== 'cancelled');
+  if (all.length <= 1) return null;
+  const facs = new Map((((boardState() || {}).facilities) || []).map((f) => [f.code, !!f.offsite]));
+  const home = all.filter((x) => !(x.facility_code && facs.get(x.facility_code)) && (x.work_status === 'not_started' || x.work_status === 'in_progress'));
+  if (home.length === 1) return home[0].id;
+  const going = home.filter((x) => x.work_status === 'in_progress');
+  return going.length === 1 ? going[0].id : null;
+}
 function dqValues(rootSel) {
   const root = $(rootSel);
   const el = root && root.querySelector('.dqIn');
@@ -5342,7 +5373,8 @@ async function saveProgress() {
   try {
     j = await apiFetch('/api/progress', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: dqTarget, worker_id: worker.id, expect_version: c.version, done_qty: v.qty, hold_memo: v.memo }),
+      body: JSON.stringify({ id: dqTarget, worker_id: worker.id, expect_version: c.version, done_qty: v.qty, hold_memo: v.memo,
+        ...(homeBatchId(c) ? { batch_id: homeBatchId(c) } : {}) }),
     });
   } finally {
     // ⭐何があっても押せる状態に戻す。ここで止まるとダイアログを閉じることもできなくなる (Codex R2 軽微1)
