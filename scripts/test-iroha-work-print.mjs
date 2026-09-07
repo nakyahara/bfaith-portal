@@ -164,6 +164,8 @@ let J1;
     const picked = enqueuePrintJob({ taskId: TS, batchId: pickTo.id, copies: 1, packQty: '120', clientRequestId: crid() });
     ok(picked.ok && db.prepare('SELECT batch_id FROM f_iroha_print_jobs WHERE id = ?').get(picked.job.id).batch_id === pickTo.id,
       '⭐選べば、そのぶんに紐づいて残る (何を刷ったかが後から分かる)');
+    ok(picked.job.client_request_id && typeof picked.job.client_request_id === 'string',
+      '⭐どの依頼から生まれたジョブかを返す (画面が控えを捨ててよいか判断できる)');
     // ⭐積んだままだと同じカードに次を積めない (在庫中の見張り)。1 つずつ片づけて次を試す
     db.prepare('DELETE FROM f_iroha_print_jobs WHERE id = ?').run(picked.job.id);
     // よそのカードのぶんは指定できない (別の新しいカードで試す)

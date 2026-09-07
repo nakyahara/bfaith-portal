@@ -2568,14 +2568,38 @@ function printableBatches(c) {
   return (c.batches || []).filter((b) => b.work_status !== 'cancelled');
 }
 /**
- * ⭐**届いたか分からない依頼**を、画面の開け閉めと 60 秒ごとの取り直しをまたいで覚えておく
- * (要件: 印刷は二重に出さない — Codex #1259 R4 重大1)。
+ * ⭐**届いたか分からない依頼**を、画面の開け閉め・60 秒ごとの取り直し・**ページの再読み込み**を
+ * またいで覚えておく (要件: 印刷は二重に出さない — Codex #1259 R4 重大1 / R5 重大1)。
  *
- * printCtx はダイアログを閉じると消えるし、カードの持ち物にすると一覧の取り直しで消える。
- * どちらでも、開き直したときに**依頼 ID が作り直されて**、届いていた 1 枚目に重ねてもう 1 枚出る。
- * だから画面の状態から独立した入れ物に置く。積めたと分かったときだけ捨てる。
+ * printCtx はダイアログを閉じると消える。カードの持ち物にすると一覧の取り直しで消える。
+ * メモリだけだと再読み込みで消える。どれでも、開き直したときに**依頼 ID が作り直されて**、
+ * 届いていた 1 枚目に重ねてもう 1 枚出る。だから端末に残す。
+ *
+ * ⭐**送った中身もそのまま残す** (R5 中1)。ID だけ残しても、開き直すと枚数などが既定値に戻り、
+ * 同じ ID で違う内容になって「同じ依頼 ID で違う内容」と断られ、抜け出せなくなる。
+ * 捨てるのは「積めた」と分かったときだけ。
  */
-const printPending = new Map();   // task_id → { reqId, batchId }
+const PRINT_PENDING_KEY = 'iw_print_pending';
+function loadPrintPending() {
+  try { return new Map(Object.entries(JSON.parse(localStorage.getItem(PRINT_PENDING_KEY) || '{}'))); }
+  catch (e) { return new Map(); }   // プライベートモード等。覚えられなくても画面は動く
+}
+const printPending = loadPrintPending();
+function savePrintPending() {
+  try { localStorage.setItem(PRINT_PENDING_KEY, JSON.stringify(Object.fromEntries(printPending))); }
+  catch (e) { /* 覚えられないだけ。ここで画面を止めない */ }
+}
+/**
+ * ⭐控えを捨ててよいか。**そのジョブがサーバーにあると分かったら**捨てる —
+ * 応答を失っても、一覧の取り直しでジョブが見えれば「届いていた」と分かる
+ */
+function clearPrintPendingIfDone(c) {
+  const p = printPending.get(String(c.id));
+  if (p && c.print_job && c.print_job.client_request_id === p.reqId) {
+    printPending.delete(String(c.id));
+    savePrintPending();
+  }
+}
 function openPrintBox(id, batchId) {
   const c = findCard(id);
   if (!c) return;
@@ -2590,6 +2614,7 @@ function openPrintBox(id, batchId) {
     showErr('このカードのぶんはすべて取り消されています。ラベルは出せません');
     return;
   }
+  clearPrintPendingIfDone(c);   // ジョブが見えていれば控えは要らない
   // ⭐届いたか分からない依頼があるなら、そのまとまりのまま開く (選び直させない)。
   // 🚨ただし**そのぶんがまだ出せるときだけ**。控えの batchId が null (預ける前に送った) や
   //   取り消しずみのまま押しつけると、分かれたカードで「選ぶ画面 → 押しつけ → 選ぶ画面」を
@@ -2606,7 +2631,7 @@ function openPrintBox(id, batchId) {
   //   同じ内容で送り直せばサーバーは同じ依頼として扱うので、2 枚にはならない
   const pend = printPending.get(String(c.id));
   printCtx = pend
-    ? { id: c.id, batchId: pend.batchId, reqId: pend.reqId, saving: false, unresolved: true }
+    ? { id: c.id, batchId: pend.batchId, reqId: pend.reqId, saving: false, unresolved: true, body: pend.body }
     : { id: c.id, batchId: batch ? batch.id : null,
         reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), saving: false };
   const m = c.master || {};
@@ -2780,15 +2805,19 @@ async function submitPrint() {
   ctx.saving = true;
   $('#printOk').disabled = true;
   msgEl.textContent = '送信しています…';
+  // ⭐**送る中身は 1 か所で作る**。控えがあるならその中身をそのまま送り直す —
+  //   開き直して枚数などが既定値に戻ってから送ると、同じ依頼 ID で違う内容になり、
+  //   サーバーに断られて抜け出せなくなる (Codex #1259 R5 中1)
+  const body = (ctx.unresolved && ctx.body) ? ctx.body : {
+    task_id: c.id, worker_id: worker.id, copies, pack_qty: packRaw || null, extra_pack_qty: extraRaw || null, expiry: expiry || null,
+    batch_id: ctx.batchId == null ? undefined : ctx.batchId,
+    target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
+  };
   let j;
   try {
     j = await apiFetch('/api/print/jobs', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        task_id: c.id, worker_id: worker.id, copies, pack_qty: packRaw || null, extra_pack_qty: extraRaw || null, expiry: expiry || null,
-        batch_id: ctx.batchId == null ? undefined : ctx.batchId,
-        target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
-      }),
+      body: JSON.stringify(body),
     });
   } catch (e) {
     ctx.saving = false;
@@ -2796,7 +2825,8 @@ async function submitPrint() {
     //   立てるのはこの経路だけ — サーバーが返事をくれたなら、その依頼のことは分かっている。
     //   ⭐画面を閉じても消えないところに置く (開き直しで ID が変わるのを防ぐ)
     ctx.unresolved = true;
-    printPending.set(String(c.id), { reqId: ctx.reqId, batchId: ctx.batchId });
+    printPending.set(String(c.id), { reqId: ctx.reqId, batchId: ctx.batchId, body });
+    savePrintPending();
     msgEl.textContent = '❌ 送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2 枚にはなりません)';
     $('#printOk').disabled = false;
     return;
@@ -2807,7 +2837,7 @@ async function submitPrint() {
   // 🚨入力の誤りで断られても下ろさない — その返事は「**いま送ったぶん**は積まれていない」しか
   //   言っておらず、前に送って返事を失ったぶんが積まれていないことの証明にはならない
   //   (Codex #1259 R3 重大1)。枚数の検査などは冪等 ID を見るより先に走る
-  if (j.ok) { ctx.unresolved = false; printPending.delete(String(c.id)); }
+  if (j.ok) { ctx.unresolved = false; printPending.delete(String(c.id)); savePrintPending(); }
   if (j.ok) {
     c.print_job = j.job;
     closePrintBox();

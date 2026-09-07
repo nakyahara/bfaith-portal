@@ -3930,11 +3930,11 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
       // 届いたか分からない依頼の控え。画面の開け閉めをまたぐので、外から渡して中身も見る
       const pending = new Map();
       const fn = new Function('printCtx', 'findCard', '$', 'apiFetch', 'worker', 'closePrintBox',
-        'repaintAfterPrint', 'toast', 'openPrintBox', 'openGate', 'showErr', 'printPending',
+        'repaintAfterPrint', 'toast', 'openPrintBox', 'openGate', 'showErr', 'printPending', 'savePrintPending',
         src + '; return submitPrint;')(
         ctx, () => ({ id: 7, title: 'x', print_job: null }), (k) => els[k],
         async () => { const r = replies[i++]; if (r instanceof Error) throw r; return r; },
-        { id: 1 }, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, pending);
+        { id: 1 }, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, pending, () => {});
       return { ctx, fn, pending };
     };
     // ① 通信が切れた → 届いたか分からないので印が立つ
@@ -3962,15 +3962,62 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   }
   ok(html.includes('repaintAfterPrint(c); openPrintBox(c.id, ctx.batchId);'),
     '⭐前回の結果を確かめて開き直すときは、**選んでいたまとまりのまま**にする (対象を変えさせない)');
-  ok(html.includes('ctx.unresolved = true;') && html.includes('if (j.ok) { ctx.unresolved = false; printPending.delete(String(c.id)); }'),
+  ok(html.includes('ctx.unresolved = true;') && html.includes('if (j.ok) { ctx.unresolved = false; printPending.delete(String(c.id)); savePrintPending(); }'),
     '印を立てるのは通信が切れたときだけ / 下ろすのは積めたと分かったときだけ');
   // 🚨画面を閉じて開き直しても、届いたか分からない依頼の ID を失わない (Codex R4 重大1)
-  ok(html.includes('const printPending = new Map();'),
-    '⭐届いたか分からない依頼は、画面の開け閉め・一覧の取り直しをまたいで覚えておく');
-  ok(html.includes("printPending.set(String(c.id), { reqId: ctx.reqId, batchId: ctx.batchId });"),
-    '通信が切れたら、その依頼 ID とまとまりを控える');
+  // 🚨ページを読み込み直しても消えないところに置く (Codex R5 重大1)
+  ok(html.includes("const PRINT_PENDING_KEY = 'iw_print_pending';") && html.includes('function loadPrintPending()')
+    && html.includes('localStorage.getItem(PRINT_PENDING_KEY)'),
+    '⭐届いたか分からない依頼は、ページを読み込み直しても消えないところに控える');
+  ok(html.includes("printPending.set(String(c.id), { reqId: ctx.reqId, batchId: ctx.batchId, body });")
+    && html.includes('savePrintPending();'),
+    '⭐控えるのは依頼 ID・まとまり・**送った中身**まで (Codex R5 中1)');
+  ok(html.includes('const body = (ctx.unresolved && ctx.body) ? ctx.body : {'),
+    '⭐控えがあるなら、その中身をそのまま送り直す (開き直して既定値に戻ったぶんを送らない)');
+  ok(html.includes('function clearPrintPendingIfDone(c)')
+    && html.includes("c.print_job.client_request_id === p.reqId"),
+    '⭐そのジョブがサーバーに見えたら控えを捨てる (応答を失っても自然に抜けられる)');
+  // 控えの読み書きを実際に動かす
+  {
+    // ⭐控えのしくみを**まとめて 1 ブロックで**取り出す (関数どうしが呼び合っているため)。
+    //   printPending はこのブロックの中で作られるので、外から渡さず**返してもらって**中を見る
+    const from = html.indexOf('function loadPrintPending()');
+    const to = html.indexOf('function openPrintBox(', from);
+    const src = html.slice(from, to);
+    ok(/savePrintPending/.test(src) && /clearPrintPendingIfDone/.test(src), '(前提) 控えのしくみを取り出せた');
+    const mk = (ls) => new Function('localStorage', 'PRINT_PENDING_KEY',
+      src + '; return { printPending, savePrintPending, clearPrintPendingIfDone };')(ls, 'iw_print_pending');
+    const store = { v: '{}' };
+    const ls = { getItem: () => store.v, setItem: (k, v) => { store.v = v; } };
+    // ① 控えは中身ごと端末に残る
+    const a1 = mk(ls);
+    a1.printPending.set('7', { reqId: 'p-1', batchId: 3, body: { copies: 2 } });
+    a1.savePrintPending();
+    ok(JSON.parse(store.v)['7'].reqId === 'p-1' && JSON.parse(store.v)['7'].body.copies === 2,
+      '⭐控えは依頼 ID と**送った中身ごと**端末に残る');
+    // ② ページを読み込み直しても戻る (新しく作り直して読ませる)
+    const a2 = mk(ls);
+    ok(a2.printPending.get('7') && a2.printPending.get('7').reqId === 'p-1'
+      && a2.printPending.get('7').body.copies === 2,
+      '⭐ページを読み込み直しても、依頼 ID と中身が戻る (Codex R5 重大1)');
+    // ③ そのジョブが見えたら捨てる
+    a2.clearPrintPendingIfDone({ id: 7, print_job: { client_request_id: 'p-1' } });
+    ok(!a2.printPending.has('7'), '⭐その依頼から生まれたジョブが見えたら控えを捨てる');
+    const a3 = mk(ls);
+    a3.printPending.set('7', { reqId: 'p-1', batchId: 3, body: {} });
+    a3.clearPrintPendingIfDone({ id: 7, print_job: { client_request_id: 'p-9' } });
+    ok(a3.printPending.has('7'), '別の依頼のジョブでは捨てない');
+    a3.clearPrintPendingIfDone({ id: 7, print_job: null });
+    ok(a3.printPending.has('7'), 'ジョブが見えないうちも捨てない');
+    // ④ 読み書きできない端末 (プライベートモード等) でも落ちない
+    const bad = { getItem: () => { throw new Error('x'); }, setItem: () => { throw new Error('x'); } };
+    let threw = null;
+    let a4 = null;
+    try { a4 = mk(bad); a4.savePrintPending(); } catch (e) { threw = e; }
+    ok(!threw && a4 && a4.printPending instanceof Map, '⭐控えを読み書きできない端末でも画面は動く');
+  }
   ok(html.includes('const pend = printPending.get(String(c.id));')
-    && html.includes('? { id: c.id, batchId: pend.batchId, reqId: pend.reqId, saving: false, unresolved: true }'),
+    && html.includes('? { id: c.id, batchId: pend.batchId, reqId: pend.reqId, saving: false, unresolved: true, body: pend.body }'),
     '⭐開き直したら**同じ依頼 ID・同じまとまり**で開く (作り直すと 2 枚出る)');
   ok(html.includes('if (pending && pending.batchId != null && bs.some((b) => b.id === pending.batchId)) batchId = pending.batchId;'),
     '届いたか分からない依頼があるうちは、まとまりを選び直させない');
