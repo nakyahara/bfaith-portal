@@ -3972,8 +3972,20 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(html.includes('const pend = printPending.get(String(c.id));')
     && html.includes('? { id: c.id, batchId: pend.batchId, reqId: pend.reqId, saving: false, unresolved: true }'),
     '⭐開き直したら**同じ依頼 ID・同じまとまり**で開く (作り直すと 2 枚出る)');
-  ok(html.includes('if (pending) batchId = pending.batchId;'),
+  ok(html.includes('if (pending && pending.batchId != null && bs.some((b) => b.id === pending.batchId)) batchId = pending.batchId;'),
     '届いたか分からない依頼があるうちは、まとまりを選び直させない');
+  // 🚨押しつけるのは「まだ出せるぶん」だけ。そうしないと選ぶ画面から出られなくなる
+  {
+    const line = html.split(/\r?\n/).find((l) => l.includes('if (pending && pending.batchId != null'));
+    const decide = (pending, bs) => new Function('pending', 'bs', 'batchId',
+      'let b = batchId; ' + line.replace('batchId =', 'b =') + '; return b;')(pending, bs, null);
+    ok(decide({ batchId: 3 }, [{ id: 3 }, { id: 4 }]) === 3, 'まだ出せるぶんなら、そのまま押しつける');
+    ok(decide({ batchId: null }, [{ id: 3 }, { id: 4 }]) === null,
+      '🚨控えにぶんが無ければ押しつけない (選ぶ画面から出られなくなる)');
+    ok(decide({ batchId: 9 }, [{ id: 3 }, { id: 4 }]) === null,
+      '🚨取り消された等でもう出せないぶんも押しつけない');
+    ok(decide(null, [{ id: 3 }]) === null, '控えが無ければ何もしない');
+  }
   // 🚨全部取り消されたカードを「まとまりの無い古いカード」と同じに扱わない (Codex R4 中1)
   ok(html.includes('if (all.length > 0 && bs.length === 0) {'),
     '⭐まとまりがあるのに出せるぶんが無ければ、カード全体の数で刷らせない');

@@ -2590,9 +2590,14 @@ function openPrintBox(id, batchId) {
     showErr('このカードのぶんはすべて取り消されています。ラベルは出せません');
     return;
   }
-  // ⭐届いたか分からない依頼があるなら、そのまとまりのまま開く (選び直させない)
+  // ⭐届いたか分からない依頼があるなら、そのまとまりのまま開く (選び直させない)。
+  // 🚨ただし**そのぶんがまだ出せるときだけ**。控えの batchId が null (預ける前に送った) や
+  //   取り消しずみのまま押しつけると、分かれたカードで「選ぶ画面 → 押しつけ → 選ぶ画面」を
+  //   繰り返して**そのカードのラベルが二度と出せなくなる**。
+  //   そのときは選び直してもらう — 依頼 ID は控えのまま使うので、内容が同じなら 2 枚にはならず、
+  //   違っていればサーバーが「同じ依頼 ID で違う内容」と断る
   const pending = printPending.get(String(c.id));
-  if (pending) batchId = pending.batchId;
+  if (pending && pending.batchId != null && bs.some((b) => b.id === pending.batchId)) batchId = pending.batchId;
   // 分かれているのに選んでいなければ、まず選んでもらう
   if (bs.length > 1 && batchId == null) { openPrintBatchPick(c, bs); return; }
   const batch = batchId != null ? bs.find((b) => b.id === Number(batchId)) : (bs.length === 1 ? bs[0] : null);
