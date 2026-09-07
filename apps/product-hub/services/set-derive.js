@@ -711,3 +711,144 @@ export function latestSetDecision(db, draftId) {
     FROM draft_set_decisions WHERE draft_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1
   `).get(Number(draftId)) || null;
 }
+
+/**
+ * createSetDraft が**作成のときだけ**書くイベント。これ以外のイベントが 1 件でもあれば
+ * 「作成のあとに人が何かした」= 手つかずではない、と判断する。
+ *
+ * 🚨 工程の版数や状態では判定できない (2026-09-07 Codex R1):
+ *    作成時に applyImagePlanToTrack が画像工程を todo → skip にして version を上げるので、
+ *    親に画像がある商品では**作った直後から**「触られている」ことになってしまう。
+ *    逆に、名前・売価・構成・画像だけを直したセットは工程の版数が動かないので取りこぼす。
+ *    このアプリの操作はすべて logEvent を通るので、**イベントの有無**が唯一まともな不変条件。
+ * 🚨 知らないイベントが出たら「触られた」に倒す (取り消しを断る)。ここに名前を足し忘れても
+ *    余計に消えることはなく、断られるだけで済む向きに倒しておく
+ */
+const SET_CREATION_EVENTS = [
+  'created_from_parent', 'price_prefilled',
+  'set_image_plan_seeded', 'set_image_plan_track', 'shipping_not_copied',
+];
+
+/**
+ * 「作成」で作ったセットが、まだ誰も手を付けていないか (取り消しと一緒に取り下げてよいか)。
+ * 手が付いていれば**その理由**を返す (null = 手つかず)。
+ */
+function setDraftTouchedReason(db, set) {
+  if (set.provisional_code !== 1) return '本コードが確定している';
+  // status は工程から導出される値。作った直後は必ず 'draft'
+  if (set.status !== 'draft') return 'すでに工程が進んでいる';
+  const rk = db.prepare('SELECT registered_at FROM draft_rakuten WHERE draft_id = ?').get(set.id);
+  if (rk?.registered_at) return 'すでに楽天へ出品されている';
+  const extra = db.prepare(`
+    SELECT event FROM draft_events
+    WHERE draft_id = ? AND event NOT IN (${SET_CREATION_EVENTS.map(() => '?').join(',')})
+    ORDER BY id LIMIT 1
+  `).get(set.id, ...SET_CREATION_EVENTS);
+  if (extra) return `作成のあとに操作されている (${extra.event})`;
+  return null;
+}
+
+/**
+ * 取り消した記録 (JSON) の区切り。draft_events.detail は人が読む画面にそのまま出るので、
+ * 「人が読む文 + この区切り + JSON」という形にしている。
+ * 🚨 復元は **最初の区切りより後ろ全部** を取る:
+ *      const at = detail.indexOf(UNDO_RECORD_MARKER);
+ *      JSON.parse(detail.slice(at + UNDO_RECORD_MARKER.length));
+ *    `split(marker)[1]` は使えない — JSON の文字列値の中に区切りが入っていると
+ *    そこで切れて JSON が途中で終わる (Codex R3)
+ */
+export const UNDO_RECORD_MARKER = ' ／ 取り消した記録 #json:';
+
+/**
+ * 区切りより前 (人が読む文) に区切りそのものが現れないようにする。
+ * 🚨 reason_text は人が打つ自由入力なので、区切り文字列をそのまま書ける (Codex R3)。
+ *    本文に紛れ込むと detail.split(UNDO_RECORD_MARKER)[1] が JSON の手前で切れて復元できない。
+ *    JSON 側の文字列に区切りが入っても、**最初の区切りより後ろ全部**が JSON なので問題ない
+ */
+function stripUndoMarker(text) {
+  return String(text).split(UNDO_RECORD_MARKER).join(' ');
+}
+
+/**
+ * set_decision_undone のイベント本文から、消した判断の記録を取り出す (無ければ null)。
+ * 復元の手順をここ 1 箇所に置く — 呼ぶ側で split したり slice したりすると必ずズレる
+ * @returns {{removed: object, previous: object|null, withdrawn: object|null}|null}
+ */
+export function undoRecordOf(detail) {
+  const text = String(detail == null ? '' : detail);
+  const at = text.indexOf(UNDO_RECORD_MARKER);
+  if (at < 0) return null;
+  try { return JSON.parse(text.slice(at + UNDO_RECORD_MARKER.length)); } catch (e) { return null; }
+}
+
+/**
+ * 直前の「セット展開判断」を取り消す (2026-09-07 中原さん:「間違って選択したときに戻せるように」)。
+ *
+ * 履歴は append-only にしていたが、ボードのカードから 1 クリックで判断できるようにすると
+ * **押し間違いが必ず起きる**。押し間違いを消せないと、現場は怖くて押さない = ボードで
+ * 判断できるようにした意味が無くなるので、直前の 1 件だけを消せるようにした。
+ * 何を取り消したかは draft_events に残す (履歴が消えるわけではない)。
+ *
+ * 🚨 「作成」を取り消すときは、作られたセット商品も一緒に取り下げる (status='excluded')。
+ *    判断だけ消してセットのカードが残ると、誰も作ったつもりのないセットがボードに漂う。
+ *    ただし**まだ手つかずのときだけ** — 誰かが進めたセットは消さずに取り消し自体を断る。
+ * 🚨 消したあとの⑤の開け閉めは、**ひとつ前の判断**から決め直す (呼び出し側が closing を見る)。
+ *    「必ず todo に戻す」にすると、作らない → 保留 → 取り消し で todo のままになるべきところが
+ *    合っていても、作らない → 作成 → 取り消し のとき「作らない」に戻ったのに⑤が開いてしまう
+ */
+export function undoSetDecision(db, draftId, actor) {
+  const id = Number(draftId);
+  // draft_id も含めて**行の全列**を退避する (復元するときに元の行をそのまま組み立てられるように)
+  const last = db.prepare(`
+    SELECT id, draft_id, decision, reason_code, reason_text, linked_set_draft_id, decided_by, decided_at
+    FROM draft_set_decisions WHERE draft_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1
+  `).get(id);
+  if (!last) throw badRequest('取り消せる判断がありません (まだ何も決めていません)');
+  const removed = { ...last };
+
+  let withdrawn = null;
+  // 取り下げるのは「作成」で作ったセットだけ。'existing' の紐づけ先は元からあったセットなので触らない
+  if (last.decision === 'create' && last.linked_set_draft_id != null) {
+    const set = db.prepare(`
+      SELECT id, ne_code, name, status, provisional_code, parent_draft_id
+      FROM product_drafts WHERE id = ?
+    `).get(last.linked_set_draft_id);
+    if (set && set.parent_draft_id === id && set.status !== 'excluded') {
+      const why = setDraftTouchedReason(db, set);
+      if (why) {
+        throw badRequest(`作成したセット商品「${set.name}」は${why}ため、この判断は取り消せません`
+          + ' (セット側のカードで対応してください)');
+      }
+      db.prepare(`
+        UPDATE product_drafts SET status = 'excluded', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?
+      `).run(set.id);
+      logEvent(db, set.id, 'set_draft_withdrawn',
+        '親の「セットを作る」判断が取り消されたため取り下げました (除外)', actor);
+      withdrawn = { id: set.id, neCode: set.ne_code, name: set.name };
+    }
+  }
+
+  db.prepare('DELETE FROM draft_set_decisions WHERE id = ?').run(last.id);
+  const prev = latestSetDecision(db, id);
+  // 🚨 消した行の中身をそのまま履歴に残す (2026-09-07 Codex R1/R2)。
+  //    append-only の表から 1 行消す以上、あとから「何を取り消したか」を構造化して
+  //    たどれないと監査にならない。文言だけだと理由コードや紐づけ先が復元できない。
+  //    操作履歴は detail をそのまま人に見せる画面なので、**前半は人が読む文・後半は
+  //    区切り (UNDO_RECORD_MARKER) の後ろに JSON** という形にした。
+  //    復元は「最初の区切りより後ろ全部」を JSON.parse する (undoRecordOf を使う)
+  const human = stripUndoMarker(
+    `判断「${describeSetDecision(last)}」を取り消しました`
+    + (withdrawn ? ` ／ セット ${withdrawn.neCode} を取り下げ` : '')
+    + (prev ? ` (ひとつ前の判断「${describeSetDecision(prev)}」に戻ります)` : ' (未判断に戻ります)'));
+  logEvent(db, id, 'set_decision_undone',
+    human + UNDO_RECORD_MARKER + JSON.stringify({ removed, previous: prev, withdrawn }),
+    actor);
+  return {
+    undone: describeSetDecision(last),
+    prev,
+    withdrawn,
+    // ひとつ前が「作成 / 既存あり / 作らない」なら⑤は閉じたまま、無い・保留なら開け直す
+    closing: !!prev && SET_DECISIONS_CLOSING.includes(prev.decision),
+  };
+}

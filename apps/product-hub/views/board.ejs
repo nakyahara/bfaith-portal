@@ -126,6 +126,30 @@
   .kb-state.off { background: #f1f5f9; color: #94a3b8; border-color: #e2e8f0; }
   .kb-klabel { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
   .kb-kstall { flex: 0 0 auto; color: #b91c1c; font-weight: 700; }
+  /* セットを「作る／作らない」をカードから決める (2026-09-07 中原さん要望)。
+     リンクの外に置くので、押しても詳細画面へ飛ばない (楽天出品ボタンと同じ扱い) */
+  .kb-set { margin-top: 6px; padding-top: 6px; border-top: 1px dashed #e2e8f0;
+            display: flex; align-items: center; gap: 5px; flex-wrap: wrap; font-size: 11px; }
+  .kb-set-chip { border-radius: 999px; padding: 2px 8px; font-weight: 700; border: 1px solid; }
+  /* まだ決めていない = 赤。詳細画面の札と同じ色分けにする (画面ごとに色が違うと読み替えが要る) */
+  .kb-set-chip.none-yet { background: #fee2e2; color: #b91c1c; border-color: #fca5a5; }
+  .kb-set-chip.create, .kb-set-chip.existing { background: #dcfce7; color: #166534; border-color: #86efac; }
+  .kb-set-chip.none { background: #e2e8f0; color: #475569; border-color: #cbd5e1; }
+  .kb-set-chip.hold { background: #fef3c7; color: #92400e; border-color: #fcd34d; }
+  .kb-set-btn { font-size: 11px; font-weight: 700; border-radius: 6px; padding: 3px 9px;
+                border: 1px solid #cbd5e1; background: #fff; color: #334155; cursor: pointer; }
+  .kb-set-btn:hover { background: #f1f5f9; }
+  .kb-set-btn.make { border-color: #2563eb; color: #1d4ed8; }
+  .kb-set-btn.undo { border-color: #cbd5e1; color: #64748b; }
+  .kb-set-btn:disabled { opacity: .5; cursor: default; }
+  .kb-set-note { color: #94a3b8; }
+  /* 「作らない／保留」の理由を聞く小さなダイアログ (カードごとに欄を置くと列が読めなくなる) */
+  .kb-modal { position: fixed; inset: 0; background: rgba(15,23,42,.45); z-index: 1000; display: none; }
+  .kb-modal-box { background: #fff; max-width: 420px; margin: 14vh auto; border-radius: 12px;
+                  padding: 16px 18px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+  .kb-modal-box select, .kb-modal-box input[type="text"] {
+    width: 100%; box-sizing: border-box; padding: 6px 8px; font-size: 13px;
+    border: 1px solid #cbd5e1; border-radius: 6px; }
 </style>
 
 <%
@@ -364,10 +388,6 @@
                 <% } %>
                 <% if (c.set.parentChanged) { %><div class="kb-parent-changed">親が更新されています</div><% } %>
               <% } %>
-              <%# ⑤の判断 (作らない・保留)。何も決めていないカードと区別する %>
-              <% if (!c.isSet && c.setDecision && c.setDecision.decision !== 'create') { %>
-                <div class="kb-tags"><span class="kb-tag decision">判断: <%= c.setDecision.label %></span></div>
-              <% } %>
               <div class="kb-card-top">
                 <% if (c.first_image_id) { %>
                   <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
@@ -434,6 +454,10 @@
                 <div class="kb-progress"><i style="width:<%= c.totalCount ? Math.round(c.doneCount / c.totalCount * 100) : 0 %>%"></i></div>
               <% } %>
             </a>
+            <%# セットを「作る／作らない」をカードから決める (2026-09-07 中原さん要望)。
+                中身は _card-set-decision.ejs (完了列のカードからも同じものを include している —
+                判断が済むとカードは列を移るので、片方にしか置かないと取り消せなくなる) %>
+            <% if (boardView !== 'image') { %><%- include('_card-set-decision', { c, colCode: col.code || col.key || '', me, isAdmin }) %><% } %>
             <% if (boardView !== 'image' && c.malls && col.code === 'listing') { %>
               <%# 楽天への出品 (2026-09-01 中原さん要望)。リンクの外に置く (押して詳細に飛ばない)。
                   出品済み = 商品ページへのリンク / 失敗 = 理由 + やり直し / 未出品 = 出品ボタン。
@@ -558,6 +582,10 @@
               <% } %>
             </div>
           </a>
+          <%# 完了列のカードでも判断を取り消せるようにする (2026-09-07 Codex R1)。
+              判断が済むとカードは列を移り、やがてここに来る — 通常の列にしか置かないと
+              「どの列でも取り消せる」がここで途切れる。列コードは 'done' なので判断ボタンは出ない %>
+          <% if (boardView !== 'image') { %><%- include('_card-set-decision', { c, colCode: 'done', me, isAdmin }) %><% } %>
           <% if (boardView === 'image') { %>
             <% const prd = imagePriorities.find((p) => p.value === c.image_priority) || null; %>
             <select class="kb-priority" data-draft="<%= c.id %>"
@@ -583,6 +611,43 @@
     <% } %>
     保留・除外にした商品はこのボードには出ません（<a href="/apps/product-hub/list">一覧</a>で確認できます）。
   </p>
+</div>
+
+<%# 「作らない」の理由 / 「保留」のメモを聞く小さなダイアログ (2026-09-07)。
+    カードごとに入力欄を置くとカードが縦に伸びて列が読めなくなるので、1 枚を使い回す。
+    理由の選択肢は詳細画面と同じ辞書 (setDecionReasons) から出す — 画面ごとに言葉が違うと
+    「送料負け」と「単価が低い」が別の理由に見える %>
+<div id="kb-setdec" class="kb-modal">
+  <div class="kb-modal-box">
+    <div style="display:flex; align-items:center;">
+      <strong id="kb-setdec-title" style="font-size:14px;">セットは作らない</strong>
+      <span style="flex:1"></span>
+      <button type="button" class="kb-set-btn" id="kb-setdec-close">✕</button>
+    </div>
+    <div class="muted" id="kb-setdec-name" style="font-size:12px;"></div>
+    <div id="kb-setdec-none">
+      <label style="font-size:12px; font-weight:600;">作らない理由</label>
+      <select id="kb-setdec-reason">
+        <% for (const [code, label] of Object.entries(setDecisionReasons)) { %>
+          <option value="<%= code %>"><%= label %></option>
+        <% } %>
+      </select>
+      <input type="text" id="kb-setdec-reason-text" maxlength="200" hidden
+             placeholder="「その他」を選んだときは一言" style="margin-top:6px;">
+    </div>
+    <div id="kb-setdec-hold" hidden>
+      <label style="font-size:12px; font-weight:600;">メモ <span class="muted">(任意)</span></label>
+      <input type="text" id="kb-setdec-hold-note" maxlength="200" placeholder="例: 売れ行きを見てから">
+      <p class="muted" style="margin:6px 0 0; font-size:11.5px;">
+        保留にすると工程「セット商品作成検討」は<strong>開いたまま</strong>で、何日待っているかを数え続けます。
+      </p>
+    </div>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <button type="button" class="kb-set-btn make" id="kb-setdec-apply" style="padding:6px 14px;">この判断で記録</button>
+      <button type="button" class="kb-set-btn" id="kb-setdec-cancel" style="padding:6px 14px;">キャンセル</button>
+      <span class="muted" id="kb-setdec-result" style="font-size:11.5px;"></span>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -716,6 +781,131 @@
       if (ran) location.reload(); else btn.disabled = false;
     });
   });
+
+  // ─── セットを「作る／作らない」をカードから決める (2026-09-07 中原さん要望) ───
+  // 詳細画面を開かずに⑤の列を流せるようにする。押し間違いは「↩ 取り消す」で戻せる
+  // (戻せないと現場は怖くて押さない = カードから決められるようにした意味が無くなる)。
+  // 判断は⑤に対する操作なので、カードが持っている版数 (data-version) を必ず添えて送る。
+  // 版数がズレていたら 409 が返る → 読み直してもらう
+  (function initSetDecision() {
+    const modal = document.getElementById('kb-setdec');
+    if (!modal) return;
+    const $ = (id) => document.getElementById(id);
+    // いま開いているダイアログの対象 (カードの .kb-set と、none / hold のどちらか)
+    let target = null;
+
+    // 🚨 通信エラーも「失敗」として返す (2026-09-07 Codex R1)。reject を投げると
+    //    未処理例外になり、ボタンが disabled・「記録しています…」のまま操作不能になる
+    function post(url, body) {
+      return fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      })
+        .then((res) => res.json().catch(() => ({ ok: false, error: 'HTTP ' + res.status + ' (応答が読めませんでした)' })))
+        .catch((err) => ({ ok: false, error: '通信エラー: ' + err.message }));
+    }
+    // カードが持っている「⑤の版数」と「未割り当てなら引き受ける」フラグ
+    function ctxOf(box) {
+      return {
+        expected_version: box.dataset.version === '' ? null : Number(box.dataset.version),
+        claim: box.dataset.claim === '1',
+      };
+    }
+
+    function openModal(box, mode) {
+      target = { box: box, mode: mode };
+      $('kb-setdec-title').textContent = mode === 'hold' ? '⏸ 保留にする' : '🚫 セットは作らない';
+      $('kb-setdec-name').textContent = box.dataset.name || '';
+      $('kb-setdec-none').hidden = mode !== 'none';
+      $('kb-setdec-hold').hidden = mode !== 'hold';
+      $('kb-setdec-result').textContent = '';
+      $('kb-setdec-apply').disabled = false;
+      // 🚨 1 枚を使い回すので、開くたびに入力を白紙に戻す (2026-09-07 Codex R1)。
+      //    残したままだと、別のカードに書いたメモ・理由がそのまま次のカードに記録される
+      $('kb-setdec-reason').selectedIndex = 0;
+      $('kb-setdec-reason-text').value = '';
+      $('kb-setdec-reason-text').hidden = $('kb-setdec-reason').value !== 'other';
+      $('kb-setdec-hold-note').value = '';
+      modal.style.display = 'block';
+    }
+    function closeModal() { modal.style.display = 'none'; target = null; }
+    ['kb-setdec-close', 'kb-setdec-cancel'].forEach((id) => $(id).addEventListener('click', closeModal));
+    modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+    // 「その他」を選んだときだけ一言を書いてもらう (サーバー側も必須で弾く)
+    $('kb-setdec-reason').addEventListener('change', function () {
+      $('kb-setdec-reason-text').hidden = this.value !== 'other';
+    });
+
+    $('kb-setdec-apply').addEventListener('click', async function () {
+      if (!target) return;
+      const body = Object.assign({ decision: target.mode }, ctxOf(target.box));
+      if (target.mode === 'none') {
+        body.reason_code = $('kb-setdec-reason').value;
+        body.reason_text = $('kb-setdec-reason-text').value.trim();
+        if (body.reason_code === 'other' && !body.reason_text) {
+          $('kb-setdec-result').textContent = '「その他」を選んだときは理由を書いてください';
+          return;
+        }
+      } else {
+        body.reason_text = $('kb-setdec-hold-note').value.trim();
+      }
+      this.disabled = true;
+      $('kb-setdec-result').textContent = '記録しています…';
+      const j = await post('/apps/product-hub/api/drafts/' + target.box.dataset.draft + '/set-decision', body);
+      if (j.ok) { location.reload(); return; }
+      this.disabled = false;
+      $('kb-setdec-result').textContent = j.error || '記録できませんでした';
+    });
+
+    document.querySelectorAll('.kb-set .kb-set-btn').forEach(function (btn) {
+      // ボタン操作でカードのドラッグが始まらないようにする (楽天出品ボタンと同じ扱い)
+      btn.addEventListener('mousedown', function () { btn.closest('.kb-card')?.setAttribute('draggable', 'false'); });
+      ['mouseup', 'mouseleave', 'blur'].forEach(function (ev) {
+        btn.addEventListener(ev, function () { btn.closest('.kb-card')?.setAttribute('draggable', 'true'); });
+      });
+      btn.addEventListener('click', async function (e) {
+        e.preventDefault();
+        const box = btn.closest('.kb-set');
+        const act = btn.dataset.act;
+        const name = box.dataset.name || 'この商品';
+        if (act === 'none' || act === 'hold') { openModal(box, act); return; }
+
+        if (act === 'create') {
+          // 中身は「この商品 × 2」で作る (いちばん多い形。詳細画面の初期値と同じ)。
+          // 構成を変えたいときは作成後に詳細画面で直す — カードに入力欄を置くと列が読めなくなる
+          if (!confirm('「' + name + '」のセット商品を作りますか?\n\n'
+            + '・中身は「この商品 × 2」で作ります (構成・名前は作成後に詳細画面で直せます)\n'
+            + '・商品コードは仮コードです (NE に登録して本コードに差し替えるまで出品できません)\n'
+            + '・単品の出品は止まりません\n\n'
+            + '※ 押し間違えたら、このカードの「↩ 取り消す」で取り下げられます')) return;
+          btn.disabled = true;
+          const ctx = ctxOf(box);
+          // 親の⑤は作成と同時に閉じるので、版数は parent_step_version という名前で送る
+          const j = await post('/apps/product-hub/api/drafts/' + box.dataset.draft + '/set-drafts',
+            { mode: 'copy', claim: ctx.claim, parent_step_version: ctx.expected_version });
+          if (j.ok) { location.reload(); return; }
+          btn.disabled = false;
+          alert('セット商品を作れませんでした\n\n' + (j.error || ''));
+          return;
+        }
+
+        if (act === 'undo') {
+          if (!confirm('「' + name + '」のセット判断「' + (box.dataset.decision || '') + '」を取り消しますか?\n\n'
+            + '・ひとつ前の判断 (無ければ「まだ決めていません」) に戻ります\n'
+            + '・「セットを作成」を取り消すときは、まだ手つかずのセット商品も一緒に取り下げます\n'
+            + '  (誰かが進めているセットがある場合は取り消せません)')) return;
+          btn.disabled = true;
+          const j = await post('/apps/product-hub/api/drafts/' + box.dataset.draft + '/set-decision/undo', ctxOf(box));
+          if (j.ok) {
+            if (j.withdrawn) alert('判断を取り消し、セット商品「' + j.withdrawn.name + '」(' + j.withdrawn.neCode + ') を取り下げました');
+            location.reload();
+            return;
+          }
+          btn.disabled = false;
+          alert('取り消せませんでした\n\n' + (j.error || ''));
+        }
+      });
+    });
+  })();
 
   // ─── カードの D&D: 列をまたぐと工程が動き、同じ列の中なら並び順が変わる ───
   // (2026-08-28 中原さん要望: 動かしたカードの順番を自由に決めたい。
