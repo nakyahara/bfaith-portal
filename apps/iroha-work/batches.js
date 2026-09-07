@@ -293,6 +293,12 @@ export function recordStockingForTask(db, taskId, opts = {}) {
  * 呼ぶのは**行き先が 1 つに決まる操作だけ** — 終了 (全部 done か cancelled) と、
  * 終了からのやり直し (全部 作業中に戻す)。
  * 「作り終えた」を全まとまりに広げるようなことはしない (どのぶんが終わったのかが決まらない)。
+ *
+ * ⭐**やり直し (作業中に戻す) では、取消になっていたまとまりも戻す**。
+ *   カードごと取消にしたときに全まとまりを取消にしているので、戻さないと
+ *   「カードは作業中なのに、作業できるまとまりが 1 つも無い」= 数も入れられない状態になる。
+ *   ただし**預けをやめて数を元に戻したまとまり (split_created の預けが取消)** は戻さない —
+ *   そのぶんの数はもう別のまとまりに足してあるので、戻すと二重になる。
  * ⚠必ずカードを更新したのと同じトランザクションの中で。
  *
  * @returns {number} 直した行数
@@ -300,10 +306,18 @@ export function recordStockingForTask(db, taskId, opts = {}) {
 export function syncAllBatchesStatus(db, taskId, task) {
   const want = batchStatusOfTask(task);
   if (!['done', 'cancelled', 'in_progress'].includes(want)) return 0;
-  // 取消したまとまりは触らない (もう無かったことにしたぶん)
+  const now = new Date().toISOString();
+  if (want === 'in_progress') {
+    return db.prepare(`UPDATE f_iroha_task_batches SET work_status = 'in_progress', version = version + 1, updated_at = ?
+      WHERE task_id = ? AND work_status <> 'in_progress'
+        AND NOT EXISTS (SELECT 1 FROM f_iroha_consignments c
+          WHERE c.batch_id = f_iroha_task_batches.id AND c.split_created = 1 AND c.state = 'cancelled')`)
+      .run(now, taskId).changes;
+  }
+  // 終了へ: 取消したまとまりは触らない (もう無かったことにしたぶん)
   return db.prepare(`UPDATE f_iroha_task_batches SET work_status = ?, version = version + 1, updated_at = ?
     WHERE task_id = ? AND work_status <> 'cancelled' AND work_status <> ?`)
-    .run(want, new Date().toISOString(), taskId, want).changes;
+    .run(want, now, taskId, want).changes;
 }
 
 /**
@@ -350,6 +364,9 @@ export function applyDerivedTaskStatus(db, taskId, now = new Date().toISOString(
   let d = deriveTaskStatus(db, taskId);
   if (!d || d === 'done') return 0;
   if (d === 'ready_for_stocking' && t.blocked_reason) d = 'in_progress';
+  // ⭐一度はじめたカードを「未着手」へ戻さない (Codex R1 中2)。
+  //   預けをやめた拍子に、作業している人がいるのに未着手に見える — が起きる
+  if (d === 'not_started' && t.started_at) return 0;
   if (d === t.status) return 0;
   const toReady = d === 'ready_for_stocking';
   return db.prepare(`UPDATE f_iroha_tasks SET status = ?, started_at = ?, ready_at = ?, updated_at = ?, updated_by = ?

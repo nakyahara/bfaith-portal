@@ -3821,6 +3821,10 @@ function batchRowHtml(c, b) {
   } else if (b.work_status === 'ready_for_stocking' && stateCan('tasks.bulk_stocked') && isStaffUI()) {
     btn = '<button class="btn primary" data-bstock="' + esc(b.id) + '">✅ このぶんを棚入完了</button>';
   }
+  // ⭐職員は「そのぶんだけやり直す」ことができる (数え間違い・手直し)。カードごと戻すと他のぶんまで巻き込む
+  const redo = (b.work_status === 'ready_for_stocking' || b.work_status === 'done') && !b.consigned_out
+    && stateCan('tasks.bulk_stocked') && isStaffUI()
+    ? '<button class="btn" data-bredo="' + esc(b.id) + '">↩ このぶんをやり直す</button>' : '';
   return '<div class="brow">' +
     '<div class="bh"><b>' + esc(facilityName(fac) || '未定') + '</b>' +
       '<span class="st ro ' + stClass(b.work_status === 'done' ? 'closed' : b.work_status) + '">' +
@@ -3829,7 +3833,7 @@ function batchRowHtml(c, b) {
     '<div class="m num">' + esc(nums) + '</div>' +
     (b.variance_note ? '<div class="m">📝 ' + esc(b.variance_note) + '</div>' : '') +
     (b.consigned_out ? '<div class="m">外にあるぶんです。返却を受け取ると「棚入待ち」になります。</div>' : '') +
-    (btn ? '<div class="bfoot">' + btn + '</div>' : '') +
+    (btn || redo ? '<div class="bfoot">' + btn + redo + '</div>' : '') +
     '</div>';
 }
 // まとまりごとの「作り終えた」「棚入完了」
@@ -3837,8 +3841,42 @@ document.addEventListener('click', (e) => {
   const d = e.target.closest('[data-bdone]');
   if (d) { const c = findCard(curDetail); if (c) openDone(c, Number(d.dataset.bdone)); return; }
   const k = e.target.closest('[data-bstock]');
-  if (k) { stockBatch(Number(k.dataset.bstock)); }
+  if (k) { stockBatch(Number(k.dataset.bstock)); return; }
+  const rd = e.target.closest('[data-bredo]');
+  if (rd) { redoBatch(Number(rd.dataset.bredo)); }
 });
+/** ⭐そのぶんだけ作業中に戻す (数え間違い・手直し)。職員だけ。他のぶんは巻き込まない */
+async function redoBatch(batchId) {
+  const c = findCard(curDetail);
+  if (!c || !stateCan('tasks.bulk_stocked')) return;
+  const b = (c.batches || []).find((x) => sameId(x.id, batchId));
+  if (!b) return;
+  const w = worker;
+  if (!w) { openGate(); return; }
+  if (!state.me.session && w.worker_type !== 'staff') { toast('やり直せるのは職員だけです (右上の名前を職員に替えてください)'); return; }
+  const okGo = await ask({
+    title: facilityName(b.facility_code || c.facility_code) + ' のぶんを作業中に戻しますか?',
+    text: 'そのぶんだけ作業中に戻します。できた数は残るので、直してから もう一度「作り終えた」を押してください。'
+      + (b.work_status === 'done' ? '棚に入れた記録はそのまま残ります。' : ''),
+    ok: 'はい、作業中に戻す', cancel: 'やめる',
+  });
+  if (!okGo) return;
+  let pin = null;
+  if (!state.me.session) {
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '作業中に戻す' });
+    if (pin == null) return;
+  }
+  const j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, to: 'in_progress', batch_id: b.id, worker_id: w.id, pin, expect_version: c.version }) });
+  if (!j.ok) { showErr(j.message || '戻せませんでした'); return; }
+  applyTask(c, j.task);
+  c.status = j.status;
+  if (j.status_label) c.status_label = j.status_label;
+  toast('このぶんを作業中に戻しました');
+  renderTabs(); renderList();
+  if (curView === 'board') renderBoard();
+  openDetail(c.id);
+}
 /** ⭐そのまとまりだけを棚入完了にする。他のぶん (外にあずけ中) はそのまま残る */
 async function stockBatch(batchId) {
   const c = findCard(curDetail);

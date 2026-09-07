@@ -5947,6 +5947,35 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
       '⭐カードを取消にしたら、まとまりも取消になる (カードだけ閉じて中身が残らない)');
     const back = TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v(t), isStaff: true, reason: '数え直す', actor: 'たにがわ' });
     ok(back.ok, 'やり直しできる');
+    ok(bs(t).length >= 1, '⭐やり直したら、作業できるまとまりが戻る (0 個になると数も入れられない — Codex R1 重大1)');
+    ok(B.deriveTaskStatus(db, t) === 'in_progress', 'まとまりから導いた進捗も作業中');
+    // ⭐預けをやめて数を元に戻したまとまりは、戻さない (数が二重になる)
+    const revived = B.listBatchesOfTask(db, t).filter((b) => b.work_status === 'in_progress');
+    const total = revived.reduce((a, b) => a + (b.planned_qty ?? 0), 0);
+    ok(total === 300, '⭐戻ったのは 300 個ぶん (預けをやめて数を戻したまとまりは復活させない)');
+  }
+
+  // ④b ⭐まとまりが 1 つのカードも、取消 → やり直しでまとまりが戻る (本番の全カードがこの形)
+  {
+    const t = mk('bp-4b', 9989, 120);
+    const b0 = bs(t)[0];
+    TD.changeTaskStatus({ taskId: t, to: 'closed', closeReason: 'cancelled', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(ws(b0.id) === 'cancelled', '取消でまとまりも取消に');
+    TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v(t), isStaff: true, reason: 'やっぱりやる', actor: 'たにがわ' });
+    ok(ws(b0.id) === 'in_progress' && bs(t).length === 1, '⭐やり直しでまとまりも戻る');
+    ok(TD.setProgress({ taskId: t, expectVersion: v(t), doneQty: 100 }).ok, '戻ったので数も入れられる');
+    ok(TD.getTask(t).done_qty === 100, 'まとまりに入った数がカードにも出る');
+  }
+
+  // ④c ⭐一度はじめたカードを、預けをやめた拍子に「未着手」へ戻さない (Codex R1 中2)
+  {
+    const t = mk('bp-4c', 9990, 200);
+    const b0 = bs(t)[0];
+    TD.changeTaskStatus({ taskId: t, to: 'in_progress', expectVersion: v(t) });
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 50, expectVersion: v(t) });
+    const c0 = C.getConsignment(cg.consignment.id);
+    C.cancelConsignment({ consignmentId: c0.id, expectVersion: c0.version });
+    ok(TD.getTask(t).status === 'in_progress', '⭐預けをやめても、作業中のカードが未着手に戻らない');
   }
 
   // ⑤ 終了したカードのまとまりは動かせない / 知らないまとまりは指せない
@@ -6018,6 +6047,11 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
     && /\.\.\.\(doneBatch \? \{ batch_id: doneBatch \} : \{\}\)/.test(html),
     '⭐「作り終えた」はどのまとまりかを添えて送る');
   ok(/close_reason: 'stocked', batch_id: b\.id/.test(html), 'まとまりの棚入完了は batch_id つきで送る');
+  ok(/data-bredo="/.test(html) && /async function redoBatch\(batchId\)/.test(html)
+    && /to: 'in_progress', batch_id: b\.id/.test(html),
+    '⭐そのぶんだけ「やり直す」入口がある (カードごと戻すと他のぶんまで巻き込む — Codex R1 中3)');
+  ok(/\(b\.work_status === 'ready_for_stocking' \|\| b\.work_status === 'done'\) && !b\.consigned_out\s*\r?\n\s*&& stateCan\('tasks\.bulk_stocked'\) && isStaffUI\(\)/.test(html),
+    'やり直しは職員モードのときだけ・外にあるぶんには出さない');
   ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
   const sw2 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
   ok(/const CACHE = 'iroha-work-shell-v14'/.test(sw2), '画面キャッシュの版を上げる');
