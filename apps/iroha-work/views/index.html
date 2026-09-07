@@ -1147,6 +1147,13 @@ let curDetail = null;      // 開いている詳細のカード id (Notion 正�
 /** カード id の比較。onclick の引数を経ると数値も文字列になるので、厳密比較せず文字列にそろえて比べる (Codex A1b R1 #1) */
 const sameId = (a, b) => a != null && b != null && String(a) === String(b);
 const findCard = (id) => state.cards.find(x => sameId(x.id, id)) || null;
+/**
+ * ⭐画面に並べる行 (要件 §AB-11 の 5b)。まとまりが 2 つ以上のカードは、いろはのぶん・
+ * ワークセンターのぶんが 1 行ずつになる。ふだん (まとまり 1 つ) は今までどおり 1 行。
+ * ⚠カードを指すとき (詳細・写真・作業時間) は今までどおり findCard(row.id)。
+ * 下見 (Notion 正本) は rows を返さないので cards をそのまま使う
+ */
+const rowsOf = (st) => ((st || {}).rows || (st || {}).cards || []);
 // ─── 詳細の文脈: どこから開いたか (state = 一覧・ボード / preview = 下見・履歴) と、許された操作 ───
 // 画面はサーバーが返した capabilities にある操作だけ描く (default-deny)。「描いてから隠す」はしない (要件 v1.3 §P Q5)
 let detailSrc = null;        // 'state' | 'preview'
@@ -1442,7 +1449,7 @@ const facilityName = (code) => ((state.facilities || []).find(f => f.code === co
 function renderSync() {
   const rf = state.refresh || {};
   let txt = isApp()
-    ? state.cards.length + ' 件'
+    ? rowsOf(state).length + ' 件'
     : fmtTime(rf.lastRefreshAt) + ' に取得 · ' + state.cards.length + ' 件 (状態の札をタップで変更。Notionにも反映)';
   $('#syncTxt').textContent = txt;
   if (rf.error) showErr('Notionから最新を取得できませんでした (前回取得分を表示しています)', rf.error);
@@ -1456,9 +1463,11 @@ function statusTabs() {
 }
 
 function counts() {
-  const c = { all: state.cards.length, blocked: 0, today: 0 };
+  // ⭐数えるのは**並んでいる行**。まとまりが 2 つ以上のカードは 2 行なので、札の数と一覧の数が合う
+  const rows = rowsOf(state);
+  const c = { all: rows.length, blocked: 0, today: 0 };
   for (const [v] of statusTabs()) c[v] = 0;
-  for (const card of state.cards) {
+  for (const card of rows) {
     if (c[card.status] != null) c[card.status]++;
     if (card.blocked) c.blocked++;   // ⛔ 止まっている (進捗とは別の札 — 案A)
     if (card.today) c.today++;       // 📌 今日やる (監修 F-6)
@@ -1510,7 +1519,7 @@ function rowTags(c, opts) {
 
 function visibleCards() {
   const q = $('#q').value.trim().toLowerCase();
-  return state.cards.filter(c => {
+  return rowsOf(state).filter(c => {
     if (curTab === 'blocked') { if (!c.blocked) return false; }
     else if (curTab === 'unblocked') { if (c.blocked) return false; }
     else if (curTab === 'today') { if (!c.today) return false; }
@@ -1564,9 +1573,12 @@ function renderList() {
       c.expiry ? '📅 期限 ' + esc(c.expiry) : null,
     ].filter(Boolean).join(' ・ ');
     const tags = rowTags(c, { short: true });
-    const selectable = bulkIds && c.status === 'ready_for_stocking';
+    // ⭐分かれた行は「まとめて棚入完了」で選べない (どのぶんかを決めずにカードごと閉じてしまうため)。
+    //   その行の「✅ 棚入完了」は そのまとまりだけを閉じる
+    const selectable = bulkIds && c.status === 'ready_for_stocking' && !c.split;
     const sel = selectable && bulkIds.has(c.id);
-    return '<div class="row' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+    return '<div class="row' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' +
+      (c.split ? ' data-batch="' + esc(c.batch_id) + '"' : '') + (selectable ? ' data-pick="1"' : '') + '>' +
       (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
       '<div class="thumb">' + thumbHtml(c) + '</div>' +
       '<div class="bd"><h2>' + esc(c.title) + '</h2>' + (tags ? '<div class="rtags">' + tags + '</div>' : '') +
@@ -1575,7 +1587,7 @@ function renderList() {
       // 状態: 変更が許されていればタップできる札 (data-st)、許されていなければただの札
       (selectable ? '' : stockBtnHtml(c)) +
       (selectable ? ''
-        : stateCan('task.status.change')
+        : stateCan('task.status.change') && !c.split
           ? '<button class="st ' + stClass(c.status) + '" data-st="' + esc(c.id) + '">' + esc(stLabel(c)) + ' ▾</button>'
           : '<span class="st ro ' + stClass(c.status) + '">' + esc(stLabel(c)) + '</span>') +
       '<span class="chev">' + (selectable ? '' : '›') + '</span></div>';
@@ -1587,7 +1599,12 @@ $('#q').addEventListener('input', renderList);
 // 一覧のクリックも委譲 (状態の札 / 選択 / 詳細)
 $('#list').addEventListener('click', (e) => {
   const stockBtn = e.target.closest('[data-stock-of]');
-  if (stockBtn) { e.stopPropagation(); stockOne(stockBtn.dataset.stockOf); return; }   // ✅ 1 枚だけ棚入完了
+  if (stockBtn) {   // ✅ 1 枚だけ棚入完了 (分かれた行はそのぶんだけ)
+    e.stopPropagation();
+    if (stockBtn.dataset.stockBatch) stockBatchOf(stockBtn.dataset.stockOf, Number(stockBtn.dataset.stockBatch));
+    else stockOne(stockBtn.dataset.stockOf);
+    return;
+  }
   const st = e.target.closest('[data-st]');
   if (st) { e.stopPropagation(); openSt(e, st.dataset.st); return; }
   const row = e.target.closest('[data-id]');
@@ -1763,7 +1780,8 @@ function colSegHtml() {
 /** 進捗の絞り込み (列が 拠点・いつ のとき)。未着手 / 作業中 / 棚入待ち */
 function statusChips() {
   const st = boardState() || { cards: [], statuses: [] };
-  const n = (v) => (v === 'all' ? st.cards.length : st.cards.filter(c => c.status === v).length);
+  const rs = rowsOf(st);
+  const n = (v) => (v === 'all' ? rs.length : rs.filter(c => c.status === v).length);
   return [['all', 'すべて'], ...(st.statuses || []).map(s => [s.value, s.label])]
     .map(([v, l]) => '<button class="chip' + (curStatus === v ? ' on' : '') + '" data-st-filter="' + esc(v) + '">' + esc(l) + ' <span class="num">' + n(v) + '</span></button>').join('');
 }
@@ -1774,7 +1792,7 @@ $('#stChips').addEventListener('click', (e) => {
   renderBoard();
 });
 function whenChips() {
-  const cards = ((boardState() || {}).cards || []);
+  const cards = rowsOf(boardState());
   const n = (v) => (v === 'all' ? cards.length : v === 'none' ? cards.filter(c => !c.when).length
     : v === 'blocked' ? cards.filter(c => c.blocked).length : v === 'unblocked' ? cards.filter(c => !c.blocked).length
     : cards.filter(c => c.when === v).length);
@@ -1794,10 +1812,11 @@ function whenChips() {
 function facChips() {
   const st = boardState() || { cards: [], facilities: [] };
   const facs = st.facilities || [];
-  const counts = { all: st.cards.length };
-  for (const c of st.cards) counts[c.facility_code] = (counts[c.facility_code] || 0) + 1;
+  const rs = rowsOf(st);
+  const counts = { all: rs.length };
+  for (const c of rs) counts[c.facility_code] = (counts[c.facility_code] || 0) + 1;
   // 値は data 属性で渡す (onclick に文字列を埋めない — HTML エスケープは JS 文字列のエスケープではない。Codex PR-C R1)
-  counts.none = st.cards.filter(c => !c.facility_code).length;
+  counts.none = rs.filter(c => !c.facility_code).length;
   const one = (v, label) => '<button class="chip' + (curFacility === v ? ' on' : '') + '" data-fac="' + esc(v) + '">' +
     esc(label) + ' <span class="num">' + (counts[v] || 0) + '</span></button>';
   // 「未定」= どこが作業するか決まっていないカード (要件 §W-2)
@@ -1847,7 +1866,12 @@ $('#board').addEventListener('click', (e) => {
   const whenBtn = e.target.closest('[data-when-of]');
   if (whenBtn) { e.stopPropagation(); openWhenPick(whenBtn.dataset.whenOf); return; }   // 今日 / 明日 / 未定 から選ぶ
   const stockBtn = e.target.closest('[data-stock-of]');
-  if (stockBtn) { e.stopPropagation(); stockOne(stockBtn.dataset.stockOf); return; }   // ✅ 1 枚だけ棚入完了
+  if (stockBtn) {   // ✅ 1 枚だけ棚入完了 (分かれた行はそのぶんだけ)
+    e.stopPropagation();
+    if (stockBtn.dataset.stockBatch) stockBatchOf(stockBtn.dataset.stockOf, Number(stockBtn.dataset.stockBatch));
+    else stockOne(stockBtn.dataset.stockOf);
+    return;
+  }
   const printBtn = e.target.closest('[data-print-of]');
   if (printBtn) { e.stopPropagation(); openPrintBox(printBtn.dataset.printOf); return; }   // 🏷 保管箱ラベル (ボードからも出せる — 中原さん 2026-09-06)
   const el = e.target.closest('[data-id]');
@@ -1868,7 +1892,7 @@ $('#histBody').addEventListener('click', (e) => {
 });
 function boardCards() {
   const q = ($('#bq').value || '').trim().toLowerCase();
-  return ((boardState() || {}).cards || []).filter(c => {
+  return rowsOf(boardState()).filter(c => {
     if (curFacility !== 'all' && (curFacility === 'none' ? !!c.facility_code : c.facility_code !== curFacility)) return false;
     if (curStatus !== 'all' && c.status !== curStatus) return false;   // 進捗の絞り込み (列が進捗以外のとき — 中原さん 2026-09-06)
     // 「⛔ 止まっている」は予定の値ではなく札の絞り込み (案A)
@@ -1943,12 +1967,19 @@ function gripHtml() { return '<span class="grip" data-grip aria-hidden="true">�
 /** 棚入待ちのカードに「✅ 棚入完了」(職員モードだけ。まとめて選んでいる間は出さない) — 中原さん 2026-09-05 */
 function stockBtnHtml(c) {
   if (c.status !== 'ready_for_stocking' || bulkIds || !isApp() || !stateCan('tasks.bulk_stocked') || !isStaffUI()) return '';
+  // ⭐分かれた行は**そのぶんだけ**棚入完了にする (他のぶん = 外にあずけ中 はそのまま残る)
+  if (c.split) {
+    return '<button class="stockbtn" data-stock-of="' + esc(c.id) + '" data-stock-batch="' + esc(c.batch_id) + '">✅ 棚入完了</button>';
+  }
   return '<button class="stockbtn" data-stock-of="' + esc(c.id) + '">✅ 棚入完了</button>';
 }
 function bcardHtml(c, status) {
-  const selectable = bulkIds && status === 'ready_for_stocking';
+  const selectable = bulkIds && status === 'ready_for_stocking' && !c.split;
   // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
-  const grab = isApp() && !bulkIds && (boardCols === 'fac' ? stateCan('task.facility.assign') : boardCols === 'when' ? stateCan('task.plan.assign') : stateCan('task.status.change'));
+  // ⭐分かれた行は掴めない。動かして変わるのはカードのこと (どこが・いつ・進捗) なので、
+  //   どのぶんを動かしたのかが決まらない (要件 §U-7: 押せないものは描かない)
+  const grab = isApp() && !bulkIds && !c.split
+    && (boardCols === 'fac' ? stateCan('task.facility.assign') : boardCols === 'when' ? stateCan('task.plan.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
   const meta = [c.qty != null ? c.qty + ' 個' : null,
     c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
@@ -1957,11 +1988,14 @@ function bcardHtml(c, status) {
     c.plan_hours != null ? '⏱ ' + approxHours(c.plan_hours) : null,
     c.external_ready ? '📦 外部に出せます' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
+    c.split && c.away ? '🚚 ' + (c.away.handed ? 'あずけ中 ' : '渡す予定 ') + c.away.qty + ' 個'
+      + (c.away.due ? ' ' + fmtMd(c.away.due) + 'まで' : '') : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
   // ⭐2 段に分ける。上 = 画像と文字、下 = 札とボタン。
   //   下の段は**カードの幅いっぱい**を使う (画像の右に押し込むと 1 つずつ行を使ってカードが縦に伸び、
   //   画像の下は空いたままになる — 中原さん 2026-09-07「表示する情報は変えずに縦を短く」)
-  return '<div class="bcard' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+  return '<div class="bcard' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' +
+    (c.split ? ' data-batch="' + esc(c.batch_id) + '"' : '') + (selectable ? ' data-pick="1"' : '') + '>' +
     '<div class="btop">' +
     (grab ? gripHtml() : '') +
     (c.image_url ? '<div class="th">' + thumbHtml(c) + '</div>' : '') +   // 📦 の空枠は幅を取るだけなので、写真があるカードだけ (監修)
@@ -2075,11 +2109,18 @@ function redrawAfterPlan() {
  */
 function recountTomorrow() {
   if (!state || !Array.isArray(state.cards)) return;
-  const mine = state.cards.filter(c => c.when === 'tomorrow');
+  // ⭐「明日の計画」の画面と**同じものさし**で数える (要件 §AB-11 の 5b):
+  //   数えるのは**カード**、時間は「まだ手元にあるまとまり」の合計。渡したぶん・棚に入れたぶんは入れない
+  const mine = rowsOf(state).filter(c => c.when === 'tomorrow' && c.plannable !== false);
   let hours = 0;
-  let unknown = 0;
-  for (const c of mine) { if (c.plan_hours == null) unknown += 1; else hours += Number(c.plan_hours) || 0; }
-  state.tomorrow_plan = { hours: Math.round(hours * 10) / 10, count: mine.length, unknown_hours_count: unknown };
+  const cardIds = new Set();
+  const unknownIds = new Set();
+  for (const c of mine) {
+    cardIds.add(String(c.id));
+    if (c.plan_hours == null) unknownIds.add(String(c.id));
+    else hours += Number(c.plan_hours) || 0;
+  }
+  state.tomorrow_plan = { hours: Math.round(hours * 10) / 10, count: cardIds.size, unknown_hours_count: unknownIds.size };
 }
 
 let facPickFor = null;
@@ -3054,7 +3095,8 @@ function renderBulk() {
  */
 function syncBulkSelection(visible) {
   if (!bulkIds) return;
-  const ok = new Set(visible.filter(c => c.status === 'ready_for_stocking').map(c => c.id));
+  // ⭐分かれた行は「まとめて」では選べない (どのぶんかを決めずにカードごと閉じてしまうため)
+  const ok = new Set(visible.filter(c => c.status === 'ready_for_stocking' && !c.split).map(c => c.id));
   let dropped = 0;
   for (const id of [...bulkIds.keys()]) if (!ok.has(id)) { bulkIds.delete(id); dropped++; }
   if (dropped > 0) toast(dropped + ' 件は絞り込みで見えなくなったので選択から外しました');
@@ -3880,13 +3922,15 @@ async function redoBatch(batchId) {
   c.status = j.status;
   if (j.status_label) c.status_label = j.status_label;
   toast('このぶんを作業中に戻しました');
+  await loadState();   // 行の数・進捗はサーバーが持っている
   renderTabs(); renderList();
   if (curView === 'board') renderBoard();
-  openDetail(c.id);
+  if (sameId(curDetail, c.id)) openDetail(c.id);
 }
 /** ⭐そのまとまりだけを棚入完了にする。他のぶん (外にあずけ中) はそのまま残る */
-async function stockBatch(batchId) {
-  const c = findCard(curDetail);
+const stockBatch = (batchId) => stockBatchOf(curDetail, batchId);
+async function stockBatchOf(taskId, batchId) {
+  const c = findCard(taskId);
   if (!c || !stateCan('tasks.bulk_stocked')) return;
   const b = (c.batches || []).find((x) => sameId(x.id, batchId));
   if (!b) return;
@@ -3914,10 +3958,11 @@ async function stockBatch(batchId) {
   c.status = j.status;
   if (j.status_label) c.status_label = j.status_label;
   toast('このぶんを棚入完了にしました' + (rest > 0 ? ' (残りのぶんはそのままです)' : ''));
-  renderTabs(); renderList();
-  if (curView === 'board') renderBoard();
-  if (j.listed === false) { closeDetail(); return; }
-  openDetail(c.id);   // まとまりの状態を取り直す
+  // ⭐行の中身 (まとまりの状態・数) はサーバーが持っているので、一覧を取り直す
+  await loadState();
+  if (sameId(curDetail, c.id)) {
+    if (j.listed === false) closeDetail(); else openDetail(c.id);
+  }
 }
 
 /**
@@ -4730,14 +4775,14 @@ async function submitDone() {
     applyTask(c, j.task);
     c.status = j.status;
     if (j.status_label) c.status_label = j.status_label;
-    const wasBatch = doneBatch != null;
+    const wasSplit = (c.batches || []).filter((x) => x.work_status !== 'cancelled').length > 1;
     closeOverlay('#doneOv'); doneTarget = null; doneBatch = null; $('#doneBody').innerHTML = '';
-    renderTabs(); renderList();
-    if (sameId(curDetail, c.id)) renderDetail(c);
-    if (curView === 'board') renderBoard();
     toast('「棚入待ち」にしました。棚に入れたら職員が「終了」にします');
-    // ⭐まとまりが 2 つ以上あるカードは、まとまりの状態を取り直す (どのぶんが終わったかを出すため)
-    if (wasBatch && sameId(curDetail, c.id)) openDetail(c.id);
+    // ⭐分かれたカードは、行の数・進捗をサーバーが持っているので取り直す (画面で組み立て直さない)
+    if (wasSplit) await loadState();
+    renderTabs(); renderList();
+    if (curView === 'board') renderBoard();
+    if (sameId(curDetail, c.id)) { if (wasSplit) openDetail(c.id); else renderDetail(c); }
     return;
   }
   if (j.error === 'conflict' && j.current) { applyTask(c, j.current); c.status = j.current.status; if (sameId(curDetail, c.id)) renderDetail(c); }
@@ -5582,14 +5627,23 @@ $('#stOv').addEventListener('click', e => { if (e.target === $('#stOv')) closeSt
 function doSetStEl(el) { doSetSt(el.dataset.v); }
 
 /** サーバーが返したタスクの最新値をカードに反映する (version を持ち越さないと次の変更が競合する) */
+/** カード単位の値 (行が分かれていても同じもの) */
+const CARD_FIELDS = ['version', 'blocked', 'blocked_label', 'hold_memo',
+  'planned_date', 'when', 'cancellation_requested_at', 'migration_review', 'external_ready'];
+/** まとまりごとに違う値 (⭐分かれた行には写さない — カードの合計を行に書くと数が化ける) */
+const BATCH_FIELDS = ['status', 'status_label', 'facility_code', 'done_qty'];
 function applyTask(c, t) {
   if (!t || typeof t !== 'object') return;
-  for (const k of ['status', 'status_label', 'version', 'facility_code', 'blocked', 'blocked_label',
-    'done_qty', 'hold_memo',
-    'planned_date', 'when', 'cancellation_requested_at', 'migration_review', 'external_ready']) {
-    if (k in t) c[k] = t[k];
-  }
+  for (const k of [...CARD_FIELDS, ...BATCH_FIELDS]) if (k in t) c[k] = t[k];
   if ('planned_date' in t) c.today = !!(state.today && t.planned_date === state.today);
+  // ⭐一覧・ボードが描くのは**行 (rows)**。カードだけ書き換えると、次の取り直しまで画面が古いまま残る。
+  //   分かれた行には「まとまりごとに違う値」を写さない (そのぶんの数・進捗はサーバーが持っている)
+  for (const r of ((state || {}).rows || [])) {
+    if (r === c || !sameId(r.id, c.id)) continue;
+    for (const k of CARD_FIELDS) if (k in t) r[k] = t[k];
+    if (!r.split) for (const k of BATCH_FIELDS) if (k in t) r[k] = t[k];
+    if ('planned_date' in t) r.today = c.today;
+  }
 }
 
 async function doSetSt(choice) {

@@ -316,8 +316,16 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
     FROM f_iroha_consignments c JOIN f_iroha_task_batches b ON b.id = c.batch_id
     WHERE c.state IN ('planned','prepared','handed') GROUP BY b.task_id`).all().map((r) => [r.task_id, r]));
   // ⭐まとまりごとの「まだ外にあるか」。外にあるぶんは人が先へ進められない (返却で棚入待ちになる — 要件 §AB-11 の 5)
-  const outByBatch = new Set(getDB().prepare(`SELECT DISTINCT batch_id FROM f_iroha_consignments
-    WHERE state IN ('planned','prepared','handed')`).all().map((r) => r.batch_id));
+  const outByBatch = new Map(getDB().prepare(`SELECT batch_id,
+      SUM(COALESCE(handed_qty, planned_qty)
+        - COALESCE((SELECT SUM(r.returned_qty) FROM f_iroha_consignment_returns r WHERE r.consignment_id = f_iroha_consignments.id), 0)) qty,
+      COUNT(*) n, MIN(due_date) due
+    FROM f_iroha_consignments WHERE state IN ('planned','prepared','handed') GROUP BY batch_id`)
+    .all().map((r) => [r.batch_id, r]));
+  // ⭐**もう物が手を離れたか** (handed)。明日の計画から外すのはこちらで決める (Codex R2 中1)。
+  //   渡す予定・用意ずみのうちは物は いろはにあり、やめることもできるので計画に残す
+  const handedOut = new Set(getDB().prepare("SELECT DISTINCT batch_id FROM f_iroha_consignments WHERE state = 'handed'")
+    .all().map((r) => r.batch_id));
   const today = jstToday();
   const tomorrow = jstTomorrow(today);
 
@@ -366,6 +374,10 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
           counted: b.good_qty_source === 'counted',
           // ⭐まだ外にあるぶんは、人が「作り終えた」を押せない (返却を受け取ると棚入待ちになる)
           consigned_out: outByBatch.has(b.id),
+          handed_out: handedOut.has(b.id),
+          away: outByBatch.has(b.id)
+            ? { qty: outByBatch.get(b.id).qty, count: outByBatch.get(b.id).n, due: outByBatch.get(b.id).due || null,
+                handed: handedOut.has(b.id) } : null,
           consignable_max: cg.max, consignable_why: cg.why };
       }),
       hold_memo: r.hold_memo || null,
@@ -414,6 +426,108 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
   return { cards, today };
 }
 
+/** まとまりの作業状態 → 画面の言葉 (カードの「終了 · 棚入完了」と読み方をそろえる) */
+const BATCH_STATUS_LABEL = { not_started: '未着手', in_progress: '作業中', ready_for_stocking: '棚入待ち', done: '終了 · 棚入完了' };
+
+/**
+ * ⭐カードを「まとまり」の行に開く (要件 §AB-11 の 5b)。
+ *
+ * **まとまりが 1 つのカードはそのまま 1 行**。ふだんの全カードがこれなので、見え方は変わらない。
+ * 2 つ以上 (外部施設に一部を預けたとき) だけ、いろはのぶん・ワークセンターのぶんが 1 行ずつになる。
+ * 区別するのは番号ではなく**「どこが」の札** (中原さん 2026-09-07。「1/2」のような枝番は出さない)。
+ *
+ * ⭐id はカードのまま。詳細を開く・写真・作業時間はカード単位なので、行が分かれても同じカードを指す。
+ *   行を見分けるのは row_key。
+ *
+ * ⭐**明日の計画に出すか** (plannable) は「拠点が外部か」ではなく**もう物が手を離れたか (handed)**
+ * で決める (Codex R1 中1 / R2 中1)。カードごと ワークセンター担当のカードは、いつ出すかを決めるために
+ * 計画に出る (今までどおり)。**渡す予定・箱とラベルを用意ずみ のうちは物は いろはにある**ので計画に残り、
+ * 渡した時点で外れる。
+ * ⭐棚に入れ終わったまとまりも出さない (もう終わっているぶん — Codex R1 中2)。
+ *
+ * @param {boolean} forPlan 明日の計画・上のゲージ用 (渡したぶん・棚に入れたぶんを外す)
+ */
+export function expandBatchRows(cards, { forPlan = false } = {}) {
+  const rows = [];
+  for (const c of cards) {
+    const bs = (c.batches || []).filter((b) => b.work_status !== 'cancelled');
+    if (bs.length <= 1) {
+      const only = bs[0] || null;
+      const plannable = !(only && (only.handed_out || only.work_status === 'done'));
+      if (forPlan && !plannable) continue;
+      rows.push({ ...c, row_key: String(c.id), batch_id: only ? only.id : null, split: false, plannable });
+      continue;
+    }
+    for (const b of bs) {
+      const fac = b.facility_code || c.facility_code;
+      // ⭐棚に入れ終わったぶんは一覧・ボードにも出さない (そのぶんの作業は終わっている)。
+      //   カードは他の行で見えるし、全部終われば カードごと一覧から外れる
+      if (b.work_status === 'done') continue;
+      const plannable = !b.handed_out;
+      if (forPlan && !plannable) continue;
+      // ⭐数・箱・時間は**そのまとまりのぶん**。カード合計を出すと、400 個のぶんに 1000 個の箱数が出る。
+      //   箱数は Z ロケの実在庫で代用しない (どちらのまとまりのぶんか分けられないため)
+      const per = c.master ? c.master.units_per_container : null;
+      rows.push({ ...c,
+        row_key: c.id + '-b' + b.id,
+        batch_id: b.id, batch_seq: b.seq, split: true,
+        // plannable = 明日やる作業として数えるぶん (まだ渡していない・棚に入れていない)
+        plannable,
+        facility_code: fac,
+        qty: b.planned_qty,
+        status: b.work_status === 'done' ? 'closed' : b.work_status,
+        status_label: BATCH_STATUS_LABEL[b.work_status] || b.work_status,
+        done_qty: b.good_qty ?? null,
+        loss_qty: b.loss_qty ?? null,
+        variance_note: b.variance_note || null,
+        counted: !!b.counted,
+        consigned_out: !!b.consigned_out,
+        away: b.away || null,
+        expiry: b.expiry || c.expiry,
+        plan_hours: planHours(b.planned_qty, c.master ? c.master.process_count : null),
+        boxes: neededBoxes(b.planned_qty, per),
+        boxes_calc: neededBoxesCalc(b.planned_qty, per),
+      });
+    }
+  }
+  return rows;
+}
+
+/**
+ * ⭐**明日の計画のための行** (要件 §AB-11 の 5b / Codex R3 中1)。
+ *
+ * この画面が決めるのは「**いつ**やるか」で、いつ は**カードの軸** (要件 §W-4)。
+ * だから分けたカードでも**カード 1 行**に戻す — 行を分けると、どちらを掴んでも同じ予定日が動くので、
+ * 「400 個だけ明日にしたつもりが 1000 個の予定が動いた」という取り違えが起きる。
+ *
+ * ⭐数・想定作業時間・必要保管箱は「**まだ手元にあるまとまり**」の合計にする。
+ *   渡したぶん・棚に入れ終わったぶんは、いろはが明日やる作業ではない。
+ *   まとまりが 1 つのカード (ふだんの全部) は、今までとまったく同じ数になる。
+ */
+export function planRows(cards) {
+  const out = [];
+  for (const c of cards) {
+    const bs = (c.batches || []).filter((b) => b.work_status !== 'cancelled'
+      && !b.handed_out && b.work_status !== 'done');
+    if (bs.length === 0) continue;                       // 明日やることが残っていないカード
+    if (bs.length === (c.batches || []).filter((b) => b.work_status !== 'cancelled').length && bs.length <= 1) {
+      out.push({ ...c, row_key: String(c.id), batch_id: bs[0].id, split: false, plannable: true });
+      continue;
+    }
+    // ⭐数が分からないまとまりが混ざったら合計も出さない (0 で代用しない — 要件 §AB-3)
+    const qty = bs.some((b) => b.planned_qty == null) ? null : bs.reduce((a, b) => a + b.planned_qty, 0);
+    const per = c.master ? c.master.units_per_container : null;
+    out.push({ ...c,
+      row_key: String(c.id), batch_id: bs.length === 1 ? bs[0].id : null, split: bs.length > 1, plannable: true,
+      qty,
+      plan_hours: planHours(qty, c.master ? c.master.process_count : null),
+      boxes: neededBoxes(qty, per),
+      boxes_calc: neededBoxesCalc(qty, per),
+    });
+  }
+  return out;
+}
+
 /**
  * 「明日の計画」画面のデータ (職員だけが開く。要件 §W-3 / §AA)。
  *   candidates = まだ予定の無い未着手カード。**おすすめ順**に並べ、1 から順の `rank` を付ける
@@ -426,7 +540,9 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
 export function buildPlan({ readOnly = false } = {}) {
   const today = jstToday();
   const tomorrow = jstTomorrow(today);
-  const { cards } = buildTaskCards(listOpenTasks({}), { readOnly });
+  const { cards: allCards } = buildTaskCards(listOpenTasks({}), { readOnly });
+  // ⭐明日の計画は**カード 1 行**。数はまだ手元にあるまとまりの合計 (要件 §AB-11 の 5b)
+  const cards = planRows(allCards);
   const byWhen = (w) => cards.filter((c) => c.when === w).sort(comparePlanOrder);
   const tomorrowCards = byWhen('tomorrow');
   const facilities = listFacilities();
@@ -526,14 +642,19 @@ export function buildTaskList({ facility = null, readOnly = false } = {}) {
   // 読むだけ (下見) では画像の取り寄せも起こさない — 開くだけで DB が変わらない (Codex PR1 R7 / R8)
   if (!readOnly) queueMissingImages(cards);
 
-  // 上のゲージ用。明日やる分の件数と合計時間 (工程数の無いカードは 0 で足さず別に数える — 要件 §W-3)
-  const tomorrowPlan = sumPlanHours(cards.filter((c) => c.when === 'tomorrow'));
+  // ⭐まとまりが 2 つ以上のカードは、一覧・ボードで行が分かれる (要件 §AB-11 の 5b)。
+  //   cards (カード 1 枚 = 1 つ) はそのまま返す — 詳細・写真・作業時間はカード単位のため
+  const batchRows = expandBatchRows(cards);
+  // 上のゲージ用。明日やる分の件数と合計時間 (工程数の無いカードは 0 で足さず別に数える — 要件 §W-3)。
+  // ⭐外部に預けたぶんは いろはが明日やる作業ではないので数えない (明日の計画の画面と同じものさし)
+  const tomorrowPlan = sumPlanHours(planRows(cards).filter((c) => c.when === 'tomorrow'));
 
   return {
     mode: 'app',
     tomorrow_plan: tomorrowPlan,
     today_ymd: today,
     cards,
+    rows: batchRows,
     statuses: OPEN_STATUSES.map(s => ({ value: s, label: STATUS_LABEL[s] })),
     transitions: TRANSITIONS,
     // 止まっている理由 (案A)。button = 利用者が押すボタンの言い方 (「ラベルが足りない」)、label = 札の言い方 (「ラベル待ち」)
