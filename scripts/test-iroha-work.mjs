@@ -6858,27 +6858,67 @@ console.log('\n[33] 外部施設の受け入れ枠 (§AB-8)');
     '⭐預けるダイアログに「いま何時間ぶん・何箱あるか」を出す');
   ok(/if \(cap\) cap\.innerHTML = capacityHtml\(f\.dataset\.cgfac\);/.test(html),
     '拠点を選び直したら、その拠点の残高に入れ替える');
-  ok(/\(目安 未設定\)/.test(html), '⭐枠を決めていなければ「未設定」と出す (0 と書かない)');
-  ok(/目安を超えています。渡してよいか職員で確かめてください（止めはしません）/.test(html),
-    '⭐目安は超えても止めない (注意するだけ)');
-  // ⭐説明と実際の結果を逆にしない (Codex R1 軽微4)
-  ok(/const hard = !!l.boxes_hard && l.capacity_boxes != null;/.test(html)
-    && /const soft = l.over_hours || (l.over_boxes && !hard);/.test(html),
-    '⭐箱数を守らせる拠点は「目安を超えた」ほうに数えない');
-  ok(/これ以上は渡せません/.test(html) && /これを超えるぶんは渡せません/.test(html),
-    '⭐サーバーが本当に断る拠点では「渡せません」と書く (「止めはしません」と書かない)');
-  ok(/空きを数えられないので<b>渡せません<\/b>/.test(html),
-    '⭐入数が分からず数えられないときも、渡せないことを画面に出す');
   ok(/工程数が登録されていない/.test(html) && /入数が登録されていない/.test(html),
     '数に入れられなかった件数も出す (黙って落とさない)');
+
+  // ⭐capacityHtml を**実際に動かして**、出てくる文言を見る。
+  //   ソースに式があるかどうかの検査ではだめ — 正規表現の | が「選択肢」に化けて、
+  //   条件式を消しても素通りしていた (Codex R2 軽微2)。文言の矛盾も式では見えない
+  {
+    const src = html.match(/function capacityHtml\(code\) \{[\s\S]*?\r?\n\}/)[0];
+    const render = (load) => new Function('esc', 'facilityName', 'boardState', src + '; return capacityHtml;')(
+      (x) => String(x == null ? '' : x).replace(/[&<>"']/g,
+        (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
+      () => 'ワークセンター',
+      () => ({ facility_loads: { workcenter: load } }))('workcenter');
+    const base = { hours: 0, boxes: 0, count: 1, qty: 100, hours_unknown: 0, boxes_unknown: 0,
+      capacity_hours: null, capacity_boxes: null, boxes_hard: false, over_hours: false, over_boxes: false };
+
+    ok(render(base).includes('(目安 未設定)'), '⭐枠を決めていなければ「未設定」と出す (0 と書かない)');
+
+    const softH = render({ ...base, hours: 20, capacity_hours: 16, over_hours: true });
+    ok(softH.includes('想定作業時間が目安を超えています') && softH.includes('止めはしません'),
+      '⭐時間の目安を超えただけなら「止めはしません」と書く');
+    ok(!softH.includes('渡せません'), '目安だけのときに「渡せません」と書かない');
+
+    const softB = render({ ...base, boxes: 9, capacity_boxes: 8, over_boxes: true });
+    ok(softB.includes('箱数が目安を超えています') && softB.includes('止めはしません'),
+      '守らせない拠点なら、箱数も「目安」として書く');
+
+    // ⭐時間の目安超過と箱数のハード上限は同時に起きる。主語なしで
+    //   「止めはしません」と「渡せません」を並べない (Codex R2 軽微1)
+    const both = render({ ...base, hours: 20, capacity_hours: 16, over_hours: true,
+      boxes: 8, capacity_boxes: 8, boxes_hard: true, over_boxes: true });
+    ok(both.includes('想定作業時間が目安を超えています'), '⭐何の目安を超えたのかを名前で言う');
+    ok(!both.includes('箱数が目安を超えています'), '⭐守らせる箱数は「目安」と言わない (本当に断るので)');
+    ok(both.includes('これ以上は渡せません'), '⭐いっぱいなら「渡せません」と書く');
+
+    const room = render({ ...base, boxes: 6, capacity_boxes: 8, boxes_hard: true });
+    ok(room.includes('あと 2 箱ぶんまで') && room.includes('これを超えるぶんは渡せません'),
+      '⭐守らせる拠点では、あと何箱ぶんまでかを書く');
+    ok(!room.includes('止めはしません'), '⭐守らせる拠点で「止めはしません」と書かない');
+
+    const unk = render({ ...base, boxes: 6, boxes_unknown: 2, capacity_boxes: 8, boxes_hard: true });
+    ok(unk.includes('空きを数えられないので<b>渡せません</b>'),
+      '⭐入数が分からず数えられないときも、渡せないと書く');
+    ok(!unk.includes('あと 2 箱ぶんまで'), '数えられないときに「あと何箱」と言わない');
+  }
   const adm = fs.readFileSync(new URL('../apps/iroha-work/views/admin.ejs', import.meta.url), 'utf8');
   ok(/sec-capacity/.test(adm) && /async function saveCapacity\(code\)/.test(adm), '管理画面で枠を決められる');
   ok(/空にすれば「未設定」に戻ります/.test(adm), '空にすると未設定に戻ることを書く');
   ok(/id="capv-<%= f\.code %>" value="<%= f\.version %>"/.test(adm)
     && /expect_version: Number\(document\.getElementById\('capv-' \+ code\)\.value\)/.test(adm),
     '⭐枠の保存に版を添える (別端末の変更を黙って上書きしない)');
-  ok(/function applyCapacities\(list\)/.test(adm) && /if \(json\.facilities\) applyCapacities\(json\.facilities\);/.test(adm),
-    '競合したら、いまの値を出し直す');
+  // ⭐押した行だけを書き換える。応答には全施設が入っているので、そのまま写すと
+  //   ほかの行の入力途中を黙って消す (Codex R2 中1)
+  ok(adm.includes('function applyCapacity(list, code)')
+    && adm.includes('const f = (list || []).find((x) => x.code === code);'),
+    '⭐保存の応答は、押した行だけに写す (ほかの施設の入力途中を消さない)');
+  ok(adm.includes('if (json.facilities) applyCapacity(json.facilities, code);'), '競合したら、その行だけ今の値を出し直す');
+  ok(adm.includes("for (const el of els) if (el) el.disabled = true;")
+    && adm.includes('} finally {'),
+    '⭐送っている間はその行を触らせない (返事で入れかけの値を消さない)');
+  ok(!adm.includes('function applyCapacities('), '全施設をまとめて書き戻す関数は残さない');
   const rt = fs.readFileSync(new URL('../apps/iroha-work/router.js', import.meta.url), 'utf8');
   ok(/capacityGuard: facilityCapacityGuard/.test(rt) && !/const capacityOf = /.test(rt),
     '⭐受け入れ枠は書き込みのトランザクションの中で数える (外で数えた残高を持ち回らない)');

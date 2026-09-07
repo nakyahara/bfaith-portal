@@ -577,11 +577,11 @@ export function facilityLoads(db = getDB()) {
  * @returns {null} 置いてよい / {error, message} 断る理由
  */
 export function facilityCapacityGuard(facilityCode, taskId, qty) {
-  const l = facilityLoads().get(facilityCode);
-  // 守らせない拠点・箱数の枠が未設定なら素通り (目安を超えても止めないのが決まり — 要件 §AB-8)
-  if (!l || !l.boxes_hard || l.capacity_boxes == null) return null;
   const fac = listFacilities(true).find((f) => f.code === facilityCode);
-  const name = fac ? fac.name : facilityCode;
+  // 守らせない拠点・箱数の枠が未設定なら素通り (目安を超えても止めないのが決まり — 要件 §AB-8)。
+  // ⭐拠点の設定を先に見て、素通りするなら残高を数えない (預けのたびに全件走査しないため)
+  if (!fac || !fac.capacity_boxes_hard || fac.capacity_boxes == null) return null;
+  const name = fac.name;
   const t = getTask(taskId);
   if (!t) return { error: 'not_found', message: 'カードが見つかりません' };
   let snap = null;
@@ -593,13 +593,16 @@ export function facilityCapacityGuard(facilityCode, taskId, qty) {
     return { error: 'capacity_unknown',
       message: `${name} は置ける箱数を守る決まりですが、この商品は入数が分からないので箱数を数えられません。作業仕様の「入数」を登録してから渡してください` };
   }
+  const l = facilityLoads().get(facilityCode);
+  // 箱数を守らせられるのは物を持ち帰る拠点だけ (setFacilityCapacity が担保)。念のため素通りさせない
+  if (!l) return { error: 'bad_facility', message: 'その拠点は選べません' };
   if (l.boxes_unknown > 0) {
     return { error: 'capacity_unknown',
       message: `${name} にいま置いてあるぶんに、入数が分からないものが ${l.boxes_unknown} 件あります。空きが数えられないので、先にその入数を登録してください` };
   }
-  if (l.boxes + add.boxes > l.capacity_boxes) {
+  if (l.boxes + add.boxes > fac.capacity_boxes) {
     return { error: 'over_capacity',
-      message: `${name} に置ける箱は ${l.capacity_boxes} 箱までです (いま ${l.boxes} 箱・今回 ${add.boxes} 箱)` };
+      message: `${name} に置ける箱は ${fac.capacity_boxes} 箱までです (いま ${l.boxes} 箱・今回 ${add.boxes} 箱)` };
   }
   return null;
 }

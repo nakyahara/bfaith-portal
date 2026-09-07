@@ -5187,15 +5187,22 @@ function capacityHtml(code) {
         + ' 箱ぶんまで</b>で、これを超えるぶんは渡せません'
       : '🚫 ' + esc(facilityName(code)) + ' は置ける箱数を守る決まりで、いっぱいです。<b>これ以上は渡せません</b>';
   }
-  // 目安を超えただけのほう = 止めない (ハード上限にした箱数は、目安としては数えない)
-  const soft = l.over_hours || (l.over_boxes && !hard);
-  return '<div class="cap' + (soft || (hard && room === 0) ? ' over' : '') + '">' +
+  // ⭐目安を超えただけのほう = 止めない。**何の目安か**を名前で言う (Codex R2 軽微1)。
+  //   時間の超過とハード上限は同時に起きる。「止めはしません」と「渡せません」が
+  //   主語なしで並ぶと、職員はどちらが本当か分からなくなる
+  const softs = [];
+  if (l.over_hours) softs.push('想定作業時間');
+  if (l.over_boxes && !hard) softs.push('箱数');          // 守らせる箱数は下の「渡せません」で言う
+  const softMsg = softs.length
+    ? '⚠ ' + softs.join('と') + 'が目安を超えています。これは目安なので止めはしません。渡してよいか職員で確かめてください'
+    : '';
+  return '<div class="cap' + (softMsg || (hard && room === 0) ? ' over' : '') + '">' +
     'いま ' + facilityName(code) + ' にあるぶん: ' + hoursTxt + ' ・ ' + boxesTxt +
     ' ・ ' + esc(String(l.count)) + ' 件 ・ ' + esc(String(l.qty)) + ' 個' +
     (l.capacity_hours != null ? '<div class="bar"><i style="width:' + pct + '%"></i></div>' : '') +
     (l.hours_unknown > 0 ? '<div class="unset">※ 工程数が登録されていない ' + esc(String(l.hours_unknown)) + ' 件は時間に入れていません</div>' : '') +
     (l.boxes_unknown > 0 ? '<div class="unset">※ 入数が登録されていない ' + esc(String(l.boxes_unknown)) + ' 件は箱数に入れていません</div>' : '') +
-    (soft ? '<div class="warn">⚠ 目安を超えています。渡してよいか職員で確かめてください（止めはしません）</div>' : '') +
+    (softMsg ? '<div class="warn">' + softMsg + '</div>' : '') +
     (hardMsg ? '<div class="stop">' + hardMsg + '</div>' : '') +
     '</div>';
 }

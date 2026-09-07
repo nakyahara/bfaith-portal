@@ -321,7 +321,7 @@
                  value="<%= f.capacity_boxes == null ? '' : f.capacity_boxes %>" placeholder="未設定"> 箱</td>
             <td><input type="checkbox" id="caphard-<%= f.code %>" <%= f.capacity_boxes_hard ? 'checked' : '' %>></td>
             <td><input type="hidden" id="capv-<%= f.code %>" value="<%= f.version %>">
-                <button class="btn-sm" onclick="saveCapacity('<%= f.code %>')">保存</button>
+                <button class="btn-sm" id="capsave-<%= f.code %>" onclick="saveCapacity('<%= f.code %>')">保存</button>
                 <span class="msg" id="capmsg-<%= f.code %>"></span></td>
           </tr>
         <% } %>
@@ -757,28 +757,41 @@
       document.getElementById('ecCode').textContent = json.code;
       document.getElementById('ecNote').textContent = '「' + json.label + '」用 ・ ' + json.ttlMinutes + '分間有効 ・ 1回だけ使えます';
     }
-    /** ⭐サーバーが返した最新の枠を画面に写す (版もいっしょに入れ替える) */
-    function applyCapacities(list) {
-      for (const f of list || []) {
-        const set = (id, v) => { const el = document.getElementById(id + '-' + f.code); if (el) el.value = v; };
-        set('caph', f.capacity_hours == null ? '' : f.capacity_hours);
-        set('capb', f.capacity_boxes == null ? '' : f.capacity_boxes);
-        set('capv', f.version);
-        const hd = document.getElementById('caphard-' + f.code);
-        if (hd) hd.checked = !!f.capacity_boxes_hard;
-      }
+    /**
+     * ⭐サーバーが返した最新の枠を画面に写す (版もいっしょに入れ替える)。
+     * ⭐**押した行だけ**を書き換える (Codex R2 中1)。応答には全施設が入っているが、
+     *   ほかの行は職員が入力している途中かもしれない。黙って書き戻すと、直したつもりの
+     *   「箱数を守らせる」が元に戻り、次の保存で意図しない設定が入る
+     */
+    function applyCapacity(list, code) {
+      const f = (list || []).find((x) => x.code === code);
+      if (!f) return;
+      const set = (id, v) => { const el = document.getElementById(id + '-' + code); if (el) el.value = v; };
+      set('caph', f.capacity_hours == null ? '' : f.capacity_hours);
+      set('capb', f.capacity_boxes == null ? '' : f.capacity_boxes);
+      set('capv', f.version);
+      const hd = document.getElementById('caphard-' + code);
+      if (hd) hd.checked = !!f.capacity_boxes_hard;
     }
     async function saveCapacity(code) {
+      const els = ['caph-', 'capb-', 'caphard-', 'capsave-'].map((p) => document.getElementById(p + code));
       const h = document.getElementById('caph-' + code).value.trim();
       const b = document.getElementById('capb-' + code).value.trim();
       const hard = document.getElementById('caphard-' + code).checked;
-      // ⭐版を添える。別の端末が先に変えていたら、こちらの保存を通さず最新を出し直す (Codex R1 中3)
-      const { json } = await post('/admin/facility-capacity', {
-        code, capacity_hours: h === '' ? null : h, capacity_boxes: b === '' ? null : b, capacity_boxes_hard: hard,
-        expect_version: Number(document.getElementById('capv-' + code).value) });
-      if (json.ok) { applyCapacities(json.facilities); setMsg('capmsg-' + code, 'ok', '保存しました'); return; }
-      if (json.facilities) applyCapacities(json.facilities);
-      setMsg('capmsg-' + code, 'err', json.message || '保存できませんでした');
+      // ⭐送っている間はこの行を触らせない。返事が来たときに、入れかけの値を古い応答で消さないため
+      for (const el of els) if (el) el.disabled = true;
+      setMsg('capmsg-' + code, '', '保存中…');
+      try {
+        // ⭐版を添える。別の端末が先に変えていたら、こちらの保存を通さず最新を出し直す (Codex R1 中3)
+        const { json } = await post('/admin/facility-capacity', {
+          code, capacity_hours: h === '' ? null : h, capacity_boxes: b === '' ? null : b, capacity_boxes_hard: hard,
+          expect_version: Number(document.getElementById('capv-' + code).value) });
+        if (json.ok) { applyCapacity(json.facilities, code); setMsg('capmsg-' + code, 'ok', '保存しました'); return; }
+        if (json.facilities) applyCapacity(json.facilities, code);
+        setMsg('capmsg-' + code, 'err', json.message || '保存できませんでした');
+      } finally {
+        for (const el of els) if (el) el.disabled = false;
+      }
     }
     async function issueFacilityLink() {
       const facility_code = document.getElementById('flFac').value;
