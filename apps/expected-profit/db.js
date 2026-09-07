@@ -40,6 +40,17 @@ export function getExpectedProfitDB() {
   return db;
 }
 
+/**
+ * 任意のハンドルにこのアプリのスキーマを作る (受信側 = Render も同じ形にする)。
+ *
+ * 🚨 テストが db.js を正規表現で読んで CREATE 文を拾う作りだと、
+ *    ALTER 文が増えただけで壊れるし、migrate を通らない。本番と同じ関数を通す
+ */
+export function createExpectedProfitSchema(db) {
+  createTables(db);
+  return db;
+}
+
 function createTables(db) {
   // ─── 1. 取得の実行管理 (§7.1) ───
   // 「未実行 / API失敗 / 出品終了 / 対象0件」を区別するための台帳。
@@ -160,6 +171,7 @@ function createTables(db) {
     -- 費用側 (税抜)
     cost_ex_tax               REAL,
     cost_method               TEXT,              -- single / set_master (§15-5)
+    unit_quantity             INTEGER,           -- 1出品が単品何個ぶんか (v_sku_resolved.数量)
     shipping_code             TEXT,
     shipping_method           TEXT,
     shipping_fee_ex_tax       REAL,              -- 送料 ÷ 1.1
@@ -228,6 +240,29 @@ function createTables(db) {
     seq            INTEGER NOT NULL,
     published_at   TEXT NOT NULL
   )`);
+
+  migrate(db);
+}
+
+/**
+ * 既にあるDBへの列追加。
+ *
+ * 🚨 CREATE TABLE IF NOT EXISTS は既存テーブルに列を足さない。
+ *    miniPC と Render の両方に既存DBがあるので、ここを通さないと
+ *    「送る側にはある列が、受け取る側では無い」状態になる。
+ */
+export function migrate(db) {
+  addColumnIfMissing(db, 'mart_listing_expected_profit', 'unit_quantity', 'INTEGER');
+}
+
+/** 冪等な列追加 (エラーは握り潰さない) */
+export function addColumnIfMissing(db, table, column, typeClause) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  if (!cols.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeClause}`);
+    return true;
+  }
+  return false;
 }
 
 /**

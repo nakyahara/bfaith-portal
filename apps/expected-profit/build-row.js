@@ -30,7 +30,7 @@ export function resolveNeCode(listing, skuMap) {
     // 楽天は SKU管理番号 でも引けるようにフォールバック (対応表の作りが2系統ある)
     if (listing.mall === 'rakuten') {
       const alt = skuMap.get(String(listing.mall_item_key).toLowerCase());
-      if (alt && alt.length === 1) return { status: 'ok', neCode: alt[0].ne_code };
+      if (alt && alt.length === 1) return { status: 'ok', neCode: alt[0].ne_code, qty: alt[0].qty ?? null };
       if (alt && alt.length > 1) return { status: 'ambiguous', reason: 'multiple_ne_codes' };
     }
     return { status: 'unresolved', reason: 'ne_code_not_found' };
@@ -39,7 +39,7 @@ export function resolveNeCode(listing, skuMap) {
     // 1出品が複数の NE 商品を指す = この出品だけでは原価構成が決まらない
     return { status: 'ambiguous', reason: 'multiple_ne_codes' };
   }
-  return { status: 'ok', neCode: hit[0].ne_code };
+  return { status: 'ok', neCode: hit[0].ne_code, qty: hit[0].qty ?? null };
 }
 
 /**
@@ -75,6 +75,7 @@ export function buildRow(listing, ctx) {
     tax_rate: null,
     cost_ex_tax: null,
     cost_method: null,
+    unit_quantity: null,
     shipping_code: null,
     shipping_method: null,
     shipping_fee_ex_tax: null,
@@ -159,7 +160,13 @@ export function buildRow(listing, ctx) {
     row.incomplete_reason = cost.reason;
     return finish(row, 'incomplete', listing);
   }
-  row.cost_ex_tax = cost.costExTax;
+  // 🚨 まとめ買いSKU は単品原価 × 数量。ここを掛けないと利益率が数量倍に化ける
+  //    (実データ 2026-09-07: opbs454 が 数量12 で 原価1,001 → 79.4%)
+  //    Amazon の対応表 (v_sku_resolved) にだけ数量がある。楽天は qty = null
+  const qty = resolved.qty;
+  if (qty != null && qty > 1) row.unit_quantity = qty;
+  else if (qty === 1) row.unit_quantity = 1;
+  row.cost_ex_tax = cost.costExTax * (qty ?? 1);
   row.cost_method = cost.method;
   row.tax_rate = cost.taxRate;
   row.cost_status = isExpired(ctx.masterFreshness.costValidUntil, now) ? 'expired' : 'ok';
@@ -319,6 +326,7 @@ function finish(row, status, listing) {
   const verdict = isRankEligible({
     mall: row.mall,
     fulfillment: row.fulfillment,
+    unit_quantity: row.unit_quantity,
     listing_status: row.listing_status,
     calculation_status: row.calculation_status,
     scenario_fit: row.scenario_fit,

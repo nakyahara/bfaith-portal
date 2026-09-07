@@ -567,6 +567,41 @@
         return;
       }
 
+      // 除外・不成立の理由を日本語にする。英語のまま出すと現場で読めない
+      var EP_REASON = {
+        quantity_shipping_unknown: 'まとめ買い出品 (送料が単品前提)',
+        quantity_variation_suspected: 'まとめ買いの疑い (価格の開きが大きい)',
+        shipping_revenue_unknown: '送料収入が不明',
+        shipping_master_missing: '送料区分が未登録',
+        ne_code_not_found: 'NE品番に紐づいていない',
+        multiple_ne_codes: '1出品が複数のNE品番を指している',
+        product_not_found: 'NE商品が見つからない',
+        cost_missing: '原価が未登録',
+        set_cost_incomplete: 'セット原価が未完成',
+        price_missing: '売価が取れていない',
+        fee_missing: '手数料の見積が無い',
+        fba_fee_missing: 'FBA配送代行の見積が無い',
+        fee_revision_crossed: '手数料改定をまたいだ見積',
+        fulfillment_unresolved: '出荷区分が判定できない',
+        not_own_price: '自社の価格ではない',
+        scenario_undecidable: '標準シナリオに当てはまらない',
+        mall_fee_rate_unknown: 'モールの手数料率が未設定',
+        listing_inactive: '出品が停止中',
+        listing_incomplete: '出品情報が未完成',
+        listing_hidden: '非公開の出品',
+        empty_enumeration: '出品を1件も取れていない',
+        enum_failed: '出品の取得に失敗',
+      };
+      function epReason(code) {
+        if (!code) return '参考値';
+        if (EP_REASON[code]) return EP_REASON[code];
+        // `${入力}_${状態}` 形式 (例 cost_expired) はそのまま出すが、よくある語だけ置き換える
+        var m = String(code).replace(/^listing_enum_/, '出品一覧が ').replace(/^price_/, '売価が ')
+          .replace(/^cost_/, '原価が ').replace(/^fee_/, '手数料が ').replace(/^shipping_master_/, '送料区分が ')
+          .replace(/expired$/, '期限切れ').replace(/missing$/, '未取得');
+        return m;
+      }
+
       const isFba = epState.scope === 'fba_v1';
       html += '<div class="table-wrap"><table class="data-table"><thead><tr>';
       const cols = ['出品コード', '商品名', 'モール', '出荷', '売価(税抜)', '売価(税込)', '送料収入', '原価(税込前)',
@@ -583,7 +618,10 @@
         html += '<td>' + epNum(r.price_ex_tax) + '</td>';
         html += '<td>' + epNum(r.price_incl_tax) + '</td>';
         html += '<td>' + epNum(r.postage_revenue_ex_tax) + '</td>';
-        html += '<td>' + epNum(r.cost_ex_tax) + '</td>';
+        // まとめ買いSKU は単品原価 x 数量。何個ぶんかを出さないと原価が高すぎるように見える
+        var qtyTag = (r.unit_quantity > 1)
+          ? ' <span style="color:#b45309;font-size:11px;" title="この出品は単品 ' + r.unit_quantity + ' 個ぶん">x' + r.unit_quantity + '</span>' : '';
+        html += '<td>' + epNum(r.cost_ex_tax) + qtyTag + '</td>';
         if (isFba) {
           html += '<td>' + epNum(r.fba_fee_ex_tax) + '</td><td>—</td>';
         } else {
@@ -597,7 +635,7 @@
         html += '<td' + profitStyle + '>' + epNum(r.expected_profit) + '</td>';
         html += '<td' + profitStyle + '>' + epPct(r.expected_margin_rate) + '</td>';
         html += '<td style="font-size:11px;color:#6b7280;">'
-          + (r.rank_eligible_now ? '' : escapeHtml(r.rank_exclusion_reason_now || r.incomplete_reason || '参考値')) + '</td>';
+          + (r.rank_eligible_now ? '' : escapeHtml(epReason(r.rank_exclusion_reason_now || r.incomplete_reason))) + '</td>';
         html += '</tr>';
       }
       html += '</tbody></table></div>';

@@ -10,6 +10,7 @@
  */
 import assert from 'node:assert/strict';
 import { buildRow, resolveNeCode } from './build-row.js';
+import { normalizeQty } from './load-inputs.js';
 // 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
 import { feeCacheKey } from './calc.js';
 
@@ -312,6 +313,67 @@ t('resolveNeCode: 1対多 は ambiguous', () => {
 t('resolveNeCode: 見つからなければ unresolved', () => {
   const r = resolveNeCode({ mall: 'amazon', mall_item_key: 'x' }, new Map());
   assert.equal(r.status, 'unresolved');
+});
+
+
+console.log('');
+console.log('まとめ買いSKU の数量 (実データで判明: v_sku_resolved.数量 を読み捨てていた)');
+
+t('[!] 数量12 のSKUは 原価 × 12 になる', () => {
+  // 実データ: opbs454 (有機ピーナッツバター 454g) が 数量12。
+  // 単品原価 1,001 のまま計算していたので利益率 79.4% と出ていた
+  const ctx = baseCtx({ skuMap: new Map([['sku1', [{ ne_code: 'ne001', qty: 12 }]]]) });
+  const r = buildRow(amazonListing(), ctx);
+  assert.equal(r.unit_quantity, 12);
+  assert.ok(near(r.cost_ex_tax, 600 * 12), `期待 7200, 実際 ${r.cost_ex_tax}`);
+});
+
+t('数量1 なら原価はそのまま', () => {
+  const ctx = baseCtx({ skuMap: new Map([['sku1', [{ ne_code: 'ne001', qty: 1 }]]]) });
+  const r = buildRow(amazonListing(), ctx);
+  assert.equal(r.unit_quantity, 1);
+  assert.ok(near(r.cost_ex_tax, 600));
+});
+
+t('[!] 数量が分からない (楽天) ときは単品として計算する', () => {
+  // 楽天の対応表には数量列が無い。まとめ買いは価格の開きで別途外す
+  const r = buildRow(rakutenListing(), baseCtx());
+  assert.equal(r.unit_quantity, null);
+  assert.ok(near(r.cost_ex_tax, 600));
+});
+
+t('[!] 数量12 の FBA はランキングに載る (SP-API が実SKUで見積もるので送料の問題が無い)', () => {
+  const ctx = baseCtx({ skuMap: new Map([['sku1', [{ ne_code: 'ne001', qty: 12 }]]]), feeEstimates: feeCache() });
+  const r = buildRow(amazonListing(), ctx);
+  assert.equal(r.calculation_status, 'ok');
+  assert.equal(r.rank_eligible, 1);
+});
+
+t('[!] 数量12 の自社配送はランキングから外す (送料マスタが単品1個ぶんのため)', () => {
+  // 実データ: 数量100 のカミソリが「長3封筒」区分だった
+  const ctx = baseCtx({ skuMap: new Map([['sku1', [{ ne_code: 'ne001', qty: 12 }]]]) });
+  const r = buildRow(rakutenListing(), ctx);
+  assert.equal(r.calculation_status, 'ok', '計算はする (参考値として見える)');
+  assert.equal(r.rank_eligible, 0);
+  assert.equal(r.rank_exclusion_reason, 'quantity_shipping_unknown');
+});
+
+t('normalizeQty: 1以上の整数だけ採用する (0 や小数や null は数量不明)', () => {
+  assert.equal(normalizeQty(12), 12);
+  assert.equal(normalizeQty('3'), 3);
+  assert.equal(normalizeQty(1), 1);
+  assert.equal(normalizeQty(0), null);
+  assert.equal(normalizeQty(-2), null);
+  assert.equal(normalizeQty(1.5), null);
+  assert.equal(normalizeQty(null), null);
+  assert.equal(normalizeQty('あ'), null);
+});
+
+t('resolveNeCode は数量も返す', () => {
+  const m = new Map([['sku1', [{ ne_code: 'ne001', qty: 5 }]]]);
+  assert.equal(resolveNeCode({ mall: 'amazon', mall_item_key: 'sku1' }, m).qty, 5);
+  const m2 = new Map([['sku1', [{ ne_code: 'ne001' }]]]);
+  assert.equal(resolveNeCode({ mall: 'amazon', mall_item_key: 'sku1' }, m2).qty, null);
 });
 
 console.log(`\n${passed} 件 PASS`);

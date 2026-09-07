@@ -394,6 +394,13 @@ export function isRankEligible(row) {
       return { eligible: false, reason: `${input}_unexpected_${status}` };
     }
   }
+  // 🚨 まとめ買いSKU (数量2以上) を自社配送で出しているとき、送料マスタは
+  //    「単品1個ぶん」の区分なので実際の配送費と合わない (実データ: 数量100 が長3封筒区分)。
+  //    原価は数量倍で正しくなるが、送料は直せないので参考値にする。
+  //    FBA は SP-API が実SKUで見積もるのでこの問題は起きない
+  if (Number(row.unit_quantity) > 1 && !(row.mall === 'amazon' && row.fulfillment === 'FBA')) {
+    return { eligible: false, reason: 'quantity_shipping_unknown' };
+  }
   // FBM の送料収入不明は参考値 (§15-2)
   if (row.shipping_revenue_status === 'unknown') return { eligible: false, reason: 'shipping_revenue_unknown' };
   // 自社モール価格であること (Amazon は my_price。buybox 代替は採用しない)

@@ -21,7 +21,7 @@ export const HASH_COLUMNS = [
   'mall', 'shop_id', 'mall_item_key', 'ne_code', 'fulfillment',
   // 金額 (符号を決める)
   'expected_profit', 'expected_margin_rate',
-  'revenue_ex_tax', 'cost_ex_tax', 'shipping_total_ex_tax', 'fba_fee_ex_tax', 'fee_total_ex_tax',
+  'revenue_ex_tax', 'cost_ex_tax', 'unit_quantity', 'shipping_total_ex_tax', 'fba_fee_ex_tax', 'fee_total_ex_tax',
   // 対象集合・順位を決める
   'expense_scope_version', 'rank_eligible', 'calculation_status', 'listing_status',
   // 表示時の失効判定を変える

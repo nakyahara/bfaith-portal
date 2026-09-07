@@ -20,7 +20,7 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-it-'));
 process.env.SP_API_MARKETPLACE_ID = 'MKT1';
 process.env.SP_API_SELLER_ID = 'SELLER1';
 
-const { initExpectedProfitDB } = await import('./db.js');
+const { initExpectedProfitDB, createExpectedProfitSchema } = await import('./db.js');
 const { fetchAmazonListings, fetchRakutenListings } = await import('./fetch-listings.js');
 const { refreshFees } = await import('./refresh-fees.js');
 const { buildGeneration, validateGeneration } = await import('./build-generation.js');
@@ -44,11 +44,10 @@ const db = initExpectedProfitDB();
 const Database = (await import('better-sqlite3')).default;
 const remoteDb = new Database(path.join(process.env.DATA_DIR, 'remote.db'));
 remoteDb.pragma('foreign_keys = ON');
-{
-  // 受信側にも同じスキーマを作る (db.js の CREATE 文をそのまま流す)
-  const src = fs.readFileSync(new URL('./db.js', import.meta.url), 'utf8');
-  for (const m of src.matchAll(/db\.exec\(`([^`]+)`\)/g)) remoteDb.exec(m[1]);
-}
+// 受信側にも同じスキーマを作る。
+// 🚨 db.js を正規表現で読んで CREATE 文を拾う作りだと、ALTER 文が1つ増えただけで壊れ、
+//    列追加 (migrate) も通らない。本番と同じ関数を呼ぶ
+createExpectedProfitSchema(remoteDb);
 
 const NOW = new Date('2026-09-07T15:00:00Z');
 const FUTURE = '2099-01-01T00:00:00Z';

@@ -444,7 +444,7 @@ const EXPECTED_PROFIT_CSV_COLS = [
   ['出品コード', 'mall_item_key', true], ['商品名', 'product_name', true], ['モール', 'mall', true],
   ['出荷', 'fulfillment', true], ['NE品番', 'ne_code', true],
   ['売価(税抜)', 'price_ex_tax'], ['売価(税込)', 'price_incl_tax'], ['送料収入(税抜)', 'postage_revenue_ex_tax'],
-  ['原価(税抜)', 'cost_ex_tax'], ['原価の出所', 'cost_method', true],
+  ['原価(税抜)', 'cost_ex_tax'], ['原価の出所', 'cost_method', true], ['単品何個ぶん', 'unit_quantity'],
   ['送料区分', 'shipping_method', true], ['配送関係費', 'shipping_total_ex_tax'],
   ['FBA配送代行', 'fba_fee_ex_tax'], ['手数料率', 'fee_rate_display'], ['手数料', 'fee_total_ex_tax'],
   ['想定利益', 'expected_profit'], ['想定利益率', 'expected_margin_rate'],

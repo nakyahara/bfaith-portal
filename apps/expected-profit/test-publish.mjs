@@ -5,16 +5,19 @@
  * 実行: node apps/expected-profit/test-publish.mjs
  */
 import assert from 'node:assert/strict';
+import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-pub-'));
 
-const { initExpectedProfitDB } = await import('./db.js');
+const { initExpectedProfitDB, getExpectedProfitDB, addColumnIfMissing } = await import('./db.js');
 const { receiveChunk, publishGeneration, getPublished, chunkChecksum, pruneGenerations, generationContentHash } = await import('./publish-api.js');
 const { makeChunks, makeManifest, publishToRender } = await import('./publish.js');
 const { hashRows } = await import('./generation-hash.js');
+
+const cols = (d) => d.prepare('PRAGMA table_info(mart_listing_expected_profit)').all().map(c => c.name);
 
 let passed = 0;
 function t(name, fn) {
@@ -32,7 +35,7 @@ const mkRow = (key, over = {}) => ({
   generation_id: null, mall: 'rakuten', shop_id: '1', mall_item_key: key, ne_code: 'ne001',
   product_name: 'x', sales_class: 3, fulfillment: 'self', listing_status: 'active',
   price_incl_tax: 1100, price_ex_tax: 1000, postage_revenue_ex_tax: 0, revenue_ex_tax: 1000, tax_rate: 0.1,
-  cost_ex_tax: 600, cost_method: 'single', shipping_code: '501', shipping_method: 'ネコポス',
+  cost_ex_tax: 600, cost_method: 'single', unit_quantity: 1, shipping_code: '501', shipping_method: 'ネコポス',
   shipping_fee_ex_tax: 180, shipping_work_ex_tax: 20, shipping_material_ex_tax: 10, shipping_labor_ex_tax: 9,
   shipping_total_ex_tax: 219, fba_fee_ex_tax: 0, referral_fee_ex_tax: null, closing_fee_ex_tax: null,
   per_item_fee_ex_tax: null, fee_total_ex_tax: 100, fee_rate_display: 0.1, fee_breakdown: null,
@@ -340,6 +343,56 @@ t('[!] 公開中の世代は消さない', () => {
   assert.ok(after < before);
 });
 
-db.close();
+
+console.log('');
+console.log('既にあるDBへの列追加 (miniPC と Render の両方に既存DBがある)');
+
+t('[!] 列が無い古いDBでも初期化を通せば足される', () => {
+  const p = path.join(process.env.DATA_DIR, 'old.db');
+  const old = new Database(p);
+  // 列が1つ足りない状態を作る (unit_quantity だけ無い)
+  old.exec(`CREATE TABLE mart_listing_expected_profit (
+    generation_id TEXT NOT NULL, mall TEXT NOT NULL, shop_id TEXT NOT NULL,
+    mall_item_key TEXT NOT NULL, cost_method TEXT,
+    PRIMARY KEY (generation_id, mall, shop_id, mall_item_key))`);
+  assert.equal(cols(old).includes('unit_quantity'), false, '前提: まだ列が無い');
+  assert.equal(addColumnIfMissing(old, 'mart_listing_expected_profit', 'unit_quantity', 'INTEGER'), true);
+  assert.ok(cols(old).includes('unit_quantity'));
+  old.close();
+});
+
+t('2回流しても壊れない (冪等)', () => {
+  const p = path.join(process.env.DATA_DIR, 'old2.db');
+  const old = new Database(p);
+  old.exec('CREATE TABLE mart_listing_expected_profit (generation_id TEXT PRIMARY KEY)');
+  assert.equal(addColumnIfMissing(old, 'mart_listing_expected_profit', 'unit_quantity', 'INTEGER'), true);
+  assert.equal(addColumnIfMissing(old, 'mart_listing_expected_profit', 'unit_quantity', 'INTEGER'), false);
+  assert.equal(cols(old).filter(c => c === 'unit_quantity').length, 1);
+  old.close();
+});
+
+t('[!] 列追加に失敗したら例外を投げる (握り潰さない)', () => {
+  const p = path.join(process.env.DATA_DIR, 'old3.db');
+  const old = new Database(p);
+  assert.throws(() => addColumnIfMissing(old, 'no_such_table', 'x', 'INTEGER'));
+  old.close();
+});
+
+t('新規DBは初期化の時点で列を持っている', () => {
+  assert.ok(cols(db).includes('unit_quantity'));
+});
+
+t('[!] 本番の初期化 (initExpectedProfitDB) が既存DBに列を足す', () => {
+  // 🚨 addColumnIfMissing を直接呼ぶだけのテストでは「migrate を呼び忘れている」を
+  //    検出できない。既存DBから列を落として、本番の入口を通し直して確かめる
+  db.exec('ALTER TABLE mart_listing_expected_profit DROP COLUMN unit_quantity');
+  assert.equal(cols(db).includes('unit_quantity'), false, '前提: 列を落とせている');
+  const reopened = initExpectedProfitDB();     // 本番と同じ入口
+  assert.ok(cols(reopened).includes('unit_quantity'), '初期化を通したのに列が足されていない');
+});
+
+// 🚨 再オープンしていることがあるので、いま開いているハンドルを閉じる (Windows は開いたままだと消せない)
+try { getExpectedProfitDB().close(); } catch { /* 既に閉じている */ }
+try { db.close(); } catch { /* 再オープン済み */ }
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);

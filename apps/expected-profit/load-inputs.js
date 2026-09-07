@@ -52,14 +52,22 @@ export function loadShippingRates(wdb) {
  * Amazon = v_sku_resolved (1 SKU = N components)、楽天 = f_rakuten_sku_map。
  * 🚨 1 SKU が複数 NE を指す場合は配列のまま返す (呼び出し側が ambiguous と判定する)
  */
+/** 数量。読めない値は「単品として扱う」ではなく null にして、呼び出し側に判断させる */
+export function normalizeQty(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 1 ? n : null;
+}
+
 export function loadSkuMap(wdb, mall) {
   const map = new Map();
   if (mall === 'amazon') {
-    const rows = wdb.prepare('SELECT seller_sku, ne_code FROM v_sku_resolved').all();
+    // 🚨 数量 を落とさない。まとめ買いSKU (12個入り等) が単品原価で計算され、
+    //    利益率がランキング上位に化ける (実データ: opbs454 が 数量12 で 79.4%)
+    const rows = wdb.prepare('SELECT seller_sku, ne_code, 数量 AS qty FROM v_sku_resolved').all();
     for (const r of rows) {
       const k = String(r.seller_sku).toLowerCase();
       if (!map.has(k)) map.set(k, []);
-      map.get(k).push({ ne_code: String(r.ne_code).toLowerCase() });
+      map.get(k).push({ ne_code: String(r.ne_code).toLowerCase(), qty: normalizeQty(r.qty) });
     }
   } else if (mall === 'rakuten') {
     let rows = [];
@@ -69,7 +77,8 @@ export function loadSkuMap(wdb, mall) {
     for (const r of rows) {
       const k = String(r.rakuten_code).toLowerCase();
       if (!map.has(k)) map.set(k, []);
-      map.get(k).push({ ne_code: String(r.ne_code).toLowerCase() });
+      // 楽天の対応表には数量列が無い (実測)。まとめ買いは価格の開きでしか判定できない
+      map.get(k).push({ ne_code: String(r.ne_code).toLowerCase(), qty: null });
     }
   }
   return map;
