@@ -1669,45 +1669,48 @@ export function reconcileRepickBatches() {
   try {
     // ①梱包側で取消されたタスクのバッチを畳む。同じ伝票の複数タスクが1バッチのとき (PR-7):
     //    全部取消 → バッチも取消 / 一部取消で未着手 (ready) → その行だけ外す (着手済みは行を残し、完了時の同期で読み飛ばす)
-    const openBatches = db.prepare(`
-      SELECT id, status, pack_task_id FROM pk_batches
+    //    判定 (行→タスクを読む) と更新 (取消 / 行削除) は同じ BEGIN IMMEDIATE の中で行う — 判定の後に別接続の
+    //    createRepickBatch が行を足すと、生きた依頼ごと畳んでしまう (Codex PR-7 R2 High)
+    const openIds = db.prepare(`
+      SELECT id FROM pk_batches
       WHERE origin = 'repick' AND validity = 'valid' AND status IN ('ready','picking','paused')
-    `).all();
+    `).all().map((r) => r.id);
     const now = utcNow();
     const rows = [];
-    for (const b of openBatches) {
+    const settle = db.transaction((batchId) => {
+      // ロックを取ってから全部読み直す (一覧の SELECT からここまでに変わっていてもよい)
+      const b = db.prepare("SELECT id, status, validity, pack_task_id FROM pk_batches WHERE id=?").get(batchId);
+      if (!b || b.validity !== 'valid' || !['ready', 'picking', 'paused'].includes(b.status)) return null;
       const lines = db.prepare('SELECT seq, qty, pack_task_id FROM pk_lines WHERE batch_id=? ORDER BY seq').all(b.id);
       const ids = [...new Set(lines.map((l) => l.pack_task_id).filter(Boolean))];
       if (ids.length === 0 && b.pack_task_id) ids.push(b.pack_task_id);
-      if (ids.length === 0) continue;
+      if (ids.length === 0) return null;
       const tasks = db.prepare(`SELECT id, status FROM pk_pack_tasks WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
-      if (tasks.length === 0) continue;
+      if (tasks.length === 0) return null;
       if (tasks.length !== ids.length) {
         // 読めない行があるうちは畳まない・外さない (fail-closed — Codex PR-7 R1)
         console.warn(`[picking] 再ピックバッチ ${b.id} のタスクが一部見つかりません (期待 ${ids.join(',')} / 実際 ${tasks.map((t) => t.id).join(',')}) — 整理を見送り`);
-        continue;
+        return null;
       }
       const cancelled = new Set(tasks.filter((t) => t.status === 'cancelled').map((t) => t.id));
-      if (cancelled.size === 0) continue;
+      if (cancelled.size === 0) return null;
       if (cancelled.size >= tasks.length) {
         db.prepare("UPDATE pk_batches SET status='cancelled', validity='invalid', updated_at=? WHERE id=?").run(now, b.id);
-        rows.push(b);
-        continue;
+        return 'cancelled';
       }
-      if (b.status !== 'ready') continue;   // 着手済み: 行は残す (取下げは 3階の画面にバナーで伝わる)
+      if (b.status !== 'ready') return null;   // 着手済み: 行は残す (取下げは 3階の画面にバナーで伝わる)
       const drop = lines.filter((l) => l.pack_task_id && cancelled.has(l.pack_task_id));
-      if (drop.length === 0) continue;
-      db.transaction(() => {
-        // ロックを取ってから「まだ未着手か」を読み直す (別接続の start と競合させない — Codex PR-7 R1 High)
-        const cur = db.prepare('SELECT status, validity FROM pk_batches WHERE id=?').get(b.id);
-        if (!cur || cur.status !== 'ready' || cur.validity !== 'valid') return;
-        for (const l of drop) db.prepare('DELETE FROM pk_lines WHERE batch_id=? AND seq=?').run(b.id, l.seq);
-        const left = db.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(qty), 0) AS q, MIN(pack_task_id) AS t FROM pk_lines WHERE batch_id=?').get(b.id);
-        // 同期キー (pack_task_id) が取下げ済みなら残った行のタスクへ付け替える
-        const key = cancelled.has(b.pack_task_id) ? (left.t || b.pack_task_id) : b.pack_task_id;
-        db.prepare(`UPDATE pk_batches SET line_count=?, total_qty=?, composition=?, pack_task_id=?, updated_at=? WHERE id=?`)
-          .run(left.c, left.q, left.c > 1 ? '複数SKU' : '単品', key, now, b.id);
-      }).immediate();
+      if (drop.length === 0) return null;
+      for (const l of drop) db.prepare('DELETE FROM pk_lines WHERE batch_id=? AND seq=?').run(b.id, l.seq);
+      const left = db.prepare('SELECT COUNT(*) AS c, COALESCE(SUM(qty), 0) AS q, MIN(pack_task_id) AS t FROM pk_lines WHERE batch_id=?').get(b.id);
+      // 同期キー (pack_task_id) が取下げ済みなら残った行のタスクへ付け替える
+      const key = cancelled.has(b.pack_task_id) ? (left.t || b.pack_task_id) : b.pack_task_id;
+      db.prepare(`UPDATE pk_batches SET line_count=?, total_qty=?, composition=?, pack_task_id=?, updated_at=? WHERE id=?`)
+        .run(left.c, left.q, left.c > 1 ? '複数SKU' : '単品', key, now, b.id);
+      return 'trimmed';
+    });
+    for (const id of openIds) {
+      if (settle.immediate(id) === 'cancelled') rows.push({ id });
     }
     // ②バッチ未生成の再ピックタスクを拾って生成 (Codexレビュー: resolve時の生成が
     // 一時障害で失敗しても、一覧を開くたびにここで必ず収束する。tb_no / pk_lines.pack_task_id で冪等)

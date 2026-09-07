@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'picking-repick-test-'));
 
@@ -247,6 +248,39 @@ console.log('── PR-7: 同じ伝票の複数タスクは1つの 🔴 バッ�
     const b = db.prepare('SELECT status, line_count FROM pk_batches WHERE id=?').get(r1.batchId);
     assert.equal(b.status, 'ready', '畳まない');
     assert.equal(b.line_count, 2, '行も外さない');
+  });
+  t('Codex R2: 判定と取消は同じ書き込みロックの中 (別接続が書き込み中なら判定にも入らず、生きた依頼を畳まない)', () => {
+    // 別接続が BEGIN IMMEDIATE で書き込みロックを持っている間に reconcile を呼ぶ:
+    // 読むだけなら通ってしまう判定が、ロック待ち (busy_timeout) → SQLITE_BUSY で見送りになる = 判定がロックの内側にある証拠
+    const other = new Database(path.join(process.env.DATA_DIR, 'picking.db'));
+    db.pragma('busy_timeout = 300');
+    try {
+      db.prepare("UPDATE pk_pack_tasks SET status='cancelled' WHERE id=302").run();
+      other.exec('BEGIN IMMEDIATE');
+      const t0 = Date.now();
+      assert.equal(reconcileRepickBatches(), 0, 'ロック中は畳めない (見送り)');
+      assert.ok(Date.now() - t0 >= 250, `ロック待ちしている (${Date.now() - t0}ms)`);
+      assert.equal(db.prepare('SELECT status FROM pk_batches WHERE id=?').get(gid).status, 'ready');
+      // 別接続がその間に生きた依頼の行を足してコミット → ロック解放後の reconcile は足された行を見て畳まない
+      other.prepare(`INSERT INTO pk_lines (batch_id, seq, location, sku, qty, pack_task_id) VALUES (?, 9, '00100101', 'g-z', 1, 309)`).run(gid);
+      other.prepare("INSERT INTO pk_pack_tasks (id, status, kind, sku, batch_id, slip_seq) VALUES (309, 'requested', 'repick', 'g-z', 50, 9)").run();
+      other.exec('COMMIT');
+      reconcileRepickBatches();
+      const b = db.prepare('SELECT status, line_count FROM pk_batches WHERE id=?').get(gid);
+      assert.equal(b.status, 'ready', '足された依頼が生きているので畳まない');
+      assert.equal(b.line_count, 1, '取下げ済みの行だけ外れる');
+      assert.deepEqual(listLines(gid).map((l) => l.pack_task_id), [309]);
+      // 後片付け: 元の状態 (302 の行だけ・requested) に戻す
+      db.prepare('DELETE FROM pk_lines WHERE batch_id=? AND pack_task_id=309').run(gid);
+      db.prepare("DELETE FROM pk_pack_tasks WHERE id=309").run();
+      db.prepare("UPDATE pk_pack_tasks SET status='requested' WHERE id=302").run();
+      db.prepare(`INSERT INTO pk_lines (batch_id, seq, location, sku, qty, pack_task_id) VALUES (?, 2, '00201604', 'g-b', 2, 302)`).run(gid);
+      db.prepare("UPDATE pk_batches SET line_count=1, total_qty=2, pack_task_id=302 WHERE id=?").run(gid);
+    } finally {
+      try { other.exec('ROLLBACK'); } catch { /* commit 済み */ }
+      other.close();
+      db.pragma('busy_timeout = 5000');
+    }
   });
   t('reconcile ①: 全部取下げ → バッチごと取消', () => {
     db.prepare("UPDATE pk_pack_tasks SET status='cancelled' WHERE id=302").run();
