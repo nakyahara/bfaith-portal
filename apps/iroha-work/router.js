@@ -904,6 +904,8 @@ router.post('/api/progress', checkOrigin, api((req, res) => {
   const r = setProgress({
     taskId: progressTaskId, expectVersion: req.body?.expect_version,
     doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+    lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+    varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
     actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),

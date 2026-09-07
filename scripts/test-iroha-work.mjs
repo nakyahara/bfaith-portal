@@ -4848,10 +4848,75 @@ console.log('\n[27] できた数 — 実績を予定で上書きしない');
     ok(TD.getTask(t).done_qty === 55, '棚入完了にしても 55 のまま (つくる数 60 で上書きしない)');
   }
 
+  // ⑧ ⭐まとまりが 2 つ以上あるカードでは、数の書き換えを**書く前に断る** (Codex R1 重大)。
+  //    黙って何もしないと、カードだけ変わって「成功」が返り、一覧 (まとまりの合計) では元の数に戻って見える
+  {
+    const t = mk27('dc-9', 9709, 200);
+    const now9 = new Date().toISOString();
+    db.prepare(`INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, created_at, updated_at)
+      VALUES (?, 2, 80, 'not_started', ?, ?)`).run(t, now9, now9);
+    const before = { ver: TD.getTask(t).version, done: TD.getTask(t).done_qty ?? null, st: TD.getTask(t).status };
+
+    const r1 = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: before.ver, doneQty: 210 });
+    ok(!r1.ok && r1.error === 'split_card', '⭐作業が分かれたカードに数を送ったら断る (状態変更の口)');
+    ok(TD.getTask(t).version === before.ver && (TD.getTask(t).done_qty ?? null) === before.done && TD.getTask(t).status === before.st,
+      '断ったので、カードも数も状態も変わらない (入力が消えて成功が返る、を起こさない)');
+
+    const r2 = TD.setProgress({ taskId: t, expectVersion: before.ver, doneQty: 210 });
+    ok(!r2.ok && r2.error === 'split_card', '⭐あとから直す口でも断る');
+    const r3 = TD.setTaskBlock({ taskId: t, reason: 'label_shortage', expectVersion: before.ver, doneQty: 210 });
+    ok(!r3.ok && r3.error === 'split_card', '⭐「⛔ 止まった」の口でも断る');
+    ok(TD.getTask(t).blocked_reason == null, '断ったので札も付かない');
+
+    // 数を送らなければ、状態や札はふつうに変えられる
+    const r4 = TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: before.ver });
+    ok(r4.ok && TD.getTask(t).status === 'ready_for_stocking', '数を送らなければ、分かれたカードでも状態は変えられる');
+    db.prepare('DELETE FROM f_iroha_task_batches WHERE task_id = ? AND seq = 2').run(t);
+  }
+  // ⑨ ⛔止まった でも作れなかった数・ひとことが残る (以前は捨てていた)
+  {
+    const t = mk27('dc-10', 9710, 100);
+    const r = TD.setTaskBlock({ taskId: t, reason: 'materials_shortage', expectVersion: TD.getTask(t).version,
+      doneQty: 40, lossQty: 3, varianceNote: 'シールを3枚破いた' });
+    ok(r.ok, '前提: 止まった札を付けた');
+    const b = B.listBatchesOfTask(db, t)[0];
+    ok(b.good_qty === 40 && b.loss_qty === 3 && b.variance_note === 'シールを3枚破いた',
+      '⭐「⛔ 止まった」で入れた 作れなかった数・ひとこと も残る (以前はルーターまでで捨てていた)');
+    const bad = TD.setTaskBlock({ taskId: t, reason: 'materials_shortage', expectVersion: TD.getTask(t).version, lossQty: -1 });
+    ok(!bad.ok && bad.error === 'bad_loss_qty', '「⛔ 止まった」でも作れなかった数を検査する');
+  }
+  // ⑩ ひとことは消せる / 文字以外は断る
+  {
+    const t = mk27('dc-11', 9711, 100);
+    TD.setProgress({ taskId: t, expectVersion: TD.getTask(t).version, doneQty: 90, lossQty: 10, varianceNote: 'あとで直す' });
+    ok(B.listBatchesOfTask(db, t)[0].variance_note === 'あとで直す', '前提: ひとことが入っている');
+    TD.setProgress({ taskId: t, expectVersion: TD.getTask(t).version, varianceNote: '' });
+    ok(B.listBatchesOfTask(db, t)[0].variance_note == null, '⭐空文字を送ると消せる (送らない = 触らない、と区別)');
+    ok(B.listBatchesOfTask(db, t)[0].good_qty === 90, '消しても、できた数は残る');
+    const badNote = TD.setProgress({ taskId: t, expectVersion: TD.getTask(t).version, varianceNote: { a: 1 } });
+    ok(!badNote.ok && badNote.error === 'bad_variance_note', 'ひとことに文字以外は入らない (SQLite の例外にしない)');
+    const longNote = TD.setProgress({ taskId: t, expectVersion: TD.getTask(t).version, varianceNote: 'あ'.repeat(501) });
+    ok(!longNote.ok && longNote.error === 'bad_variance_note', '長すぎるひとことは切らずに断る');
+  }
+  // ⑪ 移行で持ってきた数は「人が数えた」に変わらない (触らないかぎり)
+  {
+    const t = mk27('dc-12', 9712, 500);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.prepare("UPDATE f_iroha_task_batches SET good_qty = 500, good_qty_source = 'migrated' WHERE id = ?").run(bid);
+    db.transaction(() => { B.recomputeTaskDoneQty(db, t); }).immediate();
+    // 数を送らずに棚入待ちへ = 触っていない → 印は migrated のまま
+    TD.changeTaskStatus({ taskId: t, to: 'ready_for_stocking', expectVersion: TD.getTask(t).version });
+    ok(db.prepare('SELECT good_qty_source FROM f_iroha_task_batches WHERE id = ?').get(bid).good_qty_source === 'migrated',
+      '⭐触らなければ migrated のまま (無操作で「人が数えた値」に格上げしない)');
+  }
+
   // ── 画面 ──
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
-  ok(!/defaultAll/.test(html) && /const cur = c\.done_qty == null \? '' : String\(c\.done_qty\);/.test(html),
+  ok(!/defaultAll/.test(html) && /const cur = \(c\.done_qty == null \|\| migrated\) \? '' : String\(c\.done_qty\);/.test(html),
     '⭐できあがりの数を「つくる数」で初期表示しない (そのまま押されて 予定 = 実績 になってしまう)');
+  ok(/const migrated = c\.done_qty != null && c\.counted === false;/.test(html)
+    && /これは数え直した値ではありません/.test(html),
+    '⭐移行で持ってきた数も埋めない (触らないまま押されると「人が数えた値」として確定してしまう)');
   ok(/'予定どおり \(' \+ c\.qty \+ ' 個\)'/.test(html),
     'タップで入れる選択肢は「全部」ではなく「予定どおり」(数えた結果として選ぶもの)');
   ok(/function dqDiff\(el\)/.test(html) && /'予定より ' \+ d \+ ' 個 多いです'/.test(html)
@@ -4859,13 +4924,16 @@ console.log('\n[27] できた数 — 実績を予定で上書きしない');
     '入れた数と予定の差をその場で出す (止めはしない — 差があるのは普通のこと)');
   ok(/data-loss="0"/.test(html) && />ありません</.test(html) && /data-loss="ask"/.test(html) && />あります</.test(html),
     '⭐作れなかった数は「ありません / あります」を選んでもらう (空欄を 0 と読まない)');
-  ok(/const loss = !lossPicked \? undefined : \(lossRaw === '' \? undefined : Number\(lossRaw\)\);/.test(html),
-    '何も選んでいなければ「数えていない」として送らない');
-  ok(/if \(v\.qty != null && c\.qty != null && Math\.abs\(v\.qty - c\.qty\) > Math\.max\(5, c\.qty \* 0\.1\) && !doneConfirmed\)/.test(html),
-    '予定と大きく違うときは、止めずにもう一度だけ確かめる');
+  ok(/const loss = !lossPicked \? undefined\s*\r?\n\s*: lossPicked\.dataset\.loss === '0' \? 0/.test(html),
+    '何も選んでいなければ「数えていない」として送らない。「ありません」を選んだら 0');
+  ok(/Math\.abs\(v\.qty - c\.qty\) > 5 \|\| Math\.abs\(v\.qty - c\.qty\) > c\.qty \* 0\.1/.test(html)
+    && /if \(far && doneConfirmed !== v\.qty\)/.test(html),
+    '⭐「5 個より多い か 1 割より多い」ずれで、止めずにもう一度だけ確かめる (max だと両方超えたときになる)');
+  ok(/doneConfirmed = null;\s*\r?\n\}/.test(html) && /doneConfirmed = v\.qty;/.test(html),
+    '⭐数を変えたら確認はやり直し (800 で確認を出したあと 80 に直して押す、を通さない)');
   ok(/\.\.\.\(v\.loss !== undefined \? \{ loss_qty: v\.loss \} : \{\}\)/.test(html)
-    && /\.\.\.\(v\.note \? \{ variance_note: v\.note \} : \{\}\)/.test(html),
-    '作れなかった数とひとことは、状態変更と同じ 1 回の通信で送る');
+    && /\.\.\.\(v\.note !== undefined \? \{ variance_note: v\.note \} : \{\}\)/.test(html),
+    '作れなかった数とひとことは、状態変更と同じ 1 回の通信で送る (空文字も送る = 消せる)');
   ok(/数が予定と違っていても、そのまま入れてください/.test(html), '「差があってよい」と画面に書く');
 }
 

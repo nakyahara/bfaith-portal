@@ -4446,11 +4446,11 @@ async function unblockOnly() {
 
 // ── ✅ できあがり → 棚入待ち (監修 B-7 / F-3) ──
 let doneTarget = null, doneSaving = false;
-let doneConfirmed = false;   // 予定と大きく違うときの「もう一度」
+let doneConfirmed = null;   // 予定と大きく違うときに「もう一度」を出した数 (数を変えたらやり直す)
 function openDone(c) {
   if (!can('task.status.change')) return;
   doneTarget = c.id;
-  doneConfirmed = false;
+  doneConfirmed = null;
   $('#doneName').textContent = c.title;
   $('#doneMsg').textContent = '';
   $('#doneBody').innerHTML = dqPanelHtml(c, '', { title: '何個できましたか', memo: false, loss: true });
@@ -4459,7 +4459,7 @@ function openDone(c) {
   openOverlay('#doneOv');
   $('#doneTitle').focus();
 }
-function closeDone() { if (doneSaving) return; closeOverlay('#doneOv'); doneTarget = null; doneConfirmed = false; $('#doneBody').innerHTML = ''; }
+function closeDone() { if (doneSaving) return; closeOverlay('#doneOv'); doneTarget = null; doneConfirmed = null; $('#doneBody').innerHTML = ''; }
 $('#doneOv').addEventListener('click', e => { if (e.target === $('#doneOv')) closeDone(); });
 async function submitDone() {
   if (doneSaving || doneTarget == null || !worker) return;
@@ -4469,8 +4469,11 @@ async function submitDone() {
   if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#doneMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
   if (v.loss != null && (!Number.isInteger(v.loss) || v.loss < 0)) { $('#doneMsg').textContent = '❌ 作れなかった数は 0 以上の整数で入れてください'; return; }
   // ⭐予定と大きく違うときは、止めずにもう一度だけ確かめる (Codex R3: 差が大きい場合は止めずに確認)
-  if (v.qty != null && c.qty != null && Math.abs(v.qty - c.qty) > Math.max(5, c.qty * 0.1) && !doneConfirmed) {
-    doneConfirmed = true;
+  // ⭐「5 個より多い **か** 1 割より多い」ずれで確かめる。max だと「両方超えたとき」になり、
+  //   1000 個の予定で 1010 個 (10 個ちがい) が素通りしていた (Codex R1 中)
+  const far = v.qty != null && c.qty != null && (Math.abs(v.qty - c.qty) > 5 || Math.abs(v.qty - c.qty) > c.qty * 0.1);
+  if (far && doneConfirmed !== v.qty) {
+    doneConfirmed = v.qty;
     const d = v.qty - c.qty;
     $('#doneMsg').textContent = '⚠ つくる数 ' + c.qty + ' 個に対して ' + v.qty + ' 個 ('
       + (d > 0 ? '+' : '') + d + ' 個) です。これでよければ、もう一度押してください';
@@ -4485,7 +4488,7 @@ async function submitDone() {
       body: JSON.stringify({ id: c.id, to: 'ready_for_stocking', worker_id: worker.id, expect_version: c.version,
         ...(v.qty != null ? { done_qty: v.qty } : {}),
         ...(v.loss !== undefined ? { loss_qty: v.loss } : {}),
-        ...(v.note ? { variance_note: v.note } : {}) }) });
+        ...(v.note !== undefined ? { variance_note: v.note } : {}) }) });
   } finally {
     doneSaving = false;
     for (const id of ['doneGo', 'doneLater']) document.getElementById(id).disabled = false;
@@ -4897,8 +4900,11 @@ function dqPanelHtml(c, actions, opts) {
   const o = Object.assign({ title: '何個までできましたか', memo: true, memoLabel: '中断メモ (任意) — 次にやる人が読みます',
     loss: false, note: false }, opts || {});
   // 🚨**予定 (つくる数) で埋めない** (要件 §AB-4)。埋めると、そのまま押されて「予定 = 実績」になってしまう。
-  //   2026-09-07 まではできあがりのダイアログを つくる数 で初期表示していた
-  const cur = c.done_qty == null ? '' : String(c.done_qty);
+  //   2026-09-07 まではできあがりのダイアログを つくる数 で初期表示していた。
+  // ⭐**移行で持ってきた数 (counted でない) も埋めない**。あれは棚入待ちで予定数に上書きされていた
+  //   可能性があるので、触らないまま押されると「人が数えた値」として確定してしまう (Codex R1 中)
+  const migrated = c.done_qty != null && c.counted === false;
+  const cur = (c.done_qty == null || migrated) ? '' : String(c.done_qty);
   const memo = c.hold_memo || '';
   const quick = [['0', 'まだ 0 個']];
   if (c.qty != null) {
@@ -4914,6 +4920,8 @@ function dqPanelHtml(c, actions, opts) {
       '<button type="button" data-dq="">数えていない</button></div>' +
     '<p class="sub dqdiff" data-qty="' + (c.qty == null ? '' : esc(String(c.qty))) + '">' +
       '数えていないときは空のままで構いません (0 個とは別のこととして残します)</p>' +
+    (migrated ? '<p class="sub warn">前の記録では ' + esc(String(c.done_qty)) +
+      ' 個ですが、これは数え直した値ではありません。実際にできた数を入れてください</p>' : '') +
     // ⭐作れなかった数。**空欄を 0 と読まない**ので「ありません / あります」を先に選んでもらう (要件 §AB-3)
     (o.loss ? '<label style="margin-top:12px">作れなかったものはありますか</label>' +
       '<div class="quick lossq">' +
@@ -4942,6 +4950,8 @@ function dqDiff(el) {
   const d = Number(v) - qty;
   p.textContent = d === 0 ? '予定どおりです' : d > 0 ? '予定より ' + d + ' 個 多いです' : '予定より ' + (-d) + ' 個 少ないです';
   p.classList.toggle('warn', d !== 0);
+  // ⭐数を変えたら確認はやり直し。800 で確認を出したあと 80 に直して押す、を通さない (Codex R1 中)
+  doneConfirmed = null;
 }
 /**
  * 入力欄の中身を読む。空文字は「数えていない」= null (0 に丸めない)。
@@ -4956,10 +4966,15 @@ function dqValues(rootSel) {
   const lossEl = root && root.querySelector('.dqLoss');
   const lossPicked = root && root.querySelector('[data-loss].on');
   const lossRaw = lossEl ? String(lossEl.value).trim() : '';
-  const loss = !lossPicked ? undefined : (lossRaw === '' ? undefined : Number(lossRaw));
-  const noteEl = root && root.querySelector('.dqNote');
+  // 「ありません」を選んだら 0。「あります」で数が空なら「数えていない」(送らない)
+  const loss = !lossPicked ? undefined
+    : lossPicked.dataset.loss === '0' ? 0
+    : (lossRaw === '' ? undefined : Number(lossRaw));
+  // ひとことは「ありません」のときは送らない (隠れた欄の中身を持っていかない)。
+  // ⭐空にしたら消せるよう、**空文字も送る** (undefined = 触らない、'' = 消す — Codex R1 中)
+  const noteEl = lossPicked && lossPicked.dataset.loss === '0' ? null : (root && root.querySelector('.dqNote'));
   return { qty: raw === '' ? null : Number(raw), raw, memo: memoEl ? String(memoEl.value).trim() : '',
-    loss, note: noteEl ? String(noteEl.value).trim() : '' };
+    loss, note: noteEl ? String(noteEl.value).trim() : undefined };
 }
 /** クイックボタン (まだ0個 / 半分 / 全部 / 数えていない) — 値は data-dq から取る。同じパネルの中の欄だけ書き換える */
 // 作れなかった数の「ありません / あります」(要件 §AB-3: 空欄を 0 と読まない)
