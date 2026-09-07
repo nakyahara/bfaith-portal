@@ -100,10 +100,15 @@ const rakutenPage = async () => ({
   nextCursorMark: null,
 });
 
+// 🚨 pastDeadline() は **実時計**を見る (夜間バッチは何時間も動くので、これが正しい)。
+//    固定日時の期限を渡すと、その日を過ぎた翌日から試験が落ちる = 書いた日にしか通らない試験になる
+//    (実際に翌日 落ちた)。期限そのものを見たい試験だけが、明示的に過去/未来を渡す
+const FUTURE_DEADLINE = () => new Date(Date.now() + 6 * 60 * 60 * 1000);
+
 await ta('[!] 一本通ると世代ができて公開される', async () => {
   const published = [];
   const r = await runNightly({
-    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
     malls: ['rakuten'], skipFees: true,
     fetchDeps: { rakuten: { searchPage: rakutenPage } },
     publishDeps: {
@@ -122,7 +127,7 @@ await ta('[!] 一本通ると世代ができて公開される', async () => {
 
 await ta('[!] 1モールの取得が失敗しても、他モールで世代を作る (fail-soft)', async () => {
   const r = await runNightly({
-    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
     malls: ['amazon', 'rakuten'], skipFees: true,
     fetchDeps: {
       amazon: { getActiveListingsReport: async () => { throw new Error('SP-API 500'); } },
@@ -144,7 +149,7 @@ await ta('[!] 1モールの取得が失敗しても、他モールで世代を�
 
 await ta('[!] 読み戻しで確認できなければ ok にしない', async () => {
   const r = await runNightly({
-    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
     malls: ['rakuten'], skipFees: true,
     fetchDeps: { rakuten: { searchPage: rakutenPage } },
     publishDeps: {
@@ -161,7 +166,7 @@ await ta('[!] 読み戻しで確認できなければ ok にしない', async ()
 await ta('[!] 検証で拒否された世代は転送しない', async () => {
   let sent = false;
   const r = await runNightly({
-    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
     malls: ['rakuten'], skipFees: true,
     // 列挙が空 → 世代0行 → 検証で拒否
     fetchDeps: { rakuten: { searchPage: async () => ({ results: [], nextCursorMark: null }) } },
@@ -179,7 +184,7 @@ await ta('[!] 検証で拒否された世代は転送しない', async () => {
 await ta('--skip-publish なら世代だけ作って転送しない', async () => {
   let sent = false;
   const r = await runNightly({
-    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
     malls: ['rakuten'], skipFees: true, skipPublish: true,
     fetchDeps: { rakuten: { searchPage: rakutenPage } },
     publishDeps: { postChunk: async () => { sent = true; return { ok: true }; } },
@@ -193,7 +198,7 @@ await ta('--skip-publish なら世代だけ作って転送しない', async () =
 await ta('[!] 期限を過ぎたら新しい取得を始めない (全工程に伝播している)', async () => {
   let fetched = false;
   const r = await runNightly({
-    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
     deadline: new Date('2000-01-01T00:00:00Z'),   // 既に過ぎている
     malls: ['rakuten'], skipFees: true,
     fetchDeps: { rakuten: { searchPage: async () => { fetched = true; return { results: [], nextCursorMark: null }; } } },
@@ -231,7 +236,7 @@ await ta('[!] 処理の途中で期限を跨いだら、そこで取得を止め
 await ta('[!] 転送の途中で期限を跨いだら、そこで止めて公開しない', async () => {
   // 世代を作ってから、期限切れの deadline で転送する
   const built = await runNightly({
-    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
     malls: ['rakuten'], skipFees: true, skipPublish: true,
     fetchDeps: { rakuten: { searchPage: rakutenPage } },
     log: () => {},

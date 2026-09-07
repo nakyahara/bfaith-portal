@@ -17,10 +17,58 @@ import { getExpectedProfitDB, getSetting, setSetting, SETTING_AMAZON_SELLER_ID }
 import { canReuseFeeEstimate, normalizeFeeEstimate, feeCacheKey } from './calc.js';
 import { nowIso, addDays } from './util.js';
 
-const FEE_VALID_DAYS = 14;
-const BATCH_SIZE = 20;          // getMyFeesEstimates の batch 上限
-const BATCH_SLEEP_MS = 2100;    // restore_rate=2 (0.5 RPS) + 余裕
+/**
+ * SP-API の公式値 (2026-09-08 確認)
+ *   getMyFeesEstimates : rate 0.5 req/s, burst 1, batch 上限 20
+ *   → バッチ間は最低 2,000ms 空ける。ここを詰めると 429 になる
+ *   https://developer-docs.amazon.com/sp-api/reference/getmyfeesestimates
+ *
+ * 🚨 全出品ぶん取り直すと 7,385 ÷ 20 = 370 回 × 2.1 秒 ≒ 13 分。
+ *    毎晩これをやると、この 1 機能で日次の枠を食い潰す。**再利用が効いていることが前提**。
+ */
+export const SP_API_FEES_RATE_PER_SEC = 0.5;   // 公式値 (2026-09-08 確認)
+export const SP_API_FEES_MAX_BATCH = 20;       // 公式値
+export const BATCH_SIZE = SP_API_FEES_MAX_BATCH;
+export const BATCH_SLEEP_MS = 2100;            // = 1/0.5秒 (2,000ms) + 余裕
 const MAX_RETRIES = 3;
+
+/**
+ * 見積の有効期間。
+ *
+ * 🚨 全部を同じ日数にすると、同じ晩に取ったものが**同じ晩に一斉失効**する。
+ *    14 日ごとに 7,385 件の取り直しが起きる (雪崩)。
+ *    SKU ごとに決まったズレを持たせて、失効する晩をばらけさせる。
+ *    ズレは SKU から決まるので、同じ SKU は毎回同じ位相になる (毎晩ズレ直さない)。
+ */
+const FEE_VALID_MIN_DAYS = 7;
+const FEE_VALID_SPREAD_DAYS = 8;   // 7〜14 日 → 1 晩あたり約 1/8 が失効
+const FEE_VALID_DAYS = FEE_VALID_MIN_DAYS + FEE_VALID_SPREAD_DAYS - 1;   // 上限 = 14 日
+
+/**
+ * 1 晩に取り直す上限。
+ *
+ * 🚨 キーの作り方を間違えると「全件がキャッシュに当たらない」が静かに起きる
+ *    (実際に起きた: seller_id が env に無く、キーが null で作られた)。
+ *    上限を置いて、1 晩で枠を使い切らないようにする。残りは翌晩に回る。
+ *    200 バッチ × 2.1 秒 ≒ 7 分。
+ */
+const FEE_MAX_FETCH_PER_RUN = 4000;
+
+/** 取り直しが多すぎるときに警告する閾値 (キャッシュが温まっているのに半分以上ならおかしい) */
+const REFETCH_ANOMALY_RATIO = 0.5;
+
+/** SKU から決まる 0..(spread-1) のズレ。文字列ハッシュ (djb2) */
+export function validityOffsetDays(sellerSku, spread = FEE_VALID_SPREAD_DAYS) {
+  let h = 5381;
+  const str = String(sellerSku ?? '');
+  for (let i = 0; i < str.length; i++) h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+  return h % spread;
+}
+
+/** この SKU の見積が何日もつか (7〜14 日) */
+export function feeValidDays(sellerSku) {
+  return FEE_VALID_MIN_DAYS + validityOffsetDays(sellerSku);
+}
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -57,6 +105,17 @@ export function rememberSellerId(db, sellerId, now) {
 export function withResolvedSeller(targets, knownSellerId) {
   if (!knownSellerId) return targets;
   return targets.map(t => (t?.seller_id === knownSellerId ? t : { ...t, seller_id: knownSellerId }));
+}
+
+/** 取り直しの理由を数える (input_mismatch はどの項目かまでまとめる) */
+export function countReasons(need) {
+  const out = {};
+  for (const n of need) {
+    const key = String(n.reason || 'unknown').split(':')[0] === 'input_mismatch'
+      ? String(n.reason) : String(n.reason || 'unknown');
+    out[key] = (out[key] || 0) + 1;
+  }
+  return out;
 }
 
 export function planRefresh(targets, cachedByKey, now = new Date()) {
@@ -151,7 +210,7 @@ export function toEstimateRow(target, feesEstimate, fetchedAt, sellerIdFromRespo
     fee_breakdown: JSON.stringify(feesEstimate?.FeeDetailList ?? []),
     fee_status: n.status,
     fetched_at: fetchedAt,
-    valid_until: addDays(fetchedAt, FEE_VALID_DAYS),
+    valid_until: addDays(fetchedAt, feeValidDays(target.seller_sku)),
   };
 }
 
@@ -202,7 +261,21 @@ export async function refreshFees(db, targets, deps = {}) {
   const knownSellerId = storedSellerId(db);
   const resolved = withResolvedSeller(valid, knownSellerId);
   const cached = loadCache(db);
-  const { need, reuse } = planRefresh(resolved, cached, now());
+  const planned = planRefresh(resolved, cached, now());
+  const reuse = planned.reuse;
+
+  // 🚨 キャッシュが温まっているのに半分以上を取り直すのは、キーの作り方が壊れた合図。
+  //    静かに 370 回叩かせず、結果に出す (実際に seller_id で起きた)
+  const refetchAnomaly = cached.size > 0 && resolved.length > 0
+    && planned.need.length > resolved.length * REFETCH_ANOMALY_RATIO;
+
+  // 取り直す順番: 見積そのものが無い/入力が変わった → 先。期限切れは後。
+  // 前者は行が計算できない (キーが当たらない)、後者は数字は出るがランキングに載らないだけ
+  const priority = (r) => (r.reason === 'expired' ? 1 : 0);
+  const ordered = [...planned.need].sort((a, b) => priority(a) - priority(b));
+  const maxFetch = deps.maxFetch ?? FEE_MAX_FETCH_PER_RUN;
+  const need = ordered.slice(0, maxFetch);
+  const deferred = ordered.length - need.length;   // 上限で翌晩に回した数
 
   const callApi = deps.callFeesApi || defaultCallFeesApi;
   const sleepMs = deps.sleepMs ?? BATCH_SLEEP_MS;
@@ -290,6 +363,11 @@ export async function refreshFees(db, targets, deps = {}) {
   const failedTargets = errors.length + batchErrors.reduce((a, b) => a + b.targets, 0);
   return {
     targets: targets.length,
+    deferred,                 // 1晩の上限で翌晩に回した数
+    refetchAnomaly,           // 🚨 キャッシュが効いていない合図
+    plannedRefetch: ordered.length,
+    // 取り直しの理由の内訳。キャッシュが当たらない原因が入力なのか期限なのか分かる
+    refetchReasons: countReasons(ordered),
     sellerId: observedSellerId || (sellerConflict ? null : knownSellerId),
     sellerConflict,
     observedSellers: [...observedSellers],

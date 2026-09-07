@@ -116,7 +116,14 @@ export async function runNightly(opts = {}) {
       const targets = feeTargetsFrom(latest, { sellerId, marketplaceId });
       const r = await refreshFees(db, targets, { deadline, now: () => new Date(), ...(opts.feeDeps || {}) });
       result.steps.push({ step: 'fees', ok: true, ...r });
-      log(`[expected-profit] 手数料: 再取得${r.refreshed} 再利用${r.reused} 失敗${r.failedTargets} 未処理${r.pendingTargets}`);
+      log(`[expected-profit] 手数料: 再取得${r.refreshed} 再利用${r.reused} 失敗${r.failedTargets} 未処理${r.pendingTargets}`
+        + (r.deferred ? ` 翌晩に回した${r.deferred}` : ''));
+      // 🚨 キャッシュが効いていないなら必ず出す。SP-API は 0.5 req/s なので、
+      //    全件取り直しは 13 分かかり、静かに毎晩やると枠を食い潰す
+      if (r.refetchAnomaly) {
+        log(`[expected-profit] 🚨 手数料の再利用が効いていない: ${r.plannedRefetch}/${r.targets} 件を取り直そうとした`
+          + ` 理由=${JSON.stringify(r.refetchReasons)}`);
+      }
     } catch (e) {
       result.steps.push({ step: 'fees', ok: false, error: e.message });
       log(`[expected-profit] 手数料 失敗: ${e.message}`);

@@ -14,7 +14,9 @@ process.env.SP_API_MARKETPLACE_ID = 'A1VC38T7YXB528';
 
 const { initExpectedProfitDB } = await import('./db.js');
 const { planRefresh, buildFeeRequest, toEstimateRow, saveEstimates, loadCache, refreshFees, cacheKey,
-  storedSellerId, withResolvedSeller, rememberSellerId } = await import('./refresh-fees.js');
+  storedSellerId, withResolvedSeller, rememberSellerId,
+  validityOffsetDays, feeValidDays,
+  BATCH_SIZE, BATCH_SLEEP_MS, SP_API_FEES_RATE_PER_SEC, SP_API_FEES_MAX_BATCH } = await import('./refresh-fees.js');
 const { getSetting, setSetting, SETTING_AMAZON_SELLER_ID } = await import('./db.js');
 const forgetSeller = () => setSetting(db, SETTING_AMAZON_SELLER_ID, null);
 
@@ -117,9 +119,34 @@ t('FBM は FBAFees が無いので NULL (0で代用しない)', () => {
   assert.equal(row.fba_fee_incl_tax, null);
 });
 
-t('有効期限 14 日が入る', () => {
+t('[!] 有効期限は SKU ごとに 7〜14 日にばらける (一斉失効を防ぐ)', () => {
+  // 🚨 全部を同じ日数にすると、同じ晩に取ったものが同じ晩に一斉失効し、
+  //    14 日ごとに 7,385 件の取り直しが起きる。SP-API は 0.5 req/s なので 13 分かかる
   const row = toEstimateRow(target(), feeResponse('x')[0].FeesEstimate, '2026-09-07T00:00:00Z');
-  assert.equal(row.valid_until, '2026-09-21T00:00:00.000Z');
+  const days = feeValidDays('sku1');
+  assert.ok(days >= 7 && days <= 14, `7〜14日のはず (実際 ${days})`);
+  const expected = new Date(Date.UTC(2026, 8, 7 + days)).toISOString();
+  assert.equal(row.valid_until, expected);
+});
+
+t('[!] 同じ SKU なら毎回同じズレになる (毎晩ズレ直さない)', () => {
+  assert.equal(validityOffsetDays('sku1'), validityOffsetDays('sku1'));
+  assert.equal(feeValidDays('sku1'), feeValidDays('sku1'));
+});
+
+t('[!] ズレは 0〜7 の範囲に散る (どれか1日に固まらない)', () => {
+  const seen = new Set();
+  for (let i = 0; i < 400; i++) seen.add(validityOffsetDays('pr_1272115_F_2025_' + i));
+  assert.equal(seen.size, 8, `8種類に散るはず (実際 ${seen.size})`);
+  // 偏りも見る: 400件を8つに分けて、どれも極端に少なくない
+  const counts = new Array(8).fill(0);
+  for (let i = 0; i < 400; i++) counts[validityOffsetDays('pr_1272115_F_2025_' + i)]++;
+  assert.ok(Math.min(...counts) >= 20, `偏りすぎ: ${JSON.stringify(counts)}`);
+});
+
+t('SKU が空でも落ちない', () => {
+  assert.ok(Number.isInteger(validityOffsetDays(null)));
+  assert.ok(feeValidDays(undefined) >= 7);
 });
 
 t('生の内訳を残す (表示・監査用)', () => {
@@ -494,6 +521,110 @@ await ta('[!] 応答が誰も名乗らないときだけ、既知のセラーで
   assert.equal(db.prepare("SELECT seller_id FROM amazon_fee_estimate WHERE seller_sku = 'noName'").get().seller_id, 'S_KNOWN');
   assert.equal(getSetting(db, SETTING_AMAZON_SELLER_ID), 'S_KNOWN', '名乗っていないのに覚え直してはいけない');
   forgetSeller();
+});
+
+
+console.log('');
+t('[!] SP-API の公式レート制限を守っている (詰めると 429 になる)', () => {
+  // 公式: getMyFeesEstimates は rate 0.5 req/s / burst 1 / batch 上限 20
+  // https://developer-docs.amazon.com/sp-api/reference/getmyfeesestimates
+  // 🚨 ここを速くしたくなったら、先に公式ドキュメントを見直すこと。
+  //    burst が 1 なので、連続呼び出しは 1/0.5 = 2,000ms 以上あけないと必ず弾かれる
+  const minGapMs = 1000 / SP_API_FEES_RATE_PER_SEC;
+  assert.equal(minGapMs, 2000);
+  assert.ok(BATCH_SLEEP_MS >= minGapMs, `バッチ間隔 ${BATCH_SLEEP_MS}ms は ${minGapMs}ms 以上でなければならない`);
+  assert.ok(BATCH_SIZE <= SP_API_FEES_MAX_BATCH, `1リクエスト ${BATCH_SIZE} 件は上限 ${SP_API_FEES_MAX_BATCH} を超えている`);
+});
+
+t('リトライのバックオフもレート制限より短くならない', () => {
+  // 実装は sleepMs * (attempt + 1) で伸ばす。1回目が既に 2,000ms 以上あればよい
+  assert.ok(BATCH_SLEEP_MS * 1 >= 1000 / SP_API_FEES_RATE_PER_SEC);
+});
+
+console.log('再利用が効いているか (SP-API は 0.5 req/s。取り直しは 13 分かかる)');
+
+// 見積を n 件、キャッシュに入れる
+function seedCache(n, { price = 1000, validUntil = '2099-01-01T00:00:00Z' } = {}) {
+  db.exec('DELETE FROM amazon_fee_estimate');
+  const rows = [];
+  for (let i = 0; i < n; i++) {
+    const r = toEstimateRow(target({ seller_sku: 'c' + i, in_listing_price: price }),
+      feeResponse('x')[0].FeesEstimate, '2026-09-07T00:00:00Z');
+    r.valid_until = validUntil;
+    rows.push(r);
+  }
+  saveEstimates(db, rows);
+  return Array.from({ length: n }, (_, i) => target({ seller_sku: 'c' + i, in_listing_price: price }));
+}
+
+await ta('[!] 入力が変わっていなければ 1 件も取りに行かない', async () => {
+  forgetSeller();
+  const targets = seedCache(50);
+  let called = 0;
+  const r = await refreshFees(db, targets, { sleepMs: 0, callFeesApi: async () => { called++; return []; } });
+  assert.equal(called, 0, 'API を叩いてはいけない');
+  assert.equal(r.reused, 50);
+  assert.equal(r.refreshed, 0);
+  assert.equal(r.refetchAnomaly, false);
+});
+
+await ta('[!] 1 晩に取り直す件数に上限がある (枠を使い切らない)', async () => {
+  forgetSeller();
+  const targets = seedCache(50, { validUntil: '2000-01-01T00:00:00Z' });   // 全部期限切れ
+  let batches = 0;
+  const r = await refreshFees(db, targets, {
+    sleepMs: 0, maxFetch: 20,
+    callFeesApi: async (body) => { batches++; return body.map(b => feeResponse(b.FeesEstimateRequest.Identifier)[0]); },
+  });
+  assert.equal(batches, 1, '20件 = 1バッチだけ');
+  assert.equal(r.deferred, 30, '残り30件は翌晩に回る');
+  assert.equal(r.plannedRefetch, 50);
+});
+
+await ta('[!] キャッシュが温まっているのに大量に取り直すなら警告する', async () => {
+  // 🚨 これが seller_id の不具合を検出できる形。静かに 370 回叩かせない
+  forgetSeller();
+  seedCache(50);
+  // 価格を全部変えた = 全件キー不一致
+  const targets = Array.from({ length: 50 }, (_, i) => target({ seller_sku: 'c' + i, in_listing_price: 9999 }));
+  const r = await refreshFees(db, targets, {
+    sleepMs: 0, maxFetch: 0,
+    callFeesApi: async () => { throw new Error('叩かせない'); },
+  });
+  assert.equal(r.refetchAnomaly, true);
+  assert.equal(r.plannedRefetch, 50);
+});
+
+await ta('キャッシュが空 (初回) なら警告しない', async () => {
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  const r = await refreshFees(db, [target({ seller_sku: 'first' })], {
+    sleepMs: 0, maxFetch: 0, callFeesApi: async () => { throw new Error('叩かせない'); },
+  });
+  assert.equal(r.refetchAnomaly, false, '初回の全件取得は異常ではない');
+});
+
+await ta('[!] 取り直しは「入力が変わった/見積が無い」を先にやる (期限切れは後)', async () => {
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  // 期限切れ 2 件 (入力は一致) と、見積が無い 1 件
+  const expired = [];
+  for (const sku of ['e1', 'e2']) {
+    const r = toEstimateRow(target({ seller_sku: sku }), feeResponse('x')[0].FeesEstimate, '2026-09-07T00:00:00Z');
+    r.valid_until = '2000-01-01T00:00:00Z';
+    expired.push(r);
+  }
+  saveEstimates(db, expired);
+  const targets = [target({ seller_sku: 'e1' }), target({ seller_sku: 'e2' }), target({ seller_sku: 'new1' })];
+  const asked = [];
+  await refreshFees(db, targets, {
+    sleepMs: 0, maxFetch: 1,
+    callFeesApi: async (body) => {
+      for (const b of body) asked.push(String(b.FeesEstimateRequest.Identifier).split("|")[0]);
+      return body.map(b => feeResponse(b.FeesEstimateRequest.Identifier)[0]);
+    },
+  });
+  assert.deepEqual(asked, ['new1'], '見積が無いものを先に取る (期限切れは数字が出るだけまし)');
 });
 
 db.close();
