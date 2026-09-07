@@ -406,7 +406,7 @@ console.log('\n[9] 画面が安全弁を通している (退行防止)');
     '映像を切り取らずに出している (枠の % と映像の % がずれない)');
 
   // 🚨 2026-09-07 実機: カメラは開いたのに映像が黒いままだった。原因は下の3つ
-  const openAt = html.indexOf('getUserMedia({ video:');
+  const openAt = html.indexOf('getUserMedia(CAMERA_TRIES[');
   const loadAt = html.indexOf('await loadDecoder()');
   ok(openAt > 0 && loadAt > openAt,
     '🚨 カメラを先に開けてからデコーダを読む (先に wasm を落とすと iOS の「押した」扱いが切れて再生されない)');
@@ -450,6 +450,27 @@ console.log('\n[9] 画面が安全弁を通している (退行防止)');
   ok(/gen !== scanGen/.test(catchBody) && catchBody.indexOf('gen !== scanGen') < catchBody.indexOf('banner('),
     '🚨 デコーダの失敗より先に「もう閉じられたか」を見る (閉じた後にエラーだけ残さない)');
   ok(/playError = playError \|\| e/.test(html), 'あとから来た play() の失敗も捨てない (現場調査に使う)');
+
+  // 🚨 2026-09-07 実機2回目: getUserMedia は成功するのにトラックが即 ended になった。
+  //    原因を現場から聞き取れる形にしておく (経過ms / track / video / play / どこから開いたか)
+  ok(/const diag = \(\) =>/.test(html) && /esc\(diag\(\)\)/.test(html),
+    '🚨 打ち切りの案内に診断 (経過ms・track・video・play・起動元) を添える');
+  ok(/track\.addEventListener\('ended'/.test(html),
+    'ended を直接拾って「いつ切れたか」を残す (500ms の見張りより早い)');
+  ok(/isStandalone/.test(html) && /window\.navigator\.standalone/.test(html),
+    'ホーム画面 (standalone) から開いたかを見て案内を変える');
+  ok(/const CAMERA_TRIES = \[/.test(html) && /video: true/.test(html),
+    '🚨 カメラの条件を段階的に緩める (iPad は条件が強いと掴めても即切れることがある)');
+  ok(/heldMs < 3000 && cameraTry < CAMERA_TRIES\.length - 1/.test(html),
+    'つないだ直後に切れたら、次の (より緩い) 条件で取り直す');
+  ok(/OverconstrainedError/.test(html) && /cameraTry\+\+/.test(html),
+    '条件が強すぎて掴めないときも、緩めて取り直す');
+  ok(/cameraTry = 0; startScan\(\)/.test(html), 'ボタンを押し直したら条件を最初から');
+  ok(/Split View/.test(html), 'iPad で画面を2分割していると使えないことを案内する');
+  ok(html.indexOf("scanStarting = false;") < html.indexOf("setTimeout(() => { startScan(); }"),
+    '取り直しの前に「起動中」の札を外す (外さないと取り直しが素通りする)');
+  ok(/const endStarting = \(\) => \{ if \(gen === scanGen\)/.test(html),
+    '古い起動が遅れて戻っても、新しい起動の札を外さない (世代を見る)');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

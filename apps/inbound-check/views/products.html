@@ -319,6 +319,21 @@
     }
 
     let scanStream = null, scanTimer = null, scanStarting = false, scanGen = 0, scanCanvas = null, scanWatchTimer = null;
+    // 🚨 実機で「カメラが切れました」が出たとき、**何がいつ起きたか**を現場から聞けるようにする
+    //    (2026-09-07。getUserMedia は成功したのにトラックが即 ended になる = 端末側が手放している)。
+    //    ホーム画面アイコン (standalone) から開いた iPad で起きやすい
+    const isStandalone = () => !!(window.navigator.standalone
+      || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+    // 🚨 **カメラの条件は段階的に緩める** (2026-09-07 実機: iPhone は通るが iPad だけ即切れる)。
+    //    iPad は背面/前面が複数あり、解像度や facingMode の指定が強いと
+    //    **getUserMedia は成功するのにトラックが即 ended になる**ことがある。
+    //    掴めなかった / すぐ切れた ら、次の (より緩い) 条件で取り直す
+    const CAMERA_TRIES = [
+      { video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false },
+      { video: { facingMode: 'environment' }, audio: false },
+      { video: true, audio: false },                    // 最後は「どのカメラでもよい」
+    ];
+    let cameraTry = 0;
     async function startScan() {
       if (scanStarting || scanStream) return;      // 連打で getUserMedia が二重に走ると、先の stream を止められなくなる
       const gen = ++scanGen;                       // カメラが返ってくる前に画面を離れたかを見分ける
@@ -330,20 +345,31 @@
       scanStarting = true;
       const btn = $('#scanBtn');
       btn.disabled = true;
-      const endStarting = () => { scanStarting = false; btn.disabled = false; };
+      // 🚨 世代を見る。取り直しで新しい起動が始まった後に、古い起動が遅れて戻ってきて
+      //    「起動中」の札を外すと、新しい起動と取り合いになる
+      const endStarting = () => { if (gen === scanGen) { scanStarting = false; btn.disabled = false; } };
       // 🚨 **カメラを先に開ける**。デコーダ (wasm 約1MB) の読み込みを先にすると、その待ち時間で
       //    iOS の「利用者が押した」扱いが切れ、映像が黒いまま再生されない (2026-09-07 実機で発生)。
       //    デコーダは映像が出ている間に落とす
       let stream = null;
-      try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false }); }
+      const tryIndex = Math.min(cameraTry, CAMERA_TRIES.length - 1);
+      try { stream = await navigator.mediaDevices.getUserMedia(CAMERA_TRIES[tryIndex]); }
       catch (e) {
+        // 条件が強すぎて掴めないだけなら、緩めてもう一度 (画面には出さない)
+        if (cameraTry < CAMERA_TRIES.length - 1
+            && e && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError' || e.name === 'NotReadableError')) {
+          cameraTry++;
+          endStarting();
+          setTimeout(() => { startScan(); }, 200);
+          return;
+        }
         // 何が起きたかで打つ手が違う。「許可してください」だけだと、カメラが無い/塞がっているときに現場が設定をいじり続ける
         const msg = e && e.name === 'NotAllowedError' ? 'カメラの使用が許可されていません。iPad の設定 → Safari → カメラ でこのサイトを「許可」にしてください'
           : e && e.name === 'NotFoundError' ? 'この端末にカメラが見つかりません。検索欄を長押し →「テキストをスキャン」を使ってください'
           : e && e.name === 'NotReadableError' ? 'カメラを他のアプリが使っています。そのアプリを閉じてからもう一度押してください'
           : location.protocol !== 'https:' && location.hostname !== 'localhost' ? 'この画面は https でないため、カメラを使えません'
           : 'カメラを使えませんでした (' + esc((e && e.name) || '') + ')';
-        banner('err', msg, { sticky: true });
+        banner('err', msg + '<br><small>' + (isStandalone() ? 'ホーム画面から起動' : 'ブラウザで起動') + '</small>', { sticky: true });
         endStarting();
         return;
       }
@@ -385,6 +411,32 @@
       //      カメラが映像を出せなくても video は黒いコマを再生し続け、currentTime は進むため。
       const track = (scanStream.getVideoTracks && scanStream.getVideoTracks()[0]) || null;
       const sourceLive = () => !track || (track.readyState === 'live' && !track.muted);
+      // ⏱ 起動からの経過を測る。「すぐ落ちた」のか「しばらく持った」のかで打つ手が違う
+      const startedAt = now();
+      let endedAt = null;
+      if (track) {
+        // ended を待って拾う (500ms の見張りより早く、かつ確実に分かる)
+        try { track.addEventListener('ended', () => { endedAt = Math.round(now() - startedAt); }); } catch (e) { /* 古い端末 */ }
+      }
+      /** 現場から聞き取るための短い診断。原因の切り分けに使う */
+      const diag = () => {
+        const bits = [];
+        bits.push(Math.round(now() - startedAt) + 'ms');
+        if (endedAt !== null) bits.push('ended@' + endedAt + 'ms');
+        if (track) bits.push('track=' + track.readyState + (track.muted ? '/muted' : ''));
+        bits.push('video=' + v.readyState);
+        if (playError) bits.push('play=' + (playError.name || playError.message || 'NG'));
+        bits.push('条件' + (tryIndex + 1) + '/' + CAMERA_TRIES.length);
+        if (track) {
+          if (track.label) bits.push(String(track.label).slice(0, 24));
+          try {
+            const st = track.getSettings ? track.getSettings() : null;
+            if (st && st.width) bits.push(st.width + 'x' + st.height);
+          } catch (e) { /* 取れなくてよい */ }
+        }
+        bits.push(isStandalone() ? 'ホーム画面' : 'ブラウザ');
+        return bits.join(' ');
+      };
       let videoWatch = BarcodeScanDecide.newVideoWatch(now());
       let frames = BarcodeScanDecide.newFrameCursor();
       const markFrame = (id) => {
@@ -414,16 +466,41 @@
         pollFrame();
         // カメラが切れた (他アプリに取られた / 端末が閉じた) — 待つ意味がないので即やめる
         if (track && track.readyState === 'ended') {
+          const heldMs = endedAt !== null ? endedAt : Math.round(now() - startedAt);
+          clearInterval(scanWatchTimer); scanWatchTimer = null;
           stopScan();
-          banner('err', 'カメラが切れました。他のアプリがカメラを使っていないか確かめて、もう一度押してください', { sticky: true });
+          // 🚨 **すぐ落ちたときは1回だけ取り直す**。iOS は最初のストリームだけ即死して、
+          //    取り直すと通ることがある (許可ダイアログの直後など)
+          // 🚨 つないだ直後に切れたら、**次の (より緩い) 条件**で取り直す。同じ条件を繰り返さない
+          if (heldMs < 3000 && cameraTry < CAMERA_TRIES.length - 1) {
+            cameraTry++;
+            // 取り直しに入れるように「起動中」の札を先に外す (stopScan は札を触らない)
+            scanStarting = false;
+            const b = $('#scanBtn'); if (b) b.disabled = false;
+            banner('warn', 'カメラをつなぎ直しています… (' + (cameraTry + 1) + '/' + CAMERA_TRIES.length + ')');
+            setTimeout(() => { startScan(); }, 400);
+            return;
+          }
+          banner('err', 'カメラが切れました' + (heldMs < 3000 ? ' (つないだ直後に切れています)' : '')
+            + '。' + (isStandalone()
+              ? '<b>ホーム画面のアイコンから開いた状態だとカメラを使えないことがあります。'
+                + 'まず Safari で開いて試してください。</b>'
+              : '<b>iPad では、画面を2分割 (Split View / Slide Over) しているとカメラが使えないことがあります。'
+                + '全画面にしてからもう一度押してください。</b>')
+            + '他のアプリがカメラを使っていないかも確かめてください。'
+            + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます'
+            + '<br><small>' + esc(diag()) + '</small>', { sticky: true });
           return;
         }
         if (!BarcodeScanDecide.videoStalled(videoWatch, now())) return;
         stopScan();
         banner('err', 'カメラの映像が出ませんでした'
           + (playError ? ' (' + esc(playError.name || playError.message || '') + ')' : (track && track.muted ? ' (映像が届いていません)' : ''))
-          + '。ホーム画面のアイコンから開き直すか、他のアプリがカメラを使っていないか確かめてください。'
-          + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+          + '。' + (isStandalone()
+            ? 'ホーム画面のアイコンから開いた状態ではカメラを使えないことがあります。Safari で開いて試してみてください。'
+            : '他のアプリがカメラを使っていないか確かめてください。')
+          + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます'
+          + '<br><small>' + esc(diag()) + '</small>', { sticky: true });
       }, 500);
 
       // 🚨 autoplay 属性だけに頼らない。**明示的に play() する**。
@@ -522,7 +599,7 @@
       banner(n ? 'ok' : 'warn', '📷 ' + esc(code) + (n === 1 ? ' の商品です' : n ? ' … ' + n + ' 件見つかりました'
         : ' の商品は見つかりません (バーコードマスタに無いか、取扱中止かもしれません)'), { sticky: !n });
     }
-    $('#scanBtn').addEventListener('click', startScan);
+    $('#scanBtn').addEventListener('click', () => { cameraTry = 0; startScan(); });
     $('#scanCancel').addEventListener('click', stopScan);
     $('#scanBox').addEventListener('click', (e) => { if (e.target === $('#scanBox')) stopScan(); });
     // 画面を離れる・別のタブに移る・戻るボタンで抜ける — どれでもカメラを必ず止める
