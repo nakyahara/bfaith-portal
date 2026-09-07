@@ -1,0 +1,245 @@
+/**
+ * test-publish.mjs — 世代の転送と公開 受入試験 (§10.1 障害 / §15-7)
+ *
+ * HTTP は使わず、受け口の関数を直接呼ぶ (送信側と受信側を同じ経路で通す)。
+ * 実行: node apps/expected-profit/test-publish.mjs
+ */
+import assert from 'node:assert/strict';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+
+process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-pub-'));
+
+const { initExpectedProfitDB } = await import('./db.js');
+const { receiveChunk, publishGeneration, getPublished, chunkChecksum, pruneGenerations } = await import('./publish-api.js');
+const { makeChunks, makeManifest, publishToRender } = await import('./publish.js');
+
+let passed = 0;
+function t(name, fn) {
+  try { fn(); passed++; console.log(`  ok  ${name}`); }
+  catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; }
+}
+async function ta(name, fn) {
+  try { await fn(); passed++; console.log(`  ok  ${name}`); }
+  catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; }
+}
+
+const db = initExpectedProfitDB();
+
+const mkRow = (key, over = {}) => ({
+  generation_id: null, mall: 'rakuten', shop_id: '1', mall_item_key: key, ne_code: 'ne001',
+  product_name: 'x', sales_class: 3, fulfillment: 'self', listing_status: 'active',
+  price_incl_tax: 1100, price_ex_tax: 1000, postage_revenue_ex_tax: 0, revenue_ex_tax: 1000, tax_rate: 0.1,
+  cost_ex_tax: 600, cost_method: 'single', shipping_code: '501', shipping_method: 'ネコポス',
+  shipping_fee_ex_tax: 180, shipping_work_ex_tax: 20, shipping_material_ex_tax: 10, shipping_labor_ex_tax: 9,
+  shipping_total_ex_tax: 219, fba_fee_ex_tax: 0, referral_fee_ex_tax: null, closing_fee_ex_tax: null,
+  per_item_fee_ex_tax: null, fee_total_ex_tax: 100, fee_rate_display: 0.1, fee_breakdown: null,
+  expected_profit: 81, expected_margin_rate: 0.081,
+  listing_enum_status: 'ok', listing_enum_valid_until: '2099-01-01T00:00:00Z',
+  price_status: 'ok', price_valid_until: '2099-01-01T00:00:00Z', fee_status: 'not_applicable', fee_valid_until: null,
+  cost_status: 'ok', cost_valid_until: '2099-01-01T00:00:00Z',
+  shipping_master_status: 'ok', shipping_master_valid_until: '2099-01-01T00:00:00Z',
+  shipping_revenue_status: 'included', scenario_fit: 'ok', calculation_status: 'ok',
+  incomplete_reason: null, rank_eligible: 1, rank_exclusion_reason: null, expense_scope_version: 'self_v1',
+  input_snapshot: '{}', formula_version: 'v1', scenario_version: 'v1', fee_rate_version: 'v1',
+  code_version: 'test', price_run_id: 'r1', built_at: '2026-09-07T00:00:00Z', ...over,
+});
+
+const manifestOf = (rowCount, over = {}) => ({
+  built_at: '2026-09-07T00:00:00Z', row_count: rowCount, ok_count: rowCount,
+  incomplete_count: 0, rank_eligible_count: rowCount, content_hash: 'h', malls_included: ['rakuten'],
+  malls_degraded: [], ...over,
+});
+
+console.log('チャンクの受け取り');
+
+t('checksum が合えば受け取る', () => {
+  const rows = [mkRow('a'), mkRow('b')];
+  const r = receiveChunk(db, {
+    generationId: 'g1', seq: 1, chunkIndex: 0,
+    checksum: chunkChecksum(rows), rows, manifest: manifestOf(2),
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.total, 2);
+});
+
+t('[!] checksum が合わなければ拒否する', () => {
+  const rows = [mkRow('c')];
+  const r = receiveChunk(db, { generationId: 'g1', seq: 1, chunkIndex: 1, checksum: 'wrong', rows });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'checksum_mismatch');
+});
+
+t('[!] 同じチャンクを再送しても壊れない (冪等)', () => {
+  const rows = [mkRow('a'), mkRow('b')];
+  const r = receiveChunk(db, {
+    generationId: 'g1', seq: 1, chunkIndex: 0, checksum: chunkChecksum(rows), rows,
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.total, 2);      // 増えない
+});
+
+console.log('\n公開');
+
+t('公開するとポインタが立つ', () => {
+  const r = publishGeneration(db, { generationId: 'g1', seq: 1, manifest: manifestOf(2) });
+  assert.equal(r.ok, true);
+  const p = getPublished(db);
+  assert.equal(p.generation_id, 'g1');
+  assert.equal(p.seq, 1);
+});
+
+t('[!] 同じ世代の再 publish は 200 (確認応答が失われた再送)', () => {
+  const r = publishGeneration(db, { generationId: 'g1', seq: 1, manifest: manifestOf(2) });
+  assert.equal(r.ok, true);
+  assert.equal(r.idempotent, true);
+});
+
+t('[!] 公開済みの世代へ後から追記できない', () => {
+  const rows = [mkRow('z')];
+  const r = receiveChunk(db, { generationId: 'g1', seq: 1, chunkIndex: 9, checksum: chunkChecksum(rows), rows });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'generation_already_published');
+});
+
+t('[!] seq が古い世代は公開できない (逆転公開の防止)', () => {
+  const rows = [mkRow('old1')];
+  receiveChunk(db, { generationId: 'gOld', seq: 0, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(1) });
+  const r = publishGeneration(db, { generationId: 'gOld', seq: 0, manifest: manifestOf(1) });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'seq_not_newer');
+  // 公開中は g1 のまま
+  assert.equal(getPublished(db).generation_id, 'g1');
+});
+
+t('新しい seq なら公開でき、前世代は superseded になる', () => {
+  const rows = [mkRow('n1'), mkRow('n2')];
+  receiveChunk(db, { generationId: 'g2', seq: 2, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(2) });
+  const r = publishGeneration(db, { generationId: 'g2', seq: 2, manifest: manifestOf(2) });
+  assert.equal(r.ok, true);
+  assert.equal(r.supersededId, 'g1');
+  const prev = db.prepare("SELECT remote_status FROM expected_profit_generation WHERE generation_id='g1'").get();
+  assert.equal(prev.remote_status, 'superseded');
+});
+
+t('[!] 件数が manifest と合わなければ公開しない', () => {
+  const rows = [mkRow('m1')];
+  receiveChunk(db, { generationId: 'g3', seq: 3, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(1) });
+  const r = publishGeneration(db, { generationId: 'g3', seq: 3, manifest: manifestOf(999) });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'row_count_mismatch');
+  assert.equal(getPublished(db).generation_id, 'g2');   // 公開中は変わらない
+});
+
+t('[!] 行が0件の世代は公開しない', () => {
+  db.prepare(`INSERT INTO expected_profit_generation
+    (generation_id, seq, built_at, local_status, remote_status, row_count)
+    VALUES ('gEmpty', 9, '2026-09-07T00:00:00Z', 'validated', 'sending', 0)`).run();
+  const r = publishGeneration(db, { generationId: 'gEmpty', seq: 9, manifest: manifestOf(0) });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'no_rows');
+});
+
+console.log('\n送信側 (読み戻して確認するまで成功にしない)');
+
+const seedLocal = (id, seq, n, status = 'validated') => {
+  db.prepare(`INSERT OR REPLACE INTO expected_profit_generation
+    (generation_id, seq, built_at, local_status, remote_status, row_count, ok_count, incomplete_count,
+     rank_eligible_count, content_hash, malls_included, malls_degraded)
+    VALUES (?, ?, '2026-09-07T00:00:00Z', ?, 'not_sent', ?, ?, 0, ?, 'h', '["rakuten"]', '[]')`)
+    .run(id, seq, status, n, n, n);
+  const ins = db.prepare(`INSERT OR REPLACE INTO mart_listing_expected_profit
+    (generation_id, mall, shop_id, mall_item_key, listing_enum_status, price_status, fee_status,
+     cost_status, shipping_master_status, scenario_fit, calculation_status, rank_eligible,
+     expense_scope_version, input_snapshot, formula_version, scenario_version, fee_rate_version,
+     code_version, built_at, expected_profit)
+    VALUES (?, 'rakuten', '1', ?, 'ok', 'ok', 'not_applicable', 'ok', 'ok', 'ok', 'ok', 1,
+     'self_v1', '{}', 'v1', 'v1', 'v1', 'test', '2026-09-07T00:00:00Z', 81)`);
+  for (let i = 0; i < n; i++) ins.run(id, `k${i}`);
+};
+
+await ta('チャンクに分けて送り、読み戻して確認できたら published', async () => {
+  seedLocal('gp1', 100, 3);
+  const calls = { chunks: 0, publish: 0 };
+  const r = await publishToRender(db, 'gp1', {
+    chunkSize: 2,
+    postChunk: async () => { calls.chunks++; return { ok: true }; },
+    postPublish: async () => { calls.publish++; return { ok: true }; },
+    getPublished: async () => ({ generation_id: 'gp1', seq: 100 }),
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.confirmed, true);
+  assert.equal(calls.chunks, 2);     // 3行 ÷ 2 = 2チャンク
+  const gen = db.prepare("SELECT remote_status FROM expected_profit_generation WHERE generation_id='gp1'").get();
+  assert.equal(gen.remote_status, 'published');
+});
+
+await ta('[!] 読み戻しで別の世代が返ったら成功にしない', async () => {
+  seedLocal('gp2', 101, 1);
+  const r = await publishToRender(db, 'gp2', {
+    postChunk: async () => ({ ok: true }),
+    postPublish: async () => ({ ok: true }),
+    getPublished: async () => ({ generation_id: '別の世代', seq: 999 }),
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'publish_not_confirmed');
+  const gen = db.prepare("SELECT remote_status FROM expected_profit_generation WHERE generation_id='gp2'").get();
+  assert.equal(gen.remote_status, 'received');   // published にしない
+});
+
+await ta('[!] 転送が途中で失敗したら公開しない', async () => {
+  seedLocal('gp3', 102, 4);
+  let n = 0;
+  const r = await publishToRender(db, 'gp3', {
+    chunkSize: 1,
+    postChunk: async () => { n++; return n === 2 ? { ok: false, error: 'boom' } : { ok: true }; },
+    postPublish: async () => { throw new Error('publish を呼んではいけない'); },
+    getPublished: async () => null,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'chunk_failed');
+});
+
+await ta('[!] 検証を通っていない世代は送らない', async () => {
+  seedLocal('gp4', 103, 1, 'rejected');
+  const r = await publishToRender(db, 'gp4', {
+    postChunk: async () => { throw new Error('送ってはいけない'); },
+    postPublish: async () => { throw new Error('送ってはいけない'); },
+    getPublished: async () => null,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'local_status_rejected');
+});
+
+t('チャンクの分割は決定的 (同じ入力なら同じ checksum)', () => {
+  const rows = [mkRow('a'), mkRow('b'), mkRow('c')];
+  const a = makeChunks(rows, 2);
+  const b = makeChunks(rows, 2);
+  assert.equal(a.length, 2);
+  assert.equal(a[0].checksum, b[0].checksum);
+  assert.notEqual(a[0].checksum, a[1].checksum);
+});
+
+t('manifest に件数と内容ハッシュが入る', () => {
+  const gen = db.prepare("SELECT * FROM expected_profit_generation WHERE generation_id='gp1'").get();
+  const m = makeManifest(gen);
+  assert.equal(m.row_count, 3);
+  assert.deepEqual(m.malls_included, ['rakuten']);
+});
+
+console.log('\n古い世代の掃除');
+
+t('[!] 公開中の世代は消さない', () => {
+  const before = db.prepare('SELECT COUNT(*) n FROM expected_profit_generation').get().n;
+  pruneGenerations(db, 1);
+  const p = getPublished(db);
+  const still = db.prepare('SELECT COUNT(*) n FROM expected_profit_generation WHERE generation_id = ?').get(p.generation_id).n;
+  assert.equal(still, 1);
+  const after = db.prepare('SELECT COUNT(*) n FROM expected_profit_generation').get().n;
+  assert.ok(after < before);
+});
+
+db.close();
+fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
+console.log(`\n${passed} 件 PASS`);
