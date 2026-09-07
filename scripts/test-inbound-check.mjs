@@ -29,6 +29,7 @@ const {
   getDB, importCsv, getActiveBatch, getState, listEvents, eventsCsv, cleanupOld,
   applyQuantityEvents, listQuantityEvents, finalizeLine, reopenLine, listDestinations, createTables, quantitySum,
   createDevice, verifyDevice, revokeDevice, listDevices, listWorkers, getWorker, productInfoMap, workDateJst,
+  rollOverWorkDate, carryStatus, setPendingExpiry, listImportLog,
 } = dbMod;
 
 let pass = 0, fail = 0;
@@ -243,9 +244,10 @@ console.log('\n[3b] 数量 (部分確認)');
   ok(eventsCsv(b.id).includes("'=HYPERLINK"), '履歴CSV: 先頭 = の値はアポストロフィで無害化');
 }
 
-// ─── 新バッチ: 同日は引き継ぎ / 翌日はリセット・旧 batch は stale ───
+// ─── 新バッチ: 日をまたいでも引き継ぐ・旧 batch は stale ───
 // ⚠miniPC は 08:40 と 11:45 の1日2回取り込む。同日の2回目で午前中の確認が消えると現場が二度手間になる
-console.log('\n[2b] 新バッチ (同日引き継ぎ / 翌日リセット)');
+// ⚠受付済の伝票は検品されるまで CSV に残り続けるので、翌日リセットすると前日の続きが数え直しになる
+console.log('\n[2b] 新バッチ (同日も翌日も引き継ぐ)');
 {
   const old = getActiveBatch();
   // AR1|2|1 は予定数を 12 → 20 に変える (数えたものが違うので引き継がない)
@@ -263,13 +265,15 @@ console.log('\n[2b] 新バッチ (同日引き継ぎ / 翌日リセット)');
   ok(st.lines.find(l => l.line_key === 'AR3|1|1').check_status === 'unchecked', '新しい明細は未確認');
   const stale = finalizeLine({ batchId: old.id, lineKey: 'AR1|1|1', expectVersion: 1, expectQuantityVersion: 1, result: 'exact', worker: '山田' });
   ok(!stale.ok && stale.error === 'stale_batch' && stale.activeBatchId === r.batch.id, '旧 batch_id の操作 = stale_batch');
-  // 翌日の取込 (active の work_date を1日戻して再現) は引き継がない = 要件 §2 確定事項⑤ 毎朝リセット
+  // 翌日の取込 (active の work_date を1日戻して再現) も引き継ぐ = 中原さん 2026-09-07
   db.prepare("UPDATE f_inbound_check_batches SET work_date = date(work_date, '-1 day') WHERE id = ?").run(r.batch.id);
   const rc = importCsv(makeCsv([row('AR1', 1, 'abcDEF', 100), row('AR3', 1, 'new', 3)]), { fileName: 'c.csv', generatedAt: '2026-09-02T06:00:00Z' });
-  ok(rc.ok && rc.carriedOver === 0, '翌日の取込は引き継がない');
+  ok(rc.ok && rc.carriedOver === 1, '翌日の取込も確認を引き継ぐ (前日やり残しの続きから)');
   const st2 = getState();
-  ok(st2.lines.every(l => l.check_status === 'unchecked'), '翌日は全行 unchecked (毎朝リセット)');
-  ok(st2.lines.find(l => l.line_key === 'AR1|1|1').prev_checked.by === '山田', '前回確認済みの参考表示');
+  ok(st2.lines.find(l => l.line_key === 'AR1|1|1').check_status === 'checked', '前日 ✅ の行は翌日も ✅ のまま');
+  ok(st2.lines.find(l => l.line_key === 'AR3|1|1').check_status === 'unchecked', '前日に無かった明細は未確認');
+  ok(getActiveBatch().work_date === workDateJst() && !getActiveBatch().carried_from,
+    '新しい CSV を取り込めた日は carried_from を立てない (「取込が来ていない」表示を出さない)');
   ok(getActiveBatch().data_max_at === '2026-08-31T22:03:11+09:00', 'data_max_at = 明細の更新日時の最大');
   const olderData = importCsv(makeCsv([row('AR7', 1, 'q', 1, { 更新日時: '20260830090000', 作成日時: '20260830090000' })]), { fileName: 'old-data.csv', generatedAt: '2026-09-09T00:00:00Z' });
   ok(!olderData.ok && olderData.error === 'older_file' && /明細/.test(olderData.message), '生成時刻が新しくても明細時刻が古いCSVは拒否 (File.lastModified を信用しない)');
@@ -528,6 +532,116 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   const imp4 = importCsv(makeCsv([row('AR9', 2, 'TASK-B', 3)]), { fileName: 'prb4.csv', generatedAt: '2027-01-01T03:00:00Z' });
   ok(imp4.ok && !/消えた明細/.test(db.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message), '既に取消済みなら「消えた明細の取消」に数えない');
   ok(destOf(dPre).cancel_reason === 'reopen', '取消理由も上書きしない');
+}
+
+// ─── 業務日の繰り越し (前日の一覧を今日ぶんとして続ける) ───
+// 🚨受付済の伝票はロジザードで検品されるまで CSV に残り続ける。入荷受付が増えなかった日は CSV の中身が
+//   前日と同じ → file_hash 重複で取込が拒否 → work_date が前日のまま → 数量も確認も記録できない、
+//   という形で 2026-09-06〜07 に iPad が固まった。その再発防止 (中原さん 2026-09-07)
+console.log('\n[10] 業務日の繰り越し (前日のやり残しを翌日も続けられる)');
+{
+  const imp = importCsv(makeCsv([row('AR20', 1, 'CARRY-A', 10), row('AR20', 2, 'CARRY-B', 4)]),
+    { fileName: 'carry1.csv', generatedAt: '2027-02-01T00:00:00Z' });
+  ok(imp.ok, '前提: 2行の一覧を取り込む');
+  const bid = imp.batch.id;
+  const qv = k => db.prepare('SELECT quantity_version FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = ?').get(bid, k).quantity_version;
+  ok(applyQuantityEvents({ batchId: bid, lineKey: 'AR20|1|1', expectQuantityVersion: qv('AR20|1|1'),
+    events: [{ client_event_id: 'carry-ev-01', action: 'add', quantity: 6, input_kind: 'loose' }], worker: '山田' }).ok,
+    '前提: A を 6 / 10 まで数えて中断');
+  ok(finalizeLine({ batchId: bid, lineKey: 'AR20|2|1', expectVersion: 1, expectQuantityVersion: qv('AR20|2|1'),
+    result: 'exact', mode: 'fill_remaining', fillEvent: { client_event_id: 'carry-ev-02' }, worker: '山田' }).ok,
+    '前提: B は確定 (✅)');
+
+  // 翌日になったが、新しい受付が無いので取込は来ない
+  db.prepare("UPDATE f_inbound_check_batches SET work_date = date(work_date, '-1 day') WHERE id = ?").run(bid);
+  const yesterday = getActiveBatch().work_date;
+  const st = getState();   // iPad が一覧を開いた時点で繰り越す (取込を待たない)
+  ok(st.batch.work_date === workDateJst(), '一覧を開くと work_date が今日になる');
+  ok(st.carried_from === yesterday, 'carried_from に前日が残る (「本日の取込はまだ来ていません」の表示材料)');
+  ok(st.day_stale === false, '入力ロック (day_stale) は立たない');
+  ok(st.lines.find(l => l.line_key === 'AR20|1|1').found_qty === 6, '途中まで数えた 6個 はそのまま');
+  ok(st.lines.find(l => l.line_key === 'AR20|2|1').check_status === 'checked', '前日の ✅ もそのまま');
+  ok(quantitySum(db, workDateJst(), 'AR20|1|1', 'carry-a') === 6, '数量イベントも今日ぶんとして集計できる (繰越イベント)');
+  ok(/引き継ぎました/.test(listImportLog(1)[0].message), '取込ログに繰り越しを残す');
+
+  // ⭐直したかったこと = 翌日も続きから数えられる
+  const q = applyQuantityEvents({ batchId: bid, lineKey: 'AR20|1|1', expectQuantityVersion: qv('AR20|1|1'),
+    events: [{ client_event_id: 'carry-ev-03', action: 'add', quantity: 4, input_kind: 'loose' }], worker: '鈴木' });
+  ok(q.ok && q.state.found_qty === 10, '翌日も続きから数を足せる (6 → 10)');
+  ok(setPendingExpiry({ batchId: bid, lineKey: 'AR20|1|1', expiryDate: '2028-01' }).ok, '有効期限の先入力も通る (stale_work_date にならない)');
+
+  // 冪等: 繰り越しをやり直しても二重加算しない
+  ok(rollOverWorkDate(db) === null, '同じ日に2回目の繰り越しはしない');
+  db.prepare("UPDATE f_inbound_check_batches SET work_date = date(work_date, '-1 day') WHERE id = ?").run(bid);
+  rollOverWorkDate(db);
+  ok(quantitySum(db, workDateJst(), 'AR20|1|1', 'carry-a') === 10, '繰り越しをやり直しても数が二重に入らない');
+  ok(getActiveBatch().carried_from === yesterday, 'carried_from は最初に繰り越した日のまま (一番古い取込日)');
+
+  // 🚨同じ内容の CSV は取込拒否のままでよいが、業務日の繰り越しだけは効かせる
+  db.prepare("UPDATE f_inbound_check_batches SET work_date = date(work_date, '-1 day') WHERE id = ?").run(bid);
+  const dup = importCsv(makeCsv([row('AR20', 1, 'CARRY-A', 10), row('AR20', 2, 'CARRY-B', 4)]),
+    { fileName: 'carry1.csv', source: 'auto', generatedAt: '2027-02-02T00:00:00Z' });
+  ok(!dup.ok && dup.error === 'duplicate_file', '同じ内容の CSV は取込拒否のまま');
+  ok(getActiveBatch().work_date === workDateJst(), '取込が拒否されても業務日は今日に進む (入力ロックが残らない)');
+  ok(getState().lines.find(l => l.line_key === 'AR20|1|1').found_qty === 10, '拒否された取込で数が消えない');
+
+  // 🚨「中身が変わっていないだけ」(正常) と「取りに行けていない」(要調査) を言い分ける (Codex #1231 R1 中)
+  ok(getActiveBatch().last_verified_at && getActiveBatch().last_verified_source_at === '2027-02-02T00:00:00.000Z',
+    '同じ内容でも「読めた」ことは記録する (last_verified_at / 読んだ CSV の更新時刻)');
+  const stv = getState();
+  ok(stv.carried_from && stv.import_checked_today === true && stv.import_checked_at,
+    '本日読めていれば import_checked_today = true (画面は「新しい受付が増えていません」と出す)');
+  db.prepare('UPDATE f_inbound_check_batches SET last_verified_at = NULL WHERE id = ?').run(bid);
+  ok(getState().import_checked_today === false,
+    '本日一度も読めていなければ false (画面は「取りに行けていません」= 取得が止まっている疑い)');
+  db.prepare("UPDATE f_inbound_check_batches SET last_verified_at = date('now', '-3 day') || 'T00:00:00.000Z' WHERE id = ?").run(bid);
+  ok(getState().import_checked_today === false, '古い確認時刻は「本日読めた」に数えない');
+
+  // 🚨手元の古い CSV を管理画面から再アップロードしただけでは「共有ドライブを確認した」根拠にならない
+  //   (Codex #1231 R2 中)。書き換えるのは共有ドライブから取ってきたとき (auto / drive_retry) だけ
+  db.prepare('UPDATE f_inbound_check_batches SET last_verified_at = NULL, last_verified_source_at = NULL WHERE id = ?').run(bid);
+  const dupManual = importCsv(makeCsv([row('AR20', 1, 'CARRY-A', 10), row('AR20', 2, 'CARRY-B', 4)]),
+    { fileName: 'carry1.csv', source: 'manual_upload', generatedAt: '2027-02-03T00:00:00Z' });
+  ok(!dupManual.ok && dupManual.error === 'duplicate_file' && getActiveBatch().last_verified_at == null,
+    '手動アップロードの重複では「共有ドライブを確認した」時刻を書かない');
+  const dupAuto = importCsv(makeCsv([row('AR20', 1, 'CARRY-A', 10), row('AR20', 2, 'CARRY-B', 4)]),
+    { fileName: 'carry1.csv', source: 'drive_retry', generatedAt: '2027-02-03T00:00:00Z' });
+  ok(!dupAuto.ok && getActiveBatch().last_verified_at, '🚚 いま取りに行く (drive_retry) の重複では書く');
+
+  // 🚨 rclone は中身が同じなら転送しないので、Drive の更新時刻が古くても異常とは限らない。
+  //    事実として持って管理画面に出す (判定はしない — Render からは miniPC が動いたか分からない)
+  const cs = carryStatus(getActiveBatch());
+  ok(cs.sourceAt === '2027-02-03T00:00:00.000Z' && cs.sourceToday === false && cs.checkedToday === true,
+    'sourceAt (読んだ CSV の更新時刻) と checkedAt (読めた時刻) を別々に持つ');
+  // superseded バッチへの重複は確認時刻を書かない (過去の再アップロードで active の状態を動かさない)
+  const bx = importCsv(makeCsv([row('AR21', 1, 'CARRY-X', 2)]), { fileName: 'x.csv', generatedAt: '2027-02-04T00:00:00Z' });
+  ok(bx.ok && getActiveBatch().last_verified_at == null, '前提: 別の内容を取り込む (carry1 は superseded・確認時刻なし)');
+  const dupOld = importCsv(makeCsv([row('AR20', 1, 'CARRY-A', 10), row('AR20', 2, 'CARRY-B', 4)]),
+    { fileName: 'carry1.csv', source: 'auto', generatedAt: '2027-02-05T00:00:00Z' });
+  ok(!dupOld.ok && dupOld.error === 'duplicate_file' && getActiveBatch().last_verified_at == null,
+    '過去バッチと同じ内容の再アップロードでは active の確認時刻を動かさない');
+}
+
+// ─── 管理画面でも繰り越す (Codex #1231 R1 中の再発防止) ───
+// iPad が1台も開かれていない朝に管理画面だけ見ると、繰り越しが走らず案内が出ないままだった
+console.log('\n[11] 管理画面の入口でも業務日を繰り越す');
+{
+  const src = fs.readFileSync(new URL('../apps/inbound-check/router.js', import.meta.url), 'utf8');
+  const admin = src.slice(src.indexOf("router.get('/admin'"), src.indexOf('batches: listBatches(30)'));
+  ok(/rollOverWorkDate\(\)/.test(admin), '/admin のハンドラが rollOverWorkDate() を呼ぶ');
+  ok(admin.indexOf('rollOverWorkDate()') < admin.indexOf('getActiveBatch()'), '繰り越しは active バッチを読む前');
+  const ejsSrc = fs.readFileSync(new URL('../apps/inbound-check/views/admin.ejs', import.meta.url), 'utf8');
+  ok(/carry\.checkedToday/.test(ejsSrc) && /取りに行けていません/.test(ejsSrc),
+    '管理画面が「読めた日」と「取りに行けていない日」を言い分ける');
+  ok(/rclone は中身が同じなら転送しない/.test(ejsSrc),
+    'Drive の更新時刻が古いだけでは異常でないことを書いてある (誤った切り分けを誘導しない)');
+  // 🚨 Render が確かめられるのは「共有ドライブまで」。CSV 自体が古い日に
+  //    「ロジザードに増えていない」と断定しない (Codex #1231 R3 高)
+  ok(/言い切れません/.test(ejsSrc) && /共有ドライブ上の一覧には新しい入荷受付は増えていません/.test(ejsSrc),
+    'CSV 自体が古い日は「ロジザード側で増えていないとまでは言い切れない」と書く');
+  const idxSrc = fs.readFileSync(new URL('../apps/inbound-check/views/index.html', import.meta.url), 'utf8');
+  ok(/共有ドライブの一覧に新しい入荷受付は増えていません/.test(idxSrc),
+    'iPad の文言も「共有ドライブの一覧に」と範囲を書く');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

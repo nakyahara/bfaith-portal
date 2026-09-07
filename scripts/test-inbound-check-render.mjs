@@ -105,6 +105,10 @@ const LINE = (over = {}) => ({
 let PRINT_AGENTS = [];
 // 🗂 いろはの作業指示の正本。'app' (通常。Notion は 2026-09-05 廃止) なら「Notionへ送る」は出さない
 let IROHA_SOURCE = 'app';
+// 前日の一覧を引き継いで作業している日の元の業務日 (null = 通常) と、本日ぶんの取得を確かめられたか
+let CARRIED_FROM = null;
+let IMPORT_CHECKED_AT = null;
+let IMPORT_CHECKED_TODAY = true;
 
 const STATE = lines => ({
   ok: true,
@@ -114,6 +118,9 @@ const STATE = lines => ({
   slips: [{ batch_id: 7, ar_no: 'AR1', planned_date: '2026-09-01', received_date: '2026-09-01', status: '受付済', line_count: lines.length, seq: 1, checked_count: lines.filter(l => l.check_status === 'checked').length, partial_count: lines.filter(l => l.check_status !== 'checked' && l.found_qty > 0).length }],
   lines,
   day_stale: false,
+  carried_from: CARRIED_FROM,
+  import_checked_at: IMPORT_CHECKED_AT,
+  import_checked_today: IMPORT_CHECKED_TODAY,
   totals: {
     lines: lines.length,
     checked: lines.filter(l => l.check_status === 'checked').length,
@@ -326,6 +333,37 @@ console.log('\n[10] 🗂 Notion は廃止 — 「Notionへ送る」は正本が 
   ok(r.q('#notionBtn').style.display === '', `正本が Notion (退路) → ボタンを出す (display=${JSON.stringify(r.q('#notionBtn').style.display)})`);
   IROHA_SOURCE = 'app';
   ok(/在庫化アプリの「未着手」に入ります/.test(HTML), '行き先ダイアログの「いろはへ」に、確認すると在庫化アプリの未着手に入ることを書いてある');
+}
+
+console.log('\n[11] 前日の一覧を引き継いで作業している日のお知らせ (中原さん 2026-09-07)');
+{
+  CARRIED_FROM = null;
+  let r = await renderWith([LINE()]);
+  ok(r.q('#banner').innerHTML === '', '通常の日 (本日ぶんを取り込めた) はお知らせを出さない');
+
+  // ① 本日も取りに行けていて、中身が変わっていないだけ = 正常
+  CARRIED_FROM = '2026-09-05';
+  IMPORT_CHECKED_AT = '2026-09-07T01:12:00.000Z';
+  IMPORT_CHECKED_TODAY = true;
+  r = await renderWith([LINE()]);
+  let b = r.q('#banner');
+  ok(/09\/05 の一覧を引き継いで/.test(b.innerHTML), '引き継いだ元の日付が出る');
+  ok(/新しい入荷受付は増えていません/.test(b.innerHTML), '「取込が来ていない」ではなく「新しい受付が増えていない」と書く');
+  ok(/10:12/.test(b.innerHTML), '本日いつ確認したかを出す (JST)');
+  ok(b._classes.has('info') && !b._classes.has('warn'), '正常なので警告色にしない (info)');
+  ok(!/記録できません/.test(b.innerHTML), '「記録できません」とは書かない (書けるようになったため)');
+
+  // ② 本日はそもそも取りに行けていない = 要調査 (取得が止まっている疑い)
+  IMPORT_CHECKED_TODAY = false;
+  r = await renderWith([LINE()]);
+  b = r.q('#banner');
+  ok(/本日はまだ一覧を取りに行けていません/.test(b.innerHTML), '取りに行けていない日は、そう書く');
+  ok(b._classes.has('warn'), '取りに行けていない日は警告色 (取得が止まっている疑い)');
+  ok(/09\/05 の一覧を引き継いで/.test(b.innerHTML) && /いま取りに行く/.test(b.innerHTML), 'それでも作業はできる・🚚 を案内する');
+
+  CARRIED_FROM = null;
+  IMPORT_CHECKED_AT = null;
+  IMPORT_CHECKED_TODAY = true;
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

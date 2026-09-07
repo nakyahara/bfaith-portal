@@ -7,7 +7,7 @@
  *
  * env:
  *   INBOUND_CHECK_SYNC_ENABLED   … false/0/off/no で停止 (既定=有効)。非 Render では既定 OFF
- *   INBOUND_CHECK_SYNC_CRON      … cron 式を上書き (既定 '*\/30 6-20 * * *' JST)
+ *   INBOUND_CHECK_SYNC_CRON      … cron 式を上書き (既定 '*\/30 0,6-20 * * *' JST)
  *   INBOUND_CHECK_DRIVE_FOLDER_ID / INBOUND_CHECK_DRIVE_FILE … 取得先 (既定は値札CSVと同じ共有ドライブ)
  *   INBOUND_CHECK_MASTER_FILE    … 商品マスタのファイル名 (既定 shohin_master.csv)
  */
@@ -19,7 +19,12 @@ import { isRender } from '../../lib/is-render.js';
 
 const OFF = new Set(['false', '0', 'off', 'no']);
 const FORCE_ON = new Set(['true', '1', 'on', 'yes']);
-const DEFAULT_CRON = '*/30 6-20 * * *';   // JST 6〜20時台の毎時0分・30分
+// JST 0時台 + 6〜20時台の毎時0分・30分。
+// **0時台は 2026-09-07 に追加**した — miniPC が 00:20 に取り直すようになったので、00:30 に取り込めば
+// 朝いちばんから当日ぶんの一覧になる (6時始まりのままだと、せっかく深夜に取っても反映は 6:00 まで待ち)。
+// ⭐ 1〜5時台は入れない。狙いは 00:30 の1回だけで、深夜帯を通しで開けると Drive を12回余計に叩く
+//    (Codex #1231 追加分 Medium)。21〜23時台も現場が動いていないので入れない
+const DEFAULT_CRON = '*/30 0,6-20 * * *';
 
 let task = null;
 

@@ -17,7 +17,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
-  getState, importCsv, getActiveBatch, listBatches, listImportLog, listEvents, eventsCsv,
+  getState, importCsv, getActiveBatch, rollOverWorkDate, carryStatus, listBatches, listImportLog, listEvents, eventsCsv,
   applyQuantityEvents, listQuantityEvents, finalizeLine, reopenLine,
   createDevice, verifyDevice, revokeDevice, listDevices, setAgentPrinter,
   resolveDestination, infoForLine, setExpiryManaged, setPendingExpiry, pendingExpiryFor,
@@ -841,6 +841,10 @@ function destQuery(req) {
 
 // ─── 管理画面 ───
 router.get('/admin', requireSession, api(async (req, res) => {
+  // iPad が1台も開かれていない朝でも、管理画面を開けば業務日が今日になる (Codex #1231 R1 中)。
+  // ここを飛ばすと「9/5 の一覧を引き継いで作業中」の案内が管理画面にだけ出ない
+  rollOverWorkDate();
+  const activeBatch = getActiveBatch();
   let drive = null;
   try { drive = await statusForView(); } catch (e) { drive = { driveError: e.message, config: driveConfig() }; }
   let notion = null;
@@ -853,7 +857,9 @@ router.get('/admin', requireSession, api(async (req, res) => {
     displayName: req.session.displayName,
     isAdmin: isAdmin(req),
     base: BASE,
-    active: getActiveBatch(),
+    active: activeBatch,
+    // 引き継ぎ中かどうか + 本日ぶんの取得を確かめられたか (iPad と同じ判定)
+    carry: carryStatus(activeBatch),
     batches: listBatches(30),
     importLog: listImportLog(20),
     devices: isAdmin(req) ? listDevices() : [],

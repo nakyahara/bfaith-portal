@@ -17,7 +17,7 @@ const ok = (c, l) => { if (c) { pass++; console.log(`  ✓ ${l}`); } else { fail
 
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 initMirrorDB();
-const { getDB, setPendingExpiry, pendingExpiryFor, getState, reopenLine, workDateJst } = await import('../apps/inbound-check/db.js');
+const { getDB, setPendingExpiry, pendingExpiryFor, getState, reopenLine, workDateJst, getActiveBatch } = await import('../apps/inbound-check/db.js');
 
 const db = getDB();
 db.prepare(`INSERT INTO f_inbound_check_batches (id, source, file_name, file_hash, csv_generated_at, row_count, slip_count, imported_at, status)
@@ -74,14 +74,15 @@ console.log('[4] やり直すと確定に使った期限が先入力に戻る (C
   ok(pendingExpiryFor(1, 'L2') === '2026-11', '確定時の期限が pending に戻る (タグ📅入力済として見える)');
 }
 
-console.log('[5] 前日の一覧には先入力できない (day_stale ガード — Codex #1116 Med-4)');
+// 旧: 前日の一覧は stale_work_date で拒否 (Codex #1116 Med-4)。
+// 現: 前日のやり残しをそのまま続けられるよう、業務日を今日へ繰り越してから書く (中原さん 2026-09-07)
+console.log('[5] 前日の一覧は今日ぶんへ繰り越してから先入力できる');
 {
   db.prepare("UPDATE f_inbound_check_batches SET work_date = '2000-01-01' WHERE id = 1").run();
   const r = setPendingExpiry({ batchId: 1, lineKey: 'L1', expiryDate: '2026-12' });
-  ok(r.ok === false && r.error === 'stale_work_date', '前日バッチは stale_work_date');
-  db.prepare('UPDATE f_inbound_check_batches SET work_date = ? WHERE id = 1').run(workDateJst());
-  const r2 = setPendingExpiry({ batchId: 1, lineKey: 'L1', expiryDate: '2026-12' });
-  ok(r2.ok === true, '当日の一覧なら書ける');
+  ok(r.ok === true, '前日の一覧でも先入力できる (旧: stale_work_date で拒否)');
+  ok(getActiveBatch().work_date === workDateJst(), '業務日が今日に進んでいる');
+  ok(getActiveBatch().carried_from === '2000-01-01', 'carried_from に元の業務日が残る');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
