@@ -1460,6 +1460,14 @@ async function loadStateOnce() {
   } else if (planData) {
     renderPlan();   // 「どこが」の許可だけ失った場合も、ここでボタンが消える
   }
+  // ⭐預ける計画も同じ。許可を失ったら描いたものを消す (明日の計画と同じ扱い — Codex R2 中1)
+  if (!isApp() || !stateCan('task.consign')) {
+    cplan = null;
+    clearConsignPlanDom();
+    if (curView === 'cplan') setView('board');
+  } else if (cplan) {
+    renderConsignPlan();
+  }
   if (!stateCan('task.facility.assign') && facPickCtx) closeFacPick();
   restoreWorker();
   // ⭐選んでいるのが利用者なら、端末の職員モードが生きていても職員の許可は採用しない (Codex PR-A R1 #1)
@@ -5424,8 +5432,27 @@ async function loadConsignPlan() {
   renderConsignPlan();
 }
 
+/**
+ * ⭐描いたものを消す (許可を失ったとき)。**隠すだけにしない** — hidden の画面に
+ * 押せるボタンが残っていると、職員モードが切れたあとに利用者が押せてしまう
+ * (明日の計画の clearPlanDom と同じ理由)
+ */
+function clearConsignPlanDom() {
+  for (const sel of ['#cplanFacs', '#cplanCap', '#cplanCol1', '#cplanCol2', '#cplanCol3']) {
+    const el = $(sel); if (el) el.innerHTML = '';
+  }
+  for (const sel of ['#cplanN1', '#cplanN2', '#cplanN3']) { const el = $(sel); if (el) el.textContent = '0'; }
+}
 function renderConsignPlan() {
   if (!cplan) return;
+  // ⭐描き直すたびに許可を見る。取ってきたデータが手元にあるからといって、
+  //   許可を失ったあとに拠点を選び直してボタンを描き直さない (Codex R2 中1)
+  if (!isApp() || !stateCan('task.consign')) {
+    cplan = null;
+    clearConsignPlanDom();
+    if (curView === 'cplan') setView('board');
+    return;
+  }
   const facs = cplan.facilities || [];
   if (cplanFac !== 'all' && !facs.some((f) => f.code === cplanFac)) cplanFac = 'all';
   $('#cplanFacs').innerHTML = ['all', ...facs.map((f) => f.code)].map((code) =>
@@ -5477,18 +5504,20 @@ function cplanRowHtml(r) {
     facts.push('<span' + (r.overdue ? ' class="late"' : '') + '>' + esc(r.due_date) + ' までに返却' +
       (r.overdue ? '（期限を過ぎています）' : '') + '</span>');
   }
-  const acts = r.state === 'handed'
+  // ⭐押せるものだけ描く (要件 §U-7)。ここでも見るのは、描き直しの入口が複数あるため
+  const acts = !stateCan('task.consign') ? ''
+    : r.state === 'handed'
     ? '<button class="go" data-cg="return" data-cg-id="' + r.id + '">返却を受け取る</button>' +
       '<button data-cg="settle" data-cg-id="' + r.id + '">返ってこないぶんを精算</button>'
     : (r.state === 'planned' ? '<button class="go" data-cg="prepared" data-cg-id="' + r.id + '">用意できた</button>' : '') +
       '<button class="' + (r.state === 'prepared' ? 'go' : '') + '" data-cg="handed" data-cg-id="' + r.id + '">渡しました</button>' +
       '<button data-cg="cancel" data-cg-id="' + r.id + '">やめる</button>';
+  const open = findCard(r.task_id) ? '<button data-cplanopen="' + r.task_id + '">カードを開く</button>' : '';
   return '<div class="crow' + (r.overdue ? ' over' : '') + '">' +
     '<div class="t">' + esc(r.title || '(名称なし)') + '</div>' +
     '<div class="facts">' + facts.join('') + '</div>' +
-    '<div class="acts">' + acts +
-      (findCard(r.task_id) ? '<button data-cplanopen="' + r.task_id + '">カードを開く</button>' : '') +
-    '</div></div>';
+    (acts || open ? '<div class="acts">' + acts + open + '</div>' : '') +
+    '</div>';
 }
 
 document.addEventListener('click', (e) => {

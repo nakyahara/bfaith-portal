@@ -7074,6 +7074,15 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
     '⭐預けのダイアログはカード詳細と預ける計画の両方から使う (言い方を画面ごとに変えない)');
   ok(html.includes("+ (cg.seq != null ? ' ・ まとまり #' + cg.seq : '') + '）';"),
     '⭐操作のダイアログにも、どのまとまりを動かすのかを出す');
+  ok(html.includes('function clearConsignPlanDom()')
+    && html.includes("for (const sel of ['#cplanFacs', '#cplanCap', '#cplanCol1', '#cplanCol2', '#cplanCol3'])"),
+    '⭐許可を失ったら、描いたものを消す (隠すだけにしない)');
+  // 描き直しの中と、状態を取り直したあとの 2 か所で許可を見る (改行コードに依らない形で確かめる)
+  const renderSrc = html.match(/function renderConsignPlan\(\) \{[\s\S]*?\r?\n\}/)[0];
+  ok(renderSrc.includes("!stateCan('task.consign')") && renderSrc.includes('clearConsignPlanDom();'),
+    '⭐描き直しのたびに許可を見る (手元のデータでボタンを描き戻さない)');
+  ok(html.split('clearConsignPlanDom();').length - 1 >= 2,
+    '状態を取り直したときにも消す (職員モードが 30 分で切れたあと、画面に残さない)');
   ok(html.includes("if (from === 'cplan') loadConsignPlan();")
     && html.includes("if (curView === 'cplan') loadConsignPlan();"),
     '⭐操作したあとは、開いていた画面のほうを取り直す (預ける計画の上で詳細を開いていたら両方)');
@@ -7083,11 +7092,12 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
   // ⭐行の描画を実際に動かす (ソースに式があるかどうかでは文言を守れない — [33] と同じ)
   {
     const src = html.match(/function cplanRowHtml\(r\) \{[\s\S]*?\r?\n\}/)[0];
-    const render = (r, fac) => new Function('esc', 'facilityName', 'fmtDate', 'findCard', 'cplanFac',
+    const render = (r, fac, mayConsign = true) =>
+      new Function('esc', 'facilityName', 'fmtDate', 'findCard', 'cplanFac', 'stateCan',
       src + '; return cplanRowHtml;')(
       (x) => String(x == null ? '' : x).replace(/[&<>"']/g,
         (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])),
-      () => 'ワークセンター', () => '9/7', () => null, fac || 'all')(r);
+      () => 'ワークセンター', () => '9/7', () => null, fac || 'all', () => mayConsign)(r);
     const base = { id: 1, task_id: 2, state: 'planned', facility_code: 'workcenter', title: 'テスト商品',
       qty: 700, boxes: 10, units_per_container: 70, storage_container: null, material_code: null,
       expiry: null, due_date: null, overdue: false, returned_total: 0, handed_at: null, missing: [],
@@ -7118,6 +7128,14 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
     ok(noqty.includes('数が記録されていません') && !noqty.includes('<b>700</b>'),
       '⭐数が記録されていないときに数を書かない');
     ok(!noqty.includes('入数が未登録'), '数が分からないのに「入数が未登録」と重ねて言わない');
+    // ⭐許可を失ったら操作のボタンを描かない (Codex R2 中1)。
+    //   職員モードは 30 分で切れる。切れたあとに拠点を選び直すと描き直しが起きる
+    const noperm = render({ ...base, state: 'handed', qty: 140 }, 'all', false);
+    ok(!noperm.includes('返却を受け取る') && !noperm.includes('返ってこないぶんを精算')
+      && !noperm.includes('渡しました') && !noperm.includes('用意できた'),
+      '⭐許可が無ければ操作のボタンを DOM に描かない (押したら断る、にしない)');
+    ok(noperm.includes('140') && noperm.includes('まとまり #1'), '読むぶんはそのまま出す');
+    ok(!noperm.includes('<div class="acts">'), '押すものが 1 つも無ければ、置き場ごと出さない');
   }
   const sw4 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
   ok(new RegExp(`const CACHE = '${SW_CACHE}'`).test(sw4), '画面キャッシュの版を上げる');
