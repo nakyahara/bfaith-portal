@@ -3871,7 +3871,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && html.includes("let units = m.units_per_container != null ? String(m.units_per_container) : '';"),
     '既定値: 1 箱に何個=入数 / 期限=この入荷の有効期限 (無ければ期限シールありの印)');
   // ⭐箱ラベルはまとまり単位 (要件 §AB-12)
-  ok(html.includes("const expSrc = bs.length > 1 ? (batch ? batch.expiry : null) : ((batch && batch.expiry) || c.expiry);"),
+  ok(html.includes('const expSrc = batch ? batch.expiry : c.expiry;'),
     '⭐期限は**そのまとまりのもの**を既定にする (1 つの入荷に期限が混ざる)');
   // ⭐期限を実際に決めさせて確かめる (式があるかどうかでは、埋め戻しの穴を見つけられない)
   {
@@ -3885,8 +3885,10 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     ok(pick(2, { expiry: null }, '2027-03', 0) === '',
       '🚨期限なしのぶんを選んだら**空のまま**。カード全体の 2027-03 を埋め戻さない (Codex R1 重大1)');
     ok(pick(1, { expiry: '2027-03' }, '2027-03', 0) === '2027-03', '分かれていないカードは今までどおり');
-    ok(pick(1, { expiry: null }, '2027-03', 0) === '2027-03',
-      '分かれていないカードは、まとまり = カードと同じ物なのでカードの期限を使ってよい');
+    ok(pick(1, { expiry: null }, '2027-03', 0) === '',
+      '🚨取り消したぶんを除いて 1 つになっただけでも埋め戻さない (Codex R3 重大2)');
+    ok(pick(1, null, '2027-03', 0) === '2027-03',
+      'まとまりが 1 つも無い古いカードだけ、カードの期限を使う');
     ok(pick(2, { expiry: null }, null, 1) === '期限シールあり', '期限シールの印は残る');
   }
   ok(html.includes('const bc = batch && bs.length > 1 ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;'),
@@ -3896,25 +3898,49 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(html.includes('function openPrintBatchPick(c, bs)') && html.includes("$('#printOk').disabled = true;"),
     '選ぶまでは発行させない');
   // 🚨送信中・結果が分からないうちは選び直させない (依頼 ID を作り直すと 2 枚出る — Codex R1 重大2)
-  ok(html.includes('if (printCtx && (printCtx.saving || printCtx.submitted)) {'),
+  ok(html.includes('if (printCtx && (printCtx.saving || printCtx.unresolved)) {'),
     '⭐送っている最中・届いたか分からないうちは、選び直しを受け付けない');
-  // ⭐「片づいたか」の判定を**ソースから取り出して動かす** (文字列検査では状態の遷移を見られない)
+  // ⭐submitPrint を**実際に動かして**、「応答喪失 → 再送が断られる → 選び直し」の
+  //   移り変わりを見る (Codex R3。判定式だけ見ても、印を下ろす経路を追えない)
   {
-    const line = html.split(/\r?\n/).filter((l) => l.includes('const settled = j.ok ||')).join('\n')
-      + '\n' + html.split(/\r?\n/).filter((l) => l.trim().startsWith("'bad_barcode', 'bad_batch'")).join('\n');
-    ok(/const settled = /.test(line) && /idempotency_conflict/.test(line) === false,
-      '(前提) 片づいたかの判定を取り出せた (idempotency_conflict は入っていない)');
-    const settled = (j) => new Function('j', line + '; return settled;')(j);
-    ok(settled({ ok: true }) === true, '積めたら片づいた');
-    ok(settled({ ok: false, error: 'bad_copies' }) === true, '入力の誤りで断られたら、何も積まれていないので片づいた');
-    ok(settled({ ok: false, error: 'pick_batch' }) === true, 'どのぶんか選んでも同じ');
-    ok(settled({ ok: false, error: 'idempotency_conflict' }) === false,
-      '🚨同じ依頼 ID で違う内容 = 前の依頼が残っている。片づいていない (Codex R2 重大1)');
-    ok(settled({ ok: false, error: 'confirm_unknown' }) === false, '前回の結果が不明なままなら片づいていない');
-    ok(settled({ ok: false, error: 'confirm_manual' }) === false, '手で刷る扱いのままも同じ');
-    ok(settled({ ok: false, error: 'state_changed' }) === false, '前のジョブの状態が動いたのも同じ');
-    ok(settled({ ok: false, error: 'in_progress' }) === false, 'まだ刷っている最中も同じ');
+    const src = html.match(/async function submitPrint\(\) \{[\s\S]*?\r?\n\}/)[0];
+    const mkRun = (replies) => {
+      let i = 0;
+      const ctx = { id: 7, batchId: 3, reqId: 'p-fixed', saving: false };
+      const els = { '#printPack': { value: '70' }, '#printExtra': { value: '' }, '#printExpiry': { value: '2027-03' },
+        '#printCopies': { value: '1' }, '#printMsg': { textContent: '' }, '#printOk': { disabled: false },
+        '#printTarget': { value: '1' },
+        '#printBody': { querySelector: () => ({ getAttribute: () => '1' }) } };
+      const fn = new Function('printCtx', 'findCard', '$', 'apiFetch', 'worker', 'closePrintBox',
+        'repaintAfterPrint', 'toast', 'openPrintBox', 'openGate', 'showErr',
+        src + '; return submitPrint;')(
+        ctx, () => ({ id: 7, title: 'x', print_job: null }), (k) => els[k],
+        async () => { const r = replies[i++]; if (r instanceof Error) throw r; return r; },
+        { id: 1 }, () => {}, () => {}, () => {}, () => {}, () => {}, () => {});
+      return { ctx, fn };
+    };
+    // ① 通信が切れた → 届いたか分からないので印が立つ
+    const a = mkRun([new Error('network')]);
+    await a.fn();
+    ok(a.ctx.unresolved === true, '⭐通信が切れたら「届いたか分からない」印が立つ');
+    // ② そのあと再送が入力の誤りで断られても、印は下ろさない
+    const b = mkRun([new Error('network'), { ok: false, error: 'bad_copies', message: 'x' }]);
+    await b.fn();
+    await b.fn();
+    ok(b.ctx.unresolved === true,
+      '🚨再送が入力の誤りで断られても下ろさない。それは「前に送ったぶん」が積まれていない証明ではない (Codex R3 重大1)');
+    // ③ 積めたと分かったときだけ下ろす
+    const c2 = mkRun([new Error('network'), { ok: true, job: { total_copies: 1 } }]);
+    await c2.fn();
+    await c2.fn();
+    ok(c2.ctx.unresolved === false, '⭐積めたと分かったら下ろす');
+    // ④ はじめから入力の誤りなら、印は立たない (選び直せる)
+    const d = mkRun([{ ok: false, error: 'bad_copies', message: 'x' }]);
+    await d.fn();
+    ok(!d.ctx.unresolved, 'はじめての送信が断られただけなら、印は立たない (選び直せる)');
   }
+  ok(html.includes('ctx.unresolved = true;') && html.includes('if (j.ok) ctx.unresolved = false;'),
+    '印を立てるのは通信が切れたときだけ / 下ろすのは積めたと分かったときだけ');
   ok(html.includes("data-prredo=") && !html.includes("openPrintBox(' + c.id + ')\">選び直す"),
     '選び直しは直接呼ばず、見張りを通す');
   // ⭐どのカードのぶんかは選ぶ画面が覚える (前のカードに渡さない — Codex R1 中1)

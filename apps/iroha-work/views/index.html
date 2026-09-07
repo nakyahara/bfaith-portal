@@ -2599,13 +2599,14 @@ function openPrintBox(id, batchId) {
   //   多すぎるときはそのまま出して、合計の案内と発行時の検査で止める
   copies = Math.max(1, copies);
   // 期限の既定: この入荷の有効期限 → 無ければ「期限シールあり」の商品だけ印を入れる (無い商品は空欄)
-  // ⭐期限も**そのまとまりのもの**を既定にする (§AB-12 の前提 7: 1 つの入荷に期限が混ざる)。
-  // 🚨分かれているカードでは、そのまとまりに期限が無ければ**空のまま**にする。
-  //   カード全体の期限を埋め戻すと、選ぶ画面で「期限なし」と見せた直後に別の期限が入り、
-  //   そのまま違うラベルを刷れてしまう (Codex #1259 R1 重大1)。
-  //   分かれていないカードは、まとまり = カードと同じ物なので、まとまり側が空なら
-  //   カードの期限を使ってよい (期限が混ざりようがない。既定が消えるほうが現場では困る)
-  const expSrc = bs.length > 1 ? (batch ? batch.expiry : null) : ((batch && batch.expiry) || c.expiry);
+  // ⭐期限は**そのまとまりのもの**を使う (§AB-12 の前提 7: 1 つの入荷に期限が混ざる)。
+  // 🚨まとまりがあるなら、**空欄も含めて**そのまとまりに従う。カード全体の期限を埋め戻すと、
+  //   選ぶ画面で「期限なし」と見せた直後に別の期限が入り、違うラベルを刷れてしまう
+  //   (Codex #1259 R1 重大1)。
+  // 🚨「いま残っているまとまりが 1 つ」を「分かれていない」と同じに扱わない —
+  //   取り消したぶんを除いて 1 つになっただけのことがあり、そこで埋め戻すと同じ事故が起きる
+  //   (同 R3 重大2)。カードの期限を使うのは**まとまりが 1 つも無い古いカード**だけ
+  const expSrc = batch ? batch.expiry : c.expiry;
   const expiry = expSrc ? String(expSrc) : (m.expiry_seal === 1 ? '期限シールあり' : '');
   const first = agents.find(a => a.online) || agents[0];
   const opts = agents.map(a => '<option value="' + a.id + '"' + (a.id === first.id ? ' selected' : '') + '>' + esc(a.label) + ' — ' + esc(a.printer_name || '(プリンター未登録)') + (a.online ? '' : ' (応答なし)') + '</option>').join('');
@@ -2676,7 +2677,7 @@ document.addEventListener('click', (e) => {
   if (!r) return;
   // 🚨送っている最中・送ったが結果を確かめられていないときは選び直させない。
   //   ここで作り直すと**依頼 ID が変わり**、届いていた 1 枚目に重ねてもう 1 枚出る (Codex R1 重大2)
-  if (printCtx && (printCtx.saving || printCtx.submitted)) {
+  if (printCtx && (printCtx.saving || printCtx.unresolved)) {
     $('#printMsg').textContent = printCtx.saving
       ? '❌ いま送っています。終わるまでお待ちください'
       : '❌ さきほどの依頼が届いたか分かっていません。同じ内容で「発行」を押し直すか、いったん閉じて印刷の状態を見てください (選び直すと 2 枚出ることがあります)';
@@ -2745,8 +2746,6 @@ async function submitPrint() {
     return;
   }
   ctx.saving = true;
-  // ⭐この依頼を送った、という印。届いたかどうかが分かるまで下ろさない (依頼 ID を作り直させないため)
-  ctx.submitted = true;
   $('#printOk').disabled = true;
   msgEl.textContent = '送信しています…';
   let j;
@@ -2761,17 +2760,20 @@ async function submitPrint() {
     });
   } catch (e) {
     ctx.saving = false;
+    // 🚨**届いたかどうか分からない**。ここで印を立て、依頼 ID を作り直させない。
+    //   立てるのはこの経路だけ — サーバーが返事をくれたなら、その依頼のことは分かっている
+    ctx.unresolved = true;
     msgEl.textContent = '❌ 送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2 枚にはなりません)';
     $('#printOk').disabled = false;
     return;
   }
   ctx.saving = false;
-  // ⭐**「返事が来た」と「その依頼が片づいた」は別**。片づいていないうちに印を下ろすと、
-  //   選び直しで依頼 ID を作り直せてしまい、届いていた 1 枚目に重ねてもう 1 枚出る
-  //   (Codex #1259 R2 重大1)。片づいた = 積めた / この内容では積まれなかった、が確かなとき
-  const settled = j.ok || ['bad_request', 'bad_copies', 'bad_pack_qty', 'bad_extra_qty', 'bad_expiry',
-    'bad_barcode', 'bad_batch', 'pick_batch', 'not_found', 'closed_task', 'no_agent', 'worker_required'].includes(j.error);
-  if (settled) ctx.submitted = false;
+  // ⭐印を下ろせるのは **j.ok のときだけ**。積めた (または同じ依頼として積んであった) と分かった
+  //   ときにかぎり、その依頼は片づいている。
+  // 🚨入力の誤りで断られても下ろさない — その返事は「**いま送ったぶん**は積まれていない」しか
+  //   言っておらず、前に送って返事を失ったぶんが積まれていないことの証明にはならない
+  //   (Codex #1259 R3 重大1)。枚数の検査などは冪等 ID を見るより先に走る
+  if (j.ok) ctx.unresolved = false;
   if (j.ok) {
     c.print_job = j.job;
     closePrintBox();
