@@ -45,6 +45,9 @@ setMetaValue('source_of_truth', 'app');
 // role はテストの途中で切り替える — CSV は管理者だけなので、両方の立場で確かめる
 let sessionRole = 'admin';
 const app = express();
+// 本番と同じ (server.js は Cloudflare Tunnel の 1 段だけを信じる)。
+// これが無いと req.ip が socket のアドレスになり、接続元ごとの上限を試せない
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use((req, _res, next) => {
   req.session = { authenticated: true, email: 'test@b-faith.biz', displayName: 'テスト', allowedApps: '*', role: sessionRole };
@@ -382,6 +385,17 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
       if (r.status === 429) ipBlocked++;
     }
     ok(ipBlocked > 0, '⭐同じ接続元から叩き続けると 429 で断る (' + ipBlocked + ' 回)');
+
+    // ⭐送り手が X-Forwarded-For の**先頭**を書き換えても、接続元ごとの上限をすり抜けられない。
+    //   先頭は誰でも好きに書けるので、そこを鍵にすると「毎回ちがう値」で素通りできてしまう
+    //   (重大1 と同じ「外から自由に作れるものを鍵にする」誤り)
+    let spoofBlocked = 0;
+    for (let i = 0; i < 200; i++) {
+      const r = await fetch(`http://${HOST}/apps/iroha-work/f/${'c'.repeat(30)}${i}`, {
+        headers: { Host: HOST, 'X-Forwarded-For': '9.9.9.' + i + ', 198.51.100.42' } });
+      if (r.status === 429) spoofBlocked++;
+    }
+    ok(spoofBlocked > 0, '⭐X-Forwarded-For の先頭を毎回変えても、上限をすり抜けられない (' + spoofBlocked + ' 回で断った)');
   }
 
   // でたらめ・失効したトークン

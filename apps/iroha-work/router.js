@@ -2189,10 +2189,16 @@ function bumpWindow(map, key, max, cap) {
   map.set(key, { count: 1, until: now + FL_WINDOW_MS });
   return true;
 }
-/** 接続元。プロキシの後ろにいるので X-Forwarded-For の**先頭**を見る (無ければ socket) */
+/**
+ * 接続元。⭐**X-Forwarded-For を自分で読まない**。
+ *
+ * あの並びの**先頭は送り手が好きに書ける**ので、毎回ちがう値を入れるだけで
+ * 「接続元ごとの上限」を素通りできてしまう (重大1 と同じ「外から自由に作れるものを鍵にする」誤り)。
+ * server.js が `trust proxy` を設定しているので、**req.ip が信用してよい値**を返す
+ * (Cloudflare Tunnel の 1 段だけを信じ、その手前の詐称は捨てる)。
+ */
 function clientKeyOf(req) {
-  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  return (fwd || req.ip || (req.socket && req.socket.remoteAddress) || '?').slice(0, 64);
+  return String(req.ip || (req.socket && req.socket.remoteAddress) || '?').slice(0, 64);
 }
 
 function facilityLinkGate(req, res, next) {
