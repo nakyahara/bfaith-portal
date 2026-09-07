@@ -108,6 +108,11 @@
    */
   function markArrived(cursor, id, sourceLive) {
     if (!sourceLive || id === null || id === undefined) return cursor;
+    // 🚨 **同じコマを見ただけなら「届いた」ではない** (Codex #1235 R3)。
+    //    ここで新しいオブジェクトを返すと、requestVideoFrameCallback が使えない端末で
+    //    currentTime を繰り返し渡したときに見張りの時刻が更新され続け、
+    //    映像が止まっていても8秒の打ち切りが永久に発火しない
+    if (id === cursor.arrived) return cursor;
     return { arrived: id, decoded: cursor.decoded };
   }
 

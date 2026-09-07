@@ -331,10 +331,28 @@ console.log('\n[8] 映像が届いているかの見張り');
   c = D.markArrived(c, 'p1', true);
   const cMuted = D.markArrived(c, 'p2', false);
   ok(cMuted === c, 'muted のあいだは新しいコマとして数えない');
-  let wm = D.noteFrame(D.newVideoWatch(0), 1000);
-  for (let t = 1250; t <= 1000 + T; t += 250) { /* muted なので noteFrame しない */ }
-  ok(D.videoStalled(wm, 1000 + T) === true,
-    'muted が続けば「映像が来ていない」として打ち切れる (黒いコマで誤魔化されない)');
+  // 🚨 requestVideoFrameCallback が使えない端末では currentTime を繰り返し渡す。
+  //    同じ値で「届いた」を更新すると、映像が止まっていても打ち切りが永久に発火しない (Codex #1235 R3)
+  ok(D.markArrived(c, 'p1', true) === c, '🚨 同じコマを見ただけでは「届いた」に数えない');
+  ok(D.markArrived(c, 'p9', true) !== c, '違うコマなら「届いた」に数える');
+  // 画面と同じ手順 (markArrived が進んだときだけ noteFrame) を回して、止まったら鳴ることを見る
+  const runFrames = (ids, { live = () => true, step = 250, until = 20000 } = {}) => {
+    let cur = D.newFrameCursor();
+    let w = D.newVideoWatch(0);
+    let fired = null;
+    for (let t = step, i = 0; t <= until; t += step, i++) {
+      const id = typeof ids === 'function' ? ids(i) : ids[Math.min(i, ids.length - 1)];
+      const nx = D.markArrived(cur, id, live(t));
+      if (nx !== cur) { cur = nx; w = D.noteFrame(w, t); }
+      if (fired === null && D.videoStalled(w, t)) fired = t;
+    }
+    return fired;
+  };
+  ok(runFrames(['t1'], {}) !== null && runFrames(['t1'], {}) <= 250 + T + 250,
+    '🚨 currentTime が同じ値のまま (映像が止まった) なら打ち切る');
+  ok(runFrames((i) => 'p' + i, {}) === null, '違うコマが来続けている間は打ち切らない');
+  ok(runFrames((i) => 'p' + i, { live: (t) => t < 2000 }) !== null,
+    'muted になったらそこから数えて打ち切る (黒いコマで誤魔化されない)');
 }
 
 // ─── 8b. 見張りと解析で印を分ける (映像は正常なのに読めない、を防ぐ) ────────
