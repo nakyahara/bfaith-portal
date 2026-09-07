@@ -2567,19 +2567,43 @@ function boxesOf(qty, per) {
 function printableBatches(c) {
   return (c.batches || []).filter((b) => b.work_status !== 'cancelled');
 }
+/**
+ * ⭐**届いたか分からない依頼**を、画面の開け閉めと 60 秒ごとの取り直しをまたいで覚えておく
+ * (要件: 印刷は二重に出さない — Codex #1259 R4 重大1)。
+ *
+ * printCtx はダイアログを閉じると消えるし、カードの持ち物にすると一覧の取り直しで消える。
+ * どちらでも、開き直したときに**依頼 ID が作り直されて**、届いていた 1 枚目に重ねてもう 1 枚出る。
+ * だから画面の状態から独立した入れ物に置く。積めたと分かったときだけ捨てる。
+ */
+const printPending = new Map();   // task_id → { reqId, batchId }
 function openPrintBox(id, batchId) {
   const c = findCard(id);
   if (!c) return;
   if (!worker) { openGate(); return; }
   const agents = printAgents();
   if (agents.length === 0) { showErr('ラベルを印刷する いろはPC が登録されていません (管理画面で印刷係を登録)'); return; }
+  const all = c.batches || [];
   const bs = printableBatches(c);
+  // ⭐まとまりがあるのに出せるぶんが 1 つも無い = 全部取り消された。
+  //   カード全体の期限・数で刷らせない (Codex R4 中1)
+  if (all.length > 0 && bs.length === 0) {
+    showErr('このカードのぶんはすべて取り消されています。ラベルは出せません');
+    return;
+  }
+  // ⭐届いたか分からない依頼があるなら、そのまとまりのまま開く (選び直させない)
+  const pending = printPending.get(String(c.id));
+  if (pending) batchId = pending.batchId;
   // 分かれているのに選んでいなければ、まず選んでもらう
   if (bs.length > 1 && batchId == null) { openPrintBatchPick(c, bs); return; }
   const batch = batchId != null ? bs.find((b) => b.id === Number(batchId)) : (bs.length === 1 ? bs[0] : null);
   if (batchId != null && !batch) { showErr('そのぶんが見つかりません (画面を更新してください)'); return; }
-  printCtx = { id: c.id, batchId: batch ? batch.id : null,
-    reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), saving: false };
+  // ⭐届いたか分からない依頼が残っていれば、**同じ依頼 ID・同じまとまり**で開き直す。
+  //   同じ内容で送り直せばサーバーは同じ依頼として扱うので、2 枚にはならない
+  const pend = printPending.get(String(c.id));
+  printCtx = pend
+    ? { id: c.id, batchId: pend.batchId, reqId: pend.reqId, saving: false, unresolved: true }
+    : { id: c.id, batchId: batch ? batch.id : null,
+        reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), saving: false };
   const m = c.master || {};
   const type = barcodeTypeOf(c.barcode);
   // ⭐必要保管箱の内訳から分ける: 満杯の箱 (per 個) が full 箱、端数が rest 個で 1 箱。
@@ -2764,8 +2788,10 @@ async function submitPrint() {
   } catch (e) {
     ctx.saving = false;
     // 🚨**届いたかどうか分からない**。ここで印を立て、依頼 ID を作り直させない。
-    //   立てるのはこの経路だけ — サーバーが返事をくれたなら、その依頼のことは分かっている
+    //   立てるのはこの経路だけ — サーバーが返事をくれたなら、その依頼のことは分かっている。
+    //   ⭐画面を閉じても消えないところに置く (開き直しで ID が変わるのを防ぐ)
     ctx.unresolved = true;
+    printPending.set(String(c.id), { reqId: ctx.reqId, batchId: ctx.batchId });
     msgEl.textContent = '❌ 送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2 枚にはなりません)';
     $('#printOk').disabled = false;
     return;
@@ -2776,7 +2802,7 @@ async function submitPrint() {
   // 🚨入力の誤りで断られても下ろさない — その返事は「**いま送ったぶん**は積まれていない」しか
   //   言っておらず、前に送って返事を失ったぶんが積まれていないことの証明にはならない
   //   (Codex #1259 R3 重大1)。枚数の検査などは冪等 ID を見るより先に走る
-  if (j.ok) ctx.unresolved = false;
+  if (j.ok) { ctx.unresolved = false; printPending.delete(String(c.id)); }
   if (j.ok) {
     c.print_job = j.job;
     closePrintBox();

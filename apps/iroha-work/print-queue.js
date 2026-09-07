@@ -157,13 +157,21 @@ export function recordHeartbeat(deviceId, { note = null, version = null, bpac = 
  * ⭐指定があれば、そのカードのもので・取り消していないことを確かめる。
  */
 function pickPrintBatch(db, taskId, batchId) {
-  const rows = db.prepare("SELECT * FROM f_iroha_task_batches WHERE task_id = ? AND work_status <> 'cancelled' ORDER BY seq").all(taskId);
+  // ⭐**まとまりがあるか**と**出せるぶんがあるか**を分けて見る。取り消したぶんを除いてから
+  //   件数を見ると、全部取り消されたカードが「まとまりの無い古いカード」と同じ扱いになり、
+  //   カード全体の期限・数でラベルが出てしまう (Codex #1259 R4 中1)
+  const all = db.prepare('SELECT * FROM f_iroha_task_batches WHERE task_id = ? ORDER BY seq').all(taskId);
+  const rows = all.filter((r) => r.work_status !== 'cancelled');
   if (batchId != null) {
     const b = rows.find((r) => r.id === Number(batchId));
     if (!b) return { error: 'bad_batch', ok: false, message: 'そのぶんはこのカードにありません (画面を更新してください)' };
     return { batch: b };
   }
-  if (rows.length === 0) return { batch: null };            // まとまりが無い古いカード (今までどおり)
+  if (all.length === 0) return { batch: null };             // まとまりが無い古いカード (今までどおり)
+  if (rows.length === 0) {
+    return { error: 'no_batch', ok: false,
+      message: 'このカードのぶんはすべて取り消されています。ラベルは出せません' };
+  }
   if (rows.length === 1) return { batch: rows[0] };
   return { error: 'pick_batch', ok: false,
     message: 'このカードは分かれています。どのぶんのラベルを出すか選んでください',

@@ -177,8 +177,23 @@ let J1;
     const mix = enqueuePrintJob({ taskId: TS, batchId: other.id, copies: 1, packQty: '120', clientRequestId: cid2 });
     ok(!mix.ok && mix.error === 'idempotency_conflict',
       '⭐同じ依頼 ID で別のぶんが送られたら断る (違うラベルを「積めた」と返さない)');
+    // 🚨全部取り消されたカードを「まとまりの無い古いカード」と同じに扱わない (Codex R4 中1)。
+    //   取り消したぶんを除いてから件数を見ると、カード全体の期限・数でラベルが出てしまう
+    // 先に積んであるジョブを片づける (残っていると in_progress で断られ、まとまりの検査まで届かない)
+    db.prepare('DELETE FROM f_iroha_print_jobs WHERE task_id = ?').run(TS);
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'cancelled' WHERE task_id = ?").run(TS);
+    const allGone = enqueuePrintJob({ taskId: TS, copies: 1, packQty: '120', clientRequestId: crid() });
+    ok(!allGone.ok && allGone.error === 'no_batch',
+      '⭐まとまりがあるのに全部取り消されていたら断る (カード全体の数で刷らせない)');
+    ok(/取り消されています/.test(allGone.message || ''), 'なぜ出せないかを言う');
+    // まとまりが 1 つも無い古いカードは今までどおり出せる
+    const TOld = mkTask('まとまりの無い古いカード', 'SPLIT-3');
+    db.prepare('DELETE FROM f_iroha_task_batches WHERE task_id = ?').run(TOld);
+    const old = enqueuePrintJob({ taskId: TOld, copies: 1, packQty: '120', clientRequestId: crid() });
+    ok(old.ok && db.prepare('SELECT batch_id FROM f_iroha_print_jobs WHERE id = ?').get(old.job.id).batch_id == null,
+      'まとまりが 1 つも無い古いカードは、今までどおり出せる (batch_id は無し)');
     // 後の検査 (ジョブの件数) に影響しないよう片づける
-    db.prepare("DELETE FROM f_iroha_print_jobs WHERE task_id IN (?, ?)").run(TS, TW);
+    db.prepare("DELETE FROM f_iroha_print_jobs WHERE task_id IN (?, ?, ?)").run(TS, TW, TOld);
   }
   const again = enqueuePrintJob({ taskId: T1, copies: 2, packQty: '120', expiry: '2027-03', clientRequestId: id });
   ok(again.ok && again.replayed && again.job.id === J1, '同じ冪等 ID の再送は同じジョブ (2 枚出ない)');

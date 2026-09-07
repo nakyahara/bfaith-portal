@@ -539,6 +539,7 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
   if (!r.ok) {
     const status = ['in_progress', 'confirm_unknown', 'confirm_manual', 'state_changed', 'idempotency_conflict', 'closed_task'].includes(r.error) ? 409 : r.error === 'not_found' ? 404 : 400;
     // pick_batch = 「どのぶんか選んで」。入力の不足なので 400 (画面は選ばせて出し直す)
+    // no_batch = 「全部取り消されている」。出せるものが無いので 400
     // (bad_extra_qty など入力の誤りは 400)
     return res.status(status).json(r);
   }

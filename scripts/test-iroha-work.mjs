@@ -3927,18 +3927,22 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
         '#printCopies': { value: '1' }, '#printMsg': { textContent: '' }, '#printOk': { disabled: false },
         '#printTarget': { value: '1' },
         '#printBody': { querySelector: () => ({ getAttribute: () => '1' }) } };
+      // 届いたか分からない依頼の控え。画面の開け閉めをまたぐので、外から渡して中身も見る
+      const pending = new Map();
       const fn = new Function('printCtx', 'findCard', '$', 'apiFetch', 'worker', 'closePrintBox',
-        'repaintAfterPrint', 'toast', 'openPrintBox', 'openGate', 'showErr',
+        'repaintAfterPrint', 'toast', 'openPrintBox', 'openGate', 'showErr', 'printPending',
         src + '; return submitPrint;')(
         ctx, () => ({ id: 7, title: 'x', print_job: null }), (k) => els[k],
         async () => { const r = replies[i++]; if (r instanceof Error) throw r; return r; },
-        { id: 1 }, () => {}, () => {}, () => {}, () => {}, () => {}, () => {});
-      return { ctx, fn };
+        { id: 1 }, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, pending);
+      return { ctx, fn, pending };
     };
     // ① 通信が切れた → 届いたか分からないので印が立つ
     const a = mkRun([new Error('network')]);
     await a.fn();
     ok(a.ctx.unresolved === true, '⭐通信が切れたら「届いたか分からない」印が立つ');
+    ok(a.pending.get('7') && a.pending.get('7').reqId === 'p-fixed',
+      '⭐その依頼 ID を、画面の開け閉めをまたぐところに控える (開き直しで作り直させない)');
     // ② そのあと再送が入力の誤りで断られても、印は下ろさない
     const b = mkRun([new Error('network'), { ok: false, error: 'bad_copies', message: 'x' }]);
     await b.fn();
@@ -3950,6 +3954,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     await c2.fn();
     await c2.fn();
     ok(c2.ctx.unresolved === false, '⭐積めたと分かったら下ろす');
+    ok(!c2.pending.has('7'), '⭐積めたと分かったら控えも捨てる');
     // ④ はじめから入力の誤りなら、印は立たない (選び直せる)
     const d = mkRun([{ ok: false, error: 'bad_copies', message: 'x' }]);
     await d.fn();
@@ -3957,8 +3962,21 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   }
   ok(html.includes('repaintAfterPrint(c); openPrintBox(c.id, ctx.batchId);'),
     '⭐前回の結果を確かめて開き直すときは、**選んでいたまとまりのまま**にする (対象を変えさせない)');
-  ok(html.includes('ctx.unresolved = true;') && html.includes('if (j.ok) ctx.unresolved = false;'),
+  ok(html.includes('ctx.unresolved = true;') && html.includes('if (j.ok) { ctx.unresolved = false; printPending.delete(String(c.id)); }'),
     '印を立てるのは通信が切れたときだけ / 下ろすのは積めたと分かったときだけ');
+  // 🚨画面を閉じて開き直しても、届いたか分からない依頼の ID を失わない (Codex R4 重大1)
+  ok(html.includes('const printPending = new Map();'),
+    '⭐届いたか分からない依頼は、画面の開け閉め・一覧の取り直しをまたいで覚えておく');
+  ok(html.includes("printPending.set(String(c.id), { reqId: ctx.reqId, batchId: ctx.batchId });"),
+    '通信が切れたら、その依頼 ID とまとまりを控える');
+  ok(html.includes('const pend = printPending.get(String(c.id));')
+    && html.includes('? { id: c.id, batchId: pend.batchId, reqId: pend.reqId, saving: false, unresolved: true }'),
+    '⭐開き直したら**同じ依頼 ID・同じまとまり**で開く (作り直すと 2 枚出る)');
+  ok(html.includes('if (pending) batchId = pending.batchId;'),
+    '届いたか分からない依頼があるうちは、まとまりを選び直させない');
+  // 🚨全部取り消されたカードを「まとまりの無い古いカード」と同じに扱わない (Codex R4 中1)
+  ok(html.includes('if (all.length > 0 && bs.length === 0) {'),
+    '⭐まとまりがあるのに出せるぶんが無ければ、カード全体の数で刷らせない');
   ok(html.includes("data-prredo=") && !html.includes("openPrintBox(' + c.id + ')\">選び直す"),
     '選び直しは直接呼ばず、見張りを通す');
   // ⭐どのカードのぶんかは選ぶ画面が覚える (前のカードに渡さない — Codex R1 中1)
