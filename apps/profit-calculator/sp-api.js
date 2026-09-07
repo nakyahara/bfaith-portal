@@ -653,7 +653,7 @@ export async function getActiveListingsReport(opts = {}) {
     options: { version: '2021-06-30' },
   });
 
-  const reportId = createResult.reportId;
+  const reportId = createResult.reportId;
   log(`[SP-API] レポート作成: reportId=${reportId}`);
   const startedWaitingAt = (opts.now || (() => new Date()))();
 
