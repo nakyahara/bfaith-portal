@@ -79,7 +79,8 @@ export const FLAGS = {
   BELOW_COST_FLOOR: '今の価格が原価+手数料から計算した下限より低い (赤字の疑い)',
   BELOW_STOPPER: '今の価格が赤字ストッパーより低い',
   COST_UNKNOWN: '原価が未登録 (NE商品マスタ)',
-  INPUT_INVALID: '入力に異常値がある (負の原価・手数料など。データ側を確認)',
+  INPUT_INVALID: '入力に異常値がある (負の原価・範囲外の手数料率など。データ側を確認)',
+  CHANNEL_UNKNOWN: '発送区分が FBA / 自己発送のどちらか分からない',
   FEE_RATE_ASSUMED: '販売手数料率が取れていない・範囲外なので 15% と仮定',
   FBA_FEE_UNKNOWN: 'FBA配送代行手数料が取れていない',
   SHIP_UNKNOWN: '自己発送の送料が未登録',
@@ -115,8 +116,9 @@ function amountState(v, max, { allowZero = true } = {}) {
  *   浮動小数の誤差でしか生まれない (toFixed(6) のような「なんとなくの桁」ではなく、データの桁に合わせた)
  */
 export function ceilDivide(amountYen, ratio) {
-  const n = Math.round(amountYen * 100);          // 1/100 円
-  const bp = Math.round(ratio * 10000);           // basis point
+  // どちらも「下限が高くなる側」へ丸める (金額は切り上げ、分母は切り捨て — Codex R3 Medium)
+  const n = Math.ceil(amountYen * 100 - 1e-7);    // 1/100 円
+  const bp = Math.floor(ratio * 10000 + 1e-7);    // basis point
   if (bp <= 0) return null;
   return Math.ceil((n * 10000) / (bp * 100));
 }
@@ -142,7 +144,11 @@ export function ceilDivide(amountYen, ratio) {
  */
 export function computeCosts(p) {
   const flags = [];
-  const isFba = String(p.channel || '').toUpperCase() === 'FBA';
+  // 発送区分は FBA / FBM の 2 値だけ信用する。不明なら固定費が決められない → 下限を出さない (Codex R3 High)
+  const channel = String(p.channel || '').toUpperCase();
+  const isFba = channel === 'FBA';
+  const channelKnown = channel === 'FBA' || channel === 'FBM';
+  if (!channelKnown) flags.push('CHANNEL_UNKNOWN');
   let minMarginRate = num(p.min_margin_rate) ?? DEFAULT_MIN_MARGIN_RATE;
   if (minMarginRate < 0 || minMarginRate >= 0.9) minMarginRate = DEFAULT_MIN_MARGIN_RATE;
 
@@ -153,19 +159,25 @@ export function computeCosts(p) {
   if (!costKnown) flags.push('COST_UNKNOWN');
   if (cost.state === 'invalid') flags.push('INPUT_INVALID');
 
-  // 販売手数料率: 範囲外 (0・負・50% 超) は取れていないのと同じ扱い → 保守値 15%
+  // 販売手数料率: **無い** なら保守値 15% で計算する (旗 FEE_RATE_ASSUMED)。
+  // **あるのに範囲外** (0・負・50% 超) はデータ異常 → 下限を出さない (Codex R3 High: 置き換えて計算すると値下げが出る)
   let feeRate = num(p.referral_fee_rate);
   let feeRateAssumed = false;
-  if (feeRate == null || feeRate < REFERRAL_RATE_MIN || feeRate > REFERRAL_RATE_MAX) {
-    if (feeRate != null) flags.push('INPUT_INVALID');
+  let feeRateValid = true;
+  if (feeRate == null) {
     feeRate = FALLBACK_REFERRAL_RATE; feeRateAssumed = true; flags.push('FEE_RATE_ASSUMED');
+  } else if (feeRate < REFERRAL_RATE_MIN || feeRate > REFERRAL_RATE_MAX) {
+    feeRateValid = false; flags.push('INPUT_INVALID');
+    feeRate = FALLBACK_REFERRAL_RATE; feeRateAssumed = true; flags.push('FEE_RATE_ASSUMED'); // 概算粗利の表示用にだけ使う
   }
 
   // 固定費。不明・異常なものがあれば「下限は計算できない」に倒す (0 で埋めると下限が低く出て、値下げを通してしまう)
   let fixedFees = 0;
-  let fixedKnown = true;
+  let fixedKnown = channelKnown;
   const main = isFba ? amountState(p.fba_fee, MAX_FEE) : amountState(p.ship_cost, MAX_FEE);
-  if (main.state !== 'ok') {
+  if (!channelKnown) {
+    // 発送区分が分からなければ、どの固定費を足すべきかも分からない
+  } else if (main.state !== 'ok') {
     fixedKnown = false;
     flags.push(isFba ? 'FBA_FEE_UNKNOWN' : 'SHIP_UNKNOWN');
     if (main.state === 'invalid') flags.push('INPUT_INVALID');
@@ -177,12 +189,12 @@ export function computeCosts(p) {
 
   let floorPrice = null;
   const denom = 1 - feeRate - minMarginRate;
-  if (costKnown && fixedKnown && denom > 0) {
+  if (costKnown && fixedKnown && feeRateValid && denom > 0) {
     floorPrice = ceilDivide(cost.value + fixedFees, denom);
     if (floorPrice != null && !isValidPrice(floorPrice)) { floorPrice = null; flags.push('INPUT_INVALID'); }
   }
   return {
-    costKnown, feeRate, feeRateAssumed,
+    costKnown, feeRate, feeRateAssumed, feeRateValid, channelKnown,
     fixedFees: fixedKnown ? fixedFees : null,
     minMarginRate, floorPrice, flags: [...new Set(flags)],
   };
@@ -327,6 +339,10 @@ export function evaluateListing(input) {
   // ★最終の不変条件 (Codex R2 High): 持ち主不明のカートでは値下げしない。上限クランプで値上げが値下げに反転する経路も含む
   if (action === 'lower' && owner === 'unknown') {
     return { ...hold('BUYBOX_OWNER_UNKNOWN', ` (カート ${bb == null ? '無し' : bb.toLocaleString() + ' 円'}、上限で反転)`), targetPrice: target, changeRatio };
+  }
+  // ★最終の不変条件 (Codex R3 High): 価格計算に関わる入力に異常値があれば値下げしない (下限が信用できない)
+  if (action === 'lower' && (flags.includes('INPUT_INVALID') || flags.includes('CHANNEL_UNKNOWN'))) {
+    return { ...hold('NO_FLOOR', ' (入力に異常値があるため)'), targetPrice: target, changeRatio };
   }
 
   const confidence = code === 'RAISE_TO_FLOOR' ? 0.9

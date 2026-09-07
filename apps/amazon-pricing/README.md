@@ -98,11 +98,19 @@ JSON で欲しいときは `GET /api/listings.json` (画面と同じ絞り込み
 ## テスト
 
 ```
+npm run test:amazon-pricing                        # 下の 4 本をまとめて
+node apps/amazon-pricing/test-no-write-path.mjs   # ★書き込み経路が無い
 node apps/amazon-pricing/test-engine.mjs          # 判定ルール (事故ルール 4 つを固定)
 node apps/amazon-pricing/test-db.mjs              # 表・追記のみ・方針の履歴・run・読み取りモデル
-node apps/amazon-pricing/test-no-write-path.mjs   # ★書き込み経路が無い
 node apps/amazon-pricing/test-views.mjs           # 画面 (テンプレ単体 + 実物のルート)
 ```
+
+GitHub Actions の定義は [`docs/ci/amazon-pricing-tests.yml`](../../docs/ci/amazon-pricing-tests.yml) (PR で同じ 4 本 + `node --check server.js`)。
+**★中原さんの作業 (1 回・2 手)**:
+1. `docs/ci/amazon-pricing-tests.yml` を `.github/workflows/` へ移してコミット (Claude Code の GitHub トークンには workflow scope が無く、
+   `.github/workflows/` 配下を push できない — 2026-09-07 に実際に拒否された)
+2. repo の Settings → Branches → master の branch protection で `amazon-pricing tests` を必須ステータスチェックにする。
+   これで「書き込み経路が無い」テストを落とす PR はマージできなくなる
 
 ## 次 (別 PR)
 

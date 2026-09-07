@@ -84,7 +84,7 @@ console.log('\n── 読み取りモデル (1 出品 1 行) ──');
   const fba = rows.find((r) => r.seller_sku === 'PR_FBA1 ');
   ok(fba && fba.my_price === 2000 && fba.buybox_price === 1900, '最新日 (2026-09-07) の価格が付く');
   ok(fba.snapshot_date_jst === '2026-09-07', '  snapshot_date_jst');
-  ok(fba.cost_incl_tax === 1100, `大文字・空白つき SKU でも原価が突合する (1100)。実際 ${fba.cost_incl_tax}`);
+  ok(fba.cost_incl_tax === 1100, `大文字・空白つき SKU でも原価が突合する (1100、1/100 円に丸め)。実際 ${fba.cost_incl_tax}`);
   ok(fba.units_30d === 5, `30 日販売は大文字小文字を無視して合算、30 日より前は数えない (5)。実際 ${fba.units_30d}`);
   ok(fba.ne_name === 'A商品' && fba.ne_code === 'ne-a', '商品名・NE コードが付く');
   const set = rows.find((r) => r.seller_sku === 'pr_set1');
@@ -112,12 +112,12 @@ console.log('\n── 方針の保存と履歴 ──');
   const blank = savePolicy(db, { sku: 'pr_fbm1', patch: {}, actorId: 'a@example.com', reasonCode: 'initial' });
   ok(blank.changed.length === 1 && blank.changed[0] === 'mode' && getPolicy(db, 'pr_fbm1')?.mode === 'off', '何も入れずに初回保存 → mode の 1 行だけ残る (設定したことは見える)');
 
-  const r2 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox', floor_price: 1800, ceiling_price: 2500, min_margin_rate: 0.12, floor_price: 1900 }, actorId: 'b@example.com', reasonCode: 'cost_change', reasonText: '仕入値上げ' });
+  const r2 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox', floor_price: 1800, ceiling_price: 2500, min_margin_rate: 12, floor_price: 1900 }, actorId: 'b@example.com', reasonCode: 'cost_change', reasonText: '仕入値上げ' });
   ok(r2.changed.length === 1 && r2.changed[0] === 'floor_price', '変わった列だけ履歴に残る (floor_price)');
   const last = listPolicyEvents(db, { sku: 'PR_FBA1 ' })[0];
   ok(last.old_value === '1800' && last.new_value === '1900' && last.reason_text === '仕入値上げ' && last.actor_id === 'b@example.com', '  前後の値・理由・誰が');
 
-  const r3 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox', floor_price: 1900, ceiling_price: 2500, min_margin_rate: 0.12 }, actorId: 'b@example.com', reasonCode: 'margin' });
+  const r3 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox', floor_price: 1900, ceiling_price: 2500, min_margin_rate: '12%' }, actorId: 'b@example.com', reasonCode: 'margin' });
   ok(r3.changed.length === 0 && listPolicyEvents(db, { sku: 'PR_FBA1 ' }).length === 5, '同じ内容を送り直しても履歴は増えない');
 
   throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { floor_price: 0 }, actorId: 'x', reasonCode: 'mistake' }), '0 は入れられません', 'ストッパー 0 は拒否 (旧ツールの「0 = 下限なし」を二度と作らない)');
@@ -128,7 +128,10 @@ console.log('\n── 方針の保存と履歴 ──');
   throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { floor_price: 12.5 }, actorId: 'x', reasonCode: 'stop' }), '整数円', '小数は拒否 (勝手に丸めない)');
   const n = normalizePolicyPatch({ min_margin_rate: '95' });
   ok(n.errors.length > 0, '最低粗利率 95% は拒否');
-  ok(normalizePolicyPatch({ min_margin_rate: '0.2' }).patch.min_margin_rate === 0.2, '0.2 (小数) は 20% として受ける');
+  // Codex R3 Medium: 境界では常に % (0.5 = 0.5%。1 未満を比率と解釈しない)
+  ok(normalizePolicyPatch({ min_margin_rate: '0.5' }).patch.min_margin_rate === 0.005, '0.5 は 0.5% (= 0.005) として受ける');
+  ok(normalizePolicyPatch({ min_margin_rate: '12' }).patch.min_margin_rate === 0.12, '12 は 12%');
+  ok(normalizePolicyPatch({ min_margin_rate: 89.9 }).errors.length === 0 && normalizePolicyPatch({ min_margin_rate: 90 }).errors.length > 0, '89.9% は通り 90% は拒否');
 }
 
 console.log('\n── 追記のみ (トリガ) ──');

@@ -76,20 +76,25 @@ export function mirrorTablesAvailable(db) {
   return { ok: missing.length === 0, missing };
 }
 
-/** 全出品の 360 行。原価は整数円に丸める (表示・判定の両方でこの値を使う) */
+/**
+ * 原価は 1/100 円の分解能で持つ (税率 × 数量の積は小数 2 桁まで意味がある)。整数円に丸めると
+ * 下限が 1 円低く出る場合がある (Codex R3 Medium: 1103.3 → 1103 で 1880 → 1879)。表示は yen() が丸める
+ */
+const shapeRow = (r) => ({
+  ...r,
+  cost_incl_tax: r.cost_incl_tax == null ? null : Math.round(r.cost_incl_tax * 100) / 100,
+  mode: r.mode || 'off',
+  offset_jpy: r.offset_jpy ?? 0,
+});
+
+/** 全出品の 360 行 (表示・判定の両方でこの値を使う) */
 export function loadListings(db) {
-  return db.prepare(LISTING_360_SQL).all().map((r) => ({
-    ...r,
-    cost_incl_tax: r.cost_incl_tax == null ? null : Math.round(r.cost_incl_tax),
-    mode: r.mode || 'off',
-    offset_jpy: r.offset_jpy ?? 0,
-  }));
+  return db.prepare(LISTING_360_SQL).all().map(shapeRow);
 }
 
 export function loadListing(db, sku) {
   const r = db.prepare(`SELECT * FROM (${LISTING_360_SQL}) WHERE seller_sku = ?`).get(sku);
-  if (!r) return null;
-  return { ...r, cost_incl_tax: r.cost_incl_tax == null ? null : Math.round(r.cost_incl_tax), mode: r.mode || 'off', offset_jpy: r.offset_jpy ?? 0 };
+  return r ? shapeRow(r) : null;
 }
 
 /** 1 SKU の価格の推移 (日次スナップショット、新しい順) */

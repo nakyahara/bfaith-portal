@@ -281,14 +281,12 @@ export function normalizePolicyPatch(patch) {
     const v = patch.min_margin_rate;
     if (v === null || v === undefined || v === '') out.min_margin_rate = null;
     else {
-      // 画面は % で入れる (10 = 10%)。小数 (0.1) で来ても受ける
-      let n = Number(String(v).trim().replace(/%/g, ''));
-      if (!Number.isFinite(n)) errors.push('最低粗利率は数値で入力してください');
-      else {
-        if (n >= 1) n = n / 100;
-        if (n < 0 || n >= 0.9) errors.push('最低粗利率は 0〜89% の範囲で入力してください');
-        else out.min_margin_rate = Math.round(n * 10000) / 10000;
-      }
+      // ★画面・API の境界では **常に % で受ける** (10 = 10%、0.5 = 0.5%)。1 未満を比率と解釈しない
+      //   (Codex R3 Medium: 単位が入力値で変わると 0.5 が 50% になる)。DB には比率 (0.10) で入れる
+      const n = Number(String(v).trim().replace(/%/g, ''));
+      if (!Number.isFinite(n)) errors.push('最低粗利率は % の数値で入力してください (例: 10)');
+      else if (n < 0 || n >= 90) errors.push('最低粗利率は 0〜89% の範囲で入力してください');
+      else out.min_margin_rate = Math.round(n * 100) / 10000;
     }
   }
   if ('note' in patch) {

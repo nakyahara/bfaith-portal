@@ -43,16 +43,28 @@ console.log('\n── 下限の計算 (computeCosts) ──');
   // Codex R1 Medium: toFixed(6) は本物の端数まで消す。整数演算 (1/100 円 × basis point) なら 1600.01 / 0.8 = 2000.0125 → 2001
   eq(ceilDivide(1600.01, 0.8), 2001, '本物の端数 (1/100 円) は切り上げる (整数演算)');
   eq(ceilDivide(1600, 0.8), 2000, '割り切れるときは切り上げない');
-  eq(ceilDivide(1600.004, 0.8), 2000, '1/100 円未満はデータに存在しない端数 (浮動小数の誤差) として丸める');
+  eq(ceilDivide(1600.004, 0.8), 2001, '1/100 円未満の端数も安全側 (切り上げ) に倒す');
+  eq(ceilDivide(1600 + 1e-9, 0.8), 2000, '浮動小数の誤差 (1e-9) は切り上げない');
   eq(ceilDivide(1600, 0), null, '分母 0 は null');
+  // Codex R3 Medium: 税抜 1003 × 1.10 = 1103.3 + 400 = 1503.3 / 0.8 = 1879.125 → 1880 (原価を整数に丸めると 1879 になる)
+  eq(computeCosts({ ...base, cost_incl_tax: 1103.3 }).floorPrice, 1880, '原価の小数 (1103.3) を丸めずに下限 1880');
 
   console.log('  — Codex R1 High 2: 異常値は「有限の数」でも信用しない —');
   const neg = computeCosts({ ...base, cost_incl_tax: -100 });
   ok(neg.floorPrice === null && neg.flags.includes('INPUT_INVALID') && neg.flags.includes('COST_UNKNOWN'), '負の原価 → 下限 null + INPUT_INVALID');
   ok(computeCosts({ ...base, cost_incl_tax: 0 }).floorPrice === null, '原価 0 → 下限 null (0 円原価で下限を出さない)');
+  // Codex R3 High: 「無い」は保守値で計算してよいが、「あるのに範囲外」は下限を出さない
   const zeroRate = computeCosts({ ...base, referral_fee_rate: 0 });
-  ok(zeroRate.feeRateAssumed && zeroRate.feeRate === FALLBACK_REFERRAL_RATE && zeroRate.flags.includes('INPUT_INVALID'), '手数料率 0 → 範囲外として 15% に置き換え + INPUT_INVALID');
-  ok(computeCosts({ ...base, referral_fee_rate: 0.9 }).feeRateAssumed, '手数料率 90% → 範囲外として 15% に置き換え');
+  ok(zeroRate.floorPrice === null && zeroRate.flags.includes('INPUT_INVALID') && zeroRate.feeRateValid === false, '手数料率 0 (範囲外) → 下限 null + INPUT_INVALID');
+  ok(computeCosts({ ...base, referral_fee_rate: 0.9 }).floorPrice === null, '手数料率 90% (範囲外) → 下限 null');
+  ok(computeCosts({ ...base, referral_fee_rate: null }).floorPrice === Math.ceil(1400 / 0.75), '手数料率が無い → 15% で計算 (保守値)');
+  eq(evaluateListing({ ...base, referral_fee_rate: 0, buybox_price: 1500 }).action, 'hold', '手数料率 0 + カートが安い → 保留 (以前は 1867 円への値下げが出た)');
+  eq(evaluateListing({ ...base, referral_fee_rate: 0.9, buybox_price: 1500 }).action, 'hold', '手数料率 90% + カートが安い → 保留');
+  eq(evaluateListing({ ...base, referral_fee_rate: 0, buybox_price: 2300 }).action, 'raise', '手数料率 0 でも値上げは出す');
+  const noCh = computeCosts({ ...base, channel: null, ship_cost: 200 });
+  ok(noCh.floorPrice === null && noCh.flags.includes('CHANNEL_UNKNOWN'), '発送区分不明 → 下限 null (FBM 扱いにしない)');
+  eq(evaluateListing({ ...base, channel: null, ship_cost: 200, buybox_price: 1500 }).action, 'hold', '発送区分不明 + カートが安い → 保留 (以前は 1500 円への値下げが出た)');
+  eq(evaluateListing({ ...base, channel: 'fbm', ship_cost: 200, buybox_price: 1400 }).reasonCode, 'FLOOR_CLAMP', '小文字の fbm は自己発送として通る (下限 1500 で止まる)');
   ok(computeCosts({ ...base, fba_fee: -1 }).floorPrice === null, '負の FBA 手数料 → 下限 null');
   ok(computeCosts({ ...base, per_item_fee: -5 }).floorPrice === null, '負の 1 品手数料 → 下限 null');
   ok(computeCosts({ ...base, cost_incl_tax: 99_999_999 }).floorPrice === null, '上限超えの原価 → 下限 null');
