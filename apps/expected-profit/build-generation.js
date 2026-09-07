@@ -128,6 +128,16 @@ export function buildGeneration(db, deps = {}) {
     allRows.push(...rows);
   }
 
+  // 🚨 まとめ買いバリエーションの検出 (実データで判明・2026-09-07)
+  //    楽天は「2個組・4個組・40個組」を別の商品管理番号で出しているが、
+  //    対応表 (f_rakuten_sku_map) は数量を持たないので、全部が同じ NE 商品を指す。
+  //    その結果、原価が1個ぶんのまま売価だけ跳ね上がり、利益率が現実離れする:
+  //      売価 41,800 / 原価 750 → 86.7% (実際は40個ぶんの原価が要る)
+  //      売価    798 / 原価 1,440 → -169% (実際は1個ぶんの原価でよい)
+  //    件数は少ないが、**ランキングの最上位と最下位を占める**ので放置できない。
+  //    数量が分からない以上、正しい利益は出せない → 参考値に落とす
+  markQuantityVariationSuspects(allRows);
+
   const okCount = allRows.filter(r => r.calculation_status === 'ok').length;
   const rankCount = allRows.filter(r => r.rank_eligible === 1).length;
   // 🚨 ハッシュは送信側・受信側で同じ関数を通す (generation-hash.js)。
@@ -178,6 +188,43 @@ export function buildGeneration(db, deps = {}) {
     rowCount: allRows.length, okCount, rankEligibleCount: rankCount,
     mallsIncluded, mallsDegraded, perMall, contentHash: hash,
   };
+}
+
+/**
+ * 同じ NE 商品を指す出品どうしで価格が大きくひらいていたら、
+ * 「数量違いのまとめ買いバリエーション」を疑ってランキングから外す。
+ *
+ * 🚨 同じ NE を複数出品が指すこと自体は正常 (色違いなど。Codex R2-8)。
+ *    区別できるのは「価格の開き」だけなので、閾値で線を引く。
+ *    実測 (2026-09-07 楽天 5,592出品): 複数出品を持つ NE 商品 11件のうち、
+ *    1.5倍以上ひらくのは 7件。いずれもまとめ買いだった。
+ */
+export const PRICE_SPREAD_LIMIT = 1.5;
+
+export function markQuantityVariationSuspects(rows, limit = PRICE_SPREAD_LIMIT) {
+  const groups = new Map();
+  for (const r of rows) {
+    if (!r.ne_code || !Number.isFinite(r.price_incl_tax)) continue;
+    const key = `${r.mall}${r.ne_code}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+  let marked = 0;
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const prices = group.map(r => r.price_incl_tax).filter(p => p > 0);
+    if (prices.length < 2) continue;
+    const min = Math.min(...prices);
+    const max = Math.max(...prices);
+    if (max <= min * limit) continue;      // 色違いなど、価格が近いものは正常
+    for (const r of group) {
+      // 計算結果は残す (参考値として見える) が、ランキングには載せない
+      r.rank_eligible = 0;
+      r.rank_exclusion_reason = r.rank_exclusion_reason || 'quantity_variation_suspected';
+      marked++;
+    }
+  }
+  return marked;
 }
 
 /** 出品列挙の期限 = run の finished_at + 7日 (§15-8) */

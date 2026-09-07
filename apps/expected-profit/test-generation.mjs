@@ -18,6 +18,7 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-gen-'));
 const { initExpectedProfitDB } = await import('./db.js');
 const {
   mergeWithPreviousComplete, buildGeneration, validateGeneration, enumValidUntil,
+  markQuantityVariationSuspects,
 } = await import('./build-generation.js');
 
 let passed = 0;
@@ -69,6 +70,50 @@ t('今夜の行が優先される (前回の古い値で上書きしない)', ()
 t('出品列挙の期限は run の完了時刻 + 7日', () => {
   assert.equal(enumValidUntil('2026-09-07T00:00:00Z'), '2026-09-14T00:00:00.000Z');
   assert.equal(enumValidUntil('壊れた日時'), null);
+});
+
+console.log('');
+console.log('まとめ買いバリエーションの検出 (実データで判明)');
+
+const qrow = (ne, price, over = {}) => ({
+  mall: 'rakuten', ne_code: ne, price_incl_tax: price,
+  rank_eligible: 1, rank_exclusion_reason: null, ...over,
+});
+
+t('[!] 同じNE商品で価格が大きくひらく出品はランキングから外す', () => {
+  // 実データ: 0726-001644 が 1,780円〜41,800円 で6出品。原価は全部750円だった
+  const rows = [qrow('a', 1780), qrow('a', 5280), qrow('a', 41800)];
+  const marked = markQuantityVariationSuspects(rows);
+  assert.equal(marked, 3);
+  assert.ok(rows.every(r => r.rank_eligible === 0));
+  assert.equal(rows[0].rank_exclusion_reason, 'quantity_variation_suspected');
+});
+
+t('[!] 価格が近い複数出品は正常として残す (色違いなど)', () => {
+  const rows = [qrow('b', 1000), qrow('b', 1200)];
+  assert.equal(markQuantityVariationSuspects(rows), 0);
+  assert.ok(rows.every(r => r.rank_eligible === 1));
+});
+
+t('1出品しかないNE商品は対象外', () => {
+  const rows = [qrow('c', 1000)];
+  assert.equal(markQuantityVariationSuspects(rows), 0);
+  assert.equal(rows[0].rank_eligible, 1);
+});
+
+t('モールが違えば別グループ (同じNEでも混ぜない)', () => {
+  const rows = [qrow('d', 1000), qrow('d', 5000, { mall: 'amazon' })];
+  assert.equal(markQuantityVariationSuspects(rows), 0);
+});
+
+t('既にある除外理由を上書きしない', () => {
+  const rows = [
+    qrow('e', 1000, { rank_eligible: 0, rank_exclusion_reason: 'cost_missing' }),
+    qrow('e', 9000),
+  ];
+  markQuantityVariationSuspects(rows);
+  assert.equal(rows[0].rank_exclusion_reason, 'cost_missing');
+  assert.equal(rows[1].rank_exclusion_reason, 'quantity_variation_suspected');
 });
 
 console.log('\n世代の組み立て');
