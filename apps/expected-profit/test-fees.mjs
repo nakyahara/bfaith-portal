@@ -312,6 +312,42 @@ await ta('ASIN が無い対象も API を呼ばずに弾く', async () => {
 });
 
 
+await ta('[!] 欠損対象が混ざっても正常対象は処理される (検証 → 除外 → marketplace 比較の順)', async () => {
+  // marketplace 比較を先にすると、marketplace_id が欠けた1件で全体が例外になり
+  // 正常な対象まで処理されず invalidTargets にも残らない
+  let called = 0;
+  const r = await refreshFees(db, [
+    target({ seller_sku: 'mixOk', in_listing_price: 3000 }),
+    target({ seller_sku: 'mixNg', marketplace_id: null }),
+  ], {
+    sleepMs: 0,
+    callFeesApi: async (body) => { called++; return feeResponse(body[0].FeesEstimateRequest.Identifier, { referral: 252 }); },
+  });
+  assert.equal(called, 1);                 // 正常対象は API まで届く
+  assert.equal(r.refreshed, 1);
+  assert.equal(r.invalidTargets, 1);       // 欠損対象は記録される
+  assert.deepEqual(r.invalid[0].missing, ['marketplace_id']);
+});
+
+await ta('[!] fulfillment が未解決 (null) の対象は API を呼ばずに弾く', async () => {
+  let called = 0;
+  const r = await refreshFees(db, [target({ seller_sku: 'noChannel', in_fulfillment: null })], {
+    sleepMs: 0, callFeesApi: async () => { called++; return []; },
+  });
+  assert.equal(called, 0);
+  assert.equal(r.invalidTargets, 1);
+  assert.deepEqual(r.invalid[0].missing, ['in_fulfillment']);
+});
+
+await ta('通貨が欠けた対象も弾く (JPY で埋めない)', async () => {
+  const r = await refreshFees(db, [target({ seller_sku: 'noCur', in_currency: null })], {
+    sleepMs: 0, callFeesApi: async () => [],
+  });
+  assert.equal(r.invalidTargets, 1);
+  assert.deepEqual(r.invalid[0].missing, ['in_currency']);
+});
+
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);

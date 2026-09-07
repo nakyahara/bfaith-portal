@@ -109,7 +109,7 @@ export function toEstimateRow(target, feesEstimate, fetchedAt) {
     in_shipping: target.in_shipping,
     in_points: target.in_points,
     in_fulfillment: target.in_fulfillment,
-    in_currency: target.in_currency || 'JPY',
+    in_currency: target.in_currency,
     referral_fee_ex_tax: n.referral,
     closing_fee_ex_tax: n.closing,
     per_item_fee_ex_tax: n.perItem,
@@ -145,22 +145,24 @@ export function saveEstimates(db, rows) {
  */
 export async function refreshFees(db, targets, deps = {}) {
   const now = deps.now || (() => new Date());
-  // 🚨 環境の marketplace と target の marketplace が違うものを混ぜない。
-  //    送った条件と保存する条件がずれると、全入力一致の検証が意味を失う
-  const envMarketplace = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
-  const mismatched = targets.filter(t => t.marketplace_id !== envMarketplace);
-  if (mismatched.length > 0) {
-    throw new Error(
-      `marketplace_id が環境設定 (${envMarketplace}) と違う対象が ${mismatched.length} 件あります: `
-      + `${[...new Set(mismatched.map(t => t.marketplace_id))].join(', ')}`);
-  }
-  // 🚨 入力が欠けた対象は API を呼ぶ前に外す。0 で埋めて呼ぶと嘘の条件で保存される
+  // 🚨 順序が大事 (Codex R3): 入力検証 → 欠損対象の除外 → 有効対象だけ marketplace 比較。
+  //    先に marketplace を見ると、marketplace_id が欠けた1件で全体が例外になり、
+  //    正常な対象まで処理されず invalidTargets にも残らない
   const invalid = [];
   const valid = [];
   for (const t of targets) {
     const v = validateFeeTarget(t);
     if (v.ok) valid.push(t);
     else invalid.push({ sku: t?.seller_sku ?? null, missing: v.missing });
+  }
+  // 入力は揃っているが、環境と違う marketplace のものは混ぜない
+  // (送った条件と保存する条件がずれると、全入力一致の検証が意味を失う)
+  const envMarketplace = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
+  const mismatched = valid.filter(t => t.marketplace_id !== envMarketplace);
+  if (mismatched.length > 0) {
+    throw new Error(
+      `marketplace_id が環境設定 (${envMarketplace}) と違う対象が ${mismatched.length} 件あります: `
+      + `${[...new Set(mismatched.map(t => t.marketplace_id))].join(', ')}`);
   }
   const cached = loadCache(db);
   const { need, reuse } = planRefresh(valid, cached, now());

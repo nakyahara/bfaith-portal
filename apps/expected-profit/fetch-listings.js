@@ -46,12 +46,26 @@ export function amazonListingStatus(raw) {
   return 'unknown';
 }
 
+/**
+ * フルフィルメント・チャンネル列 → FBA / FBM。
+ * 🚨 欠損・未知を FBM に倒さない (Codex R3)。FBA の行を FBM として計算すると
+ *    配送費 (fba_fee か自社配送関係費か) も費用範囲も変わり、利益の符号と順位が狂う
+ */
+export function amazonFulfillment(raw) {
+  const s = String(raw ?? '').trim().toUpperCase();
+  if (!s) return null;                                   // 列が無い / 空 = 未解決
+  if (s.includes('AMAZON') || s.startsWith('AFN')) return 'FBA';
+  if (s === 'DEFAULT' || s.startsWith('MFN') || s.includes('MERCHANT')) return 'FBM';
+  return null;                                           // 未知の値も未解決 (勝手に決めない)
+}
+
 /** レポート行 → snapshot 行 (純関数。テストで固定する) */
 export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil }) {
   const sku = (row['出品者SKU'] || row['seller-sku'] || '').trim();
   const asin = (row['商品ID'] || row['asin1'] || '').trim();
   const price = toIntPrice(row['価格'] ?? row['price']);
-  const channel = String(row['フルフィルメント・チャンネル'] || row['fulfillment-channel'] || '').trim();
+  const channel = row['フルフィルメント・チャンネル'] ?? row['fulfillment-channel'];
+  const fulfillment = amazonFulfillment(channel);
   // 🚨 「明示的な0」と「列そのものが無い/読めない」を分ける (Codex R1-3)。
   //    ここで 0 に倒すと、ポイント付き出品を誤った条件で見積もってしまう
   const pointsRaw = row['ポイント'] ?? row['points'];
@@ -63,7 +77,7 @@ export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil 
     shop_id: shopId,
     mall_item_key: sku,
     mall_item_ref: asin,                 // 手数料見積の入力キー (ASIN 単位で引く)
-    fulfillment: channel.toUpperCase().includes('AMAZON') || channel.toUpperCase().startsWith('AFN') ? 'FBA' : 'FBM',
+    fulfillment,                         // null = 未解決 (見積も計算も通さない)
     ne_code: null,                       // 対応付けは build 側で行う
     price_type: 'normal',
     price_incl_tax: price,
@@ -85,18 +99,29 @@ export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil 
 
 /** 楽天 items/search の 1 商品 → snapshot 行 (variant ごとに1行) */
 export function rakutenItemToSnapshots(item, { runId, shopId, fetchedAt, validUntil }) {
+  const r = rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt, validUntil });
+  return r.rows;
+}
+
+/**
+ * 変換結果と「解析できなかった variant の数」を一緒に返す。
+ * 🚨 行が1つでもできれば OK とすると、壊れた variant が静かに消えて
+ *    欠落した集合が次の「完全集合」になる (Codex R3)
+ */
+export function rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt, validUntil }) {
   const manageNumber = String(item?.manageNumber || '').trim();
-  if (!manageNumber) return [];
+  if (!manageNumber) return { rows: [], unparsable: 1 };
   // 🚨 variants は「SKU管理番号 → variant」のオブジェクト。
   //    配列で来たら添字が SKU 管理番号になってしまうので、解析失敗として扱う (Codex R2)
   const v0 = item?.variants;
-  if (!v0 || typeof v0 !== 'object' || Array.isArray(v0)) return [];
+  if (!v0 || typeof v0 !== 'object' || Array.isArray(v0)) return { rows: [], unparsable: 1 };
   const variants = v0;
+  let unparsable = 0;
   const hideItem = item?.hideItem === true;
   const out = [];
   for (const [variantKey, v] of Object.entries(variants)) {
     // 要素が object でない / キーが空 は解析不能 (行を作らない = 呼び出し側が unparsable に数える)
-    if (!variantKey || !v || typeof v !== 'object' || Array.isArray(v)) continue;
+    if (!variantKey || !v || typeof v !== 'object' || Array.isArray(v)) { unparsable++; continue; }
     const price = toIntPrice(v?.standardPrice);            // 🚨 文字列で返る ("1080")
     const taxRate = v?.payment?.taxRate != null ? Number(v.payment.taxRate) : null;
     // 🚨 standardPrice が税込とは限らない (Codex R1-5)。taxIncluded を確認し、
@@ -132,7 +157,7 @@ export function rakutenItemToSnapshots(item, { runId, shopId, fetchedAt, validUn
       fetched_at: fetchedAt,
     });
   }
-  return out;
+  return { rows: out, unparsable };
 }
 
 /**
@@ -287,10 +312,10 @@ export async function fetchRakutenListings(db, deps = {}) {
       if (items === null) throw new Error(`RMS items/search の形式が不正 (${pages}頁目)`);
       for (const r of items) {
         const item = r?.item || r;
-        const made = rakutenItemToSnapshots(item, { runId, shopId, fetchedAt, validUntil });
-        // manageNumber / variants が欠けた商品を黙って消さない
-        if (made.length === 0) unparsable++;
-        rows.push(...made);
+        const made = rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt, validUntil });
+        // 🚨 商品まるごとの失敗も、variant 単位の失敗も数える
+        unparsable += made.unparsable;
+        rows.push(...made.rows);
       }
       const next = data?.nextCursorMark;
       if (!next || next === cursorMark || items.length === 0) break;

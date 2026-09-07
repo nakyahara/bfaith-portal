@@ -15,7 +15,7 @@ const { initExpectedProfitDB } = await import('./db.js');
 const {
   toIntPrice, amazonListingStatus, amazonRowToSnapshot, rakutenItemToSnapshots,
   evaluateEnumeration, loadLastCompleteKeys, fetchAmazonListings, fetchRakutenListings,
-  enumStatusWithParseFailures,
+  enumStatusWithParseFailures, amazonFulfillment, rakutenItemToSnapshotsDetailed,
 } = await import('./fetch-listings.js');
 
 let passed = 0;
@@ -395,7 +395,8 @@ await ta('[!] 楽天 variants が配列なら解析失敗として数える (添
   assert.equal(bad.n, 0);      // 添字キーの行を作らない
 });
 
-await ta('楽天 variant が object でなければその行だけ落として数える', async () => {
+await ta('[!] 正常と異常の variant が混在しても解析失敗を数える (欠落を完全集合にしない)', async () => {
+  // 行が1つできれば OK とすると、壊れた variant が静かに消えて次の完全集合が欠落する
   const r = await fetchRakutenListings(db, {
     searchPage: async () => ({
       results: [{ item: { manageNumber: 'mixItem', variants: { good: { standardPrice: '100', payment: { taxIncluded: true } }, bad: 'not-an-object' } } }],
@@ -404,7 +405,46 @@ await ta('楽天 variant が object でなければその行だけ落として�
   });
   const rows = db.prepare("SELECT mall_item_key FROM mall_price_snapshot WHERE run_id = ?").all(r.runId);
   assert.equal(rows.length, 1);
-  assert.equal(rows[0].mall_item_key, 'mixItem/good');
+  assert.equal(rows[0].mall_item_key, 'mixItem/good');   // 正常行は残す
+  assert.equal(r.unparsable, 1);                          // 異常 variant を数える
+  assert.equal(r.status, 'partial');
+  const run = db.prepare('SELECT listing_enum_status FROM price_fetch_run WHERE run_id = ?').get(r.runId);
+  assert.equal(run.listing_enum_status, 'partial');       // DB まで届く
+});
+
+t('rakutenItemToSnapshotsDetailed は variant 単位の失敗数を返す', () => {
+  const r = rakutenItemToSnapshotsDetailed({
+    manageNumber: 'm', variants: { a: { standardPrice: '1' }, b: 'x', c: null },
+  }, meta);
+  assert.equal(r.rows.length, 1);
+  assert.equal(r.unparsable, 2);
+});
+
+
+console.log('フルフィルメントの確定 (Codex R3-2)');
+
+t('[!] チャンネル列が無ければ FBM と決めつけない (未解決にする)', () => {
+  // FBA の行を FBM として計算すると、配送費も費用範囲も変わり順位が狂う
+  assert.equal(amazonFulfillment(undefined), null);
+  assert.equal(amazonFulfillment(''), null);
+  assert.equal(amazonFulfillment('   '), null);
+});
+
+t('[!] 未知のチャンネル値も未解決にする', () => {
+  assert.equal(amazonFulfillment('SOMETHING_NEW'), null);
+});
+
+t('確認済みの値だけ FBA / FBM に変換する', () => {
+  assert.equal(amazonFulfillment('AMAZON_JP'), 'FBA');
+  assert.equal(amazonFulfillment('AFN'), 'FBA');
+  assert.equal(amazonFulfillment('DEFAULT'), 'FBM');
+  assert.equal(amazonFulfillment('MFN'), 'FBM');
+  assert.equal(amazonFulfillment('MERCHANT'), 'FBM');
+});
+
+t('[!] チャンネル欠損の行は fulfillment が null のまま保存される', () => {
+  const r = amazonRowToSnapshot({ '出品者SKU': 'a', '商品ID': 'B1', '価格': '1000', 'ステータス': 'Active' }, meta);
+  assert.equal(r.fulfillment, null);
 });
 
 
