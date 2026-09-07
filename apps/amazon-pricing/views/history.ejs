@@ -1,0 +1,31 @@
+<%- include('_top', { nav: 'history' }) %>
+
+<div class="card">
+  <h2>方針の変更履歴 <span class="small">(全 <%= num(total) %> 件・追記のみ・書き換え不可)</span></h2>
+  <form class="filters" method="get" action="/apps/amazon-pricing/history">
+    <div><label for="h-sku">SKU で絞る</label><input id="h-sku" type="text" name="sku" value="<%= sku %>" style="min-width:260px"></div>
+    <button class="btn btn-primary" type="submit">絞り込む</button>
+    <a class="btn" href="/apps/amazon-pricing/history">クリア</a>
+  </form>
+  <% if (groups.length === 0) { %><p class="dim">まだありません</p><% } else { %>
+  <div class="tbl-wrap"><table class="ap">
+    <thead><tr><th>いつ (JST)</th><th>SKU</th><th>変えたこと</th><th>理由</th><th>誰が</th></tr></thead>
+    <tbody>
+    <% for (const g of groups) { %>
+      <tr>
+        <td class="small"><%= toJst(g.at) %></td>
+        <td class="code"><a href="/apps/amazon-pricing/listings/<%= encodeURIComponent(g.seller_sku) %>"><%= g.seller_sku %></a></td>
+        <td>
+          <% for (const c of g.changes) { %>
+            <div><%= FIELD_LABELS[c.field] || c.field %>: <span class="dim"><%= fieldValue(c.field, c.old_value) %></span> → <b><%= fieldValue(c.field, c.new_value) %></b></div>
+          <% } %>
+        </td>
+        <td class="small"><%= REASON_CODES[g.reason_code] || g.reason_code %><% if (g.reason_text) { %><br><%= g.reason_text %><% } %></td>
+        <td class="small"><%= g.actor_id %><% if (g.actor_type !== 'human') { %> <span class="chip c-none"><%= g.actor_type %></span><% } %><% if (g.source !== 'ui') { %> <span class="chip c-none"><%= g.source %></span><% } %></td>
+      </tr>
+    <% } %>
+    </tbody>
+  </table></div>
+  <% } %>
+</div>
+</div>

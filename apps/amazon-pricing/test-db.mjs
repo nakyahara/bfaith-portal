@@ -1,0 +1,193 @@
+/**
+ * test-db.mjs — ap_* 表・追記のみの強制・方針の履歴・判定 run・読み取りモデルの検証。
+ *
+ * 実行: node apps/amazon-pricing/test-db.mjs
+ */
+import Database from 'better-sqlite3';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createTables, savePolicy, getPolicy, listPolicyEvents, addReview, reviewStats, evaluationsOfRun, evaluationsForSku, runForSnapshot, listRuns, normalizePolicyPatch } from './db.js';
+import { loadListings, loadListing, priceHistory, mirrorTablesAvailable, REQUIRED_MIRROR_TABLES } from './read-model.js';
+import { runEvaluation } from './evaluate.js';
+import { RULE_VERSION } from './engine.js';
+
+let failed = 0;
+const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
+const throws = (fn, needle, label) => {
+  try { fn(); ok(false, `${label} — 例外が出なかった`); }
+  catch (e) { ok(String(e.message).includes(needle), `${label} — ${e.message}`); }
+};
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ap-test-'));
+const db = new Database(path.join(tmp, 'mirror.db'));
+db.pragma('foreign_keys = ON');
+
+// ─── mirror 表の最小フィクスチャ (本番の DDL から必要な列だけ) ───
+db.exec(`CREATE TABLE mirror_amazon_sku_fees (seller_sku TEXT PRIMARY KEY, asin TEXT, fulfillment_channel TEXT,
+  referral_fee REAL, referral_fee_rate REAL, fba_fee REAL, variable_closing_fee REAL, per_item_fee REAL, total_fee REAL, price_used REAL, fetched_at TEXT NOT NULL)`);
+db.exec(`CREATE TABLE mirror_amazon_price_snapshot_daily (date_jst TEXT NOT NULL, seller_sku TEXT NOT NULL, asin TEXT NOT NULL DEFAULT '', channel TEXT,
+  my_price REAL, buybox_price REAL, buybox_is_mine INTEGER, fetched_at TEXT, source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL, PRIMARY KEY (date_jst, seller_sku))`);
+db.exec(`CREATE TABLE mirror_sku_resolved (seller_sku TEXT NOT NULL, ne_code TEXT NOT NULL, quantity INTEGER NOT NULL, source TEXT NOT NULL, 商品名 TEXT, source_updated_at TEXT, sort_order INTEGER NOT NULL DEFAULT 0, synced_at TEXT NOT NULL, PRIMARY KEY (seller_sku, ne_code))`);
+db.exec(`CREATE TABLE mirror_products (product_id INTEGER PRIMARY KEY, 商品コード TEXT UNIQUE NOT NULL, 商品名 TEXT, 商品区分 TEXT NOT NULL, 取扱区分 TEXT, 標準売価 REAL, 原価 REAL, 原価ソース TEXT, 原価状態 TEXT NOT NULL, 送料 REAL, 消費税率 REAL, updated_at TEXT NOT NULL)`);
+db.exec(`CREATE TABLE mirror_amazon_finance_sku_daily (date_jst TEXT NOT NULL, seller_sku TEXT NOT NULL, asin_norm TEXT NOT NULL DEFAULT '', units_net_sold REAL NOT NULL DEFAULT 0, sales_principal_jpy REAL NOT NULL DEFAULT 0, cost_status TEXT NOT NULL, source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL, PRIMARY KEY (date_jst, seller_sku, asin_norm))`);
+
+const T = '2026-09-07T00:00:00.000Z';
+const fees = db.prepare(`INSERT INTO mirror_amazon_sku_fees (seller_sku, asin, fulfillment_channel, referral_fee_rate, fba_fee, per_item_fee, variable_closing_fee, fetched_at) VALUES (?,?,?,?,?,?,?,?)`);
+fees.run('PR_FBA1 ', 'B000FBA1', 'FBA', 0.10, 400, 0, 0, T);      // ★大文字 + 末尾空白 (突合の片側正規化を確かめる)
+fees.run('pr_set1', 'B000SET1', 'FBA', 0.10, 500, 0, 0, T);        // セット (構成品 2 点、片方の原価が無い)
+fees.run('pr_fbm1', 'B000FBM1', 'FBM', 0.15, null, 0, 0, T);       // 自己発送
+fees.run('pr_noprice', 'B000NOPR', 'FBA', 0.10, 300, 0, 0, T);     // 価格スナップショット無し
+const snap = db.prepare(`INSERT INTO mirror_amazon_price_snapshot_daily (date_jst, seller_sku, asin, my_price, buybox_price, buybox_is_mine, source_run_id, source_row_hash, synced_at) VALUES (?,?,?,?,?,?,?,?,?)`);
+snap.run('2026-09-06', 'PR_FBA1 ', 'B000FBA1', 2100, 1950, 0, 'r', 'h', T);
+snap.run('2026-09-07', 'PR_FBA1 ', 'B000FBA1', 2000, 1900, 0, 'r', 'h', T);
+snap.run('2026-09-07', 'pr_set1', 'B000SET1', 3000, 2500, 0, 'r', 'h', T);
+snap.run('2026-09-07', 'pr_fbm1', 'B000FBM1', 1500, 1400, 1, 'r', 'h', T);
+const res = db.prepare(`INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, 商品名, synced_at) VALUES (?,?,?,?,?,?)`);
+res.run('pr_fba1', 'ne-a', 1, 'master', 'A商品', T);
+res.run('pr_set1', 'ne-a', 2, 'master', 'A商品', T);
+res.run('pr_set1', 'ne-b', 1, 'master', 'B商品 (原価なし)', T);
+res.run('pr_fbm1', 'ne-c', 1, 'master', 'C商品', T);
+const prod = db.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 原価, 原価状態, 送料, 消費税率, updated_at) VALUES (?,?,?,?,?,?,?,?)`);
+prod.run('ne-a', 'A商品', '単品', 1000, 'COMPLETE', 200, 0.10, T);      // 税込 1100
+prod.run('ne-b', 'B商品', '単品', null, 'MISSING', 200, 0.10, T);
+prod.run('ne-c', 'C商品', '単品', 500, 'OVERRIDDEN', 300, 0.08, T);    // 税込 540、送料 300
+const fin = db.prepare(`INSERT INTO mirror_amazon_finance_sku_daily (date_jst, seller_sku, units_net_sold, sales_principal_jpy, cost_status, source_run_id, source_row_hash, synced_at) VALUES (?,?,?,?,?,?,?,?)`);
+fin.run('2026-09-01', 'pr_fba1', 3, 6000, 'complete', 'r', 'h1', T);
+fin.run('2026-08-20', 'PR_FBA1', 2, 4000, 'complete', 'r', 'h2', T);
+fin.run('2026-07-01', 'pr_fba1', 9, 18000, 'complete', 'r', 'h3', T);   // 30 日より前 → 数えない
+
+console.log('\n── 表の作成と AI 用 view ──');
+{
+  createTables(db);
+  const names = new Set(db.prepare(`SELECT name FROM sqlite_master`).all().map((r) => r.name));
+  for (const t of ['ap_policies', 'ap_policy_events', 'ap_evaluation_runs', 'ap_evaluations', 'ap_evaluation_reviews']) ok(names.has(t), `表 ${t} がある`);
+  ok(names.has('v_ap_listing_360'), 'view v_ap_listing_360 がある (mirror 表がそろっている)');
+  ok(mirrorTablesAvailable(db).ok, `必要な mirror 表 ${REQUIRED_MIRROR_TABLES.length} 個がそろっている`);
+  createTables(db);
+  ok(true, 'createTables は 2 回呼んでも落ちない (冪等)');
+
+  // 表が無い DB では view を作らない (無い表を参照する view は以後の DDL を全部壊す)
+  const empty = new Database(':memory:');
+  createTables(empty);
+  ok(!empty.prepare(`SELECT name FROM sqlite_master WHERE name='v_ap_listing_360'`).get(), 'mirror 表が無い DB では view を作らない');
+  ok(!mirrorTablesAvailable(empty).ok, '  → mirrorTablesAvailable も false');
+  empty.exec('CREATE TABLE zzz (a)');
+  ok(true, '  → その後の CREATE TABLE が通る (壊れた view が無い)');
+  empty.close();
+}
+
+console.log('\n── 読み取りモデル (1 出品 1 行) ──');
+{
+  const rows = loadListings(db);
+  ok(rows.length === 4, `出品 4 行 (fees が母集合)。実際 ${rows.length}`);
+  const fba = rows.find((r) => r.seller_sku === 'PR_FBA1 ');
+  ok(fba && fba.my_price === 2000 && fba.buybox_price === 1900, '最新日 (2026-09-07) の価格が付く');
+  ok(fba.snapshot_date_jst === '2026-09-07', '  snapshot_date_jst');
+  ok(fba.cost_incl_tax === 1100, `大文字・空白つき SKU でも原価が突合する (1100)。実際 ${fba.cost_incl_tax}`);
+  ok(fba.units_30d === 5, `30 日販売は大文字小文字を無視して合算、30 日より前は数えない (5)。実際 ${fba.units_30d}`);
+  ok(fba.ne_name === 'A商品' && fba.ne_code === 'ne-a', '商品名・NE コードが付く');
+  const set = rows.find((r) => r.seller_sku === 'pr_set1');
+  ok(set.cost_incl_tax === null, '★構成品に原価の無いものがあるセットは原価 null (部分合計を出さない)');
+  ok(set.cost_missing_parts === 1 && set.parts === 2, '  原価不明 1 / 構成 2');
+  const fbm = rows.find((r) => r.seller_sku === 'pr_fbm1');
+  ok(fbm.cost_incl_tax === 540 && fbm.ship_cost === 300, 'OVERRIDDEN も原価ありとして扱う・送料が付く');
+  const np = rows.find((r) => r.seller_sku === 'pr_noprice');
+  ok(np.my_price === null && np.cost_incl_tax === null && np.ne_code === null, '突合できない SKU は null のまま (落とさない)');
+  ok(loadListing(db, 'pr_fbm1')?.seller_sku === 'pr_fbm1' && loadListing(db, 'nope') === null, 'loadListing');
+  const hist = priceHistory(db, 'PR_FBA1 ', 90);
+  ok(hist.length === 2 && hist[0].date_jst === '2026-09-07', '価格の推移 (新しい順)');
+  const viaView = db.prepare(`SELECT COUNT(*) c FROM v_ap_listing_360`).get().c;
+  ok(viaView === 4, 'view からも同じ 4 行が読める (AI はこれを読む)');
+}
+
+console.log('\n── 方針の保存と履歴 ──');
+{
+  const r1 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox', floor_price: '1,800', ceiling_price: 2500, min_margin_rate: '12' }, actorId: 'a@example.com', reasonCode: 'initial' });
+  ok(r1.changed.length === 6, `初回は全 6 列を「設定した」として残す。実際 ${r1.changed.length}`);
+  const p = getPolicy(db, 'PR_FBA1 ');
+  ok(p.mode === 'buybox' && p.floor_price === 1800 && p.ceiling_price === 2500 && p.min_margin_rate === 0.12, '保存された値 (カンマ除去・% → 小数)');
+  const ev1 = listPolicyEvents(db, { sku: 'PR_FBA1 ' });
+  ok(ev1.length === 6 && ev1.every((e) => e.old_value === null && e.change_group === r1.changeGroup), '履歴 6 行・old は null・同じ change_group');
+
+  const r2 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox', floor_price: 1800, ceiling_price: 2500, min_margin_rate: 0.12, floor_price: 1900 }, actorId: 'b@example.com', reasonCode: 'cost_change', reasonText: '仕入値上げ' });
+  ok(r2.changed.length === 1 && r2.changed[0] === 'floor_price', '変わった列だけ履歴に残る (floor_price)');
+  const last = listPolicyEvents(db, { sku: 'PR_FBA1 ' })[0];
+  ok(last.old_value === '1800' && last.new_value === '1900' && last.reason_text === '仕入値上げ' && last.actor_id === 'b@example.com', '  前後の値・理由・誰が');
+
+  const r3 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox', floor_price: 1900, ceiling_price: 2500, min_margin_rate: 0.12 }, actorId: 'b@example.com', reasonCode: 'margin' });
+  ok(r3.changed.length === 0 && listPolicyEvents(db, { sku: 'PR_FBA1 ' }).length === 7, '同じ内容を送り直しても履歴は増えない');
+
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { floor_price: 0 }, actorId: 'x', reasonCode: 'mistake' }), '0 は入れられません', 'ストッパー 0 は拒否 (旧ツールの「0 = 下限なし」を二度と作らない)');
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { ceiling_price: 1000 }, actorId: 'x', reasonCode: 'mistake' }), '赤字ストッパー以上', '高値 < 赤字 は拒否 (片方だけ変えた時も)');
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'off' }, actorId: 'x', reasonCode: 'other' }), '理由を書いて', '「その他」は理由の文章が必須');
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'off' }, actorId: 'x', reasonCode: 'nope' }), '変更理由を選んで', '知らない理由コードは拒否');
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'auto' }, actorId: 'x', reasonCode: 'stop' }), '追従モードの値が不正', '知らないモードは拒否');
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { floor_price: 12.5 }, actorId: 'x', reasonCode: 'stop' }), '整数円', '小数は拒否 (勝手に丸めない)');
+  const n = normalizePolicyPatch({ min_margin_rate: '95' });
+  ok(n.errors.length > 0, '最低粗利率 95% は拒否');
+  ok(normalizePolicyPatch({ min_margin_rate: '0.2' }).patch.min_margin_rate === 0.2, '0.2 (小数) は 20% として受ける');
+}
+
+console.log('\n── 追記のみ (トリガ) ──');
+{
+  throws(() => db.prepare(`UPDATE ap_policy_events SET new_value = '1' WHERE event_id = 1`).run(), 'UPDATE 禁止', '履歴の UPDATE は落ちる');
+  throws(() => db.prepare(`DELETE FROM ap_policy_events WHERE event_id = 1`).run(), 'DELETE 禁止', '履歴の DELETE は落ちる');
+}
+
+console.log('\n── 判定 run (シャドー) ──');
+{
+  const r = runEvaluation(db, { trigger: 'test', actorId: 't' });
+  ok(!r.skipped && r.run.status === 'success' && r.run.listings_total === 4, `run 成功・4 出品。実際 ${JSON.stringify({ skipped: r.skipped, status: r.run?.status, n: r.run?.listings_total })}`);
+  ok(r.run.snapshot_date_jst === '2026-09-07' && r.run.rule_version === RULE_VERSION, '  価格データの日付とルール版が付く');
+  const evals = evaluationsOfRun(db, r.run.run_id);
+  ok(evals.length === 4, '  判定 4 行');
+  const fba = evals.find((e) => e.seller_sku === 'PR_FBA1 ');
+  // 原価 1100 + FBA 400 = 1500 / (1 − 0.10 − 0.12) = 1923.07 → 1924。人のストッパー 1900 < 1924 → 実効 1924。カート 1900 → 1924 で止まる
+  ok(fba.action === 'lower' && fba.proposed_price === 1924 && fba.reason_code === 'FLOOR_CLAMP', `  方針 buybox の行はカートに向かうが計算した下限 1924 で止まる。実際 ${fba.action} ${fba.proposed_price} ${fba.reason_code}`);
+  const inputs = JSON.parse(fba.inputs_json);
+  ok(inputs.policy?.mode === 'buybox' && inputs.cost_incl_tax === 1100 && inputs.snapshot_date_jst === '2026-09-07' && inputs.sources.cost, '  inputs_json に方針・原価・日付・出どころが残る');
+  const set = evals.find((e) => e.seller_sku === 'pr_set1');
+  ok(set.action === 'keep' && set.reason_code === 'OFF' && set.flags.includes('COST_UNKNOWN'), '  方針の無い行は off (維持) + 旗 COST_UNKNOWN');
+  const np = evals.find((e) => e.seller_sku === 'pr_noprice');
+  ok(np.action === 'hold' && np.reason_code === 'NO_MY_PRICE', '  価格の無い行は方針より先に「価格が取れていない」で保留 (データの穴として見える)');
+  ok(r.summary.by_action.keep === 2 && r.summary.by_action.hold === 1 && r.summary.by_action.lower === 1 && r.summary.no_policy === 3, `  summary: ${JSON.stringify(r.summary.by_action)} / 方針なし ${r.summary.no_policy}`);
+
+  const again = runEvaluation(db, { trigger: 'test', actorId: 't' });
+  ok(again.skipped && again.run.run_id === r.run.run_id, '同じ日のスナップショットには 2 本目を作らない (skip)');
+  const forced = runEvaluation(db, { trigger: 'test', actorId: 't', force: true });
+  ok(!forced.skipped && forced.run.run_id !== r.run.run_id, 'force なら作り直す');
+  ok(runForSnapshot(db, '2026-09-07', RULE_VERSION).run_id === forced.run.run_id, '  最新の成功 run が返る');
+  ok(listRuns(db).length === 2, '  run は 2 本');
+
+  // autonomy_level は 0 以外を入れられない (実行段階が無いことを表で示す)
+  throws(() => db.prepare(`INSERT INTO ap_evaluations (run_id, seller_sku, evaluated_at, rule_version, autonomy_level, action, reason_code, reason_text, inputs_json)
+    VALUES (?, 'x', ?, ?, 1, 'keep', 'OFF', 'x', '{}')`).run(forced.run.run_id, T, RULE_VERSION), 'CHECK', '★autonomy_level = 1 (人承認後に実行) は CHECK で拒否');
+  throws(() => db.prepare(`UPDATE ap_evaluations SET proposed_price = 1 WHERE decision_id = ?`).run(fba.decision_id), 'UPDATE 禁止', '判定の UPDATE は落ちる');
+  throws(() => db.prepare(`DELETE FROM ap_evaluation_runs WHERE run_id = ?`).run(r.run.run_id), '削除できません', 'run の DELETE は落ちる');
+  throws(() => db.prepare(`UPDATE ap_evaluation_runs SET trigger = 'manual' WHERE run_id = ?`).run(r.run.run_id), '終了の記録以外', '終わった run の書き換えは落ちる');
+}
+
+console.log('\n── 採点 (人のフィードバック) ──');
+{
+  const run = runForSnapshot(db, '2026-09-07', RULE_VERSION);
+  const evals = evaluationsOfRun(db, run.run_id);
+  const target = evals.find((e) => e.seller_sku === 'PR_FBA1 ');
+  addReview(db, { decisionId: target.decision_id, reviewerId: 'a@example.com', verdict: 'disagree', comment: '下限が高すぎる' });
+  addReview(db, { decisionId: target.decision_id, reviewerId: 'a@example.com', verdict: 'agree' });
+  const after = evaluationsOfRun(db, run.run_id).find((e) => e.seller_sku === 'PR_FBA1 ');
+  ok(after.review_verdict === 'agree' && after.review_by === 'a@example.com', '最後の採点が「現在の見方」になる (追記のみ)');
+  const stats = reviewStats(db, run.run_id);
+  ok(stats.agree === 1 && stats.disagree === 0, `集計は最後の採点だけを数える: ${JSON.stringify(stats)}`);
+  ok(db.prepare(`SELECT COUNT(*) c FROM ap_evaluation_reviews`).get().c === 2, '採点の行は 2 本とも残る');
+  throws(() => addReview(db, { decisionId: 999999, reviewerId: 'x', verdict: 'agree' }), 'その判定はありません', '無い判定には採点できない');
+  throws(() => addReview(db, { decisionId: target.decision_id, reviewerId: 'x', verdict: 'great' }), '採点の値が不正', '知らない採点値は拒否');
+  throws(() => db.prepare(`DELETE FROM ap_evaluation_reviews`).run(), 'DELETE 禁止', '採点の DELETE は落ちる');
+  const forSku = evaluationsForSku(db, 'PR_FBA1 ');
+  ok(forSku.length === 2 && forSku[0].decision_id > forSku[1].decision_id, 'SKU 別の判定履歴 (新しい順)');
+}
+
+db.close();
+try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows の WAL 残りは無視 */ }
+console.log(`\n${failed === 0 ? '🎉 ALL PASS' : `❌ ${failed} 件失敗`}`);
+process.exit(failed === 0 ? 0 : 1);

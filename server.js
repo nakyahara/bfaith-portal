@@ -19,7 +19,6 @@ import { startMetrics } from './apps/observability/metrics.js';
 import { startDiskWatch } from './apps/observability/disk-watch.js';
 import { bootStart, bootEnd, bootNote, bootFail, getBootId } from './apps/observability/boot-log.js';
 import profitRouter from './apps/profit-calculator/router.js';
-import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import { startNotificationJob as startInventoryNotificationJob } from './apps/profit-analysis/notify-job.js';
 import { startMarginAlertJob } from './apps/profit-analysis/margin-alert-job.js';
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
@@ -80,6 +79,7 @@ import postageJudgeRouter from './apps/postage/judge-router.js';
 import { startProductLinksCron } from './apps/product-links/cron.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import priceUpdateRouter from './apps/price-update/router.js';
+import amazonPricingRouter from './apps/amazon-pricing/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import shippingWorkRouter from './apps/shipping-work/router.js';
 import pickingRouter from './apps/picking/router.js';
@@ -927,6 +927,15 @@ const apps = [
     category: 'purchasing',
   },
   {
+    id: 'amazon-pricing',
+    name: 'Amazon 価格管理 (自社プライスター)',
+    description: 'Amazon 出品の価格・カート・原価・粗利を 1 画面で見て、値付けの方針 (追従モード・ストッパー) を記録する。ルールの判定は毎日シャドーで出し人が採点。★Amazon へは書き込まない (M1)',
+    icon: '🏷️',
+    path: '/apps/amazon-pricing/',
+    status: 'active',
+    category: 'purchasing',
+  },
+  {
     id: 'inquiry-hub',
     name: '問い合わせ管理',
     description: 'メール+楽天R-Messe+Yahoo!問い合わせの一元管理 (メールディーラー置き換え)。Step 1: 一覧/詳細/担当/メモ/検索 (read-only運用)',
@@ -1471,6 +1480,8 @@ app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.js
 // M1 は読み取り専用 — モールへの書き込みは無い。express.json は router 側で CSRF ガードの後に付ける
 // (Content-Type 検査より先に body を読ませない)
 app.use('/apps/price-update', requireAppAccess('price-update'), priceUpdateRouter);
+// Amazon 価格管理 (amazon-pricing): ap_* (warehouse-mirror.db 同居)。Amazon へ書き込まない (apps/amazon-pricing/README.md)。
+app.use('/apps/amazon-pricing', requireAppAccess('amazon-pricing'), amazonPricingRouter);
 // 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。
 // AI連携API (ローカルClaude Codeランナー用) は X-AI-Key 認証・セッション外 (設計書§9.2 権限分離。
 // 先に mount してポータルセッション認証を通さない。product-hub/service-api と同パターン)
@@ -1675,11 +1686,8 @@ app.listen(PORT, () => {
   // DATA_DIR (Persistent Disk) 使用率観測 — 2026-07-12 disk full 障害の再発防止
   startDiskWatch(DATA_DIR);
 
-  // 価格改定ワーカー — 安全装置未実装のため無効化 (2026-03-30)
-  // startPriceWorker();
-
-  // 価格改定メンテナンスジョブ — 同上理由で無効化 (2026-03-30)
-  // startMaintenanceJobs();
+  // (2026-09-07) 旧・価格改定ワーカー (price-scheduler.js) は削除した。Amazon の価格管理は
+  // apps/amazon-pricing (方針の記録 + 判定のシャドー運用のみ。Amazon へ書き込まない) に作り直し。
 
   // 経営インサイトGChat通知 (在庫サマリ、INVENTORY_NOTIFY_ENABLED=true で起動)
   startInventoryNotificationJob();
