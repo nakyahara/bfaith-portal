@@ -10,6 +10,7 @@
  */
 import { getExpectedProfitDB } from './db.js';
 import { buildRow } from './build-row.js';
+import { feeCacheKey } from './calc.js';
 import { newGenerationId, nowIso, contentHash, isExpired } from './util.js';
 import { nextSeq } from './db.js';
 
@@ -130,7 +131,19 @@ export function buildGeneration(db, deps = {}) {
 
   const okCount = allRows.filter(r => r.calculation_status === 'ok').length;
   const rankCount = allRows.filter(r => r.rank_eligible === 1).length;
-  const hash = contentHash(allRows.map(r => [r.mall, r.shop_id, r.mall_item_key, r.expected_profit]));
+  // 🚨 順位を決める値をハッシュに含める (Codex R4-5)。
+  //    キーと利益額だけだと、利益率や適格状態が変わっても検出できない。
+  //    受信側の generationContentHash と同じ並び・同じ項目にすること
+  const hash = contentHash([...allRows]
+    .sort((a, b) => `${a.mall}${a.shop_id}${a.mall_item_key}`.localeCompare(`${b.mall}${b.shop_id}${b.mall_item_key}`))
+    .map(r => ({
+      mall: r.mall, shop_id: r.shop_id, mall_item_key: r.mall_item_key,
+      expected_profit: r.expected_profit, expected_margin_rate: r.expected_margin_rate,
+      rank_eligible: r.rank_eligible, calculation_status: r.calculation_status,
+      revenue_ex_tax: r.revenue_ex_tax, cost_ex_tax: r.cost_ex_tax,
+      shipping_total_ex_tax: r.shipping_total_ex_tax, fba_fee_ex_tax: r.fba_fee_ex_tax,
+      fee_total_ex_tax: r.fee_total_ex_tax,
+    })));
 
   const insertGen = db.prepare(`
     INSERT INTO expected_profit_generation

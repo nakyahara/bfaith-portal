@@ -87,8 +87,11 @@ export function queryPublished(opts = {}) {
   if (opts.mall) { where.push('mall = ?'); params.push(opts.mall); }
   if (opts.fulfillment) { where.push('fulfillment = ?'); params.push(opts.fulfillment); }
   if (opts.salesClass != null) { where.push('sales_class = ?'); params.push(opts.salesClass); }
-  // 🚨 費用範囲が違うものを既定で混ぜない (§4.8)。expense_scope で分ける
-  if (opts.expenseScope) { where.push('expense_scope_version = ?'); params.push(opts.expenseScope); }
+  // 🚨 費用範囲が違うものを既定で混ぜない (§4.8)。
+  //    呼び出し側が指定しなくても self_v1 に倒す (画面が指定するだけでは契約にならない)。
+  //    明示的に混ぜたいときだけ expenseScope: 'all' を渡す
+  const scope = opts.expenseScope || 'self_v1';
+  if (scope !== 'all') { where.push('expense_scope_version = ?'); params.push(scope); }
 
   const all = db.prepare(`SELECT * FROM mart_listing_expected_profit WHERE ${where.join(' AND ')}`).all(...params);
   const withFreshness = all.map(r => applyFreshnessNow(r, now));

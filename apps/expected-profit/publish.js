@@ -99,6 +99,9 @@ export async function publishToRender(db, generationId, deps) {
 }
 
 /** HTTP 版の deps (Render の受け口を叩く) */
+// 🚨 timeout を必ず付ける。無いと転送が固まったまま期限を越える (Codex R4-9)
+const HTTP_TIMEOUT_MS = 120_000;
+
 export function httpDeps() {
   const base = (process.env.RENDER_PORTAL_URL || '').replace(/\/+$/, '');
   const key = process.env.MIRROR_SYNC_KEY;
@@ -106,13 +109,14 @@ export function httpDeps() {
   if (!key) throw new Error('MIRROR_SYNC_KEY not configured');
   const headers = { 'Content-Type': 'application/json', 'x-sync-key': key };
   const url = (p) => `${base}/apps/expected-profit/sync${p}`;
+  const withTimeout = (ms = HTTP_TIMEOUT_MS) => AbortSignal.timeout(ms);
   return {
     postChunk: async (id, body) => (await fetch(url(`/generations/${encodeURIComponent(id)}/chunks`),
-      { method: 'POST', headers, body: JSON.stringify(body) })).json(),
+      { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() })).json(),
     postPublish: async (body) => (await fetch(url('/publish'),
-      { method: 'POST', headers, body: JSON.stringify(body) })).json(),
+      { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() })).json(),
     getPublished: async () => {
-      const r = await (await fetch(url('/published'), { headers })).json();
+      const r = await (await fetch(url('/published'), { headers, signal: withTimeout(30_000) })).json();
       return r?.published || null;
     },
   };

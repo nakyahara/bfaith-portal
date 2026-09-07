@@ -12,7 +12,7 @@ import os from 'os';
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-pub-'));
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { receiveChunk, publishGeneration, getPublished, chunkChecksum, pruneGenerations } = await import('./publish-api.js');
+const { receiveChunk, publishGeneration, getPublished, chunkChecksum, pruneGenerations, generationContentHash } = await import('./publish-api.js');
 const { makeChunks, makeManifest, publishToRender } = await import('./publish.js');
 
 let passed = 0;
@@ -46,11 +46,15 @@ const mkRow = (key, over = {}) => ({
   code_version: 'test', price_run_id: 'r1', built_at: '2026-09-07T00:00:00Z', ...over,
 });
 
+// 🚨 content_hash は保存済み行から計算した実値を使う。
+//    固定文字列にすると「ハッシュ照合が効いているか」を検証できない (Codex R4-5)
 const manifestOf = (rowCount, over = {}) => ({
   built_at: '2026-09-07T00:00:00Z', row_count: rowCount, ok_count: rowCount,
-  incomplete_count: 0, rank_eligible_count: rowCount, content_hash: 'h', malls_included: ['rakuten'],
+  incomplete_count: 0, rank_eligible_count: rowCount, malls_included: ['rakuten'],
   malls_degraded: [], ...over,
 });
+const manifestFor = (genId, rowCount, over = {}) =>
+  manifestOf(rowCount, { content_hash: generationContentHash(db, genId), ...over });
 
 console.log('チャンクの受け取り');
 
@@ -83,15 +87,15 @@ t('[!] 同じチャンクを再送しても壊れない (冪等)', () => {
 console.log('\n公開');
 
 t('公開するとポインタが立つ', () => {
-  const r = publishGeneration(db, { generationId: 'g1', seq: 1, manifest: manifestOf(2) });
-  assert.equal(r.ok, true);
+  const r = publishGeneration(db, { generationId: 'g1', seq: 1, manifest: manifestFor('g1', 2) });
+  assert.equal(r.ok, true, JSON.stringify(r));
   const p = getPublished(db);
   assert.equal(p.generation_id, 'g1');
   assert.equal(p.seq, 1);
 });
 
 t('[!] 同じ世代の再 publish は 200 (確認応答が失われた再送)', () => {
-  const r = publishGeneration(db, { generationId: 'g1', seq: 1, manifest: manifestOf(2) });
+  const r = publishGeneration(db, { generationId: 'g1', seq: 1, manifest: manifestFor('g1', 2) });
   assert.equal(r.ok, true);
   assert.equal(r.idempotent, true);
 });
@@ -106,7 +110,7 @@ t('[!] 公開済みの世代へ後から追記できない', () => {
 t('[!] seq が古い世代は公開できない (逆転公開の防止)', () => {
   const rows = [mkRow('old1')];
   receiveChunk(db, { generationId: 'gOld', seq: 0, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(1) });
-  const r = publishGeneration(db, { generationId: 'gOld', seq: 0, manifest: manifestOf(1) });
+  const r = publishGeneration(db, { generationId: 'gOld', seq: 0, manifest: manifestFor('gOld', 1) });
   assert.equal(r.ok, false);
   assert.equal(r.error, 'seq_not_newer');
   // 公開中は g1 のまま
@@ -116,7 +120,7 @@ t('[!] seq が古い世代は公開できない (逆転公開の防止)', () => 
 t('新しい seq なら公開でき、前世代は superseded になる', () => {
   const rows = [mkRow('n1'), mkRow('n2')];
   receiveChunk(db, { generationId: 'g2', seq: 2, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(2) });
-  const r = publishGeneration(db, { generationId: 'g2', seq: 2, manifest: manifestOf(2) });
+  const r = publishGeneration(db, { generationId: 'g2', seq: 2, manifest: manifestFor('g2', 2) });
   assert.equal(r.ok, true);
   assert.equal(r.supersededId, 'g1');
   const prev = db.prepare("SELECT remote_status FROM expected_profit_generation WHERE generation_id='g1'").get();
@@ -126,10 +130,39 @@ t('新しい seq なら公開でき、前世代は superseded になる', () => 
 t('[!] 件数が manifest と合わなければ公開しない', () => {
   const rows = [mkRow('m1')];
   receiveChunk(db, { generationId: 'g3', seq: 3, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(1) });
-  const r = publishGeneration(db, { generationId: 'g3', seq: 3, manifest: manifestOf(999) });
+  const r = publishGeneration(db, { generationId: 'g3', seq: 3, manifest: manifestFor('g3', 999) });
   assert.equal(r.ok, false);
   assert.equal(r.error, 'row_count_mismatch');
   assert.equal(getPublished(db).generation_id, 'g2');   // 公開中は変わらない
+});
+
+t('[!] 内容が manifest と違う世代は公開しない (件数が同じでも)', () => {
+  const rows = [mkRow('h1'), mkRow('h2')];
+  receiveChunk(db, { generationId: 'gHash', seq: 4, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(2) });
+  const good = manifestFor('gHash', 2);
+  // 件数はそのままに、利益だけ書き換える → ハッシュが変わる
+  db.prepare("UPDATE mart_listing_expected_profit SET expected_profit = 99999 WHERE generation_id = 'gHash'").run();
+  const r = publishGeneration(db, { generationId: 'gHash', seq: 4, manifest: good });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'content_hash_mismatch');
+});
+
+t('[!] 利益率だけ変わってもハッシュで検出する (順位が変わる改変)', () => {
+  const rows = [mkRow('m1'), mkRow('m2')];
+  receiveChunk(db, { generationId: 'gRate', seq: 5, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(2) });
+  const good = manifestFor('gRate', 2);
+  db.prepare("UPDATE mart_listing_expected_profit SET expected_margin_rate = 0.99 WHERE generation_id = 'gRate'").run();
+  const r = publishGeneration(db, { generationId: 'gRate', seq: 5, manifest: good });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'content_hash_mismatch');
+});
+
+t('[!] 要求 seq が保存済みと違えば拒否する (要求を信用しない)', () => {
+  const rows = [mkRow('s1')];
+  receiveChunk(db, { generationId: 'gSeq', seq: 6, chunkIndex: 0, checksum: chunkChecksum(rows), rows, manifest: manifestOf(1) });
+  const r = publishGeneration(db, { generationId: 'gSeq', seq: 9999, manifest: manifestFor('gSeq', 1) });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'seq_mismatch');
 });
 
 t('[!] 行が0件の世代は公開しない', () => {

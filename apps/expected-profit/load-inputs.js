@@ -85,7 +85,11 @@ export function loadMasterFreshness(wdb) {
   const shippingSynced = pick(wdb, 'SELECT MAX(synced_at) AS v FROM shipping_rates');
   const productShippingSynced = pick(wdb, 'SELECT MAX(synced_at) AS v FROM product_shipping');
   // 配送は2つのマスタのうち古い方を基準にする (どちらかが止まれば失効させる)
-  const shippingBase = [shippingSynced, productShippingSynced].filter(Boolean).sort()[0] || null;
+  // 🚨 片方でも同期時刻が取れなければ「鮮度を確認できない」= 期限なし (不適格) にする。
+  //    filter(Boolean) で片方を落とすと、確認できないマスタを ok として採用してしまう
+  const shippingBase = (shippingSynced && productShippingSynced)
+    ? [shippingSynced, productShippingSynced].sort()[0]
+    : null;
   return {
     costSyncedAt: neSynced,
     costValidUntil: neSynced ? addDays(toIso(neSynced), COST_VALID_DAYS) : null,

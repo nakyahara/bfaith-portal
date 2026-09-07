@@ -80,9 +80,19 @@ export async function runNightly(opts = {}) {
   const log = opts.log || console.log;
   const result = { steps: [], ok: false };
 
+  // 🚨 期限は全工程で見る (§8.4)。手数料だけ見ても、出品取得やリトライが期限後まで走る
+  const pastDeadline = () => new Date() >= deadline;
+  const abortIfLate = (step) => {
+    if (!pastDeadline()) return false;
+    result.steps.push({ step, ok: false, error: 'deadline_exceeded' });
+    log(`[expected-profit] 期限 (${deadline.toISOString()}) を過ぎたので ${step} を行わない`);
+    return true;
+  };
+
   // ── 1. 出品列挙 + 価格取得 (モール単位で fail-soft) ──
   for (const [mall, fn] of [['amazon', fetchAmazonListings], ['rakuten', fetchRakutenListings]]) {
     if (opts.malls && !opts.malls.includes(mall)) continue;
+    if (abortIfLate(`fetch:${mall}`)) continue;   // 期限後は新しい取得を始めない
     try {
       const r = await fn(db, opts.fetchDeps?.[mall] || {});
       result.steps.push({ step: `fetch:${mall}`, ok: true, ...r });
@@ -95,7 +105,7 @@ export async function runNightly(opts = {}) {
   }
 
   // ── 2. Amazon 手数料の再見積もり ──
-  if (!opts.skipFees) {
+  if (!opts.skipFees && !abortIfLate('fees')) {
     try {
       const latest = db.prepare(`
         SELECT s.* FROM mall_price_snapshot s
@@ -115,6 +125,13 @@ export async function runNightly(opts = {}) {
   // ── 3. 世代を作る ──
   let wdb = null;
   let gen;
+  if (abortIfLate('build')) {
+    await ping('fail', '期限を過ぎたので世代を作らなかった');
+    return { ...result, error: 'deadline_exceeded' };
+  }
+  // 🚨 鮮度判定は「ビルド時点の時刻」で行う。夜間処理の開始時刻を使うと、
+  //    取得に時間がかかった夜に期限切れを見逃す
+  const buildNow = new Date();
   try {
     wdb = opts.warehouseDb || openWarehouseReadOnly();
     const warehouseInputs = {
@@ -124,7 +141,7 @@ export async function runNightly(opts = {}) {
       masterFreshness: loadMasterFreshness(wdb),
     };
     gen = buildGeneration(db, {
-      warehouseInputs, now, sellerId, marketplaceId,
+      warehouseInputs, now: opts.now || buildNow, sellerId, marketplaceId,
       malls: opts.malls, codeVersion: process.env.GIT_SHA || 'dev',
     });
     result.steps.push({ step: 'build', ok: true, ...gen });
@@ -150,6 +167,11 @@ export async function runNightly(opts = {}) {
   if (opts.skipPublish) {
     log('[expected-profit] --skip-publish のため転送しない');
     return { ...result, ok: true, generationId: gen.generationId, skippedPublish: true };
+  }
+  if (abortIfLate('publish')) {
+    // 世代は作れているので、翌日そのまま転送できる
+    await ping('fail', '期限を過ぎたので転送しなかった (世代は作成済み)');
+    return { ...result, error: 'deadline_exceeded', generationId: gen.generationId };
   }
   try {
     const pub = await publishToRender(db, gen.generationId, opts.publishDeps || httpDeps());

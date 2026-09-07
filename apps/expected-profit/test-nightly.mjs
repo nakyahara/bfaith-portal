@@ -190,6 +190,22 @@ await ta('--skip-publish なら世代だけ作って転送しない', async () =
   assert.equal(sent, false);
 });
 
+await ta('[!] 期限を過ぎたら新しい取得を始めない (全工程に伝播している)', async () => {
+  let fetched = false;
+  const r = await runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
+    deadline: new Date('2000-01-01T00:00:00Z'),   // 既に過ぎている
+    malls: ['rakuten'], skipFees: true,
+    fetchDeps: { rakuten: { searchPage: async () => { fetched = true; return { results: [], nextCursorMark: null }; } } },
+    publishDeps: { postChunk: async () => ({ ok: true }), postPublish: async () => ({ ok: true }), getPublished: async () => null },
+    log: () => {},
+  });
+  assert.equal(fetched, false, '期限後なのに取得を始めた');
+  assert.equal(r.error, 'deadline_exceeded');
+  const step = r.steps.find(s => s.step === 'fetch:rakuten');
+  assert.equal(step.error, 'deadline_exceeded');
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);

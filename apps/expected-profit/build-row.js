@@ -14,7 +14,7 @@
  */
 import {
   resolveCost, normalizeFeeEstimate, buildProfitInputs, computeProfit,
-  canReuseFeeEstimate, isRankEligible, expenseScopeVersion, effectiveTaxRate,
+  canReuseFeeEstimate, isRankEligible, expenseScopeVersion, effectiveTaxRate, feeCacheKey,
   FORMULA_VERSION, SCENARIO_VERSION, FEE_RATE_VERSION,
 } from './calc.js';
 import { isExpired } from './util.js';
@@ -194,7 +194,10 @@ export function buildRow(listing, ctx) {
   if (listing.postage_included === 1) {
     row.shipping_revenue_status = 'included';       // 送料込み = 別途収入 0
     postageRevenueInclTax = 0;
-  } else if (listing.postage_revenue_incl_tax != null) {
+  } else if (listing.postage_included === 0 && listing.postage_revenue_incl_tax != null) {
+    // 🚨 「別途徴収と分かっている」ときだけ収入に足す。
+    //    postage_included が null (扱い不明) のまま金額だけあっても足さない。
+    //    足すと赤字の出品が黒字に化ける (Codex: -119円 → +181円)
     row.shipping_revenue_status = 'ok';
     postageRevenueInclTax = listing.postage_revenue_incl_tax;
   } else {
@@ -348,7 +351,6 @@ export function feeInputsOf(listing, ctx) {
 }
 
 export function feeCacheKeyOf(listing, ctx) {
-  const t = feeInputsOf(listing, ctx);
-  return [t.seller_id, t.marketplace_id, t.seller_sku, t.in_listing_price,
-    t.in_shipping, t.in_points, t.in_fulfillment].join('');
+  // 🚨 保存側 (refresh-fees) と同じ関数を使う。ここがズレると見積を1件も引けない
+  return feeCacheKey(feeInputsOf(listing, ctx));
 }

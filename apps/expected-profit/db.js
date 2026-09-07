@@ -208,7 +208,19 @@ function createTables(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_mlep_rank ON mart_listing_expected_profit(generation_id, rank_eligible, expected_margin_rate DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mlep_ne ON mart_listing_expected_profit(generation_id, ne_code)');
 
-  // ─── 6. 公開ポインタ (§15-7) ───
+  // ─── 6. 受信したチャンクの記録 (§15-7) ───
+  // 🚨 同じ index を別内容で上書きさせないために持つ。
+  //    これが無いと「複数回の送信が混ざった世代」を作れてしまう
+  db.exec(`CREATE TABLE IF NOT EXISTS expected_profit_chunk (
+    generation_id  TEXT NOT NULL,
+    chunk_index    INTEGER NOT NULL,
+    checksum       TEXT NOT NULL,
+    row_count      INTEGER NOT NULL,
+    received_at    TEXT NOT NULL,
+    PRIMARY KEY (generation_id, chunk_index)
+  )`);
+
+  // ─── 7. 公開ポインタ (§15-7) ───
   // Render 側にも同じ形で持つ。単一行 (id = 1)
   db.exec(`CREATE TABLE IF NOT EXISTS expected_profit_publish_pointer (
     id             INTEGER PRIMARY KEY CHECK (id = 1),
@@ -218,14 +230,34 @@ function createTables(db) {
   )`);
 }
 
-/** 現在公開中の世代 (無ければ null) */
+/**
+ * 現在公開中の世代 (無ければ null)。
+ * 🚨 malls_degraded / malls_included は DB では JSON 文字列。
+ *    ここで配列に直して返す (画面が .map するので、文字列のままだと描画が落ちる)
+ */
 export function getPublishedGeneration(dbh = getExpectedProfitDB()) {
-  return dbh.prepare(`
-    SELECT p.generation_id, p.seq, p.published_at, g.built_at, g.row_count, g.malls_degraded
+  const row = dbh.prepare(`
+    SELECT p.generation_id, p.seq, p.published_at, g.built_at, g.row_count,
+           g.ok_count, g.rank_eligible_count, g.malls_included, g.malls_degraded
     FROM expected_profit_publish_pointer p
     JOIN expected_profit_generation g ON g.generation_id = p.generation_id
     WHERE p.id = 1
-  `).get() || null;
+  `).get();
+  if (!row) return null;
+  return {
+    ...row,
+    malls_included: parseJsonArray(row.malls_included),
+    malls_degraded: parseJsonArray(row.malls_degraded),
+  };
+}
+
+function parseJsonArray(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v !== 'string' || v.trim() === '') return [];
+  try {
+    const parsed = JSON.parse(v);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
 }
 
 /** 次の seq (単調増加。逆転公開の防止に使う) */

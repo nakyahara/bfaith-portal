@@ -84,8 +84,11 @@ export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil 
     price_tax_included: 1,               // Amazon の出品価格は税込 (決済の Principal + Tax と一致)
     price_raw: price,
     mall_tax_rate: null,                 // Amazon は税率を返さない (商品マスタ側を使う)
-    postage_included: null,              // FBM の送料収入は実績から推定する (§15-2)
-    postage_revenue_incl_tax: null,
+    // 🚨 標準シナリオ (1個・通常購入) では FBA は送料込み (プライム配送) で確定する。
+    //    ここを null にすると、取得した FBA 出品が全部「送料不明」でランキングから消える。
+    //    FBM は実績から標準送料を推定する必要があるので unknown のまま (§15-2。PR-2 で実装)
+    postage_included: fulfillment === 'FBA' ? 1 : null,
+    postage_revenue_incl_tax: fulfillment === 'FBA' ? 0 : null,
     points,                              // null = 取得不能 (見積入力未解決として扱う)
     listing_status: amazonListingStatus(row['ステータス'] || row['status']),
     fetch_status: price == null ? 'not_found' : 'ok',

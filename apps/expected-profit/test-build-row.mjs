@@ -10,6 +10,8 @@
  */
 import assert from 'node:assert/strict';
 import { buildRow, resolveNeCode } from './build-row.js';
+// 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
+import { feeCacheKey } from './calc.js';
 
 let passed = 0;
 function t(name, fn) {
@@ -88,6 +90,18 @@ t('[!] 別途徴収で額が取れない出品は unknown → ランキング外
   assert.equal(r.rank_exclusion_reason, 'shipping_revenue_unknown');
   // 参考値としての利益は出す (0円送料として)
   assert.ok(Number.isFinite(r.expected_profit));
+});
+
+t('[!] 扱いが不明なのに金額だけある行を売上に足さない (赤字が黒字に化ける)', () => {
+  // Codex R4-1 の例: 足すと -119円 が +181円 になる
+  const ctx = baseCtx();
+  ctx.products.set('ne001', { ...ctx.products.get('ne001'), 原価: 800 });
+  const r = buildRow(rakutenListing({ postage_included: null, postage_revenue_incl_tax: 330 }), ctx);
+  assert.equal(r.shipping_revenue_status, 'unknown');
+  assert.equal(r.postage_revenue_ex_tax, 0, '扱い不明なのに送料収入を足している');
+  assert.equal(r.rank_eligible, 0);
+  // 税抜1000 − 原価800 − 配送219 − 手数料100 = -119
+  assert.ok(near(r.expected_profit, -119), `期待 -119, 実際 ${r.expected_profit}`);
 });
 
 t('[!] 送料の扱いそのものが不明 (postage_included=null) も unknown', () => {
@@ -185,13 +199,16 @@ console.log('\nAmazon の経路');
 const amazonListing = (over = {}) => ({
   mall: 'amazon', shop_id: 'S1@M1', mall_item_key: 'sku1', mall_item_ref: 'B001',
   fulfillment: 'FBA', price_incl_tax: 1980, price_tax_included: 1, mall_tax_rate: null,
-  postage_included: null, postage_revenue_incl_tax: 0, points: 0,
+  // fetch 層 (amazonRowToSnapshot) が FBA に対して実際に返す値と揃える。
+  // ここを実態とズラすと「テストは通るが本番で全件除外される」ことになる (Codex R4-3)
+  postage_included: 1, postage_revenue_incl_tax: 0, points: 0,
   listing_status: 'active', fetch_status: 'ok', valid_until: FUTURE, fetched_at: '2026-09-07T00:00:00Z',
   ...over,
 });
 
 const feeCache = (over = {}) => new Map([[
-  ['S1', 'M1', 'sku1', 1980, 0, 0, 'FBA'].join(''),
+  feeCacheKey({ seller_id: 'S1', marketplace_id: 'M1', seller_sku: 'sku1',
+    in_listing_price: 1980, in_shipping: 0, in_points: 0, in_fulfillment: 'FBA' }),
   {
     seller_id: 'S1', marketplace_id: 'M1', seller_sku: 'sku1', asin: 'B001',
     in_listing_price: 1980, in_shipping: 0, in_points: 0, in_fulfillment: 'FBA', in_currency: 'JPY',

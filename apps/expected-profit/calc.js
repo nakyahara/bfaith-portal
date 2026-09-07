@@ -314,6 +314,19 @@ export function canReuseFeeEstimate(cached, wanted, now = new Date()) {
   return { reuse: true };
 }
 
+/**
+ * 手数料見積のキャッシュキー。
+ * 🚨 区切り文字を必ず入れる。区切りなしで連結すると別の商品と衝突する:
+ *    sku='sku1', price=1980  → 'sku1' + '1980' + ...
+ *    sku='sku11', price=980  → 'sku11' + '980' + ...  ← 同じ文字列になる
+ *    ここが衝突すると「別の商品の手数料」で利益を出してしまう
+ */
+export const FEE_KEY_SEP = '';
+export function feeCacheKey(t) {
+  return [t.seller_id, t.marketplace_id, t.seller_sku, t.in_listing_price,
+    t.in_shipping, t.in_points, t.in_fulfillment].join(FEE_KEY_SEP);
+}
+
 // ────────────────────────────────────────────────────────────
 // 想定利益 (§4.1)
 // ────────────────────────────────────────────────────────────

@@ -14,7 +14,7 @@
  *    送料別途の出品は in_shipping = 標準送料 で見積もる (§15-13)。
  */
 import { getExpectedProfitDB } from './db.js';
-import { canReuseFeeEstimate, normalizeFeeEstimate } from './calc.js';
+import { canReuseFeeEstimate, normalizeFeeEstimate, feeCacheKey } from './calc.js';
 import { nowIso, addDays } from './util.js';
 
 const FEE_VALID_DAYS = 14;
@@ -32,7 +32,7 @@ export function planRefresh(targets, cachedByKey, now = new Date()) {
   const need = [];
   const reuse = [];
   for (const t of targets) {
-    const key = cacheKey(t);
+    const key = feeCacheKey(t);
     const cached = cachedByKey.get(key);
     const verdict = canReuseFeeEstimate(cached, t, now);
     if (verdict.reuse) reuse.push({ target: t, cached });
@@ -68,7 +68,7 @@ export function cacheKey(t) {
 export function loadCache(db) {
   const rows = db.prepare('SELECT * FROM amazon_fee_estimate').all();
   const map = new Map();
-  for (const r of rows) map.set(cacheKey(r), r);
+  for (const r of rows) map.set(feeCacheKey(r), r);
   return map;
 }
 

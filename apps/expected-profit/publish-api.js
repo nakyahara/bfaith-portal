@@ -44,9 +44,21 @@ export function chunkChecksum(rows) {
  */
 export function receiveChunk(db, { generationId, seq, chunkIndex, checksum, rows, manifest }) {
   const existing = db.prepare('SELECT * FROM expected_profit_generation WHERE generation_id = ?').get(generationId);
-  if (existing && existing.remote_status === 'published') {
-    // 公開済みの世代へ後から追記させない
+  const prior = db.prepare('SELECT * FROM expected_profit_chunk WHERE generation_id = ? AND chunk_index = ?')
+    .get(generationId, chunkIndex);
+
+  if (existing && (existing.remote_status === 'published' || existing.remote_status === 'superseded')) {
+    // 🚨 公開済み・旧公開世代は不変にする。
+    //    ただし「同じ内容の再送」だけは 200 で受ける。公開成功後に応答を失った送信側が、
+    //    チャンクからやり直しても publish まで到達できるようにするため (Codex R4-7)
+    if (prior && prior.checksum === checksum) {
+      return { ok: true, idempotent: true, chunkIndex, received: 0, note: 'already_published_same_chunk' };
+    }
     return { ok: false, status: 409, error: 'generation_already_published' };
+  }
+  // 🚨 同じ index を別内容で上書きさせない (混ざった世代を作らせない — Codex R4-5)
+  if (prior && prior.checksum !== checksum) {
+    return { ok: false, status: 409, error: 'chunk_conflict', chunkIndex, storedChecksum: prior.checksum };
   }
   if (!existing) {
     db.prepare(`INSERT INTO expected_profit_generation
@@ -88,7 +100,12 @@ export function receiveChunk(db, { generationId, seq, chunkIndex, checksum, rows
       @shipping_master_status, @shipping_master_valid_until, @shipping_revenue_status, @scenario_fit,
       @calculation_status, @incomplete_reason, @rank_eligible, @rank_exclusion_reason, @expense_scope_version,
       @input_snapshot, @formula_version, @scenario_version, @fee_rate_version, @code_version, @price_run_id, @built_at)`);
-  const tx = db.transaction((list) => { for (const r of list) insert.run({ ...r, generation_id: generationId }); });
+  const recordChunk = db.prepare(`INSERT OR REPLACE INTO expected_profit_chunk
+    (generation_id, chunk_index, checksum, row_count, received_at) VALUES (?, ?, ?, ?, ?)`);
+  const tx = db.transaction((list) => {
+    for (const r of list) insert.run({ ...r, generation_id: generationId });
+    recordChunk.run(generationId, chunkIndex, checksum, list.length, nowIso());
+  });
   tx(rows);
 
   const now = db.prepare('SELECT COUNT(*) n FROM mart_listing_expected_profit WHERE generation_id = ?').get(generationId).n;
@@ -104,40 +121,80 @@ export function publishGeneration(db, { generationId, seq, manifest }) {
   const gen = db.prepare('SELECT * FROM expected_profit_generation WHERE generation_id = ?').get(generationId);
   if (!gen) return { ok: false, status: 404, error: 'generation_not_found' };
 
-  const pointer = db.prepare('SELECT * FROM expected_profit_publish_pointer WHERE id = 1').get();
-  // 冪等: 同じ世代が既に公開中なら 200 (確認応答が失われた再送)
-  if (pointer && pointer.generation_id === generationId) {
-    return { ok: true, idempotent: true, generationId, seq: pointer.seq };
+  // 🚨 要求の seq を信用しない。保存済み世代の seq を使う (Codex R4-6)。
+  //    要求と食い違うなら、送信側と受信側で世代が一致していない
+  if (seq != null && Number(seq) !== Number(gen.seq)) {
+    return { ok: false, status: 400, error: 'seq_mismatch', requested: seq, stored: gen.seq };
   }
-  // 逆転防止
-  if (pointer && seq <= pointer.seq) {
-    return { ok: false, status: 409, error: 'seq_not_newer', publishedSeq: pointer.seq, attemptedSeq: seq };
-  }
+  const effectiveSeq = Number(gen.seq);
 
-  // manifest の照合 (件数・内容ハッシュ)
-  const actual = db.prepare('SELECT COUNT(*) n FROM mart_listing_expected_profit WHERE generation_id = ?').get(generationId).n;
-  const expected = manifest?.row_count ?? gen.row_count;
-  if (expected != null && actual !== expected) {
-    return { ok: false, status: 400, error: 'row_count_mismatch', expected, actual };
-  }
-  if (actual === 0) return { ok: false, status: 400, error: 'no_rows' };
-
-  const previousId = pointer?.generation_id || null;
+  // 🚨 読取・判定・更新をすべて1つのトランザクションに入れる。
+  //    判定と更新の間に別接続の公開が割り込むと、逆転防止をすり抜ける
+  let outcome;
   const tx = db.transaction(() => {
+    const pointer = db.prepare('SELECT * FROM expected_profit_publish_pointer WHERE id = 1').get();
+    // 冪等: 同じ世代が既に公開中なら 200 (確認応答が失われた再送)
+    if (pointer && pointer.generation_id === generationId) {
+      outcome = { ok: true, idempotent: true, generationId, seq: pointer.seq };
+      return;
+    }
+    // 逆転防止 (保存済み seq で比べる)
+    if (pointer && effectiveSeq <= pointer.seq) {
+      outcome = { ok: false, status: 409, error: 'seq_not_newer', publishedSeq: pointer.seq, attemptedSeq: effectiveSeq };
+      return;
+    }
+    // 件数の照合
+    const actual = db.prepare('SELECT COUNT(*) n FROM mart_listing_expected_profit WHERE generation_id = ?').get(generationId).n;
+    const expected = manifest?.row_count ?? gen.row_count;
+    if (expected != null && actual !== expected) {
+      outcome = { ok: false, status: 400, error: 'row_count_mismatch', expected, actual };
+      return;
+    }
+    if (actual === 0) { outcome = { ok: false, status: 400, error: 'no_rows' }; return; }
+    // 🚨 内容ハッシュを保存済みの行から再計算して照合する (Codex R4-5)。
+    //    件数だけでは「同じ件数の違う内容」「複数回の送信が混ざった世代」を通してしまう
+    const expectedHash = manifest?.content_hash ?? gen.content_hash;
+    if (expectedHash) {
+      const actualHash = generationContentHash(db, generationId);
+      if (actualHash !== expectedHash) {
+        outcome = { ok: false, status: 400, error: 'content_hash_mismatch', expected: expectedHash, actual: actualHash };
+        return;
+      }
+    }
+    const previousId = pointer?.generation_id || null;
     db.prepare(`INSERT INTO expected_profit_publish_pointer (id, generation_id, seq, published_at)
                 VALUES (1, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET generation_id = excluded.generation_id,
                   seq = excluded.seq, published_at = excluded.published_at`)
-      .run(generationId, seq, nowIso());
+      .run(generationId, effectiveSeq, nowIso());
     db.prepare("UPDATE expected_profit_generation SET remote_status = 'published' WHERE generation_id = ?")
       .run(generationId);
     if (previousId) {
       db.prepare("UPDATE expected_profit_generation SET remote_status = 'superseded' WHERE generation_id = ?")
         .run(previousId);
     }
+    outcome = { ok: true, generationId, seq: effectiveSeq, supersededId: previousId };
   });
   tx();
-  return { ok: true, generationId, seq, supersededId: previousId };
+  return outcome;
+}
+
+/**
+ * 保存済みの行から内容ハッシュを再計算する。
+ * 🚨 順位を決める値 (利益率・適格状態・費用内訳) を含める。
+ *    キーと利益額だけだと、順位が変わる改変を検出できない (Codex R4-5)
+ */
+export function generationContentHash(db, generationId) {
+  const rows = db.prepare(`
+    SELECT mall, shop_id, mall_item_key, expected_profit, expected_margin_rate,
+           rank_eligible, calculation_status, revenue_ex_tax, cost_ex_tax,
+           shipping_total_ex_tax, fba_fee_ex_tax, fee_total_ex_tax
+    FROM mart_listing_expected_profit WHERE generation_id = ?
+    ORDER BY mall, shop_id, mall_item_key
+  `).all(generationId);
+  const h = crypto.createHash('sha256');
+  for (const r of rows) h.update(JSON.stringify(r));
+  return h.digest('hex');
 }
 
 /** 公開中の世代 (送信側が読み戻して確認する) */
