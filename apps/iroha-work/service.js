@@ -433,26 +433,39 @@ const BATCH_STATUS_LABEL = { not_started: '未着手', in_progress: '作業中',
  * ⭐id はカードのまま。詳細を開く・写真・作業時間はカード単位なので、行が分かれても同じカードを指す。
  *   行を見分けるのは row_key。
  *
- * @param {boolean} homeOnly 物を持ち帰る拠点のぶんを外す (明日の計画 = いろはが明日やる作業だけ)
+ * ⭐**明日の計画に出すか** (plannable) は「拠点が外部か」ではなく**もう外に渡したか**で決める
+ * (Codex R1 中1)。カードごと ワークセンター担当のカードは、いつ出すかを決めるために計画に出る
+ * (今までどおり)。すでに渡したぶんは、いろはが明日やる作業ではないので出さない。
+ * ⭐棚に入れ終わったまとまりも出さない (もう終わっているぶん — Codex R1 中2)。
+ *
+ * @param {boolean} forPlan 明日の計画・上のゲージ用 (渡したぶん・棚に入れたぶんを外す)
  */
-export function expandBatchRows(cards, { homeOnly = false } = {}) {
-  const offsite = new Set(listFacilities(true).filter((f) => f.offsite).map((f) => f.code));
+export function expandBatchRows(cards, { forPlan = false } = {}) {
   const rows = [];
   for (const c of cards) {
     const bs = (c.batches || []).filter((b) => b.work_status !== 'cancelled');
     if (bs.length <= 1) {
-      rows.push({ ...c, row_key: String(c.id), batch_id: bs[0] ? bs[0].id : null, split: false });
+      const only = bs[0] || null;
+      const plannable = !(only && (only.consigned_out || only.work_status === 'done'));
+      if (forPlan && !plannable) continue;
+      rows.push({ ...c, row_key: String(c.id), batch_id: only ? only.id : null, split: false, plannable });
       continue;
     }
     for (const b of bs) {
       const fac = b.facility_code || c.facility_code;
-      if (homeOnly && fac && offsite.has(fac)) continue;
+      // ⭐棚に入れ終わったぶんは一覧・ボードにも出さない (そのぶんの作業は終わっている)。
+      //   カードは他の行で見えるし、全部終われば カードごと一覧から外れる
+      if (b.work_status === 'done') continue;
+      const plannable = !b.consigned_out;
+      if (forPlan && !plannable) continue;
       // ⭐数・箱・時間は**そのまとまりのぶん**。カード合計を出すと、400 個のぶんに 1000 個の箱数が出る。
       //   箱数は Z ロケの実在庫で代用しない (どちらのまとまりのぶんか分けられないため)
       const per = c.master ? c.master.units_per_container : null;
       rows.push({ ...c,
         row_key: c.id + '-b' + b.id,
         batch_id: b.id, batch_seq: b.seq, split: true,
+        // plannable = 明日やる作業として数えるぶん (まだ渡していない・棚に入れていない)
+        plannable,
         facility_code: fac,
         qty: b.planned_qty,
         status: b.work_status === 'done' ? 'closed' : b.work_status,
@@ -486,9 +499,9 @@ export function buildPlan({ readOnly = false } = {}) {
   const today = jstToday();
   const tomorrow = jstTomorrow(today);
   const { cards: allCards } = buildTaskCards(listOpenTasks({}), { readOnly });
-  // ⭐明日の計画は「いろはが明日やる作業」なので、外部に預けたぶんは出さない (要件 §AB-11 の 5b)。
-  //   まとまりが 1 つのカードは今までどおり 1 行
-  const cards = expandBatchRows(allCards, { homeOnly: true });
+  // ⭐明日の計画は「いろはが明日やる作業」なので、もう渡したぶん・棚に入れたぶんは出さない (要件 §AB-11 の 5b)。
+  //   まとまりが 1 つのカードは今までどおり 1 行 (カードごと外部施設の担当でも、いつ出すかを決めるので出す)
+  const cards = expandBatchRows(allCards, { forPlan: true });
   const byWhen = (w) => cards.filter((c) => c.when === w).sort(comparePlanOrder);
   const tomorrowCards = byWhen('tomorrow');
   const facilities = listFacilities();
@@ -588,12 +601,13 @@ export function buildTaskList({ facility = null, readOnly = false } = {}) {
   // 読むだけ (下見) では画像の取り寄せも起こさない — 開くだけで DB が変わらない (Codex PR1 R7 / R8)
   if (!readOnly) queueMissingImages(cards);
 
-  // 上のゲージ用。明日やる分の件数と合計時間 (工程数の無いカードは 0 で足さず別に数える — 要件 §W-3)
-  const tomorrowPlan = sumPlanHours(cards.filter((c) => c.when === 'tomorrow'));
-
   // ⭐まとまりが 2 つ以上のカードは、一覧・ボードで行が分かれる (要件 §AB-11 の 5b)。
   //   cards (カード 1 枚 = 1 つ) はそのまま返す — 詳細・写真・作業時間はカード単位のため
   const batchRows = expandBatchRows(cards);
+  // 上のゲージ用。明日やる分の件数と合計時間 (工程数の無いカードは 0 で足さず別に数える — 要件 §W-3)。
+  // ⭐外部に預けたぶんは いろはが明日やる作業ではないので数えない (明日の計画の画面と同じものさし)
+  const tomorrowPlan = sumPlanHours(expandBatchRows(cards, { forPlan: true }).filter((c) => c.when === 'tomorrow'));
+
   return {
     mode: 'app',
     tomorrow_plan: tomorrowPlan,

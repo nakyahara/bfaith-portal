@@ -3929,7 +3929,12 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '状態とできた数は 1 回の通信で送る (分けると「保留にはなったが数が入らない」が起きる)');
   ok(/'\/api\/progress'/.test(html) && /function saveProgress\(\)/.test(html) && /expect_version: c\.version/.test(html),
     'あとから直すときは /api/progress へ (版つき)');
-  ok(/'done_qty', 'hold_memo',/.test(html), 'サーバーの返事のできた数・中断メモをカードに反映する (取り直しを待たない)');
+  ok(/const CARD_FIELDS = \['version', 'blocked', 'blocked_label', 'hold_memo',/.test(html)
+    && /const BATCH_FIELDS = \['status', 'status_label', 'facility_code', 'done_qty'\];/.test(html),
+    'サーバーの返事のできた数・中断メモをカードに反映する (取り直しを待たない)');
+  ok(/for \(const r of \(\(state \|\| \{\}\)\.rows \|\| \[\]\)\) \{/.test(html)
+    && /if \(!r\.split\) for \(const k of BATCH_FIELDS\) if \(k in t\) r\[k\] = t\[k\];/.test(html),
+    '⭐一覧・ボードが描く「行」にも写す。⭐分かれた行にはカードの合計を写さない (数が化ける)');
   ok(/c\.done_qty != null \? '✅ できた ' \+ c\.done_qty/.test(html) && /c\.hold_memo \? '📝 メモ' : null/.test(html),
     'ボードのカードでも「途中まで進んでいる」が分かる');
   ok(/'units_per_container'\)/.test(html) && /'storage_container', 'container'/.test(html), '保管箱と入数は別々にタップできる (帯の data-reg が内側で勝つ)');
@@ -6230,11 +6235,68 @@ console.log('\n[31] 分けたカードは一覧・ボードで 2 枚に見える
       '⭐預けをやめたら 1 行に戻る (取消のまとまりは出さない・数も戻る)');
   }
 
+  // ⑤ ⭐上のゲージ (明日やる分) も、いろはがやるぶんだけ数える
+  {
+    const t = mk('rw-4', 9998, 800);
+    const b0 = B.listBatchesOfTask(db, t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'rashinban', qty: 500, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    TD.setPlannedDate({ taskId: t, plannedDate: SV.jstTomorrow(SV.jstToday()), expectVersion: v(t), actor: 'test' });
+    const list = SV.buildTaskList({});
+    const rows = list.rows.filter((r) => r.id === t);
+    ok(rows.length === 2, '前提: 行は 2 つ');
+    ok(rows.find((r) => r.facility_code === 'iroha').plannable === true
+      && rows.find((r) => r.facility_code === 'rashinban').plannable === false,
+      '⭐行に「明日やる作業として数えるぶんか」が入る (もう渡したぶんは false)');
+    const plan = SV.buildPlan({});
+    const mine = plan.tomorrow.filter((r) => r.id === t);
+    ok(mine.length === 1 && mine[0].qty === 300, '明日の計画は いろはの 300 個ぶんだけ');
+    ok(list.tomorrow_plan.count === plan.totals.count && list.tomorrow_plan.hours === plan.totals.hours,
+      '⭐上のゲージと「明日の計画」の画面が同じ数になる (外に預けたぶんを二重に数えない)');
+  }
+
+  // ⑥ ⭐カードごと外部施設の担当でも、まだ渡していなければ明日の計画に出る (Codex R1 中1)
+  {
+    const t = TD.upsertTaskFromImport({ notion_page_id: 'rw-5', status: 'not_started', facility_code: 'workcenter',
+      destination_id: 9999, product_name: 'ワークセンター担当', qty: 500 }, { batchId: 'rw' }).id;
+    TD.setPlannedDate({ taskId: t, plannedDate: SV.jstTomorrow(SV.jstToday()), expectVersion: v(t), actor: 'test' });
+    ok(SV.buildPlan({}).tomorrow.some((r) => r.id === t),
+      '⭐カードごとワークセンター担当でも、渡す前なら明日の計画に出る (いつ出すかを決めるため・今までどおり)');
+    // 丸ごと渡したら、もう いろはが明日やる作業ではない
+    const b0 = B.listBatchesOfTask(db, t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 500, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    ok(!SV.buildPlan({}).tomorrow.some((r) => r.id === t), '⭐渡したら明日の計画から外れる');
+    ok(SV.buildTaskList({}).rows.some((r) => r.id === t), '一覧・ボードには残る (いま外にあることが見える)');
+  }
+
+  // ⑦ ⭐棚に入れ終わったまとまりは、行にも明日の計画にも出さない (Codex R1 中2)
+  {
+    const t = mk('rw-6', 9968, 1000);
+    const b0 = B.listBatchesOfTask(db, t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 600, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    TD.setPlannedDate({ taskId: t, plannedDate: SV.jstTomorrow(SV.jstToday()), expectVersion: v(t), actor: 'test' });
+    TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'ready_for_stocking', expectVersion: v(t), doneQty: 398 });
+    TD.changeBatchStatus({ taskId: t, batchId: b0.id, to: 'closed', closeReason: 'stocked', expectVersion: v(t), isStaff: true, actor: 'たにがわ' });
+    ok(TD.getTask(t).status === 'in_progress', '前提: 外の 600 個が残っているのでカードは開いたまま');
+    const rows = SV.buildTaskList({}).rows.filter((r) => r.id === t);
+    ok(rows.length === 1 && rows[0].facility_code === 'workcenter',
+      '⭐棚に入れた いろはのぶんは行に出さない (残るのは外の 600 個だけ)');
+    ok(!SV.buildPlan({}).tomorrow.some((r) => r.id === t),
+      '⭐明日の計画にも出さない (いろはのぶんは終わり・外のぶんは渡してある)');
+  }
+
   // ── 画面 ──
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
   ok(/const rowsOf = \(st\) => \(\(st \|\| \{\}\)\.rows \|\| \(st \|\| \{\}\)\.cards \|\| \[\]\);/.test(html)
     && /return rowsOf\(state\)\.filter/.test(html) && /return rowsOf\(boardState\(\)\)\.filter/.test(html),
     '⭐一覧・ボードは「まとまりの行」で描く (下見は rows が無いので cards のまま)');
+  ok(/const rows = rowsOf\(state\);\r?\n\s*const c = \{ all: rows\.length/.test(html)
+    && /const rs = rowsOf\(st\);/.test(html) && /const cards = rowsOf\(boardState\(\)\);/.test(html),
+    '⭐札・チップの件数も「並んでいる行」で数える (札の数と一覧の数を食い違わせない)');
+  ok(/const mine = rowsOf\(state\)\.filter\(c => c\.when === 'tomorrow' && c\.plannable !== false\);/.test(html),
+    '⭐上のゲージも「明日やる作業」だけ数える (渡したぶん・棚に入れたぶんは外す)');
   ok(/const findCard = \(id\) => state\.cards\.find/.test(html),
     '⭐カードを指すとき (詳細・写真・作業時間) は今までどおり cards から探す');
   ok(/const selectable = bulkIds && c\.status === 'ready_for_stocking' && !c\.split;/.test(html)
