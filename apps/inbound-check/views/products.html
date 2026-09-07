@@ -120,7 +120,13 @@
 
   <div class="overlay" id="scanBox"><div class="modal">
     <h2>📷 バーコードを読む</h2>
-    <video id="scanVideo" playsinline muted autoplay style="width:100%;border-radius:10px;background:#000;aspect-ratio:4/3;object-fit:cover"></video>
+    <!-- 🚨 読み取り枠。**見えている枠と、実際に解析する範囲を同じ数字 (GUIDE) から作る** —
+         枠を描かずに中央だけ解析すると「枠に入れてください」と言いながら範囲が見えない状態になり、
+         逆に枠を描かずに全体を解析すると棚の別ラベルを読んで別商品を出す (Codex #1233 R2) -->
+    <div id="scanStage" style="position:relative;width:100%;border-radius:10px;overflow:hidden;background:#000;aspect-ratio:4/3">
+      <video id="scanVideo" playsinline muted autoplay style="display:block;width:100%;height:100%;object-fit:contain"></video>
+      <div id="scanGuide" style="position:absolute;border:2px solid #fff;border-radius:6px;box-shadow:0 0 0 9999px rgba(0,0,0,.42);pointer-events:none"></div>
+    </div>
     <div class="pmsg" id="scanMsg" style="margin-top:8px"></div>
     <div class="actions"><button type="button" id="scanCancel">やめる</button></div>
   </div></div>
@@ -132,6 +138,9 @@
     <div class="actions"><button type="button" id="printCancel">やめる</button><button type="button" class="primary" id="printOk">🏷 発行する</button></div>
   </div></div>
 
+  <!-- 📷 読み取り結果を採用するかの判断 (2フレーム一致・連続失敗の打ち切り)。
+       安全弁そのものなので、画面から切り出してテストできるようにしてある -->
+  <script src="/js/barcode-scan-decide.js"></script>
   <script>
     const API = '/apps/inbound-check/api';
     const LS_CODE = 'ic_worker_code', LS_NAME = 'ic_worker_name';   // 入荷受付の作業画面と同じ (同じ iPad なら選び直さなくてよい)
@@ -271,6 +280,16 @@
       tryHarder: true,
       maxNumberOfSymbols: 1,
     };
+    // 読み取り枠 (映像に対する割合)。**画面に描く枠と、切り出す範囲の両方をここから作る**
+    const GUIDE = { x: 0.07, y: 0.31, w: 0.86, h: 0.38 };
+    function layoutGuide() {
+      const g = $('#scanGuide');
+      if (!g) return;
+      g.style.left = (GUIDE.x * 100) + '%';
+      g.style.top = (GUIDE.y * 100) + '%';
+      g.style.width = (GUIDE.w * 100) + '%';
+      g.style.height = (GUIDE.h * 100) + '%';
+    }
     let zxingPromise = null;
     function loadDecoder() {
       if (zxingPromise) return zxingPromise;
@@ -345,47 +364,58 @@
       scanStream = stream;
       const v = $('#scanVideo');
       v.srcObject = scanStream;
-      $('#scanMsg').textContent = '商品の JAN (13桁) か FNSKU を枠に入れてください';
+      // 🚨 枠の % と映像の % を一致させる。**入れ物の縦横比を実際の映像に合わせて object-fit: contain**
+      //    にしておけば、切り取り (cover) が起きないので画面の枠 = 解析する範囲になる
+      v.onloadedmetadata = () => {
+        const st = $('#scanStage');
+        if (st && v.videoWidth && v.videoHeight) st.style.aspectRatio = v.videoWidth + ' / ' + v.videoHeight;
+        layoutGuide();
+      };
+      layoutGuide();
+      $('#scanMsg').textContent = '商品の JAN (13桁) か FNSKU を、白い枠の中に入れてください';
       $('#scanBox').classList.add('on');
       // 映像を canvas に落として wasm に渡す。**横 640px に縮める** —
       // 1280px のまま毎フレーム解析すると iPad が重くなり、JAN はこの解像度で十分読める
       if (!scanCanvas) scanCanvas = document.createElement('canvas');
-      // 🚨**同じ値を2フレーム続けて読めたときだけ確定する** (Codex #1233 R1 P2)。
-      //   Code39 / Code128 / ITF はチェックデジットが無く、枠に入れる途中のブレや棚の別ラベルの
-      //   一部を「読めた」と返すことがある。倉庫では別商品を出すこと自体が事故なので、
-      //   1フレームでは信じない (確定が 250ms 遅れるだけ)
-      let lastSeen = null;
-      let failStreak = 0;
+      // 採否の判断は public/js/barcode-scan-decide.js (2フレーム一致・連続失敗の打ち切り)。
+      // ここはカメラと canvas の面倒だけ見る
+      let decide = BarcodeScanDecide.initialState();
+      let lastError = null;
       const tick = async () => {
         if (!scanStream || gen !== scanGen) return;
+        let ev = { kind: 'idle' };
         try {
           const vw = v.videoWidth, vh = v.videoHeight;
           if (vw && vh) {
-            const w = Math.min(640, vw);
-            const h = Math.round((vh / vw) * w);
+            // 🚨 **枠の中だけを切り出す**。映像全体を解析すると、棚に並んだ別ラベルを
+            //    2フレーム続けて読んでしまい「別の商品」で確定する (Codex #1233 R2)。
+            //    切り出す範囲は画面に描いている枠 (GUIDE) と同じ数字から作る
+            const sx = Math.round(GUIDE.x * vw), sy = Math.round(GUIDE.y * vh);
+            const sw = Math.round(GUIDE.w * vw), sh = Math.round(GUIDE.h * vh);
+            const w = Math.min(720, sw);                       // 横 720px まで縮める (iPad が重くならない範囲)
+            const h = Math.max(1, Math.round((sh / sw) * w));
             if (scanCanvas.width !== w || scanCanvas.height !== h) { scanCanvas.width = w; scanCanvas.height = h; }
             const ctx = scanCanvas.getContext('2d', { willReadFrequently: true });
-            ctx.drawImage(v, 0, 0, w, h);
+            ctx.drawImage(v, sx, sy, sw, sh, 0, 0, w, h);
             const img = ctx.getImageData(0, 0, w, h);
             const codes = await zx.readBarcodesFromImageData(img, READER_OPTIONS);
             // 読み取りを待っている間に閉じられたら、返ってきた結果は使わない (閉じた後に検索が走らないように)
             if (!scanStream || gen !== scanGen) return;
-            failStreak = 0;
-            // isValid === false = チェックデジットが合っていない (EAN/UPC)。そのまま検索しない
-            const hit = codes.find((x) => x.text && x.isValid !== false && /^[A-Za-z0-9]{6,}$/.test(String(x.text).trim()));
-            const val = hit ? String(hit.text).trim() : null;
-            if (val && val === lastSeen) { onScanned(val); return; }
-            lastSeen = val;
+            ev = { kind: 'codes', codes };
           }
         } catch (e) {
-          // 映像がまだ来ていないだけなら次の回で直る。**続けて失敗するのは読み取り側の異常**なので、
-          // 黙って回し続けずに止めて理由を出す (2秒ぶん = 8回)
-          if (++failStreak >= 8) {
-            stopScan();
-            banner('err', 'バーコードを読み取れませんでした (' + esc((e && e.message) || '') + ')。'
-              + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
-            return;
-          }
+          // 映像がまだ来ていないだけなら次の回で直る。**続けて失敗するのは読み取り側の異常**
+          lastError = e;
+          ev = { kind: 'error' };
+        }
+        const r = BarcodeScanDecide.step(decide, ev);
+        decide = r.state;
+        if (r.action === 'accept') { onScanned(r.value); return; }
+        if (r.action === 'abort') {
+          stopScan();
+          banner('err', 'バーコードを読み取れませんでした (' + esc((lastError && lastError.message) || '') + ')。'
+            + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+          return;
         }
         if (gen !== scanGen) return;
         scanTimer = setTimeout(tick, 250);

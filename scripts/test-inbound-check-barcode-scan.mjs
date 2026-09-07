@@ -17,6 +17,8 @@
  *   5. products.html が BarcodeDetector に依存していない (退行防止)
  *   6. **本番と同じ経路** (Express の静的配信 → Content-Type → locateFile → wasm コンパイル → 復号)。
  *      wasmBinary を直接注入するテストは、いちばん壊れやすいこの経路を通らない (Codex #1233 R1 P2)
+ *   7. 安全弁の**挙動** (2フレーム一致 / 例外で連続が切れる / 8回で打ち切り)。
+ *      「その行が書いてあるか」を正規表現で見るだけでは守れない (Codex #1233 R2)
  */
 import fs from 'fs';
 import path from 'path';
@@ -232,18 +234,68 @@ console.log('\n[6] 本番と同じ経路 (Express 配信 → Content-Type → lo
   }
 }
 
-// ─── 7. 画面が初期化の失敗をその場で拾うか (握りつぶし防止) ────────────────
-console.log('\n[7] 初期化の失敗を握りつぶさない (Codex #1233 R1 P1)');
+// ─── 7. 安全弁の挙動 (別の商品を出さないための判断そのもの) ─────────────────
+console.log('\n[7] 採否の判断 (public/js/barcode-scan-decide.js)');
+{
+  const src = fs.readFileSync(path.join(ROOT, 'public/js/barcode-scan-decide.js'), 'utf8');
+  // 画面と同じもの (script タグで読まれる形) をそのまま評価して使う
+  const sandbox = {};
+  new Function('globalThis', 'with (globalThis) { ' + src + ' }')(sandbox);
+  const D = sandbox.BarcodeScanDecide;
+  ok(!!(D && D.step && D.initialState), 'script タグで読める形 (グローバルに生える)');
+
+  const codes = (...v) => ({ kind: 'codes', codes: v.map((x) => (typeof x === 'string' ? { text: x } : x)) });
+  const run = (events) => {
+    let st = D.initialState();
+    const actions = [];
+    for (const e of events) { const r = D.step(st, e); st = r.state; actions.push(r.action + (r.value ? ':' + r.value : '')); }
+    return actions;
+  };
+
+  ok(run([codes('4901234567894')]).join() === 'continue', '1フレームだけでは確定しない');
+  ok(run([codes('4901234567894'), codes('4901234567894')]).join() === 'continue,accept:4901234567894',
+    '同じ値が2フレーム続けば確定する');
+  ok(run([codes('4901234567894'), codes('9999999999999'), codes('4901234567894')]).join() === 'continue,continue,continue',
+    '違う値を挟んだら確定しない (A → B → A)');
+  // 🚨 Codex #1233 R2: 例外を挟んでも「連続」とみなしてはいけない
+  ok(run([codes('4901234567894'), { kind: 'error' }, codes('4901234567894')]).join() === 'continue,continue,continue',
+    '例外を挟んだら連続が切れる (A → 例外 → A で確定しない)');
+  ok(run([codes('4901234567894'), { kind: 'idle' }, codes('4901234567894')]).join() === 'continue,continue,continue',
+    '映像が来ないフレームを挟んでも連続が切れる');
+  ok(run([codes('4901234567894'), codes(), codes('4901234567894')]).join() === 'continue,continue,continue',
+    '読めないフレームを挟んでも連続が切れる');
+
+  const errs = Array.from({ length: D.MAX_FAIL_STREAK }, () => ({ kind: 'error' }));
+  const a = run(errs);
+  ok(a[a.length - 1] === 'abort' && a.slice(0, -1).every((x) => x === 'continue'),
+    `例外が ${D.MAX_FAIL_STREAK} 回続いたら打ち切る (それまでは続ける)`);
+  ok(run([...errs.slice(0, D.MAX_FAIL_STREAK - 1), codes('4901234567894'), ...errs.slice(0, D.MAX_FAIL_STREAK - 1)])
+    .every((x) => x === 'continue'), '途中で1回でも解析できたら失敗の数え直し (たまの失敗で止めない)');
+
+  // 値の選び方
+  ok(D.pickValue([{ text: '4901234567894', isValid: false }]) === null,
+    'チェックデジットが合わない読み取り (isValid=false) は使わない');
+  ok(D.pickValue([{ text: '123' }]) === null, '短すぎる値は使わない');
+  ok(D.pickValue([{ text: 'X00ABCD123' }]) === 'X00ABCD123', 'FNSKU (英数字) も読める');
+  ok(D.pickValue([{ text: ' 4901234567894 ' }]) === '4901234567894', '前後の空白は落とす');
+  ok(D.pickValue([{ text: '49-0123' }]) === null, '記号を含む値は使わない');
+  ok(D.pickValue([]) === null && D.pickValue(null) === null, '空でも落ちない');
+}
+
+// ─── 8. 画面が安全弁を使っているか (退行防止) ──────────────────────────────
+console.log('\n[8] 画面が安全弁を通している (退行防止)');
 {
   const html = fs.readFileSync(path.join(ROOT, 'apps/inbound-check/views/products.html'), 'utf8');
   ok(/fireImmediately:\s*true/.test(html),
     'prepareZXingModule を fireImmediately で待つ (wasm の取得・コンパイルまで済ませてからカメラを開く)');
-  ok(/failStreak/.test(html) && /stopScan\(\)/.test(html),
-    'フレーム解析が続けて失敗したら止めて理由を出す (250ms ごとの永久リトライにしない)');
-  ok(/val === lastSeen/.test(html),
-    '同じ値を2フレーム続けて読めたときだけ確定する (1フレームの誤読で別商品を出さない)');
-  ok(/isValid !== false/.test(html),
-    'チェックデジットが合わない読み取りは使わない');
+  ok(/\/js\/barcode-scan-decide\.js/.test(html) && /BarcodeScanDecide\.step\(/.test(html),
+    '採否の判断を画面に埋め直していない (切り出したものを使っている)');
+  ok(/const GUIDE = \{/.test(html) && /GUIDE\.x \* vw/.test(html) && /GUIDE\.x \* 100/.test(html),
+    '🚨 描く枠と切り出す範囲が同じ数字 (GUIDE) から作られている');
+  ok(/drawImage\(v, sx, sy, sw, sh,/.test(html),
+    '映像全体ではなく枠の中だけを解析している (棚の別ラベルを読まない)');
+  ok(/object-fit:\s*contain/.test(html) && /style\.aspectRatio/.test(html),
+    '映像を切り取らずに出している (枠の % と映像の % がずれない)');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
