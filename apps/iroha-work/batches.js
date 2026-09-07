@@ -219,28 +219,45 @@ export function countsByTask(db, taskIds) {
  *
  * @returns {number} 足した行数 (0 = 残りが無い)
  */
-export function recordStocking(db, batchId, { at = null, by = null, note = null } = {}) {
+export function recordStocking(db, batchId, { at = undefined, by = null, note = null } = {}) {
   const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(batchId);
   if (!b) return 0;
   const done = stockedQtyOf(db, batchId);
-  // 数えていれば「できた数 − すでに棚へ入れた数」。数えていなければ数量なしで 1 行だけ
+  // ⭐**数の分からない実績が 1 つでもあれば、残りを自分で決めない** (要件: 欠損値を 0 で代用しない)。
+  //   「数えずに入れた」あとに できた数 を 100 と入れても、既に何個運んだか分からないので
+  //   残りが 100 とは言えない (Codex R1 中1)。この場合も「数は分からない」1 行として足す
   let qty = null;
-  if (b.good_qty != null) {
+  if (b.good_qty != null && done.unknown === 0) {
     qty = b.good_qty - (done.qty ?? 0);
     if (qty <= 0) return 0;                      // もう全部入れてある
-  } else if (done.rows > 0) {
+  } else if (done.rows > 0 && b.good_qty == null) {
     return 0;                                    // 数えていないまとまりは 1 回だけ
+  } else if (done.unknown > 0 && b.good_qty != null) {
+    // 数の分からない実績があるところに、あとから できた数 が入った。
+    // 何個ぶん残っているか決められないので、数を書かずに 1 行だけ足す (人が見て直せる)
+    qty = null;
   }
   const now = new Date().toISOString();
+  // ⭐`at` が渡されなかった (= いつ入れたか分からない) ときは空のまま。
+  //   `created_at` には記録した時刻が残るので、あとから追える
   db.prepare(`INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, stocked_by, note, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)`).run(batchId, qty, at || now, by, note, now);
+    VALUES (?, ?, ?, ?, ?, ?)`).run(batchId, qty, at === undefined ? now : at, by, note, now);
   return 1;
 }
 
-/** そのまとまりを棚に入れた合計。{ qty: 数えた合計 (NULL = 1 度も数えていない), rows: 実績の件数 } */
+/**
+ * そのまとまりを棚に入れた合計。
+ * @returns {{ qty: number|null, rows: number, unknown: number }}
+ *   qty = **数が分かっているぶんの合計** (NULL = 1 つも数えていない) /
+ *   rows = 実績の件数 / unknown = 数の分からない実績の件数。
+ *   ⭐unknown > 0 なら、全部で何個入れたかは**決められない**。qty を全体の合計として使わないこと
+ */
 export function stockedQtyOf(db, batchId) {
-  const r = db.prepare('SELECT COUNT(*) rows, COUNT(qty) n, SUM(qty) s FROM f_iroha_stocking_records WHERE batch_id = ?').get(batchId);
-  return { qty: r && r.n > 0 ? r.s : null, rows: r ? r.rows : 0 };
+  const r = db.prepare(`SELECT COUNT(*) rows, COUNT(qty) n, SUM(qty) s
+    FROM f_iroha_stocking_records WHERE batch_id = ?`).get(batchId);
+  const rows = r ? r.rows : 0;
+  const n = r ? r.n : 0;
+  return { qty: n > 0 ? r.s : null, rows, unknown: rows - n };
 }
 
 /** カードの棚入れ実績をまとめて (履歴・詳細に出す用)。まとまりを問わず新しい順 */
@@ -275,7 +292,10 @@ export function backfillStocking(db) {
         AND NOT EXISTS (SELECT 1 FROM f_iroha_stocking_records s WHERE s.batch_id = b.id)`).all();
     let n = 0;
     for (const r of rows) {
-      n += recordStocking(db, r.id, { at: r.closed_at || null, by: r.closed_by || null, note: '(この機能より前に棚に入れたぶん)' });
+      // ⭐いつ入れたか分からないカードは `stocked_at` を**空のまま**にする。
+      //   移行した日を入れると「その日に棚入れした」と嘘の記録になり、以後直る機会も無い (Codex R1 中2)
+      n += recordStocking(db, r.id, { at: r.closed_at || null, by: r.closed_by || null,
+        note: '(この機能より前に棚に入れたぶん' + (r.closed_at ? '' : '・いつ入れたかは記録がありません') + ')' });
     }
     return n;
   }).immediate();

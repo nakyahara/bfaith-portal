@@ -223,7 +223,9 @@ const stockingDDL = (name) => `
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       batch_id   INTEGER NOT NULL REFERENCES f_iroha_task_batches(id),
       qty        INTEGER CHECK (qty IS NULL OR qty >= 0),
-      stocked_at TEXT NOT NULL,
+      -- ⭐いつ入れたか。NULL = 記録が無い (この機能より前のぶんで、カードにも終了時刻が無かった)。
+      --   移行した日を入れると「その日に棚入れした」という嘘の記録になる (Codex R1 中2)
+      stocked_at TEXT,
       stocked_by TEXT,
       note       TEXT,
       version    INTEGER NOT NULL DEFAULT 1,

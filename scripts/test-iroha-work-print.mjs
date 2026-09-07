@@ -133,6 +133,30 @@ let J1;
     '商品名・商品コード・バーコードはカードの行から (FNSKU と判定)');
   ok(r.job.pack_qty === '120' && r.job.expiry_text === '2027-03' && r.job.copies === 2 && r.job.printer_name === 'Brother QL-800', '1 箱に何個・期限・枚数・出力先が入る');
   ok(!('lease_token' in r.job), '画面に返す形に lease token は含めない');
+  // ⭐どのまとまりのぶんを刷ったか + 刷った中身が後から変わらないこと (要件 §AB-12・Codex R1 軽微4)
+  {
+    const B = await import('../apps/iroha-work/batches.js');
+    const sole = B.listBatchesOfTask(db, T1)[0];
+    const row = db.prepare('SELECT * FROM f_iroha_print_jobs WHERE id = ?').get(J1);
+    ok(row.batch_id === sole.id, '⭐まとまりが 1 つなら、そのまとまりに紐づく');
+    // まとまりの期限と数を後から直しても、刷った記録は変わらない
+    db.prepare("UPDATE f_iroha_task_batches SET expiry = '2099-12', planned_qty = 9 WHERE id = ?").run(sole.id);
+    const after = db.prepare('SELECT * FROM f_iroha_print_jobs WHERE id = ?').get(J1);
+    ok(after.expiry_text === '2027-03' && after.pack_qty === '120' && after.copies === 2
+      && after.product_name === row.product_name,
+      '⭐あとでまとまりの期限や数を直しても、**刷った記録は変わらない** (何を刷ったかが残る)');
+    db.prepare("UPDATE f_iroha_task_batches SET expiry = ?, planned_qty = ? WHERE id = ?").run(sole.expiry, sole.planned_qty, sole.id);
+    // まとまりが 2 つ以上なら、どのぶんか決められないので紐づけない (別のカードで試す)
+    const TS = mkTask('分かれたカード', 'SPLIT-1');
+    const at2 = new Date().toISOString();
+    db.prepare(`INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, created_at, updated_at)
+      VALUES (?, 2, 5, 'not_started', ?, ?)`).run(TS, at2, at2);
+    const split = enqueuePrintJob({ taskId: TS, copies: 1, packQty: '120', clientRequestId: crid() });
+    ok(split.ok && db.prepare('SELECT batch_id FROM f_iroha_print_jobs WHERE id = ?').get(split.job.id).batch_id == null,
+      '⭐まとまりが 2 つ以上なら、どのぶんか決められないので紐づけない (適当に 1 つ目に付けない)');
+    // 後の検査 (ジョブの件数) に影響しないよう片づける
+    db.prepare('DELETE FROM f_iroha_print_jobs WHERE id = ?').run(split.job.id);
+  }
   const again = enqueuePrintJob({ taskId: T1, copies: 2, packQty: '120', expiry: '2027-03', clientRequestId: id });
   ok(again.ok && again.replayed && again.job.id === J1, '同じ冪等 ID の再送は同じジョブ (2 枚出ない)');
   const clash = enqueuePrintJob({ taskId: T2, copies: 2, packQty: '120', expiry: '2027-03', clientRequestId: id });

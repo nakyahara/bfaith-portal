@@ -3731,15 +3731,21 @@ function stockingCardHtml(c) {
   const rows = c.stocking || [];
   if (rows.length === 0) return '';
   const items = rows.map(r =>
-    '<li>' + esc(fmtDate(r.stocked_at) + ' ' + fmtTime(r.stocked_at)) + ' ・ ' +
+    '<li>' + esc(r.stocked_at ? fmtDate(r.stocked_at) + ' ' + fmtTime(r.stocked_at) : 'いつ入れたかの記録なし') + ' ・ ' +
     (r.qty == null ? '数は残していません' : '<b>' + esc(String(r.qty)) + ' 個</b>') +
     (r.stocked_by ? ' ・ ' + esc(r.stocked_by) : '') +
     (r.note ? ' ・ ' + esc(r.note) : '') + '</li>').join('');
-  const n = rows.reduce((a, r) => a + (r.qty == null ? 0 : Number(r.qty)), 0);
-  const counted = rows.some((r) => r.qty != null);
+  // ⭐数の分からない行があるなら「合計」と言い切らない。分かっているぶんの小計として出す
+  //   (200 個 + 数不明 を「合計 200 個」と書くと、全部で 200 個入れたように読める — Codex R1 中3)
+  const known = rows.filter((r) => r.qty != null);
+  const unknown = rows.length - known.length;
+  const n = known.reduce((a, r) => a + Number(r.qty), 0);
+  const foot = known.length === 0 ? '数の記録はありません (' + rows.length + '回)'
+    : unknown === 0 ? '合計 ' + n + ' 個 (' + rows.length + '回)'
+    : '数が分かるぶん ' + n + ' 個 ・ 数の記録がないもの ' + unknown + '回 (ぜんぶで ' + rows.length + '回)';
   return '<div class="dcard"><h3 class="sec">棚に入れた記録</h3>' +
     '<ul class="whist">' + items + '</ul>' +
-    (counted ? '<p class="est num">合計 ' + esc(String(n)) + ' 個 (' + rows.length + '回)</p>' : '') + '</div>';
+    '<p class="est num">' + esc(foot) + '</p></div>';
 }
 
 // ── 写真・動画: 「前回の完成形」(同じ商品の見本) と「今回のできあがり」 ──

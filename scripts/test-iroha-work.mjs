@@ -5070,6 +5070,76 @@ console.log('\n[28] 棚に入れた記録 — 作業のまとまりを割って�
     ok(B.backfillStocking(db) === 0, '2 回目は何もしない (冪等)');
   }
 
+  // ── ⭐数の分からない実績があるときは、残りを自分で決めない (Codex R1 中1) ──
+  {
+    const t = mk28('st-8', 9858, 100);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    close28(t);                                          // 数えずに棚入れ → qty NULL の実績 1 行
+    ok(B.stockedQtyOf(db, bid).unknown === 1, '前提: 数の分からない実績が 1 件');
+    // あとから できた数 を入れる → 何個ぶん残っているかは決められない
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 100 }); }).immediate();
+    db.transaction(() => { B.recordStocking(db, bid, { at: new Date().toISOString(), by: 'あとから' }); }).immediate();
+    const recs = B.stockingOfTask(db, t);
+    ok(recs.length === 2 && recs[0].qty == null,
+      '⭐数の分からない実績があるところに あとから 100 個 と入れても、「残り 100 個」とは書かない (0 個運んだ扱いにしない)');
+    const sum = B.stockedQtyOf(db, bid);
+    ok(sum.qty == null && sum.unknown === 2, '合計も「決められない」(数の分からない件数を数える)');
+  }
+  // ── 数が分かる実績と分からない実績が混ざるとき ──
+  {
+    const t = mk28('st-9', 9859, 300);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    const at9 = new Date().toISOString();
+    db.transaction(() => {
+      db.prepare(`INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, created_at) VALUES (?, 200, ?, ?)`).run(bid, at9, at9);
+      db.prepare(`INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, created_at) VALUES (?, NULL, ?, ?)`).run(bid, at9, at9);
+    }).immediate();
+    const sum = B.stockedQtyOf(db, bid);
+    ok(sum.qty === 200 && sum.unknown === 1 && sum.rows === 2,
+      '⭐数が分かるぶんの合計 (200) と、分からない件数 (1) を別に返す — 200 を全体の合計として使わせない');
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 300 }); }).immediate();
+    db.transaction(() => { B.recordStocking(db, bid, { at: at9 }); }).immediate();
+    ok(B.stockingOfTask(db, t)[0].qty == null, '混ざっているときも「残り 100 個」と決めつけない');
+  }
+  // ── できた数を後から減らしたとき ──
+  {
+    const t = mk28('st-10', 9860, 400);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 400 }); }).immediate();
+    close28(t);
+    ok(B.stockedQtyOf(db, bid).qty === 400, '前提: 400 個入れた');
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 380 }); }).immediate();   // 数え直したら 380 だった
+    db.transaction(() => { ok(B.recordStocking(db, bid, { at: new Date().toISOString() }) === 0,
+      '⭐できた数を減らしても、過去の実績は書き換えない・マイナスの行も足さない'); }).immediate();
+    ok(B.stockedQtyOf(db, bid).qty === 400, '入れた記録は 400 のまま (実際に運んだのは 400 なので)');
+  }
+  // ── 終了時刻が無い古いカードの移行 ──
+  {
+    const t = mk28('st-11', 9861, 60);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 60 }); }).immediate();
+    close28(t);
+    db.prepare('DELETE FROM f_iroha_stocking_records WHERE batch_id = ?').run(bid);
+    // ⚠カードの CHECK が「終了なら終了時刻あり」を守っているので、終了時刻の無い終了カードは作れない。
+    //   そこで、いつ入れたか分からないぶんを直接足して、**移行した日を入れない**ことを確かめる
+    db.transaction(() => { B.recordStocking(db, bid, { at: null, note: '(いつ入れたかは記録がありません)' }); }).immediate();
+    const r = B.stockingOfTask(db, t)[0];
+    ok(r && r.stocked_at == null && r.created_at,
+      '⭐いつ入れたか分からないぶんは、その日の日付を入れない (空のまま。記録した時刻は created_at に残る)');
+    ok(/いつ入れたかは記録がありません/.test(r.note || ''), 'その旨をメモに残す');
+    // 終了時刻があるカードは、その時刻がそのまま入る
+    const t2 = mk28('st-12', 9862, 60);
+    const bid2 = B.listBatchesOfTask(db, t2)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid2, { goodQty: 60 }); }).immediate();
+    close28(t2);
+    const kept = TD.getTask(t2).closed_at;
+    db.prepare('DELETE FROM f_iroha_stocking_records WHERE batch_id = ?').run(bid2);
+    B.backfillStocking(db);
+    const r2 = B.stockingOfTask(db, t2)[0];
+    ok(r2.stocked_at === kept && r2.stocked_by === TD.getTask(t2).closed_by,
+      '終了の記録があるカードは、その日時と人がそのまま入る');
+  }
+
   // ── 箱ラベルは「どのまとまりのぶんを刷ったか」を残す ──
   const pj = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_print_jobs'").get().sql;
   ok(/batch_id/.test(pj), '箱ラベルの印刷ジョブに まとまり の列がある (要件 §AB-12)');
@@ -5081,8 +5151,12 @@ console.log('\n[28] 棚に入れた記録 — 作業のまとまりを割って�
   ok(/function stockingCardHtml\(c\)/.test(html) && /棚に入れた記録/.test(html)
     && /stockingCardHtml\(c\) \+/.test(html),
     '詳細に「棚に入れた記録」を出す');
-  ok(/r\.qty == null \? '数は残していません'/.test(html),
-    '数えずに入れたぶんは「数は残していません」と出す (0 と混ぜない)');
+  ok(/r\.qty == null \? '数は残していません'/.test(html)
+    && /'いつ入れたかの記録なし'/.test(html),
+    '数えずに入れたぶんは「数は残していません」、日時が無いぶんは「記録なし」と出す (0 や今日と混ぜない)');
+  ok(/'数が分かるぶん ' \+ n \+ ' 個 ・ 数の記録がないもの ' \+ unknown \+ '回 \(ぜんぶで '/.test(html)
+    && /unknown === 0 \? '合計 ' \+ n/.test(html),
+    '⭐数の分からない行があるなら「合計」と言い切らない (200 個 + 数不明 を「合計 200 個」と書かない)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
