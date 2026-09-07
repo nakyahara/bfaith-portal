@@ -400,9 +400,12 @@ export const JOBS_REGISTRY = [
     where: 'miniPC TaskScheduler [Logizard-NyukaCSV] の2ステップ目 → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat',
     schedule: '毎日 00:20 (入荷受付CSV の直後。--once-per-day で1日1回だけ実行し、08:40 / 11:45 の回は何もしない)',
     // 2026-09-07: 入荷受付CSV に 00:20 のトリガーを足したので、1日1回のこちらも深夜の回で済むようになった。
-    // 深夜が落ちても 08:40 の回が (その日まだ取っていないので) 拾う → 猶予12h でどちらでも緑になる
+    // 深夜が落ちても 08:40 の回が (その日まだ取っていないので) 拾う → 猶予12h でどちらでも緑になる。
+    // 🚨 anchor は **タスクの起動時刻 (00:20) と同じかそれより前**にすること (Codex #1231 追加分 High)。
+    //    dead-man は「anchor 以降の ok」しか当日ぶんに数えないので、anchor を 00:30 にすると
+    //    00:25 に終わった正常な回が数えられず、速く終わった日ほど誤報になる
     anchor_hour_jst: 0,
-    anchor_minute_jst: 30,
+    anchor_minute_jst: 20,
     grace_hours: 12,
     lifecycle: 'permanent',
     runbook: 'C:\\tools\\logizard-automation\\logs\\scheduled.log の [shohin-csv] を確認 '
