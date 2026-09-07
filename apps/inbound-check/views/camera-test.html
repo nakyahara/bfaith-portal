@@ -99,8 +99,13 @@
   /** 10秒観察したあとの言い方。🚨「端末側」「アプリ側」と断定しない */
   function finish(track) {
     var last = track ? track.readyState + (track.muted ? '/muted' : '') : '不明';
+    // 🚨 **最後まで進み続けていたか**を見る (Codex #1242 R2)。最初だけ進んで途中で固まったものを
+    //    「再現しませんでした」にすると、いま調べたい現象を取り逃がす
+    var lastAt = (lastProgressAt !== null && grantedAt !== null) ? Math.round(lastProgressAt - grantedAt) : null;
+    var stalledFor = lastProgressAt === null ? null : Math.round(now() - lastProgressAt);
+    var stillGoing = stalledFor !== null && stalledFor <= 1500;   // 観察の終わりまで進んでいた
     log('— 10秒たちました — 最終状態=' + last + ' 進み=' + progress + '回'
-      + (lastProgressAt !== null ? ' 最後に進んだのは ' + since(grantedAt === null ? t0 : grantedAt) : ''));
+      + (lastAt !== null ? ' 最後に進んだのは取得から ' + lastAt + 'ms (そこから ' + stalledFor + 'ms 止まっています)' : ''));
     // 🚨 途中で終了した / 止まったものを「正常」と言わない。終了と最終状態を先に見る
     if (sawEnded || (track && track.readyState === 'ended')) {
       say('ng', '<b>カメラは開けましたが、'
@@ -109,14 +114,15 @@
         + '<br>読み取り画面と<b>同じ開き方・同じカメラ</b>でもう一度試して、結果を比べてください。');
       return;
     }
-    if (progress >= 3 && !sawMute) {
-      say('ok', '<b>今回の条件では再現しませんでした</b> (映像の進みを ' + progress + ' 回確認)。'
+    if (progress >= 3 && !sawMute && stillGoing) {
+      say('ok', '<b>今回の条件では再現しませんでした</b> (映像の進みを ' + progress + ' 回確認し、最後まで進み続けました)。'
         + '<br>⚠ これは「この開き方・このカメラ・この条件で動いた」というだけです。'
         + '読み取り画面と同じ開き方でも同じ結果になるかを確かめてください。');
       return;
     }
     if (progress > 0) {
       say('ng', '<b>映像は届きましたが、途中で止まりました</b> (進み ' + progress + ' 回'
+        + (lastAt !== null ? '・最後に進んだのは取得から ' + lastAt + 'ms で、そこから ' + stalledFor + 'ms 止まっています' : '')
         + (sawMute ? '・mute あり' : '') + ')。'
         + '<br>画面を2分割していないか、ページを拡大していないか、他のアプリがカメラを使っていないかを確かめてください。');
       return;

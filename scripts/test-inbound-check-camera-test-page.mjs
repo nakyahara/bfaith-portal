@@ -92,6 +92,12 @@ ok(finish.indexOf('sawEnded') < finish.indexOf('progress >= 3'),
   '終了の判定が「映像が進んだ」の判定より先に来る');
 ok(/今回の条件では再現しませんでした/.test(finish) && !/端末は問題なし/.test(finish),
   '🚨 「端末側」「アプリ側」と断定しない (この1回で分かるのは今回の条件だけ)');
+// 🚨 最初だけ進んで途中で固まったものを「再現しませんでした」にしない (Codex #1242 R2)
+ok(/var stillGoing = stalledFor !== null && stalledFor <= 1500/.test(finish)
+  && /progress >= 3 && !sawMute && stillGoing/.test(finish),
+  '🚨 観察の終わりまで進み続けたことまで確かめてから「再現しませんでした」と言う');
+ok(/Math\.round\(lastProgressAt - grantedAt\)/.test(finish),
+  '「最後に進んだのは」は実際の最終進行時刻から出す (判定時点までの時間ではない)');
 ok(/同じ開き方/.test(html), '同じ開き方・同じカメラで比べるよう案内する');
 
 // ─── 6. 出す情報 ───────────────────────────────────────────────────────────
