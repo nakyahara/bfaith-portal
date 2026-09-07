@@ -365,7 +365,10 @@ export const JOBS_REGISTRY = [
       + ' (管理画面から手動アップロードで凌げるので P2)。'
       + '⭐0件の日は正常 (受付済なし = 全部検品済み)。ヘッダだけの CSV を Drive まで送り、一覧を空にする',
     where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\tools\logizard-automation\run-nyuka-csv-scheduled.bat',
-    schedule: '毎日 08:40 / 11:45',
+    schedule: '毎日 00:20 / 08:40 / 11:45',
+    // 🚨 anchor は **08:40 のまま**にする (2026-09-07 に 00:20 を足したときの判断)。
+    //    00:20 に寄せると「深夜が成功していれば朝の 08:40 が壊れていても緑」になり、
+    //    現場が使う時間帯の故障を隠してしまう。深夜の回は「あれば嬉しい」ぶんで、正は朝。
     anchor_hour_jst: 8,
     anchor_minute_jst: 40,
     grace_hours: 6,
@@ -378,7 +381,8 @@ export const JOBS_REGISTRY = [
       + '朝の定時が壊れていても気づけなくなるため。ここが鳴ったら「定時が止まった」と読んでよい。'
       + 'env = LOGIZARD_NYUKA_CSV_OUT / LOGIZARD_NYUKA_CSV_RCLONE_DEST (miniPC の .env)。'
       + '⚠ロックは他のロジザード自動化と共有 (logizard-session.lock)。**時刻はどれとも重ならないように選んである**: '
-      + '値札CSV 08:30 / 緊急補充 08:50 / 在庫CSV 毎時00分 → この処理は 08:40 と 11:45。'
+      + '値札CSV 08:30 / 緊急補充 08:50 / 在庫CSV 毎時00分 → この処理は 00:20 と 08:40 と 11:45 '
+      + '(00:20 = 在庫CSV 00:00 の20分後。日付が変わってすぐ取り直し、朝いちばんの一覧を当日ぶんにする 2026-09-07 追加)。'
       + '保険として bat が最大10分ロックの解放を待ってから node を起動する (node の acquireLock は失敗時に即終了するため)。'
       + '異常終了で残ったロックは PID の死亡を確認して削除。'
       + '画面採取の正本 = AI_reference『ロジザード作業自動化\入荷状況照会CSV_画面採取_20260901.md』',
@@ -394,9 +398,11 @@ export const JOBS_REGISTRY = [
       + '在庫データからの推定 (在庫ゼロの商品は推定できない) と手動設定に頼ることになる。'
       + '⭐止まっても現場は止まらない (推定と手動で動き続ける) ので P3',
     where: 'miniPC TaskScheduler [Logizard-NyukaCSV] の2ステップ目 → C:\\tools\\logizard-automation\\run-nyuka-csv-scheduled.bat',
-    schedule: '毎日 08:40 (入荷受付CSV の直後。--once-per-day で1日1回だけ実行し、11:45 の回は何もしない)',
-    anchor_hour_jst: 8,
-    anchor_minute_jst: 45,
+    schedule: '毎日 00:20 (入荷受付CSV の直後。--once-per-day で1日1回だけ実行し、08:40 / 11:45 の回は何もしない)',
+    // 2026-09-07: 入荷受付CSV に 00:20 のトリガーを足したので、1日1回のこちらも深夜の回で済むようになった。
+    // 深夜が落ちても 08:40 の回が (その日まだ取っていないので) 拾う → 猶予12h でどちらでも緑になる
+    anchor_hour_jst: 0,
+    anchor_minute_jst: 30,
     grace_hours: 12,
     lifecycle: 'permanent',
     runbook: 'C:\\tools\\logizard-automation\\logs\\scheduled.log の [shohin-csv] を確認 '
@@ -406,6 +412,8 @@ export const JOBS_REGISTRY = [
       + 'env = LOGIZARD_SHOHIN_CSV_OUT / LOGIZARD_SHOHIN_CSV_RCLONE_DEST (miniPC の .env)。'
       + '⚠ロックは他のロジザード自動化と共有 (logizard-session.lock)。入荷受付CSV と同じ bat の中で'
       + '順番に走るので、この2つが競合することはない。'
+      + '⭐2026-09-07 に深夜 00:20 のトリガーが増えたので、通常はそこで取り終わる '
+      + '(重い 5000行/1.7MB の取得が朝のピークから外れた)。深夜が落ちた日は 08:40 の回が拾う。'
       + '⭐「有効期限区分」の値の内訳を毎回ログに出す。ロジザード側の表記が変わったら気付けるようにしてある',
   },
   {
