@@ -99,10 +99,22 @@ active バッチの work_date < 今日 (JST)
 - **数を直接コピーしない**。append-only を守るために繰越イベントを1件積む
   (数量パネルの「数えた記録」に `前日から引き継ぎ … 個 (以前の確認から)` として出て、人が打ち消せる)
 - 未来日には進めない (`work_date >= today` なら何もしない = 時計ずれの保険)
+- トランザクションは **IMMEDIATE** (読んでから書くので、DEFERRED だと別プロセスと競合したとき SQLITE_BUSY)。
+  既にトランザクションの中 (finalizeLine 等) から呼ばれたときは savepoint になるので `tx()` を使う
 - `day_stale` / `stale_work_date` は**繰り越しが動かなかったときだけの保険**として残してある
   (文言も「取りに行くを押してください」に変更)。通常は出ない
-- 🚨 **繰り越しは「取込が来ている」ことの保証ではない**。取得が壊れていても前日の一覧で作業は続くので、
-  取込が来ていないことは iPad と管理画面に必ず出す (jobs-monitor の `logizard-nyuka-csv` dead-man は別途の見張り)
+- 🚨 **繰り越しは「取込が来ている」ことの保証ではない**。取得が壊れていても前日の一覧で作業は続いてしまうので、
+  **「新しい受付が増えていないだけ」(正常) と「そもそも取りに行けていない」(要調査) を言い分ける** (Codex #1231 R1)。
+  同じ表示にすると、取得が止まった日も「新しい受付はありません」と出て静かに気づけなくなる
+  - `last_verified_at` = **共有ドライブの CSV を読んで、中身が active と同じだと確かめた時刻**。
+    `importCsv` が `duplicate_file` を返すとき、その相手が active なら書く (`last_verified_source_at` = 読んだ CSV の更新時刻)。
+    過去バッチと同じ内容の再アップロードでは書かない
+  - 判定は `carryStatus(batch)` に集約 (iPad の `/api/state` と管理画面が同じ関数を使う)
+  - 今日読めている → 🔵「9/05 の一覧を引き継いで作業中。本日 10:12 に確認しましたが**新しい入荷受付は増えていません**」
+  - 今日読めていない → 🟡「**本日はまだ一覧を取りに行けていません**」+ 管理画面には miniPC / rclone を見る案内
+  - jobs-monitor の `logizard-nyuka-csv` dead-man は引き続き別途の見張り (miniPC 側が動いたかは Render からは分からない)
+- 🚨 **管理画面 (`GET /admin`) でも繰り越す**。iPad が1台も開かれていない朝に管理画面だけ見ると、
+  繰り越しが走っておらず案内が出ない (Codex #1231 R1)
 - テスト: `node scripts/test-inbound-check.mjs` [10] / `scripts/test-inbound-check-render.mjs` [11] /
   `scripts/test-inbound-check-pending-expiry.mjs` [5]
 

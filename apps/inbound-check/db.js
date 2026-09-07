@@ -344,6 +344,11 @@ export function createTables(db = getMirrorDB()) {
   // これがある = 「本日の取込はまだ来ていない (前日の一覧を引き継いで作業中)」を画面に出す合図
   addCol(db, 'f_inbound_check_batches', 'carried_from', 'TEXT');
   addCol(db, 'f_inbound_check_batches', 'carried_at', 'TEXT');
+  // 🚨「中身が変わっていない」(正常) と「そもそも取りに行けていない」(要調査) を**別の事実として**持つ。
+  //   last_verified_at        = 共有ドライブの CSV を読んで、中身がこのバッチと同じだと確かめた時刻 (UTC)
+  //   last_verified_source_at = そのとき読んだ CSV の更新時刻 (Drive の modifiedTime)
+  addCol(db, 'f_inbound_check_batches', 'last_verified_at', 'TEXT');
+  addCol(db, 'f_inbound_check_batches', 'last_verified_source_at', 'TEXT');
 
   migrateQuantity(db);
 }
@@ -838,7 +843,9 @@ export function rollOverWorkDate(db = getDB(), now = new Date()) {
       WHERE id = ?`).run(today, at, b.id);
     return { from: b.work_date, to: today, batchId: b.id, lines, qty };
   });
-  const r = tx();
+  // 読んでから書くので IMMEDIATE (DEFERRED だと別プロセスと競合したとき SQLITE_BUSY になる)。
+  // 既にトランザクションの中 (finalizeLine 等) なら savepoint になるので immediate は使えない
+  const r = db.inTransaction ? tx() : tx.immediate();
   if (r) {
     logImport(db, { actor: 'system', source: 'rollover', fileName: null, ok: true, batchId: r.batchId,
       message: `${r.from} の一覧を ${r.to} へ引き継ぎました` + (r.lines ? ` (数えた数 ${r.lines}行 / ${r.qty}個を繰越)` : '') });
@@ -876,9 +883,16 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
   }
 
   const dupResult = dup => {
+    // ⭐**「中身が同じ」は取得が生きている証拠**なので、active バッチに確認時刻を残す (Codex #1231 R1 中)。
+    //   これが今日なら「新しい入荷受付が無いだけ」= 正常。無ければ「取りに行けていない」= 要調査。
+    //   区別しないと、取得が止まった日も「新しい受付はありません」と出て静かに気づけなくなる
+    if (dup.status === 'active') {
+      db.prepare('UPDATE f_inbound_check_batches SET last_verified_at = ?, last_verified_source_at = ? WHERE id = ?')
+        .run(utcNow(), genAt, dup.id);
+    }
     const message = `同じ内容のCSVは取込済みです (バッチ#${dup.id}、${dup.imported_at})`;
     logImport(db, { actor, source, fileName, ok: false, batchId: dup.id, message });
-    return { ok: false, error: 'duplicate_file', message, batch: dup };
+    return { ok: false, error: 'duplicate_file', message, batch: getBatch(dup.id) || dup };
   };
 
   // ⭐**取込の可否にかかわらず、先に業務日を今日へ繰り越す** (トランザクションの外で確定させる)。
@@ -1403,6 +1417,25 @@ export function productImageMap(productIds) {
 }
 
 /**
+ * 引き継ぎ中かどうかと、**本日ぶんの取得を確かめられたか**。iPad と管理画面で同じ判定を使う。
+ *
+ * 🚨「新しい入荷受付が増えていないので CSV の中身が同じ」(正常) と「そもそも取りに行けていない」
+ *   (miniPC / rclone / Drive の故障 = 要調査) は**別の事実**。同じ表示にすると、取得が止まった日も
+ *   「新しい受付はありません」と出て静かに気づけなくなる (Codex #1231 R1 中)。
+ *
+ * @returns {null | {from, checkedAt, checkedToday}} 引き継いでいなければ null (= 本日ぶんを取り込めている)
+ */
+export function carryStatus(batch) {
+  if (!batch || !batch.carried_from || batch.carried_from === batch.work_date) return null;
+  const at = batch.last_verified_at || null;
+  return {
+    from: batch.carried_from,
+    checkedAt: at,
+    checkedToday: !!(at && workDateJst(new Date(at)) === workDateJst()),
+  };
+}
+
+/**
  * iPad 一覧の状態。active バッチが無ければ { batch:null, slips:[], lines:[] }
  * 各行 = 明細 + 状態 + 補助情報 + 前回確認 (参考)
  */
@@ -1465,10 +1498,13 @@ export function getState() {
     WHERE d.destination = 'iroha' AND d.cancelled_at IS NULL`).get(batch.id);
   // 繰り越したのに work_date が今日でない = 繰り越しが動かなかった時だけの保険 (通常は起きない)
   const dayStale = !!(batch.work_date && batch.work_date !== workDateJst());
-  // 本日の取込がまだ来ておらず、前日の一覧を引き継いで作業している (作業はできる。取込が来ていないことは伝える)
-  const carriedFrom = batch.carried_from && batch.carried_from !== batch.work_date ? batch.carried_from : null;
+  // 前日の一覧を引き継いで作業している (作業はできる。何が起きているかは carryStatus が言い分ける)
+  const carry = carryStatus(batch);
   return {
-    batch, slips, lines, day_stale: dayStale, carried_from: carriedFrom, field_options: fieldOptions(),
+    batch, slips, lines, day_stale: dayStale, field_options: fieldOptions(),
+    carried_from: carry ? carry.from : null,
+    import_checked_at: carry ? carry.checkedAt : null,
+    import_checked_today: carry ? carry.checkedToday : true,
     totals: { lines: lines.length, checked, partial, undecided, toIroha: ir ? ir.c : 0, toIrohaQty: ir ? Number(ir.q) : 0 },
   };
 }

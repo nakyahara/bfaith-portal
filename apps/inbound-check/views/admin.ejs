@@ -25,6 +25,8 @@
     .ok-banner { background: #d3f9d8; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 0.95em; }
     /* 本日の取込が来ていない日のお知らせ。作業は止まっていないので警告色にしない */
     p.hint.carried { background: #e7f5ff; color: #1864ab; border-radius: 6px; padding: 8px 10px; }
+    /* 取りに行けていない日だけ警告色 (中身が変わっていないだけの日は正常なので青のまま) */
+    p.hint.carried.ng-carried { background: #fff3bf; color: #7a5c00; }
     .ng { color: #c92a2a; }
     code { background: #e9ecef; padding: 1px 5px; border-radius: 4px; }
   </style>
@@ -158,10 +160,17 @@
         <p>バッチ #<%= active.id %> ・ CSV生成 <span data-jst="<%= active.csv_generated_at %>"></span> ・ 取込 <span data-jst="<%= active.imported_at %>"></span>
           (<%= active.source === 'manual_upload' ? '手動' : active.source %><%= active.imported_by ? ' / ' + active.imported_by : '' %>) ・
           <%= active.slip_count %> 伝票 / <%= active.row_count %> 行 ・ ファイル <%= active.file_name || '-' %></p>
-        <% if (active.carried_from && active.carried_from !== active.work_date) { %>
-          <p class="hint carried">📅 <b>本日 (<%= active.work_date %>) の取込はまだ来ていません</b>。<%= active.carried_from %> に取り込んだ一覧を引き継いで作業中です
-            (前日の ✅ と数えた数は残っています)。ロジザードに新しい入荷受付が1件も増えていない日は CSV の中身が変わらないため、これが通常の状態です。
-            増えたはずなのに出ないときは「🚚 いま取りに行く」を押してください</p>
+        <% if (typeof carry !== 'undefined' && carry) { %>
+          <p class="hint carried<%= carry.checkedToday ? '' : ' ng-carried' %>">📅 <b><%= carry.from %> に取り込んだ一覧を引き継いで作業中</b>です
+            (本日 = <%= active.work_date %>。前日の ✅ と数えた数は残っています)。
+            <% if (carry.checkedToday) { %>
+              本日も共有ドライブの CSV を確認していますが (<span data-jst="<%= carry.checkedAt %>"></span>)、<b>中身が変わっていません</b>
+              = ロジザードに新しい入荷受付が1件も増えていない日です。これは通常の状態です
+            <% } else { %>
+              <b>⚠本日はまだ共有ドライブから一覧を取りに行けていません</b><% if (!carry.checkedAt) { %> (確認できた記録がありません)<% } else { %> (最後に確認できたのは <span data-jst="<%= carry.checkedAt %>"></span>)<% } %>。
+              miniPC の定時取得 (08:40 / 11:45) と rclone 転送、下の取込履歴に失敗が並んでいないかを確認してください
+            <% } %>
+          </p>
         <% } %>
       <% } else { %>
         <p class="ng">まだ取り込まれていません</p>

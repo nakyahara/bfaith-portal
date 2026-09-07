@@ -584,6 +584,25 @@ console.log('\n[10] 業務日の繰り越し (前日のやり残しを翌日も�
   ok(!dup.ok && dup.error === 'duplicate_file', '同じ内容の CSV は取込拒否のまま');
   ok(getActiveBatch().work_date === workDateJst(), '取込が拒否されても業務日は今日に進む (入力ロックが残らない)');
   ok(getState().lines.find(l => l.line_key === 'AR20|1|1').found_qty === 10, '拒否された取込で数が消えない');
+
+  // 🚨「中身が変わっていないだけ」(正常) と「取りに行けていない」(要調査) を言い分ける (Codex #1231 R1 中)
+  ok(getActiveBatch().last_verified_at && getActiveBatch().last_verified_source_at === '2027-02-02T00:00:00.000Z',
+    '同じ内容でも「読めた」ことは記録する (last_verified_at / 読んだ CSV の更新時刻)');
+  const stv = getState();
+  ok(stv.carried_from && stv.import_checked_today === true && stv.import_checked_at,
+    '本日読めていれば import_checked_today = true (画面は「新しい受付が増えていません」と出す)');
+  db.prepare('UPDATE f_inbound_check_batches SET last_verified_at = NULL WHERE id = ?').run(bid);
+  ok(getState().import_checked_today === false,
+    '本日一度も読めていなければ false (画面は「取りに行けていません」= 取得が止まっている疑い)');
+  db.prepare("UPDATE f_inbound_check_batches SET last_verified_at = date('now', '-3 day') || 'T00:00:00.000Z' WHERE id = ?").run(bid);
+  ok(getState().import_checked_today === false, '古い確認時刻は「本日読めた」に数えない');
+  // superseded バッチへの重複は確認時刻を書かない (過去の再アップロードで active の状態を動かさない)
+  const bx = importCsv(makeCsv([row('AR21', 1, 'CARRY-X', 2)]), { fileName: 'x.csv', generatedAt: '2027-02-04T00:00:00Z' });
+  ok(bx.ok && getActiveBatch().last_verified_at == null, '前提: 別の内容を取り込む (carry1 は superseded・確認時刻なし)');
+  const dupOld = importCsv(makeCsv([row('AR20', 1, 'CARRY-A', 10), row('AR20', 2, 'CARRY-B', 4)]),
+    { fileName: 'carry1.csv', generatedAt: '2027-02-05T00:00:00Z' });
+  ok(!dupOld.ok && dupOld.error === 'duplicate_file' && getActiveBatch().last_verified_at == null,
+    '過去バッチと同じ内容の再アップロードでは active の確認時刻を動かさない');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
