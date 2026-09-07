@@ -336,6 +336,24 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
     ok(D.listFacilityLinks(true).find((l) => l.id === l0.id).last_seen_at != null, 'GET なら書く');
   }
 
+  // ⭐繰り返し叩かれても、社内の画面まで巻き込まれない (Codex R2 中2)
+  {
+    const fresh = await post('/admin/facility-links', { facility_code: 'workcenter', label: '回数の上限テスト' });
+    let limited = 0;
+    let served = 0;
+    for (let i = 0; i < 80; i++) {
+      const r = await fetch(`http://${HOST}${fresh.json.url}/api/view`, { headers: { Host: HOST } });
+      if (r.status === 429) limited++; else if (r.status === 200) served++;
+    }
+    ok(served >= 30 && limited > 0, '⭐ふつうに見るぶんは通り、叩きすぎると 429 で断る (' + served + ' 回通過 / ' + limited + ' 回拒否)');
+    // ⭐社内の画面は止まらない
+    ok((await get('/api/state')).status === 200, '⭐外から叩かれている間も、社内の一覧はふつうに開ける');
+    // 別のトークンは巻き添えにしない
+    const other = await post('/admin/facility-links', { facility_code: 'rashinban', label: '別のリンク' });
+    ok((await fetch(`http://${HOST}${other.json.url}/api/view`, { headers: { Host: HOST } })).status === 200,
+      '⭐別の施設のリンクは巻き添えにしない (トークンごとに数える)');
+  }
+
   // でたらめ・失効したトークン
   const bad = await fetch(`http://${HOST}/apps/iroha-work/f/${'x'.repeat(43)}`, { headers: { Host: HOST } });
   ok(bad.status === 404, 'でたらめなトークンは 404');

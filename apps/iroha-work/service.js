@@ -16,7 +16,7 @@
 import { buildEnrichContext } from '../inbound-check/notion-sync.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
-import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask, finishedSessionsOfTask } from './db.js';
+import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask, finishedSessionsOfTask, listWorkOptions } from './db.js';
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
@@ -426,6 +426,11 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
   return { cards, today };
 }
 
+// ⭐外部に出す画面の上限 (Codex R2 中2)。上限の無い読み取りを、ログインのいらない口に置かない
+const FACILITY_ROWS_MAX = 300;   // 1 回に出す預けの数 (おあずかり中 + 直近の受け取りずみ)
+const SETTLED_SHOWN = 30;        // そのうち「受け取りずみ」は直近これだけ
+const RETURNS_SHOWN = 20;        // 1 つの預けにつき返却の明細
+
 /** まとまりの作業状態 → 画面の言葉 (カードの「終了 · 棚入完了」と読み方をそろえる) */
 const BATCH_STATUS_LABEL = { not_started: '未着手', in_progress: '作業中', ready_for_stocking: '棚入待ち', done: '終了 · 棚入完了' };
 
@@ -511,6 +516,14 @@ export function expandBatchRows(cards, { forPlan = false } = {}) {
  */
 export function buildFacilityView(facilityCode) {
   const db = getDB();
+  // ⭐**出す値そのものを確かめる** (Codex R2 中1)。項目名を絞っても、値に何が入っているかは保証できない
+  //   ("20L（山田さん担当）" のような書き方や、入れ子の JSON が入りうる)。
+  //   保管箱・資材セットは**いま登録されている選択肢に一致するものだけ**出す。合わなければ出さない
+  const okContainer = new Set(listWorkOptions('container', true).map((o) => o.code));
+  const okMaterial = new Set(listWorkOptions('material', true).map((o) => o.code));
+  const pickOption = (v, allow) => (typeof v === 'string' && allow.has(v) ? v : null);
+  // 数は**整数だけ**。文字列・小数・入れ子は出さない (0 で代用もしない)
+  const pickInt = (v) => (Number.isSafeInteger(v) && v > 0 && v <= 1_000_000 ? v : null);
   const fac = db.prepare('SELECT code, name FROM f_iroha_facilities WHERE code = ?').get(facilityCode);
   if (!fac) return null;
   // その施設あての預けだけ。取消したものは出さない (無かったことになったぶん)
@@ -522,9 +535,15 @@ export function buildFacilityView(facilityCode) {
     JOIN f_iroha_task_batches b ON b.id = c.batch_id
     JOIN f_iroha_tasks t ON t.id = b.task_id
     WHERE c.facility_code = ? AND c.state <> 'cancelled'
-    ORDER BY (c.state = 'settled'), c.due_date IS NULL, c.due_date, c.id DESC`).all(facilityCode);
-  const returnsOf = db.prepare(`SELECT returned_qty, good_qty, loss_qty, returned_at, note
-    FROM f_iroha_consignment_returns WHERE consignment_id = ? ORDER BY id`);
+      -- ⭐終わったぶん (受け取りずみ) は**直近だけ**。年が経つほど 1 回の応答が重くなるのを防ぐ (Codex R2 中2)
+      AND (c.state <> 'settled' OR c.id >= COALESCE(
+        (SELECT MIN(id) FROM (SELECT id FROM f_iroha_consignments
+          WHERE facility_code = ? AND state = 'settled' ORDER BY id DESC LIMIT ?)), 0))
+    ORDER BY (c.state = 'settled'), c.due_date IS NULL, c.due_date, c.id DESC
+    LIMIT ?`).all(facilityCode, facilityCode, SETTLED_SHOWN, FACILITY_ROWS_MAX);
+  // 返却の明細も上限つき (1 回の預けに何十回も返ってくることは無いが、上限が無い読み取りを外に置かない)
+  const returnsOf = db.prepare(`SELECT returned_qty, returned_at
+    FROM f_iroha_consignment_returns WHERE consignment_id = ? ORDER BY id LIMIT ${RETURNS_SHOWN}`);
   const today = jstToday();
   const items = rows.map((r) => {
     // 作業のしかた = 作業仕様。カード作成時のスナップショットを使う (渡した時点の指示 — §AB-13)
@@ -547,12 +566,12 @@ export function buildFacilityView(facilityCode) {
       overdue: !!(r.due_date && r.state === 'handed' && r.due_date < today),
       handed_at: r.handed_at || null,
       settled_at: r.settled_at || null,
-      // ⭐作業のしかた。**決まった形の項目だけ** (コード・数)。自由記述の「備考」は出さない
+      // ⭐作業のしかた。**決まった形の項目だけ**、しかも**値まで確かめて**出す。自由記述の「備考」は出さない
       work: snap ? {
-        material_code: snap.material_code || null,          // 資材セットID
-        storage_container: snap.storage_container || null,  // 保管箱
-        units_per_container: snap.units_per_container ?? null,
-        process_count: snap.process_count ?? null,
+        material_code: pickOption(snap.material_code, okMaterial),        // 資材セットID (登録ずみのものだけ)
+        storage_container: pickOption(snap.storage_container, okContainer), // 保管箱 (同上)
+        units_per_container: pickInt(snap.units_per_container),
+        process_count: pickInt(snap.process_count),
       } : null,
       // 返却の記録 (いつ何個持ってきたか)。⭐記録した人の名前も、いろはが書いたひとことも出さない
       returns: back.map((x) => ({ qty: x.returned_qty, at: x.returned_at })),

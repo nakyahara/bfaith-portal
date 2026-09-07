@@ -6467,10 +6467,30 @@ console.log('\n[32] 外部施設の専用 URL (見るだけ。§AB-11 の 6)');
       '⭐作業仕様の「備考」(自由記述) を外に出さない — 個人名や内部の申し送りが書かれうる');
     ok(!json.includes('田中さん') && !json.includes('さとう') && !json.includes('たにがわ'),
       '⭐返却の「ひとこと」(自由記述) も外に出さない');
+    // 選択肢として登録してあるものは出す (作業に要る)
+    D.addWorkOption({ kind: 'container', code: '20L', actor: 'test' });
+    D.addWorkOption({ kind: 'material', code: 'D-8', actor: 'test' });
     const it5 = SV.buildFacilityView('workcenter').items.find((x) => x.id === cg.consignment.id);
-    ok(it5.work && it5.work.storage_container === '20L' && it5.work.units_per_container === 70,
+    ok(it5.work && it5.work.storage_container === '20L' && it5.work.units_per_container === 70
+      && it5.work.material_code === 'D-8',
       '決まった形の項目 (保管箱・入数・資材セット) は出す — 作業に要る');
     ok(!('note' in it5.work), '備考の欄そのものを持たせない');
+
+    // ⭐値そのものも確かめる (項目名を絞るだけでは足りない — Codex R2 中1)
+    getDB().prepare("UPDATE f_iroha_tasks SET master_snapshot = ? WHERE id = ?")
+      .run(JSON.stringify({
+        storage_container: '20L（山田さん担当）',                       // 選択肢に無い書き足し
+        material_code: { code: 'D-8', note: '利用者さとうさん用' },     // 入れ子
+        units_per_container: { value: 70, note: '田中さんに聞く' },     // 数のふりをした入れ子
+        process_count: '3 (やまだ)',                                    // 数のふりをした文字列
+      }), t);
+    const it6 = SV.buildFacilityView('workcenter').items.find((x) => x.id === cg.consignment.id);
+    const w6 = JSON.stringify(it6.work);
+    ok(!w6.includes('山田') && !w6.includes('さとう') && !w6.includes('田中') && !w6.includes('やまだ'),
+      '⭐選択肢に無い値・入れ子・数のふりをした文字列は出さない (書き足された個人名を通さない)');
+    ok(it6.work.storage_container === null && it6.work.material_code === null
+      && it6.work.units_per_container === null && it6.work.process_count === null,
+      '合わない値は「無い」として出す (見せられるものだけ見せる)');
     ok(it5.returns.length === 1 && Object.keys(it5.returns[0]).sort().join(',') === 'at,qty',
       '⭐返却の記録は「いつ・何個」だけ');
   }

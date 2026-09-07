@@ -2153,10 +2153,33 @@ router.get('/admin/sessions/search.csv', requireAdmin, api((req, res) => {
  *   - **書き込みの口を作らない** (GET だけ。返却の確定はいろは側 — 要件 §AB-7)
  *   - 中身はその施設に預けたぶんだけ・個人情報なし (buildFacilityView)
  */
+/**
+ * ⭐ログインのいらない口に、**回数の上限**を置く (Codex R2 中2)。
+ * 同じ Node のプロセスで社内の画面も動いているので、外から繰り返し叩かれて中の作業を遅らせない。
+ * トークン単位で数える (URL を知っている人ごと)。素朴なメモリ内のカウンタで十分 —
+ * 目的は「壊れるほど叩かれない」ことで、厳密な公平さではない
+ */
+const FL_WINDOW_MS = 60_000;
+const FL_MAX_PER_WINDOW = 60;      // 1 分に 60 回 (人が見るぶんには十分。画面は 1 回開くと 2 回)
+const flHits = new Map();          // key → { count, until }
+function facilityRateOk(key) {
+  const now = Date.now();
+  const cur = flHits.get(key);
+  if (!cur || cur.until <= now) { flHits.set(key, { count: 1, until: now + FL_WINDOW_MS }); }
+  else if (++cur.count > FL_MAX_PER_WINDOW) return false;
+  // 古いものを捨てる (放っておくと際限なく増える)。多くないので全部見てよい
+  if (flHits.size > 500) for (const [k, v] of flHits) if (v.until <= now) flHits.delete(k);
+  return true;
+}
+
 function facilityLinkGate(req, res, next) {
   res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
   res.set('Referrer-Policy', 'no-referrer');
   res.set('Cache-Control', 'no-store');
+  if (!facilityRateOk(String(req.params.token || '').slice(0, 64))) {
+    res.set('Retry-After', '60');
+    return res.status(429).json({ ok: false, error: 'too_many', message: '少し時間をおいてから開いてください' });
+  }
   // ⭐HEAD (リンク検査・先読み) では「見に来た日時」を書かない (Codex R1 軽微6)
   const link = verifyFacilityLink(req.params.token, { touch: req.method === 'GET' });
   if (!link) {
