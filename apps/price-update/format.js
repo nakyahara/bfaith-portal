@@ -53,3 +53,18 @@ function toJst(iso, withSeconds) {
   return withSeconds ? ymd + ' ' + hm + ':' + p2(d.getUTCSeconds()) : ymd + ' ' + hm;
 }
 `.trim();
+
+/**
+ * inline `<script>` の中へ JSON を埋めるための文字列化。
+ *
+ * ★`JSON.stringify` だけでは足りない: `<` をそのまま出すので、値に script の終了タグ相当が
+ *   入ると HTML パーサがそこで script を閉じてしまう (product-links #944 と同じ事故)。
+ *   いまのモール名は固定文字列だが、後から DB や設定から取るようになった時に効く。
+ *   U+2028 / U+2029 は JS の行終端としても解釈されるので合わせて逃がす。
+ */
+export function jsonForScript(value) {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}

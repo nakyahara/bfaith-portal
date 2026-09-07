@@ -12,15 +12,19 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import ejs from 'ejs';
-import { toJst, TO_JST_CLIENT_SRC } from './format.js';
+import { toJst, TO_JST_CLIENT_SRC, jsonForScript } from './format.js';
 import { MALL_LABELS } from './mall-capabilities.js';
+import { NO_SENDABLE_MESSAGES } from './record-guard.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 // 画面が使うヘルパー。router.js が render のたびに渡しているものと同じ。
 // ここで一括して足し、テスト側の呼び出しごとに書かなくて済むようにする。
 // ★これで足すので「router が渡し忘れた」事故はテンプレのテストでは出ない → 末尾で別に見る
-const VIEW_HELPERS = { toJst, toJstClientSrc: TO_JST_CLIENT_SRC, mallLabels: MALL_LABELS };
+const VIEW_HELPERS = {
+  toJst, toJstClientSrc: TO_JST_CLIENT_SRC, mallLabels: MALL_LABELS,
+  mallLabelsJson: jsonForScript(MALL_LABELS), noSendableMessagesJson: jsonForScript(NO_SENDABLE_MESSAGES),
+};
 const _ejsRender = ejs.render.bind(ejs);
 ejs.render = (tpl, data, opts) => _ejsRender(tpl, { ...VIEW_HELPERS, ...data }, opts);
 let failed = 0;
@@ -285,6 +289,8 @@ console.log('\n── router が画面へヘルパーを渡している ──')
   ok(router.includes('toJstClientSrc'), 'run.ejs にブラウザ用のソースも渡している');
   // ★モール名も locals で渡す。渡し忘れると画面が 500 になる (上の shim では出ない)
   ok(renders.every((r) => /\bmallLabels\b/.test(r.slice(0, 400))), '★どの画面にも mallLabels を渡している');
+  ok(renders.every((r) => /mallLabelsJson/.test(r.slice(0, 400))), '★画面の JS 用は script 安全な形で渡している');
+  ok(router.includes('noSendableMessagesJson'), '確認の文言もサーバから渡している (画面に写さない)');
   ok(router.includes("from './mall-capabilities.js'"), 'router がモール名の正本を読み込んでいる');
 }
 
@@ -294,6 +300,8 @@ console.log('\n── モール名を画面に写さない (LINEギフトが英�
     const src = fs.readFileSync(path.join(HERE, 'views', name), 'utf8');
     ok(!/rakuten:\s*'楽天'/.test(src), `${name}: モール名の表をテンプレートに写していない`);
     ok(/mallLabels/.test(src), `${name}: サーバから渡されたモール名を使っている`);
+    // ★inline script へ生の JSON.stringify を埋めない (値に script 終了タグが入ると抜けられる)
+    ok(!/JSON\.stringify\(mallLabels\)/.test(src), `${name}: 画面の JS へ生の JSON を埋めていない`);
   }
   // 実物: LINEギフトの行が日本語で出る (2026-09-07 は生の linegift が出ていた)
   const file = path.join(HERE, 'views', 'run.ejs');
@@ -320,15 +328,16 @@ console.log('\n── 送れる行が0のときに「なぜ」を出す ──')
   const run = fs.readFileSync(path.join(HERE, 'views', 'run.ejs'), 'utf8');
   ok(/noTargetReason/.test(run), '★履歴画面がサーバの理由を出している');
   const idx = fs.readFileSync(path.join(HERE, 'views', 'index.ejs'), 'utf8');
-  ok(/manualOnly/.test(idx) && /confirm\(/.test(idx), '★記録の前に「送れる行がありません」を確認する');
-  ok(/allowManualOnly/.test(idx), '確認したことをサーバへ伝えている (画面だけの判断にしない)');
+  ok(/noSendable/.test(idx) && /confirm\(/.test(idx), '★記録の前に「送れる行がありません」を確認する');
+  ok(/allowNoSendable/.test(idx), '確認したことをサーバへ伝えている (画面だけの判断にしない)');
+  ok(/all_blocked/.test(idx), '★⛔ の行だけを選んだ場合も確認する');
   ok(/sum-alert/.test(idx), '記録ボタンのそばにも警告を出している');
   const router2 = fs.readFileSync(path.join(HERE, 'router.js'), 'utf8');
-  ok(/allowManualOnly !== true/.test(router2), '★サーバ側でも同じ関所がある (API 直叩きで抜けられない)');
+  ok(/allowNoSendable !== true/.test(router2), '★サーバ側でも同じ関所がある (API 直叩きで抜けられない)');
   ok(/noTargetReason:/.test(router2), 'executable が理由を返している');
   // ★サーバに止められた時に聞き直せること。道が無いと押しても同じ 400 が返るだけで詰む
-  ok(/'manual_only'/.test(router2) && /reason: e\.reason/.test(router2), 'サーバが断り方の印を返している');
-  ok(/reason !== 'manual_only'/.test(idx), '★画面がサーバの印を見て聞き直す (文言で突き合わせない)');
+  ok(/noSendableReasonOf/.test(router2) && /reason: e\.reason/.test(router2), 'サーバが断り方の印を返している');
+  ok(/NO_SENDABLE_MESSAGES\[e\.reason\]/.test(idx), '★画面がサーバの印を見て聞き直す (文言で突き合わせない)');
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);

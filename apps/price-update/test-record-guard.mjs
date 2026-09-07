@@ -10,7 +10,8 @@
  * 実行: node apps/price-update/test-record-guard.mjs
  */
 import {
-  isAutoRecordedManualRow, chooseRowsToRecord, summarizeRecord, noTargetReasonOf, MANUAL_ONLY_MESSAGE,
+  isAutoRecordedManualRow, chooseRowsToRecord, summarizeRecord,
+  noSendableReasonOf, noSendableMessageOf, NO_SENDABLE_MESSAGES, noTargetReasonOf,
 } from './record-guard.js';
 import { MALL_LABELS, MALL_CAPABILITIES } from './mall-capabilities.js';
 
@@ -36,23 +37,30 @@ console.log('\n── 記録される行の選び分け ──');
   ok(!isAutoRecordedManualRow(row()), '更新できるモールの行は自動では足さない');
 }
 
-console.log('\n── 送れる行が0 (チェック忘れ) を見つける ──');
+console.log('\n── 送れる行が0 を見つける (記録の前に知らせる) ──');
 {
+  const reasonOf = (rows) => noSendableReasonOf(summarizeRecord(rows));
+
   const only = summarizeRecord([row({ newPrice: 1200 }), linegift()]);
   ok(only.chosen.length === 1 && only.manual.length === 1, '売価を入れてもチェックが無ければ、記録は手動行1件だけ');
-  ok(only.manualOnly === true, '★送れる行が0だと分かる (これを記録の前に知らせる)');
+  ok(reasonOf([row({ newPrice: 1200 }), linegift()]) === 'manual_only', '★チェック忘れ = manual_only');
 
   const mixed = summarizeRecord([sendable(), linegift()]);
-  ok(mixed.manualOnly === false, 'チェックした行があれば止めない');
+  ok(reasonOf([sendable(), linegift()]) === null, '送れる行があれば止めない');
   ok(mixed.sendable.length === 1, '送れる行を数えられる');
 
-  // ⛔ で止まっている行は「選んではいる」= 黙って死ぬケースではない (画面に数が出ている)
-  const blocked = summarizeRecord([row({ selected: true, newPrice: 1 }), linegift()]);
-  ok(blocked.manualOnly === false, '⛔ の行を選んでいる場合は manualOnly にしない (画面に理由が出ている)');
-  ok(blocked.sendable.length === 0, 'それでも送れる行は0と数える');
+  // ★⛔ の行だけを選んだ履歴も「1件も送られない」。ここを素通りさせない (Codex R1 高)
+  ok(reasonOf([row({ selected: true, newPrice: 1 }), linegift()]) === 'all_blocked',
+    '★⛔ の行だけを選んだ場合も止める (all_blocked)');
+  ok(reasonOf([row({ selected: true })]) === 'all_blocked', '★売価が未入力の行だけでも止める');
+  ok(reasonOf([sendable(), row({ selected: true, newPrice: 1 })]) === null,
+    '送れる行が1つでもあれば、ほかが ⛔ でも止めない');
 
-  ok(summarizeRecord([]).manualOnly === false, '1行も無いときは manualOnly にしない (別の文言で断る)');
-  ok(MANUAL_ONLY_MESSAGE.includes('チェック'), 'サーバ側の断り文句が「チェック」に触れている');
+  ok(reasonOf([]) === null, '1行も無いときはここでは止めない (別の文言で断る)');
+  ok(NO_SENDABLE_MESSAGES.manual_only.includes('チェック'), 'チェック忘れの文言が「チェック」に触れている');
+  ok(NO_SENDABLE_MESSAGES.all_blocked.includes('判定'), '⛔ の文言が「判定」の列に案内している');
+  ok(noSendableMessageOf('all_blocked').includes('もう一度押してください'), 'サーバの断りに、通す道が書いてある');
+  ok(noSendableMessageOf('しらない理由').includes('送れる行がありません'), '知らない理由でも文言が出る');
 }
 
 console.log('\n── 履歴側: なぜ送る行が無いのかを必ず言う ──');
@@ -64,12 +72,29 @@ console.log('\n── 履歴側: なぜ送る行が無いのかを必ず言う �
   ok(manualOnly.includes('1件も送られていません'), '★送られていないことを言い切る (ここが今回の申告の核心)');
   ok(manualOnly.includes('チェック'), 'どうすれば送れるのかを書く');
 
-  const blocked = noTargetReasonOf([op({ initial_state: 'blocked_preview', state: 'blocked_preview' }), op({ mall: 'amazon', initial_state: 'manual_required', state: 'manual_required' })]);
+  const blocked = noTargetReasonOf([
+    op({ initial_state: 'blocked_preview', state: 'blocked_preview' }),
+    op({ mall: 'amazon', initial_state: 'manual_required', state: 'manual_required' }),
+  ]);
   ok(blocked.includes('ガードで止まっています'), 'ガードで止まった行は数えて言う');
   ok(blocked.includes('Amazon'), '手動更新モールの行も内訳に出す');
 
-  const done = noTargetReasonOf([op({ state: 'confirmed' })]);
-  ok(done.includes('すでに送信を終えています'), '送信済みだけの履歴はそう言う');
+  // ★「previewed 以外 = 送信済み」とまとめない (Codex R1 高)。結果不明を送信済みと読ませない
+  const done = noTargetReasonOf([op({ state: 'confirmed' }), op({ state: 'noop' })]);
+  ok(done.includes('送信して結果も確かめています'), '送信して確認できた行はそう言う');
+
+  const unknown = noTargetReasonOf([op({ state: 'unknown' })]);
+  ok(!unknown.includes('送信して結果も確かめています'), '★結果が不明な行を「送信済み」と言わない');
+  ok(unknown.includes('結果が不明') && unknown.includes('モールの画面で実際の価格'),
+    '★結果が不明ならモールの画面を見るよう言う (自動で送り直さない運用に合わせる)');
+  ok(noTargetReasonOf([op({ state: 'executing' })]).includes('送信中'), '送信中の行も不明側に入れる');
+
+  const notSent = noTargetReasonOf([op({ state: 'conflict' }), op({ state: 'failed' }), op({ state: 'skipped' })]);
+  ok(notSent.includes('送られていません'), '★失敗・価格の食い違い・停止は「送られていない」と言う');
+  ok(!notSent.includes('送信して結果も確かめています'), '送られていない行を送信済みに混ぜない');
+
+  ok(noTargetReasonOf([op({ state: 'みたことない状態' })]).includes('どれにも当てはまらない'),
+    '知らない状態でも黙って送信済み扱いにしない');
 
   ok(noTargetReasonOf([]).includes('行がありません'), '空の履歴でも文言が出る');
   ok(typeof noTargetReasonOf(null) === 'string', '壊れた入力でも落ちない');

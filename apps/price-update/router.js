@@ -28,9 +28,9 @@ import { makeYahooClient } from './yahoo-apply.js';
 import { makeAupayClient } from './aupay-apply.js';
 import { makeQoo10Client } from './qoo10-apply.js';
 import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
-import { toJst, TO_JST_CLIENT_SRC } from './format.js';
+import { toJst, TO_JST_CLIENT_SRC, jsonForScript } from './format.js';
 import { MALL_LABELS } from './mall-capabilities.js';
-import { summarizeRecord, noTargetReasonOf, MANUAL_ONLY_MESSAGE } from './record-guard.js';
+import { summarizeRecord, noSendableReasonOf, noSendableMessageOf, noTargetReasonOf, NO_SENDABLE_MESSAGES } from './record-guard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -417,6 +417,9 @@ router.get('/', (req, res) => {
     runs: listRuns(db, 20),
     toJst,
     mallLabels: MALL_LABELS,
+    // 画面の JS へ渡す値。★inline script に埋めるので `<` を逃がした形にする
+    mallLabelsJson: jsonForScript(MALL_LABELS),
+    noSendableMessagesJson: jsonForScript(NO_SENDABLE_MESSAGES),
   });
 });
 
@@ -432,6 +435,7 @@ router.get('/runs/:runId', (req, res) => {
     toJst,
     toJstClientSrc: TO_JST_CLIENT_SRC,
     mallLabels: MALL_LABELS,
+    mallLabelsJson: jsonForScript(MALL_LABELS),
   });
 });
 
@@ -526,12 +530,15 @@ router.post('/api/runs', (req, res) => {
     // 記録される行の選び分けは record-guard.js が正 (画面と同じ規則を使う)。
     // 未解決行 (出品コードを引き当てられなかったモール) は自動では記録しない。
     // 手動更新リストに「コード不明の行」が積み上がっても、チェックのしようがない
-    const { chosen, manualOnly } = summarizeRecord(evaluated);
+    const summary = summarizeRecord(evaluated);
+    const { chosen } = summary;
     if (chosen.length === 0) throw validationError('記録する行が選ばれていません');
     // ★送れる行が0の履歴を黙って作らせない (2026-09-07 の「価格が変わらない」の真因)。
-    //   手動更新のチェックリストとしてだけ残したい時はあるので、確認したうえでなら通す
-    if (manualOnly && req.body?.allowManualOnly !== true) {
-      throw validationError(MANUAL_ONLY_MESSAGE, 'manual_only');
+    //   チェックの入れ忘れ (manual_only) でも、⛔ だけを選んだ場合 (all_blocked) でも、
+    //   できるのは「1件も送られない履歴」。記録だけ残したい時はあるので、確認したうえでなら通す
+    const noSendable = noSendableReasonOf(summary);
+    if (noSendable && req.body?.allowNoSendable !== true) {
+      throw validationError(noSendableMessageOf(noSendable), noSendable);
     }
 
     const note = String(req.body?.note || '').slice(0, 500) || null;

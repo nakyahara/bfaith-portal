@@ -8,10 +8,10 @@
  *   チェックの無い行は記録されず、手動更新モール (Amazon / LINEギフト) の行だけは
  *   チェック無しでも自動で足されるので、**送れる行が0の履歴が黙って作れてしまった**。
  *
- *   → 記録の入口で止める (manualOnly) / 履歴側では「なぜ送る行が無いのか」を必ず言う。
+ *   → 記録の入口で止める / 履歴側では「なぜ送る行が無いのか」を必ず言う。
  *
- * ここは純関数だけ (DB も fetch も触らない)。画面とサーバで同じ規則を使うため、
- * 選び分けの規則はこのファイルを正とする (router.js に直接書かない)。
+ * ここは純関数だけ (DB も fetch も触らない)。画面とサーバで同じ規則・同じ文言を使うため、
+ * 選び分けと文言はこのファイルを正とする (router.js や画面に直接書かない)。
  */
 import { MALL_LABELS } from './mall-capabilities.js';
 
@@ -31,29 +31,65 @@ export function chooseRowsToRecord(rows = []) {
 
 /**
  * これから記録しようとしている中身の内訳。
- * @returns {{chosen:Array, updatable:Array, manual:Array, sendable:Array, manualOnly:boolean}}
- *   manualOnly … 記録はできるが **モールへ送れる行が1行も無い** (チェックの入れ忘れが疑わしい)
+ * @returns {{chosen:Array, updatable:Array, manual:Array, sendable:Array}}
  */
 export function summarizeRecord(rows = []) {
   const chosen = chooseRowsToRecord(rows);
   const updatable = chosen.filter((r) => !r.manual);
   const manual = chosen.filter((r) => r.manual);
   const sendable = updatable.filter((r) => r.evaluation?.canUpdate);
-  return {
-    chosen,
-    updatable,
-    manual,
-    sendable,
-    // ★「⛔ で全部止まっている」は画面に数が出ているので、ここでは manualOnly と区別する。
-    //   黙って死ぬのは「更新できるモールの行を1つも選んでいない」場合だけ
-    manualOnly: chosen.length > 0 && updatable.length === 0,
-  };
+  return { chosen, updatable, manual, sendable };
+}
+
+/**
+ * 記録の前に確認を出す理由。**送れる行が0なら必ず出す** (null = そのまま記録してよい)。
+ *
+ * ★2026-09-07 の事故は 'manual_only' だが、「⛔ の行だけを選んだ」履歴も同じく死んでいる。
+ *   どちらも「記録はできたのに1件も送られない」ので、区別するのは**文言だけ**にする
+ *   (Codex R1 高: manualOnly だけを見ると、⛔ だけの履歴が確認なしで作れてしまう)。
+ *
+ * @returns {'manual_only'|'all_blocked'|null}
+ */
+export function noSendableReasonOf(summary) {
+  const { chosen = [], updatable = [], sendable = [] } = summary || {};
+  if (chosen.length === 0) return null;      // 「記録する行が選ばれていません」で別に断る
+  if (sendable.length > 0) return null;
+  return updatable.length === 0 ? 'manual_only' : 'all_blocked';
+}
+
+/** 確認で出す文言 (画面もサーバもここを使う。ずれると現場が別の話だと思う) */
+export const NO_SENDABLE_MESSAGES = {
+  manual_only:
+    '送れる行がありません。チェックを入れ忘れていませんか？'
+    + '\n\nこのまま記録すると、手で直すモール (Amazon・LINEギフト) のチェックリストができるだけで、'
+    + 'モールへは価格が1件も送られません。'
+    + '\n価格を送りたいときは、送りたい行の左端のチェックを入れてください。',
+  all_blocked:
+    '送れる行がありません。選んだ行はすべて止まっています (⛔ か、新売価が未入力)。'
+    + '\n\nこのまま記録しても、モールへは価格が1件も送られません。'
+    + '\n「判定」の列に止まっている理由が出ているので、直してから記録してください。',
+};
+
+/** 確認せずに送ってきた時にサーバが返す文言 */
+export function noSendableMessageOf(reason) {
+  const base = NO_SENDABLE_MESSAGES[reason] || NO_SENDABLE_MESSAGES.manual_only;
+  return `${base}\n記録だけ残すなら、確認のうえもう一度押してください。`;
 }
 
 /** モール名の一覧を日本語で (重複なし・並びは入力順) */
 function mallNamesOf(ops) {
   return [...new Set(ops.map((o) => MALL_LABELS[o.mall] || o.mall))].join('・');
 }
+
+/**
+ * 送信が終わった行の分類。
+ * ★「previewed 以外 = 送信済み」とまとめない (Codex R1 高)。
+ *   結果不明・送信中・価格違いで送らず は**送信済みではない**。まとめて「送信を終えています」と
+ *   書くと、README の「不明は再送しない = モールの画面で実物を見る」という運用を誤らせる。
+ */
+const DONE_STATES = new Set(['confirmed', 'noop']);          // 送って結果も確かめた
+const UNCERTAIN_STATES = new Set(['executing', 'unknown']);  // 送ったかどうか分からない
+const NOT_SENT_STATES = new Set(['conflict', 'failed', 'blocked', 'skipped']);  // 送っていない
 
 /**
  * 履歴に「送る行」が1行も無いときの理由 (日本語)。
@@ -70,8 +106,12 @@ export function noTargetReasonOf(operations = []) {
 
   const manual = ops.filter((o) => o.initial_state === 'manual_required');
   const blocked = ops.filter((o) => o.initial_state === 'blocked_preview');
-  // 記録時は送れる行だったが、もう送り終えている (または送らないと決めた) 行
-  const finished = ops.filter((o) => o.initial_state === 'previewed' && o.state !== 'previewed');
+  const moved = ops.filter((o) => o.initial_state === 'previewed' && o.state !== 'previewed');
+  const done = moved.filter((o) => DONE_STATES.has(o.state));
+  const uncertain = moved.filter((o) => UNCERTAIN_STATES.has(o.state));
+  const notSent = moved.filter((o) => NOT_SENT_STATES.has(o.state));
+  const other = moved.filter((o) => !DONE_STATES.has(o.state)
+    && !UNCERTAIN_STATES.has(o.state) && !NOT_SENT_STATES.has(o.state));
 
   if (manual.length === ops.length) {
     const names = mallNamesOf(manual);
@@ -82,16 +122,17 @@ export function noTargetReasonOf(operations = []) {
   }
 
   const parts = [];
+  if (done.length > 0) parts.push(`${done.length} 行は送信して結果も確かめています`);
+  // ★ここは軽く書かない。「送ったかどうか分からない」行はモールの画面で実物を見るしかない
+  if (uncertain.length > 0) {
+    parts.push(`${uncertain.length} 行は送信中または結果が不明です`
+      + ' (自動では送り直しません。モールの画面で実際の価格を確かめてください)');
+  }
+  if (notSent.length > 0) parts.push(`${notSent.length} 行は送られていません (失敗・価格の食い違い・途中で停止)`);
+  if (other.length > 0) parts.push(`${other.length} 行は上のどれにも当てはまらない状態です (下の表で確かめてください)`);
   if (blocked.length > 0) parts.push(`${blocked.length} 行はガードで止まっています (「判定」の列に理由が出ています)`);
   if (manual.length > 0) parts.push(`${manual.length} 行は ${mallNamesOf(manual)} (このツールからは送れません)`);
-  if (finished.length > 0) parts.push(`${finished.length} 行はすでに送信を終えています`);
   return parts.length > 0
     ? `送る行がありません — ${parts.join(' / ')}。`
     : '送る行がありません (記録時のガードを通った行だけが対象です)。';
 }
-
-/** 記録の入口で止めるときの文言 (サーバ側の最後の関所。画面は先に確認を出す) */
-export const MANUAL_ONLY_MESSAGE =
-  '送れる行がありません。更新できるモールの行にチェックが入っていません'
-  + ' (チェックの無い行は記録されません)。送りたい行の左端のチェックを入れてから記録してください。'
-  + '手動更新のチェックリストとしてだけ残すなら、確認のうえもう一度押してください。';

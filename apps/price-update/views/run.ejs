@@ -343,7 +343,7 @@
   });
 
   // ── 実行 ─────────────────────────────────────────────
-  const MALL_LABEL = <%- JSON.stringify(mallLabels) %>;   // 正本 = mall-capabilities.js
+  const MALL_LABEL = <%- mallLabelsJson %>;   // 正本 = mall-capabilities.js (script 安全な形にして渡される)
 
   async function loadExecutable() {
     let info;
