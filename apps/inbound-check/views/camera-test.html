@@ -66,9 +66,9 @@
       || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
     w.className = 'where ' + (standalone ? 'app' : 'browser');
     w.innerHTML = standalone
-      ? '✅ <b>ホーム画面のアプリの中</b>で開いています。読み取り画面と同じ条件です。'
-      : '⚠ <b>ブラウザ (Safari) で開いています。</b>読み取り画面をホーム画面のアイコンから使っているなら、'
-        + '<b>この結果は比べる相手になりません</b>。'
+      ? '✅ <b>ホーム画面のアプリの中</b>で開いています。'
+      : '⚠ <b>ブラウザで開いています。</b>ホーム画面アプリで起きるカメラの不具合を確かめるには、'
+        + '<b>アプリの中で</b>試してください。'
         + '<br>ホーム画面のアイコンからアプリを開き →「商品を探す」→ 説明の下の「カメラの動作確認」から入り直してください。';
   })();
   var backBtn = document.getElementById('startBack');

@@ -133,66 +133,83 @@ console.log('\n[7] 取得は1試行1回 (保留中に別のボタンを押して
     click() { (this._on.click || []).forEach((f) => f()); },
     play() { return Promise.resolve(); },
   });
-  const nodes = {};
-  for (const id of ['log', 'v', 'verdict', 'start', 'startBack', 'stop', 'copy', 'where']) nodes[id] = el();
-
-  let calls = 0;
-  let settle = null;
-  const ctx = {
-    console,
-    document: { getElementById: (id) => nodes[id] || null, visibilityState: 'visible' },
-    navigator: {
-      userAgent: 'Mozilla/5.0 (iPad; CPU OS 18_5 like Mac OS X) AppleWebKit/605.1.15',
-      maxTouchPoints: 5,
-      mediaDevices: { getUserMedia: () => { calls++; return new Promise((r, j) => { settle = { r, j }; }); } },
-      clipboard: { writeText: async () => {} },
-      standalone: false,
-    },
-    location: { protocol: 'https:' },
-    setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {},
-    alert: () => {},
+  /** ページを1つ動かす。standalone の名乗り方を変えられる */
+  const boot = ({ standalone = false, displayMode = false } = {}) => {
+    const nodes = {};
+    for (const id of ['log', 'v', 'verdict', 'start', 'startBack', 'stop', 'copy', 'where']) nodes[id] = el();
+    const state = { calls: 0, settle: null };
+    const ctx = {
+      console,
+      document: { getElementById: (id) => nodes[id] || null, visibilityState: 'visible' },
+      navigator: {
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 18_5 like Mac OS X) AppleWebKit/605.1.15',
+        maxTouchPoints: 5,
+        mediaDevices: { getUserMedia: () => { state.calls++; return new Promise((r, j) => { state.settle = { r, j }; }); } },
+        clipboard: { writeText: async () => {} },
+        standalone,
+      },
+      location: { protocol: 'https:' },
+      setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {},
+      alert: () => {},
+    };
+    ctx.window = ctx;
+    ctx.window.performance = { now: () => Date.now() };
+    ctx.window.screen = { width: 768, height: 1024 };
+    ctx.window.matchMedia = () => ({ matches: displayMode });
+    ctx.window.isSecureContext = true;
+    ctx.window.innerWidth = 768; ctx.window.innerHeight = 954;
+    ctx.window.navigator = ctx.navigator;
+    vm.createContext(ctx);
+    vm.runInContext(script, ctx, { timeout: 5000 });
+    return { nodes, state };
   };
-  ctx.window = ctx;
-  ctx.window.performance = { now: () => Date.now() };
-  ctx.window.screen = { width: 768, height: 1024 };
-  ctx.window.matchMedia = () => ({ matches: false });
-  ctx.window.isSecureContext = true;
-  ctx.window.innerWidth = 768; ctx.window.innerHeight = 954;
-  ctx.window.navigator = ctx.navigator;
 
-  vm.createContext(ctx);
-  vm.runInContext(script, ctx, { timeout: 5000 });
+  // 🚨 開き方の判定は2通りの名乗り方があり、どちらでも「アプリの中」と出ないと誤誘導になる
+  {
+    const a = boot({ standalone: true });
+    ok(/ホーム画面のアプリの中/.test(a.nodes.where.innerHTML) && a.nodes.where.className.includes('app'),
+      'navigator.standalone だけでも「アプリの中」と分かる');
+    const b = boot({ displayMode: true });
+    ok(/ホーム画面のアプリの中/.test(b.nodes.where.innerHTML) && b.nodes.where.className.includes('app'),
+      'display-mode: standalone だけでも「アプリの中」と分かる');
+    ok(!/読み取り画面と同じ条件/.test(a.nodes.where.innerHTML),
+      '開き方しか分からないので「同じ条件」とまでは言わない');
+  }
+
+  const { nodes, state } = boot();
+  const calls = () => state.calls;
 
   // 🚨 押す前に「どちらで開いているか」が出ている (2回続けて Safari で測ってしまった件)
-  ok(/ブラウザ \(Safari\) で開いています/.test(nodes.where.innerHTML)
-    && /比べる相手になりません/.test(nodes.where.innerHTML),
-    '🚨 ブラウザで開いていることが、押す前に分かる');
+  ok(/ブラウザで開いています/.test(nodes.where.innerHTML)
+    && /アプリの中で<\/b>試してください/.test(nodes.where.innerHTML)
+    && !/Safari/.test(nodes.where.innerHTML),
+    '🚨 ブラウザで開いていることが押す前に分かる (ブラウザ名は名指ししない)');
   ok(nodes.where.className.includes('browser'), '色でも分かる (ブラウザ = 注意色)');
 
   nodes.start.click();                       // 1回目 — 取得は保留のまま
   await new Promise((r) => setImmediate(r));
-  ok(calls === 1, `押したら取得が1回だけ走る (${calls})`);
+  ok(calls() === 1, `押したら取得が1回だけ走る (${calls()})`);
   ok(nodes.start.disabled === true && nodes.startBack.disabled === true,
     '取得待ちのあいだは両方のボタンが押せない');
 
   nodes.startBack.click();                   // 🚨 保留中に別のボタン
   nodes.start.click();                       // 🚨 保留中に連打
   await new Promise((r) => setImmediate(r));
-  ok(calls === 1, `🚨 保留中に別のボタンを押しても取得は増えない (${calls})`);
+  ok(calls() === 1, `🚨 保留中に別のボタンを押しても取得は増えない (${calls()})`);
 
   nodes.stop.click();                        // 🚨 取得待ちのまま「止める」
   nodes.start.click();
   await new Promise((r) => setImmediate(r));
-  ok(calls === 1, `🚨 取得待ちのまま止めて押し直しても、決着するまで取得は増えない (${calls})`);
+  ok(calls() === 1, `🚨 取得待ちのまま止めて押し直しても、決着するまで取得は増えない (${calls()})`);
 
-  settle.j(Object.assign(new Error('x'), { name: 'NotAllowedError' }));   // 1回目が決着
+  state.settle.j(Object.assign(new Error('x'), { name: 'NotAllowedError' }));   // 1回目が決着
   await new Promise((r) => setImmediate(r));
   await new Promise((r) => setImmediate(r));
   ok(nodes.start.disabled === false && nodes.startBack.disabled === false,
     '決着したらボタンが戻る (押せないままにならない)');
   nodes.start.click();
   await new Promise((r) => setImmediate(r));
-  ok(calls === 2, `決着したあとは次の取得ができる (${calls})`);
+  ok(calls() === 2, `決着したあとは次の取得ができる (${calls()})`);
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
