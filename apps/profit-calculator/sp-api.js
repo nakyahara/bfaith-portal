@@ -642,6 +642,12 @@ export async function getActiveListingsReport(opts = {}) {
   const log = opts.log || console.log;
   const marketplaceId = opts.marketplaceId || MARKETPLACE_ID();
 
+  // 🚨 期限を過ぎているなら作らない (Codex R8-2)。
+  //    夜間入口でも見ているが、ここに直接来る呼び出し元もある
+  if (opts.deadline && (opts.now ? opts.now() : new Date()) >= new Date(opts.deadline)) {
+    throw new Error('期限を過ぎているのでレポートを作らない');
+  }
+
   // レポート作成リクエスト
   const createResult = await sp.callAPI({
     operation: 'createReport',
@@ -702,7 +708,12 @@ export async function getActiveListingsReport(opts = {}) {
   });
 
   // ドキュメントダウンロード（GZIP圧縮 + Shift_JIS対応）
-  const response = await fetch(doc.url);
+  // 🚨 本体は数MBある。ドキュメント情報の取得に時間がかかって期限を越えることがあるので、
+  //    ダウンロードを始める直前にもう一度見る (Codex R8-2)
+  if (nowFn() >= waitUntil) {
+    throw new Error('本体を取りに行く前に期限を過ぎた (翌日に回す)');
+  }
+  const response = await (opts.fetchImpl || fetch)(doc.url);
   const rawBuf = Buffer.from(await response.arrayBuffer());
 
   let dataBuf = rawBuf;
@@ -876,7 +887,7 @@ async function fetchOrderReport(sp, marketplaceId, startStr, endStr) {
     options: { version: '2021-06-30' },
   });
 
-  const response = await fetch(doc.url);
+  const response = await (opts.fetchImpl || fetch)(doc.url);
   const rawBuf = Buffer.from(await response.arrayBuffer());
 
   let dataBuf = rawBuf;

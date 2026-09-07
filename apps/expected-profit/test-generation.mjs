@@ -311,6 +311,76 @@ t('入力不足による incomplete は「正常」として公開できる (構
   assert.equal(g.rowCount, 2);
 });
 
+
+/**
+ * 数量つきの Amazon FBA 出品から、本番の buildGeneration を通して行を作る。
+ * 見積は DB に入れて、本番と同じキーで引かせる。
+ */
+function buildGenerationWithQty(specs) {
+  const runId = 'r_qty_' + Math.random().toString(36).slice(2);
+  const fetchedAt = '2026-09-07T00:00:00Z';
+  db.prepare(`INSERT INTO price_fetch_run (run_id, mall, started_at, finished_at, status, listing_enum_status)
+              VALUES (?, 'amazon', ?, ?, 'ok', 'ok')`).run(runId, fetchedAt, fetchedAt);
+  const skuMap = new Map();
+  for (const sp of specs) {
+    db.prepare(`INSERT INTO mall_price_snapshot
+      (run_id, mall, shop_id, mall_item_key, mall_item_ref, fetched_at, valid_until, fetch_status,
+       resolve_status, source, price_incl_tax, price_tax_included, postage_included,
+       postage_revenue_incl_tax, points, fulfillment, listing_status)
+      VALUES (?, 'amazon', 'S1@M1', ?, 'B001', ?, '2099-01-01T00:00:00Z', 'ok',
+              'ok', 'merchant_listings_report', ?, 1, 1, 0, 0, 'FBA', 'active')`)
+      .run(runId, sp.key, fetchedAt, sp.price);
+    skuMap.set(sp.key, [{ ne_code: 'ne-qty', qty: sp.qty }]);
+    db.prepare(`INSERT OR REPLACE INTO amazon_fee_estimate
+      (seller_id, marketplace_id, seller_sku, asin, in_listing_price, in_shipping, in_points,
+       in_fulfillment, in_currency, referral_fee_ex_tax, closing_fee_ex_tax, per_item_fee_ex_tax,
+       fba_fee_incl_tax, total_fees_estimate, fee_breakdown, fee_status, fetched_at, valid_until)
+      VALUES ('S1', 'M1', ?, 'B001', ?, 0, 0, 'FBA', 'JPY', ?, 0, 0, 462, ?, '[]', 'ok', ?, '2099-01-01T00:00:00Z')`)
+      .run(sp.key, sp.price, Math.round(sp.price * 0.08), Math.round(sp.price * 0.08) + 462, fetchedAt);
+  }
+  const gen = buildGeneration(db, {
+    warehouseInputs: {
+      products: new Map([['ne-qty', {
+        商品コード: 'ne-qty', 商品名: '数量の試験', 原価: 600, 原価ソース: 'NE', 原価状態: 'COMPLETE',
+        消費税率: 0.1, 送料コード: null, 配送方法: null, 売上分類: 3,
+      }]]),
+      shippingRates: new Map(),
+      skuMaps: { amazon: skuMap, rakuten: new Map() },
+      masterFreshness: { costValidUntil: '2099-01-01T00:00:00Z', shippingMasterValidUntil: '2099-01-01T00:00:00Z' },
+    },
+    now: new Date('2026-09-07T12:00:00Z'), malls: ['amazon'], codeVersion: 'qty-test',
+    sellerId: 'S1', marketplaceId: 'M1',
+  });
+  const rows = db.prepare('SELECT * FROM mart_listing_expected_profit WHERE generation_id = ?').all(gen.generationId);
+  return { gen, rows };
+}
+
+console.log('');
+console.log('数量が世代構築の最後まで届いているか (Codex R8-3)');
+
+t('[!] 数量1 と 数量12 の FBA 出品を世代にすると、両方ランキングに載る', () => {
+  // 🚨 markQuantityVariationSuspects を直接呼ぶ試験では、
+  //    buildGeneration → buildRow → 数量判定 → 保存 の引き渡しが壊れても通る
+  const g = buildGenerationWithQty([
+    { key: 'qty1', qty: 1, price: 1000 },
+    { key: 'qty12', qty: 12, price: 10000 },
+  ]);
+  assert.equal(g.rows.length, 2);
+  assert.deepEqual(g.rows.map(r => r.unit_quantity).sort((a, b) => a - b), [1, 12]);
+  assert.ok(g.rows.every(r => r.calculation_status === 'ok'), JSON.stringify(g.rows.map(r => r.incomplete_reason)));
+  assert.ok(g.rows.every(r => r.rank_eligible === 1),
+    '価格が10倍ひらいていても、数量が分かっていれば外さない: ' + JSON.stringify(g.rows.map(r => r.rank_exclusion_reason)));
+  // 原価が数量倍で保存されている
+  assert.equal(g.rows.find(r => r.mall_item_key === 'qty12').cost_ex_tax, 600 * 12);
+});
+
+t('[!] 数量が読めない Amazon 出品は世代でも計算不成立になる', () => {
+  const g = buildGenerationWithQty([{ key: 'noqty', qty: null, price: 1000 }]);
+  assert.equal(g.rows[0].calculation_status, 'incomplete');
+  assert.equal(g.rows[0].incomplete_reason, 'quantity_unknown');
+  assert.equal(g.rows[0].rank_eligible, 0);
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);

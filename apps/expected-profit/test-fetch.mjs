@@ -616,6 +616,45 @@ await ta('[!] DONE でも期限を過ぎていたら本体を取りに行かな�
     /期限を過ぎたので取得しない/);
 });
 
+await ta('[!] ドキュメント情報の取得中に期限を越えたら、本体 (数MB) を取りに行かない', async () => {
+  // 🚨 getReportDocument の前で見るだけでは足りない。この API に時間がかかると、
+  //    期限を過ぎてから fetch() を始めてしまう (Codex R8-2)
+  let t = new Date('2026-09-07T15:00:00Z').getTime();
+  let fetched = false;
+  await assert.rejects(
+    () => getActiveListingsReport({
+      client: {
+        async callAPI(req) {
+          if (req.operation === 'createReport') return { reportId: 'R1' };
+          if (req.operation === 'getReport') return { processingStatus: 'DONE', reportDocumentId: 'D1' };
+          if (req.operation === 'getReportDocument') { t += 10 * 60 * 1000; return { url: 'http://x/y' }; }
+          throw new Error('想定外: ' + req.operation);
+        },
+      },
+      marketplaceId: 'M1',
+      deadline: new Date('2026-09-07T15:05:00Z'),
+      now: () => new Date(t),
+      sleep: async (ms) => { t += ms; }, log: () => {},
+      fetchImpl: async () => { fetched = true; return { arrayBuffer: async () => new ArrayBuffer(0) }; },
+    }),
+    /本体を取りに行く前に期限を過ぎた/);
+  assert.equal(fetched, false, '期限を過ぎているのにダウンロードを始めた');
+});
+
+await ta('[!] 期限を過ぎていたらレポートを作りにも行かない', async () => {
+  let created = false;
+  await assert.rejects(
+    () => getActiveListingsReport({
+      client: { async callAPI(req) { if (req.operation === 'createReport') created = true; return { reportId: 'R1' }; } },
+      marketplaceId: 'M1',
+      deadline: new Date('2026-09-07T14:00:00Z'),
+      now: () => new Date('2026-09-07T15:00:00Z'),
+      sleep: async () => {}, log: () => {},
+    }),
+    /期限を過ぎているのでレポートを作らない/);
+  assert.equal(created, false);
+});
+
 await ta('DONE になったらそこで待つのをやめる', async () => {
   let t = new Date('2026-09-07T15:00:00Z').getTime();
   const client = fakeSp(['IN_QUEUE', 'IN_PROGRESS', 'DONE']);

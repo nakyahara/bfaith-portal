@@ -211,8 +211,10 @@ export async function refreshFees(db, targets, deps = {}) {
   const batchErrors = [];     // バッチ単位の失敗 (API 呼び出しそのものが通らなかった)
   let stoppedByDeadline = false;
   let processedTargets = 0;
-  let observedSellerId = knownSellerId;   // レスポンスが教えてくれる実際のセラー
-  let sellerConflict = false;            // 1回の実行で複数のセラーが返ってきた
+  // 🚨 「応答が名乗ったセラー」と「既に知っているセラー」を混ぜない (Codex R8-1)。
+  //    既知で初期化すると、セラーが正しく1つに切り替わった実行まで競合扱いになり、
+  //    覚え書きが古いまま残って世代構築が古いキーを使い続ける
+  const observedSellers = new Set();     // この実行で応答が名乗ったセラー
 
   for (let i = 0; i < need.length; i += BATCH_SIZE) {
     // 全体終了期限 (§8.4)。超えたら残りは翌日に回す (途中で止めても行は消えない)
@@ -257,19 +259,20 @@ export async function refreshFees(db, targets, deps = {}) {
         continue;
       }
       const sellerIdFromResponse = r?.FeesEstimateIdentifier?.SellerId || null;
-      if (sellerIdFromResponse) {
-        // 🚨 1回の実行で複数のセラーが返ってきたら、どれで補完してよいか決められない (Codex R7-3)
-        if (observedSellerId && observedSellerId !== sellerIdFromResponse) sellerConflict = true;
-        observedSellerId = sellerIdFromResponse;
-      }
+      if (sellerIdFromResponse) observedSellers.add(sellerIdFromResponse);
       saved.push(toEstimateRow(chunk[j], r.FeesEstimate, fetchedAt, sellerIdFromResponse));
     }
     if (i + BATCH_SIZE < need.length) await sleep(sleepMs);
   }
 
-  // レスポンスから分かったセラーで、まだ埋まっていない行を補う。
-  // 🚨 複数のセラーが混ざった実行では補完しない (どれが正か決められない)
-  if (observedSellerId && !sellerConflict) {
+  // 応答が名乗ったセラーが**1つに決まったときだけ**、補完して覚える。
+  // 🚨 複数のセラーが混ざった実行では補完も記憶もしない (どれが正か決められない)。
+  //    応答が1つなら、それが既知と違っても採用する = セラーの切り替えに追従できる (Codex R8-1)
+  // 応答が誰も名乗らなかった場合は、入力側 (withResolvedSeller) が既知セラーで
+  // 埋めているのでここでの補完は要らない (逆検証で到達しないことを確認済み)
+  const sellerConflict = observedSellers.size > 1;
+  const observedSellerId = observedSellers.size === 1 ? [...observedSellers][0] : null;
+  if (observedSellerId) {
     for (const row of saved) if (!row.seller_id) row.seller_id = observedSellerId;
     // 次回の照合に使えるよう覚えておく (env に無くてもキーが作れる)
     rememberSellerId(db, observedSellerId, nowIso());
@@ -287,8 +290,9 @@ export async function refreshFees(db, targets, deps = {}) {
   const failedTargets = errors.length + batchErrors.reduce((a, b) => a + b.targets, 0);
   return {
     targets: targets.length,
-    sellerId: sellerConflict ? null : observedSellerId,
+    sellerId: observedSellerId || (sellerConflict ? null : knownSellerId),
     sellerConflict,
+    observedSellers: [...observedSellers],
     invalidTargets: invalid.length,
     invalid: invalid.slice(0, 20),
     reused: reuse.length,

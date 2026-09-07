@@ -464,6 +464,38 @@ await ta('marketplace_id は引き続き必須 (これが無いとキーが作�
   assert.deepEqual(r.invalid[0].missing, ['marketplace_id']);
 });
 
+
+await ta('[!] 応答のセラーが1つに変わったら覚え直す (refreshFees を通す)', async () => {
+  // 🚨 rememberSellerId を直接呼ぶ試験では、observedSellerId を既知で初期化した
+  //    「正常な切り替えまで競合扱い」を検出できない (Codex R8-1)
+  db.exec('DELETE FROM amazon_fee_estimate');
+  forgetSeller();
+  rememberSellerId(db, 'S_OLD');
+  const r = await refreshFees(db, [target({ seller_id: null, seller_sku: 'switched' })], {
+    sleepMs: 0,
+    callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { sellerId: 'S_NEW' }),
+  });
+  assert.equal(r.sellerConflict, false, '応答が1種類なら競合ではない');
+  assert.equal(r.sellerId, 'S_NEW');
+  assert.equal(getSetting(db, SETTING_AMAZON_SELLER_ID), 'S_NEW', '覚え書きが古いままだと世代構築が古いキーを使う');
+  assert.equal(db.prepare("SELECT seller_id FROM amazon_fee_estimate WHERE seller_sku = 'switched'").get().seller_id, 'S_NEW');
+  forgetSeller();
+});
+
+await ta('[!] 応答が誰も名乗らないときだけ、既知のセラーで補う', async () => {
+  db.exec('DELETE FROM amazon_fee_estimate');
+  forgetSeller();
+  rememberSellerId(db, 'S_KNOWN');
+  const r = await refreshFees(db, [target({ seller_id: null, seller_sku: 'noName' })], {
+    sleepMs: 0,
+    callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier),   // SellerId 無し
+  });
+  assert.equal(r.refreshed, 1);
+  assert.equal(db.prepare("SELECT seller_id FROM amazon_fee_estimate WHERE seller_sku = 'noName'").get().seller_id, 'S_KNOWN');
+  assert.equal(getSetting(db, SETTING_AMAZON_SELLER_ID), 'S_KNOWN', '名乗っていないのに覚え直してはいけない');
+  forgetSeller();
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);
