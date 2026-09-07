@@ -340,6 +340,10 @@ export function createTables(db = getMirrorDB()) {
     db.prepare("UPDATE f_inbound_check_batches SET work_date = date(imported_at, '+9 hours') WHERE work_date IS NULL").run();
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_ic_batches_work_date ON f_inbound_check_batches(work_date, id)');
+  // 繰り越し (rollOverWorkDate)。work_date を今日へ進めた active バッチが、元はいつ取り込んだものかを残す。
+  // これがある = 「本日の取込はまだ来ていない (前日の一覧を引き継いで作業中)」を画面に出す合図
+  addCol(db, 'f_inbound_check_batches', 'carried_from', 'TEXT');
+  addCol(db, 'f_inbound_check_batches', 'carried_at', 'TEXT');
 
   migrateQuantity(db);
 }
@@ -773,6 +777,75 @@ function isIsoDate(s) {
   return typeof s === 'string' && !Number.isNaN(Date.parse(s));
 }
 
+/** 繰越イベントの作業者名 (画面の「数えた記録」に出る)。人の名前と混ざらない表記にする */
+export const CARRY_WORKER = '前日から引き継ぎ';
+
+/**
+ * 業務日の繰り越し — **前日の一覧を今日ぶんとして続けて使えるようにする**。
+ *
+ * 中原さん 2026-09-07:「翌日、前日のバッチが残ったら朝の段階でリセットされる形になってると思うけど、
+ * 実際は前日直し忘れたみたいな形になってて、それが引き継げるようにしたい」
+ *
+ * 🚨**これが無いと iPad が入力できないまま固まる** (2026-09-07 に実際に起きた):
+ *   受付済の伝票はロジザード側で検品されるまで CSV に残り続ける。入荷受付が1件も増えなかった日は
+ *   CSV の中身が前日と同じ → file_hash 重複で取込が拒否される → active バッチの work_date が
+ *   前日のまま止まる → day_stale のガードで**数量も確認も一切記録できない**。
+ *   実際に 9/5 の一覧のまま 9/6・9/7 と入力できない状態になっていた (伝票3件・47行が全部未着手)。
+ *
+ * やること = **バッチを作り直さずに work_date だけ今日へ進める**。
+ *   - 確認済み (✅)・入数・行き先は行をそのまま使い回すので何もしなくていい
+ *   - 数えた数は論理キーが (work_date, line_key, code_key) なので、そのままだと今日の集計が 0 になる。
+ *     **前日までの合計を1件の繰越イベントとして今日へ積む**。数を直接コピーしないのは append-only を
+ *     守るため (訂正パネルにも1行として出て、人が打ち消せる)
+ *   - `carried_from` に元の業務日を残す → 「本日の取込はまだ来ていません」を画面に出す材料
+ *
+ * 冪等: `client_event_id = carry:<今日>:<line_key>` が UNIQUE なので、同じ日に何度呼んでも二重に積まない。
+ * 呼ぶ場所 = 一覧の取得 (getState) / 数量・確認・期限のガード (loadForQuantity・setPendingExpiry) /
+ *            取込の直前 (importCsv)。取込が来なくても、iPad を開いた時点で今日ぶんになる
+ *
+ * @returns {null | {from, to, batchId, lines, qty}} 繰り越していなければ null
+ */
+export function rollOverWorkDate(db = getDB(), now = new Date()) {
+  const today = workDateJst(now);
+  const cur = db.prepare("SELECT id, work_date FROM f_inbound_check_batches WHERE status = 'active'").get();
+  if (!cur || !cur.work_date || cur.work_date >= today) return null;   // 未来日は触らない (時計ずれの保険)
+  const at = utcNow();
+  const tx = db.transaction(() => {
+    // 別リクエストが先に繰り越していたら何もしない (5秒ポーリングの iPad が複数台ある)
+    const b = db.prepare("SELECT id, work_date FROM f_inbound_check_batches WHERE id = ? AND status = 'active'").get(cur.id);
+    if (!b || !b.work_date || b.work_date >= today) return null;
+    const rows = db.prepare(`SELECT s.line_key, s.found_qty, l.code_key, l.ar_no, l.product_id
+      FROM f_inbound_check_line_state s
+      JOIN f_inbound_check_lines l ON l.batch_id = s.batch_id AND l.line_key = s.line_key
+      WHERE s.batch_id = ? AND s.found_qty > 0`).all(b.id);
+    const ins = db.prepare(`INSERT INTO f_inbound_check_quantity_events
+      (client_event_id, work_date, batch_id, line_key, code_key, ar_no, product_id, action, quantity, input_kind,
+       worker, received_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'add', ?, 'backfill', ?, ?)
+      ON CONFLICT(client_event_id) DO NOTHING`);
+    let lines = 0;
+    let qty = 0;
+    for (const r of rows) {
+      // 今日ぶんの数が既にある行には積まない (二重加算だけは絶対に起こさない)
+      if (quantitySum(db, today, r.line_key, r.code_key) > 0) continue;
+      const n = ins.run(`carry:${today}:${r.line_key}`, today, b.id, r.line_key, r.code_key, r.ar_no, r.product_id,
+        r.found_qty, CARRY_WORKER, at).changes;
+      if (n) { lines++; qty += r.found_qty; }
+    }
+    db.prepare('UPDATE f_inbound_check_line_state SET quantity_work_date = ? WHERE batch_id = ?').run(today, b.id);
+    db.prepare(`UPDATE f_inbound_check_batches
+      SET work_date = ?, carried_from = COALESCE(carried_from, work_date), carried_at = ?
+      WHERE id = ?`).run(today, at, b.id);
+    return { from: b.work_date, to: today, batchId: b.id, lines, qty };
+  });
+  const r = tx();
+  if (r) {
+    logImport(db, { actor: 'system', source: 'rollover', fileName: null, ok: true, batchId: r.batchId,
+      message: `${r.from} の一覧を ${r.to} へ引き継ぎました` + (r.lines ? ` (数えた数 ${r.lines}行 / ${r.qty}個を繰越)` : '') });
+  }
+  return r;
+}
+
 /**
  * CSV を取り込んで新しい active バッチにする。
  * @param {Buffer} buffer
@@ -807,6 +880,12 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     logImport(db, { actor, source, fileName, ok: false, batchId: dup.id, message });
     return { ok: false, error: 'duplicate_file', message, batch: dup };
   };
+
+  // ⭐**取込の可否にかかわらず、先に業務日を今日へ繰り越す** (トランザクションの外で確定させる)。
+  //   中に入れると duplicate_file / older_file で巻き戻ってしまい、「新しい受付が無い日は
+  //   前日の一覧のまま入力できない」という元の不具合がそのまま残る。
+  //   繰り越したあとは前 active も今日ぶんなので、下の引き継ぎは同日の場合と1本の道になる
+  rollOverWorkDate(db);
 
   const tx = db.transaction(() => {
     // 重複判定はトランザクション内で (同時取込で両方が通過→UNIQUE 例外 500 を防ぐ — Codex R3 Medium)
@@ -851,17 +930,19 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       (batch_id, line_key, status, version, checked_by, checked_device, checked_at,
        found_qty, quantity_version, quantity_work_date, finalized_result, destination_id, current_pack_qty)
       VALUES (?, ?, ?, 1, ?, ?, ?, ?, 1, ?, ?, ?, ?)`);
-    // ⭐同日中の再取込だけ確認状態を引き継ぐ (要件定義 v1.3 §11.6)。
+    // ⭐**再取込は日をまたいでも確認状態を引き継ぐ** (中原さん 2026-09-07。旧: 同日だけ / 翌日リセット)。
     //   引き継ぐ条件 = 明細キー (AR|行|詳細行) と商品 (code_key) と予定数 が全部同じ。
     //   予定数が変わった / 商品が差し替わった明細は、数えたものが違うので必ず未確認に戻す。
-    //   翌日は従来どおり全部未確認から始める (§2 確定事項⑤「毎朝リセット」を守る)。
     //
-    //   ⚠**見つけた数は引き継がない代わりに数え直しもしない**。数量イベントの論理キーが
-    //     (work_date, line_key, code_key) なので、同日なら集計がそのまま残り、翌日は 0 になる。
+    //   旧仕様 (§2 確定事項⑤「毎朝リセット」) の前提は「検品済みの伝票は翌日 CSV から消える」だったが、
+    //   実際にはロジザードで検品されるまで受付済のまま残り続ける。毎朝リセットすると
+    //   **前日やり残した伝票を翌朝もう一度ゼロから数え直す**ことになるのでやめた。
+    //
+    //   ⚠**見つけた数はここでコピーしない**。数量イベントの論理キーが (work_date, line_key, code_key) で、
+    //     取込の前に rollOverWorkDate が前日ぶんを今日へ繰り越し済みなので、集計するだけで復元できる。
     //     コピーしないぶん、同じ数が二重に入る事故が起きない。
     const carry = new Map();
-    const sameDay = !!(prevActive && prevActive.work_date === workDate);
-    if (sameDay) {
+    if (prevActive) {
       for (const p of db.prepare(`SELECT s.line_key, s.status, s.checked_by, s.checked_device, s.checked_at,
             s.finalized_result, s.destination_id, s.current_pack_qty, l.code_key, l.planned_qty
           FROM f_inbound_check_line_state s
@@ -891,8 +972,9 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       const p = carry.get(r.line_key);
       const sameProduct = !!(p && p.code_key === r.code_key);
       const same = sameProduct && p.planned_qty === r.planned_qty;
-      // 見つけた数は同日の集計から復元する (同じ商品を数えていた場合だけ数が残る)
-      const found = sameDay ? quantitySum(db, workDate, r.line_key, r.code_key) : 0;
+      // 見つけた数はイベントの集計から復元する。論理キーに code_key が入っているので、
+      // 商品が差し替わった明細は自然に 0 から始まる (数えたものが違うため)
+      const found = quantitySum(db, workDate, r.line_key, r.code_key);
       const keepChecked = same && p.status === 'checked';
       if (keepChecked) carried++;
       // 確認を引き継げない行の行き先実績は取り消す (いろはへ送る数が二重計上されないように)
@@ -905,7 +987,7 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
         keepChecked ? p.destination_id : null, sameProduct ? p.current_pack_qty : null);
     }
     logImport(db, { actor, source, fileName, ok: true, batchId,
-      message: `${parsed.rows.length}行 / ${slipsMap.size}伝票` + (carried ? ` (同日の確認 ${carried}行を引き継ぎ)` : '') + (removed ? ` (消えた明細の行き先 ${removed}件を取消)` : '') });
+      message: `${parsed.rows.length}行 / ${slipsMap.size}伝票` + (carried ? ` (確認済み ${carried}行を引き継ぎ)` : '') + (removed ? ` (消えた明細の行き先 ${removed}件を取消)` : '') });
     cleanupOld(db);
     return { ok: true, batch: getBatch(batchId), rowCount: parsed.rows.length, slipCount: slipsMap.size, carriedOver: carried, imageSkus: parsed.rows.map(r => r.product_id) };
   });
@@ -1326,6 +1408,8 @@ export function productImageMap(productIds) {
  */
 export function getState() {
   const db = getDB();
+  // 前日の一覧のままなら、まず今日ぶんへ繰り越す (取込が来ない日でも iPad を開けば作業できる)
+  rollOverWorkDate(db);
   const batch = getActiveBatch();
   if (!batch) return { batch: null, slips: [], lines: [], totals: { lines: 0, checked: 0, partial: 0, undecided: 0, toIroha: 0, toIrohaQty: 0 } };
   const slips = db.prepare('SELECT * FROM f_inbound_check_slips WHERE batch_id = ? ORDER BY seq').all(batch.id);
@@ -1379,10 +1463,12 @@ export function getState() {
     FROM f_inbound_check_destinations d
     JOIN f_inbound_check_line_state s ON s.destination_id = d.id AND s.batch_id = ?
     WHERE d.destination = 'iroha' AND d.cancelled_at IS NULL`).get(batch.id);
-  // 業務日が変わったのに当日の取込がまだ来ていない = 前日の一覧。数量操作は受け付けない
+  // 繰り越したのに work_date が今日でない = 繰り越しが動かなかった時だけの保険 (通常は起きない)
   const dayStale = !!(batch.work_date && batch.work_date !== workDateJst());
+  // 本日の取込がまだ来ておらず、前日の一覧を引き継いで作業している (作業はできる。取込が来ていないことは伝える)
+  const carriedFrom = batch.carried_from && batch.carried_from !== batch.work_date ? batch.carried_from : null;
   return {
-    batch, slips, lines, day_stale: dayStale, field_options: fieldOptions(),
+    batch, slips, lines, day_stale: dayStale, carried_from: carriedFrom, field_options: fieldOptions(),
     totals: { lines: lines.length, checked, partial, undecided, toIroha: ir ? ir.c : 0, toIrohaQty: ir ? Number(ir.q) : 0 },
   };
 }
@@ -1446,11 +1532,12 @@ export function infoForLine(codeKey) {
  */
 export function setPendingExpiry({ batchId, lineKey, expiryDate }) {
   const db = getDB();
+  rollOverWorkDate(db);   // 数量APIと同じ: 前日の一覧なら今日ぶんへ繰り越してから見る
   const active = getActiveBatch();
   if (!active || active.id !== Number(batchId)) return { ok: false, error: 'stale_batch', message: '一覧が更新されました' };
-  // 前日の一覧に今日の期限を入れさせない (数量APIと同じ day_stale ガード — Codex #1116 R1 Med-4)
+  // 繰り越しが動かなかった時だけの保険 (数量APIと同じ — Codex #1116 R1 Med-4)
   if (active.work_date && active.work_date !== workDateJst()) {
-    return { ok: false, error: 'stale_work_date', message: '本日の入荷一覧を待っています (前日の一覧には記録できません)' };
+    return { ok: false, error: 'stale_work_date', message: '一覧の業務日を今日に更新できませんでした。「🚚 いま取りに行く」を押してください' };
   }
   const r = db.prepare(`UPDATE f_inbound_check_line_state SET pending_expiry = ?
     WHERE batch_id = ? AND line_key = ? AND status = 'unchecked'`).run(expiryDate || null, active.id, lineKey);
@@ -1553,14 +1640,15 @@ const posInt = v => Number.isSafeInteger(v) && v > 0;
 
 /** 数量操作の共通ガード。active バッチ・業務日・行の存在・確定済みかどうかを見る */
 function loadForQuantity(db, batchId, lineKey) {
+  rollOverWorkDate(db);   // 前日の一覧でも「今日ぶん」として続けて記録できる (中原さん 2026-09-07)
   const active = getActiveBatch();
   if (!active || active.id !== Number(batchId)) {
     return { error: { ok: false, error: 'stale_batch', message: '一覧が更新されました。最新の一覧を読み込み直してください', activeBatchId: active ? active.id : null } };
   }
-  // ⚠日付が変わったら昨日の一覧には数を足させない (今日の荷物が昨日の行に混ざる)
+  // 繰り越し後は必ず今日になっている。ここに来るのは繰り越しが動かなかった時だけの保険
   const today = workDateJst();
   if (active.work_date && active.work_date !== today) {
-    return { error: { ok: false, error: 'stale_work_date', message: '本日の入荷一覧を待っています (前日の一覧には記録できません)', workDate: active.work_date } };
+    return { error: { ok: false, error: 'stale_work_date', message: '一覧の業務日を今日に更新できませんでした。「🚚 いま取りに行く」を押してください', workDate: active.work_date } };
   }
   const line = db.prepare('SELECT * FROM f_inbound_check_lines WHERE batch_id = ? AND line_key = ?').get(active.id, lineKey);
   if (!line) return { error: { ok: false, error: 'not_found', message: '明細が見つかりません' } };

@@ -105,6 +105,8 @@ const LINE = (over = {}) => ({
 let PRINT_AGENTS = [];
 // 🗂 いろはの作業指示の正本。'app' (通常。Notion は 2026-09-05 廃止) なら「Notionへ送る」は出さない
 let IROHA_SOURCE = 'app';
+// 本日の取込がまだ来ておらず、前日の一覧を引き継いで作業している日の元の業務日 (null = 通常)
+let CARRIED_FROM = null;
 
 const STATE = lines => ({
   ok: true,
@@ -114,6 +116,7 @@ const STATE = lines => ({
   slips: [{ batch_id: 7, ar_no: 'AR1', planned_date: '2026-09-01', received_date: '2026-09-01', status: '受付済', line_count: lines.length, seq: 1, checked_count: lines.filter(l => l.check_status === 'checked').length, partial_count: lines.filter(l => l.check_status !== 'checked' && l.found_qty > 0).length }],
   lines,
   day_stale: false,
+  carried_from: CARRIED_FROM,
   totals: {
     lines: lines.length,
     checked: lines.filter(l => l.check_status === 'checked').length,
@@ -326,6 +329,22 @@ console.log('\n[10] 🗂 Notion は廃止 — 「Notionへ送る」は正本が 
   ok(r.q('#notionBtn').style.display === '', `正本が Notion (退路) → ボタンを出す (display=${JSON.stringify(r.q('#notionBtn').style.display)})`);
   IROHA_SOURCE = 'app';
   ok(/在庫化アプリの「未着手」に入ります/.test(HTML), '行き先ダイアログの「いろはへ」に、確認すると在庫化アプリの未着手に入ることを書いてある');
+}
+
+console.log('\n[11] 本日の取込が来ていない日 — 引き継いで作業できることを伝える (中原さん 2026-09-07)');
+{
+  CARRIED_FROM = null;
+  let r = await renderWith([LINE()]);
+  ok(r.q('#banner').innerHTML === '', '通常の日はお知らせを出さない');
+  CARRIED_FROM = '2026-09-05';
+  r = await renderWith([LINE()]);
+  const b = r.q('#banner');
+  ok(/本日の取込はまだ来ていません/.test(b.innerHTML), '引き継ぎ中はお知らせを出す');
+  ok(/09\/05 の一覧を引き継いで/.test(b.innerHTML), '引き継いだ元の日付が出る');
+  ok(/いま取りに行く/.test(b.innerHTML), '🚚 で取りに行けることを案内する');
+  ok(!b._classes.has('warn') && b._classes.has('info'), '作業は止まっていないので警告色にしない (info)');
+  ok(!/記録できません/.test(b.innerHTML), '「記録できません」とは書かない (書けるようになったため)');
+  CARRIED_FROM = null;
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

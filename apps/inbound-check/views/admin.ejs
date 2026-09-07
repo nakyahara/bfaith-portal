@@ -23,6 +23,8 @@
     tr.active-batch td { background: #ebfbee; }
     .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; }
     .ok-banner { background: #d3f9d8; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 0.95em; }
+    /* 本日の取込が来ていない日のお知らせ。作業は止まっていないので警告色にしない */
+    p.hint.carried { background: #e7f5ff; color: #1864ab; border-radius: 6px; padding: 8px 10px; }
     .ng { color: #c92a2a; }
     code { background: #e9ecef; padding: 1px 5px; border-radius: 4px; }
   </style>
@@ -156,6 +158,11 @@
         <p>バッチ #<%= active.id %> ・ CSV生成 <span data-jst="<%= active.csv_generated_at %>"></span> ・ 取込 <span data-jst="<%= active.imported_at %>"></span>
           (<%= active.source === 'manual_upload' ? '手動' : active.source %><%= active.imported_by ? ' / ' + active.imported_by : '' %>) ・
           <%= active.slip_count %> 伝票 / <%= active.row_count %> 行 ・ ファイル <%= active.file_name || '-' %></p>
+        <% if (active.carried_from && active.carried_from !== active.work_date) { %>
+          <p class="hint carried">📅 <b>本日 (<%= active.work_date %>) の取込はまだ来ていません</b>。<%= active.carried_from %> に取り込んだ一覧を引き継いで作業中です
+            (前日の ✅ と数えた数は残っています)。ロジザードに新しい入荷受付が1件も増えていない日は CSV の中身が変わらないため、これが通常の状態です。
+            増えたはずなのに出ないときは「🚚 いま取りに行く」を押してください</p>
+        <% } %>
       <% } else { %>
         <p class="ng">まだ取り込まれていません</p>
       <% } %>

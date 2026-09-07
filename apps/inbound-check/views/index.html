@@ -36,6 +36,8 @@
     .banner.warn { display: block; background: #fff3bf; color: #7a5c00; }
     .banner.err { display: block; background: #ffe3e3; color: #a61e1e; }
     .banner.ok { display: block; background: #d3f9d8; color: #2b8a3e; }
+    /* 引き継ぎ中のお知らせ。作業は止まっていないので警告色にしない (取込が来ていないことだけ伝える) */
+    .banner.info { display: block; background: #e7f5ff; color: #1864ab; }
     .wrap { padding: 10px 12px; }
     .empty { text-align: center; color: #868e96; padding: 60px 10px; font-size: 1.05em; line-height: 1.8; }
     .slip { background: #fff; border-radius: 12px; margin-bottom: 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); overflow: hidden; }
@@ -564,8 +566,10 @@
         + (t.undecided ? ' <small style="color:#c92a2a;font-weight:700">・行き先未設定 ' + t.undecided + '</small>' : '')
         + (t.toIroha ? ' <small style="color:#7a5c00;font-weight:700">・🏠いろは ' + t.toIroha + '</small>' : '');
       $('#meta').textContent = 'CSV ' + fmtJst(b.csv_generated_at) + ' 生成 ・ ' + fmtJst(b.imported_at) + ' 取込';
-      // 日付が変わったのに当日の取込が来ていない = 前日の一覧。数量は入れさせない (今日の荷物が昨日の行に混ざる)
-      if (state.day_stale) banner('warn', '本日の入荷一覧を待っています (表示中は ' + esc(b.work_date || '') + ' に取り込んだ一覧です)。取込が来るまで数量・確認は記録できません');
+      // 本日の取込がまだ来ていない = 前日の一覧を引き継いで作業中。**入力は止めない** (中原さん 2026-09-07)。
+      // 取込が来ていないことだけ伝えて、🚚 で取りに行けることを案内する
+      if (state.day_stale) banner('warn', '一覧の業務日を今日に更新できませんでした (表示中は ' + esc(b.work_date || '') + ' の一覧です)。「🚚 いま取りに行く」を押してください');
+      else if (state.carried_from) banner('info', '本日の取込はまだ来ていません。<b>' + esc(fmtDate(state.carried_from)) + ' の一覧を引き継いで</b>そのまま作業できます (前日の ✅ と数えた数は残っています)。ロジザードに新しい受付を入れたら「🚚 いま取りに行く」を押してください');
       if (state.lines.length === 0) {
         $('#list').innerHTML = '<div class="empty">受付済の入荷伝票はありません<br><small>(CSV ' + esc(fmtJst(b.csv_generated_at)) + ' 生成)</small></div>';
         return;

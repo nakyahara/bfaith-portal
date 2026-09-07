@@ -177,10 +177,12 @@ async function runRefresh({ actor, fetchFn, drive, timing }) {
         slipCount: r.slipCount, rowCount: r.rowCount, batchId: r.batch ? r.batch.id : null,
       });
     } else if (r.error === 'duplicate_file' && verified) {
-      // ロジザード側に増えていなかった。失敗ではないので、そう言う
+      // ロジザード側に増えていなかった。失敗ではないので、そう言う。
+      // ⭐取込は拒否されても業務日の繰り越しは済んでいる (importCsv がトランザクションの外で先に行う)
+      //   ので、前日から残っている伝票はそのまま今日ぶんとして続けて作業できる
       setRun({
         state: 'done', phase: 'done', finishedAt: nowIso(), ok: true, unchanged: true, verified: true,
-        message: '一覧に追加される新しい受付はありませんでした (一覧は最新です)',
+        message: '一覧に追加される新しい受付はありませんでした (残っている伝票はそのまま本日ぶんとして作業できます)',
       });
     } else if (r.error === 'duplicate_file') {
       // 取り直したのに新しい世代を確認できない = 転送漏れ / Drive 障害 / 反映遅れ。
