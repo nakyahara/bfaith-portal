@@ -409,7 +409,39 @@ function sessionMediaNeedsRebuild(db, table, ddl, required) {
   const want = [...ddl('x').matchAll(/^\s+([a-z_]+)\s+(?:INTEGER|TEXT)/gm)].map((m) => m[1]);
   return want.some((c) => !have.has(c));
 }
+/**
+ * ⭐作り直しの**前に**、人数 (crew_size) を新しい定義に通る形にそろえる (要件 §AB-10)。
+ *
+ * 新しい定義は「NOT NULL・整数・1〜50」。古い版に NULL や 1.5 が残っていると、
+ * 写すところで落ちて**作り直しごと巻き戻り、再起動しても同じところで落ちる**
+ * = アプリが二度と起動しない (Codex #1258 R4 中1)。
+ *
+ * ⭐直してよいのは**決まりごとで値が決まるものだけ**:
+ *   - 個人の記録は「必ず 1 人」(表の CHECK にも書いてある)。だから欠けていても 1 にできる。推測ではない。
+ * ⭐人数だけの記録の壊れた人数は**推測で直さない**。工賃の計算に効く数字なので、
+ *   どの行かを名指しして止める。丸めて動かすほうが、静かに間違った工賃を払うぶん悪い。
+ */
+function normalizeCrewSize(db) {
+  const has = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_sessions'").get();
+  if (!has) return;
+  const cols = db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().map((c) => c.name);
+  if (!cols.includes('crew_size')) return;   // 列がまだ無い版 = 作り直しで既定値 1 が入る
+  const broken = `crew_size IS NULL OR typeof(crew_size) <> 'integer' OR crew_size < 1 OR crew_size > 50`;
+  const fixed = db.prepare(`UPDATE f_iroha_work_sessions SET crew_size = 1
+    WHERE worker_id IS NOT NULL AND (${broken} OR crew_size <> 1)`).run().changes;
+  if (fixed > 0) console.log(`[iroha-work] 個人の作業記録 ${fixed} 件の人数を 1 にそろえました (個人は必ず 1 人)`);
+  const bad = db.prepare(`SELECT id, crew_size FROM f_iroha_work_sessions
+    WHERE worker_id IS NULL AND (${broken}) ORDER BY id LIMIT 20`).all();
+  if (bad.length > 0) {
+    throw new Error('人数だけの作業記録に、人数が入っていない・整数でない行があります'
+      + ` (id: ${bad.map((r) => `${r.id}=${r.crew_size}`).join(', ')})。`
+      + '工賃の計算に効く数字なので、勝手に直さずに止めました。記録を確かめて直してから起動してください');
+  }
+}
+
 function migrateSessionMediaSchema(db) {
+  // ⭐作り直しに入る前にそろえる (落ちてから直すのでは、起動できないまま詰む)
+  normalizeCrewSize(db);
   const targets = [
     { table: 'f_iroha_work_sessions', ddl: sessionsDDL, index: SESSIONS_INDEX_DDL, required: SESSIONS_REQUIRED_DDL },
     { table: 'f_iroha_card_media', ddl: mediaDDL, index: MEDIA_INDEX_DDL, required: MEDIA_REQUIRED_DDL },

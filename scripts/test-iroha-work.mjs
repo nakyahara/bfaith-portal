@@ -7400,6 +7400,50 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
     ok(db.prepare('SELECT raw_seconds FROM f_iroha_work_sessions WHERE id = ?').get(nullRow).raw_seconds === 3600,
       '⭐その行の実測 3600 秒はそのまま (1 秒も変えない)');
     db.prepare('DELETE FROM f_iroha_work_sessions WHERE id = ?').run(nullRow);
+  }
+
+  // ⑨c ⭐弱い版に**小数の人数**が残っていたら、推測で直さず名指しして止める (Codex R4 中1)
+  {
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    const sqlNow = () => db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='f_iroha_work_sessions'").get().sql;
+    const cur = sqlNow();
+    const weak = cur.replace(/crew_size      INTEGER NOT NULL DEFAULT 1[\s\S]*?CHECK \(typeof\(crew_size\)[^)]*\)[^,]*,/, 'crew_size      INTEGER,');
+    ok(weak !== cur, '(前提) 人数の制約だけを弱められる');
+    const cols = db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().map((c) => c.name).join(', ');
+    const t = mk('crew-9d', 9022);
+    db.pragma('foreign_keys = OFF');
+    db.exec(`CREATE TEMP TABLE w9c AS SELECT * FROM f_iroha_work_sessions;
+      DROP TABLE f_iroha_work_sessions; ${weak};
+      INSERT INTO f_iroha_work_sessions (${cols}) SELECT ${cols} FROM w9c; DROP TABLE w9c;`);
+    db.pragma('foreign_keys = ON');
+    // ⭐個人の行に小数は入れられない — 弱い版にも残る CHECK (worker_id IS NULL OR crew_size = 1) が
+    //   2.5 を弾く。個人の行で実際に起きうるのは NULL で、それは ⑨ で確かめている。
+    //   ここで試すのは**人数だけの行の小数**
+    let indivFrac = null;
+    try {
+      db.prepare("INSERT INTO f_iroha_work_sessions (task_id, worker_id, worker_name, crew_size, started_at) VALUES (?, ?, 'crew利用者', 2.5, ?)")
+        .run(t, memberW.id, '2020-01-01T00:00:00.000Z');
+    } catch (e) { indivFrac = e; }
+    ok(indivFrac && /CHECK/.test(indivFrac.message),
+      '(前提) 弱い版でも、個人の行に小数は入らない (残った CHECK が弾く)');
+
+    // ② 人数だけの行の壊れた人数は、推測で直さず**どの行かを名指しして止める**
+    const crewBad = Number(db.prepare("INSERT INTO f_iroha_work_sessions (task_id, facility_code, crew_size, started_at, ended_at, raw_seconds, end_reason) VALUES (?, 'rehas', 2.5, ?, ?, 120, 'done')")
+      .run(t, '2020-01-01T00:00:00.000Z', '2020-01-01T00:02:00.000Z').lastInsertRowid);
+    let stop = null;
+    try { createTables(db); } catch (e) { stop = e; }
+    ok(stop && /人数が入っていない・整数でない/.test(stop.message),
+      '⭐人数だけの行の壊れた人数は、丸めて動かさずに止める (工賃の計算に効く)');
+    ok(stop && stop.message.includes(String(crewBad)),
+      '⭐どの行かを名指しする (直せるように)');
+    ok(db.prepare('SELECT crew_size FROM f_iroha_work_sessions WHERE id = ?').get(crewBad).crew_size === 2.5,
+      '止めたときに勝手な値を入れていない');
+    // 片づけ: その行を直せば起動できる
+    db.prepare('UPDATE f_iroha_work_sessions SET crew_size = 3 WHERE id = ?').run(crewBad);
+    let after = null;
+    try { createTables(db); } catch (e) { after = e; }
+    ok(!after && /typeof\(crew_size\)/.test(sqlNow()), '⭐直せば起動できる (詰まない)');
+    db.prepare('DELETE FROM f_iroha_work_sessions WHERE id = ?').run(crewBad);
     ok(/typeof\(crew_size\) = 'integer'/.test(sqlNow()),
       '⭐crew_size の制約だけが弱い版も、ちゃんと作り直す');
     const idx2 = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='f_iroha_work_sessions'").all().map((r) => r.name);
@@ -7501,10 +7545,34 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
     '人数だけの開始は専用の口へ送る');
   ok(html.includes('opts && opts.crewSize != null ? Number(opts.crewSize)'),
     '⭐止まっている札の確認から戻るときは、そのとき入れた人数を使う (入力欄を読み直さない)');
-  ok(html.includes('const saved = (j.session && j.session.crewSize) || n;')
-    && html.includes("j.already"),
-    '⭐知らせるのは**保存された人数**。別の端末が先に 3 人で始めていたら「5人ではじめました」と出さない');
-  ok(html.includes('はすでに ') && html.includes('人で作業中です'), 'すでに始まっていたことも伝える');
+  // ⭐startHeadcount を**実際に動かして**、知らせる文言を見る (Codex R4 軽微1)。
+  //   文字列があるかどうかの検査だと、つなぐところを n に戻されても気づけない
+  {
+    const src = html.match(/async function startHeadcount\(facilityCode, opts\) \{[\s\S]*?\r?\n\}/)[0];
+    // サーバーは「先に 3 人で始まっている」と答える。画面は 5 人と入れている
+    const run = async (reply, typed) => {
+      let said = null;
+      const el = { value: String(typed), focus() {} };
+      const fn = new Function('stateCan', 'isApp', 'worker', 'findCard', 'crewCard', 'document', '$',
+        'apiFetch', 'applyTask', 'closeCrew', 'toast', 'facilityName', 'openDetail', 'planError',
+        'openUnblock', 'homeBatchId', 'state',
+        src + '; return startHeadcount;')(
+        () => true, () => true, { id: 1 }, () => ({ id: 7, version: 1 }), 7,
+        { getElementById: () => el },
+        () => ({ textContent: '' }),
+        async () => reply,
+        () => {}, () => {}, (m) => { said = m; }, () => 'パレット', () => {}, () => false,
+        () => {}, () => null, {});
+      await fn('rehas');
+      return said;
+    };
+    const already = await run({ ok: true, already: true, session: { crewSize: 3 } }, 5);
+    ok(already && already.includes('3'), '⭐先に 3 人で始まっていたら 3 人と知らせる');
+    ok(already && !already.includes('5'), '⭐入れた 5 人をそのまま出さない (工賃の数字とずれる)');
+    ok(already && already.includes('すでに'), 'すでに始まっていたことも伝える');
+    const fresh = await run({ ok: true, already: false, session: { crewSize: 4 } }, 4);
+    ok(fresh && fresh.includes('4') && fresh.includes('はじめました'), 'はじめて始めたときは「はじめました」');
+  }
   ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
   // ⭐これまでの作業も 人時 で出す (Codex R1 の「日報・履歴の整合は未確認」への答え)。
   //   関数を実際に動かして、出てくる文言を見る
