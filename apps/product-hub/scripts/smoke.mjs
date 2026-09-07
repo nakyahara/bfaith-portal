@@ -7109,6 +7109,8 @@ const boardBase = {
   rakutenRmsItemUrl: (mn) => `https://item.rms.rakuten.co.jp/rms-sku/shops/373343/item/edit/${String(mn).toLowerCase()}`,
   // セット商品の表示 (2026-09-04)。router が渡しているものと同じ
   NE_STATE_LABELS: sd.NE_STATE_LABELS,
+  // カードから「作らない」を選ぶときの理由 (2026-09-07)。詳細画面と同じ辞書
+  setDecisionReasons: sd.SET_DECISION_REASONS,
   isAdmin: true,
 };
 renders.push(
@@ -7181,6 +7183,56 @@ renders.push(
               setDecision: { decision: 'hold', label: sd.describeSetDecision({ decision: 'hold', reason_text: '売れ行きを見てから' }) } }),
           ],
         })),
+      },
+    };
+  })()],
+  // セットの判断をカードから決める (2026-09-07)。⑤の列では 作る/作らない/保留、
+  // 判断済みならどの列でも「取り消す」。他人の担当ならボタンを出さず誰の担当かを書く
+  ['board.ejs (セット判断のボタン)', 'board.ejs', (() => {
+    const base = boardBase.board.columns.flatMap((c) => c.cards)[0];
+    const mk = (id, over) => ({
+      ...base, id, ne_code: `SETBTN-${id}`, name: `判断ボタン ${id}`,
+      isSet: false, set: null, setChildrenCount: 0, setDecision: null,
+      setReview: { version: 3, state: 'todo', assigneeId: null, assigneeName: null, roleCode: 'planner' },
+      ...over,
+    });
+    return {
+      ...boardBase,
+      // admin ではない一般ユーザー (担当者 id=1 に紐づいている) として描く
+      isAdmin: false, me: { id: 1, name: '中原 大輔' },
+      board: {
+        ...boardBase.board,
+        columns: boardBase.board.columns.map((c) => {
+          if (c.code === 'set_review') {
+            return { ...c, cards: [
+              // 未判断・未割り当て → 押した人が引き受ける (claim=1)
+              mk(96001, {}),
+              // 判断済み (保留) → ⑤は開いたままなのでボタンと取り消しが両方出る
+              mk(96002, {
+                setReview: { version: 5, state: 'todo', assigneeId: 1, assigneeName: '中原 大輔', roleCode: 'planner' },
+                setDecision: { decision: 'hold', label: sd.describeSetDecision({ decision: 'hold' }) },
+              }),
+              // 他人の担当 → ボタンを出さない (403 で弾いてから理由を知らせない)
+              mk(96003, {
+                setReview: { version: 2, state: 'todo', assigneeId: 9, assigneeName: '高島 和美', roleCode: 'planner' },
+              }),
+            ] };
+          }
+          if (c.code === 'listing') {
+            // ⑤の列を離れたあとのカード。判断済みなので「取り消す」だけが出る
+            return { ...c, cards: [mk(96004, {
+              setReview: { version: 7, state: 'done', assigneeId: 1, assigneeName: '中原 大輔', roleCode: 'planner' },
+              setDecision: { decision: 'none', label: sd.describeSetDecision({ decision: 'none', reason_code: 'low_demand' }) },
+            })] };
+          }
+          return { ...c, cards: [] };
+        }),
+        // 完了列のカードでも取り消せる (判断が済むとカードはやがてここに来る)
+        doneCards: [mk(96005, {
+          setReview: { version: 9, state: 'done', assigneeId: 1, assigneeName: '中原 大輔', roleCode: 'planner' },
+          setDecision: { decision: 'create', label: sd.describeSetDecision({ decision: 'create' }) },
+        })],
+        doneTotal: 1,
       },
     };
   })()],
@@ -7265,6 +7317,7 @@ renders.push(
   }],
 );
 const renderedHtml = new Map();
+let dumpSeq = 0;   // PH_SMOKE_DUMP で書き出すときの通し番号
 for (const [name, file, data] of renders) {
   try {
     // router が常に渡す共通 locals (画像スロットグリッド・棚の反映状態・自動追加バナー)
@@ -7316,6 +7369,15 @@ for (const [name, file, data] of renders) {
       });
     check(`render ${name}`, html.length > 500);
     renderedHtml.set(name, html);
+    // 見た目を目視するときだけ、描いた HTML をそのまま書き出す (サーバーを起こさずに確認できる)。
+    // PH_SMOKE_DUMP=<dir> で有効。ファイル名に使えない文字は落とす
+    if (process.env.PH_SMOKE_DUMP) {
+      fs.mkdirSync(process.env.PH_SMOKE_DUMP, { recursive: true });
+      // 日本語のラベルは _ に潰れて名前がぶつかるので、通し番号を頭に付ける
+      dumpSeq += 1;
+      fs.writeFileSync(path.join(process.env.PH_SMOKE_DUMP,
+        `${String(dumpSeq).padStart(3, '0')}-${name.replace(/[^\w.()\-]+/g, '_')}.html`), html);
+    }
   } catch (e) {
     check(`render ${name}`, false, e.message);
   }
@@ -7601,6 +7663,124 @@ for (const [name, file, data] of renders) {
   db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(pid, r.draftId);
 }
 
+// ─── セット判断の取り消し (2026-09-07 中原さん:「間違って選択したときに戻せるように」) ───
+// ボードのカードから 1 クリックで判断できるようにした以上、押し間違いは必ず起きる。
+// 戻せないと現場は怖くて押さない = カードから決められるようにした意味が無くなる
+{
+  const newDraft = (code) => Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES (?, ?, 'draft', 'smoke')`
+  ).run(code, `取消テスト ${code}`).lastInsertRowid);
+  const undo = (id) => { try { return { ok: true, r: sd.undoSetDecision(db, id, 'smoke') }; } catch (e) { return { ok: false, status: e.status, msg: e.message }; } };
+
+  // ① 何も決めていないものは取り消せない
+  const d0 = newDraft('SETUNDO-0');
+  check('判断の取り消し: まだ何も決めていなければ取り消せない',
+    undo(d0).status === 400, JSON.stringify(undo(d0)));
+
+  // ② 「作らない」1 件 → 取り消すと未判断に戻る (⑤も開け直す = closing:false)
+  const d1 = newDraft('SETUNDO-1');
+  sd.recordSetDecision(db, d1, { decision: 'none', reason_code: 'low_demand' }, 'smoke');
+  const u1 = undo(d1);
+  check('判断の取り消し: 直前の判断を消して未判断に戻る',
+    u1.ok && u1.r.undone.startsWith('作らない') && sd.latestSetDecision(db, d1) === null
+    && u1.r.closing === false, JSON.stringify(u1));
+  check('判断の取り消し: 何を取り消したかは履歴に残る (記録が消えるわけではない)',
+    db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(d1).c === 1);
+  // 🚨 append-only の表から 1 行消す以上、消した行を**そのまま復元できる**ところまで残す。
+  //    人が読む画面に出る detail なので「文 + 区切り + JSON」。区切りの後ろは素で JSON.parse できる
+  check('判断の取り消し: 消した行は JSON で復元できる (理由コードや紐づけ先まで)',
+    (() => {
+      const ev = db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(d1);
+      const parsed = sd.undoRecordOf(ev.detail);
+      return parsed.removed.decision === 'none' && parsed.removed.reason_code === 'low_demand'
+        && parsed.removed.decided_by === 'smoke' && !!parsed.removed.decided_at
+        && parsed.removed.draft_id === d1
+        && parsed.previous === null && parsed.withdrawn === null;
+    })(),
+    db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(d1)?.detail);
+
+  // 🚨 理由メモは人の自由入力なので、区切り文字列そのものを書ける (Codex R3)。
+  //    本文に紛れ込むと JSON の手前で切れて復元できなくなる — 本文側から区切りを落としている
+  const dMark = newDraft('SETUNDO-MARK');
+  sd.recordSetDecision(db, dMark, { decision: 'hold', reason_text: `やめる${sd.UNDO_RECORD_MARKER}{"removed":"にせもの"}` }, 'smoke');
+  const uMark = undo(dMark);
+  check('判断の取り消し: 区切り文字列を含むメモでも、消した行を復元できる',
+    uMark.ok && (() => {
+      const ev = db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(dMark);
+      const parsed = sd.undoRecordOf(ev.detail);
+      return parsed.removed.decision === 'hold' && parsed.removed.reason_text.includes('にせもの');
+    })(),
+    db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'set_decision_undone'`).get(dMark)?.detail);
+
+  // ③ 判断が 2 件あるときは**ひとつ前**に戻る (必ず未判断に戻すと辻褄が合わなくなる)
+  const d2 = newDraft('SETUNDO-2');
+  sd.recordSetDecision(db, d2, { decision: 'hold', reason_text: '様子見' }, 'smoke');
+  sd.recordSetDecision(db, d2, { decision: 'none', reason_code: 'single_enough' }, 'smoke');
+  const u2 = undo(d2);
+  check('判断の取り消し: ひとつ前の判断に戻る (履歴があれば未判断にはしない)',
+    u2.ok && sd.latestSetDecision(db, d2)?.decision === 'hold' && u2.r.closing === false,
+    JSON.stringify(u2));
+  check('判断の取り消し: 戻った先が「作る・既存あり・作らない」なら⑤は閉じたまま (closing で伝える)',
+    (() => {
+      sd.recordSetDecision(db, d2, { decision: 'none', reason_code: 'single_enough' }, 'smoke');
+      sd.recordSetDecision(db, d2, { decision: 'hold' }, 'smoke');
+      const u = undo(d2);
+      return u.ok && u.r.closing === true && sd.latestSetDecision(db, d2)?.decision === 'none';
+    })());
+
+  // ④ 「セットを作成」の取り消し = 手つかずのセットも一緒に取り下げる
+  const p1 = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, price, created_by) VALUES ('setundo-c', '取消テスト 作成', 'approved', 1980, 'smoke')`
+  ).run().lastInsertRowid);
+  const pv1 = wfp.progressOf(p1, { db }).main.find((x) => x.step_code === 'set_review').version;
+  const created = sd.createSetDraft(p1, { mode: 'copy', parent_step_version: pv1 }, 'smoke', { isAdmin: true, actorStaffId: null });
+  const u3 = undo(p1);
+  check('判断の取り消し: 「セットを作成」を取り消すと、手つかずのセットも取り下げる (除外)',
+    u3.ok && u3.r.withdrawn?.id === created.draftId
+    && db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(created.draftId).status === 'excluded',
+    JSON.stringify(u3));
+  check('判断の取り消し: 取り下げたセットは親のカードの「派生セット」に数えない',
+    wfp.boardData(db, {}).columns.concat([{ cards: wfp.boardData(db, {}).doneCards }])
+      .flatMap((c) => c.cards).filter((c) => c.id === p1).every((c) => c.setChildrenCount === 0), '');
+
+  // ⑤ 誰かが進めたセットは消さない — 取り消しごと断る (勝手に人の作業を消さない)
+  const p2 = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, price, created_by) VALUES ('setundo-t', '取消テスト 進行中', 'approved', 1980, 'smoke')`
+  ).run().lastInsertRowid);
+  const pv2 = wfp.progressOf(p2, { db }).main.find((x) => x.step_code === 'set_review').version;
+  const created2 = sd.createSetDraft(p2, { mode: 'copy', parent_step_version: pv2 }, 'smoke', { isAdmin: true, actorStaffId: null });
+  // セットの工程は progressOf の main (track='set' もここに入る) から拾う
+  const composeStep = wfp.progressOf(created2.draftId, { db }).main.find((x) => x.step_code === 'set_compose');
+  wfp.setStepState(created2.draftId, 'set_compose', { state: 'doing', expected_version: composeStep.version }, 'smoke', { isAdmin: true });
+  const u4 = undo(p2);
+  check('判断の取り消し: 誰かが進めたセットがあるときは取り消しごと断る',
+    u4.ok === false && u4.status === 400 && /作成のあとに操作されている/.test(u4.msg || '')
+    && sd.latestSetDecision(db, p2)?.decision === 'create'
+    && db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(created2.draftId).status !== 'excluded',
+    JSON.stringify(u4));
+
+  // ⑥ 🚨 親に画像がある商品でも、作った直後なら取り消せる (2026-09-07 Codex R1)。
+  //    作成時に applyImagePlanToTrack が画像工程を todo → skip にして版数を上げるので、
+  //    「工程の版数が動いたか」で見ると**実データでは常に取り消せなくなる**
+  const p3 = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, price, created_by) VALUES ('setundo-img', '取消テスト 画像あり', 'approved', 1980, 'smoke')`
+  ).run().lastInsertRowid);
+  {
+    const insImg = db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, ?, ?)');
+    for (let i = 0; i < 4; i++) insImg.run(p3, `undo-img-${i}`, i);
+  }
+  const pv3 = wfp.progressOf(p3, { db }).main.find((x) => x.step_code === 'set_review').version;
+  const created3 = sd.createSetDraft(p3, { mode: 'copy', parent_step_version: pv3 }, 'smoke', { isAdmin: true, actorStaffId: null });
+  const imgTouched = db.prepare(`SELECT COUNT(*) c FROM draft_step_progress WHERE draft_id = ? AND version > 0`).get(created3.draftId).c;
+  const u5 = undo(p3);
+  check('判断の取り消し: 親に画像がある商品でも、作った直後なら取り消せる',
+    imgTouched > 0 && u5.ok === true && u5.r.withdrawn?.id === created3.draftId,
+    `画像計画で版数が動いた工程 ${imgTouched} 件 / ${JSON.stringify(u5)}`);
+
+  db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(d0, d1, dMark, d2, p1, created.draftId, p2, created2.draftId, p3, created3.draftId);
+}
+
 // ─── ⑤を閉じる画面 (2026-09-04 §5.4) ────────────────────────────────────
 // 🚨 判断なしで⑤を閉じられなくした以上、画面から判断を送れないと工程が詰まる (Codex R3 high)
 {
@@ -7715,14 +7895,19 @@ for (const [name, file, data] of renders) {
 
   check('セットカード: 親のカードには派生の件数を出す (一覧は詳細画面)',
     parent.includes('派生セット 2件') && !parent.includes('data-set="1"'), parent.slice(0, 300));
+  // 🚨 判定は「セット商品の印」= その札そのものに限る (2026-09-07)。
+  //    ページ全体・カード全体で「🎁 セット」を includes すると、判断の札 (🎁 判断: セットを作成) を拾って
+  //    合格・不合格が入れ替わる — 否定形のテストほど、見る範囲を狭くする
   check('セットカード: 親のカードに「セット」の印は付けない',
-    !parent.includes('🎁 セット'));
+    !parent.includes('kb-tag set'), parent.slice(0, 300));
   check('⑤の判断: 「作らない」はカードに理由まで出す',
     none.includes('判断: 作らない') && none.includes('送料負け'), none.slice(0, 300));
   check('⑤の判断: 「保留」もカードに出す (未検討と区別する)',
     hold.includes('判断: 保留') && hold.includes('売れ行きを見てから'), hold.slice(0, 300));
-  check('⑤の判断: 「セットを作成」はカードに出さない (派生の件数で分かる)',
-    !parent.includes('判断: セットを作成'));
+  // 2026-09-07: 「セットを作成」も札に出すようにした。判断するとカードは次の列へ動くので、
+  // ⑤の列にしか札を出さないと『押し間違いを取り消す』入口がボードから消える
+  check('⑤の判断: 「セットを作成」も札に出し、取り消せる',
+    parent.includes('判断: セットを作成') && parent.includes('↩ 取り消す'), parent.slice(0, 600));
 
   // 全体ビューはセット工程を本流の列に投影して置くので、本当の工程名を必ず出す (§4.6)
   check('セットカード: 全体ビューでは本当のセット工程名を出す (投影を隠さない)',
@@ -7736,6 +7921,47 @@ for (const [name, file, data] of renders) {
     && bhSet.includes('出品準備') && !bhSet.includes('基本情報入力'), bhSet.slice(0, 200));
   check('セット工程ビュー: 列名と工程が同じなので投影のタグは出さない',
     !bhSet.includes('セット工程: '));
+
+  // ─── セットの判断をカードから決める (2026-09-07 中原さん要望) ───
+  {
+    const bhBtn = renderedHtml.get('board.ejs (セット判断のボタン)') || '';
+    // 完了列のカードは class="kb-card" (末尾の空白なし) なので、区切りは正規表現で取る
+    const cardB = (id) => {
+      const seg = bhBtn.split(/<div class="kb-card[" ]/).find((x) => x.includes(`data-draft="${id}"`)) || '';
+      return seg.split('<script>')[0];
+    };
+    const fresh = cardB(96001), held = cardB(96002), others = cardB(96003), later = cardB(96004);
+    check('ボード判断: ⑤の列の未判断カードに 作る/作らない/保留 が並ぶ',
+      fresh.includes('🎁 作る') && fresh.includes('🚫 作らない') && fresh.includes('⏸ 保留')
+      && fresh.includes('まだ決めていません'), fresh.slice(0, 600));
+    check('ボード判断: 未判断のカードには「取り消す」を出さない (取り消すものが無い)',
+      !fresh.includes('↩ 取り消す'), fresh.slice(0, 600));
+    check('ボード判断: 未割り当ての工程は押した人が引き受ける (claim=1 を持たせる)',
+      fresh.includes('data-claim="1"') && fresh.includes('data-version="3"'), fresh.slice(0, 400));
+    check('ボード判断: 保留は⑤が開いたままなので、判断ボタンと取り消しが両方出る',
+      held.includes('判断: 保留') && held.includes('🚫 作らない') && held.includes('↩ 取り消す'), held.slice(0, 600));
+    check('ボード判断: 自分が担当の工程は引き受け直さない (claim を送らない)',
+      held.includes('data-claim=""') && held.includes('data-version="5"'), held.slice(0, 400));
+    // 🚨 押せない理由は**押す前に**出す (403 で弾かれてから知らせない)。詳細画面 #1223 と同じ物差し
+    check('ボード判断: 他人の担当のカードはボタンを出さず、誰の担当かを書く',
+      others.includes('高島 和美 さんの担当です')
+      && !others.includes('🚫 作らない') && !others.includes('↩ 取り消す'), others.slice(0, 600));
+    // 判断が決まるとカードは次の列へ動く。⑤の列にしか置かないと押し間違いを直せなくなる
+    check('ボード判断: ⑤を離れたカードでも「取り消す」だけは出る (押し間違いを直せる)',
+      later.includes('判断: 作らない') && later.includes('↩ 取り消す')
+      && !later.includes('🎁 作る'), later.slice(0, 600));
+    // ボタンはカードのリンク (<a class="kb-card-link">) の外 = 押しても詳細画面へ飛ばない
+    check('ボード判断: ボタンはカードのリンクの外にある (入れ子リンクにしない)',
+      fresh.indexOf('</a>') !== -1 && fresh.indexOf('kb-set-btn') > fresh.indexOf('</a>'), fresh.slice(0, 800));
+    // 判断が済むとカードは列を移り、やがて完了列に来る。片方にしか置かないと取り消せなくなる
+    const doneCard = cardB(96005);
+    check('ボード判断: 完了列のカードでも「取り消す」が出る',
+      doneCard.includes('判断: セットを作成') && doneCard.includes('↩ 取り消す')
+      && !doneCard.includes('🎁 作る'), doneCard.slice(0, 600));
+    check('ボード判断: 理由を聞くダイアログは 1 枚を使い回す (カードごとに入力欄を置かない)',
+      (bhBtn.match(/id="kb-setdec"/g) || []).length === 1
+      && bhBtn.includes('送料負け (単価が低い)'), '');
+  }
 
   // NE要対応ビュー (§5.5)。列ではなく表 — 止まっているセットを1画面で見比べる
   const bhNe = renderedHtml.get('board.ejs (NE要対応)') || '';
@@ -7828,6 +8054,9 @@ for (const [name, file, data] of renders) {
     check('セット判断の入口: 未判断の「作る」ボタンは青 (いちばん進めたい操作)',
       ca > 0 && dhSingle.slice(Math.max(0, ca - 80), ca).includes('btn-primary'),
       dhSingle.slice(Math.max(0, ca - 80), ca));
+    // 取り消すものが無いうちは出さない (押せないボタンを並べない)
+    check('セット判断の入口: 未判断のうちは「取り消す」を出さない',
+      !dhSingle.includes('id="set-decision-undo"'), '');
   }
   {
     // 担当外の一般ユーザーは押せない (サーバー側 assertStepOperable と同じ物差し)。
@@ -7843,9 +8072,15 @@ for (const [name, file, data] of renders) {
       createBtn.slice(0, 120) + ' | ' + decBtn.slice(0, 120));
     // 判断済みなら理由まで札に出し、ボタンは「見直す」に変わる
     const dhNone = renderedHtml.get('detail.ejs (セットの親・判断=作らない)') || '';
+    // 🚨 否定形はページ全体で見ない (2026-09-07)。画面下の JS の確認メッセージにも
+    //    「まだ決めていません」が出るので、判定は**札そのもの**に限る
+    const chipOf = (html) => {
+      const at = html.indexOf('🎁 セット商品にする？');
+      return at > 0 ? html.slice(at, at + 400) : '';
+    };
     check('セット判断の入口: 判断済みなら理由つきで札に出る',
-      dhNone.includes('作らない (送料負け (単価が低い))') && !dhNone.includes('まだ決めていません'),
-      dhNone.slice(Math.max(0, dhNone.indexOf('セット商品にする')), dhNone.indexOf('セット商品にする') + 400));
+      chipOf(dhNone).includes('作らない (送料負け (単価が低い))') && !chipOf(dhNone).includes('まだ決めていません'),
+      chipOf(dhNone));
     // 🚨 「見直す」は判断の種類ごとに確かめる。none だけ見ていると、既存あり・作成済みで
     //    「札=既存のセットあり / ボタン=作らない」の食い違いが残る (Codex R1)
     for (const tag of ['作らない', '既存あり', '保留', '作成済み']) {
@@ -7856,7 +8091,10 @@ for (const [name, file, data] of renders) {
       const btn = at > 0 ? dh.slice(at, dh.indexOf('</button>', at)) : '';
       check(`セット判断の入口: 判断済み (${tag}) のボタンは「見直す」`,
         dh.length > 500 && btn.includes('この判断を見直す') && !btn.includes('セットは作らない')
-        && !dh.includes('まだ決めていません'), btn.slice(0, 220));
+        && !chipOf(dh).includes('まだ決めていません'), btn.slice(0, 220) + ' | ' + chipOf(dh).slice(0, 200));
+      // 押し間違いを白紙に戻す入口 (2026-09-07)。「見直す」は上書きなので、未判断には戻せない
+      check(`セット判断の入口: 判断済み (${tag}) には「取り消す」も出る`,
+        dh.includes('id="set-decision-undo"') && dh.includes('↩ この判断を取り消す'), '');
       // 決めた後に作成を推さない (青を外す)。「保留」はまだ決めていないのと同じなので青のまま
       const ca = dh.indexOf('id="set-create-open"');
       const cls = ca > 0 ? dh.slice(Math.max(0, ca - 80), ca) : ''; // このボタンの開きタグ (class を含む)
