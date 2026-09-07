@@ -1520,7 +1520,10 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       d.parent_snapshot_at,
       (SELECT ne_code FROM product_drafts p WHERE p.id = d.parent_draft_id) AS parent_ne_code,
       (SELECT updated_at FROM product_drafts p WHERE p.id = d.parent_draft_id) AS parent_updated_at,
-      (SELECT COUNT(*) FROM product_drafts c WHERE c.parent_draft_id = d.id) AS set_children_count,
+      ${/* 取り下げたセット (判断の取り消しで excluded にしたもの) は数えない — 2026-09-07。
+            数えるとカードに「派生セット 1件」が残り、取り消したのに作ったままに見える */''}
+      (SELECT COUNT(*) FROM product_drafts c WHERE c.parent_draft_id = d.id
+         AND c.status NOT IN ('on_hold', 'excluded')) AS set_children_count,
       (SELECT GROUP_CONCAT(member_ne_code || ' × ' || qty, ' + ')
          FROM (SELECT member_ne_code, qty FROM draft_set_members WHERE set_draft_id = d.id ORDER BY sort)) AS set_members,
       (SELECT decision FROM draft_set_decisions sd WHERE sd.draft_id = d.id ORDER BY sd.decided_at DESC, sd.id DESC LIMIT 1) AS set_decision,
@@ -1645,6 +1648,16 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       current: p.current, stalledDays: p.stalledDays, doneCount: p.doneCount, totalCount: p.totalCount,
       image: imageSummaryOf(p, d),
       ...setSummaryOf(d),
+      // ⑤「セット商品作成検討」の行 (2026-09-07)。ボードのカードから 作る/作らない を押すために
+      // 版数 (CAS) と担当者を渡す。担当者は「押せるか」をカード側で出し分けるのに使う —
+      // 押せないボタンを出して 403 で弾いてから理由を知らせない
+      setReview: p.setReview ? {
+        version: p.setReview.version,
+        state: p.setReview.state,
+        assigneeId: p.setReview.assignee_id,
+        assigneeName: p.setReview.assignee_name || null,
+        roleCode: p.setReview.role_code || null,
+      } : null,
       // 画像制作だけの保留 (2026-08-26)。画像ビューではバッジを出し、滞留の赤枠は付けない (止めているのは意図)
       imageOnHold: d.image_workflow_state === 'on_hold',
       imageHoldNote: d.image_hold_note || null,
@@ -1832,7 +1845,7 @@ export function progressSummaryFor(db, draftIds) {
   if (ids.length === 0) return out;
   const placeholders = ids.map(() => '?').join(',');
   const rows = db.prepare(`
-    SELECT p.draft_id, p.step_code, p.state, p.assignee_id, p.done_at, p.started_at,
+    SELECT p.draft_id, p.step_code, p.state, p.assignee_id, p.done_at, p.started_at, p.version,
            ${/* listing_gate を落とすと kindSummaryOf の gateRows が「全工程」になり、gateDone が
                 常に done と同じ意味になってしまう (ボードの「済」判定がこれを見る — 2026-09-01) */''}
            s.label, s.track, s.image_kind, s.image_stage, s.sort, s.stall_days, s.role_code, s.listing_gate,
@@ -1874,6 +1887,10 @@ export function progressSummaryFor(db, draftIds) {
       stalledDays: current ? stalledDaysOf(main, main.indexOf(current), createdAt) : null,
       doneCount: main.filter((r) => r.state === 'done' || r.state === 'skip').length,
       totalCount: main.length,
+      // セット展開判断 (⑤) の行そのもの。ボードのカードから判断を押すのに版数 (CAS) と
+      // 担当者が要る (2026-09-07)。current だけを渡すと、⑤ が閉じたあとのカード
+      // (= 取り消したいカード) で版数が取れず「取り消す」が押せなくなる
+      setReview: main.find((r) => r.step_code === SET_REVIEW_STEP) || null,
     });
   }
   return out;

@@ -711,3 +711,84 @@ export function latestSetDecision(db, draftId) {
     FROM draft_set_decisions WHERE draft_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1
   `).get(Number(draftId)) || null;
 }
+
+/**
+ * 「作成」で作ったセットが、まだ誰も手を付けていないか (取り消しと一緒に取り下げてよいか)。
+ * 手が付いていれば**その理由**を返す (null = 手つかず)。
+ * 版数も見るのは、状態が todo に戻された工程でも「一度触られた」ことが残るため —
+ * 状態だけで見ると、進めてから戻したセットが「手つかず」に見えて消える
+ */
+function setDraftTouchedReason(db, set) {
+  if (set.provisional_code !== 1) return '本コードが確定している';
+  if (set.status !== 'draft' && set.status !== 'ready_for_ai') return 'すでに工程が進んでいる';
+  const rk = db.prepare('SELECT registered_at FROM draft_rakuten WHERE draft_id = ?').get(set.id);
+  if (rk?.registered_at) return 'すでに楽天へ出品されている';
+  const touched = db.prepare(`
+    SELECT COUNT(*) AS n FROM draft_step_progress
+    WHERE draft_id = ? AND (state <> 'todo' OR version > 0)
+  `).get(set.id);
+  if ((touched?.n || 0) > 0) return 'すでに工程が動かされている';
+  return null;
+}
+
+/**
+ * 直前の「セット展開判断」を取り消す (2026-09-07 中原さん:「間違って選択したときに戻せるように」)。
+ *
+ * 履歴は append-only にしていたが、ボードのカードから 1 クリックで判断できるようにすると
+ * **押し間違いが必ず起きる**。押し間違いを消せないと、現場は怖くて押さない = ボードで
+ * 判断できるようにした意味が無くなるので、直前の 1 件だけを消せるようにした。
+ * 何を取り消したかは draft_events に残す (履歴が消えるわけではない)。
+ *
+ * 🚨 「作成」を取り消すときは、作られたセット商品も一緒に取り下げる (status='excluded')。
+ *    判断だけ消してセットのカードが残ると、誰も作ったつもりのないセットがボードに漂う。
+ *    ただし**まだ手つかずのときだけ** — 誰かが進めたセットは消さずに取り消し自体を断る。
+ * 🚨 消したあとの⑤の開け閉めは、**ひとつ前の判断**から決め直す (呼び出し側が closing を見る)。
+ *    「必ず todo に戻す」にすると、作らない → 保留 → 取り消し で todo のままになるべきところが
+ *    合っていても、作らない → 作成 → 取り消し のとき「作らない」に戻ったのに⑤が開いてしまう
+ */
+export function undoSetDecision(db, draftId, actor) {
+  const id = Number(draftId);
+  const last = db.prepare(`
+    SELECT id, decision, reason_code, reason_text, linked_set_draft_id
+    FROM draft_set_decisions WHERE draft_id = ? ORDER BY decided_at DESC, id DESC LIMIT 1
+  `).get(id);
+  if (!last) throw badRequest('取り消せる判断がありません (まだ何も決めていません)');
+
+  let withdrawn = null;
+  // 取り下げるのは「作成」で作ったセットだけ。'existing' の紐づけ先は元からあったセットなので触らない
+  if (last.decision === 'create' && last.linked_set_draft_id != null) {
+    const set = db.prepare(`
+      SELECT id, ne_code, name, status, provisional_code, parent_draft_id
+      FROM product_drafts WHERE id = ?
+    `).get(last.linked_set_draft_id);
+    if (set && set.parent_draft_id === id && set.status !== 'excluded') {
+      const why = setDraftTouchedReason(db, set);
+      if (why) {
+        throw badRequest(`作成したセット商品「${set.name}」は${why}ため、この判断は取り消せません`
+          + ' (セット側のカードで対応してください)');
+      }
+      db.prepare(`
+        UPDATE product_drafts SET status = 'excluded', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?
+      `).run(set.id);
+      logEvent(db, set.id, 'set_draft_withdrawn',
+        '親の「セットを作る」判断が取り消されたため取り下げました (除外)', actor);
+      withdrawn = { id: set.id, neCode: set.ne_code, name: set.name };
+    }
+  }
+
+  db.prepare('DELETE FROM draft_set_decisions WHERE id = ?').run(last.id);
+  const prev = latestSetDecision(db, id);
+  logEvent(db, id, 'set_decision_undone',
+    `判断「${describeSetDecision(last)}」を取り消しました`
+    + (withdrawn ? ` ／ セット ${withdrawn.neCode} を取り下げ` : '')
+    + (prev ? ` (ひとつ前の判断「${describeSetDecision(prev)}」に戻ります)` : ' (未判断に戻ります)'),
+    actor);
+  return {
+    undone: describeSetDecision(last),
+    prev,
+    withdrawn,
+    // ひとつ前が「作成 / 既存あり / 作らない」なら⑤は閉じたまま、無い・保留なら開け直す
+    closing: !!prev && SET_DECISIONS_CLOSING.includes(prev.decision),
+  };
+}

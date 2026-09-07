@@ -46,7 +46,7 @@ import {
 import {
   createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode, closeNeStepIfConfirmed,
   setNeRegistrationState, ackParentSnapshot, setImagePlansOf, replaceSetImagePlans, pendingImagePlanSlots,
-  recordSetDecision, latestSetDecision, describeSetDecision,
+  recordSetDecision, latestSetDecision, describeSetDecision, undoSetDecision,
   SET_DECISIONS_CLOSING, SET_DECISION_REASONS, NE_STATE_LABELS,
 } from './services/set-derive.js';
 import { syncDraftLinks } from '../product-links/sync.js';
@@ -2670,6 +2670,35 @@ router.post('/api/drafts/:id/own-brand', (req, res) => {
   res.json({ ok: true, ...saved });
 });
 
+/**
+ * ボードのカードから⑤「セット商品作成検討」を押したときの**自動引き受け** (2026-09-07)。
+ *
+ * ボードのカードは工程パネルを持たないので、未割り当てのままだと
+ * 「先に『自分が担当する』を押してください」で必ず弾かれる = ボードから判断できない。
+ * D&D (moveBoardCard) が既に同じ肩代わりをしているので、判断ボタンも同じ扱いにする。
+ * 権限の方針 (本人 + admin のみ・未割り当ては誰でも引き受け可) は変えず、クリックを肩代わりするだけ。
+ *
+ * 🚨 引き受けは版数を 1 消費するので、**引き受け後の版数を返して**呼び出し側がそれを使う。
+ *    渡された版数のまま次の CAS を回すと、自分の引き受けで必ず 409 になる。
+ * 詳細画面は押せないボタンを disabled にしている (claim を送らない) ので、
+ * 「担当を持たない人が詳細から黙って引き受ける」導線は増えない。
+ * @returns {number|null} 次に使う版数
+ */
+function claimSetReviewForBoard(db, draftId, expectedVersion, actor, ctx) {
+  const expected = expectedVersion == null ? null : Number(expectedVersion);
+  if (ctx.isAdmin || ctx.actorStaffId == null) return expected;
+  const row = db.prepare(`
+    SELECT p.assignee_id, s.role_code FROM draft_step_progress p
+    JOIN ph_steps s ON s.code = p.step_code
+    WHERE p.draft_id = ? AND p.step_code = 'set_review'
+  `).get(Number(draftId));
+  // 他人の担当・システム工程はここでは触らない (従来どおり assertStepPermission が弾く)
+  if (!row || row.assignee_id != null || !row.role_code) return expected;
+  setStepState(draftId, 'set_review', { assignee_id: ctx.actorStaffId, expected_version: expected },
+    actor, ctx);
+  return Number.isInteger(expected) ? expected + 1 : expected;
+}
+
 // セット展開判断の記録 (2026-09-04 §4.2)。「作らない」「保留」「既存あり」の入口。
 // 「新規作成」は下の派生生成 API が作成と同時に記録する
 router.post('/api/drafts/:id/set-decision', (req, res) => {
@@ -2688,7 +2717,11 @@ router.post('/api/drafts/:id/set-decision', (req, res) => {
     // 先に記録してから権限・版数で弾かれると、判断の履歴だけが残る。
     // 「保留」も⑤を触る操作なので、記録の前に同じ権限・版数を確かめる
     const out = db.transaction(() => {
-      const row = assertStepOperable(db, draft.id, 'set_review', req.body?.expected_version, ctx);
+      // ボードのカードからの判断は、未割り当てなら押した本人が引き受ける (claim: true)
+      const version = req.body?.claim
+        ? claimSetReviewForBoard(db, draft.id, req.body?.expected_version, actorOf(req), ctx)
+        : req.body?.expected_version;
+      const row = assertStepOperable(db, draft.id, 'set_review', version, ctx);
       // 🚨 判断は⑤に対する操作なので、**状態が変わらなくても版数を1つ消費する** (Codex R2)。
       // 消費しないと「保留 → 保留」のように状態が動かないとき CAS が効かず、
       // 古い画面から続けて別の判断を送れてしまう
@@ -2716,6 +2749,53 @@ router.post('/api/drafts/:id/set-decision', (req, res) => {
   } catch (e) { workflowError(res, e); }
 });
 
+// セット展開判断の**取り消し** (2026-09-07 中原さん:「間違って選択したときに戻せるように」)。
+// ボードのカードから 1 クリックで判断できるようにした以上、押し間違いは必ず起きる。
+// 直前の 1 件だけを消して、ひとつ前の判断 (無ければ未判断) に戻す。
+// 「作成」を取り消すときは、まだ手つかずのセット商品も一緒に取り下げる (services 側)
+router.post('/api/drafts/:id/set-decision/undo', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  try {
+    const me = staffByPortalEmail(req.session?.email);
+    const ctx = { isAdmin: req.session?.role === 'admin', actorStaffId: me?.id ?? null, requireVersion: true };
+    // 🚨 記録の削除と工程の開け直しは 1 トランザクション。権限・版数を先に確かめてから消す
+    // (先に消してから弾かれると、判断だけ失われる — 記録側 (set-decision) と同じ形)
+    const out = db.transaction(() => {
+      const version = req.body?.claim
+        ? claimSetReviewForBoard(db, draft.id, req.body?.expected_version, actorOf(req), ctx)
+        : req.body?.expected_version;
+      const row = assertStepOperable(db, draft.id, 'set_review', version, ctx);
+      // 判断を消すのも⑤に対する操作なので、状態が変わらなくても版数を 1 消費する
+      // (消費しないと、同じ画面から続けて 2 回取り消せてしまう)
+      const bumped = db.prepare(`
+        UPDATE draft_step_progress
+        SET version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE draft_id = ? AND step_code = 'set_review' AND version = ?
+      `).run(draft.id, row.version);
+      if (bumped.changes !== 1) {
+        const e = new Error('別の人がこの工程を先に更新しました。画面を読み直してください');
+        e.status = 409;
+        throw e;
+      }
+      const nextVersion = row.version + 1;
+      const r = undoSetDecision(db, draft.id, actorOf(req));
+      // ⑤の開け閉ては**ひとつ前の判断**から決め直す (取り消し後に残った判断が正)
+      if (r.closing && row.state !== 'done') {
+        setStepState(draft.id, 'set_review', { state: 'done', expected_version: nextVersion }, actorOf(req), ctx);
+      } else if (!r.closing && row.state !== 'todo') {
+        setStepState(draft.id, 'set_review', { state: 'todo', expected_version: nextVersion }, actorOf(req), ctx);
+      }
+      return r;
+    })();
+    res.json({
+      ok: true, undone: out.undone, withdrawn: out.withdrawn,
+      latest: latestSetDecision(db, draft.id),
+    });
+  } catch (e) { workflowError(res, e); }
+});
+
 // セット商品の派生ドラフト生成 (工程「セット商品作成検討」から)。
 // 単品の出品は止めず、セットは別カードとして並走させる (中原さん 2026-08-23)
 router.post('/api/drafts/:id/set-drafts', (req, res) => {
@@ -2725,10 +2805,18 @@ router.post('/api/drafts/:id/set-drafts', (req, res) => {
     // 権限判定は createSetDraft 内の setStepState (親の「セット商品作成検討」を閉じる操作) が行う。
     // 判断した本人か admin だけが作れる = 誰かのレビュー中に横から作られない
     const me = staffByPortalEmail(req.session?.email);
-    const r = createSetDraft(draft.id, req.body || {}, actorOf(req), {
-      isAdmin: req.session?.role === 'admin',
-      actorStaffId: me?.id ?? null,
-    });
+    const ctx = { isAdmin: req.session?.role === 'admin', actorStaffId: me?.id ?? null, requireVersion: true };
+    // ボードのカードから「作る」を押したとき (claim: true) は、未割り当てなら本人が引き受ける。
+    // 引き受けは版数を 1 消費するので、createSetDraft へ渡す親工程の版数も進める。
+    // 引き受けと作成は 1 トランザクション — 作成が途中で失敗したのに担当だけ付くのを防ぐ
+    const db = getDB();
+    const r = db.transaction(() => {
+      const body = req.body || {};
+      const version = body.claim
+        ? claimSetReviewForBoard(db, draft.id, body.parent_step_version, actorOf(req), ctx)
+        : body.parent_step_version;
+      return createSetDraft(draft.id, { ...body, parent_step_version: version }, actorOf(req), ctx);
+    })();
     res.json({ ok: true, draftId: r.draftId, neCode: r.neCode });
   } catch (e) { workflowError(res, e); }
 });
