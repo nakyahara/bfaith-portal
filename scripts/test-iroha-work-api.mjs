@@ -497,6 +497,42 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
   sessionRole = 'admin';
 }
 
+console.log('\n[預ける計画] GET /api/consign-plan (§AB-11 の 7b)');
+{
+  // ⭐実際に HTTP で叩く。service を直接呼ぶテストでは、router が値を渡し忘れていても気づけない
+  const t = upsertTaskFromImport({ notion_page_id: 'api-cplan', status: 'not_started', facility_code: 'iroha',
+    destination_id: null, product_code: 'API-CPLAN', product_name: '預け計画の検査', qty: 700,
+    arrival_date: '2026-09-01', master_snapshot: { units_per_container: 70, process_count: 2 },
+  }, { batchId: 'test-api' }).id;
+  const batch = getDB().prepare('SELECT id FROM f_iroha_task_batches WHERE task_id = ?').get(t);
+  const ver = getDB().prepare('SELECT version FROM f_iroha_tasks WHERE id = ?').get(t).version;
+  const made = await post('/api/consign', { id: t, batch_id: batch.id, facility_code: 'workcenter',
+    qty: 700, worker_id: S, expect_version: ver, due_date: '2026-10-01' });
+  ok(made.status === 200 && made.json.ok, '(前提) 預けを 1 件つくれる');
+
+  const r = await get('/api/consign-plan');
+  ok(r.status === 200 && r.json && r.json.ok, '職員なら 200 で返る');
+  const row = (r.json.rows || []).find((x) => x.id === made.json.consignment.id);
+  ok(!!row, '作った預けが行に出る');
+  ok(row.state === 'planned' && row.qty === 700 && row.boxes === 10,
+    '⭐状態・数・箱数がそろって返る (router が渡し忘れていない)');
+  ok(row.due_date === '2026-10-01', '返却の期限も返る');
+  ok(Array.isArray(r.json.facilities) && r.json.facilities.every((f) => f.offsite),
+    '拠点は物を持ち帰るところだけ');
+  ok(r.json.counts && r.json.counts.to_prepare >= 1, '入口に出す件数も返る');
+  ok(r.json.facility_loads && typeof r.json.facility_loads === 'object', '受け入れ枠も返る (画面がそのまま描ける)');
+
+  // ⭐ログインしていない人には出さない
+  sessionRole = null;
+  const anon = await get('/api/consign-plan');
+  ok(anon.status === 401 || anon.status === 403, '⭐ログインしていなければ出さない (' + anon.status + ')');
+  sessionRole = 'admin';
+
+  // ⭐書き込みの口ではない
+  const w = await post('/api/consign-plan', {});
+  ok(w.status === 404 || w.status === 405, '⭐POST は受けない (読むだけの画面)');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 // process.exit で落とすと、開いたままの接続を libuv が abort することがある
 // (feedback_notify_job_exit_libuv_crash)。閉じてから終了コードだけ置いて自然に終わらせる
