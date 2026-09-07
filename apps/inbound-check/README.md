@@ -190,15 +190,34 @@ active バッチの work_date < 今日 (JST)
     最初の実装はこれを使っていたため、**iPad では一度もカメラが起動しなかった** (2026-09-07 実機で発覚)。
     「iPadOS 17+ なら使える」と書いていたのが誤り。iPad 前提の画面で Shape Detection API を当てにしない
   - 配信 = `server.js` が `node_modules/zxing-wasm/dist` を `/vendor/zxing-wasm` にマウント。
-    **public/ に写さない** — 写すと JS と wasm の版がずれて静かに壊れる。Cache-Control も付けない (毎回 ETag 検証)
+    **public/ に写さない** — 写すと JS と wasm の版がずれて静かに壊れる。
+    Cache-Control も付けない (毎回 ETag 検証) = 版が上がったとき「JS だけ新しく wasm が古い」を残さない。
+    ⚠ デプロイの入れ替わり中だけは古い JS と新しい wasm が組み合わさる余地がある。
+    気になるようになったら `/vendor/zxing-wasm/<版>/…` のような版つき URL + 長期キャッシュにする (Codex #1233 R1)。
+    解決に失敗してもポータルは落とさない (カメラが使えないだけ)
   - **押したときだけ読み込む** (wasm 約1MB)。`locateFile` で wasm の場所を明示する
     (渡さないと外部 CDN に取りに行く = 社内ポータルから外へ出てしまう)
+  - 🚨 **`prepareZXingModule` は `fireImmediately` で wasm の取得・コンパイルまで待ち切ってから**
+    カメラを開く。待たないと 404 や配信障害の失敗が最初のフレーム解析まで遅れて出て、
+    フレーム側の握りつぶしに吸われる → カメラは開いたまま 250ms ごとに永久リトライし、
+    現場には正常時と同じ案内が出続ける = **また「動かないカメラ」になる** (Codex #1233 R1 P1)
   - 映像は **横 640px に縮めて** canvas → `readBarcodesFromImageData` に渡す (1280 のままだと iPad が重い)。250ms 間隔
   - 読む種類 = EAN13 / EAN8 / UPCA / UPCE / Code128 / Code39 / ITF (`READER_OPTIONS`)
+  - 🚨 **同じ値を2フレーム続けて読めたときだけ確定する**。Code39 / Code128 / ITF はチェックデジットが
+    無く、枠に入れる途中のブレや棚の別ラベルの一部を「読めた」と返すことがある。
+    倉庫では別商品を出すこと自体が事故なので1フレームでは信じない (確定が 250ms 遅れるだけ)。
+    `isValid === false` (EAN/UPC のチェックデジット不一致) も使わない
+  - フレーム解析が **続けて8回 (2秒) 失敗したら止めて理由を出す**。黙って回し続けない
   - カメラが無い・許可されていない端末には「検索欄を長押し →『テキストをスキャン』」を案内する
-  - テスト = `node scripts/test-inbound-check-barcode-scan.mjs`。**本物の wasm に本物の EAN-13 画像
-    (テスト内で規格どおりに生成) を食わせて桁まで一致することを見る**。実機を持たずに「読める」と
-    言わないための下限。白紙・ノイズで何も返さないことも見る (誤読で別の商品を出さない)
+  - テスト = `node scripts/test-inbound-check-barcode-scan.mjs` (28項目)。実機を持たずに「読める」と
+    言わないための下限:
+    - 本物の wasm に、テスト内で規格どおり生成した EAN-13 画像を食わせて **桁まで一致**を見る
+    - 白紙・ノイズでは何も返さないこと (誤読で別の商品を出さない)
+    - **本番と同じ経路** (Express の静的配信 → `Content-Type` → `locateFile` → wasm コンパイル → 復号)。
+      wasm が `application/wasm` で返らないと `WebAssembly.instantiateStreaming` が通らない。
+      wasm が 404 のときに `prepareZXingModule` がその場で失敗することも見る
+    - 画面が `BarcodeDetector` に戻っていないこと・上の安全弁が消えていないこと (退行防止)
+    - ⚠ このリポジトリにはテストを回す CI が無い (全スイート手動)。PR のたびに人が回すこと
 - 値札は**同じ印刷キュー** (`enqueuePrintJob` の `source='product'`)。刷る内容は画面の値でなく商品マスタ+控えから取る。
   進行中/結果不明の扱い (in_progress / confirm_unknown / state_changed) は伝票からの発行と同じ。**見張りは商品単位 (code_key)**: 伝票から刷っても商品画面から刷っても紙は同じ1枚なので、片方が進行中/結果不明ならもう片方からも積まない (伝票の作り直しをまたいでも同じ)。商品ごとの最新ジョブ (どちらの発行でも) = `latestJobsForProducts`
   刷るバーコードは伝票からでも商品画面からでも **resolveBarcode の値** (ロジザード側 → 控え)。ロジザード側に値がある商品は画面で直せない (readonly_barcode 409)。画面から来た値は 控えが無ければ保存してから刷り、控えと違えば `state_changed` で積まない (別の人が直した後の古い入力で違うシールを出さない)。控えの保存 `POST /api/products/barcode` も `expected` (画面が見ていた値) が今と違えば 409

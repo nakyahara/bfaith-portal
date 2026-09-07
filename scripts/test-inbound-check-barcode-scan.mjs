@@ -15,6 +15,8 @@
  *   3. 画面が渡すのと同じ形 (RGBA の ImageData) と同じ formats 指定で読める
  *   4. 白紙・ノイズでは何も返さない (誤読で違う商品を出さない)
  *   5. products.html が BarcodeDetector に依存していない (退行防止)
+ *   6. **本番と同じ経路** (Express の静的配信 → Content-Type → locateFile → wasm コンパイル → 復号)。
+ *      wasmBinary を直接注入するテストは、いちばん壊れやすいこの経路を通らない (Codex #1233 R1 P2)
  */
 import fs from 'fs';
 import path from 'path';
@@ -170,6 +172,78 @@ console.log('\n[5] 画面が BarcodeDetector に依存していない (退行防
     if (!html.includes(`'${f}'`)) { ok(false, `画面の formats に ${f} がある`); break; }
   }
   ok(READER_OPTIONS.formats.every((f) => html.includes(`'${f}'`)), '画面とテストで formats 指定が揃っている');
+}
+
+// ─── 6. 本番と同じ経路で通す ────────────────────────────────────────────────
+// 🚨 ここが今回いちばん壊れやすい: マウントのパス / Content-Type / locateFile のどれかが
+//    ずれると、画面には「読み取りプログラムを読み込めませんでした」しか出ない。
+//    wasm は `application/wasm` で返らないと WebAssembly.instantiateStreaming が通らない。
+console.log('\n[6] 本番と同じ経路 (Express 配信 → Content-Type → locateFile → wasm)');
+{
+  const express = (await import('express')).default;
+  const app = express();
+  app.use('/vendor/zxing-wasm', express.static(distDir));
+  const srv = app.listen(0, '127.0.0.1');
+  await new Promise((r) => srv.once('listening', r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  try {
+    const js = await fetch(`${base}/vendor/zxing-wasm/${IIFE_REL}`);
+    ok(js.status === 200 && /javascript/.test(js.headers.get('content-type') || ''),
+      `本体が配信される (${js.status} / ${js.headers.get('content-type')})`);
+    const wasmRes = await fetch(`${base}/vendor/zxing-wasm/${WASM_REL}`);
+    ok(wasmRes.status === 200 && wasmRes.headers.get('content-type') === 'application/wasm',
+      `wasm が application/wasm で返る (${wasmRes.headers.get('content-type')}) = instantiateStreaming が通る`);
+    ok((await fetch(`${base}/vendor/zxing-wasm/../../package.json`)).status === 404,
+      '配信ディレクトリの外へは出られない');
+
+    // IIFE をブラウザと同じように評価する。中の Emscripten は globalThis.window があるときだけ
+    // fetch でファイルを取りに行くので、Node でもそこを通すために window を置く
+    const hadWindow = 'window' in globalThis;
+    if (!hadWindow) globalThis.window = globalThis;
+    try {
+      const src = await js.text();
+      // eslint-disable-next-line no-new-func
+      new Function(src + '\n;globalThis.__ZX = ZXingWASM;')();
+      const ZX = globalThis.__ZX;
+      ok(!!(ZX && ZX.readBarcodesFromImageData), 'グローバル ZXingWASM が生える (script タグで読める形)');
+      // 画面と同じ locateFile。ここで wasm を実 URL から取ってコンパイルする
+      await ZX.prepareZXingModule({
+        overrides: { locateFile: (f, prefix) => (String(f).endsWith('.wasm') ? `${base}/vendor/zxing-wasm/${WASM_REL}` : prefix + f) },
+        fireImmediately: true,
+      });
+      const jan = '4901234567894';
+      const r = await ZX.readBarcodesFromImageData(renderEan13(jan), READER_OPTIONS);
+      ok(r.length === 1 && r[0].text === jan, `配信された wasm で JAN を復号できる (${r[0]?.text})`);
+      // 🚨 wasm が 404 なら **その場で失敗する** こと (フレームループまで遅れて出ると握りつぶされる)
+      ZX.purgeZXingModule();
+      let threw = false;
+      try {
+        await ZX.prepareZXingModule({
+          overrides: { locateFile: () => `${base}/vendor/zxing-wasm/nope.wasm` },
+          fireImmediately: true,
+        });
+      } catch { threw = true; }
+      ok(threw, 'wasm が取れないときは prepareZXingModule が失敗する (画面はここでバナーを出す)');
+    } finally {
+      if (!hadWindow) delete globalThis.window;
+    }
+  } finally {
+    srv.close();
+  }
+}
+
+// ─── 7. 画面が初期化の失敗をその場で拾うか (握りつぶし防止) ────────────────
+console.log('\n[7] 初期化の失敗を握りつぶさない (Codex #1233 R1 P1)');
+{
+  const html = fs.readFileSync(path.join(ROOT, 'apps/inbound-check/views/products.html'), 'utf8');
+  ok(/fireImmediately:\s*true/.test(html),
+    'prepareZXingModule を fireImmediately で待つ (wasm の取得・コンパイルまで済ませてからカメラを開く)');
+  ok(/failStreak/.test(html) && /stopScan\(\)/.test(html),
+    'フレーム解析が続けて失敗したら止めて理由を出す (250ms ごとの永久リトライにしない)');
+  ok(/val === lastSeen/.test(html),
+    '同じ値を2フレーム続けて読めたときだけ確定する (1フレームの誤読で別商品を出さない)');
+  ok(/isValid !== false/.test(html),
+    'チェックデジットが合わない読み取りは使わない');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

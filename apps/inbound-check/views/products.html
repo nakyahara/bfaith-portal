@@ -281,13 +281,15 @@
           if (!window.ZXingWASM || !window.ZXingWASM.readBarcodesFromImageData) {
             reject(new Error('読み取りプログラムの形が違います')); return;
           }
-          try {
-            // 🚨 locateFile を渡さないと wasm を外部 CDN から取りに行く。社内ポータルから外へ出さない
-            window.ZXingWASM.prepareZXingModule({
-              overrides: { locateFile: (p2, prefix) => (String(p2).endsWith('.wasm') ? ZXING_WASM : prefix + p2) },
-            });
-            resolve(window.ZXingWASM);
-          } catch (e2) { reject(e2); }
+          // 🚨 **wasm の取得とコンパイルまでここで待ち切る** (`fireImmediately`)。
+          //    待たないと、404 や配信障害の失敗が最初のフレーム解析まで遅れて出る →
+          //    フレーム側の握りつぶしに吸われ、カメラは開いたまま 250ms ごとに永久リトライになり、
+          //    現場には正常時と同じ案内が出続ける = また「動かないカメラ」になる (Codex #1233 R1 P1)
+          // 🚨 locateFile を渡さないと wasm を外部 CDN から取りに行く。社内ポータルから外へ出さない
+          Promise.resolve(window.ZXingWASM.prepareZXingModule({
+            overrides: { locateFile: (p2, prefix) => (String(p2).endsWith('.wasm') ? ZXING_WASM : prefix + p2) },
+            fireImmediately: true,
+          })).then(() => resolve(window.ZXingWASM), reject);
         };
         sc.onerror = () => reject(new Error('読み取りプログラムを読み込めませんでした'));
         document.head.appendChild(sc);
@@ -305,17 +307,20 @@
         return;
       }
       scanStarting = true;
-      $('#scanBtn').disabled = true;
-      // デコーダ (約1MB) を先に落とす。回線が細いと数秒かかるので、カメラを開ける前に知らせる
+      const btn = $('#scanBtn');
+      const btnLabel = btn.textContent;
+      btn.disabled = true;
+      // デコーダ (wasm 約1MB) をここで落とし切る。回線が細いと数秒かかるのでボタンに出す
       let zx = null;
+      btn.textContent = '📷 準備中…';
       try { zx = await loadDecoder(); }
       catch (e) {
         banner('err', 'バーコードの読み取りを始められませんでした (' + esc(e.message) + ')。'
           + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
-        scanStarting = false; $('#scanBtn').disabled = false;
+        scanStarting = false; btn.disabled = false; btn.textContent = btnLabel;
         return;
-      }
-      if (gen !== scanGen) { scanStarting = false; $('#scanBtn').disabled = false; return; }
+      } finally { btn.textContent = btnLabel; }
+      if (gen !== scanGen) { scanStarting = false; btn.disabled = false; return; }
       let stream = null;
       try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false }); }
       catch (e) {
@@ -345,6 +350,12 @@
       // 映像を canvas に落として wasm に渡す。**横 640px に縮める** —
       // 1280px のまま毎フレーム解析すると iPad が重くなり、JAN はこの解像度で十分読める
       if (!scanCanvas) scanCanvas = document.createElement('canvas');
+      // 🚨**同じ値を2フレーム続けて読めたときだけ確定する** (Codex #1233 R1 P2)。
+      //   Code39 / Code128 / ITF はチェックデジットが無く、枠に入れる途中のブレや棚の別ラベルの
+      //   一部を「読めた」と返すことがある。倉庫では別商品を出すこと自体が事故なので、
+      //   1フレームでは信じない (確定が 250ms 遅れるだけ)
+      let lastSeen = null;
+      let failStreak = 0;
       const tick = async () => {
         if (!scanStream || gen !== scanGen) return;
         try {
@@ -359,10 +370,23 @@
             const codes = await zx.readBarcodesFromImageData(img, READER_OPTIONS);
             // 読み取りを待っている間に閉じられたら、返ってきた結果は使わない (閉じた後に検索が走らないように)
             if (!scanStream || gen !== scanGen) return;
-            const hit = codes.find((x) => x.text && /^[A-Za-z0-9]{6,}$/.test(String(x.text).trim()));
-            if (hit) { onScanned(String(hit.text).trim()); return; }
+            failStreak = 0;
+            // isValid === false = チェックデジットが合っていない (EAN/UPC)。そのまま検索しない
+            const hit = codes.find((x) => x.text && x.isValid !== false && /^[A-Za-z0-9]{6,}$/.test(String(x.text).trim()));
+            const val = hit ? String(hit.text).trim() : null;
+            if (val && val === lastSeen) { onScanned(val); return; }
+            lastSeen = val;
           }
-        } catch (e) { /* まだ映っていない / 一時的な失敗 → 次の回 */ }
+        } catch (e) {
+          // 映像がまだ来ていないだけなら次の回で直る。**続けて失敗するのは読み取り側の異常**なので、
+          // 黙って回し続けずに止めて理由を出す (2秒ぶん = 8回)
+          if (++failStreak >= 8) {
+            stopScan();
+            banner('err', 'バーコードを読み取れませんでした (' + esc((e && e.message) || '') + ')。'
+              + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+            return;
+          }
+        }
         if (gen !== scanGen) return;
         scanTimer = setTimeout(tick, 250);
       };
