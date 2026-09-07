@@ -131,7 +131,7 @@ export function buildRow(listing, ctx) {
   // ── 3. フルフィルメントが未解決なら、どの経路でも計算できない (§R3-2) ──
   if (mall === 'amazon' && fulfillment !== 'FBA' && fulfillment !== 'FBM') {
     row.incomplete_reason = 'fulfillment_unresolved';
-    return finish(row, 'incomplete');
+    return finish(row, 'incomplete', listing);
   }
 
   // ── 4. NE商品への対応付け ──
@@ -139,7 +139,7 @@ export function buildRow(listing, ctx) {
   if (resolved.status !== 'ok') {
     row.cost_status = resolved.status === 'ambiguous' ? 'ambiguous' : 'unresolved';
     row.incomplete_reason = resolved.reason;
-    return finish(row, 'incomplete');
+    return finish(row, 'incomplete', listing);
   }
   row.ne_code = resolved.neCode;
 
@@ -147,7 +147,7 @@ export function buildRow(listing, ctx) {
   if (!product) {
     row.cost_status = 'missing';
     row.incomplete_reason = 'product_not_found';
-    return finish(row, 'incomplete');
+    return finish(row, 'incomplete', listing);
   }
   row.product_name = product.商品名 || null;
   row.sales_class = product.売上分類 ?? null;
@@ -157,7 +157,7 @@ export function buildRow(listing, ctx) {
   if (!cost.ok) {
     row.cost_status = 'missing';
     row.incomplete_reason = cost.reason;
-    return finish(row, 'incomplete');
+    return finish(row, 'incomplete', listing);
   }
   row.cost_ex_tax = cost.costExTax;
   row.cost_method = cost.method;
@@ -243,12 +243,12 @@ export function buildRow(listing, ctx) {
   });
   if (!built.ok) {
     row.incomplete_reason = row.incomplete_reason || built.reason;
-    return finish(row, 'incomplete');
+    return finish(row, 'incomplete', listing);
   }
   const profit = computeProfit(built.args);
   if (!profit.ok) {
     row.incomplete_reason = row.incomplete_reason || profit.reason;
-    return finish(row, 'incomplete');
+    return finish(row, 'incomplete', listing);
   }
 
   row.price_ex_tax = built.args.priceExTax;
@@ -293,10 +293,25 @@ export function buildRow(listing, ctx) {
     || (mall === 'amazon' && row.fee_status !== 'ok')
     || (!isFba && row.shipping_master_status !== 'ok')
     || row.shipping_revenue_status === 'unknown';
-  return finish(row, hasProblem ? 'incomplete' : 'ok');
+  return finish(row, hasProblem ? 'incomplete' : 'ok', listing);
 }
 
-function finish(row, status) {
+function finish(row, status, listing) {
+  // 🚨 計算できなかった行こそ「何を見て失敗したか」が要る。入力は必ず残す
+  if (row.input_snapshot == null) {
+    row.input_snapshot = JSON.stringify({
+      incomplete: true,
+      reason: row.incomplete_reason,
+      price_incl_tax: listing?.price_incl_tax ?? null,
+      price_tax_included: listing?.price_tax_included ?? null,
+      mall_tax_rate: listing?.mall_tax_rate ?? null,
+      postage_included: listing?.postage_included ?? null,
+      postage_revenue_incl_tax: listing?.postage_revenue_incl_tax ?? null,
+      points: listing?.points ?? null,
+      fetch_status: listing?.fetch_status ?? null,
+      price_fetched_at: listing?.fetched_at ?? null,
+    });
+  }
   row.calculation_status = status;
   const verdict = isRankEligible({
     mall: row.mall,
