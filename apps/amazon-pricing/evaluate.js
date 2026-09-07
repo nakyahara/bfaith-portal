@@ -37,7 +37,7 @@ function policyOf(row) {
 }
 
 /**
- * @param {import('better-sqlite3').Database} db
+ * @param {object} db better-sqlite3 の Database (型注釈で import を書くと静的検査に引っかかるので object)
  * @param {{trigger:'manual'|'page_open'|'test', actorId:string, force?:boolean}} opts
  * @returns {{skipped:boolean, run:object, summary?:object}}
  */
@@ -56,7 +56,9 @@ export function runEvaluation(db, { trigger, actorId, force = false }) {
       if (existing) return { skipped: true, run: existing };
     }
     const runId = insertRun(db, { trigger, actorId, snapshotDate, ruleVersion: RULE_VERSION });
-    try {
+    // ★判定の保存は内側の savepoint に分ける。失敗したらそこだけ巻き戻し、run 自体は failed として**残す**
+    //   (外側で throw すると run の INSERT ごとロールバックされ、失敗した事実が消える — Codex R1 Medium)
+    const inner = db.transaction(() => {
       const summary = { by_action: { raise: 0, lower: 0, keep: 0, hold: 0 }, by_reason: {}, flags: {}, no_policy: 0, snapshot_date_jst: snapshotDate };
       const evals = rows.map((row) => {
         const result = evaluateListing(inputOf(row));
@@ -72,23 +74,34 @@ export function runEvaluation(db, { trigger, actorId, force = false }) {
         };
       });
       insertEvaluations(db, runId, evals, { ruleVersion: RULE_VERSION, snapshotDate });
+      return summary;
+    });
+    try {
+      const summary = inner();
       finishRun(db, runId, { status: 'success', listingsTotal: rows.length, summary });
       return { skipped: false, run: getRun(db, runId), summary };
     } catch (e) {
-      finishRun(db, runId, { status: 'failed', listingsTotal: rows.length, error: String(e?.message || e) });
-      throw e;
+      const message = String(e?.message || e);
+      finishRun(db, runId, { status: 'failed', listingsTotal: rows.length, error: message });
+      return { skipped: false, run: getRun(db, runId), summary: null, error: message };
     }
   });
   return tx.immediate();
 }
 
+/** 画面を開いたついでの自動生成の主体。人の GET に紐づけない (Codex R1 Medium: GET は外部から誘導できる) */
+export const PAGE_OPEN_ACTOR = 'system:page_open';
+
 /**
  * 画面を開いたついでの自動生成。失敗しても画面は出す (エラーは戻り値で知らせる)。
  * ★表示用の絞り込み・LIMIT とは無関係に全出品を対象にする (feedback_開発プロセス)。
+ * ★actor は開いた人ではなく system:page_open。誰が開いても同じ結果になる冪等な処理で、人の判断ではないため
  */
-export function ensureEvaluation(db, actorId) {
+export function ensureEvaluation(db) {
   try {
-    return runEvaluation(db, { trigger: 'page_open', actorId });
+    const r = runEvaluation(db, { trigger: 'page_open', actorId: PAGE_OPEN_ACTOR });
+    if (r.error) console.error('[amazon-pricing] 自動判定が失敗として記録されました:', r.error);
+    return r;
   } catch (e) {
     console.error('[amazon-pricing] 自動判定に失敗:', e?.message || e);
     return { skipped: true, run: null, error: e?.message || String(e) };

@@ -115,6 +115,8 @@ try {
   ok(idx.text.includes('原価不明'), '  原価不明の行に札が出る');
   const runs = db.prepare(`SELECT COUNT(*) c FROM ap_evaluation_runs WHERE status='success'`).get().c;
   ok(runs === 1, `  画面を開いたついでに今日の判定が 1 回作られる (実際 ${runs})`);
+  const autoRun = db.prepare(`SELECT trigger, actor_id FROM ap_evaluation_runs WHERE status='success'`).get();
+  ok(autoRun.trigger === 'page_open' && autoRun.actor_id === 'system:page_open', `  その run の主体は開いた人ではなく system (${autoRun.actor_id})`);
   const idx2 = await get('/apps/amazon-pricing/?q=fba1&channel=FBA&sort=margin&flag=cost_unknown');
   ok(idx2.status === 200 && !idx2.text.includes('>pr_fba1<'), 'GET / 絞り込み (原価不明 + fba1 → 該当なし)');
   ok(db.prepare(`SELECT COUNT(*) c FROM ap_evaluation_runs`).get().c === 1, '  2 回目の表示では run を増やさない');

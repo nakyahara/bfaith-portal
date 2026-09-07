@@ -110,5 +110,18 @@ export function dataFreshness(db) {
     snapshot_date_jst: snap?.d ?? null, snapshot_rows: snap?.n ?? 0,
     fees_fetched_at: fees?.t ?? null, fees_rows: fees?.n ?? 0,
     finance_last_date_jst: fin?.d ?? null,
+    sku_norm_collisions: skuNormCollisions(db),
   };
+}
+
+/**
+ * 正規化 (LOWER/TRIM) すると同じになる出品 SKU が母集合に 2 つ以上あるか。
+ * 原価・販売は正規化キーで突合するので、衝突していると別々の出品に同じ原価・販売が付く (Codex R1 Medium)。
+ * 0 件が前提 (Amazon の 99.99% 名寄せ実測)。出たら画面に警告を出し、その行は疑って見る
+ * @returns {string[]} 衝突している正規化キー
+ */
+export function skuNormCollisions(db) {
+  return db.prepare(`
+    SELECT LOWER(TRIM(seller_sku)) AS k FROM mirror_amazon_sku_fees
+     GROUP BY LOWER(TRIM(seller_sku)) HAVING COUNT(*) > 1`).all().map((r) => r.k);
 }

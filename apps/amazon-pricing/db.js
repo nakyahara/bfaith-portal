@@ -43,6 +43,9 @@ export const REASON_CODES = {
 };
 
 export const REVIEW_VERDICTS = { agree: '妥当', disagree: '違う', unsure: 'わからない' };
+/** 自由記述の上限 (画面の maxlength と同じ値をサーバ側でも強制する) */
+export const REASON_TEXT_MAX = 300;
+export const REVIEW_COMMENT_MAX = 500;
 
 export function initAmazonPricing() {
   const db = getMirrorDB();
@@ -56,8 +59,20 @@ export function getDB() {
   return getMirrorDB();
 }
 
-/** DDL 単体 (テストが自前の DB に対して呼べるように分けてある) */
+/**
+ * DDL 単体 (テストが自前の DB に対して呼べるように分けてある)。
+ *
+ * ★脅威モデル (Codex R1 で明文化): ここのトリガ・CHECK が防ぐのは **普通のアプリ接続からの DML**
+ *   (UPDATE / DELETE / INSERT OR REPLACE / autonomy_level ≠ 0 / 履歴を伴わない方針の書き換え)。
+ *   DB ファイルの DDL 権限を持つ人 (DROP TRIGGER・表の作り直し・PRAGMA ignore_check_constraints) からは防げない。
+ *   それは render-backup の日次退避と、Company DB (Postgres) 移行後のロール分離で扱う。
+ */
 export function createTables(db) {
+  // PRAGMA は接続単位。REPLACE の内部 DELETE で DELETE トリガを発火させるには recursive_triggers が要る
+  // (それとは別に、既存主キーへの INSERT を BEFORE INSERT で止めるので、PRAGMA の無い別接続でも REPLACE は通らない)
+  db.pragma('foreign_keys = ON');
+  db.pragma('recursive_triggers = ON');
+
   db.exec(`CREATE TABLE IF NOT EXISTS ap_policies (
     seller_sku      TEXT PRIMARY KEY,
     mode            TEXT NOT NULL DEFAULT 'off' CHECK(mode IN ('off','buybox','fba_lowest','lowest')),
@@ -140,19 +155,46 @@ export function createTables(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_ap_rev_decision ON ap_evaluation_reviews(decision_id, review_id)');
 
   // ★append-only を DB 側で強制 (訂正は新しい行の追記で表す)
-  for (const t of ['ap_policy_events', 'ap_evaluations', 'ap_evaluation_reviews']) {
+  const APPEND_ONLY = { ap_policy_events: 'event_id', ap_evaluations: 'decision_id', ap_evaluation_reviews: 'review_id' };
+  for (const [t, pk] of Object.entries(APPEND_ONLY)) {
     db.exec(`CREATE TRIGGER IF NOT EXISTS ${t}_no_update BEFORE UPDATE ON ${t}
       BEGIN SELECT RAISE(ABORT, '${t} は追記のみ (UPDATE 禁止)。訂正は行を足してください'); END`);
     db.exec(`CREATE TRIGGER IF NOT EXISTS ${t}_no_delete BEFORE DELETE ON ${t}
       BEGIN SELECT RAISE(ABORT, '${t} は追記のみ (DELETE 禁止)。訂正は行を足してください'); END`);
+    // INSERT OR REPLACE は recursive_triggers が OFF の接続だと DELETE トリガを通らずに行を置き換える (Codex R1 High)。
+    // 既にある主キーへの INSERT 自体を BEFORE INSERT で止める (REPLACE も同じ経路を通る)
+    db.exec(`CREATE TRIGGER IF NOT EXISTS ${t}_no_replace BEFORE INSERT ON ${t}
+      WHEN EXISTS (SELECT 1 FROM ${t} WHERE ${pk} = NEW.${pk})
+      BEGIN SELECT RAISE(ABORT, '${t} は追記のみ (既にある行の置き換え禁止)'); END`);
   }
-  // run は running → success/failed の 1 回だけ状態が変わる。それ以外の書き換えは禁止
-  db.exec(`CREATE TRIGGER IF NOT EXISTS ap_evaluation_runs_finish_once BEFORE UPDATE ON ap_evaluation_runs
-    WHEN OLD.status <> 'running' OR NEW.run_id <> OLD.run_id OR NEW.started_at <> OLD.started_at
-      OR NEW.trigger <> OLD.trigger OR NEW.actor_id <> OLD.actor_id OR NEW.rule_version <> OLD.rule_version
-    BEGIN SELECT RAISE(ABORT, 'ap_evaluation_runs は終了の記録以外は書き換えられません'); END`);
+  // run は running → success/failed の 1 回だけ状態が変わる。変えてよい列も終了の記録だけ (ホワイトリスト)。
+  // 定義を変えたので古いトリガは作り直す (CREATE IF NOT EXISTS は既存を更新しない)
+  db.exec('DROP TRIGGER IF EXISTS ap_evaluation_runs_finish_once');
+  db.exec(`CREATE TRIGGER ap_evaluation_runs_finish_once BEFORE UPDATE ON ap_evaluation_runs
+    WHEN NOT (
+      OLD.status = 'running' AND NEW.status IN ('success', 'failed')
+      AND NEW.run_id IS OLD.run_id AND NEW.started_at IS OLD.started_at AND NEW.trigger IS OLD.trigger
+      AND NEW.actor_id IS OLD.actor_id AND NEW.rule_version IS OLD.rule_version
+      AND NEW.snapshot_date_jst IS OLD.snapshot_date_jst
+    )
+    BEGIN SELECT RAISE(ABORT, 'ap_evaluation_runs は running → success/failed の終了記録 (finished_at / listings_total / summary_json / error) 以外は書き換えられません'); END`);
   db.exec(`CREATE TRIGGER IF NOT EXISTS ap_evaluation_runs_no_delete BEFORE DELETE ON ap_evaluation_runs
     BEGIN SELECT RAISE(ABORT, 'ap_evaluation_runs は削除できません'); END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS ap_evaluation_runs_no_replace BEFORE INSERT ON ap_evaluation_runs
+    WHEN EXISTS (SELECT 1 FROM ap_evaluation_runs WHERE run_id = NEW.run_id)
+    BEGIN SELECT RAISE(ABORT, 'ap_evaluation_runs は既にある run の置き換え禁止'); END`);
+  // 方針の現在値は「同じ時刻の履歴行」が無いと書けない (履歴を残さない直接 UPDATE を構造で止める)。
+  // UPDATE は updated_at を必ず進めること (進めない UPDATE は古い履歴行で条件を満たしてしまう)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS ap_policies_requires_event_insert BEFORE INSERT ON ap_policies
+    WHEN NOT EXISTS (SELECT 1 FROM ap_policy_events e WHERE e.seller_sku = NEW.seller_sku AND e.at = NEW.updated_at)
+    BEGIN SELECT RAISE(ABORT, 'ap_policies は変更履歴 (ap_policy_events) を先に書いてからでないと書き換えられません'); END`);
+  db.exec('DROP TRIGGER IF EXISTS ap_policies_requires_event_update');
+  db.exec(`CREATE TRIGGER ap_policies_requires_event_update BEFORE UPDATE ON ap_policies
+    WHEN NEW.updated_at IS OLD.updated_at OR NEW.updated_at < OLD.updated_at
+      OR NOT EXISTS (SELECT 1 FROM ap_policy_events e WHERE e.seller_sku = NEW.seller_sku AND e.at = NEW.updated_at)
+    BEGIN SELECT RAISE(ABORT, 'ap_policies は変更履歴 (ap_policy_events) を先に書き、updated_at を進めてからでないと書き換えられません'); END`);
+  db.exec(`CREATE TRIGGER IF NOT EXISTS ap_policies_no_delete BEFORE DELETE ON ap_policies
+    BEGIN SELECT RAISE(ABORT, 'ap_policies は削除できません (追従を止めるなら mode を off に)'); END`);
 
   ensureReadModelView(db);
   return db;
@@ -251,7 +293,9 @@ const asText = (v) => (v === null || v === undefined ? null : String(v));
 export function savePolicy(db, { sku, patch, actorId, actorType = 'human', reasonCode, reasonText = null, source = 'ui' }) {
   if (!sku || typeof sku !== 'string') throw validation('SKU が不正です');
   if (!REASON_CODES[reasonCode]) throw validation('変更理由を選んでください');
-  if (reasonCode === 'other' && !(reasonText && reasonText.trim())) throw validation('「その他」のときは理由を書いてください');
+  const reason = reasonText == null ? null : String(reasonText).trim();
+  if (reasonCode === 'other' && !reason) throw validation('「その他」のときは理由を書いてください');
+  if (reason && reason.length > REASON_TEXT_MAX) throw validation(`理由のメモは ${REASON_TEXT_MAX} 文字までです`);
   const norm = normalizePolicyPatch(patch);
   if (norm.errors.length) throw validation(norm.errors.join(' / '));
 
@@ -266,15 +310,11 @@ export function savePolicy(db, { sku, patch, actorId, actorType = 'human', reaso
     const changed = POLICY_FIELDS.filter((f) => asText((before ?? POLICY_DEFAULTS)[f]) !== asText(next[f]));
     if (changed.length === 0 && before) return { changed: [], changeGroup: null, policy: before };
 
-    const at = nowIso();
+    // 時刻は前回より必ず進める (同一 ms に 2 回保存されると、トリガが「updated_at が進んでいない」で拒否するため)
+    let at = nowIso();
+    if (before?.updated_at && at <= before.updated_at) at = new Date(Date.parse(before.updated_at) + 1).toISOString();
     const changeGroup = newId('apc');
-    db.prepare(`INSERT INTO ap_policies (seller_sku, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, updated_at, updated_by)
-      VALUES (@seller_sku, @mode, @floor_price, @ceiling_price, @offset_jpy, @min_margin_rate, @note, @updated_at, @updated_by)
-      ON CONFLICT(seller_sku) DO UPDATE SET
-        mode = excluded.mode, floor_price = excluded.floor_price, ceiling_price = excluded.ceiling_price,
-        offset_jpy = excluded.offset_jpy, min_margin_rate = excluded.min_margin_rate, note = excluded.note,
-        updated_at = excluded.updated_at, updated_by = excluded.updated_by`)
-      .run({ seller_sku: sku, ...pick(next, POLICY_FIELDS), updated_at: at, updated_by: actorId });
+    // ★履歴を先に書く。ap_policies のトリガは「同じ時刻の履歴行」が無い書き換えを拒否する
     const ins = db.prepare(`INSERT INTO ap_policy_events
       (seller_sku, at, actor_type, actor_id, field, old_value, new_value, reason_code, reason_text, source, change_group)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
@@ -282,8 +322,15 @@ export function savePolicy(db, { sku, patch, actorId, actorType = 'human', reaso
     const fields = changed.length > 0 ? changed : ['mode'];
     for (const f of fields) {
       ins.run(sku, at, actorType, actorId, f, before ? asText(before[f]) : null, asText(next[f]),
-        reasonCode, reasonText ? String(reasonText).trim() : null, source, changeGroup);
+        reasonCode, reason || null, source, changeGroup);
     }
+    db.prepare(`INSERT INTO ap_policies (seller_sku, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, updated_at, updated_by)
+      VALUES (@seller_sku, @mode, @floor_price, @ceiling_price, @offset_jpy, @min_margin_rate, @note, @updated_at, @updated_by)
+      ON CONFLICT(seller_sku) DO UPDATE SET
+        mode = excluded.mode, floor_price = excluded.floor_price, ceiling_price = excluded.ceiling_price,
+        offset_jpy = excluded.offset_jpy, min_margin_rate = excluded.min_margin_rate, note = excluded.note,
+        updated_at = excluded.updated_at, updated_by = excluded.updated_by`)
+      .run({ seller_sku: sku, ...pick(next, POLICY_FIELDS), updated_at: at, updated_by: actorId });
     return { changed: fields, changeGroup, policy: getPolicy(db, sku) };
   });
   return tx.immediate();
@@ -386,7 +433,8 @@ export function addReview(db, { decisionId, reviewerId, verdict, comment = null 
   if (!REVIEW_VERDICTS[verdict]) throw validation('採点の値が不正です');
   const ev = db.prepare('SELECT decision_id FROM ap_evaluations WHERE decision_id = ?').get(decisionId);
   if (!ev) throw validation('その判定はありません');
-  const c = comment == null ? null : String(comment).trim().slice(0, 500) || null;
+  const c = comment == null ? null : (String(comment).trim() || null);
+  if (c && c.length > REVIEW_COMMENT_MAX) throw validation(`ひとことは ${REVIEW_COMMENT_MAX} 文字までです`);
   const info = db.prepare(`INSERT INTO ap_evaluation_reviews (decision_id, reviewer_id, verdict, comment, reviewed_at)
     VALUES (?,?,?,?,?)`).run(decisionId, reviewerId, verdict, c, nowIso());
   return info.lastInsertRowid;

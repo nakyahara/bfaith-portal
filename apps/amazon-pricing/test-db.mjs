@@ -135,6 +135,19 @@ console.log('\n── 追記のみ (トリガ) ──');
 {
   throws(() => db.prepare(`UPDATE ap_policy_events SET new_value = '1' WHERE event_id = 1`).run(), 'UPDATE 禁止', '履歴の UPDATE は落ちる');
   throws(() => db.prepare(`DELETE FROM ap_policy_events WHERE event_id = 1`).run(), 'DELETE 禁止', '履歴の DELETE は落ちる');
+  throws(() => db.prepare(`INSERT OR REPLACE INTO ap_policy_events (event_id, seller_sku, at, actor_type, actor_id, field, reason_code, change_group)
+    VALUES (1, 'x', 'y', 'human', 'z', 'mode', 'initial', 'g')`).run(), '置き換え禁止', 'INSERT OR REPLACE で既存行を置き換えられない');
+  // ★Codex R1 High: recursive_triggers を ON にしていない別接続 (SQL コンソール等) でも REPLACE は止まる
+  const other = new Database(path.join(tmp, 'mirror.db'));
+  const before = other.prepare(`SELECT new_value FROM ap_policy_events WHERE event_id = 1`).get().new_value;
+  throws(() => other.prepare(`INSERT OR REPLACE INTO ap_policy_events (event_id, seller_sku, at, actor_type, actor_id, field, new_value, reason_code, change_group)
+    VALUES (1, 'x', 'y', 'human', 'z', 'mode', 'HACKED', 'initial', 'g')`).run(), '置き換え禁止', '別接続 (recursive_triggers OFF) からの INSERT OR REPLACE も落ちる');
+  ok(other.prepare(`SELECT new_value FROM ap_policy_events WHERE event_id = 1`).get().new_value === before, '  行は元のまま');
+  throws(() => other.prepare(`UPDATE ap_policies SET floor_price = 1 WHERE seller_sku = 'PR_FBA1 '`).run(), '変更履歴', '履歴を伴わない ap_policies の直接 UPDATE は落ちる');
+  throws(() => other.prepare(`INSERT INTO ap_policies (seller_sku, mode, updated_at, updated_by) VALUES ('ghost', 'buybox', 'now', 'x')`).run(), '変更履歴', '履歴を伴わない ap_policies の直接 INSERT は落ちる');
+  throws(() => other.prepare(`DELETE FROM ap_policies WHERE seller_sku = 'PR_FBA1 '`).run(), '削除できません', 'ap_policies の DELETE は落ちる');
+  other.close();
+  throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'off' }, actorId: 'x', reasonCode: 'stop', reasonText: 'あ'.repeat(301) }), '300 文字', '理由のメモ 301 文字は拒否 (サーバ側でも上限)');
 }
 
 console.log('\n── 判定 run (シャドー) ──');
@@ -168,7 +181,23 @@ console.log('\n── 判定 run (シャドー) ──');
     VALUES (?, 'x', ?, ?, 1, 'keep', 'OFF', 'x', '{}')`).run(forced.run.run_id, T, RULE_VERSION), 'CHECK', '★autonomy_level = 1 (人承認後に実行) は CHECK で拒否');
   throws(() => db.prepare(`UPDATE ap_evaluations SET proposed_price = 1 WHERE decision_id = ?`).run(fba.decision_id), 'UPDATE 禁止', '判定の UPDATE は落ちる');
   throws(() => db.prepare(`DELETE FROM ap_evaluation_runs WHERE run_id = ?`).run(r.run.run_id), '削除できません', 'run の DELETE は落ちる');
-  throws(() => db.prepare(`UPDATE ap_evaluation_runs SET trigger = 'manual' WHERE run_id = ?`).run(r.run.run_id), '終了の記録以外', '終わった run の書き換えは落ちる');
+  throws(() => db.prepare(`UPDATE ap_evaluation_runs SET trigger = 'manual' WHERE run_id = ?`).run(r.run.run_id), '終了記録', '終わった run の書き換えは落ちる');
+  // Codex R1 Medium: running の run でも「終了の記録」以外は書き換えられない
+  db.prepare(`INSERT INTO ap_evaluation_runs (run_id, started_at, trigger, actor_id, snapshot_date_jst, rule_version, status) VALUES ('apr-running', ?, 'test', 't', '2026-09-07', ?, 'running')`).run(T, RULE_VERSION);
+  throws(() => db.prepare(`UPDATE ap_evaluation_runs SET snapshot_date_jst = '2099-01-01' WHERE run_id = 'apr-running'`).run(), '終了記録', 'running の run の snapshot を変える UPDATE は落ちる');
+  throws(() => db.prepare(`UPDATE ap_evaluation_runs SET status = 'running', listings_total = 999 WHERE run_id = 'apr-running'`).run(), '終了記録', 'running → running は落ちる');
+  throws(() => db.prepare(`INSERT OR REPLACE INTO ap_evaluation_runs (run_id, started_at, trigger, actor_id, rule_version, status) VALUES ('apr-running', ?, 'manual', 'x', ?, 'success')`).run(T, RULE_VERSION), '置き換え禁止', 'run の INSERT OR REPLACE は落ちる');
+  db.prepare(`UPDATE ap_evaluation_runs SET status = 'failed', finished_at = ?, error = 'test' WHERE run_id = 'apr-running'`).run(T);
+  ok(db.prepare(`SELECT status FROM ap_evaluation_runs WHERE run_id = 'apr-running'`).get().status === 'failed', '  running → failed (終了の記録) は通る');
+
+  // Codex R1 Medium: 判定の保存に失敗しても run は failed として残る (ロールバックで消えない)
+  db.exec(`CREATE TRIGGER tmp_boom BEFORE INSERT ON ap_evaluations BEGIN SELECT RAISE(ABORT, 'boom'); END`);
+  const failedRun = runEvaluation(db, { trigger: 'test', actorId: 't', force: true });
+  db.exec('DROP TRIGGER tmp_boom');
+  ok(failedRun.error && /boom/.test(failedRun.error) && failedRun.run?.status === 'failed', `保存に失敗した run は failed として残り、error が返る (${failedRun.run?.status} / ${failedRun.error})`);
+  ok(db.prepare(`SELECT COUNT(*) c FROM ap_evaluation_runs WHERE status = 'failed'`).get().c === 2, '  failed の run が DB に残っている');
+  ok(db.prepare(`SELECT COUNT(*) c FROM ap_evaluations WHERE run_id = ?`).get(failedRun.run.run_id).c === 0, '  失敗した run の判定行は残らない (savepoint で巻き戻し)');
+  ok(runForSnapshot(db, '2026-09-07', RULE_VERSION).run_id === forced.run.run_id, '  最新の成功 run は変わらない');
 }
 
 console.log('\n── 採点 (人のフィードバック) ──');
@@ -185,6 +214,7 @@ console.log('\n── 採点 (人のフィードバック) ──');
   ok(db.prepare(`SELECT COUNT(*) c FROM ap_evaluation_reviews`).get().c === 2, '採点の行は 2 本とも残る');
   throws(() => addReview(db, { decisionId: 999999, reviewerId: 'x', verdict: 'agree' }), 'その判定はありません', '無い判定には採点できない');
   throws(() => addReview(db, { decisionId: target.decision_id, reviewerId: 'x', verdict: 'great' }), '採点の値が不正', '知らない採点値は拒否');
+  throws(() => addReview(db, { decisionId: target.decision_id, reviewerId: 'x', verdict: 'agree', comment: 'あ'.repeat(501) }), '500 文字', 'ひとこと 501 文字は拒否 (黙って切らない)');
   throws(() => db.prepare(`DELETE FROM ap_evaluation_reviews`).run(), 'DELETE 禁止', '採点の DELETE は落ちる');
   const forSku = evaluationsForSku(db, 'PR_FBA1 ');
   ok(forSku.length === 2 && forSku[0].decision_id > forSku[1].decision_id, 'SKU 別の判定履歴 (新しい順)');

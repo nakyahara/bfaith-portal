@@ -1,8 +1,8 @@
 /**
  * Amazon 価格管理 (自社プライスター) — 画面 + API
  *
- * 🚨このアプリは Amazon に何も書き込まない。SP-API の書き込み関数も、miniPC の書き込み口 (research-service.js の
- *   価格更新ルート) を呼ぶコードも、ここには存在しない (test-no-write-path.mjs が機械的に確認する)。
+ * 🚨このアプリは Amazon に何も書き込まない。SP-API の書き込み関数も、miniPC の価格更新ルートを呼ぶコードも、
+ *   ここには存在しない (test-no-write-path.mjs が機械的に確認する)。
  *   できるのは:
  *     1. 出品ごとの値付け方針 (追従モード・赤字/高値ストッパー・上乗せ・最低粗利率) を決めて、変更履歴つきで記録する
  *     2. ルール (engine.js) が「もし動くならこうする」を毎日出す (判定 = 提案) → 人が 👍/👎 で採点する
@@ -160,7 +160,7 @@ router.get('/', (req, res) => {
     });
   }
   // ★表示の絞り込み・LIMIT より前に、全出品を対象に「今日の判定」を作っておく
-  const auto = ensureEvaluation(db, actorOf(req));
+  const auto = ensureEvaluation(db);
   const run = latestSuccessRun(db);
   const all = loadListings(db).map(enrich);
   const filters = {
@@ -197,7 +197,7 @@ router.get('/evaluations', (req, res) => {
   const db = getDB();
   const base = common(req, '今日の判定', 'evaluations');
   const avail = mirrorTablesAvailable(db);
-  const auto = avail.ok ? ensureEvaluation(db, actorOf(req)) : { skipped: true, run: null, error: `表がありません: ${avail.missing.join(', ')}` };
+  const auto = avail.ok ? ensureEvaluation(db) : { skipped: true, run: null, error: `表がありません: ${avail.missing.join(', ')}` };
   const run = latestSuccessRun(db);
   const evals = run ? evaluationsOfRun(db, run.run_id) : [];
   const tab = ['raise', 'lower', 'hold', 'keep', 'all', 'reviewed'].includes(req.query.tab) ? req.query.tab : 'change';
@@ -261,6 +261,7 @@ router.post('/api/evaluations/run', (req, res) => {
   try {
     const db = getDB();
     const r = runEvaluation(db, { trigger: 'manual', actorId: actorOf(req), force: true });
+    if (r.error) return res.status(500).json({ ok: false, error: `判定の保存に失敗しました (run は failed として記録): ${r.error}`, run: r.run });
     res.json({ ok: true, run: r.run, summary: r.summary });
   } catch (e) { apiError(res, e, 'evaluations/run'); }
 });
@@ -297,23 +298,26 @@ router.get('/api/export.csv', (req, res) => {
     const cols = ['seller_sku', 'asin', 'channel', 'ne_code', 'ne_name', 'my_price', 'buybox_price', 'buybox_is_mine', 'cost_incl_tax',
       'referral_fee_rate', 'fba_fee', 'ship_cost', 'gross_now', 'gross_rate_now', 'units_30d', 'computed_floor', 'floor_price', 'ceiling_price',
       'offset_jpy', 'min_margin_rate', 'mode', 'action', 'proposed_price', 'reason_code', 'reason_text', 'confidence', 'flags', 'snapshot_date_jst'];
-    const esc = (v) => {
+    const TEXT_COLS = new Set(['seller_sku', 'asin', 'channel', 'ne_code', 'ne_name', 'mode', 'action', 'reason_code', 'reason_text', 'flags', 'snapshot_date_jst']);
+    const esc = (v, text = false) => {
       if (v == null) return '';
-      const s = String(v);
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      let s = String(v);
+      // Excel の数式として解釈される先頭文字 (= + - @ タブ CR) は文字列列だけ無害化する (Codex R1 Low)
+      if (text && /^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+      return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
     const lines = [cols.join(',')];
     for (const r of rows) {
       lines.push(cols.map((c) => {
         if (c === 'gross_now') return esc(r.gross_now.gross);
         if (c === 'gross_rate_now') return esc(r.gross_now.rate == null ? null : Math.round(r.gross_now.rate * 1000) / 1000);
-        if (c === 'action') return esc(r.live.action);
+        if (c === 'action') return esc(r.live.action, true);
         if (c === 'proposed_price') return esc(r.live.proposedPrice);
-        if (c === 'reason_code') return esc(r.live.reasonCode);
-        if (c === 'reason_text') return esc(r.live.reasonText);
+        if (c === 'reason_code') return esc(r.live.reasonCode, true);
+        if (c === 'reason_text') return esc(r.live.reasonText, true);
         if (c === 'confidence') return esc(r.live.confidence);
-        if (c === 'flags') return esc(r.live.flags.join('|'));
-        return esc(r[c]);
+        if (c === 'flags') return esc(r.live.flags.join('|'), true);
+        return esc(r[c], TEXT_COLS.has(c));
       }).join(','));
     }
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
