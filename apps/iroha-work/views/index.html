@@ -2109,12 +2109,18 @@ function redrawAfterPlan() {
  */
 function recountTomorrow() {
   if (!state || !Array.isArray(state.cards)) return;
-  // ⭐外部に預けたぶんは いろはが明日やる作業ではないので数えない (明日の計画の画面と同じものさし)
+  // ⭐「明日の計画」の画面と**同じものさし**で数える (要件 §AB-11 の 5b):
+  //   数えるのは**カード**、時間は「まだ手元にあるまとまり」の合計。渡したぶん・棚に入れたぶんは入れない
   const mine = rowsOf(state).filter(c => c.when === 'tomorrow' && c.plannable !== false);
   let hours = 0;
-  let unknown = 0;
-  for (const c of mine) { if (c.plan_hours == null) unknown += 1; else hours += Number(c.plan_hours) || 0; }
-  state.tomorrow_plan = { hours: Math.round(hours * 10) / 10, count: mine.length, unknown_hours_count: unknown };
+  const cardIds = new Set();
+  const unknownIds = new Set();
+  for (const c of mine) {
+    cardIds.add(String(c.id));
+    if (c.plan_hours == null) unknownIds.add(String(c.id));
+    else hours += Number(c.plan_hours) || 0;
+  }
+  state.tomorrow_plan = { hours: Math.round(hours * 10) / 10, count: cardIds.size, unknown_hours_count: unknownIds.size };
 }
 
 let facPickFor = null;

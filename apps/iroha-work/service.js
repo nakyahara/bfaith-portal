@@ -494,6 +494,41 @@ export function expandBatchRows(cards, { forPlan = false } = {}) {
 }
 
 /**
+ * ⭐**明日の計画のための行** (要件 §AB-11 の 5b / Codex R3 中1)。
+ *
+ * この画面が決めるのは「**いつ**やるか」で、いつ は**カードの軸** (要件 §W-4)。
+ * だから分けたカードでも**カード 1 行**に戻す — 行を分けると、どちらを掴んでも同じ予定日が動くので、
+ * 「400 個だけ明日にしたつもりが 1000 個の予定が動いた」という取り違えが起きる。
+ *
+ * ⭐数・想定作業時間・必要保管箱は「**まだ手元にあるまとまり**」の合計にする。
+ *   渡したぶん・棚に入れ終わったぶんは、いろはが明日やる作業ではない。
+ *   まとまりが 1 つのカード (ふだんの全部) は、今までとまったく同じ数になる。
+ */
+export function planRows(cards) {
+  const out = [];
+  for (const c of cards) {
+    const bs = (c.batches || []).filter((b) => b.work_status !== 'cancelled'
+      && !b.handed_out && b.work_status !== 'done');
+    if (bs.length === 0) continue;                       // 明日やることが残っていないカード
+    if (bs.length === (c.batches || []).filter((b) => b.work_status !== 'cancelled').length && bs.length <= 1) {
+      out.push({ ...c, row_key: String(c.id), batch_id: bs[0].id, split: false, plannable: true });
+      continue;
+    }
+    // ⭐数が分からないまとまりが混ざったら合計も出さない (0 で代用しない — 要件 §AB-3)
+    const qty = bs.some((b) => b.planned_qty == null) ? null : bs.reduce((a, b) => a + b.planned_qty, 0);
+    const per = c.master ? c.master.units_per_container : null;
+    out.push({ ...c,
+      row_key: String(c.id), batch_id: bs.length === 1 ? bs[0].id : null, split: bs.length > 1, plannable: true,
+      qty,
+      plan_hours: planHours(qty, c.master ? c.master.process_count : null),
+      boxes: neededBoxes(qty, per),
+      boxes_calc: neededBoxesCalc(qty, per),
+    });
+  }
+  return out;
+}
+
+/**
  * 「明日の計画」画面のデータ (職員だけが開く。要件 §W-3 / §AA)。
  *   candidates = まだ予定の無い未着手カード。**おすすめ順**に並べ、1 から順の `rank` を付ける
  *                (在庫が少ない → 入荷が古い → 大きい。大きさは画面に出さない)
@@ -506,9 +541,8 @@ export function buildPlan({ readOnly = false } = {}) {
   const today = jstToday();
   const tomorrow = jstTomorrow(today);
   const { cards: allCards } = buildTaskCards(listOpenTasks({}), { readOnly });
-  // ⭐明日の計画は「いろはが明日やる作業」なので、もう渡したぶん・棚に入れたぶんは出さない (要件 §AB-11 の 5b)。
-  //   まとまりが 1 つのカードは今までどおり 1 行 (カードごと外部施設の担当でも、いつ出すかを決めるので出す)
-  const cards = expandBatchRows(allCards, { forPlan: true });
+  // ⭐明日の計画は**カード 1 行**。数はまだ手元にあるまとまりの合計 (要件 §AB-11 の 5b)
+  const cards = planRows(allCards);
   const byWhen = (w) => cards.filter((c) => c.when === w).sort(comparePlanOrder);
   const tomorrowCards = byWhen('tomorrow');
   const facilities = listFacilities();
@@ -613,7 +647,7 @@ export function buildTaskList({ facility = null, readOnly = false } = {}) {
   const batchRows = expandBatchRows(cards);
   // 上のゲージ用。明日やる分の件数と合計時間 (工程数の無いカードは 0 で足さず別に数える — 要件 §W-3)。
   // ⭐外部に預けたぶんは いろはが明日やる作業ではないので数えない (明日の計画の画面と同じものさし)
-  const tomorrowPlan = sumPlanHours(expandBatchRows(cards, { forPlan: true }).filter((c) => c.when === 'tomorrow'));
+  const tomorrowPlan = sumPlanHours(planRows(cards).filter((c) => c.when === 'tomorrow'));
 
   return {
     mode: 'app',

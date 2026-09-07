@@ -6291,10 +6291,17 @@ console.log('\n[31] 分けたカードは一覧・ボードで 2 枚に見える
     const c2b = B.listBatchesOfTask(db, t2)[0];
     const cg2 = C.startConsignment({ taskId: t2, batchId: c2b.id, facilityCode: 'workcenter', qty: 600, expectVersion: v(t2) });
     const plan2 = SV.buildPlan({}).tomorrow.filter((r) => r.id === t2);
-    ok(plan2.length === 2, '⭐分けた直後 (渡す前) は、いろは 400 も ワークセンター 600 も計画に残る');
+    // ⭐明日の計画は「いつやるか」を決める画面で、いつ はカードの軸。だから分けても**カード 1 行**
+    //   (行を分けると、どちらを掴んでも同じ予定日が動く — Codex R3 中1)
+    ok(plan2.length === 1 && plan2[0].split === true,
+      '⭐分けたカードも、明日の計画では 1 行 (予定はカード単位なので取り違えない)');
+    ok(plan2[0].qty === 1000, '⭐渡す前なので、数は手元にある 400 + 600 の合計');
     C.markHanded({ consignmentId: cg2.consignment.id, expectVersion: C.getConsignment(cg2.consignment.id).version });
     const plan3 = SV.buildPlan({}).tomorrow.filter((r) => r.id === t2);
     ok(plan3.length === 1 && plan3[0].qty === 400, '⭐渡したら、いろはの 400 個ぶんだけになる');
+    const per3 = plan3[0].master && plan3[0].master.units_per_container;
+    ok(!per3 || (plan3[0].boxes_calc && plan3[0].boxes_calc.base === 400),
+      '必要保管箱も 400 個ぶんで出し直す (入数が登録されているとき)');
   }
 
   // ⑦ ⭐棚に入れ終わったまとまりは、行にも明日の計画にも出さない (Codex R1 中2)
@@ -6322,8 +6329,9 @@ console.log('\n[31] 分けたカードは一覧・ボードで 2 枚に見える
   ok(/const rows = rowsOf\(state\);\r?\n\s*const c = \{ all: rows\.length/.test(html)
     && /const rs = rowsOf\(st\);/.test(html) && /const cards = rowsOf\(boardState\(\)\);/.test(html),
     '⭐札・チップの件数も「並んでいる行」で数える (札の数と一覧の数を食い違わせない)');
-  ok(/const mine = rowsOf\(state\)\.filter\(c => c\.when === 'tomorrow' && c\.plannable !== false\);/.test(html),
-    '⭐上のゲージも「明日やる作業」だけ数える (渡したぶん・棚に入れたぶんは外す)');
+  ok(/const mine = rowsOf\(state\)\.filter\(c => c\.when === 'tomorrow' && c\.plannable !== false\);/.test(html)
+    && /count: cardIds\.size, unknown_hours_count: unknownIds\.size/.test(html),
+    '⭐上のゲージも「明日の計画」と同じものさし (数えるのはカード・時間は手元のまとまりの合計)');
   ok(/const findCard = \(id\) => state\.cards\.find/.test(html),
     '⭐カードを指すとき (詳細・写真・作業時間) は今までどおり cards から探す');
   ok(/const selectable = bulkIds && c\.status === 'ready_for_stocking' && !c\.split;/.test(html)
