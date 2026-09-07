@@ -154,7 +154,7 @@
           <% const shown = l.flags.filter((f) => f !== 'NO_SALES_30D'); %>
           <% if (shown.length) { %><div class="flags"><% for (const f of shown) { %><span class="chip <%= f === 'BELOW_COST_FLOOR' || f === 'BELOW_STOPPER' ? 'c-bad' : 'c-warn' %>" title="<%= FLAGS[f] || f %>"><%= FLAGS[f] ? FLAGS[f].split(' (')[0] : f %></span><% } %></div><% } %>
         </td>
-        <td><button class="btn btn-sm" type="button" data-policy="<%= JSON.stringify({ seller_sku: r.seller_sku, ne_name: r.ne_name, mode: r.mode, floor_price: r.floor_price, ceiling_price: r.ceiling_price, offset_jpy: r.offset_jpy, min_margin_rate: r.min_margin_rate, note: r.policy_note, computed_floor: r.computed_floor, has_policy: r.has_policy }) %>">方針</button></td>
+        <td class="act"><button class="btn btn-sm" type="button" data-policy="<%= JSON.stringify({ seller_sku: r.seller_sku, ne_name: r.ne_name, mode: r.mode, floor_price: r.floor_price, ceiling_price: r.ceiling_price, offset_jpy: r.offset_jpy, min_margin_rate: r.min_margin_rate, note: r.policy_note, computed_floor: r.computed_floor, has_policy: r.has_policy }) %>">方針</button></td>
       </tr>
     <% } %>
     </tbody>

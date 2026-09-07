@@ -142,7 +142,7 @@ try {
   const bad = await post('/apps/amazon-pricing/api/policies/pr_fba1', { mode: 'buybox', floor_price: 0, reason_code: 'initial' });
   ok(bad.status === 400 && /0 は入れられません/.test(bad.json?.error || ''), `POST 方針 (ストッパー 0) → ${bad.status} ${bad.json?.error}`);
   const saved = await post('/apps/amazon-pricing/api/policies/pr_fba1', { mode: 'buybox', floor_price: '1800', ceiling_price: '', offset_jpy: '-10', min_margin_rate: '10', note: 'メモ', reason_code: 'initial', reason_text: '' });
-  ok(saved.status === 200 && saved.json?.ok && saved.json.changed.length === 6, `POST 方針 (初回) → ${saved.status} 変更 ${saved.json?.changed?.length}`);
+  ok(saved.status === 200 && saved.json?.ok && saved.json.changed.length === 5, `POST 方針 (初回) → ${saved.status} 変更 ${saved.json?.changed?.length} (既定と違う列だけ: mode / floor / offset / margin / note)`);
   ok(saved.json?.live?.action === 'lower' && saved.json.live.proposed_price === 1890, `  返ってくる live 判定: ${saved.json?.live?.action} → ${saved.json?.live?.proposed_price} (カート 1900 − 10)`);
   const unknownSku = await post('/apps/amazon-pricing/api/policies/nope', { mode: 'off', reason_code: 'stop' });
   ok(unknownSku.status === 400, `POST 方針 (無い SKU) → ${unknownSku.status}`);
@@ -167,7 +167,7 @@ try {
   ok(json.status === 200 && parsed.count === 1 && parsed.rows[0].live.action === 'lower', `GET /api/listings.json?mode=set → ${json.status} (1 行)`);
   const health = await get('/apps/amazon-pricing/api/health');
   const h = JSON.parse(health.text);
-  ok(health.status === 200 && h.writes_to_amazon === false && h.policy_events === 6, `GET /api/health → writes_to_amazon=false, 履歴 ${h.policy_events}`);
+  ok(health.status === 200 && h.writes_to_amazon === false && h.policy_events === 5, `GET /api/health → writes_to_amazon=false, 履歴 ${h.policy_events}`);
 } finally {
   server.close();
   try { db.close(); } catch { /* */ }

@@ -28,6 +28,8 @@ let initialized = false;
 
 /** 方針の列 (変更履歴に残す対象)。順番は画面の表示順 */
 export const POLICY_FIELDS = ['mode', 'floor_price', 'ceiling_price', 'offset_jpy', 'min_margin_rate', 'note'];
+/** 方針が無い出品の扱い (= 追従しない・ストッパー無し) */
+export const POLICY_DEFAULTS = { mode: 'off', floor_price: null, ceiling_price: null, offset_jpy: 0, min_margin_rate: null, note: null };
 
 /** 変更理由 (方針を変えるときに必ず 1 つ選ぶ) */
 export const REASON_CODES = {
@@ -255,16 +257,13 @@ export function savePolicy(db, { sku, patch, actorId, actorType = 'human', reaso
 
   const tx = db.transaction(() => {
     const before = getPolicy(db, sku);
-    const next = {
-      mode: 'off', floor_price: null, ceiling_price: null, offset_jpy: 0, min_margin_rate: null, note: null,
-      ...(before || {}),
-      ...norm.patch,
-    };
+    const next = { ...POLICY_DEFAULTS, ...(before || {}), ...norm.patch };
     // ストッパーの前後関係は「保存後の姿」で見る (片方だけ変えた時も守る)
     if (next.floor_price != null && next.ceiling_price != null && next.ceiling_price < next.floor_price) {
       throw validation('高値ストッパーは赤字ストッパー以上にしてください');
     }
-    const changed = POLICY_FIELDS.filter((f) => asText(before?.[f] ?? (f === 'mode' ? 'off' : f === 'offset_jpy' ? 0 : null)) !== asText(next[f]));
+    // 変わった列だけ履歴に残す。初回は「既定値と違う列」だけ (メモ (なし)→(なし) のような行で履歴を汚さない)
+    const changed = POLICY_FIELDS.filter((f) => asText((before ?? POLICY_DEFAULTS)[f]) !== asText(next[f]));
     if (changed.length === 0 && before) return { changed: [], changeGroup: null, policy: before };
 
     const at = nowIso();
@@ -279,7 +278,8 @@ export function savePolicy(db, { sku, patch, actorId, actorType = 'human', reaso
     const ins = db.prepare(`INSERT INTO ap_policy_events
       (seller_sku, at, actor_type, actor_id, field, old_value, new_value, reason_code, reason_text, source, change_group)
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
-    const fields = before ? changed : POLICY_FIELDS; // 初回は全列を「設定した」として残す (old = null)
+    // 初回で既定値のまま保存 (何も入れずに「記録する」) でも、設定したこと自体は mode の 1 行で見えるようにする
+    const fields = changed.length > 0 ? changed : ['mode'];
     for (const f of fields) {
       ins.run(sku, at, actorType, actorId, f, before ? asText(before[f]) : null, asText(next[f]),
         reasonCode, reasonText ? String(reasonText).trim() : null, source, changeGroup);

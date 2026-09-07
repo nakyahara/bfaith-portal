@@ -104,11 +104,13 @@ console.log('\n── 読み取りモデル (1 出品 1 行) ──');
 console.log('\n── 方針の保存と履歴 ──');
 {
   const r1 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox', floor_price: '1,800', ceiling_price: 2500, min_margin_rate: '12' }, actorId: 'a@example.com', reasonCode: 'initial' });
-  ok(r1.changed.length === 6, `初回は全 6 列を「設定した」として残す。実際 ${r1.changed.length}`);
+  ok(r1.changed.length === 4 && !r1.changed.includes('note') && !r1.changed.includes('offset_jpy'), `初回は既定値と違う 4 列だけ残す (メモ (なし)→(なし) は残さない)。実際 ${JSON.stringify(r1.changed)}`);
   const p = getPolicy(db, 'PR_FBA1 ');
   ok(p.mode === 'buybox' && p.floor_price === 1800 && p.ceiling_price === 2500 && p.min_margin_rate === 0.12, '保存された値 (カンマ除去・% → 小数)');
   const ev1 = listPolicyEvents(db, { sku: 'PR_FBA1 ' });
-  ok(ev1.length === 6 && ev1.every((e) => e.old_value === null && e.change_group === r1.changeGroup), '履歴 6 行・old は null・同じ change_group');
+  ok(ev1.length === 4 && ev1.every((e) => e.old_value === null && e.change_group === r1.changeGroup), '履歴 4 行・old は null・同じ change_group');
+  const blank = savePolicy(db, { sku: 'pr_fbm1', patch: {}, actorId: 'a@example.com', reasonCode: 'initial' });
+  ok(blank.changed.length === 1 && blank.changed[0] === 'mode' && getPolicy(db, 'pr_fbm1')?.mode === 'off', '何も入れずに初回保存 → mode の 1 行だけ残る (設定したことは見える)');
 
   const r2 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox', floor_price: 1800, ceiling_price: 2500, min_margin_rate: 0.12, floor_price: 1900 }, actorId: 'b@example.com', reasonCode: 'cost_change', reasonText: '仕入値上げ' });
   ok(r2.changed.length === 1 && r2.changed[0] === 'floor_price', '変わった列だけ履歴に残る (floor_price)');
@@ -116,7 +118,7 @@ console.log('\n── 方針の保存と履歴 ──');
   ok(last.old_value === '1800' && last.new_value === '1900' && last.reason_text === '仕入値上げ' && last.actor_id === 'b@example.com', '  前後の値・理由・誰が');
 
   const r3 = savePolicy(db, { sku: 'PR_FBA1 ', patch: { mode: 'buybox', floor_price: 1900, ceiling_price: 2500, min_margin_rate: 0.12 }, actorId: 'b@example.com', reasonCode: 'margin' });
-  ok(r3.changed.length === 0 && listPolicyEvents(db, { sku: 'PR_FBA1 ' }).length === 7, '同じ内容を送り直しても履歴は増えない');
+  ok(r3.changed.length === 0 && listPolicyEvents(db, { sku: 'PR_FBA1 ' }).length === 5, '同じ内容を送り直しても履歴は増えない');
 
   throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { floor_price: 0 }, actorId: 'x', reasonCode: 'mistake' }), '0 は入れられません', 'ストッパー 0 は拒否 (旧ツールの「0 = 下限なし」を二度と作らない)');
   throws(() => savePolicy(db, { sku: 'PR_FBA1 ', patch: { ceiling_price: 1000 }, actorId: 'x', reasonCode: 'mistake' }), '赤字ストッパー以上', '高値 < 赤字 は拒否 (片方だけ変えた時も)');
@@ -151,7 +153,8 @@ console.log('\n── 判定 run (シャドー) ──');
   ok(set.action === 'keep' && set.reason_code === 'OFF' && set.flags.includes('COST_UNKNOWN'), '  方針の無い行は off (維持) + 旗 COST_UNKNOWN');
   const np = evals.find((e) => e.seller_sku === 'pr_noprice');
   ok(np.action === 'hold' && np.reason_code === 'NO_MY_PRICE', '  価格の無い行は方針より先に「価格が取れていない」で保留 (データの穴として見える)');
-  ok(r.summary.by_action.keep === 2 && r.summary.by_action.hold === 1 && r.summary.by_action.lower === 1 && r.summary.no_policy === 3, `  summary: ${JSON.stringify(r.summary.by_action)} / 方針なし ${r.summary.no_policy}`);
+  // 方針あり = PR_FBA1 (buybox) と pr_fbm1 (空で保存 = off) の 2 件 → 方針なし 2
+  ok(r.summary.by_action.keep === 2 && r.summary.by_action.hold === 1 && r.summary.by_action.lower === 1 && r.summary.no_policy === 2, `  summary: ${JSON.stringify(r.summary.by_action)} / 方針なし ${r.summary.no_policy}`);
 
   const again = runEvaluation(db, { trigger: 'test', actorId: 't' });
   ok(again.skipped && again.run.run_id === r.run.run_id, '同じ日のスナップショットには 2 本目を作らない (skip)');
