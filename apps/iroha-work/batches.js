@@ -230,15 +230,18 @@ export function recordStocking(db, batchId, { at = undefined, by = null, note = 
   if (b.good_qty != null && done.unknown === 0) {
     qty = b.good_qty - (done.qty ?? 0);
     if (qty <= 0) return 0;                      // もう全部入れてある
-  } else if (done.rows > 0 && b.good_qty == null) {
-    return 0;                                    // 数えていないまとまりは 1 回だけ
+  } else if (b.good_qty == null && done.unknown > 0) {
+    // 数えていないまとまりに「数は分からない」で入れた記録が既にある = もう運んである。二度書かない。
+    // ⚠**数ありの記録があるかどうかでは判定しない** — 200 個入れたあと できた数 を「分からない」に
+    //   直して残りを入れるとき、残量は不明なのに「残りなし」と同じ扱いになってしまう (Codex R2 中)
+    return 0;
   } else if (done.unknown > 0 && b.good_qty != null) {
     // 数の分からない実績があるところに、あとから できた数 が入った。
     // 何個ぶん残っているか決められないので、数を書かずに 1 行だけ足す (人が見て直せる)
     qty = null;
   }
   const now = new Date().toISOString();
-  // ⭐`at` が渡されなかった (= いつ入れたか分からない) ときは空のまま。
+  // ⭐`at` を渡さなければ「いま」。**`at: null` を渡したときだけ空のまま** (= いつ入れたか分からない)。
   //   `created_at` には記録した時刻が残るので、あとから追える
   db.prepare(`INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, stocked_by, note, created_at)
     VALUES (?, ?, ?, ?, ?, ?)`).run(batchId, qty, at === undefined ? now : at, by, note, now);

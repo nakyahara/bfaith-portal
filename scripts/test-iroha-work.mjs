@@ -5085,6 +5085,27 @@ console.log('\n[28] 棚に入れた記録 — 作業のまとまりを割って�
     const sum = B.stockedQtyOf(db, bid);
     ok(sum.qty == null && sum.unknown === 2, '合計も「決められない」(数の分からない件数を数える)');
   }
+  // ── ⭐数ありの実績のあとで「できた数」が分からなくなったとき (Codex R2 中) ──
+  {
+    const t = mk28('st-13', 9863, 300);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: 300 }); }).immediate();
+    const at13 = new Date().toISOString();
+    db.transaction(() => {
+      db.prepare('INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, created_at) VALUES (?, 200, ?, ?)').run(bid, at13, at13);
+    }).immediate();
+    // 数え直したら分からなくなった (できた数を消した)
+    db.transaction(() => { B.recordBatchCounts(db, bid, { goodQty: null }); }).immediate();
+    ok(B.stockedQtyOf(db, bid).unknown === 0 && B.stockedQtyOf(db, bid).rows === 1, '前提: 数ありの実績が 1 件だけ');
+    db.transaction(() => {
+      ok(B.recordStocking(db, bid, { at: at13 }) === 1,
+        '⭐200 個入れたあと できた数 が分からなくなっても、残りを入れた記録は残せる (「残りなし」にしない)');
+    }).immediate();
+    ok(B.stockingOfTask(db, t)[0].qty == null, 'その記録は「数は分からない」で入る');
+    // 数の分からない記録が既にあるときは、二度書かない
+    db.transaction(() => { ok(B.recordStocking(db, bid, { at: at13 }) === 0, '数の分からない記録が既にあれば二度書かない'); }).immediate();
+  }
+
   // ── 数が分かる実績と分からない実績が混ざるとき ──
   {
     const t = mk28('st-9', 9859, 300);
@@ -5154,9 +5175,37 @@ console.log('\n[28] 棚に入れた記録 — 作業のまとまりを割って�
   ok(/r\.qty == null \? '数は残していません'/.test(html)
     && /'いつ入れたかの記録なし'/.test(html),
     '数えずに入れたぶんは「数は残していません」、日時が無いぶんは「記録なし」と出す (0 や今日と混ぜない)');
-  ok(/'数が分かるぶん ' \+ n \+ ' 個 ・ 数の記録がないもの ' \+ unknown \+ '回 \(ぜんぶで '/.test(html)
-    && /unknown === 0 \? '合計 ' \+ n/.test(html),
-    '⭐数の分からない行があるなら「合計」と言い切らない (200 個 + 数不明 を「合計 200 個」と書かない)');
+  // ⭐画面の関数を**実際に動かして**確かめる (正規表現では中身が守れない — Codex R2 軽微)。
+  //   HTML から関数だけ取り出し、esc / 日付の整形だけ差し替えて呼ぶ
+  {
+    const src = html.match(/function stockingCardHtml\(c\) \{[\s\S]*?\n\}/)[0];
+    const escStub = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const render = new Function('esc', 'fmtDate', 'fmtTime',
+      src + '; return stockingCardHtml;')(escStub, () => '9/7', () => '10:00');
+
+    ok(render({ stocking: [] }) === '', '記録が無ければ何も出さない');
+
+    const allKnown = render({ stocking: [{ qty: 200, stocked_at: 'x' }, { qty: 198, stocked_at: 'x' }] });
+    ok(/合計 398 個 \(2回\)/.test(allKnown), '全部数が分かるときだけ「合計」と書く');
+
+    const mixed = render({ stocking: [{ qty: 200, stocked_at: 'x' }, { qty: null, stocked_at: 'x' }] });
+    ok(/数が分かるぶん 200 個 ・ 数の記録がないもの 1回 \(ぜんぶで 2回\)/.test(mixed) && !/合計/.test(mixed),
+      '⭐混ざっているときは「合計」と言い切らない (200 個 + 数不明 を「合計 200 個」と書かない)');
+    ok(/数は残していません/.test(mixed), '数の無い行は「数は残していません」と出す');
+
+    const noneKnown = render({ stocking: [{ qty: null, stocked_at: 'x' }] });
+    ok(/数の記録はありません \(1回\)/.test(noneKnown) && !/合計/.test(noneKnown), '1 件も数が無ければ「数の記録はありません」');
+
+    const zero = render({ stocking: [{ qty: 0, stocked_at: 'x' }] });
+    ok(/<b>0 個<\/b>/.test(zero) && /合計 0 個/.test(zero) && !/数は残していません/.test(zero),
+      '⭐0 個は「数えた結果 0」として出す (「数は残していません」と混ぜない)');
+
+    const noDate = render({ stocking: [{ qty: 5, stocked_at: null }] });
+    ok(/いつ入れたかの記録なし/.test(noDate), '日時が無い行は「いつ入れたかの記録なし」(今日の日付を出さない)');
+
+    const escaped = render({ stocking: [{ qty: 1, stocked_at: 'x', stocked_by: '<script>' }] });
+    ok(/&lt;script&gt;/.test(escaped) && !/<script>/.test(escaped), '画面に出す文字は esc を通す');
+  }
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
