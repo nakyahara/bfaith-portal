@@ -492,6 +492,18 @@ console.log('\n[9] 画面が安全弁を通している (退行防止)');
   ok(!/cameraTry\+\+/.test(html), '🚨 次の条件は共有値の加算ではなく、その試行の tryIndex + 1 から決める');
   ok(/cameraTry = 0; startScan\(\)/.test(html), 'ボタンを押し直したら条件を最初から');
   ok(/Split View/.test(html), 'iPad で画面を2分割していると使えないことを案内する');
+  // 🚨 iPhone (ホーム画面アプリ) では読めて iPad だけダメ = iPad 固有の状態を診断に出す (2026-09-07)
+  ok(/const splitViewLikely = \(\) =>/.test(html) && /w < sw \* 0\.85/.test(html),
+    '🚨 窓の幅と画面の幅から「分割中の可能性」を見る (iPhone には無い状態)');
+  ok(html.indexOf('+ (splitViewLikely()') > 0,
+    '分割中らしければ、その案内を最初に出す');
+  ok(/const deviceTag = \(\) =>/.test(html) && html.includes("ua.match(/OS ("),
+    'iPad/iPhone と OS の版だけ出す (UA をそのまま出さない)');
+  ok(/enumerateDevices/.test(html) && /videoinput/.test(html) && /カメラ' \+ videoInputs/.test(html),
+    'つながっているカメラの台数を出す (0台なら端末側で使えない)');
+  ok(/facingMode: 'user'/.test(html),
+    '前面カメラも試す (背面だけ掴めない iPad の切り分け)');
+  ok((html.match(/audio: false/g) || []).length === 4, 'カメラの条件は4段階');
   // 🚨 予約だけ生き残ると、閉じたあとにカメラが勝手に開く (Codex #1239 R1 P1)
   ok(/function scheduleRescan\(ms\)/.test(html) && /const at = scanGen;/.test(html)
     && /if \(at !== scanGen\) return;/.test(html),

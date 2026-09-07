@@ -325,6 +325,36 @@
     //    ホーム画面アイコン (standalone) から開いた iPad で起きやすい
     const isStandalone = () => !!(window.navigator.standalone
       || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+    /**
+     * 🚨 iPad で画面を2分割 (Split View / Slide Over) していると、カメラを掴めても
+     *    すぐ手放されることがある。**窓の幅が画面の幅よりはっきり狭ければ分割中**。
+     *    iPhone には無い状態なので、「iPhone は読めるのに iPad だけダメ」の有力な候補
+     */
+    const splitViewLikely = () => {
+      try {
+        const w = window.innerWidth, sw = (window.screen && window.screen.width) || 0;
+        return !!(sw && w && w < sw * 0.85);
+      } catch (e) { return false; }
+    };
+    /** OS の版だけ取り出す (自由文字列は出さない)。例: iPad/18.5 */
+    const deviceTag = () => {
+      try {
+        const ua = navigator.userAgent || '';
+        const kind = /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? 'iPad'
+          : /iPhone/.test(ua) ? 'iPhone' : 'その他';
+        const m = ua.match(/OS (\d+)[_.](\d+)/);
+        return kind + (m ? '/' + m[1] + '.' + m[2] : '');
+      } catch (e) { return '不明'; }
+    };
+    /** つながっているカメラの数 (0 なら端末側で使えない状態)。取れなければ null */
+    let videoInputs = null;
+    (async () => {
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+        const ds = await navigator.mediaDevices.enumerateDevices();
+        videoInputs = ds.filter((d) => d.kind === 'videoinput').length;
+      } catch (e) { /* 取れなくてよい */ }
+    })();
     // 🚨 **カメラの条件は段階的に緩める** (2026-09-07 実機: iPhone は通るが iPad だけ即切れる)。
     //    iPad は背面/前面が複数あり、解像度や facingMode の指定が強いと
     //    **getUserMedia は成功するのにトラックが即 ended になる**ことがある。
@@ -332,7 +362,8 @@
     const CAMERA_TRIES = [
       { video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false },
       { video: { facingMode: 'environment' }, audio: false },
-      { video: true, audio: false },                    // 最後は「どのカメラでもよい」
+      { video: true, audio: false },                    // どのカメラでもよい
+      { video: { facingMode: 'user' }, audio: false },  // 前面カメラ (背面だけ掴めない iPad の切り分け)
     ];
     let cameraTry = 0;
     async function startScan() {
@@ -444,6 +475,12 @@
           } catch (e) { /* 取れなくてよい */ }
         }
         bits.push(isStandalone() ? 'ホーム画面' : 'ブラウザ');
+        bits.push(deviceTag());
+        if (videoInputs !== null) bits.push('カメラ' + videoInputs + '台');
+        try {
+          bits.push('窓' + window.innerWidth + '/画面' + ((window.screen && window.screen.width) || '?'));
+        } catch (e) { /* 取れなくてよい */ }
+        if (splitViewLikely()) bits.push('分割中の可能性');
         return bits.join(' ');
       };
       let videoWatch = BarcodeScanDecide.newVideoWatch(now());
@@ -489,12 +526,15 @@
             return;
           }
           banner('err', 'カメラが切れました' + (heldMs < 3000 ? ' (つないだ直後に切れています)' : '')
-            + '。' + (isStandalone()
+            + '。' + (splitViewLikely()
+              ? '<b>画面を2分割 (Split View / Slide Over) していませんか。'
+                + 'iPad では分割中にカメラを使えないことがあります。全画面にしてからもう一度押してください。</b>'
+              : isStandalone()
               ? '<b>ホーム画面のアイコンから開いた状態だとカメラを使えないことがあります。'
                 + 'まず Safari で開いて試してください。</b>'
-              : '<b>iPad では、画面を2分割 (Split View / Slide Over) しているとカメラが使えないことがあります。'
-                + '全画面にしてからもう一度押してください。</b>')
-            + '他のアプリがカメラを使っていないかも確かめてください。'
+              : '<b>アプリをいったん完全に終了して開き直してください</b> '
+                + '(画面下から上にスワイプして止める)。それでもだめなら iPad を再起動してください。')
+            + '他のアプリや、開きっぱなしの別のタブがカメラを使っていないかも確かめてください。'
             + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます'
             + '<br><small>' + esc(snapshot) + '</small>', { sticky: true });
           return;
