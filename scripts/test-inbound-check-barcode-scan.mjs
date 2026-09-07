@@ -455,9 +455,26 @@ console.log('\n[9] 画面が安全弁を通している (退行防止)');
   //    原因を現場から聞き取れる形にしておく (経過ms / track / video / play / どこから開いたか)
   ok(/const diag = \(\) =>/.test(html) && /esc\(snapshot\)/.test(html),
     '🚨 打ち切りの案内に診断 (経過ms・track・video・play・起動元) を添える');
-  // 🚨 stop() は readyState を ended に変えるので、止める前に取らないと状態が失われる
-  ok(html.indexOf('const snapshot = diag();') < html.indexOf('stopScan();\n          // 🚨 つないだ直後'),
-    '🚨 診断は止める前に取る (stop() が track の状態を書き換える)');
+  // 🚨 stop() は readyState を ended に変えるので、止める前に取らないと状態が失われる。
+  //    ⚠ indexOf の大小比較だけだと、片方が無くなって -1 になったときに通ってしまう (Codex #1239 R2)。
+  //    経路ごとに切り出して、**両方あること**と順序の両方を見る
+  const sliceOf = (from, to) => {
+    const a = html.indexOf(from);
+    if (a < 0) return '';
+    const b = html.indexOf(to, a);
+    return b < 0 ? '' : html.slice(a, b);
+  };
+  const orderOk = (part) => {
+    const snap = part.indexOf('const snapshot = diag();');
+    const stop = part.indexOf('stopScan();');
+    return snap >= 0 && stop >= 0 && snap < stop;
+  };
+  const endedPath = sliceOf("if (track && track.readyState === 'ended') {", 'return;');
+  const stalledPath = sliceOf('if (!BarcodeScanDecide.videoStalled(', '}, 500);');
+  ok(endedPath !== '' && orderOk(endedPath),
+    '🚨 即 ended の経路: 診断を止める前に取る (stop() が track の状態を書き換える)');
+  ok(stalledPath !== '' && orderOk(stalledPath),
+    '🚨 映像が来ない経路: 診断を止める前に取る');
   ok(!/track\.label/.test(html) && !/playError\.message/.test(html),
     '🚨 診断に自由文字列 (カメラ名・エラー本文) を出さない');
   ok(/st\.facingMode/.test(html), 'カメラは facingMode と解像度だけ出す');
@@ -479,8 +496,11 @@ console.log('\n[9] 画面が安全弁を通している (退行防止)');
   ok(/function scheduleRescan\(ms\)/.test(html) && /const at = scanGen;/.test(html)
     && /if \(at !== scanGen\) return;/.test(html),
     '🚨 取り直しの予約は、予約した時点の世代を見てから走る (止められていたら開かない)');
-  ok(!/setTimeout\(\(\) => \{ startScan\(\); \}/.test(html),
-    '取り直しを裸の setTimeout で予約していない (必ず scheduleRescan を通す)');
+  // ⚠ 書式に依存しない形で見る (Codex #1239 R2)。setTimeout の中で startScan を呼んでいる箇所は
+  //   scheduleRescan の中の1つだけであるべき
+  const rawTimers = (html.match(/setTimeout\([\s\S]{0,400}?startScan/g) || []);
+  ok(rawTimers.length === 1 && /scheduleRescan/.test(sliceOf('function scheduleRescan(ms)', '\n    function stopScan')),
+    `取り直しを裸の setTimeout で予約していない (setTimeout→startScan は scheduleRescan の1箇所だけ / 実際 ${rawTimers.length})`);
   ok(/clearTimeout\(scanRetryTimer\)/.test(stopFn),
     'stopScan が取り直しの予約も取り消す');
   ok(/scanStarting = false;/.test(stopFn) && /b\.disabled = false/.test(stopFn),
