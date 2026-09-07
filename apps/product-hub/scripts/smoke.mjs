@@ -32,12 +32,22 @@ function check(name, cond, detail = '') {
  * @returns {{code: string, isModule: boolean}[]}
  */
 function inlineScriptsOf(html) {
+  // 🚨 属性は**名前を取り出してから**見る。`/\bsrc=/` だと `data-src` の `-` の後ろでも
+  //    語境界が成立して一致し、壊れた JS が検査から外れる (Codex R2)
+  const attrsOf = (tag) => {
+    const attrs = {};
+    for (const a of String(tag).matchAll(/([^\s=/>]+)\s*(?:=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g)) {
+      attrs[a[1].toLowerCase()] = a[2] ?? a[3] ?? a[4] ?? '';
+    }
+    return attrs;
+  };
   const out = [];
   for (const m of String(html).matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
-    const attrs = m[1] || '';
-    if (/\bsrc\s*=/i.test(attrs)) continue;
-    const type = (attrs.match(/\btype\s*=\s*["']?([^"'\s>]+)/i) || [])[1] || '';
+    const attrs = attrsOf(m[1] || '');
+    if ('src' in attrs) continue; // 外部ファイル = ここに中身は無い
+    const type = attrs.type || '';
     const isModule = /^module$/i.test(type);
+    // 型なし = JS。JSON のデータ塊など JS でない型は対象外
     if (type && !isModule && !/^(text|application)\/javascript$/i.test(type)) continue;
     out.push({ code: m[2], isModule });
   }
@@ -8974,6 +8984,12 @@ for (const [name, file, data] of renders) {
         const r = checkInlineScriptSyntax(vmMod, pr.html, 'detail(set)');
         check('HTTP 画面: セットの詳細の JS が構文として通る (壊れていると画面の操作が全部死ぬ)',
           r.ok, r.detail);
+        // 🚨 上の検査は「script が 1 つも無いページ」を通す (それが正しい)。だからここでは
+        //    **事故が起きた当のコードが載っていること**を別に確かめる。載らなくなったら、
+        //    緑のまま検査対象だけが消える (Codex R2)
+        check('HTTP 画面: セットの詳細に事故が起きた当のコードが載っている (検査対象が消えていないこと)',
+          inlineScriptsOf(pr.html).some((s) => s.code.includes('parent_step_version')),
+          `${inlineScriptsOf(pr.html).length} 個の script`);
         // この画面が「事故の条件」を持ち続けていることを確かめる。持たなくなったら上の検査は
         // 別物を見ていることになる (fixture が変わって再発を素通りさせないため)
         const setMain = wfp.progressOf(idSet, { db }).main;
@@ -9118,6 +9134,11 @@ for (const [name, file, data] of renders) {
       t('<script type="module">const a=1;</script>') === false);
     check('JS 構文検査: script が無いページ・JSON だけのページは通す',
       t('<p>x</p>') === true && t('<script type="application/json">{"a":1}</script>') === true);
+    // 🚨 data-src / data-type は src / type ではない (ブラウザは普通のインライン JS として動かす)。
+    //    語境界だけで見ていると、この 2 つを付けるだけで壊れた JS が検査から消える (Codex R2)
+    check('JS 構文検査: data-src / data-type は除外の理由にしない',
+      t('<script data-src="/a.js">const a = ;</script>') === false
+      && t('<script data-type="application/json">const a = ;</script>') === false);
   }
   for (const [name, html] of renderedHtml) {
     const r = checkInlineScriptSyntax(vm, html, name);
