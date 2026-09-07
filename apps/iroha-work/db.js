@@ -231,6 +231,67 @@ const stockingDDL = (name) => `
       version    INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL
     );`;
+/**
+ * ⭐外部施設への預け (要件 §AB-7)。羅針盤・ワークセンターに**物を持ち帰ってもらう**ときの台帳。
+ *
+ * 外部施設はこのアプリを触らない (作業時間も完成写真も記録しない)。知りたいのは
+ * 「何を預けて、いま どの状態か」と返却だけ。
+ *
+ * ⭐**数量を 1 つで通さない**。「80 予定・80 準備・当日 78 しかなかった」が普通に起きる。
+ *   渡したあとに予定数を書き換えると、80 枚ぶん箱とラベルを用意した履歴が消える。
+ * ⭐最後の状態は returned ではなく **settled (精算ずみ)**。外部で壊れて返らない物があっても、
+ *   職員が確かめれば預け残高からは落とせる。
+ */
+const consignDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id      INTEGER NOT NULL REFERENCES f_iroha_task_batches(id),
+      facility_code TEXT NOT NULL REFERENCES f_iroha_facilities(code),
+      planned_qty   INTEGER NOT NULL CHECK (planned_qty > 0),   -- 預ける予定の数
+      prepared_qty  INTEGER CHECK (prepared_qty IS NULL OR prepared_qty >= 0),  -- 箱とラベルを用意した数
+      handed_qty    INTEGER CHECK (handed_qty IS NULL OR handed_qty >= 0),      -- 実際に渡した数
+      -- planned = 決めた / prepared = 箱とラベルを用意した / handed = 渡した / settled = 精算ずみ /
+      -- cancelled = 渡す前にやめた
+      state         TEXT NOT NULL CHECK (state IN ('planned','prepared','handed','settled','cancelled')),
+      due_date      TEXT,                                        -- いつまでに返してほしいか (任意)
+      planned_at    TEXT NOT NULL,
+      planned_by    TEXT,
+      prepared_at   TEXT,
+      prepared_by   TEXT,
+      handed_at     TEXT,
+      handed_by     TEXT,
+      settled_at    TEXT,
+      settled_by    TEXT,
+      note          TEXT,
+      version       INTEGER NOT NULL DEFAULT 1,
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL,
+      -- 渡す前は渡した数を持たない / 渡したあとは必ず持つ
+      CHECK ((state IN ('planned','prepared','cancelled')) = (handed_qty IS NULL))
+    );`;
+/**
+ * 返却 (要件 §AB-7)。⭐**一度で全部返るとは限らない**ので子テーブル。
+ * returned_qty = 物として返ってきた数 / good_qty = そのうち使える良品 / loss_qty = 外部で作れなかった数。⭐**返却の確定はいろは側**
+ * (物が戻ったのを確かめられるのは いろは。外部の専用 URL からは申告だけ)。
+ */
+const consignReturnDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      consignment_id  INTEGER NOT NULL REFERENCES f_iroha_consignments(id),
+      returned_qty    INTEGER NOT NULL CHECK (returned_qty >= 0),
+      good_qty        INTEGER CHECK (good_qty IS NULL OR good_qty >= 0),
+      loss_qty        INTEGER CHECK (loss_qty IS NULL OR loss_qty >= 0),
+      returned_at     TEXT NOT NULL,
+      returned_by     TEXT,
+      note            TEXT,
+      idempotency_key TEXT UNIQUE,     -- 二重タップ・通信の再送で 2 回受け取らない
+      created_at      TEXT NOT NULL
+    );`;
+const CONSIGN_INDEX_DDL = `
+    CREATE INDEX IF NOT EXISTS idx_iroha_consign_batch ON f_iroha_consignments(batch_id, id);
+    CREATE INDEX IF NOT EXISTS idx_iroha_consign_fac ON f_iroha_consignments(facility_code, state);
+    CREATE INDEX IF NOT EXISTS idx_iroha_consign_ret ON f_iroha_consignment_returns(consignment_id, id);`;
+
 const STOCKING_INDEX_DDL = `
     CREATE INDEX IF NOT EXISTS idx_iroha_stocking_batch ON f_iroha_stocking_records(batch_id, id);`;
 
@@ -653,6 +714,9 @@ export function createTables(db = getMirrorDB()) {
     ${BATCHES_INDEX_DDL}
     ${stockingDDL('f_iroha_stocking_records')}
     ${STOCKING_INDEX_DDL}
+    ${consignDDL('f_iroha_consignments')}
+    ${consignReturnDDL('f_iroha_consignment_returns')}
+    ${CONSIGN_INDEX_DDL}
     ${sessionsDDL('f_iroha_work_sessions')}
 
     -- 完成写真・動画 (要件定義 §6 / §1.7 ②outbox)。
