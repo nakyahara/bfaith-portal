@@ -11,7 +11,8 @@
  */
 import { getDB } from './db.js';
 
-import { getTaskByDestination, safeLogTaskEvent, requestCancellation } from './tasks-db.js';
+import { getTask, getTaskByDestination, safeLogTaskEvent, requestCancellation } from './tasks-db.js';
+import { ensureBatchForTask } from './batches.js';
 import { normSupplierCode } from '../purchase-orders/db.js';
 
 const utcNow = () => new Date().toISOString();
@@ -84,6 +85,9 @@ export function createTaskForDestination(dest, { actor = null, barcode = null } 
     return { action: 'exists', id: t ? t.id : null };
   }
   const id = Number(info.lastInsertRowid);
+  // ⭐カードができたら「まとまり」も 1 つ用意する (要件 §AB-1)。
+  //   カードだけあって まとまり が無い瞬間を作らない
+  ensureBatchForTask(db, getTask(id));
   safeLogTaskEvent({ taskId: id, action: 'task_created', to: `inbound_check dest#${dest.id}${e.wm ? '' : ' (作業仕様なし)'}`, workerName: actor, ok: true });
   return { action: 'inserted', id };
 }
