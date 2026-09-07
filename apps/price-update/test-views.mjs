@@ -327,6 +327,10 @@ console.log('\n── 送れる行が0のときに「なぜ」を出す ──')
 {
   const run = fs.readFileSync(path.join(HERE, 'views', 'run.ejs'), 'utf8');
   ok(/noTargetReason/.test(run), '★履歴画面がサーバの理由を出している');
+  // ★実行済み (claim あり) の履歴でも内訳を出す。claim で return すると
+  //   「結果が不明」「失敗」の注意が誰にも見えない (Codex R2 高)
+  const claimBlock = run.slice(run.indexOf('if (info.claim)'), run.indexOf('if (!info.targets)'));
+  ok(/noTargetReason/.test(claimBlock), '★実行済みの履歴でも理由 (内訳) を出す');
   const idx = fs.readFileSync(path.join(HERE, 'views', 'index.ejs'), 'utf8');
   ok(/noSendable/.test(idx) && /confirm\(/.test(idx), '★記録の前に「送れる行がありません」を確認する');
   ok(/allowNoSendable/.test(idx), '確認したことをサーバへ伝えている (画面だけの判断にしない)');

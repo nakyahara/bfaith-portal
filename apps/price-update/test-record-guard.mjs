@@ -80,18 +80,28 @@ console.log('\n── 履歴側: なぜ送る行が無いのかを必ず言う �
   ok(blocked.includes('Amazon'), '手動更新モールの行も内訳に出す');
 
   // ★「previewed 以外 = 送信済み」とまとめない (Codex R1 高)。結果不明を送信済みと読ませない
-  const done = noTargetReasonOf([op({ state: 'confirmed' }), op({ state: 'noop' })]);
-  ok(done.includes('送信して結果も確かめています'), '送信して確認できた行はそう言う');
+  const done = noTargetReasonOf([op({ state: 'confirmed' })]);
+  ok(done.includes('更新済み'), '送って変わったことも確かめた行はそう言う');
+
+  // ★noop は書き込んでいない (execute.js)。送信済みと混ぜない (Codex R2 中)
+  const noop = noTargetReasonOf([op({ state: 'noop' })]);
+  ok(noop.includes('もともと同じ価格') && noop.includes('書き込んでいません'), '★noop を「送信済み」と言わない');
 
   const unknown = noTargetReasonOf([op({ state: 'unknown' })]);
-  ok(!unknown.includes('送信して結果も確かめています'), '★結果が不明な行を「送信済み」と言わない');
+  ok(!unknown.includes('更新済み'), '★結果が不明な行を「送信済み」と言わない');
   ok(unknown.includes('結果が不明') && unknown.includes('モールの画面で実際の価格'),
     '★結果が不明ならモールの画面を見るよう言う (自動で送り直さない運用に合わせる)');
   ok(noTargetReasonOf([op({ state: 'executing' })]).includes('送信中'), '送信中の行も不明側に入れる');
 
-  const notSent = noTargetReasonOf([op({ state: 'conflict' }), op({ state: 'failed' }), op({ state: 'skipped' })]);
-  ok(notSent.includes('送られていません'), '★失敗・価格の食い違い・停止は「送られていない」と言う');
-  ok(!notSent.includes('送信して結果も確かめています'), '送られていない行を送信済みに混ぜない');
+  // ★failed は「送る前に弾かれた」と「送った後の照合が通らなかった」が混ざる (Codex R2 高)。
+  //   後者では価格が変わっているので、「送られていません」と言い切ってはいけない
+  const failed = noTargetReasonOf([op({ state: 'failed' })]);
+  ok(!failed.includes('送られていません'), '★failed を「送っていない」と言い切らない');
+  ok(failed.includes('モールの画面で実際の価格'), '★failed でもモールの画面で確かめるよう言う');
+
+  const notSent = noTargetReasonOf([op({ state: 'conflict' }), op({ state: 'skipped' })]);
+  ok(notSent.includes('送られていません'), '価格の食い違い・停止は「送られていない」と言う');
+  ok(!notSent.includes('更新済み'), '送られていない行を送信済みに混ぜない');
 
   ok(noTargetReasonOf([op({ state: 'みたことない状態' })]).includes('どれにも当てはまらない'),
     '知らない状態でも黙って送信済み扱いにしない');

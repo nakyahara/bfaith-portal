@@ -84,12 +84,19 @@ function mallNamesOf(ops) {
 /**
  * 送信が終わった行の分類。
  * ★「previewed 以外 = 送信済み」とまとめない (Codex R1 高)。
- *   結果不明・送信中・価格違いで送らず は**送信済みではない**。まとめて「送信を終えています」と
+ *   結果不明・価格違いで送らず は**送信済みではない**。まとめて「送信を終えています」と
  *   書くと、README の「不明は再送しない = モールの画面で実物を見る」という運用を誤らせる。
+ * ★`failed` を「送っていない」に入れてはいけない (Codex R2 高)。failed には
+ *   「miniPC が送る前に弾いた」(変わっていない) と「送った後の照合が通らなかった」
+ *   (**変わっているかもしれない** = execute.js が mayHaveChanged を付ける) が混ざる。
+ *   状態だけでは決められないので、独立させて「モールの画面で確かめて」と書く。
+ * ★`noop` は「もともと同じ価格だった」= **書き込んでいない** (execute.js)。送信済みと混ぜない。
  */
-const DONE_STATES = new Set(['confirmed', 'noop']);          // 送って結果も確かめた
+const CONFIRMED_STATES = new Set(['confirmed']);             // 送って、変わったことも確かめた
+const NOOP_STATES = new Set(['noop']);                       // もともと同じ価格 (書き込んでいない)
 const UNCERTAIN_STATES = new Set(['executing', 'unknown']);  // 送ったかどうか分からない
-const NOT_SENT_STATES = new Set(['conflict', 'failed', 'blocked', 'skipped']);  // 送っていない
+const FAILED_STATES = new Set(['failed']);                   // 送る前 / 送った後、どちらの失敗か状態だけでは決まらない
+const NOT_SENT_STATES = new Set(['conflict', 'blocked', 'skipped']);  // 送っていない (価格の食い違い・ガード・停止)
 
 /**
  * 履歴に「送る行」が1行も無いときの理由 (日本語)。
@@ -107,11 +114,14 @@ export function noTargetReasonOf(operations = []) {
   const manual = ops.filter((o) => o.initial_state === 'manual_required');
   const blocked = ops.filter((o) => o.initial_state === 'blocked_preview');
   const moved = ops.filter((o) => o.initial_state === 'previewed' && o.state !== 'previewed');
-  const done = moved.filter((o) => DONE_STATES.has(o.state));
-  const uncertain = moved.filter((o) => UNCERTAIN_STATES.has(o.state));
-  const notSent = moved.filter((o) => NOT_SENT_STATES.has(o.state));
-  const other = moved.filter((o) => !DONE_STATES.has(o.state)
-    && !UNCERTAIN_STATES.has(o.state) && !NOT_SENT_STATES.has(o.state));
+  const pick = (set) => moved.filter((o) => set.has(o.state));
+  const confirmed = pick(CONFIRMED_STATES);
+  const noop = pick(NOOP_STATES);
+  const uncertain = pick(UNCERTAIN_STATES);
+  const failedOps = pick(FAILED_STATES);
+  const notSent = pick(NOT_SENT_STATES);
+  const known = [CONFIRMED_STATES, NOOP_STATES, UNCERTAIN_STATES, FAILED_STATES, NOT_SENT_STATES];
+  const other = moved.filter((o) => !known.some((set) => set.has(o.state)));
 
   if (manual.length === ops.length) {
     const names = mallNamesOf(manual);
@@ -122,13 +132,19 @@ export function noTargetReasonOf(operations = []) {
   }
 
   const parts = [];
-  if (done.length > 0) parts.push(`${done.length} 行は送信して結果も確かめています`);
+  if (confirmed.length > 0) parts.push(`${confirmed.length} 行は更新済み (送って、変わったことも確かめています)`);
+  if (noop.length > 0) parts.push(`${noop.length} 行はもともと同じ価格でした (書き込んでいません)`);
   // ★ここは軽く書かない。「送ったかどうか分からない」行はモールの画面で実物を見るしかない
   if (uncertain.length > 0) {
     parts.push(`${uncertain.length} 行は送信中または結果が不明です`
       + ' (自動では送り直しません。モールの画面で実際の価格を確かめてください)');
   }
-  if (notSent.length > 0) parts.push(`${notSent.length} 行は送られていません (失敗・価格の食い違い・途中で停止)`);
+  if (failedOps.length > 0) {
+    parts.push(`${failedOps.length} 行は失敗しています`
+      + ' (送る前に弾かれた場合と、送った後の照合が通らなかった場合があります。'
+      + '後者なら価格は変わっているので、モールの画面で実際の価格を確かめてください)');
+  }
+  if (notSent.length > 0) parts.push(`${notSent.length} 行は送られていません (価格の食い違い・ガード・途中で停止)`);
   if (other.length > 0) parts.push(`${other.length} 行は上のどれにも当てはまらない状態です (下の表で確かめてください)`);
   if (blocked.length > 0) parts.push(`${blocked.length} 行はガードで止まっています (「判定」の列に理由が出ています)`);
   if (manual.length > 0) parts.push(`${manual.length} 行は ${mallNamesOf(manual)} (このツールからは送れません)`);

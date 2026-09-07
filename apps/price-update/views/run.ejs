@@ -365,11 +365,14 @@
     if (info.claim) {
       // ★claim は「実行を始めた」印であって「終わった」印ではない。
       //   途中で止まった run もここに入るので、完了だと言い切らない
+      // ★実行済みの履歴でも、行がどうなったかの内訳 (noTargetReason) を出す。
+      //   claim で return してしまうと、結果不明・失敗の注意が誰にも見えない (Codex R2 高)
       $('exec-status').innerHTML = 'この履歴は <b>' + esc(toJst(info.claim.claimed_at, true))
         + '</b> に <b>' + esc(info.claim.claimed_by) + '</b> が実行を開始しています。'
         + '同じ内容をもう一度送ることはしません。'
         + '<b>まだ途中の場合もあります</b> — 上の内訳と下の行で1行ずつ状態を確認してください'
-        + ' (「送信中」のまま残っている行は、モールの画面で実際の価格を確かめてください)。';
+        + ' (「送信中」のまま残っている行は、モールの画面で実際の価格を確かめてください)。'
+        + (info.noTargetReason ? '<div style="margin-top:6px;">' + esc(info.noTargetReason) + '</div>' : '');
       return;
     }
     if (!info.targets) {
