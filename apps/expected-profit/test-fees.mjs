@@ -17,7 +17,8 @@ const { planRefresh, buildFeeRequest, toEstimateRow, saveEstimates, loadCache, r
   storedSellerId, withResolvedSeller, rememberSellerId,
   validityOffsetDays, feeValidDays,
   BATCH_SIZE, BATCH_SLEEP_MS, SP_API_FEES_RATE_PER_SEC, SP_API_FEES_MAX_BATCH,
-  looksLikeAsin, feeIdentifierOf, backoffDays, recordFailure, clearFailure, loadFailures } = await import('./refresh-fees.js');
+  looksLikeAsin, feeIdentifierOf, backoffDays, recordFailure, clearFailure, loadFailures,
+  allocateFetchBudget, retryAfterOf } = await import('./refresh-fees.js');
 const { getSetting, setSetting, SETTING_AMAZON_SELLER_ID } = await import('./db.js');
 const forgetSeller = () => setSetting(db, SETTING_AMAZON_SELLER_ID, null);
 
@@ -728,6 +729,171 @@ await ta('[!] 入力が変われば別キーなので、待ち時間に関係な
   });
   assert.equal(called, 1, '値段が直ったのに待たされてはいけない');
   db.exec('DELETE FROM amazon_fee_failure');
+});
+
+
+console.log('');
+console.log('1晩の枠の配り方 (Codex R9-1: 飢餓を防ぐ)');
+
+const nd = (reason, sku, fetchedAt = null) =>
+  ({ reason, target: target({ seller_sku: sku }), cached: fetchedAt ? { fetched_at: fetchedAt } : null });
+
+t('上限に収まるなら全部やる', () => {
+  const need = [nd('missing', 'a'), nd('expired', 'b', '2026-09-01T00:00:00Z')];
+  assert.equal(allocateFetchBudget(need, 10).length, 2);
+});
+
+t('[!] 新規が大量にあっても、期限切れに枠を残す (飢餓を防ぐ)', () => {
+  // 🚨 毎晩4,000件以上の新規が出続けると、期限切れに永久に枠が回らない (Codex R9-1)
+  const need = [];
+  for (let i = 0; i < 100; i++) need.push(nd('missing', 'new' + i));
+  for (let i = 0; i < 100; i++) need.push(nd('expired', 'old' + i, '2026-09-01T00:00:00Z'));
+  const picked = allocateFetchBudget(need, 20);
+  assert.equal(picked.length, 20);
+  const expired = picked.filter(n => n.reason === 'expired').length;
+  assert.equal(expired, 5, `20 の 25% = 5 は期限切れに残すはず (実際 ${expired})`);
+});
+
+t('期限切れが少なければ、余った枠は新規に回す (無駄にしない)', () => {
+  const need = [];
+  for (let i = 0; i < 100; i++) need.push(nd('missing', 'new' + i));
+  need.push(nd('expired', 'old1', '2026-09-01T00:00:00Z'));
+  const picked = allocateFetchBudget(need, 20);
+  assert.equal(picked.length, 20);
+  assert.equal(picked.filter(n => n.reason === 'expired').length, 1);
+});
+
+t('新規が少なければ、余った枠は期限切れに回す', () => {
+  const need = [nd('missing', 'new1')];
+  for (let i = 0; i < 100; i++) need.push(nd('expired', 'old' + i, '2026-09-01T00:00:00Z'));
+  const picked = allocateFetchBudget(need, 20);
+  assert.equal(picked.length, 20);
+  assert.equal(picked.filter(n => n.reason === 'expired').length, 19);
+});
+
+t('[!] 同じ種類のなかは古い順 (待たされたものから)', () => {
+  // 🚨 入力順のままだと、先頭側が毎晩変わるときに末尾側が永久に進まない
+  const need = [
+    nd('expired', 'newest', '2026-09-07T00:00:00Z'),
+    nd('expired', 'oldest', '2026-01-01T00:00:00Z'),
+    nd('expired', 'middle', '2026-05-01T00:00:00Z'),
+  ];
+  const picked = allocateFetchBudget(need, 1);
+  assert.equal(picked[0].target.seller_sku, 'oldest');
+});
+
+t('[!] 見積が1件も無いものが最優先 (いちばん待たされている)', () => {
+  const need = [nd('expired', 'has', '2026-01-01T00:00:00Z'), nd('missing', 'none')];
+  assert.equal(allocateFetchBudget(need, 1)[0].target.seller_sku, 'none');
+});
+
+console.log('');
+console.log('失敗の待ちは業務日で数える (Codex R9-4)');
+
+t('[!] 00:10 に失敗しても「翌日の 00:00 JST」から試せる (翌々晩にならない)', () => {
+  // 2026-09-08 09:10 JST = 2026-09-08T00:10:00Z
+  const r = retryAfterOf('2026-09-08T00:10:00Z', 1);
+  // 2026-09-09 00:00 JST = 2026-09-08T15:00:00Z
+  assert.equal(r, '2026-09-08T15:00:00.000Z');
+});
+
+t('3日待ちも同じ数え方', () => {
+  assert.equal(retryAfterOf('2026-09-08T00:10:00Z', 3), '2026-09-10T15:00:00.000Z');
+});
+
+t('読めない日時でも落ちない', () => {
+  assert.ok(retryAfterOf('ごみ', 1));
+});
+
+console.log('');
+console.log('取れたが使えない見積 (Codex R9-2)');
+
+await ta('[!] Success でも FBA なのに FBAFees が無ければ、待たせる (毎晩取り直さない)', async () => {
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  const t1 = target({ seller_sku: 'noFbaFee', in_fulfillment: 'FBA' });
+  const r1 = await refreshFees(db, [t1], {
+    sleepMs: 0, now: () => new Date('2026-09-08T00:00:00Z'),
+    // ReferralFee だけ返す = FBA なのに FBAFees が無い
+    callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { sellerId: 'S1' }),
+  });
+  assert.equal(r1.unusable, 1, '使えない見積として数えるはず');
+  assert.equal(loadFailures(db).size, 1, '待ち記録が作られていない');
+
+  let called = 0;
+  const r2 = await refreshFees(db, [t1], {
+    sleepMs: 0, now: () => new Date('2026-09-08T01:00:00Z'),
+    callFeesApi: async () => { called++; return []; },
+  });
+  assert.equal(called, 0, '使えない見積を毎晩取り直してはいけない');
+  assert.equal(r2.waitingOnFailure, 1);
+  db.exec('DELETE FROM amazon_fee_failure');
+});
+
+await ta('ちゃんと使える見積が返れば待ち記録は消える', async () => {
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  const t1 = target({ seller_sku: 'okFba', in_fulfillment: 'FBA' });
+  const r = await refreshFees(db, [t1], {
+    sleepMs: 0, now: () => new Date('2026-09-08T00:00:00Z'),
+    callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { sellerId: 'S1', fba: 462 }),
+  });
+  assert.equal(r.unusable, 0);
+  assert.equal(r.refreshed, 1);
+  assert.equal(loadFailures(db).size, 0);
+});
+
+console.log('');
+console.log('本番の呼び出し間隔 (Codex R9-3: 定数の比較だけでは足りない)');
+
+await ta('[!] バッチとバッチの間を必ずあける (本番の refreshFees を通す)', async () => {
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  // 21件 = 2バッチ。時計と sleep を差し替えて、実時間を待たずに間隔を測る
+  const targets = Array.from({ length: 21 }, (_, i) => target({ seller_sku: 'gap' + i }));
+  let t = Date.parse('2026-09-08T00:00:00Z');
+  const callTimes = [];
+  await refreshFees(db, targets, {
+    now: () => new Date(t),
+    sleep: async (ms) => { t += ms; },
+    callFeesApi: async (body) => {
+      callTimes.push(t);
+      return body.map(b => feeResponse(b.FeesEstimateRequest.Identifier, { sellerId: 'S1' })[0]);
+    },
+  });
+  assert.equal(callTimes.length, 2, '21件 = 2バッチ');
+  const gap = callTimes[1] - callTimes[0];
+  assert.ok(gap >= 1000 / SP_API_FEES_RATE_PER_SEC,
+    `バッチ間隔 ${gap}ms が 0.5 req/s (2,000ms) を下回っている`);
+});
+
+await ta('[!] リトライのあとも次のバッチまで間隔をあける', async () => {
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  const targets = Array.from({ length: 21 }, (_, i) => target({ seller_sku: 'retry' + i }));
+  let t = Date.parse('2026-09-08T00:00:00Z');
+  const callTimes = [];
+  let n = 0;
+  await refreshFees(db, targets, {
+    now: () => new Date(t),
+    sleep: async (ms) => { t += ms; },
+    callFeesApi: async (body) => {
+      callTimes.push(t);
+      n++;
+      if (n === 1) throw new Error('429 Too Many Requests');   // 1回目だけ失敗させる
+      return body.map(b => feeResponse(b.FeesEstimateRequest.Identifier, { sellerId: 'S1' })[0]);
+    },
+  });
+  assert.ok(callTimes.length >= 3, `リトライを含めて3回以上のはず (実際 ${callTimes.length})`);
+  const minGap = 1000 / SP_API_FEES_RATE_PER_SEC;
+  for (let i = 1; i < callTimes.length; i++) {
+    const gap = callTimes[i] - callTimes[i - 1];
+    assert.ok(gap >= minGap, `${i}回目の間隔 ${gap}ms が ${minGap}ms を下回っている`);
+  }
 });
 
 db.close();

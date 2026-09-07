@@ -120,12 +120,13 @@ export async function runNightly(opts = {}) {
         + (r.deferred ? ` 翌晩に回した${r.deferred}` : '')
         // 前に失敗して待ち中の対象。ここが増え続けるなら値かカタログ側の問題
         + (r.waitingOnFailure ? ` 失敗待ち${r.waitingOnFailure}` : '')
+        + (r.unusable ? ` 使えない見積${r.unusable}` : '')
         // 🚨 取り直した理由を必ず出す。これが無いと「なぜ再利用が効かなかったか」を後から追えない
         + (r.plannedRefetch ? ` 理由=${JSON.stringify(r.refetchReasons)}` : ''));
       // 🚨 キャッシュが効いていないなら必ず出す。SP-API は 0.5 req/s なので、
       //    全件取り直しは 13 分かかり、静かに毎晩やると枠を食い潰す
       if (r.refetchAnomaly) {
-        log(`[expected-profit] 🚨 手数料の再利用が効いていない: ${r.plannedRefetch}/${r.targets} 件を取り直そうとした`
+        log(`[expected-profit] 🚨 手数料の再利用が効いていない: ${r.cacheMisses}/${r.targets} 件がキャッシュに当たらなかった`
           + ` 理由=${JSON.stringify(r.refetchReasons)}`);
       }
     } catch (e) {

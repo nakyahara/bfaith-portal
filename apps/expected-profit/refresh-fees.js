@@ -37,8 +37,12 @@ const MAX_RETRIES = 3;
  *
  * 🚨 全部を同じ日数にすると、同じ晩に取ったものが**同じ晩に一斉失効**する。
  *    14 日ごとに 7,385 件の取り直しが起きる (雪崩)。
- *    SKU ごとに決まったズレを持たせて、失効する晩をばらけさせる。
- *    ズレは SKU から決まるので、同じ SKU は毎回同じ位相になる (毎晩ズレ直さない)。
+ *    SKU ごとに決まったズレを持たせて、初回の山を崩す。
+ *
+ * 🚨 これは「取得時刻からの寿命」であって**カレンダー上の位相ではない** (Codex R9-5)。
+ *    7 日群と 14 日群は、期限どおり更新されれば 14 日後にまた重なる。
+ *    毎晩ちょうど 1/8 が失効する保証は無い。山を平らにするのは
+ *    「1 晩の上限 (FEE_MAX_FETCH_PER_RUN)」の役目で、こちらは初回の山崩し。
  */
 const FEE_VALID_MIN_DAYS = 7;
 const FEE_VALID_SPREAD_DAYS = 8;   // 7〜14 日 → 1 晩あたり約 1/8 が失効
@@ -53,6 +57,39 @@ const FEE_VALID_DAYS = FEE_VALID_MIN_DAYS + FEE_VALID_SPREAD_DAYS - 1;   // 上�
  *    200 バッチ × 2.1 秒 ≒ 7 分。
  */
 const FEE_MAX_FETCH_PER_RUN = 4000;
+
+/**
+ * 上限のうち、**期限切れの取り直しに必ず残す割合**。
+ *
+ * 🚨 これが無いと、毎晩 4,000 件以上の「新規 / 入力変更」が出続けたときに
+ *    期限切れへ永久に枠が回らない (Codex R9-1)。
+ *    枠を分けたうえで、余った枠は相手側に回す (無駄にしない)。
+ */
+const EXPIRED_QUOTA_RATIO = 0.25;
+
+/**
+ * 上限のなかで「新規/入力変更」と「期限切れ」に枠を配る。
+ *
+ * 🚨 同じ優先度のなかは**古い順** (前の晩に回されたものが先) にする。
+ *    入力順のままだと、先頭側が毎晩変わるときに末尾側が永久に進まない。
+ */
+export function allocateFetchBudget(need, maxFetch, { expiredRatio = EXPIRED_QUOTA_RATIO } = {}) {
+  const isExpired = (n) => n.reason === 'expired';
+  // 古い順 = 前回の見積が古いもの / 見積が無いものを先に (待たされた順)
+  const age = (n) => {
+    const t = Date.parse(n.cached?.fetched_at ?? '');
+    return Number.isFinite(t) ? t : -Infinity;      // 見積が無いものが最優先
+  };
+  const fresh = need.filter(n => !isExpired(n)).sort((a, b) => age(a) - age(b));
+  const expired = need.filter(isExpired).sort((a, b) => age(a) - age(b));
+  if (maxFetch >= need.length) return [...fresh, ...expired];
+
+  const expiredQuota = Math.min(expired.length, Math.floor(maxFetch * expiredRatio));
+  const freshQuota = Math.min(fresh.length, maxFetch - expiredQuota);
+  // 余った枠は相手に回す
+  const takeExpired = Math.min(expired.length, maxFetch - freshQuota);
+  return [...fresh.slice(0, freshQuota), ...expired.slice(0, takeExpired)];
+}
 
 /** 取り直しが多すぎるときに警告する閾値 (キャッシュが温まっているのに半分以上ならおかしい) */
 const REFETCH_ANOMALY_RATIO = 0.5;
@@ -118,6 +155,22 @@ export function backoffDays(attempts) {
   return FAILURE_BACKOFF_DAYS[i];
 }
 
+/**
+ * 次に試してよくなる時刻。
+ *
+ * 🚨 「失敗した時刻 + N 日」にすると、00:10 に失敗したものが翌日 00:00 の実行では
+ *    24 時間未経過で飛ばされ、実質「翌々晩」になる (Codex R9-4)。
+ *    夜間バッチは日単位で回るので、**業務日 (JST) の境目**で数える。
+ *    JST の日付を取り、その N 日後の 00:00 JST を「また試してよい時刻」にする。
+ */
+export function retryAfterOf(failedAtIso, days) {
+  const t = Date.parse(failedAtIso);
+  if (!Number.isFinite(t)) return new Date(Date.now()).toISOString();
+  const JST = 9 * 60 * 60 * 1000;
+  const jstMidnight = Math.floor((t + JST) / 86400000) * 86400000 - JST;   // その日の 00:00 JST (UTC 表記)
+  return new Date(jstMidnight + days * 86400000).toISOString();
+}
+
 /** 待ちの残っている失敗記録 (キー → 記録) */
 export function loadFailures(db) {
   const map = new Map();
@@ -139,11 +192,18 @@ export function recordFailure(db, target, error, now = new Date()) {
                 last_error = excluded.last_error, failed_at = excluded.failed_at,
                 retry_after = excluded.retry_after`)
     .run(key, target.seller_sku, attempts, String(error || '').slice(0, 300),
-      failedAt, addDays(failedAt, backoffDays(attempts)));
+      failedAt, retryAfterOf(failedAt, backoffDays(attempts)));
   return attempts;
 }
 
-/** 成功したら失敗記録を消す (次からは普通に扱う) */
+/**
+ * 成功したら失敗記録を消す (次からは普通に扱う)。
+ *
+ * 🚨 待ちが解けるのは「入力が変わった (別キーになった)」か「時間が経った」ときだけ。
+ *    出品の再開やカタログ側の修正のように**キーが変わらない直し方**は待ちを解かない
+ *    (Codex R9)。すぐ反映したいときは amazon_fee_failure の該当行を消す。
+ *    最長でも 14 日で必ずやり直すので、放っておいても直る。
+ */
 export function clearFailure(db, target) {
   try { db.prepare('DELETE FROM amazon_fee_failure WHERE fee_key = ?').run(feeCacheKey(target)); }
   catch { /* テーブルが無い環境 */ }
@@ -168,7 +228,8 @@ export function planRefresh(targets, cachedByKey, now = new Date()) {
     const cached = cachedByKey.get(key);
     const verdict = canReuseFeeEstimate(cached, t, now);
     if (verdict.reuse) reuse.push({ target: t, cached });
-    else need.push({ target: t, reason: verdict.reason });
+    // 🚨 cached も持たせる。1晩の枠を配るときに「どれだけ待たされたか」で並べる (Codex R9-1)
+    else need.push({ target: t, reason: verdict.reason, cached });
   }
   return { need, reuse };
 }
@@ -223,7 +284,12 @@ export function looksLikeAsin(v) {
 
 /**
  * 何で商品を指すか。ASIN の形なら ASIN、そうでなければ自社 SKU。
- * 🚨 SellerSKU は公式に認められた IdType (ASIN か SellerSKU の2択)
+ *
+ * 🚨 SellerSKU は公式に認められた IdType (ASIN か SellerSKU の2択)。
+ * 🚨 ただし **ASIN 指定と SellerSKU 指定で見積が必ず同じとは限らない** (Codex R9)。
+ *    公式に「SKU 指定なら FBA 納品後の実測寸法にもとづく手数料が取れる」とある。
+ *    ここは「ASIN が使えないときの代わり」であって、同額を前提にしていない。
+ *    どちらで引いたかは fee_breakdown と入力キーから追える。
  */
 export function feeIdentifierOf(t) {
   return looksLikeAsin(t.asin)
@@ -333,7 +399,6 @@ export async function refreshFees(db, targets, deps = {}) {
 
   // 取り直す順番: 見積そのものが無い/入力が変わった → 先。期限切れは後。
   // 前者は行が計算できない (キーが当たらない)、後者は数字は出るがランキングに載らないだけ
-  const priority = (r) => (r.reason === 'expired' ? 1 : 0);
   // 🚨 前に失敗して、まだ待ち時間が残っているものは今晩は試さない。
   //    85/86 が「終了した出品」で毎晩必ず失敗していた (実データ)。
   //    入力が変われば別キーになるので、値が直れば自動でやり直す
@@ -347,15 +412,18 @@ export async function refreshFees(db, targets, deps = {}) {
     if (f && Number.isFinite(retryAfter) && retryAfter > nowMs) waiting.push(n);
     else attemptable.push(n);
   }
-  const ordered = attemptable.sort((a, b) => priority(a) - priority(b));
   const maxFetch = deps.maxFetch ?? FEE_MAX_FETCH_PER_RUN;
-  const need = ordered.slice(0, maxFetch);
-  const deferred = ordered.length - need.length;   // 上限で翌晩に回した数
+  const need = allocateFetchBudget(attemptable, maxFetch);
+  const deferred = attemptable.length - need.length;   // 上限で翌晩に回した数
 
   const callApi = deps.callFeesApi || defaultCallFeesApi;
   const sleepMs = deps.sleepMs ?? BATCH_SLEEP_MS;
+  // 🚨 待ちそのものを差し替えられるようにする。定数の大小比較だけでは
+  //    「本番ループから待ちが消えた」を検出できない (Codex R9-3)
+  const wait = deps.sleep || sleep;
   const saved = [];
   const errors = [];          // 対象 (SKU) 単位の失敗
+  const unusable = [];        // 取れたが再利用できない見積 (FBAFees 欠落など)
   const batchErrors = [];     // バッチ単位の失敗 (API 呼び出しそのものが通らなかった)
   let stoppedByDeadline = false;
   let processedTargets = 0;
@@ -380,7 +448,7 @@ export async function refreshFees(db, targets, deps = {}) {
         apiThrew = true;
         if (attempt === MAX_RETRIES - 1) {
           batchErrors.push({ targets: chunk.length, skus: chunk.map(c => c.seller_sku).slice(0, 5), error: e.message });
-        } else await sleep(sleepMs * (attempt + 1));   // 指数バックオフ
+        } else await wait(sleepMs * (attempt + 1));   // 指数バックオフ
       }
     }
     if (stoppedByDeadline) break;
@@ -408,12 +476,18 @@ export async function refreshFees(db, targets, deps = {}) {
         errors.push({ sku: chunk[j].seller_sku, error: msg, attempts });
         continue;
       }
-      clearFailure(db, chunk[j]);   // 直ったら記録を消す
+      // 🚨 Status が Success でも、正規化して「使えない見積」なら再利用されない
+      //    (FBA なのに FBAFees が無い等)。そのまま通すと 取得 → 使えない → 翌晩また取得
+      //    を毎晩繰り返す (Codex R9-2)。使えないものは失敗と同じく待たせる
+      const normalized = normalizeFeeEstimate(r.FeesEstimate, { fulfillment: chunk[j].in_fulfillment });
+      if (normalized.status === 'ok') clearFailure(db, chunk[j]);   // 直ったら記録を消す
+      else unusable.push({ sku: chunk[j].seller_sku, status: normalized.status,
+        attempts: recordFailure(db, chunk[j], `unusable:${normalized.status}`, now()) });
       const sellerIdFromResponse = r?.FeesEstimateIdentifier?.SellerId || null;
       if (sellerIdFromResponse) observedSellers.add(sellerIdFromResponse);
       saved.push(toEstimateRow(chunk[j], r.FeesEstimate, fetchedAt, sellerIdFromResponse));
     }
-    if (i + BATCH_SIZE < need.length) await sleep(sleepMs);
+    if (i + BATCH_SIZE < need.length) await wait(sleepMs);
   }
 
   // 応答が名乗ったセラーが**1つに決まったときだけ**、補完して覚える。
@@ -443,10 +517,15 @@ export async function refreshFees(db, targets, deps = {}) {
     targets: targets.length,
     deferred,                 // 1晩の上限で翌晩に回した数
     waitingOnFailure: waiting.length,   // 前に失敗して待ち中 (今晩は試さない)
+    unusable: unusable.length,          // 取れたが使えない見積 (待たせる)
     refetchAnomaly,           // 🚨 キャッシュが効いていない合図
-    plannedRefetch: ordered.length,
+    // 🚨 母集団を混ぜない (Codex R9-6)。
+    //    cacheMisses = キャッシュに当たらなかった総数 (異常判定はこちらで見る)
+    //    plannedRefetch = そのうち今晩試せるもの (失敗待ちを除いたあと)
+    cacheMisses: planned.need.length,
+    plannedRefetch: attemptable.length,
     // 取り直しの理由の内訳。キャッシュが当たらない原因が入力なのか期限なのか分かる
-    refetchReasons: countReasons(ordered),
+    refetchReasons: countReasons(planned.need),
     sellerId: observedSellerId || (sellerConflict ? null : knownSellerId),
     sellerConflict,
     observedSellers: [...observedSellers],

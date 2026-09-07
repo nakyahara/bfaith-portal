@@ -341,6 +341,54 @@ await ta('[!] 失敗して待ち中の対象の数もログに出す (増え続�
   db.exec('DELETE FROM amazon_fee_failure');
 });
 
+
+await ta('[!] 再利用が効いていない警告は「キャッシュに当たらなかった数」で出す', async () => {
+  // 🚨 異常判定は失敗待ちを除く**前**の数、表示は除いた**後**の数、だと
+  //    「0/4 件を取り直そうとした」という意味の通らない警告になる (Codex R9-6)
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  const listing = (sku, price) => ({
+    '出品者SKU': sku, '商品ID': 'B00000000' + sku.slice(-1), '価格': String(price),
+    'フルフィルメント・チャンネル': 'DEFAULT', 'ステータス': 'Active', 'ポイント': '0',
+  });
+  const listings = [listing('okA', 1000), listing('bad1', 1100), listing('bad2', 1200), listing('bad3', 1300)];
+  // okA だけ成功、bad* は失敗する API
+  const api = async (body) => body.map(b => {
+    const sku = String(b.FeesEstimateRequest.Identifier).split('|')[0];
+    if (sku === 'okA') {
+      return {
+        Status: 'Success',
+        FeesEstimateIdentifier: { SellerInputIdentifier: b.FeesEstimateRequest.Identifier, SellerId: 'S1' },
+        FeesEstimate: {
+          TotalFeesEstimate: { CurrencyCode: 'JPY', Amount: 84 },
+          FeeDetailList: [{ FeeType: 'ReferralFee', FeeAmount: { Amount: 84 }, FinalFee: { Amount: 84 }, FeePromotion: { Amount: 0 } }],
+        },
+      };
+    }
+    return {
+      Status: 'ClientError',
+      FeesEstimateIdentifier: { SellerInputIdentifier: b.FeesEstimateRequest.Identifier },
+      Error: { Message: 'bad' },
+    };
+  });
+  const run = (logs) => runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
+    malls: ['amazon'], skipPublish: true,
+    fetchDeps: { amazon: { getActiveListingsReport: async () => ({ listings }) } },
+    feeDeps: { sleepMs: 0, callFeesApi: api, now: () => new Date('2026-09-08T00:00:00Z') },
+    log: (m) => logs.push(String(m)),
+  });
+
+  await run([]);                       // 1晩目: okA が保存され、bad* は失敗記録に入る
+  const logs = [];
+  await run(logs);                     // 2晩目: bad* は失敗待ち → 取り直し候補は 0 になる
+  const warn = logs.find(l => l.includes('再利用が効いていない'));
+  assert.ok(warn, `警告が出ていない: ${JSON.stringify(logs)}`);
+  assert.match(warn, /3\/4 件がキャッシュに当たらなかった/, `母集団が混ざっている: ${warn}`);
+  assert.ok(!/^.*0\/4/.test(warn), `取り直し候補の数 (0) を出してはいけない: ${warn}`);
+  db.exec('DELETE FROM amazon_fee_failure');
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);
