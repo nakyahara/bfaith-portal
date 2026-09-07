@@ -2596,8 +2596,13 @@ function openPrintBox(id, batchId) {
   //   多すぎるときはそのまま出して、合計の案内と発行時の検査で止める
   copies = Math.max(1, copies);
   // 期限の既定: この入荷の有効期限 → 無ければ「期限シールあり」の商品だけ印を入れる (無い商品は空欄)
-  // ⭐期限も**そのまとまりのもの**を既定にする (§AB-12 の前提 7: 1 つの入荷に期限が混ざる)
-  const expSrc = (batch && batch.expiry) || c.expiry;
+  // ⭐期限も**そのまとまりのもの**を既定にする (§AB-12 の前提 7: 1 つの入荷に期限が混ざる)。
+  // 🚨分かれているカードでは、そのまとまりに期限が無ければ**空のまま**にする。
+  //   カード全体の期限を埋め戻すと、選ぶ画面で「期限なし」と見せた直後に別の期限が入り、
+  //   そのまま違うラベルを刷れてしまう (Codex #1259 R1 重大1)。
+  //   分かれていないカードは、まとまり = カードと同じ物なので、まとまり側が空なら
+  //   カードの期限を使ってよい (期限が混ざりようがない。既定が消えるほうが現場では困る)
+  const expSrc = bs.length > 1 ? (batch ? batch.expiry : null) : ((batch && batch.expiry) || c.expiry);
   const expiry = expSrc ? String(expSrc) : (m.expiry_seal === 1 ? '期限シールあり' : '');
   const first = agents.find(a => a.online) || agents[0];
   const opts = agents.map(a => '<option value="' + a.id + '"' + (a.id === first.id ? ' selected' : '') + '>' + esc(a.label) + ' — ' + esc(a.printer_name || '(プリンター未登録)') + (a.online ? '' : ' (応答なし)') + '</option>').join('');
@@ -2617,7 +2622,7 @@ function openPrintBox(id, batchId) {
         + ' ・ ' + esc(String(batch.planned_qty)) + ' 個'
         + (batch.expiry ? ' ・ 期限 ' + esc(batch.expiry) : '')
         + ' ・ ' + esc(facilityName(batch.facility_code || c.facility_code) || '未定')
-        + ' <button type="button" class="btn-sm" onclick="closeOverlay(\'#printOv\'); openPrintBox(' + c.id + ')">選び直す</button></div></div>'
+        + ' <button type="button" class="btn-sm" data-prredo="' + c.id + '">選び直す</button></div></div>'
       : '') +
     '<div class="pfld"><label>バーコード</label><div class="ro num">' + esc(c.barcode || '') + ' <small>(' + (type ? type.toUpperCase() : '不明') + ')</small></div></div>' +
     '<div class="pfld"><label>1 箱に何個 (ラベルの「数量」。空欄なら印字しない)</label><input type="number" inputmode="numeric" min="1" step="1" id="printPack" value="' + esc(units) + '" placeholder="未登録"></div>' +
@@ -2638,12 +2643,14 @@ function openPrintBox(id, batchId) {
  * それを見て選べるようにする。⚠window.prompt は iOS のホーム画面アプリで出ないことがある (監修 R-1)
  */
 function openPrintBatchPick(c, bs) {
+  // ⭐前のカードの printCtx を残さない (選んだあとに別のカードへ渡してしまう — Codex R1 中1)
+  printCtx = null;
   $('#printBody').innerHTML =
     '<div class="pfld"><label>商品</label><div class="ro"><b>' + esc(c.title) + '</b></div></div>' +
     '<p class="hint">このカードは ' + bs.length + ' つに分かれています。<b>どのぶんのラベルを出しますか。</b>' +
       '期限や数がぶんごとに違うことがあります。</p>' +
     '<div class="pbatches">' + bs.map((b) =>
-      '<button type="button" class="btn wide" data-prbatch="' + esc(String(b.id)) + '">' +
+      '<button type="button" class="btn wide" data-prtask="' + esc(String(c.id)) + '" data-prbatch="' + esc(String(b.id)) + '">' +
         '<b>まとまり #' + esc(String(b.seq)) + '</b> ・ ' + esc(String(b.planned_qty)) + ' 個' +
         (b.expiry ? ' ・ 期限 ' + esc(b.expiry) : ' ・ 期限なし') +
         ' ・ ' + esc(facilityName(b.facility_code || c.facility_code) || '未定') +
@@ -2654,10 +2661,26 @@ function openPrintBatchPick(c, bs) {
 }
 document.addEventListener('click', (e) => {
   const b = e.target.closest('[data-prbatch]');
-  if (!b) return;
-  const c = findCard(printCtx ? printCtx.id : curDetail) || findCard(curDetail);
+  if (b) {
+    // ⭐どのカードのぶんかは**選ぶ画面が覚えている**。前に開いたカードの printCtx が残っていて、
+    //   そちらの id を使ってしまうのを防ぐ (Codex R1 中1)
+    const c = findCard(Number(b.dataset.prtask));
+    closeOverlay('#printOv');
+    if (c) openPrintBox(c.id, Number(b.dataset.prbatch));
+    return;
+  }
+  const r = e.target.closest('[data-prredo]');
+  if (!r) return;
+  // 🚨送っている最中・送ったが結果を確かめられていないときは選び直させない。
+  //   ここで作り直すと**依頼 ID が変わり**、届いていた 1 枚目に重ねてもう 1 枚出る (Codex R1 重大2)
+  if (printCtx && (printCtx.saving || printCtx.submitted)) {
+    $('#printMsg').textContent = printCtx.saving
+      ? '❌ いま送っています。終わるまでお待ちください'
+      : '❌ さきほどの依頼が届いたか分かっていません。同じ内容で「発行」を押し直すか、いったん閉じて印刷の状態を見てください (選び直すと 2 枚出ることがあります)';
+    return;
+  }
   closeOverlay('#printOv');
-  if (c) openPrintBox(c.id, Number(b.dataset.prbatch));
+  openPrintBox(Number(r.dataset.prredo));
 });
 
 /** 「70 個 × 5 枚 ＋ 10 個 × 1 枚 = 6 枚」— 何枚出るかを人が読める形で出す */
@@ -2719,6 +2742,8 @@ async function submitPrint() {
     return;
   }
   ctx.saving = true;
+  // ⭐この依頼を送った、という印。届いたかどうかが分かるまで下ろさない (依頼 ID を作り直させないため)
+  ctx.submitted = true;
   $('#printOk').disabled = true;
   msgEl.textContent = '送信しています…';
   let j;
@@ -2738,6 +2763,7 @@ async function submitPrint() {
     return;
   }
   ctx.saving = false;
+  ctx.submitted = false;   // サーバーの返事が来た = 届いたかどうかは分かった
   if (j.ok) {
     c.print_job = j.job;
     closePrintBox();

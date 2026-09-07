@@ -3871,14 +3871,40 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && html.includes("let units = m.units_per_container != null ? String(m.units_per_container) : '';"),
     '既定値: 1 箱に何個=入数 / 期限=この入荷の有効期限 (無ければ期限シールありの印)');
   // ⭐箱ラベルはまとまり単位 (要件 §AB-12)
-  ok(html.includes('const expSrc = (batch && batch.expiry) || c.expiry;'),
+  ok(html.includes("const expSrc = bs.length > 1 ? (batch ? batch.expiry : null) : ((batch && batch.expiry) || c.expiry);"),
     '⭐期限は**そのまとまりのもの**を既定にする (1 つの入荷に期限が混ざる)');
+  // ⭐期限を実際に決めさせて確かめる (式があるかどうかでは、埋め戻しの穴を見つけられない)
+  {
+    // ⭐**ソースの行そのもの**を取り出して動かす。テストに式を書き写すと、実物を直しても気づけない
+    const srcLines = html.split(/\r?\n/).filter((l) => /const (expSrc|expiry) = /.test(l)).slice(0, 2).join('\n');
+    ok(/expSrc/.test(srcLines) && /expiry_seal/.test(srcLines), '(前提) 期限を決める 2 行を取り出せた');
+    const pick = (bsLen, batch, cardExpiry, seal) => new Function('bs', 'batch', 'c', 'm',
+      srcLines + '; return expiry;')({ length: bsLen }, batch, { expiry: cardExpiry }, { expiry_seal: seal });
+    ok(pick(2, { expiry: '2028-06' }, '2027-03', 0) === '2028-06',
+      '⭐分かれたカードでは、選んだぶんの期限を出す (カード全体のものにしない)');
+    ok(pick(2, { expiry: null }, '2027-03', 0) === '',
+      '🚨期限なしのぶんを選んだら**空のまま**。カード全体の 2027-03 を埋め戻さない (Codex R1 重大1)');
+    ok(pick(1, { expiry: '2027-03' }, '2027-03', 0) === '2027-03', '分かれていないカードは今までどおり');
+    ok(pick(1, { expiry: null }, '2027-03', 0) === '2027-03',
+      '分かれていないカードは、まとまり = カードと同じ物なのでカードの期限を使ってよい');
+    ok(pick(2, { expiry: null }, null, 1) === '期限シールあり', '期限シールの印は残る');
+  }
   ok(html.includes('const bc = batch && bs.length > 1 ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;'),
     '⭐箱の数も**そのまとまりの数**で数える (400 個のぶんに 1000 個ぶんのラベルを出さない)');
   ok(html.includes('if (bs.length > 1 && batchId == null) { openPrintBatchPick(c, bs); return; }'),
     '⭐分かれているカードは、どのぶんか選んでから出す');
   ok(html.includes('function openPrintBatchPick(c, bs)') && html.includes("$('#printOk').disabled = true;"),
     '選ぶまでは発行させない');
+  // 🚨送信中・結果が分からないうちは選び直させない (依頼 ID を作り直すと 2 枚出る — Codex R1 重大2)
+  ok(html.includes('if (printCtx && (printCtx.saving || printCtx.submitted)) {'),
+    '⭐送っている最中・届いたか分からないうちは、選び直しを受け付けない');
+  ok(html.includes('ctx.submitted = true;') && html.includes('ctx.submitted = false;   // サーバーの返事が来た'),
+    '⭐「送った」印は、サーバーの返事が来るまで下ろさない (通信が切れたら立ったまま)');
+  ok(html.includes("data-prredo=") && !html.includes("openPrintBox(' + c.id + ')\">選び直す"),
+    '選び直しは直接呼ばず、見張りを通す');
+  // ⭐どのカードのぶんかは選ぶ画面が覚える (前のカードに渡さない — Codex R1 中1)
+  ok(html.includes("printCtx = null;") && html.includes("data-prtask=") && html.includes('findCard(Number(b.dataset.prtask))'),
+    '⭐選んだぶんは、その画面を開いたカードに渡す (前のカードの printCtx を使わない)');
   ok(html.includes('batch_id: ctx.batchId == null ? undefined : ctx.batchId,'), 'どのぶんかをサーバーにも送る');
   // 箱の数え方を実際に動かす
   {
