@@ -4727,10 +4727,11 @@ console.log('\n[26] 作業のまとまり — カードの下に独立して作�
     ok(B.listBatchesOfTask(db, tb)[0].work_status === 'done', 'まとめて棚入完了でも、まとまりが done になる');
     const tr = TD.upsertTaskFromImport({ notion_page_id: 'batch-auto-1', status: 'not_started',
       destination_id: 9619, product_name: '自動取消', qty: 30 }, { batchId: 'bt' }).id;
-    TD.requestCancellation({ taskId: tr, source: 'inbound_check', actor: 'test' });
-    if (TD.getTask(tr).status === 'closed') {
-      ok(B.listBatchesOfTask(db, tr)[0].work_status === 'cancelled', '自動取消でも、まとまりが cancelled になる');
-    }
+    const rc = TD.requestCancellation({ destinationId: 9619, source: 'inbound_check', actor: 'test' });
+    // ⭐条件つきにしない。取消が起きなければテストが素通りしてしまう (Codex R2)
+    ok(rc.ok && rc.action === 'closed', '未着手・実績なしのカードは自動で取消になる');
+    ok(TD.getTask(tr).status === 'closed' && TD.getTask(tr).close_reason === 'cancelled', 'カードは取消で終了');
+    ok(B.listBatchesOfTask(db, tr)[0].work_status === 'cancelled', '自動取消でも、まとまりが cancelled になる');
   }
 
   // ── できた数と出どころは必ず対 (片方だけの行を作らせない) ──

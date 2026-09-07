@@ -473,6 +473,33 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
     '確定と同時にタスクができる (未着手・拠点は未定・Notion ページなし)');
   ok(t1.product_code === 'TASK-A' && t1.product_name === 'タスク商品A' && t1.qty === 6 && t1.ar_no === 'AR9' && t1.barcode === '4599999999991'
     && t1.expiry === '2027-03' && t1.arrival_date === d1.work_date, 'タスクに商品コード・名前・数量 (実数)・入荷管理番号・バーコード・有効期限・入庫日が載る');
+  ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ?').get(t1.id).c === 1,
+    '⭐確定と同時に「作業のまとまり」も 1 つできる (要件 §AB-1)');
+
+  // ⭐カードとまとまりは**同じ書き込み**か。まとまりを作るところでわざと失敗させ、確定ごと巻き戻ることを確かめる。
+  //   ここが割れると「カードはあるのに、まとまりが無い」行が本番に残る (Codex R2)
+  {
+    const before = {
+      dest: db.prepare('SELECT COUNT(*) c FROM f_inbound_check_destinations').get().c,
+      task: db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c,
+      batch: db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches').get().c,
+    };
+    db.exec(`CREATE TRIGGER tmp_batch_boom BEFORE INSERT ON f_iroha_task_batches
+      BEGIN SELECT RAISE(ABORT, 'まとまりを作れない'); END;`);
+    let boom = null;
+    try {
+      fin('AR9|2|1', { fillEvent: FILL('ev-prb-boom'), clientOperationId: 'op-prb-boom', decide: decideIroha });
+    } catch (e) { boom = e; }
+    db.exec('DROP TRIGGER tmp_batch_boom');
+    ok(boom && /まとまりを作れない/.test(boom.message), '前提: まとまりを作るところで失敗させた');
+    ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_tasks').get().c === before.task
+      && db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches').get().c === before.batch
+      && db.prepare('SELECT COUNT(*) c FROM f_inbound_check_destinations').get().c === before.dest,
+      '⭐まとまりを作れなければ、カードも行き先台帳も残らない (確定ごと巻き戻る)');
+    ok(db.prepare("SELECT status FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = 'AR9|3|1'").get(b.id).status === 'unchecked',
+      '確定そのものも成立していない (この行は後でふつうに確定できる)');
+  }
+
   const snap = JSON.parse(t1.master_snapshot);
   ok(snap.material_code === 'D-8' && snap.storage_container === '透明袋' && snap.units_per_container === 180 && snap.process_count === 2 && snap.version === 3, '作業仕様のスナップショット (作成時点の値)');
   const payload = JSON.parse(t1.payload);
@@ -487,6 +514,8 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   const d3Id = destIdOf('AR9|3|1');
   const t3 = taskOf(d3Id);
   ok(t3 && t3.master_snapshot == null && t3.product_code === 'TASK-C' && t3.created_by === 'inbound:鈴木', '作業仕様が無い商品も未着手で作られる (スナップショット無し)');
+  ok(t3 && db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ?').get(t3.id).c === 1,
+    '⭐巻き戻した行も、あらためて確定すればカードとまとまりが両方できる');
 
   // やり直し (未着手・実績なし) → 自動で取消
   const s1 = lineState('AR9|1|1');
