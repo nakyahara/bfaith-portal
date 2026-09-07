@@ -50,6 +50,9 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(express.json());
 app.use((req, _res, next) => {
+  // ⭐sessionRole = null は「ログインしていない人」。セッションを入れない
+  //   (入れてしまうと、ログイン不要の口を試したつもりが管理者として通っている — Codex R5 中2)
+  if (sessionRole === null) { req.session = {}; return next(); }
   req.session = { authenticated: true, email: 'test@b-faith.biz', displayName: 'テスト', allowedApps: '*', role: sessionRole };
   next();
 });
@@ -312,6 +315,31 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
   const wr = await fetch(`http://${HOST}${made.json.url}/api/view`, {
     method: 'POST', headers: { Host: HOST, Origin: `http://${HOST}`, 'Content-Type': 'application/json' }, body: '{}' });
   ok(wr.status === 404 || wr.status === 405, '⭐POST は受け付けない (見るだけ)');
+
+  // ⭐**ログインしていない人**として確かめる (ここまではテスト用の middleware が管理者セッションを
+  //   入れていたので、「URL だけで開く」ことを本当には試せていなかった — Codex R5 中2)
+  {
+    sessionRole = null;
+    const anon = await fetch(`http://${HOST}${made.json.url}`, { headers: { Host: HOST } });
+    const anonHtml = await anon.text();
+    ok(anon.status === 200 && /おあずかりしている商品/.test(anonHtml),
+      '⭐ログインしていなくても、専用 URL は開ける');
+    const anonApi = await fetch(`http://${HOST}${made.json.url}/api/view`, { headers: { Host: HOST } });
+    ok(anonApi.status === 200 && (await anonApi.json()).ok, '⭐中身も読める');
+    // ⭐同じ「ログインしていない」状態で、社内の口は閉じている
+    const inner = await fetch(`http://${HOST}/apps/iroha-work/api/state`, { headers: { Host: HOST } });
+    ok(inner.status === 401, '⭐社内の一覧はログインしていないと 401');
+    const issue = await fetch(`http://${HOST}/apps/iroha-work/admin/facility-links`, {
+      method: 'POST', headers: { Host: HOST, Origin: `http://${HOST}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ facility_code: 'workcenter', label: 'だめ' }), redirect: 'manual' });
+    ok(issue.status >= 300 && issue.status !== 200, '⭐URL の発行はログインしていないとできない (' + issue.status + ')');
+    const revoke = await fetch(`http://${HOST}/apps/iroha-work/admin/facility-links/1/revoke`, {
+      method: 'POST', headers: { Host: HOST, Origin: `http://${HOST}` }, redirect: 'manual' });
+    ok(revoke.status >= 300 && revoke.status !== 200, '⭐失効もできない (' + revoke.status + ')');
+    const board = await fetch(`http://${HOST}/apps/iroha-work/admin`, { headers: { Host: HOST }, redirect: 'manual' });
+    ok(board.status >= 300 && board.status !== 200, '⭐管理画面も開けない (' + board.status + ')');
+    sessionRole = 'admin';
+  }
 
   // ⭐/f/ の下は、受けなかったパス・メソッドがこの先へ流れない (Codex R1)
   for (const [method, p] of [

@@ -39,6 +39,7 @@ import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, build
 import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
 import { batchTransitionNeedsStaff } from './batches.js';
+import { bumpWindow } from './rate-window.js';
 import { setTaskBlock, clearTaskBlock, undoTaskBlock, blockedOf } from './tasks-db.js';
 import { notifyStaff, materialsShortageText } from './notify.js';
 import { enqueuePrintJob, leaseNextJob, markSubmitted, markFinished, getJobStatusFor, recordHeartbeat, listPrintAgents, latestJobsByTask, listPrintJobs, publicJob, MAX_COPIES, LEASE_SEC } from './print-queue.js';
@@ -2176,29 +2177,7 @@ const FL_IP_MAX_KEYS = 2000;       // 覚える接続元の上限。あふれた
 const flHits = new Map();          // リンク id → { count, until }
 const flIpHits = new Map();        // 接続元 → { count, until }
 
-function bumpWindow(map, key, max, cap) {
-  const now = Date.now();
-  const cur = map.get(key);
-  if (cur && cur.until > now) {
-    if (++cur.count > max) return false;
-    return true;
-  }
-  if (cur) map.delete(key);                       // 期限切れは入れ直す (入れた順を新しくする)
-  if (cap && map.size >= cap) {
-    // ⭐**期限切れのものだけ**捨てる。入れた順に並んでいるので、前から数個見れば足りる (全部は見にいかない)
-    let looked = 0;
-    for (const [k, v] of map) {
-      if (v.until > now) break;                   // ここから先はまだ生きている (入れた順なので)
-      map.delete(k);
-      if (++looked >= 50 || map.size < cap) break;
-    }
-    // ⭐それでも空かないなら、**生きている記録は捨てずに断る**。
-    //   捨ててしまうと、別の接続元をたくさん作って自分の記録を消せる = 数え直しができてしまう
-    if (map.size >= cap) return false;
-  }
-  map.set(key, { count: 1, until: now + FL_WINDOW_MS });
-  return true;
-}
+const bump = (map, key, max, cap) => bumpWindow(map, key, max, cap, FL_WINDOW_MS);
 /**
  * 接続元。⭐**X-Forwarded-For を自分で読まない**。
  *
@@ -2226,8 +2205,8 @@ function facilityLinkGate(req, res, next) {
     // ② 当たったものは**リンクの id だけ**で数える (発行した本数ぶんしか増えないので、上限も追い出しも要らない)。
     //    ⭐接続元の上限は見ない — そちらは満杯のとき断る作りなので、外から大量の接続元を作られると
     //      **正しい URL を持っている施設まで締め出せて**しまう (自己レビュー)
-    if (!bumpWindow(flHits, link.id, FL_MAX_PER_WINDOW, 0)) return tooMany();
-  } else if (!bumpWindow(flIpHits, clientKeyOf(req), FL_IP_MAX_PER_WINDOW, FL_IP_MAX_KEYS)) {
+    if (!bump(flHits, link.id, FL_MAX_PER_WINDOW, 0)) return tooMany();
+  } else if (!bump(flIpHits, clientKeyOf(req), FL_IP_MAX_PER_WINDOW, FL_IP_MAX_KEYS)) {
     // ③ 当たらなかったものだけ、接続元で数える (URL を探して叩き続ける相手を頭打ちにする)
     return tooMany();
   }

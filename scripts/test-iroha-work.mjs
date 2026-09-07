@@ -6613,6 +6613,52 @@ console.log('\n[32] 外部施設の専用 URL (見るだけ。§AB-11 の 6)');
     ok(view2.summary.held_qty === before.held_qty, '精算したら「いまお持ちの数」から外れる');
   }
 
+  // ⑩ ⭐回数の上限そのものを、時計を止めて確かめる (HTTP では上限ちょうどまで埋められない — Codex R5 中1)
+  {
+    const { bumpWindow } = await import('../apps/iroha-work/rate-window.js');
+    const W = 60_000;
+    const CAP = 2000;
+    const MAX = 120;
+    const t0 = 1_000_000;
+    const m = new Map();
+    // 生きている記録を**ちょうど上限まで**作る
+    for (let i = 0; i < CAP; i++) bumpWindow(m, 'ip' + i, MAX, CAP, W, t0);
+    ok(m.size === CAP, '前提: 生きている記録を上限ちょうど (' + CAP + ' 件) 作った');
+    ok(bumpWindow(m, 'newcomer', MAX, CAP, W, t0 + 1) === false,
+      '⭐満杯のときは新しい相手を断る (生きている記録を消して席を空けない)');
+    ok(m.size === CAP, '断ったので記録は増えていない');
+
+    // ⭐いったん断られた相手が、他を大量に作って数え直せないこと
+    const m2 = new Map();
+    const victim = 'victim';
+    for (let i = 0; i < MAX; i++) bumpWindow(m2, victim, MAX, CAP, W, t0);
+    ok(bumpWindow(m2, victim, MAX, CAP, W, t0) === false, '前提: この相手は上限に達して断られた');
+    for (let i = 0; i < CAP * 3; i++) bumpWindow(m2, 'flood' + i, MAX, CAP, W, t0);
+    ok(bumpWindow(m2, victim, MAX, CAP, W, t0) === false,
+      '⭐相手を 6000 通り作って押し出しても、断られた記録は消えない (数え直せない)');
+    ok(m2.size <= CAP, '覚える数は上限を超えない (' + m2.size + ' 件)');
+
+    // ⭐窓が明けたら、たまった記録は掃けて新しい相手が入れる
+    const later = t0 + W + 1;
+    let passed = 0;
+    for (let i = 0; i < 60; i++) if (bumpWindow(m2, 'after' + i, MAX, CAP, W, later)) passed++;
+    ok(passed === 60, '⭐1 分たてば新しい相手が入れる (次の窓に持ち越さない)');
+    ok(bumpWindow(m2, victim, MAX, CAP, W, later) === true, '断られていた相手も、窓が明ければ通る');
+
+    // ⭐満杯でも 1 回あたりが重くならない (毎回すべてを見にいかない)
+    const m3 = new Map();
+    for (let i = 0; i < CAP; i++) bumpWindow(m3, 'k' + i, MAX, CAP, W, t0);
+    const started = Date.now();
+    for (let i = 0; i < 20_000; i++) bumpWindow(m3, 'x' + i, MAX, CAP, W, t0);
+    const ms = Date.now() - started;
+    ok(ms < 1000, '⭐満杯のまま 2 万回でも重くならない (' + ms + 'ms)');
+
+    // 上限なし (cap = 0) は、増えないと分かっている相手 (発行ずみリンク) 用
+    const m4 = new Map();
+    for (let i = 0; i < 100; i++) bumpWindow(m4, i, MAX, 0, W, t0);
+    ok(m4.size === 100, '上限なしのときは、そのぶん覚える (リンク id は発行本数ぶんしか増えない)');
+  }
+
   // ── 画面 ──
   const fh = fs.readFileSync(new URL('../apps/iroha-work/views/facility.html', import.meta.url), 'utf8');
   ok(/name="robots" content="noindex/.test(fh) && /name="referrer" content="no-referrer"/.test(fh),
