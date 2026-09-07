@@ -87,10 +87,16 @@ export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil 
 export function rakutenItemToSnapshots(item, { runId, shopId, fetchedAt, validUntil }) {
   const manageNumber = String(item?.manageNumber || '').trim();
   if (!manageNumber) return [];
-  const variants = item?.variants && typeof item.variants === 'object' ? item.variants : {};
+  // 🚨 variants は「SKU管理番号 → variant」のオブジェクト。
+  //    配列で来たら添字が SKU 管理番号になってしまうので、解析失敗として扱う (Codex R2)
+  const v0 = item?.variants;
+  if (!v0 || typeof v0 !== 'object' || Array.isArray(v0)) return [];
+  const variants = v0;
   const hideItem = item?.hideItem === true;
   const out = [];
   for (const [variantKey, v] of Object.entries(variants)) {
+    // 要素が object でない / キーが空 は解析不能 (行を作らない = 呼び出し側が unparsable に数える)
+    if (!variantKey || !v || typeof v !== 'object' || Array.isArray(v)) continue;
     const price = toIntPrice(v?.standardPrice);            // 🚨 文字列で返る ("1080")
     const taxRate = v?.payment?.taxRate != null ? Number(v.payment.taxRate) : null;
     // 🚨 standardPrice が税込とは限らない (Codex R1-5)。taxIncluded を確認し、

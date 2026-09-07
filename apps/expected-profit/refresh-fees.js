@@ -41,6 +41,25 @@ export function planRefresh(targets, cachedByKey, now = new Date()) {
   return { need, reuse };
 }
 
+/**
+ * 見積入力が揃っているか。
+ * 🚨 欠損を 0 や既定値で埋めて API を呼ばない (Codex R2)。
+ *    埋めると「実際とは違う条件の見積」を正常値として保存してしまう
+ */
+export function validateFeeTarget(t) {
+  const missing = [];
+  if (!t?.seller_id) missing.push('seller_id');
+  if (!t?.marketplace_id) missing.push('marketplace_id');
+  if (!t?.seller_sku) missing.push('seller_sku');
+  if (!t?.asin) missing.push('asin');
+  if (!Number.isInteger(t?.in_listing_price) || t.in_listing_price <= 0) missing.push('in_listing_price');
+  if (!Number.isInteger(t?.in_shipping) || t.in_shipping < 0) missing.push('in_shipping');
+  if (!Number.isInteger(t?.in_points) || t.in_points < 0) missing.push('in_points');
+  if (t?.in_fulfillment !== 'FBA' && t?.in_fulfillment !== 'FBM') missing.push('in_fulfillment');
+  if (!t?.in_currency) missing.push('in_currency');
+  return missing.length === 0 ? { ok: true } : { ok: false, missing };
+}
+
 export function cacheKey(t) {
   return [t.seller_id, t.marketplace_id, t.seller_sku, t.in_listing_price,
     t.in_shipping, t.in_points, t.in_fulfillment].join('');
@@ -64,10 +83,11 @@ export function buildFeeRequest(targets) {
       MarketplaceId: t.marketplace_id,
       IsAmazonFulfilled: t.in_fulfillment === 'FBA',
       PriceToEstimateFees: {
-        ListingPrice: { CurrencyCode: t.in_currency || 'JPY', Amount: t.in_listing_price },
-        Shipping: { CurrencyCode: t.in_currency || 'JPY', Amount: t.in_shipping },
-        // ポイントは見積入力に含める (§15-1)。0 でも明示的に渡す
-        Points: { PointsNumber: t.in_points || 0 },
+        ListingPrice: { CurrencyCode: t.in_currency, Amount: t.in_listing_price },
+        Shipping: { CurrencyCode: t.in_currency, Amount: t.in_shipping },
+        // ポイントは見積入力に含める (§15-1)。
+        // 🚨 || 0 で埋めない。欠損は validateFeeTarget が先に弾く
+        Points: { PointsNumber: t.in_points },
       },
       Identifier: `${t.seller_sku}|${idx}|${Date.now()}`,
     },
@@ -134,8 +154,16 @@ export async function refreshFees(db, targets, deps = {}) {
       `marketplace_id が環境設定 (${envMarketplace}) と違う対象が ${mismatched.length} 件あります: `
       + `${[...new Set(mismatched.map(t => t.marketplace_id))].join(', ')}`);
   }
+  // 🚨 入力が欠けた対象は API を呼ぶ前に外す。0 で埋めて呼ぶと嘘の条件で保存される
+  const invalid = [];
+  const valid = [];
+  for (const t of targets) {
+    const v = validateFeeTarget(t);
+    if (v.ok) valid.push(t);
+    else invalid.push({ sku: t?.seller_sku ?? null, missing: v.missing });
+  }
   const cached = loadCache(db);
-  const { need, reuse } = planRefresh(targets, cached, now());
+  const { need, reuse } = planRefresh(valid, cached, now());
 
   const callApi = deps.callFeesApi || defaultCallFeesApi;
   const sleepMs = deps.sleepMs ?? BATCH_SLEEP_MS;
@@ -151,21 +179,29 @@ export async function refreshFees(db, targets, deps = {}) {
 
     const chunk = need.slice(i, i + BATCH_SIZE).map(x => x.target);
     const body = buildFeeRequest(chunk);
-    let res = null;
+    let res;
+    let apiThrew = false;
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      try { res = await callApi(body); break; }
+      try { res = await callApi(body); apiThrew = false; break; }
       catch (e) {
+        apiThrew = true;
         if (attempt === MAX_RETRIES - 1) {
           batchErrors.push({ targets: chunk.length, skus: chunk.map(c => c.seller_sku).slice(0, 5), error: e.message });
         } else await sleep(sleepMs * (attempt + 1));   // 指数バックオフ
       }
     }
     processedTargets += chunk.length;
-    if (!res) continue;
+    if (apiThrew) continue;                 // 例外側は既に batchErrors に積んである
+    // 🚨 例外を投げずに null / 非配列を返す API も「バッチ失敗」として数える。
+    //    ここを素通りさせると対象が集計から消える (Codex R2)
+    if (!Array.isArray(res)) {
+      batchErrors.push({ targets: chunk.length, skus: chunk.map(c => c.seller_sku).slice(0, 5), error: 'レスポンスが配列でない' });
+      continue;
+    }
 
     const fetchedAt = nowIso();
     const byIdentifier = new Map();
-    for (const r of Array.isArray(res) ? res : []) {
+    for (const r of res) {
       const id = r?.FeesEstimateIdentifier?.SellerInputIdentifier;
       if (id) byIdentifier.set(id, r);
     }
@@ -188,6 +224,8 @@ export async function refreshFees(db, targets, deps = {}) {
   const failedTargets = errors.length + batchErrors.reduce((a, b) => a + b.targets, 0);
   return {
     targets: targets.length,
+    invalidTargets: invalid.length,
+    invalid: invalid.slice(0, 20),
     reused: reuse.length,
     refreshed: saved.length,
     // 🚨 SKU 単位とバッチ単位を混ぜない (取得率の判断に使えなくなる)

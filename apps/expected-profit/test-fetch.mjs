@@ -336,6 +336,78 @@ await ta('nextCursorMark が同じ値を返し続けたら止まる (無限ル�
   assert.equal(r.truncated, false);
 });
 
+await ta('[!] 解析失敗が fetch 経由で DB の listing_enum_status まで届く', async () => {
+  // enumStatusWithParseFailures の適用を fetch から外したら、この試験が落ちる
+  const r = await fetchAmazonListings(db, {
+    getActiveListingsReport: async () => ({
+      listings: [
+        { '出品者SKU': 'sku1', '商品ID': 'B001', '価格': '1980', 'ステータス': 'Active' },
+        { '出品者SKU': '', '商品ID': 'B009', '価格': '100', 'ステータス': 'Active' },   // SKU が読めない
+      ],
+    }),
+  });
+  assert.equal(r.unparsable, 1);
+  assert.equal(r.status, 'partial');
+  const run = db.prepare('SELECT listing_enum_status, error_summary FROM price_fetch_run WHERE run_id = ?').get(r.runId);
+  assert.equal(run.listing_enum_status, 'partial');
+  assert.match(run.error_summary, /解析できない行/);
+});
+
+await ta('[!] 重複キーが fetch 経由で partial になる (INSERT OR REPLACE で隠さない)', async () => {
+  const r = await fetchAmazonListings(db, {
+    getActiveListingsReport: async () => ({
+      listings: [
+        { '出品者SKU': 'dup', '商品ID': 'B001', '価格': '100', 'ステータス': 'Active' },
+        { '出品者SKU': 'dup', '商品ID': 'B002', '価格': '200', 'ステータス': 'Active' },
+      ],
+    }),
+  });
+  assert.equal(r.duplicates, 1);
+  assert.equal(r.status, 'partial');
+});
+
+await ta('[!] 楽天の mall_item_ref (merchantDefinedSkuId) も DB まで届く', async () => {
+  const r = await fetchRakutenListings(db, {
+    searchPage: async () => ({
+      results: [{ item: { manageNumber: 'refItem', variants: {
+        v1: { standardPrice: '1000', merchantDefinedSkuId: 'AM-12345', payment: { taxIncluded: true } },
+      } } }],
+      nextCursorMark: null,
+    }),
+  });
+  const row = db.prepare("SELECT mall_item_ref FROM mall_price_snapshot WHERE run_id = ? AND mall_item_key = 'refItem/v1'").get(r.runId);
+  assert.equal(row.mall_item_ref, 'AM-12345');
+});
+
+await ta('[!] 楽天 variants が配列なら解析失敗として数える (添字を SKU にしない)', async () => {
+  const r = await fetchRakutenListings(db, {
+    searchPage: async () => ({
+      results: [
+        { item: { manageNumber: 'arrItem', variants: [{ standardPrice: '1000', payment: { taxIncluded: true } }] } },
+        { item: { manageNumber: 'okItem', variants: { v: { standardPrice: '500', payment: { taxIncluded: true } } } } },
+      ],
+      nextCursorMark: null,
+    }),
+  });
+  assert.equal(r.unparsable, 1);
+  assert.equal(r.status, 'partial');
+  const bad = db.prepare("SELECT COUNT(*) n FROM mall_price_snapshot WHERE mall_item_key LIKE 'arrItem/%'").get();
+  assert.equal(bad.n, 0);      // 添字キーの行を作らない
+});
+
+await ta('楽天 variant が object でなければその行だけ落として数える', async () => {
+  const r = await fetchRakutenListings(db, {
+    searchPage: async () => ({
+      results: [{ item: { manageNumber: 'mixItem', variants: { good: { standardPrice: '100', payment: { taxIncluded: true } }, bad: 'not-an-object' } } }],
+      nextCursorMark: null,
+    }),
+  });
+  const rows = db.prepare("SELECT mall_item_key FROM mall_price_snapshot WHERE run_id = ?").all(r.runId);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].mall_item_key, 'mixItem/good');
+});
+
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);

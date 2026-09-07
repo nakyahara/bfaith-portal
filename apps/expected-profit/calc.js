@@ -152,9 +152,16 @@ export function normalizeFeeEstimate(feesEstimate, { fulfillment } = {}) {
   let sum = 0;
   let unreadable = 0;            // 🚨 読めない行を黙って飛ばさない
   const unknownTypes = [];
+  // 🚨 同じ FeeType が2行来たら、後勝ちで上書きすると控除が過少になる (Codex R2)
+  const seenTypes = new Set();
+  const duplicateTypes = [];
   for (const d of feesEstimate.FeeDetailList) {
     const amt = amountOf(d);
     if (amt == null) { unreadable++; continue; }
+    if (d.FeeType) {
+      if (seenTypes.has(d.FeeType)) duplicateTypes.push(d.FeeType);
+      seenTypes.add(d.FeeType);
+    }
     sum += amt;
     switch (d.FeeType) {
       case 'ReferralFee': referral = amt; break;
@@ -170,7 +177,8 @@ export function normalizeFeeEstimate(feesEstimate, { fulfillment } = {}) {
 
   // 状態判定は「重い順」に。ok は最後まで何も引っかからなかったときだけ
   let status = 'ok';
-  if (unreadable > 0) status = 'unreadable_fee_line';
+  if (duplicateTypes.length > 0) status = 'duplicate_fee_type';
+  else if (unreadable > 0) status = 'unreadable_fee_line';
   else if (referral == null) status = 'missing';                       // ReferralFee は必ず来る
   else if (fulfillment === 'FBA' && fbaInclTax == null) status = 'missing_fba_fee';
   else if (fulfillment === 'FBM' && fbaInclTax != null) status = 'unexpected_fba_fee';
@@ -189,6 +197,7 @@ export function normalizeFeeEstimate(feesEstimate, { fulfillment } = {}) {
     total,
     unknownTypes,
     unreadable,
+    duplicateTypes,
   };
 }
 
@@ -210,8 +219,14 @@ export function buildProfitInputs(input) {
   } = input;
 
   const taxRate = effectiveTaxRate(productTaxRate);
+  if (!Number.isFinite(priceInclTax) || priceInclTax <= 0) return { ok: false, reason: 'price_missing' };
   const priceExTax = exTax(priceInclTax, taxRate);
-  if (priceExTax == null || !(priceExTax > 0)) return { ok: false, reason: 'price_missing' };
+  if (!Number.isFinite(priceExTax) || priceExTax <= 0) return { ok: false, reason: 'price_missing' };
+  // 🚨 原価の欠損を 0 として引かない (利益が過大に出る)。有効なゼロは無い (§15-5 実測)
+  if (!Number.isFinite(costExTax) || costExTax <= 0) return { ok: false, reason: 'cost_missing' };
+  // 送料収入は「明示的な0」と「不明」を区別する。不明のまま計算しない
+  if (postageRevenueInclTax !== null && postageRevenueInclTax !== undefined
+      && !Number.isFinite(postageRevenueInclTax)) return { ok: false, reason: 'postage_revenue_invalid' };
 
   // 送料収入は送料の税率 (10%) で割り戻す。商品の軽減税率を流用しない
   const postageRevenueExTax = postageRevenueInclTax == null
@@ -249,16 +264,21 @@ export function buildProfitInputs(input) {
     feeRateDisplay = rate;
   }
 
+  const args = {
+    priceExTax,
+    postageRevenueExTax: postageRevenueExTax ?? 0,
+    costExTax,
+    shippingTotalExTax,
+    fbaFeeExTax,
+    feeTotalExTax,
+  };
+  // 🚨 どれか1つでも数値でなければ、後段で NaN のまま利益が出る
+  for (const [k, v] of Object.entries(args)) {
+    if (!Number.isFinite(v)) return { ok: false, reason: `non_finite:${k}` };
+  }
   return {
     ok: true,
-    args: {
-      priceExTax,
-      postageRevenueExTax: postageRevenueExTax ?? 0,
-      costExTax,
-      shippingTotalExTax,
-      fbaFeeExTax,
-      feeTotalExTax,
-    },
+    args,
     detail: {
       taxRate, shippingParts, feeRateDisplay,
       expenseScope: expenseScopeVersion({ mall, fulfillment }),
@@ -310,6 +330,8 @@ export function computeProfit({ priceExTax, postageRevenueExTax = 0, costExTax, 
   const revenue = priceExTax + postageRevenueExTax;
   if (!Number.isFinite(revenue) || revenue <= 0) return { ok: false, reason: 'revenue_invalid' };
   const profit = revenue - costExTax - shippingTotalExTax - fbaFeeExTax - feeTotalExTax;
+  // 🚨 入力に非数値が混ざると NaN が「利益」として表に出る
+  if (!Number.isFinite(profit)) return { ok: false, reason: 'profit_not_finite' };
   return {
     ok: true,
     revenueExTax: revenue,

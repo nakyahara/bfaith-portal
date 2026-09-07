@@ -242,6 +242,76 @@ await ta('[!] marketplace が環境設定と違う対象は拒否する (送っ�
   );
 });
 
+await ta('[!] FBA なのに FBAFees が無い見積は fee_status に残る (DB まで確認)', async () => {
+  // toEstimateRow から fulfillment 引数を外したら、この試験が落ちる
+  const r = await refreshFees(db, [target({ seller_sku: 'fbaNoFee', in_fulfillment: 'FBA' })], {
+    sleepMs: 0,
+    callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { referral: 84 }),
+  });
+  assert.equal(r.refreshed, 1);
+  const row = db.prepare("SELECT fee_status FROM amazon_fee_estimate WHERE seller_sku='fbaNoFee'").get();
+  assert.equal(row.fee_status, 'missing_fba_fee');
+});
+
+await ta('[!] FBM なのに FBAFees が来た見積も fee_status に残る', async () => {
+  const r = await refreshFees(db, [target({ seller_sku: 'fbmWithFba' })], {
+    sleepMs: 0,
+    callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { referral: 84, fba: 462 }),
+  });
+  assert.equal(r.refreshed, 1);
+  const row = db.prepare("SELECT fee_status FROM amazon_fee_estimate WHERE seller_sku='fbmWithFba'").get();
+  assert.equal(row.fee_status, 'unexpected_fba_fee');
+});
+
+await ta('[!] 同じ FeeType が重複したら duplicate_fee_type (過少控除を防ぐ)', async () => {
+  const r = await refreshFees(db, [target({ seller_sku: 'dupFee' })], {
+    sleepMs: 0,
+    callFeesApi: async (body) => ([{
+      Status: 'Success',
+      FeesEstimateIdentifier: { SellerInputIdentifier: body[0].FeesEstimateRequest.Identifier },
+      FeesEstimate: {
+        TotalFeesEstimate: { Amount: 300 },
+        FeeDetailList: [
+          { FeeType: 'ReferralFee', FinalFee: { Amount: 100 } },
+          { FeeType: 'ReferralFee', FinalFee: { Amount: 200 } },
+        ],
+      },
+    }]),
+  });
+  const row = db.prepare("SELECT fee_status FROM amazon_fee_estimate WHERE seller_sku='dupFee'").get();
+  assert.equal(row.fee_status, 'duplicate_fee_type');
+});
+
+await ta('[!] API が例外を投げず null を返してもバッチ失敗として数える', async () => {
+  const r = await refreshFees(db, [target({ seller_sku: 'nullRes' })], {
+    sleepMs: 0,
+    callFeesApi: async () => null,
+  });
+  assert.equal(r.failedBatches, 1);
+  assert.equal(r.failedTargets, 1);
+  assert.equal(r.refreshed, 0);
+});
+
+await ta('[!] ポイントが取れていない対象は API を呼ばずに弾く (0で埋めない)', async () => {
+  let called = 0;
+  const r = await refreshFees(db, [target({ seller_sku: 'noPoints', in_points: null })], {
+    sleepMs: 0,
+    callFeesApi: async () => { called++; return []; },
+  });
+  assert.equal(called, 0);
+  assert.equal(r.invalidTargets, 1);
+  assert.deepEqual(r.invalid[0].missing, ['in_points']);
+});
+
+await ta('ASIN が無い対象も API を呼ばずに弾く', async () => {
+  const r = await refreshFees(db, [target({ seller_sku: 'noAsin', asin: null })], {
+    sleepMs: 0, callFeesApi: async () => [],
+  });
+  assert.equal(r.invalidTargets, 1);
+  assert.deepEqual(r.invalid[0].missing, ['asin']);
+});
+
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);

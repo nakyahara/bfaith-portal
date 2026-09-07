@@ -489,4 +489,79 @@ t('🚨 fetched_at が壊れていたら改定日判定を通さない', () => {
   assert.equal(canReuseFeeEstimate(cached, wantedSame, now).reason, 'fetched_at_invalid');
 });
 
+console.log('欠損入力を「正常」として通さない (Codex R2)');
+
+t('[!] 原価が null なら計算不能 (0として引くと利益が過大に出る)', () => {
+  const built = buildProfitInputs({
+    mall: 'rakuten', priceInclTax: 1080, productTaxRate: 0.1, costExTax: null, shippingRate: NEKOPOSU,
+  });
+  assert.equal(built.ok, false);
+  assert.equal(built.reason, 'cost_missing');
+});
+
+t('[!] 原価が undefined でも計算不能 (NaN を利益として出さない)', () => {
+  const built = buildProfitInputs({
+    mall: 'rakuten', priceInclTax: 1080, productTaxRate: 0.1, shippingRate: NEKOPOSU,
+  });
+  assert.equal(built.ok, false);
+});
+
+t('[!] 原価0は未登録扱い (有効なゼロは無い)', () => {
+  const built = buildProfitInputs({
+    mall: 'rakuten', priceInclTax: 1080, productTaxRate: 0.1, costExTax: 0, shippingRate: NEKOPOSU,
+  });
+  assert.equal(built.reason, 'cost_missing');
+});
+
+t('[!] 送料収入が数値でなければ計算不能 (不明のまま計算しない)', () => {
+  const built = buildProfitInputs({
+    mall: 'rakuten', priceInclTax: 1080, postageRevenueInclTax: 'unknown',
+    productTaxRate: 0.1, costExTax: 600, shippingRate: NEKOPOSU,
+  });
+  assert.equal(built.reason, 'postage_revenue_invalid');
+});
+
+t('送料収入が null (送料込み) は 0 として扱ってよい', () => {
+  const built = buildProfitInputs({
+    mall: 'rakuten', priceInclTax: 1080, postageRevenueInclTax: null,
+    productTaxRate: 0.1, costExTax: 600, shippingRate: NEKOPOSU,
+  });
+  assert.equal(built.ok, true);
+  assert.equal(built.args.postageRevenueExTax, 0);
+});
+
+t('[!] computeProfit は NaN を利益として返さない', () => {
+  const r = computeProfit({ priceExTax: 1000, costExTax: NaN });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'profit_not_finite');
+});
+
+t('[!] 同じ FeeType が重複したら duplicate_fee_type (後勝ちで過少控除しない)', () => {
+  const n = normalizeFeeEstimate({
+    TotalFeesEstimate: { Amount: 300 },
+    FeeDetailList: [
+      { FeeType: 'ReferralFee', FinalFee: { Amount: 100 } },
+      { FeeType: 'ReferralFee', FinalFee: { Amount: 200 } },
+    ],
+  }, { fulfillment: 'FBM' });
+  assert.equal(n.status, 'duplicate_fee_type');
+  assert.deepEqual(n.duplicateTypes, ['ReferralFee']);
+});
+
+t('[!] 重複費目の見積は組み立てにも通さない', () => {
+  const n = normalizeFeeEstimate({
+    TotalFeesEstimate: { Amount: 300 },
+    FeeDetailList: [
+      { FeeType: 'ReferralFee', FinalFee: { Amount: 100 } },
+      { FeeType: 'ReferralFee', FinalFee: { Amount: 200 } },
+    ],
+  }, { fulfillment: 'FBM' });
+  const built = buildProfitInputs({
+    mall: 'amazon', fulfillment: 'FBM', priceInclTax: 1980, productTaxRate: 0.1,
+    costExTax: 1000, feeEstimate: n, shippingRate: NEKOPOSU,
+  });
+  assert.equal(built.ok, false);
+});
+
+
 console.log(`\n${passed} 件 PASS`);
