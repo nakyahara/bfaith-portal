@@ -71,7 +71,8 @@ ok(/var mine = \+\+run/.test(html) && /if \(mine !== run\)/.test(html),
   '🚨 1試行につき取得1回。連打や「取得待ち中に止める」で複数の取得を並走させない');
 ok(/releaseStream\(s\)/.test(html),
   '🚨 止めた後に遅れて届いたストリームはその場で解放する (掴みっぱなしにしない)');
-ok(/startBtn\.disabled = true/.test(html), '取得待ち・観察中はボタンを押せなくする');
+ok(/function setBusy\(on\)/.test(html) && /startBtn\.disabled = on; backBtn\.disabled = on/.test(html),
+  '取得待ち・観察中は**両方の**ボタンを押せなくする');
 
 // ─── 4. 観測の中身 ─────────────────────────────────────────────────────────
 console.log('\n[4] 観測');
@@ -113,6 +114,78 @@ ok(/文字の部分だけ/.test(html) && !/画面を撮って送ってくださ�
   '🚨 結果を送るときは「カメラを止めて文字だけ」と案内する (映像に人や伝票が写り込まないように)');
 ok(/await navigator\.clipboard\.writeText/.test(html),
   'コピーの成否を待ってから「コピーしました」と言う');
+
+// ─── 7. 取得が重ならないこと (実際に動かして確かめる) ──────────────────────
+// 🚨 試行番号で結果を捨てても、**未完了の getUserMedia が重なること自体は防げない** (Codex #1244 R1)。
+//    重なるとカメラ終了の切り分けに別の要因が入るので、ここは実挙動で守る
+console.log('\n[7] 取得は1試行1回 (保留中に別のボタンを押しても増えない)');
+{
+  const vm = await import('node:vm');
+  const script = html.slice(html.indexOf('<script>') + 8, html.lastIndexOf('</script>'));
+
+  const el = () => ({
+    disabled: false, innerHTML: '', textContent: '', className: '', style: {}, srcObject: null,
+    readyState: 0, videoWidth: 0, videoHeight: 0, currentTime: 0, muted: false, playsInline: false,
+    _on: {},
+    addEventListener(k, f) { (this._on[k] = this._on[k] || []).push(f); },
+    click() { (this._on.click || []).forEach((f) => f()); },
+    play() { return Promise.resolve(); },
+  });
+  const nodes = {};
+  for (const id of ['log', 'v', 'verdict', 'start', 'startBack', 'stop', 'copy']) nodes[id] = el();
+
+  let calls = 0;
+  let settle = null;
+  const ctx = {
+    console,
+    document: { getElementById: (id) => nodes[id] || null, visibilityState: 'visible' },
+    navigator: {
+      userAgent: 'Mozilla/5.0 (iPad; CPU OS 18_5 like Mac OS X) AppleWebKit/605.1.15',
+      maxTouchPoints: 5,
+      mediaDevices: { getUserMedia: () => { calls++; return new Promise((r, j) => { settle = { r, j }; }); } },
+      clipboard: { writeText: async () => {} },
+      standalone: false,
+    },
+    location: { protocol: 'https:' },
+    setInterval: () => 1, clearInterval: () => {}, setTimeout: () => 1, clearTimeout: () => {},
+    alert: () => {},
+  };
+  ctx.window = ctx;
+  ctx.window.performance = { now: () => Date.now() };
+  ctx.window.screen = { width: 768, height: 1024 };
+  ctx.window.matchMedia = () => ({ matches: false });
+  ctx.window.isSecureContext = true;
+  ctx.window.innerWidth = 768; ctx.window.innerHeight = 954;
+  ctx.window.navigator = ctx.navigator;
+
+  vm.createContext(ctx);
+  vm.runInContext(script, ctx, { timeout: 5000 });
+
+  nodes.start.click();                       // 1回目 — 取得は保留のまま
+  await new Promise((r) => setImmediate(r));
+  ok(calls === 1, `押したら取得が1回だけ走る (${calls})`);
+  ok(nodes.start.disabled === true && nodes.startBack.disabled === true,
+    '取得待ちのあいだは両方のボタンが押せない');
+
+  nodes.startBack.click();                   // 🚨 保留中に別のボタン
+  nodes.start.click();                       // 🚨 保留中に連打
+  await new Promise((r) => setImmediate(r));
+  ok(calls === 1, `🚨 保留中に別のボタンを押しても取得は増えない (${calls})`);
+
+  nodes.stop.click();                        // 🚨 取得待ちのまま「止める」
+  nodes.start.click();
+  await new Promise((r) => setImmediate(r));
+  ok(calls === 1, `🚨 取得待ちのまま止めて押し直しても、決着するまで取得は増えない (${calls})`);
+
+  settle.j(Object.assign(new Error('x'), { name: 'NotAllowedError' }));   // 1回目が決着
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  ok(nodes.start.disabled === false && nodes.startBack.disabled === false,
+    '決着したらボタンが戻る (押せないままにならない)');
+  nodes.start.click();
+  await new Promise((r) => setImmediate(r));
+  ok(calls === 2, `決着したあとは次の取得ができる (${calls})`);
+}
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;

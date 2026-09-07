@@ -38,7 +38,7 @@
 <video id="v" playsinline muted autoplay></video>
 <div id="log">「カメラを開く」を押してください。</div>
 <p class="note">
-  <b>「カメラを開く」は向きを指定しません</b>（条件のせいで落ちる可能性を消すため）。iPad では前面が選ばれます。
+  <b>「カメラを開く」は向きを指定しません</b>（条件のせいで落ちる可能性を消すため）。そのため前面が選ばれることがあります。
   読み取り画面が使うのは背面なので、<b>「背面カメラで試す」</b>も押して比べてください。
   <br>読み取り画面と<b>同じ開き方</b>（ホーム画面のアイコン／Safari）で試すと比べられます。
   結果を送るときは、<b>「止める」を押してカメラを閉じてから、下の文字の部分だけ</b>を送ってください
@@ -53,9 +53,13 @@
   var v = document.getElementById('v');
   var verdict = document.getElementById('verdict');
   var startBtn = document.getElementById('start');
+  var backBtn = document.getElementById('startBack');
   // 🚨 1回の試行につき取得は1回だけ。連打や「取得待ち中に止める」で複数の取得が並走すると、
   //    先のストリームを止められなくなり、切り分けそのものが汚れる
   var run = 0;
+  // 🚨 **取得が決着するまで次の取得を始めない** (Codex #1244 R1)。試行番号で結果を捨てても、
+  //    未完了の getUserMedia が重なること自体は防げない = カメラ終了の切り分けに別の要因が入る
+  var acquiring = false;
   var timer = null, stream = null;
   var t0 = 0, grantedAt = null, endedAt = null, lastProgressAt = null;
   // 🚨 頼んだ向き。既定は **何も指定しない** (条件のせいで落ちる可能性を消す) ので、
@@ -87,12 +91,14 @@
     if (!s) return;
     s.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
   }
+  function setBusy(on) { startBtn.disabled = on; backBtn.disabled = on; }
   function stopAll(why) {
     run++;                                   // 走っている試行を無効にする (遅れて来た取得も使わせない)
     if (timer) { clearInterval(timer); timer = null; }
     releaseStream(stream); stream = null;
     v.srcObject = null;
-    startBtn.disabled = false;
+    // ⚠ 取得がまだ決着していない間はボタンを戻さない (止めた直後に押せると要求が重なる)
+    if (!acquiring) setBusy(false);
     if (why) log(why);
   }
 
@@ -137,14 +143,15 @@
       + '<br>画面を2分割していないか、ページを拡大していないか、他のアプリがカメラを使っていないかを確かめてください。');
   }
 
-  document.getElementById('startBack').addEventListener('click', function () { runTest({ facingMode: { exact: 'environment' } }); });
+  backBtn.addEventListener('click', function () { runTest({ facingMode: { exact: 'environment' } }); });
   startBtn.addEventListener('click', function () { runTest(null); });
 
   /** 1回ぶんの確認。@param {object|null} facing null = 向きを指定しない (いちばん緩い) */
   async function runTest(facing) {
+    if (acquiring) return;                    // 取得が決着するまで次を始めない
     stopAll(null);
     var mine = ++run;                         // この試行の番号
-    startBtn.disabled = true;
+    setBusy(true);
     lines = []; progress = 0; lastTime = -1;
     grantedAt = null; endedAt = null; lastProgressAt = null; sawEnded = false; sawMute = false;
     wanted = facing;
@@ -154,7 +161,7 @@
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       log('→ この端末では getUserMedia が使えません');
       say('ng', 'この端末のブラウザはカメラに対応していません。');
-      startBtn.disabled = false;
+      setBusy(false);
       return;
     }
     // ⭐既定はいちばん緩い条件だけ (条件のせいで落ちる可能性を消す)。
@@ -162,21 +169,25 @@
     log(since() + ' 頼む条件: ' + (wanted === null ? 'video:true (向きの指定なし)' : '背面カメラ (exact environment)')
       + ' — 許可を聞かれたら「許可」を押してください');
     var s = null;
+    acquiring = true;
     try {
       s = await navigator.mediaDevices.getUserMedia({ video: wanted === null ? true : wanted, audio: false });
     } catch (e) {
-      if (mine !== run) return;               // 待っている間に止められた
+      acquiring = false;
+      // 🚨 待っている間に止められていても **ボタンは戻す**。戻さないと押せないままになる
+      if (mine !== run) { setBusy(false); return; }
       log(since() + ' ✗ 失敗: ' + (e && e.name ? e.name : '不明'));
       say('ng', '<b>カメラを開けませんでした (' + (e && e.name ? e.name : '不明') + ')</b>'
         + (wanted !== null ? '<br>背面カメラを名指しで頼んでいるので、OverconstrainedError なら'
-            + '「この端末では背面カメラを使えない」ということです。' : '')
+            + '「指定した背面カメラの条件を満たせなかった」ということです。' : '')
         + '<br>NotAllowedError なら許可の問題、NotReadableError なら他が使っている、'
         + 'NotFoundError ならカメラが見つかっていません。');
-      startBtn.disabled = false;
+      setBusy(false);
       return;
     }
+    acquiring = false;
     // 🚨 待っている間に「止める」を押されていたら、**遅れて来たストリームはその場で解放する**
-    if (mine !== run) { releaseStream(s); log('— 取得は届きましたが、止めた後なので解放しました —'); return; }
+    if (mine !== run) { releaseStream(s); setBusy(false); log('— 取得は届きましたが、止めた後なので解放しました —'); return; }
     stream = s;
     grantedAt = now();
     log(since() + ' ✓ 開けました (許可待ちを含む)');
@@ -222,7 +233,7 @@
         stopAll(null);
       }
     }, 500);
-  });
+  }
 })();
 </script>
 </body>
