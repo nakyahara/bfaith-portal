@@ -406,7 +406,7 @@ console.log('\n[9] 画面が安全弁を通している (退行防止)');
     '映像を切り取らずに出している (枠の % と映像の % がずれない)');
 
   // 🚨 2026-09-07 実機: カメラは開いたのに映像が黒いままだった。原因は下の3つ
-  const openAt = html.indexOf('getUserMedia({ video:');
+  const openAt = html.indexOf('getUserMedia(CAMERA_TRIES[');
   const loadAt = html.indexOf('await loadDecoder()');
   ok(openAt > 0 && loadAt > openAt,
     '🚨 カメラを先に開けてからデコーダを読む (先に wasm を落とすと iOS の「押した」扱いが切れて再生されない)');
@@ -450,6 +450,67 @@ console.log('\n[9] 画面が安全弁を通している (退行防止)');
   ok(/gen !== scanGen/.test(catchBody) && catchBody.indexOf('gen !== scanGen') < catchBody.indexOf('banner('),
     '🚨 デコーダの失敗より先に「もう閉じられたか」を見る (閉じた後にエラーだけ残さない)');
   ok(/playError = playError \|\| e/.test(html), 'あとから来た play() の失敗も捨てない (現場調査に使う)');
+
+  // 🚨 2026-09-07 実機2回目: getUserMedia は成功するのにトラックが即 ended になった。
+  //    原因を現場から聞き取れる形にしておく (経過ms / track / video / play / どこから開いたか)
+  ok(/const diag = \(\) =>/.test(html) && /esc\(snapshot\)/.test(html),
+    '🚨 打ち切りの案内に診断 (経過ms・track・video・play・起動元) を添える');
+  // 🚨 stop() は readyState を ended に変えるので、止める前に取らないと状態が失われる。
+  //    ⚠ indexOf の大小比較だけだと、片方が無くなって -1 になったときに通ってしまう (Codex #1239 R2)。
+  //    経路ごとに切り出して、**両方あること**と順序の両方を見る
+  const sliceOf = (from, to) => {
+    const a = html.indexOf(from);
+    if (a < 0) return '';
+    const b = html.indexOf(to, a);
+    return b < 0 ? '' : html.slice(a, b);
+  };
+  const orderOk = (part) => {
+    const snap = part.indexOf('const snapshot = diag();');
+    const stop = part.indexOf('stopScan();');
+    return snap >= 0 && stop >= 0 && snap < stop;
+  };
+  const endedPath = sliceOf("if (track && track.readyState === 'ended') {", 'return;');
+  const stalledPath = sliceOf('if (!BarcodeScanDecide.videoStalled(', '}, 500);');
+  ok(endedPath !== '' && orderOk(endedPath),
+    '🚨 即 ended の経路: 診断を止める前に取る (stop() が track の状態を書き換える)');
+  ok(stalledPath !== '' && orderOk(stalledPath),
+    '🚨 映像が来ない経路: 診断を止める前に取る');
+  ok(!/track\.label/.test(html) && !/playError\.message/.test(html),
+    '🚨 診断に自由文字列 (カメラ名・エラー本文) を出さない');
+  ok(/st\.facingMode/.test(html), 'カメラは facingMode と解像度だけ出す');
+  ok(/track\.addEventListener\('ended'/.test(html),
+    'ended を直接拾って「いつ切れたか」を残す (500ms の見張りより早い)');
+  ok(/isStandalone/.test(html) && /window\.navigator\.standalone/.test(html),
+    'ホーム画面 (standalone) から開いたかを見て案内を変える');
+  ok(/const CAMERA_TRIES = \[/.test(html) && /video: true/.test(html),
+    '🚨 カメラの条件を段階的に緩める (iPad は条件が強いと掴めても即切れることがある)');
+  ok(/heldMs < 3000 && tryIndex < CAMERA_TRIES\.length - 1/.test(html),
+    'つないだ直後に切れたら、次の (より緩い) 条件で取り直す');
+  ok(/OverconstrainedError/.test(html) && /cameraTry = tryIndex \+ 1/.test(html),
+    '条件が強すぎて掴めないときも、緩めて取り直す');
+  // 🚨 共有値を足すと、別の起動と取り合って条件が飛ぶ
+  ok(!/cameraTry\+\+/.test(html), '🚨 次の条件は共有値の加算ではなく、その試行の tryIndex + 1 から決める');
+  ok(/cameraTry = 0; startScan\(\)/.test(html), 'ボタンを押し直したら条件を最初から');
+  ok(/Split View/.test(html), 'iPad で画面を2分割していると使えないことを案内する');
+  // 🚨 予約だけ生き残ると、閉じたあとにカメラが勝手に開く (Codex #1239 R1 P1)
+  ok(/function scheduleRescan\(ms\)/.test(html) && /const at = scanGen;/.test(html)
+    && /if \(at !== scanGen\) return;/.test(html),
+    '🚨 取り直しの予約は、予約した時点の世代を見てから走る (止められていたら開かない)');
+  // ⚠ 書式に依存しない形で見る (Codex #1239 R2)。setTimeout の中で startScan を呼んでいる箇所は
+  //   scheduleRescan の中の1つだけであるべき
+  const rawTimers = (html.match(/setTimeout\([\s\S]{0,400}?startScan/g) || []);
+  ok(rawTimers.length === 1 && /scheduleRescan/.test(sliceOf('function scheduleRescan(ms)', '\n    function stopScan')),
+    `取り直しを裸の setTimeout で予約していない (setTimeout→startScan は scheduleRescan の1箇所だけ / 実際 ${rawTimers.length})`);
+  ok(/clearTimeout\(scanRetryTimer\)/.test(stopFn),
+    'stopScan が取り直しの予約も取り消す');
+  ok(/scanStarting = false;/.test(stopFn) && /b\.disabled = false/.test(stopFn),
+    '🚨 stopScan 自身が「起動中」の札とボタンを戻す (世代が変わると古い endStarting は何もしない)');
+  // 🚨 古い getUserMedia が遅れて失敗しても、いまの起動には触らない
+  const catchAt2 = html.indexOf('catch (e) {', html.indexOf('getUserMedia(CAMERA_TRIES['));
+  ok(html.slice(catchAt2, catchAt2 + 200).includes('if (gen !== scanGen) return;'),
+    '🚨 getUserMedia の catch の先頭で世代を見る (古い失敗が条件やエラー表示に干渉しない)');
+  ok(/const endStarting = \(\) => \{ if \(gen === scanGen\)/.test(html),
+    '古い起動が遅れて戻っても、新しい起動の札を外さない (世代を見る)');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
