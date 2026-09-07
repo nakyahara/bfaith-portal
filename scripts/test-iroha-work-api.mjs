@@ -31,7 +31,7 @@ function ok(cond, label) {
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 initMirrorDB();
 const { default: router } = await import('../apps/iroha-work/router.js');
-const { getDB, addIrohaWorker, setMetaValue } = await import('../apps/iroha-work/db.js');
+const { getDB, addIrohaWorker, setMetaValue, createDevice } = await import('../apps/iroha-work/db.js');
 const { upsertTaskFromImport } = await import('../apps/iroha-work/tasks-db.js');
 
 // 参照テーブルは本物の init で作る (列名を想像しない)
@@ -72,8 +72,8 @@ async function post(pathname, body) {
   });
   return { status: r.status, json: await r.json().catch(() => ({})) };
 }
-async function get(pathname) {
-  const r = await fetch(BASE + pathname, { headers: { Host: HOST } });
+async function get(pathname, cookie) {
+  const r = await fetch(BASE + pathname, { headers: cookie ? { Host: HOST, Cookie: cookie } : { Host: HOST } });
   const buf = Buffer.from(await r.arrayBuffer());
   const text = buf.toString('utf8');
   let json = null;
@@ -526,6 +526,13 @@ console.log('\n[預ける計画] GET /api/consign-plan (§AB-11 の 7b)');
   sessionRole = null;
   const anon = await get('/api/consign-plan');
   ok(anon.status === 401 || anon.status === 403, '⭐ログインしていなければ出さない (' + anon.status + ')');
+  // ⭐**登録ずみの iPad から、職員モードに入らずに**叩いたら 403。
+  //   ログインの有無だけを見ていると、この口の職員チェックを外しても気づけない (Codex R1 軽微1)
+  const dev = createDevice('検査用 iPad (預ける計画)', 'test');
+  const asDevice = await get('/api/consign-plan', 'iw_device=' + dev.token);
+  ok(asDevice.status === 403 && asDevice.json && asDevice.json.error === 'staff_required',
+    '⭐端末で入っただけ (職員モードなし) では 403 staff_required');
+  ok(/職員/.test((asDevice.json || {}).message || ''), '断る理由が読める');
   sessionRole = 'admin';
 
   // ⭐書き込みの口ではない

@@ -7026,6 +7026,38 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
       '期限なしは後ろにまとまる');
   }
 
+  // ⑥ ⭐その段の実績が記録されていなければ、予定の数で埋めない (Codex R1 中1)
+  {
+    const t = mk('cp-7', 9296, 80);
+    const r0 = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+      facilityCode: 'rashinban', qty: 80, expectVersion: v(t) });
+    C.markPrepared({ consignmentId: r0.consignment.id, expectVersion: r0.consignment.version });
+    ok(rowOf(SV.buildConsignPlan(), r0.consignment.id).qty === 80, '(前提) ふつうは用意した数が入る');
+    // 用意した数だけを消す (DB の CHECK は「渡した数」しか守っていない)
+    db.prepare('UPDATE f_iroha_consignments SET prepared_qty = NULL WHERE id = ?').run(r0.consignment.id);
+    const row = rowOf(SV.buildConsignPlan(), r0.consignment.id);
+    ok(row.qty === null, '⭐用意した数が無ければ null。予定の 80 個で埋めない (「80 個そろっている」と読ませない)');
+    ok(row.boxes === null && row.hours === null, '数が分からなければ箱数・時間も出さない');
+    ok(SV.consignPlanCounts().unknown_qty >= 1, '⭐数が記録されていない件数を別に数える (黙って落とさない)');
+    db.prepare('UPDATE f_iroha_consignments SET prepared_qty = 80 WHERE id = ?').run(r0.consignment.id);
+    ok(SV.consignPlanCounts().unknown_qty === 0, '記録が戻れば件数も戻る');
+  }
+
+  // ⑦ ⭐同じカードから同じ拠点へ 2 回預けても、どちらか見分けられる (Codex R1 中2)
+  {
+    const t = mk('cp-8', 9297, 140);
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    const a = C.startConsignment({ taskId: t, batchId: bid, facilityCode: 'rashinban', qty: 70, expectVersion: v(t) });
+    const b2 = C.startConsignment({ taskId: t, batchId: bid, facilityCode: 'rashinban', qty: 70, expectVersion: v(t) });
+    ok(a.ok && b2.ok, '(前提) 同じカードから 2 回預けられる');
+    const plan = SV.buildConsignPlan();
+    const ra = rowOf(plan, a.consignment.id), rb = rowOf(plan, b2.consignment.id);
+    ok(ra && rb, '2 件とも行に出る');
+    ok(ra.title === rb.title && ra.facility_code === rb.facility_code && ra.qty === rb.qty
+      && ra.due_date === rb.due_date, '(前提) 商品名・拠点・数・期限はまったく同じ');
+    ok(ra.seq !== rb.seq, '⭐まとまりの番号で見分けられる (別のぶんを渡した・返した にしない)');
+  }
+
   // ── 画面 ──
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
   ok(html.includes("cplan: '.cplanpage'") && /<div class="page cplanpage" hidden>/.test(html),
@@ -7040,6 +7072,8 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
   ok(html.includes('function cgSourceOf(consignmentId)') && html.includes("from: 'cplan'")
     && html.includes("document.body.classList.contains('detail-open') ? (fromCard() || fromPlan())"),
     '⭐預けのダイアログはカード詳細と預ける計画の両方から使う (言い方を画面ごとに変えない)');
+  ok(html.includes("+ (cg.seq != null ? ' ・ まとまり #' + cg.seq : '') + '）';"),
+    '⭐操作のダイアログにも、どのまとまりを動かすのかを出す');
   ok(html.includes("if (from === 'cplan') loadConsignPlan();")
     && html.includes("if (curView === 'cplan') loadConsignPlan();"),
     '⭐操作したあとは、開いていた画面のほうを取り直す (預ける計画の上で詳細を開いていたら両方)');
@@ -7056,7 +7090,8 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
       () => 'ワークセンター', () => '9/7', () => null, fac || 'all')(r);
     const base = { id: 1, task_id: 2, state: 'planned', facility_code: 'workcenter', title: 'テスト商品',
       qty: 700, boxes: 10, units_per_container: 70, storage_container: null, material_code: null,
-      expiry: null, due_date: null, overdue: false, returned_total: 0, handed_at: null, missing: [] };
+      expiry: null, due_date: null, overdue: false, returned_total: 0, handed_at: null, missing: [],
+      seq: 1, ar_no: null };
     const h = render(base);
     ok(h.includes('箱 <b>10</b> つ（70 個入り）'), '⭐何箱いるかを行に出す');
     ok(h.includes('用意できた') && h.includes('渡しました') && h.includes('やめる'), '用意する段のボタンが出る');
@@ -7072,12 +7107,23 @@ console.log('\n[34] 預ける計画の画面 (§AB-11 の 7b)');
     const one = render({ ...base }, 'workcenter');
     ok(!one.includes('🏢'), '拠点を 1 つ選んでいるときは拠点名を繰り返さない');
     ok(render(base).includes('🏢 ワークセンター'), 'すべて を見ているときは拠点名を出す');
+    // ⭐同じ商品・同じ拠点・同じ数の 2 行を見分けられる (Codex R1 中2)
+    const two1 = render({ ...base, seq: 1, ar_no: 'AR-100' });
+    const two2 = render({ ...base, seq: 2, ar_no: 'AR-100' });
+    ok(two1.includes('まとまり #1') && two2.includes('まとまり #2') && two1 !== two2,
+      '⭐まとまりの番号で見分けられる');
+    ok(two1.includes('入荷 AR-100'), '入荷番号も出す (現物と照らし合わせる)');
+    // ⭐数が記録されていないときに予定の数を出さない (Codex R1 中1)
+    const noqty = render({ ...base, qty: null, boxes: null, units_per_container: null });
+    ok(noqty.includes('数が記録されていません') && !noqty.includes('<b>700</b>'),
+      '⭐数が記録されていないときに数を書かない');
+    ok(!noqty.includes('入数が未登録'), '数が分からないのに「入数が未登録」と重ねて言わない');
   }
   const sw4 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
   ok(new RegExp(`const CACHE = '${SW_CACHE}'`).test(sw4), '画面キャッシュの版を上げる');
-  const rt2 = fs.readFileSync(new URL('../apps/iroha-work/router.js', import.meta.url), 'utf8');
-  ok(rt2.includes("router.get('/api/consign-plan'") && rt2.includes("error: 'staff_required'"),
-    '⭐預ける計画の API は職員だけ');
+  // ⭐職員だけ、は**実際に HTTP で叩く**テスト (test-iroha-work-api.mjs) で確かめている。
+  //   「ルート宣言と staff_required がファイルのどこかにある」という検査は、
+  //   その口の職員チェックを外しても緑のままになる (Codex R1 軽微1)
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

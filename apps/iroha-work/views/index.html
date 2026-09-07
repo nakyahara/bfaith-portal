@@ -5452,10 +5452,19 @@ function renderConsignPlan() {
  *   箱を用意する画面なので、分からないなら「分からない」と出して職員に登録してもらう。
  */
 function cplanRowHtml(r) {
-  const facts = ['<span><b>' + esc(String(r.qty)) + '</b> 個</span>'];
-  facts.push(r.boxes != null
-    ? '<span>箱 <b>' + esc(String(r.boxes)) + '</b> つ（' + esc(String(r.units_per_container)) + ' 個入り）</span>'
-    : '<span class="miss">入数が未登録 — 何箱いるか出せません</span>');
+  // ⭐その段の数が記録されていなければ、予定の数で埋めずに「分からない」と書く (要件 §AB-3)
+  const facts = [r.qty == null
+    ? '<span class="miss">数が記録されていません — カードで確かめてください</span>'
+    : '<span><b>' + esc(String(r.qty)) + '</b> 個</span>'];
+  if (r.qty != null) {
+    facts.push(r.boxes != null
+      ? '<span>箱 <b>' + esc(String(r.boxes)) + '</b> つ（' + esc(String(r.units_per_container)) + ' 個入り）</span>'
+      : '<span class="miss">入数が未登録 — 何箱いるか出せません</span>');
+  }
+  // ⭐同じカードから同じ拠点へ 2 回預けると行の中身がそろって同じになる。
+  //   現物と照らし合わせられる目印を必ず出す (Codex R1 中2)
+  facts.push('<span>まとまり #' + esc(String(r.seq)) + '</span>');
+  if (r.ar_no) facts.push('<span>入荷 ' + esc(r.ar_no) + '</span>');
   if (r.storage_container) facts.push('<span>保管箱 ' + esc(r.storage_container) + '</span>');
   if (r.material_code) facts.push('<span>資材 ' + esc(r.material_code) + '</span>');
   if (r.expiry) facts.push('<span>期限 ' + esc(r.expiry) + '</span>');
@@ -5530,7 +5539,9 @@ function openConsignAct(action, consignmentId) {
     key: 'ret-' + consignmentId + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) };
   $('#cgTitle').textContent = action === 'handed' ? '🚚 わたしました' : action === 'cancel' ? '🚚 この預けをやめます'
     : action === 'prepared' ? '🚚 箱とラベルを用意しました' : action === 'settle' ? '🚚 返ってこないぶんを精算' : '🚚 返却を受け取る';
-  $('#cgName').textContent = src.title + '（' + facilityName(cg.facility_code) + '）';
+  // ⭐どのまとまりを動かすのかを必ず出す。同じ商品・同じ拠点の預けが 2 つ並ぶことがある (Codex R1 中2)
+  $('#cgName').textContent = src.title + '（' + facilityName(cg.facility_code)
+    + (cg.seq != null ? ' ・ まとまり #' + cg.seq : '') + '）';
   $('#cgMsg').textContent = '';
   $('#cgBody').innerHTML = '<div class="dq">' + (
     action === 'cancel'
