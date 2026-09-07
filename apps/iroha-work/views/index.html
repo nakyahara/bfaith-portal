@@ -2548,6 +2548,9 @@ function printWarnHtml(a) {
  * 0 箱として扱うと「ラベル 0 枚」になり、必要な枚数と違うものを出す
  */
 function boxesOf(qty, per) {
+  // ⭐**数が入っていない**のと「0 個」は別。Number(null) も Number('') も 0 になるので、
+  //   数に直すまえに見分ける (要件: 欠損値を 0 で代用しない — Codex #1259 R2 中1)
+  if (qty == null || qty === '' || per == null || per === '') return null;
   const p = Number(per);
   const n = Number(qty);
   if (!Number.isSafeInteger(p) || p <= 0 || !Number.isSafeInteger(n) || n < 0) return null;
@@ -2763,7 +2766,12 @@ async function submitPrint() {
     return;
   }
   ctx.saving = false;
-  ctx.submitted = false;   // サーバーの返事が来た = 届いたかどうかは分かった
+  // ⭐**「返事が来た」と「その依頼が片づいた」は別**。片づいていないうちに印を下ろすと、
+  //   選び直しで依頼 ID を作り直せてしまい、届いていた 1 枚目に重ねてもう 1 枚出る
+  //   (Codex #1259 R2 重大1)。片づいた = 積めた / この内容では積まれなかった、が確かなとき
+  const settled = j.ok || ['bad_request', 'bad_copies', 'bad_pack_qty', 'bad_extra_qty', 'bad_expiry',
+    'bad_barcode', 'bad_batch', 'pick_batch', 'not_found', 'closed_task', 'no_agent', 'worker_required'].includes(j.error);
+  if (settled) ctx.submitted = false;
   if (j.ok) {
     c.print_job = j.job;
     closePrintBox();

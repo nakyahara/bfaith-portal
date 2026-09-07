@@ -3898,8 +3898,23 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // 🚨送信中・結果が分からないうちは選び直させない (依頼 ID を作り直すと 2 枚出る — Codex R1 重大2)
   ok(html.includes('if (printCtx && (printCtx.saving || printCtx.submitted)) {'),
     '⭐送っている最中・届いたか分からないうちは、選び直しを受け付けない');
-  ok(html.includes('ctx.submitted = true;') && html.includes('ctx.submitted = false;   // サーバーの返事が来た'),
-    '⭐「送った」印は、サーバーの返事が来るまで下ろさない (通信が切れたら立ったまま)');
+  // ⭐「片づいたか」の判定を**ソースから取り出して動かす** (文字列検査では状態の遷移を見られない)
+  {
+    const line = html.split(/\r?\n/).filter((l) => l.includes('const settled = j.ok ||')).join('\n')
+      + '\n' + html.split(/\r?\n/).filter((l) => l.trim().startsWith("'bad_barcode', 'bad_batch'")).join('\n');
+    ok(/const settled = /.test(line) && /idempotency_conflict/.test(line) === false,
+      '(前提) 片づいたかの判定を取り出せた (idempotency_conflict は入っていない)');
+    const settled = (j) => new Function('j', line + '; return settled;')(j);
+    ok(settled({ ok: true }) === true, '積めたら片づいた');
+    ok(settled({ ok: false, error: 'bad_copies' }) === true, '入力の誤りで断られたら、何も積まれていないので片づいた');
+    ok(settled({ ok: false, error: 'pick_batch' }) === true, 'どのぶんか選んでも同じ');
+    ok(settled({ ok: false, error: 'idempotency_conflict' }) === false,
+      '🚨同じ依頼 ID で違う内容 = 前の依頼が残っている。片づいていない (Codex R2 重大1)');
+    ok(settled({ ok: false, error: 'confirm_unknown' }) === false, '前回の結果が不明なままなら片づいていない');
+    ok(settled({ ok: false, error: 'confirm_manual' }) === false, '手で刷る扱いのままも同じ');
+    ok(settled({ ok: false, error: 'state_changed' }) === false, '前のジョブの状態が動いたのも同じ');
+    ok(settled({ ok: false, error: 'in_progress' }) === false, 'まだ刷っている最中も同じ');
+  }
   ok(html.includes("data-prredo=") && !html.includes("openPrintBox(' + c.id + ')\">選び直す"),
     '選び直しは直接呼ばず、見張りを通す');
   // ⭐どのカードのぶんかは選ぶ画面が覚える (前のカードに渡さない — Codex R1 中1)
@@ -3915,6 +3930,12 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     ok(fn(140, 70).rest === 0 && fn(140, 70).boxes === 2, '割り切れれば端数なし');
     ok(fn(100, null) === null && fn(100, 0) === null,
       '⭐入数が分からなければ null (0 箱として「ラベル 0 枚」にしない)');
+    // ⭐数が入っていないのと「0 個」は別 (Codex R2 中1)
+    ok(fn(null, 70) === null && fn(undefined, 70) === null && fn('', 70) === null,
+      '🚨数が入っていなければ null。Number(null) が 0 になるのに任せて「0 個・0 箱」と数えない');
+    const zero = fn(0, 70);
+    ok(zero && zero.boxes === 0 && zero.full === 0 && zero.rest === 0,
+      '⭐はっきり 0 個なら 0 箱 (これは分かっている数なので数えてよい)');
   }
 
   // 🏷 端数の箱 — 必要保管箱 6 箱 (70×5＋10) なら 70 個 5 枚 ＋ 10 個 1 枚 (中原さん 2026-09-06)
