@@ -5123,7 +5123,11 @@ th.attr-unknown { color: #dc2626; }
             mode: mode, name: document.getElementById('set-name').value,
             members: members,
             // 親の「セット商品作成検討」を閉じる操作なので、その工程の版数を添える
-            parent_step_version: <%= (workflow.main.find((s) => s.step_code === 'set_review') || {}).version %>,
+            // 🚨 JS の値の位置にテンプレートの出力タグを直に置かない。セット商品 (子) の
+            // workflow.main は set トラックだけで set_review が無く、undefined = 空文字が出て
+            // `parent_step_version: ,` という構文エラーになり、この画面の JS が丸ごと死んでいた
+            // (2026-09-07 中原さん「本コードに差し替える が押せない」)。JSON にして埋める
+            parent_step_version: <%- JSON.stringify(((workflow.main || []).find((s) => s.step_code === 'set_review') || {}).version ?? null) %>,
           }),
         });
         const j = await res.json();
