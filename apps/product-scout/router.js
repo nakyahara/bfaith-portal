@@ -20,7 +20,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'url';
 import {
   ingestSnapshot, ingestOwnFamilies, getLatestSnapshot, listCategories, listConcepts, countConcepts,
-  getConcept, recordDecision, countMatching, REASON_CODES, getOwnImport,
+  getConcept, recordDecision, countMatching, REASON_CODES, getOwnImport, getIngestStatus,
 } from './db.js';
 import { productScoutInitError } from '../warehouse-mirror/db.js';
 
@@ -47,6 +47,16 @@ function guardTables(req, res, next) {
 // ─────────────────────────────────────────────────────────────
 // ⚠️セッションを持てないバッチからの呼び出しなので、共有鍵で認証する。
 //   鍵が未設定なら通さない (fail-closed)。素通りさせると誰でも画面の中身を差し替えられる。
+// 読み取り確認も既存の取り込み鍵で保護する。商品明細・認証情報は返さない。
+ingestRouter.get('/status', guardTables, (req, res) => {
+  const key = process.env.MIRROR_SYNC_KEY;
+  if (!key) return res.status(503).json({ error: 'MIRROR_SYNC_KEY 未設定' });
+  const a = Buffer.from(String(req.headers['x-sync-key'] || ''));
+  const b = Buffer.from(key);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ error: 'unauthorized' });
+  return res.json(getIngestStatus());
+});
+
 ingestRouter.post('/', express.json({ limit: '32mb' }), guardTables, (req, res) => {
   const key = process.env.MIRROR_SYNC_KEY;
   if (!key) return res.status(503).json({ error: 'MIRROR_SYNC_KEY 未設定' });

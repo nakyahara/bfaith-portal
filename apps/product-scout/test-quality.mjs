@@ -6,7 +6,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import Database from 'better-sqlite3';
 import { createProductScoutTables } from './schema.js';
-import { ingestSnapshot, ingestOwnFamilies, getLatestSnapshot, listConcepts, getOwnImport, recordDecision, getConcept } from './db.js';
+import { ingestSnapshot, ingestOwnFamilies, getLatestSnapshot, listConcepts, getOwnImport, recordDecision, getConcept, getIngestStatus } from './db.js';
 import { validateSnapshot } from './validation.js';
 import quality from '../../scripts/product-idea-scout/quality.cjs';
 
@@ -156,4 +156,12 @@ test('既存タスクの新ランナーはCRLFで保存し、worktreeコード�
   for (const file of ['own.js','products.js','concepts.js']) assert.ok(bat.includes('node "%SCOUT_CODE_ROOT%'+file+'"'));
   assert.ok(bat.includes('pushd "%SCOUT_PORTAL_ROOT%"')); assert.ok(bat.includes('set "WAREHOUSE_DB='));
   assert.ok(bat.includes('-Id product-idea-scout -Status ok'));
+});
+
+test('反映確認は現行版・件数・採否件数のみを返し商品明細を返さない', () => {
+  const db=memory(); ingestSnapshot(snapshot(),db);
+  ingestOwnFamilies(own([family('sample')]),db);
+  const status=getIngestStatus(db);
+  assert.equal(status.qualityVersion,2);assert.equal(status.ownCounts[0].families,1);
+  assert.equal(status.decisionCount,0);assert.ok(!JSON.stringify(status).includes('code-sample'));db.close();
 });

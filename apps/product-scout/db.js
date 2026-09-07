@@ -450,3 +450,15 @@ export function recordDecision({ conceptId, decision, reasonCode, comment, reche
 export function getOwnImport(handle) {
   return resolveDb(handle).prepare('SELECT * FROM scout_own_imports ORDER BY julianday(generated_at) DESC, rowid DESC LIMIT 1').get() || null;
 }
+
+/** 既存の取り込み認証で確認する、商品明細を含まない反映状態。 */
+export function getIngestStatus(handle) {
+  const db=resolveDb(handle);
+  const snapshot=getLatestSnapshot(db);
+  const ownImport=getOwnImport(db);
+  return { qualityVersion: 2, snapshot, ownImport,
+    concepts: snapshot ? countConcepts(snapshot.snapshot_id,db) : null,
+    ownCounts: ownImport ? db.prepare('SELECT sales_class, COUNT(*) AS families, SUM(sku_count) AS skus FROM scout_own_families WHERE own_batch_id=? GROUP BY sales_class').all(ownImport.batch_id) : [],
+    decisionCount: db.prepare('SELECT COUNT(*) AS n FROM scout_decisions').get().n,
+  };
+}
