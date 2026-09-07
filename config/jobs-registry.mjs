@@ -196,6 +196,31 @@ export const JOBS_REGISTRY = [
   },
   // ─────────────── scheduled_job (miniPC Task Scheduler) ───────────────
   {
+    id: 'expected-profit-nightly',
+    type: 'scheduled_job',
+    importance: 'P3',   // 数日止まっても当日業務は止まらない (見る指標であって、業務の入口ではない)
+    owner: '中原さん',
+    purpose: '全出品の想定利益 (単品販売シナリオ) を夜間計算。'
+      + '出品列挙 (Amazon 出品レポート + 楽天 RMS items/search) → モール登録価格の取得 → '
+      + 'Amazon 手数料の再見積もり → 世代を作って公開前検証 → Render へ転送してポインタ切替。'
+      + 'daily-sync (07:00・P1・45ステップ) に載せず独立タスクにしたのは、'
+      + '50〜100分の価格取得で朝の未発送アラートを遅らせないため。'
+      + '書込先は専用DB expected-profit.db (warehouse.db は 11GB で product-idea-scout が常駐しているため読み取りのみ)',
+    where: 'miniPC TaskScheduler [ExpectedProfitNightly] → node apps/expected-profit/nightly.js',
+    schedule: '毎日 23:30 (全体終了期限 06:00。超えたら中断して翌日に持ち越す)',
+    anchor_hour_jst: 23,
+    anchor_minute_jst: 30,
+    grace_hours: 7,     // 翌 06:30 まで。daily-sync 開始 (07:00) より前に判定が出る
+    lifecycle: 'permanent',
+    runbook: '🚨 成功 ping は「Render の公開ポインタが対象世代になった」ことを読み戻して確認してから打つ。'
+      + 'プロセスが正常終了しただけでは ok にならない。'
+      + '失敗時は logs を確認 → node apps/expected-profit/nightly.js --skip-publish で世代だけ作り直せる。'
+      + '画面 = /apps/profit-analysis の「想定利益 (単品)」タブ。'
+      + '公開中の世代は GET /apps/expected-profit/sync/published (x-sync-key) で見える。'
+      + '必要 env: SP_API_* / RAKUTEN_* / RENDER_PORTAL_URL / MIRROR_SYNC_KEY / JOBS_MONITOR_TOKEN。'
+      + '正本 = AI_reference『システム設計/商品別想定利益_要件定義_20260907.md』',
+  },
+  {
     id: 'ph-generate-nightly',
     type: 'scheduled_job',
     importance: 'P2',

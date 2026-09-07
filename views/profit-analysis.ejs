@@ -187,6 +187,7 @@
         <button class="sub-tab" data-view="border" onclick="switchProfitView('border')">ボーダー帯</button>
         <button class="sub-tab" data-view="trend" onclick="switchProfitView('trend')">前月比悪化</button>
         <button class="sub-tab" data-view="mall" onclick="switchProfitView('mall')">モール別比較</button>
+        <button class="sub-tab" data-view="expected" onclick="switchProfitView('expected')">想定利益 (単品)</button>
       </div>
 
       <div class="filters">
@@ -466,11 +467,166 @@
     function switchProfitView(view) {
       currentView = view;
       document.querySelectorAll('#pd-sub-tabs-a .sub-tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
+      // 想定利益は実績を使わないので、期間フィルタを隠す (誤解を避ける)
+      const daysFilter = document.getElementById('filter-days');
+      if (daysFilter && daysFilter.parentElement) {
+        daysFilter.parentElement.style.display = (view === 'expected') ? 'none' : '';
+      }
       if (view === 'trend') {
         loadTrendData();
+      } else if (view === 'expected') {
+        loadExpectedProfit();
       } else {
         renderTable();
       }
+    }
+
+    // ─── 想定利益 (単品販売シナリオ) ───
+    // 実績を使わず、夜間に作った世代を読むだけ。計算はここでしない
+    let epState = { rows: [], summary: null, published: null, scope: 'self_v1', sort: 'margin', order: 'desc', rankOnly: true };
+
+    async function loadExpectedProfit() {
+      const mall = document.getElementById('filter-mall').value;
+      const c = document.getElementById('table-container');
+      c.innerHTML = '<div class="loading">想定利益を読み込み中...</div>';
+      try {
+        const q = new URLSearchParams({
+          scope: epState.scope, sort: epState.sort, order: epState.order,
+          rank_only: epState.rankOnly ? '1' : '0', limit: '500',
+        });
+        if (mall) q.set('mall', mall);
+        const res = await fetchJson('/apps/profit-analysis/api/expected-profit?' + q.toString());
+        epState.rows = res.rows || [];
+        epState.summary = res.summary;
+        epState.published = res.published;
+        epState.total = res.total;
+        renderExpectedProfit();
+      } catch (e) {
+        c.innerHTML = '<div class="empty" style="color:#dc2626;">エラー: ' + escapeHtml(e.message) + '</div>';
+      }
+    }
+
+    function epNum(v, digits) {
+      if (v == null || !isFinite(v)) return '—';
+      return Number(v).toLocaleString('ja-JP', { maximumFractionDigits: digits == null ? 0 : digits });
+    }
+    function epPct(v) {
+      if (v == null || !isFinite(v)) return '—';
+      return (v * 100).toFixed(1) + '%';
+    }
+
+    function renderExpectedProfit() {
+      const c = document.getElementById('table-container');
+      if (!epState.published) {
+        c.innerHTML = '<div class="empty">まだ計算結果がありません。夜間バッチ (毎日 23:30) が動くとここに出ます。</div>';
+        return;
+      }
+      const s = epState.summary || {};
+      const degraded = (epState.published.malls_degraded || [])
+        .map(function (d) { return escapeHtml(d.mall) + '(' + escapeHtml(d.reason) + ')'; }).join(', ');
+
+      let html = '';
+      // ── 前提を常に見せる (§9.1) ──
+      html += '<div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:12px;line-height:1.7;">';
+      html += '<div><b>この表の前提</b> — 1注文・1個・同梱なし・送料無料ラインなし・クーポンやポイントなし・返品なしで「今この出品を1個売ったら手元にいくら残るか」</div>';
+      html += '<div style="color:#b45309;"><b>含んでいない費用</b>: 広告費 / ポイント原資 / クーポン原資 / 返品。'
+        + 'FBA では納品の配送費・納品準備・保管料・長期保管手数料も含みません</div>';
+      html += '<div style="color:#6b7280;">計算日時: ' + escapeHtml(epState.published.built_at || '—')
+        + ' / 公開: ' + escapeHtml(epState.published.published_at || '—')
+        + ' / 対象 ' + epNum(s.total) + '件 (計算できた ' + epNum(s.ok) + ' / ランキング対象 ' + epNum(s.rankEligible)
+        + ' / 表示時に期限切れ ' + epNum(s.expiredNow) + ')'
+        + (degraded ? ' / <span style="color:#dc2626;">取得が劣化: ' + degraded + '</span>' : '') + '</div>';
+      html += '<div style="color:#6b7280;">Amazon の手数料は SP-API の<b>見積</b>です (確定請求額ではありません)。'
+        + '他モールは料率からの<b>簡易見積</b>で、ポイント原資やアフィリエイトを含みません</div>';
+      html += '</div>';
+
+      // ── 操作 ──
+      html += '<div class="filters" style="margin-bottom:8px;">';
+      html += '<label>費用の範囲: <select id="ep-scope">'
+        + '<option value="self_v1"' + (epState.scope === 'self_v1' ? ' selected' : '') + '>自社出荷 (送料・作業料・資材・人件費)</option>'
+        + '<option value="fba_v1"' + (epState.scope === 'fba_v1' ? ' selected' : '') + '>FBA (配送代行手数料)</option>'
+        + '</select></label>';
+      html += '<label>並び: <select id="ep-sort">'
+        + '<option value="margin"' + (epState.sort === 'margin' ? ' selected' : '') + '>利益率</option>'
+        + '<option value="profit"' + (epState.sort === 'profit' ? ' selected' : '') + '>利益額</option>'
+        + '</select></label>';
+      html += '<label>順: <select id="ep-order">'
+        + '<option value="desc"' + (epState.order === 'desc' ? ' selected' : '') + '>良い順</option>'
+        + '<option value="asc"' + (epState.order === 'asc' ? ' selected' : '') + '>悪い順</option>'
+        + '</select></label>';
+      html += '<label><input type="checkbox" id="ep-rank-only"' + (epState.rankOnly ? ' checked' : '') + '> 参考値を隠す</label>';
+      html += '<button class="btn btn-export" id="ep-csv">CSV出力</button>';
+      html += '</div>';
+      html += '<div style="font-size:11px;color:#6b7280;margin-bottom:6px;">'
+        + '🚨 費用の範囲が違うので、<b>FBA と自社出荷は同じ順位表に混ぜていません</b>。上の切り替えで見比べてください</div>';
+
+      if (epState.rows.length === 0) {
+        html += '<div class="empty">条件に合う行がありません</div>';
+        c.innerHTML = html;
+        bindExpectedProfitEvents();
+        return;
+      }
+
+      const isFba = epState.scope === 'fba_v1';
+      html += '<div class="table-wrap"><table class="data-table"><thead><tr>';
+      const cols = ['出品コード', '商品名', 'モール', '出荷', '売価(税抜)', '売価(税込)', '送料収入', '原価(税込前)',
+        isFba ? 'FBA配送代行' : '送料区分', isFba ? '—' : '配送関係費', '手数料率', '手数料', '想定利益', '想定利益率', '状態'];
+      for (const h of cols) html += '<th>' + escapeHtml(h) + '</th>';
+      html += '</tr></thead><tbody>';
+      for (const r of epState.rows) {
+        const profitStyle = (r.expected_profit != null && r.expected_profit < 0) ? ' style="color:#dc2626;font-weight:600;"' : '';
+        html += '<tr>';
+        html += '<td>' + escapeHtml(r.mall_item_key) + '</td>';
+        html += '<td>' + escapeHtml(r.product_name || '') + '</td>';
+        html += '<td>' + escapeHtml(MALL_FEE_RATES_LABEL[r.mall] || r.mall) + '</td>';
+        html += '<td>' + escapeHtml(r.fulfillment || '') + '</td>';
+        html += '<td>' + epNum(r.price_ex_tax) + '</td>';
+        html += '<td>' + epNum(r.price_incl_tax) + '</td>';
+        html += '<td>' + epNum(r.postage_revenue_ex_tax) + '</td>';
+        html += '<td>' + epNum(r.cost_ex_tax) + '</td>';
+        if (isFba) {
+          html += '<td>' + epNum(r.fba_fee_ex_tax) + '</td><td>—</td>';
+        } else {
+          html += '<td>' + escapeHtml(r.shipping_method || '—') + '</td>';
+          html += '<td title="送料 ' + epNum(r.shipping_fee_ex_tax) + ' / 作業料 ' + epNum(r.shipping_work_ex_tax)
+            + ' / 資材 ' + epNum(r.shipping_material_ex_tax) + ' / 人件費 ' + epNum(r.shipping_labor_ex_tax) + '">'
+            + epNum(r.shipping_total_ex_tax) + '</td>';
+        }
+        html += '<td>' + epPct(r.fee_rate_display) + (r.mall === 'amazon' ? '' : ' <span style="color:#9ca3af;">概算</span>') + '</td>';
+        html += '<td>' + epNum(r.fee_total_ex_tax) + '</td>';
+        html += '<td' + profitStyle + '>' + epNum(r.expected_profit) + '</td>';
+        html += '<td' + profitStyle + '>' + epPct(r.expected_margin_rate) + '</td>';
+        html += '<td style="font-size:11px;color:#6b7280;">'
+          + (r.rank_eligible_now ? '' : escapeHtml(r.rank_exclusion_reason_now || r.incomplete_reason || '参考値')) + '</td>';
+        html += '</tr>';
+      }
+      html += '</tbody></table></div>';
+      html += '<div style="font-size:11px;color:#6b7280;margin-top:6px;">'
+        + epNum(epState.rows.length) + ' / ' + epNum(epState.total) + ' 件を表示</div>';
+      c.innerHTML = html;
+      bindExpectedProfitEvents();
+    }
+
+    // inline onclick は品番の ' で壊れるので addEventListener で結ぶ
+    function bindExpectedProfitEvents() {
+      const scope = document.getElementById('ep-scope');
+      const sort = document.getElementById('ep-sort');
+      const order = document.getElementById('ep-order');
+      const rankOnly = document.getElementById('ep-rank-only');
+      const csv = document.getElementById('ep-csv');
+      if (scope) scope.addEventListener('change', function () { epState.scope = this.value; loadExpectedProfit(); });
+      if (sort) sort.addEventListener('change', function () { epState.sort = this.value; loadExpectedProfit(); });
+      if (order) order.addEventListener('change', function () { epState.order = this.value; loadExpectedProfit(); });
+      if (rankOnly) rankOnly.addEventListener('change', function () { epState.rankOnly = this.checked; loadExpectedProfit(); });
+      if (csv) csv.addEventListener('click', function () {
+        const mall = document.getElementById('filter-mall').value;
+        const q = new URLSearchParams({
+          scope: epState.scope, sort: epState.sort, order: epState.order,
+          rank_only: epState.rankOnly ? '1' : '0',
+        });
+        if (mall) q.set('mall', mall);
+        window.location.href = '/apps/profit-analysis/api/expected-profit.csv?' + q.toString();
+      });
     }
 
     async function loadData() {
