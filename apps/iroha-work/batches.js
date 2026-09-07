@@ -114,6 +114,54 @@ export function nextSeq(db, taskId) {
 }
 
 /**
+ * ⭐できた数・作れなかった数を**まとまり**に書き、カードの done_qty をその合計に直す (要件 §AB-3)。
+ *
+ * `good_qty` / `loss_qty` は NULL = まだ数えていない。**0 と区別する**。
+ * 予定 (planned_qty) より多い数も入る — 1010 個できることが実際にある。
+ * ⚠必ず呼び出し側の書き込みトランザクションの中で。
+ *
+ * @param {object} counts { goodQty, lossQty, note } — undefined の項目は触らない
+ * @returns {boolean} 変えたか
+ */
+export function recordBatchCounts(db, batchId, { goodQty, lossQty, note } = {}) {
+  const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(batchId);
+  if (!b) return false;
+  const nextGood = goodQty === undefined ? (b.good_qty ?? null) : goodQty;
+  const nextLoss = lossQty === undefined ? (b.loss_qty ?? null) : lossQty;
+  const nextNote = note === undefined ? (b.variance_note ?? null) : (note || null);
+  // 数と出どころは必ず対 (DB の CHECK と同じ約束)。人が入れたものは 'counted'
+  const nextSrc = nextGood == null ? null
+    : (goodQty === undefined ? (b.good_qty_source ?? 'counted') : 'counted');
+  if (nextGood === (b.good_qty ?? null) && nextLoss === (b.loss_qty ?? null)
+    && nextNote === (b.variance_note ?? null) && nextSrc === (b.good_qty_source ?? null)) return false;
+  db.prepare(`UPDATE f_iroha_task_batches
+      SET good_qty = ?, loss_qty = ?, good_qty_source = ?, variance_note = ?, version = version + 1, updated_at = ?
+    WHERE id = ?`).run(nextGood, nextLoss, nextSrc, nextNote, new Date().toISOString(), batchId);
+  recomputeTaskDoneQty(db, b.task_id);
+  return true;
+}
+
+/**
+ * カードの done_qty を、まとまりのできた数の**合計**に直す。
+ *
+ * ⭐カードの done_qty は**まとまりから出す控え**。手で書き換える正本にしない (要件 §AB-1)。
+ *   1 つも数えていなければ NULL のまま (0 で代用しない)。
+ */
+export function recomputeTaskDoneQty(db, taskId) {
+  const r = db.prepare(`SELECT COUNT(good_qty) n, SUM(good_qty) s FROM f_iroha_task_batches
+    WHERE task_id = ? AND work_status <> 'cancelled'`).get(taskId);
+  const total = r && r.n > 0 ? r.s : null;
+  return db.prepare('UPDATE f_iroha_tasks SET done_qty = ? WHERE id = ? AND (done_qty IS NOT ?)')
+    .run(total, taskId, total).changes;
+}
+
+/** そのカードの「いま作業しているまとまり」。1 つしか無ければそれ (要件 §AB-1: ふだんは 1 つ) */
+export function soleBatchOfTask(db, taskId) {
+  const rows = db.prepare("SELECT * FROM f_iroha_task_batches WHERE task_id = ? AND work_status <> 'cancelled' ORDER BY seq").all(taskId);
+  return rows.length === 1 ? rows[0] : null;
+}
+
+/**
  * カードの進捗が変わったとき、**まとまりが 1 つだけ**ならその作業状態も合わせる。
  *
  * ⭐これは移行のあいだの橋渡し。まとまりが 2 つ以上になったら**まとまり側が正本**になり、
@@ -129,4 +177,35 @@ export function syncSingleBatchStatus(db, taskId, task) {
   if (rows[0].work_status === want) return 0;
   return db.prepare('UPDATE f_iroha_task_batches SET work_status = ?, version = version + 1, updated_at = ? WHERE id = ?')
     .run(want, new Date().toISOString(), rows[0].id).changes;
+}
+
+/**
+ * カードごとの数のまとめ (一覧・詳細に出す用)。まとまりを足したもの。
+ * ⭐1 つも数えていなければ NULL のまま (0 で代用しない — 要件 §AB-3)。
+ * @returns Map<task_id, { done_qty, loss_qty, variance_note, counted }>
+ */
+export function countsByTask(db, taskIds) {
+  const ids = [...new Set((taskIds || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  const out = new Map();
+  if (ids.length === 0) return out;
+  const rows = db.prepare(`SELECT task_id,
+      COUNT(good_qty) gn, SUM(good_qty) gs, COUNT(loss_qty) ln, SUM(loss_qty) ls,
+      SUM(CASE WHEN good_qty_source = 'counted' THEN 1 ELSE 0 END) counted
+    FROM f_iroha_task_batches WHERE task_id IN (${ids.map(() => '?').join(',')}) AND work_status <> 'cancelled'
+    GROUP BY task_id`).all(...ids);
+  const notes = db.prepare(`SELECT task_id, variance_note FROM f_iroha_task_batches
+    WHERE task_id IN (${ids.map(() => '?').join(',')}) AND variance_note IS NOT NULL AND work_status <> 'cancelled'
+    ORDER BY task_id, seq`).all(...ids);
+  const noteBy = new Map();
+  for (const n of notes) if (!noteBy.has(n.task_id)) noteBy.set(n.task_id, n.variance_note);
+  for (const r of rows) {
+    out.set(r.task_id, {
+      done_qty: r.gn > 0 ? r.gs : null,
+      loss_qty: r.ln > 0 ? r.ls : null,
+      variance_note: noteBy.get(r.task_id) || null,
+      // ⭐人が数えた値かどうか。移行で持ってきた値は「確認ずみ」に見せない (要件 §AB-3)
+      counted: r.counted > 0,
+    });
+  }
+  return out;
 }

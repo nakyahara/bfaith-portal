@@ -150,9 +150,10 @@
             <div style="font-size:.85rem; color:<%= later ? '#e8590c' : '#c5221f' %>; font-weight:600;">
               <%= later ? `${b.requested_by || '-'} の欠品 → 届け先 1階 ${b.origin_ref || '-'}` : `依頼元 1階 ${b.origin_ref || '-'} / 依頼: ${b.requested_by || '-'}` %> (計測対象外)
             </div>
-            <% if (rl) { %>
-              <div style="font-size:.9rem; margin-top:2px;"><b><%= rl.name %></b> × <b><%= rl.qty %></b>
-                <% if (rl.locationLabel) { %><span style="color:#495057"> — <%= later ? '前回無かった場所' : '取った場所' %> <%= rl.locationLabel %></span><% } %>
+            <%# 同じ伝票の複数タスクは1バッチ (PR-7) → 商品を全部並べる %>
+            <% for (const line of (b.repickLines || (rl ? [rl] : []))) { %>
+              <div style="font-size:.9rem; margin-top:2px;"><b><%= line.name %></b> × <b><%= line.qty %></b>
+                <% if (line.locationLabel) { %><span style="color:#495057"> — <%= later ? '前回無かった場所' : '取った場所' %> <%= line.locationLabel %></span><% } %>
               </div>
             <% } %>
           <% } %>

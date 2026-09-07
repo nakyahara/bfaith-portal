@@ -702,6 +702,9 @@ function changeStatusApp(req, res, worker) {
     // ⭐できた数と中断メモ (要件 §Y)。送られたときだけ書き換える。
     //   状態と同じ 1 回の書き込みに載せる — 分けると「状態は変わったが数は入らなかった」が起きる
     doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+    // 作れなかった数・ひとこと (要件 §AB-3)。⭐空欄を 0 と読まないので、送られたときだけ触る
+    lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+    varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
     reason: req.body?.reason || null,
     actor: hasSessionAccess(req) ? req.iwUser : `${worker.display_name} (いろはアプリ)`,
@@ -901,6 +904,8 @@ router.post('/api/progress', checkOrigin, api((req, res) => {
   const r = setProgress({
     taskId: progressTaskId, expectVersion: req.body?.expect_version,
     doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+    lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+    varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
     actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
@@ -928,6 +933,9 @@ router.post('/api/block', checkOrigin, api((req, res) => {
     taskId: blockTaskId, reason: String(req.body?.reason || ''), note: req.body?.note ?? null,
     expectVersion: req.body?.expect_version,
     doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+    // 作れなかった数・ひとこと (要件 §AB-3)。⭐空欄を 0 と読まないので、送られたときだけ触る
+    lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+    varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
     actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),

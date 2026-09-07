@@ -21,6 +21,7 @@ import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
 import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask } from './tasks-db.js';
+import { countsByTask } from './batches.js';
 
 /**
  * ⭐「急ぎ」の線引き (中原さん 2026-09-06)。
@@ -300,6 +301,8 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
   const sizes = sizeMapByCode(codeKeys);
   // 入荷実績 (🌱「はじめての商品」の判定。§AA)
   const arrivals = arrivalHistory(codeKeys);
+  // できた数・作れなかった数は「まとまり」から (要件 §AB-1)
+  const counts = countsByTask(getDB(), rows.map((r) => r.id));
   const today = jstToday();
   const tomorrow = jstTomorrow(today);
 
@@ -331,7 +334,11 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
         note: r.blocked_note || null, at: r.blocked_at || null, by: r.blocked_by || null } : null,
       blocked_label: blockLabel(r),
       // ⭐できた数と中断メモ (要件 §Y)。done_qty は NULL = まだ数えていない (0 と区別する)
-      done_qty: r.done_qty ?? null,
+      // ⭐数は「まとまり」から出す。カードの done_qty はその控え (要件 §AB-1/§AB-3)
+      done_qty: (counts.get(r.id) || {}).done_qty ?? null,
+      loss_qty: (counts.get(r.id) || {}).loss_qty ?? null,
+      variance_note: (counts.get(r.id) || {}).variance_note ?? null,
+      counted: !!(counts.get(r.id) || {}).counted,
       hold_memo: r.hold_memo || null,
       planned_date: r.planned_date,
       today: r.planned_date === today,

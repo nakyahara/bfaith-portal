@@ -395,6 +395,10 @@
   .dq textarea{width:100%;box-sizing:border-box;margin-top:8px;min-height:70px;padding:8px 10px;font-family:var(--font);
     font-size:.95rem;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--surface);color:var(--ink);resize:vertical}
   .dq .sub{font-size:.78rem;color:var(--sub);margin-top:4px}
+  .dq .sub.warn{color:var(--amber);font-weight:700}
+  .dq .quick button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .dq .lossrow{margin-top:8px;padding-left:10px;border-left:3px solid var(--amber)}
+  .dq .lossrow .dqLoss{width:110px}
   /* 参考・外部出し目安・取引先 — 読むだけの一行 */
   .facts{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
   .facts span{font-size:.8rem;background:var(--well);border:1px solid var(--line);border-radius:999px;padding:3px 10px;color:var(--sub)}
@@ -888,7 +892,8 @@
         <button class="btn" id="doneLater" onclick="closeDone()">あとで決める</button>
         <button class="btn primary" id="doneGo" onclick="submitDone()">棚入待ちにする</button>
       </div>
-      <p class="hint">「棚入待ち」= できあがって、棚に入れるのを待っている状態です。棚に入れたら職員が「終了」にします。</p>
+      <p class="hint">「棚入待ち」= できあがって、棚に入れるのを待っている状態です。棚に入れたら職員が「終了」にします。<br>
+        <b>数が予定と違っていても、そのまま入れてください。</b>実際にできた数を残します。</p>
     </div>
   </div>
 
@@ -4441,18 +4446,20 @@ async function unblockOnly() {
 
 // ── ✅ できあがり → 棚入待ち (監修 B-7 / F-3) ──
 let doneTarget = null, doneSaving = false;
+let doneConfirmed = null;   // 予定と大きく違うときに「もう一度」を出した数 (数を変えたらやり直す)
 function openDone(c) {
   if (!can('task.status.change')) return;
   doneTarget = c.id;
+  doneConfirmed = null;
   $('#doneName').textContent = c.title;
   $('#doneMsg').textContent = '';
-  $('#doneBody').innerHTML = dqPanelHtml(c, '', { title: '何個できましたか', memo: false, defaultAll: true });
+  $('#doneBody').innerHTML = dqPanelHtml(c, '', { title: '何個できましたか', memo: false, loss: true });
   // 押しまちがい用 (監修): このカードのタイマーを止めた直後だけ「まちがえた」を出す (サーバーは 60 秒まで受ける)
   $('#doneUndo').hidden = !(lastStop && sameId(lastStop.pid, c.id) && Date.now() - lastStop.at < 55000);
   openOverlay('#doneOv');
   $('#doneTitle').focus();
 }
-function closeDone() { if (doneSaving) return; closeOverlay('#doneOv'); doneTarget = null; $('#doneBody').innerHTML = ''; }
+function closeDone() { if (doneSaving) return; closeOverlay('#doneOv'); doneTarget = null; doneConfirmed = null; $('#doneBody').innerHTML = ''; }
 $('#doneOv').addEventListener('click', e => { if (e.target === $('#doneOv')) closeDone(); });
 async function submitDone() {
   if (doneSaving || doneTarget == null || !worker) return;
@@ -4460,6 +4467,18 @@ async function submitDone() {
   if (!c) { closeDone(); return; }
   const v = dqValues('#doneBody');
   if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#doneMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
+  if (v.loss != null && (!Number.isInteger(v.loss) || v.loss < 0)) { $('#doneMsg').textContent = '❌ 作れなかった数は 0 以上の整数で入れてください'; return; }
+  // ⭐予定と大きく違うときは、止めずにもう一度だけ確かめる (Codex R3: 差が大きい場合は止めずに確認)
+  // ⭐「5 個より多い **か** 1 割より多い」ずれで確かめる。max だと「両方超えたとき」になり、
+  //   1000 個の予定で 1010 個 (10 個ちがい) が素通りしていた (Codex R1 中)
+  const far = v.qty != null && c.qty != null && (Math.abs(v.qty - c.qty) > 5 || Math.abs(v.qty - c.qty) > c.qty * 0.1);
+  if (far && doneConfirmed !== v.qty) {
+    doneConfirmed = v.qty;
+    const d = v.qty - c.qty;
+    $('#doneMsg').textContent = '⚠ つくる数 ' + c.qty + ' 個に対して ' + v.qty + ' 個 ('
+      + (d > 0 ? '+' : '') + d + ' 個) です。これでよければ、もう一度押してください';
+    return;
+  }
   doneSaving = true;
   for (const id of ['doneGo', 'doneLater']) document.getElementById(id).disabled = true;
   $('#doneMsg').textContent = '保存中…';
@@ -4467,7 +4486,9 @@ async function submitDone() {
   try {
     j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: c.id, to: 'ready_for_stocking', worker_id: worker.id, expect_version: c.version,
-        ...(v.qty != null ? { done_qty: v.qty } : {}) }) });
+        ...(v.qty != null ? { done_qty: v.qty } : {}),
+        ...(v.loss !== undefined ? { loss_qty: v.loss } : {}),
+        ...(v.note !== undefined ? { variance_note: v.note } : {}) }) });
   } finally {
     doneSaving = false;
     for (const id of ['doneGo', 'doneLater']) document.getElementById(id).disabled = false;
@@ -4876,26 +4897,61 @@ function renderStBtns(c) {
  * (空 = まだ数えていない。0 個 = 1 個もできていない。この 2 つは別のこととして扱う)
  */
 function dqPanelHtml(c, actions, opts) {
-  const o = Object.assign({ title: '何個までできましたか', memo: true, memoLabel: '中断メモ (任意) — 次にやる人が読みます', defaultAll: false }, opts || {});
-  // できあがりのダイアログでは「全部」を既定にする (数えていなければ つくる数 = できた数 とみなす — 要件 §Y)
-  const cur = c.done_qty == null ? (o.defaultAll && c.qty != null ? String(c.qty) : '') : String(c.done_qty);
+  const o = Object.assign({ title: '何個までできましたか', memo: true, memoLabel: '中断メモ (任意) — 次にやる人が読みます',
+    loss: false, note: false }, opts || {});
+  // 🚨**予定 (つくる数) で埋めない** (要件 §AB-4)。埋めると、そのまま押されて「予定 = 実績」になってしまう。
+  //   2026-09-07 まではできあがりのダイアログを つくる数 で初期表示していた。
+  // ⭐**移行で持ってきた数 (counted でない) も埋めない**。あれは棚入待ちで予定数に上書きされていた
+  //   可能性があるので、触らないまま押されると「人が数えた値」として確定してしまう (Codex R1 中)
+  const migrated = c.done_qty != null && c.counted === false;
+  const cur = (c.done_qty == null || migrated) ? '' : String(c.done_qty);
   const memo = c.hold_memo || '';
   const quick = [['0', 'まだ 0 個']];
   if (c.qty != null) {
     if (c.qty >= 2) quick.push([String(Math.floor(c.qty / 2)), '半分 (' + Math.floor(c.qty / 2) + ' 個)']);
-    quick.push([String(c.qty), '全部 (' + c.qty + ' 個)']);
+    quick.push([String(c.qty), '予定どおり (' + c.qty + ' 個)']);
   }
   return '<div class="dq">' +
     '<label>' + esc(o.title) + '</label>' +
-    '<div class="row"><input class="dqIn" type="number" inputmode="numeric" min="0" step="1" value="' + esc(cur) + '" placeholder="—">' +
+    '<div class="row"><input class="dqIn" type="number" inputmode="numeric" min="0" step="1" value="' + esc(cur) + '" placeholder="—" oninput="dqDiff(this)">' +
       '<span class="of">' + (c.qty != null ? '／ つくる数 ' + esc(String(c.qty)) + ' 個' : '／ つくる数は不明') + '</span></div>' +
     '<div class="quick">' + quick.map(([v, l]) =>
       '<button type="button" data-dq="' + esc(v) + '">' + esc(l) + '</button>').join('') +
       '<button type="button" data-dq="">数えていない</button></div>' +
-    '<p class="sub">数えていないときは空のままで構いません (0 個とは別のこととして残します)。空のまま進めると、前に数えた値はそのまま残ります</p>' +
+    '<p class="sub dqdiff" data-qty="' + (c.qty == null ? '' : esc(String(c.qty))) + '">' +
+      '数えていないときは空のままで構いません (0 個とは別のこととして残します)</p>' +
+    (migrated ? '<p class="sub warn">前の記録では ' + esc(String(c.done_qty)) +
+      ' 個ですが、これは数え直した値ではありません。実際にできた数を入れてください</p>' : '') +
+    // ⭐作れなかった数。**空欄を 0 と読まない**ので「ありません / あります」を先に選んでもらう (要件 §AB-3)
+    (o.loss ? '<label style="margin-top:12px">作れなかったものはありますか</label>' +
+      '<div class="quick lossq">' +
+        '<button type="button" data-loss="0"' + (c.loss_qty === 0 ? ' class="on"' : '') + '>ありません</button>' +
+        '<button type="button" data-loss="ask"' + (c.loss_qty > 0 ? ' class="on"' : '') + '>あります</button></div>' +
+      '<div class="lossrow"' + (c.loss_qty > 0 ? '' : ' hidden') + '>' +
+        '<div class="row"><input class="dqLoss" type="number" inputmode="numeric" min="0" step="1" value="' +
+          (c.loss_qty > 0 ? esc(String(c.loss_qty)) : '') + '" placeholder="—"><span class="of">個 作れなかった</span></div>' +
+        '<label style="margin-top:8px">どうしましたか (任意)</label>' +
+        '<textarea class="dqNote" maxlength="500" placeholder="例: 袋を2つ破いてしまいました">' + esc(c.variance_note || '') + '</textarea></div>' : '') +
     (o.memo ? '<label style="margin-top:10px">' + esc(o.memoLabel) + '</label>' +
       '<textarea class="dqMemo" maxlength="500" placeholder="例: ラベルは貼り終わり、袋詰めの途中です">' + esc(memo) + '</textarea>' : '') +
     '</div>' + actions;
+}
+/** つくる数との差をその場で出す (「予定より 2 個少ない」)。止めはしない — 差があるのは普通のこと */
+function dqDiff(el) {
+  const panel = el.closest('.dq');
+  const p = panel && panel.querySelector('.dqdiff');
+  if (!p) return;
+  // ⭐数が変わったら確認はやり直し。**早く return する前に**戻す (空欄にしたときも解除する — Codex R2 軽微)
+  doneConfirmed = null;
+  const qty = p.dataset.qty === '' ? null : Number(p.dataset.qty);
+  const v = String(el.value).trim();
+  if (v === '' || qty == null) {
+    p.textContent = '数えていないときは空のままで構いません (0 個とは別のこととして残します)';
+    p.classList.remove('warn'); return;
+  }
+  const d = Number(v) - qty;
+  p.textContent = d === 0 ? '予定どおりです' : d > 0 ? '予定より ' + d + ' 個 多いです' : '予定より ' + (-d) + ' 個 少ないです';
+  p.classList.toggle('warn', d !== 0);
 }
 /**
  * 入力欄の中身を読む。空文字は「数えていない」= null (0 に丸めない)。
@@ -4906,15 +4962,41 @@ function dqValues(rootSel) {
   const el = root && root.querySelector('.dqIn');
   const raw = el ? String(el.value).trim() : '';
   const memoEl = root && root.querySelector('.dqMemo');
-  return { qty: raw === '' ? null : Number(raw), raw, memo: memoEl ? String(memoEl.value).trim() : '' };
+  // 作れなかった数: 「ありません」を選んだときだけ 0。何も選んでいなければ「数えていない」(送らない)
+  const lossEl = root && root.querySelector('.dqLoss');
+  const lossPicked = root && root.querySelector('[data-loss].on');
+  const lossRaw = lossEl ? String(lossEl.value).trim() : '';
+  // 「ありません」を選んだら 0。「あります」で数が空なら「数えていない」(送らない)
+  const loss = !lossPicked ? undefined
+    : lossPicked.dataset.loss === '0' ? 0
+    : (lossRaw === '' ? undefined : Number(lossRaw));
+  // ⭐ひとことを読むのは「**あります**」を選んで欄が見えているときだけ。
+  //   何も選んでいないのに空文字を送ると、数を触っていないのに「数の書き換え」と見なされ、
+  //   分かれたカードで断られてしまう (Codex R2 中2)。
+  //   空にしたら消せるよう、選んでいるときは**空文字も送る** (undefined = 触らない、'' = 消す)
+  const noteEl = lossPicked && lossPicked.dataset.loss === 'ask' ? (root && root.querySelector('.dqNote')) : null;
+  return { qty: raw === '' ? null : Number(raw), raw, memo: memoEl ? String(memoEl.value).trim() : '',
+    loss, note: noteEl ? String(noteEl.value).trim() : undefined };
 }
 /** クイックボタン (まだ0個 / 半分 / 全部 / 数えていない) — 値は data-dq から取る。同じパネルの中の欄だけ書き換える */
+// 作れなかった数の「ありません / あります」(要件 §AB-3: 空欄を 0 と読まない)
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-loss]');
+  if (!b) return;
+  const panel = b.closest('.dq');
+  if (!panel) return;
+  for (const x of panel.querySelectorAll('[data-loss]')) x.classList.toggle('on', x === b);
+  const row = panel.querySelector('.lossrow');
+  const input = panel.querySelector('.dqLoss');
+  if (b.dataset.loss === '0') { if (row) row.hidden = true; if (input) input.value = '0'; }
+  else { if (row) row.hidden = false; if (input && (input.value === '' || input.value === '0')) { input.value = ''; input.focus(); } }
+});
 document.addEventListener('click', (e) => {
   const b = e.target.closest('[data-dq]');
   if (!b) return;
   const panel = b.closest('.dq');
   const input = panel && panel.querySelector('.dqIn');
-  if (input) input.value = b.dataset.dq;
+  if (input) { input.value = b.dataset.dq; dqDiff(input); }   // ⭐タップで変えたときも差の表示と確認をやり直す
 });
 
 // ─── できた数・中断メモを**あとから直す** (状態は変えない) ───

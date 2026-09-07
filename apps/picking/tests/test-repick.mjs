@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'picking-repick-test-'));
 
@@ -87,7 +88,7 @@ t('reconcile: 梱包側でタスク取消 → 漏れバッチも取消', () => {
   db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_tasks (
     id INTEGER PRIMARY KEY, status TEXT, kind TEXT, sku TEXT, product_name TEXT,
     req_qty INTEGER DEFAULT 1, location TEXT, block TEXT, folder_name TEXT,
-    slip_seq INTEGER, requested_by TEXT, later_request_id INTEGER, incident_id INTEGER)`);
+    slip_seq INTEGER, requested_by TEXT, later_request_id INTEGER, incident_id INTEGER, batch_id INTEGER)`);
   db.prepare("INSERT INTO pk_pack_tasks (id, status, kind, sku) VALUES (101, 'cancelled', 'repick', 'kofunneil-0776')").run();
   const n = reconcileRepickBatches();
   assert.equal(n, 1);
@@ -144,6 +145,188 @@ t('PR-5: v16 以前のバッチ (repick_reason NULL) は reconcile で理由と�
   reconcileRepickBatches();
   assert.equal(db.prepare('SELECT updated_at FROM pk_batches WHERE pack_task_id=104').get().updated_at, before, '2回目は更新しない (冪等)');
 });
+
+
+console.log('── PR-7: 同じ伝票の複数タスクは1つの 🔴 バッチに ──');
+{
+  const { repickTaskIdsOf } = await import('../service.js');
+  const slip = { ...task, batch_id: 50, slip_seq: 9, folder_name: '出荷_07' };
+  const ins = (id, sku, status = 'requested', extra = {}) => db.prepare(`INSERT INTO pk_pack_tasks (id, status, kind, sku, req_qty, batch_id, slip_seq, later_request_id)
+    VALUES (?, ?, 'repick', ?, ?, 50, 9, ?)`).run(id, status, sku, extra.qty ?? 1, extra.later ?? null);
+  ins(301, 'g-a'); ins(302, 'g-b', 'requested', { qty: 2 }); ins(303, 'g-c', 'requested', { later: 5 }); ins(304, 'g-d');
+  let gid;
+  t('1件目は新規バッチ (pack_batch_id / pack_slip_seq が入る)', () => {
+    const r = createRepickBatch({ ...slip, id: 301, sku: 'g-a' });
+    assert.equal(r.existed, false);
+    gid = r.batchId;
+    const b = db.prepare('SELECT * FROM pk_batches WHERE id=?').get(gid);
+    assert.equal(b.pack_batch_id, 50);
+    assert.equal(b.pack_slip_seq, 9);
+    assert.equal(listLines(gid)[0].pack_task_id, 301, '行にタスク id');
+  });
+  t('同じ伝票の2件目は既存バッチに行が足される (件数・数量・構成が更新)', () => {
+    const r = createRepickBatch({ ...slip, id: 302, sku: 'g-b', req_qty: 2 });
+    assert.equal(r.batchId, gid);
+    assert.equal(r.appended, true);
+    const b = db.prepare('SELECT * FROM pk_batches WHERE id=?').get(gid);
+    assert.equal(b.line_count, 2);
+    assert.equal(b.total_qty, 3);
+    assert.equal(b.composition, '複数SKU');
+    assert.equal(b.pack_task_id, 301, '同期キーは最初のタスクのまま');
+    const lines = listLines(gid);
+    assert.deepEqual(lines.map((l) => [l.seq, l.sku, l.qty, l.pack_task_id]), [[1, 'g-a', 1, 301], [2, 'g-b', 2, 302]]);
+    assert.deepEqual(repickTaskIdsOf(db, gid), [301, 302]);
+  });
+  t('合流済みのタスクをもう一度渡しても作らない (行の pack_task_id で冪等)', () => {
+    const r = createRepickBatch({ ...slip, id: 302, sku: 'g-b', req_qty: 2 });
+    assert.equal(r.existed, true);
+    assert.equal(r.batchId, gid);
+    assert.equal(listLines(gid).length, 2);
+  });
+  t('品違いのバッチに不足が合流すると名前は汎用の「不足」に (逆向きは変えない)', () => {
+    const wi = { ...slip, batch_id: 51, slip_seq: 2 };
+    db.prepare("INSERT INTO pk_pack_incidents (id, kind) VALUES (77, 'wrong_item')").run();
+    const r1 = createRepickBatch({ ...wi, id: 311, sku: 'm-a', incident_id: 77 });
+    assert.equal(db.prepare('SELECT repick_reason FROM pk_batches WHERE id=?').get(r1.batchId).repick_reason, 'wrong_item');
+    const r2 = createRepickBatch({ ...wi, id: 312, sku: 'm-b' });
+    assert.equal(r2.batchId, r1.batchId);
+    const b = db.prepare('SELECT repick_reason, hikiate_class FROM pk_batches WHERE id=?').get(r1.batchId);
+    assert.equal(b.repick_reason, 'shortage');
+    assert.equal(b.hikiate_class, REPICK_CLASS.shortage);
+    const r3 = createRepickBatch({ ...wi, id: 313, sku: 'm-c', incident_id: 77 });
+    assert.equal(r3.batchId, r1.batchId);
+    assert.equal(db.prepare('SELECT repick_reason FROM pk_batches WHERE id=?').get(r1.batchId).repick_reason, 'shortage', '不足に品違いが合流しても不足のまま');
+  });
+  t('自分の「後で取りに行く」(later) は同じ伝票でも別バッチ', () => {
+    const r = createRepickBatch({ ...slip, id: 303, sku: 'g-c', later_request_id: 5 });
+    assert.notEqual(r.batchId, gid);
+    assert.equal(db.prepare('SELECT repick_reason FROM pk_batches WHERE id=?').get(r.batchId).repick_reason, 'later');
+  });
+  t('着手済み (picking) のバッチには足さず新しいバッチになる', () => {
+    db.prepare("UPDATE pk_batches SET status='picking' WHERE id=?").run(gid);
+    const r = createRepickBatch({ ...slip, id: 304, sku: 'g-d' });
+    assert.notEqual(r.batchId, gid);
+    assert.equal(r.appended, undefined);
+    assert.equal(listLines(gid).length, 2, '着手済みの明細は変わらない');
+    db.prepare("UPDATE pk_batches SET status='ready' WHERE id=?").run(gid);
+  });
+  t('reconcile ②: バッチ未生成のタスクも同じ伝票の未着手バッチへ合流する', () => {
+    ins(305, 'g-e');
+    reconcileRepickBatches();
+    const l = db.prepare('SELECT batch_id FROM pk_lines WHERE pack_task_id=305').get();
+    assert.ok(l, '行が作られる');
+    // 304 のバッチ (id が大きい方) に合流する = ORDER BY id DESC
+    const b304 = db.prepare('SELECT batch_id FROM pk_lines WHERE pack_task_id=304').get().batch_id;
+    assert.equal(l.batch_id, b304);
+    assert.equal(reconcileRepickBatches(), 0, '2回目は何もしない');
+  });
+  t('reconcile ①: 一部のタスクが取下げ → 未着手ならその行だけ外れ、件数と同期キーが直る', () => {
+    db.prepare("UPDATE pk_pack_tasks SET status='cancelled' WHERE id=301").run();
+    reconcileRepickBatches();
+    const b = db.prepare('SELECT * FROM pk_batches WHERE id=?').get(gid);
+    assert.equal(b.status, 'ready', 'バッチは残る');
+    assert.equal(b.line_count, 1);
+    assert.equal(b.total_qty, 2);
+    assert.equal(b.composition, '単品');
+    assert.equal(b.pack_task_id, 302, '同期キーが残った行のタスクに付け替わる');
+    assert.deepEqual(listLines(gid).map((l) => l.pack_task_id), [302]);
+  });
+  t('reconcile ①: 着手済みなら行は外さない', () => {
+    const b304 = db.prepare('SELECT batch_id FROM pk_lines WHERE pack_task_id=304').get().batch_id;
+    db.prepare("UPDATE pk_batches SET status='picking' WHERE id=?").run(b304);
+    db.prepare("UPDATE pk_pack_tasks SET status='cancelled' WHERE id=305").run();
+    reconcileRepickBatches();
+    assert.equal(listLines(b304).length, 2, '行はそのまま');
+    assert.equal(db.prepare('SELECT status FROM pk_batches WHERE id=?').get(b304).status, 'picking');
+  });
+  t('Codex R1: 行のタスクが一部読めないうちは畳まない (fail-closed)', () => {
+    const r1 = createRepickBatch({ ...slip, batch_id: 52, slip_seq: 1, id: 321, sku: 'x-a' });
+    createRepickBatch({ ...slip, batch_id: 52, slip_seq: 1, id: 322, sku: 'x-b' });
+    ins(321, 'x-a', 'cancelled');   // 322 の行は pk_pack_tasks に無い
+    db.prepare('UPDATE pk_pack_tasks SET batch_id=52, slip_seq=1 WHERE id=321').run();
+    assert.equal(reconcileRepickBatches(), 0);
+    const b = db.prepare('SELECT status, line_count FROM pk_batches WHERE id=?').get(r1.batchId);
+    assert.equal(b.status, 'ready', '畳まない');
+    assert.equal(b.line_count, 2, '行も外さない');
+  });
+  t('Codex R2: 判定と取消は同じ書き込みロックの中 (別接続が書き込み中なら判定にも入らず、生きた依頼を畳まない)', () => {
+    // 別接続が BEGIN IMMEDIATE で書き込みロックを持っている間に reconcile を呼ぶ:
+    // 読むだけなら通ってしまう判定が、ロック待ち (busy_timeout) → SQLITE_BUSY で見送りになる = 判定がロックの内側にある証拠
+    const other = new Database(path.join(process.env.DATA_DIR, 'picking.db'));
+    db.pragma('busy_timeout = 300');
+    try {
+      db.prepare("UPDATE pk_pack_tasks SET status='cancelled' WHERE id=302").run();
+      other.exec('BEGIN IMMEDIATE');
+      const t0 = Date.now();
+      assert.equal(reconcileRepickBatches(), 0, 'ロック中は畳めない (見送り)');
+      assert.ok(Date.now() - t0 >= 250, `ロック待ちしている (${Date.now() - t0}ms)`);
+      assert.equal(db.prepare('SELECT status FROM pk_batches WHERE id=?').get(gid).status, 'ready');
+      // 別接続がその間に生きた依頼の行を足してコミット → ロック解放後の reconcile は足された行を見て畳まない
+      other.prepare(`INSERT INTO pk_lines (batch_id, seq, location, sku, qty, pack_task_id) VALUES (?, 9, '00100101', 'g-z', 1, 309)`).run(gid);
+      other.prepare("INSERT INTO pk_pack_tasks (id, status, kind, sku, batch_id, slip_seq) VALUES (309, 'requested', 'repick', 'g-z', 50, 9)").run();
+      other.exec('COMMIT');
+      reconcileRepickBatches();
+      const b = db.prepare('SELECT status, line_count FROM pk_batches WHERE id=?').get(gid);
+      assert.equal(b.status, 'ready', '足された依頼が生きているので畳まない');
+      assert.equal(b.line_count, 1, '取下げ済みの行だけ外れる');
+      assert.deepEqual(listLines(gid).map((l) => l.pack_task_id), [309]);
+      // 後片付け: 元の状態 (302 の行だけ・requested) に戻す
+      db.prepare('DELETE FROM pk_lines WHERE batch_id=? AND pack_task_id=309').run(gid);
+      db.prepare("DELETE FROM pk_pack_tasks WHERE id=309").run();
+      db.prepare("UPDATE pk_pack_tasks SET status='requested' WHERE id=302").run();
+      db.prepare(`INSERT INTO pk_lines (batch_id, seq, location, sku, qty, pack_task_id) VALUES (?, 2, '00201604', 'g-b', 2, 302)`).run(gid);
+      db.prepare("UPDATE pk_batches SET line_count=1, total_qty=2, pack_task_id=302 WHERE id=?").run(gid);
+    } finally {
+      try { other.exec('ROLLBACK'); } catch { /* commit 済み */ }
+      other.close();
+      db.pragma('busy_timeout = 5000');
+    }
+  });
+  t('reconcile ①: 全部取下げ → バッチごと取消', () => {
+    db.prepare("UPDATE pk_pack_tasks SET status='cancelled' WHERE id=302").run();
+    assert.equal(reconcileRepickBatches(), 1);
+    const b = db.prepare('SELECT status, validity FROM pk_batches WHERE id=?').get(gid);
+    assert.deepEqual([b.status, b.validity], ['cancelled', 'invalid']);
+  });
+}
+
+console.log('── v18 マイグレーション (v17 形式の DB から) ──');
+{
+  // v17 形式に戻す: 追加列と索引を落とし、旧形式の1行バッチを置いてから初期化し直す (initPickingDB は再実行で migrate)
+  db.exec('DROP INDEX IF EXISTS idx_pk_lines_pack_task');
+  db.exec('DROP INDEX IF EXISTS idx_pk_batches_repick_slip');
+  db.exec('ALTER TABLE pk_lines DROP COLUMN pack_task_id');
+  db.exec('ALTER TABLE pk_batches DROP COLUMN pack_batch_id');
+  db.exec('ALTER TABLE pk_batches DROP COLUMN pack_slip_seq');
+  db.pragma('user_version = 17');
+  db.prepare(`INSERT INTO pk_pack_tasks (id, status, kind, sku, batch_id, slip_seq) VALUES (401, 'requested', 'repick', 'mig-a', 60, 4)`).run();
+  db.prepare(`INSERT INTO pk_batches (tb_no, hikiate_class, work_date, composition, line_count, slip_count, total_qty, status, validity,
+    csv_sha256, imported_by, created_at, updated_at, origin, pack_task_id)
+    VALUES ('REPICK-401', 'x', '2026-09-07', '単品', 1, 1, 1, 'ready', 'valid', 's401', 't', 'a', 'a', 'repick', 401)`).run();
+  const mb = Number(db.prepare("SELECT id FROM pk_batches WHERE tb_no='REPICK-401'").get().id);
+  db.prepare("INSERT INTO pk_lines (batch_id, seq, location, sku, qty) VALUES (?, 1, '00100101', 'mig-a', 1)").run(mb);
+  const db2 = initPickingDB();
+  t('v17 → v18: 既存の1行バッチは行に pack_task_id、バッチに合流キーが入る', () => {
+    assert.equal(db2.pragma('user_version', { simple: true }), 18);
+    assert.equal(db2.prepare('SELECT pack_task_id FROM pk_lines WHERE batch_id=?').get(mb).pack_task_id, 401);
+    const b = db2.prepare('SELECT pack_batch_id, pack_slip_seq FROM pk_batches WHERE id=?').get(mb);
+    assert.deepEqual([b.pack_batch_id, b.pack_slip_seq], [60, 4]);
+    assert.equal(db2.prepare('SELECT COUNT(*) AS c FROM pk_lines WHERE pack_task_id IS NOT NULL').get().c > 1, true, '他の再ピック行も埋まる');
+  });
+  t('v17 → v18 (pk_pack_tasks が無い環境): 合流キーは NULL のまま通る', () => {
+    db2.exec('DROP INDEX IF EXISTS idx_pk_lines_pack_task');
+    db2.exec('DROP INDEX IF EXISTS idx_pk_batches_repick_slip');
+    db2.exec('ALTER TABLE pk_lines DROP COLUMN pack_task_id');
+    db2.exec('ALTER TABLE pk_batches DROP COLUMN pack_batch_id');
+    db2.exec('ALTER TABLE pk_batches DROP COLUMN pack_slip_seq');
+    db2.exec('ALTER TABLE pk_pack_tasks RENAME TO pk_pack_tasks_hidden');
+    db2.pragma('user_version = 17');
+    const db3 = initPickingDB();
+    assert.equal(db3.pragma('user_version', { simple: true }), 18);
+    assert.equal(db3.prepare('SELECT pack_task_id FROM pk_lines WHERE batch_id=?').get(mb).pack_task_id, 401);
+    assert.equal(db3.prepare('SELECT pack_batch_id FROM pk_batches WHERE id=?').get(mb).pack_batch_id, null);
+  });
+}
 
 try { fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true }); } catch { /* 無視 */ }
 console.log(`\ntest-repick: ${passed} 件 pass`);
