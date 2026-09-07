@@ -493,16 +493,28 @@ console.log('\n[9] 画面が安全弁を通している (退行防止)');
   ok(/cameraTry = 0; startScan\(\)/.test(html), 'ボタンを押し直したら条件を最初から');
   ok(/Split View/.test(html), 'iPad で画面を2分割していると使えないことを案内する');
   // 🚨 iPhone (ホーム画面アプリ) では読めて iPad だけダメ = iPad 固有の状態を診断に出す (2026-09-07)
-  ok(/const splitViewLikely = \(\) =>/.test(html) && /w < sw \* 0\.85/.test(html),
-    '🚨 窓の幅と画面の幅から「分割中の可能性」を見る (iPhone には無い状態)');
-  ok(html.indexOf('+ (splitViewLikely()') > 0,
-    '分割中らしければ、その案内を最初に出す');
-  ok(/const deviceTag = \(\) =>/.test(html) && html.includes("ua.match(/OS ("),
-    'iPad/iPhone と OS の版だけ出す (UA をそのまま出さない)');
-  ok(/enumerateDevices/.test(html) && /videoinput/.test(html) && /カメラ' \+ videoInputs/.test(html),
-    'つながっているカメラの台数を出す (0台なら端末側で使えない)');
-  ok(/facingMode: 'user'/.test(html),
-    '前面カメラも試す (背面だけ掴めない iPad の切り分け)');
+  // 🚨 iPhone (ホーム画面アプリ) では読めて iPad だけダメ = iPad 固有の状態を診断に出す (2026-09-07)
+  ok(/const narrowWindow = \(\) =>/.test(html) && /w < sw \* 0\.85/.test(html) && /if \(!isIpad\(\)\) return false;/.test(html),
+    '🚨 窓が画面より狭いかを見る。**iPad のときだけ** (PC の小さい窓で iPad 向けの案内を出さない)');
+  ok(html.indexOf('+ (narrowWindow()') > 0, '窓が狭ければ、その案内を最初に出す');
+  // ⚠ 狭い理由は分割とは限らない (ウィンドウ表示・ページ拡大でも狭くなる) ので断定しない
+  ok(/ウィンドウを小さくしている/.test(html) && /ページを拡大している/.test(html),
+    '🚨 「分割中」と断定せず、ウィンドウ・拡大の可能性も並べて聞く');
+  ok(/'窓が狭い'/.test(html) && !/分割中の可能性/.test(html),
+    '診断の語も「窓が狭い」に留める (理由を決めつけない)');
+  ok(/const deviceTag = \(\) =>/.test(html) && html.includes("ua.match(/OS (") && /'\/UA'/.test(html),
+    'OS の版は **UA が名乗っている値** と分かる形で出す (実際の版とは限らない)');
+  ok(/const isIpad = \(\) =>/.test(html) && /maxTouchPoints > 1/.test(html),
+    'Macintosh 形式の iPad UA も iPad と見なす');
+  // 🚨 権限前の enumerateDevices は台数が絞られるので、掴めてから数える
+  ok(/const countVideoInputs = \(\) =>/.test(html)
+    && html.indexOf('countVideoInputs();') > html.indexOf('scanStream = stream;'),
+    '🚨 映像入力の数は「カメラを掴めたあと」に数える (権限前だと台数が絞られる)');
+  ok(/'映像入力' \+ \(videoInputs === null \? '未確認'/.test(html),
+    '数えられていなければ「未確認」と出す (0 と混ぜない)');
+  ok(!/0台なら端末側で使えない/.test(html), '0 を「端末で使えない」と結論づけない');
+  ok(/facingMode: \{ exact: 'user' \}/.test(html),
+    '前面カメラは exact で確実に要求する (希望条件だと前面が選ばれる保証がない)');
   ok((html.match(/audio: false/g) || []).length === 4, 'カメラの条件は4段階');
   // 🚨 予約だけ生き残ると、閉じたあとにカメラが勝手に開く (Codex #1239 R1 P1)
   ok(/function scheduleRescan\(ms\)/.test(html) && /const at = scanGen;/.test(html)
