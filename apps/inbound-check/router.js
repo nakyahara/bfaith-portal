@@ -103,7 +103,10 @@ function access(req, res, next) {
   if (req.path === '/manifest.json') return next();
   // 端末登録の画面と API はログイン不要 (登録コード自体が認証。共用 iPad に管理者パスワードを打たせない)
   // 手順書も認証なし: 登録がまだ済んでいない iPad からこそ読まれるページのため (中身は手順だけ)
-  if (req.path === '/enroll' || req.path === '/enroll/redeem' || req.path === '/guide') return next();
+  // 📷 カメラの確認も認証なし: カメラが使えない端末の切り分けに使うもので、登録できていない
+  //   / 不調の端末からこそ開かれる。読み取りも業務データも扱わない固定 HTML
+  if (req.path === '/enroll' || req.path === '/enroll/redeem' || req.path === '/guide'
+      || req.path === '/camera-test') return next();
   // 🏷 印刷エージェント (倉庫PC) は Cookie ではなく Authorization ヘッダーで名乗る。
   //   /print/ 配下はここでは素通しし、router.use('/print', requirePrintAgent) が kind='agent' の端末だけを通す
   //   (iPad の端末Cookieでは絶対に印刷ジョブを取れない)。ルートを列挙しないのは、後から /print/... を
@@ -278,6 +281,8 @@ router.get('/guide', (req, res) => {
 //    「アプリの作りが悪いのか / 端末がカメラを渡していないのか」を切り分けられなかったので作った。
 //    guide と同じく素通し — 登録前・不調時の端末からこそ開かれるため。個人情報は扱わない
 router.get('/camera-test', (req, res) => {
+  // 外のサイトに埋め込ませない (誘導してカメラを開かせる余地を残さない — Codex #1242 R1)
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
   res.sendFile(path.join(__dirname, 'views', 'camera-test.html'));
 });
 
