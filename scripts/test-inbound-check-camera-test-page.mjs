@@ -55,8 +55,11 @@ srv.close();
 console.log('\n[2] 取得の条件');
 const callAt = html.indexOf('await navigator.mediaDevices.getUserMedia(');
 const call = callAt < 0 ? '' : html.slice(callAt, callAt + 120);
-ok(call.includes('{ video: true, audio: false }'), 'いちばん緩い条件だけを使う');
-ok(!/facingMode|width:|height:|deviceId/.test(call), '条件で落ちる余地を作らない (向き・解像度・機器を指定しない)');
+// 既定 (「カメラを開く」) は向きを指定しない。押したときだけ背面を名指しする
+ok(call.includes('video: wanted === null ? true : wanted'), '既定はいちばん緩い条件 (向きを指定しない)');
+ok(!/width:|height:|deviceId/.test(call), '解像度や機器は指定しない (条件で落ちる余地を作らない)');
+ok(/facingMode: \{ exact: 'environment' \}/.test(html) && /runTest\(null\)/.test(html),
+  '背面カメラは押したときだけ名指しで試す (読み取り画面が使う条件を確かめられる)');
 ok((html.match(/mediaDevices\.getUserMedia\(/g) || []).length === 1,
   '取得を呼ぶ箇所は1つだけ (再試行や条件の切り替えを持たない)');
 

@@ -27,6 +27,8 @@
     .filters input[type=search] { min-width: 220px; flex: 1 1 220px; }
     .filters label.chk { font-size: 0.9em; color: #495057; display: inline-flex; align-items: center; gap: 4px; }
     .hint { font-size: 0.85em; color: #495057; margin: 8px 14px 0; line-height: 1.5; }
+    .camhint { color: #868e96; }
+    .camhint a { color: #1971c2; }
     .banner { display: none; margin: 10px 14px 0; padding: 10px 12px; border-radius: 8px; font-size: 0.92em; }
     .banner.err { display: block; background: #ffe3e3; color: #a61e1e; }
     .banner.ok { display: block; background: #d3f9d8; color: #2b8a3e; }
@@ -106,7 +108,8 @@
       <button type="button" class="btn primary" id="searchBtn">検索</button>
     </div>
   </div>
-  <div class="hint">入荷受付伝票に無い商品でも、ここから<b>入庫情報 (入数・BCシール・いろは・荷姿) の確認と編集</b>、<b>🏷 値札シールの発行</b> (倉庫PCの QL-700・伝票と同じ形式) ができます。仕入先で絞ってから探すと早いです。</div>
+  <div class="hint">入荷受付伝票に無い商品でも、ここから<b>入庫情報 (入数・BCシール・いろは・荷姿) の確認と編集</b>、<b>🏷 値札シールの発行</b> (倉庫PCの QL-700・伝票と同じ形式) ができます。仕入先で絞ってから探すと早いです。
+    <br><span class="camhint">📷 が使えないときは <a href="/apps/inbound-check/camera-test">カメラの確認</a> で切り分けられます (いま開いている画面のまま試せます)</span></div>
   <div class="banner" id="banner"></div>
   <div class="wrap">
     <div class="count" id="count"></div>

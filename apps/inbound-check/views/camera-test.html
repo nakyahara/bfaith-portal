@@ -30,6 +30,7 @@
 </p>
 <div class="row">
   <button class="go" id="start">カメラを開く</button>
+  <button id="startBack">背面カメラで試す</button>
   <button id="stop">止める</button>
   <button id="copy">結果をコピー</button>
 </div>
@@ -37,7 +38,9 @@
 <video id="v" playsinline muted autoplay></video>
 <div id="log">「カメラを開く」を押してください。</div>
 <p class="note">
-  読み取り画面と<b>同じ開き方</b>（ホーム画面のアイコン／Safari）で試すと比べられます。
+  <b>「カメラを開く」は向きを指定しません</b>（条件のせいで落ちる可能性を消すため）。iPad では前面が選ばれます。
+  読み取り画面が使うのは背面なので、<b>「背面カメラで試す」</b>も押して比べてください。
+  <br>読み取り画面と<b>同じ開き方</b>（ホーム画面のアイコン／Safari）で試すと比べられます。
   結果を送るときは、<b>「止める」を押してカメラを閉じてから、下の文字の部分だけ</b>を送ってください
   （映像に人や伝票が写り込まないように）。
 </p>
@@ -55,6 +58,9 @@
   var run = 0;
   var timer = null, stream = null;
   var t0 = 0, grantedAt = null, endedAt = null, lastProgressAt = null;
+  // 🚨 頼んだ向き。既定は **何も指定しない** (条件のせいで落ちる可能性を消す) ので、
+  //    iPad では前面が選ばれることが多い。読み取り画面が使うのは背面なので、そちらも試せるようにする
+  var wanted = null;
   var progress = 0, lastTime = -1, sawEnded = false, sawMute = false;
   var now = function () { return (window.performance && performance.now) ? performance.now() : Date.now(); };
   var since = function (base) { return Math.round(now() - (base === null || base === undefined ? t0 : base)) + 'ms'; };
@@ -131,12 +137,17 @@
       + '<br>画面を2分割していないか、ページを拡大していないか、他のアプリがカメラを使っていないかを確かめてください。');
   }
 
-  startBtn.addEventListener('click', async function () {
+  document.getElementById('startBack').addEventListener('click', function () { runTest({ facingMode: { exact: 'environment' } }); });
+  startBtn.addEventListener('click', function () { runTest(null); });
+
+  /** 1回ぶんの確認。@param {object|null} facing null = 向きを指定しない (いちばん緩い) */
+  async function runTest(facing) {
     stopAll(null);
     var mine = ++run;                         // この試行の番号
     startBtn.disabled = true;
     lines = []; progress = 0; lastTime = -1;
     grantedAt = null; endedAt = null; lastProgressAt = null; sawEnded = false; sawMute = false;
+    wanted = facing;
     verdict.className = 'verdict';
     t0 = now();
     env();
@@ -146,15 +157,19 @@
       startBtn.disabled = false;
       return;
     }
-    // ⭐いちばん緩い条件だけ。条件のせいで落ちる可能性を消す
-    log(since() + ' getUserMedia({video:true}) を呼びます (許可を聞かれたら「許可」を押してください)');
+    // ⭐既定はいちばん緩い条件だけ (条件のせいで落ちる可能性を消す)。
+    //   「背面カメラで試す」を押したときだけ向きを指定する
+    log(since() + ' 頼む条件: ' + (wanted === null ? 'video:true (向きの指定なし)' : '背面カメラ (exact environment)')
+      + ' — 許可を聞かれたら「許可」を押してください');
     var s = null;
     try {
-      s = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      s = await navigator.mediaDevices.getUserMedia({ video: wanted === null ? true : wanted, audio: false });
     } catch (e) {
       if (mine !== run) return;               // 待っている間に止められた
       log(since() + ' ✗ 失敗: ' + (e && e.name ? e.name : '不明'));
       say('ng', '<b>カメラを開けませんでした (' + (e && e.name ? e.name : '不明') + ')</b>'
+        + (wanted !== null ? '<br>背面カメラを名指しで頼んでいるので、OverconstrainedError なら'
+            + '「この端末では背面カメラを使えない」ということです。' : '')
         + '<br>NotAllowedError なら許可の問題、NotReadableError なら他が使っている、'
         + 'NotFoundError ならカメラが見つかっていません。');
       startBtn.disabled = false;
@@ -169,7 +184,7 @@
     if (track) {
       var st = {};
       try { st = track.getSettings ? track.getSettings() : {}; } catch (e) {}
-      log('  カメラ: ' + (st.facingMode || '向き不明') + ' ' + (st.width || '?') + 'x' + (st.height || '?')
+      log('  選ばれたカメラ: ' + (st.facingMode || '向き不明') + ' ' + (st.width || '?') + 'x' + (st.height || '?')
         + ' / 状態=' + track.readyState + (track.muted ? ' (muted)' : ''));
       // 🚨 ended は **イベント**で拾う。stop() を呼んだ場合は状態が ended になってもイベントは出ないので、
       //    ここで拾えたなら「こちらが止めたのではなく、カメラ側が終了した」と言える
