@@ -70,4 +70,67 @@ t('原価への反映: 軽減税率 税抜600円 → 税込648円', () => {
   assert.equal(Math.round(600 * taxMultiplier(0.08)), 648);
 });
 
+t('NaN → fallback (Codex R1-3)', () => {
+  assert.equal(taxMultiplier(NaN), 1 + TAX_RATE_FALLBACK);
+});
+
+t('文字列 "0.1" → fallback (数値以外は受けない・Codex R1-3)', () => {
+  assert.equal(taxMultiplier('0.1'), 1 + TAX_RATE_FALLBACK);
+});
+
+t('Infinity → fallback', () => {
+  assert.equal(taxMultiplier(Infinity), 1 + TAX_RATE_FALLBACK);
+});
+
+// ─── セット構成品の税率混在 (呼び出し側の挙動を固定する) ───
+// router.js の実装:
+//   taxRates.push(prod.消費税率 || TAX_RATE_FALLBACK)
+//   const uniqueTaxRates = [...new Set(taxRates)]
+//   if (!allFound || uniqueTaxRates.length > 1) -> hard fail (原価不確定)
+//   else -> taxMultiplier(uniqueTaxRates[0])
+function setResolution(rawRates, allFound = true) {
+  const taxRates = rawRates.map(r => r || TAX_RATE_FALLBACK);
+  const unique = [...new Set(taxRates)];
+  if (!allFound || unique.length > 1) return { hardFail: true };
+  return { hardFail: false, multiplier: taxMultiplier(unique[0]) };
+}
+
+console.log('\nセット構成品の税率混在 (呼び出し側)');
+
+t('[0.1, 0.1] → 1.1 (混在なし)', () => {
+  const r = setResolution([0.1, 0.1]);
+  assert.equal(r.hardFail, false);
+  assert.equal(r.multiplier, 1.1);
+});
+
+t('[0.08, 0.1] は hard fail (混在)', () => {
+  assert.equal(setResolution([0.08, 0.1]).hardFail, true);
+});
+
+t('[0.1, 0.08] も hard fail (順序に依存しない)', () => {
+  assert.equal(setResolution([0.1, 0.08]).hardFail, true);
+});
+
+t('🚨 [0.1, null] は成功する (旧実装では [0.1, 10] で hard fail していた)', () => {
+  // 挙動変更を意図として固定する。旧実装は単位の取り違えで偶然 hard fail していただけで、
+  // どちらも 10% 扱いなのだから成功が正しい
+  const r = setResolution([0.1, null]);
+  assert.equal(r.hardFail, false);
+  assert.equal(r.multiplier, 1.1);
+});
+
+t('[0.08, null] は hard fail のまま (8% と 10% は本当に混在)', () => {
+  assert.equal(setResolution([0.08, null]).hardFail, true);
+});
+
+t('全件未登録 [null, null] → 1.1', () => {
+  const r = setResolution([null, null]);
+  assert.equal(r.hardFail, false);
+  assert.equal(r.multiplier, 1.1);
+});
+
+t('構成品の一部が見つからない (allFound=false) → hard fail', () => {
+  assert.equal(setResolution([0.1], false).hardFail, true);
+});
+
 console.log(`\n${passed} 件 PASS`);

@@ -32,8 +32,10 @@ router.use('/api/inventory', inventoryDecisionRouter);
 //    整数を渡してはいけないので、整数が来たら未知の単位として fallback する。
 export const TAX_RATE_FALLBACK = 0.1;
 export function taxMultiplier(rate) {
-  // null / 0 (NE 未登録) と、想定外の単位 (1 以上 = 整数表記の疑い) は fallback
-  if (rate == null || rate <= 0 || rate >= 1) return 1 + TAX_RATE_FALLBACK;
+  // 数値でない (null / undefined / NaN / 文字列) と、想定外の単位 (1 以上 = 整数表記の疑い)、
+  // 0 以下 (NE 未登録) は fallback。復元ではなく「異常値の代替」なので、
+  // 整数 8 も 10% に倒れる (将来 mirror が整数表記へ変わったら、ここではなく単位側を直す)
+  if (!Number.isFinite(rate) || rate <= 0 || rate >= 1) return 1 + TAX_RATE_FALLBACK;
   return 1 + rate;
 }
 
