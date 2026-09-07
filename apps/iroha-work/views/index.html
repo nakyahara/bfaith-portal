@@ -4935,6 +4935,7 @@ async function stopWork(reason, only, opts) {
 // ─── 🚚 外部にあずける (要件 §AB-7)。職員だけ ───
 let cgTarget = null;      // { taskId, batchId } または { consignmentId, action }
 let cgSaving = false;
+let cgPickedBatch = null; // 渡せるぶんが 2 つ以上あるとき、選んだもの
 
 /** 預けられる拠点 = 物を持ち帰るところ (羅針盤・ワークセンター) だけ */
 function externalFacilities() {
@@ -4952,15 +4953,18 @@ function openConsign() {
   // ⭐渡せるぶん・渡せる数は**サーバーが決めた値**を使う。画面が予定数から自分で出すと、
   //   「押したら断られる」ことになる (Codex R1 中7)
   const able = (c.batches || []).filter((x) => !x.consignable_why && (x.consignable_max == null || x.consignable_max > 0));
-  const b = able.find((x) => !x.facility_code || x.facility_code === 'iroha') || able[0];
-  if (!b) {
+  if (able.length === 0) {
     const why = (c.batches || []).map((x) => x.consignable_why).filter(Boolean)[0];
     showErr(why || 'いま渡せるぶんがありません');
     return;
   }
+  // ⭐渡せるぶんが 2 つ以上あるときは選んでもらう (渡さなかったぶんが手元に戻ると起きる — Codex R2 中7)。
+  //   1 つならそのまま (ふだんはこちら)
+  const b = able.find((x) => x.id === cgPickedBatch) || able.find((x) => !x.facility_code || x.facility_code === 'iroha') || able[0];
   const facs = externalFacilities();
   if (facs.length === 0) { showErr('物を持ち帰る拠点が登録されていません'); return; }
   cgTarget = { taskId: c.id, batchId: b.id, max: b.consignable_max };
+  cgPickedBatch = b.id;
   $('#cgTitle').textContent = '🚚 外部にあずける';
   $('#cgName').textContent = c.title + '（渡せるのは ' + (b.consignable_max == null ? '数不明' : b.consignable_max + ' 個') + '）';
   $('#cgMsg').textContent = '';
@@ -4970,7 +4974,13 @@ function openConsign() {
   const half = room != null ? roundToPack(Math.floor(room / 2), per) : null;
   $('#cgBody').innerHTML =
     '<div class="dq">' +
-    '<label>どこへ渡しますか</label>' +
+    // 渡せるぶんが 2 つ以上あるときだけ、どのぶんかを選ぶ
+    (able.length > 1 ? '<label>どのぶんを渡しますか</label><div class="chips" id="cgBatches">' +
+      able.map((x) => '<button type="button" class="chip' + (x.id === b.id ? ' on' : '') + '" data-cgbatch="' + x.id + '">' +
+        esc(x.facility_code && x.facility_code !== 'iroha' ? facilityName(x.facility_code) + ' ' : '') +
+        esc(String(x.consignable_max == null ? '数不明' : x.consignable_max + ' 個')) + '</button>').join('') +
+      '</div>' : '') +
+    '<label' + (able.length > 1 ? ' style="margin-top:12px"' : '') + '>どこへ渡しますか</label>' +
     '<div class="chips" id="cgFacs">' + facs.map((f, i) =>
       '<button type="button" class="chip' + (i === 0 ? ' on' : '') + '" data-cgfac="' + esc(f.code) + '">' + esc(f.name) + '</button>').join('') + '</div>' +
     '<label style="margin-top:12px">何個わたしますか</label>' +
@@ -4992,7 +5002,7 @@ function openConsign() {
   openOverlay('#cgOv');
   $('#cgTitle').focus();
 }
-function closeConsign() { if (cgSaving) return; closeOverlay('#cgOv'); cgTarget = null; $('#cgBody').innerHTML = ''; }
+function closeConsign() { if (cgSaving) return; closeOverlay('#cgOv'); cgTarget = null; cgPickedBatch = null; $('#cgBody').innerHTML = ''; }
 $('#cgOv').addEventListener('click', (e) => { if (e.target === $('#cgOv')) closeConsign(); });
 // 選択肢 (拠点・数・期限)
 document.addEventListener('click', (e) => {
@@ -5001,7 +5011,9 @@ document.addEventListener('click', (e) => {
   const d = e.target.closest('[data-cgdue]');
   if (d) { for (const x of $('#cgDue').querySelectorAll('.chip')) x.classList.toggle('on', x === d); return; }
   const q = e.target.closest('[data-cgq]');
-  if (q) { const el = $('#cgBody').querySelector('.cgQty'); if (el) el.value = q.dataset.cgq; }
+  if (q) { const el = $('#cgBody').querySelector('.cgQty'); if (el) el.value = q.dataset.cgq; return; }
+  const bb = e.target.closest('[data-cgbatch]');
+  if (bb) { cgPickedBatch = Number(bb.dataset.cgbatch); openConsign(); }   // 選び直して描き直す
 });
 /** 「いつまでに」= 今日から N 日後 (JST)。サーバーには YYYY-MM-DD で渡す */
 function dueYmd(days) {

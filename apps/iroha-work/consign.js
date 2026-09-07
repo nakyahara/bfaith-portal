@@ -25,6 +25,8 @@ function normQty0(v, label) {
 }
 function normNum(v, label, min) {
   if (typeof v !== 'number' && typeof v !== 'string') return { error: 'bad_qty', message: `${label}は数で入れてください` };
+  // ⭐空文字を 0 と読まない。未入力なのに「0 個」として保存してしまう (Codex R2 中5)
+  if (typeof v === 'string' && v.trim() === '') return { error: 'bad_qty', message: `${label}を入れてください` };
   const n = Number(typeof v === 'string' ? v.trim() : v);
   if (!Number.isInteger(n) || n < min) return { error: 'bad_qty', message: `${label}は ${min} 以上の整数で入れてください` };
   if (n > 1_000_000) return { error: 'bad_qty', message: `${label}が大きすぎます` };
@@ -56,11 +58,20 @@ function giveBackToHand(db, awayBatch, qty, now, actor) {
   if (!qty || qty <= 0) return null;
   const origin = awayBatch.split_from_batch_id
     ? db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(awayBatch.split_from_batch_id) : null;
-  const originOk = origin && origin.work_status !== 'done' && origin.work_status !== 'cancelled'
+  // ⭐戻してよい元の条件。ここを緩めると、直したはずの問題が戻し先で再発する (Codex R2 重大1・重大2)
+  //   - まだ手元で作業できる状態か (棚入待ち・終了・取消のまとまりに未着手分を足さない)
+  //   - よそへ預けていないか (相手の数が勝手に増えないように)
+  //   - 棚に入れた記録・箱ラベルを刷った記録が無いか (数が動くと記録と合わなくなる)
+  //   - ⭐予定数が分かっているか。NULL (数不明) に足すと「不明」が「40 個」に化ける
+  const originOk = origin
+    && (origin.work_status === 'not_started' || origin.work_status === 'in_progress')
+    && origin.planned_qty != null
     && (!origin.facility_code || origin.facility_code === 'iroha')
-    && db.prepare("SELECT COUNT(*) c FROM f_iroha_consignments WHERE batch_id = ? AND state <> 'cancelled'").get(origin.id).c === 0;
+    && db.prepare("SELECT COUNT(*) c FROM f_iroha_consignments WHERE batch_id = ? AND state <> 'cancelled'").get(origin.id).c === 0
+    && db.prepare('SELECT COUNT(*) c FROM f_iroha_stocking_records WHERE batch_id = ?').get(origin.id).c === 0
+    && db.prepare('SELECT COUNT(*) c FROM f_iroha_print_jobs WHERE batch_id = ?').get(origin.id).c === 0;
   if (originOk) {
-    db.prepare('UPDATE f_iroha_task_batches SET planned_qty = COALESCE(planned_qty, 0) + ?, version = version + 1, updated_at = ? WHERE id = ?')
+    db.prepare('UPDATE f_iroha_task_batches SET planned_qty = planned_qty + ?, version = version + 1, updated_at = ? WHERE id = ?')
       .run(qty, now, origin.id);
     return origin.id;
   }
@@ -123,7 +134,8 @@ export function whyCannotSplit(db, batch) {
  *   ②その新しいまとまりに預けの行を足す
  *
  * 「まとまりを分割する」という操作は現場に見せない。押すのは「🚚 外部にあずける」だけ (要件 §AB-5)。
- * 全部を預けるとき (切り出す数 = 上限) は割らず、そのまとまりごと預ける。
+ * ⭐**予定数を丸ごと預けるときだけ**割らない (行を増やす意味が無いので)。
+ *   完成した分や別の預けが元に残るなら、上限いっぱいでも割る。
  *
  * 競合対策: **親カードの version を確かめてから進める**。行ごとの version だけだと、
  * 別々の新規行が同時に入って合計が予定数を超える (要件 §AB-7)。
@@ -315,6 +327,11 @@ export function recordReturn({ consignmentId, returnedQty, goodQty = undefined, 
   if (good && good.value > r.value) {
     return { ok: false, error: 'bad_qty', message: `使える数は、返ってきた ${r.value} 個より多くできません` };
   }
+  // ⭐作れなかった数も**単独で**返ってきた数を超えられない。
+  //   合計だけ見ていると、使える数を省いたときに素通りしていた (Codex R2 重大3)
+  if (loss && loss.value > r.value) {
+    return { ok: false, error: 'bad_qty', message: `作れなかった数は、返ってきた ${r.value} 個より多くできません` };
+  }
   if (good && loss && good.value + loss.value > r.value) {
     return { ok: false, error: 'bad_qty', message: `使える数と作れなかった数の合計が、返ってきた ${r.value} 個を超えています` };
   }
@@ -344,11 +361,17 @@ export function recordReturn({ consignmentId, returnedQty, goodQty = undefined, 
     db.prepare(`UPDATE f_iroha_consignments SET state = ?, settled_at = ?, settled_by = ?, version = version + 1, updated_at = ?
       WHERE id = ?`).run(settled ? 'settled' : 'handed', settled ? now : null, settled ? actor : null, now, c.id);
     // 返ってきた良品は、そのまとまりの「できた数」になる
-    const goods = db.prepare('SELECT COUNT(good_qty) n, SUM(good_qty) s, SUM(loss_qty) l FROM f_iroha_consignment_returns WHERE consignment_id = ?').get(c.id);
-    if (goods.n > 0) {
-      db.prepare(`UPDATE f_iroha_task_batches SET good_qty = ?, good_qty_source = 'counted', loss_qty = ?,
+    // ⭐使える数と作れなかった数は**別々に**集計して反映する。
+    //   以前は「使える数が 1 件も無ければ、入れた作れなかった数も捨てる」ことになっていた (Codex R2 重大3)
+    const agg = db.prepare(`SELECT COUNT(good_qty) gn, SUM(good_qty) gs, COUNT(loss_qty) ln, SUM(loss_qty) ls
+      FROM f_iroha_consignment_returns WHERE consignment_id = ?`).get(c.id);
+    if (agg.gn > 0 || agg.ln > 0) {
+      const cur = db.prepare('SELECT good_qty, good_qty_source, loss_qty FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
+      const nextGood = agg.gn > 0 ? agg.gs : (cur.good_qty ?? null);
+      const nextLoss = agg.ln > 0 ? agg.ls : (cur.loss_qty ?? null);
+      db.prepare(`UPDATE f_iroha_task_batches SET good_qty = ?, good_qty_source = ?, loss_qty = ?,
           version = version + 1, updated_at = ? WHERE id = ?`)
-        .run(goods.s, goods.l ?? null, now, c.batch_id);
+        .run(nextGood, nextGood == null ? null : 'counted', nextLoss, now, c.batch_id);
       const b = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
       if (b) recomputeTaskDoneQty(db, b.task_id);
     }
@@ -406,9 +429,47 @@ function updateConsignment(consignmentId, expectVersion, guard, fn, actor = null
     const r = fn(db, c, now, actor);
     if (!r.ok) return r;
     // ⭐数が動く操作は**親カードの版も進める** (Codex R1 重大4)。
-    //   進めないと、取消の前のカードを見ている端末の要求がそのまま通ってしまう
+    //   進めないと、取消の前のカードを見ている端末の要求がそのまま通ってしまう。
+    //   ⚠ただし**何も変えなかったとき (already) は進めない** — 同じ要求を繰り返すだけで
+    //     親の版が上がり続け、他の端末に無用な競合を起こす (Codex R2 中4)
     const taskId = r.taskId ?? (db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id) || {}).task_id;
-    if (taskId) bumpTask(db, taskId, now, actor);
+    if (taskId && !r.already) bumpTask(db, taskId, now, actor);
     return { ...r, consignment: getConsignment(c.id, db) };
   }).immediate();
+}
+
+/**
+ * ⭐一覧用に「あと何個渡せるか / なぜ渡せないか」を**まとめて**引く (Codex R2 中6)。
+ *
+ * 1 まとまりずつ `whyCannotSplit` / `splittableMax` を呼ぶと、2000 枚 × 4 クエリで 8000 回になる。
+ * ここは 4 本の集計で全部ぶんを取り、Map で引く。
+ * @returns Map<batch_id, { max: number|null, why: string|null }>
+ */
+export function consignableByBatch(db, batchIds) {
+  const ids = [...new Set((batchIds || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  const out = new Map();
+  if (ids.length === 0) return out;
+  const inq = ids.map(() => '?').join(',');
+  const rows = db.prepare(`SELECT * FROM f_iroha_task_batches WHERE id IN (${inq})`).all(...ids);
+  const taskIds = [...new Set(rows.map((b) => b.task_id))];
+  const tinq = taskIds.map(() => '?').join(',');
+  const active = new Map(db.prepare(`SELECT task_id, COUNT(*) c FROM f_iroha_work_sessions
+    WHERE task_id IN (${tinq}) AND ended_at IS NULL AND voided_at IS NULL GROUP BY task_id`).all(...taskIds).map((r) => [r.task_id, r.c]));
+  const stocked = new Map(db.prepare(`SELECT batch_id, COUNT(*) c FROM f_iroha_stocking_records
+    WHERE batch_id IN (${inq}) GROUP BY batch_id`).all(...ids).map((r) => [r.batch_id, r.c]));
+  const printed = new Map(db.prepare(`SELECT batch_id, COUNT(*) c FROM f_iroha_print_jobs
+    WHERE batch_id IN (${inq}) GROUP BY batch_id`).all(...ids).map((r) => [r.batch_id, r.c]));
+  const consigned = new Map(db.prepare(`SELECT batch_id, COALESCE(SUM(planned_qty), 0) n FROM f_iroha_consignments
+    WHERE batch_id IN (${inq}) AND state <> 'cancelled' GROUP BY batch_id`).all(...ids).map((r) => [r.batch_id, r.n]));
+  for (const b of rows) {
+    let why = null;
+    if (b.work_status === 'done' || b.work_status === 'cancelled') why = 'このぶんはもう終わっています';
+    else if ((active.get(b.task_id) || 0) > 0) why = 'いま作業している人がいます。作業を終えてからにしてください';
+    else if ((stocked.get(b.id) || 0) > 0) why = 'もう棚に入れたぶんです';
+    else if ((printed.get(b.id) || 0) > 0) why = 'このぶんの箱ラベルはもう出しています。分けるなら先にラベルを整理してください';
+    const done = (b.good_qty ?? 0) + (b.loss_qty ?? 0);
+    const max = b.planned_qty == null ? null : Math.max(0, b.planned_qty - done - (consigned.get(b.id) || 0));
+    out.set(b.id, { max: why ? 0 : max, why });
+  }
+  return out;
 }

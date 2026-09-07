@@ -22,7 +22,7 @@ import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
 import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask } from './tasks-db.js';
 import { countsByTask, stockingOfTask, batchesByTask } from './batches.js';
-import { consignmentsOfTask, splittableMax, whyCannotSplit } from './consign.js';
+import { consignmentsOfTask, consignableByBatch } from './consign.js';
 
 /**
  * ⭐「急ぎ」の線引き (中原さん 2026-09-06)。
@@ -306,6 +306,8 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
   const counts = countsByTask(getDB(), rows.map((r) => r.id));
   // まとまり (ふだんは 1 つ)。⭐一覧では「あずけ中が何個あるか」を出すのに使う (要件 §AB-7)
   const batches = batchesByTask(getDB(), rows.map((r) => r.id));
+  // ⭐「あと何個渡せるか」は**まとめて**引く。1 まとまりずつ呼ぶと 2000 枚 × 4 クエリになる (Codex R2 中6)
+  const consignable = consignableByBatch(getDB(), [...batches.values()].flat().map((b) => b.id));
   // ⭐いま外にあるのは「渡した数 − 返ってきた数」。100 個渡して 90 個返っても 100 と出さない (Codex R1 中9)
   const awayByTask = new Map(getDB().prepare(`SELECT b.task_id,
       SUM(COALESCE(c.handed_qty, c.planned_qty)
@@ -354,12 +356,11 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       // ⭐「あと何個渡せるか」「なぜ渡せないか」はサーバーが決める。
       //   画面が自分で予定数から出すと、サーバーの判定とずれて「押したら断られる」ことになる (Codex R1 中7)
       batches: (batches.get(r.id) || []).map((b) => {
-        const why = whyCannotSplit(getDB(), b);
+        const cg = consignable.get(b.id) || { max: null, why: null };
         return { id: b.id, seq: b.seq, planned_qty: b.planned_qty,
           facility_code: b.facility_code, expiry: b.expiry, work_status: b.work_status,
           good_qty: b.good_qty, loss_qty: b.loss_qty,
-          consignable_max: why ? 0 : (splittableMax(getDB(), b) ?? null),
-          consignable_why: why ? why.message : null };
+          consignable_max: cg.max, consignable_why: cg.why };
       }),
       hold_memo: r.hold_memo || null,
       planned_date: r.planned_date,
