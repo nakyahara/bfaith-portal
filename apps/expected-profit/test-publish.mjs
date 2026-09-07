@@ -282,6 +282,36 @@ await ta('[!] 検証を通っていない世代は送らない', async () => {
   assert.equal(r.error, 'local_status_rejected');
 });
 
+await ta('[!] 最後のチャンクの応答中に期限を跨いだら、公開を始めない (Codex R6-2)', async () => {
+  // 送信開始時点では期限内。最後のチャンクの応答が返る頃に期限を越える
+  seedLocal('gLate', 200, 2);
+  const deadline = new Date(Date.now() + 60);
+  let published = false;
+  const r = await publishToRender(db, 'gLate', {
+    chunkSize: 1,
+    deadline,
+    postChunk: async () => { await new Promise(res => setTimeout(res, 40)); return { ok: true }; },
+    postPublish: async () => { published = true; return { ok: true }; },
+    getPublished: async () => null,
+  });
+  assert.equal(published, false, '期限を過ぎてから公開を始めた');
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'deadline_exceeded');
+  assert.equal(r.phase, 'before_publish');
+});
+
+await ta('期限内に終われば普通に公開する (期限判定が過剰でないこと)', async () => {
+  seedLocal('gInTime', 201, 1);
+  const r = await publishToRender(db, 'gInTime', {
+    chunkSize: 1,
+    deadline: new Date(Date.now() + 60_000),
+    postChunk: async () => ({ ok: true }),
+    postPublish: async () => ({ ok: true }),
+    getPublished: async () => ({ generation_id: 'gInTime', seq: 201 }),
+  });
+  assert.equal(r.ok, true, r.error);
+});
+
 t('チャンクの分割は決定的 (同じ入力なら同じ checksum)', () => {
   const rows = [mkRow('a'), mkRow('b'), mkRow('c')];
   const a = makeChunks(rows, 2);

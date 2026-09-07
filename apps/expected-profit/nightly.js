@@ -175,7 +175,7 @@ export async function runNightly(opts = {}) {
     return { ...result, error: 'deadline_exceeded', generationId: gen.generationId };
   }
   try {
-    const pub = await publishToRender(db, gen.generationId, { deadline, ...(opts.publishDeps || httpDeps()) });
+    const pub = await publishToRender(db, gen.generationId, { deadline, ...(opts.publishDeps || httpDeps(deadline)) });
     result.steps.push({ step: 'publish', ok: pub.ok, ...pub });
     if (!pub.ok) {
       await ping('fail', `公開できなかった: ${pub.error}`);

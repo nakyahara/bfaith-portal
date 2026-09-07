@@ -73,6 +73,12 @@ export async function publishToRender(db, generationId, deps) {
     }
   }
 
+  // 🚨 最後のチャンクの応答を待つ間に期限を跨ぐことがある。公開の直前にもう一度見る (Codex R6-2)。
+  //    ここを通さないと、06:00 を過ぎてから公開が始まる
+  if (deps.deadline && new Date() >= deps.deadline) {
+    db.prepare("UPDATE expected_profit_generation SET remote_status = 'received' WHERE generation_id = ?").run(generationId);
+    return { ok: false, error: 'deadline_exceeded', phase: 'before_publish', chunks: chunks.length };
+  }
   const pub = await deps.postPublish({ generation_id: generationId, seq: gen.seq, manifest });
   if (!pub?.ok) {
     db.prepare("UPDATE expected_profit_generation SET remote_status = 'received' WHERE generation_id = ?").run(generationId);
@@ -107,15 +113,20 @@ export async function publishToRender(db, generationId, deps) {
 // 🚨 timeout を必ず付ける。無いと転送が固まったまま期限を越える (Codex R4-9)
 const HTTP_TIMEOUT_MS = 120_000;
 
-export function httpDeps() {
+export function httpDeps(deadline = null) {
   const base = (process.env.RENDER_PORTAL_URL || '').replace(/\/+$/, '');
   const key = process.env.MIRROR_SYNC_KEY;
   if (!base) throw new Error('RENDER_PORTAL_URL not configured');
   if (!key) throw new Error('MIRROR_SYNC_KEY not configured');
   const headers = { 'Content-Type': 'application/json', 'x-sync-key': key };
   const url = (p) => `${base}/apps/expected-profit/sync${p}`;
-  const withTimeout = (ms = HTTP_TIMEOUT_MS) => AbortSignal.timeout(ms);
+  // 🚨 timeout は「残り時間」を超えない。固定 120 秒だと期限を跨いで待ち続ける
+  const withTimeout = (ms = HTTP_TIMEOUT_MS) => {
+    const cap = deadline ? Math.max(1000, deadline.getTime() - Date.now()) : ms;
+    return AbortSignal.timeout(Math.min(ms, cap));
+  };
   return {
+    deadline,
     postChunk: async (id, body) => (await fetch(url(`/generations/${encodeURIComponent(id)}/chunks`),
       { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() })).json(),
     postPublish: async (body) => (await fetch(url('/publish'),

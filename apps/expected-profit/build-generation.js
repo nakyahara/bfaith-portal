@@ -222,10 +222,25 @@ export function validateGeneration(db, generationId, opts = {}) {
       break;
     }
   }
-  // 6. ok なのにランキング不適格が多すぎる (判定の取り違え検知)
+  // 6. 集計と実際の行が食い違っていないか (これは構造異常)
   const okRows = rows.filter(r => r.calculation_status === 'ok');
-  if (okRows.length > 0 && gen.rank_eligible_count === 0) {
-    errors.push('計算できた行があるのに、ランキング対象が0件 (適格判定の取り違えの疑い)');
+  const actualRank = rows.filter(r => r.rank_eligible === 1).length;
+  if (gen.rank_eligible_count != null && actualRank !== gen.rank_eligible_count) {
+    errors.push(`ランキング対象の集計が行と合わない: 集計 ${gen.rank_eligible_count} / 実際 ${actualRank}`);
+  }
+  if (gen.ok_count != null && okRows.length !== gen.ok_count) {
+    errors.push(`計算できた件数の集計が行と合わない: 集計 ${gen.ok_count} / 実際 ${okRows.length}`);
+  }
+  // 🚨 ランキング0件そのものは構造異常ではない (Codex R6-1)。
+  //    列挙が partial の夜、全出品が Inactive の夜は、正しく0件になる。
+  //    「理由が説明できない0件」だけを異常として扱う
+  if (okRows.length > 0 && actualRank === 0) {
+    const unexplained = okRows.filter(r => !r.rank_exclusion_reason);
+    if (unexplained.length > 0) {
+      errors.push(`ランキング対象が0件で、理由が付いていない行が ${unexplained.length} 件ある (適格判定の取り違えの疑い)`);
+    } else {
+      warnings.push(`ランキング対象が0件 (理由: ${[...new Set(okRows.map(r => r.rank_exclusion_reason))].slice(0, 5).join(', ')})`);
+    }
   }
   // 7. 全モールが degraded なら公開しない
   const included = JSON.parse(gen.malls_included || '[]');

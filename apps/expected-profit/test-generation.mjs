@@ -171,14 +171,11 @@ t('[!] 費用内訳と利益が合わない世代は公開しない', () => {
   assert.ok(v.errors.some(e => /内訳と利益が合わない/.test(e)));
 });
 
-t('[!] 計算できた行があるのにランキング対象が0なら公開しない (判定の取り違え検知)', () => {
-  seedRun('rakuten', 'runRank', 'ok', [{ mall_item_key: 'y/sku1' }]);
-  const g = buildGeneration(db, { warehouseInputs, now: NOW, malls: ['rakuten'], codeVersion: 'test' });
-  db.prepare('UPDATE expected_profit_generation SET rank_eligible_count = 0 WHERE generation_id = ?').run(g.generationId);
-  const v = validateGeneration(db, g.generationId);
-  assert.equal(v.ok, false);
-  assert.ok(v.errors.some(e => /ランキング対象が0件/.test(e)));
-});
+// 🚨 旧テスト「ランキング0件なら公開しない」は削除した。
+//    集計だけ 0 に書き換えるのは「集計と行の食い違い」であって、
+//    「ランキング0件そのもの」は partial の夜に正しく起きる (Codex R6-1)。
+//    置き換え = 上の「集計と実際の行が食い違えば拒否する」と
+//    「partial の夜に正しく rank 0 になっても検証を通る」
 
 t('[!] 利益が有限値でない行があれば公開しない', () => {
   seedRun('rakuten', 'runNaN', 'ok', [{ mall_item_key: 'z/sku1' }]);
@@ -186,6 +183,41 @@ t('[!] 利益が有限値でない行があれば公開しない', () => {
   db.prepare("UPDATE mart_listing_expected_profit SET expected_profit = 'NaN' WHERE generation_id = ?").run(g.generationId);
   const v = validateGeneration(db, g.generationId);
   assert.equal(v.ok, false);
+});
+
+t('[!] partial の夜に正しく rank 0 になっても、世代は検証を通る (Codex R6-1)', () => {
+  // 列挙が partial → 全行 rank_eligible=0 になるが、これは構造異常ではない。
+  // ここを拒否すると「Amazon が落ちた夜は楽天の結果も見られない」ことになる
+  seedRun('rakuten', 'runP1', 'ok', [{ mall_item_key: 'p/sku1' }]);
+  buildGeneration(db, { warehouseInputs, now: NOW, malls: ['rakuten'], codeVersion: 'test' });
+  seedRun('rakuten', 'runP2', 'partial', [{ mall_item_key: 'p/sku1' }]);
+  const g = buildGeneration(db, { warehouseInputs, now: NOW, malls: ['rakuten'], codeVersion: 'test' });
+  assert.ok(g.okCount > 0, '計算できた行があるはず');
+  assert.equal(g.rankEligibleCount, 0, 'partial なので全行がランキング外になるはず');
+  const v = validateGeneration(db, g.generationId);
+  assert.equal(v.ok, true, `正当な rank 0 を拒否している: ${JSON.stringify(v.errors)}`);
+  assert.ok(v.warnings.some(w => /ランキング対象が0件/.test(w)), '警告として残すべき');
+});
+
+t('[!] 理由が付いていない rank 0 は構造異常として拒否する', () => {
+  seedRun('rakuten', 'runP3', 'ok', [{ mall_item_key: 'q/sku1' }]);
+  const g = buildGeneration(db, { warehouseInputs, now: NOW, malls: ['rakuten'], codeVersion: 'test' });
+  // 理由を消して rank だけ落とす (適格判定の取り違えを模す)
+  db.prepare(`UPDATE mart_listing_expected_profit
+    SET rank_eligible = 0, rank_exclusion_reason = NULL WHERE generation_id = ?`).run(g.generationId);
+  db.prepare('UPDATE expected_profit_generation SET rank_eligible_count = 0 WHERE generation_id = ?').run(g.generationId);
+  const v = validateGeneration(db, g.generationId);
+  assert.equal(v.ok, false);
+  assert.ok(v.errors.some(e => /理由が付いていない/.test(e)));
+});
+
+t('[!] 集計と実際の行が食い違えば拒否する', () => {
+  seedRun('rakuten', 'runP4', 'ok', [{ mall_item_key: 'r/sku1' }]);
+  const g = buildGeneration(db, { warehouseInputs, now: NOW, malls: ['rakuten'], codeVersion: 'test' });
+  db.prepare('UPDATE expected_profit_generation SET rank_eligible_count = 999 WHERE generation_id = ?').run(g.generationId);
+  const v = validateGeneration(db, g.generationId);
+  assert.equal(v.ok, false);
+  assert.ok(v.errors.some(e => /集計が行と合わない/.test(e)));
 });
 
 t('入力不足による incomplete は「正常」として公開できる (構造異常と分ける)', () => {
