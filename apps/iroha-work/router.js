@@ -2215,18 +2215,21 @@ function facilityLinkGate(req, res, next) {
   res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
   res.set('Referrer-Policy', 'no-referrer');
   res.set('Cache-Control', 'no-store');
-  // ③ 接続元の上限 (でたらめなトークンを繰り返し送られても、ここで頭打ちになる)
-  if (!bumpWindow(flIpHits, clientKeyOf(req), FL_IP_MAX_PER_WINDOW, FL_IP_MAX_KEYS)) {
-    res.set('Retry-After', '60');
-    return res.status(429).json({ ok: false, error: 'too_many', message: '少し時間をおいてから開いてください' });
-  }
-  // ① トークンを確かめる。⭐当たらなければ**何も覚えない**
+  // ① まずトークンを確かめる (索引つきの 1 回の読み取り)。⭐当たらなければ**何も覚えない**
   // ⭐HEAD (リンク検査・先読み) では「見に来た日時」を書かない (Codex R1 軽微6)
   const link = verifyFacilityLink(req.params.token, { touch: req.method === 'GET' });
-  // ② 当たったものだけ、リンクの id で数える (発行した本数ぶんしか増えない)
-  if (link && !bumpWindow(flHits, link.id, FL_MAX_PER_WINDOW, 0)) {
+  const tooMany = () => {
     res.set('Retry-After', '60');
     return res.status(429).json({ ok: false, error: 'too_many', message: '少し時間をおいてから開いてください' });
+  };
+  if (link) {
+    // ② 当たったものは**リンクの id だけ**で数える (発行した本数ぶんしか増えないので、上限も追い出しも要らない)。
+    //    ⭐接続元の上限は見ない — そちらは満杯のとき断る作りなので、外から大量の接続元を作られると
+    //      **正しい URL を持っている施設まで締め出せて**しまう (自己レビュー)
+    if (!bumpWindow(flHits, link.id, FL_MAX_PER_WINDOW, 0)) return tooMany();
+  } else if (!bumpWindow(flIpHits, clientKeyOf(req), FL_IP_MAX_PER_WINDOW, FL_IP_MAX_KEYS)) {
+    // ③ 当たらなかったものだけ、接続元で数える (URL を探して叩き続ける相手を頭打ちにする)
+    return tooMany();
   }
   if (!link) {
     // ⭐当たらなかった理由 (無い / 失効した / 期限切れ) を分けて教えない (総当たりの手がかりにしない)

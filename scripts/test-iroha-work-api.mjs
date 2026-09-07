@@ -436,6 +436,21 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
       ok(again.status === 429,
         '⭐別の接続元をたくさん作っても、断られた記録は消せない (生きている記録は追い出さない)');
     }
+
+    // ⭐たくさんの接続元で埋められても、**正しい URL を持っている施設は締め出されない** (自己レビュー)。
+    //   接続元の上限は「満杯なら断る」作りなので、正しいトークンにまで掛けると
+    //   外から接続元を大量に作るだけで先方を締め出せてしまう
+    {
+      const good = await post('/admin/facility-links', { facility_code: 'workcenter', label: '締め出されないこと' });
+      for (let i = 0; i < 400; i++) {
+        await fetch(`http://${HOST}/apps/iroha-work/f/${'h'.repeat(30)}${i}`,
+          { headers: { Host: HOST, 'X-Forwarded-For': '203.0.115.' + (i % 250) } }).catch(() => {});
+      }
+      // 同じ (埋めるのに使った) 接続元から、正しい URL で開く
+      const r = await fetch(`http://${HOST}${good.json.url}/api/view`,
+        { headers: { Host: HOST, 'X-Forwarded-For': '203.0.115.7' } });
+      ok(r.status === 200, '⭐接続元が埋まっていても、正しい URL なら開ける (先方を巻き添えにしない)');
+    }
   }
 
   // でたらめ・失効したトークン
