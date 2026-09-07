@@ -222,8 +222,9 @@ router.get('/', async (req, res) => {
   const repickLines = batches.some((b) => b.origin === 'repick') ? listRepickFirstLines(workDate) : new Map();
   for (const b of batches) {
     if (b.origin !== 'repick') continue;
-    const line = repickLines.get(b.id) || null;
-    b.repickLine = line ? { sku: line.sku, name: line.product_name || line.sku, qty: line.qty, locationLabel: line.location ? formatLocation(line.block, line.location) : null } : null;
+    const lines = repickLines.get(b.id) || [];
+    b.repickLines = lines.map((line) => ({ sku: line.sku, name: line.product_name || line.sku, qty: line.qty, locationLabel: line.location ? formatLocation(line.block, line.location) : null }));
+    b.repickLine = b.repickLines[0] || null;
   }
   // ↩ 棚戻し = 一覧の中に「バッチ」として並べる (例外処理監査 PR-4・指摘C)。pk_batches は作らない (計測・Notion・フロアボードに混ざらない)
   let returnTasks = [];
@@ -532,8 +533,8 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   // 各アクションは遷移ガードつきで二重適用は失敗ログ止まり=無害)。分岐は syncRepickTask (テスト対象)
   {
     const sync = syncRepickTask(batchId, { event: req.body.event }, worker.name, await packingSvc());
-    if (sync.unavailable) {
-      const { task, remaining, altQty } = sync.unavailable;
+    // 同じ伝票の複数タスクが1バッチ (PR-7) → 在庫なしになった分だけ、タスクごとに通知
+    for (const { task, remaining, altQty } of (sync.unavailables || [])) {
       import('../packing/notify.js')
         .then(({ notifyTaskUnavailable }) => notifyTaskUnavailable(task, worker.name, { remaining, altQty }))
         .catch((e) => console.warn(`[picking] 在庫なし通知失敗: ${e.message}`));
