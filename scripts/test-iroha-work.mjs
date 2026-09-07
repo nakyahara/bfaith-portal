@@ -1774,6 +1774,19 @@ console.log('\n[18] アプリ正本の画面データ (A1b): tasks 版の一覧�
       '中止したら古い表のまま・作業表も残らない (全部戻る)');
     ok(db.pragma('foreign_keys', { simple: true }) === 1, '中止しても foreign_keys は ON に戻る');
     db.prepare("DELETE FROM f_iroha_work_sessions WHERE worker_name = 'orphan'").run();
+    // ⭐**無関係な表**の孤立行では止めない。DB 全体を見ていると、古い行が 1 つあるだけで
+    //   作り直しが永久に止まり、アプリが起動しなくなる (自分が作り直す表の始末だけつける)
+    {
+      db.pragma('foreign_keys = OFF');
+      db.prepare("INSERT INTO f_iroha_stocking_records (batch_id, qty, stocked_at, created_at) VALUES (999999, 1, ?, ?)")
+        .run(new Date().toISOString(), new Date().toISOString());
+      db.pragma('foreign_keys = ON');
+      ok(db.pragma('foreign_key_check').length > 0, '(前提) 無関係な表に孤立行がある');
+      let other = null;
+      try { createTables(db); } catch (e) { other = e; }
+      ok(!other, '⭐無関係な表の孤立行では、作り直しを止めない');
+      db.prepare('DELETE FROM f_iroha_stocking_records WHERE batch_id = 999999').run();
+    }
     createTables(db);
     ok(/CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/.test(sqlOf('f_iroha_work_sessions')) && /REFERENCES f_iroha_tasks/.test(sqlOf('f_iroha_card_media')), '途中の版も新しい定義に作り直す');
     // 途中の版に無かった列 (人数だけの作業) は落ちて既定値に戻る。それ以外は id ごとそのまま
@@ -7357,25 +7370,76 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
     ok(found.summary.totalSeconds === 480, '検索の合計も人時');
   }
 
-  // ⑨ ⭐crew_size が NULL 可の途中版は作り直す (Codex R1 中3)
+  // ⑨ ⭐crew_size の制約**だけ**が弱い版も作り直す (Codex R1 中3 / R2 軽微1)。
+  //   ⭐ほかの制約は残したまま試す — FK まで壊すと、そちらの検査で作り直されてしまい、
+  //   人数の検査が効いた証明にならない。そして**実際に移行を呼ぶ** (自作の表を眺めるだけにしない)
   {
-    const probe = new (await import('better-sqlite3')).default(':memory:');
-    const cur = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='f_iroha_work_sessions'").get().sql;
-    // 「列も CHECK もあるが crew_size が NULL 可」の版を作る
-    const weak = cur.replace('crew_size      INTEGER NOT NULL DEFAULT 1 CHECK (crew_size >= 1 AND crew_size <= 50)', 'crew_size INTEGER')
-      .replace('REFERENCES f_iroha_tasks(id)', '').replace('REFERENCES f_iroha_facilities(code)', '')
-      .replace('REFERENCES f_iroha_task_batches(id)', '');
-    ok(!/crew_size      INTEGER NOT NULL/.test(weak), '(前提) crew_size が NULL 可の版を用意');
-    probe.exec(weak);
-    const info = probe.prepare('PRAGMA table_info(f_iroha_work_sessions)').all();
-    const c = info.find((x) => x.name === 'crew_size');
-    ok(c && (c.notnull !== 1 || String(c.dflt_value) !== '1'),
-      '⭐この版は「NOT NULL・既定値 1」ではない = 作り直しの対象と分かる');
-    // 実害: crew_size が NULL だと、その行の実測が合計から静かに消える
-    probe.exec("INSERT INTO f_iroha_work_sessions (task_id, worker_id, worker_name, started_at, ended_at, raw_seconds) VALUES (1, 1, 'x', 'a', 'b', 3600)");
-    const lost = probe.prepare('SELECT SUM(COALESCE(raw_seconds, 0) * crew_size) AS s FROM f_iroha_work_sessions').get().s;
-    ok(lost === null, '⭐crew_size が NULL だと 3600 秒が合計から消える (だから作り直しが要る)');
-    probe.close();
+    const { createTables } = await import('../apps/iroha-work/db.js');
+    const sqlNow = () => db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='f_iroha_work_sessions'").get().sql;
+    const cur = sqlNow();
+    const weak = cur.replace(/crew_size      INTEGER NOT NULL DEFAULT 1[\s\S]*?CHECK \(typeof\(crew_size\)[^)]*\)[^,]*,/, 'crew_size      INTEGER,');
+    ok(weak !== cur && !/typeof\(crew_size\)/.test(weak) && /REFERENCES f_iroha_tasks/.test(weak),
+      '(前提) crew_size の制約だけを弱め、ほかの制約は残した版を作れる');
+    const before = db.prepare('SELECT * FROM f_iroha_work_sessions ORDER BY id').all();
+    const cols = db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().map((c) => c.name).join(', ');
+    db.pragma('foreign_keys = OFF');
+    db.exec(`CREATE TEMP TABLE w9 AS SELECT * FROM f_iroha_work_sessions;
+      DROP TABLE f_iroha_work_sessions; ${weak};
+      INSERT INTO f_iroha_work_sessions (${cols}) SELECT ${cols} FROM w9; DROP TABLE w9;`);
+    db.pragma('foreign_keys = ON');
+    ok(!/typeof\(crew_size\)/.test(sqlNow()), '(前提) いまは弱い版が入っている');
+    // ⭐実際に移行を呼ぶ
+    createTables(db);
+    ok(/typeof\(crew_size\) = 'integer'/.test(sqlNow()),
+      '⭐crew_size の制約だけが弱い版も、ちゃんと作り直す');
+    ok(JSON.stringify(db.prepare('SELECT * FROM f_iroha_work_sessions ORDER BY id').all()) === JSON.stringify(before),
+      '⭐作り直しても行は 1 列も変わらない');
+    const idx2 = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='f_iroha_work_sessions'").all().map((r) => r.name);
+    ok(idx2.includes('idx_iroha_sessions_crew_uniq') && idx2.includes('idx_iroha_sessions_open_uniq'), '索引も戻る');
+    createTables(db);
+    ok(JSON.stringify(db.prepare('SELECT * FROM f_iroha_work_sessions ORDER BY id').all()) === JSON.stringify(before),
+      '2 回目は何もしない (冪等)');
+  }
+
+  // ⑩ ⭐人数は整数だけ (Codex R2 中1)
+  {
+    const t = mk('crew-10', 9017);
+    let frac = null;
+    try {
+      db.prepare("INSERT INTO f_iroha_work_sessions (task_id, facility_code, crew_size, started_at) VALUES (?, 'rehas', 1.5, ?)")
+        .run(t, new Date().toISOString());
+    } catch (e) { frac = e; }
+    ok(frac && /CHECK/.test(frac.message),
+      '⭐人数に 1.5 は入らない。SQLite は INTEGER と書いても小数を入れられるので typeof で守る');
+    ok(db.prepare("SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?").get(t).c === 0,
+      '(1.5 の行は残っていない)');
+    // 文字の '3' は SQLite が整数 3 に直してから入れる (欠けずに直せるため)。これは正しい振る舞い
+    const ins3 = db.prepare("INSERT INTO f_iroha_work_sessions (task_id, facility_code, crew_size, started_at) VALUES (?, 'rehas', '3', ?)")
+      .run(t, new Date().toISOString());
+    ok(db.prepare('SELECT typeof(crew_size) AS ty, crew_size AS n FROM f_iroha_work_sessions WHERE id = ?')
+      .get(Number(ins3.lastInsertRowid)).ty === 'integer', "文字の '3' は整数 3 として入る (欠けずに直せるため)");
+    db.prepare('DELETE FROM f_iroha_work_sessions WHERE id = ?').run(Number(ins3.lastInsertRowid));
+  }
+
+  // ⑪ ⭐まとまりの自動選択は「手元」だけ (Codex R2 中2)
+  {
+    const C2 = await import('../apps/iroha-work/consign.js');
+    const t = mk('crew-11', 9018, 200);
+    const home = B.listBatchesOfTask(db, t)[0].id;
+    // 半分をワークセンターへ預ける → まとまりが 2 つになる (手元 1 + 外 1)
+    const cg = C2.startConsignment({ taskId: t, batchId: home, facilityCode: 'workcenter', qty: 100,
+      expectVersion: TD.getTask(t).version });
+    ok(cg.ok && B.listBatchesOfTask(db, t).filter((b) => b.work_status !== 'cancelled').length === 2,
+      '(前提) 手元 1 つ + 外へ出したぶん 1 つ');
+    const r = TD.startTaskCrewSession({ taskId: t, staff: staffW, facilityCode: 'rehas', crewSize: 2 });
+    ok(r.ok, 'はじめられる');
+    ok(sess(r.sessionId).batch_id === home,
+      '⭐外に出したぶんは数えない。手元が 1 つに決まるなら、そこに結びつく');
+    // 外に出したぶんを名指ししても断る
+    const away = B.listBatchesOfTask(db, t).find((b) => b.id !== home && b.work_status !== 'cancelled');
+    const t2 = mk('crew-12', 9019, 200);
+    const bad = TD.startTaskCrewSession({ taskId: t2, staff: staffW, facilityCode: 'rehas', crewSize: 2, batchId: away.id });
+    ok(!bad.ok && bad.error === 'bad_batch', '⭐よそのカードのぶんも、外に出したぶんも名指しできない');
   }
 
   // ── 画面 ──

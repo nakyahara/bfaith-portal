@@ -155,7 +155,10 @@ const sessionsDDL = (name) => `
       facility_code  TEXT REFERENCES f_iroha_facilities(code),
       -- ⭐実測は **秒 × 人数 = 人時**に統一する。個人の記録は必ず 1 なので、いまの集計と辻褄が合う
       --   (いまも 3 人なら 3 行 = 3 人時)
-      crew_size      INTEGER NOT NULL DEFAULT 1 CHECK (crew_size >= 1 AND crew_size <= 50),
+      -- ⭐整数だけ。SQLite は INTEGER と書いても 1.5 を入れられる (型は「入れ物の好み」でしかない)。
+      --   1.5 が入ると 60 秒が 90 人秒になる (Codex #1258 R2 中1)
+      crew_size      INTEGER NOT NULL DEFAULT 1
+        CHECK (typeof(crew_size) = 'integer' AND crew_size >= 1 AND crew_size <= 50),
       -- ⭐どのまとまりの作業か (要件 §AB-10)。まとまりが 1 つなら画面が自動で選ぶ。
       --   決められないときは NULL のまま (カードには残る。分からないものを当てずっぽうで結びつけない)
       batch_id       INTEGER REFERENCES f_iroha_task_batches(id),
@@ -384,7 +387,7 @@ const SESSIONS_REQUIRED_DDL = [...SESSION_MEDIA_COMMON_DDL, /end_reason IS NULL 
   // ⭐人数だけの作業 (要件 §AB-10)。列だけ足した途中版と区別するため、表レベルの CHECK まで見る。
   //   ⭐crew_size は**列の定義まで**見る (Codex #1258 R1 中3) — NULL 可の途中版だと
   //   raw_seconds × crew_size が NULL になり、その行の実測が合計から静かに消える
-  /crew_size      INTEGER NOT NULL DEFAULT 1 CHECK \(crew_size >= 1 AND crew_size <= 50\)/,
+  /crew_size      INTEGER NOT NULL DEFAULT 1\s*\n?\s*CHECK \(typeof\(crew_size\) = 'integer' AND crew_size >= 1 AND crew_size <= 50\)/,
   /facility_code  TEXT REFERENCES f_iroha_facilities\(code\)/,
   /batch_id       INTEGER REFERENCES f_iroha_task_batches\(id\)/,
   /CHECK \(\(worker_id IS NULL\) = \(worker_name IS NULL\)\)/,
@@ -432,7 +435,10 @@ function migrateSessionMediaSchema(db) {
         db.exec(`ALTER TABLE ${tmp} RENAME TO ${table}`);
         db.exec(index);
       }
-      const bad = db.pragma('foreign_key_check');
+      // ⭐見るのは**作り直した表だけ**。DB 全体を見ると、無関係な表に古い孤立行が 1 つあるだけで
+      //   作り直しが永久に止まり、アプリが起動しなくなる (この PR で本番の DB も 1 回作り直すので、
+      //   そこで初めて踏む。自分の作った行の始末は自分でつける、が筋)
+      const bad = targets.flatMap(({ table }) => db.pragma(`foreign_key_check(${table})`));
       if (bad.length > 0) throw new Error(`作業時間・写真の作り直しを中止しました (FK 違反): ${JSON.stringify(bad.slice(0, 5))}`);
     })();
   } finally {
@@ -1363,19 +1369,27 @@ export function startCrewSession({ taskId, facilityCode, crewSize, batchId = nul
 
 /**
  * どのまとまりの作業かを決める (要件 §AB-10)。
- * ⭐指定があれば**そのカードのものか**を確かめる。無ければ、手元に残っているまとまりが
- *   1 つだけのときに限って自動で選ぶ。2 つ以上あって決められないときは **NULL のまま**にする —
- *   当てずっぽうで結びつけると、あとから見た人が「このぶんの実測」と読んでしまう。
+ *
+ * ⭐対象は**手元のまとまり**だけ (Codex #1258 R2 中2)。物を持ち帰る拠点 (羅針盤・ワークセンター) の
+ *   ぶんは向こうで作業しているので、いろは の中で測った時間をそこに結びつけてはいけない。
+ *   外に出したまとまりまで数えると、手元が 1 つに決まっていても「2 つあるから決められない」になる。
+ * ⭐指定があれば**そのカードの手元のもの**かを確かめる。無ければ、手元が 1 つだけのときに限って
+ *   自動で選ぶ。2 つ以上あって決められないときは **NULL のまま** — 当てずっぽうで結びつけると、
+ *   あとから見た人が「このぶんの実測」と読んでしまう。
  */
+const HOME_BATCH_SQL = `SELECT id FROM f_iroha_task_batches b
+  WHERE b.task_id = ? AND b.work_status <> 'cancelled'
+    AND (b.facility_code IS NULL OR b.facility_code IN (SELECT code FROM f_iroha_facilities WHERE offsite = 0))
+    AND NOT EXISTS (SELECT 1 FROM f_iroha_consignments c WHERE c.batch_id = b.id AND c.state <> 'cancelled')`;
 function pickSessionBatch(db, taskId, batchId) {
+  const rows = db.prepare(HOME_BATCH_SQL).all(taskId);
   if (batchId != null) {
-    const b = db.prepare('SELECT id FROM f_iroha_task_batches WHERE id = ? AND task_id = ? AND work_status <> ?')
-      .get(Number(batchId), taskId, 'cancelled');
-    if (!b) return { error: 'bad_batch', ok: false, message: 'そのぶんはこのカードにありません' };
-    return { value: b.id };
+    if (!rows.some((r) => r.id === Number(batchId))) {
+      return { error: 'bad_batch', ok: false,
+        message: 'そのぶんはこのカードの手元にありません (外に出したぶんの時間は測れません)' };
+    }
+    return { value: Number(batchId) };
   }
-  const rows = db.prepare(`SELECT id FROM f_iroha_task_batches
-    WHERE task_id = ? AND work_status <> 'cancelled'`).all(taskId);
   return { value: rows.length === 1 ? rows[0].id : null };
 }
 
