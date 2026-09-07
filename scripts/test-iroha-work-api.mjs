@@ -64,10 +64,10 @@ const HOST = `127.0.0.1:${port}`;
 const BASE = `http://${HOST}/apps/iroha-work`;
 
 /** 画面と同じヘッダで叩く (checkOrigin を通すため Origin を付ける) */
-async function post(pathname, body) {
+async function post(pathname, body, cookie) {
   const r = await fetch(BASE + pathname, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: `http://${HOST}`, Host: HOST },
+    headers: { 'Content-Type': 'application/json', Origin: `http://${HOST}`, Host: HOST, ...(cookie ? { Cookie: cookie } : {}) },
     body: JSON.stringify(body),
   });
   return { status: r.status, json: await r.json().catch(() => ({})) };
@@ -538,6 +538,42 @@ console.log('\n[預ける計画] GET /api/consign-plan (§AB-11 の 7b)');
   // ⭐書き込みの口ではない
   const w = await post('/api/consign-plan', {});
   ok(w.status === 404 || w.status === 405, '⭐POST は受けない (読むだけの画面)');
+}
+
+console.log('\n[人数だけの作業] POST /api/sessions/start-crew (§AB-10)');
+{
+  const t = upsertTaskFromImport({ notion_page_id: 'api-crew', status: 'not_started', facility_code: 'rehas',
+    destination_id: null, product_code: 'API-CREW', product_name: '人数の検査', qty: 100,
+    arrival_date: '2026-09-01', master_snapshot: { units_per_container: 10, process_count: 2 },
+  }, { batchId: 'test-api' }).id;
+  const ok200 = await post('/api/sessions/start-crew', { id: t, worker_id: S, facility_code: 'rehas', crew_size: 3 });
+  ok(ok200.status === 200 && ok200.json.ok, '職員ならはじめられる');
+  ok(ok200.json.session && ok200.json.session.crewSize === 3, '人数が返る');
+  ok(ok200.json.status === 'in_progress', '未着手のカードは作業中になる');
+  // 一覧に「誰が作業中か」が出る (router の渡し忘れを見る)
+  const st = await get('/api/state');
+  const card = (st.json.cards || []).find((c) => c.id === t);
+  ok(card && (card.active || []).length === 1, 'カードに作業中の記録が 1 件出る');
+  ok(card.active[0].worker_name === null && card.active[0].facility_code === 'rehas' && card.active[0].crew_size === 3,
+    '⭐名前は無く、拠点と人数が返る (画面が「パレット 3人」と描ける)');
+  ok((st.json.capabilities || []).includes('task.work.crew'), '職員には 人数だけの作業 の許可が出る');
+  // 断り方
+  const bad = await post('/api/sessions/start-crew', { id: t, worker_id: S, facility_code: 'workcenter', crew_size: 2 });
+  ok(bad.status === 400 && bad.json.error === 'bad_facility', '物を持ち帰る拠点は断る (400)');
+  const n0 = await post('/api/sessions/start-crew', { id: t, worker_id: S, facility_code: 'rehas', crew_size: 0 });
+  ok(n0.status === 400, '人数 0 は断る');
+  const noFac = await post('/api/sessions/start-crew', { id: t, worker_id: S });
+  ok(noFac.status === 400 && /どこ/.test(noFac.json.message || ''), '拠点を選ばなければ断る');
+  // 終わらせる (session_ids の口はそのまま使える)
+  const stop = await post('/api/sessions/stop', { id: t, worker_id: S, session_ids: [ok200.json.sessionId], reason: 'done' });
+  ok(stop.status === 200 && stop.json.ok, '⭐終わらせるのは今までの口でできる');
+  // 職員でない端末からは断る
+  sessionRole = null;
+  const dev2 = createDevice('検査用 iPad (人数)', 'test');
+  const asDev = await post('/api/sessions/start-crew', { id: t, worker_id: S, facility_code: 'rehas', crew_size: 2 },
+    'iw_device=' + dev2.token);
+  ok(asDev.status === 403, '⭐端末で入っただけ (職員モードなし) では 403 (' + asDev.status + ')');
+  sessionRole = 'admin';
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

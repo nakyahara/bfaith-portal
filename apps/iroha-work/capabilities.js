@@ -39,6 +39,12 @@ export const CAP = Object.freeze({
    * ⭐**職員だけ**。どこに何個預けるかは職員の判断で、利用者はボードで見るだけ
    */
   CONSIGN: 'task.consign',
+  /**
+   * 👥 人数だけの作業を記録する (要件 §AB-10)。パレット・ジョブサポは いろは の中で作業するが、
+   * 個人名は持たないので「拠点 × 何人」で 1 行にする。
+   * ⭐**職員だけ**。よその事業者の人数を記録する判断は職員がする
+   */
+  CREW_SESSION: 'task.work.crew',
 });
 
 const CAPS_NOTION = Object.freeze([CAP.STATUS_CHANGE, CAP.WORK_START, CAP.MEDIA_ADD, CAP.MASTER_EDIT, CAP.DAILY_REPORT]);
@@ -49,7 +55,7 @@ const CAPS_APP = Object.freeze([...CAPS_NOTION, CAP.CANCELLATION, CAP.REVIEW_CLE
  * 利用者の画面には札のボタンも計画の入口も外部出しのボタンも描かない (要件 §W-1 / 監修 F-5 2026-09-05)
  */
 /** まとめて棚入完了 (終了) も職員だけ — 利用者の画面にはボタンを描かない (中原さん 2026-09-06「棚入完了は職員のアカウントのみ」) */
-const CAPS_STAFF = Object.freeze([CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN, CAP.EXTERNAL_READY, CAP.BULK_STOCKED, CAP.CONSIGN]);
+const CAPS_STAFF = Object.freeze([CAP.PLAN_ASSIGN, CAP.FACILITY_ASSIGN, CAP.EXTERNAL_READY, CAP.BULK_STOCKED, CAP.CONSIGN, CAP.CREW_SESSION]);
 const CAPS_PREVIEW = Object.freeze([]);
 
 /**

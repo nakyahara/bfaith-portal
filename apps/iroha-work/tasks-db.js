@@ -5,7 +5,7 @@
  * 不変条件 (closed には close_reason/closed_at、止まっている理由 blocked_reason は未着手・作業中だけ …) は書く前に validateTaskInvariants で守る。
  * 状態変更は version の楽観ロック (2 台の iPad が同時に触っても後勝ちで壊さない) + 履歴 (f_iroha_app_events.task_id)。
  */
-import { getDB, startSessions, setMetaValue, logEvent, sourceOfTruth } from './db.js';
+import { getDB, startSessions, startCrewSession, setMetaValue, logEvent, sourceOfTruth } from './db.js';
 import {
   OPEN_STATUSES, CLOSE_REASONS, BLOCK_REASONS, BLOCK_LABEL, BLOCKABLE_STATUSES, LEGACY_ON_HOLD,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
@@ -1276,6 +1276,111 @@ export function _setStartTaskSessionHook(fn) { startTaskSessionHook = fn; }
  * @param worker 端末を操作している人 (状態変更の actor・ログに残る)
  * @param workers 実際に作業する人たち (複数可)。省略時は操作者ひとり
  */
+/**
+ * ⭐札を外したあとで開始に失敗したときの返し方 (Codex #1258 R1 中1)。
+ *
+ * better-sqlite3 の transaction は**ふつうに return すると確定する**。札を外してから
+ * 失敗を返すと、「はじめられないのに札だけ消えた」状態が残る。投げて外まで伝え、
+ * 呼び出し側の catch が taskResult を取り出して同じ答えを返す (画面から見た結果は変わらない)。
+ * 何も変えていなければ、そのまま返してよい。
+ */
+function failAfterBlockClear(result, clearedBlock) {
+  if (!clearedBlock) return result;
+  throw Object.assign(new Error(result.message || '作業をはじめられませんでした'), { taskResult: result });
+}
+
+/**
+ * 人数だけの作業の入力検査 (拠点と人数)。⭐**札を外すより先に**呼ぶ。
+ * startCrewSession の中でも同じことを見るが、あちらは「書く直前の最後の砦」。
+ */
+function checkCrewInput(db, facilityCode, crewSize) {
+  const n = Number(crewSize);
+  if (!Number.isSafeInteger(n) || n < 1 || n > 50) {
+    return { ok: false, error: 'bad_request', message: '人数は 1〜50 の整数で入れてください' };
+  }
+  const fac = db.prepare('SELECT code, external, offsite FROM f_iroha_facilities WHERE code = ? AND active = 1')
+    .get(String(facilityCode || ''));
+  if (!fac) return { ok: false, error: 'bad_facility', message: 'その拠点は選べません' };
+  if (!fac.external || fac.offsite) {
+    return { ok: false, error: 'bad_facility',
+      message: '人数だけで記録できるのは、いろはの中で作業する外部の事業者だけです' };
+  }
+  return null;
+}
+
+/**
+ * ⭐人数だけの作業をはじめる (要件 §AB-10)。パレット・ジョブサポ用。
+ *
+ * 個人の開始 (startTaskSession) と**同じ手順**を踏む — 止まっている札の確認、
+ * 未着手 → 作業中、手元のまとまりを作業中にする。違うのは記録の作り方だけ
+ * (個人名を持たず、拠点と人数で 1 行)。
+ *
+ * @param staff 操作した職員 (記録の「誰が押したか」。作業した人ではない)
+ */
+export function startTaskCrewSession({ taskId, staff, facilityCode, crewSize, batchId = null,
+  deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null }) {
+  const db = getDB();
+  const tx = db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    let t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
+    if (t.status === 'closed') {
+      return { ok: false, error: 'done_card', message: 'このカードは終了しています (やり直すなら職員が状態を戻してください)' };
+    }
+    // ⭐入力の検査は**札を外すより先に**する (Codex #1258 R1 中1)。
+    //   人数が 0 のような入力で、開始できないのに札だけ消える、を起こさない
+    const pre = checkCrewInput(db, facilityCode, crewSize);
+    if (pre) return pre;
+    let clearedBlock = false;
+    if (t.blocked_reason) {
+      if (!clearBlock) {
+        const b = blockedOf(t);
+        return { ok: false, error: 'blocked', blocked: b, task: t,
+          message: `まだ「${b.label}」で止まっています。解消していれば、確認してから始められます` };
+      }
+      if (expectVersion == null) return { ok: false, error: 'bad_request', message: '確認した版 (expect_version) が必要です (画面を更新してください)' };
+      if (Number(expectVersion) !== t.version) {
+        return { ok: false, error: 'conflict', current: t, blocked: blockedOf(t),
+          message: '止まっている理由が変わっています。もう一度確かめてください' };
+      }
+      const c = clearTaskBlockInTx(db, t, { via: 'start', actor: `${staff.display_name} (いろはアプリ)`,
+        workerId: staff.id, workerName: staff.display_name, deviceLabel });
+      if (!c.ok) return c;
+      t = c.task;
+      clearedBlock = true;
+    }
+    const r = startCrewSession({ taskId: t.id, facilityCode, crewSize, batchId,
+      productCode: t.product_code, title: t.product_name, deviceLabel,
+      masterSnapshot: snapshotOf ? snapshotOf(t) : undefined });
+    // ⭐記録には**押した職員**と「どの拠点の何人か」を残す。作業した人の名前は持たない
+    if (!r.already) {
+      safeLogTaskEvent({ taskId: t.id, action: 'session_start', workerId: staff.id, workerName: staff.display_name,
+        deviceLabel, to: `crew ${facilityCode} ${crewSize}人`, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    }
+    // ⭐札を外したあとで開始に失敗したら、**外したことごと戻す**。ふつうに return すると
+    //   このトランザクションは成功として確定し、「はじめられないのに札だけ消えた」が残る (Codex R1 中1)
+    if (!r.ok) return failAfterBlockClear(r, clearedBlock);
+    if (startTaskSessionHook) startTaskSessionHook(t);
+    startHomeBatches(db, t.id, utcNow());
+    let task = t;
+    if (t.status === 'not_started') {
+      const cs = changeTaskStatus({ taskId: t.id, to: 'in_progress', expectVersion: t.version,
+        actor: `${staff.display_name} (いろはアプリ)`, workerId: staff.id, workerName: staff.display_name, deviceLabel });
+      if (!cs.ok) throw Object.assign(new Error(cs.message || '状態を変更できませんでした'), { taskResult: cs });
+      task = cs.task;
+    }
+    return { ok: true, already: !!r.already, session: r.session, sessionId: r.session.id,
+      startedAt: r.session.startedAt, task: getTask(task.id) };
+  });
+  try {
+    return tx.immediate();
+  } catch (e) {
+    if (e && e.taskResult) return e.taskResult;
+    throw e;
+  }
+}
+
 export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null }) {
   const db = getDB();
   const crew = (Array.isArray(workers) && workers.length) ? workers : [worker];
@@ -1289,6 +1394,7 @@ export function startTaskSession({ taskId, worker, workers = null, deviceLabel =
     }
     // ⭐止まっている札が付いたまま始めない。画面は「まだ○○で止まっています。解消しましたか?」を出し、
     //   「はい」なら clear_block: true で送り直す → 同じトランザクションで札を外してから始める (案A)
+    let clearedBlock = false;
     if (t.blocked_reason) {
       if (!clearBlock) {
         const b = blockedOf(t);
@@ -1305,6 +1411,7 @@ export function startTaskSession({ taskId, worker, workers = null, deviceLabel =
       const c = clearTaskBlockInTx(db, t, { via: 'start', actor: `${worker.display_name} (いろはアプリ)`, workerId: worker.id, workerName: worker.display_name, deviceLabel });
       if (!c.ok) return c;
       t = c.task;
+      clearedBlock = true;
     }
     const r = startSessions({
       taskId: t.id, productCode: t.product_code, title: t.product_name, workers: crew, deviceLabel,
@@ -1317,7 +1424,8 @@ export function startTaskSession({ taskId, worker, workers = null, deviceLabel =
       safeLogTaskEvent({ taskId: t.id, action: 'session_start', workerId: w.id, workerName: w.display_name,
         deviceLabel, to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
     }
-    if (!r.ok) return r;
+    // ⭐札を外したあとで開始に失敗したら、外したことごと戻す (人数だけの開始と同じ — Codex R1 中1)
+    if (!r.ok) return failAfterBlockClear(r, clearedBlock);
     if (startTaskSessionHook) startTaskSessionHook(t);
     // ⭐「作業をはじめる」= 手元 (物を持ち帰らない拠点) のまとまりも作業中にする。
     //   カードが既に作業中でも通す — 外部に渡した時点でカードだけ先に作業中になっているため (Codex R2 中2)。

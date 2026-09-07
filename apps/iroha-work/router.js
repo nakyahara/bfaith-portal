@@ -33,7 +33,7 @@ import {
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
-import { countTasksByStatus, listTasksNeedingReview, listOrphans, listFacilities } from './tasks-db.js';
+import { countTasksByStatus, listTasksNeedingReview, listOrphans, listFacilities, startTaskCrewSession } from './tasks-db.js';
 import { OPEN_STATUSES } from './tasks.js';
 import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, buildConsignPlan, buildFacilityView, facilityCapacityGuard, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
@@ -1319,11 +1319,22 @@ router.get('/api/daily-report', api((req, res) => {
     const en = s.ended_at ? Date.parse(s.ended_at) : Math.min(nowMs, dayEnd);
     const overlapMs = Math.min(en, dayEnd) - Math.max(st, dayStart);
     if (!(overlapMs > 0)) continue;   // その日に 1 秒もかかっていない (未来の日・境界ちょうどに終わった記録) は数えない (Codex R2 #4)
-    const sec = Math.floor(overlapMs / 1000);
+    // ⭐実測は 人時 = 秒 × 人数 (要件 §AB-10)。個人は crew_size = 1 なので今までと同じ数字
+    const heads = s.worker_id == null ? (s.crew_size || 1) : 1;
+    const sec = Math.floor(overlapMs / 1000) * heads;
     const live = !s.ended_at && isToday;
-    const key = Number(s.worker_id);
-    if (!byWorker.has(key)) byWorker.set(key, { worker_id: key, worker_name: s.worker_name, total_seconds: 0, live_seconds: 0, active: 0, sessions: 0, items: new Map() });
+    // ⭐人数だけの記録には worker_id が無い。Number(null) = 0 でまとめると、
+    //   拠点の違うぶんが 1 人ぶんに潰れて名前も出ない (要件 §AB-10)
+    const key = s.worker_id == null ? 'f:' + s.facility_code : 'w:' + Number(s.worker_id);
+    if (!byWorker.has(key)) {
+      byWorker.set(key, { worker_id: s.worker_id == null ? null : Number(s.worker_id),
+        worker_name: s.worker_name || (facilityNameOf(s.facility_code) + ' ' + heads + '人'),
+        facility_code: s.facility_code || null, heads,
+        total_seconds: 0, live_seconds: 0, active: 0, sessions: 0, items: new Map() });
+    }
     const wv = byWorker.get(key);
+    // 同じ拠点が日に何度か作業したら、いちばん多かった人数を「何人でやったか」とする (延べにしない)
+    if (heads > wv.heads) { wv.heads = heads; wv.worker_name = facilityNameOf(s.facility_code) + ' ' + heads + '人'; }
     const ck = s.task_id != null ? `t${s.task_id}` : `p${s.page_id}`;
     seenCards.add(ck);
     if (!wv.items.has(ck)) wv.items.set(ck, { task_id: s.task_id, page_id: s.page_id, title: s.title_snapshot || '(名称なし)', product_code: s.product_code, seconds: 0, live_seconds: 0, sessions: 0, active: 0 });
@@ -1338,7 +1349,9 @@ router.get('/api/daily-report', api((req, res) => {
   res.json({
     ok: true, date, workers, truncated: !!page.truncated,
     totals: {
-      seconds: workers.reduce((a, x) => a + x.total_seconds, 0), workers: workers.length,
+      seconds: workers.reduce((a, x) => a + x.total_seconds, 0),
+      // ⭐人数だけの記録は 1 行で何人ぶんにもなる。行数ではなく人数で数える
+      workers: workers.reduce((a, x) => a + (x.heads || 1), 0),
       cards: seenCards.size,
       active: workers.reduce((a, x) => a + x.active, 0),
     },
@@ -1347,6 +1360,12 @@ router.get('/api/daily-report', api((req, res) => {
 }));
 
 /** ラベル待ちの一覧。読むだけなので切替前でも開ける (登録・更新はアプリ正本のみ) */
+/** 日報に出す拠点の名前 (人数だけの記録には個人名が無い) */
+function facilityNameOf(code) {
+  const f = listFacilities(true).find((x) => x.code === code);
+  return f ? f.name : (code || '拠点不明');
+}
+
 router.get('/api/label-waits', api((req, res) => {
   const taskId = req.query.task_id == null ? null : parseTaskId(req.query.task_id);
   if (req.query.task_id != null && taskId == null) return res.status(400).json(BAD_TASK_ID);
@@ -2009,6 +2028,46 @@ function startSessionApp(req, res, worker, crew) {
   res.json({ ok: true, already: !!r.already, sessions: r.sessions, sessionId: r.sessionId, startedAt: r.startedAt,
     status: r.task.status, task: publicTask(r.task), serverNow: new Date().toISOString() });
 }
+
+/**
+ * 👥 人数だけの作業をはじめる (要件 §AB-10)。パレット・ジョブサポ用。**職員だけ**。
+ *
+ * ⭐個人の開始 (/api/sessions/start) とは別の口にする。人を選ぶ経路は現場で毎日使われていて、
+ *   ここに人数の分岐を混ぜると、選び忘れ・二重記録の見張りがどちらにも効かなくなる。
+ * ⭐Notion が正本のうちは使えない (まとまり・拠点はアプリ正本の仕組み)。
+ */
+router.post('/api/sessions/start-crew', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  // ⭐中身を先に見る (不正な要求で職員モードだけ開いてしまわないように)
+  const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  if (typeof req.body?.facility_code !== 'string' || !req.body.facility_code) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: 'どこの人数かを選んでください' });
+  }
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  if (isClosedCardId(taskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
+  const snapshotOf = (t) => {
+    if (!t.product_code) return null;
+    let snap = null;
+    try { snap = t.master_snapshot ? JSON.parse(t.master_snapshot) : null; } catch { /* master だけで合成 */ }
+    const wm = getDB().prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(String(t.product_code).trim().toLowerCase());
+    return masterOfTask(wm || null, snap);
+  };
+  const r = startTaskCrewSession({
+    taskId, staff: gate.worker, facilityCode: req.body.facility_code, crewSize: req.body?.crew_size,
+    batchId: req.body?.batch_id ?? null, deviceLabel: deviceLabelOf(req), snapshotOf,
+    clearBlock: req.body?.clear_block === true, expectVersion: req.body?.expect_version ?? null,
+  });
+  if (!r.ok) {
+    const http = r.error === 'bad_request' || r.error === 'bad_facility' || r.error === 'bad_batch' ? 400
+      : r.error === 'not_found' ? 404 : 409;
+    return res.status(http).json({ ...r, task: r.task ? publicTask(r.task) : undefined,
+      current: r.current ? publicTask(r.current) : undefined });
+  }
+  res.json({ ok: true, already: !!r.already, session: r.session, sessionId: r.sessionId, startedAt: r.startedAt,
+    status: r.task.status, task: publicTask(r.task), staff_mode: staffModeOf(req), serverNow: new Date().toISOString() });
+}));
 
 /** 作業終了 (done) / 中断 (pause)。時間はサーバー時刻の差分で確定 */
 router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
