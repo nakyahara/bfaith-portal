@@ -368,14 +368,8 @@ export function requiredInputs({ mall, fulfillment }) {
  */
 export function isRankEligible(row) {
   const { required, notApplicable } = requiredInputs(row);
-  if (row.calculation_status !== 'ok') return { eligible: false, reason: `calculation_${row.calculation_status}` };
-  if (row.scenario_fit !== 'ok') return { eligible: false, reason: 'scenario_undecidable' };
-  // Inactive は計算・表示するが既定ランキング外 (中原さん決定)
-  if (row.listing_status !== 'active') return { eligible: false, reason: `listing_${row.listing_status}` };
-  // 自社モール価格であること (Amazon は my_price。buybox 代替は採用しない)
-  if (row.price_source && row.price_source !== 'own_listing') return { eligible: false, reason: 'not_own_price' };
-  // FBM の送料収入不明は参考値 (§15-2)
-  if (row.shipping_revenue_status === 'unknown') return { eligible: false, reason: 'shipping_revenue_unknown' };
+  // 🚨 具体的な理由を先に返す。calculation_status を先に見ると、
+  //    「なぜ計算できなかったか」が calculation_incomplete に埋もれる (Codex R2)
   for (const input of required) {
     const status = row[`${input}_status`];
     if (status !== 'ok') return { eligible: false, reason: `${input}_${status || 'missing'}` };
@@ -387,6 +381,15 @@ export function isRankEligible(row) {
       return { eligible: false, reason: `${input}_unexpected_${status}` };
     }
   }
+  // FBM の送料収入不明は参考値 (§15-2)
+  if (row.shipping_revenue_status === 'unknown') return { eligible: false, reason: 'shipping_revenue_unknown' };
+  // 自社モール価格であること (Amazon は my_price。buybox 代替は採用しない)
+  if (row.price_source && row.price_source !== 'own_listing') return { eligible: false, reason: 'not_own_price' };
+  // Inactive は計算・表示するが既定ランキング外 (中原さん決定)
+  if (row.listing_status !== 'active') return { eligible: false, reason: `listing_${row.listing_status}` };
+  if (row.scenario_fit !== 'ok') return { eligible: false, reason: 'scenario_undecidable' };
+  // 入力は揃っているのに計算が通らなかった場合だけ、ここに落ちる
+  if (row.calculation_status !== 'ok') return { eligible: false, reason: `calculation_${row.calculation_status}` };
   return { eligible: true };
 }
 
