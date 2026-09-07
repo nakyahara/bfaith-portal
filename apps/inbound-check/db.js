@@ -883,10 +883,14 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
   }
 
   const dupResult = dup => {
-    // ⭐**「中身が同じ」は取得が生きている証拠**なので、active バッチに確認時刻を残す (Codex #1231 R1 中)。
-    //   これが今日なら「新しい入荷受付が無いだけ」= 正常。無ければ「取りに行けていない」= 要調査。
-    //   区別しないと、取得が止まった日も「新しい受付はありません」と出て静かに気づけなくなる
-    if (dup.status === 'active') {
+    // ⭐**「中身が同じ」は共有ドライブまで取りに行けた証拠**なので、active バッチに確認時刻を残す
+    //   (Codex #1231 R1 中)。これが今日なら「新しい入荷受付が無いだけ」= 正常。
+    //   無ければ「取りに行けていない」= 要調査。区別しないと、取得が止まった日も
+    //   「新しい受付はありません」と出て静かに気づけなくなる。
+    //   🚨**共有ドライブから取ってきたときだけ**。手元に保存していた古い CSV を管理画面から
+    //     再アップロードしただけで「本日も共有ドライブを確認」と出したら、根拠にならない
+    //     (Codex #1231 R2 中)
+    if (dup.status === 'active' && (source === 'auto' || source === 'drive_retry')) {
       db.prepare('UPDATE f_inbound_check_batches SET last_verified_at = ?, last_verified_source_at = ? WHERE id = ?')
         .run(utcNow(), genAt, dup.id);
     }
@@ -1423,15 +1427,31 @@ export function productImageMap(productIds) {
  *   (miniPC / rclone / Drive の故障 = 要調査) は**別の事実**。同じ表示にすると、取得が止まった日も
  *   「新しい受付はありません」と出て静かに気づけなくなる (Codex #1231 R1 中)。
  *
- * @returns {null | {from, checkedAt, checkedToday}} 引き継いでいなければ null (= 本日ぶんを取り込めている)
+ * 🚨 ただし **Render から分かるのは「共有ドライブまで取りに行けたか」までで、
+ *   「miniPC が今日ロジザードから出し直したか」は分からない**。rclone は中身が同じなら転送しないので、
+ *   正常でも Drive の更新日時 (`sourceAt`) は動かない = 古いままでも異常とは限らない (Codex #1231 R2 高)。
+ *   そこで `sourceAt` / `sourceToday` を**そのまま返して管理画面に事実として出し**、
+ *   miniPC が動いたかの判定は jobs-monitor の `logizard-nyuka-csv` dead-man に任せる。
+ *
+ * @returns {null | {from, checkedAt, checkedToday, sourceAt, sourceToday}}
+ *   引き継いでいなければ null (= 本日ぶんを取り込めている)
  */
 export function carryStatus(batch) {
   if (!batch || !batch.carried_from || batch.carried_from === batch.work_date) return null;
+  const today = workDateJst();
+  const isToday = (iso) => {
+    if (!iso) return false;
+    const d = new Date(iso);
+    return !Number.isNaN(d.getTime()) && workDateJst(d) === today;
+  };
   const at = batch.last_verified_at || null;
+  const src = batch.last_verified_source_at || batch.csv_generated_at || null;
   return {
     from: batch.carried_from,
     checkedAt: at,
-    checkedToday: !!(at && workDateJst(new Date(at)) === workDateJst()),
+    checkedToday: isToday(at),
+    sourceAt: src,               // 最後に読んだ CSV の更新時刻 (Drive の modifiedTime)
+    sourceToday: isToday(src),   // ⚠ false でも異常とは限らない (rclone は中身が同じなら転送しない)
   };
 }
 
@@ -1505,6 +1525,7 @@ export function getState() {
     carried_from: carry ? carry.from : null,
     import_checked_at: carry ? carry.checkedAt : null,
     import_checked_today: carry ? carry.checkedToday : true,
+    import_source_at: carry ? carry.sourceAt : null,
     totals: { lines: lines.length, checked, partial, undecided, toIroha: ir ? ir.c : 0, toIrohaQty: ir ? Number(ir.q) : 0 },
   };
 }

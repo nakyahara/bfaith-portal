@@ -29,7 +29,7 @@ const {
   getDB, importCsv, getActiveBatch, getState, listEvents, eventsCsv, cleanupOld,
   applyQuantityEvents, listQuantityEvents, finalizeLine, reopenLine, listDestinations, createTables, quantitySum,
   createDevice, verifyDevice, revokeDevice, listDevices, listWorkers, getWorker, productInfoMap, workDateJst,
-  rollOverWorkDate, setPendingExpiry, listImportLog,
+  rollOverWorkDate, carryStatus, setPendingExpiry, listImportLog,
 } = dbMod;
 
 let pass = 0, fail = 0;
@@ -580,7 +580,7 @@ console.log('\n[10] 業務日の繰り越し (前日のやり残しを翌日も�
   // 🚨同じ内容の CSV は取込拒否のままでよいが、業務日の繰り越しだけは効かせる
   db.prepare("UPDATE f_inbound_check_batches SET work_date = date(work_date, '-1 day') WHERE id = ?").run(bid);
   const dup = importCsv(makeCsv([row('AR20', 1, 'CARRY-A', 10), row('AR20', 2, 'CARRY-B', 4)]),
-    { fileName: 'carry1.csv', generatedAt: '2027-02-02T00:00:00Z' });
+    { fileName: 'carry1.csv', source: 'auto', generatedAt: '2027-02-02T00:00:00Z' });
   ok(!dup.ok && dup.error === 'duplicate_file', '同じ内容の CSV は取込拒否のまま');
   ok(getActiveBatch().work_date === workDateJst(), '取込が拒否されても業務日は今日に進む (入力ロックが残らない)');
   ok(getState().lines.find(l => l.line_key === 'AR20|1|1').found_qty === 10, '拒否された取込で数が消えない');
@@ -596,13 +596,45 @@ console.log('\n[10] 業務日の繰り越し (前日のやり残しを翌日も�
     '本日一度も読めていなければ false (画面は「取りに行けていません」= 取得が止まっている疑い)');
   db.prepare("UPDATE f_inbound_check_batches SET last_verified_at = date('now', '-3 day') || 'T00:00:00.000Z' WHERE id = ?").run(bid);
   ok(getState().import_checked_today === false, '古い確認時刻は「本日読めた」に数えない');
+
+  // 🚨手元の古い CSV を管理画面から再アップロードしただけでは「共有ドライブを確認した」根拠にならない
+  //   (Codex #1231 R2 中)。書き換えるのは共有ドライブから取ってきたとき (auto / drive_retry) だけ
+  db.prepare('UPDATE f_inbound_check_batches SET last_verified_at = NULL, last_verified_source_at = NULL WHERE id = ?').run(bid);
+  const dupManual = importCsv(makeCsv([row('AR20', 1, 'CARRY-A', 10), row('AR20', 2, 'CARRY-B', 4)]),
+    { fileName: 'carry1.csv', source: 'manual_upload', generatedAt: '2027-02-03T00:00:00Z' });
+  ok(!dupManual.ok && dupManual.error === 'duplicate_file' && getActiveBatch().last_verified_at == null,
+    '手動アップロードの重複では「共有ドライブを確認した」時刻を書かない');
+  const dupAuto = importCsv(makeCsv([row('AR20', 1, 'CARRY-A', 10), row('AR20', 2, 'CARRY-B', 4)]),
+    { fileName: 'carry1.csv', source: 'drive_retry', generatedAt: '2027-02-03T00:00:00Z' });
+  ok(!dupAuto.ok && getActiveBatch().last_verified_at, '🚚 いま取りに行く (drive_retry) の重複では書く');
+
+  // 🚨 rclone は中身が同じなら転送しないので、Drive の更新時刻が古くても異常とは限らない。
+  //    事実として持って管理画面に出す (判定はしない — Render からは miniPC が動いたか分からない)
+  const cs = carryStatus(getActiveBatch());
+  ok(cs.sourceAt === '2027-02-03T00:00:00.000Z' && cs.sourceToday === false && cs.checkedToday === true,
+    'sourceAt (読んだ CSV の更新時刻) と checkedAt (読めた時刻) を別々に持つ');
   // superseded バッチへの重複は確認時刻を書かない (過去の再アップロードで active の状態を動かさない)
   const bx = importCsv(makeCsv([row('AR21', 1, 'CARRY-X', 2)]), { fileName: 'x.csv', generatedAt: '2027-02-04T00:00:00Z' });
   ok(bx.ok && getActiveBatch().last_verified_at == null, '前提: 別の内容を取り込む (carry1 は superseded・確認時刻なし)');
   const dupOld = importCsv(makeCsv([row('AR20', 1, 'CARRY-A', 10), row('AR20', 2, 'CARRY-B', 4)]),
-    { fileName: 'carry1.csv', generatedAt: '2027-02-05T00:00:00Z' });
+    { fileName: 'carry1.csv', source: 'auto', generatedAt: '2027-02-05T00:00:00Z' });
   ok(!dupOld.ok && dupOld.error === 'duplicate_file' && getActiveBatch().last_verified_at == null,
     '過去バッチと同じ内容の再アップロードでは active の確認時刻を動かさない');
+}
+
+// ─── 管理画面でも繰り越す (Codex #1231 R1 中の再発防止) ───
+// iPad が1台も開かれていない朝に管理画面だけ見ると、繰り越しが走らず案内が出ないままだった
+console.log('\n[11] 管理画面の入口でも業務日を繰り越す');
+{
+  const src = fs.readFileSync(new URL('../apps/inbound-check/router.js', import.meta.url), 'utf8');
+  const admin = src.slice(src.indexOf("router.get('/admin'"), src.indexOf('batches: listBatches(30)'));
+  ok(/rollOverWorkDate\(\)/.test(admin), '/admin のハンドラが rollOverWorkDate() を呼ぶ');
+  ok(admin.indexOf('rollOverWorkDate()') < admin.indexOf('getActiveBatch()'), '繰り越しは active バッチを読む前');
+  const ejsSrc = fs.readFileSync(new URL('../apps/inbound-check/views/admin.ejs', import.meta.url), 'utf8');
+  ok(/carry\.checkedToday/.test(ejsSrc) && /取りに行けていません/.test(ejsSrc),
+    '管理画面が「読めた日」と「取りに行けていない日」を言い分ける');
+  ok(/rclone は中身が同じなら転送しない/.test(ejsSrc),
+    'Drive の更新時刻が古いだけでは異常でないことを書いてある (誤った切り分けを誘導しない)');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);
