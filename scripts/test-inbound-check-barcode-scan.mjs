@@ -19,6 +19,9 @@
  *      wasmBinary を直接注入するテストは、いちばん壊れやすいこの経路を通らない (Codex #1233 R1 P2)
  *   7. 安全弁の**挙動** (2フレーム一致 / 例外で連続が切れる / 8回で打ち切り)。
  *      「その行が書いてあるか」を正規表現で見るだけでは守れない (Codex #1233 R2)
+ *   8. **映像が届いているかの見張り** (実時間)。1コマも来ない / 途中で止まった のどちらも打ち切る。
+ *      🚨「解析できたか」で見てはいけない — 黒一色でも止まっていてもデコード結果は空配列で返るので、
+ *      正常扱いされて安全弁が発火しない (Codex #1235 R1 P1)
  */
 import fs from 'fs';
 import path from 'path';
@@ -265,20 +268,6 @@ console.log('\n[7] 採否の判断 (public/js/barcode-scan-decide.js)');
   ok(run([codes('4901234567894'), codes(), codes('4901234567894')]).join() === 'continue,continue,continue',
     '読めないフレームを挟んでも連続が切れる');
 
-  // 🚨 映像が1コマも来ないまま黒い画面で回り続けない (2026-09-07 実機)
-  const idles = Array.from({ length: D.MAX_IDLE_STREAK }, () => ({ kind: 'idle' }));
-  const ia = run(idles);
-  ok(ia[ia.length - 1] === 'abort' && ia.slice(0, -1).every((x) => x === 'continue'),
-    `映像が ${D.MAX_IDLE_STREAK} コマ (約8秒) 来なければ打ち切る`);
-  {
-    let st = D.initialState();
-    let last = null;
-    for (const e of idles) { last = D.step(st, e); st = last.state; }
-    ok(last.reason === 'no_video', '打ち切りの理由が no_video (映像が出ない案内を出せる)');
-  }
-  ok(run([...idles.slice(0, D.MAX_IDLE_STREAK - 1), codes('4901234567894'), ...idles.slice(0, D.MAX_IDLE_STREAK - 1)])
-    .every((x) => x === 'continue'), '1コマでも映像が来たら数え直し (起動直後の待ちで止めない)');
-
   const errs = Array.from({ length: D.MAX_FAIL_STREAK }, () => ({ kind: 'error' }));
   const a = run(errs);
   ok(a[a.length - 1] === 'abort' && a.slice(0, -1).every((x) => x === 'continue'),
@@ -289,8 +278,6 @@ console.log('\n[7] 採否の判断 (public/js/barcode-scan-decide.js)');
     for (const e of errs) { last = D.step(st, e); st = last.state; }
     ok(last.reason === 'decode', '打ち切りの理由が decode (映像が出ない case と言い分けられる)');
   }
-  ok(D.MAX_FAIL_STREAK < D.MAX_IDLE_STREAK,
-    '解析の失敗のほうが先に鳴る (映像は出ているのに読めない、を先に知らせる)');
   ok(run([...errs.slice(0, D.MAX_FAIL_STREAK - 1), codes('4901234567894'), ...errs.slice(0, D.MAX_FAIL_STREAK - 1)])
     .every((x) => x === 'continue'), '途中で1回でも解析できたら失敗の数え直し (たまの失敗で止めない)');
 
@@ -304,8 +291,43 @@ console.log('\n[7] 採否の判断 (public/js/barcode-scan-decide.js)');
   ok(D.pickValue([]) === null && D.pickValue(null) === null, '空でも落ちない');
 }
 
-// ─── 8. 画面が安全弁を使っているか (退行防止) ──────────────────────────────
-console.log('\n[8] 画面が安全弁を通している (退行防止)');
+// ─── 8. 映像が届いているかの見張り (実時間) ───────────────────────────────
+// 🚨 2026-09-07 実機の症状 (readyState は進んだが表示は黒) をそのまま再発させないための下限。
+//    デコード結果で判断すると、黒一色でも「見つからない (空配列)」で返るので永久に正常扱いになる
+console.log('\n[8] 映像が届いているかの見張り');
+{
+  const src = fs.readFileSync(path.join(ROOT, 'public/js/barcode-scan-decide.js'), 'utf8');
+  const sandbox = {};
+  new Function('globalThis', 'with (globalThis) { ' + src + ' }')(sandbox);
+  const D = sandbox.BarcodeScanDecide;
+  const T = D.NO_VIDEO_TIMEOUT_MS;
+  ok(T >= 5000 && T <= 15000, `打ち切りまでの時間が現実的 (${T}ms)`);
+
+  // ① 1コマも来ない (今回の実機症状)
+  const w0 = D.newVideoWatch(0);
+  ok(D.videoStalled(w0, T - 1) === false && D.videoStalled(w0, T) === true,
+    '映像が1コマも来なければ打ち切る (デコーダの読み込みが終わっていなくても効く)');
+
+  // ② 途中で止まった (1コマ出たあと固まる)
+  const w1 = D.noteFrame(D.newVideoWatch(0), 3000);
+  ok(D.videoStalled(w1, 3000 + T - 1) === false && D.videoStalled(w1, 3000 + T) === true,
+    '1コマ来たあと止まったら、その時点から数えて打ち切る');
+  ok(D.videoStalled(w1, T) === false, '1コマ来ていれば、開始からの経過だけでは打ち切らない');
+
+  // ③ 届き続けている間は打ち切らない
+  let w2 = D.newVideoWatch(0);
+  let stalled = false;
+  for (let t = 250; t <= 60000; t += 250) { w2 = D.noteFrame(w2, t); if (D.videoStalled(w2, t)) stalled = true; }
+  ok(!stalled, '映像が届き続けている間は打ち切らない (60秒回しても発火しない)');
+
+  // ④ 解析できなかった (空配列) は「映像が来た」ことの証明にならない
+  const after = D.step(D.initialState(), { kind: 'codes', codes: [] });
+  ok(after.action === 'continue' && !('idleStreak' in after.state),
+    '🚨 デコード結果の空配列は見張りに影響しない (黒い映像を正常扱いしない)');
+}
+
+// ─── 9. 画面が安全弁を使っているか (退行防止) ──────────────────────────────
+console.log('\n[9] 画面が安全弁を通している (退行防止)');
 {
   const html = fs.readFileSync(path.join(ROOT, 'apps/inbound-check/views/products.html'), 'utf8');
   ok(/fireImmediately:\s*true/.test(html),
@@ -330,7 +352,25 @@ console.log('\n[8] 画面が安全弁を通している (退行防止)');
     '🚨 画面に出してから stream をつなぐ (display:none のまま挿すと iOS は再生を始めない)');
   ok(/await v\.play\(\)/.test(html) && /v\.muted = true/.test(html) && /v\.playsInline = true/.test(html),
     '🚨 autoplay 属性に頼らず play() を呼ぶ + muted / playsInline をプロパティでも立てる');
-  ok(/no_video/.test(html), '映像が来ないときの案内を出し分けている');
+  ok(/カメラの映像が出ませんでした/.test(html), '映像が来ないときの案内を出している');
+
+  // 🚨 Codex #1235 R1: 見張りは「デコーダの読み込みより前」に始まっていないと、
+  //    wasm の取得が固まったときにカメラを掴んだまま無期限に止まる
+  const watchAt = html.indexOf('scanWatchTimer = setInterval(');
+  ok(watchAt > 0 && watchAt < loadAt,
+    '🚨 映像の見張りをデコーダ読み込みより前に始めている (wasm が固まってもカメラを掴んだままにしない)');
+  ok(/BarcodeScanDecide\.videoStalled\(/.test(html) && /v\.currentTime !== lastVideoTime/.test(html),
+    '🚨 新しいコマが届いたかで判定している (解析できたかで見ない)');
+  ok(/if \(vw && vh && noteFrameIfNew\(\)\)/.test(html),
+    '新しいコマのときだけ解析する (同じコマを2回読んで「2回一致」にしない)');
+  const stopFn = html.slice(html.indexOf('function stopScan()'), html.indexOf('async function onScanned'));
+  ok(/clearInterval\(scanWatchTimer\)/.test(stopFn), 'stopScan が見張りを止める (閉じた後に鳴らない)');
+  // 閉じた直後にデコーダ読み込みが失敗しても、後からエラーを残さない
+  const catchAt = html.indexOf('catch (e) {', loadAt);
+  const catchBody = html.slice(catchAt, catchAt + 400);
+  ok(/gen !== scanGen/.test(catchBody) && catchBody.indexOf('gen !== scanGen') < catchBody.indexOf('banner('),
+    '🚨 デコーダの失敗より先に「もう閉じられたか」を見る (閉じた後にエラーだけ残さない)');
+  ok(/playError = playError \|\| e/.test(html), 'あとから来た play() の失敗も捨てない (現場調査に使う)');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

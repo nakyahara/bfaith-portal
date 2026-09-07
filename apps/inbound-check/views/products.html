@@ -280,6 +280,8 @@
       tryHarder: true,
       maxNumberOfSymbols: 1,
     };
+    // 実時間 (端末の時計変更に影響されない)。映像の見張りに使う
+    const now = () => (window.performance && performance.now ? performance.now() : Date.now());
     // 読み取り枠 (映像に対する割合)。**画面に描く枠と、切り出す範囲の両方をここから作る**
     const GUIDE = { x: 0.07, y: 0.31, w: 0.86, h: 0.38 };
     function layoutGuide() {
@@ -316,7 +318,7 @@
       return zxingPromise;
     }
 
-    let scanStream = null, scanTimer = null, scanStarting = false, scanGen = 0, scanCanvas = null;
+    let scanStream = null, scanTimer = null, scanStarting = false, scanGen = 0, scanCanvas = null, scanWatchTimer = null;
     async function startScan() {
       if (scanStarting || scanStream) return;      // 連打で getUserMedia が二重に走ると、先の stream を止められなくなる
       const gen = ++scanGen;                       // カメラが返ってくる前に画面を離れたかを見分ける
@@ -360,11 +362,12 @@
       $('#scanBox').classList.add('on');
       // 🚨 枠の % と映像の % を一致させる。**入れ物の縦横比を実際の映像に合わせて object-fit: contain**
       //    にしておけば、切り取り (cover) が起きないので画面の枠 = 解析する範囲になる
+      let playError = null;   // 現場調査に使うので、あとから来た失敗も捨てない (Codex #1235 R1 P3)
       v.onloadedmetadata = () => {
         const st = $('#scanStage');
         if (st && v.videoWidth && v.videoHeight) st.style.aspectRatio = v.videoWidth + ' / ' + v.videoHeight;
         layoutGuide();
-        v.play().catch(() => { /* 下の見張りが拾う */ });   // iOS はここでもう一度必要なことがある
+        v.play().catch((e) => { playError = playError || e; });   // iOS はここでもう一度必要なことがある
       };
       layoutGuide();
       // 属性だけでなくプロパティでも立てる (iOS が自動再生を許す条件)
@@ -372,14 +375,41 @@
       v.playsInline = true;
       v.srcObject = scanStream;
       // 🚨 autoplay 属性だけに頼らない。**明示的に play() する**
-      let playError = null;
-      try { await v.play(); } catch (e) { playError = e; }   // 失敗しても続ける (映像が来ないことは下の見張りが拾う)
+      try { await v.play(); } catch (e) { playError = playError || e; }   // 失敗しても続ける (下の見張りが拾う)
       if (!scanStream || gen !== scanGen) { endStarting(); return; }
+
+      // 🚨🚨 **映像の見張りは、デコーダの読み込みを待たずにここで始める** (Codex #1235 R1 P1)。
+      //   フレームループの中で見ていると、wasm の取得が遅い/固まったときに
+      //   「読み取りの準備をしています…」のままカメラを掴んで無期限に止まる。
+      //   判定は **新しいコマが届いたか** (currentTime が進んだか)。解析できたかで見てはいけない —
+      //   映像が黒一色でも止まっていても、デコード結果は「見つからない (空配列)」で返ってくるため
+      let videoWatch = BarcodeScanDecide.newVideoWatch(now());
+      let lastVideoTime = -1;
+      const noteFrameIfNew = () => {
+        if (v.readyState >= 2 && v.videoWidth && v.videoHeight && v.currentTime !== lastVideoTime) {
+          lastVideoTime = v.currentTime;
+          videoWatch = BarcodeScanDecide.noteFrame(videoWatch, now());
+          return true;
+        }
+        return false;
+      };
+      clearInterval(scanWatchTimer);
+      scanWatchTimer = setInterval(() => {
+        if (!scanStream || gen !== scanGen) { clearInterval(scanWatchTimer); scanWatchTimer = null; return; }
+        noteFrameIfNew();
+        if (!BarcodeScanDecide.videoStalled(videoWatch, now())) return;
+        stopScan();
+        banner('err', 'カメラの映像が出ませんでした' + (playError ? ' (' + esc(playError.name || playError.message || '') + ')' : '')
+          + '。ホーム画面のアイコンから開き直すか、他のアプリがカメラを使っていないか確かめてください。'
+          + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+      }, 500);
 
       // デコーダ (wasm 約1MB) は、映像が出ている間に落とす
       let zx = null;
       try { zx = await loadDecoder(); }
       catch (e) {
+        // 利用者が先に閉じていたら黙って終わる (閉じた後にエラーだけ残さない — Codex #1235 R1 P2)
+        if (!scanStream || gen !== scanGen) { endStarting(); return; }
         stopScan();
         banner('err', 'バーコードの読み取りを始められませんでした (' + esc(e.message) + ')。'
           + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
@@ -400,8 +430,10 @@
         if (!scanStream || gen !== scanGen) return;
         let ev = { kind: 'idle' };
         try {
+          // 🚨 **新しいコマが来たときだけ解析する**。同じコマを2回読むと「2回続けて一致」の
+          //    条件が実質1回になってしまい、誤読の歯止めが効かなくなる
           const vw = v.videoWidth, vh = v.videoHeight;
-          if (vw && vh) {
+          if (vw && vh && noteFrameIfNew()) {
             // 🚨 **枠の中だけを切り出す**。映像全体を解析すると、棚に並んだ別ラベルを
             //    2フレーム続けて読んでしまい「別の商品」で確定する (Codex #1233 R2)。
             //    切り出す範囲は画面に描いている枠 (GUIDE) と同じ数字から作る
@@ -427,14 +459,10 @@
         decide = r.state;
         if (r.action === 'accept') { onScanned(r.value); return; }
         if (r.action === 'abort') {
+          // 「映像が来ない」は上の見張りが出す。ここは「映像は出ているのに読めない」だけ
           stopScan();
-          // 「映像が来ない」と「読み取りが失敗し続ける」は打つ手が違うので言い分ける
-          banner('err', r.reason === 'no_video'
-            ? 'カメラの映像が出ませんでした' + (playError ? ' (' + esc(playError.name || '') + ')' : '')
-              + '。ホーム画面のアイコンから開き直すか、他のアプリがカメラを使っていないか確かめてください。'
-              + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます'
-            : 'バーコードを読み取れませんでした (' + esc((lastError && lastError.message) || '') + ')。'
-              + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+          banner('err', 'バーコードを読み取れませんでした (' + esc((lastError && lastError.message) || '') + ')。'
+            + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
           return;
         }
         if (gen !== scanGen) return;
@@ -445,6 +473,7 @@
     function stopScan() {
       scanGen++;                                   // 起動待ちの getUserMedia が返ってきても使わせない
       clearTimeout(scanTimer); scanTimer = null;
+      clearInterval(scanWatchTimer); scanWatchTimer = null;   // 映像の見張りも必ず止める
       if (scanStream) { for (const tr of scanStream.getTracks()) { try { tr.stop(); } catch (e) { /* 止められなければ放す */ } } scanStream = null; }
       const v = $('#scanVideo'); if (v) v.srcObject = null;
       $('#scanBox').classList.remove('on');
