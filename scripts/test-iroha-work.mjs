@@ -3986,8 +3986,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   // Codex R1 の指摘 (下見・履歴の読み取り専用境界)
   ok(/const stateCan = \(name\) => \(state\.capabilities \|\| \[\]\)\.includes\(name\)/.test(html),
     '一覧・ボード側も許可リストで判定する (前回の一覧に許可が無ければ何も許さない)');
-  ok(/stateCan\('task\.status\.change'\)\r?\n\s+\? '<button class="st /.test(html) && /'<span class="st ro /.test(html),
-    '一覧の状態は、変更が許されたときだけタップできる札 (data-st) にする');
+  ok(/stateCan\('task\.status\.change'\) && !c\.split\r?\n\s+\? '<button class="st /.test(html) && /'<span class="st ro /.test(html),
+    '一覧の状態は、変更が許されたときだけタップできる札 (data-st) にする。⭐分かれた行は読むだけ (カードごとの遷移は断られる)');
   ok(/function openSt\(ev, id\) \{[\s\S]{0,120}if \(!stateCan\('task\.status\.change'\)\) return;/.test(html)
     && /function startBulk\(\) \{\r?\n  if \(!stateCan\('tasks\.bulk_stocked'\)\) return;/.test(html),
     'ステータス変更・まとめて棚入完了は入口でも許可リストで止める (二重の守り)');
@@ -4022,7 +4022,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v14'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(/const CACHE = 'iroha-work-shell-v15'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -4097,9 +4097,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/function gripHtml\(\)/.test(html) && /function gripDown\(e, sel, kind\)/.test(html)
     && /const g = e\.target\.closest\('\[data-grip\]'\);\r?\n\s+if \(!g\) return;/.test(html),
     '掴めるのは掴み手の上だけ (カードの上を指でなぞれば今まで通りスクロールできる)');
-  ok(/const grab = isApp\(\) && !bulkIds && \(boardCols === 'fac' \? stateCan\('task\.facility\.assign'\) : boardCols === 'when' \? stateCan\('task\.plan\.assign'\) : stateCan\('task\.status\.change'\)\);/.test(html)
+  ok(/const grab = isApp\(\) && !bulkIds && !c\.split\r?\n\s+&& \(boardCols === 'fac' \? stateCan\('task\.facility\.assign'\) : boardCols === 'when' \? stateCan\('task\.plan\.assign'\) : stateCan\('task\.status\.change'\)\);/.test(html)
     && /\(grab \? gripHtml\(\) : ''\)/.test(html),
-    '動かせないときは掴み手を描かない (無効にして見せない — 要件 §U-7)。いつ の列は計画の許可で掴める');
+    '動かせないときは掴み手を描かない (無効にして見せない — 要件 §U-7)。いつ の列は計画の許可で掴める。⭐分かれた行も掴めない');
   ok(/pcardHtml\(c, carryActs, !ro\)/.test(html)
     && /pcardHtml\(c, ro \? \[\] : \[\['＋ 明日やる', 'primary', 'tomorrow'\]\], !ro\)/.test(html)
     && /pcardHtml\(c, pileActs, !ro\)/.test(html),
@@ -6157,7 +6157,96 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
     'やり直しは職員モードのときだけ・外にあるぶんには出さない');
   ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
   const sw2 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v14'/.test(sw2), '画面キャッシュの版を上げる');
+  ok(/const CACHE = 'iroha-work-shell-v15'/.test(sw2), '画面キャッシュの版を上げる');
+}
+
+console.log('\n[31] 分けたカードは一覧・ボードで 2 枚に見える (§AB-11 の 5b)');
+{
+  const db = getDB();
+  const B = await import('../apps/iroha-work/batches.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const C = await import('../apps/iroha-work/consign.js');
+  const SV = await import('../apps/iroha-work/service.js');
+  const mk = (page, dest, qty) => TD.upsertTaskFromImport({ notion_page_id: page, status: 'not_started',
+    facility_code: 'iroha', destination_id: dest, product_name: '行の検査', qty }, { batchId: 'rw' }).id;
+  const v = (id) => TD.getTask(id).version;
+
+  // ① まとまりが 1 つのカードは 1 行のまま (本番の全カードがこれ = 見え方は変わらない)
+  {
+    const t = mk('rw-1', 9995, 100);
+    const rows = SV.expandBatchRows([{ id: t, qty: 100, facility_code: 'iroha', master: { units_per_container: 10, process_count: 2 },
+      batches: B.listBatchesOfTask(db, t).map((b) => ({ ...b, counted: false })) }]);
+    ok(rows.length === 1 && rows[0].split === false, '⭐まとまりが 1 つなら 1 行のまま');
+    ok(rows[0].row_key === String(t) && rows[0].qty === 100, '数もカードのまま');
+    ok(rows[0].batch_id === B.listBatchesOfTask(db, t)[0].id, 'そのまとまりの id は持っている (棚入完了で使う)');
+  }
+
+  // ② ⭐一部を預けたら、いろはのぶんと ワークセンターのぶんで 2 行になる
+  {
+    const t = mk('rw-2', 9996, 1000);
+    const b0 = B.listBatchesOfTask(db, t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 600,
+      dueDate: '2026-09-21', expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    const list = SV.buildTaskList({});
+    const card = list.cards.find((c) => c.id === t);
+    const rows = list.rows.filter((r) => r.id === t);
+    ok(list.cards.filter((c) => c.id === t).length === 1, 'カードは 1 枚のまま (詳細・写真・作業時間はカード単位)');
+    ok(rows.length === 2, '⭐一覧の行は 2 つになる');
+    const home = rows.find((r) => r.facility_code === 'iroha');
+    const away = rows.find((r) => r.facility_code === 'workcenter');
+    ok(home && away, '⭐区別するのは「どこが」の札 (枝番は出さない)');
+    ok(home.qty === 400 && away.qty === 600, '⭐数はそのまとまりのぶん (カード合計 1000 を両方に出さない)');
+    ok(home.id === t && away.id === t && home.row_key !== away.row_key, 'id はカードのまま・行の見分けは row_key');
+    ok(home.split === true && away.split === true, '分かれた行だと分かる (掴めない・まとめて選べない)');
+    ok(away.away && away.away.qty === 600 && away.away.due === '2026-09-21', '⭐外のぶんの行に「あずけ中」の数と期限が出る');
+    ok(home.away == null, 'いろはのぶんの行には出ない');
+    ok(away.status === 'in_progress' && away.status_label === '作業中', '外のぶんは渡した時点で作業中');
+    // 箱・時間もそのまとまりのぶん
+    const per = card.master.units_per_container;
+    if (per) {
+      ok(home.boxes_calc && home.boxes_calc.base === 400, '⭐必要保管箱もそのまとまりの数から (カード合計で出さない)');
+      ok(away.boxes_calc && away.boxes_calc.base === 600, '外のぶんも同じ');
+    }
+    if (card.plan_hours != null) ok(home.plan_hours < card.plan_hours, '想定作業時間もそのまとまりのぶん (カードより短い)');
+
+    // ③ ⭐明日の計画には いろはのぶんだけ出す (外部に預けたぶんは いろはが明日やる作業ではない)
+    TD.setPlannedDate({ taskId: t, plannedDate: SV.jstTomorrow(SV.jstToday()), expectVersion: v(t), actor: 'test' });
+    const plan = SV.buildPlan({});
+    const mine = plan.tomorrow.filter((r) => r.id === t);
+    ok(mine.length === 1 && mine[0].facility_code === 'iroha' && mine[0].qty === 400,
+      '⭐明日の計画は いろはの 400 個ぶんだけ (ワークセンターの 600 個は出さない)');
+  }
+
+  // ④ 取消したまとまりは行に出さない
+  {
+    const t = mk('rw-3', 9997, 200);
+    const b0 = B.listBatchesOfTask(db, t)[0];
+    const cg = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 50, expectVersion: v(t) });
+    const c3 = C.getConsignment(cg.consignment.id);
+    C.cancelConsignment({ consignmentId: c3.id, expectVersion: c3.version });
+    const rows = SV.buildTaskList({}).rows.filter((r) => r.id === t);
+    ok(rows.length === 1 && rows[0].split === false && rows[0].qty === 200,
+      '⭐預けをやめたら 1 行に戻る (取消のまとまりは出さない・数も戻る)');
+  }
+
+  // ── 画面 ──
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(/const rowsOf = \(st\) => \(\(st \|\| \{\}\)\.rows \|\| \(st \|\| \{\}\)\.cards \|\| \[\]\);/.test(html)
+    && /return rowsOf\(state\)\.filter/.test(html) && /return rowsOf\(boardState\(\)\)\.filter/.test(html),
+    '⭐一覧・ボードは「まとまりの行」で描く (下見は rows が無いので cards のまま)');
+  ok(/const findCard = \(id\) => state\.cards\.find/.test(html),
+    '⭐カードを指すとき (詳細・写真・作業時間) は今までどおり cards から探す');
+  ok(/const selectable = bulkIds && c\.status === 'ready_for_stocking' && !c\.split;/.test(html)
+    && /c\.status === 'ready_for_stocking' && !c\.split\)\.map\(c => c\.id\)/.test(html),
+    '⭐分かれた行は「まとめて棚入完了」で選べない (カードごと閉じてしまうため)');
+  ok(/data-stock-batch="/.test(html) && /async function stockBatchOf\(taskId, batchId\)/.test(html),
+    '⭐分かれた行の「✅ 棚入完了」は、そのまとまりだけを閉じる');
+  ok(/c\.split && c\.away \? '🚚 あずけ中 ' \+ c\.away\.qty/.test(html),
+    'ボードの行に「あずけ中 何個・いつまで」が出る');
+  ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
+  const sw3 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
+  ok(/const CACHE = 'iroha-work-shell-v15'/.test(sw3), '画面キャッシュの版を上げる');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

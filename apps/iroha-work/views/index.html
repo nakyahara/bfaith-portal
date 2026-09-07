@@ -1147,6 +1147,13 @@ let curDetail = null;      // 開いている詳細のカード id (Notion 正�
 /** カード id の比較。onclick の引数を経ると数値も文字列になるので、厳密比較せず文字列にそろえて比べる (Codex A1b R1 #1) */
 const sameId = (a, b) => a != null && b != null && String(a) === String(b);
 const findCard = (id) => state.cards.find(x => sameId(x.id, id)) || null;
+/**
+ * ⭐画面に並べる行 (要件 §AB-11 の 5b)。まとまりが 2 つ以上のカードは、いろはのぶん・
+ * ワークセンターのぶんが 1 行ずつになる。ふだん (まとまり 1 つ) は今までどおり 1 行。
+ * ⚠カードを指すとき (詳細・写真・作業時間) は今までどおり findCard(row.id)。
+ * 下見 (Notion 正本) は rows を返さないので cards をそのまま使う
+ */
+const rowsOf = (st) => ((st || {}).rows || (st || {}).cards || []);
 // ─── 詳細の文脈: どこから開いたか (state = 一覧・ボード / preview = 下見・履歴) と、許された操作 ───
 // 画面はサーバーが返した capabilities にある操作だけ描く (default-deny)。「描いてから隠す」はしない (要件 v1.3 §P Q5)
 let detailSrc = null;        // 'state' | 'preview'
@@ -1510,7 +1517,7 @@ function rowTags(c, opts) {
 
 function visibleCards() {
   const q = $('#q').value.trim().toLowerCase();
-  return state.cards.filter(c => {
+  return rowsOf(state).filter(c => {
     if (curTab === 'blocked') { if (!c.blocked) return false; }
     else if (curTab === 'unblocked') { if (c.blocked) return false; }
     else if (curTab === 'today') { if (!c.today) return false; }
@@ -1564,9 +1571,12 @@ function renderList() {
       c.expiry ? '📅 期限 ' + esc(c.expiry) : null,
     ].filter(Boolean).join(' ・ ');
     const tags = rowTags(c, { short: true });
-    const selectable = bulkIds && c.status === 'ready_for_stocking';
+    // ⭐分かれた行は「まとめて棚入完了」で選べない (どのぶんかを決めずにカードごと閉じてしまうため)。
+    //   その行の「✅ 棚入完了」は そのまとまりだけを閉じる
+    const selectable = bulkIds && c.status === 'ready_for_stocking' && !c.split;
     const sel = selectable && bulkIds.has(c.id);
-    return '<div class="row' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+    return '<div class="row' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' +
+      (c.split ? ' data-batch="' + esc(c.batch_id) + '"' : '') + (selectable ? ' data-pick="1"' : '') + '>' +
       (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
       '<div class="thumb">' + thumbHtml(c) + '</div>' +
       '<div class="bd"><h2>' + esc(c.title) + '</h2>' + (tags ? '<div class="rtags">' + tags + '</div>' : '') +
@@ -1575,7 +1585,7 @@ function renderList() {
       // 状態: 変更が許されていればタップできる札 (data-st)、許されていなければただの札
       (selectable ? '' : stockBtnHtml(c)) +
       (selectable ? ''
-        : stateCan('task.status.change')
+        : stateCan('task.status.change') && !c.split
           ? '<button class="st ' + stClass(c.status) + '" data-st="' + esc(c.id) + '">' + esc(stLabel(c)) + ' ▾</button>'
           : '<span class="st ro ' + stClass(c.status) + '">' + esc(stLabel(c)) + '</span>') +
       '<span class="chev">' + (selectable ? '' : '›') + '</span></div>';
@@ -1587,7 +1597,12 @@ $('#q').addEventListener('input', renderList);
 // 一覧のクリックも委譲 (状態の札 / 選択 / 詳細)
 $('#list').addEventListener('click', (e) => {
   const stockBtn = e.target.closest('[data-stock-of]');
-  if (stockBtn) { e.stopPropagation(); stockOne(stockBtn.dataset.stockOf); return; }   // ✅ 1 枚だけ棚入完了
+  if (stockBtn) {   // ✅ 1 枚だけ棚入完了 (分かれた行はそのぶんだけ)
+    e.stopPropagation();
+    if (stockBtn.dataset.stockBatch) stockBatchOf(stockBtn.dataset.stockOf, Number(stockBtn.dataset.stockBatch));
+    else stockOne(stockBtn.dataset.stockOf);
+    return;
+  }
   const st = e.target.closest('[data-st]');
   if (st) { e.stopPropagation(); openSt(e, st.dataset.st); return; }
   const row = e.target.closest('[data-id]');
@@ -1847,7 +1862,12 @@ $('#board').addEventListener('click', (e) => {
   const whenBtn = e.target.closest('[data-when-of]');
   if (whenBtn) { e.stopPropagation(); openWhenPick(whenBtn.dataset.whenOf); return; }   // 今日 / 明日 / 未定 から選ぶ
   const stockBtn = e.target.closest('[data-stock-of]');
-  if (stockBtn) { e.stopPropagation(); stockOne(stockBtn.dataset.stockOf); return; }   // ✅ 1 枚だけ棚入完了
+  if (stockBtn) {   // ✅ 1 枚だけ棚入完了 (分かれた行はそのぶんだけ)
+    e.stopPropagation();
+    if (stockBtn.dataset.stockBatch) stockBatchOf(stockBtn.dataset.stockOf, Number(stockBtn.dataset.stockBatch));
+    else stockOne(stockBtn.dataset.stockOf);
+    return;
+  }
   const printBtn = e.target.closest('[data-print-of]');
   if (printBtn) { e.stopPropagation(); openPrintBox(printBtn.dataset.printOf); return; }   // 🏷 保管箱ラベル (ボードからも出せる — 中原さん 2026-09-06)
   const el = e.target.closest('[data-id]');
@@ -1868,7 +1888,7 @@ $('#histBody').addEventListener('click', (e) => {
 });
 function boardCards() {
   const q = ($('#bq').value || '').trim().toLowerCase();
-  return ((boardState() || {}).cards || []).filter(c => {
+  return rowsOf(boardState()).filter(c => {
     if (curFacility !== 'all' && (curFacility === 'none' ? !!c.facility_code : c.facility_code !== curFacility)) return false;
     if (curStatus !== 'all' && c.status !== curStatus) return false;   // 進捗の絞り込み (列が進捗以外のとき — 中原さん 2026-09-06)
     // 「⛔ 止まっている」は予定の値ではなく札の絞り込み (案A)
@@ -1943,12 +1963,19 @@ function gripHtml() { return '<span class="grip" data-grip aria-hidden="true">�
 /** 棚入待ちのカードに「✅ 棚入完了」(職員モードだけ。まとめて選んでいる間は出さない) — 中原さん 2026-09-05 */
 function stockBtnHtml(c) {
   if (c.status !== 'ready_for_stocking' || bulkIds || !isApp() || !stateCan('tasks.bulk_stocked') || !isStaffUI()) return '';
+  // ⭐分かれた行は**そのぶんだけ**棚入完了にする (他のぶん = 外にあずけ中 はそのまま残る)
+  if (c.split) {
+    return '<button class="stockbtn" data-stock-of="' + esc(c.id) + '" data-stock-batch="' + esc(c.batch_id) + '">✅ 棚入完了</button>';
+  }
   return '<button class="stockbtn" data-stock-of="' + esc(c.id) + '">✅ 棚入完了</button>';
 }
 function bcardHtml(c, status) {
-  const selectable = bulkIds && status === 'ready_for_stocking';
+  const selectable = bulkIds && status === 'ready_for_stocking' && !c.split;
   // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
-  const grab = isApp() && !bulkIds && (boardCols === 'fac' ? stateCan('task.facility.assign') : boardCols === 'when' ? stateCan('task.plan.assign') : stateCan('task.status.change'));
+  // ⭐分かれた行は掴めない。動かして変わるのはカードのこと (どこが・いつ・進捗) なので、
+  //   どのぶんを動かしたのかが決まらない (要件 §U-7: 押せないものは描かない)
+  const grab = isApp() && !bulkIds && !c.split
+    && (boardCols === 'fac' ? stateCan('task.facility.assign') : boardCols === 'when' ? stateCan('task.plan.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
   const meta = [c.qty != null ? c.qty + ' 個' : null,
     c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
@@ -1957,11 +1984,13 @@ function bcardHtml(c, status) {
     c.plan_hours != null ? '⏱ ' + approxHours(c.plan_hours) : null,
     c.external_ready ? '📦 外部に出せます' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
+    c.split && c.away ? '🚚 あずけ中 ' + c.away.qty + ' 個' + (c.away.due ? ' ' + fmtMd(c.away.due) + 'まで' : '') : null,
     c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
   // ⭐2 段に分ける。上 = 画像と文字、下 = 札とボタン。
   //   下の段は**カードの幅いっぱい**を使う (画像の右に押し込むと 1 つずつ行を使ってカードが縦に伸び、
   //   画像の下は空いたままになる — 中原さん 2026-09-07「表示する情報は変えずに縦を短く」)
-  return '<div class="bcard' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+  return '<div class="bcard' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' +
+    (c.split ? ' data-batch="' + esc(c.batch_id) + '"' : '') + (selectable ? ' data-pick="1"' : '') + '>' +
     '<div class="btop">' +
     (grab ? gripHtml() : '') +
     (c.image_url ? '<div class="th">' + thumbHtml(c) + '</div>' : '') +   // 📦 の空枠は幅を取るだけなので、写真があるカードだけ (監修)
@@ -3054,7 +3083,8 @@ function renderBulk() {
  */
 function syncBulkSelection(visible) {
   if (!bulkIds) return;
-  const ok = new Set(visible.filter(c => c.status === 'ready_for_stocking').map(c => c.id));
+  // ⭐分かれた行は「まとめて」では選べない (どのぶんかを決めずにカードごと閉じてしまうため)
+  const ok = new Set(visible.filter(c => c.status === 'ready_for_stocking' && !c.split).map(c => c.id));
   let dropped = 0;
   for (const id of [...bulkIds.keys()]) if (!ok.has(id)) { bulkIds.delete(id); dropped++; }
   if (dropped > 0) toast(dropped + ' 件は絞り込みで見えなくなったので選択から外しました');
@@ -3885,8 +3915,9 @@ async function redoBatch(batchId) {
   openDetail(c.id);
 }
 /** ⭐そのまとまりだけを棚入完了にする。他のぶん (外にあずけ中) はそのまま残る */
-async function stockBatch(batchId) {
-  const c = findCard(curDetail);
+const stockBatch = (batchId) => stockBatchOf(curDetail, batchId);
+async function stockBatchOf(taskId, batchId) {
+  const c = findCard(taskId);
   if (!c || !stateCan('tasks.bulk_stocked')) return;
   const b = (c.batches || []).find((x) => sameId(x.id, batchId));
   if (!b) return;
@@ -3914,10 +3945,11 @@ async function stockBatch(batchId) {
   c.status = j.status;
   if (j.status_label) c.status_label = j.status_label;
   toast('このぶんを棚入完了にしました' + (rest > 0 ? ' (残りのぶんはそのままです)' : ''));
-  renderTabs(); renderList();
-  if (curView === 'board') renderBoard();
-  if (j.listed === false) { closeDetail(); return; }
-  openDetail(c.id);   // まとまりの状態を取り直す
+  // ⭐行の中身 (まとまりの状態・数) はサーバーが持っているので、一覧を取り直す
+  await loadState();
+  if (sameId(curDetail, c.id)) {
+    if (j.listed === false) closeDetail(); else openDetail(c.id);
+  }
 }
 
 /**
