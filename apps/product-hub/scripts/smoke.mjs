@@ -24,6 +24,50 @@ function check(name, cond, detail = '') {
   else { failed++; console.error(`  NG  ${name} ${detail}`); }
 }
 
+/**
+ * 描画済み HTML から「ブラウザがその場で実行する JS」を script 要素ごとに取り出す。
+ * 🚨 属性を許す (`<script defer>` `<script nonce>` にしただけで検査から外れないように)、
+ *    src 付き (中身が無い) と JS でない type (application/json のデータ塊) は除く、
+ *    **連結しない** (別々の script を繋ぐと、片方が構文エラーでも通ってしまう) — Codex R1
+ * @returns {{code: string, isModule: boolean}[]}
+ */
+function inlineScriptsOf(html) {
+  const out = [];
+  for (const m of String(html).matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
+    const attrs = m[1] || '';
+    if (/\bsrc\s*=/i.test(attrs)) continue;
+    const type = (attrs.match(/\btype\s*=\s*["']?([^"'\s>]+)/i) || [])[1] || '';
+    const isModule = /^module$/i.test(type);
+    if (type && !isModule && !/^(text|application)\/javascript$/i.test(type)) continue;
+    out.push({ code: m[2], isModule });
+  }
+  return out;
+}
+
+/**
+ * 上で取り出した script を 1 つずつ構文検査する。名前は「構文」までしか保証しない
+ * (実行時エラーはこれでは分からない)。
+ * @returns {{ok: boolean, detail: string}}
+ */
+function checkInlineScriptSyntax(vm, html, label) {
+  // 取り出し自体が壊れていないか (開きタグの数 = 取り出せた要素の数)。
+  // これが合わないと「1 つも拾えなかったので緑」という素通りが起きる
+  const opens = [...String(html).matchAll(/<script\b/gi)].length;
+  const matched = [...String(html).matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].length;
+  if (opens !== matched) return { ok: false, detail: `script 要素 ${opens} 個のうち ${matched} 個しか取り出せていない` };
+  const blocks = inlineScriptsOf(html);
+  if (blocks.length === 0) return { ok: true, detail: 'その場で実行する script は無い' };
+  // ES module は vm.Script では検査できない。黙って外れないよう、現れたら落として気づく
+  const mods = blocks.filter((b) => b.isModule).length;
+  if (mods > 0) return { ok: false, detail: `type="module" の script が ${mods} 個 — この検査は未対応` };
+  for (const [i, b] of blocks.entries()) {
+    try { new vm.Script(b.code, { filename: `${label}#script${i + 1}` }); } catch (e) {
+      return { ok: false, detail: `script[${i + 1}]: ${e.message}` };
+    }
+  }
+  return { ok: true, detail: `${blocks.length} 個` };
+}
+
 // ─── drive-link ───
 const { parseDriveLink, thumbnailUrl, fileViewUrl } = await import('../lib/drive-link.js');
 check('parse file/d/', parseDriveLink('https://drive.google.com/file/d/1AbC_dEf-123456789012345/view?usp=sharing')?.id === '1AbC_dEf-123456789012345');
@@ -8927,11 +8971,15 @@ for (const [name, file, data] of renders) {
         //    セット商品では set_review が無く、埋め込みが空文字になって実際にそうなっていた
         //    (2026-09-07)。実ルートの HTML でも構文を見る
         const vmMod = await import('node:vm');
-        const js = [...pr.html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).join('\n');
-        let syntaxErr = null;
-        try { new vmMod.Script(js, { filename: 'detail(set).html' }); } catch (e) { syntaxErr = e; }
-        check('HTTP 画面: セットの詳細の JS が構文として通る (ボタンが全部死んでいないこと)',
-          js.length > 500 && syntaxErr === null, syntaxErr?.message || `js=${js.length}`);
+        const r = checkInlineScriptSyntax(vmMod, pr.html, 'detail(set)');
+        check('HTTP 画面: セットの詳細の JS が構文として通る (壊れていると画面の操作が全部死ぬ)',
+          r.ok, r.detail);
+        // この画面が「事故の条件」を持ち続けていることを確かめる。持たなくなったら上の検査は
+        // 別物を見ていることになる (fixture が変わって再発を素通りさせないため)
+        const setMain = wfp.progressOf(idSet, { db }).main;
+        check('HTTP 画面: セット商品の工程には set_review が無い (この検査が意味を持つ条件)',
+          setMain.length > 0 && !setMain.some((s) => s.step_code === 'set_review'),
+          setMain.map((s) => s.step_code).join(','));
       }
 
       for (const [label, p] of [
@@ -9056,16 +9104,24 @@ for (const [name, file, data] of renders) {
   //    一切検出できない。`parent_step_version: <%= undefined %>` が
   //    `parent_step_version: ,` になり、セット商品の画面の JS が丸ごと死んでいた (2026-09-07)。
   //    ここでは**描画済みの HTML** から素の JS を取り出して構文を見る = 埋め込みの結果を見る
+  // まずこの検査自身の検出力を見る。ここが緩むと全ページの検査が黙って素通りする (Codex R1)
+  {
+    const t = (html) => checkInlineScriptSyntax(vm, html, 'selftest').ok;
+    check('JS 構文検査: 属性つきの script も見る (defer / nonce で外れない)',
+      t('<script defer nonce="x">const a = ;</script>') === false);
+    check('JS 構文検査: script を繋がない (片方だけ壊れていても見つける)',
+      t('<script>const a =</script>\n<script>1;</script>') === false);
+    check('JS 構文検査: src 付きと JSON の塊は対象外・素の script は見る',
+      t('<script src="/a.js"></script><script type="application/json">{"a":1}</script><script>const a=1;</script>') === true
+      && t('<script src="/a.js"></script><script>const a=;</script>') === false);
+    check('JS 構文検査: type="module" は未対応と分かるように落とす',
+      t('<script type="module">const a=1;</script>') === false);
+    check('JS 構文検査: script が無いページ・JSON だけのページは通す',
+      t('<p>x</p>') === true && t('<script type="application/json">{"a":1}</script>') === true);
+  }
   for (const [name, html] of renderedHtml) {
-    // 属性なしの <script> だけ = ページの JS (type="application/json" のデータ塊は除く)
-    const blocks = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
-    if (blocks.length === 0) continue;
-    try {
-      new vm.Script(blocks.join('\n'), { filename: name });
-      check(`描画後の JS が構文として通る: ${name}`, true);
-    } catch (e) {
-      check(`描画後の JS が構文として通る: ${name}`, false, e.message);
-    }
+    const r = checkInlineScriptSyntax(vm, html, name);
+    check(`描画後の JS が構文として通る: ${name}`, r.ok, r.detail);
   }
 
   // ─── SKU別JAN の保存ワーカー (detail.ejs initSkuJans) の時系列テスト (2026-09-02 Codex R3/R4 high) ───
