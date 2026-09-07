@@ -17,11 +17,65 @@ const utcNow = () => new Date().toISOString();
 
 /** 数の受け取り。0 以下・小数・数でないものは断る (要件 §AB-3 と同じ流儀) */
 function normQty(v, label) {
+  return normNum(v, label, 1);
+}
+/** ⭐0 も許す数 (使える数 0 個 = 全部だめだった、は起きる — Codex R1 重大3) */
+function normQty0(v, label) {
+  return normNum(v, label, 0);
+}
+function normNum(v, label, min) {
   if (typeof v !== 'number' && typeof v !== 'string') return { error: 'bad_qty', message: `${label}は数で入れてください` };
   const n = Number(typeof v === 'string' ? v.trim() : v);
-  if (!Number.isInteger(n) || n <= 0) return { error: 'bad_qty', message: `${label}は 1 以上の整数で入れてください` };
+  if (!Number.isInteger(n) || n < min) return { error: 'bad_qty', message: `${label}は ${min} 以上の整数で入れてください` };
   if (n > 1_000_000) return { error: 'bad_qty', message: `${label}が大きすぎます` };
   return { value: n };
+}
+/** 日付。⭐形を見るだけでなく**実在する日か**まで見る (2026-99-99 を通さない — Codex R1 軽微) */
+function normDue(v) {
+  if (v == null || v === '') return { value: null };
+  const t = String(v);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(t)) return { error: 'bad_request', message: '日付は YYYY-MM-DD で入れてください' };
+  const d = new Date(t + 'T00:00:00Z');
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== t) {
+    return { error: 'bad_request', message: 'その日付はありません' };
+  }
+  return { value: t };
+}
+
+/**
+ * ⭐渡さなかったぶん・やめたぶんを**いろは の手元に戻す** (Codex R1 重大2・重大5)。
+ *
+ * 80 個切り出して 78 個しか渡せなかったとき、残り 2 個が外部のまとまりに残ると、
+ * 78 個返ってきた時点でそのまとまりごと棚入待ちになり、2 個が宙に浮く。
+ *
+ * 戻し先は「元のまとまり」。ただし**元が今も手元にあるときだけ** —
+ * 元をよそへ渡していたり終わっていたら、戻すと相手の数が増えてしまう (重大5)。
+ * そのときは**新しいまとまりを 1 つ作って**そこに戻す。
+ */
+function giveBackToHand(db, awayBatch, qty, now, actor) {
+  if (!qty || qty <= 0) return null;
+  const origin = awayBatch.split_from_batch_id
+    ? db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(awayBatch.split_from_batch_id) : null;
+  const originOk = origin && origin.work_status !== 'done' && origin.work_status !== 'cancelled'
+    && (!origin.facility_code || origin.facility_code === 'iroha')
+    && db.prepare("SELECT COUNT(*) c FROM f_iroha_consignments WHERE batch_id = ? AND state <> 'cancelled'").get(origin.id).c === 0;
+  if (originOk) {
+    db.prepare('UPDATE f_iroha_task_batches SET planned_qty = COALESCE(planned_qty, 0) + ?, version = version + 1, updated_at = ? WHERE id = ?')
+      .run(qty, now, origin.id);
+    return origin.id;
+  }
+  const seq = nextSeq(db, awayBatch.task_id);
+  const info = db.prepare(`INSERT INTO f_iroha_task_batches
+      (task_id, seq, planned_qty, facility_code, expiry, work_status, split_from_batch_id, split_qty, split_at, split_by, created_at, updated_at)
+    VALUES (?, ?, ?, NULL, ?, 'not_started', ?, ?, ?, ?, ?, ?)`)
+    .run(awayBatch.task_id, seq, qty, awayBatch.expiry ?? null, awayBatch.id, qty, now, actor, now, now);
+  return Number(info.lastInsertRowid);
+}
+
+/** 親カードの版を進める。⭐預けの追加・数量の変更・取消は必ずここを通す (要件 §AB-7) */
+function bumpTask(db, taskId, now, actor) {
+  db.prepare('UPDATE f_iroha_tasks SET version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?')
+    .run(now, actor, taskId);
 }
 
 /**
@@ -79,8 +133,9 @@ export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate =
   const db = getDB();
   const q = normQty(qty, '預ける数');
   if (q.error) return { ok: false, error: q.error, message: q.message };
-  const due = dueDate == null || dueDate === '' ? null : String(dueDate);
-  if (due && !/^\d{4}-\d{2}-\d{2}$/.test(due)) return { ok: false, error: 'bad_request', message: '日付は YYYY-MM-DD で入れてください' };
+  const dd = normDue(dueDate);
+  if (dd.error) return { ok: false, error: dd.error, message: dd.message };
+  const due = dd.value;
   return db.transaction(() => {
     if (guard) { const g = guard(); if (g) return g; }
     const t = db.prepare('SELECT * FROM f_iroha_tasks WHERE id = ?').get(taskId);
@@ -102,8 +157,10 @@ export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate =
       return { ok: false, error: 'too_many', message: `渡せるのは ${max} 個までです (残っているぶん)`, max };
     }
     const now = utcNow();
-    // ⭐全部を預けるならまとまりは割らない (行を増やす意味が無い)
+    // ⭐予定数を丸ごと預けるときだけ、まとまりを割らない (行を増やす意味が無い)。
+    //   完成分や別の預けが残っているなら、上限まででも割る
     let target = b;
+    let prevFac;
     if (max == null || q.value < max || b.planned_qty !== q.value) {
       const seq = nextSeq(db, taskId);
       const info = db.prepare(`INSERT INTO f_iroha_task_batches
@@ -115,18 +172,19 @@ export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate =
       db.prepare(`UPDATE f_iroha_task_batches SET planned_qty = planned_qty - ?, version = version + 1, updated_at = ?
         WHERE id = ?`).run(q.value, now, b.id);
       target = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(newId);
+      prevFac = undefined;
     } else {
+      // 丸ごと預ける = まとまりを割らない。⭐やめたときに戻せるよう、元の担当拠点を覚えておく (Codex R1 中6)
+      prevFac = b.facility_code ?? null;
       db.prepare('UPDATE f_iroha_task_batches SET facility_code = ?, version = version + 1, updated_at = ? WHERE id = ?')
         .run(facilityCode, now, b.id);
       target = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(b.id);
     }
     const ci = db.prepare(`INSERT INTO f_iroha_consignments
-        (batch_id, facility_code, planned_qty, state, due_date, planned_at, planned_by, created_at, updated_at)
-      VALUES (?, ?, ?, 'planned', ?, ?, ?, ?, ?)`)
-      .run(target.id, facilityCode, q.value, due, now, actor, now, now);
-    // ⭐親カードの版を進める。預けの追加・数量変更・取消は必ずここを通す (合計が予定数を超えないように)
-    db.prepare('UPDATE f_iroha_tasks SET version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-      .run(now, actor, t.id, t.version);
+        (batch_id, facility_code, planned_qty, state, due_date, prev_facility_code, planned_at, planned_by, created_at, updated_at)
+      VALUES (?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?)`)
+      .run(target.id, facilityCode, q.value, due, prevFac === undefined ? null : prevFac, now, actor, now, now);
+    bumpTask(db, t.id, now, actor);
     recomputeTaskDoneQty(db, t.id);
     return { ok: true, consignment: getConsignment(Number(ci.lastInsertRowid), db), batch: target };
   }).immediate();
@@ -134,15 +192,16 @@ export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate =
 
 /** 箱とラベルを用意した (職員が現物を確かめた節目。印刷が成功しただけでは prepared にしない — 要件 §AB-7) */
 export function markPrepared({ consignmentId, qty = null, expectVersion, actor = null, guard = null }) {
-  return updateConsignment(consignmentId, expectVersion, guard, (db, c, now) => {
+  return updateConsignment(consignmentId, expectVersion, guard, (db, c, now, actorIn) => {
     if (c.state !== 'planned') return { ok: false, error: 'bad_state', message: 'もう用意ずみか、渡したあとです' };
-    const n = qty == null ? c.planned_qty : normQty(qty, '用意した数');
+    const n = qty == null ? null : normQty(qty, '用意した数');
     if (n && n.error) return { ok: false, error: n.error, message: n.message };
-    const v = qty == null ? c.planned_qty : n.value;
+    const v = n ? n.value : c.planned_qty;
+    if (v > c.planned_qty) return { ok: false, error: 'too_many', message: `渡す予定は ${c.planned_qty} 個です` };
     db.prepare(`UPDATE f_iroha_consignments SET state = 'prepared', prepared_qty = ?, prepared_at = ?, prepared_by = ?,
-      version = version + 1, updated_at = ? WHERE id = ?`).run(v, now, actor, now, c.id);
+      version = version + 1, updated_at = ? WHERE id = ?`).run(v, now, actorIn, now, c.id);
     return { ok: true };
-  });
+  }, actor);
 }
 
 /**
@@ -150,42 +209,91 @@ export function markPrepared({ consignmentId, qty = null, expectVersion, actor =
  * 予定数を書き換えない — 書き換えると「80 枚ぶん用意した」履歴が消える。
  */
 export function markHanded({ consignmentId, qty = null, expectVersion, actor = null, guard = null }) {
-  return updateConsignment(consignmentId, expectVersion, guard, (db, c, now) => {
+  return updateConsignment(consignmentId, expectVersion, guard, (db, c, now, actorIn) => {
     if (c.state !== 'planned' && c.state !== 'prepared') {
       return { ok: false, error: 'bad_state', message: 'もう渡したあとです' };
     }
     const n = qty == null ? null : normQty(qty, '渡した数');
     if (n && n.error) return { ok: false, error: n.error, message: n.message };
     const handed = n ? n.value : c.planned_qty;
-    db.prepare(`UPDATE f_iroha_consignments SET state = 'handed', handed_qty = ?,
-        prepared_qty = COALESCE(prepared_qty, ?), handed_at = ?, handed_by = ?,
+    // ⭐**確保した数より多くは渡せない** (Codex R1 重大1)。
+    //   多く渡したいなら、いったんやめてから決め直す (そうしないと元の数を超えて実績が積み上がる)
+    if (handed > c.planned_qty) {
+      return { ok: false, error: 'too_many',
+        message: `渡す予定は ${c.planned_qty} 個です。もっと渡すなら、いったんやめて決め直してください` };
+    }
+    db.prepare(`UPDATE f_iroha_consignments SET state = 'handed', handed_qty = ?, handed_at = ?, handed_by = ?,
         version = version + 1, updated_at = ? WHERE id = ?`)
-      .run(handed, handed, now, actor, now, c.id);
+      .run(handed, now, actorIn, now, c.id);
+    const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
+    // ⭐渡さなかったぶんは**手元に戻す** (Codex R1 重大2)。
+    //   外部のまとまりに残したままだと、渡したぶんが返ってきた時点で一緒に棚入待ちになり宙に浮く
+    const left = (b.planned_qty ?? 0) - handed;
+    if (left > 0) {
+      db.prepare('UPDATE f_iroha_task_batches SET planned_qty = ?, version = version + 1, updated_at = ? WHERE id = ?')
+        .run(handed, now, b.id);
+      giveBackToHand(db, b, left, now, actorIn);
+    }
     // 渡したら、そのぶんは いろは の手を離れる = 作業中にする (外部が作業している)
     db.prepare("UPDATE f_iroha_task_batches SET work_status = 'in_progress', version = version + 1, updated_at = ? WHERE id = ? AND work_status = 'not_started'")
       .run(now, c.batch_id);
-    return { ok: true };
-  });
+    return { ok: true, taskId: b.task_id };
+  }, actor);
 }
 
 /** 渡す前ならやめられる。切り出したまとまりは取消にして、元のまとまりに数を戻す */
 export function cancelConsignment({ consignmentId, expectVersion, actor = null, guard = null }) {
-  return updateConsignment(consignmentId, expectVersion, guard, (db, c, now) => {
+  return updateConsignment(consignmentId, expectVersion, guard, (db, c, now, actorIn) => {
     if (c.state === 'handed' || c.state === 'settled') {
       return { ok: false, error: 'bad_state', message: 'もう渡したあとは取り消せません。返却で受け取ってください' };
     }
     if (c.state === 'cancelled') return { ok: true, already: true };
     db.prepare(`UPDATE f_iroha_consignments SET state = 'cancelled', version = version + 1, updated_at = ? WHERE id = ?`).run(now, c.id);
     const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
-    // 切り出して作ったまとまりなら、取消にして元へ数を戻す
     if (b && b.split_from_batch_id) {
+      // 切り出して作ったまとまり → 取消にして、数を手元に戻す。
+      // ⭐戻し先が今も手元にあるかを見る。よそへ渡した相手に足してしまわない (Codex R1 重大5)
       db.prepare("UPDATE f_iroha_task_batches SET work_status = 'cancelled', version = version + 1, updated_at = ? WHERE id = ?")
         .run(now, b.id);
-      db.prepare('UPDATE f_iroha_task_batches SET planned_qty = planned_qty + ?, version = version + 1, updated_at = ? WHERE id = ?')
-        .run(b.planned_qty ?? 0, now, b.split_from_batch_id);
+      giveBackToHand(db, b, b.planned_qty ?? 0, now, actorIn);
+    } else if (b) {
+      // 割らずに丸ごと預けたまとまり → 担当拠点を元に戻す (Codex R1 中6)
+      db.prepare('UPDATE f_iroha_task_batches SET facility_code = ?, version = version + 1, updated_at = ? WHERE id = ?')
+        .run(c.prev_facility_code ?? null, now, b.id);
     }
-    return { ok: true };
-  });
+    return { ok: true, taskId: b ? b.task_id : null };
+  }, actor);
+}
+
+/**
+ * ⭐物として返ってこないぶんを職員が確かめて精算する (Codex R1 中10)。
+ * 100 個渡して 98 個返り、2 個は外部で壊れて捨てた — この 2 個を入れて閉じる。
+ * 返ってきた物の内訳 (good / loss) とは別のもの。
+ */
+export function settleConsignment({ consignmentId, missingQty = 0, note = null, expectVersion, actor = null, guard = null }) {
+  return updateConsignment(consignmentId, expectVersion, guard, (db, c, now, actorIn) => {
+    if (c.state !== 'handed') return { ok: false, error: 'bad_state', message: 'まだ渡していないか、もう精算ずみです' };
+    const m = normQty0(missingQty, '返らなかった数');
+    if (m.error) return { ok: false, error: m.error, message: m.message };
+    const back = db.prepare('SELECT COALESCE(SUM(returned_qty), 0) n FROM f_iroha_consignment_returns WHERE consignment_id = ?').get(c.id).n;
+    if (back + m.value !== (c.handed_qty ?? 0)) {
+      return { ok: false, error: 'bad_qty',
+        message: `渡した ${c.handed_qty} 個のうち ${back} 個が返っています。残り ${(c.handed_qty ?? 0) - back} 個を「返らなかった数」に入れてください` };
+    }
+    db.prepare(`UPDATE f_iroha_consignments SET state = 'settled', missing_qty = ?, note = ?, settled_at = ?, settled_by = ?,
+      version = version + 1, updated_at = ? WHERE id = ?`).run(m.value, note || c.note || null, now, actorIn, now, c.id);
+    closeBatchIfSettled(db, c.batch_id, now);
+    const b = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
+    return { ok: true, taskId: b ? b.task_id : null };
+  }, actor);
+}
+
+/** 預けが片づいたら、そのまとまりを棚入待ちへ */
+function closeBatchIfSettled(db, batchId, now) {
+  const open = db.prepare("SELECT COUNT(*) c FROM f_iroha_consignments WHERE batch_id = ? AND state IN ('planned','prepared','handed')").get(batchId).c;
+  if (open > 0) return;
+  db.prepare("UPDATE f_iroha_task_batches SET work_status = 'ready_for_stocking', version = version + 1, updated_at = ? WHERE id = ? AND work_status = 'in_progress'")
+    .run(now, batchId);
 }
 
 /**
@@ -198,11 +306,17 @@ export function recordReturn({ consignmentId, returnedQty, goodQty = undefined, 
   const db = getDB();
   const r = normQty(returnedQty, '返ってきた数');
   if (r.error) return { ok: false, error: r.error, message: r.message };
-  const good = goodQty === undefined || goodQty === null ? null : normQty(goodQty, '使える数');
+  // ⭐使える数は **0 も許す** (全部だめだった、は起きる)。画面の min="0" とも合わせる (Codex R1 重大3)
+  const good = goodQty === undefined || goodQty === null ? null : normQty0(goodQty, '使える数');
   if (good && good.error) return { ok: false, error: good.error, message: good.message };
-  const loss = lossQty === undefined || lossQty === null ? null : Number(lossQty);
-  if (loss != null && (!Number.isInteger(loss) || loss < 0)) {
-    return { ok: false, error: 'bad_qty', message: '作れなかった数は 0 以上の整数で入れてください' };
+  const loss = lossQty === undefined || lossQty === null ? null : normQty0(lossQty, '作れなかった数');
+  if (loss && loss.error) return { ok: false, error: loss.error, message: loss.message };
+  // ⭐返ってきた物の内訳が、返ってきた数を超えない
+  if (good && good.value > r.value) {
+    return { ok: false, error: 'bad_qty', message: `使える数は、返ってきた ${r.value} 個より多くできません` };
+  }
+  if (good && loss && good.value + loss.value > r.value) {
+    return { ok: false, error: 'bad_qty', message: `使える数と作れなかった数の合計が、返ってきた ${r.value} 個を超えています` };
   }
   return db.transaction(() => {
     if (guard) { const g = guard(); if (g) return g; }
@@ -224,7 +338,7 @@ export function recordReturn({ consignmentId, returnedQty, goodQty = undefined, 
     db.prepare(`INSERT INTO f_iroha_consignment_returns
         (consignment_id, returned_qty, good_qty, loss_qty, returned_at, returned_by, note, idempotency_key, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(c.id, r.value, good ? good.value : null, loss, now, actor, note || null, idempotencyKey || null, now);
+      .run(c.id, r.value, good ? good.value : null, loss ? loss.value : null, now, actor, note || null, idempotencyKey || null, now);
     const total = already + r.value;
     const settled = total >= (c.handed_qty ?? 0);
     db.prepare(`UPDATE f_iroha_consignments SET state = ?, settled_at = ?, settled_by = ?, version = version + 1, updated_at = ?
@@ -238,10 +352,9 @@ export function recordReturn({ consignmentId, returnedQty, goodQty = undefined, 
       const b = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
       if (b) recomputeTaskDoneQty(db, b.task_id);
     }
-    if (settled) {
-      db.prepare("UPDATE f_iroha_task_batches SET work_status = 'ready_for_stocking', version = version + 1, updated_at = ? WHERE id = ? AND work_status = 'in_progress'")
-        .run(now, c.batch_id);
-    }
+    if (settled) closeBatchIfSettled(db, c.batch_id, now);
+    const bt = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
+    if (bt) bumpTask(db, bt.task_id, now, actor);   // ⭐数が動いたので親カードの版も進める
     return { ok: true, consignment: getConsignment(c.id, db), settled };
   }).immediate();
 }
@@ -269,14 +382,18 @@ export function consignmentsOfTask(db, taskId) {
 
 /** 施設ごとの預け残高 (要件 §AB-8。いまは残高を見せるだけで、上限で止めない) */
 export function facilityBalances(db = getDB()) {
+  // ⭐いま外にあるのは「渡した数 − 返ってきた数」。100 個渡して 90 個返っても 100 と出さない (Codex R1 中9)。
+  //   件数は**カードの数**を数える (預けの行の数ではない)
   return db.prepare(`SELECT c.facility_code,
-      COUNT(*) cards, SUM(c.handed_qty) qty,
+      COUNT(DISTINCT b.task_id) cards,
+      SUM(COALESCE(c.handed_qty, 0) - COALESCE((SELECT SUM(r.returned_qty) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id), 0)) qty,
       SUM(CASE WHEN c.due_date IS NOT NULL AND c.due_date < date('now', '+9 hours') THEN 1 ELSE 0 END) overdue
-    FROM f_iroha_consignments c WHERE c.state = 'handed' GROUP BY c.facility_code`).all();
+    FROM f_iroha_consignments c JOIN f_iroha_task_batches b ON b.id = c.batch_id
+    WHERE c.state = 'handed' GROUP BY c.facility_code`).all();
 }
 
 /** 版を見て 1 行だけ直す共通の作り (確かめるところから書くところまで同じトランザクション) */
-function updateConsignment(consignmentId, expectVersion, guard, fn) {
+function updateConsignment(consignmentId, expectVersion, guard, fn, actor = null) {
   const db = getDB();
   return db.transaction(() => {
     if (guard) { const g = guard(); if (g) return g; }
@@ -285,8 +402,13 @@ function updateConsignment(consignmentId, expectVersion, guard, fn) {
     if (expectVersion == null || Number(expectVersion) !== c.version) {
       return { ok: false, error: 'conflict', message: '他の端末で変更されています' };
     }
-    const r = fn(db, c, utcNow());
+    const now = utcNow();
+    const r = fn(db, c, now, actor);
     if (!r.ok) return r;
+    // ⭐数が動く操作は**親カードの版も進める** (Codex R1 重大4)。
+    //   進めないと、取消の前のカードを見ている端末の要求がそのまま通ってしまう
+    const taskId = r.taskId ?? (db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id) || {}).task_id;
+    if (taskId) bumpTask(db, taskId, now, actor);
     return { ...r, consignment: getConsignment(c.id, db) };
   }).immediate();
 }

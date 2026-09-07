@@ -3646,8 +3646,10 @@ function awayHtml(c) {
         (x.due_date ? ' ・ ' + esc(x.due_date) + ' までに返却' + (over ? ' (期限を過ぎています)' : '') : '') + '</div>' +
       (stateCan('task.consign') ? '<div class="acts">' +
         (x.state === 'handed'
-          ? '<button class="go" data-cg="return" data-cg-id="' + x.id + '">返却を受け取る</button>'
+          ? '<button class="go" data-cg="return" data-cg-id="' + x.id + '">返却を受け取る</button>' +
+            '<button data-cg="settle" data-cg-id="' + x.id + '">返ってこないぶんを精算</button>'
           : '<button class="go" data-cg="handed" data-cg-id="' + x.id + '">渡しました</button>' +
+            (x.state === 'planned' ? '<button data-cg="prepared" data-cg-id="' + x.id + '">箱とラベルを用意した</button>' : '') +
             '<button data-cg="cancel" data-cg-id="' + x.id + '">やめる</button>') +
         '</div>' : '') +
       '</div>';
@@ -4947,19 +4949,25 @@ function openConsign() {
   const c = findCard(curDetail);
   if (!c || !can('task.consign')) return;
   if (!worker) { openGate(); return; }
-  // まだ外に出していない、いろは側のまとまり (ふだんは 1 つ)
-  const mine = (c.batches || []).filter((b) => b.work_status === 'not_started' || b.work_status === 'in_progress');
-  const b = mine.find((x) => !x.facility_code || x.facility_code === 'iroha') || mine[0];
-  if (!b) { showErr('あずけられるぶんがありません'); return; }
+  // ⭐渡せるぶん・渡せる数は**サーバーが決めた値**を使う。画面が予定数から自分で出すと、
+  //   「押したら断られる」ことになる (Codex R1 中7)
+  const able = (c.batches || []).filter((x) => !x.consignable_why && (x.consignable_max == null || x.consignable_max > 0));
+  const b = able.find((x) => !x.facility_code || x.facility_code === 'iroha') || able[0];
+  if (!b) {
+    const why = (c.batches || []).map((x) => x.consignable_why).filter(Boolean)[0];
+    showErr(why || 'いま渡せるぶんがありません');
+    return;
+  }
   const facs = externalFacilities();
   if (facs.length === 0) { showErr('物を持ち帰る拠点が登録されていません'); return; }
-  cgTarget = { taskId: c.id, batchId: b.id, max: b.planned_qty };
+  cgTarget = { taskId: c.id, batchId: b.id, max: b.consignable_max };
   $('#cgTitle').textContent = '🚚 外部にあずける';
-  $('#cgName').textContent = c.title + '（このぶん ' + (b.planned_qty == null ? '数不明' : b.planned_qty + ' 個') + '）';
+  $('#cgName').textContent = c.title + '（渡せるのは ' + (b.consignable_max == null ? '数不明' : b.consignable_max + ' 個') + '）';
   $('#cgMsg').textContent = '';
   const per = (c.master && c.master.units_per_container) || null;
   // 🌱 はじめての商品は「半分」をすすめる。⭐数は勝手に入れない (要件 §AB-9)
-  const half = b.planned_qty != null ? roundToPack(Math.floor(b.planned_qty / 2), per) : null;
+  const room = b.consignable_max;
+  const half = room != null ? roundToPack(Math.floor(room / 2), per) : null;
   $('#cgBody').innerHTML =
     '<div class="dq">' +
     '<label>どこへ渡しますか</label>' +
@@ -4967,12 +4975,12 @@ function openConsign() {
       '<button type="button" class="chip' + (i === 0 ? ' on' : '') + '" data-cgfac="' + esc(f.code) + '">' + esc(f.name) + '</button>').join('') + '</div>' +
     '<label style="margin-top:12px">何個わたしますか</label>' +
     '<div class="row"><input class="cgQty" type="number" inputmode="numeric" min="1" step="1" placeholder="—">' +
-      '<span class="of">／ 渡せるのは ' + (b.planned_qty == null ? '—' : b.planned_qty) + ' 個まで</span></div>' +
+      '<span class="of">／ 渡せるのは ' + (room == null ? '—' : room) + ' 個まで</span></div>' +
     (c.first_time && half ? '<p class="sub warn">🌱 はじめての商品です。まず半分の ' + half + ' 個を預けるのがおすすめです</p>' +
       '<div class="quick"><button type="button" data-cgq="' + half + '">' + half + '個にする</button>' +
-      (b.planned_qty != null ? '<button type="button" data-cgq="' + b.planned_qty + '">ぜんぶ ' + b.planned_qty + '個</button>' : '') + '</div>'
+      (room != null ? '<button type="button" data-cgq="' + room + '">ぜんぶ ' + room + '個</button>' : '') + '</div>'
       : '<div class="quick">' + (half ? '<button type="button" data-cgq="' + half + '">半分 ' + half + '個</button>' : '') +
-        (b.planned_qty != null ? '<button type="button" data-cgq="' + b.planned_qty + '">ぜんぶ ' + b.planned_qty + '個</button>' : '') + '</div>') +
+        (room != null ? '<button type="button" data-cgq="' + room + '">ぜんぶ ' + room + '個</button>' : '') + '</div>') +
     '<label style="margin-top:12px">いつまでに返してもらいますか（任意）</label>' +
     '<div class="chips" id="cgDue">' +
       '<button type="button" class="chip" data-cgdue="7">1週間後</button>' +
@@ -5050,14 +5058,28 @@ function openConsignAct(action, consignmentId) {
   if (!worker) { openGate(); return; }
   const cg = (c.consignments || []).find((x) => x.id === consignmentId);
   if (!cg) return;
-  cgTarget = { act: action, id: consignmentId, version: cg.version, taskId: c.id };
   const left = (cg.handed_qty != null ? cg.handed_qty : cg.planned_qty) - (cg.returned_total || 0);
-  $('#cgTitle').textContent = action === 'handed' ? '🚚 わたしました' : action === 'cancel' ? '🚚 この預けをやめます' : '🚚 返却を受け取る';
+  // ⭐冪等の鍵は**操作を始めるときに 1 回だけ**作る。送り直すたびに変えると、
+  //   届いていた分をもう一度受け取ってしまう (Codex R1 中11)
+  cgTarget = { act: action, id: consignmentId, version: cg.version, taskId: c.id,
+    key: 'ret-' + consignmentId + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) };
+  $('#cgTitle').textContent = action === 'handed' ? '🚚 わたしました' : action === 'cancel' ? '🚚 この預けをやめます'
+    : action === 'prepared' ? '🚚 箱とラベルを用意しました' : action === 'settle' ? '🚚 返ってこないぶんを精算' : '🚚 返却を受け取る';
   $('#cgName').textContent = c.title + '（' + facilityName(cg.facility_code) + '）';
   $('#cgMsg').textContent = '';
   $('#cgBody').innerHTML = '<div class="dq">' + (
     action === 'cancel'
       ? '<p class="sub">まだ渡していないぶんが、元のぶんに戻ります。渡したあとは取り消せません。</p>'
+      : action === 'prepared'
+        ? '<label>箱とラベルを何個ぶん用意しましたか</label>' +
+          '<div class="row"><input class="cgQty" type="number" inputmode="numeric" min="1" step="1" value="' + esc(String(cg.planned_qty)) + '">' +
+            '<span class="of">／ 渡す予定は ' + esc(String(cg.planned_qty)) + ' 個</span></div>' +
+          '<p class="sub">箱を数え、正しいラベルが貼れていることを確かめてから押してください。</p>'
+      : action === 'settle'
+        ? '<label>返ってこなかった数</label>' +
+          '<div class="row"><input class="cgQty" type="number" inputmode="numeric" min="0" step="1" value="' + esc(String(Math.max(0, left))) + '">' +
+            '<span class="of">／ 残り ' + esc(String(left)) + ' 個</span></div>' +
+          '<p class="sub">向こうで壊れた等で、物として返ってこないぶんです。これで預けを閉じます。</p>'
       : action === 'handed'
         ? '<label>実際に何個わたしましたか</label>' +
           '<div class="row"><input class="cgQty" type="number" inputmode="numeric" min="1" step="1" value="' + esc(String(cg.planned_qty)) + '">' +
@@ -5072,7 +5094,8 @@ function openConsignAct(action, consignmentId) {
   ) + '</div>' +
     '<div class="mbtns"><button class="btn" onclick="closeConsign()">やめる</button>' +
     '<button class="btn primary" id="cgGo" onclick="submitConsignAct()">' +
-      (action === 'handed' ? 'わたしました' : action === 'cancel' ? 'この預けをやめる' : '受け取りました') + '</button></div>';
+      (action === 'handed' ? 'わたしました' : action === 'cancel' ? 'この預けをやめる'
+        : action === 'prepared' ? '用意しました' : action === 'settle' ? 'これで精算する' : '受け取りました') + '</button></div>';
   openOverlay('#cgOv');
   $('#cgTitle').focus();
 }
@@ -5084,8 +5107,11 @@ async function submitConsignAct() {
   const qtyEl = $('#cgBody').querySelector('.cgQty');
   if (cgTarget.act !== 'cancel') {
     const v = qtyEl ? Number(String(qtyEl.value).trim()) : NaN;
-    if (!Number.isInteger(v) || v <= 0) { $('#cgMsg').textContent = '❌ 個数は 1 以上の整数で入れてください'; return; }
-    if (cgTarget.act === 'handed') body.qty = v; else body.returned_qty = v;
+    const min = cgTarget.act === 'settle' ? 0 : 1;   // 精算は「返ってこなかった 0 個」もありうる
+    if (!Number.isInteger(v) || v < min) { $('#cgMsg').textContent = '❌ 個数は ' + min + ' 以上の整数で入れてください'; return; }
+    if (cgTarget.act === 'handed' || cgTarget.act === 'prepared') body.qty = v;
+    else if (cgTarget.act === 'settle') body.missing_qty = v;
+    else body.returned_qty = v;
   }
   if (cgTarget.act === 'return') {
     const g = $('#cgBody').querySelector('.cgGood');
@@ -5095,8 +5121,7 @@ async function submitConsignAct() {
       if (!Number.isInteger(gv) || gv < 0) { $('#cgMsg').textContent = '❌ 使える数は 0 以上の整数で入れてください'; return; }
       body.good_qty = gv;
     }
-    // 二重タップ・通信の再送で 2 回受け取らない
-    body.idempotency_key = 'ret-' + cgTarget.id + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    body.idempotency_key = cgTarget.key;   // 操作の最初に作った鍵。送り直しても同じ
   }
   cgSaving = true;
   $('#cgGo').disabled = true;
@@ -5114,6 +5139,7 @@ async function submitConsignAct() {
   const act = cgTarget.act;
   closeOverlay('#cgOv'); cgTarget = null; $('#cgBody').innerHTML = '';
   toast(act === 'handed' ? 'わたしました' : act === 'cancel' ? '預けをやめました'
+    : act === 'prepared' ? '箱とラベルを用意しました' : act === 'settle' ? '精算しました'
     : j.consignment && j.consignment.state === 'settled' ? '全部返ってきました' : '返却を記録しました');
   openDetail(c.id);   // 預けの記録を取り直す
 }

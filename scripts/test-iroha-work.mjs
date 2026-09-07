@@ -5265,9 +5265,51 @@ console.log('\n[29] 外部施設にあずける — まとまりを割る・渡�
       '全部returnったら棚入待ちに');
     ok(TD.getTask(t).done_qty === 583, 'カードのできた数も合計から出る (いろは分はまだ数えていない)');
 
-    // 渡した数より多く返ってきたら断る
     const over = C.recordReturn({ consignmentId: c1.id, returnedQty: 10, expectVersion: r2.consignment.version, idempotencyKey: 'ret-c' });
-    ok(!over.ok, '精算ずみのあとは受け取らない');
+    ok(!over.ok && over.error === 'bad_state', '精算ずみのあとは受け取らない');
+  }
+
+  // ③b ⭐渡した数を超える返却は断る (まだ精算ずみでない状態で試す — Codex R1)
+  {
+    const t = mk29('cg-1b', 9936, 100);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 60, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, qty: 60, expectVersion: r.consignment.version });
+    const c = C.getConsignment(r.consignment.id);
+    const before = db.prepare('SELECT COUNT(*) n FROM f_iroha_consignment_returns WHERE consignment_id = ?').get(c.id).n;
+    const over = C.recordReturn({ consignmentId: c.id, returnedQty: 61, expectVersion: c.version, idempotencyKey: 'ret-over-1' });
+    ok(!over.ok && over.error === 'too_many', '⭐渡した 60 個より多い返却は断る (handed のまま)');
+    ok(db.prepare('SELECT COUNT(*) n FROM f_iroha_consignment_returns WHERE consignment_id = ?').get(c.id).n === before
+      && C.getConsignment(c.id).state === 'handed', '断ったので行も状態も変わらない');
+    // 使える数は 0 も入れられる / 返ってきた数を超えられない
+    const bad = C.recordReturn({ consignmentId: c.id, returnedQty: 10, goodQty: 11, expectVersion: c.version, idempotencyKey: 'ret-bad-1' });
+    ok(!bad.ok && bad.error === 'bad_qty', '⭐返ってきた数より多い「使える数」は断る (完成数を水増しさせない)');
+    const zero = C.recordReturn({ consignmentId: c.id, returnedQty: 10, goodQty: 0, lossQty: 10, expectVersion: c.version, idempotencyKey: 'ret-zero-1' });
+    ok(zero.ok, '⭐「10 個返ってきたが 1 個も使えなかった」を記録できる (0 を断らない)');
+  }
+
+  // ③c ⭐確保した数より多くは渡せない (Codex R1 重大1)
+  {
+    const t = mk29('cg-1c', 9937, 100);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 40, expectVersion: v29(t) });
+    const over = C.markHanded({ consignmentId: r.consignment.id, qty: 100, expectVersion: r.consignment.version });
+    ok(!over.ok && over.error === 'too_many', '⭐40 個の予定で 100 個は渡せない (元の数を超えて実績が積み上がる)');
+    ok(C.getConsignment(r.consignment.id).state === 'planned', '断ったので状態も変わらない');
+  }
+
+  // ③d ⭐予定より少なく渡したら、残りは手元に戻る (Codex R1 重大2)
+  {
+    const t = mk29('cg-1d', 9938, 200);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 80, expectVersion: v29(t) });
+    const away0 = sole(t).find((b) => b.facility_code === 'workcenter');
+    C.markHanded({ consignmentId: r.consignment.id, qty: 78, expectVersion: r.consignment.version });
+    const bs = sole(t);
+    const away = bs.find((b) => b.id === away0.id);
+    ok(away.planned_qty === 78, '外部のまとまりは実際に渡した 78 個になる');
+    const hand = bs.filter((b) => b.id !== away.id).reduce((a, b) => a + (b.planned_qty ?? 0), 0);
+    ok(hand === 122, '⭐渡さなかった 2 個は手元に戻る (120 + 2 = 122。外部のまとまりに取り残さない)');
   }
 
   // ④ 実績のあるまとまりは割らない
@@ -5328,6 +5370,78 @@ console.log('\n[29] 外部施設にあずける — まとまりを割る・渡�
     ok(!no.ok && no.error === 'bad_state', '⭐渡したあとは取り消せない (返却で受け取る)');
   }
 
+  // ⑥b ⭐取消で戻す先が「よそへ渡したあと」なら、そこに足さない (Codex R1 重大5)
+  {
+    const t = mk29('cg-4b', 9939, 100);
+    const b0 = sole(t)[0];
+    const a = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 40, expectVersion: v29(t) });
+    // 元に残った 60 個を、別の施設へ丸ごと渡す
+    const rest = sole(t).find((b) => b.id === b0.id);
+    const bqty = rest.planned_qty;
+    const b2 = C.startConsignment({ taskId: t, batchId: rest.id, facilityCode: 'rashinban', qty: bqty, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: b2.consignment.id, expectVersion: b2.consignment.version });
+    const beforeRashinban = db.prepare('SELECT planned_qty FROM f_iroha_task_batches WHERE id = ?').get(rest.id).planned_qty;
+    // ここで 40 個の預けをやめる
+    const c = C.getConsignment(a.consignment.id);
+    const cancel = C.cancelConsignment({ consignmentId: c.id, expectVersion: c.version });
+    ok(cancel.ok, '前提: 渡す前の 40 個はやめられる');
+    ok(db.prepare('SELECT planned_qty FROM f_iroha_task_batches WHERE id = ?').get(rest.id).planned_qty === beforeRashinban,
+      '⭐もう羅針盤へ渡したまとまりの数は増えない (勝手に相手の数を足さない)');
+    const back = sole(t).filter((b) => (!b.facility_code || b.facility_code === 'iroha'));
+    ok(back.length === 1 && back[0].planned_qty === 40,
+      '⭐戻せないときは、手元の新しいまとまり (40 個) として戻す');
+  }
+
+  // ⑥c ⭐丸ごと預けたのをやめたら、担当拠点も元に戻る (Codex R1 中6)
+  {
+    const t = mk29('cg-4c', 9940, 50);
+    const b0 = sole(t)[0];
+    ok(b0.facility_code === 'iroha', '前提: いろは担当');
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 50, expectVersion: v29(t) });
+    ok(sole(t).length === 1 && sole(t)[0].facility_code === 'workcenter', '丸ごとならまとまりは割らず、拠点が変わる');
+    const c = C.getConsignment(r.consignment.id);
+    C.cancelConsignment({ consignmentId: c.id, expectVersion: c.version });
+    ok(sole(t)[0].facility_code === 'iroha', '⭐やめたら担当拠点も いろは に戻る');
+  }
+
+  // ⑥d ⭐返ってこないぶんの精算 (Codex R1 中10)
+  {
+    const t = mk29('cg-4d', 9941, 100);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 100, expectVersion: v29(t) });
+    C.markHanded({ consignmentId: r.consignment.id, expectVersion: r.consignment.version });
+    let c = C.getConsignment(r.consignment.id);
+    C.recordReturn({ consignmentId: c.id, returnedQty: 98, goodQty: 98, expectVersion: c.version, idempotencyKey: 'ret-m-1' });
+    c = C.getConsignment(c.id);
+    ok(c.state === 'handed', '前提: 98 個返ってきたがまだ 2 個ある');
+    const wrong = C.settleConsignment({ consignmentId: c.id, missingQty: 5, expectVersion: c.version });
+    ok(!wrong.ok && wrong.error === 'bad_qty', '数が合わない精算は断る (98 + 5 ≠ 100)');
+    const okS = C.settleConsignment({ consignmentId: c.id, missingQty: 2, note: '向こうで割れた', expectVersion: c.version });
+    ok(okS.ok && okS.consignment.state === 'settled' && okS.consignment.missing_qty === 2,
+      '⭐返ってこない 2 個を確かめて精算できる (永久に handed のままにしない)');
+    ok(db.prepare('SELECT work_status FROM f_iroha_task_batches WHERE id = ?').get(sole(t)[0].id).work_status === 'ready_for_stocking',
+      '精算したら、そのまとまりは棚入待ちに');
+  }
+
+  // ⑥e ⭐取消でも親カードの版が進む (Codex R1 重大4)
+  {
+    const t = mk29('cg-4e', 9942, 80);
+    const b0 = sole(t)[0];
+    const r = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 30, expectVersion: v29(t) });
+    const vBefore = v29(t);
+    const c = C.getConsignment(r.consignment.id);
+    C.cancelConsignment({ consignmentId: c.id, expectVersion: c.version });
+    ok(v29(t) > vBefore, '⭐やめたときも親カードの版が進む (前のカードを見ている端末の要求を通さない)');
+  }
+
+  // ⑥f 日付は実在するものだけ
+  {
+    const t = mk29('cg-4f', 9943, 20);
+    const b0 = sole(t)[0];
+    const bad = C.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 5, dueDate: '2026-99-99', expectVersion: v29(t) });
+    ok(!bad.ok && bad.error === 'bad_request', '⭐2026-99-99 のような日付は断る (形だけ見ない)');
+  }
+
   // ⑦ 数を書き換える口は、分かれたカードでは断られる (前の PR の関門が効く)
   {
     const t = mk29('cg-5', 9935, 400);
@@ -5355,6 +5469,15 @@ console.log('\n[29] 外部施設にあずける — まとまりを割る・渡�
   ok(/期限を過ぎています/.test(html) && /over \? ' over' : ''/.test(html), '返す期限を過ぎたら赤く出す');
   ok(/return planError\(j, \(\) => submitConsign\(\), \{ silent: true \}\);/.test(html),
     '職員モードが切れていたら PIN を聞いて、同じ内容をもう一度送る (計画の操作と同じ流儀)');
+  ok(/cgTarget = \{ taskId: c\.id, batchId: b\.id, max: b\.consignable_max \};/.test(html)
+    && /const able = \(c\.batches \|\| \[\]\)\.filter\(\(x\) => !x\.consignable_why/.test(html),
+    '⭐渡せるぶん・渡せる数はサーバーが決めた値を使う (画面が自分で出すと「押したら断られる」)');
+  ok(/key: 'ret-' \+ consignmentId \+ '-' \+ Date\.now\(\)/.test(html)
+    && /body\.idempotency_key = cgTarget\.key;/.test(html),
+    '⭐冪等の鍵は操作を始めるときに 1 回だけ作る (送り直すたびに変えない)');
+  ok(/data-cg="prepared"/.test(html) && /data-cg="settle"/.test(html),
+    '「箱とラベルを用意した」「返ってこないぶんを精算」の入口がある');
+  ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

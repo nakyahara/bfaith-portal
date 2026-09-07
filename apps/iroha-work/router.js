@@ -84,7 +84,7 @@ import {
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
-import { startConsignment, markHanded, cancelConsignment, recordReturn, getConsignment } from './consign.js';
+import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment } from './consign.js';
 import { startStaffUnlock, staffUnlockOf, endStaffUnlock, STAFF_UNLOCK_MS } from './db.js';
 import {
   addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
@@ -869,15 +869,17 @@ router.post('/api/consign/update', checkOrigin, api((req, res) => {
   const id = Number(req.body?.consignment_id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: '預けの記録が指定されていません' });
   const action = String(req.body?.action || '');
-  if (!['handed', 'cancel', 'return'].includes(action)) {
-    return res.status(400).json({ ok: false, error: 'bad_request', message: '何をするか (渡した / やめる / 返却) が要ります' });
+  if (!['prepared', 'handed', 'cancel', 'return', 'settle'].includes(action)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '何をするか (用意した / 渡した / やめる / 返却 / 精算) が要ります' });
   }
   const gate = requireStaffPlan(req);
   if (!gate.ok) return res.status(gate.status).json(gate.body);
   const common = { consignmentId: id, expectVersion: req.body?.expect_version,
     actor: `${gate.worker.display_name} (いろはアプリ)`, guard: planGuardOf(req, gate.worker) };
-  const r = action === 'handed' ? markHanded({ ...common, qty: req.body?.qty ?? null })
+  const r = action === 'prepared' ? markPrepared({ ...common, qty: req.body?.qty ?? null })
+    : action === 'handed' ? markHanded({ ...common, qty: req.body?.qty ?? null })
     : action === 'cancel' ? cancelConsignment(common)
+    : action === 'settle' ? settleConsignment({ ...common, missingQty: req.body?.missing_qty ?? 0, note: req.body?.note ?? null })
     : recordReturn({ ...common, returnedQty: req.body?.returned_qty,
         goodQty: 'good_qty' in (req.body || {}) ? req.body.good_qty : undefined,
         lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
@@ -897,6 +899,7 @@ router.post('/api/consign/update', checkOrigin, api((req, res) => {
 function consignErrorStatus(e) {
   if (e === 'not_found') return 404;
   if (['conflict', 'closed_task', 'bad_state', 'active_sessions', 'already_stocked', 'already_printed', 'batch_closed', 'notion_mode'].includes(e)) return 409;
+  if (e === 'too_many') return 409;
   return 400;
 }
 

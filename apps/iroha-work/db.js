@@ -254,6 +254,11 @@ const consignDDL = (name) => `
       -- cancelled = 渡す前にやめた
       state         TEXT NOT NULL CHECK (state IN ('planned','prepared','handed','settled','cancelled')),
       due_date      TEXT,                                        -- いつまでに返してほしいか (任意)
+      -- ⭐渡す前にやめたときに戻す担当拠点。まとまりを割らずに丸ごと預けたときだけ入る (Codex R1 中6)
+      prev_facility_code TEXT,
+      -- ⭐外部で壊れる等で**物として返ってこない数**。職員が確かめて精算するときに入れる (Codex R1 中10)。
+      --   返却行の good/loss (返ってきた物の内訳) とは別のもの
+      missing_qty   INTEGER CHECK (missing_qty IS NULL OR missing_qty >= 0),
       planned_at    TEXT NOT NULL,
       planned_by    TEXT,
       prepared_at   TEXT,
@@ -279,6 +284,7 @@ const consignReturnDDL = (name) => `
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       consignment_id  INTEGER NOT NULL REFERENCES f_iroha_consignments(id),
       returned_qty    INTEGER NOT NULL CHECK (returned_qty >= 0),
+      -- ⭐返ってきた物の内訳。good + loss <= returned_qty (サービス層でも守る)
       good_qty        INTEGER CHECK (good_qty IS NULL OR good_qty >= 0),
       loss_qty        INTEGER CHECK (loss_qty IS NULL OR loss_qty >= 0),
       returned_at     TEXT NOT NULL,

@@ -22,7 +22,7 @@ import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
 import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask } from './tasks-db.js';
 import { countsByTask, stockingOfTask, batchesByTask } from './batches.js';
-import { consignmentsOfTask } from './consign.js';
+import { consignmentsOfTask, splittableMax, whyCannotSplit } from './consign.js';
 
 /**
  * ⭐「急ぎ」の線引き (中原さん 2026-09-06)。
@@ -306,7 +306,10 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
   const counts = countsByTask(getDB(), rows.map((r) => r.id));
   // まとまり (ふだんは 1 つ)。⭐一覧では「あずけ中が何個あるか」を出すのに使う (要件 §AB-7)
   const batches = batchesByTask(getDB(), rows.map((r) => r.id));
-  const awayByTask = new Map(getDB().prepare(`SELECT b.task_id, SUM(COALESCE(c.handed_qty, c.planned_qty)) qty,
+  // ⭐いま外にあるのは「渡した数 − 返ってきた数」。100 個渡して 90 個返っても 100 と出さない (Codex R1 中9)
+  const awayByTask = new Map(getDB().prepare(`SELECT b.task_id,
+      SUM(COALESCE(c.handed_qty, c.planned_qty)
+        - COALESCE((SELECT SUM(r.returned_qty) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id), 0)) qty,
       COUNT(*) n, MIN(c.due_date) due
     FROM f_iroha_consignments c JOIN f_iroha_task_batches b ON b.id = c.batch_id
     WHERE c.state IN ('planned','prepared','handed') GROUP BY b.task_id`).all().map((r) => [r.task_id, r]));
@@ -348,9 +351,16 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       counted: !!(counts.get(r.id) || {}).counted,
       // ⭐外部にあずけているぶん (要件 §AB-7)。無ければ null (0 で代用しない)
       away: awayByTask.get(r.id) ? { qty: awayByTask.get(r.id).qty, count: awayByTask.get(r.id).n, due: awayByTask.get(r.id).due || null } : null,
-      batches: (batches.get(r.id) || []).map((b) => ({ id: b.id, seq: b.seq, planned_qty: b.planned_qty,
-        facility_code: b.facility_code, expiry: b.expiry, work_status: b.work_status,
-        good_qty: b.good_qty, loss_qty: b.loss_qty })),
+      // ⭐「あと何個渡せるか」「なぜ渡せないか」はサーバーが決める。
+      //   画面が自分で予定数から出すと、サーバーの判定とずれて「押したら断られる」ことになる (Codex R1 中7)
+      batches: (batches.get(r.id) || []).map((b) => {
+        const why = whyCannotSplit(getDB(), b);
+        return { id: b.id, seq: b.seq, planned_qty: b.planned_qty,
+          facility_code: b.facility_code, expiry: b.expiry, work_status: b.work_status,
+          good_qty: b.good_qty, loss_qty: b.loss_qty,
+          consignable_max: why ? 0 : (splittableMax(getDB(), b) ?? null),
+          consignable_why: why ? why.message : null };
+      }),
       hold_memo: r.hold_memo || null,
       planned_date: r.planned_date,
       today: r.planned_date === today,
