@@ -325,6 +325,54 @@
     //    ホーム画面アイコン (standalone) から開いた iPad で起きやすい
     const isStandalone = () => !!(window.navigator.standalone
       || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+    const isIpad = () => {
+      try {
+        const ua = navigator.userAgent || '';
+        return /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+      } catch (e) { return false; }
+    };
+    /**
+     * 窓の幅が画面の幅よりはっきり狭い状態。**iPad のときだけ見る**。
+     * ⚠ これで分かるのは「狭い」ことだけで、**理由までは分からない** (Codex #1241 R1):
+     *    画面2分割 (Split View / Slide Over) / ウィンドウ表示 / ページの拡大 のどれでも狭くなる。
+     *    断定せず「どれかに当てはまりませんか」と聞く言い方にする。
+     *    それでも見る価値があるのは、**iPhone には無い状態**だから
+     *    (「iPhone は読めるのに iPad だけダメ」の手がかりになる)
+     */
+    const narrowWindow = () => {
+      try {
+        if (!isIpad()) return false;
+        const w = window.innerWidth, sw = (window.screen && window.screen.width) || 0;
+        return !!(sw && w && w < sw * 0.85);
+      } catch (e) { return false; }
+    };
+    /**
+     * 端末の種類と **UA が名乗っている** OS の版。
+     * ⚠ 実際の版とは限らない (Codex #1241 R1): Macintosh 形式の iPad UA では取れず、
+     *   Safari 26 以降は OS 部分が固定値になる。**正確な版は「設定 → 一般 → 情報」で見る**
+     */
+    const deviceTag = () => {
+      try {
+        const ua = navigator.userAgent || '';
+        const kind = isIpad() ? 'iPad' : /iPhone/.test(ua) ? 'iPhone' : 'その他';
+        const m = ua.match(/OS (\d+)[_.](\d+)/);
+        return kind + (m ? '/UA' + m[1] + '.' + m[2] : '');
+      } catch (e) { return '不明'; }
+    };
+    /**
+     * **公開された**映像入力の数 (null = 未確認)。
+     * 🚨 権限を得る前の enumerateDevices は台数が絞られる (複数あっても1台に見える) ので、
+     *    **カメラを掴めてから数える**。0 でも「端末で使えない」とは言い切れない (Codex #1241 R1)
+     */
+    let videoInputs = null;
+    const countVideoInputs = () => {
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+        navigator.mediaDevices.enumerateDevices()
+          .then((ds) => { videoInputs = ds.filter((d) => d.kind === 'videoinput').length; })
+          .catch(() => { /* 取れなくてよい */ });
+      } catch (e) { /* 取れなくてよい */ }
+    };
     // 🚨 **カメラの条件は段階的に緩める** (2026-09-07 実機: iPhone は通るが iPad だけ即切れる)。
     //    iPad は背面/前面が複数あり、解像度や facingMode の指定が強いと
     //    **getUserMedia は成功するのにトラックが即 ended になる**ことがある。
@@ -332,7 +380,10 @@
     const CAMERA_TRIES = [
       { video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false },
       { video: { facingMode: 'environment' }, audio: false },
-      { video: true, audio: false },                    // 最後は「どのカメラでもよい」
+      { video: true, audio: false },                    // どのカメラでもよい
+      // 前面カメラ。**exact で確実に前面**を要求する (希望条件だと前面が選ばれる保証がない)。
+      // 掴めなければ OverconstrainedError になり、それも切り分けの材料になる
+      { video: { facingMode: { exact: 'user' } }, audio: false },
     ];
     let cameraTry = 0;
     async function startScan() {
@@ -386,6 +437,7 @@
         return;
       }
       scanStream = stream;
+      countVideoInputs();   // 🚨 権限を得たあとで数える (前だと台数が絞られる)
       const v = $('#scanVideo');
       // 🚨 **先に画面へ出してから** stream をつなぐ。display:none のまま挿すと iOS は再生を始めない
       //    (2026-09-07 実機。映像が黒いままだった原因のひとつ)
@@ -444,6 +496,12 @@
           } catch (e) { /* 取れなくてよい */ }
         }
         bits.push(isStandalone() ? 'ホーム画面' : 'ブラウザ');
+        bits.push(deviceTag());
+        bits.push('映像入力' + (videoInputs === null ? '未確認' : videoInputs));
+        try {
+          bits.push('窓' + window.innerWidth + '/画面' + ((window.screen && window.screen.width) || '?'));
+        } catch (e) { /* 取れなくてよい */ }
+        if (narrowWindow()) bits.push('窓が狭い');
         return bits.join(' ');
       };
       let videoWatch = BarcodeScanDecide.newVideoWatch(now());
@@ -489,12 +547,16 @@
             return;
           }
           banner('err', 'カメラが切れました' + (heldMs < 3000 ? ' (つないだ直後に切れています)' : '')
-            + '。' + (isStandalone()
+            + '。' + (narrowWindow()
+              ? '<b>画面を2分割 (Split View / Slide Over) していませんか。ウィンドウを小さくしている、'
+                + 'ページを拡大している場合も同じです。iPad ではそのときカメラを使えないことがあります。'
+                + '全画面・等倍にしてからもう一度押してください。</b>'
+              : isStandalone()
               ? '<b>ホーム画面のアイコンから開いた状態だとカメラを使えないことがあります。'
                 + 'まず Safari で開いて試してください。</b>'
-              : '<b>iPad では、画面を2分割 (Split View / Slide Over) しているとカメラが使えないことがあります。'
-                + '全画面にしてからもう一度押してください。</b>')
-            + '他のアプリがカメラを使っていないかも確かめてください。'
+              : '<b>アプリをいったん完全に終了して開き直してください</b> '
+                + '(画面下から上にスワイプして止める)。それでもだめなら iPad を再起動してください。')
+            + '他のアプリや、開きっぱなしの別のタブがカメラを使っていないかも確かめてください。'
             + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます'
             + '<br><small>' + esc(snapshot) + '</small>', { sticky: true });
           return;

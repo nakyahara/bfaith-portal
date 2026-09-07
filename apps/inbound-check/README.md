@@ -232,14 +232,26 @@ active バッチの work_date < 今日 (JST)
       到着の見張りだけでは正常と区別できない
   - 🚨 **iPad だけ「掴めたのに即 ended」になる** (2026-09-07 実機。iPhone は同じコードで通った)。
     - **カメラの条件を段階的に緩める** (`CAMERA_TRIES`):
-      `facingMode:environment + width 1280` → `facingMode:environment` → `video: true`。
+      `facingMode:environment + width 1280` → `facingMode:environment` → `video: true` →
+      `facingMode:{exact:'user'}` (前面。背面だけ掴めない iPad の切り分けにもなる)。
       掴めなかった (`OverconstrainedError` 等) ときも、**つないだ直後 (3秒未満) に切れた**ときも、
       次の条件で自動で取り直す。ボタンを押し直したら最初の条件から
     - 打ち切りの案内に **診断** を添える (`diag()`: 経過ms / ended@ms / track の状態 / video.readyState /
-      play の失敗 / どの条件だったか / カメラ名 / 解像度 / ホーム画面かブラウザか)。
+      play の失敗 / どの条件だったか / facingMode / 解像度 / ホーム画面かブラウザか /
+      端末と OS の版 / つながっているカメラの台数 / 窓と画面の幅 / 分割中の可能性)。
       実機を触れないので、**現場から聞き取れる形にしておく**のが唯一の手がかりになる
-    - 案内は状況で変える: ホーム画面 (standalone) なら「Safari で開いて試す」、
-      ブラウザなら「iPad の画面2分割 (Split View / Slide Over) を解除して全画面にする」
+    - **窓が画面より狭いか**を見る (`narrowWindow`。`window.innerWidth < screen.width * 0.85`)。
+      **iPad のときだけ**判定する (PC の小さい窓で iPad 向けの案内を出さないため)。
+      ⚠ 分かるのは「狭い」ことだけで**理由は分からない** — 画面2分割 / ウィンドウ表示 /
+      ページの拡大 のどれでも狭くなる (Codex #1241 R1)。断定せず全部並べて聞く。
+      それでも見る価値があるのは **iPhone には無い状態**だから
+    - ⚠ **`enumerateDevices` は権限を得てから呼ぶ**。前だと台数が絞られ (複数あっても1台)、
+      **0 を「端末で使えない」と読んではいけない**。未確認と 0 は別物として出す
+    - ⚠ **UA の OS 版は「UA が名乗っている値」**。Macintosh 形式の iPad UA では取れず、
+      Safari 26 以降は固定値になる。正確な版は「設定 → 一般 → 情報」で見る
+    - 前面カメラは **`facingMode: { exact: 'user' }`**。希望条件だと前面が選ばれる保証がない
+    - 案内は状況で変える: 窓が狭い → 「全画面・等倍にしてもう一度」/ ホーム画面 (standalone) →
+      「Safari で開いて試す」/ それ以外 → 「アプリを完全に終了して開き直す・iPad を再起動」
     - 🚨 **取り直しの予約は `scheduleRescan` を通す**。裸の `setTimeout` だと、予約したあとに
       閉じられても走ってしまい、**閉じたのにカメラが勝手に開く** (Codex #1239 R1)。
       予約した時点の世代を覚えて、変わっていたら走らせない。`stopScan` は予約も取り消す
