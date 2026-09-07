@@ -538,21 +538,25 @@ export function buildFacilityView(facilityCode) {
     JOIN f_iroha_task_batches b ON b.id = c.batch_id
     JOIN f_iroha_tasks t ON t.id = b.task_id
     WHERE c.facility_code = ? AND c.state <> 'cancelled'
-      -- ⭐終わったぶん (受け取りずみ) は**直近だけ**。年が経つほど 1 回の応答が重くなるのを防ぐ (Codex R2 中2)
-      AND (c.state <> 'settled' OR c.id >= COALESCE(
-        (SELECT MIN(id) FROM (SELECT id FROM f_iroha_consignments
-          WHERE facility_code = ? AND state = 'settled' ORDER BY id DESC LIMIT ?)), 0))
+      -- ⭐終わったぶん (受け取りずみ) は**直近だけ**。年が経つほど 1 回の応答が重くなるのを防ぐ (Codex R2 中2)。
+      -- ⭐「直近」は**精算した日**で選ぶ (Codex R4 軽微2)。作った順 (id) で選ぶと、古い預けを今日精算したときに
+      --    「今日受け取った記録」が出た瞬間に消える。id の大小ではなく、選んだ id そのもので絞る
+      AND (c.state <> 'settled' OR c.id IN (
+        SELECT id FROM f_iroha_consignments
+        WHERE facility_code = ? AND state = 'settled'
+        ORDER BY settled_at DESC, id DESC LIMIT ?))
     ORDER BY (c.state = 'settled'), c.due_date IS NULL, c.due_date, c.id DESC
     LIMIT ?`).all(facilityCode, facilityCode, SETTLED_SHOWN, FACILITY_ROWS_MAX);
-  // 返却の明細も上限つき (1 回の預けに何十回も返ってくることは無いが、上限が無い読み取りを外に置かない)
+  // 返却の明細も上限つき (1 回の預けに何十回も返ってくることは無いが、上限が無い読み取りを外に置かない)。
+  // ⭐**新しいほうから**取る (Codex R4 軽微3)。古い順に切ると、21 回目以降は毎回いちばん新しい記録が隠れる
   const returnsOf = db.prepare(`SELECT returned_qty, returned_at
-    FROM f_iroha_consignment_returns WHERE consignment_id = ? ORDER BY id LIMIT ${RETURNS_SHOWN}`);
+    FROM f_iroha_consignment_returns WHERE consignment_id = ? ORDER BY id DESC LIMIT ${RETURNS_SHOWN}`);
   const today = jstToday();
   const items = rows.map((r) => {
     // 作業のしかた = 作業仕様。カード作成時のスナップショットを使う (渡した時点の指示 — §AB-13)
     let snap = null;
     try { snap = r.master_snapshot ? JSON.parse(r.master_snapshot) : null; } catch { /* 壊れていれば出さないだけ */ }
-    const back = returnsOf.all(r.id);            // 明細は直近だけ (見せる用)
+    const back = returnsOf.all(r.id).reverse();  // 明細は直近だけ (見せる用)。画面には古い順に並べる
     const returned = Number(r.returned_total) || 0;   // ⭐数は SQL の合計を使う (明細の件数に左右されない)
     const qty = r.handed_qty ?? r.planned_qty;
     return {

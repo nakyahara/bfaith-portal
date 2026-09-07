@@ -6562,6 +6562,34 @@ console.log('\n[32] 外部施設の専用 URL (見るだけ。§AB-11 の 6)');
     ok(it9.returned_qty === 210, '⭐21 回に分けて返しても、合計は 210 個 (表示した 20 件だけで数えない)');
     ok(it9.remaining === 390, '⭐残りも 390 個 (400 個と出さない)');
     ok(it9.returns.length === 20 && it9.returns_more === 1, '明細は 20 件まで・出しきれなかった 1 件は件数で伝える');
+    // ⭐隠れるのは**古いぶん**。いちばん新しい記録は必ず出る (Codex R4 軽微3)
+    const allRet = db.prepare('SELECT id, returned_at FROM f_iroha_consignment_returns WHERE consignment_id = ? ORDER BY id')
+      .all(cg.consignment.id);
+    const newest = db.prepare('SELECT returned_at FROM f_iroha_consignment_returns WHERE consignment_id = ? ORDER BY id DESC LIMIT 1')
+      .get(cg.consignment.id);
+    ok(allRet.length === 21 && it9.returns.some((x) => x.at === newest.returned_at),
+      '⭐21 回目 (いちばん新しい返却) が明細に出る — 古い順に切って隠さない');
+  }
+
+  // ⑧b ⭐「直近の受け取りずみ」は**精算した日**で選ぶ (Codex R4 軽微2)
+  {
+    // 古い預けを今日精算しても、出た瞬間に消えないこと。SETTLED_SHOWN を超える数で試す
+    const made = [];
+    for (let i = 0; i < 32; i++) {
+      const t = mk('fl-s' + i, 9304 + i, 10);
+      const cg = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+        facilityCode: 'workcenter', qty: 10, expectVersion: v(t) });
+      C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+      const c = C.getConsignment(cg.consignment.id);
+      C.recordReturn({ consignmentId: c.id, returnedQty: 10, expectVersion: c.version, idempotencyKey: 'fls-' + i });
+      made.push(cg.consignment.id);
+    }
+    // いちばん古い預け (id が小さい) を、いちばん新しく精算したことにする
+    const oldest = made[0];
+    db.prepare("UPDATE f_iroha_consignments SET settled_at = ? WHERE id = ?").run('2099-01-01T00:00:00.000Z', oldest);
+    const shown = SV.buildFacilityView('workcenter').items.map((x) => x.id);
+    ok(shown.includes(oldest),
+      '⭐古い預けを今日精算しても、「受け取りずみ」の直近に出る (作った順で切らない)');
   }
 
   // ⑨ ⭐出す件数に上限があっても、まとめの数は全部から数える (Codex R3 中3)

@@ -104,9 +104,11 @@ function cardHtml(it) {
       : '<span class="st">' + esc(fmtMd(it.due_date)) + ' までにお願いします</span>')
     : '';
   const rets = (it.returns || []).length
-    ? '<ul class="rets">' + it.returns.map((r) =>
-      '<li>' + esc(fmtMd(r.at)) + ' に ' + esc(String(r.qty)) + ' 個お持ちいただきました</li>').join('')
-      + (it.returns_more > 0 ? '<li>ほかに ' + esc(String(it.returns_more)) + ' 回ぶんあります</li>' : '')
+    ? '<ul class="rets">'
+      // 隠れているのは**これより古いぶん**なので先に書く (新しい記録は必ず出る)
+      + (it.returns_more > 0 ? '<li>これより前に ' + esc(String(it.returns_more)) + ' 回ぶんあります</li>' : '')
+      + it.returns.map((r) =>
+        '<li>' + esc(fmtMd(r.at)) + ' に ' + esc(String(r.qty)) + ' 個お持ちいただきました</li>').join('')
       + '</ul>'
     : '';
   return '<article class="card' + (it.state === 'settled' ? ' settled' : '') + '">'

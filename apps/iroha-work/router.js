@@ -2163,8 +2163,11 @@ router.get('/admin/sessions/search.csv', requireAdmin, api((req, res) => {
  *   いまは:
  *     ① まずトークンを確かめる (索引つきの 1 回の読み取り。当たらなければ何も覚えない)
  *     ② 当たったものだけ**リンクの id** で数える (発行した本数ぶんしか増えない)
- *     ③ 接続元でも数える。こちらは**入る数に上限**を置き、あふれたら**いちばん古いものから捨てる**
- *        (Map は入れた順を覚えているので、全部を見にいかなくても捨てられる)
+ *     ③ 接続元でも数える。こちらは**入る数に上限**を置く。あふれたときは**期限切れのものだけ**捨て、
+ *        まだ生きている記録は捨てずに断る (429)。
+ *        ⚠生きている記録を追い出すと、**わざと別の接続元をたくさん作って自分の記録を消し、
+ *          数え直させる**ことができてしまう (Codex R4 中1)。あふれるほど来ている時点で異常なので、
+ *          新しい接続元を断る側に倒す
  */
 const FL_WINDOW_MS = 60_000;
 const FL_MAX_PER_WINDOW = 60;      // 1 分に 60 回 (人が見るぶんには十分。画面は 1 回開くと 2 回)
@@ -2182,9 +2185,16 @@ function bumpWindow(map, key, max, cap) {
   }
   if (cur) map.delete(key);                       // 期限切れは入れ直す (入れた順を新しくする)
   if (cap && map.size >= cap) {
-    // ⭐全部を見にいかない。**いちばん古い 1 つ**だけ捨てる (増え続けること自体を攻撃にさせない)
-    const oldest = map.keys().next();
-    if (!oldest.done) map.delete(oldest.value);
+    // ⭐**期限切れのものだけ**捨てる。入れた順に並んでいるので、前から数個見れば足りる (全部は見にいかない)
+    let looked = 0;
+    for (const [k, v] of map) {
+      if (v.until > now) break;                   // ここから先はまだ生きている (入れた順なので)
+      map.delete(k);
+      if (++looked >= 50 || map.size < cap) break;
+    }
+    // ⭐それでも空かないなら、**生きている記録は捨てずに断る**。
+    //   捨ててしまうと、別の接続元をたくさん作って自分の記録を消せる = 数え直しができてしまう
+    if (map.size >= cap) return false;
   }
   map.set(key, { count: 1, until: now + FL_WINDOW_MS });
   return true;

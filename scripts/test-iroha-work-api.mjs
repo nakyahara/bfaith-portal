@@ -396,6 +396,46 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
       if (r.status === 429) spoofBlocked++;
     }
     ok(spoofBlocked > 0, '⭐X-Forwarded-For の先頭を毎回変えても、上限をすり抜けられない (' + spoofBlocked + ' 回で断った)');
+
+    // ⭐叩かれている**最中**でも社内の画面が開く (終わったあとの計測では分からない — Codex R4)
+    {
+      let worst = 0;
+      const attack = (async () => {
+        for (let i = 0; i < 400; i++) {
+          await fetch(`http://${HOST}/apps/iroha-work/f/${'d'.repeat(30)}${i}`,
+            { headers: { Host: HOST, 'X-Forwarded-For': '192.0.2.' + (i % 200) } }).catch(() => {});
+        }
+      })();
+      for (let i = 0; i < 10; i++) {
+        const t = Date.now();
+        const r = await get('/api/state');
+        worst = Math.max(worst, Date.now() - t);
+        ok(r.status === 200, '⭐叩かれている最中でも社内の一覧が開く (' + (i + 1) + '回目)');
+      }
+      await attack;
+      ok(worst < 3000, '⭐叩かれている最中でも社内の一覧が待たされない (いちばん遅くて ' + worst + 'ms)');
+    }
+
+    // ⭐たくさんの接続元で記録をあふれさせても、いったん断った相手が数え直せない (Codex R4 中1)
+    {
+      const victim = '198.51.100.99';
+      let blockedOnce = false;
+      for (let i = 0; i < 200 && !blockedOnce; i++) {
+        const r = await fetch(`http://${HOST}/apps/iroha-work/f/${'e'.repeat(30)}${i}`,
+          { headers: { Host: HOST, 'X-Forwarded-For': victim } });
+        if (r.status === 429) blockedOnce = true;
+      }
+      ok(blockedOnce, '前提: この接続元はいったん断られた');
+      // 別の接続元を大量に作って、記録を押し出そうとする
+      for (let i = 0; i < 300; i++) {
+        await fetch(`http://${HOST}/apps/iroha-work/f/${'f'.repeat(30)}${i}`,
+          { headers: { Host: HOST, 'X-Forwarded-For': '203.0.114.' + (i % 250) } }).catch(() => {});
+      }
+      const again = await fetch(`http://${HOST}/apps/iroha-work/f/${'g'.repeat(30)}`,
+        { headers: { Host: HOST, 'X-Forwarded-For': victim } });
+      ok(again.status === 429,
+        '⭐別の接続元をたくさん作っても、断られた記録は消せない (生きている記録は追い出さない)');
+    }
   }
 
   // でたらめ・失効したトークン
