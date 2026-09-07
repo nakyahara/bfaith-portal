@@ -16,7 +16,8 @@ const { initExpectedProfitDB } = await import('./db.js');
 const { planRefresh, buildFeeRequest, toEstimateRow, saveEstimates, loadCache, refreshFees, cacheKey,
   storedSellerId, withResolvedSeller, rememberSellerId,
   validityOffsetDays, feeValidDays,
-  BATCH_SIZE, BATCH_SLEEP_MS, SP_API_FEES_RATE_PER_SEC, SP_API_FEES_MAX_BATCH } = await import('./refresh-fees.js');
+  BATCH_SIZE, BATCH_SLEEP_MS, SP_API_FEES_RATE_PER_SEC, SP_API_FEES_MAX_BATCH,
+  looksLikeAsin, feeIdentifierOf, backoffDays, recordFailure, clearFailure, loadFailures } = await import('./refresh-fees.js');
 const { getSetting, setSetting, SETTING_AMAZON_SELLER_ID } = await import('./db.js');
 const forgetSeller = () => setSetting(db, SETTING_AMAZON_SELLER_ID, null);
 
@@ -625,6 +626,108 @@ await ta('[!] 取り直しは「入力が変わった/見積が無い」を先�
     },
   });
   assert.deepEqual(asked, ['new1'], '見積が無いものを先に取る (期限切れは数字が出るだけまし)');
+});
+
+
+console.log('');
+console.log('商品の指し方 (実データ: JAN を ASIN として送っていた 5 件)');
+
+t('[!] ASIN の形なら ASIN で指す', () => {
+  assert.ok(looksLikeAsin('B09WMM1G2S'));
+  assert.deepEqual(feeIdentifierOf(target({ asin: 'B09WMM1G2S' })), { IdType: 'ASIN', IdValue: 'B09WMM1G2S' });
+});
+
+t('[!] 13桁の JAN は ASIN ではない → 自社SKU で指す', () => {
+  // 🚨 実データ: 4901267220001 を IdType:ASIN で送って必ず client-side error になっていた。
+  //    公式も「ASIN か SellerSKU。UPC/ISBN 等の識別子は不可」
+  assert.equal(looksLikeAsin('4901267220001'), false);
+  assert.deepEqual(feeIdentifierOf(target({ asin: '4901267220001', seller_sku: '3M-3JSM-8UDX' })),
+    { IdType: 'SellerSKU', IdValue: '3M-3JSM-8UDX' });
+});
+
+t('書籍の ISBN10 は ASIN として正しい (英数10桁)', () => {
+  assert.ok(looksLikeAsin('4062748223'));
+  assert.equal(looksLikeAsin('406274822'), false, '9桁は違う');
+  assert.equal(looksLikeAsin('40627482231'), false, '11桁は違う');
+  assert.equal(looksLikeAsin('b09wmm1g2s'), false, '小文字は ASIN ではない');
+});
+
+t('リクエストにも反映される', () => {
+  const body = buildFeeRequest([target({ asin: '4901267220001', seller_sku: 'sku-jan' })]);
+  assert.equal(body[0].IdType, 'SellerSKU');
+  assert.equal(body[0].IdValue, 'sku-jan');
+});
+
+console.log('');
+console.log('毎晩失敗し続ける対象を止める (実データ: 86件が毎晩必ず失敗)');
+
+t('待ち日数は 1 → 3 → 7 → 14 で伸びる (1回目は翌晩＝一時的な失敗はすぐ回復)', () => {
+  assert.equal(backoffDays(1), 1);
+  assert.equal(backoffDays(2), 3);
+  assert.equal(backoffDays(3), 7);
+  assert.equal(backoffDays(4), 14);
+  assert.equal(backoffDays(99), 14, '無限に伸ばさない');
+});
+
+await ta('[!] 失敗した対象は記録され、待ち時間の間は試さない', async () => {
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  const t1 = target({ seller_sku: 'alwaysFail' });
+  const fail = async (body) => body.map(b => ({
+    Status: 'ClientError',
+    FeesEstimateIdentifier: { SellerInputIdentifier: b.FeesEstimateRequest.Identifier },
+    Error: { Message: 'There is an client-side error.' },
+  }));
+  // 1晩目: 試して失敗し、記録される
+  const r1 = await refreshFees(db, [t1], { sleepMs: 0, callFeesApi: fail, now: () => new Date('2026-09-08T00:00:00Z') });
+  assert.equal(r1.failedTargets, 1);
+  assert.equal(loadFailures(db).size, 1);
+
+  // 同じ晩にもう一度回しても、待ちが残っているので叩かない
+  let called = 0;
+  const r2 = await refreshFees(db, [t1], {
+    sleepMs: 0, now: () => new Date('2026-09-08T01:00:00Z'),
+    callFeesApi: async () => { called++; return []; },
+  });
+  assert.equal(called, 0, '待ち時間の間は叩いてはいけない');
+  assert.equal(r2.waitingOnFailure, 1);
+});
+
+await ta('[!] 待ち時間が過ぎたらまた試す (諦めっぱなしにしない)', async () => {
+  let called = 0;
+  const t1 = target({ seller_sku: 'alwaysFail' });
+  await refreshFees(db, [t1], {
+    sleepMs: 0, now: () => new Date('2026-09-20T00:00:00Z'),   // 1日どころか十分後
+    callFeesApi: async (body) => { called++; return body.map(b => feeResponse(b.FeesEstimateRequest.Identifier, { sellerId: 'S1' })[0]); },
+  });
+  assert.equal(called, 1);
+});
+
+await ta('[!] 成功したら失敗記録を消す', async () => {
+  assert.equal(loadFailures(db).size, 0, '直ったのに記録が残っている');
+});
+
+await ta('[!] 入力が変われば別キーなので、待ち時間に関係なくすぐ試す', async () => {
+  forgetSeller();
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  const bad = target({ seller_sku: 'priceChanged', in_listing_price: 1000 });
+  await refreshFees(db, [bad], {
+    sleepMs: 0, now: () => new Date('2026-09-08T00:00:00Z'),
+    callFeesApi: async (body) => body.map(b => ({
+      Status: 'ClientError',
+      FeesEstimateIdentifier: { SellerInputIdentifier: b.FeesEstimateRequest.Identifier },
+      Error: { Message: 'bad' },
+    })),
+  });
+  let called = 0;
+  await refreshFees(db, [target({ seller_sku: 'priceChanged', in_listing_price: 1200 })], {
+    sleepMs: 0, now: () => new Date('2026-09-08T01:00:00Z'),
+    callFeesApi: async (body) => { called++; return body.map(b => feeResponse(b.FeesEstimateRequest.Identifier, { sellerId: 'S1' })[0]); },
+  });
+  assert.equal(called, 1, '値段が直ったのに待たされてはいけない');
+  db.exec('DELETE FROM amazon_fee_failure');
 });
 
 db.close();

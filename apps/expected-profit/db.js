@@ -251,6 +251,19 @@ function createTables(db) {
     updated_at  TEXT NOT NULL
   )`);
 
+  // ─── 9. 見積の失敗記録 (§16-9) ───
+  // 🚨 毎晩同じ対象で失敗し続けるのを止める。SP-API は 0.5 req/s しかないので、
+  //    確実に失敗するものを毎晩叩き続けると、取れるはずの分の枠を奪う。
+  //    入力が変われば別キーになるので、値が直れば自動でやり直す
+  db.exec(`CREATE TABLE IF NOT EXISTS amazon_fee_failure (
+    fee_key      TEXT PRIMARY KEY,     -- feeCacheKey() と同じキー
+    seller_sku   TEXT,
+    attempts     INTEGER NOT NULL,
+    last_error   TEXT,
+    failed_at    TEXT NOT NULL,
+    retry_after  TEXT NOT NULL
+  )`);
+
   migrate(db);
 }
 

@@ -107,6 +107,48 @@ export function withResolvedSeller(targets, knownSellerId) {
   return targets.map(t => (t?.seller_id === knownSellerId ? t : { ...t, seller_id: knownSellerId }));
 }
 
+/**
+ * 何日待ってからやり直すか。
+ * 🚨 1回目は翌晩 (一時的な失敗はすぐ回復させる)。続けて失敗するものだけ遠ざける
+ */
+export const FAILURE_BACKOFF_DAYS = [1, 3, 7, 14];
+
+export function backoffDays(attempts) {
+  const i = Math.min(Math.max(attempts, 1), FAILURE_BACKOFF_DAYS.length) - 1;
+  return FAILURE_BACKOFF_DAYS[i];
+}
+
+/** 待ちの残っている失敗記録 (キー → 記録) */
+export function loadFailures(db) {
+  const map = new Map();
+  try {
+    for (const r of db.prepare('SELECT * FROM amazon_fee_failure').all()) map.set(r.fee_key, r);
+  } catch { /* テーブルがまだ無い環境 */ }
+  return map;
+}
+
+/** 失敗を記録して、次に試す時刻を伸ばす */
+export function recordFailure(db, target, error, now = new Date()) {
+  const key = feeCacheKey(target);
+  const prev = db.prepare('SELECT attempts FROM amazon_fee_failure WHERE fee_key = ?').get(key);
+  const attempts = (prev?.attempts || 0) + 1;
+  const failedAt = now.toISOString();
+  db.prepare(`INSERT INTO amazon_fee_failure (fee_key, seller_sku, attempts, last_error, failed_at, retry_after)
+              VALUES (?, ?, ?, ?, ?, ?)
+              ON CONFLICT(fee_key) DO UPDATE SET attempts = excluded.attempts,
+                last_error = excluded.last_error, failed_at = excluded.failed_at,
+                retry_after = excluded.retry_after`)
+    .run(key, target.seller_sku, attempts, String(error || '').slice(0, 300),
+      failedAt, addDays(failedAt, backoffDays(attempts)));
+  return attempts;
+}
+
+/** 成功したら失敗記録を消す (次からは普通に扱う) */
+export function clearFailure(db, target) {
+  try { db.prepare('DELETE FROM amazon_fee_failure WHERE fee_key = ?').run(feeCacheKey(target)); }
+  catch { /* テーブルが無い環境 */ }
+}
+
 /** 取り直しの理由を数える (input_mismatch はどの項目かまでまとめる) */
 export function countReasons(need) {
   const out = {};
@@ -168,6 +210,27 @@ export function loadCache(db) {
  * 🚨 marketplace は target のものを使う。環境変数を使うと
  *    「保存した条件」と「実際に送った条件」がずれ、後日の全入力一致検証が嘘になる (Codex R1-6)
  */
+/**
+ * カタログID が ASIN の形をしているか。
+ *
+ * 🚨 ASIN は英数 10 桁 (書籍は ISBN10 がそのまま ASIN になる)。
+ *    13 桁の JAN を `IdType: 'ASIN'` で送ると必ず client-side error になる
+ *    (実データで 5 件そうなっていた)。公式も「ASIN か SellerSKU。UPC/ISBN 等は不可」
+ */
+export function looksLikeAsin(v) {
+  return /^[A-Z0-9]{10}$/.test(String(v ?? ''));
+}
+
+/**
+ * 何で商品を指すか。ASIN の形なら ASIN、そうでなければ自社 SKU。
+ * 🚨 SellerSKU は公式に認められた IdType (ASIN か SellerSKU の2択)
+ */
+export function feeIdentifierOf(t) {
+  return looksLikeAsin(t.asin)
+    ? { IdType: 'ASIN', IdValue: t.asin }
+    : { IdType: 'SellerSKU', IdValue: t.seller_sku };
+}
+
 export function buildFeeRequest(targets) {
   return targets.map((t, idx) => ({
     FeesEstimateRequest: {
@@ -182,8 +245,7 @@ export function buildFeeRequest(targets) {
       },
       Identifier: `${t.seller_sku}|${idx}|${Date.now()}`,
     },
-    IdType: 'ASIN',
-    IdValue: t.asin,
+    ...feeIdentifierOf(t),
   }));
 }
 
@@ -272,7 +334,20 @@ export async function refreshFees(db, targets, deps = {}) {
   // 取り直す順番: 見積そのものが無い/入力が変わった → 先。期限切れは後。
   // 前者は行が計算できない (キーが当たらない)、後者は数字は出るがランキングに載らないだけ
   const priority = (r) => (r.reason === 'expired' ? 1 : 0);
-  const ordered = [...planned.need].sort((a, b) => priority(a) - priority(b));
+  // 🚨 前に失敗して、まだ待ち時間が残っているものは今晩は試さない。
+  //    85/86 が「終了した出品」で毎晩必ず失敗していた (実データ)。
+  //    入力が変われば別キーになるので、値が直れば自動でやり直す
+  const failures = loadFailures(db);
+  const nowMs = now().getTime();
+  const waiting = [];
+  const attemptable = [];
+  for (const n of planned.need) {
+    const f = failures.get(feeCacheKey(n.target));
+    const retryAfter = f ? Date.parse(f.retry_after) : NaN;
+    if (f && Number.isFinite(retryAfter) && retryAfter > nowMs) waiting.push(n);
+    else attemptable.push(n);
+  }
+  const ordered = attemptable.sort((a, b) => priority(a) - priority(b));
   const maxFetch = deps.maxFetch ?? FEE_MAX_FETCH_PER_RUN;
   const need = ordered.slice(0, maxFetch);
   const deferred = ordered.length - need.length;   // 上限で翌晩に回した数
@@ -328,9 +403,12 @@ export async function refreshFees(db, targets, deps = {}) {
       const identifier = body[j].FeesEstimateRequest.Identifier;
       const r = byIdentifier.get(identifier);
       if (!r || r.Status !== 'Success' || !r.FeesEstimate) {
-        errors.push({ sku: chunk[j].seller_sku, error: r?.Error?.Message || r?.Status || 'no estimate' });
+        const msg = r?.Error?.Message || r?.Status || 'no estimate';
+        const attempts = recordFailure(db, chunk[j], msg, now());
+        errors.push({ sku: chunk[j].seller_sku, error: msg, attempts });
         continue;
       }
+      clearFailure(db, chunk[j]);   // 直ったら記録を消す
       const sellerIdFromResponse = r?.FeesEstimateIdentifier?.SellerId || null;
       if (sellerIdFromResponse) observedSellers.add(sellerIdFromResponse);
       saved.push(toEstimateRow(chunk[j], r.FeesEstimate, fetchedAt, sellerIdFromResponse));
@@ -364,6 +442,7 @@ export async function refreshFees(db, targets, deps = {}) {
   return {
     targets: targets.length,
     deferred,                 // 1晩の上限で翌晩に回した数
+    waitingOnFailure: waiting.length,   // 前に失敗して待ち中 (今晩は試さない)
     refetchAnomaly,           // 🚨 キャッシュが効いていない合図
     plannedRefetch: ordered.length,
     // 取り直しの理由の内訳。キャッシュが当たらない原因が入力なのか期限なのか分かる

@@ -118,6 +118,8 @@ export async function runNightly(opts = {}) {
       result.steps.push({ step: 'fees', ok: true, ...r });
       log(`[expected-profit] 手数料: 再取得${r.refreshed} 再利用${r.reused} 失敗${r.failedTargets} 未処理${r.pendingTargets}`
         + (r.deferred ? ` 翌晩に回した${r.deferred}` : '')
+        // 前に失敗して待ち中の対象。ここが増え続けるなら値かカタログ側の問題
+        + (r.waitingOnFailure ? ` 失敗待ち${r.waitingOnFailure}` : '')
         // 🚨 取り直した理由を必ず出す。これが無いと「なぜ再利用が効かなかったか」を後から追えない
         + (r.plannedRefetch ? ` 理由=${JSON.stringify(r.refetchReasons)}` : ''));
       // 🚨 キャッシュが効いていないなら必ず出す。SP-API は 0.5 req/s なので、

@@ -312,6 +312,35 @@ await ta('[!] 取り直しが 0 件なら理由は出さない (毎晩ノイズ�
   });
 });
 
+
+await ta('[!] 失敗して待ち中の対象の数もログに出す (増え続けたら値かカタログの問題)', async () => {
+  db.exec('DELETE FROM amazon_fee_estimate');
+  db.exec('DELETE FROM amazon_fee_failure');
+  const failApi = async (body) => body.map(b => ({
+    Status: 'ClientError',
+    FeesEstimateIdentifier: { SellerInputIdentifier: b.FeesEstimateRequest.Identifier },
+    Error: { Message: 'There is an client-side error.' },
+  }));
+  const runOnce = (logs) => runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
+    malls: ['amazon'], skipPublish: true,
+    fetchDeps: { amazon: { getActiveListingsReport: async () => ({ listings: [amazonListing()] }) } },
+    feeDeps: { sleepMs: 0, callFeesApi: failApi, now: () => new Date('2026-09-08T00:00:00Z') },
+    log: (m) => logs.push(String(m)),
+  });
+
+  const first = [];
+  await runOnce(first);
+  assert.match(first.find(l => l.includes('手数料:')), /失敗1/, '1晩目は失敗として数える');
+
+  const second = [];
+  await runOnce(second);
+  const line = second.find(l => l.includes('手数料:'));
+  assert.match(line, /失敗待ち1/, `待ち中の数が出ていない: ${line}`);
+  assert.ok(!/失敗1/.test(line.replace(/失敗待ち1/, '')), `待ち中なのに叩いている: ${line}`);
+  db.exec('DELETE FROM amazon_fee_failure');
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);
