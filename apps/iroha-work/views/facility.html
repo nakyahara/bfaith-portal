@@ -105,7 +105,9 @@ function cardHtml(it) {
     : '';
   const rets = (it.returns || []).length
     ? '<ul class="rets">' + it.returns.map((r) =>
-      '<li>' + esc(fmtMd(r.at)) + ' に ' + esc(String(r.qty)) + ' 個お持ちいただきました</li>').join('') + '</ul>'
+      '<li>' + esc(fmtMd(r.at)) + ' に ' + esc(String(r.qty)) + ' 個お持ちいただきました</li>').join('')
+      + (it.returns_more > 0 ? '<li>ほかに ' + esc(String(it.returns_more)) + ' 回ぶんあります</li>' : '')
+      + '</ul>'
     : '';
   return '<article class="card' + (it.state === 'settled' ? ' settled' : '') + '">'
     + '<h2>' + esc(it.product_name) + '</h2>'
@@ -155,7 +157,10 @@ async function load() {
       ? '<div class="box over"><label>お約束の日を過ぎています</label><div class="v">' + esc(String(s.overdue_count)) + '<span style="font-size:.9rem"> 件</span></div></div>'
       : '')
     + '</div>'
-    + j.items.map(cardHtml).join('');
+    + j.items.map(cardHtml).join('')
+    // ⭐出しきれなかったぶんを隠さない (上の数は全部から数えているので、件数は合っている)
+    + (j.more > 0 ? '<div class="empty">ほかに ' + esc(String(j.more)) + ' 件あります。'
+      + 'いろは にお問い合わせください。</div>' : '');
 }
 load();
 </script>

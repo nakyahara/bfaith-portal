@@ -529,6 +529,9 @@ export function buildFacilityView(facilityCode) {
   // その施設あての預けだけ。取消したものは出さない (無かったことになったぶん)
   const rows = db.prepare(`SELECT c.id, c.state, c.planned_qty, c.prepared_qty, c.handed_qty, c.missing_qty,
       c.due_date, c.planned_at, c.prepared_at, c.handed_at, c.settled_at,
+      -- ⭐返ってきた合計は**全部の返却から** SQL で出す。明細の表示上限 (20 件) で数を狂わせない (Codex R3 中2)
+      (SELECT COALESCE(SUM(r.returned_qty), 0) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id) AS returned_total,
+      (SELECT COUNT(*) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id) AS returns_count,
       b.id AS batch_id, b.expiry,
       t.id AS task_id, t.product_name, t.product_code, t.master_snapshot
     FROM f_iroha_consignments c
@@ -549,8 +552,8 @@ export function buildFacilityView(facilityCode) {
     // 作業のしかた = 作業仕様。カード作成時のスナップショットを使う (渡した時点の指示 — §AB-13)
     let snap = null;
     try { snap = r.master_snapshot ? JSON.parse(r.master_snapshot) : null; } catch { /* 壊れていれば出さないだけ */ }
-    const back = returnsOf.all(r.id);
-    const returned = back.reduce((a, x) => a + Number(x.returned_qty), 0);
+    const back = returnsOf.all(r.id);            // 明細は直近だけ (見せる用)
+    const returned = Number(r.returned_total) || 0;   // ⭐数は SQL の合計を使う (明細の件数に左右されない)
     const qty = r.handed_qty ?? r.planned_qty;
     return {
       id: r.id,
@@ -575,25 +578,38 @@ export function buildFacilityView(facilityCode) {
       } : null,
       // 返却の記録 (いつ何個持ってきたか)。⭐記録した人の名前も、いろはが書いたひとことも出さない
       returns: back.map((x) => ({ qty: x.returned_qty, at: x.returned_at })),
+      returns_more: Math.max(0, (Number(r.returns_count) || 0) - back.length),   // 出しきれなかった件数
       qty,
     };
   });
-  const open = items.filter((x) => x.state !== 'settled');
-  // ⭐「いま持っている数」は**渡したぶんの残り**で数える (Codex R1 中4)。
-  //   600 個渡して 200 個返したら 400 個。まだ渡していない予定のぶんと混ぜない
-  const held = open.filter((x) => x.state === 'handed');
-  const toCome = open.filter((x) => x.state !== 'handed');
+  // ⭐まとめは**施設の全部から** SQL で数える (Codex R3 中3)。
+  //   表示は上限で切るので、切った後の行から数えると「300 件・300 個」のように少なく出てしまう。
+  //   「いま持っている数」は渡したぶんの残り (返ったぶん・返らなかったぶんを引く — Codex R1 中4)
+  const a = db.prepare(`SELECT
+      SUM(CASE WHEN c.state = 'handed' THEN 1 ELSE 0 END) held_count,
+      SUM(CASE WHEN c.state = 'handed' THEN MAX(0, COALESCE(c.handed_qty, 0) - COALESCE(c.missing_qty, 0)
+        - COALESCE((SELECT SUM(r.returned_qty) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id), 0))
+        ELSE 0 END) held_qty,
+      SUM(CASE WHEN c.state IN ('planned','prepared') THEN 1 ELSE 0 END) coming_count,
+      SUM(CASE WHEN c.state IN ('planned','prepared') THEN COALESCE(c.planned_qty, 0) ELSE 0 END) coming_qty,
+      SUM(CASE WHEN c.state = 'handed' AND c.due_date IS NOT NULL AND c.due_date < ? THEN 1 ELSE 0 END) overdue_count,
+      SUM(CASE WHEN c.state <> 'settled' THEN 1 ELSE 0 END) open_count,
+      COUNT(*) total
+    FROM f_iroha_consignments c WHERE c.facility_code = ? AND c.state <> 'cancelled'`).get(today, facilityCode);
   return {
     facility: { code: fac.code, name: fac.name },
     today,
     items,
+    // ⭐出しきれなかった件数を隠さない (画面に「ほかに N 件あります」と出す)
+    shown: items.length,
+    more: Math.max(0, (Number(a.total) || 0) - items.length),
     summary: {
-      open_count: open.length,
-      held_count: held.length,
-      held_qty: held.reduce((a, x) => a + (x.remaining ?? 0), 0),
-      coming_count: toCome.length,
-      coming_qty: toCome.reduce((a, x) => a + (x.planned_qty ?? 0), 0),
-      overdue_count: open.filter((x) => x.overdue).length,
+      open_count: Number(a.open_count) || 0,
+      held_count: Number(a.held_count) || 0,
+      held_qty: Number(a.held_qty) || 0,
+      coming_count: Number(a.coming_count) || 0,
+      coming_qty: Number(a.coming_qty) || 0,
+      overdue_count: Number(a.overdue_count) || 0,
     },
   };
 }

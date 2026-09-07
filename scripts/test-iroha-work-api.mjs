@@ -348,10 +348,40 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
     ok(served >= 30 && limited > 0, '⭐ふつうに見るぶんは通り、叩きすぎると 429 で断る (' + served + ' 回通過 / ' + limited + ' 回拒否)');
     // ⭐社内の画面は止まらない
     ok((await get('/api/state')).status === 200, '⭐外から叩かれている間も、社内の一覧はふつうに開ける');
-    // 別のトークンは巻き添えにしない
+    // 別のトークンは巻き添えにしない (接続元の上限は別枠なので、IP を変えて確かめる)
     const other = await post('/admin/facility-links', { facility_code: 'rashinban', label: '別のリンク' });
-    ok((await fetch(`http://${HOST}${other.json.url}/api/view`, { headers: { Host: HOST } })).status === 200,
-      '⭐別の施設のリンクは巻き添えにしない (トークンごとに数える)');
+    ok((await fetch(`http://${HOST}${other.json.url}/api/view`,
+      { headers: { Host: HOST, 'X-Forwarded-For': '10.0.0.9' } })).status === 200,
+      '⭐別の施設のリンクは巻き添えにしない (リンクごとに数える)');
+  }
+
+  // ⭐でたらめなトークンを毎回変えて送られても、内側が重くならない (Codex R3 重大1)
+  {
+    const t0 = Date.now();
+    let ok404 = 0;
+    let blocked = 0;
+    for (let i = 0; i < 300; i++) {
+      // 毎回ちがうトークン = 記録を無限に増やす狙いの叩き方
+      const r = await fetch(`http://${HOST}/apps/iroha-work/f/${'a'.repeat(30)}${i}`,
+        { headers: { Host: HOST, 'X-Forwarded-For': '203.0.113.' + (i % 250) } });
+      if (r.status === 404) ok404++; else if (r.status === 429) blocked++;
+    }
+    const ms = Date.now() - t0;
+    ok(ok404 + blocked === 300, '⭐でたらめなトークンは 404 か 429 で終わる (' + ok404 + ' / ' + blocked + ')');
+    // ⭐内側の画面がふつうに開ける (叩かれても巻き込まれない)
+    const t1 = Date.now();
+    const inner = await get('/api/state');
+    ok(inner.status === 200 && Date.now() - t1 < 3000,
+      '⭐外から叩かれている間も、社内の一覧がすぐ開く (' + (Date.now() - t1) + 'ms)');
+    ok(ms < 20000, '300 回の無効アクセス自体も現実的な時間で終わる (' + ms + 'ms)');
+    // ⭐同じ接続元から繰り返せば、そこで頭打ちになる
+    let ipBlocked = 0;
+    for (let i = 0; i < 200; i++) {
+      const r = await fetch(`http://${HOST}/apps/iroha-work/f/${'b'.repeat(30)}${i}`,
+        { headers: { Host: HOST, 'X-Forwarded-For': '198.51.100.7' } });
+      if (r.status === 429) ipBlocked++;
+    }
+    ok(ipBlocked > 0, '⭐同じ接続元から叩き続けると 429 で断る (' + ipBlocked + ' 回)');
   }
 
   // でたらめ・失効したトークン

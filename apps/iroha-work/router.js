@@ -2156,32 +2156,62 @@ router.get('/admin/sessions/search.csv', requireAdmin, api((req, res) => {
 /**
  * ⭐ログインのいらない口に、**回数の上限**を置く (Codex R2 中2)。
  * 同じ Node のプロセスで社内の画面も動いているので、外から繰り返し叩かれて中の作業を遅らせない。
- * トークン単位で数える (URL を知っている人ごと)。素朴なメモリ内のカウンタで十分 —
- * 目的は「壊れるほど叩かれない」ことで、厳密な公平さではない
+ *
+ * 🚨**数える相手を、外から自由に作れるものにしない** (Codex R3 重大1)。
+ *   最初はトークンそのものを鍵にしていたが、それだと**でたらめなトークンを毎回変えるだけで**
+ *   記録が無限に増え、掃除のために毎回全部を見にいく = レート制限そのものが攻撃の口になっていた。
+ *   いまは:
+ *     ① まずトークンを確かめる (索引つきの 1 回の読み取り。当たらなければ何も覚えない)
+ *     ② 当たったものだけ**リンクの id** で数える (発行した本数ぶんしか増えない)
+ *     ③ 接続元でも数える。こちらは**入る数に上限**を置き、あふれたら**いちばん古いものから捨てる**
+ *        (Map は入れた順を覚えているので、全部を見にいかなくても捨てられる)
  */
 const FL_WINDOW_MS = 60_000;
 const FL_MAX_PER_WINDOW = 60;      // 1 分に 60 回 (人が見るぶんには十分。画面は 1 回開くと 2 回)
-const flHits = new Map();          // key → { count, until }
-function facilityRateOk(key) {
+const FL_IP_MAX_PER_WINDOW = 120;  // 接続元ごと (社内から数人が同時に見ることもある)
+const FL_IP_MAX_KEYS = 2000;       // 覚える接続元の上限。あふれたら古いものから捨てる
+const flHits = new Map();          // リンク id → { count, until }
+const flIpHits = new Map();        // 接続元 → { count, until }
+
+function bumpWindow(map, key, max, cap) {
   const now = Date.now();
-  const cur = flHits.get(key);
-  if (!cur || cur.until <= now) { flHits.set(key, { count: 1, until: now + FL_WINDOW_MS }); }
-  else if (++cur.count > FL_MAX_PER_WINDOW) return false;
-  // 古いものを捨てる (放っておくと際限なく増える)。多くないので全部見てよい
-  if (flHits.size > 500) for (const [k, v] of flHits) if (v.until <= now) flHits.delete(k);
+  const cur = map.get(key);
+  if (cur && cur.until > now) {
+    if (++cur.count > max) return false;
+    return true;
+  }
+  if (cur) map.delete(key);                       // 期限切れは入れ直す (入れた順を新しくする)
+  if (cap && map.size >= cap) {
+    // ⭐全部を見にいかない。**いちばん古い 1 つ**だけ捨てる (増え続けること自体を攻撃にさせない)
+    const oldest = map.keys().next();
+    if (!oldest.done) map.delete(oldest.value);
+  }
+  map.set(key, { count: 1, until: now + FL_WINDOW_MS });
   return true;
+}
+/** 接続元。プロキシの後ろにいるので X-Forwarded-For の**先頭**を見る (無ければ socket) */
+function clientKeyOf(req) {
+  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return (fwd || req.ip || (req.socket && req.socket.remoteAddress) || '?').slice(0, 64);
 }
 
 function facilityLinkGate(req, res, next) {
   res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
   res.set('Referrer-Policy', 'no-referrer');
   res.set('Cache-Control', 'no-store');
-  if (!facilityRateOk(String(req.params.token || '').slice(0, 64))) {
+  // ③ 接続元の上限 (でたらめなトークンを繰り返し送られても、ここで頭打ちになる)
+  if (!bumpWindow(flIpHits, clientKeyOf(req), FL_IP_MAX_PER_WINDOW, FL_IP_MAX_KEYS)) {
     res.set('Retry-After', '60');
     return res.status(429).json({ ok: false, error: 'too_many', message: '少し時間をおいてから開いてください' });
   }
+  // ① トークンを確かめる。⭐当たらなければ**何も覚えない**
   // ⭐HEAD (リンク検査・先読み) では「見に来た日時」を書かない (Codex R1 軽微6)
   const link = verifyFacilityLink(req.params.token, { touch: req.method === 'GET' });
+  // ② 当たったものだけ、リンクの id で数える (発行した本数ぶんしか増えない)
+  if (link && !bumpWindow(flHits, link.id, FL_MAX_PER_WINDOW, 0)) {
+    res.set('Retry-After', '60');
+    return res.status(429).json({ ok: false, error: 'too_many', message: '少し時間をおいてから開いてください' });
+  }
   if (!link) {
     // ⭐当たらなかった理由 (無い / 失効した / 期限切れ) を分けて教えない (総当たりの手がかりにしない)
     res.status(404);

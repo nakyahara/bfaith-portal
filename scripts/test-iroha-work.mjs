@@ -6548,12 +6548,51 @@ console.log('\n[32] 外部施設の専用 URL (見るだけ。§AB-11 の 6)');
       '⭐まだ渡していないぶんは「これからお渡しします」に分ける (持っている数と混ぜない)');
   }
 
+  // ⑧ ⭐返却を 21 回に分けても、残りの数が狂わない (明細の表示上限に引きずられない — Codex R3 中2)
+  {
+    const t = mk('fl-9', 9928, 600);
+    const cg = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+      facilityCode: 'workcenter', qty: 600, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    for (let i = 0; i < 21; i++) {
+      const c9 = C.getConsignment(cg.consignment.id);
+      C.recordReturn({ consignmentId: c9.id, returnedQty: 10, expectVersion: c9.version, idempotencyKey: 'fl9-' + i });
+    }
+    const it9 = SV.buildFacilityView('workcenter').items.find((x) => x.id === cg.consignment.id);
+    ok(it9.returned_qty === 210, '⭐21 回に分けて返しても、合計は 210 個 (表示した 20 件だけで数えない)');
+    ok(it9.remaining === 390, '⭐残りも 390 個 (400 個と出さない)');
+    ok(it9.returns.length === 20 && it9.returns_more === 1, '明細は 20 件まで・出しきれなかった 1 件は件数で伝える');
+  }
+
+  // ⑨ ⭐出す件数に上限があっても、まとめの数は全部から数える (Codex R3 中3)
+  {
+    // まとめが「表示した行」からではなく SQL の集計から出ていることを、数の作りで確かめる
+    const before = SV.buildFacilityView('rashinban').summary;
+    const t = mk('fl-10', 9929, 5);
+    const cg = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+      facilityCode: 'rashinban', qty: 5, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, qty: 5, expectVersion: cg.consignment.version });
+    const c10 = C.getConsignment(cg.consignment.id);
+    C.recordReturn({ consignmentId: c10.id, returnedQty: 2, expectVersion: c10.version, idempotencyKey: 'fl10-1' });
+    const view = SV.buildFacilityView('rashinban');
+    ok(view.summary.held_qty - before.held_qty === 3, '渡した 5 個 − 返った 2 個 = 3 個');
+    ok(typeof view.more === 'number' && view.more >= 0 && typeof view.shown === 'number',
+      '⭐出した件数と、出しきれなかった件数を返す (隠さない)');
+    // 返らなかったぶん (精算) も引く
+    const c10b = C.getConsignment(cg.consignment.id);
+    C.settleConsignment({ consignmentId: c10b.id, missingQty: 3, expectVersion: c10b.version });
+    const view2 = SV.buildFacilityView('rashinban');
+    ok(view2.summary.held_qty === before.held_qty, '精算したら「いまお持ちの数」から外れる');
+  }
+
   // ── 画面 ──
   const fh = fs.readFileSync(new URL('../apps/iroha-work/views/facility.html', import.meta.url), 'utf8');
   ok(/name="robots" content="noindex/.test(fh) && /name="referrer" content="no-referrer"/.test(fh),
     '⭐検索よけ・リファラを送らない (URL が他所のログに残らないように)');
   ok(!/method="post"/i.test(fh) && !/apiFetch/.test(fh) && !/method:/.test(fh), '⭐書き込みの口を作らない (見るだけ)');
   ok(/この画面は<b>見るだけ<\/b>です/.test(fh), '「見るだけ」と画面に書く');
+  ok(/j\.more > 0 \? '<div class="empty">ほかに '/.test(fh) && /it\.returns_more > 0/.test(fh),
+    '⭐出しきれなかった件数を隠さない (ほかに N 件あります)');
   ok(/const esc = /.test(fh) && /innerHTML/.test(fh) && /esc\(it\.product_name\)/.test(fh),
     '商品名などは必ずエスケープして描く (XSS)');
 
