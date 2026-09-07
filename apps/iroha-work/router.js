@@ -35,7 +35,7 @@ import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES 
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
 import { countTasksByStatus, listTasksNeedingReview, listOrphans, listFacilities } from './tasks-db.js';
 import { OPEN_STATUSES } from './tasks.js';
-import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, buildFacilityView, facilityLoads, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
+import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, buildFacilityView, facilityCapacityGuard, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
 import { batchTransitionNeedsStaff } from './batches.js';
@@ -890,23 +890,13 @@ router.post('/api/consign', checkOrigin, api((req, res) => {
   }
   const gate = requireStaffPlan(req);
   if (!gate.ok) return res.status(gate.status).json(gate.body);
-  // ⭐受け入れ枠 (要件 §AB-8)。箱数を守らせる拠点だけ、ここで断る
-  const loads = facilityLoads();
-  const capacityOf = (code) => {
-    const l = loads.get(code);
-    if (!l) return null;
-    const fac = listFacilities().find((f) => f.code === code);
-    const card = getTask(taskId);
-    let snap = null;
-    try { snap = card && card.master_snapshot ? JSON.parse(card.master_snapshot) : null; } catch { /* 分からなければ止めない */ }
-    return { ...l, name: fac ? fac.name : code, units_per_container: snap ? snap.units_per_container : null };
-  };
   const r = startConsignment({
     taskId, batchId, facilityCode: req.body.facility_code, qty: req.body?.qty,
     dueDate: req.body?.due_date ?? null, expectVersion: req.body?.expect_version,
     actor: `${gate.worker.display_name} (いろはアプリ)`,
     guard: planGuardOf(req, gate.worker),
-    capacityOf,
+    // ⭐受け入れ枠は**書き込みのトランザクションの中で**数える (Codex R1 中2)
+    capacityGuard: facilityCapacityGuard,
   });
   if (!r.ok) return res.status(consignErrorStatus(r.error)).json(r);
   safeLogTaskEvent({ taskId, action: 'task_consign', to: `${req.body.facility_code} ${r.consignment.planned_qty}個`,
@@ -950,6 +940,7 @@ router.post('/api/consign/update', checkOrigin, api((req, res) => {
 function consignErrorStatus(e) {
   if (e === 'not_found') return 404;
   if (e === 'over_capacity') return 409;   // 置ける箱がいっぱい (状態のずれ。入力の間違いではない)
+  if (e === 'capacity_unknown') return 409; // 入数が未登録で箱数を数えられない (登録すれば直るので、状態のずれ)
   if (['conflict', 'closed_task', 'bad_state', 'active_sessions', 'already_stocked', 'already_printed', 'batch_closed', 'notion_mode'].includes(e)) return 409;
   if (e === 'too_many') return 409;
   return 400;
@@ -2259,14 +2250,24 @@ router.use('/f', facilityRouter);
 
 /** ⭐施設の受け入れ枠を決める (要件 §AB-8)。管理者だけ */
 router.post('/admin/facility-capacity', checkOrigin, requireAdmin, api((req, res) => {
+  // ⭐版を必ず添えさせる。別の端末が先に変えていたら黙って上書きしない (Codex R1 中3)
+  if (!Number.isInteger(req.body?.expect_version)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '画面が古くなっています。開き直してください' });
+  }
   const r = setFacilityCapacity(req.body?.code, {
+    expectVersion: req.body.expect_version,
     // ⭐送られたときだけ触る。空文字は「未設定に戻す」(0 と区別する)
     hours: 'capacity_hours' in (req.body || {}) ? req.body.capacity_hours : undefined,
     boxes: 'capacity_boxes' in (req.body || {}) ? req.body.capacity_boxes : undefined,
     boxesHard: 'capacity_boxes_hard' in (req.body || {}) ? !!req.body.capacity_boxes_hard : undefined,
   });
-  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 400).json(r);
-  res.json({ ok: true, facilities: listFacilities().filter((f) => f.offsite) });
+  const offsite = () => listFacilities().filter((f) => f.offsite);
+  // ⭐競合のときも最新値を返す。画面は「保存できませんでした」ではなく**今の値**を出し直せる
+  if (!r.ok) {
+    return res.status(r.error === 'not_found' ? 404 : r.error === 'conflict' ? 409 : 400)
+      .json(r.error === 'conflict' ? { ...r, facilities: offsite() } : r);
+  }
+  res.json({ ok: true, facilities: offsite() });
 }));
 
 router.post('/admin/facility-links', checkOrigin, requireAdmin, api((req, res) => {

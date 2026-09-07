@@ -688,6 +688,8 @@ export function createTables(db = getMirrorDB()) {
       capacity_hours     REAL,
       capacity_boxes     INTEGER,
       capacity_boxes_hard INTEGER NOT NULL DEFAULT 0 CHECK (capacity_boxes_hard IN (0,1)),
+      -- ⭐枠を変えるたびに +1。別の端末が先に変えていたら上書きしない (要件: 楽観ロック)
+      version    INTEGER NOT NULL DEFAULT 0,
       active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
       sort_order INTEGER NOT NULL DEFAULT 0
     );
@@ -838,6 +840,7 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_facilities', 'capacity_hours', 'REAL');
   addCol('f_iroha_facilities', 'capacity_boxes', 'INTEGER');
   addCol('f_iroha_facilities', 'capacity_boxes_hard', 'INTEGER NOT NULL DEFAULT 0 CHECK (capacity_boxes_hard IN (0,1))');
+  addCol('f_iroha_facilities', 'version', 'INTEGER NOT NULL DEFAULT 0');
   const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, offsite, active, sort_order) VALUES (?, ?, ?, ?, 1, ?)');
   for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.offsite ? 1 : 0, f.sort_order);
   // 「物を持ち帰るか」は拠点の性質なので tasks.js を正として揃える (既に入っている行も)
@@ -1798,8 +1801,14 @@ export function revokeFacilityLink(id) {
  * ⭐受け入れ枠を決める (要件 §AB-8)。**空にすれば「未設定」に戻せる** (0 と区別する)。
  * ハード制約にできるのは箱数だけ (置き場・車両の都合。時間は概算なので守らせない)。
  */
-export function setFacilityCapacity(code, { hours, boxes, boxesHard } = {}) {
-  const fac = getDB().prepare('SELECT code, offsite FROM f_iroha_facilities WHERE code = ?').get(String(code || ''));
+/**
+ * ⭐外部施設の受け入れ枠を決める (要件 §AB-8)。
+ *
+ * expectVersion を渡すと**楽観ロック**になる (合わなければ conflict)。画面からは必ず渡すこと —
+ * 渡さないと、A が「8 箱・守らせる」に直した直後に B が時間だけ保存して、A の変更が消える (Codex R1 中3)。
+ */
+export function setFacilityCapacity(code, { hours, boxes, boxesHard, expectVersion } = {}) {
+  const fac = getDB().prepare('SELECT code, offsite, version FROM f_iroha_facilities WHERE code = ?').get(String(code || ''));
   if (!fac) return { ok: false, error: 'not_found', message: 'その拠点はありません' };
   if (!fac.offsite) return { ok: false, error: 'not_external', message: '受け入れ枠を持つのは、物を持ち帰る拠点だけです' };
   const num = (v, label, max) => {
@@ -1820,8 +1829,16 @@ export function setFacilityCapacity(code, { hours, boxes, boxesHard } = {}) {
   if (!b.skip) { sets.push('capacity_boxes = ?'); vals.push(b.value); }
   if (boxesHard !== undefined) { sets.push('capacity_boxes_hard = ?'); vals.push(boxesHard ? 1 : 0); }
   if (sets.length === 0) return { ok: false, error: 'bad_request', message: '直すものがありません' };
-  getDB().prepare(`UPDATE f_iroha_facilities SET ${sets.join(', ')} WHERE code = ?`).run(...vals, fac.code);
-  return { ok: true };
+  if (expectVersion != null && Number(expectVersion) !== fac.version) {
+    return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', version: fac.version };
+  }
+  sets.push('version = version + 1');
+  const info = getDB().prepare(`UPDATE f_iroha_facilities SET ${sets.join(', ')} WHERE code = ? AND version = ?`)
+    .run(...vals, fac.code, fac.version);
+  if (info.changes === 0) {
+    return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します' };
+  }
+  return { ok: true, version: fac.version + 1 };
 }
 
 /** 端末の職員モード。PIN を確かめた側が呼ぶ。@returns 期限 (ISO) */

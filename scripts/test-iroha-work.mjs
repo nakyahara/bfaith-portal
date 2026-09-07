@@ -26,6 +26,9 @@ if (!process.env.DATA_DIR) {
   process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'iroha-work-test-'));
 }
 
+// ⭐画面のキャッシュの版。画面を直した PR ではここだけ直す（以前は同じ文字列を 3 か所に書いていて、毎回 3 か所直していた）
+const SW_CACHE = 'iroha-work-shell-v16';
+
 let pass = 0, fail = 0;
 function ok(cond, label) {
   if (cond) { pass++; console.log(`  ✓ ${label}`); } else { fail++; console.log(`  ✗ ${label}`); }
@@ -4027,7 +4030,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/if \(curDetail && detailSrc === 'state'\)/.test(html), '一覧の再取得で下見の詳細を上書きしない');
   ok(/detailCard \? \[detailCard, \.\.\.state\.cards\] : state\.cards/.test(html), '写真を大きく見るときは開いている詳細のカードから探す (下見は一覧に無い)');
   const sw = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v15'/.test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
+  ok(new RegExp(`const CACHE = '${SW_CACHE}'`).test(sw), '画面キャッシュの版を上げる (古い画面が残らない)');
   // ══ P3: 明日の計画の画面 (職員だけ) ══
   ok(/<div class="page planpage" hidden>/.test(html) && /plan: '\.planpage'/.test(html), '明日の計画は独立した画面');
   ok(/if \(v === 'plan' && isApp\(\) && !stateCan\('task\.plan\.assign'\)\) v = 'board';/.test(html),
@@ -6162,7 +6165,7 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
     'やり直しは職員モードのときだけ・外にあるぶんには出さない');
   ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
   const sw2 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v15'/.test(sw2), '画面キャッシュの版を上げる');
+  ok(new RegExp(`const CACHE = '${SW_CACHE}'`).test(sw2), '画面キャッシュの版を上げる');
 }
 
 console.log('\n[31] 分けたカードは一覧・ボードで 2 枚に見える (§AB-11 の 5b)');
@@ -6343,7 +6346,7 @@ console.log('\n[31] 分けたカードは一覧・ボードで 2 枚に見える
     'ボードの行に「渡す予定 / あずけ中 何個・いつまで」が出る (渡す前と後を書き分ける)');
   ok(!/window\.prompt\(|window\.confirm\(/.test(html), 'prompt / confirm を使わない (監修 R-1)');
   const sw3 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
-  ok(/const CACHE = 'iroha-work-shell-v15'/.test(sw3), '画面キャッシュの版を上げる');
+  ok(new RegExp(`const CACHE = '${SW_CACHE}'`).test(sw3), '画面キャッシュの版を上げる');
 }
 
 console.log('\n[32] 外部施設の専用 URL (見るだけ。§AB-11 の 6)');
@@ -6765,26 +6768,88 @@ console.log('\n[33] 外部施設の受け入れ枠 (§AB-8)');
     ok(SV.facilityLoads().get('workcenter').over_boxes === true, '箱も、目安を下回れば超過と分かる');
     const t = mk('cap-3', 9282, 700);
     const r = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
-      facilityCode: 'workcenter', qty: 700, expectVersion: v(t) });
+      facilityCode: 'workcenter', qty: 700, expectVersion: v(t), capacityGuard: SV.facilityCapacityGuard });
     ok(r.ok, '⭐目安を超えていても、預けること自体は止めない (要件 §AB-8)');
     const c3 = C.getConsignment(r.consignment.id);
     C.cancelConsignment({ consignmentId: c3.id, expectVersion: c3.version });
 
-    // 箱数を守らせる拠点では断る (置き場・車両の都合)。いまの残高 +2 箱までにする
+    // 箱数を守らせる拠点では断る (置き場・車両の都合)。いまの残高 +2 箱までにする。
+    // ⭐判定は**実物** (facilityCapacityGuard) を通す。テスト用の作りものを渡すと、
+    //   本番と違う入数の出し方をしていても気づけない (Codex R1 重大1)
+    // ⭐ここから先は「外にあるぶんが数えられる」状態で試す。前のブロックが作った預けには
+    //   入数が入っていないので、この検査のあいだだけ 70 個入りにしておく (⑥ でわざと戻す)
+    db.prepare(`UPDATE f_iroha_tasks SET master_snapshot = json_set(COALESCE(master_snapshot, '{}'), '$.units_per_container', 70)
+      WHERE id IN (SELECT b.task_id FROM f_iroha_consignments c JOIN f_iroha_task_batches b ON b.id = c.batch_id
+                   WHERE c.state IN ('planned','prepared','handed') AND c.facility_code = 'workcenter')`).run();
     const cur = SV.facilityLoads().get('workcenter');
+    ok(cur.boxes_unknown === 0, '(前提) この時点では入数不明の預けは無い');
     const limit = cur.boxes + 2;
     D.setFacilityCapacity('workcenter', { boxes: limit, boxesHard: true });
-    const load = SV.facilityLoads().get('workcenter');
-    const capacityOf = () => ({ ...load, name: 'ワークセンター', units_per_container: 70 });
     const t2 = mk('cap-4', 9283, 700);
     const over = C.startConsignment({ taskId: t2, batchId: B.listBatchesOfTask(db, t2)[0].id,
-      facilityCode: 'workcenter', qty: 700, expectVersion: v(t2), capacityOf });   // 10 箱ぶん = あふれる
-    ok(!over.ok && over.error === 'over_capacity', '⭐箱数を守らせる拠点では、あふれる預けを断る');
+      facilityCode: 'workcenter', qty: 700, expectVersion: v(t2), capacityGuard: SV.facilityCapacityGuard });
+    ok(!over.ok && over.error === 'over_capacity', '⭐箱数を守らせる拠点では、あふれる預けを断る (10 箱ぶん)');
     ok(over.message.includes(String(limit) + ' 箱まで'), 'いくつまでかを言う');
     const small = C.startConsignment({ taskId: t2, batchId: B.listBatchesOfTask(db, t2)[0].id,
-      facilityCode: 'workcenter', qty: 70, expectVersion: v(t2), capacityOf });    // 1 箱ぶん = 収まる
-    ok(small.ok, '収まるぶんは通る');
+      facilityCode: 'workcenter', qty: 70, expectVersion: v(t2), capacityGuard: SV.facilityCapacityGuard });
+    ok(small.ok, '収まるぶんは通る (1 箱ぶん)');
+    const cs = C.getConsignment(small.consignment.id);
+    C.cancelConsignment({ consignmentId: cs.id, expectVersion: cs.version });
     D.setFacilityCapacity('workcenter', { boxes: null, boxesHard: false, hours: 16 });
+  }
+
+  // ⑤ ⭐入数が分からないものを 0 箱として通さない (Codex R1 重大1)
+  {
+    const t = TD.upsertTaskFromImport({ notion_page_id: 'cap-5', status: 'not_started', facility_code: 'iroha',
+      destination_id: 9284, product_name: '入数だけ未登録', qty: 700 }, { batchId: 'cap' }).id;
+    const bid = B.listBatchesOfTask(db, t)[0].id;
+    const cur = SV.facilityLoads().get('workcenter');
+    D.setFacilityCapacity('workcenter', { boxes: cur.boxes + 100, boxesHard: true });   // 枠はたっぷり空いている
+    const r = C.startConsignment({ taskId: t, batchId: bid, facilityCode: 'workcenter', qty: 700,
+      expectVersion: v(t), capacityGuard: SV.facilityCapacityGuard });
+    ok(!r.ok && r.error === 'capacity_unknown',
+      '⭐入数が分からないものは、箱数を守らせる拠点に渡さない (0 箱扱いで上限をすり抜けさせない)');
+    ok(r.message.includes('この商品は入数が分からない'), '何を登録すればよいかを言う');
+    // 守らせない拠点なら、分からなくても止めない (目安は止めないのが決まり)
+    D.setFacilityCapacity('workcenter', { boxesHard: false });
+    const r2 = C.startConsignment({ taskId: t, batchId: bid, facilityCode: 'workcenter', qty: 700,
+      expectVersion: v(t), capacityGuard: SV.facilityCapacityGuard });
+    ok(r2.ok, '⭐守らせない拠点なら、入数が分からなくても止めない');
+
+    // ⑥ ⭐すでに外にあるぶんが数えられないときも断る (判明分だけで空きを判定しない)
+    D.setFacilityCapacity('workcenter', { boxesHard: true });
+    ok(SV.facilityLoads().get('workcenter').boxes_unknown > 0, '(前提) 入数不明の預けが外にある');
+    const t3 = mk('cap-6', 9285, 70);                                  // こちらは入数 70 で 1 箱
+    const r3 = C.startConsignment({ taskId: t3, batchId: B.listBatchesOfTask(db, t3)[0].id,
+      facilityCode: 'workcenter', qty: 70, expectVersion: v(t3), capacityGuard: SV.facilityCapacityGuard });
+    ok(!r3.ok && r3.error === 'capacity_unknown',
+      '⭐外にあるぶんに入数不明が混ざっていたら、空きを数えられないので断る');
+    ok(r3.message.includes('入数が分からないものが'),
+      '判明分だけの小計で空きを判定していないことを、文言でも言う');
+    // 入数不明の預けを取り消せば、また通る
+    const cx = C.getConsignment(r2.consignment.id);
+    C.cancelConsignment({ consignmentId: cx.id, expectVersion: cx.version });
+    const r4 = C.startConsignment({ taskId: t3, batchId: B.listBatchesOfTask(db, t3)[0].id,
+      facilityCode: 'workcenter', qty: 70, expectVersion: v(t3), capacityGuard: SV.facilityCapacityGuard });
+    ok(r4.ok, '数えられる状態に戻れば通る');
+    const c4 = C.getConsignment(r4.consignment.id);
+    C.cancelConsignment({ consignmentId: c4.id, expectVersion: c4.version });
+    D.setFacilityCapacity('workcenter', { boxes: null, boxesHard: false, hours: 16 });
+  }
+
+  // ⑦ ⭐枠の設定は楽観ロック (Codex R1 中3)
+  {
+    const f0 = TD.listFacilities().find((x) => x.code === 'workcenter');
+    ok(Number.isInteger(f0.version), '拠点は版を持つ');
+    const bad = D.setFacilityCapacity('workcenter', { hours: 5, expectVersion: f0.version + 1 });
+    ok(!bad.ok && bad.error === 'conflict', '⭐版が合わなければ、別端末の変更を黙って上書きしない');
+    ok(TD.listFacilities().find((x) => x.code === 'workcenter').capacity_hours === 16, '断ったときは値を変えない');
+    const good = D.setFacilityCapacity('workcenter', { hours: 5, expectVersion: f0.version });
+    ok(good.ok && good.version === f0.version + 1, '版が合えば保存し、新しい版を返す');
+    ok(TD.listFacilities().find((x) => x.code === 'workcenter').capacity_hours === 5, '値が入る');
+    const again = D.setFacilityCapacity('workcenter', { hours: 6, expectVersion: f0.version });
+    ok(!again.ok && again.error === 'conflict', '⭐同じ版で 2 回目は通らない (保存のたびに版が上がる)');
+    D.setFacilityCapacity('workcenter', { hours: 16 });
   }
 
   // ── 画面 ──
@@ -6795,12 +6860,29 @@ console.log('\n[33] 外部施設の受け入れ枠 (§AB-8)');
     '拠点を選び直したら、その拠点の残高に入れ替える');
   ok(/\(目安 未設定\)/.test(html), '⭐枠を決めていなければ「未設定」と出す (0 と書かない)');
   ok(/目安を超えています。渡してよいか職員で確かめてください（止めはしません）/.test(html),
-    '⭐超えても止めない (注意するだけ)');
+    '⭐目安は超えても止めない (注意するだけ)');
+  // ⭐説明と実際の結果を逆にしない (Codex R1 軽微4)
+  ok(/const hard = !!l.boxes_hard && l.capacity_boxes != null;/.test(html)
+    && /const soft = l.over_hours || (l.over_boxes && !hard);/.test(html),
+    '⭐箱数を守らせる拠点は「目安を超えた」ほうに数えない');
+  ok(/これ以上は渡せません/.test(html) && /これを超えるぶんは渡せません/.test(html),
+    '⭐サーバーが本当に断る拠点では「渡せません」と書く (「止めはしません」と書かない)');
+  ok(/空きを数えられないので<b>渡せません<\/b>/.test(html),
+    '⭐入数が分からず数えられないときも、渡せないことを画面に出す');
   ok(/工程数が登録されていない/.test(html) && /入数が登録されていない/.test(html),
     '数に入れられなかった件数も出す (黙って落とさない)');
   const adm = fs.readFileSync(new URL('../apps/iroha-work/views/admin.ejs', import.meta.url), 'utf8');
   ok(/sec-capacity/.test(adm) && /async function saveCapacity\(code\)/.test(adm), '管理画面で枠を決められる');
   ok(/空にすれば「未設定」に戻ります/.test(adm), '空にすると未設定に戻ることを書く');
+  ok(/id="capv-<%= f\.code %>" value="<%= f\.version %>"/.test(adm)
+    && /expect_version: Number\(document\.getElementById\('capv-' \+ code\)\.value\)/.test(adm),
+    '⭐枠の保存に版を添える (別端末の変更を黙って上書きしない)');
+  ok(/function applyCapacities\(list\)/.test(adm) && /if \(json\.facilities\) applyCapacities\(json\.facilities\);/.test(adm),
+    '競合したら、いまの値を出し直す');
+  const rt = fs.readFileSync(new URL('../apps/iroha-work/router.js', import.meta.url), 'utf8');
+  ok(/capacityGuard: facilityCapacityGuard/.test(rt) && !/const capacityOf = /.test(rt),
+    '⭐受け入れ枠は書き込みのトランザクションの中で数える (外で数えた残高を持ち回らない)');
+  ok(/if \(!Number\.isInteger\(req\.body\?\.expect_version\)\)/.test(rt), '枠の保存は版が無ければ受け付けない');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

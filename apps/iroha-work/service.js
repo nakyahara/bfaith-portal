@@ -564,6 +564,47 @@ export function facilityLoads(db = getDB()) {
 }
 
 /**
+ * ⭐箱数を守らせる拠点で、これ以上置いてよいかを見る (要件 §AB-8。Codex R1 重大1・中2)。
+ *
+ * ⭐**集計と同じ経路で入数を出す** — 片方が作業仕様マスタを見て、もう片方がカードのスナップショットだけ、
+ *   では判定がすり抜ける。だから facilityLoads と同じ masterOfTask/neededBoxesCalc を通す。
+ * ⭐**数えられないなら通さない**。入数が分からないと箱に換算できない。0 箱として通すと上限が意味を失うので、
+ *   「守らせる」と決めた拠点では**今回のぶん・すでに外にあるぶんのどちらかでも不明なら断る**
+ *   (すでに外にあるぶんが不明だと、boxes は判明分だけの小計で、空き枠を多く見積もってしまう)。
+ * ⚠必ず**書き込みのトランザクションの中で**呼ぶこと。外で数えた残高を持ち回ると、
+ *   2 つの預けが同時に入って上限を超えられる。
+ *
+ * @returns {null} 置いてよい / {error, message} 断る理由
+ */
+export function facilityCapacityGuard(facilityCode, taskId, qty) {
+  const l = facilityLoads().get(facilityCode);
+  // 守らせない拠点・箱数の枠が未設定なら素通り (目安を超えても止めないのが決まり — 要件 §AB-8)
+  if (!l || !l.boxes_hard || l.capacity_boxes == null) return null;
+  const fac = listFacilities(true).find((f) => f.code === facilityCode);
+  const name = fac ? fac.name : facilityCode;
+  const t = getTask(taskId);
+  if (!t) return { error: 'not_found', message: 'カードが見つかりません' };
+  let snap = null;
+  try { snap = t.master_snapshot ? JSON.parse(t.master_snapshot) : null; } catch { /* 下で「数えられない」に落ちる */ }
+  const k = keyOf(t.product_code);
+  const m = masterOfTask(k ? enrichContext().workMaster.get(k) : null, snap);
+  const add = neededBoxesCalc(qty, m.units_per_container);
+  if (!add) {
+    return { error: 'capacity_unknown',
+      message: `${name} は置ける箱数を守る決まりですが、この商品は入数が分からないので箱数を数えられません。作業仕様の「入数」を登録してから渡してください` };
+  }
+  if (l.boxes_unknown > 0) {
+    return { error: 'capacity_unknown',
+      message: `${name} にいま置いてあるぶんに、入数が分からないものが ${l.boxes_unknown} 件あります。空きが数えられないので、先にその入数を登録してください` };
+  }
+  if (l.boxes + add.boxes > l.capacity_boxes) {
+    return { error: 'over_capacity',
+      message: `${name} に置ける箱は ${l.capacity_boxes} 箱までです (いま ${l.boxes} 箱・今回 ${add.boxes} 箱)` };
+  }
+  return null;
+}
+
+/**
  * ⭐外部施設に見せる内容 (要件 §AB-11 の 6)。**読むだけ・その施設に預けたぶんだけ**。
  *
  * 中原さん 2026-09-07:

@@ -90,7 +90,7 @@ const IMPORT_ACTOR_PREFIX = 'import:';
 
 export function listFacilities(includeInactive = false) {
   return getDB().prepare(`SELECT id, code, name, external, offsite, active, sort_order,
-      capacity_hours, capacity_boxes, capacity_boxes_hard FROM f_iroha_facilities
+      capacity_hours, capacity_boxes, capacity_boxes_hard, version FROM f_iroha_facilities
     ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY sort_order, id`).all();
 }
 

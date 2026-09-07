@@ -363,6 +363,7 @@
   .cap .bar>i{display:block;height:100%;background:var(--accent)}
   .cap.over .bar>i{background:var(--danger,#c0392b)}
   .cap .warn{color:var(--danger,#c0392b)}
+  .cap .stop{margin-top:4px;color:var(--danger,#c0392b);font-weight:700}
   .cap .unset{color:var(--muted)}
   /* 作業のまとまり (2 つ以上のときだけ出る) */
   .brow{border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:10px;background:var(--bg)}
@@ -5152,9 +5153,14 @@ function externalFacilities() {
   return ((boardState() || {}).facilities || []).filter((f) => f.offsite);
 }
 /**
- * ⭐施設の受け入れ枠 (要件 §AB-8)。**止めるための表示ではない** — 何個まで預けてよさそうかを
- * 決める材料。主に見るのは想定作業時間 (個数は商品ごとに入数も工程数も違うので比べにくい)。
+ * ⭐施設の受け入れ枠 (要件 §AB-8)。何個まで預けてよさそうかを決める材料。
+ * 主に見るのは想定作業時間 (個数は商品ごとに入数も工程数も違うので比べにくい)。
  * ⭐枠が決まっていなければ「目安 未設定」と出す (0 と書かない)
+ *
+ * ⭐**目安とハード上限を混ぜて書かない** (Codex R1 軽微4)。
+ *   目安 = 超えても止めない → 「止めはしません」。
+ *   箱数を守らせる拠点 = サーバーが本当に断る → 「これ以上は渡せません」。
+ *   説明と実際の結果が逆になると、職員は画面を信じなくなる。
  */
 function capacityHtml(code) {
   const l = ((boardState() || {}).facility_loads || {})[code];
@@ -5168,14 +5174,29 @@ function capacityHtml(code) {
     ? '<b>' + esc(String(l.boxes)) + '</b> / ' + esc(String(l.capacity_boxes)) + ' 箱'
       + (l.boxes_hard ? '（ここまで）' : '')
     : '<b>' + esc(String(l.boxes)) + '</b> 箱 <span class="unset">(目安 未設定)</span>';
-  const over = l.over_hours || l.over_boxes;
-  return '<div class="cap' + (over ? ' over' : '') + '">' +
+  // ⭐ハード上限 = サーバーが本当に断るほう。ここで「止めはしません」と書いてはいけない
+  const hard = !!l.boxes_hard && l.capacity_boxes != null;
+  const room = hard ? Math.max(0, l.capacity_boxes - l.boxes) : null;
+  let hardMsg = '';
+  if (hard && l.boxes_unknown > 0) {
+    hardMsg = '🚫 ' + esc(facilityName(code)) + ' は置ける箱数を守る決まりです。いま置いてあるぶんに'
+      + '入数が登録されていないものがあり、空きを数えられないので<b>渡せません</b>。先にその入数を登録してください';
+  } else if (hard) {
+    hardMsg = room > 0
+      ? '🚫 ' + esc(facilityName(code)) + ' は置ける箱数を守る決まりです。<b>あと ' + esc(String(room))
+        + ' 箱ぶんまで</b>で、これを超えるぶんは渡せません'
+      : '🚫 ' + esc(facilityName(code)) + ' は置ける箱数を守る決まりで、いっぱいです。<b>これ以上は渡せません</b>';
+  }
+  // 目安を超えただけのほう = 止めない (ハード上限にした箱数は、目安としては数えない)
+  const soft = l.over_hours || (l.over_boxes && !hard);
+  return '<div class="cap' + (soft || (hard && room === 0) ? ' over' : '') + '">' +
     'いま ' + facilityName(code) + ' にあるぶん: ' + hoursTxt + ' ・ ' + boxesTxt +
     ' ・ ' + esc(String(l.count)) + ' 件 ・ ' + esc(String(l.qty)) + ' 個' +
     (l.capacity_hours != null ? '<div class="bar"><i style="width:' + pct + '%"></i></div>' : '') +
     (l.hours_unknown > 0 ? '<div class="unset">※ 工程数が登録されていない ' + esc(String(l.hours_unknown)) + ' 件は時間に入れていません</div>' : '') +
     (l.boxes_unknown > 0 ? '<div class="unset">※ 入数が登録されていない ' + esc(String(l.boxes_unknown)) + ' 件は箱数に入れていません</div>' : '') +
-    (over ? '<div class="warn">⚠ 目安を超えています。渡してよいか職員で確かめてください（止めはしません）</div>' : '') +
+    (soft ? '<div class="warn">⚠ 目安を超えています。渡してよいか職員で確かめてください（止めはしません）</div>' : '') +
+    (hardMsg ? '<div class="stop">' + hardMsg + '</div>' : '') +
     '</div>';
 }
 /** 入数で丸める。70 個入りなら 500 ではなく 490 (要件 §AB-9) */
