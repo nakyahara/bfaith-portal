@@ -2584,9 +2584,12 @@ function openPrintBox(id, batchId) {
   const type = barcodeTypeOf(c.barcode);
   // ⭐必要保管箱の内訳から分ける: 満杯の箱 (per 個) が full 箱、端数が rest 個で 1 箱。
   //   例 360 個 / 1 箱 70 個 → 70 個のラベル 5 枚 ＋ 10 個のラベル 1 枚 (中原さん 2026-09-06)
-  // ⭐分かれているときは**そのまとまりの数**で箱を数える。カード全体の数で数えると、
-  //   400 個のぶんに 1000 個ぶんのラベルを出してしまう (§AB-11 の 5a と同じ落とし穴)
-  const bc = batch && bs.length > 1 ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;
+  // ⭐箱の数も**そのまとまりの数**で数える。カード全体の数で数えると、
+  //   400 個のぶんに 1000 個ぶんのラベルを出してしまう (§AB-11 の 5a と同じ落とし穴)。
+  // 🚨期限とまったく同じ規則にする — 「いま残っているまとまりが 1 つ」を「分かれていない」と
+  //   同じに扱わない。取り消したぶんを除いて 1 つになっただけのことがあり、そこでカード全体の数に
+  //   戻すと、400 個のぶんに 1000 個ぶんのラベルが出る (Codex #1259 R4)
+  const bc = batch ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;
   let units = m.units_per_container != null ? String(m.units_per_container) : '';
   let copies = 1;
   let extraQty = '';
@@ -2784,8 +2787,10 @@ async function submitPrint() {
   if (j.job) c.print_job = j.job;
   if (j.error === 'in_progress') { closePrintBox(); repaintAfterPrint(c); return; }
   if (j.error === 'confirm_unknown' || j.error === 'confirm_manual') {
-    // 画面が古かった (別の iPad で発行されて結果不明になった等)。最新のジョブで開き直す
-    repaintAfterPrint(c); openPrintBox(c.id);
+    // 画面が古かった (別の iPad で発行されて結果不明になった等)。最新のジョブで開き直す。
+    // ⭐**選んでいたまとまりのまま**開き直す。渡さないと、分かれたカードでは選ぶ画面に戻り、
+    //   別のぶんを選び直せてしまう (前回の結果を確かめる話なのに、対象が変わる)
+    repaintAfterPrint(c); openPrintBox(c.id, ctx.batchId);
     $('#printMsg').textContent = j.message || '前回の印刷結果が不明です。実物を確認してください';
     return;
   }

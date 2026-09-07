@@ -3891,8 +3891,24 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
       'まとまりが 1 つも無い古いカードだけ、カードの期限を使う');
     ok(pick(2, { expiry: null }, null, 1) === '期限シールあり', '期限シールの印は残る');
   }
-  ok(html.includes('const bc = batch && bs.length > 1 ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;'),
+  ok(html.includes('const bc = batch ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;'),
     '⭐箱の数も**そのまとまりの数**で数える (400 個のぶんに 1000 個ぶんのラベルを出さない)');
+  // ⭐期限と箱数は**同じ規則**にする。片方だけ「残り 1 つならカード全体」を残すと、
+  //   取り消しで 1 つになったカードで、期限は正しいのに枚数だけカード全体になる (Codex R4)
+  {
+    const expLine = html.split(/\r?\n/).find((l) => l.includes('const expSrc = '));
+    const bcLine = html.split(/\r?\n/).find((l) => l.includes('const bc = batch'));
+    ok(!/bs\.length/.test(expLine) && !/bs\.length/.test(bcLine),
+      '🚨期限も箱数も「いま残っているまとまりの数」で場合分けしない (取り消しで 1 つになっただけのことがある)');
+    // 箱数を実際に決めさせる
+    const boxSrc = html.match(/function boxesOf\(qty, per\) \{[\s\S]*?\r?\n\}/)[0];
+    const pickBc = (batch, cardCalc) => new Function('batch', 'c', 'm',
+      boxSrc + '; ' + bcLine + '; return bc;')(batch, { boxes_calc: cardCalc }, { units_per_container: 70 });
+    const split = pickBc({ planned_qty: 400 }, { full: 14, rest: 20, per: 70, boxes: 15 });
+    ok(split.boxes === 6 && split.full === 5 && split.rest === 50,
+      '⭐400 個のまとまりは 6 箱 (カード全体の 1000 個ぶん 15 箱にしない)');
+    ok(pickBc(null, { boxes: 15 }).boxes === 15, 'まとまりが 1 つも無い古いカードはカード全体の数で数える');
+  }
   ok(html.includes('if (bs.length > 1 && batchId == null) { openPrintBatchPick(c, bs); return; }'),
     '⭐分かれているカードは、どのぶんか選んでから出す');
   ok(html.includes('function openPrintBatchPick(c, bs)') && html.includes("$('#printOk').disabled = true;"),
@@ -3939,6 +3955,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     await d.fn();
     ok(!d.ctx.unresolved, 'はじめての送信が断られただけなら、印は立たない (選び直せる)');
   }
+  ok(html.includes('repaintAfterPrint(c); openPrintBox(c.id, ctx.batchId);'),
+    '⭐前回の結果を確かめて開き直すときは、**選んでいたまとまりのまま**にする (対象を変えさせない)');
   ok(html.includes('ctx.unresolved = true;') && html.includes('if (j.ok) ctx.unresolved = false;'),
     '印を立てるのは通信が切れたときだけ / 下ろすのは積めたと分かったときだけ');
   ok(html.includes("data-prredo=") && !html.includes("openPrintBox(' + c.id + ')\">選び直す"),
