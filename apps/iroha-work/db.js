@@ -16,6 +16,7 @@
 import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { FACILITIES, FACILITY_RENAMES } from './tasks.js';
+import { backfillBatches } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -159,6 +160,58 @@ const sessionsDDL = (name) => `
       master_snapshot TEXT,
       CHECK (page_id IS NOT NULL OR task_id IS NOT NULL)
     );`;
+/**
+ * ⭐作業の「まとまり」(要件 §AB)。1 枚のカードの下に、**独立して作業・完成・棚入れできる単位**を持つ。
+ *
+ *   - ふだんは 1 枚のカードに **まとまり 1 つ**。見え方も操作もいままでと同じ
+ *   - 一部を外部施設へ預ける / 期限が違う物が混ざる ときだけ 2 つ以上に割る
+ *   - **カードは分割しない**。入荷受付の 1 行との 1 対 1 (destination_id UNIQUE) を壊さないため。
+ *     写真・作業時間・ラベル待ちもカードに付いたままなので、帰属で悩む場面が起きない
+ *
+ * 拠点は**カードと同じ規約**: NULL = どこが作業するか未定 / 'iroha' = いろは (要件 §W-2)。
+ * 「未定」を「いろは」と見なさない。
+ */
+const batchesDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id        INTEGER NOT NULL REFERENCES f_iroha_tasks(id),
+      -- 内部の通し番号。⭐振り直さない・再利用しない (履歴が追えなくなる)。画面には出さない
+      seq            INTEGER NOT NULL,
+      planned_qty    INTEGER CHECK (planned_qty IS NULL OR planned_qty >= 0),
+      facility_code  TEXT REFERENCES f_iroha_facilities(code),
+      -- 期限は**作成時にカードからコピーする**。「NULL ならカードから継承」にしない —
+      -- あとでカードの期限を直すと、既に外に出したまとまりの期限まで黙って変わってしまう (要件 §AB-12)
+      expiry         TEXT,
+      -- 見分けるための名前 (任意)。同じ拠点・同じ期限で 2 つに割れたときだけ職員が付ける (要件 §AB-6)
+      label          TEXT,
+      work_status    TEXT NOT NULL CHECK (work_status IN ('not_started','in_progress','ready_for_stocking','done','cancelled')),
+      -- ⭐できた数・作れなかった数は NULL = まだ数えていない。0 と区別する (要件 §AB-3)。
+      --   予定 (planned_qty) で上書きしない。1010 個できることもあるので上限の CHECK も置かない
+      good_qty       INTEGER CHECK (good_qty IS NULL OR good_qty >= 0),
+      loss_qty       INTEGER CHECK (loss_qty IS NULL OR loss_qty >= 0),
+      -- ⭐その数の出どころ。'counted' = 人が数えた / 'migrated' = 移行で持ってきた値。
+      --   移行前は棚入待ちにした瞬間に予定数で上書きしていたので、**実績として信用できない**。
+      --   「確認ずみ」に見せないため出自を残す (要件 §AB-3)
+      good_qty_source TEXT CHECK (good_qty_source IS NULL OR good_qty_source IN ('counted','migrated')),
+      variance_note  TEXT,
+      -- どのまとまりから切り出したか (要件 §AB-5)。監査ログだけに頼らない
+      split_from_batch_id INTEGER REFERENCES ${name}(id),
+      split_qty      INTEGER,
+      split_at       TEXT,
+      split_by       TEXT,
+      version        INTEGER NOT NULL DEFAULT 1,
+      created_at     TEXT NOT NULL,
+      updated_at     TEXT NOT NULL,
+      -- ⭐できた数と、その出どころは必ず対。片方だけある行を作らせない (Codex R1 中5)。
+      --   「数が入っているのに出どころが分からない」= 実績として信用してよいか判断できない
+      CHECK ((good_qty IS NULL AND good_qty_source IS NULL)
+          OR (good_qty IS NOT NULL AND good_qty_source IS NOT NULL))
+    );`;
+const BATCHES_INDEX_DDL = `
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_batches_seq ON f_iroha_task_batches(task_id, seq);
+    CREATE INDEX IF NOT EXISTS idx_iroha_batches_task ON f_iroha_task_batches(task_id, id);
+    CREATE INDEX IF NOT EXISTS idx_iroha_batches_fac ON f_iroha_task_batches(facility_code, work_status);`;
+
 const SESSIONS_INDEX_DDL = `
     CREATE INDEX IF NOT EXISTS idx_iroha_sessions_page ON f_iroha_work_sessions(page_id, id);
     CREATE INDEX IF NOT EXISTS idx_iroha_sessions_task ON f_iroha_work_sessions(task_id, id);`;
@@ -569,6 +622,8 @@ export function createTables(db = getMirrorDB()) {
     --   raw_seconds はサーバー時刻の差分 (iPad の時計を信じない)。承認・補正 (approved) は後続PR。
     --   voided = 誤操作の論理削除 (行は消さず集計から外す — 実測値の除外フラグ)
     --   紐づけ先: Notion 正本の間は page_id、アプリ正本のカードは task_id (v1.1)
+    ${batchesDDL('f_iroha_task_batches')}
+    ${BATCHES_INDEX_DDL}
     ${sessionsDDL('f_iroha_work_sessions')}
 
     -- 完成写真・動画 (要件定義 §6 / §1.7 ②outbox)。
@@ -665,6 +720,9 @@ export function createTables(db = getMirrorDB()) {
   migrateTasksSchema(db);
   // 旧「保留」(status='on_hold') を「作業中/未着手 + 止まっている理由」へ (案A 2026-09-05)。列が揃った後に 1 回だけ
   migrateOnHoldToBlocked(db);
+  // ⭐まとまりを持っていないカードに 1 つずつ用意する (要件 §AB-1)。冪等。
+  //   進捗の移行 (上) が終わってから — まとまりの状態はカードの進捗から決めるため
+  backfillBatches(db);
   // v1.1 正本化: 作業時間・写真・履歴を task に紐づける (page_id は Notion 時代の証跡として残す — Codex 設計相談 R3)。
   // REFERENCES は宣言する (mirror DB は foreign_keys=ON。存在確認はサービス層でも行う)
   addCol('f_iroha_work_sessions', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');

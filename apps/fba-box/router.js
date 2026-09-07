@@ -24,7 +24,7 @@ import {
   createRun, activateRun, setRunStatus, listRuns, getRun, getRunState, finishRun,
   createRunFromPicking, getRunBySource, attachExcelToRun,
   createBox, closeBox, reopenBox, voidBox, listBoxContents, getBox,
-  addPlacement, revokePlacement, adjustPlacement, setPlacementLayer,
+  addPlacement, replayPlacement, revokePlacement, adjustPlacement, setPlacementLayer,
   setRowWorkers, setRowShortage, clearRowShortage, setRowSendQty,
   exportReadiness, buildExportPayload, recordExportBatch, listExports, getExport, markStaUploaded,
   listProductImages, listRowsNeedingCatalog,
@@ -282,6 +282,12 @@ router.post('/device/exit', checkOrigin, api((req, res) => {
   res.json({ ok: true, revoked: !!req.fbxDevice });
 }));
 
+// 投入の送信キュー (作業画面が読む素の JS。テストは node:vm で同じファイルを評価する)
+router.get('/place-queue.js', (req, res) => {
+  res.type('application/javascript; charset=utf-8');
+  res.sendFile(path.join(__dirname, 'views', 'place-queue.js'));
+});
+
 // ─── 作業画面 (iPad) ───
 router.get('/', (req, res) => {
   const qIdx = req.originalUrl.indexOf('?');
@@ -394,8 +400,31 @@ router.post('/api/workers/:id(\\d+)/active', checkOrigin, api((req, res) => {
   res.json({ ok: true });
 }));
 
+/**
+ * 職員の本人確認だけを行う (端末に残った「読めない記録」を捨てる前など、サーバーの状態は
+ * 変えないが職員の判断が要る操作)。画面だけの PIN 入力は検証になっていない (Codex PQ-R3 high#4)。
+ * 誰がいつ何のために通したかを監査に残す
+ */
+router.post('/api/staff/verify', checkOrigin, api((req, res) => {
+  const gate = staffApproval(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  safeLogEvent({ action: 'staff_verify', deviceLabel: deviceLabelOf(req), ok: true,
+    payload: { purpose: String(req.body?.purpose || '').slice(0, 60), via: gate.via, approvedBy: gate.approvedBy,
+      detail: String(req.body?.detail || '').slice(0, 500) } });
+  res.json({ ok: true, approvedBy: gate.approvedBy });
+}));
+
 /** 割当の追加 (F-2: 原子的残数検証+冪等性) */
 router.post('/api/placements', checkOrigin, api((req, res) => {
+  // 応答喪失後の送り直しは、**作業者の検証より先に**前回の結果を返す (Codex PQ-R2 high#2)。
+  // 登録済みなのに「この作業者は無効になっています」を返すと、画面は「記録できませんでした」と
+  // 出して入れ直しを促し、現物と記録が二重になる。新規のときだけ作業者が要る
+  const replay = replayPlacement({
+    deviceKey: deviceKeyOf(req), requestId: String(req.body?.request_id || ''),
+    runId: Number(req.body?.run_id), rowId: Number(req.body?.row_id), boxId: Number(req.body?.box_id),
+    qty: req.body?.qty, expiry: req.body?.expiry, layer: req.body?.layer,
+  });
+  if (replay) return res.status(replay.ok ? 200 : 409).json(replay);
   const w = resolveWorker(req);
   if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
   const r = addPlacement({
