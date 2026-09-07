@@ -178,7 +178,7 @@ export function whyCannotSplit(db, batch) {
  * 別々の新規行が同時に入って合計が予定数を超える (要件 §AB-7)。
  */
 export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate = null, expectVersion,
-  actor = null, guard = null }) {
+  actor = null, guard = null, capacityGuard = null }) {
   const db = getDB();
   const q = normQty(qty, '預ける数');
   if (q.error) return { ok: false, error: q.error, message: q.message };
@@ -210,6 +210,15 @@ export function startConsignment({ taskId, batchId, facilityCode, qty, dueDate =
     const max = splittableMax(db, b);
     if (max != null && q.value > max) {
       return { ok: false, error: 'too_many', message: `渡せるのは ${max} 個までです (残っているぶん)`, max };
+    }
+    // ⭐受け入れ枠 (要件 §AB-8)。**止めるのは箱数だけ**、しかも「置き場の都合で本当に上限がある」と
+    //   決めた拠点だけ。想定時間は概算 (外部は進捗を入れないので残りが分からない) なので、
+    //   超えても止めず、画面で注意するだけにする。
+    // ⭐**残高を数えるのもここ (トランザクションの中)** — 外で数えた残高を持ち回ると、
+    //   2 つの預けが同時に入って上限を超えられる (Codex R1 中2)
+    if (capacityGuard) {
+      const cap = capacityGuard(facilityCode, taskId, q.value);
+      if (cap) return { ok: false, ...cap };
     }
     const now = utcNow();
     // ⭐予定数を丸ごと預けるときだけ、まとまりを割らない (行を増やす意味が無い)。

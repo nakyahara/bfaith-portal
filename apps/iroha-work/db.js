@@ -682,6 +682,14 @@ export function createTables(db = getMirrorDB()) {
       name       TEXT NOT NULL,
       external   INTEGER NOT NULL DEFAULT 0 CHECK (external IN (0,1)),
       offsite    INTEGER NOT NULL DEFAULT 0 CHECK (offsite IN (0,1)),   -- 物を持ち帰って向こうで作業する (羅針盤・ワークセンター)
+      -- ⭐受け入れ枠 (要件 §AB-8)。NULL = **未設定** (0 ではない)。
+      --   主 = 想定作業時間、副 = 箱数。⭐ハード上限にしない — 残高と目安を見せて、超えたら注意するだけ。
+      --   置き場・車両の都合で本当に物理的な上限がある施設だけ、箱数を守らせる (capacity_boxes_hard = 1)
+      capacity_hours     REAL,
+      capacity_boxes     INTEGER,
+      capacity_boxes_hard INTEGER NOT NULL DEFAULT 0 CHECK (capacity_boxes_hard IN (0,1)),
+      -- ⭐枠を変えるたびに +1。別の端末が先に変えていたら上書きしない (要件: 楽観ロック)
+      version    INTEGER NOT NULL DEFAULT 0,
       active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
       sort_order INTEGER NOT NULL DEFAULT 0
     );
@@ -829,6 +837,10 @@ export function createTables(db = getMirrorDB()) {
   // 拠点の初期値 (無ければ足す。名前の変更は管理画面から — 今は無いので tasks.js を正とする)。
   // タスク表の作り直し (facility_code の FK 検査) より前に入れておく
   addCol('f_iroha_facilities', 'offsite', 'INTEGER NOT NULL DEFAULT 0 CHECK (offsite IN (0,1))');
+  addCol('f_iroha_facilities', 'capacity_hours', 'REAL');
+  addCol('f_iroha_facilities', 'capacity_boxes', 'INTEGER');
+  addCol('f_iroha_facilities', 'capacity_boxes_hard', 'INTEGER NOT NULL DEFAULT 0 CHECK (capacity_boxes_hard IN (0,1))');
+  addCol('f_iroha_facilities', 'version', 'INTEGER NOT NULL DEFAULT 0');
   const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, offsite, active, sort_order) VALUES (?, ?, ?, ?, 1, ?)');
   for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.offsite ? 1 : 0, f.sort_order);
   // 「物を持ち帰るか」は拠点の性質なので tasks.js を正として揃える (既に入っている行も)
@@ -1783,6 +1795,47 @@ export function listFacilityLinks(includeRevoked = false) {
 export function revokeFacilityLink(id) {
   return getDB().prepare('UPDATE f_iroha_facility_links SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL')
     .run(utcNow(), Number(id)).changes > 0;
+}
+
+/**
+ * ⭐外部施設の受け入れ枠を決める (要件 §AB-8)。**空にすれば「未設定」に戻せる** (0 と区別する)。
+ * ハード制約にできるのは箱数だけ (置き場・車両の都合。時間は概算なので守らせない)。
+ *
+ * expectVersion を渡すと**楽観ロック**になる (合わなければ conflict)。画面からは必ず渡すこと —
+ * 渡さないと、A が「8 箱・守らせる」に直した直後に B が時間だけ保存して、A の変更が消える (Codex R1 中3)。
+ */
+export function setFacilityCapacity(code, { hours, boxes, boxesHard, expectVersion } = {}) {
+  const fac = getDB().prepare('SELECT code, offsite, version FROM f_iroha_facilities WHERE code = ?').get(String(code || ''));
+  if (!fac) return { ok: false, error: 'not_found', message: 'その拠点はありません' };
+  if (!fac.offsite) return { ok: false, error: 'not_external', message: '受け入れ枠を持つのは、物を持ち帰る拠点だけです' };
+  const num = (v, label, max) => {
+    if (v === undefined) return { skip: true };
+    if (v === null || v === '') return { value: null };            // ⭐空 = 未設定に戻す
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0 || n > max) return { error: `${label}は 0 より大きい数で入れてください` };
+    return { value: n };
+  };
+  const h = num(hours, '目安の時間', 10_000);
+  if (h.error) return { ok: false, error: 'bad_request', message: h.error };
+  const b = num(boxes, '箱の数', 100_000);
+  if (b.error) return { ok: false, error: 'bad_request', message: b.error };
+  if (b.value != null && !Number.isSafeInteger(b.value)) return { ok: false, error: 'bad_request', message: '箱の数は整数で入れてください' };
+  const sets = [];
+  const vals = [];
+  if (!h.skip) { sets.push('capacity_hours = ?'); vals.push(h.value); }
+  if (!b.skip) { sets.push('capacity_boxes = ?'); vals.push(b.value); }
+  if (boxesHard !== undefined) { sets.push('capacity_boxes_hard = ?'); vals.push(boxesHard ? 1 : 0); }
+  if (sets.length === 0) return { ok: false, error: 'bad_request', message: '直すものがありません' };
+  if (expectVersion != null && Number(expectVersion) !== fac.version) {
+    return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', version: fac.version };
+  }
+  sets.push('version = version + 1');
+  const info = getDB().prepare(`UPDATE f_iroha_facilities SET ${sets.join(', ')} WHERE code = ? AND version = ?`)
+    .run(...vals, fac.code, fac.version);
+  if (info.changes === 0) {
+    return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します' };
+  }
+  return { ok: true, version: fac.version + 1 };
 }
 
 /** 端末の職員モード。PIN を確かめた側が呼ぶ。@returns 期限 (ISO) */
