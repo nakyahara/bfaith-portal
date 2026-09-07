@@ -328,6 +328,31 @@ t('[!] 数量12 のSKUは 原価 × 12 になる', () => {
   assert.ok(near(r.cost_ex_tax, 600 * 12), `期待 7200, 実際 ${r.cost_ex_tax}`);
 });
 
+t('[!] 利益も数量倍した原価で計算される (表示だけ直っていて利益が古い、を防ぐ)', () => {
+  // 🚨 cost_ex_tax の列だけ見るテストでは、buildProfitInputs に単品原価を
+  //    渡したままでも通ってしまう。実データで実際にそうなった (2026-09-07)
+  const ctx = baseCtx({ skuMap: new Map([['sku1', [{ ne_code: 'ne001', qty: 12 }]]]), feeEstimates: feeCache() });
+  const r12 = buildRow(amazonListing(), ctx);
+  const r1 = buildRow(amazonListing(), baseCtx({ feeEstimates: feeCache() }));
+  assert.equal(r12.calculation_status, 'ok');
+  // 原価が 600 → 7,200 に増えた分、そのまま利益が減る
+  assert.ok(near(r12.expected_profit, r1.expected_profit - 600 * 11),
+    `期待 ${r1.expected_profit - 6600}, 実際 ${r12.expected_profit}`);
+  assert.ok(r12.expected_margin_rate < r1.expected_margin_rate);
+  // 内訳と結果が合っていること (validateGeneration と同じ検算)
+  assert.ok(near(r12.expected_profit,
+    r12.revenue_ex_tax - r12.cost_ex_tax - (r12.shipping_total_ex_tax || 0)
+    - (r12.fba_fee_ex_tax || 0) - (r12.fee_total_ex_tax || 0)));
+});
+
+t('input_snapshot に単品原価と数量が残る (あとから検算できる)', () => {
+  const ctx = baseCtx({ skuMap: new Map([['sku1', [{ ne_code: 'ne001', qty: 12 }]]]), feeEstimates: feeCache() });
+  const snap = JSON.parse(buildRow(amazonListing(), ctx).input_snapshot);
+  assert.equal(snap.unit_cost_ex_tax, 600);
+  assert.equal(snap.unit_quantity, 12);
+  assert.equal(snap.cost_ex_tax, 7200);
+});
+
 t('数量1 なら原価はそのまま', () => {
   const ctx = baseCtx({ skuMap: new Map([['sku1', [{ ne_code: 'ne001', qty: 1 }]]]) });
   const r = buildRow(amazonListing(), ctx);

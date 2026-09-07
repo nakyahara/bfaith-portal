@@ -164,9 +164,11 @@ export function buildRow(listing, ctx) {
   //    (実データ 2026-09-07: opbs454 が 数量12 で 原価1,001 → 79.4%)
   //    Amazon の対応表 (v_sku_resolved) にだけ数量がある。楽天は qty = null
   const qty = resolved.qty;
-  if (qty != null && qty > 1) row.unit_quantity = qty;
-  else if (qty === 1) row.unit_quantity = 1;
-  row.cost_ex_tax = cost.costExTax * (qty ?? 1);
+  row.unit_quantity = qty ?? null;
+  // 🚨 以降は必ず costExTax (数量を掛けた後) を使う。cost.costExTax を直接使うと
+  //    「表示は数量倍だが利益は単品原価」というズレが出る (実データで実際に出た)
+  const costExTax = cost.costExTax * (qty ?? 1);
+  row.cost_ex_tax = costExTax;
   row.cost_method = cost.method;
   row.tax_rate = cost.taxRate;
   row.cost_status = isExpired(ctx.masterFreshness.costValidUntil, now) ? 'expired' : 'ok';
@@ -247,7 +249,7 @@ export function buildRow(listing, ctx) {
     priceInclTax: row.price_status === 'ok' ? listing.price_incl_tax : null,
     postageRevenueInclTax,
     productTaxRate: cost.taxRate,
-    costExTax: cost.costExTax,
+    costExTax,
     shippingRate,
     feeEstimate,
   });
@@ -285,7 +287,9 @@ export function buildRow(listing, ctx) {
     postage_included: listing.postage_included,
     postage_revenue_incl_tax: listing.postage_revenue_incl_tax,
     points: listing.points,
-    cost_ex_tax: cost.costExTax,
+    cost_ex_tax: costExTax,
+    unit_cost_ex_tax: cost.costExTax,     // 単品いくらだったか (数量倍する前)
+    unit_quantity: qty ?? null,
     cost_source: product.原価ソース,
     cost_state: product.原価状態,
     tax_rate: cost.taxRate,
