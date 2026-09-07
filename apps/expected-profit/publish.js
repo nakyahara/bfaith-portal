@@ -61,6 +61,11 @@ export async function publishToRender(db, generationId, deps) {
   db.prepare("UPDATE expected_profit_generation SET remote_status = 'sending' WHERE generation_id = ?").run(generationId);
 
   for (const c of chunks) {
+    // 🚨 チャンクごとに期限を見る。全チャンク送り切るまで止まらないと期限を越える
+    if (deps.deadline && new Date() >= deps.deadline) {
+      db.prepare("UPDATE expected_profit_generation SET remote_status = 'not_sent' WHERE generation_id = ?").run(generationId);
+      return { ok: false, error: 'deadline_exceeded', sentChunks: c.chunk_index };
+    }
     const res = await deps.postChunk(generationId, { ...c, seq: gen.seq, manifest });
     if (!res?.ok) {
       db.prepare("UPDATE expected_profit_generation SET remote_status = 'not_sent' WHERE generation_id = ?").run(generationId);

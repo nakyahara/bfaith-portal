@@ -18,6 +18,7 @@
 import { Router } from 'express';
 import crypto from 'crypto';
 import { getExpectedProfitDB } from './db.js';
+import { hashGeneration } from './generation-hash.js';
 import { nowIso } from './util.js';
 
 const router = Router();
@@ -143,23 +144,31 @@ export function publishGeneration(db, { generationId, seq, manifest }) {
       outcome = { ok: false, status: 409, error: 'seq_not_newer', publishedSeq: pointer.seq, attemptedSeq: effectiveSeq };
       return;
     }
+    // 🚨 照合の基準は「受信時に保存した manifest」。要求の値を優先しない (Codex R5-2)。
+    //    要求を優先すると、content_hash: '' を送るだけで照合を飛ばせてしまう
+    const expected = gen.row_count;
+    const expectedHash = gen.content_hash;
+    if (manifest?.row_count != null && Number(manifest.row_count) !== Number(expected)) {
+      outcome = { ok: false, status: 400, error: 'manifest_row_count_mismatch', stored: expected, requested: manifest.row_count };
+      return;
+    }
+    if (manifest?.content_hash != null && manifest.content_hash !== expectedHash) {
+      outcome = { ok: false, status: 400, error: 'manifest_hash_mismatch', stored: expectedHash, requested: manifest.content_hash };
+      return;
+    }
     // 件数の照合
     const actual = db.prepare('SELECT COUNT(*) n FROM mart_listing_expected_profit WHERE generation_id = ?').get(generationId).n;
-    const expected = manifest?.row_count ?? gen.row_count;
     if (expected != null && actual !== expected) {
       outcome = { ok: false, status: 400, error: 'row_count_mismatch', expected, actual };
       return;
     }
     if (actual === 0) { outcome = { ok: false, status: 400, error: 'no_rows' }; return; }
-    // 🚨 内容ハッシュを保存済みの行から再計算して照合する (Codex R4-5)。
-    //    件数だけでは「同じ件数の違う内容」「複数回の送信が混ざった世代」を通してしまう
-    const expectedHash = manifest?.content_hash ?? gen.content_hash;
-    if (expectedHash) {
-      const actualHash = generationContentHash(db, generationId);
-      if (actualHash !== expectedHash) {
-        outcome = { ok: false, status: 400, error: 'content_hash_mismatch', expected: expectedHash, actual: actualHash };
-        return;
-      }
+    // 🚨 ハッシュが無い世代は公開しない (照合を飛ばさせない)
+    if (!expectedHash) { outcome = { ok: false, status: 400, error: 'content_hash_missing' }; return; }
+    const actualHash = generationContentHash(db, generationId);
+    if (actualHash !== expectedHash) {
+      outcome = { ok: false, status: 400, error: 'content_hash_mismatch', expected: expectedHash, actual: actualHash };
+      return;
     }
     const previousId = pointer?.generation_id || null;
     db.prepare(`INSERT INTO expected_profit_publish_pointer (id, generation_id, seq, published_at)
@@ -179,22 +188,9 @@ export function publishGeneration(db, { generationId, seq, manifest }) {
   return outcome;
 }
 
-/**
- * 保存済みの行から内容ハッシュを再計算する。
- * 🚨 順位を決める値 (利益率・適格状態・費用内訳) を含める。
- *    キーと利益額だけだと、順位が変わる改変を検出できない (Codex R4-5)
- */
+/** 保存済みの行から内容ハッシュを再計算する (送信側と同じ関数を通す) */
 export function generationContentHash(db, generationId) {
-  const rows = db.prepare(`
-    SELECT mall, shop_id, mall_item_key, expected_profit, expected_margin_rate,
-           rank_eligible, calculation_status, revenue_ex_tax, cost_ex_tax,
-           shipping_total_ex_tax, fba_fee_ex_tax, fee_total_ex_tax
-    FROM mart_listing_expected_profit WHERE generation_id = ?
-    ORDER BY mall, shop_id, mall_item_key
-  `).all(generationId);
-  const h = crypto.createHash('sha256');
-  for (const r of rows) h.update(JSON.stringify(r));
-  return h.digest('hex');
+  return hashGeneration(db, generationId);
 }
 
 /** 公開中の世代 (送信側が読み戻して確認する) */

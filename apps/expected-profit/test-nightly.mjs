@@ -206,6 +206,50 @@ await ta('[!] 期限を過ぎたら新しい取得を始めない (全工程に�
   assert.equal(step.error, 'deadline_exceeded');
 });
 
+await ta('[!] 処理の途中で期限を跨いだら、そこで取得を止める (ページごとに見る)', async () => {
+  // 1ページ目は期限内、2ページ目で期限を越える
+  let page = 0;
+  const deadline = new Date(Date.now() + 40);
+  const r = await runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline,
+    malls: ['rakuten'], skipFees: true, skipPublish: true,
+    fetchDeps: { rakuten: { searchPage: async () => {
+      page++;
+      await new Promise(res => setTimeout(res, 30));   // 1ページ 30ms
+      return { results: [{ item: { manageNumber: `p${page}`, variants: {
+        v: { standardPrice: '1100', payment: { taxIncluded: true }, shipping: { postageIncluded: true } },
+      } } }], nextCursorMark: `c${page}` };
+    } } },
+    log: () => {},
+  });
+  const step = r.steps.find(s => s.step === 'fetch:rakuten');
+  assert.ok(page <= 3, `期限後もページを取り続けた (${page}ページ)`);
+  assert.equal(step.deadlineHit, true, '期限で打ち切ったことが記録されていない');
+  assert.equal(step.status, 'partial');
+});
+
+await ta('[!] 転送の途中で期限を跨いだら、そこで止めて公開しない', async () => {
+  // 世代を作ってから、期限切れの deadline で転送する
+  const built = await runNightly({
+    db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'),
+    malls: ['rakuten'], skipFees: true, skipPublish: true,
+    fetchDeps: { rakuten: { searchPage: rakutenPage } },
+    log: () => {},
+  });
+  const { publishToRender } = await import('./publish.js');
+  let sent = 0;
+  const r = await publishToRender(db, built.generationId, {
+    chunkSize: 1,
+    deadline: new Date(Date.now() - 1000),   // 既に過ぎている
+    postChunk: async () => { sent++; return { ok: true }; },
+    postPublish: async () => { throw new Error('publish を呼んではいけない'); },
+    getPublished: async () => null,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.error, 'deadline_exceeded');
+  assert.equal(sent, 0);
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);

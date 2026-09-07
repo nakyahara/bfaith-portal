@@ -249,9 +249,11 @@ export async function fetchAmazonListings(db, deps = {}) {
               VALUES (?, 'amazon', ?, 'running', 'failed')`).run(runId, startedAt);
 
   try {
+    // 🚨 期限を過ぎていたら取得そのものを始めない (Codex R5-3)
+    if (deps.deadline && new Date() >= deps.deadline) throw new Error('deadline_exceeded');
     const getReport = deps.getActiveListingsReport
       || (await import('../profit-calculator/sp-api.js')).getActiveListingsReport;
-    const report = await getReport();
+    const report = await getReport({ deadline: deps.deadline });
     // 🚨 レスポンス形式そのものを検証する。{} が返ったのを「0件」として通さない (Codex R1-2)
     if (!report || !Array.isArray(report.listings)) {
       throw new Error('出品レポートの形式が不正 (listings が配列でない)');
@@ -303,10 +305,13 @@ export async function fetchRakutenListings(db, deps = {}) {
     let cursorMark = '*';
     let pages = 0;
     let unparsable = 0;
+    let deadlineHit = false;
     const MAX_PAGES = deps.maxPages || 500;   // 50,000 商品。到達したら partial (打ち切りを隠さない)
     let truncated = false;
     for (;;) {
       if (pages >= MAX_PAGES) { truncated = true; break; }
+      // 🚨 ページごとに期限を見る。1ページ目だけ見ても、39ページ回る間に期限を越える
+      if (deps.deadline && new Date() >= deps.deadline) { truncated = true; deadlineHit = true; break; }
       const data = await searchPage(cursorMark);
       pages++;
       // 🚨 形式を検証する。results も items も無いレスポンスを「0件」として通さない
@@ -333,7 +338,8 @@ export async function fetchRakutenListings(db, deps = {}) {
     // 0件 (failed) は打ち切りより重い。failed > partial > ok の順で厳しい方を採る
     const enumStatus = evalResult.status === 'failed' ? 'failed' : (truncated ? 'partial' : evalResult.status);
     const summary = enumSummary(evalResult)
-      || (truncated ? `ページ上限 ${MAX_PAGES} に到達 (打ち切りの疑い)` : null);
+      || (deadlineHit ? '全体終了期限に達したので取得を打ち切った'
+        : (truncated ? `ページ上限 ${MAX_PAGES} に到達 (打ち切りの疑い)` : null));
 
     insertSnapshots(db, rows);
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,
@@ -343,7 +349,7 @@ export async function fetchRakutenListings(db, deps = {}) {
         rows.length, rows.filter(r => r.fetch_status === 'ok').length,
         rows.filter(r => r.fetch_status !== 'ok').length, evalResult.disappeared,
         summary, runId);
-    return { runId, count: rows.length, pages, truncated, unparsable, duplicates, ...evalResult, status: enumStatus };
+    return { runId, count: rows.length, pages, truncated, deadlineHit, unparsable, duplicates, ...evalResult, status: enumStatus };
   } catch (e) {
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = 'failed', listing_enum_status = 'failed',
                 error_summary = ? WHERE run_id = ?`).run(nowIso(), String(e.message).slice(0, 500), runId);

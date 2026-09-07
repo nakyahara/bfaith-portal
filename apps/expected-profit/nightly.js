@@ -65,6 +65,7 @@ async function ping(status, summary) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ status, summary }),
+      signal: AbortSignal.timeout(30_000),   // 🚨 ping で固まらせない
     });
   } catch (e) {
     console.warn('[expected-profit] ping 失敗:', e.message);
@@ -94,7 +95,7 @@ export async function runNightly(opts = {}) {
     if (opts.malls && !opts.malls.includes(mall)) continue;
     if (abortIfLate(`fetch:${mall}`)) continue;   // 期限後は新しい取得を始めない
     try {
-      const r = await fn(db, opts.fetchDeps?.[mall] || {});
+      const r = await fn(db, { deadline, ...(opts.fetchDeps?.[mall] || {}) });
       result.steps.push({ step: `fetch:${mall}`, ok: true, ...r });
       log(`[expected-profit] ${mall}: ${r.count}件 (${r.status})`);
     } catch (e) {
@@ -174,7 +175,7 @@ export async function runNightly(opts = {}) {
     return { ...result, error: 'deadline_exceeded', generationId: gen.generationId };
   }
   try {
-    const pub = await publishToRender(db, gen.generationId, opts.publishDeps || httpDeps());
+    const pub = await publishToRender(db, gen.generationId, { deadline, ...(opts.publishDeps || httpDeps()) });
     result.steps.push({ step: 'publish', ok: pub.ok, ...pub });
     if (!pub.ok) {
       await ping('fail', `公開できなかった: ${pub.error}`);

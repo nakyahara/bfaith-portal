@@ -184,6 +184,8 @@ export async function refreshFees(db, targets, deps = {}) {
     let res;
     let apiThrew = false;
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      // 🚨 リトライの途中でも期限を見る。バックオフ待ちの間に期限を越えることがある
+      if (deps.deadline && now() >= deps.deadline) { stoppedByDeadline = true; break; }
       try { res = await callApi(body); apiThrew = false; break; }
       catch (e) {
         apiThrew = true;
@@ -192,6 +194,7 @@ export async function refreshFees(db, targets, deps = {}) {
         } else await sleep(sleepMs * (attempt + 1));   // 指数バックオフ
       }
     }
+    if (stoppedByDeadline) break;
     processedTargets += chunk.length;
     if (apiThrew) continue;                 // 例外側は既に batchErrors に積んである
     // 🚨 例外を投げずに null / 非配列を返す API も「バッチ失敗」として数える。

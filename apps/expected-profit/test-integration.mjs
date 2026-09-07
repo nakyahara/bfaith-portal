@@ -37,6 +37,19 @@ async function ta(name, fn) {
 const near = (a, b, eps = 1e-6) => Math.abs(a - b) < eps;
 
 const db = initExpectedProfitDB();
+
+// 🚨 受信側 (Render 相当) は **別の DB ファイル**にする (Codex R5)。
+//    同じ DB を使うと、受信時の世代作成を通らず、送信前から全行が存在してしまう。
+//    「公開済み世代への同一チャンク再送」の分岐も検証できない
+const Database = (await import('better-sqlite3')).default;
+const remoteDb = new Database(path.join(process.env.DATA_DIR, 'remote.db'));
+remoteDb.pragma('foreign_keys = ON');
+{
+  // 受信側にも同じスキーマを作る (db.js の CREATE 文をそのまま流す)
+  const src = fs.readFileSync(new URL('./db.js', import.meta.url), 'utf8');
+  for (const m of src.matchAll(/db\.exec\(`([^`]+)`\)/g)) remoteDb.exec(m[1]);
+}
+
 const NOW = new Date('2026-09-07T15:00:00Z');
 const FUTURE = '2099-01-01T00:00:00Z';
 
@@ -137,34 +150,69 @@ await ta('5. 検証を通る', async () => {
   assert.equal(v.ok, true, JSON.stringify(v.errors));
 });
 
-await ta('🚨 6. 送信 → 受信 → 公開 を実際の関数で通す (模擬成功レスポンスを使わない)', async () => {
-  const gen = db.prepare('SELECT * FROM expected_profit_generation ORDER BY seq DESC LIMIT 1').get();
-  // 受信側を「別の DB」に見立てず、同じ DB の受け口関数を実際に呼ぶ
-  const r = await publishToRender(db, gen.generation_id, {
-    chunkSize: 1,
-    postChunk: async (id, body) => receiveChunk(db, {
-      generationId: id, seq: body.seq, chunkIndex: body.chunk_index,
-      checksum: body.checksum, rows: body.rows, manifest: body.manifest,
-    }),
-    postPublish: async (body) => publishGeneration(db, {
-      generationId: body.generation_id, seq: body.seq, manifest: body.manifest,
-    }),
-    getPublished: async () => getPublished(db),
-  });
-  assert.equal(r.ok, true, `公開できていない: ${r.error} ${JSON.stringify(r.detail || {})}`);
-  assert.equal(r.confirmed, true);
+// 送信側 (db) → 受信側 (remoteDb) を実際の関数で結ぶ
+const remoteDeps = (over = {}) => ({
+  chunkSize: 1,
+  postChunk: async (id, body) => receiveChunk(remoteDb, {
+    generationId: id, seq: body.seq, chunkIndex: body.chunk_index,
+    checksum: body.checksum, rows: body.rows, manifest: body.manifest,
+  }),
+  postPublish: async (body) => publishGeneration(remoteDb, {
+    generationId: body.generation_id, seq: body.seq, manifest: body.manifest,
+  }),
+  getPublished: async () => getPublished(remoteDb),
+  ...over,
 });
 
-await ta('🚨 7. 内容ハッシュが送信側と受信側で一致している', async () => {
-  // build 側の hash と publish-api 側の再計算が食い違うと、正常な世代が公開できなくなる
+await ta('🚨 6. 送信 → 受信 → 公開 を別DBで通す (受信側の世代作成も経由する)', async () => {
+  const gen = db.prepare('SELECT * FROM expected_profit_generation ORDER BY seq DESC LIMIT 1').get();
+  assert.equal(remoteDb.prepare('SELECT COUNT(*) n FROM mart_listing_expected_profit').get().n, 0);
+  const r = await publishToRender(db, gen.generation_id, remoteDeps());
+  assert.equal(r.ok, true, `公開できていない: ${r.error} ${JSON.stringify(r.detail || {})}`);
+  assert.equal(r.confirmed, true);
+  assert.equal(remoteDb.prepare('SELECT COUNT(*) n FROM mart_listing_expected_profit').get().n, gen.row_count);
+});
+
+await ta('🚨 7. 内容ハッシュが送信側と受信側で一致する (別DBで計算しても同じ)', async () => {
   const gen = db.prepare('SELECT * FROM expected_profit_generation ORDER BY seq DESC LIMIT 1').get();
   assert.equal(gen.remote_status, 'published');
   const { generationContentHash } = await import('./publish-api.js');
-  assert.equal(generationContentHash(db, gen.generation_id), gen.content_hash);
+  assert.equal(generationContentHash(remoteDb, gen.generation_id), gen.content_hash);
+});
+
+await ta('🚨 7b. 大文字小文字が混ざった SKU でもハッシュが一致する', async () => {
+  // JS の localeCompare は a → B、SQLite の BINARY は B → a で順序が違う。
+  // 揃っていないと、そういう SKU がある夜は正常な世代が公開できない (Codex R5-1)
+  const { hashRows, hashGeneration } = await import('./generation-hash.js');
+  const { chunkChecksum } = await import('./publish-api.js');
+  const src = db.prepare('SELECT * FROM mart_listing_expected_profit LIMIT 1').get();
+  const mixed = [
+    { ...src, generation_id: 'gCase', mall_item_key: 'rakuten1a' },
+    { ...src, generation_id: 'gCase', mall_item_key: 'rakuten1B' },
+  ];
+  receiveChunk(remoteDb, {
+    generationId: 'gCase', seq: 9000, chunkIndex: 0,
+    checksum: chunkChecksum(mixed), rows: mixed,
+    manifest: { row_count: 2, content_hash: hashRows(mixed), built_at: '2026-09-07T00:00:00Z' },
+  });
+  assert.equal(hashGeneration(remoteDb, 'gCase'), hashRows(mixed), 'JS と DB で並び順が食い違っている');
+
+  // 公開まで通ることも確認する (照合で弾かれないこと)
+  const before = remoteDb.prepare('SELECT * FROM expected_profit_publish_pointer WHERE id = 1').get();
+  const r = publishGeneration(remoteDb, { generationId: 'gCase', seq: 9000 });
+  assert.equal(r.ok, true, `大小文字混在で公開できない: ${r.error}`);
+  // 後続のテストのためにポインタを元へ戻す (この世代は検証用なので残さない)
+  remoteDb.prepare('UPDATE expected_profit_publish_pointer SET generation_id = ?, seq = ? WHERE id = 1')
+    .run(before.generation_id, before.seq);
+  remoteDb.prepare("UPDATE expected_profit_generation SET remote_status = 'published' WHERE generation_id = ?")
+    .run(before.generation_id);
+  remoteDb.prepare("DELETE FROM mart_listing_expected_profit WHERE generation_id = 'gCase'").run();
+  remoteDb.prepare("DELETE FROM expected_profit_generation WHERE generation_id = 'gCase'").run();
 });
 
 await ta('🚨 8. 画面用の読み取りが、公開世代から行を返せる', async () => {
-  const r = queryPublished({ db, now: NOW });
+  // 画面は受信側 (Render) の DB を見る
+  const r = queryPublished({ db: remoteDb, now: NOW });
   assert.ok(r.published, '公開世代が見えない');
   // malls_degraded は配列で返る (文字列だと画面の .map が落ちる — Codex R4-4)
   assert.ok(Array.isArray(r.published.malls_degraded), 'malls_degraded が配列でない');
@@ -175,32 +223,27 @@ await ta('🚨 8. 画面用の読み取りが、公開世代から行を返せ�
 });
 
 await ta('🚨 9. scope を fba_v1 にすると FBA の行が返る', async () => {
-  const r = queryPublished({ db, now: NOW, expenseScope: 'fba_v1' });
+  const r = queryPublished({ db: remoteDb, now: NOW, expenseScope: 'fba_v1' });
   assert.equal(r.rows.length, 1);
   assert.equal(r.rows[0].mall, 'amazon');
   assert.ok(near(r.rows[0].expected_profit, 614));
 });
 
 await ta('scope を all にすると混ぜて返る (明示したときだけ)', async () => {
-  const r = queryPublished({ db, now: NOW, expenseScope: 'all' });
+  const r = queryPublished({ db: remoteDb, now: NOW, expenseScope: 'all' });
   assert.equal(r.rows.length, 2);
 });
 
 await ta('🚨 10. 公開成功後に応答を失っても、同じ世代を再送できる (冪等)', async () => {
   const gen = db.prepare('SELECT * FROM expected_profit_generation ORDER BY seq DESC LIMIT 1').get();
   // 公開済みの世代へ、同じチャンクを送り直す → 409 ではなく 200 で受ける
-  const r = await publishToRender(db, gen.generation_id, {
-    chunkSize: 1,
-    postChunk: async (id, body) => receiveChunk(db, {
-      generationId: id, seq: body.seq, chunkIndex: body.chunk_index,
-      checksum: body.checksum, rows: body.rows, manifest: body.manifest,
-    }),
-    postPublish: async (body) => publishGeneration(db, {
-      generationId: body.generation_id, seq: body.seq, manifest: body.manifest,
-    }),
-    getPublished: async () => getPublished(db),
-  });
+  // 受信側は published のまま。送信側の状態だけ戻して最初からやり直す
+  db.prepare("UPDATE expected_profit_generation SET remote_status = 'not_sent' WHERE generation_id = ?")
+    .run(gen.generation_id);
+  assert.equal(getPublished(remoteDb).generation_id, gen.generation_id);
+  const r = await publishToRender(db, gen.generation_id, remoteDeps());
   assert.equal(r.ok, true, `再送で失敗: ${r.error} ${JSON.stringify(r.detail || {})}`);
+  assert.equal(r.confirmed, true);
 });
 
 await ta('🚨 11. 同じ index を別内容で送ると拒否する (混ざった世代を作らせない)', async () => {
@@ -210,25 +253,25 @@ await ta('🚨 11. 同じ index を別内容で送ると拒否する (混ざっ�
   const rows = [{ ...src, generation_id: 'gConf', mall_item_key: 'conf-a' }];
   const rows2 = [{ ...src, generation_id: 'gConf', mall_item_key: 'conf-b' }];
 
-  const first = receiveChunk(db, { generationId: 'gConf', seq: 999, chunkIndex: 0, checksum: chunkChecksum(rows), rows });
+  const first = receiveChunk(remoteDb, { generationId: 'gConf', seq: 999, chunkIndex: 0, checksum: chunkChecksum(rows), rows });
   assert.equal(first.ok, true, JSON.stringify(first));
 
   // 同じ index に別内容を送る
-  const r = receiveChunk(db, { generationId: 'gConf', seq: 999, chunkIndex: 0, checksum: chunkChecksum(rows2), rows: rows2 });
+  const r = receiveChunk(remoteDb, { generationId: 'gConf', seq: 999, chunkIndex: 0, checksum: chunkChecksum(rows2), rows: rows2 });
   assert.equal(r.ok, false);
   assert.equal(r.error, 'chunk_conflict');
 
   // 同じ内容の再送は通る (冪等)
-  const again = receiveChunk(db, { generationId: 'gConf', seq: 999, chunkIndex: 0, checksum: chunkChecksum(rows), rows });
+  const again = receiveChunk(remoteDb, { generationId: 'gConf', seq: 999, chunkIndex: 0, checksum: chunkChecksum(rows), rows });
   assert.equal(again.ok, true);
 });
 
 await ta('🚨 12. 公開済み世代への「別内容」チャンクは拒否する', async () => {
   const { chunkChecksum } = await import('./publish-api.js');
-  const gen = db.prepare("SELECT * FROM expected_profit_generation WHERE remote_status='published' LIMIT 1").get();
-  const src = db.prepare('SELECT * FROM mart_listing_expected_profit LIMIT 1').get();
+  const gen = remoteDb.prepare("SELECT * FROM expected_profit_generation WHERE remote_status='published' LIMIT 1").get();
+  const src = remoteDb.prepare('SELECT * FROM mart_listing_expected_profit LIMIT 1').get();
   const rows = [{ ...src, generation_id: gen.generation_id, mall_item_key: 'sneak' }];
-  const r = receiveChunk(db, {
+  const r = receiveChunk(remoteDb, {
     generationId: gen.generation_id, seq: gen.seq, chunkIndex: 99,
     checksum: chunkChecksum(rows), rows,
   });
@@ -237,5 +280,6 @@ await ta('🚨 12. 公開済み世代への「別内容」チャンクは拒否�
 });
 
 db.close();
+remoteDb.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);
