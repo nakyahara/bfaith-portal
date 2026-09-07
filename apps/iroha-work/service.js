@@ -502,6 +502,11 @@ export function expandBatchRows(cards, { forPlan = false } = {}) {
  * ⚠**出さないもの** (要件 §AB-13「個人情報を出さない」):
  *   作業した人の名前・写真・いろは内部のメモ (申し送り・止まっている理由)・在庫や売上の数字・
  *   他の施設のぶん・いろはが自分で作業しているぶん。
+ *   ⭐**自由記述はいっさい出さない** (Codex R1 重大1・重大2)。作業仕様の「備考」も返却の「ひとこと」も、
+ *   いろはの中で読む前提で書かれていて、「山田さん担当」「利用者○○さんのぶん」のような書き方が起こりうる。
+ *   コメントで「個人名は入っていないはず」と決めても、中身は保証できない。
+ *   外部に見せる作業メモが要るなら、**外部向けと分かっている専用の欄**を別に作って職員に書いてもらう
+ *   (要件 §AB-11 の 7 で検討)。
  * ⚠**返却の確定はいろは側** (§AB-7)。ここからは何も書き換えられない。
  */
 export function buildFacilityView(facilityCode) {
@@ -542,28 +547,33 @@ export function buildFacilityView(facilityCode) {
       overdue: !!(r.due_date && r.state === 'handed' && r.due_date < today),
       handed_at: r.handed_at || null,
       settled_at: r.settled_at || null,
-      // ⭐作業のしかた (どう作業するか)。作業仕様マスタの項目そのもので、個人名やいろは内部のメモは入っていない
+      // ⭐作業のしかた。**決まった形の項目だけ** (コード・数)。自由記述の「備考」は出さない
       work: snap ? {
         material_code: snap.material_code || null,          // 資材セットID
         storage_container: snap.storage_container || null,  // 保管箱
         units_per_container: snap.units_per_container ?? null,
         process_count: snap.process_count ?? null,
-        note: snap.note || null,                            // 気をつけること
       } : null,
-      // 返却の記録 (いつ何個持ってきたか)。記録した人の名前は出さない
-      returns: back.map((x) => ({ qty: x.returned_qty, good_qty: x.good_qty ?? null, loss_qty: x.loss_qty ?? null,
-        at: x.returned_at, note: x.note || null })),
+      // 返却の記録 (いつ何個持ってきたか)。⭐記録した人の名前も、いろはが書いたひとことも出さない
+      returns: back.map((x) => ({ qty: x.returned_qty, at: x.returned_at })),
       qty,
     };
   });
   const open = items.filter((x) => x.state !== 'settled');
+  // ⭐「いま持っている数」は**渡したぶんの残り**で数える (Codex R1 中4)。
+  //   600 個渡して 200 個返したら 400 個。まだ渡していない予定のぶんと混ぜない
+  const held = open.filter((x) => x.state === 'handed');
+  const toCome = open.filter((x) => x.state !== 'handed');
   return {
     facility: { code: fac.code, name: fac.name },
     today,
     items,
     summary: {
       open_count: open.length,
-      open_qty: open.reduce((a, x) => a + (x.handed_qty ?? x.planned_qty ?? 0), 0),
+      held_count: held.length,
+      held_qty: held.reduce((a, x) => a + (x.remaining ?? 0), 0),
+      coming_count: toCome.length,
+      coming_qty: toCome.reduce((a, x) => a + (x.planned_qty ?? 0), 0),
       overdue_count: open.filter((x) => x.overdue).length,
     },
   };

@@ -83,6 +83,7 @@ function numsHtml(it) {
     + '</ul>';
 }
 
+// 作業のしかた。⭐決まった形の項目だけを出す (自由記述は出さない — いろはの中で読む前提で書かれているため)
 function workHtml(w) {
   if (!w) return '';
   const rows = [
@@ -90,10 +91,9 @@ function workHtml(w) {
     ['1 箱に入れる数', w.units_per_container == null ? null : w.units_per_container + ' 個'],
     ['資材セット', w.material_code],
   ].filter(([, v]) => v != null && v !== '');
-  if (rows.length === 0 && !w.note) return '';
+  if (rows.length === 0) return '';
   return '<div class="work"><h3>作業のしかた</h3>'
-    + (rows.length ? '<dl>' + rows.map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>').join('') + '</dl>' : '')
-    + (w.note ? '<div class="note">⚠ ' + esc(w.note) + '</div>' : '')
+    + '<dl>' + rows.map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' + esc(v) + '</dd>').join('') + '</dl>'
     + '</div>';
 }
 
@@ -105,8 +105,7 @@ function cardHtml(it) {
     : '';
   const rets = (it.returns || []).length
     ? '<ul class="rets">' + it.returns.map((r) =>
-      '<li>' + esc(fmtMd(r.at)) + ' に ' + esc(String(r.qty)) + ' 個お持ちいただきました'
-      + (r.note ? '（' + esc(r.note) + '）' : '') + '</li>').join('') + '</ul>'
+      '<li>' + esc(fmtMd(r.at)) + ' に ' + esc(String(r.qty)) + ' 個お持ちいただきました</li>').join('') + '</ul>'
     : '';
   return '<article class="card' + (it.state === 'settled' ? ' settled' : '') + '">'
     + '<h2>' + esc(it.product_name) + '</h2>'
@@ -137,7 +136,8 @@ async function load() {
   document.title = j.facility.name + ' さんにおあずかりいただいている商品';
   $('#facName').textContent = j.facility.name + ' さん';
   const s = j.summary;
-  $('#sub').textContent = 'おあずかり中 ' + s.open_count + ' 件'
+  $('#sub').textContent = 'おあずかり中 ' + s.held_count + ' 件'
+    + (s.coming_count > 0 ? ' ／ これからお渡しするもの ' + s.coming_count + ' 件' : '')
     + (s.overdue_count > 0 ? '（お約束の日を過ぎているもの ' + s.overdue_count + ' 件）' : '');
   if (!j.items.length) {
     $('#body').innerHTML = '<div class="empty">いまおあずかりしている商品はありません。</div>';
@@ -145,8 +145,12 @@ async function load() {
   }
   $('#body').innerHTML =
     '<div class="sum">'
-    + '<div class="box"><label>おあずかり中</label><div class="v">' + esc(String(s.open_count)) + '<span style="font-size:.9rem"> 件</span></div></div>'
-    + '<div class="box"><label>合計</label><div class="v">' + esc(String(s.open_qty)) + '<span style="font-size:.9rem"> 個</span></div></div>'
+    + '<div class="box"><label>おあずかり中</label><div class="v">' + esc(String(s.held_count)) + '<span style="font-size:.9rem"> 件</span></div></div>'
+    // ⭐いま持っている数 = 渡したぶんの残り (返した分は引く)。これから渡すぶんとは混ぜない
+    + '<div class="box"><label>いまお持ちの数</label><div class="v">' + esc(String(s.held_qty)) + '<span style="font-size:.9rem"> 個</span></div></div>'
+    + (s.coming_count > 0
+      ? '<div class="box"><label>これからお渡しします</label><div class="v">' + esc(String(s.coming_qty)) + '<span style="font-size:.9rem"> 個</span></div></div>'
+      : '')
     + (s.overdue_count > 0
       ? '<div class="box over"><label>お約束の日を過ぎています</label><div class="v">' + esc(String(s.overdue_count)) + '<span style="font-size:.9rem"> 件</span></div></div>'
       : '')

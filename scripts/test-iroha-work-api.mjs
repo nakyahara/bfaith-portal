@@ -310,6 +310,32 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
     method: 'POST', headers: { Host: HOST, Origin: `http://${HOST}`, 'Content-Type': 'application/json' }, body: '{}' });
   ok(wr.status === 404 || wr.status === 405, '⭐POST は受け付けない (見るだけ)');
 
+  // ⭐/f/ の下は、受けなかったパス・メソッドがこの先へ流れない (Codex R1)
+  for (const [method, p] of [
+    ['POST', made.json.url], ['PUT', made.json.url], ['DELETE', made.json.url], ['PATCH', made.json.url],
+    ['GET', made.json.url + '/api'],
+    // ⭐パスをエンコードして .. を潜ませても、作業アプリ側へは届かない (fetch は生の ../ を送る前に正規化するので、エンコードで試す)
+    ['GET', made.json.url + '/%2e%2e%2f%2e%2e%2fapi/state'],
+    ['GET', '/apps/iroha-work/f'], ['GET', '/apps/iroha-work/f/'],
+    ['POST', '/apps/iroha-work/f/' + token + '/api/view'],
+  ]) {
+    const r = await fetch(`http://${HOST}${p}`, { method, headers: { Host: HOST, Origin: `http://${HOST}` },
+      redirect: 'manual' });
+    const body = await r.text();
+    ok(r.status >= 400 && r.status < 500, `⭐${method} ${p} は 4xx で終わる (通り抜けない)`);
+    ok(!/"capabilities"|"cards"|hold_memo/.test(body), `⭐${method} ${p} で作業アプリの中身が漏れない`);
+  }
+  // HEAD では「見た日時」を書かない (書くのは人が開いた GET だけ)
+  {
+    const l0 = D.listFacilityLinks(true).find((l) => l.label === 'ワークセンター 事務所');
+    getDB().prepare('UPDATE f_iroha_facility_links SET last_seen_at = NULL WHERE id = ?').run(l0.id);
+    await fetch(`http://${HOST}${made.json.url}`, { method: 'HEAD', headers: { Host: HOST } });
+    const after = D.listFacilityLinks(true).find((l) => l.id === l0.id);
+    ok(after.last_seen_at == null, '⭐HEAD では「見た日時」を書かない');
+    await fetch(`http://${HOST}${made.json.url}`, { headers: { Host: HOST } });
+    ok(D.listFacilityLinks(true).find((l) => l.id === l0.id).last_seen_at != null, 'GET なら書く');
+  }
+
   // でたらめ・失効したトークン
   const bad = await fetch(`http://${HOST}/apps/iroha-work/f/${'x'.repeat(43)}`, { headers: { Host: HOST } });
   ok(bad.status === 404, 'でたらめなトークンは 404');

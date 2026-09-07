@@ -2157,7 +2157,8 @@ function facilityLinkGate(req, res, next) {
   res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
   res.set('Referrer-Policy', 'no-referrer');
   res.set('Cache-Control', 'no-store');
-  const link = verifyFacilityLink(req.params.token);
+  // ⭐HEAD (リンク検査・先読み) では「見に来た日時」を書かない (Codex R1 軽微6)
+  const link = verifyFacilityLink(req.params.token, { touch: req.method === 'GET' });
   if (!link) {
     // ⭐当たらなかった理由 (無い / 失効した / 期限切れ) を分けて教えない (総当たりの手がかりにしない)
     res.status(404);
@@ -2170,14 +2171,25 @@ function facilityLinkGate(req, res, next) {
   next();
 }
 
-router.get('/f/:token', facilityLinkGate, (req, res) => {
+// ⭐**専用のルーターに閉じ込める** (Codex R1)。access() で /f/ を素通しにしているので、
+//   ここで受けなかったパス・メソッドが**この先のルートへ流れないように**必ず終わらせる。
+//   (あとから誰かが受け皿のようなルートを足しても、認証なしでそこへ届かない)
+const facilityRouter = Router();
+facilityRouter.get('/:token', facilityLinkGate, (req, res) => {
   res.sendFile(path.join(__dirname, 'views', 'facility.html'));
 });
-router.get('/f/:token/api/view', facilityLinkGate, api((req, res) => {
+facilityRouter.get('/:token/api/view', facilityLinkGate, api((req, res) => {
   const view = buildFacilityView(req.iwFacilityLink.facility_code);
   if (!view) return res.status(404).json({ ok: false, error: 'not_found', message: 'この拠点は見られません' });
   res.json({ ok: true, ...view });
 }));
+facilityRouter.all(/.*/, (req, res) => {
+  res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  res.set('Cache-Control', 'no-store');
+  // 読むだけの窓口なので、書き込みも知らない道も同じ「ありません」で終わらせる
+  res.status(404).json({ ok: false, error: 'not_found', message: 'ありません' });
+});
+router.use('/f', facilityRouter);
 
 // ─── 施設リンクの発行・失効 (管理者だけ) ───
 

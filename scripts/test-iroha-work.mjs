@@ -6449,6 +6449,85 @@ console.log('\n[32] 外部施設の専用 URL (見るだけ。§AB-11 の 6)');
     ok(wc.summary.overdue_count >= 1, 'まとめにも件数が出る');
   }
 
+  // ④ ⭐**自由記述をいっさい出さない** — 実際に個人名・内部メモを入れて確かめる (Codex R1 重大1・重大2)
+  {
+    const t = mk('fl-5', 9924, 500);
+    // 作業仕様の「備考」に個人名と内部の言い回しを入れる (現場ではこう書かれうる)
+    getDB().prepare("UPDATE f_iroha_tasks SET master_snapshot = ? WHERE id = ?")
+      .run(JSON.stringify({ material_code: 'D-8', storage_container: '20L', units_per_container: 70,
+        process_count: 3, note: '山田さんが担当。羅針盤のぶんは別工程で。利用者のたなかさんは苦手' }), t);
+    const cg = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+      facilityCode: 'workcenter', qty: 500, expectVersion: v(t) });
+    C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+    let c5 = C.getConsignment(cg.consignment.id);
+    C.recordReturn({ consignmentId: c5.id, returnedQty: 100, goodQty: 100, note: '田中さんが受領。利用者のさとうさんぶん',
+      actor: 'たにがわ', expectVersion: c5.version, idempotencyKey: 'fl-ret-5' });
+    const json = JSON.stringify(SV.buildFacilityView('workcenter'));
+    ok(!json.includes('山田さん') && !json.includes('たなか'),
+      '⭐作業仕様の「備考」(自由記述) を外に出さない — 個人名や内部の申し送りが書かれうる');
+    ok(!json.includes('田中さん') && !json.includes('さとう') && !json.includes('たにがわ'),
+      '⭐返却の「ひとこと」(自由記述) も外に出さない');
+    const it5 = SV.buildFacilityView('workcenter').items.find((x) => x.id === cg.consignment.id);
+    ok(it5.work && it5.work.storage_container === '20L' && it5.work.units_per_container === 70,
+      '決まった形の項目 (保管箱・入数・資材セット) は出す — 作業に要る');
+    ok(!('note' in it5.work), '備考の欄そのものを持たせない');
+    ok(it5.returns.length === 1 && Object.keys(it5.returns[0]).sort().join(',') === 'at,qty',
+      '⭐返却の記録は「いつ・何個」だけ');
+  }
+
+  // ⑤ ⭐拠点を止めたら、既に渡してある URL も開けない (Codex R1 中3)
+  {
+    const made = D.createFacilityLink('rashinban', '羅針盤 事務所', 'たにがわ');
+    ok(D.verifyFacilityLink(made.token) !== null, '前提: いまは開ける');
+    db.prepare("UPDATE f_iroha_facilities SET active = 0 WHERE code = 'rashinban'").run();
+    ok(D.verifyFacilityLink(made.token) === null, '⭐拠点を止めたら、1 本ずつ失効させなくても開けない');
+    db.prepare("UPDATE f_iroha_facilities SET external = 0 WHERE code = 'rashinban'").run();
+    db.prepare("UPDATE f_iroha_facilities SET active = 1 WHERE code = 'rashinban'").run();
+    ok(D.verifyFacilityLink(made.token) === null, '⭐いろは側の拠点に変えたら開けない');
+    db.prepare("UPDATE f_iroha_facilities SET external = 1 WHERE code = 'rashinban'").run();
+    ok(D.verifyFacilityLink(made.token) !== null, '戻せば開ける');
+  }
+
+  // ⑥ 実在しない日付は期限にできない / HEAD では「見た日時」を書かない
+  {
+    let err = null;
+    try { D.createFacilityLink('workcenter', '日付テスト', 'x', { expiresAt: '2026-09-99' }); } catch (e) { err = e.message; }
+    ok(err && /実在する日/.test(err), '⭐2026-09-99 のような日付は断る (形だけ見ない)');
+    const made = D.createFacilityLink('workcenter', '見た日時テスト', 'x');
+    const row = () => db.prepare('SELECT last_seen_at FROM f_iroha_facility_links WHERE token_hash IS NOT NULL AND label = ?').get('見た日時テスト');
+    ok(row().last_seen_at == null, '前提: まだ見ていない');
+    D.verifyFacilityLink(made.token, { touch: false });
+    ok(row().last_seen_at == null, '⭐HEAD (リンク検査・先読み) では「見た日時」を書かない');
+    D.verifyFacilityLink(made.token);
+    ok(row().last_seen_at != null, '⭐人が開いたら書く (業務のデータは変えない・アクセス日時だけ)');
+  }
+
+  // ⑦ 「いま持っている数」は返したぶんを引く (Codex R1 中4)
+  {
+    const t = mk('fl-6', 9925, 600);
+    const cg = C.startConsignment({ taskId: t, batchId: B.listBatchesOfTask(db, t)[0].id,
+      facilityCode: 'jobsupport', qty: 600, expectVersion: v(t) });
+    ok(!cg.ok, '前提: ジョブサポは物を持ち帰らないので預けられない');
+    // 他のテストで作った預けも混ざるので、**前後の差**で見る
+    const before = SV.buildFacilityView('rashinban').summary;
+    const t2 = mk('fl-7', 9926, 600);
+    const cg2 = C.startConsignment({ taskId: t2, batchId: B.listBatchesOfTask(db, t2)[0].id,
+      facilityCode: 'rashinban', qty: 600, expectVersion: v(t2) });
+    C.markHanded({ consignmentId: cg2.consignment.id, expectVersion: cg2.consignment.version });
+    const c7 = C.getConsignment(cg2.consignment.id);
+    C.recordReturn({ consignmentId: c7.id, returnedQty: 200, goodQty: 200, expectVersion: c7.version, idempotencyKey: 'fl-ret-7' });
+    const sum = SV.buildFacilityView('rashinban').summary;
+    ok(sum.held_qty - before.held_qty === 400,
+      '⭐600 個渡して 200 個返ったら「いまお持ちの数」は 400 増える (600 のままにしない)');
+    // これから渡すぶんは別に数える
+    const t3 = mk('fl-8', 9927, 100);
+    C.startConsignment({ taskId: t3, batchId: B.listBatchesOfTask(db, t3)[0].id,
+      facilityCode: 'rashinban', qty: 100, expectVersion: v(t3) });
+    const sum2 = SV.buildFacilityView('rashinban').summary;
+    ok(sum2.held_qty === sum.held_qty && sum2.coming_qty - before.coming_qty === 100,
+      '⭐まだ渡していないぶんは「これからお渡しします」に分ける (持っている数と混ぜない)');
+  }
+
   // ── 画面 ──
   const fh = fs.readFileSync(new URL('../apps/iroha-work/views/facility.html', import.meta.url), 'utf8');
   ok(/name="robots" content="noindex/.test(fh) && /name="referrer" content="no-referrer"/.test(fh),
@@ -6464,7 +6543,13 @@ console.log('\n[32] 外部施設の専用 URL (見るだけ。§AB-11 の 6)');
   ok(/res\.set\('X-Robots-Tag', 'noindex, nofollow, noarchive'\)/.test(rt)
     && /res\.set\('Cache-Control', 'no-store'\)/.test(rt),
     '⭐検索よけ・キャッシュさせない (共用 PC に中身を残さない)');
-  ok(!/router\.post\('\/f\//.test(rt), '⭐/f/ の下に書き込みの口を作らない');
+  ok(!/router\.post\('\/f\//.test(rt) && !/facilityRouter\.(post|put|patch|delete)\(/.test(rt),
+    '⭐/f/ の下に書き込みの口を作らない');
+  ok(/const facilityRouter = Router\(\);/.test(rt) && /facilityRouter\.all\(\/\.\*\/, /.test(rt)
+    && /router\.use\('\/f', facilityRouter\);/.test(rt),
+    '⭐/f/ は専用ルーターに閉じ込め、受けなかったパス・メソッドはそこで終わらせる (この先へ流さない)');
+  ok(/verifyFacilityLink\(req\.params\.token, \{ touch: req\.method === 'GET' \}\)/.test(rt),
+    'HEAD では「見た日時」を書かない');
   ok(/router\.post\('\/admin\/facility-links', checkOrigin, requireAdmin/.test(rt)
     && /router\.post\('\/admin\/facility-links\/:id\(\\\\d\+\)\/revoke', checkOrigin, requireAdmin/.test(rt),
     '⭐発行・失効は管理者だけ');
