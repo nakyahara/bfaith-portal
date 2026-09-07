@@ -21,7 +21,7 @@ import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
 import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask } from './tasks-db.js';
-import { countsByTask } from './batches.js';
+import { countsByTask, stockingOfTask } from './batches.js';
 
 /**
  * ⭐「急ぎ」の線引き (中原さん 2026-09-06)。
@@ -469,6 +469,8 @@ export function buildTaskCard(id, { queueImages = true, readOnly = false } = {})
   const card = buildTaskCards([t], { readOnly }).cards[0] || null;
   if (!card) return null;
   card.work_history = finishedSessionsOfTask(t.id);
+  // ⭐棚に入れた実績 (要件 §AB-2)。いつ・誰が・何個 入れたか。詳細でだけ出す
+  card.stocking = stockingOfTask(getDB(), t.id);
   // ⭐下見・履歴 (読むだけ) では取り寄せない。開くだけで画像キューの DB が変わると
   //   「読むだけの画面では何も書かない」という境界が崩れる (Codex PR1 R7)
   if (queueImages) queueMissingImages([card]);

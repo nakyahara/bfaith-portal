@@ -26,6 +26,7 @@
  * ここを変えるときは agent.ps1 も直す。
  */
 import crypto from 'crypto';
+import { soleBatchOfTask } from './batches.js';
 import { getDB } from './db.js';
 import { getTask } from './tasks-db.js';
 
@@ -239,11 +240,14 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty =
         return { ok: false, error: 'confirm_unknown', message: '前回のジョブの状態が変わりました。画面を更新してもう一度確認してください', job: publicJob(cur) };
       }
     }
+    // ⭐どのまとまりのぶんを刷ったか (要件 §AB-12)。まとまりが 1 つのうちはそれ。
+    //   刷った中身は下の列にそのまま残るので、あとで期限や数を直しても記録は変わらない
+    const sole = soleBatchOfTask(db, tid);
     const info = db.prepare(`INSERT INTO f_iroha_print_jobs
-      (client_request_id, task_id, product_code, product_name, barcode, barcode_type, pack_qty, extra_pack_qty, expiry_text, copies,
+      (client_request_id, task_id, batch_id, product_code, product_name, barcode, barcode_type, pack_qty, extra_pack_qty, expiry_text, copies,
        printer_name, target_device_id, requested_by, requested_device, acknowledged_job_id, state, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
-      .run(crid, tid, task.product_code || null, name, barcode, type, pack, extra, exp, n,
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
+      .run(crid, tid, sole ? sole.id : null, task.product_code || null, name, barcode, type, pack, extra, exp, n,
         target.agent.printer_name, target.agent.id, requestedBy, requestedDevice, acked, now, now);
     const job = db.prepare('SELECT * FROM f_iroha_print_jobs WHERE id = ?').get(Number(info.lastInsertRowid));
     return { ok: true, job: publicJob(job), created: true };
