@@ -13,6 +13,8 @@
  *   利益率が約0.5pt低く出て不当に下位へ沈むため、税抜に揃える。
  */
 
+import { parseTime } from './util.js';
+
 export const FORMULA_VERSION = 'v1-2026-09';
 export const SCENARIO_VERSION = 'v1-2026-09';
 export const FEE_RATE_VERSION = 'dim_mall_2026-09';
@@ -133,20 +135,26 @@ const KNOWN_FEE_TYPES = new Set(['ReferralFee', 'VariableClosingFee', 'PerItemFe
  * - 未知の FeeType は合計に含めた上で unknown_fee_type
  * - Σ最上位 FinalFee ≠ TotalFeesEstimate なら inconsistent (許容差 0)
  */
-export function normalizeFeeEstimate(feesEstimate) {
-  if (!feesEstimate || !Array.isArray(feesEstimate.FeeDetailList)) {
-    return { status: 'missing', referral: null, closing: null, perItem: null, fbaInclTax: null, sum: null, total: null, unknownTypes: [] };
-  }
+export function normalizeFeeEstimate(feesEstimate, { fulfillment } = {}) {
+  const empty = {
+    status: 'missing', referral: null, closing: null, perItem: null,
+    fbaInclTax: null, fbaExTax: null, sum: null, total: null, unknownTypes: [], unreadable: 0,
+  };
+  if (!feesEstimate || !Array.isArray(feesEstimate.FeeDetailList)) return empty;
+  // 🚨 内訳が空の見積を ok にしない。手数料0円の出品は存在しない
+  if (feesEstimate.FeeDetailList.length === 0) return { ...empty, status: 'missing' };
+
   const amountOf = (d) => {
     const v = d?.FinalFee?.Amount;
     return Number.isFinite(v) ? v : null;
   };
   let referral = null, closing = null, perItem = null, fbaInclTax = null;
   let sum = 0;
+  let unreadable = 0;            // 🚨 読めない行を黙って飛ばさない
   const unknownTypes = [];
   for (const d of feesEstimate.FeeDetailList) {
     const amt = amountOf(d);
-    if (amt == null) continue;
+    if (amt == null) { unreadable++; continue; }
     sum += amt;
     switch (d.FeeType) {
       case 'ReferralFee': referral = amt; break;
@@ -160,9 +168,15 @@ export function normalizeFeeEstimate(feesEstimate) {
   const total = Number.isFinite(feesEstimate.TotalFeesEstimate?.Amount)
     ? feesEstimate.TotalFeesEstimate.Amount : null;
 
+  // 状態判定は「重い順」に。ok は最後まで何も引っかからなかったときだけ
   let status = 'ok';
-  if (unknownTypes.length > 0) status = 'unknown_fee_type';
-  else if (total != null && sum !== total) status = 'inconsistent';
+  if (unreadable > 0) status = 'unreadable_fee_line';
+  else if (referral == null) status = 'missing';                       // ReferralFee は必ず来る
+  else if (fulfillment === 'FBA' && fbaInclTax == null) status = 'missing_fba_fee';
+  else if (fulfillment === 'FBM' && fbaInclTax != null) status = 'unexpected_fba_fee';
+  else if (unknownTypes.length > 0) status = 'unknown_fee_type';
+  else if (total == null) status = 'missing_total';                    // 照合できない見積は採用しない
+  else if (sum !== total) status = 'inconsistent';
 
   return {
     status,
@@ -174,6 +188,81 @@ export function normalizeFeeEstimate(feesEstimate) {
     sum,
     total,
     unknownTypes,
+    unreadable,
+  };
+}
+
+/**
+ * 1出品ぶんの計算引数を組み立てる。
+ *
+ * 🚨 ここが「本番の費用組み立て」。テスト側で費用を手で足すと、
+ *    本番の料率や控除境界を誤って変えても PASS してしまう (Codex R1-7)。
+ *    世代ビルダーもこの関数を通す。
+ *
+ * @param {object} input
+ *   mall, fulfillment, priceInclTax, postageRevenueInclTax, productTaxRate,
+ *   costExTax, shippingRate (shipping_rates の行), feeEstimate (normalizeFeeEstimate の結果)
+ */
+export function buildProfitInputs(input) {
+  const {
+    mall, fulfillment, priceInclTax, postageRevenueInclTax,
+    productTaxRate, costExTax, shippingRate, feeEstimate,
+  } = input;
+
+  const taxRate = effectiveTaxRate(productTaxRate);
+  const priceExTax = exTax(priceInclTax, taxRate);
+  if (priceExTax == null || !(priceExTax > 0)) return { ok: false, reason: 'price_missing' };
+
+  // 送料収入は送料の税率 (10%) で割り戻す。商品の軽減税率を流用しない
+  const postageRevenueExTax = postageRevenueInclTax == null
+    ? null : postageRevenueInclTax / (1 + SERVICE_TAX_RATE);
+
+  const isFba = (mall === 'amazon' && fulfillment === 'FBA');
+
+  // 配送費: FBA は fba_fee、それ以外は自社の配送関係費
+  let shippingTotalExTax = 0;
+  let shippingParts = null;
+  let fbaFeeExTax = 0;
+  if (isFba) {
+    if (!feeEstimate || feeEstimate.fbaExTax == null) return { ok: false, reason: 'fba_fee_missing' };
+    fbaFeeExTax = feeEstimate.fbaExTax;
+  } else {
+    const s = shippingCostExTax(shippingRate);
+    if (!s.ok) return { ok: false, reason: s.reason };
+    shippingParts = s;
+    shippingTotalExTax = s.total;
+  }
+
+  // 手数料: Amazon は見積、他モールは簡易料率
+  let feeTotalExTax;
+  let feeRateDisplay = null;
+  if (mall === 'amazon') {
+    if (!feeEstimate || feeEstimate.status !== 'ok') return { ok: false, reason: `fee_${feeEstimate?.status || 'missing'}` };
+    // 🚨 FBA費用をここに含めない。配送費側で1回だけ引く (§4.4.1 の控除境界)
+    feeTotalExTax = (feeEstimate.referral || 0) + (feeEstimate.closing || 0) + (feeEstimate.perItem || 0);
+    feeRateDisplay = feeEstimate.referral == null ? null : feeEstimate.referral / priceInclTax;
+  } else {
+    const rate = MALL_FEE_RATE_APPROX[mall];
+    if (rate == null) return { ok: false, reason: 'mall_fee_rate_unknown' };
+    // 税込売価 × 料率 = 税込手数料とみなし、税抜へ (§15-1)
+    feeTotalExTax = (priceInclTax * rate) / (1 + SERVICE_TAX_RATE);
+    feeRateDisplay = rate;
+  }
+
+  return {
+    ok: true,
+    args: {
+      priceExTax,
+      postageRevenueExTax: postageRevenueExTax ?? 0,
+      costExTax,
+      shippingTotalExTax,
+      fbaFeeExTax,
+      feeTotalExTax,
+    },
+    detail: {
+      taxRate, shippingParts, feeRateDisplay,
+      expenseScope: expenseScopeVersion({ mall, fulfillment }),
+    },
   };
 }
 
@@ -184,13 +273,17 @@ export function normalizeFeeEstimate(feesEstimate) {
  */
 export function canReuseFeeEstimate(cached, wanted, now = new Date()) {
   if (!cached) return { reuse: false, reason: 'missing' };
-  // 1. 期限切れ
-  if (!cached.valid_until || new Date(cached.valid_until) <= now) return { reuse: false, reason: 'expired' };
+  // 0. 見積そのものが正常でなければ再利用しない (欠損・未知費目・内訳不一致)
+  if (cached.fee_status && cached.fee_status !== 'ok') return { reuse: false, reason: `fee_status_${cached.fee_status}` };
+  // 1. 期限切れ (🚨 壊れた日時は「期限内」にしない。NaN 比較は常に false になる)
+  const validUntil = parseTime(cached.valid_until);
+  if (validUntil == null || validUntil <= now.getTime()) return { reuse: false, reason: 'expired' };
   // 2. 料率改定日を跨いでいる
-  const fetchedAt = new Date(cached.fetched_at);
+  const fetchedAt = parseTime(cached.fetched_at);
+  if (fetchedAt == null) return { reuse: false, reason: 'fetched_at_invalid' };
   for (const d of FEE_REVISION_DATES) {
-    const rev = new Date(`${d}T00:00:00+09:00`);
-    if (fetchedAt < rev && rev <= now) return { reuse: false, reason: 'fee_revision_crossed' };
+    const rev = new Date(`${d}T00:00:00+09:00`).getTime();
+    if (fetchedAt < rev && rev <= now.getTime()) return { reuse: false, reason: 'fee_revision_crossed' };
   }
   // 3. 見積入力の完全一致 (PK に無い asin / currency も見る)
   const keys = ['seller_id', 'marketplace_id', 'seller_sku', 'asin',

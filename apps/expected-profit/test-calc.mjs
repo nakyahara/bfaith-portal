@@ -11,6 +11,7 @@ import {
   taxMultiplier, effectiveTaxRate, exTax, SERVICE_TAX_RATE, TAX_RATE_FALLBACK,
   resolveCost, shippingCostExTax, normalizeFeeEstimate, canReuseFeeEstimate,
   computeProfit, requiredInputs, isRankEligible, expenseScopeVersion,
+  buildProfitInputs, MALL_FEE_RATE_APPROX,
 } from './calc.js';
 
 let passed = 0;
@@ -294,36 +295,198 @@ t('費用範囲: FBA と自社配送を別の版として識別する', () => {
   assert.equal(expenseScopeVersion({ mall: 'rakuten' }), 'self_v1');
 });
 
-// ─── 通し計算 (手計算と突合) ───
-console.log('\n通し計算 (独立した手計算と突合)');
+// ─── 通し計算 (本番の組み立て関数を通す) ───
+// 🚨 テスト側で費用を手で足さない。本番の buildProfitInputs を通し、
+//    期待値だけを独立した手計算で置く (Codex R1-7)
+console.log('\n通し計算 (本番の buildProfitInputs を通す)');
 
-t('Amazon FBA 標準10%: 手計算と一致', () => {
-  // 税込1,980 → 税抜1,800 / 原価税抜1,000 / ReferralFee 166(税抜) / FBAFees 462(税込)→420(税抜)
-  const price = exTax(1980, 0.1);                 // 1800
-  const fba = 462 / 1.1;                          // 420
-  const r = computeProfit({ priceExTax: price, costExTax: 1000, fbaFeeExTax: fba, feeTotalExTax: 166 });
-  assert.ok(near(r.expectedProfit, 1800 - 1000 - 420 - 166));  // 214
-  assert.ok(near(r.expectedMarginRate, 214 / 1800));
+const NEKOPOSU = { 送料: 198, 出荷作業料: 20, 想定梱包資材費: 10, 想定人件費: 9 };
+
+t('Amazon FBA 標準10%: 手計算 214円 と一致', () => {
+  // 税込1,980 (税抜1,800) / 原価税抜1,000 / ReferralFee 166(税抜) / FBAFees 462(税込)
+  const fee = normalizeFeeEstimate({
+    TotalFeesEstimate: { Amount: 628 },
+    FeeDetailList: [
+      { FeeType: 'ReferralFee', FinalFee: { Amount: 166 } },
+      { FeeType: 'FBAFees', FinalFee: { Amount: 462 } },
+    ],
+  }, { fulfillment: 'FBA' });
+  const built = buildProfitInputs({
+    mall: 'amazon', fulfillment: 'FBA', priceInclTax: 1980, postageRevenueInclTax: 0,
+    productTaxRate: 0.1, costExTax: 1000, feeEstimate: fee,
+  });
+  assert.equal(built.ok, true);
+  const r = computeProfit(built.args);
+  // 手計算: 1800 − 1000 − 420(=462/1.1) − 166 = 214
+  assert.ok(near(r.expectedProfit, 214), `期待 214, 実際 ${r.expectedProfit}`);
 });
 
-t('楽天 軽減8% 送料込み: 手計算と一致', () => {
-  // 税込1,080 → 税抜1,000 / 原価税抜600 / 手数料 = 1080×10% = 108(税込) → 98.18(税抜)
-  // 配送 ネコポス: 送料198(税込)→180 + 作業料等39 = 219
-  const price = exTax(1080, 0.08);                // 1000
-  const fee = (1080 * 0.10) / 1.1;                // 98.18...
-  const ship = shippingCostExTax({ 送料: 198, 出荷作業料: 20, 想定梱包資材費: 10, 想定人件費: 9 });
-  const r = computeProfit({ priceExTax: price, costExTax: 600, shippingTotalExTax: ship.total, feeTotalExTax: fee });
-  assert.ok(near(r.expectedProfit, 1000 - 600 - 219 - 98.1818181818, 1e-6));
+t('🚨 本番が FBA費用を手数料合計に入れていないこと (組み立て結果で確認)', () => {
+  const fee = normalizeFeeEstimate({
+    TotalFeesEstimate: { Amount: 628 },
+    FeeDetailList: [
+      { FeeType: 'ReferralFee', FinalFee: { Amount: 166 } },
+      { FeeType: 'FBAFees', FinalFee: { Amount: 462 } },
+    ],
+  }, { fulfillment: 'FBA' });
+  const built = buildProfitInputs({
+    mall: 'amazon', fulfillment: 'FBA', priceInclTax: 1980, productTaxRate: 0.1, costExTax: 1000, feeEstimate: fee,
+  });
+  // 手数料合計に FBA が混ざっていたら 166 + 420 になる
+  assert.ok(near(built.args.feeTotalExTax, 166), `feeTotal に FBA が混入 (${built.args.feeTotalExTax})`);
+  assert.ok(near(built.args.fbaFeeExTax, 420));
+  assert.equal(built.args.shippingTotalExTax, 0);   // FBA は自社配送費を引かない
 });
 
-t('🚨 FBA費用を手数料合計にも入れると二重控除になる (境界の確認)', () => {
-  const correct = computeProfit({ priceExTax: 1800, costExTax: 1000, fbaFeeExTax: 420, feeTotalExTax: 166 });
-  const doubled = computeProfit({ priceExTax: 1800, costExTax: 1000, fbaFeeExTax: 420, feeTotalExTax: 166 + 420 });
-  assert.ok(near(correct.expectedProfit - doubled.expectedProfit, 420));
+t('楽天 軽減8% 送料込み: 手計算 82.82円 と一致 (料率も本番から引く)', () => {
+  const built = buildProfitInputs({
+    mall: 'rakuten', fulfillment: 'self', priceInclTax: 1080, postageRevenueInclTax: 0,
+    productTaxRate: 0.08, costExTax: 600, shippingRate: NEKOPOSU,
+  });
+  assert.equal(built.ok, true);
+  const r = computeProfit(built.args);
+  // 手計算: 売価税抜 1000 − 原価600 − 配送219(=180+39) − 手数料98.1818(=1080×10%÷1.1) = 82.8181...
+  assert.ok(near(r.expectedProfit, 82.81818181, 1e-6), `期待 82.818, 実際 ${r.expectedProfit}`);
+});
+
+t('🚨 楽天の料率を本番定数から引いている (テストに直書きしない)', () => {
+  // 料率を勝手に変えたらこのテストが落ちること = 本番定数を見ている証拠
+  const built = buildProfitInputs({
+    mall: 'rakuten', priceInclTax: 1100, productTaxRate: 0.1, costExTax: 100, shippingRate: NEKOPOSU,
+  });
+  const expectedFee = (1100 * MALL_FEE_RATE_APPROX.rakuten) / (1 + SERVICE_TAX_RATE);
+  assert.ok(near(built.args.feeTotalExTax, expectedFee));
+  assert.ok(near(built.args.feeTotalExTax, 100), '楽天10%前提: 1100×10%÷1.1 = 100');
+});
+
+t('🚨 送料別途: 送料収入は送料の税率(10%)で割り戻す (商品の8%を流用しない)', () => {
+  const built = buildProfitInputs({
+    mall: 'rakuten', priceInclTax: 1080, postageRevenueInclTax: 330,
+    productTaxRate: 0.08, costExTax: 600, shippingRate: NEKOPOSU,
+  });
+  assert.ok(near(built.args.postageRevenueExTax, 300));       // 330 ÷ 1.1
+  assert.ok(!near(built.args.postageRevenueExTax, 330 / 1.08));
+  const r = computeProfit(built.args);
+  // 収入 1000 + 300 = 1300、配送費は送料込みでも引く
+  assert.ok(near(r.revenueExTax, 1300));
+});
+
+t('🚨 FBA で FBAFees が無い見積は計算不能 (0で埋めない)', () => {
+  const fee = normalizeFeeEstimate({
+    TotalFeesEstimate: { Amount: 166 },
+    FeeDetailList: [{ FeeType: 'ReferralFee', FinalFee: { Amount: 166 } }],
+  }, { fulfillment: 'FBA' });
+  assert.equal(fee.status, 'missing_fba_fee');
+  const built = buildProfitInputs({
+    mall: 'amazon', fulfillment: 'FBA', priceInclTax: 1980, productTaxRate: 0.1, costExTax: 1000, feeEstimate: fee,
+  });
+  assert.equal(built.ok, false);
+});
+
+t('🚨 FBM で配送マスタが無ければ計算不能', () => {
+  const fee = normalizeFeeEstimate({
+    TotalFeesEstimate: { Amount: 166 },
+    FeeDetailList: [{ FeeType: 'ReferralFee', FinalFee: { Amount: 166 } }],
+  }, { fulfillment: 'FBM' });
+  const built = buildProfitInputs({
+    mall: 'amazon', fulfillment: 'FBM', priceInclTax: 1980, productTaxRate: 0.1, costExTax: 1000,
+    feeEstimate: fee, shippingRate: null,
+  });
+  assert.equal(built.ok, false);
+  assert.equal(built.reason, 'shipping_master_missing');
+});
+
+t('Amazon の見積が ok でなければ計算不能 (壊れた見積で利益を出さない)', () => {
+  const fee = normalizeFeeEstimate({ FeeDetailList: [] }, { fulfillment: 'FBM' });
+  const built = buildProfitInputs({
+    mall: 'amazon', fulfillment: 'FBM', priceInclTax: 1980, productTaxRate: 0.1,
+    costExTax: 1000, feeEstimate: fee, shippingRate: NEKOPOSU,
+  });
+  assert.equal(built.ok, false);
+  assert.match(built.reason, /^fee_/);
+});
+
+t('未知のモールは料率が無いので計算不能', () => {
+  const built = buildProfitInputs({
+    mall: 'newmall', priceInclTax: 1000, productTaxRate: 0.1, costExTax: 100, shippingRate: NEKOPOSU,
+  });
+  assert.equal(built.reason, 'mall_fee_rate_unknown');
+});
+
+t('価格が無ければ計算不能', () => {
+  const built = buildProfitInputs({
+    mall: 'rakuten', priceInclTax: null, productTaxRate: 0.1, costExTax: 100, shippingRate: NEKOPOSU,
+  });
+  assert.equal(built.reason, 'price_missing');
 });
 
 t('売上が0以下なら計算不能', () => {
   assert.equal(computeProfit({ priceExTax: 0, costExTax: 100 }).ok, false);
+});
+
+// ─── 手数料内訳の構造検証 (Codex R1-4) ───
+console.log('\n手数料内訳の構造検証');
+
+t('🚨 内訳が空の見積は ok にしない', () => {
+  assert.equal(normalizeFeeEstimate({ FeeDetailList: [], TotalFeesEstimate: { Amount: 0 } }).status, 'missing');
+});
+
+t('🚨 金額が読めない行を黙って飛ばさない', () => {
+  const n = normalizeFeeEstimate({
+    TotalFeesEstimate: { Amount: 166 },
+    FeeDetailList: [
+      { FeeType: 'ReferralFee', FinalFee: { Amount: 166 } },
+      { FeeType: 'PerItemFee', FinalFee: {} },          // 金額が読めない
+    ],
+  }, { fulfillment: 'FBM' });
+  assert.equal(n.status, 'unreadable_fee_line');
+  assert.equal(n.unreadable, 1);
+});
+
+t('🚨 ReferralFee が無い見積は missing', () => {
+  const n = normalizeFeeEstimate({
+    TotalFeesEstimate: { Amount: 0 },
+    FeeDetailList: [{ FeeType: 'PerItemFee', FinalFee: { Amount: 0 } }],
+  }, { fulfillment: 'FBM' });
+  assert.equal(n.status, 'missing');
+});
+
+t('🚨 FBM なのに FBAFees が来たら unexpected_fba_fee', () => {
+  const n = normalizeFeeEstimate({
+    TotalFeesEstimate: { Amount: 628 },
+    FeeDetailList: [
+      { FeeType: 'ReferralFee', FinalFee: { Amount: 166 } },
+      { FeeType: 'FBAFees', FinalFee: { Amount: 462 } },
+    ],
+  }, { fulfillment: 'FBM' });
+  assert.equal(n.status, 'unexpected_fba_fee');
+});
+
+t('🚨 TotalFeesEstimate が無ければ照合できないので採用しない', () => {
+  const n = normalizeFeeEstimate({
+    FeeDetailList: [{ FeeType: 'ReferralFee', FinalFee: { Amount: 166 } }],
+  }, { fulfillment: 'FBM' });
+  assert.equal(n.status, 'missing_total');
+});
+
+t('壊れた見積は再利用の対象にもしない', () => {
+  const cached = {
+    ...baseCached, fee_status: 'inconsistent',
+    fetched_at: '2026-09-06T00:00:00Z', valid_until: '2099-01-01T00:00:00Z',
+  };
+  const r = canReuseFeeEstimate(cached, wantedSame, now);
+  assert.equal(r.reuse, false);
+  assert.equal(r.reason, 'fee_status_inconsistent');
+});
+
+t('🚨 valid_until が壊れていたら期限内にしない (NaN比較は常にfalse)', () => {
+  const cached = { ...baseCached, valid_until: 'not-a-date' };
+  assert.equal(canReuseFeeEstimate(cached, wantedSame, now).reason, 'expired');
+});
+
+t('🚨 fetched_at が壊れていたら改定日判定を通さない', () => {
+  const cached = { ...baseCached, fetched_at: 'garbage', valid_until: '2099-01-01T00:00:00Z' };
+  assert.equal(canReuseFeeEstimate(cached, wantedSame, now).reason, 'fetched_at_invalid');
 });
 
 console.log(`\n${passed} 件 PASS`);

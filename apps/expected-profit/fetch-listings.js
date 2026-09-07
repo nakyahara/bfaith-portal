@@ -52,20 +52,27 @@ export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil 
   const asin = (row['商品ID'] || row['asin1'] || '').trim();
   const price = toIntPrice(row['価格'] ?? row['price']);
   const channel = String(row['フルフィルメント・チャンネル'] || row['fulfillment-channel'] || '').trim();
-  const points = toIntPrice(row['ポイント'] ?? row['points']) ?? 0;
+  // 🚨 「明示的な0」と「列そのものが無い/読めない」を分ける (Codex R1-3)。
+  //    ここで 0 に倒すと、ポイント付き出品を誤った条件で見積もってしまう
+  const pointsRaw = row['ポイント'] ?? row['points'];
+  const hasPointsColumn = pointsRaw !== undefined;
+  const points = hasPointsColumn && String(pointsRaw).trim() === '' ? 0 : toIntPrice(pointsRaw);
   return {
     run_id: runId,
     mall: 'amazon',
     shop_id: shopId,
     mall_item_key: sku,
+    mall_item_ref: asin,                 // 手数料見積の入力キー (ASIN 単位で引く)
     fulfillment: channel.toUpperCase().includes('AMAZON') || channel.toUpperCase().startsWith('AFN') ? 'FBA' : 'FBM',
     ne_code: null,                       // 対応付けは build 側で行う
     price_type: 'normal',
     price_incl_tax: price,
+    price_tax_included: 1,               // Amazon の出品価格は税込 (決済の Principal + Tax と一致)
+    price_raw: price,
     mall_tax_rate: null,                 // Amazon は税率を返さない (商品マスタ側を使う)
     postage_included: null,              // FBM の送料収入は実績から推定する (§15-2)
     postage_revenue_incl_tax: null,
-    points,
+    points,                              // null = 取得不能 (見積入力未解決として扱う)
     listing_status: amazonListingStatus(row['ステータス'] || row['status']),
     fetch_status: price == null ? 'not_found' : 'ok',
     resolve_status: 'unresolved',        // build 側で解決する
@@ -73,7 +80,6 @@ export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil 
     valid_until: validUntil,
     source: 'merchant_listings_all_data',
     fetched_at: fetchedAt,
-    _asin: asin,
   };
 }
 
@@ -87,6 +93,9 @@ export function rakutenItemToSnapshots(item, { runId, shopId, fetchedAt, validUn
   for (const [variantKey, v] of Object.entries(variants)) {
     const price = toIntPrice(v?.standardPrice);            // 🚨 文字列で返る ("1080")
     const taxRate = v?.payment?.taxRate != null ? Number(v.payment.taxRate) : null;
+    // 🚨 standardPrice が税込とは限らない (Codex R1-5)。taxIncluded を確認し、
+    //    税抜登録や不明な区分は「価格が読めなかった」扱いにして、後段で税を二重に割り戻さない
+    const taxIncluded = v?.payment?.taxIncluded;
     const postageIncluded = typeof v?.shipping?.postageIncluded === 'boolean' ? v.shipping.postageIncluded : null;
     const singleItemShipping = toIntPrice(v?.shipping?.singleItemShipping);
     const hidden = hideItem || v?.hidden === true;
@@ -95,23 +104,26 @@ export function rakutenItemToSnapshots(item, { runId, shopId, fetchedAt, validUn
       mall: 'rakuten',
       shop_id: shopId,
       mall_item_key: `${manageNumber}/${variantKey}`,
+      mall_item_ref: v?.merchantDefinedSkuId || null,
       fulfillment: 'self',
       ne_code: null,
       price_type: 'normal',
-      price_incl_tax: price,
+      price_incl_tax: taxIncluded === true ? price : null,
+      price_tax_included: taxIncluded === true ? 1 : (taxIncluded === false ? 0 : null),
+      price_raw: price,                                   // 元の値は残す (調査用)
       mall_tax_rate: Number.isFinite(taxRate) ? taxRate : null,
       postage_included: postageIncluded == null ? null : (postageIncluded ? 1 : 0),
       // 送料込みなら収入 0。別途なら singleItemShipping (取れなければ NULL = unknown)
       postage_revenue_incl_tax: postageIncluded === true ? 0 : singleItemShipping,
       points: 0,
       listing_status: hidden ? 'hidden' : 'active',
-      fetch_status: price == null ? 'not_found' : 'ok',
+      fetch_status: price == null ? 'not_found'
+        : (taxIncluded === true ? 'ok' : 'tax_included_unknown'),
       resolve_status: 'unresolved',
       resolve_reason: null,
       valid_until: validUntil,
       source: 'rms_items_search',
       fetched_at: fetchedAt,
-      _merchantDefinedSkuId: v?.merchantDefinedSkuId || null,
     });
   }
   return out;
@@ -123,6 +135,13 @@ export function rakutenItemToSnapshots(item, { runId, shopId, fetchedAt, validUn
  *    partial のときは呼び出し側が前回集合と UNION する
  */
 export function evaluateEnumeration(previousKeys, currentKeys) {
+  // 🚨 0 件を正常として通さない (§7.1)。
+  //    「正常に全件列挙した結果の 0 件」と「API がおかしい」を外形では区別できない。
+  //    B-Faith が全モールで出品ゼロになることは現実に起きないので、異常として扱う。
+  //    (前回集合が無い初回でも同じ。ここを ok にすると、空レポートで世代が全消えする)
+  if (!currentKeys || currentKeys.size === 0) {
+    return { status: 'failed', disappeared: previousKeys?.size || 0, ratio: 1, reason: 'empty_enumeration' };
+  }
   if (!previousKeys || previousKeys.size === 0) {
     return { status: 'ok', disappeared: 0, ratio: 0 };   // 初回は比較対象が無い
   }
@@ -136,6 +155,27 @@ export function evaluateEnumeration(previousKeys, currentKeys) {
   };
 }
 
+/**
+ * 解析失敗・重複キーがあれば列挙を partial に落とす (Codex R1-2)。
+ * 🚨 20%判定は「前回と比べて消えた」を見る補助的な異常検知であって、
+ *    解析が成功したことの代わりにはならない。1行でも読めなければ完全集合を名乗らせない
+ */
+export function enumStatusWithParseFailures(evalResult, unparsable, duplicates) {
+  if (evalResult.status === 'failed') return { ...evalResult, unparsable, duplicates };
+  if (unparsable > 0 || duplicates > 0) {
+    return { ...evalResult, status: 'partial', unparsable, duplicates, reason: 'parse_failure' };
+  }
+  return { ...evalResult, unparsable, duplicates };
+}
+
+function enumSummary(evalResult) {
+  if (evalResult.reason === 'empty_enumeration') return '出品が0件で返った (API異常の疑い。0件を正常として通さない)';
+  if (evalResult.reason === 'parse_failure') {
+    return `解析できない行 ${evalResult.unparsable} 件 / 重複キー ${evalResult.duplicates} 件 (完全集合として扱わない)`;
+  }
+  return null;
+}
+
 // ────────────────────────────────────────────────────────────
 // 実行 (I/O を伴う部分)
 // ────────────────────────────────────────────────────────────
@@ -143,12 +183,12 @@ export function evaluateEnumeration(previousKeys, currentKeys) {
 function insertSnapshots(db, rows) {
   const stmt = db.prepare(`
     INSERT OR REPLACE INTO mall_price_snapshot
-      (run_id, mall, shop_id, mall_item_key, fulfillment, ne_code, price_type, price_incl_tax,
-       mall_tax_rate, postage_included, postage_revenue_incl_tax, points, listing_status,
+      (run_id, mall, shop_id, mall_item_key, mall_item_ref, fulfillment, ne_code, price_type, price_incl_tax,
+       price_tax_included, price_raw, mall_tax_rate, postage_included, postage_revenue_incl_tax, points, listing_status,
        fetch_status, resolve_status, resolve_reason, valid_until, source, fetched_at)
     VALUES
-      (@run_id, @mall, @shop_id, @mall_item_key, @fulfillment, @ne_code, @price_type, @price_incl_tax,
-       @mall_tax_rate, @postage_included, @postage_revenue_incl_tax, @points, @listing_status,
+      (@run_id, @mall, @shop_id, @mall_item_key, @mall_item_ref, @fulfillment, @ne_code, @price_type, @price_incl_tax,
+       @price_tax_included, @price_raw, @mall_tax_rate, @postage_included, @postage_revenue_incl_tax, @points, @listing_status,
        @fetch_status, @resolve_status, @resolve_reason, @valid_until, @source, @fetched_at)
   `);
   const tx = db.transaction((list) => { for (const r of list) stmt.run(r); });
@@ -178,24 +218,33 @@ export async function fetchAmazonListings(db, deps = {}) {
     const getReport = deps.getActiveListingsReport
       || (await import('../profit-calculator/sp-api.js')).getActiveListingsReport;
     const report = await getReport();
+    // 🚨 レスポンス形式そのものを検証する。{} が返ったのを「0件」として通さない (Codex R1-2)
+    if (!report || !Array.isArray(report.listings)) {
+      throw new Error('出品レポートの形式が不正 (listings が配列でない)');
+    }
     const fetchedAt = nowIso();
     const validUntil = addDays(fetchedAt, PRICE_VALID_DAYS);
-    const rows = (report.listings || [])
-      .map(r => amazonRowToSnapshot(r, { runId, shopId, fetchedAt, validUntil }))
-      .filter(r => r.mall_item_key);
+    const parsed = report.listings.map(r => amazonRowToSnapshot(r, { runId, shopId, fetchedAt, validUntil }));
+    // SKU が読めない行は黙って消さず、件数を残す
+    const rows = parsed.filter(r => r.mall_item_key);
+    const unparsable = parsed.length - rows.length;
 
     const currentKeys = new Set(rows.map(r => `${r.shop_id}${r.mall_item_key}`));
+    // 🚨 重複キーを INSERT OR REPLACE で隠さない
+    const duplicates = rows.length - currentKeys.size;
     const prev = loadLastCompleteKeys(db, 'amazon');
-    const evalResult = evaluateEnumeration(prev.keys, currentKeys);
+    const evalResult = enumStatusWithParseFailures(
+      evaluateEnumeration(prev.keys, currentKeys), unparsable, duplicates);
 
     insertSnapshots(db, rows);
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,
-                expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?
-                WHERE run_id = ?`)
-      .run(nowIso(), evalResult.status === 'ok' ? 'ok' : 'partial', evalResult.status,
+                expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?,
+                error_summary = ? WHERE run_id = ?`)
+      .run(nowIso(), evalResult.status, evalResult.status,
         rows.length, rows.filter(r => r.fetch_status === 'ok').length,
-        rows.filter(r => r.fetch_status !== 'ok').length, evalResult.disappeared, runId);
-    return { runId, count: rows.length, ...evalResult };
+        rows.filter(r => r.fetch_status !== 'ok').length, evalResult.disappeared,
+        enumSummary(evalResult), runId);
+    return { runId, count: rows.length, unparsable, duplicates, ...evalResult };
   } catch (e) {
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = 'failed', listing_enum_status = 'failed',
                 error_summary = ? WHERE run_id = ?`).run(nowIso(), String(e.message).slice(0, 500), runId);
@@ -219,15 +268,23 @@ export async function fetchRakutenListings(db, deps = {}) {
     const rows = [];
     let cursorMark = '*';
     let pages = 0;
+    let unparsable = 0;
     const MAX_PAGES = deps.maxPages || 500;   // 50,000 商品。到達したら partial (打ち切りを隠さない)
     let truncated = false;
     for (;;) {
       if (pages >= MAX_PAGES) { truncated = true; break; }
       const data = await searchPage(cursorMark);
       pages++;
-      const items = data?.results || data?.items || [];
+      // 🚨 形式を検証する。results も items も無いレスポンスを「0件」として通さない
+      const items = Array.isArray(data?.results) ? data.results
+        : (Array.isArray(data?.items) ? data.items : null);
+      if (items === null) throw new Error(`RMS items/search の形式が不正 (${pages}頁目)`);
       for (const r of items) {
-        rows.push(...rakutenItemToSnapshots(r?.item || r, { runId, shopId, fetchedAt, validUntil }));
+        const item = r?.item || r;
+        const made = rakutenItemToSnapshots(item, { runId, shopId, fetchedAt, validUntil });
+        // manageNumber / variants が欠けた商品を黙って消さない
+        if (made.length === 0) unparsable++;
+        rows.push(...made);
       }
       const next = data?.nextCursorMark;
       if (!next || next === cursorMark || items.length === 0) break;
@@ -235,19 +292,24 @@ export async function fetchRakutenListings(db, deps = {}) {
     }
 
     const currentKeys = new Set(rows.map(r => `${r.shop_id}${r.mall_item_key}`));
+    const duplicates = rows.length - currentKeys.size;
     const prev = loadLastCompleteKeys(db, 'rakuten');
-    const evalResult = evaluateEnumeration(prev.keys, currentKeys);
-    const enumStatus = truncated ? 'partial' : evalResult.status;
+    const evalResult = enumStatusWithParseFailures(
+      evaluateEnumeration(prev.keys, currentKeys), unparsable, duplicates);
+    // 0件 (failed) は打ち切りより重い。failed > partial > ok の順で厳しい方を採る
+    const enumStatus = evalResult.status === 'failed' ? 'failed' : (truncated ? 'partial' : evalResult.status);
+    const summary = enumSummary(evalResult)
+      || (truncated ? `ページ上限 ${MAX_PAGES} に到達 (打ち切りの疑い)` : null);
 
     insertSnapshots(db, rows);
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = ?, listing_enum_status = ?,
                 expected_count = ?, fetched_count = ?, failed_count = ?, disappeared_count = ?,
                 error_summary = ? WHERE run_id = ?`)
-      .run(nowIso(), enumStatus === 'ok' ? 'ok' : 'partial', enumStatus,
+      .run(nowIso(), enumStatus, enumStatus,
         rows.length, rows.filter(r => r.fetch_status === 'ok').length,
         rows.filter(r => r.fetch_status !== 'ok').length, evalResult.disappeared,
-        truncated ? `ページ上限 ${MAX_PAGES} に到達 (打ち切りの疑い)` : null, runId);
-    return { runId, count: rows.length, pages, truncated, ...evalResult, status: enumStatus };
+        summary, runId);
+    return { runId, count: rows.length, pages, truncated, unparsable, duplicates, ...evalResult, status: enumStatus };
   } catch (e) {
     db.prepare(`UPDATE price_fetch_run SET finished_at = ?, status = 'failed', listing_enum_status = 'failed',
                 error_summary = ? WHERE run_id = ?`).run(nowIso(), String(e.message).slice(0, 500), runId);

@@ -53,11 +53,15 @@ export function loadCache(db) {
   return map;
 }
 
-/** SP-API のリクエスト body を組む (純関数。テストで固定する) */
-export function buildFeeRequest(targets, marketplaceId) {
+/**
+ * SP-API のリクエスト body を組む (純関数。テストで固定する)
+ * 🚨 marketplace は target のものを使う。環境変数を使うと
+ *    「保存した条件」と「実際に送った条件」がずれ、後日の全入力一致検証が嘘になる (Codex R1-6)
+ */
+export function buildFeeRequest(targets) {
   return targets.map((t, idx) => ({
     FeesEstimateRequest: {
-      MarketplaceId: marketplaceId,
+      MarketplaceId: t.marketplace_id,
       IsAmazonFulfilled: t.in_fulfillment === 'FBA',
       PriceToEstimateFees: {
         ListingPrice: { CurrencyCode: t.in_currency || 'JPY', Amount: t.in_listing_price },
@@ -74,7 +78,8 @@ export function buildFeeRequest(targets, marketplaceId) {
 
 /** レスポンスを保存形へ (純関数) */
 export function toEstimateRow(target, feesEstimate, fetchedAt) {
-  const n = normalizeFeeEstimate(feesEstimate);
+  // 🚨 fulfillment を渡さないと「FBA なのに FBAFees が無い」を検出できない
+  const n = normalizeFeeEstimate(feesEstimate, { fulfillment: target.in_fulfillment });
   return {
     seller_id: target.seller_id,
     marketplace_id: target.marketplace_id,
@@ -120,30 +125,42 @@ export function saveEstimates(db, rows) {
  */
 export async function refreshFees(db, targets, deps = {}) {
   const now = deps.now || (() => new Date());
-  const marketplaceId = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
+  // 🚨 環境の marketplace と target の marketplace が違うものを混ぜない。
+  //    送った条件と保存する条件がずれると、全入力一致の検証が意味を失う
+  const envMarketplace = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
+  const mismatched = targets.filter(t => t.marketplace_id !== envMarketplace);
+  if (mismatched.length > 0) {
+    throw new Error(
+      `marketplace_id が環境設定 (${envMarketplace}) と違う対象が ${mismatched.length} 件あります: `
+      + `${[...new Set(mismatched.map(t => t.marketplace_id))].join(', ')}`);
+  }
   const cached = loadCache(db);
   const { need, reuse } = planRefresh(targets, cached, now());
 
   const callApi = deps.callFeesApi || defaultCallFeesApi;
   const sleepMs = deps.sleepMs ?? BATCH_SLEEP_MS;
   const saved = [];
-  const errors = [];
+  const errors = [];          // 対象 (SKU) 単位の失敗
+  const batchErrors = [];     // バッチ単位の失敗 (API 呼び出しそのものが通らなかった)
   let stoppedByDeadline = false;
+  let processedTargets = 0;
 
   for (let i = 0; i < need.length; i += BATCH_SIZE) {
     // 全体終了期限 (§8.4)。超えたら残りは翌日に回す (途中で止めても行は消えない)
     if (deps.deadline && now() >= deps.deadline) { stoppedByDeadline = true; break; }
 
     const chunk = need.slice(i, i + BATCH_SIZE).map(x => x.target);
-    const body = buildFeeRequest(chunk, marketplaceId);
+    const body = buildFeeRequest(chunk);
     let res = null;
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try { res = await callApi(body); break; }
       catch (e) {
-        if (attempt === MAX_RETRIES - 1) { errors.push({ skus: chunk.map(c => c.seller_sku), error: e.message }); }
-        else await sleep(sleepMs * (attempt + 1));   // 指数バックオフ
+        if (attempt === MAX_RETRIES - 1) {
+          batchErrors.push({ targets: chunk.length, skus: chunk.map(c => c.seller_sku).slice(0, 5), error: e.message });
+        } else await sleep(sleepMs * (attempt + 1));   // 指数バックオフ
       }
     }
+    processedTargets += chunk.length;
     if (!res) continue;
 
     const fetchedAt = nowIso();
@@ -167,15 +184,22 @@ export async function refreshFees(db, targets, deps = {}) {
   if (saved.length > 0) saveEstimates(db, saved);
   const unknownTypes = saved.filter(r => r.fee_status === 'unknown_fee_type').length;
   const inconsistent = saved.filter(r => r.fee_status === 'inconsistent').length;
+  const badStatus = saved.filter(r => r.fee_status !== 'ok').length;
+  const failedTargets = errors.length + batchErrors.reduce((a, b) => a + b.targets, 0);
   return {
     targets: targets.length,
     reused: reuse.length,
     refreshed: saved.length,
-    failed: errors.length,
+    // 🚨 SKU 単位とバッチ単位を混ぜない (取得率の判断に使えなくなる)
+    failedTargets,
+    failedBatches: batchErrors.length,
+    pendingTargets: need.length - processedTargets,   // 期限で止めた分
+    okEstimates: saved.length - badStatus,
     unknownTypes,
     inconsistent,
     stoppedByDeadline,
     errors: errors.slice(0, 20),
+    batchErrors: batchErrors.slice(0, 5),
   };
 }
 

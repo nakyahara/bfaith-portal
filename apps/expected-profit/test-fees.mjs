@@ -25,8 +25,9 @@ async function ta(name, fn) {
   catch (e) { console.error(`  NG  ${name}\n      ${e.message}`); process.exitCode = 1; }
 }
 
+const MARKETPLACE = process.env.SP_API_MARKETPLACE_ID;
 const target = (over = {}) => ({
-  seller_id: 'S1', marketplace_id: 'M1', seller_sku: 'sku1', asin: 'B001',
+  seller_id: 'S1', marketplace_id: MARKETPLACE, seller_sku: 'sku1', asin: 'B001',
   in_listing_price: 1000, in_shipping: 0, in_points: 0, in_fulfillment: 'FBM', in_currency: 'JPY',
   ...over,
 });
@@ -46,18 +47,23 @@ const feeResponse = (identifier, { referral = 84, fba = null, total = null } = {
 console.log('リクエストの組み立て');
 
 t('🚨 送料を算定基礎に渡す (Shipping 0 固定にしない)', () => {
-  const body = buildFeeRequest([target({ in_shipping: 230 })], 'M1');
+  const body = buildFeeRequest([target({ in_shipping: 230 })]);
   assert.equal(body[0].FeesEstimateRequest.PriceToEstimateFees.Shipping.Amount, 230);
 });
 
+t('🚨 marketplace は target のものを送る (環境変数を混ぜない)', () => {
+  const body = buildFeeRequest([target()]);
+  assert.equal(body[0].FeesEstimateRequest.MarketplaceId, MARKETPLACE);
+});
+
 t('🚨 ポイントも見積入力として渡す', () => {
-  const body = buildFeeRequest([target({ in_points: 5 })], 'M1');
+  const body = buildFeeRequest([target({ in_points: 5 })]);
   assert.equal(body[0].FeesEstimateRequest.PriceToEstimateFees.Points.PointsNumber, 5);
 });
 
 t('FBA / FBM を IsAmazonFulfilled に反映する', () => {
-  assert.equal(buildFeeRequest([target({ in_fulfillment: 'FBA' })], 'M1')[0].FeesEstimateRequest.IsAmazonFulfilled, true);
-  assert.equal(buildFeeRequest([target()], 'M1')[0].FeesEstimateRequest.IsAmazonFulfilled, false);
+  assert.equal(buildFeeRequest([target({ in_fulfillment: 'FBA' })])[0].FeesEstimateRequest.IsAmazonFulfilled, true);
+  assert.equal(buildFeeRequest([target()])[0].FeesEstimateRequest.IsAmazonFulfilled, false);
 });
 
 console.log('\n再利用の計画 (§7.3)');
@@ -127,7 +133,7 @@ await ta('見積を取って保存する', async () => {
     callFeesApi: async (body) => feeResponse(body[0].FeesEstimateRequest.Identifier, { referral: 84 }),
   });
   assert.equal(r.refreshed, 1);
-  assert.equal(r.failed, 0);
+  assert.equal(r.failedTargets, 0);
   const saved = db.prepare('SELECT * FROM amazon_fee_estimate').all();
   assert.equal(saved.length, 1);
   assert.equal(saved[0].referral_fee_ex_tax, 84);
@@ -173,7 +179,9 @@ await ta('API が Status != Success を返した SKU は失敗として数える
       Error: { Message: 'Invalid ASIN' },
     }]),
   });
-  assert.equal(r.failed, 1);
+  // SKU 単位の失敗 (バッチは通っている)
+  assert.equal(r.failedTargets, 1);
+  assert.equal(r.failedBatches, 0);
   assert.equal(r.refreshed, 0);
   assert.match(r.errors[0].error, /Invalid ASIN/);
 });
@@ -185,7 +193,32 @@ await ta('API が投げ続けたらリトライ上限で諦め、失敗として
     callFeesApi: async () => { calls++; throw new Error('429 Too Many Requests'); },
   });
   assert.equal(calls, 3);            // MAX_RETRIES
-  assert.equal(r.failed, 1);
+  // バッチ単位の失敗。対象数はバッチに含まれる SKU 数で数える (Codex R1-9)
+  assert.equal(r.failedBatches, 1);
+  assert.equal(r.failedTargets, 1);
+});
+
+await ta('[!] 20SKU のバッチ失敗を「1件の失敗」と数えない (取得率の判断に使えなくなる)', async () => {
+  const many = Array.from({ length: 20 }, (_, i) => target({ seller_sku: `batch${i}` }));
+  const r = await refreshFees(db, many, {
+    sleepMs: 0,
+    callFeesApi: async () => { throw new Error('500'); },
+  });
+  assert.equal(r.failedBatches, 1);
+  assert.equal(r.failedTargets, 20);   // 対象単位では20件
+});
+
+await ta('部分成功: 一部の SKU だけ失敗したときも対象単位で数える', async () => {
+  const targets = [target({ seller_sku: 'okSku' }), target({ seller_sku: 'ngSku' })];
+  const r = await refreshFees(db, targets, {
+    sleepMs: 0,
+    callFeesApi: async (body) => body.map((b, i) => (i === 0
+      ? feeResponse(b.FeesEstimateRequest.Identifier, { referral: 84 })[0]
+      : { Status: 'ClientError', FeesEstimateIdentifier: { SellerInputIdentifier: b.FeesEstimateRequest.Identifier }, Error: { Message: 'bad' } })),
+  });
+  assert.equal(r.refreshed, 1);
+  assert.equal(r.failedTargets, 1);
+  assert.equal(r.failedBatches, 0);
 });
 
 await ta('🚨 全体終了期限を過ぎたら残りを翌日に回す (途中で止めても壊れない)', async () => {
@@ -199,6 +232,14 @@ await ta('🚨 全体終了期限を過ぎたら残りを翌日に回す (途中
   assert.equal(calls, 0);
   assert.equal(r.stoppedByDeadline, true);
   assert.equal(r.refreshed, 0);
+  assert.equal(r.pendingTargets, 60);   // 未処理として残す (失敗ではない)
+});
+
+await ta('[!] marketplace が環境設定と違う対象は拒否する (送った条件と保存する条件をずらさない)', async () => {
+  await assert.rejects(
+    () => refreshFees(db, [target({ marketplace_id: 'ATVPDKIKX0DER' })], { sleepMs: 0, callFeesApi: async () => [] }),
+    /marketplace_id が環境設定/,
+  );
 });
 
 db.close();

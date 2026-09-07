@@ -24,10 +24,22 @@ export function addDays(iso, days) {
   return d.toISOString();
 }
 
+/**
+ * 日時として読めるか。
+ * 🚨 new Date('invalid') は NaN になり、比較が常に false になる。
+ *    壊れた日時を「期限内」として通さないために、読めるかどうかを先に判定する
+ */
+export function parseTime(iso) {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
 /** 期限切れか (現在時刻で判定する。保存済みの status を信じない — §8.3) */
 export function isExpired(validUntil, now = new Date()) {
-  if (!validUntil) return true;
-  return new Date(validUntil) <= now;
+  const t = parseTime(validUntil);
+  if (t == null) return true;          // 欠損・不正は失効扱い
+  return t <= now.getTime();
 }
 
 /** 世代の内容ハッシュ (manifest 用 — §15-7) */

@@ -67,10 +67,16 @@ function createTables(db) {
     mall                     TEXT NOT NULL,
     shop_id                  TEXT NOT NULL,     -- Amazon = seller@marketplace、楽天 = shop_code
     mall_item_key            TEXT NOT NULL,     -- Amazon = seller_sku、楽天 = manageNumber/variantKey
+    -- モール側の商品参照。Amazon = ASIN (手数料見積の入力キーに必須)、楽天 = merchantDefinedSkuId
+    -- 🚨 ここに残さないと build 時に再取得が要る (見積は ASIN 単位で引くため)
+    mall_item_ref            TEXT,
     fulfillment              TEXT,              -- FBA / FBM / self
     ne_code                  TEXT,
     price_type               TEXT,              -- normal (セール価格は採用しない §3.2)
     price_incl_tax           INTEGER,           -- 税込。整数円のみ。読めなければ NULL
+    -- 🚨 モール側が税込で持っているとは限らない。税区分が確認できない価格は price_incl_tax に入れない
+    price_tax_included       INTEGER,           -- 1 = 税込 / 0 = 税抜 / NULL = 不明
+    price_raw                INTEGER,           -- モールが返した元の価格 (調査用)
     mall_tax_rate            REAL,              -- モール側が持つ税率 (楽天 payment.taxRate)。無ければ NULL
     postage_included         INTEGER,           -- 1 / 0 / NULL
     postage_revenue_incl_tax INTEGER,           -- 別途送料収入 (税込)。不明は NULL

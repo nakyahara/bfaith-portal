@@ -15,6 +15,7 @@ const { initExpectedProfitDB } = await import('./db.js');
 const {
   toIntPrice, amazonListingStatus, amazonRowToSnapshot, rakutenItemToSnapshots,
   evaluateEnumeration, loadLastCompleteKeys, fetchAmazonListings, fetchRakutenListings,
+  enumStatusWithParseFailures,
 } = await import('./fetch-listings.js');
 
 let passed = 0;
@@ -61,6 +62,11 @@ t('FBA / FBM をチャンネル列から判定する', () => {
 t('ポイントを手数料見積の入力として持つ', () => {
   const r = amazonRowToSnapshot({ '出品者SKU': 'a', '価格': '1000', 'ポイント': '5', 'ステータス': 'Active' }, meta);
   assert.equal(r.points, 5);
+});
+
+t('🚨 ASIN を保存する (手数料見積は ASIN 単位で引くので失うと再取得になる)', () => {
+  const r = amazonRowToSnapshot({ '出品者SKU': 'a', '商品ID': 'B00TEST', '価格': '1000', 'ステータス': 'Active' }, meta);
+  assert.equal(r.mall_item_ref, 'B00TEST');
 });
 
 t('🚨 価格が読めない行も残す (行を消さない)', () => {
@@ -139,9 +145,84 @@ t('🚨 2割超が消えたら partial (レポート破損の疑い)', () => {
   assert.equal(r.disappeared, 3);
 });
 
-t('🚨 全部消えたら partial (0件を正常として通さない)', () => {
+t('🚨 0件は failed (正常として通さない)', () => {
   const prev = new Set(['a', 'b', 'c']);
-  assert.equal(evaluateEnumeration(prev, new Set()).status, 'partial');
+  const r = evaluateEnumeration(prev, new Set());
+  assert.equal(r.status, 'failed');
+  assert.equal(r.reason, 'empty_enumeration');
+});
+
+t('🚨 初回でも0件なら failed (前回集合が無くても ok にしない)', () => {
+  // ここを ok にすると、空レポートを受けた初回に世代が全消えする
+  const r = evaluateEnumeration(new Set(), new Set());
+  assert.equal(r.status, 'failed');
+  assert.equal(r.reason, 'empty_enumeration');
+});
+
+console.log('解析失敗・重複キー (Codex R1-2)');
+
+t('[!] 解析できない行が1つでもあれば完全集合を名乗らせない', () => {
+  const base = evaluateEnumeration(new Set(['a']), new Set(['a']));
+  assert.equal(base.status, 'ok');
+  const r = enumStatusWithParseFailures(base, 1, 0);
+  assert.equal(r.status, 'partial');
+  assert.equal(r.reason, 'parse_failure');
+});
+
+t('[!] 重複キーがあれば partial (INSERT OR REPLACE で隠さない)', () => {
+  const base = evaluateEnumeration(new Set(['a']), new Set(['a']));
+  assert.equal(enumStatusWithParseFailures(base, 0, 2).status, 'partial');
+});
+
+t('解析失敗が無ければ判定はそのまま', () => {
+  const base = evaluateEnumeration(new Set(['a']), new Set(['a']));
+  assert.equal(enumStatusWithParseFailures(base, 0, 0).status, 'ok');
+});
+
+t('0件 (failed) は解析失敗より重い', () => {
+  const base = evaluateEnumeration(new Set(['a']), new Set());
+  assert.equal(enumStatusWithParseFailures(base, 5, 0).status, 'failed');
+});
+
+console.log('ポイント・税区分の欠損 (Codex R1-3 / R1-5)');
+
+t('[!] ポイント列が無ければ null (0で埋めない)', () => {
+  const r = amazonRowToSnapshot({ '出品者SKU': 'a', '価格': '1000', 'ステータス': 'Active' }, meta);
+  assert.equal(r.points, null);
+});
+
+t('ポイント列が空欄なら明示的な0', () => {
+  const r = amazonRowToSnapshot({ '出品者SKU': 'a', '価格': '1000', 'ポイント': '', 'ステータス': 'Active' }, meta);
+  assert.equal(r.points, 0);
+});
+
+t('ポイントが読めない値なら null', () => {
+  const r = amazonRowToSnapshot({ '出品者SKU': 'a', '価格': '1000', 'ポイント': 'あり', 'ステータス': 'Active' }, meta);
+  assert.equal(r.points, null);
+});
+
+t('[!] 楽天 taxIncluded=false の価格を税込として保存しない', () => {
+  const rows = rakutenItemToSnapshots({
+    manageNumber: 'x', variants: { v: { standardPrice: '1000', payment: { taxIncluded: false, taxRate: '0.1' } } },
+  }, meta);
+  assert.equal(rows[0].price_incl_tax, null);
+  assert.equal(rows[0].price_tax_included, 0);
+  assert.equal(rows[0].price_raw, 1000);
+  assert.equal(rows[0].fetch_status, 'tax_included_unknown');
+});
+
+t('[!] 楽天 taxIncluded が無い場合も税込と決めつけない', () => {
+  const rows = rakutenItemToSnapshots({ manageNumber: 'x', variants: { v: { standardPrice: '1000' } } }, meta);
+  assert.equal(rows[0].price_incl_tax, null);
+  assert.equal(rows[0].fetch_status, 'tax_included_unknown');
+});
+
+t('楽天 taxIncluded=true なら税込として採用する', () => {
+  const rows = rakutenItemToSnapshots({
+    manageNumber: 'x', variants: { v: { standardPrice: '1080', payment: { taxIncluded: true, taxRate: '0.08' } } },
+  }, meta);
+  assert.equal(rows[0].price_incl_tax, 1080);
+  assert.equal(rows[0].fetch_status, 'ok');
 });
 
 console.log('\n実行 (deps 差し替え・API は叩かない)');
@@ -165,9 +246,10 @@ await ta('Amazon: レポートを取り込み run に記録する', async () => 
 });
 
 await ta('🚨 §10.1-12/13 未販売・在庫切れの出品も母集団に残る', async () => {
-  const rows = db.prepare("SELECT mall_item_key, listing_status FROM mall_price_snapshot WHERE mall='amazon' ORDER BY mall_item_key").all();
+  const rows = db.prepare("SELECT mall_item_key, listing_status, mall_item_ref FROM mall_price_snapshot WHERE mall='amazon' ORDER BY mall_item_key").all();
   assert.equal(rows.length, 2);
   assert.equal(rows[1].listing_status, 'inactive');   // Inactive も落とさない
+  assert.equal(rows[0].mall_item_ref, 'B001');        // ASIN が DB まで届いている
 });
 
 await ta('🚨 §10.1-14 2回目で大量に消えたら partial (行は消さない)', async () => {
@@ -185,6 +267,13 @@ await ta('🚨 §10.1-14 2回目で大量に消えたら partial (行は消さ�
 await ta('完全列挙できた最新 run の集合を「完全集合」として引ける', async () => {
   const prev = loadLastCompleteKeys(db, 'amazon');
   assert.equal(prev.keys.size, 2);         // partial の run ではなく ok の run を見る
+});
+
+await ta('🚨 レポートの形式が不正なら例外 ({} を0件として通さない)', async () => {
+  await assert.rejects(
+    () => fetchAmazonListings(db, { getActiveListingsReport: async () => ({}) }),
+    /形式が不正/,
+  );
 });
 
 await ta('API が落ちたら run を failed にして例外を投げる (静かに成功にしない)', async () => {
