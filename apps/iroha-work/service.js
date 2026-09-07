@@ -16,7 +16,7 @@
 import { buildEnrichContext } from '../inbound-check/notion-sync.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
-import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask, finishedSessionsOfTask } from './db.js';
+import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask, finishedSessionsOfTask, listWorkOptions } from './db.js';
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
@@ -426,6 +426,11 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
   return { cards, today };
 }
 
+// ⭐外部に出す画面の上限 (Codex R2 中2)。上限の無い読み取りを、ログインのいらない口に置かない
+const FACILITY_ROWS_MAX = 300;   // 1 回に出す預けの数 (おあずかり中 + 直近の受け取りずみ)
+const SETTLED_SHOWN = 30;        // そのうち「受け取りずみ」は直近これだけ
+const RETURNS_SHOWN = 20;        // 1 つの預けにつき返却の明細
+
 /** まとまりの作業状態 → 画面の言葉 (カードの「終了 · 棚入完了」と読み方をそろえる) */
 const BATCH_STATUS_LABEL = { not_started: '未着手', in_progress: '作業中', ready_for_stocking: '棚入待ち', done: '終了 · 棚入完了' };
 
@@ -491,6 +496,126 @@ export function expandBatchRows(cards, { forPlan = false } = {}) {
     }
   }
   return rows;
+}
+
+/**
+ * ⭐外部施設に見せる内容 (要件 §AB-11 の 6)。**読むだけ・その施設に預けたぶんだけ**。
+ *
+ * 中原さん 2026-09-07:
+ * > 外部の施設からは専用の URL で、何を預けたか・どう作業するかの情報は見れるようにしたい
+ *
+ * ⚠**出さないもの** (要件 §AB-13「個人情報を出さない」):
+ *   作業した人の名前・写真・いろは内部のメモ (申し送り・止まっている理由)・在庫や売上の数字・
+ *   他の施設のぶん・いろはが自分で作業しているぶん。
+ *   ⭐**自由記述はいっさい出さない** (Codex R1 重大1・重大2)。作業仕様の「備考」も返却の「ひとこと」も、
+ *   いろはの中で読む前提で書かれていて、「山田さん担当」「利用者○○さんのぶん」のような書き方が起こりうる。
+ *   コメントで「個人名は入っていないはず」と決めても、中身は保証できない。
+ *   外部に見せる作業メモが要るなら、**外部向けと分かっている専用の欄**を別に作って職員に書いてもらう
+ *   (要件 §AB-11 の 7 で検討)。
+ * ⚠**返却の確定はいろは側** (§AB-7)。ここからは何も書き換えられない。
+ */
+export function buildFacilityView(facilityCode) {
+  const db = getDB();
+  // ⭐**出す値そのものを確かめる** (Codex R2 中1)。項目名を絞っても、値に何が入っているかは保証できない
+  //   ("20L（山田さん担当）" のような書き方や、入れ子の JSON が入りうる)。
+  //   保管箱・資材セットは**いま登録されている選択肢に一致するものだけ**出す。合わなければ出さない
+  const okContainer = new Set(listWorkOptions('container', true).map((o) => o.code));
+  const okMaterial = new Set(listWorkOptions('material', true).map((o) => o.code));
+  const pickOption = (v, allow) => (typeof v === 'string' && allow.has(v) ? v : null);
+  // 数は**整数だけ**。文字列・小数・入れ子は出さない (0 で代用もしない)
+  const pickInt = (v) => (Number.isSafeInteger(v) && v > 0 && v <= 1_000_000 ? v : null);
+  const fac = db.prepare('SELECT code, name FROM f_iroha_facilities WHERE code = ?').get(facilityCode);
+  if (!fac) return null;
+  // その施設あての預けだけ。取消したものは出さない (無かったことになったぶん)
+  const rows = db.prepare(`SELECT c.id, c.state, c.planned_qty, c.prepared_qty, c.handed_qty, c.missing_qty,
+      c.due_date, c.planned_at, c.prepared_at, c.handed_at, c.settled_at,
+      -- ⭐返ってきた合計は**全部の返却から** SQL で出す。明細の表示上限 (20 件) で数を狂わせない (Codex R3 中2)
+      (SELECT COALESCE(SUM(r.returned_qty), 0) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id) AS returned_total,
+      (SELECT COUNT(*) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id) AS returns_count,
+      b.id AS batch_id, b.expiry,
+      t.id AS task_id, t.product_name, t.product_code, t.master_snapshot
+    FROM f_iroha_consignments c
+    JOIN f_iroha_task_batches b ON b.id = c.batch_id
+    JOIN f_iroha_tasks t ON t.id = b.task_id
+    WHERE c.facility_code = ? AND c.state <> 'cancelled'
+      -- ⭐終わったぶん (受け取りずみ) は**直近だけ**。年が経つほど 1 回の応答が重くなるのを防ぐ (Codex R2 中2)。
+      -- ⭐「直近」は**精算した日**で選ぶ (Codex R4 軽微2)。作った順 (id) で選ぶと、古い預けを今日精算したときに
+      --    「今日受け取った記録」が出た瞬間に消える。id の大小ではなく、選んだ id そのもので絞る
+      AND (c.state <> 'settled' OR c.id IN (
+        SELECT id FROM f_iroha_consignments
+        WHERE facility_code = ? AND state = 'settled'
+        ORDER BY settled_at DESC, id DESC LIMIT ?))
+    ORDER BY (c.state = 'settled'), c.due_date IS NULL, c.due_date, c.id DESC
+    LIMIT ?`).all(facilityCode, facilityCode, SETTLED_SHOWN, FACILITY_ROWS_MAX);
+  // 返却の明細も上限つき (1 回の預けに何十回も返ってくることは無いが、上限が無い読み取りを外に置かない)。
+  // ⭐**新しいほうから**取る (Codex R4 軽微3)。古い順に切ると、21 回目以降は毎回いちばん新しい記録が隠れる
+  const returnsOf = db.prepare(`SELECT returned_qty, returned_at
+    FROM f_iroha_consignment_returns WHERE consignment_id = ? ORDER BY id DESC LIMIT ${RETURNS_SHOWN}`);
+  const today = jstToday();
+  const items = rows.map((r) => {
+    // 作業のしかた = 作業仕様。カード作成時のスナップショットを使う (渡した時点の指示 — §AB-13)
+    let snap = null;
+    try { snap = r.master_snapshot ? JSON.parse(r.master_snapshot) : null; } catch { /* 壊れていれば出さないだけ */ }
+    const back = returnsOf.all(r.id).reverse();  // 明細は直近だけ (見せる用)。画面には古い順に並べる
+    const returned = Number(r.returned_total) || 0;   // ⭐数は SQL の合計を使う (明細の件数に左右されない)
+    const qty = r.handed_qty ?? r.planned_qty;
+    return {
+      id: r.id,
+      product_name: r.product_name || '(名称なし)',
+      product_code: r.product_code || null,
+      expiry: r.expiry || null,
+      state: r.state,
+      // 数は「渡す予定 → 用意ずみ → 渡した」を別々に見せる (1 つにまとめない — §AB-7)
+      planned_qty: r.planned_qty, prepared_qty: r.prepared_qty ?? null, handed_qty: r.handed_qty ?? null,
+      returned_qty: returned || 0,
+      remaining: r.handed_qty == null ? null : Math.max(0, r.handed_qty - returned - (r.missing_qty ?? 0)),
+      due_date: r.due_date || null,
+      overdue: !!(r.due_date && r.state === 'handed' && r.due_date < today),
+      handed_at: r.handed_at || null,
+      settled_at: r.settled_at || null,
+      // ⭐作業のしかた。**決まった形の項目だけ**、しかも**値まで確かめて**出す。自由記述の「備考」は出さない
+      work: snap ? {
+        material_code: pickOption(snap.material_code, okMaterial),        // 資材セットID (登録ずみのものだけ)
+        storage_container: pickOption(snap.storage_container, okContainer), // 保管箱 (同上)
+        units_per_container: pickInt(snap.units_per_container),
+        process_count: pickInt(snap.process_count),
+      } : null,
+      // 返却の記録 (いつ何個持ってきたか)。⭐記録した人の名前も、いろはが書いたひとことも出さない
+      returns: back.map((x) => ({ qty: x.returned_qty, at: x.returned_at })),
+      returns_more: Math.max(0, (Number(r.returns_count) || 0) - back.length),   // 出しきれなかった件数
+      qty,
+    };
+  });
+  // ⭐まとめは**施設の全部から** SQL で数える (Codex R3 中3)。
+  //   表示は上限で切るので、切った後の行から数えると「300 件・300 個」のように少なく出てしまう。
+  //   「いま持っている数」は渡したぶんの残り (返ったぶん・返らなかったぶんを引く — Codex R1 中4)
+  const a = db.prepare(`SELECT
+      SUM(CASE WHEN c.state = 'handed' THEN 1 ELSE 0 END) held_count,
+      SUM(CASE WHEN c.state = 'handed' THEN MAX(0, COALESCE(c.handed_qty, 0) - COALESCE(c.missing_qty, 0)
+        - COALESCE((SELECT SUM(r.returned_qty) FROM f_iroha_consignment_returns r WHERE r.consignment_id = c.id), 0))
+        ELSE 0 END) held_qty,
+      SUM(CASE WHEN c.state IN ('planned','prepared') THEN 1 ELSE 0 END) coming_count,
+      SUM(CASE WHEN c.state IN ('planned','prepared') THEN COALESCE(c.planned_qty, 0) ELSE 0 END) coming_qty,
+      SUM(CASE WHEN c.state = 'handed' AND c.due_date IS NOT NULL AND c.due_date < ? THEN 1 ELSE 0 END) overdue_count,
+      SUM(CASE WHEN c.state <> 'settled' THEN 1 ELSE 0 END) open_count,
+      COUNT(*) total
+    FROM f_iroha_consignments c WHERE c.facility_code = ? AND c.state <> 'cancelled'`).get(today, facilityCode);
+  return {
+    facility: { code: fac.code, name: fac.name },
+    today,
+    items,
+    // ⭐出しきれなかった件数を隠さない (画面に「ほかに N 件あります」と出す)
+    shown: items.length,
+    more: Math.max(0, (Number(a.total) || 0) - items.length),
+    summary: {
+      open_count: Number(a.open_count) || 0,
+      held_count: Number(a.held_count) || 0,
+      held_qty: Number(a.held_qty) || 0,
+      coming_count: Number(a.coming_count) || 0,
+      coming_qty: Number(a.coming_qty) || 0,
+      overdue_count: Number(a.overdue_count) || 0,
+    },
+  };
 }
 
 /**

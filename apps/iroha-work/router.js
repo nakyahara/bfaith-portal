@@ -28,16 +28,18 @@ import {
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
   getCachePage, startSessions, stopSession, stopSessions, undoStopSessions, sessionsOverlappingDay, listSessionsForAdmin, searchSessions, SESSION_SEARCH_MAX, jstDayStartUtc, voidSession,
+  createFacilityLink, verifyFacilityLink, listFacilityLinks, revokeFacilityLink,
   getMeta, setMetaValue, sourceOfTruth,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
-import { countTasksByStatus, listTasksNeedingReview, listOrphans } from './tasks-db.js';
+import { countTasksByStatus, listTasksNeedingReview, listOrphans, listFacilities } from './tasks-db.js';
 import { OPEN_STATUSES } from './tasks.js';
-import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
+import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, buildFacilityView, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
 import { batchTransitionNeedsStaff } from './batches.js';
+import { bumpWindow } from './rate-window.js';
 import { setTaskBlock, clearTaskBlock, undoTaskBlock, blockedOf } from './tasks-db.js';
 import { notifyStaff, materialsShortageText } from './notify.js';
 import { enqueuePrintJob, leaseNextJob, markSubmitted, markFinished, getJobStatusFor, recordHeartbeat, listPrintAgents, latestJobsByTask, listPrintJobs, publicJob, MAX_COPIES, LEASE_SEC } from './print-queue.js';
@@ -207,6 +209,9 @@ function checkOrigin(req, res, next) {
 function access(req, res, next) {
   if (req.path === '/manifest.json' || req.path === '/sw.js') return next();   // 静的 (中身に秘密なし)
   if (req.path === '/enroll' || req.path === '/enroll/redeem') return next();
+  // ⭐外部施設の専用 URL (要件 §AB-11 の 6)。ログインも端末登録もせず、**URL のトークンだけ**で入る。
+  //   中身は router.use('/f', ...) がトークンを確かめてから決める (ここは素通しするだけ)
+  if (req.path === '/f' || req.path.startsWith('/f/')) return next();
   // 🏷 印刷係 (いろはPC) は Cookie ではなく Authorization ヘッダーで名乗る。/print/ 配下はここでは素通しし、
   //   router.use('/print', requirePrintAgent) が kind='agent' の端末だけを通す (iPad の端末Cookieでは絶対に印刷ジョブを取れない)
   if (req.path === '/print' || req.path.startsWith('/print/')) return next();
@@ -2139,6 +2144,123 @@ router.get('/admin/sessions/search.csv', requireAdmin, api((req, res) => {
 }));
 
 // ─── 管理画面 ───
+// ─── 外部施設の専用 URL (読むだけ。要件 §AB-11 の 6) ───
+
+/**
+ * ⭐この配下は**ログインも端末登録もいらない**。URL に入っているトークンだけが鍵なので、
+ *   ここでの約束を厳しくする:
+ *   - 検索よけ (noindex) と **リファラを送らない** (URL が他所のログに残らないように)
+ *   - キャッシュさせない (共用 PC のブラウザに中身が残らないように)
+ *   - **書き込みの口を作らない** (GET だけ。返却の確定はいろは側 — 要件 §AB-7)
+ *   - 中身はその施設に預けたぶんだけ・個人情報なし (buildFacilityView)
+ */
+/**
+ * ⭐ログインのいらない口に、**回数の上限**を置く (Codex R2 中2)。
+ * 同じ Node のプロセスで社内の画面も動いているので、外から繰り返し叩かれて中の作業を遅らせない。
+ *
+ * 🚨**数える相手を、外から自由に作れるものにしない** (Codex R3 重大1)。
+ *   最初はトークンそのものを鍵にしていたが、それだと**でたらめなトークンを毎回変えるだけで**
+ *   記録が無限に増え、掃除のために毎回全部を見にいく = レート制限そのものが攻撃の口になっていた。
+ *   いまは:
+ *     ① まずトークンを確かめる (索引つきの 1 回の読み取り。当たらなければ何も覚えない)
+ *     ② 当たったものだけ**リンクの id** で数える (発行した本数ぶんしか増えない)
+ *     ③ 接続元でも数える。こちらは**入る数に上限**を置く。あふれたときは**期限切れのものだけ**捨て、
+ *        まだ生きている記録は捨てずに断る (429)。
+ *        ⚠生きている記録を追い出すと、**わざと別の接続元をたくさん作って自分の記録を消し、
+ *          数え直させる**ことができてしまう (Codex R4 中1)。あふれるほど来ている時点で異常なので、
+ *          新しい接続元を断る側に倒す
+ */
+const FL_WINDOW_MS = 60_000;
+const FL_MAX_PER_WINDOW = 60;      // 1 分に 60 回 (人が見るぶんには十分。画面は 1 回開くと 2 回)
+const FL_IP_MAX_PER_WINDOW = 120;  // 接続元ごと (社内から数人が同時に見ることもある)
+const FL_IP_MAX_KEYS = 2000;       // 覚える接続元の上限。あふれたら古いものから捨てる
+const flHits = new Map();          // リンク id → { count, until }
+const flIpHits = new Map();        // 接続元 → { count, until }
+
+const bump = (map, key, max, cap) => bumpWindow(map, key, max, cap, FL_WINDOW_MS);
+/**
+ * 接続元。⭐**X-Forwarded-For を自分で読まない**。
+ *
+ * あの並びの**先頭は送り手が好きに書ける**ので、毎回ちがう値を入れるだけで
+ * 「接続元ごとの上限」を素通りできてしまう (重大1 と同じ「外から自由に作れるものを鍵にする」誤り)。
+ * server.js が `trust proxy` を設定しているので、**req.ip が信用してよい値**を返す
+ * (Cloudflare Tunnel の 1 段だけを信じ、その手前の詐称は捨てる)。
+ */
+function clientKeyOf(req) {
+  return String(req.ip || (req.socket && req.socket.remoteAddress) || '?').slice(0, 64);
+}
+
+function facilityLinkGate(req, res, next) {
+  res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('Cache-Control', 'no-store');
+  // ① まずトークンを確かめる (索引つきの 1 回の読み取り)。⭐当たらなければ**何も覚えない**
+  // ⭐HEAD (リンク検査・先読み) では「見に来た日時」を書かない (Codex R1 軽微6)
+  const link = verifyFacilityLink(req.params.token, { touch: req.method === 'GET' });
+  const tooMany = () => {
+    res.set('Retry-After', '60');
+    return res.status(429).json({ ok: false, error: 'too_many', message: '少し時間をおいてから開いてください' });
+  };
+  if (link) {
+    // ② 当たったものは**リンクの id だけ**で数える (発行した本数ぶんしか増えないので、上限も追い出しも要らない)。
+    //    ⭐接続元の上限は見ない — そちらは満杯のとき断る作りなので、外から大量の接続元を作られると
+    //      **正しい URL を持っている施設まで締め出せて**しまう (自己レビュー)
+    if (!bump(flHits, link.id, FL_MAX_PER_WINDOW, 0)) return tooMany();
+  } else if (!bump(flIpHits, clientKeyOf(req), FL_IP_MAX_PER_WINDOW, FL_IP_MAX_KEYS)) {
+    // ③ 当たらなかったものだけ、接続元で数える (URL を探して叩き続ける相手を頭打ちにする)
+    return tooMany();
+  }
+  if (!link) {
+    // ⭐当たらなかった理由 (無い / 失効した / 期限切れ) を分けて教えない (総当たりの手がかりにしない)
+    res.status(404);
+    return res.type('html').send('<!doctype html><meta charset="utf-8"><meta name="robots" content="noindex">'
+      + '<title>見られません</title><body style="font-family:system-ui;padding:24px;line-height:1.8">'
+      + '<h1 style="font-size:1.2rem">この URL は見られません</h1>'
+      + '<p>期限が切れているか、使えなくなっています。いろは にお問い合わせください。</p></body>');
+  }
+  req.iwFacilityLink = link;
+  next();
+}
+
+// ⭐**専用のルーターに閉じ込める** (Codex R1)。access() で /f/ を素通しにしているので、
+//   ここで受けなかったパス・メソッドが**この先のルートへ流れないように**必ず終わらせる。
+//   (あとから誰かが受け皿のようなルートを足しても、認証なしでそこへ届かない)
+const facilityRouter = Router();
+facilityRouter.get('/:token', facilityLinkGate, (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'facility.html'));
+});
+facilityRouter.get('/:token/api/view', facilityLinkGate, api((req, res) => {
+  const view = buildFacilityView(req.iwFacilityLink.facility_code);
+  if (!view) return res.status(404).json({ ok: false, error: 'not_found', message: 'この拠点は見られません' });
+  res.json({ ok: true, ...view });
+}));
+facilityRouter.all(/.*/, (req, res) => {
+  res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  res.set('Cache-Control', 'no-store');
+  // 読むだけの窓口なので、書き込みも知らない道も同じ「ありません」で終わらせる
+  res.status(404).json({ ok: false, error: 'not_found', message: 'ありません' });
+});
+router.use('/f', facilityRouter);
+
+// ─── 施設リンクの発行・失効 (管理者だけ) ───
+
+router.post('/admin/facility-links', checkOrigin, requireAdmin, api((req, res) => {
+  try {
+    // ⭐平文のトークンを返すのはこの 1 回だけ (DB にはハッシュしか残らない)
+    const r = createFacilityLink(req.body?.facility_code, req.body?.label, req.session.email,
+      { expiresAt: req.body?.expires_at || null });
+    res.json({ ok: true, id: r.id, url: `${BASE}/f/${r.token}` });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: 'bad_request', message: e.message });
+  }
+}));
+router.post('/admin/facility-links/:id(\\d+)/revoke', checkOrigin, requireAdmin, api((req, res) => {
+  if (!revokeFacilityLink(Number(req.params.id))) {
+    return res.status(404).json({ ok: false, error: 'not_found', message: 'そのリンクは見つかりません (もう失効しています)' });
+  }
+  res.json({ ok: true });
+}));
+
 router.get('/admin', requireSession, api((req, res) => {
   res.render(path.join(__dirname, 'views/admin'), {
     title: 'いろは在庫化 作業アプリ 管理',
@@ -2157,6 +2279,8 @@ router.get('/admin', requireSession, api((req, res) => {
     printAgents: listPrintAgents(),
     printJobs: listPrintJobs(30).map(j => ({ ...publicJob(j), device_label: j.device_label })),
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
+    facilityLinks: isAdmin(req) ? listFacilityLinks(true) : [],
+    externalFacilities: listFacilities().filter((f) => f.external),
     events: listEvents(50),
     sessions: listSessionsForAdmin(50),
     media: listMediaForAdmin(50),

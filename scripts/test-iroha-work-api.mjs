@@ -45,8 +45,14 @@ setMetaValue('source_of_truth', 'app');
 // role はテストの途中で切り替える — CSV は管理者だけなので、両方の立場で確かめる
 let sessionRole = 'admin';
 const app = express();
+// 本番と同じ (server.js は Cloudflare Tunnel の 1 段だけを信じる)。
+// これが無いと req.ip が socket のアドレスになり、接続元ごとの上限を試せない
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use((req, _res, next) => {
+  // ⭐sessionRole = null は「ログインしていない人」。セッションを入れない
+  //   (入れてしまうと、ログイン不要の口を試したつもりが管理者として通っている — Codex R5 中2)
+  if (sessionRole === null) { req.session = {}; return next(); }
   req.session = { authenticated: true, email: 'test@b-faith.biz', displayName: 'テスト', allowedApps: '*', role: sessionRole };
   next();
 });
@@ -266,6 +272,229 @@ console.log('\n[7] CSV — 欠けたものを渡さない / Excel の数式に�
   // CSV を出したことは操作履歴に残す (誰がいつ何件持ち出したか)
   const logged = getDB().prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE action = 'sessions_csv'").get().c;
   ok(logged >= 1, 'CSV の書き出しが操作履歴に残る');
+}
+
+// ─── 外部施設の専用 URL (HTTP で通す。§AB-11 の 6) ───
+{
+  console.log('\n[F] 外部施設の専用 URL');
+  const D = await import('../apps/iroha-work/db.js');
+  const CG = await import('../apps/iroha-work/consign.js');
+  const B2 = await import('../apps/iroha-work/batches.js');
+  const TD2 = await import('../apps/iroha-work/tasks-db.js');
+
+  // 発行は管理者だけ
+  sessionRole = 'user';
+  const denied = await post('/admin/facility-links', { facility_code: 'workcenter', label: 'だめ' });
+  ok(denied.status === 403, '⭐管理者でなければ発行できない');
+  sessionRole = 'admin';
+  const made = await post('/admin/facility-links', { facility_code: 'workcenter', label: 'ワークセンター 事務所' });
+  ok(made.status === 200 && /^\/apps\/iroha-work\/f\//.test(made.json.url), '管理者は発行できる');
+  const token = made.json.url.split('/f/')[1];
+
+  // ⭐ログインも端末登録もなしで開ける (Host だけ付けて素の GET)
+  const raw = await fetch(`http://${HOST}${made.json.url}`, { headers: { Host: HOST } });
+  const html = await raw.text();
+  ok(raw.status === 200 && /おあずかりしている商品/.test(html), '⭐URL だけで画面が開く');
+  ok((raw.headers.get('x-robots-tag') || '').includes('noindex'), '⭐検索よけのヘッダーが付く');
+  ok((raw.headers.get('cache-control') || '').includes('no-store'), '⭐キャッシュさせない');
+  ok((raw.headers.get('referrer-policy') || '') === 'no-referrer', '⭐リファラを送らない');
+
+  // 中身 (その施設のぶんだけ)
+  const t = upsertTaskFromImport({ notion_page_id: 'flapi-1', status: 'not_started', facility_code: 'iroha',
+    destination_id: 8801, product_name: '専用URL の商品', qty: 400 }, { batchId: 'flapi' }).id;
+  const b0 = B2.listBatchesOfTask(getDB(), t)[0];
+  const cg = CG.startConsignment({ taskId: t, batchId: b0.id, facilityCode: 'workcenter', qty: 400,
+    expectVersion: TD2.getTask(t).version });
+  CG.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version });
+  const api = await fetch(`http://${HOST}${made.json.url}/api/view`, { headers: { Host: HOST } });
+  const view = await api.json();
+  ok(api.status === 200 && view.ok && view.facility.code === 'workcenter', '⭐中身も URL だけで読める');
+  ok(view.items.some((x) => x.product_name === '専用URL の商品' && x.handed_qty === 400), '預けたぶんが出る');
+
+  // ⭐書き込みは受け付けない
+  const wr = await fetch(`http://${HOST}${made.json.url}/api/view`, {
+    method: 'POST', headers: { Host: HOST, Origin: `http://${HOST}`, 'Content-Type': 'application/json' }, body: '{}' });
+  ok(wr.status === 404 || wr.status === 405, '⭐POST は受け付けない (見るだけ)');
+
+  // ⭐**ログインしていない人**として確かめる (ここまではテスト用の middleware が管理者セッションを
+  //   入れていたので、「URL だけで開く」ことを本当には試せていなかった — Codex R5 中2)
+  {
+    sessionRole = null;
+    const anon = await fetch(`http://${HOST}${made.json.url}`, { headers: { Host: HOST } });
+    const anonHtml = await anon.text();
+    ok(anon.status === 200 && /おあずかりしている商品/.test(anonHtml),
+      '⭐ログインしていなくても、専用 URL は開ける');
+    const anonApi = await fetch(`http://${HOST}${made.json.url}/api/view`, { headers: { Host: HOST } });
+    ok(anonApi.status === 200 && (await anonApi.json()).ok, '⭐中身も読める');
+    // ⭐同じ「ログインしていない」状態で、社内の口は閉じている
+    const inner = await fetch(`http://${HOST}/apps/iroha-work/api/state`, { headers: { Host: HOST } });
+    ok(inner.status === 401, '⭐社内の一覧はログインしていないと 401');
+    const issue = await fetch(`http://${HOST}/apps/iroha-work/admin/facility-links`, {
+      method: 'POST', headers: { Host: HOST, Origin: `http://${HOST}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ facility_code: 'workcenter', label: 'だめ' }), redirect: 'manual' });
+    ok(issue.status >= 300 && issue.status !== 200, '⭐URL の発行はログインしていないとできない (' + issue.status + ')');
+    const revoke = await fetch(`http://${HOST}/apps/iroha-work/admin/facility-links/1/revoke`, {
+      method: 'POST', headers: { Host: HOST, Origin: `http://${HOST}` }, redirect: 'manual' });
+    ok(revoke.status >= 300 && revoke.status !== 200, '⭐失効もできない (' + revoke.status + ')');
+    const board = await fetch(`http://${HOST}/apps/iroha-work/admin`, { headers: { Host: HOST }, redirect: 'manual' });
+    ok(board.status >= 300 && board.status !== 200, '⭐管理画面も開けない (' + board.status + ')');
+    sessionRole = 'admin';
+  }
+
+  // ⭐/f/ の下は、受けなかったパス・メソッドがこの先へ流れない (Codex R1)
+  for (const [method, p] of [
+    ['POST', made.json.url], ['PUT', made.json.url], ['DELETE', made.json.url], ['PATCH', made.json.url],
+    ['GET', made.json.url + '/api'],
+    // ⭐パスをエンコードして .. を潜ませても、作業アプリ側へは届かない (fetch は生の ../ を送る前に正規化するので、エンコードで試す)
+    ['GET', made.json.url + '/%2e%2e%2f%2e%2e%2fapi/state'],
+    ['GET', '/apps/iroha-work/f'], ['GET', '/apps/iroha-work/f/'],
+    ['POST', '/apps/iroha-work/f/' + token + '/api/view'],
+  ]) {
+    const r = await fetch(`http://${HOST}${p}`, { method, headers: { Host: HOST, Origin: `http://${HOST}` },
+      redirect: 'manual' });
+    const body = await r.text();
+    ok(r.status >= 400 && r.status < 500, `⭐${method} ${p} は 4xx で終わる (通り抜けない)`);
+    ok(!/"capabilities"|"cards"|hold_memo/.test(body), `⭐${method} ${p} で作業アプリの中身が漏れない`);
+  }
+  // HEAD では「見た日時」を書かない (書くのは人が開いた GET だけ)
+  {
+    const l0 = D.listFacilityLinks(true).find((l) => l.label === 'ワークセンター 事務所');
+    getDB().prepare('UPDATE f_iroha_facility_links SET last_seen_at = NULL WHERE id = ?').run(l0.id);
+    await fetch(`http://${HOST}${made.json.url}`, { method: 'HEAD', headers: { Host: HOST } });
+    const after = D.listFacilityLinks(true).find((l) => l.id === l0.id);
+    ok(after.last_seen_at == null, '⭐HEAD では「見た日時」を書かない');
+    await fetch(`http://${HOST}${made.json.url}`, { headers: { Host: HOST } });
+    ok(D.listFacilityLinks(true).find((l) => l.id === l0.id).last_seen_at != null, 'GET なら書く');
+  }
+
+  // ⭐繰り返し叩かれても、社内の画面まで巻き込まれない (Codex R2 中2)
+  {
+    const fresh = await post('/admin/facility-links', { facility_code: 'workcenter', label: '回数の上限テスト' });
+    let limited = 0;
+    let served = 0;
+    for (let i = 0; i < 80; i++) {
+      const r = await fetch(`http://${HOST}${fresh.json.url}/api/view`, { headers: { Host: HOST } });
+      if (r.status === 429) limited++; else if (r.status === 200) served++;
+    }
+    ok(served >= 30 && limited > 0, '⭐ふつうに見るぶんは通り、叩きすぎると 429 で断る (' + served + ' 回通過 / ' + limited + ' 回拒否)');
+    // ⭐社内の画面は止まらない
+    ok((await get('/api/state')).status === 200, '⭐外から叩かれている間も、社内の一覧はふつうに開ける');
+    // 別のトークンは巻き添えにしない (接続元の上限は別枠なので、IP を変えて確かめる)
+    const other = await post('/admin/facility-links', { facility_code: 'rashinban', label: '別のリンク' });
+    ok((await fetch(`http://${HOST}${other.json.url}/api/view`,
+      { headers: { Host: HOST, 'X-Forwarded-For': '10.0.0.9' } })).status === 200,
+      '⭐別の施設のリンクは巻き添えにしない (リンクごとに数える)');
+  }
+
+  // ⭐でたらめなトークンを毎回変えて送られても、内側が重くならない (Codex R3 重大1)
+  {
+    const t0 = Date.now();
+    let ok404 = 0;
+    let blocked = 0;
+    for (let i = 0; i < 300; i++) {
+      // 毎回ちがうトークン = 記録を無限に増やす狙いの叩き方
+      const r = await fetch(`http://${HOST}/apps/iroha-work/f/${'a'.repeat(30)}${i}`,
+        { headers: { Host: HOST, 'X-Forwarded-For': '203.0.113.' + (i % 250) } });
+      if (r.status === 404) ok404++; else if (r.status === 429) blocked++;
+    }
+    const ms = Date.now() - t0;
+    ok(ok404 + blocked === 300, '⭐でたらめなトークンは 404 か 429 で終わる (' + ok404 + ' / ' + blocked + ')');
+    // ⭐内側の画面がふつうに開ける (叩かれても巻き込まれない)
+    const t1 = Date.now();
+    const inner = await get('/api/state');
+    ok(inner.status === 200 && Date.now() - t1 < 3000,
+      '⭐外から叩かれている間も、社内の一覧がすぐ開く (' + (Date.now() - t1) + 'ms)');
+    ok(ms < 20000, '300 回の無効アクセス自体も現実的な時間で終わる (' + ms + 'ms)');
+    // ⭐同じ接続元から繰り返せば、そこで頭打ちになる
+    let ipBlocked = 0;
+    for (let i = 0; i < 200; i++) {
+      const r = await fetch(`http://${HOST}/apps/iroha-work/f/${'b'.repeat(30)}${i}`,
+        { headers: { Host: HOST, 'X-Forwarded-For': '198.51.100.7' } });
+      if (r.status === 429) ipBlocked++;
+    }
+    ok(ipBlocked > 0, '⭐同じ接続元から叩き続けると 429 で断る (' + ipBlocked + ' 回)');
+
+    // ⭐送り手が X-Forwarded-For の**先頭**を書き換えても、接続元ごとの上限をすり抜けられない。
+    //   先頭は誰でも好きに書けるので、そこを鍵にすると「毎回ちがう値」で素通りできてしまう
+    //   (重大1 と同じ「外から自由に作れるものを鍵にする」誤り)
+    let spoofBlocked = 0;
+    for (let i = 0; i < 200; i++) {
+      const r = await fetch(`http://${HOST}/apps/iroha-work/f/${'c'.repeat(30)}${i}`, {
+        headers: { Host: HOST, 'X-Forwarded-For': '9.9.9.' + i + ', 198.51.100.42' } });
+      if (r.status === 429) spoofBlocked++;
+    }
+    ok(spoofBlocked > 0, '⭐X-Forwarded-For の先頭を毎回変えても、上限をすり抜けられない (' + spoofBlocked + ' 回で断った)');
+
+    // ⭐叩かれている**最中**でも社内の画面が開く (終わったあとの計測では分からない — Codex R4)
+    {
+      let worst = 0;
+      const attack = (async () => {
+        for (let i = 0; i < 400; i++) {
+          await fetch(`http://${HOST}/apps/iroha-work/f/${'d'.repeat(30)}${i}`,
+            { headers: { Host: HOST, 'X-Forwarded-For': '192.0.2.' + (i % 200) } }).catch(() => {});
+        }
+      })();
+      for (let i = 0; i < 10; i++) {
+        const t = Date.now();
+        const r = await get('/api/state');
+        worst = Math.max(worst, Date.now() - t);
+        ok(r.status === 200, '⭐叩かれている最中でも社内の一覧が開く (' + (i + 1) + '回目)');
+      }
+      await attack;
+      ok(worst < 3000, '⭐叩かれている最中でも社内の一覧が待たされない (いちばん遅くて ' + worst + 'ms)');
+    }
+
+    // ⭐たくさんの接続元で記録をあふれさせても、いったん断った相手が数え直せない (Codex R4 中1)
+    {
+      const victim = '198.51.100.99';
+      let blockedOnce = false;
+      for (let i = 0; i < 200 && !blockedOnce; i++) {
+        const r = await fetch(`http://${HOST}/apps/iroha-work/f/${'e'.repeat(30)}${i}`,
+          { headers: { Host: HOST, 'X-Forwarded-For': victim } });
+        if (r.status === 429) blockedOnce = true;
+      }
+      ok(blockedOnce, '前提: この接続元はいったん断られた');
+      // 別の接続元を大量に作って、記録を押し出そうとする
+      for (let i = 0; i < 300; i++) {
+        await fetch(`http://${HOST}/apps/iroha-work/f/${'f'.repeat(30)}${i}`,
+          { headers: { Host: HOST, 'X-Forwarded-For': '203.0.114.' + (i % 250) } }).catch(() => {});
+      }
+      const again = await fetch(`http://${HOST}/apps/iroha-work/f/${'g'.repeat(30)}`,
+        { headers: { Host: HOST, 'X-Forwarded-For': victim } });
+      ok(again.status === 429,
+        '⭐別の接続元をたくさん作っても、断られた記録は消せない (生きている記録は追い出さない)');
+    }
+
+    // ⭐たくさんの接続元で埋められても、**正しい URL を持っている施設は締め出されない** (自己レビュー)。
+    //   接続元の上限は「満杯なら断る」作りなので、正しいトークンにまで掛けると
+    //   外から接続元を大量に作るだけで先方を締め出せてしまう
+    {
+      const good = await post('/admin/facility-links', { facility_code: 'workcenter', label: '締め出されないこと' });
+      for (let i = 0; i < 400; i++) {
+        await fetch(`http://${HOST}/apps/iroha-work/f/${'h'.repeat(30)}${i}`,
+          { headers: { Host: HOST, 'X-Forwarded-For': '203.0.115.' + (i % 250) } }).catch(() => {});
+      }
+      // 同じ (埋めるのに使った) 接続元から、正しい URL で開く
+      const r = await fetch(`http://${HOST}${good.json.url}/api/view`,
+        { headers: { Host: HOST, 'X-Forwarded-For': '203.0.115.7' } });
+      ok(r.status === 200, '⭐接続元が埋まっていても、正しい URL なら開ける (先方を巻き添えにしない)');
+    }
+  }
+
+  // でたらめ・失効したトークン
+  const bad = await fetch(`http://${HOST}/apps/iroha-work/f/${'x'.repeat(43)}`, { headers: { Host: HOST } });
+  ok(bad.status === 404, 'でたらめなトークンは 404');
+  const badBody = await bad.text();
+  ok(!/おあずかりしている商品/.test(badBody) && /見られません/.test(badBody), '⭐理由は分けて教えない (総当たりの手がかりにしない)');
+  const links = D.listFacilityLinks(true);
+  const mine = links.find((l) => l.label === 'ワークセンター 事務所');
+  const rev = await post('/admin/facility-links/' + mine.id + '/revoke');
+  ok(rev.status === 200, '失効させられる');
+  ok((await fetch(`http://${HOST}${made.json.url}`, { headers: { Host: HOST } })).status === 404,
+    '⭐失効させたら開けない');
+  sessionRole = 'user';
+  ok((await post('/admin/facility-links/' + mine.id + '/revoke')).status === 403, '⭐失効も管理者だけ');
+  sessionRole = 'admin';
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
