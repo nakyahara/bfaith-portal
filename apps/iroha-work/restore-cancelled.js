@@ -63,28 +63,35 @@ export function surveyCancelled({ from, to }, db = getDB()) {
  * 調べたあとに別の取消が起きていたら、黙って巻き込まずに断る。
  */
 export function restoreCancelled({ from, to, expectTasks, expectDestinations, actor = 'restore' }, db = getDB()) {
-  const s = surveyCancelled({ from, to }, db);
-  if (!s.ok) return s;
-  if (Number(expectTasks) !== s.tasks || Number(expectDestinations) !== s.destinations) {
-    return { ok: false, error: 'count_mismatch',
-      message: `件数が変わりました (カード ${s.tasks} 件・行き先 ${s.destinations} 件)。もう一度調べ直してください`,
-      survey: s };
-  }
+  const pre = normWindow(from, to);
+  if (pre.error) return pre;
   const now = utcNow();
+  // ⭐**調べ直しも件数の照合も、書き込みと同じトランザクションの中で**やる。
+  //   外で数えると、その直後に別の端末が同じ行を (窓の外の理由で) 取り消したとき、
+  //   その取消まで戻してしまう (Codex 指摘)
   const done = db.transaction(() => {
+    const s = surveyCancelled({ from, to }, db);
+    if (!s.ok) return { mismatch: s };
+    if (Number(expectTasks) !== s.tasks || Number(expectDestinations) !== s.destinations) {
+      return { mismatch: { ok: false, error: 'count_mismatch',
+        message: `件数が変わりました (カード ${s.tasks} 件・行き先 ${s.destinations} 件)。もう一度調べ直してください`,
+        survey: s } };
+    }
     let dests = 0;
     if (s.destination_ids.length && hasTable(db, 'f_inbound_check_destinations')) {
       const up = db.prepare(`UPDATE f_inbound_check_destinations
         SET cancelled_at = NULL, cancelled_by = NULL, cancel_reason = NULL
-        WHERE id = ? AND cancelled_at IS NOT NULL AND cancelled_by = 'import'`);
-      for (const id of s.destination_ids) dests += up.run(id).changes;
+        WHERE id = ? AND cancelled_at IS NOT NULL AND cancelled_by = 'import'
+          AND cancelled_at >= ? AND cancelled_at <= ?`);   // ⭐窓の中であることを書き込みの条件にも入れる
+      for (const id of s.destination_ids) dests += up.run(id, s.from, s.to).changes;
     }
     // ⭐カードは 1 枚ずつ、**取消のままのものだけ**戻す (途中で誰かが触っていたら数えない)
     const upTask = db.prepare(`UPDATE f_iroha_tasks
       SET status = 'not_started', close_reason = NULL, closed_at = NULL, closed_by = NULL,
           cancellation_requested_at = NULL, cancellation_source = NULL,
           version = version + 1, updated_at = ?, updated_by = ?
-      WHERE id = ? AND status = 'closed' AND close_reason = 'cancelled' AND cancellation_source = 'inbound_import'`);
+      WHERE id = ? AND status = 'closed' AND close_reason = 'cancelled' AND cancellation_source = 'inbound_import'
+        AND closed_at >= ? AND closed_at <= ?`);   // ⭐窓の中であることを書き込みの条件にも入れる (二重の守り)
     // まとまりも戻す。⭐**そのカードのまとまりが 1 つで、取消になっているとき**だけ
     //   (2 つ以上に分かれていたカードは自動取消の対象外 = 実績があるので、ここには来ない)
     const upBatch = db.prepare(`UPDATE f_iroha_task_batches
@@ -94,16 +101,57 @@ export function restoreCancelled({ from, to, expectTasks, expectDestinations, ac
     let tasks = 0;
     let batches = 0;
     for (const id of s.task_ids) {
-      if (upTask.run(now, actor, id).changes !== 1) continue;   // もう誰かが触っている
+      if (upTask.run(now, actor, id, s.from, s.to).changes !== 1) continue;   // もう誰かが触っている・窓の外になった
       tasks += 1;
       batches += upBatch.run(now, id).changes;
       // ⭐1 件ずつ証跡を残す。あとから「何を戻したか」を追えるように
       safeLogTaskEvent({ taskId: id, action: 'task_status', workerName: actor,
         from: 'closed:cancelled (auto)', to: 'not_started (空CSV事故の復旧)', ok: true });
     }
-    return { tasks, batches, dests };
+    return { tasks, batches, dests, from: s.from, to: s.to, surveyed: { tasks: s.tasks, destinations: s.destinations } };
   }).immediate();
-  return { ok: true, from: s.from, to: s.to, restored: done, surveyed: { tasks: s.tasks, destinations: s.destinations } };
+  if (done.mismatch) return done.mismatch;
+  return { ok: true, from: done.from, to: done.to,
+    restored: { tasks: done.tasks, batches: done.batches, dests: done.dests }, surveyed: done.surveyed };
+}
+
+/**
+ * 🚨 起動のときに **一度だけ** 戻す (2026-09-08 の事故)。
+ *
+ * 現場が止まっていて、管理画面を押せる人がすぐ動けないため、デプロイで直るようにする。
+ *
+ * ⭐窓の始まり = **空のCSVが Drive に上がった時刻** (2026/09/08 00:20 JST = 2026-09-07T15:20Z)。
+ *   そのあとに「取込が取り消した」ものは、この空CSV以外に原因が無い
+ *   (良いCSVを作る定期実行はこの事故で止めてあり、以後 1 度も走っていない)。
+ * ⭐終わり = いま。窓を固定しないのは、Render が空CSVをいつ取り込んだかが分からないため。
+ * ⭐**印を付けて二度は走らせない**。人が意図して取り消したものを、次の再起動で勝手に戻さない。
+ * ⭐戻すものが無ければ何もしない (印だけ付ける)。
+ */
+const RESTORE_FLAG = 'restore_20260908_empty_csv';
+const EMPTY_CSV_AT = '2026-09-07T15:20:00.000Z';   // 空CSVが上がった時刻 (JST 9/8 00:20)
+
+export function runIncidentRestoreOnce(db = getDB(), { getMeta, setMetaValue }) {
+  try {
+    if (getMeta(RESTORE_FLAG)) return { ok: true, skipped: 'すでに実行ずみ' };
+    const to = utcNow();
+    const s = surveyCancelled({ from: EMPTY_CSV_AT, to }, db);
+    if (!s.ok) { console.error('[iroha-work] 復旧を調べられませんでした:', s.message); return s; }
+    if (s.tasks === 0 && s.destinations === 0) {
+      setMetaValue(RESTORE_FLAG, JSON.stringify({ at: to, restored: { tasks: 0, destinations: 0 }, note: '戻すものなし' }));
+      return { ok: true, skipped: '戻すものがありません' };
+    }
+    const r = restoreCancelled({ from: EMPTY_CSV_AT, to,
+      expectTasks: s.tasks, expectDestinations: s.destinations, actor: '空CSV事故の自動復旧' }, db);
+    if (!r.ok) { console.error('[iroha-work] 復旧できませんでした:', r.message); return r; }
+    setMetaValue(RESTORE_FLAG, JSON.stringify({ at: to, restored: r.restored }));
+    console.log('[iroha-work] 🚨2026-09-08 の空CSV事故を復旧しました: カード ' + r.restored.tasks
+      + ' 件・まとまり ' + r.restored.batches + ' 件・行き先 ' + r.restored.dests + ' 件');
+    return r;
+  } catch (e) {
+    // ⭐復旧でこけても**起動は止めない**。止めるとアプリごと使えなくなる (管理画面から手で戻せる)
+    console.error('[iroha-work] 復旧の途中で例外 (起動は続けます):', e.message);
+    return { ok: false, error: 'exception', message: e.message };
+  }
 }
 
 /** 窓の検査。⭐**必ず両端を要求する** — 開けっぱなしで全期間を戻さない */
