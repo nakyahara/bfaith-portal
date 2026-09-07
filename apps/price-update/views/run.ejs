@@ -101,8 +101,10 @@
     blocked: 'ガードで停止', skipped: '送っていない',
   };
   var CONF_LABEL = { confirmed: '確定', rule: '規則推定', sales: '実績のみ', unresolved: '未解決' };
-  // ★モール名は画面のどこでも日本語で揃える (表だけ英語のままだと別物に見える)
-  var MALL_LABEL = { rakuten: '楽天', yahoo: 'Yahoo', amazon: 'Amazon', aupay: 'au PAY', qoo10: 'Qoo10' };
+  // ★モール名は画面のどこでも日本語で揃える (表だけ英語のままだと別物に見える)。
+  //   正本は mall-capabilities.js。ここに写すとモールを足した時に直し忘れる
+  //   (2026-09-07: LINEギフトの行が生の `linegift` のまま出ていた)
+  var MALL_LABEL = mallLabels;
   // ★href に入れてよいのは http(s) だけ (javascript: を踏ませない)
   var safeUrl = function (u) {
     var v = String(u == null ? '' : u).trim();
@@ -341,7 +343,7 @@
   });
 
   // ── 実行 ─────────────────────────────────────────────
-  const MALL_LABEL = { rakuten: '楽天', yahoo: 'Yahoo', amazon: 'Amazon', aupay: 'au PAY', qoo10: 'Qoo10' };
+  const MALL_LABEL = <%- JSON.stringify(mallLabels) %>;   // 正本 = mall-capabilities.js
 
   async function loadExecutable() {
     let info;
@@ -371,7 +373,10 @@
       return;
     }
     if (!info.targets) {
-      $('exec-status').textContent = '送る行がありません (記録時のガードを通った行だけが対象です)。';
+      // ★理由まで出す。「送る行がありません」だけだと、送られたのか送られていないのかが分からない
+      //   (2026-09-07: LINEギフト1行だけの履歴で、現場は価格を変えたつもりになっていた)
+      $('exec-status').textContent = info.noTargetReason
+        || '送る行がありません (記録時のガードを通った行だけが対象です)。';
       return;
     }
     if (!info.canExecute) {

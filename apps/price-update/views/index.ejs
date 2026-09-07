@@ -105,6 +105,8 @@
   .sum { font-size: 13px; color: #334155; }
   .sum b { font-variant-numeric: tabular-nums; }
   .sum .s-stop { color: #b91c1c; }
+  /* 送れる行が0のまま記録しようとしている時の警告 (チェックの入れ忘れ) */
+  .sum-alert { margin-top: 4px; color: #b91c1c; font-weight: 600; }
   .hidden { display: none; }
 </style>
 <div class="topbar">
@@ -125,7 +127,8 @@
         <li><b>「この内容を記録する」</b> — 履歴ができます。送信はその履歴の画面から、確認欄に入力してはじめて実行されます。</li>
       </ol>
       <ul class="howto">
-        <li>Amazon はこのツールから更新しません (別ツールがあるため)。チェックリストとしてだけ記録します。</li>
+        <li><b>チェックを入れた行だけが記録されます。</b>売価を入れてもチェックが無いと記録されず、モールへも送られません。</li>
+        <li>Amazon・LINEギフトはこのツールから更新しません (Amazon=別ツール / LINEギフト=価格だけを変える API が無い)。チェックリストとしてだけ記録します。</li>
         <li>0円・小数・−30%超の値下げ・原価割れなどは、そもそも記録しても送れません (⛔ が付きます)。</li>
         <li>送ったあとに元へ戻したいときは、履歴の画面の「元の価格に戻す」から。</li>
       </ul>
@@ -186,7 +189,7 @@
   </div>
 
   <div class="card hidden" id="manual-card">
-    <h2><span class="step">4</span>Amazon は手で直す<span class="h2-sub">記録すると履歴画面でチェックを付けられます</span></h2>
+    <h2><span class="step">4</span><span id="manual-title">手で直すモール</span><span class="h2-sub">このツールからは送りません。記録すると履歴画面でチェックを付けられます</span></h2>
     <div style="overflow-x:auto;">
       <table class="pu" id="manual-table">
         <thead><tr><th>モール</th><th>商品</th><th>出品コード</th><th class="num">参考価格</th><th>メモ</th><th></th></tr></thead>
@@ -220,7 +223,9 @@
 </div>
 
 <script>
-  const MALL_LABEL = { rakuten: '楽天', yahoo: 'Yahoo', amazon: 'Amazon', aupay: 'au PAY', qoo10: 'Qoo10' };
+  // ★モール名の正本は mall-capabilities.js。ここに写すと、モールを足した時に直し忘れる
+  //   (2026-09-07: LINEギフトが履歴の表で生の `linegift` のまま出ていた)
+  const MALL_LABEL = <%- JSON.stringify(mallLabels) %>;
   const CONF_LABEL = { confirmed: '確定', rule: '規則推定', sales: '実績のみ', unresolved: '未解決' };
   // ★サーバ側 (pricing.js) が積むブロック理由の文言。ここだけ扱いを変えるので突き合わせている
   const EMPTY_PRICE_BLOCK = '新売価が未入力です';
@@ -237,6 +242,8 @@
   // (セットが初期状態で未選択なのは安全のためで、1操作で外してよいものではない)。
   // 売価がまだ空の行は入れる — これから入れる行を選べないと「すべて選ぶ」の意味が無い
   let selectableKeys = new Set();
+  /** 記録しても送れる行が0 (= 手動更新モールの行だけ)。記録の前に確認を出す */
+  let manualOnly = false;
   /** 売価が空なだけの行は「まだ対象でない」。それ以外の理由で止まっている行と区別する */
   const isSendable = (ev) => !!ev && ev.blocks.filter((b) => b !== EMPTY_PRICE_BLOCK).length === 0;
 
@@ -250,7 +257,12 @@
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
     const json = await res.json().catch(() => null);
-    if (!res.ok || !json || json.ok === false) throw new Error(json && json.error ? json.error : ('HTTP ' + res.status));
+    if (!res.ok || !json || json.ok === false) {
+      const err = new Error(json && json.error ? json.error : ('HTTP ' + res.status));
+      // サーバがどの断り方をしたか (文言ではなく印で見分ける)
+      err.reason = json && json.reason ? json.reason : null;
+      throw err;
+    }
     return json;
   }
 
@@ -463,17 +475,25 @@
       .map((r) => String(r.key)));
 
     // 「記録すると何行になるのか」を、記録API と同じ数え方で出す。
-    // ★Amazon の行は選ばなくても記録される (手動更新のチェックリストとして足される)
+    // ★手動更新モール (Amazon・LINEギフト) の行は選ばなくても記録される
+    //   = チェックを1つも入れていなくても「記録できてしまう」。だから送れる行が0なら赤で言う
+    //   (2026-09-07: LINEギフト1行だけの履歴ができ、現場は送ったつもりになっていた)
     const sel = updatable.filter((r) => r.selected);
-    const amazon = manual.filter((r) => r.confidence !== 'unresolved' && r.listingCode);
+    const manualRecorded = manual.filter((r) => r.confidence !== 'unresolved' && r.listingCode);
+    const manualNames = [...new Set(manualRecorded.map((r) => MALL_LABEL[r.mall] || r.mall))].join('・');
     const go = sel.filter((r) => r.evaluation && r.evaluation.canUpdate);
     const empty = sel.filter((r) => r.newPrice == null);
     const stop = sel.filter((r) => r.evaluation && !r.evaluation.canUpdate && r.newPrice != null);
-    $('sum').innerHTML = '記録すると <b>' + (sel.length + amazon.length) + '</b> 行'
-      + ' — 送れる <b>' + go.length + '</b>'
+    manualOnly = sel.length === 0 && manualRecorded.length > 0;
+    $('sum').innerHTML = '記録すると <b>' + (sel.length + manualRecorded.length) + '</b> 行'
+      + ' — 送れる <b' + (go.length === 0 ? ' class="s-stop"' : '') + '>' + go.length + '</b>'
       + (stop.length ? ' / <span class="s-stop">⛔ <b>' + stop.length + '</b></span>' : '')
       + (empty.length ? ' / <span class="dim">売価が未入力 ' + empty.length + '</span>' : '')
-      + (amazon.length ? ' / <span class="dim">Amazon 手動 ' + amazon.length + '</span>' : '');
+      + (manualRecorded.length ? ' / <span class="dim">手動更新 ' + manualRecorded.length
+         + (manualNames ? ' (' + esc(manualNames) + ')' : '') + '</span>' : '')
+      + (manualOnly ? '<div class="sum-alert">⚠ 送れる行がありません — 送りたい行の左端のチェックが入っていません'
+         + ' (このまま記録しても、モールへは何も送られません)</div>' : '');
+    if (manualNames) $('manual-title').textContent = manualNames + ' は手で直す';
 
     $('manual-table').querySelector('tbody').innerHTML = manual.map((r) => (
       '<tr>'
@@ -572,6 +592,36 @@
     }
   }
 
+  /** 「送れる行が0」のときに出す確認 (画面の判断でもサーバの断りでも同じ文言にする) */
+  function manualOnlyMessage() {
+    return [
+      '送れる行がありません。チェックを入れ忘れていませんか？',
+      '',
+      'このまま記録すると、手で直すモールのチェックリストができるだけで、モールへは価格が1件も送られません。',
+      '価格を送りたいときは「キャンセル」を押して、送りたい行の左端のチェックを入れてください。',
+      '',
+      'このまま記録しますか？',
+    ].join('\n');
+  }
+
+  /**
+   * 記録する。サーバ側にも「送れる行が0」の関所があるので、画面の判断とずれていた時
+   * (画面は送れるつもりだったのにサーバが止めた) は、そこで聞き直してから通す。
+   * ★聞き直す道が無いと、押しても同じ 400 が返るだけで先へ進めなくなる
+   */
+  async function postRun(forPreviewId, confirmed) {
+    const body = { previewId: forPreviewId, note: $('run-note').value, allowManualOnly: !!confirmed };
+    try {
+      return await api('/apps/price-update/api/runs', body);
+    } catch (e) {
+      if (e.reason !== 'manual_only' || confirmed) throw e;
+      if (!confirm(manualOnlyMessage())) {
+        throw new Error('記録していません。送りたい行の左端のチェックを入れてから、もう一度押してください');
+      }
+      return api('/apps/price-update/api/runs', { ...body, allowManualOnly: true });
+    }
+  }
+
   async function save() {
     if (!previewId || saving || resolving) return;
     // ★記録するプレビューをここで固定する。await の後に読むと、
@@ -585,7 +635,14 @@
     try {
       await flushPreview();   // 直前の入力を確実にサーバへ反映してから記録する
       if (savingPreviewId !== previewId) throw new Error('検索し直されました。表を確かめてからもう一度記録してください');
-      const r = await api('/apps/price-update/api/runs', { previewId: savingPreviewId, note: $('run-note').value });
+      // ★送れる行が0のまま記録しようとしていたら、ここで止めて聞く (2026-09-07)。
+      //   手動更新モールの行はチェック無しでも記録されるので、チェックを入れ忘れても
+      //   「記録できた」ように見えてしまい、履歴を開くまで送られていないことに気づけない。
+      //   確認は flushPreview のあと = 画面の最新のチェック状態で判断する
+      if (manualOnly && !confirm(manualOnlyMessage())) {
+        throw new Error('記録していません。送りたい行の左端のチェックを入れてから、もう一度押してください');
+      }
+      const r = await postRun(savingPreviewId, manualOnly);
       location.href = '/apps/price-update/runs/' + r.runId;
     } catch (e) {
       // 失敗した時だけ入力を戻す (成功時は画面遷移するまで止めたまま)

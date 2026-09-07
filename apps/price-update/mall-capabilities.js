@@ -70,6 +70,15 @@ export const MALL_CAPABILITIES = {
   },
 };
 
+/**
+ * モール名 (日本語)。**画面もサーバもここを使う**。
+ * ★2026-09-07: 同じ表を index.ejs / run.ejs に計4つ写していたため、LINEギフトを足した時に
+ *   全部が直し忘れになり、履歴の表に生の `linegift` が出ていた (中原さんが実物で確認)。
+ */
+export const MALL_LABELS = Object.fromEntries(
+  Object.entries(MALL_CAPABILITIES).map(([m, c]) => [m, c.label || m]),
+);
+
 /** 画面で新売価を入れられるモール */
 export const UPDATABLE_MALLS = Object.entries(MALL_CAPABILITIES)
   .filter(([, c]) => c.updatable).map(([m]) => m);
@@ -115,6 +124,10 @@ export function findCapabilityProblems() {
     }
     if (!c.updatable && !c.blockReason) {
       problems.push(`${mall}: 更新できない理由が書かれていません`);
+    }
+    // ★名前が無いと画面に生の英字 (linegift 等) が出る。現場は別のモールだと思う
+    if (!c.label) {
+      problems.push(`${mall}: 画面に出す日本語の名前 (label) がありません`);
     }
   }
   return problems;

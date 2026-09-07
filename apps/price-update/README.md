@@ -26,6 +26,7 @@ Amazon は対象外 (価格改定ツールが別にあるため、ここでは�
 - **不明は再送しない** — 応答が返ってこなかった行は「送られたか不明」として残し、自動では送り直さない
 - **Yahoo はセール価格が入っている商品を更新しない** — Yahoo の API は価格を送る時にセール価格も必ず送る決まりで、空を送ると消えてしまう。うちはセール価格を使っていないが、例外が来た時に気づけるように止める
 - **Yahoo は商品説明を触らない** — 価格更新には商品一括更新API を使う。商品登録API (editItem) は全項目上書きで、送らなかった説明文が消える (実測)
+- **送れる行が0の履歴を黙って作らせない** — 手動更新モール (Amazon・LINEギフト) の行はチェック無しでも記録されるため、行のチェックを入れ忘れると「記録はできたのにモールへ何も送られない履歴」ができる。記録の入口で確認を出し、履歴側では**なぜ送る行が無いのか**を必ず表示する (`record-guard.js`)
 - **復旧でも関所は外さない** — 免除されるのは変更率 (−30%〜+100%) だけ。値上げを戻すと必ず大きな値下げになるため。0円・原価割れ・出品未確定・楽観ロック・claim・試運転・照合はそのまま効く
 
 ## 環境変数
@@ -62,6 +63,7 @@ LINEギフトに kill switch はない。**書き込む口がそもそも無い*
 
 ```
 node apps/price-update/test-pricing.mjs
+node apps/price-update/test-record-guard.mjs
 node apps/price-update/test-resolve.mjs
 node apps/price-update/test-linegift-read.mjs
 node apps/price-update/test-views.mjs

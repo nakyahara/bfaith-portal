@@ -29,6 +29,8 @@ import { makeAupayClient } from './aupay-apply.js';
 import { makeQoo10Client } from './qoo10-apply.js';
 import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
 import { toJst, TO_JST_CLIENT_SRC } from './format.js';
+import { MALL_LABELS } from './mall-capabilities.js';
+import { summarizeRecord, noTargetReasonOf, MANUAL_ONLY_MESSAGE } from './record-guard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -90,13 +92,15 @@ function canExecute(req) {
 }
 
 function apiError(res, e, where) {
-  if (e?.code === 'VALIDATION') return res.status(400).json({ ok: false, error: e.message });
+  // ★reason = 画面が「どの断り方か」を機械的に見分けるための印 (文言の突き合わせをさせない)
+  if (e?.code === 'VALIDATION') return res.status(400).json({ ok: false, error: e.message, reason: e.reason || null });
   console.error(`[price-update] ${where}:`, e);
   return res.status(500).json({ ok: false, error: 'サーバーエラーが発生しました' });
 }
-function validationError(message) {
+function validationError(message, reason = null) {
   const e = new Error(message);
   e.code = 'VALIDATION';
+  e.reason = reason;
   return e;
 }
 
@@ -412,6 +416,7 @@ router.get('/', (req, res) => {
     limits: runLimits(),
     runs: listRuns(db, 20),
     toJst,
+    mallLabels: MALL_LABELS,
   });
 });
 
@@ -426,6 +431,7 @@ router.get('/runs/:runId', (req, res) => {
     run,
     toJst,
     toJstClientSrc: TO_JST_CLIENT_SRC,
+    mallLabels: MALL_LABELS,
   });
 });
 
@@ -517,10 +523,16 @@ router.post('/api/runs', (req, res) => {
     if (p.createdBy !== actorOf(req)) throw validationError('他の人が作ったプレビューは操作できません');
 
     const evaluated = evaluateRows(p.rows);
+    // 記録される行の選び分けは record-guard.js が正 (画面と同じ規則を使う)。
     // 未解決行 (出品コードを引き当てられなかったモール) は自動では記録しない。
     // 手動更新リストに「コード不明の行」が積み上がっても、チェックのしようがない
-    const chosen = evaluated.filter((r) => r.selected || (r.manual && r.confidence !== 'unresolved' && r.listingCode));
+    const { chosen, manualOnly } = summarizeRecord(evaluated);
     if (chosen.length === 0) throw validationError('記録する行が選ばれていません');
+    // ★送れる行が0の履歴を黙って作らせない (2026-09-07 の「価格が変わらない」の真因)。
+    //   手動更新のチェックリストとしてだけ残したい時はあるので、確認したうえでなら通す
+    if (manualOnly && req.body?.allowManualOnly !== true) {
+      throw validationError(MANUAL_ONLY_MESSAGE, 'manual_only');
+    }
 
     const note = String(req.body?.note || '').slice(0, 500) || null;
     const operations = chosen.map((r) => ({
@@ -635,6 +647,9 @@ router.get('/api/runs/:runId/executable', (req, res) => {
     res.json({
       ok: true,
       targets: targets.length,
+      // ★送る行が0のときは「なぜ0なのか」を必ず添える。
+      //   理由が無いと、現場は送られたのか送られていないのかを判断できない (2026-09-07)
+      noTargetReason: targets.length === 0 ? noTargetReasonOf(run.operations) : null,
       warnings,
       canExecute: canExecute(req),
       canExecuteReason: executorGate(req).message,   // 実行できない理由を画面に出すため
