@@ -356,6 +356,13 @@
   .reasons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
   .reasons .btn.on{outline:2px solid var(--danger);outline-offset:1px;background:var(--danger-soft);border-color:var(--danger);color:var(--danger)}
   .dcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:12px}
+  /* 作業のまとまり (2 つ以上のときだけ出る) */
+  .brow{border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:10px;background:var(--bg)}
+  .brow .bh{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+  .brow .bh b{font-size:1.05rem}
+  .brow .m{color:var(--muted);font-size:.95rem;margin-top:2px}
+  .brow .bfoot{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .brow .bfoot .btn{flex:1 1 auto;min-height:48px}
   .dhead{display:flex;gap:16px}
   .dhead .thumb{width:120px;height:120px;border-radius:var(--r-sm);background:var(--well);border:1px solid var(--line);
     display:grid;place-items:center;font-size:2.8rem;flex:none;overflow:hidden}
@@ -3740,6 +3747,7 @@ function renderDetail(c, opts) {
       sealHtml(c) + blockedHtml(c) + careHtml(c) + memoHtml(c) + awayHtml(c) + consignBtnHtml(c) +
       '</div>' +
     prevCardHtml(c) +
+    batchesCardHtml(c) +
 
     '<div class="dcard"><h3 class="sec">作業情報' + missBadge(m) + '</h3>' +
       workInfoHtml(c, m, missSet) +
@@ -3782,6 +3790,89 @@ function historyCardHtml(c) {
   return '<div class="dcard"><h3 class="sec">これまでの作業 — このカード</h3>' +
     '<ul class="whist">' + items + '</ul>' +
     '<p class="est num">合計 ' + esc(fmtDur(total)) + ' (' + rows.length + '回)</p></div>';
+}
+
+/**
+ * ⭐作業のまとまり (要件 §AB-1 / §AB-11 の 5)。**2 つ以上あるときだけ**出す。
+ * ふだん (1 つ) は今までどおり、カード 1 枚の見え方のまま。
+ *
+ * いろはのぶんが終わったら、外部に預けたぶんが返るのを待たずに棚に入れられる
+ * (中原さん 2026-09-07「2 週間寝かせる理由がない」)。
+ */
+const BSTATUS = { not_started: '未着手', in_progress: '作業中', ready_for_stocking: '棚入待ち', done: '棚入完了' };
+function batchesCardHtml(c) {
+  const bs = (c.batches || []).filter((b) => b.work_status !== 'cancelled');
+  if (bs.length <= 1) return '';
+  return '<div class="dcard"><h3 class="sec">作業のまとまり</h3>' +
+    '<p class="nlink">このカードは ' + bs.length + ' つに分かれています。できたぶんから先に棚へ入れられます。</p>' +
+    bs.map((b) => batchRowHtml(c, b)).join('') + '</div>';
+}
+function batchRowHtml(c, b) {
+  const fac = b.facility_code || c.facility_code;
+  const nums = ['予定 ' + (b.planned_qty == null ? '—' : b.planned_qty + ' 個'),
+    'できた数 ' + (b.good_qty == null ? '—' : b.good_qty + ' 個'),
+    b.loss_qty != null ? '作れなかった ' + b.loss_qty + ' 個' : null].filter(Boolean).join(' ・ ');
+  // ⭐押せるものだけ描く (許可の無い操作は DOM に出さない — 要件 §U-7)
+  let btn = '';
+  if (b.consigned_out) {
+    btn = '';   // 外にあるぶんは人が進めない。返却を受け取ると棚入待ちになる
+  } else if ((b.work_status === 'not_started' || b.work_status === 'in_progress') && can('task.status.change')) {
+    btn = '<button class="btn primary" data-bdone="' + esc(b.id) + '">✅ このぶんを作り終えた</button>';
+  } else if (b.work_status === 'ready_for_stocking' && stateCan('tasks.bulk_stocked') && isStaffUI()) {
+    btn = '<button class="btn primary" data-bstock="' + esc(b.id) + '">✅ このぶんを棚入完了</button>';
+  }
+  return '<div class="brow">' +
+    '<div class="bh"><b>' + esc(facilityName(fac) || '未定') + '</b>' +
+      '<span class="st ro ' + stClass(b.work_status === 'done' ? 'closed' : b.work_status) + '">' +
+        esc(BSTATUS[b.work_status] || b.work_status) + '</span>' +
+      (b.consigned_out ? '<span class="st ro">🚚 あずけ中</span>' : '') + '</div>' +
+    '<div class="m num">' + esc(nums) + '</div>' +
+    (b.variance_note ? '<div class="m">📝 ' + esc(b.variance_note) + '</div>' : '') +
+    (b.consigned_out ? '<div class="m">外にあるぶんです。返却を受け取ると「棚入待ち」になります。</div>' : '') +
+    (btn ? '<div class="bfoot">' + btn + '</div>' : '') +
+    '</div>';
+}
+// まとまりごとの「作り終えた」「棚入完了」
+document.addEventListener('click', (e) => {
+  const d = e.target.closest('[data-bdone]');
+  if (d) { const c = findCard(curDetail); if (c) openDone(c, Number(d.dataset.bdone)); return; }
+  const k = e.target.closest('[data-bstock]');
+  if (k) { stockBatch(Number(k.dataset.bstock)); }
+});
+/** ⭐そのまとまりだけを棚入完了にする。他のぶん (外にあずけ中) はそのまま残る */
+async function stockBatch(batchId) {
+  const c = findCard(curDetail);
+  if (!c || !stateCan('tasks.bulk_stocked')) return;
+  const b = (c.batches || []).find((x) => sameId(x.id, batchId));
+  if (!b) return;
+  const w = worker;
+  if (!w) { openGate(); return; }
+  if (!state.me.session && w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです (右上の名前を職員に替えてください)'); return; }
+  const rest = (c.batches || []).filter((x) => x.work_status !== 'cancelled' && !sameId(x.id, b.id) && x.work_status !== 'done').length;
+  const okGo = await ask({
+    title: facilityName(b.facility_code || c.facility_code) + ' のぶんを棚入完了にしますか?',
+    text: '棚に入れ終わったぶんだけにしてください。'
+      + (rest > 0 ? '残り ' + rest + ' つのぶんはそのまま残ります (カードは一覧に残ります)。' : 'これで全部そろうので、カードは一覧から外れます (履歴には残ります)。'),
+    ok: 'はい、棚入完了にする', cancel: 'やめる', danger: true,
+  });
+  if (!okGo) return;
+  let pin = null;
+  if (!state.me.session) {
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '棚入完了にする' });
+    if (pin == null) return;
+  }
+  const j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, to: 'closed', close_reason: 'stocked', batch_id: b.id,
+      worker_id: w.id, pin, expect_version: c.version }) });
+  if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
+  applyTask(c, j.task);
+  c.status = j.status;
+  if (j.status_label) c.status_label = j.status_label;
+  toast('このぶんを棚入完了にしました' + (rest > 0 ? ' (残りのぶんはそのままです)' : ''));
+  renderTabs(); renderList();
+  if (curView === 'board') renderBoard();
+  if (j.listed === false) { closeDetail(); return; }
+  openDetail(c.id);   // まとまりの状態を取り直す
 }
 
 /**
@@ -4533,13 +4624,19 @@ async function unblockOnly() {
 }
 
 // ── ✅ できあがり → 棚入待ち (監修 B-7 / F-3) ──
+let doneBatch = null;
 let doneTarget = null, doneSaving = false;
 let doneConfirmed = null;   // 予定と大きく違うときに「もう一度」を出した数 (数を変えたらやり直す)
-function openDone(c) {
+function openDone(c, batchId = null) {
   if (!can('task.status.change')) return;
   doneTarget = c.id;
+  // ⭐どのまとまりを作り終えたか。指定が無ければ手元のぶん (まとまりが 1 つならサーバーに任せる)
+  doneBatch = batchId != null ? batchId : homeBatchId(c);
   doneConfirmed = null;
-  $('#doneName').textContent = c.title;
+  const fb = doneBatch != null ? (c.batches || []).find((x) => sameId(x.id, doneBatch)) : null;
+  $('#doneName').textContent = c.title + (fb && (c.batches || []).filter((x) => x.work_status !== 'cancelled').length > 1
+    ? '（' + facilityName(fb.facility_code || c.facility_code) + ' の '
+      + (fb.planned_qty == null ? '' : fb.planned_qty + ' 個ぶん') + '）' : '');
   $('#doneMsg').textContent = '';
   $('#doneBody').innerHTML = dqPanelHtml(c, '', { title: '何個できましたか', memo: false, loss: true });
   // 押しまちがい用 (監修): このカードのタイマーを止めた直後だけ「まちがえた」を出す (サーバーは 60 秒まで受ける)
@@ -4547,7 +4644,7 @@ function openDone(c) {
   openOverlay('#doneOv');
   $('#doneTitle').focus();
 }
-function closeDone() { if (doneSaving) return; closeOverlay('#doneOv'); doneTarget = null; doneConfirmed = null; $('#doneBody').innerHTML = ''; }
+function closeDone() { if (doneSaving) return; closeOverlay('#doneOv'); doneTarget = null; doneBatch = null; doneConfirmed = null; $('#doneBody').innerHTML = ''; }
 $('#doneOv').addEventListener('click', e => { if (e.target === $('#doneOv')) closeDone(); });
 async function submitDone() {
   if (doneSaving || doneTarget == null || !worker) return;
@@ -4574,7 +4671,7 @@ async function submitDone() {
   try {
     j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: c.id, to: 'ready_for_stocking', worker_id: worker.id, expect_version: c.version,
-        ...(homeBatchId(c) ? { batch_id: homeBatchId(c) } : {}),
+        ...(doneBatch ? { batch_id: doneBatch } : {}),
         ...(v.qty != null ? { done_qty: v.qty } : {}),
         ...(v.loss !== undefined ? { loss_qty: v.loss } : {}),
         ...(v.note !== undefined ? { variance_note: v.note } : {}) }) });
@@ -4586,11 +4683,14 @@ async function submitDone() {
     applyTask(c, j.task);
     c.status = j.status;
     if (j.status_label) c.status_label = j.status_label;
-    closeOverlay('#doneOv'); doneTarget = null; $('#doneBody').innerHTML = '';
+    const wasBatch = doneBatch != null;
+    closeOverlay('#doneOv'); doneTarget = null; doneBatch = null; $('#doneBody').innerHTML = '';
     renderTabs(); renderList();
     if (sameId(curDetail, c.id)) renderDetail(c);
     if (curView === 'board') renderBoard();
     toast('「棚入待ち」にしました。棚に入れたら職員が「終了」にします');
+    // ⭐まとまりが 2 つ以上あるカードは、まとまりの状態を取り直す (どのぶんが終わったかを出すため)
+    if (wasBatch && sameId(curDetail, c.id)) openDetail(c.id);
     return;
   }
   if (j.error === 'conflict' && j.current) { applyTask(c, j.current); c.status = j.current.status; if (sameId(curDetail, c.id)) renderDetail(c); }

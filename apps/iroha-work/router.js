@@ -37,6 +37,7 @@ import { OPEN_STATUSES } from './tasks.js';
 import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
+import { batchTransitionNeedsStaff } from './batches.js';
 import { setTaskBlock, clearTaskBlock, undoTaskBlock, blockedOf } from './tasks-db.js';
 import { notifyStaff, materialsShortageText } from './notify.js';
 import { enqueuePrintJob, leaseNextJob, markSubmitted, markFinished, getJobStatusFor, recordHeartbeat, listPrintAgents, latestJobsByTask, listPrintJobs, publicJob, MAX_COPIES, LEASE_SEC } from './print-queue.js';
@@ -76,7 +77,7 @@ function notifyBlockUndone(ticket, who) {
     .catch(() => { /* notifyStaff は throw しない */ });
 }
 import {
-  getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
+  getTask, changeTaskStatus, changeBatchStatus, batchesOfTask, setPlannedDate, clearMigrationReview, resolveCancellation,
   listLabelWaits, upsertLabelWait, getLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
   listNamelessTasks, removeStrayTask, setFacility, setProgress,
   startTaskSession, countChangesSince, switchSourceOfTruth, bulkCloseReady,
@@ -689,13 +690,43 @@ function changeStatusApp(req, res, worker) {
   const t = getTask(taskId);
   if (!t) return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' });
   if (!TASK_STATUSES.includes(to)) return res.status(400).json({ ok: false, error: 'bad_status', message: '変更先の状態が不正です' });
+  // ⭐まとまりが 2 つ以上あるカードで、どのぶんかが指定されていれば**そのぶんだけ**動かす (要件 §AB-11 の 5)。
+  //   いろはのぶんが終わったら、外部に預けたぶんが返るのを待たずに棚入れできる。
+  //   まとまりが 1 つのカード (ふだんの全部) は今までどおりカード単位 — 見え方は変わらない
+  const bs = batchesOfTask(t.id);
+  const batchIdIn = 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined;
+  const perBatch = batchIdIn != null && batchIdIn !== '' && bs.length > 1;
+  const target = perBatch ? bs.find((b) => String(b.id) === String(batchIdIn)) : null;
+  if (perBatch && !target) {
+    return res.status(400).json({ ok: false, error: 'bad_batch', message: 'そのぶんはこのカードにありません。一覧を更新してください' });
+  }
+  // 職員限定かは「どこから変えるか」で決まる。まとまり単位なら**そのまとまりの表**で見る (二重に定義しない)
+  const needsStaff = perBatch
+    ? batchTransitionNeedsStaff(target.work_status, to === 'closed' ? 'done' : to)
+    : transitionNeedsStaff(t.status, to);
   let isStaff = false;
   if (hasSessionAccess(req)) {
     isStaff = true;
-  } else if (worker.worker_type === 'staff' && transitionNeedsStaff(t.status, to)) {
+  } else if (worker.worker_type === 'staff' && needsStaff) {
     const pinCheck = verifyWorkerPin(worker.id, req.body?.pin);
     if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
     isStaff = true;
+  }
+  if (perBatch) {
+    const rb = changeBatchStatus({
+      taskId: t.id, batchId: target.id, to, closeReason: req.body?.close_reason || null,
+      expectVersion: req.body?.expect_version,
+      doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+      lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+      varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
+      actor: hasSessionAccess(req) ? req.iwUser : `${worker.display_name} (いろはアプリ)`,
+      isStaff, workerId: worker.id, workerName: worker.display_name, deviceLabel: deviceLabelOf(req),
+    });
+    if (!rb.ok) {
+      return res.status(taskErrorStatus(rb.error)).json({ ...rb, current: rb.current ? publicTask(rb.current) : undefined });
+    }
+    return res.json({ ok: true, already: !!rb.already, task: publicTask(rb.task), status: rb.task.status,
+      status_label: statusLabel(rb.task), listed: rb.task.status !== 'closed' });
   }
   const r = changeTaskStatus({
     taskId: t.id, to, expectVersion: req.body?.expect_version,

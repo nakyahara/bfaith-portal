@@ -286,6 +286,102 @@ export function recordStockingForTask(db, taskId, opts = {}) {
   return n;
 }
 
+/**
+ * ⭐カードごと閉じた・やり直したとき、**すべてのまとまり**をその状態に合わせる (要件 §AB-1)。
+ *
+ * `syncSingleBatchStatus` はまとまりが 1 つのときだけの橋渡し。こちらは 2 つ以上でも動かす。
+ * 呼ぶのは**行き先が 1 つに決まる操作だけ** — 終了 (全部 done か cancelled) と、
+ * 終了からのやり直し (全部 作業中に戻す)。
+ * 「作り終えた」を全まとまりに広げるようなことはしない (どのぶんが終わったのかが決まらない)。
+ * ⚠必ずカードを更新したのと同じトランザクションの中で。
+ *
+ * @returns {number} 直した行数
+ */
+export function syncAllBatchesStatus(db, taskId, task) {
+  const want = batchStatusOfTask(task);
+  if (!['done', 'cancelled', 'in_progress'].includes(want)) return 0;
+  // 取消したまとまりは触らない (もう無かったことにしたぶん)
+  return db.prepare(`UPDATE f_iroha_task_batches SET work_status = ?, version = version + 1, updated_at = ?
+    WHERE task_id = ? AND work_status <> 'cancelled' AND work_status <> ?`)
+    .run(want, new Date().toISOString(), taskId, want).changes;
+}
+
+/**
+ * ⭐**まとまりの遷移表** (要件 §AB-11 の 5)。カードの表とは別に持つ。
+ *
+ * 未着手から直接「作り終えた」へ行けるのは、**そのぶんだけの「作業をはじめる」が無い**から
+ * (作業時間の記録はまだカード単位。まとまりに紐づけるのは次の PR — 要件 §AB-10)。
+ * カード側の表 (tasks.js の TRANSITIONS) は今までどおり 未着手 → 作業中 → 棚入待ち のまま。
+ */
+export const BATCH_TRANSITIONS = {
+  not_started: ['in_progress', 'ready_for_stocking'],
+  in_progress: ['ready_for_stocking'],
+  ready_for_stocking: ['in_progress', 'done'],
+  done: ['in_progress'],
+};
+export function canBatchTransition(from, to) {
+  return Array.isArray(BATCH_TRANSITIONS[from]) && BATCH_TRANSITIONS[from].includes(to);
+}
+/** 職員だけができるまとまりの操作: 棚入完了にする / 棚入待ち・棚入完了からやり直す (カードと同じ考え方) */
+export function batchTransitionNeedsStaff(from, to) {
+  if (to === 'done') return true;
+  if ((from === 'ready_for_stocking' || from === 'done') && to === 'in_progress') return true;
+  return false;
+}
+
+/**
+ * ⭐まとまりから導いた進捗を**カードに書き戻す** (要件 §AB-1: 進捗の正本はまとまり)。
+ *
+ * 預けで まとまりの状態が変わったとき (渡した = 作業中 / 返ってきた = 棚入待ち) に、
+ * カードの進捗もそこから導く。人が押していないので、**終了 (done) にはしない** —
+ * 全部棚に入ったあとカードを閉じるのは、職員が「棚入完了」を押したときだけ。
+ * ⚠必ず呼び出し側の書き込みトランザクションの中で。
+ *
+ * @returns {number} 直した行数
+ */
+export function applyDerivedTaskStatus(db, taskId, now = new Date().toISOString(), actor = null) {
+  const t = db.prepare('SELECT * FROM f_iroha_tasks WHERE id = ?').get(taskId);
+  if (!t || t.status === 'closed') return 0;      // 終了したカードは触らない (戻すのは職員の操作)
+  const d = deriveTaskStatus(db, taskId);
+  if (!d || d === 'done' || d === t.status) return 0;
+  const toReady = d === 'ready_for_stocking';
+  return db.prepare(`UPDATE f_iroha_tasks SET status = ?,
+      started_at = ?, ready_at = ?, hold_memo = ?,
+      blocked_reason = ?, blocked_note = ?, blocked_at = ?, blocked_by = ?, updated_at = ?, updated_by = ?
+    WHERE id = ?`)
+    .run(d,
+      d === 'not_started' ? t.started_at : (t.started_at || now),
+      toReady ? (t.ready_at || now) : null,
+      toReady ? null : (t.hold_memo ?? null),
+      // 棚入待ちへ来たら「止まっている理由」の札は外す (カードと同じ不変条件)
+      toReady ? null : t.blocked_reason, toReady ? null : t.blocked_note,
+      toReady ? null : t.blocked_at, toReady ? null : t.blocked_by,
+      now, actor, taskId).changes;
+}
+
+/**
+ * ⭐まとまりから**カードの進捗を導く** (要件 §AB-1: 進捗の正本はまとまり)。
+ *
+ * まとまりが 1 つのカード (ふだんの全部) では、今までと同じ値になる。
+ * 2 つ以上あるときは「いろはのぶんは棚に入れた・外部のぶんはまだ作業中」のような
+ * 食い違いが起きるので、**いちばん進んでいない側に合わせる**。
+ *
+ * @returns 'not_started' | 'in_progress' | 'ready_for_stocking' | 'done' (全部棚に入った) / null (まとまりが無い)
+ */
+export function deriveTaskStatus(db, taskId) {
+  const rows = db.prepare("SELECT work_status FROM f_iroha_task_batches WHERE task_id = ? AND work_status <> 'cancelled'").all(taskId);
+  if (rows.length === 0) return null;
+  if (rows.every((r) => r.work_status === 'done')) return 'done';
+  if (rows.every((r) => r.work_status === 'ready_for_stocking' || r.work_status === 'done')) return 'ready_for_stocking';
+  if (rows.every((r) => r.work_status === 'not_started')) return 'not_started';
+  return 'in_progress';
+}
+
+/** そのまとまりに、まだ外にある (返ってきていない) 預けが何件あるか */
+export function batchConsignedOutCount(db, batchId) {
+  return db.prepare("SELECT COUNT(*) c FROM f_iroha_consignments WHERE batch_id = ? AND state IN ('planned','prepared','handed')").get(batchId).c;
+}
+
 /** そのカードで、まだ外にある (返ってきていない) 預けの数。0 なら棚入待ち・棚入完了にしてよい */
 export function openConsignmentCount(db, taskId) {
   return db.prepare(`SELECT COUNT(*) c FROM f_iroha_consignments c JOIN f_iroha_task_batches b ON b.id = c.batch_id
