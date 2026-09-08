@@ -1,0 +1,52 @@
+# Amazon 価格管理 (apps/amazon-pricing) のテスト — PR で必ず走らせる
+#
+# ★置き場所: このファイルを .github/workflows/amazon-pricing-tests.yml へ移すと有効になる。
+#   (docs/ci/ にあるのは、Claude Code の GitHub トークンに workflow scope が無く .github/workflows/ を push できないため)
+#
+# ★いちばん大事なのは test-no-write-path.mjs (Amazon へ書き込む経路が無いことの機械的な確認)。
+#   GitHub の branch protection で、このジョブを master への必須ステータスチェックにする (Codex R3 High)。
+#   設定は repo の Settings → Branches → master → Require status checks → "amazon-pricing tests"。
+name: amazon-pricing tests
+
+on:
+  pull_request:
+    paths:
+      - 'apps/amazon-pricing/**'
+      - 'apps/profit-calculator/**'
+      - 'apps/warehouse-mirror/db.js'
+      - 'apps/price-update/format.js'
+      - 'server.js'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/amazon-pricing-tests.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'apps/amazon-pricing/**'
+      - 'server.js'
+
+jobs:
+  test:
+    name: amazon-pricing tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install (prebuilt better-sqlite3 を使う。ブラウザは落とさない)
+        run: npm ci
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      - name: 書き込み経路が無い (最重要)
+        run: node apps/amazon-pricing/test-no-write-path.mjs
+      - name: 判定ルール
+        run: node apps/amazon-pricing/test-engine.mjs
+      - name: 表・追記のみ・履歴
+        run: node apps/amazon-pricing/test-db.mjs
+      - name: 画面 (テンプレ + 実物のルート)
+        run: node apps/amazon-pricing/test-views.mjs
+      - name: server.js の構文
+        run: node --check server.js

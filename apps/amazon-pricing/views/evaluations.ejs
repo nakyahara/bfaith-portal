@@ -1,0 +1,154 @@
+<%- include('_top', { nav: 'evaluations' }) %>
+
+<% if (auto && auto.error) { %>
+  <div class="banner-warn">⚠️ 判定を作れませんでした: <%= auto.error %></div>
+<% } %>
+
+<div class="card">
+  <h2>これは何か</h2>
+  <p style="margin:0;font-size:13px;line-height:1.7">
+    ルール (<span class="code"><%= RULE_VERSION %></span>) が、毎日の価格データと方針を見て
+    「<b>もし価格を変えるなら、いくらに、なぜ</b>」を出したもの。<b>実際には何も送っていません</b>。
+    人が 👍 妥当 / 👎 違う / ❓ わからない を付けると、その採点も記録され、あとで
+    「ルールの判定に人がどれだけ同意したか」「どういう時に外すか」を AI と人が振り返れます。
+    ここで採点が溜まらないうちは、実行の段階には進みません。
+  </p>
+</div>
+
+<div class="cards">
+  <div class="stat">
+    <div class="k">最新 run</div>
+    <div class="v"><%= run ? toJst(run.started_at) : '—' %></div>
+    <div class="small"><% if (run) { %>価格データ <%= run.snapshot_date_jst || '—' %> / <%= run.trigger %> / <%= num(run.listings_total) %> 出品<% } else { %>まだ判定がありません<% } %></div>
+  </div>
+  <div class="stat">
+    <div class="k">内訳</div>
+    <div class="v">
+      <span class="chip c-raise">値上げ <%= counts.raise %></span>
+      <span class="chip c-lower">値下げ <%= counts.lower %></span>
+      <span class="chip c-keep">維持 <%= counts.keep %></span>
+      <span class="chip c-hold">保留 <%= counts.hold %></span>
+    </div>
+  </div>
+  <div class="stat">
+    <div class="k">採点</div>
+    <div class="v">
+      <span class="chip c-agree">妥当 <%= reviews.agree %></span>
+      <span class="chip c-disagree">違う <%= reviews.disagree %></span>
+      <span class="chip c-unsure">？ <%= reviews.unsure %></span>
+    </div>
+    <div class="small">採点済み <%= counts.reviewed %> / <%= counts.all %></div>
+  </div>
+  <div class="stat">
+    <div class="k">作り直す</div>
+    <div class="v"><button class="btn btn-sm" type="button" id="rerun">いま判定を作り直す</button></div>
+    <div class="small">方針を変えたあとに。価格は変わりません</div>
+  </div>
+</div>
+
+<div class="card">
+  <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+    <% const tabs = [['change', '値上げ・値下げ', counts.change], ['raise', '値上げ', counts.raise], ['lower', '値下げ', counts.lower], ['hold', '保留', counts.hold], ['keep', '維持', counts.keep], ['reviewed', '採点済み', counts.reviewed], ['all', 'すべて', counts.all]]; %>
+    <% for (const [k, label, n] of tabs) { %>
+      <a class="btn btn-sm <%= tab === k ? 'btn-primary' : '' %>" href="?tab=<%= k %>"><%= label %> <%= n %></a>
+    <% } %>
+  </div>
+  <% if (shownTotal > limit) { %><div class="small" style="margin-bottom:8px">先頭 <%= limit %> 件を表示 (全 <%= num(shownTotal) %> 件)。絞り込みは一覧画面で</div><% } %>
+
+  <div class="tbl-wrap">
+  <table class="ap">
+    <thead>
+      <tr>
+        <th>SKU / ASIN</th>
+        <th class="num">いま</th>
+        <th>判定</th>
+        <th>理由</th>
+        <th>注意</th>
+        <th class="num">確信度</th>
+        <th>採点</th>
+      </tr>
+    </thead>
+    <tbody>
+    <% if (evals.length === 0) { %><tr><td colspan="7" class="dim" style="padding:20px;text-align:center">該当なし</td></tr><% } %>
+    <% for (const e of evals) { %>
+      <tr data-decision="<%= e.decision_id %>">
+        <td class="code"><a href="/apps/amazon-pricing/listings/<%= encodeURIComponent(e.seller_sku) %>"><%= e.seller_sku %></a><div class="small"><%= e.asin || '—' %></div></td>
+        <td class="num"><%= yen(e.current_price) %></td>
+        <td><span class="chip c-<%= e.action %>"><%= ACTIONS[e.action] %><% if (e.proposed_price != null) { %> → <%= yen(e.proposed_price) %><% } %></span></td>
+        <td class="reason"><%= e.reason_text %></td>
+        <td><% const shown = e.flags.filter((f) => f !== 'NO_SALES_30D'); %><% for (const f of shown) { %><span class="chip <%= f === 'BELOW_COST_FLOOR' || f === 'BELOW_STOPPER' ? 'c-bad' : 'c-warn' %>" title="<%= FLAGS[f] || f %>"><%= FLAGS[f] ? FLAGS[f].split(' (')[0] : f %></span> <% } %></td>
+        <td class="num"><%= e.confidence == null ? '—' : pct(e.confidence, 0) %></td>
+        <td style="white-space:nowrap">
+          <% for (const [k, label] of [['agree', '👍 妥当'], ['disagree', '👎 違う'], ['unsure', '❓']]) { %>
+            <button type="button" class="rv-btn <%= e.review_verdict === k ? 'on' : '' %>" data-verdict="<%= k %>"><%= label %></button>
+          <% } %>
+          <input type="text" class="rv-comment" placeholder="ひとこと (任意)" maxlength="500" value="<%= e.review_comment || '' %>">
+          <div class="small rv-state"><% if (e.review_verdict) { %><%= e.review_by %> <%= toJst(e.review_at) %><% } %></div>
+        </td>
+      </tr>
+    <% } %>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>判定 run の履歴</h2>
+  <div class="tbl-wrap"><table class="ap" style="max-width:900px">
+    <thead><tr><th>開始 (JST)</th><th>きっかけ</th><th>価格データ</th><th>ルール</th><th>状態</th><th class="num">出品数</th><th>内訳</th></tr></thead>
+    <tbody>
+    <% for (const r of runs) { %>
+      <tr>
+        <td class="small"><%= toJst(r.started_at) %></td>
+        <td class="small"><%= r.trigger %> / <%= r.actor_id %></td>
+        <td><%= r.snapshot_date_jst || '—' %></td>
+        <td class="code"><%= r.rule_version %></td>
+        <td><span class="chip <%= r.status === 'success' ? 'c-ok' : r.status === 'failed' ? 'c-bad' : 'c-none' %>"><%= r.status %></span><% if (r.error) { %><div class="small"><%= r.error %></div><% } %></td>
+        <td class="num"><%= num(r.listings_total) %></td>
+        <td class="small"><% if (r.summary && r.summary.by_action) { %>↑<%= r.summary.by_action.raise %> ↓<%= r.summary.by_action.lower %> ＝<%= r.summary.by_action.keep %> ⏸<%= r.summary.by_action.hold %><% } %></td>
+      </tr>
+    <% } %>
+    </tbody>
+  </table></div>
+</div>
+
+<script>
+  function toast(msg) {
+    var t = document.getElementById('toast');
+    if (!t) { alert(msg); return; }
+    t.textContent = msg; t.style.display = 'block';
+    clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, 2500);
+  }
+  (function () {
+    document.addEventListener('click', function (ev) {
+      var b = ev.target.closest ? ev.target.closest('button.rv-btn') : null;
+      if (!b) return;
+      var tr = b.closest('tr');
+      var id = tr.getAttribute('data-decision');
+      var comment = tr.querySelector('input.rv-comment').value;
+      var verdict = b.getAttribute('data-verdict');
+      var btns = tr.querySelectorAll('button.rv-btn');
+      btns.forEach(function (x) { x.disabled = true; });
+      fetch('/apps/amazon-pricing/api/evaluations/' + encodeURIComponent(id) + '/review', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ verdict: verdict, comment: comment })
+      }).then(function (r) { return r.json(); }).then(function (j) {
+        btns.forEach(function (x) { x.disabled = false; x.classList.remove('on'); });
+        if (!j.ok) { toast(j.error || 'エラー'); return; }
+        b.classList.add('on');
+        tr.querySelector('.rv-state').textContent = '記録しました';
+        toast('採点を記録しました');
+      }).catch(function (e) { btns.forEach(function (x) { x.disabled = false; }); toast('通信エラー: ' + e.message); });
+    });
+    var rerun = document.getElementById('rerun');
+    if (rerun) rerun.addEventListener('click', function () {
+      rerun.disabled = true;
+      fetch('/apps/amazon-pricing/api/evaluations/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+        .then(function (r) { return r.json(); }).then(function (j) {
+          if (!j.ok) { rerun.disabled = false; toast(j.error || 'エラー'); return; }
+          toast('作り直しました');
+          setTimeout(function () { location.href = '/apps/amazon-pricing/evaluations'; }, 500);
+        }).catch(function (e) { rerun.disabled = false; toast('通信エラー: ' + e.message); });
+    });
+  })();
+</script>
+</div>
