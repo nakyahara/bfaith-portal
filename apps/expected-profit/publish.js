@@ -113,13 +113,28 @@ export async function publishToRender(db, generationId, deps) {
 // 🚨 timeout を必ず付ける。無いと転送が固まったまま期限を越える (Codex R4-9)
 const HTTP_TIMEOUT_MS = 120_000;
 
+/**
+ * Render の受け口の**オリジン** (https://host)。
+ *
+ * 🚨 `RENDER_MIRROR_URL` は**末尾にパスが付いている** (実測: `https://<host>/apps/mirror`)。
+ *    そのまま連結すると `/apps/mirror/apps/expected-profit/sync/...` になり、
+ *    404 の HTML が返って「JSON じゃない」で落ちる。
+ *    2026-08-08 に select-set が同じ罠を踏んでいる (apps/select-set/master-sync.js)。
+ *    → **URL として解決して origin だけ**を使う。
+ *
+ * 🚨 同じ Render を指すのに新しい env を増やさない。
+ *    初回の公開が `RENDER_PORTAL_URL not configured` で止まった (2026-09-08)。
+ *    RENDER_PORTAL_URL は移行用に優先だけする。
+ */
+export function syncBaseUrl(env = process.env) {
+  const raw = String(env.RENDER_PORTAL_URL || env.RENDER_MIRROR_URL || '').trim();
+  if (!raw) return '';
+  try { return new URL(raw).origin; } catch { return ''; }
+}
+
 export function httpDeps(deadline = null) {
-  // 🚨 Render の URL は **既存の `RENDER_MIRROR_URL`** を使う。
-  //    同じ Render アプリを指すのに新しい env を増やすと、片方だけ設定されて
-  //    転送が黙って止まる (実際に初回の公開がこれで失敗した 2026-09-08)。
-  //    RENDER_PORTAL_URL が設定されていればそちらを優先する (移行用)
-  const base = (process.env.RENDER_PORTAL_URL || process.env.RENDER_MIRROR_URL || '').replace(/\/+$/, '');
   const key = process.env.MIRROR_SYNC_KEY;
+  const base = syncBaseUrl();
   if (!base) throw new Error('RENDER_MIRROR_URL not configured');
   if (!key) throw new Error('MIRROR_SYNC_KEY not configured');
   const headers = { 'Content-Type': 'application/json', 'x-sync-key': key };

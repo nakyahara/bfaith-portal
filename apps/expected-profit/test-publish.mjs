@@ -12,7 +12,7 @@ import os from 'os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-pub-'));
 
-const { httpDeps } = await import('./publish.js');
+const { httpDeps, syncBaseUrl } = await import('./publish.js');
 const { initExpectedProfitDB, getExpectedProfitDB, addColumnIfMissing, MIGRATED_COLUMNS,
   createExpectedProfitSchema } = await import('./db.js');
 const { receiveChunk, publishGeneration, getPublished, chunkChecksum, pruneGenerations, generationContentHash } = await import('./publish-api.js');
@@ -470,6 +470,35 @@ const urlUsed = async () => {
   return seen;
 };
 
+t('[!] RENDER_MIRROR_URL は末尾にパスが付いている → origin だけを使う', () => {
+  // 🚨 実測 `https://<host>/apps/mirror`。そのまま連結すると
+  //    /apps/mirror/apps/expected-profit/sync/... になり 404 の HTML が返る。
+  //    2026-08-08 に select-set が同じ罠を踏んでいる
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'https://portal.test/apps/mirror' }), 'https://portal.test');
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'https://portal.test/apps/mirror/' }), 'https://portal.test');
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'https://portal.test' }), 'https://portal.test');
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'https://portal.test:8443/a/b' }), 'https://portal.test:8443');
+});
+
+t('URL として読めない値は空にする (変な所へ鍵を送らない)', () => {
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'ごみ' }), '');
+  assert.equal(syncBaseUrl({}), '');
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: '   ' }), '');
+});
+
+await ta('[!] 実際に叩く URL がパス付きの env でも正しくなる', async () => {
+  const saved = [process.env.RENDER_PORTAL_URL, process.env.RENDER_MIRROR_URL, process.env.MIRROR_SYNC_KEY];
+  let url = null;
+  try {
+    delete process.env.RENDER_PORTAL_URL;
+    process.env.RENDER_MIRROR_URL = 'https://portal.test/apps/mirror';
+    process.env.MIRROR_SYNC_KEY = 'k';
+    url = await urlUsed();
+  } finally { restoreEnv(saved); }
+  assert.equal(url, 'https://portal.test/apps/expected-profit/sync/publish',
+    `パスが二重になっている: ${url}`);
+});
+
 await ta('[!] RENDER_MIRROR_URL だけでも転送先を組み立てられる', async () => {
   // 🚨 同じ Render を指すのに新しい env を増やしたせいで、初回の公開が黙って止まった
   let url = null;
@@ -477,7 +506,7 @@ await ta('[!] RENDER_MIRROR_URL だけでも転送先を組み立てられる', 
   const saved = [process.env.RENDER_PORTAL_URL, process.env.RENDER_MIRROR_URL, process.env.MIRROR_SYNC_KEY];
   try {
     delete process.env.RENDER_PORTAL_URL;
-    process.env.RENDER_MIRROR_URL = 'https://example.test/';
+    process.env.RENDER_MIRROR_URL = 'https://example.test/apps/mirror';
     process.env.MIRROR_SYNC_KEY = 'k';
     url = await urlUsed();
   } finally { restoreEnv(saved); }
