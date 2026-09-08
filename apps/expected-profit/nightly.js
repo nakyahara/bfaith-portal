@@ -17,6 +17,7 @@
  *
  * 終了コード (ランナー run-expected-profit-nightly.ps1 との約束):
  *   0 = 成功し、ok も報告済み          → ランナーは何もしない
+ *       (--skip-publish の手動実行もここ。監視は触らない)
  *   5 = **成功したが報告できなかった**  → ランナーが代わりに ok ping を打つ
  *   3 = 失敗したが報告済み             → ランナーは重ねて ping しない
  *   1 = 失敗し、報告もできていない      → ランナーが代わりに fail ping を打つ
@@ -114,6 +115,20 @@ async function ping(status, summary) {
     console.warn('[expected-profit] ping 失敗:', e.message);
     return false;
   }
+}
+
+/**
+ * ランナー (run-expected-profit-nightly.ps1) との約束を1か所に置く。
+ * 🚨 ここを関数にしてあるのは、4つの分岐すべてを試験で固定するため。
+ *    三項演算子を CLI に直書きすると、--skip-publish の扱いのような穴が試験を素通りする
+ */
+export function exitCodeFor(r) {
+  // --skip-publish は「Render を更新しない」ための手動実行 (復旧手順)。監視は触らせない。
+  // 5 (成功したが報告できず) にすると、ランナーが「公開できた」という ok を打ち、
+  // 監視が嘘の成功で塗り替わる (Codex 5巡目)
+  if (r.skippedPublish) return 0;
+  if (r.ok) return r.reported ? 0 : 5;
+  return r.reported ? 3 : 1;
 }
 
 export async function runNightly(opts = {}) {
@@ -265,9 +280,7 @@ if (process.argv[1] && process.argv[1].endsWith('nightly.js')) {
   })
     .then(r => {
       console.log(JSON.stringify({ ok: r.ok, generationId: r.generationId, error: r.error, reported: r.reported }, null, 2));
-      // 🚨 「報告できたか」まで含めて返す。ランナーはこの4値だけを見て、
-      //    足りない報告を補い、済んでいる報告は重ねない (ヘッダの表を参照)
-      process.exit(r.ok ? (r.reported ? 0 : 5) : (r.reported ? 3 : 1));
+      process.exit(exitCodeFor(r));
     })
     .catch(e => { console.error(e); process.exit(1); });
 }

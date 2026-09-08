@@ -14,7 +14,7 @@ process.env.SP_API_MARKETPLACE_ID = 'A1VC38T7YXB528';
 process.env.SP_API_SELLER_ID = 'S1';
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { pingUrl, runNightly, deadlineOf, feeTargetsFrom } = await import('./nightly.js');
+const { pingUrl, runNightly, deadlineOf, feeTargetsFrom, exitCodeFor } = await import('./nightly.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -497,6 +497,31 @@ await ta('[!] 公開できたのに報告だけ落ちたら ok かつ reported=f
     delete process.env.JOBS_MONITOR_URL;
     delete process.env.JOBS_MONITOR_TOKEN;
   }
+});
+
+console.log('');
+console.log('終了コードの約束 (ランナーが何を補うかを決める)');
+
+t('[!] 成功して報告済み → 0 (ランナーは何もしない)', () => {
+  assert.equal(exitCodeFor({ ok: true, reported: true }), 0);
+});
+
+t('[!] 成功したが報告できず → 5 (ランナーが ok を補う)', () => {
+  assert.equal(exitCodeFor({ ok: true, reported: false }), 5);
+});
+
+t('[!] --skip-publish は 0 (Render を更新していないので、監視を触らせない)', () => {
+  // 5 にすると、ランナーが「公開できた」という ok を打ち、監視が嘘の成功で塗り替わる。
+  // これは復旧手順で人が叩くコマンドなので、実際に起きる (Codex 5巡目)
+  assert.equal(exitCodeFor({ ok: true, reported: false, skippedPublish: true }), 0);
+});
+
+t('[!] 失敗して報告済み → 3 (ランナーは重ねて打たない)', () => {
+  assert.equal(exitCodeFor({ ok: false, reported: true }), 3);
+});
+
+t('[!] 失敗して報告もできず → 1 (ランナーが fail を補う)', () => {
+  assert.equal(exitCodeFor({ ok: false, reported: false }), 1);
 });
 
 db.close();

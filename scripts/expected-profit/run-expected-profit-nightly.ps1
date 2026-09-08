@@ -17,6 +17,11 @@
 #     partial_max_days in the registry, and a stopped night leaves the screen on yesterday's numbers).
 #     jobs-monitor keeps only the LAST ping (store.js recordPing is an upsert), so a second ping from here
 #     would overwrite nightly's specific reason ("could not publish: ...") with a generic one.
+#   - A run that starts OUTSIDE the overnight window is skipped. The task uses StartWhenAvailable, so a
+#     missed 23:30 (miniPC off / asleep) would otherwise start in the morning and run all day against
+#     warehouse.db, which product-idea-scout holds 14:00-09:00, while daily-sync (07:00, P1) is running.
+#     The batch is P3: skipping a night is cheaper than fighting the daytime jobs. Pass -AllowAnyTime to
+#     run it by hand anyway (Codex 5th round).
 #   - Single instance: the scheduler is set to IgnoreNew, but a manual run can still overlap a scheduled
 #     one, so a lock file guards it too. A lock older than $LockStaleHours is taken over (a killed run
 #     leaves the file behind).
@@ -36,6 +41,10 @@ param(
   [string]$StopAtHhmm = '06:15',
   # Print what would run instead of running node (for checking the wiring).
   [switch]$DryRun,
+  # Longest run we ever expect (23:30 -> 06:15 is 6h45m). Also used to spot a start outside that window.
+  [double]$MaxRunHours = 7.5,
+  # Run even when started outside the overnight window (for a manual run during the day).
+  [switch]$AllowAnyTime,
   # Extra arguments for nightly.js, e.g. --skip-publish
   [string[]]$NodeArgs = @(),
   # Entry point to run. Overridable so the runner itself can be exercised (exit codes, deadline stop).
@@ -108,11 +117,20 @@ try {
 
   $env:DATA_DIR = Join-Path $Repo 'data'
   $stopAt = Get-StopTime $StopAtHhmm
+  # If the cutoff is further away than one whole run, we are not in the overnight window at all
+  # (started 09:00 -> the next 06:15 is 21h away). Skip rather than run through the working day.
+  $hoursToStop = ($stopAt - (Get-Date)).TotalHours
+  $outsideWindow = ($hoursToStop -gt $MaxRunHours) -and (-not $AllowAnyTime)
   $argLine = @($Script) + $NodeArgs
   Log ('start : node ' + ($argLine -join ' ') + '  (DATA_DIR=' + $env:DATA_DIR + ')')
   Log ('stop  : ' + $stopAt.ToString('yyyy-MM-dd HH:mm') + '  log: ' + $OutLog)
 
-  if ($DryRun) {
+  if ($outsideWindow) {
+    Log ('started outside the overnight window (' + [int]$hoursToStop + 'h until the ' + $StopAtHhmm +
+         ' cutoff) - skipping. Use -AllowAnyTime to run it by hand')
+    Send-Ping 'fail' ('skipped: started outside the overnight window at ' + (Get-Date -Format 'HH:mm'))
+    $code = 0
+  } elseif ($DryRun) {
     Log 'dry run - node was not started'
     $code = 0
   } else {

@@ -104,7 +104,8 @@ Write-Output ('  1. git pull in ' + $Repo + '  (the new shipping columns come fr
 if ($missing.Count -gt 0) {
   Write-Output ('  2. fill in the missing env keys: ' + ($missing -join ', '))
 }
-Write-Output ('  3. test run  : powershell -NoProfile -ExecutionPolicy Bypass -File "' + $Runner + '"')
+Write-Output ('  3. test run  : powershell -NoProfile -ExecutionPolicy Bypass -File "' + $Runner + '" -AllowAnyTime')
+Write-Output ('     (-AllowAnyTime is needed by hand: outside 23:00-06:15 the runner skips on purpose)')
 Write-Output ('     without publishing: add  -NodeArgs --skip-publish')
 Write-Output ('  4. watch     : ' + (Join-Path $Repo 'logs') + '\expected-profit-runner.log')
 Write-Output ('  5. the morning after, jobs-monitor should show ' + 'expected-profit-nightly' + ' = ok')
