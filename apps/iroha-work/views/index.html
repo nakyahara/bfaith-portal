@@ -2788,6 +2788,11 @@ async function submitPrint() {
     batch_id: ctx.batchId == null ? undefined : ctx.batchId,
     target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
   };
+  // 🚨**送る中身を決めたら、そこから先は画面を変えさせない**。通信の待ちの間に期限や枚数を
+  //   直せると、応答を失ったときに「画面に見えている値」と「送り直す中身」が食い違う
+  //   (2027-03 で送信 → 待ちの間に 2028-06 に直す → 通信が切れる → 再送は 2027-03。
+  //    初回が届いていなければ、画面と違う期限のラベルが出る — Codex #1259 R7 重大)
+  lockPrintFields(true);
   let j;
   try {
     j = await apiFetch('/api/print/jobs', {
@@ -2800,7 +2805,7 @@ async function submitPrint() {
     //   立てるのはこの経路だけ — サーバーが返事をくれたなら、その依頼のことは分かっている。
     ctx.unresolved = true;
     ctx.body = body;            // ⭐送った中身のまま送り直す (画面の値を変えても、これを送る)
-    lockPrintFields(true);      // ⭐だから画面も編集できなくする (見えている値 = 送る中身)
+    // 入力は送る前からロックしてある。届いたか分からない間は**そのまま維持**する
     msgEl.textContent = '❌ 送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2 枚にはなりません)。内容は変えられません';
     $('#printOk').disabled = false;
     return;
@@ -2812,6 +2817,9 @@ async function submitPrint() {
   //   言っておらず、前に送って返事を失ったぶんが積まれていないことの証明にはならない
   //   (Codex #1259 R3 重大1)。枚数の検査などは冪等 ID を見るより先に走る
   if (j.ok) { ctx.unresolved = false; ctx.body = null; }
+  // ⭐サーバーが返事をくれた = その依頼がどうなったかは分かっている。届いたか分からない依頼を
+  //   抱えていなければ、直して送り直せるように入力を開ける (入力の誤りで断られたときなど)
+  if (!ctx.unresolved) lockPrintFields(false);
   if (j.ok) {
     c.print_job = j.job;
     closePrintBox();

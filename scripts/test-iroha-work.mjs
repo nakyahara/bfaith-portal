@@ -3958,14 +3958,19 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
         '#printTarget': { value: '1' },
         '#printBody': { querySelector: () => ({ getAttribute: () => '1' }) } };
       const sent = [];      // 実際にサーバーへ送った中身
-      const locked = [];    // 入力を編集できなくした回数
+      const locked = [];    // lockPrintFields(true/false) の呼ばれ方
+      const lockedWhileSending = [];   // ⭐通信の待ちの間に閉じていたか
       const fn = new Function('printCtx', 'findCard', '$', 'apiFetch', 'worker', 'closePrintBox',
         'repaintAfterPrint', 'toast', 'openPrintBox', 'openGate', 'showErr', 'lockPrintFields',
         src + '; return submitPrint;')(
         ctx, () => ({ id: 7, title: 'x', print_job: null }), (k) => els[k],
-        async (_url, o) => { sent.push(JSON.parse(o.body)); const r = replies[i++]; if (r instanceof Error) throw r; return r; },
+        async (_url, o) => {
+          sent.push(JSON.parse(o.body));
+          lockedWhileSending.push(locked[locked.length - 1]);   // 送っている最中の状態
+          const r = replies[i++]; if (r instanceof Error) throw r; return r;
+        },
         { id: 1 }, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, (v) => locked.push(v));
-      return { ctx, fn, els, sent, locked };
+      return { ctx, fn, els, sent, locked, lockedWhileSending };
     };
     // ① 通信が切れた → 届いたか分からないので印が立つ
     const a = mkRun([new Error('network')]);
@@ -3973,7 +3978,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     ok(a.ctx.unresolved === true, '⭐通信が切れたら「届いたか分からない」印が立つ');
     ok(a.ctx.body && a.ctx.body.client_request_id === 'p-fixed',
       '⭐送った中身をそのまま控える (次に送るのは画面の値ではなくこれ — Codex R6 中5)');
-    ok(a.locked[0] === true, '⭐見えている値と送る中身を食い違わせないよう、入力を編集できなくする (Codex R6 重大3)');
+    ok(a.lockedWhileSending[0] === true,
+      '⭐**送っている最中から**入力を閉じる (待ちの間に直せると、応答を失ったとき画面と送る中身が食い違う — Codex R7 重大)');
+    ok(a.locked[a.locked.length - 1] === true, '届いたか分からない間は閉じたまま (中身を変えさせない)');
     // ② 画面の値が変わっても、送るのは控えた中身
     const b = mkRun([new Error('network'), { ok: false, error: 'bad_copies', message: 'x' }]);
     await b.fn();
@@ -3991,8 +3998,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     // ④ はじめから入力の誤りなら、印は立たない (選び直せる)
     const d = mkRun([{ ok: false, error: 'bad_copies', message: 'x' }]);
     await d.fn();
-    ok(!d.ctx.unresolved && d.locked.length === 0,
-      'はじめての送信が断られただけなら、印は立たず入力も閉じない (選び直せる)');
+    ok(!d.ctx.unresolved && d.locked[d.locked.length - 1] === false,
+      '⭐サーバーが断ってきただけなら入力を開け直す (直して送り直せる。印は立たない)');
   }
   ok(html.includes('repaintAfterPrint(c); openPrintBox(c.id, ctx.batchId);'),
     '⭐前回の結果を確かめて開き直すときは、**選んでいたまとまりのまま**にする (対象を変えさせない)');
