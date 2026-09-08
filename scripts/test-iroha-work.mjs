@@ -6467,8 +6467,45 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
     'まとまりの予定数・できた数・作れなかった数・ひとことを使う');
   ok(/if \(c\.status === 'closed'\) \{\s*\r?\n\s*reason = await ask\(/.test(html),
     '終了したカードのぶんを戻すときは、理由を聞く');
-  ok(/function batchesCardHtml\(c\)/.test(html) && /if \(bs\.length <= 1\) return '';/.test(html),
-    '⭐まとまりが 1 つなら「作業のまとまり」は出さない (ふだんの見え方を変えない)');
+  // ⭐まとまりが 1 つのときの見え方。**実際に動かして**確かめる
+  //   (利用者にはこれまでどおり何も出ない / 職員には「分ける」入口だけ出る)
+  {
+    const srcA = html.match(/function splitOnlyHtml\(c\) \{[\s\S]*?\r?\n\}/)[0];
+    const srcB = html.match(/function batchesCardHtml\(c\) \{[\s\S]*?\r?\n\}/)[0];
+    const LFCH = String.fromCharCode(10);
+    // ⭐職員の見た目・許可・アプリかどうか・下見かどうかを**別々に**渡す
+    //   (同じ値を配ると、どれか 1 つの関門を消しても通ってしまう — Codex #1273 R2 軽微2)
+    const mk = (staff, opts = {}) => new Function(
+      'isApp', 'detailSrc', 'isStaffUI', 'stateCan', 'esc', 'batchRowHtml', 'facilityName',
+      srcA + LFCH + srcB + '; return batchesCardHtml;')(
+      () => opts.app !== false, opts.src || 'detail',
+      () => (opts.staffUI === undefined ? staff : opts.staffUI),
+      // ⭐**権限の名前まで見る**。名前を見ないと、実装が別の権限を見るように変わっても通る
+      (name) => name === 'task.consign' && (opts.can === undefined ? staff : opts.can),
+      (v) => String(v), () => '<row>', (c) => String(c));
+    const one = [{ id: 1, work_status: 'not_started', planned_qty: 100 }];
+    ok(mk(false)({ batches: one }) === '',
+      '⭐利用者には、まとまりが 1 つなら何も出さない (ふだんの見え方を変えない)');
+    const staffOut = mk(true)({ batches: one });
+    ok(/data-bsplit="1"/.test(staffOut) && /期限が違う物が混ざっていたら/.test(staffOut),
+      '⭐職員には「分ける」入口を出す (まとまりの欄が出ないと、最初の 1 回を分けられない — Codex #1273 R1 中1)');
+    ok(!/作業のまとまり/.test(staffOut), 'ただし「作業のまとまり」の欄は出さない (分かれていないので)');
+    ok(mk(true)({ batches: [{ id: 1, work_status: 'ready_for_stocking', planned_qty: 100 }] }) === '',
+      '棚入待ちのぶんには出さない (分けられないので)');
+    ok(mk(true)({ batches: [{ id: 1, work_status: 'not_started', planned_qty: 1 }] }) === '',
+      '1 個しか無ければ出さない (分けられないので)');
+    ok(mk(true)({ batches: [{ id: 1, work_status: 'not_started', planned_qty: 100, consigned_out: true }] }) === '',
+      '外にあずけているぶんには出さない');
+    // ⭐関門を 1 つずつ外して、どれが欠けても出ないことを見る
+    ok(mk(true, { staffUI: false })({ batches: one }) === '', '⭐職員の見た目でなければ出さない');
+    ok(mk(true, { can: false })({ batches: one }) === '', '⭐預けの許可が無ければ出さない');
+    ok(/stateCan\('task\.consign'\)/.test(srcA), '⭐見ている許可は task.consign (別の許可に変わったら気づく)');
+    ok(mk(true, { src: 'preview' })({ batches: one }) === '', '⭐下見 (読むだけ) では出さない');
+    ok(mk(true, { app: false })({ batches: one }) === '', '⭐Notion が正本のうちは出さない');
+    // 2 つ以上なら、これまでどおり「作業のまとまり」
+    const two = mk(true)({ batches: [{ id: 1, work_status: 'not_started', planned_qty: 60 }, { id: 2, work_status: 'not_started', planned_qty: 40 }] });
+    ok(/作業のまとまり/.test(two), '2 つ以上なら「作業のまとまり」を出す');
+  }
   ok(/data-bdone="/.test(html) && /data-bstock="/.test(html),
     'まとまりごとに「このぶんを作り終えた」「このぶんを棚入完了」が出せる');
   ok(/if \(b\.consigned_out\) \{\s*\r?\n\s*btn = '';/.test(html),
@@ -8459,6 +8496,107 @@ console.log('\n[期限違い] ✂ 期限が違うぶんを手で分ける (§AB-
   ok(!/別の期限のぶん\*\*/.test(html), '画面に ** をそのまま出さない');
   ok(/expect_version: b\.version/.test(html),
     '⭐画面が見ていた版を送る (二重に分けない — R1 重大)');
+}
+
+console.log('\n[つかいかた] 📖 マニュアルと実装が食い違っていないか');
+{
+  const man = fs.readFileSync(new URL('../apps/iroha-work/views/manual.html', import.meta.url), 'utf8');
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+
+  // ⭐もくじ・節の id・見出しの番号がずれていない (節を足すたびに手で直すので、ずれやすい)
+  // ⭐**節ごとに中身を切り出して**、その中の見出し番号と id が合っているかを見る
+  //   (文書全体から別々に集めると、見出しが節の外へ出ても順番さえ合えば通ってしまう)
+  const secBlocks = [...man.matchAll(/<section id="(s\d+)"[^>]*>([\s\S]*?)<\/section>/g)]
+    .map((m) => ({ id: m[1], body: m[2] }));
+  ok(secBlocks.length >= 16, "節を切り出せた");
+  const ids = secBlocks.map((x) => x.id);
+  ok(new Set(ids).size === ids.length, "節の id が重複していない");
+  ok(ids.join(",") === ids.map((_, i) => "s" + (i + 1)).join(","), "⭐節の id が s1 から順に並んでいる");
+  for (const sec of secBlocks) {
+    const inner = [...sec.body.matchAll(/<span class="no">(\d+)<\/span>/g)].map((m) => Number(m[1]));
+    ok(inner.length === 1 && "s" + inner[0] === sec.id,
+      "⭐" + sec.id + " の見出し番号が id と合っている (見出しは節の中に 1 つだけ)");
+  }
+  // もくじは nav の中だけを見る (本文の中のリンクと混ぜない)
+  const nav = (man.match(/<nav[\s\S]*?<\/nav>/) || [""])[0];
+  const toc = [...nav.matchAll(/href="#(s\d+)"/g)].map((m) => m[1]);
+  ok(toc.length === ids.length, "もくじの数と節の数が合っている");
+  ok(toc.every((t) => ids.includes(t)), "⭐もくじの飛び先が全部ある (押しても飛ばない項目が無い)");
+  ok(ids.every((x) => toc.includes(x)), "⭐全部の節がもくじに載っている (書いたのに辿り着けない節が無い)");
+
+  // ⭐画面に出るボタンの言葉と、マニュアルの言葉が合っている
+  //   (実装の文言を変えたのにマニュアルが古いまま、を防ぐ)
+  const both = [
+    ['🚚 外部にあずける', '外部にあずける'],
+    ['✂ 期限が違うぶんを分ける', '期限が違うぶんを分ける'],
+    ['数を入れる', '数が抜けている返却に出すボタン'],
+    ['数を直す', '数が入っている返却に出すボタン'],
+    ['さっき出したのとは別に要る', '同じラベルをもう一度出すときの確認'],
+    ['どのぶんの作業をはじめますか?', 'まとまりを選ぶ画面 (§3)'],
+    ['いま手をつけられるぶんがありません', '手元に作業できるぶんが無いときの案内 (§3)'],
+    ['期限が違う物が混ざっていたら', 'まだ分かれていないカードに出す欄'],
+  ];
+  for (const [word, what] of both) {
+    ok(html.includes(word) && man.includes(word), "⭐画面とマニュアルで同じ言葉を使う: " + word + " (" + what + ")");
+  }
+
+  // ⭐今日足した操作が、マニュアルに書いてある
+  // ⭐**その説明が書いてある節に絞って**見る (別の節にたまたま同じ言葉があると素通りするため)
+  const sec = (id) => (secBlocks.find((x) => x.id === id) || { body: "" }).body;
+  const s13 = sec("s13");   // 外部にあずける
+  const s14 = sec("s14");   // 分かれたカード
+  const split14 = (s14.match(/期限が違う物が混ざっていたら[\s\S]*?<\/ol>/) || [""])[0];
+  ok(split14.length > 100, "分ける手順を切り出せた");
+  for (const cond of ["棚に入れた", "箱ラベルを刷った", "できた数を数えた", "外にあずけている"]) {
+    ok(split14.includes(cond), "⭐分けられない条件を 1 つずつ書く: " + cond);
+  }
+  ok(/全部は分けられません/.test(split14), "全部は分けられないことを書く");
+  ok(/1 つに戻せません/.test(split14), "⭐分けたら戻せないことを、押す前に書く");
+  ok(/空のままでも構いません/.test(split14), "⭐期限は空のままでもよいことを書く");
+  // 返却の数まわりも、その節に絞る
+  ok(/空のままで構いません/.test(s13), "⭐使える数は空のままでよいことを書く");
+  ok(/精算がすんだあとでも入れられます/.test(s13), "⭐精算ずみでも入れられることを書く");
+  ok(/棚に入れたあとは数を変えられません/.test(s13), "⭐棚入れ後は数を直せないことを書く");
+  ok(!/このぶんをやり直す」で棚入れを取り消して/.test(man),
+    "🚨やり直しても棚入れの記録は消えないので、その案内を書かない (実装と食い違う)");
+  // ⭐**サーバーが返す文にも**同じ誤りを残さない (マニュアルだけ直しても、画面には古い案内が出る)
+  {
+    const cs = fs.readFileSync(new URL('../apps/iroha-work/consign.js', import.meta.url), 'utf8');
+    ok(!/やり直す」で棚入れを取り消して/.test(cs),
+      "🚨サーバーの案内にも「やり直せば直せる」と書かない (やり直しても記録は消えない)");
+    // ⭐**実際に返ってくる message** を見る (ファイル全体の文字列照合だと、別の言い方で復活しても通る)
+    const C5 = await import('../apps/iroha-work/consign.js');
+    const B5 = await import('../apps/iroha-work/batches.js');
+    const TD5 = await import('../apps/iroha-work/tasks-db.js');
+    const db5 = getDB();
+    const t5 = TD5.upsertTaskFromImport({ notion_page_id: 'mn-1', status: 'not_started', facility_code: 'iroha',
+      destination_id: 9781, product_name: '案内の確かめ', qty: 20 }, { batchId: 'mn' }).id;
+    const b5 = B5.listBatchesOfTask(db5, t5)[0];
+    const cg5 = C5.startConsignment({ taskId: t5, batchId: b5.id, facilityCode: "workcenter", qty: 20,
+      expectVersion: TD5.getTask(t5).version });
+    let cur5 = C5.markHanded({ consignmentId: cg5.consignment.id, expectVersion: cg5.consignment.version }).consignment;
+    cur5 = C5.recordReturn({ consignmentId: cur5.id, returnedQty: 20, goodQty: 20, expectVersion: cur5.version }).consignment;
+    B5.recordStocking(db5, b5.id, { by: "たにがわ" });
+    const r5 = C5.updateReturnCounts({ consignmentId: cur5.id, returnId: cur5.returns[0].id, goodQty: 10,
+      expectVersion: C5.getConsignment(cur5.id).version });
+    ok(!r5.ok && r5.error === 'stocked_batch', '(前提) 棚入れ後は数を直せない');
+    ok(/棚に入れた記録と食い違うため/.test(r5.message) && /職員に相談してください/.test(r5.message),
+      "⭐返ってくる案内が、直せない理由と相談先を言う");
+    ok(!/やり直/.test(r5.message), "⭐返ってくる案内に「やり直せば直せる」と書かない");
+  }
+  ok(/職員に相談してください/.test(s13), "直せないときの出口 (職員に相談) を書く");
+  // ラベルの注意は §14 に
+  ok(/ラベルを出す機械 \(QL-800\)/.test(s14), "同じラベルを出す前に、機械と出てきたラベルを見てもらう");
+  ok(/箱とラベルの期限が合わなくなります/.test(s14), "違うぶんを選ぶと期限が合わなくなることを書く");
+  // 利用者も使う「どのぶんの作業か」は §3 (作業をはじめる) に
+  ok(/どのぶんの作業をはじめますか/.test(sec("s3")),
+    "⭐まとまりの選び方は利用者の節に書く (利用者もおこなうため)");
+  ok(/いま手をつけられるぶんがありません/.test(sec("s3")), "その案内も利用者の節に");
+
+  // ⭐職員だけの節は staff の印が付いている (利用者の画面では隠れる)
+  const staffSecs = [...man.matchAll(/<section id="(s\d+)"([^>]*)>/g)].filter((m) => /class="staff"/.test(m[2])).map((m) => m[1]);
+  ok(staffSecs.includes("s13") && staffSecs.includes("s14"),
+    "⭐外部にあずける・分かれたカードの節は職員向けの印が付いている");
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
