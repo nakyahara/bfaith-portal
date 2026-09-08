@@ -101,4 +101,99 @@ t('flag ON ではタブB が出て、想定利益タブも共存する', () => {
   assert.ok(on.includes('想定利益 (単品)'));
 });
 
+
+console.log('');
+console.log('経費の内訳の表 (中原さん 2026-09-08「すべての経費と配送方法をちゃんと表示」)');
+
+// 🚨 画面の表はブラウザ側の JS が文字列で組み立てている。EJS を描くだけでは中身を見られない。
+//    関数を切り出して**実際に動かし**、列の数と colspan が合っているかを確かめる
+//    (colspan の数え間違いは目で見ないと分からず、表が1列ずれる)
+function renderTable(rows, scope) {
+  const src = html.match(/function renderExpectedProfit\(\)[\s\S]*?\n    \}/);
+  assert.ok(src, '画面から renderExpectedProfit を切り出せない');
+  const sandbox = {
+    epState: { rows, total: rows.length, scope, published: { built_at: '2026-09-08T00:00:00Z' }, summary: {} },
+    escapeHtml: (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
+    epNum: (v) => (v == null ? '' : String(Math.round(v))),
+    epPct: (v) => (v == null ? '' : (v * 100).toFixed(1) + '%'),
+    epReason: (c) => String(c || ''),
+    MALL_FEE_RATES_LABEL: { amazon: 'Amazon', rakuten: '楽天' },
+    bindExpectedProfitEvents: () => {},
+    document: { getElementById: () => container },
+  };
+  const container = { innerHTML: '' };
+  const fn = new Function(...Object.keys(sandbox), src[0] + '; return renderExpectedProfit;')(...Object.values(sandbox));
+  fn();
+  return container.innerHTML;
+}
+
+const cells = (tr) => (tr.match(/<t[dh][^>]*>/g) || []).map(tag => {
+  const m = tag.match(/colspan="(\d+)"/);
+  return m ? Number(m[1]) : 1;
+}).reduce((a, b) => a + b, 0);
+
+const sampleRow = (over = {}) => ({
+  mall: 'amazon', mall_item_key: 'sku1', product_name: '商品', fulfillment: 'FBM',
+  price_ex_tax: 900, price_incl_tax: 990, postage_revenue_ex_tax: 0,
+  cost_ex_tax: 300, unit_quantity: 1,
+  shipping_method: 'ネコポス', shipping_code: '501',
+  shipping_fee_ex_tax: 180, shipping_work_ex_tax: 20,
+  shipping_material_ex_tax: 10, shipping_labor_ex_tax: 9, shipping_total_ex_tax: 219,
+  fba_fee_ex_tax: null, referral_fee_ex_tax: 89, closing_fee_ex_tax: 0,
+  per_item_fee_ex_tax: 0, fee_total_ex_tax: 89, fee_rate_display: 0.1,
+  expected_profit: 292, expected_margin_rate: 0.324,
+  rank_eligible_now: 1, rank_exclusion_reason_now: null, incomplete_reason: null,
+  ...over,
+});
+
+t('[!] 自社配送の行の列数が見出しと一致する (colspan の数え間違いを防ぐ)', () => {
+  const out = renderTable([sampleRow()], 'self_v1');
+  const trs = out.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
+  assert.ok(trs.length >= 3, `見出し2行 + データ1行のはず (実際 ${trs.length})`);
+  const group = cells(trs[0]);
+  const head = cells(trs[1]);
+  const body = cells(trs[2]);
+  assert.equal(head, 24, `見出しは24列のはず (実際 ${head})`);
+  assert.equal(group, head, `まとまりの見出しが合わない (${group} vs ${head})`);
+  assert.equal(body, head, `データ行が合わない (${body} vs ${head})`);
+});
+
+t('[!] FBA の行も列数が一致する (Amazon が配送する行は colspan でまとめている)', () => {
+  const out = renderTable([sampleRow({
+    fulfillment: 'FBA', shipping_method: null, shipping_code: null,
+    shipping_fee_ex_tax: null, shipping_work_ex_tax: null,
+    shipping_material_ex_tax: null, shipping_labor_ex_tax: null, shipping_total_ex_tax: null,
+    fba_fee_ex_tax: 462,
+  })], 'fba_v1');
+  const trs = out.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
+  assert.equal(cells(trs[2]), cells(trs[1]), 'FBA 行の列数が見出しと合わない');
+});
+
+t('[!] 配送方法と送料区分コードが実際に出る (中原さんの元の要望)', () => {
+  const out = renderTable([sampleRow()], 'self_v1');
+  assert.ok(out.includes('ネコポス'), '配送方法が出ていない');
+  assert.ok(out.includes('>501<'), '送料区分コードが出ていない');
+});
+
+t('[!] 経費の内訳が1つずつ出る (合計だけにしない)', () => {
+  const out = renderTable([sampleRow()], 'self_v1');
+  for (const [name, v] of [['送料', '180'], ['出荷作業料', '20'], ['梱包資材費', '10'], ['人件費', '9'],
+    ['販売手数料', '89']]) {
+    assert.ok(out.includes('>' + v + '<'), `${name} (${v}) が出ていない`);
+  }
+});
+
+t('見出しに経費の名前が全部ある', () => {
+  const out = renderTable([sampleRow()], 'self_v1');
+  for (const h of ['配送方法', '送料区分', '送料', '出荷作業料', '梱包資材費', '人件費',
+    'FBA配送代行', '販売手数料', '成約料', '基本成約料', '手数料 合計']) {
+    assert.ok(out.includes('>' + h + '<'), `見出し「${h}」が無い`);
+  }
+});
+
+t('[!] 値が無いことと 0 円を見分けられる', () => {
+  const out = renderTable([sampleRow({ closing_fee_ex_tax: 0, per_item_fee_ex_tax: null })], 'self_v1');
+  assert.ok(out.includes('—'), '値が無い欄に — が出ていない');
+});
+
 console.log(`\n${passed} 件 PASS`);
