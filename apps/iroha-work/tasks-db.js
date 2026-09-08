@@ -1431,7 +1431,7 @@ export function startTaskCrewSession({ taskId, staff, facilityCode, crewSize, ba
   }
 }
 
-export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null }) {
+export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null, batchId = null }) {
   const db = getDB();
   const crew = (Array.isArray(workers) && workers.length) ? workers : [worker];
   const tx = db.transaction(() => {
@@ -1463,8 +1463,11 @@ export function startTaskSession({ taskId, worker, workers = null, deviceLabel =
       t = c.task;
       clearedBlock = true;
     }
+    // ⭐どのまとまりの作業か (要件 §AB-10)。まとまりが 1 つなら画面が自動で選ぶので操作は変わらない。
+    //   2 つ以上あって画面が絞れないときは選んでもらう — 決めずに始めると batch_id が NULL のまま残り、
+    //   「どのぶんに何分かかったか」が分からなくなる
     const r = startSessions({
-      taskId: t.id, productCode: t.product_code, title: t.product_name, workers: crew, deviceLabel,
+      taskId: t.id, productCode: t.product_code, title: t.product_name, workers: crew, deviceLabel, batchId,
       masterSnapshot: snapshotOf ? snapshotOf(t) : undefined,
     });
     // 記録は**人ごと**に残す (誰の分が新しく始まったかが後で分かるように)

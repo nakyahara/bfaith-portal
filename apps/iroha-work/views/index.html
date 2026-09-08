@@ -5465,15 +5465,52 @@ async function crewStart() {
  * @param opts { clearBlock } 止まっている札を外して始める (確認ダイアログで「はい」を押した後)
  * @returns true = 開始できた / 'blocked' = 止まっているので確認を出した / false = 断られた
  */
+/** ⭐選んだぶん (opts.batchId) が優先。無ければ画面が 1 つに絞れたぶん。どちらも無ければ null */
+function pickedBatch(c, opts) {
+  if (opts && opts.batchId) return opts.batchId;
+  return homeBatchId(c);
+}
+/**
+ * ⭐**どのぶんの作業かを選ぶ** (要件 §AB-10)。手元のまとまりが 2 つ以上あって、
+ * 画面が 1 つに絞れないときだけ出す。ふだん (1 つ) は今までどおり出ない。
+ *
+ * 選ばずに始めると、作業時間が「どのぶんか分からない」まま残る (batch_id が NULL) — あとから
+ * どのぶんに何分かかったか言えなくなるので、ここで決めてもらう。
+ */
+function openWorkBatchPick(c, ids, opts) {
+  const home = homeBatches(c);
+  $('#askTitle').textContent = 'どのぶんの作業をはじめますか?';
+  const t = $('#askText');
+  t.textContent = 'このカードは作業が分かれています。いま手をつけるぶんを選んでください。';
+  const box = document.createElement('div');
+  box.className = 'chips';
+  box.id = 'wbPick';
+  box.innerHTML = home.map((b) => '<button type="button" class="chip" data-wb="' + b.id + '">' +
+    esc(facilityName(b.facility_code) || 'いろは') + ' ' + esc(String(b.planned_qty == null ? '数不明' : b.planned_qty + ' 個')) +
+    (b.expiry ? ' ・ 期限 ' + esc(b.expiry) : '') +
+    (b.work_status === 'in_progress' ? ' (作業中)' : '') + '</button>').join('');
+  t.appendChild(box);
+  box.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-wb]');
+    if (!b) return;
+    closeOverlay('#askOv');
+    startWork(ids, { ...(opts || {}), batchId: Number(b.dataset.wb) });
+  });
+  openOverlay('#askOv');
+}
 async function startWork(ids, opts) {
   if (!can('task.work.start')) return false;   // 読むだけ (下見・履歴) では始めない
   if (!worker) { openGate(); return false; }
   if (!curDetail || !ids || !ids.length) return false;
   const cur = findCard(curDetail);
+  // ⭐手元のまとまりが 2 つ以上あって絞れないなら、先に選んでもらう (§AB-10)
+  if (!pickedBatch(cur, opts) && homeBatches(cur).length > 1) { openWorkBatchPick(cur, ids, opts); return false; }
   const j = await apiFetch('/api/sessions/start', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     // 札を外して始めるときは、確認した版 (expect_version) も送る — 確認している間に理由が付け替わっていたら断られる
     body: JSON.stringify({ id: curDetail, worker_id: worker.id, worker_ids: ids,
+      // ⭐どのぶんの作業か (§AB-10)。選んであればそれ、無ければ画面が 1 つに絞れたぶん
+      ...(pickedBatch(cur, opts) ? { batch_id: pickedBatch(cur, opts) } : {}),
       ...(opts && opts.clearBlock ? { clear_block: true, expect_version: cur ? cur.version : undefined } : {}) }),
   });
   if (!j.ok) {
@@ -6260,12 +6297,21 @@ function dqDiff(el) {
  * まとまりが 1 つならサーバーに任せる (null)。2 つ以上なら**手元の拠点**(物を持ち帰らない = offsite でない)
  * で、まだ作業できる (未着手・作業中) ものを選ぶ。作業中が 1 つならそれ。決まらなければ null (サーバーが「選んで」と断る)
  */
-function homeBatchId(c) {
+/**
+ * ⭐**手元の (物を持ち帰らない) まとまり**で、まだ作業できるもの。
+ * 2 つ以上あると「どのぶんの作業か」が決まらないので、画面で選んでもらう (要件 §AB-10)。
+ */
+function homeBatches(c) {
   const all = (c && c.batches || []).filter((x) => x.work_status !== 'cancelled');
-  if (all.length <= 1) return null;
+  if (all.length <= 1) return [];
   const facs = new Map((((boardState() || {}).facilities) || []).map((f) => [f.code, !!f.offsite]));
-  const home = all.filter((x) => !(x.facility_code && facs.get(x.facility_code)) && (x.work_status === 'not_started' || x.work_status === 'in_progress'));
+  return all.filter((x) => !(x.facility_code && facs.get(x.facility_code))
+    && (x.work_status === 'not_started' || x.work_status === 'in_progress'));
+}
+function homeBatchId(c) {
+  const home = homeBatches(c);
   if (home.length === 1) return home[0].id;
+  // 作業中が 1 つだけなら、そのぶん (「はじめる」を押し直したとき、いま進めているぶんに付ける)
   const going = home.filter((x) => x.work_status === 'in_progress');
   return going.length === 1 ? going[0].id : null;
 }

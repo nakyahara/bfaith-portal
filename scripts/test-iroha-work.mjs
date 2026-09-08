@@ -6121,7 +6121,11 @@ console.log('\n[29] 外部施設にあずける — まとまりを割る・渡�
   ok(/consign_open: '外にあずけたぶんが返っていません'/.test(html), 'まとめて棚入完了で飛ばした理由が読める');
   // homeBatchId を実際に動かす
   {
-    const src = html.match(/function homeBatchId\(c\) \{[\s\S]*?\r?\n\}/)[0];
+    const LFCH = String.fromCharCode(10);
+    // ⭐homeBatchId は homeBatches を呼ぶので、**まとめて**取り出す (判定は 1 か所に置いてある)
+    const srcA = html.match(/function homeBatches\(c\) \{[\s\S]*?\r?\n\}/)[0];
+    const srcB = html.match(/function homeBatchId\(c\) \{[\s\S]*?\r?\n\}/)[0];
+    const src = srcA + LFCH + srcB;
     const fn = new Function('boardState', src + '; return homeBatchId;')(() => ({ facilities: [
       { code: 'iroha', offsite: 0 }, { code: 'rehas', offsite: 0 }, { code: 'workcenter', offsite: 1 }] }));
     ok(fn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'in_progress' }] }) === null, 'まとまりが 1 つならサーバーに任せる');
@@ -6132,8 +6136,28 @@ console.log('\n[29] 外部施設にあずける — まとまりを割る・渡�
     ok(fn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'in_progress' }, { id: 3, facility_code: null, work_status: 'not_started' },
       { id: 2, facility_code: 'workcenter', work_status: 'in_progress' }] }) === 1, '手元が 2 つなら作業中のほう');
     ok(fn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'not_started' }, { id: 3, facility_code: null, work_status: 'not_started' },
-      { id: 2, facility_code: 'workcenter', work_status: 'in_progress' }] }) === null, '決められなければ null (サーバーが「選んで」と断る)');
+      { id: 2, facility_code: 'workcenter', work_status: 'in_progress' }] }) === null, '決められなければ null (画面が選ばせる)');
+    // ⭐手元のまとまりの一覧 (選ばせるときに出すもの)
+    const listFn = new Function('boardState', srcA + '; return homeBatches;')(() => ({ facilities: [
+      { code: 'iroha', offsite: 0 }, { code: 'rehas', offsite: 0 }, { code: 'workcenter', offsite: 1 }] }));
+    const two = listFn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'not_started' },
+      { id: 3, facility_code: null, work_status: 'not_started' }, { id: 2, facility_code: 'workcenter', work_status: 'in_progress' }] });
+    ok(two.length === 2 && two.every((b) => b.id !== 2),
+      '⭐手元のぶんだけ返す (外に持ち帰るぶんは、いろはで時間を測れないので出さない)');
+    ok(listFn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'in_progress' }] }).length === 0,
+      'まとまりが 1 つなら選ばせない (ふだんの操作は変わらない)');
+    ok(listFn({ batches: [{ id: 1, facility_code: 'iroha', work_status: 'done' },
+      { id: 3, facility_code: null, work_status: 'ready_for_stocking' }] }).length === 0,
+      '終わったぶん・棚入待ちのぶんは選ばせない (もう作業しない)');
   }
+  // 🚨手元が 2 つ以上で絞れないときは、始める前に選ばせる (要件 §AB-10)
+  ok(/if \(!pickedBatch\(cur, opts\) && homeBatches\(cur\)\.length > 1\) \{ openWorkBatchPick\(cur, ids, opts\); return false; \}/.test(html),
+    '⭐絞れないまま「はじめる」を通さない (batch_id が NULL の作業時間を作らない)');
+  ok(/function openWorkBatchPick\(c, ids, opts\)/.test(html) && /どのぶんの作業をはじめますか/.test(html)
+    && /data-wb=/.test(html),
+    'どのぶんかを選ぶ画面がある (数・期限・拠点を見て選べる)');
+  ok(/\.\.\.\(pickedBatch\(cur, opts\) \? \{ batch_id: pickedBatch\(cur, opts\) \} : \{\}\)/.test(html),
+    '⭐個人の「はじめる」でも、どのぶんかを送る (人数だけの作業と同じ)');
 }
 
 console.log('\n[30] まとまりごとに作り終える・先に棚入れする (§AB-11 の 5)');
@@ -8051,6 +8075,46 @@ console.log('\n[返却の数] ⭐あとから「使える数」を入れる (入
   ok(/let next = null;/.test(html) && !/let next = 0;/.test(html)
     && html.includes(String.raw`if (raw !== '') {`),
     '⭐空のままなら「まだ数えていない」(null) のまま。0 で代用しない');
+}
+
+console.log('\n[作業のまとまり] ⭐どのぶんの作業かを記録する (要件 §AB-10)');
+{
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const B = await import('../apps/iroha-work/batches.js');
+  const D = await import('../apps/iroha-work/db.js');
+  const dbx = getDB();
+  const w = D.addIrohaWorker({ displayName: 'まとまり係', workerType: 'member', actor: 'test' });
+  const worker = D.getIrohaWorker(w.id);
+
+  // 手元のまとまりが 2 つあるカード
+  const t = TD.upsertTaskFromImport({ notion_page_id: 'sb-1', status: 'not_started', facility_code: 'iroha',
+    destination_id: 9741, product_name: 'まとまりの作業', qty: 100 }, { batchId: 'sb' }).id;
+  const at = new Date().toISOString();
+  dbx.prepare("INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, created_at, updated_at)"
+    + " VALUES (?, 2, 40, 'not_started', ?, ?)").run(t, at, at);
+  const bs = B.listBatchesOfTask(dbx, t);
+  ok(bs.length === 2, '(前提) 手元のまとまりが 2 つ');
+
+  // ⭐どのぶんかを指定して始めると、その作業時間はそのぶんに紐づく
+  const r = TD.startTaskSession({ taskId: t, worker, batchId: bs[1].id });
+  ok(r.ok, '(前提) 始められる');
+  const sess = dbx.prepare('SELECT batch_id FROM f_iroha_work_sessions WHERE task_id = ? ORDER BY id DESC LIMIT 1').get(t);
+  ok(sess.batch_id === bs[1].id,
+    '⭐選んだぶんに作業時間が紐づく (どのぶんに何分かかったか、あとから言える)');
+
+  // ⭐指定しなければ NULL のまま (画面が選ばせる。サーバーは当てずっぽうで結びつけない)
+  D.stopSession({ taskId: t, workerId: worker.id, sessionId: r.sessionId, reason: 'done' });
+  const r2 = TD.startTaskSession({ taskId: t, worker });
+  const sess2 = dbx.prepare('SELECT batch_id FROM f_iroha_work_sessions WHERE task_id = ? ORDER BY id DESC LIMIT 1').get(t);
+  ok(r2.ok && sess2.batch_id === null, '指定しなければ NULL のまま (当てずっぽうで結びつけない)');
+
+  // ⭐よそのカードのぶんは指定できない
+  D.stopSession({ taskId: t, workerId: worker.id, sessionId: r2.sessionId, reason: 'done' });
+  const t2 = TD.upsertTaskFromImport({ notion_page_id: 'sb-2', status: 'not_started', facility_code: 'iroha',
+    destination_id: 9742, product_name: 'よそのカード', qty: 10 }, { batchId: 'sb' }).id;
+  const other = B.listBatchesOfTask(dbx, t2)[0];
+  const bad = TD.startTaskSession({ taskId: t, worker, batchId: other.id });
+  ok(!bad.ok && bad.error === 'bad_batch', '⭐よそのカードのぶんは指定できない');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
