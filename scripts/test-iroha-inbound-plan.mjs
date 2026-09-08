@@ -251,11 +251,15 @@ console.log('\n[7] 画面と API の配線');
   ok(/id="vInbound" onclick="setView\('inbound'\)"/.test(html), '作業画面のナビに 🚚 入荷予定 がある');
   ok(/inbound: '\.inboundpage'/.test(html) && /inbound: '#vInbound'/.test(html), 'PAGES / VIEW_BTN に登録されている (他の画面を隠す側も動く)');
   ok(/if \(v === 'inbound'\) loadInboundPlan\(\);/.test(html), '開いたときに取りにいく');
-  ok(/<table class="tbl plain">[\s\S]{0,400}入荷予定日[\s\S]{0,200}商品[\s\S]{0,200}数量[\s\S]{0,200}いろは在庫化区分/.test(html),
-    '表の列は 入荷予定日 / 商品 / 数量 / いろは在庫化区分');
+  ok(/<table class="tbl plain fit">[\s\S]{0,300}<th>商品<\/th><th>数量<\/th><th>いろは在庫化区分<\/th>/.test(html),
+    '表の列は 商品 / 数量 / いろは在庫化区分 の 3 つ (入荷予定日は出さない — 中原さん 2026-09-09)');
+  ok(!/入荷予定日<\/th>/.test(html) && !/ipDayLabel/.test(html), '⭐日付の列も、日付を作る道具も残さない');
+  ok(/\.tbl\.fit\{min-width:0\}/.test(html) && /@media \(max-width:560px\)/.test(html),
+    '⭐幅の狭い端末でも横スクロールなしで収まる (min-width を外す + 狭いとき用の指定)');
   ok(/\.tbl\.plain tbody tr\{cursor:default\}/.test(html), '行は押せない見た目にする (開く先が無い)');
-  ok(/\.tbl tr\.past td\{color:var\(--faint\)\}/.test(html), '⭐予定日を過ぎた行は薄く出す (グレーアウト)');
+  ok(/\.tbl tr\.past td\{color:var\(--sub\)\}/.test(html), '⭐予定日を過ぎた行は薄く出す (グレーアウト)');
   ok(/r\.past \? ' class="past"' : ''/.test(html), '⭐薄くするかはサーバーの past で決める (iPad の時計を信じない)');
+  ok(/遅れています/.test(html), '遅れている印は商品の下に出す (日付は出さない)');
   ok(/id="ipHidden"/.test(html) && /出していないもの: /.test(html), '⭐出していない分の理由を画面に書く (黙って減らさない)');
   ok(/router\.get\('\/api\/inbound-plan'/.test(router), 'GET /api/inbound-plan がある');
   ok(!/\/api\/inbound-plan'[\s\S]{0,200}checkOrigin/.test(router), '読むだけなので書き込みの口 (POST) は作らない');
