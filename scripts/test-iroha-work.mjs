@@ -6480,7 +6480,8 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
       srcA + LFCH + srcB + '; return batchesCardHtml;')(
       () => opts.app !== false, opts.src || 'detail',
       () => (opts.staffUI === undefined ? staff : opts.staffUI),
-      () => (opts.can === undefined ? staff : opts.can),
+      // ⭐**権限の名前まで見る**。名前を見ないと、実装が別の権限を見るように変わっても通る
+      (name) => name === 'task.consign' && (opts.can === undefined ? staff : opts.can),
       (v) => String(v), () => '<row>', (c) => String(c));
     const one = [{ id: 1, work_status: 'not_started', planned_qty: 100 }];
     ok(mk(false)({ batches: one }) === '',
@@ -6498,6 +6499,7 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
     // ⭐関門を 1 つずつ外して、どれが欠けても出ないことを見る
     ok(mk(true, { staffUI: false })({ batches: one }) === '', '⭐職員の見た目でなければ出さない');
     ok(mk(true, { can: false })({ batches: one }) === '', '⭐預けの許可が無ければ出さない');
+    ok(/stateCan\('task\.consign'\)/.test(srcA), '⭐見ている許可は task.consign (別の許可に変わったら気づく)');
     ok(mk(true, { src: 'preview' })({ batches: one }) === '', '⭐下見 (読むだけ) では出さない');
     ok(mk(true, { app: false })({ batches: one }) === '', '⭐Notion が正本のうちは出さない');
     // 2 つ以上なら、これまでどおり「作業のまとまり」
@@ -8562,8 +8564,25 @@ console.log('\n[つかいかた] 📖 マニュアルと実装が食い違って
     const cs = fs.readFileSync(new URL('../apps/iroha-work/consign.js', import.meta.url), 'utf8');
     ok(!/やり直す」で棚入れを取り消して/.test(cs),
       "🚨サーバーの案内にも「やり直せば直せる」と書かない (やり直しても記録は消えない)");
-    ok(/棚に入れた記録と食い違うため/.test(cs) && /職員に相談してください/.test(cs),
-      "サーバーの案内は、直せない理由と相談先を言う");
+    // ⭐**実際に返ってくる message** を見る (ファイル全体の文字列照合だと、別の言い方で復活しても通る)
+    const C5 = await import('../apps/iroha-work/consign.js');
+    const B5 = await import('../apps/iroha-work/batches.js');
+    const TD5 = await import('../apps/iroha-work/tasks-db.js');
+    const db5 = getDB();
+    const t5 = TD5.upsertTaskFromImport({ notion_page_id: 'mn-1', status: 'not_started', facility_code: 'iroha',
+      destination_id: 9781, product_name: '案内の確かめ', qty: 20 }, { batchId: 'mn' }).id;
+    const b5 = B5.listBatchesOfTask(db5, t5)[0];
+    const cg5 = C5.startConsignment({ taskId: t5, batchId: b5.id, facilityCode: "workcenter", qty: 20,
+      expectVersion: TD5.getTask(t5).version });
+    let cur5 = C5.markHanded({ consignmentId: cg5.consignment.id, expectVersion: cg5.consignment.version }).consignment;
+    cur5 = C5.recordReturn({ consignmentId: cur5.id, returnedQty: 20, goodQty: 20, expectVersion: cur5.version }).consignment;
+    B5.recordStocking(db5, b5.id, { by: "たにがわ" });
+    const r5 = C5.updateReturnCounts({ consignmentId: cur5.id, returnId: cur5.returns[0].id, goodQty: 10,
+      expectVersion: C5.getConsignment(cur5.id).version });
+    ok(!r5.ok && r5.error === 'stocked_batch', '(前提) 棚入れ後は数を直せない');
+    ok(/棚に入れた記録と食い違うため/.test(r5.message) && /職員に相談してください/.test(r5.message),
+      "⭐返ってくる案内が、直せない理由と相談先を言う");
+    ok(!/やり直/.test(r5.message), "⭐返ってくる案内に「やり直せば直せる」と書かない");
   }
   ok(/職員に相談してください/.test(s13), "直せないときの出口 (職員に相談) を書く");
   // ラベルの注意は §14 に
