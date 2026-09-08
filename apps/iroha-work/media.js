@@ -19,7 +19,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { google } from 'googleapis';
 import { getDB, sourceOfTruth } from './db.js';
-import { notionRequest, isNotionConfigured } from '../inbound-check/notion.js';
+import { notionRequest, isNotionConfigured } from './notion-client.js';
 import { codeKeyOf } from '../inbound-check/work-master.js';
 
 export const MAX_PHOTOS = 3;

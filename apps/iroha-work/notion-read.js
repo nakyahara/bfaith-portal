@@ -20,7 +20,7 @@
  * HTTP 層は inbound-check の notionRequest を共用 (同じインテグレーション・同じ DB。
  * INBOUND_CHECK_NOTION_DB_ID がこの DB の ID)。
  */
-import { notionRequest, isNotionConfigured, ensureCardSchema } from '../inbound-check/notion.js';
+import { notionRequest, isNotionConfigured, ensureCardSchema } from './notion-client.js';
 import { getDB, replaceCache, listCache, updateCacheStatus, upsertCachePage, removeCachePage, getMeta, setMetaValue } from './db.js';
 
 export { isNotionConfigured };

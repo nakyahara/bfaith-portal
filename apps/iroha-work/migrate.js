@@ -18,7 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { getDB, setMetaValue } from './db.js';
 import { queryPages, parsePage } from './notion-read.js';
-import { checkCardSchema, isNotionConfigured } from '../inbound-check/notion.js';
+import { checkCardSchema, isNotionConfigured } from './notion-client.js';
 import { mapLegacyStatus, OPEN_STATUSES } from './tasks.js';
 import { upsertTaskFromImport, backfillTaskIds, listOrphans, countTasksByStatus } from './tasks-db.js';
 

@@ -188,13 +188,6 @@ export function createTables(db = getMirrorDB()) {
       updated_by          TEXT
     );
 
-    -- Notion sweep の多重実行防止 lease (notion-sync.js。期限切れは自動回収 = 永久ロックにならない)
-    CREATE TABLE IF NOT EXISTS f_inbound_check_notion_lease (
-      id         INTEGER PRIMARY KEY CHECK (id = 1),
-      holder     TEXT NOT NULL,
-      expires_at TEXT NOT NULL
-    );
-
     CREATE TABLE IF NOT EXISTS f_inbound_check_import_log (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       at         TEXT NOT NULL,
@@ -485,26 +478,14 @@ function migrateQuantity(db) {
   // 「詳細の期限管理のところで期限を入れられるように。入れてあれば確認時に聞かなくていい」)。
   // 期限は入荷ごとに変わるので line_state (バッチ限り) に持つ — 翌日には自然に消える
   addCol(db, 'f_inbound_check_line_state', 'pending_expiry', 'TEXT');
-  // Notion 作業カード (いろは行き) の outbox 状態 (notion-sync.js が使う)。
-  // 作成の成功 (synced_at) と取消反映の成功 (cancelled_at) は別の列に持つ — synced_at を
-  // 取消時に上書きすると「いつカードを作ったか」が消える (Codex設計相談R1 2026-09-02)
+  // 旧 Notion「在庫化作業管理」カードのページID。⭐**送信のコードは 2026-09-09 に削除済み**で、
+  // 新しく入ることはない。列を残すのは、在庫化アプリの「紐付けの衝突」(iroha-work/task-intake.js
+  // listLinkConflicts) が Notion 時代に作られた行を今も引くため + 過去の対応関係を失わないため。
+  // 送信の途中経過を持っていた他の notion_* 列 (synced_at / payload / error / attempt_count /
+  // next_retry_at / cancelled_at / cancel_error / cancelled_prev_status / dedupe_key /
+  // cancel_next_retry_at / cancel_attempt_count) と lease テーブルは、読む所が無くなったので
+  // ここから外した (既存 DB に残っている列はそのまま = 過去データは消さない)
   addCol(db, 'f_inbound_check_destinations', 'notion_page_id', 'TEXT');
-  addCol(db, 'f_inbound_check_destinations', 'notion_synced_at', 'TEXT');
-  addCol(db, 'f_inbound_check_destinations', 'notion_payload', 'TEXT');
-  addCol(db, 'f_inbound_check_destinations', 'notion_error', 'TEXT');
-  addCol(db, 'f_inbound_check_destinations', 'notion_attempt_count', 'INTEGER');
-  addCol(db, 'f_inbound_check_destinations', 'notion_next_retry_at', 'TEXT');
-  addCol(db, 'f_inbound_check_destinations', 'notion_cancelled_at', 'TEXT');
-  addCol(db, 'f_inbound_check_destinations', 'notion_cancel_error', 'TEXT');
-  addCol(db, 'f_inbound_check_destinations', 'notion_cancelled_prev_status', 'TEXT');
-  // 回収用の永続ランダムキー (カードの「台帳キー」プロパティと対)。行IDは DB 作り直しで
-  // 振り直されるため回収キーにしない (Codex R1 #8)。カード作成の**前に**保存される
-  addCol(db, 'f_inbound_check_destinations', 'notion_dedupe_key', 'TEXT');
-  // 取消反映の再試行は送信側 (notion_next_retry_at) と**別の列**で制御する。
-  // 共用すると、送信エラーで永久ブロックした行の「取消」まで巻き込まれ、
-  // 取消済みの作業指示が Notion に有効なまま残る (Codex R3 High)
-  addCol(db, 'f_inbound_check_destinations', 'notion_cancel_next_retry_at', 'TEXT');
-  addCol(db, 'f_inbound_check_destinations', 'notion_cancel_attempt_count', 'INTEGER');
 
   // 作り方動画のリンク (中原さんFB⑥ 2026-09-02。いろは作業アプリ PR4 で登録・表示)。
   // 旧シートの「作業動画URL」列は全て空で持ち込まなかった — 今後はアプリから育てる

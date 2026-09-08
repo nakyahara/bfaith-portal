@@ -1,13 +1,14 @@
 /**
- * 🗂 Notion「在庫化作業管理」の運用廃止 (2026-09-05) — 入荷受付チェックの Notion の入口が閉じていること
+ * 🗂 Notion「在庫化作業管理」の運用廃止 (2026-09-05) → コード削除 (2026-09-09) —
+ *   入荷受付チェックに Notion が残っていないこと
  *
  * 実行: node scripts/test-inbound-check-notion-retired.mjs
  *
- * 守りたいのは3つ。
- *   ① 正本がアプリ (通常) のとき、Notion へ送る API は 410 で「在庫化アプリの未着手に入っている」と言う
- *      (押しても何も起きないボタンや、静かに no-op する API を残さない)
- *   ② 退路 (在庫化アプリ /admin/source で Notion に戻した) では従来どおり送れる (自動送信は無い)
- *   ③ jobs-monitor が退役した id を「台帳に無い id」として毎朝鳴らさない・古い記録は消える
+ * 守りたいのは4つ。
+ *   ① 送信のモジュール (notion-sync.js / notion.js) が無い。中にあった生きた集計は enrich.js に残っている
+ *   ② Notion へ送る API は**経路ごと無い** (404)。正本を Notion に戻しても復活しない = 退路は無い
+ *   ③ iPad・管理画面に Notion の操作が出ない
+ *   ④ jobs-monitor が退役した id を「台帳に無い id」として毎朝鳴らさない・古い記録は消える
  */
 import fs from 'fs';
 import os from 'os';
@@ -47,8 +48,28 @@ console.log('\n[2] cron: 17:30 の Notion 送信は起動されない (関数ご
   ok(!/startInboundCheckNotionCron\(\)/.test(src), 'server.js から呼び出しが消えている');
 }
 
+console.log('\n[3] モジュール: 送信のコードは消え、生きた集計だけ残っている');
+{
+  const gone = async (path) => { try { await import(path); return false; } catch (e) { return /Cannot find module|ERR_MODULE_NOT_FOUND/.test(e.message) || e.code === 'ERR_MODULE_NOT_FOUND'; } };
+  ok(await gone('../apps/inbound-check/notion-sync.js'), 'apps/inbound-check/notion-sync.js は無い (17:30 の一括送信・sweep)');
+  ok(await gone('../apps/inbound-check/notion.js'), 'apps/inbound-check/notion.js は無い (Notion HTTP クライアント)');
+  const enrich = await import('../apps/inbound-check/enrich.js');
+  ok(typeof enrich.buildEnrichContext === 'function' && typeof enrich.calcExternal === 'function',
+    '⭐sweep の中にあった純粋な集計は enrich.js に残る (いろは在庫化アプリが現役で使う)');
+  const svc = fs.readFileSync(new URL('../apps/iroha-work/service.js', import.meta.url), 'utf8');
+  ok(/from '\.\.\/inbound-check\/enrich\.js'/.test(svc), 'iroha-work/service.js は enrich.js を見ている');
+  // いろは作業アプリ側の Notion (カード読み取り・完成写真の送信・移行) は対象外 = 従来どおり動く
+  const client = await import('../apps/iroha-work/notion-client.js');
+  ok(typeof client.notionRequest === 'function' && typeof client.ensureCardSchema === 'function',
+    'いろは作業アプリの Notion クライアントは残っている (この削除の対象外)');
+  ok(typeof client.createCard === 'undefined' && typeof client.findCardsByDedupeKey === 'undefined',
+    'カード作成系は送信専用だったので消えている');
+  const dir = fs.readdirSync(new URL('../apps/inbound-check/', import.meta.url));
+  ok(!dir.some((f) => /notion/i.test(f)), 'apps/inbound-check に notion のファイルは 1 つも無い');
+}
+
 // ─── HTTP: 入荷受付チェックの Notion の入口 ───
-console.log('\n[3] HTTP: 正本がアプリなら Notion へ送る API は 410');
+console.log('\n[4] HTTP: Notion へ送る API は経路ごと無い (退路でも復活しない)');
 const express = (await import('express')).default;
 const router = (await import('../apps/inbound-check/router.js')).default;
 const app = express();
@@ -74,30 +95,33 @@ const call = async (method, url, { session = null, body = null } = {}) => {
   setMetaValue('source_of_truth', 'app');
   eq(sourceOfTruth(), 'app', '正本 = app');
   const st = await call('GET', '/api/state', { session: 'user' });
-  eq(st.body && st.body.iroha_source, 'app', '/api/state に iroha_source=app (iPad はこれで「Notionへ送る」を隠す)');
+  eq(st.status, 200, '/api/state は今までどおり返る');
+  ok(st.body && !('iroha_source' in st.body), '/api/state に iroha_source は無い (Notion ボタンを出し分ける材料が要らなくなった)');
   const a = await call('POST', '/api/notion-sync', { session: 'user', body: {} });
-  eq(a.status, 410, 'iPad/セッションからの送信は 410');
-  ok(a.body.error === 'notion_retired' && /在庫化アプリ/.test(a.body.message) && a.body.app_url === '/apps/iroha-work/', `理由と行き先を返す (${a.body.message})`);
+  eq(a.status, 404, 'iPad/セッションからの送信は 404 (経路が無い)');
   const b = await call('POST', '/admin/notion-sync', { session: 'admin', body: {} });
-  eq(b.status, 410, '管理画面の送信・再送も 410');
-  eq(b.body.error, 'notion_retired', 'notion_retired');
-}
+  eq(b.status, 404, '管理画面の送信・再送も 404');
 
-console.log('\n[4] HTTP: 退路 (正本を Notion に戻した) では従来どおり通る');
-{
+  // ⭐退路は無い: 正本を Notion に戻しても、送る口は生えない
   setMetaValue('source_of_truth', 'notion');
-  eq(sourceOfTruth(), 'notion', '正本 = notion');
-  const st = await call('GET', '/api/state', { session: 'user' });
-  eq(st.body && st.body.iroha_source, 'notion', '/api/state に iroha_source=notion (iPad はボタンを出す)');
-  const a = await call('POST', '/api/notion-sync', { session: 'user', body: {} });
-  ok(a.status !== 410, `410 ではなく sweep へ進む (HTTP ${a.status})`);
-  eq(a.body.error, 'not_configured', 'env が無いこのテストでは not_configured で止まる (= sweep が呼ばれた証拠)');
+  eq(sourceOfTruth(), 'notion', '正本 = notion (退路の設定)');
+  const c = await call('POST', '/api/notion-sync', { session: 'user', body: {} });
+  eq(c.status, 404, '⭐正本を Notion に戻しても 404 のまま (送信のコードごと消したため)');
   setMetaValue('source_of_truth', 'app');
 }
 server.close();
 
+console.log('\n[5] 画面: iPad と管理画面に Notion の操作が無い');
+{
+  const idx = fs.readFileSync(new URL('../apps/inbound-check/views/index.html', import.meta.url), 'utf8');
+  ok(!/id="notionBtn"/.test(idx) && !/Notionへ送る<\/button>/.test(idx), 'iPad に「🗂 Notionへ送る」ボタンが無い');
+  ok(!/\/notion-sync/.test(idx), 'iPad から送信 API を叩く箇所が無い');
+  const adm = fs.readFileSync(new URL('../apps/inbound-check/views/admin.ejs', import.meta.url), 'utf8');
+  ok(!/notion/i.test(adm), '管理画面に notion の文字が 1 つも無い');
+}
+
 // ─── jobs-monitor: 退役した id を鳴らさない ───
-console.log('\n[5] jobs-monitor: 退役した id は「台帳に無い id」にしない・記録は消える');
+console.log('\n[6] jobs-monitor: 退役した id は「台帳に無い id」にしない・記録は消える');
 {
   const store = await import('../apps/jobs-monitor/store.js');
   const { recordPing, getStates, purgeJobStates, setAlertState, getAlertState } = store;
@@ -134,22 +158,16 @@ console.log('\n[5] jobs-monitor: 退役した id は「台帳に無い id」に�
   ok(/setMeta\('monitoring_since'[\s\S]{0,120}purgeRetiredJobStates\(\);/.test(src), '起動処理 (monitoring_since の直後) で purgeRetiredJobStates を呼んでいる');
 }
 
-// ─── 管理画面の節: 3 つの見え方 (アプリ正本 / 退路 / 状態不明) ───
-console.log('\n[6] 管理画面: 正本ごとの見え方');
+// ─── 管理画面: notion を渡さなくても描けること (router が渡さなくなった) ───
+console.log('\n[7] 管理画面: notion 無しでレンダリングできる');
 {
   const ejs = (await import('ejs')).default;
   const src = fs.readFileSync(new URL('../apps/inbound-check/views/admin.ejs', import.meta.url), 'utf8');
   const base = { title: 't', username: 'u', displayName: 'd', isAdmin: true, base: '/apps/inbound-check', active: null, batches: [], importLog: [], devices: [], enrollCodes: [], workers: [], drive: { config: {} }, workMaster: { total: 0, filled: 0 }, printAgents: [], printJobs: [], PRINT_STATE_LABELS: {}, refreshAvailable: true };
-  const body = (html) => html.split('<script')[0];
-  const appMode = ejs.render(src, { ...base, notion: { configured: true, source: 'app', linkConflicts: [], linkConflictsTotal: 0, unsent: 3, waitingRetry: 2, blocked: [], attention: [] } });
-  ok(/いろはへの作業指示 \(在庫化アプリ\)/.test(appMode) && /2026-09-05 に運用廃止/.test(appMode), 'アプリ正本: 廃止と行き先 (在庫化アプリ) を書く');
-  ok(!/id="notionSyncBtn"/.test(body(appMode)) && !/送信待ち/.test(appMode) && !/再試行待ち/.test(appMode), 'アプリ正本: 送信ボタン・Notion 時代の件数を出さない');
-  const notionMode = ejs.render(src, { ...base, notion: { configured: true, source: 'notion', linkConflicts: [], linkConflictsTotal: 0, unsent: 3, waitingRetry: 2, cancelPending: 0, sentRecent: 0, dbIdTail: 'abc', blocked: [], attention: [] } });
-  ok(/退路モード/.test(notionMode) && /id="notionSyncBtn"/.test(body(notionMode)), '退路: 送信ボタンを出す');
-  ok(!/30分おきに自動で再試行/.test(notionMode) && /自動再試行はもうありません/.test(notionMode), '退路: 「30分おきに自動で再試行」とは言わない (巡回は削除済み)');
-  const unknownMode = ejs.render(src, { ...base, notion: { error: 'boom' } });
-  ok(/状態を取得できませんでした: boom/.test(unknownMode) && !/在庫化アプリ\)/.test(unknownMode.split('<h2>🏠 いろはへの作業指示</h2>')[1].slice(0, 40)), '状態不明: 断定せず理由を出す');
-  ok(!/id="notionSyncBtn"/.test(body(unknownMode)) && !/2026-09-05 に運用廃止になりました/.test(unknownMode), '状態不明: 送信ボタンも「廃止」の断定も出さない');
+  const html = ejs.render(src, base);   // ⭐notion を渡さない
+  ok(/いろはへの作業指示 \(在庫化アプリ\)/.test(html), 'いろはへの作業指示の案内は出る');
+  ok(/入荷側はカードを作るだけ/.test(html), '⭐「入荷側はカードを作るだけ」と書いてある (2026-09-09 の決め)');
+  ok(!/notionSyncBtn/.test(html) && !/送信待ち/.test(html), '送信ボタン・Notion 時代の件数は出ない');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

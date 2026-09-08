@@ -275,8 +275,6 @@
       <a class="btn-reload" href="/apps/inbound-check/products" style="text-decoration:none;color:inherit">🔍 商品から探す</a>
       <!-- 🚚 予定していない納品をロジザードに入れた直後に押す (定時 08:40/11:45 を待たない) -->
       <button type="button" class="btn-reload" id="refreshBtn" style="display:none">🚚 いま取りに行く</button>
-      <!-- 🗂 Notion は 2026-09-05 に廃止。正本が Notion に戻されたとき (退路) だけ出す -->
-      <button type="button" class="btn-reload" id="notionBtn" style="display:none">🗂 Notionへ送る</button>
       <div class="seg">
         <button type="button" data-filter="todo" class="on">残りあり</button>
         <button type="button" data-filter="all">すべて</button>
@@ -385,7 +383,7 @@
     // 有効期限は YYYY-MM-DD か YYYY-MM (日が書かれていない商品は年月だけ)
     const fmtExpiry = s => !s ? '' : (s.length === 7 ? s.replace('-', '/') : s.slice(2).replace(/-/g, '/'));
 
-    // sticky = ポーリング成功でも自動で消さない (Notion送信の結果など「読ませたい」通知用)。
+    // sticky = ポーリング成功でも自動で消さない (「いま取りに行く」の結果など「読ませたい」通知用)。
     // タップで閉じられる。⚠通常のerrは従来どおり回復したら自動で消す
     let bannerSticky = false;
     function banner(kind, html, { sticky = false } = {}) {
@@ -409,7 +407,6 @@
           state = j;
           render();
           renderRefresh();   // 🚚「いま取りに行く」の進み具合 (他の iPad が押した分もここに出る)
-          renderNotionBtn(); // 🗂 Notion は廃止 — 正本が Notion に戻されたときだけボタンを出す
         }
         // 最新の一覧を取得できた = 旧バッチ警告と通信エラーは解除
         if (stale) { stale = false; banner(null); }
@@ -1718,37 +1715,8 @@
 
     $('#q').addEventListener('input', () => { query = $('#q').value.trim(); editDirty = false; render(); });
 
-    // 🗂 Notion「在庫化作業管理」は 2026-09-05 に廃止。いろは行きは「確認」した時点で在庫化アプリの未着手に入る。
-    //    このボタンは、在庫化アプリの正本を Notion に戻したとき (退路) にだけ出す
-    function renderNotionBtn() {
-      const b = $('#notionBtn');
-      if (b) b.style.display = state.iroha_source === 'notion' ? '' : 'none';
-    }
-    // 🗂 Notionへ送る (iPadからも押せる。冪等 = 何回押しても二重カードにならない — 2026-09-02 中原さん)
-    $('#notionBtn').addEventListener('click', async () => {
-      const b = $('#notionBtn');
-      b.disabled = true;
-      b.textContent = '送信中…';
-      try {
-        const r = await fetch(API + '/notion-sync', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ worker_code: workerCode() || undefined }),
-        });
-        const j = await r.json().catch(() => ({}));
-        if (r.status === 401) { location.href = '/login'; return; }
-        if (j.ok) banner('ok', '🗂 Notionへ送りました: ' + esc(j.note || '完了'));
-        else if (j.error === 'notion_retired') { renderNotionBtn(); banner('warn', '🗂 ' + esc(j.message || 'Notion は廃止されました'), { sticky: true }); }
-        else if (j.error === 'worker_required') { openWorkerPick(); banner('warn', '作業者を選んでからもう一度押してください'); }
-        else if (j.error === 'rate_limited' || j.error === 'already_running') banner('warn', '⏱ ' + esc(j.message || '実行中です。少し待ってください'), { sticky: true });
-        else banner('err', '🗂 送信できませんでした: ' + esc(j.note || j.message || j.error || ('HTTP ' + r.status)), { sticky: true });
-        setTimeout(() => { if ($('#banner').classList.contains('ok')) banner(null); }, 6000);
-      } catch (e) {
-        banner('err', '🗂 通信できませんでした (' + esc(e.message) + ')');
-      } finally {
-        b.disabled = false;
-        b.textContent = '🗂 Notionへ送る';
-      }
-    });
+    // (2026-09-09 削除) 🗂「Notionへ送る」ボタン。Notion「在庫化作業管理」は 2026-09-05 に運用廃止で、
+    //   いろは行きは「確認」した時点で在庫化アプリの未着手に入るので、送る操作そのものが無い。
 
     // ─────────── 🏷 値札 (BCシール) 発行 → 倉庫PCの QL-700 ───────────
     // 入庫時BCシール貼りフラグが「貼付必要」の行にだけボタンを出す。押す前に確認ダイアログ1回。

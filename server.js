@@ -1705,8 +1705,9 @@ app.listen(PORT, () => {
   // 既定で有効 (JST 09:00 = ミラー同期完了後)。止める場合のみ INBOUND_INFO_SYNC_ENABLED=false
   startInboundInfoCron();
   startInboundCheckCron();
-  // (2026-09-05 廃止) 在庫化カードの Notion 送信 (17:30 cron・台帳 inbound-check-notion-cards) は無くなった。
-  // いろは行きの作業指示は「確認」と同じトランザクションで在庫化アプリ (f_iroha_tasks) の未着手に入る
+  // (2026-09-05 廃止 → 2026-09-09 コード削除) 在庫化カードの Notion 送信 (17:30 cron・台帳
+  // inbound-check-notion-cards)。いろは行きの作業指示は「確認」と同じトランザクションで
+  // 在庫化アプリ (f_iroha_tasks) の未着手に入る
   // 🏷 値札印刷キューの見張り (30秒間隔。滞留→manual / 報告なし→unknown / 倉庫PCエージェントの生存を台帳 nefuda-print-agent へ中継)
   startInboundCheckPrintQueueWorker();
   // いろは作業アプリ: 完成写真・動画の Drive/Notion 送信キュー (プロセス内2分間隔の再試行。

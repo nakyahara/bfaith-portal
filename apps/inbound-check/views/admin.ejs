@@ -211,89 +211,22 @@
     </div>
 
     <div class="ic-box">
-      <%# 正本 = 'app' (通常・Notion 廃止) / 'notion' (退路) / 'unknown' (状態を取れなかった — 断定しない) %>
-      <% const notionMode = (notion && !notion.error) ? (notion.source === 'notion' ? 'notion' : 'app') : 'unknown'; %>
-      <% const notionRetired = notionMode === 'app'; %>
-      <% if (notionMode === 'unknown') { %>
-      <h2>🏠 いろはへの作業指示</h2>
-      <p class="ng">⚠ 正本 (在庫化アプリ / Notion) の状態を取得できませんでした<%= notion && notion.error ? ': ' + notion.error : '' %>。
-        通常は在庫化アプリが正本で Notion は廃止 (2026-09-05) ですが、この画面からは断定できません。
-        <a href="/apps/iroha-work/admin" target="_blank" rel="noopener">在庫化アプリの管理画面</a>で正本を確認してください。</p>
-      <% } else if (notionRetired) { %>
       <h2>🏠 いろはへの作業指示 (在庫化アプリ)</h2>
       <p class="hint">
-        「いろはで在庫化」と確定した明細は、<b>確定と同時に いろは在庫化アプリの「未着手」</b> に入ります (iPad の一覧に即時)。
-        取り消し (やり直し・再取込で消えた行) も同じ経路で反映されます。<br>
-        <b>Notion「在庫化作業管理」は 2026-09-05 に運用廃止</b>になりました。17:30 の送信も、送信ボタンもありません。
+        「いろはで在庫化」と確定した明細は、<b>確定と同時に いろは在庫化アプリの「未着手」</b> に入ります (iPad の一覧に即時)。<br>
+        ⭐<b>入荷側はカードを作るだけ</b>です。やり直しても、再取込で商品や予定数が変わっても、
+        カードを消したり取消の札を付けたりはしません (2026-09-09)。要らないカードはいろはの職員が終了にします。<br>
         カードの状況は <a href="/apps/iroha-work/" target="_blank" rel="noopener">在庫化アプリ</a> /
         取込や紐付けの整理は <a href="/apps/iroha-work/admin" target="_blank" rel="noopener">在庫化アプリの管理画面</a> で。
       </p>
-      <% } else { %>
-      <h2>🗂 Notion 作業カード (いろはの在庫化作業管理) — 退路モード</h2>
-      <p class="hint">
-        ⚠ 在庫化アプリの正本が <b>Notion に戻されています</b> (/admin/source)。Notion は 2026-09-05 に運用廃止のため
-        <b>17:30 の自動送信はもうありません</b>。送るなら下のボタンで手動に。アプリへ戻したらこの節は消えます。
-      </p>
-      <% } %>
-      <% if (notion && !notion.error && notion.linkConflicts && notion.linkConflicts.length) { %>
-        <p class="ng">⚠ 紐付けの衝突 <b><%= notion.linkConflictsTotal %></b> 件: 行き先台帳の Notion カードを、確定時のタスクとは別のタスク (取込で作られた方) が持っています。
-          <a href="/apps/iroha-work/admin">在庫化アプリの管理画面</a>「Notion → アプリ正本化」の「紐付けの衝突」で統合してください —
-          <% notion.linkConflicts.forEach((c) => { %><span>task#<%= c.task_id %> (<%= c.product_code %>) ↔ task#<%= c.other_task_id %></span> <% }) %><% if (notion.linkConflictsTotal > notion.linkConflicts.length) { %> …他 <%= notion.linkConflictsTotal - notion.linkConflicts.length %> 件<% } %></p>
-      <% } %>
-      <% if (notionMode === 'unknown') { %>
-        <%# 上で理由を出した。数字やボタンは出さない (正本が分からないまま送らせない) %>
-      <% } else if (notionRetired) { %>
-        <%# Notion 廃止: 送信待ち/再送/要確認 は Notion 時代の数字なので出さない %>
-      <% } else if (!notion.configured) { %>
-        <p class="ng">⚠ 未設定です。Render の env に <code>INBOUND_CHECK_NOTION_DB_ID</code> を追加し、
-          Notion 側で「在庫化作業管理」DB のコネクトに既存インテグレーションを追加してください (NOTION_TOKEN は共用)。</p>
-      <% } else { %>
-        <p>送信待ち <b><%= notion.unsent %></b> 件 ・ 取消の反映待ち <b><%= notion.cancelPending %></b> 件
-          <% if (notion.waitingRetry) { %> ・ 一時エラーの再試行待ち <b><%= notion.waitingRetry %></b> 件 (自動再試行はもうありません — 下の「今すぐ送る」か「再送」で手動)<% } %> ・
-          直近24時間の送信 <b><%= notion.sentRecent %></b> 件<% if (notion.lastSyncedAt) { %> ・ 最終送信 <span data-jst="<%= notion.lastSyncedAt %>"></span><% } %>
-          (DB …<%= notion.dbIdTail %>)</p>
-        <div class="row">
-          <button id="notionSyncBtn" type="button">🗂 今すぐ Notion へ送る</button>
-          <span id="notionMsg" class="msg"></span>
-        </div>
-        <% if (notion.blocked && notion.blocked.length) { %>
-          <p class="hint" style="margin-top:10px"><b class="ng">エラーで止まっている明細</b> (原因を直したら「再送」):</p>
-          <table class="ic-list">
-            <thead><tr><th>#</th><th>商品</th><th>エラー</th><th></th></tr></thead>
-            <tbody>
-              <% for (const b of notion.blocked) { %>
-                <tr><td><%= b.id %></td><td><%= b.product_id %> <%= b.product_name || '' %></td>
-                  <td class="ng"><%= b.notion_error || b.notion_cancel_error || '' %></td>
-                  <td><button class="btn-sm btn-notion-retry" data-id="<%= b.id %>">再送</button></td></tr>
-              <% } %>
-            </tbody>
-          </table>
-        <% } %>
-        <% if (notion.attention && notion.attention.length) { %>
-          <p class="hint" style="margin-top:10px"><b class="ng">⚠ 要確認: 着手後に取消になったカード</b>
-            — いろはで作業が始まっていた可能性があります。現物の状態を確認してください:</p>
-          <table class="ic-list">
-            <thead><tr><th>取消反映</th><th>商品</th><th>数量</th><th>取消の理由</th><th>取消時のカード状態</th></tr></thead>
-            <tbody>
-              <% for (const a of notion.attention) { %>
-                <tr><td><span data-jst="<%= a.notion_cancelled_at %>"></span></td>
-                  <td><%= a.product_id %> <%= a.product_name || '' %></td>
-                  <td><%= a.actual_qty == null ? '' : a.actual_qty %></td>
-                  <td><%= a.cancel_reason === 'reopen' ? 'やり直し' : (a.cancel_reason || '') %></td>
-                  <td><%= a.notion_cancelled_prev_status %></td></tr>
-              <% } %>
-            </tbody>
-          </table>
-        <% } %>
-      <% } %>
     </div>
 
     <div class="ic-box">
       <h2>🧰 いろは作業仕様マスタ (資材・収納容器・入数・工程数)</h2>
       <p class="hint">
-        旧スプレッドシート「作業内容管理マスター」の置き換えです。Notion 作業カードの
+        旧スプレッドシート「作業内容管理マスター」の置き換えです。いろはの作業カードの
         資材セットID・収納容器・入数 (いろはで1容器に詰める数)・工程数・備考 は<b>カード作成時に</b>ここから載ります
-        (作成時スナップショット — 後からマスタを変えても既存カードは変わりません。直すなら Notion 側で)。<br>
+        (作成時スナップショット — 後からマスタを変えても既存カードは変わりません)。<br>
         取込は xlsx をそのままアップロード → まず<b>「検証する」</b> (何も書き込みません) →
         内容を確認してから「本取込」。※在庫化するかどうか (いろは有無) はここでは扱いません —
         正本は入庫情報で、荷受け時のその場選択で育ちます。<br>
@@ -802,27 +735,6 @@
       }
     };
     if (bcBtn) bcBtn.addEventListener('click', () => runBarcodeFetch());
-
-    // ── Notion 作業カード: 今すぐ送る / エラー行の再送 ──
-    const notionBtn = $('#notionSyncBtn');
-    const runNotionSync = async (retryId) => {
-      if (notionBtn) notionBtn.disabled = true;
-      msg($('#notionMsg'), true, '送信しています…');
-      try {
-        const { status, j } = await postJson(BASE + '/admin/notion-sync', retryId ? { retry_id: retryId } : {});
-        if (j.ok) {
-          msg($('#notionMsg'), true, '✅ ' + (j.note || '完了'));
-          setTimeout(() => location.reload(), 1500);
-          return;   // reload するのでボタンは戻さない
-        }
-        msg($('#notionMsg'), false, '❌ ' + (j.note || j.message || j.error || ('HTTP ' + status)));
-      } catch (e) {
-        msg($('#notionMsg'), false, '❌ 通信できませんでした: ' + e.message);
-      }
-      if (notionBtn) notionBtn.disabled = false;
-    };
-    if (notionBtn) notionBtn.addEventListener('click', () => runNotionSync());
-    document.querySelectorAll('.btn-notion-retry').forEach(b => b.addEventListener('click', () => runNotionSync(Number(b.dataset.id))));
 
     // ── いろは作業仕様マスタ: xlsx 取込 (dry-run → 本取込) と検索・編集 ──
     const wmDry = $('#wmDryBtn'), wmApply = $('#wmApplyBtn'), wmFile = $('#wmFile');

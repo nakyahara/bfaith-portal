@@ -62,8 +62,6 @@ export function startInboundCheckCron() {
     // 中原さん 2026-09-06:「バーコードマスタ.csv は常に最新のバーコード情報を入れている」
     try { await runScheduledBarcodeFetch({ actor: 'cron' }); }
     catch (e) { console.warn(`[inbound-check] cron(バーコードマスタ): ${e.message}`); }
-    // (2026-09-05 廃止) ここに相乗りしていた Notion カードの取消反映・再試行 (runNotionSweep mode='retry') は無くなった。
-    // いろは行きの作業指示は「確認」と同じトランザクションで在庫化アプリ (f_iroha_tasks) に入り、取消も同じ経路で反映される
   }, { timezone: 'Asia/Tokyo' });
   console.log(`[inbound-check] cron 起動 (${use} JST)`);
   return task;
@@ -73,11 +71,9 @@ export function stopInboundCheckCron() {
   if (task) { task.stop(); task = null; }
 }
 
-// ─── (2026-09-05 廃止) Notion 作業カード (いろは行き) の 17:30 一括送信 ───
-// Notion「在庫化作業管理」は運用廃止になり、いろは行きの作業指示は「確認」と同じトランザクションで
-// 在庫化アプリ (f_iroha_tasks) の未着手に入る (task-intake.js)。17:30 の cron と台帳 'inbound-check-notion-cards' は
-// 外した。sweep 本体 (notion-sync.js) は、在庫化アプリの /admin/source で正本を Notion に戻した退路のときだけ
-// 管理画面・iPad の手動ボタンから動く (自動では動かない)。
+// ─── (2026-09-05 廃止 → 2026-09-09 削除) Notion 作業カードの 17:30 一括送信 ───
+// Notion「在庫化作業管理」の運用廃止に伴い、送信のコード (notion-sync.js) ごと消した。
+// いろは行きの作業指示は「確認」と同じトランザクションで在庫化アプリ (f_iroha_tasks) の未着手に入る (task-intake.js)。
 // env INBOUND_CHECK_NOTION_ENABLED / INBOUND_CHECK_NOTION_CRON はもう読まない (残っていても無害)
 
 // ─── 🏷 値札印刷キューの見張り (プロセス内 30 秒間隔) ───

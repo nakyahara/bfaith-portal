@@ -1,24 +1,22 @@
 /**
- * 入荷受付チェック — Notion「在庫化作業管理」DB クライアント
+ * いろは在庫化作業アプリ — Notion「在庫化作業管理」DB クライアント (HTTP だけ)
  *
- * いろは行きに確定した明細を Notion の作業カードにする経路の低レベル API。
- * 業務ロジック (どの行を送るか・取消の収束) は notion-sync.js が持つ。ここは HTTP だけ。
+ * 2026-09-09 に apps/inbound-check/notion.js からここへ移した。入荷受付チェックの Notion 送信
+ * (17:30 の一括・notion-sync.js) は Notion「在庫化作業管理」の運用廃止 (2026-09-05) に伴い削除したので、
+ * このクライアントを使うのは在庫化アプリだけになった (notion-read.js / media.js / migrate.js)。
+ * カード作成系 (createCard / findCardsByDedupeKey / getCardState / setCardStatus) は送信専用だったので消してある。
  *
  * 環境変数:
- *   NOTION_TOKEN                 … 既存インテグレーションのシークレット (giftset 等と共用。中原さん 2026-09-02)
- *   INBOUND_CHECK_NOTION_DB_ID   … 「在庫化作業管理」DB の ID
+ *   NOTION_TOKEN                 … 既存インテグレーションのシークレット (giftset 等と共用)
+ *   INBOUND_CHECK_NOTION_DB_ID   … 「在庫化作業管理」DB の ID (名前は移行前のまま。Render の env を変えずに済ませる)
  * どちらか未設定なら NOTION_NOT_CONFIGURED (fail-closed)。
- *
- * ⭐カードには必ず「台帳キー」(rich_text, 例 d123-a1b2c3) を入れる。
- *   「ページ作成は成功したが応答を受け取る前に落ちて page_id を保存できなかった」とき、
- *   このキーで既存カードを探して回収する (二重カードの防止)。
- *   行IDそのもの (destination_id, number) は人が見るための表示用 — DB を作り直すと
- *   AUTOINCREMENT が 1 から振り直され過去カードと衝突するため、回収キーには使わない (Codex R1 #8)。
  */
 
 const API_BASE = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
-export const DEDUPE_PROP = '台帳キー';
+// 旧 Notion 送信が二重カード防止に使っていた回収キーのプロパティ名。
+// 送信は消えたが、既存 DB のプロパティ検証 (ensureCardSchema) がこの名前を見るので残す
+const DEDUPE_PROP = '台帳キー';
 
 export function isNotionConfigured() {
   return !!(process.env.NOTION_TOKEN && process.env.INBOUND_CHECK_NOTION_DB_ID);
@@ -191,63 +189,3 @@ export async function checkCardSchema() {
 
 /** テストからキャッシュを消すため */
 export function _clearSchemaCache() { schemaCache = null; }
-
-// ─── ページ操作 ───
-
-/**
- * 台帳キーでカードを検索 (回収用)。複数返る = 二重カードの検出も兼ねる。
- * ⚠has_more/next_cursor で**全件**取り切る (件数固定だと4枚目以降の二重カードが
- *   取消されず有効なまま残る — Codex R4 High)。通常は 0〜1 件で1ページで終わる。
- *   10ページ (200件) で打ち切るのは暴走ガード — そこまで増える事故は別問題として表面化させる
- */
-export async function findCardsByDedupeKey(dedupeKey) {
-  const { dbId } = getConfig();
-  const results = [];
-  let cursor = null;
-  for (let page = 0; page < 10; page++) {
-    const body = {
-      filter: { property: DEDUPE_PROP, rich_text: { equals: String(dedupeKey) } },
-      page_size: 20,
-    };
-    if (cursor) body.start_cursor = cursor;
-    const r = await notionRequest(`/databases/${dbId}/query`, 'POST', body);
-    results.push(...(r.results || []));
-    if (!r.has_more || !r.next_cursor) break;
-    cursor = r.next_cursor;
-  }
-  return results;
-}
-
-/**
- * カードを1枚作成 → { id, url }。
- * ⚠POST は **1回だけ** (HTTP 層の自動再試行なし — Codex R2 #1)。
- *   タイムアウト/5xx は「Notion 側では作成成功したが応答が消えた」可能性があり、
- *   盲目的に再POSTすると2枚目ができる。曖昧な失敗のやり直しは呼び元 (notion-sync の
- *   createCardSafe) が台帳キーで再検索してから行う
- */
-export async function createCard(properties) {
-  const { dbId } = getConfig();
-  const data = await notionRequest('/pages', 'POST', {
-    parent: { database_id: dbId },
-    properties,
-  }, { maxAttempts: 1 });
-  return { id: data.id, url: data.url };
-}
-
-/** ページの現在状態 (取消反映の前に「人が動かしていたか」を見る) */
-export async function getCardState(pageId) {
-  const data = await notionRequest(`/pages/${pageId}`, 'GET');
-  const status = data.properties?.['ステータス']?.select?.name || null;
-  return { archived: !!data.archived, status };
-}
-
-/**
- * カードのステータスを変える (取消など)。
- * select 型は存在しない選択肢名を送ると Notion 側が自動で選択肢を作るので、
- * 「取消」を事前に手で足していなくても失敗しない。
- */
-export async function setCardStatus(pageId, statusName) {
-  await notionRequest(`/pages/${pageId}`, 'PATCH', {
-    properties: { 'ステータス': { select: { name: statusName } } },
-  });
-}

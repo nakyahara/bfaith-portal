@@ -33,7 +33,6 @@ const {
   workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow, logWorkMasterImport,
   importIssueCount, computeDeletions,
 } = await import('../apps/inbound-check/work-master.js');
-const { buildCardProperties, calcExternal } = await import('../apps/inbound-check/notion-sync.js');
 
 console.log('DATA_DIR =', process.env.DATA_DIR);
 const db = getDB();
@@ -130,19 +129,8 @@ console.log('\n[5] 管理画面編集');
   ok(found.length >= 1 && found[0].product_name === '商品1', '検索は mirror_products の商品名付き');
 }
 
-console.log('\n[6] Notion カードへの反映 (buildCardProperties + wm)');
-{
-  const names = new Set(['名前', 'ステータス', '数量', '資材セットID', '収納容器', '入数', '工程数', '備考', '台帳キー', 'destination_id']);
-  const wm = db.prepare("SELECT * FROM f_iroha_work_master WHERE code_key = 'prod-5'").get();
-  const row = { id: 1, product_id: 'PROD-5', product_name: '商品5', actual_qty: 10, planned_qty: 10, ar_no: 'AR1', work_date: '2026-09-02', code_key: 'prod-5' };
-  const props = buildCardProperties(row, { barcode: null, product: null, supplierName: null, ext: calcExternal(null, null), dedupeKey: 'd1-test', wm }, names);
-  ok(props['資材セットID'].select.name === 'T7-18', '資材 → 資材セットID (select — 実DBの型)');
-  ok(props['収納容器'].select.name === '9Lコンテナ', '収納容器 (select)');
-  ok(props['入数'].number === 80, '入数 = units_per_container (いろは容器あたり)');
-  ok(props['工程数'].number === 1, '工程数');
-  const noWm = buildCardProperties(row, { barcode: null, product: null, supplierName: null, ext: calcExternal(null, null), dedupeKey: 'd1-test', wm: null }, names);
-  ok(!('入数' in noWm) && !('資材セットID' in noWm), 'マスタ未整備の商品はこれらの項目を送らない');
-}
+// (2026-09-09 削除) [6] Notion カードへの反映 — Notion「在庫化作業管理」の廃止に伴い送信コードごと消した。
+//   作業仕様がいろはのカードに載ることは iroha-work 側のテストで見ている
 
 console.log('\n[7] [PR2-R2 High] 取込は全置換 — xlsx に無い既存行は削除される');
 {

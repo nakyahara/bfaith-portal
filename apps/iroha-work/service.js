@@ -13,7 +13,7 @@
  *   (= 1 週間以内に Z ロケの在庫を使わないといけない商品)。
  *   **理由を必ず付ける**。データ欠損をゼロで代用しない — 「在庫データなし」「新商品」はそれぞれ別の表示にする。
  */
-import { buildEnrichContext } from '../inbound-check/notion-sync.js';
+import { buildEnrichContext } from '../inbound-check/enrich.js';
 import { productImageMap } from '../inbound-check/db.js';
 import { queueEnsureImages } from '../picking/images.js';
 import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateByProduct, workSecondsByTask, finishedSessionsOfTask, listWorkOptions } from './db.js';
