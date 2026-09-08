@@ -8,17 +8,20 @@
  *   入荷受付伝票の明細・在庫ミラー・入荷予定 (7日分) から拾うしかなかったため、
  *   「入荷したことがなく在庫も無い商品」は値札を出せなかった (粟国の塩がこれ)。
  *
- * 列 (CP932):  商品ID / 商品名 / 検索名称 / バーコード / 有効区分
+ * 列 (CP932):  商品ID / 商品名 / 検索名称 / バーコード / 有効期限区分
  *   - **1商品に複数のバーコードが載る** (JAN と Amazon の FNSKU が別行など)。全部持つ:
  *     値札に刷るのは代表1つだが、📷 カメラや検索ではどのバーコードからでも商品を引きたい
  *   - 代表 (rank=0) = **チェックデジットまで正しい GTIN** (JAN-8/UPC-A/JAN-13/GTIN-14) を最優先、
  *     次に FNSKU、最後にその他の数字列 (社内コードなど)。同じ格なら CSV に先に出てくるもの
- *   - 有効区分の意味はロジザード側の設定に依存するので**値で判断しない** (まだ確かめていない)。
- *     取り込んだ内訳を管理画面に出して、中原さんが実データを見て決められるようにする
- *     (商品マスタの有効期限区分と同じ進め方)
+ *   - 🚨5列目は**「有効期限区分」**。最初の実装は「有効区分」という列名だと思い込んでいて、
+ *     必須列チェックで**取込が毎回まるごと拒否されていた** (2026-09-08 中原さん「rosebathp の
+ *     シールが出ない」で発覚。2025-06 のバックアップも「有効期限区分」= 最初から取り違えていた)。
+ *     中身も商品マスタの有効期限区分と同じ (01 = 無し / 02 = 期限あり) で、**バーコードの
+ *     有効/無効ではない** — なので「この区分を見て使わないバーコードを除く」ことはできない。
+ *     期限管理の正本は product-master.js のままにして、ここでは内訳を管理画面に出すだけにする
  *
  * fail-closed (product-master.js と同じ考え方 + 全量置換ゆえの安全弁):
- *   - 必須列 (商品ID / 商品名 / バーコード / 有効区分) が無ければ拒否。列名が変わったのを黙って通さない
+ *   - 必須列 (商品ID / 商品名 / バーコード / 有効期限区分) が無ければ拒否。列名が変わったのを黙って通さない
  *   - 壊れた CP932・列数不一致は拒否
  *   - 0行は拒否。マスタが空になることは無く、空を通すと全商品のバーコードが消える
  *   - **同じバーコードが別の商品に付いていたら拒否** (どちらの商品か決められない = 誤った商品を刷る)
@@ -31,7 +34,10 @@ import { decodeCsvBuffer, parseCsv } from './csv.js';
 const ID_COL = '商品ID';
 const BC_COL = 'バーコード';
 const NAME_COL = '商品名';
-const KUBUN_COL = '有効区分';
+// 実ファイルは「有効期限区分」。ロジザードの出力パターン次第で「有効区分」と出る環境もありうるので
+// **どちらか一方あれば通す** (両方無ければ拒否 = fail-closed は変えない)。
+// 両方ある CSV なら**この並びで先にある方** (= 有効期限区分) を読む — CSV の列順は見ない
+const KUBUN_COLS = ['有効期限区分', '有効区分'];
 
 /** 前回より何割まで減ってよいか。これを超えて減ったら取り込まない (人が承認すれば通る) */
 export const SHRINK_LIMIT = 0.2;
@@ -94,17 +100,24 @@ export function parseBarcodeMasterCsv(buffer) {
   if (rows.length === 0) bad('中身がありません');
   const header = rows[0].map(h => String(h || '').trim());
   // 🚨 5列そろっていることまで見る。列が減ったのを黙って通すと「区分不明のまま本番で使う」ことになる
-  for (const col of [ID_COL, NAME_COL, BC_COL, KUBUN_COL]) {
+  const shownHeader = () => `${header.slice(0, 12).join(' / ')}${header.length > 12 ? ' …' : ''}`;
+  for (const col of [ID_COL, NAME_COL, BC_COL]) {
     if (!header.includes(col)) {
-      bad(`必須列「${col}」がありません (実際の列: ${header.slice(0, 12).join(' / ')}${header.length > 12 ? ' …' : ''})`);
+      bad(`必須列「${col}」がありません (実際の列: ${shownHeader()})`);
     }
+  }
+  const kubunCol = KUBUN_COLS.find(c => header.includes(c));
+  if (!kubunCol) {
+    // 列名の候補が1つしかなくなっても壊れない並べ方にする
+    const names = KUBUN_COLS.map(c => `「${c}」`).join(' または ');
+    bad(`必須列 ${names} がありません (実際の列: ${shownHeader()})`);
   }
   const dup = header.filter((h, i) => h && header.indexOf(h) !== i);
   if (dup.length) bad(`列名が重複しています: ${[...new Set(dup)].join(', ')}`);
   const iId = header.indexOf(ID_COL);
   const iBc = header.indexOf(BC_COL);
   const iName = header.indexOf(NAME_COL);
-  const iKubun = header.indexOf(KUBUN_COL);
+  const iKubun = header.indexOf(kubunCol);
 
   const out = [];
   const kubunCounts = {};
@@ -161,7 +174,7 @@ export function parseBarcodeMasterCsv(buffer) {
     let n = 1;
     for (const x of list) x.rank = x === head ? 0 : n++;
   }
-  return { rows: out, header, kubunCounts, products: byProduct.size, invalidBarcodes, blankRows, conflicts: 0 };
+  return { rows: out, header, kubunCol, kubunCounts, products: byProduct.size, invalidBarcodes, blankRows, conflicts: 0 };
 }
 
 /**
@@ -185,7 +198,7 @@ export function importBarcodeMaster(buffer, { actor = null, sourceModifiedAt = n
   const stats = {
     total: parsed.rows.length, products: parsed.products,
     invalidBarcodes: parsed.invalidBarcodes, blankRows: parsed.blankRows,
-    kubunCounts: parsed.kubunCounts, added: 0, removed: 0,
+    kubunColumn: parsed.kubunCol, kubunCounts: parsed.kubunCounts, added: 0, removed: 0,
   };
   return db.transaction(() => {
     const beforeRows = db.prepare('SELECT barcode FROM f_inbound_check_barcode_master').all();
