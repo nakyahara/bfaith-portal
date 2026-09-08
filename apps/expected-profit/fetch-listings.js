@@ -60,6 +60,40 @@ export function amazonFulfillment(raw) {
 }
 
 /** レポート行 → snapshot 行 (純関数。テストで固定する) */
+/**
+ * Amazon の出品が「送料込み」か。
+ *
+ * 🚨 FBA はプライム配送なので常に送料込み。
+ * 🚨 FBM (自社出荷) は**配送パターン**で決まる (中原さん決定 2026-09-08)。
+ *    実測 (7,597 出品): FBM 3,466 件のうち
+ *      ネコポスマケプレプライム設定             3,377
+ *      移行された配送パターン                     72
+ *      ヤマト北海道・沖縄送料別途設定               11
+ *      Selected Self-Ship Template…               3
+ *      プライム配送パターン                        3
+ *    マケプレプライムは**プライム会員への配送料無料が条件** (沖縄・北海道・離島を除く)。
+ *    標準シナリオ (本州・1個・通常購入) では送料込みとして扱う。
+ *    → 中原さんの決定 = **送料込みとして扱う**。楽天と同じ扱いに揃える。
+ *
+ * 🚨 知らない配送パターンは **null (不明)** にする。勝手に送料込みへ倒さない。
+ *    新しい配送パターンを作ったときに、黙って利益を高く見せないため。
+ */
+export const AMAZON_POSTAGE_INCLUDED_GROUPS = [
+  'ネコポスマケプレプライム設定',
+  'プライム配送パターン',
+  '移行された配送パターン',
+  'Selected Self-Ship Templateネコポスマケプレプライム設定',
+];
+
+export function amazonPostageIncluded(fulfillment, shippingGroup) {
+  if (fulfillment === 'FBA') return true;
+  if (fulfillment !== 'FBM') return null;              // 出荷区分が未解決なら判断しない
+  const g = String(shippingGroup ?? '').trim();
+  if (!g) return null;                                  // 配送パターンが読めない
+  if (AMAZON_POSTAGE_INCLUDED_GROUPS.includes(g)) return true;
+  return null;                                          // 知らないパターンは不明のまま
+}
+
 export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil }) {
   const sku = (row['出品者SKU'] || row['seller-sku'] || '').trim();
   const asin = (row['商品ID'] || row['asin1'] || '').trim();
@@ -68,6 +102,8 @@ export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil 
   const fulfillment = amazonFulfillment(channel);
   // 🚨 「明示的な0」と「列そのものが無い/読めない」を分ける (Codex R1-3)。
   //    ここで 0 に倒すと、ポイント付き出品を誤った条件で見積もってしまう
+  const shippingGroup = row['merchant-shipping-group'] ?? row['配送パターン'];
+  const postageIncluded = amazonPostageIncluded(fulfillment, shippingGroup);
   const pointsRaw = row['ポイント'] ?? row['points'];
   const hasPointsColumn = pointsRaw !== undefined;
   const points = hasPointsColumn && String(pointsRaw).trim() === '' ? 0 : toIntPrice(pointsRaw);
@@ -84,11 +120,10 @@ export function amazonRowToSnapshot(row, { runId, shopId, fetchedAt, validUntil 
     price_tax_included: 1,               // Amazon の出品価格は税込 (決済の Principal + Tax と一致)
     price_raw: price,
     mall_tax_rate: null,                 // Amazon は税率を返さない (商品マスタ側を使う)
-    // 🚨 標準シナリオ (1個・通常購入) では FBA は送料込み (プライム配送) で確定する。
-    //    ここを null にすると、取得した FBA 出品が全部「送料不明」でランキングから消える。
-    //    FBM は実績から標準送料を推定する必要があるので unknown のまま (§15-2。PR-2 で実装)
-    postage_included: fulfillment === 'FBA' ? 1 : null,
-    postage_revenue_incl_tax: fulfillment === 'FBA' ? 0 : null,
+    // 送料込みかどうかは配送パターンで決める (上の amazonPostageIncluded を見よ)
+    postage_included: postageIncluded == null ? null : (postageIncluded ? 1 : 0),
+    postage_revenue_incl_tax: postageIncluded === true ? 0 : null,
+    shipping_group: shippingGroup == null ? null : String(shippingGroup).trim() || null,
     points,                              // null = 取得不能 (見積入力未解決として扱う)
     listing_status: amazonListingStatus(row['ステータス'] || row['status']),
     fetch_status: price == null ? 'not_found' : 'ok',
@@ -163,6 +198,7 @@ export function rakutenItemToSnapshotsDetailed(item, { runId, shopId, fetchedAt,
       resolve_status: 'unresolved',
       resolve_reason: null,
       valid_until: validUntil,
+      shipping_group: null,              // 楽天に配送パターンの概念は無い
       source: 'rms_items_search',
       fetched_at: fetchedAt,
     });
@@ -226,10 +262,12 @@ function insertSnapshots(db, rows) {
     INSERT OR REPLACE INTO mall_price_snapshot
       (run_id, mall, shop_id, mall_item_key, mall_item_ref, fulfillment, ne_code, price_type, price_incl_tax,
        price_tax_included, price_raw, mall_tax_rate, postage_included, postage_revenue_incl_tax, points, listing_status,
+       shipping_group,
        fetch_status, resolve_status, resolve_reason, valid_until, source, fetched_at)
     VALUES
       (@run_id, @mall, @shop_id, @mall_item_key, @mall_item_ref, @fulfillment, @ne_code, @price_type, @price_incl_tax,
        @price_tax_included, @price_raw, @mall_tax_rate, @postage_included, @postage_revenue_incl_tax, @points, @listing_status,
+       @shipping_group,
        @fetch_status, @resolve_status, @resolve_reason, @valid_until, @source, @fetched_at)
   `);
   const tx = db.transaction((list) => { for (const r of list) stmt.run(r); });

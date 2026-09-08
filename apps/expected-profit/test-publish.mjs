@@ -388,25 +388,31 @@ t('[!] 本番の初期化 (initExpectedProfitDB) が既存DBに列を足す', ()
   //    検出できない。既存DBから列を落として、本番の入口を通し直して確かめる。
   // 🚨 列名を決め打ちせず MIGRATED_COLUMNS を全部見る。決め打ちだと、
   //    新しい列を足したときに「migrate への追加忘れ」を素通りさせる
-  const target = MIGRATED_COLUMNS.filter(([t]) => t === 'mart_listing_expected_profit');
-  assert.ok(target.length > 0);
-  for (const [, column] of target) {
-    db.exec(`ALTER TABLE mart_listing_expected_profit DROP COLUMN ${column}`);
-    assert.equal(cols(db).includes(column), false, `前提: ${column} を落とせている`);
+  // 🚨 テーブルも決め打ちしない。別テーブルへの列追加を足したときに素通りする
+  assert.ok(MIGRATED_COLUMNS.length > 0);
+  const colsOf = (d, table) => d.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  for (const [table, column] of MIGRATED_COLUMNS) {
+    db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+    assert.equal(colsOf(db, table).includes(column), false, `前提: ${table}.${column} を落とせている`);
   }
   const reopened = initExpectedProfitDB();     // 本番と同じ入口
-  for (const [, column] of target) {
-    assert.ok(cols(reopened).includes(column), `初期化を通したのに ${column} が足されていない`);
+  for (const [table, column] of MIGRATED_COLUMNS) {
+    assert.ok(colsOf(reopened, table).includes(column), `初期化を通したのに ${table}.${column} が足されていない`);
   }
 });
 
 t('[!] DDL に書いた列は MIGRATED_COLUMNS にも入っている (既存DBに足し忘れない)', () => {
   // 新規DBの列と、移行で足せる列を突き合わせる
-  const listed = new Set(MIGRATED_COLUMNS.filter(([t]) => t === 'mart_listing_expected_profit').map(([, c]) => c));
   const live = getExpectedProfitDB();   // 直前の試験で開き直しているので、いまのハンドルを使う
-  for (const c of ['unit_quantity', 'ne_code_source']) {
-    assert.ok(cols(live).includes(c), `新規DBに ${c} が無い`);
-    assert.ok(listed.has(c), `${c} が MIGRATED_COLUMNS に無い = 既存DBには足されない`);
+  const colsOf = (table) => live.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  for (const [table, column] of [
+    ['mart_listing_expected_profit', 'unit_quantity'],
+    ['mart_listing_expected_profit', 'ne_code_source'],
+    ['mall_price_snapshot', 'shipping_group'],
+  ]) {
+    assert.ok(colsOf(table).includes(column), `新規DBに ${table}.${column} が無い`);
+    assert.ok(MIGRATED_COLUMNS.some(([t, c]) => t === table && c === column),
+      `${table}.${column} が MIGRATED_COLUMNS に無い = 既存DBには足されない`);
   }
 });
 

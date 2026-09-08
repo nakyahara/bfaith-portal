@@ -16,6 +16,7 @@ const {
   toIntPrice, amazonListingStatus, amazonRowToSnapshot, rakutenItemToSnapshots,
   evaluateEnumeration, loadLastCompleteKeys, fetchAmazonListings, fetchRakutenListings,
   enumStatusWithParseFailures, amazonFulfillment, rakutenItemToSnapshotsDetailed,
+  amazonPostageIncluded, AMAZON_POSTAGE_INCLUDED_GROUPS,
 } = await import('./fetch-listings.js');
 const { reportWaitUntil, getActiveListingsReport } = await import('../profit-calculator/sp-api.js');
 
@@ -690,6 +691,83 @@ await ta('タイムアウトの文言に、どれだけ待って最後がどの�
       now: () => new Date(t), log: () => {}, sleep: async (ms) => { t += ms; },
     }),
     /300秒待った \/ 最後の状態=IN_PROGRESS/);
+});
+
+
+console.log('');
+console.log('Amazon FBM の送料込み判定 (中原さん決定 2026-09-08)');
+
+t('FBA は常に送料込み (プライム配送)', () => {
+  assert.equal(amazonPostageIncluded('FBA', null), true);
+  assert.equal(amazonPostageIncluded('FBA', '移行された配送パターン'), true);
+});
+
+t('[!] FBM のマケプレプライム設定は送料込み (プライム会員への配送料無料が条件)', () => {
+  // 実測: FBM 3,466 件のうち 3,377 件がこの配送パターン
+  assert.equal(amazonPostageIncluded('FBM', 'ネコポスマケプレプライム設定'), true);
+  assert.equal(amazonPostageIncluded('FBM', 'プライム配送パターン'), true);
+});
+
+t('[!] 知らない配送パターンは「不明」にする (勝手に送料込みへ倒さない)', () => {
+  // 🚨 新しい配送パターンを作ったときに、黙って利益を高く見せないため
+  assert.equal(amazonPostageIncluded('FBM', 'ヤマト北海道・沖縄送料別途設定'), null);
+  assert.equal(amazonPostageIncluded('FBM', '来年つくる新しいパターン'), null);
+});
+
+t('配送パターンが読めなければ不明', () => {
+  assert.equal(amazonPostageIncluded('FBM', ''), null);
+  assert.equal(amazonPostageIncluded('FBM', null), null);
+  assert.equal(amazonPostageIncluded('FBM', undefined), null);
+});
+
+t('[!] 出荷区分が未解決なら判断しない', () => {
+  assert.equal(amazonPostageIncluded(null, 'ネコポスマケプレプライム設定'), null);
+});
+
+t('前後の空白を吸収する', () => {
+  assert.equal(amazonPostageIncluded('FBM', '  ネコポスマケプレプライム設定  '), true);
+});
+
+t('[!] レポートの行から snapshot まで届く', () => {
+  const snap = amazonRowToSnapshot({
+    '出品者SKU': 'sku1', '商品ID': 'B001', '価格': '980', 'ポイント': '0',
+    'フルフィルメント・チャンネル': 'DEFAULT', 'ステータス': 'Active',
+    'merchant-shipping-group': 'ネコポスマケプレプライム設定',
+  }, { runId: 'r1', shopId: 'S1@M1', fetchedAt: '2026-09-08T00:00:00Z', validUntil: '2099-01-01T00:00:00Z' });
+  assert.equal(snap.fulfillment, 'FBM');
+  assert.equal(snap.postage_included, 1);
+  assert.equal(snap.postage_revenue_incl_tax, 0);
+  assert.equal(snap.shipping_group, 'ネコポスマケプレプライム設定', '判断の根拠を残す');
+});
+
+t('[!] 知らない配送パターンの行は送料不明のまま届く', () => {
+  const snap = amazonRowToSnapshot({
+    '出品者SKU': 'sku2', '商品ID': 'B002', '価格': '980', 'ポイント': '0',
+    'フルフィルメント・チャンネル': 'DEFAULT', 'ステータス': 'Active',
+    'merchant-shipping-group': 'ヤマト北海道・沖縄送料別途設定',
+  }, { runId: 'r1', shopId: 'S1@M1', fetchedAt: '2026-09-08T00:00:00Z', validUntil: '2099-01-01T00:00:00Z' });
+  assert.equal(snap.postage_included, null);
+  assert.equal(snap.postage_revenue_incl_tax, null);
+  assert.equal(snap.shipping_group, 'ヤマト北海道・沖縄送料別途設定');
+});
+
+t('送料込みと判断する配送パターンの一覧は空でない (実測に基づく)', () => {
+  assert.ok(AMAZON_POSTAGE_INCLUDED_GROUPS.includes('ネコポスマケプレプライム設定'));
+});
+
+await ta('[!] DB まで shipping_group が保存される', async () => {
+  const r = await fetchAmazonListings(db, {
+    getActiveListingsReport: async () => ({
+      listings: [{
+        '出品者SKU': 'shipgrp', '商品ID': 'B009', '価格': '1500', 'ポイント': '0',
+        'フルフィルメント・チャンネル': 'DEFAULT', 'ステータス': 'Active',
+        'merchant-shipping-group': 'ネコポスマケプレプライム設定',
+      }],
+    }),
+  });
+  const row = db.prepare("SELECT * FROM mall_price_snapshot WHERE run_id = ? AND mall_item_key = 'shipgrp'").get(r.runId);
+  assert.equal(row.shipping_group, 'ネコポスマケプレプライム設定');
+  assert.equal(row.postage_included, 1);
 });
 
 db.close();

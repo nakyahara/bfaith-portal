@@ -98,6 +98,7 @@ function createTables(db) {
     resolve_reason           TEXT,
     valid_until              TEXT NOT NULL,     -- 失効時刻 (§15-8。コピーしても延ばさない)
     source                   TEXT NOT NULL,     -- merchant_listings_report / rms_items_search / ...
+    shipping_group           TEXT,              -- Amazon の配送パターン (送料込みの判断根拠)
     fetched_at               TEXT NOT NULL,
     PRIMARY KEY (run_id, mall, shop_id, mall_item_key)
   )`);
@@ -306,6 +307,7 @@ export function setSetting(db, key, value, now = new Date().toISOString()) {
 export const MIGRATED_COLUMNS = [
   ['mart_listing_expected_profit', 'unit_quantity', 'INTEGER'],
   ['mart_listing_expected_profit', 'ne_code_source', 'TEXT'],
+  ['mall_price_snapshot', 'shipping_group', 'TEXT'],
 ];
 
 export function migrate(db) {
