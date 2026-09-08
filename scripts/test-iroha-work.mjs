@@ -8371,6 +8371,21 @@ console.log('\n[期限違い] ✂ 期限が違うぶんを手で分ける (§AB-
     ok(!split(tv, { qty: 5, expectVersion: null }).ok, '版を送らなければ断る');
   }
 
+  // 🚨**親カードの版も進む**。古い画面が前提にしていた「まとまりの組み立て」が変わるため
+  //   (「100 個が 1 つ」と「60 個 + 40 個」では、預ける相手が別物 — Codex #1270 R2)
+  {
+    const tp2 = mk('ex-18', 9768, 100);
+    const before = TD.getTask(tp2).version;
+    ok(split(tp2, { qty: 40, expiry: '2028-06' }).ok, '(前提) 分けられた');
+    ok(TD.getTask(tp2).version > before, '⭐分けるとカードの版も進む');
+    // ⭐分ける前の版で預けようとしたら断られる (古い組み立てのまま渡さない)
+    const stale = C.startConsignment({ taskId: tp2, batchId: only(tp2).id,
+      facilityCode: 'workcenter', qty: 10, expectVersion: before });
+    ok(!stale.ok && stale.error === 'conflict', '⭐分ける前の版で預けようとしたら断る');
+    ok(dbx.prepare('SELECT COUNT(*) c FROM f_iroha_consignments WHERE batch_id = ?').get(only(tp2).id).c === 0,
+      '断ったので預けの記録もできていない');
+  }
+
   // ⭐作業中のまとまりを分けても、作業の記録と進捗が食い違わない
   {
     const D4 = await import('../apps/iroha-work/db.js');
@@ -8386,22 +8401,32 @@ console.log('\n[期限違い] ✂ 期限が違うぶんを手で分ける (§AB-
     ok(after[0].work_status === 'in_progress' && after[1].work_status === 'not_started',
       '元は作業中のまま・分けたぶんは未着手 (どちらの作業かは、はじめるときに選ぶ)');
     // 作業を終えても数は動かない
-    D4.stopSession({ taskId: tw, workerId: w4.id, sessionId: st.sessionId, reason: 'done' });
+    const stop = D4.stopSession({ taskId: tw, workerId: w4.id, sessionId: st.sessionId, reason: 'done' });
+    ok(stop && stop.ok !== false, '(前提) 作業を終えられた');
+    ok(dbx.prepare('SELECT ended_at FROM f_iroha_work_sessions WHERE id = ?').get(st.sessionId).ended_at != null,
+      '(前提) その作業の記録が閉じている');
     const end = B.listBatchesOfTask(dbx, tw);
     ok(end[0].planned_qty === 50 && end[1].planned_qty === 30, '⭐作業を終えても、分けた数は戻らない');
   }
 
   // ⭐期限は 40 字まで / 数が分からないぶん・終わったぶんは分けない
+  //   ⭐断ったときは**まとまり一覧がそっくり同じ**であることまで見る (数・版・件数をまとめて)
   {
+    const snap = (t) => JSON.stringify(B.listBatchesOfTask(dbx, t).map((x) => [x.id, x.planned_qty, x.expiry, x.work_status, x.version]));
     const tl2 = mk('ex-14', 9764, 20);
+    const beforeL = snap(tl2);
     ok(!split(tl2, { qty: 5, expiry: 'あ'.repeat(41) }).ok, '⭐期限が長すぎれば断る');
-    ok(only(tl2).planned_qty === 20, '断ったので数はそのまま');
+    ok(snap(tl2) === beforeL, '断ったので、まとまりは数も版も件数もそのまま');
     const tn = mk('ex-15', 9765, 20);
     dbx.prepare('UPDATE f_iroha_task_batches SET planned_qty = NULL WHERE id = ?').run(only(tn).id);
+    const beforeN = snap(tn);
     ok(split(tn, { qty: 5 }).error === 'bad_qty', '⭐数が分かっていないぶんは分けられない');
+    ok(snap(tn) === beforeN, '断ったので何も変わらない');
     const td = mk('ex-16', 9766, 20);
     dbx.prepare("UPDATE f_iroha_task_batches SET work_status = 'done' WHERE id = ?").run(only(td).id);
+    const beforeD = snap(td);
     ok(split(td, { qty: 5 }).error === 'bad_state', '⭐棚入完了のぶんは分けられない');
+    ok(snap(td) === beforeD, '断ったので何も変わらない');
     const tcn = mk('ex-17', 9767, 20);
     dbx.prepare("UPDATE f_iroha_task_batches SET work_status = 'cancelled' WHERE id = ?").run(only(tcn).id);
     ok(split(tcn, { qty: 5 }).error === 'bad_state', '⭐取り消したぶんは分けられない');

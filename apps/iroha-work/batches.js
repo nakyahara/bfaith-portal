@@ -108,6 +108,9 @@ export function listBatchesOfTask(db, taskId) {
  *   40 個ずつ分けたとき、どちらも条件を通って「20 + 40 + 40」になる (合計は合うのに、期限ごとの数が
  *   現物とずれる)。応答を失って送り直したときも同じ (Codex #1270 R1 重大)。
  *
+ * ⚠**必ず呼び出し側の書き込みトランザクション (immediate) の中で**。読んで・確かめて・減らして・作る、を
+ *   ひとまとまりにしないと、確かめたあとに別の書き込みが割り込む。
+ *
  * @param {object} o  { taskId, batchId, qty (新しいぶんの数), expiry (新しいぶんの期限。null 可), expectVersion, actor }
  * @returns {{ok:true, batch}|{ok:false, error, message}}
  */
@@ -157,6 +160,11 @@ export function splitBatchByExpiry(db, { taskId, batchId, qty, expiry = null, ex
     .run(b.task_id, nextSeq(db, b.task_id), n, b.facility_code ?? null, exp === "" ? null : exp,
       b.id, n, now, actor, now, now);
   const made = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(Number(info.lastInsertRowid));
+  // 🚨**親カードの版も進める** (預けで数が動くときと同じ)。数が変わるからだけではなく、
+  //   **古い画面が前提にしていた「まとまりの組み立て」が変わる**ため — 「100 個が 1 つ」と
+  //   「60 個 + 40 個」では、預ける・作り終える の相手が別物になる (Codex #1270 R2)
+  db.prepare('UPDATE f_iroha_tasks SET version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?')
+    .run(now, actor, b.task_id);
   return { ok: true, batch: made };
 }
 
