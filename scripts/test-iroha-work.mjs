@@ -8461,5 +8461,51 @@ console.log('\n[期限違い] ✂ 期限が違うぶんを手で分ける (§AB-
     '⭐画面が見ていた版を送る (二重に分けない — R1 重大)');
 }
 
+console.log('\n[つかいかた] 📖 マニュアルと実装が食い違っていないか');
+{
+  const man = fs.readFileSync(new URL('../apps/iroha-work/views/manual.html', import.meta.url), 'utf8');
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+
+  // ⭐もくじ・節の id・見出しの番号がずれていない (節を足すたびに手で直すので、ずれやすい)
+  const secs = [...man.matchAll(/<section id="(s\d+)"/g)].map((m) => m[1]);
+  const nos = [...man.matchAll(/<span class="no">(\d+)<\/span>/g)].map((m) => Number(m[1]));
+  const toc = [...man.matchAll(/href="#(s\d+)"/g)].map((m) => m[1]);
+  ok(new Set(secs).size === secs.length, "節の id が重複していない");
+  ok(new Set(nos).size === nos.length, "見出しの番号が重複していない");
+  ok(nos.join(",") === nos.map((_, i) => i + 1).join(","), "⭐見出しの番号が 1 から順に並んでいる");
+  ok(secs.join(",") === nos.map((n) => "s" + n).join(","), "⭐節の id と見出しの番号が揃っている");
+  ok(toc.every((t) => secs.includes(t)), "⭐もくじの飛び先が全部ある (押しても飛ばない項目が無い)");
+  ok(secs.every((x) => toc.includes(x)), "⭐全部の節がもくじに載っている (書いたのに辿り着けない節が無い)");
+
+  // ⭐画面に出るボタンの言葉と、マニュアルの言葉が合っている
+  //   (実装の文言を変えたのにマニュアルが古いまま、を防ぐ)
+  const both = [
+    ['🚚 外部にあずける', '外部にあずける'],
+    ['✂ 期限が違うぶんを分ける', '期限が違うぶんを分ける'],
+    ['数を入れる', '数が抜けている返却に出すボタン'],
+    ['数を直す', '数が入っている返却に出すボタン'],
+    ['さっき出したのとは別に要る', '同じラベルをもう一度出すときの確認'],
+    ['どのぶんの作業をはじめますか?', 'まとまりを選ぶ画面'],
+    ['いま手をつけられるぶんがありません', '手元に作業できるぶんが無いときの案内'],
+  ];
+  for (const [word, what] of both) {
+    ok(html.includes(word) && man.includes(word), "⭐画面とマニュアルで同じ言葉を使う: " + word + " (" + what + ")");
+  }
+
+  // ⭐今日足した操作が、マニュアルに書いてある
+  ok(/棚に入れたあとは数を変えられません/.test(man), "棚入れ後に数を直せないことを書く (詰まったときの出口も)");
+  ok(/このぶんをやり直す/.test(man), "直したいときの出口 (やり直す) を書く");
+  ok(/全部は分けられません/.test(man), "分けるときの決まり (全部は分けられない) を書く");
+  ok(/棚に入れた/.test(man) && /箱ラベルを刷った/.test(man) && /できた数を数えた/.test(man),
+    "分けられない条件を書く");
+  ok(/QL-800 の実物を見て/.test(man), "同じラベルを出す前に実物を見てもらう");
+  ok(/貼ったあとは見分けられません/.test(man), "ラベルを間違えると取り返しがつかないことを書く");
+
+  // ⭐職員だけの節は staff の印が付いている (利用者の画面では隠れる)
+  const staffSecs = [...man.matchAll(/<section id="(s\d+)"([^>]*)>/g)].filter((m) => /class="staff"/.test(m[2])).map((m) => m[1]);
+  ok(staffSecs.includes("s13") && staffSecs.includes("s14"),
+    "⭐外部にあずける・分かれたカードの節は職員向けの印が付いている");
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exit(fail > 0 ? 1 : 0);
