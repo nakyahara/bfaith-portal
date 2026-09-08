@@ -285,7 +285,8 @@ export function scanSource(src, { isView = false, checkImports = true, external 
     // href は引用符の有無に関係なく取り出す。/ から始まる相対パスでもバックスラッシュは拒否 (Codex R7)
     for (const m of src.matchAll(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)) {
       const v = m[1] ?? m[2] ?? m[3] ?? '';
-      const okPrefix = v.startsWith('/') || v.startsWith('?') || v.startsWith('#') || v.startsWith('https://www.amazon.co.jp/dp/') || v.startsWith('<%= qs(') || v.startsWith('<%= new URLSearchParams');
+      // 外へ出るリンクは Amazon の商品ページと Keepa (リサーチ、URL に載るのは ASIN だけ) の 2 つだけ。どちらも読むだけの画面
+      const okPrefix = v.startsWith('/') || v.startsWith('?') || v.startsWith('#') || v.startsWith('https://www.amazon.co.jp/dp/') || v.startsWith('https://keepa.com/#!product/5-') || v.startsWith('<%= qs(') || v.startsWith('<%= new URLSearchParams');
       if (!okPrefix || v.includes('\\')) problems.push(`href が許可外: ${v.slice(0, 60)}`);
     }
     // CSS 経由の外向き通信 (<style> や style= の url() / @import) も禁止 (Codex R7)

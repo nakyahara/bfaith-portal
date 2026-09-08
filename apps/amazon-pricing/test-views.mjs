@@ -39,13 +39,13 @@ const row = { seller_sku: 'pr_x', asin: 'B000X', channel: 'FBA', ne_code: 'ne-x'
   cost_incl_tax: 1100, cost_missing_parts: 0, referral_fee_rate: 0.1, fba_fee: 400, per_item_fee: 0, variable_closing_fee: 0, ship_cost: null, units_30d: 5, sales_30d: 10000,
   snapshot_date_jst: '2026-09-07', mode: 'buybox', floor_price: 1800, ceiling_price: null, offset_jpy: 0, min_margin_rate: null, policy_note: null,
   policy_updated_at: '2026-09-07T01:00:00.000Z', policy_updated_by: 't@example.com', has_policy: true,
-  live, computed_floor: 1750, effective_floor: 1800, gross_now: { gross: 400, rate: 0.2 }, buybox_gap: 100 };
+  live, computed_floor: 1750, effective_floor: 1800, gross_now: { gross: 400, rate: 0.2 }, buybox_gap: 100, fee_now: 600, stock: 12 };
 const evil = 'x' + CLOSE_TAG + OPEN_TAG + '>alert(1)' + CLOSE_TAG + '"><img src=x onerror=alert(1)>';
 const evilRow = { ...row, seller_sku: evil, ne_name: evil, policy_note: evil, live: { ...live, reasonText: evil } };
 const commonData = { displayName: 'テスト', isAdmin: true, ...VIEW_HELPERS };
 const cases = [
   ['index.ejs', { ...commonData, title: 'x', unavailable: null, rows: [row, evilRow], total: 2, page: 1, per: 100, pages: 1,
-    filters: { q: '', mode: '', channel: '', action: '', flag: '', sort: 'units' }, stats: { total: 2, with_policy: 1, by_action: { raise: 0, lower: 1, keep: 1, hold: 0 }, flags: { below_floor: 1 } },
+    filters: { q: '', mode: '', channel: '', action: '', flag: '', sort: 'units', price_min: '', price_max: '', adv: '' }, stats: { total: 2, with_policy: 1, by_action: { raise: 0, lower: 1, keep: 1, hold: 0 }, flags: { below_floor: 1 } },
     run: { started_at: '2026-09-07T00:00:00.000Z' }, freshness: { snapshot_date_jst: '2026-09-07', snapshot_rows: 2, fees_fetched_at: '2026-09-07T00:00:00.000Z', fees_rows: 2, finance_last_date_jst: '2026-09-01' },
     auto: { skipped: true }, flagLabels: { below_floor: '赤字' } }],
   ['index.ejs', { ...commonData, title: 'x', unavailable: ['mirror_products'], rows: [], total: 0, page: 1, per: 100, pages: 1, filters: {}, stats: { total: 0, with_policy: 0, by_action: { raise: 0, lower: 0, keep: 0, hold: 0 }, flags: {} }, run: null, freshness: null, auto: null, flagLabels: {} }],
@@ -93,6 +93,8 @@ db.prepare(`INSERT INTO mirror_amazon_price_snapshot_daily (date_jst, seller_sku
   .run('2026-09-07', 'pr_fba1', 'B000FBA1', 2000, 1900, 0, 'r', 'h', T);
 db.prepare(`INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, 商品名, synced_at) VALUES (?,?,?,?,?,?)`).run('pr_fba1', 'ne-a', 1, 'master', 'A商品', T);
 db.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 原価, 原価状態, 送料, 消費税率, updated_at) VALUES (?,?,?,?,?,?,?,?)`).run('ne-a', 'A商品', '単品', 1000, 'COMPLETE', 200, 0.10, T);
+db.prepare(`INSERT INTO mirror_inv_daily_detail (business_date, market, category, source_system, source_item_code, ne_code, qty, cost_status, synced_at) VALUES (?,?,?,?,?,?,?,?,?)`)
+  .run('2026-09-07', 'jp', 'fba_warehouse', 'sp', 'pr_fba1', 'ne-a', 12, 'ok', T);
 
 const app = express();
 app.set('view engine', 'ejs');
@@ -113,6 +115,10 @@ try {
   ok(idx.status === 200, `GET / → ${idx.status}`);
   ok(idx.text.includes('pr_fba1') && idx.text.includes('A商品'), '  出品が表に出る');
   ok(idx.text.includes('原価不明'), '  原価不明の行に札が出る');
+  ok(idx.text.includes('data-mode="fba_lowest"') && idx.text.includes('data-mode="off"'), '  プライスター風の価格追従ボタン列が出る');
+  ok(idx.text.includes('data-field="floor_price"') && idx.text.includes('data-field="ceiling_price"'), '  ストッパーの直接入力欄が出る');
+  ok(/pt-box[^>]*>12</.test(idx.text), '  数量 (FBA 倉庫 12) が出る');
+  ok(idx.text.includes('id="bulk-floor-btn"') && idx.text.includes('id="sel-all"'), '  チェックと一括の操作が出る');
   const runs = db.prepare(`SELECT COUNT(*) c FROM ap_evaluation_runs WHERE status='success'`).get().c;
   ok(runs === 1, `  画面を開いたついでに今日の判定が 1 回作られる (実際 ${runs})`);
   const autoRun = db.prepare(`SELECT trigger, actor_id FROM ap_evaluation_runs WHERE status='success'`).get();
@@ -120,6 +126,10 @@ try {
   const idx2 = await get('/apps/amazon-pricing/?q=fba1&channel=FBA&sort=margin&flag=cost_unknown');
   ok(idx2.status === 200 && !idx2.text.includes('>pr_fba1<'), 'GET / 絞り込み (原価不明 + fba1 → 該当なし)');
   ok(db.prepare(`SELECT COUNT(*) c FROM ap_evaluation_runs`).get().c === 1, '  2 回目の表示では run を増やさない');
+  const idx3 = await get('/apps/amazon-pricing/?mode=tracking&channel=FBA&flag=stopped_at_floor&price_min=100&price_max=5000&per=150&adv=1');
+  ok(idx3.status === 200 && idx3.text.includes('該当する出品がありません') && idx3.text.includes('id="adv-toggle" class="adv-toggle" name="adv" value="1" checked'), 'GET / 詳細検索 (追従する + FBA + 下げ止まり + 価格 100〜5000 → 該当なし、詳細検索は開いたまま)');
+  const idx4 = await get('/apps/amazon-pricing/?price_min=1000&price_max=3000&sort=stock');
+  ok(idx4.status === 200 && idx4.text.includes('>pr_fba1<'), 'GET / 出品価格 1000〜3000 + 数量順 → pr_fba1 (2000 円) が残る');
 
   const lst = await get('/apps/amazon-pricing/listings/pr_fba1');
   // 原価 1000×1.10 = 1100 + FBA 400 = 1500 ÷ (1 − 0.10 − 0.10) = 1875
@@ -146,6 +156,14 @@ try {
   const saved = await post('/apps/amazon-pricing/api/policies/pr_fba1', { mode: 'buybox', floor_price: '1800', ceiling_price: '', offset_jpy: '-10', min_margin_rate: '10', note: 'メモ', reason_code: 'initial', reason_text: '' });
   ok(saved.status === 200 && saved.json?.ok && saved.json.changed.length === 5, `POST 方針 (初回) → ${saved.status} 変更 ${saved.json?.changed?.length} (既定と違う列だけ: mode / floor / offset / margin / note)`);
   ok(saved.json?.live?.action === 'lower' && saved.json.live.proposed_price === 1890, `  返ってくる live 判定: ${saved.json?.live?.action} → ${saved.json?.live?.proposed_price} (カート 1900 − 10)`);
+  // 一覧の直接入力 (プライスター風): ストッパーだけ・モードだけの部分更新が効く
+  const inl = await post('/apps/amazon-pricing/api/policies/pr_fba1', { floor_price: '1850', reason_code: 'inline' });
+  ok(inl.status === 200 && inl.json?.ok && inl.json.changed.length === 1 && inl.json.changed[0] === 'floor_price' && inl.json.policy.mode === 'buybox', `POST 方針 (一覧から赤字ストッパーだけ) → ${inl.status} 変更 ${inl.json?.changed?.join(',')} / モードは buybox のまま`);
+  ok(inl.json?.live?.verdict_label === '値下げ' && inl.json.live.verdict_class === 'lower' && inl.json.live.effective_floor === 1875, `  返ってくる live に画面用の別名 (実効下限 = max(ストッパー 1850, 計算 1875)) (${inl.json?.live?.verdict_label} / 実効下限 ${inl.json?.live?.effective_floor})`);
+  const inl2 = await post('/apps/amazon-pricing/api/policies/pr_fba1', { mode: 'off', reason_code: 'bulk', reason_text: '一括' });
+  ok(inl2.status === 200 && inl2.json?.ok && inl2.json.changed.length === 1 && inl2.json.live.verdict_class === 'keep', `POST 方針 (一括でモード off) → ${inl2.status} 判定 ${inl2.json?.live?.verdict_class}`);
+  const back = await post('/apps/amazon-pricing/api/policies/pr_fba1', { mode: 'buybox', floor_price: '1800', reason_code: 'mistake' });
+  ok(back.status === 200 && back.json?.ok, '  元に戻す (モード buybox・ストッパー 1800)');
   const unknownSku = await post('/apps/amazon-pricing/api/policies/nope', { mode: 'off', reason_code: 'stop' });
   ok(unknownSku.status === 400, `POST 方針 (無い SKU) → ${unknownSku.status}`);
 
@@ -163,13 +181,13 @@ try {
   ok(evReviewed.status === 200 && evReviewed.text.includes('よい'), '  採点済みタブにコメントが出る');
 
   const csv = await get('/apps/amazon-pricing/api/export.csv');
-  ok(csv.status === 200 && csv.text.includes('seller_sku,asin') && csv.text.includes('pr_fba1'), `GET /api/export.csv → ${csv.status}`);
+  ok(csv.status === 200 && csv.text.includes('seller_sku,asin') && csv.text.includes('pr_fba1') && csv.text.includes(',stock,') && csv.text.includes(',fee_now,'), `GET /api/export.csv → ${csv.status} (数量・手数料の列あり)`);
   const json = await get('/apps/amazon-pricing/api/listings.json?mode=set');
   const parsed = JSON.parse(json.text);
   ok(json.status === 200 && parsed.count === 1 && parsed.rows[0].live.action === 'lower', `GET /api/listings.json?mode=set → ${json.status} (1 行)`);
   const health = await get('/apps/amazon-pricing/api/health');
   const h = JSON.parse(health.text);
-  ok(health.status === 200 && h.writes_to_amazon === false && h.policy_events === 5, `GET /api/health → writes_to_amazon=false, 履歴 ${h.policy_events}`);
+  ok(health.status === 200 && h.writes_to_amazon === false && h.policy_events === 9, `GET /api/health → writes_to_amazon=false, 履歴 ${h.policy_events} (初回 5 + 一覧 1 + 一括 1 + 戻し 2)`);
 } finally {
   server.close();
   try { db.close(); } catch { /* */ }

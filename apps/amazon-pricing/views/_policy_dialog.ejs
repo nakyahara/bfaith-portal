@@ -1,11 +1,12 @@
-<%# 方針の編集ダイアログ。index / listing で共用。openPolicyDialog(rowJson) で開く %>
+<%# 方針の編集ダイアログ (プライスターの「カスタム」に相当)。index / listing で共用。
+    openPolicyDialog(rowJson) で 1 件、openPolicyDialogBulk([sku...]) でチェックした複数件に同じ値を記録する %>
 <dialog id="policy-dlg">
   <form class="dlg" id="policy-form" method="dialog">
-    <h3>値付けの方針を変える</h3>
+    <h3>カスタム (値付けの方針を変える)</h3>
     <div class="sub" id="pd-sub"></div>
     <div class="grid">
       <div class="field">
-        <label for="pd-mode">追従モード</label>
+        <label for="pd-mode">価格の自動変更 (追従モード)</label>
         <select id="pd-mode" name="mode">
           <% for (const [k, v] of Object.entries(MODES)) { %><option value="<%= k %>"><%= v %></option><% } %>
         </select>
@@ -39,7 +40,7 @@
       <div class="field">
         <label for="pd-reason" class="req">変更の理由</label>
         <select id="pd-reason" name="reason_code">
-          <% for (const [k, v] of Object.entries(REASON_CODES)) { %><option value="<%= k %>"><%= v %></option><% } %>
+          <% for (const [k, v] of Object.entries(REASON_CODES)) { if (k === 'inline' || k === 'bulk') continue; %><option value="<%= k %>"><%= v %></option><% } %>
         </select>
       </div>
       <div class="field">
@@ -48,6 +49,7 @@
       </div>
     </div>
     <div class="err" id="pd-err"></div>
+    <div class="small" id="pd-prog"></div>
     <div class="actions">
       <button type="button" class="btn" id="pd-cancel">やめる</button>
       <button type="submit" class="btn btn-primary" id="pd-save">記録する (価格は変わりません)</button>
@@ -55,38 +57,62 @@
   </form>
 </dialog>
 <script>
-  // ★グローバル (window.xxx) を経由せず、トップレベルの関数宣言で画面内から呼べるようにする
-  //   (静的検査が window / globalThis の使用を禁止している — 通信の別名づけに使われるため)
-  function showToast(msg) {
+  /* グローバル (window.xxx) を経由せず、トップレベルの関数宣言で画面内から呼べるようにする
+     (静的検査が window / globalThis の使用を禁止している — 通信の別名づけに使われるため) */
+  function showToast(msg, bad, undo) {
     var t = document.getElementById('toast');
     if (!t) return;
-    t.textContent = msg; t.style.display = 'block';
-    clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, 2500);
+    var m = document.getElementById('toast-msg');
+    var u = document.getElementById('toast-undo');
+    if (m) m.textContent = msg; else t.textContent = msg;
+    t.classList.toggle('bad', !!bad);
+    if (u) {
+      u.style.display = undo ? 'inline-block' : 'none';
+      u.onclick = undo ? function () { t.style.display = 'none'; undo(); } : null;
+    }
+    t.style.display = 'block';
+    clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, undo ? 6000 : 2800);
   }
-  var policyDialogState = { sku: null };
-  // row: { seller_sku, ne_name, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, computed_floor }
+  var policyDialogState = { skus: [] };
+  /* row: { seller_sku, ne_name, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, computed_floor, has_policy } */
   function openPolicyDialog(row) {
     var dlg = document.getElementById('policy-dlg');
     var form = document.getElementById('policy-form');
     var err = document.getElementById('pd-err');
-    policyDialogState.sku = row.seller_sku;
-      document.getElementById('pd-sub').textContent = (row.ne_name || '') + ' / ' + row.seller_sku
-        + (row.computed_floor != null ? ' — 計算した下限 ' + Number(row.computed_floor).toLocaleString() + ' 円' : ' — 下限は計算できていません (原価・手数料・送料のどれかが不明)');
-      form.mode.value = row.mode || 'off';
-      form.offset_jpy.value = row.offset_jpy == null ? '' : row.offset_jpy;
-      form.floor_price.value = row.floor_price == null ? '' : row.floor_price;
-      form.ceiling_price.value = row.ceiling_price == null ? '' : row.ceiling_price;
-      form.min_margin_rate.value = row.min_margin_rate == null ? '' : Math.round(row.min_margin_rate * 1000) / 10;
-      form.note.value = row.note || '';
-      form.reason_code.value = row.has_policy ? 'margin' : 'initial';
-      form.reason_text.value = '';
-      err.textContent = '';
-      dlg.showModal();
+    policyDialogState.skus = [row.seller_sku];
+    document.getElementById('pd-sub').textContent = (row.ne_name || '') + ' / ' + row.seller_sku
+      + (row.computed_floor != null ? ' — 計算した下限 ' + Number(row.computed_floor).toLocaleString() + ' 円' : ' — 下限は計算できていません (原価・手数料・送料のどれかが不明)');
+    form.mode.value = row.mode || 'off';
+    form.offset_jpy.value = row.offset_jpy == null ? '' : row.offset_jpy;
+    form.floor_price.value = row.floor_price == null ? '' : row.floor_price;
+    form.ceiling_price.value = row.ceiling_price == null ? '' : row.ceiling_price;
+    form.min_margin_rate.value = row.min_margin_rate == null ? '' : Math.round(row.min_margin_rate * 1000) / 10;
+    form.note.value = row.note || '';
+    form.reason_code.value = row.has_policy ? 'margin' : 'initial';
+    form.reason_text.value = '';
+    err.textContent = '';
+    document.getElementById('pd-prog').textContent = '';
+    dlg.showModal();
+  }
+  /* チェックした複数 SKU に同じ方針を記録する (空欄の項目は「変えない」ではなく「空にする」なので注意書きを出す) */
+  function openPolicyDialogBulk(skus) {
+    var dlg = document.getElementById('policy-dlg');
+    var form = document.getElementById('policy-form');
+    policyDialogState.skus = skus.slice();
+    document.getElementById('pd-sub').textContent = 'チェックした ' + skus.length + ' 件に同じ値を記録します (空欄の項目は「なし」で上書きされます)';
+    form.mode.value = 'off';
+    form.offset_jpy.value = ''; form.floor_price.value = ''; form.ceiling_price.value = ''; form.min_margin_rate.value = ''; form.note.value = '';
+    form.reason_code.value = 'margin';
+    form.reason_text.value = '';
+    document.getElementById('pd-err').textContent = '';
+    document.getElementById('pd-prog').textContent = '';
+    dlg.showModal();
   }
   (function () {
     var dlg = document.getElementById('policy-dlg');
     var form = document.getElementById('policy-form');
     var err = document.getElementById('pd-err');
+    var prog = document.getElementById('pd-prog');
     document.getElementById('pd-cancel').addEventListener('click', function () { dlg.close(); });
     form.addEventListener('submit', function (ev) {
       ev.preventDefault();
@@ -103,18 +129,32 @@
       };
       var btn = document.getElementById('pd-save');
       btn.disabled = true;
-      fetch('/apps/amazon-pricing/api/policies/' + encodeURIComponent(policyDialogState.sku), {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
-      }).then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
-        .then(function (res) {
+      var queue = policyDialogState.skus.slice();
+      var total = queue.length; var done = 0; var failed = 0; var changed = 0;
+      function step() {
+        var sku = queue.shift();
+        if (!sku) {
           btn.disabled = false;
-          if (!res.json.ok) { err.textContent = res.json.error || ('エラー (' + res.status + ')'); return; }
+          if (failed > 0 && total === 1) return;
           dlg.close();
-          if (res.json.changed.length === 0) { showToast('変更はありませんでした'); return; }
-          showToast('記録しました (' + res.json.changed.length + ' 項目)。価格は変わっていません');
-          setTimeout(function () { location.reload(); }, 600);
-        })
-        .catch(function (e) { btn.disabled = false; err.textContent = '通信エラー: ' + e.message; });
+          if (changed === 0 && failed === 0) { showToast('変更はありませんでした'); return; }
+          showToast('記録しました (' + (total - failed) + ' 件 / 変わった項目 ' + changed + ')。価格は変わっていません', failed > 0);
+          setTimeout(function () { location.reload(); }, 700);
+          return;
+        }
+        fetch('/apps/amazon-pricing/api/policies/' + encodeURIComponent(sku), {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+        }).then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
+          .then(function (res) {
+            done += 1;
+            if (!res.json.ok) { failed += 1; err.textContent = (total > 1 ? sku + ': ' : '') + (res.json.error || ('エラー (' + res.status + ')')); }
+            else changed += res.json.changed.length;
+            if (total > 1) prog.textContent = done + ' / ' + total;
+            step();
+          })
+          .catch(function (e) { done += 1; failed += 1; err.textContent = '通信エラー: ' + e.message; step(); });
+      }
+      step();
     });
   })();
 </script>

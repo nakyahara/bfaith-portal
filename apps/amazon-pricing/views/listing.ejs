@@ -4,13 +4,21 @@
   <div class="card"><h2>見つかりません</h2><p class="dim">その SKU は出品一覧 (mirror_amazon_sku_fees) にありません。</p><a class="btn" href="/apps/amazon-pricing/">← 一覧へ</a></div>
 <% } else { const l = row.live; const minMargin = row.min_margin_rate == null ? DEFAULT_MIN_MARGIN_RATE : row.min_margin_rate; %>
 
-<p><a href="/apps/amazon-pricing/">← 一覧へ</a></p>
-<h2 style="margin:0 0 4px"><%= row.ne_name || '(NE商品と未突合)' %></h2>
-<div class="code" style="margin-bottom:14px">
-  SKU <%= row.seller_sku %> /
-  ASIN <% if (row.asin) { %><a href="https://www.amazon.co.jp/dp/<%= encodeURIComponent(row.asin) %>" target="_blank" rel="noopener"><%= row.asin %></a><% } else { %>—<% } %> /
-  NE <%= row.ne_code || '—' %><% if (row.parts > 1) { %> (セット <%= row.parts %>品)<% } %> /
-  <span class="chip <%= String(row.channel).toUpperCase() === 'FBA' ? 'c-fba' : 'c-fbm' %>"><%= String(row.channel).toUpperCase() === 'FBA' ? 'FBA' : '自己発送' %></span>
+<div class="pt-panel" style="padding-bottom:8px">
+  <div class="pt-title" style="margin-bottom:6px">
+    <span class="pt-star">P</span>
+    <h1 style="font-size:20px"><%= row.ne_name || '(NE商品と未突合)' %></h1>
+    <span class="spacer"></span>
+    <a class="btn-gray" href="/apps/amazon-pricing/">← 在庫一覧へ</a>
+  </div>
+  <div class="code">
+    SKU <%= row.seller_sku %> /
+    ASIN <% if (row.asin) { %><a href="https://www.amazon.co.jp/dp/<%= encodeURIComponent(row.asin) %>" target="_blank" rel="noopener"><%= row.asin %></a><% } else { %>—<% } %> /
+    NE <%= row.ne_code || '—' %><% if (row.parts > 1) { %> (セット <%= row.parts %>品)<% } %> /
+    <span class="chip <%= String(row.channel).toUpperCase() === 'FBA' ? 'c-fba' : 'c-fbm' %>"><%= String(row.channel).toUpperCase() === 'FBA' ? 'FBA' : '自己発送' %></span>
+    / 数量 <b><%= row.stock == null ? '—' : num(row.stock) %></b>
+    <% if (row.asin) { %> / <a class="keepa" href="https://keepa.com/#!product/5-<%= encodeURIComponent(row.asin) %>" target="_blank" rel="noopener">📈 Keepa</a><% } %>
+  </div>
 </div>
 
 <div class="grid-2">
@@ -23,6 +31,7 @@
       <div class="k">原価 (税込)</div><div><% if (row.cost_incl_tax == null) { %><span class="chip c-bad">原価不明</span> <span class="small">構成品 <%= row.cost_missing_parts ?? '?' %> 点の原価が NE に無い</span><% } else { %><%= yen(row.cost_incl_tax) %> 円<% } %></div>
       <div class="k">販売手数料率</div><div><%= pct(row.referral_fee_rate) %><% if (l.costs.feeRateAssumed) { %> <span class="chip c-warn">仮定</span><% } %></div>
       <div class="k">FBA手数料 / 送料</div><div><%= yen(row.fba_fee) %> / <%= yen(row.ship_cost) %> 円 <span class="small">(その他 <%= yen((row.per_item_fee || 0) + (row.variable_closing_fee || 0)) %>)</span></div>
+      <div class="k">手数料 (いまの価格)</div><div><%= yen(row.fee_now) %> 円 <span class="small">= 販売手数料率 × 価格 + FBA配送代行 + 固定費 (プライスターの「手数料」欄に相当)</span></div>
       <div class="k">粗利 (いまの価格)</div><div><% if (row.gross_now.gross == null) { %>—<% } else { %><span class="<%= row.gross_now.gross < 0 ? 'neg' : 'pos' %>"><%= yen(row.gross_now.gross) %> 円 (<%= pct(row.gross_now.rate) %>)</span><% if (row.gross_now.rate < minMargin) { %> <span class="chip c-warn">最低粗利率 <%= pct(minMargin, 0) %> 未満</span><% } %><% } %></div>
       <div class="k">直近30日 販売 (確定分)</div><div><%= num(row.units_30d ?? 0) %> 個 / <%= yen(row.sales_30d) %> 円</div>
       <div class="k">下限 (計算)</div><div><%= yen(row.computed_floor) %> 円 <span class="small">= (原価 + 固定費) ÷ (1 − 手数料率 − 最低粗利率 <%= pct(minMargin, 0) %>)</span></div>

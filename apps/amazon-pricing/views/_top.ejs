@@ -1,15 +1,93 @@
 <%- include('_base') %>
+<%# 見た目はプライスター (jp2.pricetar.com) の在庫一覧に寄せる: 灰色の地 / 白いパネル / オレンジの下線つき見出し /
+    こげ茶の検索バー + クリーム色の検索欄 / 青い主ボタン / 灰色の罫線の表 / 縦に並ぶ価格追従ボタン (2026-09-08 中原さん指示) %>
 <style>
-  .wrap { max-width: 1500px; }
-  .topbar a.on { color: #fff; font-weight: 700; text-decoration: underline; text-underline-offset: 4px; }
-  .lede { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 10px; padding: 11px 14px; font-size: 13px; margin-bottom: 16px; }
-  .lede b { color: #1d4ed8; }
-  .dim { color: #94a3b8; }
+  body { background: #e9e9e9; color: #333; font-family: Meiryo, 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', system-ui, sans-serif; font-size: 13px; }
+  .topbar { background: #fff; color: #333; border-bottom: 3px solid #f0821e; padding: 8px 20px; }
+  .topbar a { color: #333; font-size: 14px; font-weight: 700; }
+  .topbar a:hover { color: #f0821e; }
+  .topbar a.on { color: #f0821e; }
+  .topbar .app-title { color: #f0821e; font-size: 18px; letter-spacing: .02em; margin-right: 10px; }
+  .topbar .user { color: #666; }
+  .wrap { max-width: 1560px; padding: 14px 16px; }
+  .lede { background: #fff8e1; border: 1px solid #f0c36d; border-radius: 4px; padding: 8px 12px; font-size: 12px; margin-bottom: 12px; }
+  .lede b { color: #c2410c; }
+  .dim { color: #999; }
   .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
   .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  .small { font-size: 11px; color: #64748b; }
+  .small { font-size: 11px; color: #666; }
+  /* ── プライスター風のパネル・見出し ── */
+  .pt-panel { background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.18); padding: 10px 12px 16px; margin-bottom: 14px; border-radius: 3px; }
+  .pt-title { display: flex; align-items: center; gap: 10px; border-bottom: 4px solid #e8641a; padding: 4px 4px 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  .pt-title h1 { font-size: 24px; font-weight: 400; margin: 0; }
+  .pt-title .spacer { flex: 1; }
+  .pt-star { background: #e8641a; color: #fff; border-radius: 50%; width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 18px; box-shadow: 0 0 0 3px #fbd3b8; }
+  .pt-search-h { background: #3b2f28; color: #fff; padding: 6px 12px; font-weight: 700; font-size: 13px; border-radius: 3px 3px 0 0; }
+  .pt-search-b { background: #fdf9e7; border: 1px solid #e7e0c5; border-top: 0; padding: 10px 12px; }
+  .pt-kw { width: 500px; max-width: 100%; padding: 8px 10px; border: 1px solid #bbb; border-radius: 3px; font-size: 14px; font-family: inherit; }
+  .btn-blue { background: #3a87c6; color: #fff; border: 1px solid #2f6fa3; border-radius: 3px; padding: 8px 16px; font-size: 13px; cursor: pointer; font-family: inherit; text-decoration: none; display: inline-block; }
+  .btn-blue:hover { background: #2f6fa3; }
+  .btn-gray { background: #e6e6e6; color: #333; border: 1px solid #bbb; border-radius: 3px; padding: 8px 12px; font-size: 13px; cursor: pointer; font-family: inherit; text-decoration: none; display: inline-block; }
+  .btn-gray:hover { background: #d9d9d9; }
+  .btn-xs { padding: 2px 7px; font-size: 11px; }
+  .btn-blue:disabled, .btn-gray:disabled { opacity: .5; cursor: not-allowed; }
+  .adv-toggle { position: absolute; opacity: 0; width: 0; height: 0; }
+  .adv { display: none; margin-top: 12px; border-top: 1px dashed #d8d0b0; padding-top: 10px; }
+  .adv-toggle:checked ~ .adv { display: block; }
+  .adv h4 { margin: 10px 0 6px; font-size: 12px; }
+  .adv h4::before { content: '['; } .adv h4::after { content: ']'; }
+  .tg { position: relative; display: inline-block; margin: 0 4px 6px 0; }
+  .tg input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .tg span { display: inline-block; padding: 6px 12px; border: 1px solid #bbb; background: #e6e6e6; border-radius: 3px; cursor: pointer; font-size: 12px; color: #333; }
+  .tg input:checked + span { background: #3a87c6; color: #fff; border-color: #2f6fa3; font-weight: 700; }
+  .tg input:focus-visible + span { outline: 2px solid #f0821e; }
+  .pt-result { font-size: 12px; margin: 10px 0 6px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .pt-badge { background: #777; color: #fff; padding: 1px 6px; border-radius: 2px; font-size: 11px; }
+  .pt-bulk { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0 8px; font-size: 12px; }
+  .pt-bulk .spacer { flex: 1; }
+  .pt-bulk select, .pt-bulk input[type=number] { width: auto; padding: 4px 6px; font-size: 12px; border: 1px solid #bbb; border-radius: 3px; }
+  .pt-bulk .group { display: inline-flex; align-items: center; gap: 4px; border: 1px solid #ccc; border-radius: 3px; padding: 3px 6px; background: #fafafa; }
+  table.pt { border-collapse: collapse; width: 100%; min-width: 1400px; font-size: 12px; }
+  table.pt th { background: #f2f2f2; border: 1px solid #ddd; padding: 8px 4px; font-weight: 700; text-align: center; font-size: 11px; vertical-align: middle; line-height: 1.4; white-space: nowrap; }
+  table.pt th a { color: #333; text-decoration: none; }
+  table.pt th a.sorted { color: #e8641a; }
+  table.pt td { border: 1px solid #ddd; padding: 7px 4px; vertical-align: top; background: #fff; line-height: 1.5; }
+  table.pt tr.alt td { background: #f7f7f7; }
+  table.pt tr.busy td { opacity: .6; }
+  table.pt td.center { text-align: center; }
+  .pt-name a { color: #2a6fb0; text-decoration: none; }
+  .pt-name a:hover { text-decoration: underline; }
+  .pt-sku { color: #333; }
+  .pt-mode-stack { display: flex; flex-direction: column; gap: 4px; align-items: center; }
+  button.pt-mode { width: 84px; border: 1px solid #bbb; border-radius: 3px; padding: 3px 0; font-size: 11px; cursor: pointer; background: #fff; color: #333; font-family: inherit; line-height: 1.4; }
+  button.pt-mode.m-fba_lowest { background: #cfe3ee; }
+  button.pt-mode.m-lowest { background: #dff0d3; }
+  button.pt-mode.m-buybox { background: #fff; }
+  button.pt-mode.m-custom { background: #dccbf0; }
+  button.pt-mode.m-off { background: #fff; }
+  button.pt-mode.on { border: 2px solid #333; font-weight: 700; padding: 2px 0; }
+  button.pt-mode.m-buybox.on { background: #d9b8e6; }
+  button.pt-mode:hover { filter: brightness(.95); }
+  .pt-inp { width: 72px; border: 1px solid #bbb; border-radius: 3px; padding: 3px 5px; font-size: 12px; text-align: right; font-family: inherit; }
+  .pt-inp.saved { border-color: #2e9e4a; background: #eefaf0; }
+  .pt-inp.err { border-color: #d33; background: #fff0f0; }
+  .lbl-red { color: #d9534f; font-size: 10px; }
+  .lbl-gray { color: #888; font-size: 10px; }
+  .pt-yen { color: #d9534f; margin-right: 2px; }
+  .fee-red { color: #d9534f; }
+  .pt-box { display: inline-block; border: 1px solid #ccc; background: #fafafa; border-radius: 3px; padding: 3px 6px; min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
+  .pt-box.none { color: #aaa; }
+  .badge-stop { background: #d9534f; color: #fff; font-weight: 700; border-radius: 3px; padding: 2px 6px; font-size: 11px; display: inline-block; line-height: 1.3; text-align: center; }
+  .badge-warn { background: #f0ad4e; color: #fff; font-weight: 700; border-radius: 3px; padding: 2px 6px; font-size: 11px; display: inline-block; }
+  .keepa { background: #3a87c6; color: #fff; border-radius: 3px; padding: 4px 6px; font-size: 10px; text-decoration: none; display: inline-block; text-align: center; }
+  .amz { background: #f5f5f5; border: 1px solid #ccc; color: #333; border-radius: 3px; padding: 3px 6px; font-size: 10px; text-decoration: none; display: inline-block; }
+  .st-btn { display: inline-block; background: #e6e6e6; border: 1px solid #bbb; border-radius: 3px; padding: 1px 6px; font-size: 11px; color: #333; text-decoration: none; cursor: pointer; font-family: inherit; margin: 1px 0; }
+  .st-btn:hover { background: #d9d9d9; }
+  /* ── 共通部品 (今日の判定・履歴・詳細でも使う) ── */
+  .card { border-radius: 3px; box-shadow: 0 1px 3px rgba(0,0,0,.12); border: 0; }
+  .card h2 { border-bottom: 2px solid #e8641a; padding-bottom: 4px; font-weight: 400; font-size: 16px; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
-  .stat { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; }
+  .stat { background: #fff; border: 1px solid #e2e8f0; border-radius: 3px; padding: 10px 12px; }
   .stat .k { font-size: 11px; color: #64748b; }
   .stat .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .stat .v small { font-size: 12px; font-weight: 400; color: #64748b; }
@@ -33,13 +111,13 @@
   .c-disagree { background: #fee2e2; color: #b91c1c; }
   .c-unsure { background: #f1f5f9; color: #475569; }
   table.ap { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table.ap th { text-align: left; color: #64748b; font-size: 11px; font-weight: 600; border-bottom: 2px solid #e2e8f0; padding: 7px 8px; white-space: nowrap; position: sticky; top: 0; background: #fff; }
+  table.ap th { text-align: left; color: #333; font-size: 11px; font-weight: 700; background: #f2f2f2; border: 1px solid #ddd; padding: 7px 8px; white-space: nowrap; position: sticky; top: 0; }
   table.ap th.num { text-align: right; }
-  table.ap td { border-bottom: 1px solid #f1f5f9; padding: 7px 8px; vertical-align: middle; }
-  table.ap tbody tr:hover td { background: #f8fafc; }
+  table.ap td { border: 1px solid #ddd; padding: 7px 8px; vertical-align: middle; }
+  table.ap tbody tr:hover td { background: #fffbea; }
   .tbl-wrap { overflow-x: auto; }
   .name { max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .name a { color: #1f2430; text-decoration: none; font-weight: 600; }
+  .name a { color: #2a6fb0; text-decoration: none; font-weight: 600; }
   .name a:hover { text-decoration: underline; }
   .reason { max-width: 270px; font-size: 12px; color: #334155; line-height: 1.4; }
   table.ap td.act { white-space: nowrap; }
@@ -50,39 +128,44 @@
   form.filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; margin-bottom: 12px; }
   form.filters label { margin: 0; }
   form.filters input[type=text], form.filters select { width: auto; min-width: 120px; }
-  .pager { display: flex; gap: 8px; align-items: center; font-size: 13px; margin: 10px 0; }
-  .pager a { color: #2563eb; }
-  dialog { border: 1px solid #cbd5e1; border-radius: 12px; padding: 0; max-width: 560px; width: 95vw; }
+  .pager { display: flex; gap: 8px; align-items: center; font-size: 12px; }
+  .pager a { color: #2a6fb0; }
+  .btn { border-radius: 3px; }
+  .btn-primary { background: #3a87c6; border-color: #2f6fa3; }
+  .btn-primary:hover { background: #2f6fa3; }
+  dialog { border: 1px solid #cbd5e1; border-radius: 6px; padding: 0; max-width: 560px; width: 95vw; }
   dialog::backdrop { background: rgba(15, 23, 42, .45); }
   .dlg { padding: 18px 20px; }
-  .dlg h3 { margin: 0 0 4px; font-size: 16px; }
+  .dlg h3 { margin: 0 0 4px; font-size: 16px; border-bottom: 2px solid #e8641a; padding-bottom: 4px; font-weight: 400; }
   .dlg .sub { font-size: 12px; color: #64748b; margin-bottom: 12px; }
   .dlg .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
   .dlg .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
   .dlg .err { color: #b91c1c; font-size: 12px; min-height: 16px; }
   .hint { font-size: 11px; color: #64748b; margin-top: -8px; margin-bottom: 10px; }
-  .toast { position: fixed; bottom: 18px; right: 18px; background: #1e293b; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 13px; display: none; z-index: 50; }
-  .rv-btn { border: 1px solid #cbd5e1; background: #fff; border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer; }
+  .toast { position: fixed; bottom: 18px; right: 18px; background: #1e293b; color: #fff; padding: 10px 14px; border-radius: 6px; font-size: 13px; display: none; z-index: 50; max-width: 420px; box-shadow: 0 4px 14px rgba(0,0,0,.3); }
+  .toast.bad { background: #b91c1c; }
+  .toast-undo { margin-left: 10px; background: #fff; color: #1e293b; border: 0; border-radius: 3px; padding: 3px 8px; font-size: 12px; cursor: pointer; font-family: inherit; display: none; }
+  .rv-btn { border: 1px solid #cbd5e1; background: #fff; border-radius: 3px; padding: 3px 8px; font-size: 12px; cursor: pointer; }
   .rv-btn:hover { background: #f1f5f9; }
   .rv-btn.on { border-color: #1e293b; background: #1e293b; color: #fff; }
   input.rv-comment { width: 150px; font-size: 12px; padding: 4px 6px; }
   .kv { display: grid; grid-template-columns: 150px 1fr; gap: 4px 12px; font-size: 13px; }
   .kv .k { color: #64748b; }
-  @media (max-width: 768px) { .dlg .grid { grid-template-columns: 1fr; } .kv { grid-template-columns: 1fr; } }
+  @media (max-width: 768px) { .dlg .grid { grid-template-columns: 1fr; } .kv { grid-template-columns: 1fr; } .pt-kw { width: 100%; } }
 </style>
 <div class="topbar">
-  <a href="/">← ポータル</a>
-  <span class="app-title">🏷️ Amazon 価格管理</span>
-  <a href="/apps/amazon-pricing/" class="<%= nav === 'index' ? 'on' : '' %>">出品一覧</a>
+  <span class="app-title">🏷️ 自社プライスター</span>
+  <a href="/apps/amazon-pricing/" class="<%= nav === 'index' ? 'on' : '' %>">在庫一覧</a>
   <a href="/apps/amazon-pricing/evaluations" class="<%= nav === 'evaluations' ? 'on' : '' %>">今日の判定</a>
   <a href="/apps/amazon-pricing/history" class="<%= nav === 'history' ? 'on' : '' %>">変更履歴</a>
   <span class="spacer"></span>
+  <a href="/" style="font-weight:400;font-size:12px">← ポータル</a>
   <span class="user"><%= displayName %></span>
 </div>
 <div class="wrap">
 <div class="lede">
   <b>この画面から Amazon の価格は変わりません。</b>
-  価格を送る仕組みそのものがまだありません (テストで機械的に確認しています)。ここでできるのは
-  「方針を決めて記録する」「ルールが出した判定を見て 👍/👎 で採点する」まで。記録は全部 DB に残り、あとで AI が読みます。
+  見た目はプライスターに合わせていますが、価格を送る仕組みそのものがまだありません (テストで機械的に確認しています)。
+  ここでできるのは「方針を決めて記録する」「ルールが出した判定を見て 👍/👎 で採点する」まで。記録は全部 DB に残り、あとで AI が読みます。
 </div>
-<div id="toast" class="toast"></div>
+<div id="toast" class="toast"><span id="toast-msg"></span><button type="button" id="toast-undo" class="toast-undo">元に戻す</button></div>
