@@ -674,42 +674,79 @@ console.log('\n[11] 管理画面の入口でも業務日を繰り越す');
 }
 
 
-console.log('\n[G] 🚨0 行の CSV は取り込まない (2026-09-08 の事故の再発防止)');
+console.log('\n[G] 🚨確認ずみの行き先が一斉に取り消される取込は断る (2026-09-08 の事故の再発防止)');
 {
-  // 事故の再現: 確認ずみで行き先のある行がある状態に、0 行の CSV が来る。
-  // 取り込むと「行が全部消えた」と判定され、行き先といろはのカードが一斉に取り消される。
+  const D = getDB();
+  // ⭐確認ずみ + 行き先ありの行をつくる (取り込むと取り消される = 失うもの)
+  const makeAtRisk = (batchId, n) => {
+    const keys = D.prepare('SELECT line_key FROM f_inbound_check_lines WHERE batch_id = ? ORDER BY seq').all(batchId).slice(0, n);
+    keys.forEach((k, i) => D.prepare(
+      "UPDATE f_inbound_check_line_state SET status = 'checked', destination_id = ? WHERE batch_id = ? AND line_key = ?"
+    ).run(990000 + i, batchId, k.line_key));
+    return keys.map((k) => k.line_key);
+  };
+  const atRisk = (batchId) => D.prepare(
+    "SELECT COUNT(*) c FROM f_inbound_check_line_state WHERE batch_id = ? AND status = 'checked' AND destination_id IS NOT NULL"
+  ).get(batchId).c;
+
+  // ══ ① 0 行の CSV (事故そのもの) ══
   const g1 = importCsv(makeCsv([row('GA1', 1, 'g-1', 5), row('GA1', 2, 'g-2', 3)]),
-    { fileName: 'g1.csv', source: 'auto', generatedAt: '2028-01-01T00:00:00Z' });
+    { fileName: 'g1.csv', source: 'auto', generatedAt: '2028-09-20T00:00:00Z' });
   ok(g1.ok, '(前提) 2 行の CSV を取り込める');
-  const b = getActiveBatch();
-  const lines = getDB().prepare('SELECT line_key FROM f_inbound_check_lines WHERE batch_id = ? ORDER BY seq').all(b.id);
-  // 1 行を確認ずみ + 行き先ありにする (取り消されると困る状態)
-  getDB().prepare("UPDATE f_inbound_check_line_state SET status = 'checked', destination_id = 999001 WHERE batch_id = ? AND line_key = ?")
-    .run(b.id, lines[0].line_key);
-  const before = getDB().prepare('SELECT COUNT(*) c FROM f_inbound_check_line_state WHERE batch_id = ? AND destination_id IS NOT NULL').get(b.id).c;
-  ok(before === 1, '(前提) 行き先のある確認ずみの行が 1 件');
+  const b1 = getActiveBatch();
+  makeAtRisk(b1.id, 1);
+  ok(atRisk(b1.id) === 1, '(前提) 行き先のある確認ずみの行が 1 件');
 
-  const empty = importCsv(makeCsv([]), { fileName: 'empty.csv', source: 'auto', generatedAt: '2028-01-01T01:00:00Z' });
-  ok(!empty.ok && empty.error === 'empty_csv', '⭐0 行の CSV は取り込まない');
+  const empty = importCsv(makeCsv([]), { fileName: 'empty.csv', source: 'auto', generatedAt: '2028-09-20T01:00:00Z' });
+  ok(!empty.ok && empty.error === 'empty_csv', '⭐0 行の CSV は取り込まない (1 件しか失わなくても)');
   ok(/取り消され/.test(empty.message) && /1 件/.test(empty.message), 'なぜ止めたか・何件が危なかったかを言う');
-  ok(getActiveBatch().id === b.id, '⭐いまの一覧はそのまま (差し替えない)');
-  ok(getDB().prepare('SELECT COUNT(*) c FROM f_inbound_check_destinations WHERE cancelled_at IS NOT NULL AND id = 999001').get().c === 0
-    || true, '行き先を取り消していない');
-  const st = getDB().prepare('SELECT status, destination_id FROM f_inbound_check_line_state WHERE batch_id = ? AND line_key = ?').get(b.id, lines[0].line_key);
-  ok(st.status === 'checked' && st.destination_id === 999001, '⭐確認ずみの行もそのまま');
-  ok(getDB().prepare("SELECT COUNT(*) c FROM f_inbound_check_import_log WHERE ok = 0 AND message LIKE '%0 行%'").get().c >= 1, '取込履歴に理由が残る (静かに落とさない)');
+  ok(getActiveBatch().id === b1.id, '⭐いまの一覧はそのまま (差し替えない)');
+  ok(atRisk(b1.id) === 1, '⭐確認ずみの行き先もそのまま (取り消していない)');
+  ok(D.prepare("SELECT COUNT(*) c FROM f_inbound_check_import_log WHERE ok = 0 AND message LIKE '%0 行%'").get().c >= 1,
+    '取込履歴に理由が残る (静かに落とさない)');
 
-  // ⭐人が中身を見て「これで正しい」と押したときは通す
-  const forced = importCsv(makeCsv([]), { fileName: 'empty2.csv', source: 'manual_upload', generatedAt: '2028-01-01T02:00:00Z', allowEmpty: true });
+  // ══ ② ⭐0 行でなくても、いまの行をひとつも含まない CSV は同じ全消しになる (Codex 指摘) ══
+  //    ロジザードの検索条件が違うと「1 行だけの別物 CSV」が来て、0 行と同じことが起きる
+  const g2 = importCsv(makeCsv([row('GB1', 1, 'g-3', 2), row('GB1', 2, 'g-4', 2), row('GB1', 3, 'g-5', 2)]),
+    { fileName: 'g2.csv', source: 'auto', generatedAt: '2028-09-20T02:00:00Z' });
+  ok(g2.ok, '(前提) 3 行の CSV を取り込める');
+  const b2 = getActiveBatch();
+  makeAtRisk(b2.id, 3);
+  ok(atRisk(b2.id) === 3, '(前提) 行き先のある確認ずみの行が 3 件');
+
+  const other = importCsv(makeCsv([row('GZ9', 1, 'g-9', 1)]),
+    { fileName: 'other.csv', source: 'auto', generatedAt: '2028-09-20T03:00:00Z' });
+  ok(!other.ok && other.error === 'mass_cancel',
+    '⭐いまの行をひとつも含まない CSV は取り込まない (1 行でも中身が別物なら全消しになる)');
+  ok(/3 件/.test(other.message), '何件が取り消されるところだったかを言う');
+  ok(getActiveBatch().id === b2.id, '⭐一覧はそのまま');
+  ok(atRisk(b2.id) === 3, '⭐3 件とも残っている');
+
+  // ══ ③ ⭐1 つでも残る CSV は通す (検品が進んで消えただけ = 正常な取消) ══
+  const partial = importCsv(makeCsv([row('GB1', 1, 'g-3', 2), row('GC1', 1, 'g-6', 4)]),
+    { fileName: 'partial.csv', source: 'auto', generatedAt: '2028-09-20T04:00:00Z' });
+  ok(partial.ok, '⭐確認ずみの行が 1 つでも残っていれば取り込む (正常な日を止めない)');
+  ok(getActiveBatch().id !== b2.id, '一覧が入れ替わっている');
+
+  // ══ ④ 少数 (2 件) が全部消えるのは普通に起きるので止めない ══
+  const b3 = getActiveBatch();
+  makeAtRisk(b3.id, 2);
+  ok(atRisk(b3.id) === 2, '(前提) 行き先のある確認ずみの行が 2 件');
+  const few = importCsv(makeCsv([row('GD1', 1, 'g-7', 1)]),
+    { fileName: 'few.csv', source: 'auto', generatedAt: '2028-09-20T05:00:00Z' });
+  ok(few.ok, '⭐確認ずみが 2 件しか無い日は、全部消えても止めない (毎日詰まらせない)');
+
+  // ══ ⑤ 人が中身を見て押したときは通す (逃げ道) ══
+  const b4 = getActiveBatch();
+  makeAtRisk(b4.id, 1);
+  const forced = importCsv(makeCsv([]), { fileName: 'empty2.csv', source: 'manual_upload', generatedAt: '2028-09-20T06:00:00Z', force: true });
   ok(forced.ok, '⭐人が確かめて押したときは通す (本当に入荷が無い日の逃げ道)');
 
-  // ⭐失うものが無ければ止めない
-  getDB().prepare("UPDATE f_inbound_check_line_state SET destination_id = NULL WHERE destination_id = 999001").run();
-  const g2 = importCsv(makeCsv([row('GB1', 1, 'g-3', 2)]), { fileName: 'g2.csv', source: 'auto', generatedAt: '2028-01-01T03:00:00Z' });
-  ok(g2.ok, '(前提) 1 行の CSV を取り込む');
-  // ⭐中身が同じ 0 行 CSV は「取込ずみ」で断られるので、列の並びを変えて別のファイルにする
-  const empty2 = importCsv(makeCsv([], { header: [...HEADER].reverse() }),
-    { fileName: 'empty3.csv', source: 'auto', generatedAt: '2028-01-01T04:00:00Z' });
+  // ══ ⑥ 失うものが無ければ止めない ══
+  const g3 = importCsv(makeCsv([row('GE1', 1, 'g-8', 2)]), { fileName: 'g3.csv', source: 'auto', generatedAt: '2028-09-20T07:00:00Z' });
+  ok(g3.ok, '(前提) 1 行の CSV を取り込む');
+  ok(atRisk(getActiveBatch().id) === 0, '(前提) 確認ずみの行き先は無い');
+  const empty2 = importCsv(makeCsv([], { header: [...HEADER].reverse() }), { fileName: 'empty3.csv', source: 'auto', generatedAt: '2028-09-20T08:00:00Z' });
   ok(empty2.ok, '⭐行き先のある確認ずみの行が無ければ、0 行でも止めない (失うものが無い)');
 }
 

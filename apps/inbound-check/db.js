@@ -853,46 +853,63 @@ export function rollOverWorkDate(db = getDB(), now = new Date()) {
   return r;
 }
 
+/** 一度にこれだけの行き先が「まとめて」取り消されるなら、CSV の取得不良を疑う (根拠は下の説明) */
+const MASS_CANCEL_MIN = 3;
+
 /**
- * CSV を取り込んで新しい active バッチにする。
- * @param {Buffer} buffer
- * @param {object} o  { fileName, source, actor, generatedAt (ISO。無ければ今) }
- * @returns {ok:true, batch, rowCount, slipCount} | {ok:false, error, message, batch?}
- *   error: bad_csv | duplicate_file | older_file
- */
-/**
- * 🚨**0 行の CSV は取り込まない** (2026-09-08 の事故の再発防止)。
+ * 🚨**確認ずみの行き先が一斉に取り消される取込を断る** (2026-09-08 の事故の再発防止)。
  *
  * ## 何が起きたか
  * 9/7 に足した 00:20 の取得が初回に 0 行の CSV を作り、良いファイルを上書きした。
- * 取込には「新しい CSV から消えた確認済みの行は行き先を取り消す」規則があるため、
+ * 取込には「新しい CSV から消えた確認ずみの行は行き先を取り消す」規則があるため、
  * **全行が「消えた」と判定**され、いろはの在庫化カードが全部取り消されて一覧から消えた。
  *
- * ## なぜ 0 行を断るのが正しいか
- * 取得が 0 行なのは「入荷の作業が全部片づいた」証拠ではなく、たいてい**取りに行けなかった**証拠。
- * 分からないものを「全部消えた」と読み替えるのが事故のもとだった (欠損値を 0 で代用しない、と同じ考え)。
- * ⭐本当に入荷が無い日でも、**取り込まずに今の一覧を残す**のが正しい振る舞い —
- *   その日は「新しい受付が無い」だけで、確認ずみの行き先を消してよい理由にはならない。
+ * ## 見張るのは「0 行」ではなく「まとめて取り消される数」
+ * 0 行だけを見張っても足りない。取得の条件が狂って**いまの一覧の行をひとつも含まない CSV**
+ * が来れば、1 行でも同じ全消しが起きる。なので
+ * 〈確認ずみで行き先のある行が、この取込で**ひとつ残らず**取り消されるか〉で見る。
  *
- * ⭐**確認ずみで行き先のある行が 1 つも無ければ止めない**。失うものが無く、
- *   初回の取込 (まだ何も無い) まで断ると使い始められない。
+ * - **1 つでも残れば通す**。同じ一覧の続き = 検品が進んで消えただけなので、取消は正常な動き。
+ * - ⭐0 行なら **1 件でも**断る。取得が 0 行なのは「入荷が片づいた」証拠ではなく、たいてい
+ *   **取りに行けなかった**証拠 (欠損を 0 で代用しない、と同じ)。本当に入荷が無い日でも、
+ *   取り込まずに今の一覧を残すのが正しい — その日は「新しい受付が無い」だけで、
+ *   確認ずみの行き先を消してよい理由にはならない。
+ * - 明細があるときは **{@link MASS_CANCEL_MIN} 件以上**が全滅するときだけ断る。
+ *   確認ずみが 1〜2 件しか無い日に、それが検品完了で消えるのは**普通に起きる**ので、
+ *   そこまで止めると毎日詰まる。3 件が同じ取込でまとめて消えるほうが珍しい。
+ * - ⭐断っても現場が詰まらないように、人が中身を見て押す逃げ道 (force) を画面に出してある。
  *
- * @returns {null} 取り込んでよい / {ok:false,...} 断る理由
+ * @returns {null} 取り込んでよい / {ok:false,error,message} 断る理由
  */
-function guardEmptyCsv(db, parsed, prevActive, { allowEmpty = false } = {}) {
-  if (allowEmpty) return null;                 // 人が中身を見て「これで正しい」と押したとき
-  if (parsed.rows.length > 0) return null;
+function guardMassCancel(db, parsed, prevActive, { force = false } = {}) {
+  if (force) return null;                      // 人が中身を見て「これで正しい」と押したとき
   if (!prevActive) return null;                // まだ一覧が無い (失うものが無い)
-  const atRisk = db.prepare(`SELECT COUNT(*) c FROM f_inbound_check_line_state
-    WHERE batch_id = ? AND status = 'checked' AND destination_id IS NOT NULL`).get(prevActive.id).c;
-  if (atRisk === 0) return null;
-  return { ok: false, error: 'empty_csv',
-    message: `CSV の明細が 0 行でした。取り込むと確認ずみの行き先 ${atRisk} 件が取り消され、`
-      + 'いろはの在庫化カードも消えるため、取り込みませんでした。'
-      + 'ロジザードから取り直してください (本当に入荷が無い日なら、今の一覧のままで問題ありません)' };
+  const atRisk = db.prepare(`SELECT line_key FROM f_inbound_check_line_state
+    WHERE batch_id = ? AND status = 'checked' AND destination_id IS NOT NULL`).all(prevActive.id);
+  if (atRisk.length === 0) return null;        // 失うものが無い
+  const incoming = new Set(parsed.rows.map((r) => r.line_key));
+  const doomed = atRisk.filter((p) => !incoming.has(p.line_key)).length;
+  if (doomed < atRisk.length) return null;     // 1 つでも残る = 同じ一覧の続き
+  const tail = 'いろはの在庫化カードも消えるため、取り込みませんでした。ロジザードから取り直してください';
+  if (parsed.rows.length === 0) {
+    return { ok: false, error: 'empty_csv',
+      message: `CSV の明細が 0 行でした。取り込むと確認ずみの行き先 ${atRisk.length} 件が取り消され、`
+        + tail + ' (本当に入荷が無い日なら、今の一覧のままで問題ありません)' };
+  }
+  if (atRisk.length < MASS_CANCEL_MIN) return null;
+  return { ok: false, error: 'mass_cancel',
+    message: `この CSV には、確認ずみの行き先 ${atRisk.length} 件の明細が 1 つも入っていません。`
+      + `取り込むと ${atRisk.length} 件とも取り消され、` + tail
+      + ' (ロジザードの検索条件が違う CSV かもしれません)' };
 }
-
-export function importCsv(buffer, { fileName = null, source = 'manual_upload', actor = null, generatedAt = null, allowEmpty = false } = {}) {
+/**
+ * CSV を取り込んで新しい active バッチにする。
+ * @param {Buffer} buffer
+ * @param {object} o  { fileName, source, actor, generatedAt (ISO。無ければ今), force }
+ * @returns {ok:true, batch, rowCount, slipCount} | {ok:false, error, message, batch?}
+ *   error: bad_csv | duplicate_file | older_file | empty_csv | mass_cancel
+ */
+export function importCsv(buffer, { fileName = null, source = 'manual_upload', actor = null, generatedAt = null, force = false } = {}) {
   if (!BATCH_SOURCES.includes(source)) throw new Error(`不正な source: ${source}`);
   const db = getDB();
   const fileHash = crypto.createHash('sha256').update(buffer).digest('hex');
@@ -957,12 +974,12 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     }
     // ⭐同日中の再取込は確認状態を引き継ぐ。旧 active を superseded にする前に掴んでおく
     const prevActive = active;
-    // 🚨0 行の CSV はここで止める。この先へ進めると、確認ずみの行が「消えた」と判定され、
+    // 🚨確認ずみの行き先が**ひとつ残らず**取り消される取込は、ここで止める。この先へ進めると
     //   行き先といろはのカードが一斉に取り消される (2026-09-08 の事故)
-    const empty = guardEmptyCsv(db, parsed, prevActive, { allowEmpty });
-    if (empty) {
-      logImport(db, { actor, source, fileName, ok: false, batchId: prevActive ? prevActive.id : null, message: empty.message });
-      return { ...empty, batch: prevActive || null };
+    const guard = guardMassCancel(db, parsed, prevActive, { force });
+    if (guard) {
+      logImport(db, { actor, source, fileName, ok: false, batchId: prevActive ? prevActive.id : null, message: guard.message });
+      return { ...guard, batch: prevActive || null };
     }
     // 旧 active を先に superseded にする (active の部分ユニーク索引があるため)
     db.prepare("UPDATE f_inbound_check_batches SET status = 'superseded' WHERE status = 'active'").run();

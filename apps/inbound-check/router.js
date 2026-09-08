@@ -902,9 +902,10 @@ router.post('/admin/upload', requireSession, checkOrigin, upload.single('file'),
   const lm = Number(req.body?.file_modified);
   const now = Date.now();
   const generatedAt = Number.isFinite(lm) && lm > 0 ? new Date(Math.min(lm, now)).toISOString() : null;
-  // ⭐0 行の CSV は既定で断る (2026-09-08 の事故)。人が中身を見て「これで正しい」と言うときだけ通す
-  const allowEmpty = req.body?.allow_empty === '1' || req.body?.allow_empty === true;
-  const r = importCsv(buf, { fileName: req.file.originalname, source: 'manual_upload', actor: req.session.email, generatedAt, allowEmpty });
+  // ⭐確認ずみの行き先が一斉に取り消される取込は既定で断る (2026-09-08 の事故)。
+  //   人が中身を見て「これで正しい」と押したときだけ通す (画面が確認を出してから付ける)
+  const force = req.body?.force === '1' || req.body?.force === true;
+  const r = importCsv(buf, { fileName: req.file.originalname, source: 'manual_upload', actor: req.session.email, generatedAt, force });
   if (!r.ok) return res.status(r.error === 'bad_csv' ? 400 : 409).json(r);
   res.json(r);
 }));
