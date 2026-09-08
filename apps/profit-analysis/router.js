@@ -14,6 +14,7 @@ import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { jstYearMonth, addMonthsYm, lastDayOfMonthStr } from '../../lib/jst-date.js';
 import { loadDimMall } from '../../lib/dim-mall.js';
 import inventoryDecisionRouter from './inventory-decision.js';
+import { queryPublished, csvCell } from '../expected-profit/query.js';
 
 const router = Router();
 
@@ -416,6 +417,76 @@ router.get('/api/profit/trend', (req, res) => {
 });
 
 // Amazon手数料キャッシュ状態
+// ─── 想定利益 (単品販売シナリオ) ───
+// 🚨 実績を使わない別系統。夜間に作った世代を読むだけで、ここでは計算しない。
+//    正本 = AI_reference『商品別想定利益_要件定義_20260907.md』
+router.get('/api/expected-profit', (req, res) => {
+  try {
+    const r = queryPublished({
+      mall: req.query.mall || undefined,
+      fulfillment: req.query.fulfillment || undefined,
+      expenseScope: req.query.scope || undefined,
+      salesClass: req.query.sales_class ? Number(req.query.sales_class) : undefined,
+      rankOnly: req.query.rank_only !== '0',
+      sort: req.query.sort === 'profit' ? 'profit' : 'margin',
+      order: req.query.order === 'asc' ? 'asc' : 'desc',
+      limit: Math.min(Number(req.query.limit) || 500, 5000),
+      offset: Number(req.query.offset) || 0,
+    });
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// CSV 出力。🚨 数式インジェクション対策は外部由来の文字列列にだけ適用する (§9.4)
+const EXPECTED_PROFIT_CSV_COLS = [
+  ['出品コード', 'mall_item_key', true], ['商品名', 'product_name', true], ['モール', 'mall', true],
+  ['出荷', 'fulfillment', true], ['NE品番', 'ne_code', true], ['紐づけ方', 'ne_code_source', true],
+  ['売価(税抜)', 'price_ex_tax'], ['売価(税込)', 'price_incl_tax'], ['送料収入(税抜)', 'postage_revenue_ex_tax'],
+  ['原価(税抜)', 'cost_ex_tax'], ['原価の出所', 'cost_method', true], ['単品何個ぶん', 'unit_quantity'],
+  ['配送方法', 'shipping_method', true], ['送料区分コード', 'shipping_code', true],
+  ['送料(税抜)', 'shipping_fee_ex_tax'], ['出荷作業料', 'shipping_work_ex_tax'],
+  ['梱包資材費', 'shipping_material_ex_tax'], ['人件費', 'shipping_labor_ex_tax'],
+  ['配送関係費 合計', 'shipping_total_ex_tax'],
+  ['FBA配送代行', 'fba_fee_ex_tax'],
+  ['販売手数料', 'referral_fee_ex_tax'], ['成約料', 'closing_fee_ex_tax'], ['基本成約料', 'per_item_fee_ex_tax'],
+  ['手数料率', 'fee_rate_display'], ['手数料 合計', 'fee_total_ex_tax'],
+  ['想定利益', 'expected_profit'], ['想定利益率', 'expected_margin_rate'],
+  ['費用範囲', 'expense_scope_version', true], ['計算状態', 'calculation_status', true],
+  ['計算できない理由', 'incomplete_reason', true],
+  ['ランキング対象', 'rank_eligible_now'], ['対象外の理由', 'rank_exclusion_reason_now', true],
+  ['価格の状態', 'price_status', true], ['原価の状態', 'cost_status', true],
+  ['手数料の状態', 'fee_status', true], ['配送マスタの状態', 'shipping_master_status', true],
+  ['送料収入の状態', 'shipping_revenue_status', true], ['表示時に失効', 'expired_now'],
+  ['世代', 'generation_id', true], ['計算日時', 'built_at', true],
+];
+
+router.get('/api/expected-profit.csv', (req, res) => {
+  try {
+    const r = queryPublished({
+      mall: req.query.mall || undefined,
+      expenseScope: req.query.scope || undefined,
+      rankOnly: req.query.rank_only !== '0',
+      sort: req.query.sort === 'profit' ? 'profit' : 'margin',
+      order: req.query.order === 'asc' ? 'asc' : 'desc',
+      limit: 100000,
+    });
+    const out = [EXPECTED_PROFIT_CSV_COLS.map(c => csvCell(c[0])).join(',')];
+    for (const row of r.rows) {
+      out.push(EXPECTED_PROFIT_CSV_COLS
+        .map(([, key, isText]) => csvCell(row[key], { isExternalText: !!isText })).join(','));
+    }
+    const BOM = '﻿';                       // Excel が UTF-8 と分かるように
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition',
+      `attachment; filename="expected-profit-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(BOM + out.join('\r\n'));
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 router.get('/api/fee-status', (req, res) => {
   try {
     const db = getMirrorDB();

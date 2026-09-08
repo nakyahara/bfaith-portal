@@ -41,6 +41,7 @@ import qoo10AccountingRouter from './apps/qoo10-accounting/router.js';
 import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
+import expectedProfitSyncRouter from './apps/expected-profit/publish-api.js';
 import amazonDashboardRouter from './apps/amazon-dashboard/router.js';
 import rakutenAnalyticsRouter from './apps/rakuten-analytics/router.js';
 import yahooAnalyticsRouter from './apps/yahoo-analytics/router.js';
@@ -1376,6 +1377,17 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 }, qoo10AccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
+// 想定利益: miniPC から世代を受け取る口。ログイン不要 (sync key 認証)。
+// 既存 mirror sync と同じ流儀にする (12MB parser + parser error handler)。
+// 🚨 全置換ではなく「世代を作り切ってからポインタを切り替える」ので、受信中も画面は前の世代を見る
+app.use('/apps/expected-profit/sync', requireSyncKeyStrict);
+app.use('/apps/expected-profit/sync', express.json({
+  limit: '12mb',
+  inflate: false,
+  verify: (req, res, buf) => { req.rawBodyBytes = buf.length; },
+}));
+app.use('/apps/expected-profit/sync', mirrorParserErrorHandler);
+app.use('/apps/expected-profit/sync', expectedProfitSyncRouter);
 app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.json({ limit: '256kb' }), amazonDashboardRouter);
 app.use('/apps/rakuten-analytics', requireAppAccess('rakuten-analytics'), rakutenAnalyticsRouter);
 app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), express.json({ limit: '256kb' }), yahooAnalyticsRouter);

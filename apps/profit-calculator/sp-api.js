@@ -608,9 +608,45 @@ export async function updatePrice({ sku, price }) {
  * 出品中の全商品レポートを取得（SKU数の確認用）
  * GET_MERCHANT_LISTINGS_DATA レポート
  */
-export async function getActiveListingsReport() {
-  const sp = getClient();
-  const marketplaceId = MARKETPLACE_ID();
+/**
+ * 出品レポートを待てる上限を決める。
+ *
+ * 🚨 既定は従来どおり5分 (既存の呼び出し元の挙動を変えない)。
+ *    夜間バッチだけは期限まで待てるようにする — 実データで、Amazon 側の待ち行列が
+ *    混んでいて5分では DONE にならず、7時間の余裕があるのに諦めていた
+ *    (2026-09-07 実測: IN_PROGRESS のまま5分でタイムアウト)。
+ *    無限に待たないよう上限 (30分) は残す。
+ */
+export const REPORT_DEFAULT_MAX_WAIT_MS = 5 * 60 * 1000;
+export const REPORT_MAX_WAIT_CAP_MS = 30 * 60 * 1000;
+export const REPORT_POLL_INTERVAL_MS = 5000;
+
+export function reportWaitUntil({ now = new Date(), deadline = null, maxWaitMs = null } = {}) {
+  const t = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  const cap = t + REPORT_MAX_WAIT_CAP_MS;
+  if (deadline) {
+    const d = new Date(deadline).getTime();
+    // 期限が読めないときは既定にフォールバックする (NaN で「すぐ諦める」にしない)
+    if (Number.isFinite(d)) return new Date(Math.min(d, cap));
+  }
+  const wait = Number.isFinite(Number(maxWaitMs)) && Number(maxWaitMs) > 0
+    ? Number(maxWaitMs) : REPORT_DEFAULT_MAX_WAIT_MS;
+  return new Date(Math.min(t + wait, cap));
+}
+
+export async function getActiveListingsReport(opts = {}) {
+  // 差し替え可能にしておく。ここは実データで壊れた経路 (5分で諦めた) なので、
+  // 本番の待ちループそのものをテストから通せるようにする
+  const sp = opts.client || getClient();
+  const wait = opts.sleep || sleep;
+  const log = opts.log || console.log;
+  const marketplaceId = opts.marketplaceId || MARKETPLACE_ID();
+
+  // 🚨 期限を過ぎているなら作らない (Codex R8-2)。
+  //    夜間入口でも見ているが、ここに直接来る呼び出し元もある
+  if (opts.deadline && (opts.now ? opts.now() : new Date()) >= new Date(opts.deadline)) {
+    throw new Error('期限を過ぎているのでレポートを作らない');
+  }
 
   // レポート作成リクエスト
   const createResult = await sp.callAPI({
@@ -624,27 +660,43 @@ export async function getActiveListingsReport() {
   });
 
   const reportId = createResult.reportId;
-  console.log(`[SP-API] レポート作成: reportId=${reportId}`);
+  log(`[SP-API] レポート作成: reportId=${reportId}`);
+  const startedWaitingAt = (opts.now || (() => new Date()))();
 
-  // レポート完了を待機（最大5分）
+  // レポート完了を待つ。既定5分、夜間バッチは期限まで (上限30分)
+  const nowFn = opts.now || (() => new Date());
+  const waitUntil = reportWaitUntil({ now: nowFn(), deadline: opts.deadline, maxWaitMs: opts.maxWaitMs });
   let report;
-  for (let i = 0; i < 60; i++) {
-    await sleep(5000);
+  while (nowFn() < waitUntil) {
+    // 🚨 残り時間より長く眠らない。5秒固定だと、期限の1秒前に入ったループが
+    //    期限を4秒過ぎてから API を呼ぶ (Codex R7-4)
+    const remaining = waitUntil.getTime() - nowFn().getTime();
+    await wait(Math.min(REPORT_POLL_INTERVAL_MS, Math.max(0, remaining)));
+    // 🚨 眠ったあとにも期限を見る (眠っている間に越えることがある)
+    if (nowFn() >= waitUntil) break;
     report = await sp.callAPI({
       operation: 'getReport',
       endpoint: 'reports',
       path: { reportId },
       options: { version: '2021-06-30' },
     });
-    console.log(`[SP-API] レポートステータス: ${report.processingStatus}`);
+    log(`[SP-API] レポートステータス: ${report.processingStatus}`);
     if (report.processingStatus === 'DONE') break;
     if (report.processingStatus === 'FATAL' || report.processingStatus === 'CANCELLED') {
       throw new Error(`レポート処理失敗: ${report.processingStatus}`);
     }
   }
 
-  if (report.processingStatus !== 'DONE') {
-    throw new Error('レポート取得タイムアウト');
+  if (report?.processingStatus !== 'DONE') {
+    // 諦めた理由を残す。どこまで待ったかが分からないと運用で判断できない
+    const waited = Math.round((waitUntil.getTime() - new Date(startedWaitingAt).getTime()) / 1000);
+    throw new Error(`レポート取得タイムアウト (${waited}秒待った / 最後の状態=${report?.processingStatus || '応答なし'})`);
+  }
+
+  // 🚨 DONE でも、ここから先 (本体のダウンロード) に入る前に期限を見る。
+  //    レポートは数MB あるので、期限を越えていたら始めない (Codex R7-4)
+  if (nowFn() >= waitUntil) {
+    throw new Error('レポートは完成したが期限を過ぎたので取得しない (翌日に回す)');
   }
 
   // レポートドキュメント取得
@@ -656,7 +708,12 @@ export async function getActiveListingsReport() {
   });
 
   // ドキュメントダウンロード（GZIP圧縮 + Shift_JIS対応）
-  const response = await fetch(doc.url);
+  // 🚨 本体は数MBある。ドキュメント情報の取得に時間がかかって期限を越えることがあるので、
+  //    ダウンロードを始める直前にもう一度見る (Codex R8-2)
+  if (nowFn() >= waitUntil) {
+    throw new Error('本体を取りに行く前に期限を過ぎた (翌日に回す)');
+  }
+  const response = await (opts.fetchImpl || fetch)(doc.url);
   const rawBuf = Buffer.from(await response.arrayBuffer());
 
   let dataBuf = rawBuf;
@@ -830,7 +887,7 @@ async function fetchOrderReport(sp, marketplaceId, startStr, endStr) {
     options: { version: '2021-06-30' },
   });
 
-  const response = await fetch(doc.url);
+  const response = await (opts.fetchImpl || fetch)(doc.url);
   const rawBuf = Buffer.from(await response.arrayBuffer());
 
   let dataBuf = rawBuf;
