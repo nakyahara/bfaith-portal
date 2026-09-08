@@ -104,12 +104,21 @@ export function listBatchesOfTask(db, taskId) {
  *   - 棚に入れた記録・箱ラベルを刷った記録が無いか (刷ったラベルの数と合わなくなる)
  *   - できた数を数えていないか (数え終わったものを分けると、どちらが何個できたか決められない)
  *
- * @param {object} o  { taskId, batchId, qty (新しいぶんの数), expiry (新しいぶんの期限。null 可), actor }
+ * ⭐**元のまとまりの版 (expectVersion) を必ず見る**。見ないと、同じ 100 個を 2 人が別々に開いて
+ *   40 個ずつ分けたとき、どちらも条件を通って「20 + 40 + 40」になる (合計は合うのに、期限ごとの数が
+ *   現物とずれる)。応答を失って送り直したときも同じ (Codex #1270 R1 重大)。
+ *
+ * @param {object} o  { taskId, batchId, qty (新しいぶんの数), expiry (新しいぶんの期限。null 可), expectVersion, actor }
  * @returns {{ok:true, batch}|{ok:false, error, message}}
  */
-export function splitBatchByExpiry(db, { taskId, batchId, qty, expiry = null, actor = null }) {
+export function splitBatchByExpiry(db, { taskId, batchId, qty, expiry = null, expectVersion = null, actor = null }) {
   const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ? AND task_id = ?').get(Number(batchId), Number(taskId));
   if (!b) return { ok: false, error: 'bad_batch', message: 'そのぶんはこのカードにありません (画面を更新してください)' };
+  // 🚨**画面で見ていたときの版**と同じでなければ断る (二重に分けない・古い画面で分けない)
+  if (expectVersion == null || Number(expectVersion) !== b.version) {
+    return { ok: false, error: 'conflict', current: b,
+      message: 'このぶんは他の端末で変わっています。画面を更新して、もう一度確かめてください' };
+  }
   const n = Number(qty);
   if (!Number.isSafeInteger(n) || n < 1) {
     return { ok: false, error: 'bad_qty', message: '分ける数は 1 以上の整数で入れてください' };

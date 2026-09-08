@@ -4254,7 +4254,8 @@ async function openSplitBatch(batchId) {
     if (pin == null) return;
   }
   const j = await apiFetch('/api/batches/split', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: c.id, batch_id: b.id, qty: n, expiry: String(exp).trim() || null, worker_id: w.id, pin }) });
+    body: JSON.stringify({ id: c.id, batch_id: b.id, qty: n, expiry: String(exp).trim() || null,
+      expect_version: b.version, worker_id: w.id, pin }) });
   if (!j.ok) { showErr(j.message || '分けられませんでした'); return; }
   toast('✂ ' + n + ' 個を別のぶんに分けました' + (j.batch && j.batch.expiry ? ' (期限 ' + j.batch.expiry + ')' : ''));
   await loadState();

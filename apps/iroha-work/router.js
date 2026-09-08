@@ -950,6 +950,8 @@ router.post('/api/batches/split', checkOrigin, api((req, res) => {
   // ⭐まとまりを増やすので、読んでから書くまでを 1 つのトランザクションで
   const r = db.transaction(() => splitBatchByExpiry(db, { taskId, batchId,
     qty: req.body?.qty, expiry: req.body?.expiry ?? null,
+    // ⭐画面が見ていた版。二重に分けない (同じ 100 個を 2 人が 40 個ずつ分けると現物と合わなくなる)
+    expectVersion: req.body?.expect_version,
     actor: `${gate.worker.display_name} (いろはアプリ)` })).immediate();
   if (!r.ok) return res.status(taskErrorStatus(r.error)).json(r);
   safeLogTaskEvent({ taskId, action: 'batch_split', workerId: gate.worker.id, workerName: gate.worker.display_name,
