@@ -788,7 +788,7 @@
               + (j.removed ? ' (消滅 ' + j.removed + ')' : '')
               + (j.invalidBarcodes ? ' ・ 刷れない形を ' + j.invalidBarcodes + ' 件 除外' : '')
               + (j.blankRows ? ' ・ 空欄の行 ' + j.blankRows + ' 件' : '')
-              + (naiyaku ? ' ・ 有効区分: ' + naiyaku : ''));
+              + (naiyaku ? ' ・ ' + (j.kubunColumn || '区分') + ': ' + naiyaku : ''));
           setTimeout(() => location.reload(), 2500);
         } else {
           msg($('#fetchBarcodeMsg'), false, '❌ ' + (j.message || j.error || ('HTTP ' + status)));

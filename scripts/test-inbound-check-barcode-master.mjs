@@ -73,7 +73,10 @@ const bcm = await import('../apps/inbound-check/barcode-master.js');
 const { parseBarcodeMasterCsv, importBarcodeMaster, barcodeMasterStatus } = bcm;
 const iconv = (await import('iconv-lite')).default;
 const q = v => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
-const csvOf = (rows, header = ['商品ID', '商品名', '検索名称', 'バーコード', '有効区分']) =>
+// 🚨 既定のヘッダは**共有ドライブの実ファイルの1行目そのまま** (2026-09-08 採取)。
+//    合成データだけで試験していたせいで、列名の取り違え (有効区分 / 有効期限区分) に本番まで気付けなかった
+const REAL_HEADER = ['商品ID', '商品名', '検索名称', 'バーコード', '有効期限区分'];
+const csvOf = (rows, header = REAL_HEADER) =>
   iconv.encode([header.map(q).join(',')].concat(rows.map(r => r.map(q).join(','))).join('\r\n') + '\r\n', 'cp932');
 {
   const bad = (buf, why) => {
@@ -83,7 +86,7 @@ const csvOf = (rows, header = ['商品ID', '商品名', '検索名称', 'バー�
   };
   bad(Buffer.alloc(0), '空ファイルは拒否');
   bad(csvOf([['a', 'b', 'c']], ['商品ID', '商品名', '検索名称']), '必須列 バーコード が無ければ拒否');
-  bad(csvOf([['awa-shio-250', '粟国の塩', '粟国の塩', '4936695001014']], ['商品ID', '商品名', '検索名称', 'バーコード']), '有効区分の列が消えたら拒否 (区分不明のまま本番で使わない)');
+  bad(csvOf([['awa-shio-250', '粟国の塩', '粟国の塩', '4936695001014']], ['商品ID', '商品名', '検索名称', 'バーコード']), '区分の列がどちらの名前でも無ければ拒否 (区分不明のまま本番で使わない)');
   bad(csvOf([['a1', 'A', 'A', '4936695001014', '01'], ['a2', 'B', 'B', '4936695001014', '01']]), '同じバーコードが別の商品に付いていたら取込ごと拒否');
   bad(csvOf([['awa-shio-250', '粟国の塩', '粟国の塩', '4936695001014', '01'], ['x', 'y']]), '列数が違う行は拒否');
   bad(csvOf([]), '中身が無ければ拒否 (マスタが空になることは無い)');
@@ -102,7 +105,7 @@ const csvOf = (rows, header = ['商品ID', '商品名', '検索名称', 'バー�
   eq(parsed.products, 3, '商品数');
   eq(parsed.invalidBarcodes, 1, '刷れない形の件数を数える');
   eq(parsed.blankRows, 1, '商品IDかバーコードが空の行も数える (出力が途中で切れたのを見つける)');
-  eq(parsed.kubunCounts, { '01': 3, '02': 1 }, '有効区分の内訳を返す (実データで判断できるように)');
+  eq(parsed.kubunCounts, { '01': 3, '02': 1 }, '区分の内訳を返す (実データで判断できるように)');
   const pas = parsed.rows.filter(r => r.code_key === 'pashima-single-ki');
   eq(pas.find(r => r.rank === 0).barcode, '4903357200047', '商品ごとの代表は JAN (後から出てきても JAN が勝つ)');
   // 代表はチェックデジットまで正しい GTIN を優先 (社内の数字コードや桁数違いを刷らない)
@@ -117,6 +120,22 @@ const csvOf = (rows, header = ['商品ID', '商品名', '検索名称', 'バー�
   eq(mixed.rows.filter(r => r.code_key === 'mix-2' && r.rank === 0)[0].barcode, 'X002ZZZZ9Z', 'チェックデジットが合わない数字より FNSKU を代表にする');
   ok(bcm.isValidGtin('4903357200047') && bcm.isValidGtin('4936695001014') && !bcm.isValidGtin('4903357200041') && !bcm.isValidGtin('12345'), 'GTIN のチェックデジット判定');
   ok(pas.find(r => r.rank === 1).barcode === 'X002ABCD1F', 'FNSKU も残る (どちらで読んでも引ける)');
+
+  // 🚨 列名を「有効区分」と思い込んでいたせいで、本番では**取込が毎回まるごと拒否**されていた
+  //    (2026-09-08 中原さん「rosebathp のシールが出ない」で発覚。マスタは0件のままだった)。
+  //    実ファイルの1行目を固定して、合成データだけで緑にならないようにする
+  const realRow = ['rosebathp', '入浴剤【バラ咲き誇る】ローズバスパウダー', '入浴剤【バラ咲き誇る】ローズバスパウダー', '2200000033826', '01'];
+  eq(iconv.decode(csvOf([realRow]), 'cp932').split(/\r?\n/)[0],
+    '"商品ID","商品名","検索名称","バーコード","有効期限区分"',
+    '既定ヘッダ = 共有ドライブの バーコードマスタ.csv の1行目そのまま (2026-09-08 採取)');
+  const real = parseBarcodeMasterCsv(csvOf([realRow]));
+  eq(real.kubunCol, '有効期限区分', '実ファイルの列名で読める');
+  eq(real.rows[0].barcode, '2200000033826', 'rosebathp のバーコードが取れる (在庫も入荷実績も無い商品)');
+  ok(real.rows[0].gtin_ok && real.rows[0].rank === 0, 'インストアコード (22始まり) もチェックデジットが合えば代表になる');
+  // ロジザードの出力パターン次第で「有効区分」と出る環境もありうるので、どちらでも通す
+  const oldName = parseBarcodeMasterCsv(csvOf([realRow], ['商品ID', '商品名', '検索名称', 'バーコード', '有効区分']));
+  eq(oldName.kubunCol, '有効区分', '「有効区分」という列名でも通す');
+  eq(oldName.rows[0].kubun, '01', 'どちらの列名でも同じところを区分として読む');
 
   const r = importBarcodeMaster(csvOf([
     ['awa-shio-250', '粟国の塩 250g', '粟国の塩', '4936695001014', '01'],
