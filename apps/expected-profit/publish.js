@@ -114,9 +114,13 @@ export async function publishToRender(db, generationId, deps) {
 const HTTP_TIMEOUT_MS = 120_000;
 
 export function httpDeps(deadline = null) {
-  const base = (process.env.RENDER_PORTAL_URL || '').replace(/\/+$/, '');
+  // 🚨 Render の URL は **既存の `RENDER_MIRROR_URL`** を使う。
+  //    同じ Render アプリを指すのに新しい env を増やすと、片方だけ設定されて
+  //    転送が黙って止まる (実際に初回の公開がこれで失敗した 2026-09-08)。
+  //    RENDER_PORTAL_URL が設定されていればそちらを優先する (移行用)
+  const base = (process.env.RENDER_PORTAL_URL || process.env.RENDER_MIRROR_URL || '').replace(/\/+$/, '');
   const key = process.env.MIRROR_SYNC_KEY;
-  if (!base) throw new Error('RENDER_PORTAL_URL not configured');
+  if (!base) throw new Error('RENDER_MIRROR_URL not configured');
   if (!key) throw new Error('MIRROR_SYNC_KEY not configured');
   const headers = { 'Content-Type': 'application/json', 'x-sync-key': key };
   const url = (p) => `${base}/apps/expected-profit/sync${p}`;
