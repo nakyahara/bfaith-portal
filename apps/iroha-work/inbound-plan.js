@@ -95,7 +95,8 @@ function masterRank(row, want) {
  *      ② 生の商品ID     … TRIM(商品コード) IN (商品ID)            … 全角コードで表記が同じもの
  *      ③ 非ASCII の商品コードだけ読んで JS で突き合わせる          … 全角コードで大小が違うもの
  *         (ＡＭＣ-Ｚ と ａｍｃ-ｚ。①②のどちらでも当たらない — Codex R3 P2)
- *    ③ は「非ASCII を含む商品コードを引き当てられなかったとき」だけ走る = 実データではまず走らない。
+ *    ③ は「探しているキーに非ASCII があるとき」だけ走る = 実データではまず走らない。
+ *    ②が当たっていても飛ばさない (別の仕入先の表記だけ拾って終わると、0001 の行を取り逃す — Codex R4 P2)。
  *
  * 🚨 同じ code_key の行が 2 つ以上あるときは masterRank の順で決める (毎回同じ行を選ぶ)。
  *    仕入先が食い違っている (0001 と別の仕入先が両方ある) ことは呼び元へ伝えて画面に出す —
@@ -143,8 +144,10 @@ function productMasterMap(db, lines) {
     for (const r of db.prepare(`${MASTER_SELECT} WHERE LOWER(TRIM(商品コード)) IN (${ph}) OR TRIM(商品コード) IN (${ph})`)
       .all(...part, ...part)) consider(r);
   });
-  // ③ 非ASCII の商品コードで引けなかったものが残っているときだけ
-  if ([...wanted].some((k) => !map.has(k) && NON_ASCII.test(k))) {
+  // ③ 探しているキーに非ASCII が 1 つでもあれば走らせる。
+  //    ②で「たまたま同じ表記の行」が当たっていても飛ばさない — その行が別の仕入先で、
+  //    大小違いの行が 0001 だと、飛ばした瞬間にその商品が消えて食い違いも報せられない (Codex R4 P2)
+  if ([...wanted].some((k) => NON_ASCII.test(k))) {
     for (const r of db.prepare(`${MASTER_SELECT} WHERE 商品コード GLOB '*[^ -~]*'`).all()) consider(r);
   }
   for (const [k, sups] of seen) {
