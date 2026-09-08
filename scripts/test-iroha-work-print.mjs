@@ -146,16 +146,56 @@ let J1;
       && after.product_name === row.product_name,
       '⭐あとでまとまりの期限や数を直しても、**刷った記録は変わらない** (何を刷ったかが残る)');
     db.prepare("UPDATE f_iroha_task_batches SET expiry = ?, planned_qty = ? WHERE id = ?").run(sole.expiry, sole.planned_qty, sole.id);
-    // まとまりが 2 つ以上なら、どのぶんか決められないので紐づけない (別のカードで試す)
+    // ⭐まとまりが 2 つ以上なら、どのぶんか**選ばせる** (要件 §AB-12)。
+    //   決めずに刷ると、期限の違うぶんに同じラベルを貼ってしまう。貼ると現物からは分からない
     const TS = mkTask('分かれたカード', 'SPLIT-1');
     const at2 = new Date().toISOString();
-    db.prepare(`INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, created_at, updated_at)
-      VALUES (?, 2, 5, 'not_started', ?, ?)`).run(TS, at2, at2);
+    db.prepare(`INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, expiry, work_status, created_at, updated_at)
+      VALUES (?, 2, 5, '2028-06', 'not_started', ?, ?)`).run(TS, at2, at2);
     const split = enqueuePrintJob({ taskId: TS, copies: 1, packQty: '120', clientRequestId: crid() });
-    ok(split.ok && db.prepare('SELECT batch_id FROM f_iroha_print_jobs WHERE id = ?').get(split.job.id).batch_id == null,
-      '⭐まとまりが 2 つ以上なら、どのぶんか決められないので紐づけない (適当に 1 つ目に付けない)');
+    ok(!split.ok && split.error === 'pick_batch',
+      '⭐まとまりが 2 つ以上で選んでいなければ断る (適当に 1 つ目に付けない・NULL で残さない)');
+    ok(Array.isArray(split.batches) && split.batches.length === 2,
+      '⭐選べるように、どのぶんがあるかを返す');
+    ok(split.batches.some((b) => b.expiry === '2028-06'),
+      '期限も返す (ぶんごとに違うことがある)');
+    // 選べば通り、そのぶんに紐づく
+    const pickTo = split.batches.find((b) => b.seq === 2);
+    const picked = enqueuePrintJob({ taskId: TS, batchId: pickTo.id, copies: 1, packQty: '120', clientRequestId: crid() });
+    ok(picked.ok && db.prepare('SELECT batch_id FROM f_iroha_print_jobs WHERE id = ?').get(picked.job.id).batch_id === pickTo.id,
+      '⭐選べば、そのぶんに紐づいて残る (何を刷ったかが後から分かる)');
+    ok(picked.job.client_request_id === undefined,
+      '依頼 ID は画面に返さない (端末への控えは R6 で撤去した。使わないものを API に出さない)');
+    // ⭐積んだままだと同じカードに次を積めない (在庫中の見張り)。1 つずつ片づけて次を試す
+    db.prepare('DELETE FROM f_iroha_print_jobs WHERE id = ?').run(picked.job.id);
+    // よそのカードのぶんは指定できない (別の新しいカードで試す)
+    const TW = mkTask('よそのカード', 'SPLIT-2');
+    const wrong = enqueuePrintJob({ taskId: TW, batchId: pickTo.id, copies: 1, packQty: '120', clientRequestId: crid() });
+    ok(!wrong.ok && wrong.error === 'bad_batch', 'よそのカードのぶんは指定できない');
+    // ⭐同じ冪等 ID でも、どのぶんかが違えば「積めた」と返さない
+    const cid2 = crid();
+    const other = split.batches.find((b) => b.seq !== 2);
+    ok(enqueuePrintJob({ taskId: TS, batchId: pickTo.id, copies: 1, packQty: '120', clientRequestId: cid2 }).ok, '(前提) 1 回目は積める');
+    const mix = enqueuePrintJob({ taskId: TS, batchId: other.id, copies: 1, packQty: '120', clientRequestId: cid2 });
+    ok(!mix.ok && mix.error === 'idempotency_conflict',
+      '⭐同じ依頼 ID で別のぶんが送られたら断る (違うラベルを「積めた」と返さない)');
+    // 🚨全部取り消されたカードを「まとまりの無い古いカード」と同じに扱わない (Codex R4 中1)。
+    //   取り消したぶんを除いてから件数を見ると、カード全体の期限・数でラベルが出てしまう
+    // 先に積んであるジョブを片づける (残っていると in_progress で断られ、まとまりの検査まで届かない)
+    db.prepare('DELETE FROM f_iroha_print_jobs WHERE task_id = ?').run(TS);
+    db.prepare("UPDATE f_iroha_task_batches SET work_status = 'cancelled' WHERE task_id = ?").run(TS);
+    const allGone = enqueuePrintJob({ taskId: TS, copies: 1, packQty: '120', clientRequestId: crid() });
+    ok(!allGone.ok && allGone.error === 'no_batch',
+      '⭐まとまりがあるのに全部取り消されていたら断る (カード全体の数で刷らせない)');
+    ok(/取り消されています/.test(allGone.message || ''), 'なぜ出せないかを言う');
+    // まとまりが 1 つも無い古いカードは今までどおり出せる
+    const TOld = mkTask('まとまりの無い古いカード', 'SPLIT-3');
+    db.prepare('DELETE FROM f_iroha_task_batches WHERE task_id = ?').run(TOld);
+    const old = enqueuePrintJob({ taskId: TOld, copies: 1, packQty: '120', clientRequestId: crid() });
+    ok(old.ok && db.prepare('SELECT batch_id FROM f_iroha_print_jobs WHERE id = ?').get(old.job.id).batch_id == null,
+      'まとまりが 1 つも無い古いカードは、今までどおり出せる (batch_id は無し)');
     // 後の検査 (ジョブの件数) に影響しないよう片づける
-    db.prepare('DELETE FROM f_iroha_print_jobs WHERE id = ?').run(split.job.id);
+    db.prepare("DELETE FROM f_iroha_print_jobs WHERE task_id IN (?, ?, ?)").run(TS, TW, TOld);
   }
   const again = enqueuePrintJob({ taskId: T1, copies: 2, packQty: '120', expiry: '2027-03', clientRequestId: id });
   ok(again.ok && again.replayed && again.job.id === J1, '同じ冪等 ID の再送は同じジョブ (2 枚出ない)');

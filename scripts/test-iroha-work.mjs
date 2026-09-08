@@ -27,7 +27,7 @@ if (!process.env.DATA_DIR) {
 }
 
 // ⭐画面のキャッシュの版。画面を直した PR ではここだけ直す（以前は同じ文字列を 3 か所に書いていて、毎回 3 か所直していた）
-const SW_CACHE = 'iroha-work-shell-v18';
+const SW_CACHE = 'iroha-work-shell-v19';
 
 let pass = 0, fail = 0;
 function ok(cond, label) {
@@ -3897,9 +3897,149 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     && /return '<button class="printbig" data-id="' \+ esc\(String\(c\.id\)\) \+ '" onclick="openPrintBox\(this\.dataset\.id\)">' \+ label \+ '<\/button>';/.test(html)
     && /'🖨 箱ラベルを印字する'/.test(html) && /\.printbig\{display:block;width:100%/.test(html),
     '詳細は「🖨 箱ラベルを印字する」の大きなボタン (小さなチップにしない — 中原さん 2026-09-06)');
-  ok(/const expiry = c\.expiry \? String\(c\.expiry\) : \(m\.expiry_seal === 1 \? '期限シールあり' : ''\);/.test(html)
-    && /let units = m\.units_per_container != null \? String\(m\.units_per_container\) : '';/.test(html),
+  ok(html.includes("const expiry = expSrc ? String(expSrc) : (m.expiry_seal === 1 ? '期限シールあり' : '');")
+    && html.includes("let units = m.units_per_container != null ? String(m.units_per_container) : '';"),
     '既定値: 1 箱に何個=入数 / 期限=この入荷の有効期限 (無ければ期限シールありの印)');
+  // ⭐箱ラベルはまとまり単位 (要件 §AB-12)
+  ok(html.includes('const expSrc = batch ? batch.expiry : c.expiry;'),
+    '⭐期限は**そのまとまりのもの**を既定にする (1 つの入荷に期限が混ざる)');
+  // ⭐期限を実際に決めさせて確かめる (式があるかどうかでは、埋め戻しの穴を見つけられない)
+  {
+    // ⭐**ソースの行そのもの**を取り出して動かす。テストに式を書き写すと、実物を直しても気づけない
+    const srcLines = html.split(/\r?\n/).filter((l) => /const (expSrc|expiry) = /.test(l)).slice(0, 2).join('\n');
+    ok(/expSrc/.test(srcLines) && /expiry_seal/.test(srcLines), '(前提) 期限を決める 2 行を取り出せた');
+    const pick = (bsLen, batch, cardExpiry, seal) => new Function('bs', 'batch', 'c', 'm',
+      srcLines + '; return expiry;')({ length: bsLen }, batch, { expiry: cardExpiry }, { expiry_seal: seal });
+    ok(pick(2, { expiry: '2028-06' }, '2027-03', 0) === '2028-06',
+      '⭐分かれたカードでは、選んだぶんの期限を出す (カード全体のものにしない)');
+    ok(pick(2, { expiry: null }, '2027-03', 0) === '',
+      '🚨期限なしのぶんを選んだら**空のまま**。カード全体の 2027-03 を埋め戻さない (Codex R1 重大1)');
+    ok(pick(1, { expiry: '2027-03' }, '2027-03', 0) === '2027-03', '分かれていないカードは今までどおり');
+    ok(pick(1, { expiry: null }, '2027-03', 0) === '',
+      '🚨取り消したぶんを除いて 1 つになっただけでも埋め戻さない (Codex R3 重大2)');
+    ok(pick(1, null, '2027-03', 0) === '2027-03',
+      'まとまりが 1 つも無い古いカードだけ、カードの期限を使う');
+    ok(pick(2, { expiry: null }, null, 1) === '期限シールあり', '期限シールの印は残る');
+  }
+  ok(html.includes('const bc = batch ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;'),
+    '⭐箱の数も**そのまとまりの数**で数える (400 個のぶんに 1000 個ぶんのラベルを出さない)');
+  // ⭐期限と箱数は**同じ規則**にする。片方だけ「残り 1 つならカード全体」を残すと、
+  //   取り消しで 1 つになったカードで、期限は正しいのに枚数だけカード全体になる (Codex R4)
+  {
+    const expLine = html.split(/\r?\n/).find((l) => l.includes('const expSrc = '));
+    const bcLine = html.split(/\r?\n/).find((l) => l.includes('const bc = batch'));
+    ok(!/bs\.length/.test(expLine) && !/bs\.length/.test(bcLine),
+      '🚨期限も箱数も「いま残っているまとまりの数」で場合分けしない (取り消しで 1 つになっただけのことがある)');
+    // 箱数を実際に決めさせる
+    const boxSrc = html.match(/function boxesOf\(qty, per\) \{[\s\S]*?\r?\n\}/)[0];
+    const pickBc = (batch, cardCalc) => new Function('batch', 'c', 'm',
+      boxSrc + '; ' + bcLine + '; return bc;')(batch, { boxes_calc: cardCalc }, { units_per_container: 70 });
+    const split = pickBc({ planned_qty: 400 }, { full: 14, rest: 20, per: 70, boxes: 15 });
+    ok(split.boxes === 6 && split.full === 5 && split.rest === 50,
+      '⭐400 個のまとまりは 6 箱 (カード全体の 1000 個ぶん 15 箱にしない)');
+    ok(pickBc(null, { boxes: 15 }).boxes === 15, 'まとまりが 1 つも無い古いカードはカード全体の数で数える');
+  }
+  ok(html.includes('if (bs.length > 1 && batchId == null) { openPrintBatchPick(c, bs); return; }'),
+    '⭐分かれているカードは、どのぶんか選んでから出す');
+  ok(html.includes('function openPrintBatchPick(c, bs)') && html.includes("$('#printOk').disabled = true;"),
+    '選ぶまでは発行させない');
+  // 🚨送信中・結果が分からないうちは選び直させない (依頼 ID を作り直すと 2 枚出る — Codex R1 重大2)
+  ok(html.includes('if (printCtx && (printCtx.saving || printCtx.unresolved)) {'),
+    '⭐送っている最中・届いたか分からないうちは、選び直しを受け付けない');
+  // ⭐submitPrint を**実際に動かして**、「応答喪失 → 再送 → 積めた」の移り変わりを見る
+  //   (Codex R3。判定式だけ見ても、印を下ろす経路を追えない)
+  {
+    const src = html.match(/async function submitPrint\(\) \{[\s\S]*?\r?\n\}/)[0];
+    const mkRun = (replies) => {
+      let i = 0;
+      const ctx = { id: 7, batchId: 3, reqId: 'p-fixed', saving: false };
+      const els = { '#printPack': { value: '70' }, '#printExtra': { value: '' }, '#printExpiry': { value: '2027-03' },
+        '#printCopies': { value: '1' }, '#printMsg': { textContent: '' }, '#printOk': { disabled: false },
+        '#printTarget': { value: '1' },
+        '#printBody': { querySelector: () => ({ getAttribute: () => '1' }) } };
+      const sent = [];      // 実際にサーバーへ送った中身
+      const locked = [];    // lockPrintFields(true/false) の呼ばれ方
+      const lockedWhileSending = [];   // ⭐通信の待ちの間に閉じていたか
+      const fn = new Function('printCtx', 'findCard', '$', 'apiFetch', 'worker', 'closePrintBox',
+        'repaintAfterPrint', 'toast', 'openPrintBox', 'openGate', 'showErr', 'lockPrintFields',
+        src + '; return submitPrint;')(
+        ctx, () => ({ id: 7, title: 'x', print_job: null }), (k) => els[k],
+        async (_url, o) => {
+          sent.push(JSON.parse(o.body));
+          lockedWhileSending.push(locked[locked.length - 1]);   // 送っている最中の状態
+          const r = replies[i++]; if (r instanceof Error) throw r; return r;
+        },
+        { id: 1 }, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, (v) => locked.push(v));
+      return { ctx, fn, els, sent, locked, lockedWhileSending };
+    };
+    // ① 通信が切れた → 届いたか分からないので印が立つ
+    const a = mkRun([new Error('network')]);
+    await a.fn();
+    ok(a.ctx.unresolved === true, '⭐通信が切れたら「届いたか分からない」印が立つ');
+    ok(a.ctx.body && a.ctx.body.client_request_id === 'p-fixed',
+      '⭐送った中身をそのまま控える (次に送るのは画面の値ではなくこれ — Codex R6 中5)');
+    ok(a.lockedWhileSending[0] === true,
+      '⭐**送っている最中から**入力を閉じる (待ちの間に直せると、応答を失ったとき画面と送る中身が食い違う — Codex R7 重大)');
+    ok(a.locked[a.locked.length - 1] === true, '届いたか分からない間は閉じたまま (中身を変えさせない)');
+    // ② 画面の値が変わっても、送るのは控えた中身
+    const b = mkRun([new Error('network'), { ok: false, error: 'bad_copies', message: 'x' }]);
+    await b.fn();
+    b.els['#printCopies'].value = '9';    // 編集できなくしてあるが、それでも変わったことにして確かめる
+    await b.fn();
+    ok(b.sent.length === 2 && b.sent[1].copies === b.sent[0].copies && b.sent[1].client_request_id === 'p-fixed',
+      '⭐再送は「そのとき送った中身」のまま (画面の値が変わっても、同じ依頼として同じ中身を送る)');
+    ok(b.ctx.unresolved === true,
+      '🚨再送が入力の誤りで断られても下ろさない。それは「前に送ったぶん」が積まれていない証明ではない (Codex R3 重大1)');
+    // ③ 積めたと分かったときだけ下ろす
+    const c2 = mkRun([new Error('network'), { ok: true, job: { total_copies: 1 } }]);
+    await c2.fn();
+    await c2.fn();
+    ok(c2.ctx.unresolved === false && c2.ctx.body === null, '⭐積めたと分かったら印も控えも下ろす');
+    // ④ はじめから入力の誤りなら、印は立たない (選び直せる)
+    const d = mkRun([{ ok: false, error: 'bad_copies', message: 'x' }]);
+    await d.fn();
+    ok(!d.ctx.unresolved && d.locked[d.locked.length - 1] === false,
+      '⭐サーバーが断ってきただけなら入力を開け直す (直して送り直せる。印は立たない)');
+  }
+  ok(html.includes('repaintAfterPrint(c); openPrintBox(c.id, ctx.batchId);'),
+    '⭐前回の結果を確かめて開き直すときは、**選んでいたまとまりのまま**にする (対象を変えさせない)');
+  ok(html.includes('ctx.unresolved = true;') && html.includes('if (j.ok) { ctx.unresolved = false; ctx.body = null; }'),
+    '印を立てるのは通信が切れたときだけ / 下ろすのは積めたと分かったときだけ');
+  ok(html.includes('function lockPrintFields(lock)') && html.includes("for (const id of ['#printPack'")
+    && !/lockPrintFields\('#printCancel'|'#printCancel'[^\n]*disabled/.test(html),
+    '編集できなくするのは入力欄だけ (やめる は押せる = 詰まったら閉じて印刷の状態を見に行ける)');
+  // 🚨端末に控えを残す形 (localStorage) は R6 で撤去した。別タブでの取り合い・表示と送信のズレ・
+  //   取り消しずみのまとまりから抜け出せない、と穴が増えたため (Codex R6 重大2・中2)
+  ok(!/printPending|PRINT_PENDING_KEY|clearPrintPendingIfDone/.test(html),
+    '⭐端末への控えは持たない (この PR の範囲は「まとまり単位のラベル」。冪等の作り直しは別の PR)');
+  ok(html.includes('printCtx = { id: c.id, batchId: batch ? batch.id : null,'),
+    'ダイアログを開いたら依頼 ID を作る (開き直しの二重印刷は この PR より前からある穴)');
+
+  // 🚨全部取り消されたカードを「まとまりの無い古いカード」と同じに扱わない (Codex R4 中1)
+  ok(html.includes('if (all.length > 0 && bs.length === 0) {'),
+    '⭐まとまりがあるのに出せるぶんが無ければ、カード全体の数で刷らせない');
+  ok(html.includes("data-prredo=") && !html.includes("openPrintBox(' + c.id + ')\">選び直す"),
+    '選び直しは直接呼ばず、見張りを通す');
+  // ⭐どのカードのぶんかは選ぶ画面が覚える (前のカードに渡さない — Codex R1 中1)
+  ok(html.includes("printCtx = null;") && html.includes("data-prtask=") && html.includes('findCard(Number(b.dataset.prtask))'),
+    '⭐選んだぶんは、その画面を開いたカードに渡す (前のカードの printCtx を使わない)');
+  ok(html.includes('batch_id: ctx.batchId == null ? undefined : ctx.batchId,'), 'どのぶんかをサーバーにも送る');
+  // 箱の数え方を実際に動かす
+  {
+    const src = html.match(/function boxesOf\(qty, per\) \{[\s\S]*?\r?\n\}/)[0];
+    const fn = new Function(src + '; return boxesOf;')();
+    const b = fn(360, 70);
+    ok(b.full === 5 && b.rest === 10 && b.boxes === 6, '360 個 / 70 個入り → 満杯 5 箱 + 端数 10 個で 6 箱');
+    ok(fn(140, 70).rest === 0 && fn(140, 70).boxes === 2, '割り切れれば端数なし');
+    ok(fn(100, null) === null && fn(100, 0) === null,
+      '⭐入数が分からなければ null (0 箱として「ラベル 0 枚」にしない)');
+    // ⭐数が入っていないのと「0 個」は別 (Codex R2 中1)
+    ok(fn(null, 70) === null && fn(undefined, 70) === null && fn('', 70) === null,
+      '🚨数が入っていなければ null。Number(null) が 0 になるのに任せて「0 個・0 箱」と数えない');
+    const zero = fn(0, 70);
+    ok(zero && zero.boxes === 0 && zero.full === 0 && zero.rest === 0,
+      '⭐はっきり 0 個なら 0 箱 (これは分かっている数なので数えてよい)');
+  }
 
   // 🏷 端数の箱 — 必要保管箱 6 箱 (70×5＋10) なら 70 個 5 枚 ＋ 10 個 1 枚 (中原さん 2026-09-06)
   ok(/if \(bc\.rest > 0 && bc\.full > 0\) \{ copies = bc\.full; extraQty = String\(bc\.rest\); units = String\(bc\.per\); \}/.test(html)

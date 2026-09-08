@@ -362,6 +362,10 @@
   .reasons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
   .reasons .btn.on{outline:2px solid var(--danger);outline-offset:1px;background:var(--danger-soft);border-color:var(--danger);color:var(--danger)}
   .dcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:12px}
+  /* 🏷 どのぶんのラベルかを選ぶ (§AB-12) */
+  .pbatches{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+  .pbatches .btn{text-align:left;justify-content:flex-start;font-weight:600}
+  .pbatches .btn b{font-weight:800;margin-right:4px}
   /* 👥 人数だけの作業 (§AB-10) */
   .hcnt{display:flex;flex-direction:column;gap:8px}
   .hrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--well);border:1px solid var(--line);
@@ -2546,18 +2550,64 @@ function printWarnHtml(a) {
   if (a.paper_ok === false) warn.push('QL-800 に用紙「箱ラベル 62x67」が登録されていないため、印刷に失敗します');
   return warn.length ? '<div class="pwarn">⚠ ' + warn.map(esc).join('<br>⚠ ') + '</div>' : '';
 }
-function openPrintBox(id) {
+/**
+ * 箱の数え方 (サーバーの neededBoxesCalc と同じ)。⭐入数が分からなければ null —
+ * 0 箱として扱うと「ラベル 0 枚」になり、必要な枚数と違うものを出す
+ */
+function boxesOf(qty, per) {
+  // ⭐**数が入っていない**のと「0 個」は別。Number(null) も Number('') も 0 になるので、
+  //   数に直すまえに見分ける (要件: 欠損値を 0 で代用しない — Codex #1259 R2 中1)
+  if (qty == null || qty === '' || per == null || per === '') return null;
+  const p = Number(per);
+  const n = Number(qty);
+  if (!Number.isSafeInteger(p) || p <= 0 || !Number.isSafeInteger(n) || n < 0) return null;
+  const full = Math.floor(n / p);
+  const rest = n % p;
+  return { full, rest, per: p, boxes: full + (rest > 0 ? 1 : 0) };
+}
+/**
+ * ⭐箱ラベルは**まとまり単位**で出す (要件 §AB-12)。
+ * 1 つのカードに期限の違うぶんが混ざることがあるので、分かれているカードでは
+ * どのぶんかを先に選ばせる。決めずに刷ると、**違う期限のラベルを箱に貼る** —
+ * 貼ってしまうと現物からは分からない。
+ */
+function printableBatches(c) {
+  return (c.batches || []).filter((b) => b.work_status !== 'cancelled');
+}
+function openPrintBox(id, batchId) {
   const c = findCard(id);
   if (!c) return;
   if (!worker) { openGate(); return; }
   const agents = printAgents();
   if (agents.length === 0) { showErr('ラベルを印刷する いろはPC が登録されていません (管理画面で印刷係を登録)'); return; }
-  printCtx = { id: c.id, reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), saving: false };
+  const all = c.batches || [];
+  const bs = printableBatches(c);
+  // ⭐まとまりがあるのに出せるぶんが 1 つも無い = 全部取り消された。
+  //   カード全体の期限・数で刷らせない (Codex R4 中1)
+  if (all.length > 0 && bs.length === 0) {
+    showErr('このカードのぶんはすべて取り消されています。ラベルは出せません');
+    return;
+  }
+  // 分かれているのに選んでいなければ、まず選んでもらう
+  if (bs.length > 1 && batchId == null) { openPrintBatchPick(c, bs); return; }
+  const batch = batchId != null ? bs.find((b) => b.id === Number(batchId)) : (bs.length === 1 ? bs[0] : null);
+  if (batchId != null && !batch) { showErr('そのぶんが見つかりません (画面を更新してください)'); return; }
+  // ⚠ダイアログを閉じると依頼 ID は作り直される (master と同じ)。「送ったが応答を失う → 閉じる →
+  //   開き直す」で 2 枚出る穴は**この PR より前からある**もので、ここでは塞がない。
+  //   端末に控えを残す形を試したが、別タブでの取り合い・表示と送信のズレ・取消ずみのまとまりから
+  //   抜け出せない、と穴が増えた (Codex #1259 R6 重大 2・中 2)。冪等の作り直しは別の PR で。
+  printCtx = { id: c.id, batchId: batch ? batch.id : null,
+    reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), saving: false };
   const m = c.master || {};
   const type = barcodeTypeOf(c.barcode);
   // ⭐必要保管箱の内訳から分ける: 満杯の箱 (per 個) が full 箱、端数が rest 個で 1 箱。
   //   例 360 個 / 1 箱 70 個 → 70 個のラベル 5 枚 ＋ 10 個のラベル 1 枚 (中原さん 2026-09-06)
-  const bc = c.boxes_calc;
+  // ⭐箱の数も**そのまとまりの数**で数える。カード全体の数で数えると、
+  //   400 個のぶんに 1000 個ぶんのラベルを出してしまう (§AB-11 の 5a と同じ落とし穴)。
+  // 🚨期限とまったく同じ規則にする — 「いま残っているまとまりが 1 つ」を「分かれていない」と
+  //   同じに扱わない。取り消したぶんを除いて 1 つになっただけのことがあり、そこでカード全体の数に
+  //   戻すと、400 個のぶんに 1000 個ぶんのラベルが出る (Codex #1259 R4)
+  const bc = batch ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;
   let units = m.units_per_container != null ? String(m.units_per_container) : '';
   let copies = 1;
   let extraQty = '';
@@ -2570,7 +2620,15 @@ function openPrintBox(id) {
   //   多すぎるときはそのまま出して、合計の案内と発行時の検査で止める
   copies = Math.max(1, copies);
   // 期限の既定: この入荷の有効期限 → 無ければ「期限シールあり」の商品だけ印を入れる (無い商品は空欄)
-  const expiry = c.expiry ? String(c.expiry) : (m.expiry_seal === 1 ? '期限シールあり' : '');
+  // ⭐期限は**そのまとまりのもの**を使う (§AB-12 の前提 7: 1 つの入荷に期限が混ざる)。
+  // 🚨まとまりがあるなら、**空欄も含めて**そのまとまりに従う。カード全体の期限を埋め戻すと、
+  //   選ぶ画面で「期限なし」と見せた直後に別の期限が入り、違うラベルを刷れてしまう
+  //   (Codex #1259 R1 重大1)。
+  // 🚨「いま残っているまとまりが 1 つ」を「分かれていない」と同じに扱わない —
+  //   取り消したぶんを除いて 1 つになっただけのことがあり、そこで埋め戻すと同じ事故が起きる
+  //   (同 R3 重大2)。カードの期限を使うのは**まとまりが 1 つも無い古いカード**だけ
+  const expSrc = batch ? batch.expiry : c.expiry;
+  const expiry = expSrc ? String(expSrc) : (m.expiry_seal === 1 ? '期限シールあり' : '');
   const first = agents.find(a => a.online) || agents[0];
   const opts = agents.map(a => '<option value="' + a.id + '"' + (a.id === first.id ? ' selected' : '') + '>' + esc(a.label) + ' — ' + esc(a.printer_name || '(プリンター未登録)') + (a.online ? '' : ' (応答なし)') + '</option>').join('');
   // 🚨 直前が「❓ 結果不明」「🙋 手で刷る扱い」なら、実物を見た / 手で刷っていない ことをチェックさせてからしか送らない
@@ -2584,6 +2642,13 @@ function openPrintBox(id) {
       + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printAck"> 手で刷っていない (P-touch Editor で出していない)</label></div>';
   $('#printBody').innerHTML =
     '<div class="pfld"><label>商品</label><div class="ro"><b>' + esc(c.title) + '</b><br><span class="num">' + esc(c.product_code || '') + '</span></div></div>' +
+    (bs.length > 1 && batch
+      ? '<div class="pfld"><label>どのぶんのラベルか</label><div class="ro"><b>まとまり #' + esc(String(batch.seq)) + '</b>'
+        + ' ・ ' + esc(String(batch.planned_qty)) + ' 個'
+        + (batch.expiry ? ' ・ 期限 ' + esc(batch.expiry) : '')
+        + ' ・ ' + esc(facilityName(batch.facility_code || c.facility_code) || '未定')
+        + ' <button type="button" class="btn-sm" data-prredo="' + c.id + '">選び直す</button></div></div>'
+      : '') +
     '<div class="pfld"><label>バーコード</label><div class="ro num">' + esc(c.barcode || '') + ' <small>(' + (type ? type.toUpperCase() : '不明') + ')</small></div></div>' +
     '<div class="pfld"><label>1 箱に何個 (ラベルの「数量」。空欄なら印字しない)</label><input type="number" inputmode="numeric" min="1" step="1" id="printPack" value="' + esc(units) + '" placeholder="未登録"></div>' +
     '<div class="pfld"><label>期限 (空欄なら印字しない)</label><input type="text" id="printExpiry" maxlength="40" value="' + esc(expiry) + '" placeholder="例: 2027-03"></div>' +
@@ -2598,6 +2663,51 @@ function openPrintBox(id) {
   renderPrintSum();
   openOverlay('#printOv');
 }
+/**
+ * ⭐どのぶんのラベルかを選ぶ (要件 §AB-12)。期限・数がまとまりごとに違いうるので、
+ * それを見て選べるようにする。⚠window.prompt は iOS のホーム画面アプリで出ないことがある (監修 R-1)
+ */
+function openPrintBatchPick(c, bs) {
+  // ⭐前のカードの printCtx を残さない (選んだあとに別のカードへ渡してしまう — Codex R1 中1)
+  printCtx = null;
+  $('#printBody').innerHTML =
+    '<div class="pfld"><label>商品</label><div class="ro"><b>' + esc(c.title) + '</b></div></div>' +
+    '<p class="hint">このカードは ' + bs.length + ' つに分かれています。<b>どのぶんのラベルを出しますか。</b>' +
+      '期限や数がぶんごとに違うことがあります。</p>' +
+    '<div class="pbatches">' + bs.map((b) =>
+      '<button type="button" class="btn wide" data-prtask="' + esc(String(c.id)) + '" data-prbatch="' + esc(String(b.id)) + '">' +
+        '<b>まとまり #' + esc(String(b.seq)) + '</b> ・ ' + esc(String(b.planned_qty)) + ' 個' +
+        (b.expiry ? ' ・ 期限 ' + esc(b.expiry) : ' ・ 期限なし') +
+        ' ・ ' + esc(facilityName(b.facility_code || c.facility_code) || '未定') +
+      '</button>').join('') + '</div>';
+  $('#printMsg').textContent = '';
+  $('#printOk').disabled = true;   // 選ぶまでは発行させない
+  openOverlay('#printOv');
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-prbatch]');
+  if (b) {
+    // ⭐どのカードのぶんかは**選ぶ画面が覚えている**。前に開いたカードの printCtx が残っていて、
+    //   そちらの id を使ってしまうのを防ぐ (Codex R1 中1)
+    const c = findCard(Number(b.dataset.prtask));
+    closeOverlay('#printOv');
+    if (c) openPrintBox(c.id, Number(b.dataset.prbatch));
+    return;
+  }
+  const r = e.target.closest('[data-prredo]');
+  if (!r) return;
+  // 🚨送っている最中・送ったが結果を確かめられていないときは選び直させない。
+  //   ここで作り直すと**依頼 ID が変わり**、届いていた 1 枚目に重ねてもう 1 枚出る (Codex R1 重大2)
+  if (printCtx && (printCtx.saving || printCtx.unresolved)) {
+    $('#printMsg').textContent = printCtx.saving
+      ? '❌ いま送っています。終わるまでお待ちください'
+      : '❌ さきほどの依頼が届いたか分かっていません。同じ内容で「発行」を押し直すか、いったん閉じて印刷の状態を見てください (選び直すと 2 枚出ることがあります)';
+    return;
+  }
+  closeOverlay('#printOv');
+  openPrintBox(Number(r.dataset.prredo));
+});
+
 /** 「70 個 × 5 枚 ＋ 10 個 × 1 枚 = 6 枚」— 何枚出るかを人が読める形で出す */
 function renderPrintSum() {
   const el = $('#printSum');
@@ -2622,6 +2732,17 @@ $('#printBody').addEventListener('change', (ev) => {
   const w = $('#printWarn');
   if (w) w.innerHTML = printWarnHtml(a);
 });
+/**
+ * ⭐届いたか分からない依頼を抱えている間は、入力を編集できなくする (Codex #1259 R6 重大3)。
+ * 送り直すのは「そのとき送った中身」なので、画面だけ変えられると、見えている値と送る中身が食い違う。
+ * やめる (閉じる) は押せるままにする — 詰まったら閉じて、印刷の状態を見に行ける。
+ */
+function lockPrintFields(lock) {
+  for (const id of ['#printPack', '#printExpiry', '#printCopies', '#printExtra', '#printTarget', '#printAck']) {
+    const el = $(id);
+    if (el) el.disabled = !!lock;
+  }
+}
 function closePrintBox() { if (printCtx && printCtx.saving) return; closeOverlay('#printOv'); printCtx = null; }
 /** 発行のあと、いま見ている画面を描き直す (ボードからも押せるようになったため — 中原さん 2026-09-06) */
 function repaintAfterPrint(c) {
@@ -2659,22 +2780,46 @@ async function submitPrint() {
   ctx.saving = true;
   $('#printOk').disabled = true;
   msgEl.textContent = '送信しています…';
+  // ⭐**送る中身は 1 か所で作る**。届いたか分からない依頼を送り直すときは、**そのときの中身のまま**送る —
+  //   画面の値を変えてから送ると、同じ依頼 ID で違う内容になり、サーバーに断られて抜け出せなくなる。
+  //   (だから下の catch では入力を編集できなくしてある — 画面に見えている値と送る中身を食い違わせない)
+  const body = (ctx.unresolved && ctx.body) ? ctx.body : {
+    task_id: c.id, worker_id: worker.id, copies, pack_qty: packRaw || null, extra_pack_qty: extraRaw || null, expiry: expiry || null,
+    batch_id: ctx.batchId == null ? undefined : ctx.batchId,
+    target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
+  };
+  // 🚨**送る中身を決めたら、そこから先は画面を変えさせない**。通信の待ちの間に期限や枚数を
+  //   直せると、応答を失ったときに「画面に見えている値」と「送り直す中身」が食い違う
+  //   (2027-03 で送信 → 待ちの間に 2028-06 に直す → 通信が切れる → 再送は 2027-03。
+  //    初回が届いていなければ、画面と違う期限のラベルが出る — Codex #1259 R7 重大)
+  lockPrintFields(true);
   let j;
   try {
     j = await apiFetch('/api/print/jobs', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        task_id: c.id, worker_id: worker.id, copies, pack_qty: packRaw || null, extra_pack_qty: extraRaw || null, expiry: expiry || null,
-        target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
-      }),
+      body: JSON.stringify(body),
     });
   } catch (e) {
     ctx.saving = false;
-    msgEl.textContent = '❌ 送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2 枚にはなりません)';
+    // 🚨**届いたかどうか分からない**。ここで印を立て、同じダイアログの中では依頼 ID も中身も変えない。
+    //   立てるのはこの経路だけ — サーバーが返事をくれたなら、その依頼のことは分かっている。
+    ctx.unresolved = true;
+    ctx.body = body;            // ⭐送った中身のまま送り直す (画面の値を変えても、これを送る)
+    // 入力は送る前からロックしてある。届いたか分からない間は**そのまま維持**する
+    msgEl.textContent = '❌ 送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2 枚にはなりません)。内容は変えられません';
     $('#printOk').disabled = false;
     return;
   }
   ctx.saving = false;
+  // ⭐印を下ろせるのは **j.ok のときだけ**。積めた (または同じ依頼として積んであった) と分かった
+  //   ときにかぎり、その依頼は片づいている。
+  // 🚨入力の誤りで断られても下ろさない — その返事は「**いま送ったぶん**は積まれていない」しか
+  //   言っておらず、前に送って返事を失ったぶんが積まれていないことの証明にはならない
+  //   (Codex #1259 R3 重大1)。枚数の検査などは冪等 ID を見るより先に走る
+  if (j.ok) { ctx.unresolved = false; ctx.body = null; }
+  // ⭐サーバーが返事をくれた = その依頼がどうなったかは分かっている。届いたか分からない依頼を
+  //   抱えていなければ、直して送り直せるように入力を開ける (入力の誤りで断られたときなど)
+  if (!ctx.unresolved) lockPrintFields(false);
   if (j.ok) {
     c.print_job = j.job;
     closePrintBox();
@@ -2685,8 +2830,10 @@ async function submitPrint() {
   if (j.job) c.print_job = j.job;
   if (j.error === 'in_progress') { closePrintBox(); repaintAfterPrint(c); return; }
   if (j.error === 'confirm_unknown' || j.error === 'confirm_manual') {
-    // 画面が古かった (別の iPad で発行されて結果不明になった等)。最新のジョブで開き直す
-    repaintAfterPrint(c); openPrintBox(c.id);
+    // 画面が古かった (別の iPad で発行されて結果不明になった等)。最新のジョブで開き直す。
+    // ⭐**選んでいたまとまりのまま**開き直す。渡さないと、分かれたカードでは選ぶ画面に戻り、
+    //   別のぶんを選び直せてしまう (前回の結果を確かめる話なのに、対象が変わる)
+    repaintAfterPrint(c); openPrintBox(c.id, ctx.batchId);
     $('#printMsg').textContent = j.message || '前回の印刷結果が不明です。実物を確認してください';
     return;
   }

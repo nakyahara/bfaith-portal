@@ -576,6 +576,31 @@ console.log('\n[人数だけの作業] POST /api/sessions/start-crew (§AB-10)')
   sessionRole = 'admin';
 }
 
+console.log('\n[箱ラベル] POST /api/print/jobs はまとまり単位 (§AB-12)');
+{
+  const t = upsertTaskFromImport({ notion_page_id: 'api-label', status: 'not_started', facility_code: 'iroha',
+    destination_id: null, product_code: 'API-LABEL', product_name: 'ラベルの検査', qty: 200,
+    arrival_date: '2026-09-02', barcode: 'X000T1GS6F', expiry: '2027-03',
+    master_snapshot: { units_per_container: 120 } }, { batchId: 'test-api' }).id;
+  const at = new Date().toISOString();
+  getDB().prepare("INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, expiry, work_status, created_at, updated_at) VALUES (?, 2, 80, '2028-06', 'not_started', ?, ?)")
+    .run(t, at, at);
+  // 印刷係 (いろはPC) を 1 台登録する。これが無いと、まとまりを見る前に「印刷係がいません」で断られる
+  createDevice('検査用 いろはPC', 'test', { kind: 'agent', printerName: 'Brother QL-800' });
+  const cid = () => 'apilbl' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  const noPick = await post('/api/print/jobs', { task_id: t, copies: 1, pack_qty: 120, client_request_id: cid(), worker_id: S });
+  ok(noPick.status === 400 && noPick.json.error === 'pick_batch',
+    '⭐分かれたカードで、どのぶんか選ばずに出そうとしたら断る (' + noPick.status + ')');
+  ok(Array.isArray(noPick.json.batches) && noPick.json.batches.length === 2, '選べるように候補を返す');
+  const pick = noPick.json.batches.find((b) => b.seq === 2);
+  ok(pick && pick.expiry === '2028-06', '⭐ぶんごとの期限も返る (これを見て選ぶ)');
+  const okJob = await post('/api/print/jobs', { task_id: t, batch_id: pick.id, copies: 1, pack_qty: 120, client_request_id: cid(), worker_id: S });
+  ok(okJob.status === 200 && okJob.json.ok, '選べば出せる');
+  ok(getDB().prepare('SELECT batch_id FROM f_iroha_print_jobs WHERE id = ?').get(okJob.json.job.id).batch_id === pick.id,
+    '⭐どのぶんを刷ったかが残る (router が渡し忘れていない)');
+  getDB().prepare('DELETE FROM f_iroha_print_jobs WHERE task_id = ?').run(t);
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 // process.exit で落とすと、開いたままの接続を libuv が abort することがある
 // (feedback_notify_job_exit_libuv_crash)。閉じてから終了コードだけ置いて自然に終わらせる
