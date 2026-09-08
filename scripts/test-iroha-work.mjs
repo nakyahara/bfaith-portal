@@ -8154,7 +8154,8 @@ console.log('\n[まとまり選択の操作] ⭐選ぶまで送らない / 選�
     { id: 12, facility_code: null, work_status: 'not_started', planned_qty: 40 }];
 
   // ① 手元が 2 つ = 選ばせる。**この時点では送らない**
-  const a = mkRun(two, []);
+  // ⭐応答を 1 つ用意 — 誤って送ったときに例外で止まらず ✗ で見えるように
+  const a = mkRun(two, [{ ok: true, sessions: [], task: {}, status: 'in_progress' }]);
   await a.fn([1]);
   ok(a.picks.length === 1 && a.sent.length === 0,
     '⭐絞れないときは選ぶ画面を出すだけ (この時点ではサーバーに送らない)');
@@ -8186,6 +8187,89 @@ console.log('\n[まとまり選択の操作] ⭐選ぶまで送らない / 選�
   await e.fn([1]);
   ok(e.picks.length === 0 && e.sent.length === 1 && e.sent[0].batch_id === undefined,
     '⭐まとまりが 1 つなら選ばせない (ふだんの操作は変わらない。サーバーが自動で結びつける)');
+}
+
+console.log('\n[まとまり選択の操作2] ⭐実物の選ぶ画面・札の確認を通す (Codex #1269 R2)');
+{
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  const LFCH = String.fromCharCode(10);
+  // ⭐スタブで済ませず、**選ぶ画面と札の確認の実物**もまとめて取り出す
+  const src = [
+    html.match(/function homeBatches\(c\) \{[\s\S]*?\r?\n\}/)[0],
+    html.match(/function homeBatchId\(c\) \{[\s\S]*?\r?\n\}/)[0],
+    html.match(/function pickedBatch\(c, opts\) \{[\s\S]*?\r?\n\}/)[0],
+    html.match(/function openWorkBatchPick\(c, ids, opts\) \{[\s\S]*?\r?\n\}/)[0],
+    html.match(/function openUnblock\(c, ids, headcount, batchId\) \{[\s\S]*?\r?\n\}/)[0],
+    html.match(/async function confirmUnblock\(\) \{[\s\S]*?\r?\n\}/)[0],
+    html.match(/async function startWork\(ids, opts\) \{[\s\S]*?\r?\n\}/)[0],
+  ].join(LFCH);
+
+  // ちいさな DOM もどき (チップの押下を実際に起こす)
+  const mkEl = () => {
+    const el = { textContent: '', innerHTML: '', disabled: false, className: '', id: '', children: [], handlers: {} };
+    el.appendChild = (c) => { el.children.push(c); return c; };
+    el.addEventListener = (ev, fn) => { el.handlers[ev] = fn; };
+    el.querySelectorAll = () => [];
+    el.focus = () => {};
+    el.classList = { add: () => {}, remove: () => {}, contains: () => false };
+    return el;
+  };
+  const run = (batches, replies) => {
+    let i = 0;
+    const sent = [];
+    const card = { id: 7, version: 3, batches, title: 'x', blocked: null };
+    const els = {};
+    for (const k of ['#askTitle', '#askText', '#askOv', '#unblockGo', '#unblockMsg', '#unblockTitle', '#unblockText', '#unblockOv']) els[k] = mkEl();
+    const opened = [];
+    const ctx = {};
+    const fn = new Function('can', 'worker', 'openGate', 'curDetail', 'findCard', 'apiFetch', 'boardState',
+      'showErr', 'applyTask', 'renderList', 'renderDetail', 'sameId', 'toast', 'renderTabs', 'isApp',
+      '$', 'document', 'esc', 'facilityName', 'openOverlay', 'closeOverlay', 'closeUnblock', 'closeCrew',
+      'startHeadcount', 'unblockSaving', 'unblockCtxRef',
+      src + '; return { startWork, openWorkBatchPick, openUnblock, confirmUnblock, getCtx: () => unblockCtx };')(
+      () => true, { id: 1 }, () => {}, 7, () => card,
+      async (_u, o) => { sent.push(JSON.parse(o.body)); return replies[i++]; },
+      () => ({ facilities: [{ code: 'iroha', offsite: 0 }, { code: 'workcenter', offsite: 1 }] }),
+      () => {}, (c, t) => { if (t && t.version) c.version = t.version; if (t && 'blocked' in t) c.blocked = t.blocked; },
+      () => {}, () => {}, (a, b) => a === b, () => {}, () => {}, () => true,
+      (k) => els[k] || mkEl(), { createElement: () => mkEl() },
+      (v) => String(v), (c) => String(c),
+      (k) => opened.push(k), (k) => opened.push('close:' + k), () => {}, () => {},
+      async () => true, false, ctx);
+    return { ...fn, sent, card, els, opened };
+  };
+  const two = [{ id: 11, facility_code: 'iroha', work_status: 'not_started', planned_qty: 60 },
+    { id: 12, facility_code: null, work_status: 'not_started', planned_qty: 40 }];
+
+  // ① 候補を出す → チップを押す → 選んだぶんで **1 回だけ** 送る
+  const a = run(two, [{ ok: true, sessions: [], task: {}, status: 'in_progress' }]);
+  await a.startWork([1]);
+  ok(a.sent.length === 0 && a.opened.includes('#askOv'), '(前提) 選ぶ画面が開き、まだ送っていない');
+  const box = a.els['#askText'].children[0];
+  ok(box && box.handlers.click, '(前提) 選ぶ画面にチップの見張りが付く');
+  // チップを押す (data-wb = 12)
+  await box.handlers.click({ target: { closest: (sel) => sel === '[data-wb]' ? { dataset: { wb: '12' } } : null } });
+  ok(a.sent.length === 1 && a.sent[0].batch_id === 12,
+    '⭐実物の選ぶ画面からチップを押すと、選んだぶんで 1 回だけ送る');
+
+  // ② blocked → **実物の**札の確認 → clear_block つき再送でも、選んだぶんが続く
+  const b = run(two, [{ ok: false, error: 'blocked', blocked: { label: '資材' }, task: { version: 5 } },
+    { ok: true, sessions: [], task: {}, status: 'in_progress' }]);
+  await b.startWork([1], { batchId: 12 });
+  ok(b.sent.length === 1 && b.getCtx() && b.getCtx().batchId === 12, '(前提) 札の確認へ選んだぶんを預けた');
+  await b.confirmUnblock();
+  ok(b.sent.length === 2 && b.sent[1].batch_id === 12 && b.sent[1].clear_block === true,
+    '⭐実物の確認を通しても、同じぶん・clear_block つきで送り直す (選び直させない — R2)');
+  ok(b.sent[1].expect_version === 5, '確認した版を添える (確認中に理由が変わっていたら断られる)');
+
+  // ③ 札を外すとき conflict → もう外れていれば、同じぶんで始め直す
+  const c3 = run(two, [{ ok: false, error: 'blocked', blocked: { label: '資材' }, task: { version: 5 } },
+    { ok: false, error: 'conflict', current: { version: 9, blocked: null } },
+    { ok: true, sessions: [], task: {}, status: 'in_progress' }]);
+  await c3.startWork([1], { batchId: 12 });
+  await c3.confirmUnblock();
+  ok(c3.sent.length === 3 && c3.sent[2].batch_id === 12,
+    '⭐札がもう外れていたときの始め直しでも、同じぶんを保つ');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
