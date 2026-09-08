@@ -531,6 +531,8 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
     targetDeviceId: numOrNull(b.target_device_id),
     clientRequestId: b.client_request_id,
     acknowledgeUnknownJobId: numOrNull(b.acknowledge_unknown_job_id),
+    // ⭐「さっき出したのと同じラベルだが、それとは別に要る」と人が確かめた証跡 (2026-09-08)
+    acknowledgeDuplicateJobId: numOrNull(b.acknowledge_duplicate_job_id),
     requestedBy: w.worker.display_name, requestedDevice: deviceLabel,
   });
   // 記録 (だれが・どの端末で・何枚)。再送 (replayed) は積んでいないので書かない

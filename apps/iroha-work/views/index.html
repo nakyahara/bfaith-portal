@@ -2733,9 +2733,30 @@ $('#printBody').addEventListener('change', (ev) => {
   if (w) w.innerHTML = printWarnHtml(a);
 });
 /**
+ * 🚨「さっき同じラベルを出しています」を、ダイアログの中に出す。
+ * ⭐閉じずにその場で確かめてもらう — 閉じると何を確かめるのか分からなくなるし、開き直すと依頼 ID も変わる。
+ * チェックは**入力ではなく確かめた印**なので、lockPrintFields では閉じない (中身を変えるものではない)。
+ */
+function showPrintDupWarn(msg) {
+  const box = $('#printBody');
+  if (!box) return;
+  let el = $('#printDupWarn');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'pwarn';
+    el.id = 'printDupWarn';
+    el.innerHTML = '<span class="t"></span><br>'
+      + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printDupAck"> さっき出したのとは別に要る</label>';
+    box.insertBefore(el, box.firstChild);
+  }
+  el.querySelector('.t').textContent = msg;
+}
+/**
  * ⭐届いたか分からない依頼を抱えている間は、入力を編集できなくする (Codex #1259 R6 重大3)。
  * 送り直すのは「そのとき送った中身」なので、画面だけ変えられると、見えている値と送る中身が食い違う。
  * やめる (閉じる) は押せるままにする — 詰まったら閉じて、印刷の状態を見に行ける。
+ * ⚠#printDupAck (さっき出したのとは別に要る) は入れない。**中身ではなく確かめた印**なので、
+ *   届いたか分からない依頼を抱えていても押せる必要がある。
  */
 function lockPrintFields(lock) {
   for (const id of ['#printPack', '#printExpiry', '#printCopies', '#printExtra', '#printTarget', '#printAck']) {
@@ -2783,11 +2804,16 @@ async function submitPrint() {
   // ⭐**送る中身は 1 か所で作る**。届いたか分からない依頼を送り直すときは、**そのときの中身のまま**送る —
   //   画面の値を変えてから送ると、同じ依頼 ID で違う内容になり、サーバーに断られて抜け出せなくなる。
   //   (だから下の catch では入力を編集できなくしてある — 画面に見えている値と送る中身を食い違わせない)
-  const body = (ctx.unresolved && ctx.body) ? ctx.body : {
+  const base = (ctx.unresolved && ctx.body) ? ctx.body : {
     task_id: c.id, worker_id: worker.id, copies, pack_qty: packRaw || null, extra_pack_qty: extraRaw || null, expiry: expiry || null,
     batch_id: ctx.batchId == null ? undefined : ctx.batchId,
     target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
   };
+  // ⭐「さっき出したのと同じだが、それとは別に要る」の証跡。**中身ではなく確かめた印**なので、
+  //   届いたか分からない依頼を送り直すとき (中身は変えない) にも足してよい
+  const dupAck = $('#printDupAck');
+  const body = (dupAck && dupAck.checked && ctx.dupJobId)
+    ? { ...base, acknowledge_duplicate_job_id: ctx.dupJobId } : base;
   // 🚨**送る中身を決めたら、そこから先は画面を変えさせない**。通信の待ちの間に期限や枚数を
   //   直せると、応答を失ったときに「画面に見えている値」と「送り直す中身」が食い違う
   //   (2027-03 で送信 → 待ちの間に 2028-06 に直す → 通信が切れる → 再送は 2027-03。
@@ -2828,6 +2854,15 @@ async function submitPrint() {
     return;
   }
   if (j.job) c.print_job = j.job;
+  // 🚨さっき同じラベルを出している。閉じずにその場で確かめてもらう
+  //   (閉じると「何を確かめるのか」が分からなくなる。開き直すと依頼 ID も変わる)
+  if (j.error === 'confirm_duplicate') {
+    ctx.dupJobId = j.job ? j.job.id : null;
+    showPrintDupWarn(j.message || 'さきほど同じラベルを出しています');
+    msgEl.textContent = '';
+    $('#printOk').disabled = false;
+    return;
+  }
   if (j.error === 'in_progress') { closePrintBox(); repaintAfterPrint(c); return; }
   if (j.error === 'confirm_unknown' || j.error === 'confirm_manual') {
     // 画面が古かった (別の iPad で発行されて結果不明になった等)。最新のジョブで開き直す。
