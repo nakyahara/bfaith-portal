@@ -11,7 +11,7 @@
  *   ⭐完成した商品を外部に渡すことは絶対にない (中原さん 2026-09-07) ので、これで全部表せる。
  */
 import { getDB } from './db.js';
-import { nextSeq, recomputeTaskDoneQty, applyDerivedTaskStatus } from './batches.js';
+import { nextSeq, recomputeTaskDoneQty, applyDerivedTaskStatus, stockedQtyOf } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -378,28 +378,116 @@ function closeBatchIfSettled(db, batchId, now) {
  * 一度で全部返るとは限らないので、返るたびに 1 行足す。
  * 全部そろったら (返ってきた合計 >= 渡した数) 精算ずみにする。
  */
+/**
+ * ⭐返ってきた物の内訳 (使える数・作れなかった数) の決まりごと。**1 か所に集める** —
+ * 受け取るときと、あとから入れ直すときで規則がずれると、片方だけ通る数ができてしまう。
+ *
+ * - どちらも省ける (= まだ数えていない。**0 とは違う**)
+ * - 単独でも、合計でも、返ってきた数を超えない
+ *
+ * @returns {{error, message}|{good, loss}} good/loss は {value} か null (数えていない)
+ */
+function normReturnCounts(returnedQty, goodQty, lossQty) {
+  const good = goodQty === undefined || goodQty === null ? null : normQty0(goodQty, '使える数');
+  if (good && good.error) return { error: good.error, message: good.message };
+  const loss = lossQty === undefined || lossQty === null ? null : normQty0(lossQty, '作れなかった数');
+  if (loss && loss.error) return { error: loss.error, message: loss.message };
+  if (good && good.value > returnedQty) {
+    return { error: 'bad_qty', message: `使える数は、返ってきた ${returnedQty} 個より多くできません` };
+  }
+  // ⭐作れなかった数も**単独で**超えられない。合計だけ見ると、使える数を省いたときに素通りする (Codex R2 重大3)
+  if (loss && loss.value > returnedQty) {
+    return { error: 'bad_qty', message: `作れなかった数は、返ってきた ${returnedQty} 個より多くできません` };
+  }
+  if (good && loss && good.value + loss.value > returnedQty) {
+    return { error: 'bad_qty', message: `使える数と作れなかった数の合計が、返ってきた ${returnedQty} 個を超えています` };
+  }
+  return { good, loss };
+}
+
+/**
+ * ⭐返却の行から、そのまとまりの「できた数」を出し直す。**1 か所に集める** —
+ * 受け取ったときと、あとから数を入れたときで違う集計をすると、画面の数が食い違う。
+ *
+ * 🚨**1 つでも「分からない」があれば確定しない** (Codex #1245 R3 重大2)。
+ *   60 個 (使える 60) → 40 個 (分からない) と返ってきたのに 60 を確定にすると、
+ *   100 個のうち 60 個しかできなかったと読める。分からないものは NULL のまま。
+ */
+function applyReturnsToBatch(db, consignmentId, batchId, now) {
+  const agg = db.prepare(`SELECT COUNT(*) rows, COUNT(good_qty) gn, SUM(good_qty) gs, COUNT(loss_qty) ln, SUM(loss_qty) ls
+    FROM f_iroha_consignment_returns WHERE consignment_id = ?`).get(consignmentId);
+  const cur = db.prepare('SELECT good_qty, good_qty_source, loss_qty FROM f_iroha_task_batches WHERE id = ?').get(batchId);
+  if (!cur) return false;
+  const nextGood = agg.rows > 0 && agg.gn === agg.rows ? agg.gs : null;
+  const nextLoss = agg.rows > 0 && agg.ln === agg.rows ? agg.ls : null;
+  if (nextGood === (cur.good_qty ?? null) && nextLoss === (cur.loss_qty ?? null)
+    && !(nextGood != null && cur.good_qty_source !== 'counted')) return false;
+  db.prepare(`UPDATE f_iroha_task_batches SET good_qty = ?, good_qty_source = ?, loss_qty = ?,
+      version = version + 1, updated_at = ? WHERE id = ?`)
+    .run(nextGood, nextGood == null ? null : 'counted', nextLoss, now, batchId);
+  const b = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(batchId);
+  if (b) recomputeTaskDoneQty(db, b.task_id);
+  return true;
+}
+
+/**
+ * ⭐返ってきた物の数を**あとから**入れる / 直す (要件 §AB: 精算ずみ返却行の good_qty 補完)。
+ *
+ * 受け取るときは「分からなければ空のまま」でよい。ただし 1 つでも空があると、そのまとまりの
+ * 「できた数」は NULL のまま = **棚入れに進めない** (要件 §AB-3「現物がすべて説明できる状態」)。
+ * 数え終わってから入れられる口がないと、そこで詰まる。
+ *
+ * ⭐**精算ずみでも直せる**。数を数えるのは物が返ってきたあとで、精算より遅れることがある。
+ * ⭐競合は**預けの版**で見る (返却の行に版を持たせていない)。同じ預けを 2 人が同時に触れば片方が断られる。
+ */
+export function updateReturnCounts({ consignmentId, returnId, goodQty = undefined, lossQty = undefined,
+  note = undefined, expectVersion, actor = null, guard = null }) {
+  return updateConsignment(consignmentId, expectVersion, guard, (db, c, now, actorIn) => {
+    const row = db.prepare('SELECT * FROM f_iroha_consignment_returns WHERE id = ?').get(Number(returnId));
+    if (!row || row.consignment_id !== c.id) return { ok: false, error: 'not_found', message: 'その返却の記録が見つかりません (画面を更新してください)' };
+    // 🚨**棚に入れたあとは数を変えさせない** (Codex #1268 R1 重大)。
+    //   98 個で棚に入れたあとに 38 → 30 と直すと、棚入れの記録は 98 のままカードの数だけ減る。
+    //   空に戻すと「棚に入れたのに、棚入れできる条件を満たさない」ことにもなる。
+    //   直したいときは、先にそのぶんを「やり直す」で棚入れを取り消してもらう
+    const goodChanges = goodQty !== undefined || lossQty !== undefined;
+    if (goodChanges && stockedQtyOf(db, c.batch_id).rows > 0) {
+      return { ok: false, error: 'stocked_batch',
+        message: 'このぶんはもう棚に入れています。数を直すには、先に「このぶんをやり直す」で棚入れを取り消してください (ひとことだけなら直せます)' };
+    }
+    // ⭐**省略 = いまの値のまま / null = 空にする (まだ数えていないに戻す)**。
+    //   省略を空と同じに扱うと、使える数だけ入れたときに、入っていた「作れなかった数」が消える (R1 中2)
+    const curGood = row.good_qty ?? null;
+    const curLoss = row.loss_qty ?? null;
+    const wantGood = goodQty === undefined ? curGood : goodQty;
+    const wantLoss = lossQty === undefined ? curLoss : lossQty;
+    // ⭐合計は**残す値も入れて**確かめる (片方だけ直したときに、合わせて超えていないか)
+    const n = normReturnCounts(row.returned_qty, wantGood, wantLoss);
+    if (n.error) return { ok: false, error: n.error, message: n.message };
+    const nextGood = n.good ? n.good.value : null;
+    const nextLoss = n.loss ? n.loss.value : null;
+    const nextNote = note === undefined ? (row.note ?? null) : (String(note).trim() || null);
+    if (nextGood === (row.good_qty ?? null) && nextLoss === (row.loss_qty ?? null) && nextNote === (row.note ?? null)) {
+      return { ok: true, already: true };
+    }
+    db.prepare('UPDATE f_iroha_consignment_returns SET good_qty = ?, loss_qty = ?, note = ? WHERE id = ?')
+      .run(nextGood, nextLoss, nextNote, row.id);
+    applyReturnsToBatch(db, c.id, c.batch_id, now);
+    const bt = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
+    return { ok: true, taskId: bt ? bt.task_id : null };
+  }, actor);
+}
+
 export function recordReturn({ consignmentId, returnedQty, goodQty = undefined, lossQty = undefined,
   note = null, idempotencyKey = null, expectVersion, actor = null, guard = null }) {
   const db = getDB();
   const r = normQty(returnedQty, '返ってきた数');
   if (r.error) return { ok: false, error: r.error, message: r.message };
-  // ⭐使える数は **0 も許す** (全部だめだった、は起きる)。画面の min="0" とも合わせる (Codex R1 重大3)
-  const good = goodQty === undefined || goodQty === null ? null : normQty0(goodQty, '使える数');
-  if (good && good.error) return { ok: false, error: good.error, message: good.message };
-  const loss = lossQty === undefined || lossQty === null ? null : normQty0(lossQty, '作れなかった数');
-  if (loss && loss.error) return { ok: false, error: loss.error, message: loss.message };
-  // ⭐返ってきた物の内訳が、返ってきた数を超えない
-  if (good && good.value > r.value) {
-    return { ok: false, error: 'bad_qty', message: `使える数は、返ってきた ${r.value} 個より多くできません` };
-  }
-  // ⭐作れなかった数も**単独で**返ってきた数を超えられない。
-  //   合計だけ見ていると、使える数を省いたときに素通りしていた (Codex R2 重大3)
-  if (loss && loss.value > r.value) {
-    return { ok: false, error: 'bad_qty', message: `作れなかった数は、返ってきた ${r.value} 個より多くできません` };
-  }
-  if (good && loss && good.value + loss.value > r.value) {
-    return { ok: false, error: 'bad_qty', message: `使える数と作れなかった数の合計が、返ってきた ${r.value} 個を超えています` };
-  }
+  // ⭐内訳の決まりごとは normReturnCounts に集めてある (あとから直すときと同じ規則を使う)。
+  //   使える数は **0 も許す** (全部だめだった、は起きる)。画面の min="0" とも合わせる (Codex R1 重大3)
+  const n = normReturnCounts(r.value, goodQty, lossQty);
+  if (n.error) return { ok: false, error: n.error, message: n.message };
+  const good = n.good;
+  const loss = n.loss;
   return db.transaction(() => {
     if (guard) { const g = guard(); if (g) return g; }
     if (idempotencyKey) {
@@ -428,26 +516,10 @@ export function recordReturn({ consignmentId, returnedQty, goodQty = undefined, 
     const settled = total >= (c.handed_qty ?? 0);
     db.prepare(`UPDATE f_iroha_consignments SET state = ?, settled_at = ?, settled_by = ?, version = version + 1, updated_at = ?
       WHERE id = ?`).run(settled ? 'settled' : 'handed', settled ? now : null, settled ? actor : null, now, c.id);
-    // 返ってきた良品は、そのまとまりの「できた数」になる
-    // ⭐使える数と作れなかった数は**別々に**集計して反映する。
-    //   以前は「使える数が 1 件も無ければ、入れた作れなかった数も捨てる」ことになっていた (Codex R2 重大3)
-    // ⭐**返却の行に 1 つでも「分からない」があれば、数を確定 (counted) にしない** (Codex R3 重大2)。
-    //   60 個 (使える 60) → 40 個 (分からない) と返ってきたのに 60 を確定にすると、
-    //   100 個のうち 60 個しかできなかったと読める。分からないものは「数えていない」(NULL) のまま
-    const agg = db.prepare(`SELECT COUNT(*) rows, COUNT(good_qty) gn, SUM(good_qty) gs, COUNT(loss_qty) ln, SUM(loss_qty) ls
-      FROM f_iroha_consignment_returns WHERE consignment_id = ?`).get(c.id);
-    {
-      const cur = db.prepare('SELECT good_qty, good_qty_source, loss_qty FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
-      const nextGood = agg.gn === agg.rows ? agg.gs : null;
-      const nextLoss = agg.ln === agg.rows ? agg.ls : null;
-      if (nextGood !== (cur.good_qty ?? null) || nextLoss !== (cur.loss_qty ?? null) || (nextGood != null && cur.good_qty_source !== 'counted')) {
-        db.prepare(`UPDATE f_iroha_task_batches SET good_qty = ?, good_qty_source = ?, loss_qty = ?,
-            version = version + 1, updated_at = ? WHERE id = ?`)
-          .run(nextGood, nextGood == null ? null : 'counted', nextLoss, now, c.batch_id);
-        const b = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
-        if (b) recomputeTaskDoneQty(db, b.task_id);
-      }
-    }
+    // 返ってきた良品は、そのまとまりの「できた数」になる。
+    // ⭐集計は applyReturnsToBatch に集めてある — あとから数を入れ直したときと**同じ計算**を使う
+    //   (別々に書くと、受け取ったときと直したときで画面の数が食い違う)
+    applyReturnsToBatch(db, c.id, c.batch_id, now);
     if (settled) closeBatchIfSettled(db, c.batch_id, now);
     const bt = db.prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id);
     if (bt) bumpTask(db, bt.task_id, now, actor);   // ⭐数が動いたので親カードの版も進める

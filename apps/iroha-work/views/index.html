@@ -3960,8 +3960,19 @@ function canEditProgress(c) {
  * ⭐外部にあずけているぶん (要件 §AB-7)。いつまでに返してもらうかも出す。
  * 期限を過ぎていたら赤く出す (催促のため)
  */
+/** ⭐まだ数えていない返却の行 (使える数が空)。あると、そのまとまりの「できた数」が出せず棚入れに進めない */
+const uncountedReturns = (x) => (x.returns || []).filter((r) => r.good_qty == null);
+/**
+ * ⭐精算ずみの預けを出すか。
+ * - 数が抜けている返却がある → **開いて**出す (入れないと棚入れに進めない = やること)
+ * - 数が揃っている → **折りたたんで**出す。普段は邪魔にならず、打ち間違いに気づいたら開いて直せる
+ *   (最後の 1 行を埋めた瞬間に入口ごと消えると、間違いを直せない — Codex #1268 R2 中1)
+ */
+const settledOpen = (x) => uncountedReturns(x).length > 0;
 function awayHtml(c) {
-  const list = (c.consignments || []).filter((x) => x.state !== 'cancelled' && x.state !== 'settled');
+  // ⭐精算ずみでも、返却の記録があるものは残す (数を直せる入口を消さない)
+  const list = (c.consignments || []).filter((x) => x.state !== 'cancelled'
+    && (x.state !== 'settled' || (x.returns || []).length > 0));
   if (list.length === 0) {
     // 一覧から開いたときは細かい記録が無いので、合計だけ出す
     if (!c.away) return '';
@@ -3973,21 +3984,37 @@ function awayHtml(c) {
     const over = x.due_date && today && x.due_date < today;
     const qty = x.handed_qty != null ? x.handed_qty : x.planned_qty;
     const back = x.returned_total || 0;
-    return '<div class="away"><label>🚚 ' + esc(x.state === 'handed' ? 'あずけ中' : '渡す予定') + '</label>' +
+    const settled = x.state === 'settled';
+    const folded = settled && !settledOpen(x);   // 精算ずみで数も揃っている = 普段は畳んでおく
+    return '<div class="away">' + (folded ? '<details><summary>' : '') +
+      '<label>🚚 ' + esc(settled ? '精算ずみ' : x.state === 'handed' ? 'あずけ中' : '渡す予定') + '</label>' +
       '<div class="v">' + esc(facilityName(x.facility_code)) + ' ' + esc(String(qty)) + ' 個' +
-        (back > 0 ? '（' + back + ' 個は返却ずみ）' : '') + '</div>' +
+        (back > 0 ? '（' + back + ' 個は返却ずみ）' : '') + '</div>' + (folded ? '</summary>' : '') +
       '<div class="s2' + (over ? ' over' : '') + '">' +
         (x.handed_at ? esc(fmtDate(x.handed_at)) + ' にわたした' : 'まだ渡していません') +
         (x.due_date ? ' ・ ' + esc(x.due_date) + ' までに返却' + (over ? ' (期限を過ぎています)' : '') : '') + '</div>' +
+      // ⭐返却の行を**1 行ずつ**出す (いつ何個返ってきたぶんか分かるように)。
+      //   数が入っていないものは赤く強調し、入っているものも**直せる**ようにする —
+      //   入れたとたんに入口が消えると、打ち間違いも数え直しも直せない (Codex #1268 R1 中3)
+      (x.returns || []).map((r) => {
+        const none = r.good_qty == null;
+        return '<div class="s2' + (none ? ' over' : '') + '">📥 ' + esc(fmtDate(r.returned_at)) + ' に ' +
+          esc(String(r.returned_qty)) + ' 個 返ってきたぶん — ' +
+          (none ? '<b>使える数</b>がまだ入っていません' : '使える数 ' + esc(String(r.good_qty)) + ' 個') +
+          (stateCan('task.consign')
+            ? ' <button data-cgfix="' + r.id + '" data-cgfix-cg="' + x.id + '">' + (none ? '数を入れる' : '数を直す') + '</button>'
+            : (none ? ' (職員が入れます)' : '')) + '</div>';
+      }).join('') +
       (stateCan('task.consign') ? '<div class="acts">' +
         (x.state === 'handed'
           ? '<button class="go" data-cg="return" data-cg-id="' + x.id + '">返却を受け取る</button>' +
             '<button data-cg="settle" data-cg-id="' + x.id + '">返ってこないぶんを精算</button>'
+          : x.state === 'settled' ? ''       // もう閉じている (数を入れるボタンだけ上に出す)
           : '<button class="go" data-cg="handed" data-cg-id="' + x.id + '">渡しました</button>' +
             (x.state === 'planned' ? '<button data-cg="prepared" data-cg-id="' + x.id + '">箱とラベルを用意した</button>' : '') +
             '<button data-cg="cancel" data-cg-id="' + x.id + '">やめる</button>') +
         '</div>' : '') +
-      '</div>';
+      (folded ? '</details>' : '') + '</div>';
   }).join('');
 }
 /** 🚚 外部にあずける — 職員だけ。許可が無ければ描かない (要件 §U-7) */
@@ -5926,6 +5953,44 @@ document.addEventListener('click', (e) => {
   if (!b) return;
   openConsignAct(b.dataset.cg, Number(b.dataset.cgId));
 });
+// ⭐返ってきた物の「使える数」をあとから入れる (精算ずみでも)
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-cgfix]');
+  if (!b) return;
+  openReturnFix(Number(b.dataset.cgfixCg), Number(b.dataset.cgfix));
+});
+/**
+ * ⭐返ってきた物を数え終わってから「使える数」を入れる。
+ * 受け取るときは空のままでよいが、入れないとそのまとまりの「できた数」が決まらず棚入れに進めない。
+ * 精算ずみでも入れられる (数えるのは物が返ってきたあとで、精算より遅れることがある)。
+ */
+function openReturnFix(consignmentId, returnId) {
+  const src = cgSourceOf(consignmentId);
+  if (!src) return;
+  if (!(src.from === 'detail' ? can('task.consign') : stateCan('task.consign'))) return;
+  if (!worker) { openGate(); return; }
+  const row = (src.cg.returns || []).find((r) => r.id === returnId);
+  if (!row) return;
+  // ⭐開いたときの数を覚える (送るときに「触ったか」を見る)
+  cgTarget = { act: 'fix_return', id: consignmentId, returnId, version: src.cg.version, taskId: src.taskId, from: src.from,
+    wasGood: row.good_qty ?? null };
+  $('#cgTitle').textContent = '🚚 返ってきた物の数を入れる';
+  $('#cgName').textContent = src.title + '（' + fmtDate(row.returned_at) + ' に ' + row.returned_qty + ' 個 返ってきたぶん）';
+  $('#cgMsg').textContent = '';
+  $('#cgBody').innerHTML = '<div class="dq">' +
+    '<label>そのうち使えるのは何個ですか</label>' +
+    '<div class="row"><input class="cgGood" type="number" inputmode="numeric" min="0" step="1" value="' +
+      esc(row.good_qty == null ? '' : String(row.good_qty)) + '" placeholder="—"><span class="of">／ 返ってきたのは ' +
+      esc(String(row.returned_qty)) + ' 個</span></div>' +
+    '<label style="margin-top:12px">ひとこと（任意）</label>' +
+    '<input class="cgNote" type="text" maxlength="300" value="' + esc(row.note || '') + '" placeholder="例: 30 個は割れていた">' +
+    '<p class="sub">空のままにすると「まだ数えていない」ままです。数が入るまで、このぶんは棚入れに進めません。</p>' +
+    '</div>' +
+    '<div class="mbtns"><button class="btn" onclick="closeConsign()">やめる</button>' +
+    '<button class="btn primary" id="cgGo" onclick="submitConsignAct()">この数で記録する</button></div>';
+  openOverlay('#cgOv');
+  $('#cgTitle').focus();
+}
 /**
  * ⭐預けの記録は 2 か所から開ける — カードの詳細と、預ける計画の画面。
  * どちらから開いても**同じダイアログ・同じ言い方**にする (画面ごとに言い方を変えない)。
@@ -6002,8 +6067,25 @@ async function submitConsignAct() {
   const c = findCard(cgTarget.taskId);
   if (!c && cgTarget.from === 'detail') { closeConsign(); return; }
   const body = { consignment_id: cgTarget.id, action: cgTarget.act, worker_id: worker.id, expect_version: cgTarget.version };
+  // ⭐あとから数を入れるだけの操作。数の欄は 1 つ (使える数) で、空のままなら「まだ数えていない」
+  if (cgTarget.act === 'fix_return') {
+    body.return_id = cgTarget.returnId;
+    const g = $('#cgBody').querySelector('.cgGood');
+    const raw = g ? String(g.value).trim() : '';
+    let next = null;                               // 空 = まだ数えていない (0 とは違う)
+    if (raw !== '') {
+      const gv = Number(raw);
+      if (!Number.isInteger(gv) || gv < 0) { $('#cgMsg').textContent = '❌ 使える数は 0 以上の整数で入れてください'; return; }
+      next = gv;
+    }
+    // 🚨**数を触っていなければ送らない**。同じ数でも送ると「数の変更」とみなされ、
+    //   棚に入れたあとに**ひとことだけ**直せなくなる (Codex #1268 R2 中2)
+    if (next !== (cgTarget.wasGood ?? null)) body.good_qty = next;
+    const noteEl = $('#cgBody').querySelector('.cgNote');
+    body.note = noteEl ? String(noteEl.value).trim() : '';
+  }
   const qtyEl = $('#cgBody').querySelector('.cgQty');
-  if (cgTarget.act !== 'cancel') {
+  if (cgTarget.act !== 'cancel' && cgTarget.act !== 'fix_return') {
     const v = qtyEl ? Number(String(qtyEl.value).trim()) : NaN;
     const min = cgTarget.act === 'settle' ? 0 : 1;   // 精算は「返ってこなかった 0 個」もありうる
     if (!Number.isInteger(v) || v < min) { $('#cgMsg').textContent = '❌ 個数は ' + min + ' 以上の整数で入れてください'; return; }

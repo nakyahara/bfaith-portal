@@ -7890,5 +7890,168 @@ console.log('\n[関連カード] 同じ入荷の新旧は行き先の生成順�
     '同じ理由でも出どころが変われば書き直す');
 }
 
+console.log('\n[返却の数] ⭐あとから「使える数」を入れる (入れないと棚入れに進めない)');
+{
+  const C = await import('../apps/iroha-work/consign.js');
+  const B = await import('../apps/iroha-work/batches.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const mk = (page, dest, qty) => TD.upsertTaskFromImport({ notion_page_id: page, status: 'not_started',
+    facility_code: 'iroha', destination_id: dest, product_name: '返却の数', qty }, { batchId: 'rc' }).id;
+  const v = (id) => TD.getTask(id).version;
+  const batchOf = (t) => B.listBatchesOfTask(db, t)[0];
+  const good = (t) => batchOf(t).good_qty;
+
+  // 100 個わたし、60 個 (使える 60) → 40 個 (数えていない) と返ってくる
+  const t1 = mk('rc-1', 9731, 100);
+  const cg = C.startConsignment({ taskId: t1, batchId: batchOf(t1).id, facilityCode: 'workcenter', qty: 100, expectVersion: v(t1) });
+  let cur = C.markHanded({ consignmentId: cg.consignment.id, expectVersion: cg.consignment.version }).consignment;
+  cur = C.recordReturn({ consignmentId: cur.id, returnedQty: 60, goodQty: 60, expectVersion: cur.version }).consignment;
+  cur = C.recordReturn({ consignmentId: cur.id, returnedQty: 40, expectVersion: cur.version }).consignment;   // 数えていない
+  ok(cur.state === 'settled', '(前提) 全部返ってきたので精算ずみ');
+  ok(good(t1) === null, '⭐1 つでも数えていない返却があれば、まとまりの「できた数」は決まらない (NULL)');
+
+  // ⭐あとから入れると、まとまりの「できた数」が決まる
+  const uncounted = cur.returns.find((r) => r.good_qty == null);
+  ok(uncounted && uncounted.returned_qty === 40, '(前提) 数えていない行がある');
+  const fixed = C.updateReturnCounts({ consignmentId: cur.id, returnId: uncounted.id, goodQty: 38,
+    note: '2 個は割れていた', expectVersion: cur.version, actor: 'たにがわ' });
+  ok(fixed.ok, '⭐精算ずみでも、あとから数を入れられる');
+  ok(good(t1) === 98, '⭐入れたら、まとまりの「できた数」が決まる (60 + 38)');
+  ok(batchOf(t1).good_qty_source === 'counted', '人が数えた数として残る');
+  ok((C.getConsignment(cur.id).returns.find((r) => r.id === uncounted.id) || {}).note === '2 個は割れていた', 'ひとことも残る');
+
+  // ⭐返ってきた数より多くは入れられない (受け取るときと同じ規則)
+  cur = C.getConsignment(cur.id);
+  const tooMany = C.updateReturnCounts({ consignmentId: cur.id, returnId: uncounted.id, goodQty: 41, expectVersion: cur.version });
+  ok(!tooMany.ok && tooMany.error === 'bad_qty' && /40 個より多く/.test(tooMany.message),
+    '⭐返ってきた 40 個より多くは入れられない (受け取るときと同じ規則を使う)');
+
+  // ⭐空に戻せる (数え直したい)。戻すと「できた数」も決まらなくなる
+  cur = C.getConsignment(cur.id);
+  const cleared = C.updateReturnCounts({ consignmentId: cur.id, returnId: uncounted.id, goodQty: null, expectVersion: cur.version });
+  ok(cleared.ok && good(t1) === null, '⭐空に戻すと「まだ数えていない」に戻る (0 とは違う)');
+
+  // ⭐版が違えば断る (他の端末が触っている)
+  cur = C.getConsignment(cur.id);
+  const stale = C.updateReturnCounts({ consignmentId: cur.id, returnId: uncounted.id, goodQty: 10, expectVersion: cur.version - 1 });
+  ok(!stale.ok && stale.error === 'conflict', '⭐版が違えば断る');
+
+  // ⭐よその預けの返却行は直せない
+  const t2 = mk('rc-2', 9732, 50);
+  const cg2 = C.startConsignment({ taskId: t2, batchId: batchOf(t2).id, facilityCode: 'workcenter', qty: 50, expectVersion: v(t2) });
+  const h2 = C.markHanded({ consignmentId: cg2.consignment.id, expectVersion: cg2.consignment.version }).consignment;
+  cur = C.getConsignment(cur.id);
+  const wrong = C.updateReturnCounts({ consignmentId: h2.id, returnId: uncounted.id, goodQty: 1, expectVersion: h2.version });
+  ok(!wrong.ok && wrong.error === 'not_found', '⭐よその預けの返却行は直せない');
+
+  // ⭐同じ数を入れ直しても、版は上がらない (何度押しても他の端末を邪魔しない)
+  cur = C.getConsignment(cur.id);
+  C.updateReturnCounts({ consignmentId: cur.id, returnId: uncounted.id, goodQty: 38, expectVersion: cur.version });
+  const after = C.getConsignment(cur.id);
+  const same = C.updateReturnCounts({ consignmentId: cur.id, returnId: uncounted.id, goodQty: 38, expectVersion: after.version });
+  ok(same.ok && same.already && C.getConsignment(cur.id).version === after.version,
+    '⭐同じ数なら「変わっていない」= 版を上げない');
+
+  // 🚨省略と「空にする」を分ける (Codex R1 中2)。使える数だけ直したとき、入っていた作れなかった数を消さない
+  {
+    const t3 = mk('rc-3', 9733, 40);
+    const cg3 = C.startConsignment({ taskId: t3, batchId: batchOf(t3).id, facilityCode: 'workcenter', qty: 40, expectVersion: v(t3) });
+    let c3 = C.markHanded({ consignmentId: cg3.consignment.id, expectVersion: cg3.consignment.version }).consignment;
+    c3 = C.recordReturn({ consignmentId: c3.id, returnedQty: 40, lossQty: 2, expectVersion: c3.version }).consignment;
+    const r3 = c3.returns[0];
+    ok(r3.good_qty == null && r3.loss_qty === 2, '(前提) 作れなかった数だけ入っている');
+    // 使える数だけ入れる (作れなかった数は送らない)
+    const only = C.updateReturnCounts({ consignmentId: c3.id, returnId: r3.id, goodQty: 38, expectVersion: c3.version });
+    const kept = C.getConsignment(c3.id).returns[0];
+    ok(only.ok && kept.good_qty === 38 && kept.loss_qty === 2,
+      '⭐送らなかった「作れなかった数」は消えない (省略 = いまの値のまま)');
+    // ⭐残す値も入れて合計を見る: 38 + 2 = 40 は OK。39 にすると 41 で超える
+    c3 = C.getConsignment(c3.id);
+    const over = C.updateReturnCounts({ consignmentId: c3.id, returnId: r3.id, goodQty: 39, expectVersion: c3.version });
+    ok(!over.ok && over.error === 'bad_qty',
+      '⭐合計は残す値も入れて確かめる (39 + 残った 2 = 41 > 40)');
+    // ⭐明示的に null を送れば空にできる
+    c3 = C.getConsignment(c3.id);
+    const clr = C.updateReturnCounts({ consignmentId: c3.id, returnId: r3.id, lossQty: null, expectVersion: c3.version });
+    ok(clr.ok && C.getConsignment(c3.id).returns[0].loss_qty === null && C.getConsignment(c3.id).returns[0].good_qty === 38,
+      '⭐null を送れば空にできる (送らなかったほうはそのまま)');
+  }
+
+  // 🚨棚に入れたあとは数を変えさせない (Codex R1 重大)
+  {
+    const t4 = mk('rc-4', 9734, 30);
+    const cg4 = C.startConsignment({ taskId: t4, batchId: batchOf(t4).id, facilityCode: 'workcenter', qty: 30, expectVersion: v(t4) });
+    let c4 = C.markHanded({ consignmentId: cg4.consignment.id, expectVersion: cg4.consignment.version }).consignment;
+    c4 = C.recordReturn({ consignmentId: c4.id, returnedQty: 30, goodQty: 30, expectVersion: c4.version }).consignment;
+    const r4 = c4.returns[0];
+    ok(good(t4) === 30, '(前提) できた数が決まっている');
+    // 棚に入れる
+    B.recordStocking(db, batchOf(t4).id, { by: 'たにがわ' });
+    ok(B.stockedQtyOf(db, batchOf(t4).id).rows === 1, '(前提) 棚入れの記録がある');
+    c4 = C.getConsignment(c4.id);
+    const afterStock = C.updateReturnCounts({ consignmentId: c4.id, returnId: r4.id, goodQty: 20, expectVersion: c4.version });
+    ok(!afterStock.ok && afterStock.error === 'stocked_batch',
+      '⭐棚に入れたあとは数を変えさせない (棚入れの記録と食い違う)');
+    ok(good(t4) === 30, '断ったので数はそのまま');
+    // ⭐ひとことだけなら直せる (数は動かない)
+    c4 = C.getConsignment(c4.id);
+    const noteOnly = C.updateReturnCounts({ consignmentId: c4.id, returnId: r4.id, note: 'あとで見直す', expectVersion: c4.version });
+    ok(noteOnly.ok && C.getConsignment(c4.id).returns[0].note === 'あとで見直す' && good(t4) === 30,
+      '⭐ひとことだけなら棚入れ後も直せる (数は動かない)');
+  }
+}
+
+// ⭐画面: 数が抜けている返却は、精算ずみでも出す (やることとして見える)
+{
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(/const uncountedReturns = \(x\) => \(x\.returns \|\| \[\]\)\.filter\(\(r\) => r\.good_qty == null\);/.test(html),
+    '数えていない返却の行を見分ける');
+  ok(/x\.state !== 'settled' \|\| \(x\.returns \|\| \[\]\)\.length > 0/.test(html),
+    '⭐精算ずみでも、返却の記録があれば残す (数を直せる入口を消さない)');
+  // ⭐**実際に awayHtml を動かして**確かめる。ソースに文字があるかを見るだけでは、
+  //   「数が入った行を出さない」ように戻しても気づけなかった (Codex #1268 R1 中3 の検査)
+  {
+    const src = html.match(/function awayHtml\(c\) \{[\s\S]*?\n\}/)[0];
+    const uncounted = (x) => (x.returns || []).filter((r) => r.good_qty == null);
+    const fn = new Function('esc', 'fmtDate', 'stateCan', 'facilityName', 'state', 'uncountedReturns', 'settledOpen',
+      src + '; return awayHtml;')(
+      (v) => String(v), (v) => String(v).slice(0, 10), () => true, (c) => String(c),
+      { today: '2026-09-08' }, uncounted, (x) => uncounted(x).length > 0);
+    const mkCg = (state2, returns) => ({ consignments: [{ id: 1, state: state2, facility_code: 'workcenter',
+      handed_qty: 40, returned_total: 40, returns }] });
+    const at = '2026-09-08T00:00:00Z';
+    // ① 数が抜けている行 → 赤く出して「数を入れる」
+    const none = fn(mkCg('settled', [{ id: 9, returned_qty: 40, good_qty: null, returned_at: at }]));
+    ok(/data-cgfix="9"/.test(none) && /数を入れる/.test(none) && /がまだ入っていません/.test(none),
+      '⭐数が抜けている返却は、精算ずみでも出して「数を入れる」を添える');
+    ok(!/使える数\*\*/.test(none), '画面に ** をそのまま出さない');
+    // ② 数が入っている行 → 「数を直す」で開ける (まだ開いている預けなら)
+    const done = fn(mkCg('handed', [{ id: 9, returned_qty: 40, good_qty: 38, returned_at: at }]));
+    ok(/data-cgfix="9"/.test(done) && /数を直す/.test(done) && /使える数 38 個/.test(done),
+      '⭐数が入っている行も「数を直す」で開ける (打ち間違い・数え直しを直せる — R1 中3)');
+    // ③ 精算ずみで数が揃っている → **畳んで**出す。普段は邪魔にならず、開けば直せる
+    const quiet = fn(mkCg('settled', [{ id: 9, returned_qty: 40, good_qty: 40, returned_at: at }]));
+    ok(/<details><summary>/.test(quiet) && /精算ずみ/.test(quiet),
+      '⭐精算ずみで数が揃っていれば畳んで出す (普段は邪魔にならない)');
+    ok(/data-cgfix="9"/.test(quiet) && /数を直す/.test(quiet),
+      '⭐畳んでいても、開けば「数を直す」を押せる (最後の 1 行を埋めた瞬間に入口が消えない — R2 中1)');
+    // ④ 数が抜けているものは畳まない (やることとして見えている)
+    ok(!/<details>/.test(none), '⭐数が抜けているものは畳まずに出す');
+  }
+  // 🚨画面から「ひとことだけ」直すとき、数を送らない (棚に入れたあとも直せる — R2 中2)
+  {
+    const src = html.match(/async function submitConsignAct\(\) \{[\s\S]*?\n\}/)[0];
+    ok(/if \(next !== \(cgTarget\.wasGood \?\? null\)\) body\.good_qty = next;/.test(src),
+      '⭐数を触っていなければ good_qty を送らない (同じ数を送ると「数の変更」とみなされ、棚入れ後に断られる)');
+    ok(/wasGood: row\.good_qty \?\? null/.test(html), '開いたときの数を覚えておく');
+  }
+  ok(/function openReturnFix\(consignmentId, returnId\)/.test(html)
+    && /cgTarget = \{ act: 'fix_return'/.test(html),
+    'あとから入れるダイアログがある (関数と、送るときの印の両方)');
+  ok(/let next = null;/.test(html) && !/let next = 0;/.test(html)
+    && html.includes(String.raw`if (raw !== '') {`),
+    '⭐空のままなら「まだ数えていない」(null) のまま。0 で代用しない');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exit(fail > 0 ? 1 : 0);

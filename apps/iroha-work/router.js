@@ -89,7 +89,7 @@ import {
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
-import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment } from './consign.js';
+import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment, updateReturnCounts } from './consign.js';
 import { startStaffUnlock, staffUnlockOf, endStaffUnlock, STAFF_UNLOCK_MS } from './db.js';
 import {
   addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
@@ -936,8 +936,8 @@ router.post('/api/consign/update', checkOrigin, api((req, res) => {
   const id = Number(req.body?.consignment_id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: '預けの記録が指定されていません' });
   const action = String(req.body?.action || '');
-  if (!['prepared', 'handed', 'cancel', 'return', 'settle'].includes(action)) {
-    return res.status(400).json({ ok: false, error: 'bad_request', message: '何をするか (用意した / 渡した / やめる / 返却 / 精算) が要ります' });
+  if (!['prepared', 'handed', 'cancel', 'return', 'settle', 'fix_return'].includes(action)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '何をするか (用意した / 渡した / やめる / 返却 / 精算 / 数を入れる) が要ります' });
   }
   const gate = requireStaffPlan(req);
   if (!gate.ok) return res.status(gate.status).json(gate.body);
@@ -947,6 +947,11 @@ router.post('/api/consign/update', checkOrigin, api((req, res) => {
     : action === 'handed' ? markHanded({ ...common, qty: req.body?.qty ?? null })
     : action === 'cancel' ? cancelConsignment(common)
     : action === 'settle' ? settleConsignment({ ...common, missingQty: req.body?.missing_qty ?? 0, note: req.body?.note ?? null })
+    // ⭐返ってきた物の数をあとから入れる / 直す (精算ずみでも)。入れないと棚入れに進めない
+    : action === 'fix_return' ? updateReturnCounts({ ...common, returnId: req.body?.return_id,
+        goodQty: 'good_qty' in (req.body || {}) ? req.body.good_qty : undefined,
+        lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+        note: 'note' in (req.body || {}) ? req.body.note : undefined })
     : recordReturn({ ...common, returnedQty: req.body?.returned_qty,
         goodQty: 'good_qty' in (req.body || {}) ? req.body.good_qty : undefined,
         lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
