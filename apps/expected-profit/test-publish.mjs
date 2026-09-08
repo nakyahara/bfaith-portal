@@ -437,6 +437,14 @@ t('[!] MIGRATED_COLUMNS に書いた列は実在する (古い記述が残らな
 console.log('');
 console.log('Render の URL は既存の env を使う (2026-09-08 初回公開が env 名の食い違いで止まった)');
 
+const ENV_KEYS = ['RENDER_PORTAL_URL', 'RENDER_MIRROR_URL', 'MIRROR_SYNC_KEY'];
+const restoreEnv = (saved) => {
+  for (let i = 0; i < ENV_KEYS.length; i++) {
+    if (saved[i] === undefined) delete process.env[ENV_KEYS[i]];
+    else process.env[ENV_KEYS[i]] = saved[i];
+  }
+};
+
 const withEnv = (vals, fn) => {
   const keys = ['RENDER_PORTAL_URL', 'RENDER_MIRROR_URL', 'MIRROR_SYNC_KEY'];
   const saved = keys.map(k => process.env[k]);
@@ -452,17 +460,41 @@ const withEnv = (vals, fn) => {
   }
 };
 
-t('[!] RENDER_MIRROR_URL だけでも転送先を組み立てられる', () => {
+// 🚨 「例外が出ない」だけでは、どちらの env を使ったか分からない (Codex R14)。
+//    fetch を差し替えて **実際に叩く URL** を捕まえる
+const urlUsed = async () => {
+  const real = globalThis.fetch;
+  let seen = null;
+  globalThis.fetch = async (u) => { seen = String(u); return { json: async () => ({ ok: true }) }; };
+  try { await httpDeps().postPublish({}); } finally { globalThis.fetch = real; }
+  return seen;
+};
+
+await ta('[!] RENDER_MIRROR_URL だけでも転送先を組み立てられる', async () => {
   // 🚨 同じ Render を指すのに新しい env を増やしたせいで、初回の公開が黙って止まった
-  withEnv({ RENDER_MIRROR_URL: 'https://example.test/', MIRROR_SYNC_KEY: 'k' }, () => {
-    assert.doesNotThrow(() => httpDeps(), '既存 env だけで組み立てられない = 転送が止まる');
-  });
+  let url = null;
+  withEnv({ RENDER_MIRROR_URL: 'https://example.test/', MIRROR_SYNC_KEY: 'k' }, () => {});
+  const saved = [process.env.RENDER_PORTAL_URL, process.env.RENDER_MIRROR_URL, process.env.MIRROR_SYNC_KEY];
+  try {
+    delete process.env.RENDER_PORTAL_URL;
+    process.env.RENDER_MIRROR_URL = 'https://example.test/';
+    process.env.MIRROR_SYNC_KEY = 'k';
+    url = await urlUsed();
+  } finally { restoreEnv(saved); }
+  assert.equal(url, 'https://example.test/apps/expected-profit/sync/publish',
+    '既存 env だけで組み立てられない = 転送が止まる');
 });
 
-t('RENDER_PORTAL_URL があればそちらを優先する (移行用)', () => {
-  withEnv({ RENDER_PORTAL_URL: 'https://new.test', RENDER_MIRROR_URL: 'https://old.test', MIRROR_SYNC_KEY: 'k' }, () => {
-    assert.doesNotThrow(() => httpDeps());
-  });
+await ta('[!] RENDER_PORTAL_URL があればそちらを叩く (移行用・優先順位そのものを見る)', async () => {
+  const saved = [process.env.RENDER_PORTAL_URL, process.env.RENDER_MIRROR_URL, process.env.MIRROR_SYNC_KEY];
+  let url = null;
+  try {
+    process.env.RENDER_PORTAL_URL = 'https://new.test';
+    process.env.RENDER_MIRROR_URL = 'https://old.test';
+    process.env.MIRROR_SYNC_KEY = 'k';
+    url = await urlUsed();
+  } finally { restoreEnv(saved); }
+  assert.ok(url.startsWith('https://new.test/'), `優先順位が逆になっている: ${url}`);
 });
 
 t('[!] どちらも無ければ、設定すべき env 名を挙げて止まる', () => {
