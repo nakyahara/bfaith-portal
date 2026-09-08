@@ -8247,10 +8247,17 @@ console.log('\n[まとまり選択の操作2] ⭐実物の選ぶ画面・札の�
   ok(a.sent.length === 0 && a.opened.includes('#askOv'), '(前提) 選ぶ画面が開き、まだ送っていない');
   const box = a.els['#askText'].children[0];
   ok(box && box.handlers.click, '(前提) 選ぶ画面にチップの見張りが付く');
-  // チップを押す (data-wb = 12)
-  await box.handlers.click({ target: { closest: (sel) => sel === '[data-wb]' ? { dataset: { wb: '12' } } : null } });
-  ok(a.sent.length === 1 && a.sent[0].batch_id === 12,
-    '⭐実物の選ぶ画面からチップを押すと、選んだぶんで 1 回だけ送る');
+  // 🚨**実物が作ったチップ**から値を取り出して押す (値を注入すると、間違ったチップを作っていても通る — R3)
+  const chips = [...String(box.innerHTML).matchAll(/data-wb="(\d+)"/g)].map((m) => Number(m[1]));
+  ok(chips.length === 2 && chips.includes(11) && chips.includes(12),
+    '⭐手元の 2 つぶんのチップを作る (それぞれのまとまりの id を持つ)');
+  ok(/60 個/.test(box.innerHTML) && /40 個/.test(box.innerHTML),
+    '数を出す (どのぶんかを見て選べる)');
+  // 2 つ目のチップ (id 12) を押す — 押す値は**実物の HTML から取った**もの
+  const target = chips[1];
+  await box.handlers.click({ target: { closest: (sel) => sel === '[data-wb]' ? { dataset: { wb: String(target) } } : null } });
+  ok(a.sent.length === 1 && a.sent[0].batch_id === target && target === 12,
+    '⭐実物の選ぶ画面が作ったチップを押すと、そのぶんで 1 回だけ送る');
 
   // ② blocked → **実物の**札の確認 → clear_block つき再送でも、選んだぶんが続く
   const b = run(two, [{ ok: false, error: 'blocked', blocked: { label: '資材' }, task: { version: 5 } },
