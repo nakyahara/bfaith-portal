@@ -2737,7 +2737,7 @@ $('#printBody').addEventListener('change', (ev) => {
  * ⭐閉じずにその場で確かめてもらう — 閉じると何を確かめるのか分からなくなるし、開き直すと依頼 ID も変わる。
  * チェックは**入力ではなく確かめた印**なので、lockPrintFields では閉じない (中身を変えるものではない)。
  */
-function showPrintDupWarn(msg) {
+function showPrintDupWarn(msg, resetCheck) {
   const box = $('#printBody');
   if (!box) return;
   let el = $('#printDupWarn');
@@ -2750,6 +2750,9 @@ function showPrintDupWarn(msg) {
     box.insertBefore(el, box.firstChild);
   }
   el.querySelector('.t').textContent = msg;
+  // ⭐相手が変わったら、前の確認は無かったことにする (人にもう一度見てもらう)
+  const cb = $('#printDupAck');
+  if (cb && resetCheck) cb.checked = false;
 }
 /**
  * ⭐届いたか分からない依頼を抱えている間は、入力を編集できなくする (Codex #1259 R6 重大3)。
@@ -2810,10 +2813,13 @@ async function submitPrint() {
     target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
   };
   // ⭐「さっき出したのと同じだが、それとは別に要る」の証跡。**中身ではなく確かめた印**なので、
-  //   届いたか分からない依頼を送り直すとき (中身は変えない) にも足してよい
+  //   届いたか分からない依頼を送り直すとき (中身は変えない) にも足してよい。
+  // 🚨ただし**毎回いまのチェックから付け直す**。控えた中身に居残らせると、チェックを外して送り直しても
+  //   証跡が付いたままになり、画面は未確認なのに発行できてしまう (Codex #1266 R1 中2)
   const dupAck = $('#printDupAck');
-  const body = (dupAck && dupAck.checked && ctx.dupJobId)
-    ? { ...base, acknowledge_duplicate_job_id: ctx.dupJobId } : base;
+  const body = { ...base };
+  delete body.acknowledge_duplicate_job_id;
+  if (dupAck && dupAck.checked && ctx.dupJobId) body.acknowledge_duplicate_job_id = ctx.dupJobId;
   // 🚨**送る中身を決めたら、そこから先は画面を変えさせない**。通信の待ちの間に期限や枚数を
   //   直せると、応答を失ったときに「画面に見えている値」と「送り直す中身」が食い違う
   //   (2027-03 で送信 → 待ちの間に 2028-06 に直す → 通信が切れる → 再送は 2027-03。
@@ -2857,8 +2863,12 @@ async function submitPrint() {
   // 🚨さっき同じラベルを出している。閉じずにその場で確かめてもらう
   //   (閉じると「何を確かめるのか」が分からなくなる。開き直すと依頼 ID も変わる)
   if (j.error === 'confirm_duplicate') {
-    ctx.dupJobId = j.job ? j.job.id : null;
-    showPrintDupWarn(j.message || 'さきほど同じラベルを出しています');
+    // 🚨**確認の相手が変わったらチェックを外す**。別の iPad が刷って新しいジョブが完了すると、
+    //   サーバーは違うジョブを指して聞き直してくる。チェックが残っていると、その新しいぶんを
+    //   **人が見ないまま**「確かめた」ことにして通してしまう (Codex #1266 R1 重大1)
+    const nextId = j.job ? j.job.id : null;
+    showPrintDupWarn(j.message || 'さきほど同じラベルを出しています', nextId !== ctx.dupJobId);
+    ctx.dupJobId = nextId;
     msgEl.textContent = '';
     $('#printOk').disabled = false;
     return;

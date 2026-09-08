@@ -3956,12 +3956,14 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
       const els = { '#printPack': { value: '70' }, '#printExtra': { value: '' }, '#printExpiry': { value: '2027-03' },
         '#printCopies': { value: '1' }, '#printMsg': { textContent: '' }, '#printOk': { disabled: false },
         '#printTarget': { value: '1' },
+        '#printDupAck': { checked: false },   // 「さっき出したのとは別に要る」のチェック
         '#printBody': { querySelector: () => ({ getAttribute: () => '1' }) } };
       const sent = [];      // 実際にサーバーへ送った中身
       const locked = [];    // lockPrintFields(true/false) の呼ばれ方
       const lockedWhileSending = [];   // ⭐通信の待ちの間に閉じていたか
+      const warned = [];    // showPrintDupWarn(msg, resetCheck) の呼ばれ方
       const fn = new Function('printCtx', 'findCard', '$', 'apiFetch', 'worker', 'closePrintBox',
-        'repaintAfterPrint', 'toast', 'openPrintBox', 'openGate', 'showErr', 'lockPrintFields',
+        'repaintAfterPrint', 'toast', 'openPrintBox', 'openGate', 'showErr', 'lockPrintFields', 'showPrintDupWarn',
         src + '; return submitPrint;')(
         ctx, () => ({ id: 7, title: 'x', print_job: null }), (k) => els[k],
         async (_url, o) => {
@@ -3969,8 +3971,10 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
           lockedWhileSending.push(locked[locked.length - 1]);   // 送っている最中の状態
           const r = replies[i++]; if (r instanceof Error) throw r; return r;
         },
-        { id: 1 }, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, (v) => locked.push(v));
-      return { ctx, fn, els, sent, locked, lockedWhileSending };
+        { id: 1 }, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, (v) => locked.push(v),
+        // ⭐本物と同じ約束: 相手が変わったと言われたらチェックを外す
+        (msg, reset) => { warned.push({ msg, reset }); if (reset) els['#printDupAck'].checked = false; });
+      return { ctx, fn, els, sent, locked, lockedWhileSending, warned };
     };
     // ① 通信が切れた → 届いたか分からないので印が立つ
     const a = mkRun([new Error('network')]);
@@ -4014,6 +4018,71 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '⭐端末への控えは持たない (この PR の範囲は「まとまり単位のラベル」。冪等の作り直しは別の PR)');
   ok(html.includes('printCtx = { id: c.id, batchId: batch ? batch.id : null,'),
     'ダイアログを開いたら依頼 ID を作る (開き直しの二重印刷は この PR より前からある穴)');
+
+  // 🚨「さっき同じラベルを出しています」の確認 (2026-09-08)。**実際に動かして**確かめる —
+  //   ソースに文字が入っているかを見るだけでは、条件を消しても気づけない (Codex #1266 R1 軽微)
+  {
+    const src = html.match(/async function submitPrint\(\) \{[\s\S]*?\r?\n\}/)[0];
+    const mkDup = (replies) => {
+      let i = 0;
+      const ctx = { id: 7, batchId: 3, reqId: 'p-fixed', saving: false };
+      const warned = [];
+      const els = { '#printPack': { value: '70' }, '#printExtra': { value: '' }, '#printExpiry': { value: '2027-03' },
+        '#printCopies': { value: '1' }, '#printMsg': { textContent: '' }, '#printOk': { disabled: false },
+        '#printTarget': { value: '1' }, '#printDupAck': { checked: false },
+        '#printBody': { querySelector: () => ({ getAttribute: () => '1' }) } };
+      const sent = [];
+      const fn = new Function('printCtx', 'findCard', '$', 'apiFetch', 'worker', 'closePrintBox',
+        'repaintAfterPrint', 'toast', 'openPrintBox', 'openGate', 'showErr', 'lockPrintFields', 'showPrintDupWarn',
+        src + '; return submitPrint;')(
+        ctx, () => ({ id: 7, title: 'x', print_job: null }), (k) => els[k],
+        async (_url, o) => { sent.push(JSON.parse(o.body)); const r = replies[i++]; if (r instanceof Error) throw r; return r; },
+        { id: 1 }, () => {}, () => {}, () => {}, () => {}, () => {}, () => {}, () => {},
+        (msg, reset) => { warned.push({ msg, reset }); if (reset) els['#printDupAck'].checked = false; });
+      return { ctx, fn, els, sent, warned };
+    };
+    const dupReply = (id) => ({ ok: false, error: 'confirm_duplicate', job: { id }, message: 'さきほど…' });
+
+    // ① チェックを入れないかぎり、何度押しても証跡は付かない
+    const a = mkDup([dupReply(11), dupReply(11)]);
+    await a.fn();
+    await a.fn();
+    ok(a.sent.length === 2 && a.sent.every((b) => b.acknowledge_duplicate_job_id === undefined),
+      '⭐チェックを入れなければ、何度押しても証跡は付かない (押し続けても発行できない)');
+    ok(a.ctx.dupJobId === 11, '聞かれている 1 件を覚える');
+
+    // ② チェックしたら、その 1 件を指して送る
+    const b = mkDup([dupReply(11), { ok: true, job: { total_copies: 1 } }]);
+    await b.fn();
+    b.els['#printDupAck'].checked = true;
+    await b.fn();
+    ok(b.sent[1].acknowledge_duplicate_job_id === 11,
+      '⭐チェックしたら、いま聞かれている 1 件を指す証跡を付けて送る');
+
+    // ③ 🚨相手が変わったらチェックを外す (別の iPad が刷って、違うぶんを指して聞き直されたとき)
+    const c3 = mkDup([dupReply(11), dupReply(22), { ok: true, job: { total_copies: 1 } }]);
+    await c3.fn();
+    c3.els['#printDupAck'].checked = true;
+    await c3.fn();
+    ok(c3.warned[1] && c3.warned[1].reset === true, '⭐相手が変わったら「もう一度見て」と伝える');
+    ok(c3.els['#printDupAck'].checked === false, '⭐チェックが外れる (人が見ていない相手を確かめたことにしない)');
+    await c3.fn();
+    ok(c3.sent[2].acknowledge_duplicate_job_id === undefined,
+      '⭐外れたまま押しても証跡は付かない (新しい相手はもう一度チェックが要る)');
+
+    // ④ 🚨チェックを外して送り直したら、証跡も消える (控えた中身に居残らせない)
+    const d = mkDup([dupReply(11), new Error('network'), dupReply(11)]);
+    await d.fn();
+    d.els['#printDupAck'].checked = true;
+    await d.fn();                       // 通信が切れる (中身を控える)
+    ok(d.sent[1].acknowledge_duplicate_job_id === 11, '(前提) チェックしたぶんは証跡つきで送った');
+    d.els['#printDupAck'].checked = false;
+    await d.fn();
+    ok(d.sent[2].acknowledge_duplicate_job_id === undefined,
+      '⭐チェックを外したら証跡も消える (画面は未確認なのに発行できる、をなくす)');
+    ok(d.sent[2].copies === d.sent[1].copies && d.sent[2].client_request_id === d.sent[1].client_request_id,
+      '中身と依頼 ID はそのまま (確かめた印だけが付け外しできる)');
+  }
 
   // 🚨全部取り消されたカードを「まとまりの無い古いカード」と同じに扱わない (Codex R4 中1)
   ok(html.includes('if (all.length > 0 && bs.length === 0) {'),

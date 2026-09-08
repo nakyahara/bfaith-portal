@@ -546,15 +546,64 @@ console.log('\n[重複] 🚨さっき同じラベルを出していないか (�
   db.prepare("DELETE FROM f_iroha_print_jobs WHERE task_id = ?").run(TD);
 }
 
-// ⭐画面: 確かめる場所と、送るときの証跡
+console.log('\n[重複2] 🚨窓は刷り上がった時刻で測る / 内訳の取りこぼし (Codex #1266 R1)');
 {
-  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
-  ok(html.includes("if (j.error === 'confirm_duplicate') {") && html.includes('function showPrintDupWarn(msg)'),
-    '⭐「さっき同じラベルを出しています」はダイアログの中で確かめる (閉じない = 何を確かめるのか分かる)');
-  ok(html.includes("id=\"printDupAck\"") && html.includes('acknowledge_duplicate_job_id: ctx.dupJobId'),
-    'チェックしたときだけ、その 1 件を指す証跡を付けて送る');
-  ok(!/'#printPack', '#printExpiry', '#printCopies', '#printExtra', '#printTarget', '#printAck', '#printDupAck'/.test(html),
-    '⭐この確認は入力ではないので、送信中も押せる (lockPrintFields の対象に入れない)');
+  const TW2 = mkTask('窓のはかり方', 'DUP-2', { barcode: '4900000000002' });
+  const minsAgo = (m) => new Date(Date.now() - m * 60 * 1000).toISOString();
+  const base = { taskId: TW2, copies: 1, packQty: '50', expiry: '2027-09' };
+  const mkDone = (createdMin, finishedMin) => {
+    const r = enqueuePrintJob({ ...base, clientRequestId: crid() });
+    db.prepare("UPDATE f_iroha_print_jobs SET state = 'completed', created_at = ?, finished_at = ? WHERE id = ?")
+      .run(minsAgo(createdMin), minsAgo(finishedMin), r.job.id);
+    return r.job.id;
+  };
+  // 🚨積んでから 31 分・刷り上がってから 29 分。積んだ時刻で測ると守りが早く切れる
+  const j1 = mkDone(31, 29);
+  const late = enqueuePrintJob({ ...base, clientRequestId: crid() });
+  ok(!late.ok && late.error === 'confirm_duplicate' && late.job.id === j1,
+    '⭐窓は**刷り上がった時刻**で測る (積んでから 31 分でも、刷り上がって 29 分なら聞く)');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE task_id = ?').run(TW2);
+  // 刷り上がって 31 分なら聞かない
+  mkDone(33, 31);
+  const old2 = enqueuePrintJob({ ...base, clientRequestId: crid() });
+  ok(old2.ok, '刷り上がって 31 分なら聞かない');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE task_id = ?').run(TW2);
+
+  // ⭐内訳の違いを 1 つずつ (まとめて確かめると、どれか 1 列を落としても気づけない)
+  const twinId = mkDone(1, 1);
+  ok(enqueuePrintJob({ ...base, packQty: '60', clientRequestId: crid() }).ok, '入数が違えば別のラベル');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE id <> ?').run(twinId);
+  ok(enqueuePrintJob({ ...base, extraPackQty: '7', clientRequestId: crid() }).ok, '端数の箱が違えば別のラベル');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE id <> ?').run(twinId);
+  // ⭐出力先だけの違いは「同じラベル」= 聞く (どの PC から出ても、貼るラベルは同じ)
+  const other = listPrintAgents().find((a) => a.id !== null);
+  const sameLabel = enqueuePrintJob({ ...base, targetDeviceId: other ? other.id : null, clientRequestId: crid() });
+  ok(!sameLabel.ok && sameLabel.error === 'confirm_duplicate',
+    '⭐出力先が違うだけなら「同じラベル」として聞く (貼るものは同じ)');
+
+  // ⭐証跡は「いま聞かれている 1 件」でなければ通らない
+  const otherCard = mkTask('よそのカードのぶん', 'DUP-3', { barcode: '4900000000003' });
+  const oj = enqueuePrintJob({ taskId: otherCard, copies: 1, clientRequestId: crid() });
+  db.prepare("UPDATE f_iroha_print_jobs SET state = 'completed' WHERE id = ?").run(oj.job.id);
+  const wrongCard = enqueuePrintJob({ ...base, clientRequestId: crid(), acknowledgeDuplicateJobId: oj.job.id });
+  ok(!wrongCard.ok && wrongCard.error === 'confirm_duplicate',
+    '⭐よそのカードのジョブ ID を渡しても通らない (聞かれている 1 件と違う)');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE task_id IN (?, ?)').run(TW2, otherCard);
+
+  // ⭐まとまりの違い: NULL 同士は同じ / 別のまとまりは別
+  const TB = mkTask('まとまりで見分ける', 'DUP-4', { barcode: '4900000000004' });
+  const at3 = new Date().toISOString();
+  // ⭐カードを作ると seq=1 のまとまりが 1 つできる。2 つ目を足して「分かれたカード」にする
+  db.prepare("INSERT INTO f_iroha_task_batches (task_id, seq, planned_qty, work_status, created_at, updated_at) VALUES (?, 2, 7, 'not_started', ?, ?)").run(TB, at3, at3);
+  const bs = db.prepare('SELECT id FROM f_iroha_task_batches WHERE task_id = ? ORDER BY seq').all(TB);
+  const b1 = enqueuePrintJob({ taskId: TB, batchId: bs[0].id, copies: 1, clientRequestId: crid() });
+  db.prepare("UPDATE f_iroha_print_jobs SET state = 'completed', finished_at = ? WHERE id = ?").run(at3, b1.job.id);
+  const b2 = enqueuePrintJob({ taskId: TB, batchId: bs[1].id, copies: 1, clientRequestId: crid() });
+  ok(b2.ok, '⭐別のまとまりなら聞かない (違うぶんのラベル)');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE id = ?').run(b2.job.id);
+  const b1again = enqueuePrintJob({ taskId: TB, batchId: bs[0].id, copies: 1, clientRequestId: crid() });
+  ok(!b1again.ok && b1again.error === 'confirm_duplicate', '⭐同じまとまりなら聞く');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE task_id = ?').run(TB);
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

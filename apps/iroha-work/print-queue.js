@@ -288,8 +288,11 @@ export function enqueuePrintJob({ taskId, batchId = null, copies, packQty = null
     //   1 枚目が「✅ 印刷しました」になると上の見張りを
     //   すり抜けるので、応答を失った人が開き直して押すと 2 枚出る (ラベルは貼ると見分けられない)。
     //   ⭐止めるのではなく**聞く**: 人が「別に要る」と確かめたら、その 1 件を指して発行できる
+    // ⭐窓は **印刷し終えた時刻** で測る。依頼を積んだ時刻 (created_at) で測ると、印刷に 2 分かかったとき
+    //   「刷り上がって 28 分」なのに「積んでから 30 分」で守りが切れる (Codex #1266 R1 中3)。
+    //   古い記録で finished_at が空なら updated_at → created_at の順で代わりにする (守りを緩めない側に倒す)
     const twin = db.prepare(`SELECT * FROM f_iroha_print_jobs
-      WHERE task_id = ? AND state = 'completed' AND created_at >= ?
+      WHERE task_id = ? AND state = 'completed' AND COALESCE(finished_at, updated_at, created_at) >= ?
         AND copies = ? AND pack_qty = ? AND extra_pack_qty = ? AND expiry_text = ? AND batch_id IS ?
       ORDER BY id DESC LIMIT 1`)
       .get(tid, new Date(ms(now) - DUPLICATE_WINDOW_MS).toISOString(), n, pack, extra, exp, soleId);
