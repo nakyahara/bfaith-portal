@@ -18,6 +18,9 @@
       --warn: #b54708; --warn-bg: #fffaeb;
       --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
       --radius: 10px;
+      /* 🚨 貼り付けた結果2列の幅。オフセット (right) と幅を同じ値から出さないと、
+         中身が広がったときに左の列が右の列に重なる */
+      --ep-r-col: 112px;
     }
     body { background: var(--bg); color: var(--ink); -webkit-font-smoothing: antialiased; }
     .container { max-width: 1760px; margin: 0 auto; padding: 20px 24px 40px; }
@@ -124,9 +127,12 @@
     /* 🚨 結果は2列とも右に貼る。両方 right:0 にすると重なって片方が読めなくなる */
     .ep-table th.ep-stick-r, .ep-table td.ep-stick-r,
     .ep-table th.ep-stick-r2, .ep-table td.ep-stick-r2 { position: sticky; z-index: 5; background: var(--card); }
-    .ep-table th.ep-stick-r2, .ep-table td.ep-stick-r2 { right: 104px; min-width: 104px; border-left: 1px solid var(--line);
+    .ep-table th.ep-stick-r2, .ep-table td.ep-stick-r2 { right: var(--ep-r-col); border-left: 1px solid var(--line);
       box-shadow: -6px 0 8px -8px rgba(16,24,40,.45); }
-    .ep-table th.ep-stick-r, .ep-table td.ep-stick-r { right: 0; min-width: 104px; }
+    .ep-table th.ep-stick-r, .ep-table td.ep-stick-r { right: 0; }
+    .ep-table th.ep-stick-r, .ep-table td.ep-stick-r,
+    .ep-table th.ep-stick-r2, .ep-table td.ep-stick-r2 {
+      width: var(--ep-r-col); min-width: var(--ep-r-col); max-width: var(--ep-r-col); }
     .ep-table thead th.ep-stick-r, .ep-table thead th.ep-stick-r2 { z-index: 12; background: #f8f9fb; }
     .ep-table .ep-group th.ep-stick-r { z-index: 13; background: #f2f4f7; right: 0; border-left: 1px solid var(--line); }
     .ep-table tbody tr:hover td.ep-stick-r2 { background: #f7f9ff; }
@@ -572,6 +578,11 @@
     const MALL_FEE_RATES_LABEL = { amazon: 'Amazon', rakuten: '楽天', yahoo: 'Yahoo!', aupay: 'au PAY', qoo10: 'Qoo10', linegift: 'LINEギフト', mercari: 'メルカリ' };
     let currentData = [];
     let currentView = 'worst';
+    // 🚨 表示先 (#table-container) はタブ共通。読み込み中にタブを切り替えると、
+    //    遅れて返った応答が別タブの表を上書きする。連番で「まだ自分の番か」を確かめる
+    let loadSeq = 0;
+    const nextLoad = () => ++loadSeq;
+    const stillMine = (seq, view) => seq === loadSeq && currentView === view;
     let sortCol = 'margin_rate';
     let sortAsc = true;
 
@@ -586,6 +597,7 @@
 
     function switchProfitView(view) {
       currentView = view;
+      nextLoad();                      // 前のタブ向けに走っている読み込みを無効にする
       document.querySelectorAll('#pd-sub-tabs-a .sub-tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
       const isExpected = view === 'expected';
       const intro = VIEW_INTRO[view] || VIEW_INTRO.worst;
@@ -614,27 +626,39 @@
 
     // ─── 想定利益 (単品販売シナリオ) ───
     // 実績を使わず、夜間に作った世代を読むだけ。計算はここでしない
-    let epState = { rows: [], summary: null, published: null, scope: 'self_v1', sort: 'margin', order: 'desc', rankOnly: true };
+    let epState = { rows: [], summary: null, published: null, scope: 'self_v1', sort: 'margin', order: 'desc',
+      rankOnly: true, mall: '' };
 
     async function loadExpectedProfit() {
-      const mall = document.getElementById('filter-mall').value;
+      const seq = nextLoad();
       const c = document.getElementById('table-container');
       c.innerHTML = '<div class="loading">想定利益を読み込み中...</div>';
       try {
-        const q = new URLSearchParams({
-          scope: epState.scope, sort: epState.sort, order: epState.order,
-          rank_only: epState.rankOnly ? '1' : '0', limit: '500',
-        });
-        if (mall) q.set('mall', mall);
-        const res = await fetchJson('/apps/profit-analysis/api/expected-profit?' + q.toString());
+        const res = await fetchJson('/apps/profit-analysis/api/expected-profit?' + epQuery({ limit: '500' }));
+        if (!stillMine(seq, 'expected')) return;      // 実績タブへ移っていたら描かない
         epState.rows = res.rows || [];
         epState.summary = res.summary;
         epState.published = res.published;
         epState.total = res.total;
         renderExpectedProfit();
       } catch (e) {
+        if (!stillMine(seq, 'expected')) return;
         c.innerHTML = '<div class="empty" style="color:#dc2626;">エラー: ' + escapeHtml(e.message) + '</div>';
       }
+    }
+
+    /**
+     * 🚨 このタブの絞り込みは epState だけで持つ (Codex 2巡目 [中])。
+     *    実績タブの #filter-mall に書き戻していたので、想定利益でモールを変えて
+     *    実績タブへ戻ると、断りなく実績側の絞り込みまで変わっていた
+     */
+    function epQuery(extra) {
+      const q = new URLSearchParams({
+        scope: epState.scope, sort: epState.sort, order: epState.order,
+        rank_only: epState.rankOnly ? '1' : '0', ...(extra || {}),
+      });
+      if (epState.mall) q.set('mall', epState.mall);
+      return q.toString();
     }
 
     function epNum(v, digits) {
@@ -743,7 +767,7 @@
       // ── 3. 操作 ──
       html += '<div class="filters">';
       // モール絞り込みはこの世代に入っているモールだけ出す (無いモールを選ばせない)
-      const mallNow = document.getElementById('filter-mall').value;
+      const mallNow = epState.mall;
       html += '<label>モール: <select id="ep-mall"><option value="">全モール</option>';
       for (const m of (p.malls_included || [])) {
         html += '<option value="' + escapeHtml(m) + '"' + (mallNow === m ? ' selected' : '') + '>'
@@ -937,8 +961,8 @@
     function bindExpectedProfitEvents() {
       const mallSel = document.getElementById('ep-mall');
       if (mallSel) mallSel.addEventListener('change', function () {
-        // 絞り込みの正本は実績タブと共有の #filter-mall (CSV も同じ値を見る)
-        document.getElementById('filter-mall').value = this.value;
+        // 🚨 実績タブの #filter-mall には書かない (タブ間で絞り込みが混ざる)
+        epState.mall = this.value;
         loadExpectedProfit();
       });
       const scope = document.getElementById('ep-scope');
@@ -951,13 +975,7 @@
       if (order) order.addEventListener('change', function () { epState.order = this.value; loadExpectedProfit(); });
       if (rankOnly) rankOnly.addEventListener('change', function () { epState.rankOnly = this.checked; loadExpectedProfit(); });
       if (csv) csv.addEventListener('click', function () {
-        const mall = document.getElementById('filter-mall').value;
-        const q = new URLSearchParams({
-          scope: epState.scope, sort: epState.sort, order: epState.order,
-          rank_only: epState.rankOnly ? '1' : '0',
-        });
-        if (mall) q.set('mall', mall);
-        window.location.href = '/apps/profit-analysis/api/expected-profit.csv?' + q.toString();
+        window.location.href = '/apps/profit-analysis/api/expected-profit.csv?' + epQuery();
       });
 
       // 行を押したら、その1件の計算の内訳を開く (もう一度押すと閉じる)。
@@ -977,6 +995,9 @@
     }
 
     async function loadData() {
+      // 🚨 想定利益タブに移っている間に返ってきた応答で、向こうの表を上書きしない
+      const seq = nextLoad();
+      const view = currentView;
       const days = document.getElementById('filter-days').value;
       const mall = document.getElementById('filter-mall').value;
       document.getElementById('table-container').innerHTML = '<div class="loading">データ読み込み中...</div>';
@@ -986,12 +1007,15 @@
           fetchJson(`/apps/profit-analysis/api/profit?days=${days}&mall=${mall}`),
           fetchJson('/apps/profit-analysis/api/fee-status'),
         ]);
+        // 取得したデータ自体は残す (タブを戻したときに再取得しないで済む) が、描画はしない
         currentData = profitRes.items || [];
+        document.getElementById('btn-export').disabled = false;
+        if (!stillMine(seq, view)) return;
         renderSummary(profitRes.summary);
         renderFeeStatus(feeRes);
         renderTable();
-        document.getElementById('btn-export').disabled = false;
       } catch (e) {
+        if (!stillMine(seq, view)) return;
         document.getElementById('table-container').innerHTML = `<div class="empty" style="color:#dc2626;">エラー: ${escapeHtml(e.message)}</div>`;
       } finally {
         document.getElementById('btn-load').disabled = false;
@@ -999,15 +1023,18 @@
     }
 
     async function loadTrendData() {
+      const seq = nextLoad();
       const mall = document.getElementById('filter-mall').value;
       document.getElementById('table-container').innerHTML = '<div class="loading">前月比データ計算中...</div>';
       try {
         const res = await fetchJson(`/apps/profit-analysis/api/profit/trend?mall=${mall}`);
+        if (!stillMine(seq, 'trend')) return;
         currentData = res.items || [];
         sortCol = 'profit_change_pct';
         sortAsc = true;
         renderTable();
       } catch (e) {
+        if (!stillMine(seq, 'trend')) return;
         document.getElementById('table-container').innerHTML = `<div class="empty" style="color:#dc2626;">エラー: ${escapeHtml(e.message)}</div>`;
       }
     }

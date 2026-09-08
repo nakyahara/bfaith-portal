@@ -4,16 +4,25 @@
 #
 # What it does: cd to the repo, run `node apps/expected-profit/nightly.js`, keep a rotated log.
 #
-# Design:
-#   - nightly.js sends its OWN jobs-monitor ping (ok only after reading the published pointer back).
-#     This runner pings 'fail' ONLY when node exits non-zero, to cover the case where the process dies
-#     before it can ping at all (node missing, crash on import, machine trouble). A duplicate fail ping
-#     is harmless; a missing one would leave the dead-man alert as the only signal.
+# Design (Codex review 2026-09-09):
+#   - The runner STOPS THE CHILD ITSELF at $StopAtHhmm (06:15 JST by default), before the task's own
+#     ExecutionTimeLimit (07:00 after a 23:30 start = 06:30). nightly.js only checks its 06:00 deadline
+#     BETWEEN steps, so a single long step can run past it; if the Scheduler killed the whole PowerShell
+#     process, no ping would be sent and the lock would be left behind. Stopping the child from here keeps
+#     the report and the cleanup in our hands. The task limit stays as the outer backstop.
+#   - Ping ownership is decided by the exit code (see nightly.js header):
+#       0 = ok (nightly pinged)   3 = failed but ALREADY REPORTED   1/other = failed with no report
+#     The runner pings 'fail' only for the last case, and 'partial' when it had to stop the child.
+#     jobs-monitor keeps only the LAST ping (store.js recordPing is an upsert), so a second ping from here
+#     would overwrite nightly's specific reason ("could not publish: ...") with a generic one.
 #   - Single instance: the scheduler is set to IgnoreNew, but a manual run can still overlap a scheduled
 #     one, so a lock file guards it too. A lock older than $LockStaleHours is taken over (a killed run
 #     leaves the file behind).
 #   - DATA_DIR is set explicitly, exactly like daily-sync.bat, so the batch reads/writes the same
 #     warehouse.db / expected-profit.db as everything else on this machine.
+#   - node is started with Start-Process and its own stdout/stderr files. Piping a native command through
+#     Tee-Object in PS 5.1 wraps every stderr line in a NativeCommandError record, which makes the log
+#     unreadable (and $? unreliable) even on a clean exit.
 #
 # IMPORTANT: keep this file ASCII-only.
 #   Windows PowerShell 5.1 reads BOM-less files as ANSI (CP932); multi-byte characters can swallow
@@ -21,18 +30,22 @@
 param(
   # Repo checkout to run. Pass a git worktree path to test an unmerged branch.
   [string]$Repo = 'C:\Users\bfaith\bfaith-portal',
+  # Wall clock at which the child is stopped, HH:mm. Must be BEFORE the task's ExecutionTimeLimit (06:30).
+  [string]$StopAtHhmm = '06:15',
   # Print what would run instead of running node (for checking the wiring).
   [switch]$DryRun,
   # Extra arguments for nightly.js, e.g. --skip-publish
-  [string[]]$NodeArgs = @()
+  [string[]]$NodeArgs = @(),
+  # Entry point to run. Overridable so the runner itself can be exercised (exit codes, deadline stop).
+  [string]$Entry = 'apps/expected-profit/nightly.js'
 )
 $ErrorActionPreference = 'Continue'
 
 $JobId          = 'expected-profit-nightly'
-$Script         = 'apps/expected-profit/nightly.js'
+$Script         = $Entry
 $LogDir         = Join-Path $Repo 'logs'
 $LockFile       = Join-Path $Repo 'logs\expected-profit.lock'
-$LockStaleHours = 8          # deadline is 06:00 (6.5h after the 23:30 start); anything older is a leftover
+$LockStaleHours = 8          # the run itself is bounded by $StopAtHhmm; anything older is a leftover
 $KeepLogDays    = 14
 $PingPs1        = Join-Path $Repo 'scripts\jobs-monitor\ping.ps1'
 
@@ -40,7 +53,8 @@ if (-not (Test-Path (Join-Path $Repo $Script))) { Write-Error "not a bfaith-port
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 $Stamp  = Get-Date -Format 'yyyy-MM-dd_HHmmss'
-$Log    = Join-Path $LogDir "expected-profit-$Stamp.log"
+$OutLog = Join-Path $LogDir "expected-profit-$Stamp.out.log"
+$ErrLog = Join-Path $LogDir "expected-profit-$Stamp.err.log"
 $RunLog = Join-Path $LogDir 'expected-profit-runner.log'
 
 function Log([string]$msg) {
@@ -50,13 +64,23 @@ function Log([string]$msg) {
   Add-Content -Path $RunLog -Value $line -Encoding UTF8
 }
 
-function Send-FailPing([string]$note) {
-  if (-not (Test-Path $PingPs1)) { Log 'ping.ps1 not found - skipped'; return }
+# ping.ps1 always exits 0 by design (monitoring must never fail the job), so a failed ping cannot be
+# detected from its exit code. Its own log is $env:TEMP\jobs-monitor-ping.log; note here that we tried.
+function Send-Ping([string]$status, [string]$note) {
+  if (-not (Test-Path $PingPs1)) { Log 'ping.ps1 not found - NOT reported'; return }
   $safe = ($note -replace '["\r\n\t]', ' ') -replace '\s+', ' '
   if ($safe.Length -gt 180) { $safe = $safe.Substring(0, 180) }
-  # ping.ps1 has its own timeout and always exits 0 by design
-  try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PingPs1 -Id $JobId -Status 'fail' -Note $safe }
+  Log ('ping ' + $status + ' : ' + $safe)
+  try { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PingPs1 -Id $JobId -Status $status -Note $safe }
   catch { Log ('ping error: ' + $_.Exception.Message) }
+}
+
+# The stop time is the next occurrence of $StopAtHhmm (the batch starts at 23:30 and crosses midnight).
+function Get-StopTime([string]$hhmm) {
+  $t = [datetime]::ParseExact($hhmm, 'HH:mm', $null)
+  $stop = (Get-Date).Date.AddHours($t.Hour).AddMinutes($t.Minute)
+  if ($stop -le (Get-Date)) { $stop = $stop.AddDays(1) }
+  return $stop
 }
 
 # --- single instance -------------------------------------------------------
@@ -81,28 +105,49 @@ try {
   } catch { }
 
   $env:DATA_DIR = Join-Path $Repo 'data'
-  Set-Location $Repo
+  $stopAt = Get-StopTime $StopAtHhmm
   $argLine = @($Script) + $NodeArgs
   Log ('start : node ' + ($argLine -join ' ') + '  (DATA_DIR=' + $env:DATA_DIR + ')')
-  Log ('log   : ' + $Log)
+  Log ('stop  : ' + $stopAt.ToString('yyyy-MM-dd HH:mm') + '  log: ' + $OutLog)
 
   if ($DryRun) {
     Log 'dry run - node was not started'
     $code = 0
   } else {
-    # 2>&1 keeps stderr in the same file, in order
-    & node.exe @argLine *>&1 | Tee-Object -FilePath $Log
-    $code = $LASTEXITCODE
-    if ($null -eq $code) { $code = 1 }
+    $p = Start-Process -FilePath 'node.exe' -ArgumentList $argLine -WorkingDirectory $Repo `
+           -RedirectStandardOutput $OutLog -RedirectStandardError $ErrLog -NoNewWindow -PassThru
+    # PS 5.1 quirk: with -PassThru (and no -Wait) the object does not keep the process handle, so
+    # $p.ExitCode stays $null even after the process has exited. Touching .Handle caches it.
+    # Without this every successful night reads as "exit 1" and this runner would send a bogus fail
+    # ping over nightly.js's ok (found while testing the runner, 2026-09-09).
+    $null = $p.Handle
+    $killed = $false
+    while (-not $p.HasExited) {
+      if ((Get-Date) -ge $stopAt) {
+        Log ('deadline ' + $StopAtHhmm + ' reached - stopping node (pid ' + $p.Id + ')')
+        try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch { Log ('stop failed: ' + $_.Exception.Message) }
+        $killed = $true
+        break
+      }
+      Start-Sleep -Seconds 20
+    }
+    # give the process a moment to actually die, then read the code
+    try { $p.WaitForExit(30000) | Out-Null } catch { }
+    $code = if ($killed) { 4 } elseif ($null -ne $p.ExitCode) { $p.ExitCode } else { 1 }
     Log ('node exit code: ' + $code)
-    if ($code -ne 0) {
-      # nightly.js pings 'fail' itself on the paths it knows about; this covers the ones it cannot reach
-      Send-FailPing ('nightly.js exit ' + $code + ' (see ' + $Log + ')')
+
+    if ($killed) {
+      # the generation may well be built; the next night continues from there
+      Send-Ping 'partial' ('stopped at ' + $StopAtHhmm + ' before the task limit (see ' + $OutLog + ')')
+    } elseif ($code -eq 3) {
+      Log 'nightly.js already reported the failure - not pinging again'
+    } elseif ($code -ne 0) {
+      Send-Ping 'fail' ('nightly.js exit ' + $code + ' without reporting (see ' + $ErrLog + ')')
     }
   }
 } catch {
   Log ('runner error: ' + $_.Exception.Message)
-  Send-FailPing ('runner error: ' + $_.Exception.Message)
+  Send-Ping 'fail' ('runner error: ' + $_.Exception.Message)
   $code = 1
 } finally {
   Remove-Item -Force $LockFile -ErrorAction SilentlyContinue

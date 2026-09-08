@@ -6,8 +6,11 @@
 #   daily 23:30 -> scripts\expected-profit\run-expected-profit-nightly.ps1 -> node apps/expected-profit/nightly.js
 #
 # Why 23:30 and a 7h limit: the batch spends 50-100 min fetching mall prices and must be finished before
-# daily-sync (07:00, P1) starts. nightly.js stops by itself at the 06:00 deadline; the task limit of 7h
-# (= 06:30) is the outer bound, matching grace_hours in config/jobs-registry.mjs.
+# daily-sync (07:00, P1) starts. Three bounds, innermost first:
+#   06:00  nightly.js own deadline - checked BETWEEN steps, so a long step can overrun it
+#   06:15  the runner stops the child itself and reports 'partial' (see run-expected-profit-nightly.ps1)
+#   06:30  ExecutionTimeLimit 7h - outer backstop, matching grace_hours in config/jobs-registry.mjs.
+#          If the Scheduler kills at this point, nothing gets reported, which is why 06:15 exists.
 #
 # Principal: bfaith / Interactive / Limited - the same pattern as PhGenerateNightly and MallCsvFetchAll
 # (no stored password; requires bfaith to stay logged on at the console).
@@ -17,7 +20,9 @@ param(
   [string]$Repo = 'C:\Users\bfaith\bfaith-portal',
   [string]$TaskName = 'ExpectedProfitNightly',
   # Print the plan and the environment check without touching Task Scheduler.
-  [switch]$DryRun
+  [switch]$DryRun,
+  # Register even though required env keys are missing (the batch will fail at 23:30 - be sure).
+  [switch]$Force
 )
 $ErrorActionPreference = 'Stop'
 
@@ -64,6 +69,13 @@ if ($missing.Count -gt 0) {
 
 if ($DryRun) { Write-Output ''; Write-Output 'dry run - nothing was registered'; exit 0 }
 
+# Missing env is not a warning: the batch cannot run without it, and if JOBS_MONITOR_* is what is missing
+# the failure is not even reported. Registering anyway would leave a task that fails silently every night.
+if ($missing.Count -gt 0 -and -not $Force) {
+  throw ("refusing to register: missing env in " + $EnvFile + " -> " + ($missing -join ', ') +
+         "  (fix .env, or pass -Force if you really mean it)")
+}
+
 # --- register --------------------------------------------------------------
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
             -Argument ('-NoProfile -ExecutionPolicy Bypass -File "' + $Runner + '" -Repo "' + $Repo + '"')
@@ -92,7 +104,7 @@ Write-Output ('  1. git pull in ' + $Repo + '  (the new shipping columns come fr
 if ($missing.Count -gt 0) {
   Write-Output ('  2. fill in the missing env keys: ' + ($missing -join ', '))
 }
-Write-Output ('  3. test run  : powershell -NoProfile -ExecutionPolicy Bypass -File "' + $Runner + '" --% ')
-Write-Output ('     or without publishing: -NodeArgs --skip-publish')
+Write-Output ('  3. test run  : powershell -NoProfile -ExecutionPolicy Bypass -File "' + $Runner + '"')
+Write-Output ('     without publishing: add  -NodeArgs --skip-publish')
 Write-Output ('  4. watch     : ' + (Join-Path $Repo 'logs') + '\expected-profit-runner.log')
 Write-Output ('  5. the morning after, jobs-monitor should show ' + 'expected-profit-nightly' + ' = ok')

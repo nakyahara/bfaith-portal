@@ -287,4 +287,36 @@ t('[!] 想定利益タブでは実績タブの操作と数字を隠す', () => {
   assert.ok(html.includes("document.getElementById('pd-tab-a-actions')"));
 });
 
+console.log('');
+console.log('タブ間の混線 (Codex 2巡目)');
+
+t('[!] 想定利益タブは実績タブの絞り込み (#filter-mall) に書き込まない', () => {
+  // 書き戻していたので、想定利益でモールを変えると実績タブの絞り込みまで黙って変わっていた
+  const block = html.slice(html.indexOf('// ─── 想定利益 (単品販売シナリオ) ───'), html.indexOf('async function loadData()'));
+  assert.ok(!/getElementById\('filter-mall'\)\.value\s*=/.test(block), '#filter-mall へ書き戻している');
+  assert.ok(block.includes('epState.mall'), '想定利益タブが自分のモール状態を持っていない');
+});
+
+t('[!] 読み込み中にタブを切り替えたら、遅れて返った応答で上書きしない', () => {
+  for (const fn of ['loadExpectedProfit', 'loadData', 'loadTrendData']) {
+    const i = html.indexOf('function ' + fn + '(');
+    assert.ok(i > 0, fn + ' が無い');
+    // 🚨 関数の切れ目で止める。固定長で切ると隣の関数のガードを拾ってしまい、
+    //    ガードを外しても PASS する試験になる (最初に書いたときそうなっていた)
+    const rest = html.slice(i + 10);
+    const nextFn = rest.search(/\n {4}(async )?function /);
+    const body = nextFn > 0 ? rest.slice(0, nextFn) : rest;
+    // 応答を反映する経路の数だけガードが要る (成功と失敗の両方)
+    const guards = (body.match(/stillMine\(/g) || []).length;
+    assert.ok(guards >= 2, fn + ' の取り違え防止のガードが足りない (' + guards + ')');
+  }
+});
+
+t('[!] 貼り付けた結果2列は、幅とオフセットを同じ変数から出す', () => {
+  // right: 104px / min-width: 104px と別々に書くと、中身が広がったとき左の列が右の列に重なる
+  assert.ok(html.includes('--ep-r-col'), '幅の変数が無い');
+  assert.ok(/right:\s*var\(--ep-r-col\)/.test(html), 'オフセットが変数から出ていない');
+  assert.ok(/max-width:\s*var\(--ep-r-col\)/.test(html), '幅が固定されていない');
+});
+
 console.log(`\n${passed} 件 PASS`);

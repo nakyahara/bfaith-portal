@@ -425,6 +425,52 @@ t('ジョブIDはURLに入れられる形に逃がす', () => {
   assert.ok(u.includes('/ping/a%2Fb%20c?'), u);
 });
 
+console.log('');
+console.log('監視への報告 (ランナーとの終了コードの約束)');
+
+// 🚨 ランナー (run-expected-profit-nightly.ps1) は終了コードで「もう報告したか」を受け取る。
+//    0=ok / 3=失敗だが報告済み / 1=失敗して報告もできていない。
+//    ここが崩れると、ランナーが重ねて fail ping を打ち、具体的な理由を汎用文言で上書きする
+const PAST_DEADLINE = () => new Date(Date.now() - 1000);
+
+await ta('[!] 報告できたら reported=true (ランナーは重ねて打たない)', async () => {
+  const calls = [];
+  const origFetch = globalThis.fetch;
+  process.env.JOBS_MONITOR_URL = 'https://portal.test';
+  process.env.JOBS_MONITOR_TOKEN = 'tok';
+  globalThis.fetch = async (url) => { calls.push(String(url)); return { ok: true, status: 200 }; };
+  try {
+    const r = await runNightly({ db, warehouseDb, deadline: PAST_DEADLINE(), malls: [], skipFees: true, log: () => {} });
+    assert.equal(r.ok, false);
+    assert.equal(r.reported, true, '報告したのに reported が立っていない');
+    assert.ok(calls[0] && calls[0].includes('status=fail'), calls[0]);
+  } finally {
+    globalThis.fetch = origFetch;
+    delete process.env.JOBS_MONITOR_URL;
+    delete process.env.JOBS_MONITOR_TOKEN;
+  }
+});
+
+await ta('[!] 受け口に断られたら reported=false (ランナーが代わりに打つ)', async () => {
+  const origFetch = globalThis.fetch;
+  process.env.JOBS_MONITOR_URL = 'https://portal.test';
+  process.env.JOBS_MONITOR_TOKEN = 'tok';
+  globalThis.fetch = async () => ({ ok: false, status: 401 });
+  try {
+    const r = await runNightly({ db, warehouseDb, deadline: PAST_DEADLINE(), malls: [], skipFees: true, log: () => {} });
+    assert.equal(r.reported, false, '401 で弾かれたのに報告済みにしている');
+  } finally {
+    globalThis.fetch = origFetch;
+    delete process.env.JOBS_MONITOR_URL;
+    delete process.env.JOBS_MONITOR_TOKEN;
+  }
+});
+
+await ta('[!] 監視の設定が無いときも reported=false', async () => {
+  const r = await runNightly({ db, warehouseDb, deadline: PAST_DEADLINE(), malls: [], skipFees: true, log: () => {} });
+  assert.equal(r.reported, false);
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);
