@@ -139,8 +139,43 @@ console.log('\n[4] 前の日の取込のまま');
   ok(listInboundPlan().day_stale === false, '当日の取込なら day_stale ではない');
 }
 
-// ─── ⑤ 画面・API の配線 ───
-console.log('\n[5] 画面と API の配線');
+// ─── ⑤ 商品コードの揺れ (全角・大文字小文字違いで仕入先が食い違う行) ───
+//   ⓐ SQLite の lower() は ASCII 限定なので、全角英字の商品コードは SQL 側だけでは引けない。
+//      引けないと「仕入先が分からない」= 一覧から黙って消えるので、生の商品IDでも拾う
+//   ⓑ 同じ code_key の行が 2 つあり仕入先が食い違うとき、SQLite の返す順で決めない (Codex R1 P2)
+console.log('\n[5] 商品コードの揺れ (全角 / 大文字小文字違いで仕入先が食い違う)');
+{
+  const WIDE = 'ＡＭＣ-Ｚ';                       // 全角の商品コード
+  const wideKey = WIDE.trim().toLowerCase();      // JS の code_key ('ａｍｃ-ｚ')。SQL の lower() では作れない
+  insProduct.run(7, WIDE, 'マスタ全角', '0001');
+  insProduct.run(8, 'DUP-X', 'マスタ大文字', '0002');   // 同じ code_key で仕入先が食い違う
+  insProduct.run(9, 'dup-x', 'マスタ小文字', '0001');   //   ↑ 片方が 0001
+  insProduct.run(10, 'OTH-Y', 'よそ大文字', '0002');    // 食い違うが、どちらも 0001 ではない
+  insProduct.run(11, 'oth-y', 'よそ小文字', '0003');
+  insInfo.run(wideKey, WIDE, 'マスタ全角', '有り');
+  insInfo.run('dup-x', 'DUP-X', 'マスタ大文字', '有り');
+
+  const impW = importCsv(makeCsv([
+    row('AR7', 1, 1, WIDE, 3),
+    row('AR7', 2, 1, 'DUP-X', 6),
+    row('AR7', 3, 1, 'OTH-Y', 9),
+  ]), { source: 'manual_upload', fileName: 'test3.csv' });
+  ok(impW.ok, `取込 ok (${impW.ok ? impW.rowCount + '行' : impW.message})`);
+
+  const r5 = listInboundPlan();
+  ok(r5.rows.some((x) => x.product_code === WIDE && x.qty === 3),
+    '⭐全角の商品コードでも仕入先を引けて一覧に出る (SQL の lower() では引けない)');
+  const dup = r5.rows.find((x) => x.product_code === 'DUP-X');
+  ok(dup && dup.qty === 6, '⭐大文字小文字違いの行のうち 0001 のほうを採る (出すべきものを落とさない)');
+  ok(dup && dup.supplier_conflict === true, '⭐仕入先が食い違っていることを画面へ伝える (黙って決めない)');
+  ok(r5.rows.find((x) => x.product_code === WIDE).supplier_conflict === false, '食い違っていない行には印を付けない');
+  ok(!r5.rows.some((x) => x.product_code === 'OTH-Y'), 'どちらも 0001 でなければ出さない');
+  // ⭐同じ入力から同じ結果 (SQLite の返す順に左右されない)
+  eq(JSON.stringify(listInboundPlan().rows), JSON.stringify(r5.rows), '⭐何度呼んでも同じ一覧になる');
+}
+
+// ─── ⑥ 画面・API の配線 ───
+console.log('\n[6] 画面と API の配線');
 {
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
   const router = fs.readFileSync(new URL('../apps/iroha-work/router.js', import.meta.url), 'utf8');

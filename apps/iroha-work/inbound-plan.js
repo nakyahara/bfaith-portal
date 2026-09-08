@@ -65,21 +65,79 @@ function irohaOf(raw) {
   return { label: v, kind: 'other' };
 }
 
-/** 商品マスタ (仕入先コード・商品名・取扱区分) を code_key で引く Map */
-function productMasterMap(db, keys) {
+/** 照合キー (入荷受付・入庫情報と同じ規則 = lower(trim)。JS 側で作る) */
+const codeKeyOf = (v) => trimS(v).toLowerCase();
+
+/** 出すべき仕入先 (正規形) の集合 */
+const wantedSuppliers = () => new Set(SUPPLIER_CODES.map(normSupplierSafe).filter(Boolean));
+
+/**
+ * 同じ code_key に商品マスタの行が 2 つ以上あったとき、どれを採るかの順 (小さいほど先)。
+ * 商品コードは大文字小文字違いで別の行として入りうる (`商品コード` の UNIQUE は大小を区別する)。
+ * SQLite が返す順に任せると、片方が 0001・片方が別の仕入先のとき「日によって出たり出なかったりする」
+ * 一覧になるので、ここで決め方をはっきりさせる (Codex R1 P2)。
+ */
+function masterRank(row, want) {
+  const s = normSupplierSafe(row.supplier_code);
+  if (s && want.has(s)) return 0;   // 出すべき仕入先の行
+  if (s) return 1;                  // 別の仕入先だが仕入先は入っている
+  return 2;                         // 仕入先コードが空
+}
+
+/**
+ * 商品マスタ (仕入先コード・商品名・取扱区分) を code_key で引く Map。
+ *
+ * 🚨 SQLite の lower() は **ASCII 限定**で、JS の toLowerCase() (= code_key の作り方) と食い違う
+ *    (全角英字を小文字にできない。warehouse-mirror/db.js が f_inbound_info の CHECK を張らない理由と同じ)。
+ *    SQL では「ASCII 版のキー」と「生の商品ID」の両方で候補を拾い、キーの一致は JS 側で見る。
+ *    ここで取りこぼすと、仕入先 0001 の商品でも一覧から**黙って消える**。
+ *
+ * 🚨 同じ code_key の行が 2 つ以上あるときは masterRank の順で決める (毎回同じ行を選ぶ)。
+ *    仕入先が食い違っている (0001 と別の仕入先が両方ある) ことは呼び元へ伝えて、画面に出す —
+ *    黙ってどちらかに決めない。商品マスタを直すのは人の仕事
+ *
+ * @returns {Map<string, {code, supplier_code, name, handling, supplier_conflict: boolean}>}
+ */
+function productMasterMap(db, lines) {
   const map = new Map();
-  if (!keys.length || !tableExists(db, 'mirror_products')) return map;
-  eachChunk(keys, 400, (part) => {
+  if (!tableExists(db, 'mirror_products')) return map;
+  const wanted = new Set();   // 探している code_key (JS の規則)
+  const probes = new Set();   // SQL の IN に渡す値 (ASCII 版のキー + 生の商品ID)
+  for (const l of lines) {
+    const key = codeKeyOf(l.code_key);
+    if (!key) continue;
+    wanted.add(key);
+    probes.add(key);
+    const raw = trimS(l.product_id);
+    if (raw) probes.add(raw);
+  }
+  if (!wanted.size) return map;
+  const want = wantedSuppliers();
+  const seen = new Map();   // code_key → 見つけた仕入先 (正規形) の集合。食い違いの検出用
+  // 1 チャンクで束縛する値は placeholder 2 組ぶん = 600 (SQLite の上限 999 に余裕を残す)
+  eachChunk([...probes], 300, (part) => {
     const ph = part.map(() => '?').join(',');
-    const rows = db.prepare(`SELECT LOWER(TRIM(商品コード)) AS k, 仕入先コード AS supplier_code, 商品名 AS name, 取扱区分 AS handling
-      FROM mirror_products WHERE LOWER(TRIM(商品コード)) IN (${ph})`).all(...part);
+    const rows = db.prepare(`SELECT 商品コード AS code, 仕入先コード AS supplier_code, 商品名 AS name, 取扱区分 AS handling
+      FROM mirror_products WHERE LOWER(TRIM(商品コード)) IN (${ph}) OR TRIM(商品コード) IN (${ph})`).all(...part, ...part);
     for (const r of rows) {
-      // 大文字小文字違いで同じキーの行が2つある場合がある (実データで1123件の食い違いを確認済み)。
-      // 仕入先コードが入っている行を優先する = 絞り込みから漏れないほうへ倒す
-      const cur = map.get(r.k);
-      if (!cur || (!trimS(cur.supplier_code) && trimS(r.supplier_code))) map.set(r.k, r);
+      const k = codeKeyOf(r.code);
+      if (!wanted.has(k)) continue;   // ASCII 版のキーだけ当たった別商品を拾わない
+      const s = normSupplierSafe(r.supplier_code);
+      if (s) {
+        if (!seen.has(k)) seen.set(k, new Set());
+        seen.get(k).add(s);
+      }
+      const cur = map.get(k);
+      if (!cur) { map.set(k, r); continue; }
+      const d = masterRank(r, want) - masterRank(cur, want);
+      // 同じ順位なら商品コードの文字順で決める (SQLite の返す順に左右されない)
+      if (d < 0 || (d === 0 && trimS(r.code) < trimS(cur.code))) map.set(k, r);
     }
   });
+  for (const [k, sups] of seen) {
+    const m = map.get(k);
+    if (m) m.supplier_conflict = sups.size > 1;
+  }
   return map;
 }
 
@@ -141,17 +199,18 @@ export function listInboundPlan() {
       LEFT JOIN f_inbound_check_slips s ON s.batch_id = l.batch_id AND s.ar_no = l.ar_no
      WHERE l.batch_id = ?
      ORDER BY l.seq`).all(batch.id);
-  const keys = [...new Set(lines.map((l) => trimS(l.code_key)).filter(Boolean))];
-  const master = productMasterMap(db, keys);
+  const keys = [...new Set(lines.map((l) => codeKeyOf(l.code_key)).filter(Boolean))];
+  const master = productMasterMap(db, lines);
   const iroha = irohaInfoMap(db, keys);
-  const want = new Set(SUPPLIER_CODES.map(normSupplierSafe).filter(Boolean));
+  const want = wantedSuppliers();
 
   const grouped = new Map();
   for (const l of lines) {
-    const m = master.get(l.code_key) || null;
+    const key = codeKeyOf(l.code_key);
+    const m = master.get(key) || null;
     if (!want.has(normSupplierSafe(m && m.supplier_code))) continue;
     const day = trimS(l.planned_date) || null;
-    const gk = `${day || ''} ${l.code_key}`;
+    const gk = `${day || ''} ${key}`;
     const cur = grouped.get(gk);
     if (cur) {
       cur.qty += l.planned_qty;
@@ -159,7 +218,7 @@ export function listInboundPlan() {
       if (!cur.ar_nos.includes(l.ar_no)) cur.ar_nos.push(l.ar_no);
       continue;
     }
-    const ir = irohaOf(iroha.get(l.code_key));
+    const ir = irohaOf(iroha.get(key));
     grouped.set(gk, {
       planned_date: day,
       product_code: trimS(l.product_id) || null,
@@ -170,6 +229,9 @@ export function listInboundPlan() {
       ar_nos: [l.ar_no],
       iroha: ir.label,
       iroha_kind: ir.kind,
+      // 商品マスタに同じ商品コードの行が 2 つあり、仕入先が食い違っている (Codex R1 P2)。
+      // 黙って片方に決めず画面に出す — 直すのは人の仕事
+      supplier_conflict: !!(m && m.supplier_conflict),
       handling: trimS(m && m.handling) || null,
     });
   }

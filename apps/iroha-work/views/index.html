@@ -3687,7 +3687,8 @@ function renderInboundPlan() {
           + (past ? '<br><small>予定日は過ぎています</small>' : '') + '</td>'
         + '<td class="wrap">' + esc(r.product_name || '(名称なし)')
           + '<br><small>' + esc(r.product_code || '')
-          + (r.lines > 1 ? ' / ' + r.lines + ' 行ぶんの合計' : '') + '</small></td>'
+          + (r.lines > 1 ? ' / ' + r.lines + ' 行ぶんの合計' : '') + '</small>'
+          + (r.supplier_conflict ? '<br><small>⚠ 商品マスタで仕入先が食い違っています (職員に伝えてください)</small>' : '') + '</td>'
         + '<td class="num">' + esc(r.qty) + ' 個</td>'
         + '<td><span class="pill ' + pill + '">' + esc(r.iroha) + '</span></td>'
         + '</tr>';
