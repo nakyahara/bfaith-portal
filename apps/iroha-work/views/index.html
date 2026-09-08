@@ -3962,11 +3962,17 @@ function canEditProgress(c) {
  */
 /** ⭐まだ数えていない返却の行 (使える数が空)。あると、そのまとまりの「できた数」が出せず棚入れに進めない */
 const uncountedReturns = (x) => (x.returns || []).filter((r) => r.good_qty == null);
+/**
+ * ⭐精算ずみの預けを出すか。
+ * - 数が抜けている返却がある → **開いて**出す (入れないと棚入れに進めない = やること)
+ * - 数が揃っている → **折りたたんで**出す。普段は邪魔にならず、打ち間違いに気づいたら開いて直せる
+ *   (最後の 1 行を埋めた瞬間に入口ごと消えると、間違いを直せない — Codex #1268 R2 中1)
+ */
+const settledOpen = (x) => uncountedReturns(x).length > 0;
 function awayHtml(c) {
-  // ⭐精算ずみは普段は出さない。ただし**数が抜けている返却がある**ものは出す —
-  //   入れないと「できた数」が決まらず棚入れに進めないので、やることとして見えている必要がある
+  // ⭐精算ずみでも、返却の記録があるものは残す (数を直せる入口を消さない)
   const list = (c.consignments || []).filter((x) => x.state !== 'cancelled'
-    && (x.state !== 'settled' || uncountedReturns(x).length > 0));
+    && (x.state !== 'settled' || (x.returns || []).length > 0));
   if (list.length === 0) {
     // 一覧から開いたときは細かい記録が無いので、合計だけ出す
     if (!c.away) return '';
@@ -3978,9 +3984,12 @@ function awayHtml(c) {
     const over = x.due_date && today && x.due_date < today;
     const qty = x.handed_qty != null ? x.handed_qty : x.planned_qty;
     const back = x.returned_total || 0;
-    return '<div class="away"><label>🚚 ' + esc(x.state === 'handed' ? 'あずけ中' : '渡す予定') + '</label>' +
+    const settled = x.state === 'settled';
+    const folded = settled && !settledOpen(x);   // 精算ずみで数も揃っている = 普段は畳んでおく
+    return '<div class="away">' + (folded ? '<details><summary>' : '') +
+      '<label>🚚 ' + esc(settled ? '精算ずみ' : x.state === 'handed' ? 'あずけ中' : '渡す予定') + '</label>' +
       '<div class="v">' + esc(facilityName(x.facility_code)) + ' ' + esc(String(qty)) + ' 個' +
-        (back > 0 ? '（' + back + ' 個は返却ずみ）' : '') + '</div>' +
+        (back > 0 ? '（' + back + ' 個は返却ずみ）' : '') + '</div>' + (folded ? '</summary>' : '') +
       '<div class="s2' + (over ? ' over' : '') + '">' +
         (x.handed_at ? esc(fmtDate(x.handed_at)) + ' にわたした' : 'まだ渡していません') +
         (x.due_date ? ' ・ ' + esc(x.due_date) + ' までに返却' + (over ? ' (期限を過ぎています)' : '') : '') + '</div>' +
@@ -4005,7 +4014,7 @@ function awayHtml(c) {
             (x.state === 'planned' ? '<button data-cg="prepared" data-cg-id="' + x.id + '">箱とラベルを用意した</button>' : '') +
             '<button data-cg="cancel" data-cg-id="' + x.id + '">やめる</button>') +
         '</div>' : '') +
-      '</div>';
+      (folded ? '</details>' : '') + '</div>';
   }).join('');
 }
 /** 🚚 外部にあずける — 職員だけ。許可が無ければ描かない (要件 §U-7) */
@@ -5962,7 +5971,9 @@ function openReturnFix(consignmentId, returnId) {
   if (!worker) { openGate(); return; }
   const row = (src.cg.returns || []).find((r) => r.id === returnId);
   if (!row) return;
-  cgTarget = { act: 'fix_return', id: consignmentId, returnId, version: src.cg.version, taskId: src.taskId, from: src.from };
+  // ⭐開いたときの数を覚える (送るときに「触ったか」を見る)
+  cgTarget = { act: 'fix_return', id: consignmentId, returnId, version: src.cg.version, taskId: src.taskId, from: src.from,
+    wasGood: row.good_qty ?? null };
   $('#cgTitle').textContent = '🚚 返ってきた物の数を入れる';
   $('#cgName').textContent = src.title + '（' + fmtDate(row.returned_at) + ' に ' + row.returned_qty + ' 個 返ってきたぶん）';
   $('#cgMsg').textContent = '';
@@ -6061,12 +6072,15 @@ async function submitConsignAct() {
     body.return_id = cgTarget.returnId;
     const g = $('#cgBody').querySelector('.cgGood');
     const raw = g ? String(g.value).trim() : '';
-    if (raw === '') body.good_qty = null;          // 空 = まだ数えていない (0 とは違う)
-    else {
+    let next = null;                               // 空 = まだ数えていない (0 とは違う)
+    if (raw !== '') {
       const gv = Number(raw);
       if (!Number.isInteger(gv) || gv < 0) { $('#cgMsg').textContent = '❌ 使える数は 0 以上の整数で入れてください'; return; }
-      body.good_qty = gv;
+      next = gv;
     }
+    // 🚨**数を触っていなければ送らない**。同じ数でも送ると「数の変更」とみなされ、
+    //   棚に入れたあとに**ひとことだけ**直せなくなる (Codex #1268 R2 中2)
+    if (next !== (cgTarget.wasGood ?? null)) body.good_qty = next;
     const noteEl = $('#cgBody').querySelector('.cgNote');
     body.note = noteEl ? String(noteEl.value).trim() : '';
   }

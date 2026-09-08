@@ -8006,17 +8006,17 @@ console.log('\n[返却の数] ⭐あとから「使える数」を入れる (入
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
   ok(/const uncountedReturns = \(x\) => \(x\.returns \|\| \[\]\)\.filter\(\(r\) => r\.good_qty == null\);/.test(html),
     '数えていない返却の行を見分ける');
-  ok(/x\.state !== 'settled' \|\| uncountedReturns\(x\)\.length > 0/.test(html),
-    '⭐精算ずみでも、数が抜けている返却があれば預けを出す (普段は出さない)');
+  ok(/x\.state !== 'settled' \|\| \(x\.returns \|\| \[\]\)\.length > 0/.test(html),
+    '⭐精算ずみでも、返却の記録があれば残す (数を直せる入口を消さない)');
   // ⭐**実際に awayHtml を動かして**確かめる。ソースに文字があるかを見るだけでは、
   //   「数が入った行を出さない」ように戻しても気づけなかった (Codex #1268 R1 中3 の検査)
   {
     const src = html.match(/function awayHtml\(c\) \{[\s\S]*?\n\}/)[0];
     const uncounted = (x) => (x.returns || []).filter((r) => r.good_qty == null);
-    const fn = new Function('esc', 'fmtDate', 'stateCan', 'facilityName', 'state', 'uncountedReturns',
+    const fn = new Function('esc', 'fmtDate', 'stateCan', 'facilityName', 'state', 'uncountedReturns', 'settledOpen',
       src + '; return awayHtml;')(
       (v) => String(v), (v) => String(v).slice(0, 10), () => true, (c) => String(c),
-      { today: '2026-09-08' }, uncounted);
+      { today: '2026-09-08' }, uncounted, (x) => uncounted(x).length > 0);
     const mkCg = (state2, returns) => ({ consignments: [{ id: 1, state: state2, facility_code: 'workcenter',
       handed_qty: 40, returned_total: 40, returns }] });
     const at = '2026-09-08T00:00:00Z';
@@ -8029,15 +8029,28 @@ console.log('\n[返却の数] ⭐あとから「使える数」を入れる (入
     const done = fn(mkCg('handed', [{ id: 9, returned_qty: 40, good_qty: 38, returned_at: at }]));
     ok(/data-cgfix="9"/.test(done) && /数を直す/.test(done) && /使える数 38 個/.test(done),
       '⭐数が入っている行も「数を直す」で開ける (打ち間違い・数え直しを直せる — R1 中3)');
-    // ③ 精算ずみで全部数が入っていれば、預けごと出さない (普段の見え方は変えない)
+    // ③ 精算ずみで数が揃っている → **畳んで**出す。普段は邪魔にならず、開けば直せる
     const quiet = fn(mkCg('settled', [{ id: 9, returned_qty: 40, good_qty: 40, returned_at: at }]));
-    ok(quiet === '', '⭐精算ずみで数が揃っていれば出さない (普段どおり)');
+    ok(/<details><summary>/.test(quiet) && /精算ずみ/.test(quiet),
+      '⭐精算ずみで数が揃っていれば畳んで出す (普段は邪魔にならない)');
+    ok(/data-cgfix="9"/.test(quiet) && /数を直す/.test(quiet),
+      '⭐畳んでいても、開けば「数を直す」を押せる (最後の 1 行を埋めた瞬間に入口が消えない — R2 中1)');
+    // ④ 数が抜けているものは畳まない (やることとして見えている)
+    ok(!/<details>/.test(none), '⭐数が抜けているものは畳まずに出す');
+  }
+  // 🚨画面から「ひとことだけ」直すとき、数を送らない (棚に入れたあとも直せる — R2 中2)
+  {
+    const src = html.match(/async function submitConsignAct\(\) \{[\s\S]*?\n\}/)[0];
+    ok(/if \(next !== \(cgTarget\.wasGood \?\? null\)\) body\.good_qty = next;/.test(src),
+      '⭐数を触っていなければ good_qty を送らない (同じ数を送ると「数の変更」とみなされ、棚入れ後に断られる)');
+    ok(/wasGood: row\.good_qty \?\? null/.test(html), '開いたときの数を覚えておく');
   }
   ok(/function openReturnFix\(consignmentId, returnId\)/.test(html)
     && /cgTarget = \{ act: 'fix_return'/.test(html),
     'あとから入れるダイアログがある (関数と、送るときの印の両方)');
-  ok(/if \(raw === ''\) body\.good_qty = null;/.test(html),
-    '⭐空のまま送れば「まだ数えていない」に戻る (0 で代用しない)');
+  ok(/let next = null;/.test(html) && !/let next = 0;/.test(html)
+    && html.includes(String.raw`if (raw !== '') {`),
+    '⭐空のままなら「まだ数えていない」(null) のまま。0 で代用しない');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
