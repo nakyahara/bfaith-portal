@@ -204,7 +204,52 @@ function supplierNameOf(db, code) {
   return null;
 }
 
-const emptyTotals = () => ({ products: 0, qty: 0, iroha_products: 0, iroha_qty: 0 });
+/** 過ぎた予定を何日前まで出すか (中原さん 2026-09-09「過去五日間だけ」)。
+ *  元の CSV 自体が「当日から7日前まで」なので、ここを 7 より大きくしても増えない */
+const PAST_DAYS = 5;
+
+const emptyTotals = () => ({ products: 0, qty: 0, iroha_products: 0, iroha_qty: 0,
+  arrived_products: 0, arrived_qty: 0, old_products: 0, old_qty: 0 });
+
+/**
+ * もう届いた明細 (line_key の集合)。
+ *
+ * 「届いた」の正本 = **倉庫の iPad が確認を確定したときに立つ行き先の台帳** `f_inbound_check_destinations`。
+ *   - 確定と同じトランザクションで 1 行入り、やり直し (reopen) と 伝票から消えた取込 で cancelled_at が入る
+ *   - **取込バッチに紐づかない**ので、3 日前に確認した明細も引ける (line_state の確認は業務日ごとに戻るため使えない)
+ *   - actual_qty = 数えた実数。0 = 「確認したが 1 個も来なかった」なので**届いた扱いにしない**
+ *     (列は後付けなので、それ以前の行は NULL = 確認できた分として扱う)
+ *
+ * ⚠ ロジザードの「受付数」(f_inbound_check_lines.received_qty) は使わない。入荷受付CSV は
+ *    ステータス=受付済 で出しており、受付数は伝票を受け付けた時点の数で「現物が届いたか」を表さない。
+ *
+ * 念のため、いま開いている取込の「確認ずみ・1 個以上数えた」行も足す。台帳と二重の見張りにしておくと、
+ * 行き先が付かないまま確認だけされた行 (画面を通さない経路) も取りこぼさない。
+ */
+function arrivedLineKeys(db, batchId, lines) {
+  const arrived = new Set();
+  for (const r of db.prepare(`SELECT line_key FROM f_inbound_check_line_state
+    WHERE batch_id = ? AND status = 'checked' AND found_qty > 0`).all(batchId)) arrived.add(r.line_key);
+  if (!tableExists(db, 'f_inbound_check_destinations')) return arrived;
+  const keys = [...new Set(lines.map((l) => trimS(l.line_key)).filter(Boolean))];
+  eachChunk(keys, 400, (part) => {
+    const ph = part.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT DISTINCT line_key FROM f_inbound_check_destinations
+      WHERE cancelled_at IS NULL AND (actual_qty IS NULL OR actual_qty > 0) AND line_key IN (${ph})`).all(...part)) {
+      arrived.add(r.line_key);
+    }
+  });
+  return arrived;
+}
+
+/** 'YYYY-MM-DD' を days 日ずらす (JST の日付文字列のまま計算する) */
+function shiftDate(ymd, days) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimS(ymd));
+  if (!m) return null;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
 
 /**
  * 入荷予定の一覧 (仕入先 SUPPLIER_CODES に絞る)。
@@ -215,7 +260,13 @@ const emptyTotals = () => ({ products: 0, qty: 0, iroha_products: 0, iroha_qty: 
  * いろはが見たいのは「何がいくつ来るか」なので **入荷予定日 × 商品でまとめて数量を足す**。
  * 何行をまとめたか (lines) と伝票番号 (ar_nos) は画面の補足に残す。
  *
- * @returns {{supplier, batch, rows, totals, day_stale}}
+ * ⭐出さないもの (中原さん 2026-09-09):
+ *   - **もう届いた明細** … 倉庫が確認を確定したもの (arrivedLineKeys)。いろは行きならこの時点で
+ *     📋 作業のカードになっているので、入荷予定に残すと同じものが 2 か所に出る
+ *   - **予定日が PAST_DAYS 日より前の未着** … 古い予定がいつまでも居座らないように切る
+ *   どちらも件数は totals に残して画面に理由を出す (黙って減らさない)
+ *
+ * @returns {{supplier, batch, rows, totals, day_stale, past_days}}
  */
 export function listInboundPlan() {
   const batch = getActiveBatch();   // ← inbound-check 側のテーブルもここで冪等に作られる
@@ -224,11 +275,12 @@ export function listInboundPlan() {
     codes: [...SUPPLIER_CODES],
     name: supplierNameOf(db, SUPPLIER_CODES[0]),
   };
+  const today = workDateJst();
   if (!batch) {
-    return { supplier, batch: null, rows: [], totals: emptyTotals(), day_stale: false };
+    return { supplier, batch: null, rows: [], totals: emptyTotals(), day_stale: false, past_days: PAST_DAYS, today };
   }
   const lines = db.prepare(`
-    SELECT l.code_key, l.product_id, l.product_name, l.planned_qty, l.seq, l.ar_no, s.planned_date
+    SELECT l.line_key, l.code_key, l.product_id, l.product_name, l.planned_qty, l.seq, l.ar_no, s.planned_date
       FROM f_inbound_check_lines l
       LEFT JOIN f_inbound_check_slips s ON s.batch_id = l.batch_id AND s.ar_no = l.ar_no
      WHERE l.batch_id = ?
@@ -236,16 +288,23 @@ export function listInboundPlan() {
   const keys = [...new Set(lines.map((l) => codeKeyOf(l.code_key)).filter(Boolean))];
   const master = productMasterMap(db, lines);
   const iroha = irohaInfoMap(db, keys);
+  const arrived = arrivedLineKeys(db, batch.id, lines);
   const want = wantedSuppliers();
+  const oldest = shiftDate(today, -PAST_DAYS);   // これより前の予定日は出さない
 
-  const grouped = new Map();
+  // 出すもの / 届いたので出さないもの / 古すぎて出さないもの を同じまとめ方で数える
+  const buckets = { rows: new Map(), arrived: new Map(), old: new Map() };
   for (const l of lines) {
     const key = codeKeyOf(l.code_key);
     const m = master.get(key) || null;
     if (!want.has(normSupplierSafe(m && m.supplier_code))) continue;
     const day = trimS(l.planned_date) || null;
-    const gk = `${day || ''} ${key}`;
-    const cur = grouped.get(gk);
+    // 届いたか → 古すぎるか の順に見る (届いた分は古くても「届いた」と数えたい)
+    const bucket = arrived.has(trimS(l.line_key)) ? buckets.arrived
+      : (day && oldest && day < oldest) ? buckets.old
+        : buckets.rows;
+    const gk = `${day || ''} ${key}`;
+    const cur = bucket.get(gk);
     if (cur) {
       cur.qty += l.planned_qty;
       cur.lines += 1;
@@ -253,7 +312,7 @@ export function listInboundPlan() {
       continue;
     }
     const ir = irohaOf(iroha.get(key));
-    grouped.set(gk, {
+    bucket.set(gk, {
       planned_date: day,
       product_code: trimS(l.product_id) || null,
       // 商品名はロジザードの明細を先に (現物の箱に貼ってあるのと同じ表記)。空なら商品マスタで補う
@@ -263,6 +322,8 @@ export function listInboundPlan() {
       ar_nos: [l.ar_no],
       iroha: ir.label,
       iroha_kind: ir.kind,
+      // ⭐予定日を過ぎているのに、まだ届いていない (画面はグレーにして「まだ届いていません」と出す)
+      past: !!(day && day < today),
       // 商品マスタに同じ商品コードの行が 2 つあり、仕入先が食い違っている (Codex R1 P2)。
       // 黙って片方に決めず画面に出す — 直すのは人の仕事
       supplier_conflict: !!(m && m.supplier_conflict),
@@ -270,7 +331,7 @@ export function listInboundPlan() {
     });
   }
   // 早く届く順 → 商品名。入荷予定日が空の行は末尾へ (日付が分からないものを先頭に出さない)
-  const rows = [...grouped.values()].sort((a, b) =>
+  const rows = [...buckets.rows.values()].sort((a, b) =>
     (a.planned_date ? 0 : 1) - (b.planned_date ? 0 : 1)
     || String(a.planned_date || '').localeCompare(String(b.planned_date || ''))
     || String(a.product_name || '').localeCompare(String(b.product_name || ''), 'ja')
@@ -281,6 +342,12 @@ export function listInboundPlan() {
     totals.products += 1;
     totals.qty += r.qty;
     if (r.iroha_kind === 'yes') { totals.iroha_products += 1; totals.iroha_qty += r.qty; }
+  }
+  for (const [name, bucket] of [['arrived', buckets.arrived], ['old', buckets.old]]) {
+    for (const r of bucket.values()) {
+      totals[`${name}_products`] += 1;
+      totals[`${name}_qty`] += r.qty;
+    }
   }
   return {
     supplier,
@@ -294,9 +361,11 @@ export function listInboundPlan() {
     },
     rows,
     totals,
+    past_days: PAST_DAYS,
+    today,
     // 本日の取込がまだ来ていない = 前の日の一覧を見ている。
     //   work_date が今日でない … いろは側は繰り越し (rollOverWorkDate) を呼ばないので、まずここで分かる
     //   carried_from がある     … 倉庫の iPad が先に開いて work_date を今日へ繰り越した後 (中身は前の日のまま)
-    day_stale: !!((batch.work_date && batch.work_date !== workDateJst()) || batch.carried_from),
+    day_stale: !!((batch.work_date && batch.work_date !== today) || batch.carried_from),
   };
 }

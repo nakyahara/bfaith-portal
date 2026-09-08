@@ -322,6 +322,9 @@
   /* 🚚 入荷予定: 行を開く先が無いので押せる見た目にしない */
   .tbl.plain tbody tr{cursor:default}
   .tbl.plain tbody tr:active{background:transparent}
+  /* 予定日を過ぎてもまだ届いていない行 = 薄く出す (今日以降の予定と見分けられるように) */
+  .tbl tr.past td{color:var(--faint)}
+  .tbl tr.past .pill{opacity:.65}
   .pill.iroha{background:var(--accent-soft);color:var(--accent)}
   .pill.na{background:var(--amber-soft);color:var(--amber)}
   .tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
@@ -911,6 +914,7 @@
       <span class="sum" id="ipSum"></span>
     </div>
     <div class="banner warn" id="ipStale" onclick="this.classList.remove('on')"></div>
+    <p class="hint" id="ipHidden"></p>
     <div class="tblwrap"><table class="tbl plain">
       <thead><tr><th>入荷予定日</th><th>商品</th><th>数量</th><th>いろは在庫化区分</th></tr></thead>
       <tbody id="ipBody"><tr><td colspan="4">読み込み中…</td></tr></tbody>
@@ -3670,7 +3674,13 @@ function renderInboundPlan() {
   $('#ipSum').textContent = rows.length + ' 商品 / ' + shownQty + ' 個'
     + (!ipIrohaOnly && t.iroha_products ? '　(うち いろはで作業する分 ' + t.iroha_products + ' 商品 / ' + t.iroha_qty + ' 個)' : '');
 
-  const today = ipJstDate(j.serverNow);
+  // ⭐出していない分の理由を書く (黙って減らさない — 中原さん 2026-09-09)
+  const hidden = [];
+  if (t.arrived_products) hidden.push('もう届いた分 ' + t.arrived_products + ' 商品 (' + t.arrived_qty + ' 個)');
+  if (t.old_products) hidden.push('予定日が ' + (j.past_days || 5) + ' 日より前の分 ' + t.old_products + ' 商品 (' + t.old_qty + ' 個)');
+  $('#ipHidden').textContent = hidden.length ? '出していないもの: ' + hidden.join(' / ') : '';
+
+  const today = j.today || ipJstDate(j.serverNow);
   if (!j.batch) {
     $('#ipBody').innerHTML = '<tr><td colspan="4">入荷受付の取込がまだありません</td></tr>';
   } else if (rows.length === 0) {
@@ -3679,12 +3689,12 @@ function renderInboundPlan() {
         : '仕入先 ' + esc(code) + ' の入荷予定はありません') + '</td></tr>';
   } else {
     $('#ipBody').innerHTML = rows.map((r) => {
-      const past = r.planned_date && today && r.planned_date < today;
       // 区分の札: 有り = いろは行き / 未記入 = 入庫情報管理で決めてもらう必要がある / それ以外 = 入っている文字のまま
       const pill = r.iroha_kind === 'yes' ? 'iroha' : (r.iroha_kind === 'unknown' ? 'na' : 'loc');
-      return '<tr>'
+      // ⭐予定日を過ぎていて、まだ届いていない行は薄く出す (今日以降の予定と見分けられるように)
+      return '<tr' + (r.past ? ' class="past"' : '') + '>'
         + '<td class="num">' + esc(ipDayLabel(r.planned_date, today))
-          + (past ? '<br><small>予定日は過ぎています</small>' : '') + '</td>'
+          + (r.past ? '<br><small>まだ届いていません</small>' : '') + '</td>'
         + '<td class="wrap">' + esc(r.product_name || '(名称なし)')
           + '<br><small>' + esc(r.product_code || '')
           + (r.lines > 1 ? ' / ' + r.lines + ' 行ぶんの合計' : '') + '</small>'
@@ -3697,7 +3707,9 @@ function renderInboundPlan() {
 
   $('#ipNote').innerHTML = 'ロジザードの入荷受付伝票 (倉庫の iPad が見ているのと同じもの) から、仕入先 '
     + esc(code) + ' の商品だけを取り出しています。'
-    + 'ロジザード側の集計が「当日から7日前まで」なので、<b>今日届く分と、その少し前に受け付けた分</b>が出ます (もっと先の予定は出ません)。'
+    + '<b>倉庫で確認がすんだもの (届いたもの) は消えます</b> — いろはで作業する分は 📋 作業 のカードに出ます。'
+    + '予定日を過ぎてもまだ届いていないものは<b>薄い字</b>で残り、' + (j.past_days || 5) + ' 日より前になったら出なくなります。'
+    + 'ロジザード側の集計が「当日から7日前まで」なので、もっと先の予定は出ません。'
     + '「いろは在庫化区分」は入庫情報管理の「いろは在庫化作業有無」です。'
     + (j.batch ? '<br>この一覧は ' + esc(fmtDateTime(j.batch.imported_at)) + ' に取り込んだものです。' : '');
 }
