@@ -471,6 +471,34 @@ await ta('[!] 監視の設定が無いときも reported=false', async () => {
   assert.equal(r.reported, false);
 });
 
+await ta('[!] 公開できたのに報告だけ落ちたら ok かつ reported=false (ランナーが ok を補う)', async () => {
+  // ここを ok/true にすると、ランナーは「報告済み」と信じて何もせず、監視は昨日のまま残る
+  const published = [];
+  const origFetch = globalThis.fetch;
+  process.env.JOBS_MONITOR_URL = 'https://portal.test';
+  process.env.JOBS_MONITOR_TOKEN = 'tok';
+  globalThis.fetch = async () => { throw new Error('timeout'); };
+  try {
+    const r = await runNightly({
+      db, warehouseDb, now: new Date('2026-09-07T15:00:00Z'), deadline: FUTURE_DEADLINE(),
+      malls: ['rakuten'], skipFees: true,
+      fetchDeps: { rakuten: { searchPage: rakutenPage } },
+      publishDeps: {
+        postChunk: async () => ({ ok: true }),
+        postPublish: async (b) => { published.push(b); return { ok: true }; },
+        getPublished: async () => ({ generation_id: published[0]?.generation_id, seq: published[0]?.seq }),
+      },
+      log: () => {},
+    });
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.reported, false, '報告できていないのに reported を立てている');
+  } finally {
+    globalThis.fetch = origFetch;
+    delete process.env.JOBS_MONITOR_URL;
+    delete process.env.JOBS_MONITOR_TOKEN;
+  }
+});
+
 db.close();
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${passed} 件 PASS`);

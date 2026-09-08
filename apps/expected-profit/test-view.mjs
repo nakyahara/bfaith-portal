@@ -319,4 +319,17 @@ t('[!] 貼り付けた結果2列は、幅とオフセットを同じ変数から
   assert.ok(/max-width:\s*var\(--ep-r-col\)/.test(html), '幅が固定されていない');
 });
 
+t('[!] 取り違えの確認は、共有している行データを書き換える前に行う', () => {
+  // currentData は表の描画と CSV が共有している。先に入れ替えると、別タブを見ているのに
+  // 並び替えた瞬間そこへ古い行が出る (Codex 3巡目)
+  const i = html.indexOf('async function loadData(');
+  const rest = html.slice(i + 10);
+  const nextFn = rest.search(/\n {4}(async )?function /);
+  const body = nextFn > 0 ? rest.slice(0, nextFn) : rest;
+  const guard = body.indexOf('stillMine(');
+  const mutate = body.indexOf('currentData =');
+  assert.ok(guard > 0 && mutate > 0, 'loadData の中身が読めない');
+  assert.ok(guard < mutate, 'currentData をガードより先に書き換えている');
+});
+
 console.log(`\n${passed} 件 PASS`);

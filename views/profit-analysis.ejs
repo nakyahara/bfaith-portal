@@ -1007,10 +1007,11 @@
           fetchJson(`/apps/profit-analysis/api/profit?days=${days}&mall=${mall}`),
           fetchJson('/apps/profit-analysis/api/fee-status'),
         ]);
-        // 取得したデータ自体は残す (タブを戻したときに再取得しないで済む) が、描画はしない
+        // 🚨 currentData は表の描画と CSV が共有している。ガードより先に入れ替えると、
+        //    もう前月比タブを見ているのに、並び替えた瞬間そこへ実績の行が出る (Codex 3巡目)
+        if (!stillMine(seq, view)) return;
         currentData = profitRes.items || [];
         document.getElementById('btn-export').disabled = false;
-        if (!stillMine(seq, view)) return;
         renderSummary(profitRes.summary);
         renderFeeStatus(feeRes);
         renderTable();

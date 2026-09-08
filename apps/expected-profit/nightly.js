@@ -16,9 +16,13 @@
  *   node apps/expected-profit/nightly.js --skip-publish   (転送だけしない)
  *
  * 終了コード (ランナー run-expected-profit-nightly.ps1 との約束):
- *   0 = 成功 (ok ping 済み)
- *   3 = 失敗したが **監視へ報告済み**  → ランナーは重ねて ping しない
- *   1 = 失敗し、報告もできていない    → ランナーが代わりに fail ping を打つ
+ *   0 = 成功し、ok も報告済み          → ランナーは何もしない
+ *   5 = **成功したが報告できなかった**  → ランナーが代わりに ok ping を打つ
+ *   3 = 失敗したが報告済み             → ランナーは重ねて ping しない
+ *   1 = 失敗し、報告もできていない      → ランナーが代わりに fail ping を打つ
+ *
+ * 🚨 5 が要るのは、公開まで成功したのに ping だけ落ちる (401・タイムアウト) ことがあるため。
+ *    0 で返すとランナーは「報告済み」と信じ、監視は古い状態のまま残る (Codex 3巡目)。
  */
 import 'dotenv/config';
 import { initExpectedProfitDB } from './db.js';
@@ -261,9 +265,9 @@ if (process.argv[1] && process.argv[1].endsWith('nightly.js')) {
   })
     .then(r => {
       console.log(JSON.stringify({ ok: r.ok, generationId: r.generationId, error: r.error, reported: r.reported }, null, 2));
-      // 🚨 3 = 「失敗したが監視へは報告済み」。ランナーが重ねて ping して、
-      //    具体的な理由を汎用文言で上書きしないようにするための約束
-      process.exit(r.ok ? 0 : (r.reported ? 3 : 1));
+      // 🚨 「報告できたか」まで含めて返す。ランナーはこの4値だけを見て、
+      //    足りない報告を補い、済んでいる報告は重ねない (ヘッダの表を参照)
+      process.exit(r.ok ? (r.reported ? 0 : 5) : (r.reported ? 3 : 1));
     })
     .catch(e => { console.error(e); process.exit(1); });
 }

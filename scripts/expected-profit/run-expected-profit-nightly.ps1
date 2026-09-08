@@ -11,8 +11,9 @@
 #     process, no ping would be sent and the lock would be left behind. Stopping the child from here keeps
 #     the report and the cleanup in our hands. The task limit stays as the outer backstop.
 #   - Ping ownership is decided by the exit code (see nightly.js header):
-#       0 = ok (nightly pinged)   3 = failed but ALREADY REPORTED   1/other = failed with no report
-#     The runner pings 'fail' only for the last case, and 'partial' when it had to stop the child.
+#       0 = ok, reported      5 = ok but COULD NOT report  -> the runner sends the ok ping
+#       3 = failed, reported  1 = failed and not reported  -> the runner sends the fail ping
+#     The runner also sends 'partial' when it had to stop the child at the deadline.
 #     jobs-monitor keeps only the LAST ping (store.js recordPing is an upsert), so a second ping from here
 #     would overwrite nightly's specific reason ("could not publish: ...") with a generic one.
 #   - Single instance: the scheduler is set to IgnoreNew, but a manual run can still overlap a scheduled
@@ -139,9 +140,16 @@ try {
     if ($killed) {
       # the generation may well be built; the next night continues from there
       Send-Ping 'partial' ('stopped at ' + $StopAtHhmm + ' before the task limit (see ' + $OutLog + ')')
+    } elseif ($code -eq 0) {
+      # nightly.js reported the success itself
+    } elseif ($code -eq 5) {
+      # the job DID succeed; only the report failed (401 / timeout). Without this the monitor would
+      # keep showing yesterday until the dead-man alert fires (Codex 3rd round).
+      Send-Ping 'ok' 'published, but nightly.js could not reach jobs-monitor'
+      $code = 0
     } elseif ($code -eq 3) {
       Log 'nightly.js already reported the failure - not pinging again'
-    } elseif ($code -ne 0) {
+    } else {
       Send-Ping 'fail' ('nightly.js exit ' + $code + ' without reporting (see ' + $ErrLog + ')')
     }
   }
