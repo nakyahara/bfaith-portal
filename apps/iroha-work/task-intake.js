@@ -6,7 +6,9 @@
  *   - 正本が Notion の間: 従来どおり 17:30 の sweep が Notion カードも作り、そのとき notion_page_id をタスクに紐付ける
  *     (linkTaskToNotionPage)。切替前の差分取込で同じカードが「DB 既存 destination との衝突」にならない
  *   - 正本がアプリ: sweep は何もしない。iPad はここで作ったタスクをそのまま見る
- * やり直し・再取込で行き先が取り消されたら tasks-db.requestCancellation (⭐カードは消さず「取消の確認」を付ける。続ける/取り消す は職員 — 2026-09-08)。
+ * 🚨入荷側はカードを**作るだけ** (中原さん 2026-09-09:「削除は絶対にダメ」)。やり直し・再取込で行き先が取り消されても、
+ *   入荷側からカードに何も伝えない (2026-09-08〜09 の間だけ「取消の確認」を付けていたが撤去)。
+ *   tasks-db.requestCancellation を呼ぶのは、いろはの職員が 2 枚のカードを統合したとき (下の merge ⑤) だけ
  * 呼び元 (inbound-check/db.js) のトランザクション内で呼ぶ — 同じ warehouse-mirror.db の同じ接続なので、確定と一緒にコミット/ロールバックされる。
  */
 import { getDB } from './db.js';

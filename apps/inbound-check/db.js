@@ -19,7 +19,6 @@ import { parseInboundCsv } from './csv.js';
 // いろは在庫化アプリのタスク (PR-B): 「いろはで在庫化」の確定と同じトランザクションで f_iroha_tasks に 1 枚作る。
 // 取消 (やり直し・再取込) も同じ tx でタスク側へ伝える。同じ warehouse-mirror.db の同じ接続
 import { createTaskForDestination } from '../iroha-work/task-intake.js';
-import { requestCancellation } from '../iroha-work/tasks-db.js';
 // 仕入先コードの正規形 (先頭ゼロ除去) — 発注管理と同じ規則で突き合わせる。純粋関数なので副作用は無い
 import { normSupplierCode } from '../purchase-orders/db.js';
 
@@ -1069,12 +1068,11 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       VALUES (?, ?, ?, 1, ?, ?, ?, ?, 1, ?, ?, ?, ?)`);
     const cancelDest = db.prepare(`UPDATE f_inbound_check_destinations
       SET cancelled_at = ?, cancelled_by = 'import', cancel_reason = ? WHERE id = ? AND cancelled_at IS NULL`);
-    // 行き先の取消は「実際に取り消せた (1 行)」ときだけ在庫化アプリのタスクにも伝える
-    const cancelDestAndTask = (destinationId, reason) => {
-      if (cancelDest.run(now, reason, destinationId).changes !== 1) return false;   // 既に取消済み等 (数えない)
-      requestCancellation({ destinationId, source: 'inbound_import', reason, actor: actor || 'import' });
-      return true;
-    };
+    // 🚨行き先の取消は**入荷側の台帳だけ**。いろはのカードには何も伝えない (中原さん 2026-09-09:
+    //   「いろはのアプリには新規カードを作るだけ。削除は絶対にダメ」)。入荷側がカードを消す・取消の確認を付ける
+    //   経路は全部外した。数えたものが違う行を確認し直せば新しいカードができ、古いカードは「関連カード」として
+    //   いろはの画面に並ぶので、要らないほうはいろはの職員が決めて終了にする
+    const cancelDestOnly = (destinationId, reason) => cancelDest.run(now, reason, destinationId).changes === 1;
     // ⭐新しい CSV から行ごと消えた確認ずみの行は、**行き先もいろはのカードもそのまま残す**
     //   (中原さん 2026-09-09。理由は planCancellations)。一覧から外れるだけなので、ここでは数えて
     //   取込履歴に残すだけ (「消えた = 検品が進んだ」が読み取れるように)
@@ -1094,7 +1092,7 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       // 確認を引き継げない行 (商品・予定数が変わった) の行き先実績は取り消す (いろはへ送る数が二重計上されないように)。
       // ⭐取り消す相手は cancelPlan が決めたぶんだけ。行ごと消えた明細は cancelPlan に入らない (= 取り消さない)
       const cancelReason = cancelPlan.get(r.line_key);
-      if (cancelReason) cancelDestAndTask(p.destination_id, cancelReason);
+      if (cancelReason) cancelDestOnly(p.destination_id, cancelReason);
       insState.run(batchId, r.line_key, keepChecked ? 'checked' : 'unchecked',
         keepChecked ? p.checked_by : null, keepChecked ? p.checked_device : null, keepChecked ? p.checked_at : null,
         found, workDate, keepChecked ? p.finalized_result : null,
@@ -2114,9 +2112,8 @@ export function reopenLine({ batchId, lineKey, expectVersion, expectQuantityVers
     if (state.destination_id) {
       db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = ?, cancelled_by = ?, cancel_reason = 'reopen' WHERE id = ? AND cancelled_at IS NULL")
         .run(now, w, state.destination_id);
-      // 在庫化アプリのカードにも伝える。⭐カードは消さず「取消の確認」を付けるだけ — 続ける/取り消す は
-      //   いろはの職員が決める (中原さん 2026-09-08: 一度いろはに送ったカードは残り続ける)
-      requestCancellation({ destinationId: state.destination_id, source: 'inbound_reversal', reason: 'reopen', actor: w });
+      // 🚨いろはのカードには伝えない (中原さん 2026-09-09: 入荷側はカードを作るだけ。消す・取消の確認を付ける経路は無し)。
+      //   確認し直せば新しいカードができ、古いカードは「関連カード」として並ぶ。要らないほうはいろはの職員が終了にする
     }
     const last = db.prepare("SELECT id FROM f_inbound_check_events WHERE batch_id = ? AND line_key = ? AND action = 'check' ORDER BY id DESC LIMIT 1")
       .get(active.id, line.line_key);

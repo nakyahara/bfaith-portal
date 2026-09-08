@@ -517,12 +517,13 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   ok(t3 && db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ?').get(t3.id).c === 1,
     '⭐巻き戻した行も、あらためて確定すればカードとまとまりが両方できる');
 
-  // やり直し (未着手・実績なし) → ⭐カードは消さない。「取消の確認」が付いて残る (中原さん 2026-09-08)
+  // やり直し (未着手・実績なし) → 🚨カードには何もしない (中原さん 2026-09-09: 入荷側はカードを作るだけ。消す・取消の確認も無し)
   const s1 = lineState('AR9|1|1');
   ok(reopenLine({ batchId: b.id, lineKey: 'AR9|1|1', expectVersion: s1.version, expectQuantityVersion: s1.quantity_version, worker: '山田', clientOperationId: 'op-prb-ro1' }).ok, '前提: やり直し');
   const t1b = taskOf(d1.id);
-  ok(t1b.status === 'not_started' && t1b.closed_at == null && t1b.cancellation_requested_at && t1b.cancellation_source === 'inbound_reversal' && t1b.cancellation_reason === 'reopen',
-    '⭐やり直しても未着手のタスクは消えない — 「取消の確認」(reopen) が付いて残る');
+  ok(t1b.status === 'not_started' && t1b.closed_at == null && !t1b.cancellation_requested_at,
+    '🚨やり直しても未着手のタスクはそのまま — 消えないし「取消の確認」も付かない');
+  ok(destOf(d1.id).cancelled_at && destOf(d1.id).cancel_reason === 'reopen', '入荷側の台帳だけ取消 (reopen) になる');
   // 着手後のやり直し → 自動取消せず要確認
   const w = IW.addIrohaWorker({ displayName: 'プラビー', workerType: 'member', actor: 'test' });
   const s3 = IW.startSession({ taskId: t3.id, worker: IW.getIrohaWorker(w.id) });
@@ -530,28 +531,28 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   const ls3 = lineState('AR9|3|1');
   ok(reopenLine({ batchId: b.id, lineKey: 'AR9|3|1', expectVersion: ls3.version, expectQuantityVersion: ls3.quantity_version, worker: '鈴木' }).ok, '前提: 着手後にやり直し');
   const t3b = taskOf(d3Id);
-  ok(t3b.status !== 'closed' && t3b.cancellation_requested_at && t3b.cancellation_source === 'inbound_reversal', '着手後のやり直しは自動取消せず要確認 (cancellation_requested_at)');
+  ok(t3b.status !== 'closed' && !t3b.cancellation_requested_at, '着手後のやり直しもカードには何もしない (終了にならず、取消の確認も付かない)');
   IW.stopSession({ taskId: t3.id, workerId: w.id, sessionId: s3.sessionId, reason: 'done' });
   // 再確認 → 新しい行き先 = 新しいタスク (前のは取消のまま)
   const s1b = lineState('AR9|1|1');
   const f1c = finalizeLine({ batchId: b.id, lineKey: 'AR9|1|1', expectVersion: s1b.version, expectQuantityVersion: s1b.quantity_version, result: 'exact', mode: 'current', worker: '山田', decide: decideIroha });
   const d1cId = destIdOf('AR9|1|1');
-  ok(f1c.ok && d1cId && d1cId !== d1.id && taskOf(d1cId)?.status === 'not_started' && taskOf(d1.id).cancellation_requested_at && taskOf(d1.id).status !== 'closed',
-    '再確認すると新しいタスク (前のタスクは確認待ちのまま残る — 職員が片づける)');
+  ok(f1c.ok && d1cId && d1cId !== d1.id && taskOf(d1cId)?.status === 'not_started' && !taskOf(d1.id).cancellation_requested_at && taskOf(d1.id).status !== 'closed',
+    '再確認すると新しいタスク (前のタスクもそのまま残る — 要らなければ職員が片づける)');
   {
     // ⭐同じ入荷明細から生まれた新旧カードは、互いに「関連カード」として見える (二重作業を防ぐ — Codex R1)
     const rel = TD.relatedByInboundLine(db);
     const oldId = taskOf(d1.id).id, newId = taskOf(d1cId).id;
-    ok(rel.get(newId)?.some((r) => r.id === oldId && r.cancellation_requested_at && !r.newer) && rel.get(oldId)?.some((r) => r.id === newId && r.newer),
-      '⭐新旧カードが互いを関連カードとして持つ (新しい側には「確認待ちの旧カード」、旧側には「新しいカード」)');
+    ok(rel.get(newId)?.some((r) => r.id === oldId && !r.newer) && rel.get(oldId)?.some((r) => r.id === newId && r.newer),
+      '⭐新旧カードが互いを関連カードとして持つ (新しい側には「旧カード」、旧側には「新しいカード」) — 職員が二重を見分ける材料');
     ok(!rel.has(taskOf(destIdOf('AR9|2|1'))?.id ?? -1), '関係の無い明細のカードには付かない');
   }
   // 再取込で確認を引き継げない行 (予定数が変わった) → 行き先が取り消され、タスクも取消
   const imp2 = importCsv(makeCsv([row('AR9', 1, 'TASK-A', 7), row('AR9', 2, 'TASK-B', 3), row('AR9', 3, 'TASK-C', 2)]), { fileName: 'prb2.csv', generatedAt: '2027-01-01T01:00:00Z' });
   ok(imp2.ok, '前提: 予定数が変わった再取込');
   const t1c = taskOf(d1cId);
-  ok(t1c.status === 'not_started' && t1c.cancellation_requested_at && t1c.cancellation_source === 'inbound_import' && t1c.cancellation_reason === 'planned_changed',
-    '再取込で引き継げなかった行のタスクは消えず「取消の確認」(planned_changed) が付く');
+  ok(t1c.status === 'not_started' && !t1c.cancellation_requested_at, '🚨再取込で引き継げなかった行のタスクにも何もしない (消えないし「取消の確認」も付かない)');
+  ok(destOf(d1cId).cancelled_at && destOf(d1cId).cancel_reason === 'planned_changed', '入荷側の台帳だけ取消 (planned_changed) になる');
   // ⭐再取込で行ごと消えた確認済み行 → **行き先もタスクもそのまま残す** (中原さん 2026-09-09)。
   //   CSV は「受付済」で絞っているので、明細が消える = 倉庫で検品されて次のステータスへ進んだ。
   //   荷物は届いていて在庫化はこれから行うので、前日に決めた行き先・いろはのカードを消してはいけない
