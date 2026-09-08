@@ -1237,8 +1237,8 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
 
   // 取消: ⭐どんな状態でも自動では消さない。「取消の確認」を付けて残し、職員が 続ける/取り消す を決める (中原さん 2026-09-08)
   const tB = TD.getTaskByPageId(pM2.id);   // 作業中・作業時間あり
-  const cB = TD.requestCancellation({ destinationId: 9002, source: 'inbound_reversal' });
-  ok(cB.action === 'review' && cB.task.cancellation_requested_at && TD.listTasksNeedingReview().some(t => t.id === tB.id), '着手済み (作業時間あり) の取消は要確認');
+  const cB = TD.requestCancellation({ destinationId: 9002, source: 'inbound_reversal', reason: 'reopen' });
+  ok(cB.action === 'review' && cB.task.cancellation_requested_at && cB.task.cancellation_reason === 'reopen' && TD.listTasksNeedingReview().some(t => t.id === tB.id), '着手済み (作業時間あり) の取消は要確認 (理由つき)');
   ok(TD.resolveCancellation({ taskId: tB.id, decision: 'cancel', expectVersion: cB.task.version, isStaff: false }).error === 'staff_required', '取消の判断は職員のみ');
   const cont = TD.resolveCancellation({ taskId: tB.id, decision: 'continue', expectVersion: cB.task.version, isStaff: true, actor: 'たにがわ' });
   ok(cont.ok && cont.task.cancellation_requested_at === null && cont.task.cancellation_reason === null && cont.task.cancellation_source === null && cont.task.status === 'in_progress',
@@ -3866,8 +3866,9 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '職員の判断は /api/cancellation に version つきで送る (他の端末の変更と競合しない)');
   // ⭐同じ入荷の新旧カードを互いに出す (取消後の確認し直しで二重作業にならない — Codex R1)
   ok(/function relatedHtml\(c\)/.test(html) && /同じ入荷のカードが他にあります/.test(html) && /二重に作業しないでください/.test(html)
-    && /🔁 同じ入荷のカードが他に ' \+ c\.related\.length \+ ' 枚/.test(html) && /この入荷は新しいカード ' \+ newer\.map\(relCardTxt\)/.test(html),
-    '新しい側には「同じ入荷のカードが他にある」、旧側 (取消の枠) には「新しいカードで確認し直されている」を出す');
+    && /🔁 同じ入荷のカードが他に ' \+ c\.related\.length \+ ' 枚/.test(html) && /この入荷は新しいカード ' \+ newerOk\.map\(relCardTxt\)/.test(html)
+    && /const newerOk = rel\.filter\(\(r\) => r\.newer && !r\.cancellation_requested_at\);/.test(html) && /確認待ちの相手へは作業を移さないでください/.test(html) && /rel\.length \? '<span class="sub">二重に作業しないでください/.test(html),
+    '新しい側には「同じ入荷のカードが他にある」、旧側 (取消の枠) には関連カードを全部出す。「作業はそちらで」は新しくて確認待ちでない相手にだけ (確認待ちの相手へは誘導しない)');
   ok(/'cancellation_requested_at', 'cancellation', 'migration_review'/.test(html),
     '1 枚だけ差し替えるときも取消の理由を持ち越す (CARD_FIELDS)');
   // ⛔ 止まっている理由の札 (要件 §Y-2 = 案A、中原さん 2026-09-05)
@@ -7635,6 +7636,32 @@ console.log('\n[35] 人数だけの作業 (§AB-10 / §AB-11 の 7c)');
     '⭐日報の人数も行数ではなく人数で数える');
   const sw5 = fs.readFileSync(new URL('../apps/iroha-work/views/sw.js', import.meta.url), 'utf8');
   ok(new RegExp(`const CACHE = '${SW_CACHE}'`).test(sw5), '画面キャッシュの版を上げる');
+}
+
+console.log('\n[関連カード] 同じ入荷の新旧は行き先の生成順で決める・閉じた相手は出ない・自分は入らない (Codex R2)');
+{
+  const TDr = await import('../apps/iroha-work/tasks-db.js');
+  const ins = db.prepare(`INSERT OR REPLACE INTO f_inbound_check_destinations (id, batch_id, line_key, ar_no, product_id, product_name, planned_qty, destination, decided_from, worker, decided_at, work_date, code_key, actual_qty, notion_page_id)
+    VALUES (?, 1, 'REL|1|1', 'AR-REL', 'REL', 'REL', 1, 'iroha', 'chosen', 'test', ?, '2026-09-08', 'rel', 1, ?)`);
+  ins.run(97001, '2026-09-08T00:00:00Z', 'rel-p1');   // 古い行き先
+  ins.run(97002, '2026-09-08T01:00:00Z', 'rel-p2');   // 新しい行き先
+  ins.run(97003, '2026-09-08T02:00:00Z', 'rel-p3');   // いちばん新しいが、閉じるカード
+  // ⭐カードの id は行き先の新旧と逆にする (重複カードの統合で、新しい行き先が古いカードに付いた形)
+  const tNewDest = TDr.upsertTaskFromImport({ notion_page_id: 'rel-p2', status: 'not_started', destination_id: 97002, product_code: 'REL', product_name: '新しい行き先' }, { batchId: 'rel' }).id;
+  const tOldDest = TDr.upsertTaskFromImport({ notion_page_id: 'rel-p1', status: 'not_started', destination_id: 97001, product_code: 'REL', product_name: '古い行き先' }, { batchId: 'rel' }).id;
+  const tClosed = TDr.upsertTaskFromImport({ notion_page_id: 'rel-p3', status: 'closed', close_reason: 'cancelled', closed_at: '2026-09-08T03:00:00Z', destination_id: 97003, product_code: 'REL', product_name: '閉じた' }, { batchId: 'rel' }).id;
+  ok(tNewDest < tOldDest, '(前提) 新しい行き先のカードのほうが id が小さい');
+  const rel = TDr.relatedByInboundLine(db);
+  ok(rel.get(tOldDest)?.length === 1 && rel.get(tOldDest)[0].id === tNewDest && rel.get(tOldDest)[0].newer === true,
+    '⭐新旧は行き先の生成順で決める (カードの id が小さくても、行き先が新しければ「新しい側」)');
+  ok(rel.get(tNewDest)?.length === 1 && rel.get(tNewDest)[0].id === tOldDest && rel.get(tNewDest)[0].newer === false, '古い側から見ても対称');
+  ok(!rel.has(tClosed) && !rel.get(tOldDest).some((r) => r.id === tClosed), '閉じたカードは関連に出ない (自分も相手も)');
+  ok(!rel.get(tOldDest).some((r) => r.id === tOldDest), '自分自身は入らない');
+  // source だけ変わっても書き直す (画面の出どころが古いままにならない)
+  const c1 = TDr.requestCancellation({ destinationId: 97001, source: 'inbound_reversal', reason: 'reopen' });
+  const c2 = TDr.requestCancellation({ destinationId: 97001, source: 'inbound_import', reason: 'reopen' });
+  ok(c1.action === 'review' && !c1.already && c2.action === 'review' && !c2.already && c2.task.cancellation_source === 'inbound_import',
+    '同じ理由でも出どころが変われば書き直す');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

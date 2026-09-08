@@ -1066,23 +1066,26 @@ const hasTableNamed = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WH
  * 取消後に入荷側で確認し直すと、新しい行き先 = 新しいカードができ、旧カードは「取消の確認」のまま残る。
  * そのままだと同じ現物の作業指示が 2 枚になる (Codex R1) ので、両方の画面に相手を出して職員が片づける。
  * 自動で統合・取消はしない (作業実績を守る・カードは黙って消さない)。
+ * ⭐新旧は**行き先の生成順** (decided_at → 行き先 id) で決める。カードの id で見ると、重複カードの統合で
+ *   新しい行き先が古いカードに付いたとき逆転し、「作業はそちらで」の誘導が逆を向く (Codex R2)。
  * @returns {Map<number, Array<{id, status, cancellation_requested_at, newer:boolean}>>} task id → 相手
  */
 export function relatedByInboundLine(db = getDB()) {
   const out = new Map();
   if (!hasTableNamed(db, 'f_inbound_check_destinations')) return out;
-  const rows = db.prepare(`SELECT t.id, t.status, t.cancellation_requested_at, d.line_key
+  const rows = db.prepare(`SELECT t.id, t.status, t.cancellation_requested_at, d.line_key, d.id AS dest_id, d.decided_at
     FROM f_iroha_tasks t JOIN f_inbound_check_destinations d ON d.id = t.destination_id
     WHERE t.status <> 'closed' AND d.line_key IN (
       SELECT d2.line_key FROM f_iroha_tasks t2 JOIN f_inbound_check_destinations d2 ON d2.id = t2.destination_id
       WHERE t2.status <> 'closed' GROUP BY d2.line_key HAVING COUNT(*) > 1)
-    ORDER BY t.id`).all();
+    ORDER BY d.decided_at, d.id`).all();
   const byLine = new Map();
   for (const r of rows) { if (!byLine.has(r.line_key)) byLine.set(r.line_key, []); byLine.get(r.line_key).push(r); }
+  const isNewer = (o, me) => o.decided_at > me.decided_at || (o.decided_at === me.decided_at && o.dest_id > me.dest_id);
   for (const group of byLine.values()) {
     for (const me of group) {
       out.set(me.id, group.filter((o) => o.id !== me.id)
-        .map((o) => ({ id: o.id, status: o.status, cancellation_requested_at: o.cancellation_requested_at, newer: o.id > me.id })));
+        .map((o) => ({ id: o.id, status: o.status, cancellation_requested_at: o.cancellation_requested_at, newer: isNewer(o, me) })));
     }
   }
   return out;
