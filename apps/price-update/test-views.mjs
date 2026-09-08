@@ -9,16 +9,22 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import ejs from 'ejs';
-import { toJst, TO_JST_CLIENT_SRC } from './format.js';
+import { toJst, TO_JST_CLIENT_SRC, jsonForScript } from './format.js';
+import { MALL_LABELS } from './mall-capabilities.js';
+import { NO_SENDABLE_MESSAGES } from './record-guard.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 // 画面が使うヘルパー。router.js が render のたびに渡しているものと同じ。
 // ここで一括して足し、テスト側の呼び出しごとに書かなくて済むようにする。
 // ★これで足すので「router が渡し忘れた」事故はテンプレのテストでは出ない → 末尾で別に見る
-const VIEW_HELPERS = { toJst, toJstClientSrc: TO_JST_CLIENT_SRC };
+const VIEW_HELPERS = {
+  toJst, toJstClientSrc: TO_JST_CLIENT_SRC, mallLabels: MALL_LABELS,
+  mallLabelsJson: jsonForScript(MALL_LABELS), noSendableMessagesJson: jsonForScript(NO_SENDABLE_MESSAGES),
+};
 const _ejsRender = ejs.render.bind(ejs);
 ejs.render = (tpl, data, opts) => _ejsRender(tpl, { ...VIEW_HELPERS, ...data }, opts);
 let failed = 0;
@@ -26,6 +32,21 @@ const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); i
 
 const OPEN_TAG = '<' + 'script';
 const CLOSE_TAG = '<' + '/script' + '>';
+
+/**
+ * ★描画できても、画面の JS が構文エラーだとボタンが1つも動かない (画面は出るので気づきにくい)。
+ *   2026-09-07: 確認ダイアログの文言に生の改行が入り、記録ボタンごと死ぬ寸前だった。
+ */
+function checkInlineJs(html, name) {
+  const scripts = [...html.matchAll(new RegExp(OPEN_TAG + '>([^]*?)' + CLOSE_TAG, 'g'))].map((m) => m[1]);
+  let bad = null;
+  scripts.forEach((src, i) => {
+    if (bad) return;
+    try { new vm.Script(src, { filename: `${name}#script${i}` }); }
+    catch (e) { bad = `script${i}: ${e.message}`; }
+  });
+  ok(bad === null, `${name}: 画面の JS が構文として通る (${scripts.length} 本)${bad ? ' — ' + bad : ''}`);
+}
 
 function checkTagBalance(html, name) {
   const opens = (html.match(new RegExp(OPEN_TAG, 'gi')) || []).length;
@@ -80,6 +101,7 @@ for (const [name, data] of cases) {
   }
   checkTagBalance(html, name);
   ok(!html.includes('<%'), `${name}: 未処理の EJS タグが残っていない`);
+  checkInlineJs(html, name);
 }
 
 // テンプレート原文にも「JS の中に終了タグ」が無いこと (コメント内でも HTML パーサは閉じる)
@@ -265,6 +287,61 @@ console.log('\n── router が画面へヘルパーを渡している ──')
   ok(renders.length === 2, `router の画面 render は 2 箇所 (実際 ${renders.length})`);
   ok(renders.every((r) => /\btoJst\b/.test(r.slice(0, 400))), '★どの画面にも toJst を渡している');
   ok(router.includes('toJstClientSrc'), 'run.ejs にブラウザ用のソースも渡している');
+  // ★モール名も locals で渡す。渡し忘れると画面が 500 になる (上の shim では出ない)
+  ok(renders.every((r) => /\bmallLabels\b/.test(r.slice(0, 400))), '★どの画面にも mallLabels を渡している');
+  ok(renders.every((r) => /mallLabelsJson/.test(r.slice(0, 400))), '★画面の JS 用は script 安全な形で渡している');
+  ok(router.includes('noSendableMessagesJson'), '確認の文言もサーバから渡している (画面に写さない)');
+  ok(router.includes("from './mall-capabilities.js'"), 'router がモール名の正本を読み込んでいる');
+}
+
+console.log('\n── モール名を画面に写さない (LINEギフトが英字で出ていた) ──');
+{
+  for (const name of ['index.ejs', 'run.ejs']) {
+    const src = fs.readFileSync(path.join(HERE, 'views', name), 'utf8');
+    ok(!/rakuten:\s*'楽天'/.test(src), `${name}: モール名の表をテンプレートに写していない`);
+    ok(/mallLabels/.test(src), `${name}: サーバから渡されたモール名を使っている`);
+    // ★inline script へ生の JSON.stringify を埋めない (値に script 終了タグが入ると抜けられる)
+    ok(!/JSON\.stringify\(mallLabels\)/.test(src), `${name}: 画面の JS へ生の JSON を埋めていない`);
+  }
+  // 実物: LINEギフトの行が日本語で出る (2026-09-07 は生の linegift が出ていた)
+  const file = path.join(HERE, 'views', 'run.ejs');
+  const html = ejs.render(fs.readFileSync(file, 'utf8'), {
+    title: '履歴', displayName: 'テスト', isAdmin: false,
+    run: {
+      run_id: 'pur-lg', created_at: '2026-09-07T02:53:07.000Z', created_by: 't@example.com',
+      kind: 'normal', note: null, neCodes: ['lightbluetb-100'], limits: {},
+      operations: [{
+        operation_id: 'puo-1', mall: 'linegift', ne_code: 'lightbluetb-100', row_kind: 'single',
+        product_name: 'テスト商品', listing_code: 'lightbluetb-100', sku_code: null, confidence: 'rule',
+        price_source: null, expected_current_price: null, new_price: null,
+        initial_state: 'manual_required', state: 'manual_done', guard_json: null, product_url: null,
+      }],
+      events: [],
+    },
+  }, { filename: file });
+  ok(html.includes('LINEギフト'), '★LINEギフトの行が日本語で出る');
+  ok(!/>linegift</.test(html), '生の linegift が表に出ていない');
+}
+
+console.log('\n── 送れる行が0のときに「なぜ」を出す ──');
+{
+  const run = fs.readFileSync(path.join(HERE, 'views', 'run.ejs'), 'utf8');
+  ok(/noTargetReason/.test(run), '★履歴画面がサーバの理由を出している');
+  // ★実行済み (claim あり) の履歴でも内訳を出す。claim で return すると
+  //   「結果が不明」「失敗」の注意が誰にも見えない (Codex R2 高)
+  const claimBlock = run.slice(run.indexOf('if (info.claim)'), run.indexOf('if (!info.targets)'));
+  ok(/noTargetReason/.test(claimBlock), '★実行済みの履歴でも理由 (内訳) を出す');
+  const idx = fs.readFileSync(path.join(HERE, 'views', 'index.ejs'), 'utf8');
+  ok(/noSendable/.test(idx) && /confirm\(/.test(idx), '★記録の前に「送れる行がありません」を確認する');
+  ok(/allowNoSendable/.test(idx), '確認したことをサーバへ伝えている (画面だけの判断にしない)');
+  ok(/all_blocked/.test(idx), '★⛔ の行だけを選んだ場合も確認する');
+  ok(/sum-alert/.test(idx), '記録ボタンのそばにも警告を出している');
+  const router2 = fs.readFileSync(path.join(HERE, 'router.js'), 'utf8');
+  ok(/allowNoSendable !== true/.test(router2), '★サーバ側でも同じ関所がある (API 直叩きで抜けられない)');
+  ok(/noTargetReason:/.test(router2), 'executable が理由を返している');
+  // ★サーバに止められた時に聞き直せること。道が無いと押しても同じ 400 が返るだけで詰む
+  ok(/noSendableReasonOf/.test(router2) && /reason: e\.reason/.test(router2), 'サーバが断り方の印を返している');
+  ok(/NO_SENDABLE_MESSAGES\[e\.reason\]/.test(idx), '★画面がサーバの印を見て聞き直す (文言で突き合わせない)');
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);

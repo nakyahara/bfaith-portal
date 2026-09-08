@@ -101,8 +101,10 @@
     blocked: 'ガードで停止', skipped: '送っていない',
   };
   var CONF_LABEL = { confirmed: '確定', rule: '規則推定', sales: '実績のみ', unresolved: '未解決' };
-  // ★モール名は画面のどこでも日本語で揃える (表だけ英語のままだと別物に見える)
-  var MALL_LABEL = { rakuten: '楽天', yahoo: 'Yahoo', amazon: 'Amazon', aupay: 'au PAY', qoo10: 'Qoo10' };
+  // ★モール名は画面のどこでも日本語で揃える (表だけ英語のままだと別物に見える)。
+  //   正本は mall-capabilities.js。ここに写すとモールを足した時に直し忘れる
+  //   (2026-09-07: LINEギフトの行が生の `linegift` のまま出ていた)
+  var MALL_LABEL = mallLabels;
   // ★href に入れてよいのは http(s) だけ (javascript: を踏ませない)
   var safeUrl = function (u) {
     var v = String(u == null ? '' : u).trim();
@@ -341,7 +343,7 @@
   });
 
   // ── 実行 ─────────────────────────────────────────────
-  const MALL_LABEL = { rakuten: '楽天', yahoo: 'Yahoo', amazon: 'Amazon', aupay: 'au PAY', qoo10: 'Qoo10' };
+  const MALL_LABEL = <%- mallLabelsJson %>;   // 正本 = mall-capabilities.js (script 安全な形にして渡される)
 
   async function loadExecutable() {
     let info;
@@ -363,15 +365,21 @@
     if (info.claim) {
       // ★claim は「実行を始めた」印であって「終わった」印ではない。
       //   途中で止まった run もここに入るので、完了だと言い切らない
+      // ★実行済みの履歴でも、行がどうなったかの内訳 (noTargetReason) を出す。
+      //   claim で return してしまうと、結果不明・失敗の注意が誰にも見えない (Codex R2 高)
       $('exec-status').innerHTML = 'この履歴は <b>' + esc(toJst(info.claim.claimed_at, true))
         + '</b> に <b>' + esc(info.claim.claimed_by) + '</b> が実行を開始しています。'
         + '同じ内容をもう一度送ることはしません。'
         + '<b>まだ途中の場合もあります</b> — 上の内訳と下の行で1行ずつ状態を確認してください'
-        + ' (「送信中」のまま残っている行は、モールの画面で実際の価格を確かめてください)。';
+        + ' (「送信中」のまま残っている行は、モールの画面で実際の価格を確かめてください)。'
+        + (info.noTargetReason ? '<div style="margin-top:6px;">' + esc(info.noTargetReason) + '</div>' : '');
       return;
     }
     if (!info.targets) {
-      $('exec-status').textContent = '送る行がありません (記録時のガードを通った行だけが対象です)。';
+      // ★理由まで出す。「送る行がありません」だけだと、送られたのか送られていないのかが分からない
+      //   (2026-09-07: LINEギフト1行だけの履歴で、現場は価格を変えたつもりになっていた)
+      $('exec-status').textContent = info.noTargetReason
+        || '送る行がありません (記録時のガードを通った行だけが対象です)。';
       return;
     }
     if (!info.canExecute) {
