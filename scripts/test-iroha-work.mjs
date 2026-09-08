@@ -27,7 +27,7 @@ if (!process.env.DATA_DIR) {
 }
 
 // ⭐画面のキャッシュの版。画面を直した PR ではここだけ直す（以前は同じ文字列を 3 か所に書いていて、毎回 3 か所直していた）
-const SW_CACHE = 'iroha-work-shell-v19';
+const SW_CACHE = 'iroha-work-shell-v20';
 
 let pass = 0, fail = 0;
 function ok(cond, label) {
@@ -8543,8 +8543,8 @@ console.log('\n[つかいかた] 📖 マニュアルと実装が食い違って
   // ⭐今日足した操作が、マニュアルに書いてある
   // ⭐**その説明が書いてある節に絞って**見る (別の節にたまたま同じ言葉があると素通りするため)
   const sec = (id) => (secBlocks.find((x) => x.id === id) || { body: "" }).body;
-  const s13 = sec("s13");   // 外部にあずける
-  const s14 = sec("s14");   // 分かれたカード
+  const s13 = sec("s14");   // 外部にあずける (🚚 入荷予定 を s10 に入れたので 1 つ後ろへ)
+  const s14 = sec("s15");   // 分かれたカード
   const split14 = (s14.match(/期限が違う物が混ざっていたら[\s\S]*?<\/ol>/) || [""])[0];
   ok(split14.length > 100, "分ける手順を切り出せた");
   for (const cond of ["棚に入れた", "箱ラベルを刷った", "できた数を数えた", "外にあずけている"]) {
@@ -8585,7 +8585,7 @@ console.log('\n[つかいかた] 📖 マニュアルと実装が食い違って
     ok(!/やり直/.test(r5.message), "⭐返ってくる案内に「やり直せば直せる」と書かない");
   }
   ok(/職員に相談してください/.test(s13), "直せないときの出口 (職員に相談) を書く");
-  // ラベルの注意は §14 に
+  // ラベルの注意は §15 に
   ok(/ラベルを出す機械 \(QL-800\)/.test(s14), "同じラベルを出す前に、機械と出てきたラベルを見てもらう");
   ok(/箱とラベルの期限が合わなくなります/.test(s14), "違うぶんを選ぶと期限が合わなくなることを書く");
   // 利用者も使う「どのぶんの作業か」は §3 (作業をはじめる) に
@@ -8595,7 +8595,7 @@ console.log('\n[つかいかた] 📖 マニュアルと実装が食い違って
 
   // ⭐職員だけの節は staff の印が付いている (利用者の画面では隠れる)
   const staffSecs = [...man.matchAll(/<section id="(s\d+)"([^>]*)>/g)].filter((m) => /class="staff"/.test(m[2])).map((m) => m[1]);
-  ok(staffSecs.includes("s13") && staffSecs.includes("s14"),
+  ok(staffSecs.includes("s14") && staffSecs.includes("s15"),
     "⭐外部にあずける・分かれたカードの節は職員向けの印が付いている");
 }
 
