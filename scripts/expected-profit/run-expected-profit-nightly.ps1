@@ -13,7 +13,8 @@
 #   - Ping ownership is decided by the exit code (see nightly.js header):
 #       0 = ok, reported      5 = ok but COULD NOT report  -> the runner sends the ok ping
 #       3 = failed, reported  1 = failed and not reported  -> the runner sends the fail ping
-#     The runner also sends 'partial' when it had to stop the child at the deadline.
+#     If the runner has to stop the child at the deadline it sends 'fail' (this job has no
+#     partial_max_days in the registry, and a stopped night leaves the screen on yesterday's numbers).
 #     jobs-monitor keeps only the LAST ping (store.js recordPing is an upsert), so a second ping from here
 #     would overwrite nightly's specific reason ("could not publish: ...") with a generic one.
 #   - Single instance: the scheduler is set to IgnoreNew, but a manual run can still overlap a scheduled
@@ -138,8 +139,12 @@ try {
     Log ('node exit code: ' + $code)
 
     if ($killed) {
-      # the generation may well be built; the next night continues from there
-      Send-Ping 'partial' ('stopped at ' + $StopAtHhmm + ' before the task limit (see ' + $OutLog + ')')
+      # 'fail', not 'partial': jobs-monitor only treats partial as "it ran" for jobs that declare
+      # partial_max_days (evaluate.js), and this job does not. More importantly, a stopped night means
+      # the screen still shows the previous generation - that is a failure to report, not a half-success.
+      # The note says it was stopped on purpose; the generation may already be built and can be published
+      # next night (Codex 4th round).
+      Send-Ping 'fail' ('stopped at ' + $StopAtHhmm + ' before the task limit - numbers were not updated (see ' + $OutLog + ')')
     } elseif ($code -eq 0) {
       # nightly.js reported the success itself
     } elseif ($code -eq 5) {
