@@ -174,8 +174,33 @@ console.log('\n[5] 商品コードの揺れ (全角 / 大文字小文字違い�
   eq(JSON.stringify(listInboundPlan().rows), JSON.stringify(r5.rows), '⭐何度呼んでも同じ一覧になる');
 }
 
-// ─── ⑥ 画面・API の配線 ───
-console.log('\n[6] 画面と API の配線');
+// ─── ⑥ 見出しの仕入先名の引き方 (Codex R2 P2) ───
+//   po_suppliers は発注管理の正規形 ('1') で持つが、'0001' と '1' が別の会社として
+//   両方登録されている場合がある。いきなり正規形にすると、絞り込んでいるのと違う会社の名前が出る
+console.log('\n[6] 見出しの仕入先名');
+{
+  const insSup = mirror.prepare('INSERT OR REPLACE INTO po_suppliers (supplier_code, name) VALUES (?, ?)');
+  const del = (c) => mirror.prepare('DELETE FROM po_suppliers WHERE supplier_code = ?').run(c);
+
+  insSup.run('0001', 'ゼロ埋めで登録された別の会社様');
+  eq(listInboundPlan().supplier.name, 'ゼロ埋めで登録された別の会社様',
+    '⭐生コード (0001) の完全一致を、正規形 (1) より先に見る');
+  del('0001');
+  eq(listInboundPlan().supplier.name, 'アメージングクラフト様', '完全一致が無ければ正規形で引く');
+
+  insSup.run('01', 'まぎらわしい会社様');   // 正規形はどちらも '1' — どちらか決められない
+  eq(listInboundPlan().supplier.name, null, '⭐同じ正規形に別名が 2 つあれば名前を出さない (取り違えない)');
+  del('01');
+
+  // 売れ筋共有の表示名は mirror_products と同じ体系なので、こちらが最優先
+  mirror.prepare(`INSERT OR REPLACE INTO supplier_share_master (仕入先コード, 表示名, created_at, updated_at)
+    VALUES (?, ?, '2026-09-08T00:00:00Z', '2026-09-08T00:00:00Z')`).run('0001', '共有の表示名様');
+  eq(listInboundPlan().supplier.name, '共有の表示名様', '売れ筋共有の表示名があればそれを使う');
+  mirror.prepare('DELETE FROM supplier_share_master WHERE 仕入先コード = ?').run('0001');
+}
+
+// ─── ⑦ 画面・API の配線 ───
+console.log('\n[7] 画面と API の配線');
 {
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
   const router = fs.readFileSync(new URL('../apps/iroha-work/router.js', import.meta.url), 'utf8');

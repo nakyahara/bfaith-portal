@@ -154,18 +154,36 @@ function irohaInfoMap(db, keys) {
   return map;
 }
 
-/** 仕入先名 (見出し用)。mirror_products と同じ体系の supplier_share_master → 発注管理の正規形 の順に見る */
+/**
+ * 仕入先名 (見出し用)。
+ *
+ * 🚨 コードの持ち方が 2 系統ある (inbound-check/db.js supplierNameMap と同じ事情):
+ *      supplier_share_master.仕入先コード … mirror_products と同じ体系 = NE の生コード ('0001')
+ *      po_suppliers.supplier_code         … 発注管理の正規形 ('1')
+ *    発注管理側は **生コードの完全一致を先に**見る。いきなり正規形にすると、'0001' と '1' が
+ *    別の会社として両方登録されているときに、絞り込んでいるのと違う会社の名前を見出しに出す (Codex R2 P2)。
+ *    同じ正規形に別名が 2 つ以上ぶら下がっていたら、どちらか分からないので**名前を出さない**。
+ */
 function supplierNameOf(db, code) {
   const raw = trimS(code);
   if (!raw) return null;
+  // ① 仕入先向け売れ筋共有の表示名 (mirror_products と同じ体系なので、ここが最も確か)
   if (tableExists(db, 'supplier_share_master')) {
     const r = db.prepare('SELECT 表示名 AS name FROM supplier_share_master WHERE trim(仕入先コード) = ?').get(raw);
     if (r && trimS(r.name)) return trimS(r.name);
   }
+  // ② 発注管理の仕入先マスタ (数十件なので読み切って JS で突き合わせる — 正規化は SQL では書けない)
   if (tableExists(db, 'po_suppliers')) {
-    const n = normSupplierSafe(raw);
-    const r = n ? db.prepare('SELECT name FROM po_suppliers WHERE supplier_code = ?').get(n) : null;
-    if (r && trimS(r.name)) return trimS(r.name);
+    const rows = db.prepare('SELECT supplier_code, name FROM po_suppliers').all()
+      .map((r) => ({ code: trimS(r.supplier_code), name: trimS(r.name) }))
+      .filter((r) => r.code && r.name);
+    const exact = rows.find((r) => r.code === raw);
+    if (exact) return exact.name;
+    const key = normSupplierSafe(raw);
+    if (key) {
+      const names = new Set(rows.filter((r) => normSupplierSafe(r.code) === key).map((r) => r.name));
+      if (names.size === 1) return [...names][0];   // 2 つ以上あれば決められないので出さない
+    }
   }
   return null;
 }
