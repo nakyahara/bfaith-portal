@@ -113,13 +113,54 @@ export async function publishToRender(db, generationId, deps) {
 // 🚨 timeout を必ず付ける。無いと転送が固まったまま期限を越える (Codex R4-9)
 const HTTP_TIMEOUT_MS = 120_000;
 
+/**
+ * Render の受け口の**オリジン** (https://host)。
+ *
+ * 🚨 `RENDER_MIRROR_URL` は**末尾にパスが付いている** (実測: `https://<host>/apps/mirror`)。
+ *    そのまま連結すると `/apps/mirror/apps/expected-profit/sync/...` になり、
+ *    404 の HTML が返って「JSON じゃない」で落ちる。
+ *    2026-08-08 に select-set が同じ罠を踏んでいる (apps/select-set/master-sync.js)。
+ *    → **URL として解決して origin だけ**を使う。
+ *
+ * 🚨 同じ Render を指すのに新しい env を増やさない。
+ *    初回の公開が `RENDER_PORTAL_URL not configured` で止まった (2026-09-08)。
+ *    RENDER_PORTAL_URL は移行用に優先だけする。
+ */
+export function syncBaseUrl(env = process.env) {
+  const raw = String(env.RENDER_PORTAL_URL || env.RENDER_MIRROR_URL || '').trim();
+  if (!raw) return '';
+  let u;
+  try { u = new URL(raw); } catch { return ''; }
+  // 🚨 ここには強い権限を持つ MIRROR_SYNC_KEY を載せる。設定ミスで平文や
+  //    見知らぬホストへ送らない (Codex R15。select-set が同じ守りを入れている)
+  if (u.protocol !== 'https:') return '';
+  // RENDER_PORTAL_URL で上書きするときも、既存の RENDER_MIRROR_URL と同じホストに限る
+  const mirror = String(env.RENDER_MIRROR_URL || '').trim();
+  if (mirror) {
+    try {
+      const allowed = new URL(mirror).host.toLowerCase();
+      if (u.host.toLowerCase() !== allowed) return '';
+    } catch { /* 比べられないときは下の origin をそのまま使う */ }
+  }
+  return u.origin;
+}
+
+/**
+ * 応答を JSON にする。
+ * 🚨 HTTP エラーのまま `.json()` すると、404/502 の HTML で
+ *    「JSON じゃない」としか分からない (Codex R15)。状態を先に見る
+ */
+async function asJson(res, what) {
+  if (!res.ok) {
+    const head = (await res.text().catch(() => '')).slice(0, 120).replace(/\s+/g, ' ');
+    throw new Error(`${what} が HTTP ${res.status} (${head})`);
+  }
+  return res.json();
+}
+
 export function httpDeps(deadline = null) {
-  // 🚨 Render の URL は **既存の `RENDER_MIRROR_URL`** を使う。
-  //    同じ Render アプリを指すのに新しい env を増やすと、片方だけ設定されて
-  //    転送が黙って止まる (実際に初回の公開がこれで失敗した 2026-09-08)。
-  //    RENDER_PORTAL_URL が設定されていればそちらを優先する (移行用)
-  const base = (process.env.RENDER_PORTAL_URL || process.env.RENDER_MIRROR_URL || '').replace(/\/+$/, '');
   const key = process.env.MIRROR_SYNC_KEY;
+  const base = syncBaseUrl();
   if (!base) throw new Error('RENDER_MIRROR_URL not configured');
   if (!key) throw new Error('MIRROR_SYNC_KEY not configured');
   const headers = { 'Content-Type': 'application/json', 'x-sync-key': key };
@@ -131,12 +172,12 @@ export function httpDeps(deadline = null) {
   };
   return {
     deadline,
-    postChunk: async (id, body) => (await fetch(url(`/generations/${encodeURIComponent(id)}/chunks`),
-      { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() })).json(),
-    postPublish: async (body) => (await fetch(url('/publish'),
-      { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() })).json(),
+    postChunk: async (id, body) => asJson(await fetch(url(`/generations/${encodeURIComponent(id)}/chunks`),
+      { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() }), 'チャンクの送信'),
+    postPublish: async (body) => asJson(await fetch(url('/publish'),
+      { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() }), '公開の要求'),
     getPublished: async () => {
-      const r = await (await fetch(url('/published'), { headers, signal: withTimeout(30_000) })).json();
+      const r = await asJson(await fetch(url('/published'), { headers, signal: withTimeout(30_000) }), '公開中の世代の確認');
       return r?.published || null;
     },
   };

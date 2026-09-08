@@ -12,7 +12,7 @@ import os from 'os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-pub-'));
 
-const { httpDeps } = await import('./publish.js');
+const { httpDeps, syncBaseUrl } = await import('./publish.js');
 const { initExpectedProfitDB, getExpectedProfitDB, addColumnIfMissing, MIGRATED_COLUMNS,
   createExpectedProfitSchema } = await import('./db.js');
 const { receiveChunk, publishGeneration, getPublished, chunkChecksum, pruneGenerations, generationContentHash } = await import('./publish-api.js');
@@ -465,10 +465,39 @@ const withEnv = (vals, fn) => {
 const urlUsed = async () => {
   const real = globalThis.fetch;
   let seen = null;
-  globalThis.fetch = async (u) => { seen = String(u); return { json: async () => ({ ok: true }) }; };
+  globalThis.fetch = async (u) => { seen = String(u); return { ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '' }; };
   try { await httpDeps().postPublish({}); } finally { globalThis.fetch = real; }
   return seen;
 };
+
+t('[!] RENDER_MIRROR_URL は末尾にパスが付いている → origin だけを使う', () => {
+  // 🚨 実測 `https://<host>/apps/mirror`。そのまま連結すると
+  //    /apps/mirror/apps/expected-profit/sync/... になり 404 の HTML が返る。
+  //    2026-08-08 に select-set が同じ罠を踏んでいる
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'https://portal.test/apps/mirror' }), 'https://portal.test');
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'https://portal.test/apps/mirror/' }), 'https://portal.test');
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'https://portal.test' }), 'https://portal.test');
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'https://portal.test:8443/a/b' }), 'https://portal.test:8443');
+});
+
+t('URL として読めない値は空にする (変な所へ鍵を送らない)', () => {
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'ごみ' }), '');
+  assert.equal(syncBaseUrl({}), '');
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: '   ' }), '');
+});
+
+await ta('[!] 実際に叩く URL がパス付きの env でも正しくなる', async () => {
+  const saved = [process.env.RENDER_PORTAL_URL, process.env.RENDER_MIRROR_URL, process.env.MIRROR_SYNC_KEY];
+  let url = null;
+  try {
+    delete process.env.RENDER_PORTAL_URL;
+    process.env.RENDER_MIRROR_URL = 'https://portal.test/apps/mirror';
+    process.env.MIRROR_SYNC_KEY = 'k';
+    url = await urlUsed();
+  } finally { restoreEnv(saved); }
+  assert.equal(url, 'https://portal.test/apps/expected-profit/sync/publish',
+    `パスが二重になっている: ${url}`);
+});
 
 await ta('[!] RENDER_MIRROR_URL だけでも転送先を組み立てられる', async () => {
   // 🚨 同じ Render を指すのに新しい env を増やしたせいで、初回の公開が黙って止まった
@@ -477,7 +506,7 @@ await ta('[!] RENDER_MIRROR_URL だけでも転送先を組み立てられる', 
   const saved = [process.env.RENDER_PORTAL_URL, process.env.RENDER_MIRROR_URL, process.env.MIRROR_SYNC_KEY];
   try {
     delete process.env.RENDER_PORTAL_URL;
-    process.env.RENDER_MIRROR_URL = 'https://example.test/';
+    process.env.RENDER_MIRROR_URL = 'https://example.test/apps/mirror';
     process.env.MIRROR_SYNC_KEY = 'k';
     url = await urlUsed();
   } finally { restoreEnv(saved); }
@@ -485,16 +514,45 @@ await ta('[!] RENDER_MIRROR_URL だけでも転送先を組み立てられる', 
     '既存 env だけで組み立てられない = 転送が止まる');
 });
 
-await ta('[!] RENDER_PORTAL_URL があればそちらを叩く (移行用・優先順位そのものを見る)', async () => {
+await ta('[!] RENDER_PORTAL_URL があればそちらを叩く (移行用・同じホストに限る)', async () => {
   const saved = [process.env.RENDER_PORTAL_URL, process.env.RENDER_MIRROR_URL, process.env.MIRROR_SYNC_KEY];
   let url = null;
   try {
-    process.env.RENDER_PORTAL_URL = 'https://new.test';
-    process.env.RENDER_MIRROR_URL = 'https://old.test';
+    process.env.RENDER_PORTAL_URL = 'https://portal.test/ちがうパス';
+    process.env.RENDER_MIRROR_URL = 'https://portal.test/apps/mirror';
     process.env.MIRROR_SYNC_KEY = 'k';
     url = await urlUsed();
   } finally { restoreEnv(saved); }
-  assert.ok(url.startsWith('https://new.test/'), `優先順位が逆になっている: ${url}`);
+  assert.equal(url, 'https://portal.test/apps/expected-profit/sync/publish', `組み立てが違う: ${url}`);
+});
+
+t('[!] https でなければ使わない (強い鍵を平文で送らない)', () => {
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'http://portal.test/apps/mirror' }), '');
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'file:///tmp/x' }), '', 'origin が文字列 "null" になる');
+});
+
+t('[!] RENDER_PORTAL_URL で別ホストへ向け直せない (設定ミスで鍵を外に出さない)', () => {
+  assert.equal(syncBaseUrl({
+    RENDER_PORTAL_URL: 'https://攻撃者.test',
+    RENDER_MIRROR_URL: 'https://portal.test/apps/mirror',
+  }), '');
+  // 同じホストなら通る
+  assert.equal(syncBaseUrl({
+    RENDER_PORTAL_URL: 'https://portal.test/x',
+    RENDER_MIRROR_URL: 'https://portal.test/apps/mirror',
+  }), 'https://portal.test');
+});
+
+t('[!] HTTP エラーは「JSON じゃない」ではなく状態が分かる形で落ちる', async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: false, status: 404, text: async () => '<!DOCTYPE html><html>...' });
+  const saved = [process.env.RENDER_PORTAL_URL, process.env.RENDER_MIRROR_URL, process.env.MIRROR_SYNC_KEY];
+  try {
+    delete process.env.RENDER_PORTAL_URL;
+    process.env.RENDER_MIRROR_URL = 'https://portal.test/apps/mirror';
+    process.env.MIRROR_SYNC_KEY = 'k';
+    await assert.rejects(() => httpDeps().postPublish({}), /HTTP 404/);
+  } finally { globalThis.fetch = real; restoreEnv(saved); }
 });
 
 t('[!] どちらも無ければ、設定すべき env 名を挙げて止まる', () => {

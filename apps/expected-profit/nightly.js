@@ -56,17 +56,38 @@ export function feeTargetsFrom(rows, { sellerId, marketplaceId }) {
     }));
 }
 
+/**
+ * 監視への報告 URL を組み立てる。
+ *
+ * 🚨 受け口は **クエリの `status`** しか見ない (`apps/jobs-monitor/router.js`)。
+ *    body に入れて送ると省略扱いになり、**失敗も「成功」として記録される** (Codex R15)。
+ *    既存の `scripts/jobs-monitor/ping.ps1` と同じ形に揃える。
+ * 🚨 `JOBS_MONITOR_URL` も末尾にパスが付きうるので origin だけを使う。
+ */
+export function pingUrl(jobId, status, note, env = process.env) {
+  const raw = String(env.JOBS_MONITOR_URL || '').trim();
+  let u;
+  try { u = new URL(raw); } catch { return ''; }
+  // 🚨 Bearer トークンを載せるので https だけ。file:// なども自然に弾ける
+  if (u.protocol !== 'https:') return '';
+  const origin = u.origin;
+  const q = new URLSearchParams({ status: String(status || 'ok') });
+  if (note) q.set('note', String(note).slice(0, 200));
+  return `${origin}/apps/jobs-monitor/ping/${encodeURIComponent(jobId)}?${q}`;
+}
+
 async function ping(status, summary) {
-  const url = process.env.JOBS_MONITOR_URL;
   const token = process.env.JOBS_MONITOR_TOKEN;
+  const url = pingUrl(JOB_ID, status, summary);
   if (!url || !token) return;
   try {
-    await fetch(`${url.replace(/\/+$/, '')}/apps/jobs-monitor/ping/${JOB_ID}`, {
+    const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-      body: JSON.stringify({ status, summary }),
+      headers: { Authorization: `Bearer ${token}` },
       signal: AbortSignal.timeout(30_000),   // 🚨 ping で固まらせない
     });
+    // 🚨 応答も見る。400 で弾かれていても黙って成功したことにしない
+    if (!res.ok) console.warn(`[expected-profit] ping が受け付けられなかった: HTTP ${res.status}`);
   } catch (e) {
     console.warn('[expected-profit] ping 失敗:', e.message);
   }
