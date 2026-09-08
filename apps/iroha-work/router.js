@@ -2037,7 +2037,9 @@ function startSessionApp(req, res, worker, crew) {
   };
   // ⭐止まっている札が付いたカードは、画面で「解消した」と確かめてから clear_block: true で送り直す (案A)
   const r = startTaskSession({ taskId, worker, workers: crew, deviceLabel: deviceLabelOf(req), snapshotOf,
-    clearBlock: req.body?.clear_block === true, expectVersion: req.body?.expect_version ?? null });
+    clearBlock: req.body?.clear_block === true, expectVersion: req.body?.expect_version ?? null,
+    // ⭐どのまとまりの作業か (§AB-10)。画面が絞れたときだけ来る。来なければ NULL のまま
+    batchId: numOrNull(req.body?.batch_id) });
   if (!r.ok) {
     const http = r.error === 'bad_request' ? 400 : r.error === 'not_found' ? 404 : 409;
     return res.status(http).json({ ...r, task: r.task ? publicTask(r.task) : undefined, current: r.current ? publicTask(r.current) : undefined });

@@ -1295,7 +1295,7 @@ export function startSession({ pageId = null, taskId = null, productCode = null,
  * @param workers [{id, display_name}] 1件以上
  * @returns {ok, sessions:[{sessionId, workerId, workerName, startedAt, already}]} / {ok:false, error:'busy', busy:[…]}
  */
-export function startSessions({ pageId = null, taskId = null, productCode = null, title = null, workers, deviceLabel = null, masterSnapshot = undefined, guard = null }) {
+export function startSessions({ pageId = null, taskId = null, productCode = null, title = null, workers, deviceLabel = null, masterSnapshot = undefined, guard = null, batchId = null }) {
   const db = getDB();
   const now = utcNow();
   if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
@@ -1338,8 +1338,10 @@ export function startSessions({ pageId = null, taskId = null, productCode = null
     }
     const snapshot = startSnapshotJson(db, productCode, masterSnapshot);
     // ⭐どのまとまりの作業か (要件 §AB-10)。まとまりが 1 つなら自動で結びつく。
-    //   決められないときは NULL のまま — カードには残るので記録は失われない
-    const bp = taskId == null ? { value: null } : pickSessionBatch(db, Number(taskId), null);
+    //   2 つ以上あるときは画面が選んで batchId を送ってくる (絞れないまま始めさせない)。
+    //   それでも決められないときは NULL のまま — カードには残るので記録は失われない
+    const bp = taskId == null ? { value: null } : pickSessionBatch(db, Number(taskId), batchId);
+    if (bp.error) return bp;
     const ins = db.prepare(`INSERT INTO f_iroha_work_sessions
       (page_id, task_id, product_code, title_snapshot, worker_id, worker_name, batch_id, device_label, started_at, master_snapshot)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
