@@ -517,11 +517,12 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   ok(t3 && db.prepare('SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ?').get(t3.id).c === 1,
     '⭐巻き戻した行も、あらためて確定すればカードとまとまりが両方できる');
 
-  // やり直し (未着手・実績なし) → 自動で取消
+  // やり直し (未着手・実績なし) → ⭐カードは消さない。「取消の確認」が付いて残る (中原さん 2026-09-08)
   const s1 = lineState('AR9|1|1');
   ok(reopenLine({ batchId: b.id, lineKey: 'AR9|1|1', expectVersion: s1.version, expectQuantityVersion: s1.quantity_version, worker: '山田', clientOperationId: 'op-prb-ro1' }).ok, '前提: やり直し');
   const t1b = taskOf(d1.id);
-  ok(t1b.status === 'closed' && t1b.close_reason === 'cancelled' && t1b.cancellation_source === 'inbound_reversal', 'やり直すと未着手のタスクは自動で取消 (終了:取消)');
+  ok(t1b.status === 'not_started' && t1b.closed_at == null && t1b.cancellation_requested_at && t1b.cancellation_source === 'inbound_reversal' && t1b.cancellation_reason === 'reopen',
+    '⭐やり直しても未着手のタスクは消えない — 「取消の確認」(reopen) が付いて残る');
   // 着手後のやり直し → 自動取消せず要確認
   const w = IW.addIrohaWorker({ displayName: 'プラビー', workerType: 'member', actor: 'test' });
   const s3 = IW.startSession({ taskId: t3.id, worker: IW.getIrohaWorker(w.id) });
@@ -535,12 +536,22 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   const s1b = lineState('AR9|1|1');
   const f1c = finalizeLine({ batchId: b.id, lineKey: 'AR9|1|1', expectVersion: s1b.version, expectQuantityVersion: s1b.quantity_version, result: 'exact', mode: 'current', worker: '山田', decide: decideIroha });
   const d1cId = destIdOf('AR9|1|1');
-  ok(f1c.ok && d1cId && d1cId !== d1.id && taskOf(d1cId)?.status === 'not_started' && taskOf(d1.id).status === 'closed', '再確認すると新しいタスク (前のタスクは取消のまま)');
+  ok(f1c.ok && d1cId && d1cId !== d1.id && taskOf(d1cId)?.status === 'not_started' && taskOf(d1.id).cancellation_requested_at && taskOf(d1.id).status !== 'closed',
+    '再確認すると新しいタスク (前のタスクは確認待ちのまま残る — 職員が片づける)');
+  {
+    // ⭐同じ入荷明細から生まれた新旧カードは、互いに「関連カード」として見える (二重作業を防ぐ — Codex R1)
+    const rel = TD.relatedByInboundLine(db);
+    const oldId = taskOf(d1.id).id, newId = taskOf(d1cId).id;
+    ok(rel.get(newId)?.some((r) => r.id === oldId && r.cancellation_requested_at && !r.newer) && rel.get(oldId)?.some((r) => r.id === newId && r.newer),
+      '⭐新旧カードが互いを関連カードとして持つ (新しい側には「確認待ちの旧カード」、旧側には「新しいカード」)');
+    ok(!rel.has(taskOf(destIdOf('AR9|2|1'))?.id ?? -1), '関係の無い明細のカードには付かない');
+  }
   // 再取込で確認を引き継げない行 (予定数が変わった) → 行き先が取り消され、タスクも取消
   const imp2 = importCsv(makeCsv([row('AR9', 1, 'TASK-A', 7), row('AR9', 2, 'TASK-B', 3), row('AR9', 3, 'TASK-C', 2)]), { fileName: 'prb2.csv', generatedAt: '2027-01-01T01:00:00Z' });
   ok(imp2.ok, '前提: 予定数が変わった再取込');
   const t1c = taskOf(d1cId);
-  ok(t1c.status === 'closed' && t1c.close_reason === 'cancelled' && t1c.cancellation_source === 'inbound_import', '再取込で引き継げなかった行のタスクは取消 (inbound_import)');
+  ok(t1c.status === 'not_started' && t1c.cancellation_requested_at && t1c.cancellation_source === 'inbound_import' && t1c.cancellation_reason === 'planned_changed',
+    '再取込で引き継げなかった行のタスクは消えず「取消の確認」(planned_changed) が付く');
   // 再取込で行ごと消えた確認済み行 → 行き先を取消 (line_removed)・タスクも取消 (Codex PR-B R1 #1)
   const b2 = getActiveBatch();
   const f3b = finalizeLine({ batchId: b2.id, lineKey: 'AR9|3|1', expectVersion: lineState('AR9|3|1').version, expectQuantityVersion: lineState('AR9|3|1').quantity_version, result: 'exact', mode: 'current', worker: '鈴木', decide: decideIroha });
@@ -550,7 +561,7 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   ok(imp3.ok && /消えた明細の行き先 1件を取消/.test(db.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message), '前提: 行 3 が無い CSV を再取込 (ログに件数)');
   ok(destOf(d3bId).cancelled_at && destOf(d3bId).cancel_reason === 'line_removed', '消えた明細の行き先は取消 (line_removed)');
   const t3c = taskOf(d3bId);
-  ok(t3c.status === 'closed' && t3c.close_reason === 'cancelled' && t3c.cancellation_source === 'inbound_import', '消えた明細のタスクも取消');
+  ok(t3c.status === 'not_started' && t3c.cancellation_requested_at && t3c.cancellation_reason === 'line_removed', '消えた明細のタスクも消えず「取消の確認」(line_removed) が付く');
   ok(destOf(destIdOf('AR9|2|1')).cancelled_at == null, '残った行 (B-Faith 行き) はそのまま');
   // 既に取消済みの行き先が carry に残っていても「取消 N 件」に数えない (Codex PR-B R2 Low)
   const b3 = getActiveBatch();

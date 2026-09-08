@@ -20,7 +20,7 @@ import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateB
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
-import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask } from './tasks-db.js';
+import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask, cancellationOf, relatedByInboundLine } from './tasks-db.js';
 import { countsByTask, stockingOfTask, batchesByTask } from './batches.js';
 import { consignmentsOfTask, consignableByBatch } from './consign.js';
 
@@ -298,6 +298,8 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
   //   表示 (羅針盤・ワークセンターのカードは Y を見せる) だけでなく「出荷できる在庫」の計算にも使う (§AA)
   const stocks = stockByCode(codeKeys);
   const mirrorAt = mirrorCapturedAt();
+  // ⭐同じ入荷明細から生まれた新旧カード (取消後の確認し直し)。1 回で全カードぶん引く
+  const related = relatedByInboundLine(getDB());
   // 大きさ (嵩) = 配送方法。明日どれをやるかの並びに**だけ**使う (画面には出さない — §AA)
   const sizes = sizeMapByCode(codeKeys);
   // 入荷実績 (🌱「はじめての商品」の判定。§AA)
@@ -391,6 +393,8 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       version: r.version,
       migration_review: !!r.migration_review,
       cancellation_requested_at: r.cancellation_requested_at,
+      cancellation: cancellationOf(r),   // ⭐入荷側で取り消された理由 (カードは消えない。職員が決める)
+      related: related.get(r.id) || [],   // ⭐同じ入荷の他のカード (新旧の二重作業を防ぐ)
       title: r.product_name || '(名称なし)',
       product_code: r.product_code,
       url: r.notion_page_id ? `https://www.notion.so/${String(r.notion_page_id).replace(/-/g, '')}` : null,
