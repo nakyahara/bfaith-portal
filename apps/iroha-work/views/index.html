@@ -4166,9 +4166,25 @@ function historyCardHtml(c) {
  * (中原さん 2026-09-07「2 週間寝かせる理由がない」)。
  */
 const BSTATUS = { not_started: '未着手', in_progress: '作業中', ready_for_stocking: '棚入待ち', done: '棚入完了' };
+/**
+ * ⭐**まだ分かれていないカード**にも「期限が違うぶんを分ける」を出す (§AB-12)。
+ * まとまりの欄は 2 つ以上のときしか出ないので、ここが無いと**最初の 1 回を分ける入口が無い**
+ * (Codex #1273 R1 中1)。ふだんは職員モードのときだけ、小さく出す。
+ */
+function splitOnlyHtml(c) {
+  const bs = (c.batches || []).filter((b) => b.work_status !== 'cancelled');
+  if (bs.length !== 1) return '';
+  const b = bs[0];
+  if (!(b.work_status === 'not_started' || b.work_status === 'in_progress')) return '';
+  if (b.consigned_out || b.planned_qty == null || b.planned_qty <= 1) return '';
+  if (!isApp() || detailSrc === 'preview' || !isStaffUI() || !stateCan('task.consign')) return '';
+  return '<div class="dcard"><h3 class="sec">期限が違う物が混ざっていたら</h3>' +
+    '<p class="nlink">同じ商品でも期限の違う物が届くことがあります。分けると、箱ラベルの期限をぶんごとに選べます。</p>' +
+    '<div class="bfoot"><button class="btn" data-bsplit="' + esc(b.id) + '">✂ 期限が違うぶんを分ける</button></div></div>';
+}
 function batchesCardHtml(c) {
   const bs = (c.batches || []).filter((b) => b.work_status !== 'cancelled');
-  if (bs.length <= 1) return '';
+  if (bs.length <= 1) return splitOnlyHtml(c);
   return '<div class="dcard"><h3 class="sec">作業のまとまり</h3>' +
     '<p class="nlink">このカードは ' + bs.length + ' つに分かれています。できたぶんから先に棚へ入れられます。</p>' +
     bs.map((b) => batchRowHtml(c, b)).join('') + '</div>';
@@ -4233,7 +4249,8 @@ async function openSplitBatch(batchId) {
   if (!state.me.session && w.worker_type !== 'staff') { toast('分けられるのは職員だけです (右上の名前を職員に替えてください)'); return; }
   const qty = await ask({
     title: '✂ 期限が違うぶんを分ける',
-    text: 'いま ' + b.planned_qty + ' 個です。別の期限のぶんが何個あるかを入れてください (残りは元のぶんに残ります)',
+    text: 'いま ' + b.planned_qty + ' 個です。別の期限のぶんが何個あるかを入れてください (残りは元のぶんに残ります)。'
+      + '⚠ 分けたぶんは、あとから 1 つに戻せません。数を確かめてから押してください',
     input: 'number', placeholder: '例: 40', required: true, ok: '次へ',
   });
   if (qty == null) return;

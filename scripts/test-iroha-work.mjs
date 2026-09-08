@@ -6467,8 +6467,33 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
     'まとまりの予定数・できた数・作れなかった数・ひとことを使う');
   ok(/if \(c\.status === 'closed'\) \{\s*\r?\n\s*reason = await ask\(/.test(html),
     '終了したカードのぶんを戻すときは、理由を聞く');
-  ok(/function batchesCardHtml\(c\)/.test(html) && /if \(bs\.length <= 1\) return '';/.test(html),
-    '⭐まとまりが 1 つなら「作業のまとまり」は出さない (ふだんの見え方を変えない)');
+  // ⭐まとまりが 1 つのときの見え方。**実際に動かして**確かめる
+  //   (利用者にはこれまでどおり何も出ない / 職員には「分ける」入口だけ出る)
+  {
+    const srcA = html.match(/function splitOnlyHtml\(c\) \{[\s\S]*?\r?\n\}/)[0];
+    const srcB = html.match(/function batchesCardHtml\(c\) \{[\s\S]*?\r?\n\}/)[0];
+    const LFCH = String.fromCharCode(10);
+    const mk = (staff) => new Function(
+      'isApp', 'detailSrc', 'isStaffUI', 'stateCan', 'esc', 'batchRowHtml', 'facilityName',
+      srcA + LFCH + srcB + '; return batchesCardHtml;')(
+      () => true, 'detail', () => staff, () => staff, (v) => String(v), () => '<row>', (c) => String(c));
+    const one = [{ id: 1, work_status: 'not_started', planned_qty: 100 }];
+    ok(mk(false)({ batches: one }) === '',
+      '⭐利用者には、まとまりが 1 つなら何も出さない (ふだんの見え方を変えない)');
+    const staffOut = mk(true)({ batches: one });
+    ok(/data-bsplit="1"/.test(staffOut) && /期限が違う物が混ざっていたら/.test(staffOut),
+      '⭐職員には「分ける」入口を出す (まとまりの欄が出ないと、最初の 1 回を分けられない — Codex #1273 R1 中1)');
+    ok(!/作業のまとまり/.test(staffOut), 'ただし「作業のまとまり」の欄は出さない (分かれていないので)');
+    ok(mk(true)({ batches: [{ id: 1, work_status: 'ready_for_stocking', planned_qty: 100 }] }) === '',
+      '棚入待ちのぶんには出さない (分けられないので)');
+    ok(mk(true)({ batches: [{ id: 1, work_status: 'not_started', planned_qty: 1 }] }) === '',
+      '1 個しか無ければ出さない (分けられないので)');
+    ok(mk(true)({ batches: [{ id: 1, work_status: 'not_started', planned_qty: 100, consigned_out: true }] }) === '',
+      '外にあずけているぶんには出さない');
+    // 2 つ以上なら、これまでどおり「作業のまとまり」
+    const two = mk(true)({ batches: [{ id: 1, work_status: 'not_started', planned_qty: 60 }, { id: 2, work_status: 'not_started', planned_qty: 40 }] });
+    ok(/作業のまとまり/.test(two), '2 つ以上なら「作業のまとまり」を出す');
+  }
   ok(/data-bdone="/.test(html) && /data-bstock="/.test(html),
     'まとまりごとに「このぶんを作り終えた」「このぶんを棚入完了」が出せる');
   ok(/if \(b\.consigned_out\) \{\s*\r?\n\s*btn = '';/.test(html),
@@ -8467,15 +8492,25 @@ console.log('\n[つかいかた] 📖 マニュアルと実装が食い違って
   const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
 
   // ⭐もくじ・節の id・見出しの番号がずれていない (節を足すたびに手で直すので、ずれやすい)
-  const secs = [...man.matchAll(/<section id="(s\d+)"/g)].map((m) => m[1]);
-  const nos = [...man.matchAll(/<span class="no">(\d+)<\/span>/g)].map((m) => Number(m[1]));
-  const toc = [...man.matchAll(/href="#(s\d+)"/g)].map((m) => m[1]);
-  ok(new Set(secs).size === secs.length, "節の id が重複していない");
-  ok(new Set(nos).size === nos.length, "見出しの番号が重複していない");
-  ok(nos.join(",") === nos.map((_, i) => i + 1).join(","), "⭐見出しの番号が 1 から順に並んでいる");
-  ok(secs.join(",") === nos.map((n) => "s" + n).join(","), "⭐節の id と見出しの番号が揃っている");
-  ok(toc.every((t) => secs.includes(t)), "⭐もくじの飛び先が全部ある (押しても飛ばない項目が無い)");
-  ok(secs.every((x) => toc.includes(x)), "⭐全部の節がもくじに載っている (書いたのに辿り着けない節が無い)");
+  // ⭐**節ごとに中身を切り出して**、その中の見出し番号と id が合っているかを見る
+  //   (文書全体から別々に集めると、見出しが節の外へ出ても順番さえ合えば通ってしまう)
+  const secBlocks = [...man.matchAll(/<section id="(s\d+)"[^>]*>([\s\S]*?)<\/section>/g)]
+    .map((m) => ({ id: m[1], body: m[2] }));
+  ok(secBlocks.length >= 16, "節を切り出せた");
+  const ids = secBlocks.map((x) => x.id);
+  ok(new Set(ids).size === ids.length, "節の id が重複していない");
+  ok(ids.join(",") === ids.map((_, i) => "s" + (i + 1)).join(","), "⭐節の id が s1 から順に並んでいる");
+  for (const sec of secBlocks) {
+    const inner = [...sec.body.matchAll(/<span class="no">(\d+)<\/span>/g)].map((m) => Number(m[1]));
+    ok(inner.length === 1 && "s" + inner[0] === sec.id,
+      "⭐" + sec.id + " の見出し番号が id と合っている (見出しは節の中に 1 つだけ)");
+  }
+  // もくじは nav の中だけを見る (本文の中のリンクと混ぜない)
+  const nav = (man.match(/<nav[\s\S]*?<\/nav>/) || [""])[0];
+  const toc = [...nav.matchAll(/href="#(s\d+)"/g)].map((m) => m[1]);
+  ok(toc.length === ids.length, "もくじの数と節の数が合っている");
+  ok(toc.every((t) => ids.includes(t)), "⭐もくじの飛び先が全部ある (押しても飛ばない項目が無い)");
+  ok(ids.every((x) => toc.includes(x)), "⭐全部の節がもくじに載っている (書いたのに辿り着けない節が無い)");
 
   // ⭐画面に出るボタンの言葉と、マニュアルの言葉が合っている
   //   (実装の文言を変えたのにマニュアルが古いまま、を防ぐ)
@@ -8485,21 +8520,41 @@ console.log('\n[つかいかた] 📖 マニュアルと実装が食い違って
     ['数を入れる', '数が抜けている返却に出すボタン'],
     ['数を直す', '数が入っている返却に出すボタン'],
     ['さっき出したのとは別に要る', '同じラベルをもう一度出すときの確認'],
-    ['どのぶんの作業をはじめますか?', 'まとまりを選ぶ画面'],
-    ['いま手をつけられるぶんがありません', '手元に作業できるぶんが無いときの案内'],
+    ['どのぶんの作業をはじめますか?', 'まとまりを選ぶ画面 (§3)'],
+    ['いま手をつけられるぶんがありません', '手元に作業できるぶんが無いときの案内 (§3)'],
+    ['期限が違う物が混ざっていたら', 'まだ分かれていないカードに出す欄'],
   ];
   for (const [word, what] of both) {
     ok(html.includes(word) && man.includes(word), "⭐画面とマニュアルで同じ言葉を使う: " + word + " (" + what + ")");
   }
 
   // ⭐今日足した操作が、マニュアルに書いてある
-  ok(/棚に入れたあとは数を変えられません/.test(man), "棚入れ後に数を直せないことを書く (詰まったときの出口も)");
-  ok(/このぶんをやり直す/.test(man), "直したいときの出口 (やり直す) を書く");
-  ok(/全部は分けられません/.test(man), "分けるときの決まり (全部は分けられない) を書く");
-  ok(/棚に入れた/.test(man) && /箱ラベルを刷った/.test(man) && /できた数を数えた/.test(man),
-    "分けられない条件を書く");
-  ok(/QL-800 の実物を見て/.test(man), "同じラベルを出す前に実物を見てもらう");
-  ok(/貼ったあとは見分けられません/.test(man), "ラベルを間違えると取り返しがつかないことを書く");
+  // ⭐**その説明が書いてある節に絞って**見る (別の節にたまたま同じ言葉があると素通りするため)
+  const sec = (id) => (secBlocks.find((x) => x.id === id) || { body: "" }).body;
+  const s13 = sec("s13");   // 外部にあずける
+  const s14 = sec("s14");   // 分かれたカード
+  const split14 = (s14.match(/期限が違う物が混ざっていたら[\s\S]*?<\/ol>/) || [""])[0];
+  ok(split14.length > 100, "分ける手順を切り出せた");
+  for (const cond of ["棚に入れた", "箱ラベルを刷った", "できた数を数えた", "外にあずけている"]) {
+    ok(split14.includes(cond), "⭐分けられない条件を 1 つずつ書く: " + cond);
+  }
+  ok(/全部は分けられません/.test(split14), "全部は分けられないことを書く");
+  ok(/1 つに戻せません/.test(split14), "⭐分けたら戻せないことを、押す前に書く");
+  ok(/空のままでも構いません/.test(split14), "⭐期限は空のままでもよいことを書く");
+  // 返却の数まわりも、その節に絞る
+  ok(/空のままで構いません/.test(s13), "⭐使える数は空のままでよいことを書く");
+  ok(/精算がすんだあとでも入れられます/.test(s13), "⭐精算ずみでも入れられることを書く");
+  ok(/棚に入れたあとは数を変えられません/.test(s13), "⭐棚入れ後は数を直せないことを書く");
+  ok(!/このぶんをやり直す」で棚入れを取り消して/.test(man),
+    "🚨やり直しても棚入れの記録は消えないので、その案内を書かない (実装と食い違う)");
+  ok(/職員に相談してください/.test(s13), "直せないときの出口 (職員に相談) を書く");
+  // ラベルの注意は §14 に
+  ok(/ラベルを出す機械 \(QL-800\)/.test(s14), "同じラベルを出す前に、機械と出てきたラベルを見てもらう");
+  ok(/箱とラベルの期限が合わなくなります/.test(s14), "違うぶんを選ぶと期限が合わなくなることを書く");
+  // 利用者も使う「どのぶんの作業か」は §3 (作業をはじめる) に
+  ok(/どのぶんの作業をはじめますか/.test(sec("s3")),
+    "⭐まとまりの選び方は利用者の節に書く (利用者もおこなうため)");
+  ok(/いま手をつけられるぶんがありません/.test(sec("s3")), "その案内も利用者の節に");
 
   // ⭐職員だけの節は staff の印が付いている (利用者の画面では隠れる)
   const staffSecs = [...man.matchAll(/<section id="(s\d+)"([^>]*)>/g)].filter((m) => /class="staff"/.test(m[2])).map((m) => m[1]);

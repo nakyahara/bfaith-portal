@@ -452,7 +452,8 @@ export function updateReturnCounts({ consignmentId, returnId, goodQty = undefine
     const goodChanges = goodQty !== undefined || lossQty !== undefined;
     if (goodChanges && stockedQtyOf(db, c.batch_id).rows > 0) {
       return { ok: false, error: 'stocked_batch',
-        message: 'このぶんはもう棚に入れています。数を直すには、先に「このぶんをやり直す」で棚入れを取り消してください (ひとことだけなら直せます)' };
+        message: 'このぶんはもう棚に入れています。棚に入れた記録と食い違うため、ここから数は直せません。'
+          + '直す必要があれば職員に相談してください (「ひとこと」だけなら直せます)' };
     }
     // ⭐**省略 = いまの値のまま / null = 空にする (まだ数えていないに戻す)**。
     //   省略を空と同じに扱うと、使える数だけ入れたときに、入っていた「作れなかった数」が消える (R1 中2)
