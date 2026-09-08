@@ -22,7 +22,7 @@ const { initMirrorDB, getMirrorDB } = await import('../apps/warehouse-mirror/db.
 initMirrorDB();
 const mirror = getMirrorDB();
 
-const { importCsv, workDateJst, getActiveBatch, finalizeLine, reopenLine, resolveDestination, infoForLine }
+const { importCsv, workDateJst, getActiveBatch, finalizeLine, reopenLine, applyQuantityEvents, resolveDestination, infoForLine }
   = await import('../apps/inbound-check/db.js');
 
 // 倉庫の iPad (router) が確定のときに渡す「行き先の決め方」と同じもの。
@@ -336,7 +336,24 @@ console.log('\n[8] 取得日 / 届いたもの / 古くなったもの');
     '⭐数えた結果 0 のものは「届いた」にしない (まだ来ていないものとして出す)');
   eq(z.totals.arrived_products, 0, '届いた分にも数えない');
 
-  // ⭐商品コードに空白が入っていても、載った日との境目が曖昧にならない (まとめるキーの区切りは NUL)
+  // ── 予定より少なく届いた (不足で確定) ときは、届いた分を**数えた数**で数える ──
+  //    予定 10 個で 4 個しか届いていない行を「10 個 届いた」と出さない (Codex P2)
+  {
+    // AR14|1|1 = amc-b の 3 個。1 個だけ数えて不足で確定する
+    ok(applyQuantityEvents({ batchId: b8.id, lineKey: 'AR14|1|1', expectQuantityVersion: 1,
+      events: [{ client_event_id: 'ev-ip-partial', action: 'add', quantity: 1, input_kind: 'loose' }],
+      worker: '倉庫の人' }).ok, '1 個だけ数えた');
+    const part = finalizeLine({ batchId: b8.id, lineKey: 'AR14|1|1', expectVersion: 1, expectQuantityVersion: 2,
+      result: 'shortage', mode: 'current', decide, worker: '倉庫の人', deviceLabel: '倉庫iPad' });
+    ok(part.ok, '不足で確定できた' + (part.ok ? '' : ': ' + part.message));
+    const pr = listInboundPlan();
+    eq([pr.totals.arrived_products, pr.totals.arrived_qty], [1, 1],
+      '⭐届いた数は予定数 (3) ではなく数えた数 (1) で出す');
+    ok(pr.rows.some((x) => x.product_code === 'amc-b' && x.qty === 40),
+      '同じ商品でも、確認していない別の明細 (40 個) はそのまま残る');
+  }
+
+  // ⭐商品コードに空白が入っていても、取得日との境目が曖昧にならない (まとめるキーの区切りは NUL)
   insProduct.run(20, `${iso(0)} amc-a`, '空白入りのコード', '0001');
   const impSp = importCsv(makeCsv([
     row('AR12', 1, 1, 'amc-a', 11),

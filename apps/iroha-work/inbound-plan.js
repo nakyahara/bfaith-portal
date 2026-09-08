@@ -215,7 +215,10 @@ const emptyTotals = () => ({ products: 0, qty: 0, iroha_products: 0, iroha_qty: 
   arrived_products: 0, arrived_qty: 0, old_products: 0, old_qty: 0 });
 
 /**
- * もう届いた明細 (line_key の集合)。
+ * もう届いた明細 → **実際に数えた数** の Map (line_key → 数。分からなければ null)。
+ *
+ * 予定より少なく届いて「不足」で確定することがあるので、届いた分の数は予定数ではなく
+ * 数えた数で出す (Codex P2)。予定 10 個で 4 個だけ届いた行を「10 個 届いた」と出さない。
  *
  * 「届いた」の正本 = **倉庫の iPad が確認を確定したときに立つ行き先の台帳** `f_inbound_check_destinations`。
  *   - 確定と同じトランザクションで 1 行入り、やり直し (reopen) と 伝票から消えた取込 で cancelled_at が入る
@@ -229,17 +232,23 @@ const emptyTotals = () => ({ products: 0, qty: 0, iroha_products: 0, iroha_qty: 
  * 念のため、いま開いている取込の「確認ずみ・1 個以上数えた」行も足す。台帳と二重の見張りにしておくと、
  * 行き先が付かないまま確認だけされた行 (画面を通さない経路) も取りこぼさない。
  */
-function arrivedLineKeys(db, batchId, lines) {
-  const arrived = new Set();
-  for (const r of db.prepare(`SELECT line_key FROM f_inbound_check_line_state
-    WHERE batch_id = ? AND status = 'checked' AND found_qty > 0`).all(batchId)) arrived.add(r.line_key);
+function arrivedQtyByLine(db, batchId, lines) {
+  const arrived = new Map();
+  // 同じ明細に複数の証跡があれば、数が分かるほうを採り、両方分かるなら多いほう
+  const put = (k, qty) => {
+    if (!arrived.has(k)) { arrived.set(k, qty == null ? null : qty); return; }
+    const cur = arrived.get(k);
+    if (qty != null) arrived.set(k, cur == null ? qty : Math.max(cur, qty));
+  };
+  for (const r of db.prepare(`SELECT line_key, found_qty FROM f_inbound_check_line_state
+    WHERE batch_id = ? AND status = 'checked' AND found_qty > 0`).all(batchId)) put(r.line_key, r.found_qty);
   if (!tableExists(db, 'f_inbound_check_destinations')) return arrived;
   const keys = [...new Set(lines.map((l) => trimS(l.line_key)).filter(Boolean))];
   eachChunk(keys, 400, (part) => {
     const ph = part.map(() => '?').join(',');
-    for (const r of db.prepare(`SELECT DISTINCT line_key FROM f_inbound_check_destinations
+    for (const r of db.prepare(`SELECT line_key, actual_qty FROM f_inbound_check_destinations
       WHERE cancelled_at IS NULL AND (actual_qty IS NULL OR actual_qty > 0) AND line_key IN (${ph})`).all(...part)) {
-      arrived.add(r.line_key);
+      put(r.line_key, r.actual_qty);
     }
   });
   return arrived;
@@ -326,7 +335,7 @@ export function listInboundPlan() {
   const keys = [...new Set(lines.map((l) => codeKeyOf(l.code_key)).filter(Boolean))];
   const master = productMasterMap(db, lines);
   const iroha = irohaInfoMap(db, keys);
-  const arrived = arrivedLineKeys(db, batch.id, lines);
+  const arrived = arrivedQtyByLine(db, batch.id, lines);
   const firstSeen = firstSeenMap(db, lines, today);
   const want = wantedSuppliers();
   const oldest = shiftDate(today, -PAST_DAYS);   // これより前に取り込んだものは出さない
@@ -340,14 +349,18 @@ export function listInboundPlan() {
     // さかのぼり切れなかった明細 (LOOKBACK_DAYS より前から載っている) は「古い」側へ
     const day = firstSeen.get(`${trimS(l.line_key)} ${l.code_key}`) || null;
     // 届いたか → 古すぎるか の順に見る (届いた分は古くても「届いた」と数えたい)
-    const bucket = arrived.has(trimS(l.line_key)) ? buckets.arrived
+    const isArrived = arrived.has(trimS(l.line_key));
+    const bucket = isArrived ? buckets.arrived
       : (!day || (oldest && day < oldest)) ? buckets.old
         : buckets.rows;
+    // 届いた行は**数えた数**で数える (不足で確定した行を予定数のまま数えない)。
+    // 数が残っていない古い証跡だけのときは予定数で代用する
+    const qty = isArrived ? (arrived.get(trimS(l.line_key)) ?? l.planned_qty) : l.planned_qty;
     // まとめる単位のキー。区切りは NUL — 商品コードに空白が入っていても日付との境目が曖昧にならない
     const gk = `${day || ''} ${key}`;
     const cur = bucket.get(gk);
     if (cur) {
-      cur.qty += l.planned_qty;
+      cur.qty += qty;
       cur.lines += 1;
       if (!cur.ar_nos.includes(l.ar_no)) cur.ar_nos.push(l.ar_no);
       continue;
@@ -359,7 +372,7 @@ export function listInboundPlan() {
       product_code: trimS(l.product_id) || null,
       // 商品名はロジザードの明細を先に (現物の箱に貼ってあるのと同じ表記)。空なら商品マスタで補う
       product_name: trimS(l.product_name) || trimS(m && m.name) || null,
-      qty: l.planned_qty,
+      qty,
       lines: 1,
       ar_nos: [l.ar_no],
       iroha: ir.label,
