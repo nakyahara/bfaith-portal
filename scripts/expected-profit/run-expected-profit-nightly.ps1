@@ -119,8 +119,14 @@ try {
   $stopAt = Get-StopTime $StopAtHhmm
   # If the cutoff is further away than one whole run, we are not in the overnight window at all
   # (started 09:00 -> the next 06:15 is 21h away). Skip rather than run through the working day.
+  # IMPORTANT: measure BEFORE the cap below, or the window check can never be true
   $hoursToStop = ($stopAt - (Get-Date)).TotalHours
   $outsideWindow = ($hoursToStop -gt $MaxRunHours) -and (-not $AllowAnyTime)
+  # Never run longer than one whole run, whatever the clock says. Without this, a manual -AllowAnyTime
+  # run started at 09:00 would keep going until the next morning's 06:15 (~21h) with no Task Scheduler
+  # limit behind it, so a stuck step would fight the daytime jobs all day (Codex 7th round).
+  $hardStop = (Get-Date).AddHours($MaxRunHours)
+  if ($stopAt -gt $hardStop) { $stopAt = $hardStop }
   $argLine = @($Script) + $NodeArgs
   Log ('start : node ' + ($argLine -join ' ') + '  (DATA_DIR=' + $env:DATA_DIR + ')')
   Log ('stop  : ' + $stopAt.ToString('yyyy-MM-dd HH:mm') + '  log: ' + $OutLog)
