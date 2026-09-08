@@ -25,7 +25,7 @@ const NOW = new Date('2026-09-07T12:00:00Z');
 const FUTURE = '2099-01-01T00:00:00Z';
 const PAST = '2026-09-01T00:00:00Z';
 
-const NEKOPOSU = { 送料: 198, 出荷作業料: 20, 想定梱包資材費: 10, 想定人件費: 9 };
+const NEKOPOSU = { 大分類区分: 'メール便', 小分類区分名称: 'ネコポス', 送料: 198, 出荷作業料: 20, 想定梱包資材費: 10, 想定人件費: 9 };
 
 const baseCtx = (over = {}) => ({
   generationId: 'g1',
@@ -66,6 +66,29 @@ t('楽天・送料込み: 手計算と一致し rank_eligible=1', () => {
   assert.equal(r.rank_eligible, 1);
   assert.equal(r.shipping_method, 'ネコポス');
   assert.equal(r.cost_method, 'single');
+});
+
+t('[!] どの配送方法で計算したかが行に残る (中原さん 2026-09-08)', () => {
+  // 送料コードだけでは「501 が何なのか」が画面から読めない。
+  // 金額を引いてきた送料マスタの区分名を、行そのものに持たせる
+  const r = buildRow(rakutenListing({ shipping_group: null }), baseCtx());
+  assert.equal(r.shipping_rate_name, 'ネコポス');
+  assert.equal(r.shipping_rate_category, 'メール便');
+  assert.equal(r.shipping_code, '501');
+});
+
+t('[!] 送料区分が未登録なら、使った配送も空のままにする (推測で埋めない)', () => {
+  const ctx = baseCtx();
+  ctx.shippingRates = new Map();
+  const r = buildRow(rakutenListing(), ctx);
+  assert.equal(r.shipping_master_status, 'missing');
+  assert.equal(r.shipping_rate_name, null);
+  assert.equal(r.shipping_rate_category, null);
+});
+
+t('[!] モール側の配送パターンを行に残す (FBM の送料込み判断根拠 §16-13)', () => {
+  const r = buildRow(rakutenListing({ shipping_group: 'ネコポスマケプレプライム設定' }), baseCtx());
+  assert.equal(r.shipping_group, 'ネコポスマケプレプライム設定');
 });
 
 t('input_snapshot に再現用の入力が残る', () => {

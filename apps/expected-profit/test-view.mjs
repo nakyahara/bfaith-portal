@@ -106,24 +106,42 @@ console.log('');
 console.log('経費の内訳の表 (中原さん 2026-09-08「すべての経費と配送方法をちゃんと表示」)');
 
 // 🚨 画面の表はブラウザ側の JS が文字列で組み立てている。EJS を描くだけでは中身を見られない。
-//    関数を切り出して**実際に動かし**、列の数と colspan が合っているかを確かめる
+//    想定利益タブの JS を丸ごと切り出して**実際に動かし**、列の数と colspan が合っているか、
+//    どの配送方法を使ったかが出ているかを確かめる
 //    (colspan の数え間違いは目で見ないと分からず、表が1列ずれる)
-function renderTable(rows, scope) {
-  const src = html.match(/function renderExpectedProfit\(\)[\s\S]*?\n    \}/);
-  assert.ok(src, '画面から renderExpectedProfit を切り出せない');
-  const sandbox = {
-    epState: { rows, total: rows.length, scope, published: { built_at: '2026-09-08T00:00:00Z' }, summary: {} },
-    escapeHtml: (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
-    epNum: (v) => (v == null ? '' : String(Math.round(v))),
-    epPct: (v) => (v == null ? '' : (v * 100).toFixed(1) + '%'),
-    epReason: (c) => String(c || ''),
-    MALL_FEE_RATES_LABEL: { amazon: 'Amazon', rakuten: '楽天' },
-    bindExpectedProfitEvents: () => {},
-    document: { getElementById: () => container },
-  };
+function makeScreen() {
+  const start = html.indexOf('// ─── 想定利益 (単品販売シナリオ) ───');
+  const end = html.indexOf('async function loadData()');
+  assert.ok(start > 0 && end > start, '画面から想定利益タブの JS を切り出せない');
+  const src = html.slice(start, end);
   const container = { innerHTML: '' };
-  const fn = new Function(...Object.keys(sandbox), src[0] + '; return renderExpectedProfit;')(...Object.values(sandbox));
-  fn();
+  const sandbox = {
+    escapeHtml: (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
+    MALL_FEE_RATES_LABEL: { amazon: 'Amazon', rakuten: '楽天' },
+    fetchJson: async () => ({}),
+    document: {
+      getElementById: (id) => (id === 'table-container' ? container : { value: '', addEventListener() {} }),
+      querySelector: () => null,
+    },
+  };
+  const api = new Function(...Object.keys(sandbox),
+    src + '; return { render: renderExpectedProfit, detail: epDetailHtml, cols: EP_COLS, setState: (o) => Object.assign(epState, o) };'
+  )(...Object.values(sandbox));
+  return { api, container };
+}
+
+const PUBLISHED = {
+  built_at: '2026-09-08T00:00:00Z', published_at: '2026-09-08T07:34:00Z',
+  generation_id: 'g1', seq: 23, malls_included: ['amazon', 'rakuten'], malls_degraded: [],
+};
+
+function renderTable(rows, scope) {
+  const { api, container } = makeScreen();
+  api.setState({
+    rows, total: rows.length, scope, published: PUBLISHED,
+    summary: { total: rows.length, ok: rows.length, rankEligible: rows.length, expiredNow: 0 },
+  });
+  api.render();
   return container.innerHTML;
 }
 
@@ -137,23 +155,28 @@ const sampleRow = (over = {}) => ({
   price_ex_tax: 900, price_incl_tax: 990, postage_revenue_ex_tax: 0,
   cost_ex_tax: 300, unit_quantity: 1,
   shipping_method: 'ネコポス', shipping_code: '501',
+  shipping_rate_name: 'ネコポス', shipping_rate_category: 'メール便', shipping_group: null,
   shipping_fee_ex_tax: 180, shipping_work_ex_tax: 20,
   shipping_material_ex_tax: 10, shipping_labor_ex_tax: 9, shipping_total_ex_tax: 219,
   fba_fee_ex_tax: null, referral_fee_ex_tax: 89, closing_fee_ex_tax: 0,
   per_item_fee_ex_tax: 0, fee_total_ex_tax: 89, fee_rate_display: 0.1,
-  expected_profit: 292, expected_margin_rate: 0.324,
+  expected_profit: 292, expected_margin_rate: 0.324, shipping_revenue_status: 'included',
+  cost_method: 'single', ne_code: 'ne001',
   rank_eligible_now: 1, rank_exclusion_reason_now: null, incomplete_reason: null,
   ...over,
 });
 
+const dataRows = (out) => (out.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || []);
+
 t('[!] 自社配送の行の列数が見出しと一致する (colspan の数え間違いを防ぐ)', () => {
+  const { api } = makeScreen();
   const out = renderTable([sampleRow()], 'self_v1');
-  const trs = out.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
+  const trs = dataRows(out);
   assert.ok(trs.length >= 3, `見出し2行 + データ1行のはず (実際 ${trs.length})`);
   const group = cells(trs[0]);
   const head = cells(trs[1]);
   const body = cells(trs[2]);
-  assert.equal(head, 24, `見出しは24列のはず (実際 ${head})`);
+  assert.equal(head, api.cols.length, `見出しの数が列定義と合わない (${head} vs ${api.cols.length})`);
   assert.equal(group, head, `まとまりの見出しが合わない (${group} vs ${head})`);
   assert.equal(body, head, `データ行が合わない (${body} vs ${head})`);
 });
@@ -161,18 +184,32 @@ t('[!] 自社配送の行の列数が見出しと一致する (colspan の数え
 t('[!] FBA の行も列数が一致する (Amazon が配送する行は colspan でまとめている)', () => {
   const out = renderTable([sampleRow({
     fulfillment: 'FBA', shipping_method: null, shipping_code: null,
+    shipping_rate_name: null, shipping_rate_category: null,
     shipping_fee_ex_tax: null, shipping_work_ex_tax: null,
     shipping_material_ex_tax: null, shipping_labor_ex_tax: null, shipping_total_ex_tax: null,
     fba_fee_ex_tax: 462,
   })], 'fba_v1');
-  const trs = out.match(/<tr[^>]*>[\s\S]*?<\/tr>/g) || [];
+  const trs = dataRows(out);
   assert.equal(cells(trs[2]), cells(trs[1]), 'FBA 行の列数が見出しと合わない');
 });
 
-t('[!] 配送方法と送料区分コードが実際に出る (中原さんの元の要望)', () => {
+t('[!] どの配送方法を使ったかが表に出る (送料マスタの区分名 + コード)', () => {
+  const out = renderTable([sampleRow({ shipping_rate_name: '宅急便 60サイズ', shipping_code: '702' })], 'self_v1');
+  assert.ok(out.includes('宅急便 60サイズ'), '使った配送区分の名前が出ていない');
+  assert.ok(out.includes('>702<'), '送料区分コードが出ていない');
+});
+
+t('[!] 区分名が無いときだけ NE 登録の配送方法に落とす (空欄にしない)', () => {
+  const out = renderTable([sampleRow({ shipping_rate_name: null, shipping_method: 'ゆうパケット' })], 'self_v1');
+  assert.ok(out.includes('ゆうパケット'), 'NE 登録の配送方法にも落ちていない');
+});
+
+t('[!] 結果 (想定利益・利益率) は右に貼り付ける — 横スクロールで答えが消えない', () => {
+  // 24列を横に並べた結果、いちばん見たい利益率が画面の外に出ていた (2026-09-08 作り直しの発端)
   const out = renderTable([sampleRow()], 'self_v1');
-  assert.ok(out.includes('ネコポス'), '配送方法が出ていない');
-  assert.ok(out.includes('>501<'), '送料区分コードが出ていない');
+  assert.ok(out.includes('ep-stick-r2'), '想定利益が貼り付けられていない');
+  assert.ok(out.includes('ep-stick-r'), '想定利益率が貼り付けられていない');
+  assert.ok(out.includes('ep-stick-l'), '商品名が貼り付けられていない');
 });
 
 t('[!] 経費の内訳が1つずつ出る (合計だけにしない)', () => {
@@ -185,8 +222,8 @@ t('[!] 経費の内訳が1つずつ出る (合計だけにしない)', () => {
 
 t('見出しに経費の名前が全部ある', () => {
   const out = renderTable([sampleRow()], 'self_v1');
-  for (const h of ['配送方法', '送料区分', '送料', '出荷作業料', '梱包資材費', '人件費',
-    'FBA配送代行', '販売手数料', '成約料', '基本成約料', '手数料 合計']) {
+  for (const h of ['使った配送', '送料', '出荷作業料', '梱包資材費', '人件費',
+    'FBA配送代行', '販売手数料', '成約料', '基本成約料', '手数料 合計', '想定利益', '想定利益率']) {
     assert.ok(out.includes('>' + h + '<'), `見出し「${h}」が無い`);
   }
 });
@@ -194,6 +231,60 @@ t('見出しに経費の名前が全部ある', () => {
 t('[!] 値が無いことと 0 円を見分けられる', () => {
   const out = renderTable([sampleRow({ closing_fee_ex_tax: 0, per_item_fee_ex_tax: null })], 'self_v1');
   assert.ok(out.includes('—'), '値が無い欄に — が出ていない');
+});
+
+console.log('');
+console.log('1行ぶんの内訳 (行を押すと開く)');
+
+t('[!] 「この計算で使った配送」を言葉で書く (中原さん 2026-09-08)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({ shipping_rate_name: 'ネコポス', shipping_code: '501', shipping_rate_category: 'メール便' }));
+  assert.ok(out.includes('この計算で使った配送'));
+  assert.ok(out.includes('ネコポス'));
+  assert.ok(out.includes('送料コード 501'));
+  assert.ok(out.includes('メール便'));
+});
+
+t('[!] モール側の配送パターンも出す (送料込み判断の根拠 §16-13)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({ shipping_group: 'ネコポスマケプレプライム設定' }));
+  assert.ok(out.includes('ネコポスマケプレプライム設定'));
+});
+
+t('[!] FBA は「Amazon が配送」と書き、自社の送料を出さない', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({
+    fulfillment: 'FBA', shipping_rate_name: null, shipping_total_ex_tax: null, fba_fee_ex_tax: 462,
+  }));
+  assert.ok(out.includes('Amazon が配送'));
+  assert.ok(!out.includes('配送関係費 合計'), 'FBA なのに自社の配送費を出している');
+});
+
+t('[!] 送料区分が未登録なら、そう書く (勝手に埋めない)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow({ shipping_rate_name: null, shipping_method: null, shipping_code: null }));
+  assert.ok(out.includes('送料区分が未登録'), '未登録であることが書かれていない');
+});
+
+t('[!] 内訳の列数も表と合っている (colspan)', () => {
+  const { api } = makeScreen();
+  const out = api.detail(sampleRow());
+  assert.ok(out.includes('colspan="' + api.cols.length + '"'), '内訳の colspan が列数と合わない');
+});
+
+console.log('');
+console.log('ヘッダ (2026-09-08: style.css に無いクラスを使っていて崩れていた)');
+
+t('[!] ポータル共通のヘッダを使っている', () => {
+  assert.ok(html.includes('class="portal-header"'), 'portal-header を使っていない');
+  assert.ok(!html.includes('class="top-nav"'), 'style.css に定義の無い top-nav が残っている');
+});
+
+t('[!] 想定利益タブでは実績タブの操作と数字を隠す', () => {
+  // 実績の KPI (売上合計など) が残ると、想定利益の集計だと誤読される
+  assert.ok(html.includes("document.getElementById('pd-filters-actual')"));
+  assert.ok(html.includes("document.getElementById('summary-cards')"));
+  assert.ok(html.includes("document.getElementById('pd-tab-a-actions')"));
 });
 
 console.log(`\n${passed} 件 PASS`);

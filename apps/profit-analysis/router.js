@@ -445,7 +445,10 @@ const EXPECTED_PROFIT_CSV_COLS = [
   ['出荷', 'fulfillment', true], ['NE品番', 'ne_code', true], ['紐づけ方', 'ne_code_source', true],
   ['売価(税抜)', 'price_ex_tax'], ['売価(税込)', 'price_incl_tax'], ['送料収入(税抜)', 'postage_revenue_ex_tax'],
   ['原価(税抜)', 'cost_ex_tax'], ['原価の出所', 'cost_method', true], ['単品何個ぶん', 'unit_quantity'],
-  ['配送方法', 'shipping_method', true], ['送料区分コード', 'shipping_code', true],
+  // 🚨 どの配送で計算したかは「使った区分の名前」まで出す。コードだけでは追えない
+  ['使った配送区分', 'shipping_rate_name', true], ['送料区分コード', 'shipping_code', true],
+  ['配送区分の大分類', 'shipping_rate_category', true],
+  ['配送方法(NE登録)', 'shipping_method', true], ['配送パターン(モール)', 'shipping_group', true],
   ['送料(税抜)', 'shipping_fee_ex_tax'], ['出荷作業料', 'shipping_work_ex_tax'],
   ['梱包資材費', 'shipping_material_ex_tax'], ['人件費', 'shipping_labor_ex_tax'],
   ['配送関係費 合計', 'shipping_total_ex_tax'],

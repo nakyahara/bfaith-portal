@@ -7,67 +7,167 @@
   <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="stylesheet" href="/style.css">
   <style>
-    /* ─── 常時 present: タブA（粗利分析）共通スタイル ─── */
-    .container { max-width: 100%; margin: 0 auto; padding: 12px 20px; }
-    .header-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
-    .header-row h2 { margin: 0; }
+    /* ─── 常時 present: 画面ぜんぶで使う見た目 (2026-09-08 作り直し) ───
+       ねらい = 「人が見て分かる」。数字は等幅で桁を揃え、良い/悪いは色ではなく
+       色 + 記号で示す。表は横に長いので、商品名 (左) と 結果 (右) を貼り付ける */
+    :root {
+      --ink: #101828; --ink-2: #344054; --muted: #667085; --faint: #98a2b3;
+      --line: #e4e7ec; --line-2: #eff1f4; --bg: #f5f6f8; --card: #ffffff;
+      --brand: #2563eb; --brand-dark: #1d4ed8;
+      --pos: #067647; --pos-bg: #ecfdf3; --neg: #b42318; --neg-bg: #fef3f2;
+      --warn: #b54708; --warn-bg: #fffaeb;
+      --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08);
+      --radius: 10px;
+    }
+    body { background: var(--bg); color: var(--ink); -webkit-font-smoothing: antialiased; }
+    .container { max-width: 1760px; margin: 0 auto; padding: 20px 24px 40px; }
+    .header-row { display: flex; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; }
+    .header-row h2 { margin: 0; font-size: 21px; letter-spacing: .01em; }
+    .page-lead { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
 
-    .notice { background: #fffbeb; border: 1px solid #f59e0b; border-radius: 6px; padding: 8px 14px; font-size: 12px; color: #92400e; margin-bottom: 12px; }
-    .notice-small { font-size: 11px; color: #6b7280; margin-top: 4px; }
+    .notice { background: var(--warn-bg); border: 1px solid #fedf89; border-left: 4px solid #f79009;
+      border-radius: 8px; padding: 10px 14px; font-size: 12.5px; color: #93370d; margin-bottom: 14px; }
+    .notice-small { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
 
-    .summary-cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
-    .card { background: white; border-radius: 8px; padding: 14px 18px; min-width: 140px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-    .card .label { font-size: 12px; color: #666; }
-    .card .value { font-size: 24px; font-weight: bold; margin-top: 4px; }
-    .card.danger .value { color: #dc2626; }
-    .card.warning .value { color: #f59e0b; }
-    .card.success .value { color: #16a34a; }
+    /* KPI タイル */
+    .summary-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 14px; box-shadow: var(--shadow); }
+    .card .label { font-size: 11.5px; color: var(--muted); font-weight: 500; letter-spacing: .02em; }
+    .card .value { font-size: 22px; font-weight: 650; margin-top: 6px; color: var(--ink);
+      font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+    .card .sub { font-size: 11px; color: var(--faint); margin-top: 2px; }
+    .card.danger { border-color: #fecdca; background: linear-gradient(0deg, var(--neg-bg), var(--neg-bg)); }
+    .card.danger .value { color: var(--neg); }
+    .card.warning { border-color: #fedf89; background: var(--warn-bg); }
+    .card.warning .value { color: var(--warn); }
+    .card.success { border-color: #abefc6; background: var(--pos-bg); }
+    .card.success .value { color: var(--pos); }
 
-    .sub-tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 2px solid #e5e7eb; flex-wrap: wrap; }
-    .sub-tab { padding: 8px 16px; border: none; background: none; cursor: pointer; font-size: 13px; font-weight: 500; color: #6b7280; border-bottom: 2px solid transparent; margin-bottom: -2px; }
-    .sub-tab.active { color: #2563eb; border-bottom-color: #2563eb; }
-    .sub-tab:hover { color: #1d4ed8; }
+    /* タブ = 押せると分かる形にする (下線1本だと押せると気づかれない) */
+    .sub-tabs { display: inline-flex; gap: 2px; margin-bottom: 14px; flex-wrap: wrap;
+      background: #eceef1; border-radius: 10px; padding: 3px; }
+    .sub-tab { padding: 7px 15px; border: none; background: none; cursor: pointer; font-size: 13px;
+      font-weight: 600; color: var(--ink-2); border-radius: 8px; transition: background .12s, color .12s; }
+    .sub-tab:hover:not(.active) { background: rgba(255,255,255,.7); }
+    .sub-tab.active { background: var(--card); color: var(--brand); box-shadow: var(--shadow); }
 
-    .filters { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
-    .filters label { font-size: 13px; color: #555; }
-    .filters select, .filters input { padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 13px; }
+    .filters { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 14px;
+      background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 14px; box-shadow: var(--shadow); }
+    .filters label { font-size: 12.5px; color: var(--ink-2); display: inline-flex; align-items: center; gap: 6px; }
+    .filters select, .filters input { padding: 6px 10px; border: 1px solid #d0d5dd; border-radius: 8px;
+      font-size: 13px; color: var(--ink); background: #fff; }
+    .filters select:focus, .filters input:focus { outline: 2px solid #b2ccff; outline-offset: -1px; border-color: var(--brand); }
 
-    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
-    .btn-primary { background: #2563eb; color: white; }
-    .btn-primary:hover:not(:disabled) { background: #1d4ed8; }
-    .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
-    .btn-export { background: #059669; color: white; }
-    .btn-export:hover:not(:disabled) { background: #047857; }
-    .btn-export:disabled { background: #86efac; cursor: not-allowed; }
-    .btn-secondary { background: #e5e7eb; color: #374151; }
-    .btn-secondary:hover:not(:disabled) { background: #d1d5db; }
+    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 15px; border: 1px solid transparent;
+      border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; transition: background .12s, box-shadow .12s; }
+    .btn-primary { background: var(--brand); color: #fff; box-shadow: var(--shadow); }
+    .btn-primary:hover:not(:disabled) { background: var(--brand-dark); }
+    .btn-primary:disabled { background: #b2ccff; cursor: not-allowed; box-shadow: none; }
+    .btn-export { background: #fff; color: var(--ink-2); border-color: #d0d5dd; box-shadow: var(--shadow); }
+    .btn-export:hover:not(:disabled) { background: #f9fafb; }
+    .btn-export:disabled { color: var(--faint); cursor: not-allowed; box-shadow: none; }
+    .btn-secondary { background: #fff; color: var(--ink-2); border-color: #d0d5dd; }
+    .btn-secondary:hover:not(:disabled) { background: #f9fafb; }
 
-    .table-wrap { max-height: calc(100vh - 380px); overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
-    .ep-table .ep-group th { background:#f3f4f6; color:#374151; font-size:11px; text-align:center; border-right:1px solid #e5e7eb; }
+    /* 表 */
+    .table-wrap { max-height: calc(100vh - 330px); overflow: auto; border: 1px solid var(--line);
+      border-radius: var(--radius); background: var(--card); box-shadow: var(--shadow); }
+    .data-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12.5px; }
+    .data-table th, .data-table td { border-bottom: 1px solid var(--line-2); padding: 8px 10px;
+      text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .data-table th { background: #f8f9fb; position: sticky; top: 0; z-index: 10; text-align: right;
+      font-size: 11.5px; font-weight: 600; color: var(--ink-2); cursor: pointer; user-select: none;
+      border-bottom: 1px solid var(--line); }
+    .data-table th:hover { background: #f0f2f5; }
+    /* 商品名に幅を寄せる。放っておくとモール列だけ間延びして読みにくい */
+    .data-table:not(.ep-table) td:first-child, .data-table:not(.ep-table) th:first-child { width: 30%; }
+    /* 文字の列だけ左寄せ。数字は右寄せのまま (ep-table は独自に指定する) */
+    .data-table:not(.ep-table) td:nth-child(1), .data-table:not(.ep-table) td:nth-child(2),
+    .data-table:not(.ep-table) th:nth-child(1), .data-table:not(.ep-table) th:nth-child(2) { text-align: left; }
+    .data-table tbody tr:hover { background: #f7f9ff; }
+    .data-table tbody tr:last-child td { border-bottom: none; }
+    .num-pos { color: var(--pos); font-weight: 650; }
+    .num-neg { color: var(--neg); font-weight: 650; }
+    .cell-name { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+    .cell-code { color: var(--muted); font-size: 11.5px; }
+
+    .row-danger { background: var(--neg-bg); }
+    .row-danger:hover { background: #fee4e2 !important; }
+    .row-warning { background: var(--warn-bg); }
+    .row-warning:hover { background: #fef0c7 !important; }
+    .row-success { background: var(--pos-bg); }
+    .row-success:hover { background: #dcfae6 !important; }
+
+    .badge { display: inline-block; padding: 2px 7px; border-radius: 20px; font-size: 10.5px; font-weight: 600; line-height: 1.5; }
+    .badge-fba { background: #eff4ff; color: #175cd3; }
+    .badge-fbm { background: #fffaeb; color: var(--warn); }
+    .badge-mall { background: #f2f4f7; color: var(--ink-2); }
+
+    .loading { text-align: center; padding: 48px; color: var(--muted); }
+    .empty { text-align: center; padding: 48px; color: var(--faint); }
+
+    .fee-status { font-size: 11.5px; color: var(--muted); margin-bottom: 10px; }
+    .fee-status .ok { color: var(--pos); font-weight: 600; }
+    .fee-status .warn { color: var(--warn); font-weight: 600; }
+
+    /* ─── 想定利益タブ ─── */
+    .ep-table { font-size: 12.5px; }
     .ep-table th, .ep-table td { white-space: nowrap; }
-    .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 5px 8px; text-align: right; white-space: nowrap; }
-    .data-table th { background: #f3f4f6; position: sticky; top: 0; z-index: 10; text-align: center; font-size: 11px; cursor: pointer; user-select: none; }
-    .data-table th:hover { background: #e5e7eb; }
-    .data-table td:nth-child(1), .data-table td:nth-child(2), .data-table td:nth-child(3) { text-align: left; }
-    .data-table tr:hover { background: #f0f7ff; }
+    .ep-table .ep-group th { background: #f2f4f7; color: var(--ink-2); font-size: 11px; text-align: center;
+      font-weight: 700; letter-spacing: .04em; border-right: 1px solid var(--line); top: 0; }
+    .ep-table thead tr:nth-child(2) th { top: 29px; }
+    /* 🚨 横に長い表なので、商品 (左) と 結果 (右) は貼り付けて常に見えるようにする */
+    .ep-table th.ep-stick-l, .ep-table td.ep-stick-l { position: sticky; left: 0; z-index: 5; background: var(--card);
+      border-right: 1px solid var(--line); text-align: left; box-shadow: 6px 0 8px -8px rgba(16,24,40,.45); }
+    .ep-table thead th.ep-stick-l { z-index: 12; background: #f8f9fb; }
+    .ep-table .ep-group th.ep-stick-l { z-index: 13; background: #f2f4f7; }
+    /* 🚨 結果は2列とも右に貼る。両方 right:0 にすると重なって片方が読めなくなる */
+    .ep-table th.ep-stick-r, .ep-table td.ep-stick-r,
+    .ep-table th.ep-stick-r2, .ep-table td.ep-stick-r2 { position: sticky; z-index: 5; background: var(--card); }
+    .ep-table th.ep-stick-r2, .ep-table td.ep-stick-r2 { right: 104px; min-width: 104px; border-left: 1px solid var(--line);
+      box-shadow: -6px 0 8px -8px rgba(16,24,40,.45); }
+    .ep-table th.ep-stick-r, .ep-table td.ep-stick-r { right: 0; min-width: 104px; }
+    .ep-table thead th.ep-stick-r, .ep-table thead th.ep-stick-r2 { z-index: 12; background: #f8f9fb; }
+    .ep-table .ep-group th.ep-stick-r { z-index: 13; background: #f2f4f7; right: 0; border-left: 1px solid var(--line); }
+    .ep-table tbody tr:hover td.ep-stick-r2 { background: #f7f9ff; }
+    .ep-table tbody tr.row-danger td.ep-stick-r2 { background: var(--neg-bg); }
+    .ep-table tbody tr.row-warning td.ep-stick-l, .ep-table tbody tr.row-warning td.ep-stick-r,
+    .ep-table tbody tr.row-warning td.ep-stick-r2 { background: var(--warn-bg); }
+    .ep-table tbody tr:hover td.ep-stick-l, .ep-table tbody tr:hover td.ep-stick-r { background: #f7f9ff; }
+    .ep-table tbody tr.row-danger td.ep-stick-l, .ep-table tbody tr.row-danger td.ep-stick-r { background: var(--neg-bg); }
+    .ep-table tbody tr { cursor: pointer; }
+    .ep-name { font-weight: 600; color: var(--ink); max-width: 300px; overflow: hidden; text-overflow: ellipsis; }
+    .ep-sub { font-size: 11px; color: var(--muted); margin-top: 1px; }
+    .ep-margin { font-weight: 700; font-size: 13.5px; }
+    .ep-none { color: #d0d5dd; }
+    .ep-ship { color: var(--ink); }
+    .ep-ship-code { color: var(--faint); font-size: 11px; margin-left: 4px; }
+    .ep-chip { display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 10.5px;
+      background: #f2f4f7; color: var(--ink-2); font-weight: 600; }
+    .ep-chip-warn { background: var(--warn-bg); color: var(--warn); }
 
-    .row-danger { background: #fef2f2 !important; }
-    .row-danger:hover { background: #fee2e2 !important; }
-    .row-warning { background: #fffbeb !important; }
-    .row-warning:hover { background: #fef3c7 !important; }
-    .row-success { background: #f0fdf4 !important; }
+    .ep-note { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+      padding: 12px 14px; margin-bottom: 12px; font-size: 12.5px; line-height: 1.75; box-shadow: var(--shadow); }
+    .ep-note b { color: var(--ink); }
+    .ep-note .ep-note-warn { color: var(--warn); }
+    .ep-note .ep-note-meta { color: var(--muted); font-size: 11.5px; }
+    .ep-gen { display: flex; flex-wrap: wrap; gap: 16px; align-items: baseline; }
 
-    .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600; }
-    .badge-fba { background: #dbeafe; color: #1e40af; }
-    .badge-fbm { background: #fef3c7; color: #92400e; }
-
-    .loading { text-align: center; padding: 40px; color: #6b7280; }
-    .empty { text-align: center; padding: 40px; color: #9ca3af; }
-
-    .fee-status { font-size: 11px; color: #6b7280; margin-bottom: 8px; }
-    .fee-status .ok { color: #16a34a; }
-    .fee-status .warn { color: #f59e0b; }
+    /* 1行ぶんの計算内訳 (行を押すと開く) */
+    .ep-detail td { background: #fbfcfe; padding: 0; }
+    /* 🚨 表は横に長いので、内訳は左に貼り付けて横スクロールしなくても読めるようにする。
+       .data-table td の text-align:right をここで打ち消す (打ち消さないと文字が右端へ飛ぶ) */
+    .ep-detail-inner { padding: 14px 18px; display: grid; grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+      gap: 28px; white-space: normal; text-align: left; position: sticky; left: 0; max-width: 1180px; }
+    .ep-calc { font-size: 12.5px; }
+    .ep-calc-row { display: flex; justify-content: space-between; gap: 20px; padding: 4px 0; border-bottom: 1px dashed var(--line); }
+    .ep-calc-row:last-child { border-bottom: none; }
+    .ep-calc-row.total { font-weight: 700; border-top: 2px solid var(--line); border-bottom: none; margin-top: 4px; padding-top: 8px; }
+    .ep-calc-label { color: var(--ink-2); }
+    .ep-calc-val { font-variant-numeric: tabular-nums; }
+    .ep-facts { font-size: 12.5px; line-height: 1.9; }
+    .ep-facts dt { color: var(--muted); font-size: 11.5px; }
+    .ep-facts dd { margin: 0 0 6px; color: var(--ink); }
 <% if (featureFlagEnabled) { %>
 
     /* ─── 以下、feature flag ON 時のみ出力（Dark Launch 漏れ防止） ─── */
@@ -143,27 +243,36 @@
   <link rel="stylesheet" href="/mobile.css">
 </head>
 <body>
-  <nav class="top-nav">
-    <a href="/" class="nav-brand">B-Faith Portal</a>
-    <div class="nav-right">
-      <span class="nav-user"><%= displayName || username %></span>
-      <a href="/logout" class="nav-link">Logout</a>
+  <!-- 🚨 ヘッダはポータル共通の .portal-header を使う。
+       2026-09-08 まで .top-nav という style.css に**存在しないクラス**を書いていたため、
+       この画面だけヘッダが素のテキストで縦積みになっていた -->
+  <header class="portal-header">
+    <div class="header-left">
+      <a href="/" class="back-link">&larr; Portal</a>
+      <h1>商品収益性ダッシュボード</h1>
     </div>
-  </nav>
+    <div class="header-right">
+      <span class="user-name"><%= displayName || username %></span>
+      <a href="/logout" class="btn-logout">Logout</a>
+    </div>
+  </header>
 
   <div class="container">
     <div class="header-row">
-      <h2>商品収益性ダッシュボード</h2>
+      <div>
+        <h2 id="pd-view-title">粗利ワースト商品</h2>
+        <div class="page-lead" id="pd-view-lead">直近の販売実績から、粗利の低い商品を洗い出します</div>
+      </div>
 <% if (!featureFlagEnabled) { %>
-      <div style="display:flex;gap:8px;">
+      <div style="display:flex;gap:8px;" id="pd-tab-a-actions">
         <button class="btn btn-primary" onclick="loadData()" id="btn-load">データ取得</button>
         <button class="btn btn-export" onclick="exportCSV()" id="btn-export" disabled>CSV出力</button>
       </div>
 <% } %>
     </div>
 
-    <div class="notice">
-      本ツールは現行原価・現行料率ベースの管理指標です（過去時点の再現値ではありません）。
+    <div class="notice" id="pd-notice-actual">
+      この4つのタブは<b>販売実績ベース</b>の管理指標です (現行原価・現行料率。過去時点の再現値ではありません)。
     </div>
 
 <% if (featureFlagEnabled) { %>
@@ -177,7 +286,7 @@
     <div id="pd-tab-a" class="pd-tab-panel active">
       <div class="header-row" style="margin-bottom: 8px;">
         <div></div>
-        <div style="display:flex;gap:8px;">
+        <div style="display:flex;gap:8px;" id="pd-tab-a-actions">
           <button class="btn btn-primary" onclick="loadData()" id="btn-load">データ取得</button>
           <button class="btn btn-export" onclick="exportCSV()" id="btn-export" disabled>CSV出力</button>
         </div>
@@ -192,7 +301,7 @@
         <button class="sub-tab" data-view="expected" onclick="switchProfitView('expected')">想定利益 (単品)</button>
       </div>
 
-      <div class="filters">
+      <div class="filters" id="pd-filters-actual">
         <label>期間:
           <select id="filter-days" onchange="loadData()">
             <option value="30">直近30日</option>
@@ -212,7 +321,7 @@
             <option value="mercari">メルカリ</option>
           </select>
         </label>
-        <label>最低売上:
+        <label id="pd-filter-min-revenue-label">最低売上:
           <input type="number" id="filter-min-revenue" value="1000" min="0" step="1000" style="width:90px;" onchange="renderTable()">
         </label>
       </div>
@@ -466,14 +575,34 @@
     let sortCol = 'margin_rate';
     let sortAsc = true;
 
+    // 画面の見出し。どのタブが「実績」でどれが「これから」なのかを言葉で出す
+    const VIEW_INTRO = {
+      worst:  ['粗利ワースト商品', '直近の販売実績から、粗利の低い商品を洗い出します'],
+      border: ['粗利率 10〜15% の商品', 'あと少しで健全になる商品。値上げ・送料区分の見直しが効きます'],
+      trend:  ['前月比で悪化した商品', '先月より粗利が落ちた商品を、落ち幅の大きい順に出します'],
+      mall:   ['同じ商品のモール別比較', '複数モールに出している商品を並べて、どこが取れていないかを見ます'],
+      expected: ['想定利益 (いま1個売ったら)', '販売実績は使いません。登録価格とマスタだけで「1個売ったら手元にいくら残るか」を全出品ぶん計算した、昨夜の結果です'],
+    };
+
     function switchProfitView(view) {
       currentView = view;
       document.querySelectorAll('#pd-sub-tabs-a .sub-tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
-      // 想定利益は実績を使わないので、期間フィルタを隠す (誤解を避ける)
-      const daysFilter = document.getElementById('filter-days');
-      if (daysFilter && daysFilter.parentElement) {
-        daysFilter.parentElement.style.display = (view === 'expected') ? 'none' : '';
-      }
+      const isExpected = view === 'expected';
+      const intro = VIEW_INTRO[view] || VIEW_INTRO.worst;
+      const titleEl = document.getElementById('pd-view-title');
+      const leadEl = document.getElementById('pd-view-lead');
+      if (titleEl) titleEl.textContent = intro[0];
+      if (leadEl) leadEl.textContent = intro[1];
+      // 🚨 想定利益は実績を使わない別系統。実績タブ用の操作・数字をそのまま残すと、
+      //    上の KPI が「想定利益の集計」だと誤読される (2026-09-08 作り直し)
+      const hideOnExpected = [
+        document.getElementById('pd-filters-actual'),
+        document.getElementById('fee-status'),
+        document.getElementById('summary-cards'),
+        document.getElementById('pd-tab-a-actions'),
+        document.getElementById('pd-notice-actual'),
+      ];
+      for (const el of hideOnExpected) { if (el) el.style.display = isExpected ? 'none' : ''; }
       if (view === 'trend') {
         loadTrendData();
       } else if (view === 'expected') {
@@ -517,6 +646,61 @@
       return (v * 100).toFixed(1) + '%';
     }
 
+    // 除外・不成立の理由を日本語にする。英語のまま出すと現場で読めない
+    var EP_REASON = {
+      quantity_shipping_unknown: 'まとめ買い出品 (送料が単品前提)',
+      quantity_variation_suspected: 'まとめ買いの疑い (価格の開きが大きい)',
+      shipping_revenue_unknown: '送料収入が不明',
+      shipping_master_missing: '送料区分が未登録',
+      ne_code_not_found: 'NE品番に紐づいていない',
+      multiple_ne_codes: '1出品が複数のNE品番を指している',
+      product_not_found: 'NE商品が見つからない',
+      cost_missing: '原価が未登録',
+      set_cost_incomplete: 'セット原価が未完成',
+      price_missing: '売価が取れていない',
+      fee_missing: '手数料の見積が無い',
+      fba_fee_missing: 'FBA配送代行の見積が無い',
+      fee_revision_crossed: '手数料改定をまたいだ見積',
+      fulfillment_unresolved: '出荷区分が判定できない',
+      not_own_price: '自社の価格ではない',
+      scenario_undecidable: '標準シナリオに当てはまらない',
+      mall_fee_rate_unknown: 'モールの手数料率が未設定',
+      listing_inactive: '出品が停止中',
+      listing_incomplete: '出品情報が未完成',
+      listing_hidden: '非公開の出品',
+      empty_enumeration: '出品を1件も取れていない',
+      enum_failed: '出品の取得に失敗',
+    };
+    function epReason(code) {
+      if (!code) return '参考値';
+      if (EP_REASON[code]) return EP_REASON[code];
+    // `${入力}_${状態}` 形式 (例 cost_expired) はそのまま出すが、よくある語だけ置き換える
+      var m = String(code).replace(/^listing_enum_/, '出品一覧が ').replace(/^price_/, '売価が ')
+        .replace(/^cost_/, '原価が ').replace(/^fee_/, '手数料が ').replace(/^shipping_master_/, '送料区分が ')
+        .replace(/expired$/, '期限切れ').replace(/missing$/, '未取得');
+      return m;
+    }
+
+    // 表の列。🚨 まとまり (colspan) と実際のセル数がずれると表が1列ずれるので、
+    //    見出しも本体もこの定義から作る (数え間違いを起こさない)
+    const EP_GROUPS = [
+      { label: '商品', span: 1, stickyL: true },
+      { label: '売上', span: 3 },
+      { label: '仕入', span: 2 },
+      { label: '配送にかかる費用', span: 7 },
+      { label: 'モールに払う手数料', span: 5 },
+      { label: '結果', span: 2, stickyR: true },
+    ];
+    const EP_COLS = [
+      { label: '商品', stickyL: true },
+      { label: '売価(税抜)' }, { label: '売価(税込)' }, { label: '送料収入' },
+      { label: '原価(税抜)' }, { label: '何個ぶん' },
+      { label: '使った配送' }, { label: '送料' }, { label: '出荷作業料' }, { label: '梱包資材費' },
+      { label: '人件費' }, { label: '配送費 小計' }, { label: 'FBA配送代行' },
+      { label: '販売手数料' }, { label: '成約料' }, { label: '基本成約料' }, { label: '手数料 合計' }, { label: '手数料率' },
+      { label: '想定利益', stickyR2: true }, { label: '想定利益率', stickyR: true },
+    ];
+
     function renderExpectedProfit() {
       const c = document.getElementById('table-container');
       if (!epState.published) {
@@ -524,26 +708,48 @@
         return;
       }
       const s = epState.summary || {};
-      const degraded = (epState.published.malls_degraded || [])
+      const p = epState.published;
+      const degraded = (p.malls_degraded || [])
         .map(function (d) { return escapeHtml(d.mall) + '(' + escapeHtml(d.reason) + ')'; }).join(', ');
 
       let html = '';
-      // ── 前提を常に見せる (§9.1) ──
-      html += '<div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;margin-bottom:10px;font-size:12px;line-height:1.7;">';
-      html += '<div><b>この表の前提</b> — 1注文・1個・同梱なし・送料無料ラインなし・クーポンやポイントなし・返品なしで「今この出品を1個売ったら手元にいくら残るか」</div>';
-      html += '<div style="color:#b45309;"><b>含んでいない費用</b>: 広告費 / ポイント原資 / クーポン原資 / 返品。'
+
+      // ── 1. この数字は何なのか (§9.1: 前提を常に見せる) ──
+      html += '<div class="ep-note">';
+      html += '<div><b>この表の見方</b> — 1注文・1個・同梱なし・送料無料ラインなし・クーポンやポイントなし・返品なしで'
+        + '「<b>今この出品を1個売ったら手元にいくら残るか</b>」。販売実績は使いません</div>';
+      html += '<div class="ep-note-warn"><b>含んでいない費用</b>: 広告費 / ポイント原資 / クーポン原資 / 返品。'
         + 'FBA では納品の配送費・納品準備・保管料・長期保管手数料も含みません</div>';
-      html += '<div style="color:#6b7280;">計算日時: ' + escapeHtml(epState.published.built_at || '—')
-        + ' / 公開: ' + escapeHtml(epState.published.published_at || '—')
-        + ' / 対象 ' + epNum(s.total) + '件 (計算できた ' + epNum(s.ok) + ' / ランキング対象 ' + epNum(s.rankEligible)
-        + ' / 表示時に期限切れ ' + epNum(s.expiredNow) + ')'
-        + (degraded ? ' / <span style="color:#dc2626;">取得が劣化: ' + degraded + '</span>' : '') + '</div>';
-      html += '<div style="color:#6b7280;">Amazon の手数料は SP-API の<b>見積</b>です (確定請求額ではありません)。'
+      html += '<div class="ep-note-meta">Amazon の手数料は SP-API の<b>見積</b>です (確定請求額ではありません)。'
         + '他モールは料率からの<b>簡易見積</b>で、ポイント原資やアフィリエイトを含みません</div>';
+      html += '<div class="ep-gen ep-note-meta" style="margin-top:6px;">'
+        + '<span>計算 ' + escapeHtml(epWhen(p.built_at)) + '</span>'
+        + '<span>公開 ' + escapeHtml(epWhen(p.published_at)) + '</span>'
+        + '<span>世代 ' + escapeHtml(p.generation_id || '—') + ' (seq ' + epNum(p.seq) + ')</span>'
+        + (degraded ? '<span style="color:var(--neg);">取得が劣化: ' + degraded + '</span>' : '')
+        + '</div>';
       html += '</div>';
 
-      // ── 操作 ──
-      html += '<div class="filters" style="margin-bottom:8px;">';
+      // ── 2. 母数のうちどれだけ数字になっているか ──
+      const negative = epState.rows.filter(function (r) { return r.expected_profit != null && r.expected_profit < 0; }).length;
+      html += '<div class="summary-cards">';
+      html += epCard('対象の出品', epNum(s.total), '昨夜みつかった全出品');
+      html += epCard('計算できた', epNum(s.ok), s.total ? Math.round((s.ok / s.total) * 100) + '% が金額になった' : '');
+      html += epCard('ランキング対象', epNum(s.rankEligible), '前提どおりに計算できたぶん');
+      html += epCard('計算できなかった', epNum(s.total - s.ok), '原価・送料区分・紐づけの未登録', (s.total - s.ok) > 0 ? 'warning' : '');
+      html += epCard('赤字の出品', epNum(negative), '表示中 ' + epNum(epState.rows.length) + ' 件のうち', negative > 0 ? 'danger' : 'success');
+      html += '</div>';
+
+      // ── 3. 操作 ──
+      html += '<div class="filters">';
+      // モール絞り込みはこの世代に入っているモールだけ出す (無いモールを選ばせない)
+      const mallNow = document.getElementById('filter-mall').value;
+      html += '<label>モール: <select id="ep-mall"><option value="">全モール</option>';
+      for (const m of (p.malls_included || [])) {
+        html += '<option value="' + escapeHtml(m) + '"' + (mallNow === m ? ' selected' : '') + '>'
+          + escapeHtml(MALL_FEE_RATES_LABEL[m] || m) + '</option>';
+      }
+      html += '</select></label>';
       html += '<label>費用の範囲: <select id="ep-scope">'
         + '<option value="self_v1"' + (epState.scope === 'self_v1' ? ' selected' : '') + '>自社出荷 (送料・作業料・資材・人件費)</option>'
         + '<option value="fba_v1"' + (epState.scope === 'fba_v1' ? ' selected' : '') + '>FBA (配送代行手数料)</option>'
@@ -558,9 +764,8 @@
         + '</select></label>';
       html += '<label><input type="checkbox" id="ep-rank-only"' + (epState.rankOnly ? ' checked' : '') + '> 参考値を隠す</label>';
       html += '<button class="btn btn-export" id="ep-csv">CSV出力</button>';
+      html += '<span class="notice-small" style="margin-left:auto;">🚨 費用の範囲が違うので <b>FBA と自社出荷は同じ順位表に混ぜていません</b></span>';
       html += '</div>';
-      html += '<div style="font-size:11px;color:#6b7280;margin-bottom:6px;">'
-        + '🚨 費用の範囲が違うので、<b>FBA と自社出荷は同じ順位表に混ぜていません</b>。上の切り替えで見比べてください</div>';
 
       if (epState.rows.length === 0) {
         html += '<div class="empty">条件に合う行がありません</div>';
@@ -569,116 +774,173 @@
         return;
       }
 
-      // 除外・不成立の理由を日本語にする。英語のまま出すと現場で読めない
-      var EP_REASON = {
-        quantity_shipping_unknown: 'まとめ買い出品 (送料が単品前提)',
-        quantity_variation_suspected: 'まとめ買いの疑い (価格の開きが大きい)',
-        shipping_revenue_unknown: '送料収入が不明',
-        shipping_master_missing: '送料区分が未登録',
-        ne_code_not_found: 'NE品番に紐づいていない',
-        multiple_ne_codes: '1出品が複数のNE品番を指している',
-        product_not_found: 'NE商品が見つからない',
-        cost_missing: '原価が未登録',
-        set_cost_incomplete: 'セット原価が未完成',
-        price_missing: '売価が取れていない',
-        fee_missing: '手数料の見積が無い',
-        fba_fee_missing: 'FBA配送代行の見積が無い',
-        fee_revision_crossed: '手数料改定をまたいだ見積',
-        fulfillment_unresolved: '出荷区分が判定できない',
-        not_own_price: '自社の価格ではない',
-        scenario_undecidable: '標準シナリオに当てはまらない',
-        mall_fee_rate_unknown: 'モールの手数料率が未設定',
-        listing_inactive: '出品が停止中',
-        listing_incomplete: '出品情報が未完成',
-        listing_hidden: '非公開の出品',
-        empty_enumeration: '出品を1件も取れていない',
-        enum_failed: '出品の取得に失敗',
-      };
-      function epReason(code) {
-        if (!code) return '参考値';
-        if (EP_REASON[code]) return EP_REASON[code];
-        // `${入力}_${状態}` 形式 (例 cost_expired) はそのまま出すが、よくある語だけ置き換える
-        var m = String(code).replace(/^listing_enum_/, '出品一覧が ').replace(/^price_/, '売価が ')
-          .replace(/^cost_/, '原価が ').replace(/^fee_/, '手数料が ').replace(/^shipping_master_/, '送料区分が ')
-          .replace(/expired$/, '期限切れ').replace(/missing$/, '未取得');
-        return m;
-      }
-
-      const isFba = epState.scope === 'fba_v1';
-      // 🚨 経費は合計だけでなく**内訳を列で出す** (中原さん 2026-09-08)。
-      //    どの配送方法で・どの送料区分を・いくらで使ったかが見えないと、数字を信用できない。
-      //    列は 24。横に長いので table-wrap で横スクロールする
+      // ── 4. 表 ──
       html += '<div class="table-wrap"><table class="data-table ep-table"><thead>';
-      html += '<tr class="ep-group">'
-        + '<th colspan="4">出品</th>'
-        + '<th colspan="3">売上</th>'
-        + '<th colspan="2">仕入</th>'
-        + '<th colspan="7">配送にかかる費用</th>'
-        + '<th colspan="5">モールに払う手数料</th>'
-        + '<th colspan="3">結果</th>'
-        + '</tr><tr>';
-      const cols = [
-        '出品コード', '商品名', 'モール', '出荷',                                    // 出品 4
-        '売価(税抜)', '売価(税込)', '送料収入',                                      // 売上 3
-        '原価(税抜)', '何個ぶん',                                                    // 仕入 2
-        '配送方法', '送料区分', '送料', '出荷作業料', '梱包資材費', '人件費', 'FBA配送代行',  // 配送 7
-        '販売手数料', '成約料', '基本成約料', '手数料 合計', '手数料率',              // 手数料 5
-        '想定利益', '想定利益率', '状態',                                            // 結果 3
-      ];
-      for (const h of cols) html += '<th>' + escapeHtml(h) + '</th>';
+      html += '<tr class="ep-group">';
+      for (const g of EP_GROUPS) {
+        html += '<th colspan="' + g.span + '"' + epStickyClass(g) + '>' + escapeHtml(g.label) + '</th>';
+      }
+      html += '</tr><tr>';
+      for (const col of EP_COLS) html += '<th' + epStickyClass(col) + '>' + escapeHtml(col.label) + '</th>';
       html += '</tr></thead><tbody>';
-      // 値が無い (その経路では発生しない) ことと 0 円を見分けられるようにする
-      const money = (v) => (v == null ? '<span style="color:#d1d5db;">—</span>' : epNum(v));
-      for (const r of epState.rows) {
-        const profitStyle = (r.expected_profit != null && r.expected_profit < 0) ? ' style="color:#dc2626;font-weight:600;"' : '';
-        html += '<tr>';
-        html += '<td>' + escapeHtml(r.mall_item_key) + '</td>';
-        html += '<td>' + escapeHtml(r.product_name || '') + '</td>';
-        html += '<td>' + escapeHtml(MALL_FEE_RATES_LABEL[r.mall] || r.mall) + '</td>';
-        html += '<td>' + escapeHtml(r.fulfillment || '') + '</td>';
-        // ── 売上 ──
-        html += '<td>' + epNum(r.price_ex_tax) + '</td>';
-        html += '<td>' + epNum(r.price_incl_tax) + '</td>';
-        html += '<td>' + money(r.postage_revenue_ex_tax) + '</td>';
-        // ── 仕入 ──
-        html += '<td>' + epNum(r.cost_ex_tax) + '</td>';
-        // まとめ買いSKU は単品原価 x 数量。何個ぶんかを出さないと原価が高すぎるように見える
-        html += '<td>' + (r.unit_quantity == null ? '<span style="color:#d1d5db;">—</span>'
-          : (r.unit_quantity > 1 ? '<b style="color:#b45309;">×' + r.unit_quantity + '</b>' : '1')) + '</td>';
-        // ── 配送にかかる費用 (6列 + FBA配送代行) ──
-        if (isFba) {
-          html += '<td colspan="6" style="color:#9ca3af;">Amazon が配送するので自社の配送費はかからない</td>';
-        } else {
-          html += '<td>' + escapeHtml(r.shipping_method || '—') + '</td>';
-          html += '<td style="color:#6b7280;">' + escapeHtml(r.shipping_code || '—') + '</td>';
-          html += '<td>' + money(r.shipping_fee_ex_tax) + '</td>';
-          html += '<td>' + money(r.shipping_work_ex_tax) + '</td>';
-          html += '<td>' + money(r.shipping_material_ex_tax) + '</td>';
-          html += '<td>' + money(r.shipping_labor_ex_tax) + '</td>';
-        }
-        html += '<td>' + money(r.fba_fee_ex_tax) + '</td>';
-        // ── 手数料 ──
-        html += '<td>' + money(r.referral_fee_ex_tax) + '</td>';
-        html += '<td>' + money(r.closing_fee_ex_tax) + '</td>';
-        html += '<td>' + money(r.per_item_fee_ex_tax) + '</td>';
-        html += '<td>' + money(r.fee_total_ex_tax) + '</td>';
-        html += '<td>' + epPct(r.fee_rate_display) + (r.mall === 'amazon' ? '' : ' <span style="color:#9ca3af;">概算</span>') + '</td>';
-        // ── 結果 ──
-        html += '<td' + profitStyle + '>' + epNum(r.expected_profit) + '</td>';
-        html += '<td' + profitStyle + '>' + epPct(r.expected_margin_rate) + '</td>';
-        html += '<td style="font-size:11px;color:#6b7280;">'
-          + (r.rank_eligible_now ? '' : escapeHtml(epReason(r.rank_exclusion_reason_now || r.incomplete_reason))) + '</td>';
-        html += '</tr>';
+
+      for (let i = 0; i < epState.rows.length; i++) {
+        html += epRowHtml(epState.rows[i], i);
       }
       html += '</tbody></table></div>';
-      html += '<div style="font-size:11px;color:#6b7280;margin-top:6px;">'
-        + epNum(epState.rows.length) + ' / ' + epNum(epState.total) + ' 件を表示</div>';
+      html += '<div class="notice-small">' + epNum(epState.rows.length) + ' / ' + epNum(epState.total)
+        + ' 件を表示 — 行を押すと、その1件の計算の内訳が開きます</div>';
       c.innerHTML = html;
       bindExpectedProfitEvents();
     }
 
+    function epStickyClass(col) {
+      if (col.stickyL) return ' class="ep-stick-l"';
+      if (col.stickyR2) return ' class="ep-stick-r2"';
+      if (col.stickyR) return ' class="ep-stick-r"';
+      return '';
+    }
+
+    function epCard(label, value, sub, tone) {
+      return '<div class="card' + (tone ? ' ' + tone : '') + '"><div class="label">' + escapeHtml(label) + '</div>'
+        + '<div class="value">' + value + '</div>'
+        + (sub ? '<div class="sub">' + escapeHtml(sub) + '</div>' : '') + '</div>';
+    }
+
+    /** ISO 文字列を「9/8 16:34」のように読める形にする */
+    function epWhen(iso) {
+      if (!iso) return '—';
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return String(iso);
+      return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    }
+
+    /** 値が無い (その経路では発生しない) ことと 0 円を見分けられるようにする */
+    function epMoney(v) {
+      return (v == null ? '<span class="ep-none">—</span>' : epNum(v));
+    }
+
+    /**
+     * 🚨 この計算で実際に使った配送。中原さんの指示 (2026-09-08):
+     *    「どの配送方法を使ったのか記載して」。送料コード (501) だけでは何のことか読めないので、
+     *    送料マスタの区分名 (ネコポス等) を正とし、無いときだけ NE 登録の配送方法に落とす
+     */
+    function epShippingLabel(r) {
+      const name = r.shipping_rate_name || r.shipping_method;
+      if (!name) return '<span class="ep-none">—</span>';
+      return '<span class="ep-ship">' + escapeHtml(name) + '</span>'
+        + (r.shipping_code ? '<span class="ep-ship-code">' + escapeHtml(r.shipping_code) + '</span>' : '');
+    }
+
+    function epRowHtml(r, idx) {
+      const isFba = r.fulfillment === 'FBA';
+      const profitClass = (r.expected_profit != null && r.expected_profit < 0) ? 'num-neg' : 'num-pos';
+      let rowClass = '';
+      if (r.expected_profit != null && r.expected_profit < 0) rowClass = 'row-danger';
+      else if (r.expected_margin_rate != null && r.expected_margin_rate < 0.05) rowClass = 'row-warning';
+
+      let html = '<tr class="' + rowClass + '" data-ep-idx="' + idx + '">';
+      // ── 商品 (左に貼り付け) ──
+      const reason = r.rank_eligible_now ? '' : epReason(r.rank_exclusion_reason_now || r.incomplete_reason);
+      html += '<td class="ep-stick-l">'
+        + '<div class="ep-name" title="' + escapeHtml(r.product_name || '') + '">' + escapeHtml(r.product_name || '(商品名なし)') + '</div>'
+        + '<div class="ep-sub">' + escapeHtml(r.mall_item_key) + ' · '
+        + '<span class="badge badge-mall">' + escapeHtml(MALL_FEE_RATES_LABEL[r.mall] || r.mall) + '</span> '
+        + (r.fulfillment ? '<span class="badge ' + (isFba ? 'badge-fba' : 'badge-fbm') + '">' + escapeHtml(r.fulfillment) + '</span>' : '')
+        + (reason ? ' <span class="ep-chip ep-chip-warn">' + escapeHtml(reason) + '</span>' : '')
+        + '</div></td>';
+      // ── 売上 ──
+      html += '<td>' + epNum(r.price_ex_tax) + '</td>';
+      html += '<td>' + epNum(r.price_incl_tax) + '</td>';
+      html += '<td>' + epMoney(r.postage_revenue_ex_tax) + '</td>';
+      // ── 仕入 ──
+      html += '<td>' + epMoney(r.cost_ex_tax) + '</td>';
+      // まとめ買いSKU は単品原価 × 数量。何個ぶんかを出さないと原価が高すぎるように見える
+      html += '<td>' + (r.unit_quantity == null ? '<span class="ep-none">—</span>'
+        : (r.unit_quantity > 1 ? '<b style="color:var(--warn);">×' + r.unit_quantity + '</b>' : '1')) + '</td>';
+      // ── 配送にかかる費用 (使った配送 + 内訳5 + FBA配送代行 = 7列) ──
+      html += '<td style="text-align:left;">' + (isFba ? '<span class="ep-chip">Amazon (FBA)</span>' : epShippingLabel(r)) + '</td>';
+      if (isFba) {
+        html += '<td colspan="5" style="text-align:left;color:var(--faint);">Amazon が配送するので自社の配送費はかからない</td>';
+      } else {
+        html += '<td>' + epMoney(r.shipping_fee_ex_tax) + '</td>';
+        html += '<td>' + epMoney(r.shipping_work_ex_tax) + '</td>';
+        html += '<td>' + epMoney(r.shipping_material_ex_tax) + '</td>';
+        html += '<td>' + epMoney(r.shipping_labor_ex_tax) + '</td>';
+        html += '<td>' + epMoney(r.shipping_total_ex_tax) + '</td>';
+      }
+      html += '<td>' + epMoney(r.fba_fee_ex_tax) + '</td>';
+      // ── 手数料 ──
+      html += '<td>' + epMoney(r.referral_fee_ex_tax) + '</td>';
+      html += '<td>' + epMoney(r.closing_fee_ex_tax) + '</td>';
+      html += '<td>' + epMoney(r.per_item_fee_ex_tax) + '</td>';
+      html += '<td>' + epMoney(r.fee_total_ex_tax) + '</td>';
+      html += '<td>' + epPct(r.fee_rate_display) + (r.mall === 'amazon' ? '' : ' <span class="ep-none">概算</span>') + '</td>';
+      // ── 結果 (右に貼り付け) ──
+      html += '<td class="ep-stick-r2 ' + profitClass + '">' + epNum(r.expected_profit) + '</td>';
+      html += '<td class="ep-stick-r ' + profitClass + ' ep-margin">' + epPct(r.expected_margin_rate) + '</td>';
+      html += '</tr>';
+      return html;
+    }
+
+    /**
+     * 1行ぶんの計算内訳。「なぜこの利益になったか」を式のまま出す。
+     * 🚨 ここでは計算し直さない。保存された内訳をそのまま足して見せるだけ
+     */
+    function epDetailHtml(r) {
+      const isFba = r.fulfillment === 'FBA';
+      const line = (label, v, sign) => '<div class="ep-calc-row"><span class="ep-calc-label">' + escapeHtml(label)
+        + '</span><span class="ep-calc-val">' + (v == null ? '<span class="ep-none">—</span>' : (sign || '') + epNum(v)) + '</span></div>';
+      let calc = '<div class="ep-calc">';
+      calc += line('売価 (税抜)', r.price_ex_tax);
+      if (r.postage_revenue_ex_tax) calc += line('送料収入 (税抜)', r.postage_revenue_ex_tax, '+');
+      calc += line('原価 (税抜)' + (r.unit_quantity > 1 ? ' × ' + r.unit_quantity + '個ぶん' : ''), r.cost_ex_tax, '−');
+      if (!isFba) calc += line('配送関係費 合計', r.shipping_total_ex_tax, '−');
+      if (r.fba_fee_ex_tax != null) calc += line('FBA配送代行', r.fba_fee_ex_tax, '−');
+      calc += line('モール手数料 合計', r.fee_total_ex_tax, '−');
+      calc += '<div class="ep-calc-row total"><span class="ep-calc-label">想定利益</span>'
+        + '<span class="ep-calc-val ' + (r.expected_profit < 0 ? 'num-neg' : 'num-pos') + '">'
+        + epNum(r.expected_profit) + ' 円 (' + epPct(r.expected_margin_rate) + ')</span></div>';
+      calc += '</div>';
+
+      // 🚨 「どの配送方法を使ったか」を言葉で書く (中原さん 2026-09-08)
+      const shipRevenue = { included: '送料込み (別途もらっていない)', ok: '別途もらっている', unknown: '不明 (0円として計算)' };
+      let facts = '<dl class="ep-facts">';
+      facts += '<dt>この計算で使った配送</dt><dd>' + (isFba
+        ? 'Amazon が配送 (FBA)。自社の送料・作業料は発生しない'
+        : (r.shipping_rate_name
+          ? escapeHtml(r.shipping_rate_name) + ' <span class="ep-ship-code">送料コード ' + escapeHtml(r.shipping_code || '—') + '</span>'
+            + (r.shipping_rate_category ? ' <span class="ep-chip">' + escapeHtml(r.shipping_rate_category) + '</span>' : '')
+          : '<span class="ep-none">送料区分が未登録のため決まっていません</span>')) + '</dd>';
+      if (!isFba && r.shipping_method) {
+        facts += '<dt>NE に登録されている配送方法</dt><dd>' + escapeHtml(r.shipping_method) + '</dd>';
+      }
+      if (r.shipping_group) {
+        facts += '<dt>モール側の配送パターン</dt><dd>' + escapeHtml(r.shipping_group) + '</dd>';
+      }
+      facts += '<dt>送料収入の扱い</dt><dd>' + escapeHtml(shipRevenue[r.shipping_revenue_status] || r.shipping_revenue_status || '—') + '</dd>';
+      facts += '<dt>原価の出所</dt><dd>' + escapeHtml(r.cost_method === 'set_master' ? 'セット原価' : r.cost_method === 'single' ? '単品原価' : (r.cost_method || '—'))
+        + (r.ne_code ? ' · NE品番 ' + escapeHtml(r.ne_code) : '') + '</dd>';
+      facts += '<dt>手数料</dt><dd>' + (r.mall === 'amazon' ? 'SP-API の見積' : '料率からの簡易見積')
+        + ' · 実効 ' + epPct(r.fee_rate_display) + '</dd>';
+      if (!r.rank_eligible_now) {
+        facts += '<dt>ランキングに載せていない理由</dt><dd class="ep-note-warn">'
+          + escapeHtml(epReason(r.rank_exclusion_reason_now || r.incomplete_reason)) + '</dd>';
+      }
+      facts += '</dl>';
+
+      return '<tr class="ep-detail"><td colspan="' + EP_COLS.length + '"><div class="ep-detail-inner">'
+        + calc + facts + '</div></td></tr>';
+    }
+
     // inline onclick は品番の ' で壊れるので addEventListener で結ぶ
     function bindExpectedProfitEvents() {
+      const mallSel = document.getElementById('ep-mall');
+      if (mallSel) mallSel.addEventListener('change', function () {
+        // 絞り込みの正本は実績タブと共有の #filter-mall (CSV も同じ値を見る)
+        document.getElementById('filter-mall').value = this.value;
+        loadExpectedProfit();
+      });
       const scope = document.getElementById('ep-scope');
       const sort = document.getElementById('ep-sort');
       const order = document.getElementById('ep-order');
@@ -696,6 +958,21 @@
         });
         if (mall) q.set('mall', mall);
         window.location.href = '/apps/profit-analysis/api/expected-profit.csv?' + q.toString();
+      });
+
+      // 行を押したら、その1件の計算の内訳を開く (もう一度押すと閉じる)。
+      // 🚨 委譲で結ぶ。行ごとに inline onclick を書くと品番の ' で壊れる
+      const tbody = document.querySelector('.ep-table tbody');
+      if (tbody) tbody.addEventListener('click', function (ev) {
+        const tr = ev.target.closest('tr[data-ep-idx]');
+        if (!tr) return;
+        const open = tr.nextElementSibling && tr.nextElementSibling.classList.contains('ep-detail');
+        // 開いているものは1つだけにする (どの行の内訳か迷わせない)
+        for (const d of tbody.querySelectorAll('tr.ep-detail')) d.remove();
+        if (open) return;
+        const row = epState.rows[Number(tr.dataset.epIdx)];
+        if (!row) return;
+        tr.insertAdjacentHTML('afterend', epDetailHtml(row));
       });
     }
 
@@ -737,14 +1014,15 @@
 
     function renderSummary(s) {
       if (!s) return;
+      // 単位を書く (「848,804」が何なのか分からない、を無くす)
       document.getElementById('summary-cards').innerHTML = `
-        <div class="card"><div class="label">対象商品</div><div class="value">${formatNumber(s.count)}</div></div>
-        <div class="card"><div class="label">売上合計</div><div class="value">${formatNumber(s.total_revenue)}</div></div>
-        <div class="card"><div class="label">原価合計(税込)</div><div class="value">${formatNumber(s.total_cost)}</div></div>
-        <div class="card"><div class="label">送料合計</div><div class="value">${formatNumber(s.total_shipping)}</div></div>
-        <div class="card"><div class="label">手数料合計</div><div class="value">${formatNumber(s.total_fee)}</div></div>
-        <div class="card ${s.total_profit < 0 ? 'danger' : 'success'}"><div class="label">粗利合計</div><div class="value">${formatNumber(s.total_profit)}</div></div>
-        <div class="card ${s.avg_margin_rate < 10 ? 'danger' : s.avg_margin_rate < 15 ? 'warning' : 'success'}"><div class="label">平均粗利率</div><div class="value">${s.avg_margin_rate}%</div></div>
+        <div class="card"><div class="label">対象商品</div><div class="value">${formatNumber(s.count)}</div><div class="sub">件</div></div>
+        <div class="card"><div class="label">売上合計</div><div class="value">${formatNumber(s.total_revenue)}</div><div class="sub">円</div></div>
+        <div class="card"><div class="label">原価合計</div><div class="value">${formatNumber(s.total_cost)}</div><div class="sub">円 (税込)</div></div>
+        <div class="card"><div class="label">送料合計</div><div class="value">${formatNumber(s.total_shipping)}</div><div class="sub">円</div></div>
+        <div class="card"><div class="label">手数料合計</div><div class="value">${formatNumber(s.total_fee)}</div><div class="sub">円</div></div>
+        <div class="card ${s.total_profit < 0 ? 'danger' : 'success'}"><div class="label">粗利合計</div><div class="value">${formatNumber(s.total_profit)}</div><div class="sub">円</div></div>
+        <div class="card ${s.avg_margin_rate < 10 ? 'danger' : s.avg_margin_rate < 15 ? 'warning' : 'success'}"><div class="label">平均粗利率</div><div class="value">${s.avg_margin_rate}%</div><div class="sub">売上に対する粗利</div></div>
       `;
     }
 
@@ -790,24 +1068,23 @@
       }
       const isTrend = currentView === 'trend';
       const cols = [
-        { key: 'listing_code', label: 'コード' },
-        { key: 'product_name', label: '商品名' },
+        { key: 'product_name', label: '商品' },
         { key: 'mall', label: 'モール' },
         { key: 'qty', label: '数量' },
         { key: 'revenue', label: '売上' },
         { key: 'cost', label: '原価(税込)' },
         { key: 'shipping', label: '送料' },
-        { key: 'platform_fee', label: 'PF手数料' },
+        { key: 'platform_fee', label: '手数料' },
         { key: 'gross_profit', label: '粗利額' },
-        { key: 'margin_rate', label: '粗利率%' },
+        { key: 'margin_rate', label: '粗利率' },
       ];
       if (isTrend) {
         cols.push({ key: 'prev_profit', label: '前月粗利' });
-        cols.push({ key: 'profit_change_pct', label: '変化率%' });
+        cols.push({ key: 'profit_change_pct', label: '変化率' });
       }
       let html = '<div class="table-wrap"><table class="data-table"><thead><tr>';
       for (const c of cols) {
-        const arrow = sortCol === c.key ? (sortAsc ? ' ▲' : ' ▼') : '';
+        const arrow = sortCol === c.key ? (sortAsc ? ' ↑' : ' ↓') : '';
         html += `<th data-sort-col="${escapeHtml(c.key)}" onclick="doProfitSort(this.dataset.sortCol)">${escapeHtml(c.label)}${arrow}</th>`;
       }
       html += '</tr></thead><tbody>';
@@ -820,24 +1097,25 @@
         const channelBadge = d.channel === 'FBA' ? ' <span class="badge badge-fba">FBA</span>' :
                              d.channel === 'FBM' ? ' <span class="badge badge-fbm">FBM</span>' : '';
         html += `<tr class="${rowClass}">`;
-        html += `<td>${escapeHtml(d.listing_code)}</td>`;
-        html += `<td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(d.product_name||'')}">${escapeHtml(d.product_name || '-')}</td>`;
-        html += `<td>${escapeHtml(mallLabel)}${channelBadge}</td>`;
+        // 商品名とコードは1つのセルにまとめる (列が多いほど読みにくい)
+        html += `<td class="cell-name" title="${escapeHtml(d.product_name||'')}">${escapeHtml(d.product_name || '-')}`
+          + `<div class="cell-code">${escapeHtml(d.listing_code)}</div></td>`;
+        html += `<td><span class="badge badge-mall">${escapeHtml(mallLabel)}</span>${channelBadge}</td>`;
         html += `<td>${formatNumber(d.qty)}</td>`;
         html += `<td>${formatNumber(d.revenue)}</td>`;
         html += `<td>${formatNumber(d.cost)}</td>`;
         html += `<td>${formatNumber(d.shipping)}</td>`;
         html += `<td>${formatNumber(d.platform_fee)}</td>`;
-        html += `<td style="color:${d.gross_profit < 0 ? '#dc2626' : '#111'};font-weight:600;">${formatNumber(d.gross_profit)}</td>`;
-        html += `<td style="font-weight:600;color:${d.margin_rate < 5 ? '#dc2626' : d.margin_rate < 10 ? '#f59e0b' : '#16a34a'}">${d.margin_rate}%</td>`;
+        html += `<td class="${d.gross_profit < 0 ? 'num-neg' : ''}">${formatNumber(d.gross_profit)}</td>`;
+        html += `<td class="${d.margin_rate < 10 ? 'num-neg' : 'num-pos'}">${d.margin_rate}%</td>`;
         if (isTrend) {
           html += `<td>${formatNumber(d.prev_profit)}</td>`;
-          html += `<td style="color:#dc2626;font-weight:600;">${d.profit_change_pct}%</td>`;
+          html += `<td class="num-neg">${d.profit_change_pct}%</td>`;
         }
         html += '</tr>';
       }
       html += '</tbody></table></div>';
-      html += `<div style="font-size:11px;color:#9ca3af;margin-top:4px;">${data.length}件表示</div>`;
+      html += `<div class="notice-small">${data.length}件表示 — 見出しを押すと並び替わります</div>`;
       document.getElementById('table-container').innerHTML = html;
     }
 
