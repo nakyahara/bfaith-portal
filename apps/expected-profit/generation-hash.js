@@ -18,7 +18,7 @@ import crypto from 'crypto';
 /** ハッシュに含める列。ここに無い列は「変えても検出できない」ことになる */
 export const HASH_COLUMNS = [
   // 同一性
-  'mall', 'shop_id', 'mall_item_key', 'ne_code', 'fulfillment',
+  'mall', 'shop_id', 'mall_item_key', 'ne_code', 'ne_code_source', 'fulfillment',
   // 金額 (符号を決める)
   'expected_profit', 'expected_margin_rate',
   'revenue_ex_tax', 'cost_ex_tax', 'unit_quantity', 'shipping_total_ex_tax', 'fba_fee_ex_tax', 'fee_total_ex_tax',

@@ -12,7 +12,7 @@ import os from 'os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-pub-'));
 
-const { initExpectedProfitDB, getExpectedProfitDB, addColumnIfMissing } = await import('./db.js');
+const { initExpectedProfitDB, getExpectedProfitDB, addColumnIfMissing, MIGRATED_COLUMNS } = await import('./db.js');
 const { receiveChunk, publishGeneration, getPublished, chunkChecksum, pruneGenerations, generationContentHash } = await import('./publish-api.js');
 const { makeChunks, makeManifest, publishToRender } = await import('./publish.js');
 const { hashRows } = await import('./generation-hash.js');
@@ -35,6 +35,7 @@ const mkRow = (key, over = {}) => ({
   generation_id: null, mall: 'rakuten', shop_id: '1', mall_item_key: key, ne_code: 'ne001',
   product_name: 'x', sales_class: 3, fulfillment: 'self', listing_status: 'active',
   price_incl_tax: 1100, price_ex_tax: 1000, postage_revenue_ex_tax: 0, revenue_ex_tax: 1000, tax_rate: 0.1,
+  ne_code_source: 'sku_map',
   cost_ex_tax: 600, cost_method: 'single', unit_quantity: 1, shipping_code: '501', shipping_method: 'ネコポス',
   shipping_fee_ex_tax: 180, shipping_work_ex_tax: 20, shipping_material_ex_tax: 10, shipping_labor_ex_tax: 9,
   shipping_total_ex_tax: 219, fba_fee_ex_tax: 0, referral_fee_ex_tax: null, closing_fee_ex_tax: null,
@@ -384,11 +385,29 @@ t('新規DBは初期化の時点で列を持っている', () => {
 
 t('[!] 本番の初期化 (initExpectedProfitDB) が既存DBに列を足す', () => {
   // 🚨 addColumnIfMissing を直接呼ぶだけのテストでは「migrate を呼び忘れている」を
-  //    検出できない。既存DBから列を落として、本番の入口を通し直して確かめる
-  db.exec('ALTER TABLE mart_listing_expected_profit DROP COLUMN unit_quantity');
-  assert.equal(cols(db).includes('unit_quantity'), false, '前提: 列を落とせている');
+  //    検出できない。既存DBから列を落として、本番の入口を通し直して確かめる。
+  // 🚨 列名を決め打ちせず MIGRATED_COLUMNS を全部見る。決め打ちだと、
+  //    新しい列を足したときに「migrate への追加忘れ」を素通りさせる
+  const target = MIGRATED_COLUMNS.filter(([t]) => t === 'mart_listing_expected_profit');
+  assert.ok(target.length > 0);
+  for (const [, column] of target) {
+    db.exec(`ALTER TABLE mart_listing_expected_profit DROP COLUMN ${column}`);
+    assert.equal(cols(db).includes(column), false, `前提: ${column} を落とせている`);
+  }
   const reopened = initExpectedProfitDB();     // 本番と同じ入口
-  assert.ok(cols(reopened).includes('unit_quantity'), '初期化を通したのに列が足されていない');
+  for (const [, column] of target) {
+    assert.ok(cols(reopened).includes(column), `初期化を通したのに ${column} が足されていない`);
+  }
+});
+
+t('[!] DDL に書いた列は MIGRATED_COLUMNS にも入っている (既存DBに足し忘れない)', () => {
+  // 新規DBの列と、移行で足せる列を突き合わせる
+  const listed = new Set(MIGRATED_COLUMNS.filter(([t]) => t === 'mart_listing_expected_profit').map(([, c]) => c));
+  const live = getExpectedProfitDB();   // 直前の試験で開き直しているので、いまのハンドルを使う
+  for (const c of ['unit_quantity', 'ne_code_source']) {
+    assert.ok(cols(live).includes(c), `新規DBに ${c} が無い`);
+    assert.ok(listed.has(c), `${c} が MIGRATED_COLUMNS に無い = 既存DBには足されない`);
+  }
 });
 
 // 🚨 再オープンしていることがあるので、いま開いているハンドルを閉じる (Windows は開いたままだと消せない)

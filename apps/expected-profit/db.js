@@ -158,6 +158,7 @@ function createTables(db) {
     shop_id                   TEXT NOT NULL,
     mall_item_key             TEXT NOT NULL,
     ne_code                   TEXT,
+    ne_code_source            TEXT,              -- sku_map / fbm_ne_code (§16-12)
     product_name              TEXT,
     sales_class               INTEGER,
     fulfillment               TEXT,
@@ -297,8 +298,18 @@ export function setSetting(db, key, value, now = new Date().toISOString()) {
  *    miniPC と Render の両方に既存DBがあるので、ここを通さないと
  *    「送る側にはある列が、受け取る側では無い」状態になる。
  */
+/**
+ * 既存DBに足す列の一覧。
+ * 🚨 列を足すときは**ここに1行足すだけ**にする。migrate に直接書くと、
+ *    試験が特定の列名を決め打ちしていて「足し忘れ」を検出できない
+ */
+export const MIGRATED_COLUMNS = [
+  ['mart_listing_expected_profit', 'unit_quantity', 'INTEGER'],
+  ['mart_listing_expected_profit', 'ne_code_source', 'TEXT'],
+];
+
 export function migrate(db) {
-  addColumnIfMissing(db, 'mart_listing_expected_profit', 'unit_quantity', 'INTEGER');
+  for (const [table, column, type] of MIGRATED_COLUMNS) addColumnIfMissing(db, table, column, type);
 }
 
 /** 冪等な列追加 (エラーは握り潰さない) */

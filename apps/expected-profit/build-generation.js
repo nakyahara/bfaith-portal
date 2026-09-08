@@ -157,7 +157,7 @@ export function buildGeneration(db, deps = {}) {
   `);
   const insertRow = db.prepare(`
     INSERT INTO mart_listing_expected_profit
-      (generation_id, mall, shop_id, mall_item_key, ne_code, product_name, sales_class, fulfillment,
+      (generation_id, mall, shop_id, mall_item_key, ne_code, ne_code_source, product_name, sales_class, fulfillment,
        listing_status, price_incl_tax, price_ex_tax, postage_revenue_ex_tax, revenue_ex_tax, tax_rate,
        cost_ex_tax, cost_method, unit_quantity, shipping_code, shipping_method, shipping_fee_ex_tax, shipping_work_ex_tax,
        shipping_material_ex_tax, shipping_labor_ex_tax, shipping_total_ex_tax, fba_fee_ex_tax,
@@ -168,7 +168,7 @@ export function buildGeneration(db, deps = {}) {
        calculation_status, incomplete_reason, rank_eligible, rank_exclusion_reason, expense_scope_version,
        input_snapshot, formula_version, scenario_version, fee_rate_version, code_version, price_run_id, built_at)
     VALUES
-      (@generation_id, @mall, @shop_id, @mall_item_key, @ne_code, @product_name, @sales_class, @fulfillment,
+      (@generation_id, @mall, @shop_id, @mall_item_key, @ne_code, @ne_code_source, @product_name, @sales_class, @fulfillment,
        @listing_status, @price_incl_tax, @price_ex_tax, @postage_revenue_ex_tax, @revenue_ex_tax, @tax_rate,
        @cost_ex_tax, @cost_method, @unit_quantity, @shipping_code, @shipping_method, @shipping_fee_ex_tax, @shipping_work_ex_tax,
        @shipping_material_ex_tax, @shipping_labor_ex_tax, @shipping_total_ex_tax, @fba_fee_ex_tax,

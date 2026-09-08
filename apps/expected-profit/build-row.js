@@ -20,8 +20,21 @@ import {
 import { isExpired } from './util.js';
 import { skuMapHasQuantity } from './load-inputs.js';
 
-/** 出品 → NE商品コード。1対多は「原価構成が一意に決まらない」= ambiguous (§7.2) */
-export function resolveNeCode(listing, skuMap) {
+/**
+ * 出品 → NE商品コード。1対多は「原価構成が一意に決まらない」= ambiguous (§7.2)
+ *
+ * 🚨 Amazon は出荷区分で紐づけ方が違う (中原さん 2026-09-08)。
+ *    - **FBA** = 対応表 (`v_sku_resolved`) で紐づける。ここに無ければ未紐づけ
+ *    - **FBM (自社出荷)** = 在庫連携の都合で、**SKU がそのまま NE の商品コード**
+ *      (単品) **または NE のセット商品コード**になっている。
+ *      セットの原価は NE 側が構成品から計算済み (`原価ソース = 'セット計算'`)
+ *
+ *    実測 (2026-09-08): 未紐づけ FBM 3,445 件のうち **3,369 件**が台帳に同じコードで存在
+ *    (単品 2,504 / セット 865)。FBA 側は 1,311 件中 4 件しか一致しない = ルールどおり。
+ *
+ * @param {Map} products ne_code(小文字) → 商品。FBM のフォールバックで存在を確かめる
+ */
+export function resolveNeCode(listing, skuMap, products = null) {
   // 楽天は対応表 (rakuten_code → ne_code)、Amazon は v_sku_resolved (seller_sku → ne_code[])
   const key = listing.mall === 'rakuten'
     ? String(listing.mall_item_ref || listing.mall_item_key.split('/')[1] || '').toLowerCase()
@@ -34,13 +47,32 @@ export function resolveNeCode(listing, skuMap) {
       if (alt && alt.length === 1) return { status: 'ok', neCode: alt[0].ne_code, qty: alt[0].qty ?? null };
       if (alt && alt.length > 1) return { status: 'ambiguous', reason: 'multiple_ne_codes' };
     }
+    // 🚨 FBM は対応表に載っていないのが普通。SKU がそのまま NE の商品コード
+    //    (単品またはセット) なら、それで紐づける
+    const fbm = fbmNeCode(listing, products);
+    if (fbm) return fbm;
     return { status: 'unresolved', reason: 'ne_code_not_found' };
   }
   if (hit.length > 1) {
     // 1出品が複数の NE 商品を指す = この出品だけでは原価構成が決まらない
     return { status: 'ambiguous', reason: 'multiple_ne_codes' };
   }
-  return { status: 'ok', neCode: hit[0].ne_code, qty: hit[0].qty ?? null };
+  return { status: 'ok', neCode: hit[0].ne_code, qty: hit[0].qty ?? null, source: 'sku_map' };
+}
+
+/**
+ * Amazon の自社出荷 (FBM) だけ、SKU をそのまま NE の商品コードとして引く。
+ *
+ * 🚨 **数量は 1**。NE の商品 (単品でもセットでも) 1 つが、Amazon の 1 出品に対応する。
+ *    「3個セット」なら NE 側に 3 個ぶんの原価が入っているので、ここで掛けてはいけない。
+ * 🚨 FBA には使わない。FBA は対応表で紐づける決まり (実測でも 1,311 件中 4 件しか一致しない)。
+ */
+export function fbmNeCode(listing, products) {
+  if (!products) return null;
+  if (listing?.mall !== 'amazon' || listing?.fulfillment !== 'FBM') return null;
+  const code = String(listing.mall_item_key ?? '').toLowerCase();
+  if (!code || !products.has(code)) return null;
+  return { status: 'ok', neCode: code, qty: 1, source: 'fbm_ne_code' };
 }
 
 /**
@@ -65,6 +97,7 @@ export function buildRow(listing, ctx) {
     shop_id: listing.shop_id,
     mall_item_key: listing.mall_item_key,
     ne_code: null,
+    ne_code_source: null,
     product_name: null,
     sales_class: null,
     fulfillment,
@@ -137,13 +170,15 @@ export function buildRow(listing, ctx) {
   }
 
   // ── 4. NE商品への対応付け ──
-  const resolved = resolveNeCode(listing, ctx.skuMap);
+  const resolved = resolveNeCode(listing, ctx.skuMap, ctx.products);
   if (resolved.status !== 'ok') {
     row.cost_status = resolved.status === 'ambiguous' ? 'ambiguous' : 'unresolved';
     row.incomplete_reason = resolved.reason;
     return finish(row, 'incomplete', listing);
   }
   row.ne_code = resolved.neCode;
+  // どうやって紐づけたか (対応表 / FBM の商品コード直引き) を残す
+  row.ne_code_source = resolved.source ?? null;
 
   const product = ctx.products.get(String(resolved.neCode).toLowerCase());
   if (!product) {

@@ -9,7 +9,7 @@
  * 実行: node apps/expected-profit/test-build-row.mjs
  */
 import assert from 'node:assert/strict';
-import { buildRow, resolveNeCode } from './build-row.js';
+import { buildRow, resolveNeCode, fbmNeCode } from './build-row.js';
 import { normalizeQty } from './load-inputs.js';
 // 手作りキーだと保存側とのズレを検出できない (Codex R4-2)。本番と同じ関数で作る
 import { feeCacheKey } from './calc.js';
@@ -401,6 +401,126 @@ t('resolveNeCode は数量も返す', () => {
   assert.equal(resolveNeCode({ mall: 'amazon', mall_item_key: 'sku1' }, m).qty, 5);
   const m2 = new Map([['sku1', [{ ne_code: 'ne001' }]]]);
   assert.equal(resolveNeCode({ mall: 'amazon', mall_item_key: 'sku1' }, m2).qty, null);
+});
+
+
+console.log('');
+console.log('Amazon FBM は SKU がそのまま NE の商品コード (中原さん 2026-09-08)');
+
+// 自社出荷 (FBM) の Amazon 出品。送料は自社もちなので送料区分が要る
+const fbmListing = (over = {}) => ({
+  mall: 'amazon', shop_id: 'S1@M1', mall_item_key: 'ne001', mall_item_ref: 'B001',
+  fulfillment: 'FBM', price_incl_tax: 1980, price_tax_included: 1, mall_tax_rate: null,
+  postage_included: 1, postage_revenue_incl_tax: 0, points: 0,
+  listing_status: 'active', fetch_status: 'ok', valid_until: FUTURE, fetched_at: '2026-09-07T00:00:00Z',
+  ...over,
+});
+
+// FBM の見積 (送料込みなので in_shipping = 0)
+const fbmFee = () => new Map([[
+  feeCacheKey({ seller_id: 'S1', marketplace_id: 'M1', seller_sku: 'ne001',
+    in_listing_price: 1980, in_shipping: 0, in_points: 0, in_fulfillment: 'FBM' }),
+  {
+    seller_id: 'S1', marketplace_id: 'M1', seller_sku: 'ne001', asin: 'B001',
+    in_listing_price: 1980, in_shipping: 0, in_points: 0, in_fulfillment: 'FBM', in_currency: 'JPY',
+    referral_fee_ex_tax: 166, closing_fee_ex_tax: 0, per_item_fee_ex_tax: 0,
+    fba_fee_incl_tax: null, fee_status: 'ok', fee_breakdown: '[]',
+    fetched_at: '2026-09-06T00:00:00Z', valid_until: FUTURE,
+  },
+]]);
+
+t('[!] 対応表に無くても、SKU が NE の商品コードなら紐づく', () => {
+  // 実測: 未紐づけ FBM 3,445 件のうち 3,369 件が台帳に同じコードで存在した
+  const ctx = baseCtx({ skuMap: new Map(), feeEstimates: fbmFee() });   // 対応表は空
+  const r = buildRow(fbmListing(), ctx);
+  assert.equal(r.ne_code, 'ne001');
+  assert.equal(r.ne_code_source, 'fbm_ne_code');
+  assert.equal(r.calculation_status, 'ok');
+});
+
+t('[!] そのとき数量は 1 (セットなら NE 側に構成品ぶんの原価が入っている)', () => {
+  // 🚨 「3個セット」の NE 原価は既に 3 個ぶん。ここで掛けたら二重になる
+  const ctx = baseCtx({ skuMap: new Map(), feeEstimates: fbmFee() });
+  const r = buildRow(fbmListing(), ctx);
+  assert.equal(r.unit_quantity, 1);
+  assert.ok(near(r.cost_ex_tax, 600), `NE の原価そのまま (実際 ${r.cost_ex_tax})`);
+});
+
+t('[!] FBA には使わない (FBA は対応表で紐づける決まり)', () => {
+  // 実測でも FBA 1,311 件のうち台帳に一致するのは 4 件だけ = ルールどおり
+  const ctx = baseCtx({ skuMap: new Map(), feeEstimates: feeCache() });
+  const r = buildRow(amazonListing({ mall_item_key: 'ne001' }), ctx);
+  assert.equal(r.calculation_status, 'incomplete');
+  assert.equal(r.incomplete_reason, 'ne_code_not_found');
+});
+
+t('[!] 台帳にも無い FBM は、これまでどおり未紐づけ', () => {
+  const ctx = baseCtx({ skuMap: new Map(), feeEstimates: fbmFee() });
+  const r = buildRow(fbmListing({ mall_item_key: 'nosuchcode' }), ctx);
+  assert.equal(r.incomplete_reason, 'ne_code_not_found');
+  assert.equal(r.ne_code_source, null);
+});
+
+t('[!] 対応表にあれば対応表を優先する (直引きで上書きしない)', () => {
+  const ctx = baseCtx({
+    skuMap: new Map([['ne001', [{ ne_code: 'ne001', qty: 3 }]]]),
+    feeEstimates: fbmFee(),
+  });
+  const r = buildRow(fbmListing(), ctx);
+  assert.equal(r.ne_code_source, 'sku_map');
+  assert.equal(r.unit_quantity, 3, '対応表の数量が生きる');
+});
+
+t('[!] セット原価 (原価ソース = セット計算) もそのまま使える', () => {
+  const ctx = baseCtx({
+    skuMap: new Map(), feeEstimates: fbmFee(),
+    products: new Map([['ne001', {
+      商品コード: 'ne001', 商品名: '3個セット', 原価: 1800, 原価ソース: 'セット計算',
+      原価状態: 'COMPLETE', 消費税率: 0.1, 送料コード: '501', 配送方法: 'ネコポス', 売上分類: 3,
+    }]]),
+  });
+  const r = buildRow(fbmListing(), ctx);
+  assert.equal(r.cost_method, 'set_master');
+  assert.ok(near(r.cost_ex_tax, 1800), 'セットの原価は構成品ぶん。数量を掛けない');
+  assert.equal(r.unit_quantity, 1);
+});
+
+t('[!] 原価が未完成のセットは、これまでどおり計算しない', () => {
+  const ctx = baseCtx({
+    skuMap: new Map(), feeEstimates: fbmFee(),
+    products: new Map([['ne001', {
+      商品コード: 'ne001', 商品名: '未完成セット', 原価: 1800, 原価ソース: 'セット計算',
+      原価状態: 'PARTIAL', 消費税率: 0.1, 送料コード: '501', 配送方法: 'ネコポス', 売上分類: 3,
+    }]]),
+  });
+  const r = buildRow(fbmListing(), ctx);
+  assert.equal(r.incomplete_reason, 'set_cost_incomplete');
+});
+
+t('[!] 送料コードが無ければ計算しない (実測: セット 865 件中 99 件が該当)', () => {
+  const ctx = baseCtx({
+    skuMap: new Map(), feeEstimates: fbmFee(),
+    products: new Map([['ne001', {
+      商品コード: 'ne001', 商品名: '送料区分なし', 原価: 600, 原価ソース: 'NE',
+      原価状態: 'COMPLETE', 消費税率: 0.1, 送料コード: null, 配送方法: null, 売上分類: 3,
+    }]]),
+  });
+  const r = buildRow(fbmListing(), ctx);
+  assert.equal(r.incomplete_reason, 'shipping_master_missing');
+});
+
+t('fbmNeCode は大文字小文字を吸収する', () => {
+  const products = new Map([['ne001', {}]]);
+  assert.equal(fbmNeCode({ mall: 'amazon', fulfillment: 'FBM', mall_item_key: 'NE001' }, products).neCode, 'ne001');
+});
+
+t('fbmNeCode は Amazon FBM 以外に効かない', () => {
+  const products = new Map([['ne001', {}]]);
+  assert.equal(fbmNeCode({ mall: 'rakuten', fulfillment: 'self', mall_item_key: 'ne001' }, products), null);
+  assert.equal(fbmNeCode({ mall: 'amazon', fulfillment: 'FBA', mall_item_key: 'ne001' }, products), null);
+  assert.equal(fbmNeCode({ mall: 'amazon', fulfillment: null, mall_item_key: 'ne001' }, products), null);
+  assert.equal(fbmNeCode({ mall: 'amazon', fulfillment: 'FBM', mall_item_key: '' }, products), null);
+  assert.equal(fbmNeCode({ mall: 'amazon', fulfillment: 'FBM', mall_item_key: 'ne001' }, null), null);
 });
 
 console.log(`\n${passed} 件 PASS`);

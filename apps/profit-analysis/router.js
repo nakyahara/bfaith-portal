@@ -442,7 +442,7 @@ router.get('/api/expected-profit', (req, res) => {
 // CSV 出力。🚨 数式インジェクション対策は外部由来の文字列列にだけ適用する (§9.4)
 const EXPECTED_PROFIT_CSV_COLS = [
   ['出品コード', 'mall_item_key', true], ['商品名', 'product_name', true], ['モール', 'mall', true],
-  ['出荷', 'fulfillment', true], ['NE品番', 'ne_code', true],
+  ['出荷', 'fulfillment', true], ['NE品番', 'ne_code', true], ['紐づけ方', 'ne_code_source', true],
   ['売価(税抜)', 'price_ex_tax'], ['売価(税込)', 'price_incl_tax'], ['送料収入(税抜)', 'postage_revenue_ex_tax'],
   ['原価(税抜)', 'cost_ex_tax'], ['原価の出所', 'cost_method', true], ['単品何個ぶん', 'unit_quantity'],
   ['送料区分', 'shipping_method', true], ['配送関係費', 'shipping_total_ex_tax'],
