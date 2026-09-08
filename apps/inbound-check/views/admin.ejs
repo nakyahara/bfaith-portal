@@ -614,7 +614,7 @@
         if (!confirm((j.message || '') + '\n\nそれでも取り込みますか？\n(いろはの在庫化カードが一斉に消えます)')) {
           return msg($('#uploadMsg'), false, '取り込みませんでした');
         }
-        fd.append('force', '1');
+        fd.set('force', j.force_token);
         msg($('#uploadMsg'), true, '取込中…');
         r = await fetch(BASE + '/admin/upload', { method: 'POST', body: fd });
         j = await r.json().catch(() => ({}));

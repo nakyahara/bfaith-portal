@@ -14,7 +14,8 @@
  * 取り消された (未着手・実績なしは自動で終了:取消)。一覧から商品が全部消えた。
  *
  * ## 何を戻すか
- * ⭐**その取込が触ったものだけ**。時刻の窓 + 取消の出どころで絞る。
+ * ⭐**指定した時間の間に、取込が取り消したものだけ**。時刻の窓 + 取消の出どころで絞る。
+ *   ⚠同じ窓に別の正常な取込があれば、それも入る — だから窓は人が中身を見て決める
  *   - 行き先 (f_inbound_check_destinations): cancelled_by='import' かつ窓の中
  *   - カード (f_iroha_tasks): close_reason='cancelled' かつ cancellation_source='inbound_import' かつ窓の中
  *   - まとまり (f_iroha_task_batches): そのカードのぶんで、同じときに取消になったもの

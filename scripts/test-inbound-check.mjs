@@ -739,8 +739,14 @@ console.log('\n[G] 🚨確認ずみの行き先が一斉に取り消される取
   // ══ ⑤ 人が中身を見て押したときは通す (逃げ道) ══
   const b4 = getActiveBatch();
   makeAtRisk(b4.id, 1);
-  const forced = importCsv(makeCsv([]), { fileName: 'empty2.csv', source: 'manual_upload', generatedAt: '2028-09-20T06:00:00Z', force: true });
-  ok(forced.ok, '⭐人が確かめて押したときは通す (本当に入荷が無い日の逃げ道)');
+  const opt6 = { fileName: 'empty2.csv', source: 'manual_upload', generatedAt: '2028-09-20T06:00:00Z' };
+  const refused = importCsv(makeCsv([]), opt6);
+  ok(!refused.ok && !!refused.force_token, '断るときに合言葉を返す (画面がそれを持って送り直す)');
+  const wrong = importCsv(makeCsv([]), { ...opt6, force: 'でたらめな合言葉' });
+  ok(!wrong.ok, '⭐でたらめな合言葉では通らない');
+  ok(/対象が変わりました/.test(wrong.message), '⭐画面で見たのと中身が違うと言う (黙って通さない)');
+  const forced = importCsv(makeCsv([]), { ...opt6, force: refused.force_token });
+  ok(forced.ok, '⭐人が画面で件数を見て押したときは通す (本当に入荷が無い日の逃げ道)');
 
   // ══ ⑥ 失うものが無ければ止めない ══
   const g3 = importCsv(makeCsv([row('GE1', 1, 'g-8', 2)]), { fileName: 'g3.csv', source: 'auto', generatedAt: '2028-09-20T07:00:00Z' });
@@ -748,6 +754,55 @@ console.log('\n[G] 🚨確認ずみの行き先が一斉に取り消される取
   ok(atRisk(getActiveBatch().id) === 0, '(前提) 確認ずみの行き先は無い');
   const empty2 = importCsv(makeCsv([], { header: [...HEADER].reverse() }), { fileName: 'empty3.csv', source: 'auto', generatedAt: '2028-09-20T08:00:00Z' });
   ok(empty2.ok, '⭐行き先のある確認ずみの行が無ければ、0 行でも止めない (失うものが無い)');
+
+  // ══ ⑦ 🚨明細は残っているのに、商品が全部差し替わった CSV ══
+  //    取消の道は「行が消える」だけではない。明細が在っても商品や予定数が変われば
+  //    確認は引き継げず、行き先は取り消される。行が消える道だけ見張ると、ここから同じ全消しが通る
+  const g4 = importCsv(makeCsv([row('GF1', 1, 'g-10', 3), row('GF1', 2, 'g-11', 3), row('GF1', 3, 'g-12', 3)]),
+    { fileName: 'g4.csv', source: 'auto', generatedAt: '2028-09-20T09:00:00Z' });
+  ok(g4.ok, '(前提) 3 行の CSV を取り込める');
+  const b5 = getActiveBatch();
+  makeAtRisk(b5.id, 3);
+  ok(atRisk(b5.id) === 3, '(前提) 行き先のある確認ずみの行が 3 件');
+
+  const swapped = importCsv(makeCsv([row('GF1', 1, 'x-10', 3), row('GF1', 2, 'x-11', 3), row('GF1', 3, 'x-12', 3)]),
+    { fileName: 'swapped.csv', source: 'auto', generatedAt: '2028-09-20T10:00:00Z' });
+  ok(!swapped.ok && swapped.error === 'mass_cancel',
+    '⭐明細は在るが商品が全部差し替わった CSV も断る (行が消える道だけ見張ると素通しになる)');
+  ok(atRisk(b5.id) === 3, '⭐3 件とも残っている');
+
+  // ══ ⑧ 消えた 2 件 + 商品が変わった 1 件 = 3 件全滅 ══
+  //    消えた数だけ数えると 2/3 件なので通ってしまい、実際には 3 件とも取り消される
+  const mixed = importCsv(makeCsv([row('GF1', 1, 'x-10', 3)]),
+    { fileName: 'mixed.csv', source: 'auto', generatedAt: '2028-09-20T11:00:00Z' });
+  ok(!mixed.ok && mixed.error === 'mass_cancel',
+    '⭐消えた 2 件 + 商品が変わった 1 件 でも断る (消えた数だけでは 2/3 件に見える)');
+  ok(atRisk(b5.id) === 3, '⭐3 件とも残っている');
+
+  // ══ ⑨ 商品が変わっても 1 件残れば通す (正常な日を止めない) ══
+  const keep1 = importCsv(makeCsv([row('GF1', 1, 'g-10', 3), row('GF1', 2, 'x-11', 3)]),
+    { fileName: 'keep1.csv', source: 'auto', generatedAt: '2028-09-20T12:00:00Z' });
+  ok(keep1.ok, '⭐商品が変わった行があっても、引き継げる行が 1 つ残れば取り込む');
+
+  // ══ ⑩ ⭐画面で件数を見てから押すまでの間に対象が変わったら、その合言葉では通らない ══
+  //    「3 件が取り消されます」を見て納得したのに、押したときには 4 件だった、を防ぐ。
+  //    合言葉は取り消す予定の中身そのものから作ってあるので、中身が変われば合わなくなる
+  const g5 = importCsv(makeCsv([row('GG1', 1, 'g-20', 1), row('GG1', 2, 'g-21', 1),
+    row('GG1', 3, 'g-22', 1), row('GG1', 4, 'g-23', 1)]),
+    { fileName: 'g5.csv', source: 'auto', generatedAt: '2028-09-20T13:00:00Z' });
+  ok(g5.ok, '(前提) 4 行の CSV を取り込める');
+  const b6 = getActiveBatch();
+  makeAtRisk(b6.id, 3);
+  const optS = { fileName: 'stale.csv', source: 'manual_upload', generatedAt: '2028-09-20T14:00:00Z' };
+  const csvS = makeCsv([row('GH9', 1, 'g-99', 1)]);
+  const first = importCsv(csvS, optS);
+  ok(!first.ok && first.error === 'mass_cancel', '(前提) 3 件が取り消されるので断られる');
+  makeAtRisk(b6.id, 4);                        // 押すまでの間に 4 件目が確認された
+  const stale = importCsv(csvS, { ...optS, force: first.force_token });
+  ok(!stale.ok, '⭐画面で見たあとに対象が増えたら、そのときの合言葉では通らない');
+  ok(/対象が変わりました/.test(stale.message), '何が起きたかを言う (黙って通さない)');
+  const fresh = importCsv(csvS, { ...optS, force: stale.force_token });
+  ok(fresh.ok, '⭐いまの中身の合言葉で押し直せば通る (詰まらせない)');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

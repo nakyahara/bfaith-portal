@@ -903,8 +903,9 @@ router.post('/admin/upload', requireSession, checkOrigin, upload.single('file'),
   const now = Date.now();
   const generatedAt = Number.isFinite(lm) && lm > 0 ? new Date(Math.min(lm, now)).toISOString() : null;
   // ⭐確認ずみの行き先が一斉に取り消される取込は既定で断る (2026-09-08 の事故)。
-  //   人が中身を見て「これで正しい」と押したときだけ通す (画面が確認を出してから付ける)
-  const force = req.body?.force === '1' || req.body?.force === true;
+  //   人が画面で件数を見て押したときだけ通す。合言葉は断ったときに返した force_token で、
+  //   **取り消す予定の中身そのもの**から作ってあるので、確認してから押すまでに対象が変われば通らない
+  const force = typeof req.body?.force === 'string' && req.body.force ? req.body.force : null;
   const r = importCsv(buf, { fileName: req.file.originalname, source: 'manual_upload', actor: req.session.email, generatedAt, force });
   if (!r.ok) return res.status(r.error === 'bad_csv' ? 400 : 409).json(r);
   res.json(r);
