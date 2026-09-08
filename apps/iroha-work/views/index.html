@@ -319,6 +319,11 @@
   .pill.wait{background:var(--danger-soft);color:var(--danger)}
   .pill.ok{background:var(--ok-soft);color:var(--ok)}
   .pill.loc{background:var(--well);color:var(--sub)}
+  /* 🚚 入荷予定: 行を開く先が無いので押せる見た目にしない */
+  .tbl.plain tbody tr{cursor:default}
+  .tbl.plain tbody tr:active{background:transparent}
+  .pill.iroha{background:var(--accent-soft);color:var(--accent)}
+  .pill.na{background:var(--amber-soft);color:var(--amber)}
   .tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
   .tools .date{border:1px solid var(--line);border-radius:var(--r);padding:8px 10px;font-size:.95rem;background:var(--surface);color:var(--ink)}
   .sum{font-size:.8rem;color:var(--faint);margin:8px 2px;font-family:var(--num)}
@@ -748,6 +753,7 @@
     <button id="vBoard" onclick="setView('board')">🗂 ボード</button>
     <button id="vLabel" onclick="setView('label')">🏷 ラベル待ち</button>
     <button id="vHistory" onclick="setView('history')">📚 履歴</button>
+    <button id="vInbound" onclick="setView('inbound')">🚚 入荷予定</button>
   </div>
   <div class="banner err" id="errBanner" onclick="this.classList.remove('on')"></div>
   <div class="banner warn" id="warnBanner" onclick="this.classList.remove('on')"></div>
@@ -893,6 +899,23 @@
       <tbody id="histBody"><tr><td colspan="8">読み込み中…</td></tr></tbody>
     </table></div>
     </div>
+  </div>
+
+  <!-- ══ 画面1f: 入荷予定 (仕入先コード 0001 だけ。ロジザードの入荷受付伝票が元 — 中原さん 2026-09-08) ══ -->
+  <div class="page inboundpage" hidden>
+    <div class="tools">
+      <span class="flabel" id="ipSupplier">入荷予定</span>
+      <button class="chip" id="ipAllBtn" onclick="setIpIrohaOnly(false)">すべて</button>
+      <button class="chip" id="ipIrohaBtn" onclick="setIpIrohaOnly(true)">いろはで作業する分だけ</button>
+      <button class="chip" onclick="loadInboundPlan()">🔄 いま更新</button>
+      <span class="sum" id="ipSum"></span>
+    </div>
+    <div class="banner warn" id="ipStale" onclick="this.classList.remove('on')"></div>
+    <div class="tblwrap"><table class="tbl plain">
+      <thead><tr><th>入荷予定日</th><th>商品</th><th>数量</th><th>いろは在庫化区分</th></tr></thead>
+      <tbody id="ipBody"><tr><td colspan="4">読み込み中…</td></tr></tbody>
+    </table></div>
+    <p class="hint" id="ipNote"></p>
   </div>
 
   <!-- ══ 画面2: 詳細 ══ -->
@@ -1707,9 +1730,9 @@ $('#list').addEventListener('click', (e) => {
   if (row.dataset.pick === '1') toggleBulk(row.dataset.id); else openDetail(row.dataset.id);
 });
 
-// ─── 画面の切替 (作業 / ボード / ラベル待ち / 履歴) ───
-const PAGES = { list: '.listpage', board: '.boardpage', plan: '.planpage', cplan: '.cplanpage', label: '.labelpage', history: '.historypage' };
-const VIEW_BTN = { list: '#vList', board: '#vBoard', label: '#vLabel', history: '#vHistory' };
+// ─── 画面の切替 (作業 / ボード / ラベル待ち / 履歴 / 入荷予定) ───
+const PAGES = { list: '.listpage', board: '.boardpage', plan: '.planpage', cplan: '.cplanpage', label: '.labelpage', history: '.historypage', inbound: '.inboundpage' };
+const VIEW_BTN = { list: '#vList', board: '#vBoard', label: '#vLabel', history: '#vHistory', inbound: '#vInbound' };
 function setView(v) {
   if (v === 'plan' && isApp() && !stateCan('task.plan.assign')) v = 'board';   // 計画は職員だけ (下見は誰でも読むだけ)
   // ⭐預ける計画は職員だけ。Notion が正本のうちは預けそのものが使えないので開かない
@@ -1725,6 +1748,7 @@ function setView(v) {
   if (v === 'plan') loadPlan();
   if (v === 'cplan') loadConsignPlan();
   if (v === 'label') loadLabelWaits();
+  if (v === 'inbound') loadInboundPlan();
   if (v === 'history') { renderHistTools(); if (histMode === 'daily') loadDaily(); else loadHistory(); }
 }
 function renderViews() { const el = $('#views'); if (el) el.hidden = false; }
@@ -3575,6 +3599,107 @@ async function saveLw() {
   } finally {
     btn.disabled = !stateCan('task.label_wait.edit');   // 保存中に許可が変わっていたら押せないまま
   }
+}
+
+// ─── 🚚 入荷予定 (仕入先コード 0001 だけ — 中原さん 2026-09-08) ───
+//   「入荷予定が見れるようにしてほしい。仕入先コード0001だけ商品名数量、いろは在庫化区分が見れたらいい」
+//   元データの作り方と「どこまで先が見えるか」はサーバー側 (apps/iroha-work/inbound-plan.js) の冒頭に書いてある。
+//   読むだけの画面なので 5 秒巡回には乗せない (元の CSV は 30 分おきにしか変わらない)。開いたときと 🔄 で取り直す
+let ipData = null;         // 直近に取れた入荷予定 (絞り込みの切替で描き直すために持っておく)
+let ipIrohaOnly = false;   // 既定は「すべて」— 出していない行があると思わせない
+const IP_WEEKDAY = ['日', '月', '火', '水', '木', '金', '土'];
+
+function setIpIrohaOnly(v) { ipIrohaOnly = !!v; renderInboundPlan(); }
+
+/** UTC ISO → JST の日付 ('YYYY-MM-DD')。iPad の時計は信じず、サーバーの now から出す */
+function ipJstDate(iso) {
+  const t = Date.parse(iso || '');
+  if (!isFinite(t)) return '';
+  return new Date(t + 32400000).toISOString().slice(0, 10);
+}
+function ipShiftDate(ymd, days) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd || '');
+  if (!m) return '';
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+/** 'YYYY-MM-DD' → 'きょう 9/8(火)'。日付を数えなくても分かるように、今日・明日は言葉にする */
+function ipDayLabel(ymd, today) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd || '');
+  if (!m) return '日付なし';
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  const label = Number(m[2]) + '/' + Number(m[3]) + '(' + IP_WEEKDAY[d.getUTCDay()] + ')';
+  if (!today) return label;
+  if (ymd === today) return 'きょう ' + label;
+  if (ymd === ipShiftDate(today, 1)) return 'あした ' + label;
+  return label;
+}
+
+async function loadInboundPlan() {
+  const j = await apiFetch('/api/inbound-plan');
+  if (!j.ok) {
+    $('#ipBody').innerHTML = '<tr><td colspan="4">' + esc(j.message || '読み込めませんでした') + '</td></tr>';
+    return;
+  }
+  ipData = j;
+  renderInboundPlan();
+}
+
+function renderInboundPlan() {
+  $('#ipAllBtn').classList.toggle('on', !ipIrohaOnly);
+  $('#ipIrohaBtn').classList.toggle('on', ipIrohaOnly);
+  const j = ipData;
+  if (!j) return;
+  const sup = j.supplier || {};
+  const code = (sup.codes || []).join('・');
+  $('#ipSupplier').textContent = '入荷予定 — 仕入先 ' + code + (sup.name ? ' ' + sup.name : '');
+
+  const stale = $('#ipStale');
+  stale.classList.toggle('on', !!j.day_stale);
+  if (j.day_stale) {
+    stale.innerHTML = '⚠ 本日の取込がまだ来ていません'
+      + '<small>前の日に取り込んだ一覧を出しています。しばらくすると新しくなります。</small>';
+  }
+
+  const all = j.rows || [];
+  const rows = ipIrohaOnly ? all.filter((r) => r.iroha_kind === 'yes') : all;
+  const t = j.totals || {};
+  let shownQty = 0;
+  for (const r of rows) shownQty += Number(r.qty) || 0;
+  $('#ipSum').textContent = rows.length + ' 商品 / ' + shownQty + ' 個'
+    + (!ipIrohaOnly && t.iroha_products ? '　(うち いろはで作業する分 ' + t.iroha_products + ' 商品 / ' + t.iroha_qty + ' 個)' : '');
+
+  const today = ipJstDate(j.serverNow);
+  if (!j.batch) {
+    $('#ipBody').innerHTML = '<tr><td colspan="4">入荷受付の取込がまだありません</td></tr>';
+  } else if (rows.length === 0) {
+    $('#ipBody').innerHTML = '<tr><td colspan="4">'
+      + (ipIrohaOnly && all.length ? 'いろはで作業する分はありません'
+        : '仕入先 ' + esc(code) + ' の入荷予定はありません') + '</td></tr>';
+  } else {
+    $('#ipBody').innerHTML = rows.map((r) => {
+      const past = r.planned_date && today && r.planned_date < today;
+      // 区分の札: 有り = いろは行き / 未記入 = 入庫情報管理で決めてもらう必要がある / それ以外 = 入っている文字のまま
+      const pill = r.iroha_kind === 'yes' ? 'iroha' : (r.iroha_kind === 'unknown' ? 'na' : 'loc');
+      return '<tr>'
+        + '<td class="num">' + esc(ipDayLabel(r.planned_date, today))
+          + (past ? '<br><small>予定日は過ぎています</small>' : '') + '</td>'
+        + '<td class="wrap">' + esc(r.product_name || '(名称なし)')
+          + '<br><small>' + esc(r.product_code || '')
+          + (r.lines > 1 ? ' / ' + r.lines + ' 行ぶんの合計' : '') + '</small>'
+          + (r.supplier_conflict ? '<br><small>⚠ 商品マスタで仕入先が食い違っています (職員に伝えてください)</small>' : '') + '</td>'
+        + '<td class="num">' + esc(r.qty) + ' 個</td>'
+        + '<td><span class="pill ' + pill + '">' + esc(r.iroha) + '</span></td>'
+        + '</tr>';
+    }).join('');
+  }
+
+  $('#ipNote').innerHTML = 'ロジザードの入荷受付伝票 (倉庫の iPad が見ているのと同じもの) から、仕入先 '
+    + esc(code) + ' の商品だけを取り出しています。'
+    + 'ロジザード側の集計が「当日から7日前まで」なので、<b>今日届く分と、その少し前に受け付けた分</b>が出ます (もっと先の予定は出ません)。'
+    + '「いろは在庫化区分」は入庫情報管理の「いろは在庫化作業有無」です。'
+    + (j.batch ? '<br>この一覧は ' + esc(fmtDateTime(j.batch.imported_at)) + ' に取り込んだものです。' : '');
 }
 
 // ─── 📅 きょうのみんなの作業 (日報 — 監修「あった方がよい機能」)。人 × 商品 × 分。利用者本人が見る ───

@@ -71,13 +71,14 @@
       <li><a href="#s7">まちがえたとき (もどす)</a></li>
       <li><a href="#s8">さがす・もどる・文字を大きく</a></li>
       <li><a href="#s9">きょうのみんなの作業</a></li>
-      <li><a href="#s10">職員: 職員モード</a></li>
-      <li><a href="#s11">職員: 計画 (どこが・いつ)</a></li>
-      <li><a href="#s12">職員: 棚入完了・外部出し・ラベル待ち</a></li>
-      <li><a href="#s13">職員: 外部にあずける (ワークセンター・羅針盤)</a></li>
-      <li><a href="#s14">職員: 分かれたカード (まとまり) の扱い</a></li>
-      <li><a href="#s15">職員: 管理画面 (PC)</a></li>
-      <li><a href="#s16">こまったとき</a></li>
+      <li><a href="#s10">🚚 入荷予定 (これから来るもの)</a></li>
+      <li><a href="#s11">職員: 職員モード</a></li>
+      <li><a href="#s12">職員: 計画 (どこが・いつ)</a></li>
+      <li><a href="#s13">職員: 棚入完了・外部出し・ラベル待ち</a></li>
+      <li><a href="#s14">職員: 外部にあずける (ワークセンター・羅針盤)</a></li>
+      <li><a href="#s15">職員: 分かれたカード (まとまり) の扱い</a></li>
+      <li><a href="#s16">職員: 管理画面 (PC)</a></li>
+      <li><a href="#s17">こまったとき</a></li>
     </ol>
   </nav>
 
@@ -206,10 +207,24 @@
     <figure><img src="/app-images/iroha-work/manual/m17-daily.png" alt="きょうのみんなの作業: 人ごとに商品と時間が並ぶ" loading="lazy"><figcaption>人 × 商品 × 時間。</figcaption></figure>
   </section>
 
+  <section id="s10">
+    <h2><span class="no">10</span>🚚 入荷予定 (これから来るもの)</h2>
+    <p class="why">なぜ: 何がいくつ来るのかが先に分かると、資材や置き場所の用意ができるため。</p>
+    <ol class="steps">
+      <li>上の <kbd>🚚 入荷予定</kbd> をおします。</li>
+      <li><b>アメージングクラフト様 (仕入先 0001)</b> から来るものが、<b>入荷予定日 / 商品 / 数量 / いろは在庫化区分</b>で出ます。</li>
+      <li><kbd>いろはで作業する分だけ</kbd> をおすと、いろは在庫化区分が <b>有り</b> のものだけになります。<kbd>すべて</kbd> でもどります。</li>
+      <li>新しくするときは <kbd>🔄 いま更新</kbd> をおします。</li>
+    </ol>
+    <div class="callout">ここに出るのは<b>今日届く分と、その少し前に受け付けた分</b>です。もっと先の予定は出ません。</div>
+    <div class="callout">いろは在庫化区分が <b>未記入</b> の商品は、いろはでやるかどうかがまだ決まっていません。職員に伝えてください。</div>
+    <div class="callout">この画面は<b>見るだけ</b>です。ここから作業ははじめられません。カードは商品が届いてから <kbd>📋 作業</kbd> に出ます。</div>
+  </section>
+
   <div class="staffnote">ここからは職員の方向けです。</div>
 
-  <section id="s10" class="staff">
-    <h2><span class="no">10</span>職員モード</h2>
+  <section id="s11" class="staff">
+    <h2><span class="no">11</span>職員モード</h2>
     <p class="why">なぜ: 計画・外部出し・終了などは職員だけの操作。PIN で 30 分だけ開きます。</p>
     <ol class="steps">
       <li>右上の名前を<b>職員</b>にすると <kbd>🔑 職員モードに入る</kbd> が出ます。おして<b>職員PIN</b>を入れます。</li>
@@ -229,8 +244,8 @@
     </ol>
   </section>
 
-  <section id="s11" class="staff">
-    <h2><span class="no">11</span>計画 (どこが・いつ)</h2>
+  <section id="s12" class="staff">
+    <h2><span class="no">12</span>計画 (どこが・いつ)</h2>
     <p class="why">なぜ: 「どこが (どの施設が) やるか」「いつやるか」を決めるのは職員の仕事。利用者の画面では決まった予定を見られますが、変えられるのは職員だけです。</p>
     <ol class="steps">
       <li>ボードのカードの <kbd>どこが 未定</kbd> をおす → いろは／羅針盤／ワークセンター／ジョブサポ／パレット／未定にする。</li>
@@ -246,8 +261,8 @@
     <figure><img src="/app-images/iroha-work/manual/m15-plan.png" alt="明日の計画: 左に候補、右に明日やる分、上に時間のゲージ" loading="lazy"><figcaption>明日の計画。左の候補から右へ。</figcaption></figure>
   </section>
 
-  <section id="s12" class="staff">
-    <h2><span class="no">12</span>棚入完了・外部出し・ラベル待ち</h2>
+  <section id="s13" class="staff">
+    <h2><span class="no">13</span>棚入完了・外部出し・ラベル待ち</h2>
     <ol class="steps">
       <li><b>棚入完了 (1 枚ずつ)</b>: 棚入待ちのカードに出る <kbd>✅ 棚入完了</kbd> → 確認 → PIN。終了になり一覧から外れます (履歴に残ります)。</li>
       <li><b>まとめて</b>: 職員モードのとき、棚入待ちの列に <kbd>まとめて棚入完了</kbd> が出ます → カードをおして選ぶ → 下の <kbd>まとめて棚入完了にする</kbd> → 確認 (一覧が出ます) → PIN。</li>
@@ -258,8 +273,8 @@
     <figure><img src="/app-images/iroha-work/manual/m16-stock-confirm.png" alt="棚入完了の確認ダイアログ: はい、棚入完了にする" loading="lazy"><figcaption>棚入完了の確認。このあと PIN。</figcaption></figure>
   </section>
 
-  <section id="s13" class="staff">
-    <h2><span class="no">13</span>外部にあずける (ワークセンター・羅針盤)</h2>
+  <section id="s14" class="staff">
+    <h2><span class="no">14</span>外部にあずける (ワークセンター・羅針盤)</h2>
     <p class="why">なぜ: いろはだけで作りきれない量を、よその施設にお願いします。物を持って行ってもらうので、<b>渡した数・返ってきた数</b>をきちんと数えます。</p>
     <ol class="steps">
       <li>カードをひらいて <kbd>🚚 外部にあずける</kbd>。<b>どこへ</b>・<b>何個</b>を選びます。渡せる数の上限と、その施設が<b>いま何時間ぶん・何箱おけるか</b>が出ます。</li>
@@ -279,8 +294,8 @@
     </ol>
   </section>
 
-  <section id="s14" class="staff">
-    <h2><span class="no">14</span>分かれたカード (まとまり) の扱い</h2>
+  <section id="s15" class="staff">
+    <h2><span class="no">15</span>分かれたカード (まとまり) の扱い</h2>
     <p class="why">なぜ: 外部にあずけたり、期限が違う物が混ざったりすると、1 枚のカードが<b>2 つ以上のまとまり</b>に分かれます。分かれたカードでは「どのぶんか」を必ず選びます。</p>
     <ol class="steps">
       <li>分かれると、カードの中に <b>「作業のまとまり」</b> の欄が出ます (1 つのときは出ません = ふだんの見え方は変わりません)。</li>
@@ -307,8 +322,8 @@
     </ol>
   </section>
 
-  <section id="s15" class="staff">
-    <h2><span class="no">15</span>管理画面 (PC)</h2>
+  <section id="s16" class="staff">
+    <h2><span class="no">16</span>管理画面 (PC)</h2>
     <p class="why">ポータル → いろは在庫化 作業アプリ 管理。よく使うのは上の 3 つ。</p>
     <ul class="notes">
       <li><b>👤 名簿</b>: 利用者・職員の追加、職員PIN の設定、並び順。</li>
@@ -320,8 +335,8 @@
     </ul>
   </section>
 
-  <section id="s16">
-    <h2><span class="no">16</span>こまったとき</h2>
+  <section id="s17">
+    <h2><span class="no">17</span>こまったとき</h2>
     <ul class="notes">
       <li><b>「サーバーにつながりません」</b>と出る: 前回の一覧を表示しています。少し待つと自動でつなぎ直します。数分たっても直らなければ職員へ。</li>
       <li><b>ボタンが出ない</b>: その人にはできない操作です (例: 計画・終了は職員だけ)。名前を替えるか、職員をよんでください。</li>

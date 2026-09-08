@@ -601,6 +601,45 @@ console.log('\n[箱ラベル] POST /api/print/jobs はまとまり単位 (§AB-1
   getDB().prepare('DELETE FROM f_iroha_print_jobs WHERE task_id = ?').run(t);
 }
 
+console.log('\n[入荷予定] 🚚 仕入先0001の入荷予定を読む口 (中原さん 2026-09-08)');
+{
+  sessionRole = 'admin';
+  const { importCsv } = await import('../apps/inbound-check/db.js');
+  const iconv = (await import('iconv-lite')).default;
+  const db = getDB();
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 仕入先コード, updated_at)
+    VALUES (901, 'IP-AMC', 'マスタ名', '単品', '取扱中', 'ok', '0001', '2026-09-08T00:00:00Z')`).run();
+  db.prepare(`INSERT INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 仕入先コード, updated_at)
+    VALUES (902, 'IP-OTHER', 'よそのマスタ名', '単品', '取扱中', 'ok', '0002', '2026-09-08T00:00:00Z')`).run();
+  db.prepare(`INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, いろは在庫化作業有無, source, created_at, updated_at)
+    VALUES ('ip-amc', 'IP-AMC', 'マスタ名', '有り', 'manual', '2026-09-08T00:00:00Z', '2026-09-08T00:00:00Z')`).run();
+  const HEADER = ['入荷管理番号', '入荷管理行番号', '入荷管理詳細行番号', 'ステータス', '入荷予定日', '入荷受付日',
+    '商品ID', '商品名', '予定数', '受付数', '作成日時', '更新日時', 'バーコード'];
+  const line = (no, pid, qty) => [ 'AR-IP', no, 1, '受付済', '20260908', '20260908', pid, `商品 ${pid}`, qty, qty, '20260908090000', '20260908090000', '4500000000000'];
+  const csv = iconv.encode([HEADER, line(1, 'IP-AMC', 12), line(2, 'IP-OTHER', 99)]
+    .map((r) => r.map((v) => `"${v}"`).join(',')).join('\r\n') + '\r\n', 'cp932');
+  const imported = importCsv(csv, { source: 'manual_upload', fileName: 'ip.csv' });
+  ok(imported.ok, '検査用の入荷受付CSVを取り込めた' + (imported.ok ? '' : ': ' + imported.message));
+
+  const r = await get('/api/inbound-plan');
+  ok(r.status === 200 && r.json && r.json.ok, '職員は読める (' + r.status + ')');
+  ok(r.json.supplier && r.json.supplier.codes.join() === '0001', '仕入先コード 0001 を返す');
+  ok(r.json.rows.length === 1 && r.json.rows[0].product_code === 'IP-AMC',
+    '⭐0001 の商品だけ返す (router が仕入先で絞ったものをそのまま渡している)');
+  ok(r.json.rows[0].qty === 12 && r.json.rows[0].iroha === '有り' && r.json.rows[0].product_name === '商品 IP-AMC',
+    '⭐商品名・数量・いろは在庫化区分がそろっている');
+  ok(r.json.batch && r.json.batch.imported_at && r.json.serverNow, 'いつ取り込んだか・サーバーの今の時刻も返る (画面が「きょう」を出すため)');
+
+  // ⭐利用者の iPad (職員モードなし) からも読める — この画面は職員だけのものではない
+  const dev = createDevice('検査用 iPad (入荷予定)', 'test');
+  sessionRole = null;
+  const asDevice = await get('/api/inbound-plan', 'iw_device=' + dev.token);
+  ok(asDevice.status === 200 && asDevice.json && asDevice.json.ok, '⭐登録ずみの iPad からも読める (' + asDevice.status + ')');
+  const anon = await get('/api/inbound-plan');
+  ok(anon.status === 401 || anon.status === 403, '⭐ログインも端末登録もしていなければ出さない (' + anon.status + ')');
+  sessionRole = 'admin';
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 // process.exit で落とすと、開いたままの接続を libuv が abort することがある
 // (feedback_notify_job_exit_libuv_crash)。閉じてから終了コードだけ置いて自然に終わらせる

@@ -89,6 +89,7 @@ import {
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
+import { listInboundPlan } from './inbound-plan.js';
 import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment, updateReturnCounts } from './consign.js';
 import { startStaffUnlock, staffUnlockOf, endStaffUnlock, STAFF_UNLOCK_MS } from './db.js';
 import {
@@ -1415,6 +1416,13 @@ router.get('/api/label-waits', api((req, res) => {
   const taskId = req.query.task_id == null ? null : parseTaskId(req.query.task_id);
   if (req.query.task_id != null && taskId == null) return res.status(400).json(BAD_TASK_ID);
   res.json({ ok: true, preview: !isAppMode(), rows: listLabelWaits({ taskId, openOnly: req.query.all !== '1' }) });
+}));
+
+// ─── 🚚 入荷予定 (中原さん 2026-09-08「仕入先コード0001だけ 商品名・数量・いろは在庫化区分が見れたらいい」) ───
+// 読むだけ。正本は ロジザード (入荷受付伝票) と 入庫情報管理 なので、Notion/アプリ どちらが正本でも同じものを返す。
+// 中身の作り方と「どこまで先が見えるか」は inbound-plan.js の冒頭に書いてある
+router.get('/api/inbound-plan', api((req, res) => {
+  res.json({ ok: true, ...listInboundPlan(), serverNow: new Date().toISOString() });
 }));
 
 /**
