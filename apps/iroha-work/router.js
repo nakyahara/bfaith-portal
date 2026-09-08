@@ -40,7 +40,7 @@ import { capabilitiesFor } from './capabilities.js';
 // 🚨 2026-09-08 の事故の復旧 (空の入荷CSVで一斉取消)。片づいたら消してよい
 import { surveyCancelled, restoreCancelled } from './restore-cancelled.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
-import { batchTransitionNeedsStaff } from './batches.js';
+import { batchTransitionNeedsStaff, splitBatchByExpiry } from './batches.js';
 import { bumpWindow } from './rate-window.js';
 import { setTaskBlock, clearTaskBlock, undoTaskBlock, blockedOf } from './tasks-db.js';
 import { notifyStaff, materialsShortageText } from './notify.js';
@@ -931,6 +931,34 @@ router.get('/api/consign-plan', api((req, res) => {
 }));
 
 /** 🚚 渡した / やめた / 返却を受け取った (要件 §AB-7)。**職員だけ**。返却の確定は いろは 側 */
+/**
+ * ⭐**期限が違うぶんを分ける** (要件 §AB-11 の 8 / §AB-12)。職員だけ。
+ *
+ * 同じカードに期限の違う物が混ざって届いたとき、分けないと箱ラベルの期限を 1 つしか選べない。
+ * これまで まとまりが分かれるのは「外部にあずける」ときだけだった。
+ */
+router.post('/api/batches/split', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  const batchId = numOrNull(req.body?.batch_id);
+  if (batchId == null) return res.status(400).json({ ok: false, error: 'bad_request', message: 'どのぶんを分けるかを選んでください' });
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  if (isClosedCardId(taskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
+  const db = getDB();
+  // ⭐まとまりを増やすので、読んでから書くまでを 1 つのトランザクションで
+  const r = db.transaction(() => splitBatchByExpiry(db, { taskId, batchId,
+    qty: req.body?.qty, expiry: req.body?.expiry ?? null,
+    // ⭐画面が見ていた版。二重に分けない (同じ 100 個を 2 人が 40 個ずつ分けると現物と合わなくなる)
+    expectVersion: req.body?.expect_version,
+    actor: `${gate.worker.display_name} (いろはアプリ)` })).immediate();
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json(r);
+  safeLogTaskEvent({ taskId, action: 'batch_split', workerId: gate.worker.id, workerName: gate.worker.display_name,
+    to: `#${r.batch.seq} へ ${r.batch.planned_qty} 個${r.batch.expiry ? ' (期限 ' + r.batch.expiry + ')' : ''}`, ok: true });
+  res.json({ ok: true, batch: { id: r.batch.id, seq: r.batch.seq, planned_qty: r.batch.planned_qty, expiry: r.batch.expiry } });
+}));
+
 router.post('/api/consign/update', checkOrigin, api((req, res) => {
   if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
   const id = Number(req.body?.consignment_id);

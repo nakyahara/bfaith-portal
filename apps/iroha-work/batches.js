@@ -87,6 +87,87 @@ export function listBatchesOfTask(db, taskId) {
   return db.prepare('SELECT * FROM f_iroha_task_batches WHERE task_id = ? ORDER BY seq').all(n);
 }
 
+/**
+ * ⭐**期限が違うぶんを、人が手で分ける** (要件 §AB-11 の 8 / §AB-12)。
+ *
+ * これまで、まとまりが分かれるのは「外部にあずける」ときだけだった。だから
+ * **同じカードに期限の違う物が混ざって届いても分けられず**、箱ラベルの期限を 1 つしか選べなかった。
+ * (§AB-12「期限が違うまとまりを誤って併合しない」を守るには、まず分けられる必要がある)
+ *
+ * 分ける = 元から数を引いて、新しいまとまりを 1 つ作る。**元の記録は動かさない**。
+ *
+ * ⭐分けてよい元の条件は「預けで分ける」(consign.js の giveBackToHand) と**同じ考え方**に揃える —
+ *   数が動くと辻褄が合わなくなるものが付いていたら分けない:
+ *   - まだ作業できる状態か (棚入待ち・終了・取消のまとまりからは分けない)
+ *   - 予定数が分かっているか (NULL から引くと「不明」が数に化ける)
+ *   - 外に預けていないか (相手に渡した数が勝手に減らない)
+ *   - 棚に入れた記録・箱ラベルを刷った記録が無いか (刷ったラベルの数と合わなくなる)
+ *   - できた数を数えていないか (数え終わったものを分けると、どちらが何個できたか決められない)
+ *
+ * ⭐**元のまとまりの版 (expectVersion) を必ず見る**。見ないと、同じ 100 個を 2 人が別々に開いて
+ *   40 個ずつ分けたとき、どちらも条件を通って「20 + 40 + 40」になる (合計は合うのに、期限ごとの数が
+ *   現物とずれる)。応答を失って送り直したときも同じ (Codex #1270 R1 重大)。
+ *
+ * ⚠**必ず呼び出し側の書き込みトランザクション (immediate) の中で**。読んで・確かめて・減らして・作る、を
+ *   ひとまとまりにしないと、確かめたあとに別の書き込みが割り込む。
+ *
+ * @param {object} o  { taskId, batchId, qty (新しいぶんの数), expiry (新しいぶんの期限。null 可), expectVersion, actor }
+ * @returns {{ok:true, batch}|{ok:false, error, message}}
+ */
+export function splitBatchByExpiry(db, { taskId, batchId, qty, expiry = null, expectVersion = null, actor = null }) {
+  const b = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ? AND task_id = ?').get(Number(batchId), Number(taskId));
+  if (!b) return { ok: false, error: 'bad_batch', message: 'そのぶんはこのカードにありません (画面を更新してください)' };
+  // 🚨**画面で見ていたときの版**と同じでなければ断る (二重に分けない・古い画面で分けない)
+  if (expectVersion == null || Number(expectVersion) !== b.version) {
+    return { ok: false, error: 'conflict', current: b,
+      message: 'このぶんは他の端末で変わっています。画面を更新して、もう一度確かめてください' };
+  }
+  const n = Number(qty);
+  if (!Number.isSafeInteger(n) || n < 1) {
+    return { ok: false, error: 'bad_qty', message: '分ける数は 1 以上の整数で入れてください' };
+  }
+  if (b.work_status !== 'not_started' && b.work_status !== 'in_progress') {
+    return { ok: false, error: 'bad_state', message: 'このぶんはもう分けられません (棚入待ち・終了・取消のぶんは分けられません)' };
+  }
+  if (b.planned_qty == null) {
+    return { ok: false, error: 'bad_qty', message: 'このぶんは数が分かっていないので分けられません (先に数を決めてください)' };
+  }
+  // ⭐**全部は分けられない**。元が 0 個になると「分けた」ではなく「移した」で、記録の意味が変わる
+  if (n >= b.planned_qty) {
+    return { ok: false, error: 'bad_qty',
+      message: `このぶんは ${b.planned_qty} 個です。分けられるのは ${b.planned_qty - 1} 個までです (全部は分けられません)` };
+  }
+  const away = db.prepare("SELECT COUNT(*) c FROM f_iroha_consignments WHERE batch_id = ? AND state <> 'cancelled'").get(b.id).c;
+  if (away > 0) return { ok: false, error: 'consign_open', message: '外にあずけているぶんは分けられません (先に返却を受け取るか、預けをやめてください)' };
+  const stocked = db.prepare('SELECT COUNT(*) c FROM f_iroha_stocking_records WHERE batch_id = ?').get(b.id).c;
+  if (stocked > 0) return { ok: false, error: 'stocked_batch', message: 'もう棚に入れているぶんは分けられません' };
+  const printed = db.prepare('SELECT COUNT(*) c FROM f_iroha_print_jobs WHERE batch_id = ?').get(b.id).c;
+  if (printed > 0) return { ok: false, error: 'printed_batch', message: 'もう箱ラベルを出しているぶんは分けられません (刷ったラベルの数と合わなくなります)' };
+  if (b.good_qty != null) {
+    return { ok: false, error: 'counted_batch', message: 'もうできた数を数えているぶんは分けられません (どちらが何個できたか決められません)' };
+  }
+  const exp = expiry == null ? null : String(expiry).trim();
+  if (exp != null && exp.length > 40) {
+    return { ok: false, error: 'bad_request', message: '期限は 40 字までで入れてください' };
+  }
+  const now = new Date().toISOString();
+  db.prepare('UPDATE f_iroha_task_batches SET planned_qty = planned_qty - ?, version = version + 1, updated_at = ? WHERE id = ?')
+    .run(n, now, b.id);
+  // ⭐新しいぶんは**元と同じ担当**を継ぐ (どこが作業するかは変わらない)。期限だけが違う
+  const info = db.prepare(`INSERT INTO f_iroha_task_batches
+      (task_id, seq, planned_qty, facility_code, expiry, work_status, split_from_batch_id, split_qty, split_at, split_by, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'not_started', ?, ?, ?, ?, ?, ?)`)
+    .run(b.task_id, nextSeq(db, b.task_id), n, b.facility_code ?? null, exp === "" ? null : exp,
+      b.id, n, now, actor, now, now);
+  const made = db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(Number(info.lastInsertRowid));
+  // 🚨**親カードの版も進める** (預けで数が動くときと同じ)。数が変わるからだけではなく、
+  //   **古い画面が前提にしていた「まとまりの組み立て」が変わる**ため — 「100 個が 1 つ」と
+  //   「60 個 + 40 個」では、預ける・作り終える の相手が別物になる (Codex #1270 R2)
+  db.prepare('UPDATE f_iroha_tasks SET version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?')
+    .run(now, actor, b.task_id);
+  return { ok: true, batch: made };
+}
+
 /** 複数カードのまとまりをまとめて引く (一覧で N+1 にしない)。Map<task_id, batch[]> */
 export function batchesByTask(db, taskIds) {
   const ids = [...new Set((taskIds || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];

@@ -2489,7 +2489,7 @@ function lockDeviceStaffMode() {
 
 // ─── 確認・入力の専用ダイアログ (window.prompt / confirm の置き換え — 監修 R-1) ───
 //   confirm 相当: ask({ title, text, ok, cancel }) → true / null
-//   prompt 相当:  ask({ title, text, input: 'pin' | 'text', placeholder, required }) → 文字列 / null (やめた)
+//   prompt 相当:  ask({ title, text, input: 'pin' | 'number' | 'text', placeholder, required }) → 文字列 / null (やめた)
 let askResolve = null;
 let askOpts = null;
 // ═══ 🏷 保管箱ラベル (いろはPC の QL-800) — 入荷受付チェックの値札発行と同じ流れ (中原さん 2026-09-06) ═══
@@ -2902,8 +2902,11 @@ function ask(o) {
     $('#askInRow').hidden = !askOpts.input;
     if (askOpts.input) {
       const pin = askOpts.input === 'pin';
-      inp.type = pin ? 'tel' : 'text';
-      inp.inputMode = pin ? 'numeric' : 'text';
+      // ⭐数を入れるときも数字のキーボードを出す (iPad で文字キーボードが出ると打ちにくい)。
+      //   type は 'tel' にする — 'number' はスピナーが出て、はみ出た値も入る
+      const num = pin || askOpts.input === 'number';
+      inp.type = num ? 'tel' : 'text';
+      inp.inputMode = num ? 'numeric' : 'text';
       inp.maxLength = pin ? 8 : 200;
       inp.placeholder = askOpts.placeholder || '';
       inp.value = '';
@@ -4188,6 +4191,10 @@ function batchRowHtml(c, b) {
   const redo = (b.work_status === 'ready_for_stocking' || b.work_status === 'done') && !b.consigned_out
     && stateCan('tasks.bulk_stocked') && isStaffUI()
     ? '<button class="btn" data-bredo="' + esc(b.id) + '">↩ このぶんをやり直す</button>' : '';
+  // ⭐期限が違う物が混ざっていたら、そのぶんを分ける (§AB-12)。まだ作業できるぶんだけ
+  const split = (b.work_status === 'not_started' || b.work_status === 'in_progress') && !b.consigned_out
+    && b.planned_qty != null && b.planned_qty > 1 && isStaffUI() && stateCan('task.consign')
+    ? '<button class="btn" data-bsplit="' + esc(b.id) + '">✂ 期限が違うぶんを分ける</button>' : '';
   return '<div class="brow">' +
     '<div class="bh"><b>' + esc(facilityName(fac) || '未定') + '</b>' +
       '<span class="st ro ' + stClass(b.work_status === 'done' ? 'closed' : b.work_status) + '">' +
@@ -4196,7 +4203,7 @@ function batchRowHtml(c, b) {
     '<div class="m num">' + esc(nums) + '</div>' +
     (b.variance_note ? '<div class="m">📝 ' + esc(b.variance_note) + '</div>' : '') +
     (b.consigned_out ? '<div class="m">外にあるぶんです。返却を受け取ると「棚入待ち」になります。</div>' : '') +
-    (btn || redo ? '<div class="bfoot">' + btn + redo + '</div>' : '') +
+    (btn || redo || split ? '<div class="bfoot">' + btn + redo + split + '</div>' : '') +
     '</div>';
 }
 // まとまりごとの「作り終えた」「棚入完了」
@@ -4206,8 +4213,56 @@ document.addEventListener('click', (e) => {
   const k = e.target.closest('[data-bstock]');
   if (k) { stockBatch(Number(k.dataset.bstock)); return; }
   const rd = e.target.closest('[data-bredo]');
-  if (rd) { redoBatch(Number(rd.dataset.bredo)); }
+  if (rd) { redoBatch(Number(rd.dataset.bredo)); return; }
+  const sp = e.target.closest('[data-bsplit]');
+  if (sp) { openSplitBatch(Number(sp.dataset.bsplit)); }
 });
+/**
+ * ⭐**期限が違うぶんを分ける** (要件 §AB-12)。職員だけ。
+ *
+ * 同じカードに期限の違う物が混ざって届くことがある。分けないと、箱ラベルの期限を 1 つしか選べず、
+ * 期限の違う箱に同じラベルを貼ってしまう (貼ったあとは現物から見分けられない)。
+ */
+async function openSplitBatch(batchId) {
+  const c = findCard(curDetail);
+  if (!c) return;
+  const b = (c.batches || []).find((x) => sameId(x.id, batchId));
+  if (!b) return;
+  const w = worker;
+  if (!w) { openGate(); return; }
+  if (!state.me.session && w.worker_type !== 'staff') { toast('分けられるのは職員だけです (右上の名前を職員に替えてください)'); return; }
+  const qty = await ask({
+    title: '✂ 期限が違うぶんを分ける',
+    text: 'いま ' + b.planned_qty + ' 個です。別の期限のぶんが何個あるかを入れてください (残りは元のぶんに残ります)',
+    input: 'number', placeholder: '例: 40', required: true, ok: '次へ',
+  });
+  if (qty == null) return;
+  const n = Number(String(qty).trim());
+  if (!Number.isInteger(n) || n < 1 || n >= b.planned_qty) {
+    showErr('分ける数が正しくありません', '1 以上・' + (b.planned_qty - 1) + ' 個までで入れてください (全部は分けられません)');
+    return;
+  }
+  const exp = await ask({
+    title: '✂ 分けるぶんの期限',
+    text: n + ' 個ぶんの期限を入れてください (分からなければ空のままで、あとから入れられます)',
+    input: 'text', placeholder: '例: 2027-03', ok: 'このぶんを分ける',
+  });
+  if (exp == null) return;
+  let pin = null;
+  if (!state.me.session) {
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '分ける' });
+    if (pin == null) return;
+  }
+  const j = await apiFetch('/api/batches/split', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, batch_id: b.id, qty: n, expiry: String(exp).trim() || null,
+      expect_version: b.version, worker_id: w.id, pin }) });
+  if (!j.ok) { showErr(j.message || '分けられませんでした'); return; }
+  toast('✂ ' + n + ' 個を別のぶんに分けました' + (j.batch && j.batch.expiry ? ' (期限 ' + j.batch.expiry + ')' : ''));
+  await loadState();
+  renderTabs(); renderList();
+  if (curView === 'board') renderBoard();
+  if (sameId(curDetail, c.id)) openDetail(c.id);
+}
 /** ⭐そのぶんだけ作業中に戻す (数え間違い・手直し)。職員だけ。他のぶんは巻き込まない */
 async function redoBatch(batchId) {
   const c = findCard(curDetail);

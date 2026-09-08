@@ -8279,5 +8279,187 @@ console.log('\n[まとまり選択の操作2] ⭐実物の選ぶ画面・札の�
     '⭐札がもう外れていたときの始め直しでも、同じぶんを保つ');
 }
 
+console.log('\n[期限違い] ✂ 期限が違うぶんを手で分ける (§AB-11 の 8 / §AB-12)');
+{
+  const B = await import('../apps/iroha-work/batches.js');
+  const TD = await import('../apps/iroha-work/tasks-db.js');
+  const C = await import('../apps/iroha-work/consign.js');
+  const dbx = getDB();
+  const mk = (page, dest, qty) => TD.upsertTaskFromImport({ notion_page_id: page, status: 'not_started',
+    facility_code: 'iroha', destination_id: dest, product_name: '期限違い', qty, expiry: '2027-03' }, { batchId: 'ex' }).id;
+  const only = (t) => B.listBatchesOfTask(dbx, t)[0];
+  // ⭐版は「いまの元のまとまり」のものを既定で添える (競合そのものを試すときは o.expectVersion で上書き)
+  const split = (t, o) => dbx.transaction(() => B.splitBatchByExpiry(dbx,
+    { taskId: t, batchId: only(t).id, expectVersion: only(t).version, ...o })).immediate();
+
+  // ⭐100 個のうち 40 個を、別の期限で分ける
+  const t1 = mk('ex-1', 9751, 100);
+  ok(only(t1).planned_qty === 100, '(前提) 100 個のまとまりが 1 つ');
+  const r = split(t1, { qty: 40, expiry: '2028-06', actor: 'たにがわ' });
+  ok(r.ok && r.batch.planned_qty === 40 && r.batch.expiry === '2028-06', '⭐40 個を別の期限で分けられる');
+  const bs = B.listBatchesOfTask(dbx, t1);
+  ok(bs.length === 2 && bs[0].planned_qty === 60 && bs[0].expiry === '2027-03',
+    '⭐元のぶんは 60 個に減り、期限はそのまま');
+  ok(r.batch.split_from_batch_id === bs[0].id && r.batch.split_qty === 40 && r.batch.split_by === 'たにがわ',
+    'どこから何個分けたか・誰が分けたかが残る');
+  ok(r.batch.facility_code === bs[0].facility_code, '担当は元と同じ (どこが作業するかは変わらない)');
+  ok(r.batch.work_status === 'not_started', '分けたぶんは未着手からはじまる');
+
+  // ⭐全部は分けられない (元が 0 個になると「分けた」ではなく「移した」)
+  const t2 = mk('ex-2', 9752, 50);
+  const all = split(t2, { qty: 50 });
+  ok(!all.ok && all.error === 'bad_qty' && /49 個までです/.test(all.message), '⭐全部は分けられない (49 個まで)');
+  ok(only(t2).planned_qty === 50, '断ったので元は減っていない');
+  ok(!split(t2, { qty: 0 }).ok && !split(t2, { qty: -1 }).ok && !split(t2, { qty: 1.5 }).ok, '0 個・マイナス・小数は断る');
+
+  // ⭐期限は空でもよい (あとから入れられる)
+  const t3 = mk('ex-3', 9753, 30);
+  const noExp = split(t3, { qty: 10 });
+  ok(noExp.ok && noExp.batch.expiry === null, '⭐期限が分からなければ空のままで分けられる');
+
+  // 🚨数が動くと辻褄が合わなくなるものが付いていたら分けない
+  {
+    // ① 棚に入れたぶん
+    const ts = mk('ex-4', 9754, 20);
+    B.recordStocking(dbx, only(ts).id, { by: 'たにがわ' });
+    ok(split(ts, { qty: 5 }).error === 'stocked_batch', '⭐棚に入れたぶんは分けられない');
+    // ② 箱ラベルを刷ったぶん — ⭐**実際に積んで**作る (直接 INSERT だと出力先の決まりを飛ばしてしまう)
+    const P3 = await import('../apps/iroha-work/print-queue.js');
+    const D3 = await import('../apps/iroha-work/db.js');
+    const agent = D3.createDevice('分割テストPC', 'admin@test', { kind: 'agent', printerName: 'Brother QL-800 (split)' });
+    const tp = TD.upsertTaskFromImport({ notion_page_id: 'ex-5', status: 'not_started', facility_code: 'iroha',
+      destination_id: 9755, product_name: 'ラベル刷った', qty: 20, barcode: '4900000000009' }, { batchId: 'ex' }).id;
+    const pj0 = P3.enqueuePrintJob({ taskId: tp, copies: 1, targetDeviceId: agent.id, clientRequestId: 'split-test-1' });
+    ok(pj0.ok, '(前提) 箱ラベルを積めた');
+    ok(split(tp, { qty: 5 }).error === 'printed_batch', '⭐箱ラベルを刷ったぶんは分けられない (刷った数と合わなくなる)');
+    D3.revokeDevice(agent.id);   // 後続に 2 台目を残さない
+    // ③ できた数を数えたぶん
+    const tc = mk('ex-6', 9756, 20);
+    // ⭐出どころも一緒に入れる (数だけ入れると DB の決まりに反する = 人が数えたのか不明な数を作らない)
+    dbx.prepare("UPDATE f_iroha_task_batches SET good_qty = 18, good_qty_source = 'counted' WHERE id = ?").run(only(tc).id);
+    ok(split(tc, { qty: 5 }).error === 'counted_batch', '⭐できた数を数えたぶんは分けられない (どちらが何個か決められない)');
+    // ④ 外にあずけているぶん
+    const ta = mk('ex-7', 9757, 20);
+    const v = TD.getTask(ta).version;
+    C.startConsignment({ taskId: ta, batchId: only(ta).id, facilityCode: 'workcenter', qty: 20, expectVersion: v });
+    ok(split(ta, { qty: 5 }).error === 'consign_open', '⭐外にあずけているぶんは分けられない');
+    // ⑤ 棚入待ちのぶん
+    const tr = mk('ex-8', 9758, 20);
+    dbx.prepare("UPDATE f_iroha_task_batches SET work_status = 'ready_for_stocking' WHERE id = ?").run(only(tr).id);
+    ok(split(tr, { qty: 5 }).error === 'bad_state', '⭐棚入待ちのぶんは分けられない');
+    // ⑥ よそのカードのぶん
+    const tx = mk('ex-9', 9759, 20);
+    const ty = mk('ex-10', 9760, 20);
+    const wrong = dbx.transaction(() => B.splitBatchByExpiry(dbx, { taskId: tx, batchId: only(ty).id, qty: 5, expectVersion: only(ty).version })).immediate();
+    ok(wrong.error === 'bad_batch', '⭐よそのカードのぶんは分けられない');
+  }
+
+  // 🚨**同じ版で 2 回分けられない** (2 人が同じ 100 個を 40 個ずつ分けると、合計は合うのに
+  //   期限ごとの数が現物とずれる。応答を失って送り直したときも同じ — Codex #1270 R1 重大)
+  {
+    const tv = mk('ex-12', 9762, 100);
+    const v0 = only(tv).version;
+    const one = split(tv, { qty: 40, expiry: '2028-06', expectVersion: v0 });
+    ok(one.ok && only(tv).planned_qty === 60, '(前提) 1 回目は分けられる');
+    const twice = split(tv, { qty: 40, expiry: '2028-06', expectVersion: v0 });
+    ok(!twice.ok && twice.error === 'conflict', '⭐同じ版でもう一度分けようとしたら断る');
+    ok(only(tv).planned_qty === 60 && B.listBatchesOfTask(dbx, tv).length === 2,
+      '⭐断ったので数もまとまりの数も変わらない');
+    // ⭐画面を取り直せば (新しい版で) 分けられる
+    const again = split(tv, { qty: 10, expiry: '2029-01', expectVersion: only(tv).version });
+    ok(again.ok && only(tv).planned_qty === 50, '新しい版なら分けられる (詰まらせない)');
+    ok(!split(tv, { qty: 5, expectVersion: null }).ok, '版を送らなければ断る');
+  }
+
+  // 🚨**親カードの版も進む**。古い画面が前提にしていた「まとまりの組み立て」が変わるため
+  //   (「100 個が 1 つ」と「60 個 + 40 個」では、預ける相手が別物 — Codex #1270 R2)
+  {
+    const tp2 = mk('ex-18', 9768, 100);
+    const before = TD.getTask(tp2).version;
+    ok(split(tp2, { qty: 40, expiry: '2028-06' }).ok, '(前提) 分けられた');
+    ok(TD.getTask(tp2).version > before, '⭐分けるとカードの版も進む');
+    // ⭐分ける前の版で預けようとしたら断られる (古い組み立てのまま渡さない)
+    const stale = C.startConsignment({ taskId: tp2, batchId: only(tp2).id,
+      facilityCode: 'workcenter', qty: 10, expectVersion: before });
+    ok(!stale.ok && stale.error === 'conflict', '⭐分ける前の版で預けようとしたら断る');
+    ok(dbx.prepare('SELECT COUNT(*) c FROM f_iroha_consignments WHERE batch_id = ?').get(only(tp2).id).c === 0,
+      '断ったので預けの記録もできていない');
+  }
+
+  // ⭐作業中のまとまりを分けても、作業の記録と進捗が食い違わない
+  {
+    const D4 = await import('../apps/iroha-work/db.js');
+    const w4 = D4.addIrohaWorker({ displayName: '分割中の人', workerType: 'member', actor: 'test' });
+    const tw = mk('ex-13', 9763, 80);
+    const st = TD.startTaskSession({ taskId: tw, worker: D4.getIrohaWorker(w4.id) });
+    ok(st.ok && TD.getTask(tw).status === 'in_progress', '(前提) 作業中にした');
+    const sp = split(tw, { qty: 30, expiry: '2028-09' });
+    ok(sp.ok, '⭐作業中のまとまりも分けられる');
+    ok(TD.getTask(tw).status === 'in_progress', '⭐カードは作業中のまま (未着手に落ちない)');
+    const after = B.listBatchesOfTask(dbx, tw);
+    ok(after.length === 2 && after[0].planned_qty === 50 && after[1].planned_qty === 30, '数が分かれている');
+    ok(after[0].work_status === 'in_progress' && after[1].work_status === 'not_started',
+      '元は作業中のまま・分けたぶんは未着手 (どちらの作業かは、はじめるときに選ぶ)');
+    // 作業を終えても数は動かない
+    const stop = D4.stopSession({ taskId: tw, workerId: w4.id, sessionId: st.sessionId, reason: 'done' });
+    ok(stop && stop.ok !== false, '(前提) 作業を終えられた');
+    ok(dbx.prepare('SELECT ended_at FROM f_iroha_work_sessions WHERE id = ?').get(st.sessionId).ended_at != null,
+      '(前提) その作業の記録が閉じている');
+    const end = B.listBatchesOfTask(dbx, tw);
+    ok(end[0].planned_qty === 50 && end[1].planned_qty === 30, '⭐作業を終えても、分けた数は戻らない');
+  }
+
+  // ⭐期限は 40 字まで / 数が分からないぶん・終わったぶんは分けない
+  //   ⭐断ったときは**まとまり一覧がそっくり同じ**であることまで見る (数・版・件数をまとめて)
+  {
+    const snap = (t) => JSON.stringify(B.listBatchesOfTask(dbx, t).map((x) => [x.id, x.planned_qty, x.expiry, x.work_status, x.version]));
+    const tl2 = mk('ex-14', 9764, 20);
+    const beforeL = snap(tl2);
+    ok(!split(tl2, { qty: 5, expiry: 'あ'.repeat(41) }).ok, '⭐期限が長すぎれば断る');
+    ok(snap(tl2) === beforeL, '断ったので、まとまりは数も版も件数もそのまま');
+    const tn = mk('ex-15', 9765, 20);
+    dbx.prepare('UPDATE f_iroha_task_batches SET planned_qty = NULL WHERE id = ?').run(only(tn).id);
+    const beforeN = snap(tn);
+    ok(split(tn, { qty: 5 }).error === 'bad_qty', '⭐数が分かっていないぶんは分けられない');
+    ok(snap(tn) === beforeN, '断ったので何も変わらない');
+    const td = mk('ex-16', 9766, 20);
+    dbx.prepare("UPDATE f_iroha_task_batches SET work_status = 'done' WHERE id = ?").run(only(td).id);
+    const beforeD = snap(td);
+    ok(split(td, { qty: 5 }).error === 'bad_state', '⭐棚入完了のぶんは分けられない');
+    ok(snap(td) === beforeD, '断ったので何も変わらない');
+    const tcn = mk('ex-17', 9767, 20);
+    dbx.prepare("UPDATE f_iroha_task_batches SET work_status = 'cancelled' WHERE id = ?").run(only(tcn).id);
+    ok(split(tcn, { qty: 5 }).error === 'bad_state', '⭐取り消したぶんは分けられない');
+  }
+
+  // ⭐分けたあとは、箱ラベルで「どのぶんか」を選ぶことになる (§AB-12 の目的)
+  {
+    const P2 = await import('../apps/iroha-work/print-queue.js');
+    const tl = TD.upsertTaskFromImport({ notion_page_id: 'ex-11', status: 'not_started', facility_code: 'iroha',
+      destination_id: 9761, product_name: 'ラベル', qty: 100, barcode: '4900000000010', expiry: '2027-03' }, { batchId: 'ex' }).id;
+    const rr = dbx.transaction(() => B.splitBatchByExpiry(dbx, { taskId: tl, batchId: only(tl).id, qty: 40, expiry: '2028-06', expectVersion: only(tl).version })).immediate();
+    ok(rr.ok, '(前提) 分けられた');
+    const pj = P2.enqueuePrintJob({ taskId: tl, copies: 1, clientRequestId: 'split-label-' + Date.now() });
+    ok(!pj.ok && pj.error === 'pick_batch', '⭐分けたあとは、箱ラベルもどのぶんか選ばないと出せない');
+    ok((pj.batches || []).some((x) => x.expiry === '2028-06'), '⭐選ぶときに期限が見える (違う期限のラベルを貼らない)');
+  }
+}
+
+// ⭐画面: 分ける入口 (職員・まだ作業できるぶんだけ)
+{
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  ok(/data-bsplit=/.test(html) && /✂ 期限が違うぶんを分ける/.test(html), '分ける入口がある');
+  ok(/const split = \(b\.work_status === 'not_started' \|\| b\.work_status === 'in_progress'\) && !b\.consigned_out/.test(html)
+    && /b\.planned_qty != null && b\.planned_qty > 1 && isStaffUI\(\)/.test(html),
+    '⭐まだ作業できて・手元にあって・2 個以上あるぶんにだけ、職員に出す');
+  ok(/function openSplitBatch\(batchId\)/.test(html) && /input: 'number'/.test(html),
+    '数は数字のキーボードで入れる');
+  ok(/const num = pin \|\| askOpts\.input === 'number';/.test(html) && /inp\.type = num \? 'tel' : 'text';/.test(html),
+    "⭐ask('number') で数字のキーボードが出る (以前は 'pin' 以外すべて文字扱いだった)");
+  ok(!/別の期限のぶん\*\*/.test(html), '画面に ** をそのまま出さない');
+  ok(/expect_version: b\.version/.test(html),
+    '⭐画面が見ていた版を送る (二重に分けない — R1 重大)');
+}
+
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exit(fail > 0 ? 1 : 0);

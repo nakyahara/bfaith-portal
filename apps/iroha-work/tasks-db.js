@@ -296,7 +296,7 @@ export function listOrphans(limit = 100) {
 
 const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, close_reason_required: 400, not_found: 404, bad_request: 400,
   closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409, bad_done_qty: 400, bad_hold_memo: 400, bad_loss_qty: 400,
-  bad_variance_note: 400, split_card: 409, ready_task: 409, bad_batch: 400, consign_open: 409, stocked_batch: 409,
+  bad_variance_note: 400, split_card: 409, ready_task: 409, bad_batch: 400, consign_open: 409, stocked_batch: 409, printed_batch: 409, counted_batch: 409,
   // 止まっている理由 (案A): 理由が無い/不正 = 400、止められない状態 = 409、止まっているので始められない = 409
   block_reason_required: 400, bad_block: 409, blocked: 409,
   notion_mode: 409 };   // 取得後に正本が切り替わった = 競合 (入力不正ではない — Codex PR1 R17)
