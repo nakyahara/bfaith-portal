@@ -144,7 +144,10 @@ async function main() {
       for (const r of (Array.isArray(res) ? res : [])) {
         const sku = r?.SellerSKU;
         if (!sku) continue;
-        if (r.status === 'Success' || r.Product) myPriceMap.set(sku, extractMyPrice(r.Product));
+        // ★SKU は小文字で突合する: amazon_sku_fees の seller_sku は小文字で保持しているが、Amazon が返す SellerSKU は
+        //   登録時の大文字小文字 (例: pr_1272115_F_...) なので、そのまま突合すると大文字を含む SKU が全部 NULL になる
+        //   (2026-09-08 の突合で判明: 大文字を含む 2,470 SKU すべて my_price 無し)
+        if (r.status === 'Success' || r.Product) myPriceMap.set(String(sku).trim().toLowerCase(), extractMyPrice(r.Product));
       }
     } catch (e) {
       priceErrors++;
@@ -202,7 +205,7 @@ async function main() {
       if (failedSkus.has(t.seller_sku) || failedAsins.has(t.asin)) { skipped++; continue; }
       const bb = buyboxMap.get(t.asin) || { price: null, isMine: null };
       upsert.run(today, t.seller_sku, t.asin, t.channel || null,
-        myPriceMap.get(t.seller_sku) ?? null, bb.price, bb.isMine, fetchedAt);
+        myPriceMap.get(String(t.seller_sku).trim().toLowerCase()) ?? null, bb.price, bb.isMine, fetchedAt);
       saved++;
     }
     const pruneBefore = new Date(Date.now() + 9 * 3600 * 1000 - 90 * 86400000).toISOString().slice(0, 10);
