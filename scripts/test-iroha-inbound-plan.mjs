@@ -103,8 +103,9 @@ console.log('\n[1] 入荷受付の取込がまだ無いとき');
 }
 
 // ─── ② 仕入先で絞る / 数量をまとめる ───
-console.log('\n[2] 仕入先 0001 だけ・入荷予定日 × 商品でまとめる');
-// ⚠ 入荷予定日は**伝票 (AR番号) 単位** — f_inbound_check_slips に 1 行しか無いので、同じ伝票の行は全部同じ日になる
+console.log('\n[2] 仕入先 0001 だけ・載った日 × 商品でまとめる');
+// ⚠ 軸は**入荷リストに載った日 (取込日)**。ロジザードの入荷予定日は現場で正確に入れていないので使わない
+//   (中原さん 2026-09-09)。この取込は全部「今日」なので、同じ商品はひとまとまりになる
 const imp = importCsv(makeCsv([
   row('AR1', 1, 1, 'amc-a', 10),
   row('AR1', 2, 1, 'amc-a', 5),               // 同じ伝票の別行 → 足して 15
@@ -120,24 +121,24 @@ const imp = importCsv(makeCsv([
 ok(imp.ok, `取込 ok (${imp.ok ? imp.rowCount + '行' : imp.message})`);
 
 const r = listInboundPlan();
-eq(r.rows.map(x => `${x.planned_date} ${x.product_code} ${x.qty} ${x.iroha}`), [
-  `${iso(-1)} amc-c 7 未記入`,
-  `${iso(0)} amc-a 18 有り`,
+eq(r.rows.map(x => `${x.listed_on} ${x.product_code} ${x.qty} ${x.iroha}`), [
+  `${iso(0)} amc-a 22 有り`,
   `${iso(0)} amc-b 40 無し`,
-  `${iso(2)} amc-a 4 有り`,
-  `${iso(2)} amc-d 2 状況による`,
-], '0001 の商品だけ・日付順・同じ日の同じ商品は合算');
-eq(r.rows.find(x => x.product_code === 'amc-a' && x.planned_date === iso(0)).lines, 3, '合算した明細の数を持つ');
-eq(r.rows.find(x => x.product_code === 'amc-a' && x.planned_date === iso(0)).ar_nos, ['AR1', 'AR2'], 'まとめた伝票番号を持つ');
-eq(r.rows.map(x => x.past), [true, false, false, false, false], '⭐予定日を過ぎた行にだけ past が付く (画面はここを薄くする)');
-eq(r.rows.map(x => x.iroha_kind), ['unknown', 'yes', 'no', 'yes', 'other'], '区分の種別 (未記入・有り・無し・その他) を分けて返す');
-eq(r.rows[0].product_name, '商品 amc-c', '商品名はロジザードの明細から');
-eq(r.totals, { products: 5, qty: 71, iroha_products: 2, iroha_qty: 22, arrived_products: 0, arrived_qty: 0, old_products: 0, old_qty: 0 },
+  `${iso(0)} amc-c 7 未記入`,
+  `${iso(0)} amc-d 2 状況による`,
+], '⭐0001 の商品だけ・載った日 × 商品で合算 (入荷予定日が違っても分けない)');
+ok(!r.rows.some(x => 'planned_date' in x || 'past' in x),
+  '⭐入荷予定日も「遅れている」印も返さない (使わないものを画面へ渡さない)');
+eq(r.rows.find(x => x.product_code === 'amc-a').lines, 4, '合算した明細の数を持つ');
+eq(r.rows.find(x => x.product_code === 'amc-a').ar_nos, ['AR1', 'AR2', 'AR4'], 'まとめた伝票番号を持つ');
+eq(r.rows.map(x => x.iroha_kind), ['yes', 'no', 'unknown', 'other'], '区分の種別 (有り・無し・未記入・その他) を分けて返す');
+eq(r.rows[0].product_name, '商品 amc-a', '商品名はロジザードの明細から');
+eq(r.totals, { products: 4, qty: 71, iroha_products: 1, iroha_qty: 22, arrived_products: 0, arrived_qty: 0, old_products: 0, old_qty: 0 },
   '合計と いろは分の内訳 (まだ何も届いていないので出さない分は 0)');
 ok(!r.rows.some(x => ['other-e', 'nosup-f', 'unknown-z'].includes(x.product_code)), '別の仕入先・仕入先空・マスタに無い商品は出さない');
 
-// ─── ③ 商品名が空のとき / 入荷予定日が空のとき ───
-console.log('\n[3] 商品名・入荷予定日が空の明細');
+// ─── ③ 商品名が空のとき ───
+console.log('\n[3] 商品名が空の明細');
 {
   const imp2 = importCsv(makeCsv([
     { ...row('AR5', 1, 1, 'amc-a', 1), 商品名: '', 入荷予定日: '' },
@@ -145,10 +146,8 @@ console.log('\n[3] 商品名・入荷予定日が空の明細');
   ]), { source: 'manual_upload', fileName: 'test2.csv' });
   ok(imp2.ok, `取込 ok (${imp2.ok ? imp2.rowCount + '行' : imp2.message})`);
   const r2 = listInboundPlan();
-  eq(r2.rows.map(x => `${x.planned_date} ${x.product_name}`), [
-    `${iso(1)} 商品 amc-b`,
-    'null マスタ名A',
-  ], '入荷予定日が空の行は末尾へ / 商品名が空なら商品マスタで補う');
+  eq(r2.rows.map(x => x.product_name), ['マスタ名A', '商品 amc-b'],
+    '商品名が空なら商品マスタで補う (入荷予定日が空でも困らない — 使っていないので)');
 }
 
 // ─── ④ 本日の取込がまだ来ていない (前の日の一覧) ───
@@ -251,44 +250,54 @@ console.log('\n[7] 画面と API の配線');
   ok(/id="vInbound" onclick="setView\('inbound'\)"/.test(html), '作業画面のナビに 🚚 入荷予定 がある');
   ok(/inbound: '\.inboundpage'/.test(html) && /inbound: '#vInbound'/.test(html), 'PAGES / VIEW_BTN に登録されている (他の画面を隠す側も動く)');
   ok(/if \(v === 'inbound'\) loadInboundPlan\(\);/.test(html), '開いたときに取りにいく');
-  ok(/<table class="tbl plain fit">[\s\S]{0,300}<th>商品<\/th><th>数量<\/th><th>いろは在庫化区分<\/th>/.test(html),
-    '表の列は 商品 / 数量 / いろは在庫化区分 の 3 つ (入荷予定日は出さない — 中原さん 2026-09-09)');
-  ok(!/入荷予定日<\/th>/.test(html) && !/ipDayLabel/.test(html), '⭐日付の列も、日付を作る道具も残さない');
+  ok(/<table class="tbl plain fit">[\s\S]{0,300}<th class="day">載った日<\/th><th>商品<\/th><th>数量<\/th><th>いろは在庫化区分<\/th>/.test(html),
+    '表の列は 載った日 / 商品 / 数量 / いろは在庫化区分');
+  ok(!/<th>入荷予定日<\/th>/.test(html) && !/r\.planned_date/.test(html),
+    '⭐入荷予定日は列にも行にも出さない (正確に入っていないので — 中原さん 2026-09-09。説明文で触れるのはよい)');
+  ok(/ipDayLabel\(r\.listed_on, today\)/.test(html), '⭐出す日付は「リストに載った日」');
   ok(/\.tbl\.fit\{min-width:0\}/.test(html) && /@media \(max-width:560px\)/.test(html),
     '⭐幅の狭い端末でも横スクロールなしで収まる (min-width を外す + 狭いとき用の指定)');
+  ok(/\.tbl\.fit \.day\{display:none\}/.test(html) && /class="dayline"/.test(html),
+    '⭐幅が狭いときは「載った日」の列を畳んで商品名の下へ回す (商品名に幅を与える)');
   ok(/\.tbl\.plain tbody tr\{cursor:default\}/.test(html), '行は押せない見た目にする (開く先が無い)');
-  ok(/\.tbl tr\.past td\{color:var\(--sub\)\}/.test(html), '⭐予定日を過ぎた行は薄く出す (グレーアウト)');
-  ok(/r\.past \? ' class="past"' : ''/.test(html), '⭐薄くするかはサーバーの past で決める (iPad の時計を信じない)');
-  ok(/遅れています/.test(html), '遅れている印は商品の下に出す (日付は出さない)');
+  ok(!/遅れています/.test(html) && !/tr\.past/.test(html),
+    '⭐「遅れている」印もグレーアウトも出さない (入荷予定日が当てにならないので判断しない — 中原さん 2026-09-09)');
   ok(/id="ipHidden"/.test(html) && /出していないもの: /.test(html), '⭐出していない分の理由を画面に書く (黙って減らさない)');
   ok(/router\.get\('\/api\/inbound-plan'/.test(router), 'GET /api/inbound-plan がある');
   ok(!/\/api\/inbound-plan'[\s\S]{0,200}checkOrigin/.test(router), '読むだけなので書き込みの口 (POST) は作らない');
 }
 
-// ─── ⑧ 届いたものは出さない / 予定日が古すぎるものは出さない (中原さん 2026-09-09) ───
-//   「来たものは非表示にして、来ていないものは過去分グレーアウト。過去分の表示は過去五日間だけ」
-//   「届いた」の正本 = 倉庫の iPad が確認を確定したときに立つ f_inbound_check_destinations。
-//   取込バッチに紐づかないので、前の日に確認した明細もこれで分かる
-console.log('\n[8] 届いたもの・古い予定の扱い');
+// ─── ⑧ 届いたものは出さない / 載ってから古すぎるものは出さない (中原さん 2026-09-09) ───
+//   「来たものは非表示にして、来ていないものは過去五日間だけ」
+//   ⭐軸は**入荷リストに載った日 (取込日)**。入荷予定日は現場で正確に入れていないので使わない。
+//   「載った日」= その明細を含むいちばん古い取込の日 (取込は全置換なので MIN でよい)
+console.log('\n[8] 載った日 / 届いたもの / 古くなったもの');
 {
+  // 取込を 3 回に分けて、明細ごとに「載った日」を作る (取込日は imported_at を後から動かして作る)
+  const backdate = (offset) => {
+    const id = getActiveBatch().id;
+    mirror.prepare('UPDATE f_inbound_check_batches SET imported_at = ? WHERE id = ?').run(`${iso(offset)}T00:00:00.000Z`, id);
+  };
+  ok(importCsv(makeCsv([row('AR10', 1, 1, 'amc-c', 7)]), { source: 'manual_upload', fileName: 'old6.csv' }).ok, '6 日前の取込');
+  backdate(-6);
+  ok(importCsv(makeCsv([row('AR11', 1, 1, 'amc-d', 2)]), { source: 'manual_upload', fileName: 'old5.csv' }).ok, '5 日前の取込');
+  backdate(-5);
   const imp8 = importCsv(makeCsv([
-    row('AR8', 1, 1, 'amc-a', 10),            // 今日 — あとで「届いた」ことにする
-    row('AR8', 2, 1, 'amc-b', 40),            // 今日
-    row('AR9', 1, 1, 'amc-a', 4, ymd8(-1)),   // 昨日 (まだ届いていない = 薄く出す)
-    row('AR10', 1, 1, 'amc-c', 7, ymd8(-6)),  // 6 日前 = 古すぎるので出さない
-    row('AR11', 1, 1, 'amc-d', 2, ymd8(-5)),  // ちょうど 5 日前 = 境界。まだ出す
-  ]), { source: 'manual_upload', fileName: 'test8.csv' });
-  ok(imp8.ok, `取込 ok (${imp8.ok ? imp8.rowCount + '行' : imp8.message})`);
+    row('AR8', 1, 1, 'amc-a', 10),   // 今日はじめて載った — あとで「届いた」ことにする
+    row('AR8', 2, 1, 'amc-b', 40),   // 今日はじめて載った
+    row('AR10', 1, 1, 'amc-c', 7),   // 6 日前から載っている = 古すぎるので出さない
+    row('AR11', 1, 1, 'amc-d', 2),   // ちょうど 5 日前から = 境界。まだ出す
+  ]), { source: 'manual_upload', fileName: 'today.csv' });
+  ok(imp8.ok, `今日の取込 ok (${imp8.ok ? imp8.rowCount + '行' : imp8.message})`);
 
   const before = listInboundPlan();
-  eq(before.past_days, 5, '何日前まで出すかを画面へ返す');
-  eq(before.rows.map((x) => `${x.planned_date} ${x.product_code} ${x.qty}`), [
+  eq(before.past_days, 5, '何日ぶんまで出すかを画面へ返す');
+  eq(before.today, TODAY, 'サーバーが決めた今日 (JST) を返す — iPad の時計を信じない');
+  eq(before.rows.map((x) => `${x.listed_on} ${x.product_code} ${x.qty}`), [
     `${iso(-5)} amc-d 2`,
-    `${iso(-1)} amc-a 4`,
     `${iso(0)} amc-a 10`,
     `${iso(0)} amc-b 40`,
-  ], '⭐6 日前は出さない / ちょうど 5 日前は出す');
-  eq(before.rows.map((x) => x.past), [true, true, false, false], '過ぎた予定にだけ past');
+  ], '⭐6 日前から載っているものは出さない / ちょうど 5 日前は出す / 先に載った順');
   eq([before.totals.old_products, before.totals.old_qty], [1, 7], '出さなかった古い分を数える');
 
   // ── 倉庫の iPad が「確認」を確定する = 現物が届いた ──
@@ -299,16 +308,15 @@ console.log('\n[8] 届いたもの・古い予定の扱い');
   ok(fin.ok, '確認を確定できた' + (fin.ok ? '' : ': ' + fin.message));
 
   const after = listInboundPlan();
-  ok(!after.rows.some((x) => x.planned_date === iso(0) && x.product_code === 'amc-a'),
+  ok(!after.rows.some((x) => x.product_code === 'amc-a'),
     '⭐届いた明細は入荷予定から消える (いろは行きは 📋 作業 のカードになる)');
   eq([after.totals.arrived_products, after.totals.arrived_qty], [1, 10], '届いた分を数えて画面に理由を出せる');
-  ok(after.rows.some((x) => x.planned_date === iso(-1) && x.product_code === 'amc-a' && x.qty === 4),
-    '同じ商品でも、別の伝票のまだ届いていない分は残る');
+  ok(after.rows.some((x) => x.product_code === 'amc-d' && x.qty === 2), '届いていない他の行は残る');
 
   // ── やり直し (誤タップの取り消し) をしたら、また「まだ来ていない」に戻る ──
   const un = reopenLine({ batchId: b8.id, lineKey: 'AR8|1|1', expectVersion: fin.state.version, worker: '倉庫の人' });
   ok(un.ok, 'やり直せた' + (un.ok ? '' : ': ' + un.message));
-  ok(listInboundPlan().rows.some((x) => x.planned_date === iso(0) && x.product_code === 'amc-a' && x.qty === 10),
+  ok(listInboundPlan().rows.some((x) => x.product_code === 'amc-a' && x.qty === 10),
     '⭐やり直したら また出る (取り消した確認で消えたままにしない)');
 
   // ── 「数えたけれど 1 個も来なかった」は届いた扱いにしない ──
@@ -316,22 +324,21 @@ console.log('\n[8] 届いたもの・古い予定の扱い');
     result: 'shortage', mode: 'current', decide, worker: '倉庫の人', deviceLabel: '倉庫iPad' });
   ok(zero.ok, '0 個のまま不足で確定できた' + (zero.ok ? '' : ': ' + zero.message));
   const z = listInboundPlan();
-  ok(z.rows.some((x) => x.planned_date === iso(0) && x.product_code === 'amc-b' && x.qty === 40),
+  ok(z.rows.some((x) => x.product_code === 'amc-b' && x.qty === 40),
     '⭐数えた結果 0 のものは「届いた」にしない (まだ来ていないものとして出す)');
   eq(z.totals.arrived_products, 0, '届いた分にも数えない');
 
-  // ⭐商品コードに空白が入っていても、日付との境目が曖昧にならない (まとめるキーの区切りは NUL)
+  // ⭐商品コードに空白が入っていても、載った日との境目が曖昧にならない (まとめるキーの区切りは NUL)
   insProduct.run(20, `${iso(0)} amc-a`, '空白入りのコード', '0001');
   const impSp = importCsv(makeCsv([
     row('AR12', 1, 1, 'amc-a', 11),
-    row('AR13', 1, 1, `${iso(0)} amc-a`, 22, ''),   // 日付なし + 空白入りコード
-  ]), { source: 'manual_upload', fileName: 'test8b.csv' });
+    row('AR13', 1, 1, `${iso(0)} amc-a`, 22),
+  ]), { source: 'manual_upload', fileName: 'space.csv' });
   ok(impSp.ok, `取込 ok (${impSp.ok ? impSp.rowCount + '行' : impSp.message})`);
-  const sp = listInboundPlan();
-  eq(sp.rows.map((x) => `${x.planned_date} ${x.product_code} ${x.qty}`), [
-    `${iso(0)} amc-a 11`,
-    `null ${iso(0)} amc-a 22`,
-  ], '⭐空白入りの商品コードが、日付つきの別商品とまとまってしまわない');
+  eq(listInboundPlan().rows.map((x) => `${x.product_code} ${x.qty}`), [
+    `${iso(0)} amc-a 22`,
+    'amc-a 11',
+  ], '⭐空白入りの商品コードが、別の商品とまとまってしまわない');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} passed / ${fail} failed`);

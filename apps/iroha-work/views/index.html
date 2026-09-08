@@ -323,19 +323,23 @@
   .tbl.plain tbody tr{cursor:default}
   .tbl.plain tbody tr:active{background:transparent}
   /* 予定日を過ぎてもまだ届いていない行 = 薄く出す (今日以降の予定と見分けられるように) */
-  .tbl tr.past td{color:var(--sub)}   /* 薄くするが、利用者が読めなくなるほどにはしない */
-  .tbl tr.past .pill{opacity:.65}
   .pill.iroha{background:var(--accent-soft);color:var(--accent)}
   .pill.na{background:var(--amber-soft);color:var(--amber)}
   /* 🚚 入荷予定は 商品 / 数量 / 区分 の 3 列だけ。iPhone でも横スクロールなしで収まるようにする */
   .tbl.fit{min-width:0}
   .tbl.fit td,.tbl.fit th{padding:9px 8px}
   .tbl.fit .num{text-align:right}
+  .tbl.fit .day{text-align:left;white-space:nowrap;color:var(--sub)}
+  .tbl.fit .dayline{display:none}
   .tbl.fit small{display:inline-block;line-height:1.35}
   @media (max-width:560px){
     .inboundpage .tools .flabel{flex:1 0 100%}          /* 仕入先の見出しは 1 行使う (ボタンを 3 つ並べる) */
     .tbl.fit td,.tbl.fit th{padding:8px 6px;font-size:.82rem}
     .tbl.fit td.wrap{min-width:0}                        /* 商品名は残りの幅いっぱいに折り返す */
+    /* 「載った日」の列は畳んで商品名の下へ (列のまま置くと商品名が細くなりすぎる)。
+       th と td の両方を消さないと列がずれる */
+    .tbl.fit .day{display:none}
+    .tbl.fit .dayline{display:block;color:var(--sub)}
   }
   .tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
   .tools .date{border:1px solid var(--line);border-radius:var(--r);padding:8px 10px;font-size:.95rem;background:var(--surface);color:var(--ink)}
@@ -926,8 +930,8 @@
     <div class="banner warn" id="ipStale" onclick="this.classList.remove('on')"></div>
     <p class="hint" id="ipHidden"></p>
     <div class="tblwrap"><table class="tbl plain fit">
-      <thead><tr><th>商品</th><th>数量</th><th>いろは在庫化区分</th></tr></thead>
-      <tbody id="ipBody"><tr><td colspan="3">読み込み中…</td></tr></tbody>
+      <thead><tr><th class="day">載った日</th><th>商品</th><th>数量</th><th>いろは在庫化区分</th></tr></thead>
+      <tbody id="ipBody"><tr><td colspan="4">読み込み中…</td></tr></tbody>
     </table></div>
     <p class="hint" id="ipNote"></p>
   </div>
@@ -3623,10 +3627,28 @@ let ipData = null;         // 直近に取れた入荷予定 (絞り込みの切
 let ipIrohaOnly = false;   // 既定は「すべて」— 出していない行があると思わせない
 function setIpIrohaOnly(v) { ipIrohaOnly = !!v; renderInboundPlan(); }
 
+const IP_WEEKDAY = ['日', '月', '火', '水', '木', '金', '土'];
+function ipShiftDate(ymd, days) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd || '');
+  if (!m) return '';
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+/** 'YYYY-MM-DD' → 'きょう' / 'きのう' / '9/7(日)'。日付を数えなくても分かるように */
+function ipDayLabel(ymd, today) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd || '');
+  if (!m) return '—';
+  if (today && ymd === today) return 'きょう';
+  if (today && ymd === ipShiftDate(today, -1)) return 'きのう';
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  return Number(m[2]) + '/' + Number(m[3]) + '(' + IP_WEEKDAY[d.getUTCDay()] + ')';
+}
+
 async function loadInboundPlan() {
   const j = await apiFetch('/api/inbound-plan');
   if (!j.ok) {
-    $('#ipBody').innerHTML = '<tr><td colspan="3">' + esc(j.message || '読み込めませんでした') + '</td></tr>';
+    $('#ipBody').innerHTML = '<tr><td colspan="4">' + esc(j.message || '読み込めませんでした') + '</td></tr>';
     return;
   }
   ipData = j;
@@ -3658,15 +3680,16 @@ function renderInboundPlan() {
     + (!ipIrohaOnly && t.iroha_products ? '　(うち いろはで作業する分 ' + t.iroha_products + ' 商品 / ' + t.iroha_qty + ' 個)' : '');
 
   // ⭐出していない分の理由を書く (黙って減らさない — 中原さん 2026-09-09)
+  const today = j.today || '';
   const hidden = [];
   if (t.arrived_products) hidden.push('もう届いた分 ' + t.arrived_products + ' 商品 (' + t.arrived_qty + ' 個)');
-  if (t.old_products) hidden.push('予定日が ' + (j.past_days || 5) + ' 日より前の分 ' + t.old_products + ' 商品 (' + t.old_qty + ' 個)');
+  if (t.old_products) hidden.push('載ってから ' + (j.past_days || 5) + ' 日より前の分 ' + t.old_products + ' 商品 (' + t.old_qty + ' 個)');
   $('#ipHidden').textContent = hidden.length ? '出していないもの: ' + hidden.join(' / ') : '';
 
   if (!j.batch) {
-    $('#ipBody').innerHTML = '<tr><td colspan="3">入荷受付の取込がまだありません</td></tr>';
+    $('#ipBody').innerHTML = '<tr><td colspan="4">入荷受付の取込がまだありません</td></tr>';
   } else if (rows.length === 0) {
-    $('#ipBody').innerHTML = '<tr><td colspan="3">'
+    $('#ipBody').innerHTML = '<tr><td colspan="4">'
       + (ipIrohaOnly && all.length ? 'いろはで作業する分はありません'
         : '仕入先 ' + esc(code) + ' の入荷予定はありません') + '</td></tr>';
   } else {
@@ -3674,11 +3697,14 @@ function renderInboundPlan() {
       // 区分の札: 有り = いろは行き / 未記入 = 入庫情報管理で決めてもらう必要がある / それ以外 = 入っている文字のまま
       const pill = r.iroha_kind === 'yes' ? 'iroha' : (r.iroha_kind === 'unknown' ? 'na' : 'loc');
       // ⭐予定日を過ぎていて、まだ届いていない行は薄く出す (今日以降の予定と見分けられるように)
-      return '<tr' + (r.past ? ' class="past"' : '') + '>'
+      return '<tr>'
+        + '<td class="num day">' + esc(ipDayLabel(r.listed_on, today)) + '</td>'
         + '<td class="wrap">' + esc(r.product_name || '(名称なし)')
+          // 幅の狭い端末では「載った日」の列を畳んで、ここに出す (商品名に幅を回すため)。
+          // <br> ではなく display で出し入れする — 隠したときに空行が残らないように
+          + '<small class="dayline">載った日: ' + esc(ipDayLabel(r.listed_on, today)) + '</small>'
           + '<br><small>' + esc(r.product_code || '')
           + (r.lines > 1 ? ' / ' + r.lines + ' 行ぶんの合計' : '') + '</small>'
-          + (r.past ? '<br><small>⏰ 遅れています</small>' : '')
           + (r.supplier_conflict ? '<br><small>⚠ 商品マスタで仕入先が食い違っています (職員に伝えてください)</small>' : '') + '</td>'
         + '<td class="num">' + esc(r.qty) + ' 個</td>'
         + '<td><span class="pill ' + pill + '">' + esc(r.iroha) + '</span></td>'
@@ -3688,9 +3714,9 @@ function renderInboundPlan() {
 
   $('#ipNote').innerHTML = 'ロジザードの入荷受付伝票 (倉庫の iPad が見ているのと同じもの) から、仕入先 '
     + esc(code) + ' の商品だけを取り出しています。'
+    + '<b>「載った日」は入荷のリストに出てきた日</b>です (ロジザードの入荷予定日は正確に入っていないので使いません)。'
     + '<b>倉庫で確認がすんだもの (届いたもの) は消えます</b> — いろはで作業する分は 📋 作業 のカードに出ます。'
-    + '予定日を過ぎてもまだ届いていないものは<b>薄い字</b>で残り、' + (j.past_days || 5) + ' 日より前になったら出なくなります。'
-    + 'ロジザード側の集計が「当日から7日前まで」なので、もっと先の予定は出ません。'
+    + '載ってから ' + (j.past_days || 5) + ' 日より前になったものも出なくなります。'
     + '「いろは在庫化区分」は入庫情報管理の「いろは在庫化作業有無」です。'
     + (j.batch ? '<br>この一覧は ' + esc(fmtDateTime(j.batch.imported_at)) + ' に取り込んだものです。' : '');
 }
