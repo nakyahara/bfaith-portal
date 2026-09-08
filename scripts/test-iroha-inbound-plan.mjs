@@ -278,7 +278,10 @@ console.log('\n[8] 載った日 / 届いたもの / 古くなったもの');
     const id = getActiveBatch().id;
     mirror.prepare('UPDATE f_inbound_check_batches SET imported_at = ? WHERE id = ?').run(`${iso(offset)}T00:00:00.000Z`, id);
   };
-  ok(importCsv(makeCsv([row('AR10', 1, 1, 'amc-c', 7)]), { source: 'manual_upload', fileName: 'old6.csv' }).ok, '6 日前の取込');
+  ok(importCsv(makeCsv([
+    row('AR10', 1, 1, 'amc-c', 7),
+    row('AR14', 1, 1, 'amc-c', 9),   // ⭐この明細はあとで別の商品に差し替わる
+  ]), { source: 'manual_upload', fileName: 'old6.csv' }).ok, '6 日前の取込');
   backdate(-6);
   ok(importCsv(makeCsv([row('AR11', 1, 1, 'amc-d', 2)]), { source: 'manual_upload', fileName: 'old5.csv' }).ok, '5 日前の取込');
   backdate(-5);
@@ -287,6 +290,9 @@ console.log('\n[8] 載った日 / 届いたもの / 古くなったもの');
     row('AR8', 2, 1, 'amc-b', 40),   // 今日はじめて載った
     row('AR10', 1, 1, 'amc-c', 7),   // 6 日前から載っている = 古すぎるので出さない
     row('AR11', 1, 1, 'amc-d', 2),   // ちょうど 5 日前から = 境界。まだ出す
+    // ⭐同じ明細 (AR14|1|1) の商品が差し替わった。新しい商品は「今日 載った」扱いにする —
+    //   前の商品の日付を引き継ぐと、載った当日に「5 日より前」として消えてしまう (Codex P1)
+    row('AR14', 1, 1, 'amc-b', 3),
   ]), { source: 'manual_upload', fileName: 'today.csv' });
   ok(imp8.ok, `今日の取込 ok (${imp8.ok ? imp8.rowCount + '行' : imp8.message})`);
 
@@ -296,8 +302,10 @@ console.log('\n[8] 載った日 / 届いたもの / 古くなったもの');
   eq(before.rows.map((x) => `${x.listed_on} ${x.product_code} ${x.qty}`), [
     `${iso(-5)} amc-d 2`,
     `${iso(0)} amc-a 10`,
-    `${iso(0)} amc-b 40`,
+    `${iso(0)} amc-b 43`,
   ], '⭐6 日前から載っているものは出さない / ちょうど 5 日前は出す / 先に載った順');
+  ok(before.rows.some((x) => x.product_code === 'amc-b' && x.ar_nos.includes('AR14')),
+    '⭐商品が差し替わった明細は、新しい商品として「今日 載った」扱いにする (前の商品の日付を引き継がない)');
   eq([before.totals.old_products, before.totals.old_qty], [1, 7], '出さなかった古い分を数える');
 
   // ── 倉庫の iPad が「確認」を確定する = 現物が届いた ──
@@ -324,7 +332,7 @@ console.log('\n[8] 載った日 / 届いたもの / 古くなったもの');
     result: 'shortage', mode: 'current', decide, worker: '倉庫の人', deviceLabel: '倉庫iPad' });
   ok(zero.ok, '0 個のまま不足で確定できた' + (zero.ok ? '' : ': ' + zero.message));
   const z = listInboundPlan();
-  ok(z.rows.some((x) => x.product_code === 'amc-b' && x.qty === 40),
+  ok(z.rows.some((x) => x.product_code === 'amc-b' && x.qty === 43),
     '⭐数えた結果 0 のものは「届いた」にしない (まだ来ていないものとして出す)');
   eq(z.totals.arrived_products, 0, '届いた分にも数えない');
 

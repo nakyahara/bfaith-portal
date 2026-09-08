@@ -258,8 +258,12 @@ function shiftDate(ymd, days) {
  *   それより取り込んだ日付の方が欲しい」)。ロジザード側で予定日を正確に入れていないので、
  *   予定日を軸にすると「遅れている / 古い」の判断がそのまま狂う。
  *
- * 取込は毎回**全置換**なので、同じ line_key を含むいちばん古いバッチの取込日 = 初めてリストに載った日。
+ * 取込は毎回**全置換**なので、同じ明細を含むいちばん古いバッチの取込日 = 初めてリストに載った日。
  * work_date ではなく imported_at から出す — work_date は繰り越し (rollOverWorkDate) で今日へ書き換わるため。
+ *
+ * 🚨 明細のキーは **line_key だけでなく code_key も**見る (Codex P1)。伝票の明細は商品が差し替わることが
+ *    あり (取込側も product_changed として確認をやり直させる)、line_key だけで見ると新しい商品が
+ *    前の商品の古い日付を引き継いで、載った当日に「5 日より前」として消える。
  *
  * さかのぼるのは LOOKBACK_DAYS 日ぶんだけ。それより前に載った明細は、どのみち PAST_DAYS で
  * 出さない側に落ちるので、正確な初日を知る必要がない (バッチは 365 日ぶん残るので、全部見ると重い)。
@@ -273,12 +277,12 @@ function firstSeenMap(db, lines, today) {
   const since = shiftDate(today, -LOOKBACK_DAYS) || '0000-01-01';
   eachChunk(keys, 400, (part) => {
     const ph = part.map(() => '?').join(',');
-    const rows = db.prepare(`SELECT l.line_key AS k, MIN(date(b.imported_at, '+9 hours')) AS day
+    const rows = db.prepare(`SELECT l.line_key AS k, l.code_key AS c, MIN(date(b.imported_at, '+9 hours')) AS day
       FROM f_inbound_check_lines l
       JOIN f_inbound_check_batches b ON b.id = l.batch_id
      WHERE l.line_key IN (${ph}) AND date(b.imported_at, '+9 hours') >= ?
-     GROUP BY l.line_key`).all(...part, since);
-    for (const r of rows) if (r.day) map.set(r.k, r.day);
+     GROUP BY l.line_key, l.code_key`).all(...part, since);
+    for (const r of rows) if (r.day) map.set(`${r.k} ${r.c}`, r.day);
   });
   return map;
 }
@@ -331,7 +335,7 @@ export function listInboundPlan() {
     const m = master.get(key) || null;
     if (!want.has(normSupplierSafe(m && m.supplier_code))) continue;
     // さかのぼり切れなかった明細 (LOOKBACK_DAYS より前から載っている) は「古い」側へ
-    const day = firstSeen.get(trimS(l.line_key)) || null;
+    const day = firstSeen.get(`${trimS(l.line_key)} ${l.code_key}`) || null;
     // 届いたか → 古すぎるか の順に見る (届いた分は古くても「届いた」と数えたい)
     const bucket = arrived.has(trimS(l.line_key)) ? buckets.arrived
       : (!day || (oldest && day < oldest)) ? buckets.old
