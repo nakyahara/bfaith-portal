@@ -5064,8 +5064,9 @@ async function submitBlock() {
 let unblockCtx = null;   // { ids }
 let unblockSaving = false;
 /** @param headcount 人数だけではじめようとしていたとき { facilityCode, crewSize } (要件 §AB-10) */
-function openUnblock(c, ids, headcount) {
-  unblockCtx = { ids, headcount };
+// ⭐batchId も預かる — 札を外して始め直すときに、選んだぶんを選び直させない (Codex #1269 R1 中2)
+function openUnblock(c, ids, headcount, batchId) {
+  unblockCtx = { ids, headcount, batchId: batchId ?? null };
   $('#unblockName').textContent = c.title || '';
   const b = c.blocked;
   $('#unblockText').textContent = b
@@ -5085,7 +5086,10 @@ async function confirmUnblock() {
   const hc = unblockCtx.headcount;
   let r;
   // ⭐どちらの入口から来たかで戻り先を変える。人数だけの開始も同じ確認を通す
-  try { r = hc ? await startHeadcount(hc.facilityCode, { clearBlock: true, crewSize: hc.crewSize }) : await startWork(ids, { clearBlock: true }); }
+  try {
+    r = hc ? await startHeadcount(hc.facilityCode, { clearBlock: true, crewSize: hc.crewSize })
+      : await startWork(ids, { clearBlock: true, ...(unblockCtx.batchId ? { batchId: unblockCtx.batchId } : {}) });
+  }
   finally {
     unblockSaving = false;
     $('#unblockGo').disabled = false;
@@ -5505,6 +5509,13 @@ async function startWork(ids, opts) {
   const cur = findCard(curDetail);
   // ⭐手元のまとまりが 2 つ以上あって絞れないなら、先に選んでもらう (§AB-10)
   if (!pickedBatch(cur, opts) && homeBatches(cur).length > 1) { openWorkBatchPick(cur, ids, opts); return false; }
+  // 🚨分かれているのに**手元に作業できるぶんが 1 つも無い**なら、押しても意味が無い
+  //   (全部外に預けたか、もう棚入待ち)。黙って始めると、どのぶんか分からない作業時間だけが残る
+  if (!pickedBatch(cur, opts) && (cur && cur.batches || []).filter((x) => x.work_status !== 'cancelled').length > 1
+    && homeBatches(cur).length === 0) {
+    showErr('いま手をつけられるぶんがありません', '外に預けているか、もう棚入待ちです。まとまりの一覧を見てください');
+    return false;
+  }
   const j = await apiFetch('/api/sessions/start', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     // 札を外して始めるときは、確認した版 (expect_version) も送る — 確認している間に理由が付け替わっていたら断られる
@@ -5517,15 +5528,16 @@ async function startWork(ids, opts) {
     // ⛔ 止まっている札が付いたまま → 「解消しましたか?」を聞いてから clear_block で送り直す (案A)
     if (j.error === 'blocked') {
       if (cur && j.task) applyTask(cur, j.task);
-      openUnblock(cur || { title: '', blocked: j.blocked }, ids);
+      // ⭐選んだぶんを預ける (札を外したあと、もう一度選ばせない)
+      openUnblock(cur || { title: '', blocked: j.blocked }, ids, undefined, pickedBatch(cur, opts));
       return 'blocked';
     }
     // 確認している間に札が変わった (別の端末が理由を付け替えた / 外した) → 最新で描き直して、もう一度確認
     if (j.error === 'conflict' && opts && opts.clearBlock && cur && j.current) {
       applyTask(cur, j.current);
       renderList(); if (sameId(curDetail, cur.id)) renderDetail(cur);
-      if (cur.blocked) { openUnblock(cur, ids); toast('止まっている理由が変わっていました。もう一度確かめてください'); return 'blocked'; }
-      return startWork(ids);   // もう外れていた → 普通に始める
+      if (cur.blocked) { openUnblock(cur, ids, undefined, pickedBatch(cur, opts)); toast('止まっている理由が変わっていました。もう一度確かめてください'); return 'blocked'; }
+      return startWork(ids, pickedBatch(cur, opts) ? { batchId: pickedBatch(cur, opts) } : undefined);   // もう外れていた → 普通に始める
     }
     showErr(j.message || '作業をはじめられませんでした');
     return false;
@@ -6300,12 +6312,15 @@ function dqDiff(el) {
 /**
  * ⭐**手元の (物を持ち帰らない) まとまり**で、まだ作業できるもの。
  * 2 つ以上あると「どのぶんの作業か」が決まらないので、画面で選んでもらう (要件 §AB-10)。
+ *
+ * ⚠拠点マスタに無い拠点は「手元」に寄せる (選択肢から落として押せなくするより、出して選ばせる)。
+ *   選んだものが本当に手元かは**サーバーが最後に見る** (HOME_BATCH_SQL で外に出したぶんを弾く)。
  */
 function homeBatches(c) {
   const all = (c && c.batches || []).filter((x) => x.work_status !== 'cancelled');
   if (all.length <= 1) return [];
-  const facs = new Map((((boardState() || {}).facilities) || []).map((f) => [f.code, !!f.offsite]));
-  return all.filter((x) => !(x.facility_code && facs.get(x.facility_code))
+  const offsite = new Set((((boardState() || {}).facilities) || []).filter((f) => f.offsite).map((f) => f.code));
+  return all.filter((x) => !(x.facility_code && offsite.has(x.facility_code))
     && (x.work_status === 'not_started' || x.work_status === 'in_progress'));
 }
 function homeBatchId(c) {

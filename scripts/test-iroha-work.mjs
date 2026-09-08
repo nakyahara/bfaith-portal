@@ -4207,7 +4207,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     'できあがりで全員止まったら「何個できましたか + 作れなかった数 → 棚入待ちにする」を出す (⭐予定で埋めない)');
   ok(!/終了 → 棚入完了/.test(html), '「終了 → 棚入完了を (職員PIN)」の案内は出さない (利用者が押せるのは棚入待ち)');
   // 止まっているカードを始めるときの確認 → clear_block で外してから始める
-  ok(/if \(j\.error === 'blocked'\)/.test(html) && /openUnblock\(/.test(html) && /startWork\(ids, \{ clearBlock: true \}\)/.test(html)
+  ok(/if \(j\.error === 'blocked'\)/.test(html) && /openUnblock\(/.test(html)
+    && /startWork\(ids, \{ clearBlock: true, \.\.\.\(unblockCtx\.batchId \? \{ batchId: unblockCtx\.batchId \} : \{\}\) \}\)/.test(html)
     && /clear_block: true, expect_version: cur \? cur\.version : undefined/.test(html)
     && /j\.error === 'conflict' && opts && opts\.clearBlock/.test(html),
     '止まっているカードは「解消しましたか?」を聞いてから clear_block + 確認した版で始める (理由が変わっていたらもう一度確認)');
@@ -8115,6 +8116,76 @@ console.log('\n[作業のまとまり] ⭐どのぶんの作業かを記録す�
   const other = B.listBatchesOfTask(dbx, t2)[0];
   const bad = TD.startTaskSession({ taskId: t, worker, batchId: other.id });
   ok(!bad.ok && bad.error === 'bad_batch', '⭐よそのカードのぶんは指定できない');
+}
+
+console.log('\n[まとまり選択の操作] ⭐選ぶまで送らない / 選んだら 1 回だけ / 札を外しても選び直させない');
+{
+  const html = fs.readFileSync(new URL('../apps/iroha-work/views/index.html', import.meta.url), 'utf8');
+  const LFCH = String.fromCharCode(10);
+  // ⭐startWork と、それが使う判定をまとめて取り出して**実際に動かす**
+  const src = [
+    html.match(/function homeBatches\(c\) \{[\s\S]*?\r?\n\}/)[0],
+    html.match(/function homeBatchId\(c\) \{[\s\S]*?\r?\n\}/)[0],
+    html.match(/function pickedBatch\(c, opts\) \{[\s\S]*?\r?\n\}/)[0],
+    html.match(/async function startWork\(ids, opts\) \{[\s\S]*?\r?\n\}/)[0],
+  ].join(LFCH);
+
+  const mkRun = (batches, replies) => {
+    let i = 0;
+    const sent = [];
+    const picks = [];      // openWorkBatchPick が呼ばれた回数
+    const errs = [];
+    const unblocks = [];
+    const card = { id: 7, version: 3, batches, title: 'x' };
+    const fn = new Function('can', 'worker', 'openGate', 'curDetail', 'findCard', 'apiFetch', 'boardState',
+      'openWorkBatchPick', 'showErr', 'openUnblock', 'applyTask', 'renderList', 'renderDetail', 'sameId',
+      'toast', 'renderTabs', 'isApp',
+      src + '; return startWork;')(
+      () => true, { id: 1 }, () => {}, 7, () => card,
+      async (_u, o) => { sent.push(JSON.parse(o.body)); const r = replies[i++]; return r; },
+      () => ({ facilities: [{ code: 'iroha', offsite: 0 }, { code: 'workcenter', offsite: 1 }] }),
+      (c, ids2, opts) => picks.push({ ids: ids2, opts }),
+      (m, sub) => errs.push(m),
+      (c, ids2, hc, batchId) => unblocks.push({ batchId }),
+      () => {}, () => {}, () => {}, (a, b) => a === b, () => {}, () => {}, () => true);
+    return { fn, sent, picks, errs, unblocks, card };
+  };
+  const two = [{ id: 11, facility_code: 'iroha', work_status: 'not_started', planned_qty: 60 },
+    { id: 12, facility_code: null, work_status: 'not_started', planned_qty: 40 }];
+
+  // ① 手元が 2 つ = 選ばせる。**この時点では送らない**
+  const a = mkRun(two, []);
+  await a.fn([1]);
+  ok(a.picks.length === 1 && a.sent.length === 0,
+    '⭐絞れないときは選ぶ画面を出すだけ (この時点ではサーバーに送らない)');
+
+  // ② 選んだら、そのぶんを付けて 1 回だけ送る
+  const b = mkRun(two, [{ ok: true, sessions: [], task: {}, status: 'in_progress' }]);
+  await b.fn([1], { batchId: 12 });
+  ok(b.sent.length === 1 && b.sent[0].batch_id === 12 && b.picks.length === 0,
+    '⭐選んだら、そのぶんを付けて 1 回だけ送る (選ぶ画面は出さない)');
+
+  // ③ 札が付いていたら、選んだぶんを預けて確認へ (もう一度選ばせない)
+  const c3 = mkRun(two, [{ ok: false, error: 'blocked', blocked: { label: '資材' }, task: {} }]);
+  await c3.fn([1], { batchId: 12 });
+  ok(c3.unblocks.length === 1 && c3.unblocks[0].batchId === 12,
+    '⭐札を外す確認へ進むときも、選んだぶんを預ける (外したあと選び直させない — R1 中2)');
+
+  // ④ 手元に作業できるぶんが無ければ、始めさせずに理由を言う
+  const gone = [{ id: 11, facility_code: 'workcenter', work_status: 'in_progress', planned_qty: 60 },
+    { id: 12, facility_code: 'iroha', work_status: 'ready_for_stocking', planned_qty: 40 }];
+  // ⭐応答を 1 つ用意しておく — 万一送ってしまったときに、例外で止まらず ✗ として見えるように
+  const d = mkRun(gone, [{ ok: true, sessions: [], task: {}, status: 'in_progress' }]);
+  await d.fn([1]);
+  ok(d.sent.length === 0 && d.picks.length === 0 && d.errs.length === 1 && /手をつけられるぶんがありません/.test(d.errs[0]),
+    '⭐手元に作業できるぶんが無ければ、始めさせずに理由を言う (R1 中1)');
+
+  // ⑤ まとまりが 1 つなら今までどおり (選ばせず、そのまま送る)
+  const one = [{ id: 11, facility_code: 'iroha', work_status: 'not_started', planned_qty: 100 }];
+  const e = mkRun(one, [{ ok: true, sessions: [], task: {}, status: 'in_progress' }]);
+  await e.fn([1]);
+  ok(e.picks.length === 0 && e.sent.length === 1 && e.sent[0].batch_id === undefined,
+    '⭐まとまりが 1 つなら選ばせない (ふだんの操作は変わらない。サーバーが自動で結びつける)');
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
