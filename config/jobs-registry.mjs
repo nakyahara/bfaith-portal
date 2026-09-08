@@ -217,7 +217,7 @@ export const JOBS_REGISTRY = [
       + '失敗時は logs を確認 → node apps/expected-profit/nightly.js --skip-publish で世代だけ作り直せる。'
       + '画面 = /apps/profit-analysis の「想定利益 (単品)」タブ。'
       + '公開中の世代は GET /apps/expected-profit/sync/published (x-sync-key) で見える。'
-      + '必要 env: SP_API_* / RAKUTEN_* / RENDER_PORTAL_URL / MIRROR_SYNC_KEY / JOBS_MONITOR_TOKEN。'
+      + '必要 env: SP_API_* / RAKUTEN_* / RENDER_MIRROR_URL / MIRROR_SYNC_KEY / JOBS_MONITOR_TOKEN。'
       + '正本 = AI_reference『システム設計/商品別想定利益_要件定義_20260907.md』',
   },
   {

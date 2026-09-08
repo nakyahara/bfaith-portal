@@ -12,6 +12,7 @@ import os from 'os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-pub-'));
 
+const { httpDeps } = await import('./publish.js');
 const { initExpectedProfitDB, getExpectedProfitDB, addColumnIfMissing, MIGRATED_COLUMNS,
   createExpectedProfitSchema } = await import('./db.js');
 const { receiveChunk, publishGeneration, getPublished, chunkChecksum, pruneGenerations, generationContentHash } = await import('./publish-api.js');
@@ -431,6 +432,43 @@ t('[!] MIGRATED_COLUMNS に書いた列は実在する (古い記述が残らな
     assert.ok(MIGRATED_COLUMNS.some(([t, c]) => t === table && c === column),
       `${table}.${column} が MIGRATED_COLUMNS に無い = 既存DBには足されない`);
   }
+});
+
+console.log('');
+console.log('Render の URL は既存の env を使う (2026-09-08 初回公開が env 名の食い違いで止まった)');
+
+const withEnv = (vals, fn) => {
+  const keys = ['RENDER_PORTAL_URL', 'RENDER_MIRROR_URL', 'MIRROR_SYNC_KEY'];
+  const saved = keys.map(k => process.env[k]);
+  try {
+    for (const k of keys) delete process.env[k];
+    for (const [k, v] of Object.entries(vals)) process.env[k] = v;
+    fn();
+  } finally {
+    for (let i = 0; i < keys.length; i++) {
+      if (saved[i] === undefined) delete process.env[keys[i]];
+      else process.env[keys[i]] = saved[i];
+    }
+  }
+};
+
+t('[!] RENDER_MIRROR_URL だけでも転送先を組み立てられる', () => {
+  // 🚨 同じ Render を指すのに新しい env を増やしたせいで、初回の公開が黙って止まった
+  withEnv({ RENDER_MIRROR_URL: 'https://example.test/', MIRROR_SYNC_KEY: 'k' }, () => {
+    assert.doesNotThrow(() => httpDeps(), '既存 env だけで組み立てられない = 転送が止まる');
+  });
+});
+
+t('RENDER_PORTAL_URL があればそちらを優先する (移行用)', () => {
+  withEnv({ RENDER_PORTAL_URL: 'https://new.test', RENDER_MIRROR_URL: 'https://old.test', MIRROR_SYNC_KEY: 'k' }, () => {
+    assert.doesNotThrow(() => httpDeps());
+  });
+});
+
+t('[!] どちらも無ければ、設定すべき env 名を挙げて止まる', () => {
+  withEnv({ MIRROR_SYNC_KEY: 'k' }, () => {
+    assert.throws(() => httpDeps(), /RENDER_MIRROR_URL/, '古い名前で怒られると何を設定すべきか分からない');
+  });
 });
 
 // 🚨 再オープンしていることがあるので、いま開いているハンドルを閉じる (Windows は開いたままだと消せない)

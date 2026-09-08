@@ -528,7 +528,9 @@ t('maxWaitMs を渡せば従う (上限は超えない)', () => {
 
 await ta('[!] fetchAmazonListings は期限をレポート取得まで渡す (渡し忘れると5分で諦める)', async () => {
   let seen = null;
-  const deadline = new Date('2026-09-08T06:00:00Z');
+  // 🚨 固定日時の期限を渡すと、その日を過ぎた翌日から落ちる = 書いた日にしか通らない試験
+  //    (実際に 3 回これで落ちた)。fetchAmazonListings は実時計で期限を見るので相対時刻にする
+  const deadline = new Date(Date.now() + 6 * 60 * 60 * 1000);
   await fetchAmazonListings(db, {
     deadline,
     getActiveListingsReport: async (o) => { seen = o; return { listings: [] }; },
