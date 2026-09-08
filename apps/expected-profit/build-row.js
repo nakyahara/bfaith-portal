@@ -44,7 +44,7 @@ export function resolveNeCode(listing, skuMap, products = null) {
     // 楽天は SKU管理番号 でも引けるようにフォールバック (対応表の作りが2系統ある)
     if (listing.mall === 'rakuten') {
       const alt = skuMap.get(String(listing.mall_item_key).toLowerCase());
-      if (alt && alt.length === 1) return { status: 'ok', neCode: alt[0].ne_code, qty: alt[0].qty ?? null };
+      if (alt && alt.length === 1) return { status: 'ok', neCode: alt[0].ne_code, qty: alt[0].qty ?? null, source: 'sku_map' };
       if (alt && alt.length > 1) return { status: 'ambiguous', reason: 'multiple_ne_codes' };
     }
     // 🚨 FBM は対応表に載っていないのが普通。SKU がそのまま NE の商品コード

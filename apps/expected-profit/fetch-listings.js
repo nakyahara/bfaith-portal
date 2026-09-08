@@ -78,11 +78,16 @@ export function amazonFulfillment(raw) {
  * 🚨 知らない配送パターンは **null (不明)** にする。勝手に送料込みへ倒さない。
  *    新しい配送パターンを作ったときに、黙って利益を高く見せないため。
  */
+/**
+ * 🚨 ここに載せてよいのは「**プライム扱い = 配送料無料が条件**」と根拠が言えるものだけ。
+ *    「移行された配送パターン」(72件) は名前からは何も分からないので**入れない** (Codex R12)。
+ *    根拠なく入れると、送料を別途もらっている出品の利益を高く見せてしまう。
+ *    → 参考値 (`shipping_revenue_unknown`) のままにして、中原さんの確認を待つ。
+ */
 export const AMAZON_POSTAGE_INCLUDED_GROUPS = [
-  'ネコポスマケプレプライム設定',
-  'プライム配送パターン',
-  '移行された配送パターン',
-  'Selected Self-Ship Templateネコポスマケプレプライム設定',
+  'ネコポスマケプレプライム設定',                                  // 実測 3,377 件
+  'プライム配送パターン',                                          // 実測 3 件
+  'Selected Self-Ship Templateネコポスマケプレプライム設定',       // 実測 3 件
 ];
 
 export function amazonPostageIncluded(fulfillment, shippingGroup) {

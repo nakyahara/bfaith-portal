@@ -396,6 +396,14 @@ t('normalizeQty: 1以上の整数だけ採用する (0 や小数や null は数�
   assert.equal(normalizeQty('あ'), null);
 });
 
+t('[!] 楽天の SKU管理番号 フォールバックでも紐づけ方を記録する', () => {
+  // 🚨 ここだけ source が抜けていて、紐づいているのに「不明」と出ていた (Codex R12)
+  const m = new Map([['item/sku1', [{ ne_code: 'ne001', qty: null }]]]);
+  const r = resolveNeCode({ mall: 'rakuten', mall_item_key: 'item/sku1', mall_item_ref: 'nothere' }, m);
+  assert.equal(r.status, 'ok');
+  assert.equal(r.source, 'sku_map');
+});
+
 t('resolveNeCode は数量も返す', () => {
   const m = new Map([['sku1', [{ ne_code: 'ne001', qty: 5 }]]]);
   assert.equal(resolveNeCode({ mall: 'amazon', mall_item_key: 'sku1' }, m).qty, 5);

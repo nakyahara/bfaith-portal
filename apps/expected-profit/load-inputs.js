@@ -31,7 +31,23 @@ export function loadProducts(wdb) {
     FROM m_products
   `).all();
   const map = new Map();
-  for (const r of rows) map.set(String(r.商品コード).toLowerCase(), r);
+  // 🚨 キーは小文字に揃える。Amazon の SKU と NE の商品コードで大文字小文字が違うものが
+  //    563 件ある (実測 2026-09-08。例 `0726-000629-BK` ↔ `0726-000629-bk`)。
+  // 🚨 ただし「小文字にすると重なる別コード」があると、**別商品の原価を使ってしまう**。
+  //    実測では 7,242 件中 0 件だが、黙って後勝ちにせず**両方落とす** (Codex R12)。
+  //    落ちた行は product_not_found になり、静かに間違った数字を出すことはない。
+  const collided = new Set();
+  for (const r of rows) {
+    const key = String(r.商品コード).toLowerCase();
+    const prev = map.get(key);
+    if (prev && String(prev.商品コード) !== String(r.商品コード)) { collided.add(key); continue; }
+    map.set(key, r);
+  }
+  for (const key of collided) map.delete(key);
+  if (collided.size > 0) {
+    console.warn(`[expected-profit] 🚨 商品コードが大文字小文字だけ違うものが ${collided.size} 組あります`
+      + ` (どちらの原価か決められないので両方とも計算しません): ${[...collided].slice(0, 5).join(', ')}`);
+  }
   return map;
 }
 

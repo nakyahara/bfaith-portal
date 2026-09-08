@@ -95,6 +95,32 @@ t('normalizeQty は 1以上の整数だけ通す', () => {
 console.log('');
 console.log('他の読み出しも本番の SQL を通す');
 
+t('[!] 大文字小文字だけ違う商品コードは両方とも落とす (別商品の原価を使わない)', () => {
+  // 🚨 実測では 7,242 件中 0 組だが、増えたときに黙って後勝ちにしない (Codex R12)。
+  //    落ちた行は product_not_found になり、間違った数字は出さない
+  const d = new Database(path.join(dir, 'case.db'));
+  d.exec(`CREATE TABLE m_products (商品コード TEXT, 商品名 TEXT, 原価 REAL, 原価ソース TEXT,
+    原価状態 TEXT, 消費税率 REAL, 税区分 TEXT, 送料コード TEXT, 配送方法 TEXT, 売上分類 INTEGER, 取扱区分 TEXT)`);
+  const ins = d.prepare('INSERT INTO m_products (商品コード, 原価) VALUES (?, ?)');
+  ins.run('ABC-1', 100);
+  ins.run('abc-1', 999);        // 小文字にすると重なる別コード
+  ins.run('ONLY-ME', 500);
+  const m = loadProducts(d);
+  assert.equal(m.has('abc-1'), false, 'どちらか一方を勝たせてはいけない');
+  assert.equal(m.get('only-me').原価, 500, '関係ない行は残る');
+  d.close();
+});
+
+t('大文字小文字が同じなら普通に引ける (563件がこれに頼っている)', () => {
+  const d = new Database(path.join(dir, 'case2.db'));
+  d.exec(`CREATE TABLE m_products (商品コード TEXT, 商品名 TEXT, 原価 REAL, 原価ソース TEXT,
+    原価状態 TEXT, 消費税率 REAL, 税区分 TEXT, 送料コード TEXT, 配送方法 TEXT, 売上分類 INTEGER, 取扱区分 TEXT)`);
+  d.prepare('INSERT INTO m_products (商品コード, 原価) VALUES (?, ?)').run('0726-000629-bk', 300);
+  // Amazon 側の SKU は大文字 (実測 `0726-000629-BK`)
+  assert.equal(loadProducts(d).get('0726-000629-BK'.toLowerCase()).原価, 300);
+  d.close();
+});
+
 t('商品マスタと配送マスタが実 DB から読める (列名のズレを検出する)', () => {
   wdb.exec(`CREATE TABLE m_products (商品コード TEXT, 商品名 TEXT, 原価 REAL, 原価ソース TEXT,
     原価状態 TEXT, 消費税率 REAL, 送料コード TEXT, 配送方法 TEXT, 売上分類 INTEGER, 標準売価 REAL,

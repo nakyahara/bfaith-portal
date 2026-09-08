@@ -12,7 +12,8 @@ import os from 'os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'ep-pub-'));
 
-const { initExpectedProfitDB, getExpectedProfitDB, addColumnIfMissing, MIGRATED_COLUMNS } = await import('./db.js');
+const { initExpectedProfitDB, getExpectedProfitDB, addColumnIfMissing, MIGRATED_COLUMNS,
+  createExpectedProfitSchema } = await import('./db.js');
 const { receiveChunk, publishGeneration, getPublished, chunkChecksum, pruneGenerations, generationContentHash } = await import('./publish-api.js');
 const { makeChunks, makeManifest, publishToRender } = await import('./publish.js');
 const { hashRows } = await import('./generation-hash.js');
@@ -401,7 +402,23 @@ t('[!] 本番の初期化 (initExpectedProfitDB) が既存DBに列を足す', ()
   }
 });
 
-t('[!] DDL に書いた列は MIGRATED_COLUMNS にも入っている (既存DBに足し忘れない)', () => {
+t('[!] 既存DBに列が足りないまま publish すると必ず落ちる (静かに欠けない)', () => {
+  // 🚨 MIGRATED_COLUMNS を巡回するだけの試験は「一覧への登録漏れ」を検出できない (Codex R12)。
+  //    本当に守りたいのは「受け取る側の列が足りないまま公開されないこと」なので、
+  //    列を落としたDBに本番の INSERT を通して、**落ちる**ことを確かめる
+  const p = path.join(process.env.DATA_DIR, 'missingcol.db');
+  const old = new Database(p);
+  createExpectedProfitSchema(old);
+  old.exec('ALTER TABLE mart_listing_expected_profit DROP COLUMN ne_code_source');
+  assert.throws(
+    () => old.prepare(`INSERT INTO mart_listing_expected_profit
+      (generation_id, mall, shop_id, mall_item_key, ne_code_source) VALUES ('g','amazon','s','k','sku_map')`).run(),
+    /ne_code_source/,
+    '列が無いのに INSERT が通ってしまう = 静かに欠ける');
+  old.close();
+});
+
+t('[!] MIGRATED_COLUMNS に書いた列は実在する (古い記述が残らない)', () => {
   // 新規DBの列と、移行で足せる列を突き合わせる
   const live = getExpectedProfitDB();   // 直前の試験で開き直しているので、いまのハンドルを使う
   const colsOf = (table) => live.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);

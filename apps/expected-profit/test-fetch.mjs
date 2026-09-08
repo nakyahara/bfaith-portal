@@ -714,6 +714,18 @@ t('[!] 知らない配送パターンは「不明」にする (勝手に送料�
   assert.equal(amazonPostageIncluded('FBM', '来年つくる新しいパターン'), null);
 });
 
+t('[!] 「移行された配送パターン」は送料込みにしない (根拠が無い・Codex R12)', () => {
+  // 🚨 名前からは何も分からない。中原さんが承認したのはマケプレプライムだけ。
+  //    根拠なく入れると、送料を別途もらっている出品の利益を高く見せてしまう
+  assert.equal(amazonPostageIncluded('FBM', '移行された配送パターン'), null);
+});
+
+t('[!] 許可リストに載せてよいのはプライム扱いのものだけ', () => {
+  for (const g of AMAZON_POSTAGE_INCLUDED_GROUPS) {
+    assert.ok(/プライム|Prime/i.test(g), `根拠の言えない配送パターンが混ざっている: ${g}`);
+  }
+});
+
 t('配送パターンが読めなければ不明', () => {
   assert.equal(amazonPostageIncluded('FBM', ''), null);
   assert.equal(amazonPostageIncluded('FBM', null), null);

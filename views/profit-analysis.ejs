@@ -43,6 +43,8 @@
     .btn-secondary:hover:not(:disabled) { background: #d1d5db; }
 
     .table-wrap { max-height: calc(100vh - 380px); overflow: auto; border: 1px solid #e5e7eb; border-radius: 8px; }
+    .ep-table .ep-group th { background:#f3f4f6; color:#374151; font-size:11px; text-align:center; border-right:1px solid #e5e7eb; }
+    .ep-table th, .ep-table td { white-space: nowrap; }
     .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
     .data-table th, .data-table td { border: 1px solid #e5e7eb; padding: 5px 8px; text-align: right; white-space: nowrap; }
     .data-table th { background: #f3f4f6; position: sticky; top: 0; z-index: 10; text-align: center; font-size: 11px; cursor: pointer; user-select: none; }
@@ -603,11 +605,30 @@
       }
 
       const isFba = epState.scope === 'fba_v1';
-      html += '<div class="table-wrap"><table class="data-table"><thead><tr>';
-      const cols = ['出品コード', '商品名', 'モール', '出荷', '売価(税抜)', '売価(税込)', '送料収入', '原価(税込前)',
-        isFba ? 'FBA配送代行' : '送料区分', isFba ? '—' : '配送関係費', '手数料率', '手数料', '想定利益', '想定利益率', '状態'];
+      // 🚨 経費は合計だけでなく**内訳を列で出す** (中原さん 2026-09-08)。
+      //    どの配送方法で・どの送料区分を・いくらで使ったかが見えないと、数字を信用できない。
+      //    列は 24。横に長いので table-wrap で横スクロールする
+      html += '<div class="table-wrap"><table class="data-table ep-table"><thead>';
+      html += '<tr class="ep-group">'
+        + '<th colspan="4">出品</th>'
+        + '<th colspan="3">売上</th>'
+        + '<th colspan="2">仕入</th>'
+        + '<th colspan="7">配送にかかる費用</th>'
+        + '<th colspan="5">モールに払う手数料</th>'
+        + '<th colspan="3">結果</th>'
+        + '</tr><tr>';
+      const cols = [
+        '出品コード', '商品名', 'モール', '出荷',                                    // 出品 4
+        '売価(税抜)', '売価(税込)', '送料収入',                                      // 売上 3
+        '原価(税抜)', '何個ぶん',                                                    // 仕入 2
+        '配送方法', '送料区分', '送料', '出荷作業料', '梱包資材費', '人件費', 'FBA配送代行',  // 配送 7
+        '販売手数料', '成約料', '基本成約料', '手数料 合計', '手数料率',              // 手数料 5
+        '想定利益', '想定利益率', '状態',                                            // 結果 3
+      ];
       for (const h of cols) html += '<th>' + escapeHtml(h) + '</th>';
       html += '</tr></thead><tbody>';
+      // 値が無い (その経路では発生しない) ことと 0 円を見分けられるようにする
+      const money = (v) => (v == null ? '<span style="color:#d1d5db;">—</span>' : epNum(v));
       for (const r of epState.rows) {
         const profitStyle = (r.expected_profit != null && r.expected_profit < 0) ? ' style="color:#dc2626;font-weight:600;"' : '';
         html += '<tr>';
@@ -615,23 +636,34 @@
         html += '<td>' + escapeHtml(r.product_name || '') + '</td>';
         html += '<td>' + escapeHtml(MALL_FEE_RATES_LABEL[r.mall] || r.mall) + '</td>';
         html += '<td>' + escapeHtml(r.fulfillment || '') + '</td>';
+        // ── 売上 ──
         html += '<td>' + epNum(r.price_ex_tax) + '</td>';
         html += '<td>' + epNum(r.price_incl_tax) + '</td>';
-        html += '<td>' + epNum(r.postage_revenue_ex_tax) + '</td>';
+        html += '<td>' + money(r.postage_revenue_ex_tax) + '</td>';
+        // ── 仕入 ──
+        html += '<td>' + epNum(r.cost_ex_tax) + '</td>';
         // まとめ買いSKU は単品原価 x 数量。何個ぶんかを出さないと原価が高すぎるように見える
-        var qtyTag = (r.unit_quantity > 1)
-          ? ' <span style="color:#b45309;font-size:11px;" title="この出品は単品 ' + r.unit_quantity + ' 個ぶん">x' + r.unit_quantity + '</span>' : '';
-        html += '<td>' + epNum(r.cost_ex_tax) + qtyTag + '</td>';
+        html += '<td>' + (r.unit_quantity == null ? '<span style="color:#d1d5db;">—</span>'
+          : (r.unit_quantity > 1 ? '<b style="color:#b45309;">×' + r.unit_quantity + '</b>' : '1')) + '</td>';
+        // ── 配送にかかる費用 (6列 + FBA配送代行) ──
         if (isFba) {
-          html += '<td>' + epNum(r.fba_fee_ex_tax) + '</td><td>—</td>';
+          html += '<td colspan="6" style="color:#9ca3af;">Amazon が配送するので自社の配送費はかからない</td>';
         } else {
           html += '<td>' + escapeHtml(r.shipping_method || '—') + '</td>';
-          html += '<td title="送料 ' + epNum(r.shipping_fee_ex_tax) + ' / 作業料 ' + epNum(r.shipping_work_ex_tax)
-            + ' / 資材 ' + epNum(r.shipping_material_ex_tax) + ' / 人件費 ' + epNum(r.shipping_labor_ex_tax) + '">'
-            + epNum(r.shipping_total_ex_tax) + '</td>';
+          html += '<td style="color:#6b7280;">' + escapeHtml(r.shipping_code || '—') + '</td>';
+          html += '<td>' + money(r.shipping_fee_ex_tax) + '</td>';
+          html += '<td>' + money(r.shipping_work_ex_tax) + '</td>';
+          html += '<td>' + money(r.shipping_material_ex_tax) + '</td>';
+          html += '<td>' + money(r.shipping_labor_ex_tax) + '</td>';
         }
+        html += '<td>' + money(r.fba_fee_ex_tax) + '</td>';
+        // ── 手数料 ──
+        html += '<td>' + money(r.referral_fee_ex_tax) + '</td>';
+        html += '<td>' + money(r.closing_fee_ex_tax) + '</td>';
+        html += '<td>' + money(r.per_item_fee_ex_tax) + '</td>';
+        html += '<td>' + money(r.fee_total_ex_tax) + '</td>';
         html += '<td>' + epPct(r.fee_rate_display) + (r.mall === 'amazon' ? '' : ' <span style="color:#9ca3af;">概算</span>') + '</td>';
-        html += '<td>' + epNum(r.fee_total_ex_tax) + '</td>';
+        // ── 結果 ──
         html += '<td' + profitStyle + '>' + epNum(r.expected_profit) + '</td>';
         html += '<td' + profitStyle + '>' + epPct(r.expected_margin_rate) + '</td>';
         html += '<td style="font-size:11px;color:#6b7280;">'
