@@ -6473,10 +6473,15 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
     const srcA = html.match(/function splitOnlyHtml\(c\) \{[\s\S]*?\r?\n\}/)[0];
     const srcB = html.match(/function batchesCardHtml\(c\) \{[\s\S]*?\r?\n\}/)[0];
     const LFCH = String.fromCharCode(10);
-    const mk = (staff) => new Function(
+    // ⭐職員の見た目・許可・アプリかどうか・下見かどうかを**別々に**渡す
+    //   (同じ値を配ると、どれか 1 つの関門を消しても通ってしまう — Codex #1273 R2 軽微2)
+    const mk = (staff, opts = {}) => new Function(
       'isApp', 'detailSrc', 'isStaffUI', 'stateCan', 'esc', 'batchRowHtml', 'facilityName',
       srcA + LFCH + srcB + '; return batchesCardHtml;')(
-      () => true, 'detail', () => staff, () => staff, (v) => String(v), () => '<row>', (c) => String(c));
+      () => opts.app !== false, opts.src || 'detail',
+      () => (opts.staffUI === undefined ? staff : opts.staffUI),
+      () => (opts.can === undefined ? staff : opts.can),
+      (v) => String(v), () => '<row>', (c) => String(c));
     const one = [{ id: 1, work_status: 'not_started', planned_qty: 100 }];
     ok(mk(false)({ batches: one }) === '',
       '⭐利用者には、まとまりが 1 つなら何も出さない (ふだんの見え方を変えない)');
@@ -6490,6 +6495,11 @@ console.log('\n[30] まとまりごとに作り終える・先に棚入れする
       '1 個しか無ければ出さない (分けられないので)');
     ok(mk(true)({ batches: [{ id: 1, work_status: 'not_started', planned_qty: 100, consigned_out: true }] }) === '',
       '外にあずけているぶんには出さない');
+    // ⭐関門を 1 つずつ外して、どれが欠けても出ないことを見る
+    ok(mk(true, { staffUI: false })({ batches: one }) === '', '⭐職員の見た目でなければ出さない');
+    ok(mk(true, { can: false })({ batches: one }) === '', '⭐預けの許可が無ければ出さない');
+    ok(mk(true, { src: 'preview' })({ batches: one }) === '', '⭐下見 (読むだけ) では出さない');
+    ok(mk(true, { app: false })({ batches: one }) === '', '⭐Notion が正本のうちは出さない');
     // 2 つ以上なら、これまでどおり「作業のまとまり」
     const two = mk(true)({ batches: [{ id: 1, work_status: 'not_started', planned_qty: 60 }, { id: 2, work_status: 'not_started', planned_qty: 40 }] });
     ok(/作業のまとまり/.test(two), '2 つ以上なら「作業のまとまり」を出す');
@@ -8547,6 +8557,14 @@ console.log('\n[つかいかた] 📖 マニュアルと実装が食い違って
   ok(/棚に入れたあとは数を変えられません/.test(s13), "⭐棚入れ後は数を直せないことを書く");
   ok(!/このぶんをやり直す」で棚入れを取り消して/.test(man),
     "🚨やり直しても棚入れの記録は消えないので、その案内を書かない (実装と食い違う)");
+  // ⭐**サーバーが返す文にも**同じ誤りを残さない (マニュアルだけ直しても、画面には古い案内が出る)
+  {
+    const cs = fs.readFileSync(new URL('../apps/iroha-work/consign.js', import.meta.url), 'utf8');
+    ok(!/やり直す」で棚入れを取り消して/.test(cs),
+      "🚨サーバーの案内にも「やり直せば直せる」と書かない (やり直しても記録は消えない)");
+    ok(/棚に入れた記録と食い違うため/.test(cs) && /職員に相談してください/.test(cs),
+      "サーバーの案内は、直せない理由と相談先を言う");
+  }
   ok(/職員に相談してください/.test(s13), "直せないときの出口 (職員に相談) を書く");
   // ラベルの注意は §14 に
   ok(/ラベルを出す機械 \(QL-800\)/.test(s14), "同じラベルを出す前に、機械と出てきたラベルを見てもらう");

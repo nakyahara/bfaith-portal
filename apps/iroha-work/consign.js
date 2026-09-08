@@ -448,7 +448,8 @@ export function updateReturnCounts({ consignmentId, returnId, goodQty = undefine
     // 🚨**棚に入れたあとは数を変えさせない** (Codex #1268 R1 重大)。
     //   98 個で棚に入れたあとに 38 → 30 と直すと、棚入れの記録は 98 のままカードの数だけ減る。
     //   空に戻すと「棚に入れたのに、棚入れできる条件を満たさない」ことにもなる。
-    //   直したいときは、先にそのぶんを「やり直す」で棚入れを取り消してもらう
+    //   ⚠**やり直しても棚入れの記録は消えない** (消す処理がそもそも無い)。だから「やり直せば直せる」とは案内しない。
+    //   直す必要があるときは職員へ — 記録の付け替えは人が判断する
     const goodChanges = goodQty !== undefined || lossQty !== undefined;
     if (goodChanges && stockedQtyOf(db, c.batch_id).rows > 0) {
       return { ok: false, error: 'stocked_batch',
