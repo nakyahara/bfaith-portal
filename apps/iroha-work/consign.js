@@ -11,7 +11,7 @@
  *   ⭐完成した商品を外部に渡すことは絶対にない (中原さん 2026-09-07) ので、これで全部表せる。
  */
 import { getDB } from './db.js';
-import { nextSeq, recomputeTaskDoneQty, applyDerivedTaskStatus } from './batches.js';
+import { nextSeq, recomputeTaskDoneQty, applyDerivedTaskStatus, stockedQtyOf } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -445,7 +445,23 @@ export function updateReturnCounts({ consignmentId, returnId, goodQty = undefine
   return updateConsignment(consignmentId, expectVersion, guard, (db, c, now, actorIn) => {
     const row = db.prepare('SELECT * FROM f_iroha_consignment_returns WHERE id = ?').get(Number(returnId));
     if (!row || row.consignment_id !== c.id) return { ok: false, error: 'not_found', message: 'その返却の記録が見つかりません (画面を更新してください)' };
-    const n = normReturnCounts(row.returned_qty, goodQty, lossQty);
+    // 🚨**棚に入れたあとは数を変えさせない** (Codex #1268 R1 重大)。
+    //   98 個で棚に入れたあとに 38 → 30 と直すと、棚入れの記録は 98 のままカードの数だけ減る。
+    //   空に戻すと「棚に入れたのに、棚入れできる条件を満たさない」ことにもなる。
+    //   直したいときは、先にそのぶんを「やり直す」で棚入れを取り消してもらう
+    const goodChanges = goodQty !== undefined || lossQty !== undefined;
+    if (goodChanges && stockedQtyOf(db, c.batch_id).rows > 0) {
+      return { ok: false, error: 'stocked_batch',
+        message: 'このぶんはもう棚に入れています。数を直すには、先に「このぶんをやり直す」で棚入れを取り消してください (ひとことだけなら直せます)' };
+    }
+    // ⭐**省略 = いまの値のまま / null = 空にする (まだ数えていないに戻す)**。
+    //   省略を空と同じに扱うと、使える数だけ入れたときに、入っていた「作れなかった数」が消える (R1 中2)
+    const curGood = row.good_qty ?? null;
+    const curLoss = row.loss_qty ?? null;
+    const wantGood = goodQty === undefined ? curGood : goodQty;
+    const wantLoss = lossQty === undefined ? curLoss : lossQty;
+    // ⭐合計は**残す値も入れて**確かめる (片方だけ直したときに、合わせて超えていないか)
+    const n = normReturnCounts(row.returned_qty, wantGood, wantLoss);
     if (n.error) return { ok: false, error: n.error, message: n.message };
     const nextGood = n.good ? n.good.value : null;
     const nextLoss = n.loss ? n.loss.value : null;

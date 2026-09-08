@@ -3984,12 +3984,18 @@ function awayHtml(c) {
       '<div class="s2' + (over ? ' over' : '') + '">' +
         (x.handed_at ? esc(fmtDate(x.handed_at)) + ' にわたした' : 'まだ渡していません') +
         (x.due_date ? ' ・ ' + esc(x.due_date) + ' までに返却' + (over ? ' (期限を過ぎています)' : '') : '') + '</div>' +
-      // ⭐まだ数えていない返却の行。**1 行ずつ**出す (いつ何個返ってきたぶんか分かるように)
-      uncountedReturns(x).map((r) => '<div class="s2 over">📥 ' + esc(fmtDate(r.returned_at)) + ' に ' +
-        esc(String(r.returned_qty)) + ' 個 返ってきたぶんの**使える数**がまだ入っていません' +
-        (stateCan('task.consign')
-          ? ' <button data-cgfix="' + r.id + '" data-cgfix-cg="' + x.id + '">数を入れる</button>'
-          : ' (職員が入れます)') + '</div>').join('') +
+      // ⭐返却の行を**1 行ずつ**出す (いつ何個返ってきたぶんか分かるように)。
+      //   数が入っていないものは赤く強調し、入っているものも**直せる**ようにする —
+      //   入れたとたんに入口が消えると、打ち間違いも数え直しも直せない (Codex #1268 R1 中3)
+      (x.returns || []).map((r) => {
+        const none = r.good_qty == null;
+        return '<div class="s2' + (none ? ' over' : '') + '">📥 ' + esc(fmtDate(r.returned_at)) + ' に ' +
+          esc(String(r.returned_qty)) + ' 個 返ってきたぶん — ' +
+          (none ? '<b>使える数</b>がまだ入っていません' : '使える数 ' + esc(String(r.good_qty)) + ' 個') +
+          (stateCan('task.consign')
+            ? ' <button data-cgfix="' + r.id + '" data-cgfix-cg="' + x.id + '">' + (none ? '数を入れる' : '数を直す') + '</button>'
+            : (none ? ' (職員が入れます)' : '')) + '</div>';
+      }).join('') +
       (stateCan('task.consign') ? '<div class="acts">' +
         (x.state === 'handed'
           ? '<button class="go" data-cg="return" data-cg-id="' + x.id + '">返却を受け取る</button>' +
