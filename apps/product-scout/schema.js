@@ -121,6 +121,21 @@ export function createProductScoutTables(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_scout_own_concept ON scout_own_families(concept_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_scout_own_outcome ON scout_own_families(outcome)');
 
+  // 既存の分類不明行は自社=1に推定しない。旧行は保持し最新取り込みとの所属で選ぶ。
+  for (const [table, columns] of Object.entries({
+    scout_concepts: { quality_json: 'TEXT' },
+    scout_own_families: { sales_class: 'INTEGER', products_json: 'TEXT', source_generated_at: 'TEXT', own_batch_id: 'TEXT' },
+  })) {
+    const existing = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name));
+    for (const [name, type] of Object.entries(columns)) {
+      if (!existing.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+    }
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS scout_own_imports (
+    batch_id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, source_generated_at TEXT,
+    family_count INTEGER NOT NULL, ingested_at TEXT NOT NULL
+  )`);
+
   // 採否イベント (追記専用)。UPDATE / DELETE はトリガーで拒否する
   db.exec(`
     CREATE TABLE IF NOT EXISTS scout_decisions (

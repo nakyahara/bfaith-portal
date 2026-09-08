@@ -27,6 +27,8 @@
     .filters input[type=search] { min-width: 220px; flex: 1 1 220px; }
     .filters label.chk { font-size: 0.9em; color: #495057; display: inline-flex; align-items: center; gap: 4px; }
     .hint { font-size: 0.85em; color: #495057; margin: 8px 14px 0; line-height: 1.5; }
+    .camhint { color: #868e96; }
+    .camhint a { color: #1971c2; }
     .banner { display: none; margin: 10px 14px 0; padding: 10px 12px; border-radius: 8px; font-size: 0.92em; }
     .banner.err { display: block; background: #ffe3e3; color: #a61e1e; }
     .banner.ok { display: block; background: #d3f9d8; color: #2b8a3e; }
@@ -106,7 +108,8 @@
       <button type="button" class="btn primary" id="searchBtn">検索</button>
     </div>
   </div>
-  <div class="hint">入荷受付伝票に無い商品でも、ここから<b>入庫情報 (入数・BCシール・いろは・荷姿) の確認と編集</b>、<b>🏷 値札シールの発行</b> (倉庫PCの QL-700・伝票と同じ形式) ができます。仕入先で絞ってから探すと早いです。</div>
+  <div class="hint">入荷受付伝票に無い商品でも、ここから<b>入庫情報 (入数・BCシール・いろは・荷姿) の確認と編集</b>、<b>🏷 値札シールの発行</b> (倉庫PCの QL-700・伝票と同じ形式) ができます。仕入先で絞ってから探すと早いです。
+    <br><span class="camhint">📷 が使えないときは <a href="/apps/inbound-check/camera-test">カメラの動作確認</a> で切り分けられます</span></div>
   <div class="banner" id="banner"></div>
   <div class="wrap">
     <div class="count" id="count"></div>
@@ -120,7 +123,13 @@
 
   <div class="overlay" id="scanBox"><div class="modal">
     <h2>📷 バーコードを読む</h2>
-    <video id="scanVideo" playsinline muted autoplay style="width:100%;border-radius:10px;background:#000;aspect-ratio:4/3;object-fit:cover"></video>
+    <!-- 🚨 読み取り枠。**見えている枠と、実際に解析する範囲を同じ数字 (GUIDE) から作る** —
+         枠を描かずに中央だけ解析すると「枠に入れてください」と言いながら範囲が見えない状態になり、
+         逆に枠を描かずに全体を解析すると棚の別ラベルを読んで別商品を出す (Codex #1233 R2) -->
+    <div id="scanStage" style="position:relative;width:100%;border-radius:10px;overflow:hidden;background:#000;aspect-ratio:4/3">
+      <video id="scanVideo" playsinline muted autoplay style="display:block;width:100%;height:100%;object-fit:contain"></video>
+      <div id="scanGuide" style="position:absolute;border:2px solid #fff;border-radius:6px;box-shadow:0 0 0 9999px rgba(0,0,0,.42);pointer-events:none"></div>
+    </div>
     <div class="pmsg" id="scanMsg" style="margin-top:8px"></div>
     <div class="actions"><button type="button" id="scanCancel">やめる</button></div>
   </div></div>
@@ -132,6 +141,9 @@
     <div class="actions"><button type="button" id="printCancel">やめる</button><button type="button" class="primary" id="printOk">🏷 発行する</button></div>
   </div></div>
 
+  <!-- 📷 読み取り結果を採用するかの判断 (2フレーム一致・連続失敗の打ち切り)。
+       安全弁そのものなので、画面から切り出してテストできるようにしてある -->
+  <script src="/js/barcode-scan-decide.js"></script>
   <script>
     const API = '/apps/inbound-check/api';
     const LS_CODE = 'ic_worker_code', LS_NAME = 'ic_worker_name';   // 入荷受付の作業画面と同じ (同じ iPad なら選び直さなくてよい)
@@ -257,67 +269,417 @@
     // ─── 📷 カメラでバーコードを読む ───
     // 読んだ値をそのまま検索欄に入れて検索する (バーコードマスタは1商品に複数行あるので、
     // JAN でも FNSKU でも、どれを読んでもその商品に行き着く)。
-    // BarcodeDetector が無い iPad (iPadOS 16 以前など) は、キーボードの「テキストをスキャン」を案内する
-    let scanStream = null, scanTimer = null, scanStarting = false, scanGen = 0;
+    //
+    // 🚨**デコードは zxing-wasm で自前でやる**。最初の実装は BarcodeDetector (Shape Detection API) を
+    //   使っていたが、**Safari は今も未実装**なので iPad では「対応していません」に必ず落ちて
+    //   カメラが一度も起動しなかった (2026-09-07 中原さんの実機で発覚)。
+    //   デコーダは /vendor/zxing-wasm (server.js が node_modules から配る)。**押したときだけ読み込む**
+    //   (wasm が約1MB あるので、画面を開くたびに落とさない)。
+    const ZXING_JS = '/vendor/zxing-wasm/iife/reader/index.js';
+    const ZXING_WASM = '/vendor/zxing-wasm/reader/zxing_reader.wasm';
+    // 画面に出るバーコードの種類。scripts/test-inbound-check-barcode-scan.mjs と同じ並びにすること
+    const READER_OPTIONS = {
+      formats: ['EAN13', 'EAN8', 'UPCA', 'UPCE', 'Code128', 'Code39', 'ITF'],
+      tryHarder: true,
+      maxNumberOfSymbols: 1,
+    };
+    // 実時間 (端末の時計変更に影響されない)。映像の見張りに使う
+    const now = () => (window.performance && performance.now ? performance.now() : Date.now());
+    // 読み取り枠 (映像に対する割合)。**画面に描く枠と、切り出す範囲の両方をここから作る**
+    const GUIDE = { x: 0.07, y: 0.31, w: 0.86, h: 0.38 };
+    function layoutGuide() {
+      const g = $('#scanGuide');
+      if (!g) return;
+      g.style.left = (GUIDE.x * 100) + '%';
+      g.style.top = (GUIDE.y * 100) + '%';
+      g.style.width = (GUIDE.w * 100) + '%';
+      g.style.height = (GUIDE.h * 100) + '%';
+    }
+    let zxingPromise = null;
+    function loadDecoder() {
+      if (zxingPromise) return zxingPromise;
+      zxingPromise = new Promise((resolve, reject) => {
+        const sc = document.createElement('script');
+        sc.src = ZXING_JS;
+        sc.onload = () => {
+          if (!window.ZXingWASM || !window.ZXingWASM.readBarcodesFromImageData) {
+            reject(new Error('読み取りプログラムの形が違います')); return;
+          }
+          // 🚨 **wasm の取得とコンパイルまでここで待ち切る** (`fireImmediately`)。
+          //    待たないと、404 や配信障害の失敗が最初のフレーム解析まで遅れて出る →
+          //    フレーム側の握りつぶしに吸われ、カメラは開いたまま 250ms ごとに永久リトライになり、
+          //    現場には正常時と同じ案内が出続ける = また「動かないカメラ」になる (Codex #1233 R1 P1)
+          // 🚨 locateFile を渡さないと wasm を外部 CDN から取りに行く。社内ポータルから外へ出さない
+          Promise.resolve(window.ZXingWASM.prepareZXingModule({
+            overrides: { locateFile: (p2, prefix) => (String(p2).endsWith('.wasm') ? ZXING_WASM : prefix + p2) },
+            fireImmediately: true,
+          })).then(() => resolve(window.ZXingWASM), reject);
+        };
+        sc.onerror = () => reject(new Error('読み取りプログラムを読み込めませんでした'));
+        document.head.appendChild(sc);
+      }).catch((e) => { zxingPromise = null; throw e; });   // 失敗を覚えたままにしない (もう一度押せば再試行)
+      return zxingPromise;
+    }
+
+    let scanStream = null, scanTimer = null, scanStarting = false, scanGen = 0, scanCanvas = null, scanWatchTimer = null;
+    let scanRetryTimer = null;   // 取り直しの予約。**停止したら必ず解除する** (Codex #1239 R1 P1)
+    // 🚨 実機で「カメラが切れました」が出たとき、**何がいつ起きたか**を現場から聞けるようにする
+    //    (2026-09-07。getUserMedia は成功したのにトラックが即 ended になる = 端末側が手放している)。
+    //    ホーム画面アイコン (standalone) から開いた iPad で起きやすい
+    const isStandalone = () => !!(window.navigator.standalone
+      || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+    const isIpad = () => {
+      try {
+        const ua = navigator.userAgent || '';
+        return /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+      } catch (e) { return false; }
+    };
+    /**
+     * 窓の幅が画面の幅よりはっきり狭い状態。**iPad のときだけ見る**。
+     * ⚠ これで分かるのは「狭い」ことだけで、**理由までは分からない** (Codex #1241 R1):
+     *    画面2分割 (Split View / Slide Over) / ウィンドウ表示 / ページの拡大 のどれでも狭くなる。
+     *    断定せず「どれかに当てはまりませんか」と聞く言い方にする。
+     *    それでも見る価値があるのは、**iPhone には無い状態**だから
+     *    (「iPhone は読めるのに iPad だけダメ」の手がかりになる)
+     */
+    const narrowWindow = () => {
+      try {
+        if (!isIpad()) return false;
+        const w = window.innerWidth, sw = (window.screen && window.screen.width) || 0;
+        return !!(sw && w && w < sw * 0.85);
+      } catch (e) { return false; }
+    };
+    /**
+     * 端末の種類と **UA が名乗っている** OS の版。
+     * ⚠ 実際の版とは限らない (Codex #1241 R1): Macintosh 形式の iPad UA では取れず、
+     *   Safari 26 以降は OS 部分が固定値になる。**正確な版は「設定 → 一般 → 情報」で見る**
+     */
+    const deviceTag = () => {
+      try {
+        const ua = navigator.userAgent || '';
+        const kind = isIpad() ? 'iPad' : /iPhone/.test(ua) ? 'iPhone' : 'その他';
+        const m = ua.match(/OS (\d+)[_.](\d+)/);
+        return kind + (m ? '/UA' + m[1] + '.' + m[2] : '');
+      } catch (e) { return '不明'; }
+    };
+    /**
+     * **公開された**映像入力の数 (null = 未確認)。
+     * 🚨 権限を得る前の enumerateDevices は台数が絞られる (複数あっても1台に見える) ので、
+     *    **カメラを掴めてから数える**。0 でも「端末で使えない」とは言い切れない (Codex #1241 R1)
+     */
+    let videoInputs = null;
+    const countVideoInputs = () => {
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+        navigator.mediaDevices.enumerateDevices()
+          .then((ds) => { videoInputs = ds.filter((d) => d.kind === 'videoinput').length; })
+          .catch(() => { /* 取れなくてよい */ });
+      } catch (e) { /* 取れなくてよい */ }
+    };
+    // 🚨 **カメラの条件は段階的に緩める** (2026-09-07 実機: iPhone は通るが iPad だけ即切れる)。
+    //    iPad は背面/前面が複数あり、解像度や facingMode の指定が強いと
+    //    **getUserMedia は成功するのにトラックが即 ended になる**ことがある。
+    //    掴めなかった / すぐ切れた ら、次の (より緩い) 条件で取り直す
+    const CAMERA_TRIES = [
+      { video: { facingMode: 'environment', width: { ideal: 1280 } }, audio: false },
+      { video: { facingMode: 'environment' }, audio: false },
+      { video: true, audio: false },                    // どのカメラでもよい
+      // 前面カメラ。**exact で確実に前面**を要求する (希望条件だと前面が選ばれる保証がない)。
+      // 掴めなければ OverconstrainedError になり、それも切り分けの材料になる
+      { video: { facingMode: { exact: 'user' } }, audio: false },
+    ];
+    let cameraTry = 0;
     async function startScan() {
       if (scanStarting || scanStream) return;      // 連打で getUserMedia が二重に走ると、先の stream を止められなくなる
       const gen = ++scanGen;                       // カメラが返ってくる前に画面を離れたかを見分ける
-      if (!('BarcodeDetector' in window) || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        banner('warn', 'この iPad はカメラ読み取りに対応していません。検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        banner('warn', 'この端末ではカメラを使えません。検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
         $('#q').focus();
         return;
       }
-      let detector;
-      try { detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf'] }); }
-      catch (e) { banner('err', 'バーコードの読み取りを始められませんでした (' + esc(e.message) + ')', { sticky: true }); return; }
       scanStarting = true;
-      $('#scanBtn').disabled = true;
+      const btn = $('#scanBtn');
+      btn.disabled = true;
+      // 🚨 世代を見る。取り直しで新しい起動が始まった後に、古い起動が遅れて戻ってきて
+      //    「起動中」の札を外すと、新しい起動と取り合いになる
+      const endStarting = () => { if (gen === scanGen) { scanStarting = false; btn.disabled = false; } };
+      // 🚨 **カメラを先に開ける**。デコーダ (wasm 約1MB) の読み込みを先にすると、その待ち時間で
+      //    iOS の「利用者が押した」扱いが切れ、映像が黒いまま再生されない (2026-09-07 実機で発生)。
+      //    デコーダは映像が出ている間に落とす
       let stream = null;
-      try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false }); }
+      const tryIndex = Math.min(cameraTry, CAMERA_TRIES.length - 1);
+      try { stream = await navigator.mediaDevices.getUserMedia(CAMERA_TRIES[tryIndex]); }
       catch (e) {
+        // 🚨 **古い要求が遅れて失敗しても、いまの起動には触らない** (Codex #1239 R1 P1)。
+        //    条件を飛ばしたり、閉じたあとにエラーを出したりしないため
+        if (gen !== scanGen) return;
+        // 条件が強すぎて掴めないだけなら、緩めてもう一度 (画面には出さない)。
+        // 次の条件は **この試行の tryIndex + 1**。共有値を足すと、別の起動と取り合って条件が飛ぶ
+        if (tryIndex < CAMERA_TRIES.length - 1
+            && e && (e.name === 'OverconstrainedError' || e.name === 'NotFoundError' || e.name === 'NotReadableError')) {
+          cameraTry = tryIndex + 1;
+          endStarting();
+          scheduleRescan(200);
+          return;
+        }
         // 何が起きたかで打つ手が違う。「許可してください」だけだと、カメラが無い/塞がっているときに現場が設定をいじり続ける
         const msg = e && e.name === 'NotAllowedError' ? 'カメラの使用が許可されていません。iPad の設定 → Safari → カメラ でこのサイトを「許可」にしてください'
           : e && e.name === 'NotFoundError' ? 'この端末にカメラが見つかりません。検索欄を長押し →「テキストをスキャン」を使ってください'
           : e && e.name === 'NotReadableError' ? 'カメラを他のアプリが使っています。そのアプリを閉じてからもう一度押してください'
           : location.protocol !== 'https:' && location.hostname !== 'localhost' ? 'この画面は https でないため、カメラを使えません'
           : 'カメラを使えませんでした (' + esc((e && e.name) || '') + ')';
-        banner('err', msg, { sticky: true });
+        banner('err', msg + '<br><small>' + (isStandalone() ? 'ホーム画面から起動' : 'ブラウザで起動') + '</small>', { sticky: true });
+        endStarting();
         return;
-      } finally {
-        scanStarting = false;
-        $('#scanBtn').disabled = false;
       }
       // カメラが返ってくるまでに 画面を離れた / 止めた / もう一度押した なら、受け取った stream をその場で止める
       // (返る前は scanStream が null なので、pagehide の stopScan() では止められない)
       if (gen !== scanGen || document.hidden || !$('#scanBox')) {
         for (const tr of stream.getTracks()) { try { tr.stop(); } catch (e) { /* 放す */ } }
+        endStarting();
         return;
       }
       scanStream = stream;
+      countVideoInputs();   // 🚨 権限を得たあとで数える (前だと台数が絞られる)
       const v = $('#scanVideo');
-      v.srcObject = scanStream;
-      $('#scanMsg').textContent = '商品の JAN (13桁) か FNSKU を枠に入れてください';
+      // 🚨 **先に画面へ出してから** stream をつなぐ。display:none のまま挿すと iOS は再生を始めない
+      //    (2026-09-07 実機。映像が黒いままだった原因のひとつ)
+      $('#scanMsg').textContent = '読み取りの準備をしています…';
       $('#scanBox').classList.add('on');
+      // 🚨 枠の % と映像の % を一致させる。**入れ物の縦横比を実際の映像に合わせて object-fit: contain**
+      //    にしておけば、切り取り (cover) が起きないので画面の枠 = 解析する範囲になる
+      let playError = null;   // 現場調査に使うので、あとから来た失敗も捨てない (Codex #1235 R1 P3)
+      v.onloadedmetadata = () => {
+        const st = $('#scanStage');
+        if (st && v.videoWidth && v.videoHeight) st.style.aspectRatio = v.videoWidth + ' / ' + v.videoHeight;
+        layoutGuide();
+        v.play().catch((e) => { playError = playError || e; });   // iOS はここでもう一度必要なことがある
+      };
+      layoutGuide();
+      // 属性だけでなくプロパティでも立てる (iOS が自動再生を許す条件)
+      v.muted = true;
+      v.playsInline = true;
+      v.srcObject = scanStream;
+      // 🚨🚨 **映像の見張りは play() を待つ前にここで始める** (Codex #1235 R2 P1)。
+      //   play() は「再生が始まるまで」返らない API なので、始まらない端末では Promise が
+      //   pending のままになり、await の後ろに置くと 8 秒たってもカメラを解放できない。
+      //   デコーダの読み込みとも並行 (wasm が固まってもカメラを掴んだままにしない — R1 P1)。
+      //
+      //   🚨 判定は **新しいコマが届いたか**。「解析できたか」で見てはいけない —
+      //      映像が黒一色でも、デコード結果は「見つからない (空配列)」で返ってくる。
+      //   🚨 さらに **トラックが muted の間は「届いた」に数えない** (R2 P1)。
+      //      カメラが映像を出せなくても video は黒いコマを再生し続け、currentTime は進むため。
+      const track = (scanStream.getVideoTracks && scanStream.getVideoTracks()[0]) || null;
+      const sourceLive = () => !track || (track.readyState === 'live' && !track.muted);
+      // ⏱ 起動からの経過を測る。「すぐ落ちた」のか「しばらく持った」のかで打つ手が違う
+      const startedAt = now();
+      let endedAt = null;
+      if (track) {
+        // ended を待って拾う (500ms の見張りより早く、かつ確実に分かる)
+        try { track.addEventListener('ended', () => { endedAt = Math.round(now() - startedAt); }); } catch (e) { /* 古い端末 */ }
+      }
+      /** 現場から聞き取るための短い診断。原因の切り分けに使う */
+      const diag = () => {
+        const bits = [];
+        bits.push(Math.round(now() - startedAt) + 'ms');
+        if (endedAt !== null) bits.push('ended@' + endedAt + 'ms');
+        if (track) bits.push('track=' + track.readyState + (track.muted ? '/muted' : ''));
+        bits.push('video=' + v.readyState);
+        // 🚨 自由文字列は出さない (カメラ名やエラー本文に何が入るか保証できない — Codex #1239 R1)。
+        //    出すのは **決まった語彙だけ**: エラーは name / カメラは facingMode と解像度
+        if (playError) bits.push('play=' + (playError.name || 'NG'));
+        bits.push('条件' + (tryIndex + 1) + '/' + CAMERA_TRIES.length);
+        if (track) {
+          try {
+            const st = track.getSettings ? track.getSettings() : null;
+            if (st) {
+              if (st.facingMode) bits.push(String(st.facingMode));
+              if (st.width) bits.push(st.width + 'x' + st.height);
+            }
+          } catch (e) { /* 取れなくてよい */ }
+        }
+        bits.push(isStandalone() ? 'ホーム画面' : 'ブラウザ');
+        bits.push(deviceTag());
+        bits.push('映像入力' + (videoInputs === null ? '未確認' : videoInputs));
+        try {
+          bits.push('窓' + window.innerWidth + '/画面' + ((window.screen && window.screen.width) || '?'));
+        } catch (e) { /* 取れなくてよい */ }
+        if (narrowWindow()) bits.push('窓が狭い');
+        return bits.join(' ');
+      };
+      let videoWatch = BarcodeScanDecide.newVideoWatch(now());
+      let frames = BarcodeScanDecide.newFrameCursor();
+      const markFrame = (id) => {
+        const next = BarcodeScanDecide.markArrived(frames, id, sourceLive());
+        if (next === frames) return;                  // muted / 同じコマ → 届いていない扱い
+        frames = next;
+        videoWatch = BarcodeScanDecide.noteFrame(videoWatch, now());
+      };
+      // フレームの識別子は requestVideoFrameCallback の presentedFrames が正 (コマ固有)。
+      // 使えない端末は currentTime で代用する (コマ固有ではないが、進まないことは検知できる)
+      const rvfc = typeof v.requestVideoFrameCallback === 'function';
+      if (rvfc) {
+        const onFrame = (_t, meta) => {
+          if (!scanStream || gen !== scanGen) return;
+          markFrame('p' + (meta && meta.presentedFrames != null ? meta.presentedFrames : _t));
+          v.requestVideoFrameCallback(onFrame);
+        };
+        v.requestVideoFrameCallback(onFrame);
+      }
+      const pollFrame = () => {
+        if (rvfc) return;
+        if (v.readyState >= 2 && v.videoWidth && v.videoHeight) markFrame('t' + v.currentTime);
+      };
+      clearInterval(scanWatchTimer);
+      scanWatchTimer = setInterval(() => {
+        if (!scanStream || gen !== scanGen) { clearInterval(scanWatchTimer); scanWatchTimer = null; return; }
+        pollFrame();
+        // カメラが切れた (他アプリに取られた / 端末が閉じた) — 待つ意味がないので即やめる
+        if (track && track.readyState === 'ended') {
+          const heldMs = endedAt !== null ? endedAt : Math.round(now() - startedAt);
+          // 🚨 **診断は止める前に取る**。stopScan() が track.stop() を呼ぶと readyState が
+          //    ended に変わり、直前まで live だったのか muted だったのか分からなくなる (R1 P2)
+          const snapshot = diag();
+          clearInterval(scanWatchTimer); scanWatchTimer = null;
+          stopScan();
+          // 🚨 つないだ直後に切れたら、**次の (より緩い) 条件**で取り直す。同じ条件を繰り返さない
+          if (heldMs < 3000 && tryIndex < CAMERA_TRIES.length - 1) {
+            cameraTry = tryIndex + 1;
+            banner('warn', 'カメラをつなぎ直しています… (' + (cameraTry + 1) + '/' + CAMERA_TRIES.length + ')');
+            scheduleRescan(400);
+            return;
+          }
+          banner('err', 'カメラが切れました' + (heldMs < 3000 ? ' (つないだ直後に切れています)' : '')
+            + '。' + (narrowWindow()
+              ? '<b>画面を2分割 (Split View / Slide Over) していませんか。ウィンドウを小さくしている、'
+                + 'ページを拡大している場合も同じです。iPad ではそのときカメラを使えないことがあります。'
+                + '全画面・等倍にしてからもう一度押してください。</b>'
+              : isStandalone()
+              ? '<b>ホーム画面のアイコンから開いた状態だとカメラを使えないことがあります。'
+                + 'まず Safari で開いて試してください。</b>'
+              : '<b>アプリをいったん完全に終了して開き直してください</b> '
+                + '(画面下から上にスワイプして止める)。それでもだめなら iPad を再起動してください。')
+            + '他のアプリや、開きっぱなしの別のタブがカメラを使っていないかも確かめてください。'
+            + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます'
+            + '<br><small>' + esc(snapshot) + '</small>', { sticky: true });
+          return;
+        }
+        if (!BarcodeScanDecide.videoStalled(videoWatch, now())) return;
+        const snapshot = diag();   // 止める前に取る (stop() が track の状態を書き換えるため)
+        stopScan();
+        banner('err', 'カメラの映像が出ませんでした'
+          + (playError ? ' (' + esc(playError.name || 'NG') + ')' : (track && track.muted ? ' (映像が届いていません)' : ''))
+          + '。' + (isStandalone()
+            ? 'ホーム画面のアイコンから開いた状態ではカメラを使えないことがあります。Safari で開いて試してみてください。'
+            : '他のアプリがカメラを使っていないか確かめてください。')
+          + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます'
+          + '<br><small>' + esc(snapshot) + '</small>', { sticky: true });
+      }, 500);
+
+      // 🚨 autoplay 属性だけに頼らない。**明示的に play() する**。
+      //    始まらない端末では返ってこないことがあるので、**待たない** (上の見張りが拾う)
+      v.play().catch((e) => { playError = playError || e; });
+      if (!scanStream || gen !== scanGen) { endStarting(); return; }
+
+      // デコーダ (wasm 約1MB) は、映像が出ている間に落とす
+      let zx = null;
+      try { zx = await loadDecoder(); }
+      catch (e) {
+        // 利用者が先に閉じていたら黙って終わる (閉じた後にエラーだけ残さない — Codex #1235 R1 P2)
+        if (!scanStream || gen !== scanGen) { endStarting(); return; }
+        stopScan();
+        banner('err', 'バーコードの読み取りを始められませんでした (' + esc(e.message) + ')。'
+          + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+        endStarting();
+        return;
+      }
+      endStarting();
+      if (!scanStream || gen !== scanGen) return;
+      $('#scanMsg').textContent = '商品の JAN (13桁) か FNSKU を、白い枠の中に入れてください';
+      // 映像を canvas に落として wasm に渡す。**横 640px に縮める** —
+      // 1280px のまま毎フレーム解析すると iPad が重くなり、JAN はこの解像度で十分読める
+      if (!scanCanvas) scanCanvas = document.createElement('canvas');
+      // 採否の判断は public/js/barcode-scan-decide.js (2フレーム一致・連続失敗の打ち切り)。
+      // ここはカメラと canvas の面倒だけ見る
+      let decide = BarcodeScanDecide.initialState();
+      let lastError = null;
       const tick = async () => {
         if (!scanStream || gen !== scanGen) return;
+        let ev = null;   // 🚨 新しいコマが無いだけの待機では**状態を触らない** (連続一致を消さない — R2 P2)
+        pollFrame();
+        const plan = BarcodeScanDecide.nextDecode(frames);
         try {
-          const codes = await detector.detect(v);
-          // 読み取りを待っている間に閉じられたら、返ってきた結果は使わない (閉じた後に検索が走らないように)
-          if (!scanStream || gen !== scanGen) return;
-          const hit = codes.find((x) => x.rawValue && /^[A-Za-z0-9]{6,}$/.test(String(x.rawValue).trim()));
-          if (hit) { onScanned(String(hit.rawValue).trim()); return; }
-        } catch (e) { /* まだ映っていない → 次の回 */ }
+          // 🚨 **見張りとは別の印**で「まだ解析していないコマ」だけを読む。
+          //    同じコマを2回読むと「2回続けて一致」の条件が実質1回になり、誤読の歯止めが効かない
+          const vw = v.videoWidth, vh = v.videoHeight;
+          if (vw && vh && plan.decode) {
+            frames = plan.cursor;
+            // 🚨 **枠の中だけを切り出す**。映像全体を解析すると、棚に並んだ別ラベルを
+            //    2フレーム続けて読んでしまい「別の商品」で確定する (Codex #1233 R2)。
+            //    切り出す範囲は画面に描いている枠 (GUIDE) と同じ数字から作る
+            const sx = Math.round(GUIDE.x * vw), sy = Math.round(GUIDE.y * vh);
+            const sw = Math.round(GUIDE.w * vw), sh = Math.round(GUIDE.h * vh);
+            const w = Math.min(720, sw);                       // 横 720px まで縮める (iPad が重くならない範囲)
+            const h = Math.max(1, Math.round((sh / sw) * w));
+            if (scanCanvas.width !== w || scanCanvas.height !== h) { scanCanvas.width = w; scanCanvas.height = h; }
+            const ctx = scanCanvas.getContext('2d', { willReadFrequently: true });
+            ctx.drawImage(v, sx, sy, sw, sh, 0, 0, w, h);
+            const img = ctx.getImageData(0, 0, w, h);
+            const codes = await zx.readBarcodesFromImageData(img, READER_OPTIONS);
+            // 読み取りを待っている間に閉じられたら、返ってきた結果は使わない (閉じた後に検索が走らないように)
+            if (!scanStream || gen !== scanGen) return;
+            ev = { kind: 'codes', codes };
+          }
+        } catch (e) {
+          // 一時的な失敗は次の回で直る。**続けて失敗するのは読み取り側の異常**
+          lastError = e;
+          ev = { kind: 'error' };
+        }
+        if (!ev) {                                   // 待機 = 何も判断しない
+          if (gen !== scanGen) return;
+          scanTimer = setTimeout(tick, 250);
+          return;
+        }
+        const r = BarcodeScanDecide.step(decide, ev);
+        decide = r.state;
+        if (r.action === 'accept') { onScanned(r.value); return; }
+        if (r.action === 'abort') {
+          // 「映像が来ない」は上の見張りが出す。ここは「映像は出ているのに読めない」だけ
+          stopScan();
+          banner('err', 'バーコードを読み取れませんでした (' + esc((lastError && lastError.message) || '') + ')。'
+            + '検索欄を長押し →「テキストをスキャン」でも JAN を読み取れます', { sticky: true });
+          return;
+        }
         if (gen !== scanGen) return;
         scanTimer = setTimeout(tick, 250);
       };
       scanTimer = setTimeout(tick, 400);
     }
+    /**
+     * 取り直しの予約。🚨**予約した時点の世代を覚えておき、途中で止められていたら走らせない**
+     * (Codex #1239 R1 P1)。予約だけ生き残ると、閉じたあとにカメラが勝手に開く
+     */
+    function scheduleRescan(ms) {
+      clearTimeout(scanRetryTimer);
+      const at = scanGen;
+      scanRetryTimer = setTimeout(() => {
+        scanRetryTimer = null;
+        if (at !== scanGen) return;                // 予約後に止められた / 別の起動が始まった
+        startScan();
+      }, ms);
+    }
     function stopScan() {
       scanGen++;                                   // 起動待ちの getUserMedia が返ってきても使わせない
+      clearTimeout(scanRetryTimer); scanRetryTimer = null;    // 予約済みの取り直しも取り消す
       clearTimeout(scanTimer); scanTimer = null;
+      clearInterval(scanWatchTimer); scanWatchTimer = null;   // 映像の見張りも必ず止める
       if (scanStream) { for (const tr of scanStream.getTracks()) { try { tr.stop(); } catch (e) { /* 止められなければ放す */ } } scanStream = null; }
       const v = $('#scanVideo'); if (v) v.srcObject = null;
       $('#scanBox').classList.remove('on');
+      // 🚨 世代が変わると古い endStarting() は何もしないので、**停止側で必ず戻す**。
+      //    でないと「起動中」の札が掛かったままボタンが押せなくなる (Codex #1239 R1)
+      scanStarting = false;
+      const b = $('#scanBtn'); if (b) b.disabled = false;
     }
     async function onScanned(code) {
       stopScan();
@@ -328,7 +690,7 @@
       banner(n ? 'ok' : 'warn', '📷 ' + esc(code) + (n === 1 ? ' の商品です' : n ? ' … ' + n + ' 件見つかりました'
         : ' の商品は見つかりません (バーコードマスタに無いか、取扱中止かもしれません)'), { sticky: !n });
     }
-    $('#scanBtn').addEventListener('click', startScan);
+    $('#scanBtn').addEventListener('click', () => { cameraTry = 0; startScan(); });
     $('#scanCancel').addEventListener('click', stopScan);
     $('#scanBox').addEventListener('click', (e) => { if (e.target === $('#scanBox')) stopScan(); });
     // 画面を離れる・別のタブに移る・戻るボタンで抜ける — どれでもカメラを必ず止める

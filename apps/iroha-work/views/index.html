@@ -20,6 +20,7 @@
     --accent:#1F5EFF; --accent-ink:#FFFFFF; --accent-soft:#E6EDFF;
     --amber:#C97A12; --amber-soft:#FDF0DC;
     --danger:#D63B3B; --danger-soft:#FBE5E5;
+    --warn:#9A6700; --warn-soft:#FFF3D6;
     --ok:#0F9D6B; --ok-soft:#DDF5EA;
     --shadow:0 1px 2px rgba(15,23,40,.06),0 4px 14px rgba(15,23,40,.06);
     --r:8px; --r-sm:6px;
@@ -352,10 +353,59 @@
   .blockban b{color:var(--danger);font-size:1.05rem}
   .blockban .sub{display:block;color:var(--sub);font-size:.86rem;margin-top:2px}
   .blockban .btn{margin-left:auto;min-height:44px;padding:6px 14px;font-size:.92rem}
+  /* ⚠ 入荷側で取り消されたカード (消えない。職員が決める) — 止まっている枠の黄色版 */
+  .blockban.cancel{background:var(--warn-soft);border-color:var(--warn)}
+  .blockban.cancel b{color:var(--warn)}
+  .blockban.cancel .acts{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
+  .blockban.cancel .acts .btn{margin-left:0}
   /* ⛔ 止まった の理由ボタン (2 列)。選んだものを赤で */
   .reasons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
   .reasons .btn.on{outline:2px solid var(--danger);outline-offset:1px;background:var(--danger-soft);border-color:var(--danger);color:var(--danger)}
   .dcard{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin-bottom:12px}
+  /* 🏷 どのぶんのラベルかを選ぶ (§AB-12) */
+  .pbatches{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+  .pbatches .btn{text-align:left;justify-content:flex-start;font-weight:600}
+  .pbatches .btn b{font-weight:800;margin-right:4px}
+  /* 👥 人数だけの作業 (§AB-10) */
+  .hcnt{display:flex;flex-direction:column;gap:8px}
+  .hrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--well);border:1px solid var(--line);
+    border-radius:var(--r-sm);padding:8px 10px}
+  .hrow b{min-width:6em}
+  .hrow input{width:88px;font-family:var(--num);font-size:1rem;padding:8px;border:1px solid var(--line);border-radius:var(--r-sm)}
+  .hrow .btn{margin-left:auto;min-height:40px;padding:8px 12px;font-size:.9rem}
+  .hrow.ro{color:var(--sub)}
+  /* 施設の受け入れ枠 (預けるダイアログ) */
+  .cap{margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:var(--bg);font-size:.95rem}
+  .cap b{font-variant-numeric:tabular-nums}
+  .cap .bar{height:8px;border-radius:999px;background:var(--line);overflow:hidden;margin:6px 0 4px}
+  .cap .bar>i{display:block;height:100%;background:var(--accent)}
+  .cap.over .bar>i{background:var(--danger,#c0392b)}
+  .cap .warn{color:var(--danger,#c0392b)}
+  .cap .stop{margin-top:4px;color:var(--danger,#c0392b);font-weight:700}
+  .cap .unset{color:var(--muted)}
+  /* 🚚 預ける計画 (要件 §AB-11 の 7b) */
+  .cplan3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;align-items:start}
+  @media (max-width:980px){ .cplan3{grid-template-columns:1fr} }
+  .crow{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:10px 12px;margin-bottom:8px}
+  .crow.over{border-color:var(--danger);border-left-width:4px}
+  .crow .t{font-weight:700;line-height:1.35}
+  .crow .facts{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px;font-size:.86rem;color:var(--sub)}
+  .crow .facts b{font-family:var(--num);color:var(--ink)}
+  .crow .facts .miss{color:var(--amber);font-weight:700}
+  .crow .facts .late{color:var(--danger);font-weight:700}
+  .crow .acts{display:flex;flex-wrap:wrap;gap:8px;margin-top:9px}
+  .crow .acts button{border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:var(--r-sm);
+    padding:8px 12px;font-weight:700;font-size:.88rem;min-height:40px;cursor:pointer;font-family:var(--font)}
+  .crow .acts .go{background:var(--accent);border-color:var(--accent);color:#fff}
+  .cplanempty{color:var(--sub);font-size:.9rem;padding:10px 2px}
+  .planbtn.cg{background:var(--amber);border-color:var(--amber)}
+  /* 作業のまとまり (2 つ以上のときだけ出る) */
+  .brow{border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:10px;background:var(--bg)}
+  .brow .bh{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+  .brow .bh b{font-size:1.05rem}
+  .brow .m{color:var(--muted);font-size:.95rem;margin-top:2px}
+  .brow .bfoot{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+  .brow .bfoot .btn{flex:1 1 auto;min-height:48px}
   .dhead{display:flex;gap:16px}
   .dhead .thumb{width:120px;height:120px;border-radius:var(--r-sm);background:var(--well);border:1px solid var(--line);
     display:grid;place-items:center;font-size:2.8rem;flex:none;overflow:hidden}
@@ -395,6 +445,21 @@
   .dq textarea{width:100%;box-sizing:border-box;margin-top:8px;min-height:70px;padding:8px 10px;font-family:var(--font);
     font-size:.95rem;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--surface);color:var(--ink);resize:vertical}
   .dq .sub{font-size:.78rem;color:var(--sub);margin-top:4px}
+  .dq .sub.warn{color:var(--amber);font-weight:700}
+  .dq .quick button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .dq .lossrow{margin-top:8px;padding-left:10px;border-left:3px solid var(--amber)}
+  /* ── 🚚 外部にあずける (要件 §AB-7) ── */
+  .away{margin-top:10px;background:var(--amber-soft);border:1px solid var(--amber);border-radius:var(--r-sm);padding:9px 11px}
+  .away label{display:block;font-size:.68rem;letter-spacing:.08em;font-weight:700;color:var(--amber)}
+  .away .v{font-size:.95rem;font-weight:700}
+  .away .s2{font-size:.8rem;color:var(--sub);font-weight:600;margin-top:2px}
+  .away .over{color:var(--danger);font-weight:700}
+  .away .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  .away .acts button{background:var(--surface);border:1px solid var(--amber);color:var(--amber);border-radius:var(--r-sm);
+    padding:7px 12px;font-family:var(--font);font-size:.85rem;font-weight:700;min-height:40px;cursor:pointer}
+  .away .acts button.go{background:var(--amber);color:#fff}
+  .tag.away{background:var(--amber-soft);color:var(--amber);border-color:var(--amber)}
+  .dq .lossrow .dqLoss{width:110px}
   /* 参考・外部出し目安・取引先 — 読むだけの一行 */
   .facts{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
   .facts span{font-size:.8rem;background:var(--well);border:1px solid var(--line);border-radius:999px;padding:3px 10px;color:var(--sub)}
@@ -743,6 +808,36 @@
     </div>
   </div>
 
+  <!-- ══ 画面1e: 預ける計画 (職員だけ。ボードの入口から開く。要件 §AB-11 の 7b) ══ -->
+  <div class="page cplanpage" hidden>
+    <div class="planhead">
+      <button class="btn" onclick="setView('board')">‹ ボードへ戻る</button>
+      <h2>🚚 預ける計画</h2>
+      <span id="cplanStaff" class="flabel"></span>
+    </div>
+    <p class="hint">外部の施設に渡すものを、拠点ごとにまとめて用意する画面です。
+      箱とラベルをそろえてから「用意できた」を、渡す日に「渡しました」を押してください。
+      返ってきたぶんの受け取りもここからできます。</p>
+    <div class="filters">
+      <span class="fgroup"><span class="flabel">拠点</span><span id="cplanFacs"></span></span>
+    </div>
+    <div id="cplanCap"></div>
+    <div class="cplan3">
+      <div class="pane">
+        <h3>① 用意する <span class="n" id="cplanN1">0</span><span class="sum">箱とラベルをそろえる</span></h3>
+        <div id="cplanCol1"></div>
+      </div>
+      <div class="pane">
+        <h3>② 渡す <span class="n" id="cplanN2">0</span><span class="sum">用意ずみ</span></h3>
+        <div id="cplanCol2"></div>
+      </div>
+      <div class="pane">
+        <h3>③ 外にある <span class="n" id="cplanN3">0</span><span class="sum">返ってくるのを待つ</span></h3>
+        <div id="cplanCol3"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- ══ 画面1c: ラベル待ち ══ -->
   <div class="page labelpage" hidden>
     <div class="preview" id="prevLabel" hidden></div>
@@ -876,6 +971,15 @@
   </div>
 
   <!-- ══ ✅ できあがり → 棚入待ち (監修 B-7 / F-3) ══ -->
+  <div class="overlay" id="cgOv">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="cgTitle">
+      <h3 id="cgTitle" tabindex="-1">🚚 外部にあずける</h3>
+      <div class="mname" id="cgName">—</div>
+      <div class="msaving" id="cgMsg"></div>
+      <div id="cgBody"></div>
+      <p class="hint">渡すときは、保管箱とラベルを先にそろえてください。数は返ってきたときにもう一度数えます。</p>
+    </div>
+  </div>
   <div class="overlay" id="doneOv">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="doneTitle">
       <h3 id="doneTitle" tabindex="-1">✅ できあがりです!</h3>
@@ -888,7 +992,8 @@
         <button class="btn" id="doneLater" onclick="closeDone()">あとで決める</button>
         <button class="btn primary" id="doneGo" onclick="submitDone()">棚入待ちにする</button>
       </div>
-      <p class="hint">「棚入待ち」= できあがって、棚に入れるのを待っている状態です。棚に入れたら職員が「終了」にします。</p>
+      <p class="hint">「棚入待ち」= できあがって、棚に入れるのを待っている状態です。棚に入れたら職員が「終了」にします。<br>
+        <b>数が予定と違っていても、そのまま入れてください。</b>実際にできた数を残します。</p>
     </div>
   </div>
 
@@ -1115,6 +1220,13 @@ let curDetail = null;      // 開いている詳細のカード id (Notion 正�
 /** カード id の比較。onclick の引数を経ると数値も文字列になるので、厳密比較せず文字列にそろえて比べる (Codex A1b R1 #1) */
 const sameId = (a, b) => a != null && b != null && String(a) === String(b);
 const findCard = (id) => state.cards.find(x => sameId(x.id, id)) || null;
+/**
+ * ⭐画面に並べる行 (要件 §AB-11 の 5b)。まとまりが 2 つ以上のカードは、いろはのぶん・
+ * ワークセンターのぶんが 1 行ずつになる。ふだん (まとまり 1 つ) は今までどおり 1 行。
+ * ⚠カードを指すとき (詳細・写真・作業時間) は今までどおり findCard(row.id)。
+ * 下見 (Notion 正本) は rows を返さないので cards をそのまま使う
+ */
+const rowsOf = (st) => ((st || {}).rows || (st || {}).cards || []);
 // ─── 詳細の文脈: どこから開いたか (state = 一覧・ボード / preview = 下見・履歴) と、許された操作 ───
 // 画面はサーバーが返した capabilities にある操作だけ描く (default-deny)。「描いてから隠す」はしない (要件 v1.3 §P Q5)
 let detailSrc = null;        // 'state' | 'preview'
@@ -1366,6 +1478,14 @@ async function loadStateOnce() {
   } else if (planData) {
     renderPlan();   // 「どこが」の許可だけ失った場合も、ここでボタンが消える
   }
+  // ⭐預ける計画も同じ。許可を失ったら描いたものを消す (明日の計画と同じ扱い — Codex R2 中1)
+  if (!isApp() || !stateCan('task.consign')) {
+    cplan = null;
+    clearConsignPlanDom();
+    if (curView === 'cplan') setView('board');
+  } else if (cplan) {
+    renderConsignPlan();
+  }
   if (!stateCan('task.facility.assign') && facPickCtx) closeFacPick();
   restoreWorker();
   // ⭐選んでいるのが利用者なら、端末の職員モードが生きていても職員の許可は採用しない (Codex PR-A R1 #1)
@@ -1406,11 +1526,24 @@ function fmtTime(iso) {
 }
 
 const facilityName = (code) => ((state.facilities || []).find(f => f.code === code) || {}).name || code;
+/**
+ * ⭐作業中の記録の「誰が」(要件 §AB-10)。
+ * 個人なら名前、**人数だけの記録なら「パレット 3人」**。worker_name は NULL になりうるので、
+ * ここを通さずに名前を直接つなぐと「さんが作業中」だけが出る
+ */
+function sessionWho(a) {
+  if (!a) return '';
+  return a.worker_name ? a.worker_name + 'さん' : facilityName(a.facility_code) + ' ' + (a.crew_size || 1) + '人';
+}
+/** 何人で作業しているか。人数だけの記録は 1 行で何人ぶんにもなる (要件 §AB-10) */
+function activeHeads(list) {
+  return (list || []).reduce((n, a) => n + (a.worker_name ? 1 : (a.crew_size || 1)), 0);
+}
 
 function renderSync() {
   const rf = state.refresh || {};
   let txt = isApp()
-    ? state.cards.length + ' 件'
+    ? rowsOf(state).length + ' 件'
     : fmtTime(rf.lastRefreshAt) + ' に取得 · ' + state.cards.length + ' 件 (状態の札をタップで変更。Notionにも反映)';
   $('#syncTxt').textContent = txt;
   if (rf.error) showErr('Notionから最新を取得できませんでした (前回取得分を表示しています)', rf.error);
@@ -1424,9 +1557,11 @@ function statusTabs() {
 }
 
 function counts() {
-  const c = { all: state.cards.length, blocked: 0, today: 0 };
+  // ⭐数えるのは**並んでいる行**。まとまりが 2 つ以上のカードは 2 行なので、札の数と一覧の数が合う
+  const rows = rowsOf(state);
+  const c = { all: rows.length, blocked: 0, today: 0 };
   for (const [v] of statusTabs()) c[v] = 0;
-  for (const card of state.cards) {
+  for (const card of rows) {
     if (c[card.status] != null) c[card.status]++;
     if (card.blocked) c.blocked++;   // ⛔ 止まっている (進捗とは別の札 — 案A)
     if (card.today) c.today++;       // 📌 今日やる (監修 F-6)
@@ -1463,7 +1598,8 @@ function rowTags(c, opts) {
   // ⛔ 止まっている理由 (案A)。進捗の札とは別。いちばん先に出す (作業できないことが先に分かる)
   if (c.blocked) h += '<span class="tag blocked">⛔ ' + esc(c.blocked.label) + 'で止まっています</span>';
   if (c.today) h += '<span class="tag today">📌 今日やる</span>';
-  if (c.cancellation_requested_at) h += '<span class="tag urgent">⚠ 取消の確認待ち</span>';
+  if (c.cancellation_requested_at) h += '<span class="tag urgent">⚠ 入荷側で取消 — 職員の判断待ち</span>';
+  if (c.related && c.related.length) h += '<span class="tag miss">🔁 同じ入荷のカードが他に ' + c.related.length + ' 枚</span>';
   if (c.migration_review) h += '<span class="tag miss">❓ 状態の確認待ち</span>';
   if (c.external_ready) h += '<span class="tag ready">📦 外部に出せます</span>';
   if (c.facility_code && c.facility_code !== 'iroha') h += '<span class="tag ext">🏢 ' + esc(facilityName(c.facility_code)) + '</span>';
@@ -1478,7 +1614,7 @@ function rowTags(c, opts) {
 
 function visibleCards() {
   const q = $('#q').value.trim().toLowerCase();
-  return state.cards.filter(c => {
+  return rowsOf(state).filter(c => {
     if (curTab === 'blocked') { if (!c.blocked) return false; }
     else if (curTab === 'unblocked') { if (c.blocked) return false; }
     else if (curTab === 'today') { if (!c.today) return false; }
@@ -1524,7 +1660,7 @@ function renderList() {
     const staffUI = isStaffUI();
     const meta2 = [
       estText(c, { short: true }),
-      c.active.length > 0 ? '👤 ' + esc(c.active.map(a => a.worker_name).join('・')) + 'さんが作業中' : null,
+      c.active.length > 0 ? '👤 ' + esc(c.active.map(sessionWho).join('・')) + 'が作業中' : null,
       // 「作業中」なのにだれも作業していない = 中断し忘れ・止まった札の付け忘れの発見に (監修)
       c.status === 'in_progress' && c.active.length === 0 && !c.blocked ? '⏸ いまはだれも作業していません' : null,
       staffUI && c.priority.kind !== 'urgent' ? esc(c.priority.kind === 'new' ? '売上データなし' : c.priority.label) : null,
@@ -1532,9 +1668,12 @@ function renderList() {
       c.expiry ? '📅 期限 ' + esc(c.expiry) : null,
     ].filter(Boolean).join(' ・ ');
     const tags = rowTags(c, { short: true });
-    const selectable = bulkIds && c.status === 'ready_for_stocking';
+    // ⭐分かれた行は「まとめて棚入完了」で選べない (どのぶんかを決めずにカードごと閉じてしまうため)。
+    //   その行の「✅ 棚入完了」は そのまとまりだけを閉じる
+    const selectable = bulkIds && c.status === 'ready_for_stocking' && !c.split;
     const sel = selectable && bulkIds.has(c.id);
-    return '<div class="row' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+    return '<div class="row' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' +
+      (c.split ? ' data-batch="' + esc(c.batch_id) + '"' : '') + (selectable ? ' data-pick="1"' : '') + '>' +
       (selectable ? '<input type="checkbox" class="cb"' + (sel ? ' checked' : '') + '>' : '') +
       '<div class="thumb">' + thumbHtml(c) + '</div>' +
       '<div class="bd"><h2>' + esc(c.title) + '</h2>' + (tags ? '<div class="rtags">' + tags + '</div>' : '') +
@@ -1543,7 +1682,7 @@ function renderList() {
       // 状態: 変更が許されていればタップできる札 (data-st)、許されていなければただの札
       (selectable ? '' : stockBtnHtml(c)) +
       (selectable ? ''
-        : stateCan('task.status.change')
+        : stateCan('task.status.change') && !c.split
           ? '<button class="st ' + stClass(c.status) + '" data-st="' + esc(c.id) + '">' + esc(stLabel(c)) + ' ▾</button>'
           : '<span class="st ro ' + stClass(c.status) + '">' + esc(stLabel(c)) + '</span>') +
       '<span class="chev">' + (selectable ? '' : '›') + '</span></div>';
@@ -1555,7 +1694,12 @@ $('#q').addEventListener('input', renderList);
 // 一覧のクリックも委譲 (状態の札 / 選択 / 詳細)
 $('#list').addEventListener('click', (e) => {
   const stockBtn = e.target.closest('[data-stock-of]');
-  if (stockBtn) { e.stopPropagation(); stockOne(stockBtn.dataset.stockOf); return; }   // ✅ 1 枚だけ棚入完了
+  if (stockBtn) {   // ✅ 1 枚だけ棚入完了 (分かれた行はそのぶんだけ)
+    e.stopPropagation();
+    if (stockBtn.dataset.stockBatch) stockBatchOf(stockBtn.dataset.stockOf, Number(stockBtn.dataset.stockBatch));
+    else stockOne(stockBtn.dataset.stockOf);
+    return;
+  }
   const st = e.target.closest('[data-st]');
   if (st) { e.stopPropagation(); openSt(e, st.dataset.st); return; }
   const row = e.target.closest('[data-id]');
@@ -1564,10 +1708,12 @@ $('#list').addEventListener('click', (e) => {
 });
 
 // ─── 画面の切替 (作業 / ボード / ラベル待ち / 履歴) ───
-const PAGES = { list: '.listpage', board: '.boardpage', plan: '.planpage', label: '.labelpage', history: '.historypage' };
+const PAGES = { list: '.listpage', board: '.boardpage', plan: '.planpage', cplan: '.cplanpage', label: '.labelpage', history: '.historypage' };
 const VIEW_BTN = { list: '#vList', board: '#vBoard', label: '#vLabel', history: '#vHistory' };
 function setView(v) {
   if (v === 'plan' && isApp() && !stateCan('task.plan.assign')) v = 'board';   // 計画は職員だけ (下見は誰でも読むだけ)
+  // ⭐預ける計画は職員だけ。Notion が正本のうちは預けそのものが使えないので開かない
+  if (v === 'cplan' && (!isApp() || !stateCan('task.consign'))) v = 'board';
   if (v !== 'board' && v !== 'list') exitBulk();
   curView = v;
   for (const [k, sel] of Object.entries(PAGES)) $(sel).hidden = k !== v;
@@ -1577,6 +1723,7 @@ function setView(v) {
   if (v === 'list') renderList();
   if (v === 'board') { if (isApp()) renderBoard(); else loadPreview(); }
   if (v === 'plan') loadPlan();
+  if (v === 'cplan') loadConsignPlan();
   if (v === 'label') loadLabelWaits();
   if (v === 'history') { renderHistTools(); if (histMode === 'daily') loadDaily(); else loadHistory(); }
 }
@@ -1731,7 +1878,8 @@ function colSegHtml() {
 /** 進捗の絞り込み (列が 拠点・いつ のとき)。未着手 / 作業中 / 棚入待ち */
 function statusChips() {
   const st = boardState() || { cards: [], statuses: [] };
-  const n = (v) => (v === 'all' ? st.cards.length : st.cards.filter(c => c.status === v).length);
+  const rs = rowsOf(st);
+  const n = (v) => (v === 'all' ? rs.length : rs.filter(c => c.status === v).length);
   return [['all', 'すべて'], ...(st.statuses || []).map(s => [s.value, s.label])]
     .map(([v, l]) => '<button class="chip' + (curStatus === v ? ' on' : '') + '" data-st-filter="' + esc(v) + '">' + esc(l) + ' <span class="num">' + n(v) + '</span></button>').join('');
 }
@@ -1742,7 +1890,7 @@ $('#stChips').addEventListener('click', (e) => {
   renderBoard();
 });
 function whenChips() {
-  const cards = ((boardState() || {}).cards || []);
+  const cards = rowsOf(boardState());
   const n = (v) => (v === 'all' ? cards.length : v === 'none' ? cards.filter(c => !c.when).length
     : v === 'blocked' ? cards.filter(c => c.blocked).length : v === 'unblocked' ? cards.filter(c => !c.blocked).length
     : cards.filter(c => c.when === v).length);
@@ -1762,10 +1910,11 @@ function whenChips() {
 function facChips() {
   const st = boardState() || { cards: [], facilities: [] };
   const facs = st.facilities || [];
-  const counts = { all: st.cards.length };
-  for (const c of st.cards) counts[c.facility_code] = (counts[c.facility_code] || 0) + 1;
+  const rs = rowsOf(st);
+  const counts = { all: rs.length };
+  for (const c of rs) counts[c.facility_code] = (counts[c.facility_code] || 0) + 1;
   // 値は data 属性で渡す (onclick に文字列を埋めない — HTML エスケープは JS 文字列のエスケープではない。Codex PR-C R1)
-  counts.none = st.cards.filter(c => !c.facility_code).length;
+  counts.none = rs.filter(c => !c.facility_code).length;
   const one = (v, label) => '<button class="chip' + (curFacility === v ? ' on' : '') + '" data-fac="' + esc(v) + '">' +
     esc(label) + ' <span class="num">' + (counts[v] || 0) + '</span></button>';
   // 「未定」= どこが作業するか決まっていないカード (要件 §W-2)
@@ -1815,7 +1964,12 @@ $('#board').addEventListener('click', (e) => {
   const whenBtn = e.target.closest('[data-when-of]');
   if (whenBtn) { e.stopPropagation(); openWhenPick(whenBtn.dataset.whenOf); return; }   // 今日 / 明日 / 未定 から選ぶ
   const stockBtn = e.target.closest('[data-stock-of]');
-  if (stockBtn) { e.stopPropagation(); stockOne(stockBtn.dataset.stockOf); return; }   // ✅ 1 枚だけ棚入完了
+  if (stockBtn) {   // ✅ 1 枚だけ棚入完了 (分かれた行はそのぶんだけ)
+    e.stopPropagation();
+    if (stockBtn.dataset.stockBatch) stockBatchOf(stockBtn.dataset.stockOf, Number(stockBtn.dataset.stockBatch));
+    else stockOne(stockBtn.dataset.stockOf);
+    return;
+  }
   const printBtn = e.target.closest('[data-print-of]');
   if (printBtn) { e.stopPropagation(); openPrintBox(printBtn.dataset.printOf); return; }   // 🏷 保管箱ラベル (ボードからも出せる — 中原さん 2026-09-06)
   const el = e.target.closest('[data-id]');
@@ -1836,7 +1990,7 @@ $('#histBody').addEventListener('click', (e) => {
 });
 function boardCards() {
   const q = ($('#bq').value || '').trim().toLowerCase();
-  return ((boardState() || {}).cards || []).filter(c => {
+  return rowsOf(boardState()).filter(c => {
     if (curFacility !== 'all' && (curFacility === 'none' ? !!c.facility_code : c.facility_code !== curFacility)) return false;
     if (curStatus !== 'all' && c.status !== curStatus) return false;   // 進捗の絞り込み (列が進捗以外のとき — 中原さん 2026-09-06)
     // 「⛔ 止まっている」は予定の値ではなく札の絞り込み (案A)
@@ -1860,7 +2014,7 @@ function renderBoard() {
   if (boardCols === 'status') curStatus = 'all';
   if (boardCols === 'fac') curFacility = 'all';
   if (boardCols === 'when' && !['all', 'blocked', 'unblocked'].includes(curWhen)) curWhen = 'all';
-  $('#gaugeWrap').innerHTML = planButtonHtml();
+  $('#gaugeWrap').innerHTML = planButtonHtml() + consignPlanButtonHtml();
   $('#colSeg').innerHTML = colSegHtml();
   $('#facGroup').hidden = boardCols === 'fac';
   $('#facChips').innerHTML = facChips();
@@ -1911,12 +2065,19 @@ function gripHtml() { return '<span class="grip" data-grip aria-hidden="true">�
 /** 棚入待ちのカードに「✅ 棚入完了」(職員モードだけ。まとめて選んでいる間は出さない) — 中原さん 2026-09-05 */
 function stockBtnHtml(c) {
   if (c.status !== 'ready_for_stocking' || bulkIds || !isApp() || !stateCan('tasks.bulk_stocked') || !isStaffUI()) return '';
+  // ⭐分かれた行は**そのぶんだけ**棚入完了にする (他のぶん = 外にあずけ中 はそのまま残る)
+  if (c.split) {
+    return '<button class="stockbtn" data-stock-of="' + esc(c.id) + '" data-stock-batch="' + esc(c.batch_id) + '">✅ 棚入完了</button>';
+  }
   return '<button class="stockbtn" data-stock-of="' + esc(c.id) + '">✅ 棚入完了</button>';
 }
 function bcardHtml(c, status) {
-  const selectable = bulkIds && status === 'ready_for_stocking';
+  const selectable = bulkIds && status === 'ready_for_stocking' && !c.split;
   // 動かして変えられるのは、いま並べている軸のことだけ (進捗の列なら進捗、拠点の列なら拠点)
-  const grab = isApp() && !bulkIds && (boardCols === 'fac' ? stateCan('task.facility.assign') : boardCols === 'when' ? stateCan('task.plan.assign') : stateCan('task.status.change'));
+  // ⭐分かれた行は掴めない。動かして変わるのはカードのこと (どこが・いつ・進捗) なので、
+  //   どのぶんを動かしたのかが決まらない (要件 §U-7: 押せないものは描かない)
+  const grab = isApp() && !bulkIds && !c.split
+    && (boardCols === 'fac' ? stateCan('task.facility.assign') : boardCols === 'when' ? stateCan('task.plan.assign') : stateCan('task.status.change'));
   const sel = selectable && bulkIds.has(c.id);
   const meta = [c.qty != null ? c.qty + ' 個' : null,
     c.done_qty != null ? '✅ できた ' + c.done_qty + (c.qty != null ? '/' + c.qty : '') : null,
@@ -1925,11 +2086,14 @@ function bcardHtml(c, status) {
     c.plan_hours != null ? '⏱ ' + approxHours(c.plan_hours) : null,
     c.external_ready ? '📦 外部に出せます' : null,
     c.facility_code && c.facility_code !== 'iroha' ? '🏢 ' + facilityName(c.facility_code) : null,
-    c.active.length > 0 ? '👤 ' + c.active.length + '人' : null].filter(Boolean).join(' ・ ');
+    c.split && c.away ? '🚚 ' + (c.away.handed ? 'あずけ中 ' : '渡す予定 ') + c.away.qty + ' 個'
+      + (c.away.due ? ' ' + fmtMd(c.away.due) + 'まで' : '') : null,
+    c.active.length > 0 ? '👤 ' + activeHeads(c.active) + '人' : null].filter(Boolean).join(' ・ ');
   // ⭐2 段に分ける。上 = 画像と文字、下 = 札とボタン。
   //   下の段は**カードの幅いっぱい**を使う (画像の右に押し込むと 1 つずつ行を使ってカードが縦に伸び、
   //   画像の下は空いたままになる — 中原さん 2026-09-07「表示する情報は変えずに縦を短く」)
-  return '<div class="bcard' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' + (selectable ? ' data-pick="1"' : '') + '>' +
+  return '<div class="bcard' + (sel ? ' sel' : '') + (c.blocked ? ' blocked' : '') + '" data-id="' + esc(c.id) + '"' +
+    (c.split ? ' data-batch="' + esc(c.batch_id) + '"' : '') + (selectable ? ' data-pick="1"' : '') + '>' +
     '<div class="btop">' +
     (grab ? gripHtml() : '') +
     (c.image_url ? '<div class="th">' + thumbHtml(c) + '</div>' : '') +   // 📦 の空枠は幅を取るだけなので、写真があるカードだけ (監修)
@@ -2043,11 +2207,18 @@ function redrawAfterPlan() {
  */
 function recountTomorrow() {
   if (!state || !Array.isArray(state.cards)) return;
-  const mine = state.cards.filter(c => c.when === 'tomorrow');
+  // ⭐「明日の計画」の画面と**同じものさし**で数える (要件 §AB-11 の 5b):
+  //   数えるのは**カード**、時間は「まだ手元にあるまとまり」の合計。渡したぶん・棚に入れたぶんは入れない
+  const mine = rowsOf(state).filter(c => c.when === 'tomorrow' && c.plannable !== false);
   let hours = 0;
-  let unknown = 0;
-  for (const c of mine) { if (c.plan_hours == null) unknown += 1; else hours += Number(c.plan_hours) || 0; }
-  state.tomorrow_plan = { hours: Math.round(hours * 10) / 10, count: mine.length, unknown_hours_count: unknown };
+  const cardIds = new Set();
+  const unknownIds = new Set();
+  for (const c of mine) {
+    cardIds.add(String(c.id));
+    if (c.plan_hours == null) unknownIds.add(String(c.id));
+    else hours += Number(c.plan_hours) || 0;
+  }
+  state.tomorrow_plan = { hours: Math.round(hours * 10) / 10, count: cardIds.size, unknown_hours_count: unknownIds.size };
 }
 
 let facPickFor = null;
@@ -2318,7 +2489,7 @@ function lockDeviceStaffMode() {
 
 // ─── 確認・入力の専用ダイアログ (window.prompt / confirm の置き換え — 監修 R-1) ───
 //   confirm 相当: ask({ title, text, ok, cancel }) → true / null
-//   prompt 相当:  ask({ title, text, input: 'pin' | 'text', placeholder, required }) → 文字列 / null (やめた)
+//   prompt 相当:  ask({ title, text, input: 'pin' | 'number' | 'text', placeholder, required }) → 文字列 / null (やめた)
 let askResolve = null;
 let askOpts = null;
 // ═══ 🏷 保管箱ラベル (いろはPC の QL-800) — 入荷受付チェックの値札発行と同じ流れ (中原さん 2026-09-06) ═══
@@ -2379,18 +2550,64 @@ function printWarnHtml(a) {
   if (a.paper_ok === false) warn.push('QL-800 に用紙「箱ラベル 62x67」が登録されていないため、印刷に失敗します');
   return warn.length ? '<div class="pwarn">⚠ ' + warn.map(esc).join('<br>⚠ ') + '</div>' : '';
 }
-function openPrintBox(id) {
+/**
+ * 箱の数え方 (サーバーの neededBoxesCalc と同じ)。⭐入数が分からなければ null —
+ * 0 箱として扱うと「ラベル 0 枚」になり、必要な枚数と違うものを出す
+ */
+function boxesOf(qty, per) {
+  // ⭐**数が入っていない**のと「0 個」は別。Number(null) も Number('') も 0 になるので、
+  //   数に直すまえに見分ける (要件: 欠損値を 0 で代用しない — Codex #1259 R2 中1)
+  if (qty == null || qty === '' || per == null || per === '') return null;
+  const p = Number(per);
+  const n = Number(qty);
+  if (!Number.isSafeInteger(p) || p <= 0 || !Number.isSafeInteger(n) || n < 0) return null;
+  const full = Math.floor(n / p);
+  const rest = n % p;
+  return { full, rest, per: p, boxes: full + (rest > 0 ? 1 : 0) };
+}
+/**
+ * ⭐箱ラベルは**まとまり単位**で出す (要件 §AB-12)。
+ * 1 つのカードに期限の違うぶんが混ざることがあるので、分かれているカードでは
+ * どのぶんかを先に選ばせる。決めずに刷ると、**違う期限のラベルを箱に貼る** —
+ * 貼ってしまうと現物からは分からない。
+ */
+function printableBatches(c) {
+  return (c.batches || []).filter((b) => b.work_status !== 'cancelled');
+}
+function openPrintBox(id, batchId) {
   const c = findCard(id);
   if (!c) return;
   if (!worker) { openGate(); return; }
   const agents = printAgents();
   if (agents.length === 0) { showErr('ラベルを印刷する いろはPC が登録されていません (管理画面で印刷係を登録)'); return; }
-  printCtx = { id: c.id, reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), saving: false };
+  const all = c.batches || [];
+  const bs = printableBatches(c);
+  // ⭐まとまりがあるのに出せるぶんが 1 つも無い = 全部取り消された。
+  //   カード全体の期限・数で刷らせない (Codex R4 中1)
+  if (all.length > 0 && bs.length === 0) {
+    showErr('このカードのぶんはすべて取り消されています。ラベルは出せません');
+    return;
+  }
+  // 分かれているのに選んでいなければ、まず選んでもらう
+  if (bs.length > 1 && batchId == null) { openPrintBatchPick(c, bs); return; }
+  const batch = batchId != null ? bs.find((b) => b.id === Number(batchId)) : (bs.length === 1 ? bs[0] : null);
+  if (batchId != null && !batch) { showErr('そのぶんが見つかりません (画面を更新してください)'); return; }
+  // ⚠ダイアログを閉じると依頼 ID は作り直される (master と同じ)。「送ったが応答を失う → 閉じる →
+  //   開き直す」で 2 枚出る穴は**この PR より前からある**もので、ここでは塞がない。
+  //   端末に控えを残す形を試したが、別タブでの取り合い・表示と送信のズレ・取消ずみのまとまりから
+  //   抜け出せない、と穴が増えた (Codex #1259 R6 重大 2・中 2)。冪等の作り直しは別の PR で。
+  printCtx = { id: c.id, batchId: batch ? batch.id : null,
+    reqId: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10), saving: false };
   const m = c.master || {};
   const type = barcodeTypeOf(c.barcode);
   // ⭐必要保管箱の内訳から分ける: 満杯の箱 (per 個) が full 箱、端数が rest 個で 1 箱。
   //   例 360 個 / 1 箱 70 個 → 70 個のラベル 5 枚 ＋ 10 個のラベル 1 枚 (中原さん 2026-09-06)
-  const bc = c.boxes_calc;
+  // ⭐箱の数も**そのまとまりの数**で数える。カード全体の数で数えると、
+  //   400 個のぶんに 1000 個ぶんのラベルを出してしまう (§AB-11 の 5a と同じ落とし穴)。
+  // 🚨期限とまったく同じ規則にする — 「いま残っているまとまりが 1 つ」を「分かれていない」と
+  //   同じに扱わない。取り消したぶんを除いて 1 つになっただけのことがあり、そこでカード全体の数に
+  //   戻すと、400 個のぶんに 1000 個ぶんのラベルが出る (Codex #1259 R4)
+  const bc = batch ? boxesOf(batch.planned_qty, m.units_per_container) : c.boxes_calc;
   let units = m.units_per_container != null ? String(m.units_per_container) : '';
   let copies = 1;
   let extraQty = '';
@@ -2403,7 +2620,15 @@ function openPrintBox(id) {
   //   多すぎるときはそのまま出して、合計の案内と発行時の検査で止める
   copies = Math.max(1, copies);
   // 期限の既定: この入荷の有効期限 → 無ければ「期限シールあり」の商品だけ印を入れる (無い商品は空欄)
-  const expiry = c.expiry ? String(c.expiry) : (m.expiry_seal === 1 ? '期限シールあり' : '');
+  // ⭐期限は**そのまとまりのもの**を使う (§AB-12 の前提 7: 1 つの入荷に期限が混ざる)。
+  // 🚨まとまりがあるなら、**空欄も含めて**そのまとまりに従う。カード全体の期限を埋め戻すと、
+  //   選ぶ画面で「期限なし」と見せた直後に別の期限が入り、違うラベルを刷れてしまう
+  //   (Codex #1259 R1 重大1)。
+  // 🚨「いま残っているまとまりが 1 つ」を「分かれていない」と同じに扱わない —
+  //   取り消したぶんを除いて 1 つになっただけのことがあり、そこで埋め戻すと同じ事故が起きる
+  //   (同 R3 重大2)。カードの期限を使うのは**まとまりが 1 つも無い古いカード**だけ
+  const expSrc = batch ? batch.expiry : c.expiry;
+  const expiry = expSrc ? String(expSrc) : (m.expiry_seal === 1 ? '期限シールあり' : '');
   const first = agents.find(a => a.online) || agents[0];
   const opts = agents.map(a => '<option value="' + a.id + '"' + (a.id === first.id ? ' selected' : '') + '>' + esc(a.label) + ' — ' + esc(a.printer_name || '(プリンター未登録)') + (a.online ? '' : ' (応答なし)') + '</option>').join('');
   // 🚨 直前が「❓ 結果不明」「🙋 手で刷る扱い」なら、実物を見た / 手で刷っていない ことをチェックさせてからしか送らない
@@ -2417,6 +2642,13 @@ function openPrintBox(id) {
       + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printAck"> 手で刷っていない (P-touch Editor で出していない)</label></div>';
   $('#printBody').innerHTML =
     '<div class="pfld"><label>商品</label><div class="ro"><b>' + esc(c.title) + '</b><br><span class="num">' + esc(c.product_code || '') + '</span></div></div>' +
+    (bs.length > 1 && batch
+      ? '<div class="pfld"><label>どのぶんのラベルか</label><div class="ro"><b>まとまり #' + esc(String(batch.seq)) + '</b>'
+        + ' ・ ' + esc(String(batch.planned_qty)) + ' 個'
+        + (batch.expiry ? ' ・ 期限 ' + esc(batch.expiry) : '')
+        + ' ・ ' + esc(facilityName(batch.facility_code || c.facility_code) || '未定')
+        + ' <button type="button" class="btn-sm" data-prredo="' + c.id + '">選び直す</button></div></div>'
+      : '') +
     '<div class="pfld"><label>バーコード</label><div class="ro num">' + esc(c.barcode || '') + ' <small>(' + (type ? type.toUpperCase() : '不明') + ')</small></div></div>' +
     '<div class="pfld"><label>1 箱に何個 (ラベルの「数量」。空欄なら印字しない)</label><input type="number" inputmode="numeric" min="1" step="1" id="printPack" value="' + esc(units) + '" placeholder="未登録"></div>' +
     '<div class="pfld"><label>期限 (空欄なら印字しない)</label><input type="text" id="printExpiry" maxlength="40" value="' + esc(expiry) + '" placeholder="例: 2027-03"></div>' +
@@ -2431,6 +2663,51 @@ function openPrintBox(id) {
   renderPrintSum();
   openOverlay('#printOv');
 }
+/**
+ * ⭐どのぶんのラベルかを選ぶ (要件 §AB-12)。期限・数がまとまりごとに違いうるので、
+ * それを見て選べるようにする。⚠window.prompt は iOS のホーム画面アプリで出ないことがある (監修 R-1)
+ */
+function openPrintBatchPick(c, bs) {
+  // ⭐前のカードの printCtx を残さない (選んだあとに別のカードへ渡してしまう — Codex R1 中1)
+  printCtx = null;
+  $('#printBody').innerHTML =
+    '<div class="pfld"><label>商品</label><div class="ro"><b>' + esc(c.title) + '</b></div></div>' +
+    '<p class="hint">このカードは ' + bs.length + ' つに分かれています。<b>どのぶんのラベルを出しますか。</b>' +
+      '期限や数がぶんごとに違うことがあります。</p>' +
+    '<div class="pbatches">' + bs.map((b) =>
+      '<button type="button" class="btn wide" data-prtask="' + esc(String(c.id)) + '" data-prbatch="' + esc(String(b.id)) + '">' +
+        '<b>まとまり #' + esc(String(b.seq)) + '</b> ・ ' + esc(String(b.planned_qty)) + ' 個' +
+        (b.expiry ? ' ・ 期限 ' + esc(b.expiry) : ' ・ 期限なし') +
+        ' ・ ' + esc(facilityName(b.facility_code || c.facility_code) || '未定') +
+      '</button>').join('') + '</div>';
+  $('#printMsg').textContent = '';
+  $('#printOk').disabled = true;   // 選ぶまでは発行させない
+  openOverlay('#printOv');
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-prbatch]');
+  if (b) {
+    // ⭐どのカードのぶんかは**選ぶ画面が覚えている**。前に開いたカードの printCtx が残っていて、
+    //   そちらの id を使ってしまうのを防ぐ (Codex R1 中1)
+    const c = findCard(Number(b.dataset.prtask));
+    closeOverlay('#printOv');
+    if (c) openPrintBox(c.id, Number(b.dataset.prbatch));
+    return;
+  }
+  const r = e.target.closest('[data-prredo]');
+  if (!r) return;
+  // 🚨送っている最中・送ったが結果を確かめられていないときは選び直させない。
+  //   ここで作り直すと**依頼 ID が変わり**、届いていた 1 枚目に重ねてもう 1 枚出る (Codex R1 重大2)
+  if (printCtx && (printCtx.saving || printCtx.unresolved)) {
+    $('#printMsg').textContent = printCtx.saving
+      ? '❌ いま送っています。終わるまでお待ちください'
+      : '❌ さきほどの依頼が届いたか分かっていません。同じ内容で「発行」を押し直すか、いったん閉じて印刷の状態を見てください (選び直すと 2 枚出ることがあります)';
+    return;
+  }
+  closeOverlay('#printOv');
+  openPrintBox(Number(r.dataset.prredo));
+});
+
 /** 「70 個 × 5 枚 ＋ 10 個 × 1 枚 = 6 枚」— 何枚出るかを人が読める形で出す */
 function renderPrintSum() {
   const el = $('#printSum');
@@ -2455,6 +2732,41 @@ $('#printBody').addEventListener('change', (ev) => {
   const w = $('#printWarn');
   if (w) w.innerHTML = printWarnHtml(a);
 });
+/**
+ * 🚨「さっき同じラベルを出しています」を、ダイアログの中に出す。
+ * ⭐閉じずにその場で確かめてもらう — 閉じると何を確かめるのか分からなくなるし、開き直すと依頼 ID も変わる。
+ * チェックは**入力ではなく確かめた印**なので、lockPrintFields では閉じない (中身を変えるものではない)。
+ */
+function showPrintDupWarn(msg, resetCheck) {
+  const box = $('#printBody');
+  if (!box) return;
+  let el = $('#printDupWarn');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'pwarn';
+    el.id = 'printDupWarn';
+    el.innerHTML = '<span class="t"></span><br>'
+      + '<label style="display:block;margin-top:6px"><input type="checkbox" id="printDupAck"> さっき出したのとは別に要る</label>';
+    box.insertBefore(el, box.firstChild);
+  }
+  el.querySelector('.t').textContent = msg;
+  // ⭐相手が変わったら、前の確認は無かったことにする (人にもう一度見てもらう)
+  const cb = $('#printDupAck');
+  if (cb && resetCheck) cb.checked = false;
+}
+/**
+ * ⭐届いたか分からない依頼を抱えている間は、入力を編集できなくする (Codex #1259 R6 重大3)。
+ * 送り直すのは「そのとき送った中身」なので、画面だけ変えられると、見えている値と送る中身が食い違う。
+ * やめる (閉じる) は押せるままにする — 詰まったら閉じて、印刷の状態を見に行ける。
+ * ⚠#printDupAck (さっき出したのとは別に要る) は入れない。**中身ではなく確かめた印**なので、
+ *   届いたか分からない依頼を抱えていても押せる必要がある。
+ */
+function lockPrintFields(lock) {
+  for (const id of ['#printPack', '#printExpiry', '#printCopies', '#printExtra', '#printTarget', '#printAck']) {
+    const el = $(id);
+    if (el) el.disabled = !!lock;
+  }
+}
 function closePrintBox() { if (printCtx && printCtx.saving) return; closeOverlay('#printOv'); printCtx = null; }
 /** 発行のあと、いま見ている画面を描き直す (ボードからも押せるようになったため — 中原さん 2026-09-06) */
 function repaintAfterPrint(c) {
@@ -2492,22 +2804,54 @@ async function submitPrint() {
   ctx.saving = true;
   $('#printOk').disabled = true;
   msgEl.textContent = '送信しています…';
+  // ⭐**送る中身は 1 か所で作る**。届いたか分からない依頼を送り直すときは、**そのときの中身のまま**送る —
+  //   画面の値を変えてから送ると、同じ依頼 ID で違う内容になり、サーバーに断られて抜け出せなくなる。
+  //   (だから下の catch では入力を編集できなくしてある — 画面に見えている値と送る中身を食い違わせない)
+  const base = (ctx.unresolved && ctx.body) ? ctx.body : {
+    task_id: c.id, worker_id: worker.id, copies, pack_qty: packRaw || null, extra_pack_qty: extraRaw || null, expiry: expiry || null,
+    batch_id: ctx.batchId == null ? undefined : ctx.batchId,
+    target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
+  };
+  // ⭐「さっき出したのと同じだが、それとは別に要る」の証跡。**中身ではなく確かめた印**なので、
+  //   届いたか分からない依頼を送り直すとき (中身は変えない) にも足してよい。
+  // 🚨ただし**毎回いまのチェックから付け直す**。控えた中身に居残らせると、チェックを外して送り直しても
+  //   証跡が付いたままになり、画面は未確認なのに発行できてしまう (Codex #1266 R1 中2)
+  const dupAck = $('#printDupAck');
+  const body = { ...base };
+  delete body.acknowledge_duplicate_job_id;
+  if (dupAck && dupAck.checked && ctx.dupJobId) body.acknowledge_duplicate_job_id = ctx.dupJobId;
+  // 🚨**送る中身を決めたら、そこから先は画面を変えさせない**。通信の待ちの間に期限や枚数を
+  //   直せると、応答を失ったときに「画面に見えている値」と「送り直す中身」が食い違う
+  //   (2027-03 で送信 → 待ちの間に 2028-06 に直す → 通信が切れる → 再送は 2027-03。
+  //    初回が届いていなければ、画面と違う期限のラベルが出る — Codex #1259 R7 重大)
+  lockPrintFields(true);
   let j;
   try {
     j = await apiFetch('/api/print/jobs', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        task_id: c.id, worker_id: worker.id, copies, pack_qty: packRaw || null, extra_pack_qty: extraRaw || null, expiry: expiry || null,
-        target_device_id: target, client_request_id: ctx.reqId, acknowledge_unknown_job_id: prev ? prev.id : undefined,
-      }),
+      body: JSON.stringify(body),
     });
   } catch (e) {
     ctx.saving = false;
-    msgEl.textContent = '❌ 送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2 枚にはなりません)';
+    // 🚨**届いたかどうか分からない**。ここで印を立て、同じダイアログの中では依頼 ID も中身も変えない。
+    //   立てるのはこの経路だけ — サーバーが返事をくれたなら、その依頼のことは分かっている。
+    ctx.unresolved = true;
+    ctx.body = body;            // ⭐送った中身のまま送り直す (画面の値を変えても、これを送る)
+    // 入力は送る前からロックしてある。届いたか分からない間は**そのまま維持**する
+    msgEl.textContent = '❌ 送信できませんでした (' + e.message + ')。もう一度押すと同じ依頼として送ります (2 枚にはなりません)。内容は変えられません';
     $('#printOk').disabled = false;
     return;
   }
   ctx.saving = false;
+  // ⭐印を下ろせるのは **j.ok のときだけ**。積めた (または同じ依頼として積んであった) と分かった
+  //   ときにかぎり、その依頼は片づいている。
+  // 🚨入力の誤りで断られても下ろさない — その返事は「**いま送ったぶん**は積まれていない」しか
+  //   言っておらず、前に送って返事を失ったぶんが積まれていないことの証明にはならない
+  //   (Codex #1259 R3 重大1)。枚数の検査などは冪等 ID を見るより先に走る
+  if (j.ok) { ctx.unresolved = false; ctx.body = null; }
+  // ⭐サーバーが返事をくれた = その依頼がどうなったかは分かっている。届いたか分からない依頼を
+  //   抱えていなければ、直して送り直せるように入力を開ける (入力の誤りで断られたときなど)
+  if (!ctx.unresolved) lockPrintFields(false);
   if (j.ok) {
     c.print_job = j.job;
     closePrintBox();
@@ -2516,10 +2860,25 @@ async function submitPrint() {
     return;
   }
   if (j.job) c.print_job = j.job;
+  // 🚨さっき同じラベルを出している。閉じずにその場で確かめてもらう
+  //   (閉じると「何を確かめるのか」が分からなくなる。開き直すと依頼 ID も変わる)
+  if (j.error === 'confirm_duplicate') {
+    // 🚨**確認の相手が変わったらチェックを外す**。別の iPad が刷って新しいジョブが完了すると、
+    //   サーバーは違うジョブを指して聞き直してくる。チェックが残っていると、その新しいぶんを
+    //   **人が見ないまま**「確かめた」ことにして通してしまう (Codex #1266 R1 重大1)
+    const nextId = j.job ? j.job.id : null;
+    showPrintDupWarn(j.message || 'さきほど同じラベルを出しています', nextId !== ctx.dupJobId);
+    ctx.dupJobId = nextId;
+    msgEl.textContent = '';
+    $('#printOk').disabled = false;
+    return;
+  }
   if (j.error === 'in_progress') { closePrintBox(); repaintAfterPrint(c); return; }
   if (j.error === 'confirm_unknown' || j.error === 'confirm_manual') {
-    // 画面が古かった (別の iPad で発行されて結果不明になった等)。最新のジョブで開き直す
-    repaintAfterPrint(c); openPrintBox(c.id);
+    // 画面が古かった (別の iPad で発行されて結果不明になった等)。最新のジョブで開き直す。
+    // ⭐**選んでいたまとまりのまま**開き直す。渡さないと、分かれたカードでは選ぶ画面に戻り、
+    //   別のぶんを選び直せてしまう (前回の結果を確かめる話なのに、対象が変わる)
+    repaintAfterPrint(c); openPrintBox(c.id, ctx.batchId);
     $('#printMsg').textContent = j.message || '前回の印刷結果が不明です。実物を確認してください';
     return;
   }
@@ -2543,8 +2902,11 @@ function ask(o) {
     $('#askInRow').hidden = !askOpts.input;
     if (askOpts.input) {
       const pin = askOpts.input === 'pin';
-      inp.type = pin ? 'tel' : 'text';
-      inp.inputMode = pin ? 'numeric' : 'text';
+      // ⭐数を入れるときも数字のキーボードを出す (iPad で文字キーボードが出ると打ちにくい)。
+      //   type は 'tel' にする — 'number' はスピナーが出て、はみ出た値も入る
+      const num = pin || askOpts.input === 'number';
+      inp.type = num ? 'tel' : 'text';
+      inp.inputMode = num ? 'numeric' : 'text';
       inp.maxLength = pin ? 8 : 200;
       inp.placeholder = askOpts.placeholder || '';
       inp.value = '';
@@ -3022,7 +3384,8 @@ function renderBulk() {
  */
 function syncBulkSelection(visible) {
   if (!bulkIds) return;
-  const ok = new Set(visible.filter(c => c.status === 'ready_for_stocking').map(c => c.id));
+  // ⭐分かれた行は「まとめて」では選べない (どのぶんかを決めずにカードごと閉じてしまうため)
+  const ok = new Set(visible.filter(c => c.status === 'ready_for_stocking' && !c.split).map(c => c.id));
   let dropped = 0;
   for (const id of [...bulkIds.keys()]) if (!ok.has(id)) { bulkIds.delete(id); dropped++; }
   if (dropped > 0) toast(dropped + ' 件は絞り込みで見えなくなったので選択から外しました');
@@ -3084,7 +3447,7 @@ async function stockOne(id) {
   await completeStocked([{ id: c.id, version: c.version }]);
 }
 const BULK_SKIP = { already: 'すでに棚入完了', not_ready: '棚入待ちではありません', not_found: '見つかりません',
-  conflict: '同時に変更されました', active_sessions: '作業中の人がいます' };
+  conflict: '同時に変更されました', active_sessions: '作業中の人がいます', consign_open: '外にあずけたぶんが返っていません' };
 const bulkSkipLabel = (reason) => BULK_SKIP[reason] || '棚入完了にできませんでした';
 
 // ─── ラベル待ち ───
@@ -3596,6 +3959,74 @@ function canEditProgress(c) {
     && c.status !== 'closed' && c.status !== 'ready_for_stocking'
     && can('task.status.change');
 }
+/**
+ * ⭐外部にあずけているぶん (要件 §AB-7)。いつまでに返してもらうかも出す。
+ * 期限を過ぎていたら赤く出す (催促のため)
+ */
+/** ⭐まだ数えていない返却の行 (使える数が空)。あると、そのまとまりの「できた数」が出せず棚入れに進めない */
+const uncountedReturns = (x) => (x.returns || []).filter((r) => r.good_qty == null);
+/**
+ * ⭐精算ずみの預けを出すか。
+ * - 数が抜けている返却がある → **開いて**出す (入れないと棚入れに進めない = やること)
+ * - 数が揃っている → **折りたたんで**出す。普段は邪魔にならず、打ち間違いに気づいたら開いて直せる
+ *   (最後の 1 行を埋めた瞬間に入口ごと消えると、間違いを直せない — Codex #1268 R2 中1)
+ */
+const settledOpen = (x) => uncountedReturns(x).length > 0;
+function awayHtml(c) {
+  // ⭐精算ずみでも、返却の記録があるものは残す (数を直せる入口を消さない)
+  const list = (c.consignments || []).filter((x) => x.state !== 'cancelled'
+    && (x.state !== 'settled' || (x.returns || []).length > 0));
+  if (list.length === 0) {
+    // 一覧から開いたときは細かい記録が無いので、合計だけ出す
+    if (!c.away) return '';
+    return '<div class="away"><label>🚚 あずけ中</label><div class="v">' + esc(String(c.away.qty)) + ' 個</div>' +
+      (c.away.due ? '<div class="s2">' + esc(c.away.due) + ' までに返却</div>' : '') + '</div>';
+  }
+  const today = (state && state.today) || '';
+  return list.map((x) => {
+    const over = x.due_date && today && x.due_date < today;
+    const qty = x.handed_qty != null ? x.handed_qty : x.planned_qty;
+    const back = x.returned_total || 0;
+    const settled = x.state === 'settled';
+    const folded = settled && !settledOpen(x);   // 精算ずみで数も揃っている = 普段は畳んでおく
+    return '<div class="away">' + (folded ? '<details><summary>' : '') +
+      '<label>🚚 ' + esc(settled ? '精算ずみ' : x.state === 'handed' ? 'あずけ中' : '渡す予定') + '</label>' +
+      '<div class="v">' + esc(facilityName(x.facility_code)) + ' ' + esc(String(qty)) + ' 個' +
+        (back > 0 ? '（' + back + ' 個は返却ずみ）' : '') + '</div>' + (folded ? '</summary>' : '') +
+      '<div class="s2' + (over ? ' over' : '') + '">' +
+        (x.handed_at ? esc(fmtDate(x.handed_at)) + ' にわたした' : 'まだ渡していません') +
+        (x.due_date ? ' ・ ' + esc(x.due_date) + ' までに返却' + (over ? ' (期限を過ぎています)' : '') : '') + '</div>' +
+      // ⭐返却の行を**1 行ずつ**出す (いつ何個返ってきたぶんか分かるように)。
+      //   数が入っていないものは赤く強調し、入っているものも**直せる**ようにする —
+      //   入れたとたんに入口が消えると、打ち間違いも数え直しも直せない (Codex #1268 R1 中3)
+      (x.returns || []).map((r) => {
+        const none = r.good_qty == null;
+        return '<div class="s2' + (none ? ' over' : '') + '">📥 ' + esc(fmtDate(r.returned_at)) + ' に ' +
+          esc(String(r.returned_qty)) + ' 個 返ってきたぶん — ' +
+          (none ? '<b>使える数</b>がまだ入っていません' : '使える数 ' + esc(String(r.good_qty)) + ' 個') +
+          (stateCan('task.consign')
+            ? ' <button data-cgfix="' + r.id + '" data-cgfix-cg="' + x.id + '">' + (none ? '数を入れる' : '数を直す') + '</button>'
+            : (none ? ' (職員が入れます)' : '')) + '</div>';
+      }).join('') +
+      (stateCan('task.consign') ? '<div class="acts">' +
+        (x.state === 'handed'
+          ? '<button class="go" data-cg="return" data-cg-id="' + x.id + '">返却を受け取る</button>' +
+            '<button data-cg="settle" data-cg-id="' + x.id + '">返ってこないぶんを精算</button>'
+          : x.state === 'settled' ? ''       // もう閉じている (数を入れるボタンだけ上に出す)
+          : '<button class="go" data-cg="handed" data-cg-id="' + x.id + '">渡しました</button>' +
+            (x.state === 'planned' ? '<button data-cg="prepared" data-cg-id="' + x.id + '">箱とラベルを用意した</button>' : '') +
+            '<button data-cg="cancel" data-cg-id="' + x.id + '">やめる</button>') +
+        '</div>' : '') +
+      (folded ? '</details>' : '') + '</div>';
+  }).join('');
+}
+/** 🚚 外部にあずける — 職員だけ。許可が無ければ描かない (要件 §U-7) */
+function consignBtnHtml(c) {
+  if (!isApp() || detailSrc === 'preview' || c.status === 'closed') return '';
+  if (!can('task.consign')) return '';
+  return '<button class="btn wide amber" onclick="openConsign()">🚚 外部にあずける</button>';
+}
+
 /** 中断メモ — 次にやる人が読むもの。カードを開いたらすぐ見えるところに出す (要件 §Y-3) */
 function memoHtml(c) {
   return c.hold_memo
@@ -3671,9 +4102,10 @@ function renderDetail(c, opts) {
         (c.ar_no ? ' ・ ' + esc(c.ar_no) : '') + '</div>' +
       headNumsHtml(c) +
       '</div></div>' +
-      sealHtml(c) + blockedHtml(c) + careHtml(c) + memoHtml(c) +
+      sealHtml(c) + blockedHtml(c) + cancelBanHtml(c) + relatedHtml(c) + careHtml(c) + memoHtml(c) + awayHtml(c) + consignBtnHtml(c) +
       '</div>' +
     prevCardHtml(c) +
+    batchesCardHtml(c) +
 
     '<div class="dcard"><h3 class="sec">作業情報' + missBadge(m) + '</h3>' +
       workInfoHtml(c, m, missSet) +
@@ -3687,6 +4119,7 @@ function renderDetail(c, opts) {
 
     mediaCardHtml(c) +
     historyCardHtml(c) +
+    stockingCardHtml(c) +
     workCardHtml(c);
   // 画面下の固定バー (はじめる / タイマー / ひとやすみ / できあがり / ⛔止まった — 監修 F-1)。許可が無ければ出さない
   const bar = $('#dbar');
@@ -3707,14 +4140,247 @@ const END_REASON = { done: 'できあがり', pause: '中断', admin: '職員が
 function historyCardHtml(c) {
   const rows = c.work_history || [];
   if (rows.length === 0) return '';
-  const total = rows.reduce((a, r) => a + (Number(r.raw_seconds) || 0), 0);
-  const items = rows.map(r =>
-    '<li><b>' + esc(r.worker_name || '—') + '</b> さん ・ ' + esc(fmtDate(r.started_at) + ' ' + fmtTime(r.started_at)) +
-    ' 〜 ' + esc(fmtTime(r.ended_at)) + ' ・ ' + esc(fmtDurHist(Number(r.raw_seconds) || 0)) +
-    ' ・ ' + esc(END_REASON[r.end_reason] || r.end_reason || '—') + '</li>').join('');
+  // ⭐合計は **人時** (秒 × 人数)。個人は 1 人なので今までと同じ数字 (要件 §AB-10)
+  const total = rows.reduce((a, r) => a + (Number(r.raw_seconds) || 0) * (r.crew_size || 1), 0);
+  const items = rows.map(r => {
+    const raw = Number(r.raw_seconds) || 0;
+    const heads = r.worker_name ? 1 : (r.crew_size || 1);
+    // 人数だけの記録は「1時間 × 3人 = 3時間」と書く。かかった時間と人時のどちらも隠さない
+    const dur = heads > 1
+      ? fmtDurHist(raw) + ' × ' + heads + '人 = ' + fmtDurHist(raw * heads)
+      : fmtDurHist(raw);
+    return '<li><b>' + esc(sessionWho(r) || '—') + '</b> ・ ' + esc(fmtDate(r.started_at) + ' ' + fmtTime(r.started_at)) +
+      ' 〜 ' + esc(fmtTime(r.ended_at)) + ' ・ ' + esc(dur) +
+      ' ・ ' + esc(END_REASON[r.end_reason] || r.end_reason || '—') + '</li>';
+  }).join('');
   return '<div class="dcard"><h3 class="sec">これまでの作業 — このカード</h3>' +
     '<ul class="whist">' + items + '</ul>' +
     '<p class="est num">合計 ' + esc(fmtDur(total)) + ' (' + rows.length + '回)</p></div>';
+}
+
+/**
+ * ⭐作業のまとまり (要件 §AB-1 / §AB-11 の 5)。**2 つ以上あるときだけ**出す。
+ * ふだん (1 つ) は今までどおり、カード 1 枚の見え方のまま。
+ *
+ * いろはのぶんが終わったら、外部に預けたぶんが返るのを待たずに棚に入れられる
+ * (中原さん 2026-09-07「2 週間寝かせる理由がない」)。
+ */
+const BSTATUS = { not_started: '未着手', in_progress: '作業中', ready_for_stocking: '棚入待ち', done: '棚入完了' };
+/**
+ * ⭐**まだ分かれていないカード**にも「期限が違うぶんを分ける」を出す (§AB-12)。
+ * まとまりの欄は 2 つ以上のときしか出ないので、ここが無いと**最初の 1 回を分ける入口が無い**
+ * (Codex #1273 R1 中1)。ふだんは職員モードのときだけ、小さく出す。
+ */
+function splitOnlyHtml(c) {
+  const bs = (c.batches || []).filter((b) => b.work_status !== 'cancelled');
+  if (bs.length !== 1) return '';
+  const b = bs[0];
+  if (!(b.work_status === 'not_started' || b.work_status === 'in_progress')) return '';
+  if (b.consigned_out || b.planned_qty == null || b.planned_qty <= 1) return '';
+  if (!isApp() || detailSrc === 'preview' || !isStaffUI() || !stateCan('task.consign')) return '';
+  return '<div class="dcard"><h3 class="sec">期限が違う物が混ざっていたら</h3>' +
+    '<p class="nlink">同じ商品でも期限の違う物が届くことがあります。分けると、箱ラベルの期限をぶんごとに選べます。</p>' +
+    '<div class="bfoot"><button class="btn" data-bsplit="' + esc(b.id) + '">✂ 期限が違うぶんを分ける</button></div></div>';
+}
+function batchesCardHtml(c) {
+  const bs = (c.batches || []).filter((b) => b.work_status !== 'cancelled');
+  if (bs.length <= 1) return splitOnlyHtml(c);
+  return '<div class="dcard"><h3 class="sec">作業のまとまり</h3>' +
+    '<p class="nlink">このカードは ' + bs.length + ' つに分かれています。できたぶんから先に棚へ入れられます。</p>' +
+    bs.map((b) => batchRowHtml(c, b)).join('') + '</div>';
+}
+function batchRowHtml(c, b) {
+  const fac = b.facility_code || c.facility_code;
+  const nums = ['予定 ' + (b.planned_qty == null ? '—' : b.planned_qty + ' 個'),
+    'できた数 ' + (b.good_qty == null ? '—' : b.good_qty + ' 個'),
+    b.loss_qty != null ? '作れなかった ' + b.loss_qty + ' 個' : null].filter(Boolean).join(' ・ ');
+  // ⭐押せるものだけ描く (許可の無い操作は DOM に出さない — 要件 §U-7)
+  let btn = '';
+  if (b.consigned_out) {
+    btn = '';   // 外にあるぶんは人が進めない。返却を受け取ると棚入待ちになる
+  } else if ((b.work_status === 'not_started' || b.work_status === 'in_progress') && can('task.status.change')) {
+    btn = '<button class="btn primary" data-bdone="' + esc(b.id) + '">✅ このぶんを作り終えた</button>';
+  } else if (b.work_status === 'ready_for_stocking' && stateCan('tasks.bulk_stocked') && isStaffUI()) {
+    btn = '<button class="btn primary" data-bstock="' + esc(b.id) + '">✅ このぶんを棚入完了</button>';
+  }
+  // ⭐職員は「そのぶんだけやり直す」ことができる (数え間違い・手直し)。カードごと戻すと他のぶんまで巻き込む
+  const redo = (b.work_status === 'ready_for_stocking' || b.work_status === 'done') && !b.consigned_out
+    && stateCan('tasks.bulk_stocked') && isStaffUI()
+    ? '<button class="btn" data-bredo="' + esc(b.id) + '">↩ このぶんをやり直す</button>' : '';
+  // ⭐期限が違う物が混ざっていたら、そのぶんを分ける (§AB-12)。まだ作業できるぶんだけ
+  const split = (b.work_status === 'not_started' || b.work_status === 'in_progress') && !b.consigned_out
+    && b.planned_qty != null && b.planned_qty > 1 && isStaffUI() && stateCan('task.consign')
+    ? '<button class="btn" data-bsplit="' + esc(b.id) + '">✂ 期限が違うぶんを分ける</button>' : '';
+  return '<div class="brow">' +
+    '<div class="bh"><b>' + esc(facilityName(fac) || '未定') + '</b>' +
+      '<span class="st ro ' + stClass(b.work_status === 'done' ? 'closed' : b.work_status) + '">' +
+        esc(BSTATUS[b.work_status] || b.work_status) + '</span>' +
+      (b.consigned_out ? '<span class="st ro">🚚 あずけ中</span>' : '') + '</div>' +
+    '<div class="m num">' + esc(nums) + '</div>' +
+    (b.variance_note ? '<div class="m">📝 ' + esc(b.variance_note) + '</div>' : '') +
+    (b.consigned_out ? '<div class="m">外にあるぶんです。返却を受け取ると「棚入待ち」になります。</div>' : '') +
+    (btn || redo || split ? '<div class="bfoot">' + btn + redo + split + '</div>' : '') +
+    '</div>';
+}
+// まとまりごとの「作り終えた」「棚入完了」
+document.addEventListener('click', (e) => {
+  const d = e.target.closest('[data-bdone]');
+  if (d) { const c = findCard(curDetail); if (c) openDone(c, Number(d.dataset.bdone)); return; }
+  const k = e.target.closest('[data-bstock]');
+  if (k) { stockBatch(Number(k.dataset.bstock)); return; }
+  const rd = e.target.closest('[data-bredo]');
+  if (rd) { redoBatch(Number(rd.dataset.bredo)); return; }
+  const sp = e.target.closest('[data-bsplit]');
+  if (sp) { openSplitBatch(Number(sp.dataset.bsplit)); }
+});
+/**
+ * ⭐**期限が違うぶんを分ける** (要件 §AB-12)。職員だけ。
+ *
+ * 同じカードに期限の違う物が混ざって届くことがある。分けないと、箱ラベルの期限を 1 つしか選べず、
+ * 期限の違う箱に同じラベルを貼ってしまう (貼ったあとは現物から見分けられない)。
+ */
+async function openSplitBatch(batchId) {
+  const c = findCard(curDetail);
+  if (!c) return;
+  const b = (c.batches || []).find((x) => sameId(x.id, batchId));
+  if (!b) return;
+  const w = worker;
+  if (!w) { openGate(); return; }
+  if (!state.me.session && w.worker_type !== 'staff') { toast('分けられるのは職員だけです (右上の名前を職員に替えてください)'); return; }
+  const qty = await ask({
+    title: '✂ 期限が違うぶんを分ける',
+    text: 'いま ' + b.planned_qty + ' 個です。別の期限のぶんが何個あるかを入れてください (残りは元のぶんに残ります)。'
+      + '⚠ 分けたぶんは、あとから 1 つに戻せません。数を確かめてから押してください',
+    input: 'number', placeholder: '例: 40', required: true, ok: '次へ',
+  });
+  if (qty == null) return;
+  const n = Number(String(qty).trim());
+  if (!Number.isInteger(n) || n < 1 || n >= b.planned_qty) {
+    showErr('分ける数が正しくありません', '1 以上・' + (b.planned_qty - 1) + ' 個までで入れてください (全部は分けられません)');
+    return;
+  }
+  const exp = await ask({
+    title: '✂ 分けるぶんの期限',
+    text: n + ' 個ぶんの期限を入れてください (分からなければ空のままで、あとから入れられます)',
+    input: 'text', placeholder: '例: 2027-03', ok: 'このぶんを分ける',
+  });
+  if (exp == null) return;
+  let pin = null;
+  if (!state.me.session) {
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '分ける' });
+    if (pin == null) return;
+  }
+  const j = await apiFetch('/api/batches/split', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, batch_id: b.id, qty: n, expiry: String(exp).trim() || null,
+      expect_version: b.version, worker_id: w.id, pin }) });
+  if (!j.ok) { showErr(j.message || '分けられませんでした'); return; }
+  toast('✂ ' + n + ' 個を別のぶんに分けました' + (j.batch && j.batch.expiry ? ' (期限 ' + j.batch.expiry + ')' : ''));
+  await loadState();
+  renderTabs(); renderList();
+  if (curView === 'board') renderBoard();
+  if (sameId(curDetail, c.id)) openDetail(c.id);
+}
+/** ⭐そのぶんだけ作業中に戻す (数え間違い・手直し)。職員だけ。他のぶんは巻き込まない */
+async function redoBatch(batchId) {
+  const c = findCard(curDetail);
+  if (!c || !stateCan('tasks.bulk_stocked')) return;
+  const b = (c.batches || []).find((x) => sameId(x.id, batchId));
+  if (!b) return;
+  const w = worker;
+  if (!w) { openGate(); return; }
+  if (!state.me.session && w.worker_type !== 'staff') { toast('やり直せるのは職員だけです (右上の名前を職員に替えてください)'); return; }
+  const okGo = await ask({
+    title: facilityName(b.facility_code || c.facility_code) + ' のぶんを作業中に戻しますか?',
+    text: 'そのぶんだけ作業中に戻します。できた数は残るので、直してから もう一度「作り終えた」を押してください。'
+      + (b.work_status === 'done' ? '棚に入れた記録はそのまま残ります。' : ''),
+    ok: 'はい、作業中に戻す', cancel: 'やめる',
+  });
+  if (!okGo) return;
+  // ⭐終了したカードのぶんを戻すときは理由を残す (なぜ戻したかが消えるくらいなら失敗させる — カードと同じ約束)
+  let reason = null;
+  if (c.status === 'closed') {
+    reason = await ask({ title: 'なぜ戻しますか', text: 'あとから見て分かるように、ひとこと残してください',
+      input: 'text', placeholder: '例: 2 個だけ貼り直す', required: true, ok: '続ける' });
+    if (reason == null) return;
+  }
+  let pin = null;
+  if (!state.me.session) {
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '作業中に戻す' });
+    if (pin == null) return;
+  }
+  const j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, to: 'in_progress', batch_id: b.id, worker_id: w.id, pin, reason, expect_version: c.version }) });
+  if (!j.ok) { showErr(j.message || '戻せませんでした'); return; }
+  applyTask(c, j.task);
+  c.status = j.status;
+  if (j.status_label) c.status_label = j.status_label;
+  toast('このぶんを作業中に戻しました');
+  await loadState();   // 行の数・進捗はサーバーが持っている
+  renderTabs(); renderList();
+  if (curView === 'board') renderBoard();
+  if (sameId(curDetail, c.id)) openDetail(c.id);
+}
+/** ⭐そのまとまりだけを棚入完了にする。他のぶん (外にあずけ中) はそのまま残る */
+const stockBatch = (batchId) => stockBatchOf(curDetail, batchId);
+async function stockBatchOf(taskId, batchId) {
+  const c = findCard(taskId);
+  if (!c || !stateCan('tasks.bulk_stocked')) return;
+  const b = (c.batches || []).find((x) => sameId(x.id, batchId));
+  if (!b) return;
+  const w = worker;
+  if (!w) { openGate(); return; }
+  if (!state.me.session && w.worker_type !== 'staff') { toast('棚入完了にできるのは職員だけです (右上の名前を職員に替えてください)'); return; }
+  const rest = (c.batches || []).filter((x) => x.work_status !== 'cancelled' && !sameId(x.id, b.id) && x.work_status !== 'done').length;
+  const okGo = await ask({
+    title: facilityName(b.facility_code || c.facility_code) + ' のぶんを棚入完了にしますか?',
+    text: '棚に入れ終わったぶんだけにしてください。'
+      + (rest > 0 ? '残り ' + rest + ' つのぶんはそのまま残ります (カードは一覧に残ります)。' : 'これで全部そろうので、カードは一覧から外れます (履歴には残ります)。'),
+    ok: 'はい、棚入完了にする', cancel: 'やめる', danger: true,
+  });
+  if (!okGo) return;
+  let pin = null;
+  if (!state.me.session) {
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: '棚入完了にする' });
+    if (pin == null) return;
+  }
+  const j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, to: 'closed', close_reason: 'stocked', batch_id: b.id,
+      worker_id: w.id, pin, expect_version: c.version }) });
+  if (!j.ok) { showErr(j.message || '棚入完了にできませんでした'); return; }
+  applyTask(c, j.task);
+  c.status = j.status;
+  if (j.status_label) c.status_label = j.status_label;
+  toast('このぶんを棚入完了にしました' + (rest > 0 ? ' (残りのぶんはそのままです)' : ''));
+  // ⭐行の中身 (まとまりの状態・数) はサーバーが持っているので、一覧を取り直す
+  await loadState();
+  if (sameId(curDetail, c.id)) {
+    if (j.listed === false) closeDetail(); else openDetail(c.id);
+  }
+}
+
+/**
+ * ⭐棚に入れた実績 (要件 §AB-2)。いつ・誰が・何個 入れたか。
+ * 数えずに入れたぶんは「数は残していません」と出す (0 と混ぜない)
+ */
+function stockingCardHtml(c) {
+  const rows = c.stocking || [];
+  if (rows.length === 0) return '';
+  const items = rows.map(r =>
+    '<li>' + esc(r.stocked_at ? fmtDate(r.stocked_at) + ' ' + fmtTime(r.stocked_at) : 'いつ入れたかの記録なし') + ' ・ ' +
+    (r.qty == null ? '数は残していません' : '<b>' + esc(String(r.qty)) + ' 個</b>') +
+    (r.stocked_by ? ' ・ ' + esc(r.stocked_by) : '') +
+    (r.note ? ' ・ ' + esc(r.note) : '') + '</li>').join('');
+  // ⭐数の分からない行があるなら「合計」と言い切らない。分かっているぶんの小計として出す
+  //   (200 個 + 数不明 を「合計 200 個」と書くと、全部で 200 個入れたように読める — Codex R1 中3)
+  const known = rows.filter((r) => r.qty != null);
+  const unknown = rows.length - known.length;
+  const n = known.reduce((a, r) => a + Number(r.qty), 0);
+  const foot = known.length === 0 ? '数の記録はありません (' + rows.length + '回)'
+    : unknown === 0 ? '合計 ' + n + ' 個 (' + rows.length + '回)'
+    : '数が分かるぶん ' + n + ' 個 ・ 数の記録がないもの ' + unknown + '回 (ぜんぶで ' + rows.length + '回)';
+  return '<div class="dcard"><h3 class="sec">棚に入れた記録</h3>' +
+    '<ul class="whist">' + items + '</ul>' +
+    '<p class="est num">' + esc(foot) + '</p></div>';
 }
 
 // ── 写真・動画: 「前回の完成形」(同じ商品の見本) と「今回のできあがり」 ──
@@ -4258,6 +4924,80 @@ function blockedHtml(c) {
     (canManual ? '<button class="btn" onclick="unblockOnly()">札を外す (職員)</button>' : '') + '</div>';
 }
 
+/**
+ * ⚠ 入荷側で取り消されたカード。⭐**カードは消えない** — 続ける / 取り消す は いろはの職員が決める
+ * (中原さん 2026-09-08: 一度いろはに送ったカードは残り続ける。入荷側の都合で勝手に変えない)。
+ * 押せる人にだけボタンを描く (許可の無い操作は DOM に出さない — 要件 §U-7)
+ */
+function cancelBanHtml(c) {
+  const k = c.cancellation;
+  if (!k && !c.cancellation_requested_at) return '';
+  const when = k && k.at ? fmtDate(k.at) + ' ' + fmtTime(k.at) : '';
+  const reason = k ? k.reason_label : '入荷側で取り消されました';
+  const src = k ? k.source_label : '入荷側';
+  const canDecide = isApp() && detailSrc !== 'preview' && stateCan('task.cancellation');
+  // ⭐同じ入荷の他のカードは**全部**出す。新しくて確認待ちでない相手がいれば「作業はそちらで」。
+  //   相手も確認待ちなら誘導しない (取消済みの相手へ作業を送らない — Codex R2)。二重作業の注意は必ず付ける
+  const rel = c.related || [];
+  const newerOk = rel.filter((r) => r.newer && !r.cancellation_requested_at);
+  const others = rel.filter((r) => !(r.newer && !r.cancellation_requested_at));
+  const relTxt = (newerOk.length ? '<span class="sub"><b>この入荷は新しいカード ' + newerOk.map(relCardTxt).join('・') + ' で確認し直されています。</b>' +
+      (newerOk.length === 1 ? '作業はそちらで。このカードは「取り消す」が正しいことが多いです' : 'どれで作業するかは職員が決めてください') + '</span>' : '') +
+    (others.length ? '<span class="sub"><b>同じ入荷のカードが他にもあります: ' + others.map(relCardTxt).join('・') + '</b>。' +
+      'どのカードで作業するかは職員が決めてください (確認待ちの相手へは作業を移さないでください)</span>' : '') +
+    (rel.length ? '<span class="sub">二重に作業しないでください</span>' : '');
+  return '<div class="blockban cancel"><span class="ic" aria-hidden="true">⚠</span><div>' +
+    '<b>入荷側で取り消されました — 職員の判断待ち</b>' +
+    '<span class="sub">' + esc(reason) + (when ? ' (' + esc(src) + ' ・ ' + esc(when) + ')' : '') + '</span>' + relTxt +
+    '<span class="sub">このカードは自動では消えません。いろはの職員が「続ける」か「取り消す」かを決めます' +
+      (canDecide ? '' : '。職員に声をかけてください') + '</span></div>' +
+    (canDecide
+      ? '<div class="acts"><button class="btn" onclick="resolveCancel(\'continue\')">このまま続ける (職員)</button>' +
+        '<button class="btn stop" onclick="resolveCancel(\'cancel\')">取り消す (職員)</button></div>'
+      : '') + '</div>';
+}
+const REL_ST = { not_started: '未着手', in_progress: '作業中', ready_for_stocking: '棚入待ち' };
+const relCardTxt = (r) => '#' + r.id + ' (' + (REL_ST[r.status] || r.status) + (r.cancellation_requested_at ? '・確認待ち' : '') + ')';
+/**
+ * 🔁 同じ入荷の他のカード。取消の枠が無いカード (= 確認し直しでできた新しい側) に出す。
+ * 旧カードが確認待ちのまま残っている間、両方で作業すると二重になる → 職員が旧を片づけるまで注意を促す
+ */
+function relatedHtml(c) {
+  const rel = c.related || [];
+  if (!rel.length || c.cancellation_requested_at) return '';   // 取消の枠のあるカードはそちらで言う
+  return '<div class="blockban cancel"><span class="ic" aria-hidden="true">🔁</span><div>' +
+    '<b>同じ入荷のカードが他にあります: ' + rel.map(relCardTxt).join('・') + '</b>' +
+    '<span class="sub">入荷側で確認し直されたぶんです。どのカードで作業するかは職員が決めます。決まるまで二重に作業しないでください</span></div></div>';
+}
+/** 職員が 続ける / 取り消す を決める。職員モードでなければ職員PINを聞く (redoBatch と同じ約束) */
+async function resolveCancel(decision) {
+  const c = findCard(curDetail);
+  if (!c || !stateCan('task.cancellation')) return;
+  const w = worker;
+  if (!w) { openGate(); return; }
+  if (!state.me.session && w.worker_type !== 'staff') { toast('決められるのは職員だけです (右上の名前を職員に替えてください)'); return; }
+  const k = c.cancellation || {};
+  const okGo = await ask(decision === 'cancel'
+    ? { title: 'このカードを取り消しますか?', text: (k.reason_label || '入荷側で取り消されました') + '。カードは「終了：取消」になり、一覧から消えます。できた数や写真の記録は残ります。', ok: 'はい、取り消す', cancel: 'やめる' }
+    : { title: 'このまま続けますか?', text: '入荷側の取消は無視して、このカードの作業を続けます。札が外れます。', ok: 'はい、続ける', cancel: 'やめる' });
+  if (!okGo) return;
+  let pin = null;
+  if (!state.me.session) {
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: decision === 'cancel' ? '取り消す' : '続ける' });
+    if (pin == null) return;
+  }
+  const j = await apiFetch('/api/cancellation', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, decision, worker_id: w.id, pin, expect_version: c.version }) });
+  if (!j.ok) { showErr(j.message || '決められませんでした'); return; }
+  applyTask(c, j.task);
+  toast(decision === 'cancel' ? 'カードを取り消しました' : '続けます (札を外しました)');
+  await loadState();   // 行の数・進捗はサーバーが持っている
+  renderTabs(); renderList();
+  if (curView === 'board') renderBoard();
+  if (decision === 'cancel') closeDetail();
+  else if (sameId(curDetail, c.id)) openDetail(c.id);
+}
+
 /** 画面下の固定バー。許可が無い (下見・履歴・Notion 正本の読むだけ) なら空 = 出さない */
 function barHtml(c) {
   // 許可ごとに描く: はじめる/ひとやすみ/できあがり = task.work.start、⛔止まった = task.block。どちらも無ければ出さない
@@ -4272,9 +5012,9 @@ function barHtml(c) {
     const first = c.active.reduce((a, b) => (Date.parse(a.started_at) <= Date.parse(b.started_at) ? a : b));
     return '<div class="in">' +
       '<div class="tm"><div class="t num" id="wt" data-start="' + esc(first.started_at) + '">--:--</div><small>' +
-        (c.active.length > 1 ? c.active.length + '人で作業中' : '作業中') + '</small></div>' +
+        (activeHeads(c.active) > 1 ? esc(c.active.map(sessionWho).join('・')) + 'が作業中' : '作業中') + '</small></div>' +
       '<button class="btn warn" id="pauseBtn" onclick="stopWork(\'pause\')">⏸ ひとやすみ</button>' +
-      '<button class="btn primary" id="doneBtn" onclick="stopWork(\'done\')">✅ ' + (c.active.length > 1 ? 'みんなできあがり' : 'できあがり') + '</button>' +
+      '<button class="btn primary" id="doneBtn" onclick="stopWork(\'done\')">✅ ' + (activeHeads(c.active) > 1 ? 'みんなできあがり' : 'できあがり') + '</button>' +
       stopBtn + '</div>';
   }
   return '<div class="in"><button class="btn primary" id="startBtn" onclick="openCrew()">▶ 作業をはじめる</button>' + stopBtn + '</div>';
@@ -4303,7 +5043,7 @@ function renderBlock(c) {
   // 🧰 資材が足りない: どの資材が何個足りないかを 1 タップで残し、職員に知らせる (監修「あった方がよい機能」)
   const mat = blockReason === 'materials_shortage' ? materialsPanelHtml(c) : '';
   $('#blockBody').innerHTML = blockReason
-    ? mat + dqPanelHtml(c, '', { memoLabel: blockReason === 'other' ? '何で止まりましたか (必須) — 次にやる人にも見えます' : '中断メモ (任意) — 次にやる人が読みます' })
+    ? mat + dqPanelHtml(dqSubject(c, homeBatchId(c)), '', { memoLabel: blockReason === 'other' ? '何で止まりましたか (必須) — 次にやる人にも見えます' : '中断メモ (任意) — 次にやる人が読みます' })
     : '<p class="hint">まず理由を 1 つ選んでください。</p>';
   $('#blockGo').disabled = !blockReason;
 }
@@ -4361,6 +5101,7 @@ async function submitBlock() {
       // できた数は入れたときだけ送る (空 = 前の値のまま)。メモも書いたときだけ。
       // 「その他」のメモは止まった理由 (blocked_note) にだけ入れる — 申し送り (hold_memo) と二重に持たない (Codex PR #1193 R1 #7)
       body: JSON.stringify({ id: c.id, worker_id: worker.id, reason: blockReason, expect_version: c.version,
+        ...(homeBatchId(c) ? { batch_id: homeBatchId(c) } : {}),
         ...(v.qty != null ? { done_qty: v.qty } : {}),
         ...(blockReason === 'other' ? { note: v.memo }
           : matNote ? { note: matNote, ...(v.memo ? { hold_memo: v.memo } : {}) }
@@ -4394,8 +5135,10 @@ async function submitBlock() {
 // ── 止まっているカードを始める前の確認 ──
 let unblockCtx = null;   // { ids }
 let unblockSaving = false;
-function openUnblock(c, ids) {
-  unblockCtx = { ids };
+/** @param headcount 人数だけではじめようとしていたとき { facilityCode, crewSize } (要件 §AB-10) */
+// ⭐batchId も預かる — 札を外して始め直すときに、選んだぶんを選び直させない (Codex #1269 R1 中2)
+function openUnblock(c, ids, headcount, batchId) {
+  unblockCtx = { ids, headcount, batchId: batchId ?? null };
   $('#unblockName').textContent = c.title || '';
   const b = c.blocked;
   $('#unblockText').textContent = b
@@ -4412,8 +5155,13 @@ async function confirmUnblock() {
   unblockSaving = true;
   $('#unblockGo').disabled = true;
   $('#unblockMsg').textContent = '保存中…';
+  const hc = unblockCtx.headcount;
   let r;
-  try { r = await startWork(ids, { clearBlock: true }); }
+  // ⭐どちらの入口から来たかで戻り先を変える。人数だけの開始も同じ確認を通す
+  try {
+    r = hc ? await startHeadcount(hc.facilityCode, { clearBlock: true, crewSize: hc.crewSize })
+      : await startWork(ids, { clearBlock: true, ...(unblockCtx.batchId ? { batchId: unblockCtx.batchId } : {}) });
+  }
   finally {
     unblockSaving = false;
     $('#unblockGo').disabled = false;
@@ -4440,19 +5188,27 @@ async function unblockOnly() {
 }
 
 // ── ✅ できあがり → 棚入待ち (監修 B-7 / F-3) ──
+let doneBatch = null;
 let doneTarget = null, doneSaving = false;
-function openDone(c) {
+let doneConfirmed = null;   // 予定と大きく違うときに「もう一度」を出した数 (数を変えたらやり直す)
+function openDone(c, batchId = null) {
   if (!can('task.status.change')) return;
   doneTarget = c.id;
-  $('#doneName').textContent = c.title;
+  // ⭐どのまとまりを作り終えたか。指定が無ければ手元のぶん (まとまりが 1 つならサーバーに任せる)
+  doneBatch = batchId != null ? batchId : homeBatchId(c);
+  doneConfirmed = null;
+  const fb = doneBatch != null ? (c.batches || []).find((x) => sameId(x.id, doneBatch)) : null;
+  $('#doneName').textContent = c.title + (fb && (c.batches || []).filter((x) => x.work_status !== 'cancelled').length > 1
+    ? '（' + facilityName(fb.facility_code || c.facility_code) + ' の '
+      + (fb.planned_qty == null ? '' : fb.planned_qty + ' 個ぶん') + '）' : '');
   $('#doneMsg').textContent = '';
-  $('#doneBody').innerHTML = dqPanelHtml(c, '', { title: '何個できましたか', memo: false, defaultAll: true });
+  $('#doneBody').innerHTML = dqPanelHtml(dqSubject(c, doneBatch), '', { title: '何個できましたか', memo: false, loss: true });
   // 押しまちがい用 (監修): このカードのタイマーを止めた直後だけ「まちがえた」を出す (サーバーは 60 秒まで受ける)
   $('#doneUndo').hidden = !(lastStop && sameId(lastStop.pid, c.id) && Date.now() - lastStop.at < 55000);
   openOverlay('#doneOv');
   $('#doneTitle').focus();
 }
-function closeDone() { if (doneSaving) return; closeOverlay('#doneOv'); doneTarget = null; $('#doneBody').innerHTML = ''; }
+function closeDone() { if (doneSaving) return; closeOverlay('#doneOv'); doneTarget = null; doneBatch = null; doneConfirmed = null; $('#doneBody').innerHTML = ''; }
 $('#doneOv').addEventListener('click', e => { if (e.target === $('#doneOv')) closeDone(); });
 async function submitDone() {
   if (doneSaving || doneTarget == null || !worker) return;
@@ -4460,6 +5216,20 @@ async function submitDone() {
   if (!c) { closeDone(); return; }
   const v = dqValues('#doneBody');
   if (v.qty != null && (!Number.isInteger(v.qty) || v.qty < 0)) { $('#doneMsg').textContent = '❌ できた数は 0 以上の整数で入れてください'; return; }
+  if (v.loss != null && (!Number.isInteger(v.loss) || v.loss < 0)) { $('#doneMsg').textContent = '❌ 作れなかった数は 0 以上の整数で入れてください'; return; }
+  // ⭐予定と大きく違うときは、止めずにもう一度だけ確かめる (Codex R3: 差が大きい場合は止めずに確認)
+  // ⭐「5 個より多い **か** 1 割より多い」ずれで確かめる。max だと「両方超えたとき」になり、
+  //   1000 個の予定で 1010 個 (10 個ちがい) が素通りしていた (Codex R1 中)
+  // ⭐比べる相手は**選んだまとまりの予定数** (カード合計ではない — Codex R2 重大1)
+  const subj = dqSubject(c, doneBatch);
+  const far = v.qty != null && subj.qty != null && (Math.abs(v.qty - subj.qty) > 5 || Math.abs(v.qty - subj.qty) > subj.qty * 0.1);
+  if (far && doneConfirmed !== v.qty) {
+    doneConfirmed = v.qty;
+    const d = v.qty - subj.qty;
+    $('#doneMsg').textContent = '⚠ つくる数 ' + subj.qty + ' 個に対して ' + v.qty + ' 個 ('
+      + (d > 0 ? '+' : '') + d + ' 個) です。これでよければ、もう一度押してください';
+    return;
+  }
   doneSaving = true;
   for (const id of ['doneGo', 'doneLater']) document.getElementById(id).disabled = true;
   $('#doneMsg').textContent = '保存中…';
@@ -4467,7 +5237,10 @@ async function submitDone() {
   try {
     j = await apiFetch('/api/status', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: c.id, to: 'ready_for_stocking', worker_id: worker.id, expect_version: c.version,
-        ...(v.qty != null ? { done_qty: v.qty } : {}) }) });
+        ...(doneBatch ? { batch_id: doneBatch } : {}),
+        ...(v.qty != null ? { done_qty: v.qty } : {}),
+        ...(v.loss !== undefined ? { loss_qty: v.loss } : {}),
+        ...(v.note !== undefined ? { variance_note: v.note } : {}) }) });
   } finally {
     doneSaving = false;
     for (const id of ['doneGo', 'doneLater']) document.getElementById(id).disabled = false;
@@ -4476,11 +5249,14 @@ async function submitDone() {
     applyTask(c, j.task);
     c.status = j.status;
     if (j.status_label) c.status_label = j.status_label;
-    closeOverlay('#doneOv'); doneTarget = null; $('#doneBody').innerHTML = '';
-    renderTabs(); renderList();
-    if (sameId(curDetail, c.id)) renderDetail(c);
-    if (curView === 'board') renderBoard();
+    const wasSplit = (c.batches || []).filter((x) => x.work_status !== 'cancelled').length > 1;
+    closeOverlay('#doneOv'); doneTarget = null; doneBatch = null; $('#doneBody').innerHTML = '';
     toast('「棚入待ち」にしました。棚に入れたら職員が「終了」にします');
+    // ⭐分かれたカードは、行の数・進捗をサーバーが持っているので取り直す (画面で組み立て直さない)
+    if (wasSplit) await loadState();
+    renderTabs(); renderList();
+    if (curView === 'board') renderBoard();
+    if (sameId(curDetail, c.id)) { if (wasSplit) openDetail(c.id); else renderDetail(c); }
     return;
   }
   if (j.error === 'conflict' && j.current) { applyTask(c, j.current); c.status = j.current.status; if (sameId(curDetail, c.id)) renderDetail(c); }
@@ -4650,7 +5426,7 @@ function renderCrew() {
   const chunk = (label, ws) => (ws.length ? '<div class="gsec">' + label + '</div><div class="crew">' + ws.map(person).join('') + '</div>' : '');
   const members = state.workers.filter(w => w.worker_type === 'member');
   const staff = state.workers.filter(w => w.worker_type === 'staff');
-  $('#crewBody').innerHTML = (chunk('利用者', members) + chunk('職員', staff)) ||
+  $('#crewBody').innerHTML = (chunk('利用者', members) + chunk('職員', staff) + headcountHtml(c)) ||
     '<p style="color:var(--faint)">作業者がまだ登録されていません。職員の方が管理画面から追加してください。</p>';
   const names = [...crewSel].map(id => (state.workers.find(w => w.id === id) || {}).display_name).filter(Boolean);
   $('#crewSum').innerHTML = names.length
@@ -4663,6 +5439,91 @@ function renderCrew() {
     ? (names.length ? '＋ ' + names.length + '人を追加する' : '＋ 人を追加する')
     : (names.length ? '▶ ' + names.length + '人で作業をはじめる' : '▶ 作業をはじめる');
 }
+/**
+ * 👥 人数だけではじめる (要件 §AB-10)。パレット・ジョブサポは いろは の中で作業するが、
+ * 個人名は持たないので「拠点 × 何人」で 1 行にする。
+ *
+ * ⭐**職員だけ**。許可が無ければ描かない (要件 §U-7)。
+ * ⭐出すのは「いろはの中で作業する外部の事業者」だけ — 物を持ち帰る拠点 (羅針盤・ワークセンター) は
+ *   向こうで作業するので、こちらで時間を測らない。いろは 自身は工賃の計算に個人の記録が要る
+ */
+function headcountFacilities() {
+  return ((boardState() || {}).facilities || []).filter((f) => f.external && !f.offsite);
+}
+function headcountHtml(c) {
+  if (!stateCan('task.work.crew') || !isApp()) return '';
+  const facs = headcountFacilities();
+  if (!facs.length) return '';
+  // すでに人数だけの記録がある拠点は、もう一度はじめられない (拠点 × カードで 1 本)
+  const busy = new Set((c.active || []).filter((a) => !a.worker_name).map((a) => a.facility_code));
+  const able = facs.filter((f) => !busy.has(f.code));
+  const done = facs.filter((f) => busy.has(f.code));
+  return '<div class="gsec">人数だけで記録する（名前を出さない）</div>' +
+    '<div class="hcnt">' +
+      done.map((f) => '<div class="hrow ro">' + esc(f.name) + ' はいま作業中です</div>').join('') +
+      able.map((f) =>
+        '<div class="hrow"><b>' + esc(f.name) + '</b>' +
+          '<input type="number" inputmode="numeric" min="1" max="50" step="1" placeholder="人数" ' +
+            'id="hc-' + esc(f.code) + '" aria-label="' + esc(f.name) + ' の人数">' +
+          '<span>人</span>' +
+          '<button type="button" class="btn" data-hcgo="' + esc(f.code) + '">▶ この人数ではじめる</button>' +
+        '</div>').join('') +
+    '</div>' +
+    '<p class="hint">パレット・ジョブサポは いろは の中で作業しますが、個人の名前は記録しません。' +
+      '実測は「時間 × 人数」で数えます。</p>';
+}
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-hcgo]');
+  if (b) startHeadcount(b.dataset.hcgo);
+});
+/** @returns true = はじめられた / 'blocked' = 止まっているので確認を出した / false = 断られた */
+async function startHeadcount(facilityCode, opts) {
+  if (!stateCan('task.work.crew') || !isApp()) return false;
+  if (!worker) { openGate(); return false; }
+  const c = findCard(crewCard);
+  if (!c) return false;
+  // ⭐確認ダイアログから戻ってきたときは、そのとき入れた人数をそのまま使う。
+  //   画面の入力欄を読み直すと、確認している間に触られた値で始めてしまう
+  const el = document.getElementById('hc-' + facilityCode);
+  const n = opts && opts.crewSize != null ? Number(opts.crewSize) : (el ? Number(String(el.value).trim()) : NaN);
+  if (!Number.isInteger(n) || n < 1 || n > 50) {
+    $('#crewMsg').textContent = '❌ 人数を 1〜50 の整数で入れてください';
+    if (el) el.focus();
+    return false;
+  }
+  $('#crewMsg').textContent = '保存中…';
+  const j = await apiFetch('/api/sessions/start-crew', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, worker_id: worker.id, facility_code: facilityCode, crew_size: n,
+      // ⭐まとまりが 1 つなら選ばせない (操作は今までどおり)。2 つ以上なら決めずに送る
+      batch_id: homeBatchId(c) ?? undefined,
+      ...(opts && opts.clearBlock ? { clear_block: true, expect_version: c.version } : {}) }),
+  });
+  if (!j.ok) {
+    if (j.error === 'blocked') {
+      if (j.task) applyTask(c, j.task);
+      $('#crewMsg').textContent = '';
+      openUnblock(c, null, { facilityCode, crewSize: n });   // 人数はここで固定する
+      return 'blocked';
+    }
+    $('#crewMsg').textContent = '❌ ' + (j.message || 'はじめられませんでした');
+    return planError(j, () => startHeadcount(facilityCode, opts), { silent: true });
+  }
+  if (j.staff_mode) state.staff_mode = j.staff_mode;
+  if (j.task) applyTask(c, j.task);
+  $('#crewMsg').textContent = '';
+  closeCrew();
+  // ⭐**保存された人数**で知らせる。別の端末が先に 3 人ではじめていたら、こちらが 5 人と入れても
+  //   記録は 3 人のまま (拠点 × カードで 1 本)。入れた数をそのまま出すと、工賃のもとになる
+  //   数字と職員の思っている数がずれる (Codex R3 中2)
+  const saved = (j.session && j.session.crewSize) || n;
+  toast(j.already
+    ? facilityName(facilityCode) + ' はすでに ' + saved + '人で作業中です'
+    : facilityName(facilityCode) + ' ' + saved + '人ではじめました');
+  openDetail(c.id);
+  return true;
+}
+
 async function crewStart() {
   const ids = [...crewSel];
   if (!ids.length) return;             // ボタンは disabled だが、二重に守る
@@ -4680,30 +5541,75 @@ async function crewStart() {
  * @param opts { clearBlock } 止まっている札を外して始める (確認ダイアログで「はい」を押した後)
  * @returns true = 開始できた / 'blocked' = 止まっているので確認を出した / false = 断られた
  */
+/** ⭐選んだぶん (opts.batchId) が優先。無ければ画面が 1 つに絞れたぶん。どちらも無ければ null */
+function pickedBatch(c, opts) {
+  if (opts && opts.batchId) return opts.batchId;
+  return homeBatchId(c);
+}
+/**
+ * ⭐**どのぶんの作業かを選ぶ** (要件 §AB-10)。手元のまとまりが 2 つ以上あって、
+ * 画面が 1 つに絞れないときだけ出す。ふだん (1 つ) は今までどおり出ない。
+ *
+ * 選ばずに始めると、作業時間が「どのぶんか分からない」まま残る (batch_id が NULL) — あとから
+ * どのぶんに何分かかったか言えなくなるので、ここで決めてもらう。
+ */
+function openWorkBatchPick(c, ids, opts) {
+  const home = homeBatches(c);
+  $('#askTitle').textContent = 'どのぶんの作業をはじめますか?';
+  const t = $('#askText');
+  t.textContent = 'このカードは作業が分かれています。いま手をつけるぶんを選んでください。';
+  const box = document.createElement('div');
+  box.className = 'chips';
+  box.id = 'wbPick';
+  box.innerHTML = home.map((b) => '<button type="button" class="chip" data-wb="' + b.id + '">' +
+    esc(facilityName(b.facility_code) || 'いろは') + ' ' + esc(String(b.planned_qty == null ? '数不明' : b.planned_qty + ' 個')) +
+    (b.expiry ? ' ・ 期限 ' + esc(b.expiry) : '') +
+    (b.work_status === 'in_progress' ? ' (作業中)' : '') + '</button>').join('');
+  t.appendChild(box);
+  box.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-wb]');
+    if (!b) return;
+    closeOverlay('#askOv');
+    startWork(ids, { ...(opts || {}), batchId: Number(b.dataset.wb) });
+  });
+  openOverlay('#askOv');
+}
 async function startWork(ids, opts) {
   if (!can('task.work.start')) return false;   // 読むだけ (下見・履歴) では始めない
   if (!worker) { openGate(); return false; }
   if (!curDetail || !ids || !ids.length) return false;
   const cur = findCard(curDetail);
+  // ⭐手元のまとまりが 2 つ以上あって絞れないなら、先に選んでもらう (§AB-10)
+  if (!pickedBatch(cur, opts) && homeBatches(cur).length > 1) { openWorkBatchPick(cur, ids, opts); return false; }
+  // 🚨分かれているのに**手元に作業できるぶんが 1 つも無い**なら、押しても意味が無い
+  //   (全部外に預けたか、もう棚入待ち)。黙って始めると、どのぶんか分からない作業時間だけが残る
+  if (!pickedBatch(cur, opts) && (cur && cur.batches || []).filter((x) => x.work_status !== 'cancelled').length > 1
+    && homeBatches(cur).length === 0) {
+    showErr('いま手をつけられるぶんがありません', '外に預けているか、もう棚入待ちです。まとまりの一覧を見てください');
+    return false;
+  }
   const j = await apiFetch('/api/sessions/start', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     // 札を外して始めるときは、確認した版 (expect_version) も送る — 確認している間に理由が付け替わっていたら断られる
     body: JSON.stringify({ id: curDetail, worker_id: worker.id, worker_ids: ids,
+      // ⭐どのぶんの作業か (§AB-10)。選んであればそれ、無ければ画面が 1 つに絞れたぶん
+      ...(pickedBatch(cur, opts) ? { batch_id: pickedBatch(cur, opts) } : {}),
       ...(opts && opts.clearBlock ? { clear_block: true, expect_version: cur ? cur.version : undefined } : {}) }),
   });
   if (!j.ok) {
     // ⛔ 止まっている札が付いたまま → 「解消しましたか?」を聞いてから clear_block で送り直す (案A)
     if (j.error === 'blocked') {
       if (cur && j.task) applyTask(cur, j.task);
-      openUnblock(cur || { title: '', blocked: j.blocked }, ids);
+      // ⭐選んだぶんを預ける (札を外したあと、もう一度選ばせない)
+      openUnblock(cur || { title: '', blocked: j.blocked }, ids, undefined, pickedBatch(cur, opts));
       return 'blocked';
     }
     // 確認している間に札が変わった (別の端末が理由を付け替えた / 外した) → 最新で描き直して、もう一度確認
     if (j.error === 'conflict' && opts && opts.clearBlock && cur && j.current) {
       applyTask(cur, j.current);
       renderList(); if (sameId(curDetail, cur.id)) renderDetail(cur);
-      if (cur.blocked) { openUnblock(cur, ids); toast('止まっている理由が変わっていました。もう一度確かめてください'); return 'blocked'; }
-      return startWork(ids);   // もう外れていた → 普通に始める
+      if (cur.blocked) { openUnblock(cur, ids, undefined, pickedBatch(cur, opts)); toast('止まっている理由が変わっていました。もう一度確かめてください'); return 'blocked'; }
+      return startWork(ids, pickedBatch(cur, opts) ? { batchId: pickedBatch(cur, opts) } : undefined);   // もう外れていた → 普通に始める
     }
     showErr(j.message || '作業をはじめられませんでした');
     return false;
@@ -4824,6 +5730,527 @@ async function stopWork(reason, only, opts) {
     if (m) m.textContent = 'できあがりです! 棚に入れ終わったら「棚入完了」を (職員PINが必要です)';
   }
 }
+// ─── 🚚 外部にあずける (要件 §AB-7)。職員だけ ───
+let cgTarget = null;      // { taskId, batchId } または { consignmentId, action }
+let cgSaving = false;
+let cgPickedBatch = null; // 渡せるぶんが 2 つ以上あるとき、選んだもの
+let cgKeep = null;        // ⭐どのぶんかを選び直したときに、入れかけの拠点・数・期限を持ち越す (Codex R3 中3)
+/** いま入っている拠点・数・期限を読む (選び直しで消さないため) */
+function cgReadInputs() {
+  const fac = $('#cgFacs') && $('#cgFacs').querySelector('.chip.on');
+  const due = $('#cgDue') && $('#cgDue').querySelector('.chip.on');
+  const q = $('#cgBody').querySelector('.cgQty');
+  return { fac: fac ? fac.dataset.cgfac : null, due: due ? due.dataset.cgdue : null, qty: q ? String(q.value) : '' };
+}
+
+/** 預けられる拠点 = 物を持ち帰るところ (羅針盤・ワークセンター) だけ。パレット・ジョブサポは いろは の中で作業する */
+function externalFacilities() {
+  return ((boardState() || {}).facilities || []).filter((f) => f.offsite);
+}
+/**
+ * ⭐施設の受け入れ枠 (要件 §AB-8)。何個まで預けてよさそうかを決める材料。
+ * 主に見るのは想定作業時間 (個数は商品ごとに入数も工程数も違うので比べにくい)。
+ * ⭐枠が決まっていなければ「目安 未設定」と出す (0 と書かない)
+ *
+ * ⭐**目安とハード上限を混ぜて書かない** (Codex R1 軽微4)。
+ *   目安 = 超えても止めない → 「止めはしません」。
+ *   箱数を守らせる拠点 = サーバーが本当に断る → 「これ以上は渡せません」。
+ *   説明と実際の結果が逆になると、職員は画面を信じなくなる。
+ */
+function capacityHtml(code, loads) {
+  // ⭐残高は**その画面が取ってきたもの**を使う。省くとボードの分 (最大 60 秒古い) を見る
+  const l = (loads || (boardState() || {}).facility_loads || {})[code];
+  if (!l) return '';
+  const num = (v) => esc(String(Math.round(v * 10) / 10));
+  const hoursTxt = l.capacity_hours != null
+    ? '<b>' + num(l.hours) + '</b> / 目安 <b>' + num(l.capacity_hours) + '</b> 時間'
+    : '<b>' + num(l.hours) + '</b> 時間 <span class="unset">(目安 未設定)</span>';
+  const pct = l.capacity_hours ? Math.min(100, Math.round((l.hours / l.capacity_hours) * 100)) : 0;
+  const boxesTxt = l.capacity_boxes != null
+    ? '<b>' + esc(String(l.boxes)) + '</b> / ' + esc(String(l.capacity_boxes)) + ' 箱'
+      + (l.boxes_hard ? '（ここまで）' : '')
+    : '<b>' + esc(String(l.boxes)) + '</b> 箱 <span class="unset">(目安 未設定)</span>';
+  // ⭐ハード上限 = サーバーが本当に断るほう。ここで「止めはしません」と書いてはいけない
+  const hard = !!l.boxes_hard && l.capacity_boxes != null;
+  const room = hard ? Math.max(0, l.capacity_boxes - l.boxes) : null;
+  let hardMsg = '';
+  if (hard && l.boxes_unknown > 0) {
+    hardMsg = '🚫 ' + esc(facilityName(code)) + ' は置ける箱数を守る決まりです。いま置いてあるぶんに'
+      + '入数が登録されていないものがあり、空きを数えられないので<b>渡せません</b>。先にその入数を登録してください';
+  } else if (hard) {
+    hardMsg = room > 0
+      ? '🚫 ' + esc(facilityName(code)) + ' は置ける箱数を守る決まりです。<b>あと ' + esc(String(room))
+        + ' 箱ぶんまで</b>で、これを超えるぶんは渡せません'
+      : '🚫 ' + esc(facilityName(code)) + ' は置ける箱数を守る決まりで、いっぱいです。<b>これ以上は渡せません</b>';
+  }
+  // ⭐目安を超えただけのほう = 止めない。**何の目安か**を名前で言う (Codex R2 軽微1)。
+  //   時間の超過とハード上限は同時に起きる。「止めはしません」と「渡せません」が
+  //   主語なしで並ぶと、職員はどちらが本当か分からなくなる
+  const softs = [];
+  if (l.over_hours) softs.push('想定作業時間');
+  if (l.over_boxes && !hard) softs.push('箱数');          // 守らせる箱数は下の「渡せません」で言う
+  const softMsg = softs.length
+    ? '⚠ ' + softs.join('と') + 'が目安を超えています。これは目安なので止めはしません。渡してよいか職員で確かめてください'
+    : '';
+  return '<div class="cap' + (softMsg || (hard && room === 0) ? ' over' : '') + '">' +
+    'いま ' + facilityName(code) + ' にあるぶん: ' + hoursTxt + ' ・ ' + boxesTxt +
+    ' ・ ' + esc(String(l.count)) + ' 件 ・ ' + esc(String(l.qty)) + ' 個' +
+    (l.capacity_hours != null ? '<div class="bar"><i style="width:' + pct + '%"></i></div>' : '') +
+    (l.hours_unknown > 0 ? '<div class="unset">※ 工程数が登録されていない ' + esc(String(l.hours_unknown)) + ' 件は時間に入れていません</div>' : '') +
+    (l.boxes_unknown > 0 ? '<div class="unset">※ 入数が登録されていない ' + esc(String(l.boxes_unknown)) + ' 件は箱数に入れていません</div>' : '') +
+    (softMsg ? '<div class="warn">' + softMsg + '</div>' : '') +
+    (hardMsg ? '<div class="stop">' + hardMsg + '</div>' : '') +
+    '</div>';
+}
+/**
+ * 🚚 預ける計画への入口 (要件 §AB-11 の 7b)。
+ * ⭐**許可の無い人には入口を描かない** (要件 §U-7)。ボタンを出して押したら断る、はしない。
+ * ⭐預けが 1 つも無いうちは出さない (使わないボタンを画面に置かない)。
+ */
+function consignPlanButtonHtml() {
+  if (!isApp() || !stateCan('task.consign')) return '';
+  const p = (boardState() || {}).consign_plan;
+  if (!p || (!p.to_prepare && !p.to_hand && !p.out)) return '';
+  const parts = [];
+  if (p.to_prepare) parts.push('用意する ' + p.to_prepare + ' 件');
+  if (p.to_hand) parts.push('渡す ' + p.to_hand + ' 件');
+  if (p.out) parts.push('外に ' + p.out + ' 件');
+  const sub = parts.join(' ・ ') + (p.overdue ? ' ・ ⚠ 期限ごえ ' + p.overdue + ' 件' : '');
+  return '<button class="planbtn cg" onclick="setView(\'cplan\')"><span class="ic">🚚</span>' +
+    '<span>預ける計画</span><span class="sub">' + esc(sub) + '</span><span class="chev">›</span></button>';
+}
+
+/** 入数で丸める。70 個入りなら 500 ではなく 490 (要件 §AB-9) */
+function roundToPack(n, per) {
+  if (!per || per <= 0 || n <= per) return n;
+  return Math.max(per, Math.floor(n / per) * per);
+}
+function openConsign() {
+  const c = findCard(curDetail);
+  if (!c || !can('task.consign')) return;
+  if (!worker) { openGate(); return; }
+  // ⭐渡せるぶん・渡せる数は**サーバーが決めた値**を使う。画面が予定数から自分で出すと、
+  //   「押したら断られる」ことになる (Codex R1 中7)
+  const able = (c.batches || []).filter((x) => !x.consignable_why && (x.consignable_max == null || x.consignable_max > 0));
+  if (able.length === 0) {
+    const why = (c.batches || []).map((x) => x.consignable_why).filter(Boolean)[0];
+    showErr(why || 'いま渡せるぶんがありません');
+    return;
+  }
+  // ⭐渡せるぶんが 2 つ以上あるときは選んでもらう (渡さなかったぶんが手元に戻ると起きる — Codex R2 中7)。
+  //   1 つならそのまま (ふだんはこちら)
+  const b = able.find((x) => x.id === cgPickedBatch) || able.find((x) => !x.facility_code || x.facility_code === 'iroha') || able[0];
+  const facs = externalFacilities();
+  if (facs.length === 0) { showErr('物を持ち帰る拠点が登録されていません'); return; }
+  cgTarget = { taskId: c.id, batchId: b.id, max: b.consignable_max };
+  cgPickedBatch = b.id;
+  $('#cgTitle').textContent = '🚚 外部にあずける';
+  $('#cgName').textContent = c.title + '（渡せるのは ' + (b.consignable_max == null ? '数不明' : b.consignable_max + ' 個') + '）';
+  $('#cgMsg').textContent = '';
+  const per = (c.master && c.master.units_per_container) || null;
+  // 🌱 はじめての商品は「半分」をすすめる。⭐数は勝手に入れない (要件 §AB-9)
+  const room = b.consignable_max;
+  const half = room != null ? roundToPack(Math.floor(room / 2), per) : null;
+  $('#cgBody').innerHTML =
+    '<div class="dq">' +
+    // 渡せるぶんが 2 つ以上あるときだけ、どのぶんかを選ぶ
+    (able.length > 1 ? '<label>どのぶんを渡しますか</label><div class="chips" id="cgBatches">' +
+      able.map((x) => '<button type="button" class="chip' + (x.id === b.id ? ' on' : '') + '" data-cgbatch="' + x.id + '">' +
+        esc(x.facility_code && x.facility_code !== 'iroha' ? facilityName(x.facility_code) + ' ' : '') +
+        esc(String(x.consignable_max == null ? '数不明' : x.consignable_max + ' 個')) + '</button>').join('') +
+      '</div>' : '') +
+    '<label' + (able.length > 1 ? ' style="margin-top:12px"' : '') + '>どこへ渡しますか</label>' +
+    '<div class="chips" id="cgFacs">' + facs.map((f, i) =>
+      '<button type="button" class="chip' + (i === 0 ? ' on' : '') + '" data-cgfac="' + esc(f.code) + '">' + esc(f.name) + '</button>').join('') + '</div>' +
+    // ⭐その施設に「いま何時間ぶん・何箱あるか」。何個まで預けてよさそうかを、これを見て決める (要件 §AB-8)
+    '<div id="cgCap">' + capacityHtml(facs[0].code) + '</div>' +
+    '<label style="margin-top:12px">何個わたしますか</label>' +
+    '<div class="row"><input class="cgQty" type="number" inputmode="numeric" min="1" step="1" placeholder="—">' +
+      '<span class="of">／ 渡せるのは ' + (room == null ? '—' : room) + ' 個まで</span></div>' +
+    (c.first_time && half ? '<p class="sub warn">🌱 はじめての商品です。まず半分の ' + half + ' 個を預けるのがおすすめです</p>' +
+      '<div class="quick"><button type="button" data-cgq="' + half + '">' + half + '個にする</button>' +
+      (room != null ? '<button type="button" data-cgq="' + room + '">ぜんぶ ' + room + '個</button>' : '') + '</div>'
+      : '<div class="quick">' + (half ? '<button type="button" data-cgq="' + half + '">半分 ' + half + '個</button>' : '') +
+        (room != null ? '<button type="button" data-cgq="' + room + '">ぜんぶ ' + room + '個</button>' : '') + '</div>') +
+    '<label style="margin-top:12px">いつまでに返してもらいますか（任意）</label>' +
+    '<div class="chips" id="cgDue">' +
+      '<button type="button" class="chip" data-cgdue="7">1週間後</button>' +
+      '<button type="button" class="chip" data-cgdue="14">2週間後</button>' +
+      '<button type="button" class="chip on" data-cgdue="">決めない</button></div>' +
+    '</div>' +
+    '<div class="mbtns"><button class="btn" onclick="closeConsign()">やめる</button>' +
+    '<button class="btn primary" id="cgGo" onclick="submitConsign()">この内容で渡す</button></div>';
+  // ⭐選び直す前に入れていた拠点・期限・数を戻す (描き直しで消さない — Codex R3 中3)。数は上限を超えていても入れたまま (送るときに断る)
+  if (cgKeep) {
+    const k = cgKeep; cgKeep = null;
+    if (k.fac) for (const x of $('#cgFacs').querySelectorAll('.chip')) x.classList.toggle('on', x.dataset.cgfac === k.fac);
+    if (k.due != null) for (const x of $('#cgDue').querySelectorAll('.chip')) x.classList.toggle('on', x.dataset.cgdue === k.due);
+    const q = $('#cgBody').querySelector('.cgQty'); if (q && k.qty !== '') q.value = k.qty;
+  }
+  openOverlay('#cgOv');
+  $('#cgTitle').focus();
+}
+function closeConsign() { if (cgSaving) return; closeOverlay('#cgOv'); cgTarget = null; cgPickedBatch = null; cgKeep = null; $('#cgBody').innerHTML = ''; }
+$('#cgOv').addEventListener('click', (e) => { if (e.target === $('#cgOv')) closeConsign(); });
+// 選択肢 (拠点・数・期限)
+document.addEventListener('click', (e) => {
+  const f = e.target.closest('[data-cgfac]');
+  if (f) {
+    for (const x of $('#cgFacs').querySelectorAll('.chip')) x.classList.toggle('on', x === f);
+    const cap = $('#cgCap');                      // 選んだ拠点の残高に入れ替える
+    if (cap) cap.innerHTML = capacityHtml(f.dataset.cgfac);
+    return;
+  }
+  const d = e.target.closest('[data-cgdue]');
+  if (d) { for (const x of $('#cgDue').querySelectorAll('.chip')) x.classList.toggle('on', x === d); return; }
+  const q = e.target.closest('[data-cgq]');
+  if (q) { const el = $('#cgBody').querySelector('.cgQty'); if (el) el.value = q.dataset.cgq; return; }
+  const bb = e.target.closest('[data-cgbatch]');
+  if (bb) { cgKeep = cgReadInputs(); cgPickedBatch = Number(bb.dataset.cgbatch); openConsign(); }   // 選び直して描き直す (入力は持ち越す)
+});
+/** 「いつまでに」= 今日から N 日後 (JST)。サーバーには YYYY-MM-DD で渡す */
+function dueYmd(days) {
+  if (!days) return null;
+  const base = (state && state.today) ? new Date(state.today + 'T00:00:00Z') : new Date();
+  base.setUTCDate(base.getUTCDate() + Number(days));
+  return base.toISOString().slice(0, 10);
+}
+async function submitConsign() {
+  if (cgSaving || !cgTarget || !worker) return;
+  const c = findCard(cgTarget.taskId);
+  if (!c) { closeConsign(); return; }
+  const fac = $('#cgFacs').querySelector('.chip.on');
+  const qtyEl = $('#cgBody').querySelector('.cgQty');
+  const qty = qtyEl ? Number(String(qtyEl.value).trim()) : NaN;
+  if (!fac) { $('#cgMsg').textContent = '❌ どこへ渡すかを選んでください'; return; }
+  if (!Number.isInteger(qty) || qty <= 0) { $('#cgMsg').textContent = '❌ 何個わたすかを入れてください'; return; }
+  if (cgTarget.max != null && qty > cgTarget.max) { $('#cgMsg').textContent = '❌ 渡せるのは ' + cgTarget.max + ' 個までです'; return; }
+  const due = ($('#cgDue').querySelector('.chip.on') || {}).dataset;
+  cgSaving = true;
+  $('#cgGo').disabled = true;
+  $('#cgMsg').textContent = '保存中…';
+  let j;
+  try {
+    j = await apiFetch('/api/consign', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: c.id, batch_id: cgTarget.batchId, facility_code: fac.dataset.cgfac, qty,
+        due_date: dueYmd(due && due.cgdue), worker_id: worker.id, expect_version: c.version }) });
+  } finally { cgSaving = false; const g = $('#cgGo'); if (g) g.disabled = false; }
+  if (j.ok) {
+    if (j.staff_mode) state.staff_mode = j.staff_mode;
+    applyTask(c, j.task);
+    closeOverlay('#cgOv'); cgTarget = null; $('#cgBody').innerHTML = '';
+    toast(facilityName(fac.dataset.cgfac) + ' に ' + qty + ' 個 わたす予定にしました');
+    openDetail(c.id);   // 預けの記録を出すため取り直す
+    return;
+  }
+  $('#cgMsg').textContent = '❌ ' + (j.message || 'できませんでした');
+  // 職員モードが切れていたら PIN を聞いて、同じ内容をもう一度送る (計画の操作と同じ流儀)
+  return planError(j, () => submitConsign(), { silent: true });
+}
+
+// ══════════ 🚚 預ける計画 (要件 §AB-11 の 7b) ══════════
+let cplan = null;          // サーバーから取った預ける計画
+let cplanFac = 'all';      // 見ている拠点
+
+async function loadConsignPlan() {
+  $('#cplanCol1').innerHTML = '<div class="cplanempty">読み込み中…</div>';
+  $('#cplanCol2').innerHTML = '';
+  $('#cplanCol3').innerHTML = '';
+  const j = await apiFetch('/api/consign-plan');
+  if (!j.ok) {
+    cplan = null;
+    $('#cplanCol1').innerHTML = '<div class="cplanempty">' + esc(j.message || '読み込めませんでした') + '</div>';
+    // 職員モードが切れていたら PIN を聞いて取り直す (明日の計画と同じ流儀)
+    return planError(j, () => loadConsignPlan(), { silent: true });
+  }
+  cplan = j;
+  if (j.staff_mode) state.staff_mode = j.staff_mode;
+  // ⭐ボードの入口の数もここで合わせる (戻ったときに古い数を見せない)
+  if (state) state.consign_plan = j.counts;
+  renderConsignPlan();
+}
+
+/**
+ * ⭐描いたものを消す (許可を失ったとき)。**隠すだけにしない** — hidden の画面に
+ * 押せるボタンが残っていると、職員モードが切れたあとに利用者が押せてしまう
+ * (明日の計画の clearPlanDom と同じ理由)
+ */
+function clearConsignPlanDom() {
+  for (const sel of ['#cplanFacs', '#cplanCap', '#cplanCol1', '#cplanCol2', '#cplanCol3']) {
+    const el = $(sel); if (el) el.innerHTML = '';
+  }
+  for (const sel of ['#cplanN1', '#cplanN2', '#cplanN3']) { const el = $(sel); if (el) el.textContent = '0'; }
+}
+function renderConsignPlan() {
+  if (!cplan) return;
+  // ⭐描き直すたびに許可を見る。取ってきたデータが手元にあるからといって、
+  //   許可を失ったあとに拠点を選び直してボタンを描き直さない (Codex R2 中1)
+  if (!isApp() || !stateCan('task.consign')) {
+    cplan = null;
+    clearConsignPlanDom();
+    if (curView === 'cplan') setView('board');
+    return;
+  }
+  const facs = cplan.facilities || [];
+  if (cplanFac !== 'all' && !facs.some((f) => f.code === cplanFac)) cplanFac = 'all';
+  $('#cplanFacs').innerHTML = ['all', ...facs.map((f) => f.code)].map((code) =>
+    '<button type="button" class="chip' + (code === cplanFac ? ' on' : '') + '" data-cplanfac="' + esc(code) + '">' +
+      esc(code === 'all' ? 'すべて' : facilityName(code)) + '</button>').join('');
+  // 拠点を 1 つ選んでいるときだけ受け入れ枠を出す (すべてだと どこの枠か分からない)
+  $('#cplanCap').innerHTML = cplanFac === 'all' ? '' : capacityHtml(cplanFac, cplan.facility_loads);
+  const rows = (cplan.rows || []).filter((r) => cplanFac === 'all' || r.facility_code === cplanFac);
+  const cols = [['planned', '#cplanCol1', '#cplanN1', 'いま用意するものはありません'],
+                ['prepared', '#cplanCol2', '#cplanN2', '用意ずみのものはありません'],
+                ['handed', '#cplanCol3', '#cplanN3', '外に出ているものはありません']];
+  for (const [st, colSel, nSel, empty] of cols) {
+    const list = rows.filter((r) => r.state === st);
+    $(nSel).textContent = String(list.length);
+    $(colSel).innerHTML = list.length
+      ? list.map(cplanRowHtml).join('')
+      : '<div class="cplanempty">' + empty + '</div>';
+  }
+}
+
+/**
+ * 預けの 1 行。
+ * ⭐**入数が分からないものを 0 箱と書かない** (要件: 欠損値を 0 で代用しない)。
+ *   箱を用意する画面なので、分からないなら「分からない」と出して職員に登録してもらう。
+ */
+function cplanRowHtml(r) {
+  // ⭐その段の数が記録されていなければ、予定の数で埋めずに「分からない」と書く (要件 §AB-3)
+  const facts = [r.qty == null
+    ? '<span class="miss">数が記録されていません — カードで確かめてください</span>'
+    : '<span><b>' + esc(String(r.qty)) + '</b> 個</span>'];
+  if (r.qty != null) {
+    facts.push(r.boxes != null
+      ? '<span>箱 <b>' + esc(String(r.boxes)) + '</b> つ（' + esc(String(r.units_per_container)) + ' 個入り）</span>'
+      : '<span class="miss">入数が未登録 — 何箱いるか出せません</span>');
+  }
+  // ⭐同じカードから同じ拠点へ 2 回預けると行の中身がそろって同じになる。
+  //   現物と照らし合わせられる目印を必ず出す (Codex R1 中2)
+  facts.push('<span>まとまり #' + esc(String(r.seq)) + '</span>');
+  if (r.ar_no) facts.push('<span>入荷 ' + esc(r.ar_no) + '</span>');
+  if (r.storage_container) facts.push('<span>保管箱 ' + esc(r.storage_container) + '</span>');
+  if (r.material_code) facts.push('<span>資材 ' + esc(r.material_code) + '</span>');
+  if (r.expiry) facts.push('<span>期限 ' + esc(r.expiry) + '</span>');
+  if (cplanFac === 'all') facts.push('<span>🏢 ' + esc(facilityName(r.facility_code)) + '</span>');
+  if (r.state === 'handed') {
+    facts.push('<span>' + (r.handed_at ? esc(fmtDate(r.handed_at)) + ' にわたした' : 'わたした日は記録なし') + '</span>');
+    if (r.returned_total > 0) facts.push('<span>' + esc(String(r.returned_total)) + ' 個は返却ずみ</span>');
+  }
+  if (r.due_date) {
+    facts.push('<span' + (r.overdue ? ' class="late"' : '') + '>' + esc(r.due_date) + ' までに返却' +
+      (r.overdue ? '（期限を過ぎています）' : '') + '</span>');
+  }
+  // ⭐押せるものだけ描く (要件 §U-7)。ここでも見るのは、描き直しの入口が複数あるため
+  const acts = !stateCan('task.consign') ? ''
+    : r.state === 'handed'
+    ? '<button class="go" data-cg="return" data-cg-id="' + r.id + '">返却を受け取る</button>' +
+      '<button data-cg="settle" data-cg-id="' + r.id + '">返ってこないぶんを精算</button>'
+    : (r.state === 'planned' ? '<button class="go" data-cg="prepared" data-cg-id="' + r.id + '">用意できた</button>' : '') +
+      '<button class="' + (r.state === 'prepared' ? 'go' : '') + '" data-cg="handed" data-cg-id="' + r.id + '">渡しました</button>' +
+      '<button data-cg="cancel" data-cg-id="' + r.id + '">やめる</button>';
+  const open = findCard(r.task_id) ? '<button data-cplanopen="' + r.task_id + '">カードを開く</button>' : '';
+  return '<div class="crow' + (r.overdue ? ' over' : '') + '">' +
+    '<div class="t">' + esc(r.title || '(名称なし)') + '</div>' +
+    '<div class="facts">' + facts.join('') + '</div>' +
+    (acts || open ? '<div class="acts">' + acts + open + '</div>' : '') +
+    '</div>';
+}
+
+document.addEventListener('click', (e) => {
+  const f = e.target.closest('[data-cplanfac]');
+  if (f) { cplanFac = f.dataset.cplanfac; renderConsignPlan(); return; }
+  const o = e.target.closest('[data-cplanopen]');
+  if (o) openDetail(Number(o.dataset.cplanopen));
+});
+
+/**
+ * 渡した / やめる / 返却を受け取る。
+ * ⚠window.prompt / confirm は iOS のホーム画面アプリで出ないことがある (監修 R-1) ので、同じダイアログを使う
+ */
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-cg]');
+  if (!b) return;
+  openConsignAct(b.dataset.cg, Number(b.dataset.cgId));
+});
+// ⭐返ってきた物の「使える数」をあとから入れる (精算ずみでも)
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-cgfix]');
+  if (!b) return;
+  openReturnFix(Number(b.dataset.cgfixCg), Number(b.dataset.cgfix));
+});
+/**
+ * ⭐返ってきた物を数え終わってから「使える数」を入れる。
+ * 受け取るときは空のままでよいが、入れないとそのまとまりの「できた数」が決まらず棚入れに進めない。
+ * 精算ずみでも入れられる (数えるのは物が返ってきたあとで、精算より遅れることがある)。
+ */
+function openReturnFix(consignmentId, returnId) {
+  const src = cgSourceOf(consignmentId);
+  if (!src) return;
+  if (!(src.from === 'detail' ? can('task.consign') : stateCan('task.consign'))) return;
+  if (!worker) { openGate(); return; }
+  const row = (src.cg.returns || []).find((r) => r.id === returnId);
+  if (!row) return;
+  // ⭐開いたときの数を覚える (送るときに「触ったか」を見る)
+  cgTarget = { act: 'fix_return', id: consignmentId, returnId, version: src.cg.version, taskId: src.taskId, from: src.from,
+    wasGood: row.good_qty ?? null };
+  $('#cgTitle').textContent = '🚚 返ってきた物の数を入れる';
+  $('#cgName').textContent = src.title + '（' + fmtDate(row.returned_at) + ' に ' + row.returned_qty + ' 個 返ってきたぶん）';
+  $('#cgMsg').textContent = '';
+  $('#cgBody').innerHTML = '<div class="dq">' +
+    '<label>そのうち使えるのは何個ですか</label>' +
+    '<div class="row"><input class="cgGood" type="number" inputmode="numeric" min="0" step="1" value="' +
+      esc(row.good_qty == null ? '' : String(row.good_qty)) + '" placeholder="—"><span class="of">／ 返ってきたのは ' +
+      esc(String(row.returned_qty)) + ' 個</span></div>' +
+    '<label style="margin-top:12px">ひとこと（任意）</label>' +
+    '<input class="cgNote" type="text" maxlength="300" value="' + esc(row.note || '') + '" placeholder="例: 30 個は割れていた">' +
+    '<p class="sub">空のままにすると「まだ数えていない」ままです。数が入るまで、このぶんは棚入れに進めません。</p>' +
+    '</div>' +
+    '<div class="mbtns"><button class="btn" onclick="closeConsign()">やめる</button>' +
+    '<button class="btn primary" id="cgGo" onclick="submitConsignAct()">この数で記録する</button></div>';
+  openOverlay('#cgOv');
+  $('#cgTitle').focus();
+}
+/**
+ * ⭐預けの記録は 2 か所から開ける — カードの詳細と、預ける計画の画面。
+ * どちらから開いても**同じダイアログ・同じ言い方**にする (画面ごとに言い方を変えない)。
+ * いま見ている画面のものを先に探す — 詳細を開いたままボードへ戻っていることがあるため。
+ */
+function cgSourceOf(consignmentId) {
+  const fromPlan = () => {
+    const r = cplan && (cplan.rows || []).find((x) => x.id === consignmentId);
+    return r ? { cg: r, title: r.title, taskId: r.task_id, from: 'cplan' } : null;
+  };
+  const fromCard = () => {
+    const c = findCard(curDetail);
+    const x = c && (c.consignments || []).find((y) => y.id === consignmentId);
+    return x ? { cg: x, title: c.title, taskId: c.id, from: 'detail' } : null;
+  };
+  // 詳細が開いていれば、いま見ているのはそちら (預ける計画の上から開くこともできる)
+  return document.body.classList.contains('detail-open') ? (fromCard() || fromPlan()) : (fromPlan() || fromCard());
+}
+function openConsignAct(action, consignmentId) {
+  const src = cgSourceOf(consignmentId);
+  if (!src) return;
+  // 許可は開いた画面のもので見る (詳細はカードの許可、預ける計画は一覧の許可)
+  if (!(src.from === 'detail' ? can('task.consign') : stateCan('task.consign'))) return;
+  if (!worker) { openGate(); return; }
+  const cg = src.cg;
+  const left = (cg.handed_qty != null ? cg.handed_qty : cg.planned_qty) - (cg.returned_total || 0);
+  // ⭐冪等の鍵は**操作を始めるときに 1 回だけ**作る。送り直すたびに変えると、
+  //   届いていた分をもう一度受け取ってしまう (Codex R1 中11)
+  cgTarget = { act: action, id: consignmentId, version: cg.version, taskId: src.taskId, from: src.from,
+    key: 'ret-' + consignmentId + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) };
+  $('#cgTitle').textContent = action === 'handed' ? '🚚 わたしました' : action === 'cancel' ? '🚚 この預けをやめます'
+    : action === 'prepared' ? '🚚 箱とラベルを用意しました' : action === 'settle' ? '🚚 返ってこないぶんを精算' : '🚚 返却を受け取る';
+  // ⭐どのまとまりを動かすのかを必ず出す。同じ商品・同じ拠点の預けが 2 つ並ぶことがある (Codex R1 中2)
+  $('#cgName').textContent = src.title + '（' + facilityName(cg.facility_code)
+    + (cg.seq != null ? ' ・ まとまり #' + cg.seq : '') + '）';
+  $('#cgMsg').textContent = '';
+  $('#cgBody').innerHTML = '<div class="dq">' + (
+    action === 'cancel'
+      ? '<p class="sub">まだ渡していないぶんが、元のぶんに戻ります。渡したあとは取り消せません。</p>'
+      : action === 'prepared'
+        ? '<label>箱とラベルを何個ぶん用意しましたか</label>' +
+          '<div class="row"><input class="cgQty" type="number" inputmode="numeric" min="1" step="1" value="' + esc(String(cg.planned_qty)) + '">' +
+            '<span class="of">／ 渡す予定は ' + esc(String(cg.planned_qty)) + ' 個</span></div>' +
+          '<p class="sub">箱を数え、正しいラベルが貼れていることを確かめてから押してください。</p>'
+      : action === 'settle'
+        ? '<label>返ってこなかった数</label>' +
+          '<div class="row"><input class="cgQty" type="number" inputmode="numeric" min="0" step="1" value="' + esc(String(Math.max(0, left))) + '">' +
+            '<span class="of">／ 残り ' + esc(String(left)) + ' 個</span></div>' +
+          '<p class="sub">向こうで壊れた等で、物として返ってこないぶんです。これで預けを閉じます。</p>'
+      : action === 'handed'
+        ? '<label>実際に何個わたしましたか</label>' +
+          '<div class="row"><input class="cgQty" type="number" inputmode="numeric" min="1" step="1" value="' + esc(String(cg.planned_qty)) + '">' +
+            '<span class="of">／ 渡す予定は ' + esc(String(cg.planned_qty)) + ' 個</span></div>' +
+          '<p class="sub">当日そろわなかったときは、実際に渡した数を入れてください。予定の数はそのまま残ります。</p>'
+        : '<label>できあがって返ってきた数</label>' +
+          '<div class="row"><input class="cgQty" type="number" inputmode="numeric" min="1" step="1" value="' + esc(String(Math.max(1, left))) + '">' +
+            '<span class="of">／ 残り ' + esc(String(left)) + ' 個</span></div>' +
+          '<label style="margin-top:12px">そのうち使えるのは何個ですか（分からなければ空のまま）</label>' +
+          '<div class="row"><input class="cgGood" type="number" inputmode="numeric" min="0" step="1" placeholder="—"><span class="of">個</span></div>' +
+          '<label style="margin-top:12px">ひとこと（任意。渡した数より多く返ってきたときは、その理由）</label>' +
+          '<input class="cgNote" type="text" maxlength="300" placeholder="例: 向こうで数え直したら 10 個多かった">' +
+          '<p class="sub">一度に全部返ってこなくて構いません。残りは「あずけ中」に残ります。</p>'
+  ) + '</div>' +
+    '<div class="mbtns"><button class="btn" onclick="closeConsign()">やめる</button>' +
+    '<button class="btn primary" id="cgGo" onclick="submitConsignAct()">' +
+      (action === 'handed' ? 'わたしました' : action === 'cancel' ? 'この預けをやめる'
+        : action === 'prepared' ? '用意しました' : action === 'settle' ? 'これで精算する' : '受け取りました') + '</button></div>';
+  openOverlay('#cgOv');
+  $('#cgTitle').focus();
+}
+async function submitConsignAct() {
+  if (cgSaving || !cgTarget || !cgTarget.act || !worker) return;
+  // 預ける計画から開いたときはカードを持っていない (画面ごと取り直す)
+  const c = findCard(cgTarget.taskId);
+  if (!c && cgTarget.from === 'detail') { closeConsign(); return; }
+  const body = { consignment_id: cgTarget.id, action: cgTarget.act, worker_id: worker.id, expect_version: cgTarget.version };
+  // ⭐あとから数を入れるだけの操作。数の欄は 1 つ (使える数) で、空のままなら「まだ数えていない」
+  if (cgTarget.act === 'fix_return') {
+    body.return_id = cgTarget.returnId;
+    const g = $('#cgBody').querySelector('.cgGood');
+    const raw = g ? String(g.value).trim() : '';
+    let next = null;                               // 空 = まだ数えていない (0 とは違う)
+    if (raw !== '') {
+      const gv = Number(raw);
+      if (!Number.isInteger(gv) || gv < 0) { $('#cgMsg').textContent = '❌ 使える数は 0 以上の整数で入れてください'; return; }
+      next = gv;
+    }
+    // 🚨**数を触っていなければ送らない**。同じ数でも送ると「数の変更」とみなされ、
+    //   棚に入れたあとに**ひとことだけ**直せなくなる (Codex #1268 R2 中2)
+    if (next !== (cgTarget.wasGood ?? null)) body.good_qty = next;
+    const noteEl = $('#cgBody').querySelector('.cgNote');
+    body.note = noteEl ? String(noteEl.value).trim() : '';
+  }
+  const qtyEl = $('#cgBody').querySelector('.cgQty');
+  if (cgTarget.act !== 'cancel' && cgTarget.act !== 'fix_return') {
+    const v = qtyEl ? Number(String(qtyEl.value).trim()) : NaN;
+    const min = cgTarget.act === 'settle' ? 0 : 1;   // 精算は「返ってこなかった 0 個」もありうる
+    if (!Number.isInteger(v) || v < min) { $('#cgMsg').textContent = '❌ 個数は ' + min + ' 以上の整数で入れてください'; return; }
+    if (cgTarget.act === 'handed' || cgTarget.act === 'prepared') body.qty = v;
+    else if (cgTarget.act === 'settle') body.missing_qty = v;
+    else body.returned_qty = v;
+  }
+  if (cgTarget.act === 'return') {
+    const g = $('#cgBody').querySelector('.cgGood');
+    const raw = g ? String(g.value).trim() : '';
+    if (raw !== '') {
+      const gv = Number(raw);
+      if (!Number.isInteger(gv) || gv < 0) { $('#cgMsg').textContent = '❌ 使える数は 0 以上の整数で入れてください'; return; }
+      body.good_qty = gv;
+    }
+    // 渡した数より多く返ってきたときは理由が要る (サーバーが理由なしの超過を断る)
+    const noteEl = $('#cgBody').querySelector('.cgNote');
+    if (noteEl && String(noteEl.value).trim()) body.note = String(noteEl.value).trim();
+    body.idempotency_key = cgTarget.key;   // 操作の最初に作った鍵。送り直しても同じ
+  }
+  cgSaving = true;
+  $('#cgGo').disabled = true;
+  $('#cgMsg').textContent = '保存中…';
+  let j;
+  try {
+    j = await apiFetch('/api/consign/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  } finally { cgSaving = false; const g2 = $('#cgGo'); if (g2) g2.disabled = false; }
+  if (!j.ok) {
+    $('#cgMsg').textContent = '❌ ' + (j.message || 'できませんでした');
+    return planError(j, () => submitConsignAct(), { silent: true });
+  }
+  if (j.staff_mode) state.staff_mode = j.staff_mode;
+  if (j.task && c) applyTask(c, j.task);
+  const act = cgTarget.act;
+  const from = cgTarget.from;
+  closeOverlay('#cgOv'); cgTarget = null; $('#cgBody').innerHTML = '';
+  toast(act === 'handed' ? 'わたしました' : act === 'cancel' ? '預けをやめました'
+    : act === 'prepared' ? '箱とラベルを用意しました' : act === 'settle' ? '精算しました'
+    : j.consignment && j.consignment.state === 'settled' ? '全部返ってきました' : '返却を記録しました');
+  // 預けの記録を取り直す。開いていた画面のほうを更新する
+  if (from === 'cplan') loadConsignPlan();
+  else if (c) { openDetail(c.id); if (curView === 'cplan') loadConsignPlan(); }
+}
+
 function openStFromDetail() { if (curDetail && can('task.status.change')) openSt(null, curDetail); }
 
 // ─── ステータス変更 (Codex R2 ①: 保存中表示・処理中は全ボタン無効・失敗は大きく) ───
@@ -4875,46 +6302,146 @@ function renderStBtns(c) {
  * 中断するときと、あとから直すときで同じ形を使う。**数は任意** — 数えていないなら空のままでよい
  * (空 = まだ数えていない。0 個 = 1 個もできていない。この 2 つは別のこととして扱う)
  */
+/**
+ * ⭐**数を入れる対象**。まとまりを選んでいるならそのまとまりの数、選んでいなければカードの数。
+ *
+ * これが無いと、いろは 400・ワークセンター 600 に分けたカードで「このぶんを作り終えた」を押したとき、
+ * フォームは**カード合計の 1000 個**を「つくる数」として出し、「予定どおり (1000 個)」を押すと
+ * 400 個のまとまりに 1000 が入ってしまう (Codex R2 重大1)。
+ */
+function dqSubject(c, batchId) {
+  const b = batchId == null ? null : (c.batches || []).find((x) => sameId(x.id, batchId));
+  if (!b) return c;
+  return { qty: b.planned_qty, done_qty: b.good_qty, counted: b.counted !== false,
+    loss_qty: b.loss_qty, variance_note: b.variance_note, hold_memo: c.hold_memo };
+}
 function dqPanelHtml(c, actions, opts) {
-  const o = Object.assign({ title: '何個までできましたか', memo: true, memoLabel: '中断メモ (任意) — 次にやる人が読みます', defaultAll: false }, opts || {});
-  // できあがりのダイアログでは「全部」を既定にする (数えていなければ つくる数 = できた数 とみなす — 要件 §Y)
-  const cur = c.done_qty == null ? (o.defaultAll && c.qty != null ? String(c.qty) : '') : String(c.done_qty);
+  const o = Object.assign({ title: '何個までできましたか', memo: true, memoLabel: '中断メモ (任意) — 次にやる人が読みます',
+    loss: false, note: false }, opts || {});
+  // 🚨**予定 (つくる数) で埋めない** (要件 §AB-4)。埋めると、そのまま押されて「予定 = 実績」になってしまう。
+  //   2026-09-07 まではできあがりのダイアログを つくる数 で初期表示していた。
+  // ⭐**移行で持ってきた数 (counted でない) も埋めない**。あれは棚入待ちで予定数に上書きされていた
+  //   可能性があるので、触らないまま押されると「人が数えた値」として確定してしまう (Codex R1 中)
+  const migrated = c.done_qty != null && c.counted === false;
+  const cur = (c.done_qty == null || migrated) ? '' : String(c.done_qty);
   const memo = c.hold_memo || '';
   const quick = [['0', 'まだ 0 個']];
   if (c.qty != null) {
     if (c.qty >= 2) quick.push([String(Math.floor(c.qty / 2)), '半分 (' + Math.floor(c.qty / 2) + ' 個)']);
-    quick.push([String(c.qty), '全部 (' + c.qty + ' 個)']);
+    quick.push([String(c.qty), '予定どおり (' + c.qty + ' 個)']);
   }
   return '<div class="dq">' +
     '<label>' + esc(o.title) + '</label>' +
-    '<div class="row"><input class="dqIn" type="number" inputmode="numeric" min="0" step="1" value="' + esc(cur) + '" placeholder="—">' +
+    '<div class="row"><input class="dqIn" type="number" inputmode="numeric" min="0" step="1" value="' + esc(cur) + '" placeholder="—" oninput="dqDiff(this)">' +
       '<span class="of">' + (c.qty != null ? '／ つくる数 ' + esc(String(c.qty)) + ' 個' : '／ つくる数は不明') + '</span></div>' +
     '<div class="quick">' + quick.map(([v, l]) =>
       '<button type="button" data-dq="' + esc(v) + '">' + esc(l) + '</button>').join('') +
       '<button type="button" data-dq="">数えていない</button></div>' +
-    '<p class="sub">数えていないときは空のままで構いません (0 個とは別のこととして残します)。空のまま進めると、前に数えた値はそのまま残ります</p>' +
+    '<p class="sub dqdiff" data-qty="' + (c.qty == null ? '' : esc(String(c.qty))) + '">' +
+      '数えていないときは空のままで構いません (0 個とは別のこととして残します)</p>' +
+    (migrated ? '<p class="sub warn">前の記録では ' + esc(String(c.done_qty)) +
+      ' 個ですが、これは数え直した値ではありません。実際にできた数を入れてください</p>' : '') +
+    // ⭐作れなかった数。**空欄を 0 と読まない**ので「ありません / あります」を先に選んでもらう (要件 §AB-3)
+    (o.loss ? '<label style="margin-top:12px">作れなかったものはありますか</label>' +
+      '<div class="quick lossq">' +
+        '<button type="button" data-loss="0"' + (c.loss_qty === 0 ? ' class="on"' : '') + '>ありません</button>' +
+        '<button type="button" data-loss="ask"' + (c.loss_qty > 0 ? ' class="on"' : '') + '>あります</button></div>' +
+      '<div class="lossrow"' + (c.loss_qty > 0 ? '' : ' hidden') + '>' +
+        '<div class="row"><input class="dqLoss" type="number" inputmode="numeric" min="0" step="1" value="' +
+          (c.loss_qty > 0 ? esc(String(c.loss_qty)) : '') + '" placeholder="—"><span class="of">個 作れなかった</span></div>' +
+        '<label style="margin-top:8px">どうしましたか (任意)</label>' +
+        '<textarea class="dqNote" maxlength="500" placeholder="例: 袋を2つ破いてしまいました">' + esc(c.variance_note || '') + '</textarea></div>' : '') +
     (o.memo ? '<label style="margin-top:10px">' + esc(o.memoLabel) + '</label>' +
       '<textarea class="dqMemo" maxlength="500" placeholder="例: ラベルは貼り終わり、袋詰めの途中です">' + esc(memo) + '</textarea>' : '') +
     '</div>' + actions;
+}
+/** つくる数との差をその場で出す (「予定より 2 個少ない」)。止めはしない — 差があるのは普通のこと */
+function dqDiff(el) {
+  const panel = el.closest('.dq');
+  const p = panel && panel.querySelector('.dqdiff');
+  if (!p) return;
+  // ⭐数が変わったら確認はやり直し。**早く return する前に**戻す (空欄にしたときも解除する — Codex R2 軽微)
+  doneConfirmed = null;
+  const qty = p.dataset.qty === '' ? null : Number(p.dataset.qty);
+  const v = String(el.value).trim();
+  if (v === '' || qty == null) {
+    p.textContent = '数えていないときは空のままで構いません (0 個とは別のこととして残します)';
+    p.classList.remove('warn'); return;
+  }
+  const d = Number(v) - qty;
+  p.textContent = d === 0 ? '予定どおりです' : d > 0 ? '予定より ' + d + ' 個 多いです' : '予定より ' + (-d) + ' 個 少ないです';
+  p.classList.toggle('warn', d !== 0);
 }
 /**
  * 入力欄の中身を読む。空文字は「数えていない」= null (0 に丸めない)。
  * ⚠パネルは中断ダイアログと「あとから直す」ダイアログの両方に描かれるので、**入れ物を指定して**探す
  */
+/**
+ * ⭐数を入れる先のまとまり (預けたあとの「いろは のぶん」)。
+ * まとまりが 1 つならサーバーに任せる (null)。2 つ以上なら**手元の拠点**(物を持ち帰らない = offsite でない)
+ * で、まだ作業できる (未着手・作業中) ものを選ぶ。作業中が 1 つならそれ。決まらなければ null (サーバーが「選んで」と断る)
+ */
+/**
+ * ⭐**手元の (物を持ち帰らない) まとまり**で、まだ作業できるもの。
+ * 2 つ以上あると「どのぶんの作業か」が決まらないので、画面で選んでもらう (要件 §AB-10)。
+ *
+ * ⚠拠点マスタに無い拠点は「手元」に寄せる (選択肢から落として押せなくするより、出して選ばせる)。
+ *   選んだものが本当に手元かは**サーバーが最後に見る** (HOME_BATCH_SQL で外に出したぶんを弾く)。
+ */
+function homeBatches(c) {
+  const all = (c && c.batches || []).filter((x) => x.work_status !== 'cancelled');
+  if (all.length <= 1) return [];
+  const offsite = new Set((((boardState() || {}).facilities) || []).filter((f) => f.offsite).map((f) => f.code));
+  return all.filter((x) => !(x.facility_code && offsite.has(x.facility_code))
+    && (x.work_status === 'not_started' || x.work_status === 'in_progress'));
+}
+function homeBatchId(c) {
+  const home = homeBatches(c);
+  if (home.length === 1) return home[0].id;
+  // 作業中が 1 つだけなら、そのぶん (「はじめる」を押し直したとき、いま進めているぶんに付ける)
+  const going = home.filter((x) => x.work_status === 'in_progress');
+  return going.length === 1 ? going[0].id : null;
+}
 function dqValues(rootSel) {
   const root = $(rootSel);
   const el = root && root.querySelector('.dqIn');
   const raw = el ? String(el.value).trim() : '';
   const memoEl = root && root.querySelector('.dqMemo');
-  return { qty: raw === '' ? null : Number(raw), raw, memo: memoEl ? String(memoEl.value).trim() : '' };
+  // 作れなかった数: 「ありません」を選んだときだけ 0。何も選んでいなければ「数えていない」(送らない)
+  const lossEl = root && root.querySelector('.dqLoss');
+  const lossPicked = root && root.querySelector('[data-loss].on');
+  const lossRaw = lossEl ? String(lossEl.value).trim() : '';
+  // 「ありません」を選んだら 0。「あります」で数が空なら「数えていない」(送らない)
+  const loss = !lossPicked ? undefined
+    : lossPicked.dataset.loss === '0' ? 0
+    : (lossRaw === '' ? undefined : Number(lossRaw));
+  // ⭐ひとことを読むのは「**あります**」を選んで欄が見えているときだけ。
+  //   何も選んでいないのに空文字を送ると、数を触っていないのに「数の書き換え」と見なされ、
+  //   分かれたカードで断られてしまう (Codex R2 中2)。
+  //   空にしたら消せるよう、選んでいるときは**空文字も送る** (undefined = 触らない、'' = 消す)
+  const noteEl = lossPicked && lossPicked.dataset.loss === 'ask' ? (root && root.querySelector('.dqNote')) : null;
+  return { qty: raw === '' ? null : Number(raw), raw, memo: memoEl ? String(memoEl.value).trim() : '',
+    loss, note: noteEl ? String(noteEl.value).trim() : undefined };
 }
 /** クイックボタン (まだ0個 / 半分 / 全部 / 数えていない) — 値は data-dq から取る。同じパネルの中の欄だけ書き換える */
+// 作れなかった数の「ありません / あります」(要件 §AB-3: 空欄を 0 と読まない)
+document.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-loss]');
+  if (!b) return;
+  const panel = b.closest('.dq');
+  if (!panel) return;
+  for (const x of panel.querySelectorAll('[data-loss]')) x.classList.toggle('on', x === b);
+  const row = panel.querySelector('.lossrow');
+  const input = panel.querySelector('.dqLoss');
+  if (b.dataset.loss === '0') { if (row) row.hidden = true; if (input) input.value = '0'; }
+  else { if (row) row.hidden = false; if (input && (input.value === '' || input.value === '0')) { input.value = ''; input.focus(); } }
+});
 document.addEventListener('click', (e) => {
   const b = e.target.closest('[data-dq]');
   if (!b) return;
   const panel = b.closest('.dq');
   const input = panel && panel.querySelector('.dqIn');
-  if (input) input.value = b.dataset.dq;
+  if (input) { input.value = b.dataset.dq; dqDiff(input); }   // ⭐タップで変えたときも差の表示と確認をやり直す
 });
 
 // ─── できた数・中断メモを**あとから直す** (状態は変えない) ───
@@ -4928,7 +6455,7 @@ function openDq(id) {
   $('#dqName').textContent = c.title;
   $('#dqMsg').textContent = '';
   // ⭐操作のボタンも許可を見てから描く。静的に置いておくと「許可の無い操作を DOM に描かない」が崩れる (Codex R1 中3)
-  $('#dqBody').innerHTML = dqPanelHtml(c, '') +
+  $('#dqBody').innerHTML = dqPanelHtml(dqSubject(c, homeBatchId(c)), '') +
     '<div class="mbtns"><button class="btn" id="dqCancel" onclick="closeDq()">やめる</button>' +
     '<button class="btn primary" id="dqSave" onclick="saveProgress()">保存する</button></div>';
   openOverlay('#dqOv');
@@ -4949,7 +6476,8 @@ async function saveProgress() {
   try {
     j = await apiFetch('/api/progress', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: dqTarget, worker_id: worker.id, expect_version: c.version, done_qty: v.qty, hold_memo: v.memo }),
+      body: JSON.stringify({ id: dqTarget, worker_id: worker.id, expect_version: c.version, done_qty: v.qty, hold_memo: v.memo,
+        ...(homeBatchId(c) ? { batch_id: homeBatchId(c) } : {}) }),
     });
   } finally {
     // ⭐何があっても押せる状態に戻す。ここで止まるとダイアログを閉じることもできなくなる (Codex R2 軽微1)
@@ -4992,14 +6520,23 @@ $('#stOv').addEventListener('click', e => { if (e.target === $('#stOv')) closeSt
 function doSetStEl(el) { doSetSt(el.dataset.v); }
 
 /** サーバーが返したタスクの最新値をカードに反映する (version を持ち越さないと次の変更が競合する) */
+/** カード単位の値 (行が分かれていても同じもの) */
+const CARD_FIELDS = ['version', 'blocked', 'blocked_label', 'hold_memo',
+  'planned_date', 'when', 'cancellation_requested_at', 'cancellation', 'migration_review', 'external_ready'];
+/** まとまりごとに違う値 (⭐分かれた行には写さない — カードの合計を行に書くと数が化ける) */
+const BATCH_FIELDS = ['status', 'status_label', 'facility_code', 'done_qty'];
 function applyTask(c, t) {
   if (!t || typeof t !== 'object') return;
-  for (const k of ['status', 'status_label', 'version', 'facility_code', 'blocked', 'blocked_label',
-    'done_qty', 'hold_memo',
-    'planned_date', 'when', 'cancellation_requested_at', 'migration_review', 'external_ready']) {
-    if (k in t) c[k] = t[k];
-  }
+  for (const k of [...CARD_FIELDS, ...BATCH_FIELDS]) if (k in t) c[k] = t[k];
   if ('planned_date' in t) c.today = !!(state.today && t.planned_date === state.today);
+  // ⭐一覧・ボードが描くのは**行 (rows)**。カードだけ書き換えると、次の取り直しまで画面が古いまま残る。
+  //   分かれた行には「まとまりごとに違う値」を写さない (そのぶんの数・進捗はサーバーが持っている)
+  for (const r of ((state || {}).rows || [])) {
+    if (r === c || !sameId(r.id, c.id)) continue;
+    for (const k of CARD_FIELDS) if (k in t) r[k] = t[k];
+    if (!r.split) for (const k of BATCH_FIELDS) if (k in t) r[k] = t[k];
+    if ('planned_date' in t) r.today = c.today;
+  }
 }
 
 async function doSetSt(choice) {

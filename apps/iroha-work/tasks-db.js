@@ -5,13 +5,76 @@
  * 不変条件 (closed には close_reason/closed_at、止まっている理由 blocked_reason は未着手・作業中だけ …) は書く前に validateTaskInvariants で守る。
  * 状態変更は version の楽観ロック (2 台の iPad が同時に触っても後勝ちで壊さない) + 履歴 (f_iroha_app_events.task_id)。
  */
-import { getDB, startSessions, setMetaValue, logEvent, sourceOfTruth } from './db.js';
+import { getDB, startSessions, startCrewSession, setMetaValue, logEvent, sourceOfTruth } from './db.js';
 import {
   OPEN_STATUSES, CLOSE_REASONS, BLOCK_REASONS, BLOCK_LABEL, BLOCKABLE_STATUSES, LEGACY_ON_HOLD,
   canTransition, transitionNeedsStaff, validateTaskInvariants,
 } from './tasks.js';
+import { ensureBatchForTask, syncSingleBatchStatus, recordBatchCounts, recomputeTaskDoneQty, soleBatchOfTask,
+  recordStockingForTask, openConsignmentCount, deriveTaskStatus, batchConsignedOutCount, recordStocking,
+  listBatchesOfTask, syncAllBatchesStatus, canBatchTransition, batchTransitionNeedsStaff,
+  applyDerivedTaskStatus, startHomeBatches } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
+
+/**
+ * ⭐できた数・作れなかった数は**まとまりに書く**。カードの done_qty はその合計から出す (要件 §AB-1/§AB-3)。
+ * まとまりが 1 つのうち (＝いまの全カード) は、これで今までと同じ数がカードにも載る。
+ * ⚠必ず呼び出し側の書き込みトランザクションの中で。
+ */
+function applyCountsToSoleBatch(db, taskId, counts, batchId = null) {
+  // ⭐どのまとまりかが指定されていればそこへ (預けたあとの いろは のぶん)。指定が無ければ「1 つだけ」のとき
+  const b = batchId != null
+    ? db.prepare("SELECT * FROM f_iroha_task_batches WHERE id = ? AND task_id = ? AND work_status <> 'cancelled'").get(batchId, taskId)
+    : soleBatchOfTask(db, taskId);
+  if (!b) return false;
+  return recordBatchCounts(db, b.id, counts);
+}
+
+/**
+ * ⭐数を書き換える前の関門。まとまりが 2 つ以上あるカードは、**どのまとまりの数か**が決まらない。
+ *
+ * 以前はここで黙って何もせず、カードだけ書き換えて「成功」を返していた。
+ * すると一覧はまとまりの合計から出すので、**保存できたように見えて元の数に戻る**ことになる
+ * (入力が消えて成功が返る = いちばん困る種類の壊れ方。Codex R1 重大)。
+ * ⭐画面が `batch_id` で「どのまとまりか」を送ってきたら通す (預けたあとも いろは のできた数が入る — 自己レビュー B)。
+ *   ただし**外にあずけているまとまりには入れない** — そのぶんの数は返却で入る。
+ */
+function rejectCountsOnSplitCard(db, taskId, wantsCounts, batchId = null) {
+  if (!wantsCounts) return null;
+  if (batchId != null) {
+    const n = Number(batchId);
+    const b = Number.isInteger(n) && n > 0
+      ? db.prepare("SELECT id, work_status FROM f_iroha_task_batches WHERE id = ? AND task_id = ? AND work_status <> 'cancelled'").get(n, taskId) : null;
+    if (!b) return { ok: false, error: 'bad_batch', message: 'そのぶんはこのカードにありません。一覧を更新してください' };
+    const away = db.prepare(`SELECT COUNT(*) c FROM f_iroha_consignments WHERE batch_id = ? AND state IN ('planned','prepared','handed')`).get(b.id).c;
+    if (away > 0) return { ok: false, error: 'bad_batch', message: '外にあずけているぶんの数は、返却を受け取るときに入れてください' };
+    return null;
+  }
+  const rows = db.prepare("SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ? AND work_status <> 'cancelled'").get(taskId);
+  if (!rows || rows.c <= 1) {
+    // まとまりが 1 つでも、それを丸ごと外にあずけているなら いろは の数は入れられない (返却で入る)
+    if (rows && rows.c === 1 && openConsignmentCount(db, taskId) > 0) {
+      return { ok: false, error: 'bad_batch', message: '外にあずけているぶんの数は、返却を受け取るときに入れてください' };
+    }
+    return null;
+  }
+  return { ok: false, error: 'split_card',
+    message: 'このカードは作業が分かれています。どのぶんの数かを選んでから入れてください' };
+}
+
+/**
+ * ⭐棚入待ち・棚入完了にする前の関門。外にあずけたぶん (渡す予定・用意ずみ・渡した) が残っていたら断る。
+ * 「棚入待ち」= 全部そろった、なので外にある物があるうちは成り立たない。
+ * 通してしまうと、棚入完了で**まだ外にある物まで「棚に入れた」記録**になる (自己レビュー A)。
+ * ⚠いろは のぶんだけを先に棚入待ち・棚入れする (まとまり単位の進捗) は要件 §AB-11 の 5 で入れる。
+ */
+function rejectWhileConsignedOut(db, taskId) {
+  const n = openConsignmentCount(db, taskId);
+  if (n === 0) return null;
+  return { ok: false, error: 'consign_open',
+    message: '外にあずけているぶんがまだ返ってきていません。返却を受け取る (または預けをやめる) までは、全部そろったことにも終了にもできません' };
+}
 
 /**
  * ⭐アプリ正本のときだけ書ける操作の関門 (Codex PR1 R15)。
@@ -26,7 +89,8 @@ const IMPORT_ACTOR_PREFIX = 'import:';
 // ─── 参照 ───
 
 export function listFacilities(includeInactive = false) {
-  return getDB().prepare(`SELECT id, code, name, external, active, sort_order FROM f_iroha_facilities
+  return getDB().prepare(`SELECT id, code, name, external, offsite, active, sort_order,
+      capacity_hours, capacity_boxes, capacity_boxes_hard, version FROM f_iroha_facilities
     ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY sort_order, id`).all();
 }
 
@@ -178,7 +242,10 @@ export function upsertTaskFromImport(row, { batchId, now = utcNow() }) {
       return rec[c];
     });
     const info = db.prepare(`INSERT INTO f_iroha_tasks (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`).run(...vals);
-    return { action: 'inserted', id: Number(info.lastInsertRowid) };
+    const newId = Number(info.lastInsertRowid);
+    // ⭐カードができたら「まとまり」も 1 つ用意する (要件 §AB-1)。カードだけある瞬間を作らない
+    ensureBatchForTask(db, getTask(newId));
+    return { action: 'inserted', id: newId };
   }
   const touchedByApp = !String(existing.updated_by || '').startsWith(IMPORT_ACTOR_PREFIX);
   const cols = touchedByApp ? IMPORT_INFO_COLS : [...IMPORT_INFO_COLS, ...IMPORT_STATE_COLS];
@@ -188,6 +255,11 @@ export function upsertTaskFromImport(row, { batchId, now = utcNow() }) {
   const sets = cols.map((c) => `${c} = ?`).join(', ');
   db.prepare(`UPDATE f_iroha_tasks SET ${sets}, import_batch_id = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ?`)
     .run(...cols.map((c) => rec[c]), batchId, now, touchedByApp ? existing.updated_by : actor, existing.id);
+  // ⭐取込は既存カードの進捗 (IMPORT_STATE_COLS) も書き換えることがある。
+  //   まとまりが 1 つのうちは一緒に動かす。まとまりが無い古い行はここで用意する (Codex R1 重大2)
+  const fresh = getTask(existing.id);
+  ensureBatchForTask(db, fresh);
+  syncSingleBatchStatus(db, existing.id, fresh);
   return { action: 'updated', id: existing.id };
 }
 
@@ -223,7 +295,8 @@ export function listOrphans(limit = 100) {
 // ─── 状態変更 ───
 
 const HTTP_BY_ERROR = { conflict: 409, bad_transition: 400, staff_required: 403, close_reason_required: 400, not_found: 404, bad_request: 400,
-  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409, bad_done_qty: 400, bad_hold_memo: 400, ready_task: 409,
+  closed_task: 409, done_card: 409, active_sessions: 409, not_stray: 409, bad_done_qty: 400, bad_hold_memo: 400, bad_loss_qty: 400,
+  bad_variance_note: 400, split_card: 409, ready_task: 409, bad_batch: 400, consign_open: 409, stocked_batch: 409, printed_batch: 409, counted_batch: 409,
   // 止まっている理由 (案A): 理由が無い/不正 = 400、止められない状態 = 409、止まっているので始められない = 409
   block_reason_required: 400, bad_block: 409, blocked: 409,
   notion_mode: 409 };   // 取得後に正本が切り替わった = 競合 (入力不正ではない — Codex PR1 R17)
@@ -252,6 +325,23 @@ export function normalizeDoneQty(v) {
   return { value: n };
 }
 /** 中断メモ。undefined = 触らない / 空 = 消す。長すぎる申し送りは切らずに断る (書いた人が気づけるように) */
+/** ひとこと (作れなかった理由の自由記述)。⭐分類から選ばせない (要件 §AB-6 の反論 4) */
+export function normalizeVarianceNote(v) {
+  if (v === undefined) return { skip: true };
+  if (v === null) return { value: null };
+  if (typeof v !== 'string') return { error: 'bad_variance_note', message: 'ひとことは文字で入れてください' };
+  const t = v.trim();
+  if (t.length > 500) return { error: 'bad_variance_note', message: 'ひとことは 500 文字までです' };
+  return { value: t === '' ? null : t };
+}
+
+/** 作れなかった数 (袋を破いた等)。⭐空欄を 0 と読まない — 「無い」と「数えていない」は別 (要件 §AB-3) */
+export function normalizeLossQty(v) {
+  const r = normalizeDoneQty(v);
+  if (r.error) return { error: 'bad_loss_qty', message: r.message.replace('できた数', '作れなかった数') };
+  return r;
+}
+
 export function normalizeHoldMemo(v) {
   if (v === undefined) return { skip: true };
   if (v === null) return { value: null };
@@ -262,7 +352,7 @@ export function normalizeHoldMemo(v) {
 }
 
 export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null,
-  doneQty = undefined, holdMemo = undefined,
+  doneQty = undefined, lossQty = undefined, varianceNote = undefined, holdMemo = undefined, batchId = undefined,
   actor = null, isStaff = false, workerId = null, workerName = null, deviceLabel = null, reason = null }) {
   const db = getDB();
   const t = getTask(taskId);
@@ -301,15 +391,19 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
   const dq = normalizeDoneQty(doneQty);
   if (dq.error) return { ok: false, error: dq.error, message: dq.message };
   if (!dq.skip) next.done_qty = dq.value;
+  const lq = normalizeLossQty(lossQty);
+  if (lq.error) return { ok: false, error: lq.error, message: lq.message };
+  const vn = normalizeVarianceNote(varianceNote);
+  if (vn.error) return { ok: false, error: vn.error, message: vn.message };
   const hm = normalizeHoldMemo(holdMemo);
   if (hm.error) return { ok: false, error: hm.error, message: hm.message };
   if (!hm.skip) next.hold_memo = hm.value;
   // 棚入待ち・棚入完了は「全部そろってから」(中原さん 2026-09-05)。数えていなくても、そこまで来たら全部できたとみなす。
   // 中断メモは申し送りなので、作業が終わったら消す (消した中身は履歴に残す)
   if (to === 'ready_for_stocking' || (to === 'closed' && closeReason === 'stocked')) {
-    // ⭐つくる数が分からないカードは、できた数も「数えていない」に戻す。
-    //   途中の数 (5 個) をそのまま残すと、それが完成数なのか途中経過なのか分からなくなる (Codex R1 中2)
-    next.done_qty = t.qty ?? null;
+    // 🚨**できた数を予定で上書きしない** (要件 §AB-3。2026-09-07 まではここで done_qty = qty にしていた)。
+    //   1000 個の予定で 998 個しかできなくても、記録が 1000 個になってしまっていた。
+    //   実際にできた数は、作業を終えるときに人が入れる。数えていなければ NULL のまま (0 でも予定でもない)
     next.hold_memo = null;
   }
   const problems = validateTaskInvariants(next);
@@ -326,6 +420,29 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     // 先に version を見る。別の端末が先に変えていたなら「競合」であって「作業中」ではない (Codex PR1 R5)
     const now2 = db.prepare('SELECT version FROM f_iroha_tasks WHERE id = ?').get(t.id);
     if (!now2 || now2.version !== t.version) return false;
+    // ⭐まとまりが 2 つ以上のカードで数を書き換えようとしたら、**書く前に**断る (Codex R1 重大)
+    const split = rejectCountsOnSplitCard(db, t.id, !dq.skip || !lq.skip || !vn.skip, batchId ?? null);
+    if (split) return { reject: split };
+    // ⭐まとまりが 2 つ以上のカードで「作り終えた」をカードごと押されたら断る (要件 §AB-11 の 5)。
+    //   どのぶんが終わったのかが決まらない。画面は batch_id を添えて まとまり単位の口へ送る。
+    //   ⚠「外にあずけたぶんが…」より**先に**返す — 人がすぐ次にできること (どのぶんか選ぶ) を言うため
+    const bn = db.prepare("SELECT COUNT(*) c FROM f_iroha_task_batches WHERE task_id = ? AND work_status <> 'cancelled'").get(t.id).c;
+    if (bn > 1 && to === 'ready_for_stocking') {
+      return { reject: { ok: false, error: 'split_card',
+        message: 'このカードは作業が分かれています。どのぶんを作り終えたかを選んでください' } };
+    }
+    // ⭐「棚入待ち → 作業中」(やり直し) も同じ。カードごと戻すと、どのぶんを戻すのか決まらないまま
+    //   カードだけ作業中・まとまりは棚入待ち、という食い違いが残る (Codex R3 中1)
+    if (bn > 1 && to === 'in_progress' && t.status === 'ready_for_stocking') {
+      return { reject: { ok: false, error: 'split_card',
+        message: 'このカードは作業が分かれています。どのぶんをやり直すかを選んでください' } };
+    }
+    // ⭐外にあずけたぶんが残っているうちは「全部そろった」(棚入待ち) にも、**理由を問わず終了**にもしない (自己レビュー A / Codex R4 重大2)。
+    //   取消や中止で閉じると、親は closed なのに外に 100 個ある、という状態になる。先に預けをやめる・返却を受け取る
+    if (to === 'ready_for_stocking' || to === 'closed') {
+      const out = rejectWhileConsignedOut(db, t.id);
+      if (out) return { reject: out };
+    }
     // 終了にするなら、**このトランザクションの中で**作業中の人を数える。
     // 外で数えると、数えた後・更新する前に別の接続 (miniPC も同じ DB を見る) が作業を始められる (Codex PR1 R4)
     if (to === 'closed') {
@@ -341,6 +458,19 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
         next.started_at, next.ready_at, next.cancellation_requested_at, next.done_qty ?? null, next.hold_memo ?? null,
         next.version, next.updated_at, next.updated_by, t.id, t.version);
     if (r.changes === 0) return false;
+    // まとまりが 1 つだけなら作業状態も合わせる (移行のあいだの橋渡し — 要件 §AB-1)。
+    // ⭐終了 (全部 done / cancelled) と、終了からのやり直し (全部 作業中) は**行き先が 1 つに決まる**ので、
+    //   まとまりが 2 つ以上でも合わせる。合わせないと「カードは終了・まとまりは棚入待ち」が残る
+    if (to === 'closed' || (t.status === 'closed' && to === 'in_progress')) syncAllBatchesStatus(db, t.id, next);
+    else syncSingleBatchStatus(db, t.id, next);
+    // ⭐カードを作業中にしたら、手元 (物を持ち帰らない拠点) のまとまりも作業中に。
+    //   これから渡すぶん・外部のぶんは触らない。作業開始 (startTaskWork) でも同じことをする (Codex R2 中2)
+    if (to === 'in_progress') startHomeBatches(db, t.id, now);
+    // ⭐数はまとまりが正本。カードの done_qty はその合計に直す (要件 §AB-3)
+    applyCountsToSoleBatch(db, t.id, { goodQty: dq.skip ? undefined : dq.value, lossQty: lq.skip ? undefined : lq.value, note: vn.skip ? undefined : vn.value },
+      batchId ?? null);
+    // ⭐棚に入れたら、その実績を残す (要件 §AB-2)。まとまりごと・まだ入れていない残り全部
+    if (to === 'closed' && closeReason === 'stocked') recordStockingForTask(db, t.id, { at: now, by: actor });
     const cleared = ((t.ready_at && next.ready_at === null) ? ` ready_at→${t.ready_at}` : '')
       + ((t.blocked_reason && !next.blocked_reason) ? ` 札解除(${t.blocked_reason})` : '');
     // できた数と中断メモも履歴に残す。消えた申し送りを後から追えるように (ready_at と同じ考え方)
@@ -352,6 +482,7 @@ export function changeTaskStatus({ taskId, to, expectVersion, closeReason = null
     if (reopening) logTaskEvent(line); else safeLogTaskEvent(line);
     return true;
   }).immediate();
+  if (applied && applied.reject) return applied.reject;
   if (applied && applied.notApp) return NOT_APP_MODE;
   if (applied && applied.active) {
     return { ok: false, error: 'active_sessions', message: `このカードで作業中の人が ${applied.active} 人います。作業を終えてから変えてください` };
@@ -369,6 +500,132 @@ export function blockedOf(t) {
     note: t.blocked_note || null, at: t.blocked_at || null, by: t.blocked_by || null };
 }
 
+/** そのカードの「まとまり」(取消は除く)。router が職員判定に使う */
+export function batchesOfTask(taskId) {
+  return listBatchesOfTask(getDB(), taskId).filter((b) => b.work_status !== 'cancelled');
+}
+
+/**
+ * ⭐**まとまり 1 つだけの進捗を変える** (要件 §AB-1 / §AB-11 の 5)。
+ *
+ * いろはのぶん 400 個が終わったら、外部に預けた 600 個が返るのを待たずに棚入れできる
+ * (中原さん 2026-09-07「2 週間寝かせる理由がない」)。
+ * ⭐カードの進捗は**まとまりから導く** (`deriveTaskStatus`)。手で書く正本にしない。
+ *
+ * まとまりが 1 つのカード (ふだんの全部) は今までどおり `changeTaskStatus` を通る — 見え方は変わらない。
+ */
+export function changeBatchStatus({ taskId, batchId, to, closeReason = null, expectVersion,
+  doneQty = undefined, lossQty = undefined, varianceNote = undefined, reason = null,
+  actor = null, isStaff = false, workerId = null, workerName = null, deviceLabel = null }) {
+  const db = getDB();
+  // まとまり単位で受けるのは「作業中に戻す / 作り終えた / 棚入完了」の 3 つだけ。
+  // カードごと取り消す・対象外にするのは、そのぶんだけでは意味が無いのでカードの口で
+  if (!['in_progress', 'ready_for_stocking', 'closed'].includes(to)) {
+    return { ok: false, error: 'bad_transition', message: 'そのぶんだけで変えられるのは「作業中」「作り終えた」「棚入完了」だけです' };
+  }
+  if (to === 'closed' && closeReason !== 'stocked') {
+    return { ok: false, error: 'bad_request', message: '取消・対象外はカードごとの操作です (そのぶんだけでは変えられません)' };
+  }
+  const dq = normalizeDoneQty(doneQty);
+  if (dq.error) return { ok: false, error: dq.error, message: dq.message };
+  const lq = normalizeLossQty(lossQty);
+  if (lq.error) return { ok: false, error: lq.error, message: lq.message };
+  const vn = normalizeVarianceNote(varianceNote);
+  if (vn.error) return { ok: false, error: vn.error, message: vn.message };
+  const want = to === 'closed' ? 'done' : to;
+  return db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    const t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
+    if (expectVersion == null || Number(expectVersion) !== t.version) {
+      return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: t };
+    }
+    // ⭐棚入完了で閉じたカードは、**そのぶんだけ**やり直せる (Codex R2 中3)。
+    //   カードごと戻すと、問題の無い他のぶんまで作業中に戻ってしまう。
+    //   終了からのやり直しは理由を残す約束 (カードと同じ — 例外的な操作なので、なぜ戻したかが消えるくらいなら失敗させる)
+    if (t.status === 'closed') {
+      if (!(t.close_reason === 'stocked' && want === 'in_progress')) {
+        return { ok: false, error: 'closed_task', message: '終了したカードは変えられません (履歴として残ります)' };
+      }
+      if (!String(reason || '').trim()) {
+        return { ok: false, error: 'bad_request', message: '棚入完了にしたぶんをやり直すには理由が必要です' };
+      }
+    }
+    const b = db.prepare("SELECT * FROM f_iroha_task_batches WHERE id = ? AND task_id = ? AND work_status <> 'cancelled'")
+      .get(Number(batchId), t.id);
+    if (!b) return { ok: false, error: 'bad_batch', message: 'そのぶんはこのカードにありません。一覧を更新してください' };
+    if (b.work_status === want) return { ok: true, task: t, batch: b, already: true };
+    if (!canBatchTransition(b.work_status, want)) {
+      return { ok: false, error: 'bad_transition', message: `そのぶんは「${b.work_status}」から「${want}」へは変えられません` };
+    }
+    if (batchTransitionNeedsStaff(b.work_status, want) && !isStaff) {
+      return { ok: false, error: 'staff_required', message: 'この変更は職員のみです (職員の名前を選び、PINを入れてください)' };
+    }
+    // ⭐**そのぶんが外にある間は、人が先へ進めない** (返却を受け取ると棚入待ちになる)。
+    //   他のまとまり (いろはのぶん) は止めない — これが「先に棚入れできる」ということ
+    if ((want === 'ready_for_stocking' || want === 'done') && batchConsignedOutCount(db, b.id) > 0) {
+      return { ok: false, error: 'consign_open',
+        message: 'このぶんは外にあずけています。返却を受け取る (または預けをやめる) と、棚入待ちになります' };
+    }
+    // 作業中の人がいるまま棚入完了にしない (作業時間はまだカード単位なので、カードで数える)
+    if (want === 'done') {
+      const active = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL AND voided_at IS NULL').get(t.id).c;
+      if (active > 0) return { ok: false, error: 'active_sessions', message: `このカードで作業中の人が ${active} 人います。作業を終えてから変えてください` };
+    }
+    const now = utcNow();
+    // 数はまとまりが正本 (要件 §AB-3)。送られたぶんだけ書き換える
+    recordBatchCounts(db, b.id, { goodQty: dq.skip ? undefined : dq.value, lossQty: lq.skip ? undefined : lq.value,
+      note: vn.skip ? undefined : vn.value });
+    if (db.prepare('UPDATE f_iroha_task_batches SET work_status = ?, version = version + 1, updated_at = ? WHERE id = ? AND work_status = ?')
+      .run(want, now, b.id, b.work_status).changes === 0) {
+      return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    }
+    // ⭐棚に入れたら、そのまとまりの実績を残す (要件 §AB-2)
+    if (want === 'done') recordStocking(db, b.id, { at: now, by: actor });
+    // ⭐カードの進捗はまとまりから導く。全部が棚に入って初めてカードが終了になる
+    const derived = deriveTaskStatus(db, t.id);
+    let nextStatus = derived === 'done' ? 'closed' : derived;
+    // ⭐**止まっている札が付いているうちは棚入待ちへ繰り上げない** (自動経路と同じ扱い — Codex R3 中2)。
+    //   札は他のぶんのことかもしれないし、棚入待ちのカードは札を持てない決まりなので、
+    //   繰り上げると札を黙って消すことになる。札を外したときに繰り上がる (clearTaskBlock)
+    if (nextStatus === 'ready_for_stocking' && t.blocked_reason) nextStatus = 'in_progress';
+    const next = { ...t, status: nextStatus, version: t.version + 1, updated_at: now, updated_by: actor };
+    next.hold_reason_code = null;
+    next.hold_reason_note = null;
+    if (!BLOCKABLE_STATUSES.includes(nextStatus)) { next.blocked_reason = null; next.blocked_note = null; next.blocked_at = null; next.blocked_by = null; }
+    next.close_reason = nextStatus === 'closed' ? 'stocked' : null;
+    next.closed_at = nextStatus === 'closed' ? now : null;
+    next.closed_by = nextStatus === 'closed' ? actor : null;
+    if (nextStatus === 'in_progress') { if (!t.started_at) next.started_at = now; next.ready_at = null; }
+    if (nextStatus === 'ready_for_stocking') next.ready_at = t.ready_at || now;
+    // ⭐終了まで来たら申し送りは役目を終える (カードと同じ約束)。消した中身は下の履歴に残す
+    if (nextStatus === 'closed') { next.ready_at = t.ready_at || now; next.hold_memo = null; }
+    const problems = validateTaskInvariants(next);
+    if (problems.length > 0) return { ok: false, error: 'bad_request', message: problems.join(' / ') };
+    const r = db.prepare(`UPDATE f_iroha_tasks SET status = ?, hold_reason_code = NULL, hold_reason_note = NULL,
+        close_reason = ?, closed_at = ?, closed_by = ?, blocked_reason = ?, blocked_note = ?, blocked_at = ?, blocked_by = ?,
+        started_at = ?, ready_at = ?, cancellation_requested_at = ?, hold_memo = ?, version = ?, updated_at = ?, updated_by = ?
+      WHERE id = ? AND version = ?`)
+      .run(next.status, next.close_reason, next.closed_at, next.closed_by,
+        next.blocked_reason ?? null, next.blocked_note ?? null, next.blocked_at ?? null, next.blocked_by ?? null,
+        next.started_at, next.ready_at, nextStatus === 'closed' ? null : next.cancellation_requested_at, next.hold_memo ?? null,
+        next.version, next.updated_at, next.updated_by, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    recomputeTaskDoneQty(db, t.id);   // カードの done_qty はまとまりの合計 (手で書く正本にしない)
+    // ⭐消した札・申し送りの中身も履歴に残す (あとから追えるように — カードと同じ考え方。Codex R3 中2)
+    const clearedTxt = ((t.blocked_reason && !next.blocked_reason)
+      ? ` 札解除(${t.blocked_reason}${t.blocked_note ? ':' + t.blocked_note : ''})` : '')
+      + (((next.hold_memo ?? null) !== (t.hold_memo ?? null) && !next.hold_memo) ? ` メモ消去(${t.hold_memo})` : '');
+    // ⭐終了からのやり直しは理由が残らないなら失敗させる (カードと同じ — logTaskEvent は投げる)
+    const line = { taskId: t.id, action: 'task_batch_status', from: `#${b.seq} ${b.work_status} (カード ${t.status})`,
+      to: `#${b.seq} ${want}${want === 'done' ? ' 棚入れ' : ''}${reason ? ' (' + reason + ')' : ''} → カード ${next.status}${clearedTxt}`,
+      workerId, workerName, deviceLabel, ok: true };
+    if (t.status === 'closed') logTaskEvent(line); else safeLogTaskEvent(line);
+    return { ok: true, task: getTask(t.id), batch: db.prepare('SELECT * FROM f_iroha_task_batches WHERE id = ?').get(b.id) };
+  }).immediate();
+}
+
 /**
  * 「⛔ 止まった」— 理由の札を付ける。進捗 (status) は変えない (作業中なら作業中のまま。80/180 の情報を失わない)。
  * 同じトランザクションで **このカードで作業中の人のタイマーを全員止める** (end_reason='pause'。止まっている間は数えない)。
@@ -376,7 +633,8 @@ export function blockedOf(t) {
  * expect_version の楽観ロック — 止めて外して再開した後に遅れて届いた古い「止まった」が、新しい作業を止めないように。
  * @returns {ok, task, stopped:[{id, worker_id, worker_name, raw_seconds}]} / {ok:false, error, message, current?}
  */
-export function setTaskBlock({ taskId, reason, note = null, doneQty = undefined, holdMemo = undefined, expectVersion,
+export function setTaskBlock({ taskId, reason, note = null, doneQty = undefined, lossQty = undefined, varianceNote = undefined, holdMemo = undefined,
+  batchId = undefined, expectVersion,
   actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
   const db = getDB();
   if (!BLOCK_REASONS.includes(reason)) {
@@ -386,6 +644,10 @@ export function setTaskBlock({ taskId, reason, note = null, doneQty = undefined,
   if (reason === 'other' && !noteText) return { ok: false, error: 'block_reason_required', message: '「その他」は何で止まったかをメモに書いてください' };
   const dq = normalizeDoneQty(doneQty);
   if (dq.error) return { ok: false, error: dq.error, message: dq.message };
+  const lqB = normalizeLossQty(lossQty);
+  if (lqB.error) return { ok: false, error: lqB.error, message: lqB.message };
+  const vnB = normalizeVarianceNote(varianceNote);
+  if (vnB.error) return { ok: false, error: vnB.error, message: vnB.message };
   const hm = normalizeHoldMemo(holdMemo);
   if (hm.error) return { ok: false, error: hm.error, message: hm.message };
   return db.transaction(() => {
@@ -399,6 +661,8 @@ export function setTaskBlock({ taskId, reason, note = null, doneQty = undefined,
       return { ok: false, error: 'bad_block', message: t.status === 'closed' ? '終了したカードは止められません (履歴として残ります)' : 'できあがったカード (棚入待ち) は止められません。やり直すなら職員が作業中に戻してください' };
     }
     const now = utcNow();
+    const splitB = rejectCountsOnSplitCard(db, t.id, !dq.skip || !lqB.skip || !vnB.skip, batchId ?? null);
+    if (splitB) return splitB;
     const nextQty = dq.skip ? (t.done_qty ?? null) : dq.value;
     const nextMemo = hm.skip ? (t.hold_memo ?? null) : hm.value;
     const next = { ...t, blocked_reason: reason, blocked_note: noteText, blocked_at: now, blocked_by: actor, done_qty: nextQty, hold_memo: nextMemo };
@@ -408,6 +672,9 @@ export function setTaskBlock({ taskId, reason, note = null, doneQty = undefined,
         done_qty = ?, hold_memo = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?`)
       .run(reason, noteText, now, actor, nextQty, nextMemo, now, actor, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
+    // ⭐数はまとまりが正本 (要件 §AB-3)
+    applyCountsToSoleBatch(db, t.id, { goodQty: dq.skip ? undefined : dq.value,
+      lossQty: lqB.skip ? undefined : lqB.value, note: vnB.skip ? undefined : vnB.value }, batchId ?? null);
     // 止まっている間は作業時間を数えない → このカードで作業中の人を全員止める (pause)
     const active = db.prepare('SELECT id, worker_id, worker_name, started_at FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL AND voided_at IS NULL').all(t.id);
     const upd = db.prepare("UPDATE f_iroha_work_sessions SET ended_at = ?, end_reason = 'pause', raw_seconds = ? WHERE id = ?");
@@ -455,6 +722,8 @@ function clearTaskBlockInTx(db, t, { via, actor = null, workerId = null, workerN
   if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', current: getTask(t.id) };
   safeLogTaskEvent({ taskId: t.id, action: 'task_unblocked', from: `${t.blocked_reason}${t.blocked_note ? ' (' + t.blocked_note + ')' : ''}`, to: via,
     workerId, workerName, deviceLabel, ok: true });
+  // ⭐札のせいで止めていた繰り上がりを反映する (札が付いている間は棚入待ちへ進めていない — §AB-1)
+  applyDerivedTaskStatus(db, t.id, now, actor);
   return { ok: true, task: getTask(t.id) };
 }
 
@@ -606,11 +875,14 @@ export function removeStrayTask({ taskId, actor = null, reason = null }) {
     }
     if (used > 0) {
       if (t.status === 'closed') return { ok: true, action: 'closed', id: t.id, already: true };
-      db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'out_of_scope', closed_at = ?, closed_by = ?,
+      const rOut = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'out_of_scope', closed_at = ?, closed_by = ?,
           hold_reason_code = NULL, hold_reason_note = NULL, blocked_reason = NULL, blocked_note = NULL, blocked_at = NULL, blocked_by = NULL, cancellation_requested_at = NULL,
           migration_note = COALESCE(migration_note || ' / ', '') || ?, version = version + 1, updated_at = ?, updated_by = ?
         WHERE id = ? AND version = ?`)
         .run(utcNow(), actor, note, utcNow(), actor, t.id, t.version);
+      // ⭐版がずれていたら**何も起きていない**。まとまりも履歴も触らず、成功として返さない (Codex R1 中4)
+      if (rOut.changes !== 1) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+      syncSingleBatchStatus(db, t.id, { status: 'closed', close_reason: 'out_of_scope' });
       logTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: `closed:out_of_scope (${note})`, ok: true });
       return { ok: true, action: 'closed', id: t.id };
     }
@@ -682,14 +954,19 @@ export function setFacility({ taskId, facilityCode, expectVersion, actor = null,
  * 数え間違いは後から直せないと現場が困るので、こちらも要る。
  * 確かめるところから書くところまで全部 1 つのトランザクション (要件 §U-2)
  */
-export function setProgress({ taskId, doneQty = undefined, holdMemo = undefined, expectVersion,
+export function setProgress({ taskId, doneQty = undefined, lossQty = undefined, varianceNote = undefined, holdMemo = undefined,
+  batchId = undefined, expectVersion,
   actor = null, workerId = null, workerName = null, deviceLabel = null, guard = null }) {
   const db = getDB();
   const dq = normalizeDoneQty(doneQty);
   if (dq.error) return { ok: false, error: dq.error, message: dq.message };
+  const lq2 = normalizeLossQty(lossQty);
+  if (lq2.error) return { ok: false, error: lq2.error, message: lq2.message };
+  const vn2 = normalizeVarianceNote(varianceNote);
+  if (vn2.error) return { ok: false, error: vn2.error, message: vn2.message };
   const hm = normalizeHoldMemo(holdMemo);
   if (hm.error) return { ok: false, error: hm.error, message: hm.message };
-  if (dq.skip && hm.skip) return { ok: false, error: 'bad_request', message: '直すものがありません' };
+  if (dq.skip && hm.skip && lq2.skip && vn2.skip) return { ok: false, error: 'bad_request', message: '直すものがありません' };
   return db.transaction(() => {
     if (guard) { const g0 = guard(); if (g0) return g0; }
     const g = appModeGuard();
@@ -705,10 +982,27 @@ export function setProgress({ taskId, doneQty = undefined, holdMemo = undefined,
     }
     const nextQty = dq.skip ? (t.done_qty ?? null) : dq.value;
     const nextMemo = hm.skip ? (t.hold_memo ?? null) : hm.value;
-    if (nextQty === (t.done_qty ?? null) && nextMemo === (t.hold_memo ?? null)) return { ok: true, task: t, already: true };
+    // ⭐関門が先。「同じ数だから何もしない」で素通りさせない (Codex R2 中1)
+    const split2 = rejectCountsOnSplitCard(db, t.id, !dq.skip || !lq2.skip || !vn2.skip, batchId ?? null);
+    if (split2) return split2;
+    // ⭐「変わっていない」の判定は**まとまり側の値と出どころ**まで見る。
+    //   移行で持ってきた 500 を人が数え直して 500 と入れたとき、数は同じでも
+    //   「人が数えた (counted)」に変える必要がある (Codex R2 中1)
+    const sole2 = batchId != null
+      ? db.prepare("SELECT * FROM f_iroha_task_batches WHERE id = ? AND task_id = ? AND work_status <> 'cancelled'").get(Number(batchId), t.id)
+      : soleBatchOfTask(db, t.id);
+    const sameCounts = sole2
+      ? (dq.skip || (dq.value === (sole2.good_qty ?? null) && sole2.good_qty_source !== 'migrated'))
+        && (lq2.skip || lq2.value === (sole2.loss_qty ?? null))
+        && (vn2.skip || vn2.value === (sole2.variance_note ?? null))
+      : (dq.skip && lq2.skip && vn2.skip);
+    if (nextQty === (t.done_qty ?? null) && nextMemo === (t.hold_memo ?? null) && sameCounts) return { ok: true, task: t, already: true };
     const r = db.prepare('UPDATE f_iroha_tasks SET done_qty = ?, hold_memo = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
       .run(nextQty, nextMemo, utcNow(), actor, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
+    // ⭐数はまとまりが正本 (要件 §AB-3)
+    applyCountsToSoleBatch(db, t.id, { goodQty: dq.skip ? undefined : dq.value, lossQty: lq2.skip ? undefined : lq2.value, note: vn2.skip ? undefined : vn2.value },
+      batchId ?? null);
     safeLogTaskEvent({ taskId: t.id, action: 'task_progress',
       from: `できた${t.done_qty ?? '—'}${t.hold_memo ? ' メモあり' : ''}`,
       to: `できた${nextQty ?? '—'}${nextMemo ? ' メモ:' + nextMemo : ''}`,
@@ -738,48 +1032,99 @@ export function clearMigrationReview({ taskId, expectVersion, actor = null }) {
 
 // ─── 取消 (入荷受付のやり直し → PR-B で呼ぶ。要件 v1.1 §E) ───
 
-function taskHasActivity(db, taskId) {
-  const s = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND voided_at IS NULL').get(taskId).c;
-  const m = db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id = ? AND deleted_at IS NULL').get(taskId).c;
-  const e = db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_status'").get(taskId).c;
-  return s + m + e > 0;
+/** 取消の理由 → 人が読む文。入荷側の cancel_reason と同じ語彙 (apps/inbound-check/db.js) */
+const CANCEL_REASON_LABEL = Object.freeze({
+  line_removed: '入荷の一覧から、この明細が消えました',
+  product_changed: '入荷の明細の商品が変わりました',
+  planned_changed: '入荷の明細の予定数が変わりました',
+  reopen: '入荷受付の iPad で「いろは行き」の確認が取り消されました',
+});
+const CANCEL_SOURCE_LABEL = Object.freeze({
+  inbound_import: '入荷CSVの取込',
+  inbound_reversal: '入荷受付の iPad',
+});
+
+/**
+ * 画面に出す「入荷側で取り消された」の中身。付いていなければ null。
+ * 一覧のカード (service.js) と 1 枚の詳細 (router publicTask) で同じ形
+ */
+export function cancellationOf(t) {
+  if (!t || !t.cancellation_requested_at) return null;
+  return {
+    at: t.cancellation_requested_at,
+    source: t.cancellation_source || null,
+    source_label: CANCEL_SOURCE_LABEL[t.cancellation_source] || '入荷側',
+    reason: t.cancellation_reason || null,
+    reason_label: CANCEL_REASON_LABEL[t.cancellation_reason] || '入荷側で取り消されました',
+  };
+}
+
+const hasTableNamed = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+
+/**
+ * ⭐同じ入荷明細 (行き先の line_key) から生まれた**開いているカード**が 2 枚以上あれば、互いを「関連カード」として返す。
+ * 取消後に入荷側で確認し直すと、新しい行き先 = 新しいカードができ、旧カードは「取消の確認」のまま残る。
+ * そのままだと同じ現物の作業指示が 2 枚になる (Codex R1) ので、両方の画面に相手を出して職員が片づける。
+ * 自動で統合・取消はしない (作業実績を守る・カードは黙って消さない)。
+ * ⭐新旧は**行き先の生成順** (decided_at → 行き先 id) で決める。カードの id で見ると、重複カードの統合で
+ *   新しい行き先が古いカードに付いたとき逆転し、「作業はそちらで」の誘導が逆を向く (Codex R2)。
+ * @returns {Map<number, Array<{id, status, cancellation_requested_at, newer:boolean}>>} task id → 相手
+ */
+export function relatedByInboundLine(db = getDB()) {
+  const out = new Map();
+  if (!hasTableNamed(db, 'f_inbound_check_destinations')) return out;
+  const rows = db.prepare(`SELECT t.id, t.status, t.cancellation_requested_at, d.line_key, d.id AS dest_id, d.decided_at
+    FROM f_iroha_tasks t JOIN f_inbound_check_destinations d ON d.id = t.destination_id
+    WHERE t.status <> 'closed' AND d.line_key IN (
+      SELECT d2.line_key FROM f_iroha_tasks t2 JOIN f_inbound_check_destinations d2 ON d2.id = t2.destination_id
+      WHERE t2.status <> 'closed' GROUP BY d2.line_key HAVING COUNT(*) > 1)
+    ORDER BY d.decided_at, d.id`).all();
+  const byLine = new Map();
+  for (const r of rows) { if (!byLine.has(r.line_key)) byLine.set(r.line_key, []); byLine.get(r.line_key).push(r); }
+  // decided_at は入荷側が utcNow() で書く ISO (UTC・ミリ秒・Z) で揃っているので文字列比較でよい。同時刻は行き先 id
+  const isNewer = (o, me) => o.decided_at > me.decided_at || (o.decided_at === me.decided_at && o.dest_id > me.dest_id);
+  for (const group of byLine.values()) {
+    for (const me of group) {
+      out.set(me.id, group.filter((o) => o.id !== me.id)
+        .map((o) => ({ id: o.id, status: o.status, cancellation_requested_at: o.cancellation_requested_at, newer: isNewer(o, me) })));
+    }
+  }
+  return out;
 }
 
 /**
- * 入荷側の取消。未着手・実績なしなら自動で終了 (取消)、着手済み・実績ありなら「取消要確認」にして
- * いろは職員が判断する (中原さん 9/3: 最終判断はいろはスタッフ)
- * @returns {ok:true, action:'none'|'closed'|'review', task?}
+ * 入荷側の取消をカードに伝える。⭐**カードは消さない**。どんな状態でも「取消の確認」を付けて残し、
+ * いろはの職員が iPad で 続ける / 取り消す を決める (resolveCancellation)。
+ *
+ * 2026-09-08 までは「未着手・実績なしなら自動で終了 (取消)」だった。その日、空の入荷CSVが
+ * 良いファイルを上書きし、取込が「全行が消えた」と判定して未着手のカードを**一斉に黙って消した**。
+ * 中原さんの決め (同日): **一度いろはに送ったカードは残り続ける。入荷側の都合で勝手に変えない。**
+ * 「まだ触っていない」は「要らない」ではなく「これから作業する」なので、消してよい理由にならない。
+ *
+ * @param {number} o.destinationId 入荷受付の行き先 id
+ * @param {string} o.source 誰が: inbound_import (CSV 取込) / inbound_reversal (入荷 iPad のやり直し)
+ * @param {string|null} o.reason なぜ: line_removed / product_changed / planned_changed / reopen (入荷側の cancel_reason と同じ語彙)
+ * @returns {ok:true, action:'none'|'review', already?:true, task?}
  */
-export function requestCancellation({ destinationId, source = 'inbound_reversal', actor = null }) {
+export function requestCancellation({ destinationId, source = 'inbound_reversal', reason = null, actor = null }) {
   const db = getDB();
-  // 判定と更新を 1 つの書き込みトランザクションで (判定後に誰かが開始したタスクを自動取消しない — Codex A1 R1 #10)。
-  // 自動取消の UPDATE は status と version を条件に持ち、0 行なら要確認へ倒す
+  // 判定と更新を 1 つの書き込みトランザクションで。version を条件に持つので、判定後に誰かが変えていれば書かない
   return db.transaction(() => {
     const t = getTaskByDestination(destinationId);
     if (!t) return { ok: true, action: 'none' };
     if (t.status === 'closed') return { ok: true, action: 'none', task: t };
+    // すでに確認待ちなら二度は書かない (同じことで履歴が増えない)。理由が新しく分かったときだけ書き足す
+    if (t.cancellation_requested_at && (!reason || reason === t.cancellation_reason) && source === t.cancellation_source) return { ok: true, action: 'review', already: true, task: t };
     const now = utcNow();
-    if (t.status === 'not_started' && !taskHasActivity(db, t.id)) {
-      const r = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = ?, closed_by = ?, hold_reason_code = NULL, hold_reason_note = NULL,
-        blocked_reason = NULL, blocked_note = NULL, blocked_at = NULL, blocked_by = NULL,
-        cancellation_requested_at = NULL, cancellation_source = ?, version = version + 1, updated_at = ?, updated_by = ?
-        WHERE id = ? AND status = 'not_started' AND version = ?`)
-        .run(now, actor || source, source, now, actor || source, t.id, t.version);
-      if (r.changes === 1) {
-        safeLogTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: 'closed:cancelled (auto)', ok: true });
-        return { ok: true, action: 'closed', task: getTask(t.id) };
-      }
-    }
-    const cur = getTask(t.id);
-    const r2 = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?), cancellation_source = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-      .run(now, source, now, actor || source, cur.id, cur.version);
-    if (r2.changes === 0) return { ok: false, error: 'conflict', message: '同時に変更されました。もう一度お試しください', current: getTask(cur.id) };
-    safeLogTaskEvent({ taskId: cur.id, action: 'task_cancel_requested', to: source, ok: true });
-    return { ok: true, action: 'review', task: getTask(cur.id) };
+    const r = db.prepare(`UPDATE f_iroha_tasks SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?), cancellation_source = ?,
+      cancellation_reason = COALESCE(?, cancellation_reason), version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?`)
+      .run(now, source, reason, now, actor || source, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '同時に変更されました。もう一度お試しください', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_cancel_requested', to: reason ? source + ' (' + reason + ')' : source, ok: true });
+    return { ok: true, action: 'review', task: getTask(t.id) };
   }).immediate();
 }
-
-/** 取消要確認を職員が確定 (cancel) / 続行 (continue) */
+/** 取消の確認を職員が決める: cancel (終了:取消) / continue (札を外して続ける) */
 export function resolveCancellation({ taskId, decision, expectVersion, actor = null, isStaff = false, workerId = null, workerName = null, deviceLabel = null }) {
   const db = getDB();
   const t = getTask(taskId);
@@ -795,7 +1140,7 @@ export function resolveCancellation({ taskId, decision, expectVersion, actor = n
   return db.transaction(() => {
     const g = appModeGuard();
     if (g) return g;
-    const r = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+    const r = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, cancellation_reason = NULL, cancellation_source = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
       .run(utcNow(), actor, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
     safeLogTaskEvent({ taskId: t.id, action: 'task_cancel_continued', workerId, workerName, deviceLabel, ok: true });
@@ -952,7 +1297,11 @@ export function bulkCloseReady({ taskIds, actor = null, workerId = null, workerN
       if (db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND ended_at IS NULL AND voided_at IS NULL').get(id).c > 0) {
         skipped.push({ id, reason: 'active_sessions', title }); continue;   // 作業中のまま終了にしない (Codex PR1 R3)
       }
+      // 外にあずけたぶんが返ってきていないカードは棚入完了にしない (自己レビュー A)
+      if (openConsignmentCount(db, id) > 0) { skipped.push({ id, reason: 'consign_open', title }); continue; }
       if (updVer.run(now, actor, now, now, actor, id, version).changes !== 1) { skipped.push({ id, reason: 'conflict', title }); continue; }
+      syncAllBatchesStatus(db, id, { status: 'closed', close_reason: 'stocked' });
+      recordStockingForTask(db, id, { at: now, by: actor });
       // 履歴は握り潰さない (権限のいる操作。記録できないなら全部やり直す — Codex PR-C R1)
       logTaskEvent({ taskId: id, action: 'task_status', from: 'ready_for_stocking', to: 'closed:stocked (まとめて棚入完了)',
         workerId, workerName, deviceLabel, ok: true });
@@ -977,7 +1326,112 @@ export function _setStartTaskSessionHook(fn) { startTaskSessionHook = fn; }
  * @param worker 端末を操作している人 (状態変更の actor・ログに残る)
  * @param workers 実際に作業する人たち (複数可)。省略時は操作者ひとり
  */
-export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null }) {
+/**
+ * ⭐札を外したあとで開始に失敗したときの返し方 (Codex #1258 R1 中1)。
+ *
+ * better-sqlite3 の transaction は**ふつうに return すると確定する**。札を外してから
+ * 失敗を返すと、「はじめられないのに札だけ消えた」状態が残る。投げて外まで伝え、
+ * 呼び出し側の catch が taskResult を取り出して同じ答えを返す (画面から見た結果は変わらない)。
+ * 何も変えていなければ、そのまま返してよい。
+ */
+function failAfterBlockClear(result, clearedBlock) {
+  if (!clearedBlock) return result;
+  throw Object.assign(new Error(result.message || '作業をはじめられませんでした'), { taskResult: result });
+}
+
+/**
+ * 人数だけの作業の入力検査 (拠点と人数)。⭐**札を外すより先に**呼ぶ。
+ * startCrewSession の中でも同じことを見るが、あちらは「書く直前の最後の砦」。
+ */
+function checkCrewInput(db, facilityCode, crewSize) {
+  const n = Number(crewSize);
+  if (!Number.isSafeInteger(n) || n < 1 || n > 50) {
+    return { ok: false, error: 'bad_request', message: '人数は 1〜50 の整数で入れてください' };
+  }
+  const fac = db.prepare('SELECT code, external, offsite FROM f_iroha_facilities WHERE code = ? AND active = 1')
+    .get(String(facilityCode || ''));
+  if (!fac) return { ok: false, error: 'bad_facility', message: 'その拠点は選べません' };
+  if (!fac.external || fac.offsite) {
+    return { ok: false, error: 'bad_facility',
+      message: '人数だけで記録できるのは、いろはの中で作業する外部の事業者だけです' };
+  }
+  return null;
+}
+
+/**
+ * ⭐人数だけの作業をはじめる (要件 §AB-10)。パレット・ジョブサポ用。
+ *
+ * 個人の開始 (startTaskSession) と**同じ手順**を踏む — 止まっている札の確認、
+ * 未着手 → 作業中、手元のまとまりを作業中にする。違うのは記録の作り方だけ
+ * (個人名を持たず、拠点と人数で 1 行)。
+ *
+ * @param staff 操作した職員 (記録の「誰が押したか」。作業した人ではない)
+ */
+export function startTaskCrewSession({ taskId, staff, facilityCode, crewSize, batchId = null,
+  deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null }) {
+  const db = getDB();
+  const tx = db.transaction(() => {
+    const g = appModeGuard();
+    if (g) return g;
+    let t = getTask(taskId);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' };
+    if (t.status === 'closed') {
+      return { ok: false, error: 'done_card', message: 'このカードは終了しています (やり直すなら職員が状態を戻してください)' };
+    }
+    // ⭐入力の検査は**札を外すより先に**する (Codex #1258 R1 中1)。
+    //   人数が 0 のような入力で、開始できないのに札だけ消える、を起こさない
+    const pre = checkCrewInput(db, facilityCode, crewSize);
+    if (pre) return pre;
+    let clearedBlock = false;
+    if (t.blocked_reason) {
+      if (!clearBlock) {
+        const b = blockedOf(t);
+        return { ok: false, error: 'blocked', blocked: b, task: t,
+          message: `まだ「${b.label}」で止まっています。解消していれば、確認してから始められます` };
+      }
+      if (expectVersion == null) return { ok: false, error: 'bad_request', message: '確認した版 (expect_version) が必要です (画面を更新してください)' };
+      if (Number(expectVersion) !== t.version) {
+        return { ok: false, error: 'conflict', current: t, blocked: blockedOf(t),
+          message: '止まっている理由が変わっています。もう一度確かめてください' };
+      }
+      const c = clearTaskBlockInTx(db, t, { via: 'start', actor: `${staff.display_name} (いろはアプリ)`,
+        workerId: staff.id, workerName: staff.display_name, deviceLabel });
+      if (!c.ok) return c;
+      t = c.task;
+      clearedBlock = true;
+    }
+    const r = startCrewSession({ taskId: t.id, facilityCode, crewSize, batchId,
+      productCode: t.product_code, title: t.product_name, deviceLabel,
+      masterSnapshot: snapshotOf ? snapshotOf(t) : undefined });
+    // ⭐記録には**押した職員**と「どの拠点の何人か」を残す。作業した人の名前は持たない
+    if (!r.already) {
+      safeLogTaskEvent({ taskId: t.id, action: 'session_start', workerId: staff.id, workerName: staff.display_name,
+        deviceLabel, to: `crew ${facilityCode} ${crewSize}人`, ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
+    }
+    // ⭐札を外したあとで開始に失敗したら、**外したことごと戻す**。ふつうに return すると
+    //   このトランザクションは成功として確定し、「はじめられないのに札だけ消えた」が残る (Codex R1 中1)
+    if (!r.ok) return failAfterBlockClear(r, clearedBlock);
+    if (startTaskSessionHook) startTaskSessionHook(t);
+    startHomeBatches(db, t.id, utcNow());
+    let task = t;
+    if (t.status === 'not_started') {
+      const cs = changeTaskStatus({ taskId: t.id, to: 'in_progress', expectVersion: t.version,
+        actor: `${staff.display_name} (いろはアプリ)`, workerId: staff.id, workerName: staff.display_name, deviceLabel });
+      if (!cs.ok) throw Object.assign(new Error(cs.message || '状態を変更できませんでした'), { taskResult: cs });
+      task = cs.task;
+    }
+    return { ok: true, already: !!r.already, session: r.session, sessionId: r.session.id,
+      startedAt: r.session.startedAt, task: getTask(task.id) };
+  });
+  try {
+    return tx.immediate();
+  } catch (e) {
+    if (e && e.taskResult) return e.taskResult;
+    throw e;
+  }
+}
+
+export function startTaskSession({ taskId, worker, workers = null, deviceLabel = null, snapshotOf = null, clearBlock = false, expectVersion = null, batchId = null }) {
   const db = getDB();
   const crew = (Array.isArray(workers) && workers.length) ? workers : [worker];
   const tx = db.transaction(() => {
@@ -990,6 +1444,7 @@ export function startTaskSession({ taskId, worker, workers = null, deviceLabel =
     }
     // ⭐止まっている札が付いたまま始めない。画面は「まだ○○で止まっています。解消しましたか?」を出し、
     //   「はい」なら clear_block: true で送り直す → 同じトランザクションで札を外してから始める (案A)
+    let clearedBlock = false;
     if (t.blocked_reason) {
       if (!clearBlock) {
         const b = blockedOf(t);
@@ -1006,9 +1461,13 @@ export function startTaskSession({ taskId, worker, workers = null, deviceLabel =
       const c = clearTaskBlockInTx(db, t, { via: 'start', actor: `${worker.display_name} (いろはアプリ)`, workerId: worker.id, workerName: worker.display_name, deviceLabel });
       if (!c.ok) return c;
       t = c.task;
+      clearedBlock = true;
     }
+    // ⭐どのまとまりの作業か (要件 §AB-10)。まとまりが 1 つなら画面が自動で選ぶので操作は変わらない。
+    //   2 つ以上あって画面が絞れないときは選んでもらう — 決めずに始めると batch_id が NULL のまま残り、
+    //   「どのぶんに何分かかったか」が分からなくなる
     const r = startSessions({
-      taskId: t.id, productCode: t.product_code, title: t.product_name, workers: crew, deviceLabel,
+      taskId: t.id, productCode: t.product_code, title: t.product_name, workers: crew, deviceLabel, batchId,
       masterSnapshot: snapshotOf ? snapshotOf(t) : undefined,
     });
     // 記録は**人ごと**に残す (誰の分が新しく始まったかが後で分かるように)
@@ -1018,8 +1477,13 @@ export function startTaskSession({ taskId, worker, workers = null, deviceLabel =
       safeLogTaskEvent({ taskId: t.id, action: 'session_start', workerId: w.id, workerName: w.display_name,
         deviceLabel, to: 'start', ok: r.ok, error: r.ok ? null : `${r.error}: ${r.message}` });
     }
-    if (!r.ok) return r;
+    // ⭐札を外したあとで開始に失敗したら、外したことごと戻す (人数だけの開始と同じ — Codex R1 中1)
+    if (!r.ok) return failAfterBlockClear(r, clearedBlock);
     if (startTaskSessionHook) startTaskSessionHook(t);
+    // ⭐「作業をはじめる」= 手元 (物を持ち帰らない拠点) のまとまりも作業中にする。
+    //   カードが既に作業中でも通す — 外部に渡した時点でカードだけ先に作業中になっているため (Codex R2 中2)。
+    //   これから渡すぶん・外部のぶんは触らない
+    startHomeBatches(db, t.id, utcNow());
     let task = t;
     if (t.status === 'not_started') {
       const cs = changeTaskStatus({ taskId: t.id, to: 'in_progress', expectVersion: t.version,

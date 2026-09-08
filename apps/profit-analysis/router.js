@@ -14,6 +14,7 @@ import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { jstYearMonth, addMonthsYm, lastDayOfMonthStr } from '../../lib/jst-date.js';
 import { loadDimMall } from '../../lib/dim-mall.js';
 import inventoryDecisionRouter from './inventory-decision.js';
+import { queryPublished, csvCell } from '../expected-profit/query.js';
 
 const router = Router();
 
@@ -22,6 +23,42 @@ const router = Router();
 router.use('/api/inventory', inventoryDecisionRouter);
 
 // ─── モール別手数料率 (監査PR-11: ハードコード→dim_mall.fee_rate_approx に集約。値は従来と同一) ───
+
+// ─── 消費税率 → 税込換算の係数 ───
+// 🚨 mirror_products.消費税率 は「小数」で入っている (0.1 = 10%, 0.08 = 8%)。
+//    NE が返す整数 (10 / 8) は rebuild-m-products.js の TAX_RATES で小数へ変換され、
+//    mirror へは変換せずそのまま送られる (sync-to-render.js は SELECT p.*)。
+//    2026-09-07 まで `1 + (消費税率 || 10) / 100` と書いていたため 1 + 0.1/100 = 1.001 にしかならず、
+//    税込原価がほぼ税抜のままだった (= 粗利が原価の約10%分 過大に出ていた)。
+//    整数を渡してはいけないので、整数が来たら未知の単位として fallback する。
+export const TAX_RATE_FALLBACK = 0.1;
+export function taxMultiplier(rate) {
+  // 数値でない (null / undefined / NaN / 文字列) と、想定外の単位 (1 以上 = 整数表記の疑い)、
+  // 0 以下 (NE 未登録) は fallback。復元ではなく「異常値の代替」なので、
+  // 整数 8 も 10% に倒れる (将来 mirror が整数表記へ変わったら、ここではなく単位側を直す)
+  if (!Number.isFinite(rate) || rate <= 0 || rate >= 1) return 1 + TAX_RATE_FALLBACK;
+  return 1 + rate;
+}
+
+/**
+ * セット構成品の税率を1つに解決する (Amazon SKU→NE 展開で使う)。
+ *
+ * 税率混在・構成品の欠損は「正常値っぽい粗利を出さない」ため hard fail にする。
+ * 🚨 テストと本番が同じ関数を通るように、ここから export している
+ *    (テスト側でロジックを書き写すと、本番のガードを消しても PASS してしまう — Codex R2)
+ *
+ * @param {Array<number|null>} rates 構成品の消費税率 (mirror_products.消費税率 の生値)
+ * @param {boolean} allFound 全構成品が商品マスタで見つかったか
+ * @returns {{ok: true, multiplier: number} | {ok: false, reason: 'missing_component'|'mixed_tax_rate'}}
+ */
+export function resolveSetTax(rates, allFound) {
+  if (!allFound) return { ok: false, reason: 'missing_component' };
+  // NE 未登録 (null/0) は 10% 扱いに寄せてから混在を判定する。
+  // ここで寄せないと「税率が分かる構成品」と混在扱いになり、hard fail が増える
+  const unique = [...new Set(rates.map(r => r || TAX_RATE_FALLBACK))];
+  if (unique.length > 1) return { ok: false, reason: 'mixed_tax_rate' };
+  return { ok: true, multiplier: taxMultiplier(unique[0]) };
+}
 
 // ─── メイン画面 ───
 router.get('/', (req, res) => {
@@ -150,7 +187,8 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
             const prod = productMap.get(entry.ne_code);
             if (prod) {
               if (prod.原価) totalCost += prod.原価 * entry.qty;
-              taxRates.push(prod.消費税率 || 10);
+              // 生値のまま集める (fallback と混在判定は resolveSetTax が行う)
+              taxRates.push(prod.消費税率);
               if (prod.送料) totalShip += prod.送料 * entry.qty;
               if (productName === listingCode && prod.商品名) productName = prod.商品名;
             } else {
@@ -158,18 +196,20 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
             }
           }
           // 税率混在/部分欠損は hard fail (Codex指摘: 正常値っぽい粗利を出さない)
-          const uniqueTaxRates = [...new Set(taxRates)];
-          if (!allFound || uniqueTaxRates.length > 1) {
+          const setTax = resolveSetTax(taxRates, allFound);
+          if (!setTax.ok) {
             costExTax = 0;
-            taxRate = 1.1;
-            costSource = !allFound ? 'SKU→NE(部分欠損・原価不確定)' : 'SKU→NE(税率混在・原価不確定)';
+            taxRate = 1 + TAX_RATE_FALLBACK;
+            costSource = setTax.reason === 'missing_component'
+              ? 'SKU→NE(部分欠損・原価不確定)'
+              : 'SKU→NE(税率混在・原価不確定)';
           } else {
             costExTax = totalCost * qty;
             // FBMは商品マスタの送料、FBAは後でfba_feeを送料欄に入れる
             if (channel !== 'FBA') {
               shipping = totalShip * qty;
             }
-            taxRate = uniqueTaxRates.length === 1 ? 1 + uniqueTaxRates[0] / 100 : 1.1;
+            taxRate = setTax.multiplier;
             costSource = 'SKU→NE';
           }
         }
@@ -187,7 +227,7 @@ function calculateProfitData(db, { days = 30, mall = null } = {}) {
 
       if (prod) {
         costExTax = (prod.原価 || 0) * qty;
-        taxRate = 1 + (prod.消費税率 || 10) / 100;
+        taxRate = taxMultiplier(prod.消費税率);
         shipping = (prod.送料 || 0) * qty;
         productName = prod.商品名 || listingCode;
         if (costSource === '不明') costSource = prod.原価ソース || 'NE';
@@ -377,6 +417,76 @@ router.get('/api/profit/trend', (req, res) => {
 });
 
 // Amazon手数料キャッシュ状態
+// ─── 想定利益 (単品販売シナリオ) ───
+// 🚨 実績を使わない別系統。夜間に作った世代を読むだけで、ここでは計算しない。
+//    正本 = AI_reference『商品別想定利益_要件定義_20260907.md』
+router.get('/api/expected-profit', (req, res) => {
+  try {
+    const r = queryPublished({
+      mall: req.query.mall || undefined,
+      fulfillment: req.query.fulfillment || undefined,
+      expenseScope: req.query.scope || undefined,
+      salesClass: req.query.sales_class ? Number(req.query.sales_class) : undefined,
+      rankOnly: req.query.rank_only !== '0',
+      sort: req.query.sort === 'profit' ? 'profit' : 'margin',
+      order: req.query.order === 'asc' ? 'asc' : 'desc',
+      limit: Math.min(Number(req.query.limit) || 500, 5000),
+      offset: Number(req.query.offset) || 0,
+    });
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// CSV 出力。🚨 数式インジェクション対策は外部由来の文字列列にだけ適用する (§9.4)
+const EXPECTED_PROFIT_CSV_COLS = [
+  ['出品コード', 'mall_item_key', true], ['商品名', 'product_name', true], ['モール', 'mall', true],
+  ['出荷', 'fulfillment', true], ['NE品番', 'ne_code', true], ['紐づけ方', 'ne_code_source', true],
+  ['売価(税抜)', 'price_ex_tax'], ['売価(税込)', 'price_incl_tax'], ['送料収入(税抜)', 'postage_revenue_ex_tax'],
+  ['原価(税抜)', 'cost_ex_tax'], ['原価の出所', 'cost_method', true], ['単品何個ぶん', 'unit_quantity'],
+  ['配送方法', 'shipping_method', true], ['送料区分コード', 'shipping_code', true],
+  ['送料(税抜)', 'shipping_fee_ex_tax'], ['出荷作業料', 'shipping_work_ex_tax'],
+  ['梱包資材費', 'shipping_material_ex_tax'], ['人件費', 'shipping_labor_ex_tax'],
+  ['配送関係費 合計', 'shipping_total_ex_tax'],
+  ['FBA配送代行', 'fba_fee_ex_tax'],
+  ['販売手数料', 'referral_fee_ex_tax'], ['成約料', 'closing_fee_ex_tax'], ['基本成約料', 'per_item_fee_ex_tax'],
+  ['手数料率', 'fee_rate_display'], ['手数料 合計', 'fee_total_ex_tax'],
+  ['想定利益', 'expected_profit'], ['想定利益率', 'expected_margin_rate'],
+  ['費用範囲', 'expense_scope_version', true], ['計算状態', 'calculation_status', true],
+  ['計算できない理由', 'incomplete_reason', true],
+  ['ランキング対象', 'rank_eligible_now'], ['対象外の理由', 'rank_exclusion_reason_now', true],
+  ['価格の状態', 'price_status', true], ['原価の状態', 'cost_status', true],
+  ['手数料の状態', 'fee_status', true], ['配送マスタの状態', 'shipping_master_status', true],
+  ['送料収入の状態', 'shipping_revenue_status', true], ['表示時に失効', 'expired_now'],
+  ['世代', 'generation_id', true], ['計算日時', 'built_at', true],
+];
+
+router.get('/api/expected-profit.csv', (req, res) => {
+  try {
+    const r = queryPublished({
+      mall: req.query.mall || undefined,
+      expenseScope: req.query.scope || undefined,
+      rankOnly: req.query.rank_only !== '0',
+      sort: req.query.sort === 'profit' ? 'profit' : 'margin',
+      order: req.query.order === 'asc' ? 'asc' : 'desc',
+      limit: 100000,
+    });
+    const out = [EXPECTED_PROFIT_CSV_COLS.map(c => csvCell(c[0])).join(',')];
+    for (const row of r.rows) {
+      out.push(EXPECTED_PROFIT_CSV_COLS
+        .map(([, key, isText]) => csvCell(row[key], { isExternalText: !!isText })).join(','));
+    }
+    const BOM = '﻿';                       // Excel が UTF-8 と分かるように
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition',
+      `attachment; filename="expected-profit-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(BOM + out.join('\r\n'));
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 router.get('/api/fee-status', (req, res) => {
   try {
     const db = getMirrorDB();

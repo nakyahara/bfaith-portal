@@ -1,0 +1,120 @@
+<%# 方針の編集ダイアログ。index / listing で共用。openPolicyDialog(rowJson) で開く %>
+<dialog id="policy-dlg">
+  <form class="dlg" id="policy-form" method="dialog">
+    <h3>値付けの方針を変える</h3>
+    <div class="sub" id="pd-sub"></div>
+    <div class="grid">
+      <div class="field">
+        <label for="pd-mode">追従モード</label>
+        <select id="pd-mode" name="mode">
+          <% for (const [k, v] of Object.entries(MODES)) { %><option value="<%= k %>"><%= v %></option><% } %>
+        </select>
+      </div>
+      <div class="field">
+        <label for="pd-offset">上乗せ (円・マイナス可)</label>
+        <input id="pd-offset" name="offset_jpy" type="number" step="1" placeholder="0">
+      </div>
+      <div class="field">
+        <label for="pd-floor">赤字ストッパー (税込円・空 = 計算した下限だけ)</label>
+        <input id="pd-floor" name="floor_price" type="number" step="1" min="1" placeholder="例: 1200">
+      </div>
+      <div class="field">
+        <label for="pd-ceiling">高値ストッパー (税込円・空 = なし)</label>
+        <input id="pd-ceiling" name="ceiling_price" type="number" step="1" min="1" placeholder="例: 2500">
+      </div>
+      <div class="field">
+        <label for="pd-margin">最低粗利率 (% ・空 = 既定 <%= (DEFAULT_MIN_MARGIN_RATE * 100).toFixed(0) %>%)</label>
+        <input id="pd-margin" name="min_margin_rate" type="number" step="0.1" min="0" max="89" placeholder="例: 10">
+      </div>
+      <div class="field">
+        <label for="pd-note">メモ (任意)</label>
+        <input id="pd-note" name="note" type="text" maxlength="500">
+      </div>
+    </div>
+    <div class="hint">
+      下限は「人が入れた赤字ストッパー」と「原価 + 手数料 + 最低粗利から計算した下限」の<b>高い方</b>が効きます。
+      空欄でも原価が登録されていれば原価割れの判定は出ません。
+    </div>
+    <div class="grid">
+      <div class="field">
+        <label for="pd-reason" class="req">変更の理由</label>
+        <select id="pd-reason" name="reason_code">
+          <% for (const [k, v] of Object.entries(REASON_CODES)) { %><option value="<%= k %>"><%= v %></option><% } %>
+        </select>
+      </div>
+      <div class="field">
+        <label for="pd-reason-text">理由のメモ (「その他」は必須)</label>
+        <input id="pd-reason-text" name="reason_text" type="text" maxlength="300">
+      </div>
+    </div>
+    <div class="err" id="pd-err"></div>
+    <div class="actions">
+      <button type="button" class="btn" id="pd-cancel">やめる</button>
+      <button type="submit" class="btn btn-primary" id="pd-save">記録する (価格は変わりません)</button>
+    </div>
+  </form>
+</dialog>
+<script>
+  // ★グローバル (window.xxx) を経由せず、トップレベルの関数宣言で画面内から呼べるようにする
+  //   (静的検査が window / globalThis の使用を禁止している — 通信の別名づけに使われるため)
+  function showToast(msg) {
+    var t = document.getElementById('toast');
+    if (!t) return;
+    t.textContent = msg; t.style.display = 'block';
+    clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, 2500);
+  }
+  var policyDialogState = { sku: null };
+  // row: { seller_sku, ne_name, mode, floor_price, ceiling_price, offset_jpy, min_margin_rate, note, computed_floor }
+  function openPolicyDialog(row) {
+    var dlg = document.getElementById('policy-dlg');
+    var form = document.getElementById('policy-form');
+    var err = document.getElementById('pd-err');
+    policyDialogState.sku = row.seller_sku;
+      document.getElementById('pd-sub').textContent = (row.ne_name || '') + ' / ' + row.seller_sku
+        + (row.computed_floor != null ? ' — 計算した下限 ' + Number(row.computed_floor).toLocaleString() + ' 円' : ' — 下限は計算できていません (原価・手数料・送料のどれかが不明)');
+      form.mode.value = row.mode || 'off';
+      form.offset_jpy.value = row.offset_jpy == null ? '' : row.offset_jpy;
+      form.floor_price.value = row.floor_price == null ? '' : row.floor_price;
+      form.ceiling_price.value = row.ceiling_price == null ? '' : row.ceiling_price;
+      form.min_margin_rate.value = row.min_margin_rate == null ? '' : Math.round(row.min_margin_rate * 1000) / 10;
+      form.note.value = row.note || '';
+      form.reason_code.value = row.has_policy ? 'margin' : 'initial';
+      form.reason_text.value = '';
+      err.textContent = '';
+      dlg.showModal();
+  }
+  (function () {
+    var dlg = document.getElementById('policy-dlg');
+    var form = document.getElementById('policy-form');
+    var err = document.getElementById('pd-err');
+    document.getElementById('pd-cancel').addEventListener('click', function () { dlg.close(); });
+    form.addEventListener('submit', function (ev) {
+      ev.preventDefault();
+      err.textContent = '';
+      var body = {
+        mode: form.mode.value,
+        offset_jpy: form.offset_jpy.value === '' ? 0 : form.offset_jpy.value,
+        floor_price: form.floor_price.value === '' ? null : form.floor_price.value,
+        ceiling_price: form.ceiling_price.value === '' ? null : form.ceiling_price.value,
+        min_margin_rate: form.min_margin_rate.value === '' ? null : form.min_margin_rate.value,
+        note: form.note.value,
+        reason_code: form.reason_code.value,
+        reason_text: form.reason_text.value
+      };
+      var btn = document.getElementById('pd-save');
+      btn.disabled = true;
+      fetch('/apps/amazon-pricing/api/policies/' + encodeURIComponent(policyDialogState.sku), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      }).then(function (r) { return r.json().then(function (j) { return { status: r.status, json: j }; }); })
+        .then(function (res) {
+          btn.disabled = false;
+          if (!res.json.ok) { err.textContent = res.json.error || ('エラー (' + res.status + ')'); return; }
+          dlg.close();
+          if (res.json.changed.length === 0) { showToast('変更はありませんでした'); return; }
+          showToast('記録しました (' + res.json.changed.length + ' 項目)。価格は変わっていません');
+          setTimeout(function () { location.reload(); }, 600);
+        })
+        .catch(function (e) { btn.disabled = false; err.textContent = '通信エラー: ' + e.message; });
+    });
+  })();
+</script>

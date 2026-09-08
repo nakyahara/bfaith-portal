@@ -35,7 +35,6 @@ async function createListing(params) { return callMiniPC('/listing', { method: '
 async function patchListing(params) { return callMiniPC('/listing', { method: 'PATCH', body: params }); }
 async function getShippingTemplates() { return callMiniPC('/shipping-templates'); }
 async function getItemOffers(asin, condition = 'New') { return callMiniPC(`/offers/${encodeURIComponent(asin)}?condition=${encodeURIComponent(condition)}`); }
-async function updatePrice(params) { return callMiniPC('/price', { method: 'POST', body: params }); }
 async function getActiveListingsReport() { return callMiniPC('/active-listings-report', { timeout: 180000 }); }
 async function getSalesCountBySku(days = 365) { return callMiniPC(`/sales-count?days=${days}`, { timeout: 180000 }); }
 async function searchByJan(jan) { return callMiniPC(`/search/jan/${encodeURIComponent(jan)}`); }
@@ -49,7 +48,6 @@ import { initDb, saveResearch, getResearch, getResearchById, updateResearchStatu
 import { loadSuppliers, addSupplier, deleteSupplier } from './suppliers.js';
 import { loadShipping, addShipping, updateShipping, deleteShipping } from './shipping.js';
 import { getSetting, setSetting, getAllSettings } from './settings.js';
-import { startPriceWorker, stopPriceWorker, getWorkerStatus, refreshProductCache } from './price-scheduler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -1655,17 +1653,9 @@ router.get('/api/amazon/offers/:asin', async (req, res) => {
   }
 });
 
-// ── API: 価格更新（価格改定用・技術検証） ──
-router.post('/api/amazon/update-price', async (req, res) => {
-  try {
-    const { sku, price } = req.body;
-    const result = await updatePrice({ sku, price: Number(price) });
-    res.json(result);
-  } catch (err) {
-    console.error('[ProfitCalc] 価格更新エラー:', err.message, err.stack);
-    res.status(500).json({ error: err.message });
-  }
-});
+// ── (削除 2026-09-07) POST /api/amazon/update-price — Amazon の価格を直接書き換える口。
+//    2026-03 の誤改定事故のあと放置されていた。Amazon の価格管理は apps/amazon-pricing (書き込み無し) に作り直し、
+//    実行段階は設計書 (AI_reference『Amazon価格管理_自社プライスター_要件定義_20260907.md』) の M3 で別途つくる。
 
 // ── API: Amazon出品商品レポート（SKU数確認用） ──
 router.get('/api/amazon/listings-report', async (req, res) => {
@@ -1800,26 +1790,9 @@ router.get('/api/price-revision/history/:productId', async (req, res) => {
   }
 });
 
-// ワーカー制御
-router.get('/api/price-revision/worker', (req, res) => {
-  res.json(getWorkerStatus());
-});
-
-router.post('/api/price-revision/worker/start', (req, res) => {
-  startPriceWorker();
-  res.json({ ok: true });
-});
-
-router.post('/api/price-revision/worker/stop', (req, res) => {
-  stopPriceWorker();
-  res.json({ ok: true });
-});
-
-// 商品キャッシュ手動リフレッシュ
-router.post('/api/price-revision/refresh-cache', (req, res) => {
-  refreshProductCache();
-  res.json({ ok: true });
-});
+// (削除 2026-09-07) /api/price-revision/worker* — SQS 通知で価格を自動改定するワーカーの起動口。
+//   price-scheduler.js / price-engine.js ごと削除した (2026-03-30 に server.js 側は無効化済みだったが、
+//   この API から誰でも起動できる状態が残っていた)。
 
 // ── API: Phase 1A 一括リサーチセッション管理 ──
 // 仕様: g:/共有ドライブ/AI_reference/システム設計/profit-calculator/Phase1A_実装仕様書_20260413.md

@@ -196,6 +196,31 @@ export const JOBS_REGISTRY = [
   },
   // ─────────────── scheduled_job (miniPC Task Scheduler) ───────────────
   {
+    id: 'expected-profit-nightly',
+    type: 'scheduled_job',
+    importance: 'P3',   // 数日止まっても当日業務は止まらない (見る指標であって、業務の入口ではない)
+    owner: '中原さん',
+    purpose: '全出品の想定利益 (単品販売シナリオ) を夜間計算。'
+      + '出品列挙 (Amazon 出品レポート + 楽天 RMS items/search) → モール登録価格の取得 → '
+      + 'Amazon 手数料の再見積もり → 世代を作って公開前検証 → Render へ転送してポインタ切替。'
+      + 'daily-sync (07:00・P1・45ステップ) に載せず独立タスクにしたのは、'
+      + '50〜100分の価格取得で朝の未発送アラートを遅らせないため。'
+      + '書込先は専用DB expected-profit.db (warehouse.db は 11GB で product-idea-scout が常駐しているため読み取りのみ)',
+    where: 'miniPC TaskScheduler [ExpectedProfitNightly] → node apps/expected-profit/nightly.js',
+    schedule: '毎日 23:30 (全体終了期限 06:00。超えたら中断して翌日に持ち越す)',
+    anchor_hour_jst: 23,
+    anchor_minute_jst: 30,
+    grace_hours: 7,     // 翌 06:30 まで。daily-sync 開始 (07:00) より前に判定が出る
+    lifecycle: 'permanent',
+    runbook: '🚨 成功 ping は「Render の公開ポインタが対象世代になった」ことを読み戻して確認してから打つ。'
+      + 'プロセスが正常終了しただけでは ok にならない。'
+      + '失敗時は logs を確認 → node apps/expected-profit/nightly.js --skip-publish で世代だけ作り直せる。'
+      + '画面 = /apps/profit-analysis の「想定利益 (単品)」タブ。'
+      + '公開中の世代は GET /apps/expected-profit/sync/published (x-sync-key) で見える。'
+      + '必要 env: SP_API_* / RAKUTEN_* / RENDER_MIRROR_URL / MIRROR_SYNC_KEY / JOBS_MONITOR_TOKEN。'
+      + '正本 = AI_reference『システム設計/商品別想定利益_要件定義_20260907.md』',
+  },
+  {
     id: 'ph-generate-nightly',
     type: 'scheduled_job',
     importance: 'P2',
@@ -363,7 +388,10 @@ export const JOBS_REGISTRY = [
       + '出力し、rclone で共有ドライブへ置く。社内ポータル「入荷受付チェック (iPad)」がそれを30分おきに取り込み、'
       + '現場が紙の入荷受付伝票の代わりに使う。止まると iPad の一覧が古いままになる'
       + ' (管理画面から手動アップロードで凌げるので P2)。'
-      + '⭐0件の日は正常 (受付済なし = 全部検品済み)。ヘッダだけの CSV を Drive まで送り、一覧を空にする',
+      + '⭐0件の日は **CSV を作らない・送らない** (ローカルも Drive も前回の一覧を温存。値札CSVと同じ。2026-09-08 改定)。'
+      + '取込側 (Render) も 0 件・中身が別物の CSV を断る (#1263) — 二重の歯止め。'
+      + '2026-09-08 に 0 行の CSV で Drive を上書き → 取込が「全行が消えた」と判定 → いろはの在庫化カードが一斉に消えた事故の再発防止。'
+      + '本当に入荷が無い日は前回の一覧が残るだけで正しい。手動アップロードも同じ歯止めを通る (断られた CSV は、中身を見て確認したときだけ合言葉つきで通せる)',
     where: 'miniPC TaskScheduler [Logizard-NyukaCSV] → C:\tools\logizard-automation\run-nyuka-csv-scheduled.bat',
     schedule: '毎日 00:20 / 08:40 / 11:45',
     // 🚨 anchor は **08:40 のまま**にする (2026-09-07 に 00:20 を足したときの判断)。
@@ -570,6 +598,7 @@ export const JOBS_REGISTRY = [
       '翌日 late で赤くなる。「正常終了しているが仕事が無い」を ok にしたせいで 2026-08-07〜27 の20日間、' +
       '監視が緑のまま何も進まなかった — ここを緑に戻してはいけない。' +
       '③ 収集の完全性は `node finder.js --status` で見る (⚠️不完全 = 進捗率は「下限」)。' +
+      '品質修正版は miniPC C:\\tmp\\product-scout-quality-work\\scripts\\product-idea-scout\\run-products.bat から起動。SCOUT_HOMEは既存データ、WAREHOUSE_DBは既存本番DB。手順は scripts/product-idea-scout/README.md。既存Taskと成功pingを継続し新規タスクは作らない。' +
       '④ 画面 = ポータル /apps/product-scout。供給 (concepts.js → push.js) はランナーが毎回自動で行う。' +
       '⚠️送信に失敗しても収集は止めない設計なので、画面が古いと思ったら products.log の ' +
       '「publish start」以降を見ること (2026-08-28〜09-01 は publish 自体が配線されておらず、' +

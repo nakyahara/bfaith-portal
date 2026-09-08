@@ -28,15 +28,20 @@ import {
   setWorkerPin, verifyWorkerPin,
   logEvent, listEvents,
   getCachePage, startSessions, stopSession, stopSessions, undoStopSessions, sessionsOverlappingDay, listSessionsForAdmin, searchSessions, SESSION_SEARCH_MAX, jstDayStartUtc, voidSession,
+  createFacilityLink, verifyFacilityLink, listFacilityLinks, revokeFacilityLink, setFacilityCapacity,
   getMeta, setMetaValue, sourceOfTruth,
 } from './db.js';
 import { ensureFresh, changeStatus, fetchCardLive, cacheStatsForAdmin, STATUSES } from './notion-read.js';
 import { surveyNotion, planImport, planToCsv, applyImport, reconcile, listMigrationFiles } from './migrate.js';
-import { countTasksByStatus, listTasksNeedingReview, listOrphans } from './tasks-db.js';
+import { countTasksByStatus, listTasksNeedingReview, listOrphans, listFacilities, startTaskCrewSession } from './tasks-db.js';
 import { OPEN_STATUSES } from './tasks.js';
-import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
+import { buildList, buildTaskList, buildTaskCard, buildHistory, buildPlan, buildConsignPlan, buildFacilityView, facilityCapacityGuard, classifyMasterEdit, clearEnrichCache, masterOf, masterOfTask, jstToday, jstTomorrow, whenOf } from './service.js';
 import { capabilitiesFor } from './capabilities.js';
+// 🚨 2026-09-08 の事故の復旧 (空の入荷CSVで一斉取消)。片づいたら消してよい
+import { surveyCancelled, restoreCancelled } from './restore-cancelled.js';
 import { transitionNeedsStaff, TASK_STATUSES, statusLabel, blockLabel } from './tasks.js';
+import { batchTransitionNeedsStaff, splitBatchByExpiry } from './batches.js';
+import { bumpWindow } from './rate-window.js';
 import { setTaskBlock, clearTaskBlock, undoTaskBlock, blockedOf } from './tasks-db.js';
 import { notifyStaff, materialsShortageText } from './notify.js';
 import { enqueuePrintJob, leaseNextJob, markSubmitted, markFinished, getJobStatusFor, recordHeartbeat, listPrintAgents, latestJobsByTask, listPrintJobs, publicJob, MAX_COPIES, LEASE_SEC } from './print-queue.js';
@@ -76,7 +81,7 @@ function notifyBlockUndone(ticket, who) {
     .catch(() => { /* notifyStaff は throw しない */ });
 }
 import {
-  getTask, changeTaskStatus, setPlannedDate, clearMigrationReview, resolveCancellation,
+  getTask, changeTaskStatus, changeBatchStatus, batchesOfTask, setPlannedDate, clearMigrationReview, resolveCancellation, cancellationOf,
   listLabelWaits, upsertLabelWait, getLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
   listNamelessTasks, removeStrayTask, setFacility, setProgress,
   startTaskSession, countChangesSince, switchSourceOfTruth, bulkCloseReady,
@@ -84,6 +89,7 @@ import {
 import { updateWorkMasterRow, addWorkMasterRow, codeKeyOf } from '../inbound-check/work-master.js';
 import { notionSweepRunning } from '../inbound-check/notion-sync.js';
 import { listLinkConflicts, countLinkConflicts, mergeLinkConflict } from './task-intake.js';
+import { startConsignment, markPrepared, markHanded, cancelConsignment, recordReturn, settleConsignment, getConsignment, updateReturnCounts } from './consign.js';
 import { startStaffUnlock, staffUnlockOf, endStaffUnlock, STAFF_UNLOCK_MS } from './db.js';
 import {
   addMedia, inspectMediaUpload, moveStoredFile, promoteStagedMedia, dropMedia, cardWriteBlockReason, recordMediaCancel, softDeleteMedia, resetMedia, listMediaForAdmin, schedule as scheduleMedia, getMediaRow, driveDownload,
@@ -205,6 +211,9 @@ function checkOrigin(req, res, next) {
 function access(req, res, next) {
   if (req.path === '/manifest.json' || req.path === '/sw.js') return next();   // 静的 (中身に秘密なし)
   if (req.path === '/enroll' || req.path === '/enroll/redeem') return next();
+  // ⭐外部施設の専用 URL (要件 §AB-11 の 6)。ログインも端末登録もせず、**URL のトークンだけ**で入る。
+  //   中身は router.use('/f', ...) がトークンを確かめてから決める (ここは素通しするだけ)
+  if (req.path === '/f' || req.path.startsWith('/f/')) return next();
   // 🏷 印刷係 (いろはPC) は Cookie ではなく Authorization ヘッダーで名乗る。/print/ 配下はここでは素通しし、
   //   router.use('/print', requirePrintAgent) が kind='agent' の端末だけを通す (iPad の端末Cookieでは絶対に印刷ジョブを取れない)
   if (req.path === '/print' || req.path.startsWith('/print/')) return next();
@@ -511,13 +520,19 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
   if (tid == null) return res.status(400).json(BAD_TASK_ID);
   const deviceLabel = req.iwDevice ? req.iwDevice.label : (req.iwUser || null);
   const r = enqueuePrintJob({
-    taskId: tid, copies: numOrNull(b.copies),
+    taskId: tid,
+    // ⭐どのぶんのラベルか (要件 §AB-12)。分かれたカードで決めずに刷ると、
+    //   期限の違うぶんに同じラベルを貼ってしまう
+    batchId: numOrNull(b.batch_id),
+    copies: numOrNull(b.copies),
     packQty: b.pack_qty == null || b.pack_qty === '' ? null : b.pack_qty,
     extraPackQty: b.extra_pack_qty == null || b.extra_pack_qty === '' ? null : b.extra_pack_qty,
     expiry: b.expiry == null ? null : String(b.expiry),
     targetDeviceId: numOrNull(b.target_device_id),
     clientRequestId: b.client_request_id,
     acknowledgeUnknownJobId: numOrNull(b.acknowledge_unknown_job_id),
+    // ⭐「さっき出したのと同じラベルだが、それとは別に要る」と人が確かめた証跡 (2026-09-08)
+    acknowledgeDuplicateJobId: numOrNull(b.acknowledge_duplicate_job_id),
     requestedBy: w.worker.display_name, requestedDevice: deviceLabel,
   });
   // 記録 (だれが・どの端末で・何枚)。再送 (replayed) は積んでいないので書かない
@@ -527,6 +542,8 @@ router.post('/api/print/jobs', checkOrigin, api((req, res) => {
   }
   if (!r.ok) {
     const status = ['in_progress', 'confirm_unknown', 'confirm_manual', 'state_changed', 'idempotency_conflict', 'closed_task'].includes(r.error) ? 409 : r.error === 'not_found' ? 404 : 400;
+    // pick_batch = 「どのぶんか選んで」。入力の不足なので 400 (画面は選ばせて出し直す)
+    // no_batch = 「全部取り消されている」。出せるものが無いので 400
     // (bad_extra_qty など入力の誤りは 400)
     return res.status(status).json(r);
   }
@@ -688,13 +705,44 @@ function changeStatusApp(req, res, worker) {
   const t = getTask(taskId);
   if (!t) return res.status(404).json({ ok: false, error: 'not_found', message: 'カードが見つかりません。一覧を更新してください' });
   if (!TASK_STATUSES.includes(to)) return res.status(400).json({ ok: false, error: 'bad_status', message: '変更先の状態が不正です' });
+  // ⭐まとまりが 2 つ以上あるカードで、どのぶんかが指定されていれば**そのぶんだけ**動かす (要件 §AB-11 の 5)。
+  //   いろはのぶんが終わったら、外部に預けたぶんが返るのを待たずに棚入れできる。
+  //   まとまりが 1 つのカード (ふだんの全部) は今までどおりカード単位 — 見え方は変わらない
+  const bs = batchesOfTask(t.id);
+  const batchIdIn = 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined;
+  const perBatch = batchIdIn != null && batchIdIn !== '' && bs.length > 1;
+  const target = perBatch ? bs.find((b) => String(b.id) === String(batchIdIn)) : null;
+  if (perBatch && !target) {
+    return res.status(400).json({ ok: false, error: 'bad_batch', message: 'そのぶんはこのカードにありません。一覧を更新してください' });
+  }
+  // 職員限定かは「どこから変えるか」で決まる。まとまり単位なら**そのまとまりの表**で見る (二重に定義しない)
+  const needsStaff = perBatch
+    ? batchTransitionNeedsStaff(target.work_status, to === 'closed' ? 'done' : to)
+    : transitionNeedsStaff(t.status, to);
   let isStaff = false;
   if (hasSessionAccess(req)) {
     isStaff = true;
-  } else if (worker.worker_type === 'staff' && transitionNeedsStaff(t.status, to)) {
+  } else if (worker.worker_type === 'staff' && needsStaff) {
     const pinCheck = verifyWorkerPin(worker.id, req.body?.pin);
     if (!pinCheck.ok) return res.status(STATUS_HTTP[pinCheck.error] || 403).json({ ok: false, ...pinCheck });
     isStaff = true;
+  }
+  if (perBatch) {
+    const rb = changeBatchStatus({
+      taskId: t.id, batchId: target.id, to, closeReason: req.body?.close_reason || null,
+      expectVersion: req.body?.expect_version,
+      doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+      lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+      varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
+      reason: req.body?.reason || null,
+      actor: hasSessionAccess(req) ? req.iwUser : `${worker.display_name} (いろはアプリ)`,
+      isStaff, workerId: worker.id, workerName: worker.display_name, deviceLabel: deviceLabelOf(req),
+    });
+    if (!rb.ok) {
+      return res.status(taskErrorStatus(rb.error)).json({ ...rb, current: rb.current ? publicTask(rb.current) : undefined });
+    }
+    return res.json({ ok: true, already: !!rb.already, task: publicTask(rb.task), status: rb.task.status,
+      status_label: statusLabel(rb.task), listed: rb.task.status !== 'closed' });
   }
   const r = changeTaskStatus({
     taskId: t.id, to, expectVersion: req.body?.expect_version,
@@ -702,7 +750,12 @@ function changeStatusApp(req, res, worker) {
     // ⭐できた数と中断メモ (要件 §Y)。送られたときだけ書き換える。
     //   状態と同じ 1 回の書き込みに載せる — 分けると「状態は変わったが数は入らなかった」が起きる
     doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+    // 作れなかった数・ひとこと (要件 §AB-3)。⭐空欄を 0 と読まないので、送られたときだけ触る
+    lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+    varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    // ⭐どのまとまりの数か (預けたあと、いろは のぶんに入れる — 自己レビュー B)。送られたときだけ
+    batchId: 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined,
     reason: req.body?.reason || null,
     actor: hasSessionAccess(req) ? req.iwUser : `${worker.display_name} (いろはアプリ)`,
     isStaff, workerId: worker.id, workerName: worker.display_name, deviceLabel: deviceLabelOf(req),
@@ -722,6 +775,8 @@ function publicTask(t) {
     blocked: blockedOf(t), blocked_label: blockLabel(t),
     done_qty: t.done_qty ?? null, hold_memo: t.hold_memo || null,
     planned_date: t.planned_date, when: t.status === 'closed' ? null : whenOf(t.planned_date), cancellation_requested_at: t.cancellation_requested_at, migration_review: !!t.migration_review,
+    // ⭐入荷側で取り消されたカード — 理由と出どころ。職員が 続ける/取り消す を決める材料 (2026-09-08)
+    cancellation: cancellationOf(t),
     external_ready: !!t.external_ready,
   };
 }
@@ -830,6 +885,126 @@ router.post('/api/facility', checkOrigin, api((req, res) => {
   res.json({ ok: true, task: publicTask(r.task), staff_mode: staffModeOf(req) });
 }));
 
+/**
+ * 🚚 外部施設にあずける (要件 §AB-7)。**職員だけ**。
+ * 押した結果として、そのカードの「まとまり」から未着手分が切り出される
+ * (「まとまりを分割する」という操作は現場に見せない — 要件 §AB-5)。
+ */
+router.post('/api/consign', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  // ⭐中身を先に見る (不正な要求で職員モードだけ開いてしまわないように — Codex P1 R2)
+  const taskId = parseTaskId(req.body?.id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  const batchId = Number(req.body?.batch_id);
+  if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: 'どのぶんを預けるか (batch_id) が要ります' });
+  if (typeof req.body?.facility_code !== 'string' || !req.body.facility_code) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: 'どこへ渡すかを選んでください' });
+  }
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const r = startConsignment({
+    taskId, batchId, facilityCode: req.body.facility_code, qty: req.body?.qty,
+    dueDate: req.body?.due_date ?? null, expectVersion: req.body?.expect_version,
+    actor: `${gate.worker.display_name} (いろはアプリ)`,
+    guard: planGuardOf(req, gate.worker),
+    // ⭐受け入れ枠は**書き込みのトランザクションの中で**数える (Codex R1 中2)
+    capacityGuard: facilityCapacityGuard,
+  });
+  if (!r.ok) return res.status(consignErrorStatus(r.error)).json(r);
+  safeLogTaskEvent({ taskId, action: 'task_consign', to: `${req.body.facility_code} ${r.consignment.planned_qty}個`,
+    workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req), ok: true });
+  res.json({ ok: true, consignment: r.consignment, task: publicTask(getTask(taskId)), staff_mode: staffModeOf(req) });
+}));
+
+/**
+ * 🚚 預ける計画 (要件 §AB-11 の 7b)。**読むだけ**。
+ *
+ * ⭐職員だけ。預けは職員の仕事で、この画面から用意・受け渡しを進める (§W-5 と同じ線引き)。
+ * ⭐Notion が正本のうちは預け自体が使えないので、下見も出さない (空の画面を見せない)。
+ */
+router.get('/api/consign-plan', api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  if (!staffModeOf(req).staff) {
+    return res.status(403).json({ ok: false, error: 'staff_required', message: '預ける計画を見られるのは職員だけです' });
+  }
+  res.json({ ok: true, ...buildConsignPlan(), staff_mode: staffModeOf(req), serverNow: new Date().toISOString() });
+}));
+
+/** 🚚 渡した / やめた / 返却を受け取った (要件 §AB-7)。**職員だけ**。返却の確定は いろは 側 */
+/**
+ * ⭐**期限が違うぶんを分ける** (要件 §AB-11 の 8 / §AB-12)。職員だけ。
+ *
+ * 同じカードに期限の違う物が混ざって届いたとき、分けないと箱ラベルの期限を 1 つしか選べない。
+ * これまで まとまりが分かれるのは「外部にあずける」ときだけだった。
+ */
+router.post('/api/batches/split', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  const batchId = numOrNull(req.body?.batch_id);
+  if (batchId == null) return res.status(400).json({ ok: false, error: 'bad_request', message: 'どのぶんを分けるかを選んでください' });
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  if (isClosedCardId(taskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
+  const db = getDB();
+  // ⭐まとまりを増やすので、読んでから書くまでを 1 つのトランザクションで
+  const r = db.transaction(() => splitBatchByExpiry(db, { taskId, batchId,
+    qty: req.body?.qty, expiry: req.body?.expiry ?? null,
+    // ⭐画面が見ていた版。二重に分けない (同じ 100 個を 2 人が 40 個ずつ分けると現物と合わなくなる)
+    expectVersion: req.body?.expect_version,
+    actor: `${gate.worker.display_name} (いろはアプリ)` })).immediate();
+  if (!r.ok) return res.status(taskErrorStatus(r.error)).json(r);
+  safeLogTaskEvent({ taskId, action: 'batch_split', workerId: gate.worker.id, workerName: gate.worker.display_name,
+    to: `#${r.batch.seq} へ ${r.batch.planned_qty} 個${r.batch.expiry ? ' (期限 ' + r.batch.expiry + ')' : ''}`, ok: true });
+  res.json({ ok: true, batch: { id: r.batch.id, seq: r.batch.seq, planned_qty: r.batch.planned_qty, expiry: r.batch.expiry } });
+}));
+
+router.post('/api/consign/update', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  const id = Number(req.body?.consignment_id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'bad_request', message: '預けの記録が指定されていません' });
+  const action = String(req.body?.action || '');
+  if (!['prepared', 'handed', 'cancel', 'return', 'settle', 'fix_return'].includes(action)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '何をするか (用意した / 渡した / やめる / 返却 / 精算 / 数を入れる) が要ります' });
+  }
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  const common = { consignmentId: id, expectVersion: req.body?.expect_version,
+    actor: `${gate.worker.display_name} (いろはアプリ)`, guard: planGuardOf(req, gate.worker) };
+  const r = action === 'prepared' ? markPrepared({ ...common, qty: req.body?.qty ?? null })
+    : action === 'handed' ? markHanded({ ...common, qty: req.body?.qty ?? null })
+    : action === 'cancel' ? cancelConsignment(common)
+    : action === 'settle' ? settleConsignment({ ...common, missingQty: req.body?.missing_qty ?? 0, note: req.body?.note ?? null })
+    // ⭐返ってきた物の数をあとから入れる / 直す (精算ずみでも)。入れないと棚入れに進めない
+    : action === 'fix_return' ? updateReturnCounts({ ...common, returnId: req.body?.return_id,
+        goodQty: 'good_qty' in (req.body || {}) ? req.body.good_qty : undefined,
+        lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+        note: 'note' in (req.body || {}) ? req.body.note : undefined })
+    : recordReturn({ ...common, returnedQty: req.body?.returned_qty,
+        goodQty: 'good_qty' in (req.body || {}) ? req.body.good_qty : undefined,
+        lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+        note: req.body?.note ?? null, idempotencyKey: req.body?.idempotency_key ?? null });
+  if (!r.ok) return res.status(consignErrorStatus(r.error)).json(r);
+  const c = r.consignment || getConsignment(id);
+  const b = c ? getDB().prepare('SELECT task_id FROM f_iroha_task_batches WHERE id = ?').get(c.batch_id) : null;
+  if (b) {
+    safeLogTaskEvent({ taskId: b.task_id, action: 'task_consign', to: `${action} ${c.state}`,
+      workerId: gate.worker.id, workerName: gate.worker.display_name, deviceLabel: deviceLabelOf(req), ok: true });
+  }
+  res.json({ ok: true, replayed: !!r.replayed, consignment: c,
+    task: b ? publicTask(getTask(b.task_id)) : undefined, staff_mode: staffModeOf(req) });
+}));
+
+/** 預けの断り方 → HTTP。数の入れ違いは 400、状態や版のずれは 409 */
+function consignErrorStatus(e) {
+  if (e === 'not_found') return 404;
+  if (e === 'over_capacity') return 409;   // 置ける箱がいっぱい (状態のずれ。入力の間違いではない)
+  if (e === 'capacity_unknown') return 409; // 入数が未登録で箱数を数えられない (登録すれば直るので、状態のずれ)
+  if (['conflict', 'closed_task', 'bad_state', 'active_sessions', 'already_stocked', 'already_printed', 'batch_closed', 'notion_mode'].includes(e)) return 409;
+  if (e === 'too_many') return 409;
+  return 400;
+}
+
 /** 「明日の計画」画面のデータ (職員だけ)。読むだけなので DB は変えない */
 /**
  * 「明日の計画」画面のデータ。読むだけなので DB は変えない。
@@ -901,7 +1076,10 @@ router.post('/api/progress', checkOrigin, api((req, res) => {
   const r = setProgress({
     taskId: progressTaskId, expectVersion: req.body?.expect_version,
     doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+    lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+    varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    batchId: 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined,
     actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
     // 正本の切替は version を変えないので、更新と同じトランザクションでもう一度見る (要件 §U-2)
@@ -928,7 +1106,11 @@ router.post('/api/block', checkOrigin, api((req, res) => {
     taskId: blockTaskId, reason: String(req.body?.reason || ''), note: req.body?.note ?? null,
     expectVersion: req.body?.expect_version,
     doneQty: 'done_qty' in (req.body || {}) ? req.body.done_qty : undefined,
+    // 作れなかった数・ひとこと (要件 §AB-3)。⭐空欄を 0 と読まないので、送られたときだけ触る
+    lossQty: 'loss_qty' in (req.body || {}) ? req.body.loss_qty : undefined,
+    varianceNote: 'variance_note' in (req.body || {}) ? req.body.variance_note : undefined,
     holdMemo: 'hold_memo' in (req.body || {}) ? req.body.hold_memo : undefined,
+    batchId: 'batch_id' in (req.body || {}) ? req.body.batch_id : undefined,
     actor: hasSessionAccess(req) ? req.iwUser : `${w.worker.display_name} (いろはアプリ)`,
     workerId: w.worker.id, workerName: w.worker.display_name, deviceLabel: deviceLabelOf(req),
   });
@@ -1182,11 +1364,22 @@ router.get('/api/daily-report', api((req, res) => {
     const en = s.ended_at ? Date.parse(s.ended_at) : Math.min(nowMs, dayEnd);
     const overlapMs = Math.min(en, dayEnd) - Math.max(st, dayStart);
     if (!(overlapMs > 0)) continue;   // その日に 1 秒もかかっていない (未来の日・境界ちょうどに終わった記録) は数えない (Codex R2 #4)
-    const sec = Math.floor(overlapMs / 1000);
+    // ⭐実測は 人時 = 秒 × 人数 (要件 §AB-10)。個人は crew_size = 1 なので今までと同じ数字
+    const heads = s.worker_id == null ? (s.crew_size || 1) : 1;
+    const sec = Math.floor(overlapMs / 1000) * heads;
     const live = !s.ended_at && isToday;
-    const key = Number(s.worker_id);
-    if (!byWorker.has(key)) byWorker.set(key, { worker_id: key, worker_name: s.worker_name, total_seconds: 0, live_seconds: 0, active: 0, sessions: 0, items: new Map() });
+    // ⭐人数だけの記録には worker_id が無い。Number(null) = 0 でまとめると、
+    //   拠点の違うぶんが 1 人ぶんに潰れて名前も出ない (要件 §AB-10)
+    const key = s.worker_id == null ? 'f:' + s.facility_code : 'w:' + Number(s.worker_id);
+    if (!byWorker.has(key)) {
+      byWorker.set(key, { worker_id: s.worker_id == null ? null : Number(s.worker_id),
+        worker_name: s.worker_name || (facilityNameOf(s.facility_code) + ' ' + heads + '人'),
+        facility_code: s.facility_code || null, heads,
+        total_seconds: 0, live_seconds: 0, active: 0, sessions: 0, items: new Map() });
+    }
     const wv = byWorker.get(key);
+    // 同じ拠点が日に何度か作業したら、いちばん多かった人数を「何人でやったか」とする (延べにしない)
+    if (heads > wv.heads) { wv.heads = heads; wv.worker_name = facilityNameOf(s.facility_code) + ' ' + heads + '人'; }
     const ck = s.task_id != null ? `t${s.task_id}` : `p${s.page_id}`;
     seenCards.add(ck);
     if (!wv.items.has(ck)) wv.items.set(ck, { task_id: s.task_id, page_id: s.page_id, title: s.title_snapshot || '(名称なし)', product_code: s.product_code, seconds: 0, live_seconds: 0, sessions: 0, active: 0 });
@@ -1201,7 +1394,9 @@ router.get('/api/daily-report', api((req, res) => {
   res.json({
     ok: true, date, workers, truncated: !!page.truncated,
     totals: {
-      seconds: workers.reduce((a, x) => a + x.total_seconds, 0), workers: workers.length,
+      seconds: workers.reduce((a, x) => a + x.total_seconds, 0),
+      // ⭐人数だけの記録は 1 行で何人ぶんにもなる。行数ではなく人数で数える
+      workers: workers.reduce((a, x) => a + (x.heads || 1), 0),
       cards: seenCards.size,
       active: workers.reduce((a, x) => a + x.active, 0),
     },
@@ -1210,6 +1405,12 @@ router.get('/api/daily-report', api((req, res) => {
 }));
 
 /** ラベル待ちの一覧。読むだけなので切替前でも開ける (登録・更新はアプリ正本のみ) */
+/** 日報に出す拠点の名前 (人数だけの記録には個人名が無い) */
+function facilityNameOf(code) {
+  const f = listFacilities(true).find((x) => x.code === code);
+  return f ? f.name : (code || '拠点不明');
+}
+
 router.get('/api/label-waits', api((req, res) => {
   const taskId = req.query.task_id == null ? null : parseTaskId(req.query.task_id);
   if (req.query.task_id != null && taskId == null) return res.status(400).json(BAD_TASK_ID);
@@ -1864,7 +2065,9 @@ function startSessionApp(req, res, worker, crew) {
   };
   // ⭐止まっている札が付いたカードは、画面で「解消した」と確かめてから clear_block: true で送り直す (案A)
   const r = startTaskSession({ taskId, worker, workers: crew, deviceLabel: deviceLabelOf(req), snapshotOf,
-    clearBlock: req.body?.clear_block === true, expectVersion: req.body?.expect_version ?? null });
+    clearBlock: req.body?.clear_block === true, expectVersion: req.body?.expect_version ?? null,
+    // ⭐どのまとまりの作業か (§AB-10)。画面が絞れたときだけ来る。来なければ NULL のまま
+    batchId: numOrNull(req.body?.batch_id) });
   if (!r.ok) {
     const http = r.error === 'bad_request' ? 400 : r.error === 'not_found' ? 404 : 409;
     return res.status(http).json({ ...r, task: r.task ? publicTask(r.task) : undefined, current: r.current ? publicTask(r.current) : undefined });
@@ -1872,6 +2075,46 @@ function startSessionApp(req, res, worker, crew) {
   res.json({ ok: true, already: !!r.already, sessions: r.sessions, sessionId: r.sessionId, startedAt: r.startedAt,
     status: r.task.status, task: publicTask(r.task), serverNow: new Date().toISOString() });
 }
+
+/**
+ * 👥 人数だけの作業をはじめる (要件 §AB-10)。パレット・ジョブサポ用。**職員だけ**。
+ *
+ * ⭐個人の開始 (/api/sessions/start) とは別の口にする。人を選ぶ経路は現場で毎日使われていて、
+ *   ここに人数の分岐を混ぜると、選び忘れ・二重記録の見張りがどちらにも効かなくなる。
+ * ⭐Notion が正本のうちは使えない (まとまり・拠点はアプリ正本の仕組み)。
+ */
+router.post('/api/sessions/start-crew', checkOrigin, api((req, res) => {
+  if (!isAppMode()) return res.status(409).json({ ok: false, error: 'notion_mode', message: 'Notion が正本の間は使えません' });
+  // ⭐中身を先に見る (不正な要求で職員モードだけ開いてしまわないように)
+  const taskId = parseTaskId(req.body?.id ?? req.body?.task_id);
+  if (taskId == null) return res.status(400).json(BAD_TASK_ID);
+  if (typeof req.body?.facility_code !== 'string' || !req.body.facility_code) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: 'どこの人数かを選んでください' });
+  }
+  const gate = requireStaffPlan(req);
+  if (!gate.ok) return res.status(gate.status).json(gate.body);
+  if (isClosedCardId(taskId)) return res.status(409).json(CLOSED_WRITE_REJECTED);
+  const snapshotOf = (t) => {
+    if (!t.product_code) return null;
+    let snap = null;
+    try { snap = t.master_snapshot ? JSON.parse(t.master_snapshot) : null; } catch { /* master だけで合成 */ }
+    const wm = getDB().prepare('SELECT * FROM f_iroha_work_master WHERE code_key = ?').get(String(t.product_code).trim().toLowerCase());
+    return masterOfTask(wm || null, snap);
+  };
+  const r = startTaskCrewSession({
+    taskId, staff: gate.worker, facilityCode: req.body.facility_code, crewSize: req.body?.crew_size,
+    batchId: req.body?.batch_id ?? null, deviceLabel: deviceLabelOf(req), snapshotOf,
+    clearBlock: req.body?.clear_block === true, expectVersion: req.body?.expect_version ?? null,
+  });
+  if (!r.ok) {
+    const http = r.error === 'bad_request' || r.error === 'bad_facility' || r.error === 'bad_batch' ? 400
+      : r.error === 'not_found' ? 404 : 409;
+    return res.status(http).json({ ...r, task: r.task ? publicTask(r.task) : undefined,
+      current: r.current ? publicTask(r.current) : undefined });
+  }
+  res.json({ ok: true, already: !!r.already, session: r.session, sessionId: r.sessionId, startedAt: r.startedAt,
+    status: r.task.status, task: publicTask(r.task), staff_mode: staffModeOf(req), serverNow: new Date().toISOString() });
+}));
 
 /** 作業終了 (done) / 中断 (pause)。時間はサーバー時刻の差分で確定 */
 router.post('/api/sessions/stop', checkOrigin, api((req, res) => {
@@ -2025,6 +2268,168 @@ router.get('/admin/sessions/search.csv', requireAdmin, api((req, res) => {
 }));
 
 // ─── 管理画面 ───
+// ─── 外部施設の専用 URL (読むだけ。要件 §AB-11 の 6) ───
+
+/**
+ * ⭐この配下は**ログインも端末登録もいらない**。URL に入っているトークンだけが鍵なので、
+ *   ここでの約束を厳しくする:
+ *   - 検索よけ (noindex) と **リファラを送らない** (URL が他所のログに残らないように)
+ *   - キャッシュさせない (共用 PC のブラウザに中身が残らないように)
+ *   - **書き込みの口を作らない** (GET だけ。返却の確定はいろは側 — 要件 §AB-7)
+ *   - 中身はその施設に預けたぶんだけ・個人情報なし (buildFacilityView)
+ */
+/**
+ * ⭐ログインのいらない口に、**回数の上限**を置く (Codex R2 中2)。
+ * 同じ Node のプロセスで社内の画面も動いているので、外から繰り返し叩かれて中の作業を遅らせない。
+ *
+ * 🚨**数える相手を、外から自由に作れるものにしない** (Codex R3 重大1)。
+ *   最初はトークンそのものを鍵にしていたが、それだと**でたらめなトークンを毎回変えるだけで**
+ *   記録が無限に増え、掃除のために毎回全部を見にいく = レート制限そのものが攻撃の口になっていた。
+ *   いまは:
+ *     ① まずトークンを確かめる (索引つきの 1 回の読み取り。当たらなければ何も覚えない)
+ *     ② 当たったものだけ**リンクの id** で数える (発行した本数ぶんしか増えない)
+ *     ③ 接続元でも数える。こちらは**入る数に上限**を置く。あふれたときは**期限切れのものだけ**捨て、
+ *        まだ生きている記録は捨てずに断る (429)。
+ *        ⚠生きている記録を追い出すと、**わざと別の接続元をたくさん作って自分の記録を消し、
+ *          数え直させる**ことができてしまう (Codex R4 中1)。あふれるほど来ている時点で異常なので、
+ *          新しい接続元を断る側に倒す
+ */
+const FL_WINDOW_MS = 60_000;
+const FL_MAX_PER_WINDOW = 60;      // 1 分に 60 回 (人が見るぶんには十分。画面は 1 回開くと 2 回)
+const FL_IP_MAX_PER_WINDOW = 120;  // 接続元ごと (社内から数人が同時に見ることもある)
+const FL_IP_MAX_KEYS = 2000;       // 覚える接続元の上限。あふれたら古いものから捨てる
+const flHits = new Map();          // リンク id → { count, until }
+const flIpHits = new Map();        // 接続元 → { count, until }
+
+const bump = (map, key, max, cap) => bumpWindow(map, key, max, cap, FL_WINDOW_MS);
+/**
+ * 接続元。⭐**X-Forwarded-For を自分で読まない**。
+ *
+ * あの並びの**先頭は送り手が好きに書ける**ので、毎回ちがう値を入れるだけで
+ * 「接続元ごとの上限」を素通りできてしまう (重大1 と同じ「外から自由に作れるものを鍵にする」誤り)。
+ * server.js が `trust proxy` を設定しているので、**req.ip が信用してよい値**を返す
+ * (Cloudflare Tunnel の 1 段だけを信じ、その手前の詐称は捨てる)。
+ */
+function clientKeyOf(req) {
+  return String(req.ip || (req.socket && req.socket.remoteAddress) || '?').slice(0, 64);
+}
+
+function facilityLinkGate(req, res, next) {
+  res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('Cache-Control', 'no-store');
+  // ① まずトークンを確かめる (索引つきの 1 回の読み取り)。⭐当たらなければ**何も覚えない**
+  // ⭐HEAD (リンク検査・先読み) では「見に来た日時」を書かない (Codex R1 軽微6)
+  const link = verifyFacilityLink(req.params.token, { touch: req.method === 'GET' });
+  const tooMany = () => {
+    res.set('Retry-After', '60');
+    return res.status(429).json({ ok: false, error: 'too_many', message: '少し時間をおいてから開いてください' });
+  };
+  if (link) {
+    // ② 当たったものは**リンクの id だけ**で数える (発行した本数ぶんしか増えないので、上限も追い出しも要らない)。
+    //    ⭐接続元の上限は見ない — そちらは満杯のとき断る作りなので、外から大量の接続元を作られると
+    //      **正しい URL を持っている施設まで締め出せて**しまう (自己レビュー)
+    if (!bump(flHits, link.id, FL_MAX_PER_WINDOW, 0)) return tooMany();
+  } else if (!bump(flIpHits, clientKeyOf(req), FL_IP_MAX_PER_WINDOW, FL_IP_MAX_KEYS)) {
+    // ③ 当たらなかったものだけ、接続元で数える (URL を探して叩き続ける相手を頭打ちにする)
+    return tooMany();
+  }
+  if (!link) {
+    // ⭐当たらなかった理由 (無い / 失効した / 期限切れ) を分けて教えない (総当たりの手がかりにしない)
+    res.status(404);
+    return res.type('html').send('<!doctype html><meta charset="utf-8"><meta name="robots" content="noindex">'
+      + '<title>見られません</title><body style="font-family:system-ui;padding:24px;line-height:1.8">'
+      + '<h1 style="font-size:1.2rem">この URL は見られません</h1>'
+      + '<p>期限が切れているか、使えなくなっています。いろは にお問い合わせください。</p></body>');
+  }
+  req.iwFacilityLink = link;
+  next();
+}
+
+// ⭐**専用のルーターに閉じ込める** (Codex R1)。access() で /f/ を素通しにしているので、
+//   ここで受けなかったパス・メソッドが**この先のルートへ流れないように**必ず終わらせる。
+//   (あとから誰かが受け皿のようなルートを足しても、認証なしでそこへ届かない)
+const facilityRouter = Router();
+facilityRouter.get('/:token', facilityLinkGate, (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'facility.html'));
+});
+facilityRouter.get('/:token/api/view', facilityLinkGate, api((req, res) => {
+  const view = buildFacilityView(req.iwFacilityLink.facility_code);
+  if (!view) return res.status(404).json({ ok: false, error: 'not_found', message: 'この拠点は見られません' });
+  res.json({ ok: true, ...view });
+}));
+facilityRouter.all(/.*/, (req, res) => {
+  res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  res.set('Cache-Control', 'no-store');
+  // 読むだけの窓口なので、書き込みも知らない道も同じ「ありません」で終わらせる
+  res.status(404).json({ ok: false, error: 'not_found', message: 'ありません' });
+});
+router.use('/f', facilityRouter);
+
+// ─── 施設リンクの発行・失効 (管理者だけ) ───
+
+/**
+ * 🚨 2026-09-08 の事故の復旧 — 空の入荷CSVで一斉に取り消されたカードを戻す。**管理者だけ**。
+ *
+ * ⭐GET は**調べるだけ** (書き込まない)。何件・どれが対象かを見てから POST で戻す。
+ * ⭐POST は調べた件数と合っているときだけ書き込む。調べたあとに別の取消が起きていたら断る。
+ */
+router.get('/admin/restore-cancelled', requireAdmin, api((req, res) => {
+  const r = surveyCancelled({ from: req.query.from, to: req.query.to });
+  if (!r.ok) return res.status(400).json(r);
+  res.json(r);
+}));
+router.post('/admin/restore-cancelled', checkOrigin, requireAdmin, api((req, res) => {
+  const b = req.body || {};
+  const r = restoreCancelled({ from: b.from, to: b.to,
+    expectTasks: b.expect_tasks, expectDestinations: b.expect_destinations,
+    actor: (req.iwUser || 'admin') + ' (復旧)' });
+  if (!r.ok) return res.status(r.error === 'count_mismatch' ? 409 : 400).json(r);
+  logEvent({ action: 'restore_cancelled', workerName: req.iwUser || 'admin',
+    to: `カード ${r.restored.tasks} 件・まとまり ${r.restored.batches} 件・行き先 ${r.restored.dests} 件を戻した (${r.from}〜${r.to})`,
+    ok: true });
+  res.json(r);
+}));
+
+/** ⭐施設の受け入れ枠を決める (要件 §AB-8)。管理者だけ */
+router.post('/admin/facility-capacity', checkOrigin, requireAdmin, api((req, res) => {
+  // ⭐版を必ず添えさせる。別の端末が先に変えていたら黙って上書きしない (Codex R1 中3)
+  if (!Number.isInteger(req.body?.expect_version)) {
+    return res.status(400).json({ ok: false, error: 'bad_request', message: '画面が古くなっています。開き直してください' });
+  }
+  const r = setFacilityCapacity(req.body?.code, {
+    expectVersion: req.body.expect_version,
+    // ⭐送られたときだけ触る。空文字は「未設定に戻す」(0 と区別する)
+    hours: 'capacity_hours' in (req.body || {}) ? req.body.capacity_hours : undefined,
+    boxes: 'capacity_boxes' in (req.body || {}) ? req.body.capacity_boxes : undefined,
+    boxesHard: 'capacity_boxes_hard' in (req.body || {}) ? !!req.body.capacity_boxes_hard : undefined,
+  });
+  const offsite = () => listFacilities().filter((f) => f.offsite);
+  // ⭐競合のときも最新値を返す。画面は「保存できませんでした」ではなく**今の値**を出し直せる
+  if (!r.ok) {
+    return res.status(r.error === 'not_found' ? 404 : r.error === 'conflict' ? 409 : 400)
+      .json(r.error === 'conflict' ? { ...r, facilities: offsite() } : r);
+  }
+  res.json({ ok: true, facilities: offsite() });
+}));
+
+router.post('/admin/facility-links', checkOrigin, requireAdmin, api((req, res) => {
+  try {
+    // ⭐平文のトークンを返すのはこの 1 回だけ (DB にはハッシュしか残らない)
+    const r = createFacilityLink(req.body?.facility_code, req.body?.label, req.session.email,
+      { expiresAt: req.body?.expires_at || null });
+    res.json({ ok: true, id: r.id, url: `${BASE}/f/${r.token}` });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: 'bad_request', message: e.message });
+  }
+}));
+router.post('/admin/facility-links/:id(\\d+)/revoke', checkOrigin, requireAdmin, api((req, res) => {
+  if (!revokeFacilityLink(Number(req.params.id))) {
+    return res.status(404).json({ ok: false, error: 'not_found', message: 'そのリンクは見つかりません (もう失効しています)' });
+  }
+  res.json({ ok: true });
+}));
+
 router.get('/admin', requireSession, api((req, res) => {
   res.render(path.join(__dirname, 'views/admin'), {
     title: 'いろは在庫化 作業アプリ 管理',
@@ -2043,6 +2448,8 @@ router.get('/admin', requireSession, api((req, res) => {
     printAgents: listPrintAgents(),
     printJobs: listPrintJobs(30).map(j => ({ ...publicJob(j), device_label: j.device_label })),
     enrollCodes: isAdmin(req) ? listActiveEnrollCodes() : [],
+    facilityLinks: isAdmin(req) ? listFacilityLinks(true) : [],
+    externalFacilities: listFacilities().filter((f) => f.external),
     events: listEvents(50),
     sessions: listSessionsForAdmin(50),
     media: listMediaForAdmin(50),
@@ -2216,7 +2623,7 @@ router.post('/admin/tasks/remove', checkOrigin, requireAdmin, api((req, res) => 
   if (taskId == null) return res.status(400).json(BAD_TASK_ID);
   if (req.body?.confirm !== 'REMOVE') return res.status(400).json({ ok: false, error: 'confirm_required', message: '確認のため confirm に REMOVE と入れてください' });
   const r = removeStrayTask({ taskId, actor: req.iwUser, reason: req.body?.reason ? String(req.body.reason).slice(0, 200) : null });
-  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : (r.error === 'not_stray' || r.error === 'active_sessions') ? 409 : 400).json(r);
+  if (!r.ok) return res.status(r.error === 'not_found' ? 404 : (r.error === 'not_stray' || r.error === 'active_sessions' || r.error === 'conflict') ? 409 : 400).json(r);
   safeLog({ action: 'task_remove', pageId: null, deviceLabel: `session:${req.iwUser}`, to: `task#${r.id} → ${r.action}`, ok: true });
   res.json({ ...r, remaining: listNamelessTasks(30).length });
 }));

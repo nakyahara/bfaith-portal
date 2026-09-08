@@ -73,8 +73,6 @@ const KNOWN = {
   'apps/warehouse/auto-import.js': { count: 1, exempt: 'miniPC の取込ウォッチャ。台帳では warehouse-daily-sync 側で見ている' },
   'apps/picking/drive-sync.js': { count: 1, job: 'picking-drive-poller' },
 
-  // ── 起動していない死にコード ──
-  'apps/profit-calculator/price-scheduler.js': { count: 3, exempt: 'server.js の呼び出しがコメントアウト済み = 未起動 (2026-03-30〜)' },
 };
 
 let pass = 0;

@@ -1,0 +1,175 @@
+<%- include('_top', { nav: 'index' }) %>
+
+<% if (unavailable) { %>
+  <div class="banner-warn">⚠️ まだ表示できません。必要な表がこの環境にありません: <span class="code"><%= unavailable.join(', ') %></span>
+    (miniPC の daily-sync が Render へ送る mirror 表です)</div>
+<% } else { %>
+
+<% if (auto && auto.error) { %>
+  <div class="banner-warn">⚠️ 今日の判定を自動で作れませんでした: <%= auto.error %></div>
+<% } %>
+
+<div class="cards">
+  <div class="stat">
+    <div class="k">価格データの日付 (JST)</div>
+    <div class="v"><%= freshness && freshness.snapshot_date_jst ? freshness.snapshot_date_jst : '—' %> <small><%= freshness ? num(freshness.snapshot_rows) : '' %> SKU</small></div>
+    <div class="small">手数料 <%= freshness && freshness.fees_fetched_at ? toJst(freshness.fees_fetched_at) : '—' %> / 販売 (確定分) 〜<%= freshness && freshness.finance_last_date_jst ? freshness.finance_last_date_jst : '—' %></div>
+  </div>
+  <div class="stat">
+    <div class="k">出品数 / 方針あり</div>
+    <div class="v"><%= num(stats.total) %> <small>/ <a href="?mode=set"><%= num(stats.with_policy) %></a></small></div>
+    <div class="small">判定ルール <span class="code"><%= RULE_VERSION %></span><% if (run) { %> / 最新 run <%= toJst(run.started_at) %><% } %></div>
+  </div>
+  <div class="stat">
+    <div class="k">いまの判定 (方針の現在値で計算)</div>
+    <div class="v">
+      <a href="?action=raise"><span class="chip c-raise">値上げ <%= stats.by_action.raise %></span></a>
+      <a href="?action=lower"><span class="chip c-lower">値下げ <%= stats.by_action.lower %></span></a>
+      <a href="?action=keep"><span class="chip c-keep">維持 <%= stats.by_action.keep %></span></a>
+      <a href="?action=hold"><span class="chip c-hold">保留 <%= stats.by_action.hold %></span></a>
+    </div>
+    <div class="small">採点は <a href="/apps/amazon-pricing/evaluations">今日の判定</a> で</div>
+  </div>
+  <div class="stat <%= (stats.flags.below_floor || 0) > 0 ? 'warn' : '' %>">
+    <div class="k">⚠️ 赤字の疑い</div>
+    <div class="v"><a href="?flag=below_floor"><%= num(stats.flags.below_floor || 0) %></a></div>
+    <div class="small">今の価格が下限より低い</div>
+  </div>
+  <div class="stat">
+    <div class="k">原価不明 / カート他社</div>
+    <div class="v"><a href="?flag=cost_unknown"><%= num(stats.flags.cost_unknown || 0) %></a> <small>/ <a href="?flag=buybox_lost"><%= num(stats.flags.buybox_lost || 0) %></a></small></div>
+    <div class="small">原価不明の行は値下げを出さない</div>
+  </div>
+</div>
+
+<div class="card">
+  <form class="filters" method="get" action="/apps/amazon-pricing/">
+    <div><label for="f-q">検索 (SKU / ASIN / 商品名 / NEコード)</label><input id="f-q" type="text" name="q" value="<%= filters.q %>" style="min-width:260px"></div>
+    <div><label for="f-mode">モード</label>
+      <select id="f-mode" name="mode">
+        <option value="">すべて</option>
+        <option value="set" <%= filters.mode === 'set' ? 'selected' : '' %>>方針あり</option>
+        <option value="unset" <%= filters.mode === 'unset' ? 'selected' : '' %>>方針なし</option>
+        <% for (const [k, v] of Object.entries(MODES)) { %><option value="<%= k %>" <%= filters.mode === k ? 'selected' : '' %>><%= v %></option><% } %>
+      </select></div>
+    <div><label for="f-ch">発送</label>
+      <select id="f-ch" name="channel">
+        <option value="">すべて</option>
+        <option value="FBA" <%= filters.channel === 'FBA' ? 'selected' : '' %>>FBA</option>
+        <option value="FBM" <%= filters.channel === 'FBM' ? 'selected' : '' %>>自己発送</option>
+      </select></div>
+    <div><label for="f-action">判定</label>
+      <select id="f-action" name="action">
+        <option value="">すべて</option>
+        <% for (const [k, v] of Object.entries(ACTIONS)) { %><option value="<%= k %>" <%= filters.action === k ? 'selected' : '' %>><%= v %></option><% } %>
+      </select></div>
+    <div><label for="f-flag">注意</label>
+      <select id="f-flag" name="flag">
+        <option value="">すべて</option>
+        <% for (const [k, v] of Object.entries(flagLabels)) { %><option value="<%= k %>" <%= filters.flag === k ? 'selected' : '' %>><%= v %></option><% } %>
+      </select></div>
+    <div><label for="f-sort">並び</label>
+      <select id="f-sort" name="sort">
+        <option value="units" <%= filters.sort === 'units' ? 'selected' : '' %>>30日販売が多い順</option>
+        <option value="price" <%= filters.sort === 'price' ? 'selected' : '' %>>価格が高い順</option>
+        <option value="gap" <%= filters.sort === 'gap' ? 'selected' : '' %>>カートより高い順</option>
+        <option value="margin" <%= filters.sort === 'margin' ? 'selected' : '' %>>粗利率が低い順</option>
+        <option value="sku" <%= filters.sort === 'sku' ? 'selected' : '' %>>SKU 順</option>
+      </select></div>
+    <input type="hidden" name="per" value="<%= per %>">
+    <button class="btn btn-primary" type="submit">絞り込む</button>
+    <a class="btn" href="/apps/amazon-pricing/">クリア</a>
+    <a class="btn" href="/apps/amazon-pricing/api/export.csv?<%= new URLSearchParams(filters).toString() %>">CSV</a>
+  </form>
+
+  <div class="pager">
+    <span><b><%= num(total) %></b> 件</span>
+    <% if (pages > 1) { %>
+      <% const qs = (p) => { const u = new URLSearchParams({ ...filters, per: String(per), page: String(p) }); return '?' + u.toString(); }; %>
+      <% if (page > 1) { %><a href="<%= qs(page - 1) %>">← 前</a><% } %>
+      <span><%= page %> / <%= pages %> ページ</span>
+      <% if (page < pages) { %><a href="<%= qs(page + 1) %>">次 →</a><% } %>
+    <% } %>
+    <span class="dim">1ページ
+      <% for (const n of [50, 100, 300]) { %>
+        <% if (n === per) { %><b><%= n %></b><% } else { %><a href="?<%= new URLSearchParams({ ...filters, per: String(n) }).toString() %>"><%= n %></a><% } %>
+      <% } %>
+    </span>
+  </div>
+
+  <div class="tbl-wrap">
+  <table class="ap">
+    <thead>
+      <tr>
+        <th>商品</th>
+        <th>SKU / ASIN</th>
+        <th>発送</th>
+        <th class="num">いまの価格</th>
+        <th class="num">カート</th>
+        <th class="num">原価 (税込)</th>
+        <th class="num">粗利 (いま)</th>
+        <th class="num">30日</th>
+        <th class="num">下限 (計算)</th>
+        <th class="num">ストッパー<br><span class="small">赤字 / 高値</span></th>
+        <th>モード</th>
+        <th>いまの判定</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+    <% if (rows.length === 0) { %>
+      <tr><td colspan="13" class="dim" style="padding:20px;text-align:center">該当する出品がありません</td></tr>
+    <% } %>
+    <% for (const r of rows) { %>
+      <% const l = r.live; const minMargin = r.min_margin_rate == null ? DEFAULT_MIN_MARGIN_RATE : r.min_margin_rate; %>
+      <tr>
+        <td>
+          <div class="name" title="<%= r.ne_name || '' %>"><a href="/apps/amazon-pricing/listings/<%= encodeURIComponent(r.seller_sku) %>"><%= r.ne_name || '(NE商品と未突合)' %></a></div>
+          <div class="small code"><%= r.ne_code || '—' %><% if (r.parts > 1) { %> (セット <%= r.parts %>品)<% } %></div>
+        </td>
+        <td class="code">
+          <div><%= r.seller_sku %></div>
+          <div class="small"><% if (r.asin) { %><a href="https://www.amazon.co.jp/dp/<%= encodeURIComponent(r.asin) %>" target="_blank" rel="noopener"><%= r.asin %></a><% } else { %>—<% } %></div>
+        </td>
+        <td><span class="chip <%= String(r.channel).toUpperCase() === 'FBA' ? 'c-fba' : 'c-fbm' %>"><%= String(r.channel).toUpperCase() === 'FBA' ? 'FBA' : '自己' %></span></td>
+        <td class="num"><b><%= yen(r.my_price) %></b></td>
+        <td class="num">
+          <%= yen(r.buybox_price) %>
+          <div class="small"><% if (r.buybox_is_mine === 1) { %><span class="chip c-ok">自社</span><% } else if (r.buybox_is_mine === 0) { %><span class="chip c-warn">他社</span><% } else if (r.buybox_price != null) { %><span class="chip c-none">不明</span><% } else { %><span class="chip c-none">カート無し</span><% } %></div>
+        </td>
+        <td class="num"><% if (r.cost_incl_tax == null) { %><span class="chip c-bad">原価不明</span><% } else { %><%= yen(r.cost_incl_tax) %><% } %></td>
+        <td class="num">
+          <% if (r.gross_now.gross == null) { %><span class="dim">—</span><% } else { %>
+            <span class="<%= r.gross_now.gross < 0 ? 'neg' : (r.gross_now.rate < minMargin ? 'chip c-warn' : 'pos') %>"><%= yen(r.gross_now.gross) %></span>
+            <div class="small"><%= pct(r.gross_now.rate) %></div>
+          <% } %>
+        </td>
+        <td class="num"><%= num(r.units_30d ?? 0) %></td>
+        <td class="num"><%= yen(r.computed_floor) %></td>
+        <td class="num"><%= yen(r.floor_price) %> / <%= yen(r.ceiling_price) %><% if (r.offset_jpy) { %><div class="small">上乗せ <%= r.offset_jpy > 0 ? '+' : '' %><%= r.offset_jpy %></div><% } %></td>
+        <td><span class="chip c-mode-<%= r.mode %>"><%= MODES[r.mode] || r.mode %></span></td>
+        <td>
+          <span class="chip c-<%= l.action %>"><%= ACTIONS[l.action] %><% if (l.proposedPrice != null) { %> → <%= yen(l.proposedPrice) %><% } %></span>
+          <div class="reason" title="<%= l.reasonText %>"><%= l.reasonText %></div>
+          <% const shown = l.flags.filter((f) => f !== 'NO_SALES_30D'); %>
+          <% if (shown.length) { %><div class="flags"><% for (const f of shown) { %><span class="chip <%= f === 'BELOW_COST_FLOOR' || f === 'BELOW_STOPPER' ? 'c-bad' : 'c-warn' %>" title="<%= FLAGS[f] || f %>"><%= FLAGS[f] ? FLAGS[f].split(' (')[0] : f %></span><% } %></div><% } %>
+        </td>
+        <td class="act"><button class="btn btn-sm" type="button" data-policy="<%= JSON.stringify({ seller_sku: r.seller_sku, ne_name: r.ne_name, mode: r.mode, floor_price: r.floor_price, ceiling_price: r.ceiling_price, offset_jpy: r.offset_jpy, min_margin_rate: r.min_margin_rate, note: r.policy_note, computed_floor: r.computed_floor, has_policy: r.has_policy }) %>">方針</button></td>
+      </tr>
+    <% } %>
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<%- include('_policy_dialog') %>
+<script>
+  document.addEventListener('click', function (ev) {
+    var b = ev.target.closest ? ev.target.closest('button[data-policy]') : null;
+    if (!b) return;
+    try { openPolicyDialog(JSON.parse(b.getAttribute('data-policy'))); }
+    catch (e) { showToast('開けませんでした: ' + e.message); }
+  });
+</script>
+<% } %>
+</div>

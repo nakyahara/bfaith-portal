@@ -44,12 +44,17 @@ export const HOLD_REASONS = BLOCK_REASONS;
 export const HOLD_LABEL = BLOCK_LABEL;
 
 /** 拠点 (f_iroha_facilities の初期値)。code は DB・API の値、name は Notion の施設名ステータスと一致させる */
+/**
+ * external = いろは以外の事業者か。offsite = ⭐**物を持ち帰って向こうで作業する**か (要件 §AB-7)。
+ * パレット・ジョブサポは別の事業者だが いろは の建物の中で作業する (中原さん 2026-09-07) ので offsite 0。
+ * 「外部にあずける」の相手・戻し先の判定は offsite で見る (external で見ると パレット が預け先に出てしまう)
+ */
 export const FACILITIES = [
-  { code: 'iroha', name: 'いろは', external: 0, sort_order: 0 },
-  { code: 'rashinban', name: '羅針盤', external: 1, sort_order: 1 },
-  { code: 'workcenter', name: 'ワークセンター', external: 1, sort_order: 2 },
-  { code: 'jobsupport', name: 'ジョブサポ', external: 1, sort_order: 3 },
-  { code: 'rehas', name: 'パレット', external: 1, sort_order: 4 },   // 旧名「リハス」(2026-09-05 に変更)
+  { code: 'iroha', name: 'いろは', external: 0, offsite: 0, sort_order: 0 },
+  { code: 'rashinban', name: '羅針盤', external: 1, offsite: 1, sort_order: 1 },
+  { code: 'workcenter', name: 'ワークセンター', external: 1, offsite: 1, sort_order: 2 },
+  { code: 'jobsupport', name: 'ジョブサポ', external: 1, offsite: 0, sort_order: 3 },
+  { code: 'rehas', name: 'パレット', external: 1, offsite: 0, sort_order: 4 },   // 旧名「リハス」(2026-09-05 に変更)
 ];
 export const DEFAULT_FACILITY = 'iroha';
 /** 拠点名の変更 (旧名のときだけ書き換える。DB に入っている名前は INSERT OR IGNORE では変わらないため)。中原さん 2026-09-05: リハス → パレット */

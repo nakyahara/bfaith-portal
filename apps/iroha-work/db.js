@@ -16,6 +16,7 @@
 import crypto from 'crypto';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { FACILITIES, FACILITY_RENAMES } from './tasks.js';
+import { backfillBatches, backfillStocking } from './batches.js';
 
 const utcNow = () => new Date().toISOString();
 
@@ -39,7 +40,7 @@ const workOptionsDDL = (name) => `
 const TASKS_COLS = ['id', 'destination_id', 'notion_page_id', 'legacy_status', 'status', 'close_reason', 'facility_code', 'hold_reason_code', 'hold_reason_note',
   'done_qty', 'hold_memo', 'blocked_reason', 'blocked_note', 'blocked_at', 'blocked_by',
   'planned_date', 'priority_class', 'priority_note', 'product_code', 'product_name', 'qty', 'arrival_date', 'ar_no', 'barcode', 'expiry', 'supplier', 'handling',
-  'master_snapshot', 'payload', 'started_at', 'ready_at', 'closed_at', 'closed_by', 'cancellation_requested_at', 'cancellation_source',
+  'master_snapshot', 'payload', 'started_at', 'ready_at', 'closed_at', 'closed_by', 'cancellation_requested_at', 'cancellation_source', 'cancellation_reason',
   'migration_review', 'migration_note', 'import_batch_id', 'external_ready', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
 const tasksDDL = (name) => `
     CREATE TABLE IF NOT EXISTS ${name} (
@@ -87,6 +88,7 @@ const tasksDDL = (name) => `
       closed_by        TEXT,
       cancellation_requested_at TEXT,
       cancellation_source       TEXT,
+      cancellation_reason       TEXT,
       migration_review INTEGER NOT NULL DEFAULT 0 CHECK (migration_review IN (0,1)),
       migration_note   TEXT,
       import_batch_id  TEXT,
@@ -146,8 +148,21 @@ const sessionsDDL = (name) => `
       task_id        INTEGER REFERENCES f_iroha_tasks(id),
       product_code   TEXT,
       title_snapshot TEXT,
-      worker_id      INTEGER NOT NULL,
-      worker_name    TEXT NOT NULL,
+      -- ⭐個人の記録は worker_id + worker_name。**人数だけの記録では両方 NULL** (要件 §AB-10)。
+      --   パレット・ジョブサポは いろは の中で作業するが、こちらは個人名を持たない
+      worker_id      INTEGER,
+      worker_name    TEXT,
+      -- ⭐人数だけの記録の「誰が」= 拠点。「パレット 3 人ではじめる」= 1 行 (crew_size = 3)
+      facility_code  TEXT REFERENCES f_iroha_facilities(code),
+      -- ⭐実測は **秒 × 人数 = 人時**に統一する。個人の記録は必ず 1 なので、いまの集計と辻褄が合う
+      --   (いまも 3 人なら 3 行 = 3 人時)
+      -- ⭐整数だけ。SQLite は INTEGER と書いても 1.5 を入れられる (型は「入れ物の好み」でしかない)。
+      --   1.5 が入ると 60 秒が 90 人秒になる (Codex #1258 R2 中1)
+      crew_size      INTEGER NOT NULL DEFAULT 1
+        CHECK (typeof(crew_size) = 'integer' AND crew_size >= 1 AND crew_size <= 50),
+      -- ⭐どのまとまりの作業か (要件 §AB-10)。まとまりが 1 つなら画面が自動で選ぶ。
+      --   決められないときは NULL のまま (カードには残る。分からないものを当てずっぽうで結びつけない)
+      batch_id       INTEGER REFERENCES f_iroha_task_batches(id),
       device_label   TEXT,
       started_at     TEXT NOT NULL,
       ended_at       TEXT,
@@ -157,8 +172,166 @@ const sessionsDDL = (name) => `
       voided_by      TEXT,
       void_reason    TEXT,
       master_snapshot TEXT,
-      CHECK (page_id IS NOT NULL OR task_id IS NOT NULL)
+      CHECK (page_id IS NOT NULL OR task_id IS NOT NULL),
+      -- 個人の記録は id と名前がセット (名前だけ・id だけの行を作らせない)
+      CHECK ((worker_id IS NULL) = (worker_name IS NULL)),
+      -- 個人でないなら「どの拠点の何人か」が要る (誰の作業か分からない記録を残さない)
+      CHECK (worker_id IS NOT NULL OR facility_code IS NOT NULL),
+      -- ⭐個人の記録は必ず 1 人。ここが崩れると 人時 (秒 × 人数) が今までの集計と食い違う
+      CHECK (worker_id IS NULL OR crew_size = 1)
     );`;
+/**
+ * ⭐作業の「まとまり」(要件 §AB)。1 枚のカードの下に、**独立して作業・完成・棚入れできる単位**を持つ。
+ *
+ *   - ふだんは 1 枚のカードに **まとまり 1 つ**。見え方も操作もいままでと同じ
+ *   - 一部を外部施設へ預ける / 期限が違う物が混ざる ときだけ 2 つ以上に割る
+ *   - **カードは分割しない**。入荷受付の 1 行との 1 対 1 (destination_id UNIQUE) を壊さないため。
+ *     写真・作業時間・ラベル待ちもカードに付いたままなので、帰属で悩む場面が起きない
+ *
+ * 拠点は**カードと同じ規約**: NULL = どこが作業するか未定 / 'iroha' = いろは (要件 §W-2)。
+ * 「未定」を「いろは」と見なさない。
+ */
+const batchesDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id        INTEGER NOT NULL REFERENCES f_iroha_tasks(id),
+      -- 内部の通し番号。⭐振り直さない・再利用しない (履歴が追えなくなる)。画面には出さない
+      seq            INTEGER NOT NULL,
+      planned_qty    INTEGER CHECK (planned_qty IS NULL OR planned_qty >= 0),
+      facility_code  TEXT REFERENCES f_iroha_facilities(code),
+      -- 期限は**作成時にカードからコピーする**。「NULL ならカードから継承」にしない —
+      -- あとでカードの期限を直すと、既に外に出したまとまりの期限まで黙って変わってしまう (要件 §AB-12)
+      expiry         TEXT,
+      -- 見分けるための名前 (任意)。同じ拠点・同じ期限で 2 つに割れたときだけ職員が付ける (要件 §AB-6)
+      label          TEXT,
+      work_status    TEXT NOT NULL CHECK (work_status IN ('not_started','in_progress','ready_for_stocking','done','cancelled')),
+      -- ⭐できた数・作れなかった数は NULL = まだ数えていない。0 と区別する (要件 §AB-3)。
+      --   予定 (planned_qty) で上書きしない。1010 個できることもあるので上限の CHECK も置かない
+      good_qty       INTEGER CHECK (good_qty IS NULL OR good_qty >= 0),
+      loss_qty       INTEGER CHECK (loss_qty IS NULL OR loss_qty >= 0),
+      -- ⭐その数の出どころ。'counted' = 人が数えた / 'migrated' = 移行で持ってきた値。
+      --   移行前は棚入待ちにした瞬間に予定数で上書きしていたので、**実績として信用できない**。
+      --   「確認ずみ」に見せないため出自を残す (要件 §AB-3)
+      good_qty_source TEXT CHECK (good_qty_source IS NULL OR good_qty_source IN ('counted','migrated')),
+      variance_note  TEXT,
+      -- どのまとまりから切り出したか (要件 §AB-5)。監査ログだけに頼らない
+      split_from_batch_id INTEGER REFERENCES ${name}(id),
+      split_qty      INTEGER,
+      split_at       TEXT,
+      split_by       TEXT,
+      version        INTEGER NOT NULL DEFAULT 1,
+      created_at     TEXT NOT NULL,
+      updated_at     TEXT NOT NULL,
+      -- ⭐できた数と、その出どころは必ず対。片方だけある行を作らせない (Codex R1 中5)。
+      --   「数が入っているのに出どころが分からない」= 実績として信用してよいか判断できない
+      CHECK ((good_qty IS NULL AND good_qty_source IS NULL)
+          OR (good_qty IS NOT NULL AND good_qty_source IS NOT NULL))
+    );`;
+/**
+ * ⭐棚に入れた実績 (要件 §AB-2)。**まとまり 1 つにつき、棚入れは何回でも記録できる**。
+ *
+ * 「398 個のうち 200 個だけ先に棚に入れる」が必要になったとき、
+ * **まとまりを割って表そうとしてはいけない** — 398 個ぶんの作業時間・作れなかった数・メモを
+ * 200 個側と 198 個側のどちらに付けるか決められなくなる (Codex R3 で差し戻されて分けた)。
+ * 作業を分ける単位 (まとまり) と、物を棚へ移した記録 (これ) は別のできごと。
+ *
+ * いまの画面は「棚入れする」で**残り全部を 1 行**作るだけ。数量を選ぶ入力は必要になってから。
+ * `qty` は NULL 可 = **数えずに棚に入れた** (0 と区別する)。
+ */
+const stockingDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id   INTEGER NOT NULL REFERENCES f_iroha_task_batches(id),
+      qty        INTEGER CHECK (qty IS NULL OR qty >= 0),
+      -- ⭐いつ入れたか。NULL = 記録が無い (この機能より前のぶんで、カードにも終了時刻が無かった)。
+      --   移行した日を入れると「その日に棚入れした」という嘘の記録になる (Codex R1 中2)
+      stocked_at TEXT,
+      stocked_by TEXT,
+      note       TEXT,
+      version    INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL
+    );`;
+/**
+ * ⭐外部施設への預け (要件 §AB-7)。羅針盤・ワークセンターに**物を持ち帰ってもらう**ときの台帳。
+ *
+ * 外部施設はこのアプリを触らない (作業時間も完成写真も記録しない)。知りたいのは
+ * 「何を預けて、いま どの状態か」と返却だけ。
+ *
+ * ⭐**数量を 1 つで通さない**。「80 予定・80 準備・当日 78 しかなかった」が普通に起きる。
+ *   渡したあとに予定数を書き換えると、80 枚ぶん箱とラベルを用意した履歴が消える。
+ * ⭐最後の状態は returned ではなく **settled (精算ずみ)**。外部で壊れて返らない物があっても、
+ *   職員が確かめれば預け残高からは落とせる。
+ */
+const consignDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id      INTEGER NOT NULL REFERENCES f_iroha_task_batches(id),
+      facility_code TEXT NOT NULL REFERENCES f_iroha_facilities(code),
+      planned_qty   INTEGER NOT NULL CHECK (planned_qty > 0),   -- 預ける予定の数
+      prepared_qty  INTEGER CHECK (prepared_qty IS NULL OR prepared_qty >= 0),  -- 箱とラベルを用意した数
+      handed_qty    INTEGER CHECK (handed_qty IS NULL OR handed_qty >= 0),      -- 実際に渡した数
+      -- planned = 決めた / prepared = 箱とラベルを用意した / handed = 渡した / settled = 精算ずみ /
+      -- cancelled = 渡す前にやめた
+      state         TEXT NOT NULL CHECK (state IN ('planned','prepared','handed','settled','cancelled')),
+      due_date      TEXT,                                        -- いつまでに返してほしいか (任意)
+      -- ⭐渡す前にやめたときに戻す担当拠点。まとまりを割らずに丸ごと預けたときだけ入る (Codex R1 中6)
+      prev_facility_code TEXT,
+      -- ⭐この預けのためにまとまりを切り出したか (1 = やめたらそのまとまりを取消にして数を戻す)。
+      --   まとまり側の split_from_batch_id は過去の分割の履歴なので、それで決めない (Codex R3 中4)
+      split_created INTEGER NOT NULL DEFAULT 0 CHECK (split_created IN (0,1)),
+      -- ⭐外部で壊れる等で**物として返ってこない数**。職員が確かめて精算するときに入れる (Codex R1 中10)。
+      --   返却行の good/loss (返ってきた物の内訳) とは別のもの
+      missing_qty   INTEGER CHECK (missing_qty IS NULL OR missing_qty >= 0),
+      planned_at    TEXT NOT NULL,
+      planned_by    TEXT,
+      prepared_at   TEXT,
+      prepared_by   TEXT,
+      handed_at     TEXT,
+      handed_by     TEXT,
+      settled_at    TEXT,
+      settled_by    TEXT,
+      note          TEXT,
+      version       INTEGER NOT NULL DEFAULT 1,
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL,
+      -- 渡す前は渡した数を持たない / 渡したあとは必ず持つ
+      CHECK ((state IN ('planned','prepared','cancelled')) = (handed_qty IS NULL))
+    );`;
+/**
+ * 返却 (要件 §AB-7)。⭐**一度で全部返るとは限らない**ので子テーブル。
+ * returned_qty = 物として返ってきた数 / good_qty = そのうち使える良品 / loss_qty = 外部で作れなかった数。⭐**返却の確定はいろは側**
+ * (物が戻ったのを確かめられるのは いろは。外部の専用 URL からは申告だけ)。
+ */
+const consignReturnDDL = (name) => `
+    CREATE TABLE IF NOT EXISTS ${name} (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      consignment_id  INTEGER NOT NULL REFERENCES f_iroha_consignments(id),
+      returned_qty    INTEGER NOT NULL CHECK (returned_qty >= 0),
+      -- ⭐返ってきた物の内訳。good + loss <= returned_qty (サービス層でも守る)
+      good_qty        INTEGER CHECK (good_qty IS NULL OR good_qty >= 0),
+      loss_qty        INTEGER CHECK (loss_qty IS NULL OR loss_qty >= 0),
+      returned_at     TEXT NOT NULL,
+      returned_by     TEXT,
+      note            TEXT,
+      idempotency_key TEXT UNIQUE,     -- 二重タップ・通信の再送で 2 回受け取らない
+      created_at      TEXT NOT NULL
+    );`;
+const CONSIGN_INDEX_DDL = `
+    CREATE INDEX IF NOT EXISTS idx_iroha_consign_batch ON f_iroha_consignments(batch_id, id);
+    CREATE INDEX IF NOT EXISTS idx_iroha_consign_fac ON f_iroha_consignments(facility_code, state);
+    CREATE INDEX IF NOT EXISTS idx_iroha_consign_ret ON f_iroha_consignment_returns(consignment_id, id);`;
+
+const STOCKING_INDEX_DDL = `
+    CREATE INDEX IF NOT EXISTS idx_iroha_stocking_batch ON f_iroha_stocking_records(batch_id, id);`;
+
+const BATCHES_INDEX_DDL = `
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_batches_seq ON f_iroha_task_batches(task_id, seq);
+    CREATE INDEX IF NOT EXISTS idx_iroha_batches_task ON f_iroha_task_batches(task_id, id);
+    CREATE INDEX IF NOT EXISTS idx_iroha_batches_fac ON f_iroha_task_batches(facility_code, work_status);`;
+
+// ⚠**一意索引はここに置かない**。作り直し (migrateSessionMediaSchema) の中で張られるが、
+//   重複を片づけるのはそのあと。古い版に重複が残っていると索引作りで落ち、作り直しごと巻き戻って
+//   アプリが起動しなくなる (Codex #1258 R3 中1)。一意索引は下の「片づけ → 索引」の順で作る
 const SESSIONS_INDEX_DDL = `
     CREATE INDEX IF NOT EXISTS idx_iroha_sessions_page ON f_iroha_work_sessions(page_id, id);
     CREATE INDEX IF NOT EXISTS idx_iroha_sessions_task ON f_iroha_work_sessions(task_id, id);`;
@@ -210,19 +383,66 @@ const MEDIA_INDEX_DDL = `
  */
 // 表ごとに「新しい定義に必要なもの」(列の有無だけでなく UNIQUE・CHECK も。欠けた途中版を見逃さない — Codex A1b R2 #2)
 const SESSION_MEDIA_COMMON_DDL = [/task_id\s+INTEGER REFERENCES f_iroha_tasks\(id\)/, /CHECK \(page_id IS NOT NULL OR task_id IS NOT NULL\)/];
-const SESSIONS_REQUIRED_DDL = [...SESSION_MEDIA_COMMON_DDL, /end_reason IS NULL OR end_reason IN \('done','pause','admin'\)/];
+const SESSIONS_REQUIRED_DDL = [...SESSION_MEDIA_COMMON_DDL, /end_reason IS NULL OR end_reason IN \('done','pause','admin'\)/,
+  // ⭐人数だけの作業 (要件 §AB-10)。列だけ足した途中版と区別するため、表レベルの CHECK まで見る。
+  //   ⭐crew_size は**列の定義まで**見る (Codex #1258 R1 中3) — NULL 可の途中版だと
+  //   raw_seconds × crew_size が NULL になり、その行の実測が合計から静かに消える
+  /crew_size      INTEGER NOT NULL DEFAULT 1\s*\n?\s*CHECK \(typeof\(crew_size\) = 'integer' AND crew_size >= 1 AND crew_size <= 50\)/,
+  /facility_code  TEXT REFERENCES f_iroha_facilities\(code\)/,
+  /batch_id       INTEGER REFERENCES f_iroha_task_batches\(id\)/,
+  /CHECK \(\(worker_id IS NULL\) = \(worker_name IS NULL\)\)/,
+  /CHECK \(worker_id IS NOT NULL OR facility_code IS NOT NULL\)/,
+  /CHECK \(worker_id IS NULL OR crew_size = 1\)/];
 const MEDIA_REQUIRED_DDL = [...SESSION_MEDIA_COMMON_DDL, /operation_id\s+TEXT NOT NULL UNIQUE/, /kind IN \('photo','video'\)/, /status IN \('stored','uploaded','synced'\)/];
 function sessionMediaNeedsRebuild(db, table, ddl, required) {
   const sql = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)?.sql;
   if (!sql) return false;   // 無ければ CREATE IF NOT EXISTS が新定義で作る
   const info = db.prepare(`PRAGMA table_info(${table})`).all();
   if (info.some((c) => c.name === 'page_id' && c.notnull === 1)) return true;
+  // ⭐人数だけの記録は worker_id が NULL になる。古い版は NOT NULL なので作り直す (要件 §AB-10)
+  if (info.some((c) => (c.name === 'worker_id' || c.name === 'worker_name') && c.notnull === 1)) return true;
+  // ⭐crew_size は「NOT NULL・既定値 1」でなければ作り直す (Codex #1258 R1 中3)。
+  //   DDL の文字列だけを見ると、書き方が少し違う途中版を見逃す
+  const crew = info.find((c) => c.name === 'crew_size');
+  if (crew && (crew.notnull !== 1 || String(crew.dflt_value) !== '1')) return true;
   if (required.some((re) => !re.test(sql))) return true;
   const have = new Set(info.map((c) => c.name));
   const want = [...ddl('x').matchAll(/^\s+([a-z_]+)\s+(?:INTEGER|TEXT)/gm)].map((m) => m[1]);
   return want.some((c) => !have.has(c));
 }
+/**
+ * ⭐作り直しの**前に**、人数 (crew_size) を新しい定義に通る形にそろえる (要件 §AB-10)。
+ *
+ * 新しい定義は「NOT NULL・整数・1〜50」。古い版に NULL や 1.5 が残っていると、
+ * 写すところで落ちて**作り直しごと巻き戻り、再起動しても同じところで落ちる**
+ * = アプリが二度と起動しない (Codex #1258 R4 中1)。
+ *
+ * ⭐直してよいのは**決まりごとで値が決まるものだけ**:
+ *   - 個人の記録は「必ず 1 人」(表の CHECK にも書いてある)。だから欠けていても 1 にできる。推測ではない。
+ * ⭐人数だけの記録の壊れた人数は**推測で直さない**。工賃の計算に効く数字なので、
+ *   どの行かを名指しして止める。丸めて動かすほうが、静かに間違った工賃を払うぶん悪い。
+ */
+function normalizeCrewSize(db) {
+  const has = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'f_iroha_work_sessions'").get();
+  if (!has) return;
+  const cols = db.prepare('PRAGMA table_info(f_iroha_work_sessions)').all().map((c) => c.name);
+  if (!cols.includes('crew_size')) return;   // 列がまだ無い版 = 作り直しで既定値 1 が入る
+  const broken = `crew_size IS NULL OR typeof(crew_size) <> 'integer' OR crew_size < 1 OR crew_size > 50`;
+  const fixed = db.prepare(`UPDATE f_iroha_work_sessions SET crew_size = 1
+    WHERE worker_id IS NOT NULL AND (${broken} OR crew_size <> 1)`).run().changes;
+  if (fixed > 0) console.log(`[iroha-work] 個人の作業記録 ${fixed} 件の人数を 1 にそろえました (個人は必ず 1 人)`);
+  const bad = db.prepare(`SELECT id, crew_size FROM f_iroha_work_sessions
+    WHERE worker_id IS NULL AND (${broken}) ORDER BY id LIMIT 20`).all();
+  if (bad.length > 0) {
+    throw new Error('人数だけの作業記録に、人数が入っていない・整数でない行があります'
+      + ` (id: ${bad.map((r) => `${r.id}=${r.crew_size}`).join(', ')})。`
+      + '工賃の計算に効く数字なので、勝手に直さずに止めました。記録を確かめて直してから起動してください');
+  }
+}
+
 function migrateSessionMediaSchema(db) {
+  // ⭐作り直しに入る前にそろえる (落ちてから直すのでは、起動できないまま詰む)
+  normalizeCrewSize(db);
   const targets = [
     { table: 'f_iroha_work_sessions', ddl: sessionsDDL, index: SESSIONS_INDEX_DDL, required: SESSIONS_REQUIRED_DDL },
     { table: 'f_iroha_card_media', ddl: mediaDDL, index: MEDIA_INDEX_DDL, required: MEDIA_REQUIRED_DDL },
@@ -237,17 +457,26 @@ function migrateSessionMediaSchema(db) {
         db.exec(`DROP TABLE IF EXISTS ${tmp}`);   // 中断で残った作業表があれば捨てる (行は元の表にある)
         db.exec(ddl(tmp));
         const newCols = db.prepare(`PRAGMA table_info(${tmp})`).all().map((c) => c.name);
-        const oldCols = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
-        const cols = newCols.filter((c) => oldCols.has(c));
+        // ⭐写し方は カード・ラベル待ち の作り直しと同じ copyCols を使う。
+        //   新しい定義で「NOT NULL だが既定値がある」列 (人数 crew_size など) に古い行の NULL が
+        //   あっても、既定値に寄せて写す。ここで止まると**起動時の移行が二度と通らず、
+        //   アプリが起動しなくなる** (自分で見つけた穴。#1258 4 巡目の前)
+        const cc = copyCols(db, table, tmp, newCols);
         const before = db.prepare(`SELECT COUNT(*) c FROM ${table}`).get().c;
-        db.exec(`INSERT INTO ${tmp} (${cols.join(', ')}) SELECT ${cols.join(', ')} FROM ${table}`);
+        db.exec(`INSERT INTO ${tmp} (${cc.names.join(', ')}) SELECT ${cc.exprs.join(', ')} FROM ${table}`);
         const after = db.prepare(`SELECT COUNT(*) c FROM ${tmp}`).get().c;
         if (before !== after) throw new Error(`${table} の作り直しを中止しました (件数不一致 ${before} → ${after})`);
         db.exec(`DROP TABLE ${table}`);
         db.exec(`ALTER TABLE ${tmp} RENAME TO ${table}`);
         db.exec(index);
       }
-      const bad = db.pragma('foreign_key_check');
+      // ⭐見るのは**作り直した表だけ**。DB 全体を見ると、無関係な表に古い孤立行が 1 つあるだけで
+      //   作り直しが永久に止まり、アプリが起動しなくなる (この PR で本番の DB も 1 回作り直すので、
+      //   そこで初めて踏む。自分の作った行の始末は自分でつける、が筋)。
+      // ⚠foreign_key_check(表) は「その表が**持つ** FK」だけを見る。この 2 表を**参照している**表が
+      //   あれば、そちら側の違反は見えない — いまはどの表も参照していないので見逃しは無い
+      //   (grep: REFERENCES f_iroha_work_sessions / f_iroha_card_media は 0 件)
+      const bad = targets.flatMap(({ table }) => db.pragma(`foreign_key_check(${table})`));
       if (bad.length > 0) throw new Error(`作業時間・写真の作り直しを中止しました (FK 違反): ${JSON.stringify(bad.slice(0, 5))}`);
     })();
   } finally {
@@ -531,6 +760,15 @@ export function createTables(db = getMirrorDB()) {
       code       TEXT NOT NULL UNIQUE,
       name       TEXT NOT NULL,
       external   INTEGER NOT NULL DEFAULT 0 CHECK (external IN (0,1)),
+      offsite    INTEGER NOT NULL DEFAULT 0 CHECK (offsite IN (0,1)),   -- 物を持ち帰って向こうで作業する (羅針盤・ワークセンター)
+      -- ⭐受け入れ枠 (要件 §AB-8)。NULL = **未設定** (0 ではない)。
+      --   主 = 想定作業時間、副 = 箱数。⭐ハード上限にしない — 残高と目安を見せて、超えたら注意するだけ。
+      --   置き場・車両の都合で本当に物理的な上限がある施設だけ、箱数を守らせる (capacity_boxes_hard = 1)
+      capacity_hours     REAL,
+      capacity_boxes     INTEGER,
+      capacity_boxes_hard INTEGER NOT NULL DEFAULT 0 CHECK (capacity_boxes_hard IN (0,1)),
+      -- ⭐枠を変えるたびに +1。別の端末が先に変えていたら上書きしない (要件: 楽観ロック)
+      version    INTEGER NOT NULL DEFAULT 0,
       active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
       sort_order INTEGER NOT NULL DEFAULT 0
     );
@@ -569,6 +807,13 @@ export function createTables(db = getMirrorDB()) {
     --   raw_seconds はサーバー時刻の差分 (iPad の時計を信じない)。承認・補正 (approved) は後続PR。
     --   voided = 誤操作の論理削除 (行は消さず集計から外す — 実測値の除外フラグ)
     --   紐づけ先: Notion 正本の間は page_id、アプリ正本のカードは task_id (v1.1)
+    ${batchesDDL('f_iroha_task_batches')}
+    ${BATCHES_INDEX_DDL}
+    ${stockingDDL('f_iroha_stocking_records')}
+    ${STOCKING_INDEX_DDL}
+    ${consignDDL('f_iroha_consignments')}
+    ${consignReturnDDL('f_iroha_consignment_returns')}
+    ${CONSIGN_INDEX_DDL}
     ${sessionsDDL('f_iroha_work_sessions')}
 
     -- 完成写真・動画 (要件定義 §6 / §1.7 ②outbox)。
@@ -601,6 +846,24 @@ export function createTables(db = getMirrorDB()) {
       revoked_at   TEXT
     );
 
+    -- ⭐外部施設に渡す「読むだけの専用 URL」(要件 §AB-11 の 6)。
+    -- 羅針盤・ワークセンターは このアプリを触らないので、預けた物の状態だけを見られる窓口を別に用意する。
+    -- ⚠**個人情報は出さない**・**書き換えはできない** (要件 §AB-13)。
+    --   トークンは 32 バイトの乱数を base64url にしたもの。**ハッシュだけ保存**し、平文は発行時に 1 回だけ見せる。
+    --   施設ごとに何本でも出せて (人・部署ごとに分けられる)、1 本ずつ失効できる
+    CREATE TABLE IF NOT EXISTS f_iroha_facility_links (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      facility_code TEXT NOT NULL REFERENCES f_iroha_facilities(code),
+      token_hash    TEXT NOT NULL UNIQUE,
+      label         TEXT NOT NULL,                -- 誰に渡したか (例: ワークセンター 事務所)
+      created_by    TEXT,
+      created_at    TEXT NOT NULL,
+      expires_at    TEXT,                         -- 期限 (NULL = 期限なし)
+      last_seen_at  TEXT,
+      revoked_at    TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_iw_flink_fac ON f_iroha_facility_links(facility_code);
+
     CREATE TABLE IF NOT EXISTS f_iroha_app_enroll_codes (
       id             INTEGER PRIMARY KEY AUTOINCREMENT,
       code_hash      TEXT NOT NULL UNIQUE,
@@ -630,6 +893,8 @@ export function createTables(db = getMirrorDB()) {
   // 「当時何を見て作業したか」を残す。JSON)
   // 外部施設に出す準備ができたか (状態とは別のチェック。Notion のチェックボックスの置き換え — 中原さん 2026-09-03)
   addCol('f_iroha_tasks', 'external_ready', 'INTEGER NOT NULL DEFAULT 0 CHECK (external_ready IN (0,1))');
+  // 入荷側がなぜ取り消したか (line_removed / product_changed / planned_changed / reopen)。カードに理由を出して職員が決める (2026-09-08)
+  addCol('f_iroha_tasks', 'cancellation_reason', 'TEXT');
   // 途中まで何個できたか / 次にやる人への申し送り (要件 §Y。中原さん 2026-09-05)
   addCol('f_iroha_tasks', 'done_qty', 'INTEGER CHECK (done_qty IS NULL OR done_qty >= 0)');
   addCol('f_iroha_tasks', 'hold_memo', 'TEXT');
@@ -652,8 +917,16 @@ export function createTables(db = getMirrorDB()) {
   addCol('f_iroha_work_options', 'manual_sort', 'INTEGER');
   // 拠点の初期値 (無ければ足す。名前の変更は管理画面から — 今は無いので tasks.js を正とする)。
   // タスク表の作り直し (facility_code の FK 検査) より前に入れておく
-  const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, active, sort_order) VALUES (?, ?, ?, 1, ?)');
-  for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.sort_order);
+  addCol('f_iroha_facilities', 'offsite', 'INTEGER NOT NULL DEFAULT 0 CHECK (offsite IN (0,1))');
+  addCol('f_iroha_facilities', 'capacity_hours', 'REAL');
+  addCol('f_iroha_facilities', 'capacity_boxes', 'INTEGER');
+  addCol('f_iroha_facilities', 'capacity_boxes_hard', 'INTEGER NOT NULL DEFAULT 0 CHECK (capacity_boxes_hard IN (0,1))');
+  addCol('f_iroha_facilities', 'version', 'INTEGER NOT NULL DEFAULT 0');
+  const insFac = db.prepare('INSERT OR IGNORE INTO f_iroha_facilities (code, name, external, offsite, active, sort_order) VALUES (?, ?, ?, ?, 1, ?)');
+  for (const f of FACILITIES) insFac.run(f.code, f.name, f.external, f.offsite ? 1 : 0, f.sort_order);
+  // 「物を持ち帰るか」は拠点の性質なので tasks.js を正として揃える (既に入っている行も)
+  const offFac = db.prepare('UPDATE f_iroha_facilities SET offsite = ? WHERE code = ? AND offsite <> ?');
+  for (const f of FACILITIES) offFac.run(f.offsite ? 1 : 0, f.code, f.offsite ? 1 : 0);
   // 名前の変更 (既に入っている行は INSERT OR IGNORE では変わらない)。旧名のときだけ書き換えるので、手で別の名前にした行は触らない
   const renFac = db.prepare('UPDATE f_iroha_facilities SET name = ? WHERE code = ? AND name = ?');
   for (const r of FACILITY_RENAMES) renFac.run(r.to, r.code, r.from);
@@ -665,6 +938,11 @@ export function createTables(db = getMirrorDB()) {
   migrateTasksSchema(db);
   // 旧「保留」(status='on_hold') を「作業中/未着手 + 止まっている理由」へ (案A 2026-09-05)。列が揃った後に 1 回だけ
   migrateOnHoldToBlocked(db);
+  // ⭐まとまりを持っていないカードに 1 つずつ用意する (要件 §AB-1)。冪等。
+  //   進捗の移行 (上) が終わってから — まとまりの状態はカードの進捗から決めるため
+  backfillBatches(db);
+  // ⭐既に棚入完了のカードに、棚入れの実績が無ければ足す (要件 §AB-2)。まとまりが揃ったあと
+  backfillStocking(db);
   // v1.1 正本化: 作業時間・写真・履歴を task に紐づける (page_id は Notion 時代の証跡として残す — Codex 設計相談 R3)。
   // REFERENCES は宣言する (mirror DB は foreign_keys=ON。存在確認はサービス層でも行う)
   addCol('f_iroha_work_sessions', 'task_id', 'INTEGER REFERENCES f_iroha_tasks(id)');
@@ -738,6 +1016,12 @@ export function createTables(db = getMirrorDB()) {
   `);
   // 端数の箱 (最後の 1 箱だけ入数が違う) は後から足した列。すでにある DB にも入れる (中原さん 2026-09-06)
   addCol('f_iroha_print_jobs', 'extra_pack_qty', "TEXT NOT NULL DEFAULT ''");
+  // ⭐箱ラベルは「どのまとまりのぶんを刷ったか」を残す (要件 §AB-12)。
+  //   刷った中身 (商品名・バーコード・入数・期限・枚数) は元から列で持っているので、
+  //   あとでまとまりの期限や数を直しても、**刷った記録は変わらない**
+  addCol('f_iroha_print_jobs', 'batch_id', 'INTEGER REFERENCES f_iroha_task_batches(id)');
+  // 預けの行に「この預けで切り出したか」(Codex R3 中4)。マージ前の DB にも足す
+  addCol('f_iroha_consignments', 'split_created', 'INTEGER NOT NULL DEFAULT 0 CHECK (split_created IN (0,1))');
   // 索引は作り直しの後に張る (最初の版には task_id 列が無く、先に張ると起動で落ちる)
   db.exec(`
     ${SESSIONS_INDEX_DDL}
@@ -754,14 +1038,29 @@ export function createTables(db = getMirrorDB()) {
   // アプリ側のトランザクション検査だけだと、将来の別経路・移行コードから重複を作れる)。
   // 部分ユニークを張る前に、万一の既存重複 (最新以外) を admin 終了で閉じておく
   db.exec('DROP INDEX IF EXISTS idx_iroha_sessions_open');
+  // ⭐**個人の行だけ**を見る。人数だけの記録 (worker_id IS NULL) を混ぜると、
+  //   GROUP BY worker_id が NULL をひとかたまりにして、拠点をまたいだ作業中の記録を
+  //   最新 1 本を残して全部閉じてしまう (要件 §AB-10)
   db.prepare(`UPDATE f_iroha_work_sessions
     SET ended_at = ?, end_reason = 'admin',
         raw_seconds = MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER))
-    WHERE ended_at IS NULL AND id NOT IN (
-      SELECT MAX(id) FROM f_iroha_work_sessions WHERE ended_at IS NULL GROUP BY worker_id)`)
+    WHERE ended_at IS NULL AND worker_id IS NOT NULL AND id NOT IN (
+      SELECT MAX(id) FROM f_iroha_work_sessions WHERE ended_at IS NULL AND worker_id IS NOT NULL GROUP BY worker_id)`)
     .run(utcNow(), utcNow());
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_sessions_open_uniq
     ON f_iroha_work_sessions(worker_id) WHERE ended_at IS NULL`);
+  // ⭐人数だけの記録も同じ手当て (拠点 × カードで 1 本)。**片づけてから索引**の順を守る。
+  //   閉じ方は個人と同じ — 始めた時刻から今までを実測として残す (勝手に 0 にしない)。
+  //   人時にすると 秒 × 人数 になるので、3 人の記録は 3 倍で残る
+  db.prepare(`UPDATE f_iroha_work_sessions
+    SET ended_at = ?, end_reason = 'admin',
+        raw_seconds = MAX(0, CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER))
+    WHERE ended_at IS NULL AND worker_id IS NULL AND id NOT IN (
+      SELECT MAX(id) FROM f_iroha_work_sessions WHERE ended_at IS NULL AND worker_id IS NULL
+      GROUP BY facility_code, task_id)`)
+    .run(utcNow(), utcNow());
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_iroha_sessions_crew_uniq
+    ON f_iroha_work_sessions(facility_code, task_id) WHERE ended_at IS NULL AND worker_id IS NULL`);
 }
 
 // ───────────────────────── Notion キャッシュ ─────────────────────────
@@ -840,8 +1139,18 @@ export function workSecondsByTask(taskIds) {
   const db = getDB();
   for (let i = 0; i < ids.length; i += 400) {
     const chunk = ids.slice(i, i + 400);
-    const rows = db.prepare(`SELECT task_id, SUM(COALESCE(raw_seconds, 0)) AS secs, COUNT(DISTINCT worker_id) AS people
-      FROM f_iroha_work_sessions WHERE voided_at IS NULL AND ended_at IS NOT NULL AND task_id IN (${chunk.map(() => '?').join(',')})
+    // ⭐実測は **人時 = 秒 × 人数**。個人の記録は crew_size = 1 なので、今までの数字と変わらない (要件 §AB-10)。
+    //   人数は「個人の人数」+「拠点ごとのいちばん多かった人数の合計」。
+    //   ⭐拠点ごとに数えるのがだいじ — まとめて MAX を取ると、パレット 3 人 + ジョブサポ 2 人が 3 人になる
+    //   (Codex #1258 R1 中2)。同じ拠点が 2 回に分けて作業したときは 2 倍にしない (延べ人数にしない)
+    const rows = db.prepare(`SELECT task_id, SUM(secs) AS secs, SUM(ind) + COALESCE(SUM(crew), 0) AS people FROM (
+        SELECT task_id, facility_code,
+          SUM(COALESCE(raw_seconds, 0) * crew_size) AS secs,
+          COUNT(DISTINCT worker_id) AS ind,
+          MAX(CASE WHEN worker_id IS NULL THEN crew_size END) AS crew
+        FROM f_iroha_work_sessions
+        WHERE voided_at IS NULL AND ended_at IS NOT NULL AND task_id IN (${chunk.map(() => '?').join(',')})
+        GROUP BY task_id, facility_code)
       GROUP BY task_id`).all(...chunk);
     for (const r of rows) out.set(r.task_id, { seconds: Number(r.secs) || 0, people: r.people });
   }
@@ -986,7 +1295,7 @@ export function startSession({ pageId = null, taskId = null, productCode = null,
  * @param workers [{id, display_name}] 1件以上
  * @returns {ok, sessions:[{sessionId, workerId, workerName, startedAt, already}]} / {ok:false, error:'busy', busy:[…]}
  */
-export function startSessions({ pageId = null, taskId = null, productCode = null, title = null, workers, deviceLabel = null, masterSnapshot = undefined, guard = null }) {
+export function startSessions({ pageId = null, taskId = null, productCode = null, title = null, workers, deviceLabel = null, masterSnapshot = undefined, guard = null, batchId = null }) {
   const db = getDB();
   const now = utcNow();
   if (pageId == null && taskId == null) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
@@ -1028,18 +1337,105 @@ export function startSessions({ pageId = null, taskId = null, productCode = null
         message: `${who} の作業がまだ終わっていません。先にそちらを終了・中断するか、その人を外してください` };
     }
     const snapshot = startSnapshotJson(db, productCode, masterSnapshot);
+    // ⭐どのまとまりの作業か (要件 §AB-10)。まとまりが 1 つなら自動で結びつく。
+    //   2 つ以上あるときは画面が選んで batchId を送ってくる (絞れないまま始めさせない)。
+    //   それでも決められないときは NULL のまま — カードには残るので記録は失われない
+    const bp = taskId == null ? { value: null } : pickSessionBatch(db, Number(taskId), batchId);
+    if (bp.error) return bp;
     const ins = db.prepare(`INSERT INTO f_iroha_work_sessions
-      (page_id, task_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, master_snapshot)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      (page_id, task_id, product_code, title_snapshot, worker_id, worker_name, batch_id, device_label, started_at, master_snapshot)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     const sessions = uniq.map((w) => {
       const open = already.get(Number(w.id));
       if (open) return { sessionId: open.id, workerId: Number(w.id), workerName: w.display_name, startedAt: open.started_at, already: true };
       const info = ins.run(pageId, taskId == null ? null : Number(taskId), productCode, title,
-        Number(w.id), w.display_name, deviceLabel, now, snapshot);
+        Number(w.id), w.display_name, bp.value ?? null, deviceLabel, now, snapshot);
       return { sessionId: Number(info.lastInsertRowid), workerId: Number(w.id), workerName: w.display_name, startedAt: now, already: false };
     });
     return { ok: true, sessions, startedAt: now, already: sessions.every((s) => s.already) };
   }).immediate();
+}
+
+/**
+ * ⭐人数だけの作業をはじめる (要件 §AB-10)。パレット・ジョブサポは いろは の中で作業するが、
+ * 個人名は持たない。「パレット 3 人ではじめる」= **1 行** (crew_size = 3)。
+ *
+ * ⭐擬似作業者を 1 人つくる手は使えない — 個人は「1 人につき同時 1 件」なので、
+ *   その拠点が同時に 1 カードしか持てなくなる。だから拠点は別の軸として持つ。
+ * ⭐同時に開ける記録は **拠点 × カードで 1 本** (索引 idx_iroha_sessions_crew_uniq)。
+ *   拠点は同時に複数のカードを持てる。
+ * ⭐同じカードでもう一度押されたら**成功扱いで今の記録を返す** (再送で二重に数えない)。
+ */
+export function startCrewSession({ taskId, facilityCode, crewSize, batchId = null,
+  productCode = null, title = null, masterSnapshot, deviceLabel = null, now = utcNow(), guard = null }) {
+  const db = getDB();
+  const tid = Number(taskId);
+  if (!Number.isSafeInteger(tid) || tid <= 0) return { ok: false, error: 'bad_request', message: 'カードが指定されていません' };
+  const n = Number(crewSize);
+  if (!Number.isSafeInteger(n) || n < 1 || n > 50) {
+    return { ok: false, error: 'bad_request', message: '人数は 1〜50 の整数で入れてください' };
+  }
+  return db.transaction(() => {
+    if (guard) { const g = guard(); if (g) return g; }
+    const fac = db.prepare('SELECT code, name, external, offsite FROM f_iroha_facilities WHERE code = ? AND active = 1')
+      .get(String(facilityCode || ''));
+    if (!fac) return { ok: false, error: 'bad_facility', message: 'その拠点は選べません' };
+    // ⭐人数だけで記録できるのは「いろはの中で作業する外部の事業者」だけ (要件 §AB-10)。
+    //   物を持ち帰る拠点 (offsite) は向こうで作業するので、こちらでは時間を測らない。
+    //   いろは 自身は工賃の計算に個人の記録が要るので、名前で記録する
+    if (!fac.external || fac.offsite) {
+      return { ok: false, error: 'bad_facility',
+        message: '人数だけで記録できるのは、いろはの中で作業する外部の事業者だけです' };
+    }
+    const t = db.prepare('SELECT * FROM f_iroha_tasks WHERE id = ?').get(tid);
+    if (!t) return { ok: false, error: 'not_found', message: 'カードが見つかりません' };
+    if (t.status === 'closed') return { ok: false, error: 'closed_task', message: '終了したカードでは作業をはじめられません' };
+    // ⭐どのまとまりの作業か。決められないときは NULL のまま — カードには残るので記録は失われない
+    const open = db.prepare(`SELECT id, started_at, crew_size, batch_id FROM f_iroha_work_sessions
+      WHERE facility_code = ? AND task_id = ? AND worker_id IS NULL AND ended_at IS NULL`).get(fac.code, tid);
+    if (open) {
+      return { ok: true, already: true,
+        session: { id: open.id, facilityCode: fac.code, facilityName: fac.name,
+          crewSize: open.crew_size, batchId: open.batch_id, startedAt: open.started_at } };
+    }
+    const bid = pickSessionBatch(db, tid, batchId);
+    if (bid && bid.error) return bid;
+    const snapshot = startSnapshotJson(db, productCode, masterSnapshot);
+    const info = db.prepare(`INSERT INTO f_iroha_work_sessions
+      (page_id, task_id, product_code, title_snapshot, worker_id, worker_name, facility_code, crew_size, batch_id,
+       device_label, started_at, master_snapshot)
+      VALUES (NULL, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)`)
+      .run(tid, productCode, title, fac.code, n, bid ? bid.value : null, deviceLabel, now, snapshot);
+    return { ok: true, already: false,
+      session: { id: Number(info.lastInsertRowid), facilityCode: fac.code, facilityName: fac.name,
+        crewSize: n, batchId: bid ? bid.value : null, startedAt: now } };
+  }).immediate();
+}
+
+/**
+ * どのまとまりの作業かを決める (要件 §AB-10)。
+ *
+ * ⭐対象は**手元のまとまり**だけ (Codex #1258 R2 中2)。物を持ち帰る拠点 (羅針盤・ワークセンター) の
+ *   ぶんは向こうで作業しているので、いろは の中で測った時間をそこに結びつけてはいけない。
+ *   外に出したまとまりまで数えると、手元が 1 つに決まっていても「2 つあるから決められない」になる。
+ * ⭐指定があれば**そのカードの手元のもの**かを確かめる。無ければ、手元が 1 つだけのときに限って
+ *   自動で選ぶ。2 つ以上あって決められないときは **NULL のまま** — 当てずっぽうで結びつけると、
+ *   あとから見た人が「このぶんの実測」と読んでしまう。
+ */
+const HOME_BATCH_SQL = `SELECT id FROM f_iroha_task_batches b
+  WHERE b.task_id = ? AND b.work_status <> 'cancelled'
+    AND (b.facility_code IS NULL OR b.facility_code IN (SELECT code FROM f_iroha_facilities WHERE offsite = 0))
+    AND NOT EXISTS (SELECT 1 FROM f_iroha_consignments c WHERE c.batch_id = b.id AND c.state <> 'cancelled')`;
+function pickSessionBatch(db, taskId, batchId) {
+  const rows = db.prepare(HOME_BATCH_SQL).all(taskId);
+  if (batchId != null) {
+    if (!rows.some((r) => r.id === Number(batchId))) {
+      return { error: 'bad_batch', ok: false,
+        message: 'そのぶんはこのカードの手元にありません (外に出したぶんの時間は測れません)' };
+    }
+    return { value: Number(batchId) };
+  }
+  return { value: rows.length === 1 ? rows[0].id : null };
 }
 
 /**
@@ -1080,7 +1476,10 @@ export function stopSession({ pageId = null, taskId = null, workerId, sessionId,
       .get(byTask ? Number(taskId) : pageId).c;
     const row = db.prepare('SELECT * FROM f_iroha_work_sessions WHERE id = ?').get(sid);
     const sameCard = row && (byTask ? Number(row.task_id) === Number(taskId) : row.page_id === pageId);
-    if (!row || !sameCard || row.worker_id !== Number(workerId)) {
+    // ⭐人数だけの記録 (要件 §AB-10) には「その人の記録」という持ち主がいない。
+    //   個人名を持たないので worker_id で照合できず、終わらせるのは職員 (router が確かめている)
+    const crew = !!row && row.worker_id == null;
+    if (!row || !sameCard || (!crew && row.worker_id !== Number(workerId))) {
       return { ok: false, error: 'not_started', message: 'このカードで作業をはじめた記録がありません (画面を更新してください)' };
     }
     if (row.ended_at) {
@@ -1191,6 +1590,12 @@ export function undoStopSessions({ taskId, sessionIds, withinMs = 60000, expectT
         const row = get.get(id);
         if (!row || Number(row.task_id) !== Number(taskId)) return { ok: false, error: 'not_found', message: '作業の記録が見つかりません (画面を更新してください)' };
         if (row.voided_at) return { ok: false, error: 'voided', message: '取り消された記録はもどせません' };
+        // ⭐人数だけの記録はもどさない (要件 §AB-10)。持ち主がいないので「同じ人の記録を 2 本戻さない」
+        //   という見張りが効かず、拠点 × カードの一意制約に当てて落ちる。もう一度はじめてもらう
+        if (row.worker_id == null) {
+          return { ok: false, error: 'not_undoable',
+            message: '人数だけの記録はもどせません。もう一度「はじめる」を押してください' };
+        }
         if (!row.ended_at) { targets.push({ row, already: true }); continue; }   // まだ動いている = 二重押し。そのまま
         // 人が止めたもの (pause / done) だけ。職員が管理画面で閉じたもの (admin) は戻さない (Codex R1 #1)
         if (row.end_reason !== 'pause' && row.end_reason !== 'done') return { ok: false, error: 'not_undoable', message: 'この記録はもどせません' };
@@ -1226,7 +1631,8 @@ export function sessionsOverlappingDay(ymd, { cap = 5000 } = {}) {
   const startUtc = jstDayStartUtc(ymd);
   if (!startUtc) return null;
   const endUtc = new Date(Date.parse(startUtc) + 86400000).toISOString();
-  const rows = getDB().prepare(`SELECT id, task_id, page_id, product_code, title_snapshot, worker_id, worker_name, device_label, started_at, ended_at, end_reason, raw_seconds
+  const rows = getDB().prepare(`SELECT id, task_id, page_id, product_code, title_snapshot, worker_id, worker_name,
+      facility_code, crew_size, batch_id, device_label, started_at, ended_at, end_reason, raw_seconds
     FROM f_iroha_work_sessions WHERE voided_at IS NULL AND started_at < ? AND (ended_at IS NULL OR ended_at >= ?)
     ORDER BY started_at, id LIMIT ?`).all(endUtc, startUtc, cap + 1);
   return { rows: rows.slice(0, cap), truncated: rows.length > cap, startUtc, endUtc };
@@ -1234,7 +1640,7 @@ export function sessionsOverlappingDay(ymd, { cap = 5000 } = {}) {
 
 export function activeSessionsByTask() {
   const map = new Map();
-  for (const r of getDB().prepare(`SELECT id, task_id, worker_id, worker_name, started_at, device_label
+  for (const r of getDB().prepare(`SELECT id, task_id, worker_id, worker_name, facility_code, crew_size, batch_id, started_at, device_label
     FROM f_iroha_work_sessions WHERE ended_at IS NULL AND task_id IS NOT NULL ORDER BY started_at`).all()) {
     if (!map.has(r.task_id)) map.set(r.task_id, []);
     map.get(r.task_id).push(r);
@@ -1250,7 +1656,7 @@ export function activeSessionsByTask() {
 export function finishedSessionsOfTask(taskId) {
   const n = Number(taskId);
   if (!Number.isInteger(n) || n <= 0) return [];
-  return getDB().prepare(`SELECT id, worker_name, started_at, ended_at, end_reason, raw_seconds
+  return getDB().prepare(`SELECT id, worker_name, facility_code, crew_size, batch_id, started_at, ended_at, end_reason, raw_seconds
     FROM f_iroha_work_sessions
     WHERE task_id = ? AND ended_at IS NOT NULL AND voided_at IS NULL
     ORDER BY started_at, id`).all(n);
@@ -1262,7 +1668,7 @@ export function finishedSessionsOfTask(taskId) {
  */
 export function estimateByProduct() {
   // カード単位 = task_id (アプリ正本) か page_id (Notion 時代)。同じカードの複数人・複数回を 1 件にまとめる
-  const rows = getDB().prepare(`SELECT LOWER(TRIM(product_code)) AS k, COALESCE('t' || task_id, page_id) AS card, SUM(raw_seconds) AS total, MAX(ended_at) AS last_end
+  const rows = getDB().prepare(`SELECT LOWER(TRIM(product_code)) AS k, COALESCE('t' || task_id, page_id) AS card, SUM(raw_seconds * crew_size) AS total, MAX(ended_at) AS last_end
     FROM f_iroha_work_sessions
     WHERE ended_at IS NOT NULL AND voided_at IS NULL AND product_code IS NOT NULL AND raw_seconds > 0
     GROUP BY LOWER(TRIM(product_code)), COALESCE('t' || task_id, page_id)`).all();
@@ -1362,16 +1768,24 @@ export function searchSessions({ workerId = null, from = null, to = null, q = nu
   // 合計は**絞り込んだ全件**で出す (画面に出ている 200 件ぶんだけの合計にしない)。
   // ⭐totalSeconds は**終わったぶんだけ**。作業中はまだ確定していないので足さない
   //   (工賃の計算に使う数字が、見るたびに増えていくことになる — 画面のラベルも「終わったぶん」と書く)
-  const summary = db.prepare(`SELECT COUNT(*) AS count,
-      COALESCE(SUM(CASE WHEN s.ended_at IS NOT NULL THEN s.raw_seconds ELSE 0 END), 0) AS totalSeconds,
+  const base = db.prepare(`SELECT COUNT(*) AS count,
+      COALESCE(SUM(CASE WHEN s.ended_at IS NOT NULL THEN s.raw_seconds * s.crew_size ELSE 0 END), 0) AS totalSeconds,
       COUNT(DISTINCT s.worker_id) AS workers,
       COUNT(DISTINCT LOWER(TRIM(s.product_code))) AS products,
       COUNT(DISTINCT COALESCE('t' || s.task_id, s.page_id)) AS cards,
       SUM(CASE WHEN s.ended_at IS NULL THEN 1 ELSE 0 END) AS open
     FROM f_iroha_work_sessions s ${sql}`).get(...args);
+  // ⭐人数だけの記録は**拠点ごと**に「いちばん多かった人数」を足す。
+  //   まとめて MAX を取ると、パレット 3 人 + ジョブサポ 2 人が 3 人になる (Codex #1258 R1 中2)。
+  //   個人の数え方 (DISTINCT) には触らない — 同じ人が何枚のカードにいても 1 人
+  const crewSql = sql ? `${sql} AND s.worker_id IS NULL` : 'WHERE s.worker_id IS NULL';
+  const crew = db.prepare(`SELECT COALESCE(SUM(mx), 0) AS crew FROM (
+      SELECT MAX(s.crew_size) AS mx FROM f_iroha_work_sessions s ${crewSql} GROUP BY s.facility_code)`).get(...args);
+  const summary = { ...base, workers: (base.workers || 0) + (crew.crew || 0) };
 
   const rows = db.prepare(`SELECT s.id, s.task_id, s.page_id, s.product_code, s.title_snapshot,
-      s.worker_id, s.worker_name, s.device_label, s.started_at, s.ended_at, s.end_reason,
+      s.worker_id, s.worker_name, s.facility_code, s.crew_size, s.batch_id,
+      s.device_label, s.started_at, s.ended_at, s.end_reason,
       s.raw_seconds, s.voided_at, s.void_reason
     FROM f_iroha_work_sessions s ${sql}
     ORDER BY s.started_at DESC, s.id DESC LIMIT ? OFFSET ?`).all(...args, cap, skip);
@@ -1521,6 +1935,118 @@ export function verifyDevice(token) {
     db.prepare('UPDATE f_iroha_app_devices SET last_seen_at = ? WHERE id = ?').run(now, row.id);
   }
   return row;
+}
+
+// ─── 外部施設の専用 URL (読むだけ。要件 §AB-11 の 6) ───
+
+/**
+ * 施設用のリンクを 1 本発行する。⭐**平文のトークンはここで 1 回返すだけ**で、DB にはハッシュしか残らない。
+ * @returns {{ id, token }}
+ */
+export function createFacilityLink(facilityCode, label, actor = null, { expiresAt = null } = {}) {
+  const code = String(facilityCode || '').trim();
+  const fac = getDB().prepare('SELECT code, external FROM f_iroha_facilities WHERE code = ? AND active = 1').get(code);
+  if (!fac) throw new Error('その拠点は選べません');
+  if (!fac.external) throw new Error('専用 URL を渡すのは、いろは以外の事業者だけです');
+  const l = String(label || '').trim();
+  if (!l || l.length > 60) throw new Error('渡す相手の名前を 1〜60 文字で入れてください');
+  // ⭐形だけでなく**実在する日か**まで見る (2026-09-99 を通すと 9 月いっぱい使えてしまう — Codex R1 軽微5)
+  if (expiresAt != null) {
+    const d = String(expiresAt);
+    const t = /^\d{4}-\d{2}-\d{2}$/.test(d) ? new Date(d + 'T00:00:00Z') : null;
+    // ⚠Invalid Date に toISOString() を呼ぶと例外になる。先に時刻が数として成り立つかを見る
+    if (!t || Number.isNaN(t.getTime()) || t.toISOString().slice(0, 10) !== d) {
+      throw new Error('期限は実在する日を YYYY-MM-DD で入れてください');
+    }
+  }
+  const token = crypto.randomBytes(32).toString('base64url');
+  const info = getDB().prepare(`INSERT INTO f_iroha_facility_links
+      (facility_code, token_hash, label, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(code, hashToken(token), l, actor, utcNow(), expiresAt || null);
+  return { id: Number(info.lastInsertRowid), token };
+}
+
+/**
+ * トークンから施設リンクを引く。失効・期限切れは null。
+ * ⭐**当たったときだけ** last_seen_at を更新する (1 時間に 1 回へ間引く — 端末トークンと同じ流儀)。
+ *   読むだけの画面だが「いつ見に来たか」は監査に要る (誰に渡した URL が生きているかを職員が判断する材料)
+ */
+export function verifyFacilityLink(token, { touch = true } = {}) {
+  if (!token || typeof token !== 'string' || token.length > 200) return null;
+  const db = getDB();
+  // ⭐**見るときにも拠点を確かめる** (Codex R1 中3)。発行時に見ただけだと、拠点を止めた (active = 0) あとも
+  //   1 本ずつ失効させるまで中身が読めてしまう
+  const row = db.prepare(`SELECT l.* FROM f_iroha_facility_links l
+    JOIN f_iroha_facilities f ON f.code = l.facility_code
+    WHERE l.token_hash = ? AND l.revoked_at IS NULL AND f.active = 1 AND f.external = 1`).get(hashToken(token));
+  if (!row) return null;
+  // 期限は「その日いっぱい」(YYYY-MM-DD の 23:59 JST まで) — 渡した相手が当日に見られないのを避ける
+  if (row.expires_at && new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10) > row.expires_at) return null;
+  // ⭐**業務のデータは変えない。見に来た日時だけ残す** (要件「読むだけの画面で DB を変えない」の例外。Codex R1 軽微6)。
+  //   ⚠これは「人が実際に見た」証明ではない (リンク検査・先読みでも当たる)。職員が
+  //   「この URL はまだ生きているか」を判断する材料として使う。HEAD では触らない
+  if (touch) {
+    const now = utcNow();
+    if (!row.last_seen_at || Date.parse(now) - Date.parse(row.last_seen_at) > 3600_000) {
+      db.prepare('UPDATE f_iroha_facility_links SET last_seen_at = ? WHERE id = ?').run(now, row.id);
+    }
+  }
+  return row;
+}
+
+/** 発行ずみのリンク (管理画面用)。⭐トークンそのものは出せない (ハッシュしか無い) */
+export function listFacilityLinks(includeRevoked = false) {
+  return getDB().prepare(`SELECT l.id, l.facility_code, f.name AS facility_name, l.label, l.created_by, l.created_at,
+      l.expires_at, l.last_seen_at, l.revoked_at
+    FROM f_iroha_facility_links l LEFT JOIN f_iroha_facilities f ON f.code = l.facility_code
+    ${includeRevoked ? '' : 'WHERE l.revoked_at IS NULL'} ORDER BY l.revoked_at IS NOT NULL, l.id DESC`).all();
+}
+
+/** 1 本だけ失効させる (渡した相手が変わった・漏れたとき)。@returns 直したか */
+export function revokeFacilityLink(id) {
+  return getDB().prepare('UPDATE f_iroha_facility_links SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL')
+    .run(utcNow(), Number(id)).changes > 0;
+}
+
+/**
+ * ⭐外部施設の受け入れ枠を決める (要件 §AB-8)。**空にすれば「未設定」に戻せる** (0 と区別する)。
+ * ハード制約にできるのは箱数だけ (置き場・車両の都合。時間は概算なので守らせない)。
+ *
+ * expectVersion を渡すと**楽観ロック**になる (合わなければ conflict)。画面からは必ず渡すこと —
+ * 渡さないと、A が「8 箱・守らせる」に直した直後に B が時間だけ保存して、A の変更が消える (Codex R1 中3)。
+ */
+export function setFacilityCapacity(code, { hours, boxes, boxesHard, expectVersion } = {}) {
+  const fac = getDB().prepare('SELECT code, offsite, version FROM f_iroha_facilities WHERE code = ?').get(String(code || ''));
+  if (!fac) return { ok: false, error: 'not_found', message: 'その拠点はありません' };
+  if (!fac.offsite) return { ok: false, error: 'not_external', message: '受け入れ枠を持つのは、物を持ち帰る拠点だけです' };
+  const num = (v, label, max) => {
+    if (v === undefined) return { skip: true };
+    if (v === null || v === '') return { value: null };            // ⭐空 = 未設定に戻す
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0 || n > max) return { error: `${label}は 0 より大きい数で入れてください` };
+    return { value: n };
+  };
+  const h = num(hours, '目安の時間', 10_000);
+  if (h.error) return { ok: false, error: 'bad_request', message: h.error };
+  const b = num(boxes, '箱の数', 100_000);
+  if (b.error) return { ok: false, error: 'bad_request', message: b.error };
+  if (b.value != null && !Number.isSafeInteger(b.value)) return { ok: false, error: 'bad_request', message: '箱の数は整数で入れてください' };
+  const sets = [];
+  const vals = [];
+  if (!h.skip) { sets.push('capacity_hours = ?'); vals.push(h.value); }
+  if (!b.skip) { sets.push('capacity_boxes = ?'); vals.push(b.value); }
+  if (boxesHard !== undefined) { sets.push('capacity_boxes_hard = ?'); vals.push(boxesHard ? 1 : 0); }
+  if (sets.length === 0) return { ok: false, error: 'bad_request', message: '直すものがありません' };
+  if (expectVersion != null && Number(expectVersion) !== fac.version) {
+    return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します', version: fac.version };
+  }
+  sets.push('version = version + 1');
+  const info = getDB().prepare(`UPDATE f_iroha_facilities SET ${sets.join(', ')} WHERE code = ? AND version = ?`)
+    .run(...vals, fac.code, fac.version);
+  if (info.changes === 0) {
+    return { ok: false, error: 'conflict', message: '他の端末で変更されています。最新の状態を表示します' };
+  }
+  return { ok: true, version: fac.version + 1 };
 }
 
 /** 端末の職員モード。PIN を確かめた側が呼ぶ。@returns 期限 (ISO) */

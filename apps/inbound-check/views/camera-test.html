@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>カメラの確認 — 入荷受付チェック</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; margin: 0; padding: 14px; background: #f8f9fa; color: #212529; }
+  h1 { font-size: 1.15em; margin: 0 0 4px; }
+  p.lead { margin: 0 0 14px; color: #495057; font-size: 0.92em; line-height: 1.6; }
+  button { font-size: 1.05em; padding: 12px 20px; border-radius: 10px; border: 1px solid #adb5bd; background: #fff; cursor: pointer; }
+  button.go { background: #1971c2; color: #fff; border-color: #1971c2; }
+  button[disabled] { opacity: .5; }
+  video { width: 100%; max-width: 520px; background: #000; border-radius: 10px; display: block; margin: 12px 0; aspect-ratio: 4/3; object-fit: contain; }
+  #log { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 10px; font-family: ui-monospace, Menlo, monospace;
+         font-size: 0.82em; line-height: 1.55; white-space: pre-wrap; word-break: break-all; max-width: 640px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .verdict { border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 0.95em; line-height: 1.6; max-width: 640px; display: none; }
+  .verdict.ok { display: block; background: #d3f9d8; color: #2b8a3e; }
+  .verdict.ng { display: block; background: #ffe3e3; color: #a61e1e; }
+  .note { font-size: 0.85em; color: #868e96; max-width: 640px; margin-top: 10px; line-height: 1.6; }
+  /* 🚨 どちらで開いているかを**押す前に**はっきり出す。2026-09-07 に、ホーム画面アプリで
+     試したつもりが2回続けて Safari で計測されていたため */
+  .where { border-radius: 8px; padding: 10px 12px; margin: 0 0 12px; font-size: 0.95em; line-height: 1.6; max-width: 640px; }
+  .where.app { background: #d0ebff; color: #1864ab; }
+  .where.browser { background: #fff3bf; color: #7a5c00; }
+</style>
+</head>
+<body>
+<h1>📷 カメラの確認</h1>
+<p class="lead">
+  入荷受付チェックの読み取り機能とは<b>切り離した、いちばん単純な確認</b>です。
+  カメラを1回だけ開いて、10秒ぶんの様子をそのまま出します。
+  <br><b>映像はこの画面に表示するだけで、保存も送信もしません。</b>
+</p>
+<div class="where" id="where"></div>
+<div class="row">
+  <button class="go" id="start">カメラを開く</button>
+  <button id="startBack">背面カメラで試す</button>
+  <button id="stop">止める</button>
+  <button id="copy">結果をコピー</button>
+</div>
+<div class="verdict" id="verdict"></div>
+<video id="v" playsinline muted autoplay></video>
+<div id="log">「カメラを開く」を押してください。</div>
+<p class="note">
+  <b>「カメラを開く」は向きを指定しません</b>（条件のせいで落ちる可能性を消すため）。そのため前面が選ばれることがあります。
+  読み取り画面が使うのは背面なので、<b>「背面カメラで試す」</b>も押して比べてください。
+  <br>読み取り画面と<b>同じ開き方</b>（ホーム画面のアイコン／Safari）で試すと比べられます。
+  結果を送るときは、<b>「止める」を押してカメラを閉じてから、下の文字の部分だけ</b>を送ってください
+  （映像に人や伝票が写り込まないように）。
+</p>
+
+<script>
+(function () {
+  'use strict';
+  var lines = [];
+  var logEl = document.getElementById('log');
+  var v = document.getElementById('v');
+  var verdict = document.getElementById('verdict');
+  var startBtn = document.getElementById('start');
+  // 🚨 押す前に「いまどちらで開いているか」を出す。読み取り画面と同じ開き方で測らないと比べられない
+  (function () {
+    var w = document.getElementById('where');
+    var standalone = !!(window.navigator.standalone
+      || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+    w.className = 'where ' + (standalone ? 'app' : 'browser');
+    w.innerHTML = standalone
+      ? '✅ <b>ホーム画面のアプリの中</b>で開いています。'
+      : '⚠ <b>ブラウザで開いています。</b>ホーム画面アプリで起きるカメラの不具合を確かめるには、'
+        + '<b>アプリの中で</b>試してください。'
+        + '<br>ホーム画面のアイコンからアプリを開き →「商品を探す」→ 説明の下の「カメラの動作確認」から入り直してください。';
+  })();
+  var backBtn = document.getElementById('startBack');
+  // 🚨 1回の試行につき取得は1回だけ。連打や「取得待ち中に止める」で複数の取得が並走すると、
+  //    先のストリームを止められなくなり、切り分けそのものが汚れる
+  var run = 0;
+  // 🚨 **取得が決着するまで次の取得を始めない** (Codex #1244 R1)。試行番号で結果を捨てても、
+  //    未完了の getUserMedia が重なること自体は防げない = カメラ終了の切り分けに別の要因が入る
+  var acquiring = false;
+  var timer = null, stream = null;
+  var t0 = 0, grantedAt = null, endedAt = null, lastProgressAt = null;
+  // 🚨 頼んだ向き。既定は **何も指定しない** (条件のせいで落ちる可能性を消す) ので、
+  //    iPad では前面が選ばれることが多い。読み取り画面が使うのは背面なので、そちらも試せるようにする
+  var wanted = null;
+  var progress = 0, lastTime = -1, sawEnded = false, sawMute = false;
+  var now = function () { return (window.performance && performance.now) ? performance.now() : Date.now(); };
+  var since = function (base) { return Math.round(now() - (base === null || base === undefined ? t0 : base)) + 'ms'; };
+  function log(s) { lines.push(s); logEl.textContent = lines.join('\n'); }
+  function say(kind, html) { verdict.className = 'verdict ' + kind; verdict.innerHTML = html; }
+
+  function env() {
+    var ua = navigator.userAgent || '';
+    var isIpad = /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+    var kind = isIpad ? 'iPad' : /iPhone/.test(ua) ? 'iPhone' : 'その他';
+    var m = ua.match(/OS (\d+)[_.](\d+)/);
+    var standalone = !!(window.navigator.standalone
+      || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches));
+    // ⚠ UA が名乗る版は実際の版とは限らない (Macintosh 形式の iPad では取れず、新しい Safari は固定値)
+    log('端末: ' + kind + (m ? ' UA' + m[1] + '.' + m[2] : ' UA版不明') + ' / ' + (standalone ? 'ホーム画面から起動' : 'ブラウザで起動'));
+    log('画面: 窓 ' + window.innerWidth + 'x' + window.innerHeight
+      + ' / 画面 ' + ((window.screen && window.screen.width) || '?') + 'x' + ((window.screen && window.screen.height) || '?'));
+    log('接続: ' + location.protocol + ' / secureContext=' + (window.isSecureContext ? 'はい' : 'いいえ')
+      + ' / 表示=' + (document.visibilityState || '?'));
+    log('API: getUserMedia=' + (navigator.mediaDevices && navigator.mediaDevices.getUserMedia ? 'あり' : 'なし'));
+  }
+
+  function releaseStream(s) {
+    if (!s) return;
+    s.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+  }
+  function setBusy(on) { startBtn.disabled = on; backBtn.disabled = on; }
+  function stopAll(why) {
+    run++;                                   // 走っている試行を無効にする (遅れて来た取得も使わせない)
+    if (timer) { clearInterval(timer); timer = null; }
+    releaseStream(stream); stream = null;
+    v.srcObject = null;
+    // ⚠ 取得がまだ決着していない間はボタンを戻さない (止めた直後に押せると要求が重なる)
+    if (!acquiring) setBusy(false);
+    if (why) log(why);
+  }
+
+  document.getElementById('stop').addEventListener('click', function () { stopAll('— 手で止めました —'); });
+  document.getElementById('copy').addEventListener('click', async function () {
+    try { await navigator.clipboard.writeText(lines.join('\n')); alert('コピーしました'); }
+    catch (e) { alert('コピーできませんでした。「止める」を押してから、文字の部分だけを選んで送ってください'); }
+  });
+
+  /** 10秒観察したあとの言い方。🚨「端末側」「アプリ側」と断定しない */
+  function finish(track) {
+    var last = track ? track.readyState + (track.muted ? '/muted' : '') : '不明';
+    // 🚨 **最後まで進み続けていたか**を見る (Codex #1242 R2)。最初だけ進んで途中で固まったものを
+    //    「再現しませんでした」にすると、いま調べたい現象を取り逃がす
+    var lastAt = (lastProgressAt !== null && grantedAt !== null) ? Math.round(lastProgressAt - grantedAt) : null;
+    var stalledFor = lastProgressAt === null ? null : Math.round(now() - lastProgressAt);
+    var stillGoing = stalledFor !== null && stalledFor <= 1500;   // 観察の終わりまで進んでいた
+    log('— 10秒たちました — 最終状態=' + last + ' 進み=' + progress + '回'
+      + (lastAt !== null ? ' 最後に進んだのは取得から ' + lastAt + 'ms (そこから ' + stalledFor + 'ms 止まっています)' : ''));
+    // 🚨 途中で終了した / 止まったものを「正常」と言わない。終了と最終状態を先に見る
+    if (sawEnded || (track && track.readyState === 'ended')) {
+      say('ng', '<b>カメラは開けましたが、'
+        + (endedAt !== null ? '取得できてから ' + endedAt + 'ms 後に' : '途中で') + '終了しました。</b>'
+        + '<br>この最小のページでも同じことが起きています。'
+        + '<br>読み取り画面と<b>同じ開き方・同じカメラ</b>でもう一度試して、結果を比べてください。');
+      return;
+    }
+    if (progress >= 3 && !sawMute && stillGoing) {
+      say('ok', '<b>今回の条件では再現しませんでした</b> (映像の進みを ' + progress + ' 回確認し、最後まで進み続けました)。'
+        + '<br>⚠ これは「この開き方・このカメラ・この条件で動いた」というだけです。'
+        + '読み取り画面と同じ開き方でも同じ結果になるかを確かめてください。');
+      return;
+    }
+    if (progress > 0) {
+      say('ng', '<b>映像は届きましたが、途中で止まりました</b> (進み ' + progress + ' 回'
+        + (lastAt !== null ? '・最後に進んだのは取得から ' + lastAt + 'ms で、そこから ' + stalledFor + 'ms 止まっています' : '')
+        + (sawMute ? '・mute あり' : '') + ')。'
+        + '<br>画面を2分割していないか、ページを拡大していないか、他のアプリがカメラを使っていないかを確かめてください。');
+      return;
+    }
+    say('ng', '<b>カメラは開けましたが、映像が届きませんでした</b> (進み 0 回)。'
+      + '<br>画面を2分割していないか、ページを拡大していないか、他のアプリがカメラを使っていないかを確かめてください。');
+  }
+
+  backBtn.addEventListener('click', function () { runTest({ facingMode: { exact: 'environment' } }); });
+  startBtn.addEventListener('click', function () { runTest(null); });
+
+  /** 1回ぶんの確認。@param {object|null} facing null = 向きを指定しない (いちばん緩い) */
+  async function runTest(facing) {
+    if (acquiring) return;                    // 取得が決着するまで次を始めない
+    stopAll(null);
+    var mine = ++run;                         // この試行の番号
+    setBusy(true);
+    lines = []; progress = 0; lastTime = -1;
+    grantedAt = null; endedAt = null; lastProgressAt = null; sawEnded = false; sawMute = false;
+    wanted = facing;
+    verdict.className = 'verdict';
+    t0 = now();
+    env();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      log('→ この端末では getUserMedia が使えません');
+      say('ng', 'この端末のブラウザはカメラに対応していません。');
+      setBusy(false);
+      return;
+    }
+    // ⭐既定はいちばん緩い条件だけ (条件のせいで落ちる可能性を消す)。
+    //   「背面カメラで試す」を押したときだけ向きを指定する
+    log(since() + ' 頼む条件: ' + (wanted === null ? 'video:true (向きの指定なし)' : '背面カメラ (exact environment)')
+      + ' — 許可を聞かれたら「許可」を押してください');
+    var s = null;
+    acquiring = true;
+    try {
+      s = await navigator.mediaDevices.getUserMedia({ video: wanted === null ? true : wanted, audio: false });
+    } catch (e) {
+      acquiring = false;
+      // 🚨 待っている間に止められていても **ボタンは戻す**。戻さないと押せないままになる
+      if (mine !== run) { setBusy(false); return; }
+      log(since() + ' ✗ 失敗: ' + (e && e.name ? e.name : '不明'));
+      say('ng', '<b>カメラを開けませんでした (' + (e && e.name ? e.name : '不明') + ')</b>'
+        + (wanted !== null ? '<br>背面カメラを名指しで頼んでいるので、OverconstrainedError なら'
+            + '「指定した背面カメラの条件を満たせなかった」ということです。' : '')
+        + '<br>NotAllowedError なら許可の問題、NotReadableError なら他が使っている、'
+        + 'NotFoundError ならカメラが見つかっていません。');
+      setBusy(false);
+      return;
+    }
+    acquiring = false;
+    // 🚨 待っている間に「止める」を押されていたら、**遅れて来たストリームはその場で解放する**
+    if (mine !== run) { releaseStream(s); setBusy(false); log('— 取得は届きましたが、止めた後なので解放しました —'); return; }
+    stream = s;
+    grantedAt = now();
+    log(since() + ' ✓ 開けました (許可待ちを含む)');
+    var track = stream.getVideoTracks()[0] || null;
+    if (track) {
+      var st = {};
+      try { st = track.getSettings ? track.getSettings() : {}; } catch (e) {}
+      log('  選ばれたカメラ: ' + (st.facingMode || '向き不明') + ' ' + (st.width || '?') + 'x' + (st.height || '?')
+        + ' / 状態=' + track.readyState + (track.muted ? ' (muted)' : ''));
+      // 🚨 ended は **イベント**で拾う。stop() を呼んだ場合は状態が ended になってもイベントは出ないので、
+      //    ここで拾えたなら「こちらが止めたのではなく、カメラ側が終了した」と言える
+      track.addEventListener('ended', function () {
+        if (mine !== run) return;
+        sawEnded = true; endedAt = Math.round(now() - grantedAt);
+        log(since(grantedAt) + ' (取得から) ✗ カメラが終了しました — ended イベント');
+      });
+      track.addEventListener('mute', function () { if (mine === run) { sawMute = true; log(since(grantedAt) + ' (取得から) ⚠ 映像が止まりました (mute)'); } });
+      track.addEventListener('unmute', function () { if (mine === run) log(since(grantedAt) + ' (取得から) ✓ 映像が戻りました (unmute)'); });
+    } else {
+      log('  ⚠ 映像トラックがありません');
+    }
+    v.srcObject = stream;
+    v.muted = true; v.playsInline = true;
+    v.play().then(function () { if (mine === run) log(since(grantedAt) + ' (取得から) ✓ play() 成功'); },
+                  function (e) { if (mine === run) log(since(grantedAt) + ' (取得から) ✗ play() 失敗: ' + (e && e.name ? e.name : '不明')); });
+
+    var ticks = 0;
+    timer = setInterval(function () {
+      if (mine !== run) { clearInterval(timer); timer = null; return; }
+      ticks++;
+      // ⚠ これは実際のコマ数ではなく「0.5秒ごとに currentTime が進んでいたか」を数えたもの
+      if (v.readyState >= 2 && v.videoWidth && v.currentTime !== lastTime) {
+        lastTime = v.currentTime; progress++; lastProgressAt = now();
+      }
+      if (ticks % 2 === 0 || ticks <= 2) {
+        log(since(grantedAt) + ' (取得から) 映像=' + v.readyState + ' サイズ=' + v.videoWidth + 'x' + v.videoHeight
+          + ' 進み=' + progress + (track ? ' 状態=' + track.readyState + (track.muted ? '/muted' : '') : '')
+          + ' 表示=' + (document.visibilityState || '?'));
+      }
+      if (ticks >= 20) {
+        clearInterval(timer); timer = null;
+        finish(track);
+        stopAll(null);
+      }
+    }, 500);
+  }
+})();
+</script>
+</body>
+</html>

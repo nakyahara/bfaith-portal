@@ -145,7 +145,10 @@
       <p class="hint">
         ロジザード <b>入荷状況照会 [FA04_01]</b> で「検索範囲: 当日から7日前まで / 対象データ: 受付済」で検索 → CSV エクスポートしたファイル
         (<code>CA04001_….csv</code>、Shift-JIS) を選んでください。取り込むと iPad の一覧が<b>丸ごと入れ替わり、確認状態は未確認から始まります</b>。<br>
-        同じ内容のファイル、いまの一覧より古い時刻のファイルは取り込みません。0件のCSVも正常に取り込みます (受付済が無い日)。
+        同じ内容のファイル、いまの一覧より古い時刻のファイルは取り込みません。<br>
+        🚨<b>確認ずみの行き先がひとつ残らず取り消される CSV</b> (0件のCSV・検索条件が違うCSV) も取り込みません。
+        取り込むと<b>いろはの在庫化カードが一斉に消える</b>ためです (2026-09-08 の事故)。
+        中身を見て「これで正しい」と分かるときだけ、確認のあとで取り込めます。
       </p>
       <div class="row">
         <input type="file" id="csvFile" accept=".csv,text/csv">
@@ -604,8 +607,18 @@
       fd.append('file', f);
       fd.append('file_modified', String(f.lastModified || ''));
       msg($('#uploadMsg'), true, '取込中…');
-      const r = await fetch(BASE + '/admin/upload', { method: 'POST', body: fd });
-      const j = await r.json().catch(() => ({}));
+      let r = await fetch(BASE + '/admin/upload', { method: 'POST', body: fd });
+      let j = await r.json().catch(() => ({}));
+      // 🚨一斉取消になる CSV は既定で断られる。中身を見て納得したときだけ、もう一度 force で送る
+      if (!j.ok && (j.error === 'empty_csv' || j.error === 'mass_cancel')) {
+        if (!confirm((j.message || '') + '\n\nそれでも取り込みますか？\n(いろはの在庫化カードが一斉に消えます)')) {
+          return msg($('#uploadMsg'), false, '取り込みませんでした');
+        }
+        fd.set('force', j.force_token);
+        msg($('#uploadMsg'), true, '取込中…');
+        r = await fetch(BASE + '/admin/upload', { method: 'POST', body: fd });
+        j = await r.json().catch(() => ({}));
+      }
       if (j.ok) { msg($('#uploadMsg'), true, '取り込みました: ' + j.slipCount + ' 伝票 / ' + j.rowCount + ' 行 (バッチ #' + j.batch.id + ')'); setTimeout(() => location.reload(), 800); }
       else msg($('#uploadMsg'), false, j.message || j.error || ('HTTP ' + r.status));
     });
@@ -775,7 +788,7 @@
               + (j.removed ? ' (消滅 ' + j.removed + ')' : '')
               + (j.invalidBarcodes ? ' ・ 刷れない形を ' + j.invalidBarcodes + ' 件 除外' : '')
               + (j.blankRows ? ' ・ 空欄の行 ' + j.blankRows + ' 件' : '')
-              + (naiyaku ? ' ・ 有効区分: ' + naiyaku : ''));
+              + (naiyaku ? ' ・ ' + (j.kubunColumn || '区分') + ': ' + naiyaku : ''));
           setTimeout(() => location.reload(), 2500);
         } else {
           msg($('#fetchBarcodeMsg'), false, '❌ ' + (j.message || j.error || ('HTTP ' + status)));

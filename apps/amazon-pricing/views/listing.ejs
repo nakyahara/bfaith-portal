@@ -1,0 +1,116 @@
+<%- include('_top', { nav: 'index' }) %>
+
+<% if (!row) { %>
+  <div class="card"><h2>見つかりません</h2><p class="dim">その SKU は出品一覧 (mirror_amazon_sku_fees) にありません。</p><a class="btn" href="/apps/amazon-pricing/">← 一覧へ</a></div>
+<% } else { const l = row.live; const minMargin = row.min_margin_rate == null ? DEFAULT_MIN_MARGIN_RATE : row.min_margin_rate; %>
+
+<p><a href="/apps/amazon-pricing/">← 一覧へ</a></p>
+<h2 style="margin:0 0 4px"><%= row.ne_name || '(NE商品と未突合)' %></h2>
+<div class="code" style="margin-bottom:14px">
+  SKU <%= row.seller_sku %> /
+  ASIN <% if (row.asin) { %><a href="https://www.amazon.co.jp/dp/<%= encodeURIComponent(row.asin) %>" target="_blank" rel="noopener"><%= row.asin %></a><% } else { %>—<% } %> /
+  NE <%= row.ne_code || '—' %><% if (row.parts > 1) { %> (セット <%= row.parts %>品)<% } %> /
+  <span class="chip <%= String(row.channel).toUpperCase() === 'FBA' ? 'c-fba' : 'c-fbm' %>"><%= String(row.channel).toUpperCase() === 'FBA' ? 'FBA' : '自己発送' %></span>
+</div>
+
+<div class="grid-2">
+  <div class="card">
+    <h2>いまの状態 <span class="small">(価格データ <%= row.snapshot_date_jst || '—' %>)</span></h2>
+    <div class="kv">
+      <div class="k">いまの価格</div><div><b><%= yen(row.my_price) %> 円</b></div>
+      <div class="k">カート価格</div><div><%= yen(row.buybox_price) %> 円
+        <% if (row.buybox_is_mine === 1) { %><span class="chip c-ok">自社</span><% } else if (row.buybox_is_mine === 0) { %><span class="chip c-warn">他社</span><% } else { %><span class="chip c-none">不明 / 無し</span><% } %></div>
+      <div class="k">原価 (税込)</div><div><% if (row.cost_incl_tax == null) { %><span class="chip c-bad">原価不明</span> <span class="small">構成品 <%= row.cost_missing_parts ?? '?' %> 点の原価が NE に無い</span><% } else { %><%= yen(row.cost_incl_tax) %> 円<% } %></div>
+      <div class="k">販売手数料率</div><div><%= pct(row.referral_fee_rate) %><% if (l.costs.feeRateAssumed) { %> <span class="chip c-warn">仮定</span><% } %></div>
+      <div class="k">FBA手数料 / 送料</div><div><%= yen(row.fba_fee) %> / <%= yen(row.ship_cost) %> 円 <span class="small">(その他 <%= yen((row.per_item_fee || 0) + (row.variable_closing_fee || 0)) %>)</span></div>
+      <div class="k">粗利 (いまの価格)</div><div><% if (row.gross_now.gross == null) { %>—<% } else { %><span class="<%= row.gross_now.gross < 0 ? 'neg' : 'pos' %>"><%= yen(row.gross_now.gross) %> 円 (<%= pct(row.gross_now.rate) %>)</span><% if (row.gross_now.rate < minMargin) { %> <span class="chip c-warn">最低粗利率 <%= pct(minMargin, 0) %> 未満</span><% } %><% } %></div>
+      <div class="k">直近30日 販売 (確定分)</div><div><%= num(row.units_30d ?? 0) %> 個 / <%= yen(row.sales_30d) %> 円</div>
+      <div class="k">下限 (計算)</div><div><%= yen(row.computed_floor) %> 円 <span class="small">= (原価 + 固定費) ÷ (1 − 手数料率 − 最低粗利率 <%= pct(minMargin, 0) %>)</span></div>
+      <div class="k">実効下限</div><div><b><%= yen(row.effective_floor) %> 円</b> <span class="small">(赤字ストッパーと計算値の高い方)</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>値付けの方針 <button class="btn btn-sm" type="button" id="edit-policy" style="margin-left:8px">方針を変える</button></h2>
+    <div class="kv">
+      <div class="k">追従モード</div><div><span class="chip c-mode-<%= row.mode %>"><%= MODES[row.mode] || row.mode %></span></div>
+      <div class="k">赤字ストッパー</div><div><%= yen(row.floor_price) %> 円</div>
+      <div class="k">高値ストッパー</div><div><%= yen(row.ceiling_price) %> 円</div>
+      <div class="k">上乗せ</div><div><%= row.offset_jpy || 0 %> 円</div>
+      <div class="k">最低粗利率</div><div><%= row.min_margin_rate == null ? '既定 ' + pct(DEFAULT_MIN_MARGIN_RATE, 0) : pct(row.min_margin_rate) %></div>
+      <div class="k">メモ</div><div><%= row.policy_note || '—' %></div>
+      <div class="k">最終更新</div><div><%= row.policy_updated_at ? toJst(row.policy_updated_at) + ' ' + row.policy_updated_by : '(まだ設定していない)' %></div>
+    </div>
+    <h2 style="margin-top:16px">いまの判定 <span class="small">(方針の現在値で計算・<span class="code"><%= RULE_VERSION %></span>)</span></h2>
+    <div>
+      <span class="chip c-<%= l.action %>"><%= ACTIONS[l.action] %><% if (l.proposedPrice != null) { %> → <%= yen(l.proposedPrice) %> 円<% } %></span>
+      <% if (l.confidence != null) { %><span class="small">確信度 <%= pct(l.confidence, 0) %></span><% } %>
+      <div class="reason" style="max-width:none;margin-top:6px"><%= l.reasonText %></div>
+      <% if (l.flags.length) { %><div class="flags"><% for (const f of l.flags) { %><span class="chip <%= f === 'BELOW_COST_FLOOR' || f === 'BELOW_STOPPER' ? 'c-bad' : 'c-warn' %>"><%= FLAGS[f] || f %></span><% } %></div><% } %>
+    </div>
+  </div>
+</div>
+
+<div class="grid-2">
+  <div class="card">
+    <h2>判定の記録 <span class="small">(run ごと・採点つき)</span></h2>
+    <% if (evaluations.length === 0) { %><p class="dim">まだありません</p><% } else { %>
+    <div class="tbl-wrap"><table class="ap">
+      <thead><tr><th>いつ (JST)</th><th>判定</th><th>理由</th><th>採点</th></tr></thead>
+      <tbody>
+      <% for (const e of evaluations) { %>
+        <tr>
+          <td class="small"><%= toJst(e.evaluated_at) %><div class="code"><%= e.rule_version %></div></td>
+          <td><span class="chip c-<%= e.action %>"><%= ACTIONS[e.action] %><% if (e.proposed_price != null) { %> → <%= yen(e.proposed_price) %><% } %></span><div class="small">いま <%= yen(e.current_price) %></div></td>
+          <td class="reason"><%= e.reason_text %></td>
+          <td><% if (e.review_verdict) { %><span class="chip c-<%= e.review_verdict %>"><%= REVIEW_VERDICTS[e.review_verdict] %></span><div class="small"><%= e.review_by %> <%= toJst(e.review_at) %><% if (e.review_comment) { %> — <%= e.review_comment %><% } %></div><% } else { %><span class="dim">—</span><% } %></td>
+        </tr>
+      <% } %>
+      </tbody>
+    </table></div>
+    <% } %>
+  </div>
+
+  <div class="card">
+    <h2>方針の変更履歴 <span class="small">(追記のみ)</span></h2>
+    <% if (events.length === 0) { %><p class="dim">まだありません</p><% } else { %>
+    <div class="tbl-wrap"><table class="ap">
+      <thead><tr><th>いつ (JST)</th><th>項目</th><th>前 → 後</th><th>理由</th><th>誰が</th></tr></thead>
+      <tbody>
+      <% for (const e of events) { %>
+        <tr>
+          <td class="small"><%= toJst(e.at) %></td>
+          <td><%= FIELD_LABELS[e.field] || e.field %></td>
+          <td><%= fieldValue(e.field, e.old_value) %> → <b><%= fieldValue(e.field, e.new_value) %></b></td>
+          <td class="small"><%= REASON_CODES[e.reason_code] || e.reason_code %><% if (e.reason_text) { %><br><%= e.reason_text %><% } %></td>
+          <td class="small"><%= e.actor_id %><% if (e.actor_type !== 'human') { %> <span class="chip c-none"><%= e.actor_type %></span><% } %></td>
+        </tr>
+      <% } %>
+      </tbody>
+    </table></div>
+    <% } %>
+  </div>
+</div>
+
+<div class="card">
+  <h2>価格の推移 <span class="small">(日次スナップショット・直近90日)</span></h2>
+  <% if (history.length === 0) { %><p class="dim">まだありません</p><% } else { %>
+  <div class="tbl-wrap"><table class="ap" style="max-width:520px">
+    <thead><tr><th>日付</th><th class="num">自分</th><th class="num">カート</th><th>カート保有</th></tr></thead>
+    <tbody>
+    <% for (const h of history) { %>
+      <tr><td><%= h.date_jst %></td><td class="num"><%= yen(h.my_price) %></td><td class="num"><%= yen(h.buybox_price) %></td><td><%= h.buybox_is_mine === 1 ? '自社' : h.buybox_is_mine === 0 ? '他社' : '—' %></td></tr>
+    <% } %>
+    </tbody>
+  </table></div>
+  <% } %>
+</div>
+
+<%- include('_policy_dialog') %>
+<script>
+  document.getElementById('edit-policy').addEventListener('click', function () {
+    openPolicyDialog(<%- JSON.stringify({ seller_sku: row.seller_sku, ne_name: row.ne_name, mode: row.mode, floor_price: row.floor_price, ceiling_price: row.ceiling_price, offset_jpy: row.offset_jpy, min_margin_rate: row.min_margin_rate, note: row.policy_note, computed_floor: row.computed_floor, has_policy: row.has_policy }).replace(/</g, '\\u003c') %>);
+  });
+</script>
+<% } %>
+</div>

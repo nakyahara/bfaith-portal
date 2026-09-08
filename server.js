@@ -6,6 +6,7 @@ import bcrypt from 'bcryptjs';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import linegiftRouter from './apps/linegift-sync/router.js';
 import mercariRouter from './apps/mercari-sync/router.js';
@@ -18,7 +19,6 @@ import { startMetrics } from './apps/observability/metrics.js';
 import { startDiskWatch } from './apps/observability/disk-watch.js';
 import { bootStart, bootEnd, bootNote, bootFail, getBootId } from './apps/observability/boot-log.js';
 import profitRouter from './apps/profit-calculator/router.js';
-import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import { startNotificationJob as startInventoryNotificationJob } from './apps/profit-analysis/notify-job.js';
 import { startMarginAlertJob } from './apps/profit-analysis/margin-alert-job.js';
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
@@ -40,6 +40,7 @@ import qoo10AccountingRouter from './apps/qoo10-accounting/router.js';
 import fbaProfitabilityRouter from './apps/fba-profitability/router.js';
 import mercariAccountingRouter from './apps/mercari-accounting/router.js';
 import profitAnalysisRouter from './apps/profit-analysis/router.js';
+import expectedProfitSyncRouter from './apps/expected-profit/publish-api.js';
 import amazonDashboardRouter from './apps/amazon-dashboard/router.js';
 import rakutenAnalyticsRouter from './apps/rakuten-analytics/router.js';
 import yahooAnalyticsRouter from './apps/yahoo-analytics/router.js';
@@ -78,6 +79,7 @@ import postageJudgeRouter from './apps/postage/judge-router.js';
 import { startProductLinksCron } from './apps/product-links/cron.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import priceUpdateRouter from './apps/price-update/router.js';
+import amazonPricingRouter from './apps/amazon-pricing/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import shippingWorkRouter from './apps/shipping-work/router.js';
 import pickingRouter from './apps/picking/router.js';
@@ -349,6 +351,20 @@ app.use((req, res, next) => {
   return globalJsonParser(req, res, next);
 });
 app.use(express.static(path.join(__dirname, 'public')));
+// 📷 入荷受付チェック「商品から探す」のカメラ読み取りに使うデコーダ (zxing-wasm)。
+// 🚨 **Safari は BarcodeDetector (Shape Detection API) を実装していない** ので、iPad でカメラから
+//    バーコードを読むにはデコーダを自前で配る必要がある (2026-09-07。最初の実装はこれを知らずに
+//    BarcodeDetector を使い、iPad では一度もカメラが起動しなかった)。
+// ⭐node_modules から直接配る = **JS と wasm の版が必ず揃う**。public/ に写すと片方だけ古くなる。
+//   Cache-Control は付けない (既定 = 毎回 ETag 検証 → 304)。版が変わったときに
+//   JS だけ新しく wasm が古い、という組み合わせを作らないため。読むのはボタンを押したときだけ
+// 🚨 解決に失敗してもポータル全体を落とさない (カメラが使えないだけで、検索も値札も動く)
+try {
+  const zxingWasm = createRequire(import.meta.url).resolve('zxing-wasm/reader/zxing_reader.wasm');
+  app.use('/vendor/zxing-wasm', express.static(path.dirname(path.dirname(zxingWasm))));
+} catch (e) {
+  console.warn('[server] zxing-wasm を配れません (📷 カメラ読み取りは使えません):', e.message);
+}
 
 // セッションストア(connect-sqlite3)は全リクエストで sessions.db を読み書きする。Render の
 // network-attached disk では rollback-journal モードの fsync が遅く、どのページでも TTFB を
@@ -911,6 +927,15 @@ const apps = [
     category: 'purchasing',
   },
   {
+    id: 'amazon-pricing',
+    name: 'Amazon 価格管理 (自社プライスター)',
+    description: 'Amazon 出品の価格・カート・原価・粗利を 1 画面で見て、値付けの方針 (追従モード・ストッパー) を記録する。ルールの判定は毎日シャドーで出し人が採点。★Amazon へは書き込まない (M1)',
+    icon: '🏷️',
+    path: '/apps/amazon-pricing/',
+    status: 'active',
+    category: 'purchasing',
+  },
+  {
     id: 'inquiry-hub',
     name: '問い合わせ管理',
     description: 'メール+楽天R-Messe+Yahoo!問い合わせの一元管理 (メールディーラー置き換え)。Step 1: 一覧/詳細/担当/メモ/検索 (read-only運用)',
@@ -1361,6 +1386,17 @@ app.use('/apps/qoo10-accounting', (req, res, next) => {
 }, qoo10AccountingRouter);
 app.use('/apps/fba-profitability', requireAppAccess('fba-profitability'), fbaProfitabilityRouter);
 app.use('/apps/profit-analysis', requireAppAccess('profit-analysis'), profitAnalysisRouter);
+// 想定利益: miniPC から世代を受け取る口。ログイン不要 (sync key 認証)。
+// 既存 mirror sync と同じ流儀にする (12MB parser + parser error handler)。
+// 🚨 全置換ではなく「世代を作り切ってからポインタを切り替える」ので、受信中も画面は前の世代を見る
+app.use('/apps/expected-profit/sync', requireSyncKeyStrict);
+app.use('/apps/expected-profit/sync', express.json({
+  limit: '12mb',
+  inflate: false,
+  verify: (req, res, buf) => { req.rawBodyBytes = buf.length; },
+}));
+app.use('/apps/expected-profit/sync', mirrorParserErrorHandler);
+app.use('/apps/expected-profit/sync', expectedProfitSyncRouter);
 app.use('/apps/amazon-dashboard', requireAppAccess('amazon-dashboard'), express.json({ limit: '256kb' }), amazonDashboardRouter);
 app.use('/apps/rakuten-analytics', requireAppAccess('rakuten-analytics'), rakutenAnalyticsRouter);
 app.use('/apps/yahoo-analytics', requireAppAccess('yahoo-analytics'), express.json({ limit: '256kb' }), yahooAnalyticsRouter);
@@ -1444,6 +1480,8 @@ app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.js
 // M1 は読み取り専用 — モールへの書き込みは無い。express.json は router 側で CSRF ガードの後に付ける
 // (Content-Type 検査より先に body を読ませない)
 app.use('/apps/price-update', requireAppAccess('price-update'), priceUpdateRouter);
+// Amazon 価格管理 (amazon-pricing): ap_* (warehouse-mirror.db 同居)。Amazon へ書き込まない (apps/amazon-pricing/README.md)。
+app.use('/apps/amazon-pricing', requireAppAccess('amazon-pricing'), amazonPricingRouter);
 // 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。
 // AI連携API (ローカルClaude Codeランナー用) は X-AI-Key 認証・セッション外 (設計書§9.2 権限分離。
 // 先に mount してポータルセッション認証を通さない。product-hub/service-api と同パターン)
@@ -1648,11 +1686,8 @@ app.listen(PORT, () => {
   // DATA_DIR (Persistent Disk) 使用率観測 — 2026-07-12 disk full 障害の再発防止
   startDiskWatch(DATA_DIR);
 
-  // 価格改定ワーカー — 安全装置未実装のため無効化 (2026-03-30)
-  // startPriceWorker();
-
-  // 価格改定メンテナンスジョブ — 同上理由で無効化 (2026-03-30)
-  // startMaintenanceJobs();
+  // (2026-09-07) 旧・価格改定ワーカー (price-scheduler.js) は削除した。Amazon の価格管理は
+  // apps/amazon-pricing (方針の記録 + 判定のシャドー運用のみ。Amazon へ書き込まない) に作り直し。
 
   // 経営インサイトGChat通知 (在庫サマリ、INVENTORY_NOTIFY_ENABLED=true で起動)
   startInventoryNotificationJob();

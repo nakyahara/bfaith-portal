@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "picking:standalone": "node apps/picking/standalone.js"
+    "picking:standalone": "node apps/picking/standalone.js",
+    "test:amazon-pricing": "node apps/amazon-pricing/test-no-write-path.mjs && node apps/amazon-pricing/test-engine.mjs && node apps/amazon-pricing/test-db.mjs && node apps/amazon-pricing/test-views.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.700.0",
@@ -35,7 +36,8 @@
     "pdf-parse": "^1.1.1",
     "sharp": "^0.33.5",
     "sql.js": "^1.11.0",
-    "xml2js": "^0.6.2"
+    "xml2js": "^0.6.2",
+    "zxing-wasm": "3.1.3"
   },
   "devDependencies": {
     "playwright": "^1.61.1"

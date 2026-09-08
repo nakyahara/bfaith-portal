@@ -103,7 +103,10 @@ function access(req, res, next) {
   if (req.path === '/manifest.json') return next();
   // 端末登録の画面と API はログイン不要 (登録コード自体が認証。共用 iPad に管理者パスワードを打たせない)
   // 手順書も認証なし: 登録がまだ済んでいない iPad からこそ読まれるページのため (中身は手順だけ)
-  if (req.path === '/enroll' || req.path === '/enroll/redeem' || req.path === '/guide') return next();
+  // 📷 カメラの確認も認証なし: カメラが使えない端末の切り分けに使うもので、登録できていない
+  //   / 不調の端末からこそ開かれる。読み取りも業務データも扱わない固定 HTML
+  if (req.path === '/enroll' || req.path === '/enroll/redeem' || req.path === '/guide'
+      || req.path === '/camera-test') return next();
   // 🏷 印刷エージェント (倉庫PC) は Cookie ではなく Authorization ヘッダーで名乗る。
   //   /print/ 配下はここでは素通しし、router.use('/print', requirePrintAgent) が kind='agent' の端末だけを通す
   //   (iPad の端末Cookieでは絶対に印刷ジョブを取れない)。ルートを列挙しないのは、後から /print/... を
@@ -270,6 +273,17 @@ router.post('/admin/enroll-codes', checkOrigin, requireAdmin, api((req, res) => 
 // 毎日の使い方 + 初回セットアップ。iPad の作業画面フッターと登録画面から飛べる
 router.get('/guide', (req, res) => {
   res.sendFile(path.join(__dirname, 'views', 'guide.html'));
+});
+
+// ─── 📷 カメラの確認 (認証なし) ───
+// 🚨 **アプリの読み取り機能を一切通さない**最小の確認ページ。getUserMedia を1回呼んで
+//    10秒ぶんの様子を出すだけ。2026-09-07 に iPad だけカメラが 9ms で終了する件が出たとき、
+//    「アプリの作りが悪いのか / 端末がカメラを渡していないのか」を切り分けられなかったので作った。
+//    guide と同じく素通し — 登録前・不調時の端末からこそ開かれるため。個人情報は扱わない
+router.get('/camera-test', (req, res) => {
+  // 外のサイトに埋め込ませない (誘導してカメラを開かせる余地を残さない — Codex #1242 R1)
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+  res.sendFile(path.join(__dirname, 'views', 'camera-test.html'));
 });
 
 // ─── 完了一覧 (棚入れ・確認用) ───
@@ -888,7 +902,11 @@ router.post('/admin/upload', requireSession, checkOrigin, upload.single('file'),
   const lm = Number(req.body?.file_modified);
   const now = Date.now();
   const generatedAt = Number.isFinite(lm) && lm > 0 ? new Date(Math.min(lm, now)).toISOString() : null;
-  const r = importCsv(buf, { fileName: req.file.originalname, source: 'manual_upload', actor: req.session.email, generatedAt });
+  // ⭐確認ずみの行き先が一斉に取り消される取込は既定で断る (2026-09-08 の事故)。
+  //   人が画面で件数を見て押したときだけ通す。合言葉は断ったときに返した force_token で、
+  //   **取り消す予定の中身そのもの**から作ってあるので、確認してから押すまでに対象が変われば通らない
+  const force = typeof req.body?.force === 'string' && req.body.force ? req.body.force : null;
+  const r = importCsv(buf, { fileName: req.file.originalname, source: 'manual_upload', actor: req.session.email, generatedAt, force });
   if (!r.ok) return res.status(r.error === 'bad_csv' ? 400 : 409).json(r);
   res.json(r);
 }));

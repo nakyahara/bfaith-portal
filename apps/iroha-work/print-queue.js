@@ -31,6 +31,12 @@ import { getTask } from './tasks-db.js';
 
 const utcNow = () => new Date().toISOString();
 const ms = (v) => { const t = Date.parse(v || ''); return Number.isFinite(t) ? t : null; };
+/** 画面に出す「さきほど◯時◯分」用。JST の時刻だけ (日付は同じ 30 分の窓なので要らない) */
+const fmtJstTime = (v) => {
+  const t = ms(v);
+  if (t == null) return 'さきほど';
+  return new Date(t + 9 * 3600 * 1000).toISOString().slice(11, 16);
+};
 const iso = (msVal) => new Date(msVal).toISOString();
 
 /** 1 ジョブの枚数の上限。エージェント側 (maxCopies 既定 50) と揃える — 入力ミスで 500 枚出ない */
@@ -43,6 +49,17 @@ export const REPORT_DEADLINE_SEC = 300;
 export const STALE_QUEUED_SEC = 180;
 /** エージェントの heartbeat (45 秒間隔) がこれ以内なら「オンライン」 */
 export const AGENT_ONLINE_MS = 10 * 60 * 1000;
+/**
+ * 🚨**さっき出したのと同じラベル**とみなす時間 (2026-09-08)。
+ *
+ * 1 枚目が「✅ 印刷しました」になると、下の「印刷中なら積まない」見張りをすり抜ける。
+ * 送ったのに応答を失った人が画面を開き直して押し直すと、依頼 ID が作り直されて **2 枚目が出る**。
+ * ラベルは貼ってしまうと現物から見分けられないので、ここで一度止めて人に確かめてもらう。
+ *
+ * ⭐30 分。同じまとまりの同じ中身を 30 分のうちにもう一度出すのは、たいてい押し間違い。
+ *   本当に 2 枚目が要るとき (貼り損じ・追加) は、確かめて発行できる — **止めるのではなく聞く**。
+ */
+export const DUPLICATE_WINDOW_MS = 30 * 60 * 1000;
 /** heartbeat の応答に載せる lease 秒 (エージェントは参考値として受け取るだけ) */
 export const LEASE_SEC = 120;
 
@@ -148,7 +165,37 @@ export function recordHeartbeat(deviceId, { note = null, version = null, bpac = 
  *   requestedBy / requestedDevice … 記録用
  * @returns {{ok:true, job, created:boolean}|{ok:false, error, message, job?}}
  */
-export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty = null, expiry = null, targetDeviceId = null, clientRequestId, acknowledgeUnknownJobId = null, requestedBy = null, requestedDevice = null }) {
+/**
+ * ⭐どのまとまりのぶんを刷るかを決める (要件 §AB-12)。
+ *
+ * ⭐**まとまりが 2 つ以上あるのに指定が無ければ断る**。カードに期限が違うぶんが混ざっていることが
+ *   あり (§AB-12 の前提 7)、どのぶんか決めずに刷ると**違う期限のラベルを箱に貼る**。
+ *   貼ってしまうと現物からは分からない。だから「どちらか選んで」と返す。
+ * ⭐指定があれば、そのカードのもので・取り消していないことを確かめる。
+ */
+function pickPrintBatch(db, taskId, batchId) {
+  // ⭐**まとまりがあるか**と**出せるぶんがあるか**を分けて見る。取り消したぶんを除いてから
+  //   件数を見ると、全部取り消されたカードが「まとまりの無い古いカード」と同じ扱いになり、
+  //   カード全体の期限・数でラベルが出てしまう (Codex #1259 R4 中1)
+  const all = db.prepare('SELECT * FROM f_iroha_task_batches WHERE task_id = ? ORDER BY seq').all(taskId);
+  const rows = all.filter((r) => r.work_status !== 'cancelled');
+  if (batchId != null) {
+    const b = rows.find((r) => r.id === Number(batchId));
+    if (!b) return { error: 'bad_batch', ok: false, message: 'そのぶんはこのカードにありません (画面を更新してください)' };
+    return { batch: b };
+  }
+  if (all.length === 0) return { batch: null };             // まとまりが無い古いカード (今までどおり)
+  if (rows.length === 0) {
+    return { error: 'no_batch', ok: false,
+      message: 'このカードのぶんはすべて取り消されています。ラベルは出せません' };
+  }
+  if (rows.length === 1) return { batch: rows[0] };
+  return { error: 'pick_batch', ok: false,
+    message: 'このカードは分かれています。どのぶんのラベルを出すか選んでください',
+    batches: rows.map((r) => ({ id: r.id, seq: r.seq, planned_qty: r.planned_qty, expiry: r.expiry, facility_code: r.facility_code })) };
+}
+
+export function enqueuePrintJob({ taskId, batchId = null, copies, packQty = null, extraPackQty = null, expiry = null, targetDeviceId = null, clientRequestId, acknowledgeUnknownJobId = null, acknowledgeDuplicateJobId = null, requestedBy = null, requestedDevice = null }) {
   const db = getDB();
   const crid = String(clientRequestId || '').trim();
   if (!/^[A-Za-z0-9._:-]{8,80}$/.test(crid)) return { ok: false, error: 'bad_request', message: 'client_request_id が必要です' };
@@ -183,6 +230,8 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty =
     if (dup) {
       // 同じ ID で中身が違う = 画面の不具合か ID の衝突。別のカードのジョブを「積めた」と返さない (Codex PR #1220 R1 中)
       const same = dup.task_id === tid && dup.copies === n && dup.pack_qty === pack && dup.extra_pack_qty === extra && dup.expiry_text === exp
+        // ⭐どのまとまりのぶんかも「同じ内容」の一部。違えば別のラベルなので、積めたことにしない
+        && (batchId == null || dup.batch_id === Number(batchId))
         && (targetDeviceId == null || dup.target_device_id === Number(targetDeviceId));
       if (!same) return { ok: false, error: 'idempotency_conflict', message: '同じ依頼 ID で違う内容が送られました。画面を更新してもう一度発行してください', job: publicJob(dup) };
       return { ok: true, job: publicJob(dup), created: false, replayed: true };
@@ -204,6 +253,14 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty =
     if (last && ACTIVE_STATES.includes(last.state)) {
       return { ok: false, error: 'in_progress', message: 'このカードのラベルは印刷中です (結果が出るまでお待ちください)', job: publicJob(last) };
     }
+    // ⭐どのまとまりのぶんかを**先に**決める。下の「さっき同じラベルを出していないか」に要る
+    //   (読むだけなので、ここへ動かしても書き込みの順は変わらない)
+    const pick = pickPrintBatch(db, tid, batchId);
+    if (pick.error) return pick;
+    const sole = pick.batch;
+    const soleId = sole ? sole.id : null;
+    const now = utcNow();
+
     // 🚨 直前が「❓ 結果不明」または「🙋 印刷係が応答しない (手で刷る扱い)」なら、そのジョブ ID を
     //    「実物を見て出ていなかった / まだ手で刷っていない」の証跡として受け取ってからしか積まない。
     //    manual を素通しすると、職員が P-touch Editor で手で刷るのと利用者の押し直しが競合して 2 枚になる (Codex PR #1220 R1 重要)
@@ -224,7 +281,33 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty =
 
     const target = resolvePrintTarget(targetDeviceId);
     if (!target.ok) return target;
-    const now = utcNow();
+
+    // 🚨**さっき同じラベルを出していないか**。**いちばん最後に聞く** — 出力先が無い・前回の結果が
+    //   不明といった「そもそも積めない理由」を先に片づけてから聞かないと、人が「別に要る」と確かめた
+    //   あとで「出力先を選んでください」と言われる二度手間になる。
+    //   1 枚目が「✅ 印刷しました」になると上の見張りを
+    //   すり抜けるので、応答を失った人が開き直して押すと 2 枚出る (ラベルは貼ると見分けられない)。
+    //   ⭐止めるのではなく**聞く**: 人が「別に要る」と確かめたら、その 1 件を指して発行できる
+    // ⭐窓は **印刷し終えた時刻** で測る。依頼を積んだ時刻 (created_at) で測ると、印刷に 2 分かかったとき
+    //   「刷り上がって 28 分」なのに「積んでから 30 分」で守りが切れる (Codex #1266 R1 中3)。
+    //   古い記録で finished_at が空なら updated_at → created_at の順で代わりにする (守りを緩めない側に倒す)
+    const twin = db.prepare(`SELECT * FROM f_iroha_print_jobs
+      WHERE task_id = ? AND state = 'completed' AND COALESCE(finished_at, updated_at, created_at) >= ?
+        AND copies = ? AND pack_qty = ? AND extra_pack_qty = ? AND expiry_text = ? AND batch_id IS ?
+      ORDER BY id DESC LIMIT 1`)
+      .get(tid, new Date(ms(now) - DUPLICATE_WINDOW_MS).toISOString(), n, pack, extra, exp, soleId);
+    if (twin) {
+      if (Number(acknowledgeDuplicateJobId) !== twin.id) {
+        return { ok: false, error: 'confirm_duplicate', job: publicJob(twin),
+          message: `さきほど ${fmtJstTime(twin.finished_at || twin.updated_at)} に、同じ内容のラベルを ${totalCopiesOf(twin)} 枚 出しています。`
+            + '出したはずのラベルが見あたらない・貼り損じた等で もう一度 必要なときだけ、「さっき出したのとは別に要る」にチェックして発行してください' };
+      }
+    } else if (acknowledgeDuplicateJobId != null) {
+      // 証跡を付けて送ってきたのに、その 1 件が見つからない (画面が古い / 窓を過ぎた)
+      return { ok: false, error: 'state_changed',
+        message: 'さきほど出したラベルの記録が見つかりませんでした。画面を更新して、もう一度確かめてください' };
+    }
+
     if (acked != null) {
       // 🚨 人が「出ていない / 手で刷っていない」と確認して再発行する = 旧ジョブの結果はここで確定。
       //    以後、旧 lease の遅延報告を受け付けない (2 枚出る)。同じトランザクションで CAS (状態が動いていたらやり直し)
@@ -239,11 +322,13 @@ export function enqueuePrintJob({ taskId, copies, packQty = null, extraPackQty =
         return { ok: false, error: 'confirm_unknown', message: '前回のジョブの状態が変わりました。画面を更新してもう一度確認してください', job: publicJob(cur) };
       }
     }
+    // ⭐どのまとまりのぶんを刷ったか (要件 §AB-12) は上で決めてある。刷った中身は下の列にそのまま
+    //   残るので、あとで期限や数を直しても記録は変わらない
     const info = db.prepare(`INSERT INTO f_iroha_print_jobs
-      (client_request_id, task_id, product_code, product_name, barcode, barcode_type, pack_qty, extra_pack_qty, expiry_text, copies,
+      (client_request_id, task_id, batch_id, product_code, product_name, barcode, barcode_type, pack_qty, extra_pack_qty, expiry_text, copies,
        printer_name, target_device_id, requested_by, requested_device, acknowledged_job_id, state, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
-      .run(crid, tid, task.product_code || null, name, barcode, type, pack, extra, exp, n,
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`)
+      .run(crid, tid, sole ? sole.id : null, task.product_code || null, name, barcode, type, pack, extra, exp, n,
         target.agent.printer_name, target.agent.id, requestedBy, requestedDevice, acked, now, now);
     const job = db.prepare('SELECT * FROM f_iroha_print_jobs WHERE id = ?').get(Number(info.lastInsertRowid));
     return { ok: true, job: publicJob(job), created: true };

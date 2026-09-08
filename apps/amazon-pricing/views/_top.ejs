@@ -1,0 +1,88 @@
+<%- include('_base') %>
+<style>
+  .wrap { max-width: 1500px; }
+  .topbar a.on { color: #fff; font-weight: 700; text-decoration: underline; text-underline-offset: 4px; }
+  .lede { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 10px; padding: 11px 14px; font-size: 13px; margin-bottom: 16px; }
+  .lede b { color: #1d4ed8; }
+  .dim { color: #94a3b8; }
+  .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .small { font-size: 11px; color: #64748b; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .stat { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 10px 12px; }
+  .stat .k { font-size: 11px; color: #64748b; }
+  .stat .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .stat .v small { font-size: 12px; font-weight: 400; color: #64748b; }
+  .stat a { color: inherit; text-decoration: none; }
+  .stat.warn { border-color: #fecaca; background: #fff7f7; }
+  .chip { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
+  .c-raise { background: #fee2e2; color: #b91c1c; }
+  .c-lower { background: #dbeafe; color: #1d4ed8; }
+  .c-keep { background: #dcfce7; color: #166534; }
+  .c-hold { background: #f1f5f9; color: #475569; }
+  .c-warn { background: #fef3c7; color: #92400e; }
+  .c-bad { background: #fee2e2; color: #b91c1c; }
+  .c-ok { background: #dcfce7; color: #166534; }
+  .c-none { background: #f1f5f9; color: #64748b; }
+  .c-fba { background: #ede9fe; color: #5b21b6; }
+  .c-fbm { background: #e0f2fe; color: #0369a1; }
+  .c-mode-off { background: #f1f5f9; color: #64748b; }
+  .c-mode-buybox { background: #fef3c7; color: #92400e; }
+  .c-mode-fba_lowest, .c-mode-lowest { background: #ede9fe; color: #5b21b6; }
+  .c-agree { background: #dcfce7; color: #166534; }
+  .c-disagree { background: #fee2e2; color: #b91c1c; }
+  .c-unsure { background: #f1f5f9; color: #475569; }
+  table.ap { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.ap th { text-align: left; color: #64748b; font-size: 11px; font-weight: 600; border-bottom: 2px solid #e2e8f0; padding: 7px 8px; white-space: nowrap; position: sticky; top: 0; background: #fff; }
+  table.ap th.num { text-align: right; }
+  table.ap td { border-bottom: 1px solid #f1f5f9; padding: 7px 8px; vertical-align: middle; }
+  table.ap tbody tr:hover td { background: #f8fafc; }
+  .tbl-wrap { overflow-x: auto; }
+  .name { max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .name a { color: #1f2430; text-decoration: none; font-weight: 600; }
+  .name a:hover { text-decoration: underline; }
+  .reason { max-width: 270px; font-size: 12px; color: #334155; line-height: 1.4; }
+  table.ap td.act { white-space: nowrap; }
+  .flags { margin-top: 3px; }
+  .flags .chip { margin-right: 3px; margin-bottom: 2px; }
+  .neg { color: #b91c1c; font-weight: 700; }
+  .pos { color: #166534; }
+  form.filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; margin-bottom: 12px; }
+  form.filters label { margin: 0; }
+  form.filters input[type=text], form.filters select { width: auto; min-width: 120px; }
+  .pager { display: flex; gap: 8px; align-items: center; font-size: 13px; margin: 10px 0; }
+  .pager a { color: #2563eb; }
+  dialog { border: 1px solid #cbd5e1; border-radius: 12px; padding: 0; max-width: 560px; width: 95vw; }
+  dialog::backdrop { background: rgba(15, 23, 42, .45); }
+  .dlg { padding: 18px 20px; }
+  .dlg h3 { margin: 0 0 4px; font-size: 16px; }
+  .dlg .sub { font-size: 12px; color: #64748b; margin-bottom: 12px; }
+  .dlg .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+  .dlg .actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 12px; }
+  .dlg .err { color: #b91c1c; font-size: 12px; min-height: 16px; }
+  .hint { font-size: 11px; color: #64748b; margin-top: -8px; margin-bottom: 10px; }
+  .toast { position: fixed; bottom: 18px; right: 18px; background: #1e293b; color: #fff; padding: 10px 14px; border-radius: 8px; font-size: 13px; display: none; z-index: 50; }
+  .rv-btn { border: 1px solid #cbd5e1; background: #fff; border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer; }
+  .rv-btn:hover { background: #f1f5f9; }
+  .rv-btn.on { border-color: #1e293b; background: #1e293b; color: #fff; }
+  input.rv-comment { width: 150px; font-size: 12px; padding: 4px 6px; }
+  .kv { display: grid; grid-template-columns: 150px 1fr; gap: 4px 12px; font-size: 13px; }
+  .kv .k { color: #64748b; }
+  @media (max-width: 768px) { .dlg .grid { grid-template-columns: 1fr; } .kv { grid-template-columns: 1fr; } }
+</style>
+<div class="topbar">
+  <a href="/">← ポータル</a>
+  <span class="app-title">🏷️ Amazon 価格管理</span>
+  <a href="/apps/amazon-pricing/" class="<%= nav === 'index' ? 'on' : '' %>">出品一覧</a>
+  <a href="/apps/amazon-pricing/evaluations" class="<%= nav === 'evaluations' ? 'on' : '' %>">今日の判定</a>
+  <a href="/apps/amazon-pricing/history" class="<%= nav === 'history' ? 'on' : '' %>">変更履歴</a>
+  <span class="spacer"></span>
+  <span class="user"><%= displayName %></span>
+</div>
+<div class="wrap">
+<div class="lede">
+  <b>この画面から Amazon の価格は変わりません。</b>
+  価格を送る仕組みそのものがまだありません (テストで機械的に確認しています)。ここでできるのは
+  「方針を決めて記録する」「ルールが出した判定を見て 👍/👎 で採点する」まで。記録は全部 DB に残り、あとで AI が読みます。
+</div>
+<div id="toast" class="toast"></div>
