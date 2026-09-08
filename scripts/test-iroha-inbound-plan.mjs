@@ -315,6 +315,19 @@ console.log('\n[8] 届いたもの・古い予定の扱い');
   ok(z.rows.some((x) => x.planned_date === iso(0) && x.product_code === 'amc-b' && x.qty === 40),
     '⭐数えた結果 0 のものは「届いた」にしない (まだ来ていないものとして出す)');
   eq(z.totals.arrived_products, 0, '届いた分にも数えない');
+
+  // ⭐商品コードに空白が入っていても、日付との境目が曖昧にならない (まとめるキーの区切りは NUL)
+  insProduct.run(20, `${iso(0)} amc-a`, '空白入りのコード', '0001');
+  const impSp = importCsv(makeCsv([
+    row('AR12', 1, 1, 'amc-a', 11),
+    row('AR13', 1, 1, `${iso(0)} amc-a`, 22, ''),   // 日付なし + 空白入りコード
+  ]), { source: 'manual_upload', fileName: 'test8b.csv' });
+  ok(impSp.ok, `取込 ok (${impSp.ok ? impSp.rowCount + '行' : impSp.message})`);
+  const sp = listInboundPlan();
+  eq(sp.rows.map((x) => `${x.planned_date} ${x.product_code} ${x.qty}`), [
+    `${iso(0)} amc-a 11`,
+    `null ${iso(0)} amc-a 22`,
+  ], '⭐空白入りの商品コードが、日付つきの別商品とまとまってしまわない');
 }
 
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} passed / ${fail} failed`);

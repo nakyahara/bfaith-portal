@@ -303,7 +303,9 @@ export function listInboundPlan() {
     const bucket = arrived.has(trimS(l.line_key)) ? buckets.arrived
       : (day && oldest && day < oldest) ? buckets.old
         : buckets.rows;
-    const gk = `${day || ''} ${key}`;
+    // まとめる単位のキー。区切りは NUL — 商品コードに空白が入っていても日付との境目が曖昧にならない
+    // (いまの planned_date は必ず 10 桁の日付か null なので衝突しないが、キーの作り方で担保する)
+    const gk = `${day || ''} ${key}`;
     const cur = bucket.get(gk);
     if (cur) {
       cur.qty += l.planned_qty;
