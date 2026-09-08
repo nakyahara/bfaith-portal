@@ -575,11 +575,21 @@ console.log('\n[重複2] 🚨窓は刷り上がった時刻で測る / 内訳の
   db.prepare('DELETE FROM f_iroha_print_jobs WHERE id <> ?').run(twinId);
   ok(enqueuePrintJob({ ...base, extraPackQty: '7', clientRequestId: crid() }).ok, '端数の箱が違えば別のラベル');
   db.prepare('DELETE FROM f_iroha_print_jobs WHERE id <> ?').run(twinId);
-  // ⭐出力先だけの違いは「同じラベル」= 聞く (どの PC から出ても、貼るラベルは同じ)
-  const other = listPrintAgents().find((a) => a.id !== null);
-  const sameLabel = enqueuePrintJob({ ...base, targetDeviceId: other ? other.id : null, clientRequestId: crid() });
-  ok(!sameLabel.ok && sameLabel.error === 'confirm_duplicate',
+  // ⭐出力先だけの違いは「同じラベル」= 聞く (どの PC から出ても、貼るラベルは同じ)。
+  //   🚨**別の 2 台をはっきり指す** — 同じ台を選ぶと「違う出力先」を確かめたことにならない
+  // ⭐2 台目はこの時点で解除ずみなので、ここで登録し直す (別の PC を明示的に指すため)
+  const agentB = createDevice('いろはPC (2台目)', 'admin@test', { kind: 'agent', printerName: 'Brother QL-820NWB' });
+  const agents2 = listPrintAgents().filter((a) => a.printer_name);
+  ok(agents2.length >= 2 && agents2.some((a) => a.id === agentB.id), '(前提) 印刷係が 2 台ある');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE task_id = ?').run(TW2);
+  const onA = enqueuePrintJob({ ...base, targetDeviceId: agents2[0].id, clientRequestId: crid() });
+  db.prepare("UPDATE f_iroha_print_jobs SET state = 'completed', finished_at = ? WHERE id = ?").run(minsAgo(1), onA.job.id);
+  const onB = enqueuePrintJob({ ...base, targetDeviceId: agents2[1].id, clientRequestId: crid() });
+  ok(!onB.ok && onB.error === 'confirm_duplicate' && onB.job.id === onA.job.id,
     '⭐出力先が違うだけなら「同じラベル」として聞く (貼るものは同じ)');
+  ok(db.prepare('SELECT target_device_id FROM f_iroha_print_jobs WHERE id = ?').get(onA.job.id).target_device_id === agents2[0].id,
+    '(前提) 1 枚目はもう一方の PC に出していた');
+  revokeDevice(agentB.id);   // 元の 1 台だけに戻す
 
   // ⭐証跡は「いま聞かれている 1 件」でなければ通らない
   const otherCard = mkTask('よそのカードのぶん', 'DUP-3', { barcode: '4900000000003' });
@@ -604,6 +614,29 @@ console.log('\n[重複2] 🚨窓は刷り上がった時刻で測る / 内訳の
   const b1again = enqueuePrintJob({ taskId: TB, batchId: bs[0].id, copies: 1, clientRequestId: crid() });
   ok(!b1again.ok && b1again.error === 'confirm_duplicate', '⭐同じまとまりなら聞く');
   db.prepare('DELETE FROM f_iroha_print_jobs WHERE task_id = ?').run(TB);
+
+  // ⭐まとまりが無い古いカード (batch_id が NULL 同士) も「同じ」とみなす
+  const TN = mkTask('まとまりの無い古いカード', 'DUP-5', { barcode: '4900000000005' });
+  db.prepare('DELETE FROM f_iroha_task_batches WHERE task_id = ?').run(TN);
+  const n1 = enqueuePrintJob({ taskId: TN, copies: 1, clientRequestId: crid() });
+  ok(n1.ok && db.prepare('SELECT batch_id FROM f_iroha_print_jobs WHERE id = ?').get(n1.job.id).batch_id === null,
+    '(前提) まとまりが無ければ batch_id は NULL');
+  db.prepare("UPDATE f_iroha_print_jobs SET state = 'completed', finished_at = ? WHERE id = ?").run(minsAgo(1), n1.job.id);
+  const n2 = enqueuePrintJob({ taskId: TN, copies: 1, clientRequestId: crid() });
+  ok(!n2.ok && n2.error === 'confirm_duplicate' && n2.job.id === n1.job.id,
+    '⭐batch_id が NULL 同士なら「同じラベル」として聞く');
+
+  // 🚨確認つきで受理されたあと、応答を失って**チェックを外して**同じ依頼 ID で送り直しても、
+  //   もう積んであるぶんが返るだけ (取り消されない・増えない) — Codex #1266 R2
+  const sameId = crid();
+  const accepted = enqueuePrintJob({ taskId: TN, copies: 1, clientRequestId: sameId, acknowledgeDuplicateJobId: n1.job.id });
+  ok(accepted.ok && accepted.created, '(前提) 確かめれば受理される');
+  const cnt = db.prepare('SELECT COUNT(*) c FROM f_iroha_print_jobs WHERE task_id = ?').get(TN).c;
+  const resend = enqueuePrintJob({ taskId: TN, copies: 1, clientRequestId: sameId });   // 証跡を外して同じ ID
+  ok(resend.ok && resend.replayed && resend.job.id === accepted.job.id,
+    '⭐同じ依頼 ID なら、証跡を外して送り直しても同じジョブが返る (確かめた印は「内容」ではない)');
+  ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_print_jobs WHERE task_id = ?').get(TN).c === cnt, '⭐枚数は増えない');
+  db.prepare('DELETE FROM f_iroha_print_jobs WHERE task_id = ?').run(TN);
 }
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);

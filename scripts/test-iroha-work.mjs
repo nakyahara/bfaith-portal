@@ -4083,6 +4083,21 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     ok(d.sent[2].copies === d.sent[1].copies && d.sent[2].client_request_id === d.sent[1].client_request_id,
       '中身と依頼 ID はそのまま (確かめた印だけが付け外しできる)');
   }
+  // ⭐チェックを外すのは **本物の showPrintDupWarn**。上のテストは自前のモックで外していたので、
+  //   本実装から外す処理を消しても気づけなかった (Codex #1266 R2 軽微1)
+  {
+    const src = html.match(/function showPrintDupWarn\(msg, resetCheck\) \{[\s\S]*?\r?\n\}/)[0];
+    ok(/cb\.checked = false/.test(src), '(前提) 本物を切り出せた');
+    const cb = { checked: true };
+    const warn = { querySelector: () => ({ textContent: '' }) };
+    const els = { '#printBody': { insertBefore: () => {}, firstChild: null }, '#printDupWarn': warn, '#printDupAck': cb };
+    const fn = new Function('$', src + '; return showPrintDupWarn;')((k) => els[k]);
+    fn('相手が変わりました', true);
+    ok(cb.checked === false, '⭐相手が変わったら、本物がチェックを外す');
+    cb.checked = true;
+    fn('同じ相手です', false);
+    ok(cb.checked === true, '同じ相手ならチェックは残す (何度も入れ直させない)');
+  }
 
   // 🚨全部取り消されたカードを「まとまりの無い古いカード」と同じに扱わない (Codex R4 中1)
   ok(html.includes('if (all.length > 0 && bs.length === 0) {'),
