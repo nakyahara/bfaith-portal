@@ -803,6 +803,40 @@ console.log('\n[G] 🚨確認ずみの行き先が一斉に取り消される取
   ok(/対象が変わりました/.test(stale.message), '何が起きたかを言う (黙って通さない)');
   const fresh = importCsv(csvS, { ...optS, force: stale.force_token });
   ok(fresh.ok, '⭐いまの中身の合言葉で押し直せば通る (詰まらせない)');
+
+  // ══ ⑪ ⭐合言葉は「そのファイル」のもの。取り消す対象が同じでも別の CSV には使えない ══
+  const g6 = importCsv(makeCsv([row('GJ1', 1, 'g-30', 1), row('GJ1', 2, 'g-31', 1), row('GJ1', 3, 'g-32', 1)]),
+    { fileName: 'g6.csv', source: 'auto', generatedAt: '2028-09-20T15:00:00Z' });
+  ok(g6.ok, '(前提) 3 行の CSV を取り込める');
+  const b7 = getActiveBatch();
+  makeAtRisk(b7.id, 3);
+  const optE = { fileName: 'a.csv', source: 'manual_upload', generatedAt: '2028-09-20T16:00:00Z' };
+  const csvA = makeCsv([row('GZ1', 1, 'z-1', 1)]);
+  const csvB = makeCsv([row('GZ2', 1, 'z-2', 1)]);   // 取り消す 3 件は同じ。中身だけ違う
+  const refusedA = importCsv(csvA, optE);
+  ok(!refusedA.ok && !!refusedA.force_token, '(前提) 中身が別物の CSV が断られ、合言葉が返る');
+  const reuse = importCsv(csvB, { ...optE, fileName: 'b.csv', force: refusedA.force_token });
+  ok(!reuse.ok, '⭐ある CSV に出した合言葉で、別の CSV は通せない (取り消す対象が同じでも)');
+  ok(/対象が変わりました/.test(reuse.message), '中身が違うと言う');
+  const okA = importCsv(csvA, { ...optE, force: refusedA.force_token });
+  ok(okA.ok, '⭐合言葉を出した CSV そのものなら通る');
+
+  // ══ ⑫ ⭐同じ明細でも、行き先が確定し直されたら古い合言葉では通らない ══
+  const g7 = importCsv(makeCsv([row('GK1', 1, 'g-40', 1), row('GK1', 2, 'g-41', 1), row('GK1', 3, 'g-42', 1)]),
+    { fileName: 'g7.csv', source: 'auto', generatedAt: '2028-09-20T17:00:00Z' });
+  ok(g7.ok, '(前提) 3 行の CSV を取り込める');
+  const b8 = getActiveBatch();
+  const keys8 = makeAtRisk(b8.id, 3);
+  const optR = { fileName: 'redo.csv', source: 'manual_upload', generatedAt: '2028-09-20T18:00:00Z' };
+  const csvR = makeCsv([row('GY9', 1, 'y-9', 1)]);
+  const beforeRedo = importCsv(csvR, optR);
+  ok(!beforeRedo.ok && !!beforeRedo.force_token, '(前提) 断られて合言葉が返る');
+  // 押すまでの間に、同じ明細の行き先が確定し直された (別の行き先になった)
+  D.prepare("UPDATE f_inbound_check_line_state SET destination_id = 995555 WHERE batch_id = ? AND line_key = ?")
+    .run(b8.id, keys8[0]);
+  const afterRedo = importCsv(csvR, { ...optR, force: beforeRedo.force_token });
+  ok(!afterRedo.ok, '⭐行き先が確定し直されたら古い合言葉では通らない (新しい行き先を古い確認で消さない)');
+  ok(atRisk(b8.id) === 3, '⭐3 件とも残っている');
 }
 
 console.log(`\n${pass} PASS / ${fail} FAIL`);

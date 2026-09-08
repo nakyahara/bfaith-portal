@@ -881,13 +881,22 @@ function planCancellations(carry, rows) {
 }
 
 /**
- * 断るときに返す合言葉。⭐**取り消す予定の中身そのもの**から作る。
- * 人が画面で件数を見て「それでも取り込む」を押すまでの間に対象が変わったら
- * (自動取込が走った・別の端末で確認が進んだ)、合言葉が変わって通らない。
+ * 断るときに返す合言葉。⭐**画面に出したものすべて**から作る。
+ * 人が件数を見て「それでも取り込む」を押すまでの間に何かが変わったら、合言葉が合わなくなる。
+ * 材料は 4 つ、どれが欠けても抜け道になる:
+ *   ファイルの中身 (fileHash) … 同じ行を消す別の CSV に合言葉を使い回せてしまう
+ *   いまの一覧 (batch id)     … 別の一覧に対して使えてしまう
+ *   取り消す明細 (line_key)   … 対象が増減しても通ってしまう
+ *   行き先 (destination_id)   … 同じ明細の行き先が確定し直されたとき、
+ *                               新しい行き先を古い確認で取り消せてしまう
+ * ⚠取消の理由は入れない。ファイルの中身といまの一覧が決まれば理由も決まるので、
+ *   足しても新しい情報にならない (材料を増やすと守れているつもりになる)。
  */
-function planToken(prevActive, plan) {
-  const body = prevActive.id + ':' + [...plan.keys()].sort().join('|');
-  return crypto.createHash('sha256').update(body).digest('hex').slice(0, 16);
+function planToken(prevActive, plan, carry, fileHash) {
+  const body = [...plan.keys()].sort()
+    .map((k) => k + ':' + carry.get(k).destination_id).join('|');
+  return crypto.createHash('sha256').update(prevActive.id + '#' + fileHash + '#' + body)
+    .digest('hex').slice(0, 16);
 }
 /** 一度にこれだけの行き先が「まとめて」取り消されるなら、CSV の取得不良を疑う (根拠は下の説明) */
 const MASS_CANCEL_MIN = 3;
@@ -919,12 +928,12 @@ const MASS_CANCEL_MIN = 3;
  *
  * @returns {null} 取り込んでよい / {ok:false,error,message} 断る理由
  */
-function guardMassCancel(parsed, carry, plan, prevActive, { force = null } = {}) {
+function guardMassCancel(parsed, carry, plan, prevActive, fileHash, { force = null } = {}) {
   if (!prevActive) return null;                // まだ一覧が無い (失うものが無い)
   const atRisk = [...carry.values()].filter((p) => p.status === 'checked' && p.destination_id).length;
   if (atRisk === 0) return null;               // 失うものが無い
   if (plan.size < atRisk) return null;         // 1 つでも残る = 同じ一覧の続き
-  const token = planToken(prevActive, plan);
+  const token = planToken(prevActive, plan, carry, fileHash);
   if (force && force === token) return null;   // ⭐人がこの中身を見て「それでも取り込む」を押した
   // 確認してから押すまでの間に対象が変わった。同じ画面の合言葉では通さない
   const head = force ? '確認したあとで取込の対象が変わりました。もう一度確かめてください。' : '';
@@ -1037,7 +1046,7 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     const cancelPlan = planCancellations(carry, parsed.rows);
     // 🚨確認ずみの行き先が**ひとつ残らず**取り消される取込は、ここで止める。この先へ進めると
     //   行き先といろはのカードが一斉に取り消される (2026-09-08 の事故)
-    const guard = guardMassCancel(parsed, carry, cancelPlan, prevActive, { force });
+    const guard = guardMassCancel(parsed, carry, cancelPlan, prevActive, fileHash, { force });
     if (guard) {
       logImport(db, { actor, source, fileName, ok: false, batchId: prevActive ? prevActive.id : null, message: guard.message });
       return { ...guard, batch: prevActive || null };
