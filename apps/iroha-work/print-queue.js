@@ -297,9 +297,6 @@ export function publicJob(row) {
   if (!row) return null;
   return {
     id: row.id, state: row.state, label: PRINT_STATE_LABELS[row.state] || row.state,
-    // ⭐どの依頼から生まれたジョブか。画面が「届いたか分からない依頼」の控えを
-    //   捨ててよいか判断するのに使う (要件: 印刷は二重に出さない)
-    client_request_id: row.client_request_id,
     task_id: row.task_id, product_code: row.product_code, product_name: row.product_name,
     barcode: row.barcode, barcode_type: row.barcode_type, pack_qty: row.pack_qty,
     extra_pack_qty: row.extra_pack_qty || '', total_copies: totalCopiesOf(row),
