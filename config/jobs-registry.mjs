@@ -206,7 +206,8 @@ export const JOBS_REGISTRY = [
       + 'daily-sync (07:00・P1・45ステップ) に載せず独立タスクにしたのは、'
       + '50〜100分の価格取得で朝の未発送アラートを遅らせないため。'
       + '書込先は専用DB expected-profit.db (warehouse.db は 11GB で product-idea-scout が常駐しているため読み取りのみ)',
-    where: 'miniPC TaskScheduler [ExpectedProfitNightly] → node apps/expected-profit/nightly.js',
+    where: 'miniPC TaskScheduler [ExpectedProfitNightly] → scripts/expected-profit/run-expected-profit-nightly.ps1'
+      + ' → node apps/expected-profit/nightly.js',
     schedule: '毎日 23:30 (全体終了期限 06:00。超えたら中断して翌日に持ち越す)',
     anchor_hour_jst: 23,
     anchor_minute_jst: 30,
@@ -214,6 +215,9 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: '🚨 成功 ping は「Render の公開ポインタが対象世代になった」ことを読み戻して確認してから打つ。'
       + 'プロセスが正常終了しただけでは ok にならない。'
+      + 'タスクの登録・登録し直しは miniPC で '
+      + 'powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\expected-profit\\install.ps1 (冪等。-DryRun で下見)。'
+      + 'ログは logs\\expected-profit-*.log と logs\\expected-profit-runner.log。'
       + '失敗時は logs を確認 → node apps/expected-profit/nightly.js --skip-publish で世代だけ作り直せる。'
       + '画面 = /apps/profit-analysis の「想定利益 (単品)」タブ。'
       + '公開中の世代は GET /apps/expected-profit/sync/published (x-sync-key) で見える。'
