@@ -1081,6 +1081,7 @@ export function relatedByInboundLine(db = getDB()) {
     ORDER BY d.decided_at, d.id`).all();
   const byLine = new Map();
   for (const r of rows) { if (!byLine.has(r.line_key)) byLine.set(r.line_key, []); byLine.get(r.line_key).push(r); }
+  // decided_at は入荷側が utcNow() で書く ISO (UTC・ミリ秒・Z) で揃っているので文字列比較でよい。同時刻は行き先 id
   const isNewer = (o, me) => o.decided_at > me.decided_at || (o.decided_at === me.decided_at && o.dest_id > me.dest_id);
   for (const group of byLine.values()) {
     for (const me of group) {

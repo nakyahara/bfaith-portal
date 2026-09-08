@@ -4651,9 +4651,9 @@ function cancelBanHtml(c) {
   const newerOk = rel.filter((r) => r.newer && !r.cancellation_requested_at);
   const others = rel.filter((r) => !(r.newer && !r.cancellation_requested_at));
   const relTxt = (newerOk.length ? '<span class="sub"><b>この入荷は新しいカード ' + newerOk.map(relCardTxt).join('・') + ' で確認し直されています。</b>' +
-      '作業はそちらで。このカードは「取り消す」が正しいことが多いです</span>' : '') +
+      (newerOk.length === 1 ? '作業はそちらで。このカードは「取り消す」が正しいことが多いです' : 'どれで作業するかは職員が決めてください') + '</span>' : '') +
     (others.length ? '<span class="sub"><b>同じ入荷のカードが他にもあります: ' + others.map(relCardTxt).join('・') + '</b>。' +
-      'どちらを残すかは職員が決めてください (確認待ちの相手へは作業を移さないでください)</span>' : '') +
+      'どのカードで作業するかは職員が決めてください (確認待ちの相手へは作業を移さないでください)</span>' : '') +
     (rel.length ? '<span class="sub">二重に作業しないでください</span>' : '');
   return '<div class="blockban cancel"><span class="ic" aria-hidden="true">⚠</span><div>' +
     '<b>入荷側で取り消されました — 職員の判断待ち</b>' +
@@ -4676,7 +4676,7 @@ function relatedHtml(c) {
   if (!rel.length || c.cancellation_requested_at) return '';   // 取消の枠のあるカードはそちらで言う
   return '<div class="blockban cancel"><span class="ic" aria-hidden="true">🔁</span><div>' +
     '<b>同じ入荷のカードが他にあります: ' + rel.map(relCardTxt).join('・') + '</b>' +
-    '<span class="sub">入荷側で確認し直されたぶんです。職員が古いほうを片づけるまで、二重に作業しないでください</span></div></div>';
+    '<span class="sub">入荷側で確認し直されたぶんです。どのカードで作業するかは職員が決めます。決まるまで二重に作業しないでください</span></div></div>';
 }
 /** 職員が 続ける / 取り消す を決める。職員モードでなければ職員PINを聞く (redoBatch と同じ約束) */
 async function resolveCancel(decision) {

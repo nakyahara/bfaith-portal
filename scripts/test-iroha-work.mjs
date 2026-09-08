@@ -3866,6 +3866,8 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '職員の判断は /api/cancellation に version つきで送る (他の端末の変更と競合しない)');
   // ⭐同じ入荷の新旧カードを互いに出す (取消後の確認し直しで二重作業にならない — Codex R1)
   ok(/function relatedHtml\(c\)/.test(html) && /同じ入荷のカードが他にあります/.test(html) && /二重に作業しないでください/.test(html)
+    && /どのカードで作業するかは職員が決めます。決まるまで二重に作業しないでください/.test(html) && !/古いほうを片づけるまで/.test(html)
+    && /newerOk\.length === 1 \? '作業はそちらで/.test(html)
     && /🔁 同じ入荷のカードが他に ' \+ c\.related\.length \+ ' 枚/.test(html) && /この入荷は新しいカード ' \+ newerOk\.map\(relCardTxt\)/.test(html)
     && /const newerOk = rel\.filter\(\(r\) => r\.newer && !r\.cancellation_requested_at\);/.test(html) && /確認待ちの相手へは作業を移さないでください/.test(html) && /rel\.length \? '<span class="sub">二重に作業しないでください/.test(html),
     '新しい側には「同じ入荷のカードが他にある」、旧側 (取消の枠) には関連カードを全部出す。「作業はそちらで」は新しくて確認待ちでない相手にだけ (確認待ちの相手へは誘導しない)');
