@@ -129,7 +129,33 @@ const HTTP_TIMEOUT_MS = 120_000;
 export function syncBaseUrl(env = process.env) {
   const raw = String(env.RENDER_PORTAL_URL || env.RENDER_MIRROR_URL || '').trim();
   if (!raw) return '';
-  try { return new URL(raw).origin; } catch { return ''; }
+  let u;
+  try { u = new URL(raw); } catch { return ''; }
+  // 🚨 ここには強い権限を持つ MIRROR_SYNC_KEY を載せる。設定ミスで平文や
+  //    見知らぬホストへ送らない (Codex R15。select-set が同じ守りを入れている)
+  if (u.protocol !== 'https:') return '';
+  // RENDER_PORTAL_URL で上書きするときも、既存の RENDER_MIRROR_URL と同じホストに限る
+  const mirror = String(env.RENDER_MIRROR_URL || '').trim();
+  if (mirror) {
+    try {
+      const allowed = new URL(mirror).host.toLowerCase();
+      if (u.host.toLowerCase() !== allowed) return '';
+    } catch { /* 比べられないときは下の origin をそのまま使う */ }
+  }
+  return u.origin;
+}
+
+/**
+ * 応答を JSON にする。
+ * 🚨 HTTP エラーのまま `.json()` すると、404/502 の HTML で
+ *    「JSON じゃない」としか分からない (Codex R15)。状態を先に見る
+ */
+async function asJson(res, what) {
+  if (!res.ok) {
+    const head = (await res.text().catch(() => '')).slice(0, 120).replace(/\s+/g, ' ');
+    throw new Error(`${what} が HTTP ${res.status} (${head})`);
+  }
+  return res.json();
 }
 
 export function httpDeps(deadline = null) {
@@ -146,12 +172,12 @@ export function httpDeps(deadline = null) {
   };
   return {
     deadline,
-    postChunk: async (id, body) => (await fetch(url(`/generations/${encodeURIComponent(id)}/chunks`),
-      { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() })).json(),
-    postPublish: async (body) => (await fetch(url('/publish'),
-      { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() })).json(),
+    postChunk: async (id, body) => asJson(await fetch(url(`/generations/${encodeURIComponent(id)}/chunks`),
+      { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() }), 'チャンクの送信'),
+    postPublish: async (body) => asJson(await fetch(url('/publish'),
+      { method: 'POST', headers, body: JSON.stringify(body), signal: withTimeout() }), '公開の要求'),
     getPublished: async () => {
-      const r = await (await fetch(url('/published'), { headers, signal: withTimeout(30_000) })).json();
+      const r = await asJson(await fetch(url('/published'), { headers, signal: withTimeout(30_000) }), '公開中の世代の確認');
       return r?.published || null;
     },
   };

@@ -14,7 +14,7 @@ process.env.SP_API_MARKETPLACE_ID = 'A1VC38T7YXB528';
 process.env.SP_API_SELLER_ID = 'S1';
 
 const { initExpectedProfitDB } = await import('./db.js');
-const { runNightly, deadlineOf, feeTargetsFrom } = await import('./nightly.js');
+const { pingUrl, runNightly, deadlineOf, feeTargetsFrom } = await import('./nightly.js');
 
 let passed = 0;
 function t(name, fn) {
@@ -387,6 +387,42 @@ await ta('[!] 再利用が効いていない警告は「キャッシュに当た
   assert.match(warn, /3\/4 件がキャッシュに当たらなかった/, `母集団が混ざっている: ${warn}`);
   assert.ok(!/^.*0\/4/.test(warn), `取り直し候補の数 (0) を出してはいけない: ${warn}`);
   db.exec('DELETE FROM amazon_fee_failure');
+});
+
+
+console.log('');
+console.log('監視への報告 (Codex R15: 失敗が成功として記録されていた)');
+
+t('[!] status はクエリで送る (body だと受け口が読まず ok 扱いになる)', () => {
+  // 🚨 受け口 (apps/jobs-monitor/router.js) は req.query.status しか見ない。
+  //    body に入れると省略扱い → 既定の 'ok' になり、**公開失敗が成功として記録される**
+  const u = pingUrl('expected-profit-nightly', 'fail', 'RENDER_MIRROR_URL not configured',
+    { JOBS_MONITOR_URL: 'https://portal.test' });
+  assert.ok(u.includes('status=fail'), `status がクエリに無い: ${u}`);
+  assert.ok(u.includes('note='), `note がクエリに無い: ${u}`);
+  assert.ok(u.startsWith('https://portal.test/apps/jobs-monitor/ping/expected-profit-nightly?'), u);
+});
+
+t('[!] JOBS_MONITOR_URL に末尾のパスが付いていても origin だけを使う', () => {
+  const u = pingUrl('job1', 'ok', null, { JOBS_MONITOR_URL: 'https://portal.test/apps/mirror' });
+  assert.ok(u.startsWith('https://portal.test/apps/jobs-monitor/ping/job1?'), u);
+});
+
+t('note は200文字まで (受け口の上限に合わせる)', () => {
+  const u = pingUrl('job1', 'fail', 'あ'.repeat(500), { JOBS_MONITOR_URL: 'https://portal.test' });
+  const note = new URL(u).searchParams.get('note');
+  assert.equal(note.length, 200);
+});
+
+t('URL が無ければ空 (報告しない)', () => {
+  assert.equal(pingUrl('job1', 'ok', null, {}), '');
+  assert.equal(pingUrl('job1', 'ok', null, { JOBS_MONITOR_URL: 'ごみ' }), '');
+  assert.equal(pingUrl('job1', 'ok', null, { JOBS_MONITOR_URL: 'file:///tmp/x' }), '');
+});
+
+t('ジョブIDはURLに入れられる形に逃がす', () => {
+  const u = pingUrl('a/b c', 'ok', null, { JOBS_MONITOR_URL: 'https://portal.test' });
+  assert.ok(u.includes('/ping/a%2Fb%20c?'), u);
 });
 
 db.close();

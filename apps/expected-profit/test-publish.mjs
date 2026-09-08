@@ -465,7 +465,7 @@ const withEnv = (vals, fn) => {
 const urlUsed = async () => {
   const real = globalThis.fetch;
   let seen = null;
-  globalThis.fetch = async (u) => { seen = String(u); return { json: async () => ({ ok: true }) }; };
+  globalThis.fetch = async (u) => { seen = String(u); return { ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '' }; };
   try { await httpDeps().postPublish({}); } finally { globalThis.fetch = real; }
   return seen;
 };
@@ -514,16 +514,45 @@ await ta('[!] RENDER_MIRROR_URL だけでも転送先を組み立てられる', 
     '既存 env だけで組み立てられない = 転送が止まる');
 });
 
-await ta('[!] RENDER_PORTAL_URL があればそちらを叩く (移行用・優先順位そのものを見る)', async () => {
+await ta('[!] RENDER_PORTAL_URL があればそちらを叩く (移行用・同じホストに限る)', async () => {
   const saved = [process.env.RENDER_PORTAL_URL, process.env.RENDER_MIRROR_URL, process.env.MIRROR_SYNC_KEY];
   let url = null;
   try {
-    process.env.RENDER_PORTAL_URL = 'https://new.test';
-    process.env.RENDER_MIRROR_URL = 'https://old.test';
+    process.env.RENDER_PORTAL_URL = 'https://portal.test/ちがうパス';
+    process.env.RENDER_MIRROR_URL = 'https://portal.test/apps/mirror';
     process.env.MIRROR_SYNC_KEY = 'k';
     url = await urlUsed();
   } finally { restoreEnv(saved); }
-  assert.ok(url.startsWith('https://new.test/'), `優先順位が逆になっている: ${url}`);
+  assert.equal(url, 'https://portal.test/apps/expected-profit/sync/publish', `組み立てが違う: ${url}`);
+});
+
+t('[!] https でなければ使わない (強い鍵を平文で送らない)', () => {
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'http://portal.test/apps/mirror' }), '');
+  assert.equal(syncBaseUrl({ RENDER_MIRROR_URL: 'file:///tmp/x' }), '', 'origin が文字列 "null" になる');
+});
+
+t('[!] RENDER_PORTAL_URL で別ホストへ向け直せない (設定ミスで鍵を外に出さない)', () => {
+  assert.equal(syncBaseUrl({
+    RENDER_PORTAL_URL: 'https://攻撃者.test',
+    RENDER_MIRROR_URL: 'https://portal.test/apps/mirror',
+  }), '');
+  // 同じホストなら通る
+  assert.equal(syncBaseUrl({
+    RENDER_PORTAL_URL: 'https://portal.test/x',
+    RENDER_MIRROR_URL: 'https://portal.test/apps/mirror',
+  }), 'https://portal.test');
+});
+
+t('[!] HTTP エラーは「JSON じゃない」ではなく状態が分かる形で落ちる', async () => {
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: false, status: 404, text: async () => '<!DOCTYPE html><html>...' });
+  const saved = [process.env.RENDER_PORTAL_URL, process.env.RENDER_MIRROR_URL, process.env.MIRROR_SYNC_KEY];
+  try {
+    delete process.env.RENDER_PORTAL_URL;
+    process.env.RENDER_MIRROR_URL = 'https://portal.test/apps/mirror';
+    process.env.MIRROR_SYNC_KEY = 'k';
+    await assert.rejects(() => httpDeps().postPublish({}), /HTTP 404/);
+  } finally { globalThis.fetch = real; restoreEnv(saved); }
 });
 
 t('[!] どちらも無ければ、設定すべき env 名を挙げて止まる', () => {
