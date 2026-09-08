@@ -7,13 +7,14 @@
  *     (linkTaskToNotionPage)。切替前の差分取込で同じカードが「DB 既存 destination との衝突」にならない
  *   - 正本がアプリ: sweep は何もしない。iPad はここで作ったタスクをそのまま見る
  * 🚨入荷側はカードを**作るだけ** (中原さん 2026-09-09:「削除は絶対にダメ」)。やり直し・再取込で行き先が取り消されても、
- *   入荷側からカードに何も伝えない (2026-09-08〜09 の間だけ「取消の確認」を付けていたが撤去)。
- *   tasks-db.requestCancellation を呼ぶのは、いろはの職員が 2 枚のカードを統合したとき (下の merge ⑤) だけ
+ *   入荷側からカードに何も伝えない (2026-09-08〜09 の間だけ「取消の確認」を付けていた経路は**全部撤去**)。
+ *   最後に残っていた統合 (mergeLinkConflict ⑤) も 2026-09-09 に外した — Notion 廃止後は起き得ない衝突のためだけに、
+ *   入荷側の状態がカードに書き込まれる口を残す理由が無い
  * 呼び元 (inbound-check/db.js) のトランザクション内で呼ぶ — 同じ warehouse-mirror.db の同じ接続なので、確定と一緒にコミット/ロールバックされる。
  */
 import { getDB } from './db.js';
 
-import { getTask, getTaskByDestination, safeLogTaskEvent, requestCancellation } from './tasks-db.js';
+import { getTask, getTaskByDestination, safeLogTaskEvent } from './tasks-db.js';
 import { ensureBatchForTask } from './batches.js';
 import { normSupplierCode } from '../purchase-orders/db.js';
 
@@ -172,7 +173,8 @@ const TASK_CHILD_TABLES = ['f_iroha_work_sessions', 'f_iroha_card_media', 'f_iro
  *   - 残す側が終了していて、消える側は開いている (行き先だけが終了タスクへ移り、一覧から消える) → keep_closed。両方終了なら通す
  *   - 消える側で作業中の人がいる (活動中セッションを黙って別タスクへ移すと、その端末は終了できなくなる) → from_active
  * 消える側が着手済み (作業中/保留/棚入待ち) で残す側が未着手なら、残す側を作業中に上げて started_at を引き継ぐ。
- * 取消の要求 (行き先が取消済み / 消える側の cancellation_requested_at) は残す側へ引き継ぐ (取消済みの入荷の作業が続かない)。
+ * 消える側の cancellation_requested_at (職員がまだ片づけていない札) は残す側へ引き継ぐ。
+ * 🚨**行き先が取消済みでも、残す側に新しく札は付けない** (2026-09-09。入荷側の状態でカードを触らない)。
  * @param taskId 確定側 (inbound) のタスク id (listLinkConflicts の task_id)
  * @param keep 'import' (取込側を残す。既定 — 現場が Notion 時代から動かしてきた方) | 'inbound' (確定側を残す)
  */
@@ -180,7 +182,7 @@ export function mergeLinkConflict({ taskId, keep = 'import', actor = null }) {
   const db = getDB();
   if (keep !== 'import' && keep !== 'inbound') return { ok: false, error: 'bad_request', message: 'keep は import / inbound のどちらかです' };
   return db.transaction(() => {
-    const c = db.prepare(`SELECT t.id AS task_id, t.destination_id, d.notion_page_id, d.cancelled_at AS destination_cancelled_at, d.cancel_reason AS destination_cancel_reason, d.cancelled_by AS destination_cancelled_by, o.id AS other_task_id
+    const c = db.prepare(`SELECT t.id AS task_id, t.destination_id, d.notion_page_id, o.id AS other_task_id
       ${LINK_CONFLICT_FROM} AND t.id = ?`).get(Number(taskId));
     if (!c) return { ok: false, error: 'not_found', message: 'この衝突はもうありません (解消済みか、対象が変わりました)' };
     const intoId = keep === 'import' ? c.other_task_id : c.task_id;
@@ -232,14 +234,12 @@ export function mergeLinkConflict({ taskId, keep = 'import', actor = null }) {
     }
     safeLogTaskEvent({ taskId: intoId, action: 'task_merge', from: `task#${fromId}`,
       to: `keep=${keep} dest#${c.destination_id} page=${c.notion_page_id} moved=${JSON.stringify(moved)}${promoted ? ' ' + promoted : ''}`, workerName: who, ok: true });
-    // ⑤ 行き先が取消済みなら、残す側にも取消を伝える (⭐消さない。「取消の確認」を付けて職員が決める) — 同じトランザクション
-    let cancellation = null;
-    //   出どころは行き先の cancelled_by から (CSV 取込は 'import'、それ以外は入荷 iPad の人)。画面に出すので取り違えない (Codex R1)
-    if (c.destination_cancelled_at) cancellation = requestCancellation({ destinationId: c.destination_id,
-      source: c.destination_cancelled_by === 'import' ? 'inbound_import' : 'inbound_reversal', reason: c.destination_cancel_reason || null, actor: who });
+    // 🚨(旧⑤) 行き先が取消済みのとき、残す側へ「取消の確認」を付ける処理はここにあったが 2026-09-09 に撤去。
+    //   入荷側の状態がカードを触る最後の口だった。消える側が持っていた札は上の①で引き継ぐので、
+    //   職員がまだ片づけていない確認は失われない
     const keptNow = row(intoId);
     return { ok: true, kept: intoId, closed: fromId, moved, promoted, keptStatus: keptNow.status,
-      cancellation: cancellation ? cancellation.action : null,
+      cancellation: null,
       note: '統合前から開いていた作業画面は一覧を読み直してください (古いタスク番号では操作できません)' };
   }).immediate();
 }
