@@ -160,7 +160,7 @@
           <div><button type="button" class="st-btn pt-memo">メモ ✎</button></div>
         </td>
         <td class="small pt-stamp" style="white-space:nowrap">
-          <% if (r.policy_updated_at) { %><div><%= toJst(r.policy_updated_at) %></div><div><%= r.policy_updated_by %></div><a href="/apps/amazon-pricing/history?sku=<%= encodeURIComponent(r.seller_sku) %>">方針の変動</a><% } else { %><span class="dim">方針は未設定</span><% } %>
+          <% if (r.policy_updated_at) { %><div><%= toJst(r.policy_updated_at) %></div><div title="<%= r.policy_updated_by %>"><%= String(r.policy_updated_by || '').split('@')[0] %></div><a href="/apps/amazon-pricing/history?sku=<%= encodeURIComponent(r.seller_sku) %>">方針の変動</a><% } else { %><span class="dim">方針は未設定</span><% } %>
         </td>
         <td class="code center">
           <% if (r.asin) { %><a href="https://www.amazon.co.jp/dp/<%= encodeURIComponent(r.asin) %>" target="_blank" rel="noopener"><%= r.asin %></a><% } else { %>—<% } %>
