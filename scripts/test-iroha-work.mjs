@@ -1235,7 +1235,7 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   const planned = TD.setPlannedDate({ taskId: tA2.id, plannedDate: '2099-12-31', expectVersion: reopened.task.version });
   ok(planned.ok && planned.task.planned_date === '2099-12-31' && TD.setPlannedDate({ taskId: tA2.id, plannedDate: '9/4', expectVersion: planned.task.version }).error === 'bad_request', '「今日やる」= planned_date (形式検証)');
 
-  // 取消: 未着手・実績なしは自動終了 / 実績ありは要確認 → 職員が判断
+  // 取消: ⭐どんな状態でも自動では消さない。「取消の確認」を付けて残し、職員が 続ける/取り消す を決める (中原さん 2026-09-08)
   const tB = TD.getTaskByPageId(pM2.id);   // 作業中・作業時間あり
   const cB = TD.requestCancellation({ destinationId: 9002, source: 'inbound_reversal' });
   ok(cB.action === 'review' && cB.task.cancellation_requested_at && TD.listTasksNeedingReview().some(t => t.id === tB.id), '着手済み (作業時間あり) の取消は要確認');
@@ -1243,8 +1243,18 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   const cont = TD.resolveCancellation({ taskId: tB.id, decision: 'continue', expectVersion: cB.task.version, isStaff: true, actor: 'たにがわ' });
   ok(cont.ok && cont.task.cancellation_requested_at === null && cont.task.status === 'in_progress', '続行を選ぶと要確認が消える');
   const tNew = TD.upsertTaskFromImport({ notion_page_id: 'fresh-1', status: 'not_started', destination_id: 9100, product_code: 'FRESH', product_name: '未着手だけ' }, { batchId: 'test-batch-4' });
-  const cN = TD.requestCancellation({ destinationId: 9100 });
-  ok(cN.action === 'closed' && cN.task.close_reason === 'cancelled' && cN.task.closed_at, '未着手・実績なしの取消は自動で終了 (取消)');
+  const cN = TD.requestCancellation({ destinationId: 9100, source: 'inbound_import', reason: 'line_removed' });
+  ok(cN.action === 'review' && cN.task.status === 'not_started' && cN.task.closed_at == null && cN.task.cancellation_requested_at,
+    '⭐未着手・実績なしでも自動では消さない — 「取消の確認」を付けて残す (2026-09-08 の事故の教訓)');
+  ok(cN.task.cancellation_reason === 'line_removed' && TD.cancellationOf(cN.task).reason_label.includes('明細が消え'),
+    'なぜ取り消されたかをカードに持ち、人が読む文にできる (職員が決める材料)');
+  const cAgain = TD.requestCancellation({ destinationId: 9100, source: 'inbound_import', reason: 'line_removed' });
+  ok(cAgain.already === true && cAgain.task.version === cN.task.version, '同じ取消を二度伝えても二度は書かない (履歴も version も増えない)');
+  ok(TD.listTasksNeedingReview().some((t) => t.id === tNew.id), '職員の確認待ち一覧に出る');
+  const cDecide = TD.resolveCancellation({ taskId: tNew.id, decision: 'cancel', expectVersion: cN.task.version, isStaff: true, actor: 'たにがわ' });
+  ok(cDecide.ok && cDecide.task.status === 'closed' && cDecide.task.close_reason === 'cancelled' && cDecide.task.cancellation_requested_at === null,
+    '⭐職員が「取り消す」を選んだときだけ 終了:取消 になる');
+  ok(TD.requestCancellation({ destinationId: 9100 }).action === 'none', '終了したカードにはもう伝えない');
   ok(TD.requestCancellation({ destinationId: 424242 }).action === 'none', '該当 task が無ければ何もしない');
   let dupErr = null;
   try { TD.upsertTaskFromImport({ notion_page_id: 'fresh-2', status: 'not_started', destination_id: 9100 }, { batchId: 'x' }); } catch (e) { dupErr = e; }
@@ -2851,12 +2861,13 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       const k4 = TD.getTask(p3.inb);
       ok(r4.status === 200 && r4.json.promoted && k4.status === 'in_progress' && k4.started_at === '2026-09-03T01:00:00Z' && k4.notion_page_id === 'merge-page-9962', '着手済みの側を未着手側へ統合すると作業中に昇格 (started_at を引き継ぐ)');
       ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(p3.inb).c === 2 && /読み直して/.test(r4.json.note), '作業時間は残す側に集まる。応答に再読込の案内');
-      // (5) 行き先が取消済み → 統合後に残す側へ取消を伝える (未着手・実績なしなら自動で終了:取消)
+      // (5) 行き先が取消済み → 統合後に残す側へ取消を伝える (⭐消さない。「取消の確認」を付けて残す)
       const p5 = mkPair(9963, 'MERGE-C5');
       db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = '2026-09-03T04:00:00Z' WHERE id = 9963").run();
       const r5 = await merge(p5.inb, 'import');
       const k5 = TD.getTask(p5.imp);
-      ok(r5.status === 200 && r5.json.cancellation === 'closed' && k5.status === 'closed' && k5.close_reason === 'cancelled' && k5.destination_id === 9963, '取消済み行き先の統合は残す側も取消 (未着手・実績なし)');
+      ok(r5.status === 200 && r5.json.cancellation === 'review' && k5.status !== 'closed' && k5.cancellation_requested_at && k5.destination_id === 9963,
+        '取消済み行き先の統合は、残す側に「取消の確認」が付く (自動では消さない)');
       // (6) 消える側に取消の要求 (要確認) があれば残す側へ引き継ぐ
       const p6 = mkPair(9964, 'MERGE-C6', { importStatus: 'in_progress' });
       db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T05:00:00Z', cancellation_source = 'inbound_reversal' WHERE id = ?").run(p6.inb);
@@ -3841,8 +3852,18 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const done = c\.done_qty;/.test(html) && !/c\.done_qty \|\| 0/.test(html),
     'できた数は「まだ数えていない (null)」と「0 個」を混ぜない (0 で代用しない — 要件 §U)');
   ok(/function memoHtml\(c\)/.test(html) && /📝 中断メモ \(前の人からの申し送り\)/.test(html)
-    && /sealHtml\(c\) \+ blockedHtml\(c\) \+ careHtml\(c\) \+ memoHtml\(c\)/.test(html),
-    '中断メモ・止まっている理由はカードを開いたらすぐ見えるところに出す (次にやる人が読む)');
+    && /sealHtml\(c\) \+ blockedHtml\(c\) \+ cancelBanHtml\(c\) \+ careHtml\(c\) \+ memoHtml\(c\)/.test(html),
+    '中断メモ・止まっている理由・入荷側の取消はカードを開いたらすぐ見えるところに出す (次にやる人が読む)');
+  // ⭐入荷側で取り消されたカードの枠 (2026-09-08): 消えない・理由が出る・職員だけが 続ける/取り消す を押せる
+  ok(/function cancelBanHtml\(c\)/.test(html) && /入荷側で取り消されました — 職員の判断待ち/.test(html) && /このカードは自動では消えません/.test(html),
+    '入荷側で取り消されたカードは「消えない」と枠で言う');
+  ok(/const canDecide = isApp\(\) && detailSrc !== 'preview' && stateCan\('task\.cancellation'\);/.test(html)
+    && /resolveCancel\(\\'continue\\'\)/.test(html) && /resolveCancel\(\\'cancel\\'\)/.test(html),
+    '続ける/取り消す のボタンは task.cancellation の許可があるときだけ描く (無効化して見せない — §U-7)');
+  ok(/apiFetch\('\/api\/cancellation'/.test(html) && /decision, worker_id: w\.id, pin, expect_version: c\.version/.test(html),
+    '職員の判断は /api/cancellation に version つきで送る (他の端末の変更と競合しない)');
+  ok(/'cancellation_requested_at', 'cancellation', 'migration_review'/.test(html),
+    '1 枚だけ差し替えるときも取消の理由を持ち越す (CARD_FIELDS)');
   // ⛔ 止まっている理由の札 (要件 §Y-2 = 案A、中原さん 2026-09-05)
   ok(/function blockedHtml\(c\)/.test(html) && /class="blockban"/.test(html) && /で止まっています<\/b>/.test(html)
     && /解消したら「▶ 作業をはじめる」で札が外れます/.test(html), '詳細の上部に「⛔ ○○で止まっています」の帯 (外し方も書く)');
@@ -4779,11 +4800,13 @@ console.log('\n[26] 作業のまとまり — カードの下に独立して作�
     ok(B.listBatchesOfTask(db, tb)[0].work_status === 'done', 'まとめて棚入完了でも、まとまりが done になる');
     const tr = TD.upsertTaskFromImport({ notion_page_id: 'batch-auto-1', status: 'not_started',
       destination_id: 9619, product_name: '自動取消', qty: 30 }, { batchId: 'bt' }).id;
-    const rc = TD.requestCancellation({ destinationId: 9619, source: 'inbound_check', actor: 'test' });
-    // ⭐条件つきにしない。取消が起きなければテストが素通りしてしまう (Codex R2)
-    ok(rc.ok && rc.action === 'closed', '未着手・実績なしのカードは自動で取消になる');
-    ok(TD.getTask(tr).status === 'closed' && TD.getTask(tr).close_reason === 'cancelled', 'カードは取消で終了');
-    ok(B.listBatchesOfTask(db, tr)[0].work_status === 'cancelled', '自動取消でも、まとまりが cancelled になる');
+    const rc = TD.requestCancellation({ destinationId: 9619, source: 'inbound_import', reason: 'product_changed', actor: 'test' });
+    // ⭐条件つきにしない。取消が伝わらなければテストが素通りしてしまう (Codex R2)
+    ok(rc.ok && rc.action === 'review' && TD.getTask(tr).status === 'not_started', '⭐未着手・実績なしでも自動では消さない (確認待ちで残る)');
+    ok(B.listBatchesOfTask(db, tr)[0].work_status === 'not_started', 'まとまりもそのまま (勝手に cancelled にしない)');
+    const rcd = TD.resolveCancellation({ taskId: tr, decision: 'cancel', expectVersion: TD.getTask(tr).version, isStaff: true, actor: 'test' });
+    ok(rcd.ok && TD.getTask(tr).status === 'closed' && TD.getTask(tr).close_reason === 'cancelled', '職員が取り消すと 終了:取消');
+    ok(B.listBatchesOfTask(db, tr)[0].work_status === 'cancelled', '職員の取消で、まとまりも cancelled になる');
   }
 
   // ── できた数と出どころは必ず対 (片方だけの行を作らせない) ──

@@ -81,7 +81,7 @@ function notifyBlockUndone(ticket, who) {
     .catch(() => { /* notifyStaff は throw しない */ });
 }
 import {
-  getTask, changeTaskStatus, changeBatchStatus, batchesOfTask, setPlannedDate, clearMigrationReview, resolveCancellation,
+  getTask, changeTaskStatus, changeBatchStatus, batchesOfTask, setPlannedDate, clearMigrationReview, resolveCancellation, cancellationOf,
   listLabelWaits, upsertLabelWait, getLabelWait, listClosedTasks, taskErrorStatus, safeLogTaskEvent, setExternalReady,
   listNamelessTasks, removeStrayTask, setFacility, setProgress,
   startTaskSession, countChangesSince, switchSourceOfTruth, bulkCloseReady,
@@ -767,6 +767,8 @@ function publicTask(t) {
     blocked: blockedOf(t), blocked_label: blockLabel(t),
     done_qty: t.done_qty ?? null, hold_memo: t.hold_memo || null,
     planned_date: t.planned_date, when: t.status === 'closed' ? null : whenOf(t.planned_date), cancellation_requested_at: t.cancellation_requested_at, migration_review: !!t.migration_review,
+    // ⭐入荷側で取り消されたカード — 理由と出どころ。職員が 続ける/取り消す を決める材料 (2026-09-08)
+    cancellation: cancellationOf(t),
     external_ready: !!t.external_ready,
   };
 }

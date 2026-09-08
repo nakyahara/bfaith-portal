@@ -20,6 +20,7 @@
     --accent:#1F5EFF; --accent-ink:#FFFFFF; --accent-soft:#E6EDFF;
     --amber:#C97A12; --amber-soft:#FDF0DC;
     --danger:#D63B3B; --danger-soft:#FBE5E5;
+    --warn:#9A6700; --warn-soft:#FFF3D6;
     --ok:#0F9D6B; --ok-soft:#DDF5EA;
     --shadow:0 1px 2px rgba(15,23,40,.06),0 4px 14px rgba(15,23,40,.06);
     --r:8px; --r-sm:6px;
@@ -352,6 +353,11 @@
   .blockban b{color:var(--danger);font-size:1.05rem}
   .blockban .sub{display:block;color:var(--sub);font-size:.86rem;margin-top:2px}
   .blockban .btn{margin-left:auto;min-height:44px;padding:6px 14px;font-size:.92rem}
+  /* ⚠ 入荷側で取り消されたカード (消えない。職員が決める) — 止まっている枠の黄色版 */
+  .blockban.cancel{background:var(--warn-soft);border-color:var(--warn)}
+  .blockban.cancel b{color:var(--warn)}
+  .blockban.cancel .acts{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
+  .blockban.cancel .acts .btn{margin-left:0}
   /* ⛔ 止まった の理由ボタン (2 列)。選んだものを赤で */
   .reasons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
   .reasons .btn.on{outline:2px solid var(--danger);outline-offset:1px;background:var(--danger-soft);border-color:var(--danger);color:var(--danger)}
@@ -1588,7 +1594,7 @@ function rowTags(c, opts) {
   // ⛔ 止まっている理由 (案A)。進捗の札とは別。いちばん先に出す (作業できないことが先に分かる)
   if (c.blocked) h += '<span class="tag blocked">⛔ ' + esc(c.blocked.label) + 'で止まっています</span>';
   if (c.today) h += '<span class="tag today">📌 今日やる</span>';
-  if (c.cancellation_requested_at) h += '<span class="tag urgent">⚠ 取消の確認待ち</span>';
+  if (c.cancellation_requested_at) h += '<span class="tag urgent">⚠ 入荷側で取消 — 職員の判断待ち</span>';
   if (c.migration_review) h += '<span class="tag miss">❓ 状態の確認待ち</span>';
   if (c.external_ready) h += '<span class="tag ready">📦 外部に出せます</span>';
   if (c.facility_code && c.facility_code !== 'iroha') h += '<span class="tag ext">🏢 ' + esc(facilityName(c.facility_code)) + '</span>';
@@ -3873,7 +3879,7 @@ function renderDetail(c, opts) {
         (c.ar_no ? ' ・ ' + esc(c.ar_no) : '') + '</div>' +
       headNumsHtml(c) +
       '</div></div>' +
-      sealHtml(c) + blockedHtml(c) + careHtml(c) + memoHtml(c) + awayHtml(c) + consignBtnHtml(c) +
+      sealHtml(c) + blockedHtml(c) + cancelBanHtml(c) + careHtml(c) + memoHtml(c) + awayHtml(c) + consignBtnHtml(c) +
       '</div>' +
     prevCardHtml(c) +
     batchesCardHtml(c) +
@@ -4624,6 +4630,57 @@ function blockedHtml(c) {
     '<span class="sub">' + esc([when, by].filter(Boolean).join(' ・ ')) + (when || by ? ' に止めました。' : '') +
       '解消したら「▶ 作業をはじめる」で札が外れます</span></div>' +
     (canManual ? '<button class="btn" onclick="unblockOnly()">札を外す (職員)</button>' : '') + '</div>';
+}
+
+/**
+ * ⚠ 入荷側で取り消されたカード。⭐**カードは消えない** — 続ける / 取り消す は いろはの職員が決める
+ * (中原さん 2026-09-08: 一度いろはに送ったカードは残り続ける。入荷側の都合で勝手に変えない)。
+ * 押せる人にだけボタンを描く (許可の無い操作は DOM に出さない — 要件 §U-7)
+ */
+function cancelBanHtml(c) {
+  const k = c.cancellation;
+  if (!k && !c.cancellation_requested_at) return '';
+  const when = k && k.at ? fmtDate(k.at) + ' ' + fmtTime(k.at) : '';
+  const reason = k ? k.reason_label : '入荷側で取り消されました';
+  const src = k ? k.source_label : '入荷側';
+  const canDecide = isApp() && detailSrc !== 'preview' && stateCan('task.cancellation');
+  return '<div class="blockban cancel"><span class="ic" aria-hidden="true">⚠</span><div>' +
+    '<b>入荷側で取り消されました — 職員の判断待ち</b>' +
+    '<span class="sub">' + esc(reason) + (when ? ' (' + esc(src) + ' ・ ' + esc(when) + ')' : '') + '</span>' +
+    '<span class="sub">このカードは自動では消えません。いろはの職員が「続ける」か「取り消す」かを決めます' +
+      (canDecide ? '' : '。職員に声をかけてください') + '</span></div>' +
+    (canDecide
+      ? '<div class="acts"><button class="btn" onclick="resolveCancel(\'continue\')">このまま続ける (職員)</button>' +
+        '<button class="btn stop" onclick="resolveCancel(\'cancel\')">取り消す (職員)</button></div>'
+      : '') + '</div>';
+}
+/** 職員が 続ける / 取り消す を決める。職員モードでなければ職員PINを聞く (redoBatch と同じ約束) */
+async function resolveCancel(decision) {
+  const c = findCard(curDetail);
+  if (!c || !stateCan('task.cancellation')) return;
+  const w = worker;
+  if (!w) { openGate(); return; }
+  if (!state.me.session && w.worker_type !== 'staff') { toast('決められるのは職員だけです (右上の名前を職員に替えてください)'); return; }
+  const k = c.cancellation || {};
+  const okGo = await ask(decision === 'cancel'
+    ? { title: 'このカードを取り消しますか?', text: (k.reason_label || '入荷側で取り消されました') + '。カードは「終了：取消」になり、一覧から消えます。できた数や写真の記録は残ります。', ok: 'はい、取り消す', cancel: 'やめる' }
+    : { title: 'このまま続けますか?', text: '入荷側の取消は無視して、このカードの作業を続けます。札が外れます。', ok: 'はい、続ける', cancel: 'やめる' });
+  if (!okGo) return;
+  let pin = null;
+  if (!state.me.session) {
+    pin = await ask({ title: '🔑 職員PIN', text: w.display_name + ' さんの職員PIN を入れてください', input: 'pin', ok: decision === 'cancel' ? '取り消す' : '続ける' });
+    if (pin == null) return;
+  }
+  const j = await apiFetch('/api/cancellation', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: c.id, decision, worker_id: w.id, pin, expect_version: c.version }) });
+  if (!j.ok) { showErr(j.message || '決められませんでした'); return; }
+  applyTask(c, j.task);
+  toast(decision === 'cancel' ? 'カードを取り消しました' : '続けます (札を外しました)');
+  await loadState();   // 行の数・進捗はサーバーが持っている
+  renderTabs(); renderList();
+  if (curView === 'board') renderBoard();
+  if (decision === 'cancel') closeDetail();
+  else if (sameId(curDetail, c.id)) openDetail(c.id);
 }
 
 /** 画面下の固定バー。許可が無い (下見・履歴・Notion 正本の読むだけ) なら空 = 出さない */
@@ -6034,7 +6091,7 @@ function doSetStEl(el) { doSetSt(el.dataset.v); }
 /** サーバーが返したタスクの最新値をカードに反映する (version を持ち越さないと次の変更が競合する) */
 /** カード単位の値 (行が分かれていても同じもの) */
 const CARD_FIELDS = ['version', 'blocked', 'blocked_label', 'hold_memo',
-  'planned_date', 'when', 'cancellation_requested_at', 'migration_review', 'external_ready'];
+  'planned_date', 'when', 'cancellation_requested_at', 'cancellation', 'migration_review', 'external_ready'];
 /** まとまりごとに違う値 (⭐分かれた行には写さない — カードの合計を行に書くと数が化ける) */
 const BATCH_FIELDS = ['status', 'status_label', 'facility_code', 'done_qty'];
 function applyTask(c, t) {

@@ -20,7 +20,7 @@ import { getDB, listCache, activeSessionsByPage, activeSessionsByTask, estimateB
 import { mediaByPage, mediaByTask, photosByCodeKey } from './media.js';
 import { STATUSES, LIST_STATUSES } from './notion-read.js';
 import { OPEN_STATUSES, STATUS_LABEL, TRANSITIONS, BLOCK_REASONS, BLOCK_LABEL, BLOCK_BUTTON, CLOSE_REASONS, CLOSE_LABEL, statusLabel, blockLabel } from './tasks.js';
-import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask } from './tasks-db.js';
+import { listOpenTasks, listFacilities, listClosedTasks, countClosedTasks, getTask, cancellationOf } from './tasks-db.js';
 import { countsByTask, stockingOfTask, batchesByTask } from './batches.js';
 import { consignmentsOfTask, consignableByBatch } from './consign.js';
 
@@ -391,6 +391,7 @@ function buildTaskCards(rows, { readOnly = false } = {}) {
       version: r.version,
       migration_review: !!r.migration_review,
       cancellation_requested_at: r.cancellation_requested_at,
+      cancellation: cancellationOf(r),   // ⭐入荷側で取り消された理由 (カードは消えない。職員が決める)
       title: r.product_name || '(名称なし)',
       product_code: r.product_code,
       url: r.notion_page_id ? `https://www.notion.so/${String(r.notion_page_id).replace(/-/g, '')}` : null,

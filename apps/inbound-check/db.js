@@ -1079,7 +1079,7 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
     // 行き先の取消は「実際に取り消せた (1 行)」ときだけ在庫化アプリのタスクにも伝える
     const cancelDestAndTask = (destinationId, reason) => {
       if (cancelDest.run(now, reason, destinationId).changes !== 1) return false;   // 既に取消済み等 (数えない)
-      requestCancellation({ destinationId, source: 'inbound_import', actor: actor || 'import' });
+      requestCancellation({ destinationId, source: 'inbound_import', reason, actor: actor || 'import' });
       return true;
     };
     // ⭐新しい CSV から行ごと消えた確認済み行 (伝票の明細が削除された) も、行き先を取り消す。
@@ -2123,8 +2123,9 @@ export function reopenLine({ batchId, lineKey, expectVersion, expectQuantityVers
     if (state.destination_id) {
       db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = ?, cancelled_by = ?, cancel_reason = 'reopen' WHERE id = ? AND cancelled_at IS NULL")
         .run(now, w, state.destination_id);
-      // 在庫化アプリのタスクにも伝える (未着手・実績なしは自動で取消、着手後は職員の要確認に倒す)
-      requestCancellation({ destinationId: state.destination_id, source: 'inbound_reversal', actor: w });
+      // 在庫化アプリのカードにも伝える。⭐カードは消さず「取消の確認」を付けるだけ — 続ける/取り消す は
+      //   いろはの職員が決める (中原さん 2026-09-08: 一度いろはに送ったカードは残り続ける)
+      requestCancellation({ destinationId: state.destination_id, source: 'inbound_reversal', reason: 'reopen', actor: w });
     }
     const last = db.prepare("SELECT id FROM f_inbound_check_events WHERE batch_id = ? AND line_key = ? AND action = 'check' ORDER BY id DESC LIMIT 1")
       .get(active.id, line.line_key);

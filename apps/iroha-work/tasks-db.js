@@ -1032,49 +1032,66 @@ export function clearMigrationReview({ taskId, expectVersion, actor = null }) {
 
 // ─── 取消 (入荷受付のやり直し → PR-B で呼ぶ。要件 v1.1 §E) ───
 
-function taskHasActivity(db, taskId) {
-  const s = db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ? AND voided_at IS NULL').get(taskId).c;
-  const m = db.prepare('SELECT COUNT(*) c FROM f_iroha_card_media WHERE task_id = ? AND deleted_at IS NULL').get(taskId).c;
-  const e = db.prepare("SELECT COUNT(*) c FROM f_iroha_app_events WHERE task_id = ? AND action = 'task_status'").get(taskId).c;
-  return s + m + e > 0;
+/** 取消の理由 → 人が読む文。入荷側の cancel_reason と同じ語彙 (apps/inbound-check/db.js) */
+const CANCEL_REASON_LABEL = Object.freeze({
+  line_removed: '入荷の一覧から、この明細が消えました',
+  product_changed: '入荷の明細の商品が変わりました',
+  planned_changed: '入荷の明細の予定数が変わりました',
+  reopen: '入荷受付の iPad で「いろは行き」の確認が取り消されました',
+});
+const CANCEL_SOURCE_LABEL = Object.freeze({
+  inbound_import: '入荷CSVの取込',
+  inbound_reversal: '入荷受付の iPad',
+});
+
+/**
+ * 画面に出す「入荷側で取り消された」の中身。付いていなければ null。
+ * 一覧のカード (service.js) と 1 枚の詳細 (router publicTask) で同じ形
+ */
+export function cancellationOf(t) {
+  if (!t || !t.cancellation_requested_at) return null;
+  return {
+    at: t.cancellation_requested_at,
+    source: t.cancellation_source || null,
+    source_label: CANCEL_SOURCE_LABEL[t.cancellation_source] || '入荷側',
+    reason: t.cancellation_reason || null,
+    reason_label: CANCEL_REASON_LABEL[t.cancellation_reason] || '入荷側で取り消されました',
+  };
 }
 
 /**
- * 入荷側の取消。未着手・実績なしなら自動で終了 (取消)、着手済み・実績ありなら「取消要確認」にして
- * いろは職員が判断する (中原さん 9/3: 最終判断はいろはスタッフ)
- * @returns {ok:true, action:'none'|'closed'|'review', task?}
+ * 入荷側の取消をカードに伝える。⭐**カードは消さない**。どんな状態でも「取消の確認」を付けて残し、
+ * いろはの職員が iPad で 続ける / 取り消す を決める (resolveCancellation)。
+ *
+ * 2026-09-08 までは「未着手・実績なしなら自動で終了 (取消)」だった。その日、空の入荷CSVが
+ * 良いファイルを上書きし、取込が「全行が消えた」と判定して未着手のカードを**一斉に黙って消した**。
+ * 中原さんの決め (同日): **一度いろはに送ったカードは残り続ける。入荷側の都合で勝手に変えない。**
+ * 「まだ触っていない」は「要らない」ではなく「これから作業する」なので、消してよい理由にならない。
+ *
+ * @param {number} o.destinationId 入荷受付の行き先 id
+ * @param {string} o.source 誰が: inbound_import (CSV 取込) / inbound_reversal (入荷 iPad のやり直し)
+ * @param {string|null} o.reason なぜ: line_removed / product_changed / planned_changed / reopen (入荷側の cancel_reason と同じ語彙)
+ * @returns {ok:true, action:'none'|'review', already?:true, task?}
  */
-export function requestCancellation({ destinationId, source = 'inbound_reversal', actor = null }) {
+export function requestCancellation({ destinationId, source = 'inbound_reversal', reason = null, actor = null }) {
   const db = getDB();
-  // 判定と更新を 1 つの書き込みトランザクションで (判定後に誰かが開始したタスクを自動取消しない — Codex A1 R1 #10)。
-  // 自動取消の UPDATE は status と version を条件に持ち、0 行なら要確認へ倒す
+  // 判定と更新を 1 つの書き込みトランザクションで。version を条件に持つので、判定後に誰かが変えていれば書かない
   return db.transaction(() => {
     const t = getTaskByDestination(destinationId);
     if (!t) return { ok: true, action: 'none' };
     if (t.status === 'closed') return { ok: true, action: 'none', task: t };
+    // すでに確認待ちなら二度は書かない (同じことで履歴が増えない)。理由が新しく分かったときだけ書き足す
+    if (t.cancellation_requested_at && (!reason || reason === t.cancellation_reason)) return { ok: true, action: 'review', already: true, task: t };
     const now = utcNow();
-    if (t.status === 'not_started' && !taskHasActivity(db, t.id)) {
-      const r = db.prepare(`UPDATE f_iroha_tasks SET status = 'closed', close_reason = 'cancelled', closed_at = ?, closed_by = ?, hold_reason_code = NULL, hold_reason_note = NULL,
-        blocked_reason = NULL, blocked_note = NULL, blocked_at = NULL, blocked_by = NULL,
-        cancellation_requested_at = NULL, cancellation_source = ?, version = version + 1, updated_at = ?, updated_by = ?
-        WHERE id = ? AND status = 'not_started' AND version = ?`)
-        .run(now, actor || source, source, now, actor || source, t.id, t.version);
-      if (r.changes === 1) {
-        syncSingleBatchStatus(db, t.id, { status: 'closed', close_reason: 'cancelled' });
-        safeLogTaskEvent({ taskId: t.id, action: 'task_status', from: t.status, to: 'closed:cancelled (auto)', ok: true });
-        return { ok: true, action: 'closed', task: getTask(t.id) };
-      }
-    }
-    const cur = getTask(t.id);
-    const r2 = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?), cancellation_source = ?, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
-      .run(now, source, now, actor || source, cur.id, cur.version);
-    if (r2.changes === 0) return { ok: false, error: 'conflict', message: '同時に変更されました。もう一度お試しください', current: getTask(cur.id) };
-    safeLogTaskEvent({ taskId: cur.id, action: 'task_cancel_requested', to: source, ok: true });
-    return { ok: true, action: 'review', task: getTask(cur.id) };
+    const r = db.prepare(`UPDATE f_iroha_tasks SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?), cancellation_source = ?,
+      cancellation_reason = COALESCE(?, cancellation_reason), version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?`)
+      .run(now, source, reason, now, actor || source, t.id, t.version);
+    if (r.changes === 0) return { ok: false, error: 'conflict', message: '同時に変更されました。もう一度お試しください', current: getTask(t.id) };
+    safeLogTaskEvent({ taskId: t.id, action: 'task_cancel_requested', to: reason ? source + ' (' + reason + ')' : source, ok: true });
+    return { ok: true, action: 'review', task: getTask(t.id) };
   }).immediate();
 }
-
-/** 取消要確認を職員が確定 (cancel) / 続行 (continue) */
+/** 取消の確認を職員が決める: cancel (終了:取消) / continue (札を外して続ける) */
 export function resolveCancellation({ taskId, decision, expectVersion, actor = null, isStaff = false, workerId = null, workerName = null, deviceLabel = null }) {
   const db = getDB();
   const t = getTask(taskId);
