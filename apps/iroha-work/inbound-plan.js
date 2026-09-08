@@ -89,20 +89,29 @@ function masterRank(row, want) {
  *
  * 🚨 SQLite の lower() は **ASCII 限定**で、JS の toLowerCase() (= code_key の作り方) と食い違う
  *    (全角英字を小文字にできない。warehouse-mirror/db.js が f_inbound_info の CHECK を張らない理由と同じ)。
- *    SQL では「ASCII 版のキー」と「生の商品ID」の両方で候補を拾い、キーの一致は JS 側で見る。
- *    ここで取りこぼすと、仕入先 0001 の商品でも一覧から**黙って消える**。
+ *    ここで取りこぼすと「仕入先が分からない」扱いになり、仕入先 0001 の商品でも一覧から**黙って消える**。
+ *    そこで 3 段で拾う:
+ *      ① ASCII 版のキー … LOWER(TRIM(商品コード)) IN (code_key)   … 実データはほぼこれで当たる
+ *      ② 生の商品ID     … TRIM(商品コード) IN (商品ID)            … 全角コードで表記が同じもの
+ *      ③ 非ASCII の商品コードだけ読んで JS で突き合わせる          … 全角コードで大小が違うもの
+ *         (ＡＭＣ-Ｚ と ａｍｃ-ｚ。①②のどちらでも当たらない — Codex R3 P2)
+ *    ③ は「非ASCII を含む商品コードを引き当てられなかったとき」だけ走る = 実データではまず走らない。
  *
  * 🚨 同じ code_key の行が 2 つ以上あるときは masterRank の順で決める (毎回同じ行を選ぶ)。
- *    仕入先が食い違っている (0001 と別の仕入先が両方ある) ことは呼び元へ伝えて、画面に出す —
+ *    仕入先が食い違っている (0001 と別の仕入先が両方ある) ことは呼び元へ伝えて画面に出す —
  *    黙ってどちらかに決めない。商品マスタを直すのは人の仕事
  *
  * @returns {Map<string, {code, supplier_code, name, handling, supplier_conflict: boolean}>}
  */
+const NON_ASCII = /[^\x20-\x7E]/;
+const MASTER_SELECT = `SELECT 商品コード AS code, 仕入先コード AS supplier_code, 商品名 AS name, 取扱区分 AS handling
+      FROM mirror_products`;
+
 function productMasterMap(db, lines) {
   const map = new Map();
   if (!tableExists(db, 'mirror_products')) return map;
   const wanted = new Set();   // 探している code_key (JS の規則)
-  const probes = new Set();   // SQL の IN に渡す値 (ASCII 版のキー + 生の商品ID)
+  const probes = new Set();   // SQL の IN に渡す値 (①ASCII 版のキー + ②生の商品ID)
   for (const l of lines) {
     const key = codeKeyOf(l.code_key);
     if (!key) continue;
@@ -114,26 +123,30 @@ function productMasterMap(db, lines) {
   if (!wanted.size) return map;
   const want = wantedSuppliers();
   const seen = new Map();   // code_key → 見つけた仕入先 (正規形) の集合。食い違いの検出用
-  // 1 チャンクで束縛する値は placeholder 2 組ぶん = 600 (SQLite の上限 999 に余裕を残す)
+  const consider = (r) => {
+    const k = codeKeyOf(r.code);
+    if (!wanted.has(k)) return;   // ASCII 版のキーだけ当たった別商品を拾わない
+    const s = normSupplierSafe(r.supplier_code);
+    if (s) {
+      if (!seen.has(k)) seen.set(k, new Set());
+      seen.get(k).add(s);
+    }
+    const cur = map.get(k);
+    if (!cur) { map.set(k, r); return; }
+    const d = masterRank(r, want) - masterRank(cur, want);
+    // 同じ順位なら商品コードの文字順で決める (SQLite の返す順に左右されない)
+    if (d < 0 || (d === 0 && trimS(r.code) < trimS(cur.code))) map.set(k, r);
+  };
+  // ①② 1 チャンクで束縛する値は placeholder 2 組ぶん = 600 (SQLite の上限 999 に余裕を残す)
   eachChunk([...probes], 300, (part) => {
     const ph = part.map(() => '?').join(',');
-    const rows = db.prepare(`SELECT 商品コード AS code, 仕入先コード AS supplier_code, 商品名 AS name, 取扱区分 AS handling
-      FROM mirror_products WHERE LOWER(TRIM(商品コード)) IN (${ph}) OR TRIM(商品コード) IN (${ph})`).all(...part, ...part);
-    for (const r of rows) {
-      const k = codeKeyOf(r.code);
-      if (!wanted.has(k)) continue;   // ASCII 版のキーだけ当たった別商品を拾わない
-      const s = normSupplierSafe(r.supplier_code);
-      if (s) {
-        if (!seen.has(k)) seen.set(k, new Set());
-        seen.get(k).add(s);
-      }
-      const cur = map.get(k);
-      if (!cur) { map.set(k, r); continue; }
-      const d = masterRank(r, want) - masterRank(cur, want);
-      // 同じ順位なら商品コードの文字順で決める (SQLite の返す順に左右されない)
-      if (d < 0 || (d === 0 && trimS(r.code) < trimS(cur.code))) map.set(k, r);
-    }
+    for (const r of db.prepare(`${MASTER_SELECT} WHERE LOWER(TRIM(商品コード)) IN (${ph}) OR TRIM(商品コード) IN (${ph})`)
+      .all(...part, ...part)) consider(r);
   });
+  // ③ 非ASCII の商品コードで引けなかったものが残っているときだけ
+  if ([...wanted].some((k) => !map.has(k) && NON_ASCII.test(k))) {
+    for (const r of db.prepare(`${MASTER_SELECT} WHERE 商品コード GLOB '*[^ -~]*'`).all()) consider(r);
+  }
   for (const [k, sups] of seen) {
     const m = map.get(k);
     if (m) m.supplier_conflict = sups.size > 1;

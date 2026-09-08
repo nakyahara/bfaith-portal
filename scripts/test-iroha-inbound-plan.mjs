@@ -152,13 +152,20 @@ console.log('\n[5] 商品コードの揺れ (全角 / 大文字小文字違い�
   insProduct.run(9, 'dup-x', 'マスタ小文字', '0001');   //   ↑ 片方が 0001
   insProduct.run(10, 'OTH-Y', 'よそ大文字', '0002');    // 食い違うが、どちらも 0001 ではない
   insProduct.run(11, 'oth-y', 'よそ小文字', '0003');
+  // ⭐入荷側とマスタで**全角の大小が違う**ケース (ｗｉｄｅ-ｑ / ＷＩＤＥ-Ｑ)。
+  //   SQLite の lower() でも生の比較でも当たらない — 非ASCII だけ読んで JS で突き合わせる経路 (Codex R3 P2)
+  const WIDE_UP = 'ＷＩＤＥ-Ｑ';
+  const WIDE_LOW = 'ｗｉｄｅ-ｑ';          // 入荷受付CSV 側の表記
+  insProduct.run(12, WIDE_UP, 'マスタ全角大文字', '0001');
   insInfo.run(wideKey, WIDE, 'マスタ全角', '有り');
   insInfo.run('dup-x', 'DUP-X', 'マスタ大文字', '有り');
+  insInfo.run(WIDE_LOW.trim().toLowerCase(), WIDE_LOW, 'マスタ全角大文字', '無し');
 
   const impW = importCsv(makeCsv([
     row('AR7', 1, 1, WIDE, 3),
     row('AR7', 2, 1, 'DUP-X', 6),
     row('AR7', 3, 1, 'OTH-Y', 9),
+    row('AR7', 4, 1, WIDE_LOW, 5),
   ]), { source: 'manual_upload', fileName: 'test3.csv' });
   ok(impW.ok, `取込 ok (${impW.ok ? impW.rowCount + '行' : impW.message})`);
 
@@ -170,6 +177,9 @@ console.log('\n[5] 商品コードの揺れ (全角 / 大文字小文字違い�
   ok(dup && dup.supplier_conflict === true, '⭐仕入先が食い違っていることを画面へ伝える (黙って決めない)');
   ok(r5.rows.find((x) => x.product_code === WIDE).supplier_conflict === false, '食い違っていない行には印を付けない');
   ok(!r5.rows.some((x) => x.product_code === 'OTH-Y'), 'どちらも 0001 でなければ出さない');
+  const wideLow = r5.rows.find((x) => x.product_code === WIDE_LOW);
+  ok(wideLow && wideLow.qty === 5 && wideLow.iroha === '無し',
+    '⭐入荷側とマスタで全角の大小が違っても引ける (ｗｉｄｅ-ｑ ↔ ＷＩＤＥ-Ｑ)');
   // ⭐同じ入力から同じ結果 (SQLite の返す順に左右されない)
   eq(JSON.stringify(listInboundPlan().rows), JSON.stringify(r5.rows), '⭐何度呼んでも同じ一覧になる');
 }
