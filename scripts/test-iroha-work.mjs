@@ -27,7 +27,7 @@ if (!process.env.DATA_DIR) {
 }
 
 // ⭐画面のキャッシュの版。画面を直した PR ではここだけ直す（以前は同じ文字列を 3 か所に書いていて、毎回 3 か所直していた）
-const SW_CACHE = 'iroha-work-shell-v20';
+const SW_CACHE = 'iroha-work-shell-v23';
 
 let pass = 0, fail = 0;
 function ok(cond, label) {

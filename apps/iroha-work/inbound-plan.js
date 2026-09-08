@@ -57,6 +57,9 @@ const NA_VALUES = new Set(['', '－', '-', 'ー', '―']);   // 「未記入」�
  * @returns {{label: string, kind: 'yes'|'no'|'unknown'|'other'}}
  *   other = 「状況による」等、人が意図して入れた値。画面はその文字をそのまま出す (勝手に有り/無しへ寄せない)
  */
+/** 同じ取得日の中の並び順 (中原さん 2026-09-09「あり、空欄、なしの順」)。小さいほど上 */
+const IROHA_ORDER = Object.freeze({ yes: 0, unknown: 1, other: 2, no: 3 });
+
 function irohaOf(raw) {
   const v = trimS(raw);
   if (v === IROHA_YES) return { label: IROHA_YES, kind: 'yes' };
@@ -204,18 +207,116 @@ function supplierNameOf(db, code) {
   return null;
 }
 
-const emptyTotals = () => ({ products: 0, qty: 0, iroha_products: 0, iroha_qty: 0 });
+/** 取り込んでから何日ぶんまで出すか (中原さん 2026-09-09「過去五日間だけ」)。
+ *  元の CSV 自体が「当日から7日前まで」なので、ここを 7 より大きくしても増えない */
+const PAST_DAYS = 5;
+
+const emptyTotals = () => ({ products: 0, qty: 0, iroha_products: 0, iroha_qty: 0,
+  arrived_products: 0, arrived_qty: 0, old_products: 0, old_qty: 0 });
+
+/**
+ * もう届いた明細 → **実際に数えた数** の Map (line_key → 数。分からなければ null)。
+ *
+ * 予定より少なく届いて「不足」で確定することがあるので、届いた分の数は予定数ではなく
+ * 数えた数で出す (Codex P2)。予定 10 個で 4 個だけ届いた行を「10 個 届いた」と出さない。
+ *
+ * 「届いた」の正本 = **倉庫の iPad が確認を確定したときに立つ行き先の台帳** `f_inbound_check_destinations`。
+ *   - 確定と同じトランザクションで 1 行入り、やり直し (reopen) と 伝票から消えた取込 で cancelled_at が入る
+ *   - **取込バッチに紐づかない**ので、3 日前に確認した明細も引ける (line_state の確認は業務日ごとに戻るため使えない)
+ *   - actual_qty = 数えた実数。0 = 「確認したが 1 個も来なかった」なので**届いた扱いにしない**
+ *     (列は後付けなので、それ以前の行は NULL = 確認できた分として扱う)
+ *
+ * ⚠ ロジザードの「受付数」(f_inbound_check_lines.received_qty) は使わない。入荷受付CSV は
+ *    ステータス=受付済 で出しており、受付数は伝票を受け付けた時点の数で「現物が届いたか」を表さない。
+ *
+ * 念のため、いま開いている取込の「確認ずみ・1 個以上数えた」行も足す。台帳と二重の見張りにしておくと、
+ * 行き先が付かないまま確認だけされた行 (画面を通さない経路) も取りこぼさない。
+ */
+function arrivedQtyByLine(db, batchId, lines) {
+  const arrived = new Map();
+  // 同じ明細に複数の証跡があれば、数が分かるほうを採り、両方分かるなら多いほう
+  const put = (k, qty) => {
+    if (!arrived.has(k)) { arrived.set(k, qty == null ? null : qty); return; }
+    const cur = arrived.get(k);
+    if (qty != null) arrived.set(k, cur == null ? qty : Math.max(cur, qty));
+  };
+  for (const r of db.prepare(`SELECT line_key, found_qty FROM f_inbound_check_line_state
+    WHERE batch_id = ? AND status = 'checked' AND found_qty > 0`).all(batchId)) put(r.line_key, r.found_qty);
+  if (!tableExists(db, 'f_inbound_check_destinations')) return arrived;
+  const keys = [...new Set(lines.map((l) => trimS(l.line_key)).filter(Boolean))];
+  eachChunk(keys, 400, (part) => {
+    const ph = part.map(() => '?').join(',');
+    for (const r of db.prepare(`SELECT line_key, actual_qty FROM f_inbound_check_destinations
+      WHERE cancelled_at IS NULL AND (actual_qty IS NULL OR actual_qty > 0) AND line_key IN (${ph})`).all(...part)) {
+      put(r.line_key, r.actual_qty);
+    }
+  });
+  return arrived;
+}
+
+/** 'YYYY-MM-DD' を days 日ずらす (JST の日付文字列のまま計算する) */
+function shiftDate(ymd, days) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimS(ymd));
+  if (!m) return null;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * 明細ごとの「取得日」= その明細を初めて取り込んだ日 (JST の 'YYYY-MM-DD')。
+ *
+ * ⭐**入荷予定日は使わない** (中原さん 2026-09-09「入庫予定日は正確に入れてないから、
+ *   それより取り込んだ日付の方が欲しい」)。ロジザード側で予定日を正確に入れていないので、
+ *   予定日を軸にすると「遅れている / 古い」の判断がそのまま狂う。
+ *
+ * 取込は毎回**全置換**なので、同じ明細を含むいちばん古いバッチの取込日 = その明細の取得日。
+ * work_date ではなく imported_at から出す — work_date は繰り越し (rollOverWorkDate) で今日へ書き換わるため。
+ *
+ * 🚨 明細のキーは **line_key だけでなく code_key も**見る (Codex P1)。伝票の明細は商品が差し替わることが
+ *    あり (取込側も product_changed として確認をやり直させる)、line_key だけで見ると新しい商品が
+ *    前の商品の古い日付を引き継いで、取り込んだ当日に「5 日より前」として消える。
+ *
+ * さかのぼるのは LOOKBACK_DAYS 日ぶんだけ。それより前に載った明細は、どのみち PAST_DAYS で
+ * 出さない側に落ちるので、正確な初日を知る必要がない (バッチは 365 日ぶん残るので、全部見ると重い)。
+ */
+const LOOKBACK_DAYS = 60;
+
+function firstSeenMap(db, lines, today) {
+  const map = new Map();
+  const keys = [...new Set(lines.map((l) => trimS(l.line_key)).filter(Boolean))];
+  if (!keys.length) return map;
+  const since = shiftDate(today, -LOOKBACK_DAYS) || '0000-01-01';
+  eachChunk(keys, 400, (part) => {
+    const ph = part.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT l.line_key AS k, l.code_key AS c, MIN(date(b.imported_at, '+9 hours')) AS day
+      FROM f_inbound_check_lines l
+      JOIN f_inbound_check_batches b ON b.id = l.batch_id
+     WHERE l.line_key IN (${ph}) AND date(b.imported_at, '+9 hours') >= ?
+     GROUP BY l.line_key, l.code_key`).all(...part, since);
+    for (const r of rows) if (r.day) map.set(`${r.k} ${r.c}`, r.day);
+  });
+  return map;
+}
 
 /**
  * 入荷予定の一覧 (仕入先 SUPPLIER_CODES に絞る)。
  *
- * 入荷予定日は**伝票 (AR番号) 単位** (f_inbound_check_slips.planned_date)。明細には日付が無い。
+ * ⭐軸は**取得日** (firstSeenMap)。ロジザードの入荷予定日は現場で正確に
+ *   入れていないので、画面にも出さないし、並び順・切り捨ての判断にも使わない
+ *   (中原さん 2026-09-09)。
  *
- * 同じ商品が同じ入荷予定日に複数の明細に載ることがある (伝票が分かれている・行が分かれている)。
- * いろはが見たいのは「何がいくつ来るか」なので **入荷予定日 × 商品でまとめて数量を足す**。
+ * 同じ商品が同じ日に複数の明細に載ることがある (伝票が分かれている・行が分かれている)。
+ * いろはが見たいのは「何がいくつ来るか」なので **取得日 × 商品でまとめて数量を足す**。
  * 何行をまとめたか (lines) と伝票番号 (ar_nos) は画面の補足に残す。
  *
- * @returns {{supplier, batch, rows, totals, day_stale}}
+ * ⭐出さないもの (中原さん 2026-09-09):
+ *   - **もう届いた明細** … 倉庫が確認を確定したもの (arrivedLineKeys)。いろは行きならこの時点で
+ *     📋 作業 のカードになっているので、入荷予定に残すと同じものが 2 か所に出る
+ *   - **取り込んでから PAST_DAYS 日より前の未着** … 古いものがいつまでも居座らないように切る
+ *   どちらも件数は totals に残して画面に理由を出す (黙って減らさない)
+ *
+ * @returns {{supplier, batch, rows, totals, day_stale, past_days, today}}
  */
 export function listInboundPlan() {
   const batch = getActiveBatch();   // ← inbound-check 側のテーブルもここで冪等に作られる
@@ -224,41 +325,54 @@ export function listInboundPlan() {
     codes: [...SUPPLIER_CODES],
     name: supplierNameOf(db, SUPPLIER_CODES[0]),
   };
+  const today = workDateJst();
   if (!batch) {
-    return { supplier, batch: null, rows: [], totals: emptyTotals(), day_stale: false };
+    return { supplier, batch: null, rows: [], totals: emptyTotals(), day_stale: false, past_days: PAST_DAYS, today };
   }
   const lines = db.prepare(`
-    SELECT l.code_key, l.product_id, l.product_name, l.planned_qty, l.seq, l.ar_no, s.planned_date
-      FROM f_inbound_check_lines l
-      LEFT JOIN f_inbound_check_slips s ON s.batch_id = l.batch_id AND s.ar_no = l.ar_no
-     WHERE l.batch_id = ?
-     ORDER BY l.seq`).all(batch.id);
+    SELECT line_key, code_key, product_id, product_name, planned_qty, seq, ar_no
+      FROM f_inbound_check_lines WHERE batch_id = ? ORDER BY seq`).all(batch.id);
   const keys = [...new Set(lines.map((l) => codeKeyOf(l.code_key)).filter(Boolean))];
   const master = productMasterMap(db, lines);
   const iroha = irohaInfoMap(db, keys);
+  const arrived = arrivedQtyByLine(db, batch.id, lines);
+  const firstSeen = firstSeenMap(db, lines, today);
   const want = wantedSuppliers();
+  const oldest = shiftDate(today, -PAST_DAYS);   // これより前に取り込んだものは出さない
 
-  const grouped = new Map();
+  // 出すもの / 届いたので出さないもの / 古すぎて出さないもの を同じまとめ方で数える
+  const buckets = { rows: new Map(), arrived: new Map(), old: new Map() };
   for (const l of lines) {
     const key = codeKeyOf(l.code_key);
     const m = master.get(key) || null;
     if (!want.has(normSupplierSafe(m && m.supplier_code))) continue;
-    const day = trimS(l.planned_date) || null;
+    // さかのぼり切れなかった明細 (LOOKBACK_DAYS より前から載っている) は「古い」側へ
+    const day = firstSeen.get(`${trimS(l.line_key)} ${l.code_key}`) || null;
+    // 届いたか → 古すぎるか の順に見る (届いた分は古くても「届いた」と数えたい)
+    const isArrived = arrived.has(trimS(l.line_key));
+    const bucket = isArrived ? buckets.arrived
+      : (!day || (oldest && day < oldest)) ? buckets.old
+        : buckets.rows;
+    // 届いた行は**数えた数**で数える (不足で確定した行を予定数のまま数えない)。
+    // 数が残っていない古い証跡だけのときは予定数で代用する
+    const qty = isArrived ? (arrived.get(trimS(l.line_key)) ?? l.planned_qty) : l.planned_qty;
+    // まとめる単位のキー。区切りは NUL — 商品コードに空白が入っていても日付との境目が曖昧にならない
     const gk = `${day || ''} ${key}`;
-    const cur = grouped.get(gk);
+    const cur = bucket.get(gk);
     if (cur) {
-      cur.qty += l.planned_qty;
+      cur.qty += qty;
       cur.lines += 1;
       if (!cur.ar_nos.includes(l.ar_no)) cur.ar_nos.push(l.ar_no);
       continue;
     }
     const ir = irohaOf(iroha.get(key));
-    grouped.set(gk, {
-      planned_date: day,
+    bucket.set(gk, {
+      // ⭐この明細を取り込んだ日 (JST)。入荷予定日ではない
+      fetched_on: day,
       product_code: trimS(l.product_id) || null,
       // 商品名はロジザードの明細を先に (現物の箱に貼ってあるのと同じ表記)。空なら商品マスタで補う
       product_name: trimS(l.product_name) || trimS(m && m.name) || null,
-      qty: l.planned_qty,
+      qty,
       lines: 1,
       ar_nos: [l.ar_no],
       iroha: ir.label,
@@ -269,10 +383,12 @@ export function listInboundPlan() {
       handling: trimS(m && m.handling) || null,
     });
   }
-  // 早く届く順 → 商品名。入荷予定日が空の行は末尾へ (日付が分からないものを先頭に出さない)
-  const rows = [...grouped.values()].sort((a, b) =>
-    (a.planned_date ? 0 : 1) - (b.planned_date ? 0 : 1)
-    || String(a.planned_date || '').localeCompare(String(b.planned_date || ''))
+  // ⭐先に取り込んだ日から順に並べ、**同じ取得日の中を** いろは在庫化区分 の順で並べる
+  //   (中原さん 2026-09-09「あり、空欄、なしの順で。同じ取得日内で」)。
+  //   「状況による」等 (人が入れた値) は決まっていないもの寄りなので 未記入 の次に置く
+  const rows = [...buckets.rows.values()].sort((a, b) =>
+    String(a.fetched_on || '').localeCompare(String(b.fetched_on || ''))
+    || IROHA_ORDER[a.iroha_kind] - IROHA_ORDER[b.iroha_kind]
     || String(a.product_name || '').localeCompare(String(b.product_name || ''), 'ja')
     || String(a.product_code || '').localeCompare(String(b.product_code || '')));
 
@@ -281,6 +397,12 @@ export function listInboundPlan() {
     totals.products += 1;
     totals.qty += r.qty;
     if (r.iroha_kind === 'yes') { totals.iroha_products += 1; totals.iroha_qty += r.qty; }
+  }
+  for (const [name, bucket] of [['arrived', buckets.arrived], ['old', buckets.old]]) {
+    for (const r of bucket.values()) {
+      totals[`${name}_products`] += 1;
+      totals[`${name}_qty`] += r.qty;
+    }
   }
   return {
     supplier,
@@ -294,9 +416,11 @@ export function listInboundPlan() {
     },
     rows,
     totals,
+    past_days: PAST_DAYS,
+    today,
     // 本日の取込がまだ来ていない = 前の日の一覧を見ている。
     //   work_date が今日でない … いろは側は繰り越し (rollOverWorkDate) を呼ばないので、まずここで分かる
     //   carried_from がある     … 倉庫の iPad が先に開いて work_date を今日へ繰り越した後 (中身は前の日のまま)
-    day_stale: !!((batch.work_date && batch.work_date !== workDateJst()) || batch.carried_from),
+    day_stale: !!((batch.work_date && batch.work_date !== today) || batch.carried_from),
   };
 }
