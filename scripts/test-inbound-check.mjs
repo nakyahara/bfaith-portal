@@ -847,5 +847,47 @@ console.log('\n[G] 🚨0 行の CSV は取り込まない / 明細が消えて�
   ok(atRisk(b8.id) === 3, '⭐3 件とも残っている');
 }
 
+console.log('\n[H] 🚨いろはの在庫化カードは入荷側から絶対に消えない (中原さん 2026-09-09「削除は絶対にダメ」)');
+{
+  // ⭐ソースを直接見る不変条件。将来だれかが「取消を伝える」経路を足し直したら、ここで落ちる
+  const icDir = new URL('../apps/inbound-check/', import.meta.url);
+  const icFiles = fs.readdirSync(icDir).filter((f) => f.endsWith('.js'));
+  const icSrc = icFiles.map((f) => fs.readFileSync(new URL(f, icDir), 'utf8')).join('\n');
+
+  // ① いろは側から持ち込んでよいのは「カードを作る」1 つだけ
+  const imported = [...icSrc.matchAll(/import\s+\{([^}]+)\}\s+from\s+'\.\.\/iroha-work\/[^']+'/g)]
+    .flatMap((m) => m[1].split(',').map((x) => x.trim().split(/\s+as\s+/)[0].trim())).filter(Boolean).sort();
+  ok(JSON.stringify(imported) === JSON.stringify(['createTaskForDestination']),
+    `⭐入荷側が いろは から import するのは createTaskForDestination だけ (現在: ${imported.join(', ') || 'なし'})`);
+
+  // ② カードの表を書き換える SQL を持たない (作業仕様マスタ f_iroha_work_master は別物なので除く)
+  const cardWrites = [...icSrc.matchAll(/(UPDATE|DELETE FROM|INSERT INTO)\s+(f_iroha_[a-z_]+)/g)]
+    .map((m) => m[2]).filter((t) => t !== 'f_iroha_work_master');
+  ok(cardWrites.length === 0, `⭐入荷側は いろは のカード系テーブルを直接書き換えない (現在: ${cardWrites.join(', ') || 'なし'})`);
+
+  // ③ 「取消を伝える」関数を呼ぶアプリコードは 1 か所も無い (テストを除く)
+  const appSrc = ['apps/inbound-check', 'apps/iroha-work'].flatMap((d) => {
+    const dir = new URL('../' + d + '/', import.meta.url);
+    return fs.readdirSync(dir).filter((f) => f.endsWith('.js'))
+      .map((f) => ({ f: d + '/' + f, s: fs.readFileSync(new URL(f, dir), 'utf8') }));
+  });
+  const callers = appSrc.filter(({ f, s: src }) => f !== 'apps/iroha-work/tasks-db.js' && /\brequestCancellation\s*\(/.test(src)).map((x) => x.f);
+  ok(callers.length === 0, `⭐requestCancellation を呼ぶアプリコードは無い (現在: ${callers.join(', ') || 'なし'})`);
+
+  // ④ カードを行ごと消す SQL は いろは側の removeStrayTask 1 か所だけで、
+  //    その条件に「入荷受付の行き先が無い (destination_id IS NULL)」が必ず入っている
+  const tasksDb = fs.readFileSync(new URL('../apps/iroha-work/tasks-db.js', import.meta.url), 'utf8');
+  const allSrc = appSrc.map((x) => x.s).join('\n');
+  ok((allSrc.match(/DELETE FROM f_iroha_tasks/g) || []).length === 1, 'カードを行ごと消す SQL はアプリ全体で 1 か所だけ');
+  ok(/function strayWhere\(\)[\s\S]{0,600}?destination_id IS NULL/.test(tasksDb),
+    '⭐その 1 か所の条件は「入荷受付の行き先が無いカード」に限られる = 入荷から生まれたカードは対象外');
+
+  // ⑤ 実際に通した確認 (やり直し / 予定数変更 / 明細ごと消滅 のあともカードが生きていること) は
+  //    上の [F] で見ている。ここはソースの不変条件だけを固定する
+  const closedAuto = getDB().prepare(`SELECT COUNT(*) c FROM f_iroha_tasks
+    WHERE destination_id IS NOT NULL AND status = 'closed' AND closed_by IN ('import', 'system')`).get().c;
+  ok(closedAuto === 0, '⭐入荷側 (import/system) が終了させた いろはのカードは 1 枚も無い');
+}
+
 console.log(`\n${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail ? 1 : 0;
