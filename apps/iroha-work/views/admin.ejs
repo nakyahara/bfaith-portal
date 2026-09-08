@@ -67,7 +67,7 @@
       <span class="lbl">よく使う</span>
       <a href="#sec-workers">👤 名簿</a><a href="#sec-options">🧰 選択肢</a><a href="#sec-find">🔎 記録をさがす</a>
       <span class="lbl">設定・確認</span>
-      <a href="#sec-devices">📱 iPad</a><a href="#sec-capacity">🚚 受け入れ枠</a><a href="#sec-flinks">🚚 外部施設の URL</a><a href="#sec-print">🏷 箱ラベル</a><a href="#sec-notion">🗂 Notion</a><a href="#sec-migrate">🚚 移行</a>
+      <a href="#sec-devices">📱 iPad</a><a href="#sec-restore">🚨 消えたカードを戻す</a><a href="#sec-capacity">🚚 受け入れ枠</a><a href="#sec-flinks">🚚 外部施設の URL</a><a href="#sec-print">🏷 箱ラベル</a><a href="#sec-notion">🗂 Notion</a><a href="#sec-migrate">🚚 移行</a>
       <a href="#sec-sessions">⏱ セッション</a><a href="#sec-media">📷 写真</a><a href="#sec-log">📋 操作履歴</a>
     </nav>
 
@@ -302,6 +302,29 @@
     </div>
 
     <div class="iw-box">
+      <h2 id="sec-restore">🚨 消えたカードを戻す (2026-09-08 の事故)</h2>
+      <p class="hint">
+        9/8 の朝、<b>空の入荷CSV</b>が良いファイルを上書きしたため、取込が「行が全部消えた」と判断し、
+        いろはのカードを一斉に取り消しました。<b>データは消えていません</b>。取り消されて閉じただけなので戻せます。<br>
+        ⭐<b>まず「調べる」</b>を押して、何件戻るかを見てください。<b>そのあと「戻す」</b>です。
+        戻すのは<b>指定した時間の間に、取込が取り消したもの</b>だけで、人が取り消したもの・窓の外の取消・棚入完了には触りません。
+        ⚠同じ時間帯に<b>正常な取込</b>があれば、それが取り消したものも入ります。①で中身を見てから②を押してください。
+        2 回押しても二重には戻りません。
+      </p>
+      <table class="iw-list">
+        <tr><th>いつからいつまで</th><td>
+          <input type="text" id="rcFrom" size="26" value="2026-09-07T15:00:00.000Z"> 〜
+          <input type="text" id="rcTo" size="26" value="2026-09-07T16:00:00.000Z">
+          <span class="hint">（UTC。日本時間 9/8 00:00〜01:00 にあたります）</span>
+        </td></tr>
+        <tr><th></th><td>
+          <button class="btn-sm" onclick="surveyRestore()">① 調べる</button>
+          <button class="btn-sm" id="rcGo" onclick="applyRestore()" disabled>② 戻す</button>
+          <span class="msg" id="rcMsg"></span>
+        </td></tr>
+      </table>
+      <div id="rcResult"></div>
+
       <h2 id="sec-capacity">🚚 外部施設の受け入れ枠</h2>
       <p class="hint">
         「あと何個くらい預けてよいか」を職員が決めるための<b>目安</b>です。主に見るのは<b>想定作業時間</b>
@@ -772,6 +795,37 @@
       set('capv', f.version);
       const hd = document.getElementById('caphard-' + code);
       if (hd) hd.checked = !!f.capacity_boxes_hard;
+    }
+    // 🚨 2026-09-08 の事故の復旧。片づいたらこの節ごと消してよい
+    let rcFound = null;
+    async function surveyRestore() {
+      rcFound = null;
+      document.getElementById('rcGo').disabled = true;
+      setMsg('rcMsg', '', '調べています…');
+      const from = document.getElementById('rcFrom').value.trim();
+      const to = document.getElementById('rcTo').value.trim();
+      const r = await fetch(BASE + '/admin/restore-cancelled?from=' + encodeURIComponent(from) + '&to=' + encodeURIComponent(to));
+      const json = await r.json().catch(() => ({}));
+      if (!json.ok) { setMsg('rcMsg', 'err', json.message || '調べられませんでした'); return; }
+      rcFound = json;
+      setMsg('rcMsg', 'ok', 'カード ' + json.tasks + ' 件・行き先 ' + json.destinations + ' 件が戻せます');
+      document.getElementById('rcGo').disabled = json.tasks === 0 && json.destinations === 0;
+      document.getElementById('rcResult').innerHTML = json.sample.length
+        ? '<p class="hint">はじめの ' + json.sample.length + ' 件: '
+          + json.sample.map(function (x) { return '#' + esc(String(x.id)) + ' ' + esc(x.name || ''); }).join(' / ') + '</p>'
+        : '<p class="hint">戻すものはありません。</p>';
+    }
+    async function applyRestore() {
+      if (!rcFound) { setMsg('rcMsg', 'err', 'さきに「調べる」を押してください'); return; }
+      document.getElementById('rcGo').disabled = true;
+      setMsg('rcMsg', '', '戻しています…');
+      const { json } = await post('/admin/restore-cancelled', {
+        from: rcFound.from, to: rcFound.to,
+        expect_tasks: rcFound.tasks, expect_destinations: rcFound.destinations });
+      if (!json.ok) { setMsg('rcMsg', 'err', json.message || '戻せませんでした'); return; }
+      setMsg('rcMsg', 'ok', 'カード ' + json.restored.tasks + ' 件・まとまり ' + json.restored.batches
+        + ' 件・行き先 ' + json.restored.dests + ' 件を戻しました。iPad で「🔄 いま更新」を押してください');
+      rcFound = null;
     }
     async function saveCapacity(code) {
       const els = ['caph-', 'capb-', 'caphard-', 'capsave-'].map((p) => document.getElementById(p + code));

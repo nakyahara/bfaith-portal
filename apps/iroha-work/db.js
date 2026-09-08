@@ -40,7 +40,7 @@ const workOptionsDDL = (name) => `
 const TASKS_COLS = ['id', 'destination_id', 'notion_page_id', 'legacy_status', 'status', 'close_reason', 'facility_code', 'hold_reason_code', 'hold_reason_note',
   'done_qty', 'hold_memo', 'blocked_reason', 'blocked_note', 'blocked_at', 'blocked_by',
   'planned_date', 'priority_class', 'priority_note', 'product_code', 'product_name', 'qty', 'arrival_date', 'ar_no', 'barcode', 'expiry', 'supplier', 'handling',
-  'master_snapshot', 'payload', 'started_at', 'ready_at', 'closed_at', 'closed_by', 'cancellation_requested_at', 'cancellation_source',
+  'master_snapshot', 'payload', 'started_at', 'ready_at', 'closed_at', 'closed_by', 'cancellation_requested_at', 'cancellation_source', 'cancellation_reason',
   'migration_review', 'migration_note', 'import_batch_id', 'external_ready', 'version', 'created_at', 'created_by', 'updated_at', 'updated_by'];
 const tasksDDL = (name) => `
     CREATE TABLE IF NOT EXISTS ${name} (
@@ -88,6 +88,7 @@ const tasksDDL = (name) => `
       closed_by        TEXT,
       cancellation_requested_at TEXT,
       cancellation_source       TEXT,
+      cancellation_reason       TEXT,
       migration_review INTEGER NOT NULL DEFAULT 0 CHECK (migration_review IN (0,1)),
       migration_note   TEXT,
       import_batch_id  TEXT,
@@ -892,6 +893,8 @@ export function createTables(db = getMirrorDB()) {
   // 「当時何を見て作業したか」を残す。JSON)
   // 外部施設に出す準備ができたか (状態とは別のチェック。Notion のチェックボックスの置き換え — 中原さん 2026-09-03)
   addCol('f_iroha_tasks', 'external_ready', 'INTEGER NOT NULL DEFAULT 0 CHECK (external_ready IN (0,1))');
+  // 入荷側がなぜ取り消したか (line_removed / product_changed / planned_changed / reopen)。カードに理由を出して職員が決める (2026-09-08)
+  addCol('f_iroha_tasks', 'cancellation_reason', 'TEXT');
   // 途中まで何個できたか / 次にやる人への申し送り (要件 §Y。中原さん 2026-09-05)
   addCol('f_iroha_tasks', 'done_qty', 'INTEGER CHECK (done_qty IS NULL OR done_qty >= 0)');
   addCol('f_iroha_tasks', 'hold_memo', 'TEXT');
