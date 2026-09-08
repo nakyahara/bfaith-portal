@@ -856,14 +856,20 @@ export function rollOverWorkDate(db = getDB(), now = new Date()) {
 /**
  * この取込で**取り消されることになる確認ずみの行き先**を、理由つきで先に洗い出す。
  *
- * ⭐歯止め ({@link guardMassCancel}) と実際の取消が**同じ判定を使う**ために、ここに集めた。
- *   別々に書くと集合がずれ、「歯止めは 0 件と数えたのに実際は全件取消」が起きる。
- *   取消の道は 3 本ある — 行が消える 1 本だけ見張っても、残り 2 本から同じ全消しが通る:
- *     line_removed    … 新しい CSV から明細ごと消えた
- *     product_changed … 明細は在るが商品が差し替わった (数えたものが違う)
- *     planned_changed … 明細は在るが予定数が変わった (同上)
- *   例) 確認ずみ 3 件のうち 2 件が消え、1 件が商品差し替えで取り消されるとき、
- *       行が消えた数だけ見ると 2/3 件なので通ってしまい、実際には 3 件とも取り消される。
+ * 取り消すのは〈明細は在るが、数えたものが違う〉2 本だけ:
+ *     product_changed … 商品が差し替わった
+ *     planned_changed … 予定数が変わった
+ *
+ * 🚨**新しい CSV から明細ごと消えた行は取り消さない** (中原さん 2026-09-09。旧: line_removed で取消)。
+ *   CSV は「受付済」で絞っているので、明細が消える理由はほぼ**倉庫で検品されて次のステータスへ進んだ**。
+ *   荷物は届いていて、いろはの在庫化作業はこれから行う。前日に確定した行き先といろはのカードは
+ *   そのまま残し、翌日は新しく受け付けた伝票だけを取り込む — それが通常の流れ。
+ *   2026-09-09 朝に実際に起きたこと: 前日に確認した 19 行が全部検品されて CSV から消え、新しい伝票が
+ *   2 件入った状態で「いま取りに行く」を押したら、「消えた = 取消」の規則が 19 件の取消 (= 前日の
+ *   カードが消える) を導き、それを避ける歯止め (mass_cancel) が取込ごと断って新しい伝票が一覧に出なかった。
+ *   規則の出どころ (#1223 Codex PR-B R1 #1「消えた明細の作業指示が生き続けていた」) は
+ *   「消える = 伝票の明細が削除された」を前提にしていたが、現場ではそれはまれで、消える理由は検品。
+ *   本当に明細が削除されたときは、いろはの職員がカードを見て終了にする (在庫化アプリ側で決める)。
  *
  * @returns {Map<string, string>} line_key → 取消の理由
  */
@@ -873,88 +879,76 @@ function planCancellations(carry, rows) {
   for (const p of carry.values()) {
     if (p.status !== 'checked' || !p.destination_id) continue;   // 失うものが無い行
     const r = incoming.get(p.line_key);
-    if (!r) { plan.set(p.line_key, 'line_removed'); continue; }
+    if (!r) continue;                                            // ⭐検品が進んで消えただけ。行き先もカードも残す
     if (p.code_key !== r.code_key) { plan.set(p.line_key, 'product_changed'); continue; }
     if (p.planned_qty !== r.planned_qty) plan.set(p.line_key, 'planned_changed');
   }
   return plan;
 }
 
+/** 確認ずみで行き先のある行 = 0 行の CSV を取り込むと、次の取込で ✅ を引き継げなくなる行 */
+function atRiskLines(carry) {
+  return [...carry.values()].filter((p) => p.status === 'checked' && p.destination_id);
+}
 /**
  * 断るときに返す合言葉。⭐**画面に出したものすべて**から作る。
  * 人が件数を見て「それでも取り込む」を押すまでの間に何かが変わったら、合言葉が合わなくなる。
  * 材料は 4 つ、どれが欠けても抜け道になる:
- *   ファイルの中身 (fileHash) … 同じ行を消す別の CSV に合言葉を使い回せてしまう
+ *   ファイルの中身 (fileHash) … 別の CSV に合言葉を使い回せてしまう
  *   いまの一覧 (batch id)     … 別の一覧に対して使えてしまう
- *   取り消す明細 (line_key)   … 対象が増減しても通ってしまう
- *   行き先 (destination_id)   … 同じ明細の行き先が確定し直されたとき、
- *                               新しい行き先を古い確認で取り消せてしまう
- * ⚠取消の理由は入れない。ファイルの中身といまの一覧が決まれば理由も決まるので、
- *   足しても新しい情報にならない (材料を増やすと守れているつもりになる)。
+ *   失う明細 (line_key)       … 対象が増減しても通ってしまう
+ *   行き先 (destination_id)   … 同じ明細の行き先が確定し直されたとき、古い確認で通せてしまう
  */
-function planToken(prevActive, plan, carry, fileHash) {
-  const body = [...plan.keys()].sort()
-    .map((k) => k + ':' + carry.get(k).destination_id).join('|');
+function planToken(prevActive, atRisk, fileHash) {
+  const body = atRisk.map((p) => p.line_key + ':' + p.destination_id).sort().join('|');
   return crypto.createHash('sha256').update(prevActive.id + '#' + fileHash + '#' + body)
     .digest('hex').slice(0, 16);
 }
-/** 一度にこれだけの行き先が「まとめて」取り消されるなら、CSV の取得不良を疑う (根拠は下の説明) */
-const MASS_CANCEL_MIN = 3;
 
 /**
- * 🚨**確認ずみの行き先が一斉に取り消される取込を断る** (2026-09-08 の事故の再発防止)。
+ * 🚨**0 行の CSV は取り込まない** (2026-09-08 の事故の再発防止)。
  *
- * ## 何が起きたか
+ * ## 何が起きたか (2026-09-08)
  * 9/7 に足した 00:20 の取得が初回に 0 行の CSV を作り、良いファイルを上書きした。
- * 取込には「新しい CSV から消えた確認ずみの行は行き先を取り消す」規則があるため、
+ * 当時の取込には「新しい CSV から消えた確認ずみの行は行き先を取り消す」規則があったため、
  * **全行が「消えた」と判定**され、いろはの在庫化カードが全部取り消されて一覧から消えた。
  *
- * ## 見張るのは「0 行」ではなく「まとめて取り消される数」
- * 0 行だけを見張っても足りない。取得の条件が狂って**いまの一覧の行をひとつも含まない CSV**
- * が来れば、1 行でも同じ全消しが起きる。なので
- * 〈確認ずみで行き先のある行が、この取込で**ひとつ残らず**取り消されるか〉で見る。
+ * ## いまは何を守っているか (2026-09-09 に整理)
+ * 「消えた = 取消」の規則そのものを外した ({@link planCancellations}) ので、取込で行き先やカードが
+ * 消えることはもう無い。それでも 0 行は断る — 取得が 0 行なのは「入荷が片づいた」証拠ではなく、
+ * たいてい**取りに行けなかった**証拠 (欠損を 0 で代用しない、と同じ)。0 行の一覧に差し替えると
+ *   - まだ検品されていない (= 次の CSV にまた出てくる) 確認ずみの行の ✅ を、次の取込で引き継げない
+ *     (引き継ぎは直前の active しか見ないため)。出てきた行を確認し直すと、同じ明細に 2 枚目のカードができる
+ *   - iPad の一覧が空になり、現場が「片づいた」と誤読する
+ * 本当に入荷が無い日でも、取り込まずに今の一覧を残すのが正しい — その日は「新しい受付が無い」だけ。
  *
- * - **1 つでも残れば通す**。同じ一覧の続き = 検品が進んで消えただけなので、取消は正常な動き。
- *   ⚠これは「一斉取消を全部防ぐ歯止め」ではない — 36 件中 35 件を失う取得不良は通る。
- *   狙いは〈**いまの一覧と関係が切れた CSV**〉を止めることに絞ってある。
- * - ⭐0 行なら **1 件でも**断る。取得が 0 行なのは「入荷が片づいた」証拠ではなく、たいてい
- *   **取りに行けなかった**証拠 (欠損を 0 で代用しない、と同じ)。本当に入荷が無い日でも、
- *   取り込まずに今の一覧を残すのが正しい — その日は「新しい受付が無い」だけで、
- *   確認ずみの行き先を消してよい理由にはならない。
- * - 明細があるときは **{@link MASS_CANCEL_MIN} 件以上**が全滅するときだけ断る。
- *   確認ずみが 1〜2 件しか無い日に、それが検品完了で消えるのは**普通に起きる**ので、
- *   そこまで止めると毎日詰まる。3 件が同じ取込でまとめて消えるほうが珍しい。
- * - ⭐断っても現場が詰まらないように、人が中身を見て押す逃げ道 (force) を画面に出してある。
+ * ⭐旧 mass_cancel (いまの一覧の行をひとつも含まない CSV を断る) は **2026-09-09 に撤去**。
+ *   前日の伝票が全部検品されて消え、新しい伝票だけの CSV が来るのは**毎朝の通常の流れ**で、
+ *   それを「一覧と関係が切れた CSV」と見分ける材料は CSV に無い。取消の規則を外したので守る物も無くなった。
+ * ⭐断っても現場が詰まらないように、人が中身を見て押す逃げ道 (force) を管理画面に出してある。
  *
  * @returns {null} 取り込んでよい / {ok:false,error,message} 断る理由
  */
-function guardMassCancel(parsed, carry, plan, prevActive, fileHash, { force = null } = {}) {
+function guardEmptyCsv(parsed, carry, prevActive, fileHash, { force = null } = {}) {
   if (!prevActive) return null;                // まだ一覧が無い (失うものが無い)
-  const atRisk = [...carry.values()].filter((p) => p.status === 'checked' && p.destination_id).length;
-  if (atRisk === 0) return null;               // 失うものが無い
-  if (plan.size < atRisk) return null;         // 1 つでも残る = 同じ一覧の続き
-  const token = planToken(prevActive, plan, carry, fileHash);
+  if (parsed.rows.length > 0) return null;
+  const atRisk = atRiskLines(carry);
+  if (atRisk.length === 0) return null;        // 失うものが無い
+  const token = planToken(prevActive, atRisk, fileHash);
   if (force && force === token) return null;   // ⭐人がこの中身を見て「それでも取り込む」を押した
   // 確認してから押すまでの間に対象が変わった。同じ画面の合言葉では通さない
   const head = force ? '確認したあとで取込の対象が変わりました。もう一度確かめてください。' : '';
-  const tail = 'いろはの在庫化カードも消えるため、取り込みませんでした。ロジザードから取り直してください';
-  if (parsed.rows.length === 0) {
-    return { ok: false, error: 'empty_csv', force_token: token,
-      message: head + `CSV の明細が 0 行でした。取り込むと確認ずみの行き先 ${atRisk} 件が取り消され、`
-        + tail + ' (本当に入荷が無い日なら、今の一覧のままで問題ありません)' };
-  }
-  if (atRisk < MASS_CANCEL_MIN) return null;
-  return { ok: false, error: 'mass_cancel', force_token: token,
-    message: head + `この CSV には、いま確認ずみの行き先 ${atRisk} 件が 1 つも残りません`
-      + ` (明細が消えた・商品が差し替わった)。取り込むと ${atRisk} 件とも取り消され、` + tail
-      + ' (ロジザードの検索条件が違う CSV かもしれません)' };
+  return { ok: false, error: 'empty_csv', force_token: token,
+    message: head + `CSV の明細が 0 行でした。取り込むと確認ずみ ${atRisk.length} 行の一覧が空になり、`
+      + '次の取込で ✅ を引き継げなくなるため、取り込みませんでした。ロジザードから取り直してください'
+      + ' (本当に入荷が無い日なら、今の一覧のままで問題ありません)' };
 }
 /**
  * CSV を取り込んで新しい active バッチにする。
  * @param {Buffer} buffer
  * @param {object} o  { fileName, source, actor, generatedAt (ISO。無ければ今), force (断られたとき返る合言葉) }
  * @returns {ok:true, batch, rowCount, slipCount} | {ok:false, error, message, batch?}
- *   error: bad_csv | duplicate_file | older_file | empty_csv | mass_cancel
+ *   error: bad_csv | duplicate_file | older_file | empty_csv
  */
 export function importCsv(buffer, { fileName = null, source = 'manual_upload', actor = null, generatedAt = null, force = false } = {}) {
   if (!BATCH_SOURCES.includes(source)) throw new Error(`不正な source: ${source}`);
@@ -1042,11 +1036,10 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
         carry.set(p.line_key, p);
       }
     }
-    // ⭐この取込で取り消される行き先を先に洗い出す。歯止めと実際の取消が同じ集合を使う
+    // ⭐この取込で取り消される行き先 (商品・予定数が変わった明細だけ) を先に洗い出す
     const cancelPlan = planCancellations(carry, parsed.rows);
-    // 🚨確認ずみの行き先が**ひとつ残らず**取り消される取込は、ここで止める。この先へ進めると
-    //   行き先といろはのカードが一斉に取り消される (2026-09-08 の事故)
-    const guard = guardMassCancel(parsed, carry, cancelPlan, prevActive, fileHash, { force });
+    // 🚨0 行の CSV はここで止める (取得不良を「入荷が片づいた」と読み替えない)
+    const guard = guardEmptyCsv(parsed, carry, prevActive, fileHash, { force });
     if (guard) {
       logImport(db, { actor, source, fileName, ok: false, batchId: prevActive ? prevActive.id : null, message: guard.message });
       return { ...guard, batch: prevActive || null };
@@ -1082,14 +1075,11 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       requestCancellation({ destinationId, source: 'inbound_import', reason, actor: actor || 'import' });
       return true;
     };
-    // ⭐新しい CSV から行ごと消えた確認済み行 (伝票の明細が削除された) も、行き先を取り消す。
-    //   ループは新 CSV の行しか見ないので、ここで先に拾う (Codex PR-B R1 #1: 消えた明細の作業指示が生き続けていた)。
-    //   ⭐取り消す相手は cancelPlan が決めたぶんだけ = 歯止めが数えたのと同じ集合
-    let removed = 0;
-    for (const [lineKey, reason] of cancelPlan) {
-      if (reason !== 'line_removed') continue;
-      if (cancelDestAndTask(carry.get(lineKey).destination_id, reason)) removed++;
-    }
+    // ⭐新しい CSV から行ごと消えた確認ずみの行は、**行き先もいろはのカードもそのまま残す**
+    //   (中原さん 2026-09-09。理由は planCancellations)。一覧から外れるだけなので、ここでは数えて
+    //   取込履歴に残すだけ (「消えた = 検品が進んだ」が読み取れるように)
+    const incomingKeys = new Set(parsed.rows.map((r) => r.line_key));
+    const dropped = atRiskLines(carry).filter((p) => !incomingKeys.has(p.line_key)).length;
     let carried = 0;
     for (const r of parsed.rows) {
       insLine.run(batchId, r.line_key, r.ar_no, r.line_no, r.detail_no, r.product_id, r.code_key, r.product_name, r.barcode, r.planned_qty, r.received_qty, r.seq);
@@ -1101,8 +1091,8 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
       const found = quantitySum(db, workDate, r.line_key, r.code_key);
       const keepChecked = same && p.status === 'checked';
       if (keepChecked) carried++;
-      // 確認を引き継げない行の行き先実績は取り消す (いろはへ送る数が二重計上されないように)。
-      // ⭐ここも cancelPlan の通りに = 歯止めが数えた集合と必ず一致する
+      // 確認を引き継げない行 (商品・予定数が変わった) の行き先実績は取り消す (いろはへ送る数が二重計上されないように)。
+      // ⭐取り消す相手は cancelPlan が決めたぶんだけ。行ごと消えた明細は cancelPlan に入らない (= 取り消さない)
       const cancelReason = cancelPlan.get(r.line_key);
       if (cancelReason) cancelDestAndTask(p.destination_id, cancelReason);
       insState.run(batchId, r.line_key, keepChecked ? 'checked' : 'unchecked',
@@ -1111,7 +1101,8 @@ export function importCsv(buffer, { fileName = null, source = 'manual_upload', a
         keepChecked ? p.destination_id : null, sameProduct ? p.current_pack_qty : null);
     }
     logImport(db, { actor, source, fileName, ok: true, batchId,
-      message: `${parsed.rows.length}行 / ${slipsMap.size}伝票` + (carried ? ` (確認済み ${carried}行を引き継ぎ)` : '') + (removed ? ` (消えた明細の行き先 ${removed}件を取消)` : '') });
+      message: `${parsed.rows.length}行 / ${slipsMap.size}伝票` + (carried ? ` (確認済み ${carried}行を引き継ぎ)` : '')
+        + (dropped ? ` (確認済み ${dropped}行は検品が進んで一覧から外れました。行き先はそのまま)` : '') });
     cleanupOld(db);
     return { ok: true, batch: getBatch(batchId), rowCount: parsed.rows.length, slipCount: slipsMap.size, carriedOver: carried, imageSkus: parsed.rows.map(r => r.product_id) };
   });

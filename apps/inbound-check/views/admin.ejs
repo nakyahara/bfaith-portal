@@ -609,9 +609,9 @@
       msg($('#uploadMsg'), true, '取込中…');
       let r = await fetch(BASE + '/admin/upload', { method: 'POST', body: fd });
       let j = await r.json().catch(() => ({}));
-      // 🚨一斉取消になる CSV は既定で断られる。中身を見て納得したときだけ、もう一度 force で送る
-      if (!j.ok && (j.error === 'empty_csv' || j.error === 'mass_cancel')) {
-        if (!confirm((j.message || '') + '\n\nそれでも取り込みますか？\n(いろはの在庫化カードが一斉に消えます)')) {
+      // 🚨0 行の CSV は既定で断られる。中身を見て納得したときだけ、もう一度 force で送る
+      if (!j.ok && j.error === 'empty_csv') {
+        if (!confirm((j.message || '') + '\n\nそれでも取り込みますか？\n(いまの一覧が空になります)')) {
           return msg($('#uploadMsg'), false, '取り込みませんでした');
         }
         fd.set('force', j.force_token);

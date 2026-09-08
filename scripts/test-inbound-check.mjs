@@ -552,26 +552,30 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   const t1c = taskOf(d1cId);
   ok(t1c.status === 'not_started' && t1c.cancellation_requested_at && t1c.cancellation_source === 'inbound_import' && t1c.cancellation_reason === 'planned_changed',
     '再取込で引き継げなかった行のタスクは消えず「取消の確認」(planned_changed) が付く');
-  // 再取込で行ごと消えた確認済み行 → 行き先を取消 (line_removed)・タスクも取消 (Codex PR-B R1 #1)
+  // ⭐再取込で行ごと消えた確認済み行 → **行き先もタスクもそのまま残す** (中原さん 2026-09-09)。
+  //   CSV は「受付済」で絞っているので、明細が消える = 倉庫で検品されて次のステータスへ進んだ。
+  //   荷物は届いていて在庫化はこれから行うので、前日に決めた行き先・いろはのカードを消してはいけない
+  //   (旧: line_removed で取消 — Codex PR-B R1 #1。「消える = 明細が削除された」の前提が現場で成り立たなかった)
   const b2 = getActiveBatch();
   const f3b = finalizeLine({ batchId: b2.id, lineKey: 'AR9|3|1', expectVersion: lineState('AR9|3|1').version, expectQuantityVersion: lineState('AR9|3|1').quantity_version, result: 'exact', mode: 'current', worker: '鈴木', decide: decideIroha });
   ok(f3b.ok && taskOf(destIdOf('AR9|3|1'))?.status === 'not_started', '前提: 消える予定の行を確定 (タスクあり)');
   const d3bId = destIdOf('AR9|3|1');
   const imp3 = importCsv(makeCsv([row('AR9', 1, 'TASK-A', 7), row('AR9', 2, 'TASK-B', 3)]), { fileName: 'prb3.csv', generatedAt: '2027-01-01T02:00:00Z' });
-  ok(imp3.ok && /消えた明細の行き先 1件を取消/.test(db.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message), '前提: 行 3 が無い CSV を再取込 (ログに件数)');
-  ok(destOf(d3bId).cancelled_at && destOf(d3bId).cancel_reason === 'line_removed', '消えた明細の行き先は取消 (line_removed)');
+  ok(imp3.ok && /確認済み 1行は検品が進んで一覧から外れました/.test(db.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message), '前提: 行 3 が無い CSV を再取込 (ログに「一覧から外れた」件数)');
+  ok(destOf(d3bId).cancelled_at == null, '⭐消えた明細の行き先は取り消さない (検品が進んだだけ)');
   const t3c = taskOf(d3bId);
-  ok(t3c.status === 'not_started' && t3c.cancellation_requested_at && t3c.cancellation_reason === 'line_removed', '消えた明細のタスクも消えず「取消の確認」(line_removed) が付く');
+  ok(t3c.status === 'not_started' && !t3c.cancellation_requested_at, '⭐消えた明細のタスクもそのまま (「取消の確認」も付かない)');
   ok(destOf(destIdOf('AR9|2|1')).cancelled_at == null, '残った行 (B-Faith 行き) はそのまま');
-  // 既に取消済みの行き先が carry に残っていても「取消 N 件」に数えない (Codex PR-B R2 Low)
+  ok(!getState().lines.some((l) => l.line_key === 'AR9|3|1'), '一覧からは外れる (検品ずみの明細は表示しない)');
+  // 既に取消済みの行き先が carry に残っていても「一覧から外れた N 行」に数えない (Codex PR-B R2 Low)
   const b3 = getActiveBatch();
   const f2b = finalizeLine({ batchId: b3.id, lineKey: 'AR9|1|1', expectVersion: lineState('AR9|1|1').version, expectQuantityVersion: lineState('AR9|1|1').quantity_version, result: 'shortage', mode: 'current', worker: '山田', decide: decideIroha });
   ok(f2b.ok, '前提: 行 1 を確定 (7 予定 / 6 実数 = 不足)');
   const dPre = destIdOf('AR9|1|1');
   db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = ?, cancelled_by = 'manual', cancel_reason = 'reopen' WHERE id = ?").run(new Date().toISOString(), dPre);
   const imp4 = importCsv(makeCsv([row('AR9', 2, 'TASK-B', 3)]), { fileName: 'prb4.csv', generatedAt: '2027-01-01T03:00:00Z' });
-  ok(imp4.ok && !/消えた明細/.test(db.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message), '既に取消済みなら「消えた明細の取消」に数えない');
-  ok(destOf(dPre).cancel_reason === 'reopen', '取消理由も上書きしない');
+  ok(imp4.ok && /一覧から外れました/.test(db.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message), '行 1 が外れたことはログに残る');
+  ok(destOf(dPre).cancel_reason === 'reopen', '取消理由は上書きしない');
 }
 
 // ─── 業務日の繰り越し (前日の一覧を今日ぶんとして続ける) ───
@@ -685,10 +689,10 @@ console.log('\n[11] 管理画面の入口でも業務日を繰り越す');
 }
 
 
-console.log('\n[G] 🚨確認ずみの行き先が一斉に取り消される取込は断る (2026-09-08 の事故の再発防止)');
+console.log('\n[G] 🚨0 行の CSV は取り込まない / 明細が消えても行き先とカードは残す (2026-09-08 の事故と 2026-09-09 朝の整理)');
 {
   const D = getDB();
-  // ⭐確認ずみ + 行き先ありの行をつくる (取り込むと取り消される = 失うもの)
+  // ⭐確認ずみ + 行き先ありの行をつくる (0 行に差し替えると ✅ を引き継げなくなる = 失うもの)
   const makeAtRisk = (batchId, n) => {
     const keys = D.prepare('SELECT line_key FROM f_inbound_check_lines WHERE batch_id = ? ORDER BY seq').all(batchId).slice(0, n);
     keys.forEach((k, i) => D.prepare(
@@ -699,6 +703,10 @@ console.log('\n[G] 🚨確認ずみの行き先が一斉に取り消される取
   const atRisk = (batchId) => D.prepare(
     "SELECT COUNT(*) c FROM f_inbound_check_line_state WHERE batch_id = ? AND status = 'checked' AND destination_id IS NOT NULL"
   ).get(batchId).c;
+  const cancelledByImport = () => D.prepare("SELECT COUNT(*) c FROM f_inbound_check_destinations WHERE cancelled_by = 'import'").get().c;
+  const lastLog = () => D.prepare('SELECT message FROM f_inbound_check_import_log ORDER BY id DESC LIMIT 1').get().message;
+  // 中身の違う 0 行 CSV (file_hash 重複を避ける。列の並びは取込に影響しない)
+  const rotated = (n) => [...HEADER.slice(n), ...HEADER.slice(0, n)];
 
   // ══ ① 0 行の CSV (事故そのもの) ══
   const g1 = importCsv(makeCsv([row('GA1', 1, 'g-1', 5), row('GA1', 2, 'g-2', 3)]),
@@ -710,44 +718,49 @@ console.log('\n[G] 🚨確認ずみの行き先が一斉に取り消される取
 
   const empty = importCsv(makeCsv([]), { fileName: 'empty.csv', source: 'auto', generatedAt: '2028-09-20T01:00:00Z' });
   ok(!empty.ok && empty.error === 'empty_csv', '⭐0 行の CSV は取り込まない (1 件しか失わなくても)');
-  ok(/取り消され/.test(empty.message) && /1 件/.test(empty.message), 'なぜ止めたか・何件が危なかったかを言う');
+  ok(/空になり/.test(empty.message) && /1 行/.test(empty.message), 'なぜ止めたか・何行が危なかったかを言う');
+  ok(!/カード/.test(empty.message), '⭐「カードが消える」とは言わない (取込でカードが消える規則はもう無い)');
   ok(getActiveBatch().id === b1.id, '⭐いまの一覧はそのまま (差し替えない)');
-  ok(atRisk(b1.id) === 1, '⭐確認ずみの行き先もそのまま (取り消していない)');
+  ok(atRisk(b1.id) === 1, '⭐確認ずみの行き先もそのまま');
   ok(D.prepare("SELECT COUNT(*) c FROM f_inbound_check_import_log WHERE ok = 0 AND message LIKE '%0 行%'").get().c >= 1,
     '取込履歴に理由が残る (静かに落とさない)');
 
-  // ══ ② ⭐0 行でなくても、いまの行をひとつも含まない CSV は同じ全消しになる (Codex 指摘) ══
-  //    ロジザードの検索条件が違うと「1 行だけの別物 CSV」が来て、0 行と同じことが起きる
+  // ══ ② ⭐いまの行をひとつも含まない CSV = 毎朝の通常の流れ (前日ぶんが全部検品されて消え、新しい伝票だけが来る) ══
+  //    2026-09-09 朝: 前日の 19 行が全部消えた CSV を旧 mass_cancel が断り、新しい伝票 2 件が一覧に出なかった。
+  //    取込は通す。消えた行の行き先といろはのカードは残す (荷物は届いていて、在庫化はこれから)
   const g2 = importCsv(makeCsv([row('GB1', 1, 'g-3', 2), row('GB1', 2, 'g-4', 2), row('GB1', 3, 'g-5', 2)]),
     { fileName: 'g2.csv', source: 'auto', generatedAt: '2028-09-20T02:00:00Z' });
   ok(g2.ok, '(前提) 3 行の CSV を取り込める');
   const b2 = getActiveBatch();
   makeAtRisk(b2.id, 3);
   ok(atRisk(b2.id) === 3, '(前提) 行き先のある確認ずみの行が 3 件');
-
+  const cancelledBefore = cancelledByImport();
   const other = importCsv(makeCsv([row('GZ9', 1, 'g-9', 1)]),
     { fileName: 'other.csv', source: 'auto', generatedAt: '2028-09-20T03:00:00Z' });
-  ok(!other.ok && other.error === 'mass_cancel',
-    '⭐いまの行をひとつも含まない CSV は取り込まない (1 行でも中身が別物なら全消しになる)');
-  ok(/3 件/.test(other.message), '何件が取り消されるところだったかを言う');
-  ok(getActiveBatch().id === b2.id, '⭐一覧はそのまま');
-  ok(atRisk(b2.id) === 3, '⭐3 件とも残っている');
+  ok(other.ok, '⭐前日の行をひとつも含まない CSV (全部検品ずみ + 新しい伝票) を取り込む — 翌朝の通常の流れを止めない');
+  ok(getActiveBatch().id !== b2.id && getState().lines.length === 1 && getState().lines[0].line_key === 'GZ9|1|1',
+    '⭐一覧は新しい伝票だけになる');
+  ok(cancelledByImport() === cancelledBefore, '⭐消えた 3 行の行き先は取り消さない (取込による取消が増えない)');
+  ok(/確認済み 3行は検品が進んで一覧から外れました/.test(lastLog()), '取込履歴に「検品が進んで外れた」行数が残る');
+  ok(!other.force_token, '断っていないので合言葉は返さない');
 
-  // ══ ③ ⭐1 つでも残る CSV は通す (検品が進んで消えただけ = 正常な取消) ══
-  const partial = importCsv(makeCsv([row('GB1', 1, 'g-3', 2), row('GC1', 1, 'g-6', 4)]),
+  // ══ ③ 1 つでも残る CSV (検品が途中まで進んだ日) ══
+  const b2b = getActiveBatch();
+  makeAtRisk(b2b.id, 1);
+  const partial = importCsv(makeCsv([row('GZ9', 1, 'g-9', 1), row('GC1', 1, 'g-6', 4)]),
     { fileName: 'partial.csv', source: 'auto', generatedAt: '2028-09-20T04:00:00Z' });
-  ok(partial.ok, '⭐確認ずみの行が 1 つでも残っていれば取り込む (正常な日を止めない)');
-  ok(getActiveBatch().id !== b2.id, '一覧が入れ替わっている');
+  ok(partial.ok, '確認ずみの行が残っている CSV も当然通る');
+  ok(getActiveBatch().id !== b2b.id && atRisk(getActiveBatch().id) === 1, '残った行の ✅ と行き先は引き継ぐ');
 
-  // ══ ④ 少数 (2 件) が全部消えるのは普通に起きるので止めない ══
+  // ══ ④ 少数 (2 件) が全部消えるのも通す ══
   const b3 = getActiveBatch();
   makeAtRisk(b3.id, 2);
   ok(atRisk(b3.id) === 2, '(前提) 行き先のある確認ずみの行が 2 件');
   const few = importCsv(makeCsv([row('GD1', 1, 'g-7', 1)]),
     { fileName: 'few.csv', source: 'auto', generatedAt: '2028-09-20T05:00:00Z' });
-  ok(few.ok, '⭐確認ずみが 2 件しか無い日は、全部消えても止めない (毎日詰まらせない)');
+  ok(few.ok, '確認ずみが全部消えても取り込む');
 
-  // ══ ⑤ 人が中身を見て押したときは通す (逃げ道) ══
+  // ══ ⑤ 0 行でも、人が中身を見て押したときは通す (逃げ道) ══
   const b4 = getActiveBatch();
   makeAtRisk(b4.id, 1);
   const opt6 = { fileName: 'empty2.csv', source: 'manual_upload', generatedAt: '2028-09-20T06:00:00Z' };
@@ -766,87 +779,70 @@ console.log('\n[G] 🚨確認ずみの行き先が一斉に取り消される取
   const empty2 = importCsv(makeCsv([], { header: [...HEADER].reverse() }), { fileName: 'empty3.csv', source: 'auto', generatedAt: '2028-09-20T08:00:00Z' });
   ok(empty2.ok, '⭐行き先のある確認ずみの行が無ければ、0 行でも止めない (失うものが無い)');
 
-  // ══ ⑦ 🚨明細は残っているのに、商品が全部差し替わった CSV ══
-  //    取消の道は「行が消える」だけではない。明細が在っても商品や予定数が変われば
-  //    確認は引き継げず、行き先は取り消される。行が消える道だけ見張ると、ここから同じ全消しが通る
+  // ══ ⑦ 明細は残っているのに商品が差し替わった CSV — 数えたものが違うので、その行の確認は引き継がない ══
+  //    取込は通す (0 行ではない)。行き先の取消は product_changed としていろはへ「取消の確認」を送る
   const g4 = importCsv(makeCsv([row('GF1', 1, 'g-10', 3), row('GF1', 2, 'g-11', 3), row('GF1', 3, 'g-12', 3)]),
     { fileName: 'g4.csv', source: 'auto', generatedAt: '2028-09-20T09:00:00Z' });
   ok(g4.ok, '(前提) 3 行の CSV を取り込める');
   const b5 = getActiveBatch();
   makeAtRisk(b5.id, 3);
   ok(atRisk(b5.id) === 3, '(前提) 行き先のある確認ずみの行が 3 件');
-
   const swapped = importCsv(makeCsv([row('GF1', 1, 'x-10', 3), row('GF1', 2, 'x-11', 3), row('GF1', 3, 'x-12', 3)]),
     { fileName: 'swapped.csv', source: 'auto', generatedAt: '2028-09-20T10:00:00Z' });
-  ok(!swapped.ok && swapped.error === 'mass_cancel',
-    '⭐明細は在るが商品が全部差し替わった CSV も断る (行が消える道だけ見張ると素通しになる)');
-  ok(atRisk(b5.id) === 3, '⭐3 件とも残っている');
+  ok(swapped.ok, '商品が差し替わった CSV も取り込む (断るのは 0 行だけ)');
+  ok(atRisk(getActiveBatch().id) === 0, '差し替わった行の確認は引き継がない (数えたものが違う)');
 
-  // ══ ⑧ 消えた 2 件 + 商品が変わった 1 件 = 3 件全滅 ══
-  //    消えた数だけ数えると 2/3 件なので通ってしまい、実際には 3 件とも取り消される
-  const mixed = importCsv(makeCsv([row('GF1', 1, 'x-10', 3)]),
-    { fileName: 'mixed.csv', source: 'auto', generatedAt: '2028-09-20T11:00:00Z' });
-  ok(!mixed.ok && mixed.error === 'mass_cancel',
-    '⭐消えた 2 件 + 商品が変わった 1 件 でも断る (消えた数だけでは 2/3 件に見える)');
-  ok(atRisk(b5.id) === 3, '⭐3 件とも残っている');
-
-  // ══ ⑨ 商品が変わっても 1 件残れば通す (正常な日を止めない) ══
-  const keep1 = importCsv(makeCsv([row('GF1', 1, 'g-10', 3), row('GF1', 2, 'x-11', 3)]),
-    { fileName: 'keep1.csv', source: 'auto', generatedAt: '2028-09-20T12:00:00Z' });
-  ok(keep1.ok, '⭐商品が変わった行があっても、引き継げる行が 1 つ残れば取り込む');
-
-  // ══ ⑩ ⭐画面で件数を見てから押すまでの間に対象が変わったら、その合言葉では通らない ══
-  //    「3 件が取り消されます」を見て納得したのに、押したときには 4 件だった、を防ぐ。
-  //    合言葉は取り消す予定の中身そのものから作ってあるので、中身が変われば合わなくなる
+  // ══ ⑧ ⭐画面で件数を見てから押すまでの間に対象が変わったら、その合言葉では通らない ══
+  //    「1 行が空になります」を見て納得したのに、押したときには 2 行だった、を防ぐ
   const g5 = importCsv(makeCsv([row('GG1', 1, 'g-20', 1), row('GG1', 2, 'g-21', 1),
     row('GG1', 3, 'g-22', 1), row('GG1', 4, 'g-23', 1)]),
     { fileName: 'g5.csv', source: 'auto', generatedAt: '2028-09-20T13:00:00Z' });
   ok(g5.ok, '(前提) 4 行の CSV を取り込める');
   const b6 = getActiveBatch();
-  makeAtRisk(b6.id, 3);
+  makeAtRisk(b6.id, 1);
   const optS = { fileName: 'stale.csv', source: 'manual_upload', generatedAt: '2028-09-20T14:00:00Z' };
-  const csvS = makeCsv([row('GH9', 1, 'g-99', 1)]);
+  const csvS = makeCsv([], { header: rotated(1) });
   const first = importCsv(csvS, optS);
-  ok(!first.ok && first.error === 'mass_cancel', '(前提) 3 件が取り消されるので断られる');
-  makeAtRisk(b6.id, 4);                        // 押すまでの間に 4 件目が確認された
+  ok(!first.ok && first.error === 'empty_csv', '(前提) 0 行なので断られる');
+  makeAtRisk(b6.id, 2);                        // 押すまでの間に 2 件目が確認された
   const stale = importCsv(csvS, { ...optS, force: first.force_token });
   ok(!stale.ok, '⭐画面で見たあとに対象が増えたら、そのときの合言葉では通らない');
   ok(/対象が変わりました/.test(stale.message), '何が起きたかを言う (黙って通さない)');
   const fresh = importCsv(csvS, { ...optS, force: stale.force_token });
   ok(fresh.ok, '⭐いまの中身の合言葉で押し直せば通る (詰まらせない)');
 
-  // ══ ⑪ ⭐合言葉は「そのファイル」のもの。取り消す対象が同じでも別の CSV には使えない ══
+  // ══ ⑨ ⭐合言葉は「そのファイル」のもの。失う対象が同じでも別の CSV には使えない ══
   const g6 = importCsv(makeCsv([row('GJ1', 1, 'g-30', 1), row('GJ1', 2, 'g-31', 1), row('GJ1', 3, 'g-32', 1)]),
     { fileName: 'g6.csv', source: 'auto', generatedAt: '2028-09-20T15:00:00Z' });
   ok(g6.ok, '(前提) 3 行の CSV を取り込める');
   const b7 = getActiveBatch();
   makeAtRisk(b7.id, 3);
   const optE = { fileName: 'a.csv', source: 'manual_upload', generatedAt: '2028-09-20T16:00:00Z' };
-  const csvA = makeCsv([row('GZ1', 1, 'z-1', 1)]);
-  const csvB = makeCsv([row('GZ2', 1, 'z-2', 1)]);   // 取り消す 3 件は同じ。中身だけ違う
+  const csvA = makeCsv([], { header: rotated(2) });
+  const csvB = makeCsv([], { header: rotated(3) });   // 失う 3 件は同じ。ファイルの中身だけ違う
   const refusedA = importCsv(csvA, optE);
-  ok(!refusedA.ok && !!refusedA.force_token, '(前提) 中身が別物の CSV が断られ、合言葉が返る');
+  ok(!refusedA.ok && !!refusedA.force_token, '(前提) 0 行の CSV が断られ、合言葉が返る');
   const reuse = importCsv(csvB, { ...optE, fileName: 'b.csv', force: refusedA.force_token });
-  ok(!reuse.ok, '⭐ある CSV に出した合言葉で、別の CSV は通せない (取り消す対象が同じでも)');
+  ok(!reuse.ok, '⭐ある CSV に出した合言葉で、別の CSV は通せない (失う対象が同じでも)');
   ok(/対象が変わりました/.test(reuse.message), '中身が違うと言う');
   const okA = importCsv(csvA, { ...optE, force: refusedA.force_token });
   ok(okA.ok, '⭐合言葉を出した CSV そのものなら通る');
 
-  // ══ ⑫ ⭐同じ明細でも、行き先が確定し直されたら古い合言葉では通らない ══
+  // ══ ⑩ ⭐同じ明細でも、行き先が確定し直されたら古い合言葉では通らない ══
   const g7 = importCsv(makeCsv([row('GK1', 1, 'g-40', 1), row('GK1', 2, 'g-41', 1), row('GK1', 3, 'g-42', 1)]),
     { fileName: 'g7.csv', source: 'auto', generatedAt: '2028-09-20T17:00:00Z' });
   ok(g7.ok, '(前提) 3 行の CSV を取り込める');
   const b8 = getActiveBatch();
   const keys8 = makeAtRisk(b8.id, 3);
   const optR = { fileName: 'redo.csv', source: 'manual_upload', generatedAt: '2028-09-20T18:00:00Z' };
-  const csvR = makeCsv([row('GY9', 1, 'y-9', 1)]);
+  const csvR = makeCsv([], { header: rotated(4) });
   const beforeRedo = importCsv(csvR, optR);
   ok(!beforeRedo.ok && !!beforeRedo.force_token, '(前提) 断られて合言葉が返る');
   // 押すまでの間に、同じ明細の行き先が確定し直された (別の行き先になった)
   D.prepare("UPDATE f_inbound_check_line_state SET destination_id = 995555 WHERE batch_id = ? AND line_key = ?")
     .run(b8.id, keys8[0]);
   const afterRedo = importCsv(csvR, { ...optR, force: beforeRedo.force_token });
-  ok(!afterRedo.ok, '⭐行き先が確定し直されたら古い合言葉では通らない (新しい行き先を古い確認で消さない)');
+  ok(!afterRedo.ok, '⭐行き先が確定し直されたら古い合言葉では通らない');
   ok(atRisk(b8.id) === 3, '⭐3 件とも残っている');
 }
 
