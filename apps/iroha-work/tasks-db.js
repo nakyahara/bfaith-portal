@@ -1059,6 +1059,35 @@ export function cancellationOf(t) {
   };
 }
 
+const hasTableNamed = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+
+/**
+ * ⭐同じ入荷明細 (行き先の line_key) から生まれた**開いているカード**が 2 枚以上あれば、互いを「関連カード」として返す。
+ * 取消後に入荷側で確認し直すと、新しい行き先 = 新しいカードができ、旧カードは「取消の確認」のまま残る。
+ * そのままだと同じ現物の作業指示が 2 枚になる (Codex R1) ので、両方の画面に相手を出して職員が片づける。
+ * 自動で統合・取消はしない (作業実績を守る・カードは黙って消さない)。
+ * @returns {Map<number, Array<{id, status, cancellation_requested_at, newer:boolean}>>} task id → 相手
+ */
+export function relatedByInboundLine(db = getDB()) {
+  const out = new Map();
+  if (!hasTableNamed(db, 'f_inbound_check_destinations')) return out;
+  const rows = db.prepare(`SELECT t.id, t.status, t.cancellation_requested_at, d.line_key
+    FROM f_iroha_tasks t JOIN f_inbound_check_destinations d ON d.id = t.destination_id
+    WHERE t.status <> 'closed' AND d.line_key IN (
+      SELECT d2.line_key FROM f_iroha_tasks t2 JOIN f_inbound_check_destinations d2 ON d2.id = t2.destination_id
+      WHERE t2.status <> 'closed' GROUP BY d2.line_key HAVING COUNT(*) > 1)
+    ORDER BY t.id`).all();
+  const byLine = new Map();
+  for (const r of rows) { if (!byLine.has(r.line_key)) byLine.set(r.line_key, []); byLine.get(r.line_key).push(r); }
+  for (const group of byLine.values()) {
+    for (const me of group) {
+      out.set(me.id, group.filter((o) => o.id !== me.id)
+        .map((o) => ({ id: o.id, status: o.status, cancellation_requested_at: o.cancellation_requested_at, newer: o.id > me.id })));
+    }
+  }
+  return out;
+}
+
 /**
  * 入荷側の取消をカードに伝える。⭐**カードは消さない**。どんな状態でも「取消の確認」を付けて残し、
  * いろはの職員が iPad で 続ける / 取り消す を決める (resolveCancellation)。
@@ -1081,7 +1110,7 @@ export function requestCancellation({ destinationId, source = 'inbound_reversal'
     if (!t) return { ok: true, action: 'none' };
     if (t.status === 'closed') return { ok: true, action: 'none', task: t };
     // すでに確認待ちなら二度は書かない (同じことで履歴が増えない)。理由が新しく分かったときだけ書き足す
-    if (t.cancellation_requested_at && (!reason || reason === t.cancellation_reason)) return { ok: true, action: 'review', already: true, task: t };
+    if (t.cancellation_requested_at && (!reason || reason === t.cancellation_reason) && source === t.cancellation_source) return { ok: true, action: 'review', already: true, task: t };
     const now = utcNow();
     const r = db.prepare(`UPDATE f_iroha_tasks SET cancellation_requested_at = COALESCE(cancellation_requested_at, ?), cancellation_source = ?,
       cancellation_reason = COALESCE(?, cancellation_reason), version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?`)
@@ -1107,7 +1136,7 @@ export function resolveCancellation({ taskId, decision, expectVersion, actor = n
   return db.transaction(() => {
     const g = appModeGuard();
     if (g) return g;
-    const r = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
+    const r = db.prepare('UPDATE f_iroha_tasks SET cancellation_requested_at = NULL, cancellation_reason = NULL, cancellation_source = NULL, version = version + 1, updated_at = ?, updated_by = ? WHERE id = ? AND version = ?')
       .run(utcNow(), actor, t.id, t.version);
     if (r.changes === 0) return { ok: false, error: 'conflict', message: '他の端末で変更されています', current: getTask(t.id) };
     safeLogTaskEvent({ taskId: t.id, action: 'task_cancel_continued', workerId, workerName, deviceLabel, ok: true });

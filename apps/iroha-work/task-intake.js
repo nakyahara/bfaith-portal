@@ -178,7 +178,7 @@ export function mergeLinkConflict({ taskId, keep = 'import', actor = null }) {
   const db = getDB();
   if (keep !== 'import' && keep !== 'inbound') return { ok: false, error: 'bad_request', message: 'keep は import / inbound のどちらかです' };
   return db.transaction(() => {
-    const c = db.prepare(`SELECT t.id AS task_id, t.destination_id, d.notion_page_id, d.cancelled_at AS destination_cancelled_at, d.cancel_reason AS destination_cancel_reason, o.id AS other_task_id
+    const c = db.prepare(`SELECT t.id AS task_id, t.destination_id, d.notion_page_id, d.cancelled_at AS destination_cancelled_at, d.cancel_reason AS destination_cancel_reason, d.cancelled_by AS destination_cancelled_by, o.id AS other_task_id
       ${LINK_CONFLICT_FROM} AND t.id = ?`).get(Number(taskId));
     if (!c) return { ok: false, error: 'not_found', message: 'この衝突はもうありません (解消済みか、対象が変わりました)' };
     const intoId = keep === 'import' ? c.other_task_id : c.task_id;
@@ -232,7 +232,9 @@ export function mergeLinkConflict({ taskId, keep = 'import', actor = null }) {
       to: `keep=${keep} dest#${c.destination_id} page=${c.notion_page_id} moved=${JSON.stringify(moved)}${promoted ? ' ' + promoted : ''}`, workerName: who, ok: true });
     // ⑤ 行き先が取消済みなら、残す側にも取消を伝える (⭐消さない。「取消の確認」を付けて職員が決める) — 同じトランザクション
     let cancellation = null;
-    if (c.destination_cancelled_at) cancellation = requestCancellation({ destinationId: c.destination_id, source: 'inbound_reversal', reason: c.destination_cancel_reason || null, actor: who });
+    //   出どころは行き先の cancelled_by から (CSV 取込は 'import'、それ以外は入荷 iPad の人)。画面に出すので取り違えない (Codex R1)
+    if (c.destination_cancelled_at) cancellation = requestCancellation({ destinationId: c.destination_id,
+      source: c.destination_cancelled_by === 'import' ? 'inbound_import' : 'inbound_reversal', reason: c.destination_cancel_reason || null, actor: who });
     const keptNow = row(intoId);
     return { ok: true, kept: intoId, closed: fromId, moved, promoted, keptStatus: keptNow.status,
       cancellation: cancellation ? cancellation.action : null,

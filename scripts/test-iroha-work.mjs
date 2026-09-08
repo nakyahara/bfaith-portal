@@ -1241,7 +1241,8 @@ console.log('\n[17] アプリ正本化 (v1.1): 状態モデル・Notion 移行�
   ok(cB.action === 'review' && cB.task.cancellation_requested_at && TD.listTasksNeedingReview().some(t => t.id === tB.id), '着手済み (作業時間あり) の取消は要確認');
   ok(TD.resolveCancellation({ taskId: tB.id, decision: 'cancel', expectVersion: cB.task.version, isStaff: false }).error === 'staff_required', '取消の判断は職員のみ');
   const cont = TD.resolveCancellation({ taskId: tB.id, decision: 'continue', expectVersion: cB.task.version, isStaff: true, actor: 'たにがわ' });
-  ok(cont.ok && cont.task.cancellation_requested_at === null && cont.task.status === 'in_progress', '続行を選ぶと要確認が消える');
+  ok(cont.ok && cont.task.cancellation_requested_at === null && cont.task.cancellation_reason === null && cont.task.cancellation_source === null && cont.task.status === 'in_progress',
+    '続行を選ぶと要確認が消える (理由・出どころも消す — 次に理由なしの取消が来ても古い理由を出さない)');
   const tNew = TD.upsertTaskFromImport({ notion_page_id: 'fresh-1', status: 'not_started', destination_id: 9100, product_code: 'FRESH', product_name: '未着手だけ' }, { batchId: 'test-batch-4' });
   const cN = TD.requestCancellation({ destinationId: 9100, source: 'inbound_import', reason: 'line_removed' });
   ok(cN.action === 'review' && cN.task.status === 'not_started' && cN.task.closed_at == null && cN.task.cancellation_requested_at,
@@ -2863,11 +2864,12 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(p3.inb).c === 2 && /読み直して/.test(r4.json.note), '作業時間は残す側に集まる。応答に再読込の案内');
       // (5) 行き先が取消済み → 統合後に残す側へ取消を伝える (⭐消さない。「取消の確認」を付けて残す)
       const p5 = mkPair(9963, 'MERGE-C5');
-      db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = '2026-09-03T04:00:00Z' WHERE id = 9963").run();
+      db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = '2026-09-03T04:00:00Z', cancelled_by = 'import', cancel_reason = 'line_removed' WHERE id = 9963").run();
       const r5 = await merge(p5.inb, 'import');
       const k5 = TD.getTask(p5.imp);
-      ok(r5.status === 200 && r5.json.cancellation === 'review' && k5.status !== 'closed' && k5.cancellation_requested_at && k5.destination_id === 9963,
-        '取消済み行き先の統合は、残す側に「取消の確認」が付く (自動では消さない)');
+      ok(r5.status === 200 && r5.json.cancellation === 'review' && k5.status !== 'closed' && k5.cancellation_requested_at && k5.destination_id === 9963
+        && k5.cancellation_source === 'inbound_import' && k5.cancellation_reason === 'line_removed',
+        '取消済み行き先の統合は、残す側に「取消の確認」が付く (自動では消さない)。出どころは行き先の cancelled_by から (CSV 取込なら inbound_import) — 画面に出すので取り違えない');
       // (6) 消える側に取消の要求 (要確認) があれば残す側へ引き継ぐ
       const p6 = mkPair(9964, 'MERGE-C6', { importStatus: 'in_progress' });
       db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T05:00:00Z', cancellation_source = 'inbound_reversal' WHERE id = ?").run(p6.inb);
@@ -3852,7 +3854,7 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
   ok(/const done = c\.done_qty;/.test(html) && !/c\.done_qty \|\| 0/.test(html),
     'できた数は「まだ数えていない (null)」と「0 個」を混ぜない (0 で代用しない — 要件 §U)');
   ok(/function memoHtml\(c\)/.test(html) && /📝 中断メモ \(前の人からの申し送り\)/.test(html)
-    && /sealHtml\(c\) \+ blockedHtml\(c\) \+ cancelBanHtml\(c\) \+ careHtml\(c\) \+ memoHtml\(c\)/.test(html),
+    && /sealHtml\(c\) \+ blockedHtml\(c\) \+ cancelBanHtml\(c\) \+ relatedHtml\(c\) \+ careHtml\(c\) \+ memoHtml\(c\)/.test(html),
     '中断メモ・止まっている理由・入荷側の取消はカードを開いたらすぐ見えるところに出す (次にやる人が読む)');
   // ⭐入荷側で取り消されたカードの枠 (2026-09-08): 消えない・理由が出る・職員だけが 続ける/取り消す を押せる
   ok(/function cancelBanHtml\(c\)/.test(html) && /入荷側で取り消されました — 職員の判断待ち/.test(html) && /このカードは自動では消えません/.test(html),
@@ -3862,6 +3864,10 @@ console.log('\n[22] 作業画面の構造 (別画面から戻れる・クリッ�
     '続ける/取り消す のボタンは task.cancellation の許可があるときだけ描く (無効化して見せない — §U-7)');
   ok(/apiFetch\('\/api\/cancellation'/.test(html) && /decision, worker_id: w\.id, pin, expect_version: c\.version/.test(html),
     '職員の判断は /api/cancellation に version つきで送る (他の端末の変更と競合しない)');
+  // ⭐同じ入荷の新旧カードを互いに出す (取消後の確認し直しで二重作業にならない — Codex R1)
+  ok(/function relatedHtml\(c\)/.test(html) && /同じ入荷のカードが他にあります/.test(html) && /二重に作業しないでください/.test(html)
+    && /🔁 同じ入荷のカードが他に ' \+ c\.related\.length \+ ' 枚/.test(html) && /この入荷は新しいカード ' \+ newer\.map\(relCardTxt\)/.test(html),
+    '新しい側には「同じ入荷のカードが他にある」、旧側 (取消の枠) には「新しいカードで確認し直されている」を出す');
   ok(/'cancellation_requested_at', 'cancellation', 'migration_review'/.test(html),
     '1 枚だけ差し替えるときも取消の理由を持ち越す (CARD_FIELDS)');
   // ⛔ 止まっている理由の札 (要件 §Y-2 = 案A、中原さん 2026-09-05)

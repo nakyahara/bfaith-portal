@@ -1595,6 +1595,7 @@ function rowTags(c, opts) {
   if (c.blocked) h += '<span class="tag blocked">⛔ ' + esc(c.blocked.label) + 'で止まっています</span>';
   if (c.today) h += '<span class="tag today">📌 今日やる</span>';
   if (c.cancellation_requested_at) h += '<span class="tag urgent">⚠ 入荷側で取消 — 職員の判断待ち</span>';
+  if (c.related && c.related.length) h += '<span class="tag miss">🔁 同じ入荷のカードが他に ' + c.related.length + ' 枚</span>';
   if (c.migration_review) h += '<span class="tag miss">❓ 状態の確認待ち</span>';
   if (c.external_ready) h += '<span class="tag ready">📦 外部に出せます</span>';
   if (c.facility_code && c.facility_code !== 'iroha') h += '<span class="tag ext">🏢 ' + esc(facilityName(c.facility_code)) + '</span>';
@@ -3879,7 +3880,7 @@ function renderDetail(c, opts) {
         (c.ar_no ? ' ・ ' + esc(c.ar_no) : '') + '</div>' +
       headNumsHtml(c) +
       '</div></div>' +
-      sealHtml(c) + blockedHtml(c) + cancelBanHtml(c) + careHtml(c) + memoHtml(c) + awayHtml(c) + consignBtnHtml(c) +
+      sealHtml(c) + blockedHtml(c) + cancelBanHtml(c) + relatedHtml(c) + careHtml(c) + memoHtml(c) + awayHtml(c) + consignBtnHtml(c) +
       '</div>' +
     prevCardHtml(c) +
     batchesCardHtml(c) +
@@ -4644,15 +4645,32 @@ function cancelBanHtml(c) {
   const reason = k ? k.reason_label : '入荷側で取り消されました';
   const src = k ? k.source_label : '入荷側';
   const canDecide = isApp() && detailSrc !== 'preview' && stateCan('task.cancellation');
+  // ⭐同じ入荷が確認し直されて新しいカードがあるなら、そちらを指す (旧カードで作業を続けると二重になる)
+  const newer = (c.related || []).filter((r) => r.newer);
+  const newerTxt = newer.length ? '<span class="sub"><b>この入荷は新しいカード ' + newer.map(relCardTxt).join('・') + ' で確認し直されています。</b>' +
+    '作業はそちらで。このカードは「取り消す」が正しいことが多いです</span>' : '';
   return '<div class="blockban cancel"><span class="ic" aria-hidden="true">⚠</span><div>' +
     '<b>入荷側で取り消されました — 職員の判断待ち</b>' +
-    '<span class="sub">' + esc(reason) + (when ? ' (' + esc(src) + ' ・ ' + esc(when) + ')' : '') + '</span>' +
+    '<span class="sub">' + esc(reason) + (when ? ' (' + esc(src) + ' ・ ' + esc(when) + ')' : '') + '</span>' + newerTxt +
     '<span class="sub">このカードは自動では消えません。いろはの職員が「続ける」か「取り消す」かを決めます' +
       (canDecide ? '' : '。職員に声をかけてください') + '</span></div>' +
     (canDecide
       ? '<div class="acts"><button class="btn" onclick="resolveCancel(\'continue\')">このまま続ける (職員)</button>' +
         '<button class="btn stop" onclick="resolveCancel(\'cancel\')">取り消す (職員)</button></div>'
       : '') + '</div>';
+}
+const REL_ST = { not_started: '未着手', in_progress: '作業中', ready_for_stocking: '棚入待ち' };
+const relCardTxt = (r) => '#' + r.id + ' (' + (REL_ST[r.status] || r.status) + (r.cancellation_requested_at ? '・確認待ち' : '') + ')';
+/**
+ * 🔁 同じ入荷の他のカード。取消の枠が無いカード (= 確認し直しでできた新しい側) に出す。
+ * 旧カードが確認待ちのまま残っている間、両方で作業すると二重になる → 職員が旧を片づけるまで注意を促す
+ */
+function relatedHtml(c) {
+  const rel = c.related || [];
+  if (!rel.length || c.cancellation_requested_at) return '';   // 取消の枠のあるカードはそちらで言う
+  return '<div class="blockban cancel"><span class="ic" aria-hidden="true">🔁</span><div>' +
+    '<b>同じ入荷のカードが他にあります: ' + rel.map(relCardTxt).join('・') + '</b>' +
+    '<span class="sub">入荷側で確認し直されたぶんです。職員が古いほうを片づけるまで、二重に作業しないでください</span></div></div>';
 }
 /** 職員が 続ける / 取り消す を決める。職員モードでなければ職員PINを聞く (redoBatch と同じ約束) */
 async function resolveCancel(decision) {

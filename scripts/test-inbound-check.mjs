@@ -538,6 +538,14 @@ console.log('\n[PR-B] いろは行きの確定 → 在庫化アプリのタス�
   const d1cId = destIdOf('AR9|1|1');
   ok(f1c.ok && d1cId && d1cId !== d1.id && taskOf(d1cId)?.status === 'not_started' && taskOf(d1.id).cancellation_requested_at && taskOf(d1.id).status !== 'closed',
     '再確認すると新しいタスク (前のタスクは確認待ちのまま残る — 職員が片づける)');
+  {
+    // ⭐同じ入荷明細から生まれた新旧カードは、互いに「関連カード」として見える (二重作業を防ぐ — Codex R1)
+    const rel = TD.relatedByInboundLine(db);
+    const oldId = taskOf(d1.id).id, newId = taskOf(d1cId).id;
+    ok(rel.get(newId)?.some((r) => r.id === oldId && r.cancellation_requested_at && !r.newer) && rel.get(oldId)?.some((r) => r.id === newId && r.newer),
+      '⭐新旧カードが互いを関連カードとして持つ (新しい側には「確認待ちの旧カード」、旧側には「新しいカード」)');
+    ok(!rel.has(taskOf(destIdOf('AR9|2|1'))?.id ?? -1), '関係の無い明細のカードには付かない');
+  }
   // 再取込で確認を引き継げない行 (予定数が変わった) → 行き先が取り消され、タスクも取消
   const imp2 = importCsv(makeCsv([row('AR9', 1, 'TASK-A', 7), row('AR9', 2, 'TASK-B', 3), row('AR9', 3, 'TASK-C', 2)]), { fileName: 'prb2.csv', generatedAt: '2027-01-01T01:00:00Z' });
   ok(imp2.ok, '前提: 予定数が変わった再取込');
