@@ -22,7 +22,6 @@
 | `/apps/inbound-check/api/info/register` (POST) | 同上 | 入庫情報が無い商品を登録する |
 | `/apps/inbound-check/api/product-flags` (POST) | 同上 | 期限管理 あり/なし を切り替える |
 | `/apps/inbound-check/api/lines/pending-expiry` (POST) | 同上 | 有効期限の先入力 (詳細パネル。入れてあれば確認時に聞かない) |
-| `/apps/inbound-check/api/notion-sync` (POST) | 同上 | Notion 作業カードを今すぐ送る (iPadのヘッダーボタン。冪等) |
 | `/apps/inbound-check/api/refresh-now` (POST) | 同上 | 🚚 **いま入荷を取りに行く** (miniPC にロジザードから CSV を出し直させて取り込む。予定外の納品用) |
 | `/apps/inbound-check/done` | 登録端末 or セッション | **完了一覧** (確認し終えた伝票の 商品・数量・期限。画像なし・印刷可) |
 | `/apps/inbound-check/api/done` `/done.csv` | 同上 | 完了一覧の JSON / CSV |
@@ -52,13 +51,17 @@ server.js では `requireAppAccess` を掛けずに mount する (端末Cookie �
 ```
 
 - 明細キー = `AR番号|入荷管理行番号|入荷管理詳細行番号`。商品IDはキーにしない
-- **取込は fail-closed**: 必須列欠落 / 列数不一致 / 数値でない予定数 / AR空 / 明細キー重複 / 同一ハッシュ / 生成時刻が active より古い → 拒否して active を据え置く。**0件は正常** (行数の前回比ガードは置かない)
+- **取込は fail-closed**: 必須列欠落 / 列数不一致 / 数値でない予定数 / AR空 / 明細キー重複 / 同一ハッシュ / 生成時刻が active より古い → 拒否して active を据え置く
+  - 🚨**0 行の CSV も断る** (2026-09-08。確認ずみの行が 1 行でもあるとき)。取得が 0 行なのは「入荷が片づいた」ではなく「取りに行けなかった」証拠。
+    管理画面のアップロードだけ、件数を見て「それでも取り込む」で通せる (合言葉 `force_token`)。§「明細が消えても行き先とカードは残す」も参照
 - **確認状態は再取込をまたいで引き継ぐ。日をまたいでも引き継ぐ** (中原さん 2026-09-07。旧: 同日だけ)
   - ⭐miniPC は **08:40 と 11:45 の1日2回**取り込む。引き継ぎが無いと、**午前中に新しい受付が1件でも
     登録された日は 11:45 の取込で午前の ✅ が全部消える** (同内容の CSV は file_hash 重複で弾かれるので
     新しい受付があった日だけ起きる)。バッチに `work_date` (JST) を持たせて防ぐ
   - 引き継ぐ条件 = **明細キー (AR|行|詳細行) と商品 (code_key) と予定数 が全部同じ**。
-    予定数が変わった / 商品が差し替わった明細は、数えたものが違うので必ず未確認に戻す
+    予定数が変わった / 商品が差し替わった明細は、数えたものが違うので必ず未確認に戻す (入荷側の台帳の行き先だけ取消。**いろはのカードには何もしない**)
+  - ⭐**新しい CSV から明細ごと消えた確認ずみの行は、行き先もいろはのカードも残す** (中原さん 2026-09-09)。
+    一覧から外れるだけ。§「明細が消えても行き先とカードは残す」
   - 🚨**翌日リセット (要件定義 §2 確定事項⑤) は 2026-09-07 に廃止**。前提だった「検品済みの伝票は翌日
     CSV から消える」が実際には成り立たず (ロジザードで検品されるまで受付済のまま残る)、
     **前日やり残した伝票を翌朝ゼロから数え直す**ことになっていたため。§「業務日の繰り越し」を参照
@@ -629,40 +632,81 @@ miniPC auto-shohin-csv.js (Logizard-NyukaCSV の2ステップ目・1日1回)
 
 倉庫の iPad で管理者としてログイン → 管理画面「この端末を登録」 → トークンは httpOnly Cookie `ic_device` (path=/apps/inbound-check、400日) としてその端末だけに渡り、**同時に管理者セッションを破棄**する (共用端末に管理者ログインを残さない)。⚠ ホーム画面に追加した PWA から開いて登録する (Safari 本体と Cookie 保存領域が別)。
 
-## いろはへの作業指示 = 在庫化アプリの「未着手」 (Notion は 2026-09-05 に廃止)
+## いろはへの作業指示 = 在庫化アプリの「未着手」 (Notion は 2026-09-05 廃止 → 2026-09-09 コード削除)
 
 「いろはで在庫化」と確定した明細 (`f_inbound_check_destinations`) は、**確認と同じトランザクションで
 在庫化アプリ (`apps/iroha-work`) の `f_iroha_tasks` に未着手として入る** (`iroha-work/task-intake.js createTaskForDestination`)。
-やり直し・再取込で行が消えた場合の取消も同じ経路 (`requestCancellation`)。iPad の在庫化アプリは即時にそれを見る。
+iPad の在庫化アプリは即時にそれを見る。
 
-- **Notion「在庫化作業管理」は 2026-09-05 に運用廃止** (中原さん)。17:30 の cron・30分巡回への相乗り・台帳
-  `inbound-check-notion-cards` は外した (`config/jobs-registry.mjs` の `RETIRED_JOBS` に退役記録)。
-  iPad の「🗂 Notionへ送る」は出ない。`POST /api/notion-sync` `/admin/notion-sync` は 410 `notion_retired`
-- 退路: 在庫化アプリの `/admin/source` で正本を `notion` に戻したときだけ、上のボタンと API が従来どおり動く
-  (自動送信は戻らない — 手動のみ)。`notion-sync.js` はそのために残してある
-- 正本の切替そのものと取込・紐付けの衝突は在庫化アプリ側 (`/apps/iroha-work/admin`)。
-  正本 = `f_iroha_app_meta.source_of_truth` (`iroha-work/db.js sourceOfTruth()`)
+🚨**入荷側はカードを作るだけ。消す・取消の確認を付ける経路は一切無い** (中原さん 2026-09-09:「いろはのアプリには
+新規カードを作るだけ。削除は絶対にダメ」)。やり直し (`reopenLine`) も再取込で商品・予定数が変わった行も、
+取り消すのは入荷側の台帳 (`f_inbound_check_destinations.cancelled_at`) だけで、`requestCancellation` は呼ばない
+(2026-09-08〜09 の間だけ「取消の確認」を付けていたが撤去)。確認し直すと新しいカードがもう 1 枚でき、古いカードは
+在庫化アプリの「関連カード」として並ぶ。要らないほうはいろはの職員が終了にする。次節も参照。
 
-### (廃止前の設計メモ — notion-sync.js を読むときの参考。**以下はすべて廃止済み・現在は動いていない**)
+最後まで残っていた口は、いろはの職員が 2 枚のカードを統合するとき (`iroha-work/task-intake.js mergeLinkConflict`) に
+行き先が取消済みなら残す側へ札を付ける処理だったが、これも 2026-09-09 に撤去した。そもそもこの衝突は
+**Notion が正本だった時期にしか作られない** (`f_inbound_check_destinations.notion_page_id` を書いていた送信のコードは
+2026-09-09 に削除済みで、新しく入ることはない) ので、起き得ない場合のために入荷側の状態がカードへ書き込む口を
+残す理由が無い。結果として `requestCancellation` を呼ぶアプリのコードは 1 か所も無い (テストのみ)。
+2026-09-08 に札が付いたままのカードを職員が片づける道 (`resolveCancellation` = 続ける / 取り消す) はそのまま。
 
-- 1日1回 17:30 JST に一括送信していた (`runNotionSweep`)。都度送信にしなかったのは、当日中のやり直し
-  (確認→取消→再確認) を送信前に収束させるため (中原さん 2026-09-02)。**cron は削除済み**
-- **outbox + reconcile**: 送信状態は台帳の行に持つ (`notion_page_id` / `notion_synced_at` / …)。
-  カードには**台帳キー** (行ごとの永続ランダムキー。作成前に DB へ保存) を必ず入れ、作成前に
-  同キーで検索して回収する (「作成成功→記録前に停止」の二重カード防止。行IDは DB 作り直しで
-  振り直されるため回収キーにしない)。送信後に取り消された行はカードをステータス**「取消」**に倒し、
-  取消時のカードが未着手以外なら管理画面の要確認一覧に出す (取消済みの作業指示を有効に見せない)。
-  「作成成功→記録前に停止→取消」で孤立したカードも台帳キー検索で回収して「取消」へ収束させる
-- 取消の反映と一時エラーの再試行は 30 分巡回に相乗りしていた (`mode='retry'`。既存 Drive cron の
-  1ステップ。新規カードの送信は 17:30 の一括のみ)。**相乗りは削除済み** — 退路で手動送信したときの
-  多重実行防止 (プロセス内フラグ + SQLite lease) だけが生きている
-- 4xx (429/409 以外。スキーマ不整合等) は自動再試行しない — 管理画面に出て「再送」で解除。
-  依存プロパティの**型**も送信前に検証し、合わなければ行に書き散らさず sweep 1回の失敗にする
-- env: 退路の手動送信に要るのは `NOTION_TOKEN` (既存インテグレーション共用) と `INBOUND_CHECK_NOTION_DB_ID` だけ。
-  `INBOUND_CHECK_NOTION_CRON` / `INBOUND_CHECK_NOTION_ENABLED` は**もう読まない** (残っていても無害。
-  設定しても cron は戻らない)
-- 台帳 `inbound-check-notion-cards` は**退役済み** (`config/jobs-registry.mjs` の `RETIRED_JOBS` に記録。
-  現役の台帳には無く、jobs-monitor も評価しない)
+## 🧾 明細が消えても行き先とカードは残す (2026-09-09)
+
+中原さん 2026-09-09 (朝):「前日の取り込んだ分はいろは在庫化のやつはそれで残ってて、新しく入ってきたらまた
+新しいやつを取り込むのが通常なはず」。
+
+**起きたこと**: 前日に確認した 19 行 (いろは 8 件) が全部倉庫で検品されて CSV から消え、新しい伝票 2 件だけの
+CSV になった朝、iPad の「いま取りに行く」が
+「この CSV には、いま確認ずみの行き先 19 件が 1 つも残りません … いろはの在庫化カードも消えるため、取り込みませんでした」
+と断り、新しい伝票が一覧に出なかった。
+
+**原因は 2 段**:
+1. 取込に「新しい CSV から消えた確認ずみの行は行き先を取り消す (`line_removed`)」規則があった
+   (#1223 Codex PR-B R1 #1「消えた明細の作業指示が生き続けていた」)。前提は「消える = 伝票の明細が削除された」。
+   実際は CSV を「受付済」で絞っているので、**消える理由はほぼ検品が進んだこと**。荷物は届いていて、
+   いろはの在庫化はこれから行う。取り消す理由にならない
+2. その規則が 9/8 の 0 行 CSV で全カードを消したため、#1263 が「確認ずみの行き先がひとつ残らず取り消される取込を断る
+   (`mass_cancel`)」歯止めを足した。歯止めは規則を前提に正しく動いたが、**前日ぶんが全部検品されて新しい伝票だけが
+   来る朝**は同じ形になるので、通常の流れを止めてしまった。CSV からその 2 つは見分けられない
+
+**直し方 = 規則そのものを外す** (`db.js planCancellations`):
+- 明細ごと消えた確認ずみの行 → 行き先 (`f_inbound_check_destinations`) もいろはのカード (`f_iroha_tasks`) もそのまま。
+  一覧から外れるだけ。取込履歴に「確認済み N行は検品が進んで一覧から外れました」と残す
+- 入荷側の台帳で取り消すのは〈明細は在るが数えたものが違う〉`product_changed` / `planned_changed` の 2 本だけ。
+  これもいろはのカードには伝えない (前節)
+- `mass_cancel` は撤去。守る物が無くなり、通常の朝と見分けられないため
+- **0 行の CSV を断るのは残す** (`guardEmptyCsv`)。理由が変わった: カードを守るためではなく、
+  まだ検品されていない (次の CSV にまた出てくる) 確認ずみの行の ✅ を次の取込で引き継げなくなる
+  (引き継ぎは直前の active しか見ない) のを避けるため。出てきた行を確認し直すと同じ明細に 2 枚目のカードができる
+- 本当に伝票の明細が削除されたときは、いろはの職員がカードを見て終了にする (在庫化アプリ側で決める。
+  2026-09-08「一度いろはに送ったカードは残り続ける。入荷側の都合で勝手に変えない」と同じ向き)
+
+### 🗂 旧 Notion「在庫化作業管理」— 2026-09-05 運用廃止 → 2026-09-09 コード削除
+
+中原さん 2026-09-09:「ややこしいから旧 notion の部分のコード消しといて」。**入荷受付チェックに Notion は残っていない**。
+
+消したもの:
+- `notion-sync.js` (17:30 の一括送信・取消の収束 sweep・outbox・lease) と `notion.js` (Notion HTTP クライアント)
+- `POST /api/notion-sync` `/admin/notion-sync` と、iPad の「🗂 Notionへ送る」・管理画面の Notion 節
+- 送信の途中経過を持っていた `notion_*` 列 (`synced_at` / `payload` / `error` / `attempt_count` / `next_retry_at` /
+  `cancelled_at` / `cancel_error` / `cancelled_prev_status` / `dedupe_key` / `cancel_*`) と `f_inbound_check_notion_lease`
+  をスキーマから外した (既存 DB に残っている列・表はそのまま = 過去データは消さない)
+- テスト `scripts/test-inbound-check-notion.mjs`
+
+残したもの:
+- `f_inbound_check_destinations.notion_page_id` — 在庫化アプリの「紐付けの衝突」が Notion 時代の行を今も引くため
+- `apps/inbound-check/enrich.js` — sweep の中にあった純粋な集計 (`buildEnrichContext` / `calcExternal`)。
+  Notion と無関係で、いろは在庫化アプリ (`iroha-work/service.js`) が現役で使う
+- `apps/iroha-work/notion-client.js` — 旧 `inbound-check/notion.js` の移設先。**いろは作業アプリ側の Notion**
+  (カード読み取り `notion-read.js`・完成写真の送信 `media.js`・移行ツール `migrate.js`) はこの変更の対象外で、
+  従来どおり動く。カード作成系 (`createCard` 等) は送信専用だったので消してある
+- 台帳 `inbound-check-notion-cards` の**退役記録** (`config/jobs-registry.mjs` の `RETIRED_JOBS`)
+
+🚨**退路は無くなった**: 在庫化アプリの `/admin/source` で正本を `notion` に戻しても、
+入荷受付チェックから Notion へカードを送ることはもうできない (送る先の画面も API も無い)。
+正本の切替そのものと取込・紐付けの衝突は従来どおり在庫化アプリ側 (`/apps/iroha-work/admin`)。
+
 - **いろは作業仕様マスタ (`f_iroha_work_master`)** = 旧スプレッドシート「作業内容管理マスター」の置き換え (work-master.js)。
   カードの 資材セットID・収納容器・入数・工程数・備考 はここから載る (未整備の商品は送らない — それが正常)。
   取込は管理画面から xlsx をアップロード: 既定 **dry-run** (検証レポート) → 内容を見てから本取込。
@@ -670,8 +714,8 @@ miniPC auto-shohin-csv.js (Logizard-NyukaCSV の2ステップ目・1日1回)
   不正値を null で取り込むと既存値を黙って消すため (Codex PR2 High-1)。
   **本取込はマスタ全体を xlsx で置き換える** — xlsx に無い既存行は**削除**される
   (廃止した作業仕様を残さない。画面の個別編集・追加より一括取込が正。削除予定は dry-run で予告)。
-  カードは**作成時スナップショット** — 後からのマスタ変更は既存カードに反映しない (直すなら Notion 側で。
-  自動同期を移植しないのは Codex設計相談R1 質問2-5 の決定)。
+  カードは**作成時スナップショット** — 後からのマスタ変更は既存カードに反映しない
+  (自動同期を移植しないのは Codex設計相談R1 質問2-5 の決定)。
   **在庫化必要FLG は廃止** (中原さん 2026-09-02「もうつかわない」) — xlsx に列があっても完全に読み飛ばし、
   カードにも送らない。在庫化要否の正本は `f_inbound_info.いろは在庫化作業有無` (荷受け時のその場選択で育つ) のみ。
   ⚠カードの「入数」= `units_per_container` (いろはで1容器に詰める数)。f_inbound_info の入数 (仕入箱) とは別概念で統合しない
@@ -684,7 +728,6 @@ node scripts/test-inbound-check-enroll.mjs                 # 端末の登録コ�
 node scripts/test-inbound-check-drive.mjs                  # Drive 自動取込 (17 項目)
 node scripts/test-inbound-check-product-master.mjs         # 商品マスタ取込 = 期限管理 (40 項目)
 node scripts/test-inbound-check-render.mjs                 # iPad 画面のレンダリング (状態ごとの主ボタン・数量パネル)
-node scripts/test-inbound-check-notion.mjs                 # Notion 作業カード sweep (API はモック)
 node scripts/test-inbound-check-work-master.mjs            # いろは作業仕様マスタ (xlsx取込・全置換・編集)
 node scripts/smoke-inbound-check-http.mjs [CA04001_*.csv]  # server.js を起動して HTTP 経路
 ```

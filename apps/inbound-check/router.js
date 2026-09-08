@@ -31,10 +31,6 @@ import {
 import { fetchAndImportFromDrive, statusForView, driveConfig, fetchAndImportProductMaster, fetchAndImportBarcodeMaster } from './drive-fetch.js';
 // 🚚 予定外の納品を今すぐ iPad に出す (miniPC にロジザードから CSV を出し直させて取り込む)
 import { startRefresh, refreshState, refreshConfigured } from './logizard-refresh.js';
-import { runNotionSweep, notionStatusForAdmin, resetNotionRow } from './notion-sync.js';
-// いろはの作業指示の正本 (app | notion)。2026-09-05 に Notion は運用廃止 → 通常は 'app'。
-// 'notion' は在庫化アプリ /admin/source で戻したときの退路で、そのときだけ Notion 送信の入口を開ける
-import { sourceOfTruth as irohaSourceOfTruth } from '../iroha-work/db.js';
 import {
   parseWorkMasterXlsx, applyWorkMaster, logWorkMasterImport,
   workMasterStats, searchWorkMaster, updateWorkMasterRow, addWorkMasterRow, importIssueCount, computeDeletions,
@@ -340,8 +336,6 @@ router.get('/api/state', api((req, res) => {
     print_agents: agents.map(a => ({ id: a.id, label: a.label, printer_name: a.printer_name, online: a.online, bpac: a.bpac, paper_ok: a.paper_ok })),
     // 🚚 「いま取りに行く」の進み具合 (押した後の表示はこれを5秒ポーリングで見る)
     refresh: refreshState(),
-    // いろはの作業指示の正本。'app' (通常) なら iPad の「🗂 Notionへ送る」は出さない (Notion は 2026-09-05 に廃止)
-    iroha_source: irohaSourceOfTruth(),
     workers: listWorkers(false),
     me: { session: req.icUser || null, device: req.icDevice ? { id: req.icDevice.id, label: req.icDevice.label } : null, admin: isAdmin(req) },
   });
@@ -444,7 +438,7 @@ router.post('/api/products/print-status', checkOrigin, api((req, res) => {
 router.post('/api/refresh-now', checkOrigin, api((req, res) => {
   let actor;
   if (req.icDevice) {
-    // 誰が押したかを残す (現場の端末は共用なので作業者を必須にする — Notion送信と同じ規約)
+    // 誰が押したかを残す (現場の端末は共用なので作業者を必須にする)
     const w = resolveWorker(req);
     if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
     actor = `device:${req.icDevice.label}/${w.worker}`;
@@ -793,41 +787,9 @@ router.post('/api/lines/pending-expiry', checkOrigin, api((req, res) => {
   res.status(r.ok ? 200 : (r.error === 'not_found' ? 404 : 409)).json(r);
 }));
 
-// ─── Notion へ今すぐ送る (iPad からも押せる) ───
-// 🚫 2026-09-05 Notion「在庫化作業管理」は運用廃止。いろは行きの作業指示は「確認」と同じトランザクションで
-//    在庫化アプリ (f_iroha_tasks) の未着手に入るので、送る操作そのものが無い。正本がアプリの間は 410 を返す。
-//    (在庫化アプリ /admin/source で Notion に戻した退路のときだけ、従来どおり送れる)
-// 中原さん 2026-09-02:「iPadにボタンがあれば便利」。sweep は冪等 (何回押しても二重カードにならない) で
-// lease が多重実行も防ぐ。端末Cookie経由は**作業者必須** (誰が押したかを actor に残す) +
-// 30秒のレート制限 (連打・端末Cookie漏えい時の外部API負荷を抑える — Codex #1116 Med-5)
-const NOTION_RETIRED = {
-  ok: false, error: 'notion_retired',
-  message: 'Notion の在庫化作業管理は廃止されました。いろは行きの商品は「確認」した時点で在庫化アプリの「未着手」に入っています',
-  app_url: '/apps/iroha-work/',
-};
-let notionSyncLastAt = 0;
-router.post('/api/notion-sync', checkOrigin, api(async (req, res) => {
-  if (irohaSourceOfTruth() === 'app') return res.status(410).json(NOTION_RETIRED);
-  let actor;
-  if (req.icDevice) {
-    const w = resolveWorker(req);
-    if (w.error) return res.status(400).json({ ok: false, error: 'worker_required', message: w.error });
-    actor = `device:${req.icDevice.label}/${w.worker}`;
-  } else {
-    actor = req.session?.email || 'portal';
-  }
-  const now = Date.now();
-  if (now - notionSyncLastAt < 30_000) {
-    // ⚠「失敗」ではない。直前の実行は走っている (押し直しても二重カードにはならないが、
-    //   外部APIの連打を避けるためのクールダウン)。失敗と誤読されない文言にする
-    const wait = Math.ceil((30_000 - (now - notionSyncLastAt)) / 1000);
-    return res.status(429).json({ ok: false, error: 'rate_limited',
-      message: `さっき送ったばかりです (直前の送信は実行済み)。${wait}秒あけてもう一度押せます` });
-  }
-  notionSyncLastAt = now;
-  const r = await runNotionSweep({ actor, mode: 'full' });
-  res.status(r.ok ? 200 : (r.error === 'already_running' ? 409 : 502)).json(r);
-}));
+// (2026-09-09 削除) Notion「在庫化作業管理」への送信 (POST /api/notion-sync ・ /admin/notion-sync) は
+//   2026-09-05 の運用廃止に続いてコードごと消した。いろは行きの作業指示は「確認」と同じ
+//   トランザクションで在庫化アプリ (f_iroha_tasks) の未着手に入る (iroha-work/task-intake.js)。
 
 // ─── 行き先の台帳 (いろはへ送る商品の一覧) ───
 // アプリ利用者なら誰でも見られる (いろはへの持ち出しリストは事務担当も使うため)
@@ -861,8 +823,6 @@ router.get('/admin', requireSession, api(async (req, res) => {
   const activeBatch = getActiveBatch();
   let drive = null;
   try { drive = await statusForView(); } catch (e) { drive = { driveError: e.message, config: driveConfig() }; }
-  let notion = null;
-  try { notion = notionStatusForAdmin(); } catch (e) { notion = { error: e.message }; }
   let workMaster = null;
   try { workMaster = workMasterStats(); } catch (e) { workMaster = { error: e.message, total: 0, filled: 0 }; }
   res.render(path.join(__dirname, 'views/admin'), {
@@ -884,7 +844,6 @@ router.get('/admin', requireSession, api(async (req, res) => {
     PRINT_STATE_LABELS,
     workers: listWorkers(),   // = スタッフマスタの有効スタッフ (表示のみ。編集は /apps/staff)
     drive,
-    notion,
     workMaster,
     // 🚚 「いま取りに行く」が使える環境か (miniPC を呼べる資格情報があるか)
     refreshAvailable: refreshConfigured(),
@@ -902,9 +861,9 @@ router.post('/admin/upload', requireSession, checkOrigin, upload.single('file'),
   const lm = Number(req.body?.file_modified);
   const now = Date.now();
   const generatedAt = Number.isFinite(lm) && lm > 0 ? new Date(Math.min(lm, now)).toISOString() : null;
-  // ⭐確認ずみの行き先が一斉に取り消される取込は既定で断る (2026-09-08 の事故)。
+  // ⭐0 行の CSV は既定で断る (2026-09-08 の事故。取得不良を「入荷が片づいた」と読み替えない)。
   //   人が画面で件数を見て押したときだけ通す。合言葉は断ったときに返した force_token で、
-  //   **取り消す予定の中身そのもの**から作ってあるので、確認してから押すまでに対象が変われば通らない
+  //   **失う一覧の中身そのもの**から作ってあるので、確認してから押すまでに対象が変われば通らない
   const force = typeof req.body?.force === 'string' && req.body.force ? req.body.force : null;
   const r = importCsv(buf, { fileName: req.file.originalname, source: 'manual_upload', actor: req.session.email, generatedAt, force });
   if (!r.ok) return res.status(r.error === 'bad_csv' ? 400 : 409).json(r);
@@ -923,20 +882,6 @@ router.post('/admin/fetch-drive', requireSession, checkOrigin, api(async (req, r
   } catch (e) {
     res.status(502).json({ ok: false, error: 'drive_error', message: e.message });
   }
-}));
-
-// ─── Notion 作業カード (いろは行き) を今すぐ送る ───
-// 1日1回 (17:30 JST) の cron と同じ reconcile。夕方を待たずに送りたいとき・エラー後の再送用。
-// 取込と同じく「アプリ利用者なら誰でも」(事務担当が押せるように)。
-// retry_id を渡すと、その行のエラーブロック (4xx で止めた分) を解除してから実行する
-router.post('/admin/notion-sync', requireSession, checkOrigin, api(async (req, res) => {
-  if (irohaSourceOfTruth() === 'app') return res.status(410).json(NOTION_RETIRED);   // 2026-09-05 Notion 廃止
-  const retryId = Number(req.body?.retry_id);
-  if (Number.isInteger(retryId) && retryId > 0) resetNotionRow(retryId);
-  // 「再送」(retry_id あり) はエラー行の再処理だけ (mode='retry')。正常な新規行まで
-  // 17:30 を待たずに送ってしまわない (Codex R2 #5)。「今すぐ送る」ボタンだけが full
-  const r = await runNotionSweep({ actor: req.session.email, mode: retryId ? 'retry' : 'full' });
-  res.status(r.ok ? 200 : (r.error === 'already_running' ? 409 : 502)).json(r);
 }));
 
 // ─── いろは作業仕様マスタ (旧「作業内容管理マスター」シートの DB 化) ───

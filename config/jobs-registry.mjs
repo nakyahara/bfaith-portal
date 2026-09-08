@@ -919,7 +919,8 @@ export const RETIRED_JOBS = [
     reason: 'Notion「在庫化作業管理」の運用廃止 (中原さん)。いろは行きの作業指示は「確認」と同じトランザクションで'
       + '在庫化アプリ (apps/iroha-work f_iroha_tasks) の未着手に入るようになった (2026-09-03 PR-B #1153) ので、'
       + '17:30 の一括送信 (apps/inbound-check/sync-job.js startInboundCheckNotionCron) と 30分巡回への相乗りを外した。'
-      + 'カード生成は定期実行ではなく同期処理なので、置き換え先の台帳エントリは無い',
+      + 'カード生成は定期実行ではなく同期処理なので、置き換え先の台帳エントリは無い。'
+      + '2026-09-09 に送信のコード (apps/inbound-check/notion-sync.js・notion.js・送信の API と画面) ごと削除した',
     replaced_by: 'apps/iroha-work/task-intake.js createTaskForDestination (同期)。正本の切替は在庫化アプリ /admin/source',
   },
 ];

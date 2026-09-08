@@ -2862,14 +2862,14 @@ console.log('\n[19] HTTP (アプリ正本): 端末登録 → 一覧 → 開始 �
       const k4 = TD.getTask(p3.inb);
       ok(r4.status === 200 && r4.json.promoted && k4.status === 'in_progress' && k4.started_at === '2026-09-03T01:00:00Z' && k4.notion_page_id === 'merge-page-9962', '着手済みの側を未着手側へ統合すると作業中に昇格 (started_at を引き継ぐ)');
       ok(db.prepare('SELECT COUNT(*) c FROM f_iroha_work_sessions WHERE task_id = ?').get(p3.inb).c === 2 && /読み直して/.test(r4.json.note), '作業時間は残す側に集まる。応答に再読込の案内');
-      // (5) 行き先が取消済み → 統合後に残す側へ取消を伝える (⭐消さない。「取消の確認」を付けて残す)
+      // (5) 🚨行き先が取消済みでも、統合で残す側に「取消の確認」を付けない (2026-09-09。入荷側の状態でカードを触らない)
       const p5 = mkPair(9963, 'MERGE-C5');
-      db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = '2026-09-03T04:00:00Z', cancelled_by = 'import', cancel_reason = 'line_removed' WHERE id = 9963").run();
+      db.prepare("UPDATE f_inbound_check_destinations SET cancelled_at = '2026-09-03T04:00:00Z', cancelled_by = 'import', cancel_reason = 'reopen' WHERE id = 9963").run();
       const r5 = await merge(p5.inb, 'import');
       const k5 = TD.getTask(p5.imp);
-      ok(r5.status === 200 && r5.json.cancellation === 'review' && k5.status !== 'closed' && k5.cancellation_requested_at && k5.destination_id === 9963
-        && k5.cancellation_source === 'inbound_import' && k5.cancellation_reason === 'line_removed',
-        '取消済み行き先の統合は、残す側に「取消の確認」が付く (自動では消さない)。出どころは行き先の cancelled_by から (CSV 取込なら inbound_import) — 画面に出すので取り違えない');
+      ok(r5.status === 200 && r5.json.cancellation === null && k5.status !== 'closed' && k5.destination_id === 9963
+        && !k5.cancellation_requested_at,
+        '🚨取消済み行き先を統合しても、残す側に札は付かない (入荷側の状態がカードを触る最後の口を撤去)');
       // (6) 消える側に取消の要求 (要確認) があれば残す側へ引き継ぐ
       const p6 = mkPair(9964, 'MERGE-C6', { importStatus: 'in_progress' });
       db.prepare("UPDATE f_iroha_tasks SET cancellation_requested_at = '2026-09-03T05:00:00Z', cancellation_source = 'inbound_reversal' WHERE id = ?").run(p6.inb);
