@@ -136,6 +136,15 @@ const csvOf = (rows, header = REAL_HEADER) =>
   const oldName = parseBarcodeMasterCsv(csvOf([realRow], ['商品ID', '商品名', '検索名称', 'バーコード', '有効区分']));
   eq(oldName.kubunCol, '有効区分', '「有効区分」という列名でも通す');
   eq(oldName.rows[0].kubun, '01', 'どちらの列名でも同じところを区分として読む');
+  // 両方の列名がある CSV でも迷わない: KUBUN_COLS の並び順 (有効期限区分が先) で決める
+  const bothCols = ['商品ID', '商品名', '検索名称', 'バーコード', '有効期限区分', '有効区分'];
+  const both = parseBarcodeMasterCsv(csvOf([[...realRow, '99']], bothCols));
+  eq(both.kubunCol, '有効期限区分', '両方あれば 有効期限区分 を優先する');
+  eq(both.rows[0].kubun, '01', '優先した列の値を読む (もう一方の 99 ではない)');
+  const swapped = parseBarcodeMasterCsv(csvOf([[...realRow.slice(0, 4), '99', '01']],
+    ['商品ID', '商品名', '検索名称', 'バーコード', '有効区分', '有効期限区分']));
+  eq(swapped.kubunCol, '有効期限区分', 'CSV の列順が逆でも優先順位は変わらない');
+  eq(swapped.rows[0].kubun, '01', '列順に引きずられて違う列を読まない');
 
   const r = importBarcodeMaster(csvOf([
     ['awa-shio-250', '粟国の塩 250g', '粟国の塩', '4936695001014', '01'],
@@ -143,6 +152,7 @@ const csvOf = (rows, header = REAL_HEADER) =>
     ['pashima-single-KI', 'パシーマ', 'パシーマ', '4903357200047', '01'],
   ]), { actor: 'test' });
   ok(r.ok && r.total === 3 && r.products === 2 && r.added === 3 && r.removed === 0, '取り込める');
+  eq(r.kubunColumn, '有効期限区分', '取込結果にも読んだ列名が載る (管理画面の内訳表示がこれを使う)');
   eq(barcodeMasterStatus().total, 3, '状態 (件数)');
   eq(barcodeMasterStatus().products, 2, '状態 (商品数)');
   // 全量置換: マスタから消えたものは残さない
@@ -244,6 +254,11 @@ console.log('\n[5] ② 伝票からの発行でも マスタ → 明細 の順�
     '伝票の古い値ではなく マスタの値で刷る (ロジザードで直したらマスタの方が新しい)');
   const b = pq.enqueuePrintJob({ batchId: batch.id, lineKey: 'AR9|2|1', copies: 1, clientRequestId: rid() });
   ok(b.ok && b.job.barcode === '4900000000222', 'マスタに無い商品は その明細自身の値で刷る');
+  // 🚨 今回の発端: 在庫も入荷実績も無い商品 (rosebathp と同じ立場) を 🔍 商品から探す で刷る。
+  //    マスタが取り込めていないとここが bad_barcode で止まる = シールが出ない
+  const c = pq.enqueuePrintJob({ productCode: 'pashima-single-KI', copies: 1, clientRequestId: rid() });
+  ok(c.ok && c.job.source === 'product' && c.job.barcode === '4903357200047',
+    '在庫も入荷実績も無い商品でも マスタの値で値札を刷れる (rosebathp が出なかった件)');
 }
 
 console.log('\n[6] HTTP — 管理画面の取込ボタンの入口');

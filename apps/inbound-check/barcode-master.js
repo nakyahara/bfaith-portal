@@ -35,7 +35,8 @@ const ID_COL = '商品ID';
 const BC_COL = 'バーコード';
 const NAME_COL = '商品名';
 // 実ファイルは「有効期限区分」。ロジザードの出力パターン次第で「有効区分」と出る環境もありうるので
-// **どちらか一方あれば通す** (両方無ければ拒否 = fail-closed は変えない)。先に見つかった方を読む
+// **どちらか一方あれば通す** (両方無ければ拒否 = fail-closed は変えない)。
+// 両方ある CSV なら**この並びで先にある方** (= 有効期限区分) を読む — CSV の列順は見ない
 const KUBUN_COLS = ['有効期限区分', '有効区分'];
 
 /** 前回より何割まで減ってよいか。これを超えて減ったら取り込まない (人が承認すれば通る) */
@@ -107,8 +108,9 @@ export function parseBarcodeMasterCsv(buffer) {
   }
   const kubunCol = KUBUN_COLS.find(c => header.includes(c));
   if (!kubunCol) {
-    const names = KUBUN_COLS.map(c => `「${c}」`);
-    bad(`必須列 ${names[0]} (または ${names.slice(1).join(' / ')}) がありません (実際の列: ${shownHeader()})`);
+    // 列名の候補が1つしかなくなっても壊れない並べ方にする
+    const names = KUBUN_COLS.map(c => `「${c}」`).join(' または ');
+    bad(`必須列 ${names} がありません (実際の列: ${shownHeader()})`);
   }
   const dup = header.filter((h, i) => h && header.indexOf(h) !== i);
   if (dup.length) bad(`列名が重複しています: ${[...new Set(dup)].join(', ')}`);
