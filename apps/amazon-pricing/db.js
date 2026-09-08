@@ -40,6 +40,8 @@ export const REASON_CODES = {
   mistake: '入力ミスの修正',
   stop: '追従を止めたい',
   other: 'その他 (理由を書く)',
+  inline: '一覧で直接変えた (プライスター風の操作)',
+  bulk: 'チェックして一括で記録した',
 };
 
 export const REVIEW_VERDICTS = { agree: '妥当', disagree: '違う', unsure: 'わからない' };

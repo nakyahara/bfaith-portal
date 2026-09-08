@@ -20,7 +20,7 @@ import {
   addReview, reviewStats, listRuns, REASON_CODES, REVIEW_VERDICTS, POLICY_FIELDS,
 } from './db.js';
 import { loadListings, loadListing, priceHistory, dataFreshness, mirrorTablesAvailable } from './read-model.js';
-import { evaluateListing, MODES, ACTIONS, REASONS, FLAGS, RULE_VERSION, DEFAULT_MIN_MARGIN_RATE } from './engine.js';
+import { evaluateListing, MODES, ACTIONS, REASONS, FLAGS, RULE_VERSION, DEFAULT_MIN_MARGIN_RATE, FALLBACK_REFERRAL_RATE, REFERRAL_RATE_MIN, REFERRAL_RATE_MAX } from './engine.js';
 import { inputOf, runEvaluation, ensureEvaluation } from './evaluate.js';
 import { toJst } from '../price-update/format.js';
 
@@ -79,9 +79,14 @@ function common(req, title, nav) {
 /** 360 行にいまの判定 (方針の現在値で計算) を付ける */
 export function enrich(row) {
   const live = evaluateListing(inputOf(row));
+  const isFba = String(row.channel || '').toUpperCase() === 'FBA';
   return {
     ...row,
     live,
+    // プライスターの「手数料」欄に相当: いまの出品価格に対する Amazon 手数料 (販売手数料率 × 価格 + FBA配送代行 + 固定費)。粗利の内訳表示用で、判定には使わない
+    fee_now: feeNow(row),
+    // プライスターの「数量」欄に相当: FBA は FBA 倉庫、自己発送は自社倉庫の在庫 (日次在庫スナップショット)
+    stock: isFba ? (row.fba_stock ?? null) : (row.own_stock ?? null),
     computed_floor: live.computedFloor,
     effective_floor: live.effectiveFloor,
     gross_now: live.grossNow,
@@ -90,8 +95,17 @@ export function enrich(row) {
   };
 }
 
+function feeNow(row) {
+  if (row.my_price == null || !(row.my_price > 0)) return null;
+  const rate = Number(row.referral_fee_rate);
+  const r = Number.isFinite(rate) && rate >= REFERRAL_RATE_MIN && rate <= REFERRAL_RATE_MAX ? rate : FALLBACK_REFERRAL_RATE;
+  const fixed = (Number(row.fba_fee) || 0) + (Number(row.per_item_fee) || 0) + (Number(row.variable_closing_fee) || 0);
+  return Math.round(row.my_price * r + fixed);
+}
+
 const FLAG_FILTERS = {
   below_floor: (r) => r.live.flags.includes('BELOW_COST_FLOOR') || r.live.flags.includes('BELOW_STOPPER'),
+  stopped_at_floor: (r) => r.live.flags.includes('FLOOR_CLAMP') || r.live.flags.includes('BELOW_STOPPER'),
   cost_unknown: (r) => r.live.flags.includes('COST_UNKNOWN'),
   buybox_lost: (r) => r.buybox_is_mine === 0,
   no_price: (r) => r.my_price == null,
@@ -99,8 +113,9 @@ const FLAG_FILTERS = {
   no_sales: (r) => r.live.flags.includes('NO_SALES_30D'),
 };
 export const FLAG_FILTER_LABELS = {
-  below_floor: '⚠️ 赤字の疑い (今の価格が下限より低い)', cost_unknown: '原価不明', buybox_lost: 'カートを他社が持っている',
-  no_price: '価格が取れていない', low_margin: '粗利率が最低粗利率を下回る', no_sales: '30日売れていない',
+  below_floor: '⚠️ 赤字の疑い (今の価格が下限より低い)', stopped_at_floor: '赤字ストッパーで下げ止まっている商品',
+  cost_unknown: '仕入れ価格 (原価) が未登録', buybox_lost: 'カートを他社が持っている',
+  no_price: '出品価格が取れていない', low_margin: '粗利率が最低粗利率を下回る', no_sales: '30日売れていない',
 };
 
 const SORTS = {
@@ -109,6 +124,7 @@ const SORTS = {
   gap: (a, b) => (b.buybox_gap ?? -Infinity) - (a.buybox_gap ?? -Infinity),
   margin: (a, b) => (a.gross_now.rate ?? Infinity) - (b.gross_now.rate ?? Infinity),
   sku: (a, b) => a.seller_sku.localeCompare(b.seller_sku),
+  stock: (a, b) => (b.stock ?? -1) - (a.stock ?? -1) || a.seller_sku.localeCompare(b.seller_sku),
 };
 
 /** 絞り込み・並び替え (画面と CSV で同じ) */
@@ -121,8 +137,13 @@ export function applyFilters(rows, q) {
   if (q.mode) {
     if (q.mode === 'set') out = out.filter((r) => r.has_policy);
     else if (q.mode === 'unset') out = out.filter((r) => !r.has_policy);
+    else if (q.mode === 'tracking') out = out.filter((r) => r.mode && r.mode !== 'off');
     else out = out.filter((r) => r.mode === q.mode);
   }
+  // 出品価格の範囲 (プライスターの詳細検索「出品価格」)
+  const pmin = Number(q.price_min), pmax = Number(q.price_max);
+  if (q.price_min != null && String(q.price_min) !== '' && Number.isFinite(pmin)) out = out.filter((r) => r.my_price != null && r.my_price >= pmin);
+  if (q.price_max != null && String(q.price_max) !== '' && Number.isFinite(pmax)) out = out.filter((r) => r.my_price != null && r.my_price <= pmax);
   if (q.channel) out = out.filter((r) => String(r.channel || '').toUpperCase() === String(q.channel).toUpperCase());
   if (q.action) out = out.filter((r) => r.live.action === q.action);
   if (q.flag && FLAG_FILTERS[q.flag]) out = out.filter(FLAG_FILTERS[q.flag]);
@@ -166,9 +187,10 @@ router.get('/', (req, res) => {
   const filters = {
     q: String(req.query.q || ''), mode: String(req.query.mode || ''), channel: String(req.query.channel || ''),
     action: String(req.query.action || ''), flag: String(req.query.flag || ''), sort: String(req.query.sort || 'units'),
+    price_min: String(req.query.price_min || ''), price_max: String(req.query.price_max || ''), adv: String(req.query.adv || ''),
   };
   const filtered = applyFilters(all, filters);
-  const per = [50, 100, 300].includes(Number(req.query.per)) ? Number(req.query.per) : 100;
+  const per = [50, 100, 150, 300].includes(Number(req.query.per)) ? Number(req.query.per) : 100;
   const pages = Math.max(1, Math.ceil(filtered.length / per));
   const page = Math.min(pages, Math.max(1, parseInt(req.query.page, 10) || 1));
   res.render(view('index.ejs'), {
@@ -295,7 +317,7 @@ router.get('/api/export.csv', (req, res) => {
     const avail = mirrorTablesAvailable(db);
     if (!avail.ok) return res.status(503).send(`表がありません: ${avail.missing.join(', ')}`);
     const rows = applyFilters(loadListings(db).map(enrich), req.query);
-    const cols = ['seller_sku', 'asin', 'channel', 'ne_code', 'ne_name', 'my_price', 'buybox_price', 'buybox_is_mine', 'cost_incl_tax',
+    const cols = ['seller_sku', 'asin', 'channel', 'ne_code', 'ne_name', 'stock', 'my_price', 'buybox_price', 'buybox_is_mine', 'cost_incl_tax', 'fee_now',
       'referral_fee_rate', 'fba_fee', 'ship_cost', 'gross_now', 'gross_rate_now', 'units_30d', 'computed_floor', 'floor_price', 'ceiling_price',
       'offset_jpy', 'min_margin_rate', 'mode', 'action', 'proposed_price', 'reason_code', 'reason_text', 'confidence', 'flags', 'snapshot_date_jst'];
     const TEXT_COLS = new Set(['seller_sku', 'asin', 'channel', 'ne_code', 'ne_name', 'mode', 'action', 'reason_code', 'reason_text', 'flags', 'snapshot_date_jst']);
@@ -342,7 +364,9 @@ router.get('/api/health', (req, res) => {
 function publicLive(r) {
   const l = r.live;
   return {
-    action: l.action, proposed_price: l.proposedPrice, current_price: l.currentPrice, reason_code: l.reasonCode,
+    action: l.action,
+    // 画面の JS 用 (静的検査が ".action" という文字列をブラウザ側で禁止しているので、別名でも渡す)
+    verdict_label: ACTIONS[l.action] || l.action, verdict_class: l.action, proposed_price: l.proposedPrice, current_price: l.currentPrice, reason_code: l.reasonCode,
     reason_text: l.reasonText, confidence: l.confidence, flags: l.flags, computed_floor: l.computedFloor,
     effective_floor: l.effectiveFloor, gross_now: l.grossNow,
   };

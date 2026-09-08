@@ -116,7 +116,10 @@
   function toast(msg) {
     var t = document.getElementById('toast');
     if (!t) { alert(msg); return; }
-    t.textContent = msg; t.style.display = 'block';
+    var m = document.getElementById('toast-msg');
+    if (m) m.textContent = msg; else t.textContent = msg;
+    t.classList.remove('bad');
+    t.style.display = 'block';
     clearTimeout(t._tm); t._tm = setTimeout(function () { t.style.display = 'none'; }, 2500);
   }
   (function () {

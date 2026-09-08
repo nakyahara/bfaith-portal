@@ -22,11 +22,20 @@ export const REQUIRED_MIRROR_TABLES = [
   'mirror_sku_resolved',
   'mirror_products',
   'mirror_amazon_finance_sku_daily',
+  'mirror_inv_daily_detail',
 ];
 
 export const LISTING_360_SQL = `
 WITH latest AS (
   SELECT MAX(date_jst) AS d FROM mirror_amazon_price_snapshot_daily
+),
+stock AS (
+  -- 数量 (プライスターの「数量」に相当): 日次在庫スナップショットの最新日、NE商品コードごと。FBA 倉庫と自社倉庫を別に持つ
+  SELECT ne_code, category, SUM(qty) AS qty
+    FROM mirror_inv_daily_detail
+   WHERE business_date = (SELECT MAX(business_date) FROM mirror_inv_daily_detail)
+     AND market = 'jp' AND category IN ('fba_warehouse', 'own_warehouse')
+   GROUP BY ne_code, category
 ),
 cost AS (
   SELECT LOWER(TRIM(r.seller_sku)) AS sku_norm,
@@ -37,9 +46,14 @@ cost AS (
          COUNT(*) AS parts,
          MAX(p.送料) AS ship_cost,
          MIN(r.ne_code) AS ne_code,
-         MIN(COALESCE(p.商品名, r.商品名)) AS ne_name
+         MIN(COALESCE(p.商品名, r.商品名)) AS ne_name,
+         -- セット品は「構成品の在庫 ÷ 必要数」の最小。在庫行が 1 つも無い SKU は NULL (0 ではなく「不明」)
+         CASE WHEN COUNT(sf.ne_code) = 0 THEN NULL ELSE MIN(COALESCE(sf.qty, 0) / MAX(r.quantity, 1)) END AS fba_stock,
+         CASE WHEN COUNT(so.ne_code) = 0 THEN NULL ELSE MIN(COALESCE(so.qty, 0) / MAX(r.quantity, 1)) END AS own_stock
     FROM mirror_sku_resolved r
     LEFT JOIN mirror_products p ON p.商品コード = r.ne_code
+    LEFT JOIN stock sf ON sf.ne_code = r.ne_code AND sf.category = 'fba_warehouse'
+    LEFT JOIN stock so ON so.ne_code = r.ne_code AND so.category = 'own_warehouse'
    GROUP BY LOWER(TRIM(r.seller_sku))
 ),
 sales AS (
@@ -57,7 +71,7 @@ SELECT f.seller_sku,
        f.fetched_at AS fees_fetched_at,
        (SELECT d FROM latest) AS snapshot_date_jst,
        s.my_price, s.buybox_price, s.buybox_is_mine,
-       c.ne_code, c.ne_name, c.cost_incl_tax, c.cost_missing_parts, c.parts, c.ship_cost,
+       c.ne_code, c.ne_name, c.cost_incl_tax, c.cost_missing_parts, c.parts, c.ship_cost, c.fba_stock, c.own_stock,
        sa.units_30d, sa.sales_30d,
        po.mode, po.floor_price, po.ceiling_price, po.offset_jpy, po.min_margin_rate,
        po.note AS policy_note, po.updated_at AS policy_updated_at, po.updated_by AS policy_updated_by
